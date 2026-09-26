@@ -443,6 +443,42 @@ impl Layout {
     }
 }
 
+/// Returns whether sorted stride spans prove that logical indices cannot alias.
+#[must_use]
+pub fn is_injective(layout: &Layout) -> bool {
+    if layout.element_count <= 1 {
+        return true;
+    }
+    let mut axes = layout
+        .shape
+        .iter()
+        .copied()
+        .zip(layout.strides.iter().copied())
+        .filter(|&(extent, _)| extent > 1)
+        .collect::<Vec<_>>();
+    axes.sort_unstable_by_key(|&(_, stride)| stride);
+    let mut lower_span = 0_u64;
+    for (extent, stride) in axes {
+        if stride <= lower_span {
+            return false;
+        }
+        let Some(axis_span) = u64::from(extent - 1).checked_mul(stride) else {
+            return false;
+        };
+        let Some(span) = lower_span.checked_add(axis_span) else {
+            return false;
+        };
+        lower_span = span;
+    }
+    true
+}
+
+/// Conservatively reports whether two views of the same buffer may share bytes.
+#[must_use]
+pub fn byte_ranges_overlap(left: &Layout, right: &Layout) -> bool {
+    left.byte_span.start < right.byte_span.end && right.byte_span.start < left.byte_span.end
+}
+
 fn element_count(shape: &[u32]) -> Result<u64, LayoutError> {
     if shape.contains(&0) {
         return Ok(0);
@@ -506,9 +542,11 @@ fn validate_span(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use proptest::prelude::*;
 
-    use super::{Layout, LayoutError, Slice};
+    use super::{Layout, LayoutError, Slice, byte_ranges_overlap, is_injective};
     use crate::DType;
 
     #[test]
@@ -638,7 +676,61 @@ mod tests {
         );
     }
 
+    #[test]
+    fn identifies_aliasing_layouts() {
+        let broadcast = Layout::new(DType::F32, 0, vec![7, 33], vec![0, 1], 132).unwrap();
+        let overlap = Layout::new(DType::F32, 0, vec![2, 2], vec![1, 1], 12).unwrap();
+        let strided = Layout::new(DType::F32, 0, vec![7, 33], vec![66, 2], 1844).unwrap();
+        assert!(!is_injective(&broadcast));
+        assert!(!is_injective(&overlap));
+        assert!(is_injective(&strided));
+    }
+
+    #[test]
+    fn conservatively_compares_byte_ranges() {
+        let left = Layout::contiguous(DType::U32, 0, vec![7], 64).unwrap();
+        let touching = Layout::contiguous(DType::U32, 7, vec![1], 64).unwrap();
+        let overlap = Layout::contiguous(DType::U32, 6, vec![1], 64).unwrap();
+        let empty = Layout::contiguous(DType::U32, u64::MAX, vec![0], 64).unwrap();
+        assert!(!byte_ranges_overlap(&left, &touching));
+        assert!(byte_ranges_overlap(&left, &overlap));
+        assert!(!byte_ranges_overlap(&left, &empty));
+    }
+
     proptest! {
+        #[test]
+        fn injectivity_proof_never_accepts_brute_force_aliases(
+            axes in prop::collection::vec((0_u32..=4, 0_u64..=8), 0..=4),
+        ) {
+            let (shape, strides): (Vec<_>, Vec<_>) = axes.into_iter().unzip();
+            let layout = Layout::new(DType::U32, 0, shape, strides, 4096).unwrap();
+            prop_assert!(!is_injective(&layout)
+                || brute_injective_u128(layout.shape(), layout.strides(), layout.offset()));
+        }
+
+        #[test]
+        fn injectivity_proof_handles_wide_arithmetic(
+            axes in prop::collection::vec((0_u32..=3, wide_u64()), 0..=4),
+            offset in wide_u64(),
+        ) {
+            let (shape, strides): (Vec<_>, Vec<_>) = axes.into_iter().unzip();
+            let layout = Layout::new(
+                DType::F16,
+                offset,
+                shape.clone(),
+                strides.clone(),
+                u64::MAX,
+            );
+            prop_assert_eq!(
+                layout.is_ok(),
+                u128_layout_fits(DType::F16, offset, &shape, &strides, u64::MAX)
+            );
+            if let Ok(layout) = layout {
+                prop_assert!(!is_injective(&layout)
+                    || brute_injective_u128(&shape, &strides, offset));
+            }
+        }
+
         #[test]
         fn broadcast_only_zeroes_stretched_strides(
             axes in prop::collection::vec((1_u32..=4, 0_u64..=8, 1_u32..=4), 0..=4),
@@ -780,5 +872,21 @@ mod tests {
                 element
             })
             .max()
+    }
+
+    fn brute_injective_u128(shape: &[u32], strides: &[u64], offset: u64) -> bool {
+        let mut offsets = HashSet::new();
+        let count = shape.iter().map(|&extent| u64::from(extent)).product();
+        for mut linear in 0..count {
+            let mut element = u128::from(offset);
+            for (&extent, &stride) in shape.iter().zip(strides).rev() {
+                element += u128::from(linear % u64::from(extent)) * u128::from(stride);
+                linear /= u64::from(extent);
+            }
+            if !offsets.insert(element) {
+                return false;
+            }
+        }
+        true
     }
 }
