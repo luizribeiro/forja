@@ -219,15 +219,28 @@ where
     run(candidate, op, &candidate_inputs, &candidate_output)?;
     let expected_bytes = reference.read(&reference_output)?;
     let actual_bytes = candidate.read(&candidate_output)?;
-    if matches!(output.dtype, DType::I32 | DType::U32) {
+    assert_outputs_agree(output.dtype, &expected_bytes, &actual_bytes)
+}
+
+/// Checks two encoded outputs using exact integer comparison or the dtype tolerance.
+///
+/// # Errors
+///
+/// Returns an encoding or tolerance error when the candidate differs from the reference.
+pub fn assert_outputs_agree(
+    dtype: DType,
+    expected_bytes: &[u8],
+    actual_bytes: &[u8],
+) -> Result<(), AgreementError> {
+    if matches!(dtype, DType::I32 | DType::U32) {
         return (expected_bytes == actual_bytes)
             .then_some(())
             .ok_or(AgreementError::OutputMismatch);
     }
-    let expected = decode(&expected_bytes, output.dtype)?;
-    let actual = decode(&actual_bytes, output.dtype)?;
+    let expected = decode(expected_bytes, dtype)?;
+    let actual = decode(actual_bytes, dtype)?;
     let error = normwise_relative_error(&expected, &actual);
-    let tolerance = dtype_tolerance(output.dtype)?;
+    let tolerance = dtype_tolerance(dtype)?;
     if error > tolerance {
         return Err(AgreementError::OutsideTolerance { error, tolerance });
     }

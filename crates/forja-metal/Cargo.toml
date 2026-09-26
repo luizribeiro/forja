@@ -49,3 +49,4 @@ pedantic = "warn"
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 forja-cpu = { path = "../forja-cpu" }
 forja-testing = { path = "../../support/forja-testing" }
+proptest = "1.9"
