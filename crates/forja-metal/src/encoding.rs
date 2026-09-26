@@ -14,13 +14,44 @@ use forja_core::{
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_foundation::NSString;
 use objc2_metal::{
-    MTL4CommandBuffer, MTL4CommandQueue, MTL4CommitFeedback, MTL4CommitOptions, MTLAllocation,
-    MTLBuffer, MTLComputePipelineState, MTLDataType, MTLDevice, MTLEvent,
+    MTL4ArgumentTable, MTL4CommandBuffer, MTL4CommandQueue, MTL4CommitFeedback, MTL4CommitOptions,
+    MTLAllocation, MTLBuffer, MTLComputePipelineState, MTLDataType, MTLDevice, MTLEvent,
     MTLFunctionConstantValues, MTLLibrary, MTLResidencySet, MTLResidencySetDescriptor,
     MTLSharedEvent, MTLSharedEventListener, MTLSize,
 };
 
 use crate::storage::MetalBackend;
+
+type MetalBufferRef = Retained<ProtocolObject<dyn MTLBuffer>>;
+type EncodedEmbed = (Vec<MetalBufferRef>, u64);
+
+struct EncodedDispatches {
+    temporaries: Vec<MetalBufferRef>,
+    error_flags: Vec<u64>,
+    bindings: ArgumentBindings,
+}
+
+#[derive(Default)]
+struct ArgumentBindings {
+    addresses: HashSet<u64>,
+}
+
+impl ArgumentBindings {
+    fn bind(
+        &mut self,
+        table: &ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>,
+        index: usize,
+        buffer: &ProtocolObject<dyn MTLBuffer>,
+    ) {
+        let address = buffer.gpuAddress();
+        // SAFETY: Each caller uses an index within its argument-table descriptor and registers
+        // the bound buffer in the command resource owner before submission.
+        unsafe {
+            table.setAddress_atIndex(address, index);
+        }
+        self.addresses.insert(address);
+    }
+}
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct PipelineKey {
@@ -33,7 +64,7 @@ struct CompletionState {
 }
 
 pub(super) struct InFlightBuffer {
-    pub(super) _raw: Retained<ProtocolObject<dyn MTLBuffer>>,
+    pub(super) raw: MetalBufferRef,
 }
 
 // SAFETY: Metal buffer resources support concurrent retain and release, and this wrapper never
@@ -65,11 +96,16 @@ unsafe impl Send for InFlightResidency {}
 // SAFETY: The wrapper exposes no operations on the retained residency set.
 unsafe impl Sync for InFlightResidency {}
 
+struct CommandResources {
+    buffers: Vec<InFlightBuffer>,
+    error_flags: Vec<usize>,
+}
+
 pub(super) struct Completion {
     state: Mutex<CompletionState>,
     ready: Condvar,
     event: InFlightEvent,
-    _buffers: Vec<InFlightBuffer>,
+    resources: CommandResources,
     _residency: InFlightResidency,
     commit: CommitRetention,
 }
@@ -91,8 +127,8 @@ unsafe impl Send for CommitRetention {}
 unsafe impl Sync for CommitRetention {}
 
 impl Completion {
-    pub(super) fn new(
-        buffers: Vec<InFlightBuffer>,
+    fn new(
+        resources: CommandResources,
         event: InFlightEvent,
         residency: InFlightResidency,
     ) -> Arc<Self> {
@@ -123,7 +159,7 @@ impl Completion {
                 state: Mutex::new(CompletionState { result: None }),
                 ready: Condvar::new(),
                 event,
-                _buffers: buffers,
+                resources,
                 _residency: residency,
                 commit: CommitRetention {
                     _handler: handler,
@@ -151,7 +187,8 @@ impl Completion {
         {
             return Err(BackendError::ExecutionFailed);
         }
-        self.wait_for_feedback(timeout.saturating_sub(started.elapsed()))
+        self.wait_for_feedback(timeout.saturating_sub(started.elapsed()))?;
+        self.check_error_flags()
     }
 
     fn wait_unbounded(&self) {
@@ -191,6 +228,25 @@ impl Completion {
                 return Err(BackendError::ExecutionFailed);
             }
         }
+    }
+
+    fn check_error_flags(&self) -> Result<(), BackendError> {
+        for &flag in &self.resources.error_flags {
+            // SAFETY: The queue event has signaled GPU completion, and each indexed retained
+            // shared buffer contains two aligned u32 values initialized by the host.
+            let (has_error, index) = unsafe {
+                let words = self.resources.buffers[flag]
+                    .raw
+                    .contents()
+                    .cast::<u32>()
+                    .as_ptr();
+                (words.read(), words.add(1).read())
+            };
+            if has_error != 0 {
+                return Err(BackendError::IndexOutOfRange { index });
+            }
+        }
+        Ok(())
     }
 }
 
@@ -303,6 +359,7 @@ impl MetalBackend {
                     | Op::RmsNorm { .. }
                     | Op::Softmax
                     | Op::Rope { .. }
+                    | Op::Embed
             )
         }) {
             return Err(BackendError::InvalidInput);
@@ -321,10 +378,11 @@ impl MetalBackend {
             self.validate(tensor)?;
         }
         let command_buffer = self.begin_command_buffer()?;
-        let temporaries = self.encode_dispatches(&command_buffer, &dispatches, &barriers)?;
-        let residency = self.make_resident(&command_buffer, &tensors, &temporaries)?;
+        let encoded = self.encode_dispatches(&command_buffer, &dispatches, &barriers)?;
+        let resources = self.command_resources(&tensors, encoded)?;
+        let residency = self.make_resident(&command_buffer, &resources)?;
         command_buffer.endCommandBuffer();
-        self.commit(&command_buffer, &tensors, &temporaries, residency)
+        self.commit(&command_buffer, &tensors, resources, residency)
     }
 
     fn encode_dispatches(
@@ -332,7 +390,7 @@ impl MetalBackend {
         command_buffer: &ProtocolObject<dyn MTL4CommandBuffer>,
         dispatches: &[Dispatch],
         barriers: &[bool],
-    ) -> Result<Vec<Retained<ProtocolObject<dyn MTLBuffer>>>, BackendError> {
+    ) -> Result<EncodedDispatches, BackendError> {
         use objc2_metal::{
             MTL4ArgumentTableDescriptor, MTL4CommandEncoder, MTL4VisibilityOptions, MTLStages,
         };
@@ -347,6 +405,8 @@ impl MetalBackend {
             .newArgumentTableWithDescriptor_error(&descriptor)
             .map_err(|_| BackendError::ExecutionFailed)?;
         let mut temporaries = Vec::with_capacity(dispatches.len().saturating_mul(3));
+        let mut error_flags = Vec::new();
+        let mut bindings = ArgumentBindings::default();
         for (dispatch, &barrier) in dispatches.iter().zip(barriers) {
             if barrier {
                 encoder.barrierAfterEncoderStages_beforeEncoderStages_visibilityOptions(
@@ -356,15 +416,39 @@ impl MetalBackend {
                 );
             }
             if let Op::RmsNorm { eps } = dispatch.op() {
-                temporaries.extend(self.encode_rms_norm(&encoder, &table, dispatch, eps)?);
+                temporaries.extend(self.encode_rms_norm(
+                    &encoder,
+                    &table,
+                    dispatch,
+                    eps,
+                    &mut bindings,
+                )?);
                 continue;
             }
             if dispatch.op() == Op::Softmax {
-                temporaries.extend(self.encode_softmax(&encoder, &table, dispatch)?);
+                temporaries.extend(self.encode_softmax(
+                    &encoder,
+                    &table,
+                    dispatch,
+                    &mut bindings,
+                )?);
                 continue;
             }
             if let Op::Rope { theta } = dispatch.op() {
-                temporaries.extend(self.encode_rope(&encoder, &table, dispatch, theta)?);
+                temporaries.extend(self.encode_rope(
+                    &encoder,
+                    &table,
+                    dispatch,
+                    theta,
+                    &mut bindings,
+                )?);
+                continue;
+            }
+            if dispatch.op() == Op::Embed {
+                let (buffers, flag) =
+                    self.encode_embed(&encoder, &table, dispatch, &mut bindings)?;
+                temporaries.extend(buffers);
+                error_flags.push(flag);
                 continue;
             }
             let kernel = match dispatch.op() {
@@ -388,10 +472,20 @@ impl MetalBackend {
                 Op::SiluMul => "silu_mul",
                 _ => return Err(BackendError::InvalidInput),
             };
-            temporaries.extend(self.encode_elementwise(&encoder, &table, dispatch, kernel)?);
+            temporaries.extend(self.encode_elementwise(
+                &encoder,
+                &table,
+                dispatch,
+                kernel,
+                &mut bindings,
+            )?);
         }
         encoder.endEncoding();
-        Ok(temporaries)
+        Ok(EncodedDispatches {
+            temporaries,
+            error_flags,
+            bindings,
+        })
     }
 
     #[allow(clippy::cast_precision_loss)]
@@ -401,8 +495,9 @@ impl MetalBackend {
         table: &ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>,
         dispatch: &Dispatch,
         theta: f32,
+        bindings: &mut ArgumentBindings,
     ) -> Result<Vec<Retained<ProtocolObject<dyn MTLBuffer>>>, BackendError> {
-        use objc2_metal::{MTL4ArgumentTable, MTL4ComputeCommandEncoder, MTLSize};
+        use objc2_metal::MTL4ComputeCommandEncoder;
 
         let [input, positions] = dispatch.inputs() else {
             return Err(BackendError::InvalidInput);
@@ -446,18 +541,11 @@ impl MetalBackend {
             .lock()
             .map_err(|_| BackendError::ExecutionFailed)?;
         for (index, tensor) in [input, positions, output].into_iter().enumerate() {
-            // SAFETY: The table has eight slots, and all resources remain retained through
-            // command-buffer completion.
-            unsafe {
-                table.setAddress_atIndex(buffers.get(tensor)?.raw.gpuAddress(), index);
-                table.setAddress_atIndex(temporaries[index].gpuAddress(), index + 3);
-            }
+            bindings.bind(table, index, &buffers.get(tensor)?.raw);
+            bindings.bind(table, index + 3, &temporaries[index]);
         }
-        // SAFETY: Slots six and seven exist, and both temporary buffers remain retained.
-        unsafe {
-            table.setAddress_atIndex(temporaries[3].gpuAddress(), 6);
-            table.setAddress_atIndex(temporaries[4].gpuAddress(), 7);
-        }
+        bindings.bind(table, 6, &temporaries[3]);
+        bindings.bind(table, 7, &temporaries[4]);
         drop(buffers);
         encoder.setArgumentTable(Some(table));
         let pair_count = output
@@ -482,13 +570,83 @@ impl MetalBackend {
         Ok(temporaries)
     }
 
+    fn encode_embed(
+        &self,
+        encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
+        table: &ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>,
+        dispatch: &Dispatch,
+        bindings: &mut ArgumentBindings,
+    ) -> Result<EncodedEmbed, BackendError> {
+        use objc2_metal::MTL4ComputeCommandEncoder;
+
+        let [embeddings, ids] = dispatch.inputs() else {
+            return Err(BackendError::InvalidInput);
+        };
+        let output = dispatch.output();
+        let vocab = embeddings.layout().shape()[0];
+        let width = embeddings.layout().shape()[1];
+        let constants = [
+            (0, dtype_code(embeddings.layout().dtype())),
+            (2, dtype_code(output.layout().dtype())),
+        ];
+        let pipeline = self
+            .pipelines
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?
+            .get("embed", &constants)?;
+        encoder.setComputePipelineState(&pipeline);
+        let mut params = [0_u8; 8];
+        params[..4].copy_from_slice(&vocab.to_ne_bytes());
+        params[4..].copy_from_slice(&width.to_ne_bytes());
+        let mut error_state = [0_u8; 8];
+        error_state[4..].copy_from_slice(&u32::MAX.to_ne_bytes());
+        let error_flag = self.temporary_buffer(&error_state)?;
+        let error_address = error_flag.gpuAddress();
+        let temporaries = vec![
+            self.layout_buffer(embeddings.layout())?,
+            self.layout_buffer(ids.layout())?,
+            self.layout_buffer(output.layout())?,
+            self.temporary_buffer(&params)?,
+            error_flag,
+        ];
+        let buffers = self
+            .buffers
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?;
+        for (index, tensor) in [embeddings, ids, output].into_iter().enumerate() {
+            bindings.bind(table, index, &buffers.get(tensor)?.raw);
+            bindings.bind(table, index + 3, &temporaries[index]);
+        }
+        bindings.bind(table, 6, &temporaries[3]);
+        bindings.bind(table, 7, &temporaries[4]);
+        drop(buffers);
+        encoder.setArgumentTable(Some(table));
+        let thread_count = usize::try_from(output.layout().element_count())
+            .map_err(|_| BackendError::InvalidInput)?;
+        let group_width = pipeline.maxTotalThreadsPerThreadgroup().clamp(1, 256);
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(
+            MTLSize {
+                width: thread_count.div_ceil(group_width),
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: group_width,
+                height: 1,
+                depth: 1,
+            },
+        );
+        Ok((temporaries, error_address))
+    }
+
     fn encode_softmax(
         &self,
         encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
         table: &ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>,
         dispatch: &Dispatch,
+        bindings: &mut ArgumentBindings,
     ) -> Result<Vec<Retained<ProtocolObject<dyn MTLBuffer>>>, BackendError> {
-        use objc2_metal::{MTL4ArgumentTable, MTL4ComputeCommandEncoder};
+        use objc2_metal::MTL4ComputeCommandEncoder;
 
         let [input] = dispatch.inputs() else {
             return Err(BackendError::InvalidInput);
@@ -523,14 +681,11 @@ impl MetalBackend {
             .buffers
             .lock()
             .map_err(|_| BackendError::ExecutionFailed)?;
-        // SAFETY: The table slots exist and all bound resources are retained through completion.
-        unsafe {
-            table.setAddress_atIndex(buffers.get(input)?.raw.gpuAddress(), 0);
-            table.setAddress_atIndex(buffers.get(output)?.raw.gpuAddress(), 1);
-            table.setAddress_atIndex(temporaries[0].gpuAddress(), 2);
-            table.setAddress_atIndex(temporaries[1].gpuAddress(), 3);
-            table.setAddress_atIndex(temporaries[2].gpuAddress(), 4);
-        }
+        bindings.bind(table, 0, &buffers.get(input)?.raw);
+        bindings.bind(table, 1, &buffers.get(output)?.raw);
+        bindings.bind(table, 2, &temporaries[0]);
+        bindings.bind(table, 3, &temporaries[1]);
+        bindings.bind(table, 4, &temporaries[2]);
         drop(buffers);
         encoder.setArgumentTable(Some(table));
         let (threadgroups, threads) = row_dispatch_geometry(&pipeline, output.layout(), width)?;
@@ -544,8 +699,9 @@ impl MetalBackend {
         table: &ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>,
         dispatch: &Dispatch,
         eps: f32,
+        bindings: &mut ArgumentBindings,
     ) -> Result<Vec<Retained<ProtocolObject<dyn MTLBuffer>>>, BackendError> {
-        use objc2_metal::{MTL4ArgumentTable, MTL4ComputeCommandEncoder};
+        use objc2_metal::MTL4ComputeCommandEncoder;
 
         let [input, weight] = dispatch.inputs() else {
             return Err(BackendError::InvalidInput);
@@ -586,17 +742,10 @@ impl MetalBackend {
             .lock()
             .map_err(|_| BackendError::ExecutionFailed)?;
         for (index, tensor) in [input, weight, output].into_iter().enumerate() {
-            // SAFETY: The table has seven slots, and tensor and temporary buffers are retained
-            // through completion.
-            unsafe {
-                table.setAddress_atIndex(buffers.get(tensor)?.raw.gpuAddress(), index);
-                table.setAddress_atIndex(temporaries[index].gpuAddress(), index + 3);
-            }
+            bindings.bind(table, index, &buffers.get(tensor)?.raw);
+            bindings.bind(table, index + 3, &temporaries[index]);
         }
-        // SAFETY: Slot six exists and the parameter buffer is retained through completion.
-        unsafe {
-            table.setAddress_atIndex(temporaries[3].gpuAddress(), 6);
-        }
+        bindings.bind(table, 6, &temporaries[3]);
         drop(buffers);
         encoder.setArgumentTable(Some(table));
         let (threadgroups, threads) = row_dispatch_geometry(&pipeline, output.layout(), width)?;
@@ -610,8 +759,9 @@ impl MetalBackend {
         table: &ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>,
         dispatch: &Dispatch,
         kernel: &str,
+        bindings: &mut ArgumentBindings,
     ) -> Result<Vec<Retained<ProtocolObject<dyn MTLBuffer>>>, BackendError> {
-        use objc2_metal::{MTL4ArgumentTable, MTL4ComputeCommandEncoder, MTLSize};
+        use objc2_metal::{MTL4ComputeCommandEncoder, MTLSize};
 
         let operands = dispatch
             .inputs()
@@ -649,12 +799,8 @@ impl MetalBackend {
             .map_err(|_| BackendError::ExecutionFailed)?;
         for (index, tensor) in operands.iter().enumerate() {
             let buffer = buffers.get(tensor)?;
-            // SAFETY: The argument table has room for every operand and layout address, and all
-            // resources are retained through command-buffer completion.
-            unsafe {
-                table.setAddress_atIndex(buffer.raw.gpuAddress(), index);
-                table.setAddress_atIndex(layouts[index].gpuAddress(), index + operands.len());
-            }
+            bindings.bind(table, index, &buffer.raw);
+            bindings.bind(table, index + operands.len(), &layouts[index]);
         }
         drop(buffers);
         encoder.setArgumentTable(Some(table));
@@ -721,31 +867,67 @@ impl MetalBackend {
         Ok(command_buffer)
     }
 
+    fn command_resources(
+        &self,
+        tensors: &[Tensor],
+        encoded: EncodedDispatches,
+    ) -> Result<CommandResources, BackendError> {
+        let EncodedDispatches {
+            temporaries,
+            error_flags,
+            bindings,
+        } = encoded;
+        let mut indices = HashMap::<u64, usize>::new();
+        let mut owned = Vec::<InFlightBuffer>::new();
+        let mut add = |raw: MetalBufferRef| {
+            let address = raw.gpuAddress();
+            *indices.entry(address).or_insert_with(|| {
+                let index = owned.len();
+                owned.push(InFlightBuffer { raw });
+                index
+            })
+        };
+        {
+            let buffers = self
+                .buffers
+                .lock()
+                .map_err(|_| BackendError::ExecutionFailed)?;
+            for tensor in tensors {
+                add(buffers.get(tensor)?.raw.clone());
+            }
+        }
+        for temporary in temporaries {
+            add(temporary);
+        }
+        let error_flags = error_flags
+            .iter()
+            .map(|address| {
+                indices
+                    .get(address)
+                    .copied()
+                    .ok_or(BackendError::ExecutionFailed)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let owned_addresses = indices.keys().copied().collect::<HashSet<_>>();
+        debug_assert_eq!(bindings.addresses, owned_addresses);
+        Ok(CommandResources {
+            buffers: owned,
+            error_flags,
+        })
+    }
+
     fn make_resident(
         &self,
         command_buffer: &ProtocolObject<dyn MTL4CommandBuffer>,
-        tensors: &[Tensor],
-        temporaries: &[Retained<ProtocolObject<dyn MTLBuffer>>],
+        resources: &CommandResources,
     ) -> Result<Retained<ProtocolObject<dyn MTLResidencySet>>, BackendError> {
         let descriptor = MTLResidencySetDescriptor::new();
         let residency = self
             .device
             .newResidencySetWithDescriptor_error(&descriptor)
             .map_err(|_| BackendError::ExecutionFailed)?;
-        let mut seen = HashSet::<BufferId>::new();
-        let buffers = self
-            .buffers
-            .lock()
-            .map_err(|_| BackendError::ExecutionFailed)?;
-        for tensor in tensors.iter().filter(|tensor| seen.insert(tensor.buffer())) {
-            let buffer = buffers.get(tensor)?;
+        for buffer in &resources.buffers {
             let buffer: &ProtocolObject<dyn MTLBuffer> = &buffer.raw;
-            let allocation: &ProtocolObject<dyn MTLAllocation> = buffer.as_ref();
-            residency.addAllocation(allocation);
-        }
-        drop(buffers);
-        for buffer in temporaries {
-            let buffer: &ProtocolObject<dyn MTLBuffer> = buffer;
             let allocation: &ProtocolObject<dyn MTLAllocation> = buffer.as_ref();
             residency.addAllocation(allocation);
         }
@@ -758,7 +940,7 @@ impl MetalBackend {
         &self,
         tensors: &[Tensor],
         event: InFlightEvent,
-        temporaries: &[Retained<ProtocolObject<dyn MTLBuffer>>],
+        resources: CommandResources,
         residency: InFlightResidency,
     ) -> Result<Arc<Completion>, BackendError> {
         let mut seen = HashSet::<BufferId>::new();
@@ -770,21 +952,11 @@ impl MetalBackend {
             .buffers
             .lock()
             .map_err(|_| BackendError::ExecutionFailed)?;
-        let mut retained = Vec::with_capacity(unique.len().saturating_add(temporaries.len()));
         for tensor in &unique {
             let buffer = buffers.get_mut(tensor)?;
             buffer.wait_pending(self.gpu_timeout)?;
-            retained.push(InFlightBuffer {
-                _raw: buffer.raw.clone(),
-            });
         }
-        retained.extend(
-            temporaries
-                .iter()
-                .cloned()
-                .map(|raw| InFlightBuffer { _raw: raw }),
-        );
-        let completion = Completion::new(retained, event, residency);
+        let completion = Completion::new(resources, event, residency);
         for tensor in unique {
             buffers.get_mut(tensor)?.track(&completion);
         }
@@ -795,7 +967,7 @@ impl MetalBackend {
         &self,
         command_buffer: &Retained<ProtocolObject<dyn MTL4CommandBuffer>>,
         tensors: &[Tensor],
-        temporaries: &[Retained<ProtocolObject<dyn MTLBuffer>>],
+        resources: CommandResources,
         residency: Retained<ProtocolObject<dyn MTLResidencySet>>,
     ) -> Result<MetalSubmission, BackendError> {
         let event = self
@@ -805,7 +977,7 @@ impl MetalBackend {
         let completion = self.retain_tensors(
             tensors,
             InFlightEvent { raw: event.clone() },
-            temporaries,
+            resources,
             InFlightResidency { _raw: residency },
         )?;
         self.in_flight.track(&completion, &self.event_listener)?;
@@ -987,7 +1159,10 @@ mod tests {
             command_buffer.endCommandBuffer();
             let event = backend.device.newSharedEvent().unwrap();
             let completion = Completion::new(
-                Vec::new(),
+                CommandResources {
+                    buffers: Vec::new(),
+                    error_flags: Vec::new(),
+                },
                 InFlightEvent { raw: event.clone() },
                 InFlightResidency {
                     _raw: residency.clone(),
@@ -1339,6 +1514,77 @@ mod tests {
                 &TensorSpec::contiguous(dtype, &[1, 8, 128]),
             )
             .unwrap();
+        }
+    }
+
+    #[test]
+    fn metal_embed_matches_cpu_for_dtypes_ids_and_views() {
+        let reference = CpuBackend::new();
+        let candidate = MetalBackend::new().unwrap();
+        let ids = [0_u32, 32]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect::<Vec<_>>();
+        for dtype in [DType::F32, DType::F16, DType::BF16] {
+            for width in [1, 7, 33, 4097] {
+                assert_backends_agree(
+                    &reference,
+                    &candidate,
+                    Op::Embed,
+                    &[
+                        TensorSpec::contiguous(dtype, &[33, width]),
+                        TensorSpec::initialized(DType::U32, &[2], ids.clone()),
+                    ],
+                    &TensorSpec::contiguous(dtype, &[2, width]),
+                )
+                .unwrap();
+            }
+            assert_backends_agree(
+                &reference,
+                &candidate,
+                Op::Embed,
+                &[
+                    TensorSpec::permuted(dtype, &[128, 33], &[1, 0]),
+                    TensorSpec::initialized(DType::U32, &[2], ids.clone()),
+                ],
+                &TensorSpec::contiguous(dtype, &[2, 128]),
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn metal_embed_zeros_and_reports_an_out_of_range_id() {
+        let cases = [
+            (33, vec![33_u32], 33),
+            (6, vec![5_u32, u32::MAX], u32::MAX),
+            (6, vec![u32::MAX], u32::MAX),
+        ];
+        for (vocab, values, expected) in cases {
+            let backend = MetalBackend::new().unwrap();
+            let table = backend.alloc(DType::F32, &[vocab, 7]).unwrap();
+            let ids = backend
+                .alloc(DType::U32, &[u32::try_from(values.len()).unwrap()])
+                .unwrap();
+            let bytes = values
+                .into_iter()
+                .flat_map(u32::to_le_bytes)
+                .collect::<Vec<_>>();
+            backend.write(&ids, &bytes).unwrap();
+            let output = backend
+                .alloc(DType::F32, &[u32::try_from(bytes.len() / 4).unwrap(), 7])
+                .unwrap();
+            let mut commands = CommandList::new();
+            commands
+                .dispatch(Op::Embed, &[&table, &ids], &output)
+                .unwrap();
+
+            assert_eq!(
+                backend.submit(commands).unwrap().wait(),
+                Err(BackendError::IndexOutOfRange { index: expected })
+            );
+            let _completion_error = backend.read(&output);
+            assert_eq!(backend.read(&output).unwrap(), vec![0_u8; bytes.len() * 7]);
         }
     }
 }

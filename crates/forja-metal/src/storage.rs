@@ -45,9 +45,11 @@ impl MetalBuffer {
             let Some(completion) = pending.upgrade() else {
                 continue;
             };
-            if completion.wait(timeout).is_err() {
-                result = Err(BackendError::ExecutionFailed);
-                self.pending.push(Arc::downgrade(&completion));
+            if let Err(error) = completion.wait(timeout) {
+                result = Err(error);
+                if error == BackendError::ExecutionFailed {
+                    self.pending.push(Arc::downgrade(&completion));
+                }
             }
         }
         result

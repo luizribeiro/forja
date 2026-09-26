@@ -290,6 +290,39 @@ kernel void rope(
                 second * cosine + first * sine);
 }
 
+struct EmbedParams {
+    uint vocab;
+    uint width;
+};
+
+kernel void embed(
+    device const uchar *table [[buffer(0)]],
+    device const uint *ids [[buffer(1)]],
+    device uchar *output [[buffer(2)]],
+    constant TensorLayout &table_layout [[buffer(3)]],
+    constant TensorLayout &ids_layout [[buffer(4)]],
+    constant TensorLayout &output_layout [[buffer(5)]],
+    constant EmbedParams &params [[buffer(6)]],
+    device atomic_uint *error_flag [[buffer(7)]],
+    uint index [[thread_position_in_grid]]) {
+    if (index >= output_layout.element_count) {
+        return;
+    }
+    uint id_position = index / params.width;
+    uint column = index % params.width;
+    uint id = ids[physical_index(ids_layout, id_position)];
+    if (id >= params.vocab) {
+        store_float(output, physical_index(output_layout, index), output_dtype, 0.0f);
+        atomic_store_explicit(error_flag, 1, memory_order_relaxed);
+        atomic_fetch_min_explicit(error_flag + 1, id, memory_order_relaxed);
+        return;
+    }
+    uint table_index = id * params.width + column;
+    float value = load_float(
+        table, physical_index(table_layout, table_index), input0_dtype);
+    store_float(output, physical_index(output_layout, index), output_dtype, value);
+}
+
 kernel void silu_mul(
     device const uchar *gate [[buffer(0)]],
     device const uchar *up [[buffer(1)]],
