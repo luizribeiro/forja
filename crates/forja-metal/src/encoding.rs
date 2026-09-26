@@ -8,7 +8,7 @@ use std::{
 
 use block2::RcBlock;
 use forja_core::{
-    BackendError, BufferId, CommandList, DType, Dispatch, Layout, Submission, Tensor,
+    BackendError, BufferId, CommandList, DType, Dispatch, Layout, Op, Submission, Tensor,
     required_barriers,
 };
 use objc2::{rc::Retained, runtime::ProtocolObject};
@@ -95,7 +95,6 @@ impl Completion {
         buffers: Vec<InFlightBuffer>,
         event: InFlightEvent,
         residency: InFlightResidency,
-        force_error: bool,
     ) -> Arc<Self> {
         Arc::new_cyclic(|completion: &Weak<Self>| {
             let callback_completion = completion.clone();
@@ -103,7 +102,7 @@ impl Completion {
                 move |feedback: NonNull<ProtocolObject<dyn MTL4CommitFeedback>>| {
                     // SAFETY: Metal supplies a live, non-null feedback object for this call.
                     let feedback = unsafe { feedback.as_ref() };
-                    let result = if force_error || feedback.error().is_some() {
+                    let result = if feedback.error().is_some() {
                         Err(BackendError::ExecutionFailed)
                     } else {
                         Ok(())
@@ -293,16 +292,14 @@ impl MetalBackend {
         &self,
         commands: CommandList,
     ) -> Result<MetalSubmission, BackendError> {
-        self.submit_commands_with_result(commands, true)
-    }
-
-    fn submit_commands_with_result(
-        &self,
-        commands: CommandList,
-        fail_nonempty: bool,
-    ) -> Result<MetalSubmission, BackendError> {
         let barriers = required_barriers(&commands);
         let dispatches = commands.into_dispatches();
+        if dispatches
+            .iter()
+            .any(|dispatch| dispatch.op() != Op::SiluMul)
+        {
+            return Err(BackendError::InvalidInput);
+        }
         let tensors = dispatches
             .iter()
             .flat_map(|dispatch| {
@@ -317,20 +314,10 @@ impl MetalBackend {
             self.validate(tensor)?;
         }
         let command_buffer = self.begin_command_buffer()?;
-        let temporaries = if dispatches.is_empty() {
-            Vec::new()
-        } else {
-            self.encode_dispatches(&command_buffer, &dispatches, &barriers)?
-        };
+        let temporaries = self.encode_dispatches(&command_buffer, &dispatches, &barriers)?;
         let residency = self.make_resident(&command_buffer, &tensors, &temporaries)?;
         command_buffer.endCommandBuffer();
-        self.commit(
-            &command_buffer,
-            &tensors,
-            &temporaries,
-            residency,
-            fail_nonempty && !dispatches.is_empty(),
-        )
+        self.commit(&command_buffer, &tensors, &temporaries, residency)
     }
 
     fn encode_dispatches(
@@ -347,20 +334,17 @@ impl MetalBackend {
         let encoder = command_buffer
             .computeCommandEncoder()
             .ok_or(BackendError::ExecutionFailed)?;
-        let pipeline = self
-            .pipelines
-            .lock()
-            .map_err(|_| BackendError::ExecutionFailed)?
-            .get("hold", &[])?;
-        encoder.setComputePipelineState(&pipeline);
         let descriptor = MTL4ArgumentTableDescriptor::new();
-        descriptor.setMaxBufferBindCount(1);
+        descriptor.setMaxBufferBindCount(6);
         let table = self
             .device
             .newArgumentTableWithDescriptor_error(&descriptor)
             .map_err(|_| BackendError::ExecutionFailed)?;
         let mut temporaries = Vec::with_capacity(dispatches.len().saturating_mul(3));
         for (dispatch, &barrier) in dispatches.iter().zip(barriers) {
+            if dispatch.op() != Op::SiluMul {
+                return Err(BackendError::InvalidInput);
+            }
             if barrier {
                 encoder.barrierAfterEncoderStages_beforeEncoderStages_visibilityOptions(
                     MTLStages::Dispatch,
@@ -368,38 +352,64 @@ impl MetalBackend {
                     MTL4VisibilityOptions::Device,
                 );
             }
-            for tensor in dispatch
-                .inputs()
-                .iter()
-                .chain(std::iter::once(dispatch.output()))
-            {
-                let _code = dtype_code(tensor.layout().dtype())?;
-                temporaries.push(self.layout_buffer(tensor.layout())?);
-            }
+            let [gate, up] = dispatch.inputs() else {
+                return Err(BackendError::InvalidInput);
+            };
+            let inputs = [gate, up];
+            let constants = [
+                (0, dtype_code(inputs[0].layout().dtype())?),
+                (1, dtype_code(inputs[1].layout().dtype())?),
+                (2, dtype_code(dispatch.output().layout().dtype())?),
+            ];
+            let pipeline = self
+                .pipelines
+                .lock()
+                .map_err(|_| BackendError::ExecutionFailed)?
+                .get("silu_mul", &constants)?;
+            encoder.setComputePipelineState(&pipeline);
+            let layouts = [
+                self.layout_buffer(inputs[0].layout())?,
+                self.layout_buffer(inputs[1].layout())?,
+                self.layout_buffer(dispatch.output().layout())?,
+            ];
             let buffers = self
                 .buffers
                 .lock()
                 .map_err(|_| BackendError::ExecutionFailed)?;
+            let gate = buffers.get(inputs[0])?;
+            let up = buffers.get(inputs[1])?;
             let output = buffers.get(dispatch.output())?;
-            // SAFETY: The descriptor created one buffer slot, index zero is in range, and the
-            // registered buffer remains live while the command buffer is encoded.
+            // SAFETY: The descriptor created six buffer slots, indices zero through five are
+            // in range, and every address comes from a live buffer retained through completion.
             unsafe {
-                table.setAddress_atIndex(output.raw.gpuAddress(), 0);
+                table.setAddress_atIndex(gate.raw.gpuAddress(), 0);
+                table.setAddress_atIndex(up.raw.gpuAddress(), 1);
+                table.setAddress_atIndex(output.raw.gpuAddress(), 2);
+                table.setAddress_atIndex(layouts[0].gpuAddress(), 3);
+                table.setAddress_atIndex(layouts[1].gpuAddress(), 4);
+                table.setAddress_atIndex(layouts[2].gpuAddress(), 5);
             }
             drop(buffers);
             encoder.setArgumentTable(Some(&table));
-            encoder.dispatchThreads_threadsPerThreadgroup(
+            let element_count = u32::try_from(dispatch.output().layout().element_count())
+                .map_err(|_| BackendError::InvalidInput)?;
+            let thread_count =
+                usize::try_from(element_count).map_err(|_| BackendError::ExecutionFailed)?;
+            let group_width = pipeline.maxTotalThreadsPerThreadgroup().clamp(1, 256);
+            let threadgroups = thread_count.div_ceil(group_width);
+            encoder.dispatchThreadgroups_threadsPerThreadgroup(
                 MTLSize {
-                    width: 1,
+                    width: threadgroups,
                     height: 1,
                     depth: 1,
                 },
                 MTLSize {
-                    width: 1,
+                    width: group_width,
                     height: 1,
                     depth: 1,
                 },
             );
+            temporaries.extend(layouts);
         }
         encoder.endEncoding();
         Ok(temporaries)
@@ -482,7 +492,6 @@ impl MetalBackend {
         event: InFlightEvent,
         temporaries: &[Retained<ProtocolObject<dyn MTLBuffer>>],
         residency: InFlightResidency,
-        force_error: bool,
     ) -> Result<Arc<Completion>, BackendError> {
         let mut seen = HashSet::<BufferId>::new();
         let unique = tensors
@@ -507,7 +516,7 @@ impl MetalBackend {
                 .cloned()
                 .map(|raw| InFlightBuffer { _raw: raw }),
         );
-        let completion = Completion::new(retained, event, residency, force_error);
+        let completion = Completion::new(retained, event, residency);
         for tensor in unique {
             buffers.get_mut(tensor)?.track(&completion);
         }
@@ -520,7 +529,6 @@ impl MetalBackend {
         tensors: &[Tensor],
         temporaries: &[Retained<ProtocolObject<dyn MTLBuffer>>],
         residency: Retained<ProtocolObject<dyn MTLResidencySet>>,
-        force_error: bool,
     ) -> Result<MetalSubmission, BackendError> {
         let event = self
             .device
@@ -531,7 +539,6 @@ impl MetalBackend {
             InFlightEvent { raw: event.clone() },
             temporaries,
             InFlightResidency { _raw: residency },
-            force_error,
         )?;
         self.in_flight.track(&completion, &self.event_listener)?;
         let command_buffer_ref: &ProtocolObject<dyn MTL4CommandBuffer> = command_buffer;
@@ -651,6 +658,8 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use forja_core::{Backend, CommandList, DType, Op, Submission};
+    use forja_cpu::CpuBackend;
+    use forja_testing::{TensorSpec, assert_backends_agree};
     use objc2_metal::{MTL4CommandQueue, MTLEvent};
 
     use super::*;
@@ -659,22 +668,6 @@ mod tests {
     fn metal_compile_error_is_reported() {
         let backend = MetalBackend::new().unwrap();
         assert!(PipelineCache::new(&backend.device, "kernel void broken(").is_err());
-    }
-
-    #[test]
-    fn unimplemented_dispatch_reports_execution_failure() {
-        let backend = MetalBackend::new().unwrap();
-        let left = backend.alloc(DType::F32, &[7]).unwrap();
-        let right = backend.alloc(DType::F32, &[7]).unwrap();
-        let output = backend.alloc(DType::F32, &[7]).unwrap();
-        let mut commands = CommandList::new();
-        commands
-            .dispatch(Op::SiluMul, &[&left, &right], &output)
-            .unwrap();
-        assert_eq!(
-            backend.submit(commands).unwrap().wait(),
-            Err(BackendError::ExecutionFailed)
-        );
     }
 
     #[test]
@@ -698,7 +691,6 @@ mod tests {
                 InFlightResidency {
                     _raw: residency.clone(),
                 },
-                false,
             );
             completion.finish(Ok(()));
             backend
@@ -743,9 +735,7 @@ mod tests {
             commands
                 .dispatch(Op::SiluMul, &[&gate, &up], &output)
                 .unwrap();
-            let submission = backend
-                .submit_commands_with_result(commands, false)
-                .unwrap();
+            let submission = backend.submit(commands).unwrap();
             drop(submission);
             backend.release(&gate).unwrap();
             backend.release(&up).unwrap();
@@ -755,9 +745,67 @@ mod tests {
     }
 
     #[test]
-    fn submillisecond_gpu_timeouts_do_not_round_up() {
+    fn timed_out_work_never_exposes_an_active_output() {
         let backend = MetalBackend::with_gpu_timeout(Duration::from_micros(1)).unwrap();
-        assert_eq!(backend.gpu_timeout, Duration::from_micros(1));
-        assert_eq!(timeout_millis(backend.gpu_timeout), 0);
+        let shape = [1024, 4097];
+        let gate = backend.alloc(DType::F32, &shape).unwrap();
+        let up = backend.alloc(DType::F32, &shape).unwrap();
+        let output = backend.alloc(DType::F32, &shape).unwrap();
+        let mut commands = CommandList::new();
+        commands
+            .dispatch(Op::SiluMul, &[&gate, &up], &output)
+            .unwrap();
+
+        assert_eq!(
+            backend.submit(commands).unwrap().wait(),
+            Err(BackendError::ExecutionFailed)
+        );
+        match backend.read(&output) {
+            Ok(bytes) => assert_eq!(bytes.len(), 1024 * 4097 * 4),
+            Err(error) => assert_eq!(error, BackendError::ExecutionFailed),
+        }
+    }
+
+    #[test]
+    fn metal_silu_mul_matches_cpu_for_dtypes_shapes_and_views() {
+        let reference = CpuBackend::new();
+        let candidate = MetalBackend::new().unwrap();
+        for dtype in [DType::F32, DType::F16, DType::BF16] {
+            for shape in [&[7, 3072][..], &[1, 3072], &[33, 4097]] {
+                let inputs = [
+                    TensorSpec::contiguous(dtype, shape),
+                    TensorSpec::contiguous(dtype, shape),
+                ];
+                let output = TensorSpec::contiguous(dtype, shape);
+                assert_backends_agree(&reference, &candidate, Op::SiluMul, &inputs, &output)
+                    .unwrap();
+            }
+        }
+
+        let permuted = [
+            TensorSpec::permuted(DType::F32, &[3072, 7], &[1, 0]),
+            TensorSpec::contiguous(DType::F32, &[7, 3072]),
+        ];
+        assert_backends_agree(
+            &reference,
+            &candidate,
+            Op::SiluMul,
+            &permuted,
+            &TensorSpec::contiguous(DType::F32, &[7, 3072]),
+        )
+        .unwrap();
+
+        let mixed = [
+            TensorSpec::contiguous(DType::F16, &[7, 3072]),
+            TensorSpec::contiguous(DType::BF16, &[7, 3072]),
+        ];
+        assert_backends_agree(
+            &reference,
+            &candidate,
+            Op::SiluMul,
+            &mixed,
+            &TensorSpec::contiguous(DType::F32, &[7, 3072]),
+        )
+        .unwrap();
     }
 }

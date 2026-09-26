@@ -45,3 +45,7 @@ unsafe_op_in_unsafe_fn = "deny"
 
 [lints.clippy]
 pedantic = "warn"
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+forja-cpu = { path = "../forja-cpu" }
+forja-testing = { path = "../../support/forja-testing" }
