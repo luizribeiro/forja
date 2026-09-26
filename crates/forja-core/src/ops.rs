@@ -28,6 +28,20 @@ impl BufferId {
     pub const fn backend(self) -> u64 {
         self.backend
     }
+
+    /// Returns the backend-local allocation identity.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn allocation(self) -> u64 {
+        self.allocation
+    }
+
+    /// Returns the registered allocation length.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn byte_len(self) -> u64 {
+        self.byte_len
+    }
 }
 
 /// A reason tensor construction failed.

@@ -1,6 +1,113 @@
-use std::{error::Error, fmt};
+use std::{
+    collections::HashMap,
+    error::Error,
+    fmt,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
-use crate::{CommandList, DType, Slice, Tensor};
+use crate::{BufferId, CommandList, DType, Slice, Tensor};
+
+static NEXT_BACKEND: AtomicU64 = AtomicU64::new(1);
+
+/// Live allocations owned by one backend instance.
+#[derive(Debug)]
+pub struct AllocationRegistry<S> {
+    backend: u64,
+    next_allocation: u64,
+    allocations: HashMap<u64, Allocation<S>>,
+}
+
+#[derive(Debug)]
+struct Allocation<S> {
+    storage: S,
+    byte_len: u64,
+}
+
+impl<S> AllocationRegistry<S> {
+    /// Creates an empty registry with a unique backend identity.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            backend: NEXT_BACKEND.fetch_add(1, Ordering::Relaxed),
+            next_allocation: 0,
+            allocations: HashMap::new(),
+        }
+    }
+
+    /// Registers storage and returns its allocation identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BackendError::AllocationFailed`] if allocation identities are exhausted.
+    pub fn insert(&mut self, storage: S, byte_len: u64) -> Result<BufferId, BackendError> {
+        let allocation = self.next_allocation;
+        self.next_allocation = allocation
+            .checked_add(1)
+            .ok_or(BackendError::AllocationFailed)?;
+        self.allocations
+            .insert(allocation, Allocation { storage, byte_len });
+        Ok(BufferId::new(self.backend, allocation, byte_len))
+    }
+
+    /// Returns storage after validating that the tensor names this live allocation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BackendError::InvalidInput`] for a foreign, released, or length-mismatched tensor.
+    pub fn get(&self, tensor: &Tensor) -> Result<&S, BackendError> {
+        let allocation = self.validate(tensor)?;
+        Ok(&allocation.storage)
+    }
+
+    /// Returns mutable storage after validating that the tensor names this live allocation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BackendError::InvalidInput`] for a foreign, released, or length-mismatched tensor.
+    pub fn get_mut(&mut self, tensor: &Tensor) -> Result<&mut S, BackendError> {
+        self.validate(tensor)?;
+        self.allocations
+            .get_mut(&tensor.buffer().allocation())
+            .map(|allocation| &mut allocation.storage)
+            .ok_or(BackendError::InvalidInput)
+    }
+
+    /// Removes and returns storage after validating its tensor identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BackendError::InvalidInput`] for a foreign, released, or length-mismatched tensor.
+    pub fn remove(&mut self, tensor: &Tensor) -> Result<S, BackendError> {
+        self.validate(tensor)?;
+        self.allocations
+            .remove(&tensor.buffer().allocation())
+            .map(|allocation| allocation.storage)
+            .ok_or(BackendError::InvalidInput)
+    }
+
+    fn validate(&self, tensor: &Tensor) -> Result<&Allocation<S>, BackendError> {
+        let id = tensor.buffer();
+        if id.backend() != self.backend {
+            return Err(BackendError::InvalidInput);
+        }
+        let allocation = self
+            .allocations
+            .get(&id.allocation())
+            .ok_or(BackendError::InvalidInput)?;
+        if allocation.byte_len != id.byte_len()
+            || allocation.byte_len != tensor.layout().buffer_len()
+        {
+            return Err(BackendError::InvalidInput);
+        }
+        Ok(allocation)
+    }
+}
+
+impl<S> Default for AllocationRegistry<S> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// A metadata-only transformation applied to a tensor.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -80,6 +187,12 @@ pub trait Backend {
     ///
     /// Returns invalid input for a foreign tensor.
     fn read(&self, tensor: &Tensor) -> Result<Vec<u8>, BackendError>;
+    /// Releases the allocation underlying a tensor and all of its views.
+    ///
+    /// # Errors
+    ///
+    /// Returns invalid input for a foreign or already released tensor.
+    fn release(&self, tensor: &Tensor) -> Result<(), BackendError>;
     /// Submits a validated command list.
     ///
     /// # Errors

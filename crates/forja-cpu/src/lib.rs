@@ -1,44 +1,17 @@
 //! Reference CPU execution for Forja operations.
 
-use std::{
-    collections::HashMap,
-    sync::{
-        Mutex,
-        atomic::{AtomicU64, Ordering},
-    },
-};
+use std::sync::Mutex;
 
 use forja_core::{
-    Backend, BackendError, BufferId, CommandList, DType, Layout, Op, Submission, Tensor, ViewOp,
+    AllocationRegistry, Backend, BackendError, CommandList, DType, Layout, Op, Submission, Tensor,
+    ViewOp,
 };
 use half::{bf16, f16};
-
-static NEXT_BACKEND: AtomicU64 = AtomicU64::new(1);
 
 /// A straightforward, single-process reference backend.
 #[derive(Debug)]
 pub struct CpuBackend {
-    id: u64,
-    state: Mutex<State>,
-}
-
-#[derive(Debug, Default)]
-struct State {
-    next_allocation: u64,
-    buffers: HashMap<BufferId, Vec<u8>>,
-}
-
-impl State {
-    fn validate(&self, tensor: &Tensor) -> Result<(), BackendError> {
-        let bytes = self
-            .buffers
-            .get(&tensor.buffer())
-            .ok_or(BackendError::InvalidInput)?;
-        if u64::try_from(bytes.len()).ok() != Some(tensor.layout().buffer_len()) {
-            return Err(BackendError::InvalidInput);
-        }
-        Ok(())
-    }
+    buffers: Mutex<AllocationRegistry<Vec<u8>>>,
 }
 
 impl CpuBackend {
@@ -46,8 +19,7 @@ impl CpuBackend {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            id: NEXT_BACKEND.fetch_add(1, Ordering::Relaxed),
-            state: Mutex::new(State::default()),
+            buffers: Mutex::new(AllocationRegistry::new()),
         }
     }
 
@@ -67,16 +39,11 @@ impl CpuBackend {
             .try_reserve_exact(len)
             .map_err(|_| BackendError::AllocationFailed)?;
         bytes.resize(len, 0);
-        let mut state = self
-            .state
+        let mut buffers = self
+            .buffers
             .lock()
             .map_err(|_| BackendError::ExecutionFailed)?;
-        let allocation = state.next_allocation;
-        state.next_allocation = allocation
-            .checked_add(1)
-            .ok_or(BackendError::AllocationFailed)?;
-        let buffer = BufferId::new(self.id, allocation, byte_len);
-        state.buffers.insert(buffer, bytes);
+        let buffer = buffers.insert(bytes, byte_len)?;
         let layout = Layout::contiguous(dtype, 0, shape.to_vec(), byte_len)
             .map_err(|_| BackendError::InvalidInput)?;
         Tensor::new(buffer, layout).map_err(|_| BackendError::InvalidInput)
@@ -88,10 +55,10 @@ impl CpuBackend {
     ///
     /// Returns invalid input for an unknown allocation or invalid view.
     pub fn view(&self, tensor: &Tensor, op: ViewOp) -> Result<Tensor, BackendError> {
-        self.state
+        self.buffers
             .lock()
             .map_err(|_| BackendError::ExecutionFailed)?
-            .validate(tensor)?;
+            .get(tensor)?;
         let layout = match op {
             ViewOp::Slice(spec) => tensor.layout().slice(&spec),
             ViewOp::Reshape(shape) => tensor.layout().reshape(&shape),
@@ -114,15 +81,13 @@ impl CpuBackend {
         let range = tensor.layout().byte_span();
         let range = usize::try_from(range.start).map_err(|_| BackendError::InvalidInput)?
             ..usize::try_from(range.end).map_err(|_| BackendError::InvalidInput)?;
-        let mut state = self
-            .state
+        let mut buffers = self
+            .buffers
             .lock()
             .map_err(|_| BackendError::ExecutionFailed)?;
-        state.validate(tensor)?;
-        state
-            .buffers
-            .get_mut(&tensor.buffer())
-            .and_then(|target| target.get_mut(range))
+        buffers
+            .get_mut(tensor)?
+            .get_mut(range)
             .ok_or(BackendError::InvalidInput)?
             .copy_from_slice(bytes);
         Ok(())
@@ -134,23 +99,33 @@ impl CpuBackend {
     ///
     /// Returns invalid input for an unknown allocation.
     pub fn read(&self, tensor: &Tensor) -> Result<Vec<u8>, BackendError> {
-        let state = self
-            .state
+        let buffers = self
+            .buffers
             .lock()
             .map_err(|_| BackendError::ExecutionFailed)?;
-        state.validate(tensor)?;
-        let source = state
-            .buffers
-            .get(&tensor.buffer())
-            .ok_or(BackendError::InvalidInput)?;
+        let source = buffers.get(tensor)?;
         gather(source, tensor.layout())
     }
 
-    fn validate(&self, tensor: &Tensor) -> Result<(), BackendError> {
-        self.state
+    /// Releases a tensor's allocation and invalidates all of its views.
+    ///
+    /// # Errors
+    ///
+    /// Returns invalid input for an unknown allocation.
+    pub fn release(&self, tensor: &Tensor) -> Result<(), BackendError> {
+        self.buffers
             .lock()
             .map_err(|_| BackendError::ExecutionFailed)?
-            .validate(tensor)
+            .remove(tensor)?;
+        Ok(())
+    }
+
+    fn validate(&self, tensor: &Tensor) -> Result<(), BackendError> {
+        self.buffers
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?
+            .get(tensor)
+            .map(|_| ())
     }
 
     fn execute_copy(&self, inputs: &[Tensor], output: &Tensor) -> Result<(), BackendError> {
@@ -180,14 +155,11 @@ impl CpuBackend {
     fn write_output(&self, output: &Tensor, values: &[f32]) -> Result<(), BackendError> {
         let converted =
             encode(values, output.layout().dtype()).ok_or(BackendError::ExecutionFailed)?;
-        let mut state = self
-            .state
+        let mut buffers = self
+            .buffers
             .lock()
             .map_err(|_| BackendError::ExecutionFailed)?;
-        let target = state
-            .buffers
-            .get_mut(&output.buffer())
-            .ok_or(BackendError::InvalidInput)?;
+        let target = buffers.get_mut(output)?;
         scatter(target, output.layout(), &converted)
     }
 
@@ -439,6 +411,10 @@ impl Backend for CpuBackend {
         CpuBackend::read(self, tensor)
     }
 
+    fn release(&self, tensor: &Tensor) -> Result<(), BackendError> {
+        CpuBackend::release(self, tensor)
+    }
+
     fn submit(&self, commands: CommandList) -> Result<Self::Submission, BackendError> {
         let dispatches = commands.into_dispatches();
         for dispatch in &dispatches {
@@ -624,7 +600,7 @@ fn encode(source: &[f32], output: DType) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use forja_core::{Op, Slice};
+    use forja_core::{BufferId, Op, Slice};
 
     #[test]
     fn rejects_unknown_foreign_and_wrong_length_tensors() {
@@ -648,6 +624,18 @@ mod tests {
             Err(BackendError::InvalidInput)
         );
         assert_eq!(backend.read(&foreign), Err(BackendError::InvalidInput));
+    }
+
+    #[test]
+    fn rejects_every_view_after_releasing_its_allocation() {
+        let backend = CpuBackend::new();
+        let tensor = backend.alloc(DType::F32, &[2, 3]).unwrap();
+        let view = backend.view(&tensor, ViewOp::Permute(vec![1, 0])).unwrap();
+        backend.release(&view).unwrap();
+
+        assert_eq!(backend.read(&tensor), Err(BackendError::InvalidInput));
+        assert_eq!(backend.read(&view), Err(BackendError::InvalidInput));
+        assert_eq!(backend.release(&tensor), Err(BackendError::InvalidInput));
     }
 
     #[test]

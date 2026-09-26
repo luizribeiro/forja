@@ -6,7 +6,7 @@ mod layout;
 mod ops;
 mod quantized;
 
-pub use backend::{Backend, BackendError, Submission, ViewOp};
+pub use backend::{AllocationRegistry, Backend, BackendError, Submission, ViewOp};
 pub use layout::{Layout, LayoutError, MAX_RANK, Slice, byte_ranges_overlap, is_injective};
 pub use ops::{BufferId, CommandList, Dispatch, Op, OpError, Operand, Tensor, TensorError};
 pub use quantized::{QuantizedMatrix, QuantizedMatrixError, QuantizedMatrixPart};
