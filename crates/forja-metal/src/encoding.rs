@@ -327,8 +327,7 @@ impl MetalBackend {
         barriers: &[bool],
     ) -> Result<Vec<Retained<ProtocolObject<dyn MTLBuffer>>>, BackendError> {
         use objc2_metal::{
-            MTL4ArgumentTable, MTL4ArgumentTableDescriptor, MTL4CommandEncoder,
-            MTL4ComputeCommandEncoder, MTL4VisibilityOptions, MTLSize, MTLStages,
+            MTL4ArgumentTableDescriptor, MTL4CommandEncoder, MTL4VisibilityOptions, MTLStages,
         };
 
         let encoder = command_buffer
@@ -352,67 +351,77 @@ impl MetalBackend {
                     MTL4VisibilityOptions::Device,
                 );
             }
-            let [gate, up] = dispatch.inputs() else {
-                return Err(BackendError::InvalidInput);
-            };
-            let inputs = [gate, up];
-            let constants = [
-                (0, dtype_code(inputs[0].layout().dtype())?),
-                (1, dtype_code(inputs[1].layout().dtype())?),
-                (2, dtype_code(dispatch.output().layout().dtype())?),
-            ];
-            let pipeline = self
-                .pipelines
-                .lock()
-                .map_err(|_| BackendError::ExecutionFailed)?
-                .get("silu_mul", &constants)?;
-            encoder.setComputePipelineState(&pipeline);
-            let layouts = [
-                self.layout_buffer(inputs[0].layout())?,
-                self.layout_buffer(inputs[1].layout())?,
-                self.layout_buffer(dispatch.output().layout())?,
-            ];
-            let buffers = self
-                .buffers
-                .lock()
-                .map_err(|_| BackendError::ExecutionFailed)?;
-            let gate = buffers.get(inputs[0])?;
-            let up = buffers.get(inputs[1])?;
-            let output = buffers.get(dispatch.output())?;
-            // SAFETY: The descriptor created six buffer slots, indices zero through five are
-            // in range, and every address comes from a live buffer retained through completion.
-            unsafe {
-                table.setAddress_atIndex(gate.raw.gpuAddress(), 0);
-                table.setAddress_atIndex(up.raw.gpuAddress(), 1);
-                table.setAddress_atIndex(output.raw.gpuAddress(), 2);
-                table.setAddress_atIndex(layouts[0].gpuAddress(), 3);
-                table.setAddress_atIndex(layouts[1].gpuAddress(), 4);
-                table.setAddress_atIndex(layouts[2].gpuAddress(), 5);
-            }
-            drop(buffers);
-            encoder.setArgumentTable(Some(&table));
-            let element_count = u32::try_from(dispatch.output().layout().element_count())
-                .map_err(|_| BackendError::InvalidInput)?;
-            let thread_count =
-                usize::try_from(element_count).map_err(|_| BackendError::ExecutionFailed)?;
-            let group_width = pipeline.maxTotalThreadsPerThreadgroup().clamp(1, 256);
-            let threadgroups = thread_count.div_ceil(group_width);
-            encoder.dispatchThreadgroups_threadsPerThreadgroup(
-                MTLSize {
-                    width: threadgroups,
-                    height: 1,
-                    depth: 1,
-                },
-                MTLSize {
-                    width: group_width,
-                    height: 1,
-                    depth: 1,
-                },
-            );
-            temporaries.extend(layouts);
+            temporaries.extend(self.encode_elementwise(&encoder, &table, dispatch, "silu_mul")?);
         }
         encoder.endEncoding();
         Ok(temporaries)
+    }
+
+    fn encode_elementwise(
+        &self,
+        encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
+        table: &ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>,
+        dispatch: &Dispatch,
+        kernel: &str,
+    ) -> Result<Vec<Retained<ProtocolObject<dyn MTLBuffer>>>, BackendError> {
+        use objc2_metal::{MTL4ArgumentTable, MTL4ComputeCommandEncoder, MTLSize};
+
+        let operands = dispatch
+            .inputs()
+            .iter()
+            .chain(std::iter::once(dispatch.output()))
+            .collect::<Vec<_>>();
+        let constants = operands
+            .iter()
+            .enumerate()
+            .map(|(index, tensor)| {
+                Ok((
+                    u32::try_from(index).map_err(|_| BackendError::InvalidInput)?,
+                    dtype_code(tensor.layout().dtype())?,
+                ))
+            })
+            .collect::<Result<Vec<_>, BackendError>>()?;
+        let pipeline = self
+            .pipelines
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?
+            .get(kernel, &constants)?;
+        encoder.setComputePipelineState(&pipeline);
+        let layouts = operands
+            .iter()
+            .map(|tensor| self.layout_buffer(tensor.layout()))
+            .collect::<Result<Vec<_>, _>>()?;
+        let buffers = self
+            .buffers
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?;
+        for (index, tensor) in operands.iter().enumerate() {
+            let buffer = buffers.get(tensor)?;
+            // SAFETY: The argument table has room for every operand and layout address, and all
+            // resources are retained through command-buffer completion.
+            unsafe {
+                table.setAddress_atIndex(buffer.raw.gpuAddress(), index);
+                table.setAddress_atIndex(layouts[index].gpuAddress(), index + operands.len());
+            }
+        }
+        drop(buffers);
+        encoder.setArgumentTable(Some(table));
+        let thread_count = usize::try_from(dispatch.output().layout().element_count())
+            .map_err(|_| BackendError::ExecutionFailed)?;
+        let group_width = pipeline.maxTotalThreadsPerThreadgroup().clamp(1, 256);
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(
+            MTLSize {
+                width: thread_count.div_ceil(group_width),
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: group_width,
+                height: 1,
+                depth: 1,
+            },
+        );
+        Ok(layouts)
     }
 
     fn layout_buffer(

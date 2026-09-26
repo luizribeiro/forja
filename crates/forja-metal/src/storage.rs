@@ -92,7 +92,12 @@ impl MetalBackend {
         let queue = device
             .newMTL4CommandQueue()
             .ok_or(BackendError::ExecutionFailed)?;
-        let pipelines = PipelineCache::new(&device, include_str!("kernels.metal"))?;
+        let source = concat!(
+            include_str!("elementwise.metal"),
+            "\n",
+            include_str!("kernels.metal")
+        );
+        let pipelines = PipelineCache::new(&device, source)?;
         let event_listener = MTLSharedEventListener::new();
         Ok(Self {
             device,
