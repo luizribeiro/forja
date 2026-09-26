@@ -52,6 +52,16 @@ impl TensorSpec {
             view: Some(ViewOp::Slice(slices.to_vec())),
         }
     }
+
+    /// Describes a tensor viewed through zero-stride broadcasting.
+    #[must_use]
+    pub fn broadcast(dtype: DType, allocation_shape: &[u32], shape: &[u32]) -> Self {
+        Self {
+            dtype,
+            allocation_shape: allocation_shape.to_vec(),
+            view: Some(ViewOp::Broadcast(shape.to_vec())),
+        }
+    }
 }
 
 /// A deterministic xorshift64 value source.

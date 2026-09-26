@@ -296,7 +296,7 @@ impl MetalBackend {
         let dispatches = commands.into_dispatches();
         if dispatches
             .iter()
-            .any(|dispatch| !matches!(dispatch.op(), Op::Copy | Op::SiluMul))
+            .any(|dispatch| !matches!(dispatch.op(), Op::Copy | Op::Add | Op::SiluMul))
         {
             return Err(BackendError::InvalidInput);
         }
@@ -356,6 +356,16 @@ impl MetalBackend {
                     "copy_contiguous"
                 }
                 Op::Copy => "copy_strided",
+                Op::Add
+                    if dispatch
+                        .inputs()
+                        .iter()
+                        .chain(std::iter::once(dispatch.output()))
+                        .all(|tensor| tensor.layout().is_contiguous()) =>
+                {
+                    "add_contiguous"
+                }
+                Op::Add => "add_strided",
                 Op::SiluMul => "silu_mul",
                 _ => return Err(BackendError::InvalidInput),
             };
@@ -886,5 +896,35 @@ mod tests {
             &TensorSpec::sliced(DType::F16, &[8, 4096, 128], &slices),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn metal_add_matches_cpu_for_dtypes_shapes_and_views() {
+        let reference = CpuBackend::new();
+        let candidate = MetalBackend::new().unwrap();
+        for dtype in [DType::F32, DType::F16, DType::BF16] {
+            for width in [1, 7, 33, 4097] {
+                let input = TensorSpec::contiguous(dtype, &[width]);
+                assert_backends_agree(
+                    &reference,
+                    &candidate,
+                    Op::Add,
+                    &[input.clone(), input],
+                    &TensorSpec::contiguous(dtype, &[width]),
+                )
+                .unwrap();
+            }
+            assert_backends_agree(
+                &reference,
+                &candidate,
+                Op::Add,
+                &[
+                    TensorSpec::permuted(dtype, &[7, 33], &[1, 0]),
+                    TensorSpec::broadcast(dtype, &[1, 7], &[33, 7]),
+                ],
+                &TensorSpec::contiguous(dtype, &[33, 7]),
+            )
+            .unwrap();
+        }
     }
 }

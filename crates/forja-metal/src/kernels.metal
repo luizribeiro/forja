@@ -33,6 +33,38 @@ kernel void copy_contiguous(
     }
 }
 
+kernel void add_strided(
+    device const uchar *left [[buffer(0)]],
+    device const uchar *right [[buffer(1)]],
+    device uchar *output [[buffer(2)]],
+    constant TensorLayout &left_layout [[buffer(3)]],
+    constant TensorLayout &right_layout [[buffer(4)]],
+    constant TensorLayout &output_layout [[buffer(5)]],
+    uint index [[thread_position_in_grid]]) {
+    if (index < output_layout.element_count) {
+        float result =
+            load_float(left, physical_index(left_layout, index), input0_dtype) +
+            load_float(right, physical_index(right_layout, index), input1_dtype);
+        store_float(output, physical_index(output_layout, index), output_dtype, result);
+    }
+}
+
+kernel void add_contiguous(
+    device const uchar *left [[buffer(0)]],
+    device const uchar *right [[buffer(1)]],
+    device uchar *output [[buffer(2)]],
+    constant TensorLayout &left_layout [[buffer(3)]],
+    constant TensorLayout &right_layout [[buffer(4)]],
+    constant TensorLayout &output_layout [[buffer(5)]],
+    uint index [[thread_position_in_grid]]) {
+    if (index < output_layout.element_count) {
+        float result =
+            load_float(left, left_layout.offset + index, input0_dtype) +
+            load_float(right, right_layout.offset + index, input1_dtype);
+        store_float(output, output_layout.offset + index, output_dtype, result);
+    }
+}
+
 kernel void silu_mul(
     device const uchar *gate [[buffer(0)]],
     device const uchar *up [[buffer(1)]],
