@@ -42,6 +42,17 @@ pub enum LayoutError {
         /// The repeated axis number.
         axis: u8,
     },
+    /// A broadcast target has fewer axes than its source.
+    BroadcastRankReduction,
+    /// A source extent cannot broadcast to its target extent.
+    BroadcastDimensionMismatch {
+        /// The target axis containing the mismatch.
+        axis: usize,
+        /// The source extent.
+        source: u32,
+        /// The requested target extent.
+        target: u32,
+    },
 }
 
 impl fmt::Display for LayoutError {
@@ -73,6 +84,17 @@ impl fmt::Display for LayoutError {
             Self::DuplicatePermutationAxis { axis } => {
                 write!(formatter, "permutation axis {axis} appears more than once")
             }
+            Self::BroadcastRankReduction => {
+                formatter.write_str("broadcast target cannot remove axes")
+            }
+            Self::BroadcastDimensionMismatch {
+                axis,
+                source,
+                target,
+            } => write!(
+                formatter,
+                "source extent {source} cannot broadcast to {target} on axis {axis}"
+            ),
         }
     }
 }
@@ -314,6 +336,46 @@ impl Layout {
             .collect();
         Self::new(self.dtype, self.offset, shape, strides, self.buffer_len)
     }
+
+    /// Creates a view broadcast to `target_shape` using `NumPy` rules.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LayoutError`] when the target removes axes, corresponding
+    /// extents are neither equal nor size one, or revalidation fails.
+    pub fn broadcast(&self, target_shape: &[u32]) -> Result<Self, LayoutError> {
+        if target_shape.len() > MAX_RANK {
+            return Err(LayoutError::RankTooLarge);
+        }
+        let leading = target_shape
+            .len()
+            .checked_sub(self.shape.len())
+            .ok_or(LayoutError::BroadcastRankReduction)?;
+        let mut strides = vec![0; leading];
+        for (source_axis, (&source, &target)) in
+            self.shape.iter().zip(&target_shape[leading..]).enumerate()
+        {
+            let stride = match (source, target) {
+                (source, target) if source == target => self.strides[source_axis],
+                (1, _) => 0,
+                _ => {
+                    return Err(LayoutError::BroadcastDimensionMismatch {
+                        axis: leading + source_axis,
+                        source,
+                        target,
+                    });
+                }
+            };
+            strides.push(stride);
+        }
+        Self::new(
+            self.dtype,
+            self.offset,
+            target_shape.to_vec(),
+            strides,
+            self.buffer_len,
+        )
+    }
 }
 
 fn element_count(shape: &[u32]) -> Result<u64, LayoutError> {
@@ -457,7 +519,62 @@ mod tests {
         );
     }
 
+    #[test]
+    fn broadcasts_q_heads_across_sequence() {
+        let layout = Layout::contiguous(DType::F16, 0, vec![1, 16, 128], 4096).unwrap();
+        let broadcast = layout.broadcast(&[33, 16, 128]).unwrap();
+        assert_eq!(broadcast.shape(), [33, 16, 128]);
+        assert_eq!(broadcast.strides(), [0, 128, 1]);
+        assert_eq!(broadcast.byte_span(), layout.byte_span());
+    }
+
+    #[test]
+    fn rejects_incompatible_broadcast() {
+        let layout = Layout::contiguous(DType::F32, 0, vec![7, 33], 924).unwrap();
+        assert_eq!(
+            layout.broadcast(&[7, 1]),
+            Err(LayoutError::BroadcastDimensionMismatch {
+                axis: 1,
+                source: 33,
+                target: 1
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_broadcast_rank_before_building_strides() {
+        let layout = Layout::contiguous(DType::F32, 0, vec![1], 4).unwrap();
+        assert_eq!(layout.broadcast(&[1; 9]), Err(LayoutError::RankTooLarge));
+    }
+
     proptest! {
+        #[test]
+        fn broadcast_only_zeroes_stretched_strides(
+            axes in prop::collection::vec((1_u32..=4, 0_u64..=8, 1_u32..=4), 0..=4),
+            leading in prop::collection::vec(1_u32..=4, 0..=4),
+        ) {
+            prop_assume!(axes.len() + leading.len() <= super::MAX_RANK);
+            let shape = axes.iter().map(|axis| axis.0).collect::<Vec<_>>();
+            let strides = axes.iter().map(|axis| axis.1).collect::<Vec<_>>();
+            let source = Layout::new(DType::U32, 0, shape, strides, 4096).unwrap();
+            let mut target = leading.clone();
+            target.extend(axes.iter().map(|&(extent, _, stretch)| {
+                if extent == 1 { stretch } else { extent }
+            }));
+            let result = source.broadcast(&target).unwrap();
+            prop_assert!(result.strides()[..leading.len()].iter().all(|&stride| stride == 0));
+            for (axis, (&before, &after)) in source.strides().iter()
+                .zip(&result.strides()[leading.len()..]).enumerate()
+            {
+                if source.shape()[axis] == target[leading.len() + axis] {
+                    prop_assert_eq!(after, before);
+                } else {
+                    prop_assert_eq!(after, 0);
+                    prop_assert_eq!(source.shape()[axis], 1);
+                }
+            }
+        }
+
         #[test]
         fn sliced_elements_map_to_parent(
             axes in prop::collection::vec((1_u32..=4, 0_u32..=10, 0_u32..=10, 1_u32..=3), 0..=4),
