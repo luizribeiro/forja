@@ -214,6 +214,33 @@ impl CpuBackend {
         }
         self.write_output(output, &normalized)
     }
+
+    fn execute_softmax(&self, inputs: &[Tensor], output: &Tensor) -> Result<(), BackendError> {
+        let values = decode(&self.read(&inputs[0])?, inputs[0].layout().dtype())
+            .ok_or(BackendError::ExecutionFailed)?;
+        let width = inputs[0]
+            .layout()
+            .shape()
+            .last()
+            .copied()
+            .and_then(|width| usize::try_from(width).ok())
+            .ok_or(BackendError::ExecutionFailed)?;
+        let mut probabilities = Vec::with_capacity(values.len());
+        for row in values.chunks_exact(width) {
+            let maximum = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            if maximum == f32::NEG_INFINITY {
+                probabilities.resize(probabilities.len() + width, 0.0);
+                continue;
+            }
+            let start = probabilities.len();
+            probabilities.extend(row.iter().map(|value| (value - maximum).exp()));
+            let sum = probabilities[start..].iter().sum::<f32>();
+            probabilities[start..]
+                .iter_mut()
+                .for_each(|value| *value /= sum);
+        }
+        self.write_output(output, &probabilities)
+    }
 }
 
 impl Default for CpuBackend {
@@ -272,6 +299,7 @@ impl Backend for CpuBackend {
                 Op::RmsNorm { eps } => {
                     self.execute_rms_norm(dispatch.inputs(), dispatch.output(), eps)
                 }
+                Op::Softmax => self.execute_softmax(dispatch.inputs(), dispatch.output()),
             });
         Ok(CpuSubmission(result))
     }
@@ -543,6 +571,35 @@ mod tests {
         expected.extend((0..512).flat_map(|_| [1.5 / 12.75_f32.sqrt(), 2.0 / 12.75_f32.sqrt()]));
         let actual = decode(&backend.read(&output).unwrap(), DType::F32).unwrap();
         assert_relative(&actual, &expected, 1e-5);
+    }
+
+    #[test]
+    fn computes_masked_softmax_and_zeros_an_all_masked_row() {
+        let backend = CpuBackend::new();
+        let input = backend.alloc(DType::F32, &[2, 4]).unwrap();
+        backend
+            .write(
+                &input,
+                &f32_bytes(&[
+                    1.0,
+                    f32::NEG_INFINITY,
+                    3.0,
+                    f32::NEG_INFINITY,
+                    f32::NEG_INFINITY,
+                    f32::NEG_INFINITY,
+                    f32::NEG_INFINITY,
+                    f32::NEG_INFINITY,
+                ]),
+            )
+            .unwrap();
+        let output = backend.alloc(DType::F32, &[2, 4]).unwrap();
+        let mut commands = CommandList::new();
+        commands.dispatch(Op::Softmax, &[&input], &output).unwrap();
+        backend.submit(commands).unwrap().wait().unwrap();
+        let low = (-2.0_f32).exp() / (1.0 + (-2.0_f32).exp());
+        let high = 1.0 / (1.0 + (-2.0_f32).exp());
+        let actual = decode(&backend.read(&output).unwrap(), DType::F32).unwrap();
+        assert_relative(&actual, &[low, 0.0, high, 0.0, 0.0, 0.0, 0.0, 0.0], 1e-5);
     }
 
     fn f32_bytes(values: &[f32]) -> Vec<u8> {

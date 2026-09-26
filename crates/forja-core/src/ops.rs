@@ -97,6 +97,10 @@ pub enum Op {
         /// The nonnegative stabilizer added before the square root.
         eps: f32,
     },
+    /// Applies stable softmax over the last axis.
+    ///
+    /// A row containing only negative infinity produces all zeros.
+    Softmax,
 }
 
 /// An operand named by an operation validation error.
@@ -201,6 +205,7 @@ impl CommandList {
             Op::Copy => check_copy(inputs, output)?,
             Op::Add | Op::SiluMul => check_binary(inputs, output)?,
             Op::RmsNorm { eps } => check_rms_norm(inputs, output, eps)?,
+            Op::Softmax => check_softmax(inputs, output)?,
         }
         self.dispatches.push(Dispatch {
             op,
@@ -284,6 +289,28 @@ fn check_rms_norm(inputs: &[&Tensor], output: &Tensor, eps: f32) -> Result<(), O
     if width == 0 || inputs[1].layout.shape() != [width] {
         return Err(OpError::Shape {
             operand: Operand::Input(1),
+        });
+    }
+    check_shape(output, inputs[0], Operand::Output)
+}
+
+fn check_softmax(inputs: &[&Tensor], output: &Tensor) -> Result<(), OpError> {
+    if inputs.len() != 1 {
+        return Err(OpError::Arity {
+            expected: 1,
+            actual: inputs.len(),
+        });
+    }
+    check_float(inputs[0], Operand::Input(0))?;
+    check_float(output, Operand::Output)?;
+    if inputs[0]
+        .layout
+        .shape()
+        .last()
+        .is_none_or(|&width| width == 0)
+    {
+        return Err(OpError::Shape {
+            operand: Operand::Input(0),
         });
     }
     check_shape(output, inputs[0], Operand::Output)
@@ -430,6 +457,41 @@ mod tests {
                 &[&input, &good_weight],
                 &wrong_output
             ),
+            Err(OpError::Shape {
+                operand: Operand::Output
+            })
+        );
+    }
+
+    #[test]
+    fn softmax_rejects_invalid_signatures() {
+        let input = tensor(1, DType::F16, &[2], &[1]);
+        let integer = tensor(2, DType::U32, &[2], &[1]);
+        let output = tensor(3, DType::F32, &[2], &[1]);
+        let scalar = tensor(4, DType::F32, &[], &[]);
+        let scalar_output = tensor(5, DType::F32, &[], &[]);
+        assert_eq!(
+            CommandList::new().dispatch(Op::Softmax, &[], &output),
+            Err(OpError::Arity {
+                expected: 1,
+                actual: 0
+            })
+        );
+        assert_eq!(
+            CommandList::new().dispatch(Op::Softmax, &[&integer], &output),
+            Err(OpError::DType {
+                operand: Operand::Input(0),
+                dtype: DType::U32
+            })
+        );
+        assert_eq!(
+            CommandList::new().dispatch(Op::Softmax, &[&scalar], &scalar_output),
+            Err(OpError::Shape {
+                operand: Operand::Input(0)
+            })
+        );
+        assert_eq!(
+            CommandList::new().dispatch(Op::Softmax, &[&input], &scalar),
             Err(OpError::Shape {
                 operand: Operand::Output
             })
