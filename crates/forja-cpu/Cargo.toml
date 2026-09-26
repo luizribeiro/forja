@@ -12,3 +12,6 @@ workspace = true
 [dependencies]
 forja-core = { path = "../forja-core" }
 half = "2"
+
+[dev-dependencies]
+proptest = "1"

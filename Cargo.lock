@@ -465,6 +465,7 @@ version = "0.0.0"
 dependencies = [
  "forja-core",
  "half",
+ "proptest",
 ]
 
 [[package]]
