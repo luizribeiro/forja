@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/*", "support/test-guests"]
+members = ["crates/*", "support/forja-testing", "support/test-guests"]
 resolver = "3"
 
 [workspace.package]

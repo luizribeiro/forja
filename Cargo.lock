@@ -485,6 +485,15 @@ name = "forja-sdk"
 version = "0.0.0"
 
 [[package]]
+name = "forja-testing"
+version = "0.0.0"
+dependencies = [
+ "forja-core",
+ "forja-cpu",
+ "half",
+]
+
+[[package]]
 name = "form_urlencoded"
 version = "1.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
