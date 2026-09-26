@@ -7,14 +7,18 @@ rust-version.workspace = true
 version.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
+forja-core = { path = "../forja-core" }
 objc2 = "0.6"
 objc2-metal = { version = "0.3", default-features = false, features = [
   "std",
   "MTL4CommandAllocator",
   "MTL4CommandBuffer",
   "MTL4CommandQueue",
+  "MTLAllocation",
+  "MTLBuffer",
   "MTLDevice",
   "MTLEvent",
+  "MTLResource",
 ] }
 
 [lints.rust]

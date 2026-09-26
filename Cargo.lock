@@ -476,6 +476,7 @@ version = "0.0.0"
 name = "forja-metal"
 version = "0.0.0"
 dependencies = [
+ "forja-core",
  "objc2",
  "objc2-metal",
 ]

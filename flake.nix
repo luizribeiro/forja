@@ -79,7 +79,7 @@
                   exit 1
                 fi
                 cargo nextest run --release --workspace --all-features --locked --no-tests pass \
-                  -E 'not test(submits_empty_metal4_command_buffer)'
+                  -E 'not package(forja-metal)'
               else
                 cargo nextest run --release --workspace --all-features --locked --no-tests pass
               fi

@@ -2,6 +2,12 @@
 //! This is the sole crate permitted to contain the unsafe code required by Objective-C interop.
 
 #[cfg(target_os = "macos")]
+mod storage;
+
+#[cfg(target_os = "macos")]
+pub use storage::MetalBackend;
+
+#[cfg(target_os = "macos")]
 mod platform {
     use std::ptr::NonNull;
 
