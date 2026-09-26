@@ -250,6 +250,46 @@ kernel void NAME( \
 DEFINE_SOFTMAX(softmax_single, false)
 DEFINE_SOFTMAX(softmax_looped, true)
 
+struct RopeParams {
+    uint heads;
+    uint width;
+    uint half_width;
+};
+
+kernel void rope(
+    device const uchar *input [[buffer(0)]],
+    device const uint *positions [[buffer(1)]],
+    device uchar *output [[buffer(2)]],
+    constant TensorLayout &input_layout [[buffer(3)]],
+    constant TensorLayout &positions_layout [[buffer(4)]],
+    constant TensorLayout &output_layout [[buffer(5)]],
+    constant RopeParams &params [[buffer(6)]],
+    device const float *inverse_frequencies [[buffer(7)]],
+    uint index [[thread_position_in_grid]]) {
+    uint pair_count = output_layout.element_count / 2;
+    if (index >= pair_count) {
+        return;
+    }
+    uint frequency = index % params.half_width;
+    uint row = index / params.half_width;
+    uint sequence = row / params.heads;
+    uint base = row * params.width;
+    uint first_index = base + frequency;
+    uint second_index = first_index + params.half_width;
+    uint position = positions[physical_index(positions_layout, sequence)];
+    float angle = float(position) * inverse_frequencies[frequency];
+    float cosine = cos(angle);
+    float sine = sin(angle);
+    float first = load_float(
+        input, physical_index(input_layout, first_index), input0_dtype);
+    float second = load_float(
+        input, physical_index(input_layout, second_index), input0_dtype);
+    store_float(output, physical_index(output_layout, first_index), output_dtype,
+                first * cosine - second * sine);
+    store_float(output, physical_index(output_layout, second_index), output_dtype,
+                second * cosine + first * sine);
+}
+
 kernel void silu_mul(
     device const uchar *gate [[buffer(0)]],
     device const uchar *up [[buffer(1)]],

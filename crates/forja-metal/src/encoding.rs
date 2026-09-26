@@ -297,7 +297,12 @@ impl MetalBackend {
         if dispatches.iter().any(|dispatch| {
             !matches!(
                 dispatch.op(),
-                Op::Copy | Op::Add | Op::SiluMul | Op::RmsNorm { .. } | Op::Softmax
+                Op::Copy
+                    | Op::Add
+                    | Op::SiluMul
+                    | Op::RmsNorm { .. }
+                    | Op::Softmax
+                    | Op::Rope { .. }
             )
         }) {
             return Err(BackendError::InvalidInput);
@@ -336,7 +341,7 @@ impl MetalBackend {
             .computeCommandEncoder()
             .ok_or(BackendError::ExecutionFailed)?;
         let descriptor = MTL4ArgumentTableDescriptor::new();
-        descriptor.setMaxBufferBindCount(7);
+        descriptor.setMaxBufferBindCount(8);
         let table = self
             .device
             .newArgumentTableWithDescriptor_error(&descriptor)
@@ -356,6 +361,10 @@ impl MetalBackend {
             }
             if dispatch.op() == Op::Softmax {
                 temporaries.extend(self.encode_softmax(&encoder, &table, dispatch)?);
+                continue;
+            }
+            if let Op::Rope { theta } = dispatch.op() {
+                temporaries.extend(self.encode_rope(&encoder, &table, dispatch, theta)?);
                 continue;
             }
             let kernel = match dispatch.op() {
@@ -384,6 +393,95 @@ impl MetalBackend {
         encoder.endEncoding();
         Ok(temporaries)
     }
+
+    #[allow(clippy::cast_precision_loss)]
+    fn encode_rope(
+        &self,
+        encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
+        table: &ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>,
+        dispatch: &Dispatch,
+        theta: f32,
+    ) -> Result<Vec<Retained<ProtocolObject<dyn MTLBuffer>>>, BackendError> {
+        use objc2_metal::{MTL4ArgumentTable, MTL4ComputeCommandEncoder, MTLSize};
+
+        let [input, positions] = dispatch.inputs() else {
+            return Err(BackendError::InvalidInput);
+        };
+        let output = dispatch.output();
+        let shape = input.layout().shape();
+        let heads = shape[1];
+        let width = shape[2];
+        let half_width = width / 2;
+        let constants = [
+            (0, dtype_code(input.layout().dtype())),
+            (2, dtype_code(output.layout().dtype())),
+        ];
+        let pipeline = self
+            .pipelines
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?
+            .get("rope", &constants)?;
+        encoder.setComputePipelineState(&pipeline);
+        let mut params = [0_u8; 12];
+        params[..4].copy_from_slice(&heads.to_ne_bytes());
+        params[4..8].copy_from_slice(&width.to_ne_bytes());
+        params[8..].copy_from_slice(&half_width.to_ne_bytes());
+        let frequencies = (0..half_width)
+            .flat_map(|index| {
+                theta
+                    .powf(2.0 * index as f32 / width as f32)
+                    .recip()
+                    .to_ne_bytes()
+            })
+            .collect::<Vec<_>>();
+        let temporaries = vec![
+            self.layout_buffer(input.layout())?,
+            self.layout_buffer(positions.layout())?,
+            self.layout_buffer(output.layout())?,
+            self.temporary_buffer(&params)?,
+            self.temporary_buffer(&frequencies)?,
+        ];
+        let buffers = self
+            .buffers
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?;
+        for (index, tensor) in [input, positions, output].into_iter().enumerate() {
+            // SAFETY: The table has eight slots, and all resources remain retained through
+            // command-buffer completion.
+            unsafe {
+                table.setAddress_atIndex(buffers.get(tensor)?.raw.gpuAddress(), index);
+                table.setAddress_atIndex(temporaries[index].gpuAddress(), index + 3);
+            }
+        }
+        // SAFETY: Slots six and seven exist, and both temporary buffers remain retained.
+        unsafe {
+            table.setAddress_atIndex(temporaries[3].gpuAddress(), 6);
+            table.setAddress_atIndex(temporaries[4].gpuAddress(), 7);
+        }
+        drop(buffers);
+        encoder.setArgumentTable(Some(table));
+        let pair_count = output
+            .layout()
+            .element_count()
+            .checked_div(2)
+            .ok_or(BackendError::InvalidInput)?;
+        let thread_count = usize::try_from(pair_count).map_err(|_| BackendError::InvalidInput)?;
+        let group_width = pipeline.maxTotalThreadsPerThreadgroup().clamp(1, 256);
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(
+            MTLSize {
+                width: thread_count.div_ceil(group_width),
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: group_width,
+                height: 1,
+                depth: 1,
+            },
+        );
+        Ok(temporaries)
+    }
+
     fn encode_softmax(
         &self,
         encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
@@ -1196,5 +1294,51 @@ mod tests {
             &TensorSpec::contiguous(DType::F32, &[1, 33]),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn metal_rope_matches_cpu_for_qwen_shapes_and_position() {
+        let reference = CpuBackend::new();
+        let candidate = MetalBackend::new().unwrap();
+        let query_positions = (4089_u32..=4095)
+            .flat_map(u32::to_le_bytes)
+            .collect::<Vec<_>>();
+        let decode_position = 4095_u32.to_le_bytes().to_vec();
+        for dtype in [DType::F32, DType::F16, DType::BF16] {
+            let positions = TensorSpec::initialized(DType::U32, &[7], query_positions.clone());
+            assert_backends_agree(
+                &reference,
+                &candidate,
+                Op::Rope { theta: 1e6 },
+                &[
+                    TensorSpec::contiguous(dtype, &[7, 16, 128]),
+                    positions.clone(),
+                ],
+                &TensorSpec::contiguous(dtype, &[7, 16, 128]),
+            )
+            .unwrap();
+            assert_backends_agree(
+                &reference,
+                &candidate,
+                Op::Rope { theta: 1e6 },
+                &[
+                    TensorSpec::permuted(dtype, &[128, 16, 7], &[2, 1, 0]),
+                    positions,
+                ],
+                &TensorSpec::contiguous(dtype, &[7, 16, 128]),
+            )
+            .unwrap();
+            assert_backends_agree(
+                &reference,
+                &candidate,
+                Op::Rope { theta: 1e6 },
+                &[
+                    TensorSpec::contiguous(dtype, &[1, 8, 128]),
+                    TensorSpec::initialized(DType::U32, &[1], decode_position.clone()),
+                ],
+                &TensorSpec::contiguous(dtype, &[1, 8, 128]),
+            )
+            .unwrap();
+        }
     }
 }
