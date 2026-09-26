@@ -8,3 +8,6 @@ version.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+forja-core = { path = "../forja-core" }

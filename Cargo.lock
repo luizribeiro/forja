@@ -456,6 +456,9 @@ dependencies = [
 [[package]]
 name = "forja-cpu"
 version = "0.0.0"
+dependencies = [
+ "forja-core",
+]
 
 [[package]]
 name = "forja-host"
