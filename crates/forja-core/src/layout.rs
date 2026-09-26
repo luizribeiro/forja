@@ -21,6 +21,15 @@ pub enum LayoutError {
         /// The available buffer length in bytes.
         available: u64,
     },
+    /// A slice step was zero.
+    ZeroSliceStep,
+    /// The number of slice specifications differs from the tensor rank.
+    SliceRankMismatch,
+    /// A slice selects an element outside its parent axis.
+    SliceOutOfBounds {
+        /// The axis containing the invalid slice.
+        axis: usize,
+    },
 }
 
 impl fmt::Display for LayoutError {
@@ -36,11 +45,64 @@ impl fmt::Display for LayoutError {
                 formatter,
                 "layout requires {required} bytes but its buffer has {available}"
             ),
+            Self::ZeroSliceStep => formatter.write_str("slice step must be at least one"),
+            Self::SliceRankMismatch => {
+                formatter.write_str("slice specification rank differs from tensor rank")
+            }
+            Self::SliceOutOfBounds { axis } => {
+                write!(formatter, "slice exceeds parent extent on axis {axis}")
+            }
         }
     }
 }
 
 impl Error for LayoutError {}
+
+/// A validated selection along one tensor axis.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Slice {
+    start: u32,
+    len: u32,
+    step: u32,
+}
+
+impl Slice {
+    /// Creates an axis slice with a nonzero step.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LayoutError::ZeroSliceStep`] when `step` is zero.
+    pub const fn new(start: u32, len: u32, step: u32) -> Result<Self, LayoutError> {
+        if step == 0 {
+            return Err(LayoutError::ZeroSliceStep);
+        }
+        Ok(Self { start, len, step })
+    }
+
+    /// Returns the first selected index.
+    #[must_use]
+    pub const fn start(self) -> u32 {
+        self.start
+    }
+
+    /// Returns the number of selected indices.
+    #[must_use]
+    pub const fn len(self) -> u32 {
+        self.len
+    }
+
+    /// Returns whether this slice selects no indices.
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.len == 0
+    }
+
+    /// Returns the distance between selected indices.
+    #[must_use]
+    pub const fn step(self) -> u32 {
+        self.step
+    }
+}
 
 /// An immutable, buffer-validated tensor view.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -147,6 +209,58 @@ impl Layout {
     pub fn byte_span(&self) -> Range<u64> {
         self.byte_span.clone()
     }
+
+    /// Creates a view by slicing every axis of this layout.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LayoutError`] when the slice rank differs, a selection leaves
+    /// its parent extent, or checked layout arithmetic fails.
+    pub fn slice(&self, slices: &[Slice]) -> Result<Self, LayoutError> {
+        if slices.len() != self.shape.len() {
+            return Err(LayoutError::SliceRankMismatch);
+        }
+        for (axis, (&extent, slice)) in self.shape.iter().zip(slices).enumerate() {
+            let last = if slice.is_empty() {
+                u64::from(slice.start)
+            } else {
+                u64::from(slice.len - 1)
+                    .checked_mul(u64::from(slice.step))
+                    .and_then(|distance| u64::from(slice.start).checked_add(distance))
+                    .ok_or(LayoutError::ArithmeticOverflow)?
+            };
+            let in_bounds = if slice.is_empty() {
+                last <= u64::from(extent)
+            } else {
+                last < u64::from(extent)
+            };
+            if !in_bounds {
+                return Err(LayoutError::SliceOutOfBounds { axis });
+            }
+        }
+        let shape = slices.iter().map(|slice| slice.len).collect::<Vec<_>>();
+        let strides = self
+            .strides
+            .iter()
+            .zip(slices)
+            .map(|(&stride, slice)| stride.checked_mul(u64::from(slice.step)))
+            .collect::<Option<Vec<_>>>()
+            .ok_or(LayoutError::ArithmeticOverflow)?;
+        let offset = if shape.contains(&0) {
+            self.offset
+        } else {
+            self.strides
+                .iter()
+                .zip(slices)
+                .try_fold(self.offset, |offset, (&stride, slice)| {
+                    stride
+                        .checked_mul(u64::from(slice.start))
+                        .and_then(|distance| offset.checked_add(distance))
+                        .ok_or(LayoutError::ArithmeticOverflow)
+                })?
+        };
+        Self::new(self.dtype, offset, shape, strides, self.buffer_len)
+    }
 }
 
 fn element_count(shape: &[u32]) -> Result<u64, LayoutError> {
@@ -214,7 +328,7 @@ fn validate_span(
 mod tests {
     use proptest::prelude::*;
 
-    use super::{Layout, LayoutError};
+    use super::{Layout, LayoutError, Slice};
     use crate::DType;
 
     #[test]
@@ -240,7 +354,60 @@ mod tests {
         );
     }
 
+    #[test]
+    fn slices_kv_cache_to_current_length() {
+        let layout = Layout::contiguous(DType::F16, 0, vec![8, 4096, 128], 8_388_608).unwrap();
+        let slices = [
+            Slice::new(0, 8, 1).unwrap(),
+            Slice::new(0, 33, 1).unwrap(),
+            Slice::new(0, 128, 1).unwrap(),
+        ];
+        let current = layout.slice(&slices).unwrap();
+        assert_eq!(current.shape(), [8, 33, 128]);
+        assert_eq!(current.strides(), [524_288, 128, 1]);
+        assert_eq!(current.byte_span(), 0..7_348_480);
+    }
+
+    #[test]
+    fn rejects_invalid_slices() {
+        assert_eq!(Slice::new(0, 1, 0), Err(LayoutError::ZeroSliceStep));
+        let layout = Layout::contiguous(DType::F32, 0, vec![7], 28).unwrap();
+        assert_eq!(
+            layout.slice(&[Slice::new(6, 2, 1).unwrap()]),
+            Err(LayoutError::SliceOutOfBounds { axis: 0 })
+        );
+    }
+
     proptest! {
+        #[test]
+        fn sliced_elements_map_to_parent(
+            axes in prop::collection::vec((1_u32..=4, 0_u32..=10, 0_u32..=10, 1_u32..=3), 0..=4),
+        ) {
+            let shape = axes.iter().map(|axis| axis.0).collect::<Vec<_>>();
+            let elements = shape.iter().map(|&extent| u64::from(extent)).product::<u64>();
+            let parent = Layout::contiguous(DType::U32, 0, shape, elements * 4).unwrap();
+            let slices = axes.iter().map(|&(extent, raw_start, raw_len, step)| {
+                let start = raw_start % extent;
+                let max_len = (extent - 1 - start) / step + 1;
+                Slice::new(start, raw_len % (max_len + 1), step).unwrap()
+            }).collect::<Vec<_>>();
+            let child = parent.slice(&slices).unwrap();
+            for mut linear in 0..child.element_count() {
+                let mut child_offset = child.offset();
+                let mut parent_offset = parent.offset();
+                for ((&extent, &stride), (&parent_stride, slice)) in child.shape()
+                    .iter().zip(child.strides()).zip(parent.strides().iter().zip(&slices)).rev()
+                {
+                    let index = linear % u64::from(extent);
+                    linear /= u64::from(extent);
+                    child_offset += index * stride;
+                    parent_offset += (u64::from(slice.start()) + index * u64::from(slice.step()))
+                        * parent_stride;
+                }
+                prop_assert_eq!(child_offset, parent_offset);
+            }
+        }
+
         #[test]
         fn validation_matches_brute_force_maximum(
             axes in prop::collection::vec((0_u32..=4, 0_u64..=8), 0..=4),

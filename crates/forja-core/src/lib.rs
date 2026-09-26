@@ -3,7 +3,7 @@
 
 mod layout;
 
-pub use layout::{Layout, LayoutError, MAX_RANK};
+pub use layout::{Layout, LayoutError, MAX_RANK, Slice};
 
 /// A scalar type stored in an unquantized tensor.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
