@@ -4,7 +4,7 @@ use std::{
     time::Duration,
 };
 
-use crate::encoding::{Completion, PipelineCache};
+use crate::encoding::{Completion, InFlightTracker, PipelineCache};
 use forja_core::{
     AllocationRegistry, Backend, BackendError, CommandList, DType, Layout, Submission, Tensor,
     ViewOp,
@@ -12,7 +12,7 @@ use forja_core::{
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_metal::{
     MTL4CommandQueue, MTLBuffer, MTLCreateSystemDefaultDevice, MTLDevice, MTLGPUFamily,
-    MTLResourceOptions,
+    MTLResourceOptions, MTLSharedEventListener,
 };
 
 pub(super) struct MetalBuffer {
@@ -66,6 +66,10 @@ pub struct MetalBackend {
     _queue: Retained<ProtocolObject<dyn MTL4CommandQueue>>,
     pub(super) buffers: Mutex<AllocationRegistry<MetalBuffer>>,
     pub(super) pipelines: Mutex<PipelineCache>,
+    #[cfg_attr(not(test), expect(dead_code))]
+    pub(super) in_flight: Arc<InFlightTracker>,
+    #[cfg_attr(not(test), expect(dead_code))]
+    pub(super) event_listener: Retained<MTLSharedEventListener>,
     pub(super) gpu_timeout: Duration,
 }
 
@@ -93,11 +97,14 @@ impl MetalBackend {
             .newMTL4CommandQueue()
             .ok_or(BackendError::ExecutionFailed)?;
         let pipelines = PipelineCache::new(&device, include_str!("kernels.metal"))?;
+        let event_listener = MTLSharedEventListener::new();
         Ok(Self {
             device,
             _queue: queue,
             buffers: Mutex::new(AllocationRegistry::new()),
             pipelines: Mutex::new(pipelines),
+            in_flight: Arc::new(InFlightTracker::new()),
+            event_listener,
             gpu_timeout,
         })
     }

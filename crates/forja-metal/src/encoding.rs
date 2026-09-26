@@ -6,6 +6,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use block2::RcBlock;
 use forja_core::{
     BackendError, BufferId, CommandList, DType, Dispatch, Layout, Tensor, required_barriers,
 };
@@ -14,7 +15,7 @@ use objc2_foundation::NSString;
 use objc2_metal::{
     MTL4CommandBuffer, MTLAllocation, MTLBuffer, MTLComputePipelineState, MTLDataType, MTLDevice,
     MTLFunctionConstantValues, MTLLibrary, MTLResidencySet, MTLResidencySetDescriptor,
-    MTLSharedEvent,
+    MTLSharedEvent, MTLSharedEventListener,
 };
 
 use crate::storage::MetalBackend;
@@ -71,7 +72,7 @@ pub(super) struct Completion {
 }
 
 impl Completion {
-    #[expect(dead_code)]
+    #[cfg_attr(not(test), expect(dead_code))]
     pub(super) fn new(
         buffers: Vec<InFlightBuffer>,
         event: InFlightEvent,
@@ -86,7 +87,7 @@ impl Completion {
         })
     }
 
-    #[expect(dead_code)]
+    #[cfg_attr(not(test), expect(dead_code))]
     pub(super) fn finish(&self, result: Result<(), BackendError>) {
         let mut state = self
             .state
@@ -106,6 +107,20 @@ impl Completion {
             return Err(BackendError::ExecutionFailed);
         }
         self.wait_for_feedback(timeout.saturating_sub(started.elapsed()))
+    }
+
+    fn wait_unbounded(&self) {
+        let _signaled = self.event.raw.waitUntilSignaledValue_timeoutMS(1, u64::MAX);
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while state.result.is_none() {
+            state = self
+                .ready
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
     }
 
     fn wait_for_feedback(&self, timeout: Duration) -> Result<(), BackendError> {
@@ -131,6 +146,84 @@ impl Completion {
                 return Err(BackendError::ExecutionFailed);
             }
         }
+    }
+}
+
+type NotificationHandler = RcBlock<dyn Fn(NonNull<ProtocolObject<dyn MTLSharedEvent>>, u64)>;
+
+struct InFlightCompletion {
+    completion: Arc<Completion>,
+    _listener: Retained<MTLSharedEventListener>,
+    _notification: NotificationHandler,
+}
+
+// SAFETY: The listener is thread-safe, and the immutable notification block captures only
+// thread-safe `Arc` values. Objective-C blocks may be retained and released on the listener queue.
+unsafe impl Send for InFlightCompletion {}
+
+// SAFETY: Shared access only retains the listener, block, and completion; their mutable state is
+// protected by mutexes.
+unsafe impl Sync for InFlightCompletion {}
+
+pub(super) struct InFlightTracker {
+    completions: Mutex<Vec<InFlightCompletion>>,
+}
+
+impl InFlightTracker {
+    pub(super) const fn new() -> Self {
+        Self {
+            completions: Mutex::new(Vec::new()),
+        }
+    }
+
+    #[cfg_attr(not(test), expect(dead_code))]
+    pub(super) fn track(
+        self: &Arc<Self>,
+        completion: &Arc<Completion>,
+        listener: &Retained<MTLSharedEventListener>,
+    ) -> Result<(), BackendError> {
+        let pending = Arc::clone(completion);
+        let owner = Arc::clone(self);
+        let notification: NotificationHandler = RcBlock::new(move |_event, _value| {
+            let active_completion = Arc::clone(&pending);
+            let active_owner = Arc::clone(&owner);
+            active_completion.wait_unbounded();
+            active_owner.remove(&active_completion);
+        });
+        self.completions
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?
+            .push(InFlightCompletion {
+                completion: Arc::clone(completion),
+                _listener: listener.clone(),
+                _notification: notification.clone(),
+            });
+        // SAFETY: The tracker stores the live heap block and listener before registration. The
+        // block owns `Arc`s to both the completion and tracker, and clones them before removal, so
+        // its captures remain valid even if the backend is dropped before Metal invokes it.
+        unsafe {
+            completion.event.raw.notifyListener_atValue_block(
+                listener,
+                1,
+                RcBlock::as_ptr(&notification),
+            );
+        }
+        Ok(())
+    }
+
+    fn remove(&self, completion: &Arc<Completion>) {
+        self.completions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|candidate| !Arc::ptr_eq(&candidate.completion, completion));
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.completions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
     }
 }
 
@@ -403,9 +496,10 @@ impl PipelineCache {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use forja_core::{Backend, CommandList, DType, Op, Submission};
+    use objc2_metal::{MTL4CommandQueue, MTLEvent};
 
     use super::*;
 
@@ -429,6 +523,54 @@ mod tests {
             backend.submit(commands).unwrap().wait(),
             Err(BackendError::ExecutionFailed)
         );
+    }
+
+    #[test]
+    fn shared_event_listener_reaps_many_command_buffers() {
+        let backend = MetalBackend::new().unwrap();
+        let queue = backend.device.newMTL4CommandQueue().unwrap();
+        let descriptor = MTLResidencySetDescriptor::new();
+        let residency = backend
+            .device
+            .newResidencySetWithDescriptor_error(&descriptor)
+            .unwrap();
+        residency.commit();
+
+        for _ in 0..1000 {
+            let command_buffer = backend.begin_command_buffer().unwrap();
+            command_buffer.endCommandBuffer();
+            let event = backend.device.newSharedEvent().unwrap();
+            let completion = Completion::new(
+                Vec::new(),
+                InFlightEvent { raw: event.clone() },
+                InFlightResidency {
+                    _raw: residency.clone(),
+                },
+            );
+            completion.finish(Ok(()));
+            backend
+                .in_flight
+                .track(&completion, &backend.event_listener)
+                .unwrap();
+            let command_buffer_ref: &ProtocolObject<dyn MTL4CommandBuffer> = &command_buffer;
+            let mut command_buffers = [NonNull::from(command_buffer_ref)];
+            // SAFETY: The pointer names one live command buffer and the count matches the array.
+            unsafe {
+                queue.commit_count(
+                    NonNull::from(&mut command_buffers[0]),
+                    command_buffers.len(),
+                );
+            }
+            let shared_event: &ProtocolObject<dyn MTLSharedEvent> = &event;
+            let event: &ProtocolObject<dyn MTLEvent> = shared_event.as_ref();
+            queue.signalEvent_value(event, 1);
+        }
+
+        let started = Instant::now();
+        while backend.in_flight.len() != 0 {
+            assert!(started.elapsed() < backend.gpu_timeout);
+            std::thread::yield_now();
+        }
     }
 
     #[test]

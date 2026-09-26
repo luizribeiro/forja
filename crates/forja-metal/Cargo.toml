@@ -7,6 +7,7 @@ rust-version.workspace = true
 version.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6"
 forja-core = { path = "../forja-core" }
 objc2 = "0.6"
 objc2-foundation = { version = "0.3", default-features = false, features = [
@@ -14,6 +15,7 @@ objc2-foundation = { version = "0.3", default-features = false, features = [
 ] }
 objc2-metal = { version = "0.3", default-features = false, features = [
   "std",
+  "block2",
   "MTL4ArgumentTable",
   "MTL4CommandAllocator",
   "MTL4CommandBuffer",
