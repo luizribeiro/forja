@@ -30,6 +30,18 @@ pub enum LayoutError {
         /// The axis containing the invalid slice.
         axis: usize,
     },
+    /// The permutation length differs from the tensor rank.
+    PermutationRankMismatch,
+    /// A permutation references an axis outside the tensor rank.
+    PermutationAxisOutOfRange {
+        /// The invalid axis number.
+        axis: u8,
+    },
+    /// A permutation references the same axis more than once.
+    DuplicatePermutationAxis {
+        /// The repeated axis number.
+        axis: u8,
+    },
 }
 
 impl fmt::Display for LayoutError {
@@ -51,6 +63,15 @@ impl fmt::Display for LayoutError {
             }
             Self::SliceOutOfBounds { axis } => {
                 write!(formatter, "slice exceeds parent extent on axis {axis}")
+            }
+            Self::PermutationRankMismatch => {
+                formatter.write_str("permutation length differs from tensor rank")
+            }
+            Self::PermutationAxisOutOfRange { axis } => {
+                write!(formatter, "permutation axis {axis} is out of range")
+            }
+            Self::DuplicatePermutationAxis { axis } => {
+                write!(formatter, "permutation axis {axis} appears more than once")
             }
         }
     }
@@ -261,6 +282,38 @@ impl Layout {
         };
         Self::new(self.dtype, offset, shape, strides, self.buffer_len)
     }
+
+    /// Creates a view with axes in the given order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LayoutError`] unless `axes` is a permutation of every axis,
+    /// or when revalidating the resulting layout fails.
+    pub fn permute(&self, axes: &[u8]) -> Result<Self, LayoutError> {
+        if axes.len() != self.shape.len() {
+            return Err(LayoutError::PermutationRankMismatch);
+        }
+        let mut seen = [false; MAX_RANK];
+        for &axis in axes {
+            let index = usize::from(axis);
+            if index >= self.shape.len() {
+                return Err(LayoutError::PermutationAxisOutOfRange { axis });
+            }
+            if seen[index] {
+                return Err(LayoutError::DuplicatePermutationAxis { axis });
+            }
+            seen[index] = true;
+        }
+        let shape = axes
+            .iter()
+            .map(|&axis| self.shape[usize::from(axis)])
+            .collect();
+        let strides = axes
+            .iter()
+            .map(|&axis| self.strides[usize::from(axis)])
+            .collect();
+        Self::new(self.dtype, self.offset, shape, strides, self.buffer_len)
+    }
 }
 
 fn element_count(shape: &[u32]) -> Result<u64, LayoutError> {
@@ -375,6 +428,32 @@ mod tests {
         assert_eq!(
             layout.slice(&[Slice::new(6, 2, 1).unwrap()]),
             Err(LayoutError::SliceOutOfBounds { axis: 0 })
+        );
+    }
+
+    #[test]
+    fn permutes_q_heads_before_attention() {
+        let layout = Layout::contiguous(DType::F16, 0, vec![33, 16, 128], 135_168).unwrap();
+        let heads_first = layout.permute(&[1, 0, 2]).unwrap();
+        assert_eq!(heads_first.shape(), [16, 33, 128]);
+        assert_eq!(heads_first.strides(), [128, 2048, 1]);
+        assert_eq!(heads_first.byte_span(), layout.byte_span());
+    }
+
+    #[test]
+    fn rejects_invalid_permutations() {
+        let layout = Layout::contiguous(DType::F32, 0, vec![7, 33], 924).unwrap();
+        assert_eq!(
+            layout.permute(&[0]),
+            Err(LayoutError::PermutationRankMismatch)
+        );
+        assert_eq!(
+            layout.permute(&[0, 2]),
+            Err(LayoutError::PermutationAxisOutOfRange { axis: 2 })
+        );
+        assert_eq!(
+            layout.permute(&[1, 1]),
+            Err(LayoutError::DuplicatePermutationAxis { axis: 1 })
         );
     }
 
