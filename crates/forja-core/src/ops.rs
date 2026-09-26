@@ -108,6 +108,8 @@ pub enum Op {
     },
     /// Gathers embedding rows by token id.
     Embed,
+    /// Multiplies rank-two or rank-three matrices.
+    Matmul,
 }
 
 /// An operand named by an operation validation error.
@@ -222,6 +224,7 @@ impl CommandList {
             Op::Softmax => check_softmax(inputs, output)?,
             Op::Rope { theta } => check_rope(inputs, output, theta)?,
             Op::Embed => check_embed(inputs, output)?,
+            Op::Matmul => check_matmul(inputs, output)?,
         }
         self.dispatches.push(Dispatch {
             op,
@@ -399,6 +402,42 @@ fn check_embed(inputs: &[&Tensor], output: &Tensor) -> Result<(), OpError> {
         });
     }
     if output.layout.shape() != [ids[0], table[1]] {
+        return Err(OpError::Shape {
+            operand: Operand::Output,
+        });
+    }
+    Ok(())
+}
+
+fn check_matmul(inputs: &[&Tensor], output: &Tensor) -> Result<(), OpError> {
+    if inputs.len() != 2 {
+        return Err(OpError::Arity {
+            expected: 2,
+            actual: inputs.len(),
+        });
+    }
+    check_float(inputs[0], Operand::Input(0))?;
+    check_float(inputs[1], Operand::Input(1))?;
+    check_float(output, Operand::Output)?;
+    let a = inputs[0].layout.shape();
+    let b = inputs[1].layout.shape();
+    if !matches!(a.len(), 2 | 3) {
+        return Err(OpError::Shape {
+            operand: Operand::Input(0),
+        });
+    }
+    let batch_axes = a.len() - 2;
+    if b.len() != a.len()
+        || b[..batch_axes] != a[..batch_axes]
+        || b[batch_axes] != a[batch_axes + 1]
+    {
+        return Err(OpError::Shape {
+            operand: Operand::Input(1),
+        });
+    }
+    let mut expected = a[..batch_axes].to_vec();
+    expected.extend([a[batch_axes], b[batch_axes + 1]]);
+    if output.layout.shape() != expected {
         return Err(OpError::Shape {
             operand: Operand::Output,
         });
@@ -660,6 +699,35 @@ mod tests {
             Err(OpError::DType {
                 operand: Operand::Input(1),
                 dtype: DType::F32
+            })
+        );
+    }
+
+    #[test]
+    fn matmul_rejects_invalid_shapes() {
+        let a = tensor(1, DType::F32, &[2, 3, 4], &[12, 4, 1]);
+        let b = tensor(2, DType::F32, &[2, 3, 5], &[15, 5, 1]);
+        let output = tensor(3, DType::F32, &[2, 3, 5], &[15, 5, 1]);
+        assert_eq!(
+            CommandList::new().dispatch(Op::Matmul, &[&a, &b], &output),
+            Err(OpError::Shape {
+                operand: Operand::Input(1)
+            })
+        );
+        let rank_four = tensor(4, DType::F32, &[2, 2, 3, 4], &[24, 12, 4, 1]);
+        let rank_four_b = tensor(5, DType::F32, &[2, 2, 4, 5], &[40, 20, 5, 1]);
+        let rank_four_output = tensor(6, DType::F32, &[2, 2, 3, 5], &[30, 15, 5, 1]);
+        assert_eq!(
+            CommandList::new().dispatch(Op::Matmul, &[&rank_four, &rank_four_b], &rank_four_output),
+            Err(OpError::Shape {
+                operand: Operand::Input(0)
+            })
+        );
+        let wrong_batch = tensor(7, DType::F32, &[3, 4, 5], &[20, 5, 1]);
+        assert_eq!(
+            CommandList::new().dispatch(Op::Matmul, &[&a, &wrong_batch], &output),
+            Err(OpError::Shape {
+                operand: Operand::Input(1)
             })
         );
     }

@@ -309,6 +309,38 @@ impl CpuBackend {
         self.write_output(output, &values)?;
         first_bad.map_or(Ok(()), |index| Err(BackendError::IndexOutOfRange { index }))
     }
+
+    fn execute_matmul(&self, inputs: &[Tensor], output: &Tensor) -> Result<(), BackendError> {
+        let left = decode(&self.read(&inputs[0])?, inputs[0].layout().dtype())
+            .ok_or(BackendError::ExecutionFailed)?;
+        let right = decode(&self.read(&inputs[1])?, inputs[1].layout().dtype())
+            .ok_or(BackendError::ExecutionFailed)?;
+        let left_shape = inputs[0].layout().shape();
+        let right_shape = inputs[1].layout().shape();
+        let rank = left_shape.len();
+        let rows = execution_usize(left_shape[rank - 2])?;
+        let inner = execution_usize(left_shape[rank - 1])?;
+        let columns = execution_usize(right_shape[rank - 1])?;
+        let left_batch = checked_product(rows, inner)?;
+        let right_batch = checked_product(inner, columns)?;
+        let capacity = execution_usize(output.layout().element_count())?;
+        let mut values = Vec::with_capacity(capacity);
+        for (left_batch, right_batch) in left
+            .chunks_exact(left_batch)
+            .zip(right.chunks_exact(right_batch))
+        {
+            for row in left_batch.chunks_exact(inner) {
+                for column in 0..columns {
+                    values.push(
+                        row.iter()
+                            .zip(right_batch.chunks_exact(columns))
+                            .fold(0.0, |sum, (left, b_row)| sum + left * b_row[column]),
+                    );
+                }
+            }
+        }
+        self.write_output(output, &values)
+    }
 }
 
 impl Default for CpuBackend {
@@ -372,6 +404,7 @@ impl Backend for CpuBackend {
                     self.execute_rope(dispatch.inputs(), dispatch.output(), theta)
                 }
                 Op::Embed => self.execute_embed(dispatch.inputs(), dispatch.output()),
+                Op::Matmul => self.execute_matmul(dispatch.inputs(), dispatch.output()),
             });
         Ok(CpuSubmission(result))
     }
@@ -785,6 +818,84 @@ mod tests {
         assert_eq!(error, Err(BackendError::IndexOutOfRange { index: 99 }));
         let actual = decode(&backend.read(&output).unwrap(), DType::F32).unwrap();
         assert_eq!(actual, [5.0, 6.0, 0.0, 0.0, 1.0, 2.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn multiplies_by_a_permuted_qwen_weight() {
+        let backend = CpuBackend::new();
+        let x = (0_u16..33)
+            .cycle()
+            .take(5 * 1024)
+            .map(|value| (f32::from(value) - 16.0) / 16.0)
+            .collect::<Vec<_>>();
+        let weights = (0_u16..251)
+            .cycle()
+            .take(3072 * 1024)
+            .map(|value| (f32::from(value) - 125.0) / 125.0)
+            .collect::<Vec<_>>();
+        let input = backend.alloc(DType::F32, &[5, 1024]).unwrap();
+        backend.write(&input, &f32_bytes(&x)).unwrap();
+        let stored = backend.alloc(DType::F32, &[3072, 1024]).unwrap();
+        backend.write(&stored, &f32_bytes(&weights)).unwrap();
+        let weight = backend.view(&stored, ViewOp::Permute(vec![1, 0])).unwrap();
+        let output = backend.alloc(DType::F32, &[5, 3072]).unwrap();
+        let mut commands = CommandList::new();
+        commands
+            .dispatch(Op::Matmul, &[&input, &weight], &output)
+            .unwrap();
+        backend.submit(commands).unwrap().wait().unwrap();
+        let actual = decode(&backend.read(&output).unwrap(), DType::F32).unwrap();
+        let mut expected = Vec::with_capacity(5 * 3072);
+        for row in 0..5 {
+            for column in 0..3072 {
+                let value = (0..1024)
+                    .map(|inner| {
+                        f64::from(x[row * 1024 + inner]) * f64::from(weights[column * 1024 + inner])
+                    })
+                    .sum::<f64>();
+                expected.push(value as f32);
+            }
+        }
+        assert_relative(&actual, &expected, 1e-5);
+    }
+
+    #[test]
+    fn matmul_handles_unit_contraction_and_row_dimensions() {
+        let backend = CpuBackend::new();
+        let actual = run_matmul(&backend, &[2.0, 3.0], &[4.0, 5.0, 6.0], &[2, 1], &[1, 3]);
+        assert_eq!(actual, [8.0, 10.0, 12.0, 12.0, 15.0, 18.0]);
+        let actual = run_matmul(
+            &backend,
+            &[1.0, 2.0, 3.0, 4.0],
+            &[5.0, 6.0, 7.0, 8.0],
+            &[2, 1, 2],
+            &[2, 2, 1],
+        );
+        assert_eq!(actual, [17.0, 53.0]);
+    }
+
+    fn run_matmul(
+        backend: &CpuBackend,
+        a: &[f32],
+        b: &[f32],
+        a_shape: &[u32],
+        b_shape: &[u32],
+    ) -> Vec<f32> {
+        let left = backend.alloc(DType::F32, a_shape).unwrap();
+        backend.write(&left, &f32_bytes(a)).unwrap();
+        let right = backend.alloc(DType::F32, b_shape).unwrap();
+        backend.write(&right, &f32_bytes(b)).unwrap();
+        let rank = a_shape.len();
+        let mut shape = a_shape[..rank - 2].to_vec();
+        shape.extend([a_shape[rank - 2], b_shape[rank - 1]]);
+        let output = backend.alloc(DType::F32, &shape).unwrap();
+        let mut commands = CommandList::new();
+        commands
+            .dispatch(Op::Matmul, &[&left, &right], &output)
+            .unwrap();
+        backend.submit(commands).unwrap().wait().unwrap();
+        decode(&backend.read(&output).unwrap(), DType::F32).unwrap()
     }
 
     fn run_rope(values: &[f32], positions: &[u32], shape: &[u32], theta: f32) -> Vec<f32> {
