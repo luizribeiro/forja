@@ -271,6 +271,37 @@ impl CommandList {
     }
 }
 
+/// Reports whether each dispatch needs a barrier before it.
+#[must_use]
+pub fn required_barriers(commands: &CommandList) -> Vec<bool> {
+    let mut accesses = Vec::<(&Tensor, bool)>::new();
+    commands
+        .dispatches
+        .iter()
+        .map(|dispatch| {
+            let needs_barrier = dispatch
+                .inputs
+                .iter()
+                .any(|input| conflicts(input, false, &accesses))
+                || conflicts(&dispatch.output, true, &accesses);
+            if needs_barrier {
+                accesses.clear();
+            }
+            accesses.extend(dispatch.inputs.iter().map(|input| (input, false)));
+            accesses.push((&dispatch.output, true));
+            needs_barrier
+        })
+        .collect()
+}
+
+fn conflicts(tensor: &Tensor, writes: bool, accesses: &[(&Tensor, bool)]) -> bool {
+    accesses.iter().any(|&(prior, prior_writes)| {
+        (writes || prior_writes)
+            && tensor.buffer == prior.buffer
+            && byte_ranges_overlap(&tensor.layout, &prior.layout)
+    })
+}
+
 fn check_common(inputs: &[&Tensor], output: &Tensor) -> Result<(), OpError> {
     for (input, tensor) in inputs.iter().enumerate() {
         if tensor.layout.element_count() == 0 {
@@ -543,6 +574,84 @@ mod tests {
             Layout::new(dtype, 0, shape.to_vec(), strides.to_vec(), bytes).unwrap(),
         )
         .unwrap()
+    }
+
+    fn slice(buffer: u64, start: u64, len: u32) -> Tensor {
+        Tensor::new(
+            BufferId::new(1, buffer, 64),
+            Layout::new(DType::F32, start, vec![len], vec![1], 64).unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn independent_dispatches_need_no_barriers() {
+        let mut commands = CommandList::new();
+        commands
+            .dispatch(
+                Op::Add,
+                &[&slice(1, 0, 4), &slice(2, 0, 4)],
+                &slice(3, 0, 4),
+            )
+            .unwrap();
+        commands
+            .dispatch(
+                Op::Add,
+                &[&slice(4, 0, 4), &slice(5, 0, 4)],
+                &slice(6, 0, 4),
+            )
+            .unwrap();
+
+        assert_eq!(required_barriers(&commands), [false, false]);
+    }
+
+    #[test]
+    fn dependency_chain_needs_a_barrier_at_each_link() {
+        let a = slice(1, 0, 4);
+        let b = slice(2, 0, 4);
+        let first = slice(3, 0, 4);
+        let second = slice(4, 0, 4);
+        let third = slice(5, 0, 4);
+        let mut commands = CommandList::new();
+        commands.dispatch(Op::Add, &[&a, &b], &first).unwrap();
+        commands.dispatch(Op::Add, &[&first, &b], &second).unwrap();
+        commands.dispatch(Op::Add, &[&second, &b], &third).unwrap();
+
+        assert_eq!(required_barriers(&commands), [false, true, true]);
+    }
+
+    #[test]
+    fn kv_cache_write_after_read_needs_a_barrier() {
+        let cache_read = slice(1, 4, 4);
+        let cache_write = slice(1, 6, 4);
+        let source = slice(2, 0, 4);
+        let first_output = slice(3, 0, 4);
+        let mut commands = CommandList::new();
+        commands
+            .dispatch(Op::Copy, &[&cache_read], &first_output)
+            .unwrap();
+        commands
+            .dispatch(Op::Copy, &[&source], &cache_write)
+            .unwrap();
+
+        assert_eq!(required_barriers(&commands), [false, true]);
+    }
+
+    #[test]
+    fn disjoint_slices_of_one_buffer_need_no_barrier() {
+        let first_half = slice(1, 0, 4);
+        let second_half = slice(1, 8, 4);
+        let source = slice(2, 0, 4);
+        let output = slice(3, 0, 4);
+        let mut commands = CommandList::new();
+        commands
+            .dispatch(Op::Copy, &[&source], &first_half)
+            .unwrap();
+        commands
+            .dispatch(Op::Copy, &[&second_half], &output)
+            .unwrap();
+
+        assert_eq!(required_barriers(&commands), [false, false]);
     }
 
     #[test]
