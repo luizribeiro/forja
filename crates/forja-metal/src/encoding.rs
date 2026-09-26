@@ -296,7 +296,7 @@ impl MetalBackend {
         let dispatches = commands.into_dispatches();
         if dispatches
             .iter()
-            .any(|dispatch| dispatch.op() != Op::SiluMul)
+            .any(|dispatch| !matches!(dispatch.op(), Op::Copy | Op::SiluMul))
         {
             return Err(BackendError::InvalidInput);
         }
@@ -341,9 +341,6 @@ impl MetalBackend {
             .map_err(|_| BackendError::ExecutionFailed)?;
         let mut temporaries = Vec::with_capacity(dispatches.len().saturating_mul(3));
         for (dispatch, &barrier) in dispatches.iter().zip(barriers) {
-            if dispatch.op() != Op::SiluMul {
-                return Err(BackendError::InvalidInput);
-            }
             if barrier {
                 encoder.barrierAfterEncoderStages_beforeEncoderStages_visibilityOptions(
                     MTLStages::Dispatch,
@@ -351,7 +348,18 @@ impl MetalBackend {
                     MTL4VisibilityOptions::Device,
                 );
             }
-            temporaries.extend(self.encode_elementwise(&encoder, &table, dispatch, "silu_mul")?);
+            let kernel = match dispatch.op() {
+                Op::Copy
+                    if dispatch.inputs()[0].layout().is_contiguous()
+                        && dispatch.output().layout().is_contiguous() =>
+                {
+                    "copy_contiguous"
+                }
+                Op::Copy => "copy_strided",
+                Op::SiluMul => "silu_mul",
+                _ => return Err(BackendError::InvalidInput),
+            };
+            temporaries.extend(self.encode_elementwise(&encoder, &table, dispatch, kernel)?);
         }
         encoder.endEncoding();
         Ok(temporaries)
@@ -371,15 +379,20 @@ impl MetalBackend {
             .iter()
             .chain(std::iter::once(dispatch.output()))
             .collect::<Vec<_>>();
-        let constants = operands
+        let constants = dispatch
+            .inputs()
             .iter()
             .enumerate()
             .map(|(index, tensor)| {
                 Ok((
                     u32::try_from(index).map_err(|_| BackendError::InvalidInput)?,
-                    dtype_code(tensor.layout().dtype())?,
+                    dtype_code(tensor.layout().dtype()),
                 ))
             })
+            .chain(std::iter::once(Ok((
+                2,
+                dtype_code(dispatch.output().layout().dtype()),
+            ))))
             .collect::<Result<Vec<_>, BackendError>>()?;
         let pipeline = self
             .pipelines
@@ -570,12 +583,13 @@ impl MetalBackend {
     }
 }
 
-const fn dtype_code(dtype: DType) -> Result<u32, BackendError> {
+const fn dtype_code(dtype: DType) -> u32 {
     match dtype {
-        DType::F32 => Ok(0),
-        DType::F16 => Ok(1),
-        DType::BF16 => Ok(2),
-        DType::I32 | DType::U32 => Err(BackendError::InvalidInput),
+        DType::F32 => 0,
+        DType::F16 => 1,
+        DType::BF16 => 2,
+        DType::I32 => 3,
+        DType::U32 => 4,
     }
 }
 
@@ -666,7 +680,7 @@ impl PipelineCache {
 mod tests {
     use std::time::{Duration, Instant};
 
-    use forja_core::{Backend, CommandList, DType, Op, Submission};
+    use forja_core::{Backend, CommandList, DType, Op, Slice, Submission};
     use forja_cpu::CpuBackend;
     use forja_testing::{TensorSpec, assert_backends_agree};
     use objc2_metal::{MTL4CommandQueue, MTLEvent};
@@ -814,6 +828,62 @@ mod tests {
             Op::SiluMul,
             &mixed,
             &TensorSpec::contiguous(DType::F32, &[7, 3072]),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn metal_copy_matches_cpu_for_casts_shapes_and_views() {
+        let reference = CpuBackend::new();
+        let candidate = MetalBackend::new().unwrap();
+        let floats = [DType::F32, DType::F16, DType::BF16];
+        for input_dtype in floats {
+            for output_dtype in floats {
+                for width in [1, 7, 33, 4097] {
+                    assert_backends_agree(
+                        &reference,
+                        &candidate,
+                        Op::Copy,
+                        &[TensorSpec::contiguous(input_dtype, &[width])],
+                        &TensorSpec::contiguous(output_dtype, &[width]),
+                    )
+                    .unwrap();
+                }
+                assert_backends_agree(
+                    &reference,
+                    &candidate,
+                    Op::Copy,
+                    &[TensorSpec::permuted(input_dtype, &[7, 33], &[1, 0])],
+                    &TensorSpec::contiguous(output_dtype, &[33, 7]),
+                )
+                .unwrap();
+            }
+        }
+        for dtype in [DType::I32, DType::U32] {
+            assert_backends_agree(
+                &reference,
+                &candidate,
+                Op::Copy,
+                &[TensorSpec::permuted(dtype, &[7, 33], &[1, 0])],
+                &TensorSpec::contiguous(dtype, &[33, 7]),
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn metal_copy_writes_a_kv_cache_slice() {
+        let slices = [
+            Slice::new(0, 8, 1).unwrap(),
+            Slice::new(37, 1, 1).unwrap(),
+            Slice::new(0, 128, 1).unwrap(),
+        ];
+        assert_backends_agree(
+            &CpuBackend::new(),
+            &MetalBackend::new().unwrap(),
+            Op::Copy,
+            &[TensorSpec::contiguous(DType::F16, &[8, 1, 128])],
+            &TensorSpec::sliced(DType::F16, &[8, 4096, 128], &slices),
         )
         .unwrap();
     }

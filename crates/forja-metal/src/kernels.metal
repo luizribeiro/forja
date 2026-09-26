@@ -7,6 +7,32 @@ kernel void hold(device uchar *buffer [[buffer(0)]], uint index [[thread_positio
     }
 }
 
+kernel void copy_strided(
+    device const uchar *input [[buffer(0)]],
+    device uchar *output [[buffer(1)]],
+    constant TensorLayout &input_layout [[buffer(2)]],
+    constant TensorLayout &output_layout [[buffer(3)]],
+    uint index [[thread_position_in_grid]]) {
+    if (index < output_layout.element_count) {
+        copy_value(input, output,
+                   physical_index(input_layout, index),
+                   physical_index(output_layout, index));
+    }
+}
+
+kernel void copy_contiguous(
+    device const uchar *input [[buffer(0)]],
+    device uchar *output [[buffer(1)]],
+    constant TensorLayout &input_layout [[buffer(2)]],
+    constant TensorLayout &output_layout [[buffer(3)]],
+    uint index [[thread_position_in_grid]]) {
+    if (index < output_layout.element_count) {
+        copy_value(input, output,
+                   input_layout.offset + index,
+                   output_layout.offset + index);
+    }
+}
+
 kernel void silu_mul(
     device const uchar *gate [[buffer(0)]],
     device const uchar *up [[buffer(1)]],

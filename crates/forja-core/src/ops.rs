@@ -333,8 +333,18 @@ fn check_copy(inputs: &[&Tensor], output: &Tensor) -> Result<(), OpError> {
             actual: inputs.len(),
         });
     }
-    check_float(inputs[0], Operand::Input(0))?;
-    check_float(output, Operand::Output)?;
+    let input_dtype = inputs[0].layout.dtype();
+    let output_dtype = output.layout.dtype();
+    let float_cast = matches!(input_dtype, DType::F32 | DType::F16 | DType::BF16)
+        && matches!(output_dtype, DType::F32 | DType::F16 | DType::BF16);
+    let integer_copy =
+        matches!(input_dtype, DType::I32 | DType::U32) && input_dtype == output_dtype;
+    if !float_cast && !integer_copy {
+        return Err(OpError::DType {
+            operand: Operand::Input(0),
+            dtype: input_dtype,
+        });
+    }
     check_shape(output, inputs[0], Operand::Output)?;
     Ok(())
 }

@@ -2,7 +2,7 @@
 
 use std::{error::Error, fmt};
 
-use forja_core::{Backend, BackendError, DType, Op, Submission, Tensor, ViewOp};
+use forja_core::{Backend, BackendError, DType, Op, Slice, Submission, Tensor, ViewOp};
 use half::{bf16, f16};
 
 /// The f32 normwise relative-error limit.
@@ -40,6 +40,16 @@ impl TensorSpec {
             dtype,
             allocation_shape: allocation_shape.to_vec(),
             view: Some(ViewOp::Permute(axes.to_vec())),
+        }
+    }
+
+    /// Describes a tensor viewed through independent axis slices.
+    #[must_use]
+    pub fn sliced(dtype: DType, allocation_shape: &[u32], slices: &[Slice]) -> Self {
+        Self {
+            dtype,
+            allocation_shape: allocation_shape.to_vec(),
+            view: Some(ViewOp::Slice(slices.to_vec())),
         }
     }
 }
@@ -93,6 +103,8 @@ pub enum AgreementError {
         /// Maximum accepted normwise relative error.
         tolerance: f64,
     },
+    /// Candidate integer output differed from the reference bytes.
+    OutputMismatch,
 }
 
 impl fmt::Display for AgreementError {
@@ -179,8 +191,15 @@ where
     let candidate_output = allocate(candidate, output)?;
     run(reference, op, &reference_inputs, &reference_output)?;
     run(candidate, op, &candidate_inputs, &candidate_output)?;
-    let expected = decode(&reference.read(&reference_output)?, output.dtype)?;
-    let actual = decode(&candidate.read(&candidate_output)?, output.dtype)?;
+    let expected_bytes = reference.read(&reference_output)?;
+    let actual_bytes = candidate.read(&candidate_output)?;
+    if matches!(output.dtype, DType::I32 | DType::U32) {
+        return (expected_bytes == actual_bytes)
+            .then_some(())
+            .ok_or(AgreementError::OutputMismatch);
+    }
+    let expected = decode(&expected_bytes, output.dtype)?;
+    let actual = decode(&actual_bytes, output.dtype)?;
     let error = normwise_relative_error(&expected, &actual);
     let tolerance = dtype_tolerance(output.dtype)?;
     if error > tolerance {
@@ -249,9 +268,8 @@ fn generated_bytes(
             DType::F32 => bytes.extend_from_slice(&value.to_le_bytes()),
             DType::F16 => bytes.extend_from_slice(&f16::from_f32(value).to_le_bytes()),
             DType::BF16 => bytes.extend_from_slice(&bf16::from_f32(value).to_le_bytes()),
-            DType::I32 | DType::U32 => {
-                return Err(AgreementError::UnsupportedDType(spec.dtype));
-            }
+            DType::I32 => bytes.extend_from_slice(&value.to_bits().cast_signed().to_le_bytes()),
+            DType::U32 => bytes.extend_from_slice(&value.to_bits().to_le_bytes()),
         }
     }
     Ok(bytes)

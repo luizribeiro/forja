@@ -45,3 +45,20 @@ void store_float(device uchar *buffer, ulong index, uint dtype, float value) {
         *reinterpret_cast<device bfloat *>(buffer + index * 2) = bfloat(value);
     }
 }
+
+void copy_value(
+    device const uchar *input,
+    device uchar *output,
+    ulong input_index,
+    ulong output_index) {
+    if (input0_dtype < 3) {
+        store_float(output, output_index, output_dtype,
+                    load_float(input, input_index, input0_dtype));
+    } else if (input0_dtype == 3) {
+        reinterpret_cast<device int *>(output)[output_index] =
+            reinterpret_cast<device const int *>(input)[input_index];
+    } else {
+        reinterpret_cast<device uint *>(output)[output_index] =
+            reinterpret_cast<device const uint *>(input)[input_index];
+    }
+}

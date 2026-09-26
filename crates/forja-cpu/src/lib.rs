@@ -129,6 +129,14 @@ impl CpuBackend {
     }
 
     fn execute_copy(&self, inputs: &[Tensor], output: &Tensor) -> Result<(), BackendError> {
+        if matches!(inputs[0].layout().dtype(), DType::I32 | DType::U32) {
+            let bytes = self.read(&inputs[0])?;
+            let mut buffers = self
+                .buffers
+                .lock()
+                .map_err(|_| BackendError::ExecutionFailed)?;
+            return scatter(buffers.get_mut(output)?, output.layout(), &bytes);
+        }
         let values = decode(&self.read(&inputs[0])?, inputs[0].layout().dtype())
             .ok_or(BackendError::ExecutionFailed)?;
         self.write_output(output, &values)
