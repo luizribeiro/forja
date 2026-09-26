@@ -154,9 +154,32 @@ impl CpuBackend {
     }
 
     fn execute_copy(&self, inputs: &[Tensor], output: &Tensor) -> Result<(), BackendError> {
-        let values = self.read(&inputs[0])?;
-        let converted = convert(&values, inputs[0].layout().dtype(), output.layout().dtype())
+        let values = decode(&self.read(&inputs[0])?, inputs[0].layout().dtype())
             .ok_or(BackendError::ExecutionFailed)?;
+        self.write_output(output, &values)
+    }
+
+    fn execute_binary(
+        &self,
+        inputs: &[Tensor],
+        output: &Tensor,
+        function: impl Fn(f32, f32) -> f32,
+    ) -> Result<(), BackendError> {
+        let left = decode(&self.read(&inputs[0])?, inputs[0].layout().dtype())
+            .ok_or(BackendError::ExecutionFailed)?;
+        let right = decode(&self.read(&inputs[1])?, inputs[1].layout().dtype())
+            .ok_or(BackendError::ExecutionFailed)?;
+        let values = left
+            .into_iter()
+            .zip(right)
+            .map(|(a, b)| function(a, b))
+            .collect::<Vec<_>>();
+        self.write_output(output, &values)
+    }
+
+    fn write_output(&self, output: &Tensor, values: &[f32]) -> Result<(), BackendError> {
+        let converted =
+            encode(values, output.layout().dtype()).ok_or(BackendError::ExecutionFailed)?;
         let mut state = self
             .state
             .lock()
@@ -216,6 +239,7 @@ impl Backend for CpuBackend {
             .into_iter()
             .try_for_each(|dispatch| match dispatch.op() {
                 Op::Copy => self.execute_copy(dispatch.inputs(), dispatch.output()),
+                Op::Add => self.execute_binary(dispatch.inputs(), dispatch.output(), |a, b| a + b),
             });
         Ok(CpuSubmission(result))
     }
@@ -294,17 +318,30 @@ fn scatter(target: &mut [u8], layout: &Layout, source: &[u8]) -> Result<(), Back
     Ok(())
 }
 
-fn convert(source: &[u8], input: DType, output: DType) -> Option<Vec<u8>> {
+fn decode(source: &[u8], input: DType) -> Option<Vec<f32>> {
     let input_width = usize::try_from(input.byte_size()).ok()?;
-    let mut result =
-        Vec::with_capacity(source.len() / input_width * usize::try_from(output.byte_size()).ok()?);
-    for bytes in source.chunks_exact(input_width) {
-        let value = match input {
-            DType::F32 => f32::from_le_bytes(bytes.try_into().ok()?),
-            DType::F16 => f16::from_le_bytes(bytes.try_into().ok()?).to_f32(),
-            DType::BF16 => bf16::from_le_bytes(bytes.try_into().ok()?).to_f32(),
-            DType::I32 | DType::U32 => return None,
-        };
+    source
+        .chunks_exact(input_width)
+        .map(|bytes| match input {
+            DType::F32 => bytes.try_into().ok().map(f32::from_le_bytes),
+            DType::F16 => bytes
+                .try_into()
+                .ok()
+                .map(f16::from_le_bytes)
+                .map(f16::to_f32),
+            DType::BF16 => bytes
+                .try_into()
+                .ok()
+                .map(bf16::from_le_bytes)
+                .map(bf16::to_f32),
+            DType::I32 | DType::U32 => None,
+        })
+        .collect()
+}
+
+fn encode(source: &[f32], output: DType) -> Option<Vec<u8>> {
+    let mut result = Vec::with_capacity(source.len() * usize::try_from(output.byte_size()).ok()?);
+    for &value in source {
         match output {
             DType::F32 => result.extend_from_slice(&value.to_le_bytes()),
             DType::F16 => result.extend_from_slice(&f16::from_f32(value).to_le_bytes()),
@@ -403,5 +440,36 @@ mod tests {
             backend.submit(commands),
             Err(BackendError::InvalidInput)
         ));
+    }
+
+    #[test]
+    fn adds_a_broadcast_operand() {
+        let backend = CpuBackend::new();
+        let left = backend.alloc(DType::F32, &[2, 3]).unwrap();
+        backend
+            .write(&left, &f32_bytes(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]))
+            .unwrap();
+        let row = backend.alloc(DType::F32, &[1, 3]).unwrap();
+        backend
+            .write(&row, &f32_bytes(&[10.0, 20.0, 30.0]))
+            .unwrap();
+        let right = backend.view(&row, ViewOp::Broadcast(vec![2, 3])).unwrap();
+        let output = backend.alloc(DType::F32, &[2, 3]).unwrap();
+        let mut commands = CommandList::new();
+        commands
+            .dispatch(Op::Add, &[&left, &right], &output)
+            .unwrap();
+        backend.submit(commands).unwrap().wait().unwrap();
+        assert_eq!(
+            backend.read(&output).unwrap(),
+            f32_bytes(&[11.0, 22.0, 33.0, 14.0, 25.0, 36.0])
+        );
+    }
+
+    fn f32_bytes(values: &[f32]) -> Vec<u8> {
+        values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect()
     }
 }

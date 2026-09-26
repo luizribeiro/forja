@@ -88,6 +88,8 @@ impl Tensor {
 pub enum Op {
     /// Copies and optionally casts one tensor.
     Copy,
+    /// Adds two tensors elementwise.
+    Add,
 }
 
 /// An operand named by an operation validation error.
@@ -188,6 +190,7 @@ impl CommandList {
         check_common(inputs, output)?;
         match op {
             Op::Copy => check_copy(inputs, output)?,
+            Op::Add => check_binary(inputs, output)?,
         }
         self.dispatches.push(Dispatch {
             op,
@@ -225,10 +228,27 @@ fn check_copy(inputs: &[&Tensor], output: &Tensor) -> Result<(), OpError> {
     }
     check_float(inputs[0], Operand::Input(0))?;
     check_float(output, Operand::Output)?;
-    if inputs[0].layout.shape() != output.layout.shape() {
-        return Err(OpError::Shape {
-            operand: Operand::Input(0),
+    check_shape(output, inputs[0], Operand::Output)?;
+    Ok(())
+}
+
+fn check_binary(inputs: &[&Tensor], output: &Tensor) -> Result<(), OpError> {
+    if inputs.len() != 2 {
+        return Err(OpError::Arity {
+            expected: 2,
+            actual: inputs.len(),
         });
+    }
+    check_float(inputs[0], Operand::Input(0))?;
+    check_float(inputs[1], Operand::Input(1))?;
+    check_float(output, Operand::Output)?;
+    check_shape(inputs[1], inputs[0], Operand::Input(1))?;
+    check_shape(output, inputs[0], Operand::Output)
+}
+
+fn check_shape(tensor: &Tensor, expected: &Tensor, operand: Operand) -> Result<(), OpError> {
+    if tensor.layout.shape() != expected.layout.shape() {
+        return Err(OpError::Shape { operand });
     }
     Ok(())
 }
@@ -282,7 +302,35 @@ mod tests {
         assert_eq!(
             CommandList::new().dispatch(Op::Copy, &[&input], &wrong_shape),
             Err(OpError::Shape {
-                operand: Operand::Input(0)
+                operand: Operand::Output
+            })
+        );
+    }
+
+    #[test]
+    fn add_rejects_invalid_signatures() {
+        let input = tensor(1, DType::F32, &[2], &[1]);
+        let integer = tensor(2, DType::U32, &[2], &[1]);
+        let wrong_shape = tensor(3, DType::F32, &[1], &[1]);
+        let output = tensor(4, DType::F32, &[2], &[1]);
+        assert_eq!(
+            CommandList::new().dispatch(Op::Add, &[&input], &output),
+            Err(OpError::Arity {
+                expected: 2,
+                actual: 1
+            })
+        );
+        assert_eq!(
+            CommandList::new().dispatch(Op::Add, &[&input, &integer], &output),
+            Err(OpError::DType {
+                operand: Operand::Input(1),
+                dtype: DType::U32
+            })
+        );
+        assert_eq!(
+            CommandList::new().dispatch(Op::Add, &[&input, &wrong_shape], &output),
+            Err(OpError::Shape {
+                operand: Operand::Input(1)
             })
         );
     }
