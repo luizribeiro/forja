@@ -1,0 +1,11 @@
+name: Set up Nix
+description: Install Nix and configure the shared build cache.
+
+runs:
+  using: composite
+  steps:
+    - uses: nixbuild/nix-quick-install-action@v35
+    - uses: nix-community/cache-nix-action@v7
+      with:
+        primary-key: nix-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('flake.lock', 'Cargo.lock', '**/*.nix') }}
+        restore-prefixes-first-match: nix-${{ runner.os }}-${{ runner.arch }}-

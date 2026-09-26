@@ -72,7 +72,18 @@
           cargo-nextest = cargoHook {
             name = "cargo-nextest-hook";
             runtimeInputs = [ pkgs.cargo-nextest ];
-            text = "cargo nextest run --release --workspace --all-features --locked --no-tests pass";
+            text = ''
+              if [[ "''${FORJA_NO_GPU:-}" == "1" ]]; then
+                if [[ "''${GITHUB_ACTIONS:-}" != "true" ]]; then
+                  echo "FORJA_NO_GPU is reserved for GitHub Actions" >&2
+                  exit 1
+                fi
+                cargo nextest run --release --workspace --all-features --locked --no-tests pass \
+                  -E 'not test(submits_empty_metal4_command_buffer)'
+              else
+                cargo nextest run --release --workspace --all-features --locked --no-tests pass
+              fi
+            '';
           };
           cargo-deny = cargoHook {
             name = "cargo-deny-hook";
