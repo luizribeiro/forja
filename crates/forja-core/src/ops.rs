@@ -106,6 +106,8 @@ pub enum Op {
         /// The positive finite frequency base.
         theta: f32,
     },
+    /// Gathers embedding rows by token id.
+    Embed,
 }
 
 /// An operand named by an operation validation error.
@@ -219,6 +221,7 @@ impl CommandList {
             Op::RmsNorm { eps } => check_rms_norm(inputs, output, eps)?,
             Op::Softmax => check_softmax(inputs, output)?,
             Op::Rope { theta } => check_rope(inputs, output, theta)?,
+            Op::Embed => check_embed(inputs, output)?,
         }
         self.dispatches.push(Dispatch {
             op,
@@ -366,6 +369,41 @@ fn check_rope(inputs: &[&Tensor], output: &Tensor, theta: f32) -> Result<(), OpE
         });
     }
     check_shape(output, inputs[0], Operand::Output)
+}
+
+fn check_embed(inputs: &[&Tensor], output: &Tensor) -> Result<(), OpError> {
+    if inputs.len() != 2 {
+        return Err(OpError::Arity {
+            expected: 2,
+            actual: inputs.len(),
+        });
+    }
+    check_float(inputs[0], Operand::Input(0))?;
+    if inputs[1].layout.dtype() != DType::U32 {
+        return Err(OpError::DType {
+            operand: Operand::Input(1),
+            dtype: inputs[1].layout.dtype(),
+        });
+    }
+    check_float(output, Operand::Output)?;
+    let table = inputs[0].layout.shape();
+    let ids = inputs[1].layout.shape();
+    if table.len() != 2 {
+        return Err(OpError::Shape {
+            operand: Operand::Input(0),
+        });
+    }
+    if ids.len() != 1 {
+        return Err(OpError::Shape {
+            operand: Operand::Input(1),
+        });
+    }
+    if output.layout.shape() != [ids[0], table[1]] {
+        return Err(OpError::Shape {
+            operand: Operand::Output,
+        });
+    }
+    Ok(())
 }
 
 fn check_float(tensor: &Tensor, operand: Operand) -> Result<(), OpError> {
@@ -600,6 +638,28 @@ mod tests {
             ),
             Err(OpError::EmptyOperand {
                 operand: Operand::Input(0)
+            })
+        );
+    }
+
+    #[test]
+    fn embed_rejects_invalid_signatures() {
+        let table = tensor(1, DType::F32, &[1000, 1024], &[1024, 1]);
+        let ids = tensor(2, DType::U32, &[3], &[1]);
+        let wrong_output = tensor(3, DType::F32, &[3, 1023], &[1023, 1]);
+        assert_eq!(
+            CommandList::new().dispatch(Op::Embed, &[&table, &ids], &wrong_output),
+            Err(OpError::Shape {
+                operand: Operand::Output
+            })
+        );
+        let float_ids = tensor(4, DType::F32, &[3], &[1]);
+        let output = tensor(5, DType::F32, &[3, 1024], &[1024, 1]);
+        assert_eq!(
+            CommandList::new().dispatch(Op::Embed, &[&table, &float_ids], &output),
+            Err(OpError::DType {
+                operand: Operand::Input(1),
+                dtype: DType::F32
             })
         );
     }

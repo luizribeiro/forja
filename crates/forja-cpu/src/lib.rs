@@ -274,6 +274,41 @@ impl CpuBackend {
         }
         self.write_output(output, &values)
     }
+
+    fn execute_embed(&self, inputs: &[Tensor], output: &Tensor) -> Result<(), BackendError> {
+        let table = decode(&self.read(&inputs[0])?, inputs[0].layout().dtype())
+            .ok_or(BackendError::ExecutionFailed)?;
+        let ids = decode_u32(&self.read(&inputs[1])?).ok_or(BackendError::ExecutionFailed)?;
+        let shape = inputs[0].layout().shape();
+        let vocab = execution_usize(shape[0])?;
+        let width = execution_usize(shape[1])?;
+        let capacity = execution_usize(output.layout().element_count())?;
+        let mut values = Vec::with_capacity(capacity);
+        let mut first_bad = None;
+        for id in ids {
+            if let Ok(row) = execution_usize(id)
+                && row < vocab
+            {
+                let start = row
+                    .checked_mul(width)
+                    .ok_or(BackendError::ExecutionFailed)?;
+                let end = start
+                    .checked_add(width)
+                    .ok_or(BackendError::ExecutionFailed)?;
+                values
+                    .extend_from_slice(table.get(start..end).ok_or(BackendError::ExecutionFailed)?);
+            } else {
+                let end = values
+                    .len()
+                    .checked_add(width)
+                    .ok_or(BackendError::ExecutionFailed)?;
+                values.resize(end, 0.0);
+                first_bad.get_or_insert(id);
+            }
+        }
+        self.write_output(output, &values)?;
+        first_bad.map_or(Ok(()), |index| Err(BackendError::IndexOutOfRange { index }))
+    }
 }
 
 impl Default for CpuBackend {
@@ -336,6 +371,7 @@ impl Backend for CpuBackend {
                 Op::Rope { theta } => {
                     self.execute_rope(dispatch.inputs(), dispatch.output(), theta)
                 }
+                Op::Embed => self.execute_embed(dispatch.inputs(), dispatch.output()),
             });
         Ok(CpuSubmission(result))
     }
@@ -705,16 +741,60 @@ mod tests {
         assert_relative(&actual, &expected, 1e-5);
     }
 
+    #[test]
+    fn embeds_rows_near_both_ends_of_a_qwen_width_table() {
+        let backend = CpuBackend::new();
+        let table = backend.alloc(DType::F32, &[1000, 1024]).unwrap();
+        let values = (0_u16..251)
+            .cycle()
+            .take(1000 * 1024)
+            .map(f32::from)
+            .collect::<Vec<_>>();
+        backend.write(&table, &f32_bytes(&values)).unwrap();
+        let ids = backend.alloc(DType::U32, &[4]).unwrap();
+        backend.write(&ids, &u32_bytes(&[0, 1, 998, 999])).unwrap();
+        let output = backend.alloc(DType::F32, &[4, 1024]).unwrap();
+        let mut commands = CommandList::new();
+        commands
+            .dispatch(Op::Embed, &[&table, &ids], &output)
+            .unwrap();
+        backend.submit(commands).unwrap().wait().unwrap();
+        let actual = decode(&backend.read(&output).unwrap(), DType::F32).unwrap();
+        let expected = [0, 1, 998, 999]
+            .into_iter()
+            .flat_map(|row| values[row * 1024..(row + 1) * 1024].iter().copied())
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn embed_zeros_bad_rows_and_reports_the_first_bad_id() {
+        let backend = CpuBackend::new();
+        let table = backend.alloc(DType::F32, &[3, 2]).unwrap();
+        backend
+            .write(&table, &f32_bytes(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]))
+            .unwrap();
+        let ids = backend.alloc(DType::U32, &[4]).unwrap();
+        backend.write(&ids, &u32_bytes(&[2, 99, 0, 100])).unwrap();
+        let output = backend.alloc(DType::F32, &[4, 2]).unwrap();
+        let mut commands = CommandList::new();
+        commands
+            .dispatch(Op::Embed, &[&table, &ids], &output)
+            .unwrap();
+        let error = backend.submit(commands).unwrap().wait();
+        assert_eq!(error, Err(BackendError::IndexOutOfRange { index: 99 }));
+        let actual = decode(&backend.read(&output).unwrap(), DType::F32).unwrap();
+        assert_eq!(actual, [5.0, 6.0, 0.0, 0.0, 1.0, 2.0, 0.0, 0.0]);
+    }
+
     fn run_rope(values: &[f32], positions: &[u32], shape: &[u32], theta: f32) -> Vec<f32> {
         let backend = CpuBackend::new();
         let input = backend.alloc(DType::F32, shape).unwrap();
         backend.write(&input, &f32_bytes(values)).unwrap();
         let position_tensor = backend.alloc(DType::U32, &[shape[0]]).unwrap();
-        let bytes = positions
-            .iter()
-            .flat_map(|value| value.to_le_bytes())
-            .collect::<Vec<_>>();
-        backend.write(&position_tensor, &bytes).unwrap();
+        backend
+            .write(&position_tensor, &u32_bytes(positions))
+            .unwrap();
         let output = backend.alloc(DType::F32, shape).unwrap();
         let mut commands = CommandList::new();
         commands
@@ -725,6 +805,13 @@ mod tests {
     }
 
     fn f32_bytes(values: &[f32]) -> Vec<u8> {
+        values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect()
+    }
+
+    fn u32_bytes(values: &[u32]) -> Vec<u8> {
         values
             .iter()
             .flat_map(|value| value.to_le_bytes())

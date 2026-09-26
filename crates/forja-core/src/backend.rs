@@ -26,6 +26,11 @@ pub enum BackendError {
     ExecutionFailed,
     /// An argument does not belong to this backend or violates an API rule.
     InvalidInput,
+    /// A data-dependent read used an index outside its source extent.
+    IndexOutOfRange {
+        /// The first invalid index value.
+        index: u32,
+    },
 }
 
 impl fmt::Display for BackendError {
