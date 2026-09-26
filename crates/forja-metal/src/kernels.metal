@@ -159,6 +159,97 @@ kernel void rms_norm_looped(
                         simd_lane, simd_group, partial, inverse_rms);
 }
 
+template <bool looped>
+void softmax_body(
+    device const uchar *input,
+    device uchar *output,
+    constant TensorLayout &input_layout,
+    constant TensorLayout &output_layout,
+    uint width,
+    uint row,
+    uint lane,
+    uint group_width,
+    uint simd_lane,
+    uint simd_group,
+    threadgroup float *partial,
+    threadgroup float &row_value) {
+    uint step = looped ? group_width : width;
+    float maximum = -INFINITY;
+    for (uint column = lane; column < width; column += step) {
+        maximum = max(maximum, load_float(
+            input, physical_index(input_layout, row * width + column), input0_dtype));
+    }
+    maximum = simd_max(maximum);
+    if (simd_group == 0) {
+        partial[simd_lane] = -INFINITY;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_lane == 0) {
+        partial[simd_group] = maximum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_group == 0) {
+        maximum = simd_max(partial[simd_lane]);
+        if (simd_lane == 0) {
+            row_value = maximum;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    maximum = row_value;
+    float sum = 0.0f;
+    if (maximum != -INFINITY) {
+        for (uint column = lane; column < width; column += step) {
+            float value = load_float(
+                input, physical_index(input_layout, row * width + column), input0_dtype);
+            sum += exp(value - maximum);
+        }
+    }
+    sum = simd_sum(sum);
+    if (simd_group == 0) {
+        partial[simd_lane] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_lane == 0) {
+        partial[simd_group] = sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_group == 0) {
+        sum = simd_sum(partial[simd_lane]);
+        if (simd_lane == 0) {
+            row_value = sum;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint column = lane; column < width; column += group_width) {
+        uint linear = row * width + column;
+        float value = maximum == -INFINITY ? 0.0f :
+            exp(load_float(input, physical_index(input_layout, linear), input0_dtype) - maximum) /
+                row_value;
+        store_float(output, physical_index(output_layout, linear), output_dtype, value);
+    }
+}
+
+#define DEFINE_SOFTMAX(NAME, LOOPED) \
+kernel void NAME( \
+    device const uchar *input [[buffer(0)]], \
+    device uchar *output [[buffer(1)]], \
+    constant TensorLayout &input_layout [[buffer(2)]], \
+    constant TensorLayout &output_layout [[buffer(3)]], \
+    constant uint &width [[buffer(4)]], \
+    uint row [[threadgroup_position_in_grid]], \
+    uint lane [[thread_position_in_threadgroup]], \
+    uint group_width [[threads_per_threadgroup]], \
+    uint simd_lane [[thread_index_in_simdgroup]], \
+    uint simd_group [[simdgroup_index_in_threadgroup]]) { \
+    threadgroup float partial[32]; \
+    threadgroup float row_value; \
+    softmax_body<LOOPED>(input, output, input_layout, output_layout, width, row, lane, \
+                         group_width, simd_lane, simd_group, partial, row_value); \
+}
+
+DEFINE_SOFTMAX(softmax_single, false)
+DEFINE_SOFTMAX(softmax_looped, true)
+
 kernel void silu_mul(
     device const uchar *gate [[buffer(0)]],
     device const uchar *up [[buffer(1)]],

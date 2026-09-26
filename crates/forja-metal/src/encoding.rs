@@ -17,7 +17,7 @@ use objc2_metal::{
     MTL4CommandBuffer, MTL4CommandQueue, MTL4CommitFeedback, MTL4CommitOptions, MTLAllocation,
     MTLBuffer, MTLComputePipelineState, MTLDataType, MTLDevice, MTLEvent,
     MTLFunctionConstantValues, MTLLibrary, MTLResidencySet, MTLResidencySetDescriptor,
-    MTLSharedEvent, MTLSharedEventListener,
+    MTLSharedEvent, MTLSharedEventListener, MTLSize,
 };
 
 use crate::storage::MetalBackend;
@@ -297,7 +297,7 @@ impl MetalBackend {
         if dispatches.iter().any(|dispatch| {
             !matches!(
                 dispatch.op(),
-                Op::Copy | Op::Add | Op::SiluMul | Op::RmsNorm { .. }
+                Op::Copy | Op::Add | Op::SiluMul | Op::RmsNorm { .. } | Op::Softmax
             )
         }) {
             return Err(BackendError::InvalidInput);
@@ -354,6 +354,10 @@ impl MetalBackend {
                 temporaries.extend(self.encode_rms_norm(&encoder, &table, dispatch, eps)?);
                 continue;
             }
+            if dispatch.op() == Op::Softmax {
+                temporaries.extend(self.encode_softmax(&encoder, &table, dispatch)?);
+                continue;
+            }
             let kernel = match dispatch.op() {
                 Op::Copy
                     if dispatch.inputs()[0].layout().is_contiguous()
@@ -380,6 +384,61 @@ impl MetalBackend {
         encoder.endEncoding();
         Ok(temporaries)
     }
+    fn encode_softmax(
+        &self,
+        encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
+        table: &ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>,
+        dispatch: &Dispatch,
+    ) -> Result<Vec<Retained<ProtocolObject<dyn MTLBuffer>>>, BackendError> {
+        use objc2_metal::{MTL4ArgumentTable, MTL4ComputeCommandEncoder};
+
+        let [input] = dispatch.inputs() else {
+            return Err(BackendError::InvalidInput);
+        };
+        let output = dispatch.output();
+        let width = *input
+            .layout()
+            .shape()
+            .last()
+            .ok_or(BackendError::InvalidInput)?;
+        let constants = [
+            (0, dtype_code(input.layout().dtype())),
+            (2, dtype_code(output.layout().dtype())),
+        ];
+        let kernel = if width <= 1024 {
+            "softmax_single"
+        } else {
+            "softmax_looped"
+        };
+        let pipeline = self
+            .pipelines
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?
+            .get(kernel, &constants)?;
+        encoder.setComputePipelineState(&pipeline);
+        let temporaries = vec![
+            self.layout_buffer(input.layout())?,
+            self.layout_buffer(output.layout())?,
+            self.temporary_buffer(&width.to_ne_bytes())?,
+        ];
+        let buffers = self
+            .buffers
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?;
+        // SAFETY: The table slots exist and all bound resources are retained through completion.
+        unsafe {
+            table.setAddress_atIndex(buffers.get(input)?.raw.gpuAddress(), 0);
+            table.setAddress_atIndex(buffers.get(output)?.raw.gpuAddress(), 1);
+            table.setAddress_atIndex(temporaries[0].gpuAddress(), 2);
+            table.setAddress_atIndex(temporaries[1].gpuAddress(), 3);
+            table.setAddress_atIndex(temporaries[2].gpuAddress(), 4);
+        }
+        drop(buffers);
+        encoder.setArgumentTable(Some(table));
+        let (threadgroups, threads) = row_dispatch_geometry(&pipeline, output.layout(), width)?;
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(threadgroups, threads);
+        Ok(temporaries)
+    }
 
     fn encode_rms_norm(
         &self,
@@ -388,7 +447,7 @@ impl MetalBackend {
         dispatch: &Dispatch,
         eps: f32,
     ) -> Result<Vec<Retained<ProtocolObject<dyn MTLBuffer>>>, BackendError> {
-        use objc2_metal::{MTL4ArgumentTable, MTL4ComputeCommandEncoder, MTLSize};
+        use objc2_metal::{MTL4ArgumentTable, MTL4ComputeCommandEncoder};
 
         let [input, weight] = dispatch.inputs() else {
             return Err(BackendError::InvalidInput);
@@ -442,33 +501,8 @@ impl MetalBackend {
         }
         drop(buffers);
         encoder.setArgumentTable(Some(table));
-        let max_threads = pipeline.maxTotalThreadsPerThreadgroup();
-        let thread_count = if width <= 1024 {
-            usize::try_from(width)
-                .map_err(|_| BackendError::ExecutionFailed)?
-                .next_multiple_of(32)
-                .min(max_threads)
-        } else {
-            max_threads.min(256)
-        };
-        let rows = dispatch
-            .output()
-            .layout()
-            .element_count()
-            .checked_div(u64::from(width))
-            .ok_or(BackendError::InvalidInput)?;
-        encoder.dispatchThreadgroups_threadsPerThreadgroup(
-            MTLSize {
-                width: usize::try_from(rows).map_err(|_| BackendError::ExecutionFailed)?,
-                height: 1,
-                depth: 1,
-            },
-            MTLSize {
-                width: thread_count,
-                height: 1,
-                depth: 1,
-            },
-        );
+        let (threadgroups, threads) = row_dispatch_geometry(&pipeline, output.layout(), width)?;
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(threadgroups, threads);
         Ok(temporaries)
     }
 
@@ -695,6 +729,38 @@ impl MetalBackend {
             timeout: self.gpu_timeout,
         })
     }
+}
+
+fn row_dispatch_geometry(
+    pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
+    output: &Layout,
+    width: u32,
+) -> Result<(MTLSize, MTLSize), BackendError> {
+    let max_threads = pipeline.maxTotalThreadsPerThreadgroup();
+    let thread_count = if width <= 1024 {
+        usize::try_from(width)
+            .map_err(|_| BackendError::ExecutionFailed)?
+            .next_multiple_of(32)
+            .min(max_threads)
+    } else {
+        max_threads.min(256)
+    };
+    let rows = output
+        .element_count()
+        .checked_div(u64::from(width))
+        .ok_or(BackendError::InvalidInput)?;
+    Ok((
+        MTLSize {
+            width: usize::try_from(rows).map_err(|_| BackendError::ExecutionFailed)?,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: thread_count,
+            height: 1,
+            depth: 1,
+        },
+    ))
 }
 
 const fn dtype_code(dtype: DType) -> u32 {
@@ -1071,6 +1137,63 @@ mod tests {
                 TensorSpec::contiguous(DType::BF16, &[1024]),
             ],
             &TensorSpec::contiguous(DType::F16, &[7, 1024]),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn metal_softmax_matches_cpu_for_dtypes_rows_and_masking() {
+        let reference = CpuBackend::new();
+        let candidate = MetalBackend::new().unwrap();
+        for dtype in [DType::F32, DType::F16, DType::BF16] {
+            for width in [1, 7, 33, 4097] {
+                assert_backends_agree(
+                    &reference,
+                    &candidate,
+                    Op::Softmax,
+                    &[TensorSpec::contiguous(dtype, &[7, width])],
+                    &TensorSpec::contiguous(dtype, &[7, width]),
+                )
+                .unwrap();
+            }
+            assert_backends_agree(
+                &reference,
+                &candidate,
+                Op::Softmax,
+                &[TensorSpec::permuted(dtype, &[33, 7], &[1, 0])],
+                &TensorSpec::contiguous(dtype, &[7, 33]),
+            )
+            .unwrap();
+        }
+        let masked = [
+            0.0_f32,
+            f32::NEG_INFINITY,
+            1.0,
+            -1.0,
+            f32::NEG_INFINITY,
+            2.0,
+            0.5,
+        ]
+        .into_iter()
+        .flat_map(f32::to_le_bytes)
+        .collect::<Vec<_>>();
+        assert_backends_agree(
+            &reference,
+            &candidate,
+            Op::Softmax,
+            &[TensorSpec::initialized(DType::F32, &[1, 7], masked)],
+            &TensorSpec::contiguous(DType::F32, &[1, 7]),
+        )
+        .unwrap();
+        let all_masked = std::iter::repeat_n(f32::NEG_INFINITY, 33)
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>();
+        assert_backends_agree(
+            &reference,
+            &candidate,
+            Op::Softmax,
+            &[TensorSpec::initialized(DType::F32, &[1, 33], all_masked)],
+            &TensorSpec::contiguous(DType::F32, &[1, 33]),
         )
         .unwrap();
     }

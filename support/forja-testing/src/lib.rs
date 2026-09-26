@@ -20,6 +20,7 @@ pub struct TensorSpec {
     dtype: DType,
     allocation_shape: Vec<u32>,
     view: Option<ViewOp>,
+    initialized: Option<Vec<u8>>,
 }
 
 impl TensorSpec {
@@ -30,6 +31,7 @@ impl TensorSpec {
             dtype,
             allocation_shape: shape.to_vec(),
             view: None,
+            initialized: None,
         }
     }
 
@@ -40,6 +42,7 @@ impl TensorSpec {
             dtype,
             allocation_shape: allocation_shape.to_vec(),
             view: Some(ViewOp::Permute(axes.to_vec())),
+            initialized: None,
         }
     }
 
@@ -50,6 +53,7 @@ impl TensorSpec {
             dtype,
             allocation_shape: allocation_shape.to_vec(),
             view: Some(ViewOp::Slice(slices.to_vec())),
+            initialized: None,
         }
     }
 
@@ -60,6 +64,18 @@ impl TensorSpec {
             dtype,
             allocation_shape: allocation_shape.to_vec(),
             view: Some(ViewOp::Broadcast(shape.to_vec())),
+            initialized: None,
+        }
+    }
+
+    /// Describes a contiguous tensor with explicit allocation bytes.
+    #[must_use]
+    pub fn initialized(dtype: DType, shape: &[u32], bytes: Vec<u8>) -> Self {
+        Self {
+            dtype,
+            allocation_shape: shape.to_vec(),
+            view: None,
+            initialized: Some(bytes),
         }
     }
 }
@@ -260,6 +276,9 @@ fn generated_bytes(
     spec: &TensorSpec,
     values: &mut DeterministicValues,
 ) -> Result<Vec<u8>, AgreementError> {
+    if let Some(bytes) = &spec.initialized {
+        return Ok(bytes.clone());
+    }
     let count = spec
         .allocation_shape
         .iter()
