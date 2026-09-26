@@ -2,8 +2,10 @@
 //! Use this crate to describe validated tensor views and operation signatures.
 
 mod layout;
+mod quantized;
 
 pub use layout::{Layout, LayoutError, MAX_RANK, Slice, byte_ranges_overlap, is_injective};
+pub use quantized::{QuantizedMatrix, QuantizedMatrixError, QuantizedMatrixPart};
 
 /// A scalar type stored in an unquantized tensor.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
