@@ -55,13 +55,42 @@
             pass_filenames = false;
           };
         cargoHooks = {
-          rustfmt =
+          rustfmt = cargoHook {
+            name = "rustfmt-hook";
+            text = "cargo fmt --all -- --check";
+          };
+          clippy = cargoHook {
+            name = "clippy-hook";
+            text = "cargo clippy --workspace --all-targets --all-features --locked -- -D warnings";
+          };
+          cargo-nextest = cargoHook {
+            name = "cargo-nextest-hook";
+            runtimeInputs = [ pkgs.cargo-nextest ];
+            text = "cargo nextest run --release --workspace --all-features --locked --no-tests pass";
+          };
+          cargo-deny = cargoHook {
+            name = "cargo-deny-hook";
+            runtimeInputs = [ pkgs.cargo-deny ];
+            files = "(^|/)(Cargo\\.(toml|lock)|deny\\.toml)$";
+            text = "cargo deny check bans licenses sources";
+          };
+          doctests =
             (cargoHook {
-              name = "rustfmt-hook";
-              text = "cargo fmt --all -- --check";
+              name = "doctests-hook";
+              text = "cargo test --doc --workspace --all-features --locked";
             })
             // {
-              enable = false;
+              stages = [ "pre-push" ];
+            };
+          docs =
+            (cargoHook {
+              name = "docs-hook";
+              text = ''
+                RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features --locked
+              '';
+            })
+            // {
+              stages = [ "pre-push" ];
             };
         };
         offlineHooks = {
