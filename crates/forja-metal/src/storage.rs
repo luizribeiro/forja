@@ -1,5 +1,6 @@
 use std::{ptr, slice, sync::Mutex};
 
+use crate::encoding::PipelineCache;
 use forja_core::{
     AllocationRegistry, Backend, BackendError, CommandList, DType, Layout, Submission, Tensor,
     ViewOp,
@@ -37,7 +38,7 @@ impl MetalBuffer {
 
 /// A Metal 4 backend using shared unified-memory buffers.
 pub struct MetalBackend {
-    device: Retained<ProtocolObject<dyn MTLDevice>>,
+    pub(super) device: Retained<ProtocolObject<dyn MTLDevice>>,
     _queue: Retained<ProtocolObject<dyn MTL4CommandQueue>>,
     buffers: Mutex<AllocationRegistry<MetalBuffer>>,
 }
@@ -56,6 +57,8 @@ impl MetalBackend {
         let queue = device
             .newMTL4CommandQueue()
             .ok_or(BackendError::ExecutionFailed)?;
+        let mut pipelines = PipelineCache::new(&device, include_str!("kernels.metal"))?;
+        pipelines.get("hold", &[])?;
         Ok(Self {
             device,
             _queue: queue,

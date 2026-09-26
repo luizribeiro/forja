@@ -9,6 +9,9 @@ version.workspace = true
 [target.'cfg(target_os = "macos")'.dependencies]
 forja-core = { path = "../forja-core" }
 objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = [
+  "NSString",
+] }
 objc2-metal = { version = "0.3", default-features = false, features = [
   "std",
   "MTL4CommandAllocator",
@@ -16,8 +19,12 @@ objc2-metal = { version = "0.3", default-features = false, features = [
   "MTL4CommandQueue",
   "MTLAllocation",
   "MTLBuffer",
+  "MTLComputePipeline",
+  "MTLDataType",
   "MTLDevice",
   "MTLEvent",
+  "MTLFunctionConstantValues",
+  "MTLLibrary",
   "MTLResource",
 ] }
 
