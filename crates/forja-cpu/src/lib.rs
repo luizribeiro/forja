@@ -190,6 +190,30 @@ impl CpuBackend {
             .ok_or(BackendError::InvalidInput)?;
         scatter(target, output.layout(), &converted)
     }
+
+    fn execute_rms_norm(
+        &self,
+        inputs: &[Tensor],
+        output: &Tensor,
+        eps: f32,
+    ) -> Result<(), BackendError> {
+        let values = decode(&self.read(&inputs[0])?, inputs[0].layout().dtype())
+            .ok_or(BackendError::ExecutionFailed)?;
+        let weights = decode(&self.read(&inputs[1])?, inputs[1].layout().dtype())
+            .ok_or(BackendError::ExecutionFailed)?;
+        let mut normalized = Vec::with_capacity(values.len());
+        for row in values.chunks_exact(weights.len()) {
+            let sum = row.iter().fold(0.0, |sum, value| sum + value * value);
+            let count = row.iter().fold(0.0, |count, _| count + 1.0);
+            let scale = (sum / count + eps).sqrt().recip();
+            normalized.extend(
+                row.iter()
+                    .zip(&weights)
+                    .map(|(value, weight)| value * scale * weight),
+            );
+        }
+        self.write_output(output, &normalized)
+    }
 }
 
 impl Default for CpuBackend {
@@ -244,6 +268,9 @@ impl Backend for CpuBackend {
                     self.execute_binary(dispatch.inputs(), dispatch.output(), |gate, up| {
                         gate / (1.0 + (-gate).exp()) * up
                     })
+                }
+                Op::RmsNorm { eps } => {
+                    self.execute_rms_norm(dispatch.inputs(), dispatch.output(), eps)
                 }
             });
         Ok(CpuSubmission(result))
@@ -493,10 +520,48 @@ mod tests {
         assert_eq!(backend.read(&output).unwrap(), expected);
     }
 
+    #[test]
+    fn normalizes_qwen_hidden_rows_with_epsilon() {
+        let backend = CpuBackend::new();
+        let input = backend.alloc(DType::F32, &[3, 1024]).unwrap();
+        let mut values = vec![2.0; 1024];
+        values.extend(vec![-4.0; 1024]);
+        values.extend((0..512).flat_map(|_| [3.0, 4.0]));
+        backend.write(&input, &f32_bytes(&values)).unwrap();
+        let weight = backend.alloc(DType::F32, &[1024]).unwrap();
+        backend
+            .write(&weight, &f32_bytes(&vec![0.5; 1024]))
+            .unwrap();
+        let output = backend.alloc(DType::F32, &[3, 1024]).unwrap();
+        let mut commands = CommandList::new();
+        commands
+            .dispatch(Op::RmsNorm { eps: 0.25 }, &[&input, &weight], &output)
+            .unwrap();
+        backend.submit(commands).unwrap().wait().unwrap();
+        let mut expected = vec![1.0 / 4.25_f32.sqrt(); 1024];
+        expected.extend(vec![-2.0 / 16.25_f32.sqrt(); 1024]);
+        expected.extend((0..512).flat_map(|_| [1.5 / 12.75_f32.sqrt(), 2.0 / 12.75_f32.sqrt()]));
+        let actual = decode(&backend.read(&output).unwrap(), DType::F32).unwrap();
+        assert_relative(&actual, &expected, 1e-5);
+    }
+
     fn f32_bytes(values: &[f32]) -> Vec<u8> {
         values
             .iter()
             .flat_map(|value| value.to_le_bytes())
             .collect()
+    }
+
+    fn assert_relative(actual: &[f32], expected: &[f32], tolerance: f32) {
+        let (error, reference) = actual.iter().zip(expected).fold(
+            (0.0, 0.0),
+            |(error, reference), (actual, expected)| {
+                (
+                    error + (actual - expected).powi(2),
+                    reference + expected.powi(2),
+                )
+            },
+        );
+        assert!(error.sqrt() / reference.sqrt() <= tolerance);
     }
 }

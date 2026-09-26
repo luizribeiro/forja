@@ -92,6 +92,11 @@ pub enum Op {
     Add,
     /// Applies `SiLU` to a gate and multiplies it by an up tensor.
     SiluMul,
+    /// Normalizes rows by their root mean square and applies a weight.
+    RmsNorm {
+        /// The nonnegative stabilizer added before the square root.
+        eps: f32,
+    },
 }
 
 /// An operand named by an operation validation error.
@@ -132,6 +137,8 @@ pub enum OpError {
         /// The overlapping input position.
         input: usize,
     },
+    /// An RMS normalization epsilon is negative or non-finite.
+    InvalidEpsilon,
 }
 
 impl fmt::Display for OpError {
@@ -193,6 +200,7 @@ impl CommandList {
         match op {
             Op::Copy => check_copy(inputs, output)?,
             Op::Add | Op::SiluMul => check_binary(inputs, output)?,
+            Op::RmsNorm { eps } => check_rms_norm(inputs, output, eps)?,
         }
         self.dispatches.push(Dispatch {
             op,
@@ -253,6 +261,32 @@ fn check_shape(tensor: &Tensor, expected: &Tensor, operand: Operand) -> Result<(
         return Err(OpError::Shape { operand });
     }
     Ok(())
+}
+
+fn check_rms_norm(inputs: &[&Tensor], output: &Tensor, eps: f32) -> Result<(), OpError> {
+    if inputs.len() != 2 {
+        return Err(OpError::Arity {
+            expected: 2,
+            actual: inputs.len(),
+        });
+    }
+    if !eps.is_finite() || eps < 0.0 {
+        return Err(OpError::InvalidEpsilon);
+    }
+    check_float(inputs[0], Operand::Input(0))?;
+    check_float(inputs[1], Operand::Input(1))?;
+    check_float(output, Operand::Output)?;
+    let Some(&width) = inputs[0].layout.shape().last() else {
+        return Err(OpError::Shape {
+            operand: Operand::Input(0),
+        });
+    };
+    if width == 0 || inputs[1].layout.shape() != [width] {
+        return Err(OpError::Shape {
+            operand: Operand::Input(1),
+        });
+    }
+    check_shape(output, inputs[0], Operand::Output)
 }
 
 fn check_float(tensor: &Tensor, operand: Operand) -> Result<(), OpError> {
@@ -354,6 +388,50 @@ mod tests {
             Err(OpError::DType {
                 operand: Operand::Input(1),
                 dtype: DType::I32
+            })
+        );
+    }
+
+    #[test]
+    fn rms_norm_rejects_invalid_signatures() {
+        let input = tensor(1, DType::F32, &[3, 2], &[2, 1]);
+        let weight = tensor(2, DType::F32, &[3], &[1]);
+        let output = tensor(3, DType::F32, &[3, 2], &[2, 1]);
+        let integer = tensor(4, DType::I32, &[3, 2], &[2, 1]);
+        let wrong_output = tensor(5, DType::F32, &[3, 1], &[1, 1]);
+        assert_eq!(
+            CommandList::new().dispatch(Op::RmsNorm { eps: 0.0 }, &[&input], &output),
+            Err(OpError::Arity {
+                expected: 2,
+                actual: 1
+            })
+        );
+        assert_eq!(
+            CommandList::new().dispatch(Op::RmsNorm { eps: -1.0 }, &[&input, &weight], &output),
+            Err(OpError::InvalidEpsilon)
+        );
+        assert_eq!(
+            CommandList::new().dispatch(Op::RmsNorm { eps: 0.0 }, &[&input, &weight], &output),
+            Err(OpError::Shape {
+                operand: Operand::Input(1)
+            })
+        );
+        assert_eq!(
+            CommandList::new().dispatch(Op::RmsNorm { eps: 0.0 }, &[&integer, &weight], &output),
+            Err(OpError::DType {
+                operand: Operand::Input(0),
+                dtype: DType::I32
+            })
+        );
+        let good_weight = tensor(6, DType::F32, &[2], &[1]);
+        assert_eq!(
+            CommandList::new().dispatch(
+                Op::RmsNorm { eps: 0.0 },
+                &[&input, &good_weight],
+                &wrong_output
+            ),
+            Err(OpError::Shape {
+                operand: Operand::Output
             })
         );
     }
