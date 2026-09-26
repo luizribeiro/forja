@@ -1,6 +1,10 @@
 //! Core types and contracts shared by Forja's trusted backends.
 //! Use this crate to describe validated tensor views and operation signatures.
 
+mod layout;
+
+pub use layout::{Layout, LayoutError, MAX_RANK};
+
 /// A scalar type stored in an unquantized tensor.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DType {
