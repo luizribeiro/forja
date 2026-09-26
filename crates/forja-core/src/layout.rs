@@ -53,6 +53,15 @@ pub enum LayoutError {
         /// The requested target extent.
         target: u32,
     },
+    /// A reshape would require copying a non-contiguous layout.
+    NonContiguousReshape,
+    /// A reshape would change the logical element count.
+    ReshapeElementCountMismatch {
+        /// The source layout's element count.
+        source: u64,
+        /// The requested shape's element count.
+        target: u64,
+    },
 }
 
 impl fmt::Display for LayoutError {
@@ -94,6 +103,13 @@ impl fmt::Display for LayoutError {
             } => write!(
                 formatter,
                 "source extent {source} cannot broadcast to {target} on axis {axis}"
+            ),
+            Self::NonContiguousReshape => {
+                formatter.write_str("cannot reshape a non-contiguous layout without copying")
+            }
+            Self::ReshapeElementCountMismatch { source, target } => write!(
+                formatter,
+                "reshape cannot change element count from {source} to {target}"
             ),
         }
     }
@@ -253,6 +269,27 @@ impl Layout {
         self.byte_span.clone()
     }
 
+    /// Returns whether logical elements occupy dense row-major positions.
+    #[must_use]
+    pub fn is_contiguous(&self) -> bool {
+        if self.element_count == 0 {
+            return true;
+        }
+        let mut expected = 1;
+        for (&extent, &stride) in self.shape.iter().zip(&self.strides).rev() {
+            if extent > 1 {
+                if stride != expected {
+                    return false;
+                }
+                let Some(next) = expected.checked_mul(u64::from(extent)) else {
+                    return false;
+                };
+                expected = next;
+            }
+        }
+        true
+    }
+
     /// Creates a view by slicing every axis of this layout.
     ///
     /// # Errors
@@ -373,6 +410,34 @@ impl Layout {
             self.offset,
             target_shape.to_vec(),
             strides,
+            self.buffer_len,
+        )
+    }
+
+    /// Creates a contiguous view with a different shape and the same elements.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LayoutError`] when this layout is not contiguous, the element
+    /// count changes, the target rank is unsupported, or revalidation fails.
+    pub fn reshape(&self, target_shape: &[u32]) -> Result<Self, LayoutError> {
+        if !self.is_contiguous() {
+            return Err(LayoutError::NonContiguousReshape);
+        }
+        if target_shape.len() > MAX_RANK {
+            return Err(LayoutError::RankTooLarge);
+        }
+        let target_count = element_count(target_shape)?;
+        if target_count != self.element_count {
+            return Err(LayoutError::ReshapeElementCountMismatch {
+                source: self.element_count,
+                target: target_count,
+            });
+        }
+        Self::contiguous(
+            self.dtype,
+            self.offset,
+            target_shape.to_vec(),
             self.buffer_len,
         )
     }
@@ -545,6 +610,32 @@ mod tests {
     fn rejects_broadcast_rank_before_building_strides() {
         let layout = Layout::contiguous(DType::F32, 0, vec![1], 4).unwrap();
         assert_eq!(layout.broadcast(&[1; 9]), Err(LayoutError::RankTooLarge));
+    }
+
+    #[test]
+    fn reshapes_contiguous_q_heads() {
+        let layout = Layout::contiguous(DType::F16, 0, vec![33, 16, 128], 135_168).unwrap();
+        let flattened = layout.reshape(&[33, 2048]).unwrap();
+        assert_eq!(flattened.shape(), [33, 2048]);
+        assert_eq!(flattened.strides(), [2048, 1]);
+        assert_eq!(flattened.byte_span(), layout.byte_span());
+    }
+
+    #[test]
+    fn rejects_non_contiguous_or_size_changing_reshape() {
+        let layout = Layout::contiguous(DType::F32, 0, vec![7, 33], 924).unwrap();
+        let transposed = layout.permute(&[1, 0]).unwrap();
+        assert_eq!(
+            transposed.reshape(&[231]),
+            Err(LayoutError::NonContiguousReshape)
+        );
+        assert_eq!(
+            layout.reshape(&[7, 32]),
+            Err(LayoutError::ReshapeElementCountMismatch {
+                source: 231,
+                target: 224
+            })
+        );
     }
 
     proptest! {
