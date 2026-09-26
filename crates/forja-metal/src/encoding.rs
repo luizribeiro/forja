@@ -1,11 +1,17 @@
-use std::{collections::HashMap, ffi::c_void, ptr::NonNull};
+use std::{
+    collections::{HashMap, HashSet},
+    ffi::c_void,
+    ptr::NonNull,
+};
 
-use forja_core::{BackendError, CommandList, DType, Dispatch, Layout, required_barriers};
+use forja_core::{
+    BackendError, BufferId, CommandList, DType, Dispatch, Layout, Tensor, required_barriers,
+};
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_foundation::NSString;
 use objc2_metal::{
-    MTL4CommandBuffer, MTLBuffer, MTLComputePipelineState, MTLDataType, MTLDevice,
-    MTLFunctionConstantValues, MTLLibrary,
+    MTL4CommandBuffer, MTLAllocation, MTLBuffer, MTLComputePipelineState, MTLDataType, MTLDevice,
+    MTLFunctionConstantValues, MTLLibrary, MTLResidencySet, MTLResidencySetDescriptor,
 };
 
 use crate::storage::MetalBackend;
@@ -20,17 +26,25 @@ impl MetalBackend {
     pub(super) fn encode_commands(&self, commands: CommandList) -> Result<bool, BackendError> {
         let barriers = required_barriers(&commands);
         let dispatches = commands.into_dispatches();
-        for dispatch in &dispatches {
-            self.validate(dispatch.output())?;
-            for input in dispatch.inputs() {
-                self.validate(input)?;
-            }
+        let tensors = dispatches
+            .iter()
+            .flat_map(|dispatch| {
+                dispatch
+                    .inputs()
+                    .iter()
+                    .chain(std::iter::once(dispatch.output()))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for tensor in &tensors {
+            self.validate(tensor)?;
         }
         if dispatches.is_empty() {
             return Ok(false);
         }
         let command_buffer = self.begin_command_buffer()?;
-        let _temporaries = self.encode_dispatches(&command_buffer, &dispatches, &barriers)?;
+        let temporaries = self.encode_dispatches(&command_buffer, &dispatches, &barriers)?;
+        let _residency = self.make_resident(&command_buffer, &tensors, &temporaries)?;
         command_buffer.endCommandBuffer();
         Ok(true)
     }
@@ -143,6 +157,39 @@ impl MetalBackend {
             .ok_or(BackendError::ExecutionFailed)?;
         command_buffer.beginCommandBufferWithAllocator(&allocator);
         Ok(command_buffer)
+    }
+
+    fn make_resident(
+        &self,
+        command_buffer: &ProtocolObject<dyn MTL4CommandBuffer>,
+        tensors: &[Tensor],
+        temporaries: &[Retained<ProtocolObject<dyn MTLBuffer>>],
+    ) -> Result<Retained<ProtocolObject<dyn MTLResidencySet>>, BackendError> {
+        let descriptor = MTLResidencySetDescriptor::new();
+        let residency = self
+            .device
+            .newResidencySetWithDescriptor_error(&descriptor)
+            .map_err(|_| BackendError::ExecutionFailed)?;
+        let mut seen = HashSet::<BufferId>::new();
+        let buffers = self
+            .buffers
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?;
+        for tensor in tensors.iter().filter(|tensor| seen.insert(tensor.buffer())) {
+            let buffer = buffers.get(tensor)?;
+            let buffer: &ProtocolObject<dyn MTLBuffer> = &buffer.raw;
+            let allocation: &ProtocolObject<dyn MTLAllocation> = buffer.as_ref();
+            residency.addAllocation(allocation);
+        }
+        drop(buffers);
+        for buffer in temporaries {
+            let buffer: &ProtocolObject<dyn MTLBuffer> = buffer;
+            let allocation: &ProtocolObject<dyn MTLAllocation> = buffer.as_ref();
+            residency.addAllocation(allocation);
+        }
+        residency.commit();
+        command_buffer.useResidencySet(&residency);
+        Ok(residency)
     }
 }
 
