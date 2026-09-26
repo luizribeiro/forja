@@ -240,6 +240,11 @@ impl Backend for CpuBackend {
             .try_for_each(|dispatch| match dispatch.op() {
                 Op::Copy => self.execute_copy(dispatch.inputs(), dispatch.output()),
                 Op::Add => self.execute_binary(dispatch.inputs(), dispatch.output(), |a, b| a + b),
+                Op::SiluMul => {
+                    self.execute_binary(dispatch.inputs(), dispatch.output(), |gate, up| {
+                        gate / (1.0 + (-gate).exp()) * up
+                    })
+                }
             });
         Ok(CpuSubmission(result))
     }
@@ -464,6 +469,28 @@ mod tests {
             backend.read(&output).unwrap(),
             f32_bytes(&[11.0, 22.0, 33.0, 14.0, 25.0, 36.0])
         );
+    }
+
+    #[test]
+    fn computes_silu_mul_into_bf16() {
+        let backend = CpuBackend::new();
+        let gate = backend.alloc(DType::F32, &[5]).unwrap();
+        backend
+            .write(&gate, &f32_bytes(&[-10.0, -1.0, 0.0, 1.0, 10.0]))
+            .unwrap();
+        let up = backend.alloc(DType::F32, &[5]).unwrap();
+        backend.write(&up, &f32_bytes(&[1.0; 5])).unwrap();
+        let output = backend.alloc(DType::BF16, &[5]).unwrap();
+        let mut commands = CommandList::new();
+        commands
+            .dispatch(Op::SiluMul, &[&gate, &up], &output)
+            .unwrap();
+        backend.submit(commands).unwrap().wait().unwrap();
+        let expected = [-0.000_453_978_7, -0.268_941_43, 0.0, 0.731_058_6, 9.999_546]
+            .into_iter()
+            .flat_map(|value| bf16::from_f32(value).to_le_bytes())
+            .collect::<Vec<_>>();
+        assert_eq!(backend.read(&output).unwrap(), expected);
     }
 
     fn f32_bytes(values: &[f32]) -> Vec<u8> {

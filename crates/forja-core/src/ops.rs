@@ -90,6 +90,8 @@ pub enum Op {
     Copy,
     /// Adds two tensors elementwise.
     Add,
+    /// Applies `SiLU` to a gate and multiplies it by an up tensor.
+    SiluMul,
 }
 
 /// An operand named by an operation validation error.
@@ -190,7 +192,7 @@ impl CommandList {
         check_common(inputs, output)?;
         match op {
             Op::Copy => check_copy(inputs, output)?,
-            Op::Add => check_binary(inputs, output)?,
+            Op::Add | Op::SiluMul => check_binary(inputs, output)?,
         }
         self.dispatches.push(Dispatch {
             op,
@@ -331,6 +333,27 @@ mod tests {
             CommandList::new().dispatch(Op::Add, &[&input, &wrong_shape], &output),
             Err(OpError::Shape {
                 operand: Operand::Input(1)
+            })
+        );
+    }
+
+    #[test]
+    fn silu_mul_rejects_invalid_signatures() {
+        let input = tensor(1, DType::F16, &[2], &[1]);
+        let integer = tensor(2, DType::I32, &[2], &[1]);
+        let output = tensor(3, DType::BF16, &[2], &[1]);
+        assert_eq!(
+            CommandList::new().dispatch(Op::SiluMul, &[&input], &output),
+            Err(OpError::Arity {
+                expected: 2,
+                actual: 1
+            })
+        );
+        assert_eq!(
+            CommandList::new().dispatch(Op::SiluMul, &[&input, &integer], &output),
+            Err(OpError::DType {
+                operand: Operand::Input(1),
+                dtype: DType::I32
             })
         );
     }
