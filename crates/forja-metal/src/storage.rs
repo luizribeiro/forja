@@ -11,8 +11,8 @@ use objc2_metal::{
     MTLResourceOptions,
 };
 
-struct MetalBuffer {
-    raw: Retained<ProtocolObject<dyn MTLBuffer>>,
+pub(super) struct MetalBuffer {
+    pub(super) raw: Retained<ProtocolObject<dyn MTLBuffer>>,
     len: usize,
 }
 
@@ -40,7 +40,8 @@ impl MetalBuffer {
 pub struct MetalBackend {
     pub(super) device: Retained<ProtocolObject<dyn MTLDevice>>,
     _queue: Retained<ProtocolObject<dyn MTL4CommandQueue>>,
-    buffers: Mutex<AllocationRegistry<MetalBuffer>>,
+    pub(super) buffers: Mutex<AllocationRegistry<MetalBuffer>>,
+    pub(super) pipelines: Mutex<PipelineCache>,
 }
 
 impl MetalBackend {
@@ -57,16 +58,16 @@ impl MetalBackend {
         let queue = device
             .newMTL4CommandQueue()
             .ok_or(BackendError::ExecutionFailed)?;
-        let mut pipelines = PipelineCache::new(&device, include_str!("kernels.metal"))?;
-        pipelines.get("hold", &[])?;
+        let pipelines = PipelineCache::new(&device, include_str!("kernels.metal"))?;
         Ok(Self {
             device,
             _queue: queue,
             buffers: Mutex::new(AllocationRegistry::new()),
+            pipelines: Mutex::new(pipelines),
         })
     }
 
-    fn validate(&self, tensor: &Tensor) -> Result<(), BackendError> {
+    pub(super) fn validate(&self, tensor: &Tensor) -> Result<(), BackendError> {
         self.buffers
             .lock()
             .map_err(|_| BackendError::ExecutionFailed)?
@@ -152,17 +153,11 @@ impl Backend for MetalBackend {
     }
 
     fn submit(&self, commands: CommandList) -> Result<Self::Submission, BackendError> {
-        let dispatches = commands.into_dispatches();
-        for dispatch in &dispatches {
-            self.validate(dispatch.output())?;
-            for input in dispatch.inputs() {
-                self.validate(input)?;
-            }
-        }
-        Ok(MetalSubmission(if dispatches.is_empty() {
-            Ok(())
-        } else {
+        let has_dispatches = self.encode_commands(commands)?;
+        Ok(MetalSubmission(if has_dispatches {
             Err(BackendError::ExecutionFailed)
+        } else {
+            Ok(())
         }))
     }
 }

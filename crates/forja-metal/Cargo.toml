@@ -14,18 +14,24 @@ objc2-foundation = { version = "0.3", default-features = false, features = [
 ] }
 objc2-metal = { version = "0.3", default-features = false, features = [
   "std",
+  "MTL4ArgumentTable",
   "MTL4CommandAllocator",
   "MTL4CommandBuffer",
+  "MTL4CommandEncoder",
   "MTL4CommandQueue",
+  "MTL4ComputeCommandEncoder",
   "MTLAllocation",
   "MTLBuffer",
+  "MTLCommandEncoder",
   "MTLComputePipeline",
   "MTLDataType",
   "MTLDevice",
   "MTLEvent",
   "MTLFunctionConstantValues",
+  "MTLGPUAddress",
   "MTLLibrary",
   "MTLResource",
+  "MTLTypes",
 ] }
 
 [lints.rust]
