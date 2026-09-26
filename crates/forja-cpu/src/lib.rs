@@ -8,7 +8,10 @@ use std::{
     },
 };
 
-use forja_core::{BackendError, BufferId, DType, Layout, Tensor, ViewOp};
+use forja_core::{
+    Backend, BackendError, BufferId, CommandList, DType, Layout, Op, Submission, Tensor, ViewOp,
+};
+use half::{bf16, f16};
 
 static NEXT_BACKEND: AtomicU64 = AtomicU64::new(1);
 
@@ -142,11 +145,79 @@ impl CpuBackend {
             .ok_or(BackendError::InvalidInput)?;
         gather(source, tensor.layout())
     }
+
+    fn validate(&self, tensor: &Tensor) -> Result<(), BackendError> {
+        self.state
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?
+            .validate(tensor)
+    }
+
+    fn execute_copy(&self, inputs: &[Tensor], output: &Tensor) -> Result<(), BackendError> {
+        let values = self.read(&inputs[0])?;
+        let converted = convert(&values, inputs[0].layout().dtype(), output.layout().dtype())
+            .ok_or(BackendError::ExecutionFailed)?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?;
+        let target = state
+            .buffers
+            .get_mut(&output.buffer())
+            .ok_or(BackendError::InvalidInput)?;
+        scatter(target, output.layout(), &converted)
+    }
 }
 
 impl Default for CpuBackend {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// An already-complete CPU submission.
+#[derive(Debug)]
+pub struct CpuSubmission(Result<(), BackendError>);
+
+impl Submission for CpuSubmission {
+    fn wait(self) -> Result<(), BackendError> {
+        self.0
+    }
+}
+
+impl Backend for CpuBackend {
+    type Submission = CpuSubmission;
+
+    fn alloc(&self, dtype: DType, shape: &[u32]) -> Result<Tensor, BackendError> {
+        CpuBackend::alloc(self, dtype, shape)
+    }
+
+    fn view(&self, tensor: &Tensor, op: ViewOp) -> Result<Tensor, BackendError> {
+        CpuBackend::view(self, tensor, op)
+    }
+
+    fn write(&self, tensor: &Tensor, bytes: &[u8]) -> Result<(), BackendError> {
+        CpuBackend::write(self, tensor, bytes)
+    }
+
+    fn read(&self, tensor: &Tensor) -> Result<Vec<u8>, BackendError> {
+        CpuBackend::read(self, tensor)
+    }
+
+    fn submit(&self, commands: CommandList) -> Result<Self::Submission, BackendError> {
+        let dispatches = commands.into_dispatches();
+        for dispatch in &dispatches {
+            self.validate(dispatch.output())?;
+            for input in dispatch.inputs() {
+                self.validate(input)?;
+            }
+        }
+        let result = dispatches
+            .into_iter()
+            .try_for_each(|dispatch| match dispatch.op() {
+                Op::Copy => self.execute_copy(dispatch.inputs(), dispatch.output()),
+            });
+        Ok(CpuSubmission(result))
     }
 }
 
@@ -200,9 +271,54 @@ fn gather(source: &[u8], layout: &Layout) -> Result<Vec<u8>, BackendError> {
     Ok(result)
 }
 
+fn scatter(target: &mut [u8], layout: &Layout, source: &[u8]) -> Result<(), BackendError> {
+    let width =
+        usize::try_from(layout.dtype().byte_size()).map_err(|_| BackendError::InvalidInput)?;
+    for (index, offset) in element_offsets(layout).enumerate() {
+        let start = usize::try_from(
+            offset
+                .checked_mul(layout.dtype().byte_size())
+                .ok_or(BackendError::InvalidInput)?,
+        )
+        .map_err(|_| BackendError::InvalidInput)?;
+        let source_start = index.checked_mul(width).ok_or(BackendError::InvalidInput)?;
+        target
+            .get_mut(start..start + width)
+            .ok_or(BackendError::InvalidInput)?
+            .copy_from_slice(
+                source
+                    .get(source_start..source_start + width)
+                    .ok_or(BackendError::InvalidInput)?,
+            );
+    }
+    Ok(())
+}
+
+fn convert(source: &[u8], input: DType, output: DType) -> Option<Vec<u8>> {
+    let input_width = usize::try_from(input.byte_size()).ok()?;
+    let mut result =
+        Vec::with_capacity(source.len() / input_width * usize::try_from(output.byte_size()).ok()?);
+    for bytes in source.chunks_exact(input_width) {
+        let value = match input {
+            DType::F32 => f32::from_le_bytes(bytes.try_into().ok()?),
+            DType::F16 => f16::from_le_bytes(bytes.try_into().ok()?).to_f32(),
+            DType::BF16 => bf16::from_le_bytes(bytes.try_into().ok()?).to_f32(),
+            DType::I32 | DType::U32 => return None,
+        };
+        match output {
+            DType::F32 => result.extend_from_slice(&value.to_le_bytes()),
+            DType::F16 => result.extend_from_slice(&f16::from_f32(value).to_le_bytes()),
+            DType::BF16 => result.extend_from_slice(&bf16::from_f32(value).to_le_bytes()),
+            DType::I32 | DType::U32 => return None,
+        }
+    }
+    Some(result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use forja_core::Op;
 
     #[test]
     fn rejects_unknown_foreign_and_wrong_length_tensors() {
@@ -245,5 +361,47 @@ mod tests {
             backend.alloc(DType::F32, &[u32::MAX, u32::MAX]),
             Err(BackendError::AllocationFailed)
         );
+    }
+
+    #[test]
+    fn copies_permuted_qwen_heads_to_contiguous_bf16() {
+        let backend = CpuBackend::new();
+        let source = backend.alloc(DType::F32, &[7, 16, 128]).unwrap();
+        let values = (0_u16..14_336)
+            .flat_map(|value| f32::from(value).to_le_bytes())
+            .collect::<Vec<_>>();
+        backend.write(&source, &values).unwrap();
+        let permuted = backend
+            .view(&source, ViewOp::Permute(vec![1, 0, 2]))
+            .unwrap();
+        let output = backend.alloc(DType::BF16, &[16, 7, 128]).unwrap();
+        let mut commands = CommandList::new();
+        commands.dispatch(Op::Copy, &[&permuted], &output).unwrap();
+        backend.submit(commands).unwrap().wait().unwrap();
+        let actual = backend.read(&output).unwrap();
+        let expected = (0_u16..16)
+            .flat_map(|head| {
+                (0_u16..7).flat_map(move |sequence| {
+                    (0_u16..128).flat_map(move |column| {
+                        let index = (sequence * 16 + head) * 128 + column;
+                        bf16::from_f32(f32::from(index)).to_le_bytes()
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn rejects_submission_with_a_foreign_tensor() {
+        let backend = CpuBackend::new();
+        let foreign = CpuBackend::new().alloc(DType::F32, &[1]).unwrap();
+        let output = backend.alloc(DType::F32, &[1]).unwrap();
+        let mut commands = CommandList::new();
+        commands.dispatch(Op::Copy, &[&foreign], &output).unwrap();
+        assert!(matches!(
+            backend.submit(commands),
+            Err(BackendError::InvalidInput)
+        ));
     }
 }
