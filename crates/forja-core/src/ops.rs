@@ -101,6 +101,11 @@ pub enum Op {
     ///
     /// A row containing only negative infinity produces all zeros.
     Softmax,
+    /// Applies half-split rotary position embeddings.
+    Rope {
+        /// The positive finite frequency base.
+        theta: f32,
+    },
 }
 
 /// An operand named by an operation validation error.
@@ -136,6 +141,11 @@ pub enum OpError {
     },
     /// The output maps multiple logical elements to the same storage.
     NonInjectiveOutput,
+    /// An operand contains no logical elements.
+    EmptyOperand {
+        /// The empty operand.
+        operand: Operand,
+    },
     /// An input and output may touch the same bytes.
     Aliasing {
         /// The overlapping input position.
@@ -143,6 +153,8 @@ pub enum OpError {
     },
     /// An RMS normalization epsilon is negative or non-finite.
     InvalidEpsilon,
+    /// A rotary frequency base is non-positive or non-finite.
+    InvalidTheta,
 }
 
 impl fmt::Display for OpError {
@@ -206,6 +218,7 @@ impl CommandList {
             Op::Add | Op::SiluMul => check_binary(inputs, output)?,
             Op::RmsNorm { eps } => check_rms_norm(inputs, output, eps)?,
             Op::Softmax => check_softmax(inputs, output)?,
+            Op::Rope { theta } => check_rope(inputs, output, theta)?,
         }
         self.dispatches.push(Dispatch {
             op,
@@ -223,6 +236,18 @@ impl CommandList {
 }
 
 fn check_common(inputs: &[&Tensor], output: &Tensor) -> Result<(), OpError> {
+    for (input, tensor) in inputs.iter().enumerate() {
+        if tensor.layout.element_count() == 0 {
+            return Err(OpError::EmptyOperand {
+                operand: Operand::Input(input),
+            });
+        }
+    }
+    if output.layout.element_count() == 0 {
+        return Err(OpError::EmptyOperand {
+            operand: Operand::Output,
+        });
+    }
     if !is_injective(output.layout()) {
         return Err(OpError::NonInjectiveOutput);
     }
@@ -286,7 +311,7 @@ fn check_rms_norm(inputs: &[&Tensor], output: &Tensor, eps: f32) -> Result<(), O
             operand: Operand::Input(0),
         });
     };
-    if width == 0 || inputs[1].layout.shape() != [width] {
+    if inputs[1].layout.shape() != [width] {
         return Err(OpError::Shape {
             operand: Operand::Input(1),
         });
@@ -303,14 +328,41 @@ fn check_softmax(inputs: &[&Tensor], output: &Tensor) -> Result<(), OpError> {
     }
     check_float(inputs[0], Operand::Input(0))?;
     check_float(output, Operand::Output)?;
-    if inputs[0]
-        .layout
-        .shape()
-        .last()
-        .is_none_or(|&width| width == 0)
-    {
+    if inputs[0].layout.shape().last().is_none() {
         return Err(OpError::Shape {
             operand: Operand::Input(0),
+        });
+    }
+    check_shape(output, inputs[0], Operand::Output)
+}
+
+fn check_rope(inputs: &[&Tensor], output: &Tensor, theta: f32) -> Result<(), OpError> {
+    if inputs.len() != 2 {
+        return Err(OpError::Arity {
+            expected: 2,
+            actual: inputs.len(),
+        });
+    }
+    if !theta.is_finite() || theta <= 0.0 {
+        return Err(OpError::InvalidTheta);
+    }
+    check_float(inputs[0], Operand::Input(0))?;
+    if inputs[1].layout.dtype() != DType::U32 {
+        return Err(OpError::DType {
+            operand: Operand::Input(1),
+            dtype: inputs[1].layout.dtype(),
+        });
+    }
+    check_float(output, Operand::Output)?;
+    let shape = inputs[0].layout.shape();
+    if shape.len() != 3 || !shape[2].is_multiple_of(2) {
+        return Err(OpError::Shape {
+            operand: Operand::Input(0),
+        });
+    }
+    if inputs[1].layout.shape() != [shape[0]] {
+        return Err(OpError::Shape {
+            operand: Operand::Input(1),
         });
     }
     check_shape(output, inputs[0], Operand::Output)
@@ -494,6 +546,60 @@ mod tests {
             CommandList::new().dispatch(Op::Softmax, &[&input], &scalar),
             Err(OpError::Shape {
                 operand: Operand::Output
+            })
+        );
+    }
+
+    #[test]
+    fn rope_rejects_invalid_signatures() {
+        let odd = tensor(1, DType::F32, &[7, 16, 127], &[2032, 127, 1]);
+        let positions = tensor(2, DType::U32, &[7], &[1]);
+        let odd_output = tensor(3, DType::F32, &[7, 16, 127], &[2032, 127, 1]);
+        assert_eq!(
+            CommandList::new().dispatch(Op::Rope { theta: 1e6 }, &[&odd, &positions], &odd_output),
+            Err(OpError::Shape {
+                operand: Operand::Input(0)
+            })
+        );
+        let input = tensor(4, DType::F32, &[7, 16, 128], &[2048, 128, 1]);
+        let output = tensor(5, DType::F32, &[7, 16, 128], &[2048, 128, 1]);
+        let short_positions = tensor(6, DType::U32, &[6], &[1]);
+        assert_eq!(
+            CommandList::new().dispatch(
+                Op::Rope { theta: 1e6 },
+                &[&input, &short_positions],
+                &output
+            ),
+            Err(OpError::Shape {
+                operand: Operand::Input(1)
+            })
+        );
+        let float_positions = tensor(7, DType::F32, &[7], &[1]);
+        assert_eq!(
+            CommandList::new().dispatch(
+                Op::Rope { theta: 1e6 },
+                &[&input, &float_positions],
+                &output
+            ),
+            Err(OpError::DType {
+                operand: Operand::Input(1),
+                dtype: DType::F32
+            })
+        );
+        assert_eq!(
+            CommandList::new().dispatch(Op::Rope { theta: 0.0 }, &[&input, &positions], &output),
+            Err(OpError::InvalidTheta)
+        );
+        let empty = tensor(8, DType::F32, &[7, 0, 128], &[0, 128, 1]);
+        let empty_output = tensor(9, DType::F32, &[7, 0, 128], &[0, 128, 1]);
+        assert_eq!(
+            CommandList::new().dispatch(
+                Op::Rope { theta: 1e6 },
+                &[&empty, &positions],
+                &empty_output
+            ),
+            Err(OpError::EmptyOperand {
+                operand: Operand::Input(0)
             })
         );
     }

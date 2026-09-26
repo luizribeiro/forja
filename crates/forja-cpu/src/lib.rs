@@ -218,13 +218,14 @@ impl CpuBackend {
     fn execute_softmax(&self, inputs: &[Tensor], output: &Tensor) -> Result<(), BackendError> {
         let values = decode(&self.read(&inputs[0])?, inputs[0].layout().dtype())
             .ok_or(BackendError::ExecutionFailed)?;
-        let width = inputs[0]
-            .layout()
-            .shape()
-            .last()
-            .copied()
-            .and_then(|width| usize::try_from(width).ok())
-            .ok_or(BackendError::ExecutionFailed)?;
+        let width = execution_usize(
+            inputs[0]
+                .layout()
+                .shape()
+                .last()
+                .copied()
+                .ok_or(BackendError::ExecutionFailed)?,
+        )?;
         let mut probabilities = Vec::with_capacity(values.len());
         for row in values.chunks_exact(width) {
             let maximum = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
@@ -240,6 +241,38 @@ impl CpuBackend {
                 .for_each(|value| *value /= sum);
         }
         self.write_output(output, &probabilities)
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    fn execute_rope(
+        &self,
+        inputs: &[Tensor],
+        output: &Tensor,
+        theta: f32,
+    ) -> Result<(), BackendError> {
+        let mut values = decode(&self.read(&inputs[0])?, inputs[0].layout().dtype())
+            .ok_or(BackendError::ExecutionFailed)?;
+        let positions = decode_u32(&self.read(&inputs[1])?).ok_or(BackendError::ExecutionFailed)?;
+        let shape = inputs[0].layout().shape();
+        let width = execution_usize(shape[2])?;
+        let row_width = checked_product(execution_usize(shape[1])?, width)?;
+        let half = width / 2;
+        let inv_freq = (0..half)
+            .map(|index| theta.powf(2.0 * index as f32 / width as f32).recip())
+            .collect::<Vec<_>>();
+        for (row, position) in values.chunks_exact_mut(row_width).zip(positions) {
+            for head in row.chunks_exact_mut(width) {
+                for (index, &frequency) in inv_freq.iter().enumerate() {
+                    let angle = position as f32 * frequency;
+                    let (sin, cos) = angle.sin_cos();
+                    let first = head[index];
+                    let second = head[index + half];
+                    head[index] = first * cos - second * sin;
+                    head[index + half] = second * cos + first * sin;
+                }
+            }
+        }
+        self.write_output(output, &values)
     }
 }
 
@@ -300,6 +333,9 @@ impl Backend for CpuBackend {
                     self.execute_rms_norm(dispatch.inputs(), dispatch.output(), eps)
                 }
                 Op::Softmax => self.execute_softmax(dispatch.inputs(), dispatch.output()),
+                Op::Rope { theta } => {
+                    self.execute_rope(dispatch.inputs(), dispatch.output(), theta)
+                }
             });
         Ok(CpuSubmission(result))
     }
@@ -314,6 +350,17 @@ fn element_count(shape: &[u32]) -> Result<u64, BackendError> {
             .checked_mul(u64::from(extent))
             .ok_or(BackendError::AllocationFailed)
     })
+}
+
+fn checked_product(left: usize, right: usize) -> Result<usize, BackendError> {
+    left.checked_mul(right).ok_or(BackendError::ExecutionFailed)
+}
+
+fn execution_usize<T>(value: T) -> Result<usize, BackendError>
+where
+    usize: TryFrom<T>,
+{
+    usize::try_from(value).map_err(|_| BackendError::ExecutionFailed)
 }
 
 fn logical_byte_len(layout: &Layout) -> Result<usize, BackendError> {
@@ -397,6 +444,16 @@ fn decode(source: &[u8], input: DType) -> Option<Vec<f32>> {
             DType::I32 | DType::U32 => None,
         })
         .collect()
+}
+
+fn decode_u32(source: &[u8]) -> Option<Vec<u32>> {
+    let (words, remainder) = source.as_chunks::<4>();
+    remainder.is_empty().then(|| {
+        words
+            .iter()
+            .map(|bytes| u32::from_le_bytes(*bytes))
+            .collect()
+    })
 }
 
 fn encode(source: &[f32], output: DType) -> Option<Vec<u8>> {
@@ -600,6 +657,71 @@ mod tests {
         let high = 1.0 / (1.0 + (-2.0_f32).exp());
         let actual = decode(&backend.read(&output).unwrap(), DType::F32).unwrap();
         assert_relative(&actual, &[low, 0.0, high, 0.0, 0.0, 0.0, 0.0, 0.0], 1e-5);
+    }
+
+    #[test]
+    fn rope_at_position_zero_is_identity() {
+        let actual = run_rope(&[1.0, -2.0, 3.0, -4.0], &[0], &[1, 1, 4], 10_000.0);
+        assert_eq!(actual, [1.0, -2.0, 3.0, -4.0]);
+    }
+
+    #[test]
+    fn rope_rotates_split_halves() {
+        let actual = run_rope(&[1.0, 2.0, 3.0, 4.0], &[1], &[1, 1, 4], 100.0);
+        let expected = [
+            1.0_f32.cos() - 3.0 * 1.0_f32.sin(),
+            2.0 * 0.1_f32.cos() - 4.0 * 0.1_f32.sin(),
+            3.0 * 1.0_f32.cos() + 1.0_f32.sin(),
+            4.0 * 0.1_f32.cos() + 2.0 * 0.1_f32.sin(),
+        ];
+        assert_relative(&actual, &expected, 1e-5);
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+    fn rope_matches_independent_qwen_shape_computation() {
+        let values = (0_u16..14_336)
+            .map(|index| f32::from(index % 33) / 16.0 - 1.0)
+            .collect::<Vec<_>>();
+        let positions = (0_u32..7).collect::<Vec<_>>();
+        let actual = run_rope(&values, &positions, &[7, 16, 128], 1e6);
+        let mut expected = values.clone();
+        for (row, &position) in expected
+            .as_chunks_mut::<{ 16 * 128 }>()
+            .0
+            .iter_mut()
+            .zip(&positions)
+        {
+            for head in row.as_chunks_mut::<128>().0 {
+                for index in 0..64 {
+                    let angle = f64::from(position) / 1e6_f64.powf(2.0 * index as f64 / 128.0);
+                    let first = f64::from(head[index]);
+                    let second = f64::from(head[index + 64]);
+                    head[index] = (first * angle.cos() - second * angle.sin()) as f32;
+                    head[index + 64] = (second * angle.cos() + first * angle.sin()) as f32;
+                }
+            }
+        }
+        assert_relative(&actual, &expected, 1e-5);
+    }
+
+    fn run_rope(values: &[f32], positions: &[u32], shape: &[u32], theta: f32) -> Vec<f32> {
+        let backend = CpuBackend::new();
+        let input = backend.alloc(DType::F32, shape).unwrap();
+        backend.write(&input, &f32_bytes(values)).unwrap();
+        let position_tensor = backend.alloc(DType::U32, &[shape[0]]).unwrap();
+        let bytes = positions
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+        backend.write(&position_tensor, &bytes).unwrap();
+        let output = backend.alloc(DType::F32, shape).unwrap();
+        let mut commands = CommandList::new();
+        commands
+            .dispatch(Op::Rope { theta }, &[&input, &position_tensor], &output)
+            .unwrap();
+        backend.submit(commands).unwrap().wait().unwrap();
+        decode(&backend.read(&output).unwrap(), DType::F32).unwrap()
     }
 
     fn f32_bytes(values: &[f32]) -> Vec<u8> {
