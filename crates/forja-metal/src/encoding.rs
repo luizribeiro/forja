@@ -2,6 +2,8 @@ use std::{
     collections::{HashMap, HashSet},
     ffi::c_void,
     ptr::NonNull,
+    sync::{Arc, Condvar, Mutex},
+    time::{Duration, Instant},
 };
 
 use forja_core::{
@@ -12,6 +14,7 @@ use objc2_foundation::NSString;
 use objc2_metal::{
     MTL4CommandBuffer, MTLAllocation, MTLBuffer, MTLComputePipelineState, MTLDataType, MTLDevice,
     MTLFunctionConstantValues, MTLLibrary, MTLResidencySet, MTLResidencySetDescriptor,
+    MTLSharedEvent,
 };
 
 use crate::storage::MetalBackend;
@@ -20,6 +23,119 @@ use crate::storage::MetalBackend;
 struct PipelineKey {
     name: String,
     constants: Vec<(u32, u32)>,
+}
+
+struct CompletionState {
+    result: Option<Result<(), BackendError>>,
+}
+
+pub(super) struct InFlightBuffer {
+    pub(super) _raw: Retained<ProtocolObject<dyn MTLBuffer>>,
+}
+
+// SAFETY: Metal buffer resources support concurrent retain and release, and this wrapper never
+// exposes CPU access to their contents.
+unsafe impl Send for InFlightBuffer {}
+
+// SAFETY: The wrapper only keeps a Metal buffer alive and provides no access to its contents.
+unsafe impl Sync for InFlightBuffer {}
+
+pub(super) struct InFlightEvent {
+    pub(super) raw: Retained<ProtocolObject<dyn MTLSharedEvent>>,
+}
+
+// SAFETY: Shared events are designed for cross-thread signaling and waiting, and the wrapper
+// exposes only the thread-safe wait operation.
+unsafe impl Send for InFlightEvent {}
+
+// SAFETY: Concurrent waits do not mutate the retained shared event through Rust references.
+unsafe impl Sync for InFlightEvent {}
+
+pub(super) struct InFlightResidency {
+    pub(super) _raw: Retained<ProtocolObject<dyn MTLResidencySet>>,
+}
+
+// SAFETY: The residency set is committed before submission and remains immutable while shared
+// across completion and waiting threads.
+unsafe impl Send for InFlightResidency {}
+
+// SAFETY: The wrapper exposes no operations on the retained residency set.
+unsafe impl Sync for InFlightResidency {}
+
+pub(super) struct Completion {
+    state: Mutex<CompletionState>,
+    ready: Condvar,
+    event: InFlightEvent,
+    _buffers: Vec<InFlightBuffer>,
+    _residency: InFlightResidency,
+}
+
+impl Completion {
+    #[expect(dead_code)]
+    pub(super) fn new(
+        buffers: Vec<InFlightBuffer>,
+        event: InFlightEvent,
+        residency: InFlightResidency,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(CompletionState { result: None }),
+            ready: Condvar::new(),
+            event,
+            _buffers: buffers,
+            _residency: residency,
+        })
+    }
+
+    #[expect(dead_code)]
+    pub(super) fn finish(&self, result: Result<(), BackendError>) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.result = Some(result);
+        self.ready.notify_all();
+    }
+
+    pub(super) fn wait(&self, timeout: Duration) -> Result<(), BackendError> {
+        let started = Instant::now();
+        if !self
+            .event
+            .raw
+            .waitUntilSignaledValue_timeoutMS(1, timeout_millis(timeout))
+        {
+            return Err(BackendError::ExecutionFailed);
+        }
+        self.wait_for_feedback(timeout.saturating_sub(started.elapsed()))
+    }
+
+    fn wait_for_feedback(&self, timeout: Duration) -> Result<(), BackendError> {
+        let started = Instant::now();
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        loop {
+            if let Some(result) = state.result {
+                return result;
+            }
+            let remaining = timeout.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                return Err(BackendError::ExecutionFailed);
+            }
+            let (next, wait) = self
+                .ready
+                .wait_timeout(state, remaining)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state = next;
+            if wait.timed_out() && state.result.is_none() {
+                return Err(BackendError::ExecutionFailed);
+            }
+        }
+    }
+}
+
+fn timeout_millis(timeout: Duration) -> u64 {
+    u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX)
 }
 
 impl MetalBackend {
@@ -287,6 +403,8 @@ impl PipelineCache {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use forja_core::{Backend, CommandList, DType, Op, Submission};
 
     use super::*;
@@ -311,5 +429,12 @@ mod tests {
             backend.submit(commands).unwrap().wait(),
             Err(BackendError::ExecutionFailed)
         );
+    }
+
+    #[test]
+    fn submillisecond_gpu_timeouts_do_not_round_up() {
+        let backend = MetalBackend::with_gpu_timeout(Duration::from_micros(1)).unwrap();
+        assert_eq!(backend.gpu_timeout, Duration::from_micros(1));
+        assert_eq!(timeout_millis(backend.gpu_timeout), 0);
     }
 }

@@ -1,6 +1,10 @@
-use std::{ptr, slice, sync::Mutex};
+use std::{
+    ptr, slice,
+    sync::{Arc, Mutex, Weak},
+    time::Duration,
+};
 
-use crate::encoding::PipelineCache;
+use crate::encoding::{Completion, PipelineCache};
 use forja_core::{
     AllocationRegistry, Backend, BackendError, CommandList, DType, Layout, Submission, Tensor,
     ViewOp,
@@ -14,6 +18,7 @@ use objc2_metal::{
 pub(super) struct MetalBuffer {
     pub(super) raw: Retained<ProtocolObject<dyn MTLBuffer>>,
     len: usize,
+    pending: Vec<Weak<Completion>>,
 }
 
 impl MetalBuffer {
@@ -34,6 +39,25 @@ impl MetalBuffer {
         // points to all `len` bytes of a shared-storage buffer.
         unsafe { slice::from_raw_parts(self.raw.contents().cast::<u8>().as_ptr(), self.len) }
     }
+
+    pub(super) fn wait_pending(&mut self, timeout: Duration) -> Result<(), BackendError> {
+        let mut result = Ok(());
+        for pending in std::mem::take(&mut self.pending) {
+            let Some(completion) = pending.upgrade() else {
+                continue;
+            };
+            if completion.wait(timeout).is_err() {
+                result = Err(BackendError::ExecutionFailed);
+                self.pending.push(Arc::downgrade(&completion));
+            }
+        }
+        result
+    }
+
+    #[expect(dead_code)]
+    pub(super) fn track(&mut self, completion: &Arc<Completion>) {
+        self.pending.push(Arc::downgrade(completion));
+    }
 }
 
 /// A Metal 4 backend using shared unified-memory buffers.
@@ -42,6 +66,7 @@ pub struct MetalBackend {
     _queue: Retained<ProtocolObject<dyn MTL4CommandQueue>>,
     pub(super) buffers: Mutex<AllocationRegistry<MetalBuffer>>,
     pub(super) pipelines: Mutex<PipelineCache>,
+    pub(super) gpu_timeout: Duration,
 }
 
 impl MetalBackend {
@@ -51,6 +76,15 @@ impl MetalBackend {
     ///
     /// Returns [`BackendError::ExecutionFailed`] when Metal 4 is unavailable.
     pub fn new() -> Result<Self, BackendError> {
+        Self::with_gpu_timeout(Duration::from_secs(10))
+    }
+
+    /// Creates a backend with a deadline for each wait on submitted GPU work.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BackendError::ExecutionFailed`] when Metal 4 is unavailable.
+    pub fn with_gpu_timeout(gpu_timeout: Duration) -> Result<Self, BackendError> {
         let device = MTLCreateSystemDefaultDevice().ok_or(BackendError::ExecutionFailed)?;
         if !device.supportsFamily(MTLGPUFamily::Metal4) {
             return Err(BackendError::ExecutionFailed);
@@ -64,6 +98,7 @@ impl MetalBackend {
             _queue: queue,
             buffers: Mutex::new(AllocationRegistry::new()),
             pipelines: Mutex::new(pipelines),
+            gpu_timeout,
         })
     }
 
@@ -98,7 +133,11 @@ impl Backend for MetalBackend {
             .device
             .newBufferWithLength_options(len, MTLResourceOptions::StorageModeShared)
             .ok_or(BackendError::AllocationFailed)?;
-        let buffer = MetalBuffer { raw, len };
+        let buffer = MetalBuffer {
+            raw,
+            len,
+            pending: Vec::new(),
+        };
         let mut buffers = self
             .buffers
             .lock()
@@ -132,23 +171,29 @@ impl Backend for MetalBackend {
             .buffers
             .lock()
             .map_err(|_| BackendError::ExecutionFailed)?;
-        buffers.get_mut(tensor)?.write(range, bytes);
+        let buffer = buffers.get_mut(tensor)?;
+        buffer.wait_pending(self.gpu_timeout)?;
+        buffer.write(range, bytes);
         Ok(())
     }
 
     fn read(&self, tensor: &Tensor) -> Result<Vec<u8>, BackendError> {
-        let buffers = self
+        let mut buffers = self
             .buffers
             .lock()
             .map_err(|_| BackendError::ExecutionFailed)?;
-        gather(buffers.get(tensor)?.bytes(), tensor.layout())
+        let buffer = buffers.get_mut(tensor)?;
+        buffer.wait_pending(self.gpu_timeout)?;
+        gather(buffer.bytes(), tensor.layout())
     }
 
     fn release(&self, tensor: &Tensor) -> Result<(), BackendError> {
-        self.buffers
+        let mut buffers = self
+            .buffers
             .lock()
-            .map_err(|_| BackendError::ExecutionFailed)?
-            .remove(tensor)?;
+            .map_err(|_| BackendError::ExecutionFailed)?;
+        buffers.get_mut(tensor)?.wait_pending(self.gpu_timeout)?;
+        buffers.remove(tensor)?;
         Ok(())
     }
 
