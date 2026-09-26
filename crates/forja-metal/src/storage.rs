@@ -4,10 +4,9 @@ use std::{
     time::Duration,
 };
 
-use crate::encoding::{Completion, InFlightTracker, PipelineCache};
+use crate::encoding::{Completion, InFlightTracker, MetalSubmission, PipelineCache};
 use forja_core::{
-    AllocationRegistry, Backend, BackendError, CommandList, DType, Layout, Submission, Tensor,
-    ViewOp,
+    AllocationRegistry, Backend, BackendError, CommandList, DType, Layout, Tensor, ViewOp,
 };
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_metal::{
@@ -54,7 +53,6 @@ impl MetalBuffer {
         result
     }
 
-    #[expect(dead_code)]
     pub(super) fn track(&mut self, completion: &Arc<Completion>) {
         self.pending.push(Arc::downgrade(completion));
     }
@@ -63,12 +61,10 @@ impl MetalBuffer {
 /// A Metal 4 backend using shared unified-memory buffers.
 pub struct MetalBackend {
     pub(super) device: Retained<ProtocolObject<dyn MTLDevice>>,
-    _queue: Retained<ProtocolObject<dyn MTL4CommandQueue>>,
+    pub(super) queue: Retained<ProtocolObject<dyn MTL4CommandQueue>>,
     pub(super) buffers: Mutex<AllocationRegistry<MetalBuffer>>,
     pub(super) pipelines: Mutex<PipelineCache>,
-    #[cfg_attr(not(test), expect(dead_code))]
     pub(super) in_flight: Arc<InFlightTracker>,
-    #[cfg_attr(not(test), expect(dead_code))]
     pub(super) event_listener: Retained<MTLSharedEventListener>,
     pub(super) gpu_timeout: Duration,
 }
@@ -100,7 +96,7 @@ impl MetalBackend {
         let event_listener = MTLSharedEventListener::new();
         Ok(Self {
             device,
-            _queue: queue,
+            queue,
             buffers: Mutex::new(AllocationRegistry::new()),
             pipelines: Mutex::new(pipelines),
             in_flight: Arc::new(InFlightTracker::new()),
@@ -115,16 +111,6 @@ impl MetalBackend {
             .map_err(|_| BackendError::ExecutionFailed)?
             .get(tensor)
             .map(|_| ())
-    }
-}
-
-/// A Metal completion handle.
-#[derive(Debug)]
-pub struct MetalSubmission(Result<(), BackendError>);
-
-impl Submission for MetalSubmission {
-    fn wait(self) -> Result<(), BackendError> {
-        self.0
     }
 }
 
@@ -205,12 +191,7 @@ impl Backend for MetalBackend {
     }
 
     fn submit(&self, commands: CommandList) -> Result<Self::Submission, BackendError> {
-        let has_dispatches = self.encode_commands(commands)?;
-        Ok(MetalSubmission(if has_dispatches {
-            Err(BackendError::ExecutionFailed)
-        } else {
-            Ok(())
-        }))
+        self.submit_commands(commands)
     }
 }
 

@@ -21,6 +21,7 @@ objc2-metal = { version = "0.3", default-features = false, features = [
   "MTL4CommandBuffer",
   "MTL4CommandEncoder",
   "MTL4CommandQueue",
+  "MTL4CommitFeedback",
   "MTL4ComputeCommandEncoder",
   "MTLAllocation",
   "MTLBuffer",

@@ -2,18 +2,20 @@ use std::{
     collections::{HashMap, HashSet},
     ffi::c_void,
     ptr::NonNull,
-    sync::{Arc, Condvar, Mutex},
+    sync::{Arc, Condvar, Mutex, Weak},
     time::{Duration, Instant},
 };
 
 use block2::RcBlock;
 use forja_core::{
-    BackendError, BufferId, CommandList, DType, Dispatch, Layout, Tensor, required_barriers,
+    BackendError, BufferId, CommandList, DType, Dispatch, Layout, Submission, Tensor,
+    required_barriers,
 };
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_foundation::NSString;
 use objc2_metal::{
-    MTL4CommandBuffer, MTLAllocation, MTLBuffer, MTLComputePipelineState, MTLDataType, MTLDevice,
+    MTL4CommandBuffer, MTL4CommandQueue, MTL4CommitFeedback, MTL4CommitOptions, MTLAllocation,
+    MTLBuffer, MTLComputePipelineState, MTLDataType, MTLDevice, MTLEvent,
     MTLFunctionConstantValues, MTLLibrary, MTLResidencySet, MTLResidencySetDescriptor,
     MTLSharedEvent, MTLSharedEventListener,
 };
@@ -69,25 +71,69 @@ pub(super) struct Completion {
     event: InFlightEvent,
     _buffers: Vec<InFlightBuffer>,
     _residency: InFlightResidency,
+    commit: CommitRetention,
 }
 
+type FeedbackHandler = RcBlock<dyn Fn(NonNull<ProtocolObject<dyn MTL4CommitFeedback>>)>;
+
+struct CommitRetention {
+    _handler: FeedbackHandler,
+    options: Retained<MTL4CommitOptions>,
+}
+
+// SAFETY: The commit options are immutable after registration, and the block captures only a
+// thread-safe weak completion reference. Objective-C blocks and objects may be retained and
+// released from Metal callback queues.
+unsafe impl Send for CommitRetention {}
+
+// SAFETY: Shared access can only retain the immutable commit objects; callback state is protected
+// by the completion mutex.
+unsafe impl Sync for CommitRetention {}
+
 impl Completion {
-    #[cfg_attr(not(test), expect(dead_code))]
     pub(super) fn new(
         buffers: Vec<InFlightBuffer>,
         event: InFlightEvent,
         residency: InFlightResidency,
+        force_error: bool,
     ) -> Arc<Self> {
-        Arc::new(Self {
-            state: Mutex::new(CompletionState { result: None }),
-            ready: Condvar::new(),
-            event,
-            _buffers: buffers,
-            _residency: residency,
+        Arc::new_cyclic(|completion: &Weak<Self>| {
+            let callback_completion = completion.clone();
+            let handler: FeedbackHandler = RcBlock::new(
+                move |feedback: NonNull<ProtocolObject<dyn MTL4CommitFeedback>>| {
+                    // SAFETY: Metal supplies a live, non-null feedback object for this call.
+                    let feedback = unsafe { feedback.as_ref() };
+                    let result = if force_error || feedback.error().is_some() {
+                        Err(BackendError::ExecutionFailed)
+                    } else {
+                        Ok(())
+                    };
+                    if let Some(completion) = callback_completion.upgrade() {
+                        completion.finish(result);
+                    }
+                },
+            );
+            let options = MTL4CommitOptions::new();
+            // SAFETY: `handler` is a live heap block. This completion owns both the block and the
+            // options, and the in-flight tracker retains the completion until the queue event and
+            // feedback callback have both completed.
+            unsafe {
+                options.addFeedbackHandler(RcBlock::as_ptr(&handler));
+            }
+            Self {
+                state: Mutex::new(CompletionState { result: None }),
+                ready: Condvar::new(),
+                event,
+                _buffers: buffers,
+                _residency: residency,
+                commit: CommitRetention {
+                    _handler: handler,
+                    options,
+                },
+            }
         })
     }
 
-    #[cfg_attr(not(test), expect(dead_code))]
     pub(super) fn finish(&self, result: Result<(), BackendError>) {
         let mut state = self
             .state
@@ -176,7 +222,6 @@ impl InFlightTracker {
         }
     }
 
-    #[cfg_attr(not(test), expect(dead_code))]
     pub(super) fn track(
         self: &Arc<Self>,
         completion: &Arc<Completion>,
@@ -231,8 +276,31 @@ fn timeout_millis(timeout: Duration) -> u64 {
     u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX)
 }
 
+/// Completion state for a Metal command buffer.
+pub struct MetalSubmission {
+    completion: Arc<Completion>,
+    timeout: Duration,
+}
+
+impl Submission for MetalSubmission {
+    fn wait(self) -> Result<(), BackendError> {
+        self.completion.wait(self.timeout)
+    }
+}
+
 impl MetalBackend {
-    pub(super) fn encode_commands(&self, commands: CommandList) -> Result<bool, BackendError> {
+    pub(super) fn submit_commands(
+        &self,
+        commands: CommandList,
+    ) -> Result<MetalSubmission, BackendError> {
+        self.submit_commands_with_result(commands, true)
+    }
+
+    fn submit_commands_with_result(
+        &self,
+        commands: CommandList,
+        fail_nonempty: bool,
+    ) -> Result<MetalSubmission, BackendError> {
         let barriers = required_barriers(&commands);
         let dispatches = commands.into_dispatches();
         let tensors = dispatches
@@ -248,14 +316,21 @@ impl MetalBackend {
         for tensor in &tensors {
             self.validate(tensor)?;
         }
-        if dispatches.is_empty() {
-            return Ok(false);
-        }
         let command_buffer = self.begin_command_buffer()?;
-        let temporaries = self.encode_dispatches(&command_buffer, &dispatches, &barriers)?;
-        let _residency = self.make_resident(&command_buffer, &tensors, &temporaries)?;
+        let temporaries = if dispatches.is_empty() {
+            Vec::new()
+        } else {
+            self.encode_dispatches(&command_buffer, &dispatches, &barriers)?
+        };
+        let residency = self.make_resident(&command_buffer, &tensors, &temporaries)?;
         command_buffer.endCommandBuffer();
-        Ok(true)
+        self.commit(
+            &command_buffer,
+            &tensors,
+            &temporaries,
+            residency,
+            fail_nonempty && !dispatches.is_empty(),
+        )
     }
 
     fn encode_dispatches(
@@ -400,6 +475,83 @@ impl MetalBackend {
         command_buffer.useResidencySet(&residency);
         Ok(residency)
     }
+
+    fn retain_tensors(
+        &self,
+        tensors: &[Tensor],
+        event: InFlightEvent,
+        temporaries: &[Retained<ProtocolObject<dyn MTLBuffer>>],
+        residency: InFlightResidency,
+        force_error: bool,
+    ) -> Result<Arc<Completion>, BackendError> {
+        let mut seen = HashSet::<BufferId>::new();
+        let unique = tensors
+            .iter()
+            .filter(|tensor| seen.insert(tensor.buffer()))
+            .collect::<Vec<_>>();
+        let mut buffers = self
+            .buffers
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?;
+        let mut retained = Vec::with_capacity(unique.len().saturating_add(temporaries.len()));
+        for tensor in &unique {
+            let buffer = buffers.get_mut(tensor)?;
+            buffer.wait_pending(self.gpu_timeout)?;
+            retained.push(InFlightBuffer {
+                _raw: buffer.raw.clone(),
+            });
+        }
+        retained.extend(
+            temporaries
+                .iter()
+                .cloned()
+                .map(|raw| InFlightBuffer { _raw: raw }),
+        );
+        let completion = Completion::new(retained, event, residency, force_error);
+        for tensor in unique {
+            buffers.get_mut(tensor)?.track(&completion);
+        }
+        Ok(completion)
+    }
+
+    fn commit(
+        &self,
+        command_buffer: &Retained<ProtocolObject<dyn MTL4CommandBuffer>>,
+        tensors: &[Tensor],
+        temporaries: &[Retained<ProtocolObject<dyn MTLBuffer>>],
+        residency: Retained<ProtocolObject<dyn MTLResidencySet>>,
+        force_error: bool,
+    ) -> Result<MetalSubmission, BackendError> {
+        let event = self
+            .device
+            .newSharedEvent()
+            .ok_or(BackendError::ExecutionFailed)?;
+        let completion = self.retain_tensors(
+            tensors,
+            InFlightEvent { raw: event.clone() },
+            temporaries,
+            InFlightResidency { _raw: residency },
+            force_error,
+        )?;
+        self.in_flight.track(&completion, &self.event_listener)?;
+        let command_buffer_ref: &ProtocolObject<dyn MTL4CommandBuffer> = command_buffer;
+        let mut command_buffers = [NonNull::from(command_buffer_ref)];
+        // SAFETY: The pointer names one live command buffer and the count matches the array.
+        unsafe {
+            self.queue.commit_count_options(
+                NonNull::from(&mut command_buffers[0]),
+                command_buffers.len(),
+                &completion.commit.options,
+            );
+        }
+        let shared_event: &ProtocolObject<dyn MTLSharedEvent> = &event;
+        let event: &ProtocolObject<dyn MTLEvent> = shared_event.as_ref();
+        self.queue.signalEvent_value(event, 1);
+        Ok(MetalSubmission {
+            completion,
+            timeout: self.gpu_timeout,
+        })
+    }
 }
 
 const fn dtype_code(dtype: DType) -> Result<u32, BackendError> {
@@ -510,7 +662,7 @@ mod tests {
     }
 
     #[test]
-    fn encoded_dispatch_reports_execution_failure_without_submission() {
+    fn unimplemented_dispatch_reports_execution_failure() {
         let backend = MetalBackend::new().unwrap();
         let left = backend.alloc(DType::F32, &[7]).unwrap();
         let right = backend.alloc(DType::F32, &[7]).unwrap();
@@ -546,6 +698,7 @@ mod tests {
                 InFlightResidency {
                     _raw: residency.clone(),
                 },
+                false,
             );
             completion.finish(Ok(()));
             backend
@@ -571,6 +724,34 @@ mod tests {
             assert!(started.elapsed() < backend.gpu_timeout);
             std::thread::yield_now();
         }
+    }
+
+    #[test]
+    fn metal_empty_command_list_completes() {
+        let backend = MetalBackend::new().unwrap();
+        backend.submit(CommandList::new()).unwrap().wait().unwrap();
+    }
+
+    #[test]
+    fn dropped_submissions_retain_released_buffers() {
+        let backend = MetalBackend::new().unwrap();
+        for _ in 0..100 {
+            let gate = backend.alloc(DType::F32, &[4097]).unwrap();
+            let up = backend.alloc(DType::F32, &[4097]).unwrap();
+            let output = backend.alloc(DType::F32, &[4097]).unwrap();
+            let mut commands = CommandList::new();
+            commands
+                .dispatch(Op::SiluMul, &[&gate, &up], &output)
+                .unwrap();
+            let submission = backend
+                .submit_commands_with_result(commands, false)
+                .unwrap();
+            drop(submission);
+            backend.release(&gate).unwrap();
+            backend.release(&up).unwrap();
+            backend.release(&output).unwrap();
+        }
+        drop(backend);
     }
 
     #[test]
