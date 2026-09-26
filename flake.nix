@@ -57,11 +57,17 @@
         cargoHooks = {
           rustfmt = cargoHook {
             name = "rustfmt-hook";
-            text = "cargo fmt --all -- --check";
+            text = ''
+              cargo fmt --all -- --check
+              cargo fmt --all --manifest-path support/guests/Cargo.toml -- --check
+            '';
           };
           clippy = cargoHook {
             name = "clippy-hook";
-            text = "cargo clippy --workspace --all-targets --all-features --locked -- -D warnings";
+            text = ''
+              cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+              cargo clippy --manifest-path support/guests/Cargo.toml --workspace --all-targets --target wasm32-wasip2 --locked -- -D warnings
+            '';
           };
           cargo-nextest = cargoHook {
             name = "cargo-nextest-hook";
