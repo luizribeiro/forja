@@ -65,6 +65,100 @@ kernel void add_contiguous(
     }
 }
 
+struct RmsNormParams {
+    float eps;
+    uint width;
+};
+
+template <bool looped>
+void rms_norm_body(
+    device const uchar *input,
+    device const uchar *weight,
+    device uchar *output,
+    constant TensorLayout &input_layout,
+    constant TensorLayout &weight_layout,
+    constant TensorLayout &output_layout,
+    constant RmsNormParams &params,
+    uint row,
+    uint lane,
+    uint group_width,
+    uint simd_lane,
+    uint simd_group,
+    threadgroup float *partial,
+    threadgroup float &inverse_rms) {
+    float sum = 0.0f;
+    uint first = lane;
+    uint step = looped ? group_width : params.width;
+    for (uint column = first; column < params.width; column += step) {
+        float value = load_float(
+            input, physical_index(input_layout, row * params.width + column), input0_dtype);
+        sum += value * value;
+    }
+    sum = simd_sum(sum);
+    if (simd_group == 0) {
+        partial[simd_lane] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_lane == 0) {
+        partial[simd_group] = sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_group == 0) {
+        sum = simd_sum(partial[simd_lane]);
+        if (simd_lane == 0) {
+            inverse_rms = precise::rsqrt(sum / float(params.width) + params.eps);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint column = lane; column < params.width; column += group_width) {
+        uint linear = row * params.width + column;
+        float value = load_float(input, physical_index(input_layout, linear), input0_dtype);
+        float scale = load_float(weight, physical_index(weight_layout, column), input1_dtype);
+        store_float(output, physical_index(output_layout, linear), output_dtype,
+                    value * inverse_rms * scale);
+    }
+}
+
+kernel void rms_norm_single(
+    device const uchar *input [[buffer(0)]],
+    device const uchar *weight [[buffer(1)]],
+    device uchar *output [[buffer(2)]],
+    constant TensorLayout &input_layout [[buffer(3)]],
+    constant TensorLayout &weight_layout [[buffer(4)]],
+    constant TensorLayout &output_layout [[buffer(5)]],
+    constant RmsNormParams &params [[buffer(6)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint lane [[thread_position_in_threadgroup]],
+    uint group_width [[threads_per_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float partial[32];
+    threadgroup float inverse_rms;
+    rms_norm_body<false>(input, weight, output, input_layout, weight_layout,
+                         output_layout, params, row, lane, group_width,
+                         simd_lane, simd_group, partial, inverse_rms);
+}
+
+kernel void rms_norm_looped(
+    device const uchar *input [[buffer(0)]],
+    device const uchar *weight [[buffer(1)]],
+    device uchar *output [[buffer(2)]],
+    constant TensorLayout &input_layout [[buffer(3)]],
+    constant TensorLayout &weight_layout [[buffer(4)]],
+    constant TensorLayout &output_layout [[buffer(5)]],
+    constant RmsNormParams &params [[buffer(6)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint lane [[thread_position_in_threadgroup]],
+    uint group_width [[threads_per_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float partial[32];
+    threadgroup float inverse_rms;
+    rms_norm_body<true>(input, weight, output, input_layout, weight_layout,
+                        output_layout, params, row, lane, group_width,
+                        simd_lane, simd_group, partial, inverse_rms);
+}
+
 kernel void silu_mul(
     device const uchar *gate [[buffer(0)]],
     device const uchar *up [[buffer(1)]],

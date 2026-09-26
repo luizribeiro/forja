@@ -294,10 +294,12 @@ impl MetalBackend {
     ) -> Result<MetalSubmission, BackendError> {
         let barriers = required_barriers(&commands);
         let dispatches = commands.into_dispatches();
-        if dispatches
-            .iter()
-            .any(|dispatch| !matches!(dispatch.op(), Op::Copy | Op::Add | Op::SiluMul))
-        {
+        if dispatches.iter().any(|dispatch| {
+            !matches!(
+                dispatch.op(),
+                Op::Copy | Op::Add | Op::SiluMul | Op::RmsNorm { .. }
+            )
+        }) {
             return Err(BackendError::InvalidInput);
         }
         let tensors = dispatches
@@ -334,7 +336,7 @@ impl MetalBackend {
             .computeCommandEncoder()
             .ok_or(BackendError::ExecutionFailed)?;
         let descriptor = MTL4ArgumentTableDescriptor::new();
-        descriptor.setMaxBufferBindCount(6);
+        descriptor.setMaxBufferBindCount(7);
         let table = self
             .device
             .newArgumentTableWithDescriptor_error(&descriptor)
@@ -347,6 +349,10 @@ impl MetalBackend {
                     MTLStages::Dispatch,
                     MTL4VisibilityOptions::Device,
                 );
+            }
+            if let Op::RmsNorm { eps } = dispatch.op() {
+                temporaries.extend(self.encode_rms_norm(&encoder, &table, dispatch, eps)?);
+                continue;
             }
             let kernel = match dispatch.op() {
                 Op::Copy
@@ -372,6 +378,97 @@ impl MetalBackend {
             temporaries.extend(self.encode_elementwise(&encoder, &table, dispatch, kernel)?);
         }
         encoder.endEncoding();
+        Ok(temporaries)
+    }
+
+    fn encode_rms_norm(
+        &self,
+        encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
+        table: &ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>,
+        dispatch: &Dispatch,
+        eps: f32,
+    ) -> Result<Vec<Retained<ProtocolObject<dyn MTLBuffer>>>, BackendError> {
+        use objc2_metal::{MTL4ArgumentTable, MTL4ComputeCommandEncoder, MTLSize};
+
+        let [input, weight] = dispatch.inputs() else {
+            return Err(BackendError::InvalidInput);
+        };
+        let output = dispatch.output();
+        let width = *input
+            .layout()
+            .shape()
+            .last()
+            .ok_or(BackendError::InvalidInput)?;
+        let constants = [
+            (0, dtype_code(input.layout().dtype())),
+            (1, dtype_code(weight.layout().dtype())),
+            (2, dtype_code(output.layout().dtype())),
+        ];
+        let kernel = if width <= 1024 {
+            "rms_norm_single"
+        } else {
+            "rms_norm_looped"
+        };
+        let pipeline = self
+            .pipelines
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?
+            .get(kernel, &constants)?;
+        encoder.setComputePipelineState(&pipeline);
+        let mut temporaries = vec![
+            self.layout_buffer(input.layout())?,
+            self.layout_buffer(weight.layout())?,
+            self.layout_buffer(output.layout())?,
+        ];
+        let mut params = [0_u8; 8];
+        params[..4].copy_from_slice(&eps.to_ne_bytes());
+        params[4..].copy_from_slice(&width.to_ne_bytes());
+        temporaries.push(self.temporary_buffer(&params)?);
+        let buffers = self
+            .buffers
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?;
+        for (index, tensor) in [input, weight, output].into_iter().enumerate() {
+            // SAFETY: The table has seven slots, and tensor and temporary buffers are retained
+            // through completion.
+            unsafe {
+                table.setAddress_atIndex(buffers.get(tensor)?.raw.gpuAddress(), index);
+                table.setAddress_atIndex(temporaries[index].gpuAddress(), index + 3);
+            }
+        }
+        // SAFETY: Slot six exists and the parameter buffer is retained through completion.
+        unsafe {
+            table.setAddress_atIndex(temporaries[3].gpuAddress(), 6);
+        }
+        drop(buffers);
+        encoder.setArgumentTable(Some(table));
+        let max_threads = pipeline.maxTotalThreadsPerThreadgroup();
+        let thread_count = if width <= 1024 {
+            usize::try_from(width)
+                .map_err(|_| BackendError::ExecutionFailed)?
+                .next_multiple_of(32)
+                .min(max_threads)
+        } else {
+            max_threads.min(256)
+        };
+        let rows = dispatch
+            .output()
+            .layout()
+            .element_count()
+            .checked_div(u64::from(width))
+            .ok_or(BackendError::InvalidInput)?;
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(
+            MTLSize {
+                width: usize::try_from(rows).map_err(|_| BackendError::ExecutionFailed)?,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: thread_count,
+                height: 1,
+                depth: 1,
+            },
+        );
         Ok(temporaries)
     }
 
@@ -451,9 +548,16 @@ impl MetalBackend {
         &self,
         layout: &Layout,
     ) -> Result<Retained<ProtocolObject<dyn MTLBuffer>>, BackendError> {
+        let bytes = encode_layout(layout)?;
+        self.temporary_buffer(&bytes)
+    }
+
+    fn temporary_buffer(
+        &self,
+        bytes: &[u8],
+    ) -> Result<Retained<ProtocolObject<dyn MTLBuffer>>, BackendError> {
         use objc2_metal::MTLResourceOptions;
 
-        let bytes = encode_layout(layout)?;
         let buffer = self
             .device
             .newBufferWithLength_options(bytes.len(), MTLResourceOptions::StorageModeShared)
@@ -926,5 +1030,48 @@ mod tests {
             )
             .unwrap();
         }
+    }
+
+    #[test]
+    fn metal_rms_norm_matches_cpu_for_dtypes_rows_and_views() {
+        let reference = CpuBackend::new();
+        let candidate = MetalBackend::new().unwrap();
+        for dtype in [DType::F32, DType::F16, DType::BF16] {
+            for width in [1, 7, 33, 128, 1024, 4097] {
+                assert_backends_agree(
+                    &reference,
+                    &candidate,
+                    Op::RmsNorm { eps: 1e-6 },
+                    &[
+                        TensorSpec::contiguous(dtype, &[7, width]),
+                        TensorSpec::contiguous(dtype, &[width]),
+                    ],
+                    &TensorSpec::contiguous(dtype, &[7, width]),
+                )
+                .unwrap();
+            }
+            assert_backends_agree(
+                &reference,
+                &candidate,
+                Op::RmsNorm { eps: 1e-6 },
+                &[
+                    TensorSpec::permuted(dtype, &[33, 7], &[1, 0]),
+                    TensorSpec::sliced(dtype, &[66], &[Slice::new(0, 33, 2).unwrap()]),
+                ],
+                &TensorSpec::contiguous(dtype, &[7, 33]),
+            )
+            .unwrap();
+        }
+        assert_backends_agree(
+            &reference,
+            &candidate,
+            Op::RmsNorm { eps: 1e-6 },
+            &[
+                TensorSpec::contiguous(DType::F16, &[7, 1024]),
+                TensorSpec::contiguous(DType::BF16, &[1024]),
+            ],
+            &TensorSpec::contiguous(DType::F16, &[7, 1024]),
+        )
+        .unwrap();
     }
 }
