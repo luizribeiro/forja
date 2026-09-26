@@ -6,6 +6,17 @@ publish.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-metal = { version = "0.3", default-features = false, features = [
+  "std",
+  "MTL4CommandAllocator",
+  "MTL4CommandBuffer",
+  "MTL4CommandQueue",
+  "MTLDevice",
+  "MTLEvent",
+] }
+
 [lints.rust]
 missing_docs = "warn"
 unsafe_code = "allow"
