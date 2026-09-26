@@ -228,17 +228,9 @@ impl CpuBackend {
         )?;
         let mut probabilities = Vec::with_capacity(values.len());
         for row in values.chunks_exact(width) {
-            let maximum = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            if maximum == f32::NEG_INFINITY {
-                probabilities.resize(probabilities.len() + width, 0.0);
-                continue;
-            }
             let start = probabilities.len();
-            probabilities.extend(row.iter().map(|value| (value - maximum).exp()));
-            let sum = probabilities[start..].iter().sum::<f32>();
-            probabilities[start..]
-                .iter_mut()
-                .for_each(|value| *value /= sum);
+            probabilities.extend_from_slice(row);
+            softmax(&mut probabilities[start..]);
         }
         self.write_output(output, &probabilities)
     }
@@ -341,6 +333,75 @@ impl CpuBackend {
         }
         self.write_output(output, &values)
     }
+
+    fn execute_sdpa(
+        &self,
+        inputs: &[Tensor],
+        output: &Tensor,
+        scale: f32,
+        causal: bool,
+        q_start: u32,
+    ) -> Result<(), BackendError> {
+        let query = decode(&self.read(&inputs[0])?, inputs[0].layout().dtype())
+            .ok_or(BackendError::ExecutionFailed)?;
+        let key = decode(&self.read(&inputs[1])?, inputs[1].layout().dtype())
+            .ok_or(BackendError::ExecutionFailed)?;
+        let value = decode(&self.read(&inputs[2])?, inputs[2].layout().dtype())
+            .ok_or(BackendError::ExecutionFailed)?;
+        let q_shape = inputs[0].layout().shape();
+        let k_shape = inputs[1].layout().shape();
+        let v_shape = inputs[2].layout().shape();
+        let q_heads = execution_usize(q_shape[0])?;
+        let q_len = execution_usize(q_shape[1])?;
+        let width = execution_usize(q_shape[2])?;
+        let kv_heads = execution_usize(k_shape[0])?;
+        let kv_len = execution_usize(k_shape[1])?;
+        let value_width = execution_usize(v_shape[2])?;
+        let q_head_len = checked_product(q_len, width)?;
+        let k_head_len = checked_product(kv_len, width)?;
+        let v_head_len = checked_product(kv_len, value_width)?;
+        let group = q_heads / kv_heads;
+        let q_start = execution_usize(q_start)?;
+        let mut result = Vec::new();
+        for (head_index, q_head) in query.chunks_exact(q_head_len).enumerate() {
+            let kv_head = head_index / group;
+            let key_rows = key
+                .chunks_exact(k_head_len)
+                .nth(kv_head)
+                .ok_or(BackendError::ExecutionFailed)?;
+            let value_rows = value
+                .chunks_exact(v_head_len)
+                .nth(kv_head)
+                .ok_or(BackendError::ExecutionFailed)?;
+            for (q_index, q_row) in q_head.chunks_exact(width).enumerate() {
+                let attended = if causal {
+                    q_start
+                        .checked_add(q_index)
+                        .and_then(|position| position.checked_add(1))
+                        .ok_or(BackendError::ExecutionFailed)?
+                } else {
+                    kv_len
+                };
+                let mut scores = key_rows
+                    .chunks_exact(width)
+                    .take(attended)
+                    .map(|k_row| {
+                        q_row.iter().zip(k_row).fold(0.0, |sum, (q, k)| sum + q * k) * scale
+                    })
+                    .collect::<Vec<_>>();
+                softmax(&mut scores);
+                for column in 0..value_width {
+                    result.push(
+                        scores
+                            .iter()
+                            .zip(value_rows.chunks_exact(value_width))
+                            .fold(0.0, |sum, (weight, row)| sum + weight * row[column]),
+                    );
+                }
+            }
+        }
+        self.write_output(output, &result)
+    }
 }
 
 impl Default for CpuBackend {
@@ -405,6 +466,13 @@ impl Backend for CpuBackend {
                 }
                 Op::Embed => self.execute_embed(dispatch.inputs(), dispatch.output()),
                 Op::Matmul => self.execute_matmul(dispatch.inputs(), dispatch.output()),
+                Op::Sdpa {
+                    scale,
+                    causal,
+                    q_start,
+                } => {
+                    self.execute_sdpa(dispatch.inputs(), dispatch.output(), scale, causal, q_start)
+                }
             });
         Ok(CpuSubmission(result))
     }
@@ -525,6 +593,21 @@ fn decode_u32(source: &[u8]) -> Option<Vec<u32>> {
     })
 }
 
+fn softmax(values: &mut [f32]) {
+    let maximum = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    if maximum == f32::NEG_INFINITY {
+        values.fill(0.0);
+        return;
+    }
+    for value in values.iter_mut() {
+        *value = (*value - maximum).exp();
+    }
+    let sum = values.iter().sum::<f32>();
+    for value in values {
+        *value /= sum;
+    }
+}
+
 fn encode(source: &[f32], output: DType) -> Option<Vec<u8>> {
     let mut result = Vec::with_capacity(source.len() * usize::try_from(output.byte_size()).ok()?);
     for &value in source {
@@ -541,7 +624,7 @@ fn encode(source: &[f32], output: DType) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use forja_core::Op;
+    use forja_core::{Op, Slice};
 
     #[test]
     fn rejects_unknown_foreign_and_wrong_length_tensors() {
@@ -873,6 +956,98 @@ mod tests {
             &[2, 2, 1],
         );
         assert_eq!(actual, [17.0, 53.0]);
+    }
+
+    #[test]
+    fn sdpa_matches_a_hand_checked_two_key_case() {
+        let backend = CpuBackend::new();
+        let q = f32_tensor(&backend, &[1, 1, 2], &[1.0, 0.0]);
+        let k = f32_tensor(&backend, &[1, 2, 2], &[1.0, 0.0, 0.0, 1.0]);
+        let v = f32_tensor(&backend, &[1, 2, 1], &[10.0, 20.0]);
+        let actual = submit_sdpa(&backend, &q, &k, &v, (1.0, false, 0));
+        let exponential = 1.0_f32.exp();
+        assert_relative(
+            &actual,
+            &[(10.0 * exponential + 20.0) / (exponential + 1.0)],
+            1e-5,
+        );
+    }
+
+    #[test]
+    fn sdpa_groups_qwen_heads_over_strided_cache_views() {
+        let backend = CpuBackend::new();
+        let keys = backend.alloc(DType::F32, &[8, 4096, 128]).unwrap();
+        let values = backend.alloc(DType::F32, &[8, 4096, 128]).unwrap();
+        let stored = (0_u16..8)
+            .flat_map(|head| std::iter::repeat_n(f32::from(head), 4096 * 128))
+            .collect::<Vec<_>>();
+        backend.write(&values, &f32_bytes(&stored)).unwrap();
+        let slice = vec![
+            Slice::new(0, 8, 1).unwrap(),
+            Slice::new(0, 7, 1).unwrap(),
+            Slice::new(0, 128, 1).unwrap(),
+        ];
+        let keys = backend.view(&keys, ViewOp::Slice(slice.clone())).unwrap();
+        let values = backend.view(&values, ViewOp::Slice(slice)).unwrap();
+        assert!(!keys.layout().is_contiguous() && !values.layout().is_contiguous());
+        let query = backend.alloc(DType::F32, &[16, 1, 128]).unwrap();
+        let actual = submit_sdpa(
+            &backend,
+            &query,
+            &keys,
+            &values,
+            (128.0_f32.sqrt().recip(), true, 6),
+        );
+        let expected = (0_u16..8)
+            .flat_map(|head| std::iter::repeat_n(f32::from(head), 2 * 128))
+            .collect::<Vec<_>>();
+        assert_relative(&actual, &expected, 1e-5);
+    }
+
+    #[test]
+    fn sdpa_decode_equals_the_last_prefill_row() {
+        let backend = CpuBackend::new();
+        let key = [1.0, 0.0, 0.0, 1.0, 1.0, 1.0, -1.0, 1.0];
+        let value = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let query = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let k = f32_tensor(&backend, &[1, 4, 2], &key);
+        let v = f32_tensor(&backend, &[1, 4, 2], &value);
+        let q = f32_tensor(&backend, &[1, 4, 2], &query);
+        let prefill = submit_sdpa(&backend, &q, &k, &v, (0.5, true, 0));
+        let q = f32_tensor(&backend, &[1, 1, 2], &query[6..]);
+        let decode = submit_sdpa(&backend, &q, &k, &v, (0.5, true, 3));
+        assert_eq!(decode, prefill[6..]);
+    }
+
+    fn f32_tensor(backend: &CpuBackend, shape: &[u32], values: &[f32]) -> Tensor {
+        let tensor = backend.alloc(DType::F32, shape).unwrap();
+        backend.write(&tensor, &f32_bytes(values)).unwrap();
+        tensor
+    }
+
+    fn submit_sdpa(
+        backend: &CpuBackend,
+        query: &Tensor,
+        key: &Tensor,
+        value: &Tensor,
+        (scale, causal, q_start): (f32, bool, u32),
+    ) -> Vec<f32> {
+        let q_shape = query.layout().shape();
+        let v_shape = value.layout().shape();
+        let output = backend
+            .alloc(DType::F32, &[q_shape[0], q_shape[1], v_shape[2]])
+            .unwrap();
+        let mut commands = CommandList::new();
+        let op = Op::Sdpa {
+            scale,
+            causal,
+            q_start,
+        };
+        commands
+            .dispatch(op, &[query, key, value], &output)
+            .unwrap();
+        backend.submit(commands).unwrap().wait().unwrap();
+        decode(&backend.read(&output).unwrap(), DType::F32).unwrap()
     }
 
     fn run_matmul(

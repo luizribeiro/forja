@@ -110,6 +110,15 @@ pub enum Op {
     Embed,
     /// Multiplies rank-two or rank-three matrices.
     Matmul,
+    /// Computes grouped-query scaled dot-product attention.
+    Sdpa {
+        /// The score multiplier.
+        scale: f32,
+        /// Whether keys after each query position are masked.
+        causal: bool,
+        /// The absolute position of the first query.
+        q_start: u32,
+    },
 }
 
 /// An operand named by an operation validation error.
@@ -159,6 +168,8 @@ pub enum OpError {
     InvalidEpsilon,
     /// A rotary frequency base is non-positive or non-finite.
     InvalidTheta,
+    /// An attention scale is non-finite.
+    InvalidScale,
 }
 
 impl fmt::Display for OpError {
@@ -225,6 +236,11 @@ impl CommandList {
             Op::Rope { theta } => check_rope(inputs, output, theta)?,
             Op::Embed => check_embed(inputs, output)?,
             Op::Matmul => check_matmul(inputs, output)?,
+            Op::Sdpa {
+                scale,
+                causal,
+                q_start,
+            } => check_sdpa(inputs, output, scale, causal, q_start)?,
         }
         self.dispatches.push(Dispatch {
             op,
@@ -443,6 +459,56 @@ fn check_matmul(inputs: &[&Tensor], output: &Tensor) -> Result<(), OpError> {
         });
     }
     Ok(())
+}
+
+fn check_sdpa(
+    inputs: &[&Tensor],
+    output: &Tensor,
+    scale: f32,
+    causal: bool,
+    q_start: u32,
+) -> Result<(), OpError> {
+    if inputs.len() != 3 {
+        return Err(OpError::Arity {
+            expected: 3,
+            actual: inputs.len(),
+        });
+    }
+    for (index, input) in inputs.iter().enumerate() {
+        check_float(input, Operand::Input(index))?;
+    }
+    check_float(output, Operand::Output)?;
+    if !scale.is_finite() {
+        return Err(OpError::InvalidScale);
+    }
+    let [hq, sq, d] = shape3(inputs[0], Operand::Input(0))?;
+    let [hkv, skv, kd] = shape3(inputs[1], Operand::Input(1))?;
+    if d != kd || !hq.is_multiple_of(hkv) {
+        return Err(shape_error(Operand::Input(1)));
+    }
+    let [vh, vs, dv] = shape3(inputs[2], Operand::Input(2))?;
+    if vh != hkv || vs != skv {
+        return Err(shape_error(Operand::Input(2)));
+    }
+    if causal && q_start.checked_add(sq).is_none_or(|end| end > skv) {
+        return Err(shape_error(Operand::Input(0)));
+    }
+    if output.layout.shape() != [hq, sq, dv] {
+        return Err(shape_error(Operand::Output));
+    }
+    Ok(())
+}
+
+const fn shape_error(operand: Operand) -> OpError {
+    OpError::Shape { operand }
+}
+
+fn shape3(tensor: &Tensor, operand: Operand) -> Result<[u32; 3], OpError> {
+    tensor
+        .layout
+        .shape()
+        .try_into()
+        .map_err(|_| shape_error(operand))
 }
 
 fn check_float(tensor: &Tensor, operand: Operand) -> Result<(), OpError> {
@@ -728,6 +794,59 @@ mod tests {
             CommandList::new().dispatch(Op::Matmul, &[&a, &wrong_batch], &output),
             Err(OpError::Shape {
                 operand: Operand::Input(1)
+            })
+        );
+    }
+
+    #[test]
+    fn sdpa_rejects_invalid_signatures() {
+        let q = tensor(1, DType::F32, &[4, 2, 3], &[6, 3, 1]);
+        let k = tensor(2, DType::F32, &[2, 3, 3], &[9, 3, 1]);
+        let v = tensor(3, DType::F32, &[2, 3, 2], &[6, 2, 1]);
+        let output = tensor(4, DType::F32, &[4, 2, 2], &[4, 2, 1]);
+        let noncausal = Op::Sdpa {
+            scale: 1.0,
+            causal: false,
+            q_start: 0,
+        };
+        assert_eq!(
+            CommandList::new().dispatch(noncausal, &[&q, &k], &output),
+            Err(OpError::Arity {
+                expected: 3,
+                actual: 2
+            })
+        );
+        let bad_groups = tensor(5, DType::F32, &[3, 2, 3], &[6, 3, 1]);
+        let bad_groups_output = tensor(6, DType::F32, &[3, 2, 2], &[4, 2, 1]);
+        assert_eq!(
+            CommandList::new().dispatch(noncausal, &[&bad_groups, &k, &v], &bad_groups_output),
+            Err(OpError::Shape {
+                operand: Operand::Input(1)
+            })
+        );
+        let wrong_d = tensor(7, DType::F32, &[2, 3, 4], &[12, 4, 1]);
+        assert_eq!(
+            CommandList::new().dispatch(noncausal, &[&q, &wrong_d, &v], &output),
+            Err(OpError::Shape {
+                operand: Operand::Input(1)
+            })
+        );
+        let wrong_length = tensor(8, DType::F32, &[2, 2, 2], &[4, 2, 1]);
+        assert_eq!(
+            CommandList::new().dispatch(noncausal, &[&q, &k, &wrong_length], &output),
+            Err(OpError::Shape {
+                operand: Operand::Input(2)
+            })
+        );
+        let overflow = Op::Sdpa {
+            scale: 1.0,
+            causal: true,
+            q_start: u32::MAX,
+        };
+        assert_eq!(
+            CommandList::new().dispatch(overflow, &[&q, &k, &v], &output),
+            Err(OpError::Shape {
+                operand: Operand::Input(0)
             })
         );
     }
