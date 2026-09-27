@@ -11,6 +11,7 @@ block2 = "0.6"
 forja-core = { path = "../forja-core" }
 objc2 = "0.6"
 objc2-foundation = { version = "0.3", default-features = false, features = [
+  "NSZone",
   "NSString",
 ] }
 objc2-metal = { version = "0.3", default-features = false, features = [

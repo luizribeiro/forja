@@ -1,14 +1,19 @@
 use std::{
-    ptr, slice,
+    ffi::c_void,
+    ptr::{self, NonNull},
+    slice,
     sync::{Arc, Mutex, Weak},
     time::Duration,
 };
 
 use crate::encoding::{Completion, InFlightTracker, MetalSubmission, PipelineCache};
+use block2::RcBlock;
 use forja_core::{
-    AllocationRegistry, Backend, BackendError, CommandList, DType, Layout, Tensor, ViewOp,
+    AllocationRegistry, Backend, BackendError, BufferId, CommandList, DType, Layout, MappedRegion,
+    Tensor, ViewOp,
 };
 use objc2::{rc::Retained, runtime::ProtocolObject};
+use objc2_foundation::NSPageSize;
 use objc2_metal::{
     MTL4CommandQueue, MTLBuffer, MTLCreateSystemDefaultDevice, MTLDevice, MTLGPUFamily,
     MTLResourceOptions, MTLSharedEvent, MTLSharedEventListener,
@@ -175,6 +180,22 @@ impl Backend for MetalBackend {
         buffers.tensor(id, layout)
     }
 
+    fn import_readonly(&self, bytes: MappedRegion) -> Result<BufferId, BackendError> {
+        let byte_len = u64::try_from(bytes.len()).map_err(|_| BackendError::AllocationFailed)?;
+        let buffer = no_copy_buffer(&self.device, bytes)?;
+        self.buffers
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?
+            .insert_read_only(buffer, byte_len)
+    }
+
+    fn tensor(&self, buffer: BufferId, layout: Layout) -> Result<Tensor, BackendError> {
+        self.buffers
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?
+            .tensor(buffer, layout)
+    }
+
     fn view(&self, tensor: &Tensor, op: ViewOp) -> Result<Tensor, BackendError> {
         let buffers = self
             .buffers
@@ -191,7 +212,10 @@ impl Backend for MetalBackend {
     }
 
     fn write(&self, tensor: &Tensor, bytes: &[u8]) -> Result<(), BackendError> {
-        if !tensor.layout().is_contiguous() || bytes.len() != logical_byte_len(tensor.layout())? {
+        if !tensor.is_writable()
+            || !tensor.layout().is_contiguous()
+            || bytes.len() != logical_byte_len(tensor.layout())?
+        {
             return Err(BackendError::InvalidInput);
         }
         let range = tensor.layout().byte_span();
@@ -230,6 +254,41 @@ impl Backend for MetalBackend {
     fn submit(&self, commands: CommandList) -> Result<Self::Submission, BackendError> {
         self.submit_commands(commands)
     }
+}
+
+type BufferDeallocator = RcBlock<dyn Fn(NonNull<c_void>, usize)>;
+
+fn no_copy_buffer(
+    device: &ProtocolObject<dyn MTLDevice>,
+    region: MappedRegion,
+) -> Result<MetalBuffer, BackendError> {
+    let len = region.len();
+    let rounded_len = len
+        .checked_add(NSPageSize().saturating_sub(1))
+        .map(|bytes| bytes / NSPageSize() * NSPageSize())
+        .ok_or(BackendError::AllocationFailed)?;
+    let pointer = NonNull::new(region.as_ptr().cast_mut().cast::<c_void>())
+        .ok_or(BackendError::InvalidInput)?;
+    let deallocator: BufferDeallocator = RcBlock::new(move |_pointer, _length| {
+        let _ = region.len();
+    });
+    // SAFETY: The full-file mapping starts at a page-aligned address and remains alive in the
+    // sendable deallocator block until Metal releases the buffer. The OS mapping covers the final
+    // partial page, and validated tensor layouts expose only the file's actual byte length.
+    let raw = unsafe {
+        device.newBufferWithBytesNoCopy_length_options_deallocator(
+            pointer,
+            rounded_len,
+            MTLResourceOptions::StorageModeShared,
+            Some(&deallocator),
+        )
+    }
+    .ok_or(BackendError::AllocationFailed)?;
+    Ok(MetalBuffer {
+        raw,
+        len,
+        pending: Vec::new(),
+    })
 }
 
 fn element_count(shape: &[u32]) -> Result<u64, BackendError> {
@@ -280,6 +339,58 @@ fn gather(source: &[u8], layout: &Layout) -> Result<Vec<u8>, BackendError> {
         );
     }
     Ok(result)
+}
+
+#[cfg(test)]
+mod mapped_tests {
+    use std::{
+        fs,
+        sync::atomic::{AtomicU64, Ordering},
+    };
+
+    use forja_core::{Op, OpError, Submission};
+
+    use super::*;
+
+    static NEXT_FILE: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn mapped_weights_are_read_only_gpu_inputs() {
+        let expected = [1.0_f32, 2.0, 3.0, 4.0]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>();
+        let path = std::env::temp_dir().join(format!(
+            "forja-metal-mapping-{}-{}",
+            std::process::id(),
+            NEXT_FILE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::write(&path, &expected).unwrap();
+        let region = MappedRegion::map(&fs::File::open(&path).unwrap()).unwrap();
+        let backend = MetalBackend::new().unwrap();
+        let buffer = backend.import_readonly(region).unwrap();
+        fs::remove_file(path).unwrap();
+        let weight = backend
+            .tensor(
+                buffer,
+                Layout::contiguous(DType::F32, 0, vec![4], 16).unwrap(),
+            )
+            .unwrap();
+        let output = backend.alloc(DType::F32, &[4]).unwrap();
+        let mut commands = CommandList::new();
+        commands.dispatch(Op::Copy, &[&weight], &output).unwrap();
+        backend.submit(commands).unwrap().wait().unwrap();
+
+        assert_eq!(backend.read(&output).unwrap(), expected);
+        assert_eq!(
+            backend.write(&weight, &[0; 16]),
+            Err(BackendError::InvalidInput)
+        );
+        assert_eq!(
+            CommandList::new().dispatch(Op::Copy, &[&output], &weight),
+            Err(OpError::ReadOnlyOutput)
+        );
+    }
 }
 
 #[cfg(test)]
