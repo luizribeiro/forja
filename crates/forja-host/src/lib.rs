@@ -1418,13 +1418,18 @@ where
             } = self;
             let result = match reservation {
                 Err(error) => Err(error),
-                Ok(reservation) => match backend.submit(commands) {
+                Ok(reservation) => match if profile.is_some() {
+                    backend.submit_profiled(commands)
+                } else {
+                    backend.submit(commands)
+                } {
                     Err(error) => Err(error),
                     Ok(submission) => {
                         let started = Instant::now();
                         let wait = submission.wait_timeout(timeout);
                         let wall_time = duration_ns(started.elapsed()).max(1);
                         let gpu_time = submission.gpu_time().map(duration_ns);
+                        let submission_profile = submission.profile();
                         let charged = if wait == Err(BackendError::Timeout) {
                             reservation.amount()
                         } else {
@@ -1434,6 +1439,12 @@ where
                         match (wait, accounting) {
                             (Err(error), _) | (Ok(()), Err(error)) => Err(error),
                             (Ok(()), Ok(())) => {
+                                if let (Some(target), Some(submission_profile)) =
+                                    (&profile, submission_profile)
+                                    && let Ok(mut target) = target.lock()
+                                {
+                                    target.submission = Some(submission_profile);
+                                }
                                 saturating_increment(&completed_submissions);
                                 if let Some(gpu_time) = gpu_time {
                                     saturating_increment(&timed_submissions);

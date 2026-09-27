@@ -9,8 +9,8 @@ use std::{
 
 use block2::RcBlock;
 use forja_core::{
-    BackendError, BufferId, CommandList, DType, Dispatch, Layout, Op, Slice, Submission, Tensor,
-    required_barriers,
+    BackendError, BufferId, CommandList, DType, Dispatch, Layout, Op, ProfileCount, Slice,
+    Submission, SubmissionProfile, Tensor, required_barriers,
 };
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_foundation::{NSRange, NSString};
@@ -136,6 +136,39 @@ enum CommitResult {
 
 thread_local! {
     static IN_METAL_CALLBACK: Cell<bool> = const { Cell::new(false) };
+    static TEMPORARY_PROFILE: Cell<Option<ProfileCount>> = const { Cell::new(None) };
+}
+
+struct TemporaryProfileScope {
+    previous: Option<ProfileCount>,
+    enabled: bool,
+}
+
+impl TemporaryProfileScope {
+    fn enter(enabled: bool) -> Self {
+        let previous =
+            TEMPORARY_PROFILE.with(|profile| profile.replace(enabled.then(ProfileCount::default)));
+        Self { previous, enabled }
+    }
+
+    fn finish(&mut self) -> ProfileCount {
+        if !self.enabled {
+            return ProfileCount::default();
+        }
+        self.enabled = false;
+        TEMPORARY_PROFILE.with(|profile| {
+            let current = profile.replace(self.previous);
+            current.unwrap_or_default()
+        })
+    }
+}
+
+impl Drop for TemporaryProfileScope {
+    fn drop(&mut self) {
+        if self.enabled {
+            TEMPORARY_PROFILE.with(|profile| profile.set(self.previous));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -694,23 +727,41 @@ impl InFlightTracker {
 pub struct MetalSubmission {
     completion: Arc<Completion>,
     timeout: Duration,
+    profile: Option<Mutex<SubmissionProfile>>,
 }
 
 impl Submission for MetalSubmission {
     fn wait(&self) -> Result<(), BackendError> {
-        self.completion.wait(self.timeout)
+        self.wait_profiled(self.timeout)
     }
 
     fn wait_timeout(&self, timeout: Duration) -> Result<(), BackendError> {
-        self.completion.wait(timeout)
+        self.wait_profiled(timeout)
     }
 
     fn gpu_time(&self) -> Option<Duration> {
         self.completion.gpu_time()
     }
+
+    fn profile(&self) -> Option<SubmissionProfile> {
+        Some(self.profile.as_ref()?.lock().ok()?.clone())
+    }
 }
 
 impl MetalSubmission {
+    fn wait_profiled(&self, timeout: Duration) -> Result<(), BackendError> {
+        let started = Instant::now();
+        let result = self.completion.wait(timeout);
+        if result.is_ok()
+            && let Some(profile) = &self.profile
+            && let Ok(mut profile) = profile.lock()
+        {
+            profile.wait = started.elapsed();
+            profile.gpu_time = self.completion.gpu_time().unwrap_or_default();
+        }
+        result
+    }
+
     /// Returns feedback and shared-event callback latency from queue commit after a successful wait.
     #[must_use]
     pub fn completion_timing(&self) -> Option<(Duration, Duration)> {
@@ -723,7 +774,22 @@ impl MetalBackend {
         &self,
         commands: CommandList,
     ) -> Result<MetalSubmission, BackendError> {
+        self.submit_commands_inner::<false>(commands)
+    }
+
+    pub(super) fn submit_commands_profiled(
+        &self,
+        commands: CommandList,
+    ) -> Result<MetalSubmission, BackendError> {
+        self.submit_commands_inner::<true>(commands)
+    }
+
+    fn submit_commands_inner<const PROFILE: bool>(
+        &self,
+        commands: CommandList,
+    ) -> Result<MetalSubmission, BackendError> {
         self.in_flight.drain_done();
+        let validation_started = PROFILE.then(Instant::now);
         let barriers = required_barriers(&commands);
         let dispatches = commands.into_dispatches();
         if dispatches.iter().any(|dispatch| {
@@ -755,6 +821,13 @@ impl MetalBackend {
         for tensor in &tensors {
             self.validate(tensor)?;
         }
+        let mut profile = PROFILE.then(|| SubmissionProfile {
+            validation: validation_started.map_or(Duration::ZERO, |started| started.elapsed()),
+            dispatches: u64::try_from(dispatches.len()).unwrap_or(u64::MAX),
+            barriers: u64::try_from(barriers.iter().filter(|&&barrier| barrier).count())
+                .unwrap_or(u64::MAX),
+            ..SubmissionProfile::default()
+        });
         let mut objects = self.in_flight.checkout(&self.device)?;
         let command_buffer = self.begin_command_buffer(objects.allocator()?)?;
         let timestamps = self.make_timestamps()?;
@@ -762,27 +835,45 @@ impl MetalBackend {
         unsafe {
             command_buffer.writeTimestampIntoHeap_atIndex(&timestamps.heap, 0);
         }
+        let encoding_started = PROFILE.then(Instant::now);
+        let mut temporary_profile = TemporaryProfileScope::enter(PROFILE);
         let encoded = self.encode_dispatches(
             &command_buffer,
             objects.argument_table()?,
             &dispatches,
             &barriers,
         )?;
+        if let Some(profile) = &mut profile {
+            profile.metadata_buffers = temporary_profile.finish();
+            let encoding = encoding_started.map_or(Duration::ZERO, |started| started.elapsed());
+            profile.encoding = encoding.saturating_sub(profile.metadata_buffers.time);
+        }
         let resources = self.command_resources(&tensors, encoded)?;
+        let residency_started = PROFILE.then(Instant::now);
         let residency = self.make_resident(&command_buffer, &resources)?;
+        if let Some(profile) = &mut profile {
+            profile.residency =
+                residency_started.map_or(Duration::ZERO, |started| started.elapsed());
+        }
         // SAFETY: The timestamp heap has two entries and is retained until completion.
         unsafe {
             command_buffer.writeTimestampIntoHeap_atIndex(&timestamps.heap, 1);
         }
         command_buffer.endCommandBuffer();
-        self.commit(
+        let commit_started = PROFILE.then(Instant::now);
+        let mut submission = self.commit(
             &command_buffer,
             &tensors,
             resources,
             residency,
             timestamps,
             &mut objects,
-        )
+        )?;
+        if let Some(mut profile) = profile {
+            profile.commit = commit_started.map_or(Duration::ZERO, |started| started.elapsed());
+            submission.profile = Some(Mutex::new(profile));
+        }
+        Ok(submission)
     }
 
     fn encode_dispatches(
@@ -792,8 +883,7 @@ impl MetalBackend {
         dispatches: &[Dispatch],
         barriers: &[bool],
     ) -> Result<EncodedDispatches, BackendError> {
-        use objc2_metal::{MTL4CommandEncoder, MTL4VisibilityOptions, MTLStages};
-
+        use objc2_metal::MTL4CommandEncoder;
         let encoder = command_buffer
             .computeCommandEncoder()
             .ok_or(BackendError::ExecutionFailed)?;
@@ -802,11 +892,7 @@ impl MetalBackend {
         let mut bindings = ArgumentBindings::default();
         for (dispatch, &barrier) in dispatches.iter().zip(barriers) {
             if barrier {
-                encoder.barrierAfterEncoderStages_beforeEncoderStages_visibilityOptions(
-                    MTLStages::Dispatch,
-                    MTLStages::Dispatch,
-                    MTL4VisibilityOptions::Device,
-                );
+                encode_dispatch_barrier(&encoder);
             }
             if let Op::RmsNorm { eps } = dispatch.op() {
                 temporaries.extend(self.encode_rms_norm(
@@ -2177,6 +2263,7 @@ impl MetalBackend {
     ) -> Result<Retained<ProtocolObject<dyn MTLBuffer>>, BackendError> {
         use objc2_metal::MTLResourceOptions;
 
+        let started = TEMPORARY_PROFILE.with(|profile| profile.get().map(|_| Instant::now()));
         let buffer = self
             .device
             .newBufferWithLength_options(bytes.len(), MTLResourceOptions::StorageModeShared)
@@ -2189,6 +2276,15 @@ impl MetalBackend {
                 buffer.contents().cast::<u8>().as_ptr(),
                 bytes.len(),
             );
+        }
+        if let Some(started) = started {
+            TEMPORARY_PROFILE.with(|profile| {
+                if let Some(mut timing) = profile.get() {
+                    timing.count = timing.count.saturating_add(1);
+                    timing.time = timing.time.saturating_add(started.elapsed());
+                    profile.set(Some(timing));
+                }
+            });
         }
         Ok(buffer)
     }
@@ -2384,6 +2480,7 @@ impl MetalBackend {
         Ok(MetalSubmission {
             completion,
             timeout: self.gpu_timeout,
+            profile: None,
         })
     }
 }
@@ -2792,6 +2889,24 @@ mod tests {
             gpu_time <= wall_time,
             "GPU {gpu_time:?}, wall {wall_time:?}"
         );
+    }
+
+    #[test]
+    fn profiled_submission_reports_phases_and_dispatches() {
+        let backend = MetalBackend::new().unwrap();
+        let left = backend.alloc(DType::F32, &[7, 33]).unwrap();
+        let right = backend.alloc(DType::F32, &[7, 33]).unwrap();
+        let output = backend.alloc(DType::F32, &[7, 33]).unwrap();
+        let mut commands = CommandList::new();
+        commands
+            .dispatch(Op::Add, &[&left, &right], &output)
+            .unwrap();
+        let submission = backend.submit_profiled(commands).unwrap();
+        submission.wait().unwrap();
+        let profile = submission.profile().unwrap();
+        assert_eq!(profile.dispatches, 1);
+        assert!(profile.gpu_time > Duration::ZERO);
+        assert!(profile.metadata_buffers.count >= 3);
     }
 
     #[test]

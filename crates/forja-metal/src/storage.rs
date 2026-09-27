@@ -260,6 +260,10 @@ impl Backend for MetalBackend {
     fn submit(&self, commands: CommandList) -> Result<Self::Submission, BackendError> {
         self.submit_commands(commands)
     }
+
+    fn submit_profiled(&self, commands: CommandList) -> Result<Self::Submission, BackendError> {
+        self.submit_commands_profiled(commands)
+    }
 }
 
 type BufferDeallocator = RcBlock<dyn Fn(NonNull<c_void>, usize)>;
