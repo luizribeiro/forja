@@ -100,3 +100,15 @@ world weights-smoke {
   import compute;
   export run: async func() -> result<list<u8>, string>;
 }
+
+world sdk-smoke {
+  import compute;
+  export run: async func(
+    input: list<f32>,
+    norm-weight: list<f32>,
+    q-weight: list<f32>,
+    k-weight: list<f32>,
+    v-weight: list<f32>,
+    output-weight: list<f32>,
+  ) -> result<list<f32>, string>;
+}

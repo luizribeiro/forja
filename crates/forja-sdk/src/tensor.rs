@@ -221,6 +221,15 @@ impl<T: Element> Tensor<T> {
         self.unary(sys::Op::Copy, self.shape.clone())
     }
 
+    /// Copies logical values into contiguous storage.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the copy dispatch is refused.
+    pub fn contiguous(&self) -> Result<Self> {
+        self.unary(sys::Op::Copy, self.shape.clone())
+    }
+
     /// Multiplies rank-two or rank-three matrices.
     ///
     /// # Errors

@@ -2,6 +2,7 @@
 members = [
   "hello",
   "rmsnorm-smoke",
+  "sdk-smoke",
   "tensor-abuse",
   "tensor-smoke",
   "weights-smoke",
@@ -14,4 +15,5 @@ rust-version = "1.98.1"
 version = "0.0.0"
 
 [workspace.dependencies]
+forja-sdk = { path = "../../crates/forja-sdk" }
 wit-bindgen = "0.62"

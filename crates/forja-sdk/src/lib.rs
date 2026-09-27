@@ -4,6 +4,29 @@
 //! be propagated with `?`. Engine code stays synchronous even though the host
 //! reads and submissions are asynchronous.
 //!
+//! Operations are lazy: they allocate outputs and record work in the current
+//! thread's graph. [`eval`] submits explicitly, while [`Tensor::to_vec`] submits
+//! automatically before reading.
+//!
+//! ```no_run
+//! use forja_sdk::{Result, Tensor, nn::{Linear, RmsNorm}};
+//!
+//! fn block(
+//!     input: &[f32],
+//!     norm_weight: &[f32],
+//!     projection_weight: &[f32],
+//! ) -> Result<Vec<f32>> {
+//!     let input = Tensor::from_slice(input, &[7, 1024])?;
+//!     let norm = RmsNorm::new(Tensor::from_slice(norm_weight, &[1024])?, 1.0e-6);
+//!     let projection = Linear::new(Tensor::from_slice(
+//!         projection_weight,
+//!         &[1024, 1024],
+//!     )?);
+//!     let projected = projection.forward(&norm.forward(&input)?)?;
+//!     (&input + &projected)?.to_vec()
+//! }
+//! ```
+//!
 //! The `native` feature uses the CPU backend for tests and development.
 //! `native-metal` makes Metal selectable with [`set_native_device`] on macOS.
 //! Production engines must ship as components because native mode bypasses the
