@@ -1585,6 +1585,18 @@ where
         )))
     }
 
+    fn dispatch_program(
+        &mut self,
+        _resource: Resource<CommandListEntry>,
+        _program: compute::Program,
+        _inputs: Vec<Resource<TensorEntry>>,
+        _outputs: Vec<Resource<TensorEntry>>,
+    ) -> impl Future<Output = wasmtime::Result<Result<(), compute::Error>>> + Send {
+        std::future::ready(Ok(Err(compute::Error::OpSignature(
+            "scalar programs are not available".to_owned(),
+        ))))
+    }
+
     fn drop(
         &mut self,
         resource: Resource<CommandListEntry>,

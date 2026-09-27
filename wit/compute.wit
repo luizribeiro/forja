@@ -32,6 +32,72 @@ interface compute {
     q-start: u32,
   }
 
+  enum program-kind {
+    %map,
+    row,
+  }
+
+  enum value-type {
+    %f32,
+    %u32,
+    %bool,
+  }
+
+  enum unop {
+    neg,
+    abs,
+    exp,
+    log,
+    sqrt,
+    rsqrt,
+    sin,
+    cos,
+    tanh,
+    sigmoid,
+    recip,
+    floor,
+  }
+
+  enum binop {
+    add,
+    sub,
+    mul,
+    div,
+    min,
+    max,
+    pow,
+    lt,
+    le,
+    eq,
+    ne,
+    ge,
+    gt,
+  }
+
+  enum redop {
+    sum,
+    max,
+    min,
+  }
+
+  variant inst {
+    input(u32),
+    %const(f32),
+    index(u8),
+    extent(u8),
+    unary(tuple<unop, u32>),
+    binary(tuple<binop, u32, u32>),
+    select(tuple<u32, u32, u32>),
+    cast(tuple<value-type, u32>),
+    reduce(tuple<redop, u32>),
+  }
+
+  record program {
+    kind: program-kind,
+    insts: list<inst>,
+    outputs: list<tuple<u32, u32>>,
+  }
+
   variant op {
     copy,
     add,
@@ -73,6 +139,7 @@ interface compute {
   resource command-list {
     constructor();
     dispatch: func(operation: op, ins: list<borrow<tensor>>, out: borrow<tensor>) -> result<_, error>;
+    dispatch-program: func(program: program, ins: list<borrow<tensor>>, outs: list<borrow<tensor>>) -> result<_, error>;
   }
 
   submit: async func(cmds: command-list) -> result<option<u64>, error>;
