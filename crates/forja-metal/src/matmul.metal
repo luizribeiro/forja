@@ -135,3 +135,50 @@ kernel void gemv(
         }
     }
 }
+
+kernel void gemv_transposed(
+    device const uchar *a [[buffer(0)]],
+    device const uchar *b [[buffer(1)]],
+    device uchar *d [[buffer(2)]],
+    constant MatmulParams &params [[buffer(3)]],
+    ushort simdgroup [[simdgroup_index_in_threadgroup]],
+    ushort lane [[thread_index_in_simdgroup]],
+    uint3 tile [[threadgroup_position_in_grid]]) {
+    ulong a_base = params.a_offset + ulong(tile.z) * params.batch_stride_a;
+    ulong b_base = params.b_offset + ulong(tile.z) * params.batch_stride_b;
+    uint first_column = tile.x * 32 + uint(simdgroup) * 4;
+    float sums[4] = {0.0f};
+    for (uint inner = uint(lane) * 4; inner < params.k; inner += 128) {
+        float inputs[4];
+        for (uint element = 0; element < 4; ++element) {
+            uint index = inner + element;
+            inputs[element] = index < params.k
+                ? load_float(a, a_base + index, input0_dtype)
+                : 0.0f;
+        }
+        for (uint row = 0; row < 4; ++row) {
+            uint column = first_column + row;
+            if (column < params.n) {
+                ulong weight = b_base + ulong(column) * params.ldb + inner;
+                for (uint element = 0; element < 4; ++element) {
+                    if (inner + element < params.k) {
+                        sums[row] += inputs[element] * load_float(
+                            b, weight + element, input1_dtype);
+                    }
+                }
+            }
+        }
+    }
+    for (uint row = 0; row < 4; ++row) {
+        sums[row] = simd_sum(sums[row]);
+    }
+    if (lane == 0) {
+        ulong d_base = params.d_offset + ulong(tile.z) * params.batch_stride_d;
+        for (uint row = 0; row < 4; ++row) {
+            uint column = first_column + row;
+            if (column < params.n) {
+                store_float(d, d_base + column, output_dtype, sums[row]);
+            }
+        }
+    }
+}

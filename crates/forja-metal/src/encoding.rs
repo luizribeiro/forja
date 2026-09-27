@@ -2132,11 +2132,17 @@ impl MetalBackend {
 
     fn matmul_launch(&self, shape: MatmulShape) -> Result<MatmulLaunch, BackendError> {
         let (kernel, block_rows, block_columns, thread_count, constants) = if shape.rows == 1 {
+            let (kernel, block_columns, thread_count) =
+                if shape.right_column_major && !shape.left_column_major {
+                    ("gemv_transposed", 32, 256)
+                } else {
+                    ("gemv", 4, 32)
+                };
             (
-                "gemv",
+                kernel,
                 1,
-                4,
-                32,
+                block_columns,
+                thread_count,
                 vec![
                     (0, dtype_code(shape.left_dtype)),
                     (1, dtype_code(shape.right_dtype)),
@@ -4200,6 +4206,28 @@ mod tests {
                 &TensorSpec::contiguous(DType::BF16, &[1, columns]),
             );
         }
+        assert_matmul(
+            TensorSpec::contiguous(DType::BF16, &[1, 33]),
+            TensorSpec::permuted(DType::BF16, &[4097, 33], &[1, 0]),
+            &TensorSpec::contiguous(DType::BF16, &[1, 4097]),
+        );
+    }
+
+    #[test]
+    fn metal_gemv_handles_column_major_decode_input() {
+        assert_matmul(
+            TensorSpec::sliced_permuted(
+                DType::BF16,
+                &[1024, 2],
+                &[
+                    Slice::new(0, 1024, 1).unwrap(),
+                    Slice::new(0, 1, 1).unwrap(),
+                ],
+                &[1, 0],
+            ),
+            TensorSpec::permuted(DType::BF16, &[2048, 1024], &[1, 0]),
+            &TensorSpec::contiguous(DType::BF16, &[1, 2048]),
+        );
     }
 
     #[test]

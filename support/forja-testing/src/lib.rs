@@ -14,12 +14,12 @@ pub const BF16_TOLERANCE: f64 = 1e-2;
 /// The quantized normwise relative-error limit.
 pub const QUANTIZED_TOLERANCE: f64 = 1e-2;
 
-/// A tensor allocation and optional metadata-only view used by backend tests.
+/// A tensor allocation and metadata-only views used by backend tests.
 #[derive(Clone, Debug)]
 pub struct TensorSpec {
     dtype: DType,
     allocation_shape: Vec<u32>,
-    view: Option<ViewOp>,
+    views: Vec<ViewOp>,
     initialized: Option<Vec<u8>>,
 }
 
@@ -30,7 +30,7 @@ impl TensorSpec {
         Self {
             dtype,
             allocation_shape: shape.to_vec(),
-            view: None,
+            views: Vec::new(),
             initialized: None,
         }
     }
@@ -41,7 +41,7 @@ impl TensorSpec {
         Self {
             dtype,
             allocation_shape: allocation_shape.to_vec(),
-            view: Some(ViewOp::Permute(axes.to_vec())),
+            views: vec![ViewOp::Permute(axes.to_vec())],
             initialized: None,
         }
     }
@@ -52,7 +52,26 @@ impl TensorSpec {
         Self {
             dtype,
             allocation_shape: allocation_shape.to_vec(),
-            view: Some(ViewOp::Slice(slices.to_vec())),
+            views: vec![ViewOp::Slice(slices.to_vec())],
+            initialized: None,
+        }
+    }
+
+    /// Describes a tensor viewed through a slice followed by an axis permutation.
+    #[must_use]
+    pub fn sliced_permuted(
+        dtype: DType,
+        allocation_shape: &[u32],
+        slices: &[Slice],
+        axes: &[u8],
+    ) -> Self {
+        Self {
+            dtype,
+            allocation_shape: allocation_shape.to_vec(),
+            views: vec![
+                ViewOp::Slice(slices.to_vec()),
+                ViewOp::Permute(axes.to_vec()),
+            ],
             initialized: None,
         }
     }
@@ -63,7 +82,7 @@ impl TensorSpec {
         Self {
             dtype,
             allocation_shape: allocation_shape.to_vec(),
-            view: Some(ViewOp::Broadcast(shape.to_vec())),
+            views: vec![ViewOp::Broadcast(shape.to_vec())],
             initialized: None,
         }
     }
@@ -74,7 +93,7 @@ impl TensorSpec {
         Self {
             dtype,
             allocation_shape: shape.to_vec(),
-            view: None,
+            views: Vec::new(),
             initialized: Some(bytes),
         }
     }
@@ -264,9 +283,10 @@ fn run<B: Backend>(
 
 fn allocate<B: Backend>(backend: &B, spec: &TensorSpec) -> Result<Tensor, AgreementError> {
     let tensor = backend.alloc(spec.dtype, &spec.allocation_shape)?;
-    spec.view
-        .clone()
-        .map_or(Ok(tensor.clone()), |view| backend.view(&tensor, view))
+    spec.views
+        .iter()
+        .cloned()
+        .try_fold(tensor, |tensor, view| backend.view(&tensor, view))
         .map_err(Into::into)
 }
 
@@ -277,11 +297,10 @@ fn allocate_initialized<B: Backend>(
 ) -> Result<Tensor, AgreementError> {
     let allocation = backend.alloc(spec.dtype, &spec.allocation_shape)?;
     backend.write(&allocation, bytes)?;
-    spec.view
-        .clone()
-        .map_or(Ok(allocation.clone()), |view| {
-            backend.view(&allocation, view)
-        })
+    spec.views
+        .iter()
+        .cloned()
+        .try_fold(allocation, |tensor, view| backend.view(&tensor, view))
         .map_err(Into::into)
 }
 
