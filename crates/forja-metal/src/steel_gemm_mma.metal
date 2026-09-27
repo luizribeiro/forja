@@ -3,6 +3,130 @@
 
 #include <metal_simdgroup_matrix>
 
+template <typename T>
+struct SteelMMAFragment {
+    static constant constexpr int rows = 8;
+    static constant constexpr int columns = 8;
+    static constant constexpr int elements = 2;
+
+    using fragment_type = metal::vec<T, elements>;
+    using matrix_type = metal::simdgroup_matrix<T, rows, columns>;
+
+    static short2 coordinate(ushort lane) {
+        short quad = lane / 4;
+        short row = (quad & 4) + ((lane / 2) % 4);
+        short column = (quad & 2) * 2 + (lane % 2) * 2;
+        return short2(column, row);
+    }
+
+    template <typename U>
+    static void load(
+        thread fragment_type &values,
+        threadgroup const U *source,
+        int row_stride,
+        int column_stride) {
+        for (short element = 0; element < elements; ++element) {
+            values[element] = T(source[element * column_stride]);
+        }
+    }
+
+    template <typename A, typename B, typename C>
+    static void multiply(
+        thread fragment_type &result,
+        thread metal::vec<A, elements> &left,
+        thread metal::vec<B, elements> &right,
+        thread metal::vec<C, elements> &accumulator) {
+        metal::simdgroup_matrix<T, rows, columns> result_matrix;
+        metal::simdgroup_matrix<A, rows, columns> left_matrix;
+        metal::simdgroup_matrix<B, rows, columns> right_matrix;
+        metal::simdgroup_matrix<C, rows, columns> accumulator_matrix;
+        left_matrix.thread_elements() = left;
+        right_matrix.thread_elements() = right;
+        accumulator_matrix.thread_elements() = accumulator;
+        simdgroup_multiply_accumulate(
+            result_matrix, left_matrix, right_matrix, accumulator_matrix);
+        result = result_matrix.thread_elements();
+    }
+
+    template <typename Operation>
+    static void row_reduce(
+        thread const fragment_type &values,
+        thread T &result) {
+        T pair = Operation::apply(values[0], values[1]);
+        T quad = Operation::apply(pair, simd_shuffle_xor(pair, ushort(1)));
+        result = Operation::apply(result, simd_shuffle_xor(quad, ushort(8)));
+    }
+
+    template <typename Operation>
+    static void row_apply(
+        thread fragment_type &values,
+        thread const T &row_value) {
+        for (short element = 0; element < elements; ++element) {
+            values[element] = Operation::apply(values[element], row_value);
+        }
+    }
+};
+
+template <typename T, int tile_rows, int tile_columns>
+struct SteelMMATile {
+    using Fragment = SteelMMAFragment<T>;
+    using fragment_type = typename Fragment::fragment_type;
+    static constant constexpr int fragment_count = tile_rows * tile_columns;
+    static constant constexpr int element_count = fragment_count * Fragment::elements;
+
+    fragment_type fragments[fragment_count];
+
+    void clear() thread {
+        for (short index = 0; index < fragment_count; ++index) {
+            fragments[index] = fragment_type(0);
+        }
+    }
+
+    thread fragment_type &at(short row, short column) thread {
+        return fragments[row * tile_columns + column];
+    }
+
+    thread T *elements() thread {
+        return reinterpret_cast<thread T *>(fragments);
+    }
+
+    template <typename Operation>
+    void row_reduce(thread T *values) const thread {
+        for (short row = 0; row < tile_rows; ++row) {
+            for (short column = 0; column < tile_columns; ++column) {
+                Fragment::template row_reduce<Operation>(
+                    fragments[row * tile_columns + column], values[row]);
+            }
+        }
+    }
+
+    template <typename Operation>
+    void row_apply(thread T *values) thread {
+        for (short row = 0; row < tile_rows; ++row) {
+            for (short column = 0; column < tile_columns; ++column) {
+                Fragment::template row_apply<Operation>(at(row, column), values[row]);
+            }
+        }
+    }
+};
+
+template <typename T, int rows, int columns, int inner>
+void steel_tile_multiply(
+    thread SteelMMATile<T, rows, columns> &result,
+    thread SteelMMATile<T, rows, inner> &left,
+    thread SteelMMATile<T, inner, columns> &right,
+    thread SteelMMATile<T, rows, columns> &accumulator) {
+    for (short row = 0; row < rows; ++row) {
+        for (short column = 0; column < columns; ++column) {
+            for (short reduction = 0; reduction < inner; ++reduction) {
+                SteelMMAFragment<T>::multiply(
+                    result.at(row, column), left.at(row, reduction),
+                    right.at(reduction, column), accumulator.at(row, column));
+            }
+        }
+    }
+}
+
 template <int block_rows, int block_columns, int block_inner,
           int simdgroups_rows, int simdgroups_columns>
 struct BlockMMA {
