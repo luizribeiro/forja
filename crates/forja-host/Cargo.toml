@@ -14,7 +14,11 @@ wasmtime-wasi.workspace = true
 
 [dev-dependencies]
 forja-cpu = { path = "../forja-cpu" }
+test-guests = { path = "../../support/test-guests" }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+forja-metal = { path = "../forja-metal" }
 
 [lints]
 workspace = true

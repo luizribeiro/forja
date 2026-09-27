@@ -41,3 +41,8 @@ interface compute {
 world host {
   import compute;
 }
+
+world tensor-smoke {
+  import compute;
+  export run: async func() -> result<u64, string>;
+}
