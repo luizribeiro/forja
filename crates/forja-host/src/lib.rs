@@ -84,9 +84,14 @@ pub struct EngineStep {
     pub taps: bool,
 }
 
-/// A tensor returned by a component and retained by its runner.
+/// A tensor returned by a component and owned by its runner.
+///
+/// The handle remains valid until the runner starts its next step, which releases every output
+/// from the preceding step before invoking the guest.
 #[derive(Debug)]
-pub struct EngineTensor(Resource<TensorEntry>);
+pub struct EngineTensor {
+    handle: u32,
+}
 
 /// Device-resident outputs from one engine invocation.
 #[derive(Debug)]
@@ -101,6 +106,7 @@ pub struct EngineOutput {
 pub struct EngineRunner<B: Backend + Send + Sync + 'static> {
     store: Store<Host<B>>,
     instance: engine_bindings::EngineComponent,
+    output_handles: Vec<u32>,
 }
 
 const EPOCH_TICK: Duration = Duration::from_millis(10);
@@ -183,7 +189,11 @@ where
         let instance =
             engine_bindings::EngineComponent::instantiate_async(&mut store, &component, &linker)
                 .await?;
-        Ok(Self { store, instance })
+        Ok(Self {
+            store,
+            instance,
+            output_handles: Vec::new(),
+        })
     }
 
     /// Returns the engine's static metadata.
@@ -239,6 +249,9 @@ where
         input: EngineStep,
     ) -> wasmtime::Result<Result<EngineOutput, compute::Error>> {
         use engine_bindings::exports::l9o::gpu::engine::{StepIn, StepOut};
+        if let Err(error) = self.release_outputs() {
+            return Ok(Err(error));
+        }
         self.set_guest_deadline();
         let output = match self
             .instance
@@ -257,9 +270,23 @@ where
             Err(error) if is_epoch_timeout(&error) => return Ok(Err(guest_timeout())),
             Err(error) => return Err(error),
         };
-        Ok(output.map(|StepOut { logits, taps }| EngineOutput {
-            logits: EngineTensor(logits),
-            taps: taps.into_iter().map(EngineTensor).collect(),
+        let StepOut { logits, taps } = match output {
+            Ok(output) => output,
+            Err(error) => return Ok(Err(error)),
+        };
+        self.output_handles = std::iter::once(logits.rep())
+            .chain(taps.iter().map(Resource::rep))
+            .collect();
+        Ok(Ok(EngineOutput {
+            logits: EngineTensor {
+                handle: logits.rep(),
+            },
+            taps: taps
+                .into_iter()
+                .map(|tensor| EngineTensor {
+                    handle: tensor.rep(),
+                })
+                .collect(),
         }))
     }
 
@@ -269,7 +296,8 @@ where
     ///
     /// Returns an invalid-handle or backend read failure.
     pub async fn read(&mut self, tensor: &EngineTensor) -> Result<Vec<u8>, compute::Error> {
-        match self.store.data().prepare_read(&tensor.0) {
+        let resource = Resource::new_borrow(tensor.handle);
+        match self.store.data().prepare_read(&resource) {
             Ok(request) => request.run().await.map_err(guest_error),
             Err(error) => Err(error),
         }
@@ -277,6 +305,23 @@ where
 
     fn set_guest_deadline(&mut self) {
         Host::reset_guest_deadline(&mut self.store);
+    }
+
+    fn release_outputs(&mut self) -> Result<(), compute::Error> {
+        let handles = std::mem::take(&mut self.output_handles);
+        self.release_handles(handles)
+    }
+
+    fn release_handles(&mut self, handles: Vec<u32>) -> Result<(), compute::Error> {
+        let mut failure = None;
+        for handle in handles {
+            if let Err(error) = self.store.data_mut().drop_tensor(Resource::new_own(handle))
+                && failure.is_none()
+            {
+                failure = Some(error);
+            }
+        }
+        failure.map_or(Ok(()), Err)
     }
 }
 

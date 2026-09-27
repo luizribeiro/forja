@@ -42,6 +42,30 @@ async fn guest_step_stops_at_its_cpu_deadline() -> wasmtime::Result<()> {
     run_engine(test_guests::engine_smoke(), false).await
 }
 
+#[tokio::test]
+async fn preceding_step_outputs_are_released() -> wasmtime::Result<()> {
+    let limits = Limits::new(1024 * 1024, 4, 1024, 4, 1024 * 1024);
+    let weights = weight_file()?;
+    let mut runner = EngineRunner::new(
+        test_guests::engine_smoke(),
+        CpuBackend::new(),
+        limits,
+        &weights,
+    )
+    .await?;
+    runner.load().await??;
+    for _ in 0..40 {
+        runner
+            .step(EngineStep {
+                tokens: vec![7],
+                start_pos: 0,
+                taps: false,
+            })
+            .await??;
+    }
+    Ok(())
+}
+
 async fn run_engine(component: &Path, taps: bool) -> wasmtime::Result<()> {
     let weights = weight_file()?;
     let mut runner = EngineRunner::new(component, CpuBackend::new(), LIMITS, &weights).await?;
