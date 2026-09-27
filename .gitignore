@@ -1,4 +1,6 @@
 target/
 .direnv/
+.venv/
+__pycache__/
 result
 .pre-commit-config.yaml

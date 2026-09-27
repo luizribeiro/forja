@@ -158,6 +158,7 @@
             pkgs.cargo-nextest
             pkgs.cargo-deny
             pkgs.git-absorb
+            pkgs.uv
           ]
           ++ gitHooks.enabledPackages;
           shellHook = ''
