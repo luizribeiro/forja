@@ -234,6 +234,45 @@ impl Drop for ImportTimer {
     }
 }
 
+#[derive(Clone, Copy)]
+enum BackendEvent {
+    Allocation,
+    Release,
+}
+
+struct BackendTimer {
+    profile: Option<Arc<Mutex<EngineStepProfile>>>,
+    event: BackendEvent,
+    started: Instant,
+}
+
+impl BackendTimer {
+    fn start(profile: Option<&Arc<Mutex<EngineStepProfile>>>, event: BackendEvent) -> Self {
+        Self {
+            profile: profile.cloned(),
+            event,
+            started: Instant::now(),
+        }
+    }
+}
+
+impl Drop for BackendTimer {
+    fn drop(&mut self) {
+        let Some(profile) = &self.profile else {
+            return;
+        };
+        let Ok(mut profile) = profile.lock() else {
+            return;
+        };
+        let timing = match self.event {
+            BackendEvent::Allocation => &mut profile.allocations,
+            BackendEvent::Release => &mut profile.releases,
+        };
+        timing.count = timing.count.saturating_add(1);
+        timing.time = timing.time.saturating_add(self.started.elapsed());
+    }
+}
+
 /// An instantiated engine component and its host resources.
 pub struct EngineRunner<B: Backend + Send + Sync + 'static> {
     store: Store<Host<B>>,
@@ -699,7 +738,12 @@ enum BufferKind {
 }
 
 impl BufferHandle {
-    fn release<B: Backend>(&self, backend: &B) -> Result<(), BackendError> {
+    fn release<B: Backend>(
+        &self,
+        backend: &B,
+        profile: Option<&Arc<Mutex<EngineStepProfile>>>,
+    ) -> Result<(), BackendError> {
+        let _timer = BackendTimer::start(profile, BackendEvent::Release);
         backend.release(&self.owner)?;
         match &self.kind {
             BufferKind::Allocated {
@@ -865,7 +909,9 @@ impl<B: Backend> Host<B> {
     ) -> Result<Resource<TensorEntry>, compute::Error> {
         let dtype = core_dtype(dtype);
         let byte_len = self.check_allocation(dtype, shape)?;
+        let timer = BackendTimer::start(self.active_profile.as_ref(), BackendEvent::Allocation);
         let tensor = self.backend.alloc(dtype, shape).map_err(guest_error)?;
+        drop(timer);
         let entry = TensorEntry {
             tensor: tensor.clone(),
             buffer: Arc::new(BufferHandle {
@@ -956,7 +1002,8 @@ impl<B: Backend> Host<B> {
                 Ok(resource)
             }
             Err(error) => {
-                release_buffer(self.backend.as_ref(), buffer).map_err(guest_error)?;
+                release_buffer(self.backend.as_ref(), buffer, self.active_profile.as_ref())
+                    .map_err(guest_error)?;
                 Err(invalid_handle(error))
             }
         }
@@ -1038,7 +1085,12 @@ impl<B: Backend> Host<B> {
             .live_handles
             .checked_sub(1)
             .ok_or_else(|| invalid_handle("live handle accounting underflowed"))?;
-        release_buffer(self.backend.as_ref(), entry.buffer).map_err(guest_error)?;
+        release_buffer(
+            self.backend.as_ref(),
+            entry.buffer,
+            self.active_profile.as_ref(),
+        )
+        .map_err(guest_error)?;
         self.live_handles = live_handles;
         Ok(())
     }
@@ -1135,7 +1187,8 @@ impl<B: Backend> Host<B> {
     }
 
     fn release_retained(&self, entries: Vec<TensorEntry>) -> Result<(), compute::Error> {
-        release_retained(self.backend.as_ref(), entries).map_err(guest_error)
+        release_retained(self.backend.as_ref(), entries, self.active_profile.as_ref())
+            .map_err(guest_error)
     }
 
     fn prepare_submit(
@@ -1153,6 +1206,7 @@ impl<B: Backend> Host<B> {
             completed_submissions: Arc::clone(&self.completed_submissions),
             timed_submissions: Arc::clone(&self.timed_submissions),
             completed_gpu_time_ns: Arc::clone(&self.completed_gpu_time_ns),
+            profile: self.active_profile.clone(),
         })
     }
 
@@ -1167,7 +1221,12 @@ impl<B: Backend> Host<B> {
             .live_handles
             .checked_sub(1)
             .ok_or_else(|| invalid_handle("live handle accounting underflowed"))?;
-        release_buffer(self.backend.as_ref(), entry.buffer).map_err(guest_error)?;
+        release_buffer(
+            self.backend.as_ref(),
+            entry.buffer,
+            self.active_profile.as_ref(),
+        )
+        .map_err(guest_error)?;
         self.live_handles = live_handles;
         Ok(())
     }
@@ -1264,6 +1323,7 @@ impl<B: Backend> Host<B> {
             backend: Arc::clone(&self.backend),
             tensor: entry.tensor.clone(),
             buffer: Arc::clone(&entry.buffer),
+            profile: self.active_profile.clone(),
         })
     }
 }
@@ -1272,6 +1332,7 @@ struct ReadRequest<B: Backend> {
     backend: Arc<B>,
     tensor: Tensor,
     buffer: Arc<BufferHandle>,
+    profile: Option<Arc<Mutex<EngineStepProfile>>>,
 }
 
 struct SubmitRequest<B: Backend> {
@@ -1284,6 +1345,7 @@ struct SubmitRequest<B: Backend> {
     completed_submissions: Arc<AtomicU64>,
     timed_submissions: Arc<AtomicU64>,
     completed_gpu_time_ns: Arc<AtomicU64>,
+    profile: Option<Arc<Mutex<EngineStepProfile>>>,
 }
 
 struct GpuReservation {
@@ -1352,6 +1414,7 @@ where
                 completed_submissions,
                 timed_submissions,
                 completed_gpu_time_ns,
+                profile,
             } = self;
             let result = match reservation {
                 Err(error) => Err(error),
@@ -1382,7 +1445,7 @@ where
                     }
                 },
             };
-            let release = release_retained(backend.as_ref(), retained);
+            let release = release_retained(backend.as_ref(), retained, profile.as_ref());
             match (result, release) {
                 (Err(error), _) | (Ok(_), Err(error)) => Err(error),
                 (Ok(gpu_time), Ok(())) => Ok(gpu_time),
@@ -1416,9 +1479,10 @@ where
                 backend,
                 tensor,
                 buffer,
+                profile,
             } = self;
             let result = backend.read(&tensor);
-            let release = release_buffer(backend.as_ref(), buffer);
+            let release = release_buffer(backend.as_ref(), buffer, profile.as_ref());
             match (result, release) {
                 (Err(error), _) | (Ok(_), Err(error)) => Err(error),
                 (Ok(bytes), Ok(())) => Ok(bytes),
@@ -1742,10 +1806,11 @@ fn validate_view(tensor: &Tensor, operation: &ViewOp) -> Result<Layout, LayoutEr
 fn release_retained<B: Backend>(
     backend: &B,
     entries: Vec<TensorEntry>,
+    profile: Option<&Arc<Mutex<EngineStepProfile>>>,
 ) -> Result<(), BackendError> {
     let mut failure = None;
     for entry in entries {
-        if let Err(error) = release_buffer(backend, entry.buffer)
+        if let Err(error) = release_buffer(backend, entry.buffer, profile)
             && failure.is_none()
         {
             failure = Some(error);
@@ -1754,8 +1819,12 @@ fn release_retained<B: Backend>(
     failure.map_or(Ok(()), Err)
 }
 
-fn release_buffer<B: Backend>(backend: &B, buffer: Arc<BufferHandle>) -> Result<(), BackendError> {
-    Arc::into_inner(buffer).map_or(Ok(()), |buffer| buffer.release(backend))
+fn release_buffer<B: Backend>(
+    backend: &B,
+    buffer: Arc<BufferHandle>,
+    profile: Option<&Arc<Mutex<EngineStepProfile>>>,
+) -> Result<(), BackendError> {
+    Arc::into_inner(buffer).map_or(Ok(()), |buffer| buffer.release(backend, profile))
 }
 
 fn quota(message: &str) -> compute::Error {
@@ -1856,8 +1925,8 @@ mod tests {
     use wasmtime::component::Resource;
 
     use super::{
-        EngineMetrics, EngineStepProfile, Grants, Host, ImportKind, ImportTimer, Limits,
-        bindings::l9o::gpu::compute,
+        BackendEvent, BackendTimer, EngineMetrics, EngineStepProfile, Grants, Host, ImportKind,
+        ImportTimer, Limits, bindings::l9o::gpu::compute,
     };
 
     const GENEROUS: Limits = Limits::new(u64::MAX, 8, u64::MAX, 32, u64::MAX);
@@ -1873,6 +1942,19 @@ mod tests {
         let profile = profile.lock().unwrap();
         assert_eq!(profile.imports.dispatch.count, 1);
         assert_eq!(profile.imports.alloc.count, 0);
+    }
+
+    #[test]
+    fn backend_timer_counts_allocations_and_releases() {
+        let profile = Arc::new(Mutex::new(EngineStepProfile::default()));
+        drop(BackendTimer::start(
+            Some(&profile),
+            BackendEvent::Allocation,
+        ));
+        drop(BackendTimer::start(Some(&profile), BackendEvent::Release));
+        let profile = profile.lock().unwrap();
+        assert_eq!(profile.allocations.count, 1);
+        assert_eq!(profile.releases.count, 1);
     }
 
     #[test]
