@@ -1,3 +1,8 @@
+[advisories]
+ignore = [
+  { id = "RUSTSEC-2024-0436", reason = "paste 1.0.15 via tokenizers 0.22.2 -> forja is unmaintained, not vulnerable; paste is a non-optional tokenizers dependency" },
+]
+
 [licenses]
 allow = [
   "MIT",
