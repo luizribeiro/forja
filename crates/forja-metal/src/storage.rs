@@ -71,6 +71,12 @@ pub struct MetalBackend {
     pub(super) gpu_timeout: Duration,
 }
 
+impl Drop for MetalBackend {
+    fn drop(&mut self) {
+        self.in_flight.drain(self.gpu_timeout);
+    }
+}
+
 impl MetalBackend {
     /// Creates a backend on the system default Metal 4 device.
     ///

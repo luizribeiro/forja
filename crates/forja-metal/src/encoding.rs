@@ -1,4 +1,5 @@
 use std::{
+    cell::Cell,
     collections::{HashMap, HashSet},
     ffi::c_void,
     ptr::NonNull,
@@ -101,7 +102,67 @@ struct PipelineKey {
 }
 
 struct CompletionState {
-    result: Option<Result<(), BackendError>>,
+    feedback: Option<CommitResult>,
+    event_signaled: bool,
+    committed: Option<Instant>,
+    feedback_elapsed: Option<Duration>,
+    event_elapsed: Option<Duration>,
+}
+
+struct CommitFeedback(Retained<ProtocolObject<dyn MTL4CommitFeedback>>);
+
+// SAFETY: Commit feedback is immutable after Metal invokes the handler, and ownership moves to
+// the waiting thread before its properties are read or it is released.
+unsafe impl Send for CommitFeedback {}
+
+enum CommitResult {
+    Feedback(CommitFeedback),
+    #[cfg(test)]
+    Known(Result<(), BackendError>),
+}
+
+thread_local! {
+    static IN_METAL_CALLBACK: Cell<bool> = const { Cell::new(false) };
+}
+
+struct MetalCallbackScope(bool);
+
+impl MetalCallbackScope {
+    fn enter() -> Self {
+        let previous = IN_METAL_CALLBACK.with(|active| active.replace(true));
+        debug_assert!(!previous);
+        Self(previous)
+    }
+}
+
+impl Drop for MetalCallbackScope {
+    fn drop(&mut self) {
+        IN_METAL_CALLBACK.with(|active| active.set(self.0));
+    }
+}
+
+fn assert_not_in_metal_callback() {
+    IN_METAL_CALLBACK.with(|active| {
+        #[cfg(test)]
+        assert!(!active.get(), "Metal method called from a callback");
+        #[cfg(not(test))]
+        debug_assert!(!active.get(), "Metal method called from a callback");
+    });
+}
+
+fn commit_result(feedback: &CommitResult) -> Result<(), BackendError> {
+    match feedback {
+        CommitResult::Feedback(feedback) => {
+            assert_not_in_metal_callback();
+            if feedback.0.error().is_some() {
+                Err(BackendError::ExecutionFailed)
+            } else {
+                Ok(())
+            }
+        }
+        #[cfg(test)]
+        CommitResult::Known(result) => *result,
+    }
 }
 
 pub(super) struct InFlightBuffer {
@@ -184,6 +245,7 @@ pub(super) struct Completion {
     resources: CommandResources,
     _residency: InFlightResidency,
     timestamps: Option<GpuTimestamps>,
+    tracker: Weak<InFlightTracker>,
     commit: CommitRetention,
 }
 
@@ -209,20 +271,19 @@ impl Completion {
         event: InFlightEvent,
         residency: InFlightResidency,
         timestamps: Option<GpuTimestamps>,
+        tracker: Weak<InFlightTracker>,
     ) -> Arc<Self> {
         Arc::new_cyclic(|completion: &Weak<Self>| {
             let callback_completion = completion.clone();
             let handler: FeedbackHandler = RcBlock::new(
                 move |feedback: NonNull<ProtocolObject<dyn MTL4CommitFeedback>>| {
-                    // SAFETY: Metal supplies a live, non-null feedback object for this call.
-                    let feedback = unsafe { feedback.as_ref() };
-                    let result = if feedback.error().is_some() {
-                        Err(BackendError::ExecutionFailed)
-                    } else {
-                        Ok(())
-                    };
+                    let _scope = MetalCallbackScope::enter();
                     if let Some(completion) = callback_completion.upgrade() {
-                        completion.finish(result);
+                        // SAFETY: Metal supplies a live feedback object for the callback. Retaining
+                        // it keeps the immutable result alive for inspection on the waiting thread.
+                        if let Some(feedback) = unsafe { Retained::retain(feedback.as_ptr()) } {
+                            completion.finish(CommitResult::Feedback(CommitFeedback(feedback)));
+                        }
                     }
                 },
             );
@@ -234,12 +295,19 @@ impl Completion {
                 options.addFeedbackHandler(RcBlock::as_ptr(&handler));
             }
             Self {
-                state: Mutex::new(CompletionState { result: None }),
+                state: Mutex::new(CompletionState {
+                    feedback: None,
+                    event_signaled: false,
+                    committed: None,
+                    feedback_elapsed: None,
+                    event_elapsed: None,
+                }),
                 ready: Condvar::new(),
                 event,
                 resources,
                 _residency: residency,
                 timestamps,
+                tracker,
                 commit: CommitRetention {
                     _handler: handler,
                     options,
@@ -248,51 +316,39 @@ impl Completion {
         })
     }
 
-    pub(super) fn finish(&self, result: Result<(), BackendError>) {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.result = Some(result);
+    fn finish(self: &Arc<Self>, result: CommitResult) {
+        let complete = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.feedback = Some(result);
+            state.feedback_elapsed = state.committed.map(|started| started.elapsed());
+            state.event_signaled
+        };
+        if complete {
+            self.reap();
+        }
         self.ready.notify_all();
     }
 
     pub(super) fn wait(&self, timeout: Duration) -> Result<(), BackendError> {
-        let started = Instant::now();
-        if !self
-            .event
-            .raw
-            .waitUntilSignaledValue_timeoutMS(1, timeout_millis(timeout))
-        {
-            return Err(BackendError::ExecutionFailed);
-        }
-        self.wait_for_feedback(timeout.saturating_sub(started.elapsed()))?;
-        self.check_error_flags()
-    }
-
-    fn wait_unbounded(&self) {
-        let _signaled = self.event.raw.waitUntilSignaledValue_timeoutMS(1, u64::MAX);
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        while state.result.is_none() {
-            state = self
-                .ready
-                .wait(state)
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-        }
-    }
-
-    fn wait_for_feedback(&self, timeout: Duration) -> Result<(), BackendError> {
         let started = Instant::now();
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         loop {
-            if let Some(result) = state.result {
-                return result;
+            if state.event_signaled
+                && let Some(feedback) = &state.feedback
+            {
+                let result = commit_result(feedback);
+                drop(state);
+                if let Some(tracker) = self.tracker.upgrade() {
+                    tracker.drain_done();
+                }
+                result?;
+                return self.check_error_flags();
             }
             let remaining = timeout.saturating_sub(started.elapsed());
             if remaining.is_zero() {
@@ -303,10 +359,47 @@ impl Completion {
                 .wait_timeout(state, remaining)
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             state = next;
-            if wait.timed_out() && state.result.is_none() {
+            if wait.timed_out() && (!state.event_signaled || state.feedback.is_none()) {
                 return Err(BackendError::ExecutionFailed);
             }
         }
+    }
+
+    fn signal_event(self: &Arc<Self>) {
+        let complete = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.event_signaled = true;
+            state.event_elapsed = state.committed.map(|started| started.elapsed());
+            state.feedback.is_some()
+        };
+        if complete {
+            self.reap();
+        }
+        self.ready.notify_all();
+    }
+
+    fn mark_committed(&self) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .committed = Some(Instant::now());
+    }
+
+    fn reap(self: &Arc<Self>) {
+        if let Some(tracker) = self.tracker.upgrade() {
+            tracker.remove(self);
+        }
+    }
+
+    fn completion_timing(&self) -> Option<(Duration, Duration)> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Some((state.feedback_elapsed?, state.event_elapsed?))
     }
 
     fn check_error_flags(&self) -> Result<(), BackendError> {
@@ -351,12 +444,14 @@ unsafe impl Sync for InFlightCompletion {}
 
 pub(super) struct InFlightTracker {
     completions: Mutex<Vec<InFlightCompletion>>,
+    done: Mutex<Vec<InFlightCompletion>>,
 }
 
 impl InFlightTracker {
     pub(super) const fn new() -> Self {
         Self {
             completions: Mutex::new(Vec::new()),
+            done: Mutex::new(Vec::new()),
         }
     }
 
@@ -368,10 +463,11 @@ impl InFlightTracker {
         let pending = Arc::clone(completion);
         let owner = Arc::clone(self);
         let notification: NotificationHandler = RcBlock::new(move |_event, _value| {
+            let _scope = MetalCallbackScope::enter();
             let active_completion = Arc::clone(&pending);
             let active_owner = Arc::clone(&owner);
-            active_completion.wait_unbounded();
-            active_owner.remove(&active_completion);
+            active_completion.signal_event();
+            drop(active_owner);
         });
         self.completions
             .lock()
@@ -395,10 +491,47 @@ impl InFlightTracker {
     }
 
     fn remove(&self, completion: &Arc<Completion>) {
-        self.completions
+        let completed = {
+            let mut completions = self
+                .completions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(index) = completions
+                .iter()
+                .position(|candidate| Arc::ptr_eq(&candidate.completion, completion))
+            else {
+                return;
+            };
+            completions.swap_remove(index)
+        };
+        self.done
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .retain(|candidate| !Arc::ptr_eq(&candidate.completion, completion));
+            .push(completed);
+    }
+
+    fn drain_done(&self) {
+        let done = std::mem::take(
+            &mut *self
+                .done
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        drop(done);
+    }
+
+    pub(super) fn drain(&self, timeout: Duration) {
+        let completions = self
+            .completions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .map(|entry| Arc::clone(&entry.completion))
+            .collect::<Vec<_>>();
+        for completion in completions {
+            let _ = completion.wait(timeout);
+        }
+        self.drain_done();
     }
 
     #[cfg(test)]
@@ -408,10 +541,6 @@ impl InFlightTracker {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .len()
     }
-}
-
-fn timeout_millis(timeout: Duration) -> u64 {
-    u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX)
 }
 
 /// Completion state for a Metal command buffer.
@@ -430,11 +559,20 @@ impl Submission for MetalSubmission {
     }
 }
 
+impl MetalSubmission {
+    /// Returns feedback and shared-event callback latency from queue commit after a successful wait.
+    #[must_use]
+    pub fn completion_timing(&self) -> Option<(Duration, Duration)> {
+        self.completion.completion_timing()
+    }
+}
+
 impl MetalBackend {
     pub(super) fn submit_commands(
         &self,
         commands: CommandList,
     ) -> Result<MetalSubmission, BackendError> {
+        self.in_flight.drain_done();
         let barriers = required_barriers(&commands);
         let dispatches = commands.into_dispatches();
         if dispatches.iter().any(|dispatch| {
@@ -1441,7 +1579,13 @@ impl MetalBackend {
             let buffer = buffers.get_mut(tensor)?;
             buffer.wait_pending(self.gpu_timeout)?;
         }
-        let completion = Completion::new(resources, event, residency, Some(timestamps));
+        let completion = Completion::new(
+            resources,
+            event,
+            residency,
+            Some(timestamps),
+            Arc::downgrade(&self.in_flight),
+        );
         for tensor in unique {
             buffers.get_mut(tensor)?.track(&completion);
         }
@@ -1470,6 +1614,7 @@ impl MetalBackend {
         self.in_flight.track(&completion, &self.event_listener)?;
         let command_buffer_ref: &ProtocolObject<dyn MTL4CommandBuffer> = command_buffer;
         let mut command_buffers = [NonNull::from(command_buffer_ref)];
+        completion.mark_committed();
         // SAFETY: The pointer names one live command buffer and the count matches the array.
         unsafe {
             self.queue.commit_count_options(
@@ -1655,8 +1800,9 @@ mod tests {
                     _raw: residency.clone(),
                 },
                 None,
+                Arc::downgrade(&backend.in_flight),
             );
-            completion.finish(Ok(()));
+            completion.finish(CommitResult::Known(Ok(())));
             backend
                 .in_flight
                 .track(&completion, &backend.event_listener)
@@ -1680,6 +1826,16 @@ mod tests {
             assert!(started.elapsed() < backend.gpu_timeout);
             std::thread::yield_now();
         }
+        backend.in_flight.drain_done();
+    }
+
+    #[test]
+    fn metal_calls_reject_callback_context() {
+        let result = std::panic::catch_unwind(|| {
+            let _scope = MetalCallbackScope::enter();
+            assert_not_in_metal_callback();
+        });
+        assert!(result.is_err());
     }
 
     #[test]
