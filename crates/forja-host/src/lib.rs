@@ -181,6 +181,59 @@ pub struct EngineStepProfile {
     pub submission: Option<SubmissionProfile>,
 }
 
+#[derive(Clone, Copy)]
+enum ImportKind {
+    Alloc,
+    ViewSlice,
+    ViewReshape,
+    ViewPermute,
+    ViewBroadcast,
+    Write,
+    Dispatch,
+    Submit,
+    Read,
+}
+
+struct ImportTimer {
+    profile: Option<Arc<Mutex<EngineStepProfile>>>,
+    kind: ImportKind,
+    started: Instant,
+}
+
+impl ImportTimer {
+    fn start(profile: Option<Arc<Mutex<EngineStepProfile>>>, kind: ImportKind) -> Self {
+        Self {
+            profile,
+            kind,
+            started: Instant::now(),
+        }
+    }
+}
+
+impl Drop for ImportTimer {
+    fn drop(&mut self) {
+        let Some(profile) = &self.profile else {
+            return;
+        };
+        let Ok(mut profile) = profile.lock() else {
+            return;
+        };
+        let timing = match self.kind {
+            ImportKind::Alloc => &mut profile.imports.alloc,
+            ImportKind::ViewSlice => &mut profile.imports.view_slice,
+            ImportKind::ViewReshape => &mut profile.imports.view_reshape,
+            ImportKind::ViewPermute => &mut profile.imports.view_permute,
+            ImportKind::ViewBroadcast => &mut profile.imports.view_broadcast,
+            ImportKind::Write => &mut profile.imports.write,
+            ImportKind::Dispatch => &mut profile.imports.dispatch,
+            ImportKind::Submit => &mut profile.imports.submit,
+            ImportKind::Read => &mut profile.imports.read,
+        };
+        timing.count = timing.count.saturating_add(1);
+        timing.time = timing.time.saturating_add(self.started.elapsed());
+    }
+}
+
 /// An instantiated engine component and its host resources.
 pub struct EngineRunner<B: Backend + Send + Sync + 'static> {
     store: Store<Host<B>>,
@@ -796,6 +849,10 @@ impl<B: Backend> Host<B> {
         Some(profile)
     }
 
+    fn import_timer(&self, kind: ImportKind) -> ImportTimer {
+        ImportTimer::start(self.active_profile.clone(), kind)
+    }
+
     /// Allocates a contiguous tensor after enforcing all guest quotas.
     ///
     /// # Errors
@@ -1382,6 +1439,7 @@ where
         shape: Vec<u32>,
     ) -> impl Future<Output = wasmtime::Result<Result<Resource<TensorEntry>, compute::Error>>> + Send
     {
+        let _timer = self.import_timer(ImportKind::Alloc);
         std::future::ready(Ok(Host::alloc(self, dtype, &shape)))
     }
 
@@ -1391,6 +1449,13 @@ where
         operation: compute::ViewOp,
     ) -> impl Future<Output = wasmtime::Result<Result<Resource<TensorEntry>, compute::Error>>> + Send
     {
+        let kind = match &operation {
+            compute::ViewOp::Slice(_) => ImportKind::ViewSlice,
+            compute::ViewOp::Reshape(_) => ImportKind::ViewReshape,
+            compute::ViewOp::Permute(_) => ImportKind::ViewPermute,
+            compute::ViewOp::Broadcast(_) => ImportKind::ViewBroadcast,
+        };
+        let _timer = self.import_timer(kind);
         std::future::ready(Ok(Host::view(self, &resource, operation)))
     }
 
@@ -1399,6 +1464,7 @@ where
         resource: Resource<TensorEntry>,
         bytes: Vec<u8>,
     ) -> impl Future<Output = wasmtime::Result<Result<(), compute::Error>>> + Send {
+        let _timer = self.import_timer(ImportKind::Write);
         std::future::ready(Ok(Host::write(self, &resource, &bytes)))
     }
 
@@ -1425,6 +1491,7 @@ where
         inputs: Vec<Resource<TensorEntry>>,
         output: Resource<TensorEntry>,
     ) -> impl Future<Output = wasmtime::Result<Result<(), compute::Error>>> + Send {
+        let _timer = self.import_timer(ImportKind::Dispatch);
         std::future::ready(Ok(Host::dispatch(
             self, &resource, operation, &inputs, &output,
         )))
@@ -1529,12 +1596,15 @@ where
         accessor: &Accessor<Host<B>, Self>,
         resource: Resource<TensorEntry>,
     ) -> wasmtime::Result<Result<Vec<u8>, compute::Error>> {
+        let timer = accessor.with(|mut access| access.get().import_timer(ImportKind::Read));
         let request = accessor.with(|mut access| access.get().prepare_read(&resource));
         let request = match request {
             Ok(value) => value,
             Err(error) => return Ok(Err(error)),
         };
-        Ok(request.run().await.map_err(guest_error))
+        let result = Ok(request.run().await.map_err(guest_error));
+        drop(timer);
+        result
     }
 }
 
@@ -1546,12 +1616,15 @@ where
         accessor: &Accessor<Host<B>, Self>,
         resource: Resource<CommandListEntry>,
     ) -> wasmtime::Result<Result<Option<u64>, compute::Error>> {
+        let timer = accessor.with(|mut access| access.get().import_timer(ImportKind::Submit));
         let request = accessor.with(|mut access| access.get().prepare_submit(resource));
         let request = match request {
             Ok(value) => value,
             Err(error) => return Ok(Err(error)),
         };
-        Ok(request.run().await)
+        let result = Ok(request.run().await);
+        drop(timer);
+        result
     }
 }
 
@@ -1782,10 +1855,25 @@ mod tests {
     use forja_cpu::CpuBackend;
     use wasmtime::component::Resource;
 
-    use super::{EngineMetrics, Grants, Host, Limits, bindings::l9o::gpu::compute};
+    use super::{
+        EngineMetrics, EngineStepProfile, Grants, Host, ImportKind, ImportTimer, Limits,
+        bindings::l9o::gpu::compute,
+    };
 
     const GENEROUS: Limits = Limits::new(u64::MAX, 8, u64::MAX, 32, u64::MAX);
     static NEXT_WEIGHT_FILE: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn import_timer_records_only_the_selected_kind() {
+        let profile = Arc::new(Mutex::new(EngineStepProfile::default()));
+        drop(ImportTimer::start(
+            Some(Arc::clone(&profile)),
+            ImportKind::Dispatch,
+        ));
+        let profile = profile.lock().unwrap();
+        assert_eq!(profile.imports.dispatch.count, 1);
+        assert_eq!(profile.imports.alloc.count, 0);
+    }
 
     #[test]
     fn repeated_weight_opens_share_one_import_and_obey_handle_quota() {
