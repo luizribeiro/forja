@@ -184,6 +184,36 @@ impl<B: Backend> Host<B> {
         Ok(view)
     }
 
+    /// Writes bytes to a contiguous tensor with an exact logical byte count.
+    ///
+    /// # Errors
+    ///
+    /// Returns a layout, backend, or invalid-handle error.
+    pub fn write(
+        &self,
+        resource: &Resource<TensorEntry>,
+        bytes: &[u8],
+    ) -> Result<(), compute::Error> {
+        let tensor = &self.entry(resource)?.tensor;
+        if !tensor.layout().is_contiguous() {
+            return Err(compute::Error::Layout(
+                "writes require a contiguous tensor".to_owned(),
+            ));
+        }
+        let expected = tensor
+            .layout()
+            .element_count()
+            .checked_mul(tensor.layout().dtype().byte_size())
+            .ok_or_else(|| compute::Error::Layout("tensor byte size overflowed".to_owned()))?;
+        if u64::try_from(bytes.len()) != Ok(expected) {
+            return Err(compute::Error::Layout(format!(
+                "write has {} bytes but tensor requires {expected}",
+                bytes.len()
+            )));
+        }
+        self.backend.write(tensor, bytes).map_err(backend_error)
+    }
+
     fn entry(&self, resource: &Resource<TensorEntry>) -> Result<&TensorEntry, compute::Error> {
         self.table
             .get(resource)
@@ -290,6 +320,8 @@ mod tests {
 
     use super::{Host, Limits, bindings::l9o::gpu::compute};
 
+    const GENEROUS: Limits = Limits::new(u64::MAX, 8, u64::MAX, 32, u64::MAX);
+
     #[test]
     fn refuses_each_quota_before_allocation() {
         let cases = [
@@ -343,6 +375,27 @@ mod tests {
                 compute::ViewOp::Broadcast(vec![4_000_000_000]),
             ),
             Err(compute::Error::Quota(_))
+        ));
+    }
+
+    #[test]
+    fn writes_require_contiguous_exactly_sized_bytes() {
+        let mut host = Host::new(CpuBackend::new(), GENEROUS);
+        let tensor = host.alloc(compute::Dtype::F32, &[7, 1024]).unwrap();
+        assert!(matches!(
+            host.write(&tensor, &[]),
+            Err(compute::Error::Layout(_))
+        ));
+
+        let view = host
+            .view(
+                &Resource::new_borrow(tensor.rep()),
+                compute::ViewOp::Permute(vec![1, 0]),
+            )
+            .unwrap();
+        assert!(matches!(
+            host.write(&view, &vec![0; 7 * 1024 * 4]),
+            Err(compute::Error::Layout(_))
         ));
     }
 }
