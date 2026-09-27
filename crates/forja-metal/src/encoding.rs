@@ -20,7 +20,10 @@ use objc2_metal::{
     MTLSharedEvent, MTLSharedEventListener, MTLSize,
 };
 
-use crate::storage::MetalBackend;
+use crate::{
+    matmul::{classify, select_gemm},
+    storage::MetalBackend,
+};
 
 type MetalBufferRef = Retained<ProtocolObject<dyn MTLBuffer>>;
 type EncodedEmbed = (Vec<MetalBufferRef>, u64);
@@ -365,6 +368,7 @@ impl MetalBackend {
                     | Op::Softmax
                     | Op::Rope { .. }
                     | Op::Embed
+                    | Op::Matmul
             )
         }) {
             return Err(BackendError::InvalidInput);
@@ -460,6 +464,15 @@ impl MetalBackend {
                 temporaries.extend(self.encode_copy(&encoder, &table, dispatch, &mut bindings)?);
                 continue;
             }
+            if dispatch.op() == Op::Matmul {
+                temporaries.extend(self.encode_matmul(
+                    &encoder,
+                    &table,
+                    dispatch,
+                    &mut bindings,
+                )?);
+                continue;
+            }
             let kernel = match dispatch.op() {
                 Op::Add
                     if dispatch
@@ -503,6 +516,108 @@ impl MetalBackend {
         let input = self.encoder_tensor(input)?;
         let output = self.encoder_tensor(dispatch.output())?;
         self.encode_copy_tensors(encoder, table, &input, &output, bindings)
+    }
+
+    fn encode_matmul(
+        &self,
+        encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
+        table: &ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>,
+        dispatch: &Dispatch,
+        bindings: &mut ArgumentBindings,
+    ) -> Result<Vec<MetalBufferRef>, BackendError> {
+        use objc2_metal::{MTL4ComputeCommandEncoder, MTLSize};
+
+        let [left, right] = dispatch.inputs() else {
+            return Err(BackendError::InvalidInput);
+        };
+        let output = dispatch.output();
+        let dtype = output.layout().dtype();
+        if left.layout().dtype() != dtype || right.layout().dtype() != dtype {
+            return Err(BackendError::InvalidInput);
+        }
+        let (a_column_major, lda, batch_stride_a) = classify(left.layout())
+            .kernel_strides()
+            .ok_or(BackendError::InvalidInput)?;
+        let (b_column_major, ldb, batch_stride_b) = classify(right.layout())
+            .kernel_strides()
+            .ok_or(BackendError::InvalidInput)?;
+        let (output_column_major, ldd, batch_stride_d) = classify(output.layout())
+            .kernel_strides()
+            .ok_or(BackendError::InvalidInput)?;
+        if output_column_major != 0 {
+            return Err(BackendError::InvalidInput);
+        }
+        let shape = left.layout().shape();
+        let rank = shape.len();
+        let rows = shape[rank - 2];
+        let inner = shape[rank - 1];
+        let columns = right.layout().shape()[rank - 1];
+        let batch = if rank == 3 { shape[0] } else { 1 };
+        let mut params = Vec::with_capacity(96);
+        for value in [
+            left.layout().offset(),
+            right.layout().offset(),
+            output.layout().offset(),
+            lda,
+            ldb,
+            ldd,
+            batch_stride_a,
+            batch_stride_b,
+            batch_stride_d,
+        ] {
+            params.extend_from_slice(&value.to_ne_bytes());
+        }
+        for value in [rows, columns, inner, a_column_major, b_column_major, 0] {
+            params.extend_from_slice(&value.to_ne_bytes());
+        }
+        let parameter_buffer = self.temporary_buffer(&params)?;
+        let config = select_gemm(
+            dtype,
+            batch,
+            rows,
+            columns,
+            inner,
+            a_column_major != 0,
+            b_column_major != 0,
+        )
+        .ok_or(BackendError::InvalidInput)?;
+        let constants = [
+            (0, dtype_code(dtype)),
+            (1, dtype_code(dtype)),
+            (2, dtype_code(dtype)),
+            (200, u32::from(rows.is_multiple_of(config.block_rows))),
+            (201, u32::from(columns.is_multiple_of(config.block_columns))),
+            (202, u32::from(inner.is_multiple_of(config.block_inner))),
+        ];
+        let pipeline = self
+            .pipelines
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?
+            .get(config.kernel, &constants)?;
+        encoder.setComputePipelineState(&pipeline);
+        let left = self.encoder_tensor(left)?;
+        let right = self.encoder_tensor(right)?;
+        let output = self.encoder_tensor(output)?;
+        bindings.bind(table, 0, &left.buffer);
+        bindings.bind(table, 1, &right.buffer);
+        bindings.bind(table, 2, &output.buffer);
+        bindings.bind(table, 3, &parameter_buffer);
+        encoder.setArgumentTable(Some(table));
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(
+            MTLSize {
+                width: usize::try_from(columns.div_ceil(config.block_columns))
+                    .map_err(|_| BackendError::InvalidInput)?,
+                height: usize::try_from(rows.div_ceil(config.block_rows))
+                    .map_err(|_| BackendError::InvalidInput)?,
+                depth: usize::try_from(batch).map_err(|_| BackendError::InvalidInput)?,
+            },
+            MTLSize {
+                width: config.thread_count,
+                height: 1,
+                depth: 1,
+            },
+        );
+        Ok(vec![parameter_buffer])
     }
 
     fn encode_copy_tensors(
@@ -1489,6 +1604,60 @@ mod tests {
             .wait()
             .unwrap();
         assert_eq!(backend.read(&output).unwrap(), bytes);
+    }
+
+    fn assert_matmul(a: TensorSpec, b: TensorSpec, output: &TensorSpec) {
+        assert_backends_agree(
+            &CpuBackend::new(),
+            &MetalBackend::new().unwrap(),
+            Op::Matmul,
+            &[a, b],
+            output,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn metal_gemm_matches_cpu_at_tile_edges_and_in_batches() {
+        for dtype in [DType::F32, DType::F16, DType::BF16] {
+            for (m, n, k) in [
+                (1, 1, 1),
+                (1, 4097, 33),
+                (33, 1, 4097),
+                (4097, 33, 1),
+                (33, 33, 33),
+            ] {
+                assert_matmul(
+                    TensorSpec::contiguous(dtype, &[m, k]),
+                    TensorSpec::contiguous(dtype, &[k, n]),
+                    &TensorSpec::contiguous(dtype, &[m, n]),
+                );
+            }
+            assert_matmul(
+                TensorSpec::contiguous(dtype, &[16, 7, 33]),
+                TensorSpec::contiguous(dtype, &[16, 33, 33]),
+                &TensorSpec::contiguous(dtype, &[16, 7, 33]),
+            );
+        }
+    }
+
+    #[test]
+    fn metal_gemm_matches_qwen_projection_shapes() {
+        for m in [7, 128, 512] {
+            for (k, n) in [
+                (1024, 2048),
+                (1024, 1024),
+                (2048, 1024),
+                (1024, 3072),
+                (3072, 1024),
+            ] {
+                assert_matmul(
+                    TensorSpec::contiguous(DType::BF16, &[m, k]),
+                    TensorSpec::permuted(DType::BF16, &[n, k], &[1, 0]),
+                    &TensorSpec::contiguous(DType::BF16, &[m, n]),
+                );
+            }
+        }
     }
 
     #[test]

@@ -97,7 +97,13 @@ impl MetalBackend {
         let source = concat!(
             include_str!("elementwise.metal"),
             "\n",
-            include_str!("kernels.metal")
+            include_str!("kernels.metal"),
+            "\n",
+            include_str!("steel_gemm_loader.metal"),
+            "\n",
+            include_str!("steel_gemm_mma.metal"),
+            "\n",
+            include_str!("matmul.metal")
         );
         let pipelines = PipelineCache::new(&device, source)?;
         let event_listener = MTLSharedEventListener::new();

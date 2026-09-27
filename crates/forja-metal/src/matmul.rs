@@ -2,10 +2,83 @@
 //
 // Licensed under the MIT License.
 
-use forja_core::Layout;
+use forja_core::{DType, Layout};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[allow(dead_code)]
+pub(super) struct GemmConfig {
+    pub(super) kernel: &'static str,
+    pub(super) block_rows: u32,
+    pub(super) block_columns: u32,
+    pub(super) block_inner: u32,
+    pub(super) thread_count: usize,
+}
+
+pub(super) fn select_gemm(
+    dtype: DType,
+    batch: u32,
+    rows: u32,
+    columns: u32,
+    inner: u32,
+    left_column_major: bool,
+    right_column_major: bool,
+) -> Option<GemmConfig> {
+    let output_elements = u64::from(batch)
+        .checked_mul(u64::from(rows))?
+        .checked_mul(u64::from(columns))?;
+    let large = output_elements >= 1 << 20;
+    let nt = !left_column_major && right_column_major;
+    let half = matches!(dtype, DType::F16 | DType::BF16);
+    if half && large && u64::from(rows.max(columns)) * 2 > u64::from(inner) {
+        return Some(GEMM_64_64_HALF);
+    }
+    if half && nt {
+        return Some(GEMM_64_32);
+    }
+    if half && large {
+        return Some(GEMM_32_64);
+    }
+    if half {
+        return Some(GEMM_64_64_HALF);
+    }
+    if !large && nt {
+        return Some(GEMM_32_64);
+    }
+    if !large {
+        return Some(GEMM_64_32);
+    }
+    Some(GEMM_64_64_FLOAT)
+}
+
+const GEMM_64_64_FLOAT: GemmConfig = GemmConfig {
+    kernel: "steel_gemm_64_64_16_2_2",
+    block_rows: 64,
+    block_columns: 64,
+    block_inner: 16,
+    thread_count: 128,
+};
+const GEMM_64_64_HALF: GemmConfig = GemmConfig {
+    kernel: "steel_gemm_64_64_16_1_2",
+    block_rows: 64,
+    block_columns: 64,
+    block_inner: 16,
+    thread_count: 64,
+};
+const GEMM_64_32: GemmConfig = GemmConfig {
+    kernel: "steel_gemm_64_32_32_2_2",
+    block_rows: 64,
+    block_columns: 32,
+    block_inner: 32,
+    thread_count: 128,
+};
+const GEMM_32_64: GemmConfig = GemmConfig {
+    kernel: "steel_gemm_32_64_16_1_2",
+    block_rows: 32,
+    block_columns: 64,
+    block_inner: 16,
+    thread_count: 64,
+};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum MatrixLayout {
     RowMajor {
         leading_dimension: u64,
@@ -18,7 +91,22 @@ pub(super) enum MatrixLayout {
     NeedsCopy,
 }
 
-#[allow(dead_code)]
+impl MatrixLayout {
+    pub(super) const fn kernel_strides(self) -> Option<(u32, u64, u64)> {
+        match self {
+            Self::RowMajor {
+                leading_dimension,
+                batch_stride,
+            } => Some((0, leading_dimension, batch_stride)),
+            Self::ColumnMajor {
+                leading_dimension,
+                batch_stride,
+            } => Some((1, leading_dimension, batch_stride)),
+            Self::NeedsCopy => None,
+        }
+    }
+}
+
 pub(super) fn classify(layout: &Layout) -> MatrixLayout {
     let rank = layout.shape().len();
     if !matches!(rank, 2 | 3) {
@@ -65,7 +153,38 @@ fn batch_fits(layout: &Layout, batch_stride: u64, matrix_span: Option<u64>) -> b
 mod tests {
     use forja_core::{DType, Layout, Slice};
 
-    use super::{MatrixLayout, classify};
+    use super::{
+        GEMM_32_64, GEMM_64_32, GEMM_64_64_FLOAT, GEMM_64_64_HALF, MatrixLayout, classify,
+        select_gemm,
+    };
+
+    #[test]
+    fn selects_m3_tile_configs_by_shape_and_dtype() {
+        assert_eq!(
+            select_gemm(DType::BF16, 1, 512, 3072, 1024, false, true),
+            Some(GEMM_64_64_HALF)
+        );
+        assert_eq!(
+            select_gemm(DType::F16, 1, 128, 3072, 1024, false, true),
+            Some(GEMM_64_32)
+        );
+        assert_eq!(
+            select_gemm(DType::BF16, 1, 512, 3072, 8192, false, false),
+            Some(GEMM_32_64)
+        );
+        assert_eq!(
+            select_gemm(DType::F32, 1, 128, 3072, 1024, false, true),
+            Some(GEMM_32_64)
+        );
+        assert_eq!(
+            select_gemm(DType::F32, 1, 128, 3072, 1024, false, false),
+            Some(GEMM_64_32)
+        );
+        assert_eq!(
+            select_gemm(DType::F32, 16, 128, 1024, 1024, false, false),
+            Some(GEMM_64_64_FLOAT)
+        );
+    }
 
     #[test]
     fn classifies_dense_and_permuted_matrices() {
