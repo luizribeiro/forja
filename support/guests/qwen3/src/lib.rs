@@ -82,8 +82,6 @@ struct Model {
 struct QwenWeights {
     #[load(prefix)]
     model: Model,
-    #[load(prefix, config = LinearConfig::promoted_bf16(HIDDEN, VOCAB))]
-    lm_head: Linear<f32>,
 }
 
 struct LayerCache {
@@ -248,10 +246,12 @@ impl Engine for Qwen3 {
         }
         let logits = self
             .weights
-            .lm_head
-            .forward(&hidden)?
+            .model
+            .embed_tokens
+            .project(&hidden)?
             .narrow(0, last, 1)?
-            .reshape(&[VOCAB])?;
+            .reshape(&[VOCAB])?
+            .contiguous()?;
         Ok(StepOutput { logits, taps })
     }
 }
