@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 mod element;
+mod sys;
 
 use std::{error, fmt};
 
