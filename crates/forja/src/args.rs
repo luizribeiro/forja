@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 pub(crate) const USAGE: &str = "usage:
   forja run --model-dir PATH --prompt TEXT [--max-tokens N] [--backend metal|cpu]
+  forja bench --model-dir PATH [--pp N] [--tg N] [--reps N] [--json PATH]
   forja verify --model-dir PATH --fixtures PATH [--backend metal|cpu] [--prompts NAME,...]";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -27,7 +28,17 @@ pub(crate) struct Run {
 }
 
 #[derive(Debug, Eq, PartialEq)]
+pub(crate) struct Bench {
+    pub(crate) model_dir: PathBuf,
+    pub(crate) pp: usize,
+    pub(crate) tg: usize,
+    pub(crate) reps: usize,
+    pub(crate) json: Option<PathBuf>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
 pub(crate) enum Command {
+    Bench(Bench),
     Run(Run),
     Verify(Verify),
 }
@@ -35,11 +46,51 @@ pub(crate) enum Command {
 pub(crate) fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Command, String> {
     let mut arguments = arguments.into_iter();
     match arguments.next().as_deref() {
+        Some("bench") => parse_bench(arguments).map(Command::Bench),
         Some("run") => parse_run(arguments).map(Command::Run),
         Some("verify") => parse_verify(arguments).map(Command::Verify),
         Some(command) => Err(format!("unknown command {command:?}")),
         None => Err("a command is required".to_owned()),
     }
+}
+
+fn parse_bench(mut arguments: impl Iterator<Item = String>) -> Result<Bench, String> {
+    let mut model_dir = None;
+    let mut pp = None;
+    let mut tg = None;
+    let mut reps = None;
+    let mut json = None;
+    while let Some(option) = arguments.next() {
+        let value = arguments
+            .next()
+            .ok_or_else(|| format!("{option} requires a value"))?;
+        match option.as_str() {
+            "--model-dir" if model_dir.is_none() => model_dir = Some(PathBuf::from(value)),
+            "--pp" if pp.is_none() => pp = Some(parse_count(&value, "prompt tokens")?),
+            "--tg" if tg.is_none() => tg = Some(parse_count(&value, "generated tokens")?),
+            "--reps" if reps.is_none() => reps = Some(parse_count(&value, "repetitions")?),
+            "--json" if json.is_none() => json = Some(PathBuf::from(value)),
+            _ if option.starts_with("--") => {
+                return Err(format!("unknown or repeated option {option:?}"));
+            }
+            _ => return Err(format!("unexpected argument {option:?}")),
+        }
+    }
+    Ok(Bench {
+        model_dir: model_dir.ok_or("--model-dir is required")?,
+        pp: pp.unwrap_or(512),
+        tg: tg.unwrap_or(128),
+        reps: reps.unwrap_or(30),
+        json,
+    })
+}
+
+fn parse_count(value: &str, name: &str) -> Result<usize, String> {
+    value
+        .parse()
+        .ok()
+        .filter(|&count| count > 0)
+        .ok_or_else(|| format!("{name} must be a positive integer"))
 }
 
 fn parse_run(mut arguments: impl Iterator<Item = String>) -> Result<Run, String> {
@@ -123,6 +174,44 @@ fn parse_verify(mut arguments: impl Iterator<Item = String>) -> Result<Verify, S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_benchmark_options() {
+        let command = parse(
+            [
+                "bench",
+                "--model-dir",
+                "/model",
+                "--pp",
+                "33",
+                "--tg",
+                "7",
+                "--reps",
+                "2",
+                "--json",
+                "/result.json",
+            ]
+            .map(str::to_owned),
+        )
+        .unwrap();
+        assert_eq!(
+            command,
+            Command::Bench(Bench {
+                model_dir: PathBuf::from("/model"),
+                pp: 33,
+                tg: 7,
+                reps: 2,
+                json: Some(PathBuf::from("/result.json")),
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_zero_benchmark_counts() {
+        assert!(
+            parse(["bench", "--model-dir", "/model", "--reps", "0"].map(str::to_owned)).is_err()
+        );
+    }
 
     #[test]
     fn parses_run_options() {

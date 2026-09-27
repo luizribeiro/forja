@@ -22,6 +22,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         .map_err(|error| format!("{error}\n{}", args::USAGE))?;
     let runtime = tokio::runtime::Builder::new_current_thread().build()?;
     match command {
+        args::Command::Bench(_) => Err("bench is not available in this build".into()),
         args::Command::Run(options) => runtime.block_on(generate::run(&options)),
         args::Command::Verify(options) => runtime.block_on(verify::run(&options)),
     }
