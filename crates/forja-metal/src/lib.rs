@@ -4,6 +4,8 @@
 #[cfg(target_os = "macos")]
 mod encoding;
 #[cfg(target_os = "macos")]
+mod matmul;
+#[cfg(target_os = "macos")]
 mod storage;
 
 #[cfg(target_os = "macos")]
