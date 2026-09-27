@@ -66,7 +66,7 @@ pub(crate) trait Backend {
 }
 
 #[cfg(target_family = "wasm")]
-mod guest {
+pub(crate) mod guest {
     #![allow(clippy::same_length_and_capacity)]
 
     wit_bindgen::generate!({
@@ -78,6 +78,39 @@ mod guest {
     use l9o::gpu::compute;
 
     pub(crate) struct Guest;
+
+    /// A borrowed weight resource supplied to an engine export.
+    pub struct WeightSource<'a>(&'a compute::Weights);
+
+    impl<'a> WeightSource<'a> {
+        pub(crate) const fn new(weights: &'a compute::Weights) -> Self {
+            Self(weights)
+        }
+
+        pub(crate) const fn raw(&self) -> &'a compute::Weights {
+            self.0
+        }
+
+        pub(crate) fn tensor(
+            &self,
+            name: &str,
+            dtype: DType,
+            shape: &[u32],
+        ) -> Result<compute::Tensor> {
+            let info = self.0.info(name).map_err(|error| guest_error(&error))?;
+            if info.dtype != wit_dtype(dtype) || info.shape != shape {
+                return Err(Error::new(format!(
+                    "weight {name:?} has {:?} {:?}, expected {:?} {shape:?}",
+                    info.dtype,
+                    info.shape,
+                    wit_dtype(dtype),
+                )));
+            }
+            self.0.tensor(name).map_err(|error| guest_error(&error))
+        }
+    }
+
+    pub use compute::Weights as RawWeights;
 
     impl Backend for Guest {
         type Tensor = compute::Tensor;
@@ -179,13 +212,25 @@ mod guest {
 }
 
 #[cfg(all(not(target_family = "wasm"), not(feature = "native")))]
-mod unavailable {
+pub(crate) mod unavailable {
     use super::{Backend, DType, Error, Op, Result, View};
 
     pub(crate) enum UnavailableTensor {}
     pub(crate) enum UnavailableCommands {}
 
     pub(crate) struct Unavailable;
+    pub(crate) struct WeightSource;
+
+    impl WeightSource {
+        pub(crate) fn tensor(
+            &self,
+            _name: &str,
+            _dtype: DType,
+            _shape: &[u32],
+        ) -> Result<UnavailableTensor> {
+            Err(error())
+        }
+    }
 
     impl Backend for Unavailable {
         type Tensor = UnavailableTensor;
@@ -231,11 +276,11 @@ mod unavailable {
 }
 
 #[cfg(feature = "native")]
-mod native {
+pub(crate) mod native {
     use std::cell::Cell;
 
     use forja_core::{DType as CoreDType, Op as CoreOp, Slice as CoreSlice, ViewOp};
-    use forja_host::{NativeCommandList, NativeHost, NativeTensor};
+    use forja_host::{NativeCommandList, NativeHost, NativeTensor, Safetensors, WeightSource as _};
 
     use super::{Backend, DType, Error, Op, Result, View};
     use crate::NativeDevice;
@@ -271,6 +316,53 @@ mod native {
     }
 
     pub(crate) struct Native;
+
+    pub(crate) struct WeightSource {
+        source: Safetensors,
+        region: forja_core::MappedRegion,
+    }
+
+    impl WeightSource {
+        pub(crate) fn open(path: &std::path::Path) -> Result<Self> {
+            let source = Safetensors::open(path).map_err(|error| Error::new(error.to_string()))?;
+            let region = source
+                .mapped_region()
+                .map_err(|error| Error::new(error.to_string()))?;
+            Ok(Self { source, region })
+        }
+
+        pub(crate) fn tensor(&self, name: &str, dtype: DType, shape: &[u32]) -> Result<Tensor> {
+            let tensor = self
+                .source
+                .tensors()
+                .iter()
+                .find(|tensor| tensor.name() == name)
+                .ok_or_else(|| Error::new(format!("weight {name:?} is missing")))?;
+            if tensor.dtype() != core_dtype(dtype) || tensor.shape() != shape {
+                return Err(Error::new(format!(
+                    "weight {name:?} has {:?} {:?}, expected {:?} {shape:?}",
+                    tensor.dtype(),
+                    tensor.shape(),
+                    core_dtype(dtype),
+                )));
+            }
+            let start = usize::try_from(tensor.byte_offset())
+                .map_err(|_| Error::new(format!("weight {name:?} offset is too large")))?;
+            let len = usize::try_from(tensor.byte_len())
+                .map_err(|_| Error::new(format!("weight {name:?} length is too large")))?;
+            let end = start
+                .checked_add(len)
+                .ok_or_else(|| Error::new(format!("weight {name:?} range overflowed")))?;
+            let bytes = self
+                .region
+                .bytes()
+                .get(start..end)
+                .ok_or_else(|| Error::new(format!("weight {name:?} range is invalid")))?;
+            let handle = Native::alloc(dtype, shape)?;
+            Native::write(&handle, bytes)?;
+            Ok(handle)
+        }
+    }
 
     impl Backend for Native {
         type Tensor = Tensor;
@@ -456,16 +548,19 @@ pub(crate) use unavailable::Unavailable as Active;
 pub(crate) type Handle = <Active as Backend>::Tensor;
 pub(crate) type Commands = <Active as Backend>::Commands;
 
+pub(crate) fn dtype(dtype: u8) -> Result<DType> {
+    match dtype {
+        0 => Ok(DType::F32),
+        1 => Ok(DType::F16),
+        2 => Ok(DType::BF16),
+        3 => Ok(DType::U32),
+        4 => Ok(DType::I32),
+        _ => Err(Error::new("unsupported tensor element type")),
+    }
+}
+
 pub(crate) fn alloc(dtype: u8, shape: &[u32]) -> Result<Handle> {
-    let dtype = match dtype {
-        0 => DType::F32,
-        1 => DType::F16,
-        2 => DType::BF16,
-        3 => DType::U32,
-        4 => DType::I32,
-        _ => return Err(Error::new("unsupported tensor element type")),
-    };
-    Active::alloc(dtype, shape)
+    Active::alloc(self::dtype(dtype)?, shape)
 }
 
 pub(crate) fn write(tensor: &Handle, bytes: &[u8]) -> Result<()> {

@@ -36,6 +36,7 @@
 
 mod element;
 mod graph;
+mod load;
 pub mod nn;
 mod sys;
 mod tensor;
@@ -45,6 +46,7 @@ use std::{error, fmt};
 pub use element::Element;
 pub use graph::eval;
 pub use half::{bf16, f16};
+pub use load::{Load, Weights};
 pub use tensor::{Slice, Tensor};
 
 /// An in-process backend selected for the current thread.

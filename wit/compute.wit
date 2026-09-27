@@ -52,6 +52,11 @@ interface compute {
     invalid-handle(string),
   }
 
+  record tensor-info {
+    dtype: dtype,
+    shape: list<u32>,
+  }
+
   resource tensor {
     alloc: static func(dt: dtype, shape: list<u32>) -> result<tensor, error>;
     view: func(operation: view-op) -> result<tensor, error>;
@@ -60,6 +65,7 @@ interface compute {
   }
 
   resource weights {
+    info: func(name: string) -> result<tensor-info, error>;
     tensor: func(name: string) -> result<tensor, error>;
     names: func() -> list<string>;
   }

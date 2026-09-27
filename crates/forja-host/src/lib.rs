@@ -794,6 +794,27 @@ impl<B: Backend> Host<B> {
         Ok(tensor)
     }
 
+    fn weight_info(
+        &self,
+        resource: &Resource<WeightsEntry>,
+        name: &str,
+    ) -> Result<compute::TensorInfo, compute::Error> {
+        let entry = self.table.get(resource).map_err(invalid_handle)?;
+        let source = entry
+            .buffer
+            .weights()
+            .ok_or_else(|| invalid_handle("weight handle has no metadata"))?;
+        let tensor = source
+            .tensors()
+            .iter()
+            .find(|tensor| tensor.name() == name)
+            .ok_or_else(|| invalid_handle("weight tensor is not present"))?;
+        Ok(compute::TensorInfo {
+            dtype: guest_dtype(tensor.dtype()),
+            shape: tensor.shape().to_vec(),
+        })
+    }
+
     fn weight_names(
         &self,
         resource: &Resource<WeightsEntry>,
@@ -1252,6 +1273,15 @@ impl<B> compute::HostWeights for Host<B>
 where
     B: Backend + Send + Sync + 'static,
 {
+    fn info(
+        &mut self,
+        resource: Resource<WeightsEntry>,
+        name: String,
+    ) -> impl Future<Output = wasmtime::Result<Result<compute::TensorInfo, compute::Error>>> + Send
+    {
+        std::future::ready(Ok(self.weight_info(&resource, &name)))
+    }
+
     fn tensor(
         &mut self,
         resource: Resource<WeightsEntry>,
@@ -1381,6 +1411,16 @@ fn core_dtype(dtype: compute::Dtype) -> DType {
         compute::Dtype::Bf16 => DType::BF16,
         compute::Dtype::I32 => DType::I32,
         compute::Dtype::U32 => DType::U32,
+    }
+}
+
+fn guest_dtype(dtype: DType) -> compute::Dtype {
+    match dtype {
+        DType::F32 => compute::Dtype::F32,
+        DType::F16 => compute::Dtype::F16,
+        DType::BF16 => compute::Dtype::Bf16,
+        DType::I32 => compute::Dtype::I32,
+        DType::U32 => compute::Dtype::U32,
     }
 }
 
