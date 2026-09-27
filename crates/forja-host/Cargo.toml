@@ -8,11 +8,13 @@ version.workspace = true
 
 [dependencies]
 forja-core = { path = "../forja-core" }
+tokio.workspace = true
 wasmtime.workspace = true
 wasmtime-wasi.workspace = true
 
 [dev-dependencies]
 forja-cpu = { path = "../forja-cpu" }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [lints]
 workspace = true

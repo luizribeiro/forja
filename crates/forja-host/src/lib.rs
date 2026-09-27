@@ -8,7 +8,7 @@ use std::sync::{
 };
 
 use forja_core::{Backend, BackendError, DType, LayoutError, OpError, Slice, Tensor, ViewOp};
-use wasmtime::component::{Linker, Resource, ResourceTable};
+use wasmtime::component::{Accessor, HasData, Linker, Resource, ResourceTable};
 use wasmtime::{Engine, Store, StoreLimits, StoreLimitsBuilder};
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
@@ -302,6 +302,58 @@ impl<B: Backend> Host<B> {
         }
         Ok(())
     }
+
+    fn prepare_read(
+        &self,
+        resource: &Resource<TensorEntry>,
+    ) -> Result<ReadRequest<B>, compute::Error> {
+        let entry = self.entry(resource)?;
+        let byte_len = entry
+            .tensor
+            .layout()
+            .element_count()
+            .checked_mul(entry.tensor.layout().dtype().byte_size())
+            .ok_or_else(|| quota("read byte size exceeds the guest limit"))?;
+        if byte_len > self.limits.read_bytes {
+            return Err(quota("read byte size exceeds the guest limit"));
+        }
+        Ok(ReadRequest {
+            backend: Arc::clone(&self.backend),
+            tensor: entry.tensor.clone(),
+            buffer: Arc::clone(&entry.buffer),
+        })
+    }
+}
+
+struct ReadRequest<B: Backend> {
+    backend: Arc<B>,
+    tensor: Tensor,
+    buffer: Arc<BufferHandle>,
+}
+
+impl<B> ReadRequest<B>
+where
+    B: Backend + Send + Sync + 'static,
+{
+    async fn run(self) -> Result<Vec<u8>, BackendError> {
+        tokio::task::spawn_blocking(move || {
+            let Self {
+                backend,
+                tensor,
+                buffer,
+            } = self;
+            let result = backend.read(&tensor);
+            let release = Arc::into_inner(buffer)
+                .map(|buffer| buffer.release(backend.as_ref(), &tensor))
+                .transpose();
+            match (result, release) {
+                (Err(error), _) | (Ok(_), Err(error)) => Err(error),
+                (Ok(bytes), Ok(_)) => Ok(bytes),
+            }
+        })
+        .await
+        .map_err(|_| BackendError::ExecutionFailed)?
+    }
 }
 
 impl<B> compute::HostTensor for Host<B>
@@ -366,6 +418,42 @@ where
     B: Backend + Send + Sync + 'static,
 {
     wasmtime_wasi::p2::add_to_linker_async(linker)
+}
+
+struct HostBindings<B>(std::marker::PhantomData<B>);
+
+impl<B: Backend + 'static> HasData for HostBindings<B> {
+    type Data<'a> = &'a mut Host<B>;
+}
+
+impl<B> compute::HostTensorWithStore<Host<B>> for HostBindings<B>
+where
+    B: Backend + Send + Sync + 'static,
+{
+    async fn read(
+        accessor: &Accessor<Host<B>, Self>,
+        resource: Resource<TensorEntry>,
+    ) -> wasmtime::Result<Result<Vec<u8>, compute::Error>> {
+        let request = accessor.with(|mut access| access.get().prepare_read(&resource));
+        let request = match request {
+            Ok(value) => value,
+            Err(error) => return Ok(Err(error)),
+        };
+        Ok(request.run().await.map_err(guest_error))
+    }
+}
+
+/// Adds compute and WASI Preview 2 imports to a component linker.
+///
+/// # Errors
+///
+/// Returns an error if an import cannot be defined on the linker.
+pub fn add_to_linker<B>(linker: &mut Linker<Host<B>>) -> wasmtime::Result<()>
+where
+    B: Backend + Send + Sync + 'static,
+{
+    add_wasi_to_linker(linker)?;
+    bindings::Host_::add_to_linker::<Host<B>, HostBindings<B>>(linker, |host| host)
 }
 
 fn core_dtype(dtype: compute::Dtype) -> DType {
@@ -454,7 +542,15 @@ impl From<BackendError> for GuestFailure {
 
 #[cfg(test)]
 mod tests {
-    use forja_core::{BackendError, LayoutError, OpError};
+    use std::sync::{
+        Arc, Condvar, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use forja_core::{
+        Backend, BackendError, CommandList, DType, LayoutError, OpError, Tensor,
+        ViewOp as CoreViewOp,
+    };
     use forja_cpu::CpuBackend;
     use wasmtime::component::Resource;
 
@@ -581,5 +677,120 @@ mod tests {
             host.entry(&Resource::new_borrow(42)),
             Err(compute::Error::InvalidHandle(_))
         ));
+    }
+
+    #[test]
+    fn refuses_reads_over_the_byte_limit_before_gathering() {
+        let mut host = Host::new(CpuBackend::new(), Limits::new(4, 8, 4097, 8, 4));
+        let tensor = host.alloc(compute::Dtype::F32, &[1]).unwrap();
+        let view = host
+            .view(
+                &Resource::new_borrow(tensor.rep()),
+                compute::ViewOp::Broadcast(vec![4097]),
+            )
+            .unwrap();
+        assert!(matches!(
+            host.prepare_read(&view),
+            Err(compute::Error::Quota(_))
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_in_flight_read_keeps_the_buffer_alive() {
+        let gate = Arc::new(ReadGate::default());
+        let backend = BlockingBackend::new(Arc::clone(&gate));
+        let mut host = Host::new(backend, GENEROUS);
+        let base = host.alloc(compute::Dtype::U32, &[1]).unwrap();
+        host.write(&base, &7_u32.to_le_bytes()).unwrap();
+        let view = host
+            .view(
+                &Resource::new_borrow(base.rep()),
+                compute::ViewOp::Reshape(vec![1]),
+            )
+            .unwrap();
+        let read = host.prepare_read(&view).unwrap();
+        let task = tokio::spawn(read.run());
+
+        while !gate.started() {
+            tokio::task::yield_now().await;
+        }
+        host.drop_tensor(base).unwrap();
+        host.drop_tensor(view).unwrap();
+        assert_eq!(gate.releases.load(Ordering::Acquire), 0);
+
+        gate.finish();
+        assert_eq!(task.await.unwrap().unwrap(), 7_u32.to_le_bytes());
+        assert_eq!(gate.releases.load(Ordering::Acquire), 1);
+    }
+
+    #[derive(Default)]
+    struct ReadGate {
+        state: Mutex<(bool, bool)>,
+        ready: Condvar,
+        releases: AtomicUsize,
+    }
+
+    impl ReadGate {
+        fn started(&self) -> bool {
+            self.state.lock().unwrap().0
+        }
+
+        fn wait(&self) {
+            let mut state = self.state.lock().unwrap();
+            state.0 = true;
+            self.ready.notify_all();
+            while !state.1 {
+                state = self.ready.wait(state).unwrap();
+            }
+        }
+
+        fn finish(&self) {
+            self.state.lock().unwrap().1 = true;
+            self.ready.notify_all();
+        }
+    }
+
+    struct BlockingBackend {
+        inner: CpuBackend,
+        gate: Arc<ReadGate>,
+    }
+
+    impl BlockingBackend {
+        fn new(gate: Arc<ReadGate>) -> Self {
+            Self {
+                inner: CpuBackend::new(),
+                gate,
+            }
+        }
+    }
+
+    impl Backend for BlockingBackend {
+        type Submission = <CpuBackend as Backend>::Submission;
+
+        fn alloc(&self, dtype: DType, shape: &[u32]) -> Result<Tensor, BackendError> {
+            self.inner.alloc(dtype, shape)
+        }
+
+        fn view(&self, tensor: &Tensor, op: CoreViewOp) -> Result<Tensor, BackendError> {
+            self.inner.view(tensor, op)
+        }
+
+        fn write(&self, tensor: &Tensor, bytes: &[u8]) -> Result<(), BackendError> {
+            self.inner.write(tensor, bytes)
+        }
+
+        fn read(&self, tensor: &Tensor) -> Result<Vec<u8>, BackendError> {
+            self.gate.wait();
+            self.inner.read(tensor)
+        }
+
+        fn release(&self, tensor: &Tensor) -> Result<(), BackendError> {
+            self.gate.releases.fetch_add(1, Ordering::AcqRel);
+            self.inner.release(tensor)
+        }
+
+        fn submit(&self, commands: CommandList) -> Result<Self::Submission, BackendError> {
+            self.inner.submit(commands)
+        }
     }
 }
