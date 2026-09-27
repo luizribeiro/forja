@@ -11,7 +11,7 @@ use forja_core::{
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_metal::{
     MTL4CommandQueue, MTLBuffer, MTLCreateSystemDefaultDevice, MTLDevice, MTLGPUFamily,
-    MTLResourceOptions, MTLSharedEventListener,
+    MTLResourceOptions, MTLSharedEvent, MTLSharedEventListener,
 };
 
 pub(super) struct MetalBuffer {
@@ -67,6 +67,8 @@ pub struct MetalBackend {
     pub(super) buffers: Mutex<AllocationRegistry<MetalBuffer>>,
     pub(super) pipelines: Mutex<PipelineCache>,
     pub(super) in_flight: Arc<InFlightTracker>,
+    pub(super) shared_event: Retained<ProtocolObject<dyn MTLSharedEvent>>,
+    pub(super) next_event_value: Mutex<u64>,
     pub(super) event_listener: Retained<MTLSharedEventListener>,
     pub(super) gpu_timeout: Duration,
 }
@@ -112,6 +114,9 @@ impl MetalBackend {
             include_str!("matmul.metal")
         );
         let pipelines = PipelineCache::new(&device, source)?;
+        let shared_event = device
+            .newSharedEvent()
+            .ok_or(BackendError::ExecutionFailed)?;
         let event_listener = MTLSharedEventListener::new();
         Ok(Self {
             device,
@@ -119,6 +124,8 @@ impl MetalBackend {
             buffers: Mutex::new(AllocationRegistry::new()),
             pipelines: Mutex::new(pipelines),
             in_flight: Arc::new(InFlightTracker::new()),
+            shared_event,
+            next_event_value: Mutex::new(1),
             event_listener,
             gpu_timeout,
         })

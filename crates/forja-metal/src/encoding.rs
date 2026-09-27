@@ -428,6 +428,27 @@ impl Completion {
 
 type NotificationHandler = RcBlock<dyn Fn(NonNull<ProtocolObject<dyn MTLSharedEvent>>, u64)>;
 
+struct ListenerRegistration {
+    event: Retained<ProtocolObject<dyn MTLSharedEvent>>,
+    listener: Retained<MTLSharedEventListener>,
+    notification: NotificationHandler,
+}
+
+impl ListenerRegistration {
+    fn register(&self, value: u64) {
+        assert_not_in_metal_callback();
+        // SAFETY: The in-flight tracker owns the listener and heap block before registration, and
+        // Metal invokes the notification even when the shared event has already reached `value`.
+        unsafe {
+            self.event.notifyListener_atValue_block(
+                &self.listener,
+                value,
+                RcBlock::as_ptr(&self.notification),
+            );
+        }
+    }
+}
+
 struct InFlightCompletion {
     completion: Arc<Completion>,
     _listener: Retained<MTLSharedEventListener>,
@@ -455,11 +476,11 @@ impl InFlightTracker {
         }
     }
 
-    pub(super) fn track(
+    fn track(
         self: &Arc<Self>,
         completion: &Arc<Completion>,
         listener: &Retained<MTLSharedEventListener>,
-    ) -> Result<(), BackendError> {
+    ) -> Result<ListenerRegistration, BackendError> {
         let pending = Arc::clone(completion);
         let owner = Arc::clone(self);
         let notification: NotificationHandler = RcBlock::new(move |_event, _value| {
@@ -477,37 +498,36 @@ impl InFlightTracker {
                 _listener: listener.clone(),
                 _notification: notification.clone(),
             });
-        // SAFETY: The tracker stores the live heap block and listener before registration. The
-        // block owns `Arc`s to both the completion and tracker, and clones them before removal, so
-        // its captures remain valid even if the backend is dropped before Metal invokes it.
-        unsafe {
-            completion.event.raw.notifyListener_atValue_block(
-                listener,
-                1,
-                RcBlock::as_ptr(&notification),
-            );
-        }
-        Ok(())
+        Ok(ListenerRegistration {
+            event: completion.event.raw.clone(),
+            listener: listener.clone(),
+            notification,
+        })
     }
 
     fn remove(&self, completion: &Arc<Completion>) {
-        let completed = {
-            let mut completions = self
-                .completions
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let Some(index) = completions
-                .iter()
-                .position(|candidate| Arc::ptr_eq(&candidate.completion, completion))
-            else {
-                return;
-            };
-            completions.swap_remove(index)
+        let Some(completed) = self.take(completion) else {
+            return;
         };
         self.done
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push(completed);
+    }
+
+    fn take(&self, completion: &Arc<Completion>) -> Option<InFlightCompletion> {
+        let mut completions = self
+            .completions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let index = completions
+            .iter()
+            .position(|candidate| Arc::ptr_eq(&candidate.completion, completion))?;
+        Some(completions.swap_remove(index))
+    }
+
+    fn cancel(&self, completion: &Arc<Completion>) {
+        drop(self.take(completion));
     }
 
     fn drain_done(&self) {
@@ -1600,20 +1620,28 @@ impl MetalBackend {
         residency: Retained<ProtocolObject<dyn MTLResidencySet>>,
         timestamps: GpuTimestamps,
     ) -> Result<MetalSubmission, BackendError> {
-        let event = self
-            .device
-            .newSharedEvent()
-            .ok_or(BackendError::ExecutionFailed)?;
         let completion = self.retain_tensors(
             tensors,
-            InFlightEvent { raw: event.clone() },
+            InFlightEvent {
+                raw: self.shared_event.clone(),
+            },
             resources,
             InFlightResidency { _raw: residency },
             timestamps,
         )?;
-        self.in_flight.track(&completion, &self.event_listener)?;
+        let registration = self.in_flight.track(&completion, &self.event_listener)?;
         let command_buffer_ref: &ProtocolObject<dyn MTL4CommandBuffer> = command_buffer;
         let mut command_buffers = [NonNull::from(command_buffer_ref)];
+        let Ok(mut next_event_value) = self.next_event_value.lock() else {
+            self.in_flight.cancel(&completion);
+            return Err(BackendError::ExecutionFailed);
+        };
+        let event_value = *next_event_value;
+        let Some(following_event_value) = event_value.checked_add(1) else {
+            drop(next_event_value);
+            self.in_flight.cancel(&completion);
+            return Err(BackendError::ExecutionFailed);
+        };
         completion.mark_committed();
         // SAFETY: The pointer names one live command buffer and the count matches the array.
         unsafe {
@@ -1623,9 +1651,12 @@ impl MetalBackend {
                 &completion.commit.options,
             );
         }
-        let shared_event: &ProtocolObject<dyn MTLSharedEvent> = &event;
+        let shared_event: &ProtocolObject<dyn MTLSharedEvent> = &self.shared_event;
         let event: &ProtocolObject<dyn MTLEvent> = shared_event.as_ref();
-        self.queue.signalEvent_value(event, 1);
+        self.queue.signalEvent_value(event, event_value);
+        *next_event_value = following_event_value;
+        drop(next_event_value);
+        registration.register(event_value);
         Ok(MetalSubmission {
             completion,
             timeout: self.gpu_timeout,
@@ -1803,7 +1834,7 @@ mod tests {
                 Arc::downgrade(&backend.in_flight),
             );
             completion.finish(CommitResult::Known(Ok(())));
-            backend
+            let registration = backend
                 .in_flight
                 .track(&completion, &backend.event_listener)
                 .unwrap();
@@ -1819,6 +1850,7 @@ mod tests {
             let shared_event: &ProtocolObject<dyn MTLSharedEvent> = &event;
             let event: &ProtocolObject<dyn MTLEvent> = shared_event.as_ref();
             queue.signalEvent_value(event, 1);
+            registration.register(1);
         }
 
         let started = Instant::now();
