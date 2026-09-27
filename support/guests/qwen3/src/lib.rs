@@ -1,7 +1,5 @@
 //! Qwen3-0.6B inference engine.
 
-#![allow(dead_code, reason = "model fields are exercised as forward paths land")]
-
 use forja_sdk::{
     Engine, EngineInfo, Load, Result, StepInput, StepOutput, Tensor, Weights, bf16, export_engine,
     nn::{Embedding, EmbeddingConfig, Linear, LinearConfig, RmsNorm, RmsNormConfig, ops::sdpa},
@@ -111,14 +109,14 @@ impl LayerCache {
 impl DecoderLayer {
     fn forward(
         &self,
-        input: &Tensor<bf16>,
+        input: &Tensor<f32>,
         positions: &Tensor<u32>,
         start_pos: u32,
         end_pos: u32,
         cache: &mut LayerCache,
-    ) -> Result<Tensor<bf16>> {
+    ) -> Result<Tensor<f32>> {
         let sequence = end_pos - start_pos;
-        let normalized = self.input_layernorm.forward(input)?;
+        let normalized = self.input_layernorm.forward(&input.to_dtype()?)?;
         let query = self
             .self_attn
             .q_norm
@@ -158,11 +156,16 @@ impl DecoderLayer {
         .permute(&[1, 0, 2])?
         .contiguous()?
         .reshape(&[sequence, QUERY_HEADS * HEAD_DIM])?;
-        let hidden = (input + &self.self_attn.o_proj.forward(&attended)?)?;
-        let normalized = self.post_attention_layernorm.forward(&hidden)?;
+        let attention = self.self_attn.o_proj.forward(&attended)?.to_dtype()?;
+        let hidden = (input + &attention)?;
+        let normalized = self.post_attention_layernorm.forward(&hidden.to_dtype()?)?;
         let gate = self.mlp.gate_proj.forward(&normalized)?;
         let up = self.mlp.up_proj.forward(&normalized)?;
-        let projected = self.mlp.down_proj.forward(&gate.silu_mul(&up)?)?;
+        let projected = self
+            .mlp
+            .down_proj
+            .forward(&gate.silu_mul(&up)?)?
+            .to_dtype()?;
         &hidden + &projected
     }
 }
@@ -186,10 +189,15 @@ impl Qwen3 {
             .copied()
             .ok_or_else(|| forja_sdk::Error::loading("tokens must have rank one"))?;
         let positions = Tensor::from_slice(&(0..sequence).collect::<Vec<_>>(), &[sequence])?;
-        let hidden = self.weights.model.embed_tokens.forward(tokens)?;
+        let hidden = self
+            .weights
+            .model
+            .embed_tokens
+            .forward(tokens)?
+            .to_dtype()?;
         self.weights.model.layers[0]
             .forward(&hidden, &positions, 0, sequence, &mut self.caches[0])?
-            .to_dtype()
+            .contiguous()
     }
 }
 
@@ -212,9 +220,58 @@ impl Engine for Qwen3 {
         Ok(Self { weights, caches })
     }
 
-    fn step(&mut self, _input: StepInput) -> Result<StepOutput> {
-        Err(forja_sdk::Error::loading(
-            "the full Qwen3 forward pass is not available",
-        ))
+    fn step(&mut self, input: StepInput) -> Result<StepOutput> {
+        let [sequence] = input
+            .tokens
+            .shape()
+            .try_into()
+            .map_err(|_| forja_sdk::Error::loading("tokens must have rank one"))?;
+        let last = sequence
+            .checked_sub(1)
+            .ok_or_else(|| forja_sdk::Error::loading("tokens cannot be empty"))?;
+        let end_pos = input
+            .start_pos
+            .checked_add(sequence)
+            .filter(|&end| end <= MAX_CONTEXT)
+            .ok_or_else(|| forja_sdk::Error::loading("tokens exceed the 4096-token context"))?;
+        let positions =
+            Tensor::from_slice(&(input.start_pos..end_pos).collect::<Vec<_>>(), &[sequence])?;
+        let mut hidden = self
+            .weights
+            .model
+            .embed_tokens
+            .forward(&input.tokens)?
+            .to_dtype()?;
+        let mut taps = Vec::with_capacity(if input.taps { LAYERS } else { 0 });
+        for (index, (layer, cache)) in self
+            .weights
+            .model
+            .layers
+            .iter()
+            .zip(&mut self.caches)
+            .enumerate()
+        {
+            hidden = layer.forward(&hidden, &positions, input.start_pos, end_pos, cache)?;
+            if input.taps && index + 1 < LAYERS {
+                taps.push(hidden.contiguous()?);
+            }
+        }
+        hidden = self
+            .weights
+            .model
+            .norm
+            .forward(&hidden.to_dtype()?)?
+            .to_dtype()?;
+        if input.taps {
+            taps.push(hidden.contiguous()?);
+        }
+        let logits = self
+            .weights
+            .lm_head
+            .forward(&hidden.to_dtype()?)?
+            .narrow(0, last, 1)?
+            .reshape(&[VOCAB])?
+            .to_dtype()?;
+        Ok(StepOutput { logits, taps })
     }
 }
