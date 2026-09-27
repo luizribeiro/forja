@@ -30,9 +30,6 @@ use crate::{
 type MetalBufferRef = Retained<ProtocolObject<dyn MTLBuffer>>;
 type EncodedEmbed = (Vec<MetalBufferRef>, u64);
 
-const VECTOR_TWO_PASS_MIN_KEY_LENGTH: u32 = 1024;
-const VECTOR_MAX_KEY_LENGTH: u32 = 65_536;
-
 #[derive(Clone)]
 struct EncoderTensor {
     buffer: MetalBufferRef,
@@ -72,6 +69,18 @@ struct PreparedMatmulOutput {
     leading_dimension: u64,
     batch_stride: u64,
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SdpaKernel {
+    Vector,
+    Steel,
+    Decomposed,
+}
+
+const VECTOR_TWO_PASS_MIN_KEY_LENGTH: u32 = 1024;
+const VECTOR_SELECTED_MIN_KEY_LENGTH: u32 = 512;
+const VECTOR_MAX_KEY_LENGTH: u32 = 65_536;
+const STEEL_PREFILL_SELECTED: bool = false;
 
 struct EncodedDispatches {
     temporaries: Vec<MetalBufferRef>,
@@ -127,6 +136,11 @@ enum CommitResult {
 
 thread_local! {
     static IN_METAL_CALLBACK: Cell<bool> = const { Cell::new(false) };
+}
+
+#[cfg(test)]
+thread_local! {
+    static FORCED_SDPA_KERNEL: Cell<Option<SdpaKernel>> = const { Cell::new(None) };
 }
 
 struct MetalCallbackScope(bool);
@@ -978,15 +992,16 @@ impl MetalBackend {
         else {
             return Err(BackendError::InvalidInput);
         };
-        if vector_sdpa_supported(dispatch)? {
-            return self
-                .encode_vector_sdpa(encoder, table, dispatch, scale, causal, q_start, bindings);
+        match select_sdpa(dispatch)? {
+            SdpaKernel::Vector => {
+                self.encode_vector_sdpa(encoder, table, dispatch, scale, causal, q_start, bindings)
+            }
+            SdpaKernel::Steel => {
+                self.encode_steel_sdpa(encoder, table, dispatch, scale, causal, q_start, bindings)
+            }
+            SdpaKernel::Decomposed => self
+                .encode_decomposed_sdpa(encoder, table, dispatch, scale, causal, q_start, bindings),
         }
-        if steel_sdpa_supported(dispatch)? {
-            return self
-                .encode_steel_sdpa(encoder, table, dispatch, scale, causal, q_start, bindings);
-        }
-        self.encode_decomposed_sdpa(encoder, table, dispatch, scale, causal, q_start, bindings)
     }
 
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -2400,6 +2415,28 @@ fn vector_kernel(prefix: &str, width: u32) -> Result<&'static str, BackendError>
     }
 }
 
+fn select_sdpa(dispatch: &Dispatch) -> Result<SdpaKernel, BackendError> {
+    #[cfg(test)]
+    if let Some(kernel) = FORCED_SDPA_KERNEL.with(Cell::get) {
+        return Ok(kernel);
+    }
+    let [query, key, _] = dispatch.inputs() else {
+        return Err(BackendError::InvalidInput);
+    };
+    let query_length = shape3(query.layout())?[1];
+    let key_length = shape3(key.layout())?[1];
+    if query_length == 1
+        && key_length >= VECTOR_SELECTED_MIN_KEY_LENGTH
+        && vector_sdpa_supported(dispatch)?
+    {
+        Ok(SdpaKernel::Vector)
+    } else if STEEL_PREFILL_SELECTED && steel_sdpa_supported(dispatch)? {
+        Ok(SdpaKernel::Steel)
+    } else {
+        Ok(SdpaKernel::Decomposed)
+    }
+}
+
 fn steel_sdpa_supported(dispatch: &Dispatch) -> Result<bool, BackendError> {
     let [query, key, value] = dispatch.inputs() else {
         return Err(BackendError::InvalidInput);
@@ -2965,9 +3002,37 @@ mod tests {
         .unwrap();
     }
 
+    struct SdpaOverride(Option<SdpaKernel>);
+
+    impl SdpaOverride {
+        fn set(kernel: SdpaKernel) -> Self {
+            let previous = FORCED_SDPA_KERNEL.with(|forced| forced.replace(Some(kernel)));
+            Self(previous)
+        }
+    }
+
+    impl Drop for SdpaOverride {
+        fn drop(&mut self) {
+            FORCED_SDPA_KERNEL.with(|forced| forced.set(self.0));
+        }
+    }
+
+    fn assert_sdpa_with(
+        kernel: SdpaKernel,
+        op: Op,
+        query: TensorSpec,
+        key: TensorSpec,
+        value: TensorSpec,
+        output: &TensorSpec,
+    ) {
+        let _override = SdpaOverride::set(kernel);
+        assert_sdpa(op, query, key, value, output);
+    }
+
     #[test]
     fn metal_decomposed_attention_matches_hand_sized_cases() {
-        assert_sdpa(
+        assert_sdpa_with(
+            SdpaKernel::Decomposed,
             Op::Sdpa {
                 scale: 1.0,
                 causal: false,
@@ -2981,8 +3046,9 @@ mod tests {
     }
 
     #[test]
-    fn metal_decomposed_attention_groups_query_heads_over_shared_keys() {
-        assert_sdpa(
+    fn metal_decomposed_attention_matches_grouped_heads() {
+        assert_sdpa_with(
+            SdpaKernel::Decomposed,
             Op::Sdpa {
                 scale: 0.5,
                 causal: false,
@@ -3003,7 +3069,8 @@ mod tests {
             Slice::new(0, 128, 1).unwrap(),
         ];
         for dtype in [DType::F32, DType::F16, DType::BF16] {
-            assert_sdpa(
+            assert_sdpa_with(
+                SdpaKernel::Decomposed,
                 Op::Sdpa {
                     scale: 128.0_f32.sqrt().recip(),
                     causal: true,
@@ -3019,6 +3086,7 @@ mod tests {
 
     #[test]
     fn metal_vector_attention_matches_short_decode() {
+        let _override = SdpaOverride::set(SdpaKernel::Vector);
         let reference = CpuBackend::new();
         let candidate = MetalBackend::new().unwrap();
         for dtype in [DType::F32, DType::F16, DType::BF16] {
@@ -3066,6 +3134,7 @@ mod tests {
 
     #[test]
     fn metal_vector_attention_matches_two_pass_decode() {
+        let _override = SdpaOverride::set(SdpaKernel::Vector);
         let reference = CpuBackend::new();
         let candidate = MetalBackend::new().unwrap();
         for dtype in [DType::F32, DType::F16, DType::BF16] {
@@ -3140,6 +3209,7 @@ mod tests {
             (&query, &prefill, 0),
             (&decode_query, &decode, key_length - 1),
         ] {
+            let _override = (q_start > 0).then(|| SdpaOverride::set(SdpaKernel::Vector));
             let mut commands = CommandList::new();
             commands
                 .dispatch(
@@ -3184,7 +3254,8 @@ mod tests {
                 Slice::new(0, length, 1).unwrap(),
                 Slice::new(0, 128, 1).unwrap(),
             ];
-            assert_sdpa(
+            assert_sdpa_with(
+                SdpaKernel::Steel,
                 Op::Sdpa {
                     scale: 128.0_f32.sqrt().recip(),
                     causal,
@@ -3196,7 +3267,8 @@ mod tests {
                 &TensorSpec::contiguous(dtype, &[16, length, 128]),
             );
         }
-        assert_sdpa(
+        assert_sdpa_with(
+            SdpaKernel::Steel,
             Op::Sdpa {
                 scale: 0.125,
                 causal: false,
@@ -3216,7 +3288,8 @@ mod tests {
             Slice::new(0, 512, 1).unwrap(),
             Slice::new(0, 128, 1).unwrap(),
         ];
-        assert_sdpa(
+        assert_sdpa_with(
+            SdpaKernel::Steel,
             Op::Sdpa {
                 scale: 128.0_f32.sqrt().recip(),
                 causal: true,
@@ -3226,6 +3299,21 @@ mod tests {
             TensorSpec::sliced(DType::BF16, &[8, 4096, 128], &cache_slice),
             TensorSpec::sliced(DType::BF16, &[8, 4096, 128], &cache_slice),
             &TensorSpec::contiguous(DType::BF16, &[16, 128, 128]),
+        );
+    }
+
+    #[test]
+    fn metal_attention_decomposes_unsupported_head_widths() {
+        assert_sdpa(
+            Op::Sdpa {
+                scale: 80.0_f32.sqrt().recip(),
+                causal: true,
+                q_start: 32,
+            },
+            TensorSpec::contiguous(DType::BF16, &[4, 1, 80]),
+            TensorSpec::contiguous(DType::BF16, &[2, 33, 80]),
+            TensorSpec::contiguous(DType::BF16, &[2, 33, 80]),
+            &TensorSpec::contiguous(DType::BF16, &[4, 1, 80]),
         );
     }
 

@@ -20,6 +20,7 @@ fn supported(op: Op) -> bool {
             | Op::Rope { .. }
             | Op::Embed
             | Op::Matmul
+            | Op::Sdpa { .. }
     )
 }
 
