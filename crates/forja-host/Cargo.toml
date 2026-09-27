@@ -17,8 +17,10 @@ wasmtime-wasi.workspace = true
 [dev-dependencies]
 forja-cpu = { path = "../forja-cpu" }
 forja-testing = { path = "../../support/forja-testing" }
+forja-sdk = { path = "../forja-sdk", features = ["native-metal"] }
 test-guests = { path = "../../support/test-guests" }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+toy-mlp = { path = "../../support/guests/toy-mlp" }
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 forja-metal = { path = "../forja-metal" }

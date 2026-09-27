@@ -7,6 +7,7 @@ members = [
   "sdk-smoke",
   "tensor-abuse",
   "tensor-smoke",
+  "toy-mlp",
   "weights-smoke",
 ]
 resolver = "3"

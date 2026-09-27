@@ -39,6 +39,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "TENSOR_ABUSE_COMPONENT",
         &release_dir.join("tensor_abuse.wasm"),
     );
+    emit_guest_path("TOY_MLP_COMPONENT", &release_dir.join("toy_mlp.wasm"));
     emit_guest_path(
         "WEIGHTS_SMOKE_COMPONENT",
         &release_dir.join("weights_smoke.wasm"),

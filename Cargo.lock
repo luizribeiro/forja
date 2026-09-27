@@ -485,11 +485,13 @@ dependencies = [
  "forja-core",
  "forja-cpu",
  "forja-metal",
+ "forja-sdk",
  "forja-testing",
  "serde",
  "serde_json",
  "test-guests",
  "tokio",
+ "toy-mlp",
  "wasmtime",
  "wasmtime-wasi",
 ]
@@ -1597,6 +1599,13 @@ name = "toml_writer"
 version = "1.1.2+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7d56353a2a665ad0f41a421187180aab746c8c325620617ad883a99a1cbe66d2"
+
+[[package]]
+name = "toy-mlp"
+version = "0.0.0"
+dependencies = [
+ "forja-sdk",
+]
 
 [[package]]
 name = "tracing"

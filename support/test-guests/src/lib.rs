@@ -45,6 +45,12 @@ pub fn tensor_abuse() -> &'static Path {
     Path::new(env!("TENSOR_ABUSE_COMPONENT"))
 }
 
+/// Returns the path to the SDK toy MLP engine.
+#[must_use]
+pub fn toy_mlp() -> &'static Path {
+    Path::new(env!("TOY_MLP_COMPONENT"))
+}
+
 /// Returns the path to the guest that consumes host-granted weights.
 #[must_use]
 pub fn weights_smoke() -> &'static Path {
