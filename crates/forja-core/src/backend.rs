@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-use crate::{BufferId, CommandList, DType, Layout, MappedRegion, Slice, Tensor};
+use crate::{BufferId, CommandList, DType, Layout, MappedRegion, Op, Slice, Tensor};
 
 static NEXT_BACKEND: AtomicU64 = AtomicU64::new(1);
 
@@ -205,6 +205,49 @@ pub enum BackendError {
     },
 }
 
+/// Count and wall time for one class of profiling event.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ProfileCount {
+    /// Number of events.
+    pub count: u64,
+    /// Total host wall time spent in the events.
+    pub time: Duration,
+}
+
+/// Device time attributed to one recorded dispatch.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DispatchProfile {
+    /// Operation recorded by the command list.
+    pub op: Op,
+    /// Elapsed device time surrounding that operation.
+    pub gpu_time: Duration,
+}
+
+/// Host phases and device timings from one profiled submission.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SubmissionProfile {
+    /// Command validation and hazard analysis.
+    pub validation: Duration,
+    /// Temporary Metal buffers created while encoding.
+    pub metadata_buffers: ProfileCount,
+    /// Residency-set construction.
+    pub residency: Duration,
+    /// Command encoding excluding temporary-buffer creation.
+    pub encoding: Duration,
+    /// Queue commit and in-flight resource registration.
+    pub commit: Duration,
+    /// Host time waiting for completion.
+    pub wait: Duration,
+    /// Device time for the complete submission.
+    pub gpu_time: Duration,
+    /// Number of encoded dispatches.
+    pub dispatches: u64,
+    /// Number of inserted dependency barriers.
+    pub barriers: u64,
+    /// Device timings for individual dispatches.
+    pub per_dispatch: Vec<DispatchProfile>,
+}
+
 impl fmt::Display for BackendError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "backend error: {self:?}")
@@ -240,6 +283,11 @@ pub trait Submission {
     /// GPU backends return device timestamps. Backends without device timestamps may return the
     /// wall time spent executing the submission or `None`.
     fn gpu_time(&self) -> Option<Duration>;
+
+    /// Returns profiling detail after a successful wait, when requested at submission.
+    fn profile(&self) -> Option<SubmissionProfile> {
+        None
+    }
 }
 
 /// Storage and execution implemented by every trusted backend.
@@ -301,4 +349,15 @@ pub trait Backend {
     ///
     /// Returns invalid input if any tensor belongs to another backend.
     fn submit(&self, commands: CommandList) -> Result<Self::Submission, BackendError>;
+
+    /// Submits work with detailed timing enabled.
+    ///
+    /// Backends without detailed instrumentation use the normal submission path.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Backend::submit`].
+    fn submit_profiled(&self, commands: CommandList) -> Result<Self::Submission, BackendError> {
+        self.submit(commands)
+    }
 }
