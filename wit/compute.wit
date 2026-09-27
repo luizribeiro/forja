@@ -63,6 +63,8 @@ interface compute {
     constructor();
     dispatch: func(operation: op, ins: list<borrow<tensor>>, out: borrow<tensor>) -> result<_, error>;
   }
+
+  submit: async func(cmds: command-list) -> result<option<u64>, error>;
 }
 
 world host {

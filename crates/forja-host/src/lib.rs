@@ -8,8 +8,8 @@ use std::sync::{
 };
 
 use forja_core::{
-    Backend, BackendError, CommandList, DType, Layout, LayoutError, Op, OpError, Slice, Tensor,
-    ViewOp,
+    Backend, BackendError, CommandList, DType, Layout, LayoutError, Op, OpError, Slice, Submission,
+    Tensor, ViewOp,
 };
 use wasmtime::component::{Accessor, HasData, Linker, Resource, ResourceTable};
 use wasmtime::{Engine, Store, StoreLimits, StoreLimitsBuilder};
@@ -324,16 +324,19 @@ impl<B: Backend> Host<B> {
     }
 
     fn release_retained(&self, entries: Vec<TensorEntry>) -> Result<(), compute::Error> {
-        let mut failure = None;
-        for entry in entries {
-            if let Some(buffer) = Arc::into_inner(entry.buffer)
-                && let Err(error) = buffer.release(self.backend.as_ref(), &entry.tensor)
-                && failure.is_none()
-            {
-                failure = Some(guest_error(error));
-            }
-        }
-        failure.map_or(Ok(()), Err)
+        release_retained(self.backend.as_ref(), entries).map_err(guest_error)
+    }
+
+    fn prepare_submit(
+        &mut self,
+        resource: Resource<CommandListEntry>,
+    ) -> Result<SubmitRequest<B>, compute::Error> {
+        let entry = self.table.delete(resource).map_err(invalid_handle)?;
+        Ok(SubmitRequest {
+            backend: Arc::clone(&self.backend),
+            commands: entry.commands,
+            retained: entry.retained,
+        })
     }
 
     /// Drops a guest tensor handle and releases its buffer after the last view.
@@ -456,6 +459,43 @@ struct ReadRequest<B: Backend> {
     backend: Arc<B>,
     tensor: Tensor,
     buffer: Arc<BufferHandle>,
+}
+
+struct SubmitRequest<B: Backend> {
+    backend: Arc<B>,
+    commands: CommandList,
+    retained: Vec<TensorEntry>,
+}
+
+impl<B> SubmitRequest<B>
+where
+    B: Backend + Send + Sync + 'static,
+{
+    async fn run(self) -> Result<Option<u64>, compute::Error> {
+        tokio::task::spawn_blocking(move || {
+            let Self {
+                backend,
+                commands,
+                retained,
+            } = self;
+            let result = backend.submit(commands).and_then(|submission| {
+                submission.wait()?;
+                submission
+                    .gpu_time()
+                    .map(|duration| u64::try_from(duration.as_nanos()))
+                    .transpose()
+                    .map_err(|_| BackendError::ExecutionFailed)
+            });
+            let release = release_retained(backend.as_ref(), retained);
+            match (result, release) {
+                (Err(error), _) | (Ok(_), Err(error)) => Err(error),
+                (Ok(gpu_time), Ok(())) => Ok(gpu_time),
+            }
+        })
+        .await
+        .map_err(|_| guest_error(BackendError::ExecutionFailed))?
+        .map_err(guest_error)
+    }
 }
 
 impl<B> ReadRequest<B>
@@ -601,6 +641,23 @@ where
     }
 }
 
+impl<B> compute::HostWithStore<Host<B>> for HostBindings<B>
+where
+    B: Backend + Send + Sync + 'static,
+{
+    async fn submit(
+        accessor: &Accessor<Host<B>, Self>,
+        resource: Resource<CommandListEntry>,
+    ) -> wasmtime::Result<Result<Option<u64>, compute::Error>> {
+        let request = accessor.with(|mut access| access.get().prepare_submit(resource));
+        let request = match request {
+            Ok(value) => value,
+            Err(error) => return Ok(Err(error)),
+        };
+        Ok(request.run().await)
+    }
+}
+
 /// Adds compute and WASI Preview 2 imports to a component linker.
 ///
 /// # Errors
@@ -692,6 +749,22 @@ fn validate_view(tensor: &Tensor, operation: &ViewOp) -> Result<Layout, LayoutEr
         ViewOp::Permute(axes) => tensor.layout().permute(axes),
         ViewOp::Broadcast(shape) => tensor.layout().broadcast(shape),
     }
+}
+
+fn release_retained<B: Backend>(
+    backend: &B,
+    entries: Vec<TensorEntry>,
+) -> Result<(), BackendError> {
+    let mut failure = None;
+    for entry in entries {
+        if let Some(buffer) = Arc::into_inner(entry.buffer)
+            && let Err(error) = buffer.release(backend, &entry.tensor)
+            && failure.is_none()
+        {
+            failure = Some(error);
+        }
+    }
+    failure.map_or(Ok(()), Err)
 }
 
 fn quota(message: &str) -> compute::Error {
@@ -1124,6 +1197,40 @@ mod tests {
         assert!(host.backend.read(&output_tensor).is_ok());
 
         host.drop_command_list(commands).unwrap();
+        assert_eq!(
+            host.backend.read(&input_tensor),
+            Err(BackendError::InvalidInput)
+        );
+        assert_eq!(
+            host.backend.read(&output_tensor),
+            Err(BackendError::InvalidInput)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn submit_retains_buffers_until_execution_finishes() {
+        let mut host = Host::new(CpuBackend::new(), GENEROUS);
+        let input = host.alloc(compute::Dtype::F32, &[7]).unwrap();
+        let output = host.alloc(compute::Dtype::F32, &[7]).unwrap();
+        host.write(&input, &[0; 7 * 4]).unwrap();
+        let input_tensor = host.entry(&input).unwrap().tensor.clone();
+        let output_tensor = host.entry(&output).unwrap().tensor.clone();
+        let commands = host.command_list().unwrap();
+        host.dispatch(
+            &commands,
+            compute::Op::Copy,
+            &[Resource::new_borrow(input.rep())],
+            &output,
+        )
+        .unwrap();
+
+        let request = host.prepare_submit(commands).unwrap();
+        host.drop_tensor(input).unwrap();
+        host.drop_tensor(output).unwrap();
+        assert!(host.backend.read(&input_tensor).is_ok());
+        assert!(host.backend.read(&output_tensor).is_ok());
+
+        request.run().await.unwrap();
         assert_eq!(
             host.backend.read(&input_tensor),
             Err(BackendError::InvalidInput)
