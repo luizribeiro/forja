@@ -25,6 +25,11 @@ use crate::storage::MetalBackend;
 type MetalBufferRef = Retained<ProtocolObject<dyn MTLBuffer>>;
 type EncodedEmbed = (Vec<MetalBufferRef>, u64);
 
+struct EncoderTensor {
+    buffer: MetalBufferRef,
+    layout: Layout,
+}
+
 struct EncodedDispatches {
     temporaries: Vec<MetalBufferRef>,
     error_flags: Vec<u64>,
@@ -451,14 +456,11 @@ impl MetalBackend {
                 error_flags.push(flag);
                 continue;
             }
+            if dispatch.op() == Op::Copy {
+                temporaries.extend(self.encode_copy(&encoder, &table, dispatch, &mut bindings)?);
+                continue;
+            }
             let kernel = match dispatch.op() {
-                Op::Copy
-                    if dispatch.inputs()[0].layout().is_contiguous()
-                        && dispatch.output().layout().is_contiguous() =>
-                {
-                    "copy_contiguous"
-                }
-                Op::Copy => "copy_strided",
                 Op::Add
                     if dispatch
                         .inputs()
@@ -486,6 +488,106 @@ impl MetalBackend {
             error_flags,
             bindings,
         })
+    }
+
+    fn encode_copy(
+        &self,
+        encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
+        table: &ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>,
+        dispatch: &Dispatch,
+        bindings: &mut ArgumentBindings,
+    ) -> Result<Vec<MetalBufferRef>, BackendError> {
+        let [input] = dispatch.inputs() else {
+            return Err(BackendError::InvalidInput);
+        };
+        let input = self.encoder_tensor(input)?;
+        let output = self.encoder_tensor(dispatch.output())?;
+        self.encode_copy_tensors(encoder, table, &input, &output, bindings)
+    }
+
+    fn encode_copy_tensors(
+        &self,
+        encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
+        table: &ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>,
+        input: &EncoderTensor,
+        output: &EncoderTensor,
+        bindings: &mut ArgumentBindings,
+    ) -> Result<Vec<MetalBufferRef>, BackendError> {
+        use objc2_metal::{MTL4ComputeCommandEncoder, MTLSize};
+
+        let kernel = if input.layout.is_contiguous() && output.layout.is_contiguous() {
+            "copy_contiguous"
+        } else {
+            "copy_strided"
+        };
+        let pipeline = self
+            .pipelines
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?
+            .get(
+                kernel,
+                &[
+                    (0, dtype_code(input.layout.dtype())),
+                    (2, dtype_code(output.layout.dtype())),
+                ],
+            )?;
+        encoder.setComputePipelineState(&pipeline);
+        let layouts = vec![
+            self.layout_buffer(&input.layout)?,
+            self.layout_buffer(&output.layout)?,
+        ];
+        bindings.bind(table, 0, &input.buffer);
+        bindings.bind(table, 1, &output.buffer);
+        bindings.bind(table, 2, &layouts[0]);
+        bindings.bind(table, 3, &layouts[1]);
+        encoder.setArgumentTable(Some(table));
+        let count = usize::try_from(output.layout.element_count())
+            .map_err(|_| BackendError::ExecutionFailed)?;
+        let width = pipeline.maxTotalThreadsPerThreadgroup().clamp(1, 256);
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(
+            MTLSize {
+                width: count.div_ceil(width),
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width,
+                height: 1,
+                depth: 1,
+            },
+        );
+        Ok(layouts)
+    }
+
+    fn encoder_tensor(&self, tensor: &Tensor) -> Result<EncoderTensor, BackendError> {
+        let buffers = self
+            .buffers
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?;
+        Ok(EncoderTensor {
+            buffer: buffers.get(tensor)?.raw.clone(),
+            layout: tensor.layout().clone(),
+        })
+    }
+
+    #[allow(dead_code)]
+    fn scratch_tensor(&self, dtype: DType, shape: &[u32]) -> Result<EncoderTensor, BackendError> {
+        use objc2_metal::MTLResourceOptions;
+
+        let elements = shape
+            .iter()
+            .try_fold(1_u64, |count, &extent| count.checked_mul(u64::from(extent)));
+        let byte_len = elements
+            .and_then(|count| count.checked_mul(dtype.byte_size()))
+            .ok_or(BackendError::AllocationFailed)?;
+        let len = usize::try_from(byte_len).map_err(|_| BackendError::AllocationFailed)?;
+        let buffer = self
+            .device
+            .newBufferWithLength_options(len, MTLResourceOptions::StorageModeShared)
+            .ok_or(BackendError::AllocationFailed)?;
+        let layout = Layout::contiguous(dtype, 0, shape.to_vec(), byte_len)
+            .map_err(|_| BackendError::InvalidInput)?;
+        Ok(EncoderTensor { buffer, layout })
     }
 
     #[allow(clippy::cast_precision_loss)]
@@ -1322,6 +1424,71 @@ mod tests {
             )
             .unwrap();
         }
+    }
+
+    #[test]
+    fn scratch_copy_is_visible_to_a_following_consumer() {
+        use objc2_metal::{
+            MTL4ArgumentTableDescriptor, MTL4CommandEncoder, MTL4VisibilityOptions, MTLStages,
+        };
+
+        let backend = MetalBackend::new().unwrap();
+        let source = backend.alloc(DType::F32, &[33]).unwrap();
+        let output = backend.alloc(DType::F32, &[33]).unwrap();
+        let bytes = (0_u16..33)
+            .map(f32::from)
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>();
+        backend.write(&source, &bytes).unwrap();
+
+        let command_buffer = backend.begin_command_buffer().unwrap();
+        let encoder = command_buffer.computeCommandEncoder().unwrap();
+        let descriptor = MTL4ArgumentTableDescriptor::new();
+        descriptor.setMaxBufferBindCount(4);
+        let table = backend
+            .device
+            .newArgumentTableWithDescriptor_error(&descriptor)
+            .unwrap();
+        let source_buffer = backend.encoder_tensor(&source).unwrap();
+        let output_buffer = backend.encoder_tensor(&output).unwrap();
+        let scratch = backend.scratch_tensor(DType::F32, &[33]).unwrap();
+        let mut bindings = ArgumentBindings::default();
+        let mut temporaries = vec![scratch.buffer.clone()];
+        temporaries.extend(
+            backend
+                .encode_copy_tensors(&encoder, &table, &source_buffer, &scratch, &mut bindings)
+                .unwrap(),
+        );
+        encoder.barrierAfterEncoderStages_beforeEncoderStages_visibilityOptions(
+            MTLStages::Dispatch,
+            MTLStages::Dispatch,
+            MTL4VisibilityOptions::Device,
+        );
+        temporaries.extend(
+            backend
+                .encode_copy_tensors(&encoder, &table, &scratch, &output_buffer, &mut bindings)
+                .unwrap(),
+        );
+        encoder.endEncoding();
+        let tensors = [source.clone(), output.clone()];
+        let resources = backend
+            .command_resources(
+                &tensors,
+                EncodedDispatches {
+                    temporaries,
+                    error_flags: Vec::new(),
+                    bindings,
+                },
+            )
+            .unwrap();
+        let residency = backend.make_resident(&command_buffer, &resources).unwrap();
+        command_buffer.endCommandBuffer();
+        backend
+            .commit(&command_buffer, &tensors, resources, residency)
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert_eq!(backend.read(&output).unwrap(), bytes);
     }
 
     #[test]
