@@ -485,6 +485,8 @@ dependencies = [
  "forja-cpu",
  "forja-metal",
  "forja-testing",
+ "serde",
+ "serde_json",
  "test-guests",
  "tokio",
  "wasmtime",

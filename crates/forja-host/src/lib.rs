@@ -4,6 +4,7 @@
 
 #[cfg(test)]
 mod fuzz_tests;
+mod weights;
 
 use std::sync::{
     Arc,
@@ -18,6 +19,8 @@ use forja_core::{
 use wasmtime::component::{Accessor, HasData, Linker, Resource, ResourceTable};
 use wasmtime::{Engine, Store, StoreLimits, StoreLimitsBuilder};
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
+
+pub use weights::{Safetensors, WeightError, WeightSource, WeightTensor};
 
 /// Host bindings for the guest-facing compute interface.
 #[allow(missing_docs)]
