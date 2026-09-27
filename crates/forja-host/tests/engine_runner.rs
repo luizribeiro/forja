@@ -1,8 +1,10 @@
 //! Engine component integration checks.
 
 use std::{
+    fs,
     path::{Path, PathBuf},
-    time::{Duration, Instant},
+    sync::atomic::{AtomicU64, Ordering},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use forja_cpu::CpuBackend;
@@ -10,26 +12,27 @@ use forja_host::{EngineRunner, EngineStep, Limits, bindings::l9o::gpu::compute::
 use golden_fixtures::decode_f32_le;
 
 const LIMITS: Limits = Limits::new(1024 * 1024, 4, 1024, 128, 1024 * 1024);
+static NEXT_WEIGHT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
 #[tokio::test]
 async fn runs_an_engine_and_reads_its_logits() -> wasmtime::Result<()> {
-    run_engine(test_guests::engine_smoke(), false).await
+    run_engine(test_guests::engine_smoke(), false, "engine").await
 }
 
 #[tokio::test]
 async fn runs_an_sdk_exported_engine() -> wasmtime::Result<()> {
-    run_engine(test_guests::engine_sdk_smoke(), true).await
+    run_engine(test_guests::engine_sdk_smoke(), true, "sdk-engine").await
 }
 
 #[tokio::test]
 async fn guest_step_stops_at_its_cpu_deadline() -> wasmtime::Result<()> {
     let limits = LIMITS.with_guest_call_timeout(Duration::from_millis(50));
-    let weights = weight_file()?;
+    let weights = weight_file("deadline")?;
     let mut runner = EngineRunner::new(
         test_guests::engine_smoke(),
         CpuBackend::new(),
         limits,
-        &weights,
+        weights.path(),
     )
     .await?;
     runner.load().await??;
@@ -45,18 +48,18 @@ async fn guest_step_stops_at_its_cpu_deadline() -> wasmtime::Result<()> {
     assert!(matches!(error, Error::Quota(_)));
     assert!(started.elapsed() < Duration::from_secs(1));
 
-    run_engine(test_guests::engine_smoke(), false).await
+    run_engine(test_guests::engine_smoke(), false, "deadline-followup").await
 }
 
 #[tokio::test]
 async fn preceding_step_outputs_are_released() -> wasmtime::Result<()> {
     let limits = Limits::new(1024 * 1024, 4, 1024, 4, 1024 * 1024);
-    let weights = weight_file()?;
+    let weights = weight_file("output-release")?;
     let mut runner = EngineRunner::new(
         test_guests::engine_smoke(),
         CpuBackend::new(),
         limits,
-        &weights,
+        weights.path(),
     )
     .await?;
     runner.load().await??;
@@ -74,12 +77,12 @@ async fn preceding_step_outputs_are_released() -> wasmtime::Result<()> {
 
 #[tokio::test]
 async fn rejects_outputs_that_disagree_with_metadata() -> wasmtime::Result<()> {
-    let weights = weight_file()?;
+    let weights = weight_file("metadata")?;
     let mut runner = EngineRunner::new(
         test_guests::engine_smoke(),
         CpuBackend::new(),
         LIMITS,
-        &weights,
+        weights.path(),
     )
     .await?;
     runner.load().await??;
@@ -100,12 +103,12 @@ async fn rejects_outputs_that_disagree_with_metadata() -> wasmtime::Result<()> {
 #[cfg(target_os = "macos")]
 #[tokio::test]
 async fn metal_runner_rejects_a_cpu_runner_tensor() -> wasmtime::Result<()> {
-    let weights = weight_file()?;
+    let weights = weight_file("foreign-tensor")?;
     let mut cpu = EngineRunner::new(
         test_guests::engine_smoke(),
         CpuBackend::new(),
         LIMITS,
-        &weights,
+        weights.path(),
     )
     .await?;
     cpu.load().await??;
@@ -118,7 +121,7 @@ async fn metal_runner_rejects_a_cpu_runner_tensor() -> wasmtime::Result<()> {
         .await??;
     let backend = forja_metal::MetalBackend::new().map_err(wasmtime::Error::msg)?;
     let mut metal =
-        EngineRunner::new(test_guests::engine_smoke(), backend, LIMITS, &weights).await?;
+        EngineRunner::new(test_guests::engine_smoke(), backend, LIMITS, weights.path()).await?;
     let error = metal
         .read(&output.logits)
         .await
@@ -127,9 +130,10 @@ async fn metal_runner_rejects_a_cpu_runner_tensor() -> wasmtime::Result<()> {
     Ok(())
 }
 
-async fn run_engine(component: &Path, taps: bool) -> wasmtime::Result<()> {
-    let weights = weight_file()?;
-    let mut runner = EngineRunner::new(component, CpuBackend::new(), LIMITS, &weights).await?;
+async fn run_engine(component: &Path, taps: bool, fixture: &str) -> wasmtime::Result<()> {
+    let weights = weight_file(fixture)?;
+    let mut runner =
+        EngineRunner::new(component, CpuBackend::new(), LIMITS, weights.path()).await?;
 
     assert_eq!(runner.describe().await?.vocab, 4);
     runner.load().await??;
@@ -147,10 +151,37 @@ async fn run_engine(component: &Path, taps: bool) -> wasmtime::Result<()> {
     Ok(())
 }
 
-fn weight_file() -> wasmtime::Result<PathBuf> {
-    let weights =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/engine-empty.safetensors");
-    std::fs::write(&weights, empty_safetensors()).map_err(wasmtime::Error::msg)?;
+struct WeightFile {
+    directory: PathBuf,
+    path: PathBuf,
+}
+
+impl WeightFile {
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for WeightFile {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.directory);
+    }
+}
+
+fn weight_file(test: &str) -> wasmtime::Result<WeightFile> {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(wasmtime::Error::msg)?
+        .as_nanos();
+    let nonce = NEXT_WEIGHT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+    let directory = std::env::temp_dir().join(format!(
+        "forja-engine-runner-{test}-{}-{timestamp}-{nonce}",
+        std::process::id()
+    ));
+    fs::create_dir(&directory).map_err(wasmtime::Error::msg)?;
+    let path = directory.join("weights.safetensors");
+    let weights = WeightFile { directory, path };
+    fs::write(weights.path(), empty_safetensors()).map_err(wasmtime::Error::msg)?;
     Ok(weights)
 }
 
