@@ -982,6 +982,10 @@ impl MetalBackend {
             return self
                 .encode_vector_sdpa(encoder, table, dispatch, scale, causal, q_start, bindings);
         }
+        if steel_sdpa_supported(dispatch)? {
+            return self
+                .encode_steel_sdpa(encoder, table, dispatch, scale, causal, q_start, bindings);
+        }
         self.encode_decomposed_sdpa(encoder, table, dispatch, scale, causal, q_start, bindings)
     }
 
@@ -1161,6 +1165,61 @@ impl MetalBackend {
             _ => 32,
         };
         Ok(blocks)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn encode_steel_sdpa(
+        &self,
+        encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
+        table: &ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>,
+        dispatch: &Dispatch,
+        scale: f32,
+        causal: bool,
+        q_start: u32,
+        bindings: &mut ArgumentBindings,
+    ) -> Result<Vec<MetalBufferRef>, BackendError> {
+        use objc2_metal::{MTL4ComputeCommandEncoder, MTLSize};
+
+        let [query_tensor, key_tensor, value_tensor] = dispatch.inputs() else {
+            return Err(BackendError::InvalidInput);
+        };
+        let query = self.encoder_tensor(query_tensor)?;
+        let key = self.encoder_tensor(key_tensor)?;
+        let value = self.encoder_tensor(value_tensor)?;
+        let output = self.encoder_tensor(dispatch.output())?;
+        let [query_heads, query_length, _] = shape3(&query.layout)?;
+        let params = self.sdpa_params(&query, &key, &value, &output, scale, causal, q_start, 1)?;
+        let constants = [
+            (0, dtype_code(query.layout.dtype())),
+            (1, dtype_code(key.layout.dtype())),
+            (2, dtype_code(output.layout.dtype())),
+            (3, dtype_code(value.layout.dtype())),
+        ];
+        let pipeline = self
+            .pipelines
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?
+            .get("steel_attention", &constants)?;
+        encoder.setComputePipelineState(&pipeline);
+        for (index, tensor) in [&query, &key, &value, &output].into_iter().enumerate() {
+            bindings.bind(table, index, &tensor.buffer);
+        }
+        bindings.bind(table, 4, &params);
+        encoder.setArgumentTable(Some(table));
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(
+            MTLSize {
+                width: usize::try_from(query_heads).map_err(|_| BackendError::InvalidInput)?,
+                height: usize::try_from(query_length.div_ceil(8))
+                    .map_err(|_| BackendError::InvalidInput)?,
+                depth: 1,
+            },
+            MTLSize {
+                width: 128,
+                height: 1,
+                depth: 1,
+            },
+        );
+        Ok(vec![params])
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2341,6 +2400,16 @@ fn vector_kernel(prefix: &str, width: u32) -> Result<&'static str, BackendError>
     }
 }
 
+fn steel_sdpa_supported(dispatch: &Dispatch) -> Result<bool, BackendError> {
+    let [query, key, value] = dispatch.inputs() else {
+        return Err(BackendError::InvalidInput);
+    };
+    let [_, query_length, width] = shape3(query.layout())?;
+    let [_, key_length, _] = shape3(key.layout())?;
+    let [_, _, value_width] = shape3(value.layout())?;
+    Ok(query_length > 1 && width == value_width && matches!(width, 64 | 128) && key_length <= 1024)
+}
+
 fn head_group(
     tensor: &EncoderTensor,
     first_head: u32,
@@ -3101,6 +3170,63 @@ mod tests {
             &backend.read(&decode).unwrap(),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn metal_steel_attention_matches_prefill_shapes() {
+        for (dtype, length, causal) in [
+            (DType::BF16, 7, false),
+            (DType::BF16, 128, false),
+            (DType::BF16, 512, true),
+        ] {
+            let cache_slice = [
+                Slice::new(0, 8, 1).unwrap(),
+                Slice::new(0, length, 1).unwrap(),
+                Slice::new(0, 128, 1).unwrap(),
+            ];
+            assert_sdpa(
+                Op::Sdpa {
+                    scale: 128.0_f32.sqrt().recip(),
+                    causal,
+                    q_start: 0,
+                },
+                TensorSpec::contiguous(dtype, &[16, length, 128]),
+                TensorSpec::sliced(dtype, &[8, 4096, 128], &cache_slice),
+                TensorSpec::sliced(dtype, &[8, 4096, 128], &cache_slice),
+                &TensorSpec::contiguous(dtype, &[16, length, 128]),
+            );
+        }
+        assert_sdpa(
+            Op::Sdpa {
+                scale: 0.125,
+                causal: false,
+                q_start: 0,
+            },
+            TensorSpec::contiguous(DType::F32, &[4, 128, 64]),
+            TensorSpec::contiguous(DType::F32, &[2, 128, 64]),
+            TensorSpec::contiguous(DType::F32, &[2, 128, 64]),
+            &TensorSpec::contiguous(DType::F32, &[4, 128, 64]),
+        );
+    }
+
+    #[test]
+    fn metal_steel_attention_matches_chunked_prefill() {
+        let cache_slice = [
+            Slice::new(0, 8, 1).unwrap(),
+            Slice::new(0, 512, 1).unwrap(),
+            Slice::new(0, 128, 1).unwrap(),
+        ];
+        assert_sdpa(
+            Op::Sdpa {
+                scale: 128.0_f32.sqrt().recip(),
+                causal: true,
+                q_start: 384,
+            },
+            TensorSpec::contiguous(DType::BF16, &[16, 128, 128]),
+            TensorSpec::sliced(DType::BF16, &[8, 4096, 128], &cache_slice),
+            TensorSpec::sliced(DType::BF16, &[8, 4096, 128], &cache_slice),
+            &TensorSpec::contiguous(DType::BF16, &[16, 128, 128]),
+        );
     }
 
     #[test]
