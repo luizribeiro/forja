@@ -77,10 +77,14 @@ async fn run_metal(options: &Bench) -> Result<(), Box<dyn Error>> {
         let (pp, tg, device, profiles) = bench_precision(options, component).await?;
         print_summary(precision, "pp", pp);
         print_summary(precision, "tg", tg);
-        for profile in &profiles {
-            print_profile_report(precision, &profile_report(profile)?);
+        let profile_reports = profiles
+            .iter()
+            .map(profile_report)
+            .collect::<Result<Vec<_>, _>>()?;
+        for report in &profile_reports {
+            print_profile_report(precision, report);
         }
-        results.push(serde_json::json!({
+        let mut result = serde_json::json!({
             "provenance": {
                 "git_commit": commit,
                 "engine_component_sha256": sha256_file(component)?,
@@ -90,7 +94,12 @@ async fn run_metal(options: &Bench) -> Result<(), Box<dyn Error>> {
             },
             "prompt_processing": summary_json(pp),
             "token_generation": summary_json(tg),
-        }));
+        });
+        if !profile_reports.is_empty() {
+            result["profile"] =
+                serde_json::Value::Array(profile_reports.iter().map(profile_json).collect());
+        }
+        results.push(result);
     }
     if let Some(path) = &options.json {
         let report = serde_json::json!({
@@ -436,6 +445,34 @@ fn print_profile_report(precision: &str, report: &ProfileReport) {
         report.gpu_perturbation.median,
         report.dispatch_coverage.median * 100.0
     );
+}
+
+fn profile_json(report: &ProfileReport) -> serde_json::Value {
+    let categories = report
+        .categories
+        .iter()
+        .map(|category| {
+            let count = stats(category.values.iter().map(|(count, _)| *count));
+            let time = stats(category.values.iter().map(|(_, seconds)| *seconds));
+            (
+                category.name.to_owned(),
+                serde_json::json!({
+                    "count_per_token": stats_json(count),
+                    "time_seconds": stats_json(time),
+                    "percent_of_wall": time.median / report.wall.median * 100.0,
+                }),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+    serde_json::json!({
+        "context_start": report.context_start,
+        "categories": categories,
+        "timestamp_perturbation": {
+            "wall_ratio": stats_json(report.wall_perturbation),
+            "gpu_ratio": stats_json(report.gpu_perturbation),
+            "dispatch_coverage_ratio": stats_json(report.dispatch_coverage),
+        },
+    })
 }
 
 fn print_profile_row(name: &str, count: Stats, time: Stats, wall_seconds: f64) {
