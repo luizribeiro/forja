@@ -4,6 +4,7 @@
 
 #[cfg(test)]
 mod fuzz_tests;
+mod native;
 mod weights;
 
 use std::time::{Duration, Instant};
@@ -24,6 +25,7 @@ use wasmtime::component::{Accessor, HasData, Linker, Resource, ResourceTable};
 use wasmtime::{Engine, Store, StoreLimits, StoreLimitsBuilder};
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
+pub use native::{NativeCommandList, NativeHost, NativeTensor};
 pub use weights::{Safetensors, WeightError, WeightSource, WeightTensor};
 
 /// Host bindings for the guest-facing compute interface.
