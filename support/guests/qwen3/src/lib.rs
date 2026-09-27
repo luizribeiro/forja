@@ -176,30 +176,26 @@ impl<T: Activation> DecoderLayer<T> {
     ) -> Result<Tensor<T>> {
         let sequence = end_pos - start_pos;
         let normalized = self.input_layernorm.forward(input)?;
-        let query = self
-            .self_attn
-            .q_norm
-            .forward(&self.self_attn.q_proj.forward(&normalized)?.reshape(&[
-                sequence,
-                QUERY_HEADS,
-                HEAD_DIM,
-            ])?)?
+        let query_projection = self.self_attn.q_proj.forward(&normalized)?;
+        let key_projection = self.self_attn.k_proj.forward(&normalized)?;
+        let value_projection = self.self_attn.v_proj.forward(&normalized)?;
+        let normalized_query = self.self_attn.q_norm.forward(&query_projection.reshape(&[
+            sequence,
+            QUERY_HEADS,
+            HEAD_DIM,
+        ])?)?;
+        let normalized_key = self.self_attn.k_norm.forward(&key_projection.reshape(&[
+            sequence,
+            KEY_VALUE_HEADS,
+            HEAD_DIM,
+        ])?)?;
+        let query = normalized_query
             .rope(positions, ROPE_THETA)?
             .permute(&[1, 0, 2])?;
-        let key = self
-            .self_attn
-            .k_norm
-            .forward(&self.self_attn.k_proj.forward(&normalized)?.reshape(&[
-                sequence,
-                KEY_VALUE_HEADS,
-                HEAD_DIM,
-            ])?)?
+        let key = normalized_key
             .rope(positions, ROPE_THETA)?
             .permute(&[1, 0, 2])?;
-        let value = self
-            .self_attn
-            .v_proj
-            .forward(&normalized)?
+        let value = value_projection
             .reshape(&[sequence, KEY_VALUE_HEADS, HEAD_DIM])?
             .permute(&[1, 0, 2])?;
         key.copy_into(&mut cache.key.narrow(1, start_pos, sequence)?)?;
