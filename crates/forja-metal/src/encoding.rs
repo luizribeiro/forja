@@ -975,9 +975,6 @@ impl MetalBackend {
         else {
             return Err(BackendError::InvalidInput);
         };
-        if causal {
-            return Err(BackendError::InvalidInput);
-        }
         self.encode_decomposed_sdpa(encoder, table, dispatch, scale, causal, q_start, bindings)
     }
 
@@ -2664,6 +2661,28 @@ mod tests {
             TensorSpec::contiguous(DType::F32, &[2, 7, 3]),
             &TensorSpec::contiguous(DType::F32, &[4, 3, 3]),
         );
+    }
+
+    #[test]
+    fn metal_decomposed_attention_reads_strided_qwen_cache_views() {
+        let cache_slice = [
+            Slice::new(0, 8, 1).unwrap(),
+            Slice::new(0, 7, 1).unwrap(),
+            Slice::new(0, 128, 1).unwrap(),
+        ];
+        for dtype in [DType::F32, DType::F16, DType::BF16] {
+            assert_sdpa(
+                Op::Sdpa {
+                    scale: 128.0_f32.sqrt().recip(),
+                    causal: true,
+                    q_start: 0,
+                },
+                TensorSpec::contiguous(dtype, &[16, 7, 128]),
+                TensorSpec::sliced(dtype, &[8, 4096, 128], &cache_slice),
+                TensorSpec::sliced(dtype, &[8, 4096, 128], &cache_slice),
+                &TensorSpec::contiguous(dtype, &[16, 7, 128]),
+            );
+        }
     }
 
     #[test]
