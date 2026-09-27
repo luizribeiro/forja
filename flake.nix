@@ -78,8 +78,7 @@
                   echo "FORJA_NO_GPU is reserved for GitHub Actions" >&2
                   exit 1
                 fi
-                cargo nextest run --release --workspace --all-features --locked --no-tests pass \
-                  -E 'not package(forja-metal)'
+                cargo nextest run --profile ci --release --workspace --all-features --locked --no-tests pass
               else
                 cargo nextest run --release --workspace --all-features --locked --no-tests pass
               fi

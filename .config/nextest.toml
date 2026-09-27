@@ -1,6 +1,10 @@
 [test-groups.metal]
 max-threads = 1
 
+# GitHub runners have no Metal device, so CI excludes the same tests serialized below.
+[profile.ci]
+default-filter = "not (package(forja-metal) or binary(native_metal) or test(/(^|::)metal_/))"
+
 [[profile.default.overrides]]
 filter = "package(forja-metal) or binary(native_metal) or test(/(^|::)metal_/)"
 test-group = "metal"
