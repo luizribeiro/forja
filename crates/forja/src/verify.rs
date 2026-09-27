@@ -10,15 +10,27 @@ use golden_fixtures::{
 use crate::args::{Backend as BackendArg, Verify};
 
 pub(crate) async fn run(options: &Verify) -> Result<(), Box<dyn Error>> {
+    run_with_steps(options, 32).await
+}
+
+async fn run_with_steps(options: &Verify, decode_steps: usize) -> Result<(), Box<dyn Error>> {
     let fixtures = FixtureDirectory::open(&options.fixtures)?;
     match options.backend {
-        BackendArg::Cpu => verify(forja_cpu::CpuBackend::new(), options, &fixtures).await,
+        BackendArg::Cpu => {
+            verify(
+                forja_cpu::CpuBackend::new(),
+                options,
+                &fixtures,
+                decode_steps,
+            )
+            .await
+        }
         BackendArg::Metal => {
             #[cfg(target_os = "macos")]
             {
                 let backend = forja_metal::MetalBackend::new()
                     .map_err(|error| format!("cannot create Metal backend: {error}"))?;
-                verify(backend, options, &fixtures).await
+                verify(backend, options, &fixtures, decode_steps).await
             }
             #[cfg(not(target_os = "macos"))]
             Err("the Metal backend requires macOS".into())
@@ -30,6 +42,7 @@ async fn verify<B>(
     backend: B,
     options: &Verify,
     fixtures: &FixtureDirectory,
+    decode_steps: usize,
 ) -> Result<(), Box<dyn Error>>
 where
     B: Backend + Send + Sync + 'static,
@@ -66,12 +79,14 @@ where
             .map_err(|error| format!("engine step failed: {error:?}"))?;
         let logits = decode_f32(&runner.read(&output.logits).await?)?;
         let mut first_failing = None;
+        let mut maximum_layer_error = 0.0_f64;
         for (index, tap) in output.taps.iter().enumerate() {
             let values = decode_f32(&runner.read(tap).await?)?;
             let reference = fixture
                 .hidden_state(index + 1)
                 .ok_or("hidden-state fixture is missing")?;
             let error = normwise_relative_error(reference.values(), &values)?;
+            maximum_layer_error = maximum_layer_error.max(error);
             let layer_passed = error <= BF16_HIDDEN_STATE_TOLERANCE;
             if !layer_passed && first_failing.is_none() {
                 first_failing = Some(index + 1);
@@ -87,10 +102,23 @@ where
             &logits,
             usize::try_from(info.vocab)?,
         )?;
-        let prompt_passed = first_failing.is_none() && logits_kl <= LOGIT_KL_TOLERANCE;
+        let prompt_tokens = u32::try_from(fixture.prompt_ids().len())?;
+        let (decode_kl, agreement) = decode(
+            &mut runner,
+            fixture,
+            prompt_tokens,
+            logits,
+            usize::try_from(info.vocab)?,
+            decode_steps,
+        )
+        .await?;
+        let prompt_passed = first_failing.is_none()
+            && logits_kl <= LOGIT_KL_TOLERANCE
+            && decode_kl <= LOGIT_KL_TOLERANCE
+            && agreement == decode_steps;
         passed &= prompt_passed;
         println!(
-            "{}\tfirst-failing={}\tprompt-logits-kl={logits_kl:.8e}\t{}",
+            "{}\tmax-layer={maximum_layer_error:.8e}\tfirst-failing={}\tprompt-kl={logits_kl:.8e}\tdecode-kl={decode_kl:.8e}\ttokens={agreement}/{decode_steps}\t{}",
             fixture.name(),
             first_failing.map_or_else(|| "-".to_owned(), |layer| layer.to_string()),
             if prompt_passed { "pass" } else { "FAIL" }
@@ -101,6 +129,74 @@ where
     } else {
         Err("verification failed".into())
     }
+}
+
+async fn decode<B>(
+    runner: &mut EngineRunner<B>,
+    fixture: &golden_fixtures::PromptFixture,
+    prompt_tokens: u32,
+    mut logits: Vec<f32>,
+    vocab: usize,
+    steps: usize,
+) -> Result<(f64, usize), Box<dyn Error>>
+where
+    B: Backend + Send + Sync + 'static,
+{
+    if steps == 0 || steps > fixture.greedy_tokens().len() {
+        return Err("decode step count is outside the fixture".into());
+    }
+    let mut total_kl = 0.0;
+    let mut agreement = 0;
+    println!("prompt\tstep\tlogits-kl\texpected\tactual\tresult");
+    for step in 0..steps {
+        let start = step
+            .checked_mul(vocab)
+            .ok_or("decode fixture offset overflowed")?;
+        let end = start
+            .checked_add(vocab)
+            .ok_or("decode fixture offset overflowed")?;
+        let reference = fixture
+            .greedy_step_logits()
+            .values()
+            .get(start..end)
+            .ok_or("decode logits fixture is incomplete")?;
+        let kl = mean_logit_kl_divergence(reference, &logits, vocab)?;
+        total_kl += kl;
+        let actual = argmax(&logits)?;
+        let expected = u32::try_from(fixture.greedy_tokens()[step])?;
+        let token_matches = actual == expected;
+        agreement += usize::from(token_matches);
+        println!(
+            "{}\t{step}\t{kl:.8e}\t{expected}\t{actual}\t{}",
+            fixture.name(),
+            if token_matches { "pass" } else { "FAIL" }
+        );
+        if step + 1 < steps {
+            let start_pos = prompt_tokens
+                .checked_add(u32::try_from(step)?)
+                .ok_or("decode position overflowed")?;
+            let output = runner
+                .step(EngineStep {
+                    tokens: vec![actual],
+                    start_pos,
+                    taps: false,
+                })
+                .await?
+                .map_err(|error| format!("decode step failed: {error:?}"))?;
+            logits = decode_f32(&runner.read(&output.logits).await?)?;
+        }
+    }
+    Ok((total_kl / f64::from(u32::try_from(steps)?), agreement))
+}
+
+fn argmax(values: &[f32]) -> Result<u32, Box<dyn Error>> {
+    let index = values
+        .iter()
+        .enumerate()
+        .max_by(|(_, left), (_, right)| left.total_cmp(right))
+        .map(|(index, _)| index)
+        .ok_or("cannot take argmax of empty logits")?;
+    Ok(u32::try_from(index)?)
 }
 
 fn selected_prompts<'a>(
