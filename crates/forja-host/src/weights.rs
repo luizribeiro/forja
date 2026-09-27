@@ -7,7 +7,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use forja_core::{DType, MappedRegion};
+use forja_core::{DType, Layout, LayoutError, MappedRegion};
 use serde::{
     Deserialize,
     de::{self, MapAccess, Visitor},
@@ -55,6 +55,15 @@ impl WeightTensor {
     #[must_use]
     pub const fn byte_len(&self) -> u64 {
         self.byte_len
+    }
+
+    pub(crate) fn layout(&self, buffer_len: u64) -> Result<Layout, LayoutError> {
+        Layout::contiguous(
+            self.dtype,
+            self.byte_offset / self.dtype.byte_size(),
+            self.shape.clone(),
+            buffer_len,
+        )
     }
 }
 

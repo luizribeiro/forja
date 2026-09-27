@@ -59,12 +59,18 @@ interface compute {
     read: async func() -> result<list<u8>, error>;
   }
 
+  resource weights {
+    tensor: func(name: string) -> result<tensor, error>;
+    names: func() -> list<string>;
+  }
+
   resource command-list {
     constructor();
     dispatch: func(operation: op, ins: list<borrow<tensor>>, out: borrow<tensor>) -> result<_, error>;
   }
 
   submit: async func(cmds: command-list) -> result<option<u64>, error>;
+  open-weights: func(grant: string) -> result<weights, error>;
 }
 
 world host {
@@ -88,4 +94,9 @@ world tensor-abuse {
 world rmsnorm-smoke {
   import compute;
   export run: async func() -> result<tuple<u64, u64>, string>;
+}
+
+world weights-smoke {
+  import compute;
+  export run: async func() -> result<list<u8>, string>;
 }
