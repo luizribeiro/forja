@@ -1,6 +1,6 @@
 //! Reference CPU execution for Forja operations.
 
-use std::sync::Mutex;
+use std::{sync::Mutex, time::Duration};
 
 use forja_core::{
     AllocationRegistry, Backend, BackendError, CommandList, DType, Layout, Op, Submission, Tensor,
@@ -392,11 +392,18 @@ impl Default for CpuBackend {
 
 /// An already-complete CPU submission.
 #[derive(Debug)]
-pub struct CpuSubmission(Result<(), BackendError>);
+pub struct CpuSubmission {
+    result: Result<(), BackendError>,
+    wall_time: Duration,
+}
 
 impl Submission for CpuSubmission {
-    fn wait(self) -> Result<(), BackendError> {
-        self.0
+    fn wait(&self) -> Result<(), BackendError> {
+        self.result
+    }
+
+    fn gpu_time(&self) -> Option<Duration> {
+        Some(self.wall_time)
     }
 }
 
@@ -424,6 +431,7 @@ impl Backend for CpuBackend {
     }
 
     fn submit(&self, commands: CommandList) -> Result<Self::Submission, BackendError> {
+        let started = std::time::Instant::now();
         let dispatches = commands.into_dispatches();
         for dispatch in &dispatches {
             self.validate(dispatch.output())?;
@@ -458,7 +466,10 @@ impl Backend for CpuBackend {
                     self.execute_sdpa(dispatch.inputs(), dispatch.output(), scale, causal, q_start)
                 }
             });
-        Ok(CpuSubmission(result))
+        Ok(CpuSubmission {
+            result,
+            wall_time: started.elapsed(),
+        })
     }
 }
 

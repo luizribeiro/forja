@@ -12,12 +12,13 @@ use forja_core::{
     required_barriers,
 };
 use objc2::{rc::Retained, runtime::ProtocolObject};
-use objc2_foundation::NSString;
+use objc2_foundation::{NSRange, NSString};
 use objc2_metal::{
     MTL4ArgumentTable, MTL4CommandBuffer, MTL4CommandQueue, MTL4CommitFeedback, MTL4CommitOptions,
-    MTLAllocation, MTLBuffer, MTLComputePipelineState, MTLDataType, MTLDevice, MTLEvent,
-    MTLFunctionConstantValues, MTLLibrary, MTLResidencySet, MTLResidencySetDescriptor,
-    MTLSharedEvent, MTLSharedEventListener, MTLSize,
+    MTL4CounterHeap, MTL4CounterHeapDescriptor, MTL4CounterHeapType, MTLAllocation, MTLBuffer,
+    MTLComputePipelineState, MTLDataType, MTLDevice, MTLEvent, MTLFunctionConstantValues,
+    MTLLibrary, MTLResidencySet, MTLResidencySetDescriptor, MTLSharedEvent, MTLSharedEventListener,
+    MTLSize,
 };
 
 use crate::{
@@ -136,6 +137,41 @@ unsafe impl Send for InFlightResidency {}
 // SAFETY: The wrapper exposes no operations on the retained residency set.
 unsafe impl Sync for InFlightResidency {}
 
+struct GpuTimestamps {
+    heap: Retained<ProtocolObject<dyn MTL4CounterHeap>>,
+    frequency: u64,
+    entry_size: usize,
+}
+
+// SAFETY: Counter heaps remain immutable on the CPU while the retained submission is in flight,
+// and timestamp resolution happens only after the shared event establishes GPU completion.
+unsafe impl Send for GpuTimestamps {}
+
+// SAFETY: Shared access only resolves completed timestamp data and does not mutate the heap.
+unsafe impl Sync for GpuTimestamps {}
+
+impl GpuTimestamps {
+    fn elapsed(&self) -> Option<Duration> {
+        // SAFETY: The heap has two entries and callers only resolve timestamps after waiting for
+        // the submission's shared-event signal.
+        let data = unsafe { self.heap.resolveCounterRange(NSRange::new(0, 2)) }?;
+        let bytes = data.to_vec();
+        let end_offset = self.entry_size;
+        let start = u64::from_ne_bytes(bytes.get(..8)?.try_into().ok()?);
+        let end = u64::from_ne_bytes(
+            bytes
+                .get(end_offset..end_offset.checked_add(8)?)?
+                .try_into()
+                .ok()?,
+        );
+        let ticks = end.checked_sub(start)?;
+        let seconds = ticks / self.frequency;
+        let nanos = u128::from(ticks % self.frequency).checked_mul(1_000_000_000)?
+            / u128::from(self.frequency);
+        Some(Duration::new(seconds, u32::try_from(nanos).ok()?))
+    }
+}
+
 struct CommandResources {
     buffers: Vec<InFlightBuffer>,
     error_flags: Vec<usize>,
@@ -147,6 +183,7 @@ pub(super) struct Completion {
     event: InFlightEvent,
     resources: CommandResources,
     _residency: InFlightResidency,
+    timestamps: Option<GpuTimestamps>,
     commit: CommitRetention,
 }
 
@@ -171,6 +208,7 @@ impl Completion {
         resources: CommandResources,
         event: InFlightEvent,
         residency: InFlightResidency,
+        timestamps: Option<GpuTimestamps>,
     ) -> Arc<Self> {
         Arc::new_cyclic(|completion: &Weak<Self>| {
             let callback_completion = completion.clone();
@@ -201,6 +239,7 @@ impl Completion {
                 event,
                 resources,
                 _residency: residency,
+                timestamps,
                 commit: CommitRetention {
                     _handler: handler,
                     options,
@@ -287,6 +326,10 @@ impl Completion {
             }
         }
         Ok(())
+    }
+
+    fn gpu_time(&self) -> Option<Duration> {
+        self.timestamps.as_ref()?.elapsed()
     }
 }
 
@@ -378,8 +421,12 @@ pub struct MetalSubmission {
 }
 
 impl Submission for MetalSubmission {
-    fn wait(self) -> Result<(), BackendError> {
+    fn wait(&self) -> Result<(), BackendError> {
         self.completion.wait(self.timeout)
+    }
+
+    fn gpu_time(&self) -> Option<Duration> {
+        self.completion.gpu_time()
     }
 }
 
@@ -419,11 +466,20 @@ impl MetalBackend {
             self.validate(tensor)?;
         }
         let command_buffer = self.begin_command_buffer()?;
+        let timestamps = self.make_timestamps()?;
+        // SAFETY: The timestamp heap has two entries and is retained until completion.
+        unsafe {
+            command_buffer.writeTimestampIntoHeap_atIndex(&timestamps.heap, 0);
+        }
         let encoded = self.encode_dispatches(&command_buffer, &dispatches, &barriers)?;
         let resources = self.command_resources(&tensors, encoded)?;
         let residency = self.make_resident(&command_buffer, &resources)?;
+        // SAFETY: The timestamp heap has two entries and is retained until completion.
+        unsafe {
+            command_buffer.writeTimestampIntoHeap_atIndex(&timestamps.heap, 1);
+        }
         command_buffer.endCommandBuffer();
-        self.commit(&command_buffer, &tensors, resources, residency)
+        self.commit(&command_buffer, &tensors, resources, residency, timestamps)
     }
 
     fn encode_dispatches(
@@ -1270,6 +1326,31 @@ impl MetalBackend {
         Ok(command_buffer)
     }
 
+    fn make_timestamps(&self) -> Result<GpuTimestamps, BackendError> {
+        let descriptor = MTL4CounterHeapDescriptor::new();
+        descriptor.setType(MTL4CounterHeapType::Timestamp);
+        // SAFETY: Two command-buffer timestamps are written at indices zero and one.
+        unsafe {
+            descriptor.setCount(2);
+        }
+        let heap = self
+            .device
+            .newCounterHeapWithDescriptor_error(&descriptor)
+            .map_err(|_| BackendError::ExecutionFailed)?;
+        let frequency = self.device.queryTimestampFrequency();
+        let entry_size = self
+            .device
+            .sizeOfCounterHeapEntry(MTL4CounterHeapType::Timestamp);
+        if frequency == 0 || entry_size < size_of::<u64>() {
+            return Err(BackendError::ExecutionFailed);
+        }
+        Ok(GpuTimestamps {
+            heap,
+            frequency,
+            entry_size,
+        })
+    }
+
     fn command_resources(
         &self,
         tensors: &[Tensor],
@@ -1345,6 +1426,7 @@ impl MetalBackend {
         event: InFlightEvent,
         resources: CommandResources,
         residency: InFlightResidency,
+        timestamps: GpuTimestamps,
     ) -> Result<Arc<Completion>, BackendError> {
         let mut seen = HashSet::<BufferId>::new();
         let unique = tensors
@@ -1359,7 +1441,7 @@ impl MetalBackend {
             let buffer = buffers.get_mut(tensor)?;
             buffer.wait_pending(self.gpu_timeout)?;
         }
-        let completion = Completion::new(resources, event, residency);
+        let completion = Completion::new(resources, event, residency, Some(timestamps));
         for tensor in unique {
             buffers.get_mut(tensor)?.track(&completion);
         }
@@ -1372,6 +1454,7 @@ impl MetalBackend {
         tensors: &[Tensor],
         resources: CommandResources,
         residency: Retained<ProtocolObject<dyn MTLResidencySet>>,
+        timestamps: GpuTimestamps,
     ) -> Result<MetalSubmission, BackendError> {
         let event = self
             .device
@@ -1382,6 +1465,7 @@ impl MetalBackend {
             InFlightEvent { raw: event.clone() },
             resources,
             InFlightResidency { _raw: residency },
+            timestamps,
         )?;
         self.in_flight.track(&completion, &self.event_listener)?;
         let command_buffer_ref: &ProtocolObject<dyn MTL4CommandBuffer> = command_buffer;
@@ -1570,6 +1654,7 @@ mod tests {
                 InFlightResidency {
                     _raw: residency.clone(),
                 },
+                None,
             );
             completion.finish(Ok(()));
             backend
@@ -1601,6 +1686,31 @@ mod tests {
     fn metal_empty_command_list_completes() {
         let backend = MetalBackend::new().unwrap();
         backend.submit(CommandList::new()).unwrap().wait().unwrap();
+    }
+
+    #[test]
+    fn metal_submission_reports_gpu_time() {
+        let backend = MetalBackend::new().unwrap();
+        let shape = [1024, 4097];
+        let gate = backend.alloc(DType::F32, &shape).unwrap();
+        let up = backend.alloc(DType::F32, &shape).unwrap();
+        let output = backend.alloc(DType::F32, &shape).unwrap();
+        let mut commands = CommandList::new();
+        commands
+            .dispatch(Op::SiluMul, &[&gate, &up], &output)
+            .unwrap();
+
+        let started = Instant::now();
+        let submission = backend.submit(commands).unwrap();
+        submission.wait().unwrap();
+        let wall_time = started.elapsed();
+        let gpu_time = submission.gpu_time().unwrap();
+
+        assert!(gpu_time > Duration::ZERO);
+        assert!(
+            gpu_time <= wall_time,
+            "GPU {gpu_time:?}, wall {wall_time:?}"
+        );
     }
 
     #[test]
@@ -1783,9 +1893,15 @@ mod tests {
             )
             .unwrap();
         let residency = backend.make_resident(&command_buffer, &resources).unwrap();
+        let timestamps = backend.make_timestamps().unwrap();
+        // SAFETY: The heap has two entries and remains live through completion.
+        unsafe {
+            command_buffer.writeTimestampIntoHeap_atIndex(&timestamps.heap, 0);
+            command_buffer.writeTimestampIntoHeap_atIndex(&timestamps.heap, 1);
+        }
         command_buffer.endCommandBuffer();
         backend
-            .commit(&command_buffer, &tensors, resources, residency)
+            .commit(&command_buffer, &tensors, resources, residency, timestamps)
             .unwrap()
             .wait()
             .unwrap();

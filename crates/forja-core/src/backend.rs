@@ -3,6 +3,7 @@ use std::{
     error::Error,
     fmt,
     sync::atomic::{AtomicU64, Ordering},
+    time::Duration,
 };
 
 use crate::{BufferId, CommandList, DType, Slice, Tensor};
@@ -155,7 +156,13 @@ pub trait Submission {
     /// # Errors
     ///
     /// Returns [`BackendError::ExecutionFailed`] if execution failed.
-    fn wait(self) -> Result<(), BackendError>;
+    fn wait(&self) -> Result<(), BackendError>;
+
+    /// Returns elapsed device execution time after a successful wait.
+    ///
+    /// GPU backends return device timestamps. Backends without device timestamps may return the
+    /// wall time spent executing the submission or `None`.
+    fn gpu_time(&self) -> Option<Duration>;
 }
 
 /// Storage and execution implemented by every trusted backend.
