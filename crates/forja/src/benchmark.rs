@@ -558,6 +558,12 @@ fn profile_categories(
         import_category("import.dispatch", steps, |step| step.imports.dispatch),
         import_category("import.submit", steps, |step| step.imports.submit),
         import_category("import.read", steps, |step| step.imports.read),
+        import_category("import.command_list", steps, |step| {
+            step.imports.command_list
+        }),
+        import_category("import.resource_drop", steps, |step| {
+            step.imports.resource_drop
+        }),
         import_category("buffer.output", steps, |step| step.allocations),
         import_category("buffer.release", steps, |step| step.releases),
         submission_category("submit.validation", submissions, |submission| {

@@ -144,6 +144,10 @@ pub struct ImportProfiles {
     pub submit: ImportProfile,
     /// Tensor read calls.
     pub read: ImportProfile,
+    /// Command-list construction calls.
+    pub command_list: ImportProfile,
+    /// Tensor and command-list resource-drop calls.
+    pub resource_drop: ImportProfile,
 }
 
 impl ImportProfiles {
@@ -158,6 +162,8 @@ impl ImportProfiles {
             self.dispatch,
             self.submit,
             self.read,
+            self.command_list,
+            self.resource_drop,
         ]
         .into_iter()
         .fold(Duration::ZERO, |total, profile| total + profile.time)
@@ -192,6 +198,8 @@ enum ImportKind {
     Dispatch,
     Submit,
     Read,
+    CommandList,
+    ResourceDrop,
 }
 
 struct ImportTimer {
@@ -229,6 +237,8 @@ impl Drop for ImportTimer {
             ImportKind::Dispatch => &mut profile.imports.dispatch,
             ImportKind::Submit => &mut profile.imports.submit,
             ImportKind::Read => &mut profile.imports.read,
+            ImportKind::CommandList => &mut profile.imports.command_list,
+            ImportKind::ResourceDrop => &mut profile.imports.resource_drop,
         };
         timing.count = timing.count.saturating_add(1);
         timing.time = timing.time.saturating_add(started.elapsed());
@@ -1549,6 +1559,7 @@ where
         &mut self,
         resource: Resource<TensorEntry>,
     ) -> impl Future<Output = wasmtime::Result<()>> + Send {
+        let _timer = self.import_timer(ImportKind::ResourceDrop);
         std::future::ready(Host::drop_tensor(self, resource).map_err(wasmtime::Error::msg))
     }
 }
@@ -1558,6 +1569,7 @@ where
     B: Backend + Send + Sync + 'static,
 {
     fn new(&mut self) -> impl Future<Output = wasmtime::Result<Resource<CommandListEntry>>> + Send {
+        let _timer = self.import_timer(ImportKind::CommandList);
         std::future::ready(Host::command_list(self).map_err(wasmtime::Error::msg))
     }
 
@@ -1578,6 +1590,7 @@ where
         &mut self,
         resource: Resource<CommandListEntry>,
     ) -> impl Future<Output = wasmtime::Result<()>> + Send {
+        let _timer = self.import_timer(ImportKind::ResourceDrop);
         std::future::ready(
             self.drop_command_list(resource)
                 .map_err(wasmtime::Error::msg),
