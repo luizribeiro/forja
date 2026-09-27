@@ -7,7 +7,11 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+forja-core = { path = "../forja-core" }
 wasmtime.workspace = true
+
+[dev-dependencies]
+forja-cpu = { path = "../forja-cpu" }
 
 [lints]
 workspace = true

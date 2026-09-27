@@ -481,6 +481,8 @@ dependencies = [
 name = "forja-host"
 version = "0.0.0"
 dependencies = [
+ "forja-core",
+ "forja-cpu",
  "wasmtime",
 ]
 
