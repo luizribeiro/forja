@@ -43,6 +43,7 @@ pub struct Limits {
     guest_memory_bytes: usize,
     table_elements: usize,
     instances: usize,
+    dispatches_per_list: usize,
 }
 
 impl Limits {
@@ -64,6 +65,7 @@ impl Limits {
             guest_memory_bytes: 4 * 1024 * 1024 * 1024,
             table_elements: 10_000,
             instances: 10_000,
+            dispatches_per_list: usize::MAX,
         }
     }
 
@@ -283,6 +285,9 @@ impl<B: Backend> Host<B> {
             .collect::<Vec<_>>();
         let operation = core_op(operation);
         let entry = self.table.get(commands).map_err(invalid_handle)?;
+        if entry.commands.len() >= self.limits.dispatches_per_list {
+            return Err(quota("command list dispatch count exceeds the guest limit"));
+        }
         let mut candidate = entry.commands.clone();
         candidate
             .dispatch(operation, &input_tensors, &output_entry.tensor)
@@ -968,6 +973,33 @@ mod tests {
             ),
             Err(compute::Error::InvalidHandle(_))
         ));
+    }
+
+    #[test]
+    fn refuses_dispatches_after_the_command_count_limit() {
+        let mut host = Host::new(CpuBackend::new(), GENEROUS);
+        host.limits.dispatches_per_list = 1;
+        let input = host.alloc(compute::Dtype::F32, &[7]).unwrap();
+        let output = host.alloc(compute::Dtype::F32, &[7]).unwrap();
+        let commands = host.command_list().unwrap();
+
+        host.dispatch(
+            &commands,
+            compute::Op::Copy,
+            &[Resource::new_borrow(input.rep())],
+            &output,
+        )
+        .unwrap();
+        assert!(matches!(
+            host.dispatch(
+                &commands,
+                compute::Op::Copy,
+                &[Resource::new_borrow(input.rep())],
+                &output,
+            ),
+            Err(compute::Error::Quota(_))
+        ));
+        assert_eq!(host.table.get(&commands).unwrap().commands.len(), 1);
     }
 
     #[test]

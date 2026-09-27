@@ -235,6 +235,18 @@ impl CommandList {
         }
     }
 
+    /// Returns the number of recorded dispatches.
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.dispatches.len()
+    }
+
+    /// Reports whether no dispatches have been recorded.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.dispatches.is_empty()
+    }
+
     /// Validates and records a dispatch.
     ///
     /// # Errors
