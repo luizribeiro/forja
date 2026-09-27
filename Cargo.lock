@@ -480,6 +480,9 @@ dependencies = [
 [[package]]
 name = "forja-host"
 version = "0.0.0"
+dependencies = [
+ "wasmtime",
+]
 
 [[package]]
 name = "forja-metal"

@@ -11,6 +11,7 @@ version = "0.0.0"
 
 [workspace.dependencies]
 wasmtime = { version = "49", default-features = false, features = [
+  "component-model-async",
   "component-model",
   "cranelift",
   "runtime",

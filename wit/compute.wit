@@ -1,0 +1,43 @@
+package l9o:gpu@0.1.0;
+
+interface compute {
+  enum dtype {
+    %f32,
+    %f16,
+    %bf16,
+    %i32,
+    %u32,
+  }
+
+  record slice-spec {
+    start: u32,
+    len: u32,
+    step: u32,
+  }
+
+  variant view-op {
+    slice(list<slice-spec>),
+    reshape(list<u32>),
+    permute(list<u8>),
+    broadcast(list<u32>),
+  }
+
+  variant error {
+    layout(string),
+    op-signature(string),
+    quota(string),
+    backend-execution(string),
+    invalid-handle(string),
+  }
+
+  resource tensor {
+    alloc: static func(dt: dtype, shape: list<u32>) -> result<tensor, error>;
+    view: func(operation: view-op) -> result<tensor, error>;
+    write: func(bytes: list<u8>) -> result<_, error>;
+    read: async func() -> result<list<u8>, error>;
+  }
+}
+
+world host {
+  import compute;
+}
