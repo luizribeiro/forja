@@ -51,6 +51,20 @@ struct MatmulLaunch {
     thread_count: usize,
 }
 
+struct PreparedMatmulInput {
+    tensor: EncoderTensor,
+    column_major: u32,
+    leading_dimension: u64,
+    batch_stride: u64,
+    copied: bool,
+}
+
+struct PreparedMatmulOutput {
+    tensor: EncoderTensor,
+    leading_dimension: u64,
+    batch_stride: u64,
+}
+
 struct EncodedDispatches {
     temporaries: Vec<MetalBufferRef>,
     error_flags: Vec<u64>,
@@ -543,49 +557,126 @@ impl MetalBackend {
         dispatch: &Dispatch,
         bindings: &mut ArgumentBindings,
     ) -> Result<Vec<MetalBufferRef>, BackendError> {
-        use objc2_metal::{MTL4ComputeCommandEncoder, MTLSize};
+        use objc2_metal::{MTL4CommandEncoder, MTL4VisibilityOptions, MTLStages};
 
-        let [left, right] = dispatch.inputs() else {
+        let [left_tensor, right_tensor] = dispatch.inputs() else {
             return Err(BackendError::InvalidInput);
         };
-        let output = dispatch.output();
-        let dtype = output.layout().dtype();
-        if left.layout().dtype() != dtype || right.layout().dtype() != dtype {
-            return Err(BackendError::InvalidInput);
+        let output_tensor = dispatch.output();
+        let dtype = output_tensor.layout().dtype();
+        let mut temporaries = Vec::new();
+        let left = self.prepare_matmul_input(
+            encoder,
+            table,
+            left_tensor,
+            dtype,
+            bindings,
+            &mut temporaries,
+        )?;
+        let right = self.prepare_matmul_input(
+            encoder,
+            table,
+            right_tensor,
+            dtype,
+            bindings,
+            &mut temporaries,
+        )?;
+        if left.copied || right.copied {
+            encoder.barrierAfterEncoderStages_beforeEncoderStages_visibilityOptions(
+                MTLStages::Dispatch,
+                MTLStages::Dispatch,
+                MTL4VisibilityOptions::Device,
+            );
         }
-        let (a_column_major, lda, batch_stride_a) = classify(left.layout())
+        let final_output = self.encoder_tensor(output_tensor)?;
+        let direct_output = classify(&final_output.layout)
             .kernel_strides()
-            .ok_or(BackendError::InvalidInput)?;
-        let (b_column_major, ldb, batch_stride_b) = classify(right.layout())
-            .kernel_strides()
-            .ok_or(BackendError::InvalidInput)?;
-        let (output_column_major, ldd, batch_stride_d) = classify(output.layout())
-            .kernel_strides()
-            .ok_or(BackendError::InvalidInput)?;
-        if output_column_major != 0 {
-            return Err(BackendError::InvalidInput);
+            .filter(|&(column_major, _, _)| column_major == 0);
+        let (output, copy_output) =
+            if let Some((_, leading_dimension, batch_stride)) = direct_output {
+                (
+                    PreparedMatmulOutput {
+                        tensor: self.encoder_tensor(output_tensor)?,
+                        leading_dimension,
+                        batch_stride,
+                    },
+                    false,
+                )
+            } else {
+                let scratch = self.scratch_tensor(dtype, output_tensor.layout().shape())?;
+                let (_, leading_dimension, batch_stride) = classify(&scratch.layout)
+                    .kernel_strides()
+                    .ok_or(BackendError::ExecutionFailed)?;
+                temporaries.push(scratch.buffer.clone());
+                (
+                    PreparedMatmulOutput {
+                        tensor: scratch,
+                        leading_dimension,
+                        batch_stride,
+                    },
+                    true,
+                )
+            };
+        let parameter_buffer =
+            self.encode_matmul_kernel(encoder, table, &left, &right, &output, bindings)?;
+        temporaries.push(parameter_buffer);
+        if copy_output {
+            encoder.barrierAfterEncoderStages_beforeEncoderStages_visibilityOptions(
+                MTLStages::Dispatch,
+                MTLStages::Dispatch,
+                MTL4VisibilityOptions::Device,
+            );
+            temporaries.extend(self.encode_copy_tensors(
+                encoder,
+                table,
+                &output.tensor,
+                &final_output,
+                bindings,
+            )?);
         }
-        let shape = left.layout().shape();
+        Ok(temporaries)
+    }
+
+    fn encode_matmul_kernel(
+        &self,
+        encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
+        table: &ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>,
+        left: &PreparedMatmulInput,
+        right: &PreparedMatmulInput,
+        output: &PreparedMatmulOutput,
+        bindings: &mut ArgumentBindings,
+    ) -> Result<MetalBufferRef, BackendError> {
+        use objc2_metal::{MTL4ComputeCommandEncoder, MTLSize};
+
+        let shape = left.tensor.layout.shape();
         let rank = shape.len();
         let rows = shape[rank - 2];
         let inner = shape[rank - 1];
-        let columns = right.layout().shape()[rank - 1];
+        let columns = right.tensor.layout.shape()[rank - 1];
         let batch = if rank == 3 { shape[0] } else { 1 };
+        let dtype = output.tensor.layout.dtype();
         let mut params = Vec::with_capacity(96);
         for value in [
-            left.layout().offset(),
-            right.layout().offset(),
-            output.layout().offset(),
-            lda,
-            ldb,
-            ldd,
-            batch_stride_a,
-            batch_stride_b,
-            batch_stride_d,
+            left.tensor.layout.offset(),
+            right.tensor.layout.offset(),
+            output.tensor.layout.offset(),
+            left.leading_dimension,
+            right.leading_dimension,
+            output.leading_dimension,
+            left.batch_stride,
+            right.batch_stride,
+            output.batch_stride,
         ] {
             params.extend_from_slice(&value.to_ne_bytes());
         }
-        for value in [rows, columns, inner, a_column_major, b_column_major, 0] {
+        for value in [
+            rows,
+            columns,
+            inner,
+            left.column_major,
+            right.column_major,
+            0,
+        ] {
             params.extend_from_slice(&value.to_ne_bytes());
         }
         let parameter_buffer = self.temporary_buffer(&params)?;
@@ -595,16 +686,13 @@ impl MetalBackend {
             rows,
             columns,
             inner,
-            left_column_major: a_column_major != 0,
-            right_column_major: b_column_major != 0,
+            left_column_major: left.column_major != 0,
+            right_column_major: right.column_major != 0,
         })?;
         encoder.setComputePipelineState(&launch.pipeline);
-        let left = self.encoder_tensor(left)?;
-        let right = self.encoder_tensor(right)?;
-        let output = self.encoder_tensor(output)?;
-        bindings.bind(table, 0, &left.buffer);
-        bindings.bind(table, 1, &right.buffer);
-        bindings.bind(table, 2, &output.buffer);
+        bindings.bind(table, 0, &left.tensor.buffer);
+        bindings.bind(table, 1, &right.tensor.buffer);
+        bindings.bind(table, 2, &output.tensor.buffer);
         bindings.bind(table, 3, &parameter_buffer);
         encoder.setArgumentTable(Some(table));
         encoder.dispatchThreadgroups_threadsPerThreadgroup(
@@ -621,7 +709,44 @@ impl MetalBackend {
                 depth: 1,
             },
         );
-        Ok(vec![parameter_buffer])
+        Ok(parameter_buffer)
+    }
+
+    fn prepare_matmul_input(
+        &self,
+        encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
+        table: &ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>,
+        tensor: &Tensor,
+        dtype: DType,
+        bindings: &mut ArgumentBindings,
+        temporaries: &mut Vec<MetalBufferRef>,
+    ) -> Result<PreparedMatmulInput, BackendError> {
+        let source = self.encoder_tensor(tensor)?;
+        if source.layout.dtype() == dtype
+            && let Some((column_major, leading_dimension, batch_stride)) =
+                classify(&source.layout).kernel_strides()
+        {
+            return Ok(PreparedMatmulInput {
+                tensor: source,
+                column_major,
+                leading_dimension,
+                batch_stride,
+                copied: false,
+            });
+        }
+        let scratch = self.scratch_tensor(dtype, source.layout.shape())?;
+        temporaries.push(scratch.buffer.clone());
+        temporaries.extend(self.encode_copy_tensors(encoder, table, &source, &scratch, bindings)?);
+        let (column_major, leading_dimension, batch_stride) = classify(&scratch.layout)
+            .kernel_strides()
+            .ok_or(BackendError::ExecutionFailed)?;
+        Ok(PreparedMatmulInput {
+            tensor: scratch,
+            column_major,
+            leading_dimension,
+            batch_stride,
+            copied: true,
+        })
     }
 
     fn matmul_launch(&self, shape: MatmulShape) -> Result<MatmulLaunch, BackendError> {
@@ -747,7 +872,6 @@ impl MetalBackend {
         })
     }
 
-    #[allow(dead_code)]
     fn scratch_tensor(&self, dtype: DType, shape: &[u32]) -> Result<EncoderTensor, BackendError> {
         use objc2_metal::MTLResourceOptions;
 
@@ -1738,6 +1862,32 @@ mod tests {
                 &TensorSpec::contiguous(DType::BF16, &[1, columns]),
             );
         }
+    }
+
+    #[test]
+    fn metal_matmul_copies_irregular_operands_through_scratch() {
+        assert_matmul(
+            TensorSpec::sliced(
+                DType::F32,
+                &[7, 66],
+                &[Slice::new(0, 7, 1).unwrap(), Slice::new(0, 33, 2).unwrap()],
+            ),
+            TensorSpec::permuted(DType::F32, &[17, 33], &[1, 0]),
+            &TensorSpec::sliced(
+                DType::F32,
+                &[7, 34],
+                &[Slice::new(0, 7, 1).unwrap(), Slice::new(0, 17, 2).unwrap()],
+            ),
+        );
+    }
+
+    #[test]
+    fn metal_matmul_casts_inputs_to_the_output_dtype() {
+        assert_matmul(
+            TensorSpec::contiguous(DType::F16, &[7, 33]),
+            TensorSpec::permuted(DType::BF16, &[17, 33], &[1, 0]),
+            &TensorSpec::contiguous(DType::F32, &[7, 17]),
+        );
     }
 
     #[test]
