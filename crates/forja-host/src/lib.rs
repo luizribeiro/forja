@@ -20,7 +20,7 @@ use std::{
 
 use forja_core::{
     Backend, BackendError, CommandList, DType, Layout, LayoutError, Op, OpError, Slice, Submission,
-    Tensor, ViewOp,
+    SubmissionProfile, Tensor, ViewOp,
 };
 use wasmtime::component::{Accessor, Component, HasData, Linker, Resource, ResourceTable};
 use wasmtime::{Config, Engine, Store, StoreLimits, StoreLimitsBuilder, Trap};
@@ -114,6 +114,73 @@ pub struct EngineMetrics {
     pub gpu_time: Duration,
 }
 
+/// Count and wall time for calls to one guest import.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ImportProfile {
+    /// Number of calls.
+    pub count: u64,
+    /// Total host wall time in the calls.
+    pub time: Duration,
+}
+
+/// Guest-import timings collected during one engine step.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ImportProfiles {
+    /// Tensor allocation calls.
+    pub alloc: ImportProfile,
+    /// Slice-view calls.
+    pub view_slice: ImportProfile,
+    /// Reshape-view calls.
+    pub view_reshape: ImportProfile,
+    /// Permute-view calls.
+    pub view_permute: ImportProfile,
+    /// Broadcast-view calls.
+    pub view_broadcast: ImportProfile,
+    /// Tensor write calls.
+    pub write: ImportProfile,
+    /// Dispatch-recording calls.
+    pub dispatch: ImportProfile,
+    /// Submission calls.
+    pub submit: ImportProfile,
+    /// Tensor read calls.
+    pub read: ImportProfile,
+}
+
+impl ImportProfiles {
+    fn total_time(&self) -> Duration {
+        [
+            self.alloc,
+            self.view_slice,
+            self.view_reshape,
+            self.view_permute,
+            self.view_broadcast,
+            self.write,
+            self.dispatch,
+            self.submit,
+            self.read,
+        ]
+        .into_iter()
+        .fold(Duration::ZERO, |total, profile| total + profile.time)
+    }
+}
+
+/// Timing detail for one engine step.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct EngineStepProfile {
+    /// Complete host wall time for the step.
+    pub wall_time: Duration,
+    /// Step wall time outside the measured imports.
+    pub guest_time: Duration,
+    /// Guest-import counts and timings.
+    pub imports: ImportProfiles,
+    /// Backend output-buffer allocations.
+    pub allocations: ImportProfile,
+    /// Backend buffer releases.
+    pub releases: ImportProfile,
+    /// Detailed timing for the step's submission.
+    pub submission: Option<SubmissionProfile>,
+}
+
 /// An instantiated engine component and its host resources.
 pub struct EngineRunner<B: Backend + Send + Sync + 'static> {
     store: Store<Host<B>>,
@@ -121,6 +188,8 @@ pub struct EngineRunner<B: Backend + Send + Sync + 'static> {
     id: u64,
     info: Option<EngineInfo>,
     output_handles: Vec<u32>,
+    profiling: bool,
+    last_profile: Option<EngineStepProfile>,
 }
 
 const EPOCH_TICK: Duration = Duration::from_millis(10);
@@ -213,6 +282,8 @@ where
             id,
             info: None,
             output_handles: Vec::new(),
+            profiling: false,
+            last_profile: None,
         })
     }
 
@@ -267,6 +338,20 @@ where
     ///
     /// Returns a component execution error or the engine's structured failure.
     pub async fn step(
+        &mut self,
+        input: EngineStep,
+    ) -> wasmtime::Result<Result<EngineOutput, compute::Error>> {
+        if !self.profiling {
+            return self.step_inner(input).await;
+        }
+        self.store.data_mut().begin_profile_step();
+        let started = Instant::now();
+        let result = self.step_inner(input).await;
+        self.last_profile = self.store.data_mut().finish_profile_step(started.elapsed());
+        result
+    }
+
+    async fn step_inner(
         &mut self,
         input: EngineStep,
     ) -> wasmtime::Result<Result<EngineOutput, compute::Error>> {
@@ -350,6 +435,16 @@ where
     #[must_use]
     pub fn metrics(&self) -> EngineMetrics {
         self.store.data().engine_metrics()
+    }
+
+    /// Enables detailed profiling for subsequent steps.
+    pub fn enable_profiling(&mut self) {
+        self.profiling = true;
+    }
+
+    /// Takes the most recently completed step profile.
+    pub fn take_profile(&mut self) -> Option<EngineStepProfile> {
+        self.last_profile.take()
     }
 
     fn set_guest_deadline(&mut self) {
@@ -610,6 +705,7 @@ pub struct Host<B: Backend> {
     completed_submissions: Arc<AtomicU64>,
     timed_submissions: Arc<AtomicU64>,
     completed_gpu_time_ns: Arc<AtomicU64>,
+    active_profile: Option<Arc<Mutex<EngineStepProfile>>>,
     epoch_registration: Option<Arc<()>>,
 }
 
@@ -638,6 +734,7 @@ impl<B: Backend> Host<B> {
             completed_submissions: Arc::new(AtomicU64::new(0)),
             timed_submissions: Arc::new(AtomicU64::new(0)),
             completed_gpu_time_ns: Arc::new(AtomicU64::new(0)),
+            active_profile: None,
             epoch_registration: None,
         }
     }
@@ -685,6 +782,18 @@ impl<B: Backend> Host<B> {
             timed_submissions: self.timed_submissions.load(Ordering::Acquire),
             gpu_time: Duration::from_nanos(self.completed_gpu_time_ns.load(Ordering::Acquire)),
         }
+    }
+
+    fn begin_profile_step(&mut self) {
+        self.active_profile = Some(Arc::new(Mutex::new(EngineStepProfile::default())));
+    }
+
+    fn finish_profile_step(&mut self, wall_time: Duration) -> Option<EngineStepProfile> {
+        let profile = self.active_profile.take()?;
+        let mut profile = profile.lock().ok()?.clone();
+        profile.wall_time = wall_time;
+        profile.guest_time = wall_time.saturating_sub(profile.imports.total_time());
+        Some(profile)
     }
 
     /// Allocates a contiguous tensor after enforcing all guest quotas.
