@@ -238,13 +238,13 @@ where
             .data_mut()
             .open_weights("engine")
             .map_err(wasmtime::Error::msg)?;
+        let engine = self.instance.l9o_gpu_engine();
         match self
-            .instance
-            .l9o_gpu_engine()
-            .call_load(&mut self.store, weights)
+            .store
+            .run_concurrent(async move |accessor| engine.call_load(accessor, weights).await)
             .await
         {
-            Ok(result) => Ok(result),
+            Ok(result) => result,
             Err(error) if is_epoch_timeout(&error) => Ok(Err(guest_timeout())),
             Err(error) => Err(error),
         }
@@ -272,20 +272,24 @@ where
         };
         let taps_requested = input.taps;
         self.set_guest_deadline();
+        let engine = self.instance.l9o_gpu_engine();
         let output = match self
-            .instance
-            .l9o_gpu_engine()
-            .call_step(
-                &mut self.store,
-                &StepIn {
-                    tokens: input.tokens,
-                    start_pos: input.start_pos,
-                    taps: input.taps,
-                },
-            )
+            .store
+            .run_concurrent(async move |accessor| {
+                engine
+                    .call_step(
+                        accessor,
+                        StepIn {
+                            tokens: input.tokens,
+                            start_pos: input.start_pos,
+                            taps: input.taps,
+                        },
+                    )
+                    .await
+            })
             .await
         {
-            Ok(output) => output,
+            Ok(output) => output?,
             Err(error) if is_epoch_timeout(&error) => return Ok(Err(guest_timeout())),
             Err(error) => return Err(error),
         }?;

@@ -19,11 +19,11 @@ impl Guest for Component {
         }
     }
 
-    fn load(_weights: &Weights) -> Result<(), Error> {
+    async fn load(_weights: &Weights) -> Result<(), Error> {
         Ok(())
     }
 
-    fn step(input: StepIn) -> Result<StepOut, Error> {
+    async fn step(input: StepIn) -> Result<StepOut, Error> {
         let mode = input.tokens.first().copied().unwrap_or_default();
         if mode == u32::MAX {
             loop {

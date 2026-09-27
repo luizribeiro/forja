@@ -21,8 +21,8 @@ interface engine {
   }
 
   describe: func() -> engine-info;
-  load: func(w: borrow<weights>) -> result<_, error>;
-  step: func(input: step-in) -> result<step-out, error>;
+  load: async func(w: borrow<weights>) -> result<_, error>;
+  step: async func(input: step-in) -> result<step-out, error>;
 }
 
 // This initial contract uses one sequence and engine-owned cache tensors.
