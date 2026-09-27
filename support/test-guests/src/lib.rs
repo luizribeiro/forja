@@ -57,6 +57,12 @@ pub fn qwen3() -> &'static Path {
     Path::new(env!("QWEN3_COMPONENT"))
 }
 
+/// Returns the path to the bf16 Qwen3-0.6B engine component.
+#[must_use]
+pub fn qwen3_bf16() -> &'static Path {
+    Path::new(env!("QWEN3_BF16_COMPONENT"))
+}
+
 /// Returns the path to the guest that consumes host-granted weights.
 #[must_use]
 pub fn weights_smoke() -> &'static Path {

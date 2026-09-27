@@ -13,8 +13,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let out_dir = PathBuf::from(required_var("OUT_DIR")?);
     let main_target_dir = main_target_dir(&repository, &out_dir)?;
     let guest_target_dir = main_target_dir.join("guest-build");
+    let bf16_target_dir = main_target_dir.join("guest-build-bf16");
 
-    build_guest_workspace(&guest_manifest, &guest_target_dir)?;
+    build_guest_workspace(&guest_manifest, &guest_target_dir, &[])?;
+    build_guest_workspace(
+        &guest_manifest,
+        &bf16_target_dir,
+        &["-p", "qwen3", "--features", "bf16"],
+    )?;
 
     let release_dir = guest_target_dir.join("wasm32-wasip2/release");
     emit_guest_path("HELLO_COMPONENT", &release_dir.join("hello.wasm"));
@@ -41,6 +47,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     emit_guest_path("TOY_MLP_COMPONENT", &release_dir.join("toy_mlp.wasm"));
     emit_guest_path("QWEN3_COMPONENT", &release_dir.join("qwen3.wasm"));
+    emit_guest_path(
+        "QWEN3_BF16_COMPONENT",
+        &bf16_target_dir.join("wasm32-wasip2/release/qwen3.wasm"),
+    );
     emit_guest_path(
         "WEIGHTS_SMOKE_COMPONENT",
         &release_dir.join("weights_smoke.wasm"),
@@ -97,7 +107,7 @@ fn main_target_dir(repository: &Path, out_dir: &Path) -> io::Result<PathBuf> {
     })
 }
 
-fn build_guest_workspace(manifest: &Path, target_dir: &Path) -> io::Result<()> {
+fn build_guest_workspace(manifest: &Path, target_dir: &Path, args: &[&str]) -> io::Result<()> {
     let cargo = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let mut command = Command::new(cargo);
     command.args([
@@ -111,6 +121,7 @@ fn build_guest_workspace(manifest: &Path, target_dir: &Path) -> io::Result<()> {
         target_dir.as_os_str(),
         OsStr::new("--locked"),
     ]);
+    command.args(args);
     for (key, _) in env::vars_os() {
         if key.to_string_lossy().starts_with("CARGO_") || key == "RUSTFLAGS" {
             command.env_remove(key);

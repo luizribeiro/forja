@@ -16,14 +16,35 @@ pub(crate) async fn run(options: &Verify) -> Result<(), Box<dyn Error>> {
 async fn run_with_steps(options: &Verify, decode_steps: usize) -> Result<(), Box<dyn Error>> {
     let fixtures = FixtureDirectory::open(&options.fixtures)?;
     let weights = verify_model_hash(options, &fixtures)?;
+    run_with_component(
+        options,
+        &fixtures,
+        &weights,
+        test_guests::qwen3(),
+        decode_steps,
+        true,
+    )
+    .await
+}
+
+async fn run_with_component(
+    options: &Verify,
+    fixtures: &FixtureDirectory,
+    weights: &Path,
+    component: &Path,
+    decode_steps: usize,
+    enforce_tolerances: bool,
+) -> Result<(), Box<dyn Error>> {
     match options.backend {
         BackendArg::Cpu => {
             verify(
                 forja_cpu::CpuBackend::new(),
                 options,
-                &fixtures,
-                &weights,
+                fixtures,
+                weights,
+                component,
                 decode_steps,
+                enforce_tolerances,
             )
             .await
         }
@@ -32,7 +53,16 @@ async fn run_with_steps(options: &Verify, decode_steps: usize) -> Result<(), Box
             {
                 let backend = forja_metal::MetalBackend::new()
                     .map_err(|error| format!("cannot create Metal backend: {error}"))?;
-                verify(backend, options, &fixtures, &weights, decode_steps).await
+                verify(
+                    backend,
+                    options,
+                    fixtures,
+                    weights,
+                    component,
+                    decode_steps,
+                    enforce_tolerances,
+                )
+                .await
             }
             #[cfg(not(target_os = "macos"))]
             Err("the Metal backend requires macOS".into())
@@ -45,12 +75,14 @@ async fn verify<B>(
     options: &Verify,
     fixtures: &FixtureDirectory,
     weights: &Path,
+    component: &Path,
     decode_steps: usize,
+    enforce_tolerances: bool,
 ) -> Result<(), Box<dyn Error>>
 where
     B: Backend + Send + Sync + 'static,
 {
-    let mut runner = EngineRunner::new(test_guests::qwen3(), backend, limits(), weights).await?;
+    let mut runner = EngineRunner::new(component, backend, limits(), weights).await?;
     let info = runner.describe().await?;
     if info.vocab != 151_936
         || info.max_context != 4_096
@@ -126,7 +158,7 @@ where
             if prompt_passed { "pass" } else { "FAIL" }
         );
     }
-    if passed {
+    if passed || !enforce_tolerances {
         Ok(())
     } else {
         Err("verification failed".into())
@@ -268,6 +300,31 @@ mod tests {
     #[ignore = "requires FORJA_MODELS and runs in the pre-push hook"]
     fn metal_qwen_verification() -> Result<(), Box<dyn Error>> {
         run_model_test(BackendArg::Metal, Vec::new(), 32)
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires FORJA_MODELS and runs in the pre-push hook"]
+    fn metal_bf16_qwen_measurement() -> Result<(), Box<dyn Error>> {
+        let root = PathBuf::from(env::var_os("FORJA_MODELS").ok_or("FORJA_MODELS is not set")?);
+        let options = Verify {
+            model_dir: root.join("Qwen3-0.6B"),
+            fixtures: root.join("golden/qwen3-0.6b"),
+            backend: BackendArg::Metal,
+            prompts: vec!["short-english".to_owned()],
+        };
+        let fixtures = FixtureDirectory::open(&options.fixtures)?;
+        let weights = verify_model_hash(&options, &fixtures)?;
+        tokio::runtime::Builder::new_current_thread()
+            .build()?
+            .block_on(run_with_component(
+                &options,
+                &fixtures,
+                &weights,
+                test_guests::qwen3_bf16(),
+                32,
+                false,
+            ))
     }
 
     #[test]

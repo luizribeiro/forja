@@ -1,8 +1,11 @@
 //! Qwen3-0.6B inference engine.
 
 use forja_sdk::{
-    Engine, EngineInfo, Load, Result, StepInput, StepOutput, Tensor, Weights, export_engine,
-    nn::{Embedding, EmbeddingConfig, Linear, LinearConfig, RmsNorm, RmsNormConfig, ops::sdpa},
+    Engine, EngineInfo, Load, Result, StepInput, StepOutput, Tensor, Weights, bf16, export_engine,
+    nn::{
+        Embedding, EmbeddingConfig, Linear, LinearConfig, RmsNorm, RmsNormConfig, WeightElement,
+        ops::sdpa,
+    },
 };
 
 /// Vocabulary size reported by Qwen3-0.6B.
@@ -25,78 +28,136 @@ const ATTENTION_SCALE: f32 = 0.088_388_35;
 #[derive(Clone, Copy)]
 struct Config;
 
-#[derive(Load)]
-#[load(config = Config)]
-struct Attention {
-    #[load(prefix, config = LinearConfig::promoted_bf16(HIDDEN, QUERY_HEADS * HEAD_DIM))]
-    q_proj: Linear<f32>,
-    #[load(prefix, config = LinearConfig::promoted_bf16(HIDDEN, KEY_VALUE_HEADS * HEAD_DIM))]
-    k_proj: Linear<f32>,
-    #[load(prefix, config = LinearConfig::promoted_bf16(HIDDEN, KEY_VALUE_HEADS * HEAD_DIM))]
-    v_proj: Linear<f32>,
-    #[load(prefix, config = LinearConfig::promoted_bf16(QUERY_HEADS * HEAD_DIM, HIDDEN))]
-    o_proj: Linear<f32>,
-    #[load(prefix, config = RmsNormConfig::promoted_bf16(HEAD_DIM, RMS_EPSILON))]
-    q_norm: RmsNorm<f32>,
-    #[load(prefix, config = RmsNormConfig::promoted_bf16(HEAD_DIM, RMS_EPSILON))]
-    k_norm: RmsNorm<f32>,
+/// Activation precision supported by the Qwen3 engine.
+pub trait Activation: WeightElement {
+    /// Additive identity used to initialize the KV cache.
+    const ZERO: Self;
+
+    /// Selects the model's bf16 storage representation.
+    fn linear_config(input: u32, output: u32) -> LinearConfig;
+
+    /// Selects the model's bf16 storage representation.
+    fn norm_config(hidden: u32, epsilon: f32) -> RmsNormConfig;
+
+    /// Selects the model's bf16 storage representation.
+    fn embedding_config(vocab: u32, hidden: u32) -> EmbeddingConfig;
+
+    /// Converts an engine result to the component's f32 output type.
+    fn output(tensor: Tensor<Self>) -> Result<Tensor<f32>>;
+}
+
+impl Activation for f32 {
+    const ZERO: Self = 0.0;
+
+    fn linear_config(input: u32, output: u32) -> LinearConfig {
+        LinearConfig::promoted_bf16(input, output)
+    }
+
+    fn norm_config(hidden: u32, epsilon: f32) -> RmsNormConfig {
+        RmsNormConfig::promoted_bf16(hidden, epsilon)
+    }
+
+    fn embedding_config(vocab: u32, hidden: u32) -> EmbeddingConfig {
+        EmbeddingConfig::promoted_bf16(vocab, hidden)
+    }
+
+    fn output(tensor: Tensor<Self>) -> Result<Tensor<f32>> {
+        Ok(tensor)
+    }
+}
+
+impl Activation for bf16 {
+    const ZERO: Self = bf16::ZERO;
+
+    fn linear_config(input: u32, output: u32) -> LinearConfig {
+        LinearConfig::new(input, output)
+    }
+
+    fn norm_config(hidden: u32, epsilon: f32) -> RmsNormConfig {
+        RmsNormConfig::new(hidden, epsilon)
+    }
+
+    fn embedding_config(vocab: u32, hidden: u32) -> EmbeddingConfig {
+        EmbeddingConfig::new(vocab, hidden)
+    }
+
+    fn output(tensor: Tensor<Self>) -> Result<Tensor<f32>> {
+        tensor.to_dtype()
+    }
 }
 
 #[derive(Load)]
 #[load(config = Config)]
-struct Mlp {
-    #[load(prefix, config = LinearConfig::promoted_bf16(HIDDEN, INTERMEDIATE))]
-    gate_proj: Linear<f32>,
-    #[load(prefix, config = LinearConfig::promoted_bf16(HIDDEN, INTERMEDIATE))]
-    up_proj: Linear<f32>,
-    #[load(prefix, config = LinearConfig::promoted_bf16(INTERMEDIATE, HIDDEN))]
-    down_proj: Linear<f32>,
+struct Attention<T: Activation> {
+    #[load(prefix, config = T::linear_config(HIDDEN, QUERY_HEADS * HEAD_DIM))]
+    q_proj: Linear<T>,
+    #[load(prefix, config = T::linear_config(HIDDEN, KEY_VALUE_HEADS * HEAD_DIM))]
+    k_proj: Linear<T>,
+    #[load(prefix, config = T::linear_config(HIDDEN, KEY_VALUE_HEADS * HEAD_DIM))]
+    v_proj: Linear<T>,
+    #[load(prefix, config = T::linear_config(QUERY_HEADS * HEAD_DIM, HIDDEN))]
+    o_proj: Linear<T>,
+    #[load(prefix, config = T::norm_config(HEAD_DIM, RMS_EPSILON))]
+    q_norm: RmsNorm<T>,
+    #[load(prefix, config = T::norm_config(HEAD_DIM, RMS_EPSILON))]
+    k_norm: RmsNorm<T>,
 }
 
 #[derive(Load)]
 #[load(config = Config)]
-struct DecoderLayer {
-    #[load(prefix, config = RmsNormConfig::promoted_bf16(HIDDEN, RMS_EPSILON))]
-    input_layernorm: RmsNorm<f32>,
+struct Mlp<T: Activation> {
+    #[load(prefix, config = T::linear_config(HIDDEN, INTERMEDIATE))]
+    gate_proj: Linear<T>,
+    #[load(prefix, config = T::linear_config(HIDDEN, INTERMEDIATE))]
+    up_proj: Linear<T>,
+    #[load(prefix, config = T::linear_config(INTERMEDIATE, HIDDEN))]
+    down_proj: Linear<T>,
+}
+
+#[derive(Load)]
+#[load(config = Config)]
+struct DecoderLayer<T: Activation> {
+    #[load(prefix, config = T::norm_config(HIDDEN, RMS_EPSILON))]
+    input_layernorm: RmsNorm<T>,
     #[load(prefix)]
-    self_attn: Attention,
-    #[load(prefix, config = RmsNormConfig::promoted_bf16(HIDDEN, RMS_EPSILON))]
-    post_attention_layernorm: RmsNorm<f32>,
+    self_attn: Attention<T>,
+    #[load(prefix, config = T::norm_config(HIDDEN, RMS_EPSILON))]
+    post_attention_layernorm: RmsNorm<T>,
     #[load(prefix)]
-    mlp: Mlp,
+    mlp: Mlp<T>,
 }
 
 #[derive(Load)]
 #[load(config = Config)]
-struct Model {
-    #[load(prefix, config = EmbeddingConfig::promoted_bf16(VOCAB, HIDDEN))]
-    embed_tokens: Embedding<f32>,
+struct Model<T: Activation> {
+    #[load(prefix, config = T::embedding_config(VOCAB, HIDDEN))]
+    embed_tokens: Embedding<T>,
     #[load(prefix, count = LAYERS)]
-    layers: Vec<DecoderLayer>,
-    #[load(prefix, config = RmsNormConfig::promoted_bf16(HIDDEN, RMS_EPSILON))]
-    norm: RmsNorm<f32>,
+    layers: Vec<DecoderLayer<T>>,
+    #[load(prefix, config = T::norm_config(HIDDEN, RMS_EPSILON))]
+    norm: RmsNorm<T>,
 }
 
 #[derive(Load)]
 #[load(config = Config)]
-struct QwenWeights {
+struct QwenWeights<T: Activation> {
     #[load(prefix)]
-    model: Model,
+    model: Model<T>,
 }
 
-struct LayerCache {
-    key: Tensor<f32>,
-    value: Tensor<f32>,
+struct LayerCache<T: Activation> {
+    key: Tensor<T>,
+    value: Tensor<T>,
 }
 
-impl LayerCache {
+impl<T: Activation> LayerCache<T> {
     fn new() -> Result<Self> {
         let shape = [KEY_VALUE_HEADS, MAX_CONTEXT, HEAD_DIM];
         let count = usize::try_from(
             u64::from(KEY_VALUE_HEADS) * u64::from(MAX_CONTEXT) * u64::from(HEAD_DIM),
         )
         .map_err(|_| forja_sdk::Error::loading("KV cache size does not fit usize"))?;
-        let zeros = vec![0.0_f32; count];
+        let zeros = vec![T::ZERO; count];
         Ok(Self {
             key: Tensor::from_slice(&zeros, &shape)?,
             value: Tensor::from_slice(&zeros, &shape)?,
@@ -104,15 +165,15 @@ impl LayerCache {
     }
 }
 
-impl DecoderLayer {
+impl<T: Activation> DecoderLayer<T> {
     fn forward(
         &self,
-        input: &Tensor<f32>,
+        input: &Tensor<T>,
         positions: &Tensor<u32>,
         start_pos: u32,
         end_pos: u32,
-        cache: &mut LayerCache,
-    ) -> Result<Tensor<f32>> {
+        cache: &mut LayerCache<T>,
+    ) -> Result<Tensor<T>> {
         let sequence = end_pos - start_pos;
         let normalized = self.input_layernorm.forward(input)?;
         let query = self
@@ -165,24 +226,28 @@ impl DecoderLayer {
 }
 
 /// Qwen3-0.6B with a fixed 4096-token KV cache.
-pub struct Qwen3 {
-    weights: QwenWeights,
-    caches: Vec<LayerCache>,
+pub struct Qwen3<T: Activation = f32> {
+    weights: QwenWeights<T>,
+    caches: Vec<LayerCache<T>>,
 }
 
-impl Qwen3 {
+impl<T: Activation> Qwen3<T> {
+    fn output(tensor: Tensor<T>) -> Result<Tensor<f32>> {
+        T::output(tensor)
+    }
+
     /// Runs the embedding and first decoder layer for native differential checks.
     ///
     /// # Errors
     ///
     /// Returns an error for invalid token or operation inputs, or failed execution.
-    pub fn first_layer(&mut self, tokens: &Tensor<u32>) -> Result<Tensor<f32>> {
+    pub fn first_layer(&mut self, tokens: &Tensor<u32>) -> Result<Tensor<T>> {
         let sequence = tokens
             .shape()
             .first()
             .copied()
             .ok_or_else(|| forja_sdk::Error::loading("tokens must have rank one"))?;
-        let positions = Tensor::from_slice(&(0..sequence).collect::<Vec<_>>(), &[sequence])?;
+        let positions = positions(0, sequence)?;
         let hidden = self.weights.model.embed_tokens.forward(tokens)?;
         self.weights.model.layers[0]
             .forward(&hidden, &positions, 0, sequence, &mut self.caches[0])?
@@ -190,8 +255,13 @@ impl Qwen3 {
     }
 }
 
+#[cfg(all(target_family = "wasm", feature = "bf16"))]
+type ExportedQwen3 = Qwen3<bf16>;
+#[cfg(not(all(target_family = "wasm", feature = "bf16")))]
+type ExportedQwen3 = Qwen3<f32>;
+
 #[export_engine]
-impl Engine for Qwen3 {
+impl Engine for ExportedQwen3 {
     /// Tap `i` is decoder layer `i`; tap 28 includes the final model norm.
     fn describe() -> EngineInfo {
         EngineInfo {
@@ -202,7 +272,7 @@ impl Engine for Qwen3 {
     }
 
     fn load(weights: &Weights<'_>) -> Result<Self> {
-        let weights = QwenWeights::load(weights, &Config)?;
+        let weights = QwenWeights::<_>::load(weights, &Config)?;
         let caches = (0..LAYERS)
             .map(|_| LayerCache::new())
             .collect::<Result<Vec<_>>>()?;
@@ -223,8 +293,7 @@ impl Engine for Qwen3 {
             .checked_add(sequence)
             .filter(|&end| end <= MAX_CONTEXT)
             .ok_or_else(|| forja_sdk::Error::loading("tokens exceed the 4096-token context"))?;
-        let positions =
-            Tensor::from_slice(&(input.start_pos..end_pos).collect::<Vec<_>>(), &[sequence])?;
+        let positions = positions(input.start_pos, end_pos)?;
         let mut hidden = self.weights.model.embed_tokens.forward(&input.tokens)?;
         let mut taps = Vec::with_capacity(if input.taps { LAYERS } else { 0 });
         for (index, (layer, cache)) in self
@@ -237,21 +306,26 @@ impl Engine for Qwen3 {
         {
             hidden = layer.forward(&hidden, &positions, input.start_pos, end_pos, cache)?;
             if input.taps && index + 1 < LAYERS {
-                taps.push(hidden.contiguous()?);
+                taps.push(Self::output(hidden.contiguous()?)?);
             }
         }
         hidden = self.weights.model.norm.forward(&hidden)?;
         if input.taps {
-            taps.push(hidden.contiguous()?);
+            taps.push(Self::output(hidden.contiguous()?)?);
         }
-        let logits = self
-            .weights
-            .model
-            .embed_tokens
-            .project(&hidden)?
-            .narrow(0, last, 1)?
-            .reshape(&[VOCAB])?
-            .contiguous()?;
+        let logits = Self::output(
+            self.weights
+                .model
+                .embed_tokens
+                .project(&hidden)?
+                .narrow(0, last, 1)?
+                .reshape(&[VOCAB])?
+                .contiguous()?,
+        )?;
         Ok(StepOutput { logits, taps })
     }
+}
+
+fn positions(start: u32, end: u32) -> Result<Tensor<u32>> {
+    Tensor::from_slice(&(start..end).collect::<Vec<_>>(), &[end - start])
 }
