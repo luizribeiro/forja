@@ -1,4 +1,10 @@
-#![allow(dead_code, reason = "the binding boundary precedes its tensor facade")]
+#![cfg_attr(
+    not(target_family = "wasm"),
+    allow(
+        dead_code,
+        reason = "view payloads are consumed by the guest or native backend"
+    )
+)]
 
 use crate::{Error, Result};
 
