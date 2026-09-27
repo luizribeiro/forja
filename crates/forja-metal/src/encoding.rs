@@ -30,6 +30,8 @@ use crate::{
 type MetalBufferRef = Retained<ProtocolObject<dyn MTLBuffer>>;
 type EncodedEmbed = (Vec<MetalBufferRef>, u64);
 
+const VECTOR_SINGLE_PASS_MAX_KEY_LENGTH: u32 = 1023;
+
 #[derive(Clone)]
 struct EncoderTensor {
     buffer: MetalBufferRef,
@@ -975,7 +977,113 @@ impl MetalBackend {
         else {
             return Err(BackendError::InvalidInput);
         };
+        if vector_sdpa_supported(dispatch)? {
+            return self
+                .encode_vector_sdpa(encoder, table, dispatch, scale, causal, q_start, bindings);
+        }
         self.encode_decomposed_sdpa(encoder, table, dispatch, scale, causal, q_start, bindings)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn encode_vector_sdpa(
+        &self,
+        encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
+        table: &ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>,
+        dispatch: &Dispatch,
+        scale: f32,
+        causal: bool,
+        q_start: u32,
+        bindings: &mut ArgumentBindings,
+    ) -> Result<Vec<MetalBufferRef>, BackendError> {
+        use objc2_metal::{MTL4ComputeCommandEncoder, MTLSize};
+
+        let [query_tensor, key_tensor, value_tensor] = dispatch.inputs() else {
+            return Err(BackendError::InvalidInput);
+        };
+        let query = self.encoder_tensor(query_tensor)?;
+        let key = self.encoder_tensor(key_tensor)?;
+        let value = self.encoder_tensor(value_tensor)?;
+        let output = self.encoder_tensor(dispatch.output())?;
+        let [query_heads, query_length, width] = shape3(&query.layout)?;
+        let params = self.sdpa_params(&query, &key, &value, &output, scale, causal, q_start, 1)?;
+        let constants = [
+            (0, dtype_code(query.layout.dtype())),
+            (1, dtype_code(key.layout.dtype())),
+            (2, dtype_code(output.layout.dtype())),
+            (3, dtype_code(value.layout.dtype())),
+        ];
+        let pipeline = self
+            .pipelines
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?
+            .get(vector_kernel(width)?, &constants)?;
+        encoder.setComputePipelineState(&pipeline);
+        for (index, tensor) in [&query, &key, &value, &output].into_iter().enumerate() {
+            bindings.bind(table, index, &tensor.buffer);
+        }
+        bindings.bind(table, 4, &params);
+        encoder.setArgumentTable(Some(table));
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(
+            MTLSize {
+                width: usize::try_from(query_heads).map_err(|_| BackendError::InvalidInput)?,
+                height: usize::try_from(query_length).map_err(|_| BackendError::InvalidInput)?,
+                depth: 1,
+            },
+            MTLSize {
+                width: 1024,
+                height: 1,
+                depth: 1,
+            },
+        );
+        Ok(vec![params])
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn sdpa_params(
+        &self,
+        query: &EncoderTensor,
+        key: &EncoderTensor,
+        value: &EncoderTensor,
+        output: &EncoderTensor,
+        scale: f32,
+        causal: bool,
+        q_start: u32,
+        blocks: u32,
+    ) -> Result<MetalBufferRef, BackendError> {
+        let [query_heads, query_length, width] = shape3(&query.layout)?;
+        let [kv_heads, key_length, _] = shape3(&key.layout)?;
+        let [_, _, value_width] = shape3(&value.layout)?;
+        let mut bytes = Vec::with_capacity(172);
+        for item in [
+            query.layout.offset(),
+            key.layout.offset(),
+            value.layout.offset(),
+            output.layout.offset(),
+        ]
+        .into_iter()
+        .chain(query.layout.strides().iter().copied())
+        .chain(key.layout.strides().iter().copied())
+        .chain(value.layout.strides().iter().copied())
+        .chain(output.layout.strides().iter().copied())
+        {
+            bytes.extend_from_slice(&item.to_ne_bytes());
+        }
+        bytes.extend_from_slice(&scale.to_ne_bytes());
+        for item in [
+            query_heads,
+            query_length,
+            width,
+            kv_heads,
+            key_length,
+            value_width,
+            query_heads / kv_heads,
+            q_start,
+            u32::from(causal),
+            blocks,
+        ] {
+            bytes.extend_from_slice(&item.to_ne_bytes());
+        }
+        self.temporary_buffer(&bytes)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2078,6 +2186,32 @@ fn shape3(layout: &Layout) -> Result<[u32; 3], BackendError> {
         .map_err(|_| BackendError::InvalidInput)
 }
 
+fn vector_sdpa_supported(dispatch: &Dispatch) -> Result<bool, BackendError> {
+    let [query, key, value] = dispatch.inputs() else {
+        return Err(BackendError::InvalidInput);
+    };
+    let [query_heads, query_length, width] = shape3(query.layout())?;
+    let [kv_heads, key_length, _] = shape3(key.layout())?;
+    let [_, _, value_width] = shape3(value.layout())?;
+    let simdgroups = query_heads
+        .checked_div(kv_heads)
+        .and_then(|group| group.checked_mul(query_length));
+    Ok(query_length <= 8
+        && (query_length == 1 || query_length < key_length)
+        && width == value_width
+        && matches!(width, 64 | 128)
+        && simdgroups.is_some_and(|count| count <= 32)
+        && key_length <= VECTOR_SINGLE_PASS_MAX_KEY_LENGTH)
+}
+
+fn vector_kernel(width: u32) -> Result<&'static str, BackendError> {
+    match width {
+        64 => Ok("mlx_sdpa_vector_64"),
+        128 => Ok("mlx_sdpa_vector_128"),
+        _ => Err(BackendError::InvalidInput),
+    }
+}
+
 fn head_group(
     tensor: &EncoderTensor,
     first_head: u32,
@@ -2285,7 +2419,7 @@ mod tests {
         time::{Duration, Instant},
     };
 
-    use forja_core::{Backend, CommandList, DType, Op, Slice, Submission};
+    use forja_core::{Backend, CommandList, DType, Op, Slice, Submission, ViewOp};
     use forja_cpu::CpuBackend;
     use forja_testing::{TensorSpec, assert_backends_agree, assert_outputs_agree};
 
@@ -2664,7 +2798,7 @@ mod tests {
     }
 
     #[test]
-    fn metal_decomposed_attention_reads_strided_qwen_cache_views() {
+    fn metal_attention_reads_strided_qwen_cache_views() {
         let cache_slice = [
             Slice::new(0, 8, 1).unwrap(),
             Slice::new(0, 7, 1).unwrap(),
@@ -2683,6 +2817,130 @@ mod tests {
                 &TensorSpec::contiguous(dtype, &[16, 7, 128]),
             );
         }
+    }
+
+    #[test]
+    fn metal_vector_attention_matches_short_decode() {
+        let reference = CpuBackend::new();
+        let candidate = MetalBackend::new().unwrap();
+        for dtype in [DType::F32, DType::F16, DType::BF16] {
+            for key_length in [1, 37] {
+                let cache_slice = [
+                    Slice::new(0, 8, 1).unwrap(),
+                    Slice::new(0, key_length, 1).unwrap(),
+                    Slice::new(0, 128, 1).unwrap(),
+                ];
+                assert_backends_agree(
+                    &reference,
+                    &candidate,
+                    Op::Sdpa {
+                        scale: 128.0_f32.sqrt().recip(),
+                        causal: true,
+                        q_start: key_length - 1,
+                    },
+                    &[
+                        TensorSpec::contiguous(dtype, &[16, 1, 128]),
+                        TensorSpec::sliced(dtype, &[8, 4096, 128], &cache_slice),
+                        TensorSpec::sliced(dtype, &[8, 4096, 128], &cache_slice),
+                    ],
+                    &TensorSpec::contiguous(dtype, &[16, 1, 128]),
+                )
+                .unwrap();
+            }
+        }
+        assert_backends_agree(
+            &reference,
+            &candidate,
+            Op::Sdpa {
+                scale: 0.125,
+                causal: true,
+                q_start: 29,
+            },
+            &[
+                TensorSpec::contiguous(DType::F32, &[4, 8, 64]),
+                TensorSpec::contiguous(DType::F32, &[2, 37, 64]),
+                TensorSpec::contiguous(DType::F32, &[2, 37, 64]),
+            ],
+            &TensorSpec::contiguous(DType::F32, &[4, 8, 64]),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn metal_decode_matches_the_last_prefill_row() {
+        let backend = MetalBackend::new().unwrap();
+        let key_length = 37_u32;
+        let query = backend.alloc(DType::F32, &[16, key_length, 128]).unwrap();
+        let key_cache = backend.alloc(DType::F32, &[8, 4096, 128]).unwrap();
+        let value_cache = backend.alloc(DType::F32, &[8, 4096, 128]).unwrap();
+        let query_values = (0_u16..31)
+            .cycle()
+            .take(usize::try_from(16 * key_length * 128).unwrap())
+            .map(|index| f32::from(index) / 31.0 - 0.5)
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>();
+        let cache_values = (0_u16..37)
+            .cycle()
+            .take(8 * 4096 * 128)
+            .map(|index| f32::from(index) / 37.0 - 0.5)
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>();
+        backend.write(&query, &query_values).unwrap();
+        backend.write(&key_cache, &cache_values).unwrap();
+        backend.write(&value_cache, &cache_values).unwrap();
+        let cache_slice = ViewOp::Slice(vec![
+            Slice::new(0, 8, 1).unwrap(),
+            Slice::new(0, key_length, 1).unwrap(),
+            Slice::new(0, 128, 1).unwrap(),
+        ]);
+        let key = backend.view(&key_cache, cache_slice.clone()).unwrap();
+        let value = backend.view(&value_cache, cache_slice).unwrap();
+        let decode_query = backend
+            .view(
+                &query,
+                ViewOp::Slice(vec![
+                    Slice::new(0, 16, 1).unwrap(),
+                    Slice::new(key_length - 1, 1, 1).unwrap(),
+                    Slice::new(0, 128, 1).unwrap(),
+                ]),
+            )
+            .unwrap();
+        let prefill = backend.alloc(DType::F32, &[16, key_length, 128]).unwrap();
+        let decode = backend.alloc(DType::F32, &[16, 1, 128]).unwrap();
+        for (query, output, q_start) in [
+            (&query, &prefill, 0),
+            (&decode_query, &decode, key_length - 1),
+        ] {
+            let mut commands = CommandList::new();
+            commands
+                .dispatch(
+                    Op::Sdpa {
+                        scale: 128.0_f32.sqrt().recip(),
+                        causal: true,
+                        q_start,
+                    },
+                    &[query, &key, &value],
+                    output,
+                )
+                .unwrap();
+            backend.submit(commands).unwrap().wait().unwrap();
+        }
+        let prefill_row = backend
+            .view(
+                &prefill,
+                ViewOp::Slice(vec![
+                    Slice::new(0, 16, 1).unwrap(),
+                    Slice::new(key_length - 1, 1, 1).unwrap(),
+                    Slice::new(0, 128, 1).unwrap(),
+                ]),
+            )
+            .unwrap();
+        assert_outputs_agree(
+            DType::F32,
+            &backend.read(&prefill_row).unwrap(),
+            &backend.read(&decode).unwrap(),
+        )
+        .unwrap();
     }
 
     #[test]

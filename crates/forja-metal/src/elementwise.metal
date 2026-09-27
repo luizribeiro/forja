@@ -7,6 +7,7 @@ using namespace metal;
 constant uint input0_dtype [[function_constant(0)]];
 constant uint input1_dtype [[function_constant(1)]];
 constant uint output_dtype [[function_constant(2)]];
+constant uint input2_dtype [[function_constant(3)]];
 
 struct TensorLayout {
     ulong offset;

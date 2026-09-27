@@ -25,3 +25,25 @@ kernel void sdpa_scale_mask(
         scores[index] *= params.scale;
     }
 }
+
+struct SdpaParams {
+    ulong q_offset;
+    ulong k_offset;
+    ulong v_offset;
+    ulong o_offset;
+    ulong q_strides[3];
+    ulong k_strides[3];
+    ulong v_strides[3];
+    ulong o_strides[3];
+    float scale;
+    uint query_heads;
+    uint query_length;
+    uint width;
+    uint kv_heads;
+    uint key_length;
+    uint value_width;
+    uint heads_per_group;
+    uint query_start;
+    uint causal;
+    uint blocks;
+};
