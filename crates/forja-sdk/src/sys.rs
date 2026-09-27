@@ -37,6 +37,9 @@ pub(crate) enum Op {
     SiluMul,
     RmsNorm(f32),
     Softmax,
+    Rope(f32),
+    Embed,
+    Matmul,
 }
 
 pub(crate) trait Backend {
@@ -150,6 +153,9 @@ mod guest {
             Op::SiluMul => compute::Op::SiluMul,
             Op::RmsNorm(eps) => compute::Op::RmsNorm(eps),
             Op::Softmax => compute::Op::Softmax,
+            Op::Rope(theta) => compute::Op::Rope(compute::RopeCfg { theta }),
+            Op::Embed => compute::Op::Embed,
+            Op::Matmul => compute::Op::Matmul,
         }
     }
 
@@ -399,6 +405,9 @@ mod native {
             Op::SiluMul => CoreOp::SiluMul,
             Op::RmsNorm(eps) => CoreOp::RmsNorm { eps },
             Op::Softmax => CoreOp::Softmax,
+            Op::Rope(theta) => CoreOp::Rope { theta },
+            Op::Embed => CoreOp::Embed,
+            Op::Matmul => CoreOp::Matmul,
         }
     }
 

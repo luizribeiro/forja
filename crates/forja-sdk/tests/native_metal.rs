@@ -4,6 +4,8 @@
 
 use forja_sdk::{NativeDevice, Slice, Tensor, set_native_device};
 
+mod support;
+
 #[test]
 fn metal_views_round_trip_non_contiguous_values() {
     set_native_device(NativeDevice::Metal);
@@ -16,4 +18,10 @@ fn metal_views_round_trip_non_contiguous_values() {
 
     assert_eq!(view.shape(), [3, 3]);
     assert_eq!(view.to_vec().unwrap(), [1, 8, 15, 3, 10, 17, 5, 12, 19]);
+}
+
+#[test]
+fn metal_structured_ops_match_the_cpu_backend() {
+    set_native_device(NativeDevice::Metal);
+    support::matmul_rope_embedding_match_cpu();
 }

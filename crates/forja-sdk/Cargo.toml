@@ -22,5 +22,8 @@ wit-bindgen = "0.62"
 [target.'cfg(target_os = "macos")'.dependencies]
 forja-metal = { path = "../forja-metal", optional = true }
 
+[dev-dependencies]
+forja-testing = { path = "../../support/forja-testing" }
+
 [lints]
 workspace = true

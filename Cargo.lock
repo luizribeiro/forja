@@ -523,6 +523,7 @@ dependencies = [
  "forja-cpu",
  "forja-host",
  "forja-metal",
+ "forja-testing",
  "half",
  "wit-bindgen 0.62.0",
 ]

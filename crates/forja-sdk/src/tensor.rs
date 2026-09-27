@@ -221,6 +221,65 @@ impl<T: Element> Tensor<T> {
         self.unary(sys::Op::Copy, self.shape.clone())
     }
 
+    /// Multiplies rank-two or rank-three matrices.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for incompatible ranks, shapes, types, or dispatches.
+    pub fn matmul(&self, right: &Self) -> Result<Self> {
+        let rank = self.shape.len();
+        if !matches!(rank, 2 | 3) || right.shape.len() != rank {
+            return Err(Error::new(
+                "matmul requires equal rank-two or rank-three tensors",
+            ));
+        }
+        let batch = rank - 2;
+        if self.shape[..batch] != right.shape[..batch]
+            || self.shape[batch + 1] != right.shape[batch]
+        {
+            return Err(Error::new("matmul shapes are incompatible"));
+        }
+        let mut shape = self.shape[..batch].to_vec();
+        shape.extend([self.shape[batch], right.shape[batch + 1]]);
+        self.binary_with_shape(right, sys::Op::Matmul, shape)
+    }
+
+    /// Applies half-split rotary position embeddings.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid shapes, theta, types, or dispatches.
+    pub fn rope(&self, positions: &Tensor<u32>, theta: f32) -> Result<Self> {
+        let output = Self::empty(self.shape.clone())?;
+        graph::record(
+            sys::Op::Rope(theta),
+            &[&self.handle, &positions.handle],
+            &output.handle,
+        )?;
+        Ok(output)
+    }
+
+    /// Gathers rows from this rank-two table by token id.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid shapes, ids, types, or dispatches.
+    pub fn embedding(&self, ids: &Tensor<u32>) -> Result<Self> {
+        let [_, width] = self
+            .shape
+            .as_slice()
+            .try_into()
+            .map_err(|_| Error::new("embedding table must have rank two"))?;
+        let [count] = ids
+            .shape
+            .as_slice()
+            .try_into()
+            .map_err(|_| Error::new("embedding ids must have rank one"))?;
+        let output = Self::empty(vec![count, width])?;
+        graph::record(sys::Op::Embed, &[&self.handle, &ids.handle], &output.handle)?;
+        Ok(output)
+    }
+
     /// Submits pending work and gathers the logical tensor values.
     ///
     /// # Errors
@@ -257,7 +316,11 @@ impl<T: Element> Tensor<T> {
     }
 
     fn binary(&self, other: &Self, operation: sys::Op) -> Result<Self> {
-        let output = Self::empty(self.shape.clone())?;
+        self.binary_with_shape(other, operation, self.shape.clone())
+    }
+
+    fn binary_with_shape(&self, other: &Self, operation: sys::Op, shape: Vec<u32>) -> Result<Self> {
+        let output = Self::empty(shape)?;
         graph::record(operation, &[&self.handle, &other.handle], &output.handle)?;
         Ok(output)
     }
@@ -335,6 +398,18 @@ mod tests {
     fn rejects_invalid_allocation_preconditions() {
         assert!(Tensor::from_slice(&[1_u32], &[2]).is_err());
         assert!(Tensor::<u32>::from_slice(&[], &[u32::MAX, u32::MAX, u32::MAX]).is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_matmul_preconditions() {
+        let vector = Tensor::from_slice(&[1.0_f32, 2.0], &[2]).unwrap();
+        let matrix = Tensor::from_slice(&[1.0_f32, 2.0, 3.0, 4.0], &[2, 2]).unwrap();
+        let rank_three = Tensor::from_slice(&[1.0_f32; 8], &[2, 2, 2]).unwrap();
+        let wrong_inner = Tensor::from_slice(&[1.0_f32; 6], &[3, 2]).unwrap();
+
+        assert!(vector.matmul(&vector).is_err());
+        assert!(matrix.matmul(&rank_three).is_err());
+        assert!(matrix.matmul(&wrong_inner).is_err());
     }
 
     #[test]
