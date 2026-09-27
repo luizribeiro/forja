@@ -1177,14 +1177,13 @@ impl<B: Backend> Host<B> {
         if entry.commands.len() >= self.limits.dispatches_per_list {
             return Err(quota("command list dispatch count exceeds the guest limit"));
         }
-        let mut candidate = entry.commands.clone();
-        candidate
-            .dispatch(operation, &input_tensors, &output_entry.tensor)
-            .map_err(guest_error)?;
         self.check_dispatch_work(operation, &input_tensors, &output_entry.tensor)?;
 
         let entry = self.table.get_mut(commands).map_err(invalid_handle)?;
-        entry.commands = candidate;
+        entry
+            .commands
+            .dispatch(operation, &input_tensors, &output_entry.tensor)
+            .map_err(guest_error)?;
         entry.retained.extend(input_entries);
         entry.retained.push(output_entry);
         Ok(())
@@ -1934,7 +1933,7 @@ impl From<BackendError> for GuestFailure {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
     use std::{
         fs,
         sync::{
@@ -2415,6 +2414,64 @@ mod tests {
             &output,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn failed_dispatch_leaves_existing_commands_unchanged() {
+        let mut host = Host::new(CpuBackend::new(), GENEROUS);
+        let input = host.alloc(compute::Dtype::F32, &[7]).unwrap();
+        let output = host.alloc(compute::Dtype::F32, &[7]).unwrap();
+        let commands = host.command_list().unwrap();
+        host.dispatch(
+            &commands,
+            compute::Op::Copy,
+            &[Resource::new_borrow(input.rep())],
+            &output,
+        )
+        .unwrap();
+
+        host.limits.work_per_dispatch = 13;
+        assert!(matches!(
+            host.dispatch(
+                &commands,
+                compute::Op::Copy,
+                &[Resource::new_borrow(input.rep())],
+                &output,
+            ),
+            Err(compute::Error::Quota(_))
+        ));
+        assert_eq!(host.table.get(&commands).unwrap().commands.len(), 1);
+    }
+
+    #[test]
+    fn dispatch_recording_scales_roughly_linearly() {
+        let mut host = Host::new(CpuBackend::new(), GENEROUS);
+        let input = host.alloc(compute::Dtype::F32, &[7]).unwrap();
+        let output = host.alloc(compute::Dtype::F32, &[7]).unwrap();
+        let commands = host.command_list().unwrap();
+
+        let started = Instant::now();
+        for _ in 0..1_000 {
+            host.dispatch(
+                &commands,
+                compute::Op::Copy,
+                &[Resource::new_borrow(input.rep())],
+                &output,
+            )
+            .unwrap();
+        }
+        let first_thousand = started.elapsed();
+        let started = Instant::now();
+        for _ in 1_000..10_000 {
+            host.dispatch(
+                &commands,
+                compute::Op::Copy,
+                &[Resource::new_borrow(input.rep())],
+                &output,
+            )
+            .unwrap();
+        }
+        assert!(started.elapsed() < first_thousand.saturating_mul(30));
     }
 
     #[test]
