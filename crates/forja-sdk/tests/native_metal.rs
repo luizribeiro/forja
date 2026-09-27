@@ -25,3 +25,9 @@ fn metal_structured_ops_match_the_cpu_backend() {
     set_native_device(NativeDevice::Metal);
     support::matmul_rope_embedding_match_cpu();
 }
+
+#[test]
+fn metal_attention_and_cache_copy_match_the_cpu_backend() {
+    set_native_device(NativeDevice::Metal);
+    support::attention_and_cache_copy_match_cpu();
+}

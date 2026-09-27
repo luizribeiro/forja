@@ -13,6 +13,7 @@
 
 mod element;
 mod graph;
+pub mod nn;
 mod sys;
 mod tensor;
 

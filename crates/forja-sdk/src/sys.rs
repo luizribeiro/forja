@@ -40,6 +40,11 @@ pub(crate) enum Op {
     Rope(f32),
     Embed,
     Matmul,
+    Sdpa {
+        scale: f32,
+        causal: bool,
+        q_start: u32,
+    },
 }
 
 pub(crate) trait Backend {
@@ -156,6 +161,15 @@ mod guest {
             Op::Rope(theta) => compute::Op::Rope(compute::RopeCfg { theta }),
             Op::Embed => compute::Op::Embed,
             Op::Matmul => compute::Op::Matmul,
+            Op::Sdpa {
+                scale,
+                causal,
+                q_start,
+            } => compute::Op::Sdpa(compute::SdpaCfg {
+                scale,
+                causal,
+                q_start,
+            }),
         }
     }
 
@@ -408,6 +422,15 @@ mod native {
             Op::Rope(theta) => CoreOp::Rope { theta },
             Op::Embed => CoreOp::Embed,
             Op::Matmul => CoreOp::Matmul,
+            Op::Sdpa {
+                scale,
+                causal,
+                q_start,
+            } => CoreOp::Sdpa {
+                scale,
+                causal,
+                q_start,
+            },
         }
     }
 

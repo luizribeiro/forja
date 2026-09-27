@@ -280,6 +280,15 @@ impl<T: Element> Tensor<T> {
         Ok(output)
     }
 
+    /// Records a copy into an existing writable destination view.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for incompatible shapes, types, aliasing, or dispatches.
+    pub fn copy_into(&self, destination: &mut Self) -> Result<()> {
+        graph::record(sys::Op::Copy, &[&self.handle], &destination.handle)
+    }
+
     /// Submits pending work and gathers the logical tensor values.
     ///
     /// # Errors
@@ -304,7 +313,7 @@ impl<T: Element> Tensor<T> {
         }
     }
 
-    fn empty<U: Element>(shape: Vec<u32>) -> Result<Tensor<U>> {
+    pub(crate) fn empty<U: Element>(shape: Vec<u32>) -> Result<Tensor<U>> {
         let handle = sys::alloc(U::DTYPE, &shape)?;
         Ok(Tensor::from_handle(handle, shape))
     }
@@ -323,6 +332,10 @@ impl<T: Element> Tensor<T> {
         let output = Self::empty(shape)?;
         graph::record(operation, &[&self.handle, &other.handle], &output.handle)?;
         Ok(output)
+    }
+
+    pub(crate) fn handle(&self) -> &sys::Handle {
+        &self.handle
     }
 }
 

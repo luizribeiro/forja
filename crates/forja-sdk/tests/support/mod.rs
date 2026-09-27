@@ -58,6 +58,48 @@ pub fn matmul_rope_embedding_match_cpu() {
     assert_agrees(&expected, &embedded);
 }
 
+pub fn attention_and_cache_copy_match_cpu() {
+    let query_values = values(16 * 7 * 128, 7);
+    let key_values = values(8 * 7 * 128, 8);
+    let value_values = values(8 * 7 * 128, 9);
+    let query = Tensor::from_slice(&query_values, &[16, 7, 128]).unwrap();
+    let key = Tensor::from_slice(&key_values, &[8, 7, 128]).unwrap();
+    let value = Tensor::from_slice(&value_values, &[8, 7, 128]).unwrap();
+    let scale = 128.0_f32.sqrt().recip();
+    let attended = forja_sdk::nn::ops::sdpa(&query, &key, &value, scale, true, 0)
+        .unwrap()
+        .to_vec()
+        .unwrap();
+    let expected = cpu_dispatch(
+        Op::Sdpa {
+            scale,
+            causal: true,
+            q_start: 0,
+        },
+        &[
+            Input::F32(&[16, 7, 128], &query_values),
+            Input::F32(&[8, 7, 128], &key_values),
+            Input::F32(&[8, 7, 128], &value_values),
+        ],
+        &[16, 7, 128],
+    );
+    assert_agrees(&expected, &attended);
+
+    let source = Tensor::from_slice(&key_values, &[8, 7, 128]).unwrap();
+    let cache = Tensor::from_slice(&vec![0.0_f32; 8 * 33 * 128], &[8, 33, 128]).unwrap();
+    let mut destination = cache.narrow(1, 5, 7).unwrap();
+    source.copy_into(&mut destination).unwrap();
+    let copied = cache.to_vec().unwrap();
+    let mut expected = vec![0.0_f32; 8 * 33 * 128];
+    for head in 0..8 {
+        let source_start = head * 7 * 128;
+        let target_start = (head * 33 + 5) * 128;
+        expected[target_start..target_start + 7 * 128]
+            .copy_from_slice(&key_values[source_start..source_start + 7 * 128]);
+    }
+    assert_eq!(copied, expected);
+}
+
 enum Input<'a> {
     F32(&'a [u32], &'a [f32]),
     U32(&'a [u32], &'a [u32]),
