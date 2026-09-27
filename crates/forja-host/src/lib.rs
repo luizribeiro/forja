@@ -7,7 +7,7 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 
-use forja_core::{Backend, BackendError, DType, LayoutError, Slice, Tensor, ViewOp};
+use forja_core::{Backend, BackendError, DType, LayoutError, OpError, Slice, Tensor, ViewOp};
 use wasmtime::component::{Resource, ResourceTable};
 use wasmtime::{Engine, Store, StoreLimits, StoreLimitsBuilder};
 
@@ -152,7 +152,7 @@ impl<B: Backend> Host<B> {
     ) -> Result<Resource<TensorEntry>, compute::Error> {
         let dtype = core_dtype(dtype);
         let byte_len = self.check_allocation(dtype, shape)?;
-        let tensor = self.backend.alloc(dtype, shape).map_err(backend_error)?;
+        let tensor = self.backend.alloc(dtype, shape).map_err(guest_error)?;
         let entry = TensorEntry {
             tensor: tensor.clone(),
             buffer: Arc::new(BufferHandle {
@@ -163,7 +163,7 @@ impl<B: Backend> Host<B> {
         let resource = match self.table.push(entry) {
             Ok(resource) => resource,
             Err(error) => {
-                self.backend.release(&tensor).map_err(backend_error)?;
+                self.backend.release(&tensor).map_err(guest_error)?;
                 return Err(compute::Error::InvalidHandle(error.to_string()));
             }
         };
@@ -184,12 +184,12 @@ impl<B: Backend> Host<B> {
     ) -> Result<Resource<TensorEntry>, compute::Error> {
         self.check_handle_quota()?;
         let entry = self.entry(resource)?.clone();
-        let operation = core_view(operation).map_err(|error| layout_error(&error))?;
-        validate_view(&entry.tensor, &operation).map_err(|error| layout_error(&error))?;
+        let operation = core_view(operation).map_err(guest_error)?;
+        validate_view(&entry.tensor, &operation).map_err(guest_error)?;
         let tensor = self
             .backend
             .view(&entry.tensor, operation)
-            .map_err(backend_error)?;
+            .map_err(guest_error)?;
         self.check_tensor_shape(tensor.layout().shape())?;
         let view = self
             .table
@@ -229,7 +229,7 @@ impl<B: Backend> Host<B> {
                 bytes.len()
             )));
         }
-        self.backend.write(tensor, bytes).map_err(backend_error)
+        self.backend.write(tensor, bytes).map_err(guest_error)
     }
 
     /// Drops a guest tensor handle and releases its buffer after the last view.
@@ -248,7 +248,7 @@ impl<B: Backend> Host<B> {
         if let Some(buffer) = Arc::into_inner(entry.buffer) {
             buffer
                 .release(self.backend.as_ref(), &entry.tensor)
-                .map_err(backend_error)?;
+                .map_err(guest_error)?;
         }
         self.live_handles = live_handles;
         Ok(())
@@ -379,23 +379,55 @@ fn quota(message: &str) -> compute::Error {
     compute::Error::Quota(message.to_owned())
 }
 
-fn backend_error(error: BackendError) -> compute::Error {
-    match error {
-        BackendError::QuotaExceeded => quota("backend allocation quota exceeded"),
-        BackendError::InvalidInput => {
+fn guest_error(error: impl Into<GuestFailure>) -> compute::Error {
+    match error.into() {
+        GuestFailure::Layout(error) => compute::Error::Layout(error.to_string()),
+        GuestFailure::Op(error) => compute::Error::OpSignature(error.to_string()),
+        GuestFailure::Backend(BackendError::QuotaExceeded) => {
+            quota("backend allocation quota exceeded")
+        }
+        GuestFailure::Backend(BackendError::AllocationFailed) => {
+            compute::Error::BackendExecution("backend allocation failed".to_owned())
+        }
+        GuestFailure::Backend(BackendError::ExecutionFailed) => {
+            compute::Error::BackendExecution("backend execution failed".to_owned())
+        }
+        GuestFailure::Backend(BackendError::InvalidInput) => {
             compute::Error::InvalidHandle("backend rejected the tensor handle".to_owned())
         }
-        error => compute::Error::BackendExecution(error.to_string()),
+        GuestFailure::Backend(BackendError::IndexOutOfRange { index }) => {
+            compute::Error::OpSignature(format!("backend index {index} is out of range"))
+        }
     }
 }
 
-fn layout_error(error: &LayoutError) -> compute::Error {
-    compute::Error::Layout(error.to_string())
+enum GuestFailure {
+    Layout(LayoutError),
+    Op(OpError),
+    Backend(BackendError),
+}
+
+impl From<LayoutError> for GuestFailure {
+    fn from(error: LayoutError) -> Self {
+        Self::Layout(error)
+    }
+}
+
+impl From<OpError> for GuestFailure {
+    fn from(error: OpError) -> Self {
+        Self::Op(error)
+    }
+}
+
+impl From<BackendError> for GuestFailure {
+    fn from(error: BackendError) -> Self {
+        Self::Backend(error)
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use forja_core::BackendError;
+    use forja_core::{BackendError, LayoutError, OpError};
     use forja_cpu::CpuBackend;
     use wasmtime::component::Resource;
 
@@ -496,5 +528,31 @@ mod tests {
         assert_eq!(host.backend.read(&tensor).unwrap().len(), 7 * 1024 * 4);
         host.drop_tensor(view).unwrap();
         assert_eq!(host.backend.read(&tensor), Err(BackendError::InvalidInput));
+    }
+
+    #[test]
+    fn maps_every_host_error_kind() {
+        assert!(matches!(
+            super::guest_error(LayoutError::ZeroSliceStep),
+            compute::Error::Layout(_)
+        ));
+        assert!(matches!(
+            super::guest_error(OpError::InvalidScale),
+            compute::Error::OpSignature(_)
+        ));
+        assert!(matches!(
+            super::guest_error(BackendError::QuotaExceeded),
+            compute::Error::Quota(_)
+        ));
+        assert!(matches!(
+            super::guest_error(BackendError::ExecutionFailed),
+            compute::Error::BackendExecution(_)
+        ));
+
+        let host = Host::new(CpuBackend::new(), GENEROUS);
+        assert!(matches!(
+            host.entry(&Resource::new_borrow(42)),
+            Err(compute::Error::InvalidHandle(_))
+        ));
     }
 }
