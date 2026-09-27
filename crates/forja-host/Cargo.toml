@@ -9,6 +9,7 @@ version.workspace = true
 [dependencies]
 forja-core = { path = "../forja-core" }
 wasmtime.workspace = true
+wasmtime-wasi.workspace = true
 
 [dev-dependencies]
 forja-cpu = { path = "../forja-cpu" }

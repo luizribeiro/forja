@@ -8,8 +8,9 @@ use std::sync::{
 };
 
 use forja_core::{Backend, BackendError, DType, LayoutError, OpError, Slice, Tensor, ViewOp};
-use wasmtime::component::{Resource, ResourceTable};
+use wasmtime::component::{Linker, Resource, ResourceTable};
 use wasmtime::{Engine, Store, StoreLimits, StoreLimitsBuilder};
+use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
 /// Host bindings for the guest-facing compute interface.
 #[allow(missing_docs)]
@@ -106,6 +107,7 @@ pub struct TensorEntry {
 pub struct Host<B: Backend> {
     backend: Arc<B>,
     table: ResourceTable,
+    wasi: WasiCtx,
     limits: Limits,
     store_limits: StoreLimits,
     live_bytes: Arc<AtomicU64>,
@@ -122,6 +124,7 @@ impl<B: Backend> Host<B> {
         Self {
             backend: Arc::new(backend),
             table: ResourceTable::new(),
+            wasi: WasiCtxBuilder::new().build(),
             limits,
             store_limits,
             live_bytes: Arc::new(AtomicU64::new(0)),
@@ -340,6 +343,30 @@ where
 }
 
 impl<B> compute::Host for Host<B> where B: Backend + Send + Sync + 'static {}
+
+impl<B> WasiView for Host<B>
+where
+    B: Backend + Send + Sync + 'static,
+{
+    fn ctx(&mut self) -> WasiCtxView<'_> {
+        WasiCtxView {
+            ctx: &mut self.wasi,
+            table: &mut self.table,
+        }
+    }
+}
+
+/// Adds the WASI Preview 2 imports emitted by Rust guests.
+///
+/// # Errors
+///
+/// Returns an error if a WASI import cannot be defined on the linker.
+pub fn add_wasi_to_linker<B>(linker: &mut Linker<Host<B>>) -> wasmtime::Result<()>
+where
+    B: Backend + Send + Sync + 'static,
+{
+    wasmtime_wasi::p2::add_to_linker_async(linker)
+}
 
 fn core_dtype(dtype: compute::Dtype) -> DType {
     match dtype {

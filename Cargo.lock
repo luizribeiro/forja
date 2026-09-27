@@ -484,6 +484,7 @@ dependencies = [
  "forja-core",
  "forja-cpu",
  "wasmtime",
+ "wasmtime-wasi",
 ]
 
 [[package]]
