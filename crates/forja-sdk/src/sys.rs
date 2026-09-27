@@ -6,6 +6,7 @@
     )
 )]
 
+use crate::program::{BinaryOp, ProgramKind, ReduceOp, UnaryOp};
 use crate::{Error, Result};
 
 #[derive(Clone, Copy)]
@@ -47,6 +48,25 @@ pub(crate) enum Op {
     },
 }
 
+pub(crate) struct Program {
+    pub(crate) kind: ProgramKind,
+    pub(crate) instructions: Vec<ProgramInst>,
+    pub(crate) outputs: Vec<(u32, u32)>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum ProgramInst {
+    Input(u32),
+    Constant(f32),
+    Index(u8),
+    Extent(u8),
+    Unary(UnaryOp, u32),
+    Binary(BinaryOp, u32, u32),
+    Select(u32, u32, u32),
+    CastF32(u32),
+    Reduce(ReduceOp, u32),
+}
+
 pub(crate) trait Backend {
     type Tensor;
     type Commands;
@@ -62,6 +82,12 @@ pub(crate) trait Backend {
         inputs: &[&Self::Tensor],
         output: &Self::Tensor,
     ) -> Result<()>;
+    fn dispatch_program(
+        commands: &mut Self::Commands,
+        program: Program,
+        inputs: &[&Self::Tensor],
+        outputs: &[&Self::Tensor],
+    ) -> Result<()>;
     fn submit(commands: Self::Commands) -> Result<()>;
 }
 
@@ -74,7 +100,8 @@ pub(crate) mod guest {
         world: "host",
     });
 
-    use super::{Backend, DType, Error, Op, Result, View};
+    use super::{Backend, DType, Error, Op, Program, ProgramInst, Result, View};
+    use crate::program::{BinaryOp, ProgramKind, ReduceOp, UnaryOp};
     pub use l9o::gpu::compute;
 
     pub(crate) struct Guest;
@@ -149,6 +176,18 @@ pub(crate) mod guest {
                 .map_err(|error| guest_error(&error))
         }
 
+        fn dispatch_program(
+            commands: &mut Self::Commands,
+            program: Program,
+            inputs: &[&Self::Tensor],
+            outputs: &[&Self::Tensor],
+        ) -> Result<()> {
+            let program = wit_program(program);
+            commands
+                .dispatch_program(&program, inputs, outputs)
+                .map_err(|error| guest_error(&error))
+        }
+
         fn submit(commands: Self::Commands) -> Result<()> {
             wit_bindgen::block_on(compute::submit(commands))
                 .map(|_| ())
@@ -206,6 +245,78 @@ pub(crate) mod guest {
         }
     }
 
+    fn wit_program(program: Program) -> compute::Program {
+        compute::Program {
+            kind: match program.kind {
+                ProgramKind::Map => compute::ProgramKind::Map,
+                ProgramKind::Row => compute::ProgramKind::Row,
+            },
+            insts: program.instructions.into_iter().map(wit_inst).collect(),
+            outputs: program.outputs,
+        }
+    }
+
+    fn wit_inst(instruction: ProgramInst) -> compute::Inst {
+        match instruction {
+            ProgramInst::Input(slot) => compute::Inst::Input(slot),
+            ProgramInst::Constant(value) => compute::Inst::Const(value),
+            ProgramInst::Index(axis) => compute::Inst::Index(axis),
+            ProgramInst::Extent(axis) => compute::Inst::Extent(axis),
+            ProgramInst::Unary(op, value) => compute::Inst::Unary((wit_unop(op), value)),
+            ProgramInst::Binary(op, left, right) => {
+                compute::Inst::Binary((wit_binop(op), left, right))
+            }
+            ProgramInst::Select(condition, accepted, rejected) => {
+                compute::Inst::Select((condition, accepted, rejected))
+            }
+            ProgramInst::CastF32(value) => compute::Inst::Cast((compute::ValueType::F32, value)),
+            ProgramInst::Reduce(op, value) => compute::Inst::Reduce((wit_redop(op), value)),
+        }
+    }
+
+    fn wit_unop(op: UnaryOp) -> compute::Unop {
+        match op {
+            UnaryOp::Neg => compute::Unop::Neg,
+            UnaryOp::Abs => compute::Unop::Abs,
+            UnaryOp::Exp => compute::Unop::Exp,
+            UnaryOp::Log => compute::Unop::Log,
+            UnaryOp::Sqrt => compute::Unop::Sqrt,
+            UnaryOp::Rsqrt => compute::Unop::Rsqrt,
+            UnaryOp::Sin => compute::Unop::Sin,
+            UnaryOp::Cos => compute::Unop::Cos,
+            UnaryOp::Tanh => compute::Unop::Tanh,
+            UnaryOp::Sigmoid => compute::Unop::Sigmoid,
+            UnaryOp::Recip => compute::Unop::Recip,
+            UnaryOp::Floor => compute::Unop::Floor,
+        }
+    }
+
+    fn wit_binop(op: BinaryOp) -> compute::Binop {
+        match op {
+            BinaryOp::Add => compute::Binop::Add,
+            BinaryOp::Sub => compute::Binop::Sub,
+            BinaryOp::Mul => compute::Binop::Mul,
+            BinaryOp::Div => compute::Binop::Div,
+            BinaryOp::Min => compute::Binop::Min,
+            BinaryOp::Max => compute::Binop::Max,
+            BinaryOp::Pow => compute::Binop::Pow,
+            BinaryOp::Lt => compute::Binop::Lt,
+            BinaryOp::Le => compute::Binop::Le,
+            BinaryOp::Eq => compute::Binop::Eq,
+            BinaryOp::Ne => compute::Binop::Ne,
+            BinaryOp::Ge => compute::Binop::Ge,
+            BinaryOp::Gt => compute::Binop::Gt,
+        }
+    }
+
+    const fn wit_redop(op: ReduceOp) -> compute::Redop {
+        match op {
+            ReduceOp::Sum => compute::Redop::Sum,
+            ReduceOp::Max => compute::Redop::Max,
+            ReduceOp::Min => compute::Redop::Min,
+        }
+    }
+
     fn guest_error(error: &compute::Error) -> Error {
         Error::new(format!("{error:?}"))
     }
@@ -213,7 +324,7 @@ pub(crate) mod guest {
 
 #[cfg(all(not(target_family = "wasm"), not(feature = "native")))]
 pub(crate) mod unavailable {
-    use super::{Backend, DType, Error, Op, Result, View};
+    use super::{Backend, DType, Error, Op, Program, Result, View};
 
     pub(crate) enum UnavailableTensor {}
     pub(crate) enum UnavailableCommands {}
@@ -265,6 +376,15 @@ pub(crate) mod unavailable {
             Err(error())
         }
 
+        fn dispatch_program(
+            _commands: &mut Self::Commands,
+            _program: Program,
+            _inputs: &[&Self::Tensor],
+            _outputs: &[&Self::Tensor],
+        ) -> Result<()> {
+            Err(error())
+        }
+
         fn submit(_commands: Self::Commands) -> Result<()> {
             Err(error())
         }
@@ -279,11 +399,18 @@ pub(crate) mod unavailable {
 pub(crate) mod native {
     use std::cell::Cell;
 
-    use forja_core::{DType as CoreDType, Op as CoreOp, Slice as CoreSlice, ViewOp};
+    use forja_core::{
+        DType as CoreDType, Op as CoreOp, Slice as CoreSlice, ViewOp,
+        program::{
+            BinOp, Inst, Program as CoreProgram, ProgramKind as CoreProgramKind, RedOp, UnOp,
+            ValueType,
+        },
+    };
     use forja_host::{NativeCommandList, NativeHost, NativeTensor, Safetensors, WeightSource as _};
 
-    use super::{Backend, DType, Error, Op, Result, View};
+    use super::{Backend, DType, Error, Op, Program, ProgramInst, Result, View};
     use crate::NativeDevice;
+    use crate::program::{BinaryOp, ProgramKind, ReduceOp, UnaryOp};
 
     type CpuBackend = forja_cpu::CpuBackend;
     type CpuTensor = NativeTensor<CpuBackend>;
@@ -444,6 +571,24 @@ pub(crate) mod native {
             }
         }
 
+        fn dispatch_program(
+            commands: &mut Self::Commands,
+            program: Program,
+            inputs: &[&Self::Tensor],
+            outputs: &[&Self::Tensor],
+        ) -> Result<()> {
+            let program = core_program(program)?;
+            match commands {
+                Commands::Cpu(commands) => commands
+                    .dispatch_program(&program, &cpu_inputs(inputs)?, &cpu_inputs(outputs)?)
+                    .map_err(error),
+                #[cfg(all(feature = "native-metal", target_os = "macos"))]
+                Commands::Metal(commands) => commands
+                    .dispatch_program(&program, &metal_inputs(inputs)?, &metal_inputs(outputs)?)
+                    .map_err(error),
+            }
+        }
+
         fn submit(commands: Self::Commands) -> Result<()> {
             match commands {
                 Commands::Cpu(commands) => commands.submit().map(|_| ()).map_err(error),
@@ -526,6 +671,78 @@ pub(crate) mod native {
         }
     }
 
+    fn core_program(program: Program) -> Result<forja_core::program::ValidatedProgram> {
+        CoreProgram {
+            kind: match program.kind {
+                ProgramKind::Map => CoreProgramKind::Map,
+                ProgramKind::Row => CoreProgramKind::Row,
+            },
+            insts: program.instructions.into_iter().map(core_inst).collect(),
+            outputs: program.outputs,
+        }
+        .validate()
+        .map_err(|error| Error::new(error.to_string()))
+    }
+
+    fn core_inst(instruction: ProgramInst) -> Inst {
+        match instruction {
+            ProgramInst::Input(slot) => Inst::Input(slot),
+            ProgramInst::Constant(value) => Inst::Const(value),
+            ProgramInst::Index(axis) => Inst::Index(axis),
+            ProgramInst::Extent(axis) => Inst::Extent(axis),
+            ProgramInst::Unary(op, value) => Inst::Unary(core_unop(op), value),
+            ProgramInst::Binary(op, left, right) => Inst::Binary(core_binop(op), left, right),
+            ProgramInst::Select(condition, accepted, rejected) => {
+                Inst::Select(condition, accepted, rejected)
+            }
+            ProgramInst::CastF32(value) => Inst::Cast(ValueType::F32, value),
+            ProgramInst::Reduce(op, value) => Inst::Reduce(core_redop(op), value),
+        }
+    }
+
+    fn core_unop(op: UnaryOp) -> UnOp {
+        match op {
+            UnaryOp::Neg => UnOp::Neg,
+            UnaryOp::Abs => UnOp::Abs,
+            UnaryOp::Exp => UnOp::Exp,
+            UnaryOp::Log => UnOp::Log,
+            UnaryOp::Sqrt => UnOp::Sqrt,
+            UnaryOp::Rsqrt => UnOp::Rsqrt,
+            UnaryOp::Sin => UnOp::Sin,
+            UnaryOp::Cos => UnOp::Cos,
+            UnaryOp::Tanh => UnOp::Tanh,
+            UnaryOp::Sigmoid => UnOp::Sigmoid,
+            UnaryOp::Recip => UnOp::Recip,
+            UnaryOp::Floor => UnOp::Floor,
+        }
+    }
+
+    fn core_binop(op: BinaryOp) -> BinOp {
+        match op {
+            BinaryOp::Add => BinOp::Add,
+            BinaryOp::Sub => BinOp::Sub,
+            BinaryOp::Mul => BinOp::Mul,
+            BinaryOp::Div => BinOp::Div,
+            BinaryOp::Min => BinOp::Min,
+            BinaryOp::Max => BinOp::Max,
+            BinaryOp::Pow => BinOp::Pow,
+            BinaryOp::Lt => BinOp::Lt,
+            BinaryOp::Le => BinOp::Le,
+            BinaryOp::Eq => BinOp::Eq,
+            BinaryOp::Ne => BinOp::Ne,
+            BinaryOp::Ge => BinOp::Ge,
+            BinaryOp::Gt => BinOp::Gt,
+        }
+    }
+
+    const fn core_redop(op: ReduceOp) -> RedOp {
+        match op {
+            ReduceOp::Sum => RedOp::Sum,
+            ReduceOp::Max => RedOp::Max,
+            ReduceOp::Min => RedOp::Min,
+        }
+    }
+
     #[cfg(all(feature = "native-metal", target_os = "macos"))]
     fn with_metal<T>(operation: impl FnOnce(&NativeHost<MetalBackend>) -> Result<T>) -> Result<T> {
         METAL_HOST.with(|host| match host {
@@ -586,6 +803,15 @@ pub(crate) fn dispatch(
     output: &Handle,
 ) -> Result<()> {
     Active::dispatch(commands, operation, inputs, output)
+}
+
+pub(crate) fn dispatch_program(
+    commands: &mut Commands,
+    program: Program,
+    inputs: &[&Handle],
+    outputs: &[&Handle],
+) -> Result<()> {
+    Active::dispatch_program(commands, program, inputs, outputs)
 }
 
 pub(crate) fn submit(commands: Commands) -> Result<()> {

@@ -23,6 +23,23 @@ pub(crate) fn record(
     })
 }
 
+pub(crate) fn record_program(
+    program: sys::Program,
+    inputs: &[&sys::Handle],
+    outputs: &[&sys::Handle],
+) -> Result<()> {
+    CURRENT.with(|current| {
+        let mut current = current.borrow_mut();
+        if current.is_none() {
+            *current = Some(sys::command_list()?);
+        }
+        let commands = current
+            .as_mut()
+            .ok_or_else(|| crate::Error::new("current graph was not initialized"))?;
+        sys::dispatch_program(commands, program, inputs, outputs)
+    })
+}
+
 /// Submits all operations recorded by the current thread.
 ///
 /// # Errors

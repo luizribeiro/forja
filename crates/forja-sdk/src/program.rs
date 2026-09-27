@@ -61,7 +61,6 @@ pub(crate) enum BinaryOp {
     Gt,
 }
 
-#[allow(dead_code, reason = "instructions are consumed by tensor dispatch")]
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Instruction {
     Input(u32),
@@ -84,10 +83,6 @@ struct State {
 /// A builder for a flat scalar program.
 #[derive(Debug)]
 pub struct Program {
-    #[allow(
-        dead_code,
-        reason = "the iteration strategy is consumed by tensor dispatch"
-    )]
     kind: ProgramKind,
     state: RefCell<State>,
 }
@@ -176,16 +171,66 @@ impl Program {
             .push((slot, value.instruction));
     }
 
-    #[allow(
-        dead_code,
-        reason = "the completed definition is consumed by tensor dispatch"
-    )]
     pub(crate) fn parts(&self) -> Result<ProgramParts> {
         let state = self.state.borrow();
         if let Some(error) = &state.error {
             return Err(error.clone());
         }
         Ok((self.kind, state.instructions.clone(), state.outputs.clone()))
+    }
+
+    pub(crate) fn definition(&self, rank: usize) -> Result<crate::sys::Program> {
+        let (kind, instructions, outputs) = self.parts()?;
+        let mut lowered = Vec::with_capacity(instructions.len());
+        let mut values = Vec::with_capacity(instructions.len());
+        for instruction in instructions {
+            let instruction = match instruction {
+                Instruction::Input(slot) => crate::sys::ProgramInst::Input(slot),
+                Instruction::Constant(value) => crate::sys::ProgramInst::Constant(value),
+                Instruction::Index(axis) => {
+                    let index = push_lowered(
+                        &mut lowered,
+                        crate::sys::ProgramInst::Index(resolve_axis(axis, rank)?),
+                    )?;
+                    crate::sys::ProgramInst::CastF32(index)
+                }
+                Instruction::Extent(axis) => {
+                    let extent = push_lowered(
+                        &mut lowered,
+                        crate::sys::ProgramInst::Extent(resolve_axis(axis, rank)?),
+                    )?;
+                    crate::sys::ProgramInst::CastF32(extent)
+                }
+                Instruction::Unary(op, value) => {
+                    crate::sys::ProgramInst::Unary(op, lowered_value(&values, value)?)
+                }
+                Instruction::Binary(op, left, right) => crate::sys::ProgramInst::Binary(
+                    op,
+                    lowered_value(&values, left)?,
+                    lowered_value(&values, right)?,
+                ),
+                Instruction::Select(condition, accepted, rejected) => {
+                    crate::sys::ProgramInst::Select(
+                        lowered_value(&values, condition)?,
+                        lowered_value(&values, accepted)?,
+                        lowered_value(&values, rejected)?,
+                    )
+                }
+                Instruction::Reduce(op, value) => {
+                    crate::sys::ProgramInst::Reduce(op, lowered_value(&values, value)?)
+                }
+            };
+            values.push(push_lowered(&mut lowered, instruction)?);
+        }
+        let outputs = outputs
+            .into_iter()
+            .map(|(slot, value)| Ok((slot, lowered_value(&values, value)?)))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(crate::sys::Program {
+            kind,
+            instructions: lowered,
+            outputs,
+        })
     }
 
     fn push_value(&self, instruction: Instruction) -> Value<'_> {
@@ -205,6 +250,36 @@ impl Program {
 }
 
 type ProgramParts = (ProgramKind, Vec<Instruction>, Vec<(u32, u32)>);
+
+fn resolve_axis(axis: i32, rank: usize) -> Result<u8> {
+    let rank = i64::try_from(rank).map_err(|_| Error::new("tensor rank is too large"))?;
+    let axis = i64::from(axis);
+    let axis = if axis < 0 {
+        rank.checked_add(axis)
+    } else {
+        Some(axis)
+    }
+    .filter(|&axis| axis >= 0 && axis < rank)
+    .ok_or_else(|| Error::new("program axis is out of range"))?;
+    u8::try_from(axis).map_err(|_| Error::new("program axis is out of range"))
+}
+
+fn push_lowered(
+    instructions: &mut Vec<crate::sys::ProgramInst>,
+    instruction: crate::sys::ProgramInst,
+) -> Result<u32> {
+    let index = u32::try_from(instructions.len())
+        .map_err(|_| Error::new("program has too many instructions"))?;
+    instructions.push(instruction);
+    Ok(index)
+}
+
+fn lowered_value(values: &[u32], value: u32) -> Result<u32> {
+    usize::try_from(value)
+        .ok()
+        .and_then(|value| values.get(value).copied())
+        .ok_or_else(|| Error::new("program value is invalid"))
+}
 
 /// An f32 value produced by a program instruction.
 #[derive(Clone, Copy)]

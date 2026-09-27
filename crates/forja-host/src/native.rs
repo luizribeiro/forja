@@ -1,6 +1,9 @@
 use std::{sync::Arc, time::Duration};
 
-use forja_core::{Backend, BackendError, CommandList, DType, Op, Submission, Tensor, ViewOp};
+use forja_core::{
+    Backend, BackendError, CommandList, DType, Op, Submission, Tensor, ViewOp,
+    program::ValidatedProgram,
+};
 
 /// An in-process host used by trusted native development and tests.
 #[derive(Debug)]
@@ -164,6 +167,44 @@ impl<B: Backend> NativeCommandList<B> {
         self.retained
             .extend(inputs.iter().map(|tensor| (*tensor).clone()));
         self.retained.push(output.clone());
+        Ok(())
+    }
+
+    /// Validates and records one scalar program.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for foreign tensors or an invalid program binding.
+    pub fn dispatch_program(
+        &mut self,
+        program: &ValidatedProgram,
+        inputs: &[&NativeTensor<B>],
+        outputs: &[&NativeTensor<B>],
+    ) -> Result<(), BackendError> {
+        if inputs
+            .iter()
+            .chain(outputs)
+            .any(|tensor| !Arc::ptr_eq(&self.backend, &tensor.allocation.backend))
+        {
+            return Err(BackendError::InvalidInput);
+        }
+        self.commands
+            .dispatch_program(
+                program,
+                &inputs
+                    .iter()
+                    .map(|tensor| &tensor.tensor)
+                    .collect::<Vec<_>>(),
+                &outputs
+                    .iter()
+                    .map(|tensor| &tensor.tensor)
+                    .collect::<Vec<_>>(),
+            )
+            .map_err(|_| BackendError::InvalidInput)?;
+        self.retained
+            .extend(inputs.iter().map(|tensor| (*tensor).clone()));
+        self.retained
+            .extend(outputs.iter().map(|tensor| (*tensor).clone()));
         Ok(())
     }
 

@@ -1,6 +1,6 @@
 use std::{marker::PhantomData, ops::Add, rc::Rc};
 
-use crate::{Element, Error, Result, graph, sys};
+use crate::{Element, Error, Result, graph, program::Program, sys};
 
 /// A strided selection along one tensor axis.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -298,6 +298,39 @@ impl<T: Element> Tensor<T> {
         graph::record(sys::Op::Copy, &[&self.handle], &destination.handle)
     }
 
+    /// Runs a guest-authored scalar program with this tensor bound to input slot zero.
+    ///
+    /// Additional inputs occupy subsequent slots. Every output is freshly allocated
+    /// with this tensor's shape and element type.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid program, incompatible binding, allocation,
+    /// or refused dispatch.
+    pub fn run_program(&self, program: &Program, inputs: &[&Self]) -> Result<Vec<Self>> {
+        let definition = program.definition(self.shape.len())?;
+        let output_count = definition
+            .outputs
+            .iter()
+            .map(|&(slot, _)| slot)
+            .max()
+            .and_then(|slot| slot.checked_add(1))
+            .and_then(|count| usize::try_from(count).ok())
+            .ok_or_else(|| Error::new("program has no valid outputs"))?;
+        let outputs = (0..output_count)
+            .map(|_| Self::empty(self.shape.clone()))
+            .collect::<Result<Vec<_>>>()?;
+        let input_handles = std::iter::once(&self.handle)
+            .chain(inputs.iter().map(|tensor| &tensor.handle))
+            .collect::<Vec<_>>();
+        let output_handles = outputs
+            .iter()
+            .map(|tensor| &tensor.handle)
+            .collect::<Vec<_>>();
+        graph::record_program(definition, &input_handles, &output_handles)?;
+        Ok(outputs)
+    }
+
     /// Submits pending work and gathers the logical tensor values.
     ///
     /// # Errors
@@ -375,6 +408,7 @@ fn size_error() -> Error {
 #[cfg(all(test, feature = "native"))]
 mod tests {
     use super::*;
+    use forja_testing::assert_f32_values_agree;
 
     #[test]
     fn native_views_round_trip_non_contiguous_values() {
@@ -446,7 +480,7 @@ mod tests {
         let right = Tensor::from_slice(&[4.0_f32, 5.0, -1.0], &[1, 3]).unwrap();
         let sum = (&left + &right).unwrap();
         crate::eval().unwrap();
-        assert_close(&sum.to_vec().unwrap(), &[5.0, 3.0, 2.0]);
+        assert_f32_values_agree(&[5.0, 3.0, 2.0], &sum.to_vec().unwrap()).unwrap();
 
         let gate = Tensor::from_slice(&[0.0_f32, 1.0, -1.0], &[1, 3]).unwrap();
         let up = Tensor::from_slice(&[2.0_f32, 3.0, 4.0], &[1, 3]).unwrap();
@@ -456,17 +490,17 @@ mod tests {
             3.0 / (1.0 + (-1.0_f32).exp()),
             -4.0 / (1.0 + 1.0_f32.exp()),
         ];
-        assert_close(&activated.to_vec().unwrap(), &expected);
+        assert_f32_values_agree(&expected, &activated.to_vec().unwrap()).unwrap();
 
         let input = Tensor::from_slice(&[3.0_f32, 4.0], &[1, 2]).unwrap();
         let weight = Tensor::from_slice(&[1.0_f32, 2.0], &[2]).unwrap();
         let normalized = input.rms_norm(&weight, 0.0).unwrap();
         let rms = 12.5_f32.sqrt();
-        assert_close(&normalized.to_vec().unwrap(), &[3.0 / rms, 8.0 / rms]);
+        assert_f32_values_agree(&[3.0 / rms, 8.0 / rms], &normalized.to_vec().unwrap()).unwrap();
 
         let logits = Tensor::from_slice(&[0.0_f32, 2.0_f32.ln()], &[1, 2]).unwrap();
         let probabilities = logits.softmax_last_dim().unwrap();
-        assert_close(&probabilities.to_vec().unwrap(), &[1.0 / 3.0, 2.0 / 3.0]);
+        assert_f32_values_agree(&[1.0 / 3.0, 2.0 / 3.0], &probabilities.to_vec().unwrap()).unwrap();
 
         let half = sum.to_dtype::<crate::f16>().unwrap();
         assert_eq!(
@@ -479,22 +513,49 @@ mod tests {
         );
     }
 
-    fn assert_close(actual: &[f32], expected: &[f32]) {
-        assert_eq!(actual.len(), expected.len());
-        let error = actual
-            .iter()
-            .zip(expected)
-            .map(|(actual, expected)| (actual - expected).powi(2))
-            .sum::<f32>()
-            .sqrt();
-        let norm = expected
-            .iter()
-            .map(|value| value.powi(2))
-            .sum::<f32>()
-            .sqrt();
-        assert!(
-            error <= 1.0e-5 * norm.max(1.0),
-            "{actual:?} != {expected:?}"
-        );
+    #[test]
+    fn builder_softmax_matches_the_trusted_operation() {
+        use crate::program::{Program, ReduceOp};
+
+        let values = (0..(7 * 33))
+            .map(|index| f32::from(u16::try_from(index).unwrap()) * 0.03125 - 2.0)
+            .collect::<Vec<_>>();
+        let input = Tensor::from_slice(&values, &[7, 33]).unwrap();
+        let expected = input.softmax_last_dim().unwrap();
+        let program = Program::row();
+        let value = program.input(0);
+        let maximum = program.reduce(ReduceOp::Max, value);
+        let exponent = (value - maximum).exp();
+        program.output(0, exponent / program.reduce(ReduceOp::Sum, exponent));
+        let actual = input.run_program(&program, &[]).unwrap().remove(0);
+
+        assert_f32_values_agree(&expected.to_vec().unwrap(), &actual.to_vec().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn builder_rms_norm_matches_the_trusted_operation() {
+        use crate::program::{Program, ReduceOp};
+
+        let values = (0..(7 * 1024))
+            .map(|index| f32::from(u16::try_from(index % 257).unwrap()) * 0.007_812_5 - 1.0)
+            .collect::<Vec<_>>();
+        let weights = (0..1024)
+            .map(|index| 0.5 + f32::from(u16::try_from(index).unwrap()) * 0.000_976_562_5)
+            .collect::<Vec<_>>();
+        let input = Tensor::from_slice(&values, &[7, 1024]).unwrap();
+        let weight = Tensor::from_slice(&weights, &[1024]).unwrap();
+        let expected = input.rms_norm(&weight, 1.0e-6).unwrap();
+        let broadcast_weight = weight.broadcast_as(&[7, 1024]).unwrap();
+        let program = Program::row();
+        let value = program.input(0);
+        let square_sum = program.reduce(ReduceOp::Sum, value * value);
+        let inverse_rms = (square_sum / program.extent(-1) + 1.0e-6).rsqrt();
+        program.output(0, value * inverse_rms * program.input(1));
+        let actual = input
+            .run_program(&program, &[&broadcast_weight])
+            .unwrap()
+            .remove(0);
+
+        assert_f32_values_agree(&expected.to_vec().unwrap(), &actual.to_vec().unwrap()).unwrap();
     }
 }

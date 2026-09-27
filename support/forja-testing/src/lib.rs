@@ -241,6 +241,22 @@ pub fn normwise_relative_error(reference: &[f32], candidate: &[f32]) -> f64 {
     }
 }
 
+/// Checks f32 values with the shared normwise relative-error tolerance.
+///
+/// # Errors
+///
+/// Returns an error when lengths differ or the candidate exceeds [`F32_TOLERANCE`].
+pub fn assert_f32_values_agree(reference: &[f32], candidate: &[f32]) -> Result<(), AgreementError> {
+    let error = normwise_relative_error(reference, candidate);
+    if error > F32_TOLERANCE {
+        return Err(AgreementError::OutsideTolerance {
+            error,
+            tolerance: F32_TOLERANCE,
+        });
+    }
+    Ok(())
+}
+
 /// Runs identical initialized work on two backends and checks the output tolerance.
 ///
 /// # Errors
