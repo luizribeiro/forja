@@ -113,8 +113,8 @@
               name = "qwen-weights-hook";
               runtimeInputs = [ pkgs.cargo-nextest ];
               text = ''
-                if [[ -z "''${FORJA_MODELS:-}" && -n "''${CI:-}" ]]; then
-                  echo "skipping model tests: CI runners have no model weights"
+                if [[ "''${GITHUB_ACTIONS:-}" == "true" ]]; then
+                  echo "skipping model tests: GitHub Actions runners have no model weights"
                   exit 0
                 fi
                 export FORJA_MODELS="''${FORJA_MODELS:-$HOME/.cache/forja/models}"
