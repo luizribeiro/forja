@@ -9,6 +9,7 @@ version.workspace = true
 [dependencies]
 forja-core = { path = "../../crates/forja-core" }
 half = "2"
+proptest = "1"
 
 [dev-dependencies]
 forja-cpu = { path = "../../crates/forja-cpu" }

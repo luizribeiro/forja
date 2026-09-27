@@ -1,5 +1,7 @@
 //! Shared deterministic and numeric helpers for backend tests.
 
+pub mod program;
+
 use std::{error::Error, fmt};
 
 use forja_core::{Backend, BackendError, DType, Op, Slice, Submission, Tensor, ViewOp};

@@ -733,6 +733,7 @@ dependencies = [
  "forja-core",
  "forja-cpu",
  "half",
+ "proptest",
 ]
 
 [[package]]
