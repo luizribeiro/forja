@@ -1,5 +1,11 @@
 [workspace]
-members = ["hello", "rmsnorm-smoke", "tensor-abuse", "tensor-smoke"]
+members = [
+  "hello",
+  "rmsnorm-smoke",
+  "tensor-abuse",
+  "tensor-smoke",
+  "weights-smoke",
+]
 resolver = "3"
 
 [workspace.package]

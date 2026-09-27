@@ -1165,22 +1165,130 @@ impl From<BackendError> for GuestFailure {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{
-        Arc, Condvar, Mutex,
-        atomic::{AtomicUsize, Ordering},
-    };
     use std::time::Duration;
+    use std::{
+        fs,
+        sync::{
+            Arc, Condvar, Mutex,
+            atomic::{AtomicU64, AtomicUsize, Ordering},
+        },
+    };
 
     use forja_core::{
-        Backend, BackendError, CommandList, DType, LayoutError, OpError, Submission, Tensor,
-        ViewOp as CoreViewOp,
+        Backend, BackendError, BufferId, CommandList, DType, Layout, LayoutError, MappedRegion,
+        OpError, Submission, Tensor, ViewOp as CoreViewOp,
     };
     use forja_cpu::CpuBackend;
     use wasmtime::component::Resource;
 
-    use super::{Host, Limits, bindings::l9o::gpu::compute};
+    use super::{Grants, Host, Limits, bindings::l9o::gpu::compute};
 
     const GENEROUS: Limits = Limits::new(u64::MAX, 8, u64::MAX, 32, u64::MAX);
+    static NEXT_WEIGHT_FILE: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn repeated_weight_opens_share_one_import_and_obey_handle_quota() {
+        let path = test_weight_file();
+        let imports = Arc::new(AtomicUsize::new(0));
+        let releases = Arc::new(AtomicUsize::new(0));
+        let backend = ImportCountingBackend {
+            inner: CpuBackend::new(),
+            imports: Arc::clone(&imports),
+            releases: Arc::clone(&releases),
+        };
+        let limits = Limits::new(u64::MAX, 8, u64::MAX, 8, u64::MAX);
+        let grants = Grants::new().with_weights("model", &path);
+        let mut host = Host::with_grants(backend, limits, grants);
+        let mut handles = Vec::new();
+        let mut quota_errors = 0;
+
+        for _ in 0..10_000 {
+            match host.open_weights("model") {
+                Ok(handle) => handles.push(handle),
+                Err(compute::Error::Quota(_)) => quota_errors += 1,
+                Err(error) => panic!("unexpected open error: {error:?}"),
+            }
+        }
+
+        assert_eq!(handles.len(), 8);
+        assert_eq!(quota_errors, 9_992);
+        assert_eq!(imports.load(Ordering::Acquire), 1);
+
+        host.drop_weights(handles.pop().unwrap()).unwrap();
+        let tensor = host
+            .weight_tensor(&Resource::new_borrow(handles[0].rep()), "value")
+            .unwrap();
+        for handle in handles {
+            host.drop_weights(handle).unwrap();
+        }
+        let reopened = host.open_weights("model").unwrap();
+        assert_eq!(imports.load(Ordering::Acquire), 1);
+        host.drop_weights(reopened).unwrap();
+        host.drop_tensor(tensor).unwrap();
+        assert_eq!(releases.load(Ordering::Acquire), 1);
+        fs::remove_file(path).unwrap();
+    }
+
+    fn test_weight_file() -> std::path::PathBuf {
+        let mut header = br#"{"value":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#.to_vec();
+        while !(header.len() + 8).is_multiple_of(8) {
+            header.push(b' ');
+        }
+        let mut bytes = u64::try_from(header.len()).unwrap().to_le_bytes().to_vec();
+        bytes.extend(header);
+        bytes.extend(1.0_f32.to_le_bytes());
+        let path = std::env::temp_dir().join(format!(
+            "forja-weight-cache-{}-{}",
+            std::process::id(),
+            NEXT_WEIGHT_FILE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    struct ImportCountingBackend {
+        inner: CpuBackend,
+        imports: Arc<AtomicUsize>,
+        releases: Arc<AtomicUsize>,
+    }
+
+    impl Backend for ImportCountingBackend {
+        type Submission = <CpuBackend as Backend>::Submission;
+
+        fn alloc(&self, dtype: DType, shape: &[u32]) -> Result<Tensor, BackendError> {
+            self.inner.alloc(dtype, shape)
+        }
+
+        fn import_readonly(&self, bytes: MappedRegion) -> Result<BufferId, BackendError> {
+            self.imports.fetch_add(1, Ordering::AcqRel);
+            self.inner.import_readonly(bytes)
+        }
+
+        fn tensor(&self, buffer: BufferId, layout: Layout) -> Result<Tensor, BackendError> {
+            self.inner.tensor(buffer, layout)
+        }
+
+        fn view(&self, tensor: &Tensor, op: CoreViewOp) -> Result<Tensor, BackendError> {
+            self.inner.view(tensor, op)
+        }
+
+        fn write(&self, tensor: &Tensor, bytes: &[u8]) -> Result<(), BackendError> {
+            self.inner.write(tensor, bytes)
+        }
+
+        fn read(&self, tensor: &Tensor) -> Result<Vec<u8>, BackendError> {
+            self.inner.read(tensor)
+        }
+
+        fn release(&self, tensor: &Tensor) -> Result<(), BackendError> {
+            self.releases.fetch_add(1, Ordering::AcqRel);
+            self.inner.release(tensor)
+        }
+
+        fn submit(&self, commands: CommandList) -> Result<Self::Submission, BackendError> {
+            self.inner.submit(commands)
+        }
+    }
 
     #[test]
     fn refuses_each_quota_before_allocation() {

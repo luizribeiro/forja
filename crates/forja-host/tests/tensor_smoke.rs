@@ -1,13 +1,19 @@
 //! End-to-end component tests for the guest tensor surface.
 
 use forja_core::{Backend, CommandList, DType, Op, Submission};
-use forja_host::{Host, Limits, add_to_linker};
-use std::path::Path;
+use forja_host::{Grants, Host, Limits, add_to_linker};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
+};
 use wasmtime::component::{Component, Instance, Linker};
 use wasmtime::{Config, Engine, Store};
 
 const LIMITS: Limits = Limits::new(64 * 1024, 8, 16 * 1024, 8, 64 * 1024);
 const COMMAND_LIMITS: Limits = Limits::new(128 * 1024, 8, 16 * 1024, 8, 64 * 1024);
+const WEIGHT_LIMITS: Limits = Limits::new(20, 8, 16 * 1024, 4, 64 * 1024);
+static NEXT_WEIGHT_FILE: AtomicU64 = AtomicU64::new(0);
 
 #[tokio::test(flavor = "multi_thread")]
 async fn cpu_tensor_smoke() -> wasmtime::Result<()> {
@@ -42,6 +48,17 @@ async fn metal_tensor_smoke_submits_commands() -> wasmtime::Result<()> {
         run_commands(forja_metal::MetalBackend::new().map_err(wasmtime::Error::msg)?).await?;
     assert_eq!(actual, expected);
     Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cpu_guest_uses_granted_weights() -> wasmtime::Result<()> {
+    run_weights(forja_cpu::CpuBackend::new()).await
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test(flavor = "multi_thread")]
+async fn metal_guest_uses_granted_weights() -> wasmtime::Result<()> {
+    run_weights(forja_metal::MetalBackend::new().map_err(wasmtime::Error::msg)?).await
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -145,6 +162,57 @@ where
     result.map_err(wasmtime::Error::msg)
 }
 
+async fn run_weights<B>(backend: B) -> wasmtime::Result<()>
+where
+    B: Backend + Send + Sync + 'static,
+{
+    let path = weight_file();
+    let grants = Grants::new().with_weights("model", &path);
+    let result = async {
+        let (mut store, instance) =
+            instantiate_with_grants(backend, test_guests::weights_smoke(), WEIGHT_LIMITS, grants)
+                .await?;
+        let run = instance.get_typed_func::<(), (Result<Vec<u8>, String>,)>(&mut store, "run")?;
+        let (result,) = store
+            .run_concurrent(async move |accessor| run.call_concurrent(accessor, ()).await)
+            .await??;
+        let actual = result.map_err(wasmtime::Error::msg)?;
+        let expected = [22.0_f32, 28.0]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>();
+        if actual != expected {
+            return Err(wasmtime::Error::msg("weight matmul result differed"));
+        }
+        Ok(())
+    }
+    .await;
+    fs::remove_file(path)?;
+    result
+}
+
+fn weight_file() -> PathBuf {
+    let mut header =
+        br#"{"projection":{"dtype":"F32","shape":[3,2],"data_offsets":[0,24]}}"#.to_vec();
+    while !(header.len() + 8).is_multiple_of(8) {
+        header.push(b' ');
+    }
+    let mut bytes = u64::try_from(header.len()).unwrap().to_le_bytes().to_vec();
+    bytes.extend(header);
+    bytes.extend(
+        [1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0]
+            .into_iter()
+            .flat_map(f32::to_le_bytes),
+    );
+    let path = std::env::temp_dir().join(format!(
+        "forja-weight-guest-{}-{}",
+        std::process::id(),
+        NEXT_WEIGHT_FILE.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::write(&path, bytes).unwrap();
+    path
+}
+
 fn direct_checksums<B: Backend>(backend: &B) -> wasmtime::Result<(u64, u64)> {
     let input = backend
         .alloc(DType::F32, &[7, 1024])
@@ -210,6 +278,18 @@ async fn instantiate<B>(
 where
     B: Backend + Send + Sync + 'static,
 {
+    instantiate_with_grants(backend, component_path, limits, Grants::new()).await
+}
+
+async fn instantiate_with_grants<B>(
+    backend: B,
+    component_path: &Path,
+    limits: Limits,
+    grants: Grants,
+) -> wasmtime::Result<(Store<Host<B>>, Instance)>
+where
+    B: Backend + Send + Sync + 'static,
+{
     let mut config = Config::new();
     config.wasm_component_model_async(true);
     config.concurrency_support(true);
@@ -217,7 +297,7 @@ where
     let component = Component::from_file(&engine, component_path)?;
     let mut linker = Linker::new(&engine);
     add_to_linker(&mut linker)?;
-    let mut store = Host::new_store(&engine, backend, limits);
+    let mut store = Host::new_store_with_grants(&engine, backend, limits, grants);
     let instance = linker.instantiate_async(&mut store, &component).await?;
     Ok((store, instance))
 }

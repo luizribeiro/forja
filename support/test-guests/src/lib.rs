@@ -27,6 +27,12 @@ pub fn tensor_abuse() -> &'static Path {
     Path::new(env!("TENSOR_ABUSE_COMPONENT"))
 }
 
+/// Returns the path to the guest that consumes host-granted weights.
+#[must_use]
+pub fn weights_smoke() -> &'static Path {
+    Path::new(env!("WEIGHTS_SMOKE_COMPONENT"))
+}
+
 #[cfg(test)]
 mod tests {
     use wasmtime::component::{Component, Linker, ResourceTable};
