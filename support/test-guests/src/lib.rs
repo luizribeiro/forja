@@ -9,6 +9,12 @@ pub fn engine_smoke() -> &'static Path {
     Path::new(env!("ENGINE_SMOKE_COMPONENT"))
 }
 
+/// Returns the path to the SDK-exported engine component.
+#[must_use]
+pub fn engine_sdk_smoke() -> &'static Path {
+    Path::new(env!("ENGINE_SDK_SMOKE_COMPONENT"))
+}
+
 /// Returns the path to the guest that exports a greeting function.
 #[must_use]
 pub fn hello() -> &'static Path {

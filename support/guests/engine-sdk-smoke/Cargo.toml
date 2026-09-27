@@ -1,0 +1,11 @@
+[package]
+name = "engine-sdk-smoke"
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+forja-sdk.workspace = true

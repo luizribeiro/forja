@@ -346,6 +346,12 @@ impl<T: Element> Tensor<T> {
     pub(crate) fn handle(&self) -> &sys::Handle {
         &self.handle
     }
+
+    #[cfg(all(target_family = "wasm", not(feature = "native")))]
+    #[doc(hidden)]
+    pub fn into_guest(self) -> sys::guest::compute::Tensor {
+        self.handle
+    }
 }
 
 impl<T: Element> Add<&Tensor<T>> for &Tensor<T> {

@@ -35,6 +35,7 @@
 #![forbid(unsafe_code)]
 
 mod element;
+mod engine;
 mod graph;
 mod load;
 pub mod nn;
@@ -44,7 +45,9 @@ mod tensor;
 use std::{error, fmt};
 
 pub use element::Element;
+pub use engine::{Engine, EngineInfo, StepInput, StepOutput};
 pub use forja_sdk_macros::Load;
+pub use forja_sdk_macros::export_engine;
 pub use graph::eval;
 pub use half::{bf16, f16};
 pub use load::{Load, Weights};
@@ -95,3 +98,10 @@ impl fmt::Display for Error {
 }
 
 impl error::Error for Error {}
+
+#[cfg(target_family = "wasm")]
+#[doc(hidden)]
+pub mod __private {
+    pub use crate::sys::guest::compute;
+    pub use wit_bindgen;
+}

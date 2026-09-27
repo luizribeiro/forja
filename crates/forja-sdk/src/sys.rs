@@ -67,7 +67,7 @@ pub(crate) trait Backend {
 
 #[cfg(target_family = "wasm")]
 pub(crate) mod guest {
-    #![allow(clippy::same_length_and_capacity)]
+    #![allow(missing_docs, clippy::same_length_and_capacity)]
 
     wit_bindgen::generate!({
         path: "../../wit",
@@ -75,7 +75,7 @@ pub(crate) mod guest {
     });
 
     use super::{Backend, DType, Error, Op, Result, View};
-    use l9o::gpu::compute;
+    pub use l9o::gpu::compute;
 
     pub(crate) struct Guest;
 

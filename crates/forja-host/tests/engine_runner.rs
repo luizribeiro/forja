@@ -16,6 +16,11 @@ async fn runs_an_engine_and_reads_its_logits() -> wasmtime::Result<()> {
 }
 
 #[tokio::test]
+async fn runs_an_sdk_exported_engine() -> wasmtime::Result<()> {
+    run_engine(test_guests::engine_sdk_smoke(), true).await
+}
+
+#[tokio::test]
 async fn guest_step_stops_at_its_cpu_deadline() -> wasmtime::Result<()> {
     let limits = LIMITS.with_guest_call_timeout(Duration::from_millis(50));
     let weights = weight_file()?;

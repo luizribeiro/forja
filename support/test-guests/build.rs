@@ -23,6 +23,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &release_dir.join("engine_smoke.wasm"),
     );
     emit_guest_path(
+        "ENGINE_SDK_SMOKE_COMPONENT",
+        &release_dir.join("engine_sdk_smoke.wasm"),
+    );
+    emit_guest_path(
         "RMSNORM_SMOKE_COMPONENT",
         &release_dir.join("rmsnorm_smoke.wasm"),
     );
@@ -42,6 +46,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "cargo::rerun-if-changed={}",
         repository.join("support/guests").display()
+    );
+    println!(
+        "cargo::rerun-if-changed={}",
+        repository.join("crates/forja-sdk").display()
+    );
+    println!(
+        "cargo::rerun-if-changed={}",
+        repository.join("crates/forja-sdk-macros").display()
+    );
+    println!(
+        "cargo::rerun-if-changed={}",
+        repository.join("wit").display()
     );
     Ok(())
 }

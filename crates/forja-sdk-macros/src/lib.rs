@@ -5,9 +5,153 @@
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
 use syn::{
-    Data, DeriveInput, Expr, Field, Fields, GenericArgument, LitStr, PathArguments, Type,
+    Data, DeriveInput, Expr, Field, Fields, GenericArgument, ItemImpl, LitStr, PathArguments, Type,
     parse_macro_input,
 };
+
+const COMPUTE_WIT: &str = include_str!("../../../wit/compute.wit");
+const ENGINE_WIT: &str = include_str!("../../../wit/engine.wit");
+
+/// Exports one `forja_sdk::Engine` implementation as a component.
+#[proc_macro_attribute]
+pub fn export_engine(_attribute: TokenStream, item: TokenStream) -> TokenStream {
+    let item = parse_macro_input!(item as ItemImpl);
+    expand_engine(&item)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+fn validate_engine(item: &ItemImpl) -> syn::Result<()> {
+    let Some((_, trait_path, _)) = &item.trait_ else {
+        return Err(syn::Error::new_spanned(
+            &item.self_ty,
+            "export_engine requires `impl Engine for Type`",
+        ));
+    };
+    if trait_path
+        .segments
+        .last()
+        .is_none_or(|segment| segment.ident != "Engine")
+    {
+        return Err(syn::Error::new_spanned(
+            trait_path,
+            "export_engine requires `impl Engine for Type`",
+        ));
+    }
+    if !item.generics.params.is_empty() {
+        return Err(syn::Error::new_spanned(
+            &item.generics,
+            "exported engines cannot have generic parameters",
+        ));
+    }
+    Ok(())
+}
+
+fn expand_engine(item: &ItemImpl) -> syn::Result<proc_macro2::TokenStream> {
+    validate_engine(item)?;
+    let engine = &item.self_ty;
+    let engine_wit = ENGINE_WIT
+        .strip_prefix("package l9o:gpu@0.1.0;\n")
+        .ok_or_else(|| syn::Error::new_spanned(&item.self_ty, "engine WIT package changed"))?;
+    let wit = format!("{COMPUTE_WIT}\n{engine_wit}");
+    Ok(quote! {
+        #item
+
+        #[cfg(target_family = "wasm")]
+        mod __forja_engine_export {
+            use ::std::cell::RefCell;
+            use ::forja_sdk::__private::wit_bindgen as wit_bindgen;
+
+            type ExportedEngine = super::#engine;
+
+            mod bindings {
+                use ::forja_sdk::__private::wit_bindgen as wit_bindgen;
+
+                ::forja_sdk::__private::wit_bindgen::generate!({
+                    inline: #wit,
+                    world: "engine-component",
+                    runtime_path: "::forja_sdk::__private::wit_bindgen::rt",
+                    with: {
+                        "l9o:gpu/compute@0.1.0": ::forja_sdk::__private::compute,
+                    },
+                });
+            }
+
+            use bindings::exports::l9o::gpu::engine::{
+                EngineInfo as WitEngineInfo, Guest, StepIn, StepOut,
+            };
+            use ::forja_sdk::__private::compute;
+
+            struct Component;
+
+            ::std::thread_local! {
+                static ENGINE: RefCell<Option<ExportedEngine>> = const { RefCell::new(None) };
+            }
+
+            impl Guest for Component {
+                fn describe() -> WitEngineInfo {
+                    let info = <ExportedEngine as ::forja_sdk::Engine>::describe();
+                    WitEngineInfo {
+                        vocab: info.vocab,
+                        max_context: info.max_context,
+                        tap_layers: info.tap_layers,
+                    }
+                }
+
+                async fn load(
+                    weights: &compute::Weights,
+                ) -> ::std::result::Result<(), compute::Error> {
+                    let weights = ::forja_sdk::Weights::from_guest(weights);
+                    let engine = <ExportedEngine as ::forja_sdk::Engine>::load(&weights)
+                        .map_err(wit_error)?;
+                    ENGINE.with(|slot| {
+                        let mut slot = slot.try_borrow_mut().map_err(|_| {
+                            compute::Error::OpSignature("engine state is already borrowed".into())
+                        })?;
+                        *slot = Some(engine);
+                        Ok(())
+                    })
+                }
+
+                async fn step(input: StepIn) -> ::std::result::Result<StepOut, compute::Error> {
+                    let tokens = ::forja_sdk::Tensor::from_slice(
+                        &input.tokens,
+                        &[u32::try_from(input.tokens.len()).map_err(|_| {
+                            compute::Error::Layout("token count exceeds u32".into())
+                        })?],
+                    ).map_err(wit_error)?;
+                    let output = ENGINE.with(|slot| {
+                        let mut slot = slot.try_borrow_mut().map_err(|_| {
+                            compute::Error::OpSignature("engine state is already borrowed".into())
+                        })?;
+                        let engine = slot.as_mut().ok_or_else(|| {
+                            compute::Error::InvalidHandle("engine is not loaded".into())
+                        })?;
+                        <ExportedEngine as ::forja_sdk::Engine>::step(
+                            engine,
+                            ::forja_sdk::StepInput {
+                                tokens,
+                                start_pos: input.start_pos,
+                                taps: input.taps,
+                            },
+                        ).map_err(wit_error)
+                    })?;
+                    ::forja_sdk::eval().map_err(wit_error)?;
+                    Ok(StepOut {
+                        logits: output.logits.into_guest(),
+                        taps: output.taps.into_iter().map(::forja_sdk::Tensor::into_guest).collect(),
+                    })
+                }
+            }
+
+            fn wit_error(error: ::forja_sdk::Error) -> compute::Error {
+                compute::Error::OpSignature(error.to_string())
+            }
+
+            bindings::export!(Component with_types_in bindings);
+        }
+    })
+}
 
 /// Derives recursive loading from a safetensors namespace.
 ///
