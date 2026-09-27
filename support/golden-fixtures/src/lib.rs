@@ -173,6 +173,15 @@ pub fn decode_f32_le(bytes: &[u8]) -> Result<Vec<f32>, DecodeError> {
         .collect())
 }
 
+/// Computes the lowercase SHA-256 digest of a file.
+///
+/// # Errors
+///
+/// Returns an error when the file cannot be read.
+pub fn sha256_file(path: impl AsRef<Path>) -> std::io::Result<String> {
+    fs::read(path).map(|bytes| format!("{:x}", Sha256::digest(bytes)))
+}
+
 /// A byte slice ended with a partial f32 value.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DecodeError;

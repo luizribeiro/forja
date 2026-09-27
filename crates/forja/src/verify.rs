@@ -1,10 +1,10 @@
-use std::{error::Error, time::Duration};
+use std::{error::Error, path::Path, time::Duration};
 
 use forja_core::Backend;
 use forja_host::{EngineRunner, EngineStep, Limits};
 use golden_fixtures::{
-    BF16_HIDDEN_STATE_TOLERANCE, FixtureDirectory, LOGIT_KL_TOLERANCE, mean_logit_kl_divergence,
-    normwise_relative_error,
+    BF16_HIDDEN_STATE_TOLERANCE, FixtureDirectory, LOGIT_KL_TOLERANCE, decode_f32_le,
+    mean_logit_kl_divergence, normwise_relative_error, sha256_file,
 };
 
 use crate::args::{Backend as BackendArg, Verify};
@@ -15,12 +15,14 @@ pub(crate) async fn run(options: &Verify) -> Result<(), Box<dyn Error>> {
 
 async fn run_with_steps(options: &Verify, decode_steps: usize) -> Result<(), Box<dyn Error>> {
     let fixtures = FixtureDirectory::open(&options.fixtures)?;
+    let weights = verify_model_hash(options, &fixtures)?;
     match options.backend {
         BackendArg::Cpu => {
             verify(
                 forja_cpu::CpuBackend::new(),
                 options,
                 &fixtures,
+                &weights,
                 decode_steps,
             )
             .await
@@ -30,7 +32,7 @@ async fn run_with_steps(options: &Verify, decode_steps: usize) -> Result<(), Box
             {
                 let backend = forja_metal::MetalBackend::new()
                     .map_err(|error| format!("cannot create Metal backend: {error}"))?;
-                verify(backend, options, &fixtures, decode_steps).await
+                verify(backend, options, &fixtures, &weights, decode_steps).await
             }
             #[cfg(not(target_os = "macos"))]
             Err("the Metal backend requires macOS".into())
@@ -42,12 +44,12 @@ async fn verify<B>(
     backend: B,
     options: &Verify,
     fixtures: &FixtureDirectory,
+    weights: &Path,
     decode_steps: usize,
 ) -> Result<(), Box<dyn Error>>
 where
     B: Backend + Send + Sync + 'static,
 {
-    let weights = options.model_dir.join("model.safetensors");
     let mut runner = EngineRunner::new(test_guests::qwen3(), backend, limits(), weights).await?;
     let info = runner.describe().await?;
     if info.vocab != 151_936
@@ -77,11 +79,11 @@ where
             })
             .await?
             .map_err(|error| format!("engine step failed: {error:?}"))?;
-        let logits = decode_f32(&runner.read(&output.logits).await?)?;
+        let logits = decode_f32_le(&runner.read(&output.logits).await?)?;
         let mut first_failing = None;
         let mut maximum_layer_error = 0.0_f64;
         for (index, tap) in output.taps.iter().enumerate() {
-            let values = decode_f32(&runner.read(tap).await?)?;
+            let values = decode_f32_le(&runner.read(tap).await?)?;
             let reference = fixture
                 .hidden_state(index + 1)
                 .ok_or("hidden-state fixture is missing")?;
@@ -129,6 +131,22 @@ where
     } else {
         Err("verification failed".into())
     }
+}
+
+fn verify_model_hash(
+    options: &Verify,
+    fixtures: &FixtureDirectory,
+) -> Result<std::path::PathBuf, Box<dyn Error>> {
+    let weights = options.model_dir.join("model.safetensors");
+    let actual = sha256_file(&weights)?;
+    let expected = fixtures.model_sha256();
+    if actual != expected {
+        return Err(format!(
+            "model SHA-256 mismatch: model has {actual}, fixtures require {expected}"
+        )
+        .into());
+    }
+    Ok(weights)
 }
 
 async fn decode<B>(
@@ -183,7 +201,7 @@ where
                 })
                 .await?
                 .map_err(|error| format!("decode step failed: {error:?}"))?;
-            logits = decode_f32(&runner.read(&output.logits).await?)?;
+            logits = decode_f32_le(&runner.read(&output.logits).await?)?;
         }
     }
     Ok((total_kl / f64::from(u32::try_from(steps)?), agreement))
@@ -216,17 +234,6 @@ fn selected_prompts<'a>(
         .collect()
 }
 
-fn decode_f32(bytes: &[u8]) -> Result<Vec<f32>, Box<dyn Error>> {
-    let (values, remainder) = bytes.as_chunks::<4>();
-    if !remainder.is_empty() {
-        return Err("tensor contains a partial f32 value".into());
-    }
-    Ok(values
-        .iter()
-        .map(|bytes| f32::from_le_bytes(*bytes))
-        .collect())
-}
-
 const fn limits() -> Limits {
     Limits::new(
         8 * 1024 * 1024 * 1024,
@@ -242,7 +249,11 @@ const fn limits() -> Limits {
 
 #[cfg(test)]
 mod tests {
-    use std::{env, path::PathBuf};
+    use std::{
+        env, fs,
+        path::PathBuf,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     use super::*;
 
@@ -257,6 +268,39 @@ mod tests {
     #[ignore = "requires FORJA_MODELS and runs in the pre-push hook"]
     fn metal_qwen_verification() -> Result<(), Box<dyn Error>> {
         run_model_test(BackendArg::Metal, Vec::new(), 32)
+    }
+
+    #[test]
+    fn rejects_a_model_hash_that_differs_from_the_manifest() -> Result<(), Box<dyn Error>> {
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let root = env::temp_dir().join(format!("forja-verify-hash-{nonce}"));
+        let model = root.join("model");
+        let fixtures_path = root.join("fixtures");
+        fs::create_dir_all(&model)?;
+        fs::create_dir(&fixtures_path)?;
+        fs::write(model.join("model.safetensors"), b"not a model")?;
+        let expected = "0".repeat(64);
+        fs::write(
+            fixtures_path.join("manifest.json"),
+            format!(
+                "{{\"schema_version\":1,\"model\":{{\"sha256\":\"{expected}\"}},\"prompts\":[]}}"
+            ),
+        )?;
+        let options = Verify {
+            model_dir: model,
+            fixtures: fixtures_path.clone(),
+            backend: BackendArg::Cpu,
+            prompts: Vec::new(),
+        };
+        let fixtures = FixtureDirectory::open(fixtures_path)?;
+        let actual = sha256_file(options.model_dir.join("model.safetensors"))?;
+        let error = verify_model_hash(&options, &fixtures)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(&actual));
+        assert!(error.contains(&expected));
+        fs::remove_dir_all(root)?;
+        Ok(())
     }
 
     fn run_model_test(
