@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-use crate::{BufferId, CommandList, DType, Slice, Tensor};
+use crate::{BufferId, CommandList, DType, Layout, Slice, Tensor};
 
 static NEXT_BACKEND: AtomicU64 = AtomicU64::new(1);
 
@@ -22,6 +22,7 @@ pub struct AllocationRegistry<S> {
 struct Allocation<S> {
     storage: S,
     byte_len: u64,
+    writable: bool,
 }
 
 impl<S> AllocationRegistry<S> {
@@ -41,13 +42,65 @@ impl<S> AllocationRegistry<S> {
     ///
     /// Returns [`BackendError::AllocationFailed`] if allocation identities are exhausted.
     pub fn insert(&mut self, storage: S, byte_len: u64) -> Result<BufferId, BackendError> {
+        self.insert_with_access(storage, byte_len, true)
+    }
+
+    /// Registers read-only storage and returns its allocation identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BackendError::AllocationFailed`] if allocation identities are exhausted.
+    pub fn insert_read_only(
+        &mut self,
+        storage: S,
+        byte_len: u64,
+    ) -> Result<BufferId, BackendError> {
+        self.insert_with_access(storage, byte_len, false)
+    }
+
+    fn insert_with_access(
+        &mut self,
+        storage: S,
+        byte_len: u64,
+        writable: bool,
+    ) -> Result<BufferId, BackendError> {
         let allocation = self.next_allocation;
         self.next_allocation = allocation
             .checked_add(1)
             .ok_or(BackendError::AllocationFailed)?;
-        self.allocations
-            .insert(allocation, Allocation { storage, byte_len });
+        self.allocations.insert(
+            allocation,
+            Allocation {
+                storage,
+                byte_len,
+                writable,
+            },
+        );
         Ok(BufferId::new(self.backend, allocation, byte_len))
+    }
+
+    /// Creates a tensor for a registered allocation and validated layout.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BackendError::InvalidInput`] for a foreign, released, or length-mismatched
+    /// allocation.
+    pub fn tensor(&self, buffer: BufferId, layout: Layout) -> Result<Tensor, BackendError> {
+        let allocation = self.validate_buffer(buffer, layout.buffer_len())?;
+        Tensor::from_allocation(buffer, layout, allocation.writable)
+            .map_err(|_| BackendError::InvalidInput)
+    }
+
+    /// Creates a tensor view after validating its source allocation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BackendError::InvalidInput`] for a foreign, released, or length-mismatched
+    /// tensor or layout.
+    pub fn view(&self, tensor: &Tensor, layout: Layout) -> Result<Tensor, BackendError> {
+        let allocation = self.validate(tensor)?;
+        Tensor::from_allocation(tensor.buffer(), layout, allocation.writable)
+            .map_err(|_| BackendError::InvalidInput)
     }
 
     /// Returns storage after validating that the tensor names this live allocation.
@@ -87,7 +140,18 @@ impl<S> AllocationRegistry<S> {
     }
 
     fn validate(&self, tensor: &Tensor) -> Result<&Allocation<S>, BackendError> {
-        let id = tensor.buffer();
+        let allocation = self.validate_buffer(tensor.buffer(), tensor.layout().buffer_len())?;
+        if allocation.writable != tensor.is_writable() {
+            return Err(BackendError::InvalidInput);
+        }
+        Ok(allocation)
+    }
+
+    fn validate_buffer(
+        &self,
+        id: BufferId,
+        layout_buffer_len: u64,
+    ) -> Result<&Allocation<S>, BackendError> {
         if id.backend() != self.backend {
             return Err(BackendError::InvalidInput);
         }
@@ -95,9 +159,7 @@ impl<S> AllocationRegistry<S> {
             .allocations
             .get(&id.allocation())
             .ok_or(BackendError::InvalidInput)?;
-        if allocation.byte_len != id.byte_len()
-            || allocation.byte_len != tensor.layout().buffer_len()
-        {
+        if allocation.byte_len != id.byte_len() || allocation.byte_len != layout_buffer_len {
             return Err(BackendError::InvalidInput);
         }
         Ok(allocation)

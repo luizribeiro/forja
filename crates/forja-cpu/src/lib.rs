@@ -43,10 +43,10 @@ impl CpuBackend {
             .buffers
             .lock()
             .map_err(|_| BackendError::ExecutionFailed)?;
-        let buffer = buffers.insert(bytes, byte_len)?;
         let layout = Layout::contiguous(dtype, 0, shape.to_vec(), byte_len)
             .map_err(|_| BackendError::InvalidInput)?;
-        Tensor::new(buffer, layout).map_err(|_| BackendError::InvalidInput)
+        let buffer = buffers.insert(bytes, byte_len)?;
+        buffers.tensor(buffer, layout)
     }
 
     /// Applies a validated metadata-only view operation.
@@ -55,10 +55,10 @@ impl CpuBackend {
     ///
     /// Returns invalid input for an unknown allocation or invalid view.
     pub fn view(&self, tensor: &Tensor, op: ViewOp) -> Result<Tensor, BackendError> {
-        self.buffers
+        let buffers = self
+            .buffers
             .lock()
-            .map_err(|_| BackendError::ExecutionFailed)?
-            .get(tensor)?;
+            .map_err(|_| BackendError::ExecutionFailed)?;
         let layout = match op {
             ViewOp::Slice(spec) => tensor.layout().slice(&spec),
             ViewOp::Reshape(shape) => tensor.layout().reshape(&shape),
@@ -66,7 +66,7 @@ impl CpuBackend {
             ViewOp::Broadcast(shape) => tensor.layout().broadcast(&shape),
         }
         .map_err(|_| BackendError::InvalidInput)?;
-        Tensor::new(tensor.buffer(), layout).map_err(|_| BackendError::InvalidInput)
+        buffers.view(tensor, layout)
     }
 
     /// Writes contiguous logical tensor bytes.
@@ -75,7 +75,10 @@ impl CpuBackend {
     ///
     /// Returns invalid input for an unknown allocation, non-contiguous view, or wrong byte count.
     pub fn write(&self, tensor: &Tensor, bytes: &[u8]) -> Result<(), BackendError> {
-        if !tensor.layout().is_contiguous() || bytes.len() != logical_byte_len(tensor.layout())? {
+        if !tensor.is_writable()
+            || !tensor.layout().is_contiguous()
+            || bytes.len() != logical_byte_len(tensor.layout())?
+        {
             return Err(BackendError::InvalidInput);
         }
         let range = tensor.layout().byte_span();
@@ -619,29 +622,12 @@ fn encode(source: &[f32], output: DType) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use forja_core::{BufferId, Op, Slice};
+    use forja_core::{Op, Slice};
 
     #[test]
-    fn rejects_unknown_foreign_and_wrong_length_tensors() {
+    fn rejects_foreign_tensors() {
         let backend = CpuBackend::new();
-        let real = backend.alloc(DType::F32, &[1]).unwrap();
-        let backend_id = real.buffer().backend();
-        let wrong_length = Tensor::new(
-            BufferId::new(backend_id, 0, 8),
-            Layout::contiguous(DType::F32, 0, vec![2], 8).unwrap(),
-        )
-        .unwrap();
-        let unknown = Tensor::new(
-            BufferId::new(backend_id, 99, 4),
-            Layout::contiguous(DType::F32, 0, vec![1], 4).unwrap(),
-        )
-        .unwrap();
         let foreign = CpuBackend::new().alloc(DType::F32, &[1]).unwrap();
-        assert_eq!(backend.read(&wrong_length), Err(BackendError::InvalidInput));
-        assert_eq!(
-            backend.view(&unknown, ViewOp::Reshape(vec![1])),
-            Err(BackendError::InvalidInput)
-        );
         assert_eq!(backend.read(&foreign), Err(BackendError::InvalidInput));
     }
 

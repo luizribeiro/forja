@@ -64,24 +64,35 @@ impl Error for TensorError {}
 /// Backends re-check the allocation identity and length whenever they receive
 /// a tensor. Guests only reach tensors through resource handles maintained by
 /// the host, rather than constructing this type directly.
+///
+/// ```compile_fail
+/// use forja_core::{BufferId, DType, Layout, Tensor};
+///
+/// let layout = Layout::contiguous(DType::F32, 0, vec![1], 4)?;
+/// let _ = Tensor::new(BufferId::new(1, 1, 4), layout)?;
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Tensor {
     buffer: BufferId,
     layout: Layout,
+    writable: bool,
 }
 
 impl Tensor {
-    /// Creates a tensor for use by a backend implementation.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`TensorError`] if the layout was validated for another length.
-    #[doc(hidden)]
-    pub fn new(buffer: BufferId, layout: Layout) -> Result<Self, TensorError> {
+    pub(crate) fn from_allocation(
+        buffer: BufferId,
+        layout: Layout,
+        writable: bool,
+    ) -> Result<Self, TensorError> {
         if buffer.byte_len != layout.buffer_len() {
             return Err(TensorError::BufferLengthMismatch);
         }
-        Ok(Self { buffer, layout })
+        Ok(Self {
+            buffer,
+            layout,
+            writable,
+        })
     }
 
     /// Returns the allocation identity.
@@ -94,6 +105,12 @@ impl Tensor {
     #[must_use]
     pub const fn layout(&self) -> &Layout {
         &self.layout
+    }
+
+    /// Reports whether this tensor may be written.
+    #[must_use]
+    pub const fn is_writable(&self) -> bool {
+        self.writable
     }
 }
 
@@ -168,6 +185,8 @@ pub enum OpError {
     },
     /// The output maps multiple logical elements to the same storage.
     NonInjectiveOutput,
+    /// The output tensor does not permit writes.
+    ReadOnlyOutput,
     /// An operand contains no logical elements.
     EmptyOperand {
         /// The empty operand.
@@ -326,6 +345,9 @@ fn check_common(inputs: &[&Tensor], output: &Tensor) -> Result<(), OpError> {
         return Err(OpError::EmptyOperand {
             operand: Operand::Output,
         });
+    }
+    if !output.is_writable() {
+        return Err(OpError::ReadOnlyOutput);
     }
     if !is_injective(output.layout()) {
         return Err(OpError::NonInjectiveOutput);
@@ -591,17 +613,19 @@ mod tests {
 
     fn tensor(buffer: u64, dtype: DType, shape: &[u32], strides: &[u64]) -> Tensor {
         let bytes = u64::from(shape.iter().product::<u32>()) * dtype.byte_size();
-        Tensor::new(
+        Tensor::from_allocation(
             BufferId::new(1, buffer, bytes),
             Layout::new(dtype, 0, shape.to_vec(), strides.to_vec(), bytes).unwrap(),
+            true,
         )
         .unwrap()
     }
 
     fn slice(buffer: u64, start: u64, len: u32) -> Tensor {
-        Tensor::new(
+        Tensor::from_allocation(
             BufferId::new(1, buffer, 64),
             Layout::new(DType::F32, start, vec![len], vec![1], 64).unwrap(),
+            true,
         )
         .unwrap()
     }
@@ -684,9 +708,10 @@ mod tests {
             CommandList::new().dispatch(Op::Copy, &[&input], &output),
             Err(OpError::NonInjectiveOutput)
         );
-        let overlap = Tensor::new(
+        let overlap = Tensor::from_allocation(
             input.buffer(),
             Layout::contiguous(DType::F32, 0, vec![2], 8).unwrap(),
+            true,
         )
         .unwrap();
         assert_eq!(
@@ -707,6 +732,19 @@ mod tests {
             Err(OpError::Shape {
                 operand: Operand::Output
             })
+        );
+    }
+
+    #[test]
+    fn dispatch_rejects_a_read_only_output() {
+        let input = tensor(1, DType::F32, &[2], &[1]);
+        let writable = tensor(2, DType::F32, &[2], &[1]);
+        let output =
+            Tensor::from_allocation(writable.buffer(), writable.layout().clone(), false).unwrap();
+
+        assert_eq!(
+            CommandList::new().dispatch(Op::Copy, &[&input], &output),
+            Err(OpError::ReadOnlyOutput)
         );
     }
 

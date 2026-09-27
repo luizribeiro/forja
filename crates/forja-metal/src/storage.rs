@@ -169,14 +169,17 @@ impl Backend for MetalBackend {
             .buffers
             .lock()
             .map_err(|_| BackendError::ExecutionFailed)?;
-        let id = buffers.insert(buffer, byte_len)?;
         let layout = Layout::contiguous(dtype, 0, shape.to_vec(), byte_len)
             .map_err(|_| BackendError::InvalidInput)?;
-        Tensor::new(id, layout).map_err(|_| BackendError::InvalidInput)
+        let id = buffers.insert(buffer, byte_len)?;
+        buffers.tensor(id, layout)
     }
 
     fn view(&self, tensor: &Tensor, op: ViewOp) -> Result<Tensor, BackendError> {
-        self.validate(tensor)?;
+        let buffers = self
+            .buffers
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?;
         let layout = match op {
             ViewOp::Slice(spec) => tensor.layout().slice(&spec),
             ViewOp::Reshape(shape) => tensor.layout().reshape(&shape),
@@ -184,7 +187,7 @@ impl Backend for MetalBackend {
             ViewOp::Broadcast(shape) => tensor.layout().broadcast(&shape),
         }
         .map_err(|_| BackendError::InvalidInput)?;
-        Tensor::new(tensor.buffer(), layout).map_err(|_| BackendError::InvalidInput)
+        buffers.view(tensor, layout)
     }
 
     fn write(&self, tensor: &Tensor, bytes: &[u8]) -> Result<(), BackendError> {
