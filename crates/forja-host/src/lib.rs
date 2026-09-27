@@ -7,7 +7,7 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 
-use forja_core::{Backend, BackendError, DType, Tensor};
+use forja_core::{Backend, BackendError, DType, LayoutError, Slice, Tensor, ViewOp};
 use wasmtime::component::{Resource, ResourceTable};
 use wasmtime::{Engine, Store, StoreLimits, StoreLimitsBuilder};
 
@@ -83,9 +83,7 @@ struct BufferHandle;
 /// Host-owned state behind a guest tensor resource.
 #[derive(Clone, Debug)]
 pub struct TensorEntry {
-    #[allow(dead_code)]
     tensor: Tensor,
-    #[allow(dead_code)]
     buffer: Arc<BufferHandle>,
 }
 
@@ -156,6 +154,42 @@ impl<B: Backend> Host<B> {
         Ok(resource)
     }
 
+    /// Creates a validated metadata-only tensor view.
+    ///
+    /// # Errors
+    ///
+    /// Returns a layout, quota, backend, or invalid-handle error.
+    pub fn view(
+        &mut self,
+        resource: &Resource<TensorEntry>,
+        operation: compute::ViewOp,
+    ) -> Result<Resource<TensorEntry>, compute::Error> {
+        self.check_handle_quota()?;
+        let entry = self.entry(resource)?.clone();
+        let operation = core_view(operation).map_err(|error| layout_error(&error))?;
+        validate_view(&entry.tensor, &operation).map_err(|error| layout_error(&error))?;
+        let tensor = self
+            .backend
+            .view(&entry.tensor, operation)
+            .map_err(backend_error)?;
+        self.check_tensor_shape(tensor.layout().shape())?;
+        let view = self
+            .table
+            .push(TensorEntry {
+                tensor,
+                buffer: Arc::clone(&entry.buffer),
+            })
+            .map_err(|error| compute::Error::InvalidHandle(error.to_string()))?;
+        self.live_handles += 1;
+        Ok(view)
+    }
+
+    fn entry(&self, resource: &Resource<TensorEntry>) -> Result<&TensorEntry, compute::Error> {
+        self.table
+            .get(resource)
+            .map_err(|error| compute::Error::InvalidHandle(error.to_string()))
+    }
+
     fn check_allocation(&self, dtype: DType, shape: &[u32]) -> Result<u64, compute::Error> {
         self.check_handle_quota()?;
         let elements = self.check_tensor_shape(shape)?;
@@ -207,6 +241,30 @@ fn core_dtype(dtype: compute::Dtype) -> DType {
     }
 }
 
+fn core_view(operation: compute::ViewOp) -> Result<ViewOp, LayoutError> {
+    Ok(match operation {
+        compute::ViewOp::Slice(specs) => ViewOp::Slice(
+            specs
+                .into_iter()
+                .map(|spec| Slice::new(spec.start, spec.len, spec.step))
+                .collect::<Result<_, _>>()?,
+        ),
+        compute::ViewOp::Reshape(shape) => ViewOp::Reshape(shape),
+        compute::ViewOp::Permute(axes) => ViewOp::Permute(axes),
+        compute::ViewOp::Broadcast(shape) => ViewOp::Broadcast(shape),
+    })
+}
+
+fn validate_view(tensor: &Tensor, operation: &ViewOp) -> Result<(), LayoutError> {
+    match operation {
+        ViewOp::Slice(specs) => tensor.layout().slice(specs),
+        ViewOp::Reshape(shape) => tensor.layout().reshape(shape),
+        ViewOp::Permute(axes) => tensor.layout().permute(axes),
+        ViewOp::Broadcast(shape) => tensor.layout().broadcast(shape),
+    }
+    .map(|_| ())
+}
+
 fn quota(message: &str) -> compute::Error {
     compute::Error::Quota(message.to_owned())
 }
@@ -221,9 +279,14 @@ fn backend_error(error: BackendError) -> compute::Error {
     }
 }
 
+fn layout_error(error: &LayoutError) -> compute::Error {
+    compute::Error::Layout(error.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use forja_cpu::CpuBackend;
+    use wasmtime::component::Resource;
 
     use super::{Host, Limits, bindings::l9o::gpu::compute};
 
@@ -259,5 +322,27 @@ mod tests {
                 .allocation(),
             0
         );
+    }
+
+    #[test]
+    fn refuses_views_over_handle_and_element_limits() {
+        let mut host = Host::new(CpuBackend::new(), Limits::new(16, 8, 1, 1, u64::MAX));
+        let tensor = host.alloc(compute::Dtype::F32, &[1]).unwrap();
+        assert!(matches!(
+            host.view(
+                &Resource::new_borrow(tensor.rep()),
+                compute::ViewOp::Reshape(vec![1]),
+            ),
+            Err(compute::Error::Quota(_))
+        ));
+
+        host.limits.live_tensor_handles = 8;
+        assert!(matches!(
+            host.view(
+                &Resource::new_borrow(tensor.rep()),
+                compute::ViewOp::Broadcast(vec![4_000_000_000]),
+            ),
+            Err(compute::Error::Quota(_))
+        ));
     }
 }
