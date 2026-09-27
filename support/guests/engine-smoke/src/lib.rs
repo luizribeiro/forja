@@ -15,7 +15,7 @@ impl Guest for Component {
         EngineInfo {
             vocab: 4,
             max_context: 33,
-            tap_layers: vec![],
+            tap_layers: vec![0],
         }
     }
 
@@ -24,23 +24,45 @@ impl Guest for Component {
     }
 
     fn step(input: StepIn) -> Result<StepOut, Error> {
-        if input.tokens.first() == Some(&u32::MAX) {
+        let mode = input.tokens.first().copied().unwrap_or_default();
+        if mode == u32::MAX {
             loop {
                 std::hint::spin_loop();
             }
         }
-        let logits = Tensor::alloc(Dtype::F32, &[4])?;
-        let values = [1.0_f32, 2.0, 3.0, 4.0];
-        let bytes = values
-            .into_iter()
-            .flat_map(f32::to_le_bytes)
-            .collect::<Vec<_>>();
-        logits.write(&bytes)?;
-        Ok(StepOut {
-            logits,
-            taps: vec![],
-        })
+        let logits = if mode == 100 {
+            f32_tensor(&[3], &[1.0, 2.0, 3.0])?
+        } else if mode == 103 {
+            let tensor = Tensor::alloc(Dtype::U32, &[4])?;
+            tensor.write(&[0; 16])?;
+            tensor
+        } else {
+            f32_tensor(&[4], &[1.0, 2.0, 3.0, 4.0])?
+        };
+        let taps = if input.taps && mode != 101 {
+            let (shape, values) = if mode == 102 {
+                (vec![2, 1], vec![1.0; 2])
+            } else {
+                let sequence = u32::try_from(input.tokens.len())
+                    .map_err(|_| Error::Layout("token count exceeds u32".to_owned()))?;
+                (vec![sequence, 1], vec![1.0; input.tokens.len()])
+            };
+            vec![f32_tensor(&shape, &values)?]
+        } else {
+            vec![]
+        };
+        Ok(StepOut { logits, taps })
     }
+}
+
+fn f32_tensor(shape: &[u32], values: &[f32]) -> Result<Tensor, Error> {
+    let tensor = Tensor::alloc(Dtype::F32, shape)?;
+    let bytes = values
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect::<Vec<_>>();
+    tensor.write(&bytes)?;
+    Ok(tensor)
 }
 
 export!(Component);

@@ -66,6 +66,61 @@ async fn preceding_step_outputs_are_released() -> wasmtime::Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn rejects_outputs_that_disagree_with_metadata() -> wasmtime::Result<()> {
+    let weights = weight_file()?;
+    let mut runner = EngineRunner::new(
+        test_guests::engine_smoke(),
+        CpuBackend::new(),
+        LIMITS,
+        &weights,
+    )
+    .await?;
+    runner.load().await??;
+    for (token, taps) in [(100, false), (101, true), (102, true), (103, false)] {
+        let error = runner
+            .step(EngineStep {
+                tokens: vec![token],
+                start_pos: 0,
+                taps,
+            })
+            .await?
+            .expect_err("malformed engine output must be rejected");
+        assert!(matches!(error, Error::Layout(_)));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn metal_runner_rejects_a_cpu_runner_tensor() -> wasmtime::Result<()> {
+    let weights = weight_file()?;
+    let mut cpu = EngineRunner::new(
+        test_guests::engine_smoke(),
+        CpuBackend::new(),
+        LIMITS,
+        &weights,
+    )
+    .await?;
+    cpu.load().await??;
+    let output = cpu
+        .step(EngineStep {
+            tokens: vec![7],
+            start_pos: 0,
+            taps: false,
+        })
+        .await??;
+    let backend = forja_metal::MetalBackend::new().map_err(wasmtime::Error::msg)?;
+    let mut metal =
+        EngineRunner::new(test_guests::engine_smoke(), backend, LIMITS, &weights).await?;
+    let error = metal
+        .read(&output.logits)
+        .await
+        .expect_err("a foreign engine tensor must be rejected");
+    assert!(matches!(error, Error::InvalidHandle(_)));
+    Ok(())
+}
+
 async fn run_engine(component: &Path, taps: bool) -> wasmtime::Result<()> {
     let weights = weight_file()?;
     let mut runner = EngineRunner::new(component, CpuBackend::new(), LIMITS, &weights).await?;

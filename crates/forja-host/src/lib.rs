@@ -91,6 +91,7 @@ pub struct EngineStep {
 #[derive(Debug)]
 pub struct EngineTensor {
     handle: u32,
+    runner_id: u64,
 }
 
 /// Device-resident outputs from one engine invocation.
@@ -106,12 +107,15 @@ pub struct EngineOutput {
 pub struct EngineRunner<B: Backend + Send + Sync + 'static> {
     store: Store<Host<B>>,
     instance: engine_bindings::EngineComponent,
+    id: u64,
+    info: Option<EngineInfo>,
     output_handles: Vec<u32>,
 }
 
 const EPOCH_TICK: Duration = Duration::from_millis(10);
 static EPOCH_ENGINES: Mutex<Vec<EpochEngine>> = Mutex::new(Vec::new());
 static EPOCH_TICKER: OnceLock<()> = OnceLock::new();
+static NEXT_RUNNER_ID: AtomicU64 = AtomicU64::new(1);
 
 struct EpochEngine {
     engine: Engine,
@@ -189,9 +193,14 @@ where
         let instance =
             engine_bindings::EngineComponent::instantiate_async(&mut store, &component, &linker)
                 .await?;
+        let id = NEXT_RUNNER_ID
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |id| id.checked_add(1))
+            .map_err(|_| wasmtime::Error::msg("engine runner id space is exhausted"))?;
         Ok(Self {
             store,
             instance,
+            id,
+            info: None,
             output_handles: Vec::new(),
         })
     }
@@ -208,11 +217,13 @@ where
             .l9o_gpu_engine()
             .call_describe(&mut self.store)
             .await?;
-        Ok(EngineInfo {
+        let info = EngineInfo {
             vocab: info.vocab,
             max_context: info.max_context,
             tap_layers: info.tap_layers,
-        })
+        };
+        self.info = Some(info.clone());
+        Ok(info)
     }
 
     /// Opens the configured weight grant and asks the engine to load it.
@@ -252,6 +263,14 @@ where
         if let Err(error) = self.release_outputs() {
             return Ok(Err(error));
         }
+        let info = match &self.info {
+            Some(info) => info.clone(),
+            None => self.describe().await?,
+        };
+        let Ok(sequence) = u32::try_from(input.tokens.len()) else {
+            return Ok(Err(quota("token count exceeds u32")));
+        };
+        let taps_requested = input.taps;
         self.set_guest_deadline();
         let output = match self
             .instance
@@ -269,22 +288,28 @@ where
             Ok(output) => output,
             Err(error) if is_epoch_timeout(&error) => return Ok(Err(guest_timeout())),
             Err(error) => return Err(error),
-        };
-        let StepOut { logits, taps } = match output {
-            Ok(output) => output,
-            Err(error) => return Ok(Err(error)),
-        };
-        self.output_handles = std::iter::once(logits.rep())
+        }?;
+        let StepOut { logits, taps } = output;
+        let handles = std::iter::once(logits.rep())
             .chain(taps.iter().map(Resource::rep))
-            .collect();
+            .collect::<Vec<_>>();
+        if let Err(error) = self.validate_output(&info, sequence, taps_requested, &logits, &taps) {
+            return Ok(Err(match self.release_handles(handles) {
+                Ok(()) => error,
+                Err(release_error) => release_error,
+            }));
+        }
+        self.output_handles = handles;
         Ok(Ok(EngineOutput {
             logits: EngineTensor {
                 handle: logits.rep(),
+                runner_id: self.id,
             },
             taps: taps
                 .into_iter()
                 .map(|tensor| EngineTensor {
                     handle: tensor.rep(),
+                    runner_id: self.id,
                 })
                 .collect(),
         }))
@@ -296,6 +321,9 @@ where
     ///
     /// Returns an invalid-handle or backend read failure.
     pub async fn read(&mut self, tensor: &EngineTensor) -> Result<Vec<u8>, compute::Error> {
+        if tensor.runner_id != self.id {
+            return Err(invalid_handle("engine tensor belongs to another runner"));
+        }
         let resource = Resource::new_borrow(tensor.handle);
         match self.store.data().prepare_read(&resource) {
             Ok(request) => request.run().await.map_err(guest_error),
@@ -322,6 +350,49 @@ where
             }
         }
         failure.map_or(Ok(()), Err)
+    }
+
+    fn validate_output(
+        &self,
+        info: &EngineInfo,
+        sequence: u32,
+        taps_requested: bool,
+        logits: &Resource<TensorEntry>,
+        taps: &[Resource<TensorEntry>],
+    ) -> Result<(), compute::Error> {
+        let logits = self.store.data().entry(logits)?;
+        if logits.tensor.layout().dtype() != DType::F32
+            || logits.tensor.layout().shape() != [info.vocab]
+        {
+            return Err(compute::Error::Layout(format!(
+                "engine logits must be f32 [{}]",
+                info.vocab
+            )));
+        }
+        let expected_taps = if taps_requested {
+            info.tap_layers.len()
+        } else {
+            0
+        };
+        if taps.len() != expected_taps {
+            return Err(compute::Error::Layout(format!(
+                "engine returned {} taps, expected {expected_taps}",
+                taps.len()
+            )));
+        }
+        for tap in taps {
+            let tap = self.store.data().entry(tap)?;
+            let shape = tap.tensor.layout().shape();
+            if tap.tensor.layout().dtype() != DType::F32
+                || shape.len() != 2
+                || shape.first() != Some(&sequence)
+            {
+                return Err(compute::Error::Layout(format!(
+                    "engine taps must be f32 [{sequence}, hidden]"
+                )));
+            }
+        }
+        Ok(())
     }
 }
 
