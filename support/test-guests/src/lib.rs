@@ -9,6 +9,12 @@ pub fn hello() -> &'static Path {
     Path::new(env!("HELLO_COMPONENT"))
 }
 
+/// Returns the path to the guest that submits normalization and activation operations.
+#[must_use]
+pub fn rmsnorm_smoke() -> &'static Path {
+    Path::new(env!("RMSNORM_SMOKE_COMPONENT"))
+}
+
 /// Returns the path to the guest that exercises the tensor interface.
 #[must_use]
 pub fn tensor_smoke() -> &'static Path {

@@ -84,3 +84,8 @@ world tensor-abuse {
   export grow-memory: async func(bytes: u32) -> bool;
   export misuse-handle: async func();
 }
+
+world rmsnorm-smoke {
+  import compute;
+  export run: async func() -> result<tuple<u64, u64>, string>;
+}
