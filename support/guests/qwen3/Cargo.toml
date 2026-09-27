@@ -10,4 +10,4 @@ version.workspace = true
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-forja-sdk = { workspace = true }
+forja-sdk = { path = "../../../crates/forja-sdk" }

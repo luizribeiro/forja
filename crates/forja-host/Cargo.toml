@@ -17,6 +17,8 @@ wasmtime-wasi.workspace = true
 [dev-dependencies]
 forja-cpu = { path = "../forja-cpu" }
 forja-testing = { path = "../../support/forja-testing" }
+golden-fixtures = { path = "../../support/golden-fixtures" }
+qwen3 = { path = "../../support/guests/qwen3" }
 forja-sdk = { path = "../forja-sdk", features = ["native-metal"] }
 test-guests = { path = "../../support/test-guests" }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

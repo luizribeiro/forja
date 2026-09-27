@@ -4,7 +4,7 @@
 
 use forja_sdk::{
     Engine, EngineInfo, Load, Result, StepInput, StepOutput, Tensor, Weights, bf16, export_engine,
-    nn::{Embedding, EmbeddingConfig, Linear, LinearConfig, RmsNorm, RmsNormConfig},
+    nn::{Embedding, EmbeddingConfig, Linear, LinearConfig, RmsNorm, RmsNormConfig, ops::sdpa},
 };
 
 /// Vocabulary size reported by Qwen3-0.6B.
@@ -21,6 +21,8 @@ const KEY_VALUE_HEADS: u32 = 8;
 const HEAD_DIM: u32 = 128;
 const INTERMEDIATE: u32 = 3_072;
 const RMS_EPSILON: f32 = 1.0e-6;
+const ROPE_THETA: f32 = 1.0e6;
+const ATTENTION_SCALE: f32 = 0.088_388_35;
 
 #[derive(Clone, Copy)]
 struct Config;
@@ -106,10 +108,89 @@ impl LayerCache {
     }
 }
 
+impl DecoderLayer {
+    fn forward(
+        &self,
+        input: &Tensor<bf16>,
+        positions: &Tensor<u32>,
+        start_pos: u32,
+        end_pos: u32,
+        cache: &mut LayerCache,
+    ) -> Result<Tensor<bf16>> {
+        let sequence = end_pos - start_pos;
+        let normalized = self.input_layernorm.forward(input)?;
+        let query = self
+            .self_attn
+            .q_norm
+            .forward(&self.self_attn.q_proj.forward(&normalized)?.reshape(&[
+                sequence,
+                QUERY_HEADS,
+                HEAD_DIM,
+            ])?)?
+            .rope(positions, ROPE_THETA)?
+            .permute(&[1, 0, 2])?;
+        let key = self
+            .self_attn
+            .k_norm
+            .forward(&self.self_attn.k_proj.forward(&normalized)?.reshape(&[
+                sequence,
+                KEY_VALUE_HEADS,
+                HEAD_DIM,
+            ])?)?
+            .rope(positions, ROPE_THETA)?
+            .permute(&[1, 0, 2])?;
+        let value = self
+            .self_attn
+            .v_proj
+            .forward(&normalized)?
+            .reshape(&[sequence, KEY_VALUE_HEADS, HEAD_DIM])?
+            .permute(&[1, 0, 2])?;
+        key.copy_into(&mut cache.key.narrow(1, start_pos, sequence)?)?;
+        value.copy_into(&mut cache.value.narrow(1, start_pos, sequence)?)?;
+        let attended = sdpa(
+            &query,
+            &cache.key.narrow(1, 0, end_pos)?,
+            &cache.value.narrow(1, 0, end_pos)?,
+            ATTENTION_SCALE,
+            true,
+            start_pos,
+        )?
+        .permute(&[1, 0, 2])?
+        .contiguous()?
+        .reshape(&[sequence, QUERY_HEADS * HEAD_DIM])?;
+        let hidden = (input + &self.self_attn.o_proj.forward(&attended)?)?;
+        let normalized = self.post_attention_layernorm.forward(&hidden)?;
+        let gate = self.mlp.gate_proj.forward(&normalized)?;
+        let up = self.mlp.up_proj.forward(&normalized)?;
+        let projected = self.mlp.down_proj.forward(&gate.silu_mul(&up)?)?;
+        &hidden + &projected
+    }
+}
+
 /// Qwen3-0.6B with a fixed 4096-token KV cache.
 pub struct Qwen3 {
     weights: QwenWeights,
     caches: Vec<LayerCache>,
+}
+
+impl Qwen3 {
+    /// Runs the embedding and first decoder layer for native differential checks.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid token or operation inputs, or failed execution.
+    pub fn first_layer(&mut self, tokens: &Tensor<u32>) -> Result<Tensor<f32>> {
+        let sequence = tokens
+            .shape()
+            .first()
+            .copied()
+            .ok_or_else(|| forja_sdk::Error::loading("tokens must have rank one"))?;
+        let positions = Tensor::from_slice(&(0..sequence).collect::<Vec<_>>(), &[sequence])?;
+        let hidden = self.weights.model.embed_tokens.forward(tokens)?;
+        self.weights.model.layers[0]
+            .forward(&hidden, &positions, 0, sequence, &mut self.caches[0])?
+            .to_dtype()
+    }
 }
 
 #[export_engine]
