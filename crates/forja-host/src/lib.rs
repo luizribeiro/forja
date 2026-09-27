@@ -78,7 +78,22 @@ impl Limits {
 }
 
 #[derive(Debug)]
-struct BufferHandle;
+struct BufferHandle {
+    byte_len: u64,
+    live_bytes: Arc<AtomicU64>,
+}
+
+impl BufferHandle {
+    fn release<B: Backend>(&self, backend: &B, tensor: &Tensor) -> Result<(), BackendError> {
+        backend.release(tensor)?;
+        self.live_bytes
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |bytes| {
+                bytes.checked_sub(self.byte_len)
+            })
+            .map(|_| ())
+            .map_err(|_| BackendError::ExecutionFailed)
+    }
+}
 
 /// Host-owned state behind a guest tensor resource.
 #[derive(Clone, Debug)]
@@ -140,7 +155,10 @@ impl<B: Backend> Host<B> {
         let tensor = self.backend.alloc(dtype, shape).map_err(backend_error)?;
         let entry = TensorEntry {
             tensor: tensor.clone(),
-            buffer: Arc::new(BufferHandle),
+            buffer: Arc::new(BufferHandle {
+                byte_len,
+                live_bytes: Arc::clone(&self.live_bytes),
+            }),
         };
         let resource = match self.table.push(entry) {
             Ok(resource) => resource,
@@ -214,6 +232,28 @@ impl<B: Backend> Host<B> {
         self.backend.write(tensor, bytes).map_err(backend_error)
     }
 
+    /// Drops a guest tensor handle and releases its buffer after the last view.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-handle error, or a backend error on final release.
+    pub fn drop_tensor(&mut self, resource: Resource<TensorEntry>) -> Result<(), compute::Error> {
+        let entry = self
+            .table
+            .delete(resource)
+            .map_err(|error| compute::Error::InvalidHandle(error.to_string()))?;
+        let live_handles = self.live_handles.checked_sub(1).ok_or_else(|| {
+            compute::Error::InvalidHandle("live handle accounting underflowed".to_owned())
+        })?;
+        if let Some(buffer) = Arc::into_inner(entry.buffer) {
+            buffer
+                .release(self.backend.as_ref(), &entry.tensor)
+                .map_err(backend_error)?;
+        }
+        self.live_handles = live_handles;
+        Ok(())
+    }
+
     fn entry(&self, resource: &Resource<TensorEntry>) -> Result<&TensorEntry, compute::Error> {
         self.table
             .get(resource)
@@ -260,6 +300,46 @@ impl<B: Backend> Host<B> {
         Ok(())
     }
 }
+
+impl<B> compute::HostTensor for Host<B>
+where
+    B: Backend + Send + Sync + 'static,
+{
+    fn alloc(
+        &mut self,
+        dtype: compute::Dtype,
+        shape: Vec<u32>,
+    ) -> impl Future<Output = wasmtime::Result<Result<Resource<TensorEntry>, compute::Error>>> + Send
+    {
+        std::future::ready(Ok(Host::alloc(self, dtype, &shape)))
+    }
+
+    fn view(
+        &mut self,
+        resource: Resource<TensorEntry>,
+        operation: compute::ViewOp,
+    ) -> impl Future<Output = wasmtime::Result<Result<Resource<TensorEntry>, compute::Error>>> + Send
+    {
+        std::future::ready(Ok(Host::view(self, &resource, operation)))
+    }
+
+    fn write(
+        &mut self,
+        resource: Resource<TensorEntry>,
+        bytes: Vec<u8>,
+    ) -> impl Future<Output = wasmtime::Result<Result<(), compute::Error>>> + Send {
+        std::future::ready(Ok(Host::write(self, &resource, &bytes)))
+    }
+
+    fn drop(
+        &mut self,
+        resource: Resource<TensorEntry>,
+    ) -> impl Future<Output = wasmtime::Result<()>> + Send {
+        std::future::ready(Host::drop_tensor(self, resource).map_err(wasmtime::Error::msg))
+    }
+}
+
+impl<B> compute::Host for Host<B> where B: Backend + Send + Sync + 'static {}
 
 fn core_dtype(dtype: compute::Dtype) -> DType {
     match dtype {
@@ -315,6 +395,7 @@ fn layout_error(error: &LayoutError) -> compute::Error {
 
 #[cfg(test)]
 mod tests {
+    use forja_core::BackendError;
     use forja_cpu::CpuBackend;
     use wasmtime::component::Resource;
 
@@ -397,5 +478,23 @@ mod tests {
             host.write(&view, &vec![0; 7 * 1024 * 4]),
             Err(compute::Error::Layout(_))
         ));
+    }
+
+    #[test]
+    fn views_keep_their_buffer_alive_until_the_last_drop() {
+        let mut host = Host::new(CpuBackend::new(), GENEROUS);
+        let base = host.alloc(compute::Dtype::F32, &[7, 1024]).unwrap();
+        let view = host
+            .view(
+                &Resource::new_borrow(base.rep()),
+                compute::ViewOp::Permute(vec![1, 0]),
+            )
+            .unwrap();
+        let tensor = host.entry(&view).unwrap().tensor.clone();
+
+        host.drop_tensor(base).unwrap();
+        assert_eq!(host.backend.read(&tensor).unwrap().len(), 7 * 1024 * 4);
+        host.drop_tensor(view).unwrap();
+        assert_eq!(host.backend.read(&tensor), Err(BackendError::InvalidInput));
     }
 }
