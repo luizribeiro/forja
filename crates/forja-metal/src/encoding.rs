@@ -80,7 +80,7 @@ enum SdpaKernel {
 const VECTOR_TWO_PASS_MIN_KEY_LENGTH: u32 = 1024;
 const VECTOR_SELECTED_MIN_KEY_LENGTH: u32 = 512;
 const VECTOR_MAX_KEY_LENGTH: u32 = 65_536;
-const STEEL_PREFILL_SELECTED: bool = false;
+const STEEL_SELECTED_MIN_QUERY_LENGTH: u32 = 512;
 
 struct EncodedDispatches {
     temporaries: Vec<MetalBufferRef>,
@@ -2401,9 +2401,7 @@ fn vector_sdpa_supported(dispatch: &Dispatch) -> Result<bool, BackendError> {
     let simdgroups = query_heads
         .checked_div(kv_heads)
         .and_then(|group| group.checked_mul(query_length));
-    Ok(query_length <= 8
-        && (query_length == 1 || query_length < key_length)
-        && width == value_width
+    Ok(width == value_width
         && matches!(width, 64 | 128)
         && simdgroups.is_some_and(|count| count <= 32)
         && key_length <= VECTOR_MAX_KEY_LENGTH)
@@ -2444,7 +2442,10 @@ fn select_sdpa(dispatch: &Dispatch) -> Result<SdpaKernel, BackendError> {
         && vector_sdpa_supported(dispatch)?
     {
         Ok(SdpaKernel::Vector)
-    } else if STEEL_PREFILL_SELECTED && steel_sdpa_supported(dispatch)? {
+    } else if query_length >= STEEL_SELECTED_MIN_QUERY_LENGTH
+        && query_length == key_length
+        && steel_sdpa_supported(dispatch)?
+    {
         Ok(SdpaKernel::Steel)
     } else {
         Ok(SdpaKernel::Decomposed)
@@ -2452,13 +2453,12 @@ fn select_sdpa(dispatch: &Dispatch) -> Result<SdpaKernel, BackendError> {
 }
 
 fn steel_sdpa_supported(dispatch: &Dispatch) -> Result<bool, BackendError> {
-    let [query, key, value] = dispatch.inputs() else {
+    let [query, _, value] = dispatch.inputs() else {
         return Err(BackendError::InvalidInput);
     };
     let [_, query_length, width] = shape3(query.layout())?;
-    let [_, key_length, _] = shape3(key.layout())?;
     let [_, _, value_width] = shape3(value.layout())?;
-    Ok(query_length > 1 && width == value_width && matches!(width, 64 | 128) && key_length <= 1024)
+    Ok(query_length > 1 && width == value_width && matches!(width, 64 | 128))
 }
 
 fn head_group(
