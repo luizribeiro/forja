@@ -44,6 +44,7 @@ pub struct Limits {
     table_elements: usize,
     instances: usize,
     dispatches_per_list: usize,
+    work_per_dispatch: u64,
 }
 
 impl Limits {
@@ -66,7 +67,20 @@ impl Limits {
             table_elements: 10_000,
             instances: 10_000,
             dispatches_per_list: usize::MAX,
+            work_per_dispatch: u64::MAX,
         }
+    }
+
+    /// Overrides command recording limits.
+    #[must_use]
+    pub const fn with_command_limits(
+        mut self,
+        max_dispatches_per_list: usize,
+        max_work_per_dispatch: u64,
+    ) -> Self {
+        self.dispatches_per_list = max_dispatches_per_list;
+        self.work_per_dispatch = max_work_per_dispatch;
+        self
     }
 
     /// Overrides limits applied to WebAssembly store resources.
@@ -292,6 +306,7 @@ impl<B: Backend> Host<B> {
         candidate
             .dispatch(operation, &input_tensors, &output_entry.tensor)
             .map_err(guest_error)?;
+        self.check_dispatch_work(operation, &input_tensors, &output_entry.tensor)?;
 
         let entry = self.table.get_mut(commands).map_err(invalid_handle)?;
         entry.commands = candidate;
@@ -386,6 +401,31 @@ impl<B: Backend> Host<B> {
     fn check_handle_quota(&self) -> Result<(), compute::Error> {
         if self.live_handles >= self.limits.live_tensor_handles {
             return Err(quota("live tensor handles exceed the guest limit"));
+        }
+        Ok(())
+    }
+
+    fn check_dispatch_work(
+        &self,
+        operation: Op,
+        inputs: &[&Tensor],
+        output: &Tensor,
+    ) -> Result<(), compute::Error> {
+        let mut work = self.check_tensor_shape(output.layout().shape())?;
+        for input in inputs {
+            work = work
+                .checked_add(self.check_tensor_shape(input.layout().shape())?)
+                .ok_or_else(dispatch_work_quota)?;
+        }
+        let flops = match operation {
+            Op::Matmul => matmul_flops(inputs),
+            Op::Sdpa { .. } => sdpa_flops(inputs),
+            _ => Some(0),
+        }
+        .ok_or_else(dispatch_work_quota)?;
+        work = work.checked_add(flops).ok_or_else(dispatch_work_quota)?;
+        if work > self.limits.work_per_dispatch {
+            return Err(dispatch_work_quota());
         }
         Ok(())
     }
@@ -618,6 +658,33 @@ fn core_op(operation: compute::Op) -> Op {
     }
 }
 
+fn matmul_flops(inputs: &[&Tensor]) -> Option<u64> {
+    let left = inputs.first()?.layout().shape();
+    let right = inputs.get(1)?.layout().shape();
+    let batch = if left.len() == 3 {
+        u64::from(*left.first()?)
+    } else {
+        1
+    };
+    let rank = left.len();
+    batch
+        .checked_mul(u64::from(*left.get(rank.checked_sub(2)?)?))?
+        .checked_mul(u64::from(*left.last()?))?
+        .checked_mul(u64::from(*right.last()?))?
+        .checked_mul(2)
+}
+
+fn sdpa_flops(inputs: &[&Tensor]) -> Option<u64> {
+    let query = inputs.first()?.layout().shape();
+    let key = inputs.get(1)?.layout().shape();
+    let value = inputs.get(2)?.layout().shape();
+    u64::from(*query.first()?)
+        .checked_mul(u64::from(*query.get(1)?))?
+        .checked_mul(u64::from(*key.get(1)?))?
+        .checked_mul(u64::from(*query.get(2)?).checked_add(u64::from(*value.get(2)?))?)?
+        .checked_mul(2)
+}
+
 fn validate_view(tensor: &Tensor, operation: &ViewOp) -> Result<Layout, LayoutError> {
     match operation {
         ViewOp::Slice(specs) => tensor.layout().slice(specs),
@@ -629,6 +696,10 @@ fn validate_view(tensor: &Tensor, operation: &ViewOp) -> Result<Layout, LayoutEr
 
 fn quota(message: &str) -> compute::Error {
     compute::Error::Quota(message.to_owned())
+}
+
+fn dispatch_work_quota() -> compute::Error {
+    quota("dispatch work exceeds the guest limit")
 }
 
 fn invalid_handle(error: impl ToString) -> compute::Error {
@@ -1000,6 +1071,35 @@ mod tests {
             Err(compute::Error::Quota(_))
         ));
         assert_eq!(host.table.get(&commands).unwrap().commands.len(), 1);
+    }
+
+    #[test]
+    fn refuses_dispatches_over_the_work_limit() {
+        let limits = GENEROUS.with_command_limits(usize::MAX, 13);
+        let mut host = Host::new(CpuBackend::new(), limits);
+        let input = host.alloc(compute::Dtype::F32, &[7]).unwrap();
+        let output = host.alloc(compute::Dtype::F32, &[7]).unwrap();
+        let commands = host.command_list().unwrap();
+
+        assert!(matches!(
+            host.dispatch(
+                &commands,
+                compute::Op::Copy,
+                &[Resource::new_borrow(input.rep())],
+                &output,
+            ),
+            Err(compute::Error::Quota(_))
+        ));
+        assert!(host.table.get(&commands).unwrap().commands.is_empty());
+
+        host.limits.work_per_dispatch = 14;
+        host.dispatch(
+            &commands,
+            compute::Op::Copy,
+            &[Resource::new_borrow(input.rep())],
+            &output,
+        )
+        .unwrap();
     }
 
     #[test]
