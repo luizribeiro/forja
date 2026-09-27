@@ -648,6 +648,7 @@ version = "0.0.0"
 dependencies = [
  "forja-mmap",
  "proptest",
+ "sha2",
 ]
 
 [[package]]

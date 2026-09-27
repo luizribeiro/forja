@@ -3,6 +3,7 @@
 use std::{error::Error, fmt};
 
 use crate::{DType, MAX_RANK, Tensor, byte_ranges_overlap, is_injective};
+use sha2::{Digest, Sha256};
 
 /// The largest accepted instruction count.
 pub const MAX_INSTRUCTIONS: usize = 256;
@@ -194,6 +195,24 @@ impl ValidatedProgram {
     #[must_use]
     pub const fn output_count(&self) -> usize {
         self.output_count
+    }
+
+    /// Returns a stable SHA-256 digest of the canonical program encoding.
+    #[must_use]
+    pub fn content_hash(&self) -> ProgramHash {
+        ProgramHash(Sha256::digest(canonical_bytes(&self.program)).into())
+    }
+}
+
+/// A stable content digest for a validated program.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ProgramHash([u8; 32]);
+
+impl ProgramHash {
+    /// Returns the digest bytes.
+    #[must_use]
+    pub const fn as_bytes(self) -> [u8; 32] {
+        self.0
     }
 }
 
@@ -811,6 +830,132 @@ const fn type_set(value_type: ValueType) -> TypeSet {
     }
 }
 
+fn canonical_bytes(program: &Program) -> Vec<u8> {
+    let mut bytes = b"forja-program\0".to_vec();
+    bytes.push(1);
+    bytes.push(program_kind_tag(program.kind));
+    push_len(&mut bytes, program.insts.len());
+    for &inst in &program.insts {
+        encode_inst(&mut bytes, inst);
+    }
+    push_len(&mut bytes, program.outputs.len());
+    let mut outputs = program.outputs.clone();
+    outputs.sort_unstable_by_key(|&(slot, _)| slot);
+    for (slot, instruction) in outputs {
+        push_u32(&mut bytes, slot);
+        push_u32(&mut bytes, instruction);
+    }
+    bytes
+}
+
+fn encode_inst(bytes: &mut Vec<u8>, inst: Inst) {
+    match inst {
+        Inst::Input(slot) => {
+            bytes.push(0);
+            push_u32(bytes, slot);
+        }
+        Inst::Const(value) => {
+            bytes.push(1);
+            push_u32(bytes, value.to_bits());
+        }
+        Inst::Index(axis) => {
+            bytes.extend([2, axis]);
+        }
+        Inst::Extent(axis) => {
+            bytes.extend([3, axis]);
+        }
+        Inst::Unary(op, operand) => {
+            bytes.extend([4, unary_tag(op)]);
+            push_u32(bytes, operand);
+        }
+        Inst::Binary(op, left, right) => {
+            bytes.extend([5, binary_tag(op)]);
+            push_u32(bytes, left);
+            push_u32(bytes, right);
+        }
+        Inst::Select(condition, accepted, rejected) => {
+            bytes.push(6);
+            push_u32(bytes, condition);
+            push_u32(bytes, accepted);
+            push_u32(bytes, rejected);
+        }
+        Inst::Cast(to, operand) => {
+            bytes.extend([7, value_type_tag(to)]);
+            push_u32(bytes, operand);
+        }
+        Inst::Reduce(op, operand) => {
+            bytes.extend([8, reduction_tag(op)]);
+            push_u32(bytes, operand);
+        }
+    }
+}
+
+fn push_len(bytes: &mut Vec<u8>, len: usize) {
+    push_u32(bytes, u32::try_from(len).unwrap_or(u32::MAX));
+}
+
+fn push_u32(bytes: &mut Vec<u8>, value: u32) {
+    bytes.extend(value.to_le_bytes());
+}
+
+const fn program_kind_tag(kind: ProgramKind) -> u8 {
+    match kind {
+        ProgramKind::Map => 0,
+        ProgramKind::Row => 1,
+    }
+}
+
+const fn value_type_tag(value_type: ValueType) -> u8 {
+    match value_type {
+        ValueType::F32 => 0,
+        ValueType::U32 => 1,
+        ValueType::Bool => 2,
+    }
+}
+
+const fn unary_tag(op: UnOp) -> u8 {
+    match op {
+        UnOp::Neg => 0,
+        UnOp::Abs => 1,
+        UnOp::Exp => 2,
+        UnOp::Log => 3,
+        UnOp::Sqrt => 4,
+        UnOp::Rsqrt => 5,
+        UnOp::Sin => 6,
+        UnOp::Cos => 7,
+        UnOp::Tanh => 8,
+        UnOp::Sigmoid => 9,
+        UnOp::Recip => 10,
+        UnOp::Floor => 11,
+    }
+}
+
+const fn binary_tag(op: BinOp) -> u8 {
+    match op {
+        BinOp::Add => 0,
+        BinOp::Sub => 1,
+        BinOp::Mul => 2,
+        BinOp::Div => 3,
+        BinOp::Min => 4,
+        BinOp::Max => 5,
+        BinOp::Pow => 6,
+        BinOp::Lt => 7,
+        BinOp::Le => 8,
+        BinOp::Eq => 9,
+        BinOp::Ne => 10,
+        BinOp::Ge => 11,
+        BinOp::Gt => 12,
+    }
+}
+
+const fn reduction_tag(op: RedOp) -> u8 {
+    match op {
+        RedOp::Sum => 0,
+        RedOp::Max => 1,
+        RedOp::Min => 2,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use proptest::prelude::*;
@@ -1215,6 +1360,43 @@ mod tests {
                 first: 0,
                 second: 1,
             })
+        );
+    }
+
+    #[test]
+    fn content_hash_uses_canonical_output_order_and_float_bits() {
+        let first = program(
+            vec![
+                Inst::Const(-0.0),
+                Inst::Const(1.0),
+                Inst::Binary(BinOp::Add, 0, 1),
+            ],
+            vec![(1, 0), (0, 2)],
+        )
+        .validate()
+        .unwrap();
+        let reordered = program(first.program.insts.clone(), vec![(0, 2), (1, 0)])
+            .validate()
+            .unwrap();
+        assert_eq!(first.content_hash(), reordered.content_hash());
+
+        let positive_zero = program(
+            vec![
+                Inst::Const(0.0),
+                Inst::Const(1.0),
+                Inst::Binary(BinOp::Add, 0, 1),
+            ],
+            vec![(0, 2), (1, 0)],
+        )
+        .validate()
+        .unwrap();
+        assert_ne!(first.content_hash(), positive_zero.content_hash());
+        assert_eq!(
+            first.content_hash().as_bytes(),
+            [
+                212, 40, 5, 197, 89, 79, 115, 212, 254, 84, 114, 76, 100, 92, 193, 74, 217, 162,
+                20, 200, 66, 139, 67, 115, 65, 110, 171, 255, 154, 206, 139, 237,
+            ]
         );
     }
 
