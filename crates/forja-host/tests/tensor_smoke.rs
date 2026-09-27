@@ -1,7 +1,7 @@
 //! End-to-end component tests for the guest tensor surface.
 
 use forja_core::{Backend, CommandList, DType, Op, Submission, ViewOp};
-use forja_host::{Grants, Host, Limits, add_to_linker};
+use forja_host::{Grants, Host, Limits, add_to_linker, component_engine};
 use forja_testing::{DeterministicValues, F32_TOLERANCE, normwise_relative_error};
 use std::{
     fs,
@@ -9,8 +9,8 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
     time::Duration,
 };
+use wasmtime::Store;
 use wasmtime::component::{Component, Instance, Linker};
-use wasmtime::{Config, Engine, Store};
 
 const LIMITS: Limits = Limits::new(64 * 1024, 8, 16 * 1024, 8, 64 * 1024);
 const COMMAND_LIMITS: Limits = Limits::new(128 * 1024, 8, 16 * 1024, 8, 64 * 1024);
@@ -91,6 +91,7 @@ async fn adversarial_tensor_calls_return_errors() -> wasmtime::Result<()> {
     )
     .await?;
     let run = instance.get_typed_func::<(), (Result<u64, String>,)>(&mut store, "run")?;
+    Host::reset_guest_deadline(&mut store);
     let (result,) = store
         .run_concurrent(async move |accessor| run.call_concurrent(accessor, ()).await)
         .await??;
@@ -109,6 +110,7 @@ async fn large_broadcast_is_only_usable_without_reading() -> wasmtime::Result<()
     .await?;
     let input =
         instance.get_typed_func::<(), (Result<(), String>,)>(&mut store, "large-dispatch-input")?;
+    Host::reset_guest_deadline(&mut store);
     let (result,) = store
         .run_concurrent(async move |accessor| input.call_concurrent(accessor, ()).await)
         .await??;
@@ -116,6 +118,7 @@ async fn large_broadcast_is_only_usable_without_reading() -> wasmtime::Result<()
 
     let read =
         instance.get_typed_func::<(), (Result<(), String>,)>(&mut store, "large-read-refused")?;
+    Host::reset_guest_deadline(&mut store);
     let (result,) = store
         .run_concurrent(async move |accessor| read.call_concurrent(accessor, ()).await)
         .await??;
@@ -132,6 +135,7 @@ async fn guest_memory_growth_stops_at_the_store_limit() -> wasmtime::Result<()> 
     )
     .await?;
     let grow = instance.get_typed_func::<(u32,), (bool,)>(&mut store, "grow-memory")?;
+    Host::reset_guest_deadline(&mut store);
     let (failed,) = store
         .run_concurrent(async move |accessor| {
             grow.call_concurrent(accessor, (64 * 1024 * 1024,)).await
@@ -150,6 +154,7 @@ async fn canonical_handle_misuse_traps() -> wasmtime::Result<()> {
     )
     .await?;
     let misuse = instance.get_typed_func::<(), ()>(&mut store, "misuse-handle")?;
+    Host::reset_guest_deadline(&mut store);
     let result = store
         .run_concurrent(async move |accessor| misuse.call_concurrent(accessor, ()).await)
         .await;
@@ -164,6 +169,7 @@ where
 {
     let (mut store, instance) = instantiate(backend, test_guests::tensor_smoke(), LIMITS).await?;
     let run = instance.get_typed_func::<(), (Result<u64, String>,)>(&mut store, "run")?;
+    Host::reset_guest_deadline(&mut store);
     let (result,) = store
         .run_concurrent(async move |accessor| run.call_concurrent(accessor, ()).await)
         .await??;
@@ -177,6 +183,7 @@ where
     let (mut store, instance) =
         instantiate(backend, test_guests::rmsnorm_smoke(), COMMAND_LIMITS).await?;
     let run = instance.get_typed_func::<(), (Result<(u64, u64), String>,)>(&mut store, "run")?;
+    Host::reset_guest_deadline(&mut store);
     let (result,) = store
         .run_concurrent(async move |accessor| run.call_concurrent(accessor, ()).await)
         .await??;
@@ -194,6 +201,7 @@ where
             instantiate_with_grants(backend, test_guests::weights_smoke(), WEIGHT_LIMITS, grants)
                 .await?;
         let run = instance.get_typed_func::<(), (Result<Vec<u8>, String>,)>(&mut store, "run")?;
+        Host::reset_guest_deadline(&mut store);
         let (result,) = store
             .run_concurrent(async move |accessor| run.call_concurrent(accessor, ()).await)
             .await??;
@@ -223,6 +231,7 @@ where
     let run = instance
         .get_typed_func::<AttentionParams, (Result<Vec<f32>, String>,)>(&mut store, "run")?;
     let parameters = values.into_parameters();
+    Host::reset_guest_deadline(&mut store);
     let (result,) = store
         .run_concurrent(async move |accessor| run.call_concurrent(accessor, parameters).await)
         .await??;
@@ -606,10 +615,7 @@ async fn instantiate_with_grants<B>(
 where
     B: Backend + Send + Sync + 'static,
 {
-    let mut config = Config::new();
-    config.wasm_component_model_async(true);
-    config.concurrency_support(true);
-    let engine = Engine::new(&config)?;
+    let engine = component_engine()?;
     let component = Component::from_file(&engine, component_path)?;
     let mut linker = Linker::new(&engine);
     add_to_linker(&mut linker)?;

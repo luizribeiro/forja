@@ -23,7 +23,12 @@ impl Guest for Component {
         Ok(())
     }
 
-    fn step(_input: StepIn) -> Result<StepOut, Error> {
+    fn step(input: StepIn) -> Result<StepOut, Error> {
+        if input.tokens.first() == Some(&u32::MAX) {
+            loop {
+                std::hint::spin_loop();
+            }
+        }
         let logits = Tensor::alloc(Dtype::F32, &[4])?;
         let values = [1.0_f32, 2.0, 3.0, 4.0];
         let bytes = values

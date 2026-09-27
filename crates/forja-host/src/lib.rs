@@ -12,9 +12,10 @@ use std::{
     collections::HashMap,
     path::{Path, PathBuf},
     sync::{
-        Arc, Weak,
+        Arc, Mutex, OnceLock, Weak,
         atomic::{AtomicU64, Ordering},
     },
+    thread,
 };
 
 use forja_core::{
@@ -22,7 +23,7 @@ use forja_core::{
     Tensor, ViewOp,
 };
 use wasmtime::component::{Accessor, Component, HasData, Linker, Resource, ResourceTable};
-use wasmtime::{Config, Engine, Store, StoreLimits, StoreLimitsBuilder};
+use wasmtime::{Config, Engine, Store, StoreLimits, StoreLimitsBuilder, Trap};
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
 pub use native::{NativeCommandList, NativeHost, NativeTensor};
@@ -102,6 +103,62 @@ pub struct EngineRunner<B: Backend + Send + Sync + 'static> {
     instance: engine_bindings::EngineComponent,
 }
 
+const EPOCH_TICK: Duration = Duration::from_millis(10);
+static EPOCH_ENGINES: Mutex<Vec<EpochEngine>> = Mutex::new(Vec::new());
+static EPOCH_TICKER: OnceLock<()> = OnceLock::new();
+
+struct EpochEngine {
+    engine: Engine,
+    live: Weak<()>,
+}
+
+/// Builds an engine configured for asynchronous components and epoch interruption.
+///
+/// # Errors
+///
+/// Returns an error when Wasmtime cannot create the engine.
+pub fn component_engine() -> wasmtime::Result<Engine> {
+    let mut config = Config::new();
+    config.wasm_component_model_async(true);
+    config.concurrency_support(true);
+    config.epoch_interruption(true);
+    Engine::new(&config)
+}
+
+fn register_epoch_engine(engine: &Engine) -> Arc<()> {
+    let live = Arc::new(());
+    if let Ok(mut engines) = EPOCH_ENGINES.lock() {
+        engines.push(EpochEngine {
+            engine: engine.clone(),
+            live: Arc::downgrade(&live),
+        });
+    }
+    EPOCH_TICKER.get_or_init(|| {
+        drop(thread::spawn(|| {
+            loop {
+                thread::sleep(EPOCH_TICK);
+                if let Ok(mut engines) = EPOCH_ENGINES.lock() {
+                    engines.retain(|entry| {
+                        if entry.live.strong_count() == 0 {
+                            false
+                        } else {
+                            entry.engine.increment_epoch();
+                            true
+                        }
+                    });
+                }
+            }
+        }));
+    });
+    live
+}
+
+fn epoch_ticks(timeout: Duration) -> u64 {
+    let tick_ns = EPOCH_TICK.as_nanos();
+    let ticks = timeout.as_nanos().saturating_add(tick_ns - 1) / tick_ns;
+    u64::try_from(ticks).map_or(u64::MAX, |ticks| ticks.max(1))
+}
+
 impl<B> EngineRunner<B>
 where
     B: Backend + Send + Sync + 'static,
@@ -117,10 +174,7 @@ where
         limits: Limits,
         weights_path: impl Into<PathBuf>,
     ) -> wasmtime::Result<Self> {
-        let mut config = Config::new();
-        config.wasm_component_model_async(true);
-        config.concurrency_support(true);
-        let engine = Engine::new(&config)?;
+        let engine = component_engine()?;
         let component = Component::from_file(&engine, component_path)?;
         let mut linker = Linker::new(&engine);
         add_engine_to_linker(&mut linker)?;
@@ -138,6 +192,7 @@ where
     ///
     /// Returns a component execution error.
     pub async fn describe(&mut self) -> wasmtime::Result<EngineInfo> {
+        self.set_guest_deadline();
         let info = self
             .instance
             .l9o_gpu_engine()
@@ -156,15 +211,22 @@ where
     ///
     /// Returns a host, component, or engine loading error.
     pub async fn load(&mut self) -> wasmtime::Result<Result<(), compute::Error>> {
+        self.set_guest_deadline();
         let weights = self
             .store
             .data_mut()
             .open_weights("engine")
             .map_err(wasmtime::Error::msg)?;
-        self.instance
+        match self
+            .instance
             .l9o_gpu_engine()
             .call_load(&mut self.store, weights)
             .await
+        {
+            Ok(result) => Ok(result),
+            Err(error) if is_epoch_timeout(&error) => Ok(Err(guest_timeout())),
+            Err(error) => Err(error),
+        }
     }
 
     /// Runs one engine invocation and retains its device tensors.
@@ -177,7 +239,8 @@ where
         input: EngineStep,
     ) -> wasmtime::Result<Result<EngineOutput, compute::Error>> {
         use engine_bindings::exports::l9o::gpu::engine::{StepIn, StepOut};
-        let output = self
+        self.set_guest_deadline();
+        let output = match self
             .instance
             .l9o_gpu_engine()
             .call_step(
@@ -188,7 +251,12 @@ where
                     taps: input.taps,
                 },
             )
-            .await?;
+            .await
+        {
+            Ok(output) => output,
+            Err(error) if is_epoch_timeout(&error) => return Ok(Err(guest_timeout())),
+            Err(error) => return Err(error),
+        };
         Ok(output.map(|StepOut { logits, taps }| EngineOutput {
             logits: EngineTensor(logits),
             taps: taps.into_iter().map(EngineTensor).collect(),
@@ -206,6 +274,10 @@ where
             Err(error) => Err(error),
         }
     }
+
+    fn set_guest_deadline(&mut self) {
+        Host::reset_guest_deadline(&mut self.store);
+    }
 }
 
 /// Resource limits applied before backend work or component allocation.
@@ -221,6 +293,7 @@ pub struct Limits {
     instances: usize,
     dispatches_per_list: usize,
     work_per_dispatch: u64,
+    guest_call_timeout: Duration,
     submission_timeout: Duration,
     gpu_time_budget: Duration,
 }
@@ -271,6 +344,7 @@ impl Limits {
             instances: 10_000,
             dispatches_per_list: usize::MAX,
             work_per_dispatch: u64::MAX,
+            guest_call_timeout: Duration::from_secs(30),
             submission_timeout: Duration::from_secs(10),
             gpu_time_budget: Duration::MAX,
         }
@@ -285,6 +359,13 @@ impl Limits {
     ) -> Self {
         self.dispatches_per_list = max_dispatches_per_list;
         self.work_per_dispatch = max_work_per_dispatch;
+        self
+    }
+
+    /// Overrides the maximum CPU time allowed for one guest export call.
+    #[must_use]
+    pub const fn with_guest_call_timeout(mut self, timeout: Duration) -> Self {
+        self.guest_call_timeout = timeout;
         self
     }
 
@@ -389,6 +470,7 @@ pub struct Host<B: Backend> {
     live_bytes: Arc<AtomicU64>,
     live_handles: usize,
     gpu_time_ns: Arc<AtomicU64>,
+    epoch_registration: Option<Arc<()>>,
 }
 
 impl<B: Backend> Host<B> {
@@ -413,6 +495,7 @@ impl<B: Backend> Host<B> {
             live_bytes: Arc::new(AtomicU64::new(0)),
             live_handles: 0,
             gpu_time_ns: Arc::new(AtomicU64::new(0)),
+            epoch_registration: None,
         }
     }
 
@@ -423,7 +506,9 @@ impl<B: Backend> Host<B> {
         B: Send + 'static,
     {
         let mut store = Store::new(engine, Self::new(backend, limits));
+        store.data_mut().epoch_registration = Some(register_epoch_engine(engine));
         store.limiter(|host| &mut host.store_limits);
+        Self::reset_guest_deadline(&mut store);
         store
     }
 
@@ -439,8 +524,16 @@ impl<B: Backend> Host<B> {
         B: Send + 'static,
     {
         let mut store = Store::new(engine, Self::with_grants(backend, limits, grants));
+        store.data_mut().epoch_registration = Some(register_epoch_engine(engine));
         store.limiter(|host| &mut host.store_limits);
+        Self::reset_guest_deadline(&mut store);
         store
+    }
+
+    /// Starts a fresh CPU-time budget for the next guest export call.
+    pub fn reset_guest_deadline(store: &mut Store<Self>) {
+        let ticks = epoch_ticks(store.data().limits.guest_call_timeout);
+        store.set_epoch_deadline(ticks);
     }
 
     /// Allocates a contiguous tensor after enforcing all guest quotas.
@@ -1266,6 +1359,14 @@ fn release_buffer<B: Backend>(backend: &B, buffer: Arc<BufferHandle>) -> Result<
 
 fn quota(message: &str) -> compute::Error {
     compute::Error::Quota(message.to_owned())
+}
+
+fn guest_timeout() -> compute::Error {
+    quota("guest call exceeded the CPU time limit")
+}
+
+fn is_epoch_timeout(error: &wasmtime::Error) -> bool {
+    error.downcast_ref::<Trap>() == Some(&Trap::Interrupt)
 }
 
 fn dispatch_work_quota() -> compute::Error {
