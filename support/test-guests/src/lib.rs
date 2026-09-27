@@ -15,6 +15,12 @@ pub fn tensor_smoke() -> &'static Path {
     Path::new(env!("TENSOR_SMOKE_COMPONENT"))
 }
 
+/// Returns the path to the guest that probes tensor boundary failures.
+#[must_use]
+pub fn tensor_abuse() -> &'static Path {
+    Path::new(env!("TENSOR_ABUSE_COMPONENT"))
+}
+
 #[cfg(test)]
 mod tests {
     use wasmtime::component::{Component, Linker, ResourceTable};

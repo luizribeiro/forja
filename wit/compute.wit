@@ -46,3 +46,12 @@ world tensor-smoke {
   import compute;
   export run: async func() -> result<u64, string>;
 }
+
+world tensor-abuse {
+  import compute;
+  export run: async func() -> result<u64, string>;
+  export large-dispatch-input: async func() -> result<_, string>;
+  export large-read-refused: async func() -> result<_, string>;
+  export grow-memory: async func(bytes: u32) -> bool;
+  export misuse-handle: async func();
+}

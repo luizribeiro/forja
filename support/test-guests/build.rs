@@ -22,6 +22,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "TENSOR_SMOKE_COMPONENT",
         &release_dir.join("tensor_smoke.wasm"),
     );
+    emit_guest_path(
+        "TENSOR_ABUSE_COMPONENT",
+        &release_dir.join("tensor_abuse.wasm"),
+    );
     println!(
         "cargo::rerun-if-changed={}",
         repository.join("support/guests").display()

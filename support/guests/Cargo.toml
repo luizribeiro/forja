@@ -1,5 +1,5 @@
 [workspace]
-members = ["hello", "tensor-smoke"]
+members = ["hello", "tensor-abuse", "tensor-smoke"]
 resolver = "3"
 
 [workspace.package]

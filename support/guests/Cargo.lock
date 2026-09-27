@@ -189,6 +189,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "tensor-abuse"
+version = "0.0.0"
+dependencies = [
+ "wit-bindgen",
+]
+
+[[package]]
 name = "tensor-smoke"
 version = "0.0.0"
 dependencies = [
