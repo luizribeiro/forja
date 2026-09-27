@@ -3,6 +3,7 @@
 use forja_core::{Backend, CommandList, DType, Op, Submission, ViewOp};
 use forja_host::{Grants, Host, Limits, add_to_linker, component_engine};
 use forja_testing::{DeterministicValues, F32_TOLERANCE, normwise_relative_error};
+use golden_fixtures::decode_f32_le;
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -411,12 +412,7 @@ fn direct_attention<B: Backend>(
         .wait()
         .map_err(backend_error)?;
     let bytes = backend.read(&tensors.result).map_err(backend_error)?;
-    Ok(bytes
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|bytes| f32::from_le_bytes(*bytes))
-        .collect())
+    Ok(decode_f32_le(&bytes)?)
 }
 
 fn record_attention(tensors: &AttentionTensors) -> wasmtime::Result<CommandList> {

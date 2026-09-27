@@ -157,6 +157,34 @@ impl FixtureDirectory {
     }
 }
 
+/// Decodes contiguous little-endian f32 values.
+///
+/// # Errors
+///
+/// Returns an error when `bytes` ends with a partial f32 value.
+pub fn decode_f32_le(bytes: &[u8]) -> Result<Vec<f32>, DecodeError> {
+    let (values, remainder) = bytes.as_chunks::<4>();
+    if !remainder.is_empty() {
+        return Err(DecodeError);
+    }
+    Ok(values
+        .iter()
+        .map(|bytes| f32::from_le_bytes(*bytes))
+        .collect())
+}
+
+/// A byte slice ended with a partial f32 value.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DecodeError;
+
+impl fmt::Display for DecodeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("tensor contains a partial f32 value")
+    }
+}
+
+impl Error for DecodeError {}
+
 #[derive(Debug, Deserialize)]
 struct Manifest {
     schema_version: u64,
@@ -241,13 +269,8 @@ fn read_f32(tensors: &SafeTensors<'_>, name: &str) -> Result<FloatTensor, Fixtur
     }
     let shape = tensor.shape().to_vec();
     validate_byte_len(name, &shape, tensor.data().len(), 4)?;
-    let values = tensor
-        .data()
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|bytes| f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
-        .collect();
+    let values =
+        decode_f32_le(tensor.data()).map_err(|error| FixtureError::Tensor(error.to_string()))?;
     Ok(FloatTensor { shape, values })
 }
 

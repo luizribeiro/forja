@@ -6,6 +6,7 @@ use forja_core::Backend;
 use forja_host::{EngineRunner, EngineStep, Limits};
 use forja_sdk::{Engine, NativeDevice, StepInput, Tensor, Weights, set_native_device};
 use forja_testing::{DeterministicValues, F32_TOLERANCE, normwise_relative_error};
+use golden_fixtures::decode_f32_le;
 use toy_mlp::{HIDDEN, INTERMEDIATE, LAYERS, MAX_CONTEXT, ToyEngine, VOCAB};
 
 const LIMITS: Limits = Limits::new(16 * 1024 * 1024, 8, 1024 * 1024, 512, 1024 * 1024)
@@ -89,14 +90,7 @@ fn assert_agrees(expected: &[f32], actual: &[f32]) {
 }
 
 fn decode(bytes: &[u8]) -> wasmtime::Result<Vec<f32>> {
-    let (values, remainder) = bytes.as_chunks::<4>();
-    if !remainder.is_empty() {
-        return Err(wasmtime::Error::msg("tensor contained a partial f32"));
-    }
-    Ok(values
-        .iter()
-        .map(|bytes| f32::from_le_bytes(*bytes))
-        .collect())
+    decode_f32_le(bytes).map_err(wasmtime::Error::msg)
 }
 
 fn weight_file(label: &str) -> wasmtime::Result<PathBuf> {

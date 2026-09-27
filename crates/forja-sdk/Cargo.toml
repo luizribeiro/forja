@@ -25,6 +25,7 @@ forja-metal = { path = "../forja-metal", optional = true }
 
 [dev-dependencies]
 forja-testing = { path = "../../support/forja-testing" }
+golden-fixtures = { path = "../../support/golden-fixtures" }
 trybuild = "1"
 
 [lints]

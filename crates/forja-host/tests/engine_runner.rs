@@ -7,6 +7,7 @@ use std::{
 
 use forja_cpu::CpuBackend;
 use forja_host::{EngineRunner, EngineStep, Limits, bindings::l9o::gpu::compute::Error};
+use golden_fixtures::decode_f32_le;
 
 const LIMITS: Limits = Limits::new(1024 * 1024, 4, 1024, 128, 1024 * 1024);
 
@@ -140,12 +141,7 @@ async fn run_engine(component: &Path, taps: bool) -> wasmtime::Result<()> {
         })
         .await??;
     let bytes = runner.read(&output.logits).await?;
-    let logits = bytes
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|bytes| f32::from_le_bytes(*bytes))
-        .collect::<Vec<_>>();
+    let logits = decode_f32_le(&bytes)?;
     assert_eq!(logits, [1.0, 2.0, 3.0, 4.0]);
     assert_eq!(output.taps.len(), usize::from(taps));
     Ok(())

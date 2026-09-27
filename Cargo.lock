@@ -529,6 +529,7 @@ dependencies = [
  "forja-metal",
  "forja-sdk-macros",
  "forja-testing",
+ "golden-fixtures",
  "half",
  "trybuild",
  "wit-bindgen 0.62.0",

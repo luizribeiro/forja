@@ -1,6 +1,7 @@
 use forja_core::{Backend, CommandList, DType, Op, Submission};
 use forja_sdk::Tensor;
 use forja_testing::{DeterministicValues, F32_TOLERANCE, normwise_relative_error};
+use golden_fixtures::decode_f32_le;
 
 pub fn matmul_rope_embedding_match_cpu() {
     let left_values = values(7 * 1024, 1);
@@ -191,12 +192,7 @@ fn cpu_dispatch(operation: Op, inputs: &[Input<'_>], output_shape: &[u32]) -> Ve
         .unwrap();
     backend.submit(commands).unwrap().wait().unwrap();
     let bytes = backend.read(&output).unwrap();
-    bytes
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|bytes| f32::from_le_bytes(*bytes))
-        .collect()
+    decode_f32_le(&bytes).unwrap()
 }
 
 pub fn values(len: usize, seed: u64) -> Vec<f32> {
