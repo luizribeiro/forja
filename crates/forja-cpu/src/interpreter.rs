@@ -2,7 +2,7 @@
 
 use forja_core::{
     BackendError,
-    program::{BinOp, Inst, ProgramKind, UnOp, ValidatedProgram, ValueType},
+    program::{BinOp, Inst, ProgramKind, RedOp, UnOp, ValidatedProgram, ValueType},
 };
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -53,13 +53,97 @@ pub fn interpret_map(
         decode_coordinates(linear, shape, &mut coordinates)?;
         let mut values = Vec::with_capacity(program.program().insts.len());
         for &inst in &program.program().insts {
-            values.push(eval(inst, &values, &coordinates, shape, inputs, linear)?);
+            values.push(eval(
+                inst,
+                &coordinates,
+                shape,
+                inputs,
+                linear,
+                |operand| value_at(&values, operand),
+            )?);
         }
         for &(slot, value) in &program.program().outputs {
             let output = outputs
                 .get_mut(usize::try_from(slot).map_err(|_| BackendError::ExecutionFailed)?)
                 .ok_or(BackendError::ExecutionFailed)?;
             output.push(as_f32(value_at(&values, value)?)?);
+        }
+    }
+    Ok(outputs)
+}
+
+/// Evaluates a row program in logical row-major coordinate order.
+///
+/// Reductions consume the complete last-axis row and combine F32 values
+/// sequentially from left to right. Each result is broadcast to every lane of
+/// that row. Evaluation then resumes, so subsequent instructions and reductions
+/// can depend on any earlier reduction.
+///
+/// # Errors
+///
+/// Returns [`BackendError::ExecutionFailed`] if the program is not a row or
+/// its logical inputs and nonempty iteration shape are inconsistent.
+pub fn interpret_row(
+    program: &ValidatedProgram,
+    shape: &[u32],
+    inputs: &[Input<'_>],
+) -> Result<Vec<Vec<f32>>, BackendError> {
+    if program.program().kind != ProgramKind::Row {
+        return Err(BackendError::ExecutionFailed);
+    }
+    let elements = element_count(shape)?;
+    if inputs.iter().any(|input| input.len() != elements) {
+        return Err(BackendError::ExecutionFailed);
+    }
+    let (&last_extent, row_shape) = shape.split_last().ok_or(BackendError::ExecutionFailed)?;
+    let row_width = usize::try_from(last_extent).map_err(|_| BackendError::ExecutionFailed)?;
+    if row_width == 0 {
+        return Err(BackendError::ExecutionFailed);
+    }
+    let row_count = element_count(row_shape)?;
+    let mut outputs = vec![Vec::with_capacity(elements); program.output_count()];
+    let mut coordinates = vec![0_u32; shape.len()];
+    for row in 0..row_count {
+        let row_start = row
+            .checked_mul(row_width)
+            .ok_or(BackendError::ExecutionFailed)?;
+        let mut columns = Vec::<Vec<Scalar>>::with_capacity(program.program().insts.len());
+        for &inst in &program.program().insts {
+            let column = if let Inst::Reduce(op, operand) = inst {
+                let operand = columns
+                    .get(usize::try_from(operand).map_err(|_| BackendError::ExecutionFailed)?)
+                    .ok_or(BackendError::ExecutionFailed)?;
+                vec![reduce(op, operand)?; row_width]
+            } else {
+                let mut column = Vec::with_capacity(row_width);
+                for lane in 0..row_width {
+                    let linear = row_start
+                        .checked_add(lane)
+                        .ok_or(BackendError::ExecutionFailed)?;
+                    decode_coordinates(linear, shape, &mut coordinates)?;
+                    column.push(eval(
+                        inst,
+                        &coordinates,
+                        shape,
+                        inputs,
+                        linear,
+                        |operand| column_value(&columns, operand, lane),
+                    )?);
+                }
+                column
+            };
+            columns.push(column);
+        }
+        for &(slot, value) in &program.program().outputs {
+            let output = outputs
+                .get_mut(usize::try_from(slot).map_err(|_| BackendError::ExecutionFailed)?)
+                .ok_or(BackendError::ExecutionFailed)?;
+            let column = columns
+                .get(usize::try_from(value).map_err(|_| BackendError::ExecutionFailed)?)
+                .ok_or(BackendError::ExecutionFailed)?;
+            for &value in column {
+                output.push(as_f32(value)?);
+            }
         }
     }
     Ok(outputs)
@@ -107,11 +191,11 @@ fn decode_coordinates(
 
 fn eval(
     inst: Inst,
-    values: &[Scalar],
     coordinates: &[u32],
     shape: &[u32],
     inputs: &[Input<'_>],
     linear: usize,
+    operand: impl Fn(u32) -> Result<Scalar, BackendError>,
 ) -> Result<Scalar, BackendError> {
     match inst {
         Inst::Input(slot) => inputs
@@ -129,16 +213,14 @@ fn eval(
             .copied()
             .map(Scalar::U32)
             .ok_or(BackendError::ExecutionFailed),
-        Inst::Unary(op, operand) => unary(op, value_at(values, operand)?),
-        Inst::Binary(op, left, right) => {
-            binary(op, value_at(values, left)?, value_at(values, right)?)
-        }
-        Inst::Select(condition, accepted, rejected) => match value_at(values, condition)? {
-            Scalar::Bool(true) => value_at(values, accepted),
-            Scalar::Bool(false) => value_at(values, rejected),
+        Inst::Unary(op, value) => unary(op, operand(value)?),
+        Inst::Binary(op, left, right) => binary(op, operand(left)?, operand(right)?),
+        Inst::Select(condition, accepted, rejected) => match operand(condition)? {
+            Scalar::Bool(true) => operand(accepted),
+            Scalar::Bool(false) => operand(rejected),
             Scalar::F32(_) | Scalar::U32(_) => Err(BackendError::ExecutionFailed),
         },
-        Inst::Cast(to, operand) => Ok(cast(to, value_at(values, operand)?)),
+        Inst::Cast(to, value) => Ok(cast(to, operand(value)?)),
         Inst::Reduce(_, _) => Err(BackendError::ExecutionFailed),
     }
 }
@@ -148,6 +230,35 @@ fn value_at(values: &[Scalar], index: u32) -> Result<Scalar, BackendError> {
         .get(usize::try_from(index).map_err(|_| BackendError::ExecutionFailed)?)
         .copied()
         .ok_or(BackendError::ExecutionFailed)
+}
+
+fn column_value(columns: &[Vec<Scalar>], index: u32, lane: usize) -> Result<Scalar, BackendError> {
+    columns
+        .get(usize::try_from(index).map_err(|_| BackendError::ExecutionFailed)?)
+        .and_then(|column| column.get(lane))
+        .copied()
+        .ok_or(BackendError::ExecutionFailed)
+}
+
+fn reduce(op: RedOp, values: &[Scalar]) -> Result<Scalar, BackendError> {
+    let mut values = values.iter().copied().map(as_f32);
+    match op {
+        RedOp::Sum => values
+            .try_fold(0.0, |sum, value| value.map(|value| sum + value))
+            .map(Scalar::F32),
+        RedOp::Max | RedOp::Min => {
+            let first = values.next().ok_or(BackendError::ExecutionFailed)??;
+            values
+                .try_fold(first, |accumulator, value| {
+                    value.map(|value| match op {
+                        RedOp::Max => propagating_max(accumulator, value),
+                        RedOp::Min => propagating_min(accumulator, value),
+                        RedOp::Sum => accumulator,
+                    })
+                })
+                .map(Scalar::F32)
+        }
+    }
 }
 
 fn unary(op: UnOp, value: Scalar) -> Result<Scalar, BackendError> {
@@ -288,6 +399,23 @@ mod tests {
         .remove(0)
     }
 
+    fn run_row(insts: Vec<Inst>, output: u32, input: &[f32]) -> Vec<f32> {
+        let program = Program {
+            kind: ProgramKind::Row,
+            insts,
+            outputs: vec![(0, output)],
+        }
+        .validate()
+        .unwrap();
+        interpret_row(
+            &program,
+            &[1, u32::try_from(input.len()).unwrap()],
+            &[Input::F32(input)],
+        )
+        .unwrap()
+        .remove(0)
+    }
+
     #[test]
     fn evaluates_coordinates_inputs_and_every_unary_operation() {
         let input = [4.0_f32, 9.0];
@@ -406,5 +534,42 @@ mod tests {
             &[],
         );
         assert_eq!(result, [1.0]);
+    }
+
+    #[test]
+    fn reductions_fold_left_to_right_and_broadcast() {
+        let result = run_row(
+            vec![Inst::Input(0), Inst::Reduce(RedOp::Sum, 0)],
+            1,
+            &[1.0e20, -1.0e20, 3.0],
+        );
+        assert_eq!(result, [3.0, 3.0, 3.0]);
+    }
+
+    #[test]
+    fn later_reductions_depend_on_earlier_stages() {
+        let result = run_row(
+            vec![
+                Inst::Input(0),
+                Inst::Reduce(RedOp::Sum, 0),
+                Inst::Binary(BinOp::Mul, 0, 1),
+                Inst::Reduce(RedOp::Sum, 2),
+            ],
+            3,
+            &[1.0, 2.0, 3.0],
+        );
+        assert_eq!(result, [36.0, 36.0, 36.0]);
+    }
+
+    #[test]
+    fn reduction_extrema_propagate_nan() {
+        for operation in [RedOp::Min, RedOp::Max] {
+            let result = run_row(
+                vec![Inst::Input(0), Inst::Reduce(operation, 0)],
+                1,
+                &[1.0, f32::NAN, 2.0],
+            );
+            assert!(result.iter().all(|value| value.is_nan()));
+        }
     }
 }
