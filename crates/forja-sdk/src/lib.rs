@@ -2,7 +2,7 @@
 //!
 //! Operations return [`Result`] so host validation and execution failures can
 //! be propagated with `?`. Engine code stays synchronous even though the host
-//! reads asynchronously.
+//! reads and submissions are asynchronous.
 //!
 //! The `native` feature uses the CPU backend for tests and development.
 //! `native-metal` makes Metal selectable with [`set_native_device`] on macOS.
@@ -12,12 +12,14 @@
 #![forbid(unsafe_code)]
 
 mod element;
+mod graph;
 mod sys;
 mod tensor;
 
 use std::{error, fmt};
 
 pub use element::Element;
+pub use graph::eval;
 pub use half::{bf16, f16};
 pub use tensor::{Slice, Tensor};
 

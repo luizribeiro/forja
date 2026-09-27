@@ -1,6 +1,6 @@
-use std::marker::PhantomData;
+use std::{marker::PhantomData, ops::Add, rc::Rc};
 
-use crate::{Element, Error, Result, sys};
+use crate::{Element, Error, Result, graph, sys};
 
 /// A strided selection along one tensor axis.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -25,10 +25,26 @@ impl Slice {
 }
 
 /// A typed tensor owned by the Forja host.
+///
+/// Tensors are neither [`Send`] nor [`Sync`] because their lazy command graph
+/// is local to the thread that created them.
+///
+/// ```compile_fail
+/// use forja_sdk::Tensor;
+/// fn require_send<T: Send>() {}
+/// require_send::<Tensor<f32>>();
+/// ```
+///
+/// ```compile_fail
+/// use forja_sdk::Tensor;
+/// fn require_sync<T: Sync>() {}
+/// require_sync::<Tensor<f32>>();
+/// ```
 pub struct Tensor<T: Element> {
     handle: sys::Handle,
     shape: Vec<u32>,
     element: PhantomData<T>,
+    not_thread_safe: PhantomData<Rc<()>>,
 }
 
 impl<T: Element> Tensor<T> {
@@ -169,12 +185,49 @@ impl<T: Element> Tensor<T> {
         self.view(sys::View::Broadcast(shape.to_vec()), shape.to_vec())
     }
 
-    /// Gathers the logical tensor values.
+    /// Applies `SiLU` to this gate and multiplies it by `up`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for incompatible tensors or a refused dispatch.
+    pub fn silu_mul(&self, up: &Self) -> Result<Self> {
+        self.binary(up, sys::Op::SiluMul)
+    }
+
+    /// Normalizes each row and applies a one-dimensional weight.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid epsilon, shape, type, or dispatch.
+    pub fn rms_norm(&self, weight: &Self, eps: f32) -> Result<Self> {
+        self.binary(weight, sys::Op::RmsNorm(eps))
+    }
+
+    /// Applies stable softmax over the last dimension.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid shape, type, or dispatch.
+    pub fn softmax_last_dim(&self) -> Result<Self> {
+        self.unary::<T>(sys::Op::Softmax, self.shape.clone())
+    }
+
+    /// Copies the tensor while converting between floating-point types.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unsupported cast or refused dispatch.
+    pub fn to_dtype<U: Element>(&self) -> Result<Tensor<U>> {
+        self.unary(sys::Op::Copy, self.shape.clone())
+    }
+
+    /// Submits pending work and gathers the logical tensor values.
     ///
     /// # Errors
     ///
     /// Returns an error when reading fails.
     pub fn to_vec(&self) -> Result<Vec<T>> {
+        crate::eval()?;
         T::decode(&sys::read(&self.handle)?)
     }
 
@@ -188,7 +241,33 @@ impl<T: Element> Tensor<T> {
             handle,
             shape,
             element: PhantomData,
+            not_thread_safe: PhantomData,
         }
+    }
+
+    fn empty<U: Element>(shape: Vec<u32>) -> Result<Tensor<U>> {
+        let handle = sys::alloc(U::DTYPE, &shape)?;
+        Ok(Tensor::from_handle(handle, shape))
+    }
+
+    fn unary<U: Element>(&self, operation: sys::Op, shape: Vec<u32>) -> Result<Tensor<U>> {
+        let output = Self::empty(shape)?;
+        graph::record(operation, &[&self.handle], &output.handle)?;
+        Ok(output)
+    }
+
+    fn binary(&self, other: &Self, operation: sys::Op) -> Result<Self> {
+        let output = Self::empty(self.shape.clone())?;
+        graph::record(operation, &[&self.handle, &other.handle], &output.handle)?;
+        Ok(output)
+    }
+}
+
+impl<T: Element> Add<&Tensor<T>> for &Tensor<T> {
+    type Output = Result<Tensor<T>>;
+
+    fn add(self, other: &Tensor<T>) -> Self::Output {
+        self.binary(other, sys::Op::Add)
     }
 }
 
@@ -256,5 +335,63 @@ mod tests {
     fn rejects_invalid_allocation_preconditions() {
         assert!(Tensor::from_slice(&[1_u32], &[2]).is_err());
         assert!(Tensor::<u32>::from_slice(&[], &[u32::MAX, u32::MAX, u32::MAX]).is_err());
+    }
+
+    #[test]
+    fn native_row_and_elementwise_ops_match_hand_values() {
+        let left = Tensor::from_slice(&[1.0_f32, -2.0, 3.0], &[1, 3]).unwrap();
+        let right = Tensor::from_slice(&[4.0_f32, 5.0, -1.0], &[1, 3]).unwrap();
+        let sum = (&left + &right).unwrap();
+        crate::eval().unwrap();
+        assert_close(&sum.to_vec().unwrap(), &[5.0, 3.0, 2.0]);
+
+        let gate = Tensor::from_slice(&[0.0_f32, 1.0, -1.0], &[1, 3]).unwrap();
+        let up = Tensor::from_slice(&[2.0_f32, 3.0, 4.0], &[1, 3]).unwrap();
+        let activated = gate.silu_mul(&up).unwrap();
+        let expected = [
+            0.0,
+            3.0 / (1.0 + (-1.0_f32).exp()),
+            -4.0 / (1.0 + 1.0_f32.exp()),
+        ];
+        assert_close(&activated.to_vec().unwrap(), &expected);
+
+        let input = Tensor::from_slice(&[3.0_f32, 4.0], &[1, 2]).unwrap();
+        let weight = Tensor::from_slice(&[1.0_f32, 2.0], &[2]).unwrap();
+        let normalized = input.rms_norm(&weight, 0.0).unwrap();
+        let rms = 12.5_f32.sqrt();
+        assert_close(&normalized.to_vec().unwrap(), &[3.0 / rms, 8.0 / rms]);
+
+        let logits = Tensor::from_slice(&[0.0_f32, 2.0_f32.ln()], &[1, 2]).unwrap();
+        let probabilities = logits.softmax_last_dim().unwrap();
+        assert_close(&probabilities.to_vec().unwrap(), &[1.0 / 3.0, 2.0 / 3.0]);
+
+        let half = sum.to_dtype::<crate::f16>().unwrap();
+        assert_eq!(
+            half.to_vec()
+                .unwrap()
+                .into_iter()
+                .map(crate::f16::to_f32)
+                .collect::<Vec<_>>(),
+            [5.0, 3.0, 2.0]
+        );
+    }
+
+    fn assert_close(actual: &[f32], expected: &[f32]) {
+        assert_eq!(actual.len(), expected.len());
+        let error = actual
+            .iter()
+            .zip(expected)
+            .map(|(actual, expected)| (actual - expected).powi(2))
+            .sum::<f32>()
+            .sqrt();
+        let norm = expected
+            .iter()
+            .map(|value| value.powi(2))
+            .sum::<f32>()
+            .sqrt();
+        assert!(
+            error <= 1.0e-5 * norm.max(1.0),
+            "{actual:?} != {expected:?}"
+        );
     }
 }

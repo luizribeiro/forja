@@ -2,7 +2,7 @@
     all(not(target_family = "wasm"), not(feature = "native")),
     allow(
         dead_code,
-        reason = "view payloads are consumed by the guest or native backend"
+        reason = "operation payloads are consumed by the guest or native backend"
     )
 )]
 
@@ -30,13 +30,31 @@ pub(crate) enum View {
     Broadcast(Vec<u32>),
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum Op {
+    Copy,
+    Add,
+    SiluMul,
+    RmsNorm(f32),
+    Softmax,
+}
+
 pub(crate) trait Backend {
     type Tensor;
+    type Commands;
 
     fn alloc(dtype: DType, shape: &[u32]) -> Result<Self::Tensor>;
     fn write(tensor: &Self::Tensor, bytes: &[u8]) -> Result<()>;
     fn view(tensor: &Self::Tensor, operation: View) -> Result<Self::Tensor>;
     fn read(tensor: &Self::Tensor) -> Result<Vec<u8>>;
+    fn command_list() -> Result<Self::Commands>;
+    fn dispatch(
+        commands: &mut Self::Commands,
+        operation: Op,
+        inputs: &[&Self::Tensor],
+        output: &Self::Tensor,
+    ) -> Result<()>;
+    fn submit(commands: Self::Commands) -> Result<()>;
 }
 
 #[cfg(target_family = "wasm")]
@@ -48,13 +66,14 @@ mod guest {
         world: "host",
     });
 
-    use super::{Backend, DType, Error, Result, View};
+    use super::{Backend, DType, Error, Op, Result, View};
     use l9o::gpu::compute;
 
     pub(crate) struct Guest;
 
     impl Backend for Guest {
         type Tensor = compute::Tensor;
+        type Commands = compute::CommandList;
 
         fn alloc(dtype: DType, shape: &[u32]) -> Result<Self::Tensor> {
             compute::Tensor::alloc(wit_dtype(dtype), shape).map_err(|error| guest_error(&error))
@@ -72,6 +91,27 @@ mod guest {
 
         fn read(tensor: &Self::Tensor) -> Result<Vec<u8>> {
             wit_bindgen::block_on(tensor.read()).map_err(|error| guest_error(&error))
+        }
+
+        fn command_list() -> Result<Self::Commands> {
+            Ok(compute::CommandList::new())
+        }
+
+        fn dispatch(
+            commands: &mut Self::Commands,
+            operation: Op,
+            inputs: &[&Self::Tensor],
+            output: &Self::Tensor,
+        ) -> Result<()> {
+            commands
+                .dispatch(wit_op(operation), inputs, output)
+                .map_err(|error| guest_error(&error))
+        }
+
+        fn submit(commands: Self::Commands) -> Result<()> {
+            wit_bindgen::block_on(compute::submit(commands))
+                .map(|_| ())
+                .map_err(|error| guest_error(&error))
         }
     }
 
@@ -103,6 +143,16 @@ mod guest {
         }
     }
 
+    fn wit_op(operation: Op) -> compute::Op {
+        match operation {
+            Op::Copy => compute::Op::Copy,
+            Op::Add => compute::Op::Add,
+            Op::SiluMul => compute::Op::SiluMul,
+            Op::RmsNorm(eps) => compute::Op::RmsNorm(eps),
+            Op::Softmax => compute::Op::Softmax,
+        }
+    }
+
     fn guest_error(error: &compute::Error) -> Error {
         Error::new(format!("{error:?}"))
     }
@@ -110,14 +160,16 @@ mod guest {
 
 #[cfg(all(not(target_family = "wasm"), not(feature = "native")))]
 mod unavailable {
-    use super::{Backend, DType, Error, Result, View};
+    use super::{Backend, DType, Error, Op, Result, View};
 
     pub(crate) enum UnavailableTensor {}
+    pub(crate) enum UnavailableCommands {}
 
     pub(crate) struct Unavailable;
 
     impl Backend for Unavailable {
         type Tensor = UnavailableTensor;
+        type Commands = UnavailableCommands;
 
         fn alloc(_dtype: DType, _shape: &[u32]) -> Result<Self::Tensor> {
             Err(error())
@@ -134,6 +186,23 @@ mod unavailable {
         fn read(_tensor: &Self::Tensor) -> Result<Vec<u8>> {
             Err(error())
         }
+
+        fn command_list() -> Result<Self::Commands> {
+            Err(error())
+        }
+
+        fn dispatch(
+            _commands: &mut Self::Commands,
+            _operation: Op,
+            _inputs: &[&Self::Tensor],
+            _output: &Self::Tensor,
+        ) -> Result<()> {
+            Err(error())
+        }
+
+        fn submit(_commands: Self::Commands) -> Result<()> {
+            Err(error())
+        }
     }
 
     fn error() -> Error {
@@ -145,23 +214,28 @@ mod unavailable {
 mod native {
     use std::cell::Cell;
 
-    use forja_core::{DType as CoreDType, Slice as CoreSlice, ViewOp};
-    use forja_host::{NativeHost, NativeTensor};
+    use forja_core::{DType as CoreDType, Op as CoreOp, Slice as CoreSlice, ViewOp};
+    use forja_host::{NativeCommandList, NativeHost, NativeTensor};
 
-    use super::{Backend, DType, Error, Result, View};
+    use super::{Backend, DType, Error, Op, Result, View};
     use crate::NativeDevice;
 
-    type CpuTensor = NativeTensor<forja_cpu::CpuBackend>;
+    type CpuBackend = forja_cpu::CpuBackend;
+    type CpuTensor = NativeTensor<CpuBackend>;
+    type CpuCommands = NativeCommandList<CpuBackend>;
     #[cfg(all(feature = "native-metal", target_os = "macos"))]
-    type MetalTensor = NativeTensor<forja_metal::MetalBackend>;
+    type MetalBackend = forja_metal::MetalBackend;
+    #[cfg(all(feature = "native-metal", target_os = "macos"))]
+    type MetalTensor = NativeTensor<MetalBackend>;
+    #[cfg(all(feature = "native-metal", target_os = "macos"))]
+    type MetalCommands = NativeCommandList<MetalBackend>;
 
     thread_local! {
         static DEVICE: Cell<NativeDevice> = const { Cell::new(NativeDevice::Cpu) };
-        static CPU_HOST: NativeHost<forja_cpu::CpuBackend> =
-            NativeHost::new(forja_cpu::CpuBackend::new());
+        static CPU_HOST: NativeHost<CpuBackend> = NativeHost::new(CpuBackend::new());
         #[cfg(all(feature = "native-metal", target_os = "macos"))]
-        static METAL_HOST: Result<NativeHost<forja_metal::MetalBackend>> =
-            forja_metal::MetalBackend::new().map(NativeHost::new).map_err(error);
+        static METAL_HOST: Result<NativeHost<MetalBackend>> =
+            MetalBackend::new().map(NativeHost::new).map_err(error);
     }
 
     pub(crate) enum Tensor {
@@ -170,10 +244,17 @@ mod native {
         Metal(MetalTensor),
     }
 
+    pub(crate) enum Commands {
+        Cpu(CpuCommands),
+        #[cfg(all(feature = "native-metal", target_os = "macos"))]
+        Metal(MetalCommands),
+    }
+
     pub(crate) struct Native;
 
     impl Backend for Native {
         type Tensor = Tensor;
+        type Commands = Commands;
 
         fn alloc(dtype: DType, shape: &[u32]) -> Result<Self::Tensor> {
             match DEVICE.get() {
@@ -224,10 +305,66 @@ mod native {
                 Tensor::Metal(tensor) => with_metal(|host| host.read(tensor).map_err(error)),
             }
         }
+
+        fn command_list() -> Result<Self::Commands> {
+            match DEVICE.get() {
+                NativeDevice::Cpu => CPU_HOST.with(|host| Ok(Commands::Cpu(host.command_list()))),
+                #[cfg(all(feature = "native-metal", target_os = "macos"))]
+                NativeDevice::Metal => with_metal(|host| Ok(Commands::Metal(host.command_list()))),
+            }
+        }
+
+        fn dispatch(
+            commands: &mut Self::Commands,
+            operation: Op,
+            inputs: &[&Self::Tensor],
+            output: &Self::Tensor,
+        ) -> Result<()> {
+            match (commands, output) {
+                (Commands::Cpu(commands), Tensor::Cpu(output)) => commands
+                    .dispatch(core_op(operation), &cpu_inputs(inputs)?, output)
+                    .map_err(error),
+                #[cfg(all(feature = "native-metal", target_os = "macos"))]
+                (Commands::Metal(commands), Tensor::Metal(output)) => commands
+                    .dispatch(core_op(operation), &metal_inputs(inputs)?, output)
+                    .map_err(error),
+                _ => Err(Error::new("native tensors belong to different backends")),
+            }
+        }
+
+        fn submit(commands: Self::Commands) -> Result<()> {
+            match commands {
+                Commands::Cpu(commands) => commands.submit().map(|_| ()).map_err(error),
+                #[cfg(all(feature = "native-metal", target_os = "macos"))]
+                Commands::Metal(commands) => commands.submit().map(|_| ()).map_err(error),
+            }
+        }
     }
 
     pub(crate) fn set_device(device: NativeDevice) {
         DEVICE.set(device);
+    }
+
+    fn cpu_inputs<'a>(inputs: &[&'a Tensor]) -> Result<Vec<&'a CpuTensor>> {
+        inputs
+            .iter()
+            .map(|tensor| match tensor {
+                Tensor::Cpu(tensor) => Ok(tensor),
+                #[cfg(all(feature = "native-metal", target_os = "macos"))]
+                Tensor::Metal(_) => Err(Error::new("native tensors belong to different backends")),
+            })
+            .collect()
+    }
+
+    #[cfg(all(feature = "native-metal", target_os = "macos"))]
+    fn metal_inputs<'a>(inputs: &[&'a Tensor]) -> Result<Vec<&'a MetalTensor>> {
+        inputs
+            .iter()
+            .map(|tensor| match tensor {
+                Tensor::Metal(tensor) => Ok(tensor),
+                Tensor::Cpu(_) => Err(Error::new("native tensors belong to different backends")),
+            })
+            .collect()
     }
 
     fn core_view(operation: View) -> Result<ViewOp> {
@@ -255,10 +392,18 @@ mod native {
         }
     }
 
+    fn core_op(operation: Op) -> CoreOp {
+        match operation {
+            Op::Copy => CoreOp::Copy,
+            Op::Add => CoreOp::Add,
+            Op::SiluMul => CoreOp::SiluMul,
+            Op::RmsNorm(eps) => CoreOp::RmsNorm { eps },
+            Op::Softmax => CoreOp::Softmax,
+        }
+    }
+
     #[cfg(all(feature = "native-metal", target_os = "macos"))]
-    fn with_metal<T>(
-        operation: impl FnOnce(&NativeHost<forja_metal::MetalBackend>) -> Result<T>,
-    ) -> Result<T> {
+    fn with_metal<T>(operation: impl FnOnce(&NativeHost<MetalBackend>) -> Result<T>) -> Result<T> {
         METAL_HOST.with(|host| match host {
             Ok(host) => operation(host),
             Err(error) => Err(error.clone()),
@@ -277,6 +422,7 @@ pub(crate) use native::Native as Active;
 #[cfg(all(not(feature = "native"), not(target_family = "wasm")))]
 pub(crate) use unavailable::Unavailable as Active;
 pub(crate) type Handle = <Active as Backend>::Tensor;
+pub(crate) type Commands = <Active as Backend>::Commands;
 
 pub(crate) fn alloc(dtype: u8, shape: &[u32]) -> Result<Handle> {
     let dtype = match dtype {
@@ -300,6 +446,23 @@ pub(crate) fn view(tensor: &Handle, operation: View) -> Result<Handle> {
 
 pub(crate) fn read(tensor: &Handle) -> Result<Vec<u8>> {
     Active::read(tensor)
+}
+
+pub(crate) fn command_list() -> Result<Commands> {
+    Active::command_list()
+}
+
+pub(crate) fn dispatch(
+    commands: &mut Commands,
+    operation: Op,
+    inputs: &[&Handle],
+    output: &Handle,
+) -> Result<()> {
+    Active::dispatch(commands, operation, inputs, output)
+}
+
+pub(crate) fn submit(commands: Commands) -> Result<()> {
+    Active::submit(commands)
 }
 
 #[cfg(feature = "native")]
