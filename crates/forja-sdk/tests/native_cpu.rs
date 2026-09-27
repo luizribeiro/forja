@@ -15,6 +15,11 @@ fn attention_and_cache_copy_match_the_cpu_backend() {
 }
 
 #[test]
+fn neural_network_modules_match_the_cpu_backend() {
+    support::neural_network_modules_match_cpu();
+}
+
+#[test]
 fn refusals_and_execution_failures_surface_as_results() {
     let source = forja_sdk::Tensor::from_slice(&[1.0_f32, 2.0], &[2]).unwrap();
     let mut alias = source.narrow(0, 0, 2).unwrap();

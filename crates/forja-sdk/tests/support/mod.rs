@@ -100,6 +100,68 @@ pub fn attention_and_cache_copy_match_cpu() {
     assert_eq!(copied, expected);
 }
 
+pub fn neural_network_modules_match_cpu() {
+    let input_values = values(7 * 1024, 10);
+    let weight_values = values(2048 * 1024, 11);
+    let input = Tensor::from_slice(&input_values, &[7, 1024]).unwrap();
+    let linear =
+        forja_sdk::nn::Linear::new(Tensor::from_slice(&weight_values, &[2048, 1024]).unwrap());
+    let projected = linear.forward(&input).unwrap().to_vec().unwrap();
+    let mut transposed_weight = vec![0.0; weight_values.len()];
+    for output in 0..2048 {
+        for input in 0..1024 {
+            transposed_weight[input * 2048 + output] = weight_values[output * 1024 + input];
+        }
+    }
+    let expected = cpu_dispatch(
+        Op::Matmul,
+        &[
+            Input::F32(&[7, 1024], &input_values),
+            Input::F32(&[1024, 2048], &transposed_weight),
+        ],
+        &[7, 2048],
+    );
+    assert_agrees(&expected, &projected);
+
+    let norm_input = values(7 * 1024, 12);
+    let norm_weight = values(1024, 13);
+    let norm =
+        forja_sdk::nn::RmsNorm::new(Tensor::from_slice(&norm_weight, &[1024]).unwrap(), 1.0e-6);
+    let normalized = norm
+        .forward(&Tensor::from_slice(&norm_input, &[7, 1024]).unwrap())
+        .unwrap()
+        .to_vec()
+        .unwrap();
+    let expected = cpu_dispatch(
+        Op::RmsNorm { eps: 1.0e-6 },
+        &[
+            Input::F32(&[7, 1024], &norm_input),
+            Input::F32(&[1024], &norm_weight),
+        ],
+        &[7, 1024],
+    );
+    assert_agrees(&expected, &normalized);
+
+    let table_values = values(33 * 1024, 14);
+    let ids = [0_u32, 32, 7, 1, 16, 8, 31];
+    let embedding =
+        forja_sdk::nn::Embedding::new(Tensor::from_slice(&table_values, &[33, 1024]).unwrap());
+    let embedded = embedding
+        .forward(&Tensor::from_slice(&ids, &[7]).unwrap())
+        .unwrap()
+        .to_vec()
+        .unwrap();
+    let expected = cpu_dispatch(
+        Op::Embed,
+        &[
+            Input::F32(&[33, 1024], &table_values),
+            Input::U32(&[7], &ids),
+        ],
+        &[7, 1024],
+    );
+    assert_agrees(&expected, &embedded);
+}
+
 enum Input<'a> {
     F32(&'a [u32], &'a [f32]),
     U32(&'a [u32], &'a [u32]),

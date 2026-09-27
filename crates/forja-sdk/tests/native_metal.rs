@@ -31,3 +31,9 @@ fn metal_attention_and_cache_copy_match_the_cpu_backend() {
     set_native_device(NativeDevice::Metal);
     support::attention_and_cache_copy_match_cpu();
 }
+
+#[test]
+fn metal_neural_network_modules_match_the_cpu_backend() {
+    set_native_device(NativeDevice::Metal);
+    support::neural_network_modules_match_cpu();
+}
