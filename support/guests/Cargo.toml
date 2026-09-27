@@ -4,6 +4,7 @@ members = [
   "engine-sdk-smoke",
   "hello",
   "rmsnorm-smoke",
+  "qwen3",
   "sdk-smoke",
   "tensor-abuse",
   "tensor-smoke",

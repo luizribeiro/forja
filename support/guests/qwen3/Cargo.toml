@@ -1,0 +1,13 @@
+[package]
+name = "qwen3"
+edition.workspace = true
+license = "MIT OR Apache-2.0"
+publish = false
+rust-version.workspace = true
+version.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+forja-sdk = { workspace = true }
