@@ -1,0 +1,103 @@
+// Copyright © 2024 Apple Inc.
+// SPDX-License-Identifier: MIT
+
+#include <metal_simdgroup_matrix>
+
+template <int block_rows, int block_columns, int block_inner,
+          int simdgroups_rows, int simdgroups_columns>
+struct BlockMMA {
+    static constant constexpr int fragment_size = 8;
+    static constant constexpr int row_fragments =
+        block_rows / (fragment_size * simdgroups_rows);
+    static constant constexpr int column_fragments =
+        block_columns / (fragment_size * simdgroups_columns);
+    static constant constexpr int fragment_count = row_fragments * column_fragments;
+
+    float accumulators[fragment_count * 2];
+    ushort simdgroup_row;
+    ushort simdgroup_column;
+    ushort fragment_row;
+    ushort fragment_column;
+
+    BlockMMA(
+        ushort simdgroup_index [[simdgroup_index_in_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]]) thread
+        : simdgroup_row(simdgroup_index / simdgroups_columns),
+          simdgroup_column(simdgroup_index % simdgroups_columns) {
+        ushort quad = lane / 4;
+        fragment_row = (quad & 4) + ((lane / 2) % 4);
+        fragment_column = (quad & 2) * 2 + (lane % 2) * 2;
+        for (int element = 0; element < fragment_count * 2; ++element) {
+            accumulators[element] = 0.0f;
+        }
+    }
+
+    void multiply(
+        threadgroup const float *a,
+        threadgroup const float *b) thread {
+        for (int inner = 0; inner < block_inner; inner += fragment_size) {
+            for (int row_fragment = 0; row_fragment < row_fragments; ++row_fragment) {
+                simdgroup_matrix<float, 8, 8> a_matrix;
+                uint a_row = simdgroup_row * fragment_size + fragment_row +
+                    row_fragment * fragment_size * simdgroups_rows;
+                for (int element = 0; element < 2; ++element) {
+                    a_matrix.thread_elements()[element] =
+                        a[a_row * block_inner + inner + fragment_column + element];
+                }
+                for (int column_fragment = 0;
+                     column_fragment < column_fragments;
+                     ++column_fragment) {
+                    simdgroup_matrix<float, 8, 8> b_matrix;
+                    simdgroup_matrix<float, 8, 8> accumulator;
+                    simdgroup_matrix<float, 8, 8> result;
+                    uint b_column = simdgroup_column * fragment_size + fragment_column +
+                        column_fragment * fragment_size * simdgroups_columns;
+                    int fragment_index = row_fragment * column_fragments + column_fragment;
+                    for (int element = 0; element < 2; ++element) {
+                        b_matrix.thread_elements()[element] =
+                            b[(inner + fragment_row) * block_columns + b_column + element];
+                        accumulator.thread_elements()[element] =
+                            accumulators[fragment_index * 2 + element];
+                    }
+                    simdgroup_multiply_accumulate(
+                        result, a_matrix, b_matrix, accumulator);
+                    for (int element = 0; element < 2; ++element) {
+                        accumulators[fragment_index * 2 + element] =
+                            result.thread_elements()[element];
+                    }
+                }
+            }
+        }
+    }
+
+    void store(
+        device uchar *output,
+        ulong base,
+        ulong leading_dimension,
+        uint row_origin,
+        uint column_origin,
+        uint row_extent,
+        uint column_extent,
+        uint dtype) const thread {
+        for (int row_fragment = 0; row_fragment < row_fragments; ++row_fragment) {
+            uint row = simdgroup_row * fragment_size + fragment_row +
+                row_fragment * fragment_size * simdgroups_rows;
+            for (int column_fragment = 0;
+                 column_fragment < column_fragments;
+                 ++column_fragment) {
+                uint column = simdgroup_column * fragment_size + fragment_column +
+                    column_fragment * fragment_size * simdgroups_columns;
+                int fragment_index = row_fragment * column_fragments + column_fragment;
+                for (int element = 0; element < 2; ++element) {
+                    if (row_origin + row < row_extent &&
+                        column_origin + column + element < column_extent) {
+                        ulong index = base + ulong(row_origin + row) * leading_dimension +
+                            ulong(column_origin + column + element);
+                        store_float(
+                            output, index, dtype, accumulators[fragment_index * 2 + element]);
+                    }
+                }
+            }
+        }
+    }
+};
