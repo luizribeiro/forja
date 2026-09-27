@@ -4,6 +4,7 @@
 mod backend;
 mod layout;
 mod ops;
+pub mod program;
 mod quantized;
 
 pub use backend::{
