@@ -2,6 +2,10 @@ use std::{error::Error, time::Duration};
 
 use forja_host::Limits;
 
+/// Selects the last greatest value under the IEEE total order.
+///
+/// Equal values select the later index, and positive NaNs sort above finite values rather than
+/// being ignored.
 pub(crate) fn argmax(values: &[f32]) -> Result<u32, Box<dyn Error>> {
     let index = values
         .iter()
@@ -23,4 +27,29 @@ pub(crate) const fn limits() -> Limits {
     .with_command_limits(4_096, u64::MAX)
     .with_guest_call_timeout(Duration::from_secs(300))
     .with_gpu_limits(Duration::from_secs(60), Duration::from_secs(3_600))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn argmax_rejects_empty_values() {
+        assert_eq!(
+            argmax(&[]).unwrap_err().to_string(),
+            "cannot take argmax of empty logits"
+        );
+    }
+
+    #[test]
+    fn argmax_selects_the_last_tied_value() -> Result<(), Box<dyn Error>> {
+        assert_eq!(argmax(&[1.0, 3.0, 3.0, 2.0])?, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn argmax_uses_total_order_for_nan() -> Result<(), Box<dyn Error>> {
+        assert_eq!(argmax(&[1.0, f32::NAN, 2.0])?, 1);
+        Ok(())
+    }
 }

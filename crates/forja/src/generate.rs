@@ -59,7 +59,7 @@ where
     if prompt.is_empty() {
         return Err("the prompt tokenized to an empty sequence".into());
     }
-    let eos = eos_token_ids(&options.model_dir)?;
+    let eos = load_eos_token_ids(&options.model_dir)?;
     let mut runner = EngineRunner::new(
         component,
         backend,
@@ -130,9 +130,13 @@ where
     Ok(generated)
 }
 
-fn eos_token_ids(model_dir: &Path) -> Result<Vec<u32>, Box<dyn Error>> {
+fn load_eos_token_ids(model_dir: &Path) -> Result<Vec<u32>, Box<dyn Error>> {
     let bytes = fs::read(model_dir.join("generation_config.json"))?;
     let config: serde_json::Value = serde_json::from_slice(&bytes)?;
+    eos_token_ids(&config)
+}
+
+fn eos_token_ids(config: &serde_json::Value) -> Result<Vec<u32>, Box<dyn Error>> {
     let value = config
         .get("eos_token_id")
         .ok_or("generation config has no eos_token_id")?;
@@ -158,8 +162,37 @@ mod tests {
     use std::{env, path::PathBuf};
 
     use golden_fixtures::FixtureDirectory;
+    use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn parses_scalar_and_array_eos_ids() -> Result<(), Box<dyn Error>> {
+        assert_eq!(eos_token_ids(&json!({ "eos_token_id": 7 }))?, [7]);
+        assert_eq!(eos_token_ids(&json!({ "eos_token_id": [7, 33] }))?, [7, 33]);
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_missing_eos_ids() {
+        assert!(eos_token_ids(&json!({})).is_err());
+    }
+
+    #[test]
+    fn rejects_non_integer_eos_ids() {
+        assert!(eos_token_ids(&json!({ "eos_token_id": 1.5 })).is_err());
+    }
+
+    #[test]
+    fn rejects_an_empty_eos_array() {
+        assert!(eos_token_ids(&json!({ "eos_token_id": [] })).is_err());
+    }
+
+    #[test]
+    fn rejects_eos_ids_over_u32() {
+        let overflow = u64::from(u32::MAX) + 1;
+        assert!(eos_token_ids(&json!({ "eos_token_id": overflow })).is_err());
+    }
 
     #[cfg(target_os = "macos")]
     #[test]
