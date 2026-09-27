@@ -6,6 +6,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
 };
+use std::time::{Duration, Instant};
 
 use forja_core::{
     Backend, BackendError, CommandList, DType, Layout, LayoutError, Op, OpError, Slice, Submission,
@@ -45,6 +46,8 @@ pub struct Limits {
     instances: usize,
     dispatches_per_list: usize,
     work_per_dispatch: u64,
+    submission_timeout: Duration,
+    gpu_time_budget: Duration,
 }
 
 impl Limits {
@@ -68,6 +71,8 @@ impl Limits {
             instances: 10_000,
             dispatches_per_list: usize::MAX,
             work_per_dispatch: u64::MAX,
+            submission_timeout: Duration::from_secs(10),
+            gpu_time_budget: Duration::MAX,
         }
     }
 
@@ -80,6 +85,20 @@ impl Limits {
     ) -> Self {
         self.dispatches_per_list = max_dispatches_per_list;
         self.work_per_dispatch = max_work_per_dispatch;
+        self
+    }
+
+    /// Overrides the per-submission deadline and cumulative device-time budget.
+    ///
+    /// Timeouts and exhausted budgets are reported through the guest quota error.
+    #[must_use]
+    pub const fn with_gpu_limits(
+        mut self,
+        submission_timeout: Duration,
+        gpu_time_budget: Duration,
+    ) -> Self {
+        self.submission_timeout = submission_timeout;
+        self.gpu_time_budget = gpu_time_budget;
         self
     }
 
@@ -139,6 +158,7 @@ pub struct Host<B: Backend> {
     store_limits: StoreLimits,
     live_bytes: Arc<AtomicU64>,
     live_handles: usize,
+    gpu_time_ns: Arc<AtomicU64>,
 }
 
 impl<B: Backend> Host<B> {
@@ -156,6 +176,7 @@ impl<B: Backend> Host<B> {
             store_limits,
             live_bytes: Arc::new(AtomicU64::new(0)),
             live_handles: 0,
+            gpu_time_ns: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -336,6 +357,9 @@ impl<B: Backend> Host<B> {
             backend: Arc::clone(&self.backend),
             commands: entry.commands,
             retained: entry.retained,
+            timeout: self.limits.submission_timeout,
+            gpu_time_budget_ns: duration_ns(self.limits.gpu_time_budget),
+            gpu_time_ns: Arc::clone(&self.gpu_time_ns),
         })
     }
 
@@ -465,6 +489,54 @@ struct SubmitRequest<B: Backend> {
     backend: Arc<B>,
     commands: CommandList,
     retained: Vec<TensorEntry>,
+    timeout: Duration,
+    gpu_time_budget_ns: u64,
+    gpu_time_ns: Arc<AtomicU64>,
+}
+
+struct GpuReservation {
+    total: Arc<AtomicU64>,
+    reserved: u64,
+}
+
+impl GpuReservation {
+    fn new(total: Arc<AtomicU64>, budget: u64, reserved: u64) -> Result<Self, BackendError> {
+        total
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current.checked_add(reserved).filter(|&next| next <= budget)
+            })
+            .map_err(|_| BackendError::QuotaExceeded)?;
+        Ok(Self { total, reserved })
+    }
+
+    const fn amount(&self) -> u64 {
+        self.reserved
+    }
+
+    fn settle(mut self, charged: u64) -> Result<(), BackendError> {
+        let charged = charged.min(self.reserved);
+        self.total
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current
+                    .checked_sub(self.reserved)
+                    .and_then(|remaining| remaining.checked_add(charged))
+            })
+            .map_err(|_| BackendError::ExecutionFailed)?;
+        self.reserved = 0;
+        Ok(())
+    }
+}
+
+impl Drop for GpuReservation {
+    fn drop(&mut self) {
+        if self.reserved != 0 {
+            let _ = self
+                .total
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                    current.checked_sub(self.reserved)
+                });
+        }
+    }
 }
 
 impl<B> SubmitRequest<B>
@@ -472,20 +544,42 @@ where
     B: Backend + Send + Sync + 'static,
 {
     async fn run(self) -> Result<Option<u64>, compute::Error> {
+        let reservation = GpuReservation::new(
+            Arc::clone(&self.gpu_time_ns),
+            self.gpu_time_budget_ns,
+            duration_ns(self.timeout).max(1),
+        );
         tokio::task::spawn_blocking(move || {
             let Self {
                 backend,
                 commands,
                 retained,
+                timeout,
+                gpu_time_budget_ns: _,
+                gpu_time_ns: _,
             } = self;
-            let result = backend.submit(commands).and_then(|submission| {
-                submission.wait()?;
-                submission
-                    .gpu_time()
-                    .map(|duration| u64::try_from(duration.as_nanos()))
-                    .transpose()
-                    .map_err(|_| BackendError::ExecutionFailed)
-            });
+            let result = match reservation {
+                Err(error) => Err(error),
+                Ok(reservation) => match backend.submit(commands) {
+                    Err(error) => Err(error),
+                    Ok(submission) => {
+                        let started = Instant::now();
+                        let wait = submission.wait_timeout(timeout);
+                        let wall_time = duration_ns(started.elapsed()).max(1);
+                        let gpu_time = submission.gpu_time().map(duration_ns);
+                        let charged = if wait == Err(BackendError::Timeout) {
+                            reservation.amount()
+                        } else {
+                            gpu_time.unwrap_or(wall_time).max(1)
+                        };
+                        let accounting = reservation.settle(charged);
+                        match (wait, accounting) {
+                            (Err(error), _) | (Ok(()), Err(error)) => Err(error),
+                            (Ok(()), Ok(())) => Ok(gpu_time),
+                        }
+                    }
+                },
+            };
             let release = release_retained(backend.as_ref(), retained);
             match (result, release) {
                 (Err(error), _) | (Ok(_), Err(error)) => Err(error),
@@ -785,14 +879,15 @@ fn guest_error(error: impl Into<GuestFailure>) -> compute::Error {
     match error.into() {
         GuestFailure::Layout(error) => compute::Error::Layout(error.to_string()),
         GuestFailure::Op(error) => compute::Error::OpSignature(error.to_string()),
-        GuestFailure::Backend(BackendError::QuotaExceeded) => {
-            quota("backend allocation quota exceeded")
-        }
+        GuestFailure::Backend(BackendError::QuotaExceeded) => quota("backend quota exceeded"),
         GuestFailure::Backend(BackendError::AllocationFailed) => {
             compute::Error::BackendExecution("backend allocation failed".to_owned())
         }
         GuestFailure::Backend(BackendError::ExecutionFailed) => {
             compute::Error::BackendExecution("backend execution failed".to_owned())
+        }
+        GuestFailure::Backend(BackendError::Timeout) => {
+            quota("backend submission exceeded its time limit")
         }
         GuestFailure::Backend(BackendError::InvalidInput) => {
             invalid_handle("backend rejected the tensor handle")
@@ -801,6 +896,10 @@ fn guest_error(error: impl Into<GuestFailure>) -> compute::Error {
             compute::Error::OpSignature(format!("backend index {index} is out of range"))
         }
     }
+}
+
+fn duration_ns(duration: Duration) -> u64 {
+    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
 }
 
 enum GuestFailure {
@@ -833,9 +932,10 @@ mod tests {
         Arc, Condvar, Mutex,
         atomic::{AtomicUsize, Ordering},
     };
+    use std::time::Duration;
 
     use forja_core::{
-        Backend, BackendError, CommandList, DType, LayoutError, OpError, Tensor,
+        Backend, BackendError, CommandList, DType, LayoutError, OpError, Submission, Tensor,
         ViewOp as CoreViewOp,
     };
     use forja_cpu::CpuBackend;
@@ -1277,6 +1377,10 @@ mod tests {
             super::guest_error(BackendError::ExecutionFailed),
             compute::Error::BackendExecution(_)
         ));
+        assert!(matches!(
+            super::guest_error(BackendError::Timeout),
+            compute::Error::Quota(_)
+        ));
 
         let host = Host::new(CpuBackend::new(), GENEROUS);
         assert!(matches!(
@@ -1329,6 +1433,126 @@ mod tests {
         assert_eq!(gate.releases.load(Ordering::Acquire), 1);
     }
 
+    #[cfg(target_os = "macos")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn metal_tensor_smoke_enforces_gpu_time_budget() {
+        let limits = GENEROUS.with_gpu_limits(
+            std::time::Duration::from_secs(10),
+            std::time::Duration::from_secs(10),
+        );
+        let backend = forja_metal::MetalBackend::new().unwrap();
+        let mut host = Host::new(backend, limits);
+        let input = host.alloc(compute::Dtype::F32, &[4097]).unwrap();
+        let output = host.alloc(compute::Dtype::F32, &[4097]).unwrap();
+
+        let first = host.command_list().unwrap();
+        host.dispatch(
+            &first,
+            compute::Op::Copy,
+            &[Resource::new_borrow(input.rep())],
+            &output,
+        )
+        .unwrap();
+        assert!(host.prepare_submit(first).unwrap().run().await.unwrap() > Some(0));
+
+        let later = host.command_list().unwrap();
+        host.dispatch(
+            &later,
+            compute::Op::Copy,
+            &[Resource::new_borrow(input.rep())],
+            &output,
+        )
+        .unwrap();
+        assert!(matches!(
+            host.prepare_submit(later).unwrap().run().await,
+            Err(compute::Error::Quota(_))
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_submits_reserve_their_deadlines() {
+        const SUBMITS: usize = 4;
+        let gate = Arc::new(SubmitGate::default());
+        let backend = AccountingBackend::new(
+            Some(Arc::clone(&gate)),
+            Some(Duration::from_nanos(50)),
+            Duration::ZERO,
+        );
+        let limits = GENEROUS.with_gpu_limits(Duration::from_nanos(100), Duration::from_nanos(300));
+        let mut host = Host::new(backend, limits);
+        let mut requests = Vec::new();
+        for _ in 0..SUBMITS {
+            let commands = host.command_list().unwrap();
+            requests.push(host.prepare_submit(commands).unwrap());
+        }
+        let tasks = requests
+            .into_iter()
+            .map(|request| tokio::spawn(request.run()))
+            .collect::<Vec<_>>();
+
+        gate.wait_for(SUBMITS - 1);
+        gate.release();
+        let mut accepted = 0;
+        let mut refused = 0;
+        for task in tasks {
+            match task.await.unwrap() {
+                Ok(_) => accepted += 1,
+                Err(compute::Error::Quota(_)) => refused += 1,
+                Err(error) => panic!("unexpected submit error: {error:?}"),
+            }
+        }
+        assert_eq!(accepted, SUBMITS - 1);
+        assert_eq!(refused, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cumulative_gpu_charge_never_exceeds_the_budget() {
+        let backend = AccountingBackend::new(None, Some(Duration::from_nanos(30)), Duration::ZERO);
+        let limits =
+            GENEROUS.with_gpu_limits(Duration::from_nanos(100), Duration::from_nanos(1_000));
+        let mut host = Host::new(backend, limits);
+        let mut accepted = 0;
+        let mut refused = 0;
+        for _ in 0..64 {
+            let commands = host.command_list().unwrap();
+            match host.prepare_submit(commands).unwrap().run().await {
+                Ok(_) => accepted += 1,
+                Err(compute::Error::Quota(_)) => refused += 1,
+                Err(error) => panic!("unexpected submit error: {error:?}"),
+            }
+            assert!(host.gpu_time_ns.load(Ordering::Acquire) <= 1_000);
+        }
+        assert!(accepted > 10);
+        assert!(refused > 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn missing_gpu_timestamps_charge_wall_time() {
+        let backend = AccountingBackend::new(None, None, Duration::from_millis(1));
+        let limits = GENEROUS.with_gpu_limits(Duration::from_secs(1), Duration::from_secs(2));
+        let mut host = Host::new(backend, limits);
+        let commands = host.command_list().unwrap();
+        assert_eq!(
+            host.prepare_submit(commands).unwrap().run().await.unwrap(),
+            None
+        );
+        assert!(host.gpu_time_ns.load(Ordering::Acquire) > 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn timed_out_submissions_charge_the_full_deadline() {
+        let backend = AccountingBackend::timing_out();
+        let limits =
+            GENEROUS.with_gpu_limits(Duration::from_nanos(100), Duration::from_nanos(1_000));
+        let mut host = Host::new(backend, limits);
+        let commands = host.command_list().unwrap();
+        assert!(matches!(
+            host.prepare_submit(commands).unwrap().run().await,
+            Err(compute::Error::Quota(_))
+        ));
+        assert_eq!(host.gpu_time_ns.load(Ordering::Acquire), 100);
+    }
+
     #[derive(Default)]
     struct ReadGate {
         state: Mutex<(bool, bool)>,
@@ -1359,6 +1583,119 @@ mod tests {
     struct BlockingBackend {
         inner: CpuBackend,
         gate: Arc<ReadGate>,
+    }
+
+    #[derive(Default)]
+    struct SubmitGate {
+        state: Mutex<(usize, bool)>,
+        ready: Condvar,
+    }
+
+    impl SubmitGate {
+        fn wait(&self) {
+            let mut state = self.state.lock().unwrap();
+            state.0 += 1;
+            self.ready.notify_all();
+            while !state.1 {
+                state = self.ready.wait(state).unwrap();
+            }
+        }
+
+        fn wait_for(&self, count: usize) {
+            let mut state = self.state.lock().unwrap();
+            while state.0 < count {
+                state = self.ready.wait(state).unwrap();
+            }
+        }
+
+        fn release(&self) {
+            self.state.lock().unwrap().1 = true;
+            self.ready.notify_all();
+        }
+    }
+
+    struct AccountingBackend {
+        inner: CpuBackend,
+        gate: Option<Arc<SubmitGate>>,
+        gpu_time: Option<Duration>,
+        delay: Duration,
+        wait_error: Option<BackendError>,
+    }
+
+    impl AccountingBackend {
+        fn new(gate: Option<Arc<SubmitGate>>, gpu_time: Option<Duration>, delay: Duration) -> Self {
+            Self {
+                inner: CpuBackend::new(),
+                gate,
+                gpu_time,
+                delay,
+                wait_error: None,
+            }
+        }
+
+        fn timing_out() -> Self {
+            Self {
+                inner: CpuBackend::new(),
+                gate: None,
+                gpu_time: None,
+                delay: Duration::ZERO,
+                wait_error: Some(BackendError::Timeout),
+            }
+        }
+    }
+
+    struct AccountingSubmission {
+        gate: Option<Arc<SubmitGate>>,
+        gpu_time: Option<Duration>,
+        delay: Duration,
+        wait_error: Option<BackendError>,
+    }
+
+    impl Submission for AccountingSubmission {
+        fn wait(&self) -> Result<(), BackendError> {
+            if let Some(gate) = &self.gate {
+                gate.wait();
+            }
+            std::thread::sleep(self.delay);
+            self.wait_error.map_or(Ok(()), Err)
+        }
+
+        fn gpu_time(&self) -> Option<Duration> {
+            self.gpu_time
+        }
+    }
+
+    impl Backend for AccountingBackend {
+        type Submission = AccountingSubmission;
+
+        fn alloc(&self, dtype: DType, shape: &[u32]) -> Result<Tensor, BackendError> {
+            self.inner.alloc(dtype, shape)
+        }
+
+        fn view(&self, tensor: &Tensor, op: CoreViewOp) -> Result<Tensor, BackendError> {
+            self.inner.view(tensor, op)
+        }
+
+        fn write(&self, tensor: &Tensor, bytes: &[u8]) -> Result<(), BackendError> {
+            self.inner.write(tensor, bytes)
+        }
+
+        fn read(&self, tensor: &Tensor) -> Result<Vec<u8>, BackendError> {
+            self.inner.read(tensor)
+        }
+
+        fn release(&self, tensor: &Tensor) -> Result<(), BackendError> {
+            self.inner.release(tensor)
+        }
+
+        fn submit(&self, _commands: CommandList) -> Result<Self::Submission, BackendError> {
+            Ok(AccountingSubmission {
+                gate: self.gate.clone(),
+                gpu_time: self.gpu_time,
+                delay: self.delay,
+                wait_error: self.wait_error,
+            })
+        }
     }
 
     impl BlockingBackend {

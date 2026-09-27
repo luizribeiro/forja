@@ -132,6 +132,8 @@ pub enum BackendError {
     AllocationFailed,
     /// Validated work failed while executing.
     ExecutionFailed,
+    /// Submitted work did not complete before its configured deadline.
+    Timeout,
     /// An argument does not belong to this backend or violates an API rule.
     InvalidInput,
     /// A data-dependent read used an index outside its source extent.
@@ -157,6 +159,19 @@ pub trait Submission {
     ///
     /// Returns [`BackendError::ExecutionFailed`] if execution failed.
     fn wait(&self) -> Result<(), BackendError>;
+
+    /// Waits for execution up to a caller-provided deadline.
+    ///
+    /// Backends without asynchronous device work may ignore the deadline.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BackendError::Timeout`] when work remains incomplete at the deadline, or an
+    /// execution error when completed work failed.
+    fn wait_timeout(&self, timeout: Duration) -> Result<(), BackendError> {
+        let _ = timeout;
+        self.wait()
+    }
 
     /// Returns elapsed device execution time after a successful wait.
     ///

@@ -51,7 +51,7 @@ impl MetalBuffer {
             };
             if let Err(error) = completion.wait(timeout) {
                 result = Err(error);
-                if error == BackendError::ExecutionFailed {
+                if matches!(error, BackendError::ExecutionFailed | BackendError::Timeout) {
                     self.pending.push(Arc::downgrade(&completion));
                 }
             }

@@ -415,7 +415,7 @@ impl Completion {
             }
             let remaining = timeout.saturating_sub(started.elapsed());
             if remaining.is_zero() {
-                return Err(BackendError::ExecutionFailed);
+                return Err(BackendError::Timeout);
             }
             let (next, wait) = self
                 .ready
@@ -423,7 +423,7 @@ impl Completion {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             state = next;
             if wait.timed_out() && (!state.event_signaled || state.feedback.is_none()) {
-                return Err(BackendError::ExecutionFailed);
+                return Err(BackendError::Timeout);
             }
         }
     }
@@ -699,6 +699,10 @@ pub struct MetalSubmission {
 impl Submission for MetalSubmission {
     fn wait(&self) -> Result<(), BackendError> {
         self.completion.wait(self.timeout)
+    }
+
+    fn wait_timeout(&self, timeout: Duration) -> Result<(), BackendError> {
+        self.completion.wait(timeout)
     }
 
     fn gpu_time(&self) -> Option<Duration> {
@@ -2824,11 +2828,11 @@ mod tests {
 
         assert_eq!(
             backend.submit(commands).unwrap().wait(),
-            Err(BackendError::ExecutionFailed)
+            Err(BackendError::Timeout)
         );
         match backend.read(&output) {
             Ok(bytes) => assert_eq!(bytes.len(), 1024 * 4097 * 4),
-            Err(error) => assert_eq!(error, BackendError::ExecutionFailed),
+            Err(error) => assert_eq!(error, BackendError::Timeout),
         }
     }
 
