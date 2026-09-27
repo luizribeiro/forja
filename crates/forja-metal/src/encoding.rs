@@ -30,7 +30,8 @@ use crate::{
 type MetalBufferRef = Retained<ProtocolObject<dyn MTLBuffer>>;
 type EncodedEmbed = (Vec<MetalBufferRef>, u64);
 
-const VECTOR_SINGLE_PASS_MAX_KEY_LENGTH: u32 = 1023;
+const VECTOR_TWO_PASS_MIN_KEY_LENGTH: u32 = 1024;
+const VECTOR_MAX_KEY_LENGTH: u32 = 65_536;
 
 #[derive(Clone)]
 struct EncoderTensor {
@@ -984,7 +985,7 @@ impl MetalBackend {
         self.encode_decomposed_sdpa(encoder, table, dispatch, scale, causal, q_start, bindings)
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     fn encode_vector_sdpa(
         &self,
         encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
@@ -1005,20 +1006,102 @@ impl MetalBackend {
         let value = self.encoder_tensor(value_tensor)?;
         let output = self.encoder_tensor(dispatch.output())?;
         let [query_heads, query_length, width] = shape3(&query.layout)?;
-        let params = self.sdpa_params(&query, &key, &value, &output, scale, causal, q_start, 1)?;
+        let [kv_heads, key_length, _] = shape3(&key.layout)?;
+        let [_, _, value_width] = shape3(&value.layout)?;
+        let two_pass = key_length >= VECTOR_TWO_PASS_MIN_KEY_LENGTH;
+        let heads_per_group = query_heads / kv_heads;
+        let blocks = if two_pass {
+            self.vector_block_count(key_length, heads_per_group, query_length)?
+        } else {
+            1
+        };
+        let params = self.sdpa_params(
+            &query, &key, &value, &output, scale, causal, q_start, blocks,
+        )?;
         let constants = [
             (0, dtype_code(query.layout.dtype())),
             (1, dtype_code(key.layout.dtype())),
             (2, dtype_code(output.layout.dtype())),
             (3, dtype_code(value.layout.dtype())),
         ];
-        let pipeline = self
+        let mut temporaries = vec![params.clone()];
+        if !two_pass {
+            let pipeline = self
+                .pipelines
+                .lock()
+                .map_err(|_| BackendError::ExecutionFailed)?
+                .get(vector_kernel("mlx_sdpa_vector", width)?, &constants)?;
+            encoder.setComputePipelineState(&pipeline);
+            for (index, tensor) in [&query, &key, &value, &output].into_iter().enumerate() {
+                bindings.bind(table, index, &tensor.buffer);
+            }
+            bindings.bind(table, 4, &params);
+            encoder.setArgumentTable(Some(table));
+            encoder.dispatchThreadgroups_threadsPerThreadgroup(
+                MTLSize {
+                    width: usize::try_from(query_heads).map_err(|_| BackendError::InvalidInput)?,
+                    height: usize::try_from(query_length)
+                        .map_err(|_| BackendError::InvalidInput)?,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: 1024,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            return Ok(temporaries);
+        }
+
+        let intermediate = self.scratch_tensor(
+            query.layout.dtype(),
+            &[query_heads, query_length, blocks, value_width],
+        )?;
+        let sums = self.scratch_tensor(DType::F32, &[query_heads, query_length, blocks])?;
+        let maxs = self.scratch_tensor(DType::F32, &[query_heads, query_length, blocks])?;
+        let first = self
             .pipelines
             .lock()
             .map_err(|_| BackendError::ExecutionFailed)?
-            .get(vector_kernel(width)?, &constants)?;
-        encoder.setComputePipelineState(&pipeline);
-        for (index, tensor) in [&query, &key, &value, &output].into_iter().enumerate() {
+            .get(vector_kernel("mlx_sdpa_vector_2pass_1", width)?, &constants)?;
+        encoder.setComputePipelineState(&first);
+        for (index, tensor) in [&query, &key, &value, &intermediate, &sums, &maxs]
+            .into_iter()
+            .enumerate()
+        {
+            bindings.bind(table, index, &tensor.buffer);
+        }
+        bindings.bind(table, 6, &params);
+        encoder.setArgumentTable(Some(table));
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(
+            MTLSize {
+                width: usize::try_from(kv_heads).map_err(|_| BackendError::InvalidInput)?,
+                height: 1,
+                depth: usize::try_from(blocks).map_err(|_| BackendError::InvalidInput)?,
+            },
+            MTLSize {
+                width: usize::try_from(
+                    32_u32
+                        .checked_mul(heads_per_group)
+                        .and_then(|count| count.checked_mul(query_length))
+                        .ok_or(BackendError::InvalidInput)?,
+                )
+                .map_err(|_| BackendError::InvalidInput)?,
+                height: 1,
+                depth: 1,
+            },
+        );
+        encode_dispatch_barrier(encoder);
+        let second = self
+            .pipelines
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?
+            .get(vector_kernel("mlx_sdpa_vector_2pass_2", width)?, &constants)?;
+        encoder.setComputePipelineState(&second);
+        for (index, tensor) in [&intermediate, &sums, &maxs, &output]
+            .into_iter()
+            .enumerate()
+        {
             bindings.bind(table, index, &tensor.buffer);
         }
         bindings.bind(table, 4, &params);
@@ -1035,7 +1118,49 @@ impl MetalBackend {
                 depth: 1,
             },
         );
-        Ok(vec![params])
+        temporaries.extend([intermediate.buffer, sums.buffer, maxs.buffer]);
+        Ok(temporaries)
+    }
+
+    fn vector_block_count(
+        &self,
+        key_length: u32,
+        heads_per_group: u32,
+        query_length: u32,
+    ) -> Result<u32, BackendError> {
+        let simdgroups = heads_per_group
+            .checked_mul(query_length)
+            .ok_or(BackendError::InvalidInput)?;
+        let architecture = self.device.architecture().name().to_string();
+        let class = architecture.chars().next_back();
+        let blocks = match class {
+            Some('s') => {
+                if key_length > 1024 && simdgroups > 4 {
+                    match key_length {
+                        ..=8192 => 128,
+                        8193..=32_768 => 256,
+                        32_769..=65_536 => 512,
+                        _ => 1024,
+                    }
+                } else {
+                    64
+                }
+            }
+            Some('d') => {
+                if simdgroups <= 2 && key_length > 8192 {
+                    256
+                } else if simdgroups >= 6 && key_length >= 65_536 {
+                    1024
+                } else if simdgroups >= 6 && key_length >= 16_384 {
+                    512
+                } else {
+                    128
+                }
+            }
+            _ if simdgroups >= 4 => 64,
+            _ => 32,
+        };
+        Ok(blocks)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2201,13 +2326,17 @@ fn vector_sdpa_supported(dispatch: &Dispatch) -> Result<bool, BackendError> {
         && width == value_width
         && matches!(width, 64 | 128)
         && simdgroups.is_some_and(|count| count <= 32)
-        && key_length <= VECTOR_SINGLE_PASS_MAX_KEY_LENGTH)
+        && key_length <= VECTOR_MAX_KEY_LENGTH)
 }
 
-fn vector_kernel(width: u32) -> Result<&'static str, BackendError> {
-    match width {
-        64 => Ok("mlx_sdpa_vector_64"),
-        128 => Ok("mlx_sdpa_vector_128"),
+fn vector_kernel(prefix: &str, width: u32) -> Result<&'static str, BackendError> {
+    match (prefix, width) {
+        ("mlx_sdpa_vector", 64) => Ok("mlx_sdpa_vector_64"),
+        ("mlx_sdpa_vector", 128) => Ok("mlx_sdpa_vector_128"),
+        ("mlx_sdpa_vector_2pass_1", 64) => Ok("mlx_sdpa_vector_2pass_1_64"),
+        ("mlx_sdpa_vector_2pass_1", 128) => Ok("mlx_sdpa_vector_2pass_1_128"),
+        ("mlx_sdpa_vector_2pass_2", 64) => Ok("mlx_sdpa_vector_2pass_2_64"),
+        ("mlx_sdpa_vector_2pass_2", 128) => Ok("mlx_sdpa_vector_2pass_2_128"),
         _ => Err(BackendError::InvalidInput),
     }
 }
@@ -2864,6 +2993,37 @@ mod tests {
             &TensorSpec::contiguous(DType::F32, &[4, 8, 64]),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn metal_vector_attention_matches_two_pass_decode() {
+        let reference = CpuBackend::new();
+        let candidate = MetalBackend::new().unwrap();
+        for dtype in [DType::F32, DType::F16, DType::BF16] {
+            for key_length in [1024, 4096] {
+                let cache_slice = [
+                    Slice::new(0, 8, 1).unwrap(),
+                    Slice::new(0, key_length, 1).unwrap(),
+                    Slice::new(0, 128, 1).unwrap(),
+                ];
+                assert_backends_agree(
+                    &reference,
+                    &candidate,
+                    Op::Sdpa {
+                        scale: 128.0_f32.sqrt().recip(),
+                        causal: true,
+                        q_start: key_length - 1,
+                    },
+                    &[
+                        TensorSpec::contiguous(dtype, &[16, 1, 128]),
+                        TensorSpec::sliced(dtype, &[8, 4096, 128], &cache_slice),
+                        TensorSpec::sliced(dtype, &[8, 4096, 128], &cache_slice),
+                    ],
+                    &TensorSpec::contiguous(dtype, &[16, 1, 128]),
+                )
+                .unwrap();
+            }
+        }
     }
 
     #[test]
