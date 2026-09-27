@@ -1,6 +1,7 @@
 //! Command-line entry point for Forja engine tooling.
 
 mod args;
+mod engine;
 mod verify;
 
 use std::{error::Error, process::ExitCode};
