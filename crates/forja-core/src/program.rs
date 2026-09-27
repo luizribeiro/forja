@@ -2,7 +2,7 @@
 
 use std::{error::Error, fmt};
 
-use crate::MAX_RANK;
+use crate::{DType, MAX_RANK, Tensor, byte_ranges_overlap, is_injective};
 
 /// The largest accepted instruction count.
 pub const MAX_INSTRUCTIONS: usize = 256;
@@ -196,6 +196,237 @@ impl ValidatedProgram {
         self.output_count
     }
 }
+
+/// A program paired with tensor views that satisfy its validated signature.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BoundProgram {
+    program: ValidatedProgram,
+    inputs: Vec<Tensor>,
+    outputs: Vec<Tensor>,
+}
+
+impl BoundProgram {
+    /// Returns the validated program.
+    #[must_use]
+    pub const fn program(&self) -> &ValidatedProgram {
+        &self.program
+    }
+
+    /// Returns input tensors in slot order.
+    #[must_use]
+    pub fn inputs(&self) -> &[Tensor] {
+        &self.inputs
+    }
+
+    /// Returns output tensors in slot order.
+    #[must_use]
+    pub fn outputs(&self) -> &[Tensor] {
+        &self.outputs
+    }
+}
+
+/// Binds a validated program to concrete tensor views.
+///
+/// # Errors
+///
+/// Returns [`BindError`] when tensor counts, types, shapes, mutability, or
+/// aliasing do not satisfy the program.
+/// Row programs require a nonempty last axis. A row of length one is valid,
+/// and its reductions produce that single value.
+pub fn bind_program(
+    program: &ValidatedProgram,
+    inputs: &[&Tensor],
+    outputs: &[&Tensor],
+) -> Result<BoundProgram, BindError> {
+    if inputs.len() != program.input_count {
+        return Err(BindError::InputCount {
+            expected: program.input_count,
+            actual: inputs.len(),
+        });
+    }
+    if outputs.len() != program.output_count {
+        return Err(BindError::OutputCount {
+            expected: program.output_count,
+            actual: outputs.len(),
+        });
+    }
+    let Some(iteration) = outputs.first() else {
+        return Err(BindError::NoOutputs);
+    };
+
+    let input_types = inputs
+        .iter()
+        .enumerate()
+        .map(|(slot, tensor)| input_value_type(slot, tensor.layout().dtype()))
+        .collect::<Result<Vec<_>, _>>()?;
+    check_input_types(&program.program, &input_types)?;
+
+    for (slot, tensor) in outputs.iter().enumerate() {
+        if !matches!(
+            tensor.layout().dtype(),
+            DType::F32 | DType::F16 | DType::BF16
+        ) {
+            return Err(BindError::UnsupportedOutputDType {
+                slot,
+                dtype: tensor.layout().dtype(),
+            });
+        }
+        if tensor.layout().shape() != iteration.layout().shape() {
+            return Err(BindError::OutputShape { slot });
+        }
+        if !tensor.is_writable() {
+            return Err(BindError::ReadOnlyOutput { slot });
+        }
+        if !is_injective(tensor.layout()) {
+            return Err(BindError::NonInjectiveOutput { slot });
+        }
+    }
+
+    let rank = iteration.layout().shape().len();
+    if program.program.kind == ProgramKind::Row && rank == 0 {
+        return Err(BindError::RowRequiresAxis);
+    }
+    if program.program.kind == ProgramKind::Row && iteration.layout().shape().last() == Some(&0) {
+        return Err(BindError::ZeroLengthRow);
+    }
+    for (instruction, &inst) in program.program.insts.iter().enumerate() {
+        if let Inst::Index(axis) | Inst::Extent(axis) = inst
+            && usize::from(axis) >= rank
+        {
+            return Err(BindError::AxisOutOfRange {
+                instruction,
+                axis,
+                rank,
+            });
+        }
+    }
+
+    for (slot, tensor) in inputs.iter().enumerate() {
+        if tensor.layout().shape() != iteration.layout().shape() {
+            return Err(BindError::InputShape { slot });
+        }
+        for (output, candidate) in outputs.iter().enumerate() {
+            if tensor.buffer() == candidate.buffer()
+                && byte_ranges_overlap(tensor.layout(), candidate.layout())
+            {
+                return Err(BindError::InputOutputAliasing {
+                    input: slot,
+                    output,
+                });
+            }
+        }
+    }
+    for (first, output) in outputs.iter().enumerate() {
+        for (second, candidate) in outputs.iter().enumerate().skip(first + 1) {
+            if output.buffer() == candidate.buffer()
+                && byte_ranges_overlap(output.layout(), candidate.layout())
+            {
+                return Err(BindError::OutputAliasing { first, second });
+            }
+        }
+    }
+
+    Ok(BoundProgram {
+        program: program.clone(),
+        inputs: inputs.iter().map(|tensor| (*tensor).clone()).collect(),
+        outputs: outputs.iter().map(|tensor| (*tensor).clone()).collect(),
+    })
+}
+
+/// A reason tensor views could not be bound to a validated program.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BindError {
+    /// The number of supplied inputs differs from the program's slot count.
+    InputCount {
+        /// The required count.
+        expected: usize,
+        /// The supplied count.
+        actual: usize,
+    },
+    /// The number of supplied outputs differs from the program's slot count.
+    OutputCount {
+        /// The required count.
+        expected: usize,
+        /// The supplied count.
+        actual: usize,
+    },
+    /// A program with no outputs has no iteration space to bind.
+    NoOutputs,
+    /// An input tensor has no supported program value type.
+    UnsupportedInputDType {
+        /// The input slot.
+        slot: usize,
+        /// The unsupported storage type.
+        dtype: DType,
+    },
+    /// An output tensor does not have a floating-point storage type.
+    UnsupportedOutputDType {
+        /// The output slot.
+        slot: usize,
+        /// The unsupported storage type.
+        dtype: DType,
+    },
+    /// Concrete input types violate the program's type constraints.
+    InputTypeMismatch {
+        /// The input slot that made the constraints inconsistent.
+        slot: usize,
+    },
+    /// An input shape differs from the iteration shape.
+    InputShape {
+        /// The input slot.
+        slot: usize,
+    },
+    /// An output shape differs from the iteration shape.
+    OutputShape {
+        /// The output slot.
+        slot: usize,
+    },
+    /// A row program was bound to a scalar iteration space.
+    RowRequiresAxis,
+    /// A row program was bound to a zero-length last axis.
+    ZeroLengthRow,
+    /// An index or extent instruction refers beyond the bound rank.
+    AxisOutOfRange {
+        /// The invalid instruction.
+        instruction: usize,
+        /// The requested axis.
+        axis: u8,
+        /// The bound tensor rank.
+        rank: usize,
+    },
+    /// An output tensor is read-only.
+    ReadOnlyOutput {
+        /// The output slot.
+        slot: usize,
+    },
+    /// An output maps multiple logical elements to the same storage.
+    NonInjectiveOutput {
+        /// The output slot.
+        slot: usize,
+    },
+    /// An input and output may touch the same bytes.
+    InputOutputAliasing {
+        /// The input slot.
+        input: usize,
+        /// The output slot.
+        output: usize,
+    },
+    /// Two outputs may touch the same bytes.
+    OutputAliasing {
+        /// The first output slot.
+        first: usize,
+        /// The second output slot.
+        second: usize,
+    },
+}
+
+impl fmt::Display for BindError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "invalid program binding: {self:?}")
+    }
+}
+
+impl Error for BindError {}
 
 /// A reason a scalar program failed validation.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -545,6 +776,33 @@ fn type_constraints(program: &Program) -> Result<TypeConstraints, ProgramError> 
     Ok(constraints)
 }
 
+fn input_value_type(slot: usize, dtype: DType) -> Result<ValueType, BindError> {
+    match dtype {
+        DType::F32 | DType::F16 | DType::BF16 => Ok(ValueType::F32),
+        DType::U32 => Ok(ValueType::U32),
+        DType::I32 => Err(BindError::UnsupportedInputDType { slot, dtype }),
+    }
+}
+
+fn check_input_types(program: &Program, input_types: &[ValueType]) -> Result<(), BindError> {
+    let mut constraints =
+        type_constraints(program).map_err(|_| BindError::InputTypeMismatch { slot: 0 })?;
+    let mut constrained = [false; MAX_INPUTS];
+    for (instruction, inst) in program.insts.iter().enumerate() {
+        if let Inst::Input(slot) = *inst {
+            let slot =
+                usize::try_from(slot).map_err(|_| BindError::InputTypeMismatch { slot: 0 })?;
+            if !constrained[slot] {
+                if !constraints.constrain(instruction, type_set(input_types[slot])) {
+                    return Err(BindError::InputTypeMismatch { slot });
+                }
+                constrained[slot] = true;
+            }
+        }
+    }
+    Ok(())
+}
+
 const fn type_set(value_type: ValueType) -> TypeSet {
     match value_type {
         ValueType::F32 => TypeSet::F32,
@@ -558,6 +816,7 @@ mod tests {
     use proptest::prelude::*;
 
     use super::*;
+    use crate::{BufferId, Layout};
 
     fn program(insts: Vec<Inst>, outputs: Vec<(u32, u32)>) -> Program {
         Program {
@@ -565,6 +824,31 @@ mod tests {
             insts,
             outputs,
         }
+    }
+
+    fn tensor(buffer: u64, dtype: DType, shape: &[u32], strides: &[u64]) -> Tensor {
+        tensor_with_access(buffer, dtype, shape, strides, true)
+    }
+
+    fn tensor_with_access(
+        buffer: u64,
+        dtype: DType,
+        shape: &[u32],
+        strides: &[u64],
+        writable: bool,
+    ) -> Tensor {
+        let last = shape
+            .iter()
+            .zip(strides)
+            .map(|(&extent, &stride)| u64::from(extent.saturating_sub(1)) * stride)
+            .sum::<u64>();
+        let byte_len = (last + 1) * dtype.byte_size();
+        Tensor::from_allocation(
+            BufferId::new(7, buffer, byte_len),
+            Layout::new(dtype, 0, shape.to_vec(), strides.to_vec(), byte_len).unwrap(),
+            writable,
+        )
+        .unwrap()
     }
 
     #[test]
@@ -749,6 +1033,188 @@ mod tests {
         assert_eq!(
             program(vec![Inst::Index(0)], vec![(0, 0)]).validate(),
             Err(ProgramError::InvalidOutputType { slot: 0 })
+        );
+    }
+
+    #[test]
+    fn binds_float_and_unsigned_inputs_to_qwen_shapes() {
+        let float_program = program(
+            vec![Inst::Input(0), Inst::Unary(UnOp::Abs, 0)],
+            vec![(0, 1)],
+        )
+        .validate()
+        .unwrap();
+        let input = tensor(1, DType::F16, &[7, 1024], &[1024, 1]);
+        let output = tensor(2, DType::BF16, &[7, 1024], &[1024, 1]);
+        let bound = bind_program(&float_program, &[&input], &[&output]).unwrap();
+        assert_eq!(bound.inputs(), [input]);
+        assert_eq!(bound.outputs(), [output]);
+
+        let cast_program = program(
+            vec![Inst::Input(0), Inst::Cast(ValueType::F32, 0)],
+            vec![(0, 1)],
+        )
+        .validate()
+        .unwrap();
+        let indices = tensor(3, DType::U32, &[7, 1024], &[1024, 1]);
+        let output = tensor(4, DType::F32, &[7, 1024], &[1024, 1]);
+        bind_program(&cast_program, &[&indices], &[&output]).unwrap();
+    }
+
+    #[test]
+    fn binding_rejects_counts_and_storage_types() {
+        let validated = program(
+            vec![Inst::Input(0), Inst::Unary(UnOp::Abs, 0)],
+            vec![(0, 1)],
+        )
+        .validate()
+        .unwrap();
+        let float = tensor(1, DType::F32, &[1], &[1]);
+        assert_eq!(
+            bind_program(&validated, &[], &[&float]),
+            Err(BindError::InputCount {
+                expected: 1,
+                actual: 0,
+            })
+        );
+        assert_eq!(
+            bind_program(&validated, &[&float], &[]),
+            Err(BindError::OutputCount {
+                expected: 1,
+                actual: 0,
+            })
+        );
+        let integer = tensor(2, DType::I32, &[1], &[1]);
+        assert_eq!(
+            bind_program(&validated, &[&integer], &[&float]),
+            Err(BindError::UnsupportedInputDType {
+                slot: 0,
+                dtype: DType::I32,
+            })
+        );
+        let unsigned = tensor(3, DType::U32, &[1], &[1]);
+        assert_eq!(
+            bind_program(&validated, &[&float], &[&unsigned]),
+            Err(BindError::UnsupportedOutputDType {
+                slot: 0,
+                dtype: DType::U32,
+            })
+        );
+    }
+
+    #[test]
+    fn binding_enforces_concrete_types_shapes_and_rank() {
+        let add = program(
+            vec![
+                Inst::Input(0),
+                Inst::Input(1),
+                Inst::Binary(BinOp::Add, 0, 1),
+            ],
+            vec![(0, 2)],
+        )
+        .validate()
+        .unwrap();
+        let float = tensor(1, DType::F32, &[7, 1024], &[1024, 1]);
+        let unsigned = tensor(2, DType::U32, &[7, 1024], &[1024, 1]);
+        let output = tensor(3, DType::F32, &[7, 1024], &[1024, 1]);
+        assert_eq!(
+            bind_program(&add, &[&float, &unsigned], &[&output]),
+            Err(BindError::InputTypeMismatch { slot: 1 })
+        );
+
+        let short = tensor(4, DType::F32, &[1, 1024], &[1024, 1]);
+        assert_eq!(
+            bind_program(&add, &[&float, &short], &[&output]),
+            Err(BindError::InputShape { slot: 1 })
+        );
+
+        let indexed = program(
+            vec![Inst::Index(2), Inst::Cast(ValueType::F32, 0)],
+            vec![(0, 1)],
+        )
+        .validate()
+        .unwrap();
+        assert_eq!(
+            bind_program(&indexed, &[], &[&output]),
+            Err(BindError::AxisOutOfRange {
+                instruction: 0,
+                axis: 2,
+                rank: 2,
+            })
+        );
+
+        let row = Program {
+            kind: ProgramKind::Row,
+            insts: vec![Inst::Const(1.0)],
+            outputs: vec![(0, 0)],
+        }
+        .validate()
+        .unwrap();
+        let scalar = tensor(5, DType::F32, &[], &[]);
+        assert_eq!(
+            bind_program(&row, &[], &[&scalar]),
+            Err(BindError::RowRequiresAxis)
+        );
+    }
+
+    #[test]
+    fn binding_requires_nonempty_rows_and_accepts_length_one() {
+        let row = Program {
+            kind: ProgramKind::Row,
+            insts: vec![Inst::Input(0), Inst::Reduce(RedOp::Sum, 0)],
+            outputs: vec![(0, 1)],
+        }
+        .validate()
+        .unwrap();
+        let empty_input = tensor(6, DType::F32, &[7, 0], &[0, 1]);
+        let empty_output = tensor(7, DType::F32, &[7, 0], &[0, 1]);
+        assert_eq!(
+            bind_program(&row, &[&empty_input], &[&empty_output]),
+            Err(BindError::ZeroLengthRow)
+        );
+
+        let single_input = tensor(8, DType::F32, &[7, 1], &[1, 1]);
+        let single_output = tensor(9, DType::F32, &[7, 1], &[1, 1]);
+        bind_program(&row, &[&single_input], &[&single_output]).unwrap();
+    }
+
+    #[test]
+    fn binding_rejects_unsafe_outputs_and_aliases() {
+        let unary = program(
+            vec![Inst::Input(0), Inst::Unary(UnOp::Abs, 0)],
+            vec![(0, 1)],
+        )
+        .validate()
+        .unwrap();
+        let input = tensor(1, DType::F32, &[7, 33], &[33, 1]);
+        let non_injective = tensor(2, DType::F32, &[7, 33], &[33, 0]);
+        assert_eq!(
+            bind_program(&unary, &[&input], &[&non_injective]),
+            Err(BindError::NonInjectiveOutput { slot: 0 })
+        );
+        let read_only = tensor_with_access(3, DType::F32, &[7, 33], &[33, 1], false);
+        assert_eq!(
+            bind_program(&unary, &[&input], &[&read_only]),
+            Err(BindError::ReadOnlyOutput { slot: 0 })
+        );
+        assert_eq!(
+            bind_program(&unary, &[&input], &[&input]),
+            Err(BindError::InputOutputAliasing {
+                input: 0,
+                output: 0,
+            })
+        );
+
+        let two_outputs = program(vec![Inst::Const(1.0)], vec![(0, 0), (1, 0)])
+            .validate()
+            .unwrap();
+        let shared = tensor(4, DType::F32, &[7, 33], &[33, 1]);
+        assert_eq!(
+            bind_program(&two_outputs, &[], &[&shared, &shared]),
+            Err(BindError::OutputAliasing {
+                first: 0,
+                second: 1,
+            })
         );
     }
 
