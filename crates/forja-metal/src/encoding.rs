@@ -975,12 +975,7 @@ impl MetalBackend {
         else {
             return Err(BackendError::InvalidInput);
         };
-        let [query, key, _] = dispatch.inputs() else {
-            return Err(BackendError::InvalidInput);
-        };
-        let [query_heads, _, _] = shape3(query.layout())?;
-        let [kv_heads, _, _] = shape3(key.layout())?;
-        if causal || query_heads != kv_heads {
+        if causal {
             return Err(BackendError::InvalidInput);
         }
         self.encode_decomposed_sdpa(encoder, table, dispatch, scale, causal, q_start, bindings)
@@ -2653,6 +2648,21 @@ mod tests {
             TensorSpec::contiguous(DType::F32, &[1, 2, 2]),
             TensorSpec::contiguous(DType::F32, &[1, 2, 1]),
             &TensorSpec::contiguous(DType::F32, &[1, 1, 1]),
+        );
+    }
+
+    #[test]
+    fn metal_decomposed_attention_groups_query_heads_over_shared_keys() {
+        assert_sdpa(
+            Op::Sdpa {
+                scale: 0.5,
+                causal: false,
+                q_start: 0,
+            },
+            TensorSpec::contiguous(DType::F32, &[4, 3, 4]),
+            TensorSpec::contiguous(DType::F32, &[2, 7, 4]),
+            TensorSpec::contiguous(DType::F32, &[2, 7, 3]),
+            &TensorSpec::contiguous(DType::F32, &[4, 3, 3]),
         );
     }
 
