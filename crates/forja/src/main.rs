@@ -1,19 +1,25 @@
 //! Command-line entry point for Forja engine tooling.
 
 mod args;
+mod verify;
 
-use std::process::ExitCode;
+use std::{error::Error, process::ExitCode};
 
 fn main() -> ExitCode {
-    match args::parse(std::env::args().skip(1)) {
-        Ok(args::Command::Verify(options)) => {
-            let _ = options;
-            eprintln!("verification support is unavailable");
-            ExitCode::FAILURE
-        }
+    match run() {
+        Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("{error}\n{}", args::USAGE);
+            eprintln!("{error}");
             ExitCode::FAILURE
         }
+    }
+}
+
+fn run() -> Result<(), Box<dyn Error>> {
+    let command = args::parse(std::env::args().skip(1))
+        .map_err(|error| format!("{error}\n{}", args::USAGE))?;
+    let runtime = tokio::runtime::Builder::new_current_thread().build()?;
+    match command {
+        args::Command::Verify(options) => runtime.block_on(verify::run(&options)),
     }
 }
