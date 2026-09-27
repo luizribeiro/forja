@@ -33,6 +33,24 @@ struct EncoderTensor {
     layout: Layout,
 }
 
+#[derive(Clone, Copy)]
+struct MatmulShape {
+    dtype: DType,
+    batch: u32,
+    rows: u32,
+    columns: u32,
+    inner: u32,
+    left_column_major: bool,
+    right_column_major: bool,
+}
+
+struct MatmulLaunch {
+    pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    block_rows: u32,
+    block_columns: u32,
+    thread_count: usize,
+}
+
 struct EncodedDispatches {
     temporaries: Vec<MetalBufferRef>,
     error_flags: Vec<u64>,
@@ -571,30 +589,16 @@ impl MetalBackend {
             params.extend_from_slice(&value.to_ne_bytes());
         }
         let parameter_buffer = self.temporary_buffer(&params)?;
-        let config = select_gemm(
+        let launch = self.matmul_launch(MatmulShape {
             dtype,
             batch,
             rows,
             columns,
             inner,
-            a_column_major != 0,
-            b_column_major != 0,
-        )
-        .ok_or(BackendError::InvalidInput)?;
-        let constants = [
-            (0, dtype_code(dtype)),
-            (1, dtype_code(dtype)),
-            (2, dtype_code(dtype)),
-            (200, u32::from(rows.is_multiple_of(config.block_rows))),
-            (201, u32::from(columns.is_multiple_of(config.block_columns))),
-            (202, u32::from(inner.is_multiple_of(config.block_inner))),
-        ];
-        let pipeline = self
-            .pipelines
-            .lock()
-            .map_err(|_| BackendError::ExecutionFailed)?
-            .get(config.kernel, &constants)?;
-        encoder.setComputePipelineState(&pipeline);
+            left_column_major: a_column_major != 0,
+            right_column_major: b_column_major != 0,
+        })?;
+        encoder.setComputePipelineState(&launch.pipeline);
         let left = self.encoder_tensor(left)?;
         let right = self.encoder_tensor(right)?;
         let output = self.encoder_tensor(output)?;
@@ -605,19 +609,77 @@ impl MetalBackend {
         encoder.setArgumentTable(Some(table));
         encoder.dispatchThreadgroups_threadsPerThreadgroup(
             MTLSize {
-                width: usize::try_from(columns.div_ceil(config.block_columns))
+                width: usize::try_from(columns.div_ceil(launch.block_columns))
                     .map_err(|_| BackendError::InvalidInput)?,
-                height: usize::try_from(rows.div_ceil(config.block_rows))
+                height: usize::try_from(rows.div_ceil(launch.block_rows))
                     .map_err(|_| BackendError::InvalidInput)?,
                 depth: usize::try_from(batch).map_err(|_| BackendError::InvalidInput)?,
             },
             MTLSize {
-                width: config.thread_count,
+                width: launch.thread_count,
                 height: 1,
                 depth: 1,
             },
         );
         Ok(vec![parameter_buffer])
+    }
+
+    fn matmul_launch(&self, shape: MatmulShape) -> Result<MatmulLaunch, BackendError> {
+        let (kernel, block_rows, block_columns, thread_count, constants) = if shape.rows == 1 {
+            (
+                "gemv",
+                1,
+                4,
+                32,
+                vec![
+                    (0, dtype_code(shape.dtype)),
+                    (1, dtype_code(shape.dtype)),
+                    (2, dtype_code(shape.dtype)),
+                ],
+            )
+        } else {
+            let config = select_gemm(
+                shape.dtype,
+                shape.batch,
+                shape.rows,
+                shape.columns,
+                shape.inner,
+                shape.left_column_major,
+                shape.right_column_major,
+            )
+            .ok_or(BackendError::InvalidInput)?;
+            (
+                config.kernel,
+                config.block_rows,
+                config.block_columns,
+                config.thread_count,
+                vec![
+                    (0, dtype_code(shape.dtype)),
+                    (1, dtype_code(shape.dtype)),
+                    (2, dtype_code(shape.dtype)),
+                    (200, u32::from(shape.rows.is_multiple_of(config.block_rows))),
+                    (
+                        201,
+                        u32::from(shape.columns.is_multiple_of(config.block_columns)),
+                    ),
+                    (
+                        202,
+                        u32::from(shape.inner.is_multiple_of(config.block_inner)),
+                    ),
+                ],
+            )
+        };
+        let pipeline = self
+            .pipelines
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?
+            .get(kernel, &constants)?;
+        Ok(MatmulLaunch {
+            pipeline,
+            block_rows,
+            block_columns,
+            thread_count,
+        })
     }
 
     fn encode_copy_tensors(
@@ -1618,7 +1680,7 @@ mod tests {
     }
 
     #[test]
-    fn metal_gemm_matches_cpu_at_tile_edges_and_in_batches() {
+    fn metal_matrix_multiplication_matches_cpu_at_tile_edges_and_in_batches() {
         for dtype in [DType::F32, DType::F16, DType::BF16] {
             for (m, n, k) in [
                 (1, 1, 1),
@@ -1657,6 +1719,24 @@ mod tests {
                     &TensorSpec::contiguous(DType::BF16, &[m, n]),
                 );
             }
+        }
+    }
+
+    #[test]
+    fn metal_gemv_matches_qwen_decode_shapes() {
+        for (inner, columns) in [
+            (1024, 2048),
+            (1024, 1024),
+            (2048, 1024),
+            (1024, 3072),
+            (3072, 1024),
+            (1024, 151_936),
+        ] {
+            assert_matmul(
+                TensorSpec::contiguous(DType::BF16, &[1, inner]),
+                TensorSpec::permuted(DType::BF16, &[columns, inner], &[1, 0]),
+                &TensorSpec::contiguous(DType::BF16, &[1, columns]),
+            );
         }
     }
 

@@ -95,3 +95,43 @@ DEFINE_STEEL_GEMM(steel_gemm_64_64_16_2_2, 64, 64, 16, 2, 2)
 DEFINE_STEEL_GEMM(steel_gemm_64_64_16_1_2, 64, 64, 16, 1, 2)
 DEFINE_STEEL_GEMM(steel_gemm_64_32_32_2_2, 64, 32, 32, 2, 2)
 DEFINE_STEEL_GEMM(steel_gemm_32_64_16_1_2, 32, 64, 16, 1, 2)
+
+kernel void gemv(
+    device const uchar *a [[buffer(0)]],
+    device const uchar *b [[buffer(1)]],
+    device uchar *d [[buffer(2)]],
+    constant MatmulParams &params [[buffer(3)]],
+    ushort lane [[thread_index_in_simdgroup]],
+    uint3 tile [[threadgroup_position_in_grid]]) {
+    ulong a_base = params.a_offset + ulong(tile.z) * params.batch_stride_a;
+    ulong b_base = params.b_offset + ulong(tile.z) * params.batch_stride_b;
+    float sums[4] = {0.0f};
+    for (uint inner = lane; inner < params.k; inner += 32) {
+        ulong a_index = params.a_column_major
+            ? ulong(inner) * params.lda
+            : ulong(inner);
+        float a_value = load_float(a, a_base + a_index, input0_dtype);
+        for (uint element = 0; element < 4; ++element) {
+            uint column = tile.x * 4 + element;
+            if (column < params.n) {
+                ulong b_index = params.b_column_major
+                    ? ulong(inner) + ulong(column) * params.ldb
+                    : ulong(inner) * params.ldb + ulong(column);
+                sums[element] += a_value * load_float(
+                    b, b_base + b_index, input1_dtype);
+            }
+        }
+    }
+    for (uint element = 0; element < 4; ++element) {
+        sums[element] = simd_sum(sums[element]);
+    }
+    if (lane == 0) {
+        ulong d_base = params.d_offset + ulong(tile.z) * params.batch_stride_d;
+        for (uint element = 0; element < 4; ++element) {
+            uint column = tile.x * 4 + element;
+            if (column < params.n) {
+                store_float(d, d_base + ulong(column), output_dtype, sums[element]);
+            }
+        }
+    }
+}
