@@ -3,15 +3,37 @@
 use std::{sync::Mutex, time::Duration};
 
 use forja_core::{
-    AllocationRegistry, Backend, BackendError, CommandList, DType, Layout, Op, Submission, Tensor,
-    ViewOp,
+    AllocationRegistry, Backend, BackendError, BufferId, CommandList, DType, Layout, MappedRegion,
+    Op, Submission, Tensor, ViewOp,
 };
 use half::{bf16, f16};
 
 /// A straightforward, single-process reference backend.
 #[derive(Debug)]
 pub struct CpuBackend {
-    buffers: Mutex<AllocationRegistry<Vec<u8>>>,
+    buffers: Mutex<AllocationRegistry<CpuBuffer>>,
+}
+
+#[derive(Debug)]
+enum CpuBuffer {
+    Owned(Vec<u8>),
+    Mapped(MappedRegion),
+}
+
+impl CpuBuffer {
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Self::Owned(bytes) => bytes,
+            Self::Mapped(region) => region.bytes(),
+        }
+    }
+
+    fn bytes_mut(&mut self) -> Result<&mut [u8], BackendError> {
+        match self {
+            Self::Owned(bytes) => Ok(bytes),
+            Self::Mapped(_) => Err(BackendError::InvalidInput),
+        }
+    }
 }
 
 impl CpuBackend {
@@ -45,7 +67,7 @@ impl CpuBackend {
             .map_err(|_| BackendError::ExecutionFailed)?;
         let layout = Layout::contiguous(dtype, 0, shape.to_vec(), byte_len)
             .map_err(|_| BackendError::InvalidInput)?;
-        let buffer = buffers.insert(bytes, byte_len)?;
+        let buffer = buffers.insert(CpuBuffer::Owned(bytes), byte_len)?;
         buffers.tensor(buffer, layout)
     }
 
@@ -90,6 +112,7 @@ impl CpuBackend {
             .map_err(|_| BackendError::ExecutionFailed)?;
         buffers
             .get_mut(tensor)?
+            .bytes_mut()?
             .get_mut(range)
             .ok_or(BackendError::InvalidInput)?
             .copy_from_slice(bytes);
@@ -106,7 +129,7 @@ impl CpuBackend {
             .buffers
             .lock()
             .map_err(|_| BackendError::ExecutionFailed)?;
-        let source = buffers.get(tensor)?;
+        let source = buffers.get(tensor)?.bytes();
         gather(source, tensor.layout())
     }
 
@@ -138,7 +161,11 @@ impl CpuBackend {
                 .buffers
                 .lock()
                 .map_err(|_| BackendError::ExecutionFailed)?;
-            return scatter(buffers.get_mut(output)?, output.layout(), &bytes);
+            return scatter(
+                buffers.get_mut(output)?.bytes_mut()?,
+                output.layout(),
+                &bytes,
+            );
         }
         let values = decode(&self.read(&inputs[0])?, inputs[0].layout().dtype())
             .ok_or(BackendError::ExecutionFailed)?;
@@ -170,7 +197,7 @@ impl CpuBackend {
             .buffers
             .lock()
             .map_err(|_| BackendError::ExecutionFailed)?;
-        let target = buffers.get_mut(output)?;
+        let target = buffers.get_mut(output)?.bytes_mut()?;
         scatter(target, output.layout(), &converted)
     }
 
@@ -417,6 +444,21 @@ impl Backend for CpuBackend {
         CpuBackend::alloc(self, dtype, shape)
     }
 
+    fn import_readonly(&self, bytes: MappedRegion) -> Result<BufferId, BackendError> {
+        let byte_len = u64::try_from(bytes.len()).map_err(|_| BackendError::AllocationFailed)?;
+        self.buffers
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?
+            .insert_read_only(CpuBuffer::Mapped(bytes), byte_len)
+    }
+
+    fn tensor(&self, buffer: BufferId, layout: Layout) -> Result<Tensor, BackendError> {
+        self.buffers
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?
+            .tensor(buffer, layout)
+    }
+
     fn view(&self, tensor: &Tensor, op: ViewOp) -> Result<Tensor, BackendError> {
         CpuBackend::view(self, tensor, op)
     }
@@ -623,12 +665,48 @@ fn encode(source: &[f32], output: DType) -> Option<Vec<u8>> {
 mod tests {
     use super::*;
     use forja_core::{Op, Slice};
+    use std::{
+        fs,
+        sync::atomic::{AtomicU64, Ordering},
+    };
+
+    static NEXT_FILE: AtomicU64 = AtomicU64::new(0);
 
     #[test]
     fn rejects_foreign_tensors() {
         let backend = CpuBackend::new();
         let foreign = CpuBackend::new().alloc(DType::F32, &[1]).unwrap();
         assert_eq!(backend.read(&foreign), Err(BackendError::InvalidInput));
+    }
+
+    #[test]
+    fn imports_a_file_mapping_without_copying() {
+        let path = std::env::temp_dir().join(format!(
+            "forja-cpu-mapping-{}-{}",
+            std::process::id(),
+            NEXT_FILE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let expected = (0_u32..4).flat_map(u32::to_le_bytes).collect::<Vec<_>>();
+        fs::write(&path, &expected).unwrap();
+        let region = MappedRegion::map(&fs::File::open(&path).unwrap()).unwrap();
+        let mapped_pointer = region.as_ptr();
+        let backend = CpuBackend::new();
+        let buffer = backend.import_readonly(region).unwrap();
+        fs::remove_file(path).unwrap();
+        let tensor = backend
+            .tensor(
+                buffer,
+                Layout::contiguous(DType::U32, 0, vec![4], 16).unwrap(),
+            )
+            .unwrap();
+
+        let buffers = backend.buffers.lock().unwrap();
+        assert_eq!(
+            buffers.get(&tensor).unwrap().bytes().as_ptr(),
+            mapped_pointer
+        );
+        drop(buffers);
+        assert_eq!(backend.read(&tensor).unwrap(), expected);
     }
 
     #[test]
@@ -659,6 +737,40 @@ mod tests {
         assert_eq!(
             backend.alloc(DType::F32, &[u32::MAX, u32::MAX]),
             Err(BackendError::AllocationFailed)
+        );
+    }
+
+    #[test]
+    fn read_only_views_refuse_writes() {
+        let backend = CpuBackend::new();
+        let path = std::env::temp_dir().join(format!(
+            "forja-cpu-read-only-{}-{}",
+            std::process::id(),
+            NEXT_FILE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::write(&path, [0; 24]).unwrap();
+        let buffer = backend
+            .import_readonly(MappedRegion::map(&fs::File::open(&path).unwrap()).unwrap())
+            .unwrap();
+        fs::remove_file(path).unwrap();
+        let read_only = backend
+            .tensor(
+                buffer,
+                Layout::contiguous(DType::F32, 0, vec![2, 3], 24).unwrap(),
+            )
+            .unwrap();
+        let view = backend
+            .view(&read_only, ViewOp::Reshape(vec![3, 2]))
+            .unwrap();
+
+        assert!(!view.is_writable());
+        assert_eq!(
+            backend.write(&read_only, &[0; 24]),
+            Err(BackendError::InvalidInput)
+        );
+        assert_eq!(
+            backend.write(&view, &[0; 24]),
+            Err(BackendError::InvalidInput)
         );
     }
 

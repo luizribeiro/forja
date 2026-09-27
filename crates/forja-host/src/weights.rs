@@ -1,6 +1,13 @@
-use std::{collections::HashSet, error::Error, fmt, fs::File, io::Read, path::Path};
+use std::{
+    collections::HashSet,
+    error::Error,
+    fmt,
+    fs::File,
+    io::Read,
+    path::{Path, PathBuf},
+};
 
-use forja_core::DType;
+use forja_core::{DType, MappedRegion};
 use serde::{
     Deserialize,
     de::{self, MapAccess, Visitor},
@@ -55,11 +62,18 @@ impl WeightTensor {
 pub trait WeightSource {
     /// Returns every tensor's name, scalar type, and shape.
     fn tensors(&self) -> &[WeightTensor];
+    /// Maps the source bytes for import into a backend.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the source file can no longer be mapped.
+    fn mapped_region(&self) -> Result<MappedRegion, WeightError>;
 }
 
 /// A validated safetensors file.
 #[derive(Debug)]
 pub struct Safetensors {
+    path: PathBuf,
     tensors: Vec<WeightTensor>,
 }
 
@@ -106,7 +120,10 @@ impl Safetensors {
         }) {
             return Err(WeightError::OverlappingRanges);
         }
-        Ok(Self { tensors })
+        Ok(Self {
+            path: path.to_owned(),
+            tensors,
+        })
     }
 }
 
@@ -152,6 +169,11 @@ impl WeightSource for Safetensors {
     fn tensors(&self) -> &[WeightTensor] {
         &self.tensors
     }
+
+    fn mapped_region(&self) -> Result<MappedRegion, WeightError> {
+        let file = File::open(&self.path).map_err(WeightError::Io)?;
+        MappedRegion::map(&file).map_err(WeightError::Mapping)
+    }
 }
 
 /// A reason a weight source could not be opened.
@@ -159,6 +181,8 @@ impl WeightSource for Safetensors {
 pub enum WeightError {
     /// The file could not be read.
     Io(std::io::Error),
+    /// The validated file could not be mapped.
+    Mapping(std::io::Error),
     /// The file ended before its declared metadata or tensor data.
     Truncated,
     /// The JSON metadata is malformed or has an invalid schema.
@@ -179,6 +203,7 @@ impl fmt::Display for WeightError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io(error) => write!(f, "weight file I/O failed: {error}"),
+            Self::Mapping(error) => error.fmt(f),
             Self::Truncated => f.write_str("weight file is truncated"),
             Self::InvalidHeader(error) => write!(f, "invalid safetensors header: {error}"),
             Self::HeaderTooLarge(bytes) => {
@@ -200,7 +225,7 @@ impl fmt::Display for WeightError {
 impl Error for WeightError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::Io(error) => Some(error),
+            Self::Io(error) | Self::Mapping(error) => Some(error),
             _ => None,
         }
     }

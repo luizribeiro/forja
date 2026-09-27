@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-use crate::{BufferId, CommandList, DType, Layout, Slice, Tensor};
+use crate::{BufferId, CommandList, DType, Layout, MappedRegion, Slice, Tensor};
 
 static NEXT_BACKEND: AtomicU64 = AtomicU64::new(1);
 
@@ -253,6 +253,24 @@ pub trait Backend {
     ///
     /// Returns a quota, allocation, or invalid-input error.
     fn alloc(&self, dtype: DType, shape: &[u32]) -> Result<Tensor, BackendError>;
+    /// Imports one read-only file mapping as a backend allocation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an allocation or invalid-input error when the mapping cannot be imported.
+    fn import_readonly(&self, bytes: MappedRegion) -> Result<BufferId, BackendError> {
+        let _ = bytes;
+        Err(BackendError::InvalidInput)
+    }
+    /// Creates a validated tensor for an imported allocation.
+    ///
+    /// # Errors
+    ///
+    /// Returns invalid input for a foreign allocation or mismatched layout.
+    fn tensor(&self, buffer: BufferId, layout: Layout) -> Result<Tensor, BackendError> {
+        let _ = (buffer, layout);
+        Err(BackendError::InvalidInput)
+    }
     /// Applies a validated metadata-only view operation.
     ///
     /// # Errors

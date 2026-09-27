@@ -6,6 +6,9 @@ publish.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
+[dependencies]
+forja-mmap = { path = "../forja-mmap" }
+
 [lints]
 workspace = true
 
