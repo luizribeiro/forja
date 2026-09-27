@@ -1,10 +1,13 @@
 use std::{
     error::Error,
+    fs,
     path::Path,
+    process::Command,
     time::{Duration, Instant},
 };
 
 use forja_host::{EngineMetrics, EngineRunner, EngineStep};
+use golden_fixtures::sha256_file;
 
 use crate::{
     args::Bench,
@@ -40,6 +43,13 @@ pub(crate) async fn run(options: &Bench) -> Result<(), Box<dyn Error>> {
 
 #[cfg(target_os = "macos")]
 async fn run_metal(options: &Bench) -> Result<(), Box<dyn Error>> {
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let commit = command_output(
+        "git",
+        &["-C", &repository.to_string_lossy(), "rev-parse", "HEAD"],
+    )?;
+    let os = command_output("sw_vers", &["-productVersion"])?;
+    let mut results = Vec::new();
     println!(
         "precision\tmetric\twall tok/s (95% CI)\tGPU tok/s (95% CI)\twall ms\tGPU ms\tsubmissions"
     );
@@ -47,9 +57,37 @@ async fn run_metal(options: &Bench) -> Result<(), Box<dyn Error>> {
         ("f32", test_guests::qwen3()),
         ("bf16", test_guests::qwen3_bf16()),
     ] {
-        let (pp, tg) = bench_precision(options, component).await?;
+        let (pp, tg, device) = bench_precision(options, component).await?;
         print_summary(precision, "pp", pp);
         print_summary(precision, "tg", tg);
+        results.push(serde_json::json!({
+            "provenance": {
+                "git_commit": commit,
+                "engine_component_sha256": sha256_file(component)?,
+                "device": device,
+                "os": format!("macOS {os}"),
+                "precision": precision,
+            },
+            "prompt_processing": summary_json(pp),
+            "token_generation": summary_json(tg),
+        }));
+    }
+    if let Some(path) = &options.json {
+        let report = serde_json::json!({
+            "schema_version": 1,
+            "implementation": "forja",
+            "model": options.model_dir,
+            "settings": {
+                "prompt_tokens": options.pp,
+                "generated_tokens": options.tg,
+                "warmups": WARMUPS,
+                "repetitions": options.reps,
+            },
+            "results": results,
+        });
+        let mut bytes = serde_json::to_vec_pretty(&report)?;
+        bytes.push(b'\n');
+        fs::write(path, bytes)?;
     }
     Ok(())
 }
@@ -58,8 +96,9 @@ async fn run_metal(options: &Bench) -> Result<(), Box<dyn Error>> {
 async fn bench_precision(
     options: &Bench,
     component: &Path,
-) -> Result<(Summary, Summary), Box<dyn Error>> {
+) -> Result<(Summary, Summary, String), Box<dyn Error>> {
     let backend = forja_metal::MetalBackend::new()?;
+    let device = backend.device_name();
     let mut runner = EngineRunner::new(
         component,
         backend,
@@ -92,7 +131,11 @@ async fn bench_precision(
         pp.push(measure_prefill(&mut runner, &tokens[..options.pp]).await?);
         tg.push(measure_decode(&mut runner, &tokens[..DECODE_PREFILL], options.tg).await?);
     }
-    Ok((summarize(&pp, options.pp)?, summarize(&tg, options.tg)?))
+    Ok((
+        summarize(&pp, options.pp)?,
+        summarize(&tg, options.tg)?,
+        device,
+    ))
 }
 
 #[cfg(target_os = "macos")]
@@ -221,6 +264,37 @@ fn print_summary(precision: &str, metric: &str, summary: Summary) {
         summary.submissions.median,
     );
 }
+fn summary_json(summary: Summary) -> serde_json::Value {
+    serde_json::json!({
+        "tokens_per_second": {
+            "wall": stats_json(summary.wall_tps),
+            "gpu": stats_json(summary.gpu_tps),
+        },
+        "wall_time_seconds": stats_json(summary.wall_seconds),
+        "gpu_time_seconds": stats_json(summary.gpu_seconds),
+        "submissions": stats_json(summary.submissions),
+    })
+}
+
+fn stats_json(stats: Stats) -> serde_json::Value {
+    serde_json::json!({
+        "median": stats.median,
+        "ci95": [stats.low, stats.high],
+    })
+}
+
+fn command_output(program: &str, arguments: &[&str]) -> Result<String, Box<dyn Error>> {
+    let output = Command::new(program).args(arguments).output()?;
+    if !output.status.success() {
+        return Err(format!("{program} failed with {}", output.status).into());
+    }
+    let value = String::from_utf8(output.stdout)?.trim().to_owned();
+    if value.is_empty() {
+        return Err(format!("{program} returned no output").into());
+    }
+    Ok(value)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
