@@ -1,11 +1,13 @@
 //! End-to-end component tests for the guest tensor surface.
 
-use forja_core::{Backend, CommandList, DType, Op, Submission};
+use forja_core::{Backend, CommandList, DType, Op, Submission, ViewOp};
 use forja_host::{Grants, Host, Limits, add_to_linker};
+use forja_testing::{DeterministicValues, F32_TOLERANCE, normwise_relative_error};
 use std::{
     fs,
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
+    time::Duration,
 };
 use wasmtime::component::{Component, Instance, Linker};
 use wasmtime::{Config, Engine, Store};
@@ -13,6 +15,10 @@ use wasmtime::{Config, Engine, Store};
 const LIMITS: Limits = Limits::new(64 * 1024, 8, 16 * 1024, 8, 64 * 1024);
 const COMMAND_LIMITS: Limits = Limits::new(128 * 1024, 8, 16 * 1024, 8, 64 * 1024);
 const WEIGHT_LIMITS: Limits = Limits::new(20, 8, 16 * 1024, 4, 64 * 1024);
+const SDK_LIMITS: Limits = Limits::new(64 * 1024 * 1024, 8, 2_100_000, 128, 7 * 1024 * 4)
+    .with_command_limits(32, 64 * 1024 * 1024)
+    .with_gpu_limits(Duration::from_secs(30), Duration::MAX)
+    .with_store_limits(512 * 1024 * 1024, 10_000, 10_000);
 static NEXT_WEIGHT_FILE: AtomicU64 = AtomicU64::new(0);
 
 #[tokio::test(flavor = "multi_thread")]
@@ -59,6 +65,21 @@ async fn cpu_guest_uses_granted_weights() -> wasmtime::Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn metal_guest_uses_granted_weights() -> wasmtime::Result<()> {
     run_weights(forja_metal::MetalBackend::new().map_err(wasmtime::Error::msg)?).await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cpu_sdk_attention_smoke() -> wasmtime::Result<()> {
+    run_sdk_attention(forja_cpu::CpuBackend::new(), forja_cpu::CpuBackend::new()).await
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test(flavor = "multi_thread")]
+async fn metal_tensor_smoke_runs_sdk_attention_block() -> wasmtime::Result<()> {
+    run_sdk_attention(
+        forja_metal::MetalBackend::new().map_err(wasmtime::Error::msg)?,
+        forja_metal::MetalBackend::new().map_err(wasmtime::Error::msg)?,
+    )
+    .await
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -189,6 +210,301 @@ where
     .await;
     fs::remove_file(path)?;
     result
+}
+
+async fn run_sdk_attention<B>(reference: B, guest: B) -> wasmtime::Result<()>
+where
+    B: Backend + Send + Sync + 'static,
+{
+    let values = AttentionValues::new();
+    let expected = direct_attention(&reference, &values)?;
+    drop(reference);
+    let (mut store, instance) = instantiate(guest, test_guests::sdk_smoke(), SDK_LIMITS).await?;
+    let run = instance
+        .get_typed_func::<AttentionParams, (Result<Vec<f32>, String>,)>(&mut store, "run")?;
+    let parameters = values.into_parameters();
+    let (result,) = store
+        .run_concurrent(async move |accessor| run.call_concurrent(accessor, parameters).await)
+        .await??;
+    let actual = result.map_err(wasmtime::Error::msg)?;
+    let error = normwise_relative_error(&expected, &actual);
+    if error > F32_TOLERANCE {
+        return Err(wasmtime::Error::msg(format!(
+            "SDK attention relative error {error} exceeded {F32_TOLERANCE}"
+        )));
+    }
+    Ok(())
+}
+
+type AttentionParams = (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>);
+
+struct AttentionValues {
+    input: Vec<f32>,
+    norm_weight: Vec<f32>,
+    q_weight: Vec<f32>,
+    k_weight: Vec<f32>,
+    v_weight: Vec<f32>,
+    output_weight: Vec<f32>,
+}
+
+struct AttentionTensors {
+    input: forja_core::Tensor,
+    norm_weight: forja_core::Tensor,
+    normalized: forja_core::Tensor,
+    q_weight: forja_core::Tensor,
+    k_weight: forja_core::Tensor,
+    v_weight: forja_core::Tensor,
+    q_projection: forja_core::Tensor,
+    k_projection: forja_core::Tensor,
+    v_projection: forja_core::Tensor,
+    q_rows: forja_core::Tensor,
+    k_rows: forja_core::Tensor,
+    q_rotated: forja_core::Tensor,
+    k_rotated: forja_core::Tensor,
+    q_heads: forja_core::Tensor,
+    k_heads: forja_core::Tensor,
+    v_heads: forja_core::Tensor,
+    positions: forja_core::Tensor,
+    attended: forja_core::Tensor,
+    attended_rows: forja_core::Tensor,
+    contiguous: forja_core::Tensor,
+    flattened: forja_core::Tensor,
+    output_weight: forja_core::Tensor,
+    projected: forja_core::Tensor,
+    result: forja_core::Tensor,
+}
+
+impl AttentionValues {
+    fn new() -> Self {
+        let mut generator = DeterministicValues::new(0xa54f_f53a_5f1d_36f1);
+        let mut next = |len| {
+            (0..len)
+                .map(|_| generator.next_f32() * 0.02)
+                .collect::<Vec<_>>()
+        };
+        Self {
+            input: next(7 * 1024),
+            norm_weight: next(1024),
+            q_weight: next(2048 * 1024),
+            k_weight: next(1024 * 1024),
+            v_weight: next(1024 * 1024),
+            output_weight: next(1024 * 2048),
+        }
+    }
+
+    fn into_parameters(self) -> AttentionParams {
+        (
+            self.input,
+            self.norm_weight,
+            self.q_weight,
+            self.k_weight,
+            self.v_weight,
+            self.output_weight,
+        )
+    }
+}
+
+fn direct_attention<B: Backend>(
+    backend: &B,
+    values: &AttentionValues,
+) -> wasmtime::Result<Vec<f32>> {
+    let input = f32_tensor(backend, &[7, 1024], &values.input)?;
+    let norm_weight = f32_tensor(backend, &[1024], &values.norm_weight)?;
+    let q_weight = f32_tensor(backend, &[2048, 1024], &values.q_weight)?;
+    let k_weight = f32_tensor(backend, &[1024, 1024], &values.k_weight)?;
+    let v_weight = f32_tensor(backend, &[1024, 1024], &values.v_weight)?;
+    let output_weight = f32_tensor(backend, &[1024, 2048], &values.output_weight)?;
+    let positions = backend.alloc(DType::U32, &[7]).map_err(backend_error)?;
+    backend
+        .write(
+            &positions,
+            &(0_u32..7).flat_map(u32::to_le_bytes).collect::<Vec<_>>(),
+        )
+        .map_err(backend_error)?;
+
+    let normalized = f32_output(backend, &[7, 1024])?;
+    let q_projection = f32_output(backend, &[7, 2048])?;
+    let k_projection = f32_output(backend, &[7, 1024])?;
+    let v_projection = f32_output(backend, &[7, 1024])?;
+    let q_weight = backend
+        .view(&q_weight, ViewOp::Permute(vec![1, 0]))
+        .map_err(backend_error)?;
+    let k_weight = backend
+        .view(&k_weight, ViewOp::Permute(vec![1, 0]))
+        .map_err(backend_error)?;
+    let v_weight = backend
+        .view(&v_weight, ViewOp::Permute(vec![1, 0]))
+        .map_err(backend_error)?;
+    let q_rows = backend
+        .view(&q_projection, ViewOp::Reshape(vec![7, 16, 128]))
+        .map_err(backend_error)?;
+    let k_rows = backend
+        .view(&k_projection, ViewOp::Reshape(vec![7, 8, 128]))
+        .map_err(backend_error)?;
+    let v_rows = backend
+        .view(&v_projection, ViewOp::Reshape(vec![7, 8, 128]))
+        .map_err(backend_error)?;
+    let q_rotated = f32_output(backend, &[7, 16, 128])?;
+    let k_rotated = f32_output(backend, &[7, 8, 128])?;
+    let q_heads = backend
+        .view(&q_rotated, ViewOp::Permute(vec![1, 0, 2]))
+        .map_err(backend_error)?;
+    let k_heads = backend
+        .view(&k_rotated, ViewOp::Permute(vec![1, 0, 2]))
+        .map_err(backend_error)?;
+    let v_heads = backend
+        .view(&v_rows, ViewOp::Permute(vec![1, 0, 2]))
+        .map_err(backend_error)?;
+    let attended = f32_output(backend, &[16, 7, 128])?;
+    let attended_rows = backend
+        .view(&attended, ViewOp::Permute(vec![1, 0, 2]))
+        .map_err(backend_error)?;
+    let contiguous = f32_output(backend, &[7, 16, 128])?;
+    let flattened = backend
+        .view(&contiguous, ViewOp::Reshape(vec![7, 2048]))
+        .map_err(backend_error)?;
+    let output_weight = backend
+        .view(&output_weight, ViewOp::Permute(vec![1, 0]))
+        .map_err(backend_error)?;
+    let projected = f32_output(backend, &[7, 1024])?;
+    let result = f32_output(backend, &[7, 1024])?;
+
+    let tensors = AttentionTensors {
+        input,
+        norm_weight,
+        normalized,
+        q_weight,
+        k_weight,
+        v_weight,
+        q_projection,
+        k_projection,
+        v_projection,
+        q_rows,
+        k_rows,
+        q_rotated,
+        k_rotated,
+        q_heads,
+        k_heads,
+        v_heads,
+        positions,
+        attended,
+        attended_rows,
+        contiguous,
+        flattened,
+        output_weight,
+        projected,
+        result,
+    };
+    let commands = record_attention(&tensors)?;
+    backend
+        .submit(commands)
+        .map_err(backend_error)?
+        .wait()
+        .map_err(backend_error)?;
+    let bytes = backend.read(&tensors.result).map_err(backend_error)?;
+    Ok(bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|bytes| f32::from_le_bytes(*bytes))
+        .collect())
+}
+
+fn record_attention(tensors: &AttentionTensors) -> wasmtime::Result<CommandList> {
+    let mut commands = CommandList::new();
+    commands
+        .dispatch(
+            Op::RmsNorm { eps: 1.0e-6 },
+            &[&tensors.input, &tensors.norm_weight],
+            &tensors.normalized,
+        )
+        .map_err(wasmtime::Error::msg)?;
+    commands
+        .dispatch(
+            Op::Matmul,
+            &[&tensors.normalized, &tensors.q_weight],
+            &tensors.q_projection,
+        )
+        .map_err(wasmtime::Error::msg)?;
+    commands
+        .dispatch(
+            Op::Matmul,
+            &[&tensors.normalized, &tensors.k_weight],
+            &tensors.k_projection,
+        )
+        .map_err(wasmtime::Error::msg)?;
+    commands
+        .dispatch(
+            Op::Matmul,
+            &[&tensors.normalized, &tensors.v_weight],
+            &tensors.v_projection,
+        )
+        .map_err(wasmtime::Error::msg)?;
+    commands
+        .dispatch(
+            Op::Rope { theta: 1_000_000.0 },
+            &[&tensors.q_rows, &tensors.positions],
+            &tensors.q_rotated,
+        )
+        .map_err(wasmtime::Error::msg)?;
+    commands
+        .dispatch(
+            Op::Rope { theta: 1_000_000.0 },
+            &[&tensors.k_rows, &tensors.positions],
+            &tensors.k_rotated,
+        )
+        .map_err(wasmtime::Error::msg)?;
+    commands
+        .dispatch(
+            Op::Sdpa {
+                scale: 128.0_f32.sqrt().recip(),
+                causal: true,
+                q_start: 0,
+            },
+            &[&tensors.q_heads, &tensors.k_heads, &tensors.v_heads],
+            &tensors.attended,
+        )
+        .map_err(wasmtime::Error::msg)?;
+    commands
+        .dispatch(Op::Copy, &[&tensors.attended_rows], &tensors.contiguous)
+        .map_err(wasmtime::Error::msg)?;
+    commands
+        .dispatch(
+            Op::Matmul,
+            &[&tensors.flattened, &tensors.output_weight],
+            &tensors.projected,
+        )
+        .map_err(wasmtime::Error::msg)?;
+    commands
+        .dispatch(
+            Op::Add,
+            &[&tensors.input, &tensors.projected],
+            &tensors.result,
+        )
+        .map_err(wasmtime::Error::msg)?;
+    Ok(commands)
+}
+
+fn f32_tensor<B: Backend>(
+    backend: &B,
+    shape: &[u32],
+    values: &[f32],
+) -> wasmtime::Result<forja_core::Tensor> {
+    let tensor = backend.alloc(DType::F32, shape).map_err(backend_error)?;
+    backend
+        .write(
+            &tensor,
+            &values
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect::<Vec<_>>(),
+        )
+        .map_err(backend_error)?;
+    Ok(tensor)
+}
+
+fn f32_output<B: Backend>(backend: &B, shape: &[u32]) -> wasmtime::Result<forja_core::Tensor> {
+    backend.alloc(DType::F32, shape).map_err(backend_error)
 }
 
 fn weight_file() -> PathBuf {
