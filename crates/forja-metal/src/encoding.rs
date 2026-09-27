@@ -29,22 +29,123 @@ use crate::{
 };
 
 type MetalBufferRef = Retained<ProtocolObject<dyn MTLBuffer>>;
-type EncodedEmbed = (Vec<MetalBufferRef>, u64);
+type EncodedEmbed = (Vec<BufferBinding>, BufferBinding);
+
+#[derive(Clone)]
+struct BufferBinding {
+    raw: MetalBufferRef,
+    offset: usize,
+    len: usize,
+    address: u64,
+}
+
+impl BufferBinding {
+    fn whole(raw: MetalBufferRef) -> Self {
+        let address = raw.gpuAddress();
+        let len = raw.length();
+        Self {
+            raw,
+            offset: 0,
+            len,
+            address,
+        }
+    }
+}
 
 struct ArgumentBuffer {
     raw: MetalBufferRef,
     capacity: usize,
 }
 
-impl ArgumentBuffer {
-    fn contains(&self, required: usize) -> bool {
-        self.capacity >= required && self.raw.length() >= required
+struct ArgumentWriter {
+    raw: MetalBufferRef,
+    capacity: usize,
+    offset: usize,
+    written: Vec<(usize, usize)>,
+}
+
+impl ArgumentWriter {
+    fn new(buffer: &ArgumentBuffer) -> Self {
+        Self {
+            raw: buffer.raw.clone(),
+            capacity: buffer.capacity,
+            offset: 0,
+            written: Vec::new(),
+        }
     }
+
+    fn write(&mut self, bytes: &[u8]) -> Result<BufferBinding, BackendError> {
+        let started = TEMPORARY_PROFILE.with(|profile| profile.get().map(|_| Instant::now()));
+        let offset = reserve_argument(&mut self.offset, bytes.len(), self.capacity)?;
+        // SAFETY: The checked range lies within the live shared allocation and argument writes are
+        // completed before the command buffer can execute.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                self.raw.contents().cast::<u8>().as_ptr().add(offset),
+                bytes.len(),
+            );
+        }
+        self.written.push((offset, bytes.len()));
+        if let Some(started) = started {
+            TEMPORARY_PROFILE.with(|profile| {
+                if let Some(mut timing) = profile.get() {
+                    timing.count = 1;
+                    timing.time = timing.time.saturating_add(started.elapsed());
+                    profile.set(Some(timing));
+                }
+            });
+        }
+        let address = self
+            .raw
+            .gpuAddress()
+            .checked_add(u64::try_from(offset).map_err(|_| BackendError::AllocationFailed)?)
+            .ok_or(BackendError::AllocationFailed)?;
+        Ok(BufferBinding {
+            raw: self.raw.clone(),
+            offset,
+            len: bytes.len(),
+            address,
+        })
+    }
+
+    fn validate_capacity(&self, expected: usize, empty: bool) -> Result<(), BackendError> {
+        if !empty && self.offset != expected {
+            return Err(BackendError::ExecutionFailed);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct ArgumentSizer {
+    offset: usize,
+}
+
+impl ArgumentSizer {
+    fn write(&mut self, len: usize) -> Result<(), BackendError> {
+        reserve_argument(&mut self.offset, len, usize::MAX).map(|_| ())
+    }
+}
+
+fn reserve_argument(
+    offset: &mut usize,
+    len: usize,
+    capacity: usize,
+) -> Result<usize, BackendError> {
+    let start = offset
+        .checked_next_multiple_of(16)
+        .ok_or(BackendError::AllocationFailed)?;
+    *offset = start
+        .checked_add(len)
+        .filter(|&end| end <= capacity)
+        .ok_or(BackendError::AllocationFailed)?;
+    Ok(start)
 }
 
 #[derive(Clone)]
 struct EncoderTensor {
-    buffer: MetalBufferRef,
+    buffer: BufferBinding,
     layout: Layout,
 }
 
@@ -95,14 +196,28 @@ const VECTOR_MAX_KEY_LENGTH: u32 = 65_536;
 const STEEL_SELECTED_MIN_QUERY_LENGTH: u32 = 512;
 
 struct EncodedDispatches {
-    temporaries: Vec<MetalBufferRef>,
-    error_flags: Vec<u64>,
+    temporaries: Vec<BufferBinding>,
+    error_flags: Vec<BufferBinding>,
     bindings: ArgumentBindings,
+    arguments: Option<ArgumentUsage>,
 }
 
 #[derive(Default)]
 struct ArgumentBindings {
-    addresses: HashSet<u64>,
+    ranges: HashSet<BoundRange>,
+}
+
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+struct BoundRange {
+    base: u64,
+    offset: usize,
+    len: usize,
+    address: u64,
+}
+
+struct ArgumentUsage {
+    base: u64,
+    written: HashSet<(usize, usize)>,
 }
 
 impl ArgumentBindings {
@@ -110,7 +225,26 @@ impl ArgumentBindings {
         &mut self,
         table: &ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>,
         index: usize,
-        buffer: &ProtocolObject<dyn MTLBuffer>,
+        buffer: &BufferBinding,
+    ) {
+        // SAFETY: Each caller uses an index within its argument-table descriptor and registers
+        // the bound buffer in the command resource owner before submission.
+        unsafe {
+            table.setAddress_atIndex(buffer.address, index);
+        }
+        self.ranges.insert(BoundRange {
+            base: buffer.raw.gpuAddress(),
+            offset: buffer.offset,
+            len: buffer.len,
+            address: buffer.address,
+        });
+    }
+
+    fn bind_raw(
+        &mut self,
+        table: &ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>,
+        index: usize,
+        buffer: &MetalBufferRef,
     ) {
         let address = buffer.gpuAddress();
         // SAFETY: Each caller uses an index within its argument-table descriptor and registers
@@ -118,7 +252,12 @@ impl ArgumentBindings {
         unsafe {
             table.setAddress_atIndex(address, index);
         }
-        self.addresses.insert(address);
+        self.ranges.insert(BoundRange {
+            base: address,
+            offset: 0,
+            len: buffer.length(),
+            address,
+        });
     }
 }
 
@@ -359,7 +498,7 @@ impl GpuTimestamps {
 
 struct CommandResources {
     buffers: Vec<InFlightBuffer>,
-    error_flags: Vec<usize>,
+    error_flags: Vec<(usize, usize)>,
 }
 
 pub(super) struct Completion {
@@ -527,17 +666,30 @@ impl Completion {
     }
 
     fn check_error_flags(&self) -> Result<(), BackendError> {
-        for &flag in &self.resources.error_flags {
+        for &(flag, offset) in &self.resources.error_flags {
             // SAFETY: The queue event has signaled GPU completion, and each indexed retained
             // shared buffer contains two aligned u32 values initialized by the host.
-            let (has_error, index) = unsafe {
-                let words = self.resources.buffers[flag]
-                    .raw
-                    .contents()
-                    .cast::<u32>()
-                    .as_ptr();
-                (words.read(), words.add(1).read())
+            let bytes = unsafe {
+                std::slice::from_raw_parts(
+                    self.resources.buffers[flag]
+                        .raw
+                        .contents()
+                        .cast::<u8>()
+                        .as_ptr()
+                        .add(offset),
+                    8,
+                )
             };
+            let has_error = u32::from_ne_bytes(
+                bytes[..4]
+                    .try_into()
+                    .map_err(|_| BackendError::ExecutionFailed)?,
+            );
+            let index = u32::from_ne_bytes(
+                bytes[4..]
+                    .try_into()
+                    .map_err(|_| BackendError::ExecutionFailed)?,
+            );
             if has_error != 0 {
                 return Err(BackendError::IndexOutOfRange { index });
             }
@@ -657,7 +809,7 @@ impl InFlightTracker {
                 },
             }
         };
-        if reusable.argument_buffer.capacity < argument_capacity {
+        if reusable.argument_buffer.capacity != argument_capacity {
             let raw = device
                 .newBufferWithLength_options(
                     argument_capacity,
@@ -896,11 +1048,8 @@ impl MetalBackend {
                 .unwrap_or(u64::MAX),
             ..SubmissionProfile::default()
         });
-        let argument_capacity = argument_capacity(&dispatches)?;
+        let argument_capacity = self.argument_capacity(&dispatches)?;
         let mut objects = self.in_flight.checkout(&self.device, argument_capacity)?;
-        if !objects.argument_buffer()?.contains(argument_capacity) {
-            return Err(BackendError::ExecutionFailed);
-        }
         let command_buffer = self.begin_command_buffer(objects.allocator()?)?;
         let timestamp_count = if PROFILE {
             dispatches
@@ -919,13 +1068,16 @@ impl MetalBackend {
         }
         let encoding_started = PROFILE.then(Instant::now);
         let mut temporary_profile = TemporaryProfileScope::enter(PROFILE);
+        let mut argument_writer = ArgumentWriter::new(objects.argument_buffer()?);
         let encoded = self.encode_dispatches(
             &command_buffer,
             objects.argument_table()?,
             &dispatches,
             &barriers,
             PROFILE.then_some(&timestamps),
+            &mut argument_writer,
         )?;
+        argument_writer.validate_capacity(argument_capacity, dispatches.is_empty())?;
         if let Some(profile) = &mut profile {
             profile.metadata_buffers = temporary_profile.finish();
             let encoding = encoding_started.map_or(Duration::ZERO, |started| started.elapsed());
@@ -962,6 +1114,7 @@ impl MetalBackend {
         Ok(submission)
     }
 
+    #[allow(clippy::too_many_lines)]
     fn encode_dispatches(
         &self,
         command_buffer: &ProtocolObject<dyn MTL4CommandBuffer>,
@@ -969,6 +1122,7 @@ impl MetalBackend {
         dispatches: &[Dispatch],
         barriers: &[bool],
         timestamps: Option<&GpuTimestamps>,
+        arguments: &mut ArgumentWriter,
     ) -> Result<EncodedDispatches, BackendError> {
         use objc2_metal::MTL4CommandEncoder;
         let encoder = command_buffer
@@ -992,6 +1146,7 @@ impl MetalBackend {
                     dispatch,
                     eps,
                     &mut bindings,
+                    arguments,
                 )?);
                 continue;
             }
@@ -1001,6 +1156,7 @@ impl MetalBackend {
                     table,
                     dispatch,
                     &mut bindings,
+                    arguments,
                 )?);
                 continue;
             }
@@ -1011,22 +1167,35 @@ impl MetalBackend {
                     dispatch,
                     theta,
                     &mut bindings,
+                    arguments,
                 )?);
                 continue;
             }
             if dispatch.op() == Op::Embed {
                 let (buffers, flag) =
-                    self.encode_embed(&encoder, table, dispatch, &mut bindings)?;
+                    self.encode_embed(&encoder, table, dispatch, &mut bindings, arguments)?;
                 temporaries.extend(buffers);
                 error_flags.push(flag);
                 continue;
             }
             if dispatch.op() == Op::Copy {
-                temporaries.extend(self.encode_copy(&encoder, table, dispatch, &mut bindings)?);
+                temporaries.extend(self.encode_copy(
+                    &encoder,
+                    table,
+                    dispatch,
+                    &mut bindings,
+                    arguments,
+                )?);
                 continue;
             }
             if dispatch.op() == Op::Matmul {
-                temporaries.extend(self.encode_matmul(&encoder, table, dispatch, &mut bindings)?);
+                temporaries.extend(self.encode_matmul(
+                    &encoder,
+                    table,
+                    dispatch,
+                    &mut bindings,
+                    arguments,
+                )?);
                 continue;
             }
             if matches!(dispatch.op(), Op::Sdpa { .. }) {
@@ -1035,6 +1204,7 @@ impl MetalBackend {
                     table,
                     dispatch,
                     &mut bindings,
+                    arguments,
                 )?);
                 continue;
             }
@@ -1058,16 +1228,25 @@ impl MetalBackend {
                 dispatch,
                 kernel,
                 &mut bindings,
+                arguments,
             )?);
         }
         if !dispatches.is_empty() {
             write_dispatch_timestamp(&encoder, timestamps, 1 + dispatches.len() * 2);
         }
         encoder.endEncoding();
+        let argument_usage = (arguments.offset > 0).then(|| ArgumentUsage {
+            base: arguments.raw.gpuAddress(),
+            written: arguments.written.iter().copied().collect(),
+        });
+        if argument_usage.is_some() {
+            temporaries.push(BufferBinding::whole(arguments.raw.clone()));
+        }
         Ok(EncodedDispatches {
             temporaries,
             error_flags,
             bindings,
+            arguments: argument_usage,
         })
     }
 
@@ -1077,13 +1256,14 @@ impl MetalBackend {
         table: &ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>,
         dispatch: &Dispatch,
         bindings: &mut ArgumentBindings,
-    ) -> Result<Vec<MetalBufferRef>, BackendError> {
+        arguments: &mut ArgumentWriter,
+    ) -> Result<Vec<BufferBinding>, BackendError> {
         let [input] = dispatch.inputs() else {
             return Err(BackendError::InvalidInput);
         };
         let input = self.encoder_tensor(input)?;
         let output = self.encoder_tensor(dispatch.output())?;
-        self.encode_copy_tensors(encoder, table, &input, &output, bindings)
+        self.encode_copy_tensors(encoder, table, &input, &output, bindings, arguments)
     }
 
     fn encode_matmul(
@@ -1092,7 +1272,8 @@ impl MetalBackend {
         table: &ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>,
         dispatch: &Dispatch,
         bindings: &mut ArgumentBindings,
-    ) -> Result<Vec<MetalBufferRef>, BackendError> {
+        arguments: &mut ArgumentWriter,
+    ) -> Result<Vec<BufferBinding>, BackendError> {
         use objc2_metal::{MTL4CommandEncoder, MTL4VisibilityOptions, MTLStages};
 
         let [left_tensor, right_tensor] = dispatch.inputs() else {
@@ -1101,10 +1282,22 @@ impl MetalBackend {
         let output_tensor = dispatch.output();
         let dtype = output_tensor.layout().dtype();
         let mut temporaries = Vec::new();
-        let left =
-            self.prepare_matmul_input(encoder, table, left_tensor, bindings, &mut temporaries)?;
-        let right =
-            self.prepare_matmul_input(encoder, table, right_tensor, bindings, &mut temporaries)?;
+        let left = self.prepare_matmul_input(
+            encoder,
+            table,
+            left_tensor,
+            bindings,
+            &mut temporaries,
+            arguments,
+        )?;
+        let right = self.prepare_matmul_input(
+            encoder,
+            table,
+            right_tensor,
+            bindings,
+            &mut temporaries,
+            arguments,
+        )?;
         if left.copied || right.copied {
             encoder.barrierAfterEncoderStages_beforeEncoderStages_visibilityOptions(
                 MTLStages::Dispatch,
@@ -1142,7 +1335,7 @@ impl MetalBackend {
                 )
             };
         let parameter_buffer =
-            self.encode_matmul_kernel(encoder, table, &left, &right, &output, bindings)?;
+            self.encode_matmul_kernel(encoder, table, &left, &right, &output, bindings, arguments)?;
         temporaries.push(parameter_buffer);
         if copy_output {
             encoder.barrierAfterEncoderStages_beforeEncoderStages_visibilityOptions(
@@ -1156,6 +1349,7 @@ impl MetalBackend {
                 &output.tensor,
                 &final_output,
                 bindings,
+                arguments,
             )?);
         }
         Ok(temporaries)
@@ -1167,7 +1361,8 @@ impl MetalBackend {
         table: &ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>,
         dispatch: &Dispatch,
         bindings: &mut ArgumentBindings,
-    ) -> Result<Vec<MetalBufferRef>, BackendError> {
+        arguments: &mut ArgumentWriter,
+    ) -> Result<Vec<BufferBinding>, BackendError> {
         let Op::Sdpa {
             scale,
             causal,
@@ -1177,14 +1372,15 @@ impl MetalBackend {
             return Err(BackendError::InvalidInput);
         };
         match select_sdpa(dispatch)? {
-            SdpaKernel::Vector => {
-                self.encode_vector_sdpa(encoder, table, dispatch, scale, causal, q_start, bindings)
-            }
-            SdpaKernel::Steel => {
-                self.encode_steel_sdpa(encoder, table, dispatch, scale, causal, q_start, bindings)
-            }
-            SdpaKernel::Decomposed => self
-                .encode_decomposed_sdpa(encoder, table, dispatch, scale, causal, q_start, bindings),
+            SdpaKernel::Vector => self.encode_vector_sdpa(
+                encoder, table, dispatch, scale, causal, q_start, bindings, arguments,
+            ),
+            SdpaKernel::Steel => self.encode_steel_sdpa(
+                encoder, table, dispatch, scale, causal, q_start, bindings, arguments,
+            ),
+            SdpaKernel::Decomposed => self.encode_decomposed_sdpa(
+                encoder, table, dispatch, scale, causal, q_start, bindings, arguments,
+            ),
         }
     }
 
@@ -1198,7 +1394,8 @@ impl MetalBackend {
         causal: bool,
         q_start: u32,
         bindings: &mut ArgumentBindings,
-    ) -> Result<Vec<MetalBufferRef>, BackendError> {
+        arguments: &mut ArgumentWriter,
+    ) -> Result<Vec<BufferBinding>, BackendError> {
         use objc2_metal::{MTL4ComputeCommandEncoder, MTLSize};
 
         let [query_tensor, key_tensor, value_tensor] = dispatch.inputs() else {
@@ -1218,8 +1415,8 @@ impl MetalBackend {
         } else {
             1
         };
-        let params = self.sdpa_params(
-            &query, &key, &value, &output, scale, causal, q_start, blocks,
+        let params = Self::sdpa_params(
+            &query, &key, &value, &output, scale, causal, q_start, blocks, arguments,
         )?;
         let constants = [
             (0, dtype_code(query.layout.dtype())),
@@ -1376,7 +1573,8 @@ impl MetalBackend {
         causal: bool,
         q_start: u32,
         bindings: &mut ArgumentBindings,
-    ) -> Result<Vec<MetalBufferRef>, BackendError> {
+        arguments: &mut ArgumentWriter,
+    ) -> Result<Vec<BufferBinding>, BackendError> {
         use objc2_metal::{MTL4ComputeCommandEncoder, MTLSize};
 
         let [query_tensor, key_tensor, value_tensor] = dispatch.inputs() else {
@@ -1390,7 +1588,9 @@ impl MetalBackend {
         let [_, key_length, _] = shape3(&key.layout)?;
         let block_query = 32;
         let block_key = if width == 64 { 32 } else { 16 };
-        let params = self.sdpa_params(&query, &key, &value, &output, scale, causal, q_start, 1)?;
+        let params = Self::sdpa_params(
+            &query, &key, &value, &output, scale, causal, q_start, 1, arguments,
+        )?;
         let constants = [
             (0, dtype_code(query.layout.dtype())),
             (1, dtype_code(key.layout.dtype())),
@@ -1429,7 +1629,6 @@ impl MetalBackend {
 
     #[allow(clippy::too_many_arguments)]
     fn sdpa_params(
-        &self,
         query: &EncoderTensor,
         key: &EncoderTensor,
         value: &EncoderTensor,
@@ -1438,7 +1637,8 @@ impl MetalBackend {
         causal: bool,
         q_start: u32,
         blocks: u32,
-    ) -> Result<MetalBufferRef, BackendError> {
+        arguments: &mut ArgumentWriter,
+    ) -> Result<BufferBinding, BackendError> {
         let [query_heads, query_length, width] = shape3(&query.layout)?;
         let [kv_heads, key_length, _] = shape3(&key.layout)?;
         let [_, _, value_width] = shape3(&value.layout)?;
@@ -1472,7 +1672,7 @@ impl MetalBackend {
         ] {
             bytes.extend_from_slice(&item.to_ne_bytes());
         }
-        self.temporary_buffer(&bytes)
+        arguments.write(&bytes)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1485,7 +1685,8 @@ impl MetalBackend {
         causal: bool,
         q_start: u32,
         bindings: &mut ArgumentBindings,
-    ) -> Result<Vec<MetalBufferRef>, BackendError> {
+        arguments: &mut ArgumentWriter,
+    ) -> Result<Vec<BufferBinding>, BackendError> {
         let [query, key, value] = dispatch.inputs() else {
             return Err(BackendError::InvalidInput);
         };
@@ -1508,14 +1709,16 @@ impl MetalBackend {
             kv_heads,
             heads_per_group,
             bindings,
+            arguments,
         )?);
         encode_dispatch_barrier(encoder);
-        temporaries.push(
-            self.encode_sdpa_scale_mask(encoder, table, &scores, scale, causal, q_start, bindings)?,
-        );
+        temporaries.push(self.encode_sdpa_scale_mask(
+            encoder, table, &scores, scale, causal, q_start, bindings, arguments,
+        )?);
         encode_dispatch_barrier(encoder);
-        temporaries
-            .extend(self.encode_softmax_tensors(encoder, table, &scores, &scores, bindings)?);
+        temporaries.extend(
+            self.encode_softmax_tensors(encoder, table, &scores, &scores, bindings, arguments)?,
+        );
         encode_dispatch_barrier(encoder);
 
         temporaries.extend(self.encode_sdpa_probability_value(
@@ -1529,6 +1732,7 @@ impl MetalBackend {
             query_length,
             value_width,
             bindings,
+            arguments,
         )?);
         Ok(temporaries)
     }
@@ -1544,7 +1748,8 @@ impl MetalBackend {
         kv_heads: u32,
         heads_per_group: u32,
         bindings: &mut ArgumentBindings,
-    ) -> Result<Vec<MetalBufferRef>, BackendError> {
+        arguments: &mut ArgumentWriter,
+    ) -> Result<Vec<BufferBinding>, BackendError> {
         let mut temporaries = Vec::new();
         for kv_head in 0..kv_heads {
             let first_head = kv_head
@@ -1559,6 +1764,7 @@ impl MetalBackend {
                 query_group,
                 bindings,
                 &mut temporaries,
+                arguments,
             )?;
             let right = self.prepare_matmul_encoder_input(
                 encoder,
@@ -1566,6 +1772,7 @@ impl MetalBackend {
                 key_head,
                 bindings,
                 &mut temporaries,
+                arguments,
             )?;
             if left.copied || right.copied {
                 encode_dispatch_barrier(encoder);
@@ -1584,6 +1791,7 @@ impl MetalBackend {
                     batch_stride,
                 },
                 bindings,
+                arguments,
             )?);
         }
         Ok(temporaries)
@@ -1602,7 +1810,8 @@ impl MetalBackend {
         query_length: u32,
         value_width: u32,
         bindings: &mut ArgumentBindings,
-    ) -> Result<Vec<MetalBufferRef>, BackendError> {
+        arguments: &mut ArgumentWriter,
+    ) -> Result<Vec<BufferBinding>, BackendError> {
         let mut temporaries = Vec::new();
         for kv_head in 0..kv_heads {
             let first_head = kv_head
@@ -1617,6 +1826,7 @@ impl MetalBackend {
                 score_group,
                 bindings,
                 &mut temporaries,
+                arguments,
             )?;
             let right = self.prepare_matmul_encoder_input(
                 encoder,
@@ -1624,6 +1834,7 @@ impl MetalBackend {
                 value_head,
                 bindings,
                 &mut temporaries,
+                arguments,
             )?;
             let direct = classify(&output_group.layout)
                 .kernel_strides()
@@ -1662,6 +1873,7 @@ impl MetalBackend {
                 &right,
                 &prepared_output,
                 bindings,
+                arguments,
             )?);
             if copy_output {
                 encode_dispatch_barrier(encoder);
@@ -1671,6 +1883,7 @@ impl MetalBackend {
                     &prepared_output.tensor,
                     &output_group,
                     bindings,
+                    arguments,
                 )?);
             }
         }
@@ -1687,7 +1900,8 @@ impl MetalBackend {
         causal: bool,
         q_start: u32,
         bindings: &mut ArgumentBindings,
-    ) -> Result<MetalBufferRef, BackendError> {
+        arguments: &mut ArgumentWriter,
+    ) -> Result<BufferBinding, BackendError> {
         use objc2_metal::{MTL4ComputeCommandEncoder, MTLSize};
 
         let [_, query_length, key_length] = shape3(&scores.layout)?;
@@ -1709,7 +1923,7 @@ impl MetalBackend {
         ] {
             params.extend_from_slice(&value.to_ne_bytes());
         }
-        let params = self.temporary_buffer(&params)?;
+        let params = arguments.write(&params)?;
         encoder.setComputePipelineState(&pipeline);
         bindings.bind(table, 0, &scores.buffer);
         bindings.bind(table, 1, &params);
@@ -1732,6 +1946,7 @@ impl MetalBackend {
         Ok(params)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn encode_matmul_kernel(
         &self,
         encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
@@ -1740,7 +1955,8 @@ impl MetalBackend {
         right: &PreparedMatmulInput,
         output: &PreparedMatmulOutput,
         bindings: &mut ArgumentBindings,
-    ) -> Result<MetalBufferRef, BackendError> {
+        arguments: &mut ArgumentWriter,
+    ) -> Result<BufferBinding, BackendError> {
         use objc2_metal::{MTL4ComputeCommandEncoder, MTLSize};
 
         let shape = left.tensor.layout.shape();
@@ -1779,7 +1995,7 @@ impl MetalBackend {
         ] {
             params.extend_from_slice(&value.to_ne_bytes());
         }
-        let parameter_buffer = self.temporary_buffer(&params)?;
+        let parameter_buffer = arguments.write(&params)?;
         let launch = self.matmul_launch(MatmulShape {
             left_dtype: left.tensor.layout.dtype(),
             right_dtype: right.tensor.layout.dtype(),
@@ -1820,10 +2036,11 @@ impl MetalBackend {
         table: &ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>,
         tensor: &Tensor,
         bindings: &mut ArgumentBindings,
-        temporaries: &mut Vec<MetalBufferRef>,
+        temporaries: &mut Vec<BufferBinding>,
+        arguments: &mut ArgumentWriter,
     ) -> Result<PreparedMatmulInput, BackendError> {
         let source = self.encoder_tensor(tensor)?;
-        self.prepare_matmul_encoder_input(encoder, table, source, bindings, temporaries)
+        self.prepare_matmul_encoder_input(encoder, table, source, bindings, temporaries, arguments)
     }
 
     fn prepare_matmul_encoder_input(
@@ -1832,7 +2049,8 @@ impl MetalBackend {
         table: &ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>,
         source: EncoderTensor,
         bindings: &mut ArgumentBindings,
-        temporaries: &mut Vec<MetalBufferRef>,
+        temporaries: &mut Vec<BufferBinding>,
+        arguments: &mut ArgumentWriter,
     ) -> Result<PreparedMatmulInput, BackendError> {
         if let Some((column_major, leading_dimension, batch_stride)) =
             classify(&source.layout).kernel_strides()
@@ -1847,7 +2065,9 @@ impl MetalBackend {
         }
         let scratch = self.scratch_tensor(source.layout.dtype(), source.layout.shape())?;
         temporaries.push(scratch.buffer.clone());
-        temporaries.extend(self.encode_copy_tensors(encoder, table, &source, &scratch, bindings)?);
+        temporaries.extend(
+            self.encode_copy_tensors(encoder, table, &source, &scratch, bindings, arguments)?,
+        );
         let (column_major, leading_dimension, batch_stride) = classify(&scratch.layout)
             .kernel_strides()
             .ok_or(BackendError::ExecutionFailed)?;
@@ -1925,7 +2145,8 @@ impl MetalBackend {
         input: &EncoderTensor,
         output: &EncoderTensor,
         bindings: &mut ArgumentBindings,
-    ) -> Result<Vec<MetalBufferRef>, BackendError> {
+        arguments: &mut ArgumentWriter,
+    ) -> Result<Vec<BufferBinding>, BackendError> {
         use objc2_metal::{MTL4ComputeCommandEncoder, MTLSize};
 
         let kernel = if input.layout.is_contiguous() && output.layout.is_contiguous() {
@@ -1946,8 +2167,8 @@ impl MetalBackend {
             )?;
         encoder.setComputePipelineState(&pipeline);
         let layouts = vec![
-            self.layout_buffer(&input.layout)?,
-            self.layout_buffer(&output.layout)?,
+            Self::layout_buffer(&input.layout, arguments)?,
+            Self::layout_buffer(&output.layout, arguments)?,
         ];
         bindings.bind(table, 0, &input.buffer);
         bindings.bind(table, 1, &output.buffer);
@@ -1978,7 +2199,7 @@ impl MetalBackend {
             .lock()
             .map_err(|_| BackendError::ExecutionFailed)?;
         Ok(EncoderTensor {
-            buffer: buffers.get(tensor)?.raw.clone(),
+            buffer: BufferBinding::whole(buffers.get(tensor)?.raw.clone()),
             layout: tensor.layout().clone(),
         })
     }
@@ -1999,7 +2220,10 @@ impl MetalBackend {
             .ok_or(BackendError::AllocationFailed)?;
         let layout = Layout::contiguous(dtype, 0, shape.to_vec(), byte_len)
             .map_err(|_| BackendError::InvalidInput)?;
-        Ok(EncoderTensor { buffer, layout })
+        Ok(EncoderTensor {
+            buffer: BufferBinding::whole(buffer),
+            layout,
+        })
     }
 
     #[allow(clippy::cast_precision_loss)]
@@ -2010,7 +2234,8 @@ impl MetalBackend {
         dispatch: &Dispatch,
         theta: f32,
         bindings: &mut ArgumentBindings,
-    ) -> Result<Vec<Retained<ProtocolObject<dyn MTLBuffer>>>, BackendError> {
+        arguments: &mut ArgumentWriter,
+    ) -> Result<Vec<BufferBinding>, BackendError> {
         use objc2_metal::MTL4ComputeCommandEncoder;
 
         let [input, positions] = dispatch.inputs() else {
@@ -2044,18 +2269,18 @@ impl MetalBackend {
             })
             .collect::<Vec<_>>();
         let temporaries = vec![
-            self.layout_buffer(input.layout())?,
-            self.layout_buffer(positions.layout())?,
-            self.layout_buffer(output.layout())?,
-            self.temporary_buffer(&params)?,
-            self.temporary_buffer(&frequencies)?,
+            Self::layout_buffer(input.layout(), arguments)?,
+            Self::layout_buffer(positions.layout(), arguments)?,
+            Self::layout_buffer(output.layout(), arguments)?,
+            arguments.write(&params)?,
+            arguments.write(&frequencies)?,
         ];
         let buffers = self
             .buffers
             .lock()
             .map_err(|_| BackendError::ExecutionFailed)?;
         for (index, tensor) in [input, positions, output].into_iter().enumerate() {
-            bindings.bind(table, index, &buffers.get(tensor)?.raw);
+            bindings.bind_raw(table, index, &buffers.get(tensor)?.raw);
             bindings.bind(table, index + 3, &temporaries[index]);
         }
         bindings.bind(table, 6, &temporaries[3]);
@@ -2090,6 +2315,7 @@ impl MetalBackend {
         table: &ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>,
         dispatch: &Dispatch,
         bindings: &mut ArgumentBindings,
+        arguments: &mut ArgumentWriter,
     ) -> Result<EncodedEmbed, BackendError> {
         use objc2_metal::MTL4ComputeCommandEncoder;
 
@@ -2114,21 +2340,20 @@ impl MetalBackend {
         params[4..].copy_from_slice(&width.to_ne_bytes());
         let mut error_state = [0_u8; 8];
         error_state[4..].copy_from_slice(&u32::MAX.to_ne_bytes());
-        let error_flag = self.temporary_buffer(&error_state)?;
-        let error_address = error_flag.gpuAddress();
+        let error_flag = arguments.write(&error_state)?;
         let temporaries = vec![
-            self.layout_buffer(embeddings.layout())?,
-            self.layout_buffer(ids.layout())?,
-            self.layout_buffer(output.layout())?,
-            self.temporary_buffer(&params)?,
-            error_flag,
+            Self::layout_buffer(embeddings.layout(), arguments)?,
+            Self::layout_buffer(ids.layout(), arguments)?,
+            Self::layout_buffer(output.layout(), arguments)?,
+            arguments.write(&params)?,
+            error_flag.clone(),
         ];
         let buffers = self
             .buffers
             .lock()
             .map_err(|_| BackendError::ExecutionFailed)?;
         for (index, tensor) in [embeddings, ids, output].into_iter().enumerate() {
-            bindings.bind(table, index, &buffers.get(tensor)?.raw);
+            bindings.bind_raw(table, index, &buffers.get(tensor)?.raw);
             bindings.bind(table, index + 3, &temporaries[index]);
         }
         bindings.bind(table, 6, &temporaries[3]);
@@ -2150,7 +2375,7 @@ impl MetalBackend {
                 depth: 1,
             },
         );
-        Ok((temporaries, error_address))
+        Ok((temporaries, error_flag))
     }
 
     fn encode_softmax(
@@ -2159,13 +2384,14 @@ impl MetalBackend {
         table: &ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>,
         dispatch: &Dispatch,
         bindings: &mut ArgumentBindings,
-    ) -> Result<Vec<Retained<ProtocolObject<dyn MTLBuffer>>>, BackendError> {
+        arguments: &mut ArgumentWriter,
+    ) -> Result<Vec<BufferBinding>, BackendError> {
         let [input] = dispatch.inputs() else {
             return Err(BackendError::InvalidInput);
         };
         let input = self.encoder_tensor(input)?;
         let output = self.encoder_tensor(dispatch.output())?;
-        self.encode_softmax_tensors(encoder, table, &input, &output, bindings)
+        self.encode_softmax_tensors(encoder, table, &input, &output, bindings, arguments)
     }
 
     fn encode_softmax_tensors(
@@ -2175,7 +2401,8 @@ impl MetalBackend {
         input: &EncoderTensor,
         output: &EncoderTensor,
         bindings: &mut ArgumentBindings,
-    ) -> Result<Vec<MetalBufferRef>, BackendError> {
+        arguments: &mut ArgumentWriter,
+    ) -> Result<Vec<BufferBinding>, BackendError> {
         use objc2_metal::MTL4ComputeCommandEncoder;
 
         let width = *input
@@ -2199,9 +2426,9 @@ impl MetalBackend {
             .get(kernel, &constants)?;
         encoder.setComputePipelineState(&pipeline);
         let temporaries = vec![
-            self.layout_buffer(&input.layout)?,
-            self.layout_buffer(&output.layout)?,
-            self.temporary_buffer(&width.to_ne_bytes())?,
+            Self::layout_buffer(&input.layout, arguments)?,
+            Self::layout_buffer(&output.layout, arguments)?,
+            arguments.write(&width.to_ne_bytes())?,
         ];
         bindings.bind(table, 0, &input.buffer);
         bindings.bind(table, 1, &output.buffer);
@@ -2221,7 +2448,8 @@ impl MetalBackend {
         dispatch: &Dispatch,
         eps: f32,
         bindings: &mut ArgumentBindings,
-    ) -> Result<Vec<Retained<ProtocolObject<dyn MTLBuffer>>>, BackendError> {
+        arguments: &mut ArgumentWriter,
+    ) -> Result<Vec<BufferBinding>, BackendError> {
         use objc2_metal::MTL4ComputeCommandEncoder;
 
         let [input, weight] = dispatch.inputs() else {
@@ -2250,20 +2478,20 @@ impl MetalBackend {
             .get(kernel, &constants)?;
         encoder.setComputePipelineState(&pipeline);
         let mut temporaries = vec![
-            self.layout_buffer(input.layout())?,
-            self.layout_buffer(weight.layout())?,
-            self.layout_buffer(output.layout())?,
+            Self::layout_buffer(input.layout(), arguments)?,
+            Self::layout_buffer(weight.layout(), arguments)?,
+            Self::layout_buffer(output.layout(), arguments)?,
         ];
         let mut params = [0_u8; 8];
         params[..4].copy_from_slice(&eps.to_ne_bytes());
         params[4..].copy_from_slice(&width.to_ne_bytes());
-        temporaries.push(self.temporary_buffer(&params)?);
+        temporaries.push(arguments.write(&params)?);
         let buffers = self
             .buffers
             .lock()
             .map_err(|_| BackendError::ExecutionFailed)?;
         for (index, tensor) in [input, weight, output].into_iter().enumerate() {
-            bindings.bind(table, index, &buffers.get(tensor)?.raw);
+            bindings.bind_raw(table, index, &buffers.get(tensor)?.raw);
             bindings.bind(table, index + 3, &temporaries[index]);
         }
         bindings.bind(table, 6, &temporaries[3]);
@@ -2281,7 +2509,8 @@ impl MetalBackend {
         dispatch: &Dispatch,
         kernel: &str,
         bindings: &mut ArgumentBindings,
-    ) -> Result<Vec<Retained<ProtocolObject<dyn MTLBuffer>>>, BackendError> {
+        arguments: &mut ArgumentWriter,
+    ) -> Result<Vec<BufferBinding>, BackendError> {
         use objc2_metal::{MTL4ComputeCommandEncoder, MTLSize};
 
         let operands = dispatch
@@ -2312,7 +2541,7 @@ impl MetalBackend {
         encoder.setComputePipelineState(&pipeline);
         let layouts = operands
             .iter()
-            .map(|tensor| self.layout_buffer(tensor.layout()))
+            .map(|tensor| Self::layout_buffer(tensor.layout(), arguments))
             .collect::<Result<Vec<_>, _>>()?;
         let buffers = self
             .buffers
@@ -2320,7 +2549,7 @@ impl MetalBackend {
             .map_err(|_| BackendError::ExecutionFailed)?;
         for (index, tensor) in operands.iter().enumerate() {
             let buffer = buffers.get(tensor)?;
-            bindings.bind(table, index, &buffer.raw);
+            bindings.bind_raw(table, index, &buffer.raw);
             bindings.bind(table, index + operands.len(), &layouts[index]);
         }
         drop(buffers);
@@ -2344,43 +2573,163 @@ impl MetalBackend {
     }
 
     fn layout_buffer(
-        &self,
         layout: &Layout,
-    ) -> Result<Retained<ProtocolObject<dyn MTLBuffer>>, BackendError> {
+        arguments: &mut ArgumentWriter,
+    ) -> Result<BufferBinding, BackendError> {
         let bytes = encode_layout(layout)?;
-        self.temporary_buffer(&bytes)
+        arguments.write(&bytes)
     }
 
-    fn temporary_buffer(
-        &self,
-        bytes: &[u8],
-    ) -> Result<Retained<ProtocolObject<dyn MTLBuffer>>, BackendError> {
-        use objc2_metal::MTLResourceOptions;
-
-        let started = TEMPORARY_PROFILE.with(|profile| profile.get().map(|_| Instant::now()));
-        let buffer = self
-            .device
-            .newBufferWithLength_options(bytes.len(), MTLResourceOptions::StorageModeShared)
-            .ok_or(BackendError::AllocationFailed)?;
-        // SAFETY: `buffer` is a live shared allocation of exactly `bytes.len()` bytes and the
-        // source and destination do not overlap.
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                bytes.as_ptr(),
-                buffer.contents().cast::<u8>().as_ptr(),
-                bytes.len(),
-            );
-        }
-        if let Some(started) = started {
-            TEMPORARY_PROFILE.with(|profile| {
-                if let Some(mut timing) = profile.get() {
-                    timing.count = timing.count.saturating_add(1);
-                    timing.time = timing.time.saturating_add(started.elapsed());
-                    profile.set(Some(timing));
+    fn argument_capacity(&self, dispatches: &[Dispatch]) -> Result<usize, BackendError> {
+        let mut arguments = ArgumentSizer::default();
+        for dispatch in dispatches {
+            match dispatch.op() {
+                Op::Copy => Self::size_copy_arguments(&mut arguments)?,
+                Op::Add | Op::SiluMul => {
+                    for _ in 0..=dispatch.inputs().len() {
+                        arguments.write(112)?;
+                    }
                 }
-            });
+                Op::RmsNorm { .. } => {
+                    for len in [112, 112, 112, 8] {
+                        arguments.write(len)?;
+                    }
+                }
+                Op::Softmax => Self::size_softmax_arguments(&mut arguments)?,
+                Op::Rope { .. } => {
+                    for len in [112, 112, 112, 12] {
+                        arguments.write(len)?;
+                    }
+                    let width = dispatch
+                        .output()
+                        .layout()
+                        .shape()
+                        .last()
+                        .copied()
+                        .ok_or(BackendError::InvalidInput)?;
+                    let frequency_bytes = usize::try_from(width / 2)
+                        .map_err(|_| BackendError::AllocationFailed)?
+                        .checked_mul(size_of::<f32>())
+                        .ok_or(BackendError::AllocationFailed)?;
+                    arguments.write(frequency_bytes)?;
+                }
+                Op::Embed => {
+                    for len in [8, 112, 112, 112, 8] {
+                        arguments.write(len)?;
+                    }
+                }
+                Op::Matmul => Self::size_matmul_arguments(dispatch, &mut arguments)?,
+                Op::Sdpa { .. } => self.size_sdpa_arguments(dispatch, &mut arguments)?,
+            }
         }
-        Ok(buffer)
+        Ok(arguments.offset.max(1))
+    }
+
+    fn size_copy_arguments(arguments: &mut ArgumentSizer) -> Result<(), BackendError> {
+        arguments.write(112)?;
+        arguments.write(112)
+    }
+
+    fn size_softmax_arguments(arguments: &mut ArgumentSizer) -> Result<(), BackendError> {
+        arguments.write(112)?;
+        arguments.write(112)?;
+        arguments.write(size_of::<u32>())
+    }
+
+    fn size_matmul_arguments(
+        dispatch: &Dispatch,
+        arguments: &mut ArgumentSizer,
+    ) -> Result<(), BackendError> {
+        let [left, right] = dispatch.inputs() else {
+            return Err(BackendError::InvalidInput);
+        };
+        Self::size_prepared_matmul_input(left.layout(), arguments)?;
+        Self::size_prepared_matmul_input(right.layout(), arguments)?;
+        arguments.write(96)?;
+        if classify(dispatch.output().layout())
+            .kernel_strides()
+            .is_none_or(|(column_major, _, _)| column_major != 0)
+        {
+            Self::size_copy_arguments(arguments)?;
+        }
+        Ok(())
+    }
+
+    fn size_prepared_matmul_input(
+        layout: &Layout,
+        arguments: &mut ArgumentSizer,
+    ) -> Result<(), BackendError> {
+        if classify(layout).kernel_strides().is_none() {
+            Self::size_copy_arguments(arguments)?;
+        }
+        Ok(())
+    }
+
+    fn size_sdpa_arguments(
+        &self,
+        dispatch: &Dispatch,
+        arguments: &mut ArgumentSizer,
+    ) -> Result<(), BackendError> {
+        if select_sdpa(dispatch)? != SdpaKernel::Decomposed {
+            return arguments.write(172);
+        }
+        let [query, key, value] = dispatch.inputs() else {
+            return Err(BackendError::InvalidInput);
+        };
+        let query = self.encoder_tensor(query)?;
+        let key = self.encoder_tensor(key)?;
+        let value = self.encoder_tensor(value)?;
+        let output = self.encoder_tensor(dispatch.output())?;
+        let [query_heads, query_length, _] = shape3(&query.layout)?;
+        let [kv_heads, key_length, _] = shape3(&key.layout)?;
+        let heads_per_group = query_heads
+            .checked_div(kv_heads)
+            .ok_or(BackendError::InvalidInput)?;
+        let scores_layout = Layout::contiguous(
+            DType::F32,
+            0,
+            vec![query_heads, query_length, key_length],
+            u64::from(query_heads)
+                .checked_mul(u64::from(query_length))
+                .and_then(|count| count.checked_mul(u64::from(key_length)))
+                .and_then(|count| count.checked_mul(DType::F32.byte_size()))
+                .ok_or(BackendError::AllocationFailed)?,
+        )
+        .map_err(|_| BackendError::InvalidInput)?;
+        let scores = EncoderTensor {
+            buffer: query.buffer.clone(),
+            layout: scores_layout,
+        };
+        for kv_head in 0..kv_heads {
+            let first_head = kv_head
+                .checked_mul(heads_per_group)
+                .ok_or(BackendError::InvalidInput)?;
+            let query_group = head_group(&query, first_head, heads_per_group)?;
+            let key_head = head_matrix(&key, kv_head, true)?;
+            Self::size_prepared_matmul_input(&query_group.layout, arguments)?;
+            Self::size_prepared_matmul_input(&key_head.layout, arguments)?;
+            arguments.write(96)?;
+        }
+        arguments.write(24)?;
+        Self::size_softmax_arguments(arguments)?;
+        for kv_head in 0..kv_heads {
+            let first_head = kv_head
+                .checked_mul(heads_per_group)
+                .ok_or(BackendError::InvalidInput)?;
+            let score_group = head_group(&scores, first_head, heads_per_group)?;
+            let value_head = head_matrix(&value, kv_head, false)?;
+            Self::size_prepared_matmul_input(&score_group.layout, arguments)?;
+            Self::size_prepared_matmul_input(&value_head.layout, arguments)?;
+            arguments.write(96)?;
+            let output_group = head_group(&output, first_head, heads_per_group)?;
+            if classify(&output_group.layout)
+                .kernel_strides()
+                .is_none_or(|(column_major, _, _)| column_major != 0)
+            {
+                Self::size_copy_arguments(arguments)?;
+            }
+        }
+        Ok(())
     }
 
     fn begin_command_buffer(
@@ -2430,6 +2779,7 @@ impl MetalBackend {
             temporaries,
             error_flags,
             bindings,
+            arguments,
         } = encoded;
         let mut indices = HashMap::<u64, usize>::new();
         let mut owned = Vec::<InFlightBuffer>::new();
@@ -2452,19 +2802,36 @@ impl MetalBackend {
             }
         }
         for temporary in temporaries {
-            add(temporary, false);
+            add(temporary.raw, false);
         }
         let error_flags = error_flags
             .iter()
-            .map(|address| {
+            .map(|flag| {
                 indices
-                    .get(address)
+                    .get(&flag.raw.gpuAddress())
                     .copied()
+                    .map(|index| (index, flag.offset))
                     .ok_or(BackendError::ExecutionFailed)
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let owned_addresses = indices.keys().copied().collect::<HashSet<_>>();
-        debug_assert_eq!(bindings.addresses, owned_addresses);
+        for binding in bindings.ranges {
+            let offset =
+                u64::try_from(binding.offset).map_err(|_| BackendError::ExecutionFailed)?;
+            if !indices.contains_key(&binding.base)
+                || binding.base.checked_add(offset) != Some(binding.address)
+            {
+                return Err(BackendError::ExecutionFailed);
+            }
+            if arguments
+                .as_ref()
+                .is_some_and(|usage| usage.base == binding.base)
+                && !arguments
+                    .as_ref()
+                    .is_some_and(|usage| usage.written.contains(&(binding.offset, binding.len)))
+            {
+                return Err(BackendError::ExecutionFailed);
+            }
+        }
         Ok(CommandResources {
             buffers: owned,
             error_flags,
@@ -2590,24 +2957,6 @@ fn shape3(layout: &Layout) -> Result<[u32; 3], BackendError> {
         .shape()
         .try_into()
         .map_err(|_| BackendError::InvalidInput)
-}
-
-fn argument_capacity(dispatches: &[Dispatch]) -> Result<usize, BackendError> {
-    let base = dispatches
-        .len()
-        .max(1)
-        .checked_mul(4096)
-        .ok_or(BackendError::AllocationFailed)?;
-    let rope = dispatches.iter().try_fold(0_usize, |total, dispatch| {
-        if !matches!(dispatch.op(), Op::Rope { .. }) {
-            return Some(total);
-        }
-        let width = usize::try_from(*dispatch.output().layout().shape().last()?).ok()?;
-        total.checked_add(width.checked_mul(2)?)
-    });
-    base.checked_add(rope.ok_or(BackendError::AllocationFailed)?)
-        .and_then(|bytes| bytes.checked_next_multiple_of(4096))
-        .ok_or(BackendError::AllocationFailed)
 }
 
 fn vector_sdpa_supported(dispatch: &Dispatch) -> Result<bool, BackendError> {
@@ -2967,12 +3316,111 @@ mod tests {
         backend.in_flight.drain_done();
         assert_eq!(backend.in_flight.len(), 0);
         assert_eq!(backend.in_flight.pooled_len(), 1);
-        let address = backend.in_flight.pool.lock().unwrap()[0]
-            .argument_buffer
-            .raw
-            .gpuAddress();
-        let objects = backend.in_flight.checkout(&backend.device, 4096).unwrap();
+        let pool = backend.in_flight.pool.lock().unwrap();
+        let capacity = pool[0].argument_buffer.capacity;
+        let address = pool[0].argument_buffer.raw.gpuAddress();
+        drop(pool);
+        let objects = backend
+            .in_flight
+            .checkout(&backend.device, capacity)
+            .unwrap();
         assert_eq!(objects.argument_buffer().unwrap().raw.gpuAddress(), address);
+    }
+
+    #[test]
+    fn command_resources_reject_unowned_and_unwritten_bindings() {
+        let backend = MetalBackend::new().unwrap();
+        let raw = backend
+            .device
+            .newBufferWithLength_options(64, MTLResourceOptions::StorageModeShared)
+            .unwrap();
+        let base = raw.gpuAddress();
+        let unowned = EncodedDispatches {
+            temporaries: Vec::new(),
+            error_flags: Vec::new(),
+            bindings: ArgumentBindings {
+                ranges: HashSet::from([BoundRange {
+                    base,
+                    offset: 0,
+                    len: 8,
+                    address: base,
+                }]),
+            },
+            arguments: None,
+        };
+        assert!(matches!(
+            backend.command_resources(&[], unowned),
+            Err(BackendError::ExecutionFailed)
+        ));
+
+        let unwritten = EncodedDispatches {
+            temporaries: vec![BufferBinding::whole(raw)],
+            error_flags: Vec::new(),
+            bindings: ArgumentBindings {
+                ranges: HashSet::from([BoundRange {
+                    base,
+                    offset: 16,
+                    len: 8,
+                    address: base + 16,
+                }]),
+            },
+            arguments: Some(ArgumentUsage {
+                base,
+                written: HashSet::from([(0, 8)]),
+            }),
+        };
+        assert!(matches!(
+            backend.command_resources(&[], unwritten),
+            Err(BackendError::ExecutionFailed)
+        ));
+    }
+
+    #[test]
+    fn decomposed_attention_submission_uses_exact_argument_capacity() {
+        let _override = SdpaOverride::set(SdpaKernel::Decomposed);
+        let backend = MetalBackend::new().unwrap();
+        let mut commands = CommandList::new();
+        let mut tensors = Vec::new();
+        for _ in 0..4 {
+            let query = backend.alloc(DType::F32, &[16, 7, 128]).unwrap();
+            let key_cache = backend.alloc(DType::F32, &[8, 33, 256]).unwrap();
+            let value_cache = backend.alloc(DType::F32, &[8, 33, 256]).unwrap();
+            let output = backend.alloc(DType::F32, &[16, 7, 128]).unwrap();
+            let slices = vec![
+                Slice::new(0, 8, 1).unwrap(),
+                Slice::new(0, 33, 1).unwrap(),
+                Slice::new(0, 128, 2).unwrap(),
+            ];
+            let key = backend
+                .view(&key_cache, ViewOp::Slice(slices.clone()))
+                .unwrap();
+            let value = backend.view(&value_cache, ViewOp::Slice(slices)).unwrap();
+            commands
+                .dispatch(
+                    Op::Sdpa {
+                        scale: 128.0_f32.sqrt().recip(),
+                        causal: true,
+                        q_start: 0,
+                    },
+                    &[&query, &key, &value],
+                    &output,
+                )
+                .unwrap();
+            tensors.extend([query, key_cache, value_cache, output]);
+        }
+        let capacity = backend
+            .argument_capacity(&commands.clone().into_dispatches())
+            .unwrap();
+        assert!(capacity > 4096);
+        backend.submit(commands).unwrap().wait().unwrap();
+        backend.in_flight.drain_done();
+        assert_eq!(
+            backend.in_flight.pool.lock().unwrap()[0]
+                .argument_buffer
+                .capacity,
+            capacity
+        );
+        drop(tensors);
     }
 
     #[test]
@@ -3054,7 +3502,7 @@ mod tests {
         assert_eq!(profile.per_dispatch[0].op, Op::Add);
         assert!(profile.gpu_time > Duration::ZERO);
         assert!(profile.per_dispatch[0].gpu_time > Duration::ZERO);
-        assert!(profile.metadata_buffers.count >= 3);
+        assert_eq!(profile.metadata_buffers.count, 1);
     }
 
     #[test]
@@ -3204,10 +3652,18 @@ mod tests {
         let output_buffer = backend.encoder_tensor(&output).unwrap();
         let scratch = backend.scratch_tensor(DType::F32, &[33]).unwrap();
         let mut bindings = ArgumentBindings::default();
+        let mut arguments = ArgumentWriter::new(objects.argument_buffer().unwrap());
         let mut temporaries = vec![scratch.buffer.clone()];
         temporaries.extend(
             backend
-                .encode_copy_tensors(&encoder, table, &source_buffer, &scratch, &mut bindings)
+                .encode_copy_tensors(
+                    &encoder,
+                    table,
+                    &source_buffer,
+                    &scratch,
+                    &mut bindings,
+                    &mut arguments,
+                )
                 .unwrap(),
         );
         encoder.barrierAfterEncoderStages_beforeEncoderStages_visibilityOptions(
@@ -3217,9 +3673,17 @@ mod tests {
         );
         temporaries.extend(
             backend
-                .encode_copy_tensors(&encoder, table, &scratch, &output_buffer, &mut bindings)
+                .encode_copy_tensors(
+                    &encoder,
+                    table,
+                    &scratch,
+                    &output_buffer,
+                    &mut bindings,
+                    &mut arguments,
+                )
                 .unwrap(),
         );
+        temporaries.push(BufferBinding::whole(arguments.raw.clone()));
         encoder.endEncoding();
         let tensors = [source.clone(), output.clone()];
         let resources = backend
@@ -3229,6 +3693,10 @@ mod tests {
                     temporaries,
                     error_flags: Vec::new(),
                     bindings,
+                    arguments: Some(ArgumentUsage {
+                        base: arguments.raw.gpuAddress(),
+                        written: arguments.written.iter().copied().collect(),
+                    }),
                 },
             )
             .unwrap();
