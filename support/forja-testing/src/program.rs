@@ -68,6 +68,26 @@ pub fn well_typed_programs(max_instructions: usize) -> impl Strategy<Value = Pro
         })
 }
 
+/// Builds one deterministic well-typed case from a seed.
+#[must_use]
+pub fn case_from_seed(seed: u64, max_instructions: usize) -> ProgramCase {
+    let max_instructions = max_instructions.clamp(BASE_ROW_LEN, MAX_INSTRUCTIONS);
+    let mut state = seed.max(1);
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let row = next() & 1 != 0;
+    let shape_word = next();
+    let output_count = usize::try_from(next() % 4 + 1).unwrap_or(1);
+    let words = (0..max_instructions.max(16))
+        .map(|_| next())
+        .collect::<Vec<_>>();
+    build_case(row, shape_word, output_count, &words, max_instructions)
+}
+
 fn build_case(
     row: bool,
     shape_word: u64,

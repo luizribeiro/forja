@@ -27,6 +27,24 @@ pub struct TensorSpec {
 }
 
 impl TensorSpec {
+    /// Returns the allocation element type.
+    #[must_use]
+    pub const fn dtype(&self) -> DType {
+        self.dtype
+    }
+
+    /// Returns the shape of the underlying allocation.
+    #[must_use]
+    pub fn allocation_shape(&self) -> &[u32] {
+        &self.allocation_shape
+    }
+
+    /// Returns the metadata-only views applied in order.
+    #[must_use]
+    pub fn views(&self) -> &[ViewOp] {
+        &self.views
+    }
+
     /// Describes a contiguous tensor.
     #[must_use]
     pub fn contiguous(dtype: DType, shape: &[u32]) -> Self {
@@ -100,6 +118,18 @@ impl TensorSpec {
             initialized: Some(bytes),
         }
     }
+}
+
+/// Generates deterministic encoded allocation bytes for a tensor specification.
+///
+/// # Errors
+///
+/// Returns an error when the allocation size exceeds addressable memory.
+pub fn generated_tensor_bytes(
+    spec: &TensorSpec,
+    values: &mut DeterministicValues,
+) -> Result<Vec<u8>, AgreementError> {
+    generated_bytes(spec, values)
 }
 
 /// A deterministic xorshift64 value source.

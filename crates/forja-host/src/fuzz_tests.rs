@@ -1,13 +1,25 @@
-use std::time::Duration;
+use std::{
+    fs,
+    sync::atomic::{AtomicU64, Ordering},
+    time::Duration,
+};
 
-use forja_core::Backend;
-use forja_testing::assert_outputs_agree;
+use forja_core::{
+    Backend, CommandList, DType, Submission, Tensor, ViewOp,
+    program::{BinOp, Inst, Program, ProgramKind, RedOp, UnOp, ValueType},
+};
+use forja_testing::{
+    DeterministicValues, TensorSpec, assert_outputs_agree, generated_tensor_bytes,
+    program::case_from_seed,
+};
 use wasmtime::component::Resource;
 
 use super::{
-    CommandListEntry, Host, Limits, TensorEntry, bindings::l9o::gpu::compute, core_dtype,
+    CommandListEntry, Grants, Host, Limits, TensorEntry, bindings::l9o::gpu::compute, core_dtype,
     guest_error,
 };
+
+static NEXT_PROGRAM_WEIGHT: AtomicU64 = AtomicU64::new(0);
 
 const FUZZ_LIMITS: Limits = Limits::new(8 * 1024 * 1024, 8, 1_000_000, 128, 8 * 1024 * 1024)
     .with_command_limits(16, 1_000_000_000)
@@ -75,6 +87,34 @@ impl Coverage {
         assert!(self.accepted_dispatches * 5 >= self.dispatch_attempts);
         assert!(self.successful_submits >= cases);
         assert!(self.compared_reads * 10 >= cases);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ProgramCoverage {
+    accepted_dispatches: usize,
+    aliasing_refusals: usize,
+    read_only_refusals: usize,
+    compared_reads: usize,
+}
+
+impl ProgramCoverage {
+    fn assert_sufficient(self, cases: usize) {
+        println!(
+            "WIT program fuzz coverage: {} accepted, {} aliasing refusals, {} read-only refusals, {} compared reads",
+            self.accepted_dispatches,
+            self.aliasing_refusals,
+            self.read_only_refusals,
+            self.compared_reads,
+        );
+        assert_eq!(
+            self.accepted_dispatches + self.aliasing_refusals + self.read_only_refusals,
+            cases
+        );
+        assert!(self.accepted_dispatches * 4 >= cases * 3);
+        assert!(self.aliasing_refusals * 8 >= cases);
+        assert!(self.read_only_refusals * 8 >= cases);
+        assert!(self.compared_reads >= self.accepted_dispatches);
     }
 }
 
@@ -643,12 +683,270 @@ fn error_kind(error: &compute::Error) -> ErrorKind {
     }
 }
 
+async fn run_program_case(seed: u64, coverage: &mut ProgramCoverage) {
+    let case = case_from_seed(seed, 64);
+    let program = case.program().clone();
+    let validated = program.validate().unwrap();
+    let path = program_weight_file(&case.outputs()[0]);
+    let grants = Grants::new().with_weights("program-output", &path);
+    let mut host = Host::with_grants(forja_cpu::CpuBackend::new(), FUZZ_LIMITS, grants);
+    let reference = forja_cpu::CpuBackend::new();
+    let mut values = DeterministicValues::new(seed ^ 0x6a09_e667_f3bc_c909);
+    let input_bytes = case
+        .inputs()
+        .iter()
+        .map(|spec| generated_tensor_bytes(spec, &mut values).unwrap())
+        .collect::<Vec<_>>();
+    let host_inputs = case
+        .inputs()
+        .iter()
+        .zip(&input_bytes)
+        .map(|(spec, bytes)| allocate_host_program_tensor(&mut host, spec, Some(bytes)))
+        .collect::<Vec<_>>();
+    let reference_inputs = case
+        .inputs()
+        .iter()
+        .zip(&input_bytes)
+        .map(|(spec, bytes)| allocate_reference_program_tensor(&reference, spec, Some(bytes)))
+        .collect::<Vec<_>>();
+    let mut host_outputs = case
+        .outputs()
+        .iter()
+        .map(|spec| allocate_host_program_tensor(&mut host, spec, None))
+        .collect::<Vec<_>>();
+    let reference_outputs = case
+        .outputs()
+        .iter()
+        .map(|spec| allocate_reference_program_tensor(&reference, spec, None))
+        .collect::<Vec<_>>();
+    let binding = seed % 8;
+    if binding == 0 {
+        host_outputs[0] = Resource::new_borrow(host_inputs[0].rep());
+    } else if binding == 1 {
+        let weights = host.open_weights("program-output").unwrap();
+        host_outputs[0] = host.weight_tensor(&weights, "value").unwrap();
+    }
+    let commands = host.command_list().unwrap();
+    let result =
+        host.dispatch_program(&commands, wit_program(program), &host_inputs, &host_outputs);
+    if binding == 0 {
+        assert!(matches!(result, Err(compute::Error::OpSignature(_))));
+        coverage.aliasing_refusals += 1;
+        drop(host);
+        fs::remove_file(path).unwrap();
+        return;
+    }
+    if binding == 1 {
+        assert!(matches!(result, Err(compute::Error::OpSignature(_))));
+        coverage.read_only_refusals += 1;
+        drop(host);
+        fs::remove_file(path).unwrap();
+        return;
+    }
+    result.unwrap();
+    coverage.accepted_dispatches += 1;
+    host.prepare_submit(commands).unwrap().run().await.unwrap();
+
+    let mut commands = CommandList::new();
+    commands
+        .dispatch_program(
+            &validated,
+            &reference_inputs.iter().collect::<Vec<_>>(),
+            &reference_outputs.iter().collect::<Vec<_>>(),
+        )
+        .unwrap();
+    reference.submit(commands).unwrap().wait().unwrap();
+    for ((host_output, reference_output), spec) in host_outputs
+        .iter()
+        .zip(&reference_outputs)
+        .zip(case.outputs())
+    {
+        let actual = host.prepare_read(host_output).unwrap().run().await.unwrap();
+        let expected = reference.read(reference_output).unwrap();
+        assert_outputs_agree(spec.dtype(), &expected, &actual).unwrap();
+        coverage.compared_reads += 1;
+    }
+    drop(host);
+    fs::remove_file(path).unwrap();
+}
+
+fn allocate_host_program_tensor(
+    host: &mut Host<forja_cpu::CpuBackend>,
+    spec: &TensorSpec,
+    bytes: Option<&[u8]>,
+) -> Resource<TensorEntry> {
+    let mut tensor = host
+        .alloc(guest_dtype(spec.dtype()), spec.allocation_shape())
+        .unwrap();
+    if let Some(bytes) = bytes {
+        host.write(&tensor, bytes).unwrap();
+    }
+    for view in spec.views() {
+        tensor = host
+            .view(&Resource::new_borrow(tensor.rep()), wit_view(view))
+            .unwrap();
+    }
+    tensor
+}
+
+fn allocate_reference_program_tensor(
+    backend: &forja_cpu::CpuBackend,
+    spec: &TensorSpec,
+    bytes: Option<&[u8]>,
+) -> Tensor {
+    let mut tensor = backend
+        .alloc(spec.dtype(), spec.allocation_shape())
+        .unwrap();
+    if let Some(bytes) = bytes {
+        backend.write(&tensor, bytes).unwrap();
+    }
+    for view in spec.views() {
+        tensor = backend.view(&tensor, view.clone()).unwrap();
+    }
+    tensor
+}
+
+fn wit_view(view: &ViewOp) -> compute::ViewOp {
+    match view {
+        ViewOp::Slice(slices) => compute::ViewOp::Slice(
+            slices
+                .iter()
+                .map(|&slice| compute::SliceSpec {
+                    start: slice.start(),
+                    len: slice.len(),
+                    step: slice.step(),
+                })
+                .collect(),
+        ),
+        ViewOp::Reshape(shape) => compute::ViewOp::Reshape(shape.clone()),
+        ViewOp::Permute(axes) => compute::ViewOp::Permute(axes.clone()),
+        ViewOp::Broadcast(shape) => compute::ViewOp::Broadcast(shape.clone()),
+    }
+}
+
+fn program_weight_file(spec: &TensorSpec) -> std::path::PathBuf {
+    let byte_len =
+        element_count(spec.allocation_shape()) * usize::try_from(spec.dtype().byte_size()).unwrap();
+    let dtype = match spec.dtype() {
+        DType::F32 => "F32",
+        DType::F16 => "F16",
+        DType::BF16 => "BF16",
+        DType::I32 | DType::U32 => unreachable!("program outputs are floating point"),
+    };
+    let shape = spec.allocation_shape();
+    let mut header = format!(
+        "{{\"value\":{{\"dtype\":\"{dtype}\",\"shape\":{shape:?},\"data_offsets\":[0,{byte_len}]}}}}"
+    )
+    .into_bytes();
+    while !(header.len() + 8).is_multiple_of(8) {
+        header.push(b' ');
+    }
+    let mut bytes = u64::try_from(header.len()).unwrap().to_le_bytes().to_vec();
+    bytes.extend(header);
+    bytes.resize(bytes.len() + byte_len, 0);
+    let path = std::env::temp_dir().join(format!(
+        "forja-program-fuzz-{}-{}",
+        std::process::id(),
+        NEXT_PROGRAM_WEIGHT.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::write(&path, bytes).unwrap();
+    path
+}
+
+fn wit_program(program: Program) -> compute::Program {
+    compute::Program {
+        kind: match program.kind {
+            ProgramKind::Map => compute::ProgramKind::Map,
+            ProgramKind::Row => compute::ProgramKind::Row,
+        },
+        insts: program.insts.into_iter().map(wit_inst).collect(),
+        outputs: program.outputs,
+    }
+}
+
+fn wit_inst(inst: Inst) -> compute::Inst {
+    match inst {
+        Inst::Input(slot) => compute::Inst::Input(slot),
+        Inst::Const(value) => compute::Inst::Const(value),
+        Inst::Index(axis) => compute::Inst::Index(axis),
+        Inst::Extent(axis) => compute::Inst::Extent(axis),
+        Inst::Unary(op, value) => compute::Inst::Unary((wit_unop(op), value)),
+        Inst::Binary(op, left, right) => compute::Inst::Binary((wit_binop(op), left, right)),
+        Inst::Select(condition, accepted, rejected) => {
+            compute::Inst::Select((condition, accepted, rejected))
+        }
+        Inst::Cast(to, value) => compute::Inst::Cast((wit_value_type(to), value)),
+        Inst::Reduce(op, value) => compute::Inst::Reduce((wit_redop(op), value)),
+    }
+}
+
+fn wit_unop(op: UnOp) -> compute::Unop {
+    match op {
+        UnOp::Neg => compute::Unop::Neg,
+        UnOp::Abs => compute::Unop::Abs,
+        UnOp::Exp => compute::Unop::Exp,
+        UnOp::Log => compute::Unop::Log,
+        UnOp::Sqrt => compute::Unop::Sqrt,
+        UnOp::Rsqrt => compute::Unop::Rsqrt,
+        UnOp::Sin => compute::Unop::Sin,
+        UnOp::Cos => compute::Unop::Cos,
+        UnOp::Tanh => compute::Unop::Tanh,
+        UnOp::Sigmoid => compute::Unop::Sigmoid,
+        UnOp::Recip => compute::Unop::Recip,
+        UnOp::Floor => compute::Unop::Floor,
+    }
+}
+
+fn wit_binop(op: BinOp) -> compute::Binop {
+    match op {
+        BinOp::Add => compute::Binop::Add,
+        BinOp::Sub => compute::Binop::Sub,
+        BinOp::Mul => compute::Binop::Mul,
+        BinOp::Div => compute::Binop::Div,
+        BinOp::Min => compute::Binop::Min,
+        BinOp::Max => compute::Binop::Max,
+        BinOp::Pow => compute::Binop::Pow,
+        BinOp::Lt => compute::Binop::Lt,
+        BinOp::Le => compute::Binop::Le,
+        BinOp::Eq => compute::Binop::Eq,
+        BinOp::Ne => compute::Binop::Ne,
+        BinOp::Ge => compute::Binop::Ge,
+        BinOp::Gt => compute::Binop::Gt,
+    }
+}
+
+const fn wit_redop(op: RedOp) -> compute::Redop {
+    match op {
+        RedOp::Sum => compute::Redop::Sum,
+        RedOp::Max => compute::Redop::Max,
+        RedOp::Min => compute::Redop::Min,
+    }
+}
+
+const fn wit_value_type(value_type: ValueType) -> compute::ValueType {
+    match value_type {
+        ValueType::F32 => compute::ValueType::F32,
+        ValueType::U32 => compute::ValueType::U32,
+        ValueType::Bool => compute::ValueType::Bool,
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn fuzzed_cpu_wit_sequences_match_the_reference() {
     let cases = 16;
     run_cases::<forja_cpu::CpuBackend, _>(cases, 64, forja_cpu::CpuBackend::new)
         .await
         .assert_sufficient(cases);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn fuzzed_wit_programs_match_the_direct_interpreter() {
+    let cases = 32;
+    let mut coverage = ProgramCoverage::default();
+    for seed in 1..=32 {
+        run_program_case(seed, &mut coverage).await;
+    }
+    coverage.assert_sufficient(cases);
 }
 
 #[cfg(target_os = "macos")]
