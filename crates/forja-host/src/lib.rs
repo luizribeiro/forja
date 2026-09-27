@@ -21,8 +21,8 @@ use forja_core::{
     Backend, BackendError, CommandList, DType, Layout, LayoutError, Op, OpError, Slice, Submission,
     Tensor, ViewOp,
 };
-use wasmtime::component::{Accessor, HasData, Linker, Resource, ResourceTable};
-use wasmtime::{Engine, Store, StoreLimits, StoreLimitsBuilder};
+use wasmtime::component::{Accessor, Component, HasData, Linker, Resource, ResourceTable};
+use wasmtime::{Config, Engine, Store, StoreLimits, StoreLimitsBuilder};
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
 pub use native::{NativeCommandList, NativeHost, NativeTensor};
@@ -44,7 +44,169 @@ pub mod bindings {
     });
 }
 
+/// Bindings for components implementing the engine contract.
+#[allow(missing_docs)]
+pub mod engine_bindings {
+    wasmtime::component::bindgen!({
+        path: "../../wit",
+        world: "engine-component",
+        imports: { default: async | trappable },
+        exports: { default: async },
+        require_store_data_send: true,
+        with: {
+            "l9o:gpu/compute": crate::bindings::l9o::gpu::compute,
+        },
+    });
+}
+
 use bindings::l9o::gpu::compute;
+
+/// Static metadata declared by an engine component.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EngineInfo {
+    /// Logit vector length.
+    pub vocab: u32,
+    /// Largest accepted token position.
+    pub max_context: u32,
+    /// Layers whose hidden states can be returned by a step.
+    pub tap_layers: Vec<u32>,
+}
+
+/// Input to one unbatched engine invocation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EngineStep {
+    /// Token ids processed by this invocation.
+    pub tokens: Vec<u32>,
+    /// Position of the first token.
+    pub start_pos: u32,
+    /// Whether declared hidden-state taps should be returned.
+    pub taps: bool,
+}
+
+/// A tensor returned by a component and retained by its runner.
+#[derive(Debug)]
+pub struct EngineTensor(Resource<TensorEntry>);
+
+/// Device-resident outputs from one engine invocation.
+#[derive(Debug)]
+pub struct EngineOutput {
+    /// Last-position logits with shape `[vocab]`.
+    pub logits: EngineTensor,
+    /// Requested per-layer hidden states.
+    pub taps: Vec<EngineTensor>,
+}
+
+/// An instantiated engine component and its host resources.
+pub struct EngineRunner<B: Backend + Send + Sync + 'static> {
+    store: Store<Host<B>>,
+    instance: engine_bindings::EngineComponent,
+}
+
+impl<B> EngineRunner<B>
+where
+    B: Backend + Send + Sync + 'static,
+{
+    /// Instantiates a component and gives it access to one safetensors file.
+    ///
+    /// # Errors
+    ///
+    /// Returns component compilation, linking, instantiation, or grant errors.
+    pub async fn new(
+        component_path: &Path,
+        backend: B,
+        limits: Limits,
+        weights_path: impl Into<PathBuf>,
+    ) -> wasmtime::Result<Self> {
+        let mut config = Config::new();
+        config.wasm_component_model_async(true);
+        config.concurrency_support(true);
+        let engine = Engine::new(&config)?;
+        let component = Component::from_file(&engine, component_path)?;
+        let mut linker = Linker::new(&engine);
+        add_engine_to_linker(&mut linker)?;
+        let grants = Grants::new().with_weights("engine", weights_path);
+        let mut store = Host::new_store_with_grants(&engine, backend, limits, grants);
+        let instance =
+            engine_bindings::EngineComponent::instantiate_async(&mut store, &component, &linker)
+                .await?;
+        Ok(Self { store, instance })
+    }
+
+    /// Returns the engine's static metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns a component execution error.
+    pub async fn describe(&mut self) -> wasmtime::Result<EngineInfo> {
+        let info = self
+            .instance
+            .l9o_gpu_engine()
+            .call_describe(&mut self.store)
+            .await?;
+        Ok(EngineInfo {
+            vocab: info.vocab,
+            max_context: info.max_context,
+            tap_layers: info.tap_layers,
+        })
+    }
+
+    /// Opens the configured weight grant and asks the engine to load it.
+    ///
+    /// # Errors
+    ///
+    /// Returns a host, component, or engine loading error.
+    pub async fn load(&mut self) -> wasmtime::Result<Result<(), compute::Error>> {
+        let weights = self
+            .store
+            .data_mut()
+            .open_weights("engine")
+            .map_err(wasmtime::Error::msg)?;
+        self.instance
+            .l9o_gpu_engine()
+            .call_load(&mut self.store, weights)
+            .await
+    }
+
+    /// Runs one engine invocation and retains its device tensors.
+    ///
+    /// # Errors
+    ///
+    /// Returns a component execution error or the engine's structured failure.
+    pub async fn step(
+        &mut self,
+        input: EngineStep,
+    ) -> wasmtime::Result<Result<EngineOutput, compute::Error>> {
+        use engine_bindings::exports::l9o::gpu::engine::{StepIn, StepOut};
+        let output = self
+            .instance
+            .l9o_gpu_engine()
+            .call_step(
+                &mut self.store,
+                &StepIn {
+                    tokens: input.tokens,
+                    start_pos: input.start_pos,
+                    taps: input.taps,
+                },
+            )
+            .await?;
+        Ok(output.map(|StepOut { logits, taps }| EngineOutput {
+            logits: EngineTensor(logits),
+            taps: taps.into_iter().map(EngineTensor).collect(),
+        }))
+    }
+
+    /// Reads a returned tensor through the selected backend.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-handle or backend read failure.
+    pub async fn read(&mut self, tensor: &EngineTensor) -> Result<Vec<u8>, compute::Error> {
+        match self.store.data().prepare_read(&tensor.0) {
+            Ok(request) => request.run().await.map_err(guest_error),
+            Err(error) => Err(error),
+        }
+    }
+}
 
 /// Resource limits applied before backend work or component allocation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -993,6 +1155,14 @@ where
 {
     add_wasi_to_linker(linker)?;
     bindings::Host_::add_to_linker::<Host<B>, HostBindings<B>>(linker, |host| host)
+}
+
+fn add_engine_to_linker<B>(linker: &mut Linker<Host<B>>) -> wasmtime::Result<()>
+where
+    B: Backend + Send + Sync + 'static,
+{
+    add_wasi_to_linker(linker)?;
+    engine_bindings::EngineComponent::add_to_linker::<Host<B>, HostBindings<B>>(linker, |host| host)
 }
 
 fn core_dtype(dtype: compute::Dtype) -> DType {

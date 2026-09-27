@@ -1,0 +1,33 @@
+package l9o:gpu@0.1.0;
+
+interface engine {
+  use compute.{error, tensor, weights};
+
+  record engine-info {
+    vocab: u32,
+    max-context: u32,
+    tap-layers: list<u32>,
+  }
+
+  record step-in {
+    tokens: list<u32>,
+    start-pos: u32,
+    taps: bool,
+  }
+
+  record step-out {
+    logits: tensor,
+    taps: list<tensor>,
+  }
+
+  describe: func() -> engine-info;
+  load: func(w: borrow<weights>) -> result<_, error>;
+  step: func(input: step-in) -> result<step-out, error>;
+}
+
+// This initial contract uses one sequence and engine-owned cache tensors.
+// Paged caches, batches, and drafting replace it in the serving interface.
+world engine-component {
+  import compute;
+  export engine;
+}

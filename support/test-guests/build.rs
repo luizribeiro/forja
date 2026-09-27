@@ -19,6 +19,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let release_dir = guest_target_dir.join("wasm32-wasip2/release");
     emit_guest_path("HELLO_COMPONENT", &release_dir.join("hello.wasm"));
     emit_guest_path(
+        "ENGINE_SMOKE_COMPONENT",
+        &release_dir.join("engine_smoke.wasm"),
+    );
+    emit_guest_path(
         "RMSNORM_SMOKE_COMPONENT",
         &release_dir.join("rmsnorm_smoke.wasm"),
     );

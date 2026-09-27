@@ -3,6 +3,12 @@
 
 use std::path::Path;
 
+/// Returns the path to the minimal engine component.
+#[must_use]
+pub fn engine_smoke() -> &'static Path {
+    Path::new(env!("ENGINE_SMOKE_COMPONENT"))
+}
+
 /// Returns the path to the guest that exports a greeting function.
 #[must_use]
 pub fn hello() -> &'static Path {

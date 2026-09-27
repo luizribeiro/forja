@@ -1,5 +1,6 @@
 [workspace]
 members = [
+  "engine-smoke",
   "hello",
   "rmsnorm-smoke",
   "sdk-smoke",
