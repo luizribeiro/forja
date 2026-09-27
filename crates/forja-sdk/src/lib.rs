@@ -44,6 +44,7 @@ mod tensor;
 use std::{error, fmt};
 
 pub use element::Element;
+pub use forja_sdk_macros::Load;
 pub use graph::eval;
 pub use half::{bf16, f16};
 pub use load::{Load, Weights};
@@ -79,6 +80,11 @@ pub struct Error(String);
 impl Error {
     pub(crate) fn new(message: impl Into<String>) -> Self {
         Self(message.into())
+    }
+
+    #[doc(hidden)]
+    pub fn loading(message: impl Into<String>) -> Self {
+        Self::new(message)
     }
 }
 

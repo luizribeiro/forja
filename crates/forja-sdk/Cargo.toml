@@ -11,6 +11,7 @@ native = ["dep:forja-core", "dep:forja-cpu", "dep:forja-host"]
 native-metal = ["native", "dep:forja-metal"]
 
 [dependencies]
+forja-sdk-macros = { path = "../forja-sdk-macros" }
 forja-core = { path = "../forja-core", optional = true }
 forja-cpu = { path = "../forja-cpu", optional = true }
 forja-host = { path = "../forja-host", optional = true }
@@ -24,6 +25,7 @@ forja-metal = { path = "../forja-metal", optional = true }
 
 [dev-dependencies]
 forja-testing = { path = "../../support/forja-testing" }
+trybuild = "1"
 
 [lints]
 workspace = true

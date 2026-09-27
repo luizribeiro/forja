@@ -1,0 +1,5 @@
+error: Vec fields require `#[load(count = ...)]`
+ --> tests/ui/load-vec-no-count.rs:8:5
+  |
+8 |     layers: Vec<Layer>,
+  |     ^^^^^^^^^^^^^^^^^^
