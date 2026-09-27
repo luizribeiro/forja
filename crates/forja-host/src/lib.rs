@@ -21,6 +21,10 @@ use std::{
 use forja_core::{
     Backend, BackendError, CommandList, DType, Layout, LayoutError, Op, OpError, Slice, Submission,
     SubmissionProfile, Tensor, ViewOp,
+    program::{
+        BinOp, Inst, MAX_INSTRUCTIONS, MAX_OUTPUTS, Program, ProgramError, ProgramKind, RedOp,
+        UnOp, ValidatedProgram, ValueType,
+    },
 };
 use wasmtime::component::{Accessor, Component, HasData, Linker, Resource, ResourceTable};
 use wasmtime::{Config, Engine, Store, StoreLimits, StoreLimitsBuilder, Trap};
@@ -1189,6 +1193,49 @@ impl<B: Backend> Host<B> {
         Ok(())
     }
 
+    /// Validates and records one guest-authored scalar program.
+    ///
+    /// # Errors
+    ///
+    /// Returns an operation, quota, or invalid-handle error before recording invalid work.
+    pub fn dispatch_program(
+        &mut self,
+        commands: &Resource<CommandListEntry>,
+        program: compute::Program,
+        inputs: &[Resource<TensorEntry>],
+        outputs: &[Resource<TensorEntry>],
+    ) -> Result<(), compute::Error> {
+        let input_entries = inputs
+            .iter()
+            .map(|resource| self.entry(resource).cloned())
+            .collect::<Result<Vec<_>, _>>()?;
+        let output_entries = outputs
+            .iter()
+            .map(|resource| self.entry(resource).cloned())
+            .collect::<Result<Vec<_>, _>>()?;
+        let program = core_program(program)?;
+        let entry = self.table.get(commands).map_err(invalid_handle)?;
+        if entry.commands.len() >= self.limits.dispatches_per_list {
+            return Err(quota("command list dispatch count exceeds the guest limit"));
+        }
+        let input_tensors = input_entries
+            .iter()
+            .map(|entry| &entry.tensor)
+            .collect::<Vec<_>>();
+        let output_tensors = output_entries
+            .iter()
+            .map(|entry| &entry.tensor)
+            .collect::<Vec<_>>();
+        let entry = self.table.get_mut(commands).map_err(invalid_handle)?;
+        entry
+            .commands
+            .dispatch_program(&program, &input_tensors, &output_tensors)
+            .map_err(guest_error)?;
+        entry.retained.extend(input_entries);
+        entry.retained.extend(output_entries);
+        Ok(())
+    }
+
     fn drop_command_list(
         &mut self,
         resource: Resource<CommandListEntry>,
@@ -1587,14 +1634,15 @@ where
 
     fn dispatch_program(
         &mut self,
-        _resource: Resource<CommandListEntry>,
-        _program: compute::Program,
-        _inputs: Vec<Resource<TensorEntry>>,
-        _outputs: Vec<Resource<TensorEntry>>,
+        resource: Resource<CommandListEntry>,
+        program: compute::Program,
+        inputs: Vec<Resource<TensorEntry>>,
+        outputs: Vec<Resource<TensorEntry>>,
     ) -> impl Future<Output = wasmtime::Result<Result<(), compute::Error>>> + Send {
-        std::future::ready(Ok(Err(compute::Error::OpSignature(
-            "scalar programs are not available".to_owned(),
-        ))))
+        let _timer = self.import_timer(ImportKind::Dispatch);
+        std::future::ready(Ok(Host::dispatch_program(
+            self, &resource, program, &inputs, &outputs,
+        )))
     }
 
     fn drop(
@@ -1804,6 +1852,113 @@ fn core_op(operation: compute::Op) -> Op {
     }
 }
 
+fn core_program(program: compute::Program) -> Result<ValidatedProgram, compute::Error> {
+    if program.insts.len() > MAX_INSTRUCTIONS {
+        return Err(program_error(&ProgramError::TooManyInstructions));
+    }
+    if program.outputs.len() > MAX_OUTPUTS {
+        return Err(program_error(&ProgramError::TooManyOutputs));
+    }
+    Program {
+        kind: match program.kind {
+            compute::ProgramKind::Map => ProgramKind::Map,
+            compute::ProgramKind::Row => ProgramKind::Row,
+        },
+        insts: program.insts.into_iter().map(core_inst).collect(),
+        outputs: program.outputs,
+    }
+    .validate()
+    .map_err(|error| program_error(&error))
+}
+
+fn core_inst(instruction: compute::Inst) -> Inst {
+    match instruction {
+        compute::Inst::Input(slot) => Inst::Input(slot),
+        compute::Inst::Const(value) => Inst::Const(value),
+        compute::Inst::Index(axis) => Inst::Index(axis),
+        compute::Inst::Extent(axis) => Inst::Extent(axis),
+        compute::Inst::Unary((op, value)) => Inst::Unary(core_unop(op), value),
+        compute::Inst::Binary((op, left, right)) => Inst::Binary(core_binop(op), left, right),
+        compute::Inst::Select((condition, accepted, rejected)) => {
+            Inst::Select(condition, accepted, rejected)
+        }
+        compute::Inst::Cast((to, value)) => Inst::Cast(core_value_type(to), value),
+        compute::Inst::Reduce((op, value)) => Inst::Reduce(core_redop(op), value),
+    }
+}
+
+fn core_unop(op: compute::Unop) -> UnOp {
+    match op {
+        compute::Unop::Neg => UnOp::Neg,
+        compute::Unop::Abs => UnOp::Abs,
+        compute::Unop::Exp => UnOp::Exp,
+        compute::Unop::Log => UnOp::Log,
+        compute::Unop::Sqrt => UnOp::Sqrt,
+        compute::Unop::Rsqrt => UnOp::Rsqrt,
+        compute::Unop::Sin => UnOp::Sin,
+        compute::Unop::Cos => UnOp::Cos,
+        compute::Unop::Tanh => UnOp::Tanh,
+        compute::Unop::Sigmoid => UnOp::Sigmoid,
+        compute::Unop::Recip => UnOp::Recip,
+        compute::Unop::Floor => UnOp::Floor,
+    }
+}
+
+fn core_binop(op: compute::Binop) -> BinOp {
+    match op {
+        compute::Binop::Add => BinOp::Add,
+        compute::Binop::Sub => BinOp::Sub,
+        compute::Binop::Mul => BinOp::Mul,
+        compute::Binop::Div => BinOp::Div,
+        compute::Binop::Min => BinOp::Min,
+        compute::Binop::Max => BinOp::Max,
+        compute::Binop::Pow => BinOp::Pow,
+        compute::Binop::Lt => BinOp::Lt,
+        compute::Binop::Le => BinOp::Le,
+        compute::Binop::Eq => BinOp::Eq,
+        compute::Binop::Ne => BinOp::Ne,
+        compute::Binop::Ge => BinOp::Ge,
+        compute::Binop::Gt => BinOp::Gt,
+    }
+}
+
+const fn core_redop(op: compute::Redop) -> RedOp {
+    match op {
+        compute::Redop::Sum => RedOp::Sum,
+        compute::Redop::Max => RedOp::Max,
+        compute::Redop::Min => RedOp::Min,
+    }
+}
+
+const fn core_value_type(value_type: compute::ValueType) -> ValueType {
+    match value_type {
+        compute::ValueType::F32 => ValueType::F32,
+        compute::ValueType::U32 => ValueType::U32,
+        compute::ValueType::Bool => ValueType::Bool,
+    }
+}
+
+fn program_error(error: &ProgramError) -> compute::Error {
+    let message = match error {
+        ProgramError::OperandNotEarlier { instruction, .. }
+        | ProgramError::NonFiniteConstant { instruction }
+        | ProgramError::AxisOutOfRange { instruction, .. }
+        | ProgramError::ReduceInMap { instruction }
+        | ProgramError::InvalidUnaryType { instruction }
+        | ProgramError::InvalidBinaryType { instruction }
+        | ProgramError::InvalidSelectCondition { instruction }
+        | ProgramError::InvalidSelectBranch { instruction }
+        | ProgramError::InvalidReduceType { instruction } => {
+            format!("instruction {instruction}: {error}")
+        }
+        ProgramError::InvalidOutputValue { instruction, .. } => {
+            format!("instruction {instruction}: {error}")
+        }
+        _ => error.to_string(),
+    };
+    compute::Error::OpSignature(message)
+}
+
 fn matmul_flops(inputs: &[&Tensor]) -> Option<u64> {
     let left = inputs.first()?.layout().shape();
     let right = inputs.get(1)?.layout().shape();
@@ -1966,11 +2121,105 @@ mod tests {
 
     use super::{
         BackendEvent, BackendTimer, EngineMetrics, EngineStepProfile, Grants, Host, ImportKind,
-        ImportTimer, Limits, bindings::l9o::gpu::compute,
+        ImportTimer, Limits, MAX_INSTRUCTIONS, MAX_OUTPUTS, bindings::l9o::gpu::compute,
+        core_program,
     };
 
     const GENEROUS: Limits = Limits::new(u64::MAX, 8, u64::MAX, 32, u64::MAX);
     static NEXT_WEIGHT_FILE: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn converts_and_records_wit_programs() {
+        let mut host = Host::new(CpuBackend::new(), GENEROUS);
+        let input = host.alloc(compute::Dtype::F32, &[7]).unwrap();
+        let output = host.alloc(compute::Dtype::F32, &[7]).unwrap();
+        let commands = host.command_list().unwrap();
+        let program = compute::Program {
+            kind: compute::ProgramKind::Map,
+            insts: vec![
+                compute::Inst::Input(0),
+                compute::Inst::Const(2.0),
+                compute::Inst::Binary((compute::Binop::Mul, 0, 1)),
+            ],
+            outputs: vec![(0, 2)],
+        };
+
+        host.dispatch_program(
+            &Resource::new_borrow(commands.rep()),
+            program,
+            &[Resource::new_borrow(input.rep())],
+            &[Resource::new_borrow(output.rep())],
+        )
+        .unwrap();
+
+        assert!(
+            host.table
+                .get(&commands)
+                .unwrap()
+                .commands
+                .clone()
+                .into_dispatches()[0]
+                .bound_program()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn program_validation_errors_name_the_instruction() {
+        let error = core_program(compute::Program {
+            kind: compute::ProgramKind::Map,
+            insts: vec![
+                compute::Inst::Const(1.0),
+                compute::Inst::Unary((compute::Unop::Exp, 1)),
+            ],
+            outputs: vec![(0, 0)],
+        })
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            compute::Error::OpSignature(message) if message.contains("instruction 1")
+        ));
+    }
+
+    #[test]
+    fn refuses_oversized_wit_lists_before_conversion() {
+        let instructions = vec![compute::Inst::Const(1.0); MAX_INSTRUCTIONS + 1];
+        let error = core_program(compute::Program {
+            kind: compute::ProgramKind::Map,
+            insts: instructions,
+            outputs: vec![(0, 0)],
+        })
+        .unwrap_err();
+        assert!(
+            matches!(error, compute::Error::OpSignature(message) if message.contains("TooManyInstructions"))
+        );
+
+        let error = core_program(compute::Program {
+            kind: compute::ProgramKind::Map,
+            insts: vec![compute::Inst::Const(1.0)],
+            outputs: vec![(0, 0); MAX_OUTPUTS + 1],
+        })
+        .unwrap_err();
+        assert!(
+            matches!(error, compute::Error::OpSignature(message) if message.contains("TooManyOutputs"))
+        );
+    }
+
+    #[test]
+    fn invalid_output_errors_name_the_instruction() {
+        let error = core_program(compute::Program {
+            kind: compute::ProgramKind::Map,
+            insts: vec![compute::Inst::Const(1.0)],
+            outputs: vec![(0, 7)],
+        })
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            compute::Error::OpSignature(message) if message.contains("instruction 7")
+        ));
+    }
 
     #[test]
     fn import_timer_records_only_the_selected_kind() {
