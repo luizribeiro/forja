@@ -13,3 +13,9 @@ Measure Metal submission latency with:
 ```console
 nix develop -c cargo run -p forja-metal --release --example submission_latency
 ```
+
+Generate the Qwen3 transformer golden fixtures once after downloading the model:
+
+```console
+nix develop -c sh -c 'uv run --project support/golden support/golden/generate.py --model "$FORJA_MODELS/Qwen3-0.6B" --out "$FORJA_MODELS/golden/qwen3-0.6b"'
+```
