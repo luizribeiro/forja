@@ -11,8 +11,10 @@ forja-core = { path = "../forja-core" }
 forja-cpu = { path = "../forja-cpu" }
 forja-host = { path = "../forja-host" }
 golden-fixtures = { path = "../../support/golden-fixtures" }
+serde_json.workspace = true
 test-guests = { path = "../../support/test-guests" }
 tokio.workspace = true
+tokenizers.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 forja-metal = { path = "../forja-metal" }
