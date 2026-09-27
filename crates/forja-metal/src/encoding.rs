@@ -1202,19 +1202,25 @@ impl MetalBackend {
         let key = self.encoder_tensor(key_tensor)?;
         let value = self.encoder_tensor(value_tensor)?;
         let output = self.encoder_tensor(dispatch.output())?;
-        let [query_heads, query_length, _] = shape3(&query.layout)?;
+        let [query_heads, query_length, width] = shape3(&query.layout)?;
+        let [_, key_length, _] = shape3(&key.layout)?;
+        let block_query = 32;
+        let block_key = if width == 64 { 32 } else { 16 };
         let params = self.sdpa_params(&query, &key, &value, &output, scale, causal, q_start, 1)?;
         let constants = [
             (0, dtype_code(query.layout.dtype())),
             (1, dtype_code(key.layout.dtype())),
             (2, dtype_code(output.layout.dtype())),
             (3, dtype_code(value.layout.dtype())),
+            (210, u32::from(query_length % block_query == 0)),
+            (211, u32::from(key_length % block_key == 0)),
+            (212, u32::from(causal)),
         ];
         let pipeline = self
             .pipelines
             .lock()
             .map_err(|_| BackendError::ExecutionFailed)?
-            .get("steel_attention", &constants)?;
+            .get(steel_attention_kernel(width)?, &constants)?;
         encoder.setComputePipelineState(&pipeline);
         for (index, tensor) in [&query, &key, &value, &output].into_iter().enumerate() {
             bindings.bind(table, index, &tensor.buffer);
@@ -1223,14 +1229,14 @@ impl MetalBackend {
         encoder.setArgumentTable(Some(table));
         encoder.dispatchThreadgroups_threadsPerThreadgroup(
             MTLSize {
-                width: usize::try_from(query_heads).map_err(|_| BackendError::InvalidInput)?,
-                height: usize::try_from(query_length.div_ceil(8))
+                width: usize::try_from(query_length.div_ceil(block_query))
                     .map_err(|_| BackendError::InvalidInput)?,
+                height: usize::try_from(query_heads).map_err(|_| BackendError::InvalidInput)?,
                 depth: 1,
             },
             MTLSize {
-                width: 128,
-                height: 1,
+                width: 32,
+                height: 4,
                 depth: 1,
             },
         );
@@ -2415,6 +2421,14 @@ fn vector_kernel(prefix: &str, width: u32) -> Result<&'static str, BackendError>
     }
 }
 
+fn steel_attention_kernel(width: u32) -> Result<&'static str, BackendError> {
+    match width {
+        64 => Ok("steel_attention_64"),
+        128 => Ok("steel_attention_128"),
+        _ => Err(BackendError::InvalidInput),
+    }
+}
+
 fn select_sdpa(dispatch: &Dispatch) -> Result<SdpaKernel, BackendError> {
     #[cfg(test)]
     if let Some(kernel) = FORCED_SDPA_KERNEL.with(Cell::get) {
@@ -3299,6 +3313,30 @@ mod tests {
             TensorSpec::sliced(DType::BF16, &[8, 4096, 128], &cache_slice),
             TensorSpec::sliced(DType::BF16, &[8, 4096, 128], &cache_slice),
             &TensorSpec::contiguous(DType::BF16, &[16, 128, 128]),
+        );
+        assert_sdpa_with(
+            SdpaKernel::Steel,
+            Op::Sdpa {
+                scale: 128.0_f32.sqrt().recip(),
+                causal: true,
+                q_start: 4,
+            },
+            TensorSpec::contiguous(DType::BF16, &[16, 33, 128]),
+            TensorSpec::contiguous(DType::BF16, &[8, 37, 128]),
+            TensorSpec::contiguous(DType::BF16, &[8, 37, 128]),
+            &TensorSpec::contiguous(DType::BF16, &[16, 33, 128]),
+        );
+        assert_sdpa_with(
+            SdpaKernel::Steel,
+            Op::Sdpa {
+                scale: 0.125,
+                causal: true,
+                q_start: 32,
+            },
+            TensorSpec::contiguous(DType::F32, &[4, 1, 64]),
+            TensorSpec::contiguous(DType::F32, &[2, 33, 64]),
+            TensorSpec::contiguous(DType::F32, &[2, 33, 64]),
+            &TensorSpec::contiguous(DType::F32, &[4, 1, 64]),
         );
     }
 

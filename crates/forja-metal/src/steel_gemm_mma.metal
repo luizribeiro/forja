@@ -26,7 +26,7 @@ struct SteelMMAFragment {
         int row_stride,
         int column_stride) {
         for (short element = 0; element < elements; ++element) {
-            values[element] = T(source[element * column_stride]);
+            values[element] = T(source[0 * row_stride + element * column_stride]);
         }
     }
 
@@ -40,12 +40,16 @@ struct SteelMMAFragment {
         metal::simdgroup_matrix<A, rows, columns> left_matrix;
         metal::simdgroup_matrix<B, rows, columns> right_matrix;
         metal::simdgroup_matrix<C, rows, columns> accumulator_matrix;
-        left_matrix.thread_elements() = left;
-        right_matrix.thread_elements() = right;
-        accumulator_matrix.thread_elements() = accumulator;
+        for (short element = 0; element < elements; ++element) {
+            left_matrix.thread_elements()[element] = left[element];
+            right_matrix.thread_elements()[element] = right[element];
+            accumulator_matrix.thread_elements()[element] = accumulator[element];
+        }
         simdgroup_multiply_accumulate(
             result_matrix, left_matrix, right_matrix, accumulator_matrix);
-        result = result_matrix.thread_elements();
+        for (short element = 0; element < elements; ++element) {
+            result[element] = result_matrix.thread_elements()[element];
+        }
     }
 
     template <typename Operation>
@@ -54,7 +58,8 @@ struct SteelMMAFragment {
         thread T &result) {
         T pair = Operation::apply(values[0], values[1]);
         T quad = Operation::apply(pair, simd_shuffle_xor(pair, ushort(1)));
-        result = Operation::apply(result, simd_shuffle_xor(quad, ushort(8)));
+        T row = Operation::apply(quad, simd_shuffle_xor(quad, ushort(8)));
+        result = Operation::apply(result, row);
     }
 
     template <typename Operation>
