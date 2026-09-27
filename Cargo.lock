@@ -484,6 +484,7 @@ dependencies = [
  "forja-core",
  "forja-cpu",
  "forja-metal",
+ "forja-testing",
  "test-guests",
  "tokio",
  "wasmtime",

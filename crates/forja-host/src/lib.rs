@@ -2,6 +2,9 @@
 
 #![allow(clippy::manual_async_fn)]
 
+#[cfg(test)]
+mod fuzz_tests;
+
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},

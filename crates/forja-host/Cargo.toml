@@ -14,6 +14,7 @@ wasmtime-wasi.workspace = true
 
 [dev-dependencies]
 forja-cpu = { path = "../forja-cpu" }
+forja-testing = { path = "../../support/forja-testing" }
 test-guests = { path = "../../support/test-guests" }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
