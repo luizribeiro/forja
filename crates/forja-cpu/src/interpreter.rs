@@ -149,6 +149,23 @@ pub fn interpret_row(
     Ok(outputs)
 }
 
+/// Evaluates either validated program kind.
+///
+/// # Errors
+///
+/// Returns [`BackendError::ExecutionFailed`] when the program and logical
+/// input arrays are inconsistent.
+pub fn interpret(
+    program: &ValidatedProgram,
+    shape: &[u32],
+    inputs: &[Input<'_>],
+) -> Result<Vec<Vec<f32>>, BackendError> {
+    match program.program().kind {
+        ProgramKind::Map => interpret_map(program, shape, inputs),
+        ProgramKind::Row => interpret_row(program, shape, inputs),
+    }
+}
+
 impl Input<'_> {
     fn len(self) -> usize {
         match self {

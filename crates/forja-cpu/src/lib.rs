@@ -6,7 +6,7 @@ use std::{sync::Mutex, time::Duration};
 
 use forja_core::{
     AllocationRegistry, Backend, BackendError, BufferId, CommandList, DType, Layout, MappedRegion,
-    Op, Submission, Tensor, ViewOp,
+    Op, Submission, Tensor, ViewOp, program::BoundProgram,
 };
 use half::{bf16, f16};
 
@@ -190,6 +190,48 @@ impl CpuBackend {
             .map(|(a, b)| function(a, b))
             .collect::<Vec<_>>();
         self.write_output(output, &values)
+    }
+
+    fn execute_program(&self, program: &BoundProgram) -> Result<(), BackendError> {
+        enum DecodedInput {
+            F32(Vec<f32>),
+            U32(Vec<u32>),
+        }
+
+        let decoded = program
+            .inputs()
+            .iter()
+            .map(|input| match input.layout().dtype() {
+                DType::F32 | DType::F16 | DType::BF16 => {
+                    decode(&self.read(input)?, input.layout().dtype())
+                        .map(DecodedInput::F32)
+                        .ok_or(BackendError::ExecutionFailed)
+                }
+                DType::U32 => decode_u32(&self.read(input)?)
+                    .map(DecodedInput::U32)
+                    .ok_or(BackendError::ExecutionFailed),
+                DType::I32 => Err(BackendError::ExecutionFailed),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let inputs = decoded
+            .iter()
+            .map(|input| match input {
+                DecodedInput::F32(values) => interpreter::Input::F32(values),
+                DecodedInput::U32(values) => interpreter::Input::U32(values),
+            })
+            .collect::<Vec<_>>();
+        let shape = program
+            .outputs()
+            .first()
+            .map(Tensor::layout)
+            .map(Layout::shape)
+            .ok_or(BackendError::ExecutionFailed)?;
+        let values = interpreter::interpret(program.program(), shape, &inputs)?;
+        program
+            .outputs()
+            .iter()
+            .zip(values)
+            .try_for_each(|(output, values)| self.write_output(output, &values))
     }
 
     fn write_output(&self, output: &Tensor, values: &[f32]) -> Result<(), BackendError> {
@@ -481,7 +523,9 @@ impl Backend for CpuBackend {
         let started = std::time::Instant::now();
         let dispatches = commands.into_dispatches();
         for dispatch in &dispatches {
-            self.validate(dispatch.output())?;
+            for output in dispatch.outputs() {
+                self.validate(output)?;
+            }
             for input in dispatch.inputs() {
                 self.validate(input)?;
             }
@@ -489,6 +533,10 @@ impl Backend for CpuBackend {
         let result = dispatches
             .into_iter()
             .try_for_each(|dispatch| match dispatch.op() {
+                Op::Program(_) => dispatch
+                    .bound_program()
+                    .ok_or(BackendError::ExecutionFailed)
+                    .and_then(|program| self.execute_program(program)),
                 Op::Copy => self.execute_copy(dispatch.inputs(), dispatch.output()),
                 Op::Add => self.execute_binary(dispatch.inputs(), dispatch.output(), |a, b| a + b),
                 Op::SiluMul => {
@@ -666,7 +714,10 @@ fn encode(source: &[f32], output: DType) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use forja_core::{Op, Slice};
+    use forja_core::{
+        Op, Slice,
+        program::{BinOp, Inst, Program, ProgramKind, ValueType},
+    };
     use std::{
         fs,
         sync::atomic::{AtomicU64, Ordering},
@@ -679,6 +730,49 @@ mod tests {
         let backend = CpuBackend::new();
         let foreign = CpuBackend::new().alloc(DType::F32, &[1]).unwrap();
         assert_eq!(backend.read(&foreign), Err(BackendError::InvalidInput));
+    }
+
+    #[test]
+    fn executes_bound_programs_with_multiple_outputs() {
+        let backend = CpuBackend::new();
+        let values = backend.alloc(DType::F32, &[2]).unwrap();
+        backend.write(&values, &f32_bytes(&[1.5, -2.0])).unwrap();
+        let indices = backend.alloc(DType::U32, &[2]).unwrap();
+        backend
+            .write(
+                &indices,
+                &[2_u32.to_le_bytes(), 5_u32.to_le_bytes()].concat(),
+            )
+            .unwrap();
+        let copied = backend.alloc(DType::F16, &[2]).unwrap();
+        let summed = backend.alloc(DType::F32, &[2]).unwrap();
+        let program = Program {
+            kind: ProgramKind::Map,
+            insts: vec![
+                Inst::Input(0),
+                Inst::Input(1),
+                Inst::Cast(ValueType::F32, 1),
+                Inst::Binary(BinOp::Add, 0, 2),
+            ],
+            outputs: vec![(0, 0), (1, 3)],
+        }
+        .validate()
+        .unwrap();
+        let mut commands = CommandList::new();
+        commands
+            .dispatch_program(&program, &[&values, &indices], &[&copied, &summed])
+            .unwrap();
+        backend.submit(commands).unwrap().wait().unwrap();
+
+        assert_eq!(
+            backend.read(&copied).unwrap(),
+            [
+                f16::from_f32(1.5).to_le_bytes(),
+                f16::from_f32(-2.0).to_le_bytes()
+            ]
+            .concat()
+        );
+        assert_eq!(backend.read(&summed).unwrap(), f32_bytes(&[3.5, 3.0]));
     }
 
     #[test]

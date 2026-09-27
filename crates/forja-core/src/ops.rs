@@ -1,5 +1,6 @@
 use std::{error::Error, fmt};
 
+use crate::program::{BindError, BoundProgram, ProgramHash, ValidatedProgram, bind_program};
 use crate::{DType, Layout, byte_ranges_overlap, is_injective};
 
 /// An opaque allocation identity unique to one backend instance.
@@ -117,6 +118,8 @@ impl Tensor {
 /// A trusted operation recorded in a command list.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Op {
+    /// Executes a validated scalar program with this content identity.
+    Program(ProgramHash),
     /// Copies and optionally casts one tensor.
     Copy,
     /// Adds two tensors elementwise.
@@ -164,6 +167,10 @@ pub enum Operand {
 /// A reason an operation could not be recorded.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum OpError {
+    /// Scalar programs must be recorded with [`CommandList::dispatch_program`].
+    ProgramRequiresBinding,
+    /// Tensor views do not satisfy a scalar program's signature.
+    ProgramBinding(BindError),
     /// The operation received the wrong number of inputs.
     Arity {
         /// The required count.
@@ -219,6 +226,7 @@ pub struct Dispatch {
     op: Op,
     inputs: Vec<Tensor>,
     output: Tensor,
+    program: Option<BoundProgram>,
 }
 
 impl Dispatch {
@@ -236,6 +244,20 @@ impl Dispatch {
     #[must_use]
     pub const fn output(&self) -> &Tensor {
         &self.output
+    }
+
+    /// Returns every output tensor in slot order.
+    #[must_use]
+    pub fn outputs(&self) -> &[Tensor] {
+        self.program
+            .as_ref()
+            .map_or(std::slice::from_ref(&self.output), BoundProgram::outputs)
+    }
+
+    /// Returns the bound scalar program, when this is a program dispatch.
+    #[must_use]
+    pub const fn bound_program(&self) -> Option<&BoundProgram> {
+        self.program.as_ref()
     }
 }
 
@@ -274,6 +296,7 @@ impl CommandList {
     pub fn dispatch(&mut self, op: Op, inputs: &[&Tensor], output: &Tensor) -> Result<(), OpError> {
         check_common(inputs, output)?;
         match op {
+            Op::Program(_) => return Err(OpError::ProgramRequiresBinding),
             Op::Copy => check_copy(inputs, output)?,
             Op::Add | Op::SiluMul => check_binary(inputs, output)?,
             Op::RmsNorm { eps } => check_rms_norm(inputs, output, eps)?,
@@ -291,6 +314,39 @@ impl CommandList {
             op,
             inputs: inputs.iter().map(|tensor| (*tensor).clone()).collect(),
             output: output.clone(),
+            program: None,
+        });
+        Ok(())
+    }
+
+    /// Binds, validates, and records a scalar-program dispatch.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OpError::ProgramBinding`] when the tensor views do not satisfy
+    /// the validated program's signature.
+    pub fn dispatch_program(
+        &mut self,
+        program: &ValidatedProgram,
+        inputs: &[&Tensor],
+        outputs: &[&Tensor],
+    ) -> Result<(), OpError> {
+        let output = outputs
+            .first()
+            .copied()
+            .ok_or(OpError::ProgramBinding(BindError::NoOutputs))?;
+        check_common(inputs, output)?;
+        let bound = bind_program(program, inputs, outputs).map_err(OpError::ProgramBinding)?;
+        let output = bound
+            .outputs()
+            .first()
+            .cloned()
+            .ok_or(OpError::ProgramBinding(BindError::NoOutputs))?;
+        self.dispatches.push(Dispatch {
+            op: Op::Program(program.content_hash()),
+            inputs: bound.inputs().to_vec(),
+            output,
+            program: Some(bound),
         });
         Ok(())
     }
@@ -314,12 +370,15 @@ pub fn required_barriers(commands: &CommandList) -> Vec<bool> {
                 .inputs
                 .iter()
                 .any(|input| conflicts(input, false, &accesses))
-                || conflicts(&dispatch.output, true, &accesses);
+                || dispatch
+                    .outputs()
+                    .iter()
+                    .any(|output| conflicts(output, true, &accesses));
             if needs_barrier {
                 accesses.clear();
             }
             accesses.extend(dispatch.inputs.iter().map(|input| (input, false)));
-            accesses.push((&dispatch.output, true));
+            accesses.extend(dispatch.outputs().iter().map(|output| (output, true)));
             needs_barrier
         })
         .collect()
@@ -610,6 +669,7 @@ fn check_float(tensor: &Tensor, operand: Operand) -> Result<(), OpError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::program::{Inst, Program, ProgramKind};
 
     fn tensor(buffer: u64, dtype: DType, shape: &[u32], strides: &[u64]) -> Tensor {
         let bytes = u64::from(shape.iter().product::<u32>()) * dtype.byte_size();
@@ -649,6 +709,57 @@ mod tests {
             .unwrap();
 
         assert_eq!(required_barriers(&commands), [false, false]);
+    }
+
+    #[test]
+    fn program_dispatch_uses_the_shared_binding_checker() {
+        let program = Program {
+            kind: ProgramKind::Map,
+            insts: vec![Inst::Input(0)],
+            outputs: vec![(0, 0)],
+        }
+        .validate()
+        .unwrap();
+        let input = tensor(1, DType::F32, &[2], &[1]);
+        let output = tensor(2, DType::F16, &[2], &[1]);
+        let mut commands = CommandList::new();
+        commands
+            .dispatch_program(&program, &[&input], &[&output])
+            .unwrap();
+        assert!(commands.dispatches[0].bound_program().is_some());
+
+        let integer = tensor(3, DType::U32, &[2], &[1]);
+        assert!(matches!(
+            CommandList::new().dispatch_program(&program, &[&integer], &[&output]),
+            Err(OpError::ProgramBinding(BindError::InputTypeMismatch {
+                slot: 0
+            }))
+        ));
+    }
+
+    #[test]
+    fn program_dispatch_rejects_empty_iteration_spaces() {
+        for (kind, shape, strides) in [
+            (ProgramKind::Map, vec![0], vec![1]),
+            (ProgramKind::Row, vec![0, 7], vec![7, 1]),
+        ] {
+            let program = Program {
+                kind,
+                insts: vec![Inst::Input(0)],
+                outputs: vec![(0, 0)],
+            }
+            .validate()
+            .unwrap();
+            let input = tensor(10, DType::F32, &shape, &strides);
+            let output = tensor(11, DType::F32, &shape, &strides);
+
+            assert_eq!(
+                CommandList::new().dispatch_program(&program, &[&input], &[&output]),
+                Err(OpError::EmptyOperand {
+                    operand: Operand::Input(0)
+                })
+            );
+        }
     }
 
     #[test]

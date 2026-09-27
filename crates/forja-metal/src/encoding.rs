@@ -1069,7 +1069,7 @@ impl MetalBackend {
                     | Op::Sdpa { .. }
             )
         }) {
-            return Err(BackendError::InvalidInput);
+            return Err(BackendError::UnsupportedOperation);
         }
         let tensors = dispatches
             .iter()
@@ -2641,6 +2641,7 @@ impl MetalBackend {
         let mut arguments = ArgumentSizer::default();
         for dispatch in dispatches {
             match dispatch.op() {
+                Op::Program(_) => return Err(BackendError::UnsupportedOperation),
                 Op::Copy => Self::size_copy_arguments(&mut arguments)?,
                 Op::Add | Op::SiluMul => {
                     for _ in 0..=dispatch.inputs().len() {

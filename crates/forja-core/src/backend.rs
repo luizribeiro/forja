@@ -198,6 +198,8 @@ pub enum BackendError {
     Timeout,
     /// An argument does not belong to this backend or violates an API rule.
     InvalidInput,
+    /// The backend does not implement the requested operation.
+    UnsupportedOperation,
     /// A data-dependent read used an index outside its source extent.
     IndexOutOfRange {
         /// The first invalid index value.

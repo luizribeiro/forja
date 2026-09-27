@@ -1891,6 +1891,9 @@ fn guest_error(error: impl Into<GuestFailure>) -> compute::Error {
         GuestFailure::Backend(BackendError::ExecutionFailed) => {
             compute::Error::BackendExecution("backend execution failed".to_owned())
         }
+        GuestFailure::Backend(BackendError::UnsupportedOperation) => {
+            compute::Error::BackendExecution("backend operation is unsupported".to_owned())
+        }
         GuestFailure::Backend(BackendError::Timeout) => {
             quota("backend submission exceeded its time limit")
         }

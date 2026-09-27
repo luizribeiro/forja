@@ -698,6 +698,7 @@ fn gpu_by_dispatch(
 
 const fn op_name(operation: Op) -> &'static str {
     match operation {
+        Op::Program(_) => "program",
         Op::Copy => "copy",
         Op::Add => "add",
         Op::SiluMul => "silu_mul",
