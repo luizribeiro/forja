@@ -6,7 +6,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use forja_host::{EngineMetrics, EngineRunner, EngineStep};
+use forja_host::{EngineMetrics, EngineRunner, EngineStep, EngineStepProfile, ImportProfile};
 use golden_fixtures::sha256_file;
 
 use crate::{
@@ -275,6 +275,116 @@ fn summary_json(summary: Summary) -> serde_json::Value {
         "gpu_time_seconds": stats_json(summary.gpu_seconds),
         "submissions": stats_json(summary.submissions),
     })
+}
+
+#[allow(dead_code)]
+fn profile_categories(
+    steps: &[EngineStepProfile],
+    submissions: &[&forja_core::SubmissionProfile],
+) -> Vec<ProfileCategory> {
+    vec![
+        category("wall", steps, |step| (1.0, step.wall_time)),
+        category("guest", steps, |step| (1.0, step.guest_time)),
+        import_category("import.alloc", steps, |step| step.imports.alloc),
+        import_category("import.view.slice", steps, |step| step.imports.view_slice),
+        import_category("import.view.reshape", steps, |step| {
+            step.imports.view_reshape
+        }),
+        import_category("import.view.permute", steps, |step| {
+            step.imports.view_permute
+        }),
+        import_category("import.view.broadcast", steps, |step| {
+            step.imports.view_broadcast
+        }),
+        import_category("import.write", steps, |step| step.imports.write),
+        import_category("import.dispatch", steps, |step| step.imports.dispatch),
+        import_category("import.submit", steps, |step| step.imports.submit),
+        import_category("import.read", steps, |step| step.imports.read),
+        import_category("buffer.output", steps, |step| step.allocations),
+        import_category("buffer.release", steps, |step| step.releases),
+        submission_category("submit.validation", submissions, |submission| {
+            (1.0, submission.validation)
+        }),
+        submission_category("buffer.metadata", submissions, |submission| {
+            (
+                count_as_f64(submission.metadata_buffers.count),
+                submission.metadata_buffers.time,
+            )
+        }),
+        submission_category("submit.residency", submissions, |submission| {
+            (1.0, submission.residency)
+        }),
+        submission_category("submit.encoding", submissions, |submission| {
+            (count_as_f64(submission.dispatches), submission.encoding)
+        }),
+        submission_category("submit.commit", submissions, |submission| {
+            (1.0, submission.commit)
+        }),
+        submission_category("submit.wait", submissions, |submission| {
+            (1.0, submission.wait)
+        }),
+        submission_category("gpu", submissions, |submission| {
+            (count_as_f64(submission.dispatches), submission.gpu_time)
+        }),
+        submission_category("barriers", submissions, |submission| {
+            (count_as_f64(submission.barriers), Duration::ZERO)
+        }),
+    ]
+}
+
+#[allow(dead_code)]
+struct ProfileCategory {
+    name: &'static str,
+    values: Vec<(f64, f64)>,
+}
+
+fn category(
+    name: &'static str,
+    steps: &[EngineStepProfile],
+    select: impl Fn(&EngineStepProfile) -> (f64, Duration),
+) -> ProfileCategory {
+    ProfileCategory {
+        name,
+        values: steps
+            .iter()
+            .map(|step| {
+                let (count, time) = select(step);
+                (count, time.as_secs_f64())
+            })
+            .collect(),
+    }
+}
+
+fn import_category(
+    name: &'static str,
+    steps: &[EngineStepProfile],
+    select: impl Fn(&EngineStepProfile) -> ImportProfile,
+) -> ProfileCategory {
+    category(name, steps, |step| {
+        let profile = select(step);
+        (count_as_f64(profile.count), profile.time)
+    })
+}
+
+fn submission_category(
+    name: &'static str,
+    submissions: &[&forja_core::SubmissionProfile],
+    select: impl Fn(&forja_core::SubmissionProfile) -> (f64, Duration),
+) -> ProfileCategory {
+    ProfileCategory {
+        name,
+        values: submissions
+            .iter()
+            .map(|submission| {
+                let (count, time) = select(submission);
+                (count, time.as_secs_f64())
+            })
+            .collect(),
+    }
+}
+
+fn count_as_f64(count: u64) -> f64 {
+    u32::try_from(count).map_or(f64::INFINITY, f64::from)
 }
 
 fn stats_json(stats: Stats) -> serde_json::Value {
