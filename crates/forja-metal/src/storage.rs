@@ -89,6 +89,12 @@ impl Drop for MetalBackend {
 }
 
 impl MetalBackend {
+    /// Returns the selected Metal device name.
+    #[must_use]
+    pub fn device_name(&self) -> String {
+        self.device.name().to_string()
+    }
+
     /// Creates a backend on the system default Metal 4 device.
     ///
     /// # Errors
