@@ -21,6 +21,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         .map_err(|error| format!("{error}\n{}", args::USAGE))?;
     let runtime = tokio::runtime::Builder::new_current_thread().build()?;
     match command {
+        args::Command::Run(_) => Err("run is not available in this build".into()),
         args::Command::Verify(options) => runtime.block_on(verify::run(&options)),
     }
 }
