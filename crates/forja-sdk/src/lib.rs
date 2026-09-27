@@ -82,6 +82,7 @@ mod engine;
 mod graph;
 mod load;
 pub mod nn;
+pub mod program;
 mod sys;
 mod tensor;
 
