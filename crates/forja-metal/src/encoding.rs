@@ -15,11 +15,11 @@ use forja_core::{
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_foundation::{NSRange, NSString};
 use objc2_metal::{
-    MTL4ArgumentTable, MTL4CommandBuffer, MTL4CommandQueue, MTL4CommitFeedback, MTL4CommitOptions,
-    MTL4CounterHeap, MTL4CounterHeapDescriptor, MTL4CounterHeapType, MTLAllocation, MTLBuffer,
-    MTLComputePipelineState, MTLDataType, MTLDevice, MTLEvent, MTLFunctionConstantValues,
-    MTLLibrary, MTLResidencySet, MTLResidencySetDescriptor, MTLSharedEvent, MTLSharedEventListener,
-    MTLSize,
+    MTL4ArgumentTable, MTL4CommandAllocator, MTL4CommandBuffer, MTL4CommandQueue,
+    MTL4CommitFeedback, MTL4CommitOptions, MTL4CounterHeap, MTL4CounterHeapDescriptor,
+    MTL4CounterHeapType, MTLAllocation, MTLBuffer, MTLComputePipelineState, MTLDataType, MTLDevice,
+    MTLEvent, MTLFunctionConstantValues, MTLLibrary, MTLResidencySet, MTLResidencySetDescriptor,
+    MTLSharedEvent, MTLSharedEventListener, MTLSize,
 };
 
 use crate::{
@@ -117,8 +117,6 @@ unsafe impl Send for CommitFeedback {}
 
 enum CommitResult {
     Feedback(CommitFeedback),
-    #[cfg(test)]
-    Known(Result<(), BackendError>),
 }
 
 thread_local! {
@@ -160,8 +158,6 @@ fn commit_result(feedback: &CommitResult) -> Result<(), BackendError> {
                 Ok(())
             }
         }
-        #[cfg(test)]
-        CommitResult::Known(result) => *result,
     }
 }
 
@@ -197,6 +193,53 @@ unsafe impl Send for InFlightResidency {}
 
 // SAFETY: The wrapper exposes no operations on the retained residency set.
 unsafe impl Sync for InFlightResidency {}
+
+struct ReusableSubmissionObjects {
+    allocator: Retained<ProtocolObject<dyn MTL4CommandAllocator>>,
+    argument_table: Retained<ProtocolObject<dyn MTL4ArgumentTable>>,
+}
+
+// SAFETY: Ownership moves between the encoding thread and the completion tracker, and the
+// allocator and argument table are not reused until GPU completion.
+unsafe impl Send for ReusableSubmissionObjects {}
+
+struct SubmissionObjects {
+    reusable: Option<ReusableSubmissionObjects>,
+    owner: Weak<InFlightTracker>,
+}
+
+impl SubmissionObjects {
+    fn allocator(&self) -> Result<&ProtocolObject<dyn MTL4CommandAllocator>, BackendError> {
+        self.reusable
+            .as_ref()
+            .map(|objects| objects.allocator.as_ref())
+            .ok_or(BackendError::ExecutionFailed)
+    }
+
+    fn argument_table(&self) -> Result<&ProtocolObject<dyn MTL4ArgumentTable>, BackendError> {
+        self.reusable
+            .as_ref()
+            .map(|objects| objects.argument_table.as_ref())
+            .ok_or(BackendError::ExecutionFailed)
+    }
+
+    fn take(&mut self) -> Result<ReusableSubmissionObjects, BackendError> {
+        self.reusable.take().ok_or(BackendError::ExecutionFailed)
+    }
+}
+
+impl Drop for SubmissionObjects {
+    fn drop(&mut self) {
+        if let (Some(objects), Some(owner)) = (self.reusable.take(), self.owner.upgrade()) {
+            owner.return_dirty(objects);
+        }
+    }
+}
+
+fn reset_allocator(allocator: &ProtocolObject<dyn MTL4CommandAllocator>) {
+    assert_not_in_metal_callback();
+    allocator.reset();
+}
 
 struct GpuTimestamps {
     heap: Retained<ProtocolObject<dyn MTL4CounterHeap>>,
@@ -451,6 +494,7 @@ impl ListenerRegistration {
 
 struct InFlightCompletion {
     completion: Arc<Completion>,
+    objects: ReusableSubmissionObjects,
     _listener: Retained<MTLSharedEventListener>,
     _notification: NotificationHandler,
 }
@@ -466,6 +510,7 @@ unsafe impl Sync for InFlightCompletion {}
 pub(super) struct InFlightTracker {
     completions: Mutex<Vec<InFlightCompletion>>,
     done: Mutex<Vec<InFlightCompletion>>,
+    pool: Mutex<Vec<ReusableSubmissionObjects>>,
 }
 
 impl InFlightTracker {
@@ -473,13 +518,50 @@ impl InFlightTracker {
         Self {
             completions: Mutex::new(Vec::new()),
             done: Mutex::new(Vec::new()),
+            pool: Mutex::new(Vec::new()),
         }
+    }
+
+    fn checkout(
+        self: &Arc<Self>,
+        device: &ProtocolObject<dyn MTLDevice>,
+    ) -> Result<SubmissionObjects, BackendError> {
+        use objc2_metal::MTL4ArgumentTableDescriptor;
+
+        self.drain_done();
+        let reusable = self
+            .pool
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?
+            .pop();
+        let reusable = if let Some(objects) = reusable {
+            reset_allocator(&objects.allocator);
+            objects
+        } else {
+            let allocator = device
+                .newCommandAllocator()
+                .ok_or(BackendError::ExecutionFailed)?;
+            let descriptor = MTL4ArgumentTableDescriptor::new();
+            descriptor.setMaxBufferBindCount(8);
+            let argument_table = device
+                .newArgumentTableWithDescriptor_error(&descriptor)
+                .map_err(|_| BackendError::ExecutionFailed)?;
+            ReusableSubmissionObjects {
+                allocator,
+                argument_table,
+            }
+        };
+        Ok(SubmissionObjects {
+            reusable: Some(reusable),
+            owner: Arc::downgrade(self),
+        })
     }
 
     fn track(
         self: &Arc<Self>,
         completion: &Arc<Completion>,
         listener: &Retained<MTLSharedEventListener>,
+        objects: &mut SubmissionObjects,
     ) -> Result<ListenerRegistration, BackendError> {
         let pending = Arc::clone(completion);
         let owner = Arc::clone(self);
@@ -495,6 +577,7 @@ impl InFlightTracker {
             .map_err(|_| BackendError::ExecutionFailed)?
             .push(InFlightCompletion {
                 completion: Arc::clone(completion),
+                objects: objects.take()?,
                 _listener: listener.clone(),
                 _notification: notification.clone(),
             });
@@ -527,17 +610,33 @@ impl InFlightTracker {
     }
 
     fn cancel(&self, completion: &Arc<Completion>) {
-        drop(self.take(completion));
+        if let Some(completed) = self.take(completion) {
+            self.return_dirty(completed.objects);
+        }
     }
 
     fn drain_done(&self) {
+        assert_not_in_metal_callback();
         let done = std::mem::take(
             &mut *self
                 .done
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
         );
-        drop(done);
+        let mut pool = self
+            .pool
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for completed in done {
+            pool.push(completed.objects);
+        }
+    }
+
+    fn return_dirty(&self, objects: ReusableSubmissionObjects) {
+        self.pool
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(objects);
     }
 
     pub(super) fn drain(&self, timeout: Duration) {
@@ -557,6 +656,14 @@ impl InFlightTracker {
     #[cfg(test)]
     fn len(&self) -> usize {
         self.completions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+
+    #[cfg(test)]
+    fn pooled_len(&self) -> usize {
+        self.pool
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .len()
@@ -623,13 +730,19 @@ impl MetalBackend {
         for tensor in &tensors {
             self.validate(tensor)?;
         }
-        let command_buffer = self.begin_command_buffer()?;
+        let mut objects = self.in_flight.checkout(&self.device)?;
+        let command_buffer = self.begin_command_buffer(objects.allocator()?)?;
         let timestamps = self.make_timestamps()?;
         // SAFETY: The timestamp heap has two entries and is retained until completion.
         unsafe {
             command_buffer.writeTimestampIntoHeap_atIndex(&timestamps.heap, 0);
         }
-        let encoded = self.encode_dispatches(&command_buffer, &dispatches, &barriers)?;
+        let encoded = self.encode_dispatches(
+            &command_buffer,
+            objects.argument_table()?,
+            &dispatches,
+            &barriers,
+        )?;
         let resources = self.command_resources(&tensors, encoded)?;
         let residency = self.make_resident(&command_buffer, &resources)?;
         // SAFETY: The timestamp heap has two entries and is retained until completion.
@@ -637,28 +750,28 @@ impl MetalBackend {
             command_buffer.writeTimestampIntoHeap_atIndex(&timestamps.heap, 1);
         }
         command_buffer.endCommandBuffer();
-        self.commit(&command_buffer, &tensors, resources, residency, timestamps)
+        self.commit(
+            &command_buffer,
+            &tensors,
+            resources,
+            residency,
+            timestamps,
+            &mut objects,
+        )
     }
 
     fn encode_dispatches(
         &self,
         command_buffer: &ProtocolObject<dyn MTL4CommandBuffer>,
+        table: &ProtocolObject<dyn MTL4ArgumentTable>,
         dispatches: &[Dispatch],
         barriers: &[bool],
     ) -> Result<EncodedDispatches, BackendError> {
-        use objc2_metal::{
-            MTL4ArgumentTableDescriptor, MTL4CommandEncoder, MTL4VisibilityOptions, MTLStages,
-        };
+        use objc2_metal::{MTL4CommandEncoder, MTL4VisibilityOptions, MTLStages};
 
         let encoder = command_buffer
             .computeCommandEncoder()
             .ok_or(BackendError::ExecutionFailed)?;
-        let descriptor = MTL4ArgumentTableDescriptor::new();
-        descriptor.setMaxBufferBindCount(8);
-        let table = self
-            .device
-            .newArgumentTableWithDescriptor_error(&descriptor)
-            .map_err(|_| BackendError::ExecutionFailed)?;
         let mut temporaries = Vec::with_capacity(dispatches.len().saturating_mul(3));
         let mut error_flags = Vec::new();
         let mut bindings = ArgumentBindings::default();
@@ -673,7 +786,7 @@ impl MetalBackend {
             if let Op::RmsNorm { eps } = dispatch.op() {
                 temporaries.extend(self.encode_rms_norm(
                     &encoder,
-                    &table,
+                    table,
                     dispatch,
                     eps,
                     &mut bindings,
@@ -683,7 +796,7 @@ impl MetalBackend {
             if dispatch.op() == Op::Softmax {
                 temporaries.extend(self.encode_softmax(
                     &encoder,
-                    &table,
+                    table,
                     dispatch,
                     &mut bindings,
                 )?);
@@ -692,7 +805,7 @@ impl MetalBackend {
             if let Op::Rope { theta } = dispatch.op() {
                 temporaries.extend(self.encode_rope(
                     &encoder,
-                    &table,
+                    table,
                     dispatch,
                     theta,
                     &mut bindings,
@@ -701,22 +814,17 @@ impl MetalBackend {
             }
             if dispatch.op() == Op::Embed {
                 let (buffers, flag) =
-                    self.encode_embed(&encoder, &table, dispatch, &mut bindings)?;
+                    self.encode_embed(&encoder, table, dispatch, &mut bindings)?;
                 temporaries.extend(buffers);
                 error_flags.push(flag);
                 continue;
             }
             if dispatch.op() == Op::Copy {
-                temporaries.extend(self.encode_copy(&encoder, &table, dispatch, &mut bindings)?);
+                temporaries.extend(self.encode_copy(&encoder, table, dispatch, &mut bindings)?);
                 continue;
             }
             if dispatch.op() == Op::Matmul {
-                temporaries.extend(self.encode_matmul(
-                    &encoder,
-                    &table,
-                    dispatch,
-                    &mut bindings,
-                )?);
+                temporaries.extend(self.encode_matmul(&encoder, table, dispatch, &mut bindings)?);
                 continue;
             }
             let kernel = match dispatch.op() {
@@ -735,7 +843,7 @@ impl MetalBackend {
             };
             temporaries.extend(self.encode_elementwise(
                 &encoder,
-                &table,
+                table,
                 dispatch,
                 kernel,
                 &mut bindings,
@@ -1471,16 +1579,13 @@ impl MetalBackend {
 
     fn begin_command_buffer(
         &self,
+        allocator: &ProtocolObject<dyn MTL4CommandAllocator>,
     ) -> Result<Retained<ProtocolObject<dyn MTL4CommandBuffer>>, BackendError> {
-        let allocator = self
-            .device
-            .newCommandAllocator()
-            .ok_or(BackendError::ExecutionFailed)?;
         let command_buffer = self
             .device
             .newCommandBuffer()
             .ok_or(BackendError::ExecutionFailed)?;
-        command_buffer.beginCommandBufferWithAllocator(&allocator);
+        command_buffer.beginCommandBufferWithAllocator(allocator);
         Ok(command_buffer)
     }
 
@@ -1619,6 +1724,7 @@ impl MetalBackend {
         resources: CommandResources,
         residency: Retained<ProtocolObject<dyn MTLResidencySet>>,
         timestamps: GpuTimestamps,
+        objects: &mut SubmissionObjects,
     ) -> Result<MetalSubmission, BackendError> {
         let completion = self.retain_tensors(
             tensors,
@@ -1629,7 +1735,9 @@ impl MetalBackend {
             InFlightResidency { _raw: residency },
             timestamps,
         )?;
-        let registration = self.in_flight.track(&completion, &self.event_listener)?;
+        let registration = self
+            .in_flight
+            .track(&completion, &self.event_listener, objects)?;
         let command_buffer_ref: &ProtocolObject<dyn MTL4CommandBuffer> = command_buffer;
         let mut command_buffers = [NonNull::from(command_buffer_ref)];
         let Ok(mut next_event_value) = self.next_event_value.lock() else {
@@ -1791,12 +1899,14 @@ impl PipelineCache {
 
 #[cfg(test)]
 mod tests {
-    use std::time::{Duration, Instant};
+    use std::{
+        thread,
+        time::{Duration, Instant},
+    };
 
     use forja_core::{Backend, CommandList, DType, Op, Slice, Submission};
     use forja_cpu::CpuBackend;
-    use forja_testing::{TensorSpec, assert_backends_agree};
-    use objc2_metal::{MTL4CommandQueue, MTLEvent};
+    use forja_testing::{TensorSpec, assert_backends_agree, assert_outputs_agree};
 
     use super::*;
 
@@ -1806,59 +1916,74 @@ mod tests {
         assert!(PipelineCache::new(&backend.device, "kernel void broken(").is_err());
     }
 
-    #[test]
-    fn shared_event_listener_reaps_many_command_buffers() {
-        let backend = MetalBackend::new().unwrap();
-        let queue = backend.device.newMTL4CommandQueue().unwrap();
-        let descriptor = MTLResidencySetDescriptor::new();
-        let residency = backend
-            .device
-            .newResidencySetWithDescriptor_error(&descriptor)
-            .unwrap();
-        residency.commit();
-
-        for _ in 0..1000 {
-            let command_buffer = backend.begin_command_buffer().unwrap();
-            command_buffer.endCommandBuffer();
-            let event = backend.device.newSharedEvent().unwrap();
-            let completion = Completion::new(
-                CommandResources {
-                    buffers: Vec::new(),
-                    error_flags: Vec::new(),
-                },
-                InFlightEvent { raw: event.clone() },
-                InFlightResidency {
-                    _raw: residency.clone(),
-                },
-                None,
-                Arc::downgrade(&backend.in_flight),
-            );
-            completion.finish(CommitResult::Known(Ok(())));
-            let registration = backend
-                .in_flight
-                .track(&completion, &backend.event_listener)
+    fn run_varying_submissions(backend: &MetalBackend, count: usize, offset: usize) {
+        let widths = [1_u32, 7, 33, 4097];
+        for sequence in offset..offset + count {
+            let width = widths[sequence % widths.len()];
+            let len = usize::try_from(width).unwrap();
+            let left = backend.alloc(DType::F32, &[width]).unwrap();
+            let right = backend.alloc(DType::F32, &[width]).unwrap();
+            let output = backend.alloc(DType::F32, &[width]).unwrap();
+            let left_bytes = vec![1.0_f32; len]
+                .into_iter()
+                .flat_map(f32::to_le_bytes)
+                .collect::<Vec<_>>();
+            let right_bytes = vec![2.0_f32; len]
+                .into_iter()
+                .flat_map(f32::to_le_bytes)
+                .collect::<Vec<_>>();
+            backend.write(&left, &left_bytes).unwrap();
+            backend.write(&right, &right_bytes).unwrap();
+            let mut commands = CommandList::new();
+            commands
+                .dispatch(Op::Add, &[&left, &right], &output)
                 .unwrap();
-            let command_buffer_ref: &ProtocolObject<dyn MTL4CommandBuffer> = &command_buffer;
-            let mut command_buffers = [NonNull::from(command_buffer_ref)];
-            // SAFETY: The pointer names one live command buffer and the count matches the array.
-            unsafe {
-                queue.commit_count(
-                    NonNull::from(&mut command_buffers[0]),
-                    command_buffers.len(),
-                );
+            let submission = backend.submit(commands).unwrap();
+            if sequence % 2 == 0 {
+                submission.wait().unwrap();
+            } else {
+                drop(submission);
             }
-            let shared_event: &ProtocolObject<dyn MTLSharedEvent> = &event;
-            let event: &ProtocolObject<dyn MTLEvent> = shared_event.as_ref();
-            queue.signalEvent_value(event, 1);
-            registration.register(1);
+            let actual = backend.read(&output).unwrap();
+            let expected = vec![3.0_f32; len]
+                .into_iter()
+                .flat_map(f32::to_le_bytes)
+                .collect::<Vec<_>>();
+            assert_outputs_agree(DType::F32, &expected, &actual).unwrap();
+            backend.release(&left).unwrap();
+            backend.release(&right).unwrap();
+            backend.release(&output).unwrap();
         }
+    }
 
+    #[test]
+    fn pooled_submission_objects_survive_waits_and_drops() {
+        let backend = MetalBackend::new().unwrap();
+        run_varying_submissions(&backend, 1000, 0);
+        backend.in_flight.drain_done();
+        assert_eq!(backend.in_flight.len(), 0);
+        assert_eq!(backend.in_flight.pooled_len(), 1);
+    }
+
+    #[test]
+    fn concurrent_submissions_share_one_backend() {
+        let backend = Arc::new(MetalBackend::new().unwrap());
+        let workers = (0..8)
+            .map(|worker| {
+                let backend = Arc::clone(&backend);
+                thread::spawn(move || run_varying_submissions(&backend, 200, worker * 200))
+            })
+            .collect::<Vec<_>>();
+        for worker in workers {
+            worker.join().unwrap();
+        }
         let started = Instant::now();
         while backend.in_flight.len() != 0 {
             assert!(started.elapsed() < backend.gpu_timeout);
-            std::thread::yield_now();
+            thread::yield_now();
         }
         backend.in_flight.drain_done();
+        assert!(backend.in_flight.pooled_len() >= 1);
     }
 
     #[test]
@@ -2027,9 +2152,7 @@ mod tests {
 
     #[test]
     fn scratch_copy_is_visible_to_a_following_consumer() {
-        use objc2_metal::{
-            MTL4ArgumentTableDescriptor, MTL4CommandEncoder, MTL4VisibilityOptions, MTLStages,
-        };
+        use objc2_metal::{MTL4CommandEncoder, MTL4VisibilityOptions, MTLStages};
 
         let backend = MetalBackend::new().unwrap();
         let source = backend.alloc(DType::F32, &[33]).unwrap();
@@ -2040,14 +2163,12 @@ mod tests {
             .collect::<Vec<_>>();
         backend.write(&source, &bytes).unwrap();
 
-        let command_buffer = backend.begin_command_buffer().unwrap();
-        let encoder = command_buffer.computeCommandEncoder().unwrap();
-        let descriptor = MTL4ArgumentTableDescriptor::new();
-        descriptor.setMaxBufferBindCount(4);
-        let table = backend
-            .device
-            .newArgumentTableWithDescriptor_error(&descriptor)
+        let mut objects = backend.in_flight.checkout(&backend.device).unwrap();
+        let command_buffer = backend
+            .begin_command_buffer(objects.allocator().unwrap())
             .unwrap();
+        let encoder = command_buffer.computeCommandEncoder().unwrap();
+        let table = objects.argument_table().unwrap();
         let source_buffer = backend.encoder_tensor(&source).unwrap();
         let output_buffer = backend.encoder_tensor(&output).unwrap();
         let scratch = backend.scratch_tensor(DType::F32, &[33]).unwrap();
@@ -2055,7 +2176,7 @@ mod tests {
         let mut temporaries = vec![scratch.buffer.clone()];
         temporaries.extend(
             backend
-                .encode_copy_tensors(&encoder, &table, &source_buffer, &scratch, &mut bindings)
+                .encode_copy_tensors(&encoder, table, &source_buffer, &scratch, &mut bindings)
                 .unwrap(),
         );
         encoder.barrierAfterEncoderStages_beforeEncoderStages_visibilityOptions(
@@ -2065,7 +2186,7 @@ mod tests {
         );
         temporaries.extend(
             backend
-                .encode_copy_tensors(&encoder, &table, &scratch, &output_buffer, &mut bindings)
+                .encode_copy_tensors(&encoder, table, &scratch, &output_buffer, &mut bindings)
                 .unwrap(),
         );
         encoder.endEncoding();
@@ -2089,7 +2210,14 @@ mod tests {
         }
         command_buffer.endCommandBuffer();
         backend
-            .commit(&command_buffer, &tensors, resources, residency, timestamps)
+            .commit(
+                &command_buffer,
+                &tensors,
+                resources,
+                residency,
+                timestamps,
+                &mut objects,
+            )
             .unwrap()
             .wait()
             .unwrap();

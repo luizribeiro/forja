@@ -20,6 +20,10 @@ pub(super) struct MetalBuffer {
     pending: Vec<Weak<Completion>>,
 }
 
+// SAFETY: Buffer access and pending-submission tracking are serialized by the backend registry
+// mutex, and Metal buffers support use from multiple host threads.
+unsafe impl Send for MetalBuffer {}
+
 impl MetalBuffer {
     fn write(&mut self, range: std::ops::Range<usize>, source: &[u8]) {
         // SAFETY: `raw` is a live shared-storage buffer of `len` bytes, the registry grants
