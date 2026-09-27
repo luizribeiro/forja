@@ -961,7 +961,7 @@ mod tests {
     use proptest::prelude::*;
 
     use super::*;
-    use crate::{BufferId, Layout};
+    use crate::{BufferId, Layout, Slice};
 
     fn program(insts: Vec<Inst>, outputs: Vec<(u32, u32)>) -> Program {
         Program {
@@ -994,6 +994,72 @@ mod tests {
             writable,
         )
         .unwrap()
+    }
+
+    struct Builder {
+        kind: ProgramKind,
+        insts: Vec<Inst>,
+        outputs: Vec<(u32, u32)>,
+    }
+
+    impl Builder {
+        fn new(kind: ProgramKind) -> Self {
+            Self {
+                kind,
+                insts: Vec::new(),
+                outputs: Vec::new(),
+            }
+        }
+
+        fn push(&mut self, inst: Inst) -> u32 {
+            let value = u32::try_from(self.insts.len()).unwrap();
+            self.insts.push(inst);
+            value
+        }
+
+        fn input(&mut self, slot: u32) -> u32 {
+            self.push(Inst::Input(slot))
+        }
+
+        fn constant(&mut self, value: f32) -> u32 {
+            self.push(Inst::Const(value))
+        }
+
+        fn index(&mut self, axis: u8) -> u32 {
+            self.push(Inst::Index(axis))
+        }
+
+        fn extent(&mut self, axis: u8) -> u32 {
+            self.push(Inst::Extent(axis))
+        }
+
+        fn unary(&mut self, op: UnOp, value: u32) -> u32 {
+            self.push(Inst::Unary(op, value))
+        }
+
+        fn binary(&mut self, op: BinOp, left: u32, right: u32) -> u32 {
+            self.push(Inst::Binary(op, left, right))
+        }
+
+        fn cast(&mut self, to: ValueType, value: u32) -> u32 {
+            self.push(Inst::Cast(to, value))
+        }
+
+        fn reduce(&mut self, op: RedOp, value: u32) -> u32 {
+            self.push(Inst::Reduce(op, value))
+        }
+
+        fn output(&mut self, slot: u32, value: u32) {
+            self.outputs.push((slot, value));
+        }
+
+        fn finish(self) -> Program {
+            Program {
+                kind: self.kind,
+                insts: self.insts,
+                outputs: self.outputs,
+            }
+        }
     }
 
     #[test]
@@ -1398,6 +1464,147 @@ mod tests {
                 20, 200, 66, 139, 67, 115, 65, 110, 171, 255, 154, 206, 139, 237,
             ]
         );
+    }
+
+    #[test]
+    fn representative_programs_validate_and_bind_to_qwen_views() {
+        let rms_norm = rms_norm_program().validate().unwrap();
+        let hidden = tensor(20, DType::BF16, &[7, 1024], &[1024, 1]);
+        let weight = tensor(21, DType::F32, &[7, 1024], &[0, 1]);
+        let normalized = tensor(22, DType::BF16, &[7, 1024], &[1024, 1]);
+        bind_program(&rms_norm, &[&hidden, &weight], &[&normalized]).unwrap();
+
+        let softmax = softmax_program().validate().unwrap();
+        let scores = tensor(23, DType::F32, &[16, 7, 33], &[231, 33, 1]);
+        let probabilities = tensor(24, DType::F16, &[16, 7, 33], &[231, 33, 1]);
+        bind_program(&softmax, &[&scores], &[&probabilities]).unwrap();
+
+        let silu_mul = silu_mul_program().validate().unwrap();
+        let gate = tensor(25, DType::BF16, &[7, 3072], &[3072, 1]);
+        let up = tensor(26, DType::BF16, &[7, 3072], &[3072, 1]);
+        let activated = tensor(27, DType::BF16, &[7, 3072], &[3072, 1]);
+        bind_program(&silu_mul, &[&gate, &up], &[&activated]).unwrap();
+
+        let residual_add = residual_add_program().validate().unwrap();
+        let residual = tensor(28, DType::F32, &[7, 1024], &[1024, 1]);
+        let update = tensor(29, DType::F16, &[7, 1024], &[1024, 1]);
+        let sum = tensor(30, DType::BF16, &[7, 1024], &[1024, 1]);
+        bind_program(&residual_add, &[&residual, &update], &[&sum]).unwrap();
+
+        let rope = half_split_rope_program().validate().unwrap();
+        let (first_half, second_half) = split_head_halves(31, DType::F16);
+        let first_rotated = tensor(32, DType::F16, &[7, 16, 1, 64], &[1024, 64, 64, 1]);
+        let second_rotated = tensor(33, DType::F16, &[7, 16, 1, 64], &[1024, 64, 64, 1]);
+        bind_program(
+            &rope,
+            &[&first_half, &second_half],
+            &[&first_rotated, &second_rotated],
+        )
+        .unwrap();
+    }
+
+    fn rms_norm_program() -> Program {
+        let mut builder = Builder::new(ProgramKind::Row);
+        let value = builder.input(0);
+        let weight = builder.input(1);
+        let square = builder.binary(BinOp::Mul, value, value);
+        let sum = builder.reduce(RedOp::Sum, square);
+        let width = builder.extent(1);
+        let width = builder.cast(ValueType::F32, width);
+        let mean = builder.binary(BinOp::Div, sum, width);
+        let epsilon = builder.constant(1e-6);
+        let stabilized = builder.binary(BinOp::Add, mean, epsilon);
+        let inverse_rms = builder.unary(UnOp::Rsqrt, stabilized);
+        let normalized = builder.binary(BinOp::Mul, value, inverse_rms);
+        let scaled = builder.binary(BinOp::Mul, normalized, weight);
+        builder.output(0, scaled);
+        builder.finish()
+    }
+
+    fn softmax_program() -> Program {
+        let mut builder = Builder::new(ProgramKind::Row);
+        let value = builder.input(0);
+        let maximum = builder.reduce(RedOp::Max, value);
+        let centered = builder.binary(BinOp::Sub, value, maximum);
+        let exponent = builder.unary(UnOp::Exp, centered);
+        let denominator = builder.reduce(RedOp::Sum, exponent);
+        let probability = builder.binary(BinOp::Div, exponent, denominator);
+        builder.output(0, probability);
+        builder.finish()
+    }
+
+    fn silu_mul_program() -> Program {
+        let mut builder = Builder::new(ProgramKind::Map);
+        let gate = builder.input(0);
+        let up = builder.input(1);
+        let sigmoid = builder.unary(UnOp::Sigmoid, gate);
+        let silu = builder.binary(BinOp::Mul, gate, sigmoid);
+        let activated = builder.binary(BinOp::Mul, silu, up);
+        builder.output(0, activated);
+        builder.finish()
+    }
+
+    fn residual_add_program() -> Program {
+        let mut builder = Builder::new(ProgramKind::Map);
+        let residual = builder.input(0);
+        let update = builder.input(1);
+        let sum = builder.binary(BinOp::Add, residual, update);
+        builder.output(0, sum);
+        builder.finish()
+    }
+
+    fn half_split_rope_program() -> Program {
+        let mut builder = Builder::new(ProgramKind::Map);
+        let first = builder.input(0);
+        let second = builder.input(1);
+        let position = builder.index(0);
+        let position = builder.cast(ValueType::F32, position);
+        let frequency = builder.index(3);
+        let frequency = builder.cast(ValueType::F32, frequency);
+        let two = builder.constant(2.0);
+        let doubled = builder.binary(BinOp::Mul, frequency, two);
+        let head_dimension = builder.constant(128.0);
+        let exponent = builder.binary(BinOp::Div, doubled, head_dimension);
+        let theta = builder.constant(1_000_000.0);
+        let scale = builder.binary(BinOp::Pow, theta, exponent);
+        let angle = builder.binary(BinOp::Div, position, scale);
+        let cosine = builder.unary(UnOp::Cos, angle);
+        let sine = builder.unary(UnOp::Sin, angle);
+        let first_cosine = builder.binary(BinOp::Mul, first, cosine);
+        let second_sine = builder.binary(BinOp::Mul, second, sine);
+        let first_rotated = builder.binary(BinOp::Sub, first_cosine, second_sine);
+        let second_cosine = builder.binary(BinOp::Mul, second, cosine);
+        let first_sine = builder.binary(BinOp::Mul, first, sine);
+        let second_rotated = builder.binary(BinOp::Add, second_cosine, first_sine);
+        builder.output(0, first_rotated);
+        builder.output(1, second_rotated);
+        builder.finish()
+    }
+
+    fn split_head_halves(buffer: u64, dtype: DType) -> (Tensor, Tensor) {
+        let byte_len = 7 * 16 * 128 * dtype.byte_size();
+        let buffer = BufferId::new(7, buffer, byte_len);
+        let base = Layout::contiguous(dtype, 0, vec![7, 16, 2, 64], byte_len).unwrap();
+        let first = base
+            .slice(&[
+                Slice::new(0, 7, 1).unwrap(),
+                Slice::new(0, 16, 1).unwrap(),
+                Slice::new(0, 1, 1).unwrap(),
+                Slice::new(0, 64, 1).unwrap(),
+            ])
+            .unwrap();
+        let second = base
+            .slice(&[
+                Slice::new(0, 7, 1).unwrap(),
+                Slice::new(0, 16, 1).unwrap(),
+                Slice::new(1, 1, 1).unwrap(),
+                Slice::new(0, 64, 1).unwrap(),
+            ])
+            .unwrap();
+        (
+            Tensor::from_allocation(buffer, first, true).unwrap(),
+            Tensor::from_allocation(buffer, second, true).unwrap(),
+        )
     }
 
     proptest! {
