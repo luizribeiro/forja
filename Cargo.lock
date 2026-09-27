@@ -518,6 +518,9 @@ dependencies = [
 [[package]]
 name = "forja-sdk"
 version = "0.0.0"
+dependencies = [
+ "half",
+]
 
 [[package]]
 name = "forja-testing"
