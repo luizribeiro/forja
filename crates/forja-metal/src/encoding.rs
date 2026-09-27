@@ -3,7 +3,7 @@ use std::{
     collections::{HashMap, HashSet},
     ffi::c_void,
     ptr::NonNull,
-    sync::{Arc, Condvar, Mutex, Weak},
+    sync::{Arc, Condvar, Mutex, OnceLock, Weak},
     time::{Duration, Instant},
 };
 
@@ -164,6 +164,7 @@ struct MatmulShape {
 
 struct MatmulLaunch {
     pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    kernel: &'static str,
     block_rows: u32,
     block_columns: u32,
     thread_count: usize,
@@ -181,6 +182,48 @@ struct PreparedMatmulOutput {
     tensor: EncoderTensor,
     leading_dimension: u64,
     batch_stride: u64,
+    copied: bool,
+}
+
+fn log_matmul_route(
+    left: &PreparedMatmulInput,
+    right: &PreparedMatmulInput,
+    output: &PreparedMatmulOutput,
+    launch: &MatmulLaunch,
+    shape: MatmulShape,
+) {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    if !ENABLED.get_or_init(|| std::env::var_os("FORJA_METAL_LOG_MATMUL").is_some()) {
+        return;
+    }
+    let layout = |column_major, copied| match (copied, column_major) {
+        (true, _) => "needs-copy->row-major",
+        (false, 0) => "row-major",
+        (false, _) => "column-major",
+    };
+    eprintln!(
+        "matmul route: [{}, {}, {}]x[{}, {}] path={} kernel={} layouts={}/{}/{} scratch={}/{}/{} staging-casts=none threads={} groups={}x{}x{} dtypes={:?}/{:?}/{:?}",
+        shape.batch,
+        shape.rows,
+        shape.inner,
+        shape.inner,
+        shape.columns,
+        if shape.rows == 1 { "gemv" } else { "gemm" },
+        launch.kernel,
+        layout(left.column_major, left.copied),
+        layout(right.column_major, right.copied),
+        layout(0, output.copied),
+        left.copied,
+        right.copied,
+        output.copied,
+        launch.thread_count,
+        shape.columns.div_ceil(launch.block_columns),
+        shape.rows.div_ceil(launch.block_rows),
+        shape.batch,
+        shape.left_dtype,
+        shape.right_dtype,
+        shape.output_dtype,
+    );
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1316,6 +1359,7 @@ impl MetalBackend {
                         tensor: self.encoder_tensor(output_tensor)?,
                         leading_dimension,
                         batch_stride,
+                        copied: false,
                     },
                     false,
                 )
@@ -1330,6 +1374,7 @@ impl MetalBackend {
                         tensor: scratch,
                         leading_dimension,
                         batch_stride,
+                        copied: true,
                     },
                     true,
                 )
@@ -1789,6 +1834,7 @@ impl MetalBackend {
                     tensor: score_group,
                     leading_dimension,
                     batch_stride,
+                    copied: false,
                 },
                 bindings,
                 arguments,
@@ -1845,6 +1891,7 @@ impl MetalBackend {
                         tensor: output_group.clone(),
                         leading_dimension: ld,
                         batch_stride: stride,
+                        copied: false,
                     },
                     false,
                 )
@@ -1862,6 +1909,7 @@ impl MetalBackend {
                         tensor: scratch,
                         leading_dimension: ld,
                         batch_stride: stride,
+                        copied: true,
                     },
                     true,
                 )
@@ -1996,7 +2044,7 @@ impl MetalBackend {
             params.extend_from_slice(&value.to_ne_bytes());
         }
         let parameter_buffer = arguments.write(&params)?;
-        let launch = self.matmul_launch(MatmulShape {
+        let shape = MatmulShape {
             left_dtype: left.tensor.layout.dtype(),
             right_dtype: right.tensor.layout.dtype(),
             output_dtype: dtype,
@@ -2006,7 +2054,9 @@ impl MetalBackend {
             inner,
             left_column_major: left.column_major != 0,
             right_column_major: right.column_major != 0,
-        })?;
+        };
+        let launch = self.matmul_launch(shape)?;
+        log_matmul_route(left, right, output, &launch, shape);
         encoder.setComputePipelineState(&launch.pipeline);
         bindings.bind(table, 0, &left.tensor.buffer);
         bindings.bind(table, 1, &right.tensor.buffer);
@@ -2132,6 +2182,7 @@ impl MetalBackend {
             .get(kernel, &constants)?;
         Ok(MatmulLaunch {
             pipeline,
+            kernel,
             block_rows,
             block_columns,
             thread_count,
