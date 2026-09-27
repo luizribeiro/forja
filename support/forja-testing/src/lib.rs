@@ -1,6 +1,7 @@
 //! Shared deterministic and numeric helpers for backend tests.
 
 pub mod program;
+pub mod representative;
 
 use std::{error::Error, fmt};
 
