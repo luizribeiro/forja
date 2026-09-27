@@ -178,13 +178,14 @@ fn expand_load(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
         ));
     };
     let name = input.ident;
+    let (impl_generics, type_generics, where_clause) = input.generics.split_for_impl();
     let fields = fields
         .named
         .iter()
         .map(load_field)
         .collect::<syn::Result<Vec<_>>>()?;
     Ok(quote! {
-        impl ::forja_sdk::Load<#config> for #name {
+        impl #impl_generics ::forja_sdk::Load<#config> for #name #type_generics #where_clause {
             fn load(
                 weights: &::forja_sdk::Weights<'_>,
                 config: &#config,

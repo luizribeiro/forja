@@ -2,10 +2,10 @@
 
 //! Native safetensors loading coverage.
 
-use std::path::PathBuf;
+use std::{path::PathBuf, sync::OnceLock};
 
 use forja_sdk::{
-    Load, Tensor, Weights,
+    Load, Tensor, Weights, bf16,
     nn::{Embedding, EmbeddingConfig, Linear, LinearConfig, RmsNorm, RmsNormConfig},
 };
 
@@ -44,6 +44,29 @@ struct FlatModel {
     block: Block,
 }
 
+#[derive(Load)]
+#[load(config = Config)]
+struct PromotedModel<T: forja_sdk::nn::WeightElement> {
+    #[load(
+        name = "bf16_token",
+        prefix,
+        config = EmbeddingConfig::promoted_bf16(config.vocab, config.hidden)
+    )]
+    embedding: Embedding<T>,
+    #[load(
+        name = "bf16_projection",
+        prefix,
+        config = LinearConfig::promoted_bf16(config.hidden, config.hidden)
+    )]
+    projection: Linear<T>,
+    #[load(
+        name = "bf16_norm",
+        prefix,
+        config = RmsNormConfig::promoted_bf16(config.hidden, 1.0e-6)
+    )]
+    norm: RmsNorm<T>,
+}
+
 #[test]
 fn loads_nested_modules_from_safetensors() {
     let path = weight_file();
@@ -60,6 +83,15 @@ fn loads_nested_modules_from_safetensors() {
     assert_eq!(
         model.embedding.forward(&tokens).unwrap().to_vec().unwrap(),
         [5.0, 6.0]
+    );
+    assert_eq!(
+        model
+            .embedding
+            .project(&Tensor::from_slice(&[1.0_f32, 1.0], &[1, 2]).unwrap())
+            .unwrap()
+            .to_vec()
+            .unwrap(),
+        [3.0, 7.0, 11.0]
     );
     let input = Tensor::from_slice(&[1.0_f32, 2.0], &[1, 2]).unwrap();
     assert_eq!(
@@ -96,34 +128,83 @@ fn loads_nested_modules_from_safetensors() {
     assert!(error.to_string().contains("token.weight"));
 }
 
+#[test]
+fn promotes_bf16_module_weights_to_f32() {
+    let path = weight_file();
+    let weights = Weights::open(&path).unwrap();
+    let config = Config {
+        vocab: 3,
+        hidden: 2,
+        layers: 2,
+    };
+    let model = PromotedModel::<f32>::load(&weights, &config).unwrap();
+    let tokens = Tensor::from_slice(&[2_u32], &[1]).unwrap();
+    assert_eq!(
+        model.embedding.forward(&tokens).unwrap().to_vec().unwrap(),
+        [5.0, 6.0]
+    );
+    let input = Tensor::from_slice(&[1.0_f32, 2.0], &[1, 2]).unwrap();
+    assert_eq!(
+        model.projection.forward(&input).unwrap().to_vec().unwrap(),
+        [5.0, 11.0]
+    );
+    assert_eq!(model.norm.forward(&input).unwrap().shape(), [1, 2]);
+}
+
 fn weight_file() -> PathBuf {
-    let tensors: [(&str, Vec<u32>, Vec<f32>); 5] = [
+    static PATH: OnceLock<PathBuf> = OnceLock::new();
+    PATH.get_or_init(write_weight_file).clone()
+}
+
+fn write_weight_file() -> PathBuf {
+    let tensors: [(&str, &str, Vec<u32>, Vec<u8>); 8] = [
         (
             "token.weight",
+            "F32",
             vec![3, 2],
-            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            f32_bytes(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
         ),
         (
             "blocks.0.projection.weight",
+            "F32",
             vec![2, 2],
-            vec![1.0, 0.0, 0.0, 1.0],
+            f32_bytes(&[1.0, 0.0, 0.0, 1.0]),
         ),
         (
             "blocks.1.projection.weight",
+            "F32",
             vec![2, 2],
-            vec![3.0, 10.0, 7.0, 23.0],
+            f32_bytes(&[3.0, 10.0, 7.0, 23.0]),
         ),
-        ("norm.weight", vec![2], vec![1.0, 1.0]),
-        ("projection.weight", vec![2, 2], vec![2.0, 0.0, 0.0, 3.0]),
+        ("norm.weight", "F32", vec![2], f32_bytes(&[1.0, 1.0])),
+        (
+            "projection.weight",
+            "F32",
+            vec![2, 2],
+            f32_bytes(&[2.0, 0.0, 0.0, 3.0]),
+        ),
+        (
+            "bf16_token.weight",
+            "BF16",
+            vec![3, 2],
+            bf16_bytes(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
+        ),
+        (
+            "bf16_projection.weight",
+            "BF16",
+            vec![2, 2],
+            bf16_bytes(&[1.0, 2.0, 3.0, 4.0]),
+        ),
+        ("bf16_norm.weight", "BF16", vec![2], bf16_bytes(&[1.0, 1.0])),
     ];
     let mut offset = 0_usize;
     let entries = tensors
         .iter()
-        .map(|(name, shape, values)| {
+        .map(|(name, dtype, shape, bytes)| {
             let start = offset;
-            offset += values.len() * 4;
+            offset += bytes.len();
             format!(
-                "\"{name}\":{{\"dtype\":\"F32\",\"shape\":{shape:?},\"data_offsets\":[{start},{offset}]}}"
+                "\"{name}\":{{\"dtype\":\"{dtype}\",\"shape\":{shape:?},\"data_offsets\":[{start},{offset}]}}"
             )
         })
         .collect::<Vec<_>>()
@@ -137,9 +218,23 @@ fn weight_file() -> PathBuf {
     bytes.extend(
         tensors
             .iter()
-            .flat_map(|(_, _, values)| values.iter().flat_map(|value| value.to_le_bytes())),
+            .flat_map(|(_, _, _, bytes)| bytes.iter().copied()),
     );
     let path = std::env::temp_dir().join(format!("forja-sdk-load-{}", std::process::id()));
     std::fs::write(&path, bytes).unwrap();
     path
+}
+
+fn f32_bytes(values: &[f32]) -> Vec<u8> {
+    values
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect()
+}
+
+fn bf16_bytes(values: &[f32]) -> Vec<u8> {
+    values
+        .iter()
+        .flat_map(|value| bf16::from_f32(*value).to_le_bytes())
+        .collect()
 }
