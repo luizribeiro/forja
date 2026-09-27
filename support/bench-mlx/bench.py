@@ -6,6 +6,7 @@ import importlib.metadata
 import json
 import platform
 import subprocess
+import time
 from pathlib import Path
 
 import mlx.core as mx
@@ -13,6 +14,8 @@ from mlx.utils import tree_flatten
 from mlx_lm import load, stream_generate
 
 WARMUPS = 3
+DECODE_PREFILL = 8
+TG_CONTEXT_START = DECODE_PREFILL + 1
 MASK64 = (1 << 64) - 1
 
 
@@ -116,27 +119,46 @@ def main() -> None:
     mx.eval(model.parameters())
     tokenizer._eos_token_ids = set()
     vocab = config.get("vocab_size") or config["text_config"]["vocab_size"]
-    prompt = synthetic_tokens(args.pp, vocab)
+    pp_prompt = synthetic_tokens(args.pp, vocab)
+    tg_prompt = synthetic_tokens(DECODE_PREFILL, vocab)
 
-    def trial():
-        response = None
-        for response in stream_generate(
-            model,
-            tokenizer,
-            prompt,
-            max_tokens=args.tg,
-            prefill_step_size=2048,
-        ):
-            pass
-        if response is None or response.generation_tokens != args.tg:
-            raise RuntimeError("MLX-LM generation ended before the requested length")
-        return response
+    def pp_trial() -> float:
+        response = next(
+            stream_generate(
+                model,
+                tokenizer,
+                pp_prompt,
+                max_tokens=1,
+                prefill_step_size=2048,
+            )
+        )
+        return args.pp / response.prompt_tps
+
+    def tg_trial() -> float:
+        responses = iter(
+            stream_generate(
+                model,
+                tokenizer,
+                tg_prompt,
+                max_tokens=args.tg + 2,
+                prefill_step_size=2048,
+            )
+        )
+        next(responses)
+        next(responses)
+        started = time.perf_counter()
+        for _ in range(args.tg):
+            next(responses)
+        return time.perf_counter() - started
 
     for _ in range(WARMUPS):
-        trial()
-    responses = [trial() for _ in range(args.reps)]
-    pp_times = [args.pp / response.prompt_tps for response in responses]
-    tg_times = [args.tg / response.generation_tps for response in responses]
+        pp_trial()
+        tg_trial()
+    pp_times = []
+    tg_times = []
+    for _ in range(args.reps):
+        pp_times.append(pp_trial())
+        tg_times.append(tg_trial())
     repository = Path(__file__).resolve().parents[2]
     device = mx.device_info()["device_name"]
     report = {
@@ -149,6 +171,7 @@ def main() -> None:
             "warmups": WARMUPS,
             "repetitions": args.reps,
         },
+        "tg_context_start": TG_CONTEXT_START,
         "results": [
             {
                 "provenance": {

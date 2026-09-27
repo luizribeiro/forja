@@ -17,6 +17,7 @@ use crate::{
 
 const WARMUPS: usize = 3;
 const DECODE_PREFILL: usize = 8;
+const TG_CONTEXT_START: usize = DECODE_PREFILL + 1;
 
 #[derive(Clone, Copy)]
 pub(crate) struct Summary {
@@ -83,6 +84,7 @@ async fn run_metal(options: &Bench) -> Result<(), Box<dyn Error>> {
                 "warmups": WARMUPS,
                 "repetitions": options.reps,
             },
+            "tg_context_start": TG_CONTEXT_START,
             "results": results,
         });
         let mut bytes = serde_json::to_vec_pretty(&report)?;
@@ -108,9 +110,8 @@ async fn bench_precision(
     .await?;
     let info = runner.describe().await?;
     if options.pp > usize::try_from(info.max_context)?
-        || DECODE_PREFILL
-            .checked_add(1)
-            .and_then(|length| length.checked_add(options.tg))
+        || TG_CONTEXT_START
+            .checked_add(options.tg)
             .ok_or("decode context length overflowed")?
             > usize::try_from(info.max_context)?
     {
