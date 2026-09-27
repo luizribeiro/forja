@@ -1226,6 +1226,7 @@ impl<B: Backend> Host<B> {
             .iter()
             .map(|entry| &entry.tensor)
             .collect::<Vec<_>>();
+        self.check_program_work(&program, &input_tensors, &output_tensors)?;
         let entry = self.table.get_mut(commands).map_err(invalid_handle)?;
         entry
             .commands
@@ -1357,6 +1358,53 @@ impl<B: Backend> Host<B> {
         }
         .ok_or_else(dispatch_work_quota)?;
         work = work.checked_add(flops).ok_or_else(dispatch_work_quota)?;
+        if work > self.limits.work_per_dispatch {
+            return Err(dispatch_work_quota());
+        }
+        Ok(())
+    }
+
+    fn check_program_work(
+        &self,
+        program: &ValidatedProgram,
+        inputs: &[&Tensor],
+        outputs: &[&Tensor],
+    ) -> Result<(), compute::Error> {
+        let elements = outputs
+            .first()
+            .ok_or_else(dispatch_work_quota)
+            .and_then(|output| self.check_tensor_shape(output.layout().shape()))?;
+        let mut work = inputs
+            .iter()
+            .chain(outputs)
+            .try_fold(0_u64, |work, tensor| {
+                work.checked_add(self.check_tensor_shape(tensor.layout().shape())?)
+                    .ok_or_else(dispatch_work_quota)
+            })?;
+        let reduction_passes = if program.program().kind == ProgramKind::Row {
+            program
+                .program()
+                .insts
+                .iter()
+                .filter(|inst| matches!(inst, Inst::Reduce(_, _)))
+                .count()
+        } else {
+            0
+        };
+        let passes = program
+            .program()
+            .insts
+            .len()
+            .checked_add(reduction_passes)
+            .and_then(|passes| u64::try_from(passes).ok())
+            .ok_or_else(dispatch_work_quota)?;
+        work = work
+            .checked_add(
+                passes
+                    .checked_mul(elements)
+                    .ok_or_else(dispatch_work_quota)?,
+            )
+            .ok_or_else(dispatch_work_quota)?;
         if work > self.limits.work_per_dispatch {
             return Err(dispatch_work_quota());
         }
@@ -2678,6 +2726,40 @@ mod tests {
             &output,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn refuses_large_program_iteration_work() {
+        let limits = GENEROUS.with_command_limits(usize::MAX, 10_000_000);
+        let mut host = Host::new(CpuBackend::new(), limits);
+        let scalar = host.alloc(compute::Dtype::F32, &[1]).unwrap();
+        let input = host
+            .view(
+                &Resource::new_borrow(scalar.rep()),
+                compute::ViewOp::Broadcast(vec![1_000_000]),
+            )
+            .unwrap();
+        let output = host.alloc(compute::Dtype::F32, &[1_000_000]).unwrap();
+        let commands = host.command_list().unwrap();
+        let mut insts = vec![compute::Inst::Input(0)];
+        for operand in 0..255 {
+            insts.push(compute::Inst::Unary((compute::Unop::Neg, operand)));
+        }
+
+        assert!(matches!(
+            host.dispatch_program(
+                &commands,
+                compute::Program {
+                    kind: compute::ProgramKind::Map,
+                    insts,
+                    outputs: vec![(0, 255)],
+                },
+                &[input],
+                &[output],
+            ),
+            Err(compute::Error::Quota(_))
+        ));
+        assert!(host.table.get(&commands).unwrap().commands.is_empty());
     }
 
     #[test]
