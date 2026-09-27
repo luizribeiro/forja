@@ -18,6 +18,7 @@ use crate::{
 const WARMUPS: usize = 3;
 const DECODE_PREFILL: usize = 8;
 const TG_CONTEXT_START: usize = DECODE_PREFILL + 1;
+const PROFILE_CONTEXTS: [usize; 2] = [TG_CONTEXT_START, 512];
 
 #[derive(Clone, Copy)]
 pub(crate) struct Summary {
@@ -33,6 +34,21 @@ struct Sample {
     wall_seconds: f64,
     gpu_seconds: f64,
     submissions: u32,
+}
+
+struct ProfileMeasurement {
+    context_start: usize,
+    baseline: Vec<Sample>,
+    steps: Vec<EngineStepProfile>,
+}
+
+struct ProfileReport {
+    context_start: usize,
+    categories: Vec<ProfileCategory>,
+    wall: Stats,
+    wall_perturbation: Stats,
+    gpu_perturbation: Stats,
+    dispatch_coverage: Stats,
 }
 
 pub(crate) async fn run(options: &Bench) -> Result<(), Box<dyn Error>> {
@@ -58,9 +74,12 @@ async fn run_metal(options: &Bench) -> Result<(), Box<dyn Error>> {
         ("f32", test_guests::qwen3()),
         ("bf16", test_guests::qwen3_bf16()),
     ] {
-        let (pp, tg, device) = bench_precision(options, component).await?;
+        let (pp, tg, device, profiles) = bench_precision(options, component).await?;
         print_summary(precision, "pp", pp);
         print_summary(precision, "tg", tg);
+        for profile in &profiles {
+            print_profile_report(precision, &profile_report(profile)?);
+        }
         results.push(serde_json::json!({
             "provenance": {
                 "git_commit": commit,
@@ -98,7 +117,7 @@ async fn run_metal(options: &Bench) -> Result<(), Box<dyn Error>> {
 async fn bench_precision(
     options: &Bench,
     component: &Path,
-) -> Result<(Summary, Summary, String), Box<dyn Error>> {
+) -> Result<(Summary, Summary, String, Vec<ProfileMeasurement>), Box<dyn Error>> {
     let backend = forja_metal::MetalBackend::new()?;
     let device = backend.device_name();
     let mut runner = EngineRunner::new(
@@ -114,6 +133,7 @@ async fn bench_precision(
             .checked_add(options.tg)
             .ok_or("decode context length overflowed")?
             > usize::try_from(info.max_context)?
+        || options.profile && PROFILE_CONTEXTS[1] >= usize::try_from(info.max_context)?
     {
         return Err("benchmark shape exceeds the engine context".into());
     }
@@ -121,7 +141,15 @@ async fn bench_precision(
         .load()
         .await?
         .map_err(|error| format!("engine load failed: {error:?}"))?;
-    let tokens = synthetic_tokens(options.pp.max(DECODE_PREFILL), info.vocab);
+    let profile_tokens = if options.profile {
+        PROFILE_CONTEXTS[1] - 1
+    } else {
+        0
+    };
+    let tokens = synthetic_tokens(
+        options.pp.max(DECODE_PREFILL).max(profile_tokens),
+        info.vocab,
+    );
     for _ in 0..WARMUPS {
         measure_prefill(&mut runner, &tokens[..options.pp]).await?;
         measure_decode(&mut runner, &tokens[..DECODE_PREFILL], options.tg).await?;
@@ -132,10 +160,16 @@ async fn bench_precision(
         pp.push(measure_prefill(&mut runner, &tokens[..options.pp]).await?);
         tg.push(measure_decode(&mut runner, &tokens[..DECODE_PREFILL], options.tg).await?);
     }
+    let profiles = if options.profile {
+        measure_profiles(&mut runner, &tokens, options.reps).await?
+    } else {
+        Vec::new()
+    };
     Ok((
         summarize(&pp, options.pp)?,
         summarize(&tg, options.tg)?,
         device,
+        profiles,
     ))
 }
 
@@ -175,6 +209,66 @@ async fn measure_decode(
         runner.metrics(),
         started.ok_or("decode timing did not start")?.elapsed(),
     )
+}
+
+#[cfg(target_os = "macos")]
+async fn measure_profiles(
+    runner: &mut EngineRunner<forja_metal::MetalBackend>,
+    tokens: &[u32],
+    reps: usize,
+) -> Result<Vec<ProfileMeasurement>, Box<dyn Error>> {
+    let mut measurements = Vec::new();
+    for context_start in PROFILE_CONTEXTS {
+        let mut baseline = Vec::with_capacity(reps);
+        let mut steps = Vec::with_capacity(reps);
+        for repetition in 0..WARMUPS.saturating_add(reps) {
+            prepare_profile_context(runner, tokens, context_start).await?;
+            let unprofiled = measure_decode_step(runner, tokens[0], context_start).await?;
+            prepare_profile_context(runner, tokens, context_start).await?;
+            runner.set_profiling(true);
+            let profiled = measure_decode_step(runner, tokens[0], context_start).await;
+            runner.set_profiling(false);
+            let _ = profiled?;
+            let profile = runner
+                .take_profile()
+                .ok_or("profiled step produced no timing detail")?;
+            if repetition >= WARMUPS {
+                baseline.push(unprofiled);
+                steps.push(profile);
+            }
+        }
+        measurements.push(ProfileMeasurement {
+            context_start,
+            baseline,
+            steps,
+        });
+    }
+    Ok(measurements)
+}
+
+#[cfg(target_os = "macos")]
+async fn prepare_profile_context(
+    runner: &mut EngineRunner<forja_metal::MetalBackend>,
+    tokens: &[u32],
+    context_start: usize,
+) -> Result<(), Box<dyn Error>> {
+    let prefill = context_start
+        .checked_sub(1)
+        .ok_or("profile context must follow a prefill token")?;
+    step(runner, tokens[..prefill].to_vec(), 0).await?;
+    step(runner, vec![tokens[0]], u32::try_from(prefill)?).await
+}
+
+#[cfg(target_os = "macos")]
+async fn measure_decode_step(
+    runner: &mut EngineRunner<forja_metal::MetalBackend>,
+    token: u32,
+    context_start: usize,
+) -> Result<Sample, Box<dyn Error>> {
+    let before = runner.metrics();
+    let started = Instant::now();
+    step(runner, vec![token], u32::try_from(context_start)?).await?;
+    sample(before, runner.metrics(), started.elapsed())
 }
 
 fn visit_decode_steps(
@@ -277,7 +371,82 @@ fn summary_json(summary: Summary) -> serde_json::Value {
     })
 }
 
-#[allow(dead_code)]
+fn profile_report(measurement: &ProfileMeasurement) -> Result<ProfileReport, Box<dyn Error>> {
+    let submissions = measurement
+        .steps
+        .iter()
+        .map(|step| {
+            step.submission
+                .as_ref()
+                .ok_or("profiled step has no submission detail")
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let categories = profile_categories(&measurement.steps, &submissions);
+    let wall = stats(
+        measurement
+            .steps
+            .iter()
+            .map(|profile| profile.wall_time.as_secs_f64()),
+    );
+    let wall_perturbation = stats(
+        measurement
+            .steps
+            .iter()
+            .zip(&measurement.baseline)
+            .map(|(profile, baseline)| profile.wall_time.as_secs_f64() / baseline.wall_seconds),
+    );
+    let gpu_perturbation = stats(
+        submissions
+            .iter()
+            .zip(&measurement.baseline)
+            .map(|(profile, baseline)| profile.gpu_time.as_secs_f64() / baseline.gpu_seconds),
+    );
+    let dispatch_coverage = stats(submissions.iter().map(|submission| {
+        submission
+            .per_dispatch
+            .iter()
+            .map(|dispatch| dispatch.gpu_time.as_secs_f64())
+            .sum::<f64>()
+            / submission.gpu_time.as_secs_f64()
+    }));
+    Ok(ProfileReport {
+        context_start: measurement.context_start,
+        categories,
+        wall,
+        wall_perturbation,
+        gpu_perturbation,
+        dispatch_coverage,
+    })
+}
+
+fn print_profile_report(precision: &str, report: &ProfileReport) {
+    println!(
+        "\n{precision} tg profile at context {}",
+        report.context_start
+    );
+    println!("category\tcount/token\tms/token\t% wall");
+    for category in &report.categories {
+        let count = stats(category.values.iter().map(|(count, _)| *count));
+        let time = stats(category.values.iter().map(|(_, seconds)| *seconds));
+        print_profile_row(category.name, count, time, report.wall.median);
+    }
+    println!(
+        "timestamp perturbation\twall {:.3}x\tGPU {:.3}x\tdispatch coverage {:.2}%",
+        report.wall_perturbation.median,
+        report.gpu_perturbation.median,
+        report.dispatch_coverage.median * 100.0
+    );
+}
+
+fn print_profile_row(name: &str, count: Stats, time: Stats, wall_seconds: f64) {
+    println!(
+        "{name}\t{:.1}\t{:.3}\t{:.2}",
+        count.median,
+        time.median * 1_000.0,
+        time.median / wall_seconds * 100.0
+    );
+}
+
 fn profile_categories(
     steps: &[EngineStepProfile],
     submissions: &[&forja_core::SubmissionProfile],
@@ -332,7 +501,6 @@ fn profile_categories(
     ]
 }
 
-#[allow(dead_code)]
 struct ProfileCategory {
     name: &'static str,
     values: Vec<(f64, f64)>,
