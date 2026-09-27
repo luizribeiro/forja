@@ -161,7 +161,10 @@
             pkgs.git-absorb
           ]
           ++ gitHooks.enabledPackages;
-          inherit (gitHooks) shellHook;
+          shellHook = ''
+            export FORJA_MODELS="''${FORJA_MODELS:-$HOME/.cache/forja/models}"
+            ${gitHooks.shellHook}
+          '';
         };
       }
     );
