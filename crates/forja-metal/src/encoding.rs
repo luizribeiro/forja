@@ -217,6 +217,7 @@ fn commit_result(feedback: &CommitResult) -> Result<(), BackendError> {
 
 pub(super) struct InFlightBuffer {
     pub(super) raw: MetalBufferRef,
+    pool_resident: bool,
 }
 
 // SAFETY: Metal buffer resources support concurrent retain and release, and this wrapper never
@@ -2386,11 +2387,11 @@ impl MetalBackend {
         } = encoded;
         let mut indices = HashMap::<u64, usize>::new();
         let mut owned = Vec::<InFlightBuffer>::new();
-        let mut add = |raw: MetalBufferRef| {
+        let mut add = |raw: MetalBufferRef, pool_resident: bool| {
             let address = raw.gpuAddress();
             *indices.entry(address).or_insert_with(|| {
                 let index = owned.len();
-                owned.push(InFlightBuffer { raw });
+                owned.push(InFlightBuffer { raw, pool_resident });
                 index
             })
         };
@@ -2400,11 +2401,12 @@ impl MetalBackend {
                 .lock()
                 .map_err(|_| BackendError::ExecutionFailed)?;
             for tensor in tensors {
-                add(buffers.get(tensor)?.raw.clone());
+                let buffer = buffers.get(tensor)?;
+                add(buffer.raw.clone(), buffer.pool_resident);
             }
         }
         for temporary in temporaries {
-            add(temporary);
+            add(temporary, false);
         }
         let error_flags = error_flags
             .iter()
@@ -2434,6 +2436,9 @@ impl MetalBackend {
             .newResidencySetWithDescriptor_error(&descriptor)
             .map_err(|_| BackendError::ExecutionFailed)?;
         for buffer in &resources.buffers {
+            if buffer.pool_resident {
+                continue;
+            }
             let buffer: &ProtocolObject<dyn MTLBuffer> = &buffer.raw;
             let allocation: &ProtocolObject<dyn MTLAllocation> = buffer.as_ref();
             residency.addAllocation(allocation);

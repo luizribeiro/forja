@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     ffi::c_void,
     ptr::{self, NonNull},
     slice,
@@ -15,13 +16,16 @@ use forja_core::{
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_foundation::NSPageSize;
 use objc2_metal::{
-    MTL4CommandQueue, MTLBuffer, MTLCreateSystemDefaultDevice, MTLDevice, MTLGPUFamily,
-    MTLResourceOptions, MTLSharedEvent, MTLSharedEventListener,
+    MTL4CommandQueue, MTLAllocation, MTLBuffer, MTLCreateSystemDefaultDevice, MTLDevice,
+    MTLGPUFamily, MTLResidencySet, MTLResidencySetDescriptor, MTLResourceOptions, MTLSharedEvent,
+    MTLSharedEventListener,
 };
 
 pub(super) struct MetalBuffer {
     pub(super) raw: Retained<ProtocolObject<dyn MTLBuffer>>,
     len: usize,
+    pub(super) pooled: bool,
+    pub(super) pool_resident: bool,
     pending: Vec<Weak<Completion>>,
 }
 
@@ -30,6 +34,14 @@ pub(super) struct MetalBuffer {
 unsafe impl Send for MetalBuffer {}
 
 impl MetalBuffer {
+    fn clear(&mut self) {
+        // SAFETY: `raw` is a live shared-storage buffer of `len` bytes and the pool has exclusive
+        // CPU access before the allocation is exposed to a caller.
+        unsafe {
+            ptr::write_bytes(self.raw.contents().cast::<u8>().as_ptr(), 0, self.len);
+        }
+    }
+
     fn write(&mut self, range: std::ops::Range<usize>, source: &[u8]) {
         // SAFETY: `raw` is a live shared-storage buffer of `len` bytes, the registry grants
         // exclusive CPU access, and the validated range has exactly `source.len()` bytes.
@@ -69,11 +81,102 @@ impl MetalBuffer {
     }
 }
 
+struct BufferPool {
+    free: HashMap<usize, Vec<MetalBuffer>>,
+    bytes: u64,
+    capacity: u64,
+    residency: PoolResidency,
+}
+
+struct PoolResidency {
+    raw: Retained<ProtocolObject<dyn MTLResidencySet>>,
+}
+
+// SAFETY: Host mutations of the residency set are serialized by the pool mutex, and Metal
+// residency sets support queue use while committed allocations remain immutable.
+unsafe impl Send for PoolResidency {}
+
+impl BufferPool {
+    fn take(&mut self, len: usize) -> Result<Option<MetalBuffer>, BackendError> {
+        let Some(buffer) = self.free.get_mut(&len).and_then(Vec::pop) else {
+            return Ok(None);
+        };
+        self.bytes = self
+            .bytes
+            .checked_sub(u64::try_from(buffer.len).map_err(|_| BackendError::ExecutionFailed)?)
+            .ok_or(BackendError::ExecutionFailed)?;
+        Ok(Some(buffer))
+    }
+
+    fn put(&mut self, mut buffer: MetalBuffer) -> Result<(), BackendError> {
+        let buffer_len = u64::try_from(buffer.len).map_err(|_| BackendError::AllocationFailed)?;
+        let mut evicted = Vec::new();
+        while self
+            .bytes
+            .checked_add(buffer_len)
+            .is_none_or(|bytes| bytes > self.capacity)
+        {
+            let Some(len) = self
+                .free
+                .iter()
+                .find_map(|(&len, buffers)| (!buffers.is_empty()).then_some(len))
+            else {
+                break;
+            };
+            let Some(mut allocation) = self.free.get_mut(&len).and_then(Vec::pop) else {
+                break;
+            };
+            self.bytes = self
+                .bytes
+                .checked_sub(
+                    u64::try_from(allocation.len).map_err(|_| BackendError::ExecutionFailed)?,
+                )
+                .ok_or(BackendError::ExecutionFailed)?;
+            let raw: &ProtocolObject<dyn MTLAllocation> = allocation.raw.as_ref();
+            self.residency.raw.removeAllocation(raw);
+            allocation.pool_resident = false;
+            evicted.push(allocation);
+        }
+        if buffer_len > self.capacity {
+            if buffer.pool_resident {
+                let allocation: &ProtocolObject<dyn MTLAllocation> = buffer.raw.as_ref();
+                self.residency.raw.removeAllocation(allocation);
+                buffer.pool_resident = false;
+            }
+            if !evicted.is_empty() || !buffer.pool_resident {
+                self.residency.raw.commit();
+            }
+            return Ok(());
+        }
+        if !buffer.pool_resident {
+            let allocation: &ProtocolObject<dyn MTLAllocation> = buffer.raw.as_ref();
+            self.residency.raw.addAllocation(allocation);
+            buffer.pool_resident = true;
+        }
+        self.residency.raw.commit();
+        drop(evicted);
+        self.bytes = self
+            .bytes
+            .checked_add(buffer_len)
+            .ok_or(BackendError::AllocationFailed)?;
+        self.free.entry(buffer.len).or_default().push(buffer);
+        Ok(())
+    }
+}
+
+const DEFAULT_POOL_CAPACITY: u64 = 1 << 30;
+
 /// A Metal 4 backend using shared unified-memory buffers.
+///
+/// Each backend owns an isolated buffer pool and clears reused storage before allocation, so a
+/// tensor cannot expose contents from an earlier allocation or another host store. Guest quotas
+/// and allocation counts cover live logical tensors; released buffers instead count toward this
+/// backend's separately capped pool using their page-rounded Metal allocation sizes.
 pub struct MetalBackend {
     pub(super) device: Retained<ProtocolObject<dyn MTLDevice>>,
     pub(super) queue: Retained<ProtocolObject<dyn MTL4CommandQueue>>,
     pub(super) buffers: Mutex<AllocationRegistry<MetalBuffer>>,
+    pool: Mutex<BufferPool>,
     pub(super) pipelines: Mutex<PipelineCache>,
     pub(super) in_flight: Arc<InFlightTracker>,
     pub(super) shared_event: Retained<ProtocolObject<dyn MTLSharedEvent>>,
@@ -104,12 +207,35 @@ impl MetalBackend {
         Self::with_gpu_timeout(Duration::from_secs(10))
     }
 
+    /// Creates a backend with the default GPU timeout and a free-buffer pool byte cap.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BackendError::AllocationFailed`] when `pool_capacity` does not fit the host, or
+    /// [`BackendError::ExecutionFailed`] when Metal 4 is unavailable.
+    pub fn with_pool_capacity(pool_capacity: u64) -> Result<Self, BackendError> {
+        Self::with_gpu_timeout_and_pool_capacity(Duration::from_secs(10), pool_capacity)
+    }
+
     /// Creates a backend with a deadline for each wait on submitted GPU work.
     ///
     /// # Errors
     ///
     /// Returns [`BackendError::ExecutionFailed`] when Metal 4 is unavailable.
     pub fn with_gpu_timeout(gpu_timeout: Duration) -> Result<Self, BackendError> {
+        Self::with_gpu_timeout_and_pool_capacity(gpu_timeout, DEFAULT_POOL_CAPACITY)
+    }
+
+    /// Creates a backend with a GPU wait deadline and a free-buffer pool byte cap.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BackendError::AllocationFailed`] when `pool_capacity` does not fit the host, or
+    /// [`BackendError::ExecutionFailed`] when Metal 4 is unavailable.
+    pub fn with_gpu_timeout_and_pool_capacity(
+        gpu_timeout: Duration,
+        pool_capacity: u64,
+    ) -> Result<Self, BackendError> {
         let device = MTLCreateSystemDefaultDevice().ok_or(BackendError::ExecutionFailed)?;
         if !device.supportsFamily(MTLGPUFamily::Metal4) {
             return Err(BackendError::ExecutionFailed);
@@ -117,6 +243,11 @@ impl MetalBackend {
         let queue = device
             .newMTL4CommandQueue()
             .ok_or(BackendError::ExecutionFailed)?;
+        let residency = device
+            .newResidencySetWithDescriptor_error(&MTLResidencySetDescriptor::new())
+            .map_err(|_| BackendError::ExecutionFailed)?;
+        residency.commit();
+        queue.addResidencySet(&residency);
         let source = concat!(
             include_str!("elementwise.metal"),
             "\n",
@@ -141,6 +272,12 @@ impl MetalBackend {
             device,
             queue,
             buffers: Mutex::new(AllocationRegistry::new()),
+            pool: Mutex::new(BufferPool {
+                free: HashMap::new(),
+                bytes: 0,
+                capacity: pool_capacity,
+                residency: PoolResidency { raw: residency },
+            }),
             pipelines: Mutex::new(pipelines),
             in_flight: Arc::new(InFlightTracker::new()),
             shared_event,
@@ -166,16 +303,32 @@ impl Backend for MetalBackend {
         let byte_len = element_count(shape)?
             .checked_mul(dtype.byte_size())
             .ok_or(BackendError::AllocationFailed)?;
-        let len = usize::try_from(byte_len).map_err(|_| BackendError::AllocationFailed)?;
-        let raw = self
-            .device
-            .newBufferWithLength_options(len, MTLResourceOptions::StorageModeShared)
+        let len = usize::try_from(byte_len)
+            .map_err(|_| BackendError::AllocationFailed)?
+            .max(1)
+            .checked_next_multiple_of(4096)
             .ok_or(BackendError::AllocationFailed)?;
-        let buffer = MetalBuffer {
-            raw,
-            len,
-            pending: Vec::new(),
+        let mut pool = self
+            .pool
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?;
+        let buffer = if let Some(mut buffer) = pool.take(len)? {
+            buffer.clear();
+            buffer
+        } else {
+            let raw = self
+                .device
+                .newBufferWithLength_options(len, MTLResourceOptions::StorageModeShared)
+                .ok_or(BackendError::AllocationFailed)?;
+            MetalBuffer {
+                raw,
+                len,
+                pooled: true,
+                pool_resident: false,
+                pending: Vec::new(),
+            }
         };
+        drop(pool);
         let mut buffers = self
             .buffers
             .lock()
@@ -253,7 +406,14 @@ impl Backend for MetalBackend {
             .lock()
             .map_err(|_| BackendError::ExecutionFailed)?;
         buffers.get_mut(tensor)?.wait_pending(self.gpu_timeout)?;
-        buffers.remove(tensor)?;
+        let buffer = buffers.remove(tensor)?;
+        drop(buffers);
+        if buffer.pooled {
+            self.pool
+                .lock()
+                .map_err(|_| BackendError::ExecutionFailed)?
+                .put(buffer)?;
+        }
         Ok(())
     }
 
@@ -297,6 +457,8 @@ fn no_copy_buffer(
     Ok(MetalBuffer {
         raw,
         len,
+        pooled: false,
+        pool_resident: false,
         pending: Vec::new(),
     })
 }
@@ -405,6 +567,8 @@ mod mapped_tests {
 
 #[cfg(test)]
 mod tests {
+    use forja_core::{Op, Submission};
+
     use super::*;
 
     #[test]
@@ -443,5 +607,123 @@ mod tests {
         let view = backend.view(&tensor, ViewOp::Reshape(vec![1, 7])).unwrap();
         backend.release(&tensor).unwrap();
         assert_eq!(backend.read(&view), Err(BackendError::InvalidInput));
+    }
+
+    #[test]
+    fn pooled_storage_is_reused_zeroed_and_resident() {
+        let backend = MetalBackend::new().unwrap();
+        let tensor = backend.alloc(DType::U32, &[7]).unwrap();
+        let address = backend
+            .buffers
+            .lock()
+            .unwrap()
+            .get(&tensor)
+            .unwrap()
+            .raw
+            .gpuAddress();
+        backend.write(&tensor, &[0xa5; 28]).unwrap();
+        backend.release(&tensor).unwrap();
+
+        let reused = backend.alloc(DType::U32, &[5]).unwrap();
+        let reused_address = backend
+            .buffers
+            .lock()
+            .unwrap()
+            .get(&reused)
+            .unwrap()
+            .raw
+            .gpuAddress();
+        assert_eq!(reused_address, address);
+        assert_eq!(backend.read(&reused).unwrap(), [0; 20]);
+        assert_eq!(
+            backend.pool.lock().unwrap().residency.raw.allocationCount(),
+            1
+        );
+
+        let source = backend.alloc(DType::U32, &[5]).unwrap();
+        let expected = [7_u32; 5]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect::<Vec<_>>();
+        backend.write(&source, &expected).unwrap();
+        let mut commands = CommandList::new();
+        commands.dispatch(Op::Copy, &[&source], &reused).unwrap();
+        backend.submit(commands).unwrap().wait().unwrap();
+        assert_eq!(backend.read(&reused).unwrap(), expected);
+    }
+
+    #[test]
+    fn pooled_storage_is_zeroed_within_and_across_backends() {
+        let first = MetalBackend::new().unwrap();
+        let second = MetalBackend::new().unwrap();
+        let tensor = first.alloc(DType::U32, &[33]).unwrap();
+        first.write(&tensor, &[0xa5; 33 * 4]).unwrap();
+        first.release(&tensor).unwrap();
+
+        let isolated = second.alloc(DType::U32, &[33]).unwrap();
+        assert_eq!(second.read(&isolated).unwrap(), [0; 33 * 4]);
+        second.write(&isolated, &[0x5a; 33 * 4]).unwrap();
+        second.release(&isolated).unwrap();
+        let reused = second.alloc(DType::U32, &[33]).unwrap();
+        assert_eq!(second.read(&reused).unwrap(), [0; 33 * 4]);
+    }
+
+    #[test]
+    fn pooled_bytes_are_capped_and_evictions_leave_residency() {
+        let backend = MetalBackend::with_pool_capacity(4096).unwrap();
+        let first = backend.alloc(DType::U32, &[1]).unwrap();
+        let retained = backend
+            .buffers
+            .lock()
+            .unwrap()
+            .get(&first)
+            .unwrap()
+            .raw
+            .clone();
+        backend.release(&first).unwrap();
+
+        for size in 2..=1000 {
+            let tensor = backend.alloc(DType::U32, &[size]).unwrap();
+            backend.release(&tensor).unwrap();
+            assert!(backend.pool.lock().unwrap().bytes <= 4096);
+        }
+
+        let oversized = backend.alloc(DType::U32, &[1025]).unwrap();
+        backend.release(&oversized).unwrap();
+        let pool = backend.pool.lock().unwrap();
+        let allocation: &ProtocolObject<dyn MTLAllocation> = retained.as_ref();
+        assert_eq!(pool.bytes, 0);
+        assert!(!pool.residency.raw.containsAllocation(allocation));
+    }
+
+    #[test]
+    fn release_pools_storage_after_submission_completion() {
+        let backend = MetalBackend::new().unwrap();
+        let source = backend.alloc(DType::F32, &[4097]).unwrap();
+        let output = backend.alloc(DType::F32, &[4097]).unwrap();
+        let address = backend
+            .buffers
+            .lock()
+            .unwrap()
+            .get(&output)
+            .unwrap()
+            .raw
+            .gpuAddress();
+        let mut commands = CommandList::new();
+        commands.dispatch(Op::Copy, &[&source], &output).unwrap();
+        let submission = backend.submit(commands).unwrap();
+        drop(submission);
+
+        backend.release(&output).unwrap();
+        let replacement = backend.alloc(DType::F32, &[4097]).unwrap();
+        let replacement_address = backend
+            .buffers
+            .lock()
+            .unwrap()
+            .get(&replacement)
+            .unwrap()
+            .raw
+            .gpuAddress();
+        assert_eq!(replacement_address, address);
     }
 }
