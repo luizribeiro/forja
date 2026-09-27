@@ -109,6 +109,22 @@
             // {
               stages = [ "pre-push" ];
             };
+          qwen-weights =
+            (cargoHook {
+              name = "qwen-weights-hook";
+              runtimeInputs = [ pkgs.cargo-nextest ];
+              text = ''
+                if [[ -z "''${FORJA_MODELS:-}" && -n "''${CI:-}" ]]; then
+                  echo "skipping model tests: CI runners have no model weights"
+                  exit 0
+                fi
+                export FORJA_MODELS="''${FORJA_MODELS:-$HOME/.cache/forja/models}"
+                cargo nextest run --release -p forja-host --test qwen_weights --run-ignored only
+              '';
+            })
+            // {
+              stages = [ "pre-push" ];
+            };
         };
         offlineHooks = {
           nixfmt.enable = true;
