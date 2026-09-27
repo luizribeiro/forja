@@ -19,8 +19,8 @@ use objc2_metal::{
     MTL4CommitFeedback, MTL4CommitOptions, MTL4CounterHeap, MTL4CounterHeapDescriptor,
     MTL4CounterHeapType, MTL4TimestampGranularity, MTLAllocation, MTLBuffer,
     MTLComputePipelineState, MTLDataType, MTLDevice, MTLEvent, MTLFunctionConstantValues,
-    MTLLibrary, MTLResidencySet, MTLResidencySetDescriptor, MTLSharedEvent, MTLSharedEventListener,
-    MTLSize,
+    MTLLibrary, MTLResidencySet, MTLResidencySetDescriptor, MTLResourceOptions, MTLSharedEvent,
+    MTLSharedEventListener, MTLSize,
 };
 
 use crate::{
@@ -30,6 +30,17 @@ use crate::{
 
 type MetalBufferRef = Retained<ProtocolObject<dyn MTLBuffer>>;
 type EncodedEmbed = (Vec<MetalBufferRef>, u64);
+
+struct ArgumentBuffer {
+    raw: MetalBufferRef,
+    capacity: usize,
+}
+
+impl ArgumentBuffer {
+    fn contains(&self, required: usize) -> bool {
+        self.capacity >= required && self.raw.length() >= required
+    }
+}
 
 #[derive(Clone)]
 struct EncoderTensor {
@@ -252,6 +263,7 @@ unsafe impl Sync for InFlightResidency {}
 struct ReusableSubmissionObjects {
     allocator: Retained<ProtocolObject<dyn MTL4CommandAllocator>>,
     argument_table: Retained<ProtocolObject<dyn MTL4ArgumentTable>>,
+    argument_buffer: ArgumentBuffer,
 }
 
 // SAFETY: Ownership moves between the encoding thread and the completion tracker, and the
@@ -275,6 +287,13 @@ impl SubmissionObjects {
         self.reusable
             .as_ref()
             .map(|objects| objects.argument_table.as_ref())
+            .ok_or(BackendError::ExecutionFailed)
+    }
+
+    fn argument_buffer(&self) -> Result<&ArgumentBuffer, BackendError> {
+        self.reusable
+            .as_ref()
+            .map(|objects| &objects.argument_buffer)
             .ok_or(BackendError::ExecutionFailed)
     }
 
@@ -601,6 +620,7 @@ impl InFlightTracker {
     fn checkout(
         self: &Arc<Self>,
         device: &ProtocolObject<dyn MTLDevice>,
+        argument_capacity: usize,
     ) -> Result<SubmissionObjects, BackendError> {
         use objc2_metal::MTL4ArgumentTableDescriptor;
 
@@ -610,7 +630,7 @@ impl InFlightTracker {
             .lock()
             .map_err(|_| BackendError::ExecutionFailed)?
             .pop();
-        let reusable = if let Some(objects) = reusable {
+        let mut reusable = if let Some(objects) = reusable {
             reset_allocator(&objects.allocator);
             objects
         } else {
@@ -622,11 +642,33 @@ impl InFlightTracker {
             let argument_table = device
                 .newArgumentTableWithDescriptor_error(&descriptor)
                 .map_err(|_| BackendError::ExecutionFailed)?;
+            let raw = device
+                .newBufferWithLength_options(
+                    argument_capacity,
+                    MTLResourceOptions::StorageModeShared,
+                )
+                .ok_or(BackendError::AllocationFailed)?;
             ReusableSubmissionObjects {
                 allocator,
                 argument_table,
+                argument_buffer: ArgumentBuffer {
+                    raw,
+                    capacity: argument_capacity,
+                },
             }
         };
+        if reusable.argument_buffer.capacity < argument_capacity {
+            let raw = device
+                .newBufferWithLength_options(
+                    argument_capacity,
+                    MTLResourceOptions::StorageModeShared,
+                )
+                .ok_or(BackendError::AllocationFailed)?;
+            reusable.argument_buffer = ArgumentBuffer {
+                raw,
+                capacity: argument_capacity,
+            };
+        }
         Ok(SubmissionObjects {
             reusable: Some(reusable),
             owner: Arc::downgrade(self),
@@ -854,7 +896,11 @@ impl MetalBackend {
                 .unwrap_or(u64::MAX),
             ..SubmissionProfile::default()
         });
-        let mut objects = self.in_flight.checkout(&self.device)?;
+        let argument_capacity = argument_capacity(&dispatches)?;
+        let mut objects = self.in_flight.checkout(&self.device, argument_capacity)?;
+        if !objects.argument_buffer()?.contains(argument_capacity) {
+            return Err(BackendError::ExecutionFailed);
+        }
         let command_buffer = self.begin_command_buffer(objects.allocator()?)?;
         let timestamp_count = if PROFILE {
             dispatches
@@ -2546,6 +2592,24 @@ fn shape3(layout: &Layout) -> Result<[u32; 3], BackendError> {
         .map_err(|_| BackendError::InvalidInput)
 }
 
+fn argument_capacity(dispatches: &[Dispatch]) -> Result<usize, BackendError> {
+    let base = dispatches
+        .len()
+        .max(1)
+        .checked_mul(4096)
+        .ok_or(BackendError::AllocationFailed)?;
+    let rope = dispatches.iter().try_fold(0_usize, |total, dispatch| {
+        if !matches!(dispatch.op(), Op::Rope { .. }) {
+            return Some(total);
+        }
+        let width = usize::try_from(*dispatch.output().layout().shape().last()?).ok()?;
+        total.checked_add(width.checked_mul(2)?)
+    });
+    base.checked_add(rope.ok_or(BackendError::AllocationFailed)?)
+        .and_then(|bytes| bytes.checked_next_multiple_of(4096))
+        .ok_or(BackendError::AllocationFailed)
+}
+
 fn vector_sdpa_supported(dispatch: &Dispatch) -> Result<bool, BackendError> {
     let [query, key, value] = dispatch.inputs() else {
         return Err(BackendError::InvalidInput);
@@ -2903,6 +2967,12 @@ mod tests {
         backend.in_flight.drain_done();
         assert_eq!(backend.in_flight.len(), 0);
         assert_eq!(backend.in_flight.pooled_len(), 1);
+        let address = backend.in_flight.pool.lock().unwrap()[0]
+            .argument_buffer
+            .raw
+            .gpuAddress();
+        let objects = backend.in_flight.checkout(&backend.device, 4096).unwrap();
+        assert_eq!(objects.argument_buffer().unwrap().raw.gpuAddress(), address);
     }
 
     #[test]
@@ -3124,7 +3194,7 @@ mod tests {
             .collect::<Vec<_>>();
         backend.write(&source, &bytes).unwrap();
 
-        let mut objects = backend.in_flight.checkout(&backend.device).unwrap();
+        let mut objects = backend.in_flight.checkout(&backend.device, 4096).unwrap();
         let command_buffer = backend
             .begin_command_buffer(objects.allocator().unwrap())
             .unwrap();
