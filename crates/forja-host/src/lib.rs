@@ -529,9 +529,9 @@ where
         self.store.data().engine_metrics()
     }
 
-    /// Enables detailed profiling for subsequent steps.
-    pub fn enable_profiling(&mut self) {
-        self.profiling = true;
+    /// Enables or disables detailed profiling for subsequent steps.
+    pub fn set_profiling(&mut self, enabled: bool) {
+        self.profiling = enabled;
     }
 
     /// Takes the most recently completed step profile.
