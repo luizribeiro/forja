@@ -9,17 +9,18 @@ use std::{
 
 use block2::RcBlock;
 use forja_core::{
-    BackendError, BufferId, CommandList, DType, Dispatch, Layout, Op, ProfileCount, Slice,
-    Submission, SubmissionProfile, Tensor, required_barriers,
+    BackendError, BufferId, CommandList, DType, Dispatch, DispatchProfile, Layout, Op,
+    ProfileCount, Slice, Submission, SubmissionProfile, Tensor, required_barriers,
 };
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_foundation::{NSRange, NSString};
 use objc2_metal::{
     MTL4ArgumentTable, MTL4CommandAllocator, MTL4CommandBuffer, MTL4CommandQueue,
     MTL4CommitFeedback, MTL4CommitOptions, MTL4CounterHeap, MTL4CounterHeapDescriptor,
-    MTL4CounterHeapType, MTLAllocation, MTLBuffer, MTLComputePipelineState, MTLDataType, MTLDevice,
-    MTLEvent, MTLFunctionConstantValues, MTLLibrary, MTLResidencySet, MTLResidencySetDescriptor,
-    MTLSharedEvent, MTLSharedEventListener, MTLSize,
+    MTL4CounterHeapType, MTL4TimestampGranularity, MTLAllocation, MTLBuffer,
+    MTLComputePipelineState, MTLDataType, MTLDevice, MTLEvent, MTLFunctionConstantValues,
+    MTLLibrary, MTLResidencySet, MTLResidencySetDescriptor, MTLSharedEvent, MTLSharedEventListener,
+    MTLSize,
 };
 
 use crate::{
@@ -298,6 +299,7 @@ struct GpuTimestamps {
     heap: Retained<ProtocolObject<dyn MTL4CounterHeap>>,
     frequency: u64,
     entry_size: usize,
+    count: usize,
 }
 
 // SAFETY: Counter heaps remain immutable on the CPU while the retained submission is in flight,
@@ -309,23 +311,29 @@ unsafe impl Sync for GpuTimestamps {}
 
 impl GpuTimestamps {
     fn elapsed(&self) -> Option<Duration> {
-        // SAFETY: The heap has two entries and callers only resolve timestamps after waiting for
-        // the submission's shared-event signal.
-        let data = unsafe { self.heap.resolveCounterRange(NSRange::new(0, 2)) }?;
+        self.elapsed_pairs(&[(0, 1)])?.pop()
+    }
+
+    fn elapsed_pairs(&self, pairs: &[(usize, usize)]) -> Option<Vec<Duration>> {
+        // SAFETY: The requested range covers the heap and resolution follows GPU completion.
+        let data = unsafe { self.heap.resolveCounterRange(NSRange::new(0, self.count)) }?;
         let bytes = data.to_vec();
-        let end_offset = self.entry_size;
-        let start = u64::from_ne_bytes(bytes.get(..8)?.try_into().ok()?);
-        let end = u64::from_ne_bytes(
-            bytes
-                .get(end_offset..end_offset.checked_add(8)?)?
-                .try_into()
-                .ok()?,
-        );
-        let ticks = end.checked_sub(start)?;
-        let seconds = ticks / self.frequency;
-        let nanos = u128::from(ticks % self.frequency).checked_mul(1_000_000_000)?
-            / u128::from(self.frequency);
-        Some(Duration::new(seconds, u32::try_from(nanos).ok()?))
+        pairs
+            .iter()
+            .map(|&(start, end)| {
+                let read = |index: usize| {
+                    let offset = self.entry_size.checked_mul(index)?;
+                    Some(u64::from_ne_bytes(
+                        bytes.get(offset..offset.checked_add(8)?)?.try_into().ok()?,
+                    ))
+                };
+                let ticks = read(end)?.checked_sub(read(start)?)?;
+                let seconds = ticks / self.frequency;
+                let nanos = u128::from(ticks % self.frequency).checked_mul(1_000_000_000)?
+                    / u128::from(self.frequency);
+                Some(Duration::new(seconds, u32::try_from(nanos).ok()?))
+            })
+            .collect()
     }
 }
 
@@ -519,6 +527,20 @@ impl Completion {
 
     fn gpu_time(&self) -> Option<Duration> {
         self.timestamps.as_ref()?.elapsed()
+    }
+
+    fn dispatch_times(&self, operations: &[Op]) -> Option<Vec<DispatchProfile>> {
+        let pairs = (0..operations.len())
+            .map(|index| (2 + index * 2, 3 + index * 2))
+            .collect::<Vec<_>>();
+        Some(
+            operations
+                .iter()
+                .copied()
+                .zip(self.timestamps.as_ref()?.elapsed_pairs(&pairs)?)
+                .map(|(op, gpu_time)| DispatchProfile { op, gpu_time })
+                .collect(),
+        )
     }
 }
 
@@ -728,6 +750,7 @@ pub struct MetalSubmission {
     completion: Arc<Completion>,
     timeout: Duration,
     profile: Option<Mutex<SubmissionProfile>>,
+    dispatch_operations: Vec<Op>,
 }
 
 impl Submission for MetalSubmission {
@@ -744,7 +767,9 @@ impl Submission for MetalSubmission {
     }
 
     fn profile(&self) -> Option<SubmissionProfile> {
-        Some(self.profile.as_ref()?.lock().ok()?.clone())
+        let mut profile = self.profile.as_ref()?.lock().ok()?.clone();
+        profile.per_dispatch = self.completion.dispatch_times(&self.dispatch_operations)?;
+        Some(profile)
     }
 }
 
@@ -830,8 +855,18 @@ impl MetalBackend {
         });
         let mut objects = self.in_flight.checkout(&self.device)?;
         let command_buffer = self.begin_command_buffer(objects.allocator()?)?;
-        let timestamps = self.make_timestamps()?;
-        // SAFETY: The timestamp heap has two entries and is retained until completion.
+        let timestamp_count = if PROFILE {
+            dispatches
+                .len()
+                .checked_mul(2)
+                .and_then(|count| count.checked_add(2))
+                .ok_or(BackendError::ExecutionFailed)?
+        } else {
+            2
+        };
+        let timestamps = self.make_timestamps(timestamp_count)?;
+        // SAFETY: `make_timestamps` always reserves at least two entries, so indices 0 and 1 are
+        // in range.
         unsafe {
             command_buffer.writeTimestampIntoHeap_atIndex(&timestamps.heap, 0);
         }
@@ -842,6 +877,7 @@ impl MetalBackend {
             objects.argument_table()?,
             &dispatches,
             &barriers,
+            PROFILE.then_some(&timestamps),
         )?;
         if let Some(profile) = &mut profile {
             profile.metadata_buffers = temporary_profile.finish();
@@ -855,11 +891,13 @@ impl MetalBackend {
             profile.residency =
                 residency_started.map_or(Duration::ZERO, |started| started.elapsed());
         }
-        // SAFETY: The timestamp heap has two entries and is retained until completion.
+        // SAFETY: `make_timestamps` always reserves at least two entries, so indices 0 and 1 are
+        // in range.
         unsafe {
             command_buffer.writeTimestampIntoHeap_atIndex(&timestamps.heap, 1);
         }
         command_buffer.endCommandBuffer();
+        let operations = dispatches.iter().map(Dispatch::op).collect::<Vec<_>>();
         let commit_started = PROFILE.then(Instant::now);
         let mut submission = self.commit(
             &command_buffer,
@@ -872,6 +910,7 @@ impl MetalBackend {
         if let Some(mut profile) = profile {
             profile.commit = commit_started.map_or(Duration::ZERO, |started| started.elapsed());
             submission.profile = Some(Mutex::new(profile));
+            submission.dispatch_operations = operations;
         }
         Ok(submission)
     }
@@ -882,6 +921,7 @@ impl MetalBackend {
         table: &ProtocolObject<dyn MTL4ArgumentTable>,
         dispatches: &[Dispatch],
         barriers: &[bool],
+        timestamps: Option<&GpuTimestamps>,
     ) -> Result<EncodedDispatches, BackendError> {
         use objc2_metal::MTL4CommandEncoder;
         let encoder = command_buffer
@@ -890,10 +930,14 @@ impl MetalBackend {
         let mut temporaries = Vec::with_capacity(dispatches.len().saturating_mul(3));
         let mut error_flags = Vec::new();
         let mut bindings = ArgumentBindings::default();
-        for (dispatch, &barrier) in dispatches.iter().zip(barriers) {
+        for (index, (dispatch, &barrier)) in dispatches.iter().zip(barriers).enumerate() {
+            if index > 0 {
+                write_dispatch_timestamp(&encoder, timestamps, 1 + index * 2);
+            }
             if barrier {
                 encode_dispatch_barrier(&encoder);
             }
+            write_dispatch_timestamp(&encoder, timestamps, 2 + index * 2);
             if let Op::RmsNorm { eps } = dispatch.op() {
                 temporaries.extend(self.encode_rms_norm(
                     &encoder,
@@ -968,6 +1012,9 @@ impl MetalBackend {
                 kernel,
                 &mut bindings,
             )?);
+        }
+        if !dispatches.is_empty() {
+            write_dispatch_timestamp(&encoder, timestamps, 1 + dispatches.len() * 2);
         }
         encoder.endEncoding();
         Ok(EncodedDispatches {
@@ -2301,12 +2348,12 @@ impl MetalBackend {
         Ok(command_buffer)
     }
 
-    fn make_timestamps(&self) -> Result<GpuTimestamps, BackendError> {
+    fn make_timestamps(&self, count: usize) -> Result<GpuTimestamps, BackendError> {
         let descriptor = MTL4CounterHeapDescriptor::new();
         descriptor.setType(MTL4CounterHeapType::Timestamp);
-        // SAFETY: Two command-buffer timestamps are written at indices zero and one.
+        // SAFETY: The descriptor count matches all timestamp indices encoded by the caller.
         unsafe {
-            descriptor.setCount(2);
+            descriptor.setCount(count);
         }
         let heap = self
             .device
@@ -2323,6 +2370,7 @@ impl MetalBackend {
             heap,
             frequency,
             entry_size,
+            count,
         })
     }
 
@@ -2481,6 +2529,7 @@ impl MetalBackend {
             completion,
             timeout: self.gpu_timeout,
             profile: None,
+            dispatch_operations: Vec::new(),
         })
     }
 }
@@ -2635,6 +2684,27 @@ fn encode_dispatch_barrier(encoder: &ProtocolObject<dyn objc2_metal::MTL4Compute
         MTLStages::Dispatch,
         MTL4VisibilityOptions::Device,
     );
+}
+
+fn write_dispatch_timestamp(
+    encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
+    timestamps: Option<&GpuTimestamps>,
+    index: usize,
+) {
+    use objc2_metal::MTL4ComputeCommandEncoder;
+
+    let Some(timestamps) = timestamps else {
+        return;
+    };
+    // SAFETY: Profiled heaps reserve `2 + 2 * dispatches` entries, and callers keep every
+    // per-dispatch index below that bound.
+    unsafe {
+        encoder.writeTimestampWithGranularity_intoHeap_atIndex(
+            MTL4TimestampGranularity::Precise,
+            &timestamps.heap,
+            index,
+        );
+    }
 }
 
 fn row_dispatch_geometry(
@@ -2905,7 +2975,10 @@ mod tests {
         submission.wait().unwrap();
         let profile = submission.profile().unwrap();
         assert_eq!(profile.dispatches, 1);
+        assert_eq!(profile.per_dispatch.len(), 1);
+        assert_eq!(profile.per_dispatch[0].op, Op::Add);
         assert!(profile.gpu_time > Duration::ZERO);
+        assert!(profile.per_dispatch[0].gpu_time > Duration::ZERO);
         assert!(profile.metadata_buffers.count >= 3);
     }
 
@@ -3085,7 +3158,7 @@ mod tests {
             )
             .unwrap();
         let residency = backend.make_resident(&command_buffer, &resources).unwrap();
-        let timestamps = backend.make_timestamps().unwrap();
+        let timestamps = backend.make_timestamps(2).unwrap();
         // SAFETY: The heap has two entries and remains live through completion.
         unsafe {
             command_buffer.writeTimestampIntoHeap_atIndex(&timestamps.heap, 0);
