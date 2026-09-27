@@ -1,6 +1,8 @@
 //! Command-line entry point for Forja engine tooling.
 
 mod args;
+#[cfg(test)]
+mod benchmark_stats;
 mod engine;
 mod generate;
 mod verify;
