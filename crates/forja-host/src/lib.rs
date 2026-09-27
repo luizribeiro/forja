@@ -103,6 +103,17 @@ pub struct EngineOutput {
     pub taps: Vec<EngineTensor>,
 }
 
+/// Cumulative execution counters for an engine runner.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EngineMetrics {
+    /// Successfully completed backend submissions.
+    pub submissions: u64,
+    /// Completed submissions that supplied device timestamps.
+    pub timed_submissions: u64,
+    /// Sum of device execution time reported by timed submissions.
+    pub gpu_time: Duration,
+}
+
 /// An instantiated engine component and its host resources.
 pub struct EngineRunner<B: Backend + Send + Sync + 'static> {
     store: Store<Host<B>>,
@@ -333,6 +344,12 @@ where
             Ok(request) => request.run().await.map_err(guest_error),
             Err(error) => Err(error),
         }
+    }
+
+    /// Returns cumulative backend execution counters.
+    #[must_use]
+    pub fn metrics(&self) -> EngineMetrics {
+        self.store.data().engine_metrics()
     }
 
     fn set_guest_deadline(&mut self) {
@@ -590,6 +607,9 @@ pub struct Host<B: Backend> {
     live_bytes: Arc<AtomicU64>,
     live_handles: usize,
     gpu_time_ns: Arc<AtomicU64>,
+    completed_submissions: Arc<AtomicU64>,
+    timed_submissions: Arc<AtomicU64>,
+    completed_gpu_time_ns: Arc<AtomicU64>,
     epoch_registration: Option<Arc<()>>,
 }
 
@@ -615,6 +635,9 @@ impl<B: Backend> Host<B> {
             live_bytes: Arc::new(AtomicU64::new(0)),
             live_handles: 0,
             gpu_time_ns: Arc::new(AtomicU64::new(0)),
+            completed_submissions: Arc::new(AtomicU64::new(0)),
+            timed_submissions: Arc::new(AtomicU64::new(0)),
+            completed_gpu_time_ns: Arc::new(AtomicU64::new(0)),
             epoch_registration: None,
         }
     }
@@ -654,6 +677,14 @@ impl<B: Backend> Host<B> {
     pub fn reset_guest_deadline(store: &mut Store<Self>) {
         let ticks = epoch_ticks(store.data().limits.guest_call_timeout);
         store.set_epoch_deadline(ticks);
+    }
+
+    fn engine_metrics(&self) -> EngineMetrics {
+        EngineMetrics {
+            submissions: self.completed_submissions.load(Ordering::Acquire),
+            timed_submissions: self.timed_submissions.load(Ordering::Acquire),
+            gpu_time: Duration::from_nanos(self.completed_gpu_time_ns.load(Ordering::Acquire)),
+        }
     }
 
     /// Allocates a contiguous tensor after enforcing all guest quotas.
@@ -953,6 +984,9 @@ impl<B: Backend> Host<B> {
             timeout: self.limits.submission_timeout,
             gpu_time_budget_ns: duration_ns(self.limits.gpu_time_budget),
             gpu_time_ns: Arc::clone(&self.gpu_time_ns),
+            completed_submissions: Arc::clone(&self.completed_submissions),
+            timed_submissions: Arc::clone(&self.timed_submissions),
+            completed_gpu_time_ns: Arc::clone(&self.completed_gpu_time_ns),
         })
     }
 
@@ -1081,6 +1115,9 @@ struct SubmitRequest<B: Backend> {
     timeout: Duration,
     gpu_time_budget_ns: u64,
     gpu_time_ns: Arc<AtomicU64>,
+    completed_submissions: Arc<AtomicU64>,
+    timed_submissions: Arc<AtomicU64>,
+    completed_gpu_time_ns: Arc<AtomicU64>,
 }
 
 struct GpuReservation {
@@ -1146,6 +1183,9 @@ where
                 timeout,
                 gpu_time_budget_ns: _,
                 gpu_time_ns: _,
+                completed_submissions,
+                timed_submissions,
+                completed_gpu_time_ns,
             } = self;
             let result = match reservation {
                 Err(error) => Err(error),
@@ -1164,7 +1204,14 @@ where
                         let accounting = reservation.settle(charged);
                         match (wait, accounting) {
                             (Err(error), _) | (Ok(()), Err(error)) => Err(error),
-                            (Ok(()), Ok(())) => Ok(gpu_time),
+                            (Ok(()), Ok(())) => {
+                                saturating_increment(&completed_submissions);
+                                if let Some(gpu_time) = gpu_time {
+                                    saturating_increment(&timed_submissions);
+                                    saturating_add(&completed_gpu_time_ns, gpu_time);
+                                }
+                                Ok(gpu_time)
+                            }
                         }
                     }
                 },
@@ -1179,6 +1226,18 @@ where
         .map_err(|_| guest_error(BackendError::ExecutionFailed))?
         .map_err(guest_error)
     }
+}
+
+fn saturating_increment(counter: &AtomicU64) {
+    let _ = counter.fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+        Some(value.saturating_add(1))
+    });
+}
+
+fn saturating_add(counter: &AtomicU64, value: u64) {
+    let _ = counter.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+        Some(current.saturating_add(value))
+    });
 }
 
 impl<B> ReadRequest<B>
@@ -1614,7 +1673,7 @@ mod tests {
     use forja_cpu::CpuBackend;
     use wasmtime::component::Resource;
 
-    use super::{Grants, Host, Limits, bindings::l9o::gpu::compute};
+    use super::{EngineMetrics, Grants, Host, Limits, bindings::l9o::gpu::compute};
 
     const GENEROUS: Limits = Limits::new(u64::MAX, 8, u64::MAX, 32, u64::MAX);
     static NEXT_WEIGHT_FILE: AtomicU64 = AtomicU64::new(0);
@@ -2315,6 +2374,24 @@ mod tests {
             None
         );
         assert!(host.gpu_time_ns.load(Ordering::Acquire) > 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn completed_submissions_report_device_time() {
+        let backend = AccountingBackend::new(None, Some(Duration::from_nanos(33)), Duration::ZERO);
+        let mut host = Host::new(backend, GENEROUS);
+        for _ in 0..2 {
+            let commands = host.command_list().unwrap();
+            host.prepare_submit(commands).unwrap().run().await.unwrap();
+        }
+        assert_eq!(
+            host.engine_metrics(),
+            EngineMetrics {
+                submissions: 2,
+                timed_submissions: 2,
+                gpu_time: Duration::from_nanos(66),
+            }
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
