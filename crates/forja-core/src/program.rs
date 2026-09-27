@@ -1,4 +1,17 @@
 //! Validated scalar programs over tensor iteration spaces.
+//!
+//! # Scalar semantics
+//!
+//! Floating-point [`BinOp::Min`] and [`BinOp::Max`] propagate NaN when either
+//! operand is NaN. Casting F32 to [`ValueType::U32`] saturates to the unsigned
+//! range and maps NaN to zero.
+//!
+//! # Lowering requirements
+//!
+//! Metal's `fmin` and `fmax` do not provide the required NaN propagation, so a
+//! Metal lowering must use an explicit select. MSL float-to-integer conversion
+//! is undefined for out-of-range values, so F32-to-U32 lowering must clamp and
+//! select NaN to zero before conversion.
 
 use std::{error::Error, fmt};
 
@@ -154,6 +167,11 @@ pub struct Program {
 
 impl Program {
     /// Validates structural safety and resource limits.
+    ///
+    /// Scalar execution uses IEEE `f32` arithmetic with propagating NaNs and
+    /// `f32::powf` semantics, saturating F32-to-U32 casts with NaN mapped to
+    /// zero, and wrapping U32 addition, subtraction, and multiplication.
+    /// Select instructions evaluate both SSA branches before choosing one.
     ///
     /// # Errors
     ///

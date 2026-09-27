@@ -1,5 +1,7 @@
 //! Reference CPU execution for Forja operations.
 
+pub mod interpreter;
+
 use std::{sync::Mutex, time::Duration};
 
 use forja_core::{
