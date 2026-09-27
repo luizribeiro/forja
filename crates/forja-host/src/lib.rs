@@ -7,7 +7,10 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 
-use forja_core::{Backend, BackendError, DType, LayoutError, OpError, Slice, Tensor, ViewOp};
+use forja_core::{
+    Backend, BackendError, CommandList, DType, Layout, LayoutError, Op, OpError, Slice, Tensor,
+    ViewOp,
+};
 use wasmtime::component::{Accessor, HasData, Linker, Resource, ResourceTable};
 use wasmtime::{Engine, Store, StoreLimits, StoreLimitsBuilder};
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
@@ -22,6 +25,7 @@ pub mod bindings {
         require_store_data_send: true,
         with: {
             "l9o:gpu/compute.tensor": crate::TensorEntry,
+            "l9o:gpu/compute.command-list": crate::CommandListEntry,
         },
     });
 }
@@ -103,6 +107,13 @@ pub struct TensorEntry {
     buffer: Arc<BufferHandle>,
 }
 
+/// Host-owned state behind a guest command-list resource.
+#[derive(Debug)]
+pub struct CommandListEntry {
+    commands: CommandList,
+    retained: Vec<TensorEntry>,
+}
+
 /// Store state implementing the guest compute interface over a trusted backend.
 pub struct Host<B: Backend> {
     backend: Arc<B>,
@@ -167,7 +178,7 @@ impl<B: Backend> Host<B> {
             Ok(resource) => resource,
             Err(error) => {
                 self.backend.release(&tensor).map_err(guest_error)?;
-                return Err(compute::Error::InvalidHandle(error.to_string()));
+                return Err(invalid_handle(error));
             }
         };
         self.live_bytes.fetch_add(byte_len, Ordering::AcqRel);
@@ -188,19 +199,19 @@ impl<B: Backend> Host<B> {
         self.check_handle_quota()?;
         let entry = self.entry(resource)?.clone();
         let operation = core_view(operation).map_err(guest_error)?;
-        validate_view(&entry.tensor, &operation).map_err(guest_error)?;
+        let layout = validate_view(&entry.tensor, &operation).map_err(guest_error)?;
+        self.check_tensor_shape(layout.shape())?;
         let tensor = self
             .backend
             .view(&entry.tensor, operation)
             .map_err(guest_error)?;
-        self.check_tensor_shape(tensor.layout().shape())?;
         let view = self
             .table
             .push(TensorEntry {
                 tensor,
                 buffer: Arc::clone(&entry.buffer),
             })
-            .map_err(|error| compute::Error::InvalidHandle(error.to_string()))?;
+            .map_err(invalid_handle)?;
         self.live_handles += 1;
         Ok(view)
     }
@@ -235,19 +246,87 @@ impl<B: Backend> Host<B> {
         self.backend.write(tensor, bytes).map_err(guest_error)
     }
 
+    /// Creates an empty command list.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-handle error if the resource table refuses the entry.
+    pub fn command_list(&mut self) -> Result<Resource<CommandListEntry>, compute::Error> {
+        self.table
+            .push(CommandListEntry {
+                commands: CommandList::new(),
+                retained: Vec::new(),
+            })
+            .map_err(invalid_handle)
+    }
+
+    /// Validates and records one trusted operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an operation, quota, or invalid-handle error before recording invalid work.
+    pub fn dispatch(
+        &mut self,
+        commands: &Resource<CommandListEntry>,
+        operation: compute::Op,
+        inputs: &[Resource<TensorEntry>],
+        output: &Resource<TensorEntry>,
+    ) -> Result<(), compute::Error> {
+        let input_entries = inputs
+            .iter()
+            .map(|resource| self.entry(resource).cloned())
+            .collect::<Result<Vec<_>, _>>()?;
+        let output_entry = self.entry(output)?.clone();
+        let input_tensors = input_entries
+            .iter()
+            .map(|entry| &entry.tensor)
+            .collect::<Vec<_>>();
+        let operation = core_op(operation);
+        let entry = self.table.get(commands).map_err(invalid_handle)?;
+        let mut candidate = entry.commands.clone();
+        candidate
+            .dispatch(operation, &input_tensors, &output_entry.tensor)
+            .map_err(guest_error)?;
+
+        let entry = self.table.get_mut(commands).map_err(invalid_handle)?;
+        entry.commands = candidate;
+        entry.retained.extend(input_entries);
+        entry.retained.push(output_entry);
+        Ok(())
+    }
+
+    fn drop_command_list(
+        &mut self,
+        resource: Resource<CommandListEntry>,
+    ) -> Result<(), compute::Error> {
+        let entry = self.table.delete(resource).map_err(invalid_handle)?;
+        self.release_retained(entry.retained)
+    }
+
+    fn release_retained(&self, entries: Vec<TensorEntry>) -> Result<(), compute::Error> {
+        let mut failure = None;
+        for entry in entries {
+            if let Some(buffer) = Arc::into_inner(entry.buffer)
+                && let Err(error) = buffer.release(self.backend.as_ref(), &entry.tensor)
+                && failure.is_none()
+            {
+                failure = Some(guest_error(error));
+            }
+        }
+        failure.map_or(Ok(()), Err)
+    }
+
     /// Drops a guest tensor handle and releases its buffer after the last view.
     ///
     /// # Errors
     ///
     /// Returns an invalid-handle error, or a backend error on final release.
     pub fn drop_tensor(&mut self, resource: Resource<TensorEntry>) -> Result<(), compute::Error> {
-        let entry = self
-            .table
-            .delete(resource)
-            .map_err(|error| compute::Error::InvalidHandle(error.to_string()))?;
-        let live_handles = self.live_handles.checked_sub(1).ok_or_else(|| {
-            compute::Error::InvalidHandle("live handle accounting underflowed".to_owned())
-        })?;
+        let entry = self.table.delete(resource).map_err(invalid_handle)?;
+        let live_handles = self
+            .live_handles
+            .checked_sub(1)
+            .ok_or_else(|| invalid_handle("live handle accounting underflowed"))?;
         if let Some(buffer) = Arc::into_inner(entry.buffer) {
             buffer
                 .release(self.backend.as_ref(), &entry.tensor)
@@ -258,9 +337,7 @@ impl<B: Backend> Host<B> {
     }
 
     fn entry(&self, resource: &Resource<TensorEntry>) -> Result<&TensorEntry, compute::Error> {
-        self.table
-            .get(resource)
-            .map_err(|error| compute::Error::InvalidHandle(error.to_string()))
+        self.table.get(resource).map_err(invalid_handle)
     }
 
     fn check_allocation(&self, dtype: DType, shape: &[u32]) -> Result<u64, compute::Error> {
@@ -290,6 +367,11 @@ impl<B: Backend> Host<B> {
         let Some(elements) = elements else {
             return Err(quota("tensor element count exceeds the guest limit"));
         };
+        if elements == 0 {
+            return Err(compute::Error::Layout(
+                "tensor must contain at least one element".to_owned(),
+            ));
+        }
         if elements > self.limits.tensor_elements {
             return Err(quota("tensor element count exceeds the guest limit"));
         }
@@ -394,6 +476,37 @@ where
     }
 }
 
+impl<B> compute::HostCommandList for Host<B>
+where
+    B: Backend + Send + Sync + 'static,
+{
+    fn new(&mut self) -> impl Future<Output = wasmtime::Result<Resource<CommandListEntry>>> + Send {
+        std::future::ready(Host::command_list(self).map_err(wasmtime::Error::msg))
+    }
+
+    fn dispatch(
+        &mut self,
+        resource: Resource<CommandListEntry>,
+        operation: compute::Op,
+        inputs: Vec<Resource<TensorEntry>>,
+        output: Resource<TensorEntry>,
+    ) -> impl Future<Output = wasmtime::Result<Result<(), compute::Error>>> + Send {
+        std::future::ready(Ok(Host::dispatch(
+            self, &resource, operation, &inputs, &output,
+        )))
+    }
+
+    fn drop(
+        &mut self,
+        resource: Resource<CommandListEntry>,
+    ) -> impl Future<Output = wasmtime::Result<()>> + Send {
+        std::future::ready(
+            self.drop_command_list(resource)
+                .map_err(wasmtime::Error::msg),
+        )
+    }
+}
+
 impl<B> compute::Host for Host<B> where B: Backend + Send + Sync + 'static {}
 
 impl<B> WasiView for Host<B>
@@ -480,18 +593,43 @@ fn core_view(operation: compute::ViewOp) -> Result<ViewOp, LayoutError> {
     })
 }
 
-fn validate_view(tensor: &Tensor, operation: &ViewOp) -> Result<(), LayoutError> {
+fn core_op(operation: compute::Op) -> Op {
+    match operation {
+        compute::Op::Copy => Op::Copy,
+        compute::Op::Add => Op::Add,
+        compute::Op::SiluMul => Op::SiluMul,
+        compute::Op::RmsNorm(eps) => Op::RmsNorm { eps },
+        compute::Op::Softmax => Op::Softmax,
+        compute::Op::Rope(config) => Op::Rope {
+            theta: config.theta,
+        },
+        compute::Op::Embed => Op::Embed,
+        compute::Op::Matmul => Op::Matmul,
+        compute::Op::Sdpa(config) => Op::Sdpa {
+            scale: config.scale,
+            causal: config.causal,
+            q_start: config.q_start,
+        },
+    }
+}
+
+fn validate_view(tensor: &Tensor, operation: &ViewOp) -> Result<Layout, LayoutError> {
     match operation {
         ViewOp::Slice(specs) => tensor.layout().slice(specs),
         ViewOp::Reshape(shape) => tensor.layout().reshape(shape),
         ViewOp::Permute(axes) => tensor.layout().permute(axes),
         ViewOp::Broadcast(shape) => tensor.layout().broadcast(shape),
     }
-    .map(|_| ())
 }
 
 fn quota(message: &str) -> compute::Error {
     compute::Error::Quota(message.to_owned())
+}
+
+fn invalid_handle(error: impl ToString) -> compute::Error {
+    let message = error.to_string();
+    drop(error);
+    compute::Error::InvalidHandle(message)
 }
 
 fn guest_error(error: impl Into<GuestFailure>) -> compute::Error {
@@ -508,7 +646,7 @@ fn guest_error(error: impl Into<GuestFailure>) -> compute::Error {
             compute::Error::BackendExecution("backend execution failed".to_owned())
         }
         GuestFailure::Backend(BackendError::InvalidInput) => {
-            compute::Error::InvalidHandle("backend rejected the tensor handle".to_owned())
+            invalid_handle("backend rejected the tensor handle")
         }
         GuestFailure::Backend(BackendError::IndexOutOfRange { index }) => {
             compute::Error::OpSignature(format!("backend index {index} is out of range"))
@@ -592,6 +730,37 @@ mod tests {
         );
     }
 
+    fn assert_empty_tensors_are_layout_errors<B: Backend>(backend: B) {
+        let mut host = Host::new(backend, GENEROUS);
+        assert!(matches!(
+            host.alloc(compute::Dtype::F32, &[0]),
+            Err(compute::Error::Layout(_))
+        ));
+        let tensor = host.alloc(compute::Dtype::F32, &[1]).unwrap();
+        assert!(matches!(
+            host.view(
+                &Resource::new_borrow(tensor.rep()),
+                compute::ViewOp::Slice(vec![compute::SliceSpec {
+                    start: 0,
+                    len: 0,
+                    step: 1,
+                }]),
+            ),
+            Err(compute::Error::Layout(_))
+        ));
+    }
+
+    #[test]
+    fn cpu_rejects_empty_tensors_at_the_host_boundary() {
+        assert_empty_tensors_are_layout_errors(CpuBackend::new());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_tensor_smoke_rejects_empty_tensors_at_the_host_boundary() {
+        assert_empty_tensors_are_layout_errors(forja_metal::MetalBackend::new().unwrap());
+    }
+
     #[test]
     fn refuses_views_over_handle_and_element_limits() {
         let mut host = Host::new(CpuBackend::new(), Limits::new(16, 8, 1, 1, u64::MAX));
@@ -633,6 +802,204 @@ mod tests {
             host.write(&view, &vec![0; 7 * 1024 * 4]),
             Err(compute::Error::Layout(_))
         ));
+    }
+
+    #[test]
+    fn records_every_guest_operation() {
+        let cases = [
+            (
+                compute::Op::Copy,
+                vec![(compute::Dtype::F32, vec![7])],
+                (compute::Dtype::F32, vec![7]),
+            ),
+            (
+                compute::Op::Add,
+                vec![
+                    (compute::Dtype::F16, vec![7]),
+                    (compute::Dtype::F16, vec![7]),
+                ],
+                (compute::Dtype::F16, vec![7]),
+            ),
+            (
+                compute::Op::SiluMul,
+                vec![
+                    (compute::Dtype::Bf16, vec![33]),
+                    (compute::Dtype::Bf16, vec![33]),
+                ],
+                (compute::Dtype::Bf16, vec![33]),
+            ),
+            (
+                compute::Op::RmsNorm(0.00001),
+                vec![
+                    (compute::Dtype::F32, vec![7, 1024]),
+                    (compute::Dtype::F32, vec![1024]),
+                ],
+                (compute::Dtype::F32, vec![7, 1024]),
+            ),
+            (
+                compute::Op::Softmax,
+                vec![(compute::Dtype::F32, vec![7, 33])],
+                (compute::Dtype::F32, vec![7, 33]),
+            ),
+            (
+                compute::Op::Rope(compute::RopeCfg { theta: 10_000.0 }),
+                vec![
+                    (compute::Dtype::F32, vec![7, 16, 128]),
+                    (compute::Dtype::U32, vec![7]),
+                ],
+                (compute::Dtype::F32, vec![7, 16, 128]),
+            ),
+            (
+                compute::Op::Embed,
+                vec![
+                    (compute::Dtype::F32, vec![33, 128]),
+                    (compute::Dtype::U32, vec![7]),
+                ],
+                (compute::Dtype::F32, vec![7, 128]),
+            ),
+            (
+                compute::Op::Matmul,
+                vec![
+                    (compute::Dtype::F32, vec![7, 33]),
+                    (compute::Dtype::F32, vec![33, 1024]),
+                ],
+                (compute::Dtype::F32, vec![7, 1024]),
+            ),
+            (
+                compute::Op::Sdpa(compute::SdpaCfg {
+                    scale: 0.088,
+                    causal: false,
+                    q_start: 0,
+                }),
+                vec![
+                    (compute::Dtype::F32, vec![16, 7, 128]),
+                    (compute::Dtype::F32, vec![8, 33, 128]),
+                    (compute::Dtype::F32, vec![8, 33, 128]),
+                ],
+                (compute::Dtype::F32, vec![16, 7, 128]),
+            ),
+        ];
+
+        for (operation, input_specs, (output_dtype, output_shape)) in cases {
+            let mut host = Host::new(CpuBackend::new(), GENEROUS);
+            let inputs = input_specs
+                .iter()
+                .map(|(dtype, shape)| host.alloc(*dtype, shape).unwrap())
+                .collect::<Vec<_>>();
+            let input_borrows = inputs
+                .iter()
+                .map(|resource| Resource::new_borrow(resource.rep()))
+                .collect::<Vec<_>>();
+            let output = host.alloc(output_dtype, &output_shape).unwrap();
+            let commands = host.command_list().unwrap();
+
+            host.dispatch(&commands, operation, &input_borrows, &output)
+                .unwrap();
+
+            assert_eq!(
+                host.table
+                    .get(&commands)
+                    .unwrap()
+                    .commands
+                    .clone()
+                    .into_dispatches()
+                    .len(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_dispatches_preserve_the_command_list() {
+        let mut host = Host::new(CpuBackend::new(), GENEROUS);
+        let input = host.alloc(compute::Dtype::F32, &[7]).unwrap();
+        let output = host.alloc(compute::Dtype::F32, &[7]).unwrap();
+        let commands = host.command_list().unwrap();
+        assert!(matches!(
+            host.dispatch(
+                &commands,
+                compute::Op::RmsNorm(f32::NAN),
+                &[Resource::new_borrow(input.rep())],
+                &output,
+            ),
+            Err(compute::Error::OpSignature(_))
+        ));
+        assert!(matches!(
+            host.dispatch(
+                &commands,
+                compute::Op::Copy,
+                &[Resource::new_borrow(input.rep())],
+                &Resource::new_borrow(input.rep()),
+            ),
+            Err(compute::Error::OpSignature(_))
+        ));
+        assert!(
+            host.table
+                .get(&commands)
+                .unwrap()
+                .commands
+                .clone()
+                .into_dispatches()
+                .is_empty()
+        );
+
+        host.dispatch(
+            &commands,
+            compute::Op::Copy,
+            &[Resource::new_borrow(input.rep())],
+            &output,
+        )
+        .unwrap();
+        assert!(matches!(
+            host.dispatch(
+                &Resource::new_borrow(42),
+                compute::Op::Copy,
+                &[Resource::new_borrow(input.rep())],
+                &output,
+            ),
+            Err(compute::Error::InvalidHandle(_))
+        ));
+        assert!(matches!(
+            host.dispatch(
+                &commands,
+                compute::Op::Copy,
+                &[Resource::new_borrow(43)],
+                &output,
+            ),
+            Err(compute::Error::InvalidHandle(_))
+        ));
+    }
+
+    #[test]
+    fn dropping_a_command_list_releases_unreferenced_buffers() {
+        let mut host = Host::new(CpuBackend::new(), GENEROUS);
+        let input = host.alloc(compute::Dtype::F32, &[7]).unwrap();
+        let output = host.alloc(compute::Dtype::F32, &[7]).unwrap();
+        let input_tensor = host.entry(&input).unwrap().tensor.clone();
+        let output_tensor = host.entry(&output).unwrap().tensor.clone();
+        let commands = host.command_list().unwrap();
+        host.dispatch(
+            &commands,
+            compute::Op::Copy,
+            &[Resource::new_borrow(input.rep())],
+            &output,
+        )
+        .unwrap();
+
+        host.drop_tensor(input).unwrap();
+        host.drop_tensor(output).unwrap();
+        assert!(host.backend.read(&input_tensor).is_ok());
+        assert!(host.backend.read(&output_tensor).is_ok());
+
+        host.drop_command_list(commands).unwrap();
+        assert_eq!(
+            host.backend.read(&input_tensor),
+            Err(BackendError::InvalidInput)
+        );
+        assert_eq!(
+            host.backend.read(&output_tensor),
+            Err(BackendError::InvalidInput)
+        );
     }
 
     #[test]

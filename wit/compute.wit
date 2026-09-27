@@ -22,6 +22,28 @@ interface compute {
     broadcast(list<u32>),
   }
 
+  record rope-cfg {
+    theta: f32,
+  }
+
+  record sdpa-cfg {
+    scale: f32,
+    causal: bool,
+    q-start: u32,
+  }
+
+  variant op {
+    copy,
+    add,
+    silu-mul,
+    rms-norm(f32),
+    softmax,
+    rope(rope-cfg),
+    embed,
+    matmul,
+    sdpa(sdpa-cfg),
+  }
+
   variant error {
     layout(string),
     op-signature(string),
@@ -35,6 +57,11 @@ interface compute {
     view: func(operation: view-op) -> result<tensor, error>;
     write: func(bytes: list<u8>) -> result<_, error>;
     read: async func() -> result<list<u8>, error>;
+  }
+
+  resource command-list {
+    constructor();
+    dispatch: func(operation: op, ins: list<borrow<tensor>>, out: borrow<tensor>) -> result<_, error>;
   }
 }
 
