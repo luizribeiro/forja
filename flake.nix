@@ -120,6 +120,7 @@
                 export FORJA_MODELS="''${FORJA_MODELS:-$HOME/.cache/forja/models}"
                 cargo nextest run --release -p forja-host --test qwen_weights --run-ignored only
                 cargo nextest run --release -p golden-fixtures --test qwen_fixtures --run-ignored only
+                cargo nextest run --release -p forja --bin forja --run-ignored only
               '';
             })
             // {

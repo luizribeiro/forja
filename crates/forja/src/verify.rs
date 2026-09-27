@@ -239,3 +239,40 @@ const fn limits() -> Limits {
     .with_guest_call_timeout(Duration::from_secs(300))
     .with_gpu_limits(Duration::from_secs(60), Duration::from_secs(3_600))
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{env, path::PathBuf};
+
+    use super::*;
+
+    #[test]
+    #[ignore = "requires FORJA_MODELS and runs in the pre-push hook"]
+    fn cpu_qwen_verification() -> Result<(), Box<dyn Error>> {
+        run_model_test(BackendArg::Cpu, vec!["single-token".to_owned()], 2)
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires FORJA_MODELS and runs in the pre-push hook"]
+    fn metal_qwen_verification() -> Result<(), Box<dyn Error>> {
+        run_model_test(BackendArg::Metal, Vec::new(), 32)
+    }
+
+    fn run_model_test(
+        backend: BackendArg,
+        prompts: Vec<String>,
+        decode_steps: usize,
+    ) -> Result<(), Box<dyn Error>> {
+        let root = PathBuf::from(env::var_os("FORJA_MODELS").ok_or("FORJA_MODELS is not set")?);
+        let options = Verify {
+            model_dir: root.join("Qwen3-0.6B"),
+            fixtures: root.join("golden/qwen3-0.6b"),
+            backend,
+            prompts,
+        };
+        tokio::runtime::Builder::new_current_thread()
+            .build()?
+            .block_on(run_with_steps(&options, decode_steps))
+    }
+}
