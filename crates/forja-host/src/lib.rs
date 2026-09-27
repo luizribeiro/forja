@@ -197,22 +197,23 @@ enum ImportKind {
 struct ImportTimer {
     profile: Option<Arc<Mutex<EngineStepProfile>>>,
     kind: ImportKind,
-    started: Instant,
+    started: Option<Instant>,
 }
 
 impl ImportTimer {
     fn start(profile: Option<Arc<Mutex<EngineStepProfile>>>, kind: ImportKind) -> Self {
+        let started = profile.as_ref().map(|_| Instant::now());
         Self {
             profile,
             kind,
-            started: Instant::now(),
+            started,
         }
     }
 }
 
 impl Drop for ImportTimer {
     fn drop(&mut self) {
-        let Some(profile) = &self.profile else {
+        let (Some(profile), Some(started)) = (&self.profile, self.started) else {
             return;
         };
         let Ok(mut profile) = profile.lock() else {
@@ -230,7 +231,7 @@ impl Drop for ImportTimer {
             ImportKind::Read => &mut profile.imports.read,
         };
         timing.count = timing.count.saturating_add(1);
-        timing.time = timing.time.saturating_add(self.started.elapsed());
+        timing.time = timing.time.saturating_add(started.elapsed());
     }
 }
 
@@ -243,22 +244,23 @@ enum BackendEvent {
 struct BackendTimer {
     profile: Option<Arc<Mutex<EngineStepProfile>>>,
     event: BackendEvent,
-    started: Instant,
+    started: Option<Instant>,
 }
 
 impl BackendTimer {
     fn start(profile: Option<&Arc<Mutex<EngineStepProfile>>>, event: BackendEvent) -> Self {
+        let started = profile.map(|_| Instant::now());
         Self {
             profile: profile.cloned(),
             event,
-            started: Instant::now(),
+            started,
         }
     }
 }
 
 impl Drop for BackendTimer {
     fn drop(&mut self) {
-        let Some(profile) = &self.profile else {
+        let (Some(profile), Some(started)) = (&self.profile, self.started) else {
             return;
         };
         let Ok(mut profile) = profile.lock() else {
@@ -269,7 +271,7 @@ impl Drop for BackendTimer {
             BackendEvent::Release => &mut profile.releases,
         };
         timing.count = timing.count.saturating_add(1);
-        timing.time = timing.time.saturating_add(self.started.elapsed());
+        timing.time = timing.time.saturating_add(started.elapsed());
     }
 }
 
