@@ -36,6 +36,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "RMSNORM_SMOKE_COMPONENT",
         &release_dir.join("rmsnorm_smoke.wasm"),
     );
+    emit_guest_path(
+        "PROGRAM_SMOKE_COMPONENT",
+        &release_dir.join("program_smoke.wasm"),
+    );
     emit_guest_path("SDK_SMOKE_COMPONENT", &release_dir.join("sdk_smoke.wasm"));
     emit_guest_path(
         "TENSOR_SMOKE_COMPONENT",

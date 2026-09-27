@@ -169,6 +169,11 @@ world rmsnorm-smoke {
   export run: async func() -> result<tuple<u64, u64>, string>;
 }
 
+world program-smoke {
+  import compute;
+  export run: async func() -> result<list<f32>, string>;
+}
+
 world weights-smoke {
   import compute;
   export run: async func() -> result<list<u8>, string>;

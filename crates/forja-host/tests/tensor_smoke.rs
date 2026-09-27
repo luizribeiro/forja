@@ -46,6 +46,26 @@ async fn cpu_tensor_smoke_submits_commands() -> wasmtime::Result<()> {
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn cpu_guest_fused_program_matches_trusted_operations() -> wasmtime::Result<()> {
+    let expected = direct_fused_values()?;
+    let (mut store, instance) = instantiate(
+        forja_cpu::CpuBackend::new(),
+        test_guests::program_smoke(),
+        COMMAND_LIMITS,
+    )
+    .await?;
+    let run = instance.get_typed_func::<(), (Result<Vec<f32>, String>,)>(&mut store, "run")?;
+    Host::reset_guest_deadline(&mut store);
+    let (actual,) = store
+        .run_concurrent(async move |accessor| run.call_concurrent(accessor, ()).await)
+        .await??;
+    let actual = actual.map_err(wasmtime::Error::msg)?;
+    let error = normwise_relative_error(&expected, &actual);
+    assert!(error <= F32_TOLERANCE, "relative error {error}");
+    Ok(())
+}
+
 #[cfg(target_os = "macos")]
 #[tokio::test(flavor = "multi_thread")]
 async fn metal_tensor_smoke_submits_commands() -> wasmtime::Result<()> {
@@ -532,6 +552,40 @@ fn weight_file() -> PathBuf {
     ));
     fs::write(&path, bytes).unwrap();
     path
+}
+
+fn direct_fused_values() -> wasmtime::Result<Vec<f32>> {
+    let backend = forja_cpu::CpuBackend::new();
+    let residual_values = fused_values(0.03125);
+    let update_values = fused_values(-0.015_625);
+    let weight_values = (0_u16..1024)
+        .map(|index| 0.5 + f32::from(index) / 2048.0)
+        .collect::<Vec<_>>();
+    let residual = f32_tensor(&backend, &[7, 1024], &residual_values)?;
+    let update = f32_tensor(&backend, &[7, 1024], &update_values)?;
+    let weight = f32_tensor(&backend, &[1024], &weight_values)?;
+    let sum = f32_output(&backend, &[7, 1024])?;
+    let normalized = f32_output(&backend, &[7, 1024])?;
+    let mut commands = CommandList::new();
+    commands
+        .dispatch(Op::Add, &[&residual, &update], &sum)
+        .map_err(wasmtime::Error::msg)?;
+    commands
+        .dispatch(Op::RmsNorm { eps: 1.0e-6 }, &[&sum, &weight], &normalized)
+        .map_err(wasmtime::Error::msg)?;
+    backend
+        .submit(commands)
+        .map_err(backend_error)?
+        .wait()
+        .map_err(backend_error)?;
+    let bytes = backend.read(&normalized).map_err(backend_error)?;
+    Ok(decode_f32_le(&bytes)?)
+}
+
+fn fused_values(scale: f32) -> Vec<f32> {
+    (0_u16..7 * 1024)
+        .map(|index| (f32::from(index % 257) - 128.0) * scale)
+        .collect()
 }
 
 fn direct_checksums<B: Backend>(backend: &B) -> wasmtime::Result<(u64, u64)> {

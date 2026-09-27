@@ -27,6 +27,12 @@ pub fn rmsnorm_smoke() -> &'static Path {
     Path::new(env!("RMSNORM_SMOKE_COMPONENT"))
 }
 
+/// Returns the path to the guest that runs a fused scalar program.
+#[must_use]
+pub fn program_smoke() -> &'static Path {
+    Path::new(env!("PROGRAM_SMOKE_COMPONENT"))
+}
+
 /// Returns the path to the guest that runs a Qwen-shaped SDK attention block.
 #[must_use]
 pub fn sdk_smoke() -> &'static Path {

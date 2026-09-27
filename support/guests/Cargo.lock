@@ -176,6 +176,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "program-smoke"
+version = "0.0.0"
+dependencies = [
+ "forja-sdk",
+ "wit-bindgen",
+]
+
+[[package]]
 name = "quote"
 version = "1.0.47"
 source = "registry+https://github.com/rust-lang/crates.io-index"
