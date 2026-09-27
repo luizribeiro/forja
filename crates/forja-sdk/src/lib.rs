@@ -9,21 +9,64 @@
 //! automatically before reading.
 //!
 //! ```no_run
-//! use forja_sdk::{Result, Tensor, nn::{Linear, RmsNorm}};
+//! use forja_sdk::{
+//!     Engine, EngineInfo, Load, Result, StepInput, StepOutput, Weights, export_engine,
+//!     nn::{Embedding, EmbeddingConfig, Linear, LinearConfig, RmsNorm, RmsNormConfig},
+//! };
 //!
-//! fn block(
-//!     input: &[f32],
-//!     norm_weight: &[f32],
-//!     projection_weight: &[f32],
-//! ) -> Result<Vec<f32>> {
-//!     let input = Tensor::from_slice(input, &[7, 1024])?;
-//!     let norm = RmsNorm::new(Tensor::from_slice(norm_weight, &[1024])?, 1.0e-6);
-//!     let projection = Linear::new(Tensor::from_slice(
-//!         projection_weight,
-//!         &[1024, 1024],
-//!     )?);
-//!     let projected = projection.forward(&norm.forward(&input)?)?;
-//!     (&input + &projected)?.to_vec()
+//! const HIDDEN: u32 = 1024;
+//! const VOCAB: u32 = 32_000;
+//!
+//! #[derive(Clone, Copy)]
+//! struct Config;
+//!
+//! #[derive(Load)]
+//! #[load(config = Config)]
+//! struct Block {
+//!     #[load(prefix, config = RmsNormConfig::new(HIDDEN, 1.0e-6))]
+//!     norm: RmsNorm<f32>,
+//!     #[load(prefix, config = LinearConfig::new(HIDDEN, HIDDEN))]
+//!     projection: Linear<f32>,
+//! }
+//!
+//! #[derive(Load)]
+//! #[load(config = Config)]
+//! struct Llama {
+//!     #[load(prefix, config = EmbeddingConfig::new(VOCAB, HIDDEN))]
+//!     embed: Embedding<f32>,
+//!     #[load(prefix, count = 2)]
+//!     blocks: Vec<Block>,
+//!     #[load(prefix, config = RmsNormConfig::new(HIDDEN, 1.0e-6))]
+//!     norm: RmsNorm<f32>,
+//!     #[load(prefix, config = LinearConfig::new(HIDDEN, VOCAB))]
+//!     lm_head: Linear<f32>,
+//! }
+//!
+//! #[export_engine]
+//! impl Engine for Llama {
+//!     fn describe() -> EngineInfo {
+//!         EngineInfo { vocab: VOCAB, max_context: 4096, tap_layers: vec![] }
+//!     }
+//!
+//!     fn load(weights: &Weights<'_>) -> Result<Self> {
+//!         <Self as Load<Config>>::load(weights, &Config)
+//!     }
+//!
+//!     fn step(&mut self, input: StepInput) -> Result<StepOutput> {
+//!         let last = input.tokens.shape().first().copied()
+//!             .ok_or_else(|| forja_sdk::Error::loading("tokens must have rank one"))?
+//!             .checked_sub(1)
+//!             .ok_or_else(|| forja_sdk::Error::loading("tokens cannot be empty"))?;
+//!         let mut hidden = self.embed.forward(&input.tokens)?;
+//!         for block in &self.blocks {
+//!             let projected = block.projection.forward(&block.norm.forward(&hidden)?)?;
+//!             hidden = (&hidden + &projected)?;
+//!         }
+//!         let logits = self.lm_head.forward(&self.norm.forward(&hidden)?)?
+//!             .narrow(0, last, 1)?
+//!             .reshape(&[VOCAB])?;
+//!         Ok(StepOutput { logits, taps: vec![] })
+//!     }
 //! }
 //! ```
 //!
