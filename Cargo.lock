@@ -519,6 +519,10 @@ dependencies = [
 name = "forja-sdk"
 version = "0.0.0"
 dependencies = [
+ "forja-core",
+ "forja-cpu",
+ "forja-host",
+ "forja-metal",
  "half",
  "wit-bindgen 0.62.0",
 ]

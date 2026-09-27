@@ -6,11 +6,21 @@ publish.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
+[features]
+native = ["dep:forja-core", "dep:forja-cpu", "dep:forja-host"]
+native-metal = ["native", "dep:forja-metal"]
+
 [dependencies]
+forja-core = { path = "../forja-core", optional = true }
+forja-cpu = { path = "../forja-cpu", optional = true }
+forja-host = { path = "../forja-host", optional = true }
 half = "2"
 
 [target.'cfg(target_family = "wasm")'.dependencies]
 wit-bindgen = "0.62"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+forja-metal = { path = "../forja-metal", optional = true }
 
 [lints]
 workspace = true

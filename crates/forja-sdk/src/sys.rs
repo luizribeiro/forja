@@ -1,5 +1,5 @@
 #![cfg_attr(
-    not(target_family = "wasm"),
+    all(not(target_family = "wasm"), not(feature = "native")),
     allow(
         dead_code,
         reason = "view payloads are consumed by the guest or native backend"
@@ -108,7 +108,7 @@ mod guest {
     }
 }
 
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(not(target_family = "wasm"), not(feature = "native")))]
 mod unavailable {
     use super::{Backend, DType, Error, Result, View};
 
@@ -141,9 +141,140 @@ mod unavailable {
     }
 }
 
-#[cfg(target_family = "wasm")]
+#[cfg(feature = "native")]
+mod native {
+    use std::cell::Cell;
+
+    use forja_core::{DType as CoreDType, Slice as CoreSlice, ViewOp};
+    use forja_host::{NativeHost, NativeTensor};
+
+    use super::{Backend, DType, Error, Result, View};
+    use crate::NativeDevice;
+
+    type CpuTensor = NativeTensor<forja_cpu::CpuBackend>;
+    #[cfg(all(feature = "native-metal", target_os = "macos"))]
+    type MetalTensor = NativeTensor<forja_metal::MetalBackend>;
+
+    thread_local! {
+        static DEVICE: Cell<NativeDevice> = const { Cell::new(NativeDevice::Cpu) };
+        static CPU_HOST: NativeHost<forja_cpu::CpuBackend> =
+            NativeHost::new(forja_cpu::CpuBackend::new());
+        #[cfg(all(feature = "native-metal", target_os = "macos"))]
+        static METAL_HOST: Result<NativeHost<forja_metal::MetalBackend>> =
+            forja_metal::MetalBackend::new().map(NativeHost::new).map_err(error);
+    }
+
+    pub(crate) enum Tensor {
+        Cpu(CpuTensor),
+        #[cfg(all(feature = "native-metal", target_os = "macos"))]
+        Metal(MetalTensor),
+    }
+
+    pub(crate) struct Native;
+
+    impl Backend for Native {
+        type Tensor = Tensor;
+
+        fn alloc(dtype: DType, shape: &[u32]) -> Result<Self::Tensor> {
+            match DEVICE.get() {
+                NativeDevice::Cpu => CPU_HOST.with(|host| {
+                    host.alloc(core_dtype(dtype), shape)
+                        .map(Tensor::Cpu)
+                        .map_err(error)
+                }),
+                #[cfg(all(feature = "native-metal", target_os = "macos"))]
+                NativeDevice::Metal => with_metal(|host| {
+                    host.alloc(core_dtype(dtype), shape)
+                        .map(Tensor::Metal)
+                        .map_err(error)
+                }),
+            }
+        }
+
+        fn write(tensor: &Self::Tensor, bytes: &[u8]) -> Result<()> {
+            match tensor {
+                Tensor::Cpu(tensor) => {
+                    CPU_HOST.with(|host| host.write(tensor, bytes).map_err(error))
+                }
+                #[cfg(all(feature = "native-metal", target_os = "macos"))]
+                Tensor::Metal(tensor) => {
+                    with_metal(|host| host.write(tensor, bytes).map_err(error))
+                }
+            }
+        }
+
+        fn view(tensor: &Self::Tensor, operation: View) -> Result<Self::Tensor> {
+            let operation = core_view(operation)?;
+            match tensor {
+                Tensor::Cpu(tensor) => CPU_HOST
+                    .with(|host| host.view(tensor, operation).map(Tensor::Cpu).map_err(error)),
+                #[cfg(all(feature = "native-metal", target_os = "macos"))]
+                Tensor::Metal(tensor) => with_metal(|host| {
+                    host.view(tensor, operation)
+                        .map(Tensor::Metal)
+                        .map_err(error)
+                }),
+            }
+        }
+
+        fn read(tensor: &Self::Tensor) -> Result<Vec<u8>> {
+            match tensor {
+                Tensor::Cpu(tensor) => CPU_HOST.with(|host| host.read(tensor).map_err(error)),
+                #[cfg(all(feature = "native-metal", target_os = "macos"))]
+                Tensor::Metal(tensor) => with_metal(|host| host.read(tensor).map_err(error)),
+            }
+        }
+    }
+
+    pub(crate) fn set_device(device: NativeDevice) {
+        DEVICE.set(device);
+    }
+
+    fn core_view(operation: View) -> Result<ViewOp> {
+        match operation {
+            View::Slice(slices) => Ok(ViewOp::Slice(
+                slices
+                    .into_iter()
+                    .map(|slice| CoreSlice::new(slice.start, slice.len, slice.step))
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .map_err(|error| Error::new(error.to_string()))?,
+            )),
+            View::Reshape(shape) => Ok(ViewOp::Reshape(shape)),
+            View::Permute(axes) => Ok(ViewOp::Permute(axes)),
+            View::Broadcast(shape) => Ok(ViewOp::Broadcast(shape)),
+        }
+    }
+
+    fn core_dtype(dtype: DType) -> CoreDType {
+        match dtype {
+            DType::F32 => CoreDType::F32,
+            DType::F16 => CoreDType::F16,
+            DType::BF16 => CoreDType::BF16,
+            DType::U32 => CoreDType::U32,
+            DType::I32 => CoreDType::I32,
+        }
+    }
+
+    #[cfg(all(feature = "native-metal", target_os = "macos"))]
+    fn with_metal<T>(
+        operation: impl FnOnce(&NativeHost<forja_metal::MetalBackend>) -> Result<T>,
+    ) -> Result<T> {
+        METAL_HOST.with(|host| match host {
+            Ok(host) => operation(host),
+            Err(error) => Err(error.clone()),
+        })
+    }
+
+    fn error(error: forja_core::BackendError) -> Error {
+        Error::new(error.to_string())
+    }
+}
+
+#[cfg(all(not(feature = "native"), target_family = "wasm"))]
 pub(crate) use guest::Guest as Active;
-#[cfg(not(target_family = "wasm"))]
+#[cfg(feature = "native")]
+pub(crate) use native::Native as Active;
+#[cfg(all(not(feature = "native"), not(target_family = "wasm")))]
 pub(crate) use unavailable::Unavailable as Active;
 pub(crate) type Handle = <Active as Backend>::Tensor;
 
@@ -169,4 +300,9 @@ pub(crate) fn view(tensor: &Handle, operation: View) -> Result<Handle> {
 
 pub(crate) fn read(tensor: &Handle) -> Result<Vec<u8>> {
     Active::read(tensor)
+}
+
+#[cfg(feature = "native")]
+pub(crate) fn set_native_device(device: crate::NativeDevice) {
+    native::set_device(device);
 }

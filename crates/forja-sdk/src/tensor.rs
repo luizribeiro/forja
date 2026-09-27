@@ -201,3 +201,60 @@ fn element_count(shape: &[u32]) -> Result<u64> {
 fn size_error() -> Error {
     Error::new("tensor element count overflowed")
 }
+
+#[cfg(all(test, feature = "native"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn native_views_round_trip_non_contiguous_values() {
+        let tensor = Tensor::from_slice(&(0_u32..21).collect::<Vec<_>>(), &[3, 7]).unwrap();
+        let view = tensor
+            .slice(&[Slice::new(0, 3, 1).unwrap(), Slice::new(1, 3, 2).unwrap()])
+            .unwrap()
+            .t()
+            .unwrap();
+
+        assert_eq!(view.shape(), [3, 3]);
+        assert_eq!(view.to_vec().unwrap(), [1, 8, 15, 3, 10, 17, 5, 12, 19]);
+    }
+
+    #[test]
+    fn rejects_invalid_slice_preconditions() {
+        let tensor = Tensor::from_slice(&(0_u32..6).collect::<Vec<_>>(), &[2, 3]).unwrap();
+
+        assert!(Slice::new(0, 1, 0).is_err());
+        assert!(tensor.slice(&[Slice::new(0, 1, 1).unwrap()]).is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_narrow_preconditions() {
+        let tensor = Tensor::from_slice(&(0_u32..6).collect::<Vec<_>>(), &[2, 3]).unwrap();
+
+        assert!(tensor.narrow(2, 0, 1).is_err());
+        assert!(tensor.narrow(1, 2, 2).is_err());
+        assert!(tensor.narrow(1, u32::MAX, 2).is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_permutation_preconditions() {
+        let tensor = Tensor::from_slice(&(0_u32..6).collect::<Vec<_>>(), &[2, 3]).unwrap();
+
+        assert!(tensor.permute(&[0]).is_err());
+        assert!(tensor.permute(&[0, 0]).is_err());
+        assert!(tensor.permute(&[0, 2]).is_err());
+    }
+
+    #[test]
+    fn rejects_transpose_below_rank_two() {
+        let tensor = Tensor::from_slice(&[1_u32, 2], &[2]).unwrap();
+
+        assert!(tensor.t().is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_allocation_preconditions() {
+        assert!(Tensor::from_slice(&[1_u32], &[2]).is_err());
+        assert!(Tensor::<u32>::from_slice(&[], &[u32::MAX, u32::MAX, u32::MAX]).is_err());
+    }
+}
