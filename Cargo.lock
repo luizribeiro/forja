@@ -508,6 +508,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "forja-mmap"
+version = "0.0.0"
+dependencies = [
+ "memmap2",
+]
+
+[[package]]
 name = "forja-sdk"
 version = "0.0.0"
 
@@ -910,6 +917,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "57804b2c9b69967f1536a56f86297e367a33b19e98852ed624b84551cdbc0d90"
 dependencies = [
  "rustix",
+]
+
+[[package]]
+name = "memmap2"
+version = "0.9.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d1219ed1b7f229ee7104d281dd01d6802fe28bb6e95d292942c4daacdeb798c0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]
