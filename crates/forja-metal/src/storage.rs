@@ -115,7 +115,9 @@ impl MetalBackend {
             "\n",
             include_str!("steel_gemm_mma.metal"),
             "\n",
-            include_str!("matmul.metal")
+            include_str!("matmul.metal"),
+            "\n",
+            include_str!("sdpa.metal")
         );
         let pipelines = PipelineCache::new(&device, source)?;
         let shared_event = device

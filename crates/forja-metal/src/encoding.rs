@@ -9,7 +9,7 @@ use std::{
 
 use block2::RcBlock;
 use forja_core::{
-    BackendError, BufferId, CommandList, DType, Dispatch, Layout, Op, Submission, Tensor,
+    BackendError, BufferId, CommandList, DType, Dispatch, Layout, Op, Slice, Submission, Tensor,
     required_barriers,
 };
 use objc2::{rc::Retained, runtime::ProtocolObject};
@@ -30,6 +30,7 @@ use crate::{
 type MetalBufferRef = Retained<ProtocolObject<dyn MTLBuffer>>;
 type EncodedEmbed = (Vec<MetalBufferRef>, u64);
 
+#[derive(Clone)]
 struct EncoderTensor {
     buffer: MetalBufferRef,
     layout: Layout,
@@ -37,7 +38,9 @@ struct EncoderTensor {
 
 #[derive(Clone, Copy)]
 struct MatmulShape {
-    dtype: DType,
+    left_dtype: DType,
+    right_dtype: DType,
+    output_dtype: DType,
     batch: u32,
     rows: u32,
     columns: u32,
@@ -713,6 +716,7 @@ impl MetalBackend {
                     | Op::Rope { .. }
                     | Op::Embed
                     | Op::Matmul
+                    | Op::Sdpa { .. }
             )
         }) {
             return Err(BackendError::InvalidInput);
@@ -827,6 +831,15 @@ impl MetalBackend {
                 temporaries.extend(self.encode_matmul(&encoder, table, dispatch, &mut bindings)?);
                 continue;
             }
+            if matches!(dispatch.op(), Op::Sdpa { .. }) {
+                temporaries.extend(self.encode_sdpa_dispatch(
+                    &encoder,
+                    table,
+                    dispatch,
+                    &mut bindings,
+                )?);
+                continue;
+            }
             let kernel = match dispatch.op() {
                 Op::Add
                     if dispatch
@@ -887,22 +900,10 @@ impl MetalBackend {
         let output_tensor = dispatch.output();
         let dtype = output_tensor.layout().dtype();
         let mut temporaries = Vec::new();
-        let left = self.prepare_matmul_input(
-            encoder,
-            table,
-            left_tensor,
-            dtype,
-            bindings,
-            &mut temporaries,
-        )?;
-        let right = self.prepare_matmul_input(
-            encoder,
-            table,
-            right_tensor,
-            dtype,
-            bindings,
-            &mut temporaries,
-        )?;
+        let left =
+            self.prepare_matmul_input(encoder, table, left_tensor, bindings, &mut temporaries)?;
+        let right =
+            self.prepare_matmul_input(encoder, table, right_tensor, bindings, &mut temporaries)?;
         if left.copied || right.copied {
             encoder.barrierAfterEncoderStages_beforeEncoderStages_visibilityOptions(
                 MTLStages::Dispatch,
@@ -959,6 +960,289 @@ impl MetalBackend {
         Ok(temporaries)
     }
 
+    fn encode_sdpa_dispatch(
+        &self,
+        encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
+        table: &ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>,
+        dispatch: &Dispatch,
+        bindings: &mut ArgumentBindings,
+    ) -> Result<Vec<MetalBufferRef>, BackendError> {
+        let Op::Sdpa {
+            scale,
+            causal,
+            q_start,
+        } = dispatch.op()
+        else {
+            return Err(BackendError::InvalidInput);
+        };
+        let [query, key, _] = dispatch.inputs() else {
+            return Err(BackendError::InvalidInput);
+        };
+        let [query_heads, _, _] = shape3(query.layout())?;
+        let [kv_heads, _, _] = shape3(key.layout())?;
+        if causal || query_heads != kv_heads {
+            return Err(BackendError::InvalidInput);
+        }
+        self.encode_decomposed_sdpa(encoder, table, dispatch, scale, causal, q_start, bindings)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn encode_decomposed_sdpa(
+        &self,
+        encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
+        table: &ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>,
+        dispatch: &Dispatch,
+        scale: f32,
+        causal: bool,
+        q_start: u32,
+        bindings: &mut ArgumentBindings,
+    ) -> Result<Vec<MetalBufferRef>, BackendError> {
+        let [query, key, value] = dispatch.inputs() else {
+            return Err(BackendError::InvalidInput);
+        };
+        let query = self.encoder_tensor(query)?;
+        let key = self.encoder_tensor(key)?;
+        let value = self.encoder_tensor(value)?;
+        let output = self.encoder_tensor(dispatch.output())?;
+        let [query_heads, query_length, _] = shape3(&query.layout)?;
+        let [kv_heads, key_length, _] = shape3(&key.layout)?;
+        let [_, _, value_width] = shape3(&value.layout)?;
+        let heads_per_group = query_heads / kv_heads;
+        let scores = self.scratch_tensor(DType::F32, &[query_heads, query_length, key_length])?;
+        let mut temporaries = vec![scores.buffer.clone()];
+        temporaries.extend(self.encode_sdpa_query_key(
+            encoder,
+            table,
+            &query,
+            &key,
+            &scores,
+            kv_heads,
+            heads_per_group,
+            bindings,
+        )?);
+        encode_dispatch_barrier(encoder);
+        temporaries.push(
+            self.encode_sdpa_scale_mask(encoder, table, &scores, scale, causal, q_start, bindings)?,
+        );
+        encode_dispatch_barrier(encoder);
+        temporaries
+            .extend(self.encode_softmax_tensors(encoder, table, &scores, &scores, bindings)?);
+        encode_dispatch_barrier(encoder);
+
+        temporaries.extend(self.encode_sdpa_probability_value(
+            encoder,
+            table,
+            &scores,
+            &value,
+            &output,
+            kv_heads,
+            heads_per_group,
+            query_length,
+            value_width,
+            bindings,
+        )?);
+        Ok(temporaries)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn encode_sdpa_query_key(
+        &self,
+        encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
+        table: &ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>,
+        query: &EncoderTensor,
+        key: &EncoderTensor,
+        scores: &EncoderTensor,
+        kv_heads: u32,
+        heads_per_group: u32,
+        bindings: &mut ArgumentBindings,
+    ) -> Result<Vec<MetalBufferRef>, BackendError> {
+        let mut temporaries = Vec::new();
+        for kv_head in 0..kv_heads {
+            let first_head = kv_head
+                .checked_mul(heads_per_group)
+                .ok_or(BackendError::InvalidInput)?;
+            let query_group = head_group(query, first_head, heads_per_group)?;
+            let key_head = head_matrix(key, kv_head, true)?;
+            let score_group = head_group(scores, first_head, heads_per_group)?;
+            let left = self.prepare_matmul_encoder_input(
+                encoder,
+                table,
+                query_group,
+                bindings,
+                &mut temporaries,
+            )?;
+            let right = self.prepare_matmul_encoder_input(
+                encoder,
+                table,
+                key_head,
+                bindings,
+                &mut temporaries,
+            )?;
+            if left.copied || right.copied {
+                encode_dispatch_barrier(encoder);
+            }
+            let (_, leading_dimension, batch_stride) = classify(&score_group.layout)
+                .kernel_strides()
+                .ok_or(BackendError::ExecutionFailed)?;
+            temporaries.push(self.encode_matmul_kernel(
+                encoder,
+                table,
+                &left,
+                &right,
+                &PreparedMatmulOutput {
+                    tensor: score_group,
+                    leading_dimension,
+                    batch_stride,
+                },
+                bindings,
+            )?);
+        }
+        Ok(temporaries)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn encode_sdpa_probability_value(
+        &self,
+        encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
+        table: &ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>,
+        scores: &EncoderTensor,
+        value: &EncoderTensor,
+        output: &EncoderTensor,
+        kv_heads: u32,
+        heads_per_group: u32,
+        query_length: u32,
+        value_width: u32,
+        bindings: &mut ArgumentBindings,
+    ) -> Result<Vec<MetalBufferRef>, BackendError> {
+        let mut temporaries = Vec::new();
+        for kv_head in 0..kv_heads {
+            let first_head = kv_head
+                .checked_mul(heads_per_group)
+                .ok_or(BackendError::InvalidInput)?;
+            let score_group = head_group(scores, first_head, heads_per_group)?;
+            let value_head = head_matrix(value, kv_head, false)?;
+            let output_group = head_group(output, first_head, heads_per_group)?;
+            let left = self.prepare_matmul_encoder_input(
+                encoder,
+                table,
+                score_group,
+                bindings,
+                &mut temporaries,
+            )?;
+            let right = self.prepare_matmul_encoder_input(
+                encoder,
+                table,
+                value_head,
+                bindings,
+                &mut temporaries,
+            )?;
+            let direct = classify(&output_group.layout)
+                .kernel_strides()
+                .filter(|&(column_major, _, _)| column_major == 0);
+            let (prepared_output, copy_output) = if let Some((_, ld, stride)) = direct {
+                (
+                    PreparedMatmulOutput {
+                        tensor: output_group.clone(),
+                        leading_dimension: ld,
+                        batch_stride: stride,
+                    },
+                    false,
+                )
+            } else {
+                let scratch = self.scratch_tensor(
+                    output_group.layout.dtype(),
+                    &[heads_per_group, query_length, value_width],
+                )?;
+                let (_, ld, stride) = classify(&scratch.layout)
+                    .kernel_strides()
+                    .ok_or(BackendError::ExecutionFailed)?;
+                temporaries.push(scratch.buffer.clone());
+                (
+                    PreparedMatmulOutput {
+                        tensor: scratch,
+                        leading_dimension: ld,
+                        batch_stride: stride,
+                    },
+                    true,
+                )
+            };
+            temporaries.push(self.encode_matmul_kernel(
+                encoder,
+                table,
+                &left,
+                &right,
+                &prepared_output,
+                bindings,
+            )?);
+            if copy_output {
+                encode_dispatch_barrier(encoder);
+                temporaries.extend(self.encode_copy_tensors(
+                    encoder,
+                    table,
+                    &prepared_output.tensor,
+                    &output_group,
+                    bindings,
+                )?);
+            }
+        }
+        Ok(temporaries)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn encode_sdpa_scale_mask(
+        &self,
+        encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
+        table: &ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>,
+        scores: &EncoderTensor,
+        scale: f32,
+        causal: bool,
+        q_start: u32,
+        bindings: &mut ArgumentBindings,
+    ) -> Result<MetalBufferRef, BackendError> {
+        use objc2_metal::{MTL4ComputeCommandEncoder, MTLSize};
+
+        let [_, query_length, key_length] = shape3(&scores.layout)?;
+        let pipeline = self
+            .pipelines
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?
+            .get("sdpa_scale_mask", &[])?;
+        let score_count =
+            u32::try_from(scores.layout.element_count()).map_err(|_| BackendError::InvalidInput)?;
+        let mut params = Vec::with_capacity(24);
+        params.extend_from_slice(&scale.to_ne_bytes());
+        for value in [
+            query_length,
+            key_length,
+            q_start,
+            u32::from(causal),
+            score_count,
+        ] {
+            params.extend_from_slice(&value.to_ne_bytes());
+        }
+        let params = self.temporary_buffer(&params)?;
+        encoder.setComputePipelineState(&pipeline);
+        bindings.bind(table, 0, &scores.buffer);
+        bindings.bind(table, 1, &params);
+        encoder.setArgumentTable(Some(table));
+        let count = usize::try_from(scores.layout.element_count())
+            .map_err(|_| BackendError::InvalidInput)?;
+        let width = pipeline.maxTotalThreadsPerThreadgroup().clamp(1, 256);
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(
+            MTLSize {
+                width: count.div_ceil(width),
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width,
+                height: 1,
+                depth: 1,
+            },
+        );
+        Ok(params)
+    }
+
     fn encode_matmul_kernel(
         &self,
         encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
@@ -974,7 +1258,12 @@ impl MetalBackend {
         let rank = shape.len();
         let rows = shape[rank - 2];
         let inner = shape[rank - 1];
-        let columns = right.tensor.layout.shape()[rank - 1];
+        let columns = *right
+            .tensor
+            .layout
+            .shape()
+            .last()
+            .ok_or(BackendError::InvalidInput)?;
         let batch = if rank == 3 { shape[0] } else { 1 };
         let dtype = output.tensor.layout.dtype();
         let mut params = Vec::with_capacity(96);
@@ -1003,7 +1292,9 @@ impl MetalBackend {
         }
         let parameter_buffer = self.temporary_buffer(&params)?;
         let launch = self.matmul_launch(MatmulShape {
-            dtype,
+            left_dtype: left.tensor.layout.dtype(),
+            right_dtype: right.tensor.layout.dtype(),
+            output_dtype: dtype,
             batch,
             rows,
             columns,
@@ -1039,14 +1330,23 @@ impl MetalBackend {
         encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
         table: &ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>,
         tensor: &Tensor,
-        dtype: DType,
         bindings: &mut ArgumentBindings,
         temporaries: &mut Vec<MetalBufferRef>,
     ) -> Result<PreparedMatmulInput, BackendError> {
         let source = self.encoder_tensor(tensor)?;
-        if source.layout.dtype() == dtype
-            && let Some((column_major, leading_dimension, batch_stride)) =
-                classify(&source.layout).kernel_strides()
+        self.prepare_matmul_encoder_input(encoder, table, source, bindings, temporaries)
+    }
+
+    fn prepare_matmul_encoder_input(
+        &self,
+        encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
+        table: &ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>,
+        source: EncoderTensor,
+        bindings: &mut ArgumentBindings,
+        temporaries: &mut Vec<MetalBufferRef>,
+    ) -> Result<PreparedMatmulInput, BackendError> {
+        if let Some((column_major, leading_dimension, batch_stride)) =
+            classify(&source.layout).kernel_strides()
         {
             return Ok(PreparedMatmulInput {
                 tensor: source,
@@ -1056,7 +1356,7 @@ impl MetalBackend {
                 copied: false,
             });
         }
-        let scratch = self.scratch_tensor(dtype, source.layout.shape())?;
+        let scratch = self.scratch_tensor(source.layout.dtype(), source.layout.shape())?;
         temporaries.push(scratch.buffer.clone());
         temporaries.extend(self.encode_copy_tensors(encoder, table, &source, &scratch, bindings)?);
         let (column_major, leading_dimension, batch_stride) = classify(&scratch.layout)
@@ -1079,14 +1379,14 @@ impl MetalBackend {
                 4,
                 32,
                 vec![
-                    (0, dtype_code(shape.dtype)),
-                    (1, dtype_code(shape.dtype)),
-                    (2, dtype_code(shape.dtype)),
+                    (0, dtype_code(shape.left_dtype)),
+                    (1, dtype_code(shape.right_dtype)),
+                    (2, dtype_code(shape.output_dtype)),
                 ],
             )
         } else {
             let config = select_gemm(
-                shape.dtype,
+                shape.left_dtype,
                 shape.batch,
                 shape.rows,
                 shape.columns,
@@ -1101,9 +1401,9 @@ impl MetalBackend {
                 config.block_columns,
                 config.thread_count,
                 vec![
-                    (0, dtype_code(shape.dtype)),
-                    (1, dtype_code(shape.dtype)),
-                    (2, dtype_code(shape.dtype)),
+                    (0, dtype_code(shape.left_dtype)),
+                    (1, dtype_code(shape.right_dtype)),
+                    (2, dtype_code(shape.output_dtype)),
                     (200, u32::from(shape.rows.is_multiple_of(config.block_rows))),
                     (
                         201,
@@ -1371,20 +1671,32 @@ impl MetalBackend {
         dispatch: &Dispatch,
         bindings: &mut ArgumentBindings,
     ) -> Result<Vec<Retained<ProtocolObject<dyn MTLBuffer>>>, BackendError> {
-        use objc2_metal::MTL4ComputeCommandEncoder;
-
         let [input] = dispatch.inputs() else {
             return Err(BackendError::InvalidInput);
         };
-        let output = dispatch.output();
+        let input = self.encoder_tensor(input)?;
+        let output = self.encoder_tensor(dispatch.output())?;
+        self.encode_softmax_tensors(encoder, table, &input, &output, bindings)
+    }
+
+    fn encode_softmax_tensors(
+        &self,
+        encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
+        table: &ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>,
+        input: &EncoderTensor,
+        output: &EncoderTensor,
+        bindings: &mut ArgumentBindings,
+    ) -> Result<Vec<MetalBufferRef>, BackendError> {
+        use objc2_metal::MTL4ComputeCommandEncoder;
+
         let width = *input
-            .layout()
+            .layout
             .shape()
             .last()
             .ok_or(BackendError::InvalidInput)?;
         let constants = [
-            (0, dtype_code(input.layout().dtype())),
-            (2, dtype_code(output.layout().dtype())),
+            (0, dtype_code(input.layout.dtype())),
+            (2, dtype_code(output.layout.dtype())),
         ];
         let kernel = if width <= 1024 {
             "softmax_single"
@@ -1398,22 +1710,17 @@ impl MetalBackend {
             .get(kernel, &constants)?;
         encoder.setComputePipelineState(&pipeline);
         let temporaries = vec![
-            self.layout_buffer(input.layout())?,
-            self.layout_buffer(output.layout())?,
+            self.layout_buffer(&input.layout)?,
+            self.layout_buffer(&output.layout)?,
             self.temporary_buffer(&width.to_ne_bytes())?,
         ];
-        let buffers = self
-            .buffers
-            .lock()
-            .map_err(|_| BackendError::ExecutionFailed)?;
-        bindings.bind(table, 0, &buffers.get(input)?.raw);
-        bindings.bind(table, 1, &buffers.get(output)?.raw);
+        bindings.bind(table, 0, &input.buffer);
+        bindings.bind(table, 1, &output.buffer);
         bindings.bind(table, 2, &temporaries[0]);
         bindings.bind(table, 3, &temporaries[1]);
         bindings.bind(table, 4, &temporaries[2]);
-        drop(buffers);
         encoder.setArgumentTable(Some(table));
-        let (threadgroups, threads) = row_dispatch_geometry(&pipeline, output.layout(), width)?;
+        let (threadgroups, threads) = row_dispatch_geometry(&pipeline, &output.layout, width)?;
         encoder.dispatchThreadgroups_threadsPerThreadgroup(threadgroups, threads);
         Ok(temporaries)
     }
@@ -1770,6 +2077,88 @@ impl MetalBackend {
             timeout: self.gpu_timeout,
         })
     }
+}
+
+fn shape3(layout: &Layout) -> Result<[u32; 3], BackendError> {
+    layout
+        .shape()
+        .try_into()
+        .map_err(|_| BackendError::InvalidInput)
+}
+
+fn head_group(
+    tensor: &EncoderTensor,
+    first_head: u32,
+    head_count: u32,
+) -> Result<EncoderTensor, BackendError> {
+    let [heads, rows, columns] = shape3(&tensor.layout)?;
+    let slices = [
+        Slice::new(first_head, head_count, 1).map_err(|_| BackendError::InvalidInput)?,
+        Slice::new(0, rows, 1).map_err(|_| BackendError::InvalidInput)?,
+        Slice::new(0, columns, 1).map_err(|_| BackendError::InvalidInput)?,
+    ];
+    if first_head
+        .checked_add(head_count)
+        .is_none_or(|end| end > heads)
+    {
+        return Err(BackendError::InvalidInput);
+    }
+    let layout = tensor
+        .layout
+        .slice(&slices)
+        .map_err(|_| BackendError::InvalidInput)?;
+    Ok(EncoderTensor {
+        buffer: tensor.buffer.clone(),
+        layout,
+    })
+}
+
+fn head_matrix(
+    tensor: &EncoderTensor,
+    head: u32,
+    transpose: bool,
+) -> Result<EncoderTensor, BackendError> {
+    let [heads, rows, columns] = shape3(&tensor.layout)?;
+    if head >= heads {
+        return Err(BackendError::InvalidInput);
+    }
+    let offset = u64::from(head)
+        .checked_mul(tensor.layout.strides()[0])
+        .and_then(|distance| tensor.layout.offset().checked_add(distance))
+        .ok_or(BackendError::InvalidInput)?;
+    let (shape, strides) = if transpose {
+        (
+            vec![columns, rows],
+            vec![tensor.layout.strides()[2], tensor.layout.strides()[1]],
+        )
+    } else {
+        (
+            vec![rows, columns],
+            vec![tensor.layout.strides()[1], tensor.layout.strides()[2]],
+        )
+    };
+    let layout = Layout::new(
+        tensor.layout.dtype(),
+        offset,
+        shape,
+        strides,
+        tensor.layout.buffer_len(),
+    )
+    .map_err(|_| BackendError::InvalidInput)?;
+    Ok(EncoderTensor {
+        buffer: tensor.buffer.clone(),
+        layout,
+    })
+}
+
+fn encode_dispatch_barrier(encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>) {
+    use objc2_metal::{MTL4CommandEncoder, MTL4VisibilityOptions, MTLStages};
+
+    encoder.barrierAfterEncoderStages_beforeEncoderStages_visibilityOptions(
+        MTLStages::Dispatch,
+        MTLStages::Dispatch,
+        MTL4VisibilityOptions::Device,
+    );
 }
 
 fn row_dispatch_geometry(
@@ -2233,6 +2622,38 @@ mod tests {
             output,
         )
         .unwrap();
+    }
+
+    fn assert_sdpa(
+        op: Op,
+        query: TensorSpec,
+        key: TensorSpec,
+        value: TensorSpec,
+        output: &TensorSpec,
+    ) {
+        assert_backends_agree(
+            &CpuBackend::new(),
+            &MetalBackend::new().unwrap(),
+            op,
+            &[query, key, value],
+            output,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn metal_decomposed_attention_matches_hand_sized_cases() {
+        assert_sdpa(
+            Op::Sdpa {
+                scale: 1.0,
+                causal: false,
+                q_start: 0,
+            },
+            TensorSpec::contiguous(DType::F32, &[1, 1, 2]),
+            TensorSpec::contiguous(DType::F32, &[1, 2, 2]),
+            TensorSpec::contiguous(DType::F32, &[1, 2, 1]),
+            &TensorSpec::contiguous(DType::F32, &[1, 1, 1]),
+        );
     }
 
     #[test]
