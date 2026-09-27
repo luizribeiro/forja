@@ -19,6 +19,7 @@ fn supported(op: Op) -> bool {
             | Op::Softmax
             | Op::Rope { .. }
             | Op::Embed
+            | Op::Matmul
     )
 }
 
