@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     error::Error,
     fs,
     path::Path,
@@ -6,6 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use forja_core::Op;
 use forja_host::{EngineMetrics, EngineRunner, EngineStep, EngineStepProfile, ImportProfile};
 use golden_fixtures::sha256_file;
 
@@ -49,6 +51,14 @@ struct ProfileReport {
     wall_perturbation: Stats,
     gpu_perturbation: Stats,
     dispatch_coverage: Stats,
+    gpu_by_op: Vec<ProfileCategory>,
+    gpu_by_dispatch: Vec<DispatchProfile>,
+}
+
+struct DispatchProfile {
+    index: usize,
+    operation: &'static str,
+    time: Stats,
 }
 
 pub(crate) async fn run(options: &Bench) -> Result<(), Box<dyn Error>> {
@@ -418,6 +428,8 @@ fn profile_report(measurement: &ProfileMeasurement) -> Result<ProfileReport, Box
             .sum::<f64>()
             / submission.gpu_time.as_secs_f64()
     }));
+    let gpu_by_op = gpu_by_op(&submissions);
+    let gpu_by_dispatch = gpu_by_dispatch(&submissions)?;
     Ok(ProfileReport {
         context_start: measurement.context_start,
         categories,
@@ -425,6 +437,8 @@ fn profile_report(measurement: &ProfileMeasurement) -> Result<ProfileReport, Box
         wall_perturbation,
         gpu_perturbation,
         dispatch_coverage,
+        gpu_by_op,
+        gpu_by_dispatch,
     })
 }
 
@@ -445,6 +459,16 @@ fn print_profile_report(precision: &str, report: &ProfileReport) {
         report.gpu_perturbation.median,
         report.dispatch_coverage.median * 100.0
     );
+    for operation in &report.gpu_by_op {
+        let count = stats(operation.values.iter().map(|(count, _)| *count));
+        let time = stats(operation.values.iter().map(|(_, seconds)| *seconds));
+        print_profile_row(
+            &format!("gpu.{}", operation.name),
+            count,
+            time,
+            report.wall.median,
+        );
+    }
 }
 
 fn profile_json(report: &ProfileReport) -> serde_json::Value {
@@ -464,6 +488,32 @@ fn profile_json(report: &ProfileReport) -> serde_json::Value {
             )
         })
         .collect::<serde_json::Map<_, _>>();
+    let gpu_by_op = report
+        .gpu_by_op
+        .iter()
+        .map(|operation| {
+            let count = stats(operation.values.iter().map(|(count, _)| *count));
+            let time = stats(operation.values.iter().map(|(_, seconds)| *seconds));
+            (
+                operation.name.to_owned(),
+                serde_json::json!({
+                    "count_per_token": stats_json(count),
+                    "gpu_time_seconds": stats_json(time),
+                }),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+    let gpu_by_dispatch = report
+        .gpu_by_dispatch
+        .iter()
+        .map(|dispatch| {
+            serde_json::json!({
+                "index": dispatch.index,
+                "op": dispatch.operation,
+                "gpu_time_seconds": stats_json(dispatch.time),
+            })
+        })
+        .collect::<Vec<_>>();
     serde_json::json!({
         "context_start": report.context_start,
         "categories": categories,
@@ -472,6 +522,8 @@ fn profile_json(report: &ProfileReport) -> serde_json::Value {
             "gpu_ratio": stats_json(report.gpu_perturbation),
             "dispatch_coverage_ratio": stats_json(report.dispatch_coverage),
         },
+        "gpu_by_op": gpu_by_op,
+        "gpu_by_dispatch": gpu_by_dispatch,
     })
 }
 
@@ -585,6 +637,70 @@ fn submission_category(
                 (count, time.as_secs_f64())
             })
             .collect(),
+    }
+}
+
+fn gpu_by_op(submissions: &[&forja_core::SubmissionProfile]) -> Vec<ProfileCategory> {
+    let mut samples = BTreeMap::<&'static str, Vec<(f64, f64)>>::new();
+    for submission in submissions {
+        let mut step = BTreeMap::<&'static str, (u64, Duration)>::new();
+        for dispatch in &submission.per_dispatch {
+            let value = step.entry(op_name(dispatch.op)).or_default();
+            value.0 = value.0.saturating_add(1);
+            value.1 = value.1.saturating_add(dispatch.gpu_time);
+        }
+        for (name, (count, time)) in step {
+            samples
+                .entry(name)
+                .or_default()
+                .push((count_as_f64(count), time.as_secs_f64()));
+        }
+    }
+    samples
+        .into_iter()
+        .map(|(name, values)| ProfileCategory { name, values })
+        .collect()
+}
+
+fn gpu_by_dispatch(
+    submissions: &[&forja_core::SubmissionProfile],
+) -> Result<Vec<DispatchProfile>, Box<dyn Error>> {
+    let first = submissions.first().ok_or("profile has no submissions")?;
+    let mut records = Vec::with_capacity(first.per_dispatch.len());
+    for (index, dispatch) in first.per_dispatch.iter().enumerate() {
+        let times = submissions
+            .iter()
+            .map(|submission| {
+                let candidate = submission
+                    .per_dispatch
+                    .get(index)
+                    .ok_or("profile dispatch count changed between repetitions")?;
+                if op_name(candidate.op) != op_name(dispatch.op) {
+                    return Err("profile dispatch order changed between repetitions");
+                }
+                Ok(candidate.gpu_time.as_secs_f64())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        records.push(DispatchProfile {
+            index,
+            operation: op_name(dispatch.op),
+            time: stats(times.into_iter()),
+        });
+    }
+    Ok(records)
+}
+
+const fn op_name(operation: Op) -> &'static str {
+    match operation {
+        Op::Copy => "copy",
+        Op::Add => "add",
+        Op::SiluMul => "silu_mul",
+        Op::RmsNorm { .. } => "rms_norm",
+        Op::Softmax => "softmax",
+        Op::Rope { .. } => "rope",
+        Op::Embed => "embed",
+        Op::Matmul => "matmul",
+        Op::Sdpa { .. } => "sdpa",
     }
 }
 
