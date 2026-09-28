@@ -227,6 +227,57 @@ impl ValidatedProgram {
     }
 }
 
+/// Tensor types and rank accepted by a prepared scalar program.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KernelSignature {
+    rank: u8,
+    input_dtypes: Vec<DType>,
+    output_dtypes: Vec<DType>,
+    scalars: u8,
+}
+
+impl KernelSignature {
+    /// Describes the tensor operands accepted by a prepared program.
+    #[must_use]
+    pub const fn new(
+        rank: u8,
+        input_dtypes: Vec<DType>,
+        output_dtypes: Vec<DType>,
+        scalars: u8,
+    ) -> Self {
+        Self {
+            rank,
+            input_dtypes,
+            output_dtypes,
+            scalars,
+        }
+    }
+
+    /// Returns the tensor rank.
+    #[must_use]
+    pub const fn rank(&self) -> u8 {
+        self.rank
+    }
+
+    /// Returns input storage types in slot order.
+    #[must_use]
+    pub fn input_dtypes(&self) -> &[DType] {
+        &self.input_dtypes
+    }
+
+    /// Returns output storage types in slot order.
+    #[must_use]
+    pub fn output_dtypes(&self) -> &[DType] {
+        &self.output_dtypes
+    }
+
+    /// Returns the reserved runtime-scalar count.
+    #[must_use]
+    pub const fn scalars(&self) -> u8 {
+        self.scalars
+    }
+}
+
 fn hash_program(program: &Program) -> ProgramHash {
     #[cfg(test)]
     HASH_COMPUTATIONS.with(|count| count.set(count.get() + 1));

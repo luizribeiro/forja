@@ -12,6 +12,7 @@ use block2::RcBlock;
 use forja_core::{
     AllocationRegistry, Backend, BackendError, BufferId, CommandList, DType, Layout, MappedRegion,
     Tensor, ViewOp,
+    program::{KernelSignature, ValidatedProgram},
 };
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_foundation::NSPageSize;
@@ -403,6 +404,15 @@ impl MetalBackend {
 
 impl Backend for MetalBackend {
     type Submission = MetalSubmission;
+    type ProgramHandle = ();
+
+    fn prepare_program(
+        &self,
+        _program: &ValidatedProgram,
+        _signature: &KernelSignature,
+    ) -> Result<Self::ProgramHandle, BackendError> {
+        Err(BackendError::UnsupportedOperation)
+    }
 
     fn alloc(&self, dtype: DType, shape: &[u32]) -> Result<Tensor, BackendError> {
         let byte_len = element_count(shape)?

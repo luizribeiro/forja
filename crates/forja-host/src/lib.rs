@@ -2123,6 +2123,7 @@ mod tests {
     use forja_core::{
         Backend, BackendError, BufferId, CommandList, DType, Layout, LayoutError, MappedRegion,
         OpError, Submission, Tensor, ViewOp as CoreViewOp,
+        program::{KernelSignature, ValidatedProgram},
     };
     use forja_cpu::CpuBackend;
     use wasmtime::component::Resource;
@@ -2322,6 +2323,15 @@ mod tests {
 
     impl Backend for ImportCountingBackend {
         type Submission = <CpuBackend as Backend>::Submission;
+        type ProgramHandle = <CpuBackend as Backend>::ProgramHandle;
+
+        fn prepare_program(
+            &self,
+            program: &ValidatedProgram,
+            signature: &KernelSignature,
+        ) -> Result<Self::ProgramHandle, BackendError> {
+            self.inner.prepare_program(program, signature)
+        }
 
         fn alloc(&self, dtype: DType, shape: &[u32]) -> Result<Tensor, BackendError> {
             self.inner.alloc(dtype, shape)
@@ -3190,6 +3200,15 @@ mod tests {
 
     impl Backend for AccountingBackend {
         type Submission = AccountingSubmission;
+        type ProgramHandle = <CpuBackend as Backend>::ProgramHandle;
+
+        fn prepare_program(
+            &self,
+            program: &ValidatedProgram,
+            signature: &KernelSignature,
+        ) -> Result<Self::ProgramHandle, BackendError> {
+            self.inner.prepare_program(program, signature)
+        }
 
         fn alloc(&self, dtype: DType, shape: &[u32]) -> Result<Tensor, BackendError> {
             self.inner.alloc(dtype, shape)
@@ -3232,6 +3251,15 @@ mod tests {
 
     impl Backend for BlockingBackend {
         type Submission = <CpuBackend as Backend>::Submission;
+        type ProgramHandle = <CpuBackend as Backend>::ProgramHandle;
+
+        fn prepare_program(
+            &self,
+            program: &ValidatedProgram,
+            signature: &KernelSignature,
+        ) -> Result<Self::ProgramHandle, BackendError> {
+            self.inner.prepare_program(program, signature)
+        }
 
         fn alloc(&self, dtype: DType, shape: &[u32]) -> Result<Tensor, BackendError> {
             self.inner.alloc(dtype, shape)

@@ -6,7 +6,8 @@ use std::{sync::Mutex, time::Duration};
 
 use forja_core::{
     AllocationRegistry, Backend, BackendError, BufferId, CommandList, DType, Layout, MappedRegion,
-    Op, Submission, Tensor, ViewOp, program::BoundProgram,
+    Op, Submission, Tensor, ViewOp,
+    program::{BoundProgram, KernelSignature, ValidatedProgram},
 };
 use half::{bf16, f16};
 
@@ -483,6 +484,15 @@ impl Submission for CpuSubmission {
 
 impl Backend for CpuBackend {
     type Submission = CpuSubmission;
+    type ProgramHandle = ();
+
+    fn prepare_program(
+        &self,
+        _program: &ValidatedProgram,
+        _signature: &KernelSignature,
+    ) -> Result<Self::ProgramHandle, BackendError> {
+        Ok(())
+    }
 
     fn alloc(&self, dtype: DType, shape: &[u32]) -> Result<Tensor, BackendError> {
         CpuBackend::alloc(self, dtype, shape)

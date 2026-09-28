@@ -6,7 +6,10 @@ use std::{
     time::Duration,
 };
 
-use crate::{BufferId, CommandList, DType, Layout, MappedRegion, Op, Slice, Tensor};
+use crate::{
+    BufferId, CommandList, DType, Layout, MappedRegion, Op, Slice, Tensor,
+    program::{KernelSignature, ValidatedProgram},
+};
 
 static NEXT_BACKEND: AtomicU64 = AtomicU64::new(1);
 
@@ -296,6 +299,19 @@ pub trait Submission {
 pub trait Backend {
     /// The completion handle produced by this backend.
     type Submission: Submission;
+    /// Backend state retained by a prepared scalar program.
+    type ProgramHandle: Send + Sync + 'static;
+
+    /// Prepares a validated scalar program for repeated dispatch.
+    ///
+    /// # Errors
+    ///
+    /// Returns a quota, compilation, or unsupported-operation error.
+    fn prepare_program(
+        &self,
+        program: &ValidatedProgram,
+        signature: &KernelSignature,
+    ) -> Result<Self::ProgramHandle, BackendError>;
 
     /// Allocates a contiguous tensor initialized to zero.
     ///
