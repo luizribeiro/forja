@@ -398,7 +398,7 @@ fn qk_norm_rope_program() -> Result<Program> {
     let normalized_lo = lo_value * inverse_rms * program.input(2);
     let normalized_hi = hi_value * inverse_rms * program.input(3);
     let exponent = program.index(-1).cast_f32() * (-2.0 / head_dimension);
-    let angle = program.input(4) * program.constant(ROPE_THETA).pow(exponent);
+    let angle = program.input(4) * program.constant(ROPE_THETA).powf(exponent);
     let cosine = angle.cos();
     let sine = angle.sin();
     program.output(0, normalized_lo * cosine - normalized_hi * sine);

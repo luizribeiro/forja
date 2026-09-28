@@ -3,7 +3,7 @@
 use std::{
     cell::RefCell,
     marker::PhantomData,
-    ops::{Add, Deref, Div, Mul, Neg, Sub},
+    ops::{Add, BitAnd, BitOr, Deref, Div, Mul, Neg, Not, Sub},
     rc::Rc,
 };
 
@@ -162,8 +162,7 @@ impl Program {
     /// Creates a Boolean constant.
     #[must_use]
     pub fn boolean(&self, value: bool) -> Bool<'_> {
-        let value = self.push_f32(Instruction::Constant(f32::from(u8::from(value))));
-        value.cast_bool()
+        boolean(&self.state, value)
     }
 
     /// Reads an axis coordinate as u32. Negative axes count from the end.
@@ -470,7 +469,7 @@ impl<'a> F32<'a> {
 
     /// Computes the natural logarithm.
     #[must_use]
-    pub fn log(self) -> Self {
+    pub fn ln(self) -> Self {
         self.unary(UnaryOp::Log)
     }
 
@@ -522,21 +521,21 @@ impl<'a> F32<'a> {
         self.unary(UnaryOp::Floor)
     }
 
-    /// Computes the minimum.
+    /// Computes the minimum, propagating NaN like Rust's `f32::minimum`.
     #[must_use]
-    pub fn min(self, other: Self) -> Self {
+    pub fn minimum(self, other: Self) -> Self {
         self.binary(BinaryOp::Min, other)
     }
 
-    /// Computes the maximum.
+    /// Computes the maximum, propagating NaN like Rust's `f32::maximum`.
     #[must_use]
-    pub fn max(self, other: Self) -> Self {
+    pub fn maximum(self, other: Self) -> Self {
         self.binary(BinaryOp::Max, other)
     }
 
     /// Raises this value to a power.
     #[must_use]
-    pub fn pow(self, other: Self) -> Self {
+    pub fn powf(self, other: Self) -> Self {
         self.binary(BinaryOp::Pow, other)
     }
 
@@ -611,17 +610,6 @@ impl<'a> F32<'a> {
         }
     }
 
-    fn cast_bool(self) -> Bool<'a> {
-        Bool {
-            state: self.state,
-            instruction: push(
-                self.state,
-                Instruction::Cast(ValueType::Bool, self.instruction),
-            ),
-            marker: PhantomData,
-        }
-    }
-
     fn scalar(self, op: BinaryOp, scalar: f32) -> Self {
         let scalar = Self {
             state: self.state,
@@ -652,16 +640,43 @@ impl<'a> Bool<'a> {
     /// Selects `accepted` when true and `rejected` otherwise.
     #[must_use]
     pub fn select(self, accepted: F32<'a>, rejected: F32<'a>) -> F32<'a> {
-        check_same_state(self.state, accepted.state);
-        check_same_state(self.state, rejected.state);
-        F32 {
-            state: self.state,
-            instruction: push(
-                self.state,
-                Instruction::Select(self.instruction, accepted.instruction, rejected.instruction),
-            ),
-            marker: PhantomData,
-        }
+        select_value(self, accepted, rejected)
+    }
+
+    /// Selects between two unsigned values.
+    #[must_use]
+    pub fn select_u32(self, accepted: U32<'a>, rejected: U32<'a>) -> U32<'a> {
+        select_value(self, accepted, rejected)
+    }
+
+    /// Selects between two Boolean values.
+    #[must_use]
+    pub fn select_bool(self, accepted: Self, rejected: Self) -> Self {
+        select_value(self, accepted, rejected)
+    }
+
+    /// Negates this condition.
+    ///
+    /// Builder logical operations lower to selects and do not short-circuit.
+    #[must_use]
+    #[allow(
+        clippy::should_implement_trait,
+        reason = "the builder exposes the named logical operation alongside Not"
+    )]
+    pub fn not(self) -> Self {
+        self.select_bool(boolean(self.state, false), boolean(self.state, true))
+    }
+
+    /// Computes logical AND without short-circuiting.
+    #[must_use]
+    pub fn and(self, other: Self) -> Self {
+        self.select_bool(other, boolean(self.state, false))
+    }
+
+    /// Computes logical OR without short-circuiting.
+    #[must_use]
+    pub fn or(self, other: Self) -> Self {
+        self.select_bool(boolean(self.state, true), other)
     }
 
     /// Casts this condition to zero or one as u32.
@@ -835,6 +850,30 @@ fn compare_values<'a, T: TypedValue<'a>>(op: BinaryOp, left: T, right: T) -> Boo
     )
 }
 
+fn select_value<'a, T: TypedValue<'a>>(condition: Bool<'a>, accepted: T, rejected: T) -> T {
+    check_same_state(condition.state, accepted.state());
+    check_same_state(condition.state, rejected.state());
+    T::from_instruction(
+        condition.state,
+        push(
+            condition.state,
+            Instruction::Select(
+                condition.instruction,
+                accepted.instruction(),
+                rejected.instruction(),
+            ),
+        ),
+    )
+}
+
+fn boolean(state: &RefCell<State>, value: bool) -> Bool<'_> {
+    let constant = push(state, Instruction::Constant(f32::from(u8::from(value))));
+    Bool::from_instruction(
+        state,
+        push(state, Instruction::Cast(ValueType::Bool, constant)),
+    )
+}
+
 fn push(state: &RefCell<State>, instruction: Instruction) -> u32 {
     let mut state = state.borrow_mut();
     let index = u32::try_from(state.instructions.len()).unwrap_or(u32::MAX);
@@ -888,6 +927,30 @@ impl Neg for F32<'_> {
     }
 }
 
+impl Not for Bool<'_> {
+    type Output = Self;
+
+    fn not(self) -> Self::Output {
+        Self::not(self)
+    }
+}
+
+impl BitAnd for Bool<'_> {
+    type Output = Self;
+
+    fn bitand(self, other: Self) -> Self::Output {
+        self.and(other)
+    }
+}
+
+impl BitOr for Bool<'_> {
+    type Output = Self;
+
+    fn bitor(self, other: Self) -> Self::Output {
+        self.or(other)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -921,6 +984,26 @@ mod tests {
         let first = Program::new(ProgramKind::Map);
         let second = Program::new(ProgramKind::Map);
         let _ = first.index(0).wrapping_add(second.index(0));
+
+        assert!(first.parts().is_err());
+    }
+
+    #[test]
+    fn rejects_cross_program_unsigned_selects() {
+        let first = Ctx::new();
+        let second = Ctx::new();
+        let condition = first.boolean(true);
+        let _ = condition.select_u32(first.index(0), second.index(0));
+
+        assert!(first.parts().is_err());
+    }
+
+    #[test]
+    fn rejects_cross_program_boolean_selects() {
+        let first = Ctx::new();
+        let second = Ctx::new();
+        let condition = first.boolean(true);
+        let _ = condition.select_bool(first.boolean(false), second.boolean(false));
 
         assert!(first.parts().is_err());
     }
@@ -962,13 +1045,17 @@ mod tests {
     #[test]
     fn row_context_lowers_named_operations() {
         fn clamp_nonnegative<'a>(context: &'a Ctx, value: F32<'a>) -> F32<'a> {
-            value.max(context.constant(0.0)).min(context.constant(1.0))
+            value
+                .maximum(context.constant(0.0))
+                .minimum(context.constant(1.0))
         }
 
         let context = RowCtx::new();
         let value = clamp_nonnegative(&context, context.input(0));
         let positive = value.gt(context.constant(0.0));
-        context.output(0, positive.select(context.row_mean(value), value));
+        let finite_width = context.index(-1).lt(context.extent(-1));
+        let condition = positive.and(finite_width).or(context.boolean(false)).not();
+        context.output(0, condition.select(context.row_mean(value), value));
         context.output(1, context.row_sum(value));
         context.output(2, context.row_max(value));
         context.output(3, context.row_min(value));
@@ -979,7 +1066,7 @@ mod tests {
                 .iter()
                 .filter(|instruction| matches!(instruction, Instruction::Select(..)))
                 .count(),
-            1
+            4
         );
         assert_eq!(
             instructions
