@@ -1,9 +1,9 @@
-use std::{error::Error, fmt};
+use std::{error::Error, fmt, sync::Arc};
 
 use crate::{
-    Affine, Dispatch, Op, OpError, ParamError, ParamValues, SymbolicLayout, SymbolicLayoutError,
-    Tensor, TensorError,
-    program::{Inst, ProgramKind},
+    Affine, ByteHull, Dispatch, Op, OpError, ParamError, ParamSpace, ParamValues, SymbolicLayout,
+    SymbolicLayoutError, Tensor, TensorError,
+    program::{BindError, Inst, PreparedProgram, ProgramKind},
 };
 
 /// A reason graph-template construction or instantiation failed.
@@ -88,7 +88,6 @@ impl GraphLimits {
         }
     }
 
-    #[allow(dead_code)]
     fn check_dispatch(&self, dispatch: &Dispatch) -> Result<(), GraphError> {
         let mut work = self.tensor_work(dispatch.output())?;
         for input in dispatch.inputs() {
@@ -111,7 +110,6 @@ impl GraphLimits {
         Ok(())
     }
 
-    #[allow(dead_code)]
     fn check_program(&self, dispatch: &Dispatch) -> Result<(), GraphError> {
         let program = dispatch
             .prepared_program()
@@ -192,6 +190,37 @@ impl TemplateTensor {
         }
         Ok(Self::Symbolic { base, layout })
     }
+
+    fn space(&self) -> Option<&ParamSpace> {
+        match self {
+            Self::Concrete(_) => None,
+            Self::Symbolic { layout, .. } => Some(layout.space()),
+        }
+    }
+
+    fn instantiate(&self, values: &ParamValues) -> Result<Tensor, GraphError> {
+        match self {
+            Self::Concrete(tensor) => Ok(tensor.clone()),
+            Self::Symbolic { base, layout } => Ok(Tensor::from_allocation(
+                base.buffer(),
+                layout.instantiate(values)?,
+                base.is_writable(),
+            )?),
+        }
+    }
+
+    fn buffer(&self) -> crate::BufferId {
+        match self {
+            Self::Concrete(tensor) | Self::Symbolic { base: tensor, .. } => tensor.buffer(),
+        }
+    }
+
+    fn byte_hull(&self) -> Result<ByteHull, GraphError> {
+        match self {
+            Self::Concrete(tensor) => Ok(ByteHull::from_layouts([tensor.layout()])),
+            Self::Symbolic { layout, .. } => Ok(layout.byte_hull()?),
+        }
+    }
 }
 
 impl From<Tensor> for TemplateTensor {
@@ -267,6 +296,206 @@ impl From<Op> for TemplateOp {
     }
 }
 
+#[derive(Clone, Debug)]
+enum DynamicDispatch {
+    Operation {
+        op: TemplateOp,
+        inputs: Vec<TemplateTensor>,
+        output: Box<TemplateTensor>,
+    },
+    Program {
+        program: Arc<PreparedProgram>,
+        inputs: Vec<TemplateTensor>,
+        outputs: Vec<TemplateTensor>,
+    },
+}
+
+impl DynamicDispatch {
+    fn uses_only(&self, space: &ParamSpace) -> bool {
+        self.tensors()
+            .all(|tensor| tensor.space().is_none_or(|candidate| candidate == space))
+    }
+
+    fn check_hull_aliasing(&self) -> Result<(), GraphError> {
+        match self {
+            Self::Operation { inputs, output, .. } => {
+                for (input, tensor) in inputs.iter().enumerate() {
+                    if hulls_overlap(tensor, output)? {
+                        return Err(OpError::Aliasing { input }.into());
+                    }
+                }
+            }
+            Self::Program {
+                inputs, outputs, ..
+            } => {
+                for (input, tensor) in inputs.iter().enumerate() {
+                    for (output, candidate) in outputs.iter().enumerate() {
+                        if hulls_overlap(tensor, candidate)? {
+                            return Err(OpError::ProgramBinding(BindError::InputOutputAliasing {
+                                input,
+                                output,
+                            })
+                            .into());
+                        }
+                    }
+                }
+                for (first, output) in outputs.iter().enumerate() {
+                    for (second, candidate) in outputs.iter().enumerate().skip(first + 1) {
+                        if hulls_overlap(output, candidate)? {
+                            return Err(OpError::ProgramBinding(BindError::OutputAliasing {
+                                first,
+                                second,
+                            })
+                            .into());
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn tensors(&self) -> impl Iterator<Item = &TemplateTensor> {
+        let (inputs, outputs) = match self {
+            Self::Operation { inputs, output, .. } => {
+                (inputs.as_slice(), std::slice::from_ref(output.as_ref()))
+            }
+            Self::Program {
+                inputs, outputs, ..
+            } => (inputs.as_slice(), outputs.as_slice()),
+        };
+        inputs.iter().chain(outputs)
+    }
+
+    fn instantiate(
+        &self,
+        values: &ParamValues,
+        limits: GraphLimits,
+    ) -> Result<Dispatch, GraphError> {
+        match self {
+            Self::Operation { op, inputs, output } => {
+                let inputs = instantiate_tensors(inputs, values)?;
+                let output = output.instantiate(values)?;
+                let input_refs = inputs.iter().collect::<Vec<_>>();
+                let dispatch = Dispatch::new(op.instantiate(values)?, &input_refs, &output)?;
+                limits.check_dispatch(&dispatch)?;
+                Ok(dispatch)
+            }
+            Self::Program {
+                program,
+                inputs,
+                outputs,
+            } => {
+                let inputs = instantiate_tensors(inputs, values)?;
+                let outputs = instantiate_tensors(outputs, values)?;
+                let input_refs = inputs.iter().collect::<Vec<_>>();
+                let output_refs = outputs.iter().collect::<Vec<_>>();
+                let dispatch = Dispatch::kernel(program, &input_refs, &output_refs)?;
+                limits.check_program(&dispatch)?;
+                Ok(dispatch)
+            }
+        }
+    }
+}
+
+/// A validated command sequence over one parameter space.
+#[derive(Clone, Debug)]
+pub struct GraphTemplate {
+    space: ParamSpace,
+    limits: GraphLimits,
+    dispatches: Vec<DynamicDispatch>,
+}
+
+impl GraphTemplate {
+    /// Creates an empty graph template governed by the supplied resource bounds.
+    #[must_use]
+    pub const fn new(space: ParamSpace, limits: GraphLimits) -> Self {
+        Self {
+            space,
+            limits,
+            dispatches: Vec::new(),
+        }
+    }
+
+    /// Returns the number of recorded dispatches.
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.dispatches.len()
+    }
+
+    /// Reports whether the template contains no dispatches.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.dispatches.is_empty()
+    }
+
+    /// Validates and records one trusted operation at every parameter-space corner.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GraphError`] for mixed parameter spaces, invalid concrete operations, or work
+    /// beyond the configured bounds.
+    pub fn dispatch(
+        &mut self,
+        op: impl Into<TemplateOp>,
+        inputs: &[&TemplateTensor],
+        output: &TemplateTensor,
+    ) -> Result<(), GraphError> {
+        self.record(DynamicDispatch::Operation {
+            op: op.into(),
+            inputs: inputs.iter().map(|tensor| (*tensor).clone()).collect(),
+            output: Box::new(output.clone()),
+        })
+    }
+
+    /// Validates and records one prepared scalar-program dispatch at every corner.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GraphError`] for mixed parameter spaces, invalid bindings or signatures, or work
+    /// beyond the configured bounds.
+    pub fn dispatch_kernel(
+        &mut self,
+        program: &Arc<PreparedProgram>,
+        inputs: &[&TemplateTensor],
+        outputs: &[&TemplateTensor],
+    ) -> Result<(), GraphError> {
+        self.record(DynamicDispatch::Program {
+            program: Arc::clone(program),
+            inputs: inputs.iter().map(|tensor| (*tensor).clone()).collect(),
+            outputs: outputs.iter().map(|tensor| (*tensor).clone()).collect(),
+        })
+    }
+
+    fn record(&mut self, dispatch: DynamicDispatch) -> Result<(), GraphError> {
+        if self.dispatches.len() >= self.limits.dispatches {
+            return Err(GraphError::DispatchLimit);
+        }
+        if !dispatch.uses_only(&self.space) {
+            return Err(GraphError::ParameterSpaceMismatch);
+        }
+        dispatch.check_hull_aliasing()?;
+        for values in self.space.corners() {
+            dispatch.instantiate(&values, self.limits)?;
+        }
+        self.dispatches.push(dispatch);
+        Ok(())
+    }
+}
+
+fn hulls_overlap(first: &TemplateTensor, second: &TemplateTensor) -> Result<bool, GraphError> {
+    Ok(first.buffer() == second.buffer() && first.byte_hull()?.overlaps_hull(&second.byte_hull()?))
+}
+
+fn instantiate_tensors(
+    tensors: &[TemplateTensor],
+    values: &ParamValues,
+) -> Result<Vec<Tensor>, GraphError> {
+    tensors
+        .iter()
+        .map(|tensor| tensor.instantiate(values))
+        .collect()
+}
 fn matmul_flops(inputs: &[Tensor]) -> Option<u64> {
     let left = inputs.first()?.layout().shape();
     let right = inputs.get(1)?.layout().shape();
@@ -296,10 +525,10 @@ fn sdpa_flops(inputs: &[Tensor]) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{GraphError, GraphLimits, TemplateOp, TemplateTensor};
+    use super::{GraphError, GraphLimits, GraphTemplate, TemplateOp, TemplateTensor};
     use crate::{
-        Affine, BufferId, DType, Dispatch, Layout, Op, ParamError, ParamSpace, SymbolicLayout,
-        Tensor,
+        Affine, BufferId, DType, Dispatch, Layout, Op, OpError, Operand, ParamError, ParamSpace,
+        SymbolicLayout, Tensor,
         program::{Inst, KernelSignature, Program, ProgramKind, prepared_for_test},
     };
 
@@ -313,6 +542,18 @@ mod tests {
         Tensor::from_allocation(BufferId::new(1, buffer, bytes), layout, true).unwrap()
     }
 
+    fn symbolic_prefix(
+        buffer: u64,
+        shape: &[u32],
+        space: ParamSpace,
+        len: Affine,
+    ) -> TemplateTensor {
+        let base = tensor(buffer, shape);
+        let layout = SymbolicLayout::new(base.layout().clone(), space)
+            .slice(0, 0.into(), len, 1)
+            .unwrap();
+        TemplateTensor::symbolic(base, layout).unwrap()
+    }
     #[test]
     fn instantiates_affine_attention_positions_with_checked_arithmetic() {
         let space = ParamSpace::new(std::iter::once(0..=u32::MAX).collect()).unwrap();
@@ -381,5 +622,120 @@ mod tests {
             Err(GraphError::WorkLimit)
         );
         assert!(GraphLimits::new(1, 4, 12).check_program(&program).is_ok());
+    }
+
+    #[test]
+    fn refuses_mixed_parameter_spaces() {
+        let space = ParamSpace::new(std::iter::once(1..=3).collect()).unwrap();
+        let other = ParamSpace::new(std::iter::once(1..=3).collect()).unwrap();
+        let input = symbolic_prefix(1, &[3], other, Affine::parameter(0, 0, 1));
+        let output = TemplateTensor::from(tensor(2, &[3]));
+        let mut graph = GraphTemplate::new(space, GraphLimits::default());
+
+        assert_eq!(
+            graph.dispatch(Op::Copy, &[&input], &output),
+            Err(GraphError::ParameterSpaceMismatch)
+        );
+    }
+
+    #[test]
+    fn corner_checks_refuse_empty_low_and_work_over_high() {
+        let zero_space = ParamSpace::new(std::iter::once(0..=1).collect()).unwrap();
+        let empty_input = symbolic_prefix(1, &[1], zero_space.clone(), Affine::parameter(0, 0, 1));
+        let empty_output = symbolic_prefix(2, &[1], zero_space.clone(), Affine::parameter(0, 0, 1));
+        let mut empty = GraphTemplate::new(zero_space, GraphLimits::default());
+        assert_eq!(
+            empty.dispatch(Op::Copy, &[&empty_input], &empty_output),
+            Err(GraphError::Operation(OpError::EmptyOperand {
+                operand: Operand::Input(0),
+            }))
+        );
+
+        let work_space = ParamSpace::new(std::iter::once(0..=3).collect()).unwrap();
+        let input = symbolic_prefix(3, &[4], work_space.clone(), Affine::parameter(0, 1, 1));
+        let output = symbolic_prefix(4, &[4], work_space.clone(), Affine::parameter(0, 1, 1));
+        let mut work = GraphTemplate::new(work_space, GraphLimits::new(1, 4, 7));
+        assert_eq!(
+            work.dispatch(Op::Copy, &[&input], &output),
+            Err(GraphError::WorkLimit)
+        );
+    }
+
+    #[test]
+    fn corner_checks_refuse_attention_position_overflow_at_high() {
+        let space = ParamSpace::new(std::iter::once(0..=u32::MAX).collect()).unwrap();
+        let query = TemplateTensor::from(tensor(1, &[2, 1, 1]));
+        let key = TemplateTensor::from(tensor(2, &[1, 1, 1]));
+        let value = TemplateTensor::from(tensor(3, &[1, 1, 1]));
+        let output = TemplateTensor::from(tensor(4, &[2, 1, 1]));
+        let mut graph = GraphTemplate::new(space, GraphLimits::default());
+
+        assert_eq!(
+            graph.dispatch(
+                TemplateOp::sdpa(1.0, false, Affine::parameter(0, 1, 1)),
+                &[&query, &key, &value],
+                &output,
+            ),
+            Err(GraphError::Parameter(ParamError::ArithmeticOverflow))
+        );
+    }
+
+    #[test]
+    fn hulls_refuse_aliasing_that_appears_only_inside_the_box() {
+        let space = ParamSpace::new(std::iter::once(0..=2).collect()).unwrap();
+        let base = tensor(1, &[5]);
+        let moving = SymbolicLayout::new(base.layout().clone(), space.clone())
+            .slice(0, Affine::parameter(0, 0, 2), 1.into(), 1)
+            .unwrap();
+        let input = TemplateTensor::symbolic(base.clone(), moving).unwrap();
+        let output = TemplateTensor::from(
+            Tensor::from_allocation(
+                base.buffer(),
+                Layout::contiguous(DType::F32, 2, vec![1], 20).unwrap(),
+                true,
+            )
+            .unwrap(),
+        );
+        let mut graph = GraphTemplate::new(space, GraphLimits::default());
+
+        assert_eq!(
+            graph.dispatch(Op::Copy, &[&input], &output),
+            Err(GraphError::Operation(OpError::Aliasing { input: 0 }))
+        );
+    }
+
+    #[test]
+    fn prepared_programs_are_checked_at_corners() {
+        let program = Program {
+            kind: ProgramKind::Map,
+            insts: vec![Inst::Input(0)],
+            outputs: vec![(0, 0)],
+        }
+        .validate()
+        .unwrap();
+        let prepared = prepared_for_test(
+            program.clone(),
+            KernelSignature::new(1, vec![DType::F32], vec![DType::F32], 0),
+        )
+        .unwrap();
+        let wrong_rank = prepared_for_test(
+            program,
+            KernelSignature::new(2, vec![DType::F32], vec![DType::F32], 0),
+        )
+        .unwrap();
+        let space = ParamSpace::new(std::iter::once(0..=3).collect()).unwrap();
+        let len = Affine::parameter(0, 1, 1);
+        let input = symbolic_prefix(1, &[4], space.clone(), len);
+        let output = symbolic_prefix(2, &[4], space.clone(), len);
+        let mut graph = GraphTemplate::new(space.clone(), GraphLimits::default());
+        graph
+            .dispatch_kernel(&prepared, &[&input], &[&output])
+            .unwrap();
+
+        let mut invalid = GraphTemplate::new(space, GraphLimits::default());
+        assert_eq!(
+            invalid.dispatch_kernel(&wrong_rank, &[&input], &[&output]),
+            Err(GraphError::Operation(OpError::ProgramSignature))
+        );
     }
 }
