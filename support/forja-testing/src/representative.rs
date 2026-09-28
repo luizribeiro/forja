@@ -22,6 +22,28 @@ pub fn rms_norm(epsilon: f32) -> Program {
     builder.finish()
 }
 
+/// Builds fused residual addition followed by row-wise RMS normalization.
+#[must_use]
+pub fn residual_rms_norm(epsilon: f32) -> Program {
+    let mut builder = Builder::new(ProgramKind::Row);
+    let residual = builder.input(0);
+    let update = builder.input(1);
+    let weight = builder.input(2);
+    let value = builder.binary(BinOp::Add, residual, update);
+    let square = builder.binary(BinOp::Mul, value, value);
+    let sum = builder.reduce(RedOp::Sum, square);
+    let width = builder.extent(1);
+    let width = builder.cast(ValueType::F32, width);
+    let mean = builder.binary(BinOp::Div, sum, width);
+    let epsilon = builder.constant(epsilon);
+    let stabilized = builder.binary(BinOp::Add, mean, epsilon);
+    let inverse_rms = builder.unary(UnOp::Rsqrt, stabilized);
+    let normalized = builder.binary(BinOp::Mul, value, inverse_rms);
+    let scaled = builder.binary(BinOp::Mul, normalized, weight);
+    builder.output(0, scaled);
+    builder.finish()
+}
+
 /// Builds stable row-wise softmax.
 #[must_use]
 pub fn softmax() -> Program {
