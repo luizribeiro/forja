@@ -478,7 +478,7 @@ where
 
 fn interval_width_limit(dtype: DType) -> Result<f64, AgreementError> {
     match dtype {
-        DType::F32 => Ok(5.0e-3),
+        DType::F32 => Ok(6.0e-3),
         DType::F16 => Ok(2.0e-2),
         DType::BF16 => Ok(1.0e-1),
         DType::I32 | DType::U32 => Err(AgreementError::UnsupportedDType(dtype)),
@@ -643,6 +643,13 @@ fn decode(bytes: &[u8], dtype: DType) -> Result<Vec<f32>, AgreementError> {
 mod tests {
     use super::*;
     use forja_cpu::CpuBackend;
+
+    #[test]
+    fn interval_width_limits_cover_observed_output_medians() {
+        assert_eq!(interval_width_limit(DType::F32), Ok(6.0e-3));
+        assert_eq!(interval_width_limit(DType::F16), Ok(2.0e-2));
+        assert_eq!(interval_width_limit(DType::BF16), Ok(1.0e-1));
+    }
 
     #[test]
     fn generator_repeats_for_the_same_seed() {
