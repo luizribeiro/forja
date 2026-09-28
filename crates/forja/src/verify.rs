@@ -10,6 +10,12 @@ use golden_fixtures::{
 use crate::args::{Backend as BackendArg, Verify};
 use crate::engine::{argmax, limits};
 
+#[derive(Clone, Copy)]
+struct VerificationSummary {
+    maximum_layer_error: f64,
+    maximum_prompt_kl: f64,
+}
+
 pub(crate) async fn run(options: &Verify) -> Result<(), Box<dyn Error>> {
     run_with_steps(options, 32).await
 }
@@ -26,8 +32,8 @@ async fn run_with_steps(options: &Verify, decode_steps: usize) -> Result<(), Box
         true,
     )
     .await
+    .map(|_| ())
 }
-
 async fn run_with_component(
     options: &Verify,
     fixtures: &FixtureDirectory,
@@ -35,7 +41,7 @@ async fn run_with_component(
     component: &Path,
     decode_steps: usize,
     enforce_tolerances: bool,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<VerificationSummary, Box<dyn Error>> {
     match options.backend {
         BackendArg::Cpu => {
             verify(
@@ -79,7 +85,7 @@ async fn verify<B>(
     component: &Path,
     decode_steps: usize,
     enforce_tolerances: bool,
-) -> Result<(), Box<dyn Error>>
+) -> Result<VerificationSummary, Box<dyn Error>>
 where
     B: Backend + Send + Sync + 'static,
 {
@@ -97,6 +103,10 @@ where
         .map_err(|error| format!("engine load failed: {error:?}"))?;
     let prompts = selected_prompts(fixtures, &options.prompts)?;
     let mut passed = true;
+    let mut summary = VerificationSummary {
+        maximum_layer_error: 0.0,
+        maximum_prompt_kl: 0.0,
+    };
     println!("prompt\tlayer\trelative-error\tresult");
     for fixture in prompts {
         let tokens = fixture
@@ -151,6 +161,8 @@ where
             && logits_kl <= LOGIT_KL_TOLERANCE
             && decode_kl <= LOGIT_KL_TOLERANCE
             && agreement == decode_steps;
+        summary.maximum_layer_error = summary.maximum_layer_error.max(maximum_layer_error);
+        summary.maximum_prompt_kl = summary.maximum_prompt_kl.max(logits_kl);
         passed &= prompt_passed;
         println!(
             "{}\tmax-layer={maximum_layer_error:.8e}\tfirst-failing={}\tprompt-kl={logits_kl:.8e}\tdecode-kl={decode_kl:.8e}\ttokens={agreement}/{decode_steps}\t{}",
@@ -160,7 +172,7 @@ where
         );
     }
     if passed || !enforce_tolerances {
-        Ok(())
+        Ok(summary)
     } else {
         Err("verification failed".into())
     }
@@ -283,6 +295,51 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     #[ignore = "requires FORJA_MODELS and runs in the pre-push hook"]
+    fn metal_qwen_fusion_profiles() -> Result<(), Box<dyn Error>> {
+        let options = model_options(BackendArg::Metal, vec!["short-english".to_owned()])?;
+        let fixtures = FixtureDirectory::open(&options.fixtures)?;
+        let weights = verify_model_hash(&options, &fixtures)?;
+        let components = [
+            test_guests::qwen3(),
+            test_guests::qwen3_qk_norm_rope(),
+            test_guests::qwen3_silu_mul(),
+            test_guests::qwen3_final_norm(),
+            test_guests::qwen3_all_fusions(),
+        ];
+        let runtime = tokio::runtime::Builder::new_current_thread().build()?;
+        for component in components {
+            runtime.block_on(run_with_component(
+                &options, &fixtures, &weights, component, 32, true,
+            ))?;
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires FORJA_MODELS and runs in the pre-push hook"]
+    fn metal_bf16_all_fusions_prefill() -> Result<(), Box<dyn Error>> {
+        let options = model_options(BackendArg::Metal, vec!["short-english".to_owned()])?;
+        let fixtures = FixtureDirectory::open(&options.fixtures)?;
+        let weights = verify_model_hash(&options, &fixtures)?;
+        let summary = tokio::runtime::Builder::new_current_thread()
+            .build()?
+            .block_on(run_with_component(
+                &options,
+                &fixtures,
+                &weights,
+                test_guests::qwen3_bf16_all_fusions(),
+                32,
+                false,
+            ))?;
+        assert!(summary.maximum_layer_error <= BF16_HIDDEN_STATE_TOLERANCE);
+        assert!(summary.maximum_prompt_kl <= LOGIT_KL_TOLERANCE);
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires FORJA_MODELS and runs in the pre-push hook"]
     fn metal_bf16_qwen_measurement() -> Result<(), Box<dyn Error>> {
         let root = PathBuf::from(env::var_os("FORJA_MODELS").ok_or("FORJA_MODELS is not set")?);
         let options = Verify {
@@ -303,6 +360,7 @@ mod tests {
                 32,
                 false,
             ))
+            .map(|_| ())
     }
 
     #[test]
@@ -343,15 +401,19 @@ mod tests {
         prompts: Vec<String>,
         decode_steps: usize,
     ) -> Result<(), Box<dyn Error>> {
+        let options = model_options(backend, prompts)?;
+        tokio::runtime::Builder::new_current_thread()
+            .build()?
+            .block_on(run_with_steps(&options, decode_steps))
+    }
+
+    fn model_options(backend: BackendArg, prompts: Vec<String>) -> Result<Verify, Box<dyn Error>> {
         let root = PathBuf::from(env::var_os("FORJA_MODELS").ok_or("FORJA_MODELS is not set")?);
-        let options = Verify {
+        Ok(Verify {
             model_dir: root.join("Qwen3-0.6B"),
             fixtures: root.join("golden/qwen3-0.6b"),
             backend,
             prompts,
-        };
-        tokio::runtime::Builder::new_current_thread()
-            .build()?
-            .block_on(run_with_steps(&options, decode_steps))
+        })
     }
 }
