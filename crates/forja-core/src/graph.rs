@@ -1,8 +1,8 @@
 use std::{error::Error, fmt, sync::Arc};
 
 use crate::{
-    Affine, ByteHull, Dispatch, Op, OpError, ParamError, ParamSpace, ParamValues, SymbolicLayout,
-    SymbolicLayoutError, Tensor, TensorError,
+    Affine, ByteHull, CommandList, Dispatch, Op, OpError, ParamError, ParamSpace, ParamValues,
+    SymbolicLayout, SymbolicLayoutError, Tensor, TensorError,
     program::{BindError, Inst, PreparedProgram, ProgramKind},
 };
 
@@ -198,6 +198,10 @@ impl TemplateTensor {
         }
     }
 
+    fn is_parameter_dependent(&self) -> bool {
+        matches!(self, Self::Symbolic { .. })
+    }
+
     fn instantiate(&self, values: &ParamValues) -> Result<Tensor, GraphError> {
         match self {
             Self::Concrete(tensor) => Ok(tensor.clone()),
@@ -311,6 +315,22 @@ enum DynamicDispatch {
 }
 
 impl DynamicDispatch {
+    fn is_parameter_dependent(&self) -> bool {
+        match self {
+            Self::Operation { op, inputs, output } => {
+                op.is_parameter_dependent()
+                    || inputs.iter().any(TemplateTensor::is_parameter_dependent)
+                    || output.is_parameter_dependent()
+            }
+            Self::Program {
+                inputs, outputs, ..
+            } => inputs
+                .iter()
+                .chain(outputs)
+                .any(TemplateTensor::is_parameter_dependent),
+        }
+    }
+
     fn uses_only(&self, space: &ParamSpace) -> bool {
         self.tensors()
             .all(|tensor| tensor.space().is_none_or(|candidate| candidate == space))
@@ -398,12 +418,18 @@ impl DynamicDispatch {
     }
 }
 
+#[derive(Clone, Debug)]
+enum TemplateDispatch {
+    Static(Box<Dispatch>),
+    Dynamic(DynamicDispatch),
+}
+
 /// A validated command sequence over one parameter space.
 #[derive(Clone, Debug)]
 pub struct GraphTemplate {
     space: ParamSpace,
     limits: GraphLimits,
-    dispatches: Vec<DynamicDispatch>,
+    dispatches: Vec<TemplateDispatch>,
 }
 
 impl GraphTemplate {
@@ -467,6 +493,30 @@ impl GraphTemplate {
         })
     }
 
+    /// Instantiates parameter-dependent dispatches and fully validates their concrete forms.
+    ///
+    /// Static dispatches are reused without validation because they contain only concrete tensors
+    /// and were fully validated when recorded.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GraphError`] when values belong to another space or a parameter-dependent
+    /// dispatch fails concrete layout, operation, program, or work validation.
+    pub fn instantiate(&self, values: &ParamValues) -> Result<CommandList, GraphError> {
+        if !self.space.contains_values(values) {
+            return Err(GraphError::ParameterSpaceMismatch);
+        }
+        let mut commands = CommandList::new();
+        for dispatch in &self.dispatches {
+            let concrete = match dispatch {
+                TemplateDispatch::Static(dispatch) => dispatch.as_ref().clone(),
+                TemplateDispatch::Dynamic(dispatch) => dispatch.instantiate(values, self.limits)?,
+            };
+            commands.push_prevalidated(concrete);
+        }
+        Ok(commands)
+    }
+
     fn record(&mut self, dispatch: DynamicDispatch) -> Result<(), GraphError> {
         if self.dispatches.len() >= self.limits.dispatches {
             return Err(GraphError::DispatchLimit);
@@ -475,10 +525,20 @@ impl GraphTemplate {
             return Err(GraphError::ParameterSpaceMismatch);
         }
         dispatch.check_hull_aliasing()?;
-        for values in self.space.corners() {
+        let mut corners = self.space.corners().into_iter();
+        let first = corners
+            .next()
+            .ok_or(GraphError::ParameterSpaceMismatch)
+            .and_then(|values| dispatch.instantiate(&values, self.limits))?;
+        for values in corners {
             dispatch.instantiate(&values, self.limits)?;
         }
-        self.dispatches.push(dispatch);
+        if dispatch.is_parameter_dependent() {
+            self.dispatches.push(TemplateDispatch::Dynamic(dispatch));
+        } else {
+            self.dispatches
+                .push(TemplateDispatch::Static(Box::new(first)));
+        }
         Ok(())
     }
 }
@@ -525,11 +585,15 @@ fn sdpa_flops(inputs: &[Tensor]) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
+
     use super::{GraphError, GraphLimits, GraphTemplate, TemplateOp, TemplateTensor};
     use crate::{
-        Affine, BufferId, DType, Dispatch, Layout, Op, OpError, Operand, ParamError, ParamSpace,
-        SymbolicLayout, Tensor,
-        program::{Inst, KernelSignature, Program, ProgramKind, prepared_for_test},
+        Affine, BufferId, CommandList, DType, Dispatch, Layout, Op, OpError, Operand, ParamError,
+        ParamSpace, ParamValues, SymbolicLayout, Tensor,
+        program::{
+            Inst, KernelSignature, PreparedProgram, Program, ProgramKind, prepared_for_test,
+        },
     };
 
     fn tensor(buffer: u64, shape: &[u32]) -> Tensor {
@@ -553,6 +617,105 @@ mod tests {
             .slice(0, 0.into(), len, 1)
             .unwrap();
         TemplateTensor::symbolic(base, layout).unwrap()
+    }
+
+    fn symbolic_slice(
+        buffer: u64,
+        shape: &[u32],
+        space: ParamSpace,
+        axis: u8,
+        start: Affine,
+        len: Affine,
+    ) -> TemplateTensor {
+        let base = tensor(buffer, shape);
+        let layout = SymbolicLayout::new(base.layout().clone(), space)
+            .slice(axis, start, len, 1)
+            .unwrap();
+        TemplateTensor::symbolic(base, layout).unwrap()
+    }
+
+    fn fresh_operation_succeeds(
+        op: TemplateOp,
+        inputs: &[&TemplateTensor],
+        output: &TemplateTensor,
+        values: &ParamValues,
+    ) -> bool {
+        let Ok(inputs) = inputs
+            .iter()
+            .map(|tensor| tensor.instantiate(values))
+            .collect::<Result<Vec<_>, _>>()
+        else {
+            return false;
+        };
+        let Ok(output) = output.instantiate(values) else {
+            return false;
+        };
+        let Ok(op) = op.instantiate(values) else {
+            return false;
+        };
+        let input_refs = inputs.iter().collect::<Vec<_>>();
+        CommandList::new()
+            .dispatch(op, &input_refs, &output)
+            .is_ok()
+    }
+
+    fn operation_replay_matches_fresh(
+        graph: &GraphTemplate,
+        space: &ParamSpace,
+        parameters: std::ops::RangeInclusive<u32>,
+        op: TemplateOp,
+        inputs: &[&TemplateTensor],
+        output: &TemplateTensor,
+    ) -> bool {
+        parameters
+            .map(|parameter| space.values(vec![parameter]).unwrap())
+            .all(|values| {
+                graph.instantiate(&values).is_ok()
+                    == fresh_operation_succeeds(op, inputs, output, &values)
+            })
+    }
+
+    fn fresh_program_succeeds(
+        program: &std::sync::Arc<PreparedProgram>,
+        inputs: &[&TemplateTensor],
+        outputs: &[&TemplateTensor],
+        values: &ParamValues,
+    ) -> bool {
+        let Ok(inputs) = inputs
+            .iter()
+            .map(|tensor| tensor.instantiate(values))
+            .collect::<Result<Vec<_>, _>>()
+        else {
+            return false;
+        };
+        let Ok(outputs) = outputs
+            .iter()
+            .map(|tensor| tensor.instantiate(values))
+            .collect::<Result<Vec<_>, _>>()
+        else {
+            return false;
+        };
+        let input_refs = inputs.iter().collect::<Vec<_>>();
+        let output_refs = outputs.iter().collect::<Vec<_>>();
+        CommandList::new()
+            .dispatch_kernel(program, &input_refs, &output_refs)
+            .is_ok()
+    }
+
+    fn program_replay_matches_fresh(
+        graph: &GraphTemplate,
+        space: &ParamSpace,
+        parameters: std::ops::RangeInclusive<u32>,
+        program: &std::sync::Arc<PreparedProgram>,
+        inputs: &[&TemplateTensor],
+        outputs: &[&TemplateTensor],
+    ) -> bool {
+        parameters
+            .map(|parameter| space.values(vec![parameter]).unwrap())
+            .all(|values| {
+                graph.instantiate(&values).is_ok()
+                    == fresh_program_succeeds(program, inputs, outputs, &values)
+            })
     }
     #[test]
     fn instantiates_affine_attention_positions_with_checked_arithmetic() {
@@ -586,6 +749,26 @@ mod tests {
         assert!(matches!(
             tensor,
             TemplateTensor::Symbolic { base: retained, .. } if retained == base
+        ));
+    }
+
+    #[test]
+    fn refuses_values_outside_the_template_space() {
+        let space = ParamSpace::new(std::iter::once(1..=7).collect()).unwrap();
+        let foreign = ParamSpace::new(std::iter::once(1..=7).collect()).unwrap();
+        let graph = GraphTemplate::new(space.clone(), GraphLimits::default());
+
+        assert!(matches!(
+            space.values(vec![]),
+            Err(ParamError::CountMismatch { .. })
+        ));
+        assert!(matches!(
+            space.values(vec![8]),
+            Err(ParamError::OutOfRange { .. })
+        ));
+        assert!(matches!(
+            graph.instantiate(&foreign.values(vec![1]).unwrap()),
+            Err(GraphError::ParameterSpaceMismatch)
         ));
     }
 
@@ -681,6 +864,33 @@ mod tests {
     }
 
     #[test]
+    fn replay_rechecks_attention_head_divisibility() {
+        let space = ParamSpace::new(std::iter::once(0..=2).collect()).unwrap();
+        let heads = Affine::parameter(0, 2, 1);
+        let query = symbolic_prefix(1, &[4, 1, 1], space.clone(), heads);
+        let key = TemplateTensor::from(tensor(2, &[2, 1, 1]));
+        let value = TemplateTensor::from(tensor(3, &[2, 1, 1]));
+        let output = symbolic_prefix(4, &[4, 1, 1], space.clone(), heads);
+        let mut graph = GraphTemplate::new(space.clone(), GraphLimits::default());
+        graph
+            .dispatch(
+                TemplateOp::sdpa(1.0, false, 0.into()),
+                &[&query, &key, &value],
+                &output,
+            )
+            .unwrap();
+
+        assert!(graph.instantiate(&space.values(vec![0]).unwrap()).is_ok());
+        assert!(graph.instantiate(&space.values(vec![2]).unwrap()).is_ok());
+        assert!(matches!(
+            graph.instantiate(&space.values(vec![1]).unwrap()),
+            Err(GraphError::Operation(OpError::Shape {
+                operand: Operand::Input(1),
+            }))
+        ));
+    }
+
+    #[test]
     fn hulls_refuse_aliasing_that_appears_only_inside_the_box() {
         let space = ParamSpace::new(std::iter::once(0..=2).collect()).unwrap();
         let base = tensor(1, &[5]);
@@ -737,5 +947,168 @@ mod tests {
             invalid.dispatch_kernel(&wrong_rank, &[&input], &[&output]),
             Err(GraphError::Operation(OpError::ProgramSignature))
         );
+    }
+
+    proptest! {
+        #[test]
+        fn replay_matches_fresh_validation_without_filtering(hi in 2_u32..=7) {
+            let space = ParamSpace::new(std::iter::once(0..=hi).collect()).unwrap();
+            let position = Affine::parameter(0, 0, 1);
+            let cache_shape = [8, hi + 1, 128];
+            let cache_write = symbolic_slice(
+                3,
+                &cache_shape,
+                space.clone(),
+                1,
+                position,
+                1.into(),
+            );
+            let copy_input = TemplateTensor::from(tensor(1, &[8, 1, 128]));
+            let mut copy = GraphTemplate::new(space.clone(), GraphLimits::default());
+            copy.dispatch(Op::Copy, &[&copy_input], &cache_write).unwrap();
+            prop_assert!(operation_replay_matches_fresh(
+                &copy,
+                &space,
+                0..=hi,
+                Op::Copy.into(),
+                &[&copy_input],
+                &cache_write,
+            ));
+
+            let add_input = TemplateTensor::from(tensor(2, &[8, 1, 128]));
+            let mut add = GraphTemplate::new(space.clone(), GraphLimits::default());
+            add.dispatch(Op::Add, &[&copy_input, &add_input], &cache_write)
+                .unwrap();
+            prop_assert!(operation_replay_matches_fresh(
+                &add,
+                &space,
+                0..=hi,
+                Op::Add.into(),
+                &[&copy_input, &add_input],
+                &cache_write,
+            ));
+
+            let extent = Affine::parameter(0, 1, 1);
+            let left = symbolic_prefix(4, &[hi + 1, 3], space.clone(), extent);
+            let right = TemplateTensor::from(tensor(5, &[3, 5]));
+            let product = symbolic_prefix(6, &[hi + 1, 5], space.clone(), extent);
+            let mut matmul = GraphTemplate::new(space.clone(), GraphLimits::default());
+            matmul.dispatch(Op::Matmul, &[&left, &right], &product).unwrap();
+            prop_assert!(operation_replay_matches_fresh(
+                &matmul,
+                &space,
+                0..=hi,
+                Op::Matmul.into(),
+                &[&left, &right],
+                &product,
+            ));
+
+            let attention_space = ParamSpace::new(std::iter::once(0..=2).collect()).unwrap();
+            let heads = Affine::parameter(0, 2, 1);
+            let query = symbolic_prefix(7, &[4, 1, 1], attention_space.clone(), heads);
+            let key = TemplateTensor::from(tensor(8, &[2, 1, 1]));
+            let value = TemplateTensor::from(tensor(9, &[2, 1, 1]));
+            let attention_output =
+                symbolic_prefix(10, &[4, 1, 1], attention_space.clone(), heads);
+            let attention_op = TemplateOp::sdpa(1.0, false, 0.into());
+            let mut attention =
+                GraphTemplate::new(attention_space.clone(), GraphLimits::default());
+            attention
+                .dispatch(
+                    attention_op,
+                    &[&query, &key, &value],
+                    &attention_output,
+                )
+                .unwrap();
+            prop_assert!(operation_replay_matches_fresh(
+                &attention,
+                &attention_space,
+                0..=2,
+                attention_op,
+                &[&query, &key, &value],
+                &attention_output,
+            ));
+
+            let program = Program {
+                kind: ProgramKind::Map,
+                insts: vec![Inst::Input(0)],
+                outputs: vec![(0, 0)],
+            }
+            .validate()
+            .unwrap();
+            let prepared = prepared_for_test(
+                program,
+                KernelSignature::new(1, vec![DType::F32], vec![DType::F32], 0),
+            )
+            .unwrap();
+            let program_input = symbolic_prefix(11, &[hi + 1], space.clone(), extent);
+            let program_output = symbolic_prefix(12, &[hi + 1], space.clone(), extent);
+            let mut program_graph = GraphTemplate::new(space.clone(), GraphLimits::default());
+            program_graph
+                .dispatch_kernel(&prepared, &[&program_input], &[&program_output])
+                .unwrap();
+            prop_assert!(program_replay_matches_fresh(
+                &program_graph,
+                &space,
+                0..=hi,
+                &prepared,
+                &[&program_input],
+                &[&program_output],
+            ));
+
+            let contiguity_space = ParamSpace::new(std::iter::once(1..=3).collect()).unwrap();
+            let width = Affine::parameter(0, 0, 1);
+            let noncontiguous_input = symbolic_slice(
+                13,
+                &[3, 3],
+                contiguity_space.clone(),
+                1,
+                0.into(),
+                width,
+            );
+            let noncontiguous_output = symbolic_slice(
+                14,
+                &[3, 3],
+                contiguity_space.clone(),
+                1,
+                0.into(),
+                width,
+            );
+            let row_program = Program {
+                kind: ProgramKind::Row,
+                insts: vec![Inst::Input(0)],
+                outputs: vec![(0, 0)],
+            }
+            .validate()
+            .unwrap();
+            let prepared_row = prepared_for_test(
+                row_program,
+                KernelSignature::new(2, vec![DType::F32], vec![DType::F32], 0),
+            )
+            .unwrap();
+            let mut contiguity =
+                GraphTemplate::new(contiguity_space.clone(), GraphLimits::default());
+            contiguity
+                .dispatch_kernel(
+                    &prepared_row,
+                    &[&noncontiguous_input],
+                    &[&noncontiguous_output],
+                )
+                .unwrap();
+            let interior = contiguity_space.values(vec![2]).unwrap();
+            prop_assert!(!noncontiguous_output
+                .instantiate(&interior)
+                .unwrap()
+                .layout()
+                .is_contiguous());
+            prop_assert!(program_replay_matches_fresh(
+                &contiguity,
+                &contiguity_space,
+                1..=3,
+                &prepared_row,
+                &[&noncontiguous_input],
+                &[&noncontiguous_output],
+            ));
+        }
     }
 }
