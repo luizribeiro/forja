@@ -19,7 +19,8 @@ pub use ops::{
 };
 pub use quantized::{QuantizedMatrix, QuantizedMatrixError, QuantizedMatrixPart};
 pub use symbolic::{
-    Affine, MAX_PARAMS, ParamError, ParamSpace, ParamValues, SymbolicLayout, SymbolicLayoutError,
+    Affine, ByteHull, MAX_PARAMS, ParamError, ParamSpace, ParamValues, SymbolicLayout,
+    SymbolicLayoutError,
 };
 
 /// A scalar type stored in an unquantized tensor.

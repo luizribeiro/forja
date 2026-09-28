@@ -1,7 +1,7 @@
 use std::{
     error::Error,
     fmt,
-    ops::RangeInclusive,
+    ops::{Range, RangeInclusive},
     sync::atomic::{AtomicU64, Ordering},
 };
 
@@ -153,6 +153,17 @@ impl ParamSpace {
                     .collect(),
             })
             .collect()
+    }
+
+    fn endpoint_values(&self, upper: bool) -> ParamValues {
+        ParamValues {
+            space_id: self.id,
+            values: self
+                .ranges
+                .iter()
+                .map(|range| if upper { *range.end() } else { *range.start() })
+                .collect(),
+        }
     }
 }
 
@@ -442,6 +453,31 @@ impl SymbolicLayout {
             .collect()
     }
 
+    /// Returns a conservative byte-span envelope over the entire parameter box.
+    ///
+    /// Empty layouts contribute no bytes. The recipe grammar makes offsets and
+    /// nonempty span ends monotone, but this method retains the base start when
+    /// the lower corner is empty. Corner validation alone is not a safety proof.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SymbolicLayoutError`] if an endpoint cannot be instantiated.
+    pub fn byte_hull(&self) -> Result<ByteHull, SymbolicLayoutError> {
+        let upper = self.instantiate(&self.space.endpoint_values(true))?;
+        if upper.element_count() == 0 {
+            return Ok(ByteHull::empty());
+        }
+        let lower = self.instantiate(&self.space.endpoint_values(false))?;
+        let start = if lower.element_count() == 0 {
+            self.base.byte_span().start
+        } else {
+            lower.byte_span().start
+        };
+        Ok(ByteHull {
+            span: Some(start..upper.byte_span().end),
+        })
+    }
+
     fn with_concrete_extent_op(&self, op: RecipeOp) -> Result<Self, SymbolicLayoutError> {
         if self.symbolic_extents.contains(&true) {
             return Err(SymbolicLayoutError::SymbolicExtentTransform);
@@ -491,11 +527,81 @@ impl SymbolicLayout {
     }
 }
 
+/// A conservative byte-span envelope used for overlap analysis.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ByteHull {
+    span: Option<Range<u64>>,
+}
+
+impl ByteHull {
+    /// Creates a hull containing no bytes.
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self { span: None }
+    }
+
+    /// Encloses the nonempty layouts, skipping empty layouts.
+    #[must_use]
+    pub fn from_layouts<'a>(layouts: impl IntoIterator<Item = &'a Layout>) -> Self {
+        let span = layouts
+            .into_iter()
+            .filter(|layout| layout.element_count() != 0)
+            .map(Layout::byte_span)
+            .reduce(|left, right| left.start.min(right.start)..left.end.max(right.end));
+        Self { span }
+    }
+
+    /// Returns the hull's byte range, or `None` when every layout was empty.
+    #[must_use]
+    pub fn byte_span(&self) -> Option<Range<u64>> {
+        self.span.clone()
+    }
+
+    /// Returns whether this hull contains every byte touched by `layout`.
+    #[must_use]
+    pub fn contains(&self, layout: &Layout) -> bool {
+        if layout.element_count() == 0 {
+            return true;
+        }
+        let layout_span = layout.byte_span();
+        self.span
+            .as_ref()
+            .is_some_and(|span| span.start <= layout_span.start && span.end >= layout_span.end)
+    }
+
+    /// Conservatively reports whether this hull and a concrete layout may overlap.
+    #[must_use]
+    pub fn overlaps(&self, layout: &Layout) -> bool {
+        if layout.element_count() == 0 {
+            return false;
+        }
+        let layout_span = layout.byte_span();
+        self.span
+            .as_ref()
+            .is_some_and(|span| span.start < layout_span.end && layout_span.start < span.end)
+    }
+
+    /// Conservatively reports whether two hulls of the same buffer overlap.
+    #[must_use]
+    pub fn overlaps_hull(&self, other: &Self) -> bool {
+        self.span.as_ref().is_some_and(|left| {
+            other
+                .span
+                .as_ref()
+                .is_some_and(|right| left.start < right.end && right.start < left.end)
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::ops::RangeInclusive;
 
-    use super::{Affine, MAX_PARAMS, ParamError, ParamSpace, SymbolicLayout, SymbolicLayoutError};
+    use proptest::prelude::*;
+
+    use super::{
+        Affine, ByteHull, MAX_PARAMS, ParamError, ParamSpace, SymbolicLayout, SymbolicLayoutError,
+    };
     use crate::{DType, Layout, LayoutError};
 
     #[test]
@@ -674,6 +780,32 @@ mod tests {
     }
 
     #[test]
+    fn hulls_skip_empty_layouts_and_detect_overlap() {
+        let empty = Layout::contiguous(DType::F32, 0, vec![0], 28).unwrap();
+        let middle = Layout::contiguous(DType::F32, 2, vec![3], 28).unwrap();
+        let hull = ByteHull::from_layouts([&empty, &middle]);
+        let touching = Layout::contiguous(DType::F32, 5, vec![1], 28).unwrap();
+        let overlapping = Layout::contiguous(DType::F32, 4, vec![1], 28).unwrap();
+
+        assert_eq!(hull.byte_span(), Some(8..20));
+        assert!(!hull.overlaps(&empty));
+        assert!(!hull.overlaps(&touching));
+        assert!(hull.overlaps(&overlapping));
+        assert_eq!(ByteHull::from_layouts([&empty]).byte_span(), None);
+        assert!(hull.overlaps_hull(&ByteHull::from_layouts([&overlapping])));
+        assert!(!hull.overlaps_hull(&ByteHull::from_layouts([&touching])));
+        assert!(!hull.overlaps_hull(&ByteHull::empty()));
+
+        let range = RangeInclusive::new(1, 3);
+        let space = ParamSpace::new(vec![range]).unwrap();
+        let base = Layout::contiguous(DType::F32, 0, vec![7], 28).unwrap();
+        let symbolic = SymbolicLayout::new(base, space)
+            .slice(0, Affine::parameter(0, 0, 1), 1.into(), 1)
+            .unwrap();
+        assert_eq!(symbolic.byte_hull().unwrap().byte_span(), Some(4..16));
+    }
+
+    #[test]
     fn corner_contiguity_does_not_prove_interior_contiguity() {
         let range = RangeInclusive::new(0, 3);
         let space = ParamSpace::new(vec![range]).unwrap();
@@ -695,5 +827,73 @@ mod tests {
                 .unwrap()
                 .is_contiguous()
         );
+    }
+    fn chained_recipe(
+        hi0: u32,
+        hi1: u32,
+        step: u32,
+        constant_start: u32,
+    ) -> (ParamSpace, SymbolicLayout) {
+        let space = ParamSpace::new(vec![0..=hi0, 0..=hi1]).unwrap();
+        let symbolic_len_offset = hi0 + 1;
+        let first_extent = hi0 + (hi0 + hi1) * step + 1;
+        let buffer_len = u64::from(first_extent) * 7 * 3 * DType::F32.byte_size();
+        let base = Layout::contiguous(DType::F32, 0, vec![first_extent, 7, 3], buffer_len).unwrap();
+        let layout = SymbolicLayout::new(base, space.clone())
+            .slice(
+                0,
+                Affine::parameter(0, 0, 1),
+                Affine::parameter(1, symbolic_len_offset, 1),
+                step,
+            )
+            .unwrap()
+            .slice(0, Affine::parameter(0, 0, 1), Affine::parameter(1, 1, 1), 1)
+            .unwrap()
+            .slice(1, constant_start.into(), (7 - constant_start).into(), 1)
+            .unwrap()
+            .permute(&[1, 0, 2])
+            .unwrap();
+        (space, layout)
+    }
+
+    proptest! {
+        #[test]
+        fn chained_recipe_instantiations_stay_in_the_base_buffer(
+            hi0 in 0_u32..=3,
+            hi1 in 0_u32..=3,
+            step in 2_u32..=3,
+            constant_start in 0_u32..=2,
+        ) {
+            let (space, symbolic) = chained_recipe(hi0, hi1, step, constant_start);
+            for value0 in 0..=hi0 {
+                for value1 in 0..=hi1 {
+                    if let Ok(layout) =
+                        symbolic.instantiate(&space.values(vec![value0, value1]).unwrap())
+                    {
+                        prop_assert!(layout.byte_span().end <= symbolic.base().buffer_len());
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn chained_recipe_hull_contains_every_instantiation(
+            hi0 in 0_u32..=3,
+            hi1 in 0_u32..=3,
+            step in 2_u32..=3,
+            constant_start in 0_u32..=2,
+        ) {
+            let (space, symbolic) = chained_recipe(hi0, hi1, step, constant_start);
+            let hull = symbolic.byte_hull().unwrap();
+            for value0 in 0..=hi0 {
+                for value1 in 0..=hi1 {
+                    if let Ok(layout) =
+                        symbolic.instantiate(&space.values(vec![value0, value1]).unwrap())
+                    {
+                        prop_assert!(hull.contains(&layout));
+                    }
+                }
+            }
+        }
     }
 }
