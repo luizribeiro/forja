@@ -89,9 +89,17 @@ fn helper_square(x: f32) -> f32 {
     x * x
 }
 
-#[forja_sdk::kernel(map)]
-fn macro_helper_square(x: forja_sdk::kernel::Elem) -> forja_sdk::kernel::Elem {
-    helper_square(x)
+#[forja_sdk::kernel(row, helper)]
+fn helper_rms(x: f32) -> f32 {
+    (helper_square(x).row_mean() + 1.0e-6).rsqrt()
+}
+
+#[forja_sdk::kernel(row)]
+fn macro_helper_norm(
+    x: forja_sdk::kernel::Row,
+    weight: forja_sdk::kernel::Row,
+) -> forja_sdk::kernel::Row {
+    x * helper_rms(x) * weight
 }
 
 #[forja_sdk::kernel(helper)]
@@ -138,6 +146,16 @@ fn helper_too_wide(x: f32) -> f32 {
 #[forja_sdk::kernel(map)]
 fn macro_helper_too_wide(x: forja_sdk::kernel::Elem) -> forja_sdk::kernel::Elem {
     helper_too_wide(x)
+}
+
+#[forja_sdk::kernel(row, helper)]
+fn helper_reduce(x: f32) -> f32 {
+    x.row_sum()
+}
+
+#[forja_sdk::kernel(row)]
+fn macro_helper_too_many_reductions(x: forja_sdk::kernel::Row) -> forja_sdk::kernel::Row {
+    helper_reduce(x) + helper_reduce(x) + helper_reduce(x) + helper_reduce(x) + helper_reduce(x)
 }
 
 struct TestInput {
@@ -373,12 +391,13 @@ fn axis_errors_name_the_kernel() {
 
 #[test]
 fn helpers_match_builder_and_interpreter() -> Result<(), Box<dyn Error>> {
-    let shape = [4097];
-    let inputs = [input(&shape, 0xaaaa)];
-    let macro_kernel = macro_helper_square_program(1, &[DType::F32], &[DType::F32])?;
-    let hand = Ctx::new();
+    let shape = [7, 1024];
+    let inputs = [input(&shape, 0xaaaa), input(&shape, 0xbbbb)];
+    let macro_kernel = macro_helper_norm_program(2, &[DType::F32, DType::F32], &[DType::F32])?;
+    let hand = RowCtx::new();
     let x = hand.input(0);
-    hand.output(0, x * x);
+    let inverse_rms = (hand.row_mean(x * x) + 1.0e-6).rsqrt();
+    hand.output(0, x * inverse_rms * hand.input(1));
 
     differential(
         &shape,
@@ -386,7 +405,7 @@ fn helpers_match_builder_and_interpreter() -> Result<(), Box<dyn Error>> {
         &macro_kernel,
         &hand.finish(),
         true,
-        |input| Ok(vec![macro_helper_square(&input[0])?]),
+        |input| Ok(vec![macro_helper_norm(&input[0], &input[1])?]),
     )
 }
 
@@ -398,6 +417,14 @@ fn helper_expansion_caps_name_the_kernel() {
     assert_eq!(
         instructions.to_string(),
         "kernel `macro_helper_too_wide`: invalid program: TooManyInstructions"
+    );
+
+    let reductions = macro_helper_too_many_reductions_program(1, &[DType::F32], &[DType::F32])
+        .err()
+        .expect("expanded helpers must exceed the reduction cap");
+    assert_eq!(
+        reductions.to_string(),
+        "kernel `macro_helper_too_many_reductions`: invalid program: TooManyReductions"
     );
 }
 

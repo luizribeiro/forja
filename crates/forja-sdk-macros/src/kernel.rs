@@ -123,7 +123,10 @@ impl HelperFunction {
         let name = &self.item.sig.ident;
         let context = internal("__forja_context");
         let lifetime = syn::Lifetime::new("'__forja", Span::mixed_site());
-        let context_type = quote!(::forja_sdk::program::Ctx);
+        let context_type = match self.kind {
+            KernelKind::Map => quote!(::forja_sdk::program::Ctx),
+            KernelKind::Row => quote!(::forja_sdk::program::RowCtx),
+        };
         let arguments = self.parameters.iter().map(|parameter| {
             let ident = &parameter.ident;
             match parameter.compute {
@@ -603,9 +606,13 @@ fn parse_attribute(attribute: TokenStream) -> syn::Result<Attribute> {
             kind: KernelKind::Map,
             helper: true,
         }),
+        [kind, helper] if kind == "row" && helper == "helper" => Ok(Attribute {
+            kind: KernelKind::Row,
+            helper: true,
+        }),
         _ => Err(syn::Error::new_spanned(
             arguments,
-            "expected `map`, `row`, or `helper`",
+            "expected `map`, `row`, `helper`, or `row, helper`",
         )),
     }
 }

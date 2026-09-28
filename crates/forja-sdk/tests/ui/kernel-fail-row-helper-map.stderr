@@ -1,0 +1,19 @@
+error[E0308]: mismatched types
+ --> tests/ui/kernel-fail-row-helper-map.rs:6:1
+  |
+6 | #[forja_sdk::kernel(map)]
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^ expected `&RowCtx`, found `&Ctx`
+7 | fn map_calls_row(x: forja_sdk::kernel::Elem) -> forja_sdk::kernel::Elem {
+8 |     centered(x)
+  |     -------- arguments to this function are incorrect
+  |
+  = note: expected reference `&RowCtx`
+             found reference `&Ctx`
+note: function defined here
+ --> tests/ui/kernel-fail-row-helper-map.rs:2:4
+  |
+1 | #[forja_sdk::kernel(row, helper)]
+  | ---------------------------------
+2 | fn centered(x: f32) -> f32 {
+  |    ^^^^^^^^
+  = note: this error originates in the attribute macro `forja_sdk::kernel` (in Nightly builds, run with -Z macro-backtrace for more info)
