@@ -1,5 +1,7 @@
 //! Map-program GPU differential tests.
 
+mod common;
+
 use std::time::Duration;
 
 use forja_core::{
@@ -14,6 +16,8 @@ use forja_testing::{
     representative::{half_split_rope, residual_add, silu_mul},
 };
 use proptest::{prelude::*, test_runner::TestCaseError};
+
+use common::median_gpu_time;
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(32))]
@@ -526,19 +530,4 @@ fn program_commands(
 
 fn run(backend: &MetalBackend, commands: CommandList) {
     backend.submit(commands).unwrap().wait().unwrap();
-}
-
-fn median_gpu_time(backend: &MetalBackend, mut commands: impl FnMut() -> CommandList) -> Duration {
-    for _ in 0..5 {
-        run(backend, commands());
-    }
-    let mut samples = (0..31)
-        .map(|_| {
-            let submission = backend.submit_profiled(commands()).unwrap();
-            submission.wait().unwrap();
-            submission.gpu_time().unwrap()
-        })
-        .collect::<Vec<_>>();
-    samples.sort_unstable();
-    samples[samples.len() / 2]
 }
