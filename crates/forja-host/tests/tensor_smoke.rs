@@ -66,6 +66,44 @@ async fn cpu_guest_fused_program_matches_trusted_operations() -> wasmtime::Resul
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn compatibility_cache_releases_evicted_kernel_leases() -> wasmtime::Result<()> {
+    let (mut store, instance) = instantiate(
+        forja_cpu::CpuBackend::new(),
+        test_guests::program_smoke(),
+        COMMAND_LIMITS.with_kernel_limit(8),
+    )
+    .await?;
+    let churn =
+        instance.get_typed_func::<(), (Result<(), String>,)>(&mut store, "churn-program-cache")?;
+    Host::reset_guest_deadline(&mut store);
+    let (result,) = store
+        .run_concurrent(async move |accessor| churn.call_concurrent(accessor, ()).await)
+        .await??;
+    result.map_err(wasmtime::Error::msg)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn explicit_kernels_and_compatibility_cache_share_quota() -> wasmtime::Result<()> {
+    let (mut store, instance) = instantiate(
+        forja_cpu::CpuBackend::new(),
+        test_guests::program_smoke(),
+        COMMAND_LIMITS.with_kernel_limit(8),
+    )
+    .await?;
+    let exhaust =
+        instance.get_typed_func::<(), (Result<(), String>,)>(&mut store, "exhaust-shared-quota")?;
+    Host::reset_guest_deadline(&mut store);
+    let (result,) = store
+        .run_concurrent(async move |accessor| exhaust.call_concurrent(accessor, ()).await)
+        .await??;
+    assert_eq!(
+        result,
+        Err("Error::Quota(\"live kernels exceed the guest limit\")".to_owned())
+    );
+    Ok(())
+}
+
 #[cfg(target_os = "macos")]
 #[tokio::test(flavor = "multi_thread")]
 async fn metal_tensor_smoke_submits_commands() -> wasmtime::Result<()> {

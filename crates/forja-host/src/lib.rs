@@ -1257,50 +1257,6 @@ impl<B: Backend> Host<B> {
         Ok(())
     }
 
-    /// Validates and records one guest-authored scalar program by value.
-    ///
-    /// # Errors
-    ///
-    /// Returns an operation, quota, or invalid-handle error before recording invalid work.
-    pub fn dispatch_program(
-        &mut self,
-        commands: &Resource<CommandListEntry>,
-        program: compute::ProgramSource,
-        inputs: &[Resource<TensorEntry>],
-        outputs: &[Resource<TensorEntry>],
-    ) -> Result<(), compute::Error> {
-        let input_entries = inputs
-            .iter()
-            .map(|resource| self.entry(resource).cloned())
-            .collect::<Result<Vec<_>, _>>()?;
-        let output_entries = outputs
-            .iter()
-            .map(|resource| self.entry(resource).cloned())
-            .collect::<Result<Vec<_>, _>>()?;
-        let program = core_program(program)?;
-        let entry = self.table.get(commands).map_err(invalid_handle)?;
-        if entry.commands.len() >= self.limits.dispatches_per_list {
-            return Err(quota("command list dispatch count exceeds the guest limit"));
-        }
-        let input_tensors = input_entries
-            .iter()
-            .map(|entry| &entry.tensor)
-            .collect::<Vec<_>>();
-        let output_tensors = output_entries
-            .iter()
-            .map(|entry| &entry.tensor)
-            .collect::<Vec<_>>();
-        self.check_program_work(&program, &input_tensors, &output_tensors)?;
-        let entry = self.table.get_mut(commands).map_err(invalid_handle)?;
-        entry
-            .commands
-            .dispatch_program(&program, &input_tensors, &output_tensors)
-            .map_err(guest_error)?;
-        entry.retained.extend(input_entries);
-        entry.retained.extend(output_entries);
-        Ok(())
-    }
-
     /// Validates and records one guest-authored scalar program.
     ///
     /// # Errors
@@ -1798,19 +1754,6 @@ where
         let _timer = self.import_timer(ImportKind::Dispatch);
         std::future::ready(Ok(Host::dispatch_kernel(
             self, &resource, &kernel, &inputs, &outputs,
-        )))
-    }
-
-    fn dispatch_program(
-        &mut self,
-        resource: Resource<CommandListEntry>,
-        program: compute::ProgramSource,
-        inputs: Vec<Resource<TensorEntry>>,
-        outputs: Vec<Resource<TensorEntry>>,
-    ) -> impl Future<Output = wasmtime::Result<Result<(), compute::Error>>> + Send {
-        let _timer = self.import_timer(ImportKind::Dispatch);
-        std::future::ready(Ok(Host::dispatch_program(
-            self, &resource, program, &inputs, &outputs,
         )))
     }
 

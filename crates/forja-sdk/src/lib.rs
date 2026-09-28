@@ -114,6 +114,7 @@ pub enum NativeDevice {
 /// participate in one operation.
 #[cfg(feature = "native")]
 pub fn set_native_device(device: NativeDevice) {
+    graph::clear_kernel_cache();
     sys::set_native_device(device);
 }
 

@@ -84,13 +84,6 @@ pub(crate) trait Backend {
         inputs: &[&Self::Tensor],
         output: &Self::Tensor,
     ) -> Result<()>;
-    #[cfg(target_family = "wasm")]
-    fn dispatch_program(
-        commands: &mut Self::Commands,
-        program: Program,
-        inputs: &[&Self::Tensor],
-        outputs: &[&Self::Tensor],
-    ) -> Result<()>;
     fn create_kernel(
         program: Program,
         rank: u8,
@@ -192,18 +185,6 @@ pub(crate) mod guest {
         ) -> Result<()> {
             commands
                 .dispatch(wit_op(operation), inputs, output)
-                .map_err(|error| guest_error(&error))
-        }
-
-        #[cfg(target_family = "wasm")]
-        fn dispatch_program(
-            commands: &mut Self::Commands,
-            program: Program,
-            inputs: &[&Self::Tensor],
-            outputs: &[&Self::Tensor],
-        ) -> Result<()> {
-            commands
-                .dispatch_program(&wit_program(program), inputs, outputs)
                 .map_err(|error| guest_error(&error))
         }
 
@@ -388,16 +369,6 @@ pub(crate) mod unavailable {
             _operation: Op,
             _inputs: &[&Self::Tensor],
             _output: &Self::Tensor,
-        ) -> Result<()> {
-            Err(error())
-        }
-
-        #[cfg(target_family = "wasm")]
-        fn dispatch_program(
-            _commands: &mut Self::Commands,
-            _program: Program,
-            _inputs: &[&Self::Tensor],
-            _outputs: &[&Self::Tensor],
         ) -> Result<()> {
             Err(error())
         }
@@ -615,25 +586,6 @@ pub(crate) mod native {
                     .dispatch(core_op(operation), &metal_inputs(inputs)?, output)
                     .map_err(error),
                 _ => Err(Error::new("native tensors belong to different backends")),
-            }
-        }
-
-        #[cfg(target_family = "wasm")]
-        fn dispatch_program(
-            commands: &mut Self::Commands,
-            program: Program,
-            inputs: &[&Self::Tensor],
-            outputs: &[&Self::Tensor],
-        ) -> Result<()> {
-            let program = core_program(program)?;
-            match commands {
-                Commands::Cpu(commands) => commands
-                    .dispatch_program(&program, &cpu_inputs(inputs)?, &cpu_inputs(outputs)?)
-                    .map_err(error),
-                #[cfg(all(feature = "native-metal", target_os = "macos"))]
-                Commands::Metal(commands) => commands
-                    .dispatch_program(&program, &metal_inputs(inputs)?, &metal_inputs(outputs)?)
-                    .map_err(error),
             }
         }
 
@@ -865,16 +817,6 @@ pub(crate) fn dispatch(
     output: &Handle,
 ) -> Result<()> {
     Active::dispatch(commands, operation, inputs, output)
-}
-
-#[cfg(target_family = "wasm")]
-pub(crate) fn dispatch_program(
-    commands: &mut Commands,
-    program: Program,
-    inputs: &[&Handle],
-    outputs: &[&Handle],
-) -> Result<()> {
-    Active::dispatch_program(commands, program, inputs, outputs)
 }
 
 pub(crate) fn create_kernel(

@@ -150,7 +150,6 @@ interface compute {
   resource command-list {
     constructor();
     dispatch: func(operation: op, ins: list<borrow<tensor>>, out: borrow<tensor>) -> result<_, error>;
-    dispatch-program: func(program: program-source, ins: list<borrow<tensor>>, outs: list<borrow<tensor>>) -> result<_, error>;
     dispatch-kernel: func(k: borrow<kernel>, ins: list<borrow<tensor>>, outs: list<borrow<tensor>>) -> result<_, error>;
   }
 
@@ -184,6 +183,8 @@ world rmsnorm-smoke {
 world program-smoke {
   import compute;
   export run: async func() -> result<list<f32>, string>;
+  export churn-program-cache: async func() -> result<_, string>;
+  export exhaust-shared-quota: async func() -> result<_, string>;
 }
 
 world weights-smoke {

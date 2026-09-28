@@ -342,8 +342,8 @@ impl<T: Element> Tensor<T> {
         graph::record_program(
             definition,
             rank,
-            &vec![dtype; input_handles.len()],
-            &vec![dtype; output_handles.len()],
+            vec![dtype; input_handles.len()],
+            vec![dtype; output_handles.len()],
             &input_handles,
             &output_handles,
         )?;
@@ -379,8 +379,8 @@ impl<T: Element> Tensor<T> {
         graph::record_program(
             definition,
             rank,
-            &vec![dtype; input_handles.len()],
-            &vec![dtype; output_handles.len()],
+            vec![dtype; input_handles.len()],
+            vec![dtype; output_handles.len()],
             &input_handles,
             &output_handles,
         )
