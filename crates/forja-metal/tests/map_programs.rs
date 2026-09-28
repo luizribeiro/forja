@@ -29,7 +29,7 @@ proptest! {
 }
 
 #[test]
-fn fast_transcendentals_stay_within_dtype_tolerances() {
+fn transcendentals_stay_within_dtype_tolerances() {
     let program = transcendental_program().validate().unwrap();
     for dtype in [DType::F32, DType::F16, DType::BF16] {
         let cpu = CpuBackend::new();
@@ -129,7 +129,7 @@ fn metal_map_preserves_nan_dependent_control_flow() {
 }
 
 #[test]
-fn metal_fast_transcendentals_remain_defined_for_finite_inputs() {
+fn metal_transcendentals_remain_defined_for_finite_inputs() {
     let program = Program {
         kind: ProgramKind::Map,
         insts: vec![
@@ -161,6 +161,43 @@ fn metal_fast_transcendentals_remain_defined_for_finite_inputs() {
         &metal.read(&actual).unwrap(),
     )
     .unwrap();
+}
+
+#[test]
+fn metal_transcendentals_preserve_numeric_classes() {
+    let program = Program {
+        kind: ProgramKind::Map,
+        insts: vec![
+            Inst::Input(0),
+            Inst::Unary(UnOp::Log, 0),
+            Inst::Unary(UnOp::Sin, 1),
+            Inst::Unary(UnOp::Sqrt, 0),
+            Inst::Unary(UnOp::Rsqrt, 0),
+        ],
+        outputs: vec![(0, 1), (1, 2), (2, 3), (3, 4)],
+    }
+    .validate()
+    .unwrap();
+    let values = [
+        -1.0,
+        f32::NEG_INFINITY,
+        -0.0,
+        0.0,
+        1.0,
+        f32::INFINITY,
+        f32::NAN,
+    ];
+    let bytes = values
+        .into_iter()
+        .flat_map(f32::to_le_bytes)
+        .collect::<Vec<_>>();
+    let cpu = CpuBackend::new();
+    let metal = MetalBackend::new().unwrap();
+    let expected = run_small_program(&cpu, &program, &bytes, values.len());
+    let actual = run_small_program(&metal, &program, &bytes, values.len());
+    for (expected, actual) in expected.iter().zip(actual) {
+        assert_outputs_agree(DType::F32, expected, &actual).unwrap();
+    }
 }
 
 fn run_corner_program<B: Backend>(
@@ -257,6 +294,29 @@ fn run_program<B: Backend>(
     backend.write(&input, input_bytes).unwrap();
     let outputs = (0..4)
         .map(|_| backend.alloc(dtype, &[4097]).unwrap())
+        .collect::<Vec<_>>();
+    let mut commands = CommandList::new();
+    commands
+        .dispatch_program(program, &[&input], &outputs.iter().collect::<Vec<_>>())
+        .unwrap();
+    backend.submit(commands).unwrap().wait().unwrap();
+    outputs
+        .iter()
+        .map(|output| backend.read(output).unwrap())
+        .collect()
+}
+
+fn run_small_program<B: Backend>(
+    backend: &B,
+    program: &ValidatedProgram,
+    input_bytes: &[u8],
+    len: usize,
+) -> Vec<Vec<u8>> {
+    let shape = [u32::try_from(len).unwrap()];
+    let input = backend.alloc(DType::F32, &shape).unwrap();
+    backend.write(&input, input_bytes).unwrap();
+    let outputs = (0..4)
+        .map(|_| backend.alloc(DType::F32, &shape).unwrap())
         .collect::<Vec<_>>();
     let mut commands = CommandList::new();
     commands

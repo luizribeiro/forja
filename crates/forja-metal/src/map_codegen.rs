@@ -198,22 +198,35 @@ fn instruction_expression(
 }
 
 fn unary(op: UnOp, operand: u32) -> String {
+    let nan = "as_type<float>(0x7fc00000u)";
     match op {
         UnOp::Neg => format!("-v{operand}"),
         UnOp::Abs => format!("abs(v{operand})"),
-        UnOp::Exp => format!("fast::exp(v{operand})"),
-        UnOp::Log => format!("fast::log(v{operand})"),
-        UnOp::Sqrt => format!("fast::sqrt(v{operand})"),
-        UnOp::Rsqrt => format!("fast::rsqrt(v{operand})"),
-        UnOp::Sin => format!("fast::sin(v{operand})"),
-        UnOp::Cos => format!("fast::cos(v{operand})"),
-        UnOp::Tanh => format!(
-            "select(fast::tanh(v{operand}), copysign(1.0f, v{operand}), \
-             !isnan(v{operand}) && abs(v{operand}) > 8.0f)"
+        UnOp::Exp => format!("select(precise::exp(v{operand}), {nan}, isnan(v{operand}))"),
+        UnOp::Log => {
+            format!(
+                "select(precise::log(v{operand}), {nan}, isnan(v{operand}) || v{operand} < 0.0f)"
+            )
+        }
+        UnOp::Sqrt => {
+            format!(
+                "select(precise::sqrt(v{operand}), {nan}, isnan(v{operand}) || v{operand} < 0.0f)"
+            )
+        }
+        UnOp::Rsqrt => format!(
+            "select(precise::rsqrt(v{operand}), {nan}, isnan(v{operand}) || v{operand} < 0.0f)"
         ),
-        UnOp::Sigmoid => format!("1.0f / (1.0f + fast::exp(-v{operand}))"),
-        UnOp::Recip => format!("1.0f / v{operand}"),
-        UnOp::Floor => format!("floor(v{operand})"),
+        UnOp::Sin => format!("select(precise::sin(v{operand}), {nan}, !isfinite(v{operand}))"),
+        UnOp::Cos => format!("select(precise::cos(v{operand}), {nan}, !isfinite(v{operand}))"),
+        UnOp::Tanh => format!(
+            "select(select(precise::tanh(v{operand}), copysign(1.0f, v{operand}), \
+             abs(v{operand}) > 8.0f), {nan}, isnan(v{operand}))"
+        ),
+        UnOp::Sigmoid => {
+            format!("select(1.0f / (1.0f + precise::exp(-v{operand})), {nan}, isnan(v{operand}))")
+        }
+        UnOp::Recip => format!("select(1.0f / v{operand}, {nan}, isnan(v{operand}))"),
+        UnOp::Floor => format!("select(floor(v{operand}), {nan}, isnan(v{operand}))"),
     }
 }
 
@@ -380,7 +393,7 @@ kernel void forja_map(
         assert!(source.contains("isnan(v0) || isnan(v1)"));
         assert!(source.contains("clamp(v2, 0.0f, 4294967040.0f)"));
         assert!(source.contains("uint v5 = v4 + v4;"));
-        assert!(source.contains("fast::exp(v3)"));
+        assert!(source.contains("precise::exp(v3)"));
     }
 
     proptest! {
