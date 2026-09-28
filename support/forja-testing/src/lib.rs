@@ -290,6 +290,56 @@ where
     assert_outputs_agree(output.dtype, &expected_bytes, &actual_bytes)
 }
 
+/// Runs one generated scalar program on two backends and checks every output.
+///
+/// # Errors
+///
+/// Returns a validation, backend, encoding, size, dtype, or tolerance error.
+pub fn assert_program_backends_agree<R, C>(
+    reference: &R,
+    candidate: &C,
+    case: &program::ProgramCase,
+) -> Result<(), Box<dyn Error>>
+where
+    R: Backend,
+    C: Backend,
+{
+    let mut values = DeterministicValues::new(0xbb67_ae85_84ca_a73b);
+    let mut reference_inputs = Vec::with_capacity(case.inputs().len());
+    let mut candidate_inputs = Vec::with_capacity(case.inputs().len());
+    for input in case.inputs() {
+        let bytes = generated_bytes(input, &mut values)?;
+        reference_inputs.push(allocate_initialized(reference, input, &bytes)?);
+        candidate_inputs.push(allocate_initialized(candidate, input, &bytes)?);
+    }
+    let reference_outputs = case
+        .outputs()
+        .iter()
+        .map(|output| allocate(reference, output))
+        .collect::<Result<Vec<_>, _>>()?;
+    let candidate_outputs = case
+        .outputs()
+        .iter()
+        .map(|output| allocate(candidate, output))
+        .collect::<Result<Vec<_>, _>>()?;
+    let program = case.program().validate()?;
+    run_program(reference, &program, &reference_inputs, &reference_outputs)?;
+    run_program(candidate, &program, &candidate_inputs, &candidate_outputs)?;
+    for ((spec, expected), actual) in case
+        .outputs()
+        .iter()
+        .zip(reference_outputs)
+        .zip(candidate_outputs)
+    {
+        assert_outputs_agree(
+            spec.dtype(),
+            &reference.read(&expected)?,
+            &candidate.read(&actual)?,
+        )?;
+    }
+    Ok(())
+}
+
 /// Checks two encoded outputs using exact integer comparison or the dtype tolerance.
 ///
 /// # Errors
@@ -328,6 +378,23 @@ fn run<B: Backend>(
         .map_err(|_| BackendError::InvalidInput)?;
     backend.submit(commands)?.wait()?;
     Ok(())
+}
+
+fn run_program<B: Backend>(
+    backend: &B,
+    program: &forja_core::program::ValidatedProgram,
+    inputs: &[Tensor],
+    outputs: &[Tensor],
+) -> Result<(), BackendError> {
+    let mut commands = forja_core::CommandList::new();
+    commands
+        .dispatch_program(
+            program,
+            &inputs.iter().collect::<Vec<_>>(),
+            &outputs.iter().collect::<Vec<_>>(),
+        )
+        .map_err(|_| BackendError::InvalidInput)?;
+    backend.submit(commands)?.wait()
 }
 
 fn allocate<B: Backend>(backend: &B, spec: &TensorSpec) -> Result<Tensor, AgreementError> {

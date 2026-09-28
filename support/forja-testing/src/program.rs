@@ -52,8 +52,8 @@ impl ProgramCase {
 ///
 /// Every case contains input, constant, index, extent, unary, binary, select,
 /// and cast instructions. Row cases also contain reductions. Inputs independently
-/// use contiguous, broadcast, or permuted views; shapes cover ranks one through
-/// four and include last-axis length 4097. Each program writes one to four outputs.
+/// use contiguous, broadcast, permuted, or sliced views; shapes cover ranks one
+/// through four and include last-axis length 4097. Each program writes one to four outputs.
 pub fn well_typed_programs(max_instructions: usize) -> impl Strategy<Value = ProgramCase> {
     let max_instructions = max_instructions.clamp(BASE_ROW_LEN, MAX_INSTRUCTIONS);
     let word_count = max_instructions.max(16);
@@ -65,6 +65,23 @@ pub fn well_typed_programs(max_instructions: usize) -> impl Strategy<Value = Pro
     )
         .prop_map(move |(row, shape_word, output_count, words)| {
             build_case(row, shape_word, output_count, &words, max_instructions)
+        })
+}
+
+/// Generates valid map programs up to a caller-selected instruction count.
+///
+/// Shapes cover ranks one through four and include 4097-element edges. Inputs
+/// independently use contiguous, broadcast, permuted, or sliced views.
+pub fn map_programs(max_instructions: usize) -> impl Strategy<Value = ProgramCase> {
+    let max_instructions = max_instructions.clamp(BASE_ROW_LEN, MAX_INSTRUCTIONS);
+    let word_count = max_instructions.max(16);
+    (
+        any::<u64>(),
+        1_usize..=4,
+        prop::collection::vec(any::<u64>(), word_count..=word_count),
+    )
+        .prop_map(move |(shape_word, output_count, words)| {
+            build_case(false, shape_word, output_count, &words, max_instructions)
         })
 }
 
@@ -133,7 +150,7 @@ fn generated_shape(word: u64) -> Vec<u32> {
 }
 
 fn generated_input(dtype: DType, shape: &[u32], word: u64) -> TensorSpec {
-    match word % 3 {
+    match word % 4 {
         0 => TensorSpec::contiguous(dtype, shape),
         1 => {
             let allocation = shape
@@ -149,7 +166,7 @@ fn generated_input(dtype: DType, shape: &[u32], word: u64) -> TensorSpec {
                 .collect::<Vec<_>>();
             TensorSpec::broadcast(dtype, &allocation, shape)
         }
-        _ => {
+        2 => {
             let rank = shape.len();
             let shift = usize::try_from(word).unwrap_or(0) % rank;
             let mut axes = (0..rank)
@@ -164,6 +181,14 @@ fn generated_input(dtype: DType, shape: &[u32], word: u64) -> TensorSpec {
                 allocation[usize::from(input_axis)] = shape[output_axis];
             }
             TensorSpec::permuted(dtype, &allocation, &axes)
+        }
+        _ => {
+            let allocation = shape.iter().map(|extent| extent + 1).collect::<Vec<_>>();
+            let slices = shape
+                .iter()
+                .filter_map(|&extent| forja_core::Slice::new(1, extent, 1).ok())
+                .collect::<Vec<_>>();
+            TensorSpec::sliced(dtype, &allocation, &slices)
         }
     }
 }
