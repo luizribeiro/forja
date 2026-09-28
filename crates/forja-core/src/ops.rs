@@ -245,6 +245,60 @@ struct ProgramDispatch {
 }
 
 impl Dispatch {
+    pub(crate) fn new(op: Op, inputs: &[&Tensor], output: &Tensor) -> Result<Self, OpError> {
+        check_common(inputs, output)?;
+        match op {
+            Op::Program(_) => return Err(OpError::ProgramRequiresBinding),
+            Op::Copy => check_copy(inputs, output)?,
+            Op::Add | Op::SiluMul => check_binary(inputs, output)?,
+            Op::RmsNorm { eps } => check_rms_norm(inputs, output, eps)?,
+            Op::Softmax => check_softmax(inputs, output)?,
+            Op::Rope { theta } => check_rope(inputs, output, theta)?,
+            Op::Embed => check_embed(inputs, output)?,
+            Op::Matmul => check_matmul(inputs, output)?,
+            Op::Sdpa {
+                scale,
+                causal,
+                q_start,
+            } => check_sdpa(inputs, output, scale, causal, q_start)?,
+        }
+        Ok(Self {
+            op,
+            inputs: inputs.iter().map(|tensor| (*tensor).clone()).collect(),
+            output: output.clone(),
+            program: None,
+        })
+    }
+
+    pub(crate) fn kernel(
+        program: &Arc<PreparedProgram>,
+        inputs: &[&Tensor],
+        outputs: &[&Tensor],
+    ) -> Result<Self, OpError> {
+        let output = outputs
+            .first()
+            .copied()
+            .ok_or(OpError::ProgramBinding(BindError::NoOutputs))?;
+        check_common(inputs, output)?;
+        let bound =
+            bind_program(program.validated(), inputs, outputs).map_err(OpError::ProgramBinding)?;
+        check_kernel_signature(&bound, program.signature())?;
+        let output = bound
+            .outputs()
+            .first()
+            .cloned()
+            .ok_or(OpError::ProgramBinding(BindError::NoOutputs))?;
+        Ok(Self {
+            op: Op::Program(program.validated().content_hash()),
+            inputs: bound.inputs().to_vec(),
+            output,
+            program: Some(ProgramDispatch {
+                bound,
+                prepared: Arc::clone(program),
+            }),
+        })
+    }
+
     /// Returns the operation configuration.
     #[must_use]
     pub const fn op(&self) -> Op {
@@ -324,28 +378,8 @@ impl CommandList {
     ///
     /// Returns [`OpError`] for an invalid signature or unsafe aliasing.
     pub fn dispatch(&mut self, op: Op, inputs: &[&Tensor], output: &Tensor) -> Result<(), OpError> {
-        check_common(inputs, output)?;
-        match op {
-            Op::Program(_) => return Err(OpError::ProgramRequiresBinding),
-            Op::Copy => check_copy(inputs, output)?,
-            Op::Add | Op::SiluMul => check_binary(inputs, output)?,
-            Op::RmsNorm { eps } => check_rms_norm(inputs, output, eps)?,
-            Op::Softmax => check_softmax(inputs, output)?,
-            Op::Rope { theta } => check_rope(inputs, output, theta)?,
-            Op::Embed => check_embed(inputs, output)?,
-            Op::Matmul => check_matmul(inputs, output)?,
-            Op::Sdpa {
-                scale,
-                causal,
-                q_start,
-            } => check_sdpa(inputs, output, scale, causal, q_start)?,
-        }
-        self.dispatches.push(Dispatch {
-            op,
-            inputs: inputs.iter().map(|tensor| (*tensor).clone()).collect(),
-            output: output.clone(),
-            program: None,
-        });
+        let dispatch = Dispatch::new(op, inputs, output)?;
+        self.push_prevalidated(dispatch);
         Ok(())
     }
 
@@ -362,30 +396,14 @@ impl CommandList {
         outputs: &[&Tensor],
     ) -> Result<(), OpError> {
         let started = Instant::now();
-        let output = outputs
-            .first()
-            .copied()
-            .ok_or(OpError::ProgramBinding(BindError::NoOutputs))?;
-        check_common(inputs, output)?;
-        let bound =
-            bind_program(program.validated(), inputs, outputs).map_err(OpError::ProgramBinding)?;
-        check_kernel_signature(&bound, program.signature())?;
-        let output = bound
-            .outputs()
-            .first()
-            .cloned()
-            .ok_or(OpError::ProgramBinding(BindError::NoOutputs))?;
-        self.dispatches.push(Dispatch {
-            op: Op::Program(program.validated().content_hash()),
-            inputs: bound.inputs().to_vec(),
-            output,
-            program: Some(ProgramDispatch {
-                bound,
-                prepared: Arc::clone(program),
-            }),
-        });
+        let dispatch = Dispatch::kernel(program, inputs, outputs)?;
+        self.push_prevalidated(dispatch);
         self.record_program(started);
         Ok(())
+    }
+
+    pub(crate) fn push_prevalidated(&mut self, dispatch: Dispatch) {
+        self.dispatches.push(dispatch);
     }
 
     fn record_program(&mut self, started: Instant) {

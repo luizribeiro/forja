@@ -134,7 +134,7 @@ impl ParamSpace {
         })
     }
 
-    fn corners(&self) -> Vec<ParamValues> {
+    pub(crate) fn corners(&self) -> Vec<ParamValues> {
         let count = 1_usize << self.ranges.len();
         (0..count)
             .map(|corner| ParamValues {
@@ -165,6 +165,10 @@ impl ParamSpace {
                 .collect(),
         }
     }
+
+    pub(crate) fn contains_values(&self, values: &ParamValues) -> bool {
+        self.id == values.space_id
+    }
 }
 
 /// Concrete parameter values checked against their originating space.
@@ -179,10 +183,6 @@ impl ParamValues {
     #[must_use]
     pub fn as_slice(&self) -> &[u32] {
         &self.values
-    }
-
-    fn space_id(&self) -> u64 {
-        self.space_id
     }
 }
 
@@ -430,7 +430,7 @@ impl SymbolicLayout {
     /// Returns [`SymbolicLayoutError`] when values belong to another space, affine
     /// evaluation fails, or any concrete layout operation refuses the result.
     pub fn instantiate(&self, values: &ParamValues) -> Result<Layout, SymbolicLayoutError> {
-        if values.space_id() != self.space.id {
+        if !self.space.contains_values(values) {
             return Err(SymbolicLayoutError::ParameterSpaceMismatch);
         }
         self.recipe
