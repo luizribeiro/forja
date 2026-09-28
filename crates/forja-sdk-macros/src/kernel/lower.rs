@@ -354,31 +354,84 @@ impl Lowerer {
         }
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "all Rust binary operators are diagnosed from one type-directed table"
+    )]
     fn lower_binary(&mut self, binary: &ExprBinary) -> syn::Result<Value> {
         let left = self.lower_expr(&binary.left)?;
         let right = self.lower_expr(&binary.right)?;
-        if left.ty != ValueType::F32 || right.ty != ValueType::F32 {
-            return Err(type_mismatch(binary.op.span(), ValueType::F32, right.ty));
-        }
-        let operator = match binary.op {
-            BinOp::Add(_) => quote!(+),
-            BinOp::Sub(_) => quote!(-),
-            BinOp::Mul(_) => quote!(*),
-            BinOp::Div(_) => quote!(/),
-            _ => {
-                return Err(kernel_error(
-                    binary.op,
-                    "operator is not supported in this kernel subset",
-                ));
+        match binary.op {
+            BinOp::Add(_) | BinOp::Sub(_) | BinOp::Mul(_) => {
+                if left.ty == ValueType::U32 && right.ty == ValueType::U32 {
+                    let method = match binary.op {
+                        BinOp::Add(_) => "wrapping_add",
+                        BinOp::Sub(_) => "wrapping_sub",
+                        BinOp::Mul(_) => "wrapping_mul",
+                        _ => {
+                            return Err(kernel_error(
+                                binary.op,
+                                "operator is not supported in this kernel subset",
+                            ));
+                        }
+                    };
+                    return Err(kernel_error(
+                        binary.op,
+                        format!(
+                            "u32 `{}` is not allowed; use `{method}` for explicit wrapping semantics",
+                            binary_operator(&binary.op)
+                        ),
+                    ));
+                }
+                require_same_numeric(binary, &left, &right)?;
+                let left = left.ident;
+                let right = right.ident;
+                let operator = &binary.op;
+                Ok(self.emit(
+                    quote!(#left #operator #right),
+                    ValueType::F32,
+                    binary.span(),
+                ))
             }
-        };
-        let left = left.ident;
-        let right = right.ident;
-        Ok(self.emit(
-            quote!(#left #operator #right),
-            ValueType::F32,
-            binary.span(),
-        ))
+            BinOp::Div(_) => {
+                if left.ty == ValueType::U32 && right.ty == ValueType::U32 {
+                    return Err(kernel_error(
+                        binary.op,
+                        "integer division is not supported by the IR; convert with `as f32` and use `(a / b).floor()`",
+                    ));
+                }
+                require_same_numeric(binary, &left, &right)?;
+                let left = left.ident;
+                let right = right.ident;
+                Ok(self.emit(quote!(#left / #right), ValueType::F32, binary.span()))
+            }
+            BinOp::Rem(_) => Err(kernel_error(
+                binary.op,
+                "remainder `%` is not supported; write `a - (a / b).floor() * b` on f32",
+            )),
+            BinOp::Lt(_)
+            | BinOp::Le(_)
+            | BinOp::Eq(_)
+            | BinOp::Ne(_)
+            | BinOp::Ge(_)
+            | BinOp::Gt(_) => {
+                require_same_comparable(binary, &left, &right)?;
+                let method = comparison_method(&binary.op).ok_or_else(|| {
+                    kernel_error(binary.op, "operator is not supported in this kernel subset")
+                })?;
+                let left = left.ident;
+                let right = right.ident;
+                Ok(self.emit(
+                    quote!(#left.#method(#right)),
+                    ValueType::Bool,
+                    binary.span(),
+                ))
+            }
+            _ => Err(kernel_error(
+                binary.op,
+                "operator is not supported in this kernel subset",
+            )),
+        }
     }
 
     fn lower_method(&mut self, call: &ExprMethodCall) -> syn::Result<Value> {
@@ -522,6 +575,21 @@ impl Lowerer {
                 let product = product.ident;
                 Ok(self.emit(quote!(#product.exp()), ValueType::F32, call.span()))
             }
+            (
+                ValueType::U32,
+                "wrapping_add" | "wrapping_sub" | "wrapping_mul" | "min" | "max",
+                [argument],
+            ) => {
+                require_type(argument, ValueType::U32)?;
+                let receiver = receiver.ident;
+                let argument = &argument.ident;
+                let method = &call.method;
+                Ok(self.emit(
+                    quote!(#receiver.#method(#argument)),
+                    ValueType::U32,
+                    call.span(),
+                ))
+            }
             _ => Err(unknown_method(&call.method, receiver.ty)),
         }
     }
@@ -610,6 +678,9 @@ fn method_arity(name: &str, ty: ValueType) -> Option<usize> {
         ) => Some(0),
         (ValueType::F32, "maximum" | "minimum" | "powf" | "powi") => Some(1),
         (ValueType::F32, "clamp") => Some(2),
+        (ValueType::U32, "wrapping_add" | "wrapping_sub" | "wrapping_mul" | "min" | "max") => {
+            Some(1)
+        }
         _ => None,
     }
 }
@@ -672,6 +743,55 @@ fn value_type(ty: &Type) -> Option<ValueType> {
     }
 }
 
+fn require_same_numeric(binary: &ExprBinary, left: &Value, right: &Value) -> syn::Result<()> {
+    if left.ty == ValueType::F32 && right.ty == ValueType::F32 {
+        return Ok(());
+    }
+    if left.ty == ValueType::F32 && right.ty == ValueType::U32 {
+        return Err(f32_integer_mismatch(&binary.right, right.span));
+    }
+    if left.ty == ValueType::U32 && right.ty == ValueType::F32 {
+        return Err(f32_integer_mismatch(&binary.left, left.span));
+    }
+    Err(type_mismatch(binary.op.span(), ValueType::F32, right.ty))
+}
+
+fn require_same_comparable(binary: &ExprBinary, left: &Value, right: &Value) -> syn::Result<()> {
+    if left.ty == right.ty && matches!(left.ty, ValueType::F32 | ValueType::U32) {
+        return Ok(());
+    }
+    if left.ty == ValueType::F32 && right.ty == ValueType::U32 {
+        return Err(f32_integer_mismatch(&binary.right, right.span));
+    }
+    if left.ty == ValueType::U32 && right.ty == ValueType::F32 {
+        return Err(f32_integer_mismatch(&binary.left, left.span));
+    }
+    Err(type_mismatch(binary.op.span(), left.ty, right.ty))
+}
+
+fn f32_integer_mismatch(expression: &Expr, fallback: Span) -> syn::Error {
+    if let Some(literal) = integer_literal(expression) {
+        kernel_error(
+            literal,
+            format!("integer literal `{literal}` in an f32 expression; write `{literal}.0`"),
+        )
+    } else {
+        type_mismatch(fallback, ValueType::F32, ValueType::U32)
+    }
+}
+
+fn integer_literal(expression: &Expr) -> Option<&syn::LitInt> {
+    match expression {
+        Expr::Lit(literal) => match &literal.lit {
+            Lit::Int(value) => Some(value),
+            _ => None,
+        },
+        Expr::Paren(paren) => integer_literal(&paren.expr),
+        Expr::Group(group) => integer_literal(&group.expr),
+        _ => None,
+    }
+}
+
 fn require_type(value: &Value, expected: ValueType) -> syn::Result<()> {
     if value.ty == expected {
         Ok(())
@@ -681,10 +801,10 @@ fn require_type(value: &Value, expected: ValueType) -> syn::Result<()> {
 }
 
 fn type_mismatch(span: impl Spanned, expected: ValueType, found: ValueType) -> syn::Error {
-    let help = if expected == ValueType::F32 && found == ValueType::U32 {
-        "; add `as f32`"
-    } else {
-        ""
+    let help = match (expected, found) {
+        (ValueType::F32, ValueType::U32) => "; add `as f32`",
+        (ValueType::U32, ValueType::F32) => "; use an integer literal or `as u32`",
+        _ => "",
     };
     kernel_error(
         span,
@@ -694,6 +814,28 @@ fn type_mismatch(span: impl Spanned, expected: ValueType, found: ValueType) -> s
             found.name()
         ),
     )
+}
+
+fn comparison_method(operator: &BinOp) -> Option<Ident> {
+    let name = match operator {
+        BinOp::Lt(_) => "lt",
+        BinOp::Le(_) => "le",
+        BinOp::Eq(_) => "equal",
+        BinOp::Ne(_) => "not_equal",
+        BinOp::Ge(_) => "ge",
+        BinOp::Gt(_) => "gt",
+        _ => return None,
+    };
+    Some(format_ident!("{name}"))
+}
+
+fn binary_operator(operator: &BinOp) -> &'static str {
+    match operator {
+        BinOp::Add(_) => "+",
+        BinOp::Sub(_) => "-",
+        BinOp::Mul(_) => "*",
+        _ => "?",
+    }
 }
 
 fn unknown_method(method: &Ident, ty: ValueType) -> syn::Error {

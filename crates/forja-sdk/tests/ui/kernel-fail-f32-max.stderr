@@ -1,0 +1,5 @@
+error: kernel: `.max(b)` on f32 is not supported; use `f32::maximum` for NaN-propagating semantics
+ --> tests/ui/kernel-fail-f32-max.rs:3:7
+  |
+3 |     x.max(0.0)
+  |       ^^^

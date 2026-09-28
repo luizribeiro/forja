@@ -1,0 +1,5 @@
+error: kernel: mismatched types: expected `u32`, found `f32`; use an integer literal or `as u32`
+ --> tests/ui/kernel-fail-mismatched-u32.rs:3:16
+  |
+3 |     let count: u32 = x;
+  |                ^^^

@@ -1,0 +1,5 @@
+error: kernel: integer division is not supported by the IR; convert with `as f32` and use `(a / b).floor()`
+ --> tests/ui/kernel-fail-integer-division.rs:6:9
+  |
+6 |     ids / 2
+  |         ^

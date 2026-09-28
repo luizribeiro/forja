@@ -1,0 +1,5 @@
+error: kernel: integer literal `2` in an f32 expression; write `2.0`
+ --> tests/ui/kernel-fail-integer-literal.rs:3:9
+  |
+3 |     x + 2
+  |         ^

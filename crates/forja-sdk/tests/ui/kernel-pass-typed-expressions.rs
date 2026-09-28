@@ -8,10 +8,10 @@ fn typed_expressions(
     ids: forja_sdk::kernel::Elem<u32>,
     limit: u32,
 ) -> forja_sdk::kernel::Elem {
-    let integer: u32 = 2;
-    let boolean: bool = true;
-    let tensor_value: u32 = ids;
-    let scalar_value: u32 = limit;
+    let wrapped: u32 = ids.wrapping_add(2).wrapping_mul(3).wrapping_sub(1);
+    let bounded = wrapped.min(limit).max(1);
+    let in_range: bool = bounded < limit;
+    let equal: bool = ids == 0;
     x + OFFSET
 }
 

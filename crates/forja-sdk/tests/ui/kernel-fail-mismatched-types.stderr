@@ -1,0 +1,5 @@
+error: kernel: mismatched types: expected `f32`, found `u32`; add `as f32`
+ --> tests/ui/kernel-fail-mismatched-types.rs:3:9
+  |
+3 |     x + count
+  |         ^^^^^

@@ -1,0 +1,5 @@
+error: kernel: u32 `+` is not allowed; use `wrapping_add` for explicit wrapping semantics
+ --> tests/ui/kernel-fail-u32-add.rs:6:9
+  |
+6 |     ids + 1
+  |         ^

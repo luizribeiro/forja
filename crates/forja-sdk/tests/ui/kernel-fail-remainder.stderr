@@ -1,0 +1,5 @@
+error: kernel: remainder `%` is not supported; write `a - (a / b).floor() * b` on f32
+ --> tests/ui/kernel-fail-remainder.rs:3:7
+  |
+3 |     x % 1.0
+  |       ^
