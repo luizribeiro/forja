@@ -37,6 +37,10 @@ float load_float(device const uchar *buffer, ulong index, uint dtype) {
     return float(*reinterpret_cast<device const bfloat *>(buffer + index * 2));
 }
 
+uint load_uint(device const uchar *buffer, ulong index) {
+    return reinterpret_cast<device const uint *>(buffer)[index];
+}
+
 void store_float(device uchar *buffer, ulong index, uint dtype, float value) {
     if (dtype == 0) {
         *reinterpret_cast<device float *>(buffer + index * 4) = value;
