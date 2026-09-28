@@ -25,9 +25,16 @@ pub(crate) fn record(
 
 pub(crate) fn record_program(
     program: sys::Program,
+    rank: u8,
+    input_dtypes: &[sys::DType],
+    output_dtypes: &[sys::DType],
     inputs: &[&sys::Handle],
     outputs: &[&sys::Handle],
 ) -> Result<()> {
+    #[cfg(not(target_family = "wasm"))]
+    let kernel = sys::create_kernel(program, rank, input_dtypes, output_dtypes)?;
+    #[cfg(target_family = "wasm")]
+    let _ = (rank, input_dtypes, output_dtypes);
     CURRENT.with(|current| {
         let mut current = current.borrow_mut();
         if current.is_none() {
@@ -36,7 +43,10 @@ pub(crate) fn record_program(
         let commands = current
             .as_mut()
             .ok_or_else(|| crate::Error::new("current graph was not initialized"))?;
-        sys::dispatch_program(commands, program, inputs, outputs)
+        #[cfg(target_family = "wasm")]
+        return sys::dispatch_program(commands, program, inputs, outputs);
+        #[cfg(not(target_family = "wasm"))]
+        sys::dispatch_kernel(commands, &kernel, inputs, outputs)
     })
 }
 

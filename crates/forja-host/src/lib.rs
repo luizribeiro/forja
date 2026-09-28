@@ -22,15 +22,16 @@ use forja_core::{
     Backend, BackendError, CommandList, DType, Layout, LayoutError, Op, OpError, Slice, Submission,
     SubmissionProfile, Tensor, ViewOp,
     program::{
-        BinOp, Inst, MAX_INSTRUCTIONS, MAX_OUTPUTS, Program, ProgramError, ProgramKind, RedOp,
-        UnOp, ValidatedProgram, ValueType,
+        BinOp, Inst, KernelSignature, MAX_INSTRUCTIONS, MAX_OUTPUTS, PrepareError, PreparedProgram,
+        Program, ProgramError, ProgramKind, RedOp, UnOp, ValidatedProgram, ValueType,
+        prepare_program,
     },
 };
 use wasmtime::component::{Accessor, Component, HasData, Linker, Resource, ResourceTable};
 use wasmtime::{Config, Engine, Store, StoreLimits, StoreLimitsBuilder, Trap};
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
-pub use native::{NativeCommandList, NativeHost, NativeTensor};
+pub use native::{NativeCommandList, NativeHost, NativeKernel, NativeTensor};
 pub use weights::{Safetensors, WeightError, WeightSource, WeightTensor};
 
 /// Host bindings for the guest-facing compute interface.
@@ -43,6 +44,7 @@ pub mod bindings {
         require_store_data_send: true,
         with: {
             "l9o:gpu/compute.tensor": crate::TensorEntry,
+            "l9o:gpu/compute.kernel": crate::KernelEntry,
             "l9o:gpu/compute.command-list": crate::CommandListEntry,
             "l9o:gpu/compute.weights": crate::WeightsEntry,
         },
@@ -797,6 +799,12 @@ pub struct WeightsEntry {
     buffer: Arc<BufferHandle>,
 }
 
+/// Host-owned state behind a guest kernel resource.
+#[derive(Clone, Debug)]
+pub struct KernelEntry {
+    program: Arc<PreparedProgram>,
+}
+
 /// Host-owned state behind a guest command-list resource.
 #[derive(Debug)]
 pub struct CommandListEntry {
@@ -1156,6 +1164,27 @@ impl<B: Backend> Host<B> {
             .map_err(invalid_handle)
     }
 
+    fn create_kernel(
+        &mut self,
+        source: compute::ProgramSource,
+        signature: compute::KernelSignature,
+    ) -> Result<Resource<KernelEntry>, compute::Error> {
+        let validated = core_program(source)?;
+        let signature = core_kernel_signature(signature);
+        let program =
+            prepare_program(self.backend.as_ref(), validated, signature).map_err(prepare_error)?;
+        self.table
+            .push(KernelEntry { program })
+            .map_err(invalid_handle)
+    }
+
+    fn drop_kernel(&mut self, resource: Resource<KernelEntry>) -> Result<(), compute::Error> {
+        self.table
+            .delete(resource)
+            .map(|_| ())
+            .map_err(invalid_handle)
+    }
+
     /// Validates and records one trusted operation.
     ///
     /// # Errors
@@ -1194,7 +1223,7 @@ impl<B: Backend> Host<B> {
         Ok(())
     }
 
-    /// Validates and records one guest-authored scalar program.
+    /// Validates and records one guest-authored scalar program by value.
     ///
     /// # Errors
     ///
@@ -1202,7 +1231,7 @@ impl<B: Backend> Host<B> {
     pub fn dispatch_program(
         &mut self,
         commands: &Resource<CommandListEntry>,
-        program: compute::Program,
+        program: compute::ProgramSource,
         inputs: &[Resource<TensorEntry>],
         outputs: &[Resource<TensorEntry>],
     ) -> Result<(), compute::Error> {
@@ -1232,6 +1261,50 @@ impl<B: Backend> Host<B> {
         entry
             .commands
             .dispatch_program(&program, &input_tensors, &output_tensors)
+            .map_err(guest_error)?;
+        entry.retained.extend(input_entries);
+        entry.retained.extend(output_entries);
+        Ok(())
+    }
+
+    /// Validates and records one guest-authored scalar program.
+    ///
+    /// # Errors
+    ///
+    /// Returns an operation, quota, or invalid-handle error before recording invalid work.
+    pub fn dispatch_kernel(
+        &mut self,
+        commands: &Resource<CommandListEntry>,
+        kernel: &Resource<KernelEntry>,
+        inputs: &[Resource<TensorEntry>],
+        outputs: &[Resource<TensorEntry>],
+    ) -> Result<(), compute::Error> {
+        let input_entries = inputs
+            .iter()
+            .map(|resource| self.entry(resource).cloned())
+            .collect::<Result<Vec<_>, _>>()?;
+        let output_entries = outputs
+            .iter()
+            .map(|resource| self.entry(resource).cloned())
+            .collect::<Result<Vec<_>, _>>()?;
+        let program = Arc::clone(&self.table.get(kernel).map_err(invalid_handle)?.program);
+        let entry = self.table.get(commands).map_err(invalid_handle)?;
+        if entry.commands.len() >= self.limits.dispatches_per_list {
+            return Err(quota("command list dispatch count exceeds the guest limit"));
+        }
+        let input_tensors = input_entries
+            .iter()
+            .map(|entry| &entry.tensor)
+            .collect::<Vec<_>>();
+        let output_tensors = output_entries
+            .iter()
+            .map(|entry| &entry.tensor)
+            .collect::<Vec<_>>();
+        self.check_program_work(program.validated(), &input_tensors, &output_tensors)?;
+        let entry = self.table.get_mut(commands).map_err(invalid_handle)?;
+        entry
+            .commands
+            .dispatch_kernel(&program, &input_tensors, &output_tensors)
             .map_err(guest_error)?;
         entry.retained.extend(input_entries);
         entry.retained.extend(output_entries);
@@ -1681,10 +1754,23 @@ where
         )))
     }
 
+    fn dispatch_kernel(
+        &mut self,
+        resource: Resource<CommandListEntry>,
+        kernel: Resource<KernelEntry>,
+        inputs: Vec<Resource<TensorEntry>>,
+        outputs: Vec<Resource<TensorEntry>>,
+    ) -> impl Future<Output = wasmtime::Result<Result<(), compute::Error>>> + Send {
+        let _timer = self.import_timer(ImportKind::Dispatch);
+        std::future::ready(Ok(Host::dispatch_kernel(
+            self, &resource, &kernel, &inputs, &outputs,
+        )))
+    }
+
     fn dispatch_program(
         &mut self,
         resource: Resource<CommandListEntry>,
-        program: compute::Program,
+        program: compute::ProgramSource,
         inputs: Vec<Resource<TensorEntry>>,
         outputs: Vec<Resource<TensorEntry>>,
     ) -> impl Future<Output = wasmtime::Result<Result<(), compute::Error>>> + Send {
@@ -1703,6 +1789,27 @@ where
             self.drop_command_list(resource)
                 .map_err(wasmtime::Error::msg),
         )
+    }
+}
+
+impl<B> compute::HostKernel for Host<B>
+where
+    B: Backend + Send + Sync + 'static,
+{
+    fn create(
+        &mut self,
+        source: compute::ProgramSource,
+        signature: compute::KernelSignature,
+    ) -> impl Future<Output = wasmtime::Result<Result<Resource<KernelEntry>, compute::Error>>> + Send
+    {
+        std::future::ready(Ok(self.create_kernel(source, signature)))
+    }
+
+    fn drop(
+        &mut self,
+        resource: Resource<KernelEntry>,
+    ) -> impl Future<Output = wasmtime::Result<()>> + Send {
+        std::future::ready(self.drop_kernel(resource).map_err(wasmtime::Error::msg))
     }
 }
 
@@ -1901,7 +2008,7 @@ fn core_op(operation: compute::Op) -> Op {
     }
 }
 
-fn core_program(program: compute::Program) -> Result<ValidatedProgram, compute::Error> {
+fn core_program(program: compute::ProgramSource) -> Result<ValidatedProgram, compute::Error> {
     if program.insts.len() > MAX_INSTRUCTIONS {
         return Err(program_error(&ProgramError::TooManyInstructions));
     }
@@ -1918,6 +2025,22 @@ fn core_program(program: compute::Program) -> Result<ValidatedProgram, compute::
     }
     .validate()
     .map_err(|error| program_error(&error))
+}
+
+fn core_kernel_signature(signature: compute::KernelSignature) -> KernelSignature {
+    KernelSignature::new(
+        signature.rank,
+        signature.inputs.into_iter().map(core_dtype).collect(),
+        signature.outputs.into_iter().map(core_dtype).collect(),
+        signature.scalars,
+    )
+}
+
+fn prepare_error(error: PrepareError) -> compute::Error {
+    match error {
+        PrepareError::Backend(error) => guest_error(error),
+        error => compute::Error::OpSignature(error.to_string()),
+    }
 }
 
 fn core_inst(instruction: compute::Inst) -> Inst {
@@ -2137,25 +2260,39 @@ mod tests {
     const GENEROUS: Limits = Limits::new(u64::MAX, 8, u64::MAX, 32, u64::MAX);
     static NEXT_WEIGHT_FILE: AtomicU64 = AtomicU64::new(0);
 
+    fn doubling_program(value: f32) -> compute::ProgramSource {
+        compute::ProgramSource {
+            kind: compute::ProgramKind::Map,
+            insts: vec![
+                compute::Inst::Input(0),
+                compute::Inst::Const(value),
+                compute::Inst::Binary((compute::Binop::Mul, 0, 1)),
+            ],
+            outputs: vec![(0, 2)],
+        }
+    }
+
+    fn unary_f32_signature(rank: u8) -> compute::KernelSignature {
+        compute::KernelSignature {
+            rank,
+            inputs: vec![compute::Dtype::F32],
+            outputs: vec![compute::Dtype::F32],
+            scalars: 0,
+        }
+    }
+
     #[test]
     fn converts_and_records_wit_programs() {
         let mut host = Host::new(CpuBackend::new(), GENEROUS);
         let input = host.alloc(compute::Dtype::F32, &[7]).unwrap();
         let output = host.alloc(compute::Dtype::F32, &[7]).unwrap();
         let commands = host.command_list().unwrap();
-        let program = compute::Program {
-            kind: compute::ProgramKind::Map,
-            insts: vec![
-                compute::Inst::Input(0),
-                compute::Inst::Const(2.0),
-                compute::Inst::Binary((compute::Binop::Mul, 0, 1)),
-            ],
-            outputs: vec![(0, 2)],
-        };
+        let program = doubling_program(2.0);
 
-        host.dispatch_program(
+        let kernel = host.create_kernel(program, unary_f32_signature(1)).unwrap();
+        host.dispatch_kernel(
             &Resource::new_borrow(commands.rep()),
-            program,
+            &kernel,
             &[Resource::new_borrow(input.rep())],
             &[Resource::new_borrow(output.rep())],
         )
@@ -2174,8 +2311,58 @@ mod tests {
     }
 
     #[test]
+    fn kernel_dispatch_refuses_signature_mismatches() {
+        let mut host = Host::new(CpuBackend::new(), GENEROUS);
+        let input = host.alloc(compute::Dtype::F32, &[7]).unwrap();
+        let output = host.alloc(compute::Dtype::F32, &[7]).unwrap();
+        let kernel = host
+            .create_kernel(doubling_program(2.0), unary_f32_signature(2))
+            .unwrap();
+        let commands = host.command_list().unwrap();
+
+        assert!(matches!(
+            host.dispatch_kernel(&commands, &kernel, &[input], &[output]),
+            Err(compute::Error::OpSignature(_))
+        ));
+        assert!(host.table.get(&commands).unwrap().commands.is_empty());
+    }
+
+    #[test]
+    fn kernel_creation_refuses_reserved_scalars() {
+        let mut host = Host::new(CpuBackend::new(), GENEROUS);
+        let mut signature = unary_f32_signature(1);
+        signature.scalars = 1;
+        assert!(matches!(
+            host.create_kernel(doubling_program(2.0), signature),
+            Err(compute::Error::OpSignature(_))
+        ));
+    }
+
+    #[test]
+    fn kernel_from_another_store_is_invalid() {
+        let mut first = Host::new(CpuBackend::new(), GENEROUS);
+        let kernel = first
+            .create_kernel(doubling_program(2.0), unary_f32_signature(1))
+            .unwrap();
+        let mut second = Host::new(CpuBackend::new(), GENEROUS);
+        let input = second.alloc(compute::Dtype::F32, &[7]).unwrap();
+        let output = second.alloc(compute::Dtype::F32, &[7]).unwrap();
+        let commands = second.command_list().unwrap();
+
+        assert!(matches!(
+            second.dispatch_kernel(
+                &commands,
+                &Resource::new_borrow(kernel.rep()),
+                &[input],
+                &[output],
+            ),
+            Err(compute::Error::InvalidHandle(_))
+        ));
+    }
+
+    #[test]
     fn program_validation_errors_name_the_instruction() {
-        let error = core_program(compute::Program {
+        let error = core_program(compute::ProgramSource {
             kind: compute::ProgramKind::Map,
             insts: vec![
                 compute::Inst::Const(1.0),
@@ -2194,7 +2381,7 @@ mod tests {
     #[test]
     fn refuses_oversized_wit_lists_before_conversion() {
         let instructions = vec![compute::Inst::Const(1.0); MAX_INSTRUCTIONS + 1];
-        let error = core_program(compute::Program {
+        let error = core_program(compute::ProgramSource {
             kind: compute::ProgramKind::Map,
             insts: instructions,
             outputs: vec![(0, 0)],
@@ -2204,7 +2391,7 @@ mod tests {
             matches!(error, compute::Error::OpSignature(message) if message.contains("TooManyInstructions"))
         );
 
-        let error = core_program(compute::Program {
+        let error = core_program(compute::ProgramSource {
             kind: compute::ProgramKind::Map,
             insts: vec![compute::Inst::Const(1.0)],
             outputs: vec![(0, 0); MAX_OUTPUTS + 1],
@@ -2217,7 +2404,7 @@ mod tests {
 
     #[test]
     fn invalid_output_errors_name_the_instruction() {
-        let error = core_program(compute::Program {
+        let error = core_program(compute::ProgramSource {
             kind: compute::ProgramKind::Map,
             insts: vec![compute::Inst::Const(1.0)],
             outputs: vec![(0, 7)],
@@ -2717,16 +2904,24 @@ mod tests {
         }
 
         assert!(matches!(
-            host.dispatch_program(
-                &commands,
-                compute::Program {
-                    kind: compute::ProgramKind::Map,
-                    insts,
-                    outputs: vec![(0, 255)],
-                },
-                &[input],
-                &[output],
-            ),
+            {
+                let kernel = host
+                    .create_kernel(
+                        compute::ProgramSource {
+                            kind: compute::ProgramKind::Map,
+                            insts,
+                            outputs: vec![(0, 255)],
+                        },
+                        compute::KernelSignature {
+                            rank: 1,
+                            inputs: vec![compute::Dtype::F32],
+                            outputs: vec![compute::Dtype::F32],
+                            scalars: 0,
+                        },
+                    )
+                    .unwrap();
+                host.dispatch_kernel(&commands, &kernel, &[input], &[output])
+            },
             Err(compute::Error::Quota(_))
         ));
         assert!(host.table.get(&commands).unwrap().commands.is_empty());

@@ -92,10 +92,17 @@ interface compute {
     reduce(tuple<redop, u32>),
   }
 
-  record program {
+  record program-source {
     kind: program-kind,
     insts: list<inst>,
     outputs: list<tuple<u32, u32>>,
+  }
+
+  record kernel-signature {
+    rank: u8,
+    inputs: list<dtype>,
+    outputs: list<dtype>,
+    scalars: u8,
   }
 
   variant op {
@@ -136,10 +143,15 @@ interface compute {
     names: func() -> list<string>;
   }
 
+  resource kernel {
+    create: static func(src: program-source, sig: kernel-signature) -> result<kernel, error>;
+  }
+
   resource command-list {
     constructor();
     dispatch: func(operation: op, ins: list<borrow<tensor>>, out: borrow<tensor>) -> result<_, error>;
-    dispatch-program: func(program: program, ins: list<borrow<tensor>>, outs: list<borrow<tensor>>) -> result<_, error>;
+    dispatch-program: func(program: program-source, ins: list<borrow<tensor>>, outs: list<borrow<tensor>>) -> result<_, error>;
+    dispatch-kernel: func(k: borrow<kernel>, ins: list<borrow<tensor>>, outs: list<borrow<tensor>>) -> result<_, error>;
   }
 
   submit: async func(cmds: command-list) -> result<option<u64>, error>;

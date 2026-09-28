@@ -9,7 +9,7 @@
 use crate::program::{BinaryOp, ProgramKind, ReduceOp, UnaryOp};
 use crate::{Error, Result};
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub(crate) enum DType {
     F32,
     F16,
@@ -48,6 +48,7 @@ pub(crate) enum Op {
     },
 }
 
+#[derive(Clone)]
 pub(crate) struct Program {
     pub(crate) kind: ProgramKind,
     pub(crate) instructions: Vec<ProgramInst>,
@@ -70,6 +71,7 @@ pub(crate) enum ProgramInst {
 pub(crate) trait Backend {
     type Tensor;
     type Commands;
+    type Kernel;
 
     fn alloc(dtype: DType, shape: &[u32]) -> Result<Self::Tensor>;
     fn write(tensor: &Self::Tensor, bytes: &[u8]) -> Result<()>;
@@ -82,9 +84,22 @@ pub(crate) trait Backend {
         inputs: &[&Self::Tensor],
         output: &Self::Tensor,
     ) -> Result<()>;
+    #[cfg(target_family = "wasm")]
     fn dispatch_program(
         commands: &mut Self::Commands,
         program: Program,
+        inputs: &[&Self::Tensor],
+        outputs: &[&Self::Tensor],
+    ) -> Result<()>;
+    fn create_kernel(
+        program: Program,
+        rank: u8,
+        inputs: &[DType],
+        outputs: &[DType],
+    ) -> Result<Self::Kernel>;
+    fn dispatch_kernel(
+        commands: &mut Self::Commands,
+        kernel: &Self::Kernel,
         inputs: &[&Self::Tensor],
         outputs: &[&Self::Tensor],
     ) -> Result<()>;
@@ -145,6 +160,7 @@ pub(crate) mod guest {
     impl Backend for Guest {
         type Tensor = compute::Tensor;
         type Commands = compute::CommandList;
+        type Kernel = compute::Kernel;
 
         fn alloc(dtype: DType, shape: &[u32]) -> Result<Self::Tensor> {
             compute::Tensor::alloc(wit_dtype(dtype), shape).map_err(|error| guest_error(&error))
@@ -179,15 +195,44 @@ pub(crate) mod guest {
                 .map_err(|error| guest_error(&error))
         }
 
+        #[cfg(target_family = "wasm")]
         fn dispatch_program(
             commands: &mut Self::Commands,
             program: Program,
             inputs: &[&Self::Tensor],
             outputs: &[&Self::Tensor],
         ) -> Result<()> {
-            let program = wit_program(program);
             commands
-                .dispatch_program(&program, inputs, outputs)
+                .dispatch_program(&wit_program(program), inputs, outputs)
+                .map_err(|error| guest_error(&error))
+        }
+
+        fn create_kernel(
+            program: Program,
+            rank: u8,
+            inputs: &[DType],
+            outputs: &[DType],
+        ) -> Result<Self::Kernel> {
+            compute::Kernel::create(
+                &wit_program(program),
+                &compute::KernelSignature {
+                    rank,
+                    inputs: inputs.iter().copied().map(wit_dtype).collect(),
+                    outputs: outputs.iter().copied().map(wit_dtype).collect(),
+                    scalars: 0,
+                },
+            )
+            .map_err(|error| guest_error(&error))
+        }
+
+        fn dispatch_kernel(
+            commands: &mut Self::Commands,
+            kernel: &Self::Kernel,
+            inputs: &[&Self::Tensor],
+            outputs: &[&Self::Tensor],
+        ) -> Result<()> {
+            commands
+                .dispatch_kernel(kernel, inputs, outputs)
                 .map_err(|error| guest_error(&error))
         }
 
@@ -248,8 +293,8 @@ pub(crate) mod guest {
         }
     }
 
-    fn wit_program(program: Program) -> compute::Program {
-        compute::Program {
+    fn wit_program(program: Program) -> compute::ProgramSource {
+        compute::ProgramSource {
             kind: match program.kind {
                 ProgramKind::Map => compute::ProgramKind::Map,
                 ProgramKind::Row => compute::ProgramKind::Row,
@@ -297,6 +342,7 @@ pub(crate) mod unavailable {
 
     pub(crate) enum UnavailableTensor {}
     pub(crate) enum UnavailableCommands {}
+    pub(crate) enum UnavailableKernel {}
 
     pub(crate) struct Unavailable;
     pub(crate) struct WeightSource;
@@ -315,6 +361,7 @@ pub(crate) mod unavailable {
     impl Backend for Unavailable {
         type Tensor = UnavailableTensor;
         type Commands = UnavailableCommands;
+        type Kernel = UnavailableKernel;
 
         fn alloc(_dtype: DType, _shape: &[u32]) -> Result<Self::Tensor> {
             Err(error())
@@ -345,9 +392,28 @@ pub(crate) mod unavailable {
             Err(error())
         }
 
+        #[cfg(target_family = "wasm")]
         fn dispatch_program(
             _commands: &mut Self::Commands,
             _program: Program,
+            _inputs: &[&Self::Tensor],
+            _outputs: &[&Self::Tensor],
+        ) -> Result<()> {
+            Err(error())
+        }
+
+        fn create_kernel(
+            _program: Program,
+            _rank: u8,
+            _inputs: &[DType],
+            _outputs: &[DType],
+        ) -> Result<Self::Kernel> {
+            Err(error())
+        }
+
+        fn dispatch_kernel(
+            _commands: &mut Self::Commands,
+            _kernel: &Self::Kernel,
             _inputs: &[&Self::Tensor],
             _outputs: &[&Self::Tensor],
         ) -> Result<()> {
@@ -375,7 +441,9 @@ pub(crate) mod native {
             ValueType as CoreValueType,
         },
     };
-    use forja_host::{NativeCommandList, NativeHost, NativeTensor, Safetensors, WeightSource as _};
+    use forja_host::{
+        NativeCommandList, NativeHost, NativeKernel, NativeTensor, Safetensors, WeightSource as _,
+    };
 
     use super::{Backend, DType, Error, Op, Program, ProgramInst, Result, View};
     use crate::NativeDevice;
@@ -384,12 +452,15 @@ pub(crate) mod native {
     type CpuBackend = forja_cpu::CpuBackend;
     type CpuTensor = NativeTensor<CpuBackend>;
     type CpuCommands = NativeCommandList<CpuBackend>;
+    type CpuKernel = NativeKernel<CpuBackend>;
     #[cfg(all(feature = "native-metal", target_os = "macos"))]
     type MetalBackend = forja_metal::MetalBackend;
     #[cfg(all(feature = "native-metal", target_os = "macos"))]
     type MetalTensor = NativeTensor<MetalBackend>;
     #[cfg(all(feature = "native-metal", target_os = "macos"))]
     type MetalCommands = NativeCommandList<MetalBackend>;
+    #[cfg(all(feature = "native-metal", target_os = "macos"))]
+    type MetalKernel = NativeKernel<MetalBackend>;
 
     thread_local! {
         static DEVICE: Cell<NativeDevice> = const { Cell::new(NativeDevice::Cpu) };
@@ -409,6 +480,12 @@ pub(crate) mod native {
         Cpu(CpuCommands),
         #[cfg(all(feature = "native-metal", target_os = "macos"))]
         Metal(MetalCommands),
+    }
+
+    pub(crate) enum Kernel {
+        Cpu(CpuKernel),
+        #[cfg(all(feature = "native-metal", target_os = "macos"))]
+        Metal(MetalKernel),
     }
 
     pub(crate) struct Native;
@@ -463,6 +540,7 @@ pub(crate) mod native {
     impl Backend for Native {
         type Tensor = Tensor;
         type Commands = Commands;
+        type Kernel = Kernel;
 
         fn alloc(dtype: DType, shape: &[u32]) -> Result<Self::Tensor> {
             match DEVICE.get() {
@@ -540,6 +618,7 @@ pub(crate) mod native {
             }
         }
 
+        #[cfg(target_family = "wasm")]
         fn dispatch_program(
             commands: &mut Self::Commands,
             program: Program,
@@ -555,6 +634,53 @@ pub(crate) mod native {
                 Commands::Metal(commands) => commands
                     .dispatch_program(&program, &metal_inputs(inputs)?, &metal_inputs(outputs)?)
                     .map_err(error),
+            }
+        }
+
+        fn create_kernel(
+            program: Program,
+            rank: u8,
+            inputs: &[DType],
+            outputs: &[DType],
+        ) -> Result<Self::Kernel> {
+            let program = core_program(program)?;
+            let signature = forja_core::program::KernelSignature::new(
+                rank,
+                inputs.iter().copied().map(core_dtype).collect(),
+                outputs.iter().copied().map(core_dtype).collect(),
+                0,
+            );
+            match DEVICE.get() {
+                NativeDevice::Cpu => CPU_HOST.with(|host| {
+                    host.prepare_program(program, signature)
+                        .map(Kernel::Cpu)
+                        .map_err(error)
+                }),
+                #[cfg(all(feature = "native-metal", target_os = "macos"))]
+                NativeDevice::Metal => with_metal(|host| {
+                    host.prepare_program(program, signature)
+                        .map(Kernel::Metal)
+                        .map_err(error)
+                }),
+            }
+        }
+
+        fn dispatch_kernel(
+            commands: &mut Self::Commands,
+            kernel: &Self::Kernel,
+            inputs: &[&Self::Tensor],
+            outputs: &[&Self::Tensor],
+        ) -> Result<()> {
+            match (commands, kernel) {
+                (Commands::Cpu(commands), Kernel::Cpu(kernel)) => commands
+                    .dispatch_kernel(kernel, &cpu_inputs(inputs)?, &cpu_inputs(outputs)?)
+                    .map_err(error),
+                #[cfg(all(feature = "native-metal", target_os = "macos"))]
+                (Commands::Metal(commands), Kernel::Metal(kernel)) => commands
+                    .dispatch_kernel(kernel, &metal_inputs(inputs)?, &metal_inputs(outputs)?)
+                    .map_err(error),
+                #[cfg(all(feature = "native-metal", target_os = "macos"))]
+                _ => Err(Error::new("native resources belong to different backends")),
             }
         }
 
@@ -699,6 +825,7 @@ pub(crate) use native::Native as Active;
 pub(crate) use unavailable::Unavailable as Active;
 pub(crate) type Handle = <Active as Backend>::Tensor;
 pub(crate) type Commands = <Active as Backend>::Commands;
+pub(crate) type Kernel = <Active as Backend>::Kernel;
 
 pub(crate) fn dtype(dtype: u8) -> Result<DType> {
     match dtype {
@@ -740,6 +867,7 @@ pub(crate) fn dispatch(
     Active::dispatch(commands, operation, inputs, output)
 }
 
+#[cfg(target_family = "wasm")]
 pub(crate) fn dispatch_program(
     commands: &mut Commands,
     program: Program,
@@ -747,6 +875,24 @@ pub(crate) fn dispatch_program(
     outputs: &[&Handle],
 ) -> Result<()> {
     Active::dispatch_program(commands, program, inputs, outputs)
+}
+
+pub(crate) fn create_kernel(
+    program: Program,
+    rank: u8,
+    inputs: &[DType],
+    outputs: &[DType],
+) -> Result<Kernel> {
+    Active::create_kernel(program, rank, inputs, outputs)
+}
+
+pub(crate) fn dispatch_kernel(
+    commands: &mut Commands,
+    kernel: &Kernel,
+    inputs: &[&Handle],
+    outputs: &[&Handle],
+) -> Result<()> {
+    Active::dispatch_kernel(commands, kernel, inputs, outputs)
 }
 
 pub(crate) fn submit(commands: Commands) -> Result<()> {

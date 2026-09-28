@@ -6,7 +6,9 @@ use std::{
 
 use forja_core::{
     Backend, CommandList, DType, Submission, Tensor, ViewOp,
-    program::{BinOp, Inst, Program, ProgramKind, RedOp, UnOp, ValueType},
+    program::{
+        BinOp, Inst, KernelSignature, Program, ProgramKind, RedOp, UnOp, ValueType, prepare_program,
+    },
 };
 use forja_testing::{
     DeterministicValues, TensorSpec, assert_outputs_agree, generated_tensor_bytes,
@@ -727,9 +729,11 @@ async fn run_program_case(seed: u64, coverage: &mut ProgramCoverage) {
         let weights = host.open_weights("program-output").unwrap();
         host_outputs[0] = host.weight_tensor(&weights, "value").unwrap();
     }
+    let kernel = host
+        .create_kernel(wit_program(program), wit_signature(&case))
+        .unwrap();
     let commands = host.command_list().unwrap();
-    let result =
-        host.dispatch_program(&commands, wit_program(program), &host_inputs, &host_outputs);
+    let result = host.dispatch_kernel(&commands, &kernel, &host_inputs, &host_outputs);
     if binding == 0 {
         assert!(matches!(result, Err(compute::Error::OpSignature(_))));
         coverage.aliasing_refusals += 1;
@@ -748,10 +752,17 @@ async fn run_program_case(seed: u64, coverage: &mut ProgramCoverage) {
     coverage.accepted_dispatches += 1;
     host.prepare_submit(commands).unwrap().run().await.unwrap();
 
+    let signature = KernelSignature::new(
+        u8::try_from(case.shape().len()).unwrap(),
+        case.inputs().iter().map(TensorSpec::dtype).collect(),
+        case.outputs().iter().map(TensorSpec::dtype).collect(),
+        0,
+    );
+    let prepared = prepare_program(&reference, validated, signature).unwrap();
     let mut commands = CommandList::new();
     commands
-        .dispatch_program(
-            &validated,
+        .dispatch_kernel(
+            &prepared,
             &reference_inputs.iter().collect::<Vec<_>>(),
             &reference_outputs.iter().collect::<Vec<_>>(),
         )
@@ -854,14 +865,31 @@ fn program_weight_file(spec: &TensorSpec) -> std::path::PathBuf {
     path
 }
 
-fn wit_program(program: Program) -> compute::Program {
-    compute::Program {
+fn wit_program(program: Program) -> compute::ProgramSource {
+    compute::ProgramSource {
         kind: match program.kind {
             ProgramKind::Map => compute::ProgramKind::Map,
             ProgramKind::Row => compute::ProgramKind::Row,
         },
         insts: program.insts.into_iter().map(wit_inst).collect(),
         outputs: program.outputs,
+    }
+}
+
+fn wit_signature(case: &forja_testing::program::ProgramCase) -> compute::KernelSignature {
+    compute::KernelSignature {
+        rank: u8::try_from(case.shape().len()).unwrap(),
+        inputs: case
+            .inputs()
+            .iter()
+            .map(|spec| guest_dtype(spec.dtype()))
+            .collect(),
+        outputs: case
+            .outputs()
+            .iter()
+            .map(|spec| guest_dtype(spec.dtype()))
+            .collect(),
+        scalars: 0,
     }
 }
 

@@ -336,7 +336,17 @@ impl<T: Element> Tensor<T> {
             .iter()
             .map(|tensor| &tensor.handle)
             .collect::<Vec<_>>();
-        graph::record_program(definition, &input_handles, &output_handles)?;
+        let rank = u8::try_from(self.shape.len())
+            .map_err(|_| Error::new("program tensor rank is too large"))?;
+        let dtype = sys::dtype(T::DTYPE)?;
+        graph::record_program(
+            definition,
+            rank,
+            &vec![dtype; input_handles.len()],
+            &vec![dtype; output_handles.len()],
+            &input_handles,
+            &output_handles,
+        )?;
         Ok(outputs)
     }
 
@@ -363,7 +373,17 @@ impl<T: Element> Tensor<T> {
             .iter()
             .map(|tensor| &tensor.handle)
             .collect::<Vec<_>>();
-        graph::record_program(definition, &input_handles, &output_handles)
+        let rank = u8::try_from(self.shape.len())
+            .map_err(|_| Error::new("program tensor rank is too large"))?;
+        let dtype = sys::dtype(T::DTYPE)?;
+        graph::record_program(
+            definition,
+            rank,
+            &vec![dtype; input_handles.len()],
+            &vec![dtype; output_handles.len()],
+            &input_handles,
+            &output_handles,
+        )
     }
 
     /// Submits pending work and gathers the logical tensor values.
