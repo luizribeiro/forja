@@ -36,6 +36,13 @@ pub enum ParamError {
     },
     /// No unused process-unique identity remains.
     IdentityExhausted,
+    /// An affine expression references a parameter absent from the value list.
+    UnknownParameter {
+        /// The referenced parameter index.
+        index: u8,
+    },
+    /// An affine expression cannot be represented as a `u32`.
+    ArithmeticOverflow,
 }
 
 impl fmt::Display for ParamError {
@@ -58,6 +65,10 @@ impl fmt::Display for ParamError {
                 )
             }
             Self::IdentityExhausted => formatter.write_str("parameter space identities exhausted"),
+            Self::UnknownParameter { index } => {
+                write!(formatter, "parameter {index} is not declared")
+            }
+            Self::ArithmeticOverflow => formatter.write_str("affine arithmetic overflowed"),
         }
     }
 }
@@ -137,11 +148,70 @@ impl ParamValues {
     }
 }
 
+/// A nonnegative affine expression over at most one parameter.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Affine {
+    offset: u32,
+    term: Option<(u8, u32)>,
+}
+
+impl Affine {
+    /// Creates a constant expression.
+    #[must_use]
+    pub const fn constant(value: u32) -> Self {
+        Self {
+            offset: value,
+            term: None,
+        }
+    }
+
+    /// Creates `offset + scale * parameter`.
+    #[must_use]
+    pub const fn parameter(parameter: u8, offset: u32, scale: u32) -> Self {
+        Self {
+            offset,
+            term: Some((parameter, scale)),
+        }
+    }
+
+    /// Returns whether this expression is independent of all parameters.
+    #[must_use]
+    pub const fn is_constant(self) -> bool {
+        matches!(self.term, None | Some((_, 0)))
+    }
+
+    /// Evaluates the expression using checked `u64` arithmetic and narrows to `u32`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ParamError`] when the parameter is absent or the result exceeds `u32`.
+    pub fn evaluate(self, values: &ParamValues) -> Result<u32, ParamError> {
+        let Some((parameter, scale)) = self.term else {
+            return Ok(self.offset);
+        };
+        let value = values
+            .as_slice()
+            .get(usize::from(parameter))
+            .ok_or(ParamError::UnknownParameter { index: parameter })?;
+        u64::from(scale)
+            .checked_mul(u64::from(*value))
+            .and_then(|term| term.checked_add(u64::from(self.offset)))
+            .and_then(|result| u32::try_from(result).ok())
+            .ok_or(ParamError::ArithmeticOverflow)
+    }
+}
+
+impl From<u32> for Affine {
+    fn from(value: u32) -> Self {
+        Self::constant(value)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::ops::RangeInclusive;
 
-    use super::{MAX_PARAMS, ParamError, ParamSpace};
+    use super::{Affine, MAX_PARAMS, ParamError, ParamSpace};
 
     #[test]
     fn checks_parameter_spaces_and_values() {
@@ -172,6 +242,29 @@ mod tests {
         assert_eq!(
             ParamSpace::new(vec![0..=0; MAX_PARAMS + 1]),
             Err(ParamError::TooManyParameters)
+        );
+    }
+
+    #[test]
+    fn evaluates_affine_expressions_with_checked_narrowing() {
+        let range = RangeInclusive::new(7, u32::MAX);
+        let space = ParamSpace::new(vec![range]).unwrap();
+        let values = space.values(vec![7]).unwrap();
+        assert_eq!(Affine::parameter(0, 1, 2).evaluate(&values), Ok(15));
+        assert_eq!(Affine::constant(33).evaluate(&values), Ok(33));
+        assert_eq!(Affine::parameter(0, 33, 0).evaluate(&values), Ok(33));
+        assert_eq!(
+            Affine::parameter(1, 0, 1).evaluate(&values),
+            Err(ParamError::UnknownParameter { index: 1 })
+        );
+        assert_eq!(
+            Affine::parameter(1, 33, 0).evaluate(&values),
+            Err(ParamError::UnknownParameter { index: 1 })
+        );
+        let largest = space.values(vec![u32::MAX]).unwrap();
+        assert_eq!(
+            Affine::parameter(0, 1, 1).evaluate(&largest),
+            Err(ParamError::ArithmeticOverflow)
         );
     }
 }
