@@ -21,6 +21,10 @@ pub use forja_sdk_macros::kernel;
 /// Maximum number of prepared signatures retained by one kernel definition.
 pub const CACHE_CAPACITY: usize = 16;
 
+const MAX_INPUT_DTYPES: usize = 8;
+const MAX_OUTPUT_DTYPES: usize = 4;
+const MAX_SCALAR_BITS: usize = 8;
+
 /// A type-erased tensor binding used by generated kernels.
 #[doc(hidden)]
 #[derive(Clone, Copy)]
@@ -102,12 +106,17 @@ fn check_bindings(
         .first()
         .and_then(|input| u8::try_from(input.shape.len()).ok())
         .ok_or_else(|| Error::new("kernel tensor rank is invalid"))?;
-    let input_dtypes = inputs.iter().map(|input| input.dtype).collect::<Vec<_>>();
-    let output_dtypes = outputs
-        .iter()
-        .map(|output| output.dtype)
-        .collect::<Vec<_>>();
-    if rank != kernel.rank || input_dtypes != kernel.inputs || output_dtypes != kernel.outputs {
+    let inputs_match = inputs.len() == kernel.inputs.len()
+        && inputs
+            .iter()
+            .zip(&kernel.inputs)
+            .all(|(binding, dtype)| binding.dtype == *dtype);
+    let outputs_match = outputs.len() == kernel.outputs.len()
+        && outputs
+            .iter()
+            .zip(&kernel.outputs)
+            .all(|(binding, dtype)| binding.dtype == *dtype);
+    if rank != kernel.rank || !inputs_match || !outputs_match {
         return Err(Error::new(
             "kernel tensor bindings do not match its signature",
         ));
@@ -151,12 +160,51 @@ pub const fn extent(_axis: i32) -> u32 {
     0
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Signature {
     rank: u8,
-    inputs: Vec<DType>,
-    outputs: Vec<DType>,
-    scalars: Vec<u32>,
+    inputs: FixedValues<DType, MAX_INPUT_DTYPES>,
+    outputs: FixedValues<DType, MAX_OUTPUT_DTYPES>,
+    scalars: FixedValues<u32, MAX_SCALAR_BITS>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FixedValues<T, const N: usize> {
+    len: u8,
+    values: [T; N],
+}
+
+impl<T: Copy, const N: usize> FixedValues<T, N> {
+    fn new(values: &[T], fill: T, kind: &str) -> Result<Self> {
+        if values.len() > N {
+            return Err(Error::new(format!(
+                "kernel cache supports at most {N} {kind}"
+            )));
+        }
+        let mut fixed = [fill; N];
+        fixed[..values.len()].copy_from_slice(values);
+        Ok(Self {
+            len: u8::try_from(values.len())
+                .map_err(|_| Error::new("kernel cache key length does not fit u8"))?,
+            values: fixed,
+        })
+    }
+}
+
+impl Signature {
+    fn new(
+        rank: u8,
+        input_dtypes: &[DType],
+        output_dtypes: &[DType],
+        scalar_bits: &[u32],
+    ) -> Result<Self> {
+        Ok(Self {
+            rank,
+            inputs: FixedValues::new(input_dtypes, DType::F32, "input dtypes")?,
+            outputs: FixedValues::new(output_dtypes, DType::F32, "output dtypes")?,
+            scalars: FixedValues::new(scalar_bits, 0, "scalar values")?,
+        })
+    }
 }
 
 struct Entry {
@@ -216,12 +264,7 @@ impl Cache {
         scalar_bits: &[u32],
         build: impl FnOnce() -> Result<Kernel>,
     ) -> Result<Kernel> {
-        let signature = Signature {
-            rank,
-            inputs: input_dtypes.to_vec(),
-            outputs: output_dtypes.to_vec(),
-            scalars: scalar_bits.to_vec(),
-        };
+        let signature = Signature::new(rank, input_dtypes, output_dtypes, scalar_bits)?;
         let mut entries = self.entries.borrow_mut();
         if let Some(index) = entries
             .iter()
@@ -380,6 +423,26 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "kernel `position_kernel`: more than 16 distinct (rank, dtype, scalar) variants; pass varying scalars as tensors"
+        );
+    }
+
+    #[test]
+    fn rejects_scalar_signatures_beyond_inline_capacity() {
+        let cache = Cache::new();
+        let error = cache
+            .get_or_try_insert_with(
+                1,
+                &[DType::F32],
+                &[DType::F32],
+                &[0; MAX_SCALAR_BITS + 1],
+                || kernel(1, &[DType::F32], &[DType::F32]),
+            )
+            .err()
+            .expect("an oversized scalar signature must be rejected");
+
+        assert_eq!(
+            error.to_string(),
+            "kernel cache supports at most 8 scalar values"
         );
     }
 
