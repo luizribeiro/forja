@@ -13,7 +13,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, OnceLock, Weak,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     thread,
 };
@@ -24,7 +24,7 @@ use forja_core::{
     program::{
         BinOp, Inst, KernelSignature, MAX_INSTRUCTIONS, MAX_OUTPUTS, PrepareError, PreparedProgram,
         Program, ProgramError, ProgramKind, RedOp, UnOp, ValidatedProgram, ValueType,
-        prepare_program,
+        prepare_program_retained,
     },
 };
 use wasmtime::component::{Accessor, Component, HasData, Linker, Resource, ResourceTable};
@@ -630,6 +630,7 @@ pub struct Limits {
     tensor_rank: usize,
     tensor_elements: u64,
     live_tensor_handles: usize,
+    live_kernels: usize,
     read_bytes: u64,
     guest_memory_bytes: usize,
     table_elements: usize,
@@ -681,6 +682,7 @@ impl Limits {
             tensor_rank: max_tensor_rank,
             tensor_elements: max_tensor_elements,
             live_tensor_handles: max_live_tensor_handles,
+            live_kernels: 64,
             read_bytes: max_read_bytes,
             guest_memory_bytes: 4 * 1024 * 1024 * 1024,
             table_elements: 10_000,
@@ -702,6 +704,13 @@ impl Limits {
     ) -> Self {
         self.dispatches_per_list = max_dispatches_per_list;
         self.work_per_dispatch = max_work_per_dispatch;
+        self
+    }
+
+    /// Overrides the number of prepared programs that may remain alive.
+    #[must_use]
+    pub const fn with_kernel_limit(mut self, max_live_kernels: usize) -> Self {
+        self.live_kernels = max_live_kernels;
         self
     }
 
@@ -805,6 +814,27 @@ pub struct KernelEntry {
     program: Arc<PreparedProgram>,
 }
 
+#[derive(Debug)]
+struct KernelLease {
+    live: Arc<AtomicUsize>,
+}
+
+impl Drop for KernelLease {
+    fn drop(&mut self) {
+        self.live.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+impl KernelLease {
+    fn acquire(live: Arc<AtomicUsize>, limit: usize) -> Result<Self, compute::Error> {
+        live.fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+            count.checked_add(1).filter(|&next| next <= limit)
+        })
+        .map_err(|_| quota("live kernels exceed the guest limit"))?;
+        Ok(Self { live })
+    }
+}
+
 /// Host-owned state behind a guest command-list resource.
 #[derive(Debug)]
 pub struct CommandListEntry {
@@ -823,6 +853,7 @@ pub struct Host<B: Backend> {
     store_limits: StoreLimits,
     live_bytes: Arc<AtomicU64>,
     live_handles: usize,
+    live_kernels: Arc<AtomicUsize>,
     gpu_time_ns: Arc<AtomicU64>,
     completed_submissions: Arc<AtomicU64>,
     timed_submissions: Arc<AtomicU64>,
@@ -852,6 +883,7 @@ impl<B: Backend> Host<B> {
             store_limits,
             live_bytes: Arc::new(AtomicU64::new(0)),
             live_handles: 0,
+            live_kernels: Arc::new(AtomicUsize::new(0)),
             gpu_time_ns: Arc::new(AtomicU64::new(0)),
             completed_submissions: Arc::new(AtomicU64::new(0)),
             timed_submissions: Arc::new(AtomicU64::new(0)),
@@ -1171,8 +1203,10 @@ impl<B: Backend> Host<B> {
     ) -> Result<Resource<KernelEntry>, compute::Error> {
         let validated = core_program(source)?;
         let signature = core_kernel_signature(signature);
+        let lease = KernelLease::acquire(Arc::clone(&self.live_kernels), self.limits.live_kernels)?;
         let program =
-            prepare_program(self.backend.as_ref(), validated, signature).map_err(prepare_error)?;
+            prepare_program_retained(self.backend.as_ref(), validated, signature, Box::new(lease))
+                .map_err(prepare_error)?;
         self.table
             .push(KernelEntry { program })
             .map_err(invalid_handle)
@@ -2311,6 +2345,29 @@ mod tests {
     }
 
     #[test]
+    fn kernel_quota_counts_live_preparations() {
+        let mut host = Host::new(CpuBackend::new(), GENEROUS.with_kernel_limit(2));
+        let first = host
+            .create_kernel(doubling_program(2.0), unary_f32_signature(1))
+            .unwrap();
+        let duplicate = host
+            .create_kernel(doubling_program(2.0), unary_f32_signature(1))
+            .unwrap();
+        assert_eq!(host.live_kernels.load(Ordering::Acquire), 2);
+        assert!(matches!(
+            host.create_kernel(doubling_program(3.0), unary_f32_signature(1)),
+            Err(compute::Error::Quota(_))
+        ));
+
+        host.drop_kernel(first).unwrap();
+        assert_eq!(host.live_kernels.load(Ordering::Acquire), 1);
+        host.drop_kernel(duplicate).unwrap();
+        assert_eq!(host.live_kernels.load(Ordering::Acquire), 0);
+        host.create_kernel(doubling_program(3.0), unary_f32_signature(1))
+            .unwrap();
+    }
+
+    #[test]
     fn kernel_dispatch_refuses_signature_mismatches() {
         let mut host = Host::new(CpuBackend::new(), GENEROUS);
         let input = host.alloc(compute::Dtype::F32, &[7]).unwrap();
@@ -2336,6 +2393,7 @@ mod tests {
             host.create_kernel(doubling_program(2.0), signature),
             Err(compute::Error::OpSignature(_))
         ));
+        assert_eq!(host.live_kernels.load(Ordering::Acquire), 0);
     }
 
     #[test]
@@ -2358,6 +2416,35 @@ mod tests {
             ),
             Err(compute::Error::InvalidHandle(_))
         ));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dropped_kernel_is_retained_until_submission_completes() {
+        let mut host = Host::new(CpuBackend::new(), GENEROUS.with_kernel_limit(1));
+        let input = host.alloc(compute::Dtype::F32, &[1]).unwrap();
+        host.write(&input, &3.0_f32.to_le_bytes()).unwrap();
+        let output = host.alloc(compute::Dtype::F32, &[1]).unwrap();
+        let kernel = host
+            .create_kernel(doubling_program(2.0), unary_f32_signature(1))
+            .unwrap();
+        let commands = host.command_list().unwrap();
+        host.dispatch_kernel(
+            &commands,
+            &kernel,
+            &[input],
+            &[Resource::new_borrow(output.rep())],
+        )
+        .unwrap();
+        host.drop_kernel(kernel).unwrap();
+        assert_eq!(host.live_kernels.load(Ordering::Acquire), 1);
+
+        host.prepare_submit(commands).unwrap().run().await.unwrap();
+        assert_eq!(host.live_kernels.load(Ordering::Acquire), 0);
+        let bytes = host.prepare_read(&output).unwrap().run().await.unwrap();
+        assert_eq!(
+            f32::from_le_bytes(bytes.try_into().unwrap()).to_bits(),
+            6.0_f32.to_bits()
+        );
     }
 
     #[test]
