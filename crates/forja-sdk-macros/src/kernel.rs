@@ -4,7 +4,10 @@ use std::collections::HashMap;
 
 use proc_macro2::{Ident, Span, TokenStream};
 use quote::{ToTokens, format_ident, quote};
-use syn::{FnArg, GenericArgument, ItemFn, Pat, PathArguments, ReturnType, Type, spanned::Spanned};
+use syn::{
+    FnArg, GenericArgument, ItemFn, Pat, PathArguments, ReturnType, Token, Type, parse::Parser,
+    punctuated::Punctuated, spanned::Spanned,
+};
 
 use lower::{Parameter, lower};
 
@@ -40,10 +43,124 @@ struct KernelFunction {
     output_count: usize,
 }
 
+struct HelperFunction {
+    item: ItemFn,
+    kind: KernelKind,
+    parameters: Vec<ScalarParameter>,
+}
+
+struct Attribute {
+    kind: KernelKind,
+    helper: bool,
+}
+
 pub(super) fn expand(attribute: TokenStream, item: ItemFn) -> syn::Result<TokenStream> {
-    let kind = parse_kind(attribute)?;
-    let function = KernelFunction::parse(item, kind)?;
-    function.expand()
+    let attribute = parse_attribute(attribute)?;
+    if attribute.helper {
+        HelperFunction::parse(item, attribute.kind)?.expand()
+    } else {
+        KernelFunction::parse(item, attribute.kind)?.expand()
+    }
+}
+
+impl HelperFunction {
+    fn parse(item: ItemFn, kind: KernelKind) -> syn::Result<Self> {
+        validate_modifiers(&item)?;
+        let parameters = item
+            .sig
+            .inputs
+            .iter()
+            .map(|argument| {
+                let FnArg::Typed(argument) = argument else {
+                    return Err(syn::Error::new_spanned(
+                        argument,
+                        "kernel helper methods are not supported",
+                    ));
+                };
+                let Pat::Ident(pattern) = &*argument.pat else {
+                    return Err(syn::Error::new_spanned(
+                        &argument.pat,
+                        "kernel helper parameters must be identifiers",
+                    ));
+                };
+                if pattern.by_ref.is_some()
+                    || pattern.mutability.is_some()
+                    || pattern.subpat.is_some()
+                {
+                    return Err(syn::Error::new_spanned(
+                        &argument.pat,
+                        "kernel helper parameters must be plain identifiers",
+                    ));
+                }
+                let Some(compute) = scalar_type(&argument.ty) else {
+                    return Err(syn::Error::new_spanned(
+                        &argument.ty,
+                        "kernel helper parameters must have type `f32` or `u32`",
+                    ));
+                };
+                Ok(ScalarParameter {
+                    ident: pattern.ident.clone(),
+                    compute,
+                })
+            })
+            .collect::<syn::Result<Vec<_>>>()?;
+        if output_scalar_type(&item.sig.output)? != ComputeType::F32 {
+            return Err(syn::Error::new_spanned(
+                &item.sig.output,
+                "kernel helpers must return `f32`",
+            ));
+        }
+        Ok(Self {
+            item,
+            kind,
+            parameters,
+        })
+    }
+
+    fn expand(&self) -> syn::Result<TokenStream> {
+        let visibility = &self.item.vis;
+        let attributes = &self.item.attrs;
+        let name = &self.item.sig.ident;
+        let context = internal("__forja_context");
+        let lifetime = syn::Lifetime::new("'__forja", Span::mixed_site());
+        let context_type = quote!(::forja_sdk::program::Ctx);
+        let arguments = self.parameters.iter().map(|parameter| {
+            let ident = &parameter.ident;
+            match parameter.compute {
+                ComputeType::F32 => quote!(#ident: ::forja_sdk::program::F32<#lifetime>),
+                ComputeType::U32 => quote!(#ident: ::forja_sdk::program::U32<#lifetime>),
+            }
+        });
+        let parameters = self
+            .parameters
+            .iter()
+            .map(|parameter| {
+                (
+                    parameter.ident.to_string(),
+                    Parameter::Value(parameter.compute),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let lowered = lower(&self.item.block, parameters, &context, self.kind)?;
+        let [output] = lowered.outputs.as_slice() else {
+            return Err(syn::Error::new_spanned(
+                &self.item.sig.output,
+                "kernel helpers must return one `f32` value",
+            ));
+        };
+        let statements = &lowered.statements;
+        Ok(quote! {
+            #(#attributes)*
+            #[inline]
+            #visibility fn #name<#lifetime>(
+                #context: &#lifetime #context_type,
+                #(#arguments),*
+            ) -> ::forja_sdk::program::F32<#lifetime> {
+                #(#statements)*
+                #output
+            }
+        })
+    }
 }
 
 impl KernelFunction {
@@ -460,12 +577,30 @@ impl KernelKind {
     }
 }
 
-fn parse_kind(attribute: TokenStream) -> syn::Result<KernelKind> {
-    let ident = syn::parse2::<Ident>(attribute)?;
-    match ident.to_string().as_str() {
-        "map" => Ok(KernelKind::Map),
-        "row" => Ok(KernelKind::Row),
-        _ => Err(syn::Error::new_spanned(ident, "expected `map` or `row`")),
+fn parse_attribute(attribute: TokenStream) -> syn::Result<Attribute> {
+    let arguments = Punctuated::<Ident, Token![,]>::parse_terminated.parse2(attribute)?;
+    match arguments
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .as_slice()
+    {
+        [kind] if kind == "map" => Ok(Attribute {
+            kind: KernelKind::Map,
+            helper: false,
+        }),
+        [kind] if kind == "row" => Ok(Attribute {
+            kind: KernelKind::Row,
+            helper: false,
+        }),
+        [helper] if helper == "helper" => Ok(Attribute {
+            kind: KernelKind::Map,
+            helper: true,
+        }),
+        _ => Err(syn::Error::new_spanned(
+            arguments,
+            "expected `map`, `row`, or `helper`",
+        )),
     }
 }
 
@@ -539,6 +674,17 @@ fn scalar_type(ty: &Type) -> Option<ComputeType> {
         "u32" => Some(ComputeType::U32),
         _ => None,
     }
+}
+
+fn output_scalar_type(output: &ReturnType) -> syn::Result<ComputeType> {
+    let ReturnType::Type(_, ty) = output else {
+        return Err(syn::Error::new_spanned(
+            output,
+            "kernel helper requires a return type",
+        ));
+    };
+    scalar_type(ty)
+        .ok_or_else(|| syn::Error::new_spanned(ty, "kernel helper return type must be `f32`"))
 }
 
 fn type_name(ty: &Type) -> String {

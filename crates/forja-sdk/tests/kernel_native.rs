@@ -84,6 +84,62 @@ fn macro_bad_axis(x: forja_sdk::kernel::Elem) -> forja_sdk::kernel::Elem {
     x + forja_sdk::kernel::index(2) as f32
 }
 
+#[forja_sdk::kernel(helper)]
+fn helper_square(x: f32) -> f32 {
+    x * x
+}
+
+#[forja_sdk::kernel(map)]
+fn macro_helper_square(x: forja_sdk::kernel::Elem) -> forja_sdk::kernel::Elem {
+    helper_square(x)
+}
+
+#[forja_sdk::kernel(helper)]
+fn helper_sixteen(mut_x: f32) -> f32 {
+    let x = mut_x + 1.0;
+    let x = x + 1.0;
+    let x = x + 1.0;
+    let x = x + 1.0;
+    let x = x + 1.0;
+    let x = x + 1.0;
+    let x = x + 1.0;
+    let x = x + 1.0;
+    let x = x + 1.0;
+    let x = x + 1.0;
+    let x = x + 1.0;
+    let x = x + 1.0;
+    let x = x + 1.0;
+    let x = x + 1.0;
+    let x = x + 1.0;
+    x + 1.0
+}
+
+#[forja_sdk::kernel(helper)]
+fn helper_too_wide(x: f32) -> f32 {
+    let x = helper_sixteen(x);
+    let x = helper_sixteen(x);
+    let x = helper_sixteen(x);
+    let x = helper_sixteen(x);
+    let x = helper_sixteen(x);
+    let x = helper_sixteen(x);
+    let x = helper_sixteen(x);
+    let x = helper_sixteen(x);
+    let x = helper_sixteen(x);
+    let x = helper_sixteen(x);
+    let x = helper_sixteen(x);
+    let x = helper_sixteen(x);
+    let x = helper_sixteen(x);
+    let x = helper_sixteen(x);
+    let x = helper_sixteen(x);
+    let x = helper_sixteen(x);
+    helper_sixteen(x)
+}
+
+#[forja_sdk::kernel(map)]
+fn macro_helper_too_wide(x: forja_sdk::kernel::Elem) -> forja_sdk::kernel::Elem {
+    helper_too_wide(x)
+}
+
 struct TestInput {
     values: Vec<f32>,
     shape: Vec<u32>,
@@ -312,6 +368,36 @@ fn axis_errors_name_the_kernel() {
     assert_eq!(
         error.to_string(),
         "kernel `macro_bad_axis`: program axis is out of range"
+    );
+}
+
+#[test]
+fn helpers_match_builder_and_interpreter() -> Result<(), Box<dyn Error>> {
+    let shape = [4097];
+    let inputs = [input(&shape, 0xaaaa)];
+    let macro_kernel = macro_helper_square_program(1, &[DType::F32], &[DType::F32])?;
+    let hand = Ctx::new();
+    let x = hand.input(0);
+    hand.output(0, x * x);
+
+    differential(
+        &shape,
+        &inputs,
+        &macro_kernel,
+        &hand.finish(),
+        true,
+        |input| Ok(vec![macro_helper_square(&input[0])?]),
+    )
+}
+
+#[test]
+fn helper_expansion_caps_name_the_kernel() {
+    let instructions = macro_helper_too_wide_program(1, &[DType::F32], &[DType::F32])
+        .err()
+        .expect("expanded helpers must exceed the instruction cap");
+    assert_eq!(
+        instructions.to_string(),
+        "kernel `macro_helper_too_wide`: invalid program: TooManyInstructions"
     );
 }
 

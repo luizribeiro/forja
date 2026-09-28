@@ -17,6 +17,7 @@ pub(super) enum Parameter {
         span: Span,
     },
     Scalar(ComputeType),
+    Value(ComputeType),
 }
 
 pub(super) struct Lowered {
@@ -34,7 +35,7 @@ pub(super) fn lower(
         .iter()
         .filter_map(|(name, parameter)| match parameter {
             Parameter::Tensor { slot, span, .. } => Some((*slot, name.clone(), *span)),
-            Parameter::Scalar(_) => None,
+            Parameter::Scalar(_) | Parameter::Value(_) => None,
         })
         .collect::<Vec<_>>();
     tensors.sort_by_key(|(slot, _, _)| *slot);
@@ -394,6 +395,14 @@ impl Lowerer {
                         Ok(self.emit(quote!(#constant.cast_u32()), ValueType::U32, path.span()))
                     }
                 }
+            }
+            Some(Binding::Parameter(Parameter::Value(compute))) => {
+                let ident = &path.path.segments[0].ident;
+                Ok(Value {
+                    ident: ident.clone(),
+                    ty: compute_type(compute),
+                    span: path.span(),
+                })
             }
             None => Err(kernel_error(path, "unknown kernel binding")),
         }
@@ -768,9 +777,18 @@ impl Lowerer {
         };
         let name = segment.ident.to_string();
         if !matches!(name.as_str(), "index" | "extent") {
-            return Err(kernel_error(
-                &segment.ident,
-                format!("unknown kernel function `{name}`"),
+            let arguments = call
+                .args
+                .iter()
+                .map(|argument| self.lower_expr(argument))
+                .collect::<syn::Result<Vec<_>>>()?;
+            let arguments = arguments.iter().map(|argument| &argument.ident);
+            let context = self.context.clone();
+            let function = &path.path;
+            return Ok(self.emit(
+                quote!(#function(&#context, #(#arguments),*)),
+                ValueType::F32,
+                call.span(),
             ));
         }
         if call.args.len() != 1 {

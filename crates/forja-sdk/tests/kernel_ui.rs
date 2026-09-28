@@ -8,5 +8,6 @@ fn kernel_syntax_contracts() {
     cases.pass("tests/ui/kernel-pass-signatures.rs");
     cases.pass("tests/ui/kernel-pass-typed-expressions.rs");
     cases.pass("tests/ui/kernel-pass-row-expressions.rs");
+    cases.pass("tests/ui/kernel-pass-helpers.rs");
     cases.compile_fail("tests/ui/kernel-fail-*.rs");
 }
