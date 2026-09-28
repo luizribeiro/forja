@@ -3,7 +3,7 @@
 use std::{
     cell::RefCell,
     marker::PhantomData,
-    ops::{Add, Div, Mul, Neg, Sub},
+    ops::{Add, Deref, Div, Mul, Neg, Sub},
     rc::Rc,
 };
 
@@ -130,9 +130,7 @@ impl Kernel {
 }
 
 impl Program {
-    /// Creates a builder with the selected iteration strategy.
-    #[must_use]
-    pub fn new(kind: ProgramKind) -> Self {
+    fn new(kind: ProgramKind) -> Self {
         Self {
             kind,
             state: RefCell::new(State {
@@ -143,13 +141,13 @@ impl Program {
         }
     }
 
-    /// Creates an elementwise program builder.
+    #[doc(hidden)]
     #[must_use]
     pub fn map() -> Self {
         Self::new(ProgramKind::Map)
     }
 
-    /// Creates a row-reduction program builder.
+    #[doc(hidden)]
     #[must_use]
     pub fn row() -> Self {
         Self::new(ProgramKind::Row)
@@ -192,7 +190,7 @@ impl Program {
         self.push_u32(Instruction::Extent(axis))
     }
 
-    /// Reduces a value across the last axis and broadcasts the result.
+    #[doc(hidden)]
     #[must_use]
     pub fn reduce<'a>(&'a self, op: ReduceOp, value: F32<'a>) -> F32<'a> {
         self.check_value(value.state);
@@ -308,6 +306,121 @@ impl Program {
     }
 }
 
+/// Builder context for an elementwise map program.
+///
+/// Map contexts do not expose row reductions, so attempting to reduce is a
+/// compile-time error.
+///
+/// ```compile_fail
+/// use forja_sdk::program::Ctx;
+/// let context = Ctx::new();
+/// let value = context.input(0);
+/// let _ = context.row_sum(value);
+/// ```
+#[derive(Debug)]
+pub struct Ctx {
+    program: Program,
+}
+
+impl Ctx {
+    /// Creates an elementwise program context.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            program: Program::new(ProgramKind::Map),
+        }
+    }
+
+    fn row() -> Self {
+        Self {
+            program: Program::new(ProgramKind::Row),
+        }
+    }
+
+    /// Finishes building and returns the scalar program.
+    #[must_use]
+    pub fn finish(self) -> Program {
+        self.program
+    }
+}
+
+impl Default for Ctx {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Deref for Ctx {
+    type Target = Program;
+
+    fn deref(&self) -> &Self::Target {
+        &self.program
+    }
+}
+
+/// Builder context for a row program.
+///
+/// A row context dereferences to [`Ctx`], allowing ordinary helpers that take
+/// `&Ctx` to be reused by row programs while keeping reductions row-only.
+#[derive(Debug)]
+pub struct RowCtx {
+    context: Ctx,
+}
+
+impl RowCtx {
+    /// Creates a row program context.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            context: Ctx::row(),
+        }
+    }
+
+    /// Sums a value across the last axis and broadcasts the result.
+    #[must_use]
+    pub fn row_sum<'a>(&'a self, value: F32<'a>) -> F32<'a> {
+        self.context.program.reduce(ReduceOp::Sum, value)
+    }
+
+    /// Finds the maximum across the last axis and broadcasts the result.
+    #[must_use]
+    pub fn row_max<'a>(&'a self, value: F32<'a>) -> F32<'a> {
+        self.context.program.reduce(ReduceOp::Max, value)
+    }
+
+    /// Finds the minimum across the last axis and broadcasts the result.
+    #[must_use]
+    pub fn row_min<'a>(&'a self, value: F32<'a>) -> F32<'a> {
+        self.context.program.reduce(ReduceOp::Min, value)
+    }
+
+    /// Computes the mean across the last axis and broadcasts the result.
+    #[must_use]
+    pub fn row_mean<'a>(&'a self, value: F32<'a>) -> F32<'a> {
+        self.row_sum(value) / self.extent(-1).cast_f32()
+    }
+
+    /// Finishes building and returns the scalar program.
+    #[must_use]
+    pub fn finish(self) -> Program {
+        self.context.finish()
+    }
+}
+
+impl Default for RowCtx {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Deref for RowCtx {
+    type Target = Ctx;
+
+    fn deref(&self) -> &Self::Target {
+        &self.context
+    }
+}
+
 type ProgramParts = (ProgramKind, Vec<Instruction>, Vec<(u32, u32)>);
 
 fn resolve_axis(axis: i32, rank: usize) -> Result<u8> {
@@ -341,6 +454,14 @@ fn lowered_value(values: &[u32], value: u32) -> Result<u32> {
 }
 
 /// An f32 value produced by a program instruction.
+///
+/// Numeric types do not mix without an explicit cast.
+///
+/// ```compile_fail
+/// use forja_sdk::program::Ctx;
+/// let context = Ctx::new();
+/// let _ = context.input(0) + context.index(0);
+/// ```
 #[derive(Clone, Copy)]
 pub struct F32<'a> {
     state: &'a RefCell<State>,
@@ -526,6 +647,14 @@ impl<'a> F32<'a> {
 }
 
 /// A Boolean value produced by a comparison instruction.
+///
+/// Conditions cannot be stored as program outputs, which are always f32.
+///
+/// ```compile_fail
+/// use forja_sdk::program::Ctx;
+/// let context = Ctx::new();
+/// context.output(0, context.input(0).gt(context.constant(0.0)));
+/// ```
 #[derive(Clone, Copy)]
 pub struct Bool<'a> {
     state: &'a RefCell<State>,
@@ -569,8 +698,8 @@ impl<'a> Bool<'a> {
 /// using Rust's `+`, `-`, or `*` operators is a type error.
 ///
 /// ```compile_fail
-/// use forja_sdk::program::Program;
-/// let program = Program::map();
+/// use forja_sdk::program::Ctx;
+/// let program = Ctx::new();
 /// let value = program.index(0);
 /// let _ = value + value;
 /// ```
@@ -780,11 +909,11 @@ mod tests {
 
     #[test]
     fn builds_the_documented_softmax_shape() {
-        let program = Program::row();
+        let program = RowCtx::new();
         let value = program.input(0);
-        let maximum = program.reduce(ReduceOp::Max, value);
+        let maximum = program.row_max(value);
         let exponent = (value - maximum).exp();
-        let sum = program.reduce(ReduceOp::Sum, exponent);
+        let sum = program.row_sum(exponent);
         program.output(0, exponent / sum);
 
         let (kind, instructions, outputs) = program.parts().unwrap();
@@ -795,8 +924,8 @@ mod tests {
 
     #[test]
     fn remembers_cross_program_value_errors() {
-        let first = Program::map();
-        let second = Program::map();
+        let first = Ctx::new();
+        let second = Ctx::new();
         first.output(0, second.constant(1.0));
         assert!(first.parts().is_err());
     }
@@ -812,7 +941,7 @@ mod tests {
 
     #[test]
     fn lowers_typed_values_and_explicit_casts() {
-        let program = Program::map();
+        let program = Ctx::new();
         let input = program.input_u32(0);
         let lane = program.index(-1);
         let wrapped = input
@@ -844,10 +973,60 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn row_context_lowers_named_operations() {
+        fn clamp_nonnegative<'a>(context: &'a Ctx, value: F32<'a>) -> F32<'a> {
+            value.max(context.constant(0.0)).min(context.constant(1.0))
+        }
+
+        let context = RowCtx::new();
+        let value = clamp_nonnegative(&context, context.input(0));
+        let positive = value.gt(context.constant(0.0));
+        context.output(0, positive.select(context.row_mean(value), value));
+        context.output(1, context.row_sum(value));
+        context.output(2, context.row_max(value));
+        context.output(3, context.row_min(value));
+
+        let (_, instructions, _) = context.parts().unwrap();
+        assert_eq!(
+            instructions
+                .iter()
+                .filter(|instruction| matches!(instruction, Instruction::Select(..)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            instructions
+                .iter()
+                .filter(|instruction| matches!(instruction, Instruction::Reduce(..)))
+                .count(),
+            4
+        );
+        assert!(
+            instructions
+                .iter()
+                .any(|instruction| matches!(instruction, Instruction::Binary(BinaryOp::Max, ..)))
+        );
+        assert!(
+            instructions
+                .iter()
+                .any(|instruction| matches!(instruction, Instruction::Binary(BinaryOp::Min, ..)))
+        );
+    }
+
+    #[test]
+    fn rejects_cross_program_row_reductions() {
+        let first = RowCtx::new();
+        let second = RowCtx::new();
+        let _ = first.row_sum(second.input(0));
+
+        assert!(first.parts().is_err());
+    }
+
     #[cfg(feature = "native")]
     #[test]
     fn prepares_an_explicit_kernel_signature() {
-        let program = Program::map();
+        let program = Ctx::new();
         program.output(0, program.input(0));
 
         Kernel::new(&program, 2, &[DType::F32], &[DType::F32]).unwrap();
@@ -856,7 +1035,7 @@ mod tests {
     #[cfg(feature = "native")]
     #[test]
     fn prepares_an_unsigned_input_signature() {
-        let program = Program::map();
+        let program = Ctx::new();
         program.output(0, program.input_u32(0).cast_f32());
 
         Kernel::new(&program, 1, &[DType::U32], &[DType::F32]).unwrap();
