@@ -478,8 +478,6 @@ fn residual_norm(
     weight: forja_sdk::kernel::Row,
 ) -> (forja_sdk::kernel::Row, forja_sdk::kernel::Row) {
     let value = residual + update;
-    // Pin the weight input ahead of reduction temporaries in the canonical IR.
-    let weight = weight;
     let inverse_rms = (value * value).row_mean() + RMS_EPSILON;
     (value, value * inverse_rms.rsqrt() * weight)
 }
@@ -489,9 +487,6 @@ fn final_norm(
     input: forja_sdk::kernel::Row,
     weight: forja_sdk::kernel::Row,
 ) -> forja_sdk::kernel::Row {
-    // Pin input emission to signature order for the canonical IR identity.
-    let input = input;
-    let weight = weight;
     input * ((input * input).row_mean() + RMS_EPSILON).rsqrt() * weight
 }
 

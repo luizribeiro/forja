@@ -94,7 +94,6 @@ fn macro_residual_norm(
     weight: forja_sdk::kernel::Row,
 ) -> (forja_sdk::kernel::Row, forja_sdk::kernel::Row) {
     let value = residual + update;
-    let weight = weight;
     let inverse_rms = (value * value).row_mean() + QWEN_RMS_EPSILON;
     (value, value * inverse_rms.rsqrt() * weight)
 }
@@ -104,8 +103,6 @@ fn macro_final_norm(
     input: forja_sdk::kernel::Row,
     weight: forja_sdk::kernel::Row,
 ) -> forja_sdk::kernel::Row {
-    let input = input;
-    let weight = weight;
     input * ((input * input).row_mean() + QWEN_RMS_EPSILON).rsqrt() * weight
 }
 
@@ -476,7 +473,7 @@ fn helper_expansion_caps_name_the_kernel() {
 }
 
 #[test]
-fn qwen_norm_programs_preserve_builder_ir() -> Result<(), Box<dyn Error>> {
+fn qwen_norm_programs_preserve_interpreter_bits() -> Result<(), Box<dyn Error>> {
     let residual = macro_residual_norm_program(
         2,
         &[DType::F32, DType::F32, DType::F32],
@@ -493,10 +490,15 @@ fn qwen_norm_programs_preserve_builder_ir() -> Result<(), Box<dyn Error>> {
         &[DType::F32, DType::F32, DType::F32],
         &[DType::F32, DType::F32],
     )?;
-    assert_eq!(
-        residual.validated_program().content_hash(),
-        hand.validated_program().content_hash()
-    );
+    let shape = [7, 1024];
+    let values = (0..3)
+        .map(|input| random_values(7168, 0xface + input))
+        .collect::<Vec<_>>();
+    let inputs = values
+        .iter()
+        .map(|values| Input::F32(values))
+        .collect::<Vec<_>>();
+    assert_interpreter_bits_equal(&residual, &hand, &shape, &inputs)?;
 
     let final_kernel = macro_final_norm_program(2, &[DType::F32, DType::F32], &[DType::F32])?;
     let hand = RowCtx::new();
@@ -504,10 +506,7 @@ fn qwen_norm_programs_preserve_builder_ir() -> Result<(), Box<dyn Error>> {
     let weight = hand.input(1);
     hand.output(0, rms_normalize(&hand, value, weight));
     let hand = Kernel::new(&hand.finish(), 2, &[DType::F32, DType::F32], &[DType::F32])?;
-    assert_eq!(
-        final_kernel.validated_program().content_hash(),
-        hand.validated_program().content_hash()
-    );
+    assert_interpreter_bits_equal(&final_kernel, &hand, &shape, &inputs[..2])?;
     Ok(())
 }
 
@@ -527,10 +526,20 @@ fn qwen_qk_norm_rope_preserves_interpreter_bits() -> Result<(), Box<dyn Error>> 
         .iter()
         .map(|values| Input::F32(values))
         .collect::<Vec<_>>();
+    assert_interpreter_bits_equal(&macro_kernel, &hand, &shape, &inputs)
+}
+
+fn assert_interpreter_bits_equal(
+    macro_kernel: &Kernel,
+    hand_kernel: &Kernel,
+    shape: &[u32],
+    inputs: &[Input<'_>],
+) -> Result<(), Box<dyn Error>> {
     let macro_outputs =
-        forja_cpu::interpreter::interpret(macro_kernel.validated_program(), &shape, &inputs)?;
+        forja_cpu::interpreter::interpret(macro_kernel.validated_program(), shape, inputs)?;
     let hand_outputs =
-        forja_cpu::interpreter::interpret(hand.validated_program(), &shape, &inputs)?;
+        forja_cpu::interpreter::interpret(hand_kernel.validated_program(), shape, inputs)?;
+    assert_eq!(hand_outputs.len(), macro_outputs.len());
     for (expected, actual) in hand_outputs.iter().zip(&macro_outputs) {
         assert_eq!(
             expected
