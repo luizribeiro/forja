@@ -30,7 +30,7 @@ use forja_sdk::{
         Embedding, EmbeddingConfig, Linear, LinearConfig, RmsNorm, RmsNormConfig, WeightElement,
         ops::sdpa,
     },
-    program::{Kernel, Program, ReduceOp, Value},
+    program::{F32, Kernel, Program, ReduceOp},
 };
 
 /// Vocabulary size reported by Qwen3-0.6B.
@@ -397,7 +397,7 @@ fn qk_norm_rope_program() -> Result<Program> {
     let inverse_rms = (square_sum / head_dimension + RMS_EPSILON).rsqrt();
     let normalized_lo = lo_value * inverse_rms * program.input(2);
     let normalized_hi = hi_value * inverse_rms * program.input(3);
-    let exponent = program.index(-1) * (-2.0 / head_dimension);
+    let exponent = program.index(-1).cast_f32() * (-2.0 / head_dimension);
     let angle = program.input(4) * program.constant(ROPE_THETA).pow(exponent);
     let cosine = angle.cos();
     let sine = angle.sin();
@@ -462,9 +462,9 @@ fn prepare_kernel<T: Activation>(
     )
 }
 
-fn rms_normalize<'a>(program: &'a Program, value: Value<'a>, weight: Value<'a>) -> Value<'a> {
+fn rms_normalize<'a>(program: &'a Program, value: F32<'a>, weight: F32<'a>) -> F32<'a> {
     let square_sum = program.reduce(ReduceOp::Sum, value * value);
-    let inverse_rms = (square_sum / program.extent(-1) + RMS_EPSILON).rsqrt();
+    let inverse_rms = (square_sum / program.extent(-1).cast_f32() + RMS_EPSILON).rsqrt();
     value * inverse_rms * weight
 }
 

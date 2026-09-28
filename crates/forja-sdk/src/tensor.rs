@@ -794,7 +794,7 @@ mod tests {
         let program = Program::row();
         let value = program.input(0);
         let square_sum = program.reduce(ReduceOp::Sum, value * value);
-        let inverse_rms = (square_sum / program.extent(-1) + 1.0e-6).rsqrt();
+        let inverse_rms = (square_sum / program.extent(-1).cast_f32() + 1.0e-6).rsqrt();
         program.output(0, value * inverse_rms * program.input(1));
         let actual = input
             .run_program(&program, &[&broadcast_weight])

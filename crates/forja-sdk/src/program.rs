@@ -348,9 +348,6 @@ pub struct F32<'a> {
     marker: PhantomData<&'a Program>,
 }
 
-#[doc(hidden)]
-pub type Value<'a> = F32<'a>;
-
 impl<'a> F32<'a> {
     /// Computes the absolute value.
     #[must_use]
@@ -773,22 +770,6 @@ impl Neg for F32<'_> {
 
     fn neg(self) -> Self::Output {
         self.unary(UnaryOp::Neg)
-    }
-}
-
-impl<'a> Mul<f32> for U32<'a> {
-    type Output = F32<'a>;
-
-    fn mul(self, other: f32) -> Self::Output {
-        self.cast_f32() * other
-    }
-}
-
-impl<'a> Div<U32<'a>> for F32<'a> {
-    type Output = Self;
-
-    fn div(self, other: U32<'a>) -> Self::Output {
-        self / other.cast_f32()
     }
 }
 

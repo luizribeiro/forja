@@ -134,7 +134,7 @@ fn fused() -> forja_sdk::Result<Vec<f32>> {
     let program = Program::row();
     let sum = program.input(0) + program.input(1);
     let square_sum = program.reduce(ReduceOp::Sum, sum * sum);
-    let inverse_rms = (square_sum / program.extent(-1) + 1.0e-6).rsqrt();
+    let inverse_rms = (square_sum / program.extent(-1).cast_f32() + 1.0e-6).rsqrt();
     program.output(0, sum * inverse_rms * program.input(2));
     residual
         .run_program(&program, &[&update, &weight])?
