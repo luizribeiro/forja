@@ -231,6 +231,12 @@ pub struct DispatchProfile {
 /// Host phases and device timings from one profiled submission.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SubmissionProfile {
+    /// Scalar-program dispatch recording on the submitting thread.
+    pub program_recording: ProfileCount,
+    /// Scalar-program dispatch encoding on the submitting thread.
+    pub program_encoding: ProfileCount,
+    /// Resident program compilations skipped because no compile token was available.
+    pub program_compile_fallbacks: u64,
     /// Command validation and hazard analysis.
     pub validation: Duration,
     /// Temporary Metal buffers created while encoding.

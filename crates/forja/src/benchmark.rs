@@ -569,6 +569,24 @@ fn profile_categories(
         submission_category("submit.validation", submissions, |submission| {
             (1.0, submission.validation)
         }),
+        submission_category("program.recording", submissions, |submission| {
+            (
+                count_as_f64(submission.program_recording.count),
+                submission.program_recording.time,
+            )
+        }),
+        submission_category("program.encoding", submissions, |submission| {
+            (
+                count_as_f64(submission.program_encoding.count),
+                submission.program_encoding.time,
+            )
+        }),
+        submission_category("program.compile-fallbacks", submissions, |submission| {
+            (
+                count_as_f64(submission.program_compile_fallbacks),
+                Duration::ZERO,
+            )
+        }),
         submission_category("buffer.metadata", submissions, |submission| {
             (
                 count_as_f64(submission.metadata_buffers.count),

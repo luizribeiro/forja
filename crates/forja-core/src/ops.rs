@@ -1,4 +1,9 @@
-use std::{error::Error, fmt, sync::Arc};
+use std::{
+    error::Error,
+    fmt,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use crate::program::{
     BindError, BoundProgram, KernelSignature, PreparedProgram, ProgramHash, ValidatedProgram,
@@ -287,6 +292,8 @@ impl Dispatch {
 #[derive(Clone, Debug, Default)]
 pub struct CommandList {
     dispatches: Vec<Dispatch>,
+    program_recording: Duration,
+    program_dispatches: u64,
 }
 
 impl CommandList {
@@ -295,6 +302,8 @@ impl CommandList {
     pub const fn new() -> Self {
         Self {
             dispatches: Vec::new(),
+            program_recording: Duration::ZERO,
+            program_dispatches: 0,
         }
     }
 
@@ -353,6 +362,7 @@ impl CommandList {
         inputs: &[&Tensor],
         outputs: &[&Tensor],
     ) -> Result<(), OpError> {
+        let started = Instant::now();
         let output = outputs
             .first()
             .copied()
@@ -373,6 +383,7 @@ impl CommandList {
                 prepared: None,
             }),
         });
+        self.record_program(started);
         Ok(())
     }
 
@@ -388,6 +399,7 @@ impl CommandList {
         inputs: &[&Tensor],
         outputs: &[&Tensor],
     ) -> Result<(), OpError> {
+        let started = Instant::now();
         let output = outputs
             .first()
             .copied()
@@ -410,7 +422,23 @@ impl CommandList {
                 prepared: Some(Arc::clone(program)),
             }),
         });
+        self.record_program(started);
         Ok(())
+    }
+
+    fn record_program(&mut self, started: Instant) {
+        self.program_recording = self.program_recording.saturating_add(started.elapsed());
+        self.program_dispatches = self.program_dispatches.saturating_add(1);
+    }
+
+    /// Returns scalar-program recording count and host time.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn program_recording(&self) -> crate::ProfileCount {
+        crate::ProfileCount {
+            count: self.program_dispatches,
+            time: self.program_recording,
+        }
     }
 
     /// Consumes the list into its validated dispatches.
