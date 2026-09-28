@@ -242,11 +242,7 @@ fn compare_float_values(reference: &[f32], candidate: &[f32]) -> (f64, usize) {
             let delta = f64::from(actual) - expected;
             difference = delta.mul_add(delta, difference);
             norm = expected.mul_add(expected, norm);
-        } else if !(expected.is_nan() && actual.is_nan()
-            || expected.is_infinite()
-                && actual.is_infinite()
-                && expected.to_bits() == actual.to_bits())
-        {
+        } else if !nonfinite_values_agree(expected, actual) {
             class_mismatches += 1;
         }
     }
@@ -260,6 +256,32 @@ fn compare_float_values(reference: &[f32], candidate: &[f32]) -> (f64, usize) {
         (difference / norm).sqrt()
     };
     (error, class_mismatches)
+}
+
+/// Compares non-finite classes while admitting rounding at the f32 overflow edge.
+///
+/// Sequential CPU evaluation and parallel or fused GPU evaluation can round the
+/// same mathematical result to a finite value or infinity on opposite sides of
+/// the overflow boundary. A finite/infinite pair therefore agrees only when its
+/// signs match and the finite magnitude is at least 2^126. NaN against any
+/// non-NaN remains a mismatch.
+fn nonfinite_values_agree(left: f32, right: f32) -> bool {
+    const OVERFLOW_EDGE: f32 = f32::from_bits(0x7e80_0000);
+
+    if left.is_nan() || right.is_nan() {
+        return left.is_nan() && right.is_nan();
+    }
+    if left.is_infinite() && right.is_infinite() {
+        return left.to_bits() == right.to_bits();
+    }
+    let (finite, infinite) = if left.is_finite() {
+        (left, right)
+    } else {
+        (right, left)
+    };
+    infinite.is_infinite()
+        && finite.abs() >= OVERFLOW_EDGE
+        && finite.is_sign_negative() == infinite.is_sign_negative()
 }
 
 /// Checks f32 values with the shared normwise relative-error tolerance.
@@ -544,6 +566,34 @@ mod tests {
         );
         assert!(normwise_relative_error(&[0.0], &[f32::NAN]).is_infinite());
         assert!(normwise_relative_error(&[f32::INFINITY], &[f32::NEG_INFINITY]).is_infinite());
+    }
+
+    #[test]
+    fn overflow_edge_accepts_only_matching_nearby_finite_values() {
+        let edge = f32::from_bits(0x7e80_0000);
+        let below_edge = f32::from_bits(edge.to_bits() - 1);
+
+        for (reference, candidate) in [
+            (edge, f32::INFINITY),
+            (f32::INFINITY, edge),
+            (-edge, f32::NEG_INFINITY),
+            (f32::NEG_INFINITY, -edge),
+        ] {
+            assert_f32_values_agree(&[reference], &[candidate]).unwrap();
+        }
+        for (reference, candidate) in [
+            (below_edge, f32::INFINITY),
+            (-below_edge, f32::NEG_INFINITY),
+            (edge, f32::NEG_INFINITY),
+            (-edge, f32::INFINITY),
+            (f32::NAN, f32::INFINITY),
+            (f32::NAN, edge),
+        ] {
+            assert_eq!(
+                assert_f32_values_agree(&[reference], &[candidate]),
+                Err(AgreementError::ClassMismatch { count: 1 })
+            );
+        }
     }
 
     #[test]
