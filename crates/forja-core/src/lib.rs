@@ -6,6 +6,7 @@ mod layout;
 mod ops;
 pub mod program;
 mod quantized;
+mod symbolic;
 
 pub use backend::{
     AllocationRegistry, Backend, BackendError, DispatchProfile, ProfileCount, Submission,
@@ -17,6 +18,7 @@ pub use ops::{
     BufferId, CommandList, Dispatch, Op, OpError, Operand, Tensor, TensorError, required_barriers,
 };
 pub use quantized::{QuantizedMatrix, QuantizedMatrixError, QuantizedMatrixPart};
+pub use symbolic::{MAX_PARAMS, ParamError, ParamSpace, ParamValues};
 
 /// A scalar type stored in an unquantized tensor.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
