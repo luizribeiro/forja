@@ -219,17 +219,26 @@ pub fn normwise_relative_error(reference: &[f32], candidate: &[f32]) -> f64 {
     if reference.len() != candidate.len() {
         return f64::INFINITY;
     }
-    let (difference, norm) = reference.iter().zip(candidate).fold(
-        (0.0_f64, 0.0_f64),
-        |(difference, norm), (&expected, &actual)| {
-            let expected = f64::from(expected);
-            let delta = f64::from(actual) - expected;
-            (
-                delta.mul_add(delta, difference),
-                expected.mul_add(expected, norm),
-            )
-        },
-    );
+    let mut difference = 0.0_f64;
+    let mut norm = 0.0_f64;
+    for (&expected, &actual) in reference.iter().zip(candidate) {
+        if expected.is_nan() || actual.is_nan() {
+            if expected.is_nan() && actual.is_nan() {
+                continue;
+            }
+            return f64::INFINITY;
+        }
+        if !expected.is_finite() || !actual.is_finite() {
+            if expected.to_bits() == actual.to_bits() {
+                continue;
+            }
+            return f64::INFINITY;
+        }
+        let expected = f64::from(expected);
+        let delta = f64::from(actual) - expected;
+        difference = delta.mul_add(delta, difference);
+        norm = expected.mul_add(expected, norm);
+    }
     if norm == 0.0 {
         if difference == 0.0 {
             0.0
@@ -497,6 +506,20 @@ mod tests {
         assert!(normwise_relative_error(&[0.0], &[0.0]).abs() < f64::EPSILON);
         assert!(normwise_relative_error(&[0.0], &[1.0]).is_infinite());
         assert!((normwise_relative_error(&[3.0, 4.0], &[0.0, 0.0]) - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn normwise_error_matches_nonfinite_values_by_kind() {
+        assert!(
+            normwise_relative_error(
+                &[f32::NAN, f32::INFINITY, f32::NEG_INFINITY],
+                &[f32::NAN, f32::INFINITY, f32::NEG_INFINITY]
+            )
+            .abs()
+                < f64::EPSILON
+        );
+        assert!(normwise_relative_error(&[0.0], &[f32::NAN]).is_infinite());
+        assert!(normwise_relative_error(&[f32::INFINITY], &[f32::NEG_INFINITY]).is_infinite());
     }
 
     #[test]

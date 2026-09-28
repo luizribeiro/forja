@@ -20,7 +20,7 @@ kernel void sdpa_scale_mask(
     uint query = (index / params.key_length) % params.query_length;
     uint key = index % params.key_length;
     if (params.causal != 0 && key > params.query_start + query) {
-        scores[index] = -INFINITY;
+        scores[index] = negative_finite_sentinel();
     } else {
         scores[index] *= params.scale;
     }
@@ -135,7 +135,7 @@ void steel_attention_body(
     short row = coordinate.y;
     short column = coordinate.x;
     short query_row = FRAGMENT * simdgroup + row;
-    float maximum[1] = {-INFINITY};
+    float maximum[1] = {negative_finite_sentinel()};
     float denominator[1] = {0.0f};
 
     uint key_blocks = (params.key_length + BK - 1) / BK;
@@ -183,7 +183,7 @@ void steel_attention_body(
                 short key_column = key_fragment * FRAGMENT + column;
                 for (short element = 0; element < Fragment::elements; ++element) {
                     if (first_key + key_column + element >= params.key_length) {
-                        scores.at(0, key_fragment)[element] = -INFINITY;
+                        scores.at(0, key_fragment)[element] = negative_finite_sentinel();
                     }
                 }
             }
@@ -194,7 +194,7 @@ void steel_attention_body(
                 short key_column = key_fragment * FRAGMENT + column;
                 for (short element = 0; element < Fragment::elements; ++element) {
                     if (first_key + key_column + element > absolute_query) {
-                        scores.at(0, key_fragment)[element] = -INFINITY;
+                        scores.at(0, key_fragment)[element] = negative_finite_sentinel();
                     }
                 }
             }

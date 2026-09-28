@@ -3460,7 +3460,8 @@ fn encode_layout(layout: &Layout) -> Result<[u8; 112], BackendError> {
 
 pub(super) struct PipelineCache {
     device: Retained<ProtocolObject<dyn MTLDevice>>,
-    library: Retained<ProtocolObject<dyn MTLLibrary>>,
+    fast_library: Retained<ProtocolObject<dyn MTLLibrary>>,
+    nan_preserving_library: Retained<ProtocolObject<dyn MTLLibrary>>,
     pipelines: HashMap<PipelineKey, Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
     programs: LruCache<ProgramPipelineKey, Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
 }
@@ -3474,13 +3475,18 @@ impl PipelineCache {
         source: &str,
     ) -> Result<Self, BackendError> {
         let source = NSString::from_str(source);
-        let options = compile_options(MTLMathMode::Fast);
-        let library = device
-            .newLibraryWithSource_options_error(&source, Some(&options))
+        let fast_options = compile_options(MTLMathMode::Fast);
+        let fast_library = device
+            .newLibraryWithSource_options_error(&source, Some(&fast_options))
+            .map_err(|_| BackendError::ExecutionFailed)?;
+        let nan_preserving_options = compile_options(MTLMathMode::Relaxed);
+        let nan_preserving_library = device
+            .newLibraryWithSource_options_error(&source, Some(&nan_preserving_options))
             .map_err(|_| BackendError::ExecutionFailed)?;
         Ok(Self {
             device: device.clone(),
-            library,
+            fast_library,
+            nan_preserving_library,
             pipelines: HashMap::new(),
             programs: LruCache::new(PROGRAM_PIPELINE_CAPACITY),
         })
@@ -3510,9 +3516,13 @@ impl PipelineCache {
                 );
             }
         }
+        let library = if nan_preserving_kernel(name) {
+            &self.nan_preserving_library
+        } else {
+            &self.fast_library
+        };
         let name = NSString::from_str(name);
-        let function = self
-            .library
+        let function = library
             .newFunctionWithName_constantValues_error(&name, &values)
             .map_err(|_| BackendError::ExecutionFailed)?;
         let pipeline = self
@@ -3582,6 +3592,10 @@ impl PipelineCache {
             .newComputePipelineStateWithFunction_error(&function)
             .map_err(|_| program_compile_failed(key.hash))
     }
+}
+
+fn nan_preserving_kernel(name: &str) -> bool {
+    matches!(name, "softmax_single" | "softmax_looped")
 }
 
 fn compile_options(math_mode: MTLMathMode) -> Retained<MTLCompileOptions> {
@@ -4383,6 +4397,29 @@ mod tests {
     }
 
     #[test]
+    fn causal_attention_first_row_is_finite_on_every_path() {
+        for (kernel, key_length) in [
+            (SdpaKernel::Vector, 33),
+            (SdpaKernel::Vector, 1024),
+            (SdpaKernel::Steel, 33),
+            (SdpaKernel::Decomposed, 33),
+        ] {
+            assert_sdpa_with(
+                kernel,
+                Op::Sdpa {
+                    scale: 0.125,
+                    causal: true,
+                    q_start: 0,
+                },
+                TensorSpec::contiguous(DType::F32, &[4, 1, 64]),
+                TensorSpec::contiguous(DType::F32, &[2, key_length, 64]),
+                TensorSpec::contiguous(DType::F32, &[2, key_length, 64]),
+                &TensorSpec::contiguous(DType::F32, &[4, 1, 64]),
+            );
+        }
+    }
+
+    #[test]
     fn metal_attention_reads_strided_qwen_cache_views() {
         let cache_slice = [
             Slice::new(0, 8, 1).unwrap(),
@@ -4862,7 +4899,7 @@ mod tests {
     }
 
     #[test]
-    fn metal_softmax_matches_cpu_for_dtypes_rows_and_masking() {
+    fn metal_softmax_matches_cpu_for_dtypes_rows_and_views() {
         let reference = CpuBackend::new();
         let candidate = MetalBackend::new().unwrap();
         for dtype in [DType::F32, DType::F16, DType::BF16] {
@@ -4885,6 +4922,12 @@ mod tests {
             )
             .unwrap();
         }
+    }
+
+    #[test]
+    fn metal_softmax_handles_masked_and_all_masked_rows() {
+        let reference = CpuBackend::new();
+        let candidate = MetalBackend::new().unwrap();
         let masked = [
             0.0_f32,
             f32::NEG_INFINITY,

@@ -17,6 +17,10 @@ constant uint program_output1_dtype [[function_constant(9)]];
 constant uint program_output2_dtype [[function_constant(10)]];
 constant uint program_output3_dtype [[function_constant(11)]];
 
+float negative_finite_sentinel() {
+    return as_type<float>(0xff7fffffu);
+}
+
 struct TensorLayout {
     ulong offset;
     uint rank;

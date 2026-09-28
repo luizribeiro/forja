@@ -31,7 +31,7 @@ void mlx_sdpa_vector_body(
         result[element] = 0.0f;
     }
 
-    float maximum = -INFINITY;
+    float maximum = negative_finite_sentinel();
     float denominator = 0.0f;
     for (uint key_row = simd_group; key_row < params.key_length; key_row += BN) {
         if (params.causal != 0 && key_row > params.query_start + query_row) {
@@ -136,7 +136,7 @@ void mlx_sdpa_vector_2pass_1_body(
         result[element] = 0.0f;
     }
 
-    float maximum = -INFINITY;
+    float maximum = negative_finite_sentinel();
     float denominator = 0.0f;
     for (uint key_row = block; key_row < params.key_length; key_row += params.blocks) {
         if (params.causal != 0 && key_row > params.query_start + query_row) {
@@ -213,7 +213,7 @@ void mlx_sdpa_vector_2pass_2_body(
     uint head = position.x;
     uint query_row = position.y;
     ulong first_block = (ulong(head) * params.query_length + query_row) * params.blocks;
-    float maximum = -INFINITY;
+    float maximum = negative_finite_sentinel();
     for (uint group = 0; group < params.blocks / BN; ++group) {
         maximum = max(maximum, maxs[first_block + simd_lane + BN * group]);
     }
