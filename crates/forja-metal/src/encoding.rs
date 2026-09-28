@@ -1302,6 +1302,7 @@ impl MetalBackend {
         self.in_flight.drain_done();
         let validation_started = PROFILE.then(Instant::now);
         let program_recording = commands.program_recording();
+        let retained_tensors_validated = commands.retained_tensors_validated();
         let barriers = required_barriers(&commands);
         let dispatches = commands.into_dispatches();
         let prepared_programs = dispatches
@@ -1320,8 +1321,10 @@ impl MetalBackend {
             .flat_map(|dispatch| dispatch.inputs().iter().chain(dispatch.outputs()))
             .cloned()
             .collect::<Vec<_>>();
-        for tensor in &tensors {
-            self.validate(tensor)?;
+        if !retained_tensors_validated {
+            for tensor in &tensors {
+                self.validate(tensor)?;
+            }
         }
         let mut profile = PROFILE.then(|| SubmissionProfile {
             program_recording,

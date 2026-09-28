@@ -490,6 +490,15 @@ impl GraphTemplate {
         &self.required_barriers
     }
 
+    /// Checks raw replay values against this template's parameter space.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ParamError`] when the count differs or a value is out of range.
+    pub fn values(&self, values: Vec<u32>) -> Result<ParamValues, ParamError> {
+        self.space.values(values)
+    }
+
     /// Validates and records one trusted operation at every parameter-space corner.
     ///
     /// # Errors

@@ -531,13 +531,16 @@ impl Backend for CpuBackend {
 
     fn submit(&self, commands: CommandList) -> Result<Self::Submission, BackendError> {
         let started = std::time::Instant::now();
+        let retained_tensors_validated = commands.retained_tensors_validated();
         let dispatches = commands.into_dispatches();
-        for dispatch in &dispatches {
-            for output in dispatch.outputs() {
-                self.validate(output)?;
-            }
-            for input in dispatch.inputs() {
-                self.validate(input)?;
+        if !retained_tensors_validated {
+            for dispatch in &dispatches {
+                for output in dispatch.outputs() {
+                    self.validate(output)?;
+                }
+                for input in dispatch.inputs() {
+                    self.validate(input)?;
+                }
             }
         }
         let result = dispatches
@@ -725,7 +728,7 @@ fn encode(source: &[f32], output: DType) -> Option<Vec<u8>> {
 mod tests {
     use super::*;
     use forja_core::{
-        Op, Slice,
+        Affine, GraphLimits, GraphTemplate, Op, ParamSpace, Slice, SymbolicLayout, TemplateTensor,
         program::{BinOp, Inst, KernelSignature, Program, ProgramKind, ValueType, prepare_program},
     };
     use std::{
@@ -734,6 +737,60 @@ mod tests {
     };
 
     static NEXT_FILE: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn replays_graphs_through_the_prevalidated_path() {
+        let backend = CpuBackend::new();
+        let input = backend.alloc(DType::F32, &[4]).unwrap();
+        let output_base = backend.alloc(DType::F32, &[4]).unwrap();
+        backend
+            .write(&input, &f32_bytes(&[1.0, 2.0, 3.0, 4.0]))
+            .unwrap();
+        let space = ParamSpace::new(std::iter::once(1..=4).collect()).unwrap();
+        let extent = Affine::parameter(0, 0, 1);
+        let input = TemplateTensor::symbolic(
+            input.clone(),
+            SymbolicLayout::new(input.layout().clone(), space.clone())
+                .slice(0, 0.into(), extent, 1)
+                .unwrap(),
+        )
+        .unwrap();
+        let output = TemplateTensor::symbolic(
+            output_base.clone(),
+            SymbolicLayout::new(output_base.layout().clone(), space.clone())
+                .slice(0, 0.into(), extent, 1)
+                .unwrap(),
+        )
+        .unwrap();
+        let mut graph = GraphTemplate::new(space, GraphLimits::default());
+        graph.dispatch(Op::Copy, &[&input], &output).unwrap();
+        let graph = backend.prepare_graph(graph).unwrap();
+
+        backend.replay(&graph, vec![3]).unwrap().wait().unwrap();
+
+        assert_eq!(
+            backend.read(&output_base).unwrap(),
+            f32_bytes(&[1.0, 2.0, 3.0, 0.0])
+        );
+    }
+
+    #[test]
+    fn appending_to_an_instantiated_graph_restores_tensor_validation() {
+        let backend = CpuBackend::new();
+        let graph =
+            GraphTemplate::new(ParamSpace::new(Vec::new()).unwrap(), GraphLimits::default());
+        let values = graph.values(Vec::new()).unwrap();
+        let mut commands = graph.instantiate(&values).unwrap();
+        let foreign = CpuBackend::new();
+        let input = foreign.alloc(DType::F32, &[1]).unwrap();
+        let output = foreign.alloc(DType::F32, &[1]).unwrap();
+        commands.dispatch(Op::Copy, &[&input], &output).unwrap();
+
+        assert!(matches!(
+            backend.submit(commands),
+            Err(BackendError::InvalidInput)
+        ));
+    }
 
     #[test]
     fn rejects_foreign_tensors() {

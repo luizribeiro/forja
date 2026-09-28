@@ -7,7 +7,7 @@ use std::{
 };
 
 use crate::{
-    BufferId, CommandList, DType, Layout, MappedRegion, Op, Slice, Tensor,
+    BufferId, CommandList, DType, GraphTemplate, Layout, MappedRegion, Op, Slice, Tensor,
     program::{KernelSignature, ValidatedProgram},
 };
 
@@ -373,6 +373,41 @@ pub trait Backend {
     ///
     /// Returns invalid input if any tensor belongs to another backend.
     fn submit(&self, commands: CommandList) -> Result<Self::Submission, BackendError>;
+
+    /// Prepares a validated graph for repeated execution.
+    ///
+    /// The default tier retains the template unchanged. Backend-specific encoding plans may be
+    /// introduced without changing the guest-facing graph contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns a backend error when graph preparation cannot be completed.
+    fn prepare_graph(&self, graph: GraphTemplate) -> Result<GraphTemplate, BackendError> {
+        Ok(graph)
+    }
+
+    /// Instantiates and submits a prepared graph through the prevalidated command path.
+    ///
+    /// Parameter-dependent dispatches receive complete concrete validation during instantiation.
+    /// Static dispatches skip repeated operation validation, retained tensors skip the redundant
+    /// registry scan, and the template's conservative hull barriers replace hazard recomputation.
+    ///
+    /// # Errors
+    ///
+    /// Returns invalid input for bad parameter values or a backend submission error.
+    fn replay(
+        &self,
+        graph: &GraphTemplate,
+        values: Vec<u32>,
+    ) -> Result<Self::Submission, BackendError> {
+        let values = graph
+            .values(values)
+            .map_err(|_| BackendError::InvalidInput)?;
+        let commands = graph
+            .instantiate(&values)
+            .map_err(|_| BackendError::InvalidInput)?;
+        self.submit(commands)
+    }
 
     /// Submits work with detailed timing enabled.
     ///

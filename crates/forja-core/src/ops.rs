@@ -346,9 +346,16 @@ impl Dispatch {
 #[derive(Clone, Debug, Default)]
 pub struct CommandList {
     dispatches: Vec<Dispatch>,
-    precomputed_barriers: Option<Vec<bool>>,
+    validation: ValidationState,
     program_recording: Duration,
     program_dispatches: u64,
+}
+
+#[derive(Clone, Debug, Default)]
+enum ValidationState {
+    #[default]
+    Fresh,
+    Prevalidated(Vec<bool>),
 }
 
 impl CommandList {
@@ -357,7 +364,7 @@ impl CommandList {
     pub const fn new() -> Self {
         Self {
             dispatches: Vec::new(),
-            precomputed_barriers: None,
+            validation: ValidationState::Fresh,
             program_recording: Duration::ZERO,
             program_dispatches: 0,
         }
@@ -406,12 +413,19 @@ impl CommandList {
     }
 
     pub(crate) fn push_prevalidated(&mut self, dispatch: Dispatch) {
-        self.precomputed_barriers = None;
+        self.validation = ValidationState::Fresh;
         self.dispatches.push(dispatch);
     }
 
     pub(crate) fn set_precomputed_barriers(&mut self, barriers: Vec<bool>) {
-        self.precomputed_barriers = Some(barriers);
+        self.validation = ValidationState::Prevalidated(barriers);
+    }
+
+    /// Reports whether every tensor registry entry is retained by a validated graph.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn retained_tensors_validated(&self) -> bool {
+        matches!(self.validation, ValidationState::Prevalidated(_))
     }
 
     fn record_program(&mut self, started: Instant) {
@@ -461,7 +475,7 @@ fn check_kernel_signature(
 /// Reports whether each dispatch needs a barrier before it.
 #[must_use]
 pub fn required_barriers(commands: &CommandList) -> Vec<bool> {
-    if let Some(barriers) = &commands.precomputed_barriers {
+    if let ValidationState::Prevalidated(barriers) = &commands.validation {
         return barriers.clone();
     }
     barriers_for_accesses(commands.dispatches.iter().map(dispatch_accesses))
