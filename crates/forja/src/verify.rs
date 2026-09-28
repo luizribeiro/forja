@@ -10,10 +10,50 @@ use golden_fixtures::{
 use crate::args::{Backend as BackendArg, Precision, Verify};
 use crate::engine::{argmax, limits};
 
+#[derive(Clone, Copy, Default)]
+struct DecodeMetrics {
+    total_kl: f64,
+    maximum_kl: f64,
+    agreement: u32,
+    steps: u32,
+}
+
+impl DecodeMetrics {
+    fn mean_kl(self) -> f64 {
+        if self.steps == 0 {
+            f64::INFINITY
+        } else {
+            self.total_kl / f64::from(self.steps)
+        }
+    }
+
+    fn include(&mut self, other: Self) {
+        self.total_kl += other.total_kl;
+        self.maximum_kl = self.maximum_kl.max(other.maximum_kl);
+        self.agreement += other.agreement;
+        self.steps += other.steps;
+    }
+}
+
 #[derive(Clone, Copy)]
+enum DecodeMode {
+    FreeRunning,
+}
+
+struct DecodeInput<'a> {
+    prompt: &'a str,
+    expected_tokens: &'a [i64],
+    reference_logits: &'a [f32],
+    prompt_tokens: u32,
+    logits: Vec<f32>,
+    vocab: usize,
+    steps: usize,
+}
+
+#[derive(Clone, Copy, Default)]
 struct VerificationSummary {
     maximum_layer_error: f64,
-    maximum_prompt_kl: f64,
+    free_running: DecodeMetrics,
 }
 
 pub(crate) async fn run(options: &Verify) -> Result<(), Box<dyn Error>> {
@@ -100,10 +140,7 @@ where
         .map_err(|error| format!("engine load failed: {error:?}"))?;
     let prompts = selected_prompts(fixtures, &options.prompts)?;
     let mut passed = true;
-    let mut summary = VerificationSummary {
-        maximum_layer_error: 0.0,
-        maximum_prompt_kl: 0.0,
-    };
+    let mut summary = VerificationSummary::default();
     println!("prompt\tlayer\trelative-error\tresult");
     for fixture in prompts {
         let tokens = fixture
@@ -144,27 +181,36 @@ where
             &logits,
             usize::try_from(info.vocab)?,
         )?;
-        let prompt_tokens = u32::try_from(fixture.prompt_ids().len())?;
-        let (decode_kl, agreement) = decode(
+        let free_running = decode(
             &mut runner,
-            fixture,
-            prompt_tokens,
-            logits,
-            usize::try_from(info.vocab)?,
-            decode_steps,
+            DecodeInput {
+                prompt: fixture.name(),
+                expected_tokens: fixture.greedy_tokens(),
+                reference_logits: fixture.greedy_step_logits().values(),
+                prompt_tokens: u32::try_from(fixture.prompt_ids().len())?,
+                logits,
+                vocab: usize::try_from(info.vocab)?,
+                steps: decode_steps,
+            },
+            DecodeMode::FreeRunning,
+            true,
         )
         .await?;
         let prompt_passed = first_failing.is_none()
             && logits_kl <= LOGIT_KL_TOLERANCE
-            && decode_kl <= LOGIT_KL_TOLERANCE
-            && agreement == decode_steps;
+            && free_running.mean_kl() <= LOGIT_KL_TOLERANCE
+            && free_running.agreement == free_running.steps;
         summary.maximum_layer_error = summary.maximum_layer_error.max(maximum_layer_error);
-        summary.maximum_prompt_kl = summary.maximum_prompt_kl.max(logits_kl);
+        summary.free_running.include(free_running);
         passed &= prompt_passed;
         println!(
-            "{}\tmax-layer={maximum_layer_error:.8e}\tfirst-failing={}\tprompt-kl={logits_kl:.8e}\tdecode-kl={decode_kl:.8e}\ttokens={agreement}/{decode_steps}\t{}",
+            "{}\tmax-layer={maximum_layer_error:.8e}\tfirst-failing={}\tprompt-kl={logits_kl:.8e}\tfree-mean-kl={:.8e}\tfree-max-kl={:.8e}\ttop-1={}/{}\t{}",
             fixture.name(),
             first_failing.map_or_else(|| "-".to_owned(), |layer| layer.to_string()),
+            free_running.mean_kl(),
+            free_running.maximum_kl,
+            free_running.agreement,
+            free_running.steps,
             if prompt_passed { "pass" } else { "FAIL" }
         );
     }
@@ -193,51 +239,64 @@ fn verify_model_hash(
 
 async fn decode<B>(
     runner: &mut EngineRunner<B>,
-    fixture: &golden_fixtures::PromptFixture,
-    prompt_tokens: u32,
-    mut logits: Vec<f32>,
-    vocab: usize,
-    steps: usize,
-) -> Result<(f64, usize), Box<dyn Error>>
+    input: DecodeInput<'_>,
+    mode: DecodeMode,
+    report_steps: bool,
+) -> Result<DecodeMetrics, Box<dyn Error>>
 where
     B: Backend + Send + Sync + 'static,
 {
-    if steps == 0 || steps > fixture.greedy_tokens().len() {
+    let DecodeInput {
+        prompt,
+        expected_tokens,
+        reference_logits,
+        prompt_tokens,
+        mut logits,
+        vocab,
+        steps,
+    } = input;
+    if steps == 0 || steps > expected_tokens.len() {
         return Err("decode step count is outside the fixture".into());
     }
-    let mut total_kl = 0.0;
-    let mut agreement = 0;
-    println!("prompt\tstep\tlogits-kl\texpected\tactual\tresult");
-    for step in 0..steps {
+    let mut metrics = DecodeMetrics {
+        steps: u32::try_from(steps)?,
+        ..DecodeMetrics::default()
+    };
+    if report_steps {
+        println!("prompt\tstep\tlogits-kl\texpected\tactual\tresult");
+    }
+    for (step, &expected) in expected_tokens.iter().take(steps).enumerate() {
         let start = step
             .checked_mul(vocab)
             .ok_or("decode fixture offset overflowed")?;
         let end = start
             .checked_add(vocab)
             .ok_or("decode fixture offset overflowed")?;
-        let reference = fixture
-            .greedy_step_logits()
-            .values()
+        let reference = reference_logits
             .get(start..end)
             .ok_or("decode logits fixture is incomplete")?;
         let kl = mean_logit_kl_divergence(reference, &logits, vocab)?;
-        total_kl += kl;
+        metrics.total_kl += kl;
+        metrics.maximum_kl = metrics.maximum_kl.max(kl);
         let actual = argmax(&logits)?;
-        let expected = u32::try_from(fixture.greedy_tokens()[step])?;
+        let expected = u32::try_from(expected)?;
         let token_matches = actual == expected;
-        agreement += usize::from(token_matches);
-        println!(
-            "{}\t{step}\t{kl:.8e}\t{expected}\t{actual}\t{}",
-            fixture.name(),
-            if token_matches { "pass" } else { "FAIL" }
-        );
+        metrics.agreement += u32::from(token_matches);
+        if report_steps {
+            println!(
+                "{prompt}\t{step}\t{kl:.8e}\t{expected}\t{actual}\t{}",
+                if token_matches { "pass" } else { "FAIL" }
+            );
+        }
         if step + 1 < steps {
             let start_pos = prompt_tokens
                 .checked_add(u32::try_from(step)?)
                 .ok_or("decode position overflowed")?;
             let output = runner
                 .step(EngineStep {
-                    tokens: vec![actual],
+                    tokens: vec![match mode {
+                        DecodeMode::FreeRunning => actual,
+                    }],
                     start_pos,
                     taps: false,
                 })
@@ -246,7 +305,7 @@ where
             logits = decode_f32_le(&runner.read(&output.logits).await?)?;
         }
     }
-    Ok((total_kl / f64::from(u32::try_from(steps)?), agreement))
+    Ok(metrics)
 }
 
 fn selected_prompts<'a>(
@@ -343,7 +402,6 @@ mod tests {
                 false,
             ))?;
         assert!(summary.maximum_layer_error <= BF16_HIDDEN_STATE_TOLERANCE);
-        assert!(summary.maximum_prompt_kl <= LOGIT_KL_TOLERANCE);
         Ok(())
     }
 
