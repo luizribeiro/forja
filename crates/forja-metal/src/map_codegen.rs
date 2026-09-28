@@ -189,7 +189,7 @@ fn emit_resident_reduce(source: &mut String, reduce_slot: usize, op: RedOp, oper
     );
     line(
         source,
-        format_args!("        bool accumulator_nan = active && isnan(v{operand});"),
+        format_args!("        bool accumulator_nan = active && f32_is_nan(v{operand});"),
     );
     emit_threadgroup_reduce(source, reduce_slot, identity, simd_reduce);
     line(source, format_args!("    }}"));
@@ -287,7 +287,7 @@ fn emit_reduce_stage(
     emit_values(source, program, instruction_end, 12);
     line(
         source,
-        format_args!("            accumulator_nan = accumulator_nan || isnan(v{operand});"),
+        format_args!("            accumulator_nan = accumulator_nan || f32_is_nan(v{operand});"),
     );
     let combine = match op {
         RedOp::Sum => format!("accumulator + v{operand}"),
@@ -573,31 +573,37 @@ fn unary(op: UnOp, operand: u32) -> String {
     match op {
         UnOp::Neg => format!("-v{operand}"),
         UnOp::Abs => format!("abs(v{operand})"),
-        UnOp::Exp => format!("select(precise::exp(v{operand}), {nan}, isnan(v{operand}))"),
+        UnOp::Exp => format!("select(precise::exp(v{operand}), {nan}, f32_is_nan(v{operand}))"),
         UnOp::Log => {
             format!(
-                "select(precise::log(v{operand}), {nan}, isnan(v{operand}) || v{operand} < 0.0f)"
+                "select(precise::log(v{operand}), {nan}, f32_is_nan(v{operand}) || v{operand} < 0.0f)"
             )
         }
         UnOp::Sqrt => {
             format!(
-                "select(precise::sqrt(v{operand}), {nan}, isnan(v{operand}) || v{operand} < 0.0f)"
+                "select(precise::sqrt(v{operand}), {nan}, f32_is_nan(v{operand}) || v{operand} < 0.0f)"
             )
         }
         UnOp::Rsqrt => format!(
-            "select(precise::rsqrt(v{operand}), {nan}, isnan(v{operand}) || v{operand} < 0.0f)"
+            "select(precise::rsqrt(v{operand}), {nan}, f32_is_nan(v{operand}) || v{operand} < 0.0f)"
         ),
-        UnOp::Sin => format!("select(precise::sin(v{operand}), {nan}, !isfinite(v{operand}))"),
-        UnOp::Cos => format!("select(precise::cos(v{operand}), {nan}, !isfinite(v{operand}))"),
+        UnOp::Sin => {
+            format!("select(precise::sin(v{operand}), {nan}, f32_is_non_finite(v{operand}))")
+        }
+        UnOp::Cos => {
+            format!("select(precise::cos(v{operand}), {nan}, f32_is_non_finite(v{operand}))")
+        }
         UnOp::Tanh => format!(
             "select(select(precise::tanh(v{operand}), copysign(1.0f, v{operand}), \
-             abs(v{operand}) > 8.0f), {nan}, isnan(v{operand}))"
+             abs(v{operand}) > 8.0f), {nan}, f32_is_nan(v{operand}))"
         ),
         UnOp::Sigmoid => {
-            format!("select(1.0f / (1.0f + precise::exp(-v{operand})), {nan}, isnan(v{operand}))")
+            format!(
+                "select(1.0f / (1.0f + precise::exp(-v{operand})), {nan}, f32_is_nan(v{operand}))"
+            )
         }
-        UnOp::Recip => format!("select(1.0f / v{operand}, {nan}, isnan(v{operand}))"),
-        UnOp::Floor => format!("select(floor(v{operand}), {nan}, isnan(v{operand}))"),
+        UnOp::Recip => format!("select(1.0f / v{operand}, {nan}, f32_is_nan(v{operand}))"),
+        UnOp::Floor => format!("select(floor(v{operand}), {nan}, f32_is_nan(v{operand}))"),
     }
 }
 
@@ -621,6 +627,12 @@ fn binary(op: BinOp, left: u32, right: u32, operand_type: ValueType) -> (ValueTy
         (BinOp::Max, ValueType::F32) => propagating_extreme(left, right, ">"),
         (BinOp::Min, ValueType::U32) => format!("min(v{left}, v{right})"),
         (BinOp::Max, ValueType::U32) => format!("max(v{left}, v{right})"),
+        (BinOp::Lt, ValueType::F32) => format!("f32_lt(v{left}, v{right})"),
+        (BinOp::Le, ValueType::F32) => format!("f32_le(v{left}, v{right})"),
+        (BinOp::Eq, ValueType::F32) => format!("f32_eq(v{left}, v{right})"),
+        (BinOp::Ne, ValueType::F32) => format!("f32_ne(v{left}, v{right})"),
+        (BinOp::Ge, ValueType::F32) => format!("f32_ge(v{left}, v{right})"),
+        (BinOp::Gt, ValueType::F32) => format!("f32_gt(v{left}, v{right})"),
         (BinOp::Lt, _) => format!("v{left} < v{right}"),
         (BinOp::Le, _) => format!("v{left} <= v{right}"),
         (BinOp::Eq, _) => format!("v{left} == v{right}"),
@@ -635,7 +647,7 @@ fn binary(op: BinOp, left: u32, right: u32, operand_type: ValueType) -> (ValueTy
 fn propagating_extreme(left: u32, right: u32, comparison: &str) -> String {
     format!(
         "select(select(v{right}, v{left}, v{left} {comparison} v{right}), \
-         as_type<float>(0x7fc00000u), isnan(v{left}) || isnan(v{right}))"
+         as_type<float>(0x7fc00000u), f32_is_nan(v{left}) || f32_is_nan(v{right}))"
     )
 }
 
@@ -648,9 +660,9 @@ fn cast(to: ValueType, operand: u32, from: ValueType) -> String {
         (ValueType::U32, ValueType::Bool) => format!("uint(v{operand})"),
         (ValueType::U32, ValueType::F32) => format!(
             "select(select(uint(clamp(v{operand}, 0.0f, 4294967040.0f)), 0xffffffffu, \
-             v{operand} >= 4294967296.0f), 0u, isnan(v{operand}))"
+             v{operand} >= 4294967296.0f), 0u, f32_is_nan(v{operand}))"
         ),
-        (ValueType::Bool, ValueType::F32) => format!("v{operand} != 0.0f"),
+        (ValueType::Bool, ValueType::F32) => format!("f32_ne(v{operand}, 0.0f)"),
         (ValueType::Bool, ValueType::U32) => format!("v{operand} != 0u"),
     }
 }
@@ -779,7 +791,8 @@ kernel void forja_map(
             &[DType::F32],
             &[1],
         );
-        assert!(source.contains("isnan(v0) || isnan(v1)"));
+        assert!(source.contains("f32_is_nan(v0) || f32_is_nan(v1)"));
+        assert!(source.contains("(as_type<uint>(value) & 0x7fffffffu) > 0x7f800000u"));
         assert!(source.contains("clamp(v2, 0.0f, 4294967040.0f)"));
         assert!(source.contains("uint v5 = v4 + v4;"));
         assert!(source.contains("precise::exp(v3)"));
@@ -822,7 +835,7 @@ kernel void forja_row(
             ulong input_address0 = input0_layout.offset + ulong(coord0) * input0_layout.strides[0];
             ulong output_address0 = output0_layout.offset + ulong(coord0) * output0_layout.strides[0];
             float v0 = load_float(input0, input_address0, input0_dtype);
-            accumulator_nan = accumulator_nan || isnan(v0);
+            accumulator_nan = accumulator_nan || f32_is_nan(v0);
             accumulator = accumulator + v0;
         }
         accumulator = simd_sum(accumulator);

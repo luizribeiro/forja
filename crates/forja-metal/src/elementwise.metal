@@ -21,6 +21,38 @@ float negative_finite_sentinel() {
     return as_type<float>(0xff7fffffu);
 }
 
+bool f32_is_nan(float value) {
+    return (as_type<uint>(value) & 0x7fffffffu) > 0x7f800000u;
+}
+
+bool f32_is_non_finite(float value) {
+    return (as_type<uint>(value) & 0x7fffffffu) >= 0x7f800000u;
+}
+
+bool f32_lt(float left, float right) {
+    return !f32_is_nan(left) && !f32_is_nan(right) && left < right;
+}
+
+bool f32_le(float left, float right) {
+    return !f32_is_nan(left) && !f32_is_nan(right) && left <= right;
+}
+
+bool f32_eq(float left, float right) {
+    return !f32_is_nan(left) && !f32_is_nan(right) && left == right;
+}
+
+bool f32_ne(float left, float right) {
+    return f32_is_nan(left) || f32_is_nan(right) || left != right;
+}
+
+bool f32_ge(float left, float right) {
+    return !f32_is_nan(left) && !f32_is_nan(right) && left >= right;
+}
+
+bool f32_gt(float left, float right) {
+    return !f32_is_nan(left) && !f32_is_nan(right) && left > right;
+}
+
 struct TensorLayout {
     ulong offset;
     uint rank;

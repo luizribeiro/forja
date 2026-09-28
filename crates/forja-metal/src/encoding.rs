@@ -3675,7 +3675,7 @@ impl PipelineCache {
         source: &str,
     ) -> Result<Retained<ProtocolObject<dyn MTLComputePipelineState>>, BackendError> {
         let source = NSString::from_str(source);
-        let options = compile_options(MTLMathMode::Relaxed);
+        let options = compile_options(MTLMathMode::Safe);
         let library = self
             .device
             .newLibraryWithSource_options_error(&source, Some(&options))
