@@ -3,7 +3,7 @@ use std::path::PathBuf;
 pub(crate) const USAGE: &str = "usage:
   forja run --model-dir PATH --prompt TEXT [--max-tokens N] [--backend metal|cpu]
   forja bench --model-dir PATH [--pp N] [--tg N] [--reps N] [--json PATH] [--profile]
-  forja verify --model-dir PATH --fixtures PATH [--backend metal|cpu] [--prompts NAME,...]";
+  forja verify --model-dir PATH --fixtures PATH [--backend metal|cpu] [--precision f32|bf16] [--prompts NAME,...]";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Backend {
@@ -11,11 +11,18 @@ pub(crate) enum Backend {
     Cpu,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Precision {
+    F32,
+    Bf16,
+}
+
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct Verify {
     pub(crate) model_dir: PathBuf,
     pub(crate) fixtures: PathBuf,
     pub(crate) backend: Backend,
+    pub(crate) precision: Precision,
     pub(crate) prompts: Vec<String>,
 }
 
@@ -146,6 +153,7 @@ fn parse_verify(mut arguments: impl Iterator<Item = String>) -> Result<Verify, S
     let mut model_dir = None;
     let mut fixtures = None;
     let mut backend = Backend::Metal;
+    let mut precision = Precision::F32;
     let mut prompts = Vec::new();
     while let Some(option) = arguments.next() {
         let value = arguments
@@ -156,6 +164,13 @@ fn parse_verify(mut arguments: impl Iterator<Item = String>) -> Result<Verify, S
             "--fixtures" if fixtures.is_none() => fixtures = Some(PathBuf::from(value)),
             "--backend" => {
                 backend = parse_backend(&value)?;
+            }
+            "--precision" => {
+                precision = match value.as_str() {
+                    "f32" => Precision::F32,
+                    "bf16" => Precision::Bf16,
+                    _ => return Err(format!("unknown precision {value:?}")),
+                };
             }
             "--prompts" => {
                 let names = value.split(',').collect::<Vec<_>>();
@@ -174,6 +189,7 @@ fn parse_verify(mut arguments: impl Iterator<Item = String>) -> Result<Verify, S
         model_dir: model_dir.ok_or("--model-dir is required")?,
         fixtures: fixtures.ok_or("--fixtures is required")?,
         backend,
+        precision,
         prompts,
     })
 }
@@ -270,6 +286,8 @@ mod tests {
                 "/fixtures",
                 "--backend",
                 "cpu",
+                "--precision",
+                "bf16",
                 "--prompts",
                 "one,two",
             ]
@@ -282,6 +300,7 @@ mod tests {
                 model_dir: PathBuf::from("/model"),
                 fixtures: PathBuf::from("/fixtures"),
                 backend: Backend::Cpu,
+                precision: Precision::Bf16,
                 prompts: vec!["one".to_owned(), "two".to_owned()],
             })
         );

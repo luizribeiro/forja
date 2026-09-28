@@ -7,7 +7,7 @@ use golden_fixtures::{
     mean_logit_kl_divergence, normwise_relative_error, sha256_file,
 };
 
-use crate::args::{Backend as BackendArg, Verify};
+use crate::args::{Backend as BackendArg, Precision, Verify};
 use crate::engine::{argmax, limits};
 
 #[derive(Clone, Copy)]
@@ -23,16 +23,13 @@ pub(crate) async fn run(options: &Verify) -> Result<(), Box<dyn Error>> {
 async fn run_with_steps(options: &Verify, decode_steps: usize) -> Result<(), Box<dyn Error>> {
     let fixtures = FixtureDirectory::open(&options.fixtures)?;
     let weights = verify_model_hash(options, &fixtures)?;
-    run_with_component(
-        options,
-        &fixtures,
-        &weights,
-        test_guests::qwen3(),
-        decode_steps,
-        true,
-    )
-    .await
-    .map(|_| ())
+    let component = match options.precision {
+        Precision::F32 => test_guests::qwen3(),
+        Precision::Bf16 => test_guests::qwen3_bf16(),
+    };
+    run_with_component(options, &fixtures, &weights, component, decode_steps, true)
+        .await
+        .map(|_| ())
 }
 async fn run_with_component(
     options: &Verify,
@@ -282,21 +279,30 @@ mod tests {
     #[test]
     #[ignore = "requires FORJA_MODELS and runs in the pre-push hook"]
     fn cpu_qwen_verification() -> Result<(), Box<dyn Error>> {
-        run_model_test(BackendArg::Cpu, vec!["single-token".to_owned()], 2)
+        run_model_test(
+            BackendArg::Cpu,
+            Precision::F32,
+            vec!["single-token".to_owned()],
+            2,
+        )
     }
 
     #[cfg(target_os = "macos")]
     #[test]
     #[ignore = "requires FORJA_MODELS and runs in the pre-push hook"]
     fn metal_qwen_verification() -> Result<(), Box<dyn Error>> {
-        run_model_test(BackendArg::Metal, Vec::new(), 32)
+        run_model_test(BackendArg::Metal, Precision::F32, Vec::new(), 32)
     }
 
     #[cfg(target_os = "macos")]
     #[test]
     #[ignore = "requires FORJA_MODELS and runs in the pre-push hook"]
     fn metal_qwen_fusion_profiles() -> Result<(), Box<dyn Error>> {
-        let options = model_options(BackendArg::Metal, vec!["short-english".to_owned()])?;
+        let options = model_options(
+            BackendArg::Metal,
+            Precision::F32,
+            vec!["short-english".to_owned()],
+        )?;
         let fixtures = FixtureDirectory::open(&options.fixtures)?;
         let weights = verify_model_hash(&options, &fixtures)?;
         let components = [
@@ -319,7 +325,11 @@ mod tests {
     #[test]
     #[ignore = "requires FORJA_MODELS and runs in the pre-push hook"]
     fn metal_bf16_all_fusions_prefill() -> Result<(), Box<dyn Error>> {
-        let options = model_options(BackendArg::Metal, vec!["short-english".to_owned()])?;
+        let options = model_options(
+            BackendArg::Metal,
+            Precision::Bf16,
+            vec!["short-english".to_owned()],
+        )?;
         let fixtures = FixtureDirectory::open(&options.fixtures)?;
         let weights = verify_model_hash(&options, &fixtures)?;
         let summary = tokio::runtime::Builder::new_current_thread()
@@ -346,6 +356,7 @@ mod tests {
             model_dir: root.join("Qwen3-0.6B"),
             fixtures: root.join("golden/qwen3-0.6b"),
             backend: BackendArg::Metal,
+            precision: Precision::Bf16,
             prompts: vec!["short-english".to_owned()],
         };
         let fixtures = FixtureDirectory::open(&options.fixtures)?;
@@ -383,6 +394,7 @@ mod tests {
             model_dir: model,
             fixtures: fixtures_path.clone(),
             backend: BackendArg::Cpu,
+            precision: Precision::F32,
             prompts: Vec::new(),
         };
         let fixtures = FixtureDirectory::open(fixtures_path)?;
@@ -398,21 +410,27 @@ mod tests {
 
     fn run_model_test(
         backend: BackendArg,
+        precision: Precision,
         prompts: Vec<String>,
         decode_steps: usize,
     ) -> Result<(), Box<dyn Error>> {
-        let options = model_options(backend, prompts)?;
+        let options = model_options(backend, precision, prompts)?;
         tokio::runtime::Builder::new_current_thread()
             .build()?
             .block_on(run_with_steps(&options, decode_steps))
     }
 
-    fn model_options(backend: BackendArg, prompts: Vec<String>) -> Result<Verify, Box<dyn Error>> {
+    fn model_options(
+        backend: BackendArg,
+        precision: Precision,
+        prompts: Vec<String>,
+    ) -> Result<Verify, Box<dyn Error>> {
         let root = PathBuf::from(env::var_os("FORJA_MODELS").ok_or("FORJA_MODELS is not set")?);
         Ok(Verify {
             model_dir: root.join("Qwen3-0.6B"),
             fixtures: root.join("golden/qwen3-0.6b"),
             backend,
+            precision,
             prompts,
         })
     }
