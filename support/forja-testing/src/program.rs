@@ -11,7 +11,19 @@ use proptest::prelude::*;
 use crate::TensorSpec;
 
 const BASE_MAP_LEN: usize = 11;
-const BASE_ROW_LEN: usize = 12;
+const BASE_ROW_LEN: usize = 14;
+
+#[derive(Clone, Copy)]
+enum NumericDomain {
+    Full,
+    Stable,
+}
+
+#[derive(Clone, Copy)]
+struct Generation {
+    kind: ProgramKind,
+    domain: NumericDomain,
+}
 
 /// A generated program and concrete tensor-view signature that accepts it.
 #[derive(Clone, Debug)]
@@ -64,7 +76,14 @@ pub fn well_typed_programs(max_instructions: usize) -> impl Strategy<Value = Pro
         prop::collection::vec(any::<u64>(), word_count..=word_count),
     )
         .prop_map(move |(row, shape_word, output_count, words)| {
-            build_case(row, shape_word, output_count, &words, max_instructions)
+            build_case(
+                row,
+                shape_word,
+                output_count,
+                &words,
+                max_instructions,
+                NumericDomain::Full,
+            )
         })
 }
 
@@ -81,7 +100,62 @@ pub fn map_programs(max_instructions: usize) -> impl Strategy<Value = ProgramCas
         prop::collection::vec(any::<u64>(), word_count..=word_count),
     )
         .prop_map(move |(shape_word, output_count, words)| {
-            build_case(false, shape_word, output_count, &words, max_instructions)
+            build_case(
+                false,
+                shape_word,
+                output_count,
+                &words,
+                max_instructions,
+                NumericDomain::Full,
+            )
+        })
+}
+
+/// Generates valid row programs up to a caller-selected instruction count.
+///
+/// Shapes cover ranks one through four and last-axis lengths 1, 7, 33, 1024,
+/// and 4097. Every program contains multiple dependent reductions.
+pub fn row_programs(max_instructions: usize) -> impl Strategy<Value = ProgramCase> {
+    let max_instructions = max_instructions.clamp(BASE_ROW_LEN, MAX_INSTRUCTIONS);
+    let word_count = max_instructions.max(16);
+    (
+        any::<u64>(),
+        1_usize..=4,
+        prop::collection::vec(any::<u64>(), word_count..=word_count),
+    )
+        .prop_map(move |(shape_word, output_count, words)| {
+            build_case(
+                true,
+                shape_word,
+                output_count,
+                &words,
+                max_instructions,
+                NumericDomain::Full,
+            )
+        })
+}
+
+/// Generates valid row programs restricted to numerically stable operations.
+///
+/// This supplements [`row_programs`] with cases that avoid transcendental and
+/// domain-singular scalar operations.
+pub fn stable_row_programs(max_instructions: usize) -> impl Strategy<Value = ProgramCase> {
+    let max_instructions = max_instructions.clamp(BASE_ROW_LEN, MAX_INSTRUCTIONS);
+    let word_count = max_instructions.max(16);
+    (
+        any::<u64>(),
+        1_usize..=4,
+        prop::collection::vec(any::<u64>(), word_count..=word_count),
+    )
+        .prop_map(move |(shape_word, output_count, words)| {
+            build_case(
+                true,
+                shape_word,
+                output_count,
+                &words,
+                max_instructions,
+                NumericDomain::Stable,
+            )
         })
 }
 
@@ -102,7 +176,14 @@ pub fn case_from_seed(seed: u64, max_instructions: usize) -> ProgramCase {
     let words = (0..max_instructions.max(16))
         .map(|_| next())
         .collect::<Vec<_>>();
-    build_case(row, shape_word, output_count, &words, max_instructions)
+    build_case(
+        row,
+        shape_word,
+        output_count,
+        &words,
+        max_instructions,
+        NumericDomain::Full,
+    )
 }
 
 fn build_case(
@@ -111,14 +192,19 @@ fn build_case(
     output_count: usize,
     words: &[u64],
     max_instructions: usize,
+    domain: NumericDomain,
 ) -> ProgramCase {
     let kind = if row {
         ProgramKind::Row
     } else {
         ProgramKind::Map
     };
-    let shape = generated_shape(shape_word);
-    let program = generated_program(kind, output_count, words, max_instructions);
+    let shape = if row {
+        generated_row_shape(shape_word)
+    } else {
+        generated_shape(shape_word)
+    };
+    let program = generated_program(kind, output_count, words, max_instructions, domain);
     let inputs = vec![
         generated_input(float_dtype(words[0]), &shape, words[1]),
         generated_input(DType::U32, &shape, words[2]),
@@ -131,6 +217,17 @@ fn build_case(
         shape,
         inputs,
         outputs,
+    }
+}
+
+fn generated_row_shape(word: u64) -> Vec<u32> {
+    let widths = [1, 7, 33, 1024, 4097];
+    let width = widths[usize::try_from(word % 5).unwrap_or(0)];
+    match word / 5 % 4 {
+        0 => vec![width],
+        1 => vec![2, width],
+        2 => vec![2, 3, width],
+        _ => vec![1, 2, 3, width],
     }
 }
 
@@ -198,7 +295,9 @@ fn generated_program(
     output_count: usize,
     words: &[u64],
     max_instructions: usize,
+    domain: NumericDomain,
 ) -> Program {
+    let generation = Generation { kind, domain };
     let mut insts = Vec::with_capacity(max_instructions);
     let mut floats = Vec::new();
     let mut integers = Vec::new();
@@ -211,13 +310,13 @@ fn generated_program(
     push(
         &mut insts,
         &mut floats,
-        Inst::Unary(unop(words[5]), 0),
+        Inst::Unary(selected_unop(domain, words[5]), 0),
         ValueType::F32,
     );
     push(
         &mut insts,
         &mut floats,
-        Inst::Binary(float_binop(words[6]), 0, 2),
+        Inst::Binary(selected_float_binop(domain, words[6]), 0, 2),
         ValueType::F32,
     );
     push(
@@ -249,10 +348,23 @@ fn generated_program(
         push(
             &mut insts,
             &mut floats,
-            Inst::Reduce(redop(words[9]), 9),
+            Inst::Reduce(selected_redop(domain, words[9]), 9),
             ValueType::F32,
         );
-        reductions = 1;
+        let dependent = u32::try_from(insts.len()).unwrap_or(0);
+        push(
+            &mut insts,
+            &mut floats,
+            Inst::Binary(BinOp::Add, 9, 11),
+            ValueType::F32,
+        );
+        push(
+            &mut insts,
+            &mut floats,
+            Inst::Reduce(selected_redop(domain, words[10]), dependent),
+            ValueType::F32,
+        );
+        reductions = 2;
     }
 
     let base = if kind == ProgramKind::Row {
@@ -263,7 +375,7 @@ fn generated_program(
     let extra = usize::try_from(words[10]).unwrap_or(0) % (max_instructions - base + 1);
     for &word in words.iter().skip(11).take(extra) {
         push_random(
-            kind,
+            generation,
             word,
             &mut insts,
             &mut floats,
@@ -288,7 +400,7 @@ fn generated_program(
 }
 
 fn push_random(
-    kind: ProgramKind,
+    generation: Generation,
     word: u64,
     insts: &mut Vec<Inst>,
     floats: &mut Vec<u32>,
@@ -302,17 +414,16 @@ fn push_random(
         2 => push(insts, floats, Inst::Const(finite(word)), ValueType::F32),
         3 => push(insts, integers, Inst::Index(0), ValueType::U32),
         4 => push(insts, integers, Inst::Extent(0), ValueType::U32),
-        5 => push(
-            insts,
-            floats,
-            Inst::Unary(unop(word), choose(floats, word >> 8)),
-            ValueType::F32,
-        ),
+        5 => {
+            let op = selected_unop(generation.domain, word);
+            let operand = unary_operand(op, floats, word >> 8);
+            push(insts, floats, Inst::Unary(op, operand), ValueType::F32);
+        }
         6 => push(
             insts,
             floats,
             Inst::Binary(
-                float_binop(word),
+                selected_float_binop(generation.domain, word),
                 choose(floats, word >> 8),
                 choose(floats, word >> 16),
             ),
@@ -348,12 +459,15 @@ fn push_random(
             ),
             ValueType::F32,
         ),
-        _ if kind == ProgramKind::Row && *reductions < MAX_REDUCTIONS => {
+        _ if generation.kind == ProgramKind::Row && *reductions < MAX_REDUCTIONS => {
             *reductions += 1;
             push(
                 insts,
                 floats,
-                Inst::Reduce(redop(word), choose(floats, word >> 8)),
+                Inst::Reduce(
+                    selected_redop(generation.domain, word),
+                    choose(floats, word >> 8),
+                ),
                 ValueType::F32,
             );
         }
@@ -374,6 +488,14 @@ fn push(insts: &mut Vec<Inst>, values: &mut Vec<u32>, inst: Inst, _: ValueType) 
 fn choose(values: &[u32], word: u64) -> u32 {
     let divisor = u64::try_from(values.len()).unwrap_or(1);
     values[usize::try_from(word % divisor).unwrap_or(0)]
+}
+
+fn unary_operand(op: UnOp, floats: &[u32], word: u64) -> u32 {
+    if matches!(op, UnOp::Sin | UnOp::Cos) {
+        choose(&floats[..floats.len().min(2)], word)
+    } else {
+        choose(floats, word)
+    }
 }
 
 fn float_dtype(word: u64) -> DType {
@@ -406,6 +528,18 @@ fn unop(word: u64) -> UnOp {
     OPS[usize::try_from(word % 12).unwrap_or(0)]
 }
 
+fn selected_unop(domain: NumericDomain, word: u64) -> UnOp {
+    match domain {
+        NumericDomain::Full => unop(word),
+        NumericDomain::Stable => stable_unop(word),
+    }
+}
+
+fn stable_unop(word: u64) -> UnOp {
+    const OPS: [UnOp; 5] = [UnOp::Neg, UnOp::Abs, UnOp::Tanh, UnOp::Sigmoid, UnOp::Floor];
+    OPS[usize::try_from(word % 5).unwrap_or(0)]
+}
+
 fn float_binop(word: u64) -> BinOp {
     const OPS: [BinOp; 7] = [
         BinOp::Add,
@@ -417,6 +551,18 @@ fn float_binop(word: u64) -> BinOp {
         BinOp::Pow,
     ];
     OPS[usize::try_from(word % 7).unwrap_or(0)]
+}
+
+fn selected_float_binop(domain: NumericDomain, word: u64) -> BinOp {
+    match domain {
+        NumericDomain::Full => float_binop(word),
+        NumericDomain::Stable => stable_float_binop(word),
+    }
+}
+
+fn stable_float_binop(word: u64) -> BinOp {
+    const OPS: [BinOp; 5] = [BinOp::Add, BinOp::Sub, BinOp::Mul, BinOp::Min, BinOp::Max];
+    OPS[usize::try_from(word % 5).unwrap_or(0)]
 }
 
 fn integer_binop(word: u64) -> BinOp {
@@ -439,6 +585,13 @@ fn comparison(word: u64) -> BinOp {
 fn redop(word: u64) -> RedOp {
     const OPS: [RedOp; 3] = [RedOp::Sum, RedOp::Max, RedOp::Min];
     OPS[usize::try_from(word % 3).unwrap_or(0)]
+}
+
+fn selected_redop(domain: NumericDomain, word: u64) -> RedOp {
+    match domain {
+        NumericDomain::Full => redop(word),
+        NumericDomain::Stable => [RedOp::Max, RedOp::Min][usize::try_from(word % 2).unwrap_or(0)],
+    }
 }
 
 #[cfg(test)]

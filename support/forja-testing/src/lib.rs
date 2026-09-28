@@ -181,6 +181,11 @@ pub enum AgreementError {
         /// Maximum accepted normwise relative error.
         tolerance: f64,
     },
+    /// Candidate output disagreed with the reference numeric classes.
+    ClassMismatch {
+        /// Number of positions with a NaN, infinity, or finite-class mismatch.
+        count: usize,
+    },
     /// Candidate integer output differed from the reference bytes.
     OutputMismatch,
 }
@@ -219,27 +224,33 @@ pub fn normwise_relative_error(reference: &[f32], candidate: &[f32]) -> f64 {
     if reference.len() != candidate.len() {
         return f64::INFINITY;
     }
+    let (error, class_mismatches) = compare_float_values(reference, candidate);
+    if class_mismatches == 0 {
+        error
+    } else {
+        f64::INFINITY
+    }
+}
+
+fn compare_float_values(reference: &[f32], candidate: &[f32]) -> (f64, usize) {
     let mut difference = 0.0_f64;
     let mut norm = 0.0_f64;
+    let mut class_mismatches = 0;
     for (&expected, &actual) in reference.iter().zip(candidate) {
-        if expected.is_nan() || actual.is_nan() {
-            if expected.is_nan() && actual.is_nan() {
-                continue;
-            }
-            return f64::INFINITY;
+        if expected.is_finite() && actual.is_finite() {
+            let expected = f64::from(expected);
+            let delta = f64::from(actual) - expected;
+            difference = delta.mul_add(delta, difference);
+            norm = expected.mul_add(expected, norm);
+        } else if !(expected.is_nan() && actual.is_nan()
+            || expected.is_infinite()
+                && actual.is_infinite()
+                && expected.to_bits() == actual.to_bits())
+        {
+            class_mismatches += 1;
         }
-        if !expected.is_finite() || !actual.is_finite() {
-            if expected.to_bits() == actual.to_bits() {
-                continue;
-            }
-            return f64::INFINITY;
-        }
-        let expected = f64::from(expected);
-        let delta = f64::from(actual) - expected;
-        difference = delta.mul_add(delta, difference);
-        norm = expected.mul_add(expected, norm);
     }
-    if norm == 0.0 {
+    let error = if norm == 0.0 {
         if difference == 0.0 {
             0.0
         } else {
@@ -247,7 +258,8 @@ pub fn normwise_relative_error(reference: &[f32], candidate: &[f32]) -> f64 {
         }
     } else {
         (difference / norm).sqrt()
-    }
+    };
+    (error, class_mismatches)
 }
 
 /// Checks f32 values with the shared normwise relative-error tolerance.
@@ -256,7 +268,13 @@ pub fn normwise_relative_error(reference: &[f32], candidate: &[f32]) -> f64 {
 ///
 /// Returns an error when lengths differ or the candidate exceeds [`F32_TOLERANCE`].
 pub fn assert_f32_values_agree(reference: &[f32], candidate: &[f32]) -> Result<(), AgreementError> {
-    let error = normwise_relative_error(reference, candidate);
+    if reference.len() != candidate.len() {
+        return Err(AgreementError::OutputMismatch);
+    }
+    let (error, count) = compare_float_values(reference, candidate);
+    if count != 0 {
+        return Err(AgreementError::ClassMismatch { count });
+    }
     if error > F32_TOLERANCE {
         return Err(AgreementError::OutsideTolerance {
             error,
@@ -366,7 +384,13 @@ pub fn assert_outputs_agree(
     }
     let expected = decode(expected_bytes, dtype)?;
     let actual = decode(actual_bytes, dtype)?;
-    let error = normwise_relative_error(&expected, &actual);
+    if expected.len() != actual.len() {
+        return Err(AgreementError::OutputMismatch);
+    }
+    let (error, count) = compare_float_values(&expected, &actual);
+    if count != 0 {
+        return Err(AgreementError::ClassMismatch { count });
+    }
     let tolerance = dtype_tolerance(dtype)?;
     if error > tolerance {
         return Err(AgreementError::OutsideTolerance { error, tolerance });
@@ -520,6 +544,17 @@ mod tests {
         );
         assert!(normwise_relative_error(&[0.0], &[f32::NAN]).is_infinite());
         assert!(normwise_relative_error(&[f32::INFINITY], &[f32::NEG_INFINITY]).is_infinite());
+    }
+
+    #[test]
+    fn reports_class_mismatches_separately_from_finite_error() {
+        let reference = [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 3.0, 4.0];
+        let candidate = [f32::NAN, f32::NEG_INFINITY, f32::INFINITY, 0.0, 0.0];
+        assert_eq!(
+            assert_f32_values_agree(&reference, &candidate),
+            Err(AgreementError::ClassMismatch { count: 2 })
+        );
+        assert!((compare_float_values(&reference, &candidate).0 - 1.0).abs() < f64::EPSILON);
     }
 
     #[test]
