@@ -54,39 +54,10 @@ pub(super) fn generate(program: &BoundProgram) -> Result<String, CodegenError> {
     }
     line(
         &mut source,
-        format_args!("    uint index [[thread_position_in_grid]]) {{"),
+        format_args!("    uint3 position [[thread_position_in_grid]]) {{"),
     );
-    line(
-        &mut source,
-        format_args!("    if (index >= output0_layout.element_count) return;"),
-    );
-    line(&mut source, format_args!("    uint remaining = index;"));
-    for axis in (0..rank).rev() {
-        line(
-            &mut source,
-            format_args!("    uint coord{axis} = remaining % output0_layout.shape[{axis}];"),
-        );
-        line(
-            &mut source,
-            format_args!("    remaining /= output0_layout.shape[{axis}];"),
-        );
-    }
-    for slot in 0..inputs.len() {
-        line(
-            &mut source,
-            format_args!(
-                "    ulong input_address{slot} = physical_index(input{slot}_layout, index);"
-            ),
-        );
-    }
-    for slot in 0..outputs.len() {
-        line(
-            &mut source,
-            format_args!(
-                "    ulong output_address{slot} = physical_index(output{slot}_layout, index);"
-            ),
-        );
-    }
+    emit_coordinates(&mut source, rank);
+    emit_addresses(&mut source, inputs.len(), outputs.len(), rank);
 
     let mut types = Vec::with_capacity(program.program().program().insts.len());
     for (index, &instruction) in program.program().program().insts.iter().enumerate() {
@@ -99,16 +70,89 @@ pub(super) fn generate(program: &BoundProgram) -> Result<String, CodegenError> {
     }
     for &(slot, value) in &program.program().program().outputs {
         let slot = usize::try_from(slot).unwrap_or(usize::MAX);
-        line(
-            &mut source,
-            format_args!(
-                "    store_float(output{slot}, output_address{slot}, {}u, v{value});",
-                dtype_code(outputs[slot].layout().dtype())
-            ),
-        );
+        let expression = if outputs[slot].layout().dtype() == DType::BF16 {
+            format!("store_bfloat_bits(output{slot}, output_address{slot}, v{value});")
+        } else {
+            format!(
+                "store_float(output{slot}, output_address{slot}, {}, v{value});",
+                output_dtype_name(slot)
+            )
+        };
+        line(&mut source, format_args!("    {expression}"));
     }
     line(&mut source, format_args!("}}"));
     Ok(source)
+}
+
+fn address_expression(layout: &str, rank: usize) -> String {
+    (0..rank).fold(format!("{layout}.offset"), |address, axis| {
+        format!("{address} + ulong(coord{axis}) * {layout}.strides[{axis}]")
+    })
+}
+
+fn emit_addresses(source: &mut String, input_count: usize, output_count: usize, rank: usize) {
+    for (name, slot) in operands(input_count, output_count) {
+        line(
+            source,
+            format_args!(
+                "    ulong {name}_address{slot} = {};",
+                address_expression(&format!("{name}{slot}_layout"), rank)
+            ),
+        );
+    }
+}
+
+fn emit_coordinates(source: &mut String, rank: usize) {
+    if rank == 0 {
+        line(source, format_args!("    if (position.x != 0) return;"));
+        return;
+    }
+    if rank == 1 {
+        line(
+            source,
+            format_args!("    if (position.x >= output0_layout.shape[0]) return;"),
+        );
+        line(source, format_args!("    uint coord0 = position.x;"));
+        return;
+    }
+    let last = rank - 1;
+    let penultimate = rank - 2;
+    line(
+        source,
+        format_args!(
+            "    if (position.x >= output0_layout.shape[{last}] || \
+             position.y >= output0_layout.shape[{penultimate}]) return;"
+        ),
+    );
+    line(source, format_args!("    uint coord{last} = position.x;"));
+    line(
+        source,
+        format_args!("    uint coord{penultimate} = position.y;"),
+    );
+    if penultimate > 0 {
+        line(source, format_args!("    uint remaining = position.z;"));
+        for axis in (0..penultimate).rev() {
+            line(
+                source,
+                format_args!("    uint coord{axis} = remaining % output0_layout.shape[{axis}];"),
+            );
+            if axis > 0 {
+                line(
+                    source,
+                    format_args!("    remaining /= output0_layout.shape[{axis}];"),
+                );
+            }
+        }
+    }
+}
+
+fn operands(
+    input_count: usize,
+    output_count: usize,
+) -> impl Iterator<Item = (&'static str, usize)> {
+    (0..input_count)
+        .map(|slot| ("input", slot))
+        .chain((0..output_count).map(|slot| ("output", slot)))
 }
 
 fn instruction_expression(
@@ -120,12 +164,16 @@ fn instruction_expression(
         Inst::Input(slot) => {
             let slot = usize::try_from(slot).unwrap_or(usize::MAX);
             match inputs[slot].layout().dtype() {
-                DType::F32 | DType::F16 | DType::BF16 => (
+                DType::F32 | DType::F16 => (
                     ValueType::F32,
                     format!(
-                        "load_float(input{slot}, input_address{slot}, {}u)",
-                        dtype_code(inputs[slot].layout().dtype())
+                        "load_float(input{slot}, input_address{slot}, {})",
+                        input_dtype_name(slot)
                     ),
+                ),
+                DType::BF16 => (
+                    ValueType::F32,
+                    format!("load_bfloat_bits(input{slot}, input_address{slot})"),
                 ),
                 DType::U32 => (
                     ValueType::U32,
@@ -155,14 +203,14 @@ fn unary(op: UnOp, operand: u32) -> String {
     match op {
         UnOp::Neg => format!("-v{operand}"),
         UnOp::Abs => format!("abs(v{operand})"),
-        UnOp::Exp => format!("precise::exp(v{operand})"),
-        UnOp::Log => format!("precise::log(v{operand})"),
-        UnOp::Sqrt => format!("precise::sqrt(v{operand})"),
-        UnOp::Rsqrt => format!("precise::rsqrt(v{operand})"),
-        UnOp::Sin => format!("precise::sin(v{operand})"),
-        UnOp::Cos => format!("precise::cos(v{operand})"),
-        UnOp::Tanh => format!("precise::tanh(v{operand})"),
-        UnOp::Sigmoid => format!("1.0f / (1.0f + precise::exp(-v{operand}))"),
+        UnOp::Exp => format!("fast::exp(v{operand})"),
+        UnOp::Log => format!("fast::log(v{operand})"),
+        UnOp::Sqrt => format!("fast::sqrt(v{operand})"),
+        UnOp::Rsqrt => format!("fast::rsqrt(v{operand})"),
+        UnOp::Sin => format!("fast::sin(v{operand})"),
+        UnOp::Cos => format!("fast::cos(v{operand})"),
+        UnOp::Tanh => format!("fast::tanh(v{operand})"),
+        UnOp::Sigmoid => format!("1.0f / (1.0f + fast::exp(-v{operand}))"),
         UnOp::Recip => format!("1.0f / v{operand}"),
         UnOp::Floor => format!("floor(v{operand})"),
     }
@@ -222,21 +270,28 @@ fn cast(to: ValueType, operand: u32, from: ValueType) -> String {
     }
 }
 
+fn input_dtype_name(slot: usize) -> String {
+    match slot {
+        0 => "input0_dtype".to_owned(),
+        1 => "input1_dtype".to_owned(),
+        2 => "input2_dtype".to_owned(),
+        _ => format!("program_input{slot}_dtype"),
+    }
+}
+
+fn output_dtype_name(slot: usize) -> String {
+    if slot == 0 {
+        "output_dtype".to_owned()
+    } else {
+        format!("program_output{slot}_dtype")
+    }
+}
+
 const fn type_name(value_type: ValueType) -> &'static str {
     match value_type {
         ValueType::F32 => "float",
         ValueType::U32 => "uint",
         ValueType::Bool => "bool",
-    }
-}
-
-const fn dtype_code(dtype: DType) -> u32 {
-    match dtype {
-        DType::F32 => 0,
-        DType::F16 => 1,
-        DType::BF16 => 2,
-        DType::I32 => 3,
-        DType::U32 => 4,
     }
 }
 
@@ -252,6 +307,8 @@ mod tests {
         program::{BinOp, Inst, Program, ProgramKind, UnOp, ValueType, bind_program},
     };
     use forja_cpu::CpuBackend;
+    use forja_testing::{TensorSpec, program::map_programs};
+    use proptest::prelude::*;
 
     use super::*;
 
@@ -281,20 +338,17 @@ kernel void forja_map(
     constant TensorLayout &input0_layout [[buffer(3)]],
     constant TensorLayout &input1_layout [[buffer(4)]],
     constant TensorLayout &output0_layout [[buffer(5)]],
-    uint index [[thread_position_in_grid]]) {
-    if (index >= output0_layout.element_count) return;
-    uint remaining = index;
-    uint coord1 = remaining % output0_layout.shape[1];
-    remaining /= output0_layout.shape[1];
-    uint coord0 = remaining % output0_layout.shape[0];
-    remaining /= output0_layout.shape[0];
-    ulong input_address0 = physical_index(input0_layout, index);
-    ulong input_address1 = physical_index(input1_layout, index);
-    ulong output_address0 = physical_index(output0_layout, index);
-    float v0 = load_float(input0, input_address0, 1u);
-    float v1 = load_float(input1, input_address1, 2u);
+    uint3 position [[thread_position_in_grid]]) {
+    if (position.x >= output0_layout.shape[1] || position.y >= output0_layout.shape[0]) return;
+    uint coord1 = position.x;
+    uint coord0 = position.y;
+    ulong input_address0 = input0_layout.offset + ulong(coord0) * input0_layout.strides[0] + ulong(coord1) * input0_layout.strides[1];
+    ulong input_address1 = input1_layout.offset + ulong(coord0) * input1_layout.strides[0] + ulong(coord1) * input1_layout.strides[1];
+    ulong output_address0 = output0_layout.offset + ulong(coord0) * output0_layout.strides[0] + ulong(coord1) * output0_layout.strides[1];
+    float v0 = load_float(input0, input_address0, input0_dtype);
+    float v1 = load_bfloat_bits(input1, input_address1);
     float v2 = v0 + v1;
-    store_float(output0, output_address0, 0u, v2);
+    store_float(output0, output_address0, output_dtype, v2);
 }
 "
         );
@@ -325,34 +379,34 @@ kernel void forja_map(
         assert!(source.contains("isnan(v0) || isnan(v1)"));
         assert!(source.contains("clamp(v2, 0.0f, 4294967040.0f)"));
         assert!(source.contains("uint v5 = v4 + v4;"));
-        assert!(source.contains("precise::exp(v3)"));
+        assert!(source.contains("fast::exp(v3)"));
     }
 
-    #[test]
-    fn addresses_never_depend_on_program_values() {
-        let source = source(
-            &Program {
-                kind: ProgramKind::Map,
-                insts: vec![
-                    Inst::Input(0),
-                    Inst::Index(0),
-                    Inst::Cast(ValueType::F32, 1),
-                ],
-                outputs: vec![(0, 2)],
-            },
-            &[DType::F32],
-            &[DType::F32],
-            &[4097],
-        );
-        for line in source
-            .lines()
-            .filter(|line| line.contains("physical_index("))
-        {
-            assert!(
-                !(0..3).any(|value| line.contains(&format!("v{value}"))),
-                "program value in address expression: {line}"
-            );
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(32))]
+
+        #[test]
+        fn addresses_never_depend_on_program_values(case in map_programs(64)) {
+            let inputs = case.inputs().iter().map(TensorSpec::dtype).collect::<Vec<_>>();
+            let outputs = case.outputs().iter().map(TensorSpec::dtype).collect::<Vec<_>>();
+            let source = source(case.program(), &inputs, &outputs, case.shape());
+            for line in source
+                .lines()
+                .filter(|line| line.contains("ulong ") && line.contains("_address"))
+            {
+                prop_assert!(
+                    !contains_program_value(line),
+                    "program value in address expression: {line}"
+                );
+            }
         }
+    }
+
+    fn contains_program_value(expression: &str) -> bool {
+        expression
+            .as_bytes()
+            .windows(2)
+            .any(|pair| pair[0] == b'v' && pair[1].is_ascii_digit())
     }
 
     fn source(program: &Program, inputs: &[DType], outputs: &[DType], shape: &[u32]) -> String {

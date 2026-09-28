@@ -8,6 +8,14 @@ constant uint input0_dtype [[function_constant(0)]];
 constant uint input1_dtype [[function_constant(1)]];
 constant uint output_dtype [[function_constant(2)]];
 constant uint input2_dtype [[function_constant(3)]];
+constant uint program_input3_dtype [[function_constant(4)]];
+constant uint program_input4_dtype [[function_constant(5)]];
+constant uint program_input5_dtype [[function_constant(6)]];
+constant uint program_input6_dtype [[function_constant(7)]];
+constant uint program_input7_dtype [[function_constant(8)]];
+constant uint program_output1_dtype [[function_constant(9)]];
+constant uint program_output2_dtype [[function_constant(10)]];
+constant uint program_output3_dtype [[function_constant(11)]];
 
 struct TensorLayout {
     ulong offset;
@@ -41,6 +49,11 @@ uint load_uint(device const uchar *buffer, ulong index) {
     return reinterpret_cast<device const uint *>(buffer)[index];
 }
 
+float load_bfloat_bits(device const uchar *buffer, ulong index) {
+    uint bits = uint(reinterpret_cast<device const ushort *>(buffer)[index]) << 16;
+    return as_type<float>(bits);
+}
+
 void store_float(device uchar *buffer, ulong index, uint dtype, float value) {
     if (dtype == 0) {
         *reinterpret_cast<device float *>(buffer + index * 4) = value;
@@ -49,6 +62,12 @@ void store_float(device uchar *buffer, ulong index, uint dtype, float value) {
     } else {
         *reinterpret_cast<device bfloat *>(buffer + index * 2) = bfloat(value);
     }
+}
+
+void store_bfloat_bits(device uchar *buffer, ulong index, float value) {
+    uint bits = as_type<uint>(value);
+    uint rounded = bits + 0x7fffu + ((bits >> 16) & 1u);
+    reinterpret_cast<device ushort *>(buffer)[index] = ushort(rounded >> 16);
 }
 
 void copy_value(

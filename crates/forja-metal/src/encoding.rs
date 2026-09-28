@@ -2,6 +2,8 @@ use std::{
     cell::Cell,
     collections::{HashMap, HashSet},
     ffi::c_void,
+    fmt::Write as _,
+    hash::Hash,
     ptr::NonNull,
     sync::{Arc, Condvar, Mutex, OnceLock, Weak},
     time::{Duration, Instant},
@@ -10,7 +12,9 @@ use std::{
 use block2::RcBlock;
 use forja_core::{
     BackendError, BufferId, CommandList, DType, Dispatch, DispatchProfile, Layout, Op,
-    ProfileCount, Slice, Submission, SubmissionProfile, Tensor, required_barriers,
+    ProfileCount, Slice, Submission, SubmissionProfile, Tensor,
+    program::{BoundProgram, ProgramHash},
+    required_barriers,
 };
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_foundation::{NSRange, NSString};
@@ -24,6 +28,7 @@ use objc2_metal::{
 };
 
 use crate::{
+    map_codegen,
     matmul::{classify, select_gemm},
     storage::MetalBackend,
 };
@@ -308,6 +313,91 @@ impl ArgumentBindings {
 struct PipelineKey {
     name: String,
     constants: Vec<(u32, u32)>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[allow(dead_code)]
+struct ProgramPipelineKey {
+    hash: ProgramHash,
+    input_dtypes: Vec<u8>,
+    output_dtypes: Vec<u8>,
+    rank: u8,
+}
+
+impl ProgramPipelineKey {
+    #[allow(dead_code)]
+    fn new(program: &BoundProgram) -> Self {
+        Self {
+            hash: program.program().content_hash(),
+            input_dtypes: program
+                .inputs()
+                .iter()
+                .map(|tensor| dtype_key(tensor.layout().dtype()))
+                .collect(),
+            output_dtypes: program
+                .outputs()
+                .iter()
+                .map(|tensor| dtype_key(tensor.layout().dtype()))
+                .collect(),
+            rank: u8::try_from(program.outputs()[0].layout().shape().len()).unwrap_or(u8::MAX),
+        }
+    }
+}
+
+#[allow(dead_code)]
+struct LruEntry<V> {
+    value: V,
+    last_used: u64,
+}
+
+#[allow(dead_code)]
+struct LruCache<K, V> {
+    entries: HashMap<K, LruEntry<V>>,
+    capacity: usize,
+    clock: u64,
+}
+
+#[allow(dead_code)]
+impl<K: Clone + Eq + Hash, V> LruCache<K, V> {
+    fn new(capacity: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            capacity,
+            clock: 0,
+        }
+    }
+
+    fn get(&mut self, key: &K) -> Option<&V> {
+        self.clock = self.clock.wrapping_add(1);
+        let entry = self.entries.get_mut(key)?;
+        entry.last_used = self.clock;
+        Some(&entry.value)
+    }
+
+    #[cfg(test)]
+    fn contains(&self, key: &K) -> bool {
+        self.entries.contains_key(key)
+    }
+
+    fn insert(&mut self, key: K, value: V) {
+        self.clock = self.clock.wrapping_add(1);
+        if self.entries.len() == self.capacity
+            && let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(key, _)| key.clone())
+        {
+            self.entries.remove(&oldest);
+        }
+        self.entries.insert(
+            key,
+            LruEntry {
+                value,
+                last_used: self.clock,
+            },
+        );
+    }
 }
 
 struct CompletionState {
@@ -3225,6 +3315,17 @@ const fn dtype_code(dtype: DType) -> u32 {
     }
 }
 
+#[allow(dead_code)]
+const fn dtype_key(dtype: DType) -> u8 {
+    match dtype {
+        DType::F32 => 0,
+        DType::F16 => 1,
+        DType::BF16 => 2,
+        DType::I32 => 3,
+        DType::U32 => 4,
+    }
+}
+
 fn encode_layout(layout: &Layout) -> Result<[u8; 112], BackendError> {
     let mut bytes = [0_u8; 112];
     bytes[0..8].copy_from_slice(&layout.offset().to_ne_bytes());
@@ -3252,7 +3353,11 @@ pub(super) struct PipelineCache {
     device: Retained<ProtocolObject<dyn MTLDevice>>,
     library: Retained<ProtocolObject<dyn MTLLibrary>>,
     pipelines: HashMap<PipelineKey, Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
+    #[allow(dead_code)]
+    programs: LruCache<ProgramPipelineKey, Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
 }
+
+const PROGRAM_PIPELINE_CAPACITY: usize = 64;
 
 impl PipelineCache {
     pub(super) fn new(
@@ -3267,6 +3372,7 @@ impl PipelineCache {
             device: device.clone(),
             library,
             pipelines: HashMap::new(),
+            programs: LruCache::new(PROGRAM_PIPELINE_CAPACITY),
         })
     }
 
@@ -3306,6 +3412,77 @@ impl PipelineCache {
         self.pipelines.insert(key, pipeline.clone());
         Ok(pipeline)
     }
+
+    #[allow(dead_code)]
+    pub(super) fn get_program(
+        &mut self,
+        program: &BoundProgram,
+    ) -> Result<Retained<ProtocolObject<dyn MTLComputePipelineState>>, BackendError> {
+        let key = ProgramPipelineKey::new(program);
+        if let Some(pipeline) = self.programs.get(&key) {
+            return Ok(pipeline.clone());
+        }
+        let source =
+            map_codegen::generate(program).map_err(|_| BackendError::UnsupportedOperation)?;
+        let pipeline = self.compile_program_source(&key, &source)?;
+        self.programs.insert(key, pipeline.clone());
+        Ok(pipeline)
+    }
+
+    #[allow(dead_code)]
+    fn compile_program_source(
+        &self,
+        key: &ProgramPipelineKey,
+        source: &str,
+    ) -> Result<Retained<ProtocolObject<dyn MTLComputePipelineState>>, BackendError> {
+        let source = NSString::from_str(source);
+        let library = self
+            .device
+            .newLibraryWithSource_options_error(&source, None)
+            .map_err(|_| program_compile_failed(key.hash))?;
+        let name = NSString::from_str(map_codegen::KERNEL_NAME);
+        let values = MTLFunctionConstantValues::new();
+        let constants = key
+            .input_dtypes
+            .iter()
+            .enumerate()
+            .map(|(slot, &dtype)| ([0, 1, 3, 4, 5, 6, 7, 8][slot], dtype))
+            .chain(
+                key.output_dtypes
+                    .iter()
+                    .enumerate()
+                    .map(|(slot, &dtype)| ([2, 9, 10, 11][slot], dtype)),
+            )
+            .map(|(index, dtype)| (index, u32::from(dtype)))
+            .collect::<Vec<_>>();
+        for &(index, dtype) in &constants {
+            // SAFETY: `dtype` is live for the call, its type matches `MTLDataType::UInt`, and
+            // program dtype constants occupy the declared indices zero through eleven.
+            unsafe {
+                values.setConstantValue_type_atIndex(
+                    NonNull::from(&dtype).cast::<c_void>(),
+                    MTLDataType::UInt,
+                    index,
+                );
+            }
+        }
+        let function = library
+            .newFunctionWithName_constantValues_error(&name, &values)
+            .map_err(|_| program_compile_failed(key.hash))?;
+        self.device
+            .newComputePipelineStateWithFunction_error(&function)
+            .map_err(|_| program_compile_failed(key.hash))
+    }
+}
+
+#[allow(dead_code)]
+fn program_compile_failed(hash: ProgramHash) -> BackendError {
+    let mut encoded = String::with_capacity(64);
+    for byte in hash.as_bytes() {
+        let _ = write!(encoded, "{byte:02x}");
+    }
+    eprintln!("Metal map program compilation failed: {encoded}");
+    BackendError::ExecutionFailed
 }
 
 #[cfg(test)]
@@ -3315,7 +3492,10 @@ mod tests {
         time::{Duration, Instant},
     };
 
-    use forja_core::{Backend, CommandList, DType, Op, Slice, Submission, ViewOp};
+    use forja_core::{
+        Backend, CommandList, DType, Op, Slice, Submission, ViewOp,
+        program::{BoundProgram, Inst, Program, ProgramKind, bind_program},
+    };
     use forja_cpu::CpuBackend;
     use forja_testing::{TensorSpec, assert_backends_agree, assert_outputs_agree};
 
@@ -3325,6 +3505,77 @@ mod tests {
     fn metal_compile_error_is_reported() {
         let backend = MetalBackend::new().unwrap();
         assert!(PipelineCache::new(&backend.device, "kernel void broken(").is_err());
+    }
+
+    #[test]
+    fn program_cache_evicts_the_least_recent_entry() {
+        let mut cache = LruCache::new(2);
+        cache.insert(1, "one");
+        cache.insert(2, "two");
+        assert_eq!(cache.get(&1), Some(&"one"));
+        cache.insert(3, "three");
+        assert!(cache.contains(&1));
+        assert!(!cache.contains(&2));
+        assert!(cache.contains(&3));
+    }
+
+    #[test]
+    fn program_cache_key_ignores_shapes_and_strides() {
+        let backend = CpuBackend::new();
+        let contiguous = identity_program(&backend, DType::F16, DType::F32, &[7, 33], false);
+        let permuted = identity_program(&backend, DType::F16, DType::F32, &[7, 33], true);
+        let other_shape = identity_program(&backend, DType::F16, DType::F32, &[1, 4097], false);
+        let other_rank = identity_program(&backend, DType::F16, DType::F32, &[7], false);
+        let other_input = identity_program(&backend, DType::BF16, DType::F32, &[7, 33], false);
+        let other_output = identity_program(&backend, DType::F16, DType::F16, &[7, 33], false);
+        let key = ProgramPipelineKey::new(&contiguous);
+        assert_eq!(key, ProgramPipelineKey::new(&permuted));
+        assert_eq!(key, ProgramPipelineKey::new(&other_shape));
+        assert_ne!(key, ProgramPipelineKey::new(&other_rank));
+        assert_ne!(key, ProgramPipelineKey::new(&other_input));
+        assert_ne!(key, ProgramPipelineKey::new(&other_output));
+    }
+
+    #[test]
+    fn map_pipeline_compiles_once_and_reports_failure() {
+        let cpu = CpuBackend::new();
+        let program = identity_program(&cpu, DType::F32, DType::F32, &[7], false);
+        let backend = MetalBackend::new().unwrap();
+        let mut cache = backend.pipelines.lock().unwrap();
+        cache.get_program(&program).unwrap();
+        cache.get_program(&program).unwrap();
+        assert_eq!(cache.programs.entries.len(), 1);
+        let key = ProgramPipelineKey::new(&program);
+        assert!(matches!(
+            cache.compile_program_source(&key, "kernel void broken("),
+            Err(BackendError::ExecutionFailed)
+        ));
+    }
+
+    fn identity_program(
+        backend: &CpuBackend,
+        input_dtype: DType,
+        output_dtype: DType,
+        shape: &[u32],
+        permuted: bool,
+    ) -> BoundProgram {
+        let input = if permuted {
+            let allocation = backend.alloc(input_dtype, &[shape[1], shape[0]]).unwrap();
+            backend
+                .view(&allocation, ViewOp::Permute(vec![1, 0]))
+                .unwrap()
+        } else {
+            backend.alloc(input_dtype, shape).unwrap()
+        };
+        let output = backend.alloc(output_dtype, shape).unwrap();
+        let program = Program {
+            kind: ProgramKind::Map,
+            insts: vec![Inst::Input(0)],
+            outputs: vec![(0, 0)],
+        }
+        .validate()
+        .unwrap();
+        bind_program(&program, &[&input], &[&output]).unwrap()
     }
 
     fn run_varying_submissions(backend: &MetalBackend, count: usize, offset: usize) {
