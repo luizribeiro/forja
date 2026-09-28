@@ -2,7 +2,9 @@ use std::fmt::{self, Write};
 
 use forja_core::{
     DType,
-    program::{BinOp, BoundProgram, Inst, ProgramKind, RedOp, UnOp, ValueType},
+    program::{
+        BinOp, Inst, KernelSignature, ProgramKind, RedOp, UnOp, ValidatedProgram, ValueType,
+    },
 };
 
 pub(super) const KERNEL_NAME: &str = "forja_map";
@@ -10,30 +12,38 @@ pub(super) const ROW_KERNEL_NAME: &str = "forja_row";
 pub(super) const REGISTER_RESIDENT_WIDTH: u32 = 1024;
 pub(super) const SHARED_HEADER: &str = include_str!("elementwise.metal");
 
-pub(super) fn generate(program: &BoundProgram, resident: bool) -> String {
-    match program.program().program().kind {
-        ProgramKind::Map => generate_map(program),
-        ProgramKind::Row if resident => generate_resident_row(program),
-        ProgramKind::Row => generate_row(program),
+pub(super) fn generate(
+    program: &ValidatedProgram,
+    signature: &KernelSignature,
+    resident: bool,
+) -> String {
+    match program.program().kind {
+        ProgramKind::Map => generate_map(program, signature),
+        ProgramKind::Row if resident => generate_resident_row(program, signature),
+        ProgramKind::Row => generate_row(program, signature),
     }
 }
 
-fn generate_map(program: &BoundProgram) -> String {
-    let inputs = program.inputs();
-    let outputs = program.outputs();
-    let rank = outputs[0].layout().shape().len();
+fn generate_map(program: &ValidatedProgram, signature: &KernelSignature) -> String {
+    let inputs = signature.input_dtypes();
+    let rank = usize::from(signature.rank());
     let mut source = String::from(SHARED_HEADER);
     line(&mut source, format_args!("\nkernel void {KERNEL_NAME}("));
-    emit_operand_parameters(&mut source, inputs.len(), outputs.len());
+    emit_operand_parameters(&mut source, inputs.len(), signature.output_dtypes().len());
     line(
         &mut source,
         format_args!("    uint3 position [[thread_position_in_grid]]) {{"),
     );
     emit_coordinates(&mut source, rank);
-    emit_addresses(&mut source, inputs.len(), outputs.len(), rank);
+    emit_addresses(
+        &mut source,
+        inputs.len(),
+        signature.output_dtypes().len(),
+        rank,
+    );
 
-    let mut types = Vec::with_capacity(program.program().program().insts.len());
-    for (index, &instruction) in program.program().program().insts.iter().enumerate() {
+    let mut types = Vec::with_capacity(program.program().insts.len());
+    for (index, &instruction) in program.program().insts.iter().enumerate() {
         let (value_type, expression) = instruction_expression(instruction, inputs, &types);
         types.push(value_type);
         line(
@@ -41,7 +51,7 @@ fn generate_map(program: &BoundProgram) -> String {
             format_args!("    {} v{index} = {expression};", type_name(value_type)),
         );
     }
-    for &(slot, value) in &program.program().program().outputs {
+    for &(slot, value) in &program.program().outputs {
         let slot = usize::try_from(slot).unwrap_or(usize::MAX);
         let expression = format!(
             "store_float(output{slot}, output_address{slot}, {}, v{value});",
@@ -53,10 +63,10 @@ fn generate_map(program: &BoundProgram) -> String {
     source
 }
 
-fn generate_row(program: &BoundProgram) -> String {
-    let mut source = row_source(program);
-    let rank = program.outputs()[0].layout().shape().len();
-    let instructions = &program.program().program().insts;
+fn generate_row(program: &ValidatedProgram, signature: &KernelSignature) -> String {
+    let mut source = row_source(signature);
+    let rank = usize::from(signature.rank());
+    let instructions = &program.program().insts;
     for (reduce_slot, (index, instruction)) in instructions
         .iter()
         .enumerate()
@@ -69,21 +79,21 @@ fn generate_row(program: &BoundProgram) -> String {
         emit_reduce_stage(
             &mut source,
             program,
+            signature,
             index,
             reduce_slot,
             instruction.0,
             instruction.1,
-            rank,
         );
     }
-    emit_output_stage(&mut source, program, rank);
+    emit_output_stage(&mut source, program, signature, rank);
     line(&mut source, format_args!("}}"));
     source
 }
 
-fn generate_resident_row(program: &BoundProgram) -> String {
-    let mut source = row_source(program);
-    let rank = program.outputs()[0].layout().shape().len();
+fn generate_resident_row(program: &ValidatedProgram, signature: &KernelSignature) -> String {
+    let mut source = row_source(signature);
+    let rank = usize::from(signature.rank());
     line(&mut source, format_args!("    bool active = lane < width;"));
     line(
         &mut source,
@@ -92,14 +102,14 @@ fn generate_resident_row(program: &BoundProgram) -> String {
     emit_lane_coordinates(&mut source, rank, 4);
     emit_addresses_indented(
         &mut source,
-        program.inputs().len(),
-        program.outputs().len(),
+        signature.input_dtypes().len(),
+        signature.output_dtypes().len(),
         rank,
         4,
     );
-    let mut types = Vec::with_capacity(program.program().program().insts.len());
+    let mut types = Vec::with_capacity(program.program().insts.len());
     let mut reduce_slot = 0;
-    for (index, &instruction) in program.program().program().insts.iter().enumerate() {
+    for (index, &instruction) in program.program().insts.iter().enumerate() {
         if let Inst::Reduce(op, operand) = instruction {
             emit_resident_reduce(&mut source, reduce_slot, op, operand);
             types.push(ValueType::F32);
@@ -110,7 +120,7 @@ fn generate_resident_row(program: &BoundProgram) -> String {
             reduce_slot += 1;
         } else {
             let (value_type, expression) =
-                instruction_expression(instruction, program.inputs(), &types);
+                instruction_expression(instruction, signature.input_dtypes(), &types);
             types.push(value_type);
             line(
                 &mut source,
@@ -125,16 +135,18 @@ fn generate_resident_row(program: &BoundProgram) -> String {
     source
 }
 
-fn row_source(program: &BoundProgram) -> String {
-    let inputs = program.inputs();
-    let outputs = program.outputs();
-    let rank = outputs[0].layout().shape().len();
+fn row_source(signature: &KernelSignature) -> String {
+    let rank = usize::from(signature.rank());
     let mut source = String::from(SHARED_HEADER);
     line(
         &mut source,
         format_args!("\nkernel void {ROW_KERNEL_NAME}("),
     );
-    emit_operand_parameters(&mut source, inputs.len(), outputs.len());
+    emit_operand_parameters(
+        &mut source,
+        signature.input_dtypes().len(),
+        signature.output_dtypes().len(),
+    );
     line(
         &mut source,
         format_args!("    uint row [[threadgroup_position_in_grid]],"),
@@ -251,13 +263,14 @@ fn emit_row_coordinates(source: &mut String, rank: usize) {
 
 fn emit_reduce_stage(
     source: &mut String,
-    program: &BoundProgram,
+    program: &ValidatedProgram,
+    signature: &KernelSignature,
     instruction_end: usize,
     reduce_slot: usize,
     op: RedOp,
     operand: u32,
-    rank: usize,
 ) {
+    let rank = usize::from(signature.rank());
     let identity = match op {
         RedOp::Sum => "0.0f",
         RedOp::Max => "-INFINITY",
@@ -279,12 +292,12 @@ fn emit_reduce_stage(
     emit_lane_coordinates(source, rank, 12);
     emit_addresses_indented(
         source,
-        program.inputs().len(),
-        program.outputs().len(),
+        signature.input_dtypes().len(),
+        signature.output_dtypes().len(),
         rank,
         12,
     );
-    emit_values(source, program, instruction_end, 12);
+    emit_values(source, program, signature, instruction_end, 12);
     line(
         source,
         format_args!("            accumulator_nan = accumulator_nan || f32_is_nan(v{operand});"),
@@ -371,7 +384,12 @@ fn emit_threadgroup_reduce(
     );
 }
 
-fn emit_output_stage(source: &mut String, program: &BoundProgram, rank: usize) {
+fn emit_output_stage(
+    source: &mut String,
+    program: &ValidatedProgram,
+    signature: &KernelSignature,
+    rank: usize,
+) {
     line(
         source,
         format_args!("    for (uint column = lane; column < width; column += group_width) {{"),
@@ -379,18 +397,18 @@ fn emit_output_stage(source: &mut String, program: &BoundProgram, rank: usize) {
     emit_lane_coordinates(source, rank, 8);
     emit_addresses_indented(
         source,
-        program.inputs().len(),
-        program.outputs().len(),
+        signature.input_dtypes().len(),
+        signature.output_dtypes().len(),
         rank,
         8,
     );
-    emit_values(source, program, program.program().program().insts.len(), 8);
+    emit_values(source, program, signature, program.program().insts.len(), 8);
     emit_stores(source, program, 8);
     line(source, format_args!("    }}"));
 }
 
-fn emit_stores(source: &mut String, program: &BoundProgram, indent: usize) {
-    for &(slot, value) in &program.program().program().outputs {
+fn emit_stores(source: &mut String, program: &ValidatedProgram, indent: usize) {
+    for &(slot, value) in &program.program().outputs {
         let slot = usize::try_from(slot).unwrap_or(usize::MAX);
         let expression = format!(
             "store_float(output{slot}, output_address{slot}, {}, v{value});",
@@ -426,10 +444,16 @@ fn emit_addresses_indented(
     }
 }
 
-fn emit_values(source: &mut String, program: &BoundProgram, end: usize, indent: usize) {
+fn emit_values(
+    source: &mut String,
+    program: &ValidatedProgram,
+    signature: &KernelSignature,
+    end: usize,
+    indent: usize,
+) {
     let mut types = Vec::with_capacity(end);
     let mut reduction = 0;
-    for (index, &instruction) in program.program().program().insts[..end].iter().enumerate() {
+    for (index, &instruction) in program.program().insts[..end].iter().enumerate() {
         if matches!(instruction, Inst::Reduce(_, _)) {
             types.push(ValueType::F32);
             line(
@@ -440,7 +464,7 @@ fn emit_values(source: &mut String, program: &BoundProgram, end: usize, indent: 
             continue;
         }
         let (value_type, expression) =
-            instruction_expression(instruction, program.inputs(), &types);
+            instruction_expression(instruction, signature.input_dtypes(), &types);
         types.push(value_type);
         line(
             source,
@@ -526,13 +550,13 @@ fn operands(
 
 fn instruction_expression(
     instruction: Inst,
-    inputs: &[forja_core::Tensor],
+    inputs: &[DType],
     types: &[ValueType],
 ) -> (ValueType, String) {
     match instruction {
         Inst::Input(slot) => {
             let slot = usize::try_from(slot).unwrap_or(usize::MAX);
-            match inputs[slot].layout().dtype() {
+            match inputs[slot] {
                 DType::F32 | DType::F16 => (
                     ValueType::F32,
                     format!(
@@ -702,9 +726,8 @@ mod tests {
     use crate::rounding_program;
     use forja_core::{
         DType,
-        program::{BinOp, Inst, Program, ProgramKind, RedOp, UnOp, ValueType, bind_program},
+        program::{BinOp, Inst, KernelSignature, Program, ProgramKind, RedOp, UnOp, ValueType},
     };
-    use forja_cpu::CpuBackend;
     use forja_testing::{TensorSpec, program::well_typed_programs};
     use proptest::prelude::*;
 
@@ -942,22 +965,13 @@ kernel void forja_row(
         shape: &[u32],
         resident: bool,
     ) -> String {
-        let backend = CpuBackend::new();
-        let inputs = inputs
-            .iter()
-            .map(|&dtype| backend.alloc(dtype, shape).unwrap())
-            .collect::<Vec<_>>();
-        let outputs = outputs
-            .iter()
-            .map(|&dtype| backend.alloc(dtype, shape).unwrap())
-            .collect::<Vec<_>>();
         let program = program.validate().unwrap();
-        let bound = bind_program(
-            &program,
-            &inputs.iter().collect::<Vec<_>>(),
-            &outputs.iter().collect::<Vec<_>>(),
-        )
-        .unwrap();
-        generate(&bound, resident)
+        let signature = KernelSignature::new(
+            u8::try_from(shape.len()).unwrap(),
+            inputs.to_vec(),
+            outputs.to_vec(),
+            0,
+        );
+        generate(&program, &signature, resident)
     }
 }

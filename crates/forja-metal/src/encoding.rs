@@ -13,7 +13,7 @@ use block2::RcBlock;
 use forja_core::{
     BackendError, BufferId, CommandList, DType, Dispatch, DispatchProfile, Layout, Op,
     ProfileCount, Slice, Submission, SubmissionProfile, Tensor,
-    program::{BoundProgram, ProgramHash, ProgramKind},
+    program::{BoundProgram, KernelSignature, ProgramHash, ProgramKind, ValidatedProgram},
     required_barriers,
 };
 use objc2::{rc::Retained, runtime::ProtocolObject};
@@ -326,21 +326,23 @@ struct ProgramPipelineKey {
 }
 
 impl ProgramPipelineKey {
-    fn new(program: &BoundProgram, resident: bool) -> Self {
-        let row = program.program().program().kind == ProgramKind::Row;
+    fn new(program: &ValidatedProgram, signature: &KernelSignature, resident: bool) -> Self {
+        let row = program.program().kind == ProgramKind::Row;
         Self {
             hash: program.content_hash(),
-            input_dtypes: program
-                .inputs()
+            input_dtypes: signature
+                .input_dtypes()
                 .iter()
-                .map(|tensor| dtype_key(tensor.layout().dtype()))
+                .copied()
+                .map(dtype_key)
                 .collect(),
-            output_dtypes: program
-                .outputs()
+            output_dtypes: signature
+                .output_dtypes()
                 .iter()
-                .map(|tensor| dtype_key(tensor.layout().dtype()))
+                .copied()
+                .map(dtype_key)
                 .collect(),
-            rank: u8::try_from(program.outputs()[0].layout().shape().len()).unwrap_or(u8::MAX),
+            rank: signature.rank(),
             row,
             resident: row && resident,
         }
@@ -358,11 +360,12 @@ enum ProgramPipelineKeys {
 
 impl ProgramPipelineKeys {
     fn new(program: &BoundProgram) -> Self {
-        let rereading = ProgramPipelineKey::new(program, false);
+        let signature = bound_signature(program);
+        let rereading = ProgramPipelineKey::new(program.program(), &signature, false);
         if let Some(width) = resident_program_width(program) {
             Self::Resident {
                 width,
-                resident: ProgramPipelineKey::new(program, true),
+                resident: ProgramPipelineKey::new(program.program(), &signature, true),
                 rereading,
             }
         } else {
@@ -377,6 +380,23 @@ impl ProgramPipelineKeys {
     }
 }
 
+fn bound_signature(program: &BoundProgram) -> KernelSignature {
+    KernelSignature::new(
+        u8::try_from(program.outputs()[0].layout().shape().len()).unwrap_or(u8::MAX),
+        program
+            .inputs()
+            .iter()
+            .map(|tensor| tensor.layout().dtype())
+            .collect(),
+        program
+            .outputs()
+            .iter()
+            .map(|tensor| tensor.layout().dtype())
+            .collect(),
+        0,
+    )
+}
+
 struct DispatchEncoding<'a> {
     dispatches: &'a [Dispatch],
     program_keys: &'a [Option<ProgramPipelineKeys>],
@@ -386,6 +406,57 @@ struct DispatchEncoding<'a> {
 struct ProgramPipeline {
     state: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     resident: bool,
+}
+
+pub(super) struct MetalProgram {
+    rereading: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    resident: Option<LazyProgramPipeline>,
+}
+
+// SAFETY: Compiled pipeline states are immutable, and Metal permits encoding them from multiple
+// host threads.
+unsafe impl Send for MetalProgram {}
+// SAFETY: Compiled pipeline states are immutable, and lazy initialization is synchronized by
+// `OnceLock`.
+unsafe impl Sync for MetalProgram {}
+
+struct LazyProgramPipeline {
+    key: ProgramPipelineKey,
+    source: String,
+    state: OnceLock<Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
+    compilation: Mutex<()>,
+}
+
+/// Opaque state retained by a prepared Metal scalar program.
+pub struct MetalProgramHandle(pub(super) Arc<MetalProgram>);
+
+impl std::fmt::Debug for MetalProgramHandle {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_tuple("MetalProgramHandle")
+            .field(&self.0)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for MetalProgram {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MetalProgram")
+            .field("rereading", &self.rereading.label())
+            .field(
+                "resident",
+                &self.resident.as_ref().map(|resident| {
+                    (
+                        &resident.key,
+                        resident.source.len(),
+                        resident.state.get().is_some(),
+                        resident.compilation.is_poisoned(),
+                    )
+                }),
+            )
+            .finish()
+    }
 }
 
 fn resident_program_width(program: &BoundProgram) -> Option<u32> {
@@ -1170,6 +1241,53 @@ impl MetalSubmission {
 }
 
 impl MetalBackend {
+    pub(super) fn prepare_scalar_program(
+        &self,
+        program: &ValidatedProgram,
+        signature: &KernelSignature,
+    ) -> Result<MetalProgramHandle, BackendError> {
+        let cache_key = (program.content_hash(), signature.clone());
+        let mut prepared = self
+            .prepared_programs
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?;
+        prepared.retain(|_, program| program.strong_count() > 0);
+        if let Some(existing) = prepared.get(&cache_key).and_then(Weak::upgrade) {
+            return Ok(MetalProgramHandle(existing));
+        }
+
+        self.program_compile_tokens
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?
+            .consume(1)
+            .then_some(())
+            .ok_or(BackendError::QuotaExceeded)?;
+        let rereading_key = ProgramPipelineKey::new(program, signature, false);
+        let rereading_source = map_codegen::generate(program, signature, false);
+        let rereading = self
+            .pipelines
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?
+            .compile_program_source(&rereading_key, &rereading_source)?;
+        // The bound row width is unavailable at preparation. The rereading pipeline works for
+        // every width; the resident candidate is compiled only when a dispatch can select it.
+        let resident = (program.program().kind == ProgramKind::Row).then(|| {
+            let key = ProgramPipelineKey::new(program, signature, true);
+            LazyProgramPipeline {
+                source: map_codegen::generate(program, signature, true),
+                key,
+                state: OnceLock::new(),
+                compilation: Mutex::new(()),
+            }
+        });
+        let program = Arc::new(MetalProgram {
+            rereading,
+            resident,
+        });
+        prepared.insert(cache_key, Arc::downgrade(&program));
+        Ok(MetalProgramHandle(program))
+    }
+
     pub(super) fn submit_commands(
         &self,
         commands: CommandList,
@@ -1184,6 +1302,7 @@ impl MetalBackend {
         self.submit_commands_inner::<true>(commands)
     }
 
+    #[allow(clippy::too_many_lines)]
     fn submit_commands_inner<const PROFILE: bool>(
         &self,
         commands: CommandList,
@@ -3688,7 +3807,8 @@ impl PipelineCache {
         if let Some(pipeline) = self.programs.get(key) {
             return Ok(pipeline.clone());
         }
-        let source = map_codegen::generate(program, key.resident);
+        let source =
+            map_codegen::generate(program.program(), &bound_signature(program), key.resident);
         let pipeline = self.compile_program_source(key, &source)?;
         self.programs.insert(key.clone(), pipeline.clone());
         Ok(pipeline)
@@ -3809,7 +3929,8 @@ mod tests {
     use forja_core::{
         Backend, CommandList, DType, Op, Slice, Submission, ViewOp,
         program::{
-            BinOp, BoundProgram, Inst, Program, ProgramKind, RedOp, ValidatedProgram, bind_program,
+            BinOp, BoundProgram, Inst, KernelSignature, Program, ProgramKind, RedOp,
+            ValidatedProgram, bind_program, prepare_program,
         },
     };
     use forja_cpu::CpuBackend;
@@ -3844,20 +3965,20 @@ mod tests {
         let other_rank = identity_program(&backend, DType::F16, DType::F32, &[7], false);
         let other_input = identity_program(&backend, DType::BF16, DType::F32, &[7, 33], false);
         let other_output = identity_program(&backend, DType::F16, DType::F16, &[7, 33], false);
-        let key = ProgramPipelineKey::new(&contiguous, false);
-        assert_eq!(key, ProgramPipelineKey::new(&permuted, false));
-        assert_eq!(key, ProgramPipelineKey::new(&other_shape, false));
-        assert_ne!(key, ProgramPipelineKey::new(&other_rank, false));
-        assert_ne!(key, ProgramPipelineKey::new(&other_input, false));
-        assert_ne!(key, ProgramPipelineKey::new(&other_output, false));
+        let key = program_pipeline_key(&contiguous, false);
+        assert_eq!(key, program_pipeline_key(&permuted, false));
+        assert_eq!(key, program_pipeline_key(&other_shape, false));
+        assert_ne!(key, program_pipeline_key(&other_rank, false));
+        assert_ne!(key, program_pipeline_key(&other_input, false));
+        assert_ne!(key, program_pipeline_key(&other_output, false));
     }
 
     #[test]
     fn row_pipeline_key_distinguishes_register_residency() {
         let backend = CpuBackend::new();
         let resident = row_program(&backend, map_codegen::REGISTER_RESIDENT_WIDTH);
-        let resident_key = ProgramPipelineKey::new(&resident, true);
-        let rereading_key = ProgramPipelineKey::new(&resident, false);
+        let resident_key = program_pipeline_key(&resident, true);
+        let rereading_key = program_pipeline_key(&resident, false);
         assert!(resident_key.resident);
         assert!(!rereading_key.resident);
         assert_ne!(resident_key, rereading_key);
@@ -3925,6 +4046,77 @@ mod tests {
     }
 
     #[test]
+    fn identical_preparations_share_compilation_until_handles_drop() {
+        let budget = crate::ProgramCompileBudget::new(3, Duration::from_hours(24)).unwrap();
+        let backend = MetalBackend::with_program_compile_budget(budget).unwrap();
+        let signature = KernelSignature::new(1, vec![DType::F32], vec![DType::F32], 0);
+        let program = |constant| {
+            Program {
+                kind: ProgramKind::Map,
+                insts: vec![
+                    Inst::Input(0),
+                    Inst::Const(constant),
+                    Inst::Binary(BinOp::Add, 0, 1),
+                ],
+                outputs: vec![(0, 2)],
+            }
+            .validate()
+            .unwrap()
+        };
+        let prepared = (0..100)
+            .map(|_| prepare_program(&backend, program(1.0), signature.clone()).unwrap())
+            .collect::<Vec<_>>();
+        let first = prepared[0].backend_handle::<MetalProgramHandle>().unwrap();
+        assert!(prepared.iter().all(|candidate| Arc::ptr_eq(
+            &first.0,
+            &candidate.backend_handle::<MetalProgramHandle>().unwrap().0
+        )));
+        let second = prepare_program(&backend, program(2.0), signature.clone()).unwrap();
+        drop(prepared);
+        let replacement = prepare_program(&backend, program(1.0), signature.clone()).unwrap();
+        assert!(matches!(
+            prepare_program(&backend, program(3.0), signature),
+            Err(forja_core::program::PrepareError::Backend(
+                BackendError::QuotaExceeded
+            ))
+        ));
+        drop((second, replacement));
+    }
+
+    #[test]
+    fn preparation_prunes_dead_dedup_entries() {
+        let backend = MetalBackend::new().unwrap();
+        let signature = KernelSignature::new(1, vec![], vec![DType::F32], 0);
+        {
+            let mut prepared = backend.prepared_programs.lock().unwrap();
+            for value in 0_u16..1_000 {
+                let program = Program {
+                    kind: ProgramKind::Map,
+                    insts: vec![Inst::Const(f32::from(value))],
+                    outputs: vec![(0, 0)],
+                }
+                .validate()
+                .unwrap();
+                prepared.insert(
+                    (program.content_hash(), signature.clone()),
+                    Weak::<MetalProgram>::new(),
+                );
+            }
+            assert_eq!(prepared.len(), 1_000);
+        }
+        let program = Program {
+            kind: ProgramKind::Map,
+            insts: vec![Inst::Const(-1.0)],
+            outputs: vec![(0, 0)],
+        }
+        .validate()
+        .unwrap();
+        let _prepared = prepare_program(&backend, program, signature).unwrap();
+
+        assert_eq!(backend.prepared_programs.lock().unwrap().len(), 1);
+    }
+
+    #[test]
     fn map_pipeline_compiles_once_and_reports_failure() {
         let cpu = CpuBackend::new();
         let program = identity_program(&cpu, DType::F32, DType::F32, &[7], false);
@@ -3934,7 +4126,7 @@ mod tests {
         cache.get_program(&program, &keys).unwrap();
         cache.get_program(&program, &keys).unwrap();
         assert_eq!(cache.programs.entries.len(), 1);
-        let key = ProgramPipelineKey::new(&program, false);
+        let key = program_pipeline_key(&program, false);
         assert!(matches!(
             cache.compile_program_source(&key, "kernel void broken("),
             Err(BackendError::ExecutionFailed)
@@ -4127,6 +4319,10 @@ mod tests {
         .validate()
         .unwrap();
         bind_program(&program, &[&input], &[&output]).unwrap()
+    }
+
+    fn program_pipeline_key(program: &BoundProgram, resident: bool) -> ProgramPipelineKey {
+        ProgramPipelineKey::new(program.program(), &bound_signature(program), resident)
     }
 
     fn submit_constant_program(

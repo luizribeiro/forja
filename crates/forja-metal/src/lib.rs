@@ -14,6 +14,8 @@ mod rounding_program;
 mod storage;
 
 #[cfg(target_os = "macos")]
+pub use encoding::MetalProgramHandle;
+#[cfg(target_os = "macos")]
 pub use storage::{MetalBackend, ProgramCompileBudget};
 
 #[cfg(target_os = "macos")]

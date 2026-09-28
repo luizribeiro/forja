@@ -7,12 +7,14 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::encoding::{Completion, InFlightTracker, MetalSubmission, PipelineCache};
+use crate::encoding::{
+    Completion, InFlightTracker, MetalProgram, MetalProgramHandle, MetalSubmission, PipelineCache,
+};
 use block2::RcBlock;
 use forja_core::{
     AllocationRegistry, Backend, BackendError, BufferId, CommandList, DType, Layout, MappedRegion,
     Tensor, ViewOp,
-    program::{KernelSignature, ValidatedProgram},
+    program::{KernelSignature, ProgramHash, ValidatedProgram},
 };
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_foundation::NSPageSize;
@@ -253,6 +255,8 @@ pub struct MetalBackend {
     pub(super) buffers: Mutex<AllocationRegistry<MetalBuffer>>,
     pool: Mutex<BufferPool>,
     pub(super) pipelines: Mutex<PipelineCache>,
+    pub(super) prepared_programs:
+        Mutex<HashMap<(ProgramHash, KernelSignature), Weak<MetalProgram>>>,
     pub(super) program_compile_tokens: Mutex<ProgramCompileTokens>,
     pub(super) in_flight: Arc<InFlightTracker>,
     pub(super) shared_event: Retained<ProtocolObject<dyn MTLSharedEvent>>,
@@ -384,6 +388,7 @@ impl MetalBackend {
                 residency: PoolResidency { raw: residency },
             }),
             pipelines: Mutex::new(pipelines),
+            prepared_programs: Mutex::new(HashMap::new()),
             program_compile_tokens: Mutex::new(ProgramCompileTokens::new(program_compile_budget)),
             in_flight: Arc::new(InFlightTracker::new()),
             shared_event,
@@ -404,14 +409,14 @@ impl MetalBackend {
 
 impl Backend for MetalBackend {
     type Submission = MetalSubmission;
-    type ProgramHandle = ();
+    type ProgramHandle = MetalProgramHandle;
 
     fn prepare_program(
         &self,
-        _program: &ValidatedProgram,
-        _signature: &KernelSignature,
+        program: &ValidatedProgram,
+        signature: &KernelSignature,
     ) -> Result<Self::ProgramHandle, BackendError> {
-        Err(BackendError::UnsupportedOperation)
+        self.prepare_scalar_program(program, signature)
     }
 
     fn alloc(&self, dtype: DType, shape: &[u32]) -> Result<Tensor, BackendError> {
