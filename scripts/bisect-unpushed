@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if (( $# == 0 )); then
+  echo "usage: scripts/bisect-unpushed <command> [args ...]" >&2
+  exit 2
+fi
+
+repo_root=$(git rev-parse --show-toplevel)
+cd "$repo_root"
+
+if [[ -n "$(git status --porcelain)" ]]; then
+  echo "working tree must be clean" >&2
+  exit 2
+fi
+
+if ! git rev-parse --verify --quiet 'origin/main^{commit}' >/dev/null; then
+  echo "origin/main is not available" >&2
+  exit 2
+fi
+
+if ! git merge-base --is-ancestor origin/main HEAD; then
+  echo "origin/main is not an ancestor of HEAD" >&2
+  exit 2
+fi
+
+if [[ $(git rev-list --count origin/main..HEAD) == 0 ]]; then
+  echo "there are no unpushed commits to bisect" >&2
+  exit 2
+fi
+
+bisect_active=0
+restore_head() {
+  if (( bisect_active == 1 )); then
+    git bisect reset >/dev/null 2>&1 || true
+  fi
+}
+trap restore_head EXIT
+
+git bisect start HEAD origin/main
+bisect_active=1
+
+set +e
+git bisect run nix develop -c "$@"
+status=$?
+set -e
+if (( status != 0 )); then
+  echo "bisect did not identify a first bad commit" >&2
+  exit "$status"
+fi
+
+first_bad=$(git rev-parse refs/bisect/bad)
+git bisect reset >/dev/null
+bisect_active=0
+printf 'First bad commit: %s\n' "$first_bad"
