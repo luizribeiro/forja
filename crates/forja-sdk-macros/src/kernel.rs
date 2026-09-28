@@ -225,6 +225,22 @@ impl KernelFunction {
         let output_dtypes = internal("__forja_output_dtypes");
         let kernel = internal("__forja_kernel");
         let binding = internal("__forja_binding");
+        let broadcasts = self.tensors.iter().skip(1).map(|tensor| {
+            let ident = &tensor.ident;
+            let storage = format_ident!("__forja_broadcast_{}", ident, span = Span::mixed_site());
+            let broadcast = internal("__forja_broadcast_value");
+            quote! {
+                let #storage = if #ident.shape() == #shape {
+                    None
+                } else {
+                    Some(#ident.broadcast_as(#shape)?)
+                };
+                let #ident = match &#storage {
+                    Some(#broadcast) => #broadcast,
+                    None => #ident,
+                };
+            }
+        });
         let tensor_names = self.tensors.iter().map(|tensor| &tensor.ident);
         let scalar_names = self.scalars.iter().map(|scalar| &scalar.ident);
         let outputs = (0..self.output_count)
@@ -239,6 +255,7 @@ impl KernelFunction {
         let output_count = self.output_count;
         quote! {
             let #shape = #first.shape();
+            #(#broadcasts)*
             let #inputs = [#(::forja_sdk::kernel::TensorRef::new(#tensor_names)?),*];
             let #input_dtypes = #inputs
                 .iter()
@@ -316,6 +333,9 @@ impl KernelFunction {
     ) -> syn::Result<TokenStream> {
         let context = internal("__forja_context");
         let rank = internal("__forja_rank");
+        let scalar_bits_name = internal("__forja_scalar_bits");
+        let cache_name = internal("__FORJA_CACHE");
+        let cache = internal("__forja_cache");
         let program = internal("__forja_program");
         let parameters = self
             .tensors
@@ -370,6 +390,13 @@ impl KernelFunction {
                 },
             }
         });
+        let scalar_bits = self.scalars.iter().map(|scalar| {
+            let ident = &scalar.ident;
+            match scalar.compute {
+                ComputeType::F32 => quote!(#ident.to_bits()),
+                ComputeType::U32 => quote!(#ident),
+            }
+        });
         Ok(quote! {
             #(#scalar_checks)*
             let #rank = u8::try_from(#rank_argument).map_err(|_| {
@@ -377,16 +404,31 @@ impl KernelFunction {
                     "kernel `", stringify!(#name), "`: tensor rank is too large"
                 ))
             })?;
-            let #context = #context_type::new();
-            #(#statements)*
-            #(#output_statements)*
-            let #program = #context.finish();
-            ::forja_sdk::kernel::Kernel::new(
-                &#program,
-                #rank,
-                #input_dtypes_argument,
-                #output_dtypes_argument,
-            )
+            let #scalar_bits_name = [#(#scalar_bits),*];
+            ::std::thread_local! {
+                static #cache_name: ::forja_sdk::kernel::Cache =
+                    const { ::forja_sdk::kernel::Cache::rejecting(stringify!(#name)) };
+            }
+            #cache_name.with(|#cache| {
+                #cache.get_or_try_insert_with(
+                    #rank,
+                    #input_dtypes_argument,
+                    #output_dtypes_argument,
+                    &#scalar_bits_name,
+                    || {
+                        let #context = #context_type::new();
+                        #(#statements)*
+                        #(#output_statements)*
+                        let #program = #context.finish();
+                        ::forja_sdk::kernel::Kernel::new(
+                            &#program,
+                            #rank,
+                            #input_dtypes_argument,
+                            #output_dtypes_argument,
+                        )
+                    },
+                )
+            })
         })
     }
 }

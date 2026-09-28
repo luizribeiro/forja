@@ -1,4 +1,9 @@
 //! Foundations used by Rust-syntax kernel definitions.
+//!
+//! Generated allocating calls broadcast non-leading inputs to the leading
+//! input's concrete shape. Graph replay must refuse that automatic broadcast
+//! when an extent is symbolic; callers can use the generated `_into` function
+//! with explicitly bound views instead.
 
 use std::{cell::RefCell, collections::VecDeque, marker::PhantomData};
 
@@ -160,6 +165,13 @@ struct Entry {
 /// entries are evicted, dropping the cache's clone of the prepared handle.
 pub struct Cache {
     entries: RefCell<VecDeque<Entry>>,
+    full: FullBehavior,
+}
+
+#[derive(Clone, Copy)]
+enum FullBehavior {
+    Evict,
+    Reject(&'static str),
 }
 
 impl Cache {
@@ -168,6 +180,17 @@ impl Cache {
     pub const fn new() -> Self {
         Self {
             entries: RefCell::new(VecDeque::new()),
+            full: FullBehavior::Evict,
+        }
+    }
+
+    /// Creates an empty cache that rejects signatures beyond its capacity.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn rejecting(kernel_name: &'static str) -> Self {
+        Self {
+            entries: RefCell::new(VecDeque::new()),
+            full: FullBehavior::Reject(kernel_name),
         }
     }
 
@@ -207,11 +230,23 @@ impl Cache {
         }
         drop(entries);
 
-        let kernel = build()?;
         let mut entries = self.entries.borrow_mut();
         if entries.len() == CACHE_CAPACITY {
-            entries.pop_front();
+            match self.full {
+                FullBehavior::Evict => {
+                    entries.pop_front();
+                }
+                FullBehavior::Reject(name) => {
+                    return Err(crate::Error::new(format!(
+                        "kernel `{name}`: more than 16 distinct (rank, dtype, scalar) variants; pass varying scalars as tensors"
+                    )));
+                }
+            }
         }
+        drop(entries);
+
+        let kernel = build()?;
+        let mut entries = self.entries.borrow_mut();
         entries.push_back(Entry {
             signature,
             kernel: kernel.clone(),
@@ -309,6 +344,37 @@ mod tests {
         }
 
         assert!(handle.upgrade().is_none());
+    }
+
+    #[test]
+    fn rejecting_cache_reports_the_seventeenth_signature() {
+        let cache = Cache::rejecting("position_kernel");
+        for scalar in 0..CACHE_CAPACITY {
+            cache
+                .get_or_try_insert_with(
+                    1,
+                    &[DType::F32],
+                    &[DType::F32],
+                    &[u32::try_from(scalar).unwrap()],
+                    || kernel(1, &[DType::F32], &[DType::F32]),
+                )
+                .unwrap();
+        }
+
+        let error = cache
+            .get_or_try_insert_with(
+                1,
+                &[DType::F32],
+                &[DType::F32],
+                &[u32::try_from(CACHE_CAPACITY).unwrap()],
+                || kernel(1, &[DType::F32], &[DType::F32]),
+            )
+            .err()
+            .expect("the seventeenth signature must be rejected");
+        assert_eq!(
+            error.to_string(),
+            "kernel `position_kernel`: more than 16 distinct (rank, dtype, scalar) variants; pass varying scalars as tensors"
+        );
     }
 
     #[test]
