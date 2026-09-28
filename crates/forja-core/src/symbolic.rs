@@ -7,7 +7,7 @@ use std::{
 
 static NEXT_PARAM_SPACE_ID: AtomicU64 = AtomicU64::new(0);
 
-use crate::{Layout, LayoutError};
+use crate::{Layout, LayoutError, Slice};
 
 /// The largest number of parameters accepted by a symbolic layout.
 pub const MAX_PARAMS: usize = 4;
@@ -133,6 +133,27 @@ impl ParamSpace {
             values,
         })
     }
+
+    fn corners(&self) -> Vec<ParamValues> {
+        let count = 1_usize << self.ranges.len();
+        (0..count)
+            .map(|corner| ParamValues {
+                space_id: self.id,
+                values: self
+                    .ranges
+                    .iter()
+                    .enumerate()
+                    .map(|(index, range)| {
+                        if corner & (1 << index) == 0 {
+                            *range.start()
+                        } else {
+                            *range.end()
+                        }
+                    })
+                    .collect(),
+            })
+            .collect()
+    }
 }
 
 /// Concrete parameter values checked against their originating space.
@@ -147,6 +168,10 @@ impl ParamValues {
     #[must_use]
     pub fn as_slice(&self) -> &[u32] {
         &self.values
+    }
+
+    fn space_id(&self) -> u64 {
+        self.space_id
     }
 }
 
@@ -320,11 +345,11 @@ impl SymbolicLayout {
         &self.space
     }
 
-    /// Appends a slice along one axis.
+    /// Appends a slice along one axis and validates every parameter-space corner.
     ///
     /// # Errors
     ///
-    /// Returns [`SymbolicLayoutError`] for an invalid composition.
+    /// Returns [`SymbolicLayoutError`] for an invalid composition or corner layout.
     pub fn slice(
         &self,
         axis: u8,
@@ -348,28 +373,24 @@ impl SymbolicLayout {
             len,
             step,
         });
+        result.validate_corners()?;
         result.symbolic_extents[usize::from(axis)] = !len.is_constant();
         Ok(result)
     }
 
-    /// Appends an axis permutation.
+    /// Appends an axis permutation and validates every parameter-space corner.
     ///
     /// # Errors
     ///
-    /// Returns [`SymbolicLayoutError`] when an axis is invalid.
+    /// Returns [`SymbolicLayoutError`] when the permutation or a corner is invalid.
     pub fn permute(&self, axes: &[u8]) -> Result<Self, SymbolicLayoutError> {
-        let symbolic_extents = axes
-            .iter()
-            .map(|&axis| {
-                self.symbolic_extents
-                    .get(usize::from(axis))
-                    .copied()
-                    .ok_or(SymbolicLayoutError::AxisOutOfRange { axis })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
         let mut result = self.clone();
         result.recipe.push(RecipeOp::Permute(axes.to_owned()));
-        result.symbolic_extents = symbolic_extents;
+        result.validate_corners()?;
+        result.symbolic_extents = axes
+            .iter()
+            .map(|&axis| self.symbolic_extents[usize::from(axis)])
+            .collect();
         Ok(result)
     }
 
@@ -377,7 +398,7 @@ impl SymbolicLayout {
     ///
     /// # Errors
     ///
-    /// Returns [`SymbolicLayoutError`] when any extent is symbolic.
+    /// Returns [`SymbolicLayoutError`] for symbolic extents or invalid corners.
     pub fn broadcast(&self, shape: Vec<u32>) -> Result<Self, SymbolicLayoutError> {
         self.with_concrete_extent_op(RecipeOp::Broadcast(shape))
     }
@@ -386,9 +407,39 @@ impl SymbolicLayout {
     ///
     /// # Errors
     ///
-    /// Returns [`SymbolicLayoutError`] when any extent is symbolic.
+    /// Returns [`SymbolicLayoutError`] for symbolic extents or invalid corners.
     pub fn reshape(&self, shape: Vec<u32>) -> Result<Self, SymbolicLayoutError> {
         self.with_concrete_extent_op(RecipeOp::Reshape(shape))
+    }
+
+    /// Instantiates and revalidates the complete recipe with trusted [`Layout`] operations.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SymbolicLayoutError`] when values belong to another space, affine
+    /// evaluation fails, or any concrete layout operation refuses the result.
+    pub fn instantiate(&self, values: &ParamValues) -> Result<Layout, SymbolicLayoutError> {
+        if values.space_id() != self.space.id {
+            return Err(SymbolicLayoutError::ParameterSpaceMismatch);
+        }
+        self.recipe
+            .iter()
+            .try_fold(self.base.clone(), |layout, op| {
+                Self::apply_op(&layout, op, values)
+            })
+    }
+
+    /// Instantiates every corner for early refusal, not as a proof of replay safety.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SymbolicLayoutError`] when any corner cannot be instantiated.
+    pub fn corner_layouts(&self) -> Result<Vec<Layout>, SymbolicLayoutError> {
+        self.space
+            .corners()
+            .iter()
+            .map(|values| self.instantiate(values))
+            .collect()
     }
 
     fn with_concrete_extent_op(&self, op: RecipeOp) -> Result<Self, SymbolicLayoutError> {
@@ -401,8 +452,42 @@ impl SymbolicLayout {
         };
         let mut result = self.clone();
         result.recipe.push(op);
+        result.validate_corners()?;
         result.symbolic_extents = vec![false; rank];
         Ok(result)
+    }
+
+    fn validate_corners(&self) -> Result<(), SymbolicLayoutError> {
+        self.corner_layouts().map(|_| ())
+    }
+
+    fn apply_op(
+        layout: &Layout,
+        op: &RecipeOp,
+        values: &ParamValues,
+    ) -> Result<Layout, SymbolicLayoutError> {
+        match op {
+            RecipeOp::Slice {
+                axis,
+                start,
+                len,
+                step,
+            } => {
+                let mut slices = layout
+                    .shape()
+                    .iter()
+                    .map(|&extent| Slice::new(0, extent, 1))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let selected = slices
+                    .get_mut(usize::from(*axis))
+                    .ok_or(SymbolicLayoutError::AxisOutOfRange { axis: *axis })?;
+                *selected = Slice::new(start.evaluate(values)?, len.evaluate(values)?, *step)?;
+                Ok(layout.slice(&slices)?)
+            }
+            RecipeOp::Permute(axes) => Ok(layout.permute(axes)?),
+            RecipeOp::Broadcast(shape) => Ok(layout.broadcast(shape)?),
+            RecipeOp::Reshape(shape) => Ok(layout.reshape(shape)?),
+        }
     }
 }
 
@@ -411,7 +496,7 @@ mod tests {
     use std::ops::RangeInclusive;
 
     use super::{Affine, MAX_PARAMS, ParamError, ParamSpace, SymbolicLayout, SymbolicLayoutError};
-    use crate::{DType, Layout};
+    use crate::{DType, Layout, LayoutError};
 
     #[test]
     fn checks_parameter_spaces_and_values() {
@@ -469,6 +554,47 @@ mod tests {
     }
 
     #[test]
+    fn instantiates_qwen_cache_views_through_layout_validation() {
+        let range = RangeInclusive::new(0, 4095);
+        let space = ParamSpace::new(vec![range]).unwrap();
+        let base = Layout::contiguous(DType::F16, 0, vec![8, 4096, 128], 8_388_608).unwrap();
+        let appended = SymbolicLayout::new(base.clone(), space.clone())
+            .slice(1, Affine::parameter(0, 0, 1), 1.into(), 1)
+            .unwrap();
+        let attended = SymbolicLayout::new(base, space.clone())
+            .slice(1, 0.into(), Affine::parameter(0, 1, 1), 1)
+            .unwrap();
+        let values = space.values(vec![33]).unwrap();
+
+        assert_eq!(appended.instantiate(&values).unwrap().shape(), [8, 1, 128]);
+        assert_eq!(appended.instantiate(&values).unwrap().offset(), 4224);
+        assert_eq!(attended.instantiate(&values).unwrap().shape(), [8, 34, 128]);
+    }
+
+    #[test]
+    fn parameter_spaces_are_not_interchangeable() {
+        let first = ParamSpace::new(vec![0..=3, 7..=7]).unwrap();
+        let equal_ranges = ParamSpace::new(vec![0..=3, 7..=7]).unwrap();
+        let different_ranges = ParamSpace::new(vec![1..=4, 7..=7]).unwrap();
+        let base = Layout::contiguous(DType::F32, 0, vec![4], 16).unwrap();
+        let layout = SymbolicLayout::new(base, first.clone());
+
+        assert!(
+            layout
+                .instantiate(&first.values(vec![2, 7]).unwrap())
+                .is_ok()
+        );
+        assert_eq!(
+            layout.instantiate(&equal_ranges.values(vec![2, 7]).unwrap()),
+            Err(SymbolicLayoutError::ParameterSpaceMismatch)
+        );
+        assert_eq!(
+            layout.instantiate(&different_ranges.values(vec![2, 7]).unwrap()),
+            Err(SymbolicLayoutError::ParameterSpaceMismatch)
+        );
+    }
+
+    #[test]
     fn enforces_symbolic_composition_rules() {
         let range = RangeInclusive::new(0, 3);
         let space = ParamSpace::new(vec![range]).unwrap();
@@ -494,5 +620,80 @@ mod tests {
             permuted.slice(0, 0.into(), 1.into(), 1),
             Err(SymbolicLayoutError::ConstantSliceOnSymbolicAxis { axis: 0 })
         ));
+    }
+
+    #[test]
+    fn allows_shape_changes_with_only_a_symbolic_offset() {
+        let range = RangeInclusive::new(0, 6);
+        let space = ParamSpace::new(vec![range]).unwrap();
+        let base = Layout::contiguous(DType::F32, 0, vec![7], 28).unwrap();
+        let layout = SymbolicLayout::new(base, space.clone())
+            .slice(0, Affine::parameter(0, 0, 1), 1.into(), 1)
+            .unwrap()
+            .reshape(vec![1, 1])
+            .unwrap()
+            .broadcast(vec![7, 1])
+            .unwrap();
+
+        assert_eq!(
+            layout
+                .instantiate(&space.values(vec![6]).unwrap())
+                .unwrap()
+                .byte_span(),
+            24..28
+        );
+    }
+
+    #[test]
+    fn corners_refuse_invalid_recipes_early() {
+        let range = RangeInclusive::new(0, 7);
+        let space = ParamSpace::new(vec![range]).unwrap();
+        let base = Layout::contiguous(DType::F32, 0, vec![7], 28).unwrap();
+        let result =
+            SymbolicLayout::new(base, space).slice(0, Affine::parameter(0, 0, 1), 1.into(), 1);
+
+        assert!(matches!(
+            result,
+            Err(SymbolicLayoutError::Layout(LayoutError::SliceOutOfBounds {
+                axis: 0
+            }))
+        ));
+    }
+
+    #[test]
+    fn enumerates_at_most_sixteen_corners() {
+        let space = ParamSpace::new(vec![0..=1, 2..=3, 4..=5, 6..=7]).unwrap();
+        let base = Layout::contiguous(DType::F32, 0, vec![1], 4).unwrap();
+        assert_eq!(
+            SymbolicLayout::new(base, space)
+                .corner_layouts()
+                .unwrap()
+                .len(),
+            16
+        );
+    }
+
+    #[test]
+    fn corner_contiguity_does_not_prove_interior_contiguity() {
+        let range = RangeInclusive::new(0, 3);
+        let space = ParamSpace::new(vec![range]).unwrap();
+        let base = Layout::contiguous(DType::F32, 0, vec![3, 3], 36).unwrap();
+        let layout = SymbolicLayout::new(base, space.clone())
+            .slice(1, 0.into(), Affine::parameter(0, 0, 1), 1)
+            .unwrap();
+
+        assert!(
+            layout
+                .corner_layouts()
+                .unwrap()
+                .iter()
+                .all(Layout::is_contiguous)
+        );
+        assert!(
+            !layout
+                .instantiate(&space.values(vec![2]).unwrap())
+                .unwrap()
+                .is_contiguous()
+        );
     }
 }
