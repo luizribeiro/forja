@@ -7,6 +7,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use crate::encoding::{
     Completion, InFlightTracker, MetalProgram, MetalProgramHandle, MetalSubmission, PipelineCache,
 };
@@ -169,6 +172,23 @@ impl BufferPool {
 
 const DEFAULT_POOL_CAPACITY: u64 = 1 << 30;
 
+#[cfg(test)]
+static LIVE_BACKENDS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+static LIVE_LISTENER_QUEUES: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct BackendDebugState {
+    pub(super) live_backends: usize,
+    pub(super) live_listener_queues: usize,
+    pub(super) in_flight_submissions: usize,
+    pub(super) pooled_submissions: usize,
+    pub(super) pooled_bytes: u64,
+    pub(super) residency_allocations: usize,
+    pub(super) residency_bytes: u64,
+}
+
 /// Limits runtime scalar-program compilations for one backend.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ProgramCompileBudget {
@@ -268,6 +288,11 @@ pub struct MetalBackend {
 impl Drop for MetalBackend {
     fn drop(&mut self) {
         self.in_flight.drain(self.gpu_timeout);
+        #[cfg(test)]
+        {
+            LIVE_LISTENER_QUEUES.fetch_sub(1, Ordering::Relaxed);
+            LIVE_BACKENDS.fetch_sub(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -377,7 +402,7 @@ impl MetalBackend {
             .newSharedEvent()
             .ok_or(BackendError::ExecutionFailed)?;
         let event_listener = MTLSharedEventListener::new();
-        Ok(Self {
+        let backend = Self {
             device,
             queue,
             buffers: Mutex::new(AllocationRegistry::new()),
@@ -395,7 +420,39 @@ impl MetalBackend {
             next_event_value: Mutex::new(1),
             event_listener,
             gpu_timeout,
-        })
+        };
+        #[cfg(test)]
+        {
+            LIVE_BACKENDS.fetch_add(1, Ordering::Relaxed);
+            LIVE_LISTENER_QUEUES.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(backend)
+    }
+
+    #[cfg(test)]
+    pub(super) fn debug_state(&self) -> BackendDebugState {
+        self.in_flight.drain_done();
+        let pool = self
+            .pool
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        BackendDebugState {
+            live_backends: LIVE_BACKENDS.load(Ordering::Relaxed),
+            live_listener_queues: LIVE_LISTENER_QUEUES.load(Ordering::Relaxed),
+            in_flight_submissions: self.in_flight.len(),
+            pooled_submissions: self.in_flight.pooled_len(),
+            pooled_bytes: pool.bytes,
+            residency_allocations: pool.residency.raw.allocationCount(),
+            residency_bytes: pool.residency.raw.allocatedSize(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn debug_live_counts() -> (usize, usize) {
+        (
+            LIVE_BACKENDS.load(Ordering::Relaxed),
+            LIVE_LISTENER_QUEUES.load(Ordering::Relaxed),
+        )
     }
 
     pub(super) fn validate(&self, tensor: &Tensor) -> Result<(), BackendError> {
@@ -690,6 +747,26 @@ mod tests {
     use forja_core::{Op, Submission};
 
     use super::*;
+
+    #[test]
+    fn backend_debug_state_tracks_owned_resources() {
+        assert_eq!(MetalBackend::debug_live_counts(), (0, 0));
+        let backend = MetalBackend::new().unwrap();
+        assert_eq!(
+            backend.debug_state(),
+            BackendDebugState {
+                live_backends: 1,
+                live_listener_queues: 1,
+                in_flight_submissions: 0,
+                pooled_submissions: 0,
+                pooled_bytes: 0,
+                residency_allocations: 0,
+                residency_bytes: 0,
+            }
+        );
+        drop(backend);
+        assert_eq!(MetalBackend::debug_live_counts(), (0, 0));
+    }
 
     #[test]
     fn program_compile_tokens_refill_to_the_configured_burst() {

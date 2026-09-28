@@ -1182,7 +1182,7 @@ impl InFlightTracker {
         }
     }
 
-    fn drain_done(&self) {
+    pub(super) fn drain_done(&self) {
         assert_not_in_metal_callback();
         let done = std::mem::take(
             &mut *self
@@ -1221,7 +1221,7 @@ impl InFlightTracker {
     }
 
     #[cfg(test)]
-    fn len(&self) -> usize {
+    pub(super) fn len(&self) -> usize {
         self.completions
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1229,7 +1229,7 @@ impl InFlightTracker {
     }
 
     #[cfg(test)]
-    fn pooled_len(&self) -> usize {
+    pub(super) fn pooled_len(&self) -> usize {
         self.pool
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
