@@ -7,6 +7,8 @@ use std::{
 
 static NEXT_PARAM_SPACE_ID: AtomicU64 = AtomicU64::new(0);
 
+use crate::{Layout, LayoutError};
+
 /// The largest number of parameters accepted by a symbolic layout.
 pub const MAX_PARAMS: usize = 4;
 
@@ -207,11 +209,209 @@ impl From<u32> for Affine {
     }
 }
 
+/// A reason that symbolic layout construction or instantiation failed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SymbolicLayoutError {
+    /// Parameter evaluation failed.
+    Parameter(ParamError),
+    /// Concrete layout validation failed.
+    Layout(LayoutError),
+    /// Values were checked against a different parameter space.
+    ParameterSpaceMismatch,
+    /// A slice references an axis outside the current rank.
+    AxisOutOfRange {
+        /// The invalid axis.
+        axis: u8,
+    },
+    /// A constant slice targeted an axis whose extent is symbolic.
+    ConstantSliceOnSymbolicAxis {
+        /// The axis that cannot accept the slice.
+        axis: u8,
+    },
+    /// A shape-changing operation requires concrete extents.
+    SymbolicExtentTransform,
+}
+
+impl fmt::Display for SymbolicLayoutError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Parameter(error) => error.fmt(formatter),
+            Self::Layout(error) => error.fmt(formatter),
+            Self::ParameterSpaceMismatch => {
+                formatter.write_str("values belong to a different parameter space")
+            }
+            Self::AxisOutOfRange { axis } => write!(formatter, "axis {axis} is out of range"),
+            Self::ConstantSliceOnSymbolicAxis { axis } => {
+                write!(formatter, "axis {axis} has a symbolic extent")
+            }
+            Self::SymbolicExtentTransform => {
+                formatter.write_str("operation requires concrete extents")
+            }
+        }
+    }
+}
+
+impl Error for SymbolicLayoutError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Parameter(error) => Some(error),
+            Self::Layout(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+impl From<ParamError> for SymbolicLayoutError {
+    fn from(error: ParamError) -> Self {
+        Self::Parameter(error)
+    }
+}
+
+impl From<LayoutError> for SymbolicLayoutError {
+    fn from(error: LayoutError) -> Self {
+        Self::Layout(error)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum RecipeOp {
+    Slice {
+        axis: u8,
+        start: Affine,
+        len: Affine,
+        step: u32,
+    },
+    Permute(Vec<u8>),
+    Broadcast(Vec<u32>),
+    Reshape(Vec<u32>),
+}
+
+/// A concrete base layout and a checked recipe for parameterized views.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SymbolicLayout {
+    base: Layout,
+    space: ParamSpace,
+    recipe: Vec<RecipeOp>,
+    symbolic_extents: Vec<bool>,
+}
+
+impl SymbolicLayout {
+    /// Starts an empty recipe from a validated concrete layout.
+    #[must_use]
+    pub fn new(base: Layout, space: ParamSpace) -> Self {
+        let symbolic_extents = vec![false; base.shape().len()];
+        Self {
+            base,
+            space,
+            recipe: Vec::new(),
+            symbolic_extents,
+        }
+    }
+
+    /// Returns the concrete layout from which the recipe starts.
+    #[must_use]
+    pub const fn base(&self) -> &Layout {
+        &self.base
+    }
+
+    /// Returns the parameter space accepted by this layout.
+    #[must_use]
+    pub const fn space(&self) -> &ParamSpace {
+        &self.space
+    }
+
+    /// Appends a slice along one axis.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SymbolicLayoutError`] for an invalid composition.
+    pub fn slice(
+        &self,
+        axis: u8,
+        start: Affine,
+        len: Affine,
+        step: u32,
+    ) -> Result<Self, SymbolicLayoutError> {
+        if usize::from(axis) >= self.symbolic_extents.len() {
+            return Err(SymbolicLayoutError::AxisOutOfRange { axis });
+        }
+        if start.is_constant()
+            && len.is_constant()
+            && self.symbolic_extents.get(usize::from(axis)) == Some(&true)
+        {
+            return Err(SymbolicLayoutError::ConstantSliceOnSymbolicAxis { axis });
+        }
+        let mut result = self.clone();
+        result.recipe.push(RecipeOp::Slice {
+            axis,
+            start,
+            len,
+            step,
+        });
+        result.symbolic_extents[usize::from(axis)] = !len.is_constant();
+        Ok(result)
+    }
+
+    /// Appends an axis permutation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SymbolicLayoutError`] when an axis is invalid.
+    pub fn permute(&self, axes: &[u8]) -> Result<Self, SymbolicLayoutError> {
+        let symbolic_extents = axes
+            .iter()
+            .map(|&axis| {
+                self.symbolic_extents
+                    .get(usize::from(axis))
+                    .copied()
+                    .ok_or(SymbolicLayoutError::AxisOutOfRange { axis })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut result = self.clone();
+        result.recipe.push(RecipeOp::Permute(axes.to_owned()));
+        result.symbolic_extents = symbolic_extents;
+        Ok(result)
+    }
+
+    /// Appends a broadcast when all extents are concrete.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SymbolicLayoutError`] when any extent is symbolic.
+    pub fn broadcast(&self, shape: Vec<u32>) -> Result<Self, SymbolicLayoutError> {
+        self.with_concrete_extent_op(RecipeOp::Broadcast(shape))
+    }
+
+    /// Appends a reshape when all extents are concrete.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SymbolicLayoutError`] when any extent is symbolic.
+    pub fn reshape(&self, shape: Vec<u32>) -> Result<Self, SymbolicLayoutError> {
+        self.with_concrete_extent_op(RecipeOp::Reshape(shape))
+    }
+
+    fn with_concrete_extent_op(&self, op: RecipeOp) -> Result<Self, SymbolicLayoutError> {
+        if self.symbolic_extents.contains(&true) {
+            return Err(SymbolicLayoutError::SymbolicExtentTransform);
+        }
+        let rank = match &op {
+            RecipeOp::Broadcast(shape) | RecipeOp::Reshape(shape) => shape.len(),
+            _ => self.symbolic_extents.len(),
+        };
+        let mut result = self.clone();
+        result.recipe.push(op);
+        result.symbolic_extents = vec![false; rank];
+        Ok(result)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::ops::RangeInclusive;
 
-    use super::{Affine, MAX_PARAMS, ParamError, ParamSpace};
+    use super::{Affine, MAX_PARAMS, ParamError, ParamSpace, SymbolicLayout, SymbolicLayoutError};
+    use crate::{DType, Layout};
 
     #[test]
     fn checks_parameter_spaces_and_values() {
@@ -266,5 +466,33 @@ mod tests {
             Affine::parameter(0, 1, 1).evaluate(&largest),
             Err(ParamError::ArithmeticOverflow)
         );
+    }
+
+    #[test]
+    fn enforces_symbolic_composition_rules() {
+        let range = RangeInclusive::new(0, 3);
+        let space = ParamSpace::new(vec![range]).unwrap();
+        let base = Layout::contiguous(DType::F32, 0, vec![3, 3], 36).unwrap();
+        let variable = SymbolicLayout::new(base, space)
+            .slice(1, 0.into(), Affine::parameter(0, 0, 1), 1)
+            .unwrap();
+
+        assert!(matches!(
+            variable.slice(1, 0.into(), 1.into(), 1),
+            Err(SymbolicLayoutError::ConstantSliceOnSymbolicAxis { axis: 1 })
+        ));
+        assert_eq!(
+            variable.reshape(vec![9]),
+            Err(SymbolicLayoutError::SymbolicExtentTransform)
+        );
+        assert_eq!(
+            variable.broadcast(vec![3, 3]),
+            Err(SymbolicLayoutError::SymbolicExtentTransform)
+        );
+        let permuted = variable.permute(&[1, 0]).unwrap();
+        assert!(matches!(
+            permuted.slice(0, 0.into(), 1.into(), 1),
+            Err(SymbolicLayoutError::ConstantSliceOnSymbolicAxis { axis: 0 })
+        ));
     }
 }

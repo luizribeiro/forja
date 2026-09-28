@@ -18,7 +18,9 @@ pub use ops::{
     BufferId, CommandList, Dispatch, Op, OpError, Operand, Tensor, TensorError, required_barriers,
 };
 pub use quantized::{QuantizedMatrix, QuantizedMatrixError, QuantizedMatrixPart};
-pub use symbolic::{Affine, MAX_PARAMS, ParamError, ParamSpace, ParamValues};
+pub use symbolic::{
+    Affine, MAX_PARAMS, ParamError, ParamSpace, ParamValues, SymbolicLayout, SymbolicLayoutError,
+};
 
 /// A scalar type stored in an unquantized tensor.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
