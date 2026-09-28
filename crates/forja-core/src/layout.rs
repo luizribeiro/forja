@@ -476,7 +476,48 @@ pub fn is_injective(layout: &Layout) -> bool {
 /// Conservatively reports whether two views of the same buffer may share bytes.
 #[must_use]
 pub fn byte_ranges_overlap(left: &Layout, right: &Layout) -> bool {
-    left.byte_span.start < right.byte_span.end && right.byte_span.start < left.byte_span.end
+    left.byte_span.start < right.byte_span.end
+        && right.byte_span.start < left.byte_span.end
+        && !disjoint_inner_blocks(left, right)
+}
+
+fn disjoint_inner_blocks(left: &Layout, right: &Layout) -> bool {
+    if left.dtype != right.dtype
+        || left.shape != right.shape
+        || left.strides != right.strides
+        || left.shape.is_empty()
+        || left.strides.last() != Some(&1)
+    {
+        return false;
+    }
+    let period = left.shape[..left.shape.len() - 1]
+        .iter()
+        .zip(&left.strides)
+        .filter(|&(extent, stride)| *extent > 1 && *stride > 0)
+        .map(|(_, &stride)| stride)
+        .reduce(greatest_common_divisor);
+    let Some(period) = period else {
+        return false;
+    };
+    let width = u64::from(*left.shape.last().unwrap_or(&0));
+    let left_start = left.offset % period;
+    let right_start = right.offset % period;
+    let Some(left_end) = left_start.checked_add(width).filter(|&end| end <= period) else {
+        return false;
+    };
+    let Some(right_end) = right_start.checked_add(width).filter(|&end| end <= period) else {
+        return false;
+    };
+    left_end <= right_start || right_end <= left_start
+}
+
+const fn greatest_common_divisor(mut left: u64, mut right: u64) -> u64 {
+    while right != 0 {
+        let remainder = left % right;
+        left = right;
+        right = remainder;
+    }
+    left
 }
 
 fn element_count(shape: &[u32]) -> Result<u64, LayoutError> {
@@ -695,6 +736,12 @@ mod tests {
         assert!(!byte_ranges_overlap(&left, &touching));
         assert!(byte_ranges_overlap(&left, &overlap));
         assert!(!byte_ranges_overlap(&left, &empty));
+
+        let halves =
+            Layout::new(DType::F32, 0, vec![7, 16, 64], vec![2048, 128, 1], 57_344).unwrap();
+        let other_half =
+            Layout::new(DType::F32, 64, vec![7, 16, 64], vec![2048, 128, 1], 57_344).unwrap();
+        assert!(!byte_ranges_overlap(&halves, &other_half));
     }
 
     proptest! {
