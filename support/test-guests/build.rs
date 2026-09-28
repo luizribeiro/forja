@@ -26,6 +26,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let [
         qwen3,
         qwen3_bf16,
+        qwen3_residual_norm,
+        qwen3_bf16_residual_norm,
         qwen3_qk_norm_rope,
         qwen3_silu_mul,
         qwen3_final_norm,
@@ -67,6 +69,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     emit_guest_path("TOY_MLP_COMPONENT", &release_dir.join("toy_mlp.wasm"));
     emit_guest_path("QWEN3_COMPONENT", &qwen3);
     emit_guest_path("QWEN3_BF16_COMPONENT", &qwen3_bf16);
+    emit_guest_path("QWEN3_RESIDUAL_NORM_COMPONENT", &qwen3_residual_norm);
+    emit_guest_path(
+        "QWEN3_BF16_RESIDUAL_NORM_COMPONENT",
+        &qwen3_bf16_residual_norm,
+    );
     emit_guest_path("QWEN3_QK_NORM_ROPE_COMPONENT", &qwen3_qk_norm_rope);
     emit_guest_path("QWEN3_SILU_MUL_COMPONENT", &qwen3_silu_mul);
     emit_guest_path("QWEN3_FINAL_NORM_COMPONENT", &qwen3_final_norm);
@@ -100,7 +107,7 @@ fn build_qwen_profiles(
     target_dir: &Path,
     bf16_target_dir: &Path,
     out_dir: &Path,
-) -> io::Result<[PathBuf; 7]> {
+) -> io::Result<[PathBuf; 9]> {
     let release_dir = target_dir.join("wasm32-wasip2/release");
     let bf16_release_dir = bf16_target_dir.join("wasm32-wasip2/release");
     let qwen3 = copy_component(&release_dir.join("qwen3.wasm"), out_dir, "qwen3.wasm")?;
@@ -110,6 +117,7 @@ fn build_qwen_profiles(
         "qwen3-bf16.wasm",
     )?;
     let variants = [
+        ("residual-norm-only", "qwen3-residual-norm.wasm"),
         ("qk-norm-rope-only", "qwen3-qk-norm-rope.wasm"),
         ("silu-mul-only", "qwen3-silu-mul.wasm"),
         ("final-norm-only", "qwen3-final-norm.wasm"),
@@ -122,6 +130,7 @@ fn build_qwen_profiles(
     .into_iter()
     .collect::<io::Result<Vec<_>>>()?;
     let [
+        qwen3_residual_norm,
         qwen3_qk_norm_rope,
         qwen3_silu_mul,
         qwen3_final_norm,
@@ -129,6 +138,12 @@ fn build_qwen_profiles(
     ] = variants
         .try_into()
         .map_err(|_| io::Error::other("fusion profile count changed"))?;
+    build_qwen_profile(manifest, bf16_target_dir, "bf16,residual-norm-only")?;
+    let qwen3_bf16_residual_norm = copy_component(
+        &bf16_release_dir.join("qwen3.wasm"),
+        out_dir,
+        "qwen3-bf16-residual-norm.wasm",
+    )?;
     build_qwen_profile(manifest, bf16_target_dir, "bf16,all-fusions")?;
     let qwen3_bf16_all_fusions = copy_component(
         &bf16_release_dir.join("qwen3.wasm"),
@@ -138,6 +153,8 @@ fn build_qwen_profiles(
     Ok([
         qwen3,
         qwen3_bf16,
+        qwen3_residual_norm,
+        qwen3_bf16_residual_norm,
         qwen3_qk_norm_rope,
         qwen3_silu_mul,
         qwen3_final_norm,
@@ -150,7 +167,13 @@ fn build_qwen_profile(manifest: &Path, target_dir: &Path, features: &str) -> io:
     build_guest_workspace(
         manifest,
         target_dir,
-        &["-p", "qwen3", "--features", features],
+        &[
+            "-p",
+            "qwen3",
+            "--no-default-features",
+            "--features",
+            features,
+        ],
     )
 }
 

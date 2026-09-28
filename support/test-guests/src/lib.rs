@@ -69,6 +69,18 @@ pub fn qwen3_bf16() -> &'static Path {
     Path::new(env!("QWEN3_BF16_COMPONENT"))
 }
 
+/// Returns the path to Qwen3 with only fused residual normalization.
+#[must_use]
+pub fn qwen3_residual_norm() -> &'static Path {
+    Path::new(env!("QWEN3_RESIDUAL_NORM_COMPONENT"))
+}
+
+/// Returns the path to bf16 Qwen3 with only fused residual normalization.
+#[must_use]
+pub fn qwen3_bf16_residual_norm() -> &'static Path {
+    Path::new(env!("QWEN3_BF16_RESIDUAL_NORM_COMPONENT"))
+}
+
 /// Returns the path to Qwen3 with only fused QK normalization and `RoPE`.
 #[must_use]
 pub fn qwen3_qk_norm_rope() -> &'static Path {

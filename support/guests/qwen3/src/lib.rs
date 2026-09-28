@@ -3,6 +3,15 @@
 #[cfg(any(
     all(
         not(feature = "all-fusions"),
+        feature = "residual-norm-only",
+        any(
+            feature = "qk-norm-rope-only",
+            feature = "silu-mul-only",
+            feature = "final-norm-only"
+        )
+    ),
+    all(
+        not(feature = "all-fusions"),
         feature = "qk-norm-rope-only",
         any(feature = "silu-mul-only", feature = "final-norm-only")
     ),
@@ -40,12 +49,7 @@ const INTERMEDIATE: u32 = 3_072;
 const RMS_EPSILON: f32 = 1.0e-6;
 const ROPE_THETA: f32 = 1.0e6;
 const ATTENTION_SCALE: f32 = 0.088_388_35;
-const FUSE_RESIDUAL_NORM: bool = cfg!(feature = "all-fusions")
-    || !cfg!(any(
-        feature = "qk-norm-rope-only",
-        feature = "silu-mul-only",
-        feature = "final-norm-only"
-    ));
+const FUSE_RESIDUAL_NORM: bool = cfg!(any(feature = "residual-norm-only", feature = "all-fusions"));
 const FUSE_QK_NORM_ROPE: bool = cfg!(any(feature = "qk-norm-rope-only", feature = "all-fusions"));
 const FUSE_SILU_MUL: bool = cfg!(any(feature = "silu-mul-only", feature = "all-fusions"));
 const FUSE_FINAL_NORM: bool = cfg!(any(feature = "final-norm-only", feature = "all-fusions"));

@@ -300,7 +300,7 @@ mod tests {
         let fixtures = FixtureDirectory::open(&options.fixtures)?;
         let weights = verify_model_hash(&options, &fixtures)?;
         let components = [
-            test_guests::qwen3(),
+            test_guests::qwen3_residual_norm(),
             test_guests::qwen3_qk_norm_rope(),
             test_guests::qwen3_silu_mul(),
             test_guests::qwen3_final_norm(),
