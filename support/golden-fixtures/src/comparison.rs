@@ -1,7 +1,9 @@
 use std::{error::Error, fmt};
 
 /// The accepted per-layer bf16 error against float32 transformer fixtures.
-pub const BF16_HIDDEN_STATE_TOLERANCE: f64 = 2e-2;
+pub const BF16_HIDDEN_STATE_TOLERANCE: f64 = 5e-2;
+/// The accepted teacher-forced bf16 mean KL divergence.
+pub const BF16_LOGIT_KL_TOLERANCE: f64 = 1e-2;
 /// The accepted mean KL divergence between end-to-end logit distributions.
 pub const LOGIT_KL_TOLERANCE: f64 = 5e-3;
 

@@ -6,8 +6,8 @@
 mod comparison;
 
 pub use comparison::{
-    BF16_HIDDEN_STATE_TOLERANCE, ComparisonError, LOGIT_KL_TOLERANCE, LayerComparison,
-    compare_hidden_states, mean_logit_kl_divergence, normwise_relative_error,
+    BF16_HIDDEN_STATE_TOLERANCE, BF16_LOGIT_KL_TOLERANCE, ComparisonError, LOGIT_KL_TOLERANCE,
+    LayerComparison, compare_hidden_states, mean_logit_kl_divergence, normwise_relative_error,
 };
 
 use std::{error::Error, fmt, fs, path::Path};
