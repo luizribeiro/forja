@@ -1,0 +1,5 @@
+error: kernel: indexing is not supported (no gather in step 3 IR); bind a sliced view at the call site
+ --> tests/ui/kernel-fail-indexing.rs:3:6
+  |
+3 |     x[0]
+  |      ^

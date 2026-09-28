@@ -1,5 +1,5 @@
-error: kernel: function calls are not supported in kernels
- --> tests/ui/kernel-fail-closure.rs:3:5
+error: kernel: closures are not supported in kernels; use a `#[kernel(helper)]` fn
+ --> tests/ui/kernel-fail-closure.rs:3:6
   |
 3 |     (|value| value)(x)
-  |     ^^^^^^^^^^^^^^^
+  |      ^

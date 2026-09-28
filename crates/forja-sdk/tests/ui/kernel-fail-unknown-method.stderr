@@ -1,0 +1,5 @@
+error: kernel: unknown method `tan` on `f32`; supported: abs, exp, ln, sqrt, rsqrt, recip, sin, cos, tanh, sigmoid, floor, maximum, minimum, powf, powi, clamp, ceil, log2, log10, exp2, row_sum, row_max, row_min, row_mean
+ --> tests/ui/kernel-fail-unknown-method.rs:3:7
+  |
+3 |     x.tan()
+  |       ^^^

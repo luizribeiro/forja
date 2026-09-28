@@ -1,0 +1,5 @@
+error: kernel: early `return` is not supported; the last expression is the kernel's output
+ --> tests/ui/kernel-fail-return.rs:3:5
+  |
+3 |     return x;
+  |     ^^^^^^

@@ -30,13 +30,14 @@ pub(super) fn lower(
     context: &Ident,
     kind: KernelKind,
 ) -> syn::Result<Lowered> {
-    let tensors = parameters
+    let mut tensors = parameters
         .iter()
         .filter_map(|(name, parameter)| match parameter {
-            Parameter::Tensor { span, .. } => Some((name.clone(), *span)),
+            Parameter::Tensor { slot, span, .. } => Some((*slot, name.clone(), *span)),
             Parameter::Scalar(_) => None,
         })
         .collect::<Vec<_>>();
+    tensors.sort_by_key(|(slot, _, _)| *slot);
     let mut lowerer = Lowerer {
         bindings: parameters
             .into_iter()
@@ -87,9 +88,9 @@ pub(super) fn lower(
             ),
         ));
     }
-    if let Some((name, span)) = tensors
+    if let Some((_, name, span)) = tensors
         .iter()
-        .find(|(name, _)| !lowerer.used_tensors.contains(name))
+        .find(|(_, name, _)| !lowerer.used_tensors.contains(name))
     {
         return Err(kernel_error(
             *span,
@@ -177,6 +178,9 @@ impl Lowerer {
                     result = Some(self.lower_result(expression)?);
                 }
                 Stmt::Expr(expression, Some(_)) => {
+                    if matches!(expression, Expr::Assign(_) | Expr::Return(_)) {
+                        let _ = self.lower_expr(expression)?;
+                    }
                     return Err(kernel_error(
                         expression,
                         "only `let` statements and a final expression are supported in kernels",
@@ -747,6 +751,12 @@ impl Lowerer {
     }
 
     fn lower_call(&mut self, call: &syn::ExprCall) -> syn::Result<Value> {
+        if let Expr::Closure(closure) = unparenthesized(&call.func) {
+            return Err(kernel_error(
+                closure,
+                "closures are not supported in kernels; use a `#[kernel(helper)]` fn",
+            ));
+        }
         let Expr::Path(path) = &*call.func else {
             return Err(kernel_error(
                 call,
@@ -786,7 +796,9 @@ impl Lowerer {
             ));
         }
         let method = match (value.ty, target) {
-            (ValueType::F32 | ValueType::Bool, ValueType::U32) => format_ident!("cast_u32"),
+            (ValueType::F32 | ValueType::Bool, ValueType::U32) => {
+                format_ident!("cast_u32")
+            }
             (ValueType::U32, ValueType::F32) => format_ident!("cast_f32"),
             _ => {
                 return Err(kernel_error(
@@ -1045,6 +1057,14 @@ fn integer_literal(expression: &Expr) -> Option<&syn::LitInt> {
     }
 }
 
+fn unparenthesized(expression: &Expr) -> &Expr {
+    match expression {
+        Expr::Paren(paren) => unparenthesized(&paren.expr),
+        Expr::Group(group) => unparenthesized(&group.expr),
+        expression => expression,
+    }
+}
+
 fn require_type(value: &Value, expected: ValueType) -> syn::Result<()> {
     if value.ty == expected {
         Ok(())
@@ -1133,38 +1153,8 @@ fn axis_literal(expression: &Expr) -> syn::Result<i32> {
 }
 
 fn powi_exponent(expression: &Expr) -> syn::Result<i32> {
-    let (negative, literal) = match expression {
-        Expr::Lit(literal) => (false, literal),
-        Expr::Unary(unary) if matches!(unary.op, UnOp::Neg(_)) => {
-            let Expr::Lit(literal) = &*unary.expr else {
-                return Err(kernel_error(
-                    expression,
-                    "`powi` requires an integer literal",
-                ));
-            };
-            (true, literal)
-        }
-        _ => {
-            return Err(kernel_error(
-                expression,
-                "`powi` requires an integer literal",
-            ));
-        }
-    };
-    let Lit::Int(literal) = &literal.lit else {
-        return Err(kernel_error(
-            expression,
-            "`powi` requires an integer literal",
-        ));
-    };
-    let value = literal.base10_parse::<i32>()?;
-    if negative {
-        value
-            .checked_neg()
-            .ok_or_else(|| kernel_error(expression, "`powi` exponent is out of range"))
-    } else {
-        Ok(value)
-    }
+    axis_literal(expression)
+        .map_err(|_| kernel_error(expression, "`powi` requires an integer literal"))
 }
 
 #[allow(

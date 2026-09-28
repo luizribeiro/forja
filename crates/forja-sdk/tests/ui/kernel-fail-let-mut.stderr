@@ -1,0 +1,5 @@
+error: kernel: `let mut` and assignment are not supported; shadow with a new `let`
+ --> tests/ui/kernel-fail-let-mut.rs:3:9
+  |
+3 |     let mut value = x;
+  |         ^^^
