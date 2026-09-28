@@ -184,6 +184,7 @@ world rmsnorm-smoke {
 world program-smoke {
   import compute;
   export run: async func() -> result<list<f32>, string>;
+  export exercise-explicit-kernel: async func() -> result<_, string>;
   export churn-program-cache: async func() -> result<_, string>;
   export exhaust-shared-quota: async func() -> result<_, string>;
 }

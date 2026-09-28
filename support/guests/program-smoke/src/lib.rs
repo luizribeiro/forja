@@ -6,8 +6,8 @@ wit_bindgen::generate!({
 });
 
 use forja_sdk::{
-    Tensor,
-    program::{Program, ReduceOp},
+    DType, Tensor,
+    program::{Kernel as SdkKernel, Program, ReduceOp},
 };
 use l9o::gpu::compute::{Binop, Dtype, Inst, Kernel, KernelSignature, ProgramKind, ProgramSource};
 
@@ -22,6 +22,10 @@ impl Guest for Component {
         run_distinct_programs(20).map_err(|error| error.to_string())
     }
 
+    async fn exercise_explicit_kernel() -> Result<(), String> {
+        exercise_explicit_kernel().map_err(|error| error.to_string())
+    }
+
     async fn exhaust_shared_quota() -> Result<(), String> {
         let kernels = (0_u16..4)
             .map(explicit_kernel)
@@ -32,6 +36,48 @@ impl Guest for Component {
         }
         result
     }
+}
+
+fn exercise_explicit_kernel() -> forja_sdk::Result<()> {
+    let program = Program::map();
+    program.output(0, program.input(0) * 2.0);
+    let kernel = SdkKernel::new(&program, 2, &[DType::F32], &[DType::F32])?;
+    let wrong_rank = Tensor::from_slice(&[1.0_f32; 7], &[7])?;
+    let mismatch = wrong_rank
+        .run_kernel(&kernel, &[])
+        .err()
+        .ok_or_else(|| forja_sdk::Error::loading("kernel accepted the wrong rank"))?;
+    if mismatch.to_string() != "kernel signature expects rank 2, but tensor has rank 1" {
+        return Err(forja_sdk::Error::loading(format!(
+            "kernel returned an unclear signature error: {mismatch}"
+        )));
+    }
+    for shape in [[1_u32, 7], [7, 33], [33, 1]] {
+        let count = usize::try_from(shape[0] * shape[1])
+            .map_err(|_| forja_sdk::Error::loading("test tensor is too large"))?;
+        let input = Tensor::from_slice(&vec![3.0_f32; count], &shape)?;
+        let output = input
+            .run_kernel(&kernel, &[])?
+            .pop()
+            .ok_or_else(|| forja_sdk::Error::loading("kernel produced no output"))?;
+        if output.to_vec()? != vec![6.0; count] {
+            return Err(forja_sdk::Error::loading(
+                "reused kernel produced wrong values",
+            ));
+        }
+    }
+    let input = Tensor::from_slice(&[4.0_f32; 7], &[1, 7])?;
+    let pending = input
+        .run_kernel(&kernel, &[])?
+        .pop()
+        .ok_or_else(|| forja_sdk::Error::loading("kernel produced no pending output"))?;
+    drop(kernel);
+    if pending.to_vec()? != [8.0; 7] {
+        return Err(forja_sdk::Error::loading(
+            "dropped kernel did not complete pending work",
+        ));
+    }
+    Ok(())
 }
 
 fn run_distinct_programs(count: u16) -> forja_sdk::Result<()> {

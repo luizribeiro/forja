@@ -67,6 +67,23 @@ async fn cpu_guest_fused_program_matches_trusted_operations() -> wasmtime::Resul
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn guest_sdk_reuses_and_releases_explicit_kernels() -> wasmtime::Result<()> {
+    let (mut store, instance) = instantiate(
+        forja_cpu::CpuBackend::new(),
+        test_guests::program_smoke(),
+        COMMAND_LIMITS,
+    )
+    .await?;
+    let exercise = instance
+        .get_typed_func::<(), (Result<(), String>,)>(&mut store, "exercise-explicit-kernel")?;
+    Host::reset_guest_deadline(&mut store);
+    let (result,) = store
+        .run_concurrent(async move |accessor| exercise.call_concurrent(accessor, ()).await)
+        .await??;
+    result.map_err(wasmtime::Error::msg)
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn compatibility_cache_releases_evicted_kernel_leases() -> wasmtime::Result<()> {
     let (mut store, instance) = instantiate(
         forja_cpu::CpuBackend::new(),
