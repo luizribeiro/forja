@@ -30,7 +30,13 @@ impl Guest for Component {
                 std::hint::spin_loop();
             }
         }
-        let logits = if mode == 100 {
+        let logits = if mode < 4 {
+            let mut values = vec![1.0; 4];
+            let next = usize::try_from((mode + 1) % 4)
+                .map_err(|_| Error::Layout("token does not fit usize".to_owned()))?;
+            values[next] = 4.0;
+            f32_tensor(&[4], &values)?
+        } else if mode == 100 {
             f32_tensor(&[3], &[1.0, 2.0, 3.0])?
         } else if mode == 103 {
             let tensor = Tensor::alloc(Dtype::U32, &[4])?;
