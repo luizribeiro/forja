@@ -596,6 +596,7 @@ pub(crate) mod native {
                 (Commands::Metal(commands), Tensor::Metal(output)) => commands
                     .dispatch(core_op(operation), &metal_inputs(inputs)?, output)
                     .map_err(error),
+                #[cfg(all(feature = "native-metal", target_os = "macos"))]
                 _ => Err(Error::new("native tensors belong to different backends")),
             }
         }
