@@ -6,7 +6,7 @@
     )
 )]
 
-use crate::program::{BinaryOp, ProgramKind, ReduceOp, UnaryOp};
+use crate::program::{BinaryOp, ProgramKind, ReduceOp, UnaryOp, ValueType};
 use crate::{Error, Result};
 
 /// A scalar type accepted by kernel signatures.
@@ -70,7 +70,7 @@ pub(crate) enum ProgramInst {
     Unary(UnaryOp, u32),
     Binary(BinaryOp, u32, u32),
     Select(u32, u32, u32),
-    CastF32(u32),
+    Cast(ValueType, u32),
     Reduce(ReduceOp, u32),
 }
 
@@ -115,7 +115,7 @@ pub(crate) mod guest {
     });
 
     use super::{Backend, DType, Error, Op, Program, ProgramInst, Result, View};
-    use crate::program::{BinaryOp, ProgramKind, ReduceOp, UnaryOp};
+    use crate::program::{BinaryOp, ProgramKind, ReduceOp, UnaryOp, ValueType};
     use compute::{
         Binop as WitBinOp, Redop as WitRedOp, Unop as WitUnOp, ValueType as WitValueType,
     };
@@ -304,10 +304,7 @@ pub(crate) mod guest {
             ProgramInst::Select(condition, accepted, rejected) => {
                 compute::Inst::Select((condition, accepted, rejected))
             }
-            ProgramInst::CastF32(value) => compute::Inst::Cast((
-                forja_program_conversions::program_f32_value_type!(WitValueType),
-                value,
-            )),
+            ProgramInst::Cast(to, value) => compute::Inst::Cast((wit_value_type(to), value)),
             ProgramInst::Reduce(op, value) => compute::Inst::Reduce((wit_redop(op), value)),
         }
     }
@@ -316,6 +313,14 @@ pub(crate) mod guest {
         fn wit_unop(UnaryOp => WitUnOp);
         fn wit_binop(BinaryOp => WitBinOp);
         fn wit_redop(ReduceOp => WitRedOp);
+    }
+
+    const fn wit_value_type(value_type: ValueType) -> WitValueType {
+        match value_type {
+            ValueType::F32 => WitValueType::F32,
+            ValueType::U32 => WitValueType::U32,
+            ValueType::Bool => WitValueType::Bool,
+        }
     }
 
     fn guest_error(error: &compute::Error) -> Error {
@@ -424,7 +429,7 @@ pub(crate) mod native {
 
     use super::{Backend, DType, Error, Op, Program, ProgramInst, Result, View};
     use crate::NativeDevice;
-    use crate::program::{BinaryOp, ProgramKind, ReduceOp, UnaryOp};
+    use crate::program::{BinaryOp, ProgramKind, ReduceOp, UnaryOp, ValueType};
 
     type CpuBackend = forja_cpu::CpuBackend;
     type CpuTensor = NativeTensor<CpuBackend>;
@@ -748,10 +753,7 @@ pub(crate) mod native {
             ProgramInst::Select(condition, accepted, rejected) => {
                 Inst::Select(condition, accepted, rejected)
             }
-            ProgramInst::CastF32(value) => Inst::Cast(
-                forja_program_conversions::program_f32_value_type!(CoreValueType),
-                value,
-            ),
+            ProgramInst::Cast(to, value) => Inst::Cast(core_value_type(to), value),
             ProgramInst::Reduce(op, value) => Inst::Reduce(core_redop(op), value),
         }
     }
@@ -760,6 +762,14 @@ pub(crate) mod native {
         fn core_unop(UnaryOp => UnOp);
         fn core_binop(BinaryOp => BinOp);
         fn core_redop(ReduceOp => RedOp);
+    }
+
+    const fn core_value_type(value_type: ValueType) -> CoreValueType {
+        match value_type {
+            ValueType::F32 => CoreValueType::F32,
+            ValueType::U32 => CoreValueType::U32,
+            ValueType::Bool => CoreValueType::Bool,
+        }
     }
 
     #[cfg(all(feature = "native-metal", target_os = "macos"))]

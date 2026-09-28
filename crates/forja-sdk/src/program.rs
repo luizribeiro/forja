@@ -63,6 +63,13 @@ pub(crate) enum BinaryOp {
 }
 
 #[derive(Clone, Copy, Debug)]
+pub(crate) enum ValueType {
+    F32,
+    U32,
+    Bool,
+}
+
+#[derive(Clone, Copy, Debug)]
 pub(crate) enum Instruction {
     Input(u32),
     Constant(f32),
@@ -71,6 +78,7 @@ pub(crate) enum Instruction {
     Unary(UnaryOp, u32),
     Binary(BinaryOp, u32, u32),
     Select(u32, u32, u32),
+    Cast(ValueType, u32),
     Reduce(ReduceOp, u32),
 }
 
@@ -149,47 +157,60 @@ impl Program {
 
     /// Loads a bound input slot.
     #[must_use]
-    pub fn input(&self, slot: u32) -> Value<'_> {
-        self.push_value(Instruction::Input(slot))
+    pub fn input(&self, slot: u32) -> F32<'_> {
+        self.push_f32(Instruction::Input(slot))
+    }
+
+    /// Loads a bound unsigned integer input slot.
+    #[must_use]
+    pub fn input_u32(&self, slot: u32) -> U32<'_> {
+        self.push_u32(Instruction::Input(slot))
     }
 
     /// Creates an f32 constant.
     #[must_use]
-    pub fn constant(&self, value: f32) -> Value<'_> {
-        self.push_value(Instruction::Constant(value))
+    pub fn constant(&self, value: f32) -> F32<'_> {
+        self.push_f32(Instruction::Constant(value))
     }
 
-    /// Reads an axis coordinate as f32. Negative axes count from the end.
+    /// Creates a Boolean constant.
     #[must_use]
-    pub fn index(&self, axis: i32) -> Value<'_> {
-        self.push_value(Instruction::Index(axis))
+    pub fn boolean(&self, value: bool) -> Bool<'_> {
+        let value = self.push_f32(Instruction::Constant(f32::from(u8::from(value))));
+        value.cast_bool()
     }
 
-    /// Reads an axis extent as f32. Negative axes count from the end.
+    /// Reads an axis coordinate as u32. Negative axes count from the end.
     #[must_use]
-    pub fn extent(&self, axis: i32) -> Value<'_> {
-        self.push_value(Instruction::Extent(axis))
+    pub fn index(&self, axis: i32) -> U32<'_> {
+        self.push_u32(Instruction::Index(axis))
+    }
+
+    /// Reads an axis extent as u32. Negative axes count from the end.
+    #[must_use]
+    pub fn extent(&self, axis: i32) -> U32<'_> {
+        self.push_u32(Instruction::Extent(axis))
     }
 
     /// Reduces a value across the last axis and broadcasts the result.
     #[must_use]
-    pub fn reduce<'a>(&'a self, op: ReduceOp, value: Value<'a>) -> Value<'a> {
+    pub fn reduce<'a>(&'a self, op: ReduceOp, value: F32<'a>) -> F32<'a> {
         self.check_value(value.state);
-        self.push_value(Instruction::Reduce(op, value.instruction))
+        self.push_f32(Instruction::Reduce(op, value.instruction))
     }
 
     /// Selects between two values using a Boolean condition.
     #[must_use]
     pub fn select<'a>(
         &'a self,
-        condition: BoolValue<'a>,
-        accepted: Value<'a>,
-        rejected: Value<'a>,
-    ) -> Value<'a> {
+        condition: Bool<'a>,
+        accepted: F32<'a>,
+        rejected: F32<'a>,
+    ) -> F32<'a> {
         self.check_value(condition.state);
         self.check_value(accepted.state);
         self.check_value(rejected.state);
-        self.push_value(Instruction::Select(
+        self.push_f32(Instruction::Select(
             condition.instruction,
             accepted.instruction,
             rejected.instruction,
@@ -197,7 +218,7 @@ impl Program {
     }
 
     /// Assigns a value to an output slot.
-    pub fn output(&self, slot: u32, value: Value<'_>) {
+    pub fn output(&self, slot: u32, value: F32<'_>) {
         self.check_value(value.state);
         self.state
             .borrow_mut()
@@ -222,18 +243,10 @@ impl Program {
                 Instruction::Input(slot) => crate::sys::ProgramInst::Input(slot),
                 Instruction::Constant(value) => crate::sys::ProgramInst::Constant(value),
                 Instruction::Index(axis) => {
-                    let index = push_lowered(
-                        &mut lowered,
-                        crate::sys::ProgramInst::Index(resolve_axis(axis, rank)?),
-                    )?;
-                    crate::sys::ProgramInst::CastF32(index)
+                    crate::sys::ProgramInst::Index(resolve_axis(axis, rank)?)
                 }
                 Instruction::Extent(axis) => {
-                    let extent = push_lowered(
-                        &mut lowered,
-                        crate::sys::ProgramInst::Extent(resolve_axis(axis, rank)?),
-                    )?;
-                    crate::sys::ProgramInst::CastF32(extent)
+                    crate::sys::ProgramInst::Extent(resolve_axis(axis, rank)?)
                 }
                 Instruction::Unary(op, value) => {
                     crate::sys::ProgramInst::Unary(op, lowered_value(&values, value)?)
@@ -249,6 +262,9 @@ impl Program {
                         lowered_value(&values, accepted)?,
                         lowered_value(&values, rejected)?,
                     )
+                }
+                Instruction::Cast(to, value) => {
+                    crate::sys::ProgramInst::Cast(to, lowered_value(&values, value)?)
                 }
                 Instruction::Reduce(op, value) => {
                     crate::sys::ProgramInst::Reduce(op, lowered_value(&values, value)?)
@@ -267,9 +283,18 @@ impl Program {
         })
     }
 
-    fn push_value(&self, instruction: Instruction) -> Value<'_> {
+    fn push_f32(&self, instruction: Instruction) -> F32<'_> {
         let instruction = push(&self.state, instruction);
-        Value {
+        F32 {
+            state: &self.state,
+            instruction,
+            marker: PhantomData,
+        }
+    }
+
+    fn push_u32(&self, instruction: Instruction) -> U32<'_> {
+        let instruction = push(&self.state, instruction);
+        U32 {
             state: &self.state,
             instruction,
             marker: PhantomData,
@@ -317,13 +342,16 @@ fn lowered_value(values: &[u32], value: u32) -> Result<u32> {
 
 /// An f32 value produced by a program instruction.
 #[derive(Clone, Copy)]
-pub struct Value<'a> {
+pub struct F32<'a> {
     state: &'a RefCell<State>,
     instruction: u32,
     marker: PhantomData<&'a Program>,
 }
 
-impl<'a> Value<'a> {
+#[doc(hidden)]
+pub type Value<'a> = F32<'a>;
+
+impl<'a> F32<'a> {
     /// Computes the absolute value.
     #[must_use]
     pub fn abs(self) -> Self {
@@ -410,37 +438,37 @@ impl<'a> Value<'a> {
 
     /// Compares two values with `<`.
     #[must_use]
-    pub fn lt(self, other: Self) -> BoolValue<'a> {
+    pub fn lt(self, other: Self) -> Bool<'a> {
         self.compare(BinaryOp::Lt, other)
     }
 
     /// Compares two values with `<=`.
     #[must_use]
-    pub fn le(self, other: Self) -> BoolValue<'a> {
+    pub fn le(self, other: Self) -> Bool<'a> {
         self.compare(BinaryOp::Le, other)
     }
 
     /// Compares two values for equality.
     #[must_use]
-    pub fn equal(self, other: Self) -> BoolValue<'a> {
+    pub fn equal(self, other: Self) -> Bool<'a> {
         self.compare(BinaryOp::Eq, other)
     }
 
     /// Compares two values for inequality.
     #[must_use]
-    pub fn not_equal(self, other: Self) -> BoolValue<'a> {
+    pub fn not_equal(self, other: Self) -> Bool<'a> {
         self.compare(BinaryOp::Ne, other)
     }
 
     /// Compares two values with `>=`.
     #[must_use]
-    pub fn ge(self, other: Self) -> BoolValue<'a> {
+    pub fn ge(self, other: Self) -> Bool<'a> {
         self.compare(BinaryOp::Ge, other)
     }
 
     /// Compares two values with `>`.
     #[must_use]
-    pub fn gt(self, other: Self) -> BoolValue<'a> {
+    pub fn gt(self, other: Self) -> Bool<'a> {
         self.compare(BinaryOp::Gt, other)
     }
 
@@ -462,15 +490,30 @@ impl<'a> Value<'a> {
         }
     }
 
-    fn compare(self, op: BinaryOp, other: Self) -> BoolValue<'a> {
-        check_same_state(self.state, other.state);
-        let instruction = push(
-            self.state,
-            Instruction::Binary(op, self.instruction, other.instruction),
-        );
-        BoolValue {
+    fn compare(self, op: BinaryOp, other: Self) -> Bool<'a> {
+        compare_values(op, self, other)
+    }
+
+    /// Casts this value to u32 using the IR's saturating conversion.
+    #[must_use]
+    pub fn cast_u32(self) -> U32<'a> {
+        U32 {
             state: self.state,
-            instruction,
+            instruction: push(
+                self.state,
+                Instruction::Cast(ValueType::U32, self.instruction),
+            ),
+            marker: PhantomData,
+        }
+    }
+
+    fn cast_bool(self) -> Bool<'a> {
+        Bool {
+            state: self.state,
+            instruction: push(
+                self.state,
+                Instruction::Cast(ValueType::Bool, self.instruction),
+            ),
             marker: PhantomData,
         }
     }
@@ -487,19 +530,19 @@ impl<'a> Value<'a> {
 
 /// A Boolean value produced by a comparison instruction.
 #[derive(Clone, Copy)]
-pub struct BoolValue<'a> {
+pub struct Bool<'a> {
     state: &'a RefCell<State>,
     instruction: u32,
     marker: PhantomData<&'a Program>,
 }
 
-impl<'a> BoolValue<'a> {
+impl<'a> Bool<'a> {
     /// Selects `accepted` when true and `rejected` otherwise.
     #[must_use]
-    pub fn select(self, accepted: Value<'a>, rejected: Value<'a>) -> Value<'a> {
+    pub fn select(self, accepted: F32<'a>, rejected: F32<'a>) -> F32<'a> {
         check_same_state(self.state, accepted.state);
         check_same_state(self.state, rejected.state);
-        Value {
+        F32 {
             state: self.state,
             instruction: push(
                 self.state,
@@ -508,6 +551,176 @@ impl<'a> BoolValue<'a> {
             marker: PhantomData,
         }
     }
+
+    /// Casts this condition to zero or one as u32.
+    #[must_use]
+    pub fn cast_u32(self) -> U32<'a> {
+        U32 {
+            state: self.state,
+            instruction: push(
+                self.state,
+                Instruction::Cast(ValueType::U32, self.instruction),
+            ),
+            marker: PhantomData,
+        }
+    }
+}
+
+/// An unsigned integer value produced by a program instruction.
+///
+/// Integer arithmetic is available only through the explicit wrapping methods;
+/// using Rust's `+`, `-`, or `*` operators is a type error.
+///
+/// ```compile_fail
+/// use forja_sdk::program::Program;
+/// let program = Program::map();
+/// let value = program.index(0);
+/// let _ = value + value;
+/// ```
+#[derive(Clone, Copy)]
+pub struct U32<'a> {
+    state: &'a RefCell<State>,
+    instruction: u32,
+    marker: PhantomData<&'a Program>,
+}
+
+impl<'a> U32<'a> {
+    /// Adds with wrapping at the u32 boundary.
+    #[must_use]
+    pub fn wrapping_add(self, other: Self) -> Self {
+        self.binary(BinaryOp::Add, other)
+    }
+
+    /// Subtracts with wrapping at the u32 boundary.
+    #[must_use]
+    pub fn wrapping_sub(self, other: Self) -> Self {
+        self.binary(BinaryOp::Sub, other)
+    }
+
+    /// Multiplies with wrapping at the u32 boundary.
+    #[must_use]
+    pub fn wrapping_mul(self, other: Self) -> Self {
+        self.binary(BinaryOp::Mul, other)
+    }
+
+    /// Computes the minimum.
+    #[must_use]
+    pub fn min(self, other: Self) -> Self {
+        self.binary(BinaryOp::Min, other)
+    }
+
+    /// Computes the maximum.
+    #[must_use]
+    pub fn max(self, other: Self) -> Self {
+        self.binary(BinaryOp::Max, other)
+    }
+
+    /// Compares two values with `<`.
+    #[must_use]
+    pub fn lt(self, other: Self) -> Bool<'a> {
+        self.compare(BinaryOp::Lt, other)
+    }
+
+    /// Compares two values with `<=`.
+    #[must_use]
+    pub fn le(self, other: Self) -> Bool<'a> {
+        self.compare(BinaryOp::Le, other)
+    }
+
+    /// Compares two values for equality.
+    #[must_use]
+    pub fn equal(self, other: Self) -> Bool<'a> {
+        self.compare(BinaryOp::Eq, other)
+    }
+
+    /// Compares two values for inequality.
+    #[must_use]
+    pub fn not_equal(self, other: Self) -> Bool<'a> {
+        self.compare(BinaryOp::Ne, other)
+    }
+
+    /// Compares two values with `>=`.
+    #[must_use]
+    pub fn ge(self, other: Self) -> Bool<'a> {
+        self.compare(BinaryOp::Ge, other)
+    }
+
+    /// Compares two values with `>`.
+    #[must_use]
+    pub fn gt(self, other: Self) -> Bool<'a> {
+        self.compare(BinaryOp::Gt, other)
+    }
+
+    /// Casts this value to f32.
+    #[must_use]
+    pub fn cast_f32(self) -> F32<'a> {
+        F32 {
+            state: self.state,
+            instruction: push(
+                self.state,
+                Instruction::Cast(ValueType::F32, self.instruction),
+            ),
+            marker: PhantomData,
+        }
+    }
+
+    fn binary(self, op: BinaryOp, other: Self) -> Self {
+        check_same_state(self.state, other.state);
+        Self {
+            instruction: push(
+                self.state,
+                Instruction::Binary(op, self.instruction, other.instruction),
+            ),
+            ..self
+        }
+    }
+
+    fn compare(self, op: BinaryOp, other: Self) -> Bool<'a> {
+        compare_values(op, self, other)
+    }
+}
+
+trait TypedValue<'a>: Copy {
+    fn state(self) -> &'a RefCell<State>;
+    fn instruction(self) -> u32;
+    fn from_instruction(state: &'a RefCell<State>, instruction: u32) -> Self;
+}
+
+macro_rules! typed_value {
+    ($value:ident) => {
+        impl<'a> TypedValue<'a> for $value<'a> {
+            fn state(self) -> &'a RefCell<State> {
+                self.state
+            }
+
+            fn instruction(self) -> u32 {
+                self.instruction
+            }
+
+            fn from_instruction(state: &'a RefCell<State>, instruction: u32) -> Self {
+                Self {
+                    state,
+                    instruction,
+                    marker: PhantomData,
+                }
+            }
+        }
+    };
+}
+
+typed_value!(F32);
+typed_value!(U32);
+typed_value!(Bool);
+
+fn compare_values<'a, T: TypedValue<'a>>(op: BinaryOp, left: T, right: T) -> Bool<'a> {
+    check_same_state(left.state(), right.state());
+    Bool::from_instruction(
+        left.state(),
+        push(
+            left.state(),
+            Instruction::Binary(op, left.instruction(), right.instruction()),
+        ),
+    )
 }
 
 fn push(state: &RefCell<State>, instruction: Instruction) -> u32 {
@@ -532,7 +745,7 @@ fn record_error(state: &RefCell<State>, message: &str) {
 
 macro_rules! value_operator {
     ($trait:ident, $method:ident, $op:ident) => {
-        impl<'a> $trait for Value<'a> {
+        impl<'a> $trait for F32<'a> {
             type Output = Self;
 
             fn $method(self, other: Self) -> Self::Output {
@@ -540,7 +753,7 @@ macro_rules! value_operator {
             }
         }
 
-        impl<'a> $trait<f32> for Value<'a> {
+        impl<'a> $trait<f32> for F32<'a> {
             type Output = Self;
 
             fn $method(self, other: f32) -> Self::Output {
@@ -555,7 +768,7 @@ value_operator!(Sub, sub, Sub);
 value_operator!(Mul, mul, Mul);
 value_operator!(Div, div, Div);
 
-impl Neg for Value<'_> {
+impl Neg for F32<'_> {
     type Output = Self;
 
     fn neg(self) -> Self::Output {
@@ -563,9 +776,26 @@ impl Neg for Value<'_> {
     }
 }
 
+impl<'a> Mul<f32> for U32<'a> {
+    type Output = F32<'a>;
+
+    fn mul(self, other: f32) -> Self::Output {
+        self.cast_f32() * other
+    }
+}
+
+impl<'a> Div<U32<'a>> for F32<'a> {
+    type Output = Self;
+
+    fn div(self, other: U32<'a>) -> Self::Output {
+        self / other.cast_f32()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sys;
 
     #[test]
     fn builds_the_documented_softmax_shape() {
@@ -590,6 +820,49 @@ mod tests {
         assert!(first.parts().is_err());
     }
 
+    #[test]
+    fn rejects_cross_program_unsigned_arithmetic() {
+        let first = Program::new(ProgramKind::Map);
+        let second = Program::new(ProgramKind::Map);
+        let _ = first.index(0).wrapping_add(second.index(0));
+
+        assert!(first.parts().is_err());
+    }
+
+    #[test]
+    fn lowers_typed_values_and_explicit_casts() {
+        let program = Program::map();
+        let input = program.input_u32(0);
+        let lane = program.index(-1);
+        let wrapped = input
+            .wrapping_add(lane)
+            .wrapping_sub(lane)
+            .wrapping_mul(program.constant(1.0).cast_u32());
+        let condition = wrapped.lt(program.extent(-1));
+        program.output(
+            0,
+            condition.select(wrapped.cast_f32(), condition.cast_u32().cast_f32()),
+        );
+
+        let definition = program.definition(1).unwrap();
+        assert!(matches!(
+            definition.instructions[1],
+            sys::ProgramInst::Index(0)
+        ));
+        assert!(matches!(
+            definition.instructions[2],
+            sys::ProgramInst::Binary(BinaryOp::Add, 0, 1)
+        ));
+        assert!(matches!(
+            definition.instructions[5],
+            sys::ProgramInst::Cast(ValueType::U32, 4)
+        ));
+        assert!(matches!(
+            definition.instructions[12],
+            sys::ProgramInst::Select(8, 9, 11)
+        ));
+    }
+
     #[cfg(feature = "native")]
     #[test]
     fn prepares_an_explicit_kernel_signature() {
@@ -597,5 +870,14 @@ mod tests {
         program.output(0, program.input(0));
 
         Kernel::new(&program, 2, &[DType::F32], &[DType::F32]).unwrap();
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn prepares_an_unsigned_input_signature() {
+        let program = Program::map();
+        program.output(0, program.input_u32(0).cast_f32());
+
+        Kernel::new(&program, 1, &[DType::U32], &[DType::F32]).unwrap();
     }
 }

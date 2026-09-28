@@ -147,7 +147,17 @@ fn encode_instruction(bytes: &mut Vec<u8>, instruction: sys::ProgramInst) {
             bytes.extend(accepted.to_le_bytes());
             bytes.extend(rejected.to_le_bytes());
         }
-        ProgramInst::CastF32(value) => encode_one(bytes, 7, value),
+        ProgramInst::Cast(to, value) => {
+            bytes.extend([
+                7,
+                match to {
+                    crate::program::ValueType::F32 => 0,
+                    crate::program::ValueType::U32 => 1,
+                    crate::program::ValueType::Bool => 2,
+                },
+            ]);
+            bytes.extend(value.to_le_bytes());
+        }
         ProgramInst::Reduce(op, value) => {
             bytes.extend([8, op as u8]);
             bytes.extend(value.to_le_bytes());
