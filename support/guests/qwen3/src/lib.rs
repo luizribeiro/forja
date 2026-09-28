@@ -6,6 +6,7 @@ use forja_sdk::{
         Embedding, EmbeddingConfig, Linear, LinearConfig, RmsNorm, RmsNormConfig, WeightElement,
         ops::sdpa,
     },
+    program::{Program, ReduceOp},
 };
 
 /// Vocabulary size reported by Qwen3-0.6B.
@@ -24,6 +25,7 @@ const INTERMEDIATE: u32 = 3_072;
 const RMS_EPSILON: f32 = 1.0e-6;
 const ROPE_THETA: f32 = 1.0e6;
 const ATTENTION_SCALE: f32 = 0.088_388_35;
+const FUSE_RESIDUAL_NORM: bool = true;
 
 #[derive(Clone, Copy)]
 struct Config;
@@ -169,16 +171,16 @@ impl<T: Activation> DecoderLayer<T> {
     fn forward(
         &self,
         input: &Tensor<T>,
+        normalized_input: &Tensor<T>,
         positions: &Tensor<u32>,
-        start_pos: u32,
-        end_pos: u32,
+        positions_range: std::ops::Range<u32>,
         cache: &mut LayerCache<T>,
-    ) -> Result<Tensor<T>> {
-        let sequence = end_pos - start_pos;
-        let normalized = self.input_layernorm.forward(input)?;
-        let query_projection = self.self_attn.q_proj.forward(&normalized)?;
-        let key_projection = self.self_attn.k_proj.forward(&normalized)?;
-        let value_projection = self.self_attn.v_proj.forward(&normalized)?;
+        following_norm: Option<&RmsNorm<T>>,
+    ) -> Result<(Tensor<T>, Option<Tensor<T>>)> {
+        let sequence = positions_range.end - positions_range.start;
+        let query_projection = self.self_attn.q_proj.forward(normalized_input)?;
+        let key_projection = self.self_attn.k_proj.forward(normalized_input)?;
+        let value_projection = self.self_attn.v_proj.forward(normalized_input)?;
         let normalized_query = self.self_attn.q_norm.forward(&query_projection.reshape(&[
             sequence,
             QUERY_HEADS,
@@ -198,27 +200,60 @@ impl<T: Activation> DecoderLayer<T> {
         let value = value_projection
             .reshape(&[sequence, KEY_VALUE_HEADS, HEAD_DIM])?
             .permute(&[1, 0, 2])?;
-        key.copy_into(&mut cache.key.narrow(1, start_pos, sequence)?)?;
-        value.copy_into(&mut cache.value.narrow(1, start_pos, sequence)?)?;
+        key.copy_into(&mut cache.key.narrow(1, positions_range.start, sequence)?)?;
+        value.copy_into(&mut cache.value.narrow(1, positions_range.start, sequence)?)?;
         let attended = sdpa(
             &query,
-            &cache.key.narrow(1, 0, end_pos)?,
-            &cache.value.narrow(1, 0, end_pos)?,
+            &cache.key.narrow(1, 0, positions_range.end)?,
+            &cache.value.narrow(1, 0, positions_range.end)?,
             ATTENTION_SCALE,
             true,
-            start_pos,
+            positions_range.start,
         )?
         .permute(&[1, 0, 2])?
         .contiguous()?
         .reshape(&[sequence, QUERY_HEADS * HEAD_DIM])?;
         let attention = self.self_attn.o_proj.forward(&attended)?;
-        let hidden = (input + &attention)?;
-        let normalized = self.post_attention_layernorm.forward(&hidden)?;
+        let (hidden, normalized) = if FUSE_RESIDUAL_NORM {
+            residual_norm(input, &attention, &self.post_attention_layernorm)?
+        } else {
+            let hidden = (input + &attention)?;
+            let normalized = self.post_attention_layernorm.forward(&hidden)?;
+            (hidden, normalized)
+        };
         let gate = self.mlp.gate_proj.forward(&normalized)?;
         let up = self.mlp.up_proj.forward(&normalized)?;
         let projected = self.mlp.down_proj.forward(&gate.silu_mul(&up)?)?;
-        &hidden + &projected
+        if FUSE_RESIDUAL_NORM && let Some(norm) = following_norm {
+            let (residual, normalized) = residual_norm(&hidden, &projected, norm)?;
+            Ok((residual, Some(normalized)))
+        } else {
+            let residual = (&hidden + &projected)?;
+            let normalized = following_norm
+                .map(|norm| norm.forward(&residual))
+                .transpose()?;
+            Ok((residual, normalized))
+        }
     }
+}
+
+fn residual_norm<T: Activation>(
+    residual: &Tensor<T>,
+    update: &Tensor<T>,
+    norm: &RmsNorm<T>,
+) -> Result<(Tensor<T>, Tensor<T>)> {
+    let weight = norm.weight().broadcast_as(residual.shape())?;
+    let program = Program::row();
+    let value = program.input(0) + program.input(1);
+    let square_sum = program.reduce(ReduceOp::Sum, value * value);
+    let inverse_rms = (square_sum / program.extent(-1) + RMS_EPSILON).rsqrt();
+    program.output(0, value);
+    program.output(1, value * inverse_rms * program.input(2));
+    let outputs = residual.run_program(&program, &[update, &weight])?;
+    let [residual, normalized] = outputs
+        .try_into()
+        .map_err(|_| forja_sdk::Error::loading("residual norm produced invalid outputs"))?;
+    Ok((residual, normalized))
 }
 
 /// Qwen3-0.6B with a fixed 4096-token KV cache.
@@ -245,8 +280,19 @@ impl<T: Activation> Qwen3<T> {
             .ok_or_else(|| forja_sdk::Error::loading("tokens must have rank one"))?;
         let positions = positions(0, sequence)?;
         let hidden = self.weights.model.embed_tokens.forward(tokens)?;
+        let normalized = self.weights.model.layers[0]
+            .input_layernorm
+            .forward(&hidden)?;
         self.weights.model.layers[0]
-            .forward(&hidden, &positions, 0, sequence, &mut self.caches[0])?
+            .forward(
+                &hidden,
+                &normalized,
+                &positions,
+                0..sequence,
+                &mut self.caches[0],
+                None,
+            )?
+            .0
             .contiguous()
     }
 }
@@ -291,18 +337,32 @@ impl Engine for ExportedQwen3 {
             .ok_or_else(|| forja_sdk::Error::loading("tokens exceed the 4096-token context"))?;
         let positions = positions(input.start_pos, end_pos)?;
         let mut hidden = self.weights.model.embed_tokens.forward(&input.tokens)?;
+        let mut normalized = self.weights.model.layers[0]
+            .input_layernorm
+            .forward(&hidden)?;
         let mut taps = Vec::with_capacity(if input.taps { LAYERS } else { 0 });
-        for (index, (layer, cache)) in self
-            .weights
-            .model
-            .layers
-            .iter()
-            .zip(&mut self.caches)
-            .enumerate()
-        {
-            hidden = layer.forward(&hidden, &positions, input.start_pos, end_pos, cache)?;
+        for index in 0..LAYERS {
+            let layer = &self.weights.model.layers[index];
+            let following_norm = self
+                .weights
+                .model
+                .layers
+                .get(index + 1)
+                .map(|layer| &layer.input_layernorm);
+            let (next_hidden, next_normalized) = layer.forward(
+                &hidden,
+                &normalized,
+                &positions,
+                input.start_pos..end_pos,
+                &mut self.caches[index],
+                following_norm,
+            )?;
+            hidden = next_hidden;
             if input.taps && index + 1 < LAYERS {
                 taps.push(Self::output(hidden.contiguous()?)?);
+            }
+            if let Some(value) = next_normalized {
+                normalized = value;
             }
         }
         hidden = self.weights.model.norm.forward(&hidden)?;

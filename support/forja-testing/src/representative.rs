@@ -40,7 +40,8 @@ pub fn residual_rms_norm(epsilon: f32) -> Program {
     let inverse_rms = builder.unary(UnOp::Rsqrt, stabilized);
     let normalized = builder.binary(BinOp::Mul, value, inverse_rms);
     let scaled = builder.binary(BinOp::Mul, normalized, weight);
-    builder.output(0, scaled);
+    builder.output(0, value);
+    builder.output(1, scaled);
     builder.finish()
 }
 
@@ -262,6 +263,57 @@ mod tests {
             &[&actual],
             &[(&expected, &actual)],
         );
+    }
+
+    #[test]
+    fn residual_rms_norm_matches_the_trusted_operations() {
+        let backend = CpuBackend::new();
+        let shape = [7, 1024];
+        let residual = initialized(&backend, &shape, 6);
+        let update = initialized(&backend, &shape, 7);
+        let weight = initialized(&backend, &[1024], 8);
+        let broadcast_weight = backend
+            .view(&weight, ViewOp::Broadcast(shape.to_vec()))
+            .unwrap();
+        let expected_residual = backend.alloc(DType::F32, &shape).unwrap();
+        let expected_normalized = backend.alloc(DType::F32, &shape).unwrap();
+        let actual_residual = backend.alloc(DType::F32, &shape).unwrap();
+        let actual_normalized = backend.alloc(DType::F32, &shape).unwrap();
+        let mut trusted = CommandList::new();
+        trusted
+            .dispatch(Op::Add, &[&residual, &update], &expected_residual)
+            .unwrap();
+        trusted
+            .dispatch(
+                Op::RmsNorm { eps: 1e-6 },
+                &[&expected_residual, &weight],
+                &expected_normalized,
+            )
+            .unwrap();
+        backend.submit(trusted).unwrap().wait().unwrap();
+
+        let program = residual_rms_norm(1e-6).validate().unwrap();
+        let mut commands = CommandList::new();
+        commands
+            .dispatch_program(
+                &program,
+                &[&residual, &update, &broadcast_weight],
+                &[&actual_residual, &actual_normalized],
+            )
+            .unwrap();
+        backend.submit(commands).unwrap().wait().unwrap();
+
+        for (expected, actual) in [
+            (&expected_residual, &actual_residual),
+            (&expected_normalized, &actual_normalized),
+        ] {
+            assert_outputs_agree(
+                DType::F32,
+                &backend.read(expected).unwrap(),
+                &backend.read(actual).unwrap(),
+            )
+            .unwrap();
+        }
     }
 
     #[test]

@@ -182,6 +182,12 @@ impl<T: Element> RmsNorm<T> {
         Self { weight, eps }
     }
 
+    /// Returns the learned scale tensor.
+    #[must_use]
+    pub const fn weight(&self) -> &Tensor<T> {
+        &self.weight
+    }
+
     /// Normalizes the input's last dimension.
     ///
     /// # Errors

@@ -128,6 +128,7 @@ fn fused_residual_norm_matches_and_beats_two_dispatches() {
         .unwrap();
     let intermediate = backend.alloc(DType::F32, &shape).unwrap();
     let trusted_output = backend.alloc(DType::F32, &shape).unwrap();
+    let program_residual = backend.alloc(DType::F32, &shape).unwrap();
     let program_output = backend.alloc(DType::F32, &shape).unwrap();
     let program = residual_rms_norm(1.0e-6).validate().unwrap();
     run(
@@ -139,7 +140,7 @@ fn fused_residual_norm_matches_and_beats_two_dispatches() {
         program_commands(
             &program,
             &[&residual, &update, &broadcast_weight],
-            &[&program_output],
+            &[&program_residual, &program_output],
         ),
     );
     assert_outputs_agree(
@@ -155,7 +156,7 @@ fn fused_residual_norm_matches_and_beats_two_dispatches() {
         program_commands(
             &program,
             &[&residual, &update, &broadcast_weight],
-            &[&program_output],
+            &[&program_residual, &program_output],
         )
     });
     let ratio = fused.as_secs_f64() / unfused.as_secs_f64();
