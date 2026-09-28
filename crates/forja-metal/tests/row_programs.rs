@@ -5,7 +5,7 @@ mod common;
 use std::time::Duration;
 
 use forja_core::{
-    Backend, CommandList, DType, Op, Submission, Tensor, ViewOp,
+    Backend, CommandList, DType, Op, Slice, Submission, Tensor, ViewOp,
     program::{Inst, Program, ProgramKind, RedOp, ValidatedProgram},
 };
 use forja_cpu::CpuBackend;
@@ -13,7 +13,7 @@ use forja_metal::MetalBackend;
 use forja_testing::{
     DeterministicValues, assert_outputs_agree, assert_program_backends_agree,
     program::{ProgramCase, row_programs, stable_row_programs},
-    representative::{residual_rms_norm, rms_norm, softmax},
+    representative::{qk_norm_rope, residual_rms_norm, rms_norm, softmax},
 };
 use proptest::{
     prelude::*,
@@ -197,6 +197,63 @@ fn fused_residual_norm_matches_and_beats_two_dispatches() {
     assert!(ratio <= 1.05, "fused ratio exceeded 1.05: {ratio:.3}");
 }
 
+#[test]
+fn fused_qk_norm_rope_matches_and_beats_two_dispatches() {
+    let backend = MetalBackend::new().unwrap();
+    let values = initialized_f32(&backend, &[8, 16, 128], 10);
+    let weight = initialized_f32(&backend, &[128], 11);
+    let positions = position_tensor(&backend, DType::U32);
+    let program_positions = position_tensor(&backend, DType::F32);
+    let program_positions = backend
+        .view(&program_positions, ViewOp::Reshape(vec![8, 1, 1]))
+        .unwrap();
+    let program_positions = backend
+        .view(&program_positions, ViewOp::Broadcast(vec![8, 16, 64]))
+        .unwrap();
+    let first = qk_half(&backend, &values, 0);
+    let second = qk_half(&backend, &values, 64);
+    let first_weight = qk_weight(&backend, &weight, 0);
+    let second_weight = qk_weight(&backend, &weight, 64);
+    let normalized = backend.alloc(DType::F32, &[8, 16, 128]).unwrap();
+    let expected = backend.alloc(DType::F32, &[8, 16, 128]).unwrap();
+    let actual = backend.alloc(DType::F32, &[8, 16, 128]).unwrap();
+    let actual_first = qk_half(&backend, &actual, 0);
+    let actual_second = qk_half(&backend, &actual, 64);
+    let program = qk_norm_rope(1.0e-6, 1_000_000.0).validate().unwrap();
+    let trusted = || qk_norm_rope_commands(&values, &weight, &positions, &normalized, &expected);
+    let fused = || {
+        program_commands(
+            &program,
+            &[
+                &first,
+                &second,
+                &first_weight,
+                &second_weight,
+                &program_positions,
+            ],
+            &[&actual_first, &actual_second],
+        )
+    };
+    run(&backend, trusted());
+    run(&backend, fused());
+    assert_outputs_agree(
+        DType::F32,
+        &backend.read(&expected).unwrap(),
+        &backend.read(&actual).unwrap(),
+    )
+    .unwrap();
+    let unfused = median_gpu_time(&backend, trusted);
+    let fused = median_gpu_time(&backend, fused);
+    let ratio = fused.as_secs_f64() / unfused.as_secs_f64();
+    eprintln!("operation,unfused_ns,fused_ns,ratio");
+    eprintln!(
+        "qk-norm-rope,{},{},{ratio:.3}",
+        unfused.as_nanos(),
+        fused.as_nanos()
+    );
+    assert!(ratio <= 1.05, "fused ratio exceeded 1.05: {ratio:.3}");
+}
+
 struct Timing {
     name: &'static str,
     trusted: Duration,
@@ -329,6 +386,65 @@ fn residual_norm_commands(
         .dispatch(Op::RmsNorm { eps: 1.0e-6 }, &[intermediate, weight], output)
         .unwrap();
     commands
+}
+
+fn qk_norm_rope_commands(
+    values: &Tensor,
+    weight: &Tensor,
+    positions: &Tensor,
+    normalized: &Tensor,
+    output: &Tensor,
+) -> CommandList {
+    let mut commands = CommandList::new();
+    commands
+        .dispatch(Op::RmsNorm { eps: 1.0e-6 }, &[values, weight], normalized)
+        .unwrap();
+    commands
+        .dispatch(
+            Op::Rope { theta: 1_000_000.0 },
+            &[normalized, positions],
+            output,
+        )
+        .unwrap();
+    commands
+}
+
+fn position_tensor(backend: &MetalBackend, dtype: DType) -> Tensor {
+    let tensor = backend.alloc(dtype, &[8]).unwrap();
+    let bytes = match dtype {
+        DType::F32 => (0_u16..8)
+            .flat_map(|value| f32::from(value).to_le_bytes())
+            .collect::<Vec<_>>(),
+        DType::U32 => (0_u32..8).flat_map(u32::to_le_bytes).collect::<Vec<_>>(),
+        _ => panic!("unsupported position dtype"),
+    };
+    backend.write(&tensor, &bytes).unwrap();
+    tensor
+}
+
+fn qk_half(backend: &MetalBackend, tensor: &Tensor, start: u32) -> Tensor {
+    backend
+        .view(
+            tensor,
+            ViewOp::Slice(vec![
+                Slice::new(0, 8, 1).unwrap(),
+                Slice::new(0, 16, 1).unwrap(),
+                Slice::new(start, 64, 1).unwrap(),
+            ]),
+        )
+        .unwrap()
+}
+
+fn qk_weight(backend: &MetalBackend, tensor: &Tensor, start: u32) -> Tensor {
+    let weight = backend
+        .view(
+            tensor,
+            ViewOp::Slice(vec![Slice::new(start, 64, 1).unwrap()]),
+        )
+        .unwrap();
+    backend
+        .view(&weight, ViewOp::Broadcast(vec![8, 16, 64]))
+        .unwrap()
 }
 
 fn run<B: Backend>(backend: &B, commands: CommandList) {

@@ -48,6 +48,15 @@ pub struct Tensor<T: Element> {
 }
 
 impl<T: Element> Tensor<T> {
+    /// Allocates a contiguous tensor initialized to zero.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the shape size overflows or allocation is refused.
+    pub fn zeros(shape: &[u32]) -> Result<Self> {
+        Self::empty(shape.to_vec())
+    }
+
     /// Allocates a contiguous tensor and initializes it from a slice.
     ///
     /// # Errors
@@ -331,6 +340,32 @@ impl<T: Element> Tensor<T> {
         Ok(outputs)
     }
 
+    /// Runs a guest-authored scalar program into caller-supplied output views.
+    ///
+    /// This tensor is bound to input slot zero and additional inputs occupy
+    /// subsequent slots.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid program, incompatible binding, or
+    /// refused dispatch.
+    pub fn run_program_into(
+        &self,
+        program: &Program,
+        inputs: &[&Self],
+        outputs: &[&Self],
+    ) -> Result<()> {
+        let definition = program.definition(self.shape.len())?;
+        let input_handles = std::iter::once(&self.handle)
+            .chain(inputs.iter().map(|tensor| &tensor.handle))
+            .collect::<Vec<_>>();
+        let output_handles = outputs
+            .iter()
+            .map(|tensor| &tensor.handle)
+            .collect::<Vec<_>>();
+        graph::record_program(definition, &input_handles, &output_handles)
+    }
+
     /// Submits pending work and gathers the logical tensor values.
     ///
     /// # Errors
@@ -421,6 +456,33 @@ mod tests {
 
         assert_eq!(view.shape(), [3, 3]);
         assert_eq!(view.to_vec().unwrap(), [1, 8, 15, 3, 10, 17, 5, 12, 19]);
+    }
+
+    #[test]
+    fn zeros_initializes_contiguous_tensor() {
+        let tensor = Tensor::<f32>::zeros(&[1, 7]).unwrap();
+
+        assert_eq!(tensor.to_vec().unwrap(), [0.0; 7]);
+    }
+
+    #[test]
+    fn run_program_into_writes_supplied_output_views() {
+        use crate::program::Program;
+
+        let input = Tensor::from_slice(&[1.0_f32, 2.0], &[1, 2]).unwrap();
+        let output = Tensor::<f32>::zeros(&[1, 4]).unwrap();
+        let first = output.narrow(1, 0, 2).unwrap();
+        let second = output.narrow(1, 2, 2).unwrap();
+        let program = Program::map();
+        let value = program.input(0);
+        program.output(0, value + 1.0);
+        program.output(1, value * 2.0);
+
+        input
+            .run_program_into(&program, &[], &[&first, &second])
+            .unwrap();
+
+        assert_eq!(output.to_vec().unwrap(), [2.0, 3.0, 2.0, 4.0]);
     }
 
     #[test]

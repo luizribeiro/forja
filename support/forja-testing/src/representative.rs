@@ -45,6 +45,48 @@ pub fn residual_rms_norm(epsilon: f32) -> Program {
     builder.finish()
 }
 
+/// Builds fused QK normalization and half-split rotary position embedding.
+#[must_use]
+pub fn qk_norm_rope(epsilon: f32, theta: f32) -> Program {
+    let mut builder = Builder::new(ProgramKind::Row);
+    let first = builder.input(0);
+    let second = builder.input(1);
+    let first_weight = builder.input(2);
+    let second_weight = builder.input(3);
+    let position = builder.input(4);
+    let first_square = builder.binary(BinOp::Mul, first, first);
+    let second_square = builder.binary(BinOp::Mul, second, second);
+    let squares = builder.binary(BinOp::Add, first_square, second_square);
+    let square_sum = builder.reduce(RedOp::Sum, squares);
+    let width = builder.constant(128.0);
+    let mean = builder.binary(BinOp::Div, square_sum, width);
+    let epsilon = builder.constant(epsilon);
+    let stabilized = builder.binary(BinOp::Add, mean, epsilon);
+    let inverse_rms = builder.unary(UnOp::Rsqrt, stabilized);
+    let first = builder.binary(BinOp::Mul, first, inverse_rms);
+    let first = builder.binary(BinOp::Mul, first, first_weight);
+    let second = builder.binary(BinOp::Mul, second, inverse_rms);
+    let second = builder.binary(BinOp::Mul, second, second_weight);
+    let frequency = builder.index(2);
+    let frequency = builder.cast(ValueType::F32, frequency);
+    let exponent_scale = builder.constant(-2.0 / 128.0);
+    let exponent = builder.binary(BinOp::Mul, frequency, exponent_scale);
+    let theta = builder.constant(theta);
+    let scale = builder.binary(BinOp::Pow, theta, exponent);
+    let angle = builder.binary(BinOp::Mul, position, scale);
+    let cosine = builder.unary(UnOp::Cos, angle);
+    let sine = builder.unary(UnOp::Sin, angle);
+    let first_cosine = builder.binary(BinOp::Mul, first, cosine);
+    let second_sine = builder.binary(BinOp::Mul, second, sine);
+    let first_rotated = builder.binary(BinOp::Sub, first_cosine, second_sine);
+    let second_cosine = builder.binary(BinOp::Mul, second, cosine);
+    let first_sine = builder.binary(BinOp::Mul, first, sine);
+    let second_rotated = builder.binary(BinOp::Add, second_cosine, first_sine);
+    builder.output(0, first_rotated);
+    builder.output(1, second_rotated);
+    builder.finish()
+}
+
 /// Builds stable row-wise softmax.
 #[must_use]
 pub fn softmax() -> Program {
