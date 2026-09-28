@@ -3537,7 +3537,7 @@ pub(super) struct PipelineCache {
 }
 
 const PROGRAM_PIPELINE_CAPACITY: usize = 64;
-const MAX_PROGRAM_COMPILES_PER_SUBMISSION: usize = 4;
+const MAX_PROGRAM_COMPILES_PER_SUBMISSION: usize = 8;
 
 impl PipelineCache {
     pub(super) fn new(
