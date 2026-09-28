@@ -15,12 +15,15 @@ use forja_testing::{
     program::{ProgramCase, row_programs, stable_row_programs},
     representative::{residual_rms_norm, rms_norm, softmax},
 };
-use proptest::{prelude::*, test_runner::TestCaseError};
+use proptest::{
+    prelude::*,
+    test_runner::{FileFailurePersistence, RngSeed, TestCaseError},
+};
 
 use common::median_gpu_time;
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(32))]
+    #![proptest_config(row_program_config())]
 
     #[test]
     fn metal_row_programs_match_the_interpreter(case in row_programs(64)) {
@@ -30,6 +33,31 @@ proptest! {
     #[test]
     fn stable_metal_row_programs_match_the_interpreter(case in stable_row_programs(64)) {
         compare_program(&case)?;
+    }
+}
+
+fn row_program_config() -> ProptestConfig {
+    let explore = std::env::var_os("FORJA_PROPTEST_EXPLORE").is_some();
+    let failure_file = if explore {
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/proptest-regressions/row_programs-exploration.txt"
+        )
+    } else {
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/proptest-regressions/row_programs.txt"
+        )
+    };
+    ProptestConfig {
+        cases: if explore { 64 } else { 32 },
+        failure_persistence: Some(Box::new(FileFailurePersistence::Direct(failure_file))),
+        rng_seed: if explore {
+            RngSeed::Random
+        } else {
+            RngSeed::Fixed(0x6a09_e667_f3bc_c909)
+        },
+        ..ProptestConfig::default()
     }
 }
 
