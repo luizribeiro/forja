@@ -10,6 +10,8 @@ use std::{
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+#[cfg(test)]
+use crate::encoding::last_submission_timing;
 use crate::encoding::{
     Completion, InFlightTracker, MetalProgram, MetalProgramHandle, MetalSubmission, PipelineCache,
 };
@@ -187,6 +189,8 @@ pub(super) struct BackendDebugState {
     pub(super) pooled_bytes: u64,
     pub(super) residency_allocations: usize,
     pub(super) residency_bytes: u64,
+    pub(super) last_submit: Duration,
+    pub(super) last_wait: Duration,
 }
 
 /// Limits runtime scalar-program compilations for one backend.
@@ -432,6 +436,7 @@ impl MetalBackend {
     #[cfg(test)]
     pub(super) fn debug_state(&self) -> BackendDebugState {
         self.in_flight.drain_done();
+        let (last_submit, last_wait) = last_submission_timing();
         let pool = self
             .pool
             .lock()
@@ -444,6 +449,8 @@ impl MetalBackend {
             pooled_bytes: pool.bytes,
             residency_allocations: pool.residency.raw.allocationCount(),
             residency_bytes: pool.residency.raw.allocatedSize(),
+            last_submit,
+            last_wait,
         }
     }
 
@@ -762,6 +769,8 @@ mod tests {
                 pooled_bytes: 0,
                 residency_allocations: 0,
                 residency_bytes: 0,
+                last_submit: Duration::ZERO,
+                last_wait: Duration::ZERO,
             }
         );
         drop(backend);

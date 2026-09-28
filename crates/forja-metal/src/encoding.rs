@@ -9,6 +9,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(test)]
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use block2::RcBlock;
 use forja_core::{
     BackendError, BufferId, CommandList, DType, Dispatch, DispatchProfile, Layout, Op,
@@ -563,9 +566,32 @@ impl<K: Clone + Eq + Hash, V> LruCache<K, V> {
 struct CompletionState {
     feedback: Option<CommitResult>,
     event_signaled: bool,
+    #[cfg(test)]
+    expected_event: Option<u64>,
     committed: Option<Instant>,
     feedback_elapsed: Option<Duration>,
     event_elapsed: Option<Duration>,
+}
+
+#[cfg(test)]
+static LAST_SUBMIT_NANOS: AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
+static LAST_WAIT_NANOS: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+pub(super) fn last_submission_timing() -> (Duration, Duration) {
+    (
+        Duration::from_nanos(LAST_SUBMIT_NANOS.load(Ordering::Relaxed)),
+        Duration::from_nanos(LAST_WAIT_NANOS.load(Ordering::Relaxed)),
+    )
+}
+
+#[cfg(test)]
+fn store_duration(target: &AtomicU64, duration: Duration) {
+    target.store(
+        u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX),
+        Ordering::Relaxed,
+    );
 }
 
 struct CommitFeedback(Retained<ProtocolObject<dyn MTL4CommitFeedback>>);
@@ -855,6 +881,8 @@ impl Completion {
                 state: Mutex::new(CompletionState {
                     feedback: None,
                     event_signaled: false,
+                    #[cfg(test)]
+                    expected_event: None,
                     committed: None,
                     feedback_elapsed: None,
                     event_elapsed: None,
@@ -909,6 +937,8 @@ impl Completion {
             }
             let remaining = timeout.saturating_sub(started.elapsed());
             if remaining.is_zero() {
+                #[cfg(test)]
+                self.log_timeout(&state);
                 return Err(BackendError::Timeout);
             }
             let (next, wait) = self
@@ -917,6 +947,8 @@ impl Completion {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             state = next;
             if wait.timed_out() && (!state.event_signaled || state.feedback.is_none()) {
+                #[cfg(test)]
+                self.log_timeout(&state);
                 return Err(BackendError::Timeout);
             }
         }
@@ -938,11 +970,32 @@ impl Completion {
         self.ready.notify_all();
     }
 
-    fn mark_committed(&self) {
-        self.state
+    fn mark_committed(&self, event_value: u64) {
+        let mut state = self
+            .state
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .committed = Some(Instant::now());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.committed = Some(Instant::now());
+        #[cfg(test)]
+        {
+            state.expected_event = Some(event_value);
+        }
+        #[cfg(not(test))]
+        {
+            let _ = event_value;
+        }
+    }
+
+    #[cfg(test)]
+    fn log_timeout(&self, state: &CompletionState) {
+        eprintln!(
+            "Metal wait timed out: submission={:?} expected_event={:?} signaled_event={} listener_notified={} feedback_received={}",
+            state.expected_event,
+            state.expected_event,
+            self.event.raw.signaledValue(),
+            state.event_signaled,
+            state.feedback.is_some(),
+        );
     }
 
     fn reap(self: &Arc<Self>) {
@@ -1269,6 +1322,8 @@ impl MetalSubmission {
     fn wait_profiled(&self, timeout: Duration) -> Result<(), BackendError> {
         let started = Instant::now();
         let result = self.completion.wait(timeout);
+        #[cfg(test)]
+        store_duration(&LAST_WAIT_NANOS, started.elapsed());
         if result.is_ok()
             && let Some(profile) = &self.profile
             && let Ok(mut profile) = profile.lock()
@@ -1353,6 +1408,8 @@ impl MetalBackend {
         &self,
         commands: CommandList,
     ) -> Result<MetalSubmission, BackendError> {
+        #[cfg(test)]
+        let submit_started = Instant::now();
         self.in_flight.drain_done();
         let validation_started = PROFILE.then(Instant::now);
         let program_recording = commands.program_recording();
@@ -1464,6 +1521,8 @@ impl MetalBackend {
             submission.profile = Some(Mutex::new(profile));
             submission.dispatch_operations = operations;
         }
+        #[cfg(test)]
+        store_duration(&LAST_SUBMIT_NANOS, submit_started.elapsed());
         Ok(submission)
     }
 
@@ -3436,7 +3495,7 @@ impl MetalBackend {
             self.in_flight.cancel(&completion);
             return Err(BackendError::ExecutionFailed);
         };
-        completion.mark_committed();
+        completion.mark_committed(event_value);
         // SAFETY: The pointer names one live command buffer and the count matches the array.
         unsafe {
             self.queue.commit_count_options(
