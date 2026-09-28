@@ -3,6 +3,7 @@ use std::{error::Error, fmt, sync::Arc};
 use crate::{
     Affine, ByteHull, CommandList, Dispatch, Op, OpError, ParamError, ParamSpace, ParamValues,
     SymbolicLayout, SymbolicLayoutError, Tensor, TensorError,
+    ops::{BufferAccess, barriers_for_accesses},
     program::{BindError, Inst, PreparedProgram, ProgramKind},
 };
 
@@ -225,6 +226,14 @@ impl TemplateTensor {
             Self::Symbolic { layout, .. } => Ok(layout.byte_hull()?),
         }
     }
+
+    fn access(&self, writes: bool) -> Result<BufferAccess, GraphError> {
+        Ok(BufferAccess {
+            buffer: self.buffer(),
+            bytes: self.byte_hull()?.byte_span(),
+            writes,
+        })
+    }
 }
 
 impl From<Tensor> for TemplateTensor {
@@ -375,6 +384,22 @@ impl DynamicDispatch {
         Ok(())
     }
 
+    fn accesses(&self) -> Result<Vec<BufferAccess>, GraphError> {
+        let (inputs, outputs) = match self {
+            Self::Operation { inputs, output, .. } => {
+                (inputs.as_slice(), std::slice::from_ref(output.as_ref()))
+            }
+            Self::Program {
+                inputs, outputs, ..
+            } => (inputs.as_slice(), outputs.as_slice()),
+        };
+        inputs
+            .iter()
+            .map(|tensor| tensor.access(false))
+            .chain(outputs.iter().map(|tensor| tensor.access(true)))
+            .collect()
+    }
+
     fn tensors(&self) -> impl Iterator<Item = &TemplateTensor> {
         let (inputs, outputs) = match self {
             Self::Operation { inputs, output, .. } => {
@@ -430,6 +455,8 @@ pub struct GraphTemplate {
     space: ParamSpace,
     limits: GraphLimits,
     dispatches: Vec<TemplateDispatch>,
+    barrier_accesses: Vec<Vec<BufferAccess>>,
+    required_barriers: Vec<bool>,
 }
 
 impl GraphTemplate {
@@ -440,6 +467,8 @@ impl GraphTemplate {
             space,
             limits,
             dispatches: Vec::new(),
+            barrier_accesses: Vec::new(),
+            required_barriers: Vec::new(),
         }
     }
 
@@ -453,6 +482,12 @@ impl GraphTemplate {
     #[must_use]
     pub const fn is_empty(&self) -> bool {
         self.dispatches.is_empty()
+    }
+
+    /// Returns the conservative barrier decisions computed from symbolic byte hulls.
+    #[must_use]
+    pub fn required_barriers(&self) -> &[bool] {
+        &self.required_barriers
     }
 
     /// Validates and records one trusted operation at every parameter-space corner.
@@ -514,6 +549,7 @@ impl GraphTemplate {
             };
             commands.push_prevalidated(concrete);
         }
+        commands.set_precomputed_barriers(self.required_barriers.clone());
         Ok(commands)
     }
 
@@ -525,6 +561,7 @@ impl GraphTemplate {
             return Err(GraphError::ParameterSpaceMismatch);
         }
         dispatch.check_hull_aliasing()?;
+        let accesses = dispatch.accesses()?;
         let mut corners = self.space.corners().into_iter();
         let first = corners
             .next()
@@ -539,6 +576,8 @@ impl GraphTemplate {
             self.dispatches
                 .push(TemplateDispatch::Static(Box::new(first)));
         }
+        self.barrier_accesses.push(accesses);
+        self.required_barriers = barriers_for_accesses(self.barrier_accesses.iter().cloned());
         Ok(())
     }
 }
@@ -594,6 +633,7 @@ mod tests {
         program::{
             Inst, KernelSignature, PreparedProgram, Program, ProgramKind, prepared_for_test,
         },
+        required_barriers,
     };
 
     fn tensor(buffer: u64, shape: &[u32]) -> Tensor {
@@ -716,6 +756,18 @@ mod tests {
                 graph.instantiate(&values).is_ok()
                     == fresh_program_succeeds(program, inputs, outputs, &values)
             })
+    }
+
+    fn symbolic_element(
+        base: &Tensor,
+        space: ParamSpace,
+        offset: u32,
+        scale: u32,
+    ) -> TemplateTensor {
+        let layout = SymbolicLayout::new(base.layout().clone(), space)
+            .slice(0, Affine::parameter(0, offset, scale), 1.into(), 1)
+            .unwrap();
+        TemplateTensor::symbolic(base.clone(), layout).unwrap()
     }
     #[test]
     fn instantiates_affine_attention_positions_with_checked_arithmetic() {
@@ -1109,6 +1161,89 @@ mod tests {
                 &[&noncontiguous_input],
                 &[&noncontiguous_output],
             ));
+        }
+    }
+
+    #[test]
+    fn instantiated_lists_reuse_hull_barriers() {
+        let space = ParamSpace::new(std::iter::once(0..=2).collect()).unwrap();
+        let cache = tensor(1, &[5]);
+        let moving = SymbolicLayout::new(cache.layout().clone(), space.clone())
+            .slice(0, Affine::parameter(0, 0, 2), 1.into(), 1)
+            .unwrap();
+        let cache_write = TemplateTensor::symbolic(cache.clone(), moving).unwrap();
+        let cache_read = TemplateTensor::from(
+            Tensor::from_allocation(
+                cache.buffer(),
+                Layout::contiguous(DType::F32, 2, vec![1], 20).unwrap(),
+                true,
+            )
+            .unwrap(),
+        );
+        let source = TemplateTensor::from(tensor(2, &[1]));
+        let sink = TemplateTensor::from(tensor(3, &[1]));
+        let mut graph = GraphTemplate::new(space.clone(), GraphLimits::default());
+        graph.dispatch(Op::Copy, &[&source], &cache_write).unwrap();
+        graph.dispatch(Op::Copy, &[&cache_read], &sink).unwrap();
+
+        assert_eq!(graph.required_barriers(), [false, true]);
+        for value in 0..=2 {
+            let values = space.values(vec![value]).unwrap();
+            let mut commands = graph.instantiate(&values).unwrap();
+            assert_eq!(required_barriers(&commands), [false, true]);
+            let sink = sink.instantiate(&values).unwrap();
+            let next = tensor(4, &[1]);
+            commands.dispatch(Op::Copy, &[&sink], &next).unwrap();
+            assert_eq!(required_barriers(&commands), [false, value == 1, true]);
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn hull_barriers_cover_every_concrete_instantiation(
+            hi in 0_u32..=3,
+            write_offset in 0_u32..=4,
+            write_scale in 0_u32..=2,
+            read_offset in 0_u32..=4,
+            read_scale in 0_u32..=2,
+        ) {
+            let space = ParamSpace::new(std::iter::once(0..=hi).collect()).unwrap();
+            let cache = tensor(1, &[16]);
+            let cache_write = symbolic_element(
+                &cache,
+                space.clone(),
+                write_offset,
+                write_scale,
+            );
+            let cache_read = symbolic_element(
+                &cache,
+                space.clone(),
+                read_offset,
+                read_scale,
+            );
+            let source = TemplateTensor::from(tensor(2, &[1]));
+            let sink = TemplateTensor::from(tensor(3, &[1]));
+            let mut graph = GraphTemplate::new(space.clone(), GraphLimits::default());
+            graph.dispatch(Op::Copy, &[&source], &cache_write).unwrap();
+            graph.dispatch(Op::Copy, &[&cache_read], &sink).unwrap();
+            let hull = graph.required_barriers().to_vec();
+
+            for value in 0..=hi {
+                let values = space.values(vec![value]).unwrap();
+                let source = source.instantiate(&values).unwrap();
+                let cache_write = cache_write.instantiate(&values).unwrap();
+                let cache_read = cache_read.instantiate(&values).unwrap();
+                let sink = sink.instantiate(&values).unwrap();
+                let mut concrete = CommandList::new();
+                concrete.dispatch(Op::Copy, &[&source], &cache_write).unwrap();
+                concrete.dispatch(Op::Copy, &[&cache_read], &sink).unwrap();
+
+                for (hull_has_barrier, concrete_has_barrier) in
+                    hull.iter().zip(required_barriers(&concrete))
+                {
+                    prop_assert!(*hull_has_barrier || !concrete_has_barrier);
+                }
+            }
         }
     }
 }

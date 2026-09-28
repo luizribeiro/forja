@@ -1,6 +1,7 @@
 use std::{
     error::Error,
     fmt,
+    ops::Range,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -345,6 +346,7 @@ impl Dispatch {
 #[derive(Clone, Debug, Default)]
 pub struct CommandList {
     dispatches: Vec<Dispatch>,
+    precomputed_barriers: Option<Vec<bool>>,
     program_recording: Duration,
     program_dispatches: u64,
 }
@@ -355,6 +357,7 @@ impl CommandList {
     pub const fn new() -> Self {
         Self {
             dispatches: Vec::new(),
+            precomputed_barriers: None,
             program_recording: Duration::ZERO,
             program_dispatches: 0,
         }
@@ -403,7 +406,12 @@ impl CommandList {
     }
 
     pub(crate) fn push_prevalidated(&mut self, dispatch: Dispatch) {
+        self.precomputed_barriers = None;
         self.dispatches.push(dispatch);
+    }
+
+    pub(crate) fn set_precomputed_barriers(&mut self, barriers: Vec<bool>) {
+        self.precomputed_barriers = Some(barriers);
     }
 
     fn record_program(&mut self, started: Instant) {
@@ -453,35 +461,72 @@ fn check_kernel_signature(
 /// Reports whether each dispatch needs a barrier before it.
 #[must_use]
 pub fn required_barriers(commands: &CommandList) -> Vec<bool> {
-    let mut accesses = Vec::<(&Tensor, bool)>::new();
-    commands
-        .dispatches
+    if let Some(barriers) = &commands.precomputed_barriers {
+        return barriers.clone();
+    }
+    barriers_for_accesses(commands.dispatches.iter().map(dispatch_accesses))
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct BufferAccess {
+    pub(crate) buffer: BufferId,
+    pub(crate) bytes: Option<Range<u64>>,
+    pub(crate) writes: bool,
+}
+
+pub(crate) fn dispatch_accesses(dispatch: &Dispatch) -> Vec<BufferAccess> {
+    dispatch
+        .inputs
         .iter()
-        .map(|dispatch| {
-            let needs_barrier = dispatch
-                .inputs
+        .map(|tensor| BufferAccess::new(tensor, false))
+        .chain(
+            dispatch
+                .outputs()
                 .iter()
-                .any(|input| conflicts(input, false, &accesses))
-                || dispatch
-                    .outputs()
-                    .iter()
-                    .any(|output| conflicts(output, true, &accesses));
+                .map(|tensor| BufferAccess::new(tensor, true)),
+        )
+        .collect()
+}
+
+pub(crate) fn barriers_for_accesses(
+    dispatches: impl IntoIterator<Item = Vec<BufferAccess>>,
+) -> Vec<bool> {
+    let mut prior = Vec::<BufferAccess>::new();
+    dispatches
+        .into_iter()
+        .map(|current| {
+            let needs_barrier = current
+                .iter()
+                .any(|access| prior.iter().any(|candidate| access.conflicts(candidate)));
             if needs_barrier {
-                accesses.clear();
+                prior.clear();
             }
-            accesses.extend(dispatch.inputs.iter().map(|input| (input, false)));
-            accesses.extend(dispatch.outputs().iter().map(|output| (output, true)));
+            prior.extend(current);
             needs_barrier
         })
         .collect()
 }
 
-fn conflicts(tensor: &Tensor, writes: bool, accesses: &[(&Tensor, bool)]) -> bool {
-    accesses.iter().any(|&(prior, prior_writes)| {
-        (writes || prior_writes)
-            && tensor.buffer == prior.buffer
-            && byte_ranges_overlap(&tensor.layout, &prior.layout)
-    })
+impl BufferAccess {
+    pub(crate) fn new(tensor: &Tensor, writes: bool) -> Self {
+        let bytes = (tensor.layout().element_count() != 0).then(|| tensor.layout().byte_span());
+        Self {
+            buffer: tensor.buffer(),
+            bytes,
+            writes,
+        }
+    }
+
+    fn conflicts(&self, prior: &Self) -> bool {
+        (self.writes || prior.writes)
+            && self.buffer == prior.buffer
+            && self.bytes.as_ref().is_some_and(|current| {
+                prior
+                    .bytes
+                    .as_ref()
+                    .is_some_and(|other| current.start < other.end && other.start < current.end)
+            })
+    }
 }
 
 fn check_common(inputs: &[&Tensor], output: &Tensor) -> Result<(), OpError> {
