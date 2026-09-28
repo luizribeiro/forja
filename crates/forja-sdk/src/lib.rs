@@ -80,6 +80,7 @@
 mod element;
 mod engine;
 mod graph;
+pub mod kernel;
 mod load;
 pub mod nn;
 pub mod program;
