@@ -5,6 +5,9 @@
 //! Floating-point [`BinOp::Min`] and [`BinOp::Max`] propagate NaN when either
 //! operand is NaN. Casting F32 to [`ValueType::U32`] saturates to the unsigned
 //! range and maps NaN to zero.
+//! Row reductions broadcast their result to every lane before evaluation
+//! continues. Parallel lowerings may use a different summation order from the
+//! reference interpreter's sequential left-to-right order.
 //!
 //! # Lowering requirements
 //!

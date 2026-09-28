@@ -2,54 +2,27 @@ use std::fmt::{self, Write};
 
 use forja_core::{
     DType,
-    program::{BinOp, BoundProgram, Inst, ProgramKind, UnOp, ValueType},
+    program::{BinOp, BoundProgram, Inst, ProgramKind, RedOp, UnOp, ValueType},
 };
 
 pub(super) const KERNEL_NAME: &str = "forja_map";
+pub(super) const ROW_KERNEL_NAME: &str = "forja_row";
 pub(super) const SHARED_HEADER: &str = include_str!("elementwise.metal");
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum CodegenError {
-    UnsupportedProgramKind,
+pub(super) fn generate(program: &BoundProgram) -> String {
+    match program.program().program().kind {
+        ProgramKind::Map => generate_map(program),
+        ProgramKind::Row => generate_row(program),
+    }
 }
 
-pub(super) fn generate(program: &BoundProgram) -> Result<String, CodegenError> {
-    if program.program().program().kind != ProgramKind::Map {
-        return Err(CodegenError::UnsupportedProgramKind);
-    }
+fn generate_map(program: &BoundProgram) -> String {
     let inputs = program.inputs();
     let outputs = program.outputs();
     let rank = outputs[0].layout().shape().len();
     let mut source = String::from(SHARED_HEADER);
     line(&mut source, format_args!("\nkernel void {KERNEL_NAME}("));
-    let operand_count = inputs.len() + outputs.len();
-    for (slot, _) in inputs.iter().enumerate() {
-        line(
-            &mut source,
-            format_args!("    device const uchar *input{slot} [[buffer({slot})]],"),
-        );
-    }
-    for (slot, _) in outputs.iter().enumerate() {
-        let buffer = inputs.len() + slot;
-        line(
-            &mut source,
-            format_args!("    device uchar *output{slot} [[buffer({buffer})]],"),
-        );
-    }
-    for slot in 0..inputs.len() {
-        let buffer = operand_count + slot;
-        line(
-            &mut source,
-            format_args!("    constant TensorLayout &input{slot}_layout [[buffer({buffer})]],"),
-        );
-    }
-    for slot in 0..outputs.len() {
-        let buffer = operand_count + inputs.len() + slot;
-        line(
-            &mut source,
-            format_args!("    constant TensorLayout &output{slot}_layout [[buffer({buffer})]],"),
-        );
-    }
+    emit_operand_parameters(&mut source, inputs.len(), outputs.len());
     line(
         &mut source,
         format_args!("    uint3 position [[thread_position_in_grid]]) {{"),
@@ -79,7 +52,334 @@ pub(super) fn generate(program: &BoundProgram) -> Result<String, CodegenError> {
         line(&mut source, format_args!("    {expression}"));
     }
     line(&mut source, format_args!("}}"));
-    Ok(source)
+    source
+}
+
+fn generate_row(program: &BoundProgram) -> String {
+    let inputs = program.inputs();
+    let outputs = program.outputs();
+    let rank = outputs[0].layout().shape().len();
+    let mut source = String::from(SHARED_HEADER);
+    line(
+        &mut source,
+        format_args!("\nkernel void {ROW_KERNEL_NAME}("),
+    );
+    emit_operand_parameters(&mut source, inputs.len(), outputs.len());
+    line(
+        &mut source,
+        format_args!("    uint row [[threadgroup_position_in_grid]],"),
+    );
+    line(
+        &mut source,
+        format_args!("    uint lane [[thread_position_in_threadgroup]],"),
+    );
+    line(
+        &mut source,
+        format_args!("    uint group_width [[threads_per_threadgroup]],"),
+    );
+    line(
+        &mut source,
+        format_args!("    uint simd_lane [[thread_index_in_simdgroup]],"),
+    );
+    line(
+        &mut source,
+        format_args!("    uint simd_group [[simdgroup_index_in_threadgroup]]) {{"),
+    );
+    line(
+        &mut source,
+        format_args!("    threadgroup float partial[32];"),
+    );
+    line(
+        &mut source,
+        format_args!("    threadgroup uint nan_partial[32];"),
+    );
+    line(
+        &mut source,
+        format_args!("    threadgroup float row_values[4];"),
+    );
+    emit_row_coordinates(&mut source, rank);
+
+    let instructions = &program.program().program().insts;
+    for (reduce_slot, (index, instruction)) in instructions
+        .iter()
+        .enumerate()
+        .filter_map(|(index, instruction)| match instruction {
+            Inst::Reduce(op, operand) => Some((index, (*op, *operand))),
+            _ => None,
+        })
+        .enumerate()
+    {
+        emit_reduce_stage(
+            &mut source,
+            program,
+            index,
+            reduce_slot,
+            instruction.0,
+            instruction.1,
+            rank,
+        );
+    }
+    emit_output_stage(&mut source, program, rank);
+    line(&mut source, format_args!("}}"));
+    source
+}
+
+fn emit_operand_parameters(source: &mut String, input_count: usize, output_count: usize) {
+    let operand_count = input_count + output_count;
+    for slot in 0..input_count {
+        line(
+            source,
+            format_args!("    device const uchar *input{slot} [[buffer({slot})]],"),
+        );
+    }
+    for slot in 0..output_count {
+        let buffer = input_count + slot;
+        line(
+            source,
+            format_args!("    device uchar *output{slot} [[buffer({buffer})]],"),
+        );
+    }
+    for slot in 0..input_count {
+        let buffer = operand_count + slot;
+        line(
+            source,
+            format_args!("    constant TensorLayout &input{slot}_layout [[buffer({buffer})]],"),
+        );
+    }
+    for slot in 0..output_count {
+        let buffer = operand_count + input_count + slot;
+        line(
+            source,
+            format_args!("    constant TensorLayout &output{slot}_layout [[buffer({buffer})]],"),
+        );
+    }
+}
+
+fn emit_row_coordinates(source: &mut String, rank: usize) {
+    let last = rank - 1;
+    line(
+        source,
+        format_args!("    uint width = output0_layout.shape[{last}];"),
+    );
+    if rank > 1 {
+        line(source, format_args!("    uint remaining = row;"));
+        for axis in (0..last).rev() {
+            line(
+                source,
+                format_args!("    uint coord{axis} = remaining % output0_layout.shape[{axis}];"),
+            );
+            if axis > 0 {
+                line(
+                    source,
+                    format_args!("    remaining /= output0_layout.shape[{axis}];"),
+                );
+            }
+        }
+    }
+}
+
+fn emit_reduce_stage(
+    source: &mut String,
+    program: &BoundProgram,
+    instruction_end: usize,
+    reduce_slot: usize,
+    op: RedOp,
+    operand: u32,
+    rank: usize,
+) {
+    let identity = match op {
+        RedOp::Sum => "0.0f",
+        RedOp::Max => "-INFINITY",
+        RedOp::Min => "INFINITY",
+    };
+    line(source, format_args!("    {{"));
+    line(
+        source,
+        format_args!("        float accumulator = {identity};"),
+    );
+    line(
+        source,
+        format_args!("        bool accumulator_nan = false;"),
+    );
+    line(
+        source,
+        format_args!("        for (uint column = lane; column < width; column += group_width) {{"),
+    );
+    emit_lane_coordinates(source, rank, 12);
+    emit_addresses_indented(
+        source,
+        program.inputs().len(),
+        program.outputs().len(),
+        rank,
+        12,
+    );
+    emit_values(source, program, instruction_end, 12);
+    line(
+        source,
+        format_args!("            accumulator_nan = accumulator_nan || isnan(v{operand});"),
+    );
+    let combine = match op {
+        RedOp::Sum => format!("accumulator + v{operand}"),
+        RedOp::Max => format!("max(accumulator, v{operand})"),
+        RedOp::Min => format!("min(accumulator, v{operand})"),
+    };
+    line(source, format_args!("            accumulator = {combine};"));
+    line(source, format_args!("        }}"));
+    let simd_reduce = match op {
+        RedOp::Sum => "simd_sum",
+        RedOp::Max => "simd_max",
+        RedOp::Min => "simd_min",
+    };
+    emit_threadgroup_reduce(source, reduce_slot, identity, simd_reduce);
+    line(source, format_args!("    }}"));
+}
+
+fn emit_threadgroup_reduce(
+    source: &mut String,
+    reduce_slot: usize,
+    identity: &str,
+    simd_reduce: &str,
+) {
+    line(
+        source,
+        format_args!("        accumulator = {simd_reduce}(accumulator);"),
+    );
+    line(
+        source,
+        format_args!("        accumulator_nan = simd_any(accumulator_nan);"),
+    );
+    line(source, format_args!("        if (simd_group == 0) {{"));
+    line(
+        source,
+        format_args!("            partial[simd_lane] = {identity};"),
+    );
+    line(
+        source,
+        format_args!("            nan_partial[simd_lane] = 0u;"),
+    );
+    line(source, format_args!("        }}"));
+    line(
+        source,
+        format_args!("        threadgroup_barrier(mem_flags::mem_threadgroup);"),
+    );
+    line(source, format_args!("        if (simd_lane == 0) {{"));
+    line(
+        source,
+        format_args!("            partial[simd_group] = accumulator;"),
+    );
+    line(
+        source,
+        format_args!("            nan_partial[simd_group] = uint(accumulator_nan);"),
+    );
+    line(source, format_args!("        }}"));
+    line(
+        source,
+        format_args!("        threadgroup_barrier(mem_flags::mem_threadgroup);"),
+    );
+    line(source, format_args!("        if (simd_group == 0) {{"));
+    line(
+        source,
+        format_args!("            accumulator = {simd_reduce}(partial[simd_lane]);"),
+    );
+    line(
+        source,
+        format_args!("            accumulator_nan = simd_any(nan_partial[simd_lane] != 0u);"),
+    );
+    line(source, format_args!("            if (simd_lane == 0) {{"));
+    line(
+        source,
+        format_args!(
+            "                row_values[{reduce_slot}] = select(accumulator, as_type<float>(0x7fc00000u), accumulator_nan);"
+        ),
+    );
+    line(source, format_args!("            }}"));
+    line(source, format_args!("        }}"));
+    line(
+        source,
+        format_args!("        threadgroup_barrier(mem_flags::mem_threadgroup);"),
+    );
+}
+
+fn emit_output_stage(source: &mut String, program: &BoundProgram, rank: usize) {
+    line(
+        source,
+        format_args!("    for (uint column = lane; column < width; column += group_width) {{"),
+    );
+    emit_lane_coordinates(source, rank, 8);
+    emit_addresses_indented(
+        source,
+        program.inputs().len(),
+        program.outputs().len(),
+        rank,
+        8,
+    );
+    emit_values(source, program, program.program().program().insts.len(), 8);
+    for &(slot, value) in &program.program().program().outputs {
+        let slot = usize::try_from(slot).unwrap_or(usize::MAX);
+        let expression = if program.outputs()[slot].layout().dtype() == DType::BF16 {
+            format!("store_bfloat_bits(output{slot}, output_address{slot}, v{value});")
+        } else {
+            format!(
+                "store_float(output{slot}, output_address{slot}, {}, v{value});",
+                output_dtype_name(slot)
+            )
+        };
+        line(source, format_args!("        {expression}"));
+    }
+    line(source, format_args!("    }}"));
+}
+
+fn emit_lane_coordinates(source: &mut String, rank: usize, indent: usize) {
+    line(
+        source,
+        format_args!("{:indent$}uint coord{} = column;", "", rank - 1),
+    );
+}
+
+fn emit_addresses_indented(
+    source: &mut String,
+    input_count: usize,
+    output_count: usize,
+    rank: usize,
+    indent: usize,
+) {
+    for (name, slot) in operands(input_count, output_count) {
+        line(
+            source,
+            format_args!(
+                "{:indent$}ulong {name}_address{slot} = {};",
+                "",
+                address_expression(&format!("{name}{slot}_layout"), rank)
+            ),
+        );
+    }
+}
+
+fn emit_values(source: &mut String, program: &BoundProgram, end: usize, indent: usize) {
+    let mut types = Vec::with_capacity(end);
+    let mut reduction = 0;
+    for (index, &instruction) in program.program().program().insts[..end].iter().enumerate() {
+        if matches!(instruction, Inst::Reduce(_, _)) {
+            types.push(ValueType::F32);
+            line(
+                source,
+                format_args!("{:indent$}float v{index} = row_values[{reduction}];", ""),
+            );
+            reduction += 1;
+            continue;
+        }
+        let (value_type, expression) =
+            instruction_expression(instruction, program.inputs(), &types);
+        types.push(value_type);
+        line(
+            source,
+            format_args!(
+                "{:indent$}{} v{index} = {expression};",
+                "",
+                type_name(value_type)
+            ),
+        );
+    }
 }
 
 fn address_expression(layout: &str, rank: usize) -> String {
@@ -318,10 +618,10 @@ fn line(source: &mut String, arguments: fmt::Arguments<'_>) {
 mod tests {
     use forja_core::{
         DType,
-        program::{BinOp, Inst, Program, ProgramKind, UnOp, ValueType, bind_program},
+        program::{BinOp, Inst, Program, ProgramKind, RedOp, UnOp, ValueType, bind_program},
     };
     use forja_cpu::CpuBackend;
-    use forja_testing::{TensorSpec, program::map_programs};
+    use forja_testing::{TensorSpec, program::well_typed_programs};
     use proptest::prelude::*;
 
     use super::*;
@@ -396,14 +696,97 @@ kernel void forja_map(
         assert!(source.contains("precise::exp(v3)"));
     }
 
+    #[test]
+    fn row_sum_has_stable_source() {
+        let source = source(
+            &Program {
+                kind: ProgramKind::Row,
+                insts: vec![Inst::Input(0), Inst::Reduce(RedOp::Sum, 0)],
+                outputs: vec![(0, 1)],
+            },
+            &[DType::F32],
+            &[DType::F32],
+            &[7],
+        );
+        assert_eq!(
+            source.strip_prefix(SHARED_HEADER).unwrap(),
+            r"
+kernel void forja_row(
+    device const uchar *input0 [[buffer(0)]],
+    device uchar *output0 [[buffer(1)]],
+    constant TensorLayout &input0_layout [[buffer(2)]],
+    constant TensorLayout &output0_layout [[buffer(3)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint lane [[thread_position_in_threadgroup]],
+    uint group_width [[threads_per_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float partial[32];
+    threadgroup uint nan_partial[32];
+    threadgroup float row_values[4];
+    uint width = output0_layout.shape[0];
+    {
+        float accumulator = 0.0f;
+        bool accumulator_nan = false;
+        for (uint column = lane; column < width; column += group_width) {
+            uint coord0 = column;
+            ulong input_address0 = input0_layout.offset + ulong(coord0) * input0_layout.strides[0];
+            ulong output_address0 = output0_layout.offset + ulong(coord0) * output0_layout.strides[0];
+            float v0 = load_float(input0, input_address0, input0_dtype);
+            accumulator_nan = accumulator_nan || isnan(v0);
+            accumulator = accumulator + v0;
+        }
+        accumulator = simd_sum(accumulator);
+        accumulator_nan = simd_any(accumulator_nan);
+        if (simd_group == 0) {
+            partial[simd_lane] = 0.0f;
+            nan_partial[simd_lane] = 0u;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (simd_lane == 0) {
+            partial[simd_group] = accumulator;
+            nan_partial[simd_group] = uint(accumulator_nan);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (simd_group == 0) {
+            accumulator = simd_sum(partial[simd_lane]);
+            accumulator_nan = simd_any(nan_partial[simd_lane] != 0u);
+            if (simd_lane == 0) {
+                row_values[0] = select(accumulator, as_type<float>(0x7fc00000u), accumulator_nan);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for (uint column = lane; column < width; column += group_width) {
+        uint coord0 = column;
+        ulong input_address0 = input0_layout.offset + ulong(coord0) * input0_layout.strides[0];
+        ulong output_address0 = output0_layout.offset + ulong(coord0) * output0_layout.strides[0];
+        float v0 = load_float(input0, input_address0, input0_dtype);
+        float v1 = row_values[0];
+        store_float(output0, output_address0, output_dtype, v1);
+    }
+}
+"
+        );
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(32))]
 
         #[test]
-        fn addresses_never_depend_on_program_values(case in map_programs(64)) {
+        fn addresses_never_depend_on_program_values(
+            case in well_typed_programs(64),
+            resident in any::<bool>(),
+        ) {
             let inputs = case.inputs().iter().map(TensorSpec::dtype).collect::<Vec<_>>();
             let outputs = case.outputs().iter().map(TensorSpec::dtype).collect::<Vec<_>>();
-            let source = source(case.program(), &inputs, &outputs, case.shape());
+            let source = bound_source(
+                case.program(),
+                &inputs,
+                &outputs,
+                case.shape(),
+                resident,
+            );
             for line in source
                 .lines()
                 .filter(|line| line.contains("ulong ") && line.contains("_address"))
@@ -440,6 +823,6 @@ kernel void forja_map(
             &outputs.iter().collect::<Vec<_>>(),
         )
         .unwrap();
-        generate(&bound).unwrap()
+        generate(&bound)
     }
 }

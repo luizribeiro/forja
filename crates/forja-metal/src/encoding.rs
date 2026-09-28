@@ -3541,8 +3541,7 @@ impl PipelineCache {
         if let Some(pipeline) = self.programs.get(&key) {
             return Ok(pipeline.clone());
         }
-        let source =
-            map_codegen::generate(program).map_err(|_| BackendError::UnsupportedOperation)?;
+        let source = map_codegen::generate(program);
         let pipeline = self.compile_program_source(&key, &source)?;
         self.programs.insert(key, pipeline.clone());
         Ok(pipeline)
