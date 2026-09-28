@@ -5,12 +5,22 @@
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
 use syn::{
-    Data, DeriveInput, Expr, Field, Fields, GenericArgument, ItemImpl, LitStr, PathArguments, Type,
-    parse_macro_input,
+    Data, DeriveInput, Expr, Field, Fields, GenericArgument, ItemFn, ItemImpl, LitStr,
+    PathArguments, Type, parse_macro_input,
 };
+
+mod kernel;
 
 const COMPUTE_WIT: &str = include_str!("../../../wit/compute.wit");
 const ENGINE_WIT: &str = include_str!("../../../wit/engine.wit");
+
+/// Defines a restricted Rust-syntax scalar kernel.
+#[proc_macro_attribute]
+pub fn kernel(attribute: TokenStream, item: TokenStream) -> TokenStream {
+    kernel::expand(attribute.into(), parse_macro_input!(item as ItemFn))
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
 
 /// Exports one `forja_sdk::Engine` implementation as a component.
 #[proc_macro_attribute]

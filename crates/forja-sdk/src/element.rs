@@ -18,6 +18,9 @@ pub trait Element: sealed::Sealed + Copy + 'static {
     fn decode(bytes: &[u8]) -> Result<Vec<Self>>;
 }
 
+/// A floating-point tensor storage element.
+pub trait FloatElement: Element {}
+
 macro_rules! element {
     ($type:ty, $dtype:literal, $width:literal) => {
         impl sealed::Sealed for $type {}
@@ -51,3 +54,7 @@ element!(f16, 1, 2);
 element!(bf16, 2, 2);
 element!(u32, 3, 4);
 element!(i32, 4, 4);
+
+impl FloatElement for f32 {}
+impl FloatElement for f16 {}
+impl FloatElement for bf16 {}

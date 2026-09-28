@@ -2,12 +2,107 @@
 
 use std::{cell::RefCell, collections::VecDeque, marker::PhantomData};
 
-use crate::{DType, Result};
+use crate::{DType, Element, Error, FloatElement, Result, Tensor, graph, sys};
 
 pub use crate::program::Kernel;
+pub use forja_sdk_macros::kernel;
 
 /// Maximum number of prepared signatures retained by one kernel definition.
 pub const CACHE_CAPACITY: usize = 16;
+
+/// A type-erased tensor binding used by generated kernels.
+#[doc(hidden)]
+#[derive(Clone, Copy)]
+pub struct TensorRef<'a> {
+    handle: &'a sys::Handle,
+    shape: &'a [u32],
+    dtype: DType,
+}
+
+impl<'a> TensorRef<'a> {
+    /// Erases a tensor's storage element while retaining its checked metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the tensor's element type has no kernel dtype.
+    pub fn new<T: Element>(tensor: &'a Tensor<T>) -> Result<Self> {
+        Ok(Self {
+            handle: tensor.handle(),
+            shape: tensor.shape(),
+            dtype: sys::dtype(T::DTYPE)?,
+        })
+    }
+
+    /// Returns the tensor's storage type.
+    #[must_use]
+    pub const fn dtype(self) -> DType {
+        self.dtype
+    }
+}
+
+/// Dispatches a generated kernel into newly allocated outputs.
+#[doc(hidden)]
+pub fn run<T: FloatElement, const N: usize>(
+    kernel: &Kernel,
+    inputs: &[TensorRef<'_>],
+) -> Result<[Tensor<T>; N]> {
+    let shape = inputs
+        .first()
+        .ok_or_else(|| Error::new("kernel requires at least one tensor input"))?
+        .shape;
+    let outputs = (0..N)
+        .map(|_| Tensor::<T>::empty(shape.to_vec()))
+        .collect::<Result<Vec<_>>>()?;
+    let output_refs = outputs
+        .iter()
+        .map(TensorRef::new)
+        .collect::<Result<Vec<_>>>()?;
+    run_into(kernel, inputs, &output_refs)?;
+    outputs
+        .try_into()
+        .map_err(|_| Error::new("kernel allocated an unexpected output count"))
+}
+
+/// Dispatches a generated kernel into caller-supplied output views.
+#[doc(hidden)]
+pub fn run_into(
+    kernel: &Kernel,
+    inputs: &[TensorRef<'_>],
+    outputs: &[TensorRef<'_>],
+) -> Result<()> {
+    check_bindings(kernel, inputs, outputs)?;
+    let input_handles = inputs
+        .iter()
+        .map(|binding| binding.handle)
+        .collect::<Vec<_>>();
+    let output_handles = outputs
+        .iter()
+        .map(|binding| binding.handle)
+        .collect::<Vec<_>>();
+    graph::record_kernel(&kernel.handle, &input_handles, &output_handles)
+}
+
+fn check_bindings(
+    kernel: &Kernel,
+    inputs: &[TensorRef<'_>],
+    outputs: &[TensorRef<'_>],
+) -> Result<()> {
+    let rank = inputs
+        .first()
+        .and_then(|input| u8::try_from(input.shape.len()).ok())
+        .ok_or_else(|| Error::new("kernel tensor rank is invalid"))?;
+    let input_dtypes = inputs.iter().map(|input| input.dtype).collect::<Vec<_>>();
+    let output_dtypes = outputs
+        .iter()
+        .map(|output| output.dtype)
+        .collect::<Vec<_>>();
+    if rank != kernel.rank || input_dtypes != kernel.inputs || output_dtypes != kernel.outputs {
+        return Err(Error::new(
+            "kernel tensor bindings do not match its signature",
+        ));
+    }
+    Ok(())
+}
 
 /// A row-kernel tensor parameter in `#[kernel]` syntax.
 ///
@@ -214,5 +309,21 @@ mod tests {
         }
 
         assert!(handle.upgrade().is_none());
+    }
+
+    #[test]
+    fn dispatches_mixed_storage_types() {
+        let context = Ctx::new();
+        context.output(0, context.input(0) + context.input_u32(1).cast_f32());
+        let kernel = Kernel::new(&context, 1, &[DType::F32, DType::U32], &[DType::F32]).unwrap();
+        let floats = Tensor::from_slice(&[1.0_f32, 2.0], &[2]).unwrap();
+        let integers = Tensor::from_slice(&[3_u32, 4], &[2]).unwrap();
+        let inputs = [
+            TensorRef::new(&floats).unwrap(),
+            TensorRef::new(&integers).unwrap(),
+        ];
+        let [output] = run::<f32, 1>(&kernel, &inputs).unwrap();
+
+        assert_eq!(output.to_vec().unwrap(), [4.0, 6.0]);
     }
 }

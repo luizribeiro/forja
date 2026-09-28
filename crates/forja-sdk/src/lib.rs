@@ -89,10 +89,9 @@ mod tensor;
 
 use std::{error, fmt};
 
-pub use element::Element;
+pub use element::{Element, FloatElement};
 pub use engine::{Engine, EngineInfo, StepInput, StepOutput};
-pub use forja_sdk_macros::Load;
-pub use forja_sdk_macros::export_engine;
+pub use forja_sdk_macros::{Load, export_engine, kernel};
 pub use graph::eval;
 pub use half::{bf16, f16};
 pub use load::{Load, Weights};

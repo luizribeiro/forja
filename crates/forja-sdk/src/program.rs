@@ -103,6 +103,8 @@ pub struct Kernel {
     pub(crate) rank: u8,
     pub(crate) inputs: Vec<DType>,
     pub(crate) outputs: Vec<DType>,
+    #[cfg(feature = "native")]
+    validated: forja_core::program::ValidatedProgram,
 }
 
 impl Kernel {
@@ -119,13 +121,25 @@ impl Kernel {
         output_dtypes: &[DType],
     ) -> Result<Self> {
         let definition = program.definition(usize::from(rank))?;
+        #[cfg(feature = "native")]
+        let validated = crate::sys::native::core_program(definition.clone())?;
         let handle = sys::create_kernel(definition, rank, input_dtypes, output_dtypes)?;
         Ok(Self {
             handle: Rc::new(handle),
             rank,
             inputs: input_dtypes.to_vec(),
             outputs: output_dtypes.to_vec(),
+            #[cfg(feature = "native")]
+            validated,
         })
+    }
+
+    /// Returns the validated program retained by a native prepared kernel.
+    #[cfg(feature = "native")]
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn validated_program(&self) -> &forja_core::program::ValidatedProgram {
+        &self.validated
     }
 }
 
