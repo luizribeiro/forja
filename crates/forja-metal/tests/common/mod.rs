@@ -2,6 +2,17 @@ use std::time::Duration;
 
 use forja_core::{Backend, CommandList, Submission};
 use forja_metal::MetalBackend;
+use forja_testing::PredicateReport;
+
+pub fn report_predicates(report: PredicateReport) {
+    eprintln!(
+        "predicate-oracle ambiguous={} alternate={} excluded={} total={}",
+        report.ambiguous_predicates,
+        report.alternate_elements,
+        report.excluded_elements,
+        report.total_elements,
+    );
+}
 
 pub fn median_gpu_time(
     backend: &MetalBackend,

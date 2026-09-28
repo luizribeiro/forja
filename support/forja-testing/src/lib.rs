@@ -188,6 +188,26 @@ pub enum AgreementError {
     },
     /// Candidate integer output differed from the reference bytes.
     OutputMismatch,
+    /// Too many output elements exceeded the predicate-candidate cap.
+    ExcessivePredicateExclusions {
+        /// Output elements excluded from numeric comparison.
+        excluded: usize,
+        /// Total output elements considered by the oracle.
+        total: usize,
+    },
+}
+
+/// Predicate-ambiguity activity observed while comparing one generated program.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PredicateReport {
+    /// Ambiguous floating-point predicate evaluations.
+    pub ambiguous_predicates: usize,
+    /// Output elements matched through an alternate predicate branch.
+    pub alternate_elements: usize,
+    /// Output elements excluded after exceeding the candidate cap.
+    pub excluded_elements: usize,
+    /// Total output elements examined.
+    pub total_elements: usize,
 }
 
 impl fmt::Display for AgreementError {
@@ -348,7 +368,7 @@ pub fn assert_program_backends_agree<R, C>(
     reference: &R,
     candidate: &C,
     case: &program::ProgramCase,
-) -> Result<(), Box<dyn Error>>
+) -> Result<PredicateReport, Box<dyn Error>>
 where
     R: Backend,
     C: Backend,
@@ -377,58 +397,118 @@ where
     let row_tolerances = (case.program().kind == forja_core::program::ProgramKind::Row)
         .then(|| program::row_reduction_tolerances(case, &input_bytes))
         .transpose()?;
+    let predicate_candidates = program::predicate_candidates(case, &input_bytes)?;
+    let mut report = PredicateReport {
+        ambiguous_predicates: predicate_candidates.ambiguous_predicates,
+        ..PredicateReport::default()
+    };
     run_program(reference, &program, &reference_inputs, &reference_outputs)?;
     run_program(candidate, &program, &candidate_inputs, &candidate_outputs)?;
-    for ((spec, expected), actual) in case
+    for (output_slot, ((spec, expected), actual)) in case
         .outputs()
         .iter()
         .zip(reference_outputs)
         .zip(candidate_outputs)
+        .enumerate()
     {
         let expected = reference.read(&expected)?;
         let actual = candidate.read(&actual)?;
-        if let Some(tolerances) = &row_tolerances {
-            assert_output_rows_agree(
-                spec.dtype(),
-                &expected,
-                &actual,
+        let candidates = predicate_candidates
+            .outputs
+            .get(output_slot)
+            .ok_or(AgreementError::InvalidOutput)?;
+        let (width, tolerances) = if let Some(tolerances) = &row_tolerances {
+            (
                 *case.shape().last().ok_or(AgreementError::InvalidOutput)?,
-                tolerances,
-            )?;
+                tolerances.as_slice(),
+            )
         } else {
-            assert_outputs_agree(spec.dtype(), &expected, &actual)?;
-        }
+            (
+                u32::try_from(candidates.len()).map_err(|_| AgreementError::SizeOverflow)?,
+                &[0.0][..],
+            )
+        };
+        let output_report = assert_output_candidates_agree(
+            spec.dtype(),
+            &expected,
+            &actual,
+            width,
+            tolerances,
+            candidates,
+        )?;
+        report.alternate_elements += output_report.alternate_elements;
+        report.excluded_elements += output_report.excluded_elements;
+        report.total_elements += output_report.total_elements;
     }
-    Ok(())
+    let scaled_exclusions = report
+        .excluded_elements
+        .checked_mul(1000)
+        .ok_or(AgreementError::SizeOverflow)?;
+    if scaled_exclusions >= report.total_elements && report.excluded_elements != 0 {
+        return Err(AgreementError::ExcessivePredicateExclusions {
+            excluded: report.excluded_elements,
+            total: report.total_elements,
+        }
+        .into());
+    }
+    Ok(report)
 }
 
-fn assert_output_rows_agree(
+fn assert_output_candidates_agree(
     dtype: DType,
     expected_bytes: &[u8],
     actual_bytes: &[u8],
     width: u32,
     reduction_tolerances: &[f64],
-) -> Result<(), AgreementError> {
+    candidates: &[program::OutputCandidates],
+) -> Result<PredicateReport, AgreementError> {
     if matches!(dtype, DType::I32 | DType::U32) {
-        return (expected_bytes == actual_bytes)
-            .then_some(())
-            .ok_or(AgreementError::OutputMismatch);
+        return Err(AgreementError::UnsupportedDType(dtype));
     }
     let expected = decode(expected_bytes, dtype)?;
     let actual = decode(actual_bytes, dtype)?;
     let width = usize::try_from(width).map_err(|_| AgreementError::SizeOverflow)?;
     if expected.len() != actual.len()
+        || expected.len() != candidates.len()
         || expected.len() != width.saturating_mul(reduction_tolerances.len())
     {
         return Err(AgreementError::OutputMismatch);
     }
     let base_tolerance = dtype_tolerance(dtype)?;
-    for ((expected, actual), &reduction_tolerance) in expected
+    let mut report = PredicateReport {
+        total_elements: expected.len(),
+        ..PredicateReport::default()
+    };
+    for (((expected, actual), candidates), &reduction_tolerance) in expected
         .chunks_exact(width)
         .zip(actual.chunks_exact(width))
+        .zip(candidates.chunks_exact(width))
         .zip(reduction_tolerances)
     {
-        let (error, count) = compare_float_values(expected, actual);
+        let mut selected_expected = Vec::with_capacity(width);
+        let mut selected_actual = Vec::with_capacity(width);
+        for ((&expected, &actual), candidates) in expected.iter().zip(actual).zip(candidates) {
+            let program::OutputCandidates::Values(candidates) = candidates else {
+                report.excluded_elements += 1;
+                continue;
+            };
+            let mut best = expected;
+            let mut best_distance = candidate_distance(actual, expected);
+            for &candidate in candidates {
+                let candidate = quantize(candidate, dtype);
+                let distance = candidate_distance(actual, candidate);
+                if distance < best_distance {
+                    best = candidate;
+                    best_distance = distance;
+                }
+            }
+            if best.to_bits() != expected.to_bits() {
+                report.alternate_elements += 1;
+            }
+            selected_expected.push(best);
+            selected_actual.push(actual);
+        }
+        let (error, count) = compare_float_values(&selected_expected, &selected_actual);
         if count != 0 {
             return Err(AgreementError::ClassMismatch { count });
         }
@@ -437,7 +517,25 @@ fn assert_output_rows_agree(
             return Err(AgreementError::OutsideTolerance { error, tolerance });
         }
     }
-    Ok(())
+    Ok(report)
+}
+
+fn quantize(value: f32, dtype: DType) -> f32 {
+    match dtype {
+        DType::F32 | DType::I32 | DType::U32 => value,
+        DType::F16 => f16::from_f32(value).to_f32(),
+        DType::BF16 => bf16::from_f32(value).to_f32(),
+    }
+}
+
+fn candidate_distance(actual: f32, candidate: f32) -> f64 {
+    if actual.is_finite() && candidate.is_finite() {
+        (f64::from(actual) - f64::from(candidate)).abs()
+    } else if nonfinite_values_agree(actual, candidate) {
+        0.0
+    } else {
+        f64::INFINITY
+    }
 }
 
 /// Checks two encoded outputs using exact integer comparison or the dtype tolerance.

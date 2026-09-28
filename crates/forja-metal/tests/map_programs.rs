@@ -17,7 +17,7 @@ use forja_testing::{
 };
 use proptest::{prelude::*, test_runner::TestCaseError};
 
-use common::median_gpu_time;
+use common::{median_gpu_time, report_predicates};
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(32))]
@@ -27,8 +27,9 @@ proptest! {
         let cpu = CpuBackend::new();
         let metal = MetalBackend::new()
             .map_err(|error| TestCaseError::fail(error.to_string()))?;
-        assert_program_backends_agree(&cpu, &metal, &case)
+        let report = assert_program_backends_agree(&cpu, &metal, &case)
             .map_err(|error| TestCaseError::fail(error.to_string()))?;
+        report_predicates(report);
     }
 }
 

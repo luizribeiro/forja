@@ -6,12 +6,12 @@ use std::time::Duration;
 
 use forja_core::{
     Backend, CommandList, DType, Op, Slice, Submission, Tensor, ViewOp,
-    program::{Inst, Program, ProgramKind, RedOp, ValidatedProgram},
+    program::{BinOp, Inst, Program, ProgramKind, RedOp, UnOp, ValidatedProgram},
 };
 use forja_cpu::CpuBackend;
 use forja_metal::MetalBackend;
 use forja_testing::{
-    DeterministicValues, assert_outputs_agree, assert_program_backends_agree,
+    DeterministicValues, TensorSpec, assert_outputs_agree, assert_program_backends_agree,
     program::{ProgramCase, row_programs, stable_row_programs},
     representative::{qk_norm_rope, residual_rms_norm, rms_norm, softmax},
 };
@@ -20,7 +20,7 @@ use proptest::{
     test_runner::{FileFailurePersistence, RngSeed, TestCaseError},
 };
 
-use common::median_gpu_time;
+use common::{median_gpu_time, report_predicates};
 
 proptest! {
     #![proptest_config(row_program_config())]
@@ -64,8 +64,10 @@ fn row_program_config() -> ProptestConfig {
 fn compare_program(case: &ProgramCase) -> Result<(), TestCaseError> {
     let cpu = CpuBackend::new();
     let metal = MetalBackend::new().map_err(|error| TestCaseError::fail(error.to_string()))?;
-    assert_program_backends_agree(&cpu, &metal, case)
-        .map_err(|error| TestCaseError::fail(error.to_string()))
+    let report = assert_program_backends_agree(&cpu, &metal, case)
+        .map_err(|error| TestCaseError::fail(error.to_string()))?;
+    report_predicates(report);
+    Ok(())
 }
 
 #[test]
@@ -145,6 +147,38 @@ fn wide_constant_sum_fits_reduction_roundoff_bound() {
     assert!(cpu_error <= tolerance, "{cpu_error} > {tolerance}");
     assert!(metal_error <= tolerance, "{metal_error} > {tolerance}");
     assert!(metal_error < cpu_error);
+}
+
+#[test]
+fn ambiguous_tanh_predicate_accepts_either_branch() {
+    let mut values = vec![1.0_f32; 1024];
+    values[252] = 0.000_701_427_46;
+    let bytes = values
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect();
+    let case = ProgramCase::new(
+        Program {
+            kind: ProgramKind::Row,
+            insts: vec![
+                Inst::Input(0),
+                Inst::Const(-2.0),
+                Inst::Unary(UnOp::Tanh, 0),
+                Inst::Binary(BinOp::Le, 0, 2),
+                Inst::Select(3, 1, 0),
+            ],
+            outputs: vec![(0, 4)],
+        },
+        vec![1, 1024],
+        vec![TensorSpec::initialized(DType::F32, &[1, 1024], bytes)],
+        vec![TensorSpec::contiguous(DType::F16, &[1, 1024])],
+    );
+    let report =
+        assert_program_backends_agree(&CpuBackend::new(), &MetalBackend::new().unwrap(), &case)
+            .unwrap();
+    assert_eq!(report.ambiguous_predicates, 1);
+    assert_eq!(report.alternate_elements, 1);
+    assert_eq!(report.excluded_elements, 0);
 }
 
 #[test]

@@ -36,6 +36,22 @@ pub struct ProgramCase {
 }
 
 impl ProgramCase {
+    /// Creates a concrete program case for a differential regression test.
+    #[must_use]
+    pub fn new(
+        program: Program,
+        shape: Vec<u32>,
+        inputs: Vec<TensorSpec>,
+        outputs: Vec<TensorSpec>,
+    ) -> Self {
+        Self {
+            program,
+            shape,
+            inputs,
+            outputs,
+        }
+    }
+
     /// Returns the unvalidated program.
     #[must_use]
     pub const fn program(&self) -> &Program {
@@ -68,6 +84,45 @@ enum ExactScalar {
     Float(f64),
     U32(u32),
     Bool(bool),
+}
+
+const MAX_PREDICATE_CANDIDATES: usize = 8;
+// Each rounded arithmetic step contributes one ulp; precise transcendentals
+// get a conservative four-ulp allowance matching their observed few-ulp spread.
+const F32_OPERATION_ULP_BUDGET: u32 = 1;
+const TRANSCENDENTAL_ULP_BUDGET: u32 = 4;
+
+#[derive(Clone, Copy)]
+struct CandidateValue {
+    scalar: OracleScalar,
+    alternate: bool,
+}
+
+#[derive(Clone, Copy)]
+enum OracleScalar {
+    Float {
+        exact: f64,
+        rounded: f32,
+        ulp_budget: u32,
+    },
+    U32(u32),
+    Bool(bool),
+}
+
+#[derive(Clone)]
+enum CandidateSet {
+    Values(Vec<CandidateValue>),
+    Excluded,
+}
+
+pub(crate) enum OutputCandidates {
+    Values(Vec<f32>),
+    Excluded,
+}
+
+pub(crate) struct PredicateCandidates {
+    pub(crate) outputs: Vec<Vec<OutputCandidates>>,
+    pub(crate) ambiguous_predicates: usize,
 }
 
 pub(crate) fn row_reduction_tolerances(
@@ -122,6 +177,308 @@ pub(crate) fn row_reduction_tolerances(
         }
     }
     Ok(tolerances)
+}
+
+pub(crate) fn predicate_candidates(
+    case: &ProgramCase,
+    input_bytes: &[Vec<u8>],
+) -> Result<PredicateCandidates, AgreementError> {
+    let elements = element_count(&case.shape)?;
+    let scope_width = if case.program.kind == ProgramKind::Row {
+        usize::try_from(*case.shape.last().ok_or(AgreementError::InvalidOutput)?)
+            .map_err(|_| AgreementError::SizeOverflow)?
+    } else {
+        1
+    };
+    let scope_count = elements
+        .checked_div(scope_width)
+        .ok_or(AgreementError::InvalidOutput)?;
+    let inputs = case
+        .inputs
+        .iter()
+        .zip(input_bytes)
+        .map(|(spec, bytes)| logical_values(spec, bytes))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut outputs = (0..case.outputs.len())
+        .map(|_| Vec::with_capacity(elements))
+        .collect::<Vec<_>>();
+    let mut ambiguous_predicates = 0;
+    let mut coordinates = vec![0_u32; case.shape.len()];
+    for scope in 0..scope_count {
+        let start = scope
+            .checked_mul(scope_width)
+            .ok_or(AgreementError::SizeOverflow)?;
+        let mut columns = Vec::<Vec<CandidateSet>>::with_capacity(case.program.insts.len());
+        for &inst in &case.program.insts {
+            let column = if let Inst::Reduce(op, operand) = inst {
+                let values = columns
+                    .get(usize::try_from(operand).map_err(|_| AgreementError::InvalidOutput)?)
+                    .ok_or(AgreementError::InvalidOutput)?;
+                vec![candidate_reduce(op, values)?; scope_width]
+            } else {
+                let mut column = Vec::with_capacity(scope_width);
+                for lane in 0..scope_width {
+                    let linear = start
+                        .checked_add(lane)
+                        .ok_or(AgreementError::SizeOverflow)?;
+                    decode_coordinates(linear, &case.shape, &mut coordinates)?;
+                    column.push(candidate_eval(
+                        inst,
+                        &coordinates,
+                        &case.shape,
+                        &inputs,
+                        linear,
+                        |operand| candidate_column_value(&columns, operand, lane),
+                        &mut ambiguous_predicates,
+                    )?);
+                }
+                column
+            };
+            columns.push(column);
+        }
+        for &(slot, value) in &case.program.outputs {
+            let output = outputs
+                .get_mut(usize::try_from(slot).map_err(|_| AgreementError::InvalidOutput)?)
+                .ok_or(AgreementError::InvalidOutput)?;
+            let column = columns
+                .get(usize::try_from(value).map_err(|_| AgreementError::InvalidOutput)?)
+                .ok_or(AgreementError::InvalidOutput)?;
+            for candidates in column {
+                output.push(output_candidates(candidates)?);
+            }
+        }
+    }
+    Ok(PredicateCandidates {
+        outputs,
+        ambiguous_predicates,
+    })
+}
+
+fn candidate_eval<'a>(
+    inst: Inst,
+    coordinates: &[u32],
+    shape: &[u32],
+    inputs: &[Vec<ExactScalar>],
+    linear: usize,
+    operand: impl Fn(u32) -> Result<&'a CandidateSet, AgreementError>,
+    ambiguous_predicates: &mut usize,
+) -> Result<CandidateSet, AgreementError> {
+    match inst {
+        Inst::Input(slot) => inputs
+            .get(usize::try_from(slot).map_err(|_| AgreementError::InvalidOutput)?)
+            .and_then(|input| input.get(linear))
+            .copied()
+            .map(oracle_from_exact)
+            .map(CandidateSet::singleton)
+            .ok_or(AgreementError::InvalidOutput),
+        Inst::Const(value) => Ok(CandidateSet::singleton(OracleScalar::Float {
+            exact: f64::from(value),
+            rounded: value,
+            ulp_budget: 0,
+        })),
+        Inst::Index(axis) => coordinates
+            .get(usize::from(axis))
+            .copied()
+            .map(OracleScalar::U32)
+            .map(CandidateSet::singleton)
+            .ok_or(AgreementError::InvalidOutput),
+        Inst::Extent(axis) => shape
+            .get(usize::from(axis))
+            .copied()
+            .map(OracleScalar::U32)
+            .map(CandidateSet::singleton)
+            .ok_or(AgreementError::InvalidOutput),
+        Inst::Unary(op, value) => candidate_unary(op, operand(value)?),
+        Inst::Binary(op, left, right) => candidate_binary(
+            op,
+            operand(left)?,
+            operand(right)?,
+            left != right,
+            ambiguous_predicates,
+        ),
+        Inst::Select(condition, accepted, rejected) => {
+            candidate_select(operand(condition)?, operand(accepted)?, operand(rejected)?)
+        }
+        Inst::Cast(to, value) => Ok(candidate_cast(to, operand(value)?)),
+        Inst::Reduce(_, _) => Err(AgreementError::InvalidOutput),
+    }
+}
+
+impl CandidateSet {
+    fn singleton(scalar: OracleScalar) -> Self {
+        Self::Values(vec![CandidateValue {
+            scalar,
+            alternate: false,
+        }])
+    }
+
+    fn push(&mut self, value: CandidateValue) {
+        let Self::Values(values) = self else {
+            return;
+        };
+        if let Some(existing) = values
+            .iter_mut()
+            .find(|candidate| same_oracle_scalar(candidate.scalar, value.scalar))
+        {
+            existing.alternate &= value.alternate;
+            existing.scalar = merge_oracle_budget(existing.scalar, value.scalar);
+        } else if values.len() == MAX_PREDICATE_CANDIDATES {
+            *self = Self::Excluded;
+        } else {
+            values.push(value);
+        }
+    }
+}
+
+fn candidate_unary(op: UnOp, input: &CandidateSet) -> Result<CandidateSet, AgreementError> {
+    let CandidateSet::Values(values) = input else {
+        return Ok(CandidateSet::Excluded);
+    };
+    let mut result = CandidateSet::Values(Vec::new());
+    for value in values {
+        result.push(CandidateValue {
+            scalar: oracle_unary(op, value.scalar)?,
+            alternate: value.alternate,
+        });
+    }
+    Ok(result)
+}
+
+fn candidate_binary(
+    op: BinOp,
+    left: &CandidateSet,
+    right: &CandidateSet,
+    allow_ambiguity: bool,
+    ambiguous_predicates: &mut usize,
+) -> Result<CandidateSet, AgreementError> {
+    let (CandidateSet::Values(left), CandidateSet::Values(right)) = (left, right) else {
+        return Ok(CandidateSet::Excluded);
+    };
+    let mut result = CandidateSet::Values(Vec::new());
+    let mut ambiguous = false;
+    for left in left {
+        for right in right {
+            let scalar = oracle_binary(op, left.scalar, right.scalar)?;
+            let inherited = left.alternate || right.alternate;
+            result.push(CandidateValue {
+                scalar,
+                alternate: inherited,
+            });
+            if allow_ambiguity && comparison_is_ambiguous(op, left.scalar, right.scalar) {
+                let OracleScalar::Bool(value) = scalar else {
+                    return Err(AgreementError::InvalidOutput);
+                };
+                result.push(CandidateValue {
+                    scalar: OracleScalar::Bool(!value),
+                    alternate: true,
+                });
+                ambiguous = true;
+            }
+        }
+    }
+    *ambiguous_predicates += usize::from(ambiguous);
+    Ok(result)
+}
+
+fn candidate_select(
+    condition: &CandidateSet,
+    accepted: &CandidateSet,
+    rejected: &CandidateSet,
+) -> Result<CandidateSet, AgreementError> {
+    let CandidateSet::Values(conditions) = condition else {
+        return Ok(CandidateSet::Excluded);
+    };
+    let mut result = CandidateSet::Values(Vec::new());
+    for condition in conditions {
+        let OracleScalar::Bool(condition_value) = condition.scalar else {
+            return Err(AgreementError::InvalidOutput);
+        };
+        let branch = if condition_value { accepted } else { rejected };
+        let CandidateSet::Values(values) = branch else {
+            return Ok(CandidateSet::Excluded);
+        };
+        for value in values {
+            result.push(CandidateValue {
+                scalar: value.scalar,
+                alternate: condition.alternate || value.alternate,
+            });
+        }
+    }
+    Ok(result)
+}
+
+fn candidate_cast(to: ValueType, input: &CandidateSet) -> CandidateSet {
+    let CandidateSet::Values(values) = input else {
+        return CandidateSet::Excluded;
+    };
+    let mut result = CandidateSet::Values(Vec::new());
+    for value in values {
+        result.push(CandidateValue {
+            scalar: oracle_cast(to, value.scalar),
+            alternate: value.alternate,
+        });
+    }
+    result
+}
+
+fn candidate_reduce(op: RedOp, lanes: &[CandidateSet]) -> Result<CandidateSet, AgreementError> {
+    let identity = OracleScalar::Float {
+        exact: match op {
+            RedOp::Sum => 0.0,
+            RedOp::Max => f64::NEG_INFINITY,
+            RedOp::Min => f64::INFINITY,
+        },
+        rounded: match op {
+            RedOp::Sum => 0.0,
+            RedOp::Max => f32::NEG_INFINITY,
+            RedOp::Min => f32::INFINITY,
+        },
+        ulp_budget: 0,
+    };
+    let mut result = CandidateSet::singleton(identity);
+    for lane in lanes {
+        let (CandidateSet::Values(accumulators), CandidateSet::Values(values)) = (&result, lane)
+        else {
+            return Ok(CandidateSet::Excluded);
+        };
+        let mut next = CandidateSet::Values(Vec::new());
+        for accumulator in accumulators {
+            for value in values {
+                next.push(CandidateValue {
+                    scalar: oracle_reduce(op, accumulator.scalar, value.scalar)?,
+                    alternate: accumulator.alternate || value.alternate,
+                });
+            }
+        }
+        result = next;
+    }
+    Ok(result)
+}
+
+fn candidate_column_value(
+    columns: &[Vec<CandidateSet>],
+    operand: u32,
+    lane: usize,
+) -> Result<&CandidateSet, AgreementError> {
+    columns
+        .get(usize::try_from(operand).map_err(|_| AgreementError::InvalidOutput)?)
+        .and_then(|column| column.get(lane))
+        .ok_or(AgreementError::InvalidOutput)
+}
+
+fn output_candidates(candidates: &CandidateSet) -> Result<OutputCandidates, AgreementError> {
+    let CandidateSet::Values(values) = candidates else {
+        return Ok(OutputCandidates::Excluded);
+    };
+    values
+        .iter()
+        .filter(|value| value.alternate)
+        .map(|value| match value.scalar {
+            OracleScalar::Float { rounded, .. } => Ok(rounded),
+            OracleScalar::U32(_) | OracleScalar::Bool(_) => Err(AgreementError::InvalidOutput),
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(OutputCandidates::Values)
 }
 
 fn sum_tolerance(values: &[ExactScalar]) -> Result<f64, AgreementError> {
@@ -383,6 +740,315 @@ fn exact_column_value(
         .ok_or(AgreementError::InvalidOutput)
 }
 
+fn oracle_from_exact(value: ExactScalar) -> OracleScalar {
+    match value {
+        ExactScalar::Float(value) => OracleScalar::Float {
+            exact: value,
+            #[allow(clippy::cast_possible_truncation)]
+            rounded: value as f32,
+            ulp_budget: 0,
+        },
+        ExactScalar::U32(value) => OracleScalar::U32(value),
+        ExactScalar::Bool(value) => OracleScalar::Bool(value),
+    }
+}
+
+fn oracle_unary(op: UnOp, value: OracleScalar) -> Result<OracleScalar, AgreementError> {
+    let OracleScalar::Float {
+        exact,
+        rounded,
+        ulp_budget,
+    } = value
+    else {
+        return Err(AgreementError::InvalidOutput);
+    };
+    Ok(OracleScalar::Float {
+        exact: match op {
+            UnOp::Neg => -exact,
+            UnOp::Abs => exact.abs(),
+            UnOp::Exp => exact.exp(),
+            UnOp::Log => exact.ln(),
+            UnOp::Sqrt => exact.sqrt(),
+            UnOp::Rsqrt => exact.sqrt().recip(),
+            UnOp::Sin => exact.sin(),
+            UnOp::Cos => exact.cos(),
+            UnOp::Tanh => exact.tanh(),
+            UnOp::Sigmoid => 1.0 / (1.0 + (-exact).exp()),
+            UnOp::Recip => exact.recip(),
+            UnOp::Floor => exact.floor(),
+        },
+        rounded: match op {
+            UnOp::Neg => -rounded,
+            UnOp::Abs => rounded.abs(),
+            UnOp::Exp => rounded.exp(),
+            UnOp::Log => rounded.ln(),
+            UnOp::Sqrt => rounded.sqrt(),
+            UnOp::Rsqrt => rounded.sqrt().recip(),
+            UnOp::Sin => rounded.sin(),
+            UnOp::Cos => rounded.cos(),
+            UnOp::Tanh => rounded.tanh(),
+            UnOp::Sigmoid => 1.0 / (1.0 + (-rounded).exp()),
+            UnOp::Recip => rounded.recip(),
+            UnOp::Floor => rounded.floor(),
+        },
+        ulp_budget: ulp_budget.saturating_add(match op {
+            UnOp::Neg | UnOp::Abs | UnOp::Floor => 0,
+            UnOp::Recip => F32_OPERATION_ULP_BUDGET,
+            UnOp::Exp
+            | UnOp::Log
+            | UnOp::Sqrt
+            | UnOp::Rsqrt
+            | UnOp::Sin
+            | UnOp::Cos
+            | UnOp::Tanh
+            | UnOp::Sigmoid => TRANSCENDENTAL_ULP_BUDGET,
+        }),
+    })
+}
+
+#[allow(clippy::float_cmp)]
+fn oracle_binary(
+    op: BinOp,
+    left: OracleScalar,
+    right: OracleScalar,
+) -> Result<OracleScalar, AgreementError> {
+    match (left, right) {
+        (
+            OracleScalar::Float {
+                exact: left_exact,
+                rounded: left_rounded,
+                ulp_budget: left_budget,
+            },
+            OracleScalar::Float {
+                exact: right_exact,
+                rounded: right_rounded,
+                ulp_budget: right_budget,
+            },
+        ) => Ok(match op {
+            BinOp::Add => oracle_float(
+                left_exact + right_exact,
+                left_rounded + right_rounded,
+                left_budget
+                    .max(right_budget)
+                    .saturating_add(F32_OPERATION_ULP_BUDGET),
+            ),
+            BinOp::Sub => oracle_float(
+                left_exact - right_exact,
+                left_rounded - right_rounded,
+                left_budget
+                    .max(right_budget)
+                    .saturating_add(F32_OPERATION_ULP_BUDGET),
+            ),
+            BinOp::Mul => oracle_float(
+                left_exact * right_exact,
+                left_rounded * right_rounded,
+                left_budget
+                    .max(right_budget)
+                    .saturating_add(F32_OPERATION_ULP_BUDGET),
+            ),
+            BinOp::Div => oracle_float(
+                left_exact / right_exact,
+                left_rounded / right_rounded,
+                left_budget
+                    .max(right_budget)
+                    .saturating_add(F32_OPERATION_ULP_BUDGET),
+            ),
+            BinOp::Min => oracle_float(
+                propagating_min(left_exact, right_exact),
+                propagating_min_f32(left_rounded, right_rounded),
+                left_budget.max(right_budget),
+            ),
+            BinOp::Max => oracle_float(
+                propagating_max(left_exact, right_exact),
+                propagating_max_f32(left_rounded, right_rounded),
+                left_budget.max(right_budget),
+            ),
+            BinOp::Pow => oracle_float(
+                left_exact.powf(right_exact),
+                left_rounded.powf(right_rounded),
+                left_budget
+                    .max(right_budget)
+                    .saturating_add(TRANSCENDENTAL_ULP_BUDGET),
+            ),
+            BinOp::Lt => OracleScalar::Bool(left_rounded < right_rounded),
+            BinOp::Le => OracleScalar::Bool(left_rounded <= right_rounded),
+            BinOp::Eq => OracleScalar::Bool(left_rounded == right_rounded),
+            BinOp::Ne => OracleScalar::Bool(left_rounded != right_rounded),
+            BinOp::Ge => OracleScalar::Bool(left_rounded >= right_rounded),
+            BinOp::Gt => OracleScalar::Bool(left_rounded > right_rounded),
+        }),
+        (OracleScalar::U32(left), OracleScalar::U32(right)) => {
+            exact_integer_binary(op, left, right).map(oracle_from_exact)
+        }
+        _ => Err(AgreementError::InvalidOutput),
+    }
+}
+
+fn oracle_float(exact: f64, rounded: f32, ulp_budget: u32) -> OracleScalar {
+    OracleScalar::Float {
+        exact,
+        rounded,
+        ulp_budget,
+    }
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss
+)]
+fn oracle_cast(to: ValueType, value: OracleScalar) -> OracleScalar {
+    match to {
+        ValueType::F32 => match value {
+            OracleScalar::Float {
+                exact,
+                rounded,
+                ulp_budget,
+            } => oracle_float(exact, rounded, ulp_budget),
+            OracleScalar::U32(value) => oracle_float(f64::from(value), value as f32, 0),
+            OracleScalar::Bool(value) => {
+                let value = u8::from(value);
+                oracle_float(f64::from(value), f32::from(value), 0)
+            }
+        },
+        ValueType::U32 => OracleScalar::U32(match value {
+            OracleScalar::Float { rounded, .. } => rounded as u32,
+            OracleScalar::U32(value) => value,
+            OracleScalar::Bool(value) => u32::from(value),
+        }),
+        ValueType::Bool => OracleScalar::Bool(match value {
+            OracleScalar::Float { rounded, .. } => rounded != 0.0,
+            OracleScalar::U32(value) => value != 0,
+            OracleScalar::Bool(value) => value,
+        }),
+    }
+}
+
+fn oracle_reduce(
+    op: RedOp,
+    left: OracleScalar,
+    right: OracleScalar,
+) -> Result<OracleScalar, AgreementError> {
+    let (
+        OracleScalar::Float {
+            exact: left_exact,
+            rounded: left_rounded,
+            ulp_budget: left_budget,
+        },
+        OracleScalar::Float {
+            exact: right_exact,
+            rounded: right_rounded,
+            ulp_budget: right_budget,
+        },
+    ) = (left, right)
+    else {
+        return Err(AgreementError::InvalidOutput);
+    };
+    Ok(match op {
+        RedOp::Sum => oracle_float(
+            left_exact + right_exact,
+            left_rounded + right_rounded,
+            left_budget
+                .max(right_budget)
+                .saturating_add(F32_OPERATION_ULP_BUDGET),
+        ),
+        RedOp::Max => oracle_float(
+            propagating_max(left_exact, right_exact),
+            propagating_max_f32(left_rounded, right_rounded),
+            left_budget.max(right_budget),
+        ),
+        RedOp::Min => oracle_float(
+            propagating_min(left_exact, right_exact),
+            propagating_min_f32(left_rounded, right_rounded),
+            left_budget.max(right_budget),
+        ),
+    })
+}
+
+fn comparison_is_ambiguous(op: BinOp, left: OracleScalar, right: OracleScalar) -> bool {
+    if !matches!(
+        op,
+        BinOp::Lt | BinOp::Le | BinOp::Eq | BinOp::Ne | BinOp::Ge | BinOp::Gt
+    ) {
+        return false;
+    }
+    let (
+        OracleScalar::Float {
+            exact: left,
+            ulp_budget: left_budget,
+            ..
+        },
+        OracleScalar::Float {
+            exact: right,
+            ulp_budget: right_budget,
+            ..
+        },
+    ) = (left, right)
+    else {
+        return false;
+    };
+    if !left.is_finite() || !right.is_finite() {
+        return false;
+    }
+    let magnitude = left.abs().max(right.abs());
+    let budget = left_budget.saturating_add(right_budget);
+    if budget == 0 {
+        return false;
+    }
+    let band = f64::from(budget) * f32_ulp_at(magnitude);
+    (left - right).abs() <= band
+}
+
+fn f32_ulp_at(value: f64) -> f64 {
+    #[allow(clippy::cast_possible_truncation)]
+    let value = value as f32;
+    if !value.is_finite() {
+        return f64::INFINITY;
+    }
+    let next = f32::from_bits(value.to_bits().saturating_add(1));
+    f64::from(next - value)
+}
+
+fn same_oracle_scalar(left: OracleScalar, right: OracleScalar) -> bool {
+    match (left, right) {
+        (
+            OracleScalar::Float {
+                exact: left_exact,
+                rounded: left_rounded,
+                ..
+            },
+            OracleScalar::Float {
+                exact: right_exact,
+                rounded: right_rounded,
+                ..
+            },
+        ) => {
+            left_exact.to_bits() == right_exact.to_bits()
+                && left_rounded.to_bits() == right_rounded.to_bits()
+        }
+        (OracleScalar::U32(left), OracleScalar::U32(right)) => left == right,
+        (OracleScalar::Bool(left), OracleScalar::Bool(right)) => left == right,
+        _ => false,
+    }
+}
+
+fn merge_oracle_budget(left: OracleScalar, right: OracleScalar) -> OracleScalar {
+    match (left, right) {
+        (
+            OracleScalar::Float {
+                exact,
+                rounded,
+                ulp_budget: left_budget,
+            },
+            OracleScalar::Float {
+                ulp_budget: right_budget,
+                ..
+            },
+        ) => oracle_float(exact, rounded, left_budget.max(right_budget)),
+        _ => left,
+    }
+}
+
 fn element_count(shape: &[u32]) -> Result<usize, AgreementError> {
     shape.iter().try_fold(1_usize, |count, &extent| {
         count
@@ -418,6 +1084,22 @@ fn propagating_min(left: f64, right: f64) -> f64 {
 fn propagating_max(left: f64, right: f64) -> f64 {
     if left.is_nan() || right.is_nan() {
         f64::NAN
+    } else {
+        left.max(right)
+    }
+}
+
+fn propagating_min_f32(left: f32, right: f32) -> f32 {
+    if left.is_nan() || right.is_nan() {
+        f32::NAN
+    } else {
+        left.min(right)
+    }
+}
+
+fn propagating_max_f32(left: f32, right: f32) -> f32 {
+    if left.is_nan() || right.is_nan() {
+        f32::NAN
     } else {
         left.max(right)
     }
