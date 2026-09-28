@@ -321,6 +321,7 @@ struct ProgramPipelineKey {
     input_dtypes: Vec<u8>,
     output_dtypes: Vec<u8>,
     rank: u8,
+    row: bool,
 }
 
 impl ProgramPipelineKey {
@@ -338,6 +339,7 @@ impl ProgramPipelineKey {
                 .map(|tensor| dtype_key(tensor.layout().dtype()))
                 .collect(),
             rank: u8::try_from(program.outputs()[0].layout().shape().len()).unwrap_or(u8::MAX),
+            row: program.program().program().kind == ProgramKind::Row,
         }
     }
 }
@@ -1277,7 +1279,7 @@ impl MetalBackend {
             }
             write_dispatch_timestamp(&encoder, timestamps, 2 + index * 2);
             if matches!(dispatch.op(), Op::Program(_)) {
-                temporaries.extend(self.encode_map_program(
+                temporaries.extend(self.encode_program(
                     &encoder,
                     table,
                     dispatch,
@@ -2733,7 +2735,7 @@ impl MetalBackend {
         Ok(layouts)
     }
 
-    fn encode_map_program(
+    fn encode_program(
         &self,
         encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
         table: &ProtocolObject<dyn MTL4ArgumentTable>,
@@ -2769,8 +2771,19 @@ impl MetalBackend {
         }
         drop(buffers);
         encoder.setArgumentTable(Some(table));
-        let (threadgroups, threads_per_threadgroup) =
-            map_dispatch_geometry(&pipeline, dispatch.output().layout())?;
+        let (threadgroups, threads_per_threadgroup) = match program.program().program().kind {
+            ProgramKind::Map => map_dispatch_geometry(&pipeline, dispatch.output().layout())?,
+            ProgramKind::Row => {
+                let width = dispatch
+                    .output()
+                    .layout()
+                    .shape()
+                    .last()
+                    .copied()
+                    .ok_or(BackendError::InvalidInput)?;
+                row_dispatch_geometry(&pipeline, dispatch.output().layout(), width)?
+            }
+        };
         encoder.dispatchThreadgroups_threadsPerThreadgroup(threadgroups, threads_per_threadgroup);
         Ok(layouts)
     }
@@ -3170,9 +3183,7 @@ fn shape3(layout: &Layout) -> Result<[u32; 3], BackendError> {
 
 fn supported_dispatch(dispatch: &Dispatch) -> bool {
     match dispatch.op() {
-        Op::Program(_) => dispatch
-            .bound_program()
-            .is_some_and(|program| program.program().program().kind == ProgramKind::Map),
+        Op::Program(_) => dispatch.bound_program().is_some(),
         Op::Copy
         | Op::Add
         | Op::SiluMul
@@ -3558,7 +3569,12 @@ impl PipelineCache {
             .device
             .newLibraryWithSource_options_error(&source, Some(&options))
             .map_err(|_| program_compile_failed(key.hash))?;
-        let name = NSString::from_str(map_codegen::KERNEL_NAME);
+        let kernel = if key.row {
+            map_codegen::ROW_KERNEL_NAME
+        } else {
+            map_codegen::KERNEL_NAME
+        };
+        let name = NSString::from_str(kernel);
         let values = MTLFunctionConstantValues::new();
         let constants = key
             .input_dtypes
@@ -3608,7 +3624,7 @@ fn program_compile_failed(hash: ProgramHash) -> BackendError {
     for byte in hash.as_bytes() {
         let _ = write!(encoded, "{byte:02x}");
     }
-    eprintln!("Metal map program compilation failed: {encoded}");
+    eprintln!("Metal program compilation failed: {encoded}");
     BackendError::ExecutionFailed
 }
 
@@ -3621,7 +3637,9 @@ mod tests {
 
     use forja_core::{
         Backend, CommandList, DType, Op, Slice, Submission, ViewOp,
-        program::{BinOp, BoundProgram, Inst, Program, ProgramKind, RedOp, bind_program},
+        program::{
+            BinOp, BoundProgram, Inst, Program, ProgramKind, RedOp, ValidatedProgram, bind_program,
+        },
     };
     use forja_cpu::CpuBackend;
     use forja_testing::{TensorSpec, assert_backends_agree, assert_outputs_agree};
@@ -3752,25 +3770,40 @@ mod tests {
     }
 
     #[test]
-    fn metal_keeps_row_programs_unsupported() {
-        let backend = MetalBackend::new().unwrap();
-        let input = backend.alloc(DType::F32, &[7]).unwrap();
-        let output = backend.alloc(DType::F32, &[7]).unwrap();
+    fn metal_executes_dependent_row_reductions() {
+        let cpu = CpuBackend::new();
+        let metal = MetalBackend::new().unwrap();
         let program = Program {
             kind: ProgramKind::Row,
-            insts: vec![Inst::Input(0), Inst::Reduce(RedOp::Sum, 0)],
-            outputs: vec![(0, 1)],
+            insts: vec![
+                Inst::Input(0),
+                Inst::Reduce(RedOp::Sum, 0),
+                Inst::Binary(BinOp::Div, 0, 1),
+                Inst::Reduce(RedOp::Max, 2),
+                Inst::Binary(BinOp::Add, 2, 3),
+            ],
+            outputs: vec![(0, 4)],
         }
         .validate()
         .unwrap();
+        let expected = run_single_program(&cpu, &program);
+        let actual = run_single_program(&metal, &program);
+        assert_outputs_agree(DType::F32, &expected, &actual).unwrap();
+    }
+
+    fn run_single_program<B: Backend>(backend: &B, program: &ValidatedProgram) -> Vec<u8> {
+        let input = backend.alloc(DType::F32, &[2, 33]).unwrap();
+        let bytes = (0_u16..66)
+            .flat_map(|value| (f32::from(value) / 16.0 - 2.0).to_le_bytes())
+            .collect::<Vec<_>>();
+        backend.write(&input, &bytes).unwrap();
+        let output = backend.alloc(DType::F32, &[2, 33]).unwrap();
         let mut commands = CommandList::new();
         commands
-            .dispatch_program(&program, &[&input], &[&output])
+            .dispatch_program(program, &[&input], &[&output])
             .unwrap();
-        assert!(matches!(
-            backend.submit(commands),
-            Err(BackendError::UnsupportedOperation)
-        ));
+        backend.submit(commands).unwrap().wait().unwrap();
+        backend.read(&output).unwrap()
     }
 
     fn run_two_output_program<B: Backend>(backend: &B) -> [Vec<u8>; 2] {
