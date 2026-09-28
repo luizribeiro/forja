@@ -9,7 +9,7 @@ use syn::{FnArg, GenericArgument, ItemFn, Pat, PathArguments, ReturnType, Type, 
 use lower::{Parameter, lower};
 
 #[derive(Clone, Copy, Eq, PartialEq)]
-enum KernelKind {
+pub(super) enum KernelKind {
     Map,
     Row,
 }
@@ -328,6 +328,10 @@ impl KernelFunction {
         }
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the generated build path stays together so hygiene is reviewable"
+    )]
     fn program_body(
         &self,
         name: &Ident,
@@ -360,7 +364,7 @@ impl KernelFunction {
                     .map(|scalar| (scalar.ident.to_string(), Parameter::Scalar(scalar.compute))),
             )
             .collect::<HashMap<_, _>>();
-        let lowered = lower(&self.item.block, parameters, &context)?;
+        let lowered = lower(&self.item.block, parameters, &context, self.kind)?;
         if lowered.outputs.len() != self.output_count {
             return Err(syn::Error::new_spanned(
                 &self.item.sig.output,
@@ -431,6 +435,11 @@ impl KernelFunction {
                             #input_dtypes_argument,
                             #output_dtypes_argument,
                         )
+                        .map_err(|#program| ::forja_sdk::Error::loading(::std::format!(
+                            "kernel `{}`: {}",
+                            stringify!(#name),
+                            #program,
+                        )))
                     },
                 )
             })

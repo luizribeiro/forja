@@ -1,0 +1,5 @@
+error: kernel: unknown method `sum` on `u32`; supported: wrapping_add, wrapping_sub, wrapping_mul, min, max
+ --> tests/ui/kernel-fail-reduction-name-u32.rs:6:13
+  |
+6 |     x + ids.sum() as f32
+  |             ^^^

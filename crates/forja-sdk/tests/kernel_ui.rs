@@ -7,6 +7,7 @@ fn kernel_syntax_contracts() {
     cases.pass("tests/ui/kernel-pass-methods.rs");
     cases.pass("tests/ui/kernel-pass-signatures.rs");
     cases.pass("tests/ui/kernel-pass-typed-expressions.rs");
+    cases.pass("tests/ui/kernel-pass-row-expressions.rs");
     cases.compile_fail("tests/ui/kernel-fail-closure.rs");
     cases.compile_fail("tests/ui/kernel-fail-loop.rs");
     cases.compile_fail("tests/ui/kernel-fail-match.rs");
@@ -24,6 +25,11 @@ fn kernel_syntax_contracts() {
     cases.compile_fail("tests/ui/kernel-fail-mismatched-types.rs");
     cases.compile_fail("tests/ui/kernel-fail-mismatched-u32.rs");
     cases.compile_fail("tests/ui/kernel-fail-remainder.rs");
+    cases.compile_fail("tests/ui/kernel-fail-reduction-map.rs");
+    cases.compile_fail("tests/ui/kernel-fail-reduction-max-name.rs");
+    cases.compile_fail("tests/ui/kernel-fail-reduction-name.rs");
+    cases.compile_fail("tests/ui/kernel-fail-reduction-name-u32.rs");
     cases.compile_fail("tests/ui/kernel-fail-u32-add.rs");
     cases.compile_fail("tests/ui/kernel-fail-too-large.rs");
+    cases.compile_fail("tests/ui/kernel-fail-too-many-reductions.rs");
 }

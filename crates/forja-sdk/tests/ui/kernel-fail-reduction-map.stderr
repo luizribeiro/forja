@@ -1,0 +1,5 @@
+error: kernel: reduction `.row_sum()` is only available in `#[kernel(row)]`
+ --> tests/ui/kernel-fail-reduction-map.rs:3:7
+  |
+3 |     x.row_sum()
+  |       ^^^^^^^

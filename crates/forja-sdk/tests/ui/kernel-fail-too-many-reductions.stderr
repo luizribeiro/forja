@@ -1,0 +1,5 @@
+error: kernel: too many reductions: 5 (IR limit is 4)
+ --> tests/ui/kernel-fail-too-many-reductions.rs:3:64
+  |
+3 |     x.row_sum() + x.row_max() + x.row_min() + x.row_mean() + x.row_sum()
+  |                                                                ^^^^^^^

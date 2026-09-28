@@ -4,12 +4,12 @@
 
 use std::error::Error;
 
-use forja_core::DType as CoreDType;
+use forja_core::{DType as CoreDType, Slice};
 use forja_cpu::{CpuBackend, interpreter::Input};
 use forja_sdk::{
     DType, Tensor,
     kernel::Kernel,
-    program::{Ctx, Program},
+    program::{Ctx, Program, RowCtx},
 };
 use forja_testing::{
     DeterministicValues, TensorSpec, assert_f32_values_agree, assert_program_backends_agree,
@@ -48,6 +48,40 @@ fn macro_multi(
 #[forja_sdk::kernel(map)]
 fn macro_cached_scalar(x: forja_sdk::kernel::Elem, position: f32) -> forja_sdk::kernel::Elem {
     x + position
+}
+
+#[forja_sdk::kernel(row)]
+fn macro_typed_row(
+    x: forja_sdk::kernel::Row,
+    ids: forja_sdk::kernel::Row<u32>,
+) -> forja_sdk::kernel::Row {
+    let lane = forja_sdk::kernel::index(-1);
+    let width = x.len().min(forja_sdk::kernel::extent(-1));
+    let wrapped = ids
+        .wrapping_add(lane)
+        .wrapping_mul(3)
+        .wrapping_sub(1)
+        .min(width)
+        .max(0);
+    let choose = (x >= 0.0 && lane < width) || !(ids != 0);
+    let selected = if choose {
+        wrapped
+    } else if ids > lane {
+        choose as u32
+    } else {
+        x as u32
+    };
+    let value = if choose {
+        x.maximum(selected as f32)
+    } else {
+        x.minimum(selected as f32)
+    };
+    value + value.row_mean()
+}
+
+#[forja_sdk::kernel(map)]
+fn macro_bad_axis(x: forja_sdk::kernel::Elem) -> forja_sdk::kernel::Elem {
+    x + forja_sdk::kernel::index(2) as f32
 }
 
 struct TestInput {
@@ -246,6 +280,90 @@ fn macro_cache_rejects_the_seventeenth_signature() -> Result<(), Box<dyn Error>>
     Ok(())
 }
 
+#[test]
+fn typed_row_matches_builder_and_interpreter() -> Result<(), Box<dyn Error>> {
+    let (macro_kernel, hand_kernel) = typed_kernels()?;
+    let cpu = CpuBackend::new();
+    for kernel in [&macro_kernel, &hand_kernel] {
+        let report = assert_program_backends_agree(&cpu, &cpu, &typed_case(kernel))?;
+        assert!(report.reduction_steps > 0);
+    }
+
+    let shape = [7, 33];
+    let count = 7 * 33;
+    let floats = random_values(count, 0xfeed);
+    let integers = (0..count)
+        .map(|index| u32::try_from(index % 41).unwrap())
+        .collect::<Vec<_>>();
+    let inputs = [Input::F32(&floats), Input::U32(&integers)];
+    let macro_outputs =
+        forja_cpu::interpreter::interpret(macro_kernel.validated_program(), &shape, &inputs)?;
+    let hand_outputs =
+        forja_cpu::interpreter::interpret(hand_kernel.validated_program(), &shape, &inputs)?;
+    assert_f32_values_agree(&hand_outputs[0], &macro_outputs[0])?;
+    Ok(())
+}
+
+#[test]
+fn axis_errors_name_the_kernel() {
+    let error = macro_bad_axis_program(2, &[DType::F32], &[DType::F32])
+        .err()
+        .expect("the third axis must be rejected for rank two");
+    assert_eq!(
+        error.to_string(),
+        "kernel `macro_bad_axis`: program axis is out of range"
+    );
+}
+
+fn typed_kernels() -> forja_sdk::Result<(Kernel, Kernel)> {
+    let macro_kernel = macro_typed_row_program(2, &[DType::F32, DType::U32], &[DType::F32])?;
+    let context = RowCtx::new();
+    let x = context.input(0);
+    let ids = context.input_u32(1);
+    let lane = context.index(-1);
+    let width = context.extent(-1).min(context.extent(-1));
+    let three = context.constant(3.0).cast_u32();
+    let one = context.constant(1.0).cast_u32();
+    let zero = context.constant(0.0).cast_u32();
+    let wrapped = ids
+        .wrapping_add(lane)
+        .wrapping_mul(three)
+        .wrapping_sub(one)
+        .min(width)
+        .max(zero);
+    let choose = x
+        .ge(context.constant(0.0))
+        .and(lane.lt(width))
+        .or(ids.not_equal(zero).not());
+    let selected = choose.select_u32(
+        wrapped,
+        ids.gt(lane).select_u32(choose.cast_u32(), x.cast_u32()),
+    );
+    let selected = selected.cast_f32();
+    let value = choose.select(x.maximum(selected), x.minimum(selected));
+    context.output(0, value + context.row_mean(value));
+    let hand_kernel = Kernel::new(
+        &context.finish(),
+        2,
+        &[DType::F32, DType::U32],
+        &[DType::F32],
+    )?;
+    Ok((macro_kernel, hand_kernel))
+}
+
+fn typed_case(kernel: &Kernel) -> ProgramCase {
+    let slices = [Slice::new(0, 7, 1).unwrap(), Slice::new(1, 33, 1).unwrap()];
+    ProgramCase::new(
+        kernel.validated_program().program().clone(),
+        vec![7, 33],
+        vec![
+            TensorSpec::sliced(CoreDType::F32, &[7, 34], &slices),
+            TensorSpec::sliced(CoreDType::U32, &[7, 34], &slices),
+        ],
+        vec![TensorSpec::contiguous(CoreDType::F32, &[7, 33])],
+    )
+}
+
 fn input(shape: &[u32], seed: u64) -> TestInput {
     let count = shape
         .iter()
@@ -282,6 +400,10 @@ fn metal_macro_programs_match_interval_oracle() -> Result<(), Box<dyn Error>> {
     ];
     for case in &cases {
         assert_program_backends_agree(&cpu, &metal, case)?;
+    }
+    let (typed_macro, typed_hand) = typed_kernels()?;
+    for kernel in [&typed_macro, &typed_hand] {
+        assert_program_backends_agree(&cpu, &metal, &typed_case(kernel))?;
     }
     Ok(())
 }

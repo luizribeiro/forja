@@ -1,0 +1,5 @@
+error: kernel: use `.row_max()` for row reductions
+ --> tests/ui/kernel-fail-reduction-max-name.rs:3:7
+  |
+3 |     x.max()
+  |       ^^^

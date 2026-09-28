@@ -1,4 +1,4 @@
-error: kernel: expression is not supported in this kernel subset
+error: kernel: function calls are not supported in kernels
  --> tests/ui/kernel-fail-closure.rs:3:5
   |
 3 |     (|value| value)(x)

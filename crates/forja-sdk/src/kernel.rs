@@ -6,7 +6,10 @@
 //! with explicitly bound views instead.
 //!
 //! Kernel Boolean operators and conditionals evaluate both sides before a
-//! select, so they do not short-circuit.
+//! select, so they do not short-circuit. The macro enforces instruction and
+//! reduction limits when it can see the complete expression. If helper bodies
+//! are involved, their inlined totals are instead rejected when the named
+//! kernel is built.
 
 use std::{cell::RefCell, collections::VecDeque, marker::PhantomData};
 

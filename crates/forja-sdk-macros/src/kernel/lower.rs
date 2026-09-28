@@ -4,9 +4,10 @@ use proc_macro2::{Ident, Span, TokenStream};
 use quote::{format_ident, quote};
 use syn::{BinOp, Expr, ExprBinary, ExprMethodCall, Lit, Pat, Stmt, Type, UnOp, spanned::Spanned};
 
-use super::ComputeType;
+use super::{ComputeType, KernelKind};
 
 const MAX_INSTRUCTIONS: usize = 256;
+const MAX_REDUCTIONS: usize = 4;
 
 #[derive(Clone, Copy)]
 pub(super) enum Parameter {
@@ -27,6 +28,7 @@ pub(super) fn lower(
     body: &syn::Block,
     parameters: HashMap<String, Parameter>,
     context: &Ident,
+    kind: KernelKind,
 ) -> syn::Result<Lowered> {
     let tensors = parameters
         .iter()
@@ -44,7 +46,9 @@ pub(super) fn lower(
         used_tensors: HashSet::new(),
         statements: Vec::new(),
         instruction_spans: Vec::new(),
+        reduction_spans: Vec::new(),
         context: context.clone(),
+        kind,
     };
     let result = lowerer.lower_block(body)?;
     let outputs = match result {
@@ -71,6 +75,15 @@ pub(super) fn lower(
             format!(
                 "kernel is too large: {} instructions (IR limit is {MAX_INSTRUCTIONS})",
                 lowerer.instruction_spans.len()
+            ),
+        ));
+    }
+    if lowerer.reduction_spans.len() > MAX_REDUCTIONS {
+        return Err(kernel_error(
+            lowerer.reduction_spans[MAX_REDUCTIONS],
+            format!(
+                "too many reductions: {} (IR limit is {MAX_REDUCTIONS})",
+                lowerer.reduction_spans.len()
             ),
         ));
     }
@@ -130,7 +143,9 @@ struct Lowerer {
     used_tensors: HashSet<String>,
     statements: Vec<TokenStream>,
     instruction_spans: Vec<Span>,
+    reduction_spans: Vec<Span>,
     context: Ident,
+    kind: KernelKind,
 }
 
 impl Lowerer {
@@ -238,6 +253,7 @@ impl Lowerer {
                 }
             }
             Expr::MethodCall(call) => self.lower_method(call),
+            Expr::Call(call) => self.lower_call(call),
             Expr::Cast(cast) => self.lower_cast(cast),
             Expr::If(if_expression) => self.lower_if(if_expression),
             Expr::Paren(paren) => self.lower_expr(&paren.expr),
@@ -494,7 +510,20 @@ impl Lowerer {
             ));
         }
         let name = call.method.to_string();
+        if name == "len" {
+            return self.lower_len(call);
+        }
         let receiver = self.lower_expr(&call.receiver)?;
+        if matches!(name.as_str(), "sum" | "mean")
+            && receiver.ty == ValueType::F32
+            && self.kind == KernelKind::Row
+        {
+            let replacement = if name == "sum" { "row_sum" } else { "row_mean" };
+            return Err(kernel_error(
+                &call.method,
+                format!("use `.{replacement}()` for row reductions"),
+            ));
+        }
         if matches!(name.as_str(), "max" | "min")
             && receiver.ty == ValueType::F32
             && call.args.is_empty()
@@ -539,6 +568,12 @@ impl Lowerer {
                 ValueType::F32,
                 call.span(),
             ));
+        }
+        if matches!(
+            name.as_str(),
+            "row_sum" | "row_max" | "row_min" | "row_mean"
+        ) {
+            return self.lower_reduction(call, receiver);
         }
         let arguments = call
             .args
@@ -644,6 +679,100 @@ impl Lowerer {
             }
             _ => Err(unknown_method(&call.method, receiver.ty)),
         }
+    }
+
+    fn lower_reduction(&mut self, call: &ExprMethodCall, receiver: Value) -> syn::Result<Value> {
+        if receiver.ty != ValueType::F32 {
+            return Err(unknown_method(&call.method, receiver.ty));
+        }
+        if self.kind != KernelKind::Row {
+            return Err(kernel_error(
+                &call.method,
+                format!(
+                    "reduction `.{}()` is only available in `#[kernel(row)]`",
+                    call.method
+                ),
+            ));
+        }
+        self.reduction_spans.push(call.method.span());
+        let context = self.context.clone();
+        let receiver = receiver.ident;
+        let reduction = match call.method.to_string().as_str() {
+            "row_sum" | "row_mean" => quote!(#context.row_sum(#receiver)),
+            "row_max" => quote!(#context.row_max(#receiver)),
+            "row_min" => quote!(#context.row_min(#receiver)),
+            _ => return Err(unknown_method(&call.method, ValueType::F32)),
+        };
+        let reduced = self.emit(reduction, ValueType::F32, call.span());
+        if call.method != "row_mean" {
+            return Ok(reduced);
+        }
+        let extent = self.emit(quote!(#context.extent(-1)), ValueType::U32, call.span());
+        let extent = extent.ident;
+        let extent = self.emit(quote!(#extent.cast_f32()), ValueType::F32, call.span());
+        let reduced = reduced.ident;
+        let extent = extent.ident;
+        Ok(self.emit(quote!(#reduced / #extent), ValueType::F32, call.span()))
+    }
+
+    fn lower_len(&mut self, call: &ExprMethodCall) -> syn::Result<Value> {
+        if !call.args.is_empty() {
+            return Err(kernel_error(&call.method, "`len` takes no arguments"));
+        }
+        let Expr::Path(path) = &*call.receiver else {
+            return Err(kernel_error(
+                &call.method,
+                "`.len()` is only available on a row tensor parameter",
+            ));
+        };
+        let Some(name) = path.path.get_ident().map(ToString::to_string) else {
+            return Err(kernel_error(
+                &call.method,
+                "`.len()` is only available on a row tensor parameter",
+            ));
+        };
+        if self.kind != KernelKind::Row
+            || !matches!(
+                self.bindings.get(&name),
+                Some(Binding::Parameter(Parameter::Tensor { .. }))
+            )
+        {
+            return Err(kernel_error(
+                &call.method,
+                "`.len()` is only available on a row tensor parameter",
+            ));
+        }
+        let context = self.context.clone();
+        Ok(self.emit(quote!(#context.extent(-1)), ValueType::U32, call.span()))
+    }
+
+    fn lower_call(&mut self, call: &syn::ExprCall) -> syn::Result<Value> {
+        let Expr::Path(path) = &*call.func else {
+            return Err(kernel_error(
+                call,
+                "function calls are not supported in kernels",
+            ));
+        };
+        let Some(segment) = path.path.segments.last() else {
+            return Err(kernel_error(call, "unknown kernel function"));
+        };
+        let name = segment.ident.to_string();
+        if !matches!(name.as_str(), "index" | "extent") {
+            return Err(kernel_error(
+                &segment.ident,
+                format!("unknown kernel function `{name}`"),
+            ));
+        }
+        if call.args.len() != 1 {
+            return Err(kernel_error(
+                &segment.ident,
+                format!("`{name}` takes one literal axis"),
+            ));
+        }
+        let axis = axis_literal(&call.args[0])?;
+        let context = self.context.clone();
+        let method = &segment.ident;
+        Ok(self.emit(quote!(#context.#method(#axis)), ValueType::U32, call.span()))
     }
 
     fn lower_cast(&mut self, cast: &syn::ExprCast) -> syn::Result<Value> {
@@ -797,7 +926,8 @@ fn method_arity(name: &str, ty: ValueType) -> Option<usize> {
         (
             ValueType::F32,
             "abs" | "exp" | "ln" | "sqrt" | "rsqrt" | "recip" | "sin" | "cos" | "tanh" | "sigmoid"
-            | "floor" | "ceil" | "log2" | "log10" | "exp2",
+            | "floor" | "ceil" | "log2" | "log10" | "exp2" | "row_sum" | "row_max" | "row_min"
+            | "row_mean",
         ) => Some(0),
         (ValueType::F32, "maximum" | "minimum" | "powf" | "powi") => Some(1),
         (ValueType::F32, "clamp") => Some(2),
@@ -976,6 +1106,30 @@ fn unknown_method(method: &Ident, ty: ValueType) -> syn::Error {
             ty.name()
         ),
     )
+}
+
+fn axis_literal(expression: &Expr) -> syn::Result<i32> {
+    let (negative, literal) = match expression {
+        Expr::Lit(literal) => (false, literal),
+        Expr::Unary(unary) if matches!(unary.op, UnOp::Neg(_)) => {
+            let Expr::Lit(literal) = &*unary.expr else {
+                return Err(kernel_error(expression, "axis must be an integer literal"));
+            };
+            (true, literal)
+        }
+        _ => return Err(kernel_error(expression, "axis must be an integer literal")),
+    };
+    let Lit::Int(literal) = &literal.lit else {
+        return Err(kernel_error(expression, "axis must be an integer literal"));
+    };
+    let value = literal.base10_parse::<i32>()?;
+    if negative {
+        value
+            .checked_neg()
+            .ok_or_else(|| kernel_error(expression, "axis is out of range"))
+    } else {
+        Ok(value)
+    }
 }
 
 fn powi_exponent(expression: &Expr) -> syn::Result<i32> {

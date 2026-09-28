@@ -1,0 +1,5 @@
+error: kernel: use `.row_sum()` for row reductions
+ --> tests/ui/kernel-fail-reduction-name.rs:3:7
+  |
+3 |     x.sum()
+  |       ^^^
