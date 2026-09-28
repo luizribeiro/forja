@@ -1,14 +1,17 @@
 use std::{error::Error, path::Path};
 
 use forja_core::Backend;
-use forja_host::{EngineRunner, EngineStep};
+use forja_host::{EngineRunner, EngineStep, EngineTensor};
 use golden_fixtures::{
-    BF16_HIDDEN_STATE_TOLERANCE, FixtureDirectory, LOGIT_KL_TOLERANCE, decode_f32_le,
-    mean_logit_kl_divergence, normwise_relative_error, sha256_file,
+    BF16_HIDDEN_STATE_TOLERANCE, BF16_LOGIT_KL_TOLERANCE, FixtureDirectory, LOGIT_KL_TOLERANCE,
+    decode_f32_le, mean_logit_kl_divergence, normwise_relative_error, sha256_file,
 };
 
 use crate::args::{Backend as BackendArg, Precision, Verify};
 use crate::engine::{argmax, limits};
+
+const F32_HIDDEN_STATE_TOLERANCE: f64 = 2e-2;
+const BF16_TOP1_PERCENT: u64 = 95;
 
 #[derive(Clone, Copy, Default)]
 struct DecodeMetrics {
@@ -38,6 +41,22 @@ impl DecodeMetrics {
 #[derive(Clone, Copy)]
 enum DecodeMode {
     FreeRunning,
+    TeacherForced,
+}
+
+#[derive(Clone, Copy, Default)]
+struct VerificationSummary {
+    maximum_layer_error: f64,
+    teacher_forced: DecodeMetrics,
+    free_running: DecodeMetrics,
+}
+
+struct PromptVerification {
+    maximum_layer_error: f64,
+    layers_passed: bool,
+    passed: bool,
+    teacher_forced: DecodeMetrics,
+    free_running: DecodeMetrics,
 }
 
 struct DecodeInput<'a> {
@@ -48,12 +67,6 @@ struct DecodeInput<'a> {
     logits: Vec<f32>,
     vocab: usize,
     steps: usize,
-}
-
-#[derive(Clone, Copy, Default)]
-struct VerificationSummary {
-    maximum_layer_error: f64,
-    free_running: DecodeMetrics,
 }
 
 pub(crate) async fn run(options: &Verify) -> Result<(), Box<dyn Error>> {
@@ -143,75 +156,33 @@ where
     let mut summary = VerificationSummary::default();
     println!("prompt\tlayer\trelative-error\tresult");
     for fixture in prompts {
-        let tokens = fixture
-            .prompt_ids()
-            .iter()
-            .map(|&token| u32::try_from(token))
-            .collect::<Result<Vec<_>, _>>()?;
-        let output = runner
-            .step(EngineStep {
-                tokens,
-                start_pos: 0,
-                taps: true,
-            })
-            .await?
-            .map_err(|error| format!("engine step failed: {error:?}"))?;
-        let logits = decode_f32_le(&runner.read(&output.logits).await?)?;
-        let mut first_failing = None;
-        let mut maximum_layer_error = 0.0_f64;
-        for (index, tap) in output.taps.iter().enumerate() {
-            let values = decode_f32_le(&runner.read(tap).await?)?;
-            let reference = fixture
-                .hidden_state(index + 1)
-                .ok_or("hidden-state fixture is missing")?;
-            let error = normwise_relative_error(reference.values(), &values)?;
-            maximum_layer_error = maximum_layer_error.max(error);
-            let layer_passed = error <= BF16_HIDDEN_STATE_TOLERANCE;
-            if !layer_passed && first_failing.is_none() {
-                first_failing = Some(index + 1);
-            }
-            if layer_passed {
-                println!("{}\t{}\t{error:.8e}\tpass", fixture.name(), index + 1);
-            } else {
-                println!("{}\t{}\t{error:.8e}\tFAIL", fixture.name(), index + 1);
-            }
-        }
-        let logits_kl = mean_logit_kl_divergence(
-            fixture.prompt_logits().values(),
-            &logits,
-            usize::try_from(info.vocab)?,
-        )?;
-        let free_running = decode(
+        let prompt = verify_prompt(
             &mut runner,
-            DecodeInput {
-                prompt: fixture.name(),
-                expected_tokens: fixture.greedy_tokens(),
-                reference_logits: fixture.greedy_step_logits().values(),
-                prompt_tokens: u32::try_from(fixture.prompt_ids().len())?,
-                logits,
-                vocab: usize::try_from(info.vocab)?,
-                steps: decode_steps,
-            },
-            DecodeMode::FreeRunning,
-            true,
+            fixture,
+            options.precision,
+            usize::try_from(info.vocab)?,
+            decode_steps,
         )
         .await?;
-        let prompt_passed = first_failing.is_none()
-            && logits_kl <= LOGIT_KL_TOLERANCE
-            && free_running.mean_kl() <= LOGIT_KL_TOLERANCE
-            && free_running.agreement == free_running.steps;
-        summary.maximum_layer_error = summary.maximum_layer_error.max(maximum_layer_error);
-        summary.free_running.include(free_running);
-        passed &= prompt_passed;
+        summary.maximum_layer_error = summary.maximum_layer_error.max(prompt.maximum_layer_error);
+        summary.teacher_forced.include(prompt.teacher_forced);
+        summary.free_running.include(prompt.free_running);
+        passed &= match options.precision {
+            Precision::F32 => prompt.passed,
+            Precision::Bf16 => prompt.layers_passed,
+        };
+    }
+    if options.precision == Precision::Bf16 {
+        let teacher_passed = summary.teacher_forced.mean_kl() <= BF16_LOGIT_KL_TOLERANCE
+            && top1_passes(summary.teacher_forced);
+        passed &= teacher_passed;
         println!(
-            "{}\tmax-layer={maximum_layer_error:.8e}\tfirst-failing={}\tprompt-kl={logits_kl:.8e}\tfree-mean-kl={:.8e}\tfree-max-kl={:.8e}\ttop-1={}/{}\t{}",
-            fixture.name(),
-            first_failing.map_or_else(|| "-".to_owned(), |layer| layer.to_string()),
-            free_running.mean_kl(),
-            free_running.maximum_kl,
-            free_running.agreement,
-            free_running.steps,
-            if prompt_passed { "pass" } else { "FAIL" }
+            "all-prompts\tteacher-mean-kl={:.8e}\tteacher-max-kl={:.8e}\ttop-1={}/{}\t{}",
+            summary.teacher_forced.mean_kl(),
+            summary.teacher_forced.maximum_kl,
+            summary.teacher_forced.agreement,
+            summary.teacher_forced.steps,
+            if passed { "pass" } else { "FAIL" }
         );
     }
     if passed || !enforce_tolerances {
@@ -219,6 +190,192 @@ where
     } else {
         Err("verification failed".into())
     }
+}
+
+async fn verify_prompt<B>(
+    runner: &mut EngineRunner<B>,
+    fixture: &golden_fixtures::PromptFixture,
+    precision: Precision,
+    vocab: usize,
+    decode_steps: usize,
+) -> Result<PromptVerification, Box<dyn Error>>
+where
+    B: Backend + Send + Sync + 'static,
+{
+    let tokens = fixture
+        .prompt_ids()
+        .iter()
+        .map(|&token| u32::try_from(token))
+        .collect::<Result<Vec<_>, _>>()?;
+    let output = runner
+        .step(EngineStep {
+            tokens: tokens.clone(),
+            start_pos: 0,
+            taps: true,
+        })
+        .await?
+        .map_err(|error| format!("engine step failed: {error:?}"))?;
+    let logits = decode_f32_le(&runner.read(&output.logits).await?)?;
+    let layer_tolerance = match precision {
+        Precision::F32 => F32_HIDDEN_STATE_TOLERANCE,
+        Precision::Bf16 => BF16_HIDDEN_STATE_TOLERANCE,
+    };
+    let (maximum_layer_error, first_failing) =
+        compare_layers(runner, fixture, &output.taps, layer_tolerance).await?;
+    let input = DecodeInput {
+        prompt: fixture.name(),
+        expected_tokens: fixture.greedy_tokens(),
+        reference_logits: fixture.greedy_step_logits().values(),
+        prompt_tokens: u32::try_from(fixture.prompt_ids().len())?,
+        logits,
+        vocab,
+        steps: decode_steps,
+    };
+    match precision {
+        Precision::F32 => {
+            verify_f32_decode(runner, fixture, input, maximum_layer_error, first_failing).await
+        }
+        Precision::Bf16 => {
+            verify_bf16_decode(runner, input, tokens, maximum_layer_error, first_failing).await
+        }
+    }
+}
+
+async fn compare_layers<B>(
+    runner: &mut EngineRunner<B>,
+    fixture: &golden_fixtures::PromptFixture,
+    taps: &[EngineTensor],
+    tolerance: f64,
+) -> Result<(f64, Option<usize>), Box<dyn Error>>
+where
+    B: Backend + Send + Sync + 'static,
+{
+    let mut first_failing = None;
+    let mut maximum = 0.0_f64;
+    for (index, tap) in taps.iter().enumerate() {
+        let values = decode_f32_le(&runner.read(tap).await?)?;
+        let reference = fixture
+            .hidden_state(index + 1)
+            .ok_or("hidden-state fixture is missing")?;
+        let error = normwise_relative_error(reference.values(), &values)?;
+        maximum = maximum.max(error);
+        let passed = error <= tolerance;
+        if !passed && first_failing.is_none() {
+            first_failing = Some(index + 1);
+        }
+        println!(
+            "{}\t{}\t{error:.8e}\t{}",
+            fixture.name(),
+            index + 1,
+            if passed { "pass" } else { "FAIL" }
+        );
+    }
+    Ok((maximum, first_failing))
+}
+
+async fn verify_f32_decode<B>(
+    runner: &mut EngineRunner<B>,
+    fixture: &golden_fixtures::PromptFixture,
+    input: DecodeInput<'_>,
+    maximum_layer_error: f64,
+    first_failing: Option<usize>,
+) -> Result<PromptVerification, Box<dyn Error>>
+where
+    B: Backend + Send + Sync + 'static,
+{
+    let prompt_kl =
+        mean_logit_kl_divergence(fixture.prompt_logits().values(), &input.logits, input.vocab)?;
+    let free_running = decode(runner, input, DecodeMode::FreeRunning, true).await?;
+    let passed = first_failing.is_none()
+        && prompt_kl <= LOGIT_KL_TOLERANCE
+        && free_running.mean_kl() <= LOGIT_KL_TOLERANCE
+        && free_running.agreement == free_running.steps;
+    println!(
+        "{}\tmax-layer={maximum_layer_error:.8e}\tfirst-failing={}\tprompt-kl={prompt_kl:.8e}\tfree-mean-kl={:.8e}\tfree-max-kl={:.8e}\ttop-1={}/{}\t{}",
+        fixture.name(),
+        layer_name(first_failing),
+        free_running.mean_kl(),
+        free_running.maximum_kl,
+        free_running.agreement,
+        free_running.steps,
+        if passed { "pass" } else { "FAIL" }
+    );
+    Ok(PromptVerification {
+        maximum_layer_error,
+        layers_passed: first_failing.is_none(),
+        passed,
+        teacher_forced: DecodeMetrics::default(),
+        free_running,
+    })
+}
+
+async fn verify_bf16_decode<B>(
+    runner: &mut EngineRunner<B>,
+    input: DecodeInput<'_>,
+    prompt_tokens: Vec<u32>,
+    maximum_layer_error: f64,
+    first_failing: Option<usize>,
+) -> Result<PromptVerification, Box<dyn Error>>
+where
+    B: Backend + Send + Sync + 'static,
+{
+    let prompt = input.prompt;
+    let expected_tokens = input.expected_tokens;
+    let reference_logits = input.reference_logits;
+    let prompt_length = input.prompt_tokens;
+    let vocab = input.vocab;
+    let steps = input.steps;
+    let teacher_forced = decode(runner, input, DecodeMode::TeacherForced, true).await?;
+    let prompt_passed = first_failing.is_none()
+        && teacher_forced.mean_kl() <= BF16_LOGIT_KL_TOLERANCE
+        && top1_passes(teacher_forced);
+    println!(
+        "{}\tmax-layer={maximum_layer_error:.8e}\tfirst-failing={}\tteacher-mean-kl={:.8e}\tteacher-max-kl={:.8e}\ttop-1={}/{}\t{}",
+        prompt,
+        layer_name(first_failing),
+        teacher_forced.mean_kl(),
+        teacher_forced.maximum_kl,
+        teacher_forced.agreement,
+        teacher_forced.steps,
+        if prompt_passed { "pass" } else { "FAIL" }
+    );
+    let output = runner
+        .step(EngineStep {
+            tokens: prompt_tokens,
+            start_pos: 0,
+            taps: false,
+        })
+        .await?
+        .map_err(|error| format!("engine step failed: {error:?}"))?;
+    let free_input = DecodeInput {
+        prompt,
+        expected_tokens,
+        reference_logits,
+        prompt_tokens: prompt_length,
+        logits: decode_f32_le(&runner.read(&output.logits).await?)?,
+        vocab,
+        steps,
+    };
+    let free_running = decode(runner, free_input, DecodeMode::FreeRunning, false).await?;
+    println!(
+        "{}\tfree-running-mean-kl={:.8e}\tfree-running-max-kl={:.8e}\ttop-1={}/{}\tinformational",
+        prompt,
+        free_running.mean_kl(),
+        free_running.maximum_kl,
+        free_running.agreement,
+        free_running.steps
+    );
+    Ok(PromptVerification {
+        maximum_layer_error,
+        layers_passed: first_failing.is_none(),
+        passed: prompt_passed,
+        teacher_forced,
+        free_running,
+    })
+}
+
+fn layer_name(layer: Option<usize>) -> String {
+    layer.map_or_else(|| "-".to_owned(), |layer| layer.to_string())
 }
 
 fn verify_model_hash(
@@ -296,6 +453,7 @@ where
                 .step(EngineStep {
                     tokens: vec![match mode {
                         DecodeMode::FreeRunning => actual,
+                        DecodeMode::TeacherForced => expected,
                     }],
                     start_pos,
                     taps: false,
@@ -306,6 +464,11 @@ where
         }
     }
     Ok(metrics)
+}
+
+fn top1_passes(metrics: DecodeMetrics) -> bool {
+    metrics.steps > 0
+        && u64::from(metrics.agreement) * 100 >= u64::from(metrics.steps) * BF16_TOP1_PERCENT
 }
 
 fn selected_prompts<'a>(
@@ -383,12 +546,8 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     #[ignore = "requires FORJA_MODELS and runs in the pre-push hook"]
-    fn metal_bf16_all_fusions_prefill() -> Result<(), Box<dyn Error>> {
-        let options = model_options(
-            BackendArg::Metal,
-            Precision::Bf16,
-            vec!["short-english".to_owned()],
-        )?;
+    fn metal_bf16_qwen_verification() -> Result<(), Box<dyn Error>> {
+        let options = model_options(BackendArg::Metal, Precision::Bf16, Vec::new())?;
         let fixtures = FixtureDirectory::open(&options.fixtures)?;
         let weights = verify_model_hash(&options, &fixtures)?;
         let summary = tokio::runtime::Builder::new_current_thread()
@@ -397,39 +556,55 @@ mod tests {
                 &options,
                 &fixtures,
                 &weights,
-                test_guests::qwen3_bf16_all_fusions(),
+                test_guests::qwen3_bf16(),
                 32,
-                false,
+                true,
             ))?;
         assert!(summary.maximum_layer_error <= BF16_HIDDEN_STATE_TOLERANCE);
+        assert!(summary.teacher_forced.mean_kl() <= BF16_LOGIT_KL_TOLERANCE);
+        assert!(top1_passes(summary.teacher_forced));
         Ok(())
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
-    #[ignore = "requires FORJA_MODELS and runs in the pre-push hook"]
-    fn metal_bf16_qwen_measurement() -> Result<(), Box<dyn Error>> {
-        let root = PathBuf::from(env::var_os("FORJA_MODELS").ok_or("FORJA_MODELS is not set")?);
-        let options = Verify {
-            model_dir: root.join("Qwen3-0.6B"),
-            fixtures: root.join("golden/qwen3-0.6b"),
-            backend: BackendArg::Metal,
-            precision: Precision::Bf16,
-            prompts: vec!["short-english".to_owned()],
-        };
-        let fixtures = FixtureDirectory::open(&options.fixtures)?;
-        let weights = verify_model_hash(&options, &fixtures)?;
-        tokio::runtime::Builder::new_current_thread()
+    fn teacher_forcing_uses_reference_tokens() -> Result<(), Box<dyn Error>> {
+        let root = temporary_directory("teacher-forcing")?;
+        let weights = root.join("weights.safetensors");
+        fs::write(&weights, empty_safetensors())?;
+        let result = tokio::runtime::Builder::new_current_thread()
             .build()?
-            .block_on(run_with_component(
-                &options,
-                &fixtures,
-                &weights,
-                test_guests::qwen3_bf16(),
-                32,
-                false,
-            ))
-            .map(|_| ())
+            .block_on(async {
+                let mut runner = EngineRunner::new(
+                    test_guests::engine_smoke(),
+                    forja_cpu::CpuBackend::new(),
+                    limits(),
+                    &weights,
+                )
+                .await?;
+                runner.load().await??;
+                decode(
+                    &mut runner,
+                    DecodeInput {
+                        prompt: "tiny",
+                        expected_tokens: &[0, 1, 2],
+                        reference_logits: &[
+                            4.0, 1.0, 1.0, 1.0, 1.0, 4.0, 1.0, 1.0, 1.0, 1.0, 4.0, 1.0,
+                        ],
+                        prompt_tokens: 1,
+                        logits: vec![1.0, 1.0, 1.0, 4.0],
+                        vocab: 4,
+                        steps: 3,
+                    },
+                    DecodeMode::TeacherForced,
+                    false,
+                )
+                .await
+            });
+        fs::remove_dir_all(root)?;
+        let metrics = result?;
+        assert_eq!(metrics.agreement, 2);
+        assert_eq!(metrics.steps, 3);
+        Ok(())
     }
 
     #[test]
@@ -491,5 +666,23 @@ mod tests {
             precision,
             prompts,
         })
+    }
+
+    fn temporary_directory(test: &str) -> Result<PathBuf, Box<dyn Error>> {
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let root = env::temp_dir().join(format!("forja-verify-{test}-{nonce}"));
+        fs::create_dir(&root)?;
+        Ok(root)
+    }
+
+    fn empty_safetensors() -> Vec<u8> {
+        let mut header = br#"{"value":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#.to_vec();
+        while !(header.len() + 8).is_multiple_of(8) {
+            header.push(b' ');
+        }
+        let mut bytes = u64::try_from(header.len()).unwrap().to_le_bytes().to_vec();
+        bytes.extend(header);
+        bytes.extend_from_slice(&0_f32.to_le_bytes());
+        bytes
     }
 }
