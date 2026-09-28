@@ -26,9 +26,9 @@ const RMS_EPSILON: f32 = 1.0e-6;
 const ROPE_THETA: f32 = 1.0e6;
 const ATTENTION_SCALE: f32 = 0.088_388_35;
 const FUSE_RESIDUAL_NORM: bool = true;
-const FUSE_QK_NORM_ROPE: bool = true;
-const FUSE_SILU_MUL: bool = true;
-const FUSE_FINAL_NORM: bool = true;
+const FUSE_QK_NORM_ROPE: bool = false;
+const FUSE_SILU_MUL: bool = false;
+const FUSE_FINAL_NORM: bool = false;
 
 #[derive(Clone, Copy)]
 struct Config;
