@@ -184,6 +184,7 @@ impl Program {
         let (input_count, output_count) = validate_structure(self)?;
         typecheck(self)?;
         Ok(ValidatedProgram {
+            content_hash: hash_program(self),
             program: self.clone(),
             input_count,
             output_count,
@@ -194,6 +195,7 @@ impl Program {
 /// A program whose structure and resource use have been validated.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ValidatedProgram {
+    content_hash: ProgramHash,
     program: Program,
     input_count: usize,
     output_count: usize,
@@ -220,9 +222,25 @@ impl ValidatedProgram {
 
     /// Returns a stable SHA-256 digest of the canonical program encoding.
     #[must_use]
-    pub fn content_hash(&self) -> ProgramHash {
-        ProgramHash(Sha256::digest(canonical_bytes(&self.program)).into())
+    pub const fn content_hash(&self) -> ProgramHash {
+        self.content_hash
     }
+}
+
+fn hash_program(program: &Program) -> ProgramHash {
+    #[cfg(test)]
+    HASH_COMPUTATIONS.with(|count| count.set(count.get() + 1));
+    ProgramHash(Sha256::digest(canonical_bytes(program)).into())
+}
+
+#[cfg(test)]
+thread_local! {
+    static HASH_COMPUTATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn take_hash_computations() -> usize {
+    HASH_COMPUTATIONS.with(|count| count.replace(0))
 }
 
 /// A stable content digest for a validated program.

@@ -669,7 +669,7 @@ fn check_float(tensor: &Tensor, operand: Operand) -> Result<(), OpError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::program::{Inst, Program, ProgramKind};
+    use crate::program::{Inst, Program, ProgramKind, take_hash_computations};
 
     fn tensor(buffer: u64, dtype: DType, shape: &[u32], strides: &[u64]) -> Tensor {
         let bytes = u64::from(shape.iter().product::<u32>()) * dtype.byte_size();
@@ -735,6 +735,30 @@ mod tests {
                 slot: 0
             }))
         ));
+    }
+
+    #[test]
+    fn program_dispatch_does_not_recompute_the_content_hash() {
+        let program = Program {
+            kind: ProgramKind::Map,
+            insts: vec![Inst::Input(0)],
+            outputs: vec![(0, 0)],
+        }
+        .validate()
+        .unwrap();
+        let input = tensor(1, DType::F32, &[7, 1024], &[1024, 1]);
+        let output = tensor(2, DType::F32, &[7, 1024], &[1024, 1]);
+        take_hash_computations();
+
+        let mut commands = CommandList::new();
+        commands
+            .dispatch_program(&program, &[&input], &[&output])
+            .unwrap();
+        commands
+            .dispatch_program(&program, &[&input], &[&output])
+            .unwrap();
+
+        assert_eq!(take_hash_computations(), 0);
     }
 
     #[test]
