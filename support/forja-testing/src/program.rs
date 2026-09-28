@@ -1,14 +1,15 @@
 //! Well-typed scalar-program generation for backend differential tests.
 
 use forja_core::{
-    DType,
+    DType, Layout, ViewOp,
     program::{
         BinOp, Inst, MAX_INSTRUCTIONS, MAX_REDUCTIONS, Program, ProgramKind, RedOp, UnOp, ValueType,
     },
 };
+use half::{bf16, f16};
 use proptest::prelude::*;
 
-use crate::TensorSpec;
+use crate::{AgreementError, TensorSpec};
 
 const BASE_MAP_LEN: usize = 11;
 const BASE_ROW_LEN: usize = 14;
@@ -57,6 +58,368 @@ impl ProgramCase {
     #[must_use]
     pub fn outputs(&self) -> &[TensorSpec] {
         &self.outputs
+    }
+}
+
+const REDUCTION_ROUNDOFF_FACTOR: f64 = 2.0;
+
+#[derive(Clone, Copy)]
+enum ExactScalar {
+    Float(f64),
+    U32(u32),
+    Bool(bool),
+}
+
+pub(crate) fn row_reduction_tolerances(
+    case: &ProgramCase,
+    inputs: &[Vec<u8>],
+) -> Result<Vec<f64>, AgreementError> {
+    let width = usize::try_from(*case.shape.last().ok_or(AgreementError::InvalidOutput)?)
+        .map_err(|_| AgreementError::SizeOverflow)?;
+    let elements = element_count(&case.shape)?;
+    let rows = elements
+        .checked_div(width)
+        .ok_or(AgreementError::InvalidOutput)?;
+    let inputs = case
+        .inputs
+        .iter()
+        .zip(inputs)
+        .map(|(spec, bytes)| logical_values(spec, bytes))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut tolerances = vec![0.0_f64; rows];
+    let mut coordinates = vec![0_u32; case.shape.len()];
+    for (row, tolerance) in tolerances.iter_mut().enumerate() {
+        let row_start = row.checked_mul(width).ok_or(AgreementError::SizeOverflow)?;
+        let mut columns = Vec::<Vec<ExactScalar>>::with_capacity(case.program.insts.len());
+        for &inst in &case.program.insts {
+            let column = if let Inst::Reduce(op, operand) = inst {
+                let values = columns
+                    .get(usize::try_from(operand).map_err(|_| AgreementError::InvalidOutput)?)
+                    .ok_or(AgreementError::InvalidOutput)?;
+                if op == RedOp::Sum {
+                    *tolerance = tolerance.max(sum_tolerance(values)?);
+                }
+                vec![exact_reduce(op, values)?; width]
+            } else {
+                let mut column = Vec::with_capacity(width);
+                for lane in 0..width {
+                    let linear = row_start
+                        .checked_add(lane)
+                        .ok_or(AgreementError::SizeOverflow)?;
+                    decode_coordinates(linear, &case.shape, &mut coordinates)?;
+                    column.push(exact_eval(
+                        inst,
+                        &coordinates,
+                        &case.shape,
+                        &inputs,
+                        linear,
+                        |operand| exact_column_value(&columns, operand, lane),
+                    )?);
+                }
+                column
+            };
+            columns.push(column);
+        }
+    }
+    Ok(tolerances)
+}
+
+fn sum_tolerance(values: &[ExactScalar]) -> Result<f64, AgreementError> {
+    let values = values
+        .iter()
+        .map(|value| match value {
+            ExactScalar::Float(value) => Ok(*value),
+            ExactScalar::U32(_) | ExactScalar::Bool(_) => Err(AgreementError::InvalidOutput),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if values.iter().any(|value| !value.is_finite()) {
+        return Ok(0.0);
+    }
+    let sum = values.iter().sum::<f64>();
+    let magnitude = values.iter().map(|value| value.abs()).sum::<f64>();
+    if magnitude == 0.0 {
+        return Ok(0.0);
+    }
+    if sum == 0.0 {
+        return Ok(f64::INFINITY);
+    }
+    let count = f64::from(u32::try_from(values.len()).map_err(|_| AgreementError::SizeOverflow)?);
+    // Two legal f32 reduction orders each need one first-order rounding budget.
+    Ok(REDUCTION_ROUNDOFF_FACTOR * count * f64::from(f32::EPSILON) * magnitude / sum.abs())
+}
+
+fn logical_values(spec: &TensorSpec, bytes: &[u8]) -> Result<Vec<ExactScalar>, AgreementError> {
+    let buffer_len = u64::try_from(bytes.len()).map_err(|_| AgreementError::SizeOverflow)?;
+    let layout = Layout::contiguous(
+        spec.dtype(),
+        0,
+        spec.allocation_shape().to_vec(),
+        buffer_len,
+    )
+    .map_err(|_| AgreementError::InvalidOutput)?;
+    let layout = spec
+        .views()
+        .iter()
+        .try_fold(layout, |layout, view| match view {
+            ViewOp::Slice(slices) => layout.slice(slices),
+            ViewOp::Reshape(shape) => layout.reshape(shape),
+            ViewOp::Permute(axes) => layout.permute(axes),
+            ViewOp::Broadcast(shape) => layout.broadcast(shape),
+        })
+        .map_err(|_| AgreementError::InvalidOutput)?;
+    let elements =
+        usize::try_from(layout.element_count()).map_err(|_| AgreementError::SizeOverflow)?;
+    let mut coordinates = vec![0_u32; layout.shape().len()];
+    (0..elements)
+        .map(|linear| {
+            decode_coordinates(linear, layout.shape(), &mut coordinates)?;
+            let index = coordinates.iter().zip(layout.strides()).try_fold(
+                layout.offset(),
+                |index, (&coordinate, &stride)| {
+                    u64::from(coordinate)
+                        .checked_mul(stride)
+                        .and_then(|offset| index.checked_add(offset))
+                        .ok_or(AgreementError::SizeOverflow)
+                },
+            )?;
+            decode_scalar(spec.dtype(), bytes, index)
+        })
+        .collect()
+}
+
+fn decode_scalar(dtype: DType, bytes: &[u8], index: u64) -> Result<ExactScalar, AgreementError> {
+    let width = dtype.byte_size();
+    let start = usize::try_from(
+        index
+            .checked_mul(width)
+            .ok_or(AgreementError::SizeOverflow)?,
+    )
+    .map_err(|_| AgreementError::SizeOverflow)?;
+    let end = start
+        .checked_add(usize::try_from(width).map_err(|_| AgreementError::SizeOverflow)?)
+        .ok_or(AgreementError::SizeOverflow)?;
+    let bytes = bytes.get(start..end).ok_or(AgreementError::InvalidOutput)?;
+    match dtype {
+        DType::F32 => bytes
+            .try_into()
+            .map(f32::from_le_bytes)
+            .map(f64::from)
+            .map(ExactScalar::Float)
+            .map_err(|_| AgreementError::InvalidOutput),
+        DType::F16 => bytes
+            .try_into()
+            .map(f16::from_le_bytes)
+            .map(f16::to_f32)
+            .map(f64::from)
+            .map(ExactScalar::Float)
+            .map_err(|_| AgreementError::InvalidOutput),
+        DType::BF16 => bytes
+            .try_into()
+            .map(bf16::from_le_bytes)
+            .map(bf16::to_f32)
+            .map(f64::from)
+            .map(ExactScalar::Float)
+            .map_err(|_| AgreementError::InvalidOutput),
+        DType::U32 => bytes
+            .try_into()
+            .map(u32::from_le_bytes)
+            .map(ExactScalar::U32)
+            .map_err(|_| AgreementError::InvalidOutput),
+        DType::I32 => Err(AgreementError::UnsupportedDType(dtype)),
+    }
+}
+
+fn exact_eval(
+    inst: Inst,
+    coordinates: &[u32],
+    shape: &[u32],
+    inputs: &[Vec<ExactScalar>],
+    linear: usize,
+    operand: impl Fn(u32) -> Result<ExactScalar, AgreementError>,
+) -> Result<ExactScalar, AgreementError> {
+    match inst {
+        Inst::Input(slot) => inputs
+            .get(usize::try_from(slot).map_err(|_| AgreementError::InvalidOutput)?)
+            .and_then(|input| input.get(linear))
+            .copied()
+            .ok_or(AgreementError::InvalidOutput),
+        Inst::Const(value) => Ok(ExactScalar::Float(f64::from(value))),
+        Inst::Index(axis) => coordinates
+            .get(usize::from(axis))
+            .copied()
+            .map(ExactScalar::U32)
+            .ok_or(AgreementError::InvalidOutput),
+        Inst::Extent(axis) => shape
+            .get(usize::from(axis))
+            .copied()
+            .map(ExactScalar::U32)
+            .ok_or(AgreementError::InvalidOutput),
+        Inst::Unary(op, value) => exact_unary(op, operand(value)?),
+        Inst::Binary(op, left, right) => exact_binary(op, operand(left)?, operand(right)?),
+        Inst::Select(condition, accepted, rejected) => match operand(condition)? {
+            ExactScalar::Bool(true) => operand(accepted),
+            ExactScalar::Bool(false) => operand(rejected),
+            ExactScalar::Float(_) | ExactScalar::U32(_) => Err(AgreementError::InvalidOutput),
+        },
+        Inst::Cast(to, value) => Ok(exact_cast(to, operand(value)?)),
+        Inst::Reduce(_, _) => Err(AgreementError::InvalidOutput),
+    }
+}
+
+fn exact_unary(op: UnOp, value: ExactScalar) -> Result<ExactScalar, AgreementError> {
+    let ExactScalar::Float(value) = value else {
+        return Err(AgreementError::InvalidOutput);
+    };
+    Ok(ExactScalar::Float(match op {
+        UnOp::Neg => -value,
+        UnOp::Abs => value.abs(),
+        UnOp::Exp => value.exp(),
+        UnOp::Log => value.ln(),
+        UnOp::Sqrt => value.sqrt(),
+        UnOp::Rsqrt => value.sqrt().recip(),
+        UnOp::Sin => value.sin(),
+        UnOp::Cos => value.cos(),
+        UnOp::Tanh => value.tanh(),
+        UnOp::Sigmoid => 1.0 / (1.0 + (-value).exp()),
+        UnOp::Recip => value.recip(),
+        UnOp::Floor => value.floor(),
+    }))
+}
+
+#[allow(clippy::float_cmp)]
+fn exact_binary(
+    op: BinOp,
+    left: ExactScalar,
+    right: ExactScalar,
+) -> Result<ExactScalar, AgreementError> {
+    match (left, right) {
+        (ExactScalar::Float(left), ExactScalar::Float(right)) => Ok(match op {
+            BinOp::Add => ExactScalar::Float(left + right),
+            BinOp::Sub => ExactScalar::Float(left - right),
+            BinOp::Mul => ExactScalar::Float(left * right),
+            BinOp::Div => ExactScalar::Float(left / right),
+            BinOp::Min => ExactScalar::Float(propagating_min(left, right)),
+            BinOp::Max => ExactScalar::Float(propagating_max(left, right)),
+            BinOp::Pow => ExactScalar::Float(left.powf(right)),
+            BinOp::Lt => ExactScalar::Bool(left < right),
+            BinOp::Le => ExactScalar::Bool(left <= right),
+            BinOp::Eq => ExactScalar::Bool(left == right),
+            BinOp::Ne => ExactScalar::Bool(left != right),
+            BinOp::Ge => ExactScalar::Bool(left >= right),
+            BinOp::Gt => ExactScalar::Bool(left > right),
+        }),
+        (ExactScalar::U32(left), ExactScalar::U32(right)) => exact_integer_binary(op, left, right),
+        _ => Err(AgreementError::InvalidOutput),
+    }
+}
+
+fn exact_integer_binary(op: BinOp, left: u32, right: u32) -> Result<ExactScalar, AgreementError> {
+    Ok(match op {
+        BinOp::Add => ExactScalar::U32(left.wrapping_add(right)),
+        BinOp::Sub => ExactScalar::U32(left.wrapping_sub(right)),
+        BinOp::Mul => ExactScalar::U32(left.wrapping_mul(right)),
+        BinOp::Min => ExactScalar::U32(left.min(right)),
+        BinOp::Max => ExactScalar::U32(left.max(right)),
+        BinOp::Lt => ExactScalar::Bool(left < right),
+        BinOp::Le => ExactScalar::Bool(left <= right),
+        BinOp::Eq => ExactScalar::Bool(left == right),
+        BinOp::Ne => ExactScalar::Bool(left != right),
+        BinOp::Ge => ExactScalar::Bool(left >= right),
+        BinOp::Gt => ExactScalar::Bool(left > right),
+        BinOp::Div | BinOp::Pow => return Err(AgreementError::InvalidOutput),
+    })
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn exact_cast(to: ValueType, value: ExactScalar) -> ExactScalar {
+    match to {
+        ValueType::F32 => ExactScalar::Float(match value {
+            ExactScalar::Float(value) => value,
+            ExactScalar::U32(value) => f64::from(value),
+            ExactScalar::Bool(value) => f64::from(u8::from(value)),
+        }),
+        ValueType::U32 => ExactScalar::U32(match value {
+            ExactScalar::Float(value) => value as u32,
+            ExactScalar::U32(value) => value,
+            ExactScalar::Bool(value) => u32::from(value),
+        }),
+        ValueType::Bool => ExactScalar::Bool(match value {
+            ExactScalar::Float(value) => value != 0.0,
+            ExactScalar::U32(value) => value != 0,
+            ExactScalar::Bool(value) => value,
+        }),
+    }
+}
+
+fn exact_reduce(op: RedOp, values: &[ExactScalar]) -> Result<ExactScalar, AgreementError> {
+    values.iter().try_fold(
+        ExactScalar::Float(match op {
+            RedOp::Sum => 0.0,
+            RedOp::Max => f64::NEG_INFINITY,
+            RedOp::Min => f64::INFINITY,
+        }),
+        |accumulator, &value| match (accumulator, value) {
+            (ExactScalar::Float(left), ExactScalar::Float(right)) => {
+                Ok(ExactScalar::Float(match op {
+                    RedOp::Sum => left + right,
+                    RedOp::Max => propagating_max(left, right),
+                    RedOp::Min => propagating_min(left, right),
+                }))
+            }
+            _ => Err(AgreementError::InvalidOutput),
+        },
+    )
+}
+
+fn exact_column_value(
+    columns: &[Vec<ExactScalar>],
+    operand: u32,
+    lane: usize,
+) -> Result<ExactScalar, AgreementError> {
+    columns
+        .get(usize::try_from(operand).map_err(|_| AgreementError::InvalidOutput)?)
+        .and_then(|column| column.get(lane))
+        .copied()
+        .ok_or(AgreementError::InvalidOutput)
+}
+
+fn element_count(shape: &[u32]) -> Result<usize, AgreementError> {
+    shape.iter().try_fold(1_usize, |count, &extent| {
+        count
+            .checked_mul(usize::try_from(extent).map_err(|_| AgreementError::SizeOverflow)?)
+            .ok_or(AgreementError::SizeOverflow)
+    })
+}
+
+fn decode_coordinates(
+    mut linear: usize,
+    shape: &[u32],
+    coordinates: &mut [u32],
+) -> Result<(), AgreementError> {
+    for (coordinate, &extent) in coordinates.iter_mut().zip(shape).rev() {
+        let extent = usize::try_from(extent).map_err(|_| AgreementError::SizeOverflow)?;
+        if extent == 0 {
+            return Err(AgreementError::InvalidOutput);
+        }
+        *coordinate = u32::try_from(linear % extent).map_err(|_| AgreementError::SizeOverflow)?;
+        linear /= extent;
+    }
+    Ok(())
+}
+
+fn propagating_min(left: f64, right: f64) -> f64 {
+    if left.is_nan() || right.is_nan() {
+        f64::NAN
+    } else {
+        left.min(right)
+    }
+}
+
+fn propagating_max(left: f64, right: f64) -> f64 {
+    if left.is_nan() || right.is_nan() {
+        f64::NAN
+    } else {
+        left.max(right)
     }
 }
 

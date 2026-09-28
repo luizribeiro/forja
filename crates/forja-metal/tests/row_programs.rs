@@ -121,6 +121,33 @@ fn row_reductions_propagate_nan_and_handle_singletons() {
 }
 
 #[test]
+fn wide_constant_sum_fits_reduction_roundoff_bound() {
+    let value = 0.558_304_9_f32;
+    let shape = [1, 4097];
+    let program = Program {
+        kind: ProgramKind::Row,
+        insts: vec![Inst::Const(value), Inst::Reduce(RedOp::Sum, 0)],
+        outputs: vec![(0, 1)],
+    }
+    .validate()
+    .unwrap();
+    let cpu = CpuBackend::new();
+    let metal = MetalBackend::new().unwrap();
+    let expected = run_without_inputs(&cpu, &program, &shape);
+    let actual = run_without_inputs(&metal, &program, &shape);
+    let exact = f64::from(value) * 4097.0;
+    let cpu_error = (f64::from(expected[0]) - exact).abs() / exact.abs();
+    let metal_error = (f64::from(actual[0]) - exact).abs() / exact.abs();
+    let pair_error =
+        (f64::from(actual[0]) - f64::from(expected[0])).abs() / f64::from(expected[0]).abs();
+    let tolerance = 2.0 * 4097.0 * f64::from(f32::EPSILON);
+    assert!(pair_error > forja_testing::F32_TOLERANCE);
+    assert!(cpu_error <= tolerance, "{cpu_error} > {tolerance}");
+    assert!(metal_error <= tolerance, "{metal_error} > {tolerance}");
+    assert!(metal_error < cpu_error);
+}
+
+#[test]
 fn representative_rows_match_and_meet_kernel_time() {
     let backend = MetalBackend::new().unwrap();
     let timings = [rms_timing(&backend), softmax_timing(&backend)];
@@ -342,6 +369,23 @@ fn run_with_values<B: Backend>(
     outputs
         .iter()
         .map(|output| backend.read(output).unwrap())
+        .collect()
+}
+
+fn run_without_inputs<B: Backend>(
+    backend: &B,
+    program: &ValidatedProgram,
+    shape: &[u32],
+) -> Vec<f32> {
+    let output = backend.alloc(DType::F32, shape).unwrap();
+    run(backend, program_commands(program, &[], &[&output]));
+    backend
+        .read(&output)
+        .unwrap()
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|bytes| f32::from_le_bytes(*bytes))
         .collect()
 }
 

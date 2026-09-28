@@ -356,10 +356,12 @@ where
     let mut values = DeterministicValues::new(0xbb67_ae85_84ca_a73b);
     let mut reference_inputs = Vec::with_capacity(case.inputs().len());
     let mut candidate_inputs = Vec::with_capacity(case.inputs().len());
+    let mut input_bytes = Vec::with_capacity(case.inputs().len());
     for input in case.inputs() {
         let bytes = generated_bytes(input, &mut values)?;
         reference_inputs.push(allocate_initialized(reference, input, &bytes)?);
         candidate_inputs.push(allocate_initialized(candidate, input, &bytes)?);
+        input_bytes.push(bytes);
     }
     let reference_outputs = case
         .outputs()
@@ -372,6 +374,9 @@ where
         .map(|output| allocate(candidate, output))
         .collect::<Result<Vec<_>, _>>()?;
     let program = case.program().validate()?;
+    let row_tolerances = (case.program().kind == forja_core::program::ProgramKind::Row)
+        .then(|| program::row_reduction_tolerances(case, &input_bytes))
+        .transpose()?;
     run_program(reference, &program, &reference_inputs, &reference_outputs)?;
     run_program(candidate, &program, &candidate_inputs, &candidate_outputs)?;
     for ((spec, expected), actual) in case
@@ -380,11 +385,57 @@ where
         .zip(reference_outputs)
         .zip(candidate_outputs)
     {
-        assert_outputs_agree(
-            spec.dtype(),
-            &reference.read(&expected)?,
-            &candidate.read(&actual)?,
-        )?;
+        let expected = reference.read(&expected)?;
+        let actual = candidate.read(&actual)?;
+        if let Some(tolerances) = &row_tolerances {
+            assert_output_rows_agree(
+                spec.dtype(),
+                &expected,
+                &actual,
+                *case.shape().last().ok_or(AgreementError::InvalidOutput)?,
+                tolerances,
+            )?;
+        } else {
+            assert_outputs_agree(spec.dtype(), &expected, &actual)?;
+        }
+    }
+    Ok(())
+}
+
+fn assert_output_rows_agree(
+    dtype: DType,
+    expected_bytes: &[u8],
+    actual_bytes: &[u8],
+    width: u32,
+    reduction_tolerances: &[f64],
+) -> Result<(), AgreementError> {
+    if matches!(dtype, DType::I32 | DType::U32) {
+        return (expected_bytes == actual_bytes)
+            .then_some(())
+            .ok_or(AgreementError::OutputMismatch);
+    }
+    let expected = decode(expected_bytes, dtype)?;
+    let actual = decode(actual_bytes, dtype)?;
+    let width = usize::try_from(width).map_err(|_| AgreementError::SizeOverflow)?;
+    if expected.len() != actual.len()
+        || expected.len() != width.saturating_mul(reduction_tolerances.len())
+    {
+        return Err(AgreementError::OutputMismatch);
+    }
+    let base_tolerance = dtype_tolerance(dtype)?;
+    for ((expected, actual), &reduction_tolerance) in expected
+        .chunks_exact(width)
+        .zip(actual.chunks_exact(width))
+        .zip(reduction_tolerances)
+    {
+        let (error, count) = compare_float_values(expected, actual);
+        if count != 0 {
+            return Err(AgreementError::ClassMismatch { count });
+        }
+        let tolerance = base_tolerance.max(reduction_tolerance);
+        if error > tolerance {
+            return Err(AgreementError::OutsideTolerance { error, tolerance });
+        }
     }
     Ok(())
 }
