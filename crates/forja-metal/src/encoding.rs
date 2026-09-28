@@ -5591,6 +5591,7 @@ mod tests {
 
     #[test]
     fn metal_gemm_matches_qwen_projection_shapes() {
+        let backend = MetalBackend::new().unwrap();
         for m in [7, 128, 512] {
             for (k, n) in [
                 (1024, 2048),
@@ -5599,7 +5600,8 @@ mod tests {
                 (1024, 3072),
                 (3072, 1024),
             ] {
-                assert_matmul(
+                assert_matmul_with(
+                    &backend,
                     TensorSpec::contiguous(DType::BF16, &[m, k]),
                     TensorSpec::permuted(DType::BF16, &[n, k], &[1, 0]),
                     &TensorSpec::contiguous(DType::BF16, &[m, n]),
