@@ -27,6 +27,7 @@ const ROPE_THETA: f32 = 1.0e6;
 const ATTENTION_SCALE: f32 = 0.088_388_35;
 const FUSE_RESIDUAL_NORM: bool = true;
 const FUSE_QK_NORM_ROPE: bool = true;
+const FUSE_SILU_MUL: bool = true;
 
 #[derive(Clone, Copy)]
 struct Config;
@@ -249,7 +250,12 @@ impl<T: Activation> DecoderLayer<T> {
         };
         let gate = self.mlp.gate_proj.forward(&normalized)?;
         let up = self.mlp.up_proj.forward(&normalized)?;
-        let projected = self.mlp.down_proj.forward(&gate.silu_mul(&up)?)?;
+        let activated = if FUSE_SILU_MUL {
+            silu_mul(&gate, &up)?
+        } else {
+            gate.silu_mul(&up)?
+        };
+        let projected = self.mlp.down_proj.forward(&activated)?;
         if FUSE_RESIDUAL_NORM && let Some(norm) = following_norm {
             let (residual, normalized) = residual_norm(&hidden, &projected, norm)?;
             Ok((residual, Some(normalized)))
@@ -261,6 +267,17 @@ impl<T: Activation> DecoderLayer<T> {
             Ok((residual, normalized))
         }
     }
+}
+
+fn silu_mul<T: Activation>(gate: &Tensor<T>, up: &Tensor<T>) -> Result<Tensor<T>> {
+    let program = Program::map();
+    let gate_value = program.input(0);
+    program.output(0, gate_value * gate_value.sigmoid() * program.input(1));
+    let [output] = gate
+        .run_program(&program, &[up])?
+        .try_into()
+        .map_err(|_| forja_sdk::Error::loading("SiLU multiplication produced invalid outputs"))?;
+    Ok(output)
 }
 
 fn qk_norm_rope<T: Activation>(
