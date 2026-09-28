@@ -12,6 +12,7 @@ use crate::{AgreementError, TensorSpec, program::ProgramCase};
 
 const F32_ULPS: u32 = 1;
 const PRECISE_ULPS: u32 = 4;
+const ZERO_SCALE_NORMALS: f64 = 1.0;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct FloatInterval {
@@ -90,22 +91,16 @@ impl FloatInterval {
         }
     }
 
-    pub(crate) fn is_vacuous(self) -> bool {
-        if !self.has_numbers() {
-            return false;
+    pub(crate) fn is_meaningful(self, relative_limit: f64) -> bool {
+        self.relative_width() <= relative_limit || self.absolute_width() <= zero_scale_width_limit()
+    }
+
+    fn absolute_width(self) -> f64 {
+        if self.has_numbers() {
+            self.hi - self.lo
+        } else {
+            0.0
         }
-        if self.lo.to_bits() == self.hi.to_bits() {
-            return false;
-        }
-        if !self.lo.is_finite() || !self.hi.is_finite() {
-            return true;
-        }
-        let width = self.hi - self.lo;
-        if width == 0.0 {
-            return false;
-        }
-        let center = self.lo + width / 2.0;
-        width >= center.abs()
     }
 
     pub(crate) fn converted(self, dtype: DType) -> Result<Self, AgreementError> {
@@ -132,6 +127,11 @@ impl FloatInterval {
         self.lo = overflow_endpoint(self.lo, maximum);
         self.hi = overflow_endpoint(self.hi, maximum);
     }
+}
+
+fn zero_scale_width_limit() -> f64 {
+    // One minimum-normal f32 keeps the exception inside the subnormal scale.
+    f64::from(f32::MIN_POSITIVE) * ZERO_SCALE_NORMALS
 }
 
 #[derive(Clone, Copy)]

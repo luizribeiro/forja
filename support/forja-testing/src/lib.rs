@@ -426,6 +426,7 @@ where
     };
     let mut relative_widths = Vec::new();
     for (output_slot, (spec, actual)) in case.outputs().iter().zip(candidate_outputs).enumerate() {
+        let limit = interval_width_limit(spec.dtype())?;
         let actual = decode(&candidate.read(&actual)?, spec.dtype())?;
         let intervals = evaluation
             .outputs
@@ -436,6 +437,7 @@ where
         }
 
         let mut output_widths = Vec::with_capacity(intervals.len());
+        let mut output_vacuous = 0_usize;
         for (index, (&actual, interval)) in actual.iter().zip(intervals).enumerate() {
             let interval = interval.converted(spec.dtype())?;
             if !interval.contains(actual) {
@@ -451,12 +453,12 @@ where
             let width = interval.relative_width();
             output_widths.push(width);
             relative_widths.push(width);
-            report.vacuous_elements += usize::from(interval.is_vacuous());
+            output_vacuous += usize::from(!interval.is_meaningful(limit));
             report.total_elements += 1;
         }
+        report.vacuous_elements += output_vacuous;
         let median = percentile(&mut output_widths, 50);
-        let limit = interval_width_limit(spec.dtype())?;
-        if median > limit {
+        if output_vacuous > intervals.len() / 2 {
             return Err(AgreementError::WideIntervals {
                 dtype: spec.dtype(),
                 median,
@@ -649,6 +651,30 @@ mod tests {
         assert_eq!(interval_width_limit(DType::F32), Ok(6.0e-3));
         assert_eq!(interval_width_limit(DType::F16), Ok(2.0e-2));
         assert_eq!(interval_width_limit(DType::BF16), Ok(1.0e-1));
+    }
+
+    #[test]
+    fn zero_scale_width_keeps_exact_zero_intervals_meaningful() {
+        let subnormal_ulp = f64::from(f32::from_bits(1));
+        let interval = interval::FloatInterval {
+            lo: -subnormal_ulp,
+            hi: subnormal_ulp,
+            may_nan: false,
+        };
+
+        assert!(interval.relative_width().is_infinite());
+        assert!(interval.is_meaningful(interval_width_limit(DType::F32).unwrap()));
+    }
+
+    #[test]
+    fn zero_scale_width_does_not_weaken_nonzero_relative_limit() {
+        let interval = interval::FloatInterval {
+            lo: 1.0,
+            hi: 1.01,
+            may_nan: false,
+        };
+
+        assert!(!interval.is_meaningful(interval_width_limit(DType::F32).unwrap()));
     }
 
     #[test]
