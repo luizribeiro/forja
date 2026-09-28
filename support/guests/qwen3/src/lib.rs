@@ -6,7 +6,7 @@ use forja_sdk::{
         Embedding, EmbeddingConfig, Linear, LinearConfig, RmsNorm, RmsNormConfig, WeightElement,
         ops::sdpa,
     },
-    program::{Program, ReduceOp},
+    program::{Program, ReduceOp, Value},
 };
 
 /// Vocabulary size reported by Qwen3-0.6B.
@@ -28,6 +28,7 @@ const ATTENTION_SCALE: f32 = 0.088_388_35;
 const FUSE_RESIDUAL_NORM: bool = true;
 const FUSE_QK_NORM_ROPE: bool = true;
 const FUSE_SILU_MUL: bool = true;
+const FUSE_FINAL_NORM: bool = true;
 
 #[derive(Clone, Copy)]
 struct Config;
@@ -331,15 +332,31 @@ fn residual_norm<T: Activation>(
     let weight = norm.weight().broadcast_as(residual.shape())?;
     let program = Program::row();
     let value = program.input(0) + program.input(1);
-    let square_sum = program.reduce(ReduceOp::Sum, value * value);
-    let inverse_rms = (square_sum / program.extent(-1) + RMS_EPSILON).rsqrt();
     program.output(0, value);
-    program.output(1, value * inverse_rms * program.input(2));
+    program.output(1, rms_normalize(&program, value, program.input(2)));
     let outputs = residual.run_program(&program, &[update, &weight])?;
     let [residual, normalized] = outputs
         .try_into()
         .map_err(|_| forja_sdk::Error::loading("residual norm produced invalid outputs"))?;
     Ok((residual, normalized))
+}
+
+fn final_norm<T: Activation>(input: &Tensor<T>, norm: &RmsNorm<T>) -> Result<Tensor<T>> {
+    let weight = norm.weight().broadcast_as(input.shape())?;
+    let program = Program::row();
+    let value = program.input(0);
+    program.output(0, rms_normalize(&program, value, program.input(1)));
+    let [output] = input
+        .run_program(&program, &[&weight])?
+        .try_into()
+        .map_err(|_| forja_sdk::Error::loading("final norm produced invalid outputs"))?;
+    Ok(output)
+}
+
+fn rms_normalize<'a>(program: &'a Program, value: Value<'a>, weight: Value<'a>) -> Value<'a> {
+    let square_sum = program.reduce(ReduceOp::Sum, value * value);
+    let inverse_rms = (square_sum / program.extent(-1) + RMS_EPSILON).rsqrt();
+    value * inverse_rms * weight
 }
 
 /// Qwen3-0.6B with a fixed 4096-token KV cache.
@@ -461,7 +478,11 @@ impl Engine for ExportedQwen3 {
                 normalized = value;
             }
         }
-        hidden = self.weights.model.norm.forward(&hidden)?;
+        hidden = if FUSE_FINAL_NORM {
+            final_norm(&hidden, &self.weights.model.norm)?
+        } else {
+            self.weights.model.norm.forward(&hidden)?
+        };
         if input.taps {
             taps.push(Self::output(hidden.contiguous()?)?);
         }
