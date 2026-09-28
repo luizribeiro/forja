@@ -7,11 +7,13 @@ use forja_core::{
 
 pub(super) const KERNEL_NAME: &str = "forja_map";
 pub(super) const ROW_KERNEL_NAME: &str = "forja_row";
+pub(super) const REGISTER_RESIDENT_WIDTH: u32 = 1024;
 pub(super) const SHARED_HEADER: &str = include_str!("elementwise.metal");
 
-pub(super) fn generate(program: &BoundProgram) -> String {
+pub(super) fn generate(program: &BoundProgram, resident: bool) -> String {
     match program.program().program().kind {
         ProgramKind::Map => generate_map(program),
+        ProgramKind::Row if resident => generate_resident_row(program),
         ProgramKind::Row => generate_row(program),
     }
 }
@@ -56,6 +58,78 @@ fn generate_map(program: &BoundProgram) -> String {
 }
 
 fn generate_row(program: &BoundProgram) -> String {
+    let mut source = row_source(program);
+    let rank = program.outputs()[0].layout().shape().len();
+    let instructions = &program.program().program().insts;
+    for (reduce_slot, (index, instruction)) in instructions
+        .iter()
+        .enumerate()
+        .filter_map(|(index, instruction)| match instruction {
+            Inst::Reduce(op, operand) => Some((index, (*op, *operand))),
+            _ => None,
+        })
+        .enumerate()
+    {
+        emit_reduce_stage(
+            &mut source,
+            program,
+            index,
+            reduce_slot,
+            instruction.0,
+            instruction.1,
+            rank,
+        );
+    }
+    emit_output_stage(&mut source, program, rank);
+    line(&mut source, format_args!("}}"));
+    source
+}
+
+fn generate_resident_row(program: &BoundProgram) -> String {
+    let mut source = row_source(program);
+    let rank = program.outputs()[0].layout().shape().len();
+    line(&mut source, format_args!("    bool active = lane < width;"));
+    line(
+        &mut source,
+        format_args!("    uint column = min(lane, width - 1u);"),
+    );
+    emit_lane_coordinates(&mut source, rank, 4);
+    emit_addresses_indented(
+        &mut source,
+        program.inputs().len(),
+        program.outputs().len(),
+        rank,
+        4,
+    );
+    let mut types = Vec::with_capacity(program.program().program().insts.len());
+    let mut reduce_slot = 0;
+    for (index, &instruction) in program.program().program().insts.iter().enumerate() {
+        if let Inst::Reduce(op, operand) = instruction {
+            emit_resident_reduce(&mut source, reduce_slot, op, operand);
+            types.push(ValueType::F32);
+            line(
+                &mut source,
+                format_args!("    float v{index} = row_values[{reduce_slot}];"),
+            );
+            reduce_slot += 1;
+        } else {
+            let (value_type, expression) =
+                instruction_expression(instruction, program.inputs(), &types);
+            types.push(value_type);
+            line(
+                &mut source,
+                format_args!("    {} v{index} = {expression};", type_name(value_type)),
+            );
+        }
+    }
+    line(&mut source, format_args!("    if (active) {{"));
+    emit_stores(&mut source, program, 8);
+    line(&mut source, format_args!("    }}"));
+    line(&mut source, format_args!("}}"));
+    source
+}
+
+fn row_source(program: &BoundProgram) -> String {
     let inputs = program.inputs();
     let outputs = program.outputs();
     let rank = outputs[0].layout().shape().len();
@@ -98,30 +172,31 @@ fn generate_row(program: &BoundProgram) -> String {
         format_args!("    threadgroup float row_values[4];"),
     );
     emit_row_coordinates(&mut source, rank);
-
-    let instructions = &program.program().program().insts;
-    for (reduce_slot, (index, instruction)) in instructions
-        .iter()
-        .enumerate()
-        .filter_map(|(index, instruction)| match instruction {
-            Inst::Reduce(op, operand) => Some((index, (*op, *operand))),
-            _ => None,
-        })
-        .enumerate()
-    {
-        emit_reduce_stage(
-            &mut source,
-            program,
-            index,
-            reduce_slot,
-            instruction.0,
-            instruction.1,
-            rank,
-        );
-    }
-    emit_output_stage(&mut source, program, rank);
-    line(&mut source, format_args!("}}"));
     source
+}
+
+fn emit_resident_reduce(source: &mut String, reduce_slot: usize, op: RedOp, operand: u32) {
+    let identity = match op {
+        RedOp::Sum => "0.0f",
+        RedOp::Max => "-INFINITY",
+        RedOp::Min => "INFINITY",
+    };
+    let simd_reduce = match op {
+        RedOp::Sum => "simd_sum",
+        RedOp::Max => "simd_max",
+        RedOp::Min => "simd_min",
+    };
+    line(source, format_args!("    {{"));
+    line(
+        source,
+        format_args!("        float accumulator = select({identity}, v{operand}, active);"),
+    );
+    line(
+        source,
+        format_args!("        bool accumulator_nan = active && isnan(v{operand});"),
+    );
+    emit_threadgroup_reduce(source, reduce_slot, identity, simd_reduce);
+    line(source, format_args!("    }}"));
 }
 
 fn emit_operand_parameters(source: &mut String, input_count: usize, output_count: usize) {
@@ -314,6 +389,11 @@ fn emit_output_stage(source: &mut String, program: &BoundProgram, rank: usize) {
         8,
     );
     emit_values(source, program, program.program().program().insts.len(), 8);
+    emit_stores(source, program, 8);
+    line(source, format_args!("    }}"));
+}
+
+fn emit_stores(source: &mut String, program: &BoundProgram, indent: usize) {
     for &(slot, value) in &program.program().program().outputs {
         let slot = usize::try_from(slot).unwrap_or(usize::MAX);
         let expression = if program.outputs()[slot].layout().dtype() == DType::BF16 {
@@ -324,9 +404,8 @@ fn emit_output_stage(source: &mut String, program: &BoundProgram, rank: usize) {
                 output_dtype_name(slot)
             )
         };
-        line(source, format_args!("        {expression}"));
+        line(source, format_args!("{:indent$}{expression}", ""));
     }
-    line(source, format_args!("    }}"));
 }
 
 fn emit_lane_coordinates(source: &mut String, rank: usize, indent: usize) {
@@ -770,6 +849,29 @@ kernel void forja_row(
         );
     }
 
+    #[test]
+    fn resident_rows_keep_values_across_reductions() {
+        let program = Program {
+            kind: ProgramKind::Row,
+            insts: vec![
+                Inst::Input(0),
+                Inst::Reduce(RedOp::Max, 0),
+                Inst::Binary(BinOp::Sub, 0, 1),
+            ],
+            outputs: vec![(0, 2)],
+        };
+        let source = bound_source(
+            &program,
+            &[DType::F32],
+            &[DType::F32],
+            &[REGISTER_RESIDENT_WIDTH],
+            true,
+        );
+        assert_eq!(source.matches("load_float(input0").count(), 1);
+        assert!(source.contains("float accumulator = select(-INFINITY, v0, active);"));
+        assert!(source.contains("float v2 = v0 - v1;"));
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(32))]
 
@@ -807,6 +909,16 @@ kernel void forja_row(
     }
 
     fn source(program: &Program, inputs: &[DType], outputs: &[DType], shape: &[u32]) -> String {
+        bound_source(program, inputs, outputs, shape, false)
+    }
+
+    fn bound_source(
+        program: &Program,
+        inputs: &[DType],
+        outputs: &[DType],
+        shape: &[u32],
+        resident: bool,
+    ) -> String {
         let backend = CpuBackend::new();
         let inputs = inputs
             .iter()
@@ -823,6 +935,6 @@ kernel void forja_row(
             &outputs.iter().collect::<Vec<_>>(),
         )
         .unwrap();
-        generate(&bound)
+        generate(&bound, resident)
     }
 }

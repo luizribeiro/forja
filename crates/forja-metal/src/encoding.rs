@@ -322,10 +322,12 @@ struct ProgramPipelineKey {
     output_dtypes: Vec<u8>,
     rank: u8,
     row: bool,
+    resident: bool,
 }
 
 impl ProgramPipelineKey {
-    fn new(program: &BoundProgram) -> Self {
+    fn new(program: &BoundProgram, resident: bool) -> Self {
+        let row = program.program().program().kind == ProgramKind::Row;
         Self {
             hash: program.program().content_hash(),
             input_dtypes: program
@@ -339,9 +341,22 @@ impl ProgramPipelineKey {
                 .map(|tensor| dtype_key(tensor.layout().dtype()))
                 .collect(),
             rank: u8::try_from(program.outputs()[0].layout().shape().len()).unwrap_or(u8::MAX),
-            row: program.program().program().kind == ProgramKind::Row,
+            row,
+            resident: row && resident,
         }
     }
+}
+
+struct ProgramPipeline {
+    state: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    resident: bool,
+}
+
+fn resident_program_width(program: &BoundProgram) -> Option<u32> {
+    (program.program().program().kind == ProgramKind::Row)
+        .then(|| program.outputs()[0].layout().shape().last().copied())
+        .flatten()
+        .filter(|&width| width <= map_codegen::REGISTER_RESIDENT_WIDTH)
 }
 
 struct LruEntry<V> {
@@ -1230,14 +1245,13 @@ impl MetalBackend {
     }
 
     fn charge_program_compile_budget(&self, dispatches: &[Dispatch]) -> Result<(), BackendError> {
-        let pipelines = self
+        let mut pipelines = self
             .pipelines
             .lock()
             .map_err(|_| BackendError::ExecutionFailed)?;
         let mut missing = HashSet::new();
         for program in dispatches.iter().filter_map(Dispatch::bound_program) {
-            let key = ProgramPipelineKey::new(program);
-            if !pipelines.programs.contains(&key) {
+            for key in pipelines.program_keys_to_compile(program)? {
                 missing.insert(key);
                 if missing.len() > MAX_PROGRAM_COMPILES_PER_SUBMISSION {
                     return Err(BackendError::QuotaExceeded);
@@ -2751,7 +2765,7 @@ impl MetalBackend {
             .lock()
             .map_err(|_| BackendError::ExecutionFailed)?
             .get_program(program)?;
-        encoder.setComputePipelineState(&pipeline);
+        encoder.setComputePipelineState(&pipeline.state);
         let operands = program
             .inputs()
             .iter()
@@ -2772,7 +2786,7 @@ impl MetalBackend {
         drop(buffers);
         encoder.setArgumentTable(Some(table));
         let (threadgroups, threads_per_threadgroup) = match program.program().program().kind {
-            ProgramKind::Map => map_dispatch_geometry(&pipeline, dispatch.output().layout())?,
+            ProgramKind::Map => map_dispatch_geometry(&pipeline.state, dispatch.output().layout())?,
             ProgramKind::Row => {
                 let width = dispatch
                     .output()
@@ -2781,7 +2795,12 @@ impl MetalBackend {
                     .last()
                     .copied()
                     .ok_or(BackendError::InvalidInput)?;
-                row_dispatch_geometry(&pipeline, dispatch.output().layout(), width)?
+                program_row_dispatch_geometry(
+                    &pipeline.state,
+                    dispatch.output().layout(),
+                    width,
+                    pipeline.resident,
+                )?
             }
         };
         encoder.dispatchThreadgroups_threadsPerThreadgroup(threadgroups, threads_per_threadgroup);
@@ -3394,6 +3413,46 @@ fn row_dispatch_geometry(
     ))
 }
 
+fn program_row_dispatch_geometry(
+    pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
+    output: &Layout,
+    width: u32,
+    resident: bool,
+) -> Result<(MTLSize, MTLSize), BackendError> {
+    if !resident {
+        return row_dispatch_geometry(pipeline, output, width);
+    }
+    let width = usize::try_from(width).map_err(|_| BackendError::ExecutionFailed)?;
+    let max_threads = pipeline.maxTotalThreadsPerThreadgroup();
+    if width > max_threads {
+        return Err(BackendError::ExecutionFailed);
+    }
+    let preferred = width
+        .checked_next_multiple_of(32)
+        .ok_or(BackendError::ExecutionFailed)?;
+    let thread_count = if preferred <= max_threads {
+        preferred
+    } else {
+        width
+    };
+    let rows = output
+        .element_count()
+        .checked_div(u64::try_from(width).map_err(|_| BackendError::InvalidInput)?)
+        .ok_or(BackendError::InvalidInput)?;
+    Ok((
+        MTLSize {
+            width: usize::try_from(rows).map_err(|_| BackendError::ExecutionFailed)?,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: thread_count,
+            height: 1,
+            depth: 1,
+        },
+    ))
+}
+
 fn map_dispatch_geometry(
     pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
     output: &Layout,
@@ -3544,18 +3603,70 @@ impl PipelineCache {
         Ok(pipeline)
     }
 
-    pub(super) fn get_program(
+    fn get_program(&mut self, program: &BoundProgram) -> Result<ProgramPipeline, BackendError> {
+        if let Some(width) = resident_program_width(program)
+            && let Ok(pipeline) = self.get_program_variant(program, true)
+            && pipeline.maxTotalThreadsPerThreadgroup()
+                >= usize::try_from(width).map_err(|_| BackendError::ExecutionFailed)?
+        {
+            return Ok(ProgramPipeline {
+                state: pipeline,
+                resident: true,
+            });
+        }
+        Ok(ProgramPipeline {
+            state: self.get_program_variant(program, false)?,
+            resident: false,
+        })
+    }
+
+    fn get_program_variant(
         &mut self,
         program: &BoundProgram,
+        resident: bool,
     ) -> Result<Retained<ProtocolObject<dyn MTLComputePipelineState>>, BackendError> {
-        let key = ProgramPipelineKey::new(program);
+        let key = ProgramPipelineKey::new(program, resident);
         if let Some(pipeline) = self.programs.get(&key) {
             return Ok(pipeline.clone());
         }
-        let source = map_codegen::generate(program);
+        let source = map_codegen::generate(program, key.resident);
         let pipeline = self.compile_program_source(&key, &source)?;
         self.programs.insert(key, pipeline.clone());
         Ok(pipeline)
+    }
+
+    fn program_keys_to_compile(
+        &mut self,
+        program: &BoundProgram,
+    ) -> Result<Vec<ProgramPipelineKey>, BackendError> {
+        let Some(width) = resident_program_width(program) else {
+            let key = ProgramPipelineKey::new(program, false);
+            return Ok((!self.programs.contains(&key))
+                .then_some(key)
+                .into_iter()
+                .collect());
+        };
+
+        let resident_key = ProgramPipelineKey::new(program, true);
+        if let Some(pipeline) = self.programs.get(&resident_key) {
+            if pipeline.maxTotalThreadsPerThreadgroup()
+                >= usize::try_from(width).map_err(|_| BackendError::ExecutionFailed)?
+            {
+                return Ok(Vec::new());
+            }
+            let rereading_key = ProgramPipelineKey::new(program, false);
+            return Ok((!self.programs.contains(&rereading_key))
+                .then_some(rereading_key)
+                .into_iter()
+                .collect());
+        }
+
+        let mut keys = vec![resident_key];
+        let rereading_key = ProgramPipelineKey::new(program, false);
+        if !self.programs.contains(&rereading_key) {
+            keys.push(rereading_key);
+        }
+        Ok(keys)
     }
 
     fn compile_program_source(
@@ -3673,12 +3784,23 @@ mod tests {
         let other_rank = identity_program(&backend, DType::F16, DType::F32, &[7], false);
         let other_input = identity_program(&backend, DType::BF16, DType::F32, &[7, 33], false);
         let other_output = identity_program(&backend, DType::F16, DType::F16, &[7, 33], false);
-        let key = ProgramPipelineKey::new(&contiguous);
-        assert_eq!(key, ProgramPipelineKey::new(&permuted));
-        assert_eq!(key, ProgramPipelineKey::new(&other_shape));
-        assert_ne!(key, ProgramPipelineKey::new(&other_rank));
-        assert_ne!(key, ProgramPipelineKey::new(&other_input));
-        assert_ne!(key, ProgramPipelineKey::new(&other_output));
+        let key = ProgramPipelineKey::new(&contiguous, false);
+        assert_eq!(key, ProgramPipelineKey::new(&permuted, false));
+        assert_eq!(key, ProgramPipelineKey::new(&other_shape, false));
+        assert_ne!(key, ProgramPipelineKey::new(&other_rank, false));
+        assert_ne!(key, ProgramPipelineKey::new(&other_input, false));
+        assert_ne!(key, ProgramPipelineKey::new(&other_output, false));
+    }
+
+    #[test]
+    fn row_pipeline_key_distinguishes_register_residency() {
+        let backend = CpuBackend::new();
+        let resident = row_program(&backend, map_codegen::REGISTER_RESIDENT_WIDTH);
+        let resident_key = ProgramPipelineKey::new(&resident, true);
+        let rereading_key = ProgramPipelineKey::new(&resident, false);
+        assert!(resident_key.resident);
+        assert!(!rereading_key.resident);
+        assert_ne!(resident_key, rereading_key);
     }
 
     #[test]
@@ -3751,7 +3873,7 @@ mod tests {
         cache.get_program(&program).unwrap();
         cache.get_program(&program).unwrap();
         assert_eq!(cache.programs.entries.len(), 1);
-        let key = ProgramPipelineKey::new(&program);
+        let key = ProgramPipelineKey::new(&program, false);
         assert!(matches!(
             cache.compile_program_source(&key, "kernel void broken("),
             Err(BackendError::ExecutionFailed)
@@ -3791,6 +3913,25 @@ mod tests {
         assert_outputs_agree(DType::F32, &expected, &actual).unwrap();
     }
 
+    #[test]
+    fn register_heavy_rows_cover_every_element_at_residency_boundary() {
+        let cpu = CpuBackend::new();
+        let metal = MetalBackend::new().unwrap();
+        let program = register_heavy_row_program();
+
+        for width in [1024_u32, 1025] {
+            let expected = run_row_program(&cpu, &program, width);
+            let actual = run_row_program(&metal, &program, width);
+            let (expected, expected_remainder) = expected.as_chunks::<4>();
+            let (actual, actual_remainder) = actual.as_chunks::<4>();
+            assert!(expected_remainder.is_empty());
+            assert!(actual_remainder.is_empty());
+            for (expected, actual) in expected.iter().zip(actual) {
+                assert_outputs_agree(DType::F32, expected, actual).unwrap();
+            }
+        }
+    }
+
     fn run_single_program<B: Backend>(backend: &B, program: &ValidatedProgram) -> Vec<u8> {
         let input = backend.alloc(DType::F32, &[2, 33]).unwrap();
         let bytes = (0_u16..66)
@@ -3804,6 +3945,52 @@ mod tests {
             .unwrap();
         backend.submit(commands).unwrap().wait().unwrap();
         backend.read(&output).unwrap()
+    }
+
+    fn run_row_program<B: Backend>(backend: &B, program: &ValidatedProgram, width: u32) -> Vec<u8> {
+        let input = backend.alloc(DType::F32, &[width]).unwrap();
+        let bytes = (0..width)
+            .flat_map(|index| {
+                let value = f32::from(u16::try_from(index % 17).unwrap()) / 64.0 - 0.125;
+                value.to_le_bytes()
+            })
+            .collect::<Vec<_>>();
+        backend.write(&input, &bytes).unwrap();
+        let output = backend.alloc(DType::F32, &[width]).unwrap();
+        let mut commands = CommandList::new();
+        commands
+            .dispatch_program(program, &[&input], &[&output])
+            .unwrap();
+        backend.submit(commands).unwrap().wait().unwrap();
+        backend.read(&output).unwrap()
+    }
+
+    fn register_heavy_row_program() -> ValidatedProgram {
+        let mut insts = vec![Inst::Input(0)];
+        let mut values = Vec::with_capacity(85);
+        for coefficient in 1_u16..=85 {
+            let constant = u32::try_from(insts.len()).unwrap();
+            insts.push(Inst::Const(f32::from(coefficient) / 128.0));
+            let product = u32::try_from(insts.len()).unwrap();
+            insts.push(Inst::Binary(BinOp::Mul, 0, constant));
+            values.push(product);
+        }
+        let mut combined = values[0];
+        for value in values.into_iter().skip(1) {
+            let sum = u32::try_from(insts.len()).unwrap();
+            insts.push(Inst::Binary(BinOp::Add, combined, value));
+            combined = sum;
+        }
+        let reduced = u32::try_from(insts.len()).unwrap();
+        insts.push(Inst::Reduce(RedOp::Sum, combined));
+        assert_eq!(insts.len(), forja_core::program::MAX_INSTRUCTIONS);
+        Program {
+            kind: ProgramKind::Row,
+            insts,
+            outputs: vec![(0, reduced)],
+        }
+        .validate()
+        .unwrap()
     }
 
     fn run_two_output_program<B: Backend>(backend: &B) -> [Vec<u8>; 2] {
@@ -3862,6 +4049,19 @@ mod tests {
             kind: ProgramKind::Map,
             insts: vec![Inst::Input(0)],
             outputs: vec![(0, 0)],
+        }
+        .validate()
+        .unwrap();
+        bind_program(&program, &[&input], &[&output]).unwrap()
+    }
+
+    fn row_program(backend: &CpuBackend, width: u32) -> BoundProgram {
+        let input = backend.alloc(DType::F32, &[width]).unwrap();
+        let output = backend.alloc(DType::F32, &[width]).unwrap();
+        let program = Program {
+            kind: ProgramKind::Row,
+            insts: vec![Inst::Input(0), Inst::Reduce(RedOp::Sum, 0)],
+            outputs: vec![(0, 1)],
         }
         .validate()
         .unwrap();
