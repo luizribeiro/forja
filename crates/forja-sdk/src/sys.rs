@@ -9,12 +9,18 @@
 use crate::program::{BinaryOp, ProgramKind, ReduceOp, UnaryOp};
 use crate::{Error, Result};
 
-#[derive(Clone, Copy, Eq, PartialEq)]
-pub(crate) enum DType {
+/// A scalar type accepted by kernel signatures.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DType {
+    /// IEEE 754 binary32.
     F32,
+    /// IEEE 754 binary16.
     F16,
+    /// Brain floating point with an eight-bit exponent.
     BF16,
+    /// Unsigned 32-bit integer.
     U32,
+    /// Signed 32-bit integer.
     I32,
 }
 

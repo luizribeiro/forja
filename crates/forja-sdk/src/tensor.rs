@@ -1,6 +1,10 @@
 use std::{marker::PhantomData, ops::Add, rc::Rc};
 
-use crate::{Element, Error, Result, graph, program::Program, sys};
+use crate::{
+    Element, Error, Result, graph,
+    program::{Kernel, Program},
+    sys,
+};
 
 /// A strided selection along one tensor axis.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -386,6 +390,43 @@ impl<T: Element> Tensor<T> {
         )
     }
 
+    /// Runs a prepared kernel with this tensor bound to input slot zero.
+    ///
+    /// Additional inputs occupy subsequent slots. Every output is freshly allocated
+    /// with this tensor's shape and element type.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a signature mismatch, incompatible binding, allocation,
+    /// or refused dispatch.
+    pub fn run_kernel(&self, kernel: &Kernel, inputs: &[&Self]) -> Result<Vec<Self>> {
+        self.check_kernel_signature(kernel, inputs.len(), kernel.outputs.len())?;
+        let outputs = (0..kernel.outputs.len())
+            .map(|_| Self::empty(self.shape.clone()))
+            .collect::<Result<Vec<_>>>()?;
+        self.record_kernel(kernel, inputs, &outputs.iter().collect::<Vec<_>>())?;
+        Ok(outputs)
+    }
+
+    /// Runs a prepared kernel into caller-supplied output views.
+    ///
+    /// This tensor is bound to input slot zero and additional inputs occupy
+    /// subsequent slots.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a signature mismatch, incompatible binding, or
+    /// refused dispatch.
+    pub fn run_kernel_into(
+        &self,
+        kernel: &Kernel,
+        inputs: &[&Self],
+        outputs: &[&Self],
+    ) -> Result<()> {
+        self.check_kernel_signature(kernel, inputs.len(), outputs.len())?;
+        self.record_kernel(kernel, inputs, outputs)
+    }
+
     /// Submits pending work and gathers the logical tensor values.
     ///
     /// # Errors
@@ -431,6 +472,55 @@ impl<T: Element> Tensor<T> {
         Ok(output)
     }
 
+    fn check_kernel_signature(
+        &self,
+        kernel: &Kernel,
+        additional_inputs: usize,
+        outputs: usize,
+    ) -> Result<()> {
+        let rank = u8::try_from(self.shape.len())
+            .map_err(|_| Error::new("kernel tensor rank is too large"))?;
+        if rank != kernel.rank {
+            return Err(Error::new(format!(
+                "kernel signature expects rank {}, but tensor has rank {rank}",
+                kernel.rank
+            )));
+        }
+        let inputs = additional_inputs
+            .checked_add(1)
+            .ok_or_else(|| Error::new("kernel input count overflowed"))?;
+        if inputs != kernel.inputs.len() || outputs != kernel.outputs.len() {
+            return Err(Error::new(format!(
+                "kernel signature expects {} inputs and {} outputs, but received {inputs} inputs and {outputs} outputs",
+                kernel.inputs.len(),
+                kernel.outputs.len()
+            )));
+        }
+        let dtype = sys::dtype(T::DTYPE)?;
+        if kernel
+            .inputs
+            .iter()
+            .chain(&kernel.outputs)
+            .any(|&item| item != dtype)
+        {
+            return Err(Error::new(format!(
+                "kernel signature element types do not match tensor type {dtype:?}"
+            )));
+        }
+        Ok(())
+    }
+
+    fn record_kernel(&self, kernel: &Kernel, inputs: &[&Self], outputs: &[&Self]) -> Result<()> {
+        let input_handles = std::iter::once(&self.handle)
+            .chain(inputs.iter().map(|tensor| &tensor.handle))
+            .collect::<Vec<_>>();
+        let output_handles = outputs
+            .iter()
+            .map(|tensor| &tensor.handle)
+            .collect::<Vec<_>>();
+        graph::record_kernel(&kernel.handle, &input_handles, &output_handles)
+    }
+
     pub(crate) fn handle(&self) -> &sys::Handle {
         &self.handle
     }
@@ -463,6 +553,7 @@ fn size_error() -> Error {
 #[cfg(all(test, feature = "native"))]
 mod tests {
     use super::*;
+    use crate::{DType, program::Kernel};
     use forja_testing::assert_f32_values_agree;
 
     #[test]
@@ -503,6 +594,78 @@ mod tests {
             .unwrap();
 
         assert_eq!(output.to_vec().unwrap(), [2.0, 3.0, 2.0, 4.0]);
+    }
+
+    #[test]
+    fn prepared_kernel_reuses_one_handle_across_shapes() {
+        let program = Program::map();
+        program.output(0, program.input(0) * 2.0);
+        let kernel = Kernel::new(&program, 2, &[DType::F32], &[DType::F32]).unwrap();
+
+        for shape in [[1_u32, 7], [7, 33], [1, 4097]] {
+            let count = usize::try_from(shape[0] * shape[1]).unwrap();
+            let input = Tensor::from_slice(&vec![3.0_f32; count], &shape).unwrap();
+            let output = input.run_kernel(&kernel, &[]).unwrap().remove(0);
+            assert_eq!(output.to_vec().unwrap(), vec![6.0; count]);
+        }
+    }
+
+    #[test]
+    fn prepared_kernel_reports_signature_mismatch_at_dispatch() {
+        let program = Program::map();
+        program.output(0, program.input(0));
+        let kernel = Kernel::new(&program, 2, &[DType::F32], &[DType::F32]).unwrap();
+        let input = Tensor::from_slice(&[1.0_f32; 7], &[7]).unwrap();
+
+        let error = input.run_kernel(&kernel, &[]).err().unwrap();
+
+        assert_eq!(
+            error.to_string(),
+            "kernel signature expects rank 2, but tensor has rank 1"
+        );
+    }
+
+    #[test]
+    fn prepared_kernel_rejects_binding_count_mismatch() {
+        let program = Program::map();
+        program.output(0, program.input(0) + program.input(1));
+        let kernel = Kernel::new(&program, 1, &[DType::F32, DType::F32], &[DType::F32]).unwrap();
+        let input = Tensor::from_slice(&[1.0_f32; 7], &[7]).unwrap();
+
+        let error = input.run_kernel(&kernel, &[]).err().unwrap();
+
+        assert_eq!(
+            error.to_string(),
+            "kernel signature expects 2 inputs and 1 outputs, but received 1 inputs and 1 outputs"
+        );
+    }
+
+    #[test]
+    fn prepared_kernel_rejects_binding_dtype_mismatch() {
+        let program = Program::map();
+        program.output(0, program.input(0));
+        let kernel = Kernel::new(&program, 1, &[DType::F32], &[DType::F32]).unwrap();
+        let input = Tensor::from_slice(&[1_u32; 7], &[7]).unwrap();
+
+        let error = input.run_kernel(&kernel, &[]).err().unwrap();
+
+        assert_eq!(
+            error.to_string(),
+            "kernel signature element types do not match tensor type U32"
+        );
+    }
+
+    #[test]
+    fn pending_dispatch_retains_a_dropped_kernel() {
+        let program = Program::map();
+        program.output(0, program.input(0) + 1.0);
+        let kernel = Kernel::new(&program, 1, &[DType::F32], &[DType::F32]).unwrap();
+        let input = Tensor::from_slice(&[1.0_f32, 2.0], &[2]).unwrap();
+        let output = input.run_kernel(&kernel, &[]).unwrap().remove(0);
+
+        drop(kernel);
+
+        assert_eq!(output.to_vec().unwrap(), [2.0, 3.0]);
     }
 
     #[test]

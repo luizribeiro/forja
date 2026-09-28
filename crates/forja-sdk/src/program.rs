@@ -4,9 +4,10 @@ use std::{
     cell::RefCell,
     marker::PhantomData,
     ops::{Add, Div, Mul, Neg, Sub},
+    rc::Rc,
 };
 
-use crate::{Error, Result};
+use crate::{DType, Error, Result, sys};
 
 /// A scalar program's iteration strategy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -85,6 +86,39 @@ struct State {
 pub struct Program {
     kind: ProgramKind,
     state: RefCell<State>,
+}
+
+/// A prepared scalar program with a fixed tensor signature.
+#[derive(Clone)]
+pub struct Kernel {
+    pub(crate) handle: Rc<sys::Kernel>,
+    pub(crate) rank: u8,
+    pub(crate) inputs: Vec<DType>,
+    pub(crate) outputs: Vec<DType>,
+}
+
+impl Kernel {
+    /// Prepares a program for tensors with the given rank and element types.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the program or signature is invalid, preparation
+    /// fails, or the host refuses another live kernel.
+    pub fn new(
+        program: &Program,
+        rank: u8,
+        input_dtypes: &[DType],
+        output_dtypes: &[DType],
+    ) -> Result<Self> {
+        let definition = program.definition(usize::from(rank))?;
+        let handle = sys::create_kernel(definition, rank, input_dtypes, output_dtypes)?;
+        Ok(Self {
+            handle: Rc::new(handle),
+            rank,
+            inputs: input_dtypes.to_vec(),
+            outputs: output_dtypes.to_vec(),
+        })
+    }
 }
 
 impl Program {
@@ -554,5 +588,14 @@ mod tests {
         let second = Program::map();
         first.output(0, second.constant(1.0));
         assert!(first.parts().is_err());
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn prepares_an_explicit_kernel_signature() {
+        let program = Program::map();
+        program.output(0, program.input(0));
+
+        Kernel::new(&program, 2, &[DType::F32], &[DType::F32]).unwrap();
     }
 }

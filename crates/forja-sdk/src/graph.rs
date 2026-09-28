@@ -48,6 +48,14 @@ pub(crate) fn record_program(
     outputs: &[&sys::Handle],
 ) -> Result<()> {
     let kernel = cached_kernel(program, rank, input_dtypes, output_dtypes)?;
+    record_kernel(&kernel, inputs, outputs)
+}
+
+pub(crate) fn record_kernel(
+    kernel: &sys::Kernel,
+    inputs: &[&sys::Handle],
+    outputs: &[&sys::Handle],
+) -> Result<()> {
     CURRENT.with(|current| {
         let mut current = current.borrow_mut();
         if current.is_none() {
@@ -56,7 +64,7 @@ pub(crate) fn record_program(
         let commands = current
             .as_mut()
             .ok_or_else(|| crate::Error::new("current graph was not initialized"))?;
-        sys::dispatch_kernel(commands, &kernel, inputs, outputs)
+        sys::dispatch_kernel(commands, kernel, inputs, outputs)
     })
 }
 

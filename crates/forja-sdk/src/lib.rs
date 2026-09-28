@@ -95,6 +95,7 @@ pub use forja_sdk_macros::export_engine;
 pub use graph::eval;
 pub use half::{bf16, f16};
 pub use load::{Load, Weights};
+pub use sys::DType;
 pub use tensor::{Slice, Tensor};
 
 /// An in-process backend selected for the current thread.
