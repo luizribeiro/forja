@@ -20,12 +20,12 @@ pub(super) enum Parameter {
     Value(ComputeType),
 }
 
-pub(super) struct Lowered {
-    pub(super) statements: Vec<TokenStream>,
-    pub(super) outputs: Vec<Ident>,
+pub(crate) struct Lowered {
+    pub(crate) statements: Vec<TokenStream>,
+    pub(crate) outputs: Vec<Ident>,
 }
 
-pub(super) fn lower(
+pub(crate) fn lower(
     body: &syn::Block,
     parameters: HashMap<String, Parameter>,
     context: &Ident,
@@ -1191,3 +1191,6 @@ fn powi_exponent(expression: &Expr) -> syn::Result<i32> {
 fn kernel_error(span: impl Spanned, message: impl std::fmt::Display) -> syn::Error {
     syn::Error::new(span.span(), format!("kernel: {message}"))
 }
+
+#[cfg(test)]
+mod tests;

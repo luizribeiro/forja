@@ -14,5 +14,11 @@ proc-macro2 = "1"
 quote = "1"
 syn = { version = "2", features = ["full"] }
 
+[dev-dependencies]
+forja-core = { path = "../forja-core" }
+forja-cpu = { path = "../forja-cpu" }
+forja-testing = { path = "../../support/forja-testing" }
+proptest = "1"
+
 [lints]
 workspace = true
