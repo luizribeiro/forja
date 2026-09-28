@@ -1,0 +1,5 @@
+error: kernel: `bool as f32` is not allowed; use `if c { 1.0 } else { 0.0 }`
+ --> tests/ui/kernel-fail-bool-as-f32.rs:3:15
+  |
+3 |     (x > 0.0) as f32
+  |               ^^

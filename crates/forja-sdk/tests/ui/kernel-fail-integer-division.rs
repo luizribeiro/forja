@@ -3,7 +3,7 @@ fn integer_division(
     x: forja_sdk::kernel::Elem,
     ids: forja_sdk::kernel::Elem<u32>,
 ) -> forja_sdk::kernel::Elem {
-    ids / 2
+    x + (ids / 2) as f32
 }
 
 fn main() {}

@@ -14,13 +14,11 @@ fn typed_expressions(
     let selected = if !(in_range && ids != 0) || ids >= limit {
         bounded
     } else if ids == 1 {
-        1
+        in_range as u32
     } else {
-        0
+        x as u32
     };
-    let _selected = selected;
-    let equal: bool = ids == 0;
-    x + OFFSET
+    x.maximum(selected as f32) + OFFSET
 }
 
 fn check_calls() -> forja_sdk::Result<()> {

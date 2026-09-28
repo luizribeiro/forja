@@ -16,6 +16,7 @@ fn kernel_syntax_contracts() {
     cases.compile_fail("tests/ui/kernel-fail-output-bool.rs");
     cases.compile_fail("tests/ui/kernel-fail-parameter-type.rs");
     cases.compile_fail("tests/ui/kernel-fail-unused-tensor.rs");
+    cases.compile_fail("tests/ui/kernel-fail-bool-as-f32.rs");
     cases.compile_fail("tests/ui/kernel-fail-f32-max.rs");
     cases.compile_fail("tests/ui/kernel-fail-integer-division.rs");
     cases.compile_fail("tests/ui/kernel-fail-if-without-else.rs");

@@ -238,6 +238,7 @@ impl Lowerer {
                 }
             }
             Expr::MethodCall(call) => self.lower_method(call),
+            Expr::Cast(cast) => self.lower_cast(cast),
             Expr::If(if_expression) => self.lower_if(if_expression),
             Expr::Paren(paren) => self.lower_expr(&paren.expr),
             Expr::Group(group) => self.lower_expr(&group.expr),
@@ -643,6 +644,34 @@ impl Lowerer {
             }
             _ => Err(unknown_method(&call.method, receiver.ty)),
         }
+    }
+
+    fn lower_cast(&mut self, cast: &syn::ExprCast) -> syn::Result<Value> {
+        let value = self.lower_expr(&cast.expr)?;
+        let target = value_type(&cast.ty)
+            .ok_or_else(|| kernel_error(&cast.ty, "kernel casts may target only `f32` or `u32`"))?;
+        if value.ty == ValueType::Bool && target == ValueType::F32 {
+            return Err(kernel_error(
+                cast.as_token,
+                "`bool as f32` is not allowed; use `if c { 1.0 } else { 0.0 }`",
+            ));
+        }
+        let method = match (value.ty, target) {
+            (ValueType::F32 | ValueType::Bool, ValueType::U32) => format_ident!("cast_u32"),
+            (ValueType::U32, ValueType::F32) => format_ident!("cast_f32"),
+            _ => {
+                return Err(kernel_error(
+                    cast.as_token,
+                    format!(
+                        "cast from `{}` to `{}` is not supported in kernels",
+                        value.ty.name(),
+                        target.name()
+                    ),
+                ));
+            }
+        };
+        let value = value.ident;
+        Ok(self.emit(quote!(#value.#method()), target, cast.span()))
     }
 
     fn lower_if(&mut self, if_expression: &syn::ExprIf) -> syn::Result<Value> {
