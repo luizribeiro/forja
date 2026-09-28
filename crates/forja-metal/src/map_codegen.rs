@@ -43,14 +43,10 @@ fn generate_map(program: &BoundProgram) -> String {
     }
     for &(slot, value) in &program.program().program().outputs {
         let slot = usize::try_from(slot).unwrap_or(usize::MAX);
-        let expression = if outputs[slot].layout().dtype() == DType::BF16 {
-            format!("store_bfloat_bits(output{slot}, output_address{slot}, v{value});")
-        } else {
-            format!(
-                "store_float(output{slot}, output_address{slot}, {}, v{value});",
-                output_dtype_name(slot)
-            )
-        };
+        let expression = format!(
+            "store_float(output{slot}, output_address{slot}, {}, v{value});",
+            output_dtype_name(slot)
+        );
         line(&mut source, format_args!("    {expression}"));
     }
     line(&mut source, format_args!("}}"));
@@ -396,14 +392,10 @@ fn emit_output_stage(source: &mut String, program: &BoundProgram, rank: usize) {
 fn emit_stores(source: &mut String, program: &BoundProgram, indent: usize) {
     for &(slot, value) in &program.program().program().outputs {
         let slot = usize::try_from(slot).unwrap_or(usize::MAX);
-        let expression = if program.outputs()[slot].layout().dtype() == DType::BF16 {
-            format!("store_bfloat_bits(output{slot}, output_address{slot}, v{value});")
-        } else {
-            format!(
-                "store_float(output{slot}, output_address{slot}, {}, v{value});",
-                output_dtype_name(slot)
-            )
-        };
+        let expression = format!(
+            "store_float(output{slot}, output_address{slot}, {}, v{value});",
+            output_dtype_name(slot)
+        );
         line(source, format_args!("{:indent$}{expression}", ""));
     }
 }
@@ -695,6 +687,7 @@ fn line(source: &mut String, arguments: fmt::Arguments<'_>) {
 
 #[cfg(test)]
 mod tests {
+    use crate::rounding_program;
     use forja_core::{
         DType,
         program::{BinOp, Inst, Program, ProgramKind, RedOp, UnOp, ValueType, bind_program},
@@ -704,6 +697,23 @@ mod tests {
     use proptest::prelude::*;
 
     use super::*;
+
+    #[test]
+    fn sigmoid_rounding_context_uses_the_shared_store() {
+        let source = bound_source(
+            &rounding_program::context_program(),
+            &[DType::BF16, DType::U32],
+            &[DType::F16],
+            &[1],
+            true,
+        );
+        assert!(source.contains("float v19 = select(1.0f /"));
+        assert!(source.contains("float v29 = select(v19, v5, v8);"));
+        assert!(source.contains("store_float(output0, output_address0, output_dtype, v29);"));
+        assert!(source.contains("f32_to_f16_rne_bits(value)"));
+        assert!(!source.contains("half(value)"));
+        assert!(!source.contains("store_bfloat_bits"));
+    }
 
     #[test]
     fn residual_add_has_stable_source() {

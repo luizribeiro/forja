@@ -58,20 +58,61 @@ float load_bfloat_bits(device const uchar *buffer, ulong index) {
     return as_type<float>(bits);
 }
 
+// NaN payloads are intentionally canonicalized to one quiet NaN.
+ushort f32_to_f16_rne_bits(float value) {
+    uint bits = as_type<uint>(value);
+    uint sign = (bits >> 16) & 0x8000u;
+    uint magnitude = bits & 0x7fffffffu;
+    if (magnitude >= 0x7f800000u) {
+        return ushort(sign | select(0x7c00u, 0x7e00u, magnitude > 0x7f800000u));
+    }
+
+    int exponent = int(magnitude >> 23) - 127;
+    uint fraction = magnitude & 0x007fffffu;
+    if (exponent > 15) {
+        return ushort(sign | 0x7c00u);
+    }
+    if (exponent >= -14) {
+        uint rounded = fraction + 0x00000fffu + ((fraction >> 13) & 1u);
+        uint half_exponent = uint(exponent + 15) << 10;
+        if ((rounded & 0x00800000u) != 0u) {
+            half_exponent += 0x0400u;
+            rounded = 0u;
+        }
+        return ushort(sign | half_exponent | (rounded >> 13));
+    }
+    if (exponent < -25) {
+        return ushort(sign);
+    }
+
+    uint significand = fraction | 0x00800000u;
+    uint shift = uint(-exponent - 1);
+    uint truncated = significand >> shift;
+    uint remainder = significand & ((1u << shift) - 1u);
+    uint halfway = 1u << (shift - 1u);
+    truncated += uint(remainder > halfway ||
+                      (remainder == halfway && (truncated & 1u) != 0u));
+    return ushort(sign | truncated);
+}
+
+ushort f32_to_bf16_rne_bits(float value) {
+    uint bits = as_type<uint>(value);
+    uint sign = (bits >> 16) & 0x8000u;
+    if ((bits & 0x7fffffffu) > 0x7f800000u) {
+        return ushort(sign | 0x7fc0u);
+    }
+    uint rounded = bits + 0x7fffu + ((bits >> 16) & 1u);
+    return ushort(rounded >> 16);
+}
+
 void store_float(device uchar *buffer, ulong index, uint dtype, float value) {
     if (dtype == 0) {
         *reinterpret_cast<device float *>(buffer + index * 4) = value;
     } else if (dtype == 1) {
-        *reinterpret_cast<device half *>(buffer + index * 2) = half(value);
+        reinterpret_cast<device ushort *>(buffer)[index] = f32_to_f16_rne_bits(value);
     } else {
-        *reinterpret_cast<device bfloat *>(buffer + index * 2) = bfloat(value);
+        reinterpret_cast<device ushort *>(buffer)[index] = f32_to_bf16_rne_bits(value);
     }
-}
-
-void store_bfloat_bits(device uchar *buffer, ulong index, float value) {
-    uint bits = as_type<uint>(value);
-    uint rounded = bits + 0x7fffu + ((bits >> 16) & 1u);
-    reinterpret_cast<device ushort *>(buffer)[index] = ushort(rounded >> 16);
 }
 
 void copy_value(
