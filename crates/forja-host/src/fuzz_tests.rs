@@ -17,8 +17,8 @@ use forja_testing::{
 use wasmtime::component::Resource;
 
 use super::{
-    CommandListEntry, Grants, Host, Limits, TensorEntry, bindings::l9o::gpu::compute, core_dtype,
-    guest_error,
+    CommandListEntry, Grants, Host, KernelEntry, Limits, TensorEntry, bindings::l9o::gpu::compute,
+    core_dtype, guest_error,
 };
 use compute::{Binop as WitBinOp, Redop as WitRedOp, Unop as WitUnOp, ValueType as WitValueType};
 
@@ -98,16 +98,18 @@ struct ProgramCoverage {
     accepted_dispatches: usize,
     aliasing_refusals: usize,
     read_only_refusals: usize,
+    signature_refusals: usize,
     compared_reads: usize,
 }
 
 impl ProgramCoverage {
     fn assert_sufficient(self, cases: usize) {
         println!(
-            "WIT program fuzz coverage: {} accepted, {} aliasing refusals, {} read-only refusals, {} compared reads",
+            "WIT program fuzz coverage: {} accepted, {} aliasing refusals, {} read-only refusals, {} signature refusals, {} compared reads",
             self.accepted_dispatches,
             self.aliasing_refusals,
             self.read_only_refusals,
+            self.signature_refusals,
             self.compared_reads,
         );
         assert_eq!(
@@ -117,6 +119,7 @@ impl ProgramCoverage {
         assert!(self.accepted_dispatches * 4 >= cases * 3);
         assert!(self.aliasing_refusals * 8 >= cases);
         assert!(self.read_only_refusals * 8 >= cases);
+        assert_eq!(self.signature_refusals, self.accepted_dispatches);
         assert!(self.compared_reads >= self.accepted_dispatches);
     }
 }
@@ -717,11 +720,6 @@ async fn run_program_case(seed: u64, coverage: &mut ProgramCoverage) {
         .iter()
         .map(|spec| allocate_host_program_tensor(&mut host, spec, None))
         .collect::<Vec<_>>();
-    let reference_outputs = case
-        .outputs()
-        .iter()
-        .map(|spec| allocate_reference_program_tensor(&reference, spec, None))
-        .collect::<Vec<_>>();
     let binding = seed % 8;
     if binding == 0 {
         host_outputs[0] = Resource::new_borrow(host_inputs[0].rep());
@@ -730,7 +728,7 @@ async fn run_program_case(seed: u64, coverage: &mut ProgramCoverage) {
         host_outputs[0] = host.weight_tensor(&weights, "value").unwrap();
     }
     let kernel = host
-        .create_kernel(wit_program(program), wit_signature(&case))
+        .create_kernel(wit_program(program.clone()), wit_signature(&case))
         .unwrap();
     let commands = host.command_list().unwrap();
     let result = host.dispatch_kernel(&commands, &kernel, &host_inputs, &host_outputs);
@@ -750,28 +748,24 @@ async fn run_program_case(seed: u64, coverage: &mut ProgramCoverage) {
     }
     result.unwrap();
     coverage.accepted_dispatches += 1;
+    let second_outputs = reuse_and_drop_kernel(
+        &mut host,
+        &commands,
+        kernel,
+        program,
+        &case,
+        &host_inputs,
+        coverage,
+    );
     host.prepare_submit(commands).unwrap().run().await.unwrap();
 
-    let signature = KernelSignature::new(
-        u8::try_from(case.shape().len()).unwrap(),
-        case.inputs().iter().map(TensorSpec::dtype).collect(),
-        case.outputs().iter().map(TensorSpec::dtype).collect(),
-        0,
-    );
-    let prepared = prepare_program(&reference, validated, signature).unwrap();
-    let mut commands = CommandList::new();
-    commands
-        .dispatch_kernel(
-            &prepared,
-            &reference_inputs.iter().collect::<Vec<_>>(),
-            &reference_outputs.iter().collect::<Vec<_>>(),
-        )
-        .unwrap();
-    reference.submit(commands).unwrap().wait().unwrap();
+    let (reference_outputs, second_reference_outputs) =
+        run_reference_program(&reference, &case, validated, &reference_inputs);
     for ((host_output, reference_output), spec) in host_outputs
         .iter()
-        .zip(&reference_outputs)
-        .zip(case.outputs())
+        .chain(&second_outputs)
+        .zip(reference_outputs.iter().chain(&second_reference_outputs))
+        .zip(case.outputs().iter().cycle())
     {
         let actual = host.prepare_read(host_output).unwrap().run().await.unwrap();
         let expected = reference.read(reference_output).unwrap();
@@ -780,6 +774,74 @@ async fn run_program_case(seed: u64, coverage: &mut ProgramCoverage) {
     }
     drop(host);
     fs::remove_file(path).unwrap();
+}
+
+fn run_reference_program(
+    backend: &forja_cpu::CpuBackend,
+    case: &forja_testing::program::ProgramCase,
+    program: forja_core::program::ValidatedProgram,
+    inputs: &[Tensor],
+) -> (Vec<Tensor>, Vec<Tensor>) {
+    let outputs = case
+        .outputs()
+        .iter()
+        .map(|spec| allocate_reference_program_tensor(backend, spec, None))
+        .collect::<Vec<_>>();
+    let second_outputs = case
+        .outputs()
+        .iter()
+        .map(|spec| allocate_reference_program_tensor(backend, spec, None))
+        .collect::<Vec<_>>();
+    let signature = KernelSignature::new(
+        u8::try_from(case.shape().len()).unwrap(),
+        case.inputs().iter().map(TensorSpec::dtype).collect(),
+        case.outputs().iter().map(TensorSpec::dtype).collect(),
+        0,
+    );
+    let prepared = prepare_program(backend, program, signature).unwrap();
+    let input_refs = inputs.iter().collect::<Vec<_>>();
+    let output_refs = outputs.iter().collect::<Vec<_>>();
+    let second_output_refs = second_outputs.iter().collect::<Vec<_>>();
+    let mut commands = CommandList::new();
+    commands
+        .dispatch_kernel(&prepared, &input_refs, &output_refs)
+        .unwrap();
+    commands
+        .dispatch_kernel(&prepared, &input_refs, &second_output_refs)
+        .unwrap();
+    backend.submit(commands).unwrap().wait().unwrap();
+    (outputs, second_outputs)
+}
+
+fn reuse_and_drop_kernel(
+    host: &mut Host<forja_cpu::CpuBackend>,
+    commands: &Resource<CommandListEntry>,
+    kernel: Resource<KernelEntry>,
+    program: Program,
+    case: &forja_testing::program::ProgramCase,
+    inputs: &[Resource<TensorEntry>],
+    coverage: &mut ProgramCoverage,
+) -> Vec<Resource<TensorEntry>> {
+    let outputs = case
+        .outputs()
+        .iter()
+        .map(|spec| allocate_host_program_tensor(host, spec, None))
+        .collect::<Vec<_>>();
+    host.dispatch_kernel(commands, &kernel, inputs, &outputs)
+        .unwrap();
+    let mut wrong_signature = wit_signature(case);
+    wrong_signature.rank = wrong_signature.rank.checked_add(1).unwrap();
+    let wrong_kernel = host
+        .create_kernel(wit_program(program), wrong_signature)
+        .unwrap();
+    assert!(matches!(
+        host.dispatch_kernel(commands, &wrong_kernel, inputs, &outputs),
+        Err(compute::Error::OpSignature(_))
+    ));
+    coverage.signature_refusals += 1;
+    host.drop_kernel(wrong_kernel).unwrap();
+    host.drop_kernel(kernel).unwrap();
+    outputs
 }
 
 fn allocate_host_program_tensor(

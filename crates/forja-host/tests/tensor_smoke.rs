@@ -185,6 +185,25 @@ async fn large_broadcast_is_only_usable_without_reading() -> wasmtime::Result<()
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn kernel_churn_returns_a_quota_error() -> wasmtime::Result<()> {
+    let limits = LIMITS.with_kernel_limit(4);
+    let (mut store, instance) = instantiate(
+        forja_cpu::CpuBackend::new(),
+        test_guests::tensor_abuse(),
+        limits,
+    )
+    .await?;
+    let churn =
+        instance.get_typed_func::<(), (Result<u32, String>,)>(&mut store, "churn-kernels")?;
+    Host::reset_guest_deadline(&mut store);
+    let (created,) = store
+        .run_concurrent(async move |accessor| churn.call_concurrent(accessor, ()).await)
+        .await??;
+    assert_eq!(created.map_err(wasmtime::Error::msg)?, 4);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn guest_memory_growth_stops_at_the_store_limit() -> wasmtime::Result<()> {
     let limits = LIMITS.with_store_limits(16 * 1024 * 1024, 10_000, 10_000);
     let (mut store, instance) = instantiate(

@@ -2363,7 +2363,9 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn dropped_kernel_is_retained_until_submission_completes() {
-        let mut host = Host::new(CpuBackend::new(), GENEROUS.with_kernel_limit(1));
+        let gate = Arc::new(SubmitGate::default());
+        let backend = AccountingBackend::new(Some(Arc::clone(&gate)), None, Duration::ZERO);
+        let mut host = Host::new(backend, GENEROUS.with_kernel_limit(1));
         let input = host.alloc(compute::Dtype::F32, &[1]).unwrap();
         host.write(&input, &3.0_f32.to_le_bytes()).unwrap();
         let output = host.alloc(compute::Dtype::F32, &[1]).unwrap();
@@ -2381,7 +2383,12 @@ mod tests {
         host.drop_kernel(kernel).unwrap();
         assert_eq!(host.live_kernels.load(Ordering::Acquire), 1);
 
-        host.prepare_submit(commands).unwrap().run().await.unwrap();
+        let request = host.prepare_submit(commands).unwrap();
+        let task = tokio::spawn(request.run());
+        gate.wait_for(1);
+        assert_eq!(host.live_kernels.load(Ordering::Acquire), 1);
+        gate.release();
+        task.await.unwrap().unwrap();
         assert_eq!(host.live_kernels.load(Ordering::Acquire), 0);
         let bytes = host.prepare_read(&output).unwrap().run().await.unwrap();
         assert_eq!(
@@ -3403,6 +3410,8 @@ mod tests {
     }
 
     struct AccountingSubmission {
+        inner: <CpuBackend as Backend>::Submission,
+        _commands: CommandList,
         gate: Option<Arc<SubmitGate>>,
         gpu_time: Option<Duration>,
         delay: Duration,
@@ -3414,6 +3423,7 @@ mod tests {
             if let Some(gate) = &self.gate {
                 gate.wait();
             }
+            self.inner.wait()?;
             std::thread::sleep(self.delay);
             self.wait_error.map_or(Ok(()), Err)
         }
@@ -3455,8 +3465,12 @@ mod tests {
             self.inner.release(tensor)
         }
 
-        fn submit(&self, _commands: CommandList) -> Result<Self::Submission, BackendError> {
+        fn submit(&self, commands: CommandList) -> Result<Self::Submission, BackendError> {
+            let retained = commands.clone();
+            let inner = self.inner.submit(commands)?;
             Ok(AccountingSubmission {
+                inner,
+                _commands: retained,
                 gate: self.gate.clone(),
                 gpu_time: self.gpu_time,
                 delay: self.delay,

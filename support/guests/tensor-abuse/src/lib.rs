@@ -5,7 +5,10 @@ wit_bindgen::generate!({
     world: "tensor-abuse",
 });
 
-use l9o::gpu::compute::{Dtype, Error, SliceSpec, Tensor, ViewOp};
+use l9o::gpu::compute::{
+    Binop, Dtype, Error, Inst, Kernel, KernelSignature, ProgramKind, ProgramSource, SliceSpec,
+    Tensor, ViewOp,
+};
 
 struct Component;
 
@@ -57,6 +60,37 @@ impl Guest for Component {
             Err(error) => Err(format!("large read returned {error:?}")),
             Ok(_) => Err("large read was accepted".to_owned()),
         }
+    }
+
+    async fn churn_kernels() -> Result<u32, String> {
+        let mut kernels = Vec::new();
+        for value in 0_u16..100 {
+            let source = ProgramSource {
+                kind: ProgramKind::Map,
+                insts: vec![
+                    Inst::Const(f32::from(value)),
+                    Inst::Const(1.0),
+                    Inst::Binary((Binop::Add, 0, 1)),
+                ],
+                outputs: vec![(0, 2)],
+            };
+            let signature = KernelSignature {
+                rank: 1,
+                inputs: vec![],
+                outputs: vec![Dtype::F32],
+                scalars: 0,
+            };
+            match Kernel::create(&source, &signature) {
+                Ok(kernel) => kernels.push(kernel),
+                Err(Error::Quota(_)) => {
+                    return u32::try_from(kernels.len()).map_err(|_| {
+                        "kernel count exceeded the component result range".to_owned()
+                    });
+                }
+                Err(error) => return Err(format!("kernel creation returned {error:?}")),
+            }
+        }
+        Err("kernel churn did not reach a quota".to_owned())
     }
 
     async fn grow_memory(bytes: u32) -> bool {
