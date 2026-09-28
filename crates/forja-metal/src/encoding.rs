@@ -21,10 +21,10 @@ use objc2_foundation::{NSRange, NSString};
 use objc2_metal::{
     MTL4ArgumentTable, MTL4CommandAllocator, MTL4CommandBuffer, MTL4CommandQueue,
     MTL4CommitFeedback, MTL4CommitOptions, MTL4CounterHeap, MTL4CounterHeapDescriptor,
-    MTL4CounterHeapType, MTL4TimestampGranularity, MTLAllocation, MTLBuffer,
+    MTL4CounterHeapType, MTL4TimestampGranularity, MTLAllocation, MTLBuffer, MTLCompileOptions,
     MTLComputePipelineState, MTLDataType, MTLDevice, MTLEvent, MTLFunctionConstantValues,
-    MTLLibrary, MTLResidencySet, MTLResidencySetDescriptor, MTLResourceOptions, MTLSharedEvent,
-    MTLSharedEventListener, MTLSize,
+    MTLLibrary, MTLMathMode, MTLResidencySet, MTLResidencySetDescriptor, MTLResourceOptions,
+    MTLSharedEvent, MTLSharedEventListener, MTLSize,
 };
 
 use crate::{
@@ -3468,8 +3468,9 @@ impl PipelineCache {
         source: &str,
     ) -> Result<Self, BackendError> {
         let source = NSString::from_str(source);
+        let options = compile_options(MTLMathMode::Fast);
         let library = device
-            .newLibraryWithSource_options_error(&source, None)
+            .newLibraryWithSource_options_error(&source, Some(&options))
             .map_err(|_| BackendError::ExecutionFailed)?;
         Ok(Self {
             device: device.clone(),
@@ -3537,9 +3538,10 @@ impl PipelineCache {
         source: &str,
     ) -> Result<Retained<ProtocolObject<dyn MTLComputePipelineState>>, BackendError> {
         let source = NSString::from_str(source);
+        let options = compile_options(MTLMathMode::Relaxed);
         let library = self
             .device
-            .newLibraryWithSource_options_error(&source, None)
+            .newLibraryWithSource_options_error(&source, Some(&options))
             .map_err(|_| program_compile_failed(key.hash))?;
         let name = NSString::from_str(map_codegen::KERNEL_NAME);
         let values = MTLFunctionConstantValues::new();
@@ -3574,6 +3576,12 @@ impl PipelineCache {
             .newComputePipelineStateWithFunction_error(&function)
             .map_err(|_| program_compile_failed(key.hash))
     }
+}
+
+fn compile_options(math_mode: MTLMathMode) -> Retained<MTLCompileOptions> {
+    let options = MTLCompileOptions::new();
+    options.setMathMode(math_mode);
+    options
 }
 
 fn program_compile_failed(hash: ProgramHash) -> BackendError {

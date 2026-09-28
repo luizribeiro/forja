@@ -207,7 +207,10 @@ fn unary(op: UnOp, operand: u32) -> String {
         UnOp::Rsqrt => format!("fast::rsqrt(v{operand})"),
         UnOp::Sin => format!("fast::sin(v{operand})"),
         UnOp::Cos => format!("fast::cos(v{operand})"),
-        UnOp::Tanh => format!("fast::tanh(v{operand})"),
+        UnOp::Tanh => format!(
+            "select(fast::tanh(v{operand}), copysign(1.0f, v{operand}), \
+             !isnan(v{operand}) && abs(v{operand}) > 8.0f)"
+        ),
         UnOp::Sigmoid => format!("1.0f / (1.0f + fast::exp(-v{operand}))"),
         UnOp::Recip => format!("1.0f / v{operand}"),
         UnOp::Floor => format!("floor(v{operand})"),

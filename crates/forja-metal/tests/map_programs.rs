@@ -97,6 +97,72 @@ fn metal_map_preserves_scalar_corner_semantics() {
     }
 }
 
+#[test]
+fn metal_map_preserves_nan_dependent_control_flow() {
+    let program = Program {
+        kind: ProgramKind::Map,
+        insts: vec![
+            Inst::Input(0),
+            Inst::Const(1.0),
+            Inst::Binary(BinOp::Min, 0, 1),
+            Inst::Binary(BinOp::Max, 2, 1),
+            Inst::Binary(BinOp::Eq, 3, 3),
+            Inst::Const(17.0),
+            Inst::Const(29.0),
+            Inst::Select(4, 5, 6),
+        ],
+        outputs: vec![(0, 7)],
+    }
+    .validate()
+    .unwrap();
+    let backend = MetalBackend::new().unwrap();
+    let input = backend.alloc(DType::F32, &[1]).unwrap();
+    backend.write(&input, &f32::NAN.to_le_bytes()).unwrap();
+    let output = backend.alloc(DType::F32, &[1]).unwrap();
+    let mut commands = CommandList::new();
+    commands
+        .dispatch_program(&program, &[&input], &[&output])
+        .unwrap();
+    backend.submit(commands).unwrap().wait().unwrap();
+    let actual = f32::from_le_bytes(backend.read(&output).unwrap().try_into().unwrap());
+    assert_eq!(actual.to_bits(), 29.0_f32.to_bits());
+}
+
+#[test]
+fn metal_fast_transcendentals_remain_defined_for_finite_inputs() {
+    let program = Program {
+        kind: ProgramKind::Map,
+        insts: vec![
+            Inst::Const(58.5625),
+            Inst::Unary(UnOp::Tanh, 0),
+            Inst::Unary(UnOp::Log, 1),
+        ],
+        outputs: vec![(0, 2)],
+    }
+    .validate()
+    .unwrap();
+    let cpu = CpuBackend::new();
+    let metal = MetalBackend::new().unwrap();
+    let expected = cpu.alloc(DType::BF16, &[1]).unwrap();
+    let actual = metal.alloc(DType::BF16, &[1]).unwrap();
+    let mut cpu_commands = CommandList::new();
+    cpu_commands
+        .dispatch_program(&program, &[], &[&expected])
+        .unwrap();
+    cpu.submit(cpu_commands).unwrap().wait().unwrap();
+    let mut metal_commands = CommandList::new();
+    metal_commands
+        .dispatch_program(&program, &[], &[&actual])
+        .unwrap();
+    metal.submit(metal_commands).unwrap().wait().unwrap();
+    assert_outputs_agree(
+        DType::BF16,
+        &cpu.read(&expected).unwrap(),
+        &metal.read(&actual).unwrap(),
+    )
+    .unwrap();
+}
+
 fn run_corner_program<B: Backend>(
     backend: &B,
     program: &ValidatedProgram,
