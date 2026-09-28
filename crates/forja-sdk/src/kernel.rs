@@ -1,6 +1,6 @@
 //! Foundations used by Rust-syntax kernel definitions.
 
-use std::{cell::RefCell, collections::VecDeque};
+use std::{cell::RefCell, collections::VecDeque, marker::PhantomData};
 
 use crate::{DType, Result};
 
@@ -8,6 +8,42 @@ pub use crate::program::Kernel;
 
 /// Maximum number of prepared signatures retained by one kernel definition.
 pub const CACHE_CAPACITY: usize = 16;
+
+/// A row-kernel tensor parameter in `#[kernel]` syntax.
+///
+/// `T` is the lane's compute type and defaults to `f32`; storage precision is
+/// selected when the generated kernel is called. This zero-sized marker is
+/// syntax consumed by the kernel attribute and does not contain tensor data.
+#[derive(Clone, Copy, Debug)]
+pub struct Row<T = f32>(PhantomData<fn() -> T>);
+
+/// An elementwise map-kernel tensor parameter in `#[kernel]` syntax.
+///
+/// `T` is the element's compute type and defaults to `f32`; storage precision
+/// is selected when the generated kernel is called. This zero-sized marker is
+/// syntax consumed by the kernel attribute and does not contain tensor data.
+#[derive(Clone, Copy, Debug)]
+pub struct Elem<T = f32>(PhantomData<fn() -> T>);
+
+/// Names an iteration-axis coordinate in `#[kernel]` syntax.
+///
+/// The kernel attribute requires a literal axis and lowers this call to an
+/// unsigned IR index; negative axes count from the end. Outside an attributed
+/// kernel this syntax-only placeholder has no coordinate context.
+#[must_use]
+pub const fn index(_axis: i32) -> u32 {
+    0
+}
+
+/// Names an iteration-axis extent in `#[kernel]` syntax.
+///
+/// The kernel attribute requires a literal axis and lowers this call to an
+/// unsigned IR extent; negative axes count from the end. Outside an attributed
+/// kernel this syntax-only placeholder has no shape context.
+#[must_use]
+pub const fn extent(_axis: i32) -> u32 {
+    0
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct Signature {
