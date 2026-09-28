@@ -335,13 +335,12 @@ mod tests {
         backend.submit(trusted).unwrap().wait().unwrap();
 
         let program = residual_rms_norm(1e-6).validate().unwrap();
+        let inputs = [&residual, &update, &broadcast_weight];
+        let outputs = [&actual_residual, &actual_normalized];
+        let prepared = crate::prepare_program(&backend, &program, &inputs, &outputs).unwrap();
         let mut commands = CommandList::new();
         commands
-            .dispatch_program(
-                &program,
-                &[&residual, &update, &broadcast_weight],
-                &[&actual_residual, &actual_normalized],
-            )
+            .dispatch_kernel(&prepared, &inputs, &outputs)
             .unwrap();
         backend.submit(commands).unwrap().wait().unwrap();
 
@@ -447,19 +446,18 @@ mod tests {
         let actual_first = qk_half(&backend, &actual, 0);
         let actual_second = qk_half(&backend, &actual, 64);
         let program = qk_norm_rope(1e-6, 1_000_000.0).validate().unwrap();
+        let inputs = [
+            &first,
+            &second,
+            &first_weight,
+            &second_weight,
+            &program_positions,
+        ];
+        let outputs = [&actual_first, &actual_second];
+        let prepared = crate::prepare_program(&backend, &program, &inputs, &outputs).unwrap();
         let mut commands = CommandList::new();
         commands
-            .dispatch_program(
-                &program,
-                &[
-                    &first,
-                    &second,
-                    &first_weight,
-                    &second_weight,
-                    &program_positions,
-                ],
-                &[&actual_first, &actual_second],
-            )
+            .dispatch_kernel(&prepared, &inputs, &outputs)
             .unwrap();
         backend.submit(commands).unwrap().wait().unwrap();
 
@@ -489,9 +487,11 @@ mod tests {
         backend.submit(trusted_commands).unwrap().wait().unwrap();
 
         let program = program.validate().unwrap();
+        let prepared =
+            crate::prepare_program(backend, &program, program_inputs, program_outputs).unwrap();
         let mut program_commands = CommandList::new();
         program_commands
-            .dispatch_program(&program, program_inputs, program_outputs)
+            .dispatch_kernel(&prepared, program_inputs, program_outputs)
             .unwrap();
         backend.submit(program_commands).unwrap().wait().unwrap();
 

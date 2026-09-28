@@ -19,6 +19,38 @@ pub const BF16_TOLERANCE: f64 = 1e-2;
 /// The quantized normwise relative-error limit.
 pub const QUANTIZED_TOLERANCE: f64 = 1e-2;
 
+/// Prepares a validated program for the supplied concrete tensor bindings.
+///
+/// # Errors
+///
+/// Returns an error when the binding cannot form a valid kernel signature or preparation fails.
+pub fn prepare_program<B: Backend>(
+    backend: &B,
+    program: &forja_core::program::ValidatedProgram,
+    inputs: &[&Tensor],
+    outputs: &[&Tensor],
+) -> Result<std::sync::Arc<forja_core::program::PreparedProgram>, forja_core::program::PrepareError>
+{
+    let rank = outputs
+        .first()
+        .or_else(|| inputs.first())
+        .and_then(|tensor| u8::try_from(tensor.layout().shape().len()).ok())
+        .ok_or(forja_core::program::PrepareError::Rank)?;
+    let signature = forja_core::program::KernelSignature::new(
+        rank,
+        inputs
+            .iter()
+            .map(|tensor| tensor.layout().dtype())
+            .collect(),
+        outputs
+            .iter()
+            .map(|tensor| tensor.layout().dtype())
+            .collect(),
+        0,
+    );
+    forja_core::program::prepare_program(backend, program.clone(), signature)
+}
+
 /// A tensor allocation and metadata-only views used by backend tests.
 #[derive(Clone, Debug)]
 pub struct TensorSpec {
@@ -617,13 +649,13 @@ fn run_program<B: Backend>(
     inputs: &[Tensor],
     outputs: &[Tensor],
 ) -> Result<(), BackendError> {
+    let input_refs = inputs.iter().collect::<Vec<_>>();
+    let output_refs = outputs.iter().collect::<Vec<_>>();
+    let prepared = prepare_program(backend, program, &input_refs, &output_refs)
+        .map_err(|_| BackendError::InvalidInput)?;
     let mut commands = forja_core::CommandList::new();
     commands
-        .dispatch_program(
-            program,
-            &inputs.iter().collect::<Vec<_>>(),
-            &outputs.iter().collect::<Vec<_>>(),
-        )
+        .dispatch_kernel(&prepared, &input_refs, &output_refs)
         .map_err(|_| BackendError::InvalidInput)?;
     backend.submit(commands)?.wait()
 }

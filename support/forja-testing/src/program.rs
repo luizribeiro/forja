@@ -665,12 +665,11 @@ mod tests {
             .map(|spec| allocate(&backend, spec))
             .collect::<Result<Vec<_>, _>>()?;
         let program = case.program.validate()?;
+        let input_refs = inputs.iter().collect::<Vec<_>>();
+        let output_refs = outputs.iter().collect::<Vec<_>>();
+        let prepared = crate::prepare_program(&backend, &program, &input_refs, &output_refs)?;
         let mut commands = CommandList::new();
-        commands.dispatch_program(
-            &program,
-            &inputs.iter().collect::<Vec<_>>(),
-            &outputs.iter().collect::<Vec<_>>(),
-        )?;
+        commands.dispatch_kernel(&prepared, &input_refs, &output_refs)?;
         backend.submit(commands)?.wait()?;
         Ok(())
     }
