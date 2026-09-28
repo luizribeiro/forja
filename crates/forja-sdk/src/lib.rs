@@ -70,6 +70,25 @@
 //! }
 //! ```
 //!
+//! Custom kernels use a restricted Rust expression subset. [`kernel::Elem`]
+//! defines elementwise work, [`kernel::Row`] permits reductions over the last
+//! axis, and helpers are inlined while the program is built.
+//! Mutual recursion between helpers is not detected and overflows the build.
+//!
+//! ```no_run
+//! use forja_sdk::{kernel, kernel::Row};
+//!
+//! #[kernel(helper)]
+//! fn square(x: f32) -> f32 {
+//!     x * x
+//! }
+//!
+//! #[kernel(row)]
+//! fn rms_norm(x: Row, weight: Row, epsilon: f32) -> Row {
+//!     x * (square(x).row_mean() + epsilon).rsqrt() * weight
+//! }
+//! ```
+//!
 //! The `native` feature uses the CPU backend for tests and development.
 //! `native-metal` makes Metal selectable with [`set_native_device`] on macOS.
 //! Production engines must ship as components because native mode bypasses the
