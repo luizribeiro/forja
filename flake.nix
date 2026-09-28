@@ -35,6 +35,10 @@
           targets = [ "wasm32-wasip2" ];
         };
         cargoFiles = "(^|/)(Cargo\\.(toml|lock)|.*\\.rs)$";
+        allLocalStages = [
+          "pre-commit"
+          "pre-push"
+        ];
         cargoHook =
           {
             name,
@@ -42,6 +46,7 @@
             cargoToolchain ? toolchain,
             runtimeInputs ? [ ],
             files ? cargoFiles,
+            stages ? [ "pre-commit" ],
           }:
           {
             enable = true;
@@ -51,27 +56,38 @@
                 runtimeInputs = [ cargoToolchain ] ++ runtimeInputs;
               }
             }/bin/${name}";
-            inherit files;
+            inherit files stages;
             pass_filenames = false;
           };
         cargoHooks = {
           rustfmt = cargoHook {
             name = "rustfmt-hook";
+            stages = allLocalStages;
             text = ''
               cargo fmt --all -- --check
               cargo fmt --all --manifest-path support/guests/Cargo.toml -- --check
             '';
           };
-          clippy = cargoHook {
-            name = "clippy-hook";
-            text = ''
-              cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-              cargo clippy --manifest-path support/guests/Cargo.toml --workspace --all-targets --target wasm32-wasip2 --locked -- -D warnings
-            '';
+          host-clippy = cargoHook {
+            name = "host-clippy-hook";
+            stages = allLocalStages;
+            text = "cargo clippy --workspace --all-targets --all-features --locked -- -D warnings";
+          };
+          wasm-clippy = cargoHook {
+            name = "wasm-clippy-hook";
+            files = "^support/guests/";
+            stages = allLocalStages;
+            text = "cargo clippy --manifest-path support/guests/Cargo.toml --workspace --all-targets --target wasm32-wasip2 --locked -- -D warnings";
           };
           cargo-nextest = cargoHook {
             name = "cargo-nextest-hook";
             runtimeInputs = [ pkgs.cargo-nextest ];
+            text = "cargo nextest run --profile ci --release --workspace --all-features --locked --no-tests pass";
+          };
+          cargo-nextest-full = cargoHook {
+            name = "cargo-nextest-full-hook";
+            runtimeInputs = [ pkgs.cargo-nextest ];
+            stages = [ "pre-push" ];
             text = ''
               if [[ "''${FORJA_NO_GPU:-}" == "1" ]]; then
                 if [[ "''${GITHUB_ACTIONS:-}" != "true" ]]; then
@@ -88,6 +104,7 @@
             name = "cargo-deny-hook";
             runtimeInputs = [ pkgs.cargo-deny ];
             files = "(^|/)(Cargo\\.(toml|lock)|deny\\.toml)$";
+            stages = allLocalStages;
             text = "cargo deny check bans licenses sources";
           };
           doctests =
@@ -128,7 +145,7 @@
               stages = [ "pre-push" ];
             };
         };
-        offlineHooks = {
+        offlineHooks = pkgs.lib.mapAttrs (_: hook: hook // { stages = allLocalStages; }) {
           nixfmt.enable = true;
           deadnix.enable = true;
           statix.enable = true;
