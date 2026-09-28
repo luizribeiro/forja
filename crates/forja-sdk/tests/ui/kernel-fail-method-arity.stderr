@@ -1,0 +1,5 @@
+error: `clamp` takes two arguments
+ --> tests/ui/kernel-fail-method-arity.rs:3:5
+  |
+3 |     x.clamp(0.0)
+  |     ^^^^^^^^^^^^

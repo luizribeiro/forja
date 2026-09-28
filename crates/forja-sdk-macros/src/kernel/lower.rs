@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use proc_macro2::{Ident, Span, TokenStream};
 use quote::{format_ident, quote};
-use syn::{BinOp, Expr, Lit, Pat, Stmt, Type, UnOp, spanned::Spanned};
+use syn::{BinOp, Expr, ExprMethodCall, Lit, Pat, Stmt, Type, UnOp, spanned::Spanned};
 
 use super::ComputeType;
 
@@ -91,7 +91,9 @@ impl Lowerer {
                     let value = self.lower_expr(&init.expr)?;
                     self.bindings.insert(name, Binding::Value(value));
                 }
-                Stmt::Expr(expression, None) => result = Some(self.lower_result(expression)?),
+                Stmt::Expr(expression, None) => {
+                    result = Some(self.lower_result(expression)?);
+                }
                 Stmt::Expr(expression, Some(_)) => {
                     return Err(syn::Error::new_spanned(
                         expression,
@@ -136,10 +138,12 @@ impl Lowerer {
                 self.next_value,
                 span = Span::mixed_site()
             );
-            return Ok(self.emit(quote!({
-                let #constant_name: f32 = #constant;
-                #context.constant(#constant_name)
-            })));
+            return Ok(self.emit(quote!(
+                {
+                    let #constant_name: f32 = #constant;
+                    #context.constant(#constant_name)
+                }
+            )));
         }
         match expression {
             Expr::Path(path) => self.lower_path(path),
@@ -164,6 +168,7 @@ impl Lowerer {
                 let value = self.lower_expr(&unary.expr)?;
                 Ok(self.emit(quote!(-#value)))
             }
+            Expr::MethodCall(call) => self.lower_method(call),
             Expr::Paren(paren) => self.lower_expr(&paren.expr),
             Expr::Group(group) => self.lower_expr(&group.expr),
             Expr::Block(block) => match self.lower_block(&block.block)? {
@@ -216,6 +221,89 @@ impl Lowerer {
                 "u32 expressions are outside the core kernel subset",
             )),
             None => Err(syn::Error::new_spanned(path, "unknown kernel binding")),
+        }
+    }
+
+    fn lower_method(&mut self, call: &ExprMethodCall) -> syn::Result<Ident> {
+        if call.turbofish.is_some() {
+            return Err(syn::Error::new_spanned(
+                call,
+                "turbofish is not supported in kernels",
+            ));
+        }
+        let name = call.method.to_string();
+        if matches!(name.as_str(), "max" | "min") {
+            return Err(syn::Error::new_spanned(
+                call,
+                "use `maximum`/`minimum` for NaN-propagating f32 semantics",
+            ));
+        }
+        if let Some(arity) = method_arity(&name)
+            && call.args.len() != arity
+        {
+            return Err(syn::Error::new_spanned(
+                call,
+                method_arity_error(&name, arity),
+            ));
+        }
+        let receiver = self.lower_expr(&call.receiver)?;
+        if name == "powi" {
+            let exponent = powi_exponent(call.args.first().ok_or_else(|| {
+                syn::Error::new_spanned(call, "`powi` requires an integer literal")
+            })?)?;
+            let context = &self.context;
+            let exponent = self.emit(quote!(#context.constant(#exponent as f32)));
+            return Ok(self.emit(quote!(#receiver.powf(#exponent))));
+        }
+        let arguments = call
+            .args
+            .iter()
+            .map(|argument| self.lower_expr(argument))
+            .collect::<syn::Result<Vec<_>>>()?;
+        match (name.as_str(), arguments.as_slice()) {
+            (
+                "abs" | "exp" | "ln" | "sqrt" | "rsqrt" | "recip" | "sin" | "cos" | "tanh"
+                | "sigmoid" | "floor",
+                [],
+            ) => {
+                let method = &call.method;
+                Ok(self.emit(quote!(#receiver.#method())))
+            }
+            ("maximum" | "minimum" | "powf", [argument]) => {
+                let method = &call.method;
+                Ok(self.emit(quote!(#receiver.#method(#argument))))
+            }
+            ("clamp", [low, high]) => {
+                let maximum = self.emit(quote!(#receiver.maximum(#low)));
+                Ok(self.emit(quote!(#maximum.minimum(#high))))
+            }
+            ("ceil", []) => {
+                let negative = self.emit(quote!(-#receiver));
+                let floor = self.emit(quote!(#negative.floor()));
+                Ok(self.emit(quote!(-#floor)))
+            }
+            ("log2", []) => {
+                let logarithm = self.emit(quote!(#receiver.ln()));
+                let context = &self.context;
+                let scale = self.emit(quote!(#context.constant(::core::f32::consts::LOG2_E)));
+                Ok(self.emit(quote!(#logarithm * #scale)))
+            }
+            ("log10", []) => {
+                let logarithm = self.emit(quote!(#receiver.ln()));
+                let context = &self.context;
+                let scale = self.emit(quote!(#context.constant(::core::f32::consts::LOG10_E)));
+                Ok(self.emit(quote!(#logarithm * #scale)))
+            }
+            ("exp2", []) => {
+                let context = &self.context;
+                let scale = self.emit(quote!(#context.constant(::core::f32::consts::LN_2)));
+                let product = self.emit(quote!(#receiver * #scale));
+                Ok(self.emit(quote!(#product.exp())))
+            }
+            _ => Err(syn::Error::new_spanned(
+                call,
+                format!("method `{name}` is not supported in this kernel subset"),
+            )),
         }
     }
 
@@ -294,6 +382,26 @@ impl Lowerer {
     }
 }
 
+fn method_arity(name: &str) -> Option<usize> {
+    match name {
+        "abs" | "exp" | "ln" | "sqrt" | "rsqrt" | "recip" | "sin" | "cos" | "tanh" | "sigmoid"
+        | "floor" | "ceil" | "log2" | "log10" | "exp2" => Some(0),
+        "maximum" | "minimum" | "powf" | "powi" => Some(1),
+        "clamp" => Some(2),
+        _ => None,
+    }
+}
+
+fn method_arity_error(name: &str, arity: usize) -> String {
+    let arguments = match arity {
+        0 => "no arguments",
+        1 => "one argument",
+        2 => "two arguments",
+        _ => "the documented number of arguments",
+    };
+    format!("`{name}` takes {arguments}")
+}
+
 fn binding_pattern(pattern: &Pat) -> syn::Result<(String, Option<&Type>)> {
     let (pattern, ty) = match pattern {
         Pat::Type(pattern) => (&*pattern.pat, Some(&*pattern.ty)),
@@ -331,4 +439,39 @@ fn type_ident(ty: &Type) -> Option<&Ident> {
         .is_none()
         .then(|| path.path.get_ident())
         .flatten()
+}
+
+fn powi_exponent(expression: &Expr) -> syn::Result<i32> {
+    let (negative, literal) = match expression {
+        Expr::Lit(literal) => (false, literal),
+        Expr::Unary(unary) if matches!(unary.op, UnOp::Neg(_)) => {
+            let Expr::Lit(literal) = &*unary.expr else {
+                return Err(syn::Error::new_spanned(
+                    expression,
+                    "`powi` requires an integer literal",
+                ));
+            };
+            (true, literal)
+        }
+        _ => {
+            return Err(syn::Error::new_spanned(
+                expression,
+                "`powi` requires an integer literal",
+            ));
+        }
+    };
+    let Lit::Int(literal) = &literal.lit else {
+        return Err(syn::Error::new_spanned(
+            expression,
+            "`powi` requires an integer literal",
+        ));
+    };
+    let value = literal.base10_parse::<i32>()?;
+    if negative {
+        value
+            .checked_neg()
+            .ok_or_else(|| syn::Error::new_spanned(expression, "`powi` exponent is out of range"))
+    } else {
+        Ok(value)
+    }
 }
