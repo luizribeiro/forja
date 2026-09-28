@@ -4,6 +4,9 @@
 //! input's concrete shape. Graph replay must refuse that automatic broadcast
 //! when an extent is symbolic; callers can use the generated `_into` function
 //! with explicitly bound views instead.
+//!
+//! Kernel Boolean operators and conditionals evaluate both sides before a
+//! select, so they do not short-circuit.
 
 use std::{cell::RefCell, collections::VecDeque, marker::PhantomData};
 

@@ -1,0 +1,5 @@
+error: kernel: `if` without `else` has no value; kernels need both branches (both are evaluated)
+ --> tests/ui/kernel-fail-if-without-else.rs:3:5
+  |
+3 |     if x > 0.0 { x }
+  |     ^^

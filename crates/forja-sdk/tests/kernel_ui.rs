@@ -18,9 +18,11 @@ fn kernel_syntax_contracts() {
     cases.compile_fail("tests/ui/kernel-fail-unused-tensor.rs");
     cases.compile_fail("tests/ui/kernel-fail-f32-max.rs");
     cases.compile_fail("tests/ui/kernel-fail-integer-division.rs");
+    cases.compile_fail("tests/ui/kernel-fail-if-without-else.rs");
     cases.compile_fail("tests/ui/kernel-fail-integer-literal.rs");
     cases.compile_fail("tests/ui/kernel-fail-mismatched-types.rs");
     cases.compile_fail("tests/ui/kernel-fail-mismatched-u32.rs");
     cases.compile_fail("tests/ui/kernel-fail-remainder.rs");
     cases.compile_fail("tests/ui/kernel-fail-u32-add.rs");
+    cases.compile_fail("tests/ui/kernel-fail-too-large.rs");
 }

@@ -11,6 +11,14 @@ fn typed_expressions(
     let wrapped: u32 = ids.wrapping_add(2).wrapping_mul(3).wrapping_sub(1);
     let bounded = wrapped.min(limit).max(1);
     let in_range: bool = bounded < limit;
+    let selected = if !(in_range && ids != 0) || ids >= limit {
+        bounded
+    } else if ids == 1 {
+        1
+    } else {
+        0
+    };
+    let _selected = selected;
     let equal: bool = ids == 0;
     x + OFFSET
 }

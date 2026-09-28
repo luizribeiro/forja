@@ -6,6 +6,8 @@ use syn::{BinOp, Expr, ExprBinary, ExprMethodCall, Lit, Pat, Stmt, Type, UnOp, s
 
 use super::ComputeType;
 
+const MAX_INSTRUCTIONS: usize = 256;
+
 #[derive(Clone, Copy)]
 pub(super) enum Parameter {
     Tensor {
@@ -41,6 +43,7 @@ pub(super) fn lower(
         inputs: HashMap::new(),
         used_tensors: HashSet::new(),
         statements: Vec::new(),
+        instruction_spans: Vec::new(),
         context: context.clone(),
     };
     let result = lowerer.lower_block(body)?;
@@ -61,6 +64,15 @@ pub(super) fn lower(
                 ),
             ));
         }
+    }
+    if lowerer.instruction_spans.len() > MAX_INSTRUCTIONS {
+        return Err(kernel_error(
+            lowerer.instruction_spans[MAX_INSTRUCTIONS],
+            format!(
+                "kernel is too large: {} instructions (IR limit is {MAX_INSTRUCTIONS})",
+                lowerer.instruction_spans.len()
+            ),
+        ));
     }
     if let Some((name, span)) = tensors
         .iter()
@@ -117,6 +129,7 @@ struct Lowerer {
     inputs: HashMap<u32, Value>,
     used_tensors: HashSet<String>,
     statements: Vec<TokenStream>,
+    instruction_spans: Vec<Span>,
     context: Ident,
 }
 
@@ -209,6 +222,12 @@ impl Lowerer {
                         let ident = value.ident;
                         Ok(self.emit(quote!(-#ident), ValueType::F32, unary.span()))
                     }
+                    UnOp::Not(_) if value.ty == ValueType::Bool => {
+                        let ident = value.ident;
+                        let value = self.emit(quote!(#ident.not()), ValueType::Bool, unary.span());
+                        self.account_hidden_instructions(4, unary.span());
+                        Ok(value)
+                    }
                     _ => Err(kernel_error(
                         unary.op,
                         format!(
@@ -219,6 +238,7 @@ impl Lowerer {
                 }
             }
             Expr::MethodCall(call) => self.lower_method(call),
+            Expr::If(if_expression) => self.lower_if(if_expression),
             Expr::Paren(paren) => self.lower_expr(&paren.expr),
             Expr::Group(group) => self.lower_expr(&group.expr),
             Expr::Block(block) => match self.lower_block(&block.block)? {
@@ -295,11 +315,15 @@ impl Lowerer {
                 let constant = constant.ident;
                 Ok(self.emit(quote!(#constant.cast_u32()), ValueType::U32, value.span()))
             }
-            Lit::Bool(value) => Ok(self.emit(
-                quote!(#context.boolean(#value)),
-                ValueType::Bool,
-                value.span(),
-            )),
+            Lit::Bool(value) => {
+                let lowered = self.emit(
+                    quote!(#context.boolean(#value)),
+                    ValueType::Bool,
+                    value.span(),
+                );
+                self.account_hidden_instructions(1, value.span());
+                Ok(lowered)
+            }
             Lit::Float(value) => Err(kernel_error(
                 value,
                 "float literal could not be lowered as an f32 constant",
@@ -426,6 +450,33 @@ impl Lowerer {
                     ValueType::Bool,
                     binary.span(),
                 ))
+            }
+            BinOp::And(_) | BinOp::Or(_) => {
+                if left.ty != ValueType::Bool || right.ty != ValueType::Bool {
+                    return Err(type_mismatch(
+                        binary.op.span(),
+                        ValueType::Bool,
+                        if left.ty == ValueType::Bool {
+                            right.ty
+                        } else {
+                            left.ty
+                        },
+                    ));
+                }
+                let method = if matches!(binary.op, BinOp::And(_)) {
+                    format_ident!("and")
+                } else {
+                    format_ident!("or")
+                };
+                let left = left.ident;
+                let right = right.ident;
+                let value = self.emit(
+                    quote!(#left.#method(#right)),
+                    ValueType::Bool,
+                    binary.span(),
+                );
+                self.account_hidden_instructions(2, binary.span());
+                Ok(value)
             }
             _ => Err(kernel_error(
                 binary.op,
@@ -594,6 +645,43 @@ impl Lowerer {
         }
     }
 
+    fn lower_if(&mut self, if_expression: &syn::ExprIf) -> syn::Result<Value> {
+        let condition = self.lower_expr(&if_expression.cond)?;
+        require_type(&condition, ValueType::Bool)?;
+        let accepted = match self.lower_block(&if_expression.then_branch)? {
+            BlockResult::Value(value) => value,
+            BlockResult::Tuple(_) => {
+                return Err(kernel_error(
+                    &if_expression.then_branch,
+                    "tuple values are only supported as the kernel's final expression",
+                ));
+            }
+        };
+        let Some((_, rejected)) = &if_expression.else_branch else {
+            return Err(kernel_error(
+                if_expression.if_token,
+                "`if` without `else` has no value; kernels need both branches (both are evaluated)",
+            ));
+        };
+        let rejected = self.lower_expr(rejected)?;
+        if accepted.ty != rejected.ty {
+            return Err(type_mismatch(rejected.span, accepted.ty, rejected.ty));
+        }
+        let method = match accepted.ty {
+            ValueType::F32 => format_ident!("select"),
+            ValueType::U32 => format_ident!("select_u32"),
+            ValueType::Bool => format_ident!("select_bool"),
+        };
+        let condition = condition.ident;
+        let accepted_ident = accepted.ident;
+        let rejected_ident = rejected.ident;
+        Ok(self.emit(
+            quote!(#condition.#method(#accepted_ident, #rejected_ident)),
+            accepted.ty,
+            if_expression.span(),
+        ))
+    }
+
     fn constant_expression(&self, expression: &Expr) -> syn::Result<Option<TokenStream>> {
         match expression {
             Expr::Lit(literal) => match &literal.lit {
@@ -658,7 +746,13 @@ impl Lowerer {
             span = Span::mixed_site()
         );
         self.statements.push(quote!(let #ident = #expression;));
+        self.instruction_spans.push(span);
         Value { ident, ty, span }
+    }
+
+    fn account_hidden_instructions(&mut self, count: usize, span: Span) {
+        self.instruction_spans
+            .extend(std::iter::repeat_n(span, count));
     }
 }
 
