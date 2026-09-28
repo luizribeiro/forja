@@ -1,8 +1,9 @@
 use std::{error::Error, fmt};
 
 use crate::{
-    Affine, Op, OpError, ParamError, ParamValues, SymbolicLayout, SymbolicLayoutError, Tensor,
-    TensorError,
+    Affine, Dispatch, Op, OpError, ParamError, ParamValues, SymbolicLayout, SymbolicLayoutError,
+    Tensor, TensorError,
+    program::{Inst, ProgramKind},
 };
 
 /// A reason graph-template construction or instantiation failed.
@@ -85,6 +86,77 @@ impl GraphLimits {
             tensor_elements,
             work_per_dispatch,
         }
+    }
+
+    #[allow(dead_code)]
+    fn check_dispatch(&self, dispatch: &Dispatch) -> Result<(), GraphError> {
+        let mut work = self.tensor_work(dispatch.output())?;
+        for input in dispatch.inputs() {
+            work = work
+                .checked_add(self.tensor_work(input)?)
+                .ok_or(GraphError::WorkLimit)?;
+        }
+        let flops = match dispatch.op() {
+            Op::Matmul => matmul_flops(dispatch.inputs()),
+            Op::Sdpa { .. } => sdpa_flops(dispatch.inputs()),
+            _ => Some(0),
+        }
+        .ok_or(GraphError::WorkLimit)?;
+        if work
+            .checked_add(flops)
+            .is_none_or(|total| total > self.work_per_dispatch)
+        {
+            return Err(GraphError::WorkLimit);
+        }
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    fn check_program(&self, dispatch: &Dispatch) -> Result<(), GraphError> {
+        let program = dispatch
+            .prepared_program()
+            .ok_or(GraphError::WorkLimit)?
+            .validated();
+        let elements = self.tensor_work(dispatch.output())?;
+        let mut work = 0_u64;
+        for tensor in dispatch.inputs().iter().chain(dispatch.outputs()) {
+            work = work
+                .checked_add(self.tensor_work(tensor)?)
+                .ok_or(GraphError::WorkLimit)?;
+        }
+        let reduction_passes = if program.program().kind == ProgramKind::Row {
+            program
+                .program()
+                .insts
+                .iter()
+                .filter(|inst| matches!(inst, Inst::Reduce(_, _)))
+                .count()
+        } else {
+            0
+        };
+        let passes = program
+            .program()
+            .insts
+            .len()
+            .checked_add(reduction_passes)
+            .and_then(|count| u64::try_from(count).ok())
+            .ok_or(GraphError::WorkLimit)?;
+        if passes
+            .checked_mul(elements)
+            .and_then(|program_work| work.checked_add(program_work))
+            .is_none_or(|total| total > self.work_per_dispatch)
+        {
+            return Err(GraphError::WorkLimit);
+        }
+        Ok(())
+    }
+
+    fn tensor_work(&self, tensor: &Tensor) -> Result<u64, GraphError> {
+        let elements = tensor.layout().element_count();
+        if elements > self.tensor_elements {
+            return Err(GraphError::TensorElementsLimit);
+        }
+        Ok(elements)
     }
 }
 
@@ -195,12 +267,51 @@ impl From<Op> for TemplateOp {
     }
 }
 
+fn matmul_flops(inputs: &[Tensor]) -> Option<u64> {
+    let left = inputs.first()?.layout().shape();
+    let right = inputs.get(1)?.layout().shape();
+    let batch = if left.len() == 3 {
+        u64::from(*left.first()?)
+    } else {
+        1
+    };
+    let rank = left.len();
+    batch
+        .checked_mul(u64::from(*left.get(rank.checked_sub(2)?)?))?
+        .checked_mul(u64::from(*left.last()?))?
+        .checked_mul(u64::from(*right.last()?))?
+        .checked_mul(2)
+}
+
+fn sdpa_flops(inputs: &[Tensor]) -> Option<u64> {
+    let query = inputs.first()?.layout().shape();
+    let key = inputs.get(1)?.layout().shape();
+    let value = inputs.get(2)?.layout().shape();
+    u64::from(*query.first()?)
+        .checked_mul(u64::from(*query.get(1)?))?
+        .checked_mul(u64::from(*key.get(1)?))?
+        .checked_mul(u64::from(*query.get(2)?).checked_add(u64::from(*value.get(2)?))?)?
+        .checked_mul(2)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{TemplateOp, TemplateTensor};
+    use super::{GraphError, GraphLimits, TemplateOp, TemplateTensor};
     use crate::{
-        Affine, BufferId, DType, Layout, Op, ParamError, ParamSpace, SymbolicLayout, Tensor,
+        Affine, BufferId, DType, Dispatch, Layout, Op, ParamError, ParamSpace, SymbolicLayout,
+        Tensor,
+        program::{Inst, KernelSignature, Program, ProgramKind, prepared_for_test},
     };
+
+    fn tensor(buffer: u64, shape: &[u32]) -> Tensor {
+        let bytes = shape
+            .iter()
+            .map(|&extent| u64::from(extent))
+            .product::<u64>()
+            * DType::F32.byte_size();
+        let layout = Layout::contiguous(DType::F32, 0, shape.to_vec(), bytes).unwrap();
+        Tensor::from_allocation(BufferId::new(1, buffer, bytes), layout, true).unwrap()
+    }
 
     #[test]
     fn instantiates_affine_attention_positions_with_checked_arithmetic() {
@@ -235,5 +346,40 @@ mod tests {
             tensor,
             TemplateTensor::Symbolic { base: retained, .. } if retained == base
         ));
+    }
+
+    #[test]
+    fn checks_operation_and_program_work_bounds() {
+        let input = tensor(1, &[4]);
+        let output = tensor(2, &[4]);
+        let copy = Dispatch::new(Op::Copy, &[&input], &output).unwrap();
+        assert_eq!(
+            GraphLimits::new(1, 4, 7).check_dispatch(&copy),
+            Err(GraphError::WorkLimit)
+        );
+        assert_eq!(
+            GraphLimits::new(1, 3, u64::MAX).check_dispatch(&copy),
+            Err(GraphError::TensorElementsLimit)
+        );
+        assert!(GraphLimits::new(1, 4, 8).check_dispatch(&copy).is_ok());
+
+        let program = Program {
+            kind: ProgramKind::Map,
+            insts: vec![Inst::Input(0)],
+            outputs: vec![(0, 0)],
+        }
+        .validate()
+        .unwrap();
+        let prepared = prepared_for_test(
+            program,
+            KernelSignature::new(1, vec![DType::F32], vec![DType::F32], 0),
+        )
+        .unwrap();
+        let program = Dispatch::kernel(&prepared, &[&input], &[&output]).unwrap();
+        assert_eq!(
+            GraphLimits::new(1, 4, 11).check_program(&program),
+            Err(GraphError::WorkLimit)
+        );
+        assert!(GraphLimits::new(1, 4, 12).check_program(&program).is_ok());
     }
 }

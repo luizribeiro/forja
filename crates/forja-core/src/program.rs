@@ -403,6 +403,20 @@ fn prepare_program_inner<B: Backend>(
     }))
 }
 
+#[cfg(test)]
+pub(crate) fn prepared_for_test(
+    validated: ValidatedProgram,
+    signature: KernelSignature,
+) -> Result<Arc<PreparedProgram>, PrepareError> {
+    validate_signature(&validated, &signature)?;
+    Ok(Arc::new(PreparedProgram {
+        validated,
+        signature,
+        backend: Box::new(()),
+        _retained: None,
+    }))
+}
+
 fn validate_signature(
     validated: &ValidatedProgram,
     signature: &KernelSignature,
