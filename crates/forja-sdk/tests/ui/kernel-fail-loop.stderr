@@ -1,0 +1,5 @@
+error: expression is not supported in this kernel subset
+ --> tests/ui/kernel-fail-loop.rs:3:5
+  |
+3 |     loop { x }
+  |     ^^^^^^^^^^

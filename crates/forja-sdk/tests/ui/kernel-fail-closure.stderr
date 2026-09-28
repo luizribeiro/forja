@@ -1,0 +1,5 @@
+error: expression is not supported in this kernel subset
+ --> tests/ui/kernel-fail-closure.rs:3:5
+  |
+3 |     (|value| value)(x)
+  |     ^^^^^^^^^^^^^^^^^^

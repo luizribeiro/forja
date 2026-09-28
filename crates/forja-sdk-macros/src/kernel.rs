@@ -332,7 +332,7 @@ impl KernelFunction {
             .chain(
                 self.scalars
                     .iter()
-                    .map(|scalar| (scalar.ident.to_string(), Parameter::Scalar)),
+                    .map(|scalar| (scalar.ident.to_string(), Parameter::Scalar(scalar.compute))),
             )
             .collect::<HashMap<_, _>>();
         let lowered = lower(&self.item.block, parameters, &context)?;
