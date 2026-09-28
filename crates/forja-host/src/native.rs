@@ -2,7 +2,7 @@ use std::{sync::Arc, time::Duration};
 
 use forja_core::{
     Backend, BackendError, CommandList, DType, Op, Submission, Tensor, ViewOp,
-    program::ValidatedProgram,
+    program::{KernelSignature, PreparedProgram, ValidatedProgram, prepare_program},
 };
 
 /// An in-process host used by trusted native development and tests.
@@ -80,11 +80,36 @@ impl<B: Backend> NativeHost<B> {
         }
     }
 
+    /// Validates and prepares a scalar program for repeated dispatch.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when validation or backend preparation fails.
+    pub fn prepare_program(
+        &self,
+        program: ValidatedProgram,
+        signature: KernelSignature,
+    ) -> Result<NativeKernel<B>, BackendError> {
+        let program = prepare_program(self.backend.as_ref(), program, signature)
+            .map_err(|_| BackendError::InvalidInput)?;
+        Ok(NativeKernel {
+            backend: Arc::clone(&self.backend),
+            program,
+        })
+    }
+
     fn validate(&self, tensor: &NativeTensor<B>) -> Result<(), BackendError> {
         Arc::ptr_eq(&self.backend, &tensor.allocation.backend)
             .then_some(())
             .ok_or(BackendError::InvalidInput)
     }
+}
+
+/// A prepared scalar program owned by one native host.
+#[derive(Debug)]
+pub struct NativeKernel<B: Backend> {
+    backend: Arc<B>,
+    program: Arc<PreparedProgram>,
 }
 
 /// A refcounted native tensor handle.
@@ -191,6 +216,45 @@ impl<B: Backend> NativeCommandList<B> {
         self.commands
             .dispatch_program(
                 program,
+                &inputs
+                    .iter()
+                    .map(|tensor| &tensor.tensor)
+                    .collect::<Vec<_>>(),
+                &outputs
+                    .iter()
+                    .map(|tensor| &tensor.tensor)
+                    .collect::<Vec<_>>(),
+            )
+            .map_err(|_| BackendError::InvalidInput)?;
+        self.retained
+            .extend(inputs.iter().map(|tensor| (*tensor).clone()));
+        self.retained
+            .extend(outputs.iter().map(|tensor| (*tensor).clone()));
+        Ok(())
+    }
+
+    /// Validates and records one prepared scalar program.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for foreign resources or an invalid program binding.
+    pub fn dispatch_kernel(
+        &mut self,
+        kernel: &NativeKernel<B>,
+        inputs: &[&NativeTensor<B>],
+        outputs: &[&NativeTensor<B>],
+    ) -> Result<(), BackendError> {
+        if !Arc::ptr_eq(&self.backend, &kernel.backend)
+            || inputs
+                .iter()
+                .chain(outputs)
+                .any(|tensor| !Arc::ptr_eq(&self.backend, &tensor.allocation.backend))
+        {
+            return Err(BackendError::InvalidInput);
+        }
+        self.commands
+            .dispatch_kernel(
+                &kernel.program,
                 &inputs
                     .iter()
                     .map(|tensor| &tensor.tensor)
