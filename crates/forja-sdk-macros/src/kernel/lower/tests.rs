@@ -249,6 +249,27 @@ proptest! {
         assert_f32_values_agree(&expected, &interpreted[0])
             .map_err(|error| TestCaseError::fail(error.to_string()))?;
     }
+
+    #[test]
+    fn over_cap_syntax_is_rejected(excess in 1_usize..32) {
+        let mut expression = quote!(x);
+        for _ in 0..(128 + excess) {
+            expression = quote!((#expression + 1.0));
+        }
+        let instruction_error = lower_body(quote!({ #expression }))
+            .err()
+            .expect("generated expression must exceed the instruction cap");
+        prop_assert!(instruction_error.to_string().contains("kernel is too large"));
+
+        let mut expression = quote!(x.row_sum());
+        for _ in 0..(4 + excess) {
+            expression = quote!((#expression + x.row_sum()));
+        }
+        let reduction_error = lower_body(quote!({ #expression }))
+            .err()
+            .expect("generated expression must exceed the reduction cap");
+        prop_assert!(reduction_error.to_string().contains("too many reductions"));
+    }
 }
 
 fn property_config() -> ProptestConfig {
