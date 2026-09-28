@@ -24,13 +24,12 @@
 compile_error!("select at most one fusion profile");
 
 use forja_sdk::{
-    DType, Engine, EngineInfo, Load, Result, StepInput, StepOutput, Tensor, Weights, bf16,
+    Engine, EngineInfo, FloatElement, Load, Result, StepInput, StepOutput, Tensor, Weights, bf16,
     export_engine,
     nn::{
         Embedding, EmbeddingConfig, Linear, LinearConfig, RmsNorm, RmsNormConfig, WeightElement,
         ops::sdpa,
     },
-    program::{Ctx, F32, Kernel, Program, RowCtx},
 };
 
 /// Vocabulary size reported by Qwen3-0.6B.
@@ -57,31 +56,10 @@ const FUSE_FINAL_NORM: bool = cfg!(any(feature = "final-norm-only", feature = "a
 #[derive(Clone, Copy)]
 struct Config;
 
-struct Kernels {
-    residual_norm: Kernel,
-    qk_norm_rope: Kernel,
-    silu_mul: Kernel,
-    final_norm: Kernel,
-}
-
-impl Kernels {
-    fn new<T: Activation>() -> Result<Self> {
-        Ok(Self {
-            residual_norm: prepare_kernel::<T>(&residual_norm_program(), 2, 3, 2)?,
-            qk_norm_rope: prepare_kernel::<T>(&qk_norm_rope_program()?, 3, 5, 2)?,
-            silu_mul: prepare_kernel::<T>(&silu_mul_program(), 2, 2, 1)?,
-            final_norm: prepare_kernel::<T>(&final_norm_program(), 2, 2, 1)?,
-        })
-    }
-}
-
 /// Activation precision supported by the Qwen3 engine.
-pub trait Activation: WeightElement {
+pub trait Activation: WeightElement + FloatElement {
     /// Additive identity used to initialize the KV cache.
     const ZERO: Self;
-
-    /// Element type used by prepared activation kernels.
-    const DTYPE: DType;
 
     /// Converts a context position to the activation representation.
     fn from_position(position: u16) -> Self;
@@ -101,7 +79,6 @@ pub trait Activation: WeightElement {
 
 impl Activation for f32 {
     const ZERO: Self = 0.0;
-    const DTYPE: DType = DType::F32;
 
     fn from_position(position: u16) -> Self {
         Self::from(position)
@@ -126,7 +103,6 @@ impl Activation for f32 {
 
 impl Activation for bf16 {
     const ZERO: Self = bf16::ZERO;
-    const DTYPE: DType = DType::BF16;
 
     fn from_position(position: u16) -> Self {
         Self::from_f32(f32::from(position))
@@ -216,7 +192,6 @@ struct LayerCache<T: Activation> {
 struct LayerResources<'a, T: Activation> {
     cache: &'a mut LayerCache<T>,
     following_norm: Option<&'a RmsNorm<T>>,
-    kernels: &'a Kernels,
 }
 
 impl<T: Activation> LayerCache<T> {
@@ -246,7 +221,6 @@ impl<T: Activation> DecoderLayer<T> {
         let LayerResources {
             cache,
             following_norm,
-            kernels,
         } = resources;
         let sequence = positions_range.end - positions_range.start;
         let query_projection = self.self_attn.q_proj.forward(normalized_input)?.reshape(&[
@@ -265,18 +239,8 @@ impl<T: Activation> DecoderLayer<T> {
                 forja_sdk::Error::loading("fused rotary positions are unavailable")
             })?;
             (
-                qk_norm_rope(
-                    &query_projection,
-                    &self.self_attn.q_norm,
-                    program_positions,
-                    &kernels.qk_norm_rope,
-                )?,
-                qk_norm_rope(
-                    &key_projection,
-                    &self.self_attn.k_norm,
-                    program_positions,
-                    &kernels.qk_norm_rope,
-                )?,
+                apply_qk_norm_rope(&query_projection, &self.self_attn.q_norm, program_positions)?,
+                apply_qk_norm_rope(&key_projection, &self.self_attn.k_norm, program_positions)?,
             )
         } else {
             (
@@ -310,12 +274,7 @@ impl<T: Activation> DecoderLayer<T> {
         .reshape(&[sequence, QUERY_HEADS * HEAD_DIM])?;
         let attention = self.self_attn.o_proj.forward(&attended)?;
         let (hidden, normalized) = if FUSE_RESIDUAL_NORM {
-            residual_norm(
-                input,
-                &attention,
-                &self.post_attention_layernorm,
-                &kernels.residual_norm,
-            )?
+            residual_norm(input, &attention, self.post_attention_layernorm.weight())?
         } else {
             let hidden = (input + &attention)?;
             let normalized = self.post_attention_layernorm.forward(&hidden)?;
@@ -324,14 +283,13 @@ impl<T: Activation> DecoderLayer<T> {
         let gate = self.mlp.gate_proj.forward(&normalized)?;
         let up = self.mlp.up_proj.forward(&normalized)?;
         let activated = if FUSE_SILU_MUL {
-            silu_mul(&gate, &up, &kernels.silu_mul)?
+            silu_mul(&gate, &up)?
         } else {
             gate.silu_mul(&up)?
         };
         let projected = self.mlp.down_proj.forward(&activated)?;
         if FUSE_RESIDUAL_NORM && let Some(norm) = following_norm {
-            let (residual, normalized) =
-                residual_norm(&hidden, &projected, norm, &kernels.residual_norm)?;
+            let (residual, normalized) = residual_norm(&hidden, &projected, norm.weight())?;
             Ok((residual, Some(normalized)))
         } else {
             let residual = (&hidden + &projected)?;
@@ -343,26 +301,15 @@ impl<T: Activation> DecoderLayer<T> {
     }
 }
 
-fn silu_mul<T: Activation>(gate: &Tensor<T>, up: &Tensor<T>, kernel: &Kernel) -> Result<Tensor<T>> {
-    let [output] = gate
-        .run_kernel(kernel, &[up])?
-        .try_into()
-        .map_err(|_| forja_sdk::Error::loading("SiLU multiplication produced invalid outputs"))?;
-    Ok(output)
+#[forja_sdk::kernel(map)]
+fn silu_mul(gate: forja_sdk::kernel::Elem, up: forja_sdk::kernel::Elem) -> forja_sdk::kernel::Elem {
+    gate * gate.sigmoid() * up
 }
 
-fn silu_mul_program() -> Program {
-    let program = Ctx::new();
-    let gate_value = program.input(0);
-    program.output(0, gate_value * gate_value.sigmoid() * program.input(1));
-    program.finish()
-}
-
-fn qk_norm_rope<T: Activation>(
+fn apply_qk_norm_rope<T: Activation>(
     input: &Tensor<T>,
     norm: &RmsNorm<T>,
     positions: &Tensor<T>,
-    kernel: &Kernel,
 ) -> Result<Tensor<T>> {
     let [sequence, heads, head_dim]: [u32; 3] = input
         .shape()
@@ -378,115 +325,76 @@ fn qk_norm_rope<T: Activation>(
     let output = Tensor::<T>::zeros(input.shape())?;
     let output_lo = output.narrow(2, 0, half)?;
     let output_hi = output.narrow(2, half, half)?;
-    lo.run_kernel_into(
-        kernel,
-        &[&hi, &weight_lo, &weight_hi, &positions],
-        &[&output_lo, &output_hi],
+    qk_norm_rope_into(
+        &lo,
+        &hi,
+        &weight_lo,
+        &weight_hi,
+        &positions,
+        (&output_lo, &output_hi),
     )?;
     Ok(output)
 }
 
-fn qk_norm_rope_program() -> Result<Program> {
-    let head_dimension = u16::try_from(HEAD_DIM)
-        .map(f32::from)
-        .map_err(|_| forja_sdk::Error::loading("head dimension exceeds the program range"))?;
-    let program = RowCtx::new();
-    let lo_value = program.input(0);
-    let hi_value = program.input(1);
-    let square_sum = program.row_sum(lo_value * lo_value + hi_value * hi_value);
-    let inverse_rms = (square_sum / head_dimension + RMS_EPSILON).rsqrt();
-    let normalized_lo = lo_value * inverse_rms * program.input(2);
-    let normalized_hi = hi_value * inverse_rms * program.input(3);
-    let exponent = program.index(-1).cast_f32() * (-2.0 / head_dimension);
-    let angle = program.input(4) * program.constant(ROPE_THETA).powf(exponent);
+#[forja_sdk::kernel(row)]
+fn qk_norm_rope(
+    lo: forja_sdk::kernel::Row,
+    hi: forja_sdk::kernel::Row,
+    weight_lo: forja_sdk::kernel::Row,
+    weight_hi: forja_sdk::kernel::Row,
+    positions: forja_sdk::kernel::Row,
+) -> (forja_sdk::kernel::Row, forja_sdk::kernel::Row) {
+    let square_sum = (lo * lo + hi * hi).row_sum();
+    let inverse_rms = (square_sum / 128.0 + RMS_EPSILON).rsqrt();
+    let normalized_lo = lo * inverse_rms * weight_lo;
+    let normalized_hi = hi * inverse_rms * weight_hi;
+    let exponent = forja_sdk::kernel::index(-1) as f32 * (-2.0 / 128.0);
+    let angle = positions * ROPE_THETA.powf(exponent);
     let cosine = angle.cos();
     let sine = angle.sin();
-    program.output(0, normalized_lo * cosine - normalized_hi * sine);
-    program.output(1, normalized_hi * cosine + normalized_lo * sine);
-    Ok(program.finish())
-}
-
-fn residual_norm<T: Activation>(
-    residual: &Tensor<T>,
-    update: &Tensor<T>,
-    norm: &RmsNorm<T>,
-    kernel: &Kernel,
-) -> Result<(Tensor<T>, Tensor<T>)> {
-    let weight = norm.weight().broadcast_as(residual.shape())?;
-    let outputs = residual.run_kernel(kernel, &[update, &weight])?;
-    let [residual, normalized] = outputs
-        .try_into()
-        .map_err(|_| forja_sdk::Error::loading("residual norm produced invalid outputs"))?;
-    Ok((residual, normalized))
-}
-
-fn residual_norm_program() -> Program {
-    let program = RowCtx::new();
-    let value = program.input(0) + program.input(1);
-    program.output(0, value);
-    program.output(1, rms_normalize(&program, value, program.input(2)));
-    program.finish()
-}
-
-fn final_norm<T: Activation>(
-    input: &Tensor<T>,
-    norm: &RmsNorm<T>,
-    kernel: &Kernel,
-) -> Result<Tensor<T>> {
-    let weight = norm.weight().broadcast_as(input.shape())?;
-    let [output] = input
-        .run_kernel(kernel, &[&weight])?
-        .try_into()
-        .map_err(|_| forja_sdk::Error::loading("final norm produced invalid outputs"))?;
-    Ok(output)
-}
-
-fn final_norm_program() -> Program {
-    let program = RowCtx::new();
-    let value = program.input(0);
-    program.output(0, rms_normalize(&program, value, program.input(1)));
-    program.finish()
-}
-
-fn prepare_kernel<T: Activation>(
-    program: &Program,
-    rank: u8,
-    inputs: usize,
-    outputs: usize,
-) -> Result<Kernel> {
-    Kernel::new(
-        program,
-        rank,
-        &vec![<T as Activation>::DTYPE; inputs],
-        &vec![<T as Activation>::DTYPE; outputs],
+    (
+        normalized_lo * cosine - normalized_hi * sine,
+        normalized_hi * cosine + normalized_lo * sine,
     )
 }
 
-fn rms_normalize<'a>(program: &'a RowCtx, value: F32<'a>, weight: F32<'a>) -> F32<'a> {
-    let square_sum = program.row_sum(value * value);
-    let inverse_rms = (square_sum / program.extent(-1).cast_f32() + RMS_EPSILON).rsqrt();
-    value * inverse_rms * weight
+#[forja_sdk::kernel(row)]
+fn residual_norm(
+    residual: forja_sdk::kernel::Row,
+    update: forja_sdk::kernel::Row,
+    weight: forja_sdk::kernel::Row,
+) -> (forja_sdk::kernel::Row, forja_sdk::kernel::Row) {
+    let value = residual + update;
+    // Pin the weight input ahead of reduction temporaries in the canonical IR.
+    let weight = weight;
+    let inverse_rms = (value * value).row_mean() + RMS_EPSILON;
+    (value, value * inverse_rms.rsqrt() * weight)
+}
+
+#[forja_sdk::kernel(row)]
+fn final_norm(
+    input: forja_sdk::kernel::Row,
+    weight: forja_sdk::kernel::Row,
+) -> forja_sdk::kernel::Row {
+    // Pin input emission to signature order for the canonical IR identity.
+    let input = input;
+    let weight = weight;
+    input * ((input * input).row_mean() + RMS_EPSILON).rsqrt() * weight
 }
 
 /// Qwen3-0.6B with a fixed 4096-token KV cache.
 pub struct Qwen3<T: Activation = f32> {
     weights: QwenWeights<T>,
     caches: Vec<LayerCache<T>>,
-    kernels: Kernels,
 }
 
 impl<T: Activation> Qwen3<T> {
     fn load_from_weights(weights: &Weights<'_>) -> Result<Self> {
-        let kernels = Kernels::new::<T>()?;
         let weights = QwenWeights::<_>::load(weights, &Config)?;
         let caches = (0..LAYERS)
             .map(|_| LayerCache::new())
             .collect::<Result<Vec<_>>>()?;
-        Ok(Self {
-            weights,
-            caches,
-            kernels,
-        })
+        Ok(Self { weights, caches })
     }
 
     fn output(tensor: Tensor<T>) -> Result<Tensor<f32>> {
@@ -523,7 +431,6 @@ impl<T: Activation> Qwen3<T> {
                 LayerResources {
                     cache: &mut self.caches[0],
                     following_norm: None,
-                    kernels: &self.kernels,
                 },
             )?
             .0
@@ -592,7 +499,6 @@ impl Engine for ExportedQwen3 {
                 LayerResources {
                     cache: &mut self.caches[index],
                     following_norm,
-                    kernels: &self.kernels,
                 },
             )?;
             hidden = next_hidden;
@@ -604,7 +510,7 @@ impl Engine for ExportedQwen3 {
             }
         }
         hidden = if FUSE_FINAL_NORM {
-            final_norm(&hidden, &self.weights.model.norm, &self.kernels.final_norm)?
+            final_norm(&hidden, self.weights.model.norm.weight())?
         } else {
             self.weights.model.norm.forward(&hidden)?
         };

@@ -84,6 +84,53 @@ fn macro_bad_axis(x: forja_sdk::kernel::Elem) -> forja_sdk::kernel::Elem {
     x + forja_sdk::kernel::index(2) as f32
 }
 
+const QWEN_RMS_EPSILON: f32 = 1.0e-6;
+const QWEN_ROPE_THETA: f32 = 1.0e6;
+
+#[forja_sdk::kernel(row)]
+fn macro_residual_norm(
+    residual: forja_sdk::kernel::Row,
+    update: forja_sdk::kernel::Row,
+    weight: forja_sdk::kernel::Row,
+) -> (forja_sdk::kernel::Row, forja_sdk::kernel::Row) {
+    let value = residual + update;
+    let weight = weight;
+    let inverse_rms = (value * value).row_mean() + QWEN_RMS_EPSILON;
+    (value, value * inverse_rms.rsqrt() * weight)
+}
+
+#[forja_sdk::kernel(row)]
+fn macro_final_norm(
+    input: forja_sdk::kernel::Row,
+    weight: forja_sdk::kernel::Row,
+) -> forja_sdk::kernel::Row {
+    let input = input;
+    let weight = weight;
+    input * ((input * input).row_mean() + QWEN_RMS_EPSILON).rsqrt() * weight
+}
+
+#[forja_sdk::kernel(row)]
+fn macro_qk_norm_rope(
+    lo: forja_sdk::kernel::Row,
+    hi: forja_sdk::kernel::Row,
+    weight_lo: forja_sdk::kernel::Row,
+    weight_hi: forja_sdk::kernel::Row,
+    positions: forja_sdk::kernel::Row,
+) -> (forja_sdk::kernel::Row, forja_sdk::kernel::Row) {
+    let square_sum = (lo * lo + hi * hi).row_sum();
+    let inverse_rms = (square_sum / 128.0 + QWEN_RMS_EPSILON).rsqrt();
+    let normalized_lo = lo * inverse_rms * weight_lo;
+    let normalized_hi = hi * inverse_rms * weight_hi;
+    let exponent = forja_sdk::kernel::index(-1) as f32 * (-2.0 / 128.0);
+    let angle = positions * QWEN_ROPE_THETA.powf(exponent);
+    let cosine = angle.cos();
+    let sine = angle.sin();
+    (
+        normalized_lo * cosine - normalized_hi * sine,
+        normalized_hi * cosine + normalized_lo * sine,
+    )
+}
+
 #[forja_sdk::kernel(helper)]
 fn helper_square(x: f32) -> f32 {
     x * x
@@ -426,6 +473,109 @@ fn helper_expansion_caps_name_the_kernel() {
         reductions.to_string(),
         "kernel `macro_helper_too_many_reductions`: invalid program: TooManyReductions"
     );
+}
+
+#[test]
+fn qwen_norm_programs_preserve_builder_ir() -> Result<(), Box<dyn Error>> {
+    let residual = macro_residual_norm_program(
+        2,
+        &[DType::F32, DType::F32, DType::F32],
+        &[DType::F32, DType::F32],
+    )?;
+    let hand = RowCtx::new();
+    let value = hand.input(0) + hand.input(1);
+    hand.output(0, value);
+    let weight = hand.input(2);
+    hand.output(1, rms_normalize(&hand, value, weight));
+    let hand = Kernel::new(
+        &hand.finish(),
+        2,
+        &[DType::F32, DType::F32, DType::F32],
+        &[DType::F32, DType::F32],
+    )?;
+    assert_eq!(
+        residual.validated_program().content_hash(),
+        hand.validated_program().content_hash()
+    );
+
+    let final_kernel = macro_final_norm_program(2, &[DType::F32, DType::F32], &[DType::F32])?;
+    let hand = RowCtx::new();
+    let value = hand.input(0);
+    let weight = hand.input(1);
+    hand.output(0, rms_normalize(&hand, value, weight));
+    let hand = Kernel::new(&hand.finish(), 2, &[DType::F32, DType::F32], &[DType::F32])?;
+    assert_eq!(
+        final_kernel.validated_program().content_hash(),
+        hand.validated_program().content_hash()
+    );
+    Ok(())
+}
+
+#[test]
+fn qwen_qk_norm_rope_preserves_interpreter_bits() -> Result<(), Box<dyn Error>> {
+    let macro_kernel = macro_qk_norm_rope_program(
+        3,
+        &[DType::F32, DType::F32, DType::F32, DType::F32, DType::F32],
+        &[DType::F32, DType::F32],
+    )?;
+    let hand = qk_norm_rope_builder()?;
+    let shape = [1, 8, 64];
+    let values = (0..5)
+        .map(|input| random_values(512, 0xcafe + input))
+        .collect::<Vec<_>>();
+    let inputs = values
+        .iter()
+        .map(|values| Input::F32(values))
+        .collect::<Vec<_>>();
+    let macro_outputs =
+        forja_cpu::interpreter::interpret(macro_kernel.validated_program(), &shape, &inputs)?;
+    let hand_outputs =
+        forja_cpu::interpreter::interpret(hand.validated_program(), &shape, &inputs)?;
+    for (expected, actual) in hand_outputs.iter().zip(&macro_outputs) {
+        assert_eq!(
+            expected
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            actual
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        );
+    }
+    Ok(())
+}
+
+fn rms_normalize<'a>(
+    context: &'a RowCtx,
+    value: forja_sdk::program::F32<'a>,
+    weight: forja_sdk::program::F32<'a>,
+) -> forja_sdk::program::F32<'a> {
+    let square_sum = context.row_sum(value * value);
+    let inverse_rms = (square_sum / context.extent(-1).cast_f32() + QWEN_RMS_EPSILON).rsqrt();
+    value * inverse_rms * weight
+}
+
+fn qk_norm_rope_builder() -> forja_sdk::Result<Kernel> {
+    let context = RowCtx::new();
+    let lo = context.input(0);
+    let hi = context.input(1);
+    let square_sum = context.row_sum(lo * lo + hi * hi);
+    let inverse_rms = (square_sum / 128.0 + QWEN_RMS_EPSILON).rsqrt();
+    let normalized_lo = lo * inverse_rms * context.input(2);
+    let normalized_hi = hi * inverse_rms * context.input(3);
+    let exponent = context.index(-1).cast_f32() * (-2.0 / 128.0);
+    let angle = context.input(4) * context.constant(QWEN_ROPE_THETA).powf(exponent);
+    let cosine = angle.cos();
+    let sine = angle.sin();
+    context.output(0, normalized_lo * cosine - normalized_hi * sine);
+    context.output(1, normalized_hi * cosine + normalized_lo * sine);
+    Kernel::new(
+        &context.finish(),
+        3,
+        &[DType::F32, DType::F32, DType::F32, DType::F32, DType::F32],
+        &[DType::F32, DType::F32],
+    )
 }
 
 fn typed_kernels() -> forja_sdk::Result<(Kernel, Kernel)> {
