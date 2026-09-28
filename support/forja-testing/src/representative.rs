@@ -397,6 +397,80 @@ mod tests {
         );
     }
 
+    #[test]
+    fn qk_norm_rope_matches_the_trusted_operations() {
+        let backend = CpuBackend::new();
+        let values = initialized(&backend, &[7, 16, 128], 9);
+        let weight = initialized(&backend, &[128], 10);
+        let positions = backend.alloc(DType::U32, &[7]).unwrap();
+        backend
+            .write(
+                &positions,
+                &(0_u32..7).flat_map(u32::to_le_bytes).collect::<Vec<_>>(),
+            )
+            .unwrap();
+        let normalized = backend.alloc(DType::F32, &[7, 16, 128]).unwrap();
+        let expected = backend.alloc(DType::F32, &[7, 16, 128]).unwrap();
+        let mut trusted = CommandList::new();
+        trusted
+            .dispatch(Op::RmsNorm { eps: 1e-6 }, &[&values, &weight], &normalized)
+            .unwrap();
+        trusted
+            .dispatch(
+                Op::Rope { theta: 1_000_000.0 },
+                &[&normalized, &positions],
+                &expected,
+            )
+            .unwrap();
+        backend.submit(trusted).unwrap().wait().unwrap();
+
+        let first = qk_half(&backend, &values, 0);
+        let second = qk_half(&backend, &values, 64);
+        let first_weight = qk_weight(&backend, &weight, 0);
+        let second_weight = qk_weight(&backend, &weight, 64);
+        let program_positions = backend.alloc(DType::F32, &[7]).unwrap();
+        backend
+            .write(
+                &program_positions,
+                &(0_u16..7)
+                    .flat_map(|value| f32::from(value).to_le_bytes())
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        let program_positions = backend
+            .view(&program_positions, ViewOp::Reshape(vec![7, 1, 1]))
+            .unwrap();
+        let program_positions = backend
+            .view(&program_positions, ViewOp::Broadcast(vec![7, 16, 64]))
+            .unwrap();
+        let actual = backend.alloc(DType::F32, &[7, 16, 128]).unwrap();
+        let actual_first = qk_half(&backend, &actual, 0);
+        let actual_second = qk_half(&backend, &actual, 64);
+        let program = qk_norm_rope(1e-6, 1_000_000.0).validate().unwrap();
+        let mut commands = CommandList::new();
+        commands
+            .dispatch_program(
+                &program,
+                &[
+                    &first,
+                    &second,
+                    &first_weight,
+                    &second_weight,
+                    &program_positions,
+                ],
+                &[&actual_first, &actual_second],
+            )
+            .unwrap();
+        backend.submit(commands).unwrap().wait().unwrap();
+
+        assert_outputs_agree(
+            DType::F32,
+            &backend.read(&expected).unwrap(),
+            &backend.read(&actual).unwrap(),
+        )
+        .unwrap();
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn assert_program_matches(
         backend: &CpuBackend,
@@ -452,6 +526,31 @@ mod tests {
                     Slice::new(0, 64, 1).unwrap(),
                 ]),
             )
+            .unwrap()
+    }
+
+    fn qk_half(backend: &CpuBackend, tensor: &Tensor, start: u32) -> Tensor {
+        backend
+            .view(
+                tensor,
+                ViewOp::Slice(vec![
+                    Slice::new(0, 7, 1).unwrap(),
+                    Slice::new(0, 16, 1).unwrap(),
+                    Slice::new(start, 64, 1).unwrap(),
+                ]),
+            )
+            .unwrap()
+    }
+
+    fn qk_weight(backend: &CpuBackend, tensor: &Tensor, start: u32) -> Tensor {
+        let weight = backend
+            .view(
+                tensor,
+                ViewOp::Slice(vec![Slice::new(start, 64, 1).unwrap()]),
+            )
+            .unwrap();
+        backend
+            .view(&weight, ViewOp::Broadcast(vec![7, 16, 64]))
             .unwrap()
     }
 }

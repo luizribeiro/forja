@@ -26,6 +26,7 @@ const RMS_EPSILON: f32 = 1.0e-6;
 const ROPE_THETA: f32 = 1.0e6;
 const ATTENTION_SCALE: f32 = 0.088_388_35;
 const FUSE_RESIDUAL_NORM: bool = true;
+const FUSE_QK_NORM_ROPE: bool = true;
 
 #[derive(Clone, Copy)]
 struct Config;
@@ -34,6 +35,9 @@ struct Config;
 pub trait Activation: WeightElement {
     /// Additive identity used to initialize the KV cache.
     const ZERO: Self;
+
+    /// Converts a context position to the activation representation.
+    fn from_position(position: u16) -> Self;
 
     /// Selects the model's bf16 storage representation.
     fn linear_config(input: u32, output: u32) -> LinearConfig;
@@ -50,6 +54,10 @@ pub trait Activation: WeightElement {
 
 impl Activation for f32 {
     const ZERO: Self = 0.0;
+
+    fn from_position(position: u16) -> Self {
+        Self::from(position)
+    }
 
     fn linear_config(input: u32, output: u32) -> LinearConfig {
         LinearConfig::promoted_bf16(input, output)
@@ -70,6 +78,10 @@ impl Activation for f32 {
 
 impl Activation for bf16 {
     const ZERO: Self = bf16::ZERO;
+
+    fn from_position(position: u16) -> Self {
+        Self::from_f32(f32::from(position))
+    }
 
     fn linear_config(input: u32, output: u32) -> LinearConfig {
         LinearConfig::new(input, output)
@@ -172,31 +184,45 @@ impl<T: Activation> DecoderLayer<T> {
         &self,
         input: &Tensor<T>,
         normalized_input: &Tensor<T>,
-        positions: &Tensor<u32>,
+        positions: (&Tensor<u32>, Option<&Tensor<T>>),
         positions_range: std::ops::Range<u32>,
         cache: &mut LayerCache<T>,
         following_norm: Option<&RmsNorm<T>>,
     ) -> Result<(Tensor<T>, Option<Tensor<T>>)> {
         let sequence = positions_range.end - positions_range.start;
-        let query_projection = self.self_attn.q_proj.forward(normalized_input)?;
-        let key_projection = self.self_attn.k_proj.forward(normalized_input)?;
-        let value_projection = self.self_attn.v_proj.forward(normalized_input)?;
-        let normalized_query = self.self_attn.q_norm.forward(&query_projection.reshape(&[
+        let query_projection = self.self_attn.q_proj.forward(normalized_input)?.reshape(&[
             sequence,
             QUERY_HEADS,
             HEAD_DIM,
-        ])?)?;
-        let normalized_key = self.self_attn.k_norm.forward(&key_projection.reshape(&[
+        ])?;
+        let key_projection = self.self_attn.k_proj.forward(normalized_input)?.reshape(&[
             sequence,
             KEY_VALUE_HEADS,
             HEAD_DIM,
-        ])?)?;
-        let query = normalized_query
-            .rope(positions, ROPE_THETA)?
-            .permute(&[1, 0, 2])?;
-        let key = normalized_key
-            .rope(positions, ROPE_THETA)?
-            .permute(&[1, 0, 2])?;
+        ])?;
+        let value_projection = self.self_attn.v_proj.forward(normalized_input)?;
+        let (query, key) = if FUSE_QK_NORM_ROPE {
+            let program_positions = positions.1.ok_or_else(|| {
+                forja_sdk::Error::loading("fused rotary positions are unavailable")
+            })?;
+            (
+                qk_norm_rope(&query_projection, &self.self_attn.q_norm, program_positions)?,
+                qk_norm_rope(&key_projection, &self.self_attn.k_norm, program_positions)?,
+            )
+        } else {
+            (
+                self.self_attn
+                    .q_norm
+                    .forward(&query_projection)?
+                    .rope(positions.0, ROPE_THETA)?,
+                self.self_attn
+                    .k_norm
+                    .forward(&key_projection)?
+                    .rope(positions.0, ROPE_THETA)?,
+            )
+        };
+        let query = query.permute(&[1, 0, 2])?;
+        let key = key.permute(&[1, 0, 2])?;
         let value = value_projection
             .reshape(&[sequence, KEY_VALUE_HEADS, HEAD_DIM])?
             .permute(&[1, 0, 2])?;
@@ -235,6 +261,49 @@ impl<T: Activation> DecoderLayer<T> {
             Ok((residual, normalized))
         }
     }
+}
+
+fn qk_norm_rope<T: Activation>(
+    input: &Tensor<T>,
+    norm: &RmsNorm<T>,
+    positions: &Tensor<T>,
+) -> Result<Tensor<T>> {
+    let [sequence, heads, head_dim]: [u32; 3] = input
+        .shape()
+        .try_into()
+        .map_err(|_| forja_sdk::Error::loading("QK projection must have rank three"))?;
+    let half = head_dim / 2;
+    let shape = [sequence, heads, half];
+    let lo = input.narrow(2, 0, half)?;
+    let hi = input.narrow(2, half, half)?;
+    let weight_lo = norm.weight().narrow(0, 0, half)?.broadcast_as(&shape)?;
+    let weight_hi = norm.weight().narrow(0, half, half)?.broadcast_as(&shape)?;
+    let positions = positions.reshape(&[sequence, 1, 1])?.broadcast_as(&shape)?;
+    let output = Tensor::<T>::zeros(input.shape())?;
+    let output_lo = output.narrow(2, 0, half)?;
+    let output_hi = output.narrow(2, half, half)?;
+    let head_dimension = u16::try_from(HEAD_DIM)
+        .map(f32::from)
+        .map_err(|_| forja_sdk::Error::loading("head dimension exceeds the program range"))?;
+    let program = Program::row();
+    let lo_value = program.input(0);
+    let hi_value = program.input(1);
+    let square_sum = program.reduce(ReduceOp::Sum, lo_value * lo_value + hi_value * hi_value);
+    let inverse_rms = (square_sum / head_dimension + RMS_EPSILON).rsqrt();
+    let normalized_lo = lo_value * inverse_rms * program.input(2);
+    let normalized_hi = hi_value * inverse_rms * program.input(3);
+    let exponent = program.index(-1) * (-2.0 / head_dimension);
+    let angle = program.input(4) * program.constant(ROPE_THETA).pow(exponent);
+    let cosine = angle.cos();
+    let sine = angle.sin();
+    program.output(0, normalized_lo * cosine - normalized_hi * sine);
+    program.output(1, normalized_hi * cosine + normalized_lo * sine);
+    lo.run_program_into(
+        &program,
+        &[&hi, &weight_lo, &weight_hi, &positions],
+        &[&output_lo, &output_hi],
+    )?;
+    Ok(output)
 }
 
 fn residual_norm<T: Activation>(
@@ -279,6 +348,11 @@ impl<T: Activation> Qwen3<T> {
             .copied()
             .ok_or_else(|| forja_sdk::Error::loading("tokens must have rank one"))?;
         let positions = positions(0, sequence)?;
+        let program_positions = if FUSE_QK_NORM_ROPE {
+            Some(activation_positions::<T>(0, sequence)?)
+        } else {
+            None
+        };
         let hidden = self.weights.model.embed_tokens.forward(tokens)?;
         let normalized = self.weights.model.layers[0]
             .input_layernorm
@@ -287,7 +361,7 @@ impl<T: Activation> Qwen3<T> {
             .forward(
                 &hidden,
                 &normalized,
-                &positions,
+                (&positions, program_positions.as_ref()),
                 0..sequence,
                 &mut self.caches[0],
                 None,
@@ -336,6 +410,11 @@ impl Engine for ExportedQwen3 {
             .filter(|&end| end <= MAX_CONTEXT)
             .ok_or_else(|| forja_sdk::Error::loading("tokens exceed the 4096-token context"))?;
         let positions = positions(input.start_pos, end_pos)?;
+        let program_positions = if FUSE_QK_NORM_ROPE {
+            Some(activation_positions(input.start_pos, end_pos)?)
+        } else {
+            None
+        };
         let mut hidden = self.weights.model.embed_tokens.forward(&input.tokens)?;
         let mut normalized = self.weights.model.layers[0]
             .input_layernorm
@@ -352,7 +431,7 @@ impl Engine for ExportedQwen3 {
             let (next_hidden, next_normalized) = layer.forward(
                 &hidden,
                 &normalized,
-                &positions,
+                (&positions, program_positions.as_ref()),
                 input.start_pos..end_pos,
                 &mut self.caches[index],
                 following_norm,
@@ -384,4 +463,15 @@ impl Engine for ExportedQwen3 {
 
 fn positions(start: u32, end: u32) -> Result<Tensor<u32>> {
     Tensor::from_slice(&(start..end).collect::<Vec<_>>(), &[end - start])
+}
+
+fn activation_positions<T: Activation>(start: u32, end: u32) -> Result<Tensor<T>> {
+    let values = (start..end)
+        .map(|position| {
+            u16::try_from(position)
+                .map(T::from_position)
+                .map_err(|_| forja_sdk::Error::loading("position exceeds activation range"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Tensor::from_slice(&values, &[end - start])
 }
