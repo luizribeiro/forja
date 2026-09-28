@@ -7,7 +7,7 @@ wit_bindgen::generate!({
 
 use forja_sdk::{
     DType, Tensor,
-    program::{Kernel as SdkKernel, Program, ReduceOp},
+    program::{Ctx, Kernel as SdkKernel, RowCtx},
 };
 use l9o::gpu::compute::{Binop, Dtype, Inst, Kernel, KernelSignature, ProgramKind, ProgramSource};
 
@@ -39,7 +39,7 @@ impl Guest for Component {
 }
 
 fn exercise_explicit_kernel() -> forja_sdk::Result<()> {
-    let program = Program::map();
+    let program = Ctx::new();
     program.output(0, program.input(0) * 2.0);
     let kernel = SdkKernel::new(&program, 2, &[DType::F32], &[DType::F32])?;
     let wrong_rank = Tensor::from_slice(&[1.0_f32; 7], &[7])?;
@@ -83,7 +83,7 @@ fn exercise_explicit_kernel() -> forja_sdk::Result<()> {
 fn run_distinct_programs(count: u16) -> forja_sdk::Result<()> {
     let input = Tensor::from_slice(&[2.0_f32], &[1])?;
     for value in 0..count {
-        let program = Program::map();
+        let program = Ctx::new();
         program.output(0, program.input(0) + program.constant(f32::from(value)));
         let output = input
             .run_program(&program, &[])?
@@ -131,9 +131,9 @@ fn fused() -> forja_sdk::Result<Vec<f32>> {
         .map(|index| 0.5 + f32::from(index) / 2048.0)
         .collect::<Vec<_>>();
     let weight = Tensor::from_slice(&weight_values, &[1024])?.broadcast_as(&[7, 1024])?;
-    let program = Program::row();
+    let program = RowCtx::new();
     let sum = program.input(0) + program.input(1);
-    let square_sum = program.reduce(ReduceOp::Sum, sum * sum);
+    let square_sum = program.row_sum(sum * sum);
     let inverse_rms = (square_sum / program.extent(-1).cast_f32() + 1.0e-6).rsqrt();
     program.output(0, sum * inverse_rms * program.input(2));
     residual

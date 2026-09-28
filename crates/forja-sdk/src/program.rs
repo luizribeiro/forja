@@ -141,18 +141,6 @@ impl Program {
         }
     }
 
-    #[doc(hidden)]
-    #[must_use]
-    pub fn map() -> Self {
-        Self::new(ProgramKind::Map)
-    }
-
-    #[doc(hidden)]
-    #[must_use]
-    pub fn row() -> Self {
-        Self::new(ProgramKind::Row)
-    }
-
     /// Loads a bound input slot.
     #[must_use]
     pub fn input(&self, slot: u32) -> F32<'_> {
@@ -190,9 +178,7 @@ impl Program {
         self.push_u32(Instruction::Extent(axis))
     }
 
-    #[doc(hidden)]
-    #[must_use]
-    pub fn reduce<'a>(&'a self, op: ReduceOp, value: F32<'a>) -> F32<'a> {
+    fn reduce<'a>(&'a self, op: ReduceOp, value: F32<'a>) -> F32<'a> {
         self.check_value(value.state);
         self.push_f32(Instruction::Reduce(op, value.instruction))
     }

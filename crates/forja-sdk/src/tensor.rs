@@ -578,13 +578,13 @@ mod tests {
 
     #[test]
     fn run_program_into_writes_supplied_output_views() {
-        use crate::program::Program;
+        use crate::program::Ctx;
 
         let input = Tensor::from_slice(&[1.0_f32, 2.0], &[1, 2]).unwrap();
         let output = Tensor::<f32>::zeros(&[1, 4]).unwrap();
         let first = output.narrow(1, 0, 2).unwrap();
         let second = output.narrow(1, 2, 2).unwrap();
-        let program = Program::map();
+        let program = Ctx::new();
         let value = program.input(0);
         program.output(0, value + 1.0);
         program.output(1, value * 2.0);
@@ -598,7 +598,7 @@ mod tests {
 
     #[test]
     fn prepared_kernel_reuses_one_handle_across_shapes() {
-        let program = Program::map();
+        let program = crate::program::Ctx::new();
         program.output(0, program.input(0) * 2.0);
         let kernel = Kernel::new(&program, 2, &[DType::F32], &[DType::F32]).unwrap();
 
@@ -612,7 +612,7 @@ mod tests {
 
     #[test]
     fn prepared_kernel_reports_signature_mismatch_at_dispatch() {
-        let program = Program::map();
+        let program = crate::program::Ctx::new();
         program.output(0, program.input(0));
         let kernel = Kernel::new(&program, 2, &[DType::F32], &[DType::F32]).unwrap();
         let input = Tensor::from_slice(&[1.0_f32; 7], &[7]).unwrap();
@@ -627,7 +627,7 @@ mod tests {
 
     #[test]
     fn prepared_kernel_rejects_binding_count_mismatch() {
-        let program = Program::map();
+        let program = crate::program::Ctx::new();
         program.output(0, program.input(0) + program.input(1));
         let kernel = Kernel::new(&program, 1, &[DType::F32, DType::F32], &[DType::F32]).unwrap();
         let input = Tensor::from_slice(&[1.0_f32; 7], &[7]).unwrap();
@@ -642,7 +642,7 @@ mod tests {
 
     #[test]
     fn prepared_kernel_rejects_binding_dtype_mismatch() {
-        let program = Program::map();
+        let program = crate::program::Ctx::new();
         program.output(0, program.input(0));
         let kernel = Kernel::new(&program, 1, &[DType::F32], &[DType::F32]).unwrap();
         let input = Tensor::from_slice(&[1_u32; 7], &[7]).unwrap();
@@ -657,7 +657,7 @@ mod tests {
 
     #[test]
     fn pending_dispatch_retains_a_dropped_kernel() {
-        let program = Program::map();
+        let program = crate::program::Ctx::new();
         program.output(0, program.input(0) + 1.0);
         let kernel = Kernel::new(&program, 1, &[DType::F32], &[DType::F32]).unwrap();
         let input = Tensor::from_slice(&[1.0_f32, 2.0], &[2]).unwrap();
@@ -760,18 +760,18 @@ mod tests {
 
     #[test]
     fn builder_softmax_matches_the_trusted_operation() {
-        use crate::program::{Program, ReduceOp};
+        use crate::program::RowCtx;
 
         let values = (0..(7 * 33))
             .map(|index| f32::from(u16::try_from(index).unwrap()) * 0.03125 - 2.0)
             .collect::<Vec<_>>();
         let input = Tensor::from_slice(&values, &[7, 33]).unwrap();
         let expected = input.softmax_last_dim().unwrap();
-        let program = Program::row();
+        let program = RowCtx::new();
         let value = program.input(0);
-        let maximum = program.reduce(ReduceOp::Max, value);
+        let maximum = program.row_max(value);
         let exponent = (value - maximum).exp();
-        program.output(0, exponent / program.reduce(ReduceOp::Sum, exponent));
+        program.output(0, exponent / program.row_sum(exponent));
         let actual = input.run_program(&program, &[]).unwrap().remove(0);
 
         assert_f32_values_agree(&expected.to_vec().unwrap(), &actual.to_vec().unwrap()).unwrap();
@@ -779,7 +779,7 @@ mod tests {
 
     #[test]
     fn builder_rms_norm_matches_the_trusted_operation() {
-        use crate::program::{Program, ReduceOp};
+        use crate::program::RowCtx;
 
         let values = (0..(7 * 1024))
             .map(|index| f32::from(u16::try_from(index % 257).unwrap()) * 0.007_812_5 - 1.0)
@@ -791,9 +791,9 @@ mod tests {
         let weight = Tensor::from_slice(&weights, &[1024]).unwrap();
         let expected = input.rms_norm(&weight, 1.0e-6).unwrap();
         let broadcast_weight = weight.broadcast_as(&[7, 1024]).unwrap();
-        let program = Program::row();
+        let program = RowCtx::new();
         let value = program.input(0);
-        let square_sum = program.reduce(ReduceOp::Sum, value * value);
+        let square_sum = program.row_sum(value * value);
         let inverse_rms = (square_sum / program.extent(-1).cast_f32() + 1.0e-6).rsqrt();
         program.output(0, value * inverse_rms * program.input(1));
         let actual = input

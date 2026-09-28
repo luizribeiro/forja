@@ -30,7 +30,7 @@ use forja_sdk::{
         Embedding, EmbeddingConfig, Linear, LinearConfig, RmsNorm, RmsNormConfig, WeightElement,
         ops::sdpa,
     },
-    program::{F32, Kernel, Program, ReduceOp},
+    program::{Ctx, F32, Kernel, Program, RowCtx},
 };
 
 /// Vocabulary size reported by Qwen3-0.6B.
@@ -352,10 +352,10 @@ fn silu_mul<T: Activation>(gate: &Tensor<T>, up: &Tensor<T>, kernel: &Kernel) ->
 }
 
 fn silu_mul_program() -> Program {
-    let program = Program::map();
+    let program = Ctx::new();
     let gate_value = program.input(0);
     program.output(0, gate_value * gate_value.sigmoid() * program.input(1));
-    program
+    program.finish()
 }
 
 fn qk_norm_rope<T: Activation>(
@@ -390,10 +390,10 @@ fn qk_norm_rope_program() -> Result<Program> {
     let head_dimension = u16::try_from(HEAD_DIM)
         .map(f32::from)
         .map_err(|_| forja_sdk::Error::loading("head dimension exceeds the program range"))?;
-    let program = Program::row();
+    let program = RowCtx::new();
     let lo_value = program.input(0);
     let hi_value = program.input(1);
-    let square_sum = program.reduce(ReduceOp::Sum, lo_value * lo_value + hi_value * hi_value);
+    let square_sum = program.row_sum(lo_value * lo_value + hi_value * hi_value);
     let inverse_rms = (square_sum / head_dimension + RMS_EPSILON).rsqrt();
     let normalized_lo = lo_value * inverse_rms * program.input(2);
     let normalized_hi = hi_value * inverse_rms * program.input(3);
@@ -403,7 +403,7 @@ fn qk_norm_rope_program() -> Result<Program> {
     let sine = angle.sin();
     program.output(0, normalized_lo * cosine - normalized_hi * sine);
     program.output(1, normalized_hi * cosine + normalized_lo * sine);
-    Ok(program)
+    Ok(program.finish())
 }
 
 fn residual_norm<T: Activation>(
@@ -421,11 +421,11 @@ fn residual_norm<T: Activation>(
 }
 
 fn residual_norm_program() -> Program {
-    let program = Program::row();
+    let program = RowCtx::new();
     let value = program.input(0) + program.input(1);
     program.output(0, value);
     program.output(1, rms_normalize(&program, value, program.input(2)));
-    program
+    program.finish()
 }
 
 fn final_norm<T: Activation>(
@@ -442,10 +442,10 @@ fn final_norm<T: Activation>(
 }
 
 fn final_norm_program() -> Program {
-    let program = Program::row();
+    let program = RowCtx::new();
     let value = program.input(0);
     program.output(0, rms_normalize(&program, value, program.input(1)));
-    program
+    program.finish()
 }
 
 fn prepare_kernel<T: Activation>(
@@ -462,8 +462,8 @@ fn prepare_kernel<T: Activation>(
     )
 }
 
-fn rms_normalize<'a>(program: &'a Program, value: F32<'a>, weight: F32<'a>) -> F32<'a> {
-    let square_sum = program.reduce(ReduceOp::Sum, value * value);
+fn rms_normalize<'a>(program: &'a RowCtx, value: F32<'a>, weight: F32<'a>) -> F32<'a> {
+    let square_sum = program.row_sum(value * value);
     let inverse_rms = (square_sum / program.extent(-1).cast_f32() + RMS_EPSILON).rsqrt();
     value * inverse_rms * weight
 }
