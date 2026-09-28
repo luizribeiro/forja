@@ -450,19 +450,7 @@ fn validate_signature(
 }
 
 fn hash_program(program: &Program) -> ProgramHash {
-    #[cfg(test)]
-    HASH_COMPUTATIONS.with(|count| count.set(count.get() + 1));
     ProgramHash(Sha256::digest(canonical_bytes(program)).into())
-}
-
-#[cfg(test)]
-thread_local! {
-    static HASH_COMPUTATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-#[cfg(test)]
-pub(crate) fn take_hash_computations() -> usize {
-    HASH_COMPUTATIONS.with(|count| count.replace(0))
 }
 
 /// A stable content digest for a validated program.

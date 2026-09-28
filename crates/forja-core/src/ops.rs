@@ -6,8 +6,7 @@ use std::{
 };
 
 use crate::program::{
-    BindError, BoundProgram, KernelSignature, PreparedProgram, ProgramHash, ValidatedProgram,
-    bind_program,
+    BindError, BoundProgram, KernelSignature, PreparedProgram, ProgramHash, bind_program,
 };
 use crate::{DType, Layout, byte_ranges_overlap, is_injective};
 
@@ -175,7 +174,7 @@ pub enum Operand {
 /// A reason an operation could not be recorded.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum OpError {
-    /// Scalar programs must be recorded with [`CommandList::dispatch_program`].
+    /// Scalar programs must be recorded with [`CommandList::dispatch_kernel`].
     ProgramRequiresBinding,
     /// Tensor views do not satisfy a scalar program's signature.
     ProgramBinding(BindError),
@@ -242,7 +241,7 @@ pub struct Dispatch {
 #[derive(Clone, Debug)]
 struct ProgramDispatch {
     bound: BoundProgram,
-    prepared: Option<Arc<PreparedProgram>>,
+    prepared: Arc<PreparedProgram>,
 }
 
 impl Dispatch {
@@ -284,7 +283,7 @@ impl Dispatch {
     /// Returns retained preparation state for a prepared-program dispatch.
     #[must_use]
     pub fn prepared_program(&self) -> Option<&Arc<PreparedProgram>> {
-        self.program.as_ref()?.prepared.as_ref()
+        self.program.as_ref().map(|program| &program.prepared)
     }
 }
 
@@ -350,43 +349,6 @@ impl CommandList {
         Ok(())
     }
 
-    /// Binds, validates, and records a scalar-program dispatch.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`OpError::ProgramBinding`] when the tensor views do not satisfy
-    /// the validated program's signature.
-    pub fn dispatch_program(
-        &mut self,
-        program: &ValidatedProgram,
-        inputs: &[&Tensor],
-        outputs: &[&Tensor],
-    ) -> Result<(), OpError> {
-        let started = Instant::now();
-        let output = outputs
-            .first()
-            .copied()
-            .ok_or(OpError::ProgramBinding(BindError::NoOutputs))?;
-        check_common(inputs, output)?;
-        let bound = bind_program(program, inputs, outputs).map_err(OpError::ProgramBinding)?;
-        let output = bound
-            .outputs()
-            .first()
-            .cloned()
-            .ok_or(OpError::ProgramBinding(BindError::NoOutputs))?;
-        self.dispatches.push(Dispatch {
-            op: Op::Program(bound.content_hash()),
-            inputs: bound.inputs().to_vec(),
-            output,
-            program: Some(ProgramDispatch {
-                bound,
-                prepared: None,
-            }),
-        });
-        self.record_program(started);
-        Ok(())
-    }
-
     /// Binds, validates, and records a prepared scalar-program dispatch.
     ///
     /// # Errors
@@ -419,7 +381,7 @@ impl CommandList {
             output,
             program: Some(ProgramDispatch {
                 bound,
-                prepared: Some(Arc::clone(program)),
+                prepared: Arc::clone(program),
             }),
         });
         self.record_program(started);
@@ -781,7 +743,6 @@ fn check_float(tensor: &Tensor, operand: Operand) -> Result<(), OpError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::program::{Inst, Program, ProgramKind, take_hash_computations};
 
     fn tensor(buffer: u64, dtype: DType, shape: &[u32], strides: &[u64]) -> Tensor {
         let bytes = u64::from(shape.iter().product::<u32>()) * dtype.byte_size();
@@ -821,81 +782,6 @@ mod tests {
             .unwrap();
 
         assert_eq!(required_barriers(&commands), [false, false]);
-    }
-
-    #[test]
-    fn program_dispatch_uses_the_shared_binding_checker() {
-        let program = Program {
-            kind: ProgramKind::Map,
-            insts: vec![Inst::Input(0)],
-            outputs: vec![(0, 0)],
-        }
-        .validate()
-        .unwrap();
-        let input = tensor(1, DType::F32, &[2], &[1]);
-        let output = tensor(2, DType::F16, &[2], &[1]);
-        let mut commands = CommandList::new();
-        commands
-            .dispatch_program(&program, &[&input], &[&output])
-            .unwrap();
-        assert!(commands.dispatches[0].bound_program().is_some());
-
-        let integer = tensor(3, DType::U32, &[2], &[1]);
-        assert!(matches!(
-            CommandList::new().dispatch_program(&program, &[&integer], &[&output]),
-            Err(OpError::ProgramBinding(BindError::InputTypeMismatch {
-                slot: 0
-            }))
-        ));
-    }
-
-    #[test]
-    fn program_dispatch_does_not_recompute_the_content_hash() {
-        let program = Program {
-            kind: ProgramKind::Map,
-            insts: vec![Inst::Input(0)],
-            outputs: vec![(0, 0)],
-        }
-        .validate()
-        .unwrap();
-        let input = tensor(1, DType::F32, &[7, 1024], &[1024, 1]);
-        let output = tensor(2, DType::F32, &[7, 1024], &[1024, 1]);
-        take_hash_computations();
-
-        let mut commands = CommandList::new();
-        commands
-            .dispatch_program(&program, &[&input], &[&output])
-            .unwrap();
-        commands
-            .dispatch_program(&program, &[&input], &[&output])
-            .unwrap();
-
-        assert_eq!(take_hash_computations(), 0);
-    }
-
-    #[test]
-    fn program_dispatch_rejects_empty_iteration_spaces() {
-        for (kind, shape, strides) in [
-            (ProgramKind::Map, vec![0], vec![1]),
-            (ProgramKind::Row, vec![0, 7], vec![7, 1]),
-        ] {
-            let program = Program {
-                kind,
-                insts: vec![Inst::Input(0)],
-                outputs: vec![(0, 0)],
-            }
-            .validate()
-            .unwrap();
-            let input = tensor(10, DType::F32, &shape, &strides);
-            let output = tensor(11, DType::F32, &shape, &strides);
-
-            assert_eq!(
-                CommandList::new().dispatch_program(&program, &[&input], &[&output]),
-                Err(OpError::EmptyOperand {
-                    operand: Operand::Input(0)
-                })
-            );
-        }
     }
 
     #[test]

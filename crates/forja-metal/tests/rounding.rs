@@ -93,13 +93,13 @@ fn run_program<B: Backend>(
         .iter()
         .map(|_| backend.alloc(dtype, &shape).unwrap())
         .collect::<Vec<_>>();
+    let input_refs = owned_inputs.iter().collect::<Vec<_>>();
+    let output_refs = outputs.iter().collect::<Vec<_>>();
+    let prepared =
+        forja_testing::prepare_program(backend, program, &input_refs, &output_refs).unwrap();
     let mut commands = CommandList::new();
     commands
-        .dispatch_program(
-            program,
-            &owned_inputs.iter().collect::<Vec<_>>(),
-            &outputs.iter().collect::<Vec<_>>(),
-        )
+        .dispatch_kernel(&prepared, &input_refs, &output_refs)
         .unwrap();
     backend.submit(commands).unwrap().wait().unwrap();
     outputs

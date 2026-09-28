@@ -131,9 +131,11 @@ fn metal_map_preserves_nan_dependent_control_flow() {
     let input = backend.alloc(DType::F32, &[1]).unwrap();
     backend.write(&input, &f32::NAN.to_le_bytes()).unwrap();
     let output = backend.alloc(DType::F32, &[1]).unwrap();
+    let prepared =
+        forja_testing::prepare_program(&backend, &program, &[&input], &[&output]).unwrap();
     let mut commands = CommandList::new();
     commands
-        .dispatch_program(&program, &[&input], &[&output])
+        .dispatch_kernel(&prepared, &[&input], &[&output])
         .unwrap();
     backend.submit(commands).unwrap().wait().unwrap();
     let actual = f32::from_le_bytes(backend.read(&output).unwrap().try_into().unwrap());
@@ -157,14 +159,16 @@ fn metal_transcendentals_remain_defined_for_finite_inputs() {
     let metal = MetalBackend::new().unwrap();
     let expected = cpu.alloc(DType::BF16, &[1]).unwrap();
     let actual = metal.alloc(DType::BF16, &[1]).unwrap();
+    let cpu_program = forja_testing::prepare_program(&cpu, &program, &[], &[&expected]).unwrap();
     let mut cpu_commands = CommandList::new();
     cpu_commands
-        .dispatch_program(&program, &[], &[&expected])
+        .dispatch_kernel(&cpu_program, &[], &[&expected])
         .unwrap();
     cpu.submit(cpu_commands).unwrap().wait().unwrap();
+    let metal_program = forja_testing::prepare_program(&metal, &program, &[], &[&actual]).unwrap();
     let mut metal_commands = CommandList::new();
     metal_commands
-        .dispatch_program(&program, &[], &[&actual])
+        .dispatch_kernel(&metal_program, &[], &[&actual])
         .unwrap();
     metal.submit(metal_commands).unwrap().wait().unwrap();
     assert_outputs_agree(
@@ -255,13 +259,13 @@ fn run_corner_program<B: Backend>(
     let outputs = (0..4)
         .map(|_| backend.alloc(DType::F32, &shape).unwrap())
         .collect::<Vec<_>>();
+    let input_refs = inputs.iter().collect::<Vec<_>>();
+    let output_refs = outputs.iter().collect::<Vec<_>>();
+    let prepared =
+        forja_testing::prepare_program(backend, program, &input_refs, &output_refs).unwrap();
     let mut commands = CommandList::new();
     commands
-        .dispatch_program(
-            program,
-            &inputs.iter().collect::<Vec<_>>(),
-            &outputs.iter().collect::<Vec<_>>(),
-        )
+        .dispatch_kernel(&prepared, &input_refs, &output_refs)
         .unwrap();
     backend.submit(commands).unwrap().wait().unwrap();
     outputs
@@ -307,9 +311,12 @@ fn run_program<B: Backend>(
     let outputs = (0..4)
         .map(|_| backend.alloc(dtype, &[4097]).unwrap())
         .collect::<Vec<_>>();
+    let output_refs = outputs.iter().collect::<Vec<_>>();
+    let prepared =
+        forja_testing::prepare_program(backend, program, &[&input], &output_refs).unwrap();
     let mut commands = CommandList::new();
     commands
-        .dispatch_program(program, &[&input], &outputs.iter().collect::<Vec<_>>())
+        .dispatch_kernel(&prepared, &[&input], &output_refs)
         .unwrap();
     backend.submit(commands).unwrap().wait().unwrap();
     outputs
@@ -330,9 +337,12 @@ fn run_small_program<B: Backend>(
     let outputs = (0..4)
         .map(|_| backend.alloc(DType::F32, &shape).unwrap())
         .collect::<Vec<_>>();
+    let output_refs = outputs.iter().collect::<Vec<_>>();
+    let prepared =
+        forja_testing::prepare_program(backend, program, &[&input], &output_refs).unwrap();
     let mut commands = CommandList::new();
     commands
-        .dispatch_program(program, &[&input], &outputs.iter().collect::<Vec<_>>())
+        .dispatch_kernel(&prepared, &[&input], &output_refs)
         .unwrap();
     backend.submit(commands).unwrap().wait().unwrap();
     outputs
@@ -402,13 +412,16 @@ fn binary_timing(
     let trusted_output = backend.alloc(DType::F32, shape).unwrap();
     let program_output = backend.alloc(DType::F32, shape).unwrap();
     let program = source.validate().unwrap();
+    let _prepared =
+        forja_testing::prepare_program(backend, &program, &[&left, &right], &[&program_output])
+            .unwrap();
     run(
         backend,
         trusted_commands(op, &[&left, &right], &trusted_output),
     );
     run(
         backend,
-        program_commands(&program, &[&left, &right], &[&program_output]),
+        program_commands(backend, &program, &[&left, &right], &[&program_output]),
     );
     assert_outputs_agree(
         DType::F32,
@@ -422,7 +435,7 @@ fn binary_timing(
             trusted_commands(op, &[&left, &right], &trusted_output)
         }),
         program: median_gpu_time(backend, || {
-            program_commands(&program, &[&left, &right], &[&program_output])
+            program_commands(backend, &program, &[&left, &right], &[&program_output])
         }),
     }
 }
@@ -450,6 +463,13 @@ fn rope_timing(backend: &MetalBackend) -> Timing {
     let program_first = backend.alloc(DType::F32, &[33, 16, 1, 64]).unwrap();
     let program_second = backend.alloc(DType::F32, &[33, 16, 1, 64]).unwrap();
     let program = half_split_rope().validate().unwrap();
+    let _prepared = forja_testing::prepare_program(
+        backend,
+        &program,
+        &[&first, &second],
+        &[&program_first, &program_second],
+    )
+    .unwrap();
     run(
         backend,
         trusted_commands(
@@ -461,6 +481,7 @@ fn rope_timing(backend: &MetalBackend) -> Timing {
     run(
         backend,
         program_commands(
+            backend,
             &program,
             &[&first, &second],
             &[&program_first, &program_second],
@@ -488,6 +509,7 @@ fn rope_timing(backend: &MetalBackend) -> Timing {
         }),
         program: median_gpu_time(backend, || {
             program_commands(
+                backend,
                 &program,
                 &[&first, &second],
                 &[&program_first, &program_second],
@@ -527,12 +549,16 @@ fn trusted_commands(op: Op, inputs: &[&Tensor], output: &Tensor) -> CommandList 
 }
 
 fn program_commands(
+    backend: &MetalBackend,
     program: &ValidatedProgram,
     inputs: &[&Tensor],
     outputs: &[&Tensor],
 ) -> CommandList {
+    let prepared = forja_testing::prepare_program(backend, program, inputs, outputs).unwrap();
     let mut commands = CommandList::new();
-    commands.dispatch_program(program, inputs, outputs).unwrap();
+    commands
+        .dispatch_kernel(&prepared, inputs, outputs)
+        .unwrap();
     commands
 }
 

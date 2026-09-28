@@ -326,6 +326,13 @@ fn fused_residual_norm_matches_and_beats_two_dispatches() {
     let program_residual = backend.alloc(DType::F32, &shape).unwrap();
     let program_output = backend.alloc(DType::F32, &shape).unwrap();
     let program = residual_rms_norm(1.0e-6).validate().unwrap();
+    let _prepared = forja_testing::prepare_program(
+        &backend,
+        &program,
+        &[&residual, &update, &broadcast_weight],
+        &[&program_residual, &program_output],
+    )
+    .unwrap();
     run(
         &backend,
         residual_norm_commands(&residual, &update, &weight, &intermediate, &trusted_output),
@@ -333,6 +340,7 @@ fn fused_residual_norm_matches_and_beats_two_dispatches() {
     run(
         &backend,
         program_commands(
+            &backend,
             &program,
             &[&residual, &update, &broadcast_weight],
             &[&program_residual, &program_output],
@@ -349,6 +357,7 @@ fn fused_residual_norm_matches_and_beats_two_dispatches() {
     });
     let fused = median_gpu_time(&backend, || {
         program_commands(
+            &backend,
             &program,
             &[&residual, &update, &broadcast_weight],
             &[&program_residual, &program_output],
@@ -387,9 +396,23 @@ fn fused_qk_norm_rope_matches_and_beats_two_dispatches() {
     let actual_first = qk_half(&backend, &actual, 0);
     let actual_second = qk_half(&backend, &actual, 64);
     let program = qk_norm_rope(1.0e-6, 1_000_000.0).validate().unwrap();
+    let _prepared = forja_testing::prepare_program(
+        &backend,
+        &program,
+        &[
+            &first,
+            &second,
+            &first_weight,
+            &second_weight,
+            &program_positions,
+        ],
+        &[&actual_first, &actual_second],
+    )
+    .unwrap();
     let trusted = || qk_norm_rope_commands(&values, &weight, &positions, &normalized, &expected);
     let fused = || {
         program_commands(
+            &backend,
             &program,
             &[
                 &first,
@@ -437,13 +460,16 @@ fn rms_timing(backend: &MetalBackend) -> Timing {
     let expected = backend.alloc(DType::F32, &shape).unwrap();
     let actual = backend.alloc(DType::F32, &shape).unwrap();
     let program = rms_norm(1.0e-6).validate().unwrap();
+    let _prepared =
+        forja_testing::prepare_program(backend, &program, &[&input, &broadcast_weight], &[&actual])
+            .unwrap();
     run(
         backend,
         trusted_commands(Op::RmsNorm { eps: 1.0e-6 }, &[&input, &weight], &expected),
     );
     run(
         backend,
-        program_commands(&program, &[&input, &broadcast_weight], &[&actual]),
+        program_commands(backend, &program, &[&input, &broadcast_weight], &[&actual]),
     );
     assert_outputs_agree(
         DType::F32,
@@ -457,7 +483,7 @@ fn rms_timing(backend: &MetalBackend) -> Timing {
             trusted_commands(Op::RmsNorm { eps: 1.0e-6 }, &[&input, &weight], &expected)
         }),
         program: median_gpu_time(backend, || {
-            program_commands(&program, &[&input, &broadcast_weight], &[&actual])
+            program_commands(backend, &program, &[&input, &broadcast_weight], &[&actual])
         }),
     }
 }
@@ -468,8 +494,13 @@ fn softmax_timing(backend: &MetalBackend) -> Timing {
     let expected = backend.alloc(DType::F32, &shape).unwrap();
     let actual = backend.alloc(DType::F32, &shape).unwrap();
     let program = softmax().validate().unwrap();
+    let _prepared =
+        forja_testing::prepare_program(backend, &program, &[&input], &[&actual]).unwrap();
     run(backend, trusted_commands(Op::Softmax, &[&input], &expected));
-    run(backend, program_commands(&program, &[&input], &[&actual]));
+    run(
+        backend,
+        program_commands(backend, &program, &[&input], &[&actual]),
+    );
     assert_outputs_agree(
         DType::F32,
         &backend.read(&expected).unwrap(),
@@ -482,7 +513,7 @@ fn softmax_timing(backend: &MetalBackend) -> Timing {
             trusted_commands(Op::Softmax, &[&input], &expected)
         }),
         program: median_gpu_time(backend, || {
-            program_commands(&program, &[&input], &[&actual])
+            program_commands(backend, &program, &[&input], &[&actual])
         }),
     }
 }
@@ -504,7 +535,12 @@ fn run_with_values<B: Backend>(
         .collect::<Vec<_>>();
     run(
         backend,
-        program_commands(program, &[&input], &outputs.iter().collect::<Vec<_>>()),
+        program_commands(
+            backend,
+            program,
+            &[&input],
+            &outputs.iter().collect::<Vec<_>>(),
+        ),
     );
     outputs
         .iter()
@@ -528,13 +564,17 @@ fn trusted_commands(op: Op, inputs: &[&Tensor], output: &Tensor) -> CommandList 
     commands
 }
 
-fn program_commands(
+fn program_commands<B: Backend>(
+    backend: &B,
     program: &ValidatedProgram,
     inputs: &[&Tensor],
     outputs: &[&Tensor],
 ) -> CommandList {
+    let prepared = forja_testing::prepare_program(backend, program, inputs, outputs).unwrap();
     let mut commands = CommandList::new();
-    commands.dispatch_program(program, inputs, outputs).unwrap();
+    commands
+        .dispatch_kernel(&prepared, inputs, outputs)
+        .unwrap();
     commands
 }
 

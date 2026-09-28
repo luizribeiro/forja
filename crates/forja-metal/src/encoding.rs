@@ -3,7 +3,6 @@ use std::{
     collections::{HashMap, HashSet},
     ffi::c_void,
     fmt::Write as _,
-    hash::Hash,
     ptr::NonNull,
     sync::{Arc, Condvar, Mutex, OnceLock, Weak},
     time::{Duration, Instant},
@@ -16,9 +15,7 @@ use block2::RcBlock;
 use forja_core::{
     BackendError, BufferId, CommandList, DType, Dispatch, DispatchProfile, Layout, Op,
     ProfileCount, Slice, Submission, SubmissionProfile, Tensor,
-    program::{
-        BoundProgram, KernelSignature, PreparedProgram, ProgramHash, ProgramKind, ValidatedProgram,
-    },
+    program::{KernelSignature, PreparedProgram, ProgramHash, ProgramKind, ValidatedProgram},
     required_barriers,
 };
 use objc2::{rc::Retained, runtime::ProtocolObject};
@@ -356,57 +353,8 @@ impl ProgramPipelineKey {
     }
 }
 
-enum ProgramPipelineKeys {
-    Rereading(ProgramPipelineKey),
-    Resident {
-        width: u32,
-        resident: ProgramPipelineKey,
-        rereading: ProgramPipelineKey,
-    },
-}
-
-impl ProgramPipelineKeys {
-    fn new(program: &BoundProgram) -> Self {
-        let signature = bound_signature(program);
-        let rereading = ProgramPipelineKey::new(program.program(), &signature, false);
-        if let Some(width) = resident_program_width(program) {
-            Self::Resident {
-                width,
-                resident: ProgramPipelineKey::new(program.program(), &signature, true),
-                rereading,
-            }
-        } else {
-            Self::Rereading(rereading)
-        }
-    }
-
-    const fn rereading(&self) -> &ProgramPipelineKey {
-        match self {
-            Self::Rereading(key) | Self::Resident { rereading: key, .. } => key,
-        }
-    }
-}
-
-fn bound_signature(program: &BoundProgram) -> KernelSignature {
-    KernelSignature::new(
-        u8::try_from(program.outputs()[0].layout().shape().len()).unwrap_or(u8::MAX),
-        program
-            .inputs()
-            .iter()
-            .map(|tensor| tensor.layout().dtype())
-            .collect(),
-        program
-            .outputs()
-            .iter()
-            .map(|tensor| tensor.layout().dtype())
-            .collect(),
-        0,
-    )
-}
-
 struct DispatchEncoding<'a> {
     dispatches: &'a [Dispatch],
-    program_keys: &'a [Option<ProgramPipelineKeys>],
     barriers: &'a [bool],
 }
 
@@ -501,65 +449,6 @@ impl MetalProgram {
             });
         }
         Ok(self.rereading(false))
-    }
-}
-
-fn resident_program_width(program: &BoundProgram) -> Option<u32> {
-    (program.program().program().kind == ProgramKind::Row)
-        .then(|| program.outputs()[0].layout().shape().last().copied())
-        .flatten()
-        .filter(|&width| width <= map_codegen::REGISTER_RESIDENT_WIDTH)
-}
-
-struct LruEntry<V> {
-    value: V,
-    last_used: u64,
-}
-
-struct LruCache<K, V> {
-    entries: HashMap<K, LruEntry<V>>,
-    capacity: usize,
-    clock: u64,
-}
-
-impl<K: Clone + Eq + Hash, V> LruCache<K, V> {
-    fn new(capacity: usize) -> Self {
-        Self {
-            entries: HashMap::new(),
-            capacity,
-            clock: 0,
-        }
-    }
-
-    fn get(&mut self, key: &K) -> Option<&V> {
-        self.clock = self.clock.wrapping_add(1);
-        let entry = self.entries.get_mut(key)?;
-        entry.last_used = self.clock;
-        Some(&entry.value)
-    }
-
-    fn contains(&self, key: &K) -> bool {
-        self.entries.contains_key(key)
-    }
-
-    fn insert(&mut self, key: K, value: V) {
-        self.clock = self.clock.wrapping_add(1);
-        if self.entries.len() == self.capacity
-            && let Some(oldest) = self
-                .entries
-                .iter()
-                .min_by_key(|(_, entry)| entry.last_used)
-                .map(|(key, _)| key.clone())
-        {
-            self.entries.remove(&oldest);
-        }
-        self.entries.insert(
-            key,
-            LruEntry {
-                value,
-                last_used: self.clock,
-            },
-        );
     }
 }
 
@@ -1434,16 +1323,6 @@ impl MetalBackend {
         for tensor in &tensors {
             self.validate(tensor)?;
         }
-        let program_keys = dispatches
-            .iter()
-            .map(|dispatch| {
-                dispatch
-                    .bound_program()
-                    .filter(|_| dispatch.prepared_program().is_none())
-                    .map(ProgramPipelineKeys::new)
-            })
-            .collect::<Vec<_>>();
-        self.charge_program_compile_budget(&program_keys)?;
         let mut profile = PROFILE.then(|| SubmissionProfile {
             program_recording,
             validation: validation_started.map_or(Duration::ZERO, |started| started.elapsed()),
@@ -1478,7 +1357,6 @@ impl MetalBackend {
             objects.argument_table()?,
             &DispatchEncoding {
                 dispatches: &dispatches,
-                program_keys: &program_keys,
                 barriers: &barriers,
             },
             PROFILE.then_some(&timestamps),
@@ -1526,32 +1404,6 @@ impl MetalBackend {
         Ok(submission)
     }
 
-    fn charge_program_compile_budget(
-        &self,
-        program_keys: &[Option<ProgramPipelineKeys>],
-    ) -> Result<(), BackendError> {
-        let mut pipelines = self
-            .pipelines
-            .lock()
-            .map_err(|_| BackendError::ExecutionFailed)?;
-        let mut missing = HashSet::new();
-        for keys in program_keys.iter().flatten() {
-            for key in pipelines.program_keys_to_compile(keys)? {
-                missing.insert(key);
-                if missing.len() > MAX_PROGRAM_COMPILES_PER_SUBMISSION {
-                    return Err(BackendError::QuotaExceeded);
-                }
-            }
-        }
-        drop(pipelines);
-        self.program_compile_tokens
-            .lock()
-            .map_err(|_| BackendError::ExecutionFailed)?
-            .consume(missing.len())
-            .then_some(())
-            .ok_or(BackendError::QuotaExceeded)
-    }
-
     #[allow(clippy::too_many_lines)]
     fn encode_dispatches(
         &self,
@@ -1570,13 +1422,7 @@ impl MetalBackend {
         let mut bindings = ArgumentBindings::default();
         let mut program_encoding = ProfileCount::default();
         let mut program_compile_fallbacks = 0_u64;
-        for (index, ((dispatch, keys), &barrier)) in plan
-            .dispatches
-            .iter()
-            .zip(plan.program_keys)
-            .zip(plan.barriers)
-            .enumerate()
-        {
+        for (index, (dispatch, &barrier)) in plan.dispatches.iter().zip(plan.barriers).enumerate() {
             if index > 0 {
                 write_dispatch_timestamp(&encoder, timestamps, 1 + index * 2);
             }
@@ -1591,13 +1437,7 @@ impl MetalBackend {
                     arguments,
                     compile_fallbacks: &mut program_compile_fallbacks,
                 };
-                temporaries.extend(self.encode_program(
-                    &encoder,
-                    table,
-                    dispatch,
-                    keys.as_ref(),
-                    &mut state,
-                )?);
+                temporaries.extend(self.encode_program(&encoder, table, dispatch, &mut state)?);
                 if let Some(started) = started {
                     program_encoding.count = program_encoding.count.saturating_add(1);
                     program_encoding.time = program_encoding.time.saturating_add(started.elapsed());
@@ -3058,30 +2898,25 @@ impl MetalBackend {
         encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
         table: &ProtocolObject<dyn MTL4ArgumentTable>,
         dispatch: &Dispatch,
-        keys: Option<&ProgramPipelineKeys>,
         state: &mut ProgramEncodingState<'_>,
     ) -> Result<Vec<BufferBinding>, BackendError> {
         use objc2_metal::MTL4ComputeCommandEncoder;
 
         let program = dispatch.bound_program().ok_or(BackendError::InvalidInput)?;
-        let pipeline = if let Some(prepared) = dispatch.prepared_program() {
-            let handle = prepared
-                .backend_handle::<MetalProgramHandle>()
-                .ok_or(BackendError::InvalidInput)?;
-            let width = dispatch
-                .output()
-                .layout()
-                .shape()
-                .last()
-                .copied()
-                .unwrap_or(1);
-            handle.0.select(self, width)?
-        } else {
-            self.pipelines
-                .lock()
-                .map_err(|_| BackendError::ExecutionFailed)?
-                .get_program(program, keys.ok_or(BackendError::InvalidInput)?)?
-        };
+        let prepared = dispatch
+            .prepared_program()
+            .ok_or(BackendError::InvalidInput)?;
+        let handle = prepared
+            .backend_handle::<MetalProgramHandle>()
+            .ok_or(BackendError::InvalidInput)?;
+        let width = dispatch
+            .output()
+            .layout()
+            .shape()
+            .last()
+            .copied()
+            .unwrap_or(1);
+        let pipeline = handle.0.select(self, width)?;
         if pipeline.compile_fallback {
             *state.compile_fallbacks = state.compile_fallbacks.saturating_add(1);
         }
@@ -3859,11 +3694,7 @@ pub(super) struct PipelineCache {
     fast_library: Retained<ProtocolObject<dyn MTLLibrary>>,
     nan_preserving_library: Retained<ProtocolObject<dyn MTLLibrary>>,
     pipelines: HashMap<PipelineKey, Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
-    programs: LruCache<ProgramPipelineKey, Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
 }
-
-const PROGRAM_PIPELINE_CAPACITY: usize = 64;
-const MAX_PROGRAM_COMPILES_PER_SUBMISSION: usize = 8;
 
 impl PipelineCache {
     pub(super) fn new(
@@ -3884,7 +3715,6 @@ impl PipelineCache {
             fast_library,
             nan_preserving_library,
             pipelines: HashMap::new(),
-            programs: LruCache::new(PROGRAM_PIPELINE_CAPACITY),
         })
     }
 
@@ -3927,81 +3757,6 @@ impl PipelineCache {
             .map_err(|_| BackendError::ExecutionFailed)?;
         self.pipelines.insert(key, pipeline.clone());
         Ok(pipeline)
-    }
-
-    fn get_program(
-        &mut self,
-        program: &BoundProgram,
-        keys: &ProgramPipelineKeys,
-    ) -> Result<ProgramPipeline, BackendError> {
-        if let ProgramPipelineKeys::Resident {
-            width, resident, ..
-        } = keys
-            && let Ok(pipeline) = self.get_program_variant(program, resident)
-            && pipeline.maxTotalThreadsPerThreadgroup()
-                >= usize::try_from(*width).map_err(|_| BackendError::ExecutionFailed)?
-        {
-            return Ok(ProgramPipeline {
-                state: pipeline,
-                resident: true,
-                compile_fallback: false,
-            });
-        }
-        Ok(ProgramPipeline {
-            state: self.get_program_variant(program, keys.rereading())?,
-            resident: false,
-            compile_fallback: false,
-        })
-    }
-
-    fn get_program_variant(
-        &mut self,
-        program: &BoundProgram,
-        key: &ProgramPipelineKey,
-    ) -> Result<Retained<ProtocolObject<dyn MTLComputePipelineState>>, BackendError> {
-        if let Some(pipeline) = self.programs.get(key) {
-            return Ok(pipeline.clone());
-        }
-        let source =
-            map_codegen::generate(program.program(), &bound_signature(program), key.resident);
-        let pipeline = self.compile_program_source(key, &source)?;
-        self.programs.insert(key.clone(), pipeline.clone());
-        Ok(pipeline)
-    }
-
-    fn program_keys_to_compile(
-        &mut self,
-        keys: &ProgramPipelineKeys,
-    ) -> Result<Vec<ProgramPipelineKey>, BackendError> {
-        let ProgramPipelineKeys::Resident {
-            width,
-            resident,
-            rereading,
-        } = keys
-        else {
-            return Ok((!self.programs.contains(keys.rereading()))
-                .then(|| keys.rereading().clone())
-                .into_iter()
-                .collect());
-        };
-
-        if let Some(pipeline) = self.programs.get(resident) {
-            if pipeline.maxTotalThreadsPerThreadgroup()
-                >= usize::try_from(*width).map_err(|_| BackendError::ExecutionFailed)?
-            {
-                return Ok(Vec::new());
-            }
-            return Ok((!self.programs.contains(rereading))
-                .then(|| rereading.clone())
-                .into_iter()
-                .collect());
-        }
-
-        let mut missing = vec![resident.clone()];
-        if !self.programs.contains(rereading) {
-            missing.push(rereading.clone());
-        }
-        Ok(missing)
     }
 
     fn compile_program_source(
@@ -4100,18 +3855,6 @@ mod tests {
     }
 
     #[test]
-    fn program_cache_evicts_the_least_recent_entry() {
-        let mut cache = LruCache::new(2);
-        cache.insert(1, "one");
-        cache.insert(2, "two");
-        assert_eq!(cache.get(&1), Some(&"one"));
-        cache.insert(3, "three");
-        assert!(cache.contains(&1));
-        assert!(!cache.contains(&2));
-        assert!(cache.contains(&3));
-    }
-
-    #[test]
     fn program_cache_key_ignores_shapes_and_strides() {
         let backend = CpuBackend::new();
         let contiguous = identity_program(&backend, DType::F16, DType::F32, &[7, 33], false);
@@ -4137,67 +3880,6 @@ mod tests {
         assert!(resident_key.resident);
         assert!(!rereading_key.resident);
         assert_ne!(resident_key, rereading_key);
-    }
-
-    #[test]
-    fn program_compile_quota_rejects_before_compiling() {
-        let backend = MetalBackend::new().unwrap();
-        let mut commands = CommandList::new();
-        for value in 0..=MAX_PROGRAM_COMPILES_PER_SUBMISSION {
-            let input = backend.alloc(DType::F32, &[1]).unwrap();
-            let output = backend.alloc(DType::F32, &[1]).unwrap();
-            let constant = f32::from(u16::try_from(value).unwrap());
-            let program = Program {
-                kind: ProgramKind::Map,
-                insts: vec![
-                    Inst::Input(0),
-                    Inst::Const(constant),
-                    Inst::Binary(BinOp::Add, 0, 1),
-                ],
-                outputs: vec![(0, 2)],
-            }
-            .validate()
-            .unwrap();
-            commands
-                .dispatch_program(&program, &[&input], &[&output])
-                .unwrap();
-        }
-        assert!(matches!(
-            backend.submit(commands),
-            Err(BackendError::QuotaExceeded)
-        ));
-        assert!(
-            backend
-                .pipelines
-                .lock()
-                .unwrap()
-                .programs
-                .entries
-                .is_empty()
-        );
-    }
-
-    #[test]
-    fn cumulative_program_compile_budget_ignores_cache_hits() {
-        let budget = crate::ProgramCompileBudget::new(2, Duration::from_secs(60)).unwrap();
-        let backend = MetalBackend::with_program_compile_budget(budget).unwrap();
-        submit_constant_program(&backend, 1.0)
-            .unwrap()
-            .wait()
-            .unwrap();
-        submit_constant_program(&backend, 2.0)
-            .unwrap()
-            .wait()
-            .unwrap();
-        submit_constant_program(&backend, 1.0)
-            .unwrap()
-            .wait()
-            .unwrap();
-        assert!(matches!(
-            submit_constant_program(&backend, 3.0),
-            Err(BackendError::QuotaExceeded)
-        ));
-        assert_eq!(backend.pipelines.lock().unwrap().programs.entries.len(), 2);
     }
 
     #[test]
@@ -4350,7 +4032,7 @@ mod tests {
     }
 
     #[test]
-    fn prepared_row_program_matches_cpu_and_by_value_metal() {
+    fn prepared_row_program_matches_cpu() {
         let program = Program {
             kind: ProgramKind::Row,
             insts: vec![
@@ -4364,78 +4046,18 @@ mod tests {
         .unwrap();
         let cpu = CpuBackend::new();
         let metal = MetalBackend::new().unwrap();
-        let expected = run_prepared_row(&cpu, &program, 33);
-        let actual = run_prepared_row(&metal, &program, 33);
-        let by_value = run_row_program(&metal, &program, 33);
+        let expected = run_row_program(&cpu, &program, 33);
+        let actual = run_row_program(&metal, &program, 33);
 
         assert_outputs_agree(DType::F32, &expected, &actual).unwrap();
-        assert_outputs_agree(DType::F32, &by_value, &actual).unwrap();
     }
 
     #[test]
-    #[ignore = "host-cost microbenchmark"]
-    fn measures_prepared_program_host_cost() {
-        const DISPATCHES: usize = 500;
-        let backend = MetalBackend::new().unwrap();
-        let input = backend.alloc(DType::F32, &[7, 1024]).unwrap();
-        let output = backend.alloc(DType::F32, &[7, 1024]).unwrap();
-        let program = Program {
-            kind: ProgramKind::Map,
-            insts: vec![
-                Inst::Input(0),
-                Inst::Unary(forja_core::program::UnOp::Neg, 0),
-            ],
-            outputs: vec![(0, 1)],
-        }
-        .validate()
-        .unwrap();
-        let prepared = prepare_program(
-            &backend,
-            program.clone(),
-            KernelSignature::new(2, vec![DType::F32], vec![DType::F32], 0),
-        )
-        .unwrap();
-        let mut warmup = CommandList::new();
-        warmup
-            .dispatch_program(&program, &[&input], &[&output])
-            .unwrap();
-        backend.submit(warmup).unwrap().wait().unwrap();
-
-        let mut by_value = CommandList::new();
-        let mut prepared_commands = CommandList::new();
-        for _ in 0..DISPATCHES {
-            by_value
-                .dispatch_program(&program, &[&input], &[&output])
-                .unwrap();
-            prepared_commands
-                .dispatch_kernel(&prepared, &[&input], &[&output])
-                .unwrap();
-        }
-        let by_value = backend.submit_profiled(by_value).unwrap();
-        by_value.wait().unwrap();
-        let by_value = by_value.profile().unwrap();
-        let prepared = backend.submit_profiled(prepared_commands).unwrap();
-        prepared.wait().unwrap();
-        let prepared = prepared.profile().unwrap();
-        eprintln!(
-            "program host ns/dispatch: by-value record {}, encode {}; prepared record {}, encode {}",
-            by_value.program_recording.time.as_nanos() / u128::try_from(DISPATCHES).unwrap(),
-            by_value.program_encoding.time.as_nanos() / u128::try_from(DISPATCHES).unwrap(),
-            prepared.program_recording.time.as_nanos() / u128::try_from(DISPATCHES).unwrap(),
-            prepared.program_encoding.time.as_nanos() / u128::try_from(DISPATCHES).unwrap(),
-        );
-    }
-
-    #[test]
-    fn map_pipeline_compiles_once_and_reports_failure() {
+    fn map_pipeline_compile_failure_is_reported() {
         let cpu = CpuBackend::new();
         let program = identity_program(&cpu, DType::F32, DType::F32, &[7], false);
         let backend = MetalBackend::new().unwrap();
-        let mut cache = backend.pipelines.lock().unwrap();
-        let keys = ProgramPipelineKeys::new(&program);
-        cache.get_program(&program, &keys).unwrap();
-        cache.get_program(&program, &keys).unwrap();
-        assert_eq!(cache.programs.entries.len(), 1);
+        let cache = backend.pipelines.lock().unwrap();
         let key = program_pipeline_key(&program, false);
         assert!(matches!(
             cache.compile_program_source(&key, "kernel void broken("),
@@ -4502,9 +4124,15 @@ mod tests {
             .collect::<Vec<_>>();
         backend.write(&input, &bytes).unwrap();
         let output = backend.alloc(DType::F32, &[2, 33]).unwrap();
+        let prepared = prepare_program(
+            backend,
+            program.clone(),
+            KernelSignature::new(2, vec![DType::F32], vec![DType::F32], 0),
+        )
+        .unwrap();
         let mut commands = CommandList::new();
         commands
-            .dispatch_program(program, &[&input], &[&output])
+            .dispatch_kernel(&prepared, &[&input], &[&output])
             .unwrap();
         backend.submit(commands).unwrap().wait().unwrap();
         backend.read(&output).unwrap()
@@ -4519,28 +4147,6 @@ mod tests {
             })
             .collect::<Vec<_>>();
         backend.write(&input, &bytes).unwrap();
-        let output = backend.alloc(DType::F32, &[width]).unwrap();
-        let mut commands = CommandList::new();
-        commands
-            .dispatch_program(program, &[&input], &[&output])
-            .unwrap();
-        backend.submit(commands).unwrap().wait().unwrap();
-        backend.read(&output).unwrap()
-    }
-
-    fn run_prepared_row<B: Backend>(
-        backend: &B,
-        program: &ValidatedProgram,
-        width: u32,
-    ) -> Vec<u8> {
-        let input = backend.alloc(DType::F32, &[width]).unwrap();
-        let values = (0..width)
-            .flat_map(|index| {
-                let value = f32::from(u16::try_from(index % 17).unwrap()) / 64.0 - 0.125;
-                value.to_le_bytes()
-            })
-            .collect::<Vec<_>>();
-        backend.write(&input, &values).unwrap();
         let output = backend.alloc(DType::F32, &[width]).unwrap();
         let prepared = prepare_program(
             backend,
@@ -4609,9 +4215,20 @@ mod tests {
         }
         .validate()
         .unwrap();
+        let prepared = prepare_program(
+            backend,
+            program,
+            KernelSignature::new(
+                1,
+                vec![DType::F32, DType::F32],
+                vec![DType::F32, DType::F32],
+                0,
+            ),
+        )
+        .unwrap();
         let mut commands = CommandList::new();
         commands
-            .dispatch_program(&program, &[&left, &right], &[&sum, &difference])
+            .dispatch_kernel(&prepared, &[&left, &right], &[&sum, &difference])
             .unwrap();
         backend.submit(commands).unwrap().wait().unwrap();
         [
@@ -4660,26 +4277,21 @@ mod tests {
     }
 
     fn program_pipeline_key(program: &BoundProgram, resident: bool) -> ProgramPipelineKey {
-        ProgramPipelineKey::new(program.program(), &bound_signature(program), resident)
-    }
-
-    fn submit_constant_program(
-        backend: &MetalBackend,
-        value: f32,
-    ) -> Result<MetalSubmission, BackendError> {
-        let output = backend.alloc(DType::F32, &[1])?;
-        let program = Program {
-            kind: ProgramKind::Map,
-            insts: vec![Inst::Const(value)],
-            outputs: vec![(0, 0)],
-        }
-        .validate()
-        .map_err(|_| BackendError::InvalidInput)?;
-        let mut commands = CommandList::new();
-        commands
-            .dispatch_program(&program, &[], &[&output])
-            .map_err(|_| BackendError::InvalidInput)?;
-        backend.submit(commands)
+        let signature = KernelSignature::new(
+            u8::try_from(program.outputs()[0].layout().shape().len()).unwrap(),
+            program
+                .inputs()
+                .iter()
+                .map(|tensor| tensor.layout().dtype())
+                .collect(),
+            program
+                .outputs()
+                .iter()
+                .map(|tensor| tensor.layout().dtype())
+                .collect(),
+            0,
+        );
+        ProgramPipelineKey::new(program.program(), &signature, resident)
     }
 
     fn run_varying_submissions(backend: &MetalBackend, count: usize, offset: usize) {

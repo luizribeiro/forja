@@ -768,9 +768,20 @@ mod tests {
         }
         .validate()
         .unwrap();
+        let prepared = prepare_program(
+            &backend,
+            program,
+            KernelSignature::new(
+                1,
+                vec![DType::F32, DType::U32],
+                vec![DType::F16, DType::F32],
+                0,
+            ),
+        )
+        .unwrap();
         let mut commands = CommandList::new();
         commands
-            .dispatch_program(&program, &[&values, &indices], &[&copied, &summed])
+            .dispatch_kernel(&prepared, &[&values, &indices], &[&copied, &summed])
             .unwrap();
         backend.submit(commands).unwrap().wait().unwrap();
 
@@ -786,7 +797,7 @@ mod tests {
     }
 
     #[test]
-    fn prepared_program_matches_by_value_dispatch() {
+    fn prepared_program_can_be_dispatched_repeatedly() {
         let backend = CpuBackend::new();
         let input = backend.alloc(DType::F32, &[7, 1024]).unwrap();
         backend
@@ -813,7 +824,7 @@ mod tests {
         .unwrap();
         let mut commands = CommandList::new();
         commands
-            .dispatch_program(&program, &[&input], &[&expected])
+            .dispatch_kernel(&prepared, &[&input], &[&expected])
             .unwrap();
         commands
             .dispatch_kernel(&prepared, &[&input], &[&actual])
