@@ -409,7 +409,8 @@ fn exact_transcendental(op: UnOp, input: FloatInterval) -> Option<FloatInterval>
         return None;
     }
     let value = match (op, input.lo) {
-        (UnOp::Exp | UnOp::Cos, 0.0) | (UnOp::Log, 1.0) => 1.0_f64,
+        (UnOp::Exp | UnOp::Cos, 0.0) => 1.0_f64,
+        (UnOp::Log, 1.0) => 0.0,
         (UnOp::Sqrt | UnOp::Sin | UnOp::Tanh, 0.0) => input.lo,
         (UnOp::Sigmoid, 0.0) => 0.5,
         _ => return None,
@@ -1270,4 +1271,98 @@ fn decode_coordinates(
         linear /= extent;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use forja_core::program::{Inst, Program};
+    use proptest::prelude::*;
+
+    use super::*;
+
+    #[test]
+    fn rounded_inputs_near_one_use_their_stored_value() {
+        for dtype in [DType::F16, DType::BF16] {
+            for raw in [
+                f32::from_bits(0x3f7f_c4c8),
+                f32::from_bits(0x3f7f_f000),
+                f32::from_bits(0x3f80_1000),
+            ] {
+                let (bytes, stored) = stored_value(dtype, raw);
+                for op in [UnOp::Log, UnOp::Exp, UnOp::Sqrt] {
+                    let interval = evaluate_unary(dtype, bytes.clone(), op);
+                    assert_contains_truth(interval, unary_truth(op, stored));
+                }
+            }
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn single_unary_intervals_contain_stored_truth(
+            raw in 0.001_f32..10.0,
+            bf16_input in any::<bool>(),
+            operation in 0_u8..3,
+        ) {
+            let dtype = if bf16_input { DType::BF16 } else { DType::F16 };
+            let op = [UnOp::Log, UnOp::Exp, UnOp::Sqrt][usize::from(operation)];
+            let (bytes, stored) = stored_value(dtype, raw);
+            let interval = evaluate_unary(dtype, bytes, op);
+            assert_contains_truth(interval, unary_truth(op, stored));
+        }
+    }
+
+    fn evaluate_unary(dtype: DType, bytes: Vec<u8>, op: UnOp) -> FloatInterval {
+        let case = ProgramCase::new(
+            Program {
+                kind: ProgramKind::Map,
+                insts: vec![Inst::Input(0), Inst::Unary(op, 0)],
+                outputs: vec![(0, 1)],
+            },
+            vec![1],
+            vec![TensorSpec::contiguous(dtype, &[1])],
+            vec![TensorSpec::contiguous(DType::F32, &[1])],
+        );
+        evaluate(&case, &[bytes]).unwrap().outputs[0][0]
+    }
+
+    fn stored_value(dtype: DType, raw: f32) -> (Vec<u8>, f64) {
+        match dtype {
+            DType::F16 => {
+                let stored = f16::from_f32(raw);
+                (stored.to_le_bytes().to_vec(), f64::from(stored.to_f32()))
+            }
+            DType::BF16 => {
+                let stored = bf16::from_f32(raw);
+                (stored.to_le_bytes().to_vec(), f64::from(stored.to_f32()))
+            }
+            DType::F32 | DType::I32 | DType::U32 => unreachable!(),
+        }
+    }
+
+    fn unary_truth(op: UnOp, input: f64) -> f64 {
+        match op {
+            UnOp::Log => input.ln(),
+            UnOp::Exp => input.exp(),
+            UnOp::Sqrt => input.sqrt(),
+            UnOp::Neg
+            | UnOp::Abs
+            | UnOp::Rsqrt
+            | UnOp::Sin
+            | UnOp::Cos
+            | UnOp::Tanh
+            | UnOp::Sigmoid
+            | UnOp::Recip
+            | UnOp::Floor => unreachable!(),
+        }
+    }
+
+    fn assert_contains_truth(interval: FloatInterval, truth: f64) {
+        assert!(
+            interval.lo <= truth && truth <= interval.hi,
+            "{truth} escaped [{}, {}]",
+            interval.lo,
+            interval.hi,
+        );
+    }
 }
