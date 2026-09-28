@@ -235,6 +235,18 @@ pub struct IntervalReport {
     pub max_relative_width: f64,
 }
 
+#[derive(Clone, Copy)]
+struct WideOutput {
+    dtype: DType,
+    median: f64,
+    limit: f64,
+}
+
+struct ProgramIntervals {
+    input_bytes: Vec<Vec<u8>>,
+    evaluation: interval::Evaluation,
+}
+
 impl fmt::Display for AgreementError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(formatter, "backend agreement failed: {self:?}")
@@ -401,32 +413,35 @@ where
     R: Backend,
     C: Backend,
 {
-    let mut values = DeterministicValues::new(0xbb67_ae85_84ca_a73b);
-    let mut candidate_inputs = Vec::with_capacity(case.inputs().len());
-    let mut input_bytes = Vec::with_capacity(case.inputs().len());
-    for input in case.inputs() {
-        let bytes = generated_bytes(input, &mut values)?;
-        candidate_inputs.push(allocate_initialized(candidate, input, &bytes)?);
-        input_bytes.push(bytes);
+    let program = case.program().validate()?;
+    let ProgramIntervals {
+        input_bytes,
+        evaluation,
+    } = evaluate_program_intervals(case)?;
+    let (report, wide_output) = summarize_program_intervals(case, &evaluation)?;
+    if let Some(wide) = wide_output {
+        return Err(AgreementError::WideIntervals {
+            dtype: wide.dtype,
+            median: wide.median,
+            limit: wide.limit,
+        }
+        .into());
     }
+
+    let candidate_inputs = case
+        .inputs()
+        .iter()
+        .zip(&input_bytes)
+        .map(|(input, bytes)| allocate_initialized(candidate, input, bytes))
+        .collect::<Result<Vec<_>, _>>()?;
     let candidate_outputs = case
         .outputs()
         .iter()
         .map(|output| allocate(candidate, output))
         .collect::<Result<Vec<_>, _>>()?;
-    let program = case.program().validate()?;
-    let evaluation = interval::evaluate(case, &input_bytes)?;
     run_program(candidate, &program, &candidate_inputs, &candidate_outputs)?;
 
-    let mut report = IntervalReport {
-        ambiguous_predicates: evaluation.ambiguous_predicates,
-        ambiguous_selects: evaluation.ambiguous_selects,
-        reduction_steps: evaluation.reduction_steps,
-        ..IntervalReport::default()
-    };
-    let mut relative_widths = Vec::new();
     for (output_slot, (spec, actual)) in case.outputs().iter().zip(candidate_outputs).enumerate() {
-        let limit = interval_width_limit(spec.dtype())?;
         let actual = decode(&candidate.read(&actual)?, spec.dtype())?;
         let intervals = evaluation
             .outputs
@@ -436,8 +451,6 @@ where
             return Err(AgreementError::OutputMismatch.into());
         }
 
-        let mut output_widths = Vec::with_capacity(intervals.len());
-        let mut output_vacuous = 0_usize;
         for (index, (&actual, interval)) in actual.iter().zip(intervals).enumerate() {
             let interval = interval.converted(spec.dtype())?;
             if !interval.contains(actual) {
@@ -450,6 +463,63 @@ where
                 }
                 .into());
             }
+        }
+    }
+    Ok(report)
+}
+
+/// Assesses a generated program's output intervals without running a backend.
+///
+/// # Errors
+///
+/// Returns a validation, encoding, size, or dtype error.
+pub fn program_interval_report(
+    case: &program::ProgramCase,
+) -> Result<IntervalReport, Box<dyn Error>> {
+    case.program().validate()?;
+    let intervals = evaluate_program_intervals(case)?;
+    let (report, _) = summarize_program_intervals(case, &intervals.evaluation)?;
+    Ok(report)
+}
+
+fn evaluate_program_intervals(
+    case: &program::ProgramCase,
+) -> Result<ProgramIntervals, Box<dyn Error>> {
+    let mut values = DeterministicValues::new(0xbb67_ae85_84ca_a73b);
+    let mut input_bytes = Vec::with_capacity(case.inputs().len());
+    for input in case.inputs() {
+        input_bytes.push(generated_bytes(input, &mut values)?);
+    }
+    let evaluation = interval::evaluate(case, &input_bytes)?;
+    Ok(ProgramIntervals {
+        input_bytes,
+        evaluation,
+    })
+}
+
+fn summarize_program_intervals(
+    case: &program::ProgramCase,
+    evaluation: &interval::Evaluation,
+) -> Result<(IntervalReport, Option<WideOutput>), AgreementError> {
+    let mut report = IntervalReport {
+        ambiguous_predicates: evaluation.ambiguous_predicates,
+        ambiguous_selects: evaluation.ambiguous_selects,
+        reduction_steps: evaluation.reduction_steps,
+        ..IntervalReport::default()
+    };
+    let mut relative_widths = Vec::new();
+    let mut wide_output = None;
+    for (output_slot, spec) in case.outputs().iter().enumerate() {
+        let limit = interval_width_limit(spec.dtype())?;
+        let intervals = evaluation
+            .outputs
+            .get(output_slot)
+            .ok_or(AgreementError::InvalidOutput)?;
+
+        let mut output_widths = Vec::with_capacity(intervals.len());
+        let mut output_vacuous = 0_usize;
+        for &interval in intervals {
+            let interval = interval.converted(spec.dtype())?;
             let width = interval.relative_width();
             output_widths.push(width);
             relative_widths.push(width);
@@ -458,13 +528,12 @@ where
         }
         report.vacuous_elements += output_vacuous;
         let median = percentile(&mut output_widths, 50);
-        if output_vacuous > intervals.len() / 2 {
-            return Err(AgreementError::WideIntervals {
+        if output_vacuous > intervals.len() / 2 && wide_output.is_none() {
+            wide_output = Some(WideOutput {
                 dtype: spec.dtype(),
                 median,
                 limit,
-            }
-            .into());
+            });
         }
     }
 
@@ -475,7 +544,7 @@ where
         .copied()
         .max_by(f64::total_cmp)
         .unwrap_or(0.0);
-    Ok(report)
+    Ok((report, wide_output))
 }
 
 fn interval_width_limit(dtype: DType) -> Result<f64, AgreementError> {

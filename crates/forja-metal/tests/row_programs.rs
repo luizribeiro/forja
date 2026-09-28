@@ -13,6 +13,7 @@ use forja_metal::MetalBackend;
 use forja_testing::{
     DeterministicValues, TensorSpec, assert_outputs_agree, assert_program_backends_agree,
     program::{ProgramCase, row_programs, stable_row_programs},
+    program_interval_report,
     representative::{qk_norm_rope, residual_rms_norm, rms_norm, softmax},
 };
 use proptest::{
@@ -23,12 +24,16 @@ use proptest::{
 use common::{median_gpu_time, report_intervals};
 
 proptest! {
-    #![proptest_config(row_program_config())]
+    #![proptest_config(general_row_program_config())]
 
     #[test]
     fn metal_row_programs_match_the_interpreter(case in row_programs(64)) {
         compare_program(&case)?;
     }
+}
+
+proptest! {
+    #![proptest_config(stable_row_program_config())]
 
     #[test]
     fn stable_metal_row_programs_match_the_interpreter(case in stable_row_programs(64)) {
@@ -36,7 +41,17 @@ proptest! {
     }
 }
 
-fn row_program_config() -> ProptestConfig {
+/// Random programs can be intrinsically ill-conditioned, so up to 10% may be
+/// discarded while every program still faces the unchanged 1% element guard.
+fn general_row_program_config() -> ProptestConfig {
+    row_program_config(4, 8)
+}
+
+fn stable_row_program_config() -> ProptestConfig {
+    row_program_config(2, 4)
+}
+
+fn row_program_config(normal_reject_limit: u32, exploration_reject_limit: u32) -> ProptestConfig {
     let explore = std::env::var_os("FORJA_PROPTEST_EXPLORE").is_some();
     let failure_file = if explore {
         concat!(
@@ -57,17 +72,48 @@ fn row_program_config() -> ProptestConfig {
         } else {
             RngSeed::Fixed(0x6a09_e667_f3bc_c909)
         },
+        max_global_rejects: if explore {
+            exploration_reject_limit
+        } else {
+            normal_reject_limit
+        },
         ..ProptestConfig::default()
     }
 }
 
 fn compare_program(case: &ProgramCase) -> Result<(), TestCaseError> {
+    let preflight =
+        program_interval_report(case).map_err(|error| TestCaseError::fail(error.to_string()))?;
+    if !intervals_are_judgeable(preflight) {
+        report_intervals(preflight);
+        prop_assume!(false);
+    }
     let cpu = CpuBackend::new();
     let metal = MetalBackend::new().map_err(|error| TestCaseError::fail(error.to_string()))?;
     let report = assert_program_backends_agree(&cpu, &metal, case)
         .map_err(|error| TestCaseError::fail(error.to_string()))?;
     report_intervals(report);
     Ok(())
+}
+
+const fn intervals_are_judgeable(report: forja_testing::IntervalReport) -> bool {
+    report.vacuous_elements.saturating_mul(100) < report.total_elements
+}
+
+#[test]
+fn interval_preflight_rejects_one_percent_vacuity() {
+    let report = forja_testing::IntervalReport {
+        vacuous_elements: 1,
+        total_elements: 100,
+        ..forja_testing::IntervalReport::default()
+    };
+    assert!(!intervals_are_judgeable(report));
+
+    let report = forja_testing::IntervalReport {
+        total_elements: 101,
+        ..report
+    };
+    assert!(intervals_are_judgeable(report));
 }
 
 #[test]

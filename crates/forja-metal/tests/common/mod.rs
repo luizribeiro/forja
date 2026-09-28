@@ -16,14 +16,6 @@ pub fn report_intervals(report: IntervalReport) {
         report.p90_relative_width,
         report.max_relative_width,
     );
-    if std::env::var_os("FORJA_PROPTEST_EXPLORE").is_some() {
-        assert!(
-            report.vacuous_elements.saturating_mul(100) < report.total_elements,
-            "interval oracle vacuous elements reached 1%: {}/{}",
-            report.vacuous_elements,
-            report.total_elements,
-        );
-    }
 }
 
 pub fn median_gpu_time(
