@@ -13,7 +13,7 @@ use block2::RcBlock;
 use forja_core::{
     BackendError, BufferId, CommandList, DType, Dispatch, DispatchProfile, Layout, Op,
     ProfileCount, Slice, Submission, SubmissionProfile, Tensor,
-    program::{BoundProgram, ProgramHash},
+    program::{BoundProgram, ProgramHash, ProgramKind},
     required_barriers,
 };
 use objc2::{rc::Retained, runtime::ProtocolObject};
@@ -316,7 +316,6 @@ struct PipelineKey {
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-#[allow(dead_code)]
 struct ProgramPipelineKey {
     hash: ProgramHash,
     input_dtypes: Vec<u8>,
@@ -325,7 +324,6 @@ struct ProgramPipelineKey {
 }
 
 impl ProgramPipelineKey {
-    #[allow(dead_code)]
     fn new(program: &BoundProgram) -> Self {
         Self {
             hash: program.program().content_hash(),
@@ -344,20 +342,17 @@ impl ProgramPipelineKey {
     }
 }
 
-#[allow(dead_code)]
 struct LruEntry<V> {
     value: V,
     last_used: u64,
 }
 
-#[allow(dead_code)]
 struct LruCache<K, V> {
     entries: HashMap<K, LruEntry<V>>,
     capacity: usize,
     clock: u64,
 }
 
-#[allow(dead_code)]
 impl<K: Clone + Eq + Hash, V> LruCache<K, V> {
     fn new(capacity: usize) -> Self {
         Self {
@@ -923,7 +918,7 @@ impl InFlightTracker {
                 .newCommandAllocator()
                 .ok_or(BackendError::ExecutionFailed)?;
             let descriptor = MTL4ArgumentTableDescriptor::new();
-            descriptor.setMaxBufferBindCount(8);
+            descriptor.setMaxBufferBindCount(24);
             let argument_table = device
                 .newArgumentTableWithDescriptor_error(&descriptor)
                 .map_err(|_| BackendError::ExecutionFailed)?;
@@ -1145,30 +1140,15 @@ impl MetalBackend {
         let validation_started = PROFILE.then(Instant::now);
         let barriers = required_barriers(&commands);
         let dispatches = commands.into_dispatches();
-        if dispatches.iter().any(|dispatch| {
-            !matches!(
-                dispatch.op(),
-                Op::Copy
-                    | Op::Add
-                    | Op::SiluMul
-                    | Op::RmsNorm { .. }
-                    | Op::Softmax
-                    | Op::Rope { .. }
-                    | Op::Embed
-                    | Op::Matmul
-                    | Op::Sdpa { .. }
-            )
-        }) {
+        if dispatches
+            .iter()
+            .any(|dispatch| !supported_dispatch(dispatch))
+        {
             return Err(BackendError::UnsupportedOperation);
         }
         let tensors = dispatches
             .iter()
-            .flat_map(|dispatch| {
-                dispatch
-                    .inputs()
-                    .iter()
-                    .chain(std::iter::once(dispatch.output()))
-            })
+            .flat_map(|dispatch| dispatch.inputs().iter().chain(dispatch.outputs()))
             .cloned()
             .collect::<Vec<_>>();
         for tensor in &tensors {
@@ -1272,6 +1252,16 @@ impl MetalBackend {
                 encode_dispatch_barrier(&encoder);
             }
             write_dispatch_timestamp(&encoder, timestamps, 2 + index * 2);
+            if matches!(dispatch.op(), Op::Program(_)) {
+                temporaries.extend(self.encode_map_program(
+                    &encoder,
+                    table,
+                    dispatch,
+                    &mut bindings,
+                    arguments,
+                )?);
+                continue;
+            }
             if let Op::RmsNorm { eps } = dispatch.op() {
                 temporaries.extend(self.encode_rms_norm(
                     &encoder,
@@ -2719,6 +2709,48 @@ impl MetalBackend {
         Ok(layouts)
     }
 
+    fn encode_map_program(
+        &self,
+        encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
+        table: &ProtocolObject<dyn MTL4ArgumentTable>,
+        dispatch: &Dispatch,
+        bindings: &mut ArgumentBindings,
+        arguments: &mut ArgumentWriter,
+    ) -> Result<Vec<BufferBinding>, BackendError> {
+        use objc2_metal::MTL4ComputeCommandEncoder;
+
+        let program = dispatch.bound_program().ok_or(BackendError::InvalidInput)?;
+        let pipeline = self
+            .pipelines
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?
+            .get_program(program)?;
+        encoder.setComputePipelineState(&pipeline);
+        let operands = program
+            .inputs()
+            .iter()
+            .chain(program.outputs())
+            .collect::<Vec<_>>();
+        let layouts = operands
+            .iter()
+            .map(|tensor| Self::layout_buffer(tensor.layout(), arguments))
+            .collect::<Result<Vec<_>, _>>()?;
+        let buffers = self
+            .buffers
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?;
+        for (index, tensor) in operands.iter().enumerate() {
+            bindings.bind_raw(table, index, &buffers.get(tensor)?.raw);
+            bindings.bind(table, index + operands.len(), &layouts[index]);
+        }
+        drop(buffers);
+        encoder.setArgumentTable(Some(table));
+        let (threadgroups, threads_per_threadgroup) =
+            map_dispatch_geometry(&pipeline, dispatch.output().layout())?;
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(threadgroups, threads_per_threadgroup);
+        Ok(layouts)
+    }
+
     fn layout_buffer(
         layout: &Layout,
         arguments: &mut ArgumentWriter,
@@ -2731,7 +2763,12 @@ impl MetalBackend {
         let mut arguments = ArgumentSizer::default();
         for dispatch in dispatches {
             match dispatch.op() {
-                Op::Program(_) => return Err(BackendError::UnsupportedOperation),
+                Op::Program(_) => {
+                    let program = dispatch.bound_program().ok_or(BackendError::InvalidInput)?;
+                    for _ in program.inputs().iter().chain(program.outputs()) {
+                        arguments.write(112)?;
+                    }
+                }
                 Op::Copy => Self::size_copy_arguments(&mut arguments)?,
                 Op::Add | Op::SiluMul => {
                     for _ in 0..=dispatch.inputs().len() {
@@ -3107,6 +3144,23 @@ fn shape3(layout: &Layout) -> Result<[u32; 3], BackendError> {
         .map_err(|_| BackendError::InvalidInput)
 }
 
+fn supported_dispatch(dispatch: &Dispatch) -> bool {
+    match dispatch.op() {
+        Op::Program(_) => dispatch
+            .bound_program()
+            .is_some_and(|program| program.program().program().kind == ProgramKind::Map),
+        Op::Copy
+        | Op::Add
+        | Op::SiluMul
+        | Op::RmsNorm { .. }
+        | Op::Softmax
+        | Op::Rope { .. }
+        | Op::Embed
+        | Op::Matmul
+        | Op::Sdpa { .. } => true,
+    }
+}
+
 fn vector_sdpa_supported(dispatch: &Dispatch) -> Result<bool, BackendError> {
     let [query, key, value] = dispatch.inputs() else {
         return Err(BackendError::InvalidInput);
@@ -3305,6 +3359,38 @@ fn row_dispatch_geometry(
     ))
 }
 
+fn map_dispatch_geometry(
+    pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
+    output: &Layout,
+) -> Result<(MTLSize, MTLSize), BackendError> {
+    let shape = output.shape();
+    let width = shape.last().copied().unwrap_or(1);
+    let height = shape.iter().rev().nth(1).copied().unwrap_or(1);
+    let depth = shape[..shape.len().saturating_sub(2)]
+        .iter()
+        .try_fold(1_usize, |count, &extent| {
+            count.checked_mul(usize::try_from(extent).ok()?)
+        })
+        .ok_or(BackendError::ExecutionFailed)?;
+    let width = usize::try_from(width).map_err(|_| BackendError::ExecutionFailed)?;
+    let group_width = pipeline
+        .maxTotalThreadsPerThreadgroup()
+        .clamp(1, 256)
+        .min(width.max(1));
+    Ok((
+        MTLSize {
+            width: width.div_ceil(group_width),
+            height: usize::try_from(height).map_err(|_| BackendError::ExecutionFailed)?,
+            depth,
+        },
+        MTLSize {
+            width: group_width,
+            height: 1,
+            depth: 1,
+        },
+    ))
+}
+
 const fn dtype_code(dtype: DType) -> u32 {
     match dtype {
         DType::F32 => 0,
@@ -3315,7 +3401,6 @@ const fn dtype_code(dtype: DType) -> u32 {
     }
 }
 
-#[allow(dead_code)]
 const fn dtype_key(dtype: DType) -> u8 {
     match dtype {
         DType::F32 => 0,
@@ -3353,7 +3438,6 @@ pub(super) struct PipelineCache {
     device: Retained<ProtocolObject<dyn MTLDevice>>,
     library: Retained<ProtocolObject<dyn MTLLibrary>>,
     pipelines: HashMap<PipelineKey, Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
-    #[allow(dead_code)]
     programs: LruCache<ProgramPipelineKey, Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
 }
 
@@ -3413,7 +3497,6 @@ impl PipelineCache {
         Ok(pipeline)
     }
 
-    #[allow(dead_code)]
     pub(super) fn get_program(
         &mut self,
         program: &BoundProgram,
@@ -3429,7 +3512,6 @@ impl PipelineCache {
         Ok(pipeline)
     }
 
-    #[allow(dead_code)]
     fn compile_program_source(
         &self,
         key: &ProgramPipelineKey,
@@ -3475,7 +3557,6 @@ impl PipelineCache {
     }
 }
 
-#[allow(dead_code)]
 fn program_compile_failed(hash: ProgramHash) -> BackendError {
     let mut encoded = String::with_capacity(64);
     for byte in hash.as_bytes() {
@@ -3494,7 +3575,7 @@ mod tests {
 
     use forja_core::{
         Backend, CommandList, DType, Op, Slice, Submission, ViewOp,
-        program::{BoundProgram, Inst, Program, ProgramKind, bind_program},
+        program::{BinOp, BoundProgram, Inst, Program, ProgramKind, RedOp, bind_program},
     };
     use forja_cpu::CpuBackend;
     use forja_testing::{TensorSpec, assert_backends_agree, assert_outputs_agree};
@@ -3550,6 +3631,75 @@ mod tests {
             cache.compile_program_source(&key, "kernel void broken("),
             Err(BackendError::ExecutionFailed)
         ));
+    }
+
+    #[test]
+    fn metal_executes_map_program_with_multiple_outputs() {
+        let cpu = CpuBackend::new();
+        let metal = MetalBackend::new().unwrap();
+        let expected = run_two_output_program(&cpu);
+        let actual = run_two_output_program(&metal);
+        for (expected, actual) in expected.iter().zip(actual) {
+            assert_outputs_agree(DType::F32, expected, &actual).unwrap();
+        }
+    }
+
+    #[test]
+    fn metal_keeps_row_programs_unsupported() {
+        let backend = MetalBackend::new().unwrap();
+        let input = backend.alloc(DType::F32, &[7]).unwrap();
+        let output = backend.alloc(DType::F32, &[7]).unwrap();
+        let program = Program {
+            kind: ProgramKind::Row,
+            insts: vec![Inst::Input(0), Inst::Reduce(RedOp::Sum, 0)],
+            outputs: vec![(0, 1)],
+        }
+        .validate()
+        .unwrap();
+        let mut commands = CommandList::new();
+        commands
+            .dispatch_program(&program, &[&input], &[&output])
+            .unwrap();
+        assert!(matches!(
+            backend.submit(commands),
+            Err(BackendError::UnsupportedOperation)
+        ));
+    }
+
+    fn run_two_output_program<B: Backend>(backend: &B) -> [Vec<u8>; 2] {
+        let left = backend.alloc(DType::F32, &[7]).unwrap();
+        let right = backend.alloc(DType::F32, &[7]).unwrap();
+        let left_bytes = (0_u32..7)
+            .flat_map(|value| f32::from(u16::try_from(value).unwrap()).to_le_bytes())
+            .collect::<Vec<_>>();
+        let right_bytes = (0_u32..7)
+            .flat_map(|value| (f32::from(u16::try_from(value).unwrap()) / 2.0).to_le_bytes())
+            .collect::<Vec<_>>();
+        backend.write(&left, &left_bytes).unwrap();
+        backend.write(&right, &right_bytes).unwrap();
+        let sum = backend.alloc(DType::F32, &[7]).unwrap();
+        let difference = backend.alloc(DType::F32, &[7]).unwrap();
+        let program = Program {
+            kind: ProgramKind::Map,
+            insts: vec![
+                Inst::Input(0),
+                Inst::Input(1),
+                Inst::Binary(BinOp::Add, 0, 1),
+                Inst::Binary(BinOp::Sub, 0, 1),
+            ],
+            outputs: vec![(0, 2), (1, 3)],
+        }
+        .validate()
+        .unwrap();
+        let mut commands = CommandList::new();
+        commands
+            .dispatch_program(&program, &[&left, &right], &[&sum, &difference])
+            .unwrap();
+        backend.submit(commands).unwrap().wait().unwrap();
+        [
+            backend.read(&sum).unwrap(),
+            backend.read(&difference).unwrap(),
+        ]
     }
 
     fn identity_program(

@@ -567,10 +567,7 @@ mod mapped_tests {
 
 #[cfg(test)]
 mod tests {
-    use forja_core::{
-        Op, Submission,
-        program::{Inst, Program, ProgramKind},
-    };
+    use forja_core::{Op, Submission};
 
     use super::*;
 
@@ -584,29 +581,6 @@ mod tests {
             .collect::<Vec<_>>();
         backend.write(&tensor, &bytes).unwrap();
         assert_eq!(backend.read(&tensor).unwrap(), bytes);
-    }
-
-    #[test]
-    fn metal_rejects_scalar_programs_until_lowering_exists() {
-        let backend = MetalBackend::new().unwrap();
-        let input = backend.alloc(DType::F32, &[1]).unwrap();
-        let output = backend.alloc(DType::F32, &[1]).unwrap();
-        let program = Program {
-            kind: ProgramKind::Map,
-            insts: vec![Inst::Input(0)],
-            outputs: vec![(0, 0)],
-        }
-        .validate()
-        .unwrap();
-        let mut commands = CommandList::new();
-        commands
-            .dispatch_program(&program, &[&input], &[&output])
-            .unwrap();
-
-        assert!(matches!(
-            backend.submit(commands),
-            Err(BackendError::UnsupportedOperation)
-        ));
     }
 
     #[test]
