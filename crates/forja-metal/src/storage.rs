@@ -4,7 +4,7 @@ use std::{
     ptr::{self, NonNull},
     slice,
     sync::{Arc, Mutex, Weak},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use crate::encoding::{Completion, InFlightTracker, MetalSubmission, PipelineCache};
@@ -166,19 +166,93 @@ impl BufferPool {
 
 const DEFAULT_POOL_CAPACITY: u64 = 1 << 30;
 
+/// Limits runtime scalar-program compilations for one backend.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProgramCompileBudget {
+    burst: usize,
+    refill_interval: Duration,
+}
+
+impl ProgramCompileBudget {
+    /// Creates a budget with `burst` initial tokens and one replacement token per interval.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BackendError::InvalidInput`] when either value is zero.
+    pub fn new(burst: usize, refill_interval: Duration) -> Result<Self, BackendError> {
+        if burst == 0 || refill_interval.is_zero() {
+            return Err(BackendError::InvalidInput);
+        }
+        Ok(Self {
+            burst,
+            refill_interval,
+        })
+    }
+}
+
+impl Default for ProgramCompileBudget {
+    fn default() -> Self {
+        Self {
+            burst: 64,
+            refill_interval: Duration::from_millis(250),
+        }
+    }
+}
+
+pub(super) struct ProgramCompileTokens {
+    configuration: ProgramCompileBudget,
+    available: usize,
+    last_refill: Instant,
+}
+
+impl ProgramCompileTokens {
+    fn new(configuration: ProgramCompileBudget) -> Self {
+        Self {
+            configuration,
+            available: configuration.burst,
+            last_refill: Instant::now(),
+        }
+    }
+
+    pub(super) fn consume(&mut self, count: usize) -> bool {
+        self.refill(Instant::now());
+        if count > self.available {
+            return false;
+        }
+        self.available -= count;
+        true
+    }
+
+    fn refill(&mut self, now: Instant) {
+        let elapsed = now.saturating_duration_since(self.last_refill);
+        let intervals = elapsed.as_nanos() / self.configuration.refill_interval.as_nanos();
+        let added = usize::try_from(intervals).unwrap_or(usize::MAX);
+        if added == 0 {
+            return;
+        }
+        self.available = self
+            .configuration
+            .burst
+            .min(self.available.saturating_add(added));
+        self.last_refill = now;
+    }
+}
+
 /// A Metal 4 backend using shared unified-memory buffers.
 ///
 /// Each backend owns an isolated buffer pool and clears reused storage before allocation, so a
 /// tensor cannot expose contents from an earlier allocation or another host store. Guest quotas
 /// and allocation counts cover live logical tensors; released buffers instead count toward this
 /// backend's separately capped pool using their page-rounded Metal allocation sizes.
-/// A submission may compile at most four cache-missing scalar programs.
+/// A submission may compile at most four cache-missing scalar programs, and cache misses also
+/// consume this backend's configurable cumulative compile budget.
 pub struct MetalBackend {
     pub(super) device: Retained<ProtocolObject<dyn MTLDevice>>,
     pub(super) queue: Retained<ProtocolObject<dyn MTL4CommandQueue>>,
     pub(super) buffers: Mutex<AllocationRegistry<MetalBuffer>>,
     pool: Mutex<BufferPool>,
     pub(super) pipelines: Mutex<PipelineCache>,
+    pub(super) program_compile_tokens: Mutex<ProgramCompileTokens>,
     pub(super) in_flight: Arc<InFlightTracker>,
     pub(super) shared_event: Retained<ProtocolObject<dyn MTLSharedEvent>>,
     pub(super) next_event_value: Mutex<u64>,
@@ -205,7 +279,20 @@ impl MetalBackend {
     ///
     /// Returns [`BackendError::ExecutionFailed`] when Metal 4 is unavailable.
     pub fn new() -> Result<Self, BackendError> {
-        Self::with_gpu_timeout(Duration::from_secs(10))
+        Self::with_configuration(
+            Duration::from_secs(10),
+            DEFAULT_POOL_CAPACITY,
+            ProgramCompileBudget::default(),
+        )
+    }
+
+    /// Creates a backend with a cumulative runtime scalar-program compile budget.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BackendError::ExecutionFailed`] when Metal 4 is unavailable.
+    pub fn with_program_compile_budget(budget: ProgramCompileBudget) -> Result<Self, BackendError> {
+        Self::with_configuration(Duration::from_secs(10), DEFAULT_POOL_CAPACITY, budget)
     }
 
     /// Creates a backend with the default GPU timeout and a free-buffer pool byte cap.
@@ -215,7 +302,11 @@ impl MetalBackend {
     /// Returns [`BackendError::AllocationFailed`] when `pool_capacity` does not fit the host, or
     /// [`BackendError::ExecutionFailed`] when Metal 4 is unavailable.
     pub fn with_pool_capacity(pool_capacity: u64) -> Result<Self, BackendError> {
-        Self::with_gpu_timeout_and_pool_capacity(Duration::from_secs(10), pool_capacity)
+        Self::with_configuration(
+            Duration::from_secs(10),
+            pool_capacity,
+            ProgramCompileBudget::default(),
+        )
     }
 
     /// Creates a backend with a deadline for each wait on submitted GPU work.
@@ -224,7 +315,11 @@ impl MetalBackend {
     ///
     /// Returns [`BackendError::ExecutionFailed`] when Metal 4 is unavailable.
     pub fn with_gpu_timeout(gpu_timeout: Duration) -> Result<Self, BackendError> {
-        Self::with_gpu_timeout_and_pool_capacity(gpu_timeout, DEFAULT_POOL_CAPACITY)
+        Self::with_configuration(
+            gpu_timeout,
+            DEFAULT_POOL_CAPACITY,
+            ProgramCompileBudget::default(),
+        )
     }
 
     /// Creates a backend with a GPU wait deadline and a free-buffer pool byte cap.
@@ -236,6 +331,14 @@ impl MetalBackend {
     pub fn with_gpu_timeout_and_pool_capacity(
         gpu_timeout: Duration,
         pool_capacity: u64,
+    ) -> Result<Self, BackendError> {
+        Self::with_configuration(gpu_timeout, pool_capacity, ProgramCompileBudget::default())
+    }
+
+    fn with_configuration(
+        gpu_timeout: Duration,
+        pool_capacity: u64,
+        program_compile_budget: ProgramCompileBudget,
     ) -> Result<Self, BackendError> {
         let device = MTLCreateSystemDefaultDevice().ok_or(BackendError::ExecutionFailed)?;
         if !device.supportsFamily(MTLGPUFamily::Metal4) {
@@ -280,6 +383,7 @@ impl MetalBackend {
                 residency: PoolResidency { raw: residency },
             }),
             pipelines: Mutex::new(pipelines),
+            program_compile_tokens: Mutex::new(ProgramCompileTokens::new(program_compile_budget)),
             in_flight: Arc::new(InFlightTracker::new()),
             shared_event,
             next_event_value: Mutex::new(1),
@@ -571,6 +675,20 @@ mod tests {
     use forja_core::{Op, Submission};
 
     use super::*;
+
+    #[test]
+    fn program_compile_tokens_refill_to_the_configured_burst() {
+        let configuration = ProgramCompileBudget::new(2, Duration::from_hours(24)).unwrap();
+        let mut tokens = ProgramCompileTokens::new(configuration);
+        let started = tokens.last_refill;
+        assert!(tokens.consume(2));
+        assert!(!tokens.consume(1));
+        tokens.refill(started + Duration::from_hours(24));
+        assert!(tokens.consume(1));
+        assert!(!tokens.consume(1));
+        tokens.refill(started + Duration::from_hours(72));
+        assert!(tokens.consume(2));
+    }
 
     #[test]
     fn metal_storage_round_trips_bytes() {

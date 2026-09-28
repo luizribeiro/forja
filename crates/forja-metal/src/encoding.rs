@@ -1153,7 +1153,7 @@ impl MetalBackend {
         for tensor in &tensors {
             self.validate(tensor)?;
         }
-        self.validate_program_compile_quota(&dispatches)?;
+        self.charge_program_compile_budget(&dispatches)?;
         let mut profile = PROFILE.then(|| SubmissionProfile {
             validation: validation_started.map_or(Duration::ZERO, |started| started.elapsed()),
             dispatches: u64::try_from(dispatches.len()).unwrap_or(u64::MAX),
@@ -1227,7 +1227,7 @@ impl MetalBackend {
         Ok(submission)
     }
 
-    fn validate_program_compile_quota(&self, dispatches: &[Dispatch]) -> Result<(), BackendError> {
+    fn charge_program_compile_budget(&self, dispatches: &[Dispatch]) -> Result<(), BackendError> {
         let pipelines = self
             .pipelines
             .lock()
@@ -1242,7 +1242,13 @@ impl MetalBackend {
                 }
             }
         }
-        Ok(())
+        drop(pipelines);
+        self.program_compile_tokens
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?
+            .consume(missing.len())
+            .then_some(())
+            .ok_or(BackendError::QuotaExceeded)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -3683,6 +3689,29 @@ mod tests {
     }
 
     #[test]
+    fn cumulative_program_compile_budget_ignores_cache_hits() {
+        let budget = crate::ProgramCompileBudget::new(2, Duration::from_secs(60)).unwrap();
+        let backend = MetalBackend::with_program_compile_budget(budget).unwrap();
+        submit_constant_program(&backend, 1.0)
+            .unwrap()
+            .wait()
+            .unwrap();
+        submit_constant_program(&backend, 2.0)
+            .unwrap()
+            .wait()
+            .unwrap();
+        submit_constant_program(&backend, 1.0)
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert!(matches!(
+            submit_constant_program(&backend, 3.0),
+            Err(BackendError::QuotaExceeded)
+        ));
+        assert_eq!(backend.pipelines.lock().unwrap().programs.entries.len(), 2);
+    }
+
+    #[test]
     fn map_pipeline_compiles_once_and_reports_failure() {
         let cpu = CpuBackend::new();
         let program = identity_program(&cpu, DType::F32, DType::F32, &[7], false);
@@ -3791,6 +3820,25 @@ mod tests {
         .validate()
         .unwrap();
         bind_program(&program, &[&input], &[&output]).unwrap()
+    }
+
+    fn submit_constant_program(
+        backend: &MetalBackend,
+        value: f32,
+    ) -> Result<MetalSubmission, BackendError> {
+        let output = backend.alloc(DType::F32, &[1])?;
+        let program = Program {
+            kind: ProgramKind::Map,
+            insts: vec![Inst::Const(value)],
+            outputs: vec![(0, 0)],
+        }
+        .validate()
+        .map_err(|_| BackendError::InvalidInput)?;
+        let mut commands = CommandList::new();
+        commands
+            .dispatch_program(&program, &[], &[&output])
+            .map_err(|_| BackendError::InvalidInput)?;
+        backend.submit(commands)
     }
 
     fn run_varying_submissions(backend: &MetalBackend, count: usize, offset: usize) {

@@ -11,7 +11,7 @@ mod matmul;
 mod storage;
 
 #[cfg(target_os = "macos")]
-pub use storage::MetalBackend;
+pub use storage::{MetalBackend, ProgramCompileBudget};
 
 #[cfg(target_os = "macos")]
 mod platform {
