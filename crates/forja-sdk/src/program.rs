@@ -1113,4 +1113,79 @@ mod tests {
 
         Kernel::new(&program, 1, &[DType::U32], &[DType::F32]).unwrap();
     }
+
+    #[cfg(feature = "native")]
+    fn typed_differential_case() -> forja_testing::program::ProgramCase {
+        use forja_core::{DType as CoreDType, Slice};
+        use forja_testing::TensorSpec;
+
+        let context = RowCtx::new();
+        let value = context.input(0);
+        let integer = context.input_u32(1);
+        let lane = context.index(-1);
+        let extent = context.extent(-1);
+        let one = context.constant(1.0).cast_u32();
+        let converted = value.abs().cast_u32().min(extent);
+        let bounded = integer.min(extent.wrapping_sub(one));
+        let mixed = bounded
+            .wrapping_add(converted)
+            .wrapping_add(lane)
+            .wrapping_sub(lane)
+            .wrapping_mul(one)
+            .cast_f32();
+        let condition = value
+            .gt(context.constant(0.0))
+            .and(lane.lt(extent))
+            .or(context.boolean(false))
+            .not();
+        let selected = condition.select(value.maximum(mixed), value.minimum(mixed))
+            + condition.cast_u32().cast_f32();
+        let summary = context.row_sum(selected)
+            + context.row_max(selected)
+            + context.row_min(selected)
+            + context.row_mean(selected);
+        context.output(0, selected);
+        context.output(1, summary);
+        let program = context.finish();
+        let program = crate::sys::native::core_program(program.definition(2).unwrap())
+            .unwrap()
+            .program()
+            .clone();
+        let slices = [Slice::new(0, 7, 1).unwrap(), Slice::new(1, 33, 1).unwrap()];
+        forja_testing::program::ProgramCase::new(
+            program,
+            vec![7, 33],
+            vec![
+                TensorSpec::sliced(CoreDType::F32, &[7, 34], &slices),
+                TensorSpec::sliced(CoreDType::U32, &[7, 34], &slices),
+            ],
+            vec![
+                TensorSpec::contiguous(CoreDType::F32, &[7, 33]),
+                TensorSpec::contiguous(CoreDType::F32, &[7, 33]),
+            ],
+        )
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn typed_builder_program_matches_the_cpu_interval_oracle() {
+        let cpu = forja_cpu::CpuBackend::new();
+        let report =
+            forja_testing::assert_program_backends_agree(&cpu, &cpu, &typed_differential_case())
+                .unwrap();
+
+        assert!(report.reduction_steps > 0);
+    }
+
+    #[cfg(all(feature = "native-metal", target_os = "macos"))]
+    #[test]
+    fn metal_typed_builder_program_matches_the_interval_oracle() {
+        let cpu = forja_cpu::CpuBackend::new();
+        let metal = forja_metal::MetalBackend::new().unwrap();
+        let report =
+            forja_testing::assert_program_backends_agree(&cpu, &metal, &typed_differential_case())
+                .unwrap();
+
+        assert!(report.reduction_steps > 0);
+    }
 }

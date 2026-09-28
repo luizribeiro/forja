@@ -729,7 +729,7 @@ pub(crate) mod native {
         }
     }
 
-    fn core_program(program: Program) -> Result<forja_core::program::ValidatedProgram> {
+    pub(crate) fn core_program(program: Program) -> Result<forja_core::program::ValidatedProgram> {
         CoreProgram {
             kind: match program.kind {
                 ProgramKind::Map => CoreProgramKind::Map,
