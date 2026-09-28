@@ -270,6 +270,12 @@ impl BoundProgram {
         &self.program
     }
 
+    /// Returns the validated program's stable content digest.
+    #[must_use]
+    pub const fn content_hash(&self) -> ProgramHash {
+        self.program.content_hash()
+    }
+
     /// Returns input tensors in slot order.
     #[must_use]
     pub fn inputs(&self) -> &[Tensor] {

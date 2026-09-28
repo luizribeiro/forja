@@ -343,7 +343,7 @@ impl CommandList {
             .cloned()
             .ok_or(OpError::ProgramBinding(BindError::NoOutputs))?;
         self.dispatches.push(Dispatch {
-            op: Op::Program(program.content_hash()),
+            op: Op::Program(bound.content_hash()),
             inputs: bound.inputs().to_vec(),
             output,
             program: Some(bound),
