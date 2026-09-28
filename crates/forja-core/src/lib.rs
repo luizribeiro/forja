@@ -2,6 +2,7 @@
 //! Use this crate to describe validated tensor views and operation signatures.
 
 mod backend;
+mod graph;
 mod layout;
 mod ops;
 pub mod program;
@@ -13,6 +14,7 @@ pub use backend::{
     SubmissionProfile, ViewOp,
 };
 pub use forja_mmap::MappedRegion;
+pub use graph::TemplateOp;
 pub use layout::{Layout, LayoutError, MAX_RANK, Slice, byte_ranges_overlap, is_injective};
 pub use ops::{
     BufferId, CommandList, Dispatch, Op, OpError, Operand, Tensor, TensorError, required_barriers,
