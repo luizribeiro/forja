@@ -2,6 +2,7 @@
 
 use std::env;
 use std::ffi::OsStr;
+use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -22,6 +23,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &["-p", "qwen3", "--features", "bf16"],
     )?;
 
+    let [
+        qwen3,
+        qwen3_bf16,
+        qwen3_qk_norm_rope,
+        qwen3_silu_mul,
+        qwen3_final_norm,
+        qwen3_all_fusions,
+        qwen3_bf16_all_fusions,
+    ] = build_qwen_profiles(
+        &guest_manifest,
+        &guest_target_dir,
+        &bf16_target_dir,
+        &out_dir,
+    )?;
     let release_dir = guest_target_dir.join("wasm32-wasip2/release");
     emit_guest_path("HELLO_COMPONENT", &release_dir.join("hello.wasm"));
     emit_guest_path(
@@ -50,11 +65,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &release_dir.join("tensor_abuse.wasm"),
     );
     emit_guest_path("TOY_MLP_COMPONENT", &release_dir.join("toy_mlp.wasm"));
-    emit_guest_path("QWEN3_COMPONENT", &release_dir.join("qwen3.wasm"));
-    emit_guest_path(
-        "QWEN3_BF16_COMPONENT",
-        &bf16_target_dir.join("wasm32-wasip2/release/qwen3.wasm"),
-    );
+    emit_guest_path("QWEN3_COMPONENT", &qwen3);
+    emit_guest_path("QWEN3_BF16_COMPONENT", &qwen3_bf16);
+    emit_guest_path("QWEN3_QK_NORM_ROPE_COMPONENT", &qwen3_qk_norm_rope);
+    emit_guest_path("QWEN3_SILU_MUL_COMPONENT", &qwen3_silu_mul);
+    emit_guest_path("QWEN3_FINAL_NORM_COMPONENT", &qwen3_final_norm);
+    emit_guest_path("QWEN3_ALL_FUSIONS_COMPONENT", &qwen3_all_fusions);
+    emit_guest_path("QWEN3_BF16_ALL_FUSIONS_COMPONENT", &qwen3_bf16_all_fusions);
     emit_guest_path(
         "WEIGHTS_SMOKE_COMPONENT",
         &release_dir.join("weights_smoke.wasm"),
@@ -76,6 +93,71 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         repository.join("wit").display()
     );
     Ok(())
+}
+
+fn build_qwen_profiles(
+    manifest: &Path,
+    target_dir: &Path,
+    bf16_target_dir: &Path,
+    out_dir: &Path,
+) -> io::Result<[PathBuf; 7]> {
+    let release_dir = target_dir.join("wasm32-wasip2/release");
+    let bf16_release_dir = bf16_target_dir.join("wasm32-wasip2/release");
+    let qwen3 = copy_component(&release_dir.join("qwen3.wasm"), out_dir, "qwen3.wasm")?;
+    let qwen3_bf16 = copy_component(
+        &bf16_release_dir.join("qwen3.wasm"),
+        out_dir,
+        "qwen3-bf16.wasm",
+    )?;
+    let variants = [
+        ("qk-norm-rope-only", "qwen3-qk-norm-rope.wasm"),
+        ("silu-mul-only", "qwen3-silu-mul.wasm"),
+        ("final-norm-only", "qwen3-final-norm.wasm"),
+        ("all-fusions", "qwen3-all-fusions.wasm"),
+    ]
+    .map(|(feature, name)| {
+        build_qwen_profile(manifest, target_dir, feature)?;
+        copy_component(&release_dir.join("qwen3.wasm"), out_dir, name)
+    })
+    .into_iter()
+    .collect::<io::Result<Vec<_>>>()?;
+    let [
+        qwen3_qk_norm_rope,
+        qwen3_silu_mul,
+        qwen3_final_norm,
+        qwen3_all_fusions,
+    ] = variants
+        .try_into()
+        .map_err(|_| io::Error::other("fusion profile count changed"))?;
+    build_qwen_profile(manifest, bf16_target_dir, "bf16,all-fusions")?;
+    let qwen3_bf16_all_fusions = copy_component(
+        &bf16_release_dir.join("qwen3.wasm"),
+        out_dir,
+        "qwen3-bf16-all-fusions.wasm",
+    )?;
+    Ok([
+        qwen3,
+        qwen3_bf16,
+        qwen3_qk_norm_rope,
+        qwen3_silu_mul,
+        qwen3_final_norm,
+        qwen3_all_fusions,
+        qwen3_bf16_all_fusions,
+    ])
+}
+
+fn build_qwen_profile(manifest: &Path, target_dir: &Path, features: &str) -> io::Result<()> {
+    build_guest_workspace(
+        manifest,
+        target_dir,
+        &["-p", "qwen3", "--features", features],
+    )
+}
+
+fn copy_component(source: &Path, out_dir: &Path, name: &str) -> io::Result<PathBuf> {
+    let destination = out_dir.join(name);
+    fs::copy(source, &destination)?;
+    Ok(destination)
 }
 
 fn main_target_dir(repository: &Path, out_dir: &Path) -> io::Result<PathBuf> {

@@ -69,6 +69,36 @@ pub fn qwen3_bf16() -> &'static Path {
     Path::new(env!("QWEN3_BF16_COMPONENT"))
 }
 
+/// Returns the path to Qwen3 with only fused QK normalization and `RoPE`.
+#[must_use]
+pub fn qwen3_qk_norm_rope() -> &'static Path {
+    Path::new(env!("QWEN3_QK_NORM_ROPE_COMPONENT"))
+}
+
+/// Returns the path to Qwen3 with only fused `SiLU` multiplication.
+#[must_use]
+pub fn qwen3_silu_mul() -> &'static Path {
+    Path::new(env!("QWEN3_SILU_MUL_COMPONENT"))
+}
+
+/// Returns the path to Qwen3 with only fused final normalization.
+#[must_use]
+pub fn qwen3_final_norm() -> &'static Path {
+    Path::new(env!("QWEN3_FINAL_NORM_COMPONENT"))
+}
+
+/// Returns the path to Qwen3 with every optional fusion enabled.
+#[must_use]
+pub fn qwen3_all_fusions() -> &'static Path {
+    Path::new(env!("QWEN3_ALL_FUSIONS_COMPONENT"))
+}
+
+/// Returns the path to bf16 Qwen3 with every optional fusion enabled.
+#[must_use]
+pub fn qwen3_bf16_all_fusions() -> &'static Path {
+    Path::new(env!("QWEN3_BF16_ALL_FUSIONS_COMPONENT"))
+}
+
 /// Returns the path to the guest that consumes host-granted weights.
 #[must_use]
 pub fn weights_smoke() -> &'static Path {

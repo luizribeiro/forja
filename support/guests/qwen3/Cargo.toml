@@ -10,7 +10,11 @@ version.workspace = true
 crate-type = ["cdylib", "rlib"]
 
 [features]
+all-fusions = []
 bf16 = []
+final-norm-only = []
+qk-norm-rope-only = []
+silu-mul-only = []
 
 [dependencies]
 forja-sdk = { path = "../../../crates/forja-sdk" }

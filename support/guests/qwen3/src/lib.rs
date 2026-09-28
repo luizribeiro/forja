@@ -1,5 +1,19 @@
 //! Qwen3-0.6B inference engine.
 
+#[cfg(any(
+    all(
+        not(feature = "all-fusions"),
+        feature = "qk-norm-rope-only",
+        any(feature = "silu-mul-only", feature = "final-norm-only")
+    ),
+    all(
+        not(feature = "all-fusions"),
+        feature = "silu-mul-only",
+        feature = "final-norm-only"
+    )
+))]
+compile_error!("select at most one fusion profile");
+
 use forja_sdk::{
     DType, Engine, EngineInfo, Load, Result, StepInput, StepOutput, Tensor, Weights, bf16,
     export_engine,
@@ -26,10 +40,15 @@ const INTERMEDIATE: u32 = 3_072;
 const RMS_EPSILON: f32 = 1.0e-6;
 const ROPE_THETA: f32 = 1.0e6;
 const ATTENTION_SCALE: f32 = 0.088_388_35;
-const FUSE_RESIDUAL_NORM: bool = true;
-const FUSE_QK_NORM_ROPE: bool = false;
-const FUSE_SILU_MUL: bool = false;
-const FUSE_FINAL_NORM: bool = false;
+const FUSE_RESIDUAL_NORM: bool = cfg!(feature = "all-fusions")
+    || !cfg!(any(
+        feature = "qk-norm-rope-only",
+        feature = "silu-mul-only",
+        feature = "final-norm-only"
+    ));
+const FUSE_QK_NORM_ROPE: bool = cfg!(any(feature = "qk-norm-rope-only", feature = "all-fusions"));
+const FUSE_SILU_MUL: bool = cfg!(any(feature = "silu-mul-only", feature = "all-fusions"));
+const FUSE_FINAL_NORM: bool = cfg!(any(feature = "final-norm-only", feature = "all-fusions"));
 
 #[derive(Clone, Copy)]
 struct Config;
