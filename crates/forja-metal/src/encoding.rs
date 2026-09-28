@@ -5143,14 +5143,47 @@ mod tests {
     }
 
     fn assert_matmul(a: TensorSpec, b: TensorSpec, output: &TensorSpec) {
-        assert_backends_agree(
-            &CpuBackend::new(),
-            &MetalBackend::new().unwrap(),
-            Op::Matmul,
-            &[a, b],
-            output,
-        )
-        .unwrap();
+        assert_matmul_with(&MetalBackend::new().unwrap(), a, b, output);
+    }
+
+    fn assert_matmul_with(
+        backend: &MetalBackend,
+        a: TensorSpec,
+        b: TensorSpec,
+        output: &TensorSpec,
+    ) {
+        let shape = (a.allocation_shape().to_vec(), b.allocation_shape().to_vec());
+        let started = Instant::now();
+        assert_backends_agree(&CpuBackend::new(), backend, Op::Matmul, &[a, b], output).unwrap();
+        let state = backend.debug_state();
+        eprintln!(
+            "matmul {shape:?}: wall={:?} submit={:?} wait={:?} resources={state:?}",
+            started.elapsed(),
+            state.last_submit,
+            state.last_wait,
+        );
+    }
+
+    #[test]
+    fn repeated_backend_gemms_release_owned_resources() {
+        for iteration in 0..200 {
+            let started = Instant::now();
+            {
+                let backend = MetalBackend::new().unwrap();
+                assert_matmul_with(
+                    &backend,
+                    TensorSpec::contiguous(DType::F32, &[7, 33]),
+                    TensorSpec::contiguous(DType::F32, &[33, 33]),
+                    &TensorSpec::contiguous(DType::F32, &[7, 33]),
+                );
+                let state = backend.debug_state();
+                assert_eq!(state.live_backends, 1);
+                assert_eq!(state.live_listener_queues, 1);
+                assert_eq!(state.in_flight_submissions, 0);
+            }
+            assert_eq!(MetalBackend::debug_live_counts(), (0, 0));
+            eprintln!("backend iteration {iteration}: {:?}", started.elapsed());
+        }
     }
 
     fn assert_sdpa(
