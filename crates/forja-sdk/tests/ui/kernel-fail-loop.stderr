@@ -1,5 +1,5 @@
-error: expression is not supported in this kernel subset
+error: kernel: loops are not supported in kernels; express the computation per element, or reduce with `.row_sum()`/`.row_max()`/`.row_min()`
  --> tests/ui/kernel-fail-loop.rs:3:5
   |
 3 |     loop { x }
-  |     ^^^^^^^^^^
+  |     ^^^^

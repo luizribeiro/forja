@@ -1,0 +1,5 @@
+error: kernel: float literal `1e40` is not finite in f32
+ --> tests/ui/kernel-fail-float-nonfinite.rs:3:9
+  |
+3 |     x + 1e40
+  |         ^^^^

@@ -1,14 +1,18 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use proc_macro2::{Ident, Span, TokenStream};
 use quote::{format_ident, quote};
-use syn::{BinOp, Expr, ExprMethodCall, Lit, Pat, Stmt, Type, UnOp, spanned::Spanned};
+use syn::{BinOp, Expr, ExprBinary, ExprMethodCall, Lit, Pat, Stmt, Type, UnOp, spanned::Spanned};
 
 use super::ComputeType;
 
 #[derive(Clone, Copy)]
 pub(super) enum Parameter {
-    Tensor { slot: u32, compute: ComputeType },
+    Tensor {
+        slot: u32,
+        compute: ComputeType,
+        span: Span,
+    },
     Scalar(ComputeType),
 }
 
@@ -22,14 +26,21 @@ pub(super) fn lower(
     parameters: HashMap<String, Parameter>,
     context: &Ident,
 ) -> syn::Result<Lowered> {
+    let tensors = parameters
+        .iter()
+        .filter_map(|(name, parameter)| match parameter {
+            Parameter::Tensor { span, .. } => Some((name.clone(), *span)),
+            Parameter::Scalar(_) => None,
+        })
+        .collect::<Vec<_>>();
     let mut lowerer = Lowerer {
         bindings: parameters
             .into_iter()
             .map(|(name, parameter)| (name, Binding::Parameter(parameter)))
             .collect(),
         inputs: HashMap::new(),
+        used_tensors: HashSet::new(),
         statements: Vec::new(),
-        next_value: 0,
         context: context.clone(),
     };
     let result = lowerer.lower_block(body)?;
@@ -38,33 +49,74 @@ pub(super) fn lower(
         BlockResult::Tuple(values) => values,
     };
     if outputs.is_empty() || outputs.len() > 4 {
-        return Err(syn::Error::new(
-            body.span(),
-            "kernel must return one to four values",
+        return Err(kernel_error(body, "kernel must return one to four values"));
+    }
+    for (index, value) in outputs.iter().enumerate() {
+        if value.ty != ValueType::F32 {
+            return Err(kernel_error(
+                value.span,
+                format!(
+                    "output {index} has type `{}`; kernel outputs must be `f32`",
+                    value.ty.name()
+                ),
+            ));
+        }
+    }
+    if let Some((name, span)) = tensors
+        .iter()
+        .find(|(name, _)| !lowerer.used_tensors.contains(name))
+    {
+        return Err(kernel_error(
+            *span,
+            format!("tensor parameter `{name}` is never used (every input slot must be read)"),
         ));
     }
     Ok(Lowered {
         statements: lowerer.statements,
-        outputs,
+        outputs: outputs.into_iter().map(|value| value.ident).collect(),
     })
 }
 
 #[derive(Clone)]
 enum Binding {
     Parameter(Parameter),
-    Value(Ident),
+    Value(Value),
 }
 
 enum BlockResult {
-    Value(Ident),
-    Tuple(Vec<Ident>),
+    Value(Value),
+    Tuple(Vec<Value>),
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ValueType {
+    F32,
+    U32,
+    Bool,
+}
+
+impl ValueType {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::F32 => "f32",
+            Self::U32 => "u32",
+            Self::Bool => "bool",
+        }
+    }
+}
+
+#[derive(Clone)]
+struct Value {
+    ident: Ident,
+    ty: ValueType,
+    span: Span,
 }
 
 struct Lowerer {
     bindings: HashMap<String, Binding>,
-    inputs: HashMap<u32, Ident>,
+    inputs: HashMap<u32, Value>,
+    used_tensors: HashSet<String>,
     statements: Vec<TokenStream>,
-    next_value: usize,
     context: Ident,
 }
 
@@ -75,39 +127,38 @@ impl Lowerer {
         for statement in &block.stmts {
             match statement {
                 Stmt::Local(local) => {
-                    let (name, ty) = binding_pattern(&local.pat)?;
-                    if let Some(ty) = ty {
-                        require_f32(ty)?;
-                    }
+                    let (name, annotation) = binding_pattern(&local.pat)?;
                     let init = local.init.as_ref().ok_or_else(|| {
-                        syn::Error::new_spanned(local, "kernel `let` bindings need an initializer")
+                        kernel_error(local, "kernel `let` bindings need an initializer")
                     })?;
                     if init.diverge.is_some() {
-                        return Err(syn::Error::new_spanned(
+                        return Err(kernel_error(
                             &init.expr,
                             "`let else` is not supported in kernels",
                         ));
                     }
                     let value = self.lower_expr(&init.expr)?;
+                    if let Some((ty, span)) = annotation
+                        && ty != value.ty
+                    {
+                        return Err(type_mismatch(span, ty, value.ty));
+                    }
                     self.bindings.insert(name, Binding::Value(value));
                 }
                 Stmt::Expr(expression, None) => {
                     result = Some(self.lower_result(expression)?);
                 }
                 Stmt::Expr(expression, Some(_)) => {
-                    return Err(syn::Error::new_spanned(
+                    return Err(kernel_error(
                         expression,
                         "only `let` statements and a final expression are supported in kernels",
                     ));
                 }
                 Stmt::Item(item) => {
-                    return Err(syn::Error::new_spanned(
-                        item,
-                        "items are not supported inside kernels",
-                    ));
+                    return Err(kernel_error(item, "items are not supported inside kernels"));
                 }
                 Stmt::Macro(mac) => {
-                    return Err(syn::Error::new_spanned(
+                    return Err(kernel_error(
                         mac,
                         "macro calls are not supported in kernels",
                     ));
@@ -115,7 +166,7 @@ impl Lowerer {
             }
         }
         self.bindings = saved;
-        result.ok_or_else(|| syn::Error::new(block.span(), "kernel body needs a final expression"))
+        result.ok_or_else(|| kernel_error(block, "kernel body needs a final expression"))
     }
 
     fn lower_result(&mut self, expression: &Expr) -> syn::Result<BlockResult> {
@@ -130,180 +181,348 @@ impl Lowerer {
         self.lower_expr(expression).map(BlockResult::Value)
     }
 
-    fn lower_expr(&mut self, expression: &Expr) -> syn::Result<Ident> {
+    fn lower_expr(&mut self, expression: &Expr) -> syn::Result<Value> {
         if let Some(constant) = self.constant_expression(expression)? {
-            let context = &self.context;
+            let context = self.context.clone();
             let constant_name = format_ident!(
                 "__forja_constant_{}",
-                self.next_value,
+                self.statements.len(),
                 span = Span::mixed_site()
             );
-            return Ok(self.emit(quote!(
-                {
+            return Ok(self.emit(
+                quote!({
                     let #constant_name: f32 = #constant;
                     #context.constant(#constant_name)
-                }
-            )));
+                }),
+                ValueType::F32,
+                expression.span(),
+            ));
         }
         match expression {
             Expr::Path(path) => self.lower_path(path),
-            Expr::Binary(binary) => {
-                let left = self.lower_expr(&binary.left)?;
-                let right = self.lower_expr(&binary.right)?;
-                let operator = match binary.op {
-                    BinOp::Add(_) => quote!(+),
-                    BinOp::Sub(_) => quote!(-),
-                    BinOp::Mul(_) => quote!(*),
-                    BinOp::Div(_) => quote!(/),
-                    _ => {
-                        return Err(syn::Error::new_spanned(
-                            binary.op,
-                            "operator is not supported in this kernel subset",
-                        ));
-                    }
-                };
-                Ok(self.emit(quote!(#left #operator #right)))
-            }
-            Expr::Unary(unary) if matches!(unary.op, UnOp::Neg(_)) => {
+            Expr::Lit(literal) => self.lower_literal(literal),
+            Expr::Binary(binary) => self.lower_binary(binary),
+            Expr::Unary(unary) => {
                 let value = self.lower_expr(&unary.expr)?;
-                Ok(self.emit(quote!(-#value)))
+                match unary.op {
+                    UnOp::Neg(_) if value.ty == ValueType::F32 => {
+                        let ident = value.ident;
+                        Ok(self.emit(quote!(-#ident), ValueType::F32, unary.span()))
+                    }
+                    _ => Err(kernel_error(
+                        unary.op,
+                        format!(
+                            "operator is not supported for `{}` in kernels",
+                            value.ty.name()
+                        ),
+                    )),
+                }
             }
             Expr::MethodCall(call) => self.lower_method(call),
             Expr::Paren(paren) => self.lower_expr(&paren.expr),
             Expr::Group(group) => self.lower_expr(&group.expr),
             Expr::Block(block) => match self.lower_block(&block.block)? {
                 BlockResult::Value(value) => Ok(value),
-                BlockResult::Tuple(_) => Err(syn::Error::new_spanned(
+                BlockResult::Tuple(_) => Err(kernel_error(
                     block,
                     "tuple values are only supported as the kernel's final expression",
                 )),
             },
-            Expr::Tuple(tuple) => Err(syn::Error::new_spanned(
+            Expr::Tuple(tuple) => Err(kernel_error(
                 tuple,
                 "tuple values are only supported as the kernel's final expression",
             )),
-            _ => Err(syn::Error::new_spanned(
+            Expr::Loop(loop_expression) => Err(kernel_error(
+                loop_expression.loop_token,
+                "loops are not supported in kernels; express the computation per element, or reduce with `.row_sum()`/`.row_max()`/`.row_min()`",
+            )),
+            Expr::ForLoop(loop_expression) => Err(kernel_error(
+                loop_expression.for_token,
+                "loops are not supported in kernels; express the computation per element, or reduce with `.row_sum()`/`.row_max()`/`.row_min()`",
+            )),
+            Expr::While(loop_expression) => Err(kernel_error(
+                loop_expression.while_token,
+                "loops are not supported in kernels; express the computation per element, or reduce with `.row_sum()`/`.row_max()`/`.row_min()`",
+            )),
+            Expr::Closure(closure) => Err(kernel_error(
+                closure,
+                "closures are not supported in kernels; use a `#[kernel(helper)]` fn",
+            )),
+            Expr::Return(return_expression) => Err(kernel_error(
+                return_expression.return_token,
+                "early `return` is not supported; the last expression is the kernel's output",
+            )),
+            Expr::Index(index) => Err(kernel_error(
+                index.bracket_token.span.open(),
+                "indexing is not supported (no gather in step 3 IR); bind a sliced view at the call site",
+            )),
+            Expr::Assign(assign) => Err(kernel_error(
+                assign.eq_token,
+                "`let mut` and assignment are not supported; shadow with a new `let`",
+            )),
+            Expr::Macro(mac) => Err(kernel_error(
+                mac,
+                "macro calls are not supported in kernels",
+            )),
+            _ => Err(kernel_error(
                 expression,
                 "expression is not supported in this kernel subset",
             )),
         }
     }
 
-    fn lower_path(&mut self, path: &syn::ExprPath) -> syn::Result<Ident> {
+    fn lower_literal(&mut self, literal: &syn::ExprLit) -> syn::Result<Value> {
+        let context = self.context.clone();
+        match &literal.lit {
+            Lit::Int(value) => {
+                if !matches!(value.suffix(), "" | "u32") {
+                    return Err(kernel_error(value, "integer literals must have type `u32`"));
+                }
+                let parsed = value.base10_parse::<u64>()?;
+                if parsed > 16_777_216 {
+                    return Err(kernel_error(
+                        value,
+                        format!(
+                            "integer literal `{value}` exceeds 2^24 and is not exactly representable"
+                        ),
+                    ));
+                }
+                let constant = self.emit(
+                    quote!(#context.constant(#value as f32)),
+                    ValueType::F32,
+                    value.span(),
+                );
+                let constant = constant.ident;
+                Ok(self.emit(quote!(#constant.cast_u32()), ValueType::U32, value.span()))
+            }
+            Lit::Bool(value) => Ok(self.emit(
+                quote!(#context.boolean(#value)),
+                ValueType::Bool,
+                value.span(),
+            )),
+            Lit::Float(value) => Err(kernel_error(
+                value,
+                "float literal could not be lowered as an f32 constant",
+            )),
+            _ => Err(kernel_error(literal, "literal is not supported in kernels")),
+        }
+    }
+
+    fn lower_path(&mut self, path: &syn::ExprPath) -> syn::Result<Value> {
         if path.qself.is_some() || path.path.segments.len() != 1 {
-            return Err(syn::Error::new_spanned(
-                path,
-                "outer constants must have type `f32`",
-            ));
+            return Err(kernel_error(path, "outer constants must have type `f32`"));
         }
         let name = path.path.segments[0].ident.to_string();
         match self.bindings.get(&name).cloned() {
             Some(Binding::Value(value)) => Ok(value),
-            Some(Binding::Parameter(Parameter::Tensor {
-                slot,
-                compute: ComputeType::F32,
-            })) => {
+            Some(Binding::Parameter(Parameter::Tensor { slot, compute, .. })) => {
+                self.used_tensors.insert(name);
                 if let Some(value) = self.inputs.get(&slot) {
                     return Ok(value.clone());
                 }
-                let context = &self.context;
-                let value = self.emit(quote!(#context.input(#slot)));
+                let context = self.context.clone();
+                let ty = compute_type(compute);
+                let expression = match compute {
+                    ComputeType::F32 => quote!(#context.input(#slot)),
+                    ComputeType::U32 => quote!(#context.input_u32(#slot)),
+                };
+                let value = self.emit(expression, ty, path.span());
                 self.inputs.insert(slot, value.clone());
                 Ok(value)
             }
-            Some(Binding::Parameter(Parameter::Scalar(ComputeType::F32))) => {
+            Some(Binding::Parameter(Parameter::Scalar(compute))) => {
                 let ident = &path.path.segments[0].ident;
-                let context = &self.context;
-                Ok(self.emit(quote!(#context.constant(#ident))))
+                let context = self.context.clone();
+                match compute {
+                    ComputeType::F32 => Ok(self.emit(
+                        quote!(#context.constant(#ident)),
+                        ValueType::F32,
+                        path.span(),
+                    )),
+                    ComputeType::U32 => {
+                        let constant = self.emit(
+                            quote!(#context.constant(#ident as f32)),
+                            ValueType::F32,
+                            path.span(),
+                        );
+                        let constant = constant.ident;
+                        Ok(self.emit(quote!(#constant.cast_u32()), ValueType::U32, path.span()))
+                    }
+                }
             }
-            Some(Binding::Parameter(_)) => Err(syn::Error::new_spanned(
-                path,
-                "u32 expressions are outside the core kernel subset",
-            )),
-            None => Err(syn::Error::new_spanned(path, "unknown kernel binding")),
+            None => Err(kernel_error(path, "unknown kernel binding")),
         }
     }
 
-    fn lower_method(&mut self, call: &ExprMethodCall) -> syn::Result<Ident> {
-        if call.turbofish.is_some() {
-            return Err(syn::Error::new_spanned(
-                call,
+    fn lower_binary(&mut self, binary: &ExprBinary) -> syn::Result<Value> {
+        let left = self.lower_expr(&binary.left)?;
+        let right = self.lower_expr(&binary.right)?;
+        if left.ty != ValueType::F32 || right.ty != ValueType::F32 {
+            return Err(type_mismatch(binary.op.span(), ValueType::F32, right.ty));
+        }
+        let operator = match binary.op {
+            BinOp::Add(_) => quote!(+),
+            BinOp::Sub(_) => quote!(-),
+            BinOp::Mul(_) => quote!(*),
+            BinOp::Div(_) => quote!(/),
+            _ => {
+                return Err(kernel_error(
+                    binary.op,
+                    "operator is not supported in this kernel subset",
+                ));
+            }
+        };
+        let left = left.ident;
+        let right = right.ident;
+        Ok(self.emit(
+            quote!(#left #operator #right),
+            ValueType::F32,
+            binary.span(),
+        ))
+    }
+
+    fn lower_method(&mut self, call: &ExprMethodCall) -> syn::Result<Value> {
+        if let Some(turbofish) = &call.turbofish {
+            return Err(kernel_error(
+                turbofish,
                 "turbofish is not supported in kernels",
             ));
         }
         let name = call.method.to_string();
-        if matches!(name.as_str(), "max" | "min") {
-            return Err(syn::Error::new_spanned(
-                call,
-                "use `maximum`/`minimum` for NaN-propagating f32 semantics",
+        let receiver = self.lower_expr(&call.receiver)?;
+        if matches!(name.as_str(), "max" | "min")
+            && receiver.ty == ValueType::F32
+            && call.args.is_empty()
+        {
+            let replacement = if name == "max" { "row_max" } else { "row_min" };
+            return Err(kernel_error(
+                &call.method,
+                format!("use `.{replacement}()` for row reductions"),
             ));
         }
-        if let Some(arity) = method_arity(&name)
+        if matches!(name.as_str(), "max" | "min") && receiver.ty == ValueType::F32 {
+            let replacement = if name == "max" { "maximum" } else { "minimum" };
+            return Err(kernel_error(
+                &call.method,
+                format!(
+                    "`.{name}(b)` on f32 is not supported; use `f32::{replacement}` for NaN-propagating semantics"
+                ),
+            ));
+        }
+        if let Some(arity) = method_arity(&name, receiver.ty)
             && call.args.len() != arity
         {
-            return Err(syn::Error::new_spanned(
-                call,
-                method_arity_error(&name, arity),
-            ));
+            return Err(kernel_error(&call.method, method_arity_error(&name, arity)));
         }
-        let receiver = self.lower_expr(&call.receiver)?;
         if name == "powi" {
+            if receiver.ty != ValueType::F32 {
+                return Err(unknown_method(&call.method, receiver.ty));
+            }
             let exponent = powi_exponent(call.args.first().ok_or_else(|| {
-                syn::Error::new_spanned(call, "`powi` requires an integer literal")
+                kernel_error(&call.method, "`powi` requires an integer literal")
             })?)?;
-            let context = &self.context;
-            let exponent = self.emit(quote!(#context.constant(#exponent as f32)));
-            return Ok(self.emit(quote!(#receiver.powf(#exponent))));
+            let context = self.context.clone();
+            let exponent = self.emit(
+                quote!(#context.constant(#exponent as f32)),
+                ValueType::F32,
+                call.span(),
+            );
+            let receiver = receiver.ident;
+            let exponent = exponent.ident;
+            return Ok(self.emit(
+                quote!(#receiver.powf(#exponent)),
+                ValueType::F32,
+                call.span(),
+            ));
         }
         let arguments = call
             .args
             .iter()
             .map(|argument| self.lower_expr(argument))
             .collect::<syn::Result<Vec<_>>>()?;
-        match (name.as_str(), arguments.as_slice()) {
+        self.lower_typed_method(call, receiver, &arguments)
+    }
+
+    fn lower_typed_method(
+        &mut self,
+        call: &ExprMethodCall,
+        receiver: Value,
+        arguments: &[Value],
+    ) -> syn::Result<Value> {
+        let name = call.method.to_string();
+        match (receiver.ty, name.as_str(), arguments) {
             (
+                ValueType::F32,
                 "abs" | "exp" | "ln" | "sqrt" | "rsqrt" | "recip" | "sin" | "cos" | "tanh"
                 | "sigmoid" | "floor",
                 [],
             ) => {
+                let receiver = receiver.ident;
                 let method = &call.method;
-                Ok(self.emit(quote!(#receiver.#method())))
+                Ok(self.emit(quote!(#receiver.#method()), ValueType::F32, call.span()))
             }
-            ("maximum" | "minimum" | "powf", [argument]) => {
+            (ValueType::F32, "maximum" | "minimum" | "powf", [argument]) => {
+                require_type(argument, ValueType::F32)?;
+                let receiver = receiver.ident;
+                let argument = &argument.ident;
                 let method = &call.method;
-                Ok(self.emit(quote!(#receiver.#method(#argument))))
+                Ok(self.emit(
+                    quote!(#receiver.#method(#argument)),
+                    ValueType::F32,
+                    call.span(),
+                ))
             }
-            ("clamp", [low, high]) => {
-                let maximum = self.emit(quote!(#receiver.maximum(#low)));
-                Ok(self.emit(quote!(#maximum.minimum(#high))))
+            (ValueType::F32, "clamp", [low, high]) => {
+                require_type(low, ValueType::F32)?;
+                require_type(high, ValueType::F32)?;
+                let receiver = receiver.ident;
+                let low = &low.ident;
+                let high = &high.ident;
+                let maximum =
+                    self.emit(quote!(#receiver.maximum(#low)), ValueType::F32, call.span());
+                let maximum = maximum.ident;
+                Ok(self.emit(quote!(#maximum.minimum(#high)), ValueType::F32, call.span()))
             }
-            ("ceil", []) => {
-                let negative = self.emit(quote!(-#receiver));
-                let floor = self.emit(quote!(#negative.floor()));
-                Ok(self.emit(quote!(-#floor)))
+            (ValueType::F32, "ceil", []) => {
+                let receiver = receiver.ident;
+                let negative = self.emit(quote!(-#receiver), ValueType::F32, call.span());
+                let negative = negative.ident;
+                let floor = self.emit(quote!(#negative.floor()), ValueType::F32, call.span());
+                let floor = floor.ident;
+                Ok(self.emit(quote!(-#floor), ValueType::F32, call.span()))
             }
-            ("log2", []) => {
-                let logarithm = self.emit(quote!(#receiver.ln()));
-                let context = &self.context;
-                let scale = self.emit(quote!(#context.constant(::core::f32::consts::LOG2_E)));
-                Ok(self.emit(quote!(#logarithm * #scale)))
+            (ValueType::F32, "log2" | "log10", []) => {
+                let receiver = receiver.ident;
+                let logarithm = self.emit(quote!(#receiver.ln()), ValueType::F32, call.span());
+                let context = self.context.clone();
+                let scale = if name == "log2" {
+                    quote!(::core::f32::consts::LOG2_E)
+                } else {
+                    quote!(::core::f32::consts::LOG10_E)
+                };
+                let scale = self.emit(
+                    quote!(#context.constant(#scale)),
+                    ValueType::F32,
+                    call.span(),
+                );
+                let logarithm = logarithm.ident;
+                let scale = scale.ident;
+                Ok(self.emit(quote!(#logarithm * #scale), ValueType::F32, call.span()))
             }
-            ("log10", []) => {
-                let logarithm = self.emit(quote!(#receiver.ln()));
-                let context = &self.context;
-                let scale = self.emit(quote!(#context.constant(::core::f32::consts::LOG10_E)));
-                Ok(self.emit(quote!(#logarithm * #scale)))
+            (ValueType::F32, "exp2", []) => {
+                let context = self.context.clone();
+                let scale = self.emit(
+                    quote!(#context.constant(::core::f32::consts::LN_2)),
+                    ValueType::F32,
+                    call.span(),
+                );
+                let receiver = receiver.ident;
+                let scale = scale.ident;
+                let product = self.emit(quote!(#receiver * #scale), ValueType::F32, call.span());
+                let product = product.ident;
+                Ok(self.emit(quote!(#product.exp()), ValueType::F32, call.span()))
             }
-            ("exp2", []) => {
-                let context = &self.context;
-                let scale = self.emit(quote!(#context.constant(::core::f32::consts::LN_2)));
-                let product = self.emit(quote!(#receiver * #scale));
-                Ok(self.emit(quote!(#product.exp())))
-            }
-            _ => Err(syn::Error::new_spanned(
-                call,
-                format!("method `{name}` is not supported in this kernel subset"),
-            )),
+            _ => Err(unknown_method(&call.method, receiver.ty)),
         }
     }
 
@@ -312,24 +531,18 @@ impl Lowerer {
             Expr::Lit(literal) => match &literal.lit {
                 Lit::Float(value) => {
                     if !matches!(value.suffix(), "" | "f32") {
-                        return Err(syn::Error::new_spanned(
-                            value,
-                            "kernel float literals must be f32",
-                        ));
+                        return Err(kernel_error(value, "float literals must have type `f32`"));
                     }
                     let parsed = value.base10_parse::<f32>()?;
                     if !parsed.is_finite() {
-                        return Err(syn::Error::new_spanned(
+                        return Err(kernel_error(
                             value,
-                            "kernel float literal is not finite in f32",
+                            format!("float literal `{value}` is not finite in f32"),
                         ));
                     }
                     Ok(Some(quote!(#value)))
                 }
-                _ => Err(syn::Error::new_spanned(
-                    literal,
-                    "only float literals are supported in the core kernel subset",
-                )),
+                _ => Ok(None),
             },
             Expr::Path(path) if self.is_outer_constant(path) => Ok(Some(quote!(#path))),
             Expr::Unary(unary) if matches!(unary.op, UnOp::Neg(_)) => Ok(self
@@ -368,26 +581,35 @@ impl Lowerer {
 
     #[allow(
         clippy::needless_pass_by_value,
-        reason = "lowering transfers each constructed token stream into one statement"
+        reason = "each constructed token stream is transferred into one statement"
     )]
-    fn emit(&mut self, expression: TokenStream) -> Ident {
-        let value = format_ident!(
+    fn emit(&mut self, expression: TokenStream, ty: ValueType, span: Span) -> Value {
+        let ident = format_ident!(
             "__forja_value_{}",
-            self.next_value,
+            self.statements.len(),
             span = Span::mixed_site()
         );
-        self.next_value += 1;
-        self.statements.push(quote!(let #value = #expression;));
-        value
+        self.statements.push(quote!(let #ident = #expression;));
+        Value { ident, ty, span }
     }
 }
 
-fn method_arity(name: &str) -> Option<usize> {
-    match name {
-        "abs" | "exp" | "ln" | "sqrt" | "rsqrt" | "recip" | "sin" | "cos" | "tanh" | "sigmoid"
-        | "floor" | "ceil" | "log2" | "log10" | "exp2" => Some(0),
-        "maximum" | "minimum" | "powf" | "powi" => Some(1),
-        "clamp" => Some(2),
+fn compute_type(ty: ComputeType) -> ValueType {
+    match ty {
+        ComputeType::F32 => ValueType::F32,
+        ComputeType::U32 => ValueType::U32,
+    }
+}
+
+fn method_arity(name: &str, ty: ValueType) -> Option<usize> {
+    match (ty, name) {
+        (
+            ValueType::F32,
+            "abs" | "exp" | "ln" | "sqrt" | "rsqrt" | "recip" | "sin" | "cos" | "tanh" | "sigmoid"
+            | "floor" | "ceil" | "log2" | "log10" | "exp2",
+        ) => Some(0),
+        (ValueType::F32, "maximum" | "minimum" | "powf" | "powi") => Some(1),
+        (ValueType::F32, "clamp") => Some(2),
         _ => None,
     }
 }
@@ -402,43 +624,93 @@ fn method_arity_error(name: &str, arity: usize) -> String {
     format!("`{name}` takes {arguments}")
 }
 
-fn binding_pattern(pattern: &Pat) -> syn::Result<(String, Option<&Type>)> {
+fn binding_pattern(pattern: &Pat) -> syn::Result<(String, Option<(ValueType, Span)>)> {
     let (pattern, ty) = match pattern {
         Pat::Type(pattern) => (&*pattern.pat, Some(&*pattern.ty)),
         pattern => (pattern, None),
     };
     let Pat::Ident(pattern) = pattern else {
-        return Err(syn::Error::new_spanned(
+        return Err(kernel_error(
             pattern,
             "kernel `let` patterns must be identifiers",
         ));
     };
-    if pattern.by_ref.is_some() || pattern.mutability.is_some() || pattern.subpat.is_some() {
-        return Err(syn::Error::new_spanned(
+    if let Some(mutability) = pattern.mutability {
+        return Err(kernel_error(
+            mutability,
+            "`let mut` and assignment are not supported; shadow with a new `let`",
+        ));
+    }
+    if pattern.by_ref.is_some() || pattern.subpat.is_some() {
+        return Err(kernel_error(
             pattern,
             "kernel `let` bindings must be immutable identifiers",
         ));
     }
-    Ok((pattern.ident.to_string(), ty))
+    let annotation = ty
+        .map(|ty| {
+            value_type(ty)
+                .map(|value| (value, ty.span()))
+                .ok_or_else(|| kernel_error(ty, "kernel bindings may be `f32`, `u32`, or `bool`"))
+        })
+        .transpose()?;
+    Ok((pattern.ident.to_string(), annotation))
 }
 
-fn require_f32(ty: &Type) -> syn::Result<()> {
-    if type_ident(ty).is_some_and(|ident| ident == "f32") {
-        Ok(())
-    } else {
-        Err(syn::Error::new_spanned(
-            ty,
-            "core kernel `let` annotations must be `f32`",
-        ))
+fn value_type(ty: &Type) -> Option<ValueType> {
+    let Type::Path(path) = ty else { return None };
+    let ident = path
+        .qself
+        .is_none()
+        .then(|| path.path.get_ident())
+        .flatten()?;
+    match ident.to_string().as_str() {
+        "f32" => Some(ValueType::F32),
+        "u32" => Some(ValueType::U32),
+        "bool" => Some(ValueType::Bool),
+        _ => None,
     }
 }
 
-fn type_ident(ty: &Type) -> Option<&Ident> {
-    let Type::Path(path) = ty else { return None };
-    path.qself
-        .is_none()
-        .then(|| path.path.get_ident())
-        .flatten()
+fn require_type(value: &Value, expected: ValueType) -> syn::Result<()> {
+    if value.ty == expected {
+        Ok(())
+    } else {
+        Err(type_mismatch(value.span, expected, value.ty))
+    }
+}
+
+fn type_mismatch(span: impl Spanned, expected: ValueType, found: ValueType) -> syn::Error {
+    let help = if expected == ValueType::F32 && found == ValueType::U32 {
+        "; add `as f32`"
+    } else {
+        ""
+    };
+    kernel_error(
+        span,
+        format!(
+            "mismatched types: expected `{}`, found `{}`{help}",
+            expected.name(),
+            found.name()
+        ),
+    )
+}
+
+fn unknown_method(method: &Ident, ty: ValueType) -> syn::Error {
+    let supported = match ty {
+        ValueType::F32 => {
+            "abs, exp, ln, sqrt, rsqrt, recip, sin, cos, tanh, sigmoid, floor, maximum, minimum, powf, powi, clamp, ceil, log2, log10, exp2, row_sum, row_max, row_min, row_mean"
+        }
+        ValueType::U32 => "wrapping_add, wrapping_sub, wrapping_mul, min, max",
+        ValueType::Bool => "none",
+    };
+    kernel_error(
+        method,
+        format!(
+            "unknown method `{method}` on `{}`; supported: {supported}",
+            ty.name()
+        ),
+    )
 }
 
 fn powi_exponent(expression: &Expr) -> syn::Result<i32> {
@@ -446,7 +718,7 @@ fn powi_exponent(expression: &Expr) -> syn::Result<i32> {
         Expr::Lit(literal) => (false, literal),
         Expr::Unary(unary) if matches!(unary.op, UnOp::Neg(_)) => {
             let Expr::Lit(literal) = &*unary.expr else {
-                return Err(syn::Error::new_spanned(
+                return Err(kernel_error(
                     expression,
                     "`powi` requires an integer literal",
                 ));
@@ -454,14 +726,14 @@ fn powi_exponent(expression: &Expr) -> syn::Result<i32> {
             (true, literal)
         }
         _ => {
-            return Err(syn::Error::new_spanned(
+            return Err(kernel_error(
                 expression,
                 "`powi` requires an integer literal",
             ));
         }
     };
     let Lit::Int(literal) = &literal.lit else {
-        return Err(syn::Error::new_spanned(
+        return Err(kernel_error(
             expression,
             "`powi` requires an integer literal",
         ));
@@ -470,8 +742,16 @@ fn powi_exponent(expression: &Expr) -> syn::Result<i32> {
     if negative {
         value
             .checked_neg()
-            .ok_or_else(|| syn::Error::new_spanned(expression, "`powi` exponent is out of range"))
+            .ok_or_else(|| kernel_error(expression, "`powi` exponent is out of range"))
     } else {
         Ok(value)
     }
+}
+
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "accepting tokens and spans by value keeps diagnostic call sites uniform"
+)]
+fn kernel_error(span: impl Spanned, message: impl std::fmt::Display) -> syn::Error {
+    syn::Error::new(span.span(), format!("kernel: {message}"))
 }

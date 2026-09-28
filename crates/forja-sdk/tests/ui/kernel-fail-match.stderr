@@ -1,5 +1,5 @@
-error: expression is not supported in this kernel subset
+error: kernel: expression is not supported in this kernel subset
  --> tests/ui/kernel-fail-match.rs:3:5
   |
 3 |     match x { value => value }
-  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |     ^^^^^

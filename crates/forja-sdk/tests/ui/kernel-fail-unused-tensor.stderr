@@ -1,0 +1,5 @@
+error: kernel: tensor parameter `w` is never used (every input slot must be read)
+ --> tests/ui/kernel-fail-unused-tensor.rs:4:5
+  |
+4 |     w: forja_sdk::kernel::Elem,
+  |     ^

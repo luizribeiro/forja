@@ -1,0 +1,5 @@
+error: kernel: generic parameters are not allowed; storage dtypes are chosen at the call site
+ --> tests/ui/kernel-fail-generic.rs:2:11
+  |
+2 | fn generic<T>(x: forja_sdk::kernel::Elem) -> forja_sdk::kernel::Elem {
+  |           ^^^

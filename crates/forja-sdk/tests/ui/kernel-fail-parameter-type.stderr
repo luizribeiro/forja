@@ -1,0 +1,5 @@
+error: kernel: parameter `x: &Tensor<f32>` is not a kernel type; use `Row`/`Elem` for tensors or `f32`/`u32` for constants
+ --> tests/ui/kernel-fail-parameter-type.rs:5:22
+  |
+5 | fn parameter_type(x: &Tensor<f32>) -> forja_sdk::kernel::Elem {
+  |                      ^^^^^^^^^^^^

@@ -1,0 +1,5 @@
+error: kernel: output 1 has type `bool`; kernel outputs must be `f32`
+ --> tests/ui/kernel-fail-output-bool.rs:5:9
+  |
+5 |     (x, true)
+  |         ^^^^

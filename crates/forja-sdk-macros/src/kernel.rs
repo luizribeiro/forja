@@ -3,7 +3,7 @@ mod lower;
 use std::collections::HashMap;
 
 use proc_macro2::{Ident, Span, TokenStream};
-use quote::{format_ident, quote};
+use quote::{ToTokens, format_ident, quote};
 use syn::{FnArg, GenericArgument, ItemFn, Pat, PathArguments, ReturnType, Type, spanned::Spanned};
 
 use lower::{Parameter, lower};
@@ -104,7 +104,11 @@ impl KernelFunction {
             } else {
                 return Err(syn::Error::new_spanned(
                     &argument.ty,
-                    "kernel parameters must be `Elem`/`Row`, `f32`, or `u32`",
+                    format!(
+                        "kernel: parameter `{}: {}` is not a kernel type; use `Row`/`Elem` for tensors or `f32`/`u32` for constants",
+                        pattern.ident,
+                        type_name(&argument.ty),
+                    ),
                 ));
             }
         }
@@ -346,6 +350,7 @@ impl KernelFunction {
                     Parameter::Tensor {
                         slot: tensor.slot,
                         compute: tensor.compute,
+                        span: tensor.ident.span(),
                     },
                 )
             })
@@ -457,11 +462,16 @@ fn parse_kind(attribute: TokenStream) -> syn::Result<KernelKind> {
 
 fn validate_modifiers(item: &ItemFn) -> syn::Result<()> {
     let signature = &item.sig;
+    if !signature.generics.params.is_empty() {
+        return Err(syn::Error::new_spanned(
+            &signature.generics,
+            "kernel: generic parameters are not allowed; storage dtypes are chosen at the call site",
+        ));
+    }
     if signature.constness.is_some()
         || signature.asyncness.is_some()
         || signature.unsafety.is_some()
         || signature.abi.is_some()
-        || !signature.generics.params.is_empty()
         || signature.variadic.is_some()
     {
         return Err(syn::Error::new_spanned(
@@ -520,6 +530,10 @@ fn scalar_type(ty: &Type) -> Option<ComputeType> {
         "u32" => Some(ComputeType::U32),
         _ => None,
     }
+}
+
+fn type_name(ty: &Type) -> String {
+    ty.to_token_stream().to_string().replace(' ', "")
 }
 
 fn output_count(output: &ReturnType, kind: KernelKind) -> syn::Result<usize> {
