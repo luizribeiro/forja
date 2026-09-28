@@ -283,6 +283,7 @@ pub struct PreparedProgram {
     validated: ValidatedProgram,
     signature: KernelSignature,
     backend: Box<dyn Any + Send + Sync>,
+    _retained: Option<Box<dyn Any + Send + Sync>>,
 }
 
 impl fmt::Debug for PreparedProgram {
@@ -365,6 +366,31 @@ pub fn prepare_program<B: Backend>(
     validated: ValidatedProgram,
     signature: KernelSignature,
 ) -> Result<Arc<PreparedProgram>, PrepareError> {
+    prepare_program_inner(backend, validated, signature, None)
+}
+
+/// Prepares a program while retaining host-owned lifetime state.
+///
+/// # Errors
+///
+/// Returns [`PrepareError`] when the signature is inconsistent with the program or the backend
+/// refuses preparation.
+#[doc(hidden)]
+pub fn prepare_program_retained<B: Backend>(
+    backend: &B,
+    validated: ValidatedProgram,
+    signature: KernelSignature,
+    retained: Box<dyn Any + Send + Sync>,
+) -> Result<Arc<PreparedProgram>, PrepareError> {
+    prepare_program_inner(backend, validated, signature, Some(retained))
+}
+
+fn prepare_program_inner<B: Backend>(
+    backend: &B,
+    validated: ValidatedProgram,
+    signature: KernelSignature,
+    retained: Option<Box<dyn Any + Send + Sync>>,
+) -> Result<Arc<PreparedProgram>, PrepareError> {
     validate_signature(&validated, &signature)?;
     let handle = backend
         .prepare_program(&validated, &signature)
@@ -373,6 +399,7 @@ pub fn prepare_program<B: Backend>(
         validated,
         signature,
         backend: Box::new(handle),
+        _retained: retained,
     }))
 }
 
