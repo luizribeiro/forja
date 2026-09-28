@@ -1,6 +1,9 @@
-use std::{error::Error, fmt};
+use std::{error::Error, fmt, sync::Arc};
 
-use crate::program::{BindError, BoundProgram, ProgramHash, ValidatedProgram, bind_program};
+use crate::program::{
+    BindError, BoundProgram, KernelSignature, PreparedProgram, ProgramHash, ValidatedProgram,
+    bind_program,
+};
 use crate::{DType, Layout, byte_ranges_overlap, is_injective};
 
 /// An opaque allocation identity unique to one backend instance.
@@ -171,6 +174,8 @@ pub enum OpError {
     ProgramRequiresBinding,
     /// Tensor views do not satisfy a scalar program's signature.
     ProgramBinding(BindError),
+    /// Tensor types or rank differ from a prepared program's signature.
+    ProgramSignature,
     /// The operation received the wrong number of inputs.
     Arity {
         /// The required count.
@@ -226,7 +231,13 @@ pub struct Dispatch {
     op: Op,
     inputs: Vec<Tensor>,
     output: Tensor,
-    program: Option<BoundProgram>,
+    program: Option<ProgramDispatch>,
+}
+
+#[derive(Clone, Debug)]
+struct ProgramDispatch {
+    bound: BoundProgram,
+    prepared: Option<Arc<PreparedProgram>>,
 }
 
 impl Dispatch {
@@ -251,13 +262,24 @@ impl Dispatch {
     pub fn outputs(&self) -> &[Tensor] {
         self.program
             .as_ref()
-            .map_or(std::slice::from_ref(&self.output), BoundProgram::outputs)
+            .map_or(std::slice::from_ref(&self.output), |program| {
+                program.bound.outputs()
+            })
     }
 
     /// Returns the bound scalar program, when this is a program dispatch.
     #[must_use]
     pub const fn bound_program(&self) -> Option<&BoundProgram> {
-        self.program.as_ref()
+        match &self.program {
+            Some(program) => Some(&program.bound),
+            None => None,
+        }
+    }
+
+    /// Returns retained preparation state for a prepared-program dispatch.
+    #[must_use]
+    pub fn prepared_program(&self) -> Option<&Arc<PreparedProgram>> {
+        self.program.as_ref()?.prepared.as_ref()
     }
 }
 
@@ -346,7 +368,47 @@ impl CommandList {
             op: Op::Program(bound.content_hash()),
             inputs: bound.inputs().to_vec(),
             output,
-            program: Some(bound),
+            program: Some(ProgramDispatch {
+                bound,
+                prepared: None,
+            }),
+        });
+        Ok(())
+    }
+
+    /// Binds, validates, and records a prepared scalar-program dispatch.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OpError::ProgramBinding`] for invalid tensor views and
+    /// [`OpError::ProgramSignature`] when their types or rank differ from the prepared signature.
+    pub fn dispatch_kernel(
+        &mut self,
+        program: &Arc<PreparedProgram>,
+        inputs: &[&Tensor],
+        outputs: &[&Tensor],
+    ) -> Result<(), OpError> {
+        let output = outputs
+            .first()
+            .copied()
+            .ok_or(OpError::ProgramBinding(BindError::NoOutputs))?;
+        check_common(inputs, output)?;
+        let bound =
+            bind_program(program.validated(), inputs, outputs).map_err(OpError::ProgramBinding)?;
+        check_kernel_signature(&bound, program.signature())?;
+        let output = bound
+            .outputs()
+            .first()
+            .cloned()
+            .ok_or(OpError::ProgramBinding(BindError::NoOutputs))?;
+        self.dispatches.push(Dispatch {
+            op: Op::Program(program.validated().content_hash()),
+            inputs: bound.inputs().to_vec(),
+            output,
+            program: Some(ProgramDispatch {
+                bound,
+                prepared: Some(Arc::clone(program)),
+            }),
         });
         Ok(())
     }
@@ -355,6 +417,28 @@ impl CommandList {
     #[must_use]
     pub fn into_dispatches(self) -> Vec<Dispatch> {
         self.dispatches
+    }
+}
+
+fn check_kernel_signature(
+    program: &BoundProgram,
+    signature: &KernelSignature,
+) -> Result<(), OpError> {
+    let rank = program.outputs()[0].layout().shape().len();
+    let inputs_match = program
+        .inputs()
+        .iter()
+        .map(|tensor| tensor.layout().dtype())
+        .eq(signature.input_dtypes().iter().copied());
+    let outputs_match = program
+        .outputs()
+        .iter()
+        .map(|tensor| tensor.layout().dtype())
+        .eq(signature.output_dtypes().iter().copied());
+    if rank == usize::from(signature.rank()) && inputs_match && outputs_match {
+        Ok(())
+    } else {
+        Err(OpError::ProgramSignature)
     }
 }
 

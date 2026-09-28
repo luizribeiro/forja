@@ -726,7 +726,7 @@ mod tests {
     use super::*;
     use forja_core::{
         Op, Slice,
-        program::{BinOp, Inst, Program, ProgramKind, ValueType},
+        program::{BinOp, Inst, KernelSignature, Program, ProgramKind, ValueType, prepare_program},
     };
     use std::{
         fs,
@@ -783,6 +783,78 @@ mod tests {
             .concat()
         );
         assert_eq!(backend.read(&summed).unwrap(), f32_bytes(&[3.5, 3.0]));
+    }
+
+    #[test]
+    fn prepared_program_matches_by_value_dispatch() {
+        let backend = CpuBackend::new();
+        let input = backend.alloc(DType::F32, &[7, 1024]).unwrap();
+        backend
+            .write(&input, &f32_bytes(&vec![1.5; 7 * 1024]))
+            .unwrap();
+        let expected = backend.alloc(DType::F32, &[7, 1024]).unwrap();
+        let actual = backend.alloc(DType::F32, &[7, 1024]).unwrap();
+        let program = Program {
+            kind: ProgramKind::Map,
+            insts: vec![
+                Inst::Input(0),
+                Inst::Const(2.0),
+                Inst::Binary(BinOp::Add, 0, 1),
+            ],
+            outputs: vec![(0, 2)],
+        }
+        .validate()
+        .unwrap();
+        let prepared = prepare_program(
+            &backend,
+            program.clone(),
+            KernelSignature::new(2, vec![DType::F32], vec![DType::F32], 0),
+        )
+        .unwrap();
+        let mut commands = CommandList::new();
+        commands
+            .dispatch_program(&program, &[&input], &[&expected])
+            .unwrap();
+        commands
+            .dispatch_kernel(&prepared, &[&input], &[&actual])
+            .unwrap();
+        backend.submit(commands).unwrap().wait().unwrap();
+
+        assert_eq!(
+            backend.read(&actual).unwrap(),
+            backend.read(&expected).unwrap()
+        );
+    }
+
+    #[test]
+    fn prepared_dispatch_refuses_dtype_and_rank_mismatches() {
+        let backend = CpuBackend::new();
+        let program = Program {
+            kind: ProgramKind::Map,
+            insts: vec![Inst::Input(0)],
+            outputs: vec![(0, 0)],
+        }
+        .validate()
+        .unwrap();
+        let prepared = prepare_program(
+            &backend,
+            program,
+            KernelSignature::new(2, vec![DType::F32], vec![DType::F32], 0),
+        )
+        .unwrap();
+        let input = backend.alloc(DType::F16, &[7, 1024]).unwrap();
+        let output = backend.alloc(DType::F32, &[7, 1024]).unwrap();
+        assert_eq!(
+            CommandList::new().dispatch_kernel(&prepared, &[&input], &[&output]),
+            Err(forja_core::OpError::ProgramSignature)
+        );
+
+        let input = backend.alloc(DType::F32, &[1024]).unwrap();
+        let output = backend.alloc(DType::F32, &[1024]).unwrap();
+        assert_eq!(
+            CommandList::new().dispatch_kernel(&prepared, &[&input], &[&output]),
+            Err(forja_core::OpError::ProgramSignature)
+        );
     }
 
     #[test]
