@@ -1,0 +1,5 @@
+error: kernel: kernel helpers cannot call themselves
+ --> tests/ui/kernel-fail-helper-recursion.rs:3:5
+  |
+3 |     recursive(x)
+  |     ^^^^^^^^^

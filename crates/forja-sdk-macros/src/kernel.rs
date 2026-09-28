@@ -141,7 +141,13 @@ impl HelperFunction {
                 )
             })
             .collect::<HashMap<_, _>>();
-        let lowered = lower(&self.item.block, parameters, &context, self.kind)?;
+        let lowered = lower(
+            &self.item.block,
+            parameters,
+            &context,
+            self.kind,
+            Some(name),
+        )?;
         let [output] = lowered.outputs.as_slice() else {
             return Err(syn::Error::new_spanned(
                 &self.item.sig.output,
@@ -481,7 +487,7 @@ impl KernelFunction {
                     .map(|scalar| (scalar.ident.to_string(), Parameter::Scalar(scalar.compute))),
             )
             .collect::<HashMap<_, _>>();
-        let lowered = lower(&self.item.block, parameters, &context, self.kind)?;
+        let lowered = lower(&self.item.block, parameters, &context, self.kind, None)?;
         if lowered.outputs.len() != self.output_count {
             return Err(syn::Error::new_spanned(
                 &self.item.sig.output,

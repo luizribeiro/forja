@@ -30,6 +30,7 @@ pub(super) fn lower(
     parameters: HashMap<String, Parameter>,
     context: &Ident,
     kind: KernelKind,
+    helper: Option<&Ident>,
 ) -> syn::Result<Lowered> {
     let mut tensors = parameters
         .iter()
@@ -51,6 +52,7 @@ pub(super) fn lower(
         reduction_spans: Vec::new(),
         context: context.clone(),
         kind,
+        helper: helper.map(ToString::to_string),
     };
     let result = lowerer.lower_block(body)?;
     let outputs = match result {
@@ -148,6 +150,7 @@ struct Lowerer {
     reduction_spans: Vec<Span>,
     context: Ident,
     kind: KernelKind,
+    helper: Option<String>,
 }
 
 impl Lowerer {
@@ -777,6 +780,12 @@ impl Lowerer {
         };
         let name = segment.ident.to_string();
         if !matches!(name.as_str(), "index" | "extent") {
+            if self.helper.as_deref() == Some(name.as_str()) {
+                return Err(kernel_error(
+                    &segment.ident,
+                    "kernel helpers cannot call themselves",
+                ));
+            }
             let arguments = call
                 .args
                 .iter()
