@@ -369,7 +369,6 @@ impl<K: Clone + Eq + Hash, V> LruCache<K, V> {
         Some(&entry.value)
     }
 
-    #[cfg(test)]
     fn contains(&self, key: &K) -> bool {
         self.entries.contains_key(key)
     }
@@ -1154,6 +1153,7 @@ impl MetalBackend {
         for tensor in &tensors {
             self.validate(tensor)?;
         }
+        self.validate_program_compile_quota(&dispatches)?;
         let mut profile = PROFILE.then(|| SubmissionProfile {
             validation: validation_started.map_or(Duration::ZERO, |started| started.elapsed()),
             dispatches: u64::try_from(dispatches.len()).unwrap_or(u64::MAX),
@@ -1225,6 +1225,24 @@ impl MetalBackend {
             submission.dispatch_operations = operations;
         }
         Ok(submission)
+    }
+
+    fn validate_program_compile_quota(&self, dispatches: &[Dispatch]) -> Result<(), BackendError> {
+        let pipelines = self
+            .pipelines
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?;
+        let mut missing = HashSet::new();
+        for program in dispatches.iter().filter_map(Dispatch::bound_program) {
+            let key = ProgramPipelineKey::new(program);
+            if !pipelines.programs.contains(&key) {
+                missing.insert(key);
+                if missing.len() > MAX_PROGRAM_COMPILES_PER_SUBMISSION {
+                    return Err(BackendError::QuotaExceeded);
+                }
+            }
+        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_lines)]
@@ -3442,6 +3460,7 @@ pub(super) struct PipelineCache {
 }
 
 const PROGRAM_PIPELINE_CAPACITY: usize = 64;
+const MAX_PROGRAM_COMPILES_PER_SUBMISSION: usize = 4;
 
 impl PipelineCache {
     pub(super) fn new(
@@ -3615,6 +3634,44 @@ mod tests {
         assert_ne!(key, ProgramPipelineKey::new(&other_rank));
         assert_ne!(key, ProgramPipelineKey::new(&other_input));
         assert_ne!(key, ProgramPipelineKey::new(&other_output));
+    }
+
+    #[test]
+    fn program_compile_quota_rejects_before_compiling() {
+        let backend = MetalBackend::new().unwrap();
+        let mut commands = CommandList::new();
+        for value in 0..=MAX_PROGRAM_COMPILES_PER_SUBMISSION {
+            let input = backend.alloc(DType::F32, &[1]).unwrap();
+            let output = backend.alloc(DType::F32, &[1]).unwrap();
+            let constant = f32::from(u16::try_from(value).unwrap());
+            let program = Program {
+                kind: ProgramKind::Map,
+                insts: vec![
+                    Inst::Input(0),
+                    Inst::Const(constant),
+                    Inst::Binary(BinOp::Add, 0, 1),
+                ],
+                outputs: vec![(0, 2)],
+            }
+            .validate()
+            .unwrap();
+            commands
+                .dispatch_program(&program, &[&input], &[&output])
+                .unwrap();
+        }
+        assert!(matches!(
+            backend.submit(commands),
+            Err(BackendError::QuotaExceeded)
+        ));
+        assert!(
+            backend
+                .pipelines
+                .lock()
+                .unwrap()
+                .programs
+                .entries
+                .is_empty()
+        );
     }
 
     #[test]

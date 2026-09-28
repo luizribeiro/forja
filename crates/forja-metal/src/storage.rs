@@ -172,6 +172,7 @@ const DEFAULT_POOL_CAPACITY: u64 = 1 << 30;
 /// tensor cannot expose contents from an earlier allocation or another host store. Guest quotas
 /// and allocation counts cover live logical tensors; released buffers instead count toward this
 /// backend's separately capped pool using their page-rounded Metal allocation sizes.
+/// A submission may compile at most four cache-missing scalar programs.
 pub struct MetalBackend {
     pub(super) device: Retained<ProtocolObject<dyn MTLDevice>>,
     pub(super) queue: Retained<ProtocolObject<dyn MTL4CommandQueue>>,
