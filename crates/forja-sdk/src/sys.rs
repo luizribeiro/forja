@@ -102,6 +102,9 @@ pub(crate) mod guest {
 
     use super::{Backend, DType, Error, Op, Program, ProgramInst, Result, View};
     use crate::program::{BinaryOp, ProgramKind, ReduceOp, UnaryOp};
+    use compute::{
+        Binop as WitBinOp, Redop as WitRedOp, Unop as WitUnOp, ValueType as WitValueType,
+    };
     pub use l9o::gpu::compute;
 
     pub(crate) struct Guest;
@@ -269,52 +272,18 @@ pub(crate) mod guest {
             ProgramInst::Select(condition, accepted, rejected) => {
                 compute::Inst::Select((condition, accepted, rejected))
             }
-            ProgramInst::CastF32(value) => compute::Inst::Cast((compute::ValueType::F32, value)),
+            ProgramInst::CastF32(value) => compute::Inst::Cast((
+                forja_program_conversions::program_f32_value_type!(WitValueType),
+                value,
+            )),
             ProgramInst::Reduce(op, value) => compute::Inst::Reduce((wit_redop(op), value)),
         }
     }
 
-    fn wit_unop(op: UnaryOp) -> compute::Unop {
-        match op {
-            UnaryOp::Neg => compute::Unop::Neg,
-            UnaryOp::Abs => compute::Unop::Abs,
-            UnaryOp::Exp => compute::Unop::Exp,
-            UnaryOp::Log => compute::Unop::Log,
-            UnaryOp::Sqrt => compute::Unop::Sqrt,
-            UnaryOp::Rsqrt => compute::Unop::Rsqrt,
-            UnaryOp::Sin => compute::Unop::Sin,
-            UnaryOp::Cos => compute::Unop::Cos,
-            UnaryOp::Tanh => compute::Unop::Tanh,
-            UnaryOp::Sigmoid => compute::Unop::Sigmoid,
-            UnaryOp::Recip => compute::Unop::Recip,
-            UnaryOp::Floor => compute::Unop::Floor,
-        }
-    }
-
-    fn wit_binop(op: BinaryOp) -> compute::Binop {
-        match op {
-            BinaryOp::Add => compute::Binop::Add,
-            BinaryOp::Sub => compute::Binop::Sub,
-            BinaryOp::Mul => compute::Binop::Mul,
-            BinaryOp::Div => compute::Binop::Div,
-            BinaryOp::Min => compute::Binop::Min,
-            BinaryOp::Max => compute::Binop::Max,
-            BinaryOp::Pow => compute::Binop::Pow,
-            BinaryOp::Lt => compute::Binop::Lt,
-            BinaryOp::Le => compute::Binop::Le,
-            BinaryOp::Eq => compute::Binop::Eq,
-            BinaryOp::Ne => compute::Binop::Ne,
-            BinaryOp::Ge => compute::Binop::Ge,
-            BinaryOp::Gt => compute::Binop::Gt,
-        }
-    }
-
-    const fn wit_redop(op: ReduceOp) -> compute::Redop {
-        match op {
-            ReduceOp::Sum => compute::Redop::Sum,
-            ReduceOp::Max => compute::Redop::Max,
-            ReduceOp::Min => compute::Redop::Min,
-        }
+    forja_program_conversions::program_op_conversions! {
+        fn wit_unop(UnaryOp => WitUnOp);
+        fn wit_binop(BinaryOp => WitBinOp);
+        fn wit_redop(ReduceOp => WitRedOp);
     }
 
     fn guest_error(error: &compute::Error) -> Error {
@@ -403,7 +372,7 @@ pub(crate) mod native {
         DType as CoreDType, Op as CoreOp, Slice as CoreSlice, ViewOp,
         program::{
             BinOp, Inst, Program as CoreProgram, ProgramKind as CoreProgramKind, RedOp, UnOp,
-            ValueType,
+            ValueType as CoreValueType,
         },
     };
     use forja_host::{NativeCommandList, NativeHost, NativeTensor, Safetensors, WeightSource as _};
@@ -695,52 +664,18 @@ pub(crate) mod native {
             ProgramInst::Select(condition, accepted, rejected) => {
                 Inst::Select(condition, accepted, rejected)
             }
-            ProgramInst::CastF32(value) => Inst::Cast(ValueType::F32, value),
+            ProgramInst::CastF32(value) => Inst::Cast(
+                forja_program_conversions::program_f32_value_type!(CoreValueType),
+                value,
+            ),
             ProgramInst::Reduce(op, value) => Inst::Reduce(core_redop(op), value),
         }
     }
 
-    fn core_unop(op: UnaryOp) -> UnOp {
-        match op {
-            UnaryOp::Neg => UnOp::Neg,
-            UnaryOp::Abs => UnOp::Abs,
-            UnaryOp::Exp => UnOp::Exp,
-            UnaryOp::Log => UnOp::Log,
-            UnaryOp::Sqrt => UnOp::Sqrt,
-            UnaryOp::Rsqrt => UnOp::Rsqrt,
-            UnaryOp::Sin => UnOp::Sin,
-            UnaryOp::Cos => UnOp::Cos,
-            UnaryOp::Tanh => UnOp::Tanh,
-            UnaryOp::Sigmoid => UnOp::Sigmoid,
-            UnaryOp::Recip => UnOp::Recip,
-            UnaryOp::Floor => UnOp::Floor,
-        }
-    }
-
-    fn core_binop(op: BinaryOp) -> BinOp {
-        match op {
-            BinaryOp::Add => BinOp::Add,
-            BinaryOp::Sub => BinOp::Sub,
-            BinaryOp::Mul => BinOp::Mul,
-            BinaryOp::Div => BinOp::Div,
-            BinaryOp::Min => BinOp::Min,
-            BinaryOp::Max => BinOp::Max,
-            BinaryOp::Pow => BinOp::Pow,
-            BinaryOp::Lt => BinOp::Lt,
-            BinaryOp::Le => BinOp::Le,
-            BinaryOp::Eq => BinOp::Eq,
-            BinaryOp::Ne => BinOp::Ne,
-            BinaryOp::Ge => BinOp::Ge,
-            BinaryOp::Gt => BinOp::Gt,
-        }
-    }
-
-    const fn core_redop(op: ReduceOp) -> RedOp {
-        match op {
-            ReduceOp::Sum => RedOp::Sum,
-            ReduceOp::Max => RedOp::Max,
-            ReduceOp::Min => RedOp::Min,
-        }
+    forja_program_conversions::program_op_conversions! {
+        fn core_unop(UnaryOp => UnOp);
+        fn core_binop(BinaryOp => BinOp);
+        fn core_redop(ReduceOp => RedOp);
     }
 
     #[cfg(all(feature = "native-metal", target_os = "macos"))]

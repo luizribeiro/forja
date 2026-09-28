@@ -65,6 +65,7 @@ pub mod engine_bindings {
 }
 
 use bindings::l9o::gpu::compute;
+use compute::{Binop as WitBinOp, Redop as WitRedOp, Unop as WitUnOp, ValueType as WitValueType};
 
 /// Static metadata declared by an engine component.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1935,55 +1936,14 @@ fn core_inst(instruction: compute::Inst) -> Inst {
     }
 }
 
-fn core_unop(op: compute::Unop) -> UnOp {
-    match op {
-        compute::Unop::Neg => UnOp::Neg,
-        compute::Unop::Abs => UnOp::Abs,
-        compute::Unop::Exp => UnOp::Exp,
-        compute::Unop::Log => UnOp::Log,
-        compute::Unop::Sqrt => UnOp::Sqrt,
-        compute::Unop::Rsqrt => UnOp::Rsqrt,
-        compute::Unop::Sin => UnOp::Sin,
-        compute::Unop::Cos => UnOp::Cos,
-        compute::Unop::Tanh => UnOp::Tanh,
-        compute::Unop::Sigmoid => UnOp::Sigmoid,
-        compute::Unop::Recip => UnOp::Recip,
-        compute::Unop::Floor => UnOp::Floor,
-    }
+forja_program_conversions::program_op_conversions! {
+    fn core_unop(WitUnOp => UnOp);
+    fn core_binop(WitBinOp => BinOp);
+    fn core_redop(WitRedOp => RedOp);
 }
 
-fn core_binop(op: compute::Binop) -> BinOp {
-    match op {
-        compute::Binop::Add => BinOp::Add,
-        compute::Binop::Sub => BinOp::Sub,
-        compute::Binop::Mul => BinOp::Mul,
-        compute::Binop::Div => BinOp::Div,
-        compute::Binop::Min => BinOp::Min,
-        compute::Binop::Max => BinOp::Max,
-        compute::Binop::Pow => BinOp::Pow,
-        compute::Binop::Lt => BinOp::Lt,
-        compute::Binop::Le => BinOp::Le,
-        compute::Binop::Eq => BinOp::Eq,
-        compute::Binop::Ne => BinOp::Ne,
-        compute::Binop::Ge => BinOp::Ge,
-        compute::Binop::Gt => BinOp::Gt,
-    }
-}
-
-const fn core_redop(op: compute::Redop) -> RedOp {
-    match op {
-        compute::Redop::Sum => RedOp::Sum,
-        compute::Redop::Max => RedOp::Max,
-        compute::Redop::Min => RedOp::Min,
-    }
-}
-
-const fn core_value_type(value_type: compute::ValueType) -> ValueType {
-    match value_type {
-        compute::ValueType::F32 => ValueType::F32,
-        compute::ValueType::U32 => ValueType::U32,
-        compute::ValueType::Bool => ValueType::Bool,
-    }
+forja_program_conversions::program_value_type_conversion! {
+    fn core_value_type(WitValueType => ValueType);
 }
 
 fn program_error(error: &ProgramError) -> compute::Error {

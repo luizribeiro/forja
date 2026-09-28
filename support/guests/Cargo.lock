@@ -53,9 +53,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 
 [[package]]
+name = "forja-program-conversions"
+version = "0.0.0"
+
+[[package]]
 name = "forja-sdk"
 version = "0.0.0"
 dependencies = [
+ "forja-program-conversions",
  "forja-sdk-macros",
  "half",
  "wit-bindgen",

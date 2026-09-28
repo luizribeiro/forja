@@ -12,6 +12,7 @@ native-metal = ["native", "dep:forja-metal"]
 
 [dependencies]
 forja-sdk-macros = { path = "../forja-sdk-macros" }
+forja-program-conversions = { path = "../forja-program-conversions" }
 forja-core = { path = "../forja-core", optional = true }
 forja-cpu = { path = "../forja-cpu", optional = true }
 forja-host = { path = "../forja-host", optional = true }

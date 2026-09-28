@@ -18,6 +18,7 @@ use super::{
     CommandListEntry, Grants, Host, Limits, TensorEntry, bindings::l9o::gpu::compute, core_dtype,
     guest_error,
 };
+use compute::{Binop as WitBinOp, Redop as WitRedOp, Unop as WitUnOp, ValueType as WitValueType};
 
 static NEXT_PROGRAM_WEIGHT: AtomicU64 = AtomicU64::new(0);
 
@@ -880,55 +881,14 @@ fn wit_inst(inst: Inst) -> compute::Inst {
     }
 }
 
-fn wit_unop(op: UnOp) -> compute::Unop {
-    match op {
-        UnOp::Neg => compute::Unop::Neg,
-        UnOp::Abs => compute::Unop::Abs,
-        UnOp::Exp => compute::Unop::Exp,
-        UnOp::Log => compute::Unop::Log,
-        UnOp::Sqrt => compute::Unop::Sqrt,
-        UnOp::Rsqrt => compute::Unop::Rsqrt,
-        UnOp::Sin => compute::Unop::Sin,
-        UnOp::Cos => compute::Unop::Cos,
-        UnOp::Tanh => compute::Unop::Tanh,
-        UnOp::Sigmoid => compute::Unop::Sigmoid,
-        UnOp::Recip => compute::Unop::Recip,
-        UnOp::Floor => compute::Unop::Floor,
-    }
+forja_program_conversions::program_op_conversions! {
+    fn wit_unop(UnOp => WitUnOp);
+    fn wit_binop(BinOp => WitBinOp);
+    fn wit_redop(RedOp => WitRedOp);
 }
 
-fn wit_binop(op: BinOp) -> compute::Binop {
-    match op {
-        BinOp::Add => compute::Binop::Add,
-        BinOp::Sub => compute::Binop::Sub,
-        BinOp::Mul => compute::Binop::Mul,
-        BinOp::Div => compute::Binop::Div,
-        BinOp::Min => compute::Binop::Min,
-        BinOp::Max => compute::Binop::Max,
-        BinOp::Pow => compute::Binop::Pow,
-        BinOp::Lt => compute::Binop::Lt,
-        BinOp::Le => compute::Binop::Le,
-        BinOp::Eq => compute::Binop::Eq,
-        BinOp::Ne => compute::Binop::Ne,
-        BinOp::Ge => compute::Binop::Ge,
-        BinOp::Gt => compute::Binop::Gt,
-    }
-}
-
-const fn wit_redop(op: RedOp) -> compute::Redop {
-    match op {
-        RedOp::Sum => compute::Redop::Sum,
-        RedOp::Max => compute::Redop::Max,
-        RedOp::Min => compute::Redop::Min,
-    }
-}
-
-const fn wit_value_type(value_type: ValueType) -> compute::ValueType {
-    match value_type {
-        ValueType::F32 => compute::ValueType::F32,
-        ValueType::U32 => compute::ValueType::U32,
-        ValueType::Bool => compute::ValueType::Bool,
-    }
+forja_program_conversions::program_value_type_conversion! {
+    fn wit_value_type(ValueType => WitValueType);
 }
 
 #[tokio::test(flavor = "multi_thread")]

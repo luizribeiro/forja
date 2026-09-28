@@ -8,6 +8,7 @@ version.workspace = true
 
 [dependencies]
 forja-core = { path = "../forja-core" }
+forja-program-conversions = { path = "../forja-program-conversions" }
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
