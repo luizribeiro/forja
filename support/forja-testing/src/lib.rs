@@ -3,6 +3,8 @@
 pub mod program;
 pub mod representative;
 
+mod interval;
+
 use std::{error::Error, fmt};
 
 use forja_core::{Backend, BackendError, DType, Op, Slice, Submission, Tensor, ViewOp};
@@ -188,26 +190,49 @@ pub enum AgreementError {
     },
     /// Candidate integer output differed from the reference bytes.
     OutputMismatch,
-    /// Too many output elements exceeded the predicate-candidate cap.
-    ExcessivePredicateExclusions {
-        /// Output elements excluded from numeric comparison.
-        excluded: usize,
-        /// Total output elements considered by the oracle.
-        total: usize,
+    /// A generated-program output fell outside its conforming interval.
+    OutsideInterval {
+        /// Output element index within its tensor.
+        index: usize,
+        /// Value produced by the candidate backend.
+        value: f32,
+        /// Inclusive lower numeric bound.
+        lo: f64,
+        /// Inclusive upper numeric bound.
+        hi: f64,
+        /// Whether the interval admits NaN.
+        may_nan: bool,
+    },
+    /// Generated-program intervals were too wide to judge the result.
+    WideIntervals {
+        /// Output dtype whose median was excessive.
+        dtype: DType,
+        /// Observed median relative width.
+        median: f64,
+        /// Maximum accepted median relative width.
+        limit: f64,
     },
 }
 
-/// Predicate-ambiguity activity observed while comparing one generated program.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct PredicateReport {
+/// Interval-oracle activity observed while checking one generated program.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct IntervalReport {
     /// Ambiguous floating-point predicate evaluations.
     pub ambiguous_predicates: usize,
-    /// Output elements matched through an alternate predicate branch.
-    pub alternate_elements: usize,
-    /// Output elements excluded after exceeding the candidate cap.
-    pub excluded_elements: usize,
+    /// Select evaluations whose condition admitted both branches.
+    pub ambiguous_selects: usize,
+    /// Rounded reduction steps included in the interval budget.
+    pub reduction_steps: usize,
+    /// Output elements whose numeric interval was vacuous.
+    pub vacuous_elements: usize,
     /// Total output elements examined.
     pub total_elements: usize,
+    /// Median relative output-interval width.
+    pub median_relative_width: f64,
+    /// Ninetieth-percentile relative output-interval width.
+    pub p90_relative_width: f64,
+    /// Largest relative output-interval width.
+    pub max_relative_width: f64,
 }
 
 impl fmt::Display for AgreementError {
@@ -359,183 +384,114 @@ where
     assert_outputs_agree(output.dtype, &expected_bytes, &actual_bytes)
 }
 
-/// Runs one generated scalar program on two backends and checks every output.
+/// Runs a generated scalar program and checks each candidate output against an f64 interval.
+///
+/// The reference backend parameter is retained so differential-test call sites can share setup;
+/// generated-program acceptance depends only on the conforming interval.
 ///
 /// # Errors
 ///
-/// Returns a validation, backend, encoding, size, dtype, or tolerance error.
+/// Returns a validation, backend, encoding, size, dtype, interval, or meaningfulness error.
 pub fn assert_program_backends_agree<R, C>(
-    reference: &R,
+    _reference: &R,
     candidate: &C,
     case: &program::ProgramCase,
-) -> Result<PredicateReport, Box<dyn Error>>
+) -> Result<IntervalReport, Box<dyn Error>>
 where
     R: Backend,
     C: Backend,
 {
     let mut values = DeterministicValues::new(0xbb67_ae85_84ca_a73b);
-    let mut reference_inputs = Vec::with_capacity(case.inputs().len());
     let mut candidate_inputs = Vec::with_capacity(case.inputs().len());
     let mut input_bytes = Vec::with_capacity(case.inputs().len());
     for input in case.inputs() {
         let bytes = generated_bytes(input, &mut values)?;
-        reference_inputs.push(allocate_initialized(reference, input, &bytes)?);
         candidate_inputs.push(allocate_initialized(candidate, input, &bytes)?);
         input_bytes.push(bytes);
     }
-    let reference_outputs = case
-        .outputs()
-        .iter()
-        .map(|output| allocate(reference, output))
-        .collect::<Result<Vec<_>, _>>()?;
     let candidate_outputs = case
         .outputs()
         .iter()
         .map(|output| allocate(candidate, output))
         .collect::<Result<Vec<_>, _>>()?;
     let program = case.program().validate()?;
-    let row_tolerances = (case.program().kind == forja_core::program::ProgramKind::Row)
-        .then(|| program::row_reduction_tolerances(case, &input_bytes))
-        .transpose()?;
-    let predicate_candidates = program::predicate_candidates(case, &input_bytes)?;
-    let mut report = PredicateReport {
-        ambiguous_predicates: predicate_candidates.ambiguous_predicates,
-        ..PredicateReport::default()
-    };
-    run_program(reference, &program, &reference_inputs, &reference_outputs)?;
+    let evaluation = interval::evaluate(case, &input_bytes)?;
     run_program(candidate, &program, &candidate_inputs, &candidate_outputs)?;
-    for (output_slot, ((spec, expected), actual)) in case
-        .outputs()
-        .iter()
-        .zip(reference_outputs)
-        .zip(candidate_outputs)
-        .enumerate()
-    {
-        let expected = reference.read(&expected)?;
-        let actual = candidate.read(&actual)?;
-        let candidates = predicate_candidates
+
+    let mut report = IntervalReport {
+        ambiguous_predicates: evaluation.ambiguous_predicates,
+        ambiguous_selects: evaluation.ambiguous_selects,
+        reduction_steps: evaluation.reduction_steps,
+        ..IntervalReport::default()
+    };
+    let mut relative_widths = Vec::new();
+    for (output_slot, (spec, actual)) in case.outputs().iter().zip(candidate_outputs).enumerate() {
+        let actual = decode(&candidate.read(&actual)?, spec.dtype())?;
+        let intervals = evaluation
             .outputs
             .get(output_slot)
             .ok_or(AgreementError::InvalidOutput)?;
-        let (width, tolerances) = if let Some(tolerances) = &row_tolerances {
-            (
-                *case.shape().last().ok_or(AgreementError::InvalidOutput)?,
-                tolerances.as_slice(),
-            )
-        } else {
-            (
-                u32::try_from(candidates.len()).map_err(|_| AgreementError::SizeOverflow)?,
-                &[0.0][..],
-            )
-        };
-        let output_report = assert_output_candidates_agree(
-            spec.dtype(),
-            &expected,
-            &actual,
-            width,
-            tolerances,
-            candidates,
-        )?;
-        report.alternate_elements += output_report.alternate_elements;
-        report.excluded_elements += output_report.excluded_elements;
-        report.total_elements += output_report.total_elements;
-    }
-    let scaled_exclusions = report
-        .excluded_elements
-        .checked_mul(1000)
-        .ok_or(AgreementError::SizeOverflow)?;
-    if scaled_exclusions >= report.total_elements && report.excluded_elements != 0 {
-        return Err(AgreementError::ExcessivePredicateExclusions {
-            excluded: report.excluded_elements,
-            total: report.total_elements,
+        if actual.len() != intervals.len() {
+            return Err(AgreementError::OutputMismatch.into());
         }
-        .into());
-    }
-    Ok(report)
-}
 
-fn assert_output_candidates_agree(
-    dtype: DType,
-    expected_bytes: &[u8],
-    actual_bytes: &[u8],
-    width: u32,
-    reduction_tolerances: &[f64],
-    candidates: &[program::OutputCandidates],
-) -> Result<PredicateReport, AgreementError> {
-    if matches!(dtype, DType::I32 | DType::U32) {
-        return Err(AgreementError::UnsupportedDType(dtype));
-    }
-    let expected = decode(expected_bytes, dtype)?;
-    let actual = decode(actual_bytes, dtype)?;
-    let width = usize::try_from(width).map_err(|_| AgreementError::SizeOverflow)?;
-    if expected.len() != actual.len()
-        || expected.len() != candidates.len()
-        || expected.len() != width.saturating_mul(reduction_tolerances.len())
-    {
-        return Err(AgreementError::OutputMismatch);
-    }
-    let base_tolerance = dtype_tolerance(dtype)?;
-    let mut report = PredicateReport {
-        total_elements: expected.len(),
-        ..PredicateReport::default()
-    };
-    for (((expected, actual), candidates), &reduction_tolerance) in expected
-        .chunks_exact(width)
-        .zip(actual.chunks_exact(width))
-        .zip(candidates.chunks_exact(width))
-        .zip(reduction_tolerances)
-    {
-        let mut selected_expected = Vec::with_capacity(width);
-        let mut selected_actual = Vec::with_capacity(width);
-        for ((&expected, &actual), candidates) in expected.iter().zip(actual).zip(candidates) {
-            let program::OutputCandidates::Values(candidates) = candidates else {
-                report.excluded_elements += 1;
-                continue;
-            };
-            let mut best = expected;
-            let mut best_distance = candidate_distance(actual, expected);
-            for &candidate in candidates {
-                let candidate = quantize(candidate, dtype);
-                let distance = candidate_distance(actual, candidate);
-                if distance < best_distance {
-                    best = candidate;
-                    best_distance = distance;
+        let mut output_widths = Vec::with_capacity(intervals.len());
+        for (index, (&actual, interval)) in actual.iter().zip(intervals).enumerate() {
+            let interval = interval.converted(spec.dtype())?;
+            if !interval.contains(actual) {
+                return Err(AgreementError::OutsideInterval {
+                    index,
+                    value: actual,
+                    lo: interval.lo,
+                    hi: interval.hi,
+                    may_nan: interval.may_nan,
                 }
+                .into());
             }
-            if best.to_bits() != expected.to_bits() {
-                report.alternate_elements += 1;
+            let width = interval.relative_width();
+            output_widths.push(width);
+            relative_widths.push(width);
+            report.vacuous_elements += usize::from(interval.is_vacuous());
+            report.total_elements += 1;
+        }
+        let median = percentile(&mut output_widths, 50);
+        let limit = interval_width_limit(spec.dtype())?;
+        if median > limit {
+            return Err(AgreementError::WideIntervals {
+                dtype: spec.dtype(),
+                median,
+                limit,
             }
-            selected_expected.push(best);
-            selected_actual.push(actual);
-        }
-        let (error, count) = compare_float_values(&selected_expected, &selected_actual);
-        if count != 0 {
-            return Err(AgreementError::ClassMismatch { count });
-        }
-        let tolerance = base_tolerance.max(reduction_tolerance);
-        if error > tolerance {
-            return Err(AgreementError::OutsideTolerance { error, tolerance });
+            .into());
         }
     }
+
+    report.median_relative_width = percentile(&mut relative_widths, 50);
+    report.p90_relative_width = percentile(&mut relative_widths, 90);
+    report.max_relative_width = relative_widths
+        .iter()
+        .copied()
+        .max_by(f64::total_cmp)
+        .unwrap_or(0.0);
     Ok(report)
 }
 
-fn quantize(value: f32, dtype: DType) -> f32 {
+fn interval_width_limit(dtype: DType) -> Result<f64, AgreementError> {
     match dtype {
-        DType::F32 | DType::I32 | DType::U32 => value,
-        DType::F16 => f16::from_f32(value).to_f32(),
-        DType::BF16 => bf16::from_f32(value).to_f32(),
+        DType::F32 => Ok(5.0e-3),
+        DType::F16 => Ok(2.0e-2),
+        DType::BF16 => Ok(1.0e-1),
+        DType::I32 | DType::U32 => Err(AgreementError::UnsupportedDType(dtype)),
     }
 }
 
-fn candidate_distance(actual: f32, candidate: f32) -> f64 {
-    if actual.is_finite() && candidate.is_finite() {
-        (f64::from(actual) - f64::from(candidate)).abs()
-    } else if nonfinite_values_agree(actual, candidate) {
-        0.0
-    } else {
-        f64::INFINITY
+fn percentile(values: &mut [f64], percentage: usize) -> f64 {
+    if values.is_empty() {
+        return 0.0;
     }
+    values.sort_by(f64::total_cmp);
+    let index = values.len().saturating_sub(1) * percentage / 100;
+    values[index]
 }
 
 /// Checks two encoded outputs using exact integer comparison or the dtype tolerance.

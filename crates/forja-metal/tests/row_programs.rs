@@ -20,7 +20,7 @@ use proptest::{
     test_runner::{FileFailurePersistence, RngSeed, TestCaseError},
 };
 
-use common::{median_gpu_time, report_predicates};
+use common::{median_gpu_time, report_intervals};
 
 proptest! {
     #![proptest_config(row_program_config())]
@@ -66,7 +66,7 @@ fn compare_program(case: &ProgramCase) -> Result<(), TestCaseError> {
     let metal = MetalBackend::new().map_err(|error| TestCaseError::fail(error.to_string()))?;
     let report = assert_program_backends_agree(&cpu, &metal, case)
         .map_err(|error| TestCaseError::fail(error.to_string()))?;
-    report_predicates(report);
+    report_intervals(report);
     Ok(())
 }
 
@@ -123,30 +123,24 @@ fn row_reductions_propagate_nan_and_handle_singletons() {
 }
 
 #[test]
-fn wide_constant_sum_fits_reduction_roundoff_bound() {
+fn wide_constant_sum_uses_reduction_interval() {
     let value = 0.558_304_9_f32;
-    let shape = [1, 4097];
-    let program = Program {
-        kind: ProgramKind::Row,
-        insts: vec![Inst::Const(value), Inst::Reduce(RedOp::Sum, 0)],
-        outputs: vec![(0, 1)],
-    }
-    .validate()
-    .unwrap();
-    let cpu = CpuBackend::new();
-    let metal = MetalBackend::new().unwrap();
-    let expected = run_without_inputs(&cpu, &program, &shape);
-    let actual = run_without_inputs(&metal, &program, &shape);
-    let exact = f64::from(value) * 4097.0;
-    let cpu_error = (f64::from(expected[0]) - exact).abs() / exact.abs();
-    let metal_error = (f64::from(actual[0]) - exact).abs() / exact.abs();
-    let pair_error =
-        (f64::from(actual[0]) - f64::from(expected[0])).abs() / f64::from(expected[0]).abs();
-    let tolerance = 2.0 * 4097.0 * f64::from(f32::EPSILON);
-    assert!(pair_error > forja_testing::F32_TOLERANCE);
-    assert!(cpu_error <= tolerance, "{cpu_error} > {tolerance}");
-    assert!(metal_error <= tolerance, "{metal_error} > {tolerance}");
-    assert!(metal_error < cpu_error);
+    let case = ProgramCase::new(
+        Program {
+            kind: ProgramKind::Row,
+            insts: vec![Inst::Const(value), Inst::Reduce(RedOp::Sum, 0)],
+            outputs: vec![(0, 1)],
+        },
+        vec![1, 4097],
+        Vec::new(),
+        vec![TensorSpec::contiguous(DType::F32, &[1, 4097])],
+    );
+    let report =
+        assert_program_backends_agree(&CpuBackend::new(), &MetalBackend::new().unwrap(), &case)
+            .unwrap();
+    assert_eq!(report.reduction_steps, 4096);
+    assert_eq!(report.vacuous_elements, 0);
+    assert!(report.max_relative_width < 2.0e-3);
 }
 
 #[test]
@@ -177,8 +171,74 @@ fn ambiguous_tanh_predicate_accepts_either_branch() {
         assert_program_backends_agree(&CpuBackend::new(), &MetalBackend::new().unwrap(), &case)
             .unwrap();
     assert_eq!(report.ambiguous_predicates, 1);
-    assert_eq!(report.alternate_elements, 1);
-    assert_eq!(report.excluded_elements, 0);
+    assert_eq!(report.ambiguous_selects, 1);
+    assert_eq!(report.vacuous_elements, 1);
+    assert!(report.median_relative_width < 2.0e-2);
+}
+
+#[test]
+fn extrema_cancellation_stays_inside_a_narrow_interval() {
+    let values = [
+        0.632_068_16_f32,
+        0.989_548_9,
+        -0.582_683_56,
+        -0.281_108_38,
+        -0.811_542_5,
+        0.304_452_9,
+        0.845_899_1,
+        -0.888_599_16,
+        0.172_425_27,
+        -0.914_864_06,
+        0.697_305_2,
+        0.642_967,
+        -0.986_603_74,
+        -0.073_560_24,
+        -0.227_872_37,
+        0.885_685_2,
+        -0.525_104_76,
+        0.363_495_35,
+        -0.673_333_9,
+        -0.938_154_94,
+        -0.894_051_55,
+        0.055_157_66,
+        -0.300_585_75,
+        0.651_407_5,
+        -0.306_084_16,
+        -0.405_201_9,
+        -0.951_931_95,
+        -0.013_886_929,
+        -0.681_762_7,
+        -0.436_078_07,
+        -0.125_971_56,
+        0.106_915_236,
+        0.486_760_38,
+    ];
+    let bytes = values
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect();
+    let case = ProgramCase::new(
+        Program {
+            kind: ProgramKind::Row,
+            insts: vec![
+                Inst::Input(0),
+                Inst::Unary(UnOp::Sin, 0),
+                Inst::Reduce(RedOp::Max, 1),
+                Inst::Binary(BinOp::Add, 1, 2),
+                Inst::Reduce(RedOp::Min, 3),
+            ],
+            outputs: vec![(0, 4)],
+        },
+        vec![1, 33],
+        vec![TensorSpec::initialized(DType::F32, &[1, 33], bytes)],
+        vec![TensorSpec::contiguous(DType::F32, &[1, 33])],
+    );
+    let report =
+        assert_program_backends_agree(&CpuBackend::new(), &MetalBackend::new().unwrap(), &case)
+            .unwrap();
+    assert_eq!(report.reduction_steps, 64);
+    assert_eq!(report.vacuous_elements, 0);
+    assert!(report.max_relative_width < 1.0e-3);
 }
 
 #[test]
@@ -403,23 +463,6 @@ fn run_with_values<B: Backend>(
     outputs
         .iter()
         .map(|output| backend.read(output).unwrap())
-        .collect()
-}
-
-fn run_without_inputs<B: Backend>(
-    backend: &B,
-    program: &ValidatedProgram,
-    shape: &[u32],
-) -> Vec<f32> {
-    let output = backend.alloc(DType::F32, shape).unwrap();
-    run(backend, program_commands(program, &[], &[&output]));
-    backend
-        .read(&output)
-        .unwrap()
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|bytes| f32::from_le_bytes(*bytes))
         .collect()
 }
 

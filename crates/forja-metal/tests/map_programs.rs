@@ -15,12 +15,19 @@ use forja_testing::{
     program::map_programs,
     representative::{half_split_rope, residual_add, silu_mul},
 };
-use proptest::{prelude::*, test_runner::TestCaseError};
+use proptest::{
+    prelude::*,
+    test_runner::{RngSeed, TestCaseError},
+};
 
-use common::{median_gpu_time, report_predicates};
+use common::{median_gpu_time, report_intervals};
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(32))]
+    #![proptest_config(ProptestConfig {
+        cases: 32,
+        rng_seed: RngSeed::Fixed(0x510e_527f_ade6_82d1),
+        ..ProptestConfig::default()
+    })]
 
     #[test]
     fn metal_map_programs_match_the_interpreter(case in map_programs(64)) {
@@ -29,7 +36,7 @@ proptest! {
             .map_err(|error| TestCaseError::fail(error.to_string()))?;
         let report = assert_program_backends_agree(&cpu, &metal, &case)
             .map_err(|error| TestCaseError::fail(error.to_string()))?;
-        report_predicates(report);
+        report_intervals(report);
     }
 }
 
