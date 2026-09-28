@@ -19,7 +19,7 @@ pub use ops::{
 pub use quantized::{QuantizedMatrix, QuantizedMatrixError, QuantizedMatrixPart};
 
 /// A scalar type stored in an unquantized tensor.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum DType {
     /// A 32-bit IEEE 754 floating-point value.
     F32,

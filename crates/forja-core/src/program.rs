@@ -16,9 +16,9 @@
 //! is undefined for out-of-range values, so F32-to-U32 lowering must clamp and
 //! select NaN to zero before conversion.
 
-use std::{error::Error, fmt};
+use std::{any::Any, error::Error, fmt, sync::Arc};
 
-use crate::{DType, MAX_RANK, Tensor, byte_ranges_overlap, is_injective};
+use crate::{Backend, BackendError, DType, MAX_RANK, Tensor, byte_ranges_overlap, is_injective};
 use sha2::{Digest, Sha256};
 
 /// The largest accepted instruction count.
@@ -228,7 +228,7 @@ impl ValidatedProgram {
 }
 
 /// Tensor types and rank accepted by a prepared scalar program.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct KernelSignature {
     rank: u8,
     input_dtypes: Vec<DType>,
@@ -276,6 +276,150 @@ impl KernelSignature {
     pub const fn scalars(&self) -> u8 {
         self.scalars
     }
+}
+
+/// A validated scalar program paired with immutable backend preparation state.
+pub struct PreparedProgram {
+    validated: ValidatedProgram,
+    signature: KernelSignature,
+    backend: Box<dyn Any + Send + Sync>,
+}
+
+impl fmt::Debug for PreparedProgram {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedProgram")
+            .field("validated", &self.validated)
+            .field("signature", &self.signature)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PreparedProgram {
+    /// Returns the validated program.
+    #[must_use]
+    pub const fn validated(&self) -> &ValidatedProgram {
+        &self.validated
+    }
+
+    /// Returns the checked tensor signature.
+    #[must_use]
+    pub const fn signature(&self) -> &KernelSignature {
+        &self.signature
+    }
+
+    /// Returns backend preparation state when requested with its concrete type.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn backend_handle<T: 'static>(&self) -> Option<&T> {
+        self.backend.downcast_ref()
+    }
+}
+
+/// A reason a scalar program could not be prepared.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PrepareError {
+    /// The signature has the wrong number of inputs.
+    InputCount,
+    /// The signature has the wrong number of outputs.
+    OutputCount,
+    /// Runtime scalar parameters are not supported yet.
+    Scalars,
+    /// The rank cannot satisfy the program.
+    Rank,
+    /// An input storage type is unsupported.
+    InputDType {
+        /// The rejected input slot.
+        slot: usize,
+    },
+    /// Input storage types violate the program's type constraints.
+    InputType {
+        /// The mismatched input slot.
+        slot: usize,
+    },
+    /// An output storage type is not floating-point.
+    OutputDType {
+        /// The rejected output slot.
+        slot: usize,
+    },
+    /// The backend refused preparation.
+    Backend(BackendError),
+}
+
+impl fmt::Display for PrepareError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "program preparation failed: {self:?}")
+    }
+}
+
+impl Error for PrepareError {}
+
+/// Checks a program signature and creates reusable backend preparation state.
+///
+/// # Errors
+///
+/// Returns [`PrepareError`] when the signature is inconsistent with the program or the backend
+/// refuses preparation.
+pub fn prepare_program<B: Backend>(
+    backend: &B,
+    validated: ValidatedProgram,
+    signature: KernelSignature,
+) -> Result<Arc<PreparedProgram>, PrepareError> {
+    validate_signature(&validated, &signature)?;
+    let handle = backend
+        .prepare_program(&validated, &signature)
+        .map_err(PrepareError::Backend)?;
+    Ok(Arc::new(PreparedProgram {
+        validated,
+        signature,
+        backend: Box::new(handle),
+    }))
+}
+
+fn validate_signature(
+    validated: &ValidatedProgram,
+    signature: &KernelSignature,
+) -> Result<(), PrepareError> {
+    if signature.input_dtypes.len() != validated.input_count {
+        return Err(PrepareError::InputCount);
+    }
+    if signature.output_dtypes.len() != validated.output_count {
+        return Err(PrepareError::OutputCount);
+    }
+    if signature.scalars != 0 {
+        return Err(PrepareError::Scalars);
+    }
+    let rank = usize::from(signature.rank);
+    if rank > MAX_RANK
+        || (validated.program.kind == ProgramKind::Row && rank == 0)
+        || validated.program.insts.iter().any(
+            |inst| matches!(inst, Inst::Index(axis) | Inst::Extent(axis) if usize::from(*axis) >= rank),
+        )
+    {
+        return Err(PrepareError::Rank);
+    }
+    let input_types = signature
+        .input_dtypes
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(slot, dtype)| {
+            input_value_type(slot, dtype).map_err(|_| PrepareError::InputDType { slot })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    check_input_types(&validated.program, &input_types).map_err(|error| match error {
+        BindError::InputTypeMismatch { slot } => PrepareError::InputType { slot },
+        _ => PrepareError::InputType { slot: 0 },
+    })?;
+    if let Some((slot, _)) = signature
+        .output_dtypes
+        .iter()
+        .enumerate()
+        .find(|(_, dtype)| !matches!(dtype, DType::F32 | DType::F16 | DType::BF16))
+    {
+        return Err(PrepareError::OutputDType { slot });
+    }
+    Ok(())
 }
 
 fn hash_program(program: &Program) -> ProgramHash {
@@ -1090,6 +1234,76 @@ mod tests {
             writable,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn prepared_signature_refuses_every_inconsistent_part() {
+        let float = program(
+            vec![Inst::Input(0), Inst::Unary(UnOp::Neg, 0)],
+            vec![(0, 1)],
+        )
+        .validate()
+        .unwrap();
+        let signature =
+            |rank, inputs, outputs, scalars| KernelSignature::new(rank, inputs, outputs, scalars);
+
+        assert_eq!(
+            validate_signature(&float, &signature(1, vec![], vec![DType::F32], 0)),
+            Err(PrepareError::InputCount)
+        );
+        assert_eq!(
+            validate_signature(&float, &signature(1, vec![DType::F32], vec![], 0)),
+            Err(PrepareError::OutputCount)
+        );
+        assert_eq!(
+            validate_signature(&float, &signature(1, vec![DType::F32], vec![DType::F32], 1)),
+            Err(PrepareError::Scalars)
+        );
+        assert_eq!(
+            validate_signature(&float, &signature(9, vec![DType::F32], vec![DType::F32], 0)),
+            Err(PrepareError::Rank)
+        );
+        assert_eq!(
+            validate_signature(&float, &signature(1, vec![DType::I32], vec![DType::F32], 0)),
+            Err(PrepareError::InputDType { slot: 0 })
+        );
+        assert_eq!(
+            validate_signature(&float, &signature(1, vec![DType::U32], vec![DType::F32], 0)),
+            Err(PrepareError::InputType { slot: 0 })
+        );
+        assert_eq!(
+            validate_signature(&float, &signature(1, vec![DType::F32], vec![DType::U32], 0)),
+            Err(PrepareError::OutputDType { slot: 0 })
+        );
+    }
+
+    #[test]
+    fn prepared_signature_checks_row_and_axis_rank_requirements() {
+        let row = Program {
+            kind: ProgramKind::Row,
+            insts: vec![Inst::Const(1.0)],
+            outputs: vec![(0, 0)],
+        }
+        .validate()
+        .unwrap();
+        assert_eq!(
+            validate_signature(&row, &KernelSignature::new(0, vec![], vec![DType::F32], 0)),
+            Err(PrepareError::Rank)
+        );
+
+        let indexed = program(
+            vec![Inst::Index(1), Inst::Cast(ValueType::F32, 0)],
+            vec![(0, 1)],
+        )
+        .validate()
+        .unwrap();
+        assert_eq!(
+            validate_signature(
+                &indexed,
+                &KernelSignature::new(1, vec![], vec![DType::F32], 0)
+            ),
+            Err(PrepareError::Rank)
+        );
     }
 
     #[test]
