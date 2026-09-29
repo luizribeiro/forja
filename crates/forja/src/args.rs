@@ -106,6 +106,7 @@ pub(crate) struct Bench {
     pub(crate) config: Box<DevConfig>,
     pub(crate) origins: BTreeMap<KeyPath, Origin>,
     pub(crate) axes: BTreeMap<KeyPath, Vec<toml::Value>>,
+    pub(crate) strategy_axes: Vec<KeyPath>,
     pub(crate) points: Vec<BenchPoint>,
 }
 
@@ -523,6 +524,13 @@ impl BenchArgs {
         let points = expand_points(layered).map_err(|error| {
             Cli::command().error(clap::error::ErrorKind::ValueValidation, error)
         })?;
+        let strategy_axes = config
+            .bench
+            .vary
+            .keys()
+            .filter(|key| axis_class(key.as_str()) == Ok(AxisClass::Strategy))
+            .cloned()
+            .collect();
         Ok(Bench {
             engines: self.engines,
             model_dir: self.model_dir,
@@ -547,6 +555,7 @@ impl BenchArgs {
             config: Box::new(config.clone()),
             origins: layered.origins.clone(),
             axes: config.bench.vary.clone(),
+            strategy_axes,
             points,
         })
     }

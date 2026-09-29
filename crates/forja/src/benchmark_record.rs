@@ -171,6 +171,7 @@ mod tests {
             config: Box::new(config),
             origins: BTreeMap::new(),
             axes: BTreeMap::new(),
+            strategy_axes: Vec::new(),
             points: Vec::new(),
         }
     }

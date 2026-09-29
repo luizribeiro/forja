@@ -104,6 +104,7 @@ async fn run_metal(options: &Bench) -> Result<(), Box<dyn Error>> {
         })
         .collect::<Result<Vec<_>, _>>()?;
     let (results, device) = measure_points(options, &perf_hashes).await?;
+    check_strategy_outputs(&options.strategy_axes, &results)?;
     if let Some(path) = &options.json {
         let snapshot = benchmark_record::snapshot(options, &device, &os)?;
         let report = serde_json::json!({
@@ -131,6 +132,44 @@ async fn run_metal(options: &Bench) -> Result<(), Box<dyn Error>> {
         let mut bytes = serde_json::to_vec_pretty(&report)?;
         bytes.push(b'\n');
         fs::write(path, bytes)?;
+    }
+    Ok(())
+}
+
+fn check_strategy_outputs(
+    strategy_axes: &[forja_config::KeyPath],
+    results: &[serde_json::Value],
+) -> Result<(), String> {
+    if strategy_axes.is_empty() {
+        return Ok(());
+    }
+    let mut outputs = BTreeMap::<String, (&serde_json::Value, &str)>::new();
+    for result in results {
+        let point = result["point"]
+            .as_object()
+            .ok_or_else(|| "benchmark result point is not an object".to_owned())?;
+        let workload = point
+            .iter()
+            .filter(|(key, _)| {
+                !strategy_axes
+                    .iter()
+                    .any(|axis| axis.as_str() == key.as_str())
+            })
+            .collect::<BTreeMap<_, _>>();
+        let group = serde_json::to_string(&(&result["input"], &result["selection"], workload))
+            .map_err(|error| format!("cannot group benchmark outputs: {error}"))?;
+        let digest = result["output_digest"]
+            .as_str()
+            .ok_or_else(|| "benchmark result has no output digest".to_owned())?;
+        if let Some((first, expected)) = outputs.get(&group)
+            && *expected != digest
+        {
+            return Err(format!(
+                "strategy axis output mismatch for input {} and selection {}:\n  {} -> {expected}\n  {} -> {digest}",
+                result["input"], result["selection"], first["point"], result["point"],
+            ));
+        }
+        outputs.entry(group).or_insert((result, digest));
     }
     Ok(())
 }
@@ -1142,5 +1181,54 @@ mod tests {
         assert_eq!(visited.iter().filter(|(_, timed)| *timed).count(), 7);
         assert_eq!(visited.last(), Some(&(15, true)));
         Ok(())
+    }
+
+    #[test]
+    fn strategy_axes_require_equal_outputs() {
+        let axes = [forja_config::KeyPath::new("backend.metal.graph_replay")];
+        let results = [
+            serde_json::json!({
+                "input": 0,
+                "selection": "gpu-pipelined",
+                "point": {"backend.metal.graph_replay": "tier1", "bench.tg": 7},
+                "output_digest": "sha256:first",
+            }),
+            serde_json::json!({
+                "input": 0,
+                "selection": "gpu-pipelined",
+                "point": {"backend.metal.graph_replay": "tier2", "bench.tg": 7},
+                "output_digest": "sha256:second",
+            }),
+        ];
+        let error = check_strategy_outputs(&axes, &results).unwrap_err();
+        assert!(error.contains("strategy axis output mismatch"));
+        assert!(error.contains("tier1") && error.contains("sha256:first"));
+        assert!(error.contains("tier2") && error.contains("sha256:second"));
+    }
+
+    #[test]
+    fn strategy_checks_separate_workloads_and_engines() {
+        let axes = [forja_config::KeyPath::new("backend.metal.graph_replay")];
+        let results = [
+            serde_json::json!({
+                "input": 0,
+                "selection": "gpu-pipelined",
+                "point": {"backend.metal.graph_replay": "tier1", "bench.tg": 7},
+                "output_digest": "sha256:first",
+            }),
+            serde_json::json!({
+                "input": 0,
+                "selection": "gpu-pipelined",
+                "point": {"backend.metal.graph_replay": "tier2", "bench.tg": 33},
+                "output_digest": "sha256:second",
+            }),
+            serde_json::json!({
+                "input": 1,
+                "selection": "gpu-pipelined",
+                "point": {"backend.metal.graph_replay": "tier2", "bench.tg": 7},
+                "output_digest": "sha256:third",
+            }),
+        ];
+        check_strategy_outputs(&axes, &results).unwrap();
     }
 }
