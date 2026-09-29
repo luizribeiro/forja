@@ -2,7 +2,7 @@ use std::{error::Error, fmt, sync::Arc};
 
 use crate::{
     Affine, ByteHull, CommandList, Dispatch, Op, OpError, ParamError, ParamSpace, ParamValues,
-    SymbolicLayout, SymbolicLayoutError, Tensor, TensorError,
+    SymbolicLayout, SymbolicLayoutError, Tensor, TensorError, byte_ranges_overlap,
     ops::{BufferAccess, barriers_for_accesses},
     program::{BindError, Inst, PreparedProgram, ProgramKind},
 };
@@ -592,7 +592,13 @@ impl GraphTemplate {
 }
 
 fn hulls_overlap(first: &TemplateTensor, second: &TemplateTensor) -> Result<bool, GraphError> {
-    Ok(first.buffer() == second.buffer() && first.byte_hull()?.overlaps_hull(&second.byte_hull()?))
+    if first.buffer() != second.buffer() {
+        return Ok(false);
+    }
+    if let (TemplateTensor::Concrete(first), TemplateTensor::Concrete(second)) = (first, second) {
+        return Ok(byte_ranges_overlap(first.layout(), second.layout()));
+    }
+    Ok(first.byte_hull()?.overlaps_hull(&second.byte_hull()?))
 }
 
 fn instantiate_tensors(
@@ -1008,6 +1014,42 @@ mod tests {
             invalid.dispatch_kernel(&wrong_rank, &[&input], &[&output]),
             Err(GraphError::Operation(OpError::ProgramSignature))
         );
+    }
+
+    #[test]
+    fn concrete_strided_program_outputs_use_exact_alias_checks() {
+        let program = Program {
+            kind: ProgramKind::Map,
+            insts: vec![Inst::Input(0)],
+            outputs: vec![(0, 0), (1, 0)],
+        }
+        .validate()
+        .unwrap();
+        let prepared = prepared_for_test(
+            program,
+            KernelSignature::new(3, vec![DType::F32], vec![DType::F32, DType::F32], 0),
+        )
+        .unwrap();
+        let input = tensor(1, &[7, 16, 64]);
+        let buffer = BufferId::new(1, 2, 57_344);
+        let low = Tensor::from_allocation(
+            buffer,
+            Layout::new(DType::F32, 0, vec![7, 16, 64], vec![2_048, 128, 1], 57_344).unwrap(),
+            true,
+        )
+        .unwrap();
+        let high = Tensor::from_allocation(
+            buffer,
+            Layout::new(DType::F32, 64, vec![7, 16, 64], vec![2_048, 128, 1], 57_344).unwrap(),
+            true,
+        )
+        .unwrap();
+        let space = ParamSpace::new(Vec::new()).unwrap();
+        let mut graph = GraphTemplate::new(space, GraphLimits::default());
+
+        graph
+            .dispatch_kernel(&prepared, &[&input.into()], &[&low.into(), &high.into()])
+            .unwrap();
     }
 
     proptest! {
