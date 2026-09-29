@@ -126,6 +126,12 @@ impl From<Pos> for Dim {
     }
 }
 
+impl From<&Dim> for Dim {
+    fn from(dimension: &Dim) -> Self {
+        dimension.clone()
+    }
+}
+
 impl Add<u32> for Pos {
     type Output = Result<Dim>;
 

@@ -23,9 +23,11 @@
 ))]
 compile_error!("select at most one fusion profile");
 
+#[cfg(target_family = "wasm")]
+use forja_sdk::Graph;
 use forja_sdk::{
-    DType, Engine, EngineInfo, FloatElement, Load, Result, StepInput, StepOutput, Tensor, Weights,
-    bf16, export_engine,
+    DType, Dim, Engine, EngineInfo, FloatElement, Load, Result, StepInput, StepOutput, Tensor,
+    Weights, bf16, export_engine,
     kernel::{Kernel, TensorRef},
     nn::{
         Embedding, EmbeddingConfig, Linear, LinearConfig, RmsNorm, RmsNormConfig, WeightElement,
@@ -53,6 +55,8 @@ const FUSE_RESIDUAL_NORM: bool = cfg!(any(feature = "residual-norm-only", featur
 const FUSE_QK_NORM_ROPE: bool = cfg!(any(feature = "qk-norm-rope-only", feature = "all-fusions"));
 const FUSE_SILU_MUL: bool = cfg!(any(feature = "silu-mul-only", feature = "all-fusions"));
 const FUSE_FINAL_NORM: bool = cfg!(any(feature = "final-norm-only", feature = "all-fusions"));
+#[cfg(target_family = "wasm")]
+const REPLAY_DECODE: bool = !cfg!(feature = "no-replay");
 
 #[derive(Clone, Copy)]
 struct Config;
@@ -251,6 +255,14 @@ struct LayerResources<'a, T: Activation> {
     following_norm: Option<&'a RmsNorm<T>>,
 }
 
+struct LayerPosition<'a, T: Activation> {
+    positions: &'a Tensor<u32>,
+    activation_positions: Option<&'a Tensor<T>>,
+    sequence: u32,
+    start: &'a Dim,
+    end: &'a Dim,
+}
+
 impl<T: Activation> LayerCache<T> {
     fn new() -> Result<Self> {
         let shape = [KEY_VALUE_HEADS, MAX_CONTEXT, HEAD_DIM];
@@ -272,15 +284,20 @@ impl<T: Activation> DecoderLayer<T> {
         kernels: &FusedKernels,
         input: &Tensor<T>,
         normalized_input: &Tensor<T>,
-        positions: (&Tensor<u32>, Option<&Tensor<T>>),
-        positions_range: std::ops::Range<u32>,
+        position: LayerPosition<'_, T>,
         resources: LayerResources<'_, T>,
     ) -> Result<(Tensor<T>, Option<Tensor<T>>)> {
         let LayerResources {
             cache,
             following_norm,
         } = resources;
-        let sequence = positions_range.end - positions_range.start;
+        let LayerPosition {
+            positions,
+            activation_positions,
+            sequence,
+            start,
+            end,
+        } = position;
         let query_projection = self.self_attn.q_proj.forward(normalized_input)?.reshape(&[
             sequence,
             QUERY_HEADS,
@@ -293,7 +310,7 @@ impl<T: Activation> DecoderLayer<T> {
         ])?;
         let value_projection = self.self_attn.v_proj.forward(normalized_input)?;
         let (query, key) = if FUSE_QK_NORM_ROPE {
-            let program_positions = positions.1.ok_or_else(|| {
+            let program_positions = activation_positions.ok_or_else(|| {
                 forja_sdk::Error::loading("fused rotary positions are unavailable")
             })?;
             (
@@ -315,11 +332,11 @@ impl<T: Activation> DecoderLayer<T> {
                 self.self_attn
                     .q_norm
                     .forward(&query_projection)?
-                    .rope(positions.0, ROPE_THETA)?,
+                    .rope(positions, ROPE_THETA)?,
                 self.self_attn
                     .k_norm
                     .forward(&key_projection)?
-                    .rope(positions.0, ROPE_THETA)?,
+                    .rope(positions, ROPE_THETA)?,
             )
         };
         let query = query.permute(&[1, 0, 2])?;
@@ -327,15 +344,15 @@ impl<T: Activation> DecoderLayer<T> {
         let value = value_projection
             .reshape(&[sequence, KEY_VALUE_HEADS, HEAD_DIM])?
             .permute(&[1, 0, 2])?;
-        key.copy_into(&mut cache.key.narrow(1, positions_range.start, sequence)?)?;
-        value.copy_into(&mut cache.value.narrow(1, positions_range.start, sequence)?)?;
+        key.copy_into(&mut cache.key.narrow(1, start, sequence)?)?;
+        value.copy_into(&mut cache.value.narrow(1, start, sequence)?)?;
         let attended = sdpa(
             &query,
-            &cache.key.narrow(1, 0, positions_range.end)?,
-            &cache.value.narrow(1, 0, positions_range.end)?,
+            &cache.key.narrow(1, 0, end)?,
+            &cache.value.narrow(1, 0, end)?,
             ATTENTION_SCALE,
             true,
-            positions_range.start,
+            start,
         )?
         .permute(&[1, 0, 2])?
         .contiguous()?
@@ -495,6 +512,12 @@ pub struct Qwen3<T: Activation = f32> {
     weights: QwenWeights<T>,
     caches: Vec<LayerCache<T>>,
     kernels: FusedKernels,
+    positions: Tensor<u32>,
+    activation_positions: Option<Tensor<T>>,
+    #[cfg(target_family = "wasm")]
+    token: Tensor<u32>,
+    #[cfg(target_family = "wasm")]
+    decode: Option<Graph<Tensor<f32>>>,
 }
 
 impl<T: Activation> Qwen3<T> {
@@ -504,10 +527,20 @@ impl<T: Activation> Qwen3<T> {
             .map(|_| LayerCache::new())
             .collect::<Result<Vec<_>>>()?;
         let kernels = FusedKernels::load::<T>()?;
+        let positions = Tensor::constant(&(0..MAX_CONTEXT).collect::<Vec<_>>(), &[MAX_CONTEXT])?;
+        let activation_positions = FUSE_QK_NORM_ROPE
+            .then(|| activation_position_table::<T>())
+            .transpose()?;
         Ok(Self {
             weights,
             caches,
             kernels,
+            positions,
+            activation_positions,
+            #[cfg(target_family = "wasm")]
+            token: Tensor::zeros(&[1])?,
+            #[cfg(target_family = "wasm")]
+            decode: None,
         })
     }
 
@@ -526,23 +559,30 @@ impl<T: Activation> Qwen3<T> {
             .first()
             .copied()
             .ok_or_else(|| forja_sdk::Error::loading("tokens must have rank one"))?;
-        let positions = positions(0, sequence)?;
-        let program_positions = if FUSE_QK_NORM_ROPE {
-            Some(activation_positions::<T>(0, sequence)?)
-        } else {
-            None
-        };
+        let positions = self.positions.narrow(0, 0, sequence)?;
+        let program_positions = self
+            .activation_positions
+            .as_ref()
+            .map(|positions| positions.narrow(0, 0, sequence))
+            .transpose()?;
         let hidden = self.weights.model.embed_tokens.forward(tokens)?;
         let normalized = self.weights.model.layers[0]
             .input_layernorm
             .forward(&hidden)?;
+        let start = 0.into();
+        let end = sequence.into();
         self.weights.model.layers[0]
             .forward(
                 &self.kernels,
                 &hidden,
                 &normalized,
-                (&positions, program_positions.as_ref()),
-                0..sequence,
+                LayerPosition {
+                    positions: &positions,
+                    activation_positions: program_positions.as_ref(),
+                    sequence,
+                    start: &start,
+                    end: &end,
+                },
                 LayerResources {
                     cache: &mut self.caches[0],
                     following_norm: None,
@@ -579,25 +619,51 @@ impl Engine for ExportedQwen3 {
             .shape()
             .try_into()
             .map_err(|_| forja_sdk::Error::loading("tokens must have rank one"))?;
-        let last = sequence
-            .checked_sub(1)
-            .ok_or_else(|| forja_sdk::Error::loading("tokens cannot be empty"))?;
+        if sequence == 0 {
+            return Err(forja_sdk::Error::loading("tokens cannot be empty"));
+        }
         let end_pos = input
             .start_pos
             .checked_add(sequence)
             .filter(|&end| end <= MAX_CONTEXT)
             .ok_or_else(|| forja_sdk::Error::loading("tokens exceed the 4096-token context"))?;
-        let positions = positions(input.start_pos, end_pos)?;
-        let program_positions = if FUSE_QK_NORM_ROPE {
-            Some(activation_positions(input.start_pos, end_pos)?)
-        } else {
-            None
-        };
-        let mut hidden = self.weights.model.embed_tokens.forward(&input.tokens)?;
+        #[cfg(target_family = "wasm")]
+        if REPLAY_DECODE && sequence == 1 && !input.taps {
+            return self.decode_step(&input.tokens, input.start_pos);
+        }
+        self.forward(
+            &input.tokens,
+            sequence,
+            input.start_pos.into(),
+            end_pos.into(),
+            input.taps,
+        )
+    }
+}
+
+impl<T: Activation> Qwen3<T> {
+    fn forward(
+        &mut self,
+        tokens: &Tensor<u32>,
+        sequence: u32,
+        start: Dim,
+        end: Dim,
+        taps_enabled: bool,
+    ) -> Result<StepOutput> {
+        let last = sequence
+            .checked_sub(1)
+            .ok_or_else(|| forja_sdk::Error::loading("tokens cannot be empty"))?;
+        let positions = self.positions.narrow(0, &start, sequence)?;
+        let program_positions = self
+            .activation_positions
+            .as_ref()
+            .map(|positions| positions.narrow(0, &start, sequence))
+            .transpose()?;
+        let mut hidden = self.weights.model.embed_tokens.forward(tokens)?;
         let mut normalized = self.weights.model.layers[0]
             .input_layernorm
             .forward(&hidden)?;
-        let mut taps = Vec::with_capacity(if input.taps { LAYERS } else { 0 });
+        let mut taps = Vec::with_capacity(if taps_enabled { LAYERS } else { 0 });
         for index in 0..LAYERS {
             let layer = &self.weights.model.layers[index];
             let following_norm = self
@@ -610,15 +676,20 @@ impl Engine for ExportedQwen3 {
                 &self.kernels,
                 &hidden,
                 &normalized,
-                (&positions, program_positions.as_ref()),
-                input.start_pos..end_pos,
+                LayerPosition {
+                    positions: &positions,
+                    activation_positions: program_positions.as_ref(),
+                    sequence,
+                    start: &start,
+                    end: &end,
+                },
                 LayerResources {
                     cache: &mut self.caches[index],
                     following_norm,
                 },
             )?;
             hidden = next_hidden;
-            if input.taps && index + 1 < LAYERS {
+            if taps_enabled && index + 1 < LAYERS {
                 taps.push(Self::output(hidden.contiguous()?)?);
             }
             if let Some(value) = next_normalized {
@@ -634,7 +705,7 @@ impl Engine for ExportedQwen3 {
         } else {
             self.weights.model.norm.forward(&hidden)?
         };
-        if input.taps {
+        if taps_enabled {
             taps.push(Self::output(hidden.contiguous()?)?);
         }
         let logits = Self::output(
@@ -648,19 +719,41 @@ impl Engine for ExportedQwen3 {
         )?;
         Ok(StepOutput { logits, taps })
     }
+
+    #[cfg(target_family = "wasm")]
+    fn decode_step(&mut self, tokens: &Tensor<u32>, start_pos: u32) -> Result<StepOutput> {
+        let values = tokens.to_vec()?;
+        self.token.write(&values)?;
+        if self.decode.is_none() {
+            let position = forja_sdk::Param::new(0..=MAX_CONTEXT - 1)?;
+            let start = position.at(start_pos);
+            let end = (start.clone() + 1)?;
+            let token = self.token.alias()?;
+            let graph = forja_sdk::capture(&[&position], || {
+                self.forward(&token, 1, start.into(), end, false)
+                    .map(|output| output.logits)
+            })?;
+            self.decode = Some(graph);
+        }
+        let graph = self
+            .decode
+            .as_ref()
+            .ok_or_else(|| forja_sdk::Error::loading("decode graph was not captured"))?;
+        graph.replay(&[start_pos])?;
+        Ok(StepOutput {
+            logits: graph.result().alias()?,
+            taps: Vec::new(),
+        })
+    }
 }
 
-fn positions(start: u32, end: u32) -> Result<Tensor<u32>> {
-    Tensor::from_slice(&(start..end).collect::<Vec<_>>(), &[end - start])
-}
-
-fn activation_positions<T: Activation>(start: u32, end: u32) -> Result<Tensor<T>> {
-    let values = (start..end)
+fn activation_position_table<T: Activation>() -> Result<Tensor<T>> {
+    let values = (0..MAX_CONTEXT)
         .map(|position| {
             u16::try_from(position)
                 .map(T::from_position)
                 .map_err(|_| forja_sdk::Error::loading("position exceeds activation range"))
         })
         .collect::<Result<Vec<_>>>()?;
-    Tensor::from_slice(&values, &[end - start])
+    Tensor::constant(&values, &[MAX_CONTEXT])
 }
