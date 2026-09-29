@@ -121,7 +121,7 @@ fn chunked_prefill_matches_single_pass_and_transformers() -> Result<(), Box<dyn 
 #[ignore = "requires FORJA_MODELS and runs in the pre-push hook"]
 async fn replay_matches_lazy_decode_on_cpu() -> Result<(), Box<dyn Error>> {
     compare_replay(
-        forja_cpu::CpuBackend::new(),
+        vec![("cpu replay", forja_cpu::CpuBackend::new())],
         forja_cpu::CpuBackend::new(),
         8,
     )
@@ -133,7 +133,16 @@ async fn replay_matches_lazy_decode_on_cpu() -> Result<(), Box<dyn Error>> {
 #[ignore = "requires FORJA_MODELS and runs in the pre-push hook"]
 async fn metal_replay_matches_lazy_decode() -> Result<(), Box<dyn Error>> {
     compare_replay(
-        forja_metal::MetalBackend::new()?,
+        vec![
+            (
+                "Metal Tier 1",
+                forja_metal::MetalBackend::with_graph_replay(forja_metal::MetalGraphReplay::Tier1)?,
+            ),
+            (
+                "Metal Tier 2",
+                forja_metal::MetalBackend::with_graph_replay(forja_metal::MetalGraphReplay::Tier2)?,
+            ),
+        ],
         forja_metal::MetalBackend::new()?,
         128,
     )
@@ -141,7 +150,7 @@ async fn metal_replay_matches_lazy_decode() -> Result<(), Box<dyn Error>> {
 }
 
 async fn compare_replay<B>(
-    replay_backend: B,
+    replay_backends: Vec<(&'static str, B)>,
     lazy_backend: B,
     token_count: u32,
 ) -> Result<(), Box<dyn Error>>
@@ -150,13 +159,13 @@ where
 {
     let root = PathBuf::from(env::var_os("FORJA_MODELS").ok_or("FORJA_MODELS is not set")?);
     let weights = root.join("Qwen3-0.6B/model.safetensors");
-    let mut replay = EngineRunner::new(
-        test_guests::qwen3_bf16(),
-        replay_backend,
-        REPLAY_LIMITS,
-        &weights,
-    )
-    .await?;
+    let mut replays = Vec::with_capacity(replay_backends.len());
+    for (label, backend) in replay_backends {
+        replays.push((
+            label,
+            EngineRunner::new(test_guests::qwen3_bf16(), backend, REPLAY_LIMITS, &weights).await?,
+        ));
+    }
     let mut lazy = EngineRunner::new(
         test_guests::qwen3_bf16_no_replay(),
         lazy_backend,
@@ -164,16 +173,20 @@ where
         weights,
     )
     .await?;
-    replay.load().await??;
+    for (_, replay) in &mut replays {
+        replay.load().await??;
+    }
     lazy.load().await??;
     let prompt = (0_u32..8).collect::<Vec<_>>();
-    replay
-        .step(EngineStep {
-            tokens: prompt.clone(),
-            start_pos: 0,
-            taps: false,
-        })
-        .await??;
+    for (_, replay) in &mut replays {
+        replay
+            .step(EngineStep {
+                tokens: prompt.clone(),
+                start_pos: 0,
+                taps: false,
+            })
+            .await??;
+    }
     lazy.step(EngineStep {
         tokens: prompt,
         start_pos: 0,
@@ -184,13 +197,6 @@ where
     for step in 0..token_count {
         let start_pos = 8 + step;
         let token = (step * 7_919 + 17) % qwen3::VOCAB;
-        let replay_output = replay
-            .step(EngineStep {
-                tokens: vec![token],
-                start_pos,
-                taps: false,
-            })
-            .await??;
         let lazy_output = lazy
             .step(EngineStep {
                 tokens: vec![token],
@@ -198,11 +204,21 @@ where
                 taps: false,
             })
             .await??;
-        assert_eq!(
-            replay.read(&replay_output.logits).await?,
-            lazy.read(&lazy_output.logits).await?,
-            "decode logits differed at position {start_pos}"
-        );
+        let lazy_logits = lazy.read(&lazy_output.logits).await?;
+        for (label, replay) in &mut replays {
+            let replay_output = replay
+                .step(EngineStep {
+                    tokens: vec![token],
+                    start_pos,
+                    taps: false,
+                })
+                .await??;
+            assert_eq!(
+                replay.read(&replay_output.logits).await?,
+                lazy_logits,
+                "{label} decode logits differed at position {start_pos}"
+            );
+        }
     }
     Ok(())
 }

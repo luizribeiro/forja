@@ -116,6 +116,33 @@ impl ArgumentWriter {
         })
     }
 
+    fn copy_image(&mut self, image: &[u8]) -> Result<(), BackendError> {
+        let started = TEMPORARY_PROFILE.with(|profile| profile.get().map(|_| Instant::now()));
+        if image.len() > self.capacity {
+            return Err(BackendError::AllocationFailed);
+        }
+        // SAFETY: The image length was checked against the live shared allocation capacity, and
+        // the copy completes before the command buffer can execute.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                image.as_ptr(),
+                self.raw.contents().cast::<u8>().as_ptr(),
+                image.len(),
+            );
+        }
+        self.offset = image.len();
+        if let Some(started) = started {
+            TEMPORARY_PROFILE.with(|profile| {
+                if let Some(mut timing) = profile.get() {
+                    timing.count = timing.count.saturating_add(1);
+                    timing.time = timing.time.saturating_add(started.elapsed());
+                    profile.set(Some(timing));
+                }
+            });
+        }
+        Ok(())
+    }
+
     fn validate_capacity(&self, expected: usize, empty: bool) -> Result<(), BackendError> {
         if !empty && self.offset != expected {
             return Err(BackendError::ExecutionFailed);
@@ -273,14 +300,12 @@ struct ArgumentUsage {
 }
 
 #[derive(Clone)]
-#[allow(dead_code)]
 enum PlannedRange {
     Fixed(BoundRange),
     Arena { offset: usize, len: usize },
 }
 
 #[derive(Clone)]
-#[allow(dead_code)]
 enum PlanCall {
     Pipeline(Retained<ProtocolObject<dyn MTLComputePipelineState>>),
     Bind {
@@ -807,24 +832,18 @@ struct CommandResources {
 pub(super) struct PreparedMetalGraph {
     residency: Retained<ProtocolObject<dyn MTLResidencySet>>,
     buffers: HashSet<BufferId>,
-    #[allow(dead_code)]
     tensors: Vec<Tensor>,
-    #[allow(dead_code)]
     encoding: Option<MetalEncodingPlan>,
 }
 
 #[derive(Clone)]
 struct StaticEncodingPlan {
-    #[allow(dead_code)]
     calls: Vec<PlanCall>,
 }
 
 struct MetalEncodingPlan {
-    #[allow(dead_code)]
     dispatches: Vec<Option<StaticEncodingPlan>>,
-    #[allow(dead_code)]
     arena: Vec<u8>,
-    #[allow(dead_code)]
     argument_offset: usize,
 }
 
@@ -1485,6 +1504,7 @@ impl MetalBackend {
                 },
                 None,
                 &mut arguments,
+                None,
             )?;
             let calls = recorder.finish();
             if !encoded.error_flags.is_empty()
@@ -1553,20 +1573,35 @@ impl MetalBackend {
         let dispatches = commands.into_dispatches();
         let prepared_programs = dispatches
             .iter()
-            .filter_map(Dispatch::prepared_program)
+            .enumerate()
+            .filter(|(index, _)| {
+                graph
+                    .and_then(|prepared| prepared.encoding.as_ref())
+                    .and_then(|encoding| encoding.dispatches.get(*index))
+                    .is_none_or(Option::is_none)
+            })
+            .filter_map(|(_, dispatch)| dispatch.prepared_program())
             .cloned()
             .collect::<Vec<_>>();
-        if dispatches
-            .iter()
-            .any(|dispatch| !supported_dispatch(dispatch))
-        {
+        if dispatches.iter().enumerate().any(|(index, dispatch)| {
+            !graph
+                .and_then(|prepared| prepared.encoding.as_ref())
+                .and_then(|encoding| encoding.dispatches.get(index))
+                .is_some_and(Option::is_some)
+                && !supported_dispatch(dispatch)
+        }) {
             return Err(BackendError::UnsupportedOperation);
         }
-        let tensors = dispatches
-            .iter()
-            .flat_map(|dispatch| dispatch.inputs().iter().chain(dispatch.outputs()))
-            .cloned()
-            .collect::<Vec<_>>();
+        let tensors = graph.map_or_else(
+            || {
+                dispatches
+                    .iter()
+                    .flat_map(|dispatch| dispatch.inputs().iter().chain(dispatch.outputs()))
+                    .cloned()
+                    .collect::<Vec<_>>()
+            },
+            |prepared| prepared.tensors.clone(),
+        );
         if !retained_tensors_validated {
             for tensor in &tensors {
                 self.validate(tensor)?;
@@ -1580,7 +1615,10 @@ impl MetalBackend {
                 .unwrap_or(u64::MAX),
             ..SubmissionProfile::default()
         });
-        let argument_capacity = self.argument_capacity(&dispatches)?;
+        let argument_capacity = self.argument_capacity_with_plan(
+            &dispatches,
+            graph.and_then(|prepared| prepared.encoding.as_ref()),
+        )?;
         let mut objects = self.in_flight.checkout(&self.device, argument_capacity)?;
         let command_buffer = self.begin_command_buffer(objects.allocator()?)?;
         let timestamp_count = if PROFILE {
@@ -1601,6 +1639,9 @@ impl MetalBackend {
         let encoding_started = PROFILE.then(Instant::now);
         let mut temporary_profile = TemporaryProfileScope::enter(PROFILE);
         let mut argument_writer = ArgumentWriter::new(objects.argument_buffer()?);
+        if let Some(encoding) = graph.and_then(|graph| graph.encoding.as_ref()) {
+            argument_writer.copy_image(&encoding.arena)?;
+        }
         let encoded = self.encode_dispatches(
             &command_buffer,
             objects.argument_table()?,
@@ -1610,6 +1651,12 @@ impl MetalBackend {
             },
             PROFILE.then_some(&timestamps),
             &mut argument_writer,
+            graph.and_then(|prepared| {
+                prepared
+                    .encoding
+                    .as_ref()
+                    .map(|encoding| encoding.dispatches.as_slice())
+            }),
         )?;
         argument_writer.validate_capacity(argument_capacity, dispatches.is_empty())?;
         if let Some(profile) = &mut profile {
@@ -1668,6 +1715,7 @@ impl MetalBackend {
         plan: &DispatchEncoding<'_>,
         timestamps: Option<&GpuTimestamps>,
         arguments: &mut ArgumentWriter,
+        prepared: Option<&[Option<StaticEncodingPlan>]>,
     ) -> Result<EncodedDispatches, BackendError> {
         use objc2_metal::MTL4CommandEncoder;
         let encoder = command_buffer
@@ -1686,111 +1734,25 @@ impl MetalBackend {
                 encode_dispatch_barrier(&encoder);
             }
             write_dispatch_timestamp(&encoder, timestamps, 2 + index * 2);
-            if matches!(dispatch.op(), Op::Program(_)) {
-                let started = timestamps.map(|_| Instant::now());
-                let mut state = ProgramEncodingState {
-                    bindings: &mut bindings,
-                    arguments,
-                    compile_fallbacks: &mut program_compile_fallbacks,
-                };
-                temporaries.extend(self.encode_program(&encoder, table, dispatch, &mut state)?);
-                if let Some(started) = started {
-                    program_encoding.count = program_encoding.count.saturating_add(1);
-                    program_encoding.time = program_encoding.time.saturating_add(started.elapsed());
-                }
+            if let Some(plan) = prepared
+                .and_then(|plans| plans.get(index))
+                .and_then(Option::as_ref)
+            {
+                Self::encode_plan(&encoder, table, plan, &mut bindings, arguments)?;
                 continue;
             }
-            if let Op::RmsNorm { eps } = dispatch.op() {
-                temporaries.extend(self.encode_rms_norm(
-                    &encoder,
-                    table,
-                    dispatch,
-                    eps,
-                    &mut bindings,
-                    arguments,
-                )?);
-                continue;
-            }
-            if dispatch.op() == Op::Softmax {
-                temporaries.extend(self.encode_softmax(
-                    &encoder,
-                    table,
-                    dispatch,
-                    &mut bindings,
-                    arguments,
-                )?);
-                continue;
-            }
-            if let Op::Rope { theta } = dispatch.op() {
-                temporaries.extend(self.encode_rope(
-                    &encoder,
-                    table,
-                    dispatch,
-                    theta,
-                    &mut bindings,
-                    arguments,
-                )?);
-                continue;
-            }
-            if dispatch.op() == Op::Embed {
-                let (buffers, flag) =
-                    self.encode_embed(&encoder, table, dispatch, &mut bindings, arguments)?;
-                temporaries.extend(buffers);
-                error_flags.push(flag);
-                continue;
-            }
-            if dispatch.op() == Op::Copy {
-                temporaries.extend(self.encode_copy(
-                    &encoder,
-                    table,
-                    dispatch,
-                    &mut bindings,
-                    arguments,
-                )?);
-                continue;
-            }
-            if dispatch.op() == Op::Matmul {
-                temporaries.extend(self.encode_matmul(
-                    &encoder,
-                    table,
-                    dispatch,
-                    &mut bindings,
-                    arguments,
-                )?);
-                continue;
-            }
-            if matches!(dispatch.op(), Op::Sdpa { .. }) {
-                temporaries.extend(self.encode_sdpa_dispatch(
-                    &encoder,
-                    table,
-                    dispatch,
-                    &mut bindings,
-                    arguments,
-                )?);
-                continue;
-            }
-            let kernel = match dispatch.op() {
-                Op::Add
-                    if dispatch
-                        .inputs()
-                        .iter()
-                        .chain(std::iter::once(dispatch.output()))
-                        .all(|tensor| tensor.layout().is_contiguous()) =>
-                {
-                    "add_contiguous"
-                }
-                Op::Add => "add_strided",
-                Op::SiluMul => "silu_mul",
-                _ => return Err(BackendError::InvalidInput),
-            };
-            temporaries.extend(self.encode_elementwise(
+            self.encode_dispatch(
                 &encoder,
                 table,
                 dispatch,
-                kernel,
+                timestamps.is_some(),
+                &mut temporaries,
+                &mut error_flags,
                 &mut bindings,
                 arguments,
-            )?);
+                &mut program_encoding,
+                &mut program_compile_fallbacks,
+            )?;
         }
         if !plan.dispatches.is_empty() {
             write_dispatch_timestamp(&encoder, timestamps, 1 + plan.dispatches.len() * 2);
@@ -1811,6 +1773,134 @@ impl MetalBackend {
             program_encoding,
             program_compile_fallbacks,
         })
+    }
+
+    fn encode_plan(
+        encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
+        table: &ProtocolObject<dyn MTL4ArgumentTable>,
+        plan: &StaticEncodingPlan,
+        bindings: &mut ArgumentBindings,
+        arguments: &mut ArgumentWriter,
+    ) -> Result<(), BackendError> {
+        use objc2_metal::MTL4ComputeCommandEncoder;
+
+        for call in &plan.calls {
+            match call {
+                PlanCall::Pipeline(pipeline) => encoder.setComputePipelineState(pipeline),
+                PlanCall::Bind { index, range } => {
+                    let range = match range {
+                        PlannedRange::Fixed(range) => *range,
+                        PlannedRange::Arena { offset, len } => {
+                            offset
+                                .checked_add(*len)
+                                .filter(|&end| end <= arguments.offset)
+                                .ok_or(BackendError::ExecutionFailed)?;
+                            let address = arguments
+                                .raw
+                                .gpuAddress()
+                                .checked_add(
+                                    u64::try_from(*offset)
+                                        .map_err(|_| BackendError::ExecutionFailed)?,
+                                )
+                                .ok_or(BackendError::ExecutionFailed)?;
+                            arguments.written.push((*offset, *len));
+                            BoundRange {
+                                base: arguments.raw.gpuAddress(),
+                                offset: *offset,
+                                len: *len,
+                                address,
+                            }
+                        }
+                    };
+                    // SAFETY: Prepared binding indices and ranges were captured from a successful
+                    // encoding, and arena addresses are rebased into the current live allocation.
+                    unsafe {
+                        table.setAddress_atIndex(range.address, *index);
+                    }
+                    bindings.ranges.insert(range);
+                }
+                PlanCall::ArgumentTable => encoder.setArgumentTable(Some(table)),
+                PlanCall::Dispatch {
+                    threadgroups,
+                    threads_per_threadgroup,
+                } => encoder.dispatchThreadgroups_threadsPerThreadgroup(
+                    *threadgroups,
+                    *threads_per_threadgroup,
+                ),
+                PlanCall::Barrier => encode_dispatch_barrier(encoder),
+            }
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn encode_dispatch(
+        &self,
+        encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
+        table: &ProtocolObject<dyn MTL4ArgumentTable>,
+        dispatch: &Dispatch,
+        profile: bool,
+        temporaries: &mut Vec<BufferBinding>,
+        error_flags: &mut Vec<BufferBinding>,
+        bindings: &mut ArgumentBindings,
+        arguments: &mut ArgumentWriter,
+        program_encoding: &mut ProfileCount,
+        program_compile_fallbacks: &mut u64,
+    ) -> Result<(), BackendError> {
+        if matches!(dispatch.op(), Op::Program(_)) {
+            let started = profile.then(Instant::now);
+            let mut state = ProgramEncodingState {
+                bindings,
+                arguments,
+                compile_fallbacks: program_compile_fallbacks,
+            };
+            temporaries.extend(self.encode_program(encoder, table, dispatch, &mut state)?);
+            if let Some(started) = started {
+                program_encoding.count = program_encoding.count.saturating_add(1);
+                program_encoding.time = program_encoding.time.saturating_add(started.elapsed());
+            }
+            return Ok(());
+        }
+        let buffers = match dispatch.op() {
+            Op::RmsNorm { eps } => {
+                self.encode_rms_norm(encoder, table, dispatch, eps, bindings, arguments)?
+            }
+            Op::Softmax => self.encode_softmax(encoder, table, dispatch, bindings, arguments)?,
+            Op::Rope { theta } => {
+                self.encode_rope(encoder, table, dispatch, theta, bindings, arguments)?
+            }
+            Op::Embed => {
+                let (buffers, flag) =
+                    self.encode_embed(encoder, table, dispatch, bindings, arguments)?;
+                error_flags.push(flag);
+                buffers
+            }
+            Op::Copy => self.encode_copy(encoder, table, dispatch, bindings, arguments)?,
+            Op::Matmul => self.encode_matmul(encoder, table, dispatch, bindings, arguments)?,
+            Op::Sdpa { .. } => {
+                self.encode_sdpa_dispatch(encoder, table, dispatch, bindings, arguments)?
+            }
+            Op::Add | Op::SiluMul => {
+                let kernel = match dispatch.op() {
+                    Op::Add
+                        if dispatch
+                            .inputs()
+                            .iter()
+                            .chain(std::iter::once(dispatch.output()))
+                            .all(|tensor| tensor.layout().is_contiguous()) =>
+                    {
+                        "add_contiguous"
+                    }
+                    Op::Add => "add_strided",
+                    Op::SiluMul => "silu_mul",
+                    _ => return Err(BackendError::InvalidInput),
+                };
+                self.encode_elementwise(encoder, table, dispatch, kernel, bindings, arguments)?
+            }
+            Op::Program(_) => return Err(BackendError::InvalidInput),
+        };
+        temporaries.extend(buffers);
+        Ok(())
     }
 
     fn encode_copy(
@@ -3221,54 +3311,80 @@ impl MetalBackend {
     }
 
     fn argument_capacity(&self, dispatches: &[Dispatch]) -> Result<usize, BackendError> {
+        self.argument_capacity_with_plan(dispatches, None)
+    }
+
+    fn argument_capacity_with_plan(
+        &self,
+        dispatches: &[Dispatch],
+        plan: Option<&MetalEncodingPlan>,
+    ) -> Result<usize, BackendError> {
         let mut arguments = ArgumentSizer::default();
-        for dispatch in dispatches {
-            match dispatch.op() {
-                Op::Program(_) => {
-                    let program = dispatch.bound_program().ok_or(BackendError::InvalidInput)?;
-                    for _ in program.inputs().iter().chain(program.outputs()) {
-                        arguments.write(112)?;
-                    }
-                }
-                Op::Copy => Self::size_copy_arguments(&mut arguments)?,
-                Op::Add | Op::SiluMul => {
-                    for _ in 0..=dispatch.inputs().len() {
-                        arguments.write(112)?;
-                    }
-                }
-                Op::RmsNorm { .. } => {
-                    for len in [112, 112, 112, 8] {
-                        arguments.write(len)?;
-                    }
-                }
-                Op::Softmax => Self::size_softmax_arguments(&mut arguments)?,
-                Op::Rope { .. } => {
-                    for len in [112, 112, 112, 12] {
-                        arguments.write(len)?;
-                    }
-                    let width = dispatch
-                        .output()
-                        .layout()
-                        .shape()
-                        .last()
-                        .copied()
-                        .ok_or(BackendError::InvalidInput)?;
-                    let frequency_bytes = usize::try_from(width / 2)
-                        .map_err(|_| BackendError::AllocationFailed)?
-                        .checked_mul(size_of::<f32>())
-                        .ok_or(BackendError::AllocationFailed)?;
-                    arguments.write(frequency_bytes)?;
-                }
-                Op::Embed => {
-                    for len in [8, 112, 112, 112, 8] {
-                        arguments.write(len)?;
-                    }
-                }
-                Op::Matmul => Self::size_matmul_arguments(dispatch, &mut arguments)?,
-                Op::Sdpa { .. } => self.size_sdpa_arguments(dispatch, &mut arguments)?,
+        if let Some(plan) = plan {
+            arguments.offset = plan.argument_offset;
+        }
+        for (index, dispatch) in dispatches.iter().enumerate() {
+            if plan
+                .and_then(|plan| plan.dispatches.get(index))
+                .is_some_and(Option::is_some)
+            {
+                continue;
             }
+            self.size_dispatch_arguments(dispatch, &mut arguments)?;
         }
         Ok(arguments.offset.max(1))
+    }
+
+    fn size_dispatch_arguments(
+        &self,
+        dispatch: &Dispatch,
+        arguments: &mut ArgumentSizer,
+    ) -> Result<(), BackendError> {
+        match dispatch.op() {
+            Op::Program(_) => {
+                let program = dispatch.bound_program().ok_or(BackendError::InvalidInput)?;
+                for _ in program.inputs().iter().chain(program.outputs()) {
+                    arguments.write(112)?;
+                }
+            }
+            Op::Copy => Self::size_copy_arguments(arguments)?,
+            Op::Add | Op::SiluMul => {
+                for _ in 0..=dispatch.inputs().len() {
+                    arguments.write(112)?;
+                }
+            }
+            Op::RmsNorm { .. } => {
+                for len in [112, 112, 112, 8] {
+                    arguments.write(len)?;
+                }
+            }
+            Op::Softmax => Self::size_softmax_arguments(arguments)?,
+            Op::Rope { .. } => {
+                for len in [112, 112, 112, 12] {
+                    arguments.write(len)?;
+                }
+                let width = dispatch
+                    .output()
+                    .layout()
+                    .shape()
+                    .last()
+                    .copied()
+                    .ok_or(BackendError::InvalidInput)?;
+                let frequency_bytes = usize::try_from(width / 2)
+                    .map_err(|_| BackendError::AllocationFailed)?
+                    .checked_mul(size_of::<f32>())
+                    .ok_or(BackendError::AllocationFailed)?;
+                arguments.write(frequency_bytes)?;
+            }
+            Op::Embed => {
+                for len in [8, 112, 112, 112, 8] {
+                    arguments.write(len)?;
+                }
+            }
+            Op::Matmul => Self::size_matmul_arguments(dispatch, arguments)?,
+            Op::Sdpa { .. } => self.size_sdpa_arguments(dispatch, arguments)?,
+        }
+        Ok(())
     }
 
     fn size_copy_arguments(arguments: &mut ArgumentSizer) -> Result<(), BackendError> {
@@ -4139,7 +4255,8 @@ mod tests {
     };
 
     use forja_core::{
-        Backend, CommandList, DType, GraphLimits, Op, ParamSpace, Slice, Submission, ViewOp,
+        Affine, Backend, CommandList, DType, GraphLimits, Op, ParamSpace, Slice, Submission,
+        SymbolicLayout, TemplateTensor, ViewOp,
         program::{
             BinOp, BoundProgram, Inst, KernelSignature, Program, ProgramKind, RedOp,
             ValidatedProgram, bind_program, prepare_program,
@@ -4149,6 +4266,13 @@ mod tests {
     use forja_testing::{TensorSpec, assert_backends_agree, assert_outputs_agree};
 
     use super::*;
+
+    fn symbolic_prefix(base: &Tensor, space: ParamSpace, len: Affine) -> TemplateTensor {
+        let layout = SymbolicLayout::new(base.layout().clone(), space)
+            .slice(0, 0.into(), len, 1)
+            .unwrap();
+        TemplateTensor::symbolic(base.clone(), layout).unwrap()
+    }
 
     #[test]
     fn metal_compile_error_is_reported() {
@@ -4882,7 +5006,81 @@ mod tests {
         let graph = backend.prepare_graph(graph).unwrap();
         let state = graph.backend_state::<PreparedMetalGraph>().unwrap();
         assert_eq!(state.residency.allocationCount(), 3);
+        assert!(
+            state
+                .encoding
+                .as_ref()
+                .unwrap()
+                .dispatches
+                .iter()
+                .any(Option::is_some)
+        );
         backend.replay(&graph, Vec::new()).unwrap().wait().unwrap();
+        backend.replay(&graph, Vec::new()).unwrap().wait().unwrap();
+    }
+
+    #[test]
+    fn tier_two_replay_checks_mixed_plan_argument_capacity() {
+        let backend = MetalBackend::new().unwrap();
+        let static_input = backend.alloc(DType::F32, &[7]).unwrap();
+        let static_output = backend.alloc(DType::F32, &[7]).unwrap();
+        let dynamic_input = backend.alloc(DType::F32, &[7]).unwrap();
+        let dynamic_output = backend.alloc(DType::F32, &[7]).unwrap();
+        let space = ParamSpace::new(std::iter::once(1..=7).collect()).unwrap();
+        let dynamic_input =
+            symbolic_prefix(&dynamic_input, space.clone(), Affine::parameter(0, 0, 1));
+        let dynamic_output =
+            symbolic_prefix(&dynamic_output, space.clone(), Affine::parameter(0, 0, 1));
+        let mut template = GraphTemplate::new(space, GraphLimits::default());
+        template
+            .dispatch(
+                Op::Copy,
+                &[&TemplateTensor::from(static_input)],
+                &TemplateTensor::from(static_output),
+            )
+            .unwrap();
+        template
+            .dispatch(Op::Copy, &[&dynamic_input], &dynamic_output)
+            .unwrap();
+
+        let graph = backend.prepare_graph(template.clone()).unwrap();
+        backend.replay(&graph, vec![7]).unwrap().wait().unwrap();
+
+        let mut state = backend.prepare_metal_graph(&template).unwrap();
+        state.encoding.as_mut().unwrap().argument_offset += 16;
+        let corrupted = PreparedGraph::with_backend_state(template, state);
+        assert!(matches!(
+            backend.replay(&corrupted, vec![7]),
+            Err(BackendError::ExecutionFailed)
+        ));
+    }
+
+    #[test]
+    fn replay_failure_does_not_consume_the_graph() {
+        let backend = MetalBackend::new().unwrap();
+        let table = backend.alloc(DType::F32, &[6, 7]).unwrap();
+        let ids = backend.alloc(DType::U32, &[1]).unwrap();
+        let output = backend.alloc(DType::F32, &[1, 7]).unwrap();
+        backend.write(&ids, &99_u32.to_le_bytes()).unwrap();
+        let table_template = table.clone().into();
+        let ids_template = ids.clone().into();
+        let output_template = output.clone().into();
+        let mut graph =
+            GraphTemplate::new(ParamSpace::new(Vec::new()).unwrap(), GraphLimits::default());
+        graph
+            .dispatch(
+                Op::Embed,
+                &[&table_template, &ids_template],
+                &output_template,
+            )
+            .unwrap();
+        let graph = backend.prepare_graph(graph).unwrap();
+
+        assert_eq!(
+            backend.replay(&graph, Vec::new()).unwrap().wait(),
+            Err(BackendError::IndexOutOfRange { index: 99 })
+        );
+        backend.write(&ids, &1_u32.to_le_bytes()).unwrap();
         backend.replay(&graph, Vec::new()).unwrap().wait().unwrap();
     }
 
