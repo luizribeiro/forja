@@ -271,6 +271,7 @@ const VECTOR_TWO_PASS_MIN_KEY_LENGTH: u32 = 1024;
 const VECTOR_SELECTED_MIN_KEY_LENGTH: u32 = 512;
 const VECTOR_MAX_KEY_LENGTH: u32 = 65_536;
 const STEEL_SELECTED_MIN_QUERY_LENGTH: u32 = 512;
+const ARGMAX_CHUNK_WIDTH: u32 = 2048;
 
 struct EncodedDispatches {
     temporaries: Vec<BufferBinding>,
@@ -3147,51 +3148,91 @@ impl MetalBackend {
             .shape()
             .last()
             .ok_or(BackendError::InvalidInput)?;
-        let pipeline = self
-            .pipelines
-            .lock()
-            .map_err(|_| BackendError::ExecutionFailed)?
-            .get("argmax", &[(0, dtype_code(input.layout().dtype()))])?;
-        set_pipeline(encoder, &pipeline);
-        let temporaries = vec![
+        let chunks = width.div_ceil(ARGMAX_CHUNK_WIDTH);
+        let rows = u32::try_from(output.layout().element_count())
+            .map_err(|_| BackendError::ExecutionFailed)?;
+        let scratch = self.scratch_tensor(DType::U32, &[rows, chunks, 2])?;
+        let (partials_pipeline, finalize_pipeline) = {
+            let mut pipelines = self
+                .pipelines
+                .lock()
+                .map_err(|_| BackendError::ExecutionFailed)?;
+            (
+                pipelines.get(
+                    "argmax_partials",
+                    &[(0, dtype_code(input.layout().dtype()))],
+                )?,
+                pipelines.get("argmax_finalize", &[])?,
+            )
+        };
+        let mut temporaries = vec![
             Self::layout_buffer(input.layout(), arguments)?,
             Self::layout_buffer(output.layout(), arguments)?,
             arguments.write(&width.to_ne_bytes())?,
+            arguments.write(&chunks.to_ne_bytes())?,
         ];
         let buffers = self
             .buffers
             .lock()
             .map_err(|_| BackendError::ExecutionFailed)?;
         bindings.bind_raw(table, 0, &buffers.get(input)?.raw);
-        bindings.bind_raw(table, 1, &buffers.get(output)?.raw);
         drop(buffers);
+        set_pipeline(encoder, &partials_pipeline);
+        bindings.bind(table, 1, &scratch.buffer);
         bindings.bind(table, 2, &temporaries[0]);
-        bindings.bind(table, 3, &temporaries[1]);
-        bindings.bind(table, 4, &temporaries[2]);
+        bindings.bind(table, 3, &temporaries[2]);
+        bindings.bind(table, 4, &temporaries[3]);
         set_argument_table(encoder, table);
-        let max_threads = pipeline.maxTotalThreadsPerThreadgroup();
-        let thread_count = if width <= 1024 {
-            usize::try_from(width)
-                .map_err(|_| BackendError::ExecutionFailed)?
-                .next_multiple_of(32)
-                .min(max_threads)
-        } else {
-            max_threads.min(256)
-        };
+        let partial_threads = simd_thread_count(&partials_pipeline, 256)?;
         dispatch_threadgroups(
             encoder,
             MTLSize {
-                width: usize::try_from(output.layout().element_count())
-                    .map_err(|_| BackendError::ExecutionFailed)?,
+                width: usize::try_from(rows)
+                    .map_err(|_| BackendError::ExecutionFailed)?
+                    .checked_mul(
+                        usize::try_from(chunks).map_err(|_| BackendError::ExecutionFailed)?,
+                    )
+                    .ok_or(BackendError::ExecutionFailed)?,
                 height: 1,
                 depth: 1,
             },
             MTLSize {
-                width: thread_count,
+                width: partial_threads,
                 height: 1,
                 depth: 1,
             },
         );
+        encode_dispatch_barrier(encoder);
+        set_pipeline(encoder, &finalize_pipeline);
+        bindings.bind(table, 0, &scratch.buffer);
+        let buffers = self
+            .buffers
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?;
+        bindings.bind_raw(table, 1, &buffers.get(output)?.raw);
+        drop(buffers);
+        bindings.bind(table, 2, &temporaries[1]);
+        bindings.bind(table, 3, &temporaries[3]);
+        set_argument_table(encoder, table);
+        let requested_threads = usize::try_from(chunks)
+            .map_err(|_| BackendError::ExecutionFailed)?
+            .next_multiple_of(32)
+            .min(256);
+        let finalize_threads = simd_thread_count(&finalize_pipeline, requested_threads)?;
+        dispatch_threadgroups(
+            encoder,
+            MTLSize {
+                width: usize::try_from(rows).map_err(|_| BackendError::ExecutionFailed)?,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: finalize_threads,
+                height: 1,
+                depth: 1,
+            },
+        );
+        temporaries.push(scratch.buffer);
         Ok(temporaries)
     }
 
@@ -3452,7 +3493,11 @@ impl MetalBackend {
                     arguments.write(len)?;
                 }
             }
-            Op::Softmax | Op::Argmax => Self::size_softmax_arguments(arguments)?,
+            Op::Softmax => Self::size_softmax_arguments(arguments)?,
+            Op::Argmax => {
+                Self::size_softmax_arguments(arguments)?;
+                arguments.write(size_of::<u32>())?;
+            }
             Op::Rope { .. } => {
                 for len in [112, 112, 112, 12] {
                     arguments.write(len)?;
@@ -3840,7 +3885,7 @@ fn supported_dispatch(dispatch: &Dispatch) -> bool {
 
 fn reusable_dispatch(dispatch: &Dispatch) -> bool {
     match dispatch.op() {
-        Op::Embed | Op::Sdpa { .. } => false,
+        Op::Argmax | Op::Embed | Op::Sdpa { .. } => false,
         Op::Matmul => {
             dispatch
                 .inputs()
@@ -4159,6 +4204,17 @@ fn map_dispatch_geometry(
     ))
 }
 
+fn simd_thread_count(
+    pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
+    requested: usize,
+) -> Result<usize, BackendError> {
+    let available = pipeline.maxTotalThreadsPerThreadgroup().min(requested);
+    if available < 32 {
+        return Err(BackendError::ExecutionFailed);
+    }
+    Ok(available - available % 32)
+}
+
 const fn dtype_code(dtype: DType) -> u32 {
     match dtype {
         DType::F32 => 0,
@@ -4324,7 +4380,10 @@ impl PipelineCache {
 }
 
 fn nan_preserving_kernel(name: &str) -> bool {
-    matches!(name, "softmax_single" | "softmax_looped" | "argmax")
+    matches!(
+        name,
+        "softmax_single" | "softmax_looped" | "argmax_partials"
+    )
 }
 
 fn compile_options(math_mode: MTLMathMode) -> Retained<MTLCompileOptions> {
@@ -5112,6 +5171,25 @@ mod tests {
         );
         backend.replay(&graph, Vec::new()).unwrap().wait().unwrap();
         backend.replay(&graph, Vec::new()).unwrap().wait().unwrap();
+    }
+
+    #[test]
+    fn tier_two_replays_argmax_with_dynamic_scratch() {
+        let backend = MetalBackend::new().unwrap();
+        let input = backend.alloc(DType::F32, &[1, 4097]).unwrap();
+        let output = backend.alloc(DType::U32, &[1]).unwrap();
+        let mut template =
+            GraphTemplate::new(ParamSpace::new(Vec::new()).unwrap(), GraphLimits::default());
+        template
+            .dispatch(Op::Argmax, &[&input.clone().into()], &output.clone().into())
+            .unwrap();
+
+        let graph = backend.prepare_graph(template).unwrap();
+        let state = graph.backend_state::<PreparedMetalGraph>().unwrap();
+        assert!(state.encoding.as_ref().unwrap().dispatches[0].is_none());
+        backend.replay(&graph, Vec::new()).unwrap().wait().unwrap();
+        backend.replay(&graph, Vec::new()).unwrap().wait().unwrap();
+        assert_eq!(backend.read(&output).unwrap(), 4096_u32.to_le_bytes());
     }
 
     #[test]
@@ -6101,7 +6179,7 @@ mod tests {
         let reference = CpuBackend::new();
         let candidate = MetalBackend::new().unwrap();
         for dtype in [DType::F32, DType::F16, DType::BF16] {
-            for width in [1, 7, 33, 4097, 151_936] {
+            for width in [1, 7, 33, 2047, 2048, 2049, 4097, 151_936] {
                 assert_backends_agree(
                     &reference,
                     &candidate,
@@ -6123,30 +6201,69 @@ mod tests {
     }
 
     #[test]
+    fn metal_argmax_reports_gpu_time() {
+        let backend = MetalBackend::new().unwrap();
+        let input = backend.alloc(DType::F32, &[1, 151_936]).unwrap();
+        let output = backend.alloc(DType::U32, &[1]).unwrap();
+        let mut timings = Vec::with_capacity(20);
+        for iteration in 0..23 {
+            let mut commands = CommandList::new();
+            commands.dispatch(Op::Argmax, &[&input], &output).unwrap();
+            let submission = backend.submit_profiled(commands).unwrap();
+            submission.wait().unwrap();
+            if iteration >= 3 {
+                timings.push(submission.profile().unwrap().per_dispatch[0].gpu_time);
+            }
+        }
+        timings.sort_unstable();
+        let median = timings[timings.len() / 2];
+        eprintln!("argmax width 151936: median GPU {median:?}");
+        assert!(median > Duration::ZERO);
+    }
+
+    #[test]
     fn metal_argmax_matches_cpu_total_order_and_last_tie() {
-        let values = [
-            3.0,
-            1.0,
-            3.0,
-            f32::NEG_INFINITY,
-            f32::INFINITY,
-            f32::INFINITY,
-            -0.0,
-            0.0,
-            -0.0,
-            1.0,
-            f32::NAN,
-            2.0,
+        let cases = [
+            (
+                DType::F32,
+                [
+                    0x7fc0_0001_u32,
+                    0xffc0_0001,
+                    0xff80_0000,
+                    0x8000_0000,
+                    0x0000_0000,
+                    0x7f80_0000,
+                    0x7fc0_0001,
+                ]
+                .into_iter()
+                .flat_map(u32::to_le_bytes)
+                .collect::<Vec<_>>(),
+            ),
+            (
+                DType::F16,
+                [0x7e01_u16, 0xfe01, 0xfc00, 0x8000, 0x0000, 0x7c00, 0x7e01]
+                    .into_iter()
+                    .flat_map(u16::to_le_bytes)
+                    .collect::<Vec<_>>(),
+            ),
+            (
+                DType::BF16,
+                [0x7fc1_u16, 0xffc1, 0xff80, 0x8000, 0x0000, 0x7f80, 0x7fc1]
+                    .into_iter()
+                    .flat_map(u16::to_le_bytes)
+                    .collect::<Vec<_>>(),
+            ),
         ];
-        let bytes = values.into_iter().flat_map(f32::to_le_bytes).collect();
-        assert_backends_agree(
-            &CpuBackend::new(),
-            &MetalBackend::new().unwrap(),
-            Op::Argmax,
-            &[TensorSpec::initialized(DType::F32, &[3, 4], bytes)],
-            &TensorSpec::contiguous(DType::U32, &[3]),
-        )
-        .unwrap();
+        for (dtype, bytes) in cases {
+            assert_backends_agree(
+                &CpuBackend::new(),
+                &MetalBackend::new().unwrap(),
+                Op::Argmax,
+                &[TensorSpec::initialized(dtype, &[1, 7], bytes)],
+                &TensorSpec::contiguous(DType::U32, &[1]),
+            )
+            .unwrap();
+        }
     }
 
     #[test]
