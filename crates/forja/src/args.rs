@@ -1,11 +1,6 @@
 use std::path::PathBuf;
 
-use clap::{Args, FromArgMatches, ValueEnum};
-
-pub(crate) const USAGE: &str = "usage:
-  forja run --model-dir PATH --prompt TEXT [--max-tokens N] [--backend metal|cpu]
-  forja bench --model-dir PATH [--precision f32|bf16] [--pp N] [--tg N] [--reps N] [--json PATH] [--profile] [--host-argmax] [--no-replay] [--backend-option graph-replay=tier1|tier2]
-  forja verify --model-dir PATH --fixtures PATH [--backend metal|cpu] [--precision f32|bf16] [--prompts NAME,...]";
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub(crate) enum Backend {
@@ -32,6 +27,25 @@ pub(crate) struct Verify {
     pub(crate) backend: Backend,
     pub(crate) precision: Precision,
     pub(crate) prompts: Vec<String>,
+}
+
+#[derive(Args)]
+struct VerifyArgs {
+    /// Directory containing model weights.
+    #[arg(long)]
+    model_dir: PathBuf,
+    /// Directory containing golden fixtures.
+    #[arg(long)]
+    fixtures: PathBuf,
+    /// Compute backend. Repeating the option uses the last value.
+    #[arg(long, value_enum, default_value = "metal", action = clap::ArgAction::Append)]
+    backend: Vec<Backend>,
+    /// Engine precision. Repeating the option uses the last value.
+    #[arg(long, value_enum, default_value = "f32", action = clap::ArgAction::Append)]
+    precision: Vec<Precision>,
+    /// Comma-separated fixture names. Repeating the option appends names.
+    #[arg(long, value_delimiter = ',', value_parser = parse_prompt_name)]
+    prompts: Vec<String>,
 }
 
 #[derive(Args, Debug, Eq, PartialEq)]
@@ -95,23 +109,30 @@ pub(crate) enum Command {
     Verify(Verify),
 }
 
-pub(crate) fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Command, String> {
-    let mut arguments = arguments.into_iter();
-    match arguments.next().as_deref() {
-        Some("bench") => parse_bench(arguments).map(Command::Bench),
-        Some("run") => parse_run(arguments).map(Command::Run),
-        Some("verify") => parse_verify(arguments).map(Command::Verify),
-        Some(command) => Err(format!("unknown command {command:?}")),
-        None => Err("a command is required".to_owned()),
-    }
+#[derive(Parser)]
+#[command(name = "forja", about = "Run and inspect Forja inference engines")]
+struct Cli {
+    #[command(subcommand)]
+    command: ParsedCommand,
 }
 
-fn parse_bench(arguments: impl Iterator<Item = String>) -> Result<Bench, String> {
-    let command = Bench::augment_args(clap::Command::new("bench"));
-    let matches = command
-        .try_get_matches_from(std::iter::once("bench".to_owned()).chain(arguments))
-        .map_err(|error| error.to_string())?;
-    Bench::from_arg_matches(&matches).map_err(|error| error.to_string())
+#[derive(Subcommand)]
+enum ParsedCommand {
+    /// Benchmark one or more engines.
+    Bench(Bench),
+    /// Generate a completion.
+    Run(Run),
+    /// Compare engine outputs with golden fixtures.
+    Verify(VerifyArgs),
+}
+
+pub(crate) fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Command, clap::Error> {
+    let cli = Cli::try_parse_from(std::iter::once("forja".to_owned()).chain(arguments))?;
+    Ok(match cli.command {
+        ParsedCommand::Bench(options) => Command::Bench(options),
+        ParsedCommand::Run(options) => Command::Run(options),
+        ParsedCommand::Verify(options) => Command::Verify(options.into()),
+    })
 }
 
 fn parse_positive(value: &str) -> Result<usize, String> {
@@ -122,30 +143,6 @@ fn parse_positive(value: &str) -> Result<usize, String> {
         .ok_or_else(|| "value must be a positive integer".to_owned())
 }
 
-fn parse_run(mut arguments: impl Iterator<Item = String>) -> Result<Run, String> {
-    let command = Run::augment_args(clap::Command::new("run"));
-    let matches = command
-        .try_get_matches_from(std::iter::once("run".to_owned()).chain(arguments.by_ref()))
-        .map_err(|error| error.to_string())?;
-    Run::from_arg_matches(&matches).map_err(|error| error.to_string())
-}
-
-fn parse_backend(value: &str) -> Result<Backend, String> {
-    match value {
-        "metal" => Ok(Backend::Metal),
-        "cpu" => Ok(Backend::Cpu),
-        _ => Err(format!("unknown backend {value:?}")),
-    }
-}
-
-fn parse_precision(value: &str) -> Result<Precision, String> {
-    match value {
-        "f32" => Ok(Precision::F32),
-        "bf16" => Ok(Precision::Bf16),
-        _ => Err(format!("unknown precision {value:?}")),
-    }
-}
-
 fn parse_backend_option(value: &str) -> Result<GraphReplay, String> {
     match value {
         "graph-replay=tier1" => Ok(GraphReplay::Tier1),
@@ -154,45 +151,24 @@ fn parse_backend_option(value: &str) -> Result<GraphReplay, String> {
     }
 }
 
-fn parse_verify(mut arguments: impl Iterator<Item = String>) -> Result<Verify, String> {
-    let mut model_dir = None;
-    let mut fixtures = None;
-    let mut backend = Backend::Metal;
-    let mut precision = Precision::F32;
-    let mut prompts = Vec::new();
-    while let Some(option) = arguments.next() {
-        let value = arguments
-            .next()
-            .ok_or_else(|| format!("{option} requires a value"))?;
-        match option.as_str() {
-            "--model-dir" if model_dir.is_none() => model_dir = Some(PathBuf::from(value)),
-            "--fixtures" if fixtures.is_none() => fixtures = Some(PathBuf::from(value)),
-            "--backend" => {
-                backend = parse_backend(&value)?;
-            }
-            "--precision" => {
-                precision = parse_precision(&value)?;
-            }
-            "--prompts" => {
-                let names = value.split(',').collect::<Vec<_>>();
-                if names.iter().any(|name| name.is_empty()) {
-                    return Err("--prompts cannot contain an empty name".to_owned());
-                }
-                prompts.extend(names.into_iter().map(str::to_owned));
-            }
-            _ if option.starts_with("--") => {
-                return Err(format!("unknown or repeated option {option:?}"));
-            }
-            _ => return Err(format!("unexpected argument {option:?}")),
+fn parse_prompt_name(value: &str) -> Result<String, String> {
+    if value.is_empty() {
+        Err("prompt name cannot be empty".to_owned())
+    } else {
+        Ok(value.to_owned())
+    }
+}
+
+impl From<VerifyArgs> for Verify {
+    fn from(options: VerifyArgs) -> Self {
+        Self {
+            model_dir: options.model_dir,
+            fixtures: options.fixtures,
+            backend: options.backend.last().copied().unwrap_or(Backend::Metal),
+            precision: options.precision.last().copied().unwrap_or(Precision::F32),
+            prompts: options.prompts,
         }
     }
-    Ok(Verify {
-        model_dir: model_dir.ok_or("--model-dir is required")?,
-        fixtures: fixtures.ok_or("--fixtures is required")?,
-        backend,
-        precision,
-        prompts,
-    })
 }
 
 #[cfg(test)]
@@ -430,6 +406,57 @@ mod tests {
     }
 
     #[test]
+    fn preserves_repeated_verify_options() {
+        let command = parse(
+            [
+                "verify",
+                "--model-dir",
+                "/model",
+                "--fixtures",
+                "/fixtures",
+                "--backend",
+                "cpu",
+                "--backend",
+                "metal",
+                "--precision",
+                "bf16",
+                "--precision",
+                "f32",
+                "--prompts",
+                "one,two",
+                "--prompts",
+                "three",
+            ]
+            .map(str::to_owned),
+        )
+        .unwrap();
+        assert_eq!(
+            command,
+            Command::Verify(Verify {
+                model_dir: PathBuf::from("/model"),
+                fixtures: PathBuf::from("/fixtures"),
+                backend: Backend::Metal,
+                precision: Precision::F32,
+                prompts: vec!["one".to_owned(), "two".to_owned(), "three".to_owned()],
+            })
+        );
+    }
+
+    #[test]
+    fn parses_verify_defaults() {
+        let command = parse(
+            ["verify", "--model-dir", "/model", "--fixtures", "/fixtures"].map(str::to_owned),
+        )
+        .unwrap();
+        let Command::Verify(options) = command else {
+            panic!("expected verify command");
+        };
+        assert_eq!(options.backend, Backend::Metal);
+        assert_eq!(options.precision, Precision::F32);
+        assert!(options.prompts.is_empty());
+    }
+
+    #[test]
     fn rejects_missing_and_unknown_options() {
         assert!(parse(["verify"].map(str::to_owned)).is_err());
         assert!(
@@ -441,7 +468,7 @@ mod tests {
     #[test]
     fn rejects_an_option_without_a_value() {
         let error = parse(["verify", "--model-dir"].map(str::to_owned)).unwrap_err();
-        assert_eq!(error, "--model-dir requires a value");
+        assert!(error.to_string().contains("--model-dir"));
     }
 
     #[test]
@@ -461,5 +488,56 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn rejects_invalid_verify_options() {
+        for arguments in [
+            vec![
+                "verify",
+                "--model-dir",
+                "/model",
+                "--fixtures",
+                "/fixtures",
+                "--backend",
+                "neural",
+            ],
+            vec![
+                "verify",
+                "--model-dir",
+                "/model",
+                "--fixtures",
+                "/fixtures",
+                "--precision",
+                "int8",
+            ],
+            vec![
+                "verify",
+                "--model-dir",
+                "/model",
+                "--model-dir",
+                "/other",
+                "--fixtures",
+                "/fixtures",
+            ],
+        ] {
+            assert!(parse(arguments.into_iter().map(str::to_owned)).is_err());
+        }
+    }
+
+    #[test]
+    fn prints_root_and_command_help() {
+        let root = parse(["--help"].map(str::to_owned)).unwrap_err();
+        assert_eq!(root.kind(), clap::error::ErrorKind::DisplayHelp);
+        let root = root.to_string();
+        assert!(root.contains("bench"));
+        assert!(root.contains("run"));
+        assert!(root.contains("verify"));
+
+        for command in ["bench", "run", "verify"] {
+            let help = parse([command, "--help"].map(str::to_owned)).unwrap_err();
+            assert_eq!(help.kind(), clap::error::ErrorKind::DisplayHelp);
+            assert!(help.to_string().contains("--model-dir"));
+        }
     }
 }

@@ -10,7 +10,11 @@ mod verify;
 use std::{error::Error, process::ExitCode};
 
 fn main() -> ExitCode {
-    match run() {
+    let command = match args::parse(std::env::args().skip(1)) {
+        Ok(command) => command,
+        Err(error) => error.exit(),
+    };
+    match run(command) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("{error}");
@@ -19,9 +23,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn run() -> Result<(), Box<dyn Error>> {
-    let command = args::parse(std::env::args().skip(1))
-        .map_err(|error| format!("{error}\n{}", args::USAGE))?;
+fn run(command: args::Command) -> Result<(), Box<dyn Error>> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_time()
         .build()?;
