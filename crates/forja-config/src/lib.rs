@@ -224,7 +224,7 @@ impl Default for Limits {
 
 #[cfg(test)]
 mod tests {
-    use std::time;
+    use std::{fs, path::Path, time};
 
     use super::*;
 
@@ -308,6 +308,13 @@ selection = ["host-argmax"]
         ] {
             assert!(toml::from_str::<DevConfig>(source).is_err(), "{source}");
         }
+    }
+
+    #[test]
+    fn committed_default_suite_matches_bench_defaults() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../bench/suites/default.toml");
+        let config: DevConfig = toml::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(config.bench, Bench::default());
     }
 
     #[test]
