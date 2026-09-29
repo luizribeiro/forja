@@ -15,7 +15,7 @@ use forja_host::{
 use golden_fixtures::{decode_f32_le, sha256_file};
 
 use crate::{
-    args::{Bench, GraphReplay, Precision},
+    args::{Bench, GraphReplay},
     benchmark_stats::{Stats, stats, synthetic_tokens},
     engine::{argmax, limits, read_token},
 };
@@ -82,14 +82,10 @@ async fn run_metal(options: &Bench) -> Result<(), Box<dyn Error>> {
     let os = command_output("sw_vers", &["-productVersion"])?;
     let mut results = Vec::new();
     println!(
-        "precision\tselection\tmetric\twall tok/s (95% CI)\tGPU tok/s (95% CI)\twall ms\tGPU ms\tsubmissions"
+        "engine\tselection\tmetric\twall tok/s (95% CI)\tGPU tok/s (95% CI)\twall ms\tGPU ms\tsubmissions"
     );
-    let precisions = options.precision.map_or_else(
-        || vec![Precision::F32, Precision::Bf16],
-        |value| vec![value],
-    );
-    for precision in precisions {
-        let (precision, component) = component(precision, !options.no_replay);
+    for component in &options.engines {
+        let engine = component.display().to_string();
         let modes: &[bool] = if options.host_argmax {
             &[false]
         } else {
@@ -97,15 +93,15 @@ async fn run_metal(options: &Bench) -> Result<(), Box<dyn Error>> {
         };
         for &overlap in modes {
             let selection = selection_name(options.host_argmax, overlap);
-            let (pp, tg, device, profiles) = bench_precision(options, component, overlap).await?;
-            print_summary(precision, selection, "pp", pp);
-            print_summary(precision, selection, "tg", tg);
+            let (pp, tg, device, profiles) = bench_engine(options, component, overlap).await?;
+            print_summary(&engine, selection, "pp", pp);
+            print_summary(&engine, selection, "tg", tg);
             let profile_reports = profiles
                 .iter()
                 .map(profile_report)
                 .collect::<Result<Vec<_>, _>>()?;
             for report in &profile_reports {
-                print_profile_report(precision, selection, report);
+                print_profile_report(&engine, selection, report);
             }
             let mut result = serde_json::json!({
                 "provenance": {
@@ -113,8 +109,7 @@ async fn run_metal(options: &Bench) -> Result<(), Box<dyn Error>> {
                     "engine_component_sha256": sha256_file(component)?,
                     "device": device,
                     "os": format!("macOS {os}"),
-                    "precision": precision,
-                    "replay": !options.no_replay,
+                    "engine": component,
                     "graph_replay": graph_replay_name(options.graph_replay),
                     "selection": selection,
                 },
@@ -138,7 +133,6 @@ async fn run_metal(options: &Bench) -> Result<(), Box<dyn Error>> {
                 "generated_tokens": options.tg,
                 "warmups": WARMUPS,
                 "repetitions": options.reps,
-                "replay": !options.no_replay,
                 "graph_replay": graph_replay_name(options.graph_replay),
                 "selection": if options.host_argmax { "host-argmax" } else { "compared" },
             },
@@ -153,17 +147,7 @@ async fn run_metal(options: &Bench) -> Result<(), Box<dyn Error>> {
 }
 
 #[cfg(target_os = "macos")]
-fn component(precision: Precision, replay: bool) -> (&'static str, &'static Path) {
-    match (precision, replay) {
-        (Precision::F32, true) => ("f32", test_guests::qwen3()),
-        (Precision::F32, false) => ("f32", test_guests::qwen3_no_replay()),
-        (Precision::Bf16, true) => ("bf16", test_guests::qwen3_bf16()),
-        (Precision::Bf16, false) => ("bf16", test_guests::qwen3_bf16_no_replay()),
-    }
-}
-
-#[cfg(target_os = "macos")]
-async fn bench_precision(
+async fn bench_engine(
     options: &Bench,
     component: &Path,
     overlap: bool,
@@ -647,9 +631,9 @@ fn summarize(samples: &[Sample], tokens: usize) -> Result<Summary, Box<dyn Error
     })
 }
 
-fn print_summary(precision: &str, selection: &str, metric: &str, summary: Summary) {
+fn print_summary(engine: &str, selection: &str, metric: &str, summary: Summary) {
     println!(
-        "{precision}\t{selection}\t{metric}\t{:.2} ({:.2}–{:.2})\t{:.2} ({:.2}–{:.2})\t{:.3}\t{:.3}\t{:.0}",
+        "{engine}\t{selection}\t{metric}\t{:.2} ({:.2}–{:.2})\t{:.2} ({:.2}–{:.2})\t{:.3}\t{:.3}\t{:.0}",
         summary.wall_tps.median,
         summary.wall_tps.low,
         summary.wall_tps.high,
@@ -726,9 +710,9 @@ fn profile_report(measurement: &ProfileMeasurement) -> Result<ProfileReport, Box
     })
 }
 
-fn print_profile_report(precision: &str, selection: &str, report: &ProfileReport) {
+fn print_profile_report(engine: &str, selection: &str, report: &ProfileReport) {
     println!(
-        "\n{precision} {selection} tg profile at context {}",
+        "\n{engine} {selection} tg profile at context {}",
         report.context_start
     );
     println!(

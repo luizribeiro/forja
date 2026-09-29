@@ -73,6 +73,9 @@ pub(crate) struct Run {
 
 #[derive(Args, Debug, Eq, PartialEq)]
 pub(crate) struct Bench {
+    /// WebAssembly engine component. Repeat to compare engines.
+    #[arg(long = "engine", required = true)]
+    pub(crate) engines: Vec<PathBuf>,
     /// Directory containing model weights.
     #[arg(long)]
     pub(crate) model_dir: PathBuf,
@@ -94,12 +97,6 @@ pub(crate) struct Bench {
     /// Select tokens on the host instead of comparing selection modes.
     #[arg(long)]
     pub(crate) host_argmax: bool,
-    /// Use an engine that records its graph lazily.
-    #[arg(long)]
-    pub(crate) no_replay: bool,
-    /// Benchmark one precision instead of both.
-    #[arg(long, value_enum)]
-    pub(crate) precision: Option<Precision>,
     /// Set a Metal backend option.
     #[arg(
         long = "backend-option",
@@ -188,6 +185,8 @@ mod tests {
         let command = parse(
             [
                 "bench",
+                "--engine",
+                "/engine.wasm",
                 "--model-dir",
                 "/model",
                 "--pp",
@@ -205,6 +204,7 @@ mod tests {
         assert_eq!(
             command,
             Command::Bench(Bench {
+                engines: vec![PathBuf::from("/engine.wasm")],
                 model_dir: PathBuf::from("/model"),
                 pp: 33,
                 tg: 7,
@@ -212,8 +212,6 @@ mod tests {
                 json: Some(PathBuf::from("/result.json")),
                 breakdown: false,
                 host_argmax: false,
-                no_replay: false,
-                precision: None,
                 graph_replay: GraphReplay::Tier2,
             })
         );
@@ -224,13 +222,14 @@ mod tests {
         let command = parse(
             [
                 "bench",
+                "--engine",
+                "/f32.wasm",
+                "--engine",
+                "/bf16.wasm",
                 "--model-dir",
                 "/model",
                 "--breakdown",
                 "--host-argmax",
-                "--no-replay",
-                "--precision",
-                "bf16",
                 "--backend-option",
                 "graph-replay=tier1",
             ]
@@ -242,21 +241,38 @@ mod tests {
         };
         assert!(options.breakdown);
         assert!(options.host_argmax);
-        assert!(options.no_replay);
-        assert_eq!(options.precision, Some(Precision::Bf16));
+        assert_eq!(
+            options.engines,
+            [PathBuf::from("/f32.wasm"), PathBuf::from("/bf16.wasm")]
+        );
         assert_eq!(options.graph_replay, GraphReplay::Tier1);
     }
 
     #[test]
     fn rejects_zero_benchmark_counts() {
         assert!(
-            parse(["bench", "--model-dir", "/model", "--reps", "0"].map(str::to_owned)).is_err()
+            parse(
+                [
+                    "bench",
+                    "--engine",
+                    "/engine.wasm",
+                    "--model-dir",
+                    "/model",
+                    "--reps",
+                    "0",
+                ]
+                .map(str::to_owned)
+            )
+            .is_err()
         );
     }
 
     #[test]
     fn parses_benchmark_defaults() {
-        let command = parse(["bench", "--model-dir", "/model"].map(str::to_owned)).unwrap();
+        let command = parse(
+            ["bench", "--engine", "/engine.wasm", "--model-dir", "/model"].map(str::to_owned),
+        )
+        .unwrap();
         let Command::Bench(options) = command else {
             panic!("expected bench command");
         };
@@ -269,12 +285,46 @@ mod tests {
     #[test]
     fn rejects_invalid_benchmark_options() {
         for arguments in [
-            vec!["bench"],
-            vec!["bench", "--model-dir", "/model", "--pp", "many"],
-            vec!["bench", "--model-dir", "/model", "--tg", "0"],
-            vec!["bench", "--model-dir", "/model", "--precision", "int8"],
+            vec!["bench", "--model-dir", "/model"],
             vec![
                 "bench",
+                "--engine",
+                "/engine.wasm",
+                "--model-dir",
+                "/model",
+                "--pp",
+                "many",
+            ],
+            vec![
+                "bench",
+                "--engine",
+                "/engine.wasm",
+                "--model-dir",
+                "/model",
+                "--tg",
+                "0",
+            ],
+            vec![
+                "bench",
+                "--engine",
+                "/engine.wasm",
+                "--model-dir",
+                "/model",
+                "--precision",
+                "bf16",
+            ],
+            vec![
+                "bench",
+                "--engine",
+                "/engine.wasm",
+                "--model-dir",
+                "/model",
+                "--no-replay",
+            ],
+            vec![
+                "bench",
+                "--engine",
+                "/engine.wasm",
                 "--model-dir",
                 "/model",
                 "--backend-option",
@@ -282,6 +332,8 @@ mod tests {
             ],
             vec![
                 "bench",
+                "--engine",
+                "/engine.wasm",
                 "--model-dir",
                 "/model",
                 "--json",
@@ -291,12 +343,22 @@ mod tests {
             ],
             vec![
                 "bench",
+                "--engine",
+                "/engine.wasm",
                 "--model-dir",
                 "/model",
                 "--breakdown",
                 "--breakdown",
             ],
-            vec!["bench", "--model-dir", "/model", "--wat", "value"],
+            vec![
+                "bench",
+                "--engine",
+                "/engine.wasm",
+                "--model-dir",
+                "/model",
+                "--wat",
+                "value",
+            ],
         ] {
             assert!(parse(arguments.into_iter().map(str::to_owned)).is_err());
         }

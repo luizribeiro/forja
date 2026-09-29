@@ -21,7 +21,7 @@ def rate(result: dict[str, object], metric: str) -> str:
 
 
 def main() -> None:
-    """Validate comparable settings and print one row per precision."""
+    """Validate comparable settings and print one row per engine."""
     args = arguments()
     reports = [json.loads(args.forja.read_text()), json.loads(args.mlx.read_text())]
     if reports[0]["settings"] != reports[1]["settings"]:
@@ -29,12 +29,13 @@ def main() -> None:
     depths = [report.get("tg_context_start") for report in reports]
     if None in depths or depths[0] != depths[1]:
         raise RuntimeError("token-generation context depths differ")
-    print("engine\tprecision\tpp wall tok/s (95% CI)\ttg wall tok/s (95% CI)")
+    print("implementation\tengine\tpp wall tok/s (95% CI)\ttg wall tok/s (95% CI)")
     for report in reports:
         for result in report["results"]:
+            provenance = result["provenance"]
             print(
                 report["implementation"],
-                result["provenance"]["precision"],
+                provenance.get("engine", provenance.get("precision", "unknown")),
                 rate(result, "prompt_processing"),
                 rate(result, "token_generation"),
                 sep="\t",
