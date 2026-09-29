@@ -3,10 +3,11 @@
 use std::{env, error::Error, path::PathBuf, time::Duration};
 
 use forja_core::Backend;
-use forja_host::{EngineRunner, EngineStep, Limits};
+use forja_host::{EngineDecode, EngineRunner, EngineStep, Limits};
 use forja_sdk::{Engine, Tensor, Weights};
 use golden_fixtures::{
-    BF16_HIDDEN_STATE_TOLERANCE, FixtureDirectory, PromptFixture, normwise_relative_error,
+    BF16_HIDDEN_STATE_TOLERANCE, FixtureDirectory, PromptFixture, decode_f32_le,
+    normwise_relative_error,
 };
 use qwen3::Qwen3;
 
@@ -147,6 +148,132 @@ async fn metal_replay_matches_lazy_decode() -> Result<(), Box<dyn Error>> {
         128,
     )
     .await
+}
+
+#[tokio::test]
+#[ignore = "requires FORJA_MODELS and runs in the pre-push hook"]
+async fn cpu_greedy_selection_matches_host_argmax() -> Result<(), Box<dyn Error>> {
+    compare_greedy_selection(
+        forja_cpu::CpuBackend::new(),
+        forja_cpu::CpuBackend::new(),
+        test_guests::qwen3(),
+        8,
+    )
+    .await
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[ignore = "requires FORJA_MODELS and runs in the pre-push hook"]
+async fn metal_greedy_selection_matches_host_argmax() -> Result<(), Box<dyn Error>> {
+    compare_greedy_selection(
+        forja_metal::MetalBackend::new()?,
+        forja_metal::MetalBackend::new()?,
+        test_guests::qwen3_bf16(),
+        128,
+    )
+    .await
+}
+
+async fn compare_greedy_selection<B>(
+    host_backend: B,
+    selected_backend: B,
+    component: &std::path::Path,
+    token_count: u32,
+) -> Result<(), Box<dyn Error>>
+where
+    B: Backend + Send + Sync + 'static,
+{
+    let root = PathBuf::from(env::var_os("FORJA_MODELS").ok_or("FORJA_MODELS is not set")?);
+    let weights = root.join("Qwen3-0.6B/model.safetensors");
+    let mut host = EngineRunner::new(component, host_backend, REPLAY_LIMITS, &weights).await?;
+    let mut selected =
+        EngineRunner::new(component, selected_backend, REPLAY_LIMITS, weights).await?;
+    host.load().await??;
+    selected.load().await??;
+    let prompt = (0_u32..8).collect::<Vec<_>>();
+    let host_output = host
+        .step(EngineStep {
+            tokens: prompt.clone(),
+            start_pos: 0,
+            taps: false,
+        })
+        .await??;
+    let selected_output = selected
+        .decode(EngineDecode {
+            tokens: Some(prompt),
+            start_pos: 0,
+        })
+        .await??;
+    let mut host_token = host_argmax(&host.read(&host_output.logits).await?)?;
+    let mut selected_token = read_token(&selected.read(&selected_output.token).await?)?;
+    assert_eq!(selected_token, host_token, "prefill selection differed");
+
+    for offset in 1..token_count {
+        let position = 7_u32
+            .checked_add(offset)
+            .ok_or("decode position overflowed")?;
+        let replacement =
+            (offset == token_count / 2).then(|| selected_token.wrapping_add(1) % qwen3::VOCAB);
+        let input_token = replacement.unwrap_or(host_token);
+        let host_output = host
+            .step(EngineStep {
+                tokens: vec![input_token],
+                start_pos: position,
+                taps: false,
+            })
+            .await??;
+        let selected_output = selected
+            .decode(EngineDecode {
+                tokens: replacement.map(|token| vec![token]),
+                start_pos: position,
+            })
+            .await??;
+        host_token = host_argmax(&host.read(&host_output.logits).await?)?;
+        selected_token = read_token(&selected.read(&selected_output.token).await?)?;
+        assert_eq!(
+            selected_token, host_token,
+            "selection differed at {position}"
+        );
+    }
+    let position = 7_u32
+        .checked_add(token_count)
+        .ok_or("decode position overflowed")?;
+    let replacement = selected_token.wrapping_add(1) % qwen3::VOCAB;
+    let host_output = host
+        .step(EngineStep {
+            tokens: vec![replacement],
+            start_pos: position,
+            taps: false,
+        })
+        .await??;
+    let selected_output = selected
+        .decode(EngineDecode {
+            tokens: Some(vec![replacement]),
+            start_pos: position,
+        })
+        .await??;
+    assert_eq!(
+        read_token(&selected.read(&selected_output.token).await?)?,
+        host_argmax(&host.read(&host_output.logits).await?)?,
+        "replacement token was not honored at {position}"
+    );
+    Ok(())
+}
+
+fn host_argmax(bytes: &[u8]) -> Result<u32, Box<dyn Error>> {
+    let values = decode_f32_le(bytes)?;
+    values
+        .iter()
+        .enumerate()
+        .max_by(|(_, left), (_, right)| left.total_cmp(right))
+        .map(|(index, _)| u32::try_from(index))
+        .transpose()?
+        .ok_or_else(|| "cannot select from empty logits".into())
+}
+
+fn read_token(bytes: &[u8]) -> Result<u32, Box<dyn Error>> {
+    Ok(u32::from_le_bytes(bytes.try_into()?))
 }
 
 async fn compare_replay<B>(
