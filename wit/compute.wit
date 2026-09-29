@@ -199,6 +199,10 @@ world tensor-abuse {
   export large-dispatch-input: async func() -> result<_, string>;
   export large-read-refused: async func() -> result<_, string>;
   export churn-kernels: async func() -> result<u32, string>;
+  export replay-churn: async func() -> result<u32, string>;
+  export exhaust-graphs: async func() -> result<u32, string>;
+  export rewrite-graph-buffer: async func() -> result<list<u8>, string>;
+  export retained-graph-replay: async func() -> result<_, string>;
   export grow-memory: async func(bytes: u32) -> bool;
   export misuse-handle: async func();
 }

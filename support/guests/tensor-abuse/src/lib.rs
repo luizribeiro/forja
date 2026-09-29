@@ -6,8 +6,8 @@ wit_bindgen::generate!({
 });
 
 use l9o::gpu::compute::{
-    Binop, Dtype, Error, Inst, Kernel, KernelSignature, ProgramKind, ProgramSource, SliceSpec,
-    Tensor, ViewOp,
+    Affine, Binop, CommandList, Dtype, Error, Graph, Inst, Kernel, KernelSignature, Op, ParamRange,
+    ParamSlice, Params, ProgramKind, ProgramSource, SliceSpec, Tensor, ViewOp, replay,
 };
 
 struct Component;
@@ -91,6 +91,81 @@ impl Guest for Component {
             }
         }
         Err("kernel churn did not reach a quota".to_owned())
+    }
+
+    async fn replay_churn() -> Result<u32, String> {
+        let graph = Graph::create(CommandList::new()).map_err(error)?;
+        let mut completed = 0_u32;
+        loop {
+            match replay(&graph, Vec::new()).await {
+                Ok(_) => completed = completed.saturating_add(1),
+                Err(Error::Quota(_)) => return Ok(completed),
+                Err(error) => return Err(format!("graph replay returned {error:?}")),
+            }
+        }
+    }
+
+    async fn exhaust_graphs() -> Result<u32, String> {
+        let mut graphs = Vec::new();
+        loop {
+            match Graph::create(CommandList::new()) {
+                Ok(graph) => graphs.push(graph),
+                Err(Error::Quota(_)) => {
+                    return u32::try_from(graphs.len())
+                        .map_err(|_| "graph count exceeded the component result range".to_owned());
+                }
+                Err(error) => return Err(format!("graph creation returned {error:?}")),
+            }
+        }
+    }
+
+    async fn rewrite_graph_buffer() -> Result<Vec<u8>, String> {
+        let input = Tensor::alloc(Dtype::F32, &[1]).map_err(error)?;
+        let output = Tensor::alloc(Dtype::F32, &[1]).map_err(error)?;
+        let commands = CommandList::new();
+        commands
+            .dispatch(Op::Copy, &[&input], &output)
+            .map_err(error)?;
+        let graph = Graph::create(commands).map_err(error)?;
+        input.write(&1.0_f32.to_le_bytes()).map_err(error)?;
+        replay(&graph, Vec::new()).await.map_err(error)?;
+        input.write(&2.0_f32.to_le_bytes()).map_err(error)?;
+        replay(&graph, Vec::new()).await.map_err(error)?;
+        output.read().await.map_err(error)
+    }
+
+    async fn retained_graph_replay() -> Result<(), String> {
+        let params = Params::new(&[ParamRange { lo: 0, hi: 3 }]);
+        let input = Tensor::alloc(Dtype::F32, &[4]).map_err(error)?;
+        let output = Tensor::alloc(Dtype::F32, &[4]).map_err(error)?;
+        input.write(&[0; 16]).map_err(error)?;
+        let slice = ParamSlice {
+            start: Affine {
+                param: None,
+                scale: 0,
+                offset: 0,
+            },
+            len: Affine {
+                param: Some(0),
+                scale: 1,
+                offset: 1,
+            },
+            step: 1,
+        };
+        let input_view = input.view_param(&params, &[slice]).map_err(error)?;
+        let output_view = output.view_param(&params, &[slice]).map_err(error)?;
+        let commands = CommandList::new();
+        commands
+            .dispatch(Op::Copy, &[&input_view], &output_view)
+            .map_err(error)?;
+        let graph = Graph::create(commands).map_err(error)?;
+        drop(input_view);
+        drop(output_view);
+        drop(input);
+        drop(output);
+        drop(params);
+        replay(&graph, vec![2]).await.map_err(error)?;
+        Ok(())
     }
 
     async fn grow_memory(bytes: u32) -> bool {

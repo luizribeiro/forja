@@ -221,6 +221,65 @@ async fn kernel_churn_returns_a_quota_error() -> wasmtime::Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn graph_abuse_hits_time_and_live_graph_quotas() -> wasmtime::Result<()> {
+    let replay_limits = LIMITS.with_gpu_limits(Duration::from_secs(1), Duration::from_secs(1));
+    let (mut store, instance) = instantiate(
+        forja_cpu::CpuBackend::new(),
+        test_guests::tensor_abuse(),
+        replay_limits,
+    )
+    .await?;
+    let churn =
+        instance.get_typed_func::<(), (Result<u32, String>,)>(&mut store, "replay-churn")?;
+    Host::reset_guest_deadline(&mut store);
+    let (completed,) = store
+        .run_concurrent(async move |accessor| churn.call_concurrent(accessor, ()).await)
+        .await??;
+    assert_eq!(completed.map_err(wasmtime::Error::msg)?, 1);
+
+    let limits = LIMITS.with_graph_limit(3);
+    let (mut store, instance) = instantiate(
+        forja_cpu::CpuBackend::new(),
+        test_guests::tensor_abuse(),
+        limits,
+    )
+    .await?;
+    let exhaust =
+        instance.get_typed_func::<(), (Result<u32, String>,)>(&mut store, "exhaust-graphs")?;
+    Host::reset_guest_deadline(&mut store);
+    let (created,) = store
+        .run_concurrent(async move |accessor| exhaust.call_concurrent(accessor, ()).await)
+        .await??;
+    assert_eq!(created.map_err(wasmtime::Error::msg)?, 3);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn guest_graphs_retain_buffers_and_allow_completed_writes() -> wasmtime::Result<()> {
+    let (mut store, instance) = instantiate(
+        forja_cpu::CpuBackend::new(),
+        test_guests::tensor_abuse(),
+        COMMAND_LIMITS,
+    )
+    .await?;
+    let rewrite = instance
+        .get_typed_func::<(), (Result<Vec<u8>, String>,)>(&mut store, "rewrite-graph-buffer")?;
+    Host::reset_guest_deadline(&mut store);
+    let (bytes,) = store
+        .run_concurrent(async move |accessor| rewrite.call_concurrent(accessor, ()).await)
+        .await??;
+    assert_eq!(bytes.map_err(wasmtime::Error::msg)?, 2.0_f32.to_le_bytes());
+
+    let retained = instance
+        .get_typed_func::<(), (Result<(), String>,)>(&mut store, "retained-graph-replay")?;
+    Host::reset_guest_deadline(&mut store);
+    let (result,) = store
+        .run_concurrent(async move |accessor| retained.call_concurrent(accessor, ()).await)
+        .await??;
+    result.map_err(wasmtime::Error::msg)
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn guest_memory_growth_stops_at_the_store_limit() -> wasmtime::Result<()> {
     let limits = LIMITS.with_store_limits(16 * 1024 * 1024, 10_000, 10_000);
     let (mut store, instance) = instantiate(
