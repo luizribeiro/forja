@@ -35,6 +35,7 @@
           targets = [ "wasm32-wasip2" ];
         };
         cargoFiles = "(^|/)(Cargo\\.(toml|lock)|.*\\.rs)$";
+        pythonFiles = "^support/.*\\.py$";
         allLocalStages = [
           "pre-commit"
           "pre-push"
@@ -145,6 +146,28 @@
               stages = [ "pre-push" ];
             };
         };
+        pythonHooks = {
+          python-checks = {
+            enable = true;
+            entry = "${
+              pkgs.writeShellApplication {
+                name = "python-checks-hook";
+                runtimeInputs = [
+                  pkgs.python3
+                  pkgs.python3Packages.pytest
+                  pkgs.ruff
+                ];
+                text = ''
+                  pytest -q support
+                  ruff check --select E4,E7,E9,F support
+                '';
+              }
+            }/bin/python-checks-hook";
+            files = pythonFiles;
+            pass_filenames = false;
+            stages = [ "pre-commit" ];
+          };
+        };
         offlineHooks = pkgs.lib.mapAttrs (_: hook: hook // { stages = allLocalStages; }) {
           nixfmt.enable = true;
           deadnix.enable = true;
@@ -158,7 +181,7 @@
           check-yaml.enable = true;
           check-toml.enable = true;
         };
-        hookDefinitions = offlineHooks // cargoHooks;
+        hookDefinitions = offlineHooks // cargoHooks // pythonHooks;
         gitHooks = git-hooks.lib.${system}.run {
           src = ./.;
           hooks = hookDefinitions;
