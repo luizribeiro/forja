@@ -183,6 +183,11 @@ fn perf_key_from(
         serde_json::json!(config.bench.selection.as_slice()),
     );
     key.insert(
+        "bench.sampling".to_owned(),
+        serde_json::to_value(config.bench.sampling)
+            .map_err(|error| format!("cannot serialize benchmark sampling: {error}"))?,
+    );
+    key.insert(
         "bench.breakdown".to_owned(),
         serde_json::json!(config.bench.breakdown),
     );
@@ -291,11 +296,11 @@ mod tests {
         }];
         assert_eq!(
             config_hash(&snapshot, &inputs).unwrap(),
-            "sha256:07ab0870bf1dcd54d1c10b8f7b4401f861734cbe3a8f3ebaaff2d612cfaba108"
+            "sha256:f2373634abea8c90f11fe3eccadf8cc4433d14572d7a86522779c26ce4612398"
         );
         assert_eq!(
             comparison_hash(&perf_key(&point, &inputs[0]).unwrap()).unwrap(),
-            "sha256:5480f24dad09712f904594964052e810be98dad10df79a9aa275e9c20cf96c70"
+            "sha256:ac6dce17a2ee57b6ffe4d8aac6388e9af2adf1a630073750632e88be013a94cb"
         );
     }
 

@@ -271,6 +271,8 @@ pub struct Bench {
     pub contexts: ContextList,
     /// Token-selection strategies to measure.
     pub selection: SelectionList,
+    /// Token sampling parameters used by GPU selection strategies.
+    pub sampling: BenchSampling,
     /// Whether to collect per-operation timings.
     pub breakdown: bool,
     /// Configuration axes parsed for later benchmark expansion.
@@ -287,8 +289,34 @@ impl Default for Bench {
             decode_prefill: nonzero(8),
             contexts: ContextList(vec![9, 512, 2_048, 4_000]),
             selection: SelectionList(vec![Selection::GpuSequential, Selection::GpuPipelined]),
+            sampling: BenchSampling::default(),
             breakdown: false,
             vary: BTreeMap::new(),
+        }
+    }
+}
+
+/// Token sampling parameters used by benchmarks.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct BenchSampling {
+    /// Logit temperature, where zero selects greedily.
+    pub temperature: f32,
+    /// Number of greatest logits retained, where zero disables top-k.
+    pub top_k: u32,
+    /// Cumulative probability retained after top-k.
+    pub top_p: f32,
+    /// Counter-based random seed.
+    pub seed: u64,
+}
+
+impl Default for BenchSampling {
+    fn default() -> Self {
+        Self {
+            temperature: 0.0,
+            top_k: 0,
+            top_p: 1.0,
+            seed: 0,
         }
     }
 }
@@ -503,6 +531,11 @@ submission_timeout = "250ms"
             r#"[bench]
 contexts = [1, 7, 33, 4097]
 selection = ["host-argmax"]
+[bench.sampling]
+temperature = 0.7
+top_k = 40
+top_p = 0.9
+seed = 42
 [bench.vary]
 "backend.metal.graph_replay" = ["tier1", "tier2"]
 "#,
@@ -510,6 +543,13 @@ selection = ["host-argmax"]
         .unwrap();
         assert_eq!(config.bench.contexts.as_slice(), [1, 7, 33, 4097]);
         assert_eq!(config.bench.selection.as_slice(), [Selection::HostArgmax]);
+        assert_eq!(
+            config.bench.sampling.temperature.to_bits(),
+            0.7_f32.to_bits()
+        );
+        assert_eq!(config.bench.sampling.top_k, 40);
+        assert_eq!(config.bench.sampling.top_p.to_bits(), 0.9_f32.to_bits());
+        assert_eq!(config.bench.sampling.seed, 42);
         assert_eq!(
             config
                 .bench

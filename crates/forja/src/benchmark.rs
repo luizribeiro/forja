@@ -41,6 +41,13 @@ struct Sample {
     submissions: u32,
 }
 
+#[derive(Clone, Copy)]
+struct DecodeOptions {
+    host_argmax: bool,
+    overlap: bool,
+    sampling: SamplingParams,
+}
+
 struct ProfileMeasurement {
     context_start: usize,
     baseline: Vec<Sample>,
@@ -432,6 +439,17 @@ async fn measure_points(
 }
 
 #[cfg(target_os = "macos")]
+fn sampling_params(point: &BenchPoint) -> SamplingParams {
+    let sampling = point.config.bench.sampling;
+    SamplingParams {
+        temperature: sampling.temperature,
+        top_k: sampling.top_k,
+        top_p: sampling.top_p,
+        seed: sampling.seed,
+    }
+}
+
+#[cfg(target_os = "macos")]
 async fn bench_engine(
     options: &Bench,
     point: &BenchPoint,
@@ -439,6 +457,11 @@ async fn bench_engine(
     host_argmax: bool,
     overlap: bool,
 ) -> Result<(Summary, Summary, String, Vec<ProfileMeasurement>, String), Box<dyn Error>> {
+    let decode = DecodeOptions {
+        host_argmax,
+        overlap,
+        sampling: sampling_params(point),
+    };
     let backend =
         forja_metal::MetalBackend::with_graph_replay(metal_graph_replay(point.graph_replay))?;
     let device = backend.device_name();
@@ -487,8 +510,7 @@ async fn bench_engine(
             &mut runner,
             &tokens[..options.decode_prefill],
             point.tg,
-            host_argmax,
-            overlap,
+            decode,
         )
         .await?;
     }
@@ -501,8 +523,7 @@ async fn bench_engine(
                 &mut runner,
                 &tokens[..options.decode_prefill],
                 point.tg,
-                host_argmax,
-                overlap,
+                decode,
             )
             .await?,
         );
@@ -514,15 +535,19 @@ async fn bench_engine(
             options.reps,
             options.warmups,
             &point.contexts,
-            host_argmax,
-            overlap,
+            decode,
         )
         .await?
     } else {
         Vec::new()
     };
-    let output_digest =
-        probe_output(&mut runner, &tokens[..options.decode_prefill], point.tg).await?;
+    let output_digest = probe_output(
+        &mut runner,
+        &tokens[..options.decode_prefill],
+        point.tg,
+        decode.sampling,
+    )
+    .await?;
     Ok((
         summarize(&pp, point.pp)?,
         summarize(&tg, point.tg)?,
@@ -537,6 +562,7 @@ async fn probe_output(
     runner: &mut EngineRunner<forja_metal::MetalBackend>,
     prompt: &[u32],
     steps: usize,
+    sampling: SamplingParams,
 ) -> Result<String, Box<dyn Error>> {
     let mut tokens = Vec::with_capacity(steps);
     let mut logits = Vec::new();
@@ -554,7 +580,7 @@ async fn probe_output(
                             .ok_or("decode position overflowed")?,
                     )?
                 },
-                sampling: SamplingParams::default(),
+                sampling,
             })
             .await?
             .map_err(|error| format!("engine decode failed: {error:?}"))?;
@@ -598,13 +624,12 @@ async fn measure_decode(
     runner: &mut EngineRunner<forja_metal::MetalBackend>,
     prompt: &[u32],
     steps: usize,
-    host_argmax: bool,
-    overlap: bool,
+    options: DecodeOptions,
 ) -> Result<Sample, Box<dyn Error>> {
-    if overlap && !host_argmax {
-        return measure_pipelined_decode(runner, prompt, steps).await;
+    if options.overlap && !options.host_argmax {
+        return measure_pipelined_decode(runner, prompt, steps, options.sampling).await;
     }
-    let mut token = select_from_tokens(runner, prompt.to_vec(), 0, host_argmax).await?;
+    let mut token = select_from_tokens(runner, prompt.to_vec(), 0, options).await?;
     let mut schedule = Vec::with_capacity(steps.saturating_add(1));
     visit_decode_steps(u32::try_from(prompt.len())?, steps, |position, timed| {
         schedule.push((position, timed));
@@ -613,7 +638,7 @@ async fn measure_decode(
     let mut started = None;
     for (position, timed) in schedule {
         let submission_before = runner.metrics().submissions;
-        token = select_next(runner, token, position, host_argmax).await?;
+        token = select_next(runner, token, position, options).await?;
         if !timed {
             runner
                 .wait_for_submissions(
@@ -647,11 +672,17 @@ async fn measure_pipelined_decode(
     runner: &mut EngineRunner<forja_metal::MetalBackend>,
     prompt: &[u32],
     steps: usize,
+    sampling: SamplingParams,
 ) -> Result<Sample, Box<dyn Error>> {
-    let token = select_from_tokens(runner, prompt.to_vec(), 0, false).await?;
+    let options = DecodeOptions {
+        host_argmax: false,
+        overlap: true,
+        sampling,
+    };
+    let token = select_from_tokens(runner, prompt.to_vec(), 0, options).await?;
     let context_start = u32::try_from(prompt.len())?;
     let warmup_before = runner.metrics().submissions;
-    select_next(runner, token, context_start, false).await?;
+    select_next(runner, token, context_start, options).await?;
     runner
         .wait_for_submissions(
             warmup_before
@@ -676,7 +707,7 @@ async fn measure_pipelined_decode(
                     .enqueue_decode(EngineDecode {
                         tokens: None,
                         start_pos: position,
-                        sampling: SamplingParams::default(),
+                        sampling,
                     })
                     .await?
                     .map_err(|error| format!("engine decode failed: {error:?}"))?,
@@ -708,7 +739,6 @@ async fn measure_pipelined_decode(
 }
 
 #[cfg(target_os = "macos")]
-#[cfg(target_os = "macos")]
 async fn settle_submission_metrics(
     runner: &EngineRunner<forja_metal::MetalBackend>,
 ) -> Result<(), Box<dyn Error>> {
@@ -725,25 +755,23 @@ async fn measure_profiles(
     reps: usize,
     warmups: usize,
     contexts: &[usize],
-    host_argmax: bool,
-    overlap: bool,
+    options: DecodeOptions,
 ) -> Result<Vec<ProfileMeasurement>, Box<dyn Error>> {
     let mut measurements = Vec::new();
     for &context_start in contexts {
         let mut baseline = Vec::with_capacity(reps);
         let mut steps = Vec::with_capacity(reps);
         for repetition in 0..warmups.saturating_add(reps) {
-            let unprofiled = if overlap && !host_argmax {
-                prepare_profile_context(runner, tokens, context_start, host_argmax).await?;
-                measure_pipelined_profile_step(runner, context_start).await?
+            let unprofiled = if options.overlap && !options.host_argmax {
+                prepare_profile_context(runner, tokens, context_start, options).await?;
+                measure_pipelined_profile_step(runner, context_start, options.sampling).await?
             } else {
-                let token =
-                    prepare_profile_context(runner, tokens, context_start, host_argmax).await?;
-                measure_decode_step(runner, token, context_start, host_argmax).await?
+                let token = prepare_profile_context(runner, tokens, context_start, options).await?;
+                measure_decode_step(runner, token, context_start, options).await?
             };
-            let token = prepare_profile_context(runner, tokens, context_start, host_argmax).await?;
+            let token = prepare_profile_context(runner, tokens, context_start, options).await?;
             runner.set_profiling(true);
-            let profiled = measure_decode_step(runner, token, context_start, host_argmax).await;
+            let profiled = measure_decode_step(runner, token, context_start, options).await;
             runner.set_profiling(false);
             let _ = profiled?;
             let profile = runner
@@ -767,6 +795,7 @@ async fn measure_profiles(
 async fn measure_pipelined_profile_step(
     runner: &mut EngineRunner<forja_metal::MetalBackend>,
     context_start: usize,
+    sampling: SamplingParams,
 ) -> Result<Sample, Box<dyn Error>> {
     settle_submission_metrics(runner).await?;
     let before = runner.metrics();
@@ -782,7 +811,7 @@ async fn measure_pipelined_profile_step(
                             .checked_add(offset)
                             .ok_or("decode position overflowed")?,
                     )?,
-                    sampling: SamplingParams::default(),
+                    sampling,
                 })
                 .await?
                 .map_err(|error| format!("engine decode failed: {error:?}"))?,
@@ -809,13 +838,13 @@ async fn prepare_profile_context(
     runner: &mut EngineRunner<forja_metal::MetalBackend>,
     tokens: &[u32],
     context_start: usize,
-    host_argmax: bool,
+    options: DecodeOptions,
 ) -> Result<u32, Box<dyn Error>> {
     let prefill = context_start
         .checked_sub(1)
         .ok_or("profile context must follow a prefill token")?;
-    let token = select_from_tokens(runner, tokens[..prefill].to_vec(), 0, host_argmax).await?;
-    select_next(runner, token, u32::try_from(prefill)?, host_argmax).await
+    let token = select_from_tokens(runner, tokens[..prefill].to_vec(), 0, options).await?;
+    select_next(runner, token, u32::try_from(prefill)?, options).await
 }
 
 #[cfg(target_os = "macos")]
@@ -823,12 +852,12 @@ async fn measure_decode_step(
     runner: &mut EngineRunner<forja_metal::MetalBackend>,
     token: u32,
     context_start: usize,
-    host_argmax: bool,
+    options: DecodeOptions,
 ) -> Result<Sample, Box<dyn Error>> {
     settle_submission_metrics(runner).await?;
     let before = runner.metrics();
     let started = Instant::now();
-    select_next(runner, token, u32::try_from(context_start)?, host_argmax).await?;
+    select_next(runner, token, u32::try_from(context_start)?, options).await?;
     runner
         .wait_for_submissions(
             before
@@ -877,16 +906,16 @@ async fn select_from_tokens(
     runner: &mut EngineRunner<forja_metal::MetalBackend>,
     tokens: Vec<u32>,
     start_pos: u32,
-    host_argmax: bool,
+    options: DecodeOptions,
 ) -> Result<u32, Box<dyn Error>> {
-    if host_argmax {
+    if options.host_argmax {
         return host_select(runner, tokens, start_pos).await;
     }
     let output = runner
         .decode(EngineDecode {
             tokens: Some(tokens),
             start_pos,
-            sampling: SamplingParams::default(),
+            sampling: options.sampling,
         })
         .await?
         .map_err(|error| format!("engine decode failed: {error:?}"))?;
@@ -898,16 +927,16 @@ async fn select_next(
     runner: &mut EngineRunner<forja_metal::MetalBackend>,
     token: u32,
     start_pos: u32,
-    host_argmax: bool,
+    options: DecodeOptions,
 ) -> Result<u32, Box<dyn Error>> {
-    if host_argmax {
+    if options.host_argmax {
         return host_select(runner, vec![token], start_pos).await;
     }
     let output = runner
         .decode(EngineDecode {
             tokens: None,
             start_pos,
-            sampling: SamplingParams::default(),
+            sampling: options.sampling,
         })
         .await?
         .map_err(|error| format!("engine decode failed: {error:?}"))?;

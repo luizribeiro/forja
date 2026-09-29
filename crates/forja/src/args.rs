@@ -727,6 +727,7 @@ fn point(
         layers.push(Layer::new(Origin::Vary, table));
     }
     let resolved = layer::<DevConfig>(layers).map_err(|error| error.to_string())?;
+    validate_bench_sampling(&resolved.config)?;
     let mut origins = base.origins.clone();
     origins.extend(values.keys().cloned().map(|key| (key, Origin::Vary)));
     let count =
@@ -810,7 +811,8 @@ fn axis_class(key: &str) -> Result<AxisClass, String> {
     } else if matches!(
         key,
         "bench.selection" | "bench.contexts" | "bench.pp" | "bench.tg"
-    ) {
+    ) || key.starts_with("bench.sampling.")
+    {
         Ok(AxisClass::Workload)
     } else if ["limits", "paths", "run", "verify"]
         .iter()
@@ -821,6 +823,17 @@ fn axis_class(key: &str) -> Result<AxisClass, String> {
     } else {
         Err(format!("configuration key {key} is not a benchmark axis"))
     }
+}
+
+fn validate_bench_sampling(config: &DevConfig) -> Result<(), String> {
+    let sampling = config.bench.sampling;
+    if !sampling.temperature.is_finite() || sampling.temperature < 0.0 {
+        return Err("bench.sampling.temperature must be finite and nonnegative".to_owned());
+    }
+    if !(sampling.top_p.is_finite() && 0.0 < sampling.top_p && sampling.top_p <= 1.0) {
+        return Err("bench.sampling.top_p must be finite and in (0, 1]".to_owned());
+    }
+    Ok(())
 }
 
 impl RunArgs {
@@ -1113,6 +1126,75 @@ mod tests {
     }
 
     #[test]
+    fn varies_benchmark_sampling_parameters() {
+        let command = parse(
+            [
+                "bench",
+                "--engine",
+                "/engine.wasm",
+                "--model-dir",
+                "/model",
+                "--vary",
+                "bench.sampling.temperature=0.0,0.7",
+                "--vary",
+                "bench.sampling.top_p=1.0,0.9",
+            ]
+            .map(str::to_owned),
+        )
+        .unwrap();
+        let Command::Bench(options) = command else {
+            panic!("expected bench command");
+        };
+        assert_eq!(options.points.len(), 4);
+        assert_eq!(
+            options
+                .points
+                .iter()
+                .map(|point| {
+                    (
+                        point.config.bench.sampling.temperature.to_bits(),
+                        point.config.bench.sampling.top_p.to_bits(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            [
+                (0.0_f32.to_bits(), 1.0_f32.to_bits()),
+                (0.0_f32.to_bits(), 0.9_f32.to_bits()),
+                (0.7_f32.to_bits(), 1.0_f32.to_bits()),
+                (0.7_f32.to_bits(), 0.9_f32.to_bits()),
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_benchmark_sampling_parameters() {
+        for setting in [
+            "bench.sampling.temperature=-1.0",
+            "bench.sampling.temperature=nan",
+            "bench.sampling.top_p=0.0",
+            "bench.sampling.top_p=1.1",
+            "bench.sampling.top_p=nan",
+        ] {
+            assert!(
+                parse(
+                    [
+                        "bench",
+                        "--engine",
+                        "/engine.wasm",
+                        "--model-dir",
+                        "/model",
+                        "--set",
+                        setting,
+                    ]
+                    .map(str::to_owned),
+                )
+                .is_err(),
+                "accepted {setting}"
+            );
+        }
+    }
+
+    #[test]
     fn classifies_axes_and_refuses_non_axes() {
         assert_eq!(
             axis_class("backend.metal.graph_replay"),
@@ -1120,6 +1202,10 @@ mod tests {
         );
         assert_eq!(axis_class("engine.tunings"), Ok(AxisClass::Tuning));
         assert_eq!(axis_class("bench.contexts"), Ok(AxisClass::Workload));
+        assert_eq!(
+            axis_class("bench.sampling.temperature"),
+            Ok(AxisClass::Workload)
+        );
         for key in [
             "limits.live_bytes",
             "paths.models",
