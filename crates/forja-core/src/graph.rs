@@ -556,7 +556,7 @@ impl GraphTemplate {
                 TemplateDispatch::Static(dispatch) => dispatch.as_ref().clone(),
                 TemplateDispatch::Dynamic(dispatch) => dispatch.instantiate(values, self.limits)?,
             };
-            commands.push_prevalidated(concrete);
+            commands.push_and_reset_validation(concrete);
         }
         commands.set_precomputed_barriers(self.required_barriers.clone());
         Ok(commands)

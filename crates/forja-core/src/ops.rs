@@ -389,7 +389,7 @@ impl CommandList {
     /// Returns [`OpError`] for an invalid signature or unsafe aliasing.
     pub fn dispatch(&mut self, op: Op, inputs: &[&Tensor], output: &Tensor) -> Result<(), OpError> {
         let dispatch = Dispatch::new(op, inputs, output)?;
-        self.push_prevalidated(dispatch);
+        self.push_and_reset_validation(dispatch);
         Ok(())
     }
 
@@ -407,12 +407,12 @@ impl CommandList {
     ) -> Result<(), OpError> {
         let started = Instant::now();
         let dispatch = Dispatch::kernel(program, inputs, outputs)?;
-        self.push_prevalidated(dispatch);
+        self.push_and_reset_validation(dispatch);
         self.record_program(started);
         Ok(())
     }
 
-    pub(crate) fn push_prevalidated(&mut self, dispatch: Dispatch) {
+    pub(crate) fn push_and_reset_validation(&mut self, dispatch: Dispatch) {
         self.validation = ValidationState::Fresh;
         self.dispatches.push(dispatch);
     }
