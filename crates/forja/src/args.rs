@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 pub(crate) const USAGE: &str = "usage:
   forja run --model-dir PATH --prompt TEXT [--max-tokens N] [--backend metal|cpu]
-  forja bench --model-dir PATH [--pp N] [--tg N] [--reps N] [--json PATH] [--profile] [--no-replay]
+  forja bench --model-dir PATH [--precision f32|bf16] [--pp N] [--tg N] [--reps N] [--json PATH] [--profile] [--no-replay]
   forja verify --model-dir PATH --fixtures PATH [--backend metal|cpu] [--precision f32|bf16] [--prompts NAME,...]";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -43,6 +43,7 @@ pub(crate) struct Bench {
     pub(crate) json: Option<PathBuf>,
     pub(crate) profile: bool,
     pub(crate) no_replay: bool,
+    pub(crate) precision: Option<Precision>,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -71,6 +72,7 @@ fn parse_bench(mut arguments: impl Iterator<Item = String>) -> Result<Bench, Str
     let mut json = None;
     let mut profile = false;
     let mut no_replay = false;
+    let mut precision = None;
     while let Some(option) = arguments.next() {
         if option == "--profile" && !profile {
             profile = true;
@@ -89,6 +91,7 @@ fn parse_bench(mut arguments: impl Iterator<Item = String>) -> Result<Bench, Str
             "--tg" if tg.is_none() => tg = Some(parse_count(&value, "generated tokens")?),
             "--reps" if reps.is_none() => reps = Some(parse_count(&value, "repetitions")?),
             "--json" if json.is_none() => json = Some(PathBuf::from(value)),
+            "--precision" if precision.is_none() => precision = Some(parse_precision(&value)?),
             _ if option.starts_with("--") => {
                 return Err(format!("unknown or repeated option {option:?}"));
             }
@@ -103,6 +106,7 @@ fn parse_bench(mut arguments: impl Iterator<Item = String>) -> Result<Bench, Str
         json,
         profile,
         no_replay,
+        precision,
     })
 }
 
@@ -156,6 +160,14 @@ fn parse_backend(value: &str) -> Result<Backend, String> {
     }
 }
 
+fn parse_precision(value: &str) -> Result<Precision, String> {
+    match value {
+        "f32" => Ok(Precision::F32),
+        "bf16" => Ok(Precision::Bf16),
+        _ => Err(format!("unknown precision {value:?}")),
+    }
+}
+
 fn parse_verify(mut arguments: impl Iterator<Item = String>) -> Result<Verify, String> {
     let mut model_dir = None;
     let mut fixtures = None;
@@ -173,11 +185,7 @@ fn parse_verify(mut arguments: impl Iterator<Item = String>) -> Result<Verify, S
                 backend = parse_backend(&value)?;
             }
             "--precision" => {
-                precision = match value.as_str() {
-                    "f32" => Precision::F32,
-                    "bf16" => Precision::Bf16,
-                    _ => return Err(format!("unknown precision {value:?}")),
-                };
+                precision = parse_precision(&value)?;
             }
             "--prompts" => {
                 let names = value.split(',').collect::<Vec<_>>();
@@ -234,6 +242,7 @@ mod tests {
                 json: Some(PathBuf::from("/result.json")),
                 profile: false,
                 no_replay: false,
+                precision: None,
             })
         );
     }
@@ -241,7 +250,16 @@ mod tests {
     #[test]
     fn parses_benchmark_profile_flag() {
         let command = parse(
-            ["bench", "--model-dir", "/model", "--profile", "--no-replay"].map(str::to_owned),
+            [
+                "bench",
+                "--model-dir",
+                "/model",
+                "--profile",
+                "--no-replay",
+                "--precision",
+                "bf16",
+            ]
+            .map(str::to_owned),
         )
         .unwrap();
         let Command::Bench(options) = command else {
@@ -249,6 +267,7 @@ mod tests {
         };
         assert!(options.profile);
         assert!(options.no_replay);
+        assert_eq!(options.precision, Some(Precision::Bf16));
     }
 
     #[test]

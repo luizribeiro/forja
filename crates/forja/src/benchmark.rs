@@ -12,7 +12,7 @@ use forja_host::{EngineMetrics, EngineRunner, EngineStep, EngineStepProfile, Imp
 use golden_fixtures::sha256_file;
 
 use crate::{
-    args::Bench,
+    args::{Bench, Precision},
     benchmark_stats::{Stats, stats, synthetic_tokens},
     engine::limits,
 };
@@ -80,18 +80,12 @@ async fn run_metal(options: &Bench) -> Result<(), Box<dyn Error>> {
     println!(
         "precision\tmetric\twall tok/s (95% CI)\tGPU tok/s (95% CI)\twall ms\tGPU ms\tsubmissions"
     );
-    let components = if options.no_replay {
-        [
-            ("f32", test_guests::qwen3_no_replay()),
-            ("bf16", test_guests::qwen3_bf16_no_replay()),
-        ]
-    } else {
-        [
-            ("f32", test_guests::qwen3()),
-            ("bf16", test_guests::qwen3_bf16()),
-        ]
-    };
-    for (precision, component) in components {
+    let precisions = options.precision.map_or_else(
+        || vec![Precision::F32, Precision::Bf16],
+        |value| vec![value],
+    );
+    for precision in precisions {
+        let (precision, component) = component(precision, !options.no_replay);
         let (pp, tg, device, profiles) = bench_precision(options, component).await?;
         print_summary(precision, "pp", pp);
         print_summary(precision, "tg", tg);
@@ -140,6 +134,16 @@ async fn run_metal(options: &Bench) -> Result<(), Box<dyn Error>> {
         fs::write(path, bytes)?;
     }
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn component(precision: Precision, replay: bool) -> (&'static str, &'static Path) {
+    match (precision, replay) {
+        (Precision::F32, true) => ("f32", test_guests::qwen3()),
+        (Precision::F32, false) => ("f32", test_guests::qwen3_no_replay()),
+        (Precision::Bf16, true) => ("bf16", test_guests::qwen3_bf16()),
+        (Precision::Bf16, false) => ("bf16", test_guests::qwen3_bf16_no_replay()),
+    }
 }
 
 #[cfg(target_os = "macos")]
