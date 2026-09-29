@@ -294,7 +294,7 @@ const VECTOR_SELECTED_MIN_KEY_LENGTH: u32 = 512;
 const VECTOR_MAX_KEY_LENGTH: u32 = 65_536;
 const STEEL_SELECTED_MIN_QUERY_LENGTH: u32 = 512;
 const ARGMAX_CHUNK_WIDTH: u32 = 2048;
-const SAMPLE_RADIX_PASSES: [(u32, u32); 3] = [(21, 2047), (10, 2047), (0, 1023)];
+const SAMPLE_REJECTION_ROUNDS: u32 = 1;
 const SAMPLE_ERROR: usize = 0;
 const SAMPLE_LOGITS_LAYOUT: usize = 1;
 const SAMPLE_PARAMS_LAYOUT: usize = 2;
@@ -302,7 +302,8 @@ const SAMPLE_OUTPUT_LAYOUT: usize = 3;
 const SAMPLE_WIDTH: usize = 4;
 const SAMPLE_POSITION: usize = 5;
 const SAMPLE_CHUNKS: usize = 6;
-const SAMPLE_RADIX_ARGUMENTS: usize = 7;
+const SAMPLE_MAX_ROUNDS: usize = 7;
+const SAMPLE_ROUND_ARGUMENTS: usize = 8;
 
 struct EncodedDispatches {
     temporaries: Vec<BufferBinding>,
@@ -711,6 +712,15 @@ impl Drop for TemporaryProfileScope {
 #[cfg(test)]
 thread_local! {
     static FORCED_SDPA_KERNEL: Cell<Option<SdpaKernel>> = const { Cell::new(None) };
+    static FORCED_SAMPLE_REJECTION_ROUNDS: Cell<Option<u32>> = const { Cell::new(None) };
+}
+
+fn sample_rejection_rounds() -> u32 {
+    #[cfg(test)]
+    if let Some(rounds) = FORCED_SAMPLE_REJECTION_ROUNDS.with(Cell::get) {
+        return rounds.min(SAMPLE_REJECTION_ROUNDS);
+    }
+    SAMPLE_REJECTION_ROUNDS
 }
 
 struct MetalCallbackScope(bool);
@@ -1229,6 +1239,30 @@ impl Completion {
         Ok(())
     }
 
+    fn sample_fallbacks(&self) -> u64 {
+        self.resources
+            .error_flags
+            .iter()
+            .fold(0_u64, |count, &(flag, offset)| {
+                // SAFETY: Profiles are read only after GPU completion, and every error flag owns two
+                // aligned u32 words in a retained shared buffer.
+                let value = unsafe {
+                    self.resources.buffers[flag]
+                        .raw
+                        .contents()
+                        .cast::<u32>()
+                        .as_ptr()
+                        .add(offset / size_of::<u32>() + 1)
+                        .read()
+                };
+                if value == u32::MAX {
+                    count
+                } else {
+                    count.saturating_add(u64::from(value))
+                }
+            })
+    }
+
     fn gpu_time(&self) -> Option<Duration> {
         self.timestamps.as_ref()?.elapsed()
     }
@@ -1498,6 +1532,7 @@ impl Submission for MetalSubmission {
 
     fn profile(&self) -> Option<SubmissionProfile> {
         let mut profile = self.profile.as_ref()?.lock().ok()?.clone();
+        profile.sample_fallbacks = self.completion.sample_fallbacks();
         profile.per_dispatch = self.completion.dispatch_times(&self.dispatch_operations)?;
         Some(profile)
     }
@@ -3393,7 +3428,7 @@ impl MetalBackend {
             .last()
             .ok_or(BackendError::InvalidInput)?;
         let chunks = width.div_ceil(ARGMAX_CHUNK_WIDTH);
-        let mut written = Vec::with_capacity(13);
+        let mut written = Vec::with_capacity(10);
         written.push(arguments.write_argument(&[0_u8; 8])?);
         for layout in [
             logits.layout(),
@@ -3405,9 +3440,9 @@ impl MetalBackend {
         for value in [width, position, chunks] {
             written.push(arguments.write_argument(&value.to_ne_bytes())?);
         }
-        for (shift, mask) in SAMPLE_RADIX_PASSES {
-            written.push(arguments.write_argument(&shift.to_ne_bytes())?);
-            written.push(arguments.write_argument(&mask.to_ne_bytes())?);
+        written.push(arguments.write_argument(&sample_rejection_rounds().to_ne_bytes())?);
+        for round in 0..SAMPLE_REJECTION_ROUNDS {
+            written.push(arguments.write_argument(&round.to_ne_bytes())?);
         }
         Ok(written)
     }
@@ -3434,21 +3469,19 @@ impl MetalBackend {
         let rows = u32::try_from(output.layout().element_count())
             .map_err(|_| BackendError::ExecutionFailed)?;
         let chunks = width.div_ceil(ARGMAX_CHUNK_WIDTH);
-        let histogram = self.scratch_tensor(DType::U32, &[rows, 2048])?;
-        let state = self.scratch_tensor(DType::U32, &[rows, 4])?;
-        let candidates = self.scratch_tensor(DType::U32, &[rows, 1024, 2])?;
+        let state = self.scratch_tensor(DType::U32, &[rows, 7])?;
+        let rejection_partials = self.scratch_tensor(DType::U32, &[rows, chunks, 4])?;
         let partials = self.scratch_tensor(DType::U32, &[rows, chunks, 2])?;
         let dtype = [(0, dtype_code(logits.layout().dtype()))];
         let (
             prepare_pipeline,
-            radix_histogram_pipeline,
-            radix_locate_pipeline,
-            index_histogram_pipeline,
-            index_locate_pipeline,
-            compact_pipeline,
+            rejection_proposal_partials_pipeline,
+            rejection_proposal_finalize_pipeline,
+            rejection_threshold_partials_pipeline,
+            rejection_threshold_finalize_pipeline,
+            exact_fallback_pipeline,
             partials_pipeline,
             reduce_finalize_pipeline,
-            candidates_finalize_pipeline,
         ) = {
             let mut pipelines = self
                 .pipelines
@@ -3456,14 +3489,13 @@ impl MetalBackend {
                 .map_err(|_| BackendError::ExecutionFailed)?;
             (
                 pipelines.get("sample_prepare", &[])?,
-                pipelines.get("sample_radix_histogram", &dtype)?,
-                pipelines.get("sample_radix_locate", &[])?,
-                pipelines.get("sample_index_histogram", &dtype)?,
-                pipelines.get("sample_index_locate", &dtype)?,
-                pipelines.get("sample_compact", &dtype)?,
+                pipelines.get("sample_rejection_proposal_partials", &dtype)?,
+                pipelines.get("sample_rejection_proposal_finalize", &[])?,
+                pipelines.get("sample_rejection_threshold_partials", &dtype)?,
+                pipelines.get("sample_rejection_threshold_finalize", &dtype)?,
+                pipelines.get("sample_exact_fallback", &dtype)?,
                 pipelines.get("sample_partials", &dtype)?,
                 pipelines.get("sample_reduce_finalize", &[])?,
-                pipelines.get("sample_candidates_finalize", &dtype)?,
             )
         };
         let mut temporaries = Self::write_sample_arguments(dispatch, position, arguments)?;
@@ -3493,18 +3525,18 @@ impl MetalBackend {
             depth: 1,
         };
         let threads = MTLSize {
-            width: simd_thread_count(&radix_histogram_pipeline, 256)?,
+            width: simd_thread_count(&rejection_proposal_partials_pipeline, 256)?,
             height: 1,
             depth: 1,
         };
 
         set_pipeline(encoder, &prepare_pipeline);
         bindings.bind(table, 0, &sampling_buffer);
-        bindings.bind(table, 1, &histogram.buffer);
-        bindings.bind(table, 2, &state.buffer);
-        bindings.bind(table, 3, &temporaries[SAMPLE_PARAMS_LAYOUT]);
-        bindings.bind(table, 4, &temporaries[SAMPLE_WIDTH]);
-        bindings.bind(table, 5, &temporaries[SAMPLE_ERROR]);
+        bindings.bind(table, 1, &state.buffer);
+        bindings.bind(table, 2, &temporaries[SAMPLE_PARAMS_LAYOUT]);
+        bindings.bind(table, 3, &temporaries[SAMPLE_WIDTH]);
+        bindings.bind(table, 4, &temporaries[SAMPLE_ERROR]);
+        bindings.bind(table, 5, &temporaries[SAMPLE_MAX_ROUNDS]);
         set_argument_table(encoder, table);
         dispatch_threadgroups(encoder, row_groups, threads);
 
@@ -3516,55 +3548,72 @@ impl MetalBackend {
             sampling_layout: &temporaries[SAMPLE_PARAMS_LAYOUT],
             width: &temporaries[SAMPLE_WIDTH],
         };
-        for (pass, _) in SAMPLE_RADIX_PASSES.iter().enumerate() {
+        for round in 0..sample_rejection_rounds() {
+            let round_buffer = &temporaries[SAMPLE_ROUND_ARGUMENTS
+                + usize::try_from(round).map_err(|_| BackendError::ExecutionFailed)?];
             encode_dispatch_barrier(encoder);
-            let shift_buffer = &temporaries[SAMPLE_RADIX_ARGUMENTS + pass * 2];
-            let mask_buffer = &temporaries[SAMPLE_RADIX_ARGUMENTS + pass * 2 + 1];
-            set_pipeline(encoder, &radix_histogram_pipeline);
-            common.bind(table, bindings, &histogram.buffer);
-            bindings.bind(table, 7, shift_buffer);
-            bindings.bind(table, 8, mask_buffer);
+            set_pipeline(encoder, &rejection_proposal_partials_pipeline);
+            common.bind(table, bindings, &rejection_partials.buffer);
+            bindings.bind(table, 7, &temporaries[SAMPLE_POSITION]);
+            bindings.bind(table, 8, round_buffer);
             bindings.bind(table, 9, &temporaries[SAMPLE_CHUNKS]);
             set_argument_table(encoder, table);
             dispatch_threadgroups(encoder, chunk_groups, threads);
+
             encode_dispatch_barrier(encoder);
-            set_pipeline(encoder, &radix_locate_pipeline);
-            bindings.bind(table, 0, &sampling_buffer);
-            bindings.bind(table, 1, &histogram.buffer);
-            bindings.bind(table, 2, &state.buffer);
-            bindings.bind(table, 3, &temporaries[SAMPLE_PARAMS_LAYOUT]);
-            bindings.bind(table, 4, &temporaries[SAMPLE_WIDTH]);
-            bindings.bind(table, 5, shift_buffer);
-            bindings.bind(table, 6, mask_buffer);
+            set_pipeline(encoder, &rejection_proposal_finalize_pipeline);
+            bindings.bind(table, 0, &rejection_partials.buffer);
+            bindings.bind(table, 1, &state.buffer);
+            bindings.bind(table, 2, &temporaries[SAMPLE_CHUNKS]);
+            set_argument_table(encoder, table);
+            dispatch_threadgroups(encoder, row_groups, threads);
+
+            encode_dispatch_barrier(encoder);
+            set_pipeline(encoder, &rejection_threshold_partials_pipeline);
+            common.bind(table, bindings, &rejection_partials.buffer);
+            bindings.bind(table, 7, &temporaries[SAMPLE_CHUNKS]);
+            set_argument_table(encoder, table);
+            dispatch_threadgroups(encoder, chunk_groups, threads);
+
+            encode_dispatch_barrier(encoder);
+            set_pipeline(encoder, &rejection_threshold_finalize_pipeline);
+            bindings.bind(table, 0, &logits_buffer);
+            bindings.bind(table, 1, &sampling_buffer);
+            bindings.bind(table, 2, &rejection_partials.buffer);
+            bindings.bind(table, 3, &state.buffer);
+            bindings.bind(table, 4, &output_buffer);
+            bindings.bind(table, 5, &temporaries[SAMPLE_LOGITS_LAYOUT]);
+            bindings.bind(table, 6, &temporaries[SAMPLE_PARAMS_LAYOUT]);
+            bindings.bind(table, 7, &temporaries[SAMPLE_OUTPUT_LAYOUT]);
+            bindings.bind(table, 8, &temporaries[SAMPLE_WIDTH]);
+            bindings.bind(table, 9, round_buffer);
+            bindings.bind(table, 10, &temporaries[SAMPLE_MAX_ROUNDS]);
+            bindings.bind(table, 11, &temporaries[SAMPLE_CHUNKS]);
             set_argument_table(encoder, table);
             dispatch_threadgroups(encoder, row_groups, threads);
         }
-
         encode_dispatch_barrier(encoder);
-        set_pipeline(encoder, &index_histogram_pipeline);
-        common.bind(table, bindings, &histogram.buffer);
-        bindings.bind(table, 7, &temporaries[SAMPLE_CHUNKS]);
-        set_argument_table(encoder, table);
-        dispatch_threadgroups(encoder, chunk_groups, threads);
-
-        encode_dispatch_barrier(encoder);
-        set_pipeline(encoder, &index_locate_pipeline);
-        common.bind(table, bindings, &histogram.buffer);
+        set_pipeline(encoder, &exact_fallback_pipeline);
+        bindings.bind(table, 0, &logits_buffer);
+        bindings.bind(table, 1, &sampling_buffer);
+        bindings.bind(table, 2, &state.buffer);
+        bindings.bind(table, 3, &output_buffer);
+        bindings.bind(table, 4, &temporaries[SAMPLE_LOGITS_LAYOUT]);
+        bindings.bind(table, 5, &temporaries[SAMPLE_PARAMS_LAYOUT]);
+        bindings.bind(table, 6, &temporaries[SAMPLE_OUTPUT_LAYOUT]);
+        bindings.bind(table, 7, &temporaries[SAMPLE_WIDTH]);
+        bindings.bind(table, 8, &temporaries[SAMPLE_POSITION]);
+        bindings.bind(table, 9, &temporaries[SAMPLE_MAX_ROUNDS]);
+        bindings.bind(table, 10, &temporaries[SAMPLE_ERROR]);
         set_argument_table(encoder, table);
         dispatch_threadgroups(encoder, row_groups, threads);
-
-        encode_dispatch_barrier(encoder);
-        set_pipeline(encoder, &compact_pipeline);
-        common.bind(table, bindings, &candidates.buffer);
-        bindings.bind(table, 7, &temporaries[SAMPLE_CHUNKS]);
-        set_argument_table(encoder, table);
-        dispatch_threadgroups(encoder, chunk_groups, threads);
 
         encode_dispatch_barrier(encoder);
         set_pipeline(encoder, &partials_pipeline);
         common.bind(table, bindings, &partials.buffer);
         bindings.bind(table, 7, &temporaries[SAMPLE_POSITION]);
         bindings.bind(table, 8, &temporaries[SAMPLE_CHUNKS]);
+        bindings.bind(table, 9, &temporaries[SAMPLE_MAX_ROUNDS]);
         set_argument_table(encoder, table);
         dispatch_threadgroups(encoder, chunk_groups, threads);
 
@@ -3572,24 +3621,12 @@ impl MetalBackend {
         set_pipeline(encoder, &reduce_finalize_pipeline);
         bindings.bind(table, 0, &sampling_buffer);
         bindings.bind(table, 1, &partials.buffer);
-        bindings.bind(table, 2, &output_buffer);
-        bindings.bind(table, 3, &temporaries[SAMPLE_PARAMS_LAYOUT]);
-        bindings.bind(table, 4, &temporaries[SAMPLE_OUTPUT_LAYOUT]);
-        bindings.bind(table, 5, &temporaries[SAMPLE_WIDTH]);
-        bindings.bind(table, 6, &temporaries[SAMPLE_CHUNKS]);
-        set_argument_table(encoder, table);
-        dispatch_threadgroups(encoder, row_groups, threads);
-
-        set_pipeline(encoder, &candidates_finalize_pipeline);
-        bindings.bind(table, 0, &logits_buffer);
-        bindings.bind(table, 1, &sampling_buffer);
-        bindings.bind(table, 2, &candidates.buffer);
+        bindings.bind(table, 2, &state.buffer);
         bindings.bind(table, 3, &output_buffer);
-        bindings.bind(table, 4, &temporaries[SAMPLE_LOGITS_LAYOUT]);
-        bindings.bind(table, 5, &temporaries[SAMPLE_PARAMS_LAYOUT]);
-        bindings.bind(table, 6, &temporaries[SAMPLE_OUTPUT_LAYOUT]);
-        bindings.bind(table, 7, &temporaries[SAMPLE_WIDTH]);
-        bindings.bind(table, 8, &temporaries[SAMPLE_POSITION]);
+        bindings.bind(table, 4, &temporaries[SAMPLE_PARAMS_LAYOUT]);
+        bindings.bind(table, 5, &temporaries[SAMPLE_OUTPUT_LAYOUT]);
+        bindings.bind(table, 6, &temporaries[SAMPLE_WIDTH]);
+        bindings.bind(table, 7, &temporaries[SAMPLE_CHUNKS]);
         set_argument_table(encoder, table);
         dispatch_threadgroups(encoder, row_groups, threads);
 
@@ -3597,9 +3634,8 @@ impl MetalBackend {
             logits_buffer,
             sampling_buffer,
             output_buffer,
-            histogram.buffer,
             state.buffer,
-            candidates.buffer,
+            rejection_partials.buffer,
             partials.buffer,
         ]);
         Ok((temporaries, error_flag))
@@ -4787,6 +4823,10 @@ fn nan_preserving_kernel(name: &str) -> bool {
         "softmax_single"
             | "softmax_looped"
             | "argmax_partials"
+            | "sample_rejection_proposal_partials"
+            | "sample_rejection_threshold_partials"
+            | "sample_rejection_threshold_finalize"
+            | "sample_exact_fallback"
             | "sample_radix_histogram"
             | "sample_index_histogram"
             | "sample_index_locate"
@@ -4853,9 +4893,73 @@ mod tests {
         .collect()
     }
 
+    fn allowed_sample_indices(
+        logits: &[f32],
+        temperature: f32,
+        top_k: u32,
+        top_p: f32,
+    ) -> Vec<u32> {
+        let mut allowed = (0..logits.len()).collect::<Vec<_>>();
+        allowed.sort_unstable_by(|&left, &right| {
+            logits[right]
+                .total_cmp(&logits[left])
+                .then_with(|| right.cmp(&left))
+        });
+        let requested = usize::try_from(top_k).unwrap();
+        let cap = if top_p < 1.0 {
+            if requested == 0 {
+                1024
+            } else {
+                requested.min(1024)
+            }
+        } else if requested == 0 {
+            allowed.len()
+        } else {
+            requested
+        };
+        allowed.truncate(cap.min(allowed.len()));
+        if top_p < 1.0 {
+            let maximum = logits[allowed[0]];
+            let weights = allowed
+                .iter()
+                .map(|&index| ((logits[index] - maximum) / temperature).exp())
+                .collect::<Vec<_>>();
+            let total = weights.iter().sum::<f32>();
+            let mut cumulative = 0.0;
+            let keep = weights
+                .iter()
+                .position(|weight| {
+                    cumulative += weight / total;
+                    cumulative >= top_p
+                })
+                .map_or(weights.len(), |index| index + 1);
+            allowed.truncate(keep.max(1));
+        }
+        allowed
+            .into_iter()
+            .map(|index| u32::try_from(index).unwrap())
+            .collect()
+    }
+
+    struct SampleRoundsOverride(Option<u32>);
+
+    impl SampleRoundsOverride {
+        fn set(rounds: u32) -> Self {
+            let previous =
+                FORCED_SAMPLE_REJECTION_ROUNDS.with(|forced| forced.replace(Some(rounds)));
+            Self(previous)
+        }
+    }
+
+    impl Drop for SampleRoundsOverride {
+        fn drop(&mut self) {
+            FORCED_SAMPLE_REJECTION_ROUNDS.with(|forced| forced.set(self.0));
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
-    fn run_sample(
-        backend: &MetalBackend,
+    fn run_sample<B: Backend>(
+        backend: &B,
         logits: &[u8],
         width: u32,
         temperature: f32,
@@ -6877,29 +6981,73 @@ mod tests {
     }
 
     #[test]
-    fn metal_sample_matches_cpu_for_large_tied_populations() {
+    fn metal_forced_sampling_fallback_preserves_distribution() {
+        let _rounds = SampleRoundsOverride::set(0);
+        let backend = MetalBackend::new().unwrap();
+        let logits = [2.0_f32, 1.0, 0.0]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>();
+        let trials = 4_096_u32;
+        let mut counts = [0_u32; 3];
+        for position in 0..trials {
+            let token = run_sample(&backend, &logits, 3, 1.0, 2, 1.0, 95, position).unwrap();
+            counts[usize::try_from(token).unwrap()] += 1;
+        }
+        let expected = [0.731_058_6_f32, 0.268_941_4];
+        let statistic = counts[..2]
+            .iter()
+            .zip(expected)
+            .map(|(&count, probability)| {
+                let expected_count = probability * 4096.0;
+                let difference = f32::from(u16::try_from(count).unwrap()) - expected_count;
+                difference * difference / expected_count
+            })
+            .sum::<f32>();
+        assert!(statistic < 16.3, "chi-squared statistic was {statistic}");
+        assert_eq!(counts[2], 0);
+    }
+
+    #[test]
+    fn metal_and_cpu_sample_from_same_large_tied_allowed_sets() {
         let reference = CpuBackend::new();
         let candidate = MetalBackend::new().unwrap();
         for width in [4_097_u32, 151_936] {
-            let logits = (0..usize::try_from(width).unwrap())
-                .flat_map(|index| [3.0_f32, 1.0, 3.0, 0.0, 2.0][index % 5].to_le_bytes())
+            let values = (0..usize::try_from(width).unwrap())
+                .map(|index| [3.0_f32, 1.0, 3.0, 0.0, 2.0][index % 5])
+                .collect::<Vec<_>>();
+            let logits = values
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
                 .collect::<Vec<_>>();
             for (top_k, top_p) in [(513, 1.0), (2_049, 1.0), (0, 0.9)] {
-                assert_backends_agree(
-                    &reference,
-                    &candidate,
-                    Op::Sample { position: 57 },
-                    &[
-                        TensorSpec::initialized(DType::F32, &[1, width], logits.clone()),
-                        TensorSpec::initialized(
-                            DType::U32,
-                            &[5],
-                            sample_params(0.7, top_k, top_p, 0xfeed_beef_dead_cafe),
-                        ),
-                    ],
-                    &TensorSpec::contiguous(DType::U32, &[1]),
-                )
-                .unwrap();
+                let allowed = allowed_sample_indices(&values, 0.7, top_k, top_p);
+                for backend_token in [
+                    run_sample(
+                        &reference,
+                        &logits,
+                        width,
+                        0.7,
+                        top_k,
+                        top_p,
+                        0xfeed_beef_dead_cafe,
+                        57,
+                    )
+                    .unwrap(),
+                    run_sample(
+                        &candidate,
+                        &logits,
+                        width,
+                        0.7,
+                        top_k,
+                        top_p,
+                        0xfeed_beef_dead_cafe,
+                        57,
+                    )
+                    .unwrap(),
+                ] {
+                    assert!(allowed.contains(&backend_token));
+                }
             }
         }
     }

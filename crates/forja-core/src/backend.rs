@@ -238,6 +238,8 @@ pub struct SubmissionProfile {
     pub program_encoding: ProfileCount,
     /// Resident program compilations skipped because no compile token was available.
     pub program_compile_fallbacks: u64,
+    /// Sampling rows that exhausted rejection rounds and used the exact fallback.
+    pub sample_fallbacks: u64,
     /// Command validation and hazard analysis.
     pub validation: Duration,
     /// Temporary Metal buffers created while encoding.

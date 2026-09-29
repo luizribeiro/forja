@@ -348,8 +348,9 @@ ulong splitmix64(ulong value) {
     return value ^ (value >> 31);
 }
 
-float gumbel_noise(ulong seed, uint position, uint index) {
-    ulong counter = seed ^ (ulong(position) << 32) ^ ulong(index);
+float gumbel_noise(ulong seed, uint position, uint round, uint index) {
+    ulong counter = seed ^ (ulong(position) << 32) ^
+                    (ulong(round) * 0xd1342543de82ef95ul) ^ ulong(index);
     uint mantissa = uint(splitmix64(counter) >> 40);
     float uniform = (float(mantissa) + 0.5f) * (1.0f / 16777216.0f);
     return -log(-log(uniform));
@@ -402,11 +403,27 @@ bool sampling_uses_candidates(SamplingConfig config, uint width) {
            (config.top_p < 1.0f || (count < width && count <= 1024u));
 }
 
+bool sampling_needs_rejection(SamplingConfig config, uint width) {
+    return !sampling_is_greedy(config) &&
+           (config.top_p < 1.0f || (config.top_k != 0 && config.top_k < width));
+}
+
 constant uint sample_prefix = 0;
 constant uint sample_remaining = 1;
 constant uint sample_cutoff = 2;
 constant uint sample_selected = 3;
-constant uint sample_state_words = 4;
+constant uint sample_status = 4;
+constant uint sample_proposal = 5;
+constant uint sample_maximum = 6;
+constant uint sample_state_words = 7;
+constant uint sample_pending = 0;
+constant uint sample_accepted = 1;
+constant uint sample_exact = 2;
+
+bool sample_uses_exact(device atomic_uint *state, uint row) {
+    return atomic_load_explicit(
+        state + row * sample_state_words + sample_status, memory_order_relaxed) == sample_exact;
+}
 
 void sample_histogram_add(
     uint bucket,
@@ -437,11 +454,11 @@ void sample_histogram_add(
 
 kernel void sample_prepare(
     device const uint *sampling [[buffer(0)]],
-    device uint *histogram [[buffer(1)]],
-    device atomic_uint *state [[buffer(2)]],
-    constant TensorLayout &sampling_layout [[buffer(3)]],
-    constant uint &width [[buffer(4)]],
-    device atomic_uint *error_flag [[buffer(5)]],
+    device atomic_uint *state [[buffer(1)]],
+    constant TensorLayout &sampling_layout [[buffer(2)]],
+    constant uint &width [[buffer(3)]],
+    device atomic_uint *error_flag [[buffer(4)]],
+    constant uint &max_rounds [[buffer(5)]],
     uint row [[threadgroup_position_in_grid]],
     uint lane [[thread_position_in_threadgroup]],
     uint group_width [[threads_per_threadgroup]]) {
@@ -449,19 +466,469 @@ kernel void sample_prepare(
     if (invalid_sampling(config)) {
         if (lane == 0) {
             atomic_store_explicit(error_flag, 2, memory_order_relaxed);
+            atomic_store_explicit(
+                state + row * sample_state_words + sample_status,
+                sample_accepted, memory_order_relaxed);
         }
         return;
     }
     if (lane < sample_state_words) {
-        uint values[4] = {0, sampling_candidate_count(config, width), 0, 0};
+        uint status = sampling_needs_rejection(config, width) && max_rounds != 0
+            ? sample_pending
+            : sample_exact;
+        uint values[7] = {
+            0, sampling_candidate_count(config, width), 0, 0, status, 0, 0
+        };
         atomic_store_explicit(
             state + row * sample_state_words + lane, values[lane], memory_order_relaxed);
     }
-    if (!sampling_needs_radix(config, width)) {
+}
+
+kernel void sample_rejection_proposal_partials(
+    device const uchar *logits [[buffer(0)]],
+    device const uint *sampling [[buffer(1)]],
+    device uint *partials [[buffer(2)]],
+    device atomic_uint *state [[buffer(3)]],
+    constant TensorLayout &logits_layout [[buffer(4)]],
+    constant TensorLayout &sampling_layout [[buffer(5)]],
+    constant uint &width [[buffer(6)]],
+    constant uint &position [[buffer(7)]],
+    constant uint &round [[buffer(8)]],
+    constant uint &chunks [[buffer(9)]],
+    uint group [[threadgroup_position_in_grid]],
+    uint lane [[thread_position_in_threadgroup]],
+    uint group_width [[threads_per_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+    uint row = group / chunks;
+    if (atomic_load_explicit(
+            state + row * sample_state_words + sample_status,
+            memory_order_relaxed) != sample_pending) {
         return;
     }
-    for (uint bucket = lane; bucket < 2048; bucket += group_width) {
-        histogram[row * 2048 + bucket] = 0;
+    threadgroup uint partial_keys[32];
+    threadgroup uint partial_indices[32];
+    SamplingConfig config = sampling_config(sampling, sampling_layout);
+    uint chunk = group % chunks;
+    uint first = chunk * 2048u;
+    uint end = first + min(2048u, width - first);
+    ulong proposal = 0;
+    ulong maximum = 0;
+    for (uint column = first + lane; column < end; column += group_width) {
+        float value = load_float(
+            logits, physical_index(logits_layout, row * width + column), input0_dtype);
+        float score = value / config.temperature +
+                      gumbel_noise(config.seed, position, round, column);
+        proposal = max(proposal, argmax_candidate(score, column));
+        maximum = max(maximum, argmax_candidate(value, column));
+    }
+    proposal = argmax_threadgroup_max(
+        proposal, simd_lane, simd_group, partial_keys, partial_indices);
+    maximum = argmax_threadgroup_max(
+        maximum, simd_lane, simd_group, partial_keys, partial_indices);
+    if (lane == 0) {
+        uint offset = (row * chunks + chunk) * 4;
+        partials[offset] = uint(proposal);
+        partials[offset + 1] = uint(proposal >> 32);
+        partials[offset + 2] = uint(maximum);
+        partials[offset + 3] = uint(maximum >> 32);
+    }
+}
+
+kernel void sample_rejection_proposal_finalize(
+    device const uint *partials [[buffer(0)]],
+    device atomic_uint *state [[buffer(1)]],
+    constant uint &chunks [[buffer(2)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint lane [[thread_position_in_threadgroup]],
+    uint group_width [[threads_per_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+    if (atomic_load_explicit(
+            state + row * sample_state_words + sample_status,
+            memory_order_relaxed) != sample_pending) {
+        return;
+    }
+    threadgroup uint partial_keys[32];
+    threadgroup uint partial_indices[32];
+    ulong proposal = 0;
+    ulong maximum = 0;
+    for (uint chunk = lane; chunk < chunks; chunk += group_width) {
+        uint offset = (row * chunks + chunk) * 4;
+        proposal = max(proposal, (ulong(partials[offset + 1]) << 32) | partials[offset]);
+        maximum = max(maximum, (ulong(partials[offset + 3]) << 32) | partials[offset + 2]);
+    }
+    proposal = argmax_threadgroup_max(
+        proposal, simd_lane, simd_group, partial_keys, partial_indices);
+    maximum = argmax_threadgroup_max(
+        maximum, simd_lane, simd_group, partial_keys, partial_indices);
+    if (lane == 0) {
+        atomic_store_explicit(
+            state + row * sample_state_words + sample_proposal,
+            uint(proposal), memory_order_relaxed);
+        atomic_store_explicit(
+            state + row * sample_state_words + sample_maximum,
+            uint(maximum), memory_order_relaxed);
+    }
+}
+
+kernel void sample_rejection_threshold_partials(
+    device const uchar *logits [[buffer(0)]],
+    device const uint *sampling [[buffer(1)]],
+    device uint *partials [[buffer(2)]],
+    device atomic_uint *state [[buffer(3)]],
+    constant TensorLayout &logits_layout [[buffer(4)]],
+    constant TensorLayout &sampling_layout [[buffer(5)]],
+    constant uint &width [[buffer(6)]],
+    constant uint &chunks [[buffer(7)]],
+    uint group [[threadgroup_position_in_grid]],
+    uint lane [[thread_position_in_threadgroup]],
+    uint group_width [[threads_per_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+    uint row = group / chunks;
+    if (atomic_load_explicit(
+            state + row * sample_state_words + sample_status,
+            memory_order_relaxed) != sample_pending) {
+        return;
+    }
+    threadgroup uint partial_counts[32];
+    threadgroup float partial_totals[32];
+    threadgroup float partial_prefixes[32];
+    SamplingConfig config = sampling_config(sampling, sampling_layout);
+    uint candidate = atomic_load_explicit(
+        state + row * sample_state_words + sample_proposal, memory_order_relaxed);
+    uint maximum = atomic_load_explicit(
+        state + row * sample_state_words + sample_maximum, memory_order_relaxed);
+    float candidate_value = load_float(
+        logits, physical_index(logits_layout, row * width + candidate), input0_dtype);
+    float maximum_value = load_float(
+        logits, physical_index(logits_layout, row * width + maximum), input0_dtype);
+    ulong candidate_order = argmax_candidate(candidate_value, candidate);
+    uint chunk = group % chunks;
+    uint first = chunk * 2048u;
+    uint end = first + min(2048u, width - first);
+    uint count = 0;
+    float total = 0.0f;
+    float prefix = 0.0f;
+    for (uint column = first + lane; column < end; column += group_width) {
+        float value = load_float(
+            logits, physical_index(logits_layout, row * width + column), input0_dtype);
+        bool before = argmax_candidate(value, column) > candidate_order;
+        float weight = exp((value - maximum_value) / config.temperature);
+        count += before;
+        total += weight;
+        prefix += before ? weight : 0.0f;
+    }
+    count = simd_sum(count);
+    total = simd_sum(total);
+    prefix = simd_sum(prefix);
+    if (simd_group == 0) {
+        partial_counts[simd_lane] = 0;
+        partial_totals[simd_lane] = 0.0f;
+        partial_prefixes[simd_lane] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_lane == 0) {
+        partial_counts[simd_group] = count;
+        partial_totals[simd_group] = total;
+        partial_prefixes[simd_group] = prefix;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_group == 0) {
+        count = simd_sum(partial_counts[simd_lane]);
+        total = simd_sum(partial_totals[simd_lane]);
+        prefix = simd_sum(partial_prefixes[simd_lane]);
+        if (simd_lane == 0) {
+            uint offset = (row * chunks + chunk) * 4;
+            partials[offset] = count;
+            partials[offset + 1] = as_type<uint>(total);
+            partials[offset + 2] = as_type<uint>(prefix);
+        }
+    }
+}
+
+kernel void sample_rejection_threshold_finalize(
+    device const uchar *logits [[buffer(0)]],
+    device const uint *sampling [[buffer(1)]],
+    device const uint *partials [[buffer(2)]],
+    device atomic_uint *state [[buffer(3)]],
+    device uint *output [[buffer(4)]],
+    constant TensorLayout &logits_layout [[buffer(5)]],
+    constant TensorLayout &sampling_layout [[buffer(6)]],
+    constant TensorLayout &output_layout [[buffer(7)]],
+    constant uint &width [[buffer(8)]],
+    constant uint &round [[buffer(9)]],
+    constant uint &max_rounds [[buffer(10)]],
+    constant uint &chunks [[buffer(11)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint lane [[thread_position_in_threadgroup]]) {
+    if (lane != 0 || atomic_load_explicit(
+            state + row * sample_state_words + sample_status,
+            memory_order_relaxed) != sample_pending) {
+        return;
+    }
+    SamplingConfig config = sampling_config(sampling, sampling_layout);
+    uint candidate = atomic_load_explicit(
+        state + row * sample_state_words + sample_proposal, memory_order_relaxed);
+    uint maximum = atomic_load_explicit(
+        state + row * sample_state_words + sample_maximum, memory_order_relaxed);
+    uint count = 0;
+    float total = 0.0f;
+    float prefix = 0.0f;
+    for (uint chunk = 0; chunk < chunks; ++chunk) {
+        uint offset = (row * chunks + chunk) * 4;
+        count += partials[offset];
+        total += as_type<float>(partials[offset + 1]);
+        prefix += as_type<float>(partials[offset + 2]);
+    }
+    uint rank = count + 1;
+    uint cap = sampling_candidate_count(config, width);
+    bool decided = true;
+    bool allowed = rank <= cap;
+    if (allowed && config.top_p < 1.0f) {
+        if (!isfinite(total) || total <= 0.0f || !isfinite(prefix)) {
+            decided = false;
+        } else if (cap == width) {
+            allowed = prefix < config.top_p * total;
+        } else {
+            float candidate_value = load_float(
+                logits, physical_index(logits_layout, row * width + candidate), input0_dtype);
+            float maximum_value = load_float(
+                logits, physical_index(logits_layout, row * width + maximum), input0_dtype);
+            float candidate_weight = exp(
+                (candidate_value - maximum_value) / config.temperature);
+            float lower = prefix + candidate_weight;
+            float upper = prefix + float(cap - rank + 1) * candidate_weight;
+            if (prefix < config.top_p * lower) {
+                allowed = true;
+            } else if (prefix >= config.top_p * upper) {
+                allowed = false;
+            } else {
+                decided = false;
+            }
+        }
+    }
+    if (decided && allowed) {
+        output[physical_index(output_layout, row)] = candidate;
+        atomic_store_explicit(
+            state + row * sample_state_words + sample_status,
+            sample_accepted, memory_order_relaxed);
+    } else if (!decided || round + 1 >= max_rounds) {
+        atomic_store_explicit(
+            state + row * sample_state_words + sample_status,
+            sample_exact, memory_order_relaxed);
+    }
+}
+
+kernel void sample_exact_fallback(
+    device const uchar *logits [[buffer(0)]],
+    device const uint *sampling [[buffer(1)]],
+    device atomic_uint *state [[buffer(2)]],
+    device uint *output [[buffer(3)]],
+    constant TensorLayout &logits_layout [[buffer(4)]],
+    constant TensorLayout &sampling_layout [[buffer(5)]],
+    constant TensorLayout &output_layout [[buffer(6)]],
+    constant uint &width [[buffer(7)]],
+    constant uint &position [[buffer(8)]],
+    constant uint &max_rounds [[buffer(9)]],
+    device atomic_uint *error_flag [[buffer(10)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint lane [[thread_position_in_threadgroup]],
+    uint group_width [[threads_per_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+    threadgroup atomic_uint histogram[2048];
+    threadgroup ulong ordered[1024];
+    threadgroup float weights[1024];
+    threadgroup atomic_uint selected;
+    threadgroup uint prefix;
+    threadgroup uint remaining;
+    threadgroup uint cutoff;
+    threadgroup uint keep;
+    threadgroup uint partial_keys[32];
+    threadgroup uint partial_indices[32];
+    SamplingConfig config = sampling_config(sampling, sampling_layout);
+    if (!sampling_needs_rejection(config, width) || !sample_uses_exact(state, row)) {
+        return;
+    }
+    if (lane == 0) {
+        atomic_fetch_add_explicit(error_flag + 1, 1, memory_order_relaxed);
+    }
+    uint count = sampling_candidate_count(config, width);
+    if (lane == 0) {
+        prefix = 0;
+        remaining = count;
+        cutoff = 0;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (count < width) {
+        for (uint pass = 0; pass < 3; ++pass) {
+            for (uint bucket = lane; bucket < 2048; bucket += group_width) {
+                atomic_store_explicit(histogram + bucket, 0, memory_order_relaxed);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            uint shift = pass == 0 ? 21 : (pass == 1 ? 10 : 0);
+            uint mask = pass == 2 ? 1023 : 2047;
+            uint high_mask = shift == 21 ? 0 : ~0u << (shift + (shift == 0 ? 10 : 11));
+            for (uint column = lane; column < width; column += group_width) {
+                float value = load_float(
+                    logits, physical_index(logits_layout, row * width + column), input0_dtype);
+                uint key = total_order_key(value);
+                if ((key & high_mask) == prefix) {
+                    uint bucket = (key >> shift) & mask;
+                    atomic_fetch_add_explicit(
+                        histogram + bucket, 1, memory_order_relaxed);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (lane == 0) {
+                for (int bucket = int(mask); bucket >= 0; --bucket) {
+                    uint bucket_count = atomic_load_explicit(
+                        histogram + uint(bucket), memory_order_relaxed);
+                    if (remaining > bucket_count) {
+                        remaining -= bucket_count;
+                    } else {
+                        prefix |= uint(bucket) << shift;
+                        break;
+                    }
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        uint block_width = (width + group_width - 1) / group_width;
+        uint first = min(lane * block_width, width);
+        uint end = min(first + block_width, width);
+        uint ties = 0;
+        for (uint column = first; column < end; ++column) {
+            float value = load_float(
+                logits, physical_index(logits_layout, row * width + column), input0_dtype);
+            ties += total_order_key(value) == prefix;
+        }
+        atomic_store_explicit(histogram + lane, ties, memory_order_relaxed);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (lane == 0) {
+            uint tied = remaining;
+            uint block = group_width;
+            while (block-- > 0) {
+                uint block_ties = atomic_load_explicit(
+                    histogram + block, memory_order_relaxed);
+                if (tied > block_ties) {
+                    tied -= block_ties;
+                    continue;
+                }
+                uint block_first = min(block * block_width, width);
+                uint block_end = min(block_first + block_width, width);
+                for (uint column = block_end; column-- > block_first;) {
+                    float value = load_float(
+                        logits,
+                        physical_index(logits_layout, row * width + column),
+                        input0_dtype);
+                    if (total_order_key(value) == prefix && --tied == 0) {
+                        cutoff = column;
+                        break;
+                    }
+                }
+                break;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (config.top_p == 1.0f) {
+        ulong best = 0;
+        for (uint column = lane; column < width; column += group_width) {
+            float value = load_float(
+                logits, physical_index(logits_layout, row * width + column), input0_dtype);
+            uint key = total_order_key(value);
+            if (count == width || key > prefix || (key == prefix && column >= cutoff)) {
+                float score = value / config.temperature +
+                              gumbel_noise(config.seed, position, max_rounds, column);
+                best = max(best, argmax_candidate(score, column));
+            }
+        }
+        best = argmax_threadgroup_max(
+            best, simd_lane, simd_group, partial_keys, partial_indices);
+        if (lane == 0) {
+            output[physical_index(output_layout, row)] = uint(best);
+        }
+        return;
+    }
+    for (uint slot = lane; slot < 1024; slot += group_width) {
+        ordered[slot] = 0;
+    }
+    if (lane == 0) {
+        atomic_store_explicit(&selected, 0, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint column = lane; column < width; column += group_width) {
+        float value = load_float(
+            logits, physical_index(logits_layout, row * width + column), input0_dtype);
+        uint key = total_order_key(value);
+        if (count == width || key > prefix || (key == prefix && column >= cutoff)) {
+            uint slot = atomic_fetch_add_explicit(&selected, 1, memory_order_relaxed);
+            if (slot < 1024) {
+                ordered[slot] = (ulong(key) << 32) | ulong(column);
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint span = 2; span <= 1024; span <<= 1) {
+        for (uint stride = span >> 1; stride > 0; stride >>= 1) {
+            for (uint slot = lane; slot < 1024; slot += group_width) {
+                uint other = slot ^ stride;
+                if (other > slot) {
+                    ulong left = ordered[slot];
+                    ulong right = ordered[other];
+                    bool descending = (slot & span) == 0;
+                    if ((descending && left < right) || (!descending && left > right)) {
+                        ordered[slot] = right;
+                        ordered[other] = left;
+                    }
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+    float maximum = load_float(
+        logits, physical_index(logits_layout, row * width + uint(ordered[0])), input0_dtype);
+    for (uint slot = lane; slot < count; slot += group_width) {
+        uint column = uint(ordered[slot]);
+        float value = load_float(
+            logits, physical_index(logits_layout, row * width + column), input0_dtype);
+        weights[slot] = exp((value - maximum) / config.temperature);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane == 0) {
+        float total = 0.0f;
+        for (uint slot = 0; slot < count; ++slot) {
+            total += weights[slot];
+        }
+        keep = 1;
+        if (isfinite(total) && total > 0.0f) {
+            float cumulative = 0.0f;
+            for (uint slot = 0; slot < count; ++slot) {
+                cumulative += weights[slot] / total;
+                keep = slot + 1;
+                if (cumulative >= config.top_p) {
+                    break;
+                }
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    ulong best = 0;
+    for (uint slot = lane; slot < keep; slot += group_width) {
+        uint column = uint(ordered[slot]);
+        float value = load_float(
+            logits, physical_index(logits_layout, row * width + column), input0_dtype);
+        float score = value / config.temperature +
+                      gumbel_noise(config.seed, position, max_rounds, column);
+        best = max(best, argmax_candidate(score, column));
+    }
+    best = argmax_threadgroup_max(
+        best, simd_lane, simd_group, partial_keys, partial_indices);
+    if (lane == 0) {
+        output[physical_index(output_layout, row)] = uint(best);
     }
 }
 
@@ -481,10 +948,11 @@ kernel void sample_radix_histogram(
     uint group_width [[threads_per_threadgroup]],
     uint simd_lane [[thread_index_in_simdgroup]]) {
     SamplingConfig config = sampling_config(sampling, sampling_layout);
-    if (invalid_sampling(config) || !sampling_needs_radix(config, width)) {
+    uint row = group / chunks;
+    if (invalid_sampling(config) || !sampling_needs_radix(config, width) ||
+        !sample_uses_exact(state, row)) {
         return;
     }
-    uint row = group / chunks;
     uint chunk = group % chunks;
     uint first = chunk * 2048u;
     uint end = first + min(2048u, width - first);
@@ -522,7 +990,8 @@ kernel void sample_radix_locate(
     uint lane [[thread_position_in_threadgroup]],
     uint group_width [[threads_per_threadgroup]]) {
     SamplingConfig config = sampling_config(sampling, sampling_layout);
-    if (invalid_sampling(config) || !sampling_needs_radix(config, width)) {
+    if (invalid_sampling(config) || !sampling_needs_radix(config, width) ||
+        !sample_uses_exact(state, row)) {
         return;
     }
     if (lane == 0) {
@@ -566,10 +1035,11 @@ kernel void sample_index_histogram(
     uint group_width [[threads_per_threadgroup]],
     uint simd_lane [[thread_index_in_simdgroup]]) {
     SamplingConfig config = sampling_config(sampling, sampling_layout);
-    if (invalid_sampling(config) || !sampling_needs_radix(config, width)) {
+    uint row = group / chunks;
+    if (invalid_sampling(config) || !sampling_needs_radix(config, width) ||
+        !sample_uses_exact(state, row)) {
         return;
     }
-    uint row = group / chunks;
     uint chunk = group % chunks;
     uint first = chunk * 2048u;
     uint end = first + min(2048u, width - first);
@@ -601,7 +1071,8 @@ kernel void sample_index_locate(
     uint row [[threadgroup_position_in_grid]],
     uint lane [[thread_position_in_threadgroup]]) {
     SamplingConfig config = sampling_config(sampling, sampling_layout);
-    if (invalid_sampling(config) || !sampling_needs_radix(config, width) || lane != 0) {
+    if (invalid_sampling(config) || !sampling_needs_radix(config, width) || lane != 0 ||
+        !sample_uses_exact(state, row)) {
         return;
     }
     uint remaining = atomic_load_explicit(
@@ -646,10 +1117,11 @@ kernel void sample_compact(
     uint lane [[thread_position_in_threadgroup]],
     uint group_width [[threads_per_threadgroup]]) {
     SamplingConfig config = sampling_config(sampling, sampling_layout);
-    if (invalid_sampling(config) || !sampling_uses_candidates(config, width)) {
+    uint row = group / chunks;
+    if (invalid_sampling(config) || !sampling_uses_candidates(config, width) ||
+        !sample_uses_exact(state, row)) {
         return;
     }
-    uint row = group / chunks;
     uint chunk = group % chunks;
     uint first = chunk * 2048u;
     uint end = first + min(2048u, width - first);
@@ -682,18 +1154,19 @@ kernel void sample_partials(
     constant uint &width [[buffer(6)]],
     constant uint &position [[buffer(7)]],
     constant uint &chunks [[buffer(8)]],
+    constant uint &max_rounds [[buffer(9)]],
     uint group [[threadgroup_position_in_grid]],
     uint lane [[thread_position_in_threadgroup]],
     uint group_width [[threads_per_threadgroup]],
     uint simd_lane [[thread_index_in_simdgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]]) {
     SamplingConfig config = sampling_config(sampling, sampling_layout);
-    if (sampling_uses_candidates(config, width)) {
+    uint row = group / chunks;
+    if (sampling_needs_rejection(config, width) || !sample_uses_exact(state, row)) {
         return;
     }
     threadgroup uint partial_keys[32];
     threadgroup uint partial_indices[32];
-    uint row = group / chunks;
     uint chunk = group % chunks;
     uint first = chunk * 2048u;
     uint end = first + min(2048u, width - first);
@@ -712,8 +1185,9 @@ kernel void sample_partials(
             if (greedy) {
                 best = max(best, (ulong(key) << 32) | ulong(column));
             } else if (!filter || key > threshold || (key == threshold && column >= cutoff)) {
+                uint round = sampling_needs_rejection(config, width) ? max_rounds : 0;
                 float score = value / config.temperature +
-                              gumbel_noise(config.seed, position, column);
+                              gumbel_noise(config.seed, position, round, column);
                 best = max(best, argmax_candidate(score, column));
             }
         }
@@ -728,18 +1202,19 @@ kernel void sample_partials(
 kernel void sample_reduce_finalize(
     device const uint *sampling [[buffer(0)]],
     device const ulong *partials [[buffer(1)]],
-    device uint *output [[buffer(2)]],
-    constant TensorLayout &sampling_layout [[buffer(3)]],
-    constant TensorLayout &output_layout [[buffer(4)]],
-    constant uint &width [[buffer(5)]],
-    constant uint &chunks [[buffer(6)]],
+    device atomic_uint *state [[buffer(2)]],
+    device uint *output [[buffer(3)]],
+    constant TensorLayout &sampling_layout [[buffer(4)]],
+    constant TensorLayout &output_layout [[buffer(5)]],
+    constant uint &width [[buffer(6)]],
+    constant uint &chunks [[buffer(7)]],
     uint row [[threadgroup_position_in_grid]],
     uint lane [[thread_position_in_threadgroup]],
     uint group_width [[threads_per_threadgroup]],
     uint simd_lane [[thread_index_in_simdgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]]) {
     SamplingConfig config = sampling_config(sampling, sampling_layout);
-    if (sampling_uses_candidates(config, width)) {
+    if (sampling_needs_rejection(config, width) || !sample_uses_exact(state, row)) {
         return;
     }
     threadgroup uint partial_keys[32];
@@ -761,12 +1236,14 @@ kernel void sample_candidates_finalize(
     device const uchar *logits [[buffer(0)]],
     device const uint *sampling [[buffer(1)]],
     device const ulong *candidates [[buffer(2)]],
-    device uint *output [[buffer(3)]],
-    constant TensorLayout &logits_layout [[buffer(4)]],
-    constant TensorLayout &sampling_layout [[buffer(5)]],
-    constant TensorLayout &output_layout [[buffer(6)]],
-    constant uint &width [[buffer(7)]],
-    constant uint &position [[buffer(8)]],
+    device atomic_uint *state [[buffer(3)]],
+    device uint *output [[buffer(4)]],
+    constant TensorLayout &logits_layout [[buffer(5)]],
+    constant TensorLayout &sampling_layout [[buffer(6)]],
+    constant TensorLayout &output_layout [[buffer(7)]],
+    constant uint &width [[buffer(8)]],
+    constant uint &position [[buffer(9)]],
+    constant uint &max_rounds [[buffer(10)]],
     uint row [[threadgroup_position_in_grid]],
     uint lane [[thread_position_in_threadgroup]],
     uint group_width [[threads_per_threadgroup]],
@@ -778,7 +1255,8 @@ kernel void sample_candidates_finalize(
     threadgroup uint partial_keys[32];
     threadgroup uint partial_indices[32];
     SamplingConfig config = sampling_config(sampling, sampling_layout);
-    if (invalid_sampling(config) || !sampling_uses_candidates(config, width)) {
+    if (invalid_sampling(config) || !sampling_uses_candidates(config, width) ||
+        !sample_uses_exact(state, row)) {
         return;
     }
     uint count = sampling_candidate_count(config, width);
@@ -840,7 +1318,8 @@ kernel void sample_candidates_finalize(
         uint column = uint(ordered[slot]);
         float value = load_float(
             logits, physical_index(logits_layout, row * width + column), input0_dtype);
-        float score = value / config.temperature + gumbel_noise(config.seed, position, column);
+        float score = value / config.temperature +
+                      gumbel_noise(config.seed, position, max_rounds, column);
         best = max(best, argmax_candidate(score, column));
     }
     best = argmax_threadgroup_max(

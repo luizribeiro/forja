@@ -1279,6 +1279,9 @@ fn profile_categories(
                 Duration::ZERO,
             )
         }),
+        submission_category("sample.fallbacks", submissions, |submission| {
+            (count_as_f64(submission.sample_fallbacks), Duration::ZERO)
+        }),
         submission_category("buffer.metadata", submissions, |submission| {
             (
                 count_as_f64(submission.metadata_buffers.count),
