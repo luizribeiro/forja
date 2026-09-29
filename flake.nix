@@ -170,6 +170,29 @@
           };
         };
         offlineHooks = pkgs.lib.mapAttrs (_: hook: hook // { stages = allLocalStages; }) {
+          benchmark-record-size = {
+            enable = true;
+            entry = "${
+              pkgs.writeShellApplication {
+                name = "benchmark-record-size-hook";
+                text = ''
+                  readonly maximum_bytes=65536
+                  failed=0
+                  for record in "$@"; do
+                    [[ -f "$record" ]] || continue
+                    bytes=$(wc -c < "$record")
+                    if (( bytes > maximum_bytes )); then
+                      echo "$record is $bytes bytes; committed benchmark records must not exceed $maximum_bytes bytes" >&2
+                      failed=1
+                    fi
+                  done
+                  exit "$failed"
+                '';
+              }
+            }/bin/benchmark-record-size-hook";
+            files = "^bench/.*\\.json$";
+            pass_filenames = true;
+          };
           nixfmt.enable = true;
           deadnix.enable = true;
           statix.enable = true;
