@@ -31,6 +31,7 @@ tokio = { version = "1.51", features = ["rt"] }
 tokenizers = { version = "0.22", default-features = false, features = [
   "fancy-regex",
 ] }
+toml = "1.0"
 wasmtime = { version = "49", default-features = false, features = [
   "component-model-async",
   "component-model",
