@@ -17,8 +17,8 @@ use forja_testing::{
 use wasmtime::component::Resource;
 
 use super::{
-    CommandListEntry, Grants, Host, KernelEntry, Limits, TensorEntry, bindings::l9o::gpu::compute,
-    core_dtype, guest_error,
+    CommandListEntry, Grants, GraphEntry, Host, KernelEntry, Limits, TensorEntry,
+    bindings::l9o::gpu::compute, core_dtype, guest_error,
 };
 use compute::{Binop as WitBinOp, Redop as WitRedOp, Unop as WitUnOp, ValueType as WitValueType};
 
@@ -27,6 +27,561 @@ static NEXT_PROGRAM_WEIGHT: AtomicU64 = AtomicU64::new(0);
 const FUZZ_LIMITS: Limits = Limits::new(8 * 1024 * 1024, 8, 1_000_000, 128, 8 * 1024 * 1024)
     .with_command_limits(16, 1_000_000_000)
     .with_gpu_limits(Duration::from_secs(60), Duration::MAX);
+
+#[tokio::test(flavor = "multi_thread")]
+async fn symbolic_graphs_match_fresh_cpu_lists() {
+    let mut coverage = GraphCoverage::default();
+    for seed in 0..64 {
+        coverage.record(symbolic_graph_case(forja_cpu::CpuBackend::new(), seed).await);
+    }
+    coverage.assert_sufficient(64);
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test(flavor = "multi_thread")]
+async fn metal_symbolic_graphs_match_fresh_lists() {
+    let mut coverage = GraphCoverage::default();
+    for seed in 0..32 {
+        coverage.record(symbolic_graph_case(forja_metal::MetalBackend::new().unwrap(), seed).await);
+    }
+    coverage.assert_sufficient(32);
+}
+
+#[derive(Clone, Copy, Debug)]
+enum GraphScenario {
+    Elementwise,
+    Matmul,
+    Program,
+    Sdpa,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct GraphCaseCoverage {
+    scenario: GraphScenario,
+    dtype: compute::Dtype,
+    rank: usize,
+    dispatches: usize,
+    barriers: usize,
+    replays: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct GraphCoverage {
+    scenarios: [usize; 4],
+    dtypes: [usize; 3],
+    ranks: [usize; 3],
+    dispatches: usize,
+    barriers: usize,
+    replays: usize,
+}
+
+impl GraphCoverage {
+    fn record(&mut self, case: GraphCaseCoverage) {
+        let scenario = match case.scenario {
+            GraphScenario::Elementwise => 0,
+            GraphScenario::Matmul => 1,
+            GraphScenario::Program => 2,
+            GraphScenario::Sdpa => 3,
+        };
+        let dtype = match case.dtype {
+            compute::Dtype::F32 => 0,
+            compute::Dtype::F16 => 1,
+            compute::Dtype::Bf16 => 2,
+            compute::Dtype::I32 | compute::Dtype::U32 => {
+                panic!("graph fuzz generated a non-floating dtype")
+            }
+        };
+        self.scenarios[scenario] += 1;
+        self.dtypes[dtype] += 1;
+        self.ranks[case.rank - 1] += 1;
+        self.dispatches += case.dispatches;
+        self.barriers += case.barriers;
+        self.replays += case.replays;
+    }
+
+    fn assert_sufficient(self, cases: usize) {
+        println!(
+            "graph fuzz coverage: scenarios {:?}, dtypes {:?}, ranks {:?}, {} dispatches, {} barriers, {} replays",
+            self.scenarios, self.dtypes, self.ranks, self.dispatches, self.barriers, self.replays,
+        );
+        assert!(self.scenarios.into_iter().all(|count| count > 0));
+        assert!(self.dtypes.into_iter().all(|count| count > 0));
+        assert!(self.ranks.into_iter().all(|count| count > 0));
+        assert!(self.dispatches >= cases * 2);
+        assert!(self.barriers >= cases);
+        assert_eq!(self.replays, cases * 3);
+    }
+}
+
+async fn symbolic_graph_case<B>(backend: B, seed: u64) -> GraphCaseCoverage
+where
+    B: Backend + Send + Sync + 'static,
+{
+    let mut values = Values::new(seed ^ 0xa076_1d64_78bd_642f);
+    let dtype = [
+        compute::Dtype::F32,
+        compute::Dtype::F16,
+        compute::Dtype::Bf16,
+    ][usize::try_from(seed % 3).unwrap()];
+    match seed % 4 {
+        0 => graph_elementwise_case(backend, dtype, seed, &mut values).await,
+        1 => graph_matmul_case(backend, dtype, seed, &mut values).await,
+        2 => graph_program_case(backend, dtype, seed, &mut values).await,
+        _ => graph_sdpa_case(backend, dtype, seed, &mut values).await,
+    }
+}
+
+async fn graph_elementwise_case<B>(
+    backend: B,
+    dtype: compute::Dtype,
+    seed: u64,
+    values: &mut Values,
+) -> GraphCaseCoverage
+where
+    B: Backend + Send + Sync + 'static,
+{
+    let rank = 1 + usize::try_from((seed / 4) % 2).unwrap();
+    let shape = if rank == 1 { vec![17] } else { vec![7, 17] };
+    let axis = rank - 1;
+    let mut host = Host::new(backend, FUZZ_LIMITS);
+    let left = initialized_tensor(&mut host, dtype, &shape, seed);
+    let right = initialized_tensor(&mut host, dtype, &shape, seed.wrapping_add(1));
+    let scratch = host.alloc(dtype, &shape).unwrap();
+    let graph_output = host.alloc(dtype, &shape).unwrap();
+    let fresh_scratch = host.alloc(dtype, &shape).unwrap();
+    let fresh_output = host.alloc(dtype, &shape).unwrap();
+    let params = host
+        .params(vec![compute::ParamRange { lo: 0, hi: 10 }])
+        .unwrap();
+    let symbolic = parameter_slices(&shape, axis, affine_param(0, 1, 0), affine_const(7));
+    let left_view = host.view_param(&left, &params, symbolic.clone()).unwrap();
+    let right_view = host.view_param(&right, &params, symbolic.clone()).unwrap();
+    let scratch_view = host
+        .view_param(&scratch, &params, symbolic.clone())
+        .unwrap();
+    let output_view = host.view_param(&graph_output, &params, symbolic).unwrap();
+    let commands = host.command_list().unwrap();
+    host.dispatch(&commands, compute::Op::Copy, &[left_view], &scratch_view)
+        .unwrap();
+    host.dispatch(
+        &commands,
+        compute::Op::Add,
+        &[scratch_view, right_view],
+        &output_view,
+    )
+    .unwrap();
+    let graph = host.create_graph(commands).unwrap();
+    let barriers = graph_barriers(&host, &graph);
+    for _ in 0..3 {
+        let value = u32::try_from(values.index(11)).unwrap();
+        host.prepare_replay(&graph, vec![value])
+            .unwrap()
+            .run()
+            .await
+            .unwrap();
+        let concrete = concrete_slices(&shape, axis, value, 7);
+        let left_view = host.view(&left, concrete.clone()).unwrap();
+        let right_view = host.view(&right, concrete.clone()).unwrap();
+        let scratch_view = host.view(&fresh_scratch, concrete.clone()).unwrap();
+        let output_view = host.view(&fresh_output, concrete).unwrap();
+        let fresh = host.command_list().unwrap();
+        host.dispatch(&fresh, compute::Op::Copy, &[left_view], &scratch_view)
+            .unwrap();
+        host.dispatch(
+            &fresh,
+            compute::Op::Add,
+            &[scratch_view, right_view],
+            &output_view,
+        )
+        .unwrap();
+        host.prepare_submit(fresh).unwrap().run().await.unwrap();
+        compare_host_tensors(&host, dtype, &graph_output, &fresh_output).await;
+    }
+    GraphCaseCoverage {
+        scenario: GraphScenario::Elementwise,
+        dtype,
+        rank,
+        dispatches: 2,
+        barriers,
+        replays: 3,
+    }
+}
+
+async fn graph_matmul_case<B>(
+    backend: B,
+    dtype: compute::Dtype,
+    seed: u64,
+    values: &mut Values,
+) -> GraphCaseCoverage
+where
+    B: Backend + Send + Sync + 'static,
+{
+    let rank = 2 + usize::try_from((seed / 4) % 2).unwrap();
+    let (left_shape, right_shape, output_shape, axis) = if rank == 2 {
+        (vec![4, 7], vec![7, 5], vec![4, 5], 0)
+    } else {
+        (vec![2, 4, 7], vec![2, 7, 5], vec![2, 4, 5], 1)
+    };
+    let mut host = Host::new(backend, FUZZ_LIMITS);
+    let left = initialized_tensor(&mut host, dtype, &left_shape, seed);
+    let right = initialized_tensor(&mut host, dtype, &right_shape, seed.wrapping_add(1));
+    let scratch = host.alloc(dtype, &output_shape).unwrap();
+    let graph_output = host.alloc(dtype, &output_shape).unwrap();
+    let fresh_scratch = host.alloc(dtype, &output_shape).unwrap();
+    let fresh_output = host.alloc(dtype, &output_shape).unwrap();
+    let params = host
+        .params(vec![compute::ParamRange { lo: 0, hi: 3 }])
+        .unwrap();
+    let left_symbolic = parameter_slices(&left_shape, axis, affine_const(0), affine_param(0, 1, 1));
+    let output_symbolic =
+        parameter_slices(&output_shape, axis, affine_const(0), affine_param(0, 1, 1));
+    let left_view = host.view_param(&left, &params, left_symbolic).unwrap();
+    let scratch_view = host
+        .view_param(&scratch, &params, output_symbolic.clone())
+        .unwrap();
+    let output_view = host
+        .view_param(&graph_output, &params, output_symbolic)
+        .unwrap();
+    let commands = host.command_list().unwrap();
+    host.dispatch(
+        &commands,
+        compute::Op::Matmul,
+        &[left_view, Resource::new_borrow(right.rep())],
+        &scratch_view,
+    )
+    .unwrap();
+    host.dispatch(&commands, compute::Op::Copy, &[scratch_view], &output_view)
+        .unwrap();
+    let graph = host.create_graph(commands).unwrap();
+    let barriers = graph_barriers(&host, &graph);
+    for _ in 0..3 {
+        let value = u32::try_from(values.index(4)).unwrap();
+        host.prepare_replay(&graph, vec![value])
+            .unwrap()
+            .run()
+            .await
+            .unwrap();
+        let extent = value + 1;
+        let left_view = host
+            .view(&left, concrete_slices(&left_shape, axis, 0, extent))
+            .unwrap();
+        let scratch_view = host
+            .view(
+                &fresh_scratch,
+                concrete_slices(&output_shape, axis, 0, extent),
+            )
+            .unwrap();
+        let output_view = host
+            .view(
+                &fresh_output,
+                concrete_slices(&output_shape, axis, 0, extent),
+            )
+            .unwrap();
+        let fresh = host.command_list().unwrap();
+        host.dispatch(
+            &fresh,
+            compute::Op::Matmul,
+            &[left_view, Resource::new_borrow(right.rep())],
+            &scratch_view,
+        )
+        .unwrap();
+        host.dispatch(&fresh, compute::Op::Copy, &[scratch_view], &output_view)
+            .unwrap();
+        host.prepare_submit(fresh).unwrap().run().await.unwrap();
+        compare_host_tensors(&host, dtype, &graph_output, &fresh_output).await;
+    }
+    GraphCaseCoverage {
+        scenario: GraphScenario::Matmul,
+        dtype,
+        rank,
+        dispatches: 2,
+        barriers,
+        replays: 3,
+    }
+}
+
+async fn graph_program_case<B>(
+    backend: B,
+    dtype: compute::Dtype,
+    seed: u64,
+    values: &mut Values,
+) -> GraphCaseCoverage
+where
+    B: Backend + Send + Sync + 'static,
+{
+    let rank = 1 + usize::try_from((seed / 4) % 2).unwrap();
+    let shape = if rank == 1 { vec![17] } else { vec![7, 17] };
+    let axis = rank - 1;
+    let mut host = Host::new(backend, FUZZ_LIMITS);
+    let input = initialized_tensor(&mut host, dtype, &shape, seed);
+    let scratch = host.alloc(dtype, &shape).unwrap();
+    let graph_output = host.alloc(dtype, &shape).unwrap();
+    let fresh_scratch = host.alloc(dtype, &shape).unwrap();
+    let fresh_output = host.alloc(dtype, &shape).unwrap();
+    let kernel = host
+        .create_kernel(
+            compute::ProgramSource {
+                kind: compute::ProgramKind::Map,
+                insts: vec![
+                    compute::Inst::Input(0),
+                    compute::Inst::Const(2.0),
+                    compute::Inst::Binary((compute::Binop::Mul, 0, 1)),
+                ],
+                outputs: vec![(0, 2)],
+            },
+            compute::KernelSignature {
+                rank: u8::try_from(rank).unwrap(),
+                inputs: vec![dtype],
+                outputs: vec![dtype],
+                scalars: 0,
+            },
+        )
+        .unwrap();
+    let params = host
+        .params(vec![compute::ParamRange { lo: 0, hi: 10 }])
+        .unwrap();
+    let symbolic = parameter_slices(&shape, axis, affine_param(0, 1, 0), affine_const(7));
+    let input_view = host.view_param(&input, &params, symbolic.clone()).unwrap();
+    let scratch_view = host
+        .view_param(&scratch, &params, symbolic.clone())
+        .unwrap();
+    let output_view = host.view_param(&graph_output, &params, symbolic).unwrap();
+    let commands = host.command_list().unwrap();
+    host.dispatch_kernel(
+        &commands,
+        &kernel,
+        &[input_view],
+        &[Resource::new_borrow(scratch_view.rep())],
+    )
+    .unwrap();
+    host.dispatch(&commands, compute::Op::Copy, &[scratch_view], &output_view)
+        .unwrap();
+    let graph = host.create_graph(commands).unwrap();
+    let barriers = graph_barriers(&host, &graph);
+    for _ in 0..3 {
+        let value = u32::try_from(values.index(11)).unwrap();
+        host.prepare_replay(&graph, vec![value])
+            .unwrap()
+            .run()
+            .await
+            .unwrap();
+        let concrete = concrete_slices(&shape, axis, value, 7);
+        let input_view = host.view(&input, concrete.clone()).unwrap();
+        let scratch_view = host.view(&fresh_scratch, concrete.clone()).unwrap();
+        let output_view = host.view(&fresh_output, concrete).unwrap();
+        let fresh = host.command_list().unwrap();
+        host.dispatch_kernel(
+            &fresh,
+            &kernel,
+            &[input_view],
+            &[Resource::new_borrow(scratch_view.rep())],
+        )
+        .unwrap();
+        host.dispatch(&fresh, compute::Op::Copy, &[scratch_view], &output_view)
+            .unwrap();
+        host.prepare_submit(fresh).unwrap().run().await.unwrap();
+        compare_host_tensors(&host, dtype, &graph_output, &fresh_output).await;
+    }
+    GraphCaseCoverage {
+        scenario: GraphScenario::Program,
+        dtype,
+        rank,
+        dispatches: 2,
+        barriers,
+        replays: 3,
+    }
+}
+
+async fn graph_sdpa_case<B>(
+    backend: B,
+    dtype: compute::Dtype,
+    seed: u64,
+    values: &mut Values,
+) -> GraphCaseCoverage
+where
+    B: Backend + Send + Sync + 'static,
+{
+    let mut host = Host::new(backend, FUZZ_LIMITS);
+    let query = initialized_tensor(&mut host, dtype, &[2, 1, 128], seed);
+    let source_key = initialized_tensor(&mut host, dtype, &[1, 1, 128], seed.wrapping_add(1));
+    let key_cache = initialized_tensor(&mut host, dtype, &[1, 7, 128], seed.wrapping_add(2));
+    let value_cache = initialized_tensor(&mut host, dtype, &[1, 7, 128], seed.wrapping_add(3));
+    let graph_output = host.alloc(dtype, &[2, 1, 128]).unwrap();
+    let fresh_key_cache = initialized_tensor(&mut host, dtype, &[1, 7, 128], seed.wrapping_add(2));
+    let fresh_output = host.alloc(dtype, &[2, 1, 128]).unwrap();
+    let params = host
+        .params(vec![compute::ParamRange { lo: 0, hi: 6 }])
+        .unwrap();
+    let key_slot = parameter_slices(&[1, 7, 128], 1, affine_param(0, 1, 0), affine_const(1));
+    let prefix = parameter_slices(&[1, 7, 128], 1, affine_const(0), affine_param(0, 1, 1));
+    let key_slot = host.view_param(&key_cache, &params, key_slot).unwrap();
+    let key_prefix = host
+        .view_param(&key_cache, &params, prefix.clone())
+        .unwrap();
+    let value_prefix = host.view_param(&value_cache, &params, prefix).unwrap();
+    let commands = host.command_list().unwrap();
+    host.dispatch(
+        &commands,
+        compute::Op::Copy,
+        &[Resource::new_borrow(source_key.rep())],
+        &key_slot,
+    )
+    .unwrap();
+    host.dispatch(
+        &commands,
+        compute::Op::Sdpa(compute::SdpaCfg {
+            scale: 0.088_388_346,
+            causal: true,
+            q_start: affine_param(0, 1, 0),
+        }),
+        &[Resource::new_borrow(query.rep()), key_prefix, value_prefix],
+        &graph_output,
+    )
+    .unwrap();
+    let graph = host.create_graph(commands).unwrap();
+    let barriers = graph_barriers(&host, &graph);
+    for _ in 0..3 {
+        let value = u32::try_from(values.index(7)).unwrap();
+        host.prepare_replay(&graph, vec![value])
+            .unwrap()
+            .run()
+            .await
+            .unwrap();
+        let key_slot = host
+            .view(&fresh_key_cache, concrete_slices(&[1, 7, 128], 1, value, 1))
+            .unwrap();
+        let key_prefix = host
+            .view(
+                &fresh_key_cache,
+                concrete_slices(&[1, 7, 128], 1, 0, value + 1),
+            )
+            .unwrap();
+        let value_prefix = host
+            .view(&value_cache, concrete_slices(&[1, 7, 128], 1, 0, value + 1))
+            .unwrap();
+        let fresh = host.command_list().unwrap();
+        host.dispatch(
+            &fresh,
+            compute::Op::Copy,
+            &[Resource::new_borrow(source_key.rep())],
+            &key_slot,
+        )
+        .unwrap();
+        host.dispatch(
+            &fresh,
+            compute::Op::Sdpa(compute::SdpaCfg {
+                scale: 0.088_388_346,
+                causal: true,
+                q_start: affine_const(value),
+            }),
+            &[Resource::new_borrow(query.rep()), key_prefix, value_prefix],
+            &fresh_output,
+        )
+        .unwrap();
+        host.prepare_submit(fresh).unwrap().run().await.unwrap();
+        compare_host_tensors(&host, dtype, &graph_output, &fresh_output).await;
+    }
+    GraphCaseCoverage {
+        scenario: GraphScenario::Sdpa,
+        dtype,
+        rank: 3,
+        dispatches: 2,
+        barriers,
+        replays: 3,
+    }
+}
+
+fn initialized_tensor<B: Backend>(
+    host: &mut Host<B>,
+    dtype: compute::Dtype,
+    shape: &[u32],
+    seed: u64,
+) -> Resource<TensorEntry> {
+    let tensor = host.alloc(dtype, shape).unwrap();
+    let spec = TensorSpec::contiguous(core_dtype(dtype), shape);
+    let bytes = generated_tensor_bytes(&spec, &mut DeterministicValues::new(seed)).unwrap();
+    host.write(&tensor, &bytes).unwrap();
+    tensor
+}
+
+const fn affine_const(offset: u32) -> compute::Affine {
+    compute::Affine {
+        param: None,
+        scale: 0,
+        offset,
+    }
+}
+
+const fn affine_param(param: u8, scale: u32, offset: u32) -> compute::Affine {
+    compute::Affine {
+        param: Some(param),
+        scale,
+        offset,
+    }
+}
+
+fn parameter_slices(
+    shape: &[u32],
+    axis: usize,
+    start: compute::Affine,
+    len: compute::Affine,
+) -> Vec<compute::ParamSlice> {
+    shape
+        .iter()
+        .enumerate()
+        .map(|(index, &extent)| compute::ParamSlice {
+            start: if index == axis {
+                start
+            } else {
+                affine_const(0)
+            },
+            len: if index == axis {
+                len
+            } else {
+                affine_const(extent)
+            },
+            step: 1,
+        })
+        .collect()
+}
+
+fn concrete_slices(shape: &[u32], axis: usize, start: u32, len: u32) -> compute::ViewOp {
+    compute::ViewOp::Slice(
+        shape
+            .iter()
+            .enumerate()
+            .map(|(index, &extent)| compute::SliceSpec {
+                start: if index == axis { start } else { 0 },
+                len: if index == axis { len } else { extent },
+                step: 1,
+            })
+            .collect(),
+    )
+}
+
+fn graph_barriers<B: Backend>(host: &Host<B>, graph: &Resource<GraphEntry>) -> usize {
+    host.table
+        .get(graph)
+        .unwrap()
+        .graph
+        .required_barriers()
+        .iter()
+        .filter(|&&barrier| barrier)
+        .count()
+}
+
+async fn compare_host_tensors<B>(
+    host: &Host<B>,
+    dtype: compute::Dtype,
+    actual: &Resource<TensorEntry>,
+    expected: &Resource<TensorEntry>,
+) where
+    B: Backend + Send + Sync + 'static,
+{
+    let actual = host.prepare_read(actual).unwrap().run().await.unwrap();
+    let expected = host.prepare_read(expected).unwrap().run().await.unwrap();
+    assert_outputs_agree(core_dtype(dtype), &expected, &actual).unwrap();
+}
 
 #[derive(Clone, Debug)]
 enum Action {
