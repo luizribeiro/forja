@@ -46,7 +46,7 @@ interface compute {
   record sdpa-cfg {
     scale: f32,
     causal: bool,
-    q-start: u32,
+    q-start: affine,
   }
 
   enum program-kind {

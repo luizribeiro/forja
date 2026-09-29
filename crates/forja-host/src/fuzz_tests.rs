@@ -460,7 +460,7 @@ fn canonical_actions() -> Vec<Action> {
             compute::Op::Sdpa(compute::SdpaCfg {
                 scale: 0.088,
                 causal: false,
-                q_start: 0,
+                q_start: constant_affine(0),
             }),
             &[22, 23, 24],
             25,
@@ -610,8 +610,16 @@ fn random_op(values: &mut Values) -> compute::Op {
         _ => compute::Op::Sdpa(compute::SdpaCfg {
             scale: random_config(values),
             causal: values.next().is_multiple_of(2),
-            q_start: u32::try_from(values.index(40)).unwrap(),
+            q_start: constant_affine(u32::try_from(values.index(40)).unwrap()),
         }),
+    }
+}
+
+fn constant_affine(offset: u32) -> compute::Affine {
+    compute::Affine {
+        param: None,
+        scale: 0,
+        offset,
     }
 }
 

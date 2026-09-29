@@ -20,8 +20,8 @@ use std::{
 
 use forja_core::{
     Affine, Backend, BackendError, CommandList, DType, Layout, LayoutError, Op, OpError,
-    ParamSpace, Slice, Submission, SubmissionProfile, SymbolicLayout, SymbolicLayoutError, Tensor,
-    ViewOp,
+    ParamSpace, Slice, Submission, SubmissionProfile, SymbolicLayout, SymbolicLayoutError,
+    TemplateOp, TemplateTensor, Tensor, ViewOp,
     program::{
         BinOp, Inst, KernelSignature, MAX_INSTRUCTIONS, MAX_OUTPUTS, PrepareError, PreparedProgram,
         Program, ProgramError, ProgramKind, RedOp, UnOp, ValidatedProgram, ValueType,
@@ -805,6 +805,18 @@ pub struct TensorEntry {
     buffer: Arc<BufferHandle>,
 }
 
+impl TensorEntry {
+    fn template(&self) -> Result<TemplateTensor, compute::Error> {
+        self.symbolic.as_ref().map_or_else(
+            || Ok(self.tensor.clone().into()),
+            |layout| {
+                TemplateTensor::symbolic(self.tensor.clone(), layout.clone())
+                    .map_err(|error| compute::Error::Layout(error.to_string()))
+            },
+        )
+    }
+}
+
 /// Host-owned state behind a guest weights resource.
 #[derive(Debug)]
 pub struct WeightsEntry {
@@ -844,10 +856,31 @@ impl KernelLease {
     }
 }
 
+#[derive(Debug)]
+#[expect(
+    dead_code,
+    reason = "recorded commands are consumed by graph construction"
+)]
+enum RecordedDispatch {
+    Operation {
+        op: TemplateOp,
+        inputs: Vec<TemplateTensor>,
+        output: Box<TemplateTensor>,
+    },
+    Program {
+        program: Arc<PreparedProgram>,
+        inputs: Vec<TemplateTensor>,
+        outputs: Vec<TemplateTensor>,
+    },
+}
+
 /// Host-owned state behind a guest command-list resource.
 #[derive(Debug)]
 pub struct CommandListEntry {
     commands: CommandList,
+    recorded: Vec<RecordedDispatch>,
+    space: Option<ParamSpace>,
+    parameterized: bool,
     retained: Vec<TensorEntry>,
 }
 
@@ -1288,6 +1321,9 @@ impl<B: Backend> Host<B> {
         self.table
             .push(CommandListEntry {
                 commands: CommandList::new(),
+                recorded: Vec::new(),
+                space: None,
+                parameterized: false,
                 retained: Vec::new(),
             })
             .map_err(invalid_handle)
@@ -1337,18 +1373,39 @@ impl<B: Backend> Host<B> {
             .iter()
             .map(|entry| &entry.tensor)
             .collect::<Vec<_>>();
-        let operation = core_op(operation);
+        let (template_op, concrete_op) = core_op(operation);
+        let template_inputs = input_entries
+            .iter()
+            .map(TensorEntry::template)
+            .collect::<Result<Vec<_>, _>>()?;
+        let template_output = output_entry.template()?;
+        let dispatch_space = tensor_space(input_entries.iter().chain([&output_entry]))?;
         let entry = self.table.get(commands).map_err(invalid_handle)?;
-        if entry.commands.len() >= self.limits.dispatches_per_list {
+        if entry.recorded.len() >= self.limits.dispatches_per_list {
             return Err(quota("command list dispatch count exceeds the guest limit"));
         }
-        self.check_dispatch_work(operation, &input_tensors, &output_entry.tensor)?;
+        merge_parameter_space(entry.space.as_ref(), dispatch_space.as_ref())?;
+        if let Some(operation) = concrete_op {
+            self.check_dispatch_work(operation, &input_tensors, &output_entry.tensor)?;
+        }
 
         let entry = self.table.get_mut(commands).map_err(invalid_handle)?;
-        entry
-            .commands
-            .dispatch(operation, &input_tensors, &output_entry.tensor)
-            .map_err(guest_error)?;
+        if let Some(operation) = concrete_op
+            && dispatch_space.is_none()
+        {
+            entry
+                .commands
+                .dispatch(operation, &input_tensors, &output_entry.tensor)
+                .map_err(guest_error)?;
+        } else {
+            entry.parameterized = true;
+        }
+        entry.space = entry.space.take().or(dispatch_space);
+        entry.recorded.push(RecordedDispatch::Operation {
+            op: template_op,
+            inputs: template_inputs,
+            output: Box::new(template_output),
+        });
         entry.retained.extend(input_entries);
         entry.retained.push(output_entry);
         Ok(())
@@ -1376,7 +1433,7 @@ impl<B: Backend> Host<B> {
             .collect::<Result<Vec<_>, _>>()?;
         let program = Arc::clone(&self.table.get(kernel).map_err(invalid_handle)?.program);
         let entry = self.table.get(commands).map_err(invalid_handle)?;
-        if entry.commands.len() >= self.limits.dispatches_per_list {
+        if entry.recorded.len() >= self.limits.dispatches_per_list {
             return Err(quota("command list dispatch count exceeds the guest limit"));
         }
         let input_tensors = input_entries
@@ -1387,12 +1444,35 @@ impl<B: Backend> Host<B> {
             .iter()
             .map(|entry| &entry.tensor)
             .collect::<Vec<_>>();
-        self.check_program_work(program.validated(), &input_tensors, &output_tensors)?;
+        let dispatch_space = tensor_space(input_entries.iter().chain(&output_entries))?;
+        let entry = self.table.get(commands).map_err(invalid_handle)?;
+        merge_parameter_space(entry.space.as_ref(), dispatch_space.as_ref())?;
+        if dispatch_space.is_none() {
+            self.check_program_work(program.validated(), &input_tensors, &output_tensors)?;
+        }
+        let template_inputs = input_entries
+            .iter()
+            .map(TensorEntry::template)
+            .collect::<Result<Vec<_>, _>>()?;
+        let template_outputs = output_entries
+            .iter()
+            .map(TensorEntry::template)
+            .collect::<Result<Vec<_>, _>>()?;
         let entry = self.table.get_mut(commands).map_err(invalid_handle)?;
-        entry
-            .commands
-            .dispatch_kernel(&program, &input_tensors, &output_tensors)
-            .map_err(guest_error)?;
+        if dispatch_space.is_none() {
+            entry
+                .commands
+                .dispatch_kernel(&program, &input_tensors, &output_tensors)
+                .map_err(guest_error)?;
+        } else {
+            entry.parameterized = true;
+        }
+        entry.space = entry.space.take().or(dispatch_space);
+        entry.recorded.push(RecordedDispatch::Program {
+            program,
+            inputs: template_inputs,
+            outputs: template_outputs,
+        });
         entry.retained.extend(input_entries);
         entry.retained.extend(output_entries);
         Ok(())
@@ -2104,24 +2184,35 @@ fn core_affine(affine: compute::Affine) -> Affine {
     )
 }
 
-fn core_op(operation: compute::Op) -> Op {
+fn core_op(operation: compute::Op) -> (TemplateOp, Option<Op>) {
     match operation {
-        compute::Op::Copy => Op::Copy,
-        compute::Op::Add => Op::Add,
-        compute::Op::SiluMul => Op::SiluMul,
-        compute::Op::RmsNorm(eps) => Op::RmsNorm { eps },
-        compute::Op::Softmax => Op::Softmax,
-        compute::Op::Rope(config) => Op::Rope {
+        compute::Op::Copy => concrete_template(Op::Copy),
+        compute::Op::Add => concrete_template(Op::Add),
+        compute::Op::SiluMul => concrete_template(Op::SiluMul),
+        compute::Op::RmsNorm(eps) => concrete_template(Op::RmsNorm { eps }),
+        compute::Op::Softmax => concrete_template(Op::Softmax),
+        compute::Op::Rope(config) => concrete_template(Op::Rope {
             theta: config.theta,
-        },
-        compute::Op::Embed => Op::Embed,
-        compute::Op::Matmul => Op::Matmul,
-        compute::Op::Sdpa(config) => Op::Sdpa {
-            scale: config.scale,
-            causal: config.causal,
-            q_start: config.q_start,
-        },
+        }),
+        compute::Op::Embed => concrete_template(Op::Embed),
+        compute::Op::Matmul => concrete_template(Op::Matmul),
+        compute::Op::Sdpa(config) => {
+            let q_start = core_affine(config.q_start);
+            let concrete = q_start.is_constant().then_some(Op::Sdpa {
+                scale: config.scale,
+                causal: config.causal,
+                q_start: config.q_start.offset,
+            });
+            (
+                TemplateOp::sdpa(config.scale, config.causal, q_start),
+                concrete,
+            )
+        }
     }
+}
+
+fn concrete_template(op: Op) -> (TemplateOp, Option<Op>) {
+    (op.into(), Some(op))
 }
 
 fn symbolic_view(
@@ -2143,6 +2234,32 @@ fn symbolic_view(
         ViewOp::Permute(axes) => layout.permute(axes),
         ViewOp::Broadcast(shape) => layout.broadcast(shape.clone()),
     }
+}
+
+fn tensor_space<'a>(
+    entries: impl Iterator<Item = &'a TensorEntry>,
+) -> Result<Option<ParamSpace>, compute::Error> {
+    let mut space = None;
+    for candidate in entries.filter_map(|entry| entry.symbolic.as_ref().map(SymbolicLayout::space))
+    {
+        merge_parameter_space(space.as_ref(), Some(candidate))?;
+        space = Some(candidate.clone());
+    }
+    Ok(space)
+}
+
+fn merge_parameter_space(
+    current: Option<&ParamSpace>,
+    candidate: Option<&ParamSpace>,
+) -> Result<(), compute::Error> {
+    if let (Some(current), Some(candidate)) = (current, candidate)
+        && current != candidate
+    {
+        return Err(compute::Error::Layout(
+            "command list mixes parameter spaces".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn graph_error(error: &impl ToString) -> compute::Error {
@@ -2385,7 +2502,7 @@ mod tests {
     };
 
     use forja_core::{
-        Backend, BackendError, BufferId, CommandList, DType, Layout, LayoutError, MappedRegion,
+        Backend, BackendError, BufferId, CommandList, DType, Layout, LayoutError, MappedRegion, Op,
         OpError, Submission, Tensor, ViewOp as CoreViewOp,
         program::{KernelSignature, ValidatedProgram},
     };
@@ -2394,7 +2511,7 @@ mod tests {
 
     use super::{
         BackendEvent, BackendTimer, EngineMetrics, EngineStepProfile, Grants, Host, ImportKind,
-        ImportTimer, Limits, MAX_INSTRUCTIONS, MAX_OUTPUTS, bindings::l9o::gpu::compute,
+        ImportTimer, Limits, MAX_INSTRUCTIONS, MAX_OUTPUTS, bindings::l9o::gpu::compute, core_op,
         core_program,
     };
 
@@ -2419,6 +2536,14 @@ mod tests {
             inputs: vec![compute::Dtype::F32],
             outputs: vec![compute::Dtype::F32],
             scalars: 0,
+        }
+    }
+
+    fn wit_affine(param: Option<u8>, scale: u32, offset: u32) -> compute::Affine {
+        compute::Affine {
+            param,
+            scale,
+            offset,
         }
     }
 
@@ -2499,6 +2624,33 @@ mod tests {
         let symbolic = host.entry(&permuted).unwrap().symbolic.as_ref().unwrap();
         let values = symbolic.space().values(vec![2]).unwrap();
         assert_eq!(symbolic.instantiate(&values).unwrap().shape(), &[2, 2]);
+    }
+
+    #[test]
+    fn affine_sdpa_positions_remain_parameterized_when_recorded() {
+        let (operation, concrete) = core_op(compute::Op::Sdpa(compute::SdpaCfg {
+            scale: 0.088,
+            causal: true,
+            q_start: wit_affine(Some(0), 2, 1),
+        }));
+
+        assert!(operation.is_parameter_dependent());
+        assert!(concrete.is_none());
+
+        let (operation, concrete) = core_op(compute::Op::Sdpa(compute::SdpaCfg {
+            scale: 0.088,
+            causal: true,
+            q_start: wit_affine(None, 0, 7),
+        }));
+        assert!(!operation.is_parameter_dependent());
+        assert_eq!(
+            concrete,
+            Some(Op::Sdpa {
+                scale: 0.088,
+                causal: true,
+                q_start: 7,
+            })
+        );
     }
 
     #[test]
@@ -2979,7 +3131,7 @@ mod tests {
                 compute::Op::Sdpa(compute::SdpaCfg {
                     scale: 0.088,
                     causal: false,
-                    q_start: 0,
+                    q_start: wit_affine(None, 0, 0),
                 }),
                 vec![
                     (compute::Dtype::F32, vec![16, 7, 128]),

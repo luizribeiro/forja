@@ -275,7 +275,11 @@ pub(crate) mod guest {
             } => compute::Op::Sdpa(compute::SdpaCfg {
                 scale,
                 causal,
-                q_start,
+                q_start: compute::Affine {
+                    param: None,
+                    scale: 0,
+                    offset: q_start,
+                },
             }),
         }
     }
