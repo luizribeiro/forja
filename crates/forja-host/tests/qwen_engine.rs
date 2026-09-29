@@ -1,12 +1,25 @@
 //! Native Qwen3 engine checks against independent transformer fixtures.
 
-use std::{env, error::Error, path::PathBuf};
+use std::{env, error::Error, path::PathBuf, time::Duration};
 
+use forja_core::Backend;
+use forja_host::{EngineRunner, EngineStep, Limits};
 use forja_sdk::{Engine, Tensor, Weights};
 use golden_fixtures::{
     BF16_HIDDEN_STATE_TOLERANCE, FixtureDirectory, PromptFixture, normwise_relative_error,
 };
 use qwen3::Qwen3;
+
+const REPLAY_LIMITS: Limits = Limits::new(
+    8 * 1024 * 1024 * 1024,
+    4,
+    1_000_000_000,
+    20_000,
+    1024 * 1024 * 1024,
+)
+.with_command_limits(4_096, u64::MAX)
+.with_guest_call_timeout(Duration::from_secs(300))
+.with_gpu_limits(Duration::from_secs(60), Duration::from_secs(3_600));
 
 #[test]
 #[ignore = "requires FORJA_MODELS and runs in the pre-push hook"]
@@ -100,6 +113,96 @@ fn chunked_prefill_matches_single_pass_and_transformers() -> Result<(), Box<dyn 
             &golden.values()[3 * 1_024..7 * 1_024],
             &chunked,
         )?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires FORJA_MODELS and runs in the pre-push hook"]
+async fn replay_matches_lazy_decode_on_cpu() -> Result<(), Box<dyn Error>> {
+    compare_replay(
+        forja_cpu::CpuBackend::new(),
+        forja_cpu::CpuBackend::new(),
+        8,
+    )
+    .await
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[ignore = "requires FORJA_MODELS and runs in the pre-push hook"]
+async fn metal_replay_matches_lazy_decode() -> Result<(), Box<dyn Error>> {
+    compare_replay(
+        forja_metal::MetalBackend::new()?,
+        forja_metal::MetalBackend::new()?,
+        128,
+    )
+    .await
+}
+
+async fn compare_replay<B>(
+    replay_backend: B,
+    lazy_backend: B,
+    token_count: u32,
+) -> Result<(), Box<dyn Error>>
+where
+    B: Backend + Send + Sync + 'static,
+{
+    let root = PathBuf::from(env::var_os("FORJA_MODELS").ok_or("FORJA_MODELS is not set")?);
+    let weights = root.join("Qwen3-0.6B/model.safetensors");
+    let mut replay = EngineRunner::new(
+        test_guests::qwen3_bf16(),
+        replay_backend,
+        REPLAY_LIMITS,
+        &weights,
+    )
+    .await?;
+    let mut lazy = EngineRunner::new(
+        test_guests::qwen3_bf16_no_replay(),
+        lazy_backend,
+        REPLAY_LIMITS,
+        weights,
+    )
+    .await?;
+    replay.load().await??;
+    lazy.load().await??;
+    let prompt = (0_u32..8).collect::<Vec<_>>();
+    replay
+        .step(EngineStep {
+            tokens: prompt.clone(),
+            start_pos: 0,
+            taps: false,
+        })
+        .await??;
+    lazy.step(EngineStep {
+        tokens: prompt,
+        start_pos: 0,
+        taps: false,
+    })
+    .await??;
+
+    for step in 0..token_count {
+        let start_pos = 8 + step;
+        let token = (step * 7_919 + 17) % qwen3::VOCAB;
+        let replay_output = replay
+            .step(EngineStep {
+                tokens: vec![token],
+                start_pos,
+                taps: false,
+            })
+            .await??;
+        let lazy_output = lazy
+            .step(EngineStep {
+                tokens: vec![token],
+                start_pos,
+                taps: false,
+            })
+            .await??;
+        assert_eq!(
+            replay.read(&replay_output.logits).await?,
+            lazy.read(&lazy_output.logits).await?,
+            "decode logits differed at position {start_pos}"
+        );
     }
     Ok(())
 }
