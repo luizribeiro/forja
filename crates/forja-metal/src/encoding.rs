@@ -1894,6 +1894,7 @@ impl MetalBackend {
                 self.encode_rms_norm(encoder, table, dispatch, eps, bindings, arguments)?
             }
             Op::Softmax => self.encode_softmax(encoder, table, dispatch, bindings, arguments)?,
+            Op::Argmax => self.encode_argmax(encoder, table, dispatch, bindings, arguments)?,
             Op::Rope { theta } => {
                 self.encode_rope(encoder, table, dispatch, theta, bindings, arguments)?
             }
@@ -1925,7 +1926,7 @@ impl MetalBackend {
                 };
                 self.encode_elementwise(encoder, table, dispatch, kernel, bindings, arguments)?
             }
-            Op::Argmax | Op::Program(_) => return Err(BackendError::InvalidInput),
+            Op::Program(_) => return Err(BackendError::InvalidInput),
         };
         temporaries.extend(buffers);
         Ok(())
@@ -3129,6 +3130,71 @@ impl MetalBackend {
         Ok(temporaries)
     }
 
+    fn encode_argmax(
+        &self,
+        encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
+        table: &ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>,
+        dispatch: &Dispatch,
+        bindings: &mut ArgumentBindings,
+        arguments: &mut ArgumentWriter,
+    ) -> Result<Vec<BufferBinding>, BackendError> {
+        let [input] = dispatch.inputs() else {
+            return Err(BackendError::InvalidInput);
+        };
+        let output = dispatch.output();
+        let width = *input
+            .layout()
+            .shape()
+            .last()
+            .ok_or(BackendError::InvalidInput)?;
+        let pipeline = self
+            .pipelines
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?
+            .get("argmax", &[(0, dtype_code(input.layout().dtype()))])?;
+        set_pipeline(encoder, &pipeline);
+        let temporaries = vec![
+            Self::layout_buffer(input.layout(), arguments)?,
+            Self::layout_buffer(output.layout(), arguments)?,
+            arguments.write(&width.to_ne_bytes())?,
+        ];
+        let buffers = self
+            .buffers
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?;
+        bindings.bind_raw(table, 0, &buffers.get(input)?.raw);
+        bindings.bind_raw(table, 1, &buffers.get(output)?.raw);
+        drop(buffers);
+        bindings.bind(table, 2, &temporaries[0]);
+        bindings.bind(table, 3, &temporaries[1]);
+        bindings.bind(table, 4, &temporaries[2]);
+        set_argument_table(encoder, table);
+        let max_threads = pipeline.maxTotalThreadsPerThreadgroup();
+        let thread_count = if width <= 1024 {
+            usize::try_from(width)
+                .map_err(|_| BackendError::ExecutionFailed)?
+                .next_multiple_of(32)
+                .min(max_threads)
+        } else {
+            max_threads.min(256)
+        };
+        dispatch_threadgroups(
+            encoder,
+            MTLSize {
+                width: usize::try_from(output.layout().element_count())
+                    .map_err(|_| BackendError::ExecutionFailed)?,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: thread_count,
+                height: 1,
+                depth: 1,
+            },
+        );
+        Ok(temporaries)
+    }
+
     fn encode_rms_norm(
         &self,
         encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
@@ -3386,8 +3452,7 @@ impl MetalBackend {
                     arguments.write(len)?;
                 }
             }
-            Op::Softmax => Self::size_softmax_arguments(arguments)?,
-            Op::Argmax => return Err(BackendError::InvalidInput),
+            Op::Softmax | Op::Argmax => Self::size_softmax_arguments(arguments)?,
             Op::Rope { .. } => {
                 for len in [112, 112, 112, 12] {
                     arguments.write(len)?;
@@ -3765,11 +3830,11 @@ fn supported_dispatch(dispatch: &Dispatch) -> bool {
         | Op::SiluMul
         | Op::RmsNorm { .. }
         | Op::Softmax
+        | Op::Argmax
         | Op::Rope { .. }
         | Op::Embed
         | Op::Matmul
         | Op::Sdpa { .. } => true,
-        Op::Argmax => false,
     }
 }
 
@@ -4259,7 +4324,7 @@ impl PipelineCache {
 }
 
 fn nan_preserving_kernel(name: &str) -> bool {
-    matches!(name, "softmax_single" | "softmax_looped")
+    matches!(name, "softmax_single" | "softmax_looped" | "argmax")
 }
 
 fn compile_options(math_mode: MTLMathMode) -> Retained<MTLCompileOptions> {
@@ -6029,6 +6094,59 @@ mod tests {
             )
             .unwrap();
         }
+    }
+
+    #[test]
+    fn metal_argmax_matches_cpu_for_dtypes_rows_and_views() {
+        let reference = CpuBackend::new();
+        let candidate = MetalBackend::new().unwrap();
+        for dtype in [DType::F32, DType::F16, DType::BF16] {
+            for width in [1, 7, 33, 4097, 151_936] {
+                assert_backends_agree(
+                    &reference,
+                    &candidate,
+                    Op::Argmax,
+                    &[TensorSpec::contiguous(dtype, &[2, width])],
+                    &TensorSpec::contiguous(DType::U32, &[2]),
+                )
+                .unwrap();
+            }
+            assert_backends_agree(
+                &reference,
+                &candidate,
+                Op::Argmax,
+                &[TensorSpec::permuted(dtype, &[33, 7], &[1, 0])],
+                &TensorSpec::contiguous(DType::U32, &[7]),
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn metal_argmax_matches_cpu_total_order_and_last_tie() {
+        let values = [
+            3.0,
+            1.0,
+            3.0,
+            f32::NEG_INFINITY,
+            f32::INFINITY,
+            f32::INFINITY,
+            -0.0,
+            0.0,
+            -0.0,
+            1.0,
+            f32::NAN,
+            2.0,
+        ];
+        let bytes = values.into_iter().flat_map(f32::to_le_bytes).collect();
+        assert_backends_agree(
+            &CpuBackend::new(),
+            &MetalBackend::new().unwrap(),
+            Op::Argmax,
+            &[TensorSpec::initialized(DType::F32, &[3, 4], bytes)],
+            &TensorSpec::contiguous(DType::U32, &[3]),
+        )
+        .unwrap();
     }
 
     #[test]

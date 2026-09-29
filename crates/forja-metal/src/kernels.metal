@@ -250,6 +250,54 @@ kernel void NAME( \
 DEFINE_SOFTMAX(softmax_single, false)
 DEFINE_SOFTMAX(softmax_looped, true)
 
+uint total_order_key(float value) {
+    uint bits = as_type<uint>(value);
+    return (bits & 0x80000000u) != 0u ? ~bits : bits ^ 0x80000000u;
+}
+
+kernel void argmax(
+    device const uchar *input [[buffer(0)]],
+    device uint *output [[buffer(1)]],
+    constant TensorLayout &input_layout [[buffer(2)]],
+    constant TensorLayout &output_layout [[buffer(3)]],
+    constant uint &width [[buffer(4)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint lane [[thread_position_in_threadgroup]],
+    uint group_width [[threads_per_threadgroup]]) {
+    threadgroup uint keys[1024];
+    threadgroup uint indices[1024];
+    if (lane < width) {
+        uint best_index = lane;
+        uint best_key = total_order_key(load_float(
+            input, physical_index(input_layout, row * width + lane), input0_dtype));
+        for (uint column = lane + group_width; column < width; column += group_width) {
+            uint key = total_order_key(load_float(
+                input, physical_index(input_layout, row * width + column), input0_dtype));
+            if (key >= best_key) {
+                best_key = key;
+                best_index = column;
+            }
+        }
+        keys[lane] = best_key;
+        indices[lane] = best_index;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane == 0) {
+        uint best_key = keys[0];
+        uint best_index = indices[0];
+        uint active = min(width, group_width);
+        for (uint index = 1; index < active; ++index) {
+            uint key = keys[index];
+            uint candidate = indices[index];
+            if (key > best_key || (key == best_key && candidate > best_index)) {
+                best_key = key;
+                best_index = candidate;
+            }
+        }
+        output[physical_index(output_layout, row)] = best_index;
+    }
+}
+
 struct RopeParams {
     uint heads;
     uint width;
