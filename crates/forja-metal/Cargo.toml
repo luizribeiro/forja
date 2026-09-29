@@ -34,6 +34,8 @@ objc2-metal = { version = "0.3", default-features = false, features = [
   "MTLEvent",
   "MTLFunctionConstantValues",
   "MTLGPUAddress",
+  "MTLIndirectCommandBuffer",
+  "MTLIndirectCommandEncoder",
   "MTLLibrary",
   "MTLResidencySet",
   "MTLResource",
