@@ -1,19 +1,36 @@
 use std::collections::BTreeMap;
 
-use forja_config::{Choice, GraphReplay, KeyPath, Origin, Selection};
-use serde::Serialize;
+use forja_config::{Choice, DevConfig, GraphReplay, KeyPath, Origin};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::args::{Bench, BenchPoint};
 
 pub(crate) const SCHEMA_VERSION: u32 = 2;
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub(crate) struct Input {
     pub(crate) engine_sha256: String,
     pub(crate) profile_hash: Option<String>,
     pub(crate) weights_sha256: String,
     pub(crate) model_revision: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[cfg_attr(not(test), expect(dead_code))]
+pub(crate) struct RecordedProvenance {
+    pub(crate) commit: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[cfg_attr(not(test), expect(dead_code))]
+pub(crate) struct Recorded {
+    pub(crate) schema_version: u32,
+    pub(crate) provenance: RecordedProvenance,
+    pub(crate) inputs: Vec<Input>,
+    pub(crate) config: String,
+    pub(crate) axes: BTreeMap<KeyPath, Vec<toml::Value>>,
+    pub(crate) results: Vec<serde_json::Value>,
 }
 
 pub(crate) struct Snapshot {
@@ -30,20 +47,7 @@ struct ConfigKey<'a> {
     inputs: &'a [Input],
 }
 
-#[derive(Serialize)]
-struct PerfKey<'a> {
-    backend: GraphReplay,
-    pp: usize,
-    tg: usize,
-    reps: usize,
-    warmups: usize,
-    decode_prefill: usize,
-    contexts: &'a [usize],
-    selection: &'a [Selection],
-    breakdown: bool,
-    engine_sha256: &'a str,
-    weights_sha256: &'a str,
-}
+pub(crate) type PerfKey = BTreeMap<String, serde_json::Value>;
 
 pub(crate) fn snapshot(options: &Bench, device: &str, macos: &str) -> Result<Snapshot, String> {
     let mut config = (*options.config).clone();
@@ -96,28 +100,104 @@ pub(crate) fn config_hash(snapshot: &Snapshot, inputs: &[Input]) -> Result<Strin
     })
 }
 
-pub(crate) fn perf_hash(
-    options: &Bench,
-    point: &BenchPoint,
-    input: &Input,
-) -> Result<String, String> {
-    hash(&PerfKey {
-        backend: point.graph_replay,
-        pp: point.pp,
-        tg: point.tg,
-        reps: options.reps,
-        warmups: options.warmups,
-        decode_prefill: options.decode_prefill,
-        contexts: &point.contexts,
-        selection: &point.selection,
-        breakdown: options.breakdown,
-        engine_sha256: &input.engine_sha256,
-        weights_sha256: &input.weights_sha256,
-    })
+pub(crate) fn perf_key(point: &BenchPoint, input: &Input) -> Result<PerfKey, String> {
+    perf_key_from(&point.config, point.graph_replay, input)
 }
 
 pub(crate) fn combined_perf_hash(hashes: &[String]) -> Result<String, String> {
     hash(hashes)
+}
+
+pub(crate) fn comparison_hash(key: &PerfKey) -> Result<String, String> {
+    hash(key)
+}
+
+#[cfg_attr(not(test), expect(dead_code))]
+pub(crate) fn recorded_perf_keys(record: &Recorded) -> Result<Vec<PerfKey>, String> {
+    let base = toml::from_str(&record.config)
+        .map_err(|error| format!("record config is invalid: {error}"))?;
+    record
+        .results
+        .iter()
+        .map(|result| recorded_perf_key(record, &base, result))
+        .collect()
+}
+
+fn recorded_perf_key(
+    record: &Recorded,
+    base: &toml::Table,
+    result: &serde_json::Value,
+) -> Result<PerfKey, String> {
+    let mut layers = vec![forja_config::Layer::new(Origin::Vary, base.clone())];
+    let point = result["point"]
+        .as_object()
+        .ok_or_else(|| "record result point is not an object".to_owned())?;
+    for (key, value) in point {
+        let value = toml::Value::try_from(value.clone())
+            .map_err(|error| format!("record point {key} is invalid: {error}"))?;
+        let table = toml::from_str(&format!("{key} = {value}"))
+            .map_err(|error| format!("record point {key} is invalid: {error}"))?;
+        layers.push(forja_config::Layer::new(Origin::Vary, table));
+    }
+    let config = forja_config::layer::<DevConfig>(layers)
+        .map_err(|error| format!("record point is invalid: {error}"))?
+        .config;
+    let input = result["input"]
+        .as_u64()
+        .and_then(|index| usize::try_from(index).ok())
+        .and_then(|index| record.inputs.get(index))
+        .ok_or_else(|| "record result input is invalid".to_owned())?;
+    let replay = config.backend.metal.resolve().graph_replay;
+    perf_key_from(&config, replay, input)
+}
+
+fn perf_key_from(
+    config: &DevConfig,
+    graph_replay: GraphReplay,
+    input: &Input,
+) -> Result<PerfKey, String> {
+    let mut key = BTreeMap::new();
+    key.insert("backend.kind".to_owned(), serde_json::json!("metal"));
+    key.insert(
+        "backend.metal.graph_replay".to_owned(),
+        serde_json::to_value(graph_replay)
+            .map_err(|error| format!("cannot serialize graph replay: {error}"))?,
+    );
+    key.insert("bench.pp".to_owned(), serde_json::json!(config.bench.pp));
+    key.insert("bench.tg".to_owned(), serde_json::json!(config.bench.tg));
+    key.insert(
+        "bench.reps".to_owned(),
+        serde_json::json!(config.bench.reps),
+    );
+    key.insert(
+        "bench.warmups".to_owned(),
+        serde_json::json!(config.bench.warmups),
+    );
+    key.insert(
+        "bench.decode_prefill".to_owned(),
+        serde_json::json!(config.bench.decode_prefill),
+    );
+    key.insert(
+        "bench.contexts".to_owned(),
+        serde_json::json!(config.bench.contexts.as_slice()),
+    );
+    key.insert(
+        "bench.selection".to_owned(),
+        serde_json::json!(config.bench.selection.as_slice()),
+    );
+    key.insert(
+        "bench.breakdown".to_owned(),
+        serde_json::json!(config.bench.breakdown),
+    );
+    key.insert(
+        "engine.sha256".to_owned(),
+        serde_json::json!(input.engine_sha256),
+    );
+    key.insert(
+        "weights.sha256".to_owned(),
+        serde_json::json!(input.weights_sha256),
+    );
+    Ok(key)
 }
 
 pub(crate) fn output_digest(tokens: &[u32], logits: &[u8]) -> String {
@@ -150,10 +230,20 @@ fn record_origin(origin: &Origin) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use forja_config::DevConfig;
 
     fn options() -> Bench {
-        let config = DevConfig::default();
+        let mut config = DevConfig::default();
+        config.bench.tg = std::num::NonZeroU32::new(7).unwrap();
+        config.bench.reps = std::num::NonZeroU32::new(3).unwrap();
+        config.bench.warmups = 1;
+        let contexts = config
+            .bench
+            .contexts
+            .as_slice()
+            .iter()
+            .map(|&value| usize::try_from(value).unwrap())
+            .collect();
+        let selection = config.bench.selection.as_slice().to_vec();
         Bench {
             engines: vec!["engine.wasm".into()],
             model_dir: "model".into(),
@@ -162,8 +252,8 @@ mod tests {
             reps: 3,
             warmups: 1,
             decode_prefill: 8,
-            contexts: vec![9, 512, 4_000],
-            selection: vec![Selection::GpuPipelined],
+            contexts,
+            selection,
             json: None,
             breakdown: false,
             graph_replay: GraphReplay::Tier2,
@@ -202,11 +292,11 @@ mod tests {
         }];
         assert_eq!(
             config_hash(&snapshot, &inputs).unwrap(),
-            "sha256:95d94399d6e91a69d57e5a7236df00cd71becc644ed58068e954222579f4fe96"
+            "sha256:5d8c0825f1f203ba387700bce4b5f61826ac2cd0c79f86f7d02a48d00276bbfd"
         );
         assert_eq!(
-            perf_hash(&options, &point, &inputs[0]).unwrap(),
-            "sha256:37cb92a99e577a083df83232c34cd1db744c181b3f232ed3fc1cc67c4eeccbc6"
+            comparison_hash(&perf_key(&point, &inputs[0]).unwrap()).unwrap(),
+            "sha256:5480f24dad09712f904594964052e810be98dad10df79a9aa275e9c20cf96c70"
         );
     }
 
@@ -227,6 +317,32 @@ mod tests {
         assert_eq!(
             output_digest(&[1, 0x1020_3040], &[5, 6]),
             "sha256:b8097b75ea7e84e2fb279fc7d7f62b6dc2f19af32be084035b0b8b2906580404"
+        );
+    }
+
+    #[test]
+    fn reconstructs_performance_keys_from_recorded_points() {
+        let options = options();
+        let point = point(&options);
+        let input = Input {
+            engine_sha256: "engine".to_owned(),
+            profile_hash: None,
+            weights_sha256: "weights".to_owned(),
+            model_revision: None,
+        };
+        let record = Recorded {
+            schema_version: SCHEMA_VERSION,
+            provenance: RecordedProvenance {
+                commit: "recorded".to_owned(),
+            },
+            inputs: vec![input.clone()],
+            config: snapshot(&options, "Apple M3 Ultra", "26.6").unwrap().config,
+            axes: BTreeMap::new(),
+            results: vec![serde_json::json!({"input": 0, "point": {}})],
+        };
+        assert_eq!(
+            recorded_perf_keys(&record).unwrap(),
+            [perf_key(&point, &input).unwrap()]
         );
     }
 }

@@ -93,13 +93,21 @@ async fn run_metal(options: &Bench) -> Result<(), Box<dyn Error>> {
             })
         })
         .collect::<Result<Vec<_>, std::io::Error>>()?;
-    let perf_hashes = options
+    let perf_keys = options
         .points
         .iter()
         .map(|point| {
             inputs
                 .iter()
-                .map(|input| benchmark_record::perf_hash(options, point, input))
+                .map(|input| benchmark_record::perf_key(point, input))
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let perf_hashes = perf_keys
+        .iter()
+        .map(|keys| {
+            keys.iter()
+                .map(benchmark_record::comparison_hash)
                 .collect::<Result<Vec<_>, _>>()
         })
         .collect::<Result<Vec<_>, _>>()?;
