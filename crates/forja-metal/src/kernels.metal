@@ -502,9 +502,14 @@ kernel void sample_prepare(
     constant uint &width [[buffer(3)]],
     device atomic_uint *error_flag [[buffer(4)]],
     constant uint &max_rounds [[buffer(5)]],
+    device atomic_uint *rejection_dispatch [[buffer(6)]],
     uint row [[threadgroup_position_in_grid]],
     uint lane [[thread_position_in_threadgroup]],
     uint group_width [[threads_per_threadgroup]]) {
+    if (row == 0 && lane < 3) {
+        uint value = lane == 0 ? 0 : 1;
+        atomic_store_explicit(rejection_dispatch + lane, value, memory_order_relaxed);
+    }
     SamplingConfig config = sampling_config(sampling, sampling_layout);
     if (invalid_sampling(config)) {
         if (lane == 0) {
@@ -704,8 +709,12 @@ kernel void sample_rejection_threshold_finalize(
     constant uint &round [[buffer(9)]],
     constant uint &max_rounds [[buffer(10)]],
     constant uint &chunks [[buffer(11)]],
-    uint row [[threadgroup_position_in_grid]],
-    uint lane [[thread_position_in_threadgroup]]) {
+    device atomic_uint *rejection_dispatch [[buffer(12)]],
+    uint3 grid_position [[threadgroup_position_in_grid]],
+    uint3 thread_position [[thread_position_in_threadgroup]],
+    uint3 groups [[threadgroups_per_grid]]) {
+    uint row = grid_position.x;
+    uint lane = thread_position.x;
     if (lane != 0 || atomic_load_explicit(
             state + row * sample_state_words + sample_status,
             memory_order_relaxed) != sample_pending) {
@@ -767,6 +776,12 @@ kernel void sample_rejection_threshold_finalize(
         atomic_store_explicit(
             state + row * sample_state_words + sample_status,
             status, memory_order_relaxed);
+    }
+    if (atomic_load_explicit(
+            state + row * sample_state_words + sample_status,
+            memory_order_relaxed) == sample_pending) {
+        atomic_store_explicit(
+            rejection_dispatch, groups.x * chunks, memory_order_relaxed);
     }
 }
 

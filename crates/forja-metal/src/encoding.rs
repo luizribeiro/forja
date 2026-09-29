@@ -294,7 +294,7 @@ const VECTOR_SELECTED_MIN_KEY_LENGTH: u32 = 512;
 const VECTOR_MAX_KEY_LENGTH: u32 = 65_536;
 const STEEL_SELECTED_MIN_QUERY_LENGTH: u32 = 512;
 const ARGMAX_CHUNK_WIDTH: u32 = 2048;
-const SAMPLE_REJECTION_ROUNDS: u32 = 1;
+const SAMPLE_REJECTION_ROUNDS: u32 = 2;
 const SAMPLE_ERROR: usize = 0;
 const SAMPLE_LOGITS_LAYOUT: usize = 1;
 const SAMPLE_PARAMS_LAYOUT: usize = 2;
@@ -348,6 +348,10 @@ enum PlanCall {
     ArgumentTable,
     Dispatch {
         threadgroups: MTLSize,
+        threads_per_threadgroup: MTLSize,
+    },
+    IndirectDispatch {
+        address: u64,
         threads_per_threadgroup: MTLSize,
     },
     Barrier,
@@ -942,7 +946,10 @@ fn dedupe_plan_calls(plans: &mut [Option<StaticEncodingPlan>]) {
                 argument_table_set = true;
                 !repeated
             }
-            PlanCall::Bind { .. } | PlanCall::Dispatch { .. } | PlanCall::Barrier => true,
+            PlanCall::Bind { .. }
+            | PlanCall::Dispatch { .. }
+            | PlanCall::IndirectDispatch { .. }
+            | PlanCall::Barrier => true,
         });
     }
 }
@@ -2028,6 +2035,19 @@ impl MetalBackend {
                     *threadgroups,
                     *threads_per_threadgroup,
                 ),
+                PlanCall::IndirectDispatch {
+                    address,
+                    threads_per_threadgroup,
+                } => {
+                    // SAFETY: The address was captured from a live retained scratch buffer and
+                    // names a three-u32 indirect dispatch record initialized by the sample kernel.
+                    unsafe {
+                        encoder.dispatchThreadgroupsWithIndirectBuffer_threadsPerThreadgroup(
+                            *address,
+                            *threads_per_threadgroup,
+                        );
+                    }
+                }
                 PlanCall::Barrier => encode_dispatch_barrier(encoder),
             }
         }
@@ -3470,6 +3490,7 @@ impl MetalBackend {
             .map_err(|_| BackendError::ExecutionFailed)?;
         let chunks = width.div_ceil(ARGMAX_CHUNK_WIDTH);
         let state = self.scratch_tensor(DType::U32, &[rows, 7])?;
+        let rejection_dispatch = self.scratch_tensor(DType::U32, &[3])?;
         let rejection_partials = self.scratch_tensor(DType::U32, &[rows, chunks, 4])?;
         let topk_partials = self.scratch_tensor(DType::U32, &[rows, chunks, 40])?;
         let partials = self.scratch_tensor(DType::U32, &[rows, chunks, 2])?;
@@ -3541,6 +3562,7 @@ impl MetalBackend {
         bindings.bind(table, 3, &temporaries[SAMPLE_WIDTH]);
         bindings.bind(table, 4, &temporaries[SAMPLE_ERROR]);
         bindings.bind(table, 5, &temporaries[SAMPLE_MAX_ROUNDS]);
+        bindings.bind(table, 6, &rejection_dispatch.buffer);
         set_argument_table(encoder, table);
         dispatch_threadgroups(encoder, row_groups, threads);
 
@@ -3562,7 +3584,11 @@ impl MetalBackend {
             bindings.bind(table, 8, round_buffer);
             bindings.bind(table, 9, &temporaries[SAMPLE_CHUNKS]);
             set_argument_table(encoder, table);
-            dispatch_threadgroups(encoder, chunk_groups, threads);
+            if round == 0 {
+                dispatch_threadgroups(encoder, chunk_groups, threads);
+            } else {
+                dispatch_threadgroups_indirect(encoder, &rejection_dispatch.buffer, threads);
+            }
 
             encode_dispatch_barrier(encoder);
             set_pipeline(encoder, &rejection_proposal_finalize_pipeline);
@@ -3577,7 +3603,11 @@ impl MetalBackend {
             common.bind(table, bindings, &rejection_partials.buffer);
             bindings.bind(table, 7, &temporaries[SAMPLE_CHUNKS]);
             set_argument_table(encoder, table);
-            dispatch_threadgroups(encoder, chunk_groups, threads);
+            if round == 0 {
+                dispatch_threadgroups(encoder, chunk_groups, threads);
+            } else {
+                dispatch_threadgroups_indirect(encoder, &rejection_dispatch.buffer, threads);
+            }
 
             encode_dispatch_barrier(encoder);
             set_pipeline(encoder, &rejection_threshold_finalize_pipeline);
@@ -3593,6 +3623,7 @@ impl MetalBackend {
             bindings.bind(table, 9, round_buffer);
             bindings.bind(table, 10, &temporaries[SAMPLE_MAX_ROUNDS]);
             bindings.bind(table, 11, &temporaries[SAMPLE_CHUNKS]);
+            bindings.bind(table, 12, &rejection_dispatch.buffer);
             set_argument_table(encoder, table);
             dispatch_threadgroups(encoder, row_groups, threads);
         }
@@ -3666,6 +3697,7 @@ impl MetalBackend {
             sampling_buffer,
             output_buffer,
             state.buffer,
+            rejection_dispatch.buffer,
             rejection_partials.buffer,
             topk_partials.buffer,
             partials.buffer,
@@ -4536,6 +4568,28 @@ fn dispatch_threadgroups(
         threads_per_threadgroup,
     });
     encoder.dispatchThreadgroups_threadsPerThreadgroup(threadgroups, threads_per_threadgroup);
+}
+
+fn dispatch_threadgroups_indirect(
+    encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
+    arguments: &BufferBinding,
+    threads_per_threadgroup: MTLSize,
+) {
+    use objc2_metal::MTL4ComputeCommandEncoder;
+
+    debug_assert!(arguments.len >= 3 * size_of::<u32>());
+    record_plan_call(PlanCall::IndirectDispatch {
+        address: arguments.address,
+        threads_per_threadgroup,
+    });
+    // SAFETY: `arguments` retains a live allocation containing the aligned three-u32 indirect
+    // dispatch record initialized by the preceding sample kernels.
+    unsafe {
+        encoder.dispatchThreadgroupsWithIndirectBuffer_threadsPerThreadgroup(
+            arguments.address,
+            threads_per_threadgroup,
+        );
+    }
 }
 
 fn encode_dispatch_barrier(encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>) {
