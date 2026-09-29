@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use forja_config::{
-    ConfigError, DevConfig, Layer, Limits, dev_layers, file_layer, layer, set_layer,
+    ConfigError, DevConfig, Layer, Layered, Limits, dev_layers, file_layer, layer, set_layer,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -119,8 +119,46 @@ pub(crate) struct Bench {
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) enum Command {
     Bench(Bench),
+    Config(ConfigShow),
     Run(Run),
     Verify(Verify),
+}
+
+#[derive(Args)]
+struct ConfigArgs {
+    #[command(subcommand)]
+    command: ConfigCommand,
+}
+
+#[derive(Subcommand)]
+enum ConfigCommand {
+    /// Print the effective development configuration.
+    Show(ConfigShowArgs),
+}
+
+#[derive(Args)]
+struct ConfigShowArgs {
+    /// Annotate each value with its winning source.
+    #[arg(long)]
+    origin: bool,
+    /// Print only one key or section.
+    #[arg(long)]
+    key: Option<String>,
+    /// Print JSON instead of TOML.
+    #[arg(long)]
+    json: bool,
+    /// Include values that still have their compiled defaults.
+    #[arg(long)]
+    defaults: bool,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct ConfigShow {
+    pub(crate) layered: Layered<DevConfig>,
+    pub(crate) origin: bool,
+    pub(crate) key: Option<String>,
+    pub(crate) json: bool,
+    pub(crate) defaults: bool,
 }
 
 #[derive(Parser)]
@@ -143,6 +181,8 @@ struct Cli {
 enum ParsedCommand {
     /// Benchmark one or more engines.
     Bench(Bench),
+    /// Inspect configuration.
+    Config(ConfigArgs),
     /// Generate a completion.
     Run(Run),
     /// Compare engine outputs with golden fixtures.
@@ -179,15 +219,22 @@ fn parse_with(
             }
         }
     }
-    let limits = layer::<DevConfig>(layers)
-        .map_err(|error| config_error(&error))?
-        .config
-        .limits;
+    let layered = layer::<DevConfig>(layers).map_err(|error| config_error(&error))?;
+    let limits = layered.config.limits.clone();
     Ok(match cli.command {
         ParsedCommand::Bench(mut options) => {
             options.limits = limits;
             Command::Bench(options)
         }
+        ParsedCommand::Config(options) => match options.command {
+            ConfigCommand::Show(options) => Command::Config(ConfigShow {
+                layered,
+                origin: options.origin,
+                key: options.key,
+                json: options.json,
+                defaults: options.defaults,
+            }),
+        },
         ParsedCommand::Run(mut options) => {
             options.limits = limits;
             Command::Run(options)

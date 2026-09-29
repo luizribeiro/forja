@@ -3,6 +3,7 @@
 mod args;
 mod benchmark;
 mod benchmark_stats;
+mod config_show;
 mod engine;
 mod generate;
 mod verify;
@@ -24,11 +25,16 @@ fn main() -> ExitCode {
 }
 
 fn run(command: args::Command) -> Result<(), Box<dyn Error>> {
+    if let args::Command::Config(options) = command {
+        print!("{}", config_show::render(&options)?);
+        return Ok(());
+    }
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_time()
         .build()?;
     match command {
         args::Command::Bench(options) => runtime.block_on(benchmark::run(&options)),
+        args::Command::Config(_) => unreachable!("configuration commands return before runtime"),
         args::Command::Run(options) => runtime.block_on(generate::run(&options)),
         args::Command::Verify(options) => runtime.block_on(verify::run(&options)),
     }

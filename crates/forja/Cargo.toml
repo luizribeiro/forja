@@ -16,6 +16,7 @@ golden-fixtures = { path = "../../support/golden-fixtures" }
 serde_json.workspace = true
 tokio.workspace = true
 tokenizers.workspace = true
+toml.workspace = true
 
 [dev-dependencies]
 forja-testing = { path = "../../support/forja-testing" }
