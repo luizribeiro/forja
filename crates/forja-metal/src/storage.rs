@@ -40,6 +40,7 @@ pub(super) struct MetalBuffer {
 struct PendingCompletion {
     completion: Weak<Completion>,
     range: std::ops::Range<u64>,
+    writes: bool,
 }
 
 // SAFETY: Buffer access and pending-submission tracking are serialized by the backend registry
@@ -79,14 +80,15 @@ impl MetalBuffer {
             let Some(completion) = pending.completion.upgrade() else {
                 continue;
             };
-            if let Err(error) = completion.wait(timeout) {
+            if let Err(error) = completion.wait(timeout)
+                && (pending.writes || error == BackendError::Timeout)
+            {
                 result = Err(error);
-                if matches!(error, BackendError::ExecutionFailed | BackendError::Timeout) {
-                    self.pending.push(PendingCompletion {
-                        completion: Arc::downgrade(&completion),
-                        range: pending.range,
-                    });
-                }
+                self.pending.push(PendingCompletion {
+                    completion: Arc::downgrade(&completion),
+                    range: pending.range,
+                    writes: pending.writes,
+                });
             }
         }
         result
@@ -102,22 +104,44 @@ impl MetalBuffer {
             let Some(completion) = pending.completion.upgrade() else {
                 return false;
             };
-            if pending.range.start < range.end
-                && range.start < pending.range.end
-                && let Err(error) = completion.wait(timeout)
-            {
-                result = Err(error);
+            if pending.range.start >= range.end || range.start >= pending.range.end {
+                return true;
             }
-            true
+            match completion.wait(timeout) {
+                Err(error) if pending.writes => {
+                    result = Err(error);
+                    true
+                }
+                Ok(()) | Err(_) => false,
+            }
         });
         result
     }
 
-    pub(super) fn track(&mut self, tensor: &Tensor, completion: &Arc<Completion>) {
+    pub(super) fn track(&mut self, tensor: &Tensor, completion: &Arc<Completion>, writes: bool) {
         self.pending.push(PendingCompletion {
             completion: Arc::downgrade(completion),
             range: tensor.layout().byte_span(),
+            writes,
         });
+    }
+
+    pub(super) fn dependencies(&mut self, range: &std::ops::Range<u64>) -> Vec<Arc<Completion>> {
+        let mut dependencies = Vec::new();
+        self.pending.retain(|pending| {
+            let Some(completion) = pending.completion.upgrade() else {
+                return false;
+            };
+            if completion.result() == Some(Ok(())) {
+                return false;
+            }
+            if pending.writes && pending.range.start < range.end && range.start < pending.range.end
+            {
+                dependencies.push(completion);
+            }
+            true
+        });
+        dependencies
     }
 
     pub(super) fn pending_event_value(&mut self) -> Option<u64> {

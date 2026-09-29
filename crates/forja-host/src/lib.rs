@@ -9,21 +9,22 @@ mod weights;
 
 use std::time::{Duration, Instant};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     future::Future,
     path::{Path, PathBuf},
     pin::Pin,
     sync::{
-        Arc, Mutex, OnceLock, Weak,
+        Arc, Condvar, Mutex, OnceLock, Weak,
         atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     thread,
 };
 
 use forja_core::{
-    Affine, Backend, BackendError, CommandList, DType, GraphLimits, GraphTemplate, Layout,
-    LayoutError, Op, OpError, ParamSpace, PreparedGraph, Slice, Submission, SubmissionProfile,
-    SymbolicLayout, SymbolicLayoutError, TemplateOp, TemplateTensor, Tensor, ViewOp,
+    Affine, Backend, BackendError, BufferId, CommandList, DType, GraphLimits, GraphTemplate,
+    Layout, LayoutError, Op, OpError, ParamSpace, PreparedGraph, Slice, Submission,
+    SubmissionProfile, SymbolicLayout, SymbolicLayoutError, TemplateOp, TemplateTensor, Tensor,
+    ViewOp,
     program::{
         BinOp, Inst, KernelSignature, MAX_INSTRUCTIONS, MAX_OUTPUTS, PrepareError, PreparedProgram,
         Program, ProgramError, ProgramKind, RedOp, UnOp, ValidatedProgram, ValueType,
@@ -970,6 +971,7 @@ impl Limits {
 struct BufferHandle {
     owner: Tensor,
     kind: BufferKind,
+    taints: Arc<BufferTaints>,
 }
 
 #[derive(Debug)]
@@ -989,6 +991,7 @@ impl BufferHandle {
     ) -> Result<(), BackendError> {
         let _timer = BackendTimer::start(profile, BackendEvent::Release);
         backend.release(&self.owner)?;
+        self.taints.release(self.owner.buffer());
         match &self.kind {
             BufferKind::Allocated {
                 byte_len,
@@ -1111,6 +1114,7 @@ enum RecordedDispatch {
 pub struct CommandListEntry {
     commands: CommandList,
     recorded: Vec<RecordedDispatch>,
+    access: SubmissionAccess,
     space: Option<ParamSpace>,
     parameterized: bool,
     retained: Vec<TensorEntry>,
@@ -1121,6 +1125,7 @@ pub struct CommandListEntry {
 #[derive(Debug)]
 pub struct GraphEntry {
     graph: Arc<PreparedGraph>,
+    access: SubmissionAccess,
     retained: Vec<TensorEntry>,
     retained_kernels: Vec<KernelEntry>,
     replay: Arc<ReplayState>,
@@ -1144,6 +1149,7 @@ pub struct Host<B: Backend> {
     completed_submissions: Arc<AtomicU64>,
     timed_submissions: Arc<AtomicU64>,
     completed_gpu_time_ns: Arc<AtomicU64>,
+    taints: Arc<BufferTaints>,
     active_profile: Option<Arc<Mutex<EngineStepProfile>>>,
     epoch_registration: Option<Arc<()>>,
 }
@@ -1175,6 +1181,7 @@ impl<B: Backend> Host<B> {
             completed_submissions: Arc::new(AtomicU64::new(0)),
             timed_submissions: Arc::new(AtomicU64::new(0)),
             completed_gpu_time_ns: Arc::new(AtomicU64::new(0)),
+            taints: Arc::new(BufferTaints::default()),
             active_profile: None,
             epoch_registration: None,
         }
@@ -1261,6 +1268,7 @@ impl<B: Backend> Host<B> {
             symbolic: None,
             buffer: Arc::new(BufferHandle {
                 owner: tensor.clone(),
+                taints: Arc::clone(&self.taints),
                 kind: BufferKind::Allocated {
                     byte_len,
                     live_bytes: Arc::clone(&self.live_bytes),
@@ -1417,6 +1425,7 @@ impl<B: Backend> Host<B> {
             let buffer = Arc::new(BufferHandle {
                 owner,
                 kind: BufferKind::Weights(source),
+                taints: Arc::clone(&self.taints),
             });
             self.weight_files
                 .insert(grant.to_owned(), Arc::downgrade(&buffer));
@@ -1560,6 +1569,11 @@ impl<B: Backend> Host<B> {
                 bytes.len()
             )));
         }
+        entry
+            .buffer
+            .taints
+            .wait_for_writes(tensor.buffer())
+            .map_err(guest_error)?;
         self.backend.write(tensor, bytes).map_err(guest_error)
     }
 
@@ -1573,6 +1587,7 @@ impl<B: Backend> Host<B> {
             .push(CommandListEntry {
                 commands: CommandList::new(),
                 recorded: Vec::new(),
+                access: SubmissionAccess::default(),
                 space: None,
                 parameterized: false,
                 retained: Vec::new(),
@@ -1666,6 +1681,9 @@ impl<B: Backend> Host<B> {
             });
         }
         entry.space = entry.space.take().or(dispatch_space);
+        entry
+            .access
+            .record(&input_entries, std::slice::from_ref(&output_entry));
         entry.retained.extend(input_entries);
         entry.retained.push(output_entry);
         Ok(())
@@ -1744,6 +1762,7 @@ impl<B: Backend> Host<B> {
             });
         }
         entry.space = entry.space.take().or(dispatch_space);
+        entry.access.record(&input_entries, &output_entries);
         entry.retained.extend(input_entries);
         entry.retained.extend(output_entries);
         entry.retained_kernels.push(retained_kernel);
@@ -1817,6 +1836,7 @@ impl<B: Backend> Host<B> {
             };
         let graph_entry = GraphEntry {
             graph: Arc::new(graph),
+            access: entry.access,
             retained: Vec::new(),
             retained_kernels: Vec::new(),
             replay: Arc::new(ReplayState::default()),
@@ -1859,6 +1879,7 @@ impl<B: Backend> Host<B> {
         Ok(SubmitRequest {
             backend: Arc::clone(&self.backend),
             work: SubmissionWork::Commands(entry.commands),
+            access: entry.access,
             retained: entry.retained,
             flight: None,
             timeout: self.limits.submission_timeout,
@@ -1867,6 +1888,7 @@ impl<B: Backend> Host<B> {
             completed_submissions: Arc::clone(&self.completed_submissions),
             timed_submissions: Arc::clone(&self.timed_submissions),
             completed_gpu_time_ns: Arc::clone(&self.completed_gpu_time_ns),
+            taints: Arc::clone(&self.taints),
             profile: self.active_profile.clone(),
         })
     }
@@ -1888,6 +1910,7 @@ impl<B: Backend> Host<B> {
                 graph: Arc::clone(&entry.graph),
                 values,
             },
+            access: entry.access.clone(),
             retained: Vec::new(),
             flight: Some(flight),
             timeout: self.limits.submission_timeout,
@@ -1896,6 +1919,7 @@ impl<B: Backend> Host<B> {
             completed_submissions: Arc::clone(&self.completed_submissions),
             timed_submissions: Arc::clone(&self.timed_submissions),
             completed_gpu_time_ns: Arc::clone(&self.completed_gpu_time_ns),
+            taints: Arc::clone(&self.taints),
             profile: self.active_profile.clone(),
         })
     }
@@ -2091,6 +2115,7 @@ struct ReadRequest<B: Backend> {
 struct SubmitRequest<B: Backend> {
     backend: Arc<B>,
     work: SubmissionWork,
+    access: SubmissionAccess,
     retained: Vec<TensorEntry>,
     flight: Option<ReplayFlight>,
     timeout: Duration,
@@ -2099,6 +2124,7 @@ struct SubmitRequest<B: Backend> {
     completed_submissions: Arc<AtomicU64>,
     timed_submissions: Arc<AtomicU64>,
     completed_gpu_time_ns: Arc<AtomicU64>,
+    taints: Arc<BufferTaints>,
     profile: Option<Arc<Mutex<EngineStepProfile>>>,
 }
 
@@ -2108,6 +2134,202 @@ enum SubmissionWork {
         graph: Arc<PreparedGraph>,
         values: Vec<u32>,
     },
+}
+
+#[derive(Clone, Debug, Default)]
+struct SubmissionAccess {
+    reads: HashSet<BufferId>,
+    writes: HashSet<BufferId>,
+}
+
+impl SubmissionAccess {
+    fn record(&mut self, inputs: &[TensorEntry], outputs: &[TensorEntry]) {
+        self.reads
+            .extend(inputs.iter().map(|entry| entry.tensor.buffer()));
+        self.writes
+            .extend(outputs.iter().map(|entry| entry.tensor.buffer()));
+    }
+}
+
+#[derive(Debug, Default)]
+struct BufferTaints {
+    state: Mutex<BufferTaintState>,
+}
+
+#[derive(Debug, Default)]
+struct BufferTaintState {
+    tainted: HashMap<BufferId, BackendError>,
+    pending_writes: HashMap<BufferId, Vec<Weak<SubmissionOutcome>>>,
+}
+
+#[derive(Debug, Default)]
+struct SubmissionOutcome {
+    result: Mutex<Option<Result<(), BackendError>>>,
+    ready: Condvar,
+}
+
+impl SubmissionOutcome {
+    fn wait(&self) -> Result<(), BackendError> {
+        let mut result = self
+            .result
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?;
+        while result.is_none() {
+            result = self
+                .ready
+                .wait(result)
+                .map_err(|_| BackendError::ExecutionFailed)?;
+        }
+        result.unwrap_or(Err(BackendError::ExecutionFailed))
+    }
+
+    fn complete(&self, result: Result<(), BackendError>) {
+        if let Ok(mut target) = self.result.lock() {
+            *target = Some(result);
+        }
+        self.ready.notify_all();
+    }
+}
+
+impl BufferTaints {
+    fn begin(self: &Arc<Self>, access: &SubmissionAccess) -> Result<TaintFlight, BackendError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?;
+        if let Some(error) = access
+            .reads
+            .iter()
+            .find_map(|buffer| state.tainted.get(buffer).copied())
+        {
+            return Err(error);
+        }
+        let mut seen = HashSet::new();
+        let mut dependencies = Vec::new();
+        for buffer in &access.reads {
+            if let Some(pending) = state.pending_writes.get_mut(buffer) {
+                pending.retain(|outcome| outcome.strong_count() != 0);
+                dependencies.extend(
+                    pending
+                        .iter()
+                        .filter_map(Weak::upgrade)
+                        .filter(|outcome| seen.insert(Arc::as_ptr(outcome) as usize)),
+                );
+            }
+        }
+        let outcome = Arc::new(SubmissionOutcome::default());
+        for buffer in &access.writes {
+            state
+                .pending_writes
+                .entry(*buffer)
+                .or_default()
+                .push(Arc::downgrade(&outcome));
+        }
+        Ok(TaintFlight {
+            owner: Arc::clone(self),
+            outcome,
+            dependencies,
+            writes: access.writes.iter().copied().collect(),
+            finished: false,
+        })
+    }
+
+    fn wait_for_writes(&self, buffer: BufferId) -> Result<(), BackendError> {
+        let pending = {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| BackendError::ExecutionFailed)?;
+            if let Some(error) = state.tainted.get(&buffer) {
+                return Err(*error);
+            }
+            let Some(pending) = state.pending_writes.get_mut(&buffer) else {
+                return Ok(());
+            };
+            pending.retain(|outcome| outcome.strong_count() != 0);
+            pending.iter().filter_map(Weak::upgrade).collect::<Vec<_>>()
+        };
+        for outcome in pending {
+            outcome.wait()?;
+        }
+        self.state
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?
+            .tainted
+            .get(&buffer)
+            .copied()
+            .map_or(Ok(()), Err)
+    }
+
+    fn check(&self, buffer: BufferId) -> Result<(), BackendError> {
+        self.state
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?
+            .tainted
+            .get(&buffer)
+            .copied()
+            .map_or(Ok(()), Err)
+    }
+
+    fn release(&self, buffer: BufferId) {
+        if let Ok(mut state) = self.state.lock() {
+            state.tainted.remove(&buffer);
+            state.pending_writes.remove(&buffer);
+        }
+    }
+}
+
+struct TaintFlight {
+    owner: Arc<BufferTaints>,
+    outcome: Arc<SubmissionOutcome>,
+    dependencies: Vec<Arc<SubmissionOutcome>>,
+    writes: Vec<BufferId>,
+    finished: bool,
+}
+
+impl TaintFlight {
+    fn finish<T>(
+        mut self,
+        mut result: Result<T, BackendError>,
+        committed: bool,
+    ) -> Result<T, BackendError> {
+        if result.is_ok() {
+            for dependency in &self.dependencies {
+                if let Err(error) = dependency.wait() {
+                    result = Err(error);
+                    break;
+                }
+            }
+        }
+        if committed
+            && let Err(error) = result
+            && let Ok(mut state) = self.owner.state.lock()
+        {
+            for buffer in &self.writes {
+                state.tainted.entry(*buffer).or_insert(error);
+            }
+        }
+        self.outcome
+            .complete(result.as_ref().map(|_| ()).map_err(|error| *error));
+        self.finished = true;
+        result
+    }
+}
+
+impl Drop for TaintFlight {
+    fn drop(&mut self) {
+        if !self.finished {
+            if let Ok(mut state) = self.owner.state.lock() {
+                for buffer in &self.writes {
+                    state
+                        .tainted
+                        .entry(*buffer)
+                        .or_insert(BackendError::ExecutionFailed);
+                }
+            }
+            self.outcome.complete(Err(BackendError::ExecutionFailed));
+        }
+    }
 }
 
 const DEFAULT_REPLAY_DEPTH: usize = 2;
@@ -2120,7 +2342,6 @@ struct ReplayState {
 #[derive(Debug, Default)]
 struct ReplayStatus {
     in_flight: usize,
-    failure: Option<BackendError>,
 }
 
 struct ReplayFlight(Arc<ReplayState>);
@@ -2131,9 +2352,6 @@ impl ReplayFlight {
             .status
             .lock()
             .map_err(|_| guest_error(BackendError::ExecutionFailed))?;
-        if let Some(error) = status.failure {
-            return Err(guest_error(error));
-        }
         status.in_flight = status
             .in_flight
             .checked_add(1)
@@ -2145,24 +2363,12 @@ impl ReplayFlight {
         Ok(Self(replay))
     }
 
-    fn finish<T>(self, result: Result<T, BackendError>) -> Result<T, BackendError> {
-        let mut status = self
+    fn finish<T>(&self, result: Result<T, BackendError>) -> Result<T, BackendError> {
+        let status = self
             .0
             .status
             .lock()
             .map_err(|_| BackendError::ExecutionFailed)?;
-        if let Err(error) = result
-            && matches!(
-                error,
-                BackendError::ExecutionFailed
-                    | BackendError::Timeout
-                    | BackendError::IndexOutOfRange { .. }
-            )
-            && status.failure.is_none()
-        {
-            status.failure = Some(error);
-        }
-        let result = status.failure.map_or(result, Err);
         drop(status);
         result
     }
@@ -2255,6 +2461,7 @@ where
             let Self {
                 backend,
                 work,
+                access,
                 retained,
                 flight,
                 timeout,
@@ -2263,25 +2470,26 @@ where
                 completed_submissions,
                 timed_submissions,
                 completed_gpu_time_ns,
+                taints,
                 profile,
             } = self;
             let submitted = match reservation {
                 Err(error) => Err(error),
-                Ok(reservation) => match match work {
-                    SubmissionWork::Commands(commands) if profile.is_some() => {
-                        backend.submit_profiled(commands)
-                    }
-                    SubmissionWork::Commands(commands) => backend.submit(commands),
-                    SubmissionWork::Replay { graph, values } if profile.is_some() => {
-                        backend.replay_profiled(&graph, values)
-                    }
-                    SubmissionWork::Replay { graph, values } => backend.replay(&graph, values),
-                } {
+                Ok(reservation) => match taints.begin(&access) {
                     Err(error) => Err(error),
-                    Ok(submission) => Ok((submission, reservation)),
+                    Ok(taint) => match submit_work(backend.as_ref(), work, profile.is_some()) {
+                        Err(error) => {
+                            let error = taint
+                                .finish::<()>(Err(error), false)
+                                .err()
+                                .unwrap_or(BackendError::ExecutionFailed);
+                            Err(error)
+                        }
+                        Ok(submission) => Ok((submission, reservation, taint)),
+                    },
                 },
             };
-            let (submission, reservation) = match submitted {
+            let (submission, reservation, taint) = match submitted {
                 Ok(submitted) => {
                     if let Some(started) = started {
                         let _ = started.send(Ok(()));
@@ -2291,7 +2499,10 @@ where
                 Err(error) => {
                     let release = release_retained(backend.as_ref(), retained, profile.as_ref());
                     let result = combine_submission_release(Err(error), release);
-                    let result = flight.map_or(result, |flight| flight.finish(result));
+                    let result = match &flight {
+                        Some(flight) => flight.finish(result),
+                        None => result,
+                    };
                     if let Some(started) = started {
                         let _ = started.send(result.as_ref().map(|_| ()).map_err(|error| *error));
                     }
@@ -2322,7 +2533,11 @@ where
             };
             let release = release_retained(backend.as_ref(), retained, profile.as_ref());
             let result = combine_submission_release(result, release);
-            let result = flight.map_or(result, |flight| flight.finish(result));
+            let result = match &flight {
+                Some(flight) => flight.finish(result),
+                None => result,
+            };
+            let result = taint.finish(result, true);
             if let Ok(gpu_time) = result {
                 saturating_increment(&completed_submissions);
                 if let Some(gpu_time) = gpu_time {
@@ -2330,8 +2545,24 @@ where
                     saturating_add(&completed_gpu_time_ns, gpu_time);
                 }
             }
+            drop(flight);
             result
         })
+    }
+}
+
+fn submit_work<B: Backend>(
+    backend: &B,
+    work: SubmissionWork,
+    profiled: bool,
+) -> Result<B::Submission, BackendError> {
+    match work {
+        SubmissionWork::Commands(commands) if profiled => backend.submit_profiled(commands),
+        SubmissionWork::Commands(commands) => backend.submit(commands),
+        SubmissionWork::Replay { graph, values } if profiled => {
+            backend.replay_profiled(&graph, values)
+        }
+        SubmissionWork::Replay { graph, values } => backend.replay(&graph, values),
     }
 }
 
@@ -2370,10 +2601,23 @@ where
                 profile,
                 replay_output,
             } = self;
+            let taint = if replay_output {
+                buffer.taints.check(tensor.buffer())
+            } else {
+                buffer.taints.wait_for_writes(tensor.buffer())
+            };
+            if let Err(error) = taint {
+                let release = release_buffer(backend.as_ref(), buffer, profile.as_ref());
+                return combine_submission_release(Err(error), release);
+            }
             let result = if replay_output {
                 backend.read_replay_output(&tensor)
             } else {
                 backend.read(&tensor)
+            };
+            let result = match result {
+                Ok(bytes) => buffer.taints.check(tensor.buffer()).map(|()| bytes),
+                Err(error) => Err(error),
             };
             let release = release_buffer(backend.as_ref(), buffer, profile.as_ref());
             match (result, release) {
@@ -3382,6 +3626,61 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(host.engine_metrics().submissions, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn failed_writer_taints_same_and_shared_graph_replays() {
+        let gate = Arc::new(SubmitGate::default());
+        let backend = AccountingBackend::failing_nth(Arc::clone(&gate), 1);
+        let mut host = Host::new(backend, GENEROUS);
+        let source = host.alloc(compute::Dtype::F32, &[1]).unwrap();
+        let shared = host.alloc(compute::Dtype::F32, &[1]).unwrap();
+        let temporary = host.alloc(compute::Dtype::F32, &[1]).unwrap();
+        let sink = host.alloc(compute::Dtype::F32, &[1]).unwrap();
+
+        let first_commands = host.command_list().unwrap();
+        host.dispatch(
+            &first_commands,
+            compute::Op::Copy,
+            &[Resource::new_borrow(shared.rep())],
+            &temporary,
+        )
+        .unwrap();
+        host.dispatch(
+            &first_commands,
+            compute::Op::Copy,
+            &[Resource::new_borrow(source.rep())],
+            &shared,
+        )
+        .unwrap();
+        let first_graph = host.create_graph(first_commands).unwrap();
+
+        let second_commands = host.command_list().unwrap();
+        host.dispatch(
+            &second_commands,
+            compute::Op::Copy,
+            &[Resource::new_borrow(shared.rep())],
+            &sink,
+        )
+        .unwrap();
+        let second_graph = host.create_graph(second_commands).unwrap();
+
+        let failed = host.prepare_replay(&first_graph, Vec::new()).unwrap();
+        let failed_task = tokio::spawn(failed.run());
+        gate.wait_for(1);
+        let same_task = tokio::spawn(host.prepare_replay(&first_graph, Vec::new()).unwrap().run());
+        let shared_task = tokio::spawn(
+            host.prepare_replay(&second_graph, Vec::new())
+                .unwrap()
+                .run(),
+        );
+        gate.wait_for(3);
+        gate.release();
+
+        assert!(failed_task.await.unwrap().is_err());
+        assert!(same_task.await.unwrap().is_err());
+        assert!(shared_task.await.unwrap().is_err());
+        assert!(host.prepare_read(&shared).unwrap().run().await.is_err());
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -4632,6 +4931,8 @@ mod tests {
         gpu_time: Option<Duration>,
         delay: Duration,
         wait_error: Option<BackendError>,
+        fail_submission: Option<u64>,
+        submissions: AtomicU64,
     }
 
     impl AccountingBackend {
@@ -4642,6 +4943,20 @@ mod tests {
                 gpu_time,
                 delay,
                 wait_error: None,
+                fail_submission: None,
+                submissions: AtomicU64::new(0),
+            }
+        }
+
+        fn failing_nth(gate: Arc<SubmitGate>, submission: u64) -> Self {
+            Self {
+                inner: CpuBackend::new(),
+                gate: Some(gate),
+                gpu_time: None,
+                delay: Duration::ZERO,
+                wait_error: None,
+                fail_submission: Some(submission),
+                submissions: AtomicU64::new(0),
             }
         }
 
@@ -4652,6 +4967,8 @@ mod tests {
                 gpu_time: None,
                 delay: Duration::ZERO,
                 wait_error: Some(BackendError::Timeout),
+                fail_submission: None,
+                submissions: AtomicU64::new(0),
             }
         }
     }
@@ -4663,6 +4980,8 @@ mod tests {
         gpu_time: Option<Duration>,
         delay: Duration,
         wait_error: Option<BackendError>,
+        sequence: u64,
+        fail_submission: Option<u64>,
     }
 
     impl Submission for AccountingSubmission {
@@ -4672,6 +4991,9 @@ mod tests {
             }
             self.inner.wait()?;
             std::thread::sleep(self.delay);
+            if self.fail_submission == Some(self.sequence) {
+                return Err(BackendError::ExecutionFailed);
+            }
             self.wait_error.map_or(Ok(()), Err)
         }
 
@@ -4715,6 +5037,10 @@ mod tests {
         fn submit(&self, commands: CommandList) -> Result<Self::Submission, BackendError> {
             let retained = commands.clone();
             let inner = self.inner.submit(commands)?;
+            let sequence = self
+                .submissions
+                .fetch_add(1, Ordering::AcqRel)
+                .saturating_add(1);
             Ok(AccountingSubmission {
                 inner,
                 _commands: retained,
@@ -4722,6 +5048,8 @@ mod tests {
                 gpu_time: self.gpu_time,
                 delay: self.delay,
                 wait_error: self.wait_error,
+                sequence,
+                fail_submission: self.fail_submission,
             })
         }
     }

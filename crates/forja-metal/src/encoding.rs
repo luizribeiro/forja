@@ -578,6 +578,8 @@ struct CompletionState {
     committed: Option<Instant>,
     feedback_elapsed: Option<Duration>,
     event_elapsed: Option<Duration>,
+    result: Option<Result<(), BackendError>>,
+    resolving: bool,
 }
 
 #[cfg(test)]
@@ -893,6 +895,7 @@ pub(super) struct Completion {
     _residency: InFlightResidency,
     timestamps: Option<GpuTimestamps>,
     tracker: Weak<InFlightTracker>,
+    dependencies: Mutex<Vec<Arc<Completion>>>,
     commit: CommitRetention,
 }
 
@@ -919,6 +922,7 @@ impl Completion {
         residency: InFlightResidency,
         timestamps: Option<GpuTimestamps>,
         tracker: Weak<InFlightTracker>,
+        dependencies: Vec<Arc<Completion>>,
     ) -> Arc<Self> {
         Arc::new_cyclic(|completion: &Weak<Self>| {
             let callback_completion = completion.clone();
@@ -949,6 +953,8 @@ impl Completion {
                     committed: None,
                     feedback_elapsed: None,
                     event_elapsed: None,
+                    result: None,
+                    resolving: false,
                 }),
                 ready: Condvar::new(),
                 event,
@@ -956,6 +962,7 @@ impl Completion {
                 _residency: residency,
                 timestamps,
                 tracker,
+                dependencies: Mutex::new(dependencies),
                 commit: CommitRetention {
                     _handler: handler,
                     options,
@@ -987,16 +994,63 @@ impl Completion {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         loop {
+            if let Some(result) = state.result {
+                return result;
+            }
+            if state.resolving {
+                let remaining = timeout.saturating_sub(started.elapsed());
+                if remaining.is_zero() {
+                    return Err(BackendError::Timeout);
+                }
+                let (next, wait) = self
+                    .ready
+                    .wait_timeout(state, remaining)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                state = next;
+                if wait.timed_out() && state.result.is_none() {
+                    return Err(BackendError::Timeout);
+                }
+                continue;
+            }
             if state.event_signaled
                 && let Some(feedback) = &state.feedback
             {
-                let result = commit_result(feedback);
+                let mut result = commit_result(feedback);
+                state.resolving = true;
                 drop(state);
                 if let Some(tracker) = self.tracker.upgrade() {
                     tracker.drain_done();
                 }
-                result?;
-                return self.check_error_flags();
+                if result.is_ok() {
+                    result = self.check_error_flags();
+                }
+                let dependencies = std::mem::take(
+                    &mut *self
+                        .dependencies
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner),
+                );
+                if result.is_ok() {
+                    for dependency in dependencies {
+                        let remaining = timeout.saturating_sub(started.elapsed());
+                        if remaining.is_zero() {
+                            result = Err(BackendError::Timeout);
+                            break;
+                        }
+                        if let Err(error) = dependency.wait(remaining) {
+                            result = Err(error);
+                            break;
+                        }
+                    }
+                }
+                let mut state = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let result = *state.result.get_or_insert(result);
+                state.resolving = false;
+                self.ready.notify_all();
+                return result;
             }
             let remaining = timeout.saturating_sub(started.elapsed());
             if remaining.is_zero() {
@@ -1047,6 +1101,13 @@ impl Completion {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .event_value
+    }
+
+    pub(super) fn result(&self) -> Option<Result<(), BackendError>> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .result
     }
 
     #[cfg(test)]
@@ -1622,10 +1683,26 @@ impl MetalBackend {
         }) {
             return Err(BackendError::UnsupportedOperation);
         }
-        let tensors = dispatches
+        let accesses = dispatches
             .iter()
-            .flat_map(|dispatch| dispatch.inputs().iter().chain(dispatch.outputs()))
-            .cloned()
+            .flat_map(|dispatch| {
+                dispatch
+                    .inputs()
+                    .iter()
+                    .cloned()
+                    .map(|tensor| (tensor, false))
+                    .chain(
+                        dispatch
+                            .outputs()
+                            .iter()
+                            .cloned()
+                            .map(|tensor| (tensor, true)),
+                    )
+            })
+            .collect::<Vec<_>>();
+        let tensors = accesses
+            .iter()
+            .map(|(tensor, _)| tensor.clone())
             .collect::<Vec<_>>();
         if !retained_tensors_validated {
             for tensor in &tensors {
@@ -1713,7 +1790,7 @@ impl MetalBackend {
         let commit_started = PROFILE.then(Instant::now);
         let mut submission = self.commit(
             &command_buffer,
-            &tensors,
+            &accesses,
             resources,
             CommitResidency {
                 sets: graph.map_or_else(
@@ -3770,7 +3847,7 @@ impl MetalBackend {
 
     fn retain_tensors(
         &self,
-        tensors: &[Tensor],
+        accesses: &[(Tensor, bool)],
         event: InFlightEvent,
         resources: CommandResources,
         residency: InFlightResidency,
@@ -3778,8 +3855,9 @@ impl MetalBackend {
         order_on_queue: bool,
     ) -> Result<(Arc<Completion>, Option<u64>), BackendError> {
         let mut seen = HashSet::<BufferId>::new();
-        let unique = tensors
+        let unique = accesses
             .iter()
+            .map(|(tensor, _)| tensor)
             .filter(|tensor| seen.insert(tensor.buffer()))
             .collect::<Vec<_>>();
         let mut buffers = self
@@ -3787,6 +3865,8 @@ impl MetalBackend {
             .lock()
             .map_err(|_| BackendError::ExecutionFailed)?;
         let mut dependency = None;
+        let mut dependencies = Vec::new();
+        let mut seen_dependencies = HashSet::new();
         for tensor in &unique {
             let buffer = buffers.get_mut(tensor)?;
             if order_on_queue {
@@ -3795,15 +3875,29 @@ impl MetalBackend {
                 buffer.wait_pending(self.gpu_timeout)?;
             }
         }
+        for (tensor, writes) in accesses {
+            if !writes {
+                dependencies.extend(
+                    buffers
+                        .get_mut(tensor)?
+                        .dependencies(&tensor.layout().byte_span())
+                        .into_iter()
+                        .filter(|completion| {
+                            seen_dependencies.insert(Arc::as_ptr(completion) as usize)
+                        }),
+                );
+            }
+        }
         let completion = Completion::new(
             resources,
             event,
             residency,
             Some(timestamps),
             Arc::downgrade(&self.in_flight),
+            dependencies,
         );
-        for tensor in tensors {
-            buffers.get_mut(tensor)?.track(tensor, &completion);
+        for (tensor, writes) in accesses {
+            buffers.get_mut(tensor)?.track(tensor, &completion, *writes);
         }
         Ok((completion, dependency))
     }
@@ -3811,7 +3905,7 @@ impl MetalBackend {
     fn commit(
         &self,
         command_buffer: &Retained<ProtocolObject<dyn MTL4CommandBuffer>>,
-        tensors: &[Tensor],
+        accesses: &[(Tensor, bool)],
         resources: CommandResources,
         residency: CommitResidency,
         timestamps: GpuTimestamps,
@@ -3822,7 +3916,7 @@ impl MetalBackend {
             .lock()
             .map_err(|_| BackendError::ExecutionFailed)?;
         let (completion, dependency) = self.retain_tensors(
-            tensors,
+            accesses,
             InFlightEvent {
                 raw: self.shared_event.clone(),
             },
@@ -5358,6 +5452,48 @@ mod tests {
     }
 
     #[test]
+    fn failed_replay_taints_later_graph_reads() {
+        let backend = MetalBackend::new().unwrap();
+        let table = backend.alloc(DType::F32, &[1, 7]).unwrap();
+        let invalid = backend.alloc(DType::U32, &[1]).unwrap();
+        let shared = backend.alloc(DType::F32, &[1, 7]).unwrap();
+        let sink = backend.alloc(DType::F32, &[1, 7]).unwrap();
+        backend.write(&invalid, &99_u32.to_le_bytes()).unwrap();
+        let mut failing =
+            GraphTemplate::new(ParamSpace::new(Vec::new()).unwrap(), GraphLimits::default());
+        failing
+            .dispatch(
+                Op::Embed,
+                &[&table.into(), &invalid.into()],
+                &shared.clone().into(),
+            )
+            .unwrap();
+        let failing = backend.prepare_graph(failing).unwrap();
+        let mut consumer =
+            GraphTemplate::new(ParamSpace::new(Vec::new()).unwrap(), GraphLimits::default());
+        consumer
+            .dispatch(Op::Copy, &[&shared.into()], &sink.into())
+            .unwrap();
+        let consumer = backend.prepare_graph(consumer).unwrap();
+
+        let failed = backend.replay(&failing, Vec::new()).unwrap();
+        let same = backend.replay(&failing, Vec::new()).unwrap();
+        let shared = backend.replay(&consumer, Vec::new()).unwrap();
+        assert_eq!(
+            failed.wait(),
+            Err(BackendError::IndexOutOfRange { index: 99 })
+        );
+        assert_eq!(
+            same.wait(),
+            Err(BackendError::IndexOutOfRange { index: 99 })
+        );
+        assert_eq!(
+            shared.wait(),
+            Err(BackendError::IndexOutOfRange { index: 99 })
+        );
+    }
+
+    #[test]
     fn dropped_submissions_retain_released_buffers() {
         let backend = MetalBackend::new().unwrap();
         for _ in 0..100 {
@@ -5566,7 +5702,7 @@ mod tests {
         backend
             .commit(
                 &command_buffer,
-                &tensors,
+                &[(source, false), (output.clone(), true)],
                 resources,
                 CommitResidency {
                     sets: vec![residency],
