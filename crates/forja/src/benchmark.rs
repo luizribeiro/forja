@@ -17,7 +17,7 @@ use golden_fixtures::{decode_f32_le, sha256_file};
 
 use crate::{
     args::{Bench, BenchPoint},
-    benchmark_record::{self, Input},
+    benchmark_record::{self, Input, Recorded},
     benchmark_stats::{Stats, stats, synthetic_tokens},
     engine::{argmax, limits, read_token},
 };
@@ -93,6 +93,15 @@ async fn run_metal(options: &Bench) -> Result<(), Box<dyn Error>> {
             })
         })
         .collect::<Result<Vec<_>, std::io::Error>>()?;
+    if let Some(record) = &options.rerun {
+        validate_rerun_inputs(record, &inputs)?;
+        if record.provenance.commit != commit {
+            println!(
+                "rerun binary commit differs: recorded {}, current {commit}",
+                record.provenance.commit
+            );
+        }
+    }
     let perf_keys = options
         .points
         .iter()
@@ -140,6 +149,36 @@ async fn run_metal(options: &Bench) -> Result<(), Box<dyn Error>> {
         let mut bytes = serde_json::to_vec_pretty(&report)?;
         bytes.push(b'\n');
         fs::write(path, bytes)?;
+    }
+    Ok(())
+}
+
+fn validate_rerun_inputs(record: &Recorded, inputs: &[Input]) -> Result<(), String> {
+    if record.inputs.len() != inputs.len() {
+        return Err(format!(
+            "rerun input count mismatch: record has {}, command has {}",
+            record.inputs.len(),
+            inputs.len()
+        ));
+    }
+    let mut unmatched = inputs.iter().collect::<Vec<_>>();
+    for recorded in &record.inputs {
+        let Some(index) = unmatched
+            .iter()
+            .position(|current| current.engine_sha256 == recorded.engine_sha256)
+        else {
+            return Err(format!(
+                "rerun engine sha256 mismatch: recorded {} is not present",
+                recorded.engine_sha256
+            ));
+        };
+        let current = unmatched.remove(index);
+        if recorded.weights_sha256 != current.weights_sha256 {
+            return Err(format!(
+                "rerun weights sha256 mismatch for engine {}: recorded {}, current {}",
+                recorded.engine_sha256, recorded.weights_sha256, current.weights_sha256
+            ));
+        }
     }
     Ok(())
 }
@@ -1238,5 +1277,56 @@ mod tests {
             }),
         ];
         check_strategy_outputs(&axes, &results).unwrap();
+    }
+
+    #[test]
+    fn rerun_refuses_input_hash_mismatches() {
+        let record = Recorded {
+            schema_version: benchmark_record::SCHEMA_VERSION,
+            provenance: benchmark_record::RecordedProvenance {
+                commit: "recorded".to_owned(),
+            },
+            inputs: vec![Input {
+                engine_sha256: "old-engine".to_owned(),
+                profile_hash: None,
+                weights_sha256: "weights".to_owned(),
+                model_revision: None,
+            }],
+            config: String::new(),
+            axes: BTreeMap::new(),
+            results: Vec::new(),
+        };
+        let current = [Input {
+            engine_sha256: "new-engine".to_owned(),
+            profile_hash: None,
+            weights_sha256: "weights".to_owned(),
+            model_revision: None,
+        }];
+        assert!(
+            validate_rerun_inputs(&record, &current)
+                .unwrap_err()
+                .contains("engine sha256 mismatch")
+        );
+    }
+
+    #[test]
+    fn rerun_accepts_reordered_inputs() {
+        let input = |engine: &str| Input {
+            engine_sha256: engine.to_owned(),
+            profile_hash: None,
+            weights_sha256: "weights".to_owned(),
+            model_revision: None,
+        };
+        let record = Recorded {
+            schema_version: benchmark_record::SCHEMA_VERSION,
+            provenance: benchmark_record::RecordedProvenance {
+                commit: "recorded".to_owned(),
+            },
+            inputs: vec![input("first"), input("second")],
+            config: String::new(),
+            axes: BTreeMap::new(),
+            results: Vec::new(),
+        };
+        validate_rerun_inputs(&record, &[input("second"), input("first")]).unwrap();
     }
 }

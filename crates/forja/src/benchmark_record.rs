@@ -17,13 +17,11 @@ pub(crate) struct Input {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
-#[cfg_attr(not(test), expect(dead_code))]
 pub(crate) struct RecordedProvenance {
     pub(crate) commit: String,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
-#[cfg_attr(not(test), expect(dead_code))]
 pub(crate) struct Recorded {
     pub(crate) schema_version: u32,
     pub(crate) provenance: RecordedProvenance,
@@ -263,6 +261,7 @@ mod tests {
             axes: BTreeMap::new(),
             strategy_axes: Vec::new(),
             points: Vec::new(),
+            rerun: None,
         }
     }
 

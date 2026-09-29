@@ -1,10 +1,12 @@
-use std::{collections::BTreeMap, path::PathBuf};
+use std::{collections::BTreeMap, fs, path::PathBuf};
 
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use forja_config::{
     BackendKind, ConfigError, DevConfig, GraphReplay, KeyPath, Layer, Layered, Limits, Origin,
     Selection, dev_layers, file_layer, layer, set_layer,
 };
+
+use crate::benchmark_record::{Recorded, SCHEMA_VERSION};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub(crate) enum Backend {
@@ -108,6 +110,7 @@ pub(crate) struct Bench {
     pub(crate) axes: BTreeMap<KeyPath, Vec<toml::Value>>,
     pub(crate) strategy_axes: Vec<KeyPath>,
     pub(crate) points: Vec<BenchPoint>,
+    pub(crate) rerun: Option<Recorded>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -154,6 +157,9 @@ struct BenchArgs {
     /// Vary one configuration key over a comma list or TOML array.
     #[arg(long = "vary", value_parser = parse_vary)]
     vary: Vec<VaryArg>,
+    /// Re-run a schema-v2 benchmark record.
+    #[arg(long)]
+    rerun: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -256,7 +262,18 @@ fn parse_with(
     let mut matches = Cli::command().try_get_matches_from(arguments)?;
     let overrides = ordered_overrides(&matches);
     let cli = Cli::from_arg_matches_mut(&mut matches)?;
-    let mut layers = base_layers(cli.isolated).map_err(|error| config_error(&error))?;
+    let rerun = cli.command.rerun_record()?;
+    let mut layers =
+        base_layers(cli.isolated || rerun.is_some()).map_err(|error| config_error(&error))?;
+    if let Some((path, record)) = &rerun {
+        let table = toml::from_str(&record.config).map_err(|error| {
+            Cli::command().error(
+                clap::error::ErrorKind::ValueValidation,
+                format!("{}: record config is invalid: {error}", path.display()),
+            )
+        })?;
+        layers.push(Layer::new(Origin::File(path.clone()), table));
+    }
     let mut set_layers = Vec::new();
     let mut set_keys = BTreeMap::new();
     let mut set_index = 0;
@@ -290,7 +307,11 @@ fn parse_with(
     let layered = layer::<DevConfig>(layers).map_err(|error| config_error(&error))?;
     let limits = layered.config.limits.clone();
     Ok(match cli.command {
-        ParsedCommand::Bench(options) => Command::Bench(options.with_config(&layered, limits)?),
+        ParsedCommand::Bench(options) => Command::Bench(options.with_config(
+            &layered,
+            limits,
+            rerun.map(|(_, record)| record),
+        )?),
         ParsedCommand::Config(options) => match options.command {
             ConfigCommand::Show(options) => Command::Config(ConfigShow {
                 layered,
@@ -305,6 +326,48 @@ fn parse_with(
             Command::Verify(options.with_config(&layered.config, limits)?)
         }
     })
+}
+
+impl ParsedCommand {
+    fn rerun_record(&self) -> Result<Option<(PathBuf, Recorded)>, clap::Error> {
+        let Self::Bench(options) = self else {
+            return Ok(None);
+        };
+        options.rerun.as_ref().map(load_record).transpose()
+    }
+}
+
+fn load_record(path: &PathBuf) -> Result<(PathBuf, Recorded), clap::Error> {
+    let bytes = fs::read(path).map_err(|error| {
+        Cli::command().error(
+            clap::error::ErrorKind::Io,
+            format!("cannot read {}: {error}", path.display()),
+        )
+    })?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
+        Cli::command().error(
+            clap::error::ErrorKind::ValueValidation,
+            format!("{}: invalid benchmark record: {error}", path.display()),
+        )
+    })?;
+    let schema_version = value["schema_version"].as_u64().unwrap_or_default();
+    if schema_version != u64::from(SCHEMA_VERSION) {
+        return Err(Cli::command().error(
+            clap::error::ErrorKind::ValueValidation,
+            format!(
+                "{}: rerun requires schema version {SCHEMA_VERSION}, found {}",
+                path.display(),
+                schema_version
+            ),
+        ));
+    }
+    let record: Recorded = serde_json::from_value(value).map_err(|error| {
+        Cli::command().error(
+            clap::error::ErrorKind::ValueValidation,
+            format!("{}: invalid benchmark record: {error}", path.display()),
+        )
+    })?;
+    Ok((path.clone(), record))
 }
 
 enum Override {
@@ -514,6 +577,7 @@ impl BenchArgs {
         self,
         layered: &Layered<DevConfig>,
         limits: Limits,
+        rerun: Option<Recorded>,
     ) -> Result<Bench, clap::Error> {
         let config = &layered.config;
         let count = |value: u32| {
@@ -557,6 +621,7 @@ impl BenchArgs {
             axes: config.bench.vary.clone(),
             strategy_axes,
             points,
+            rerun,
         })
     }
 }
@@ -1562,6 +1627,47 @@ fixtures = "/fixtures"
             },
         )
         .unwrap();
+    }
+
+    #[test]
+    fn rerun_implies_isolated_and_layers_the_recorded_config() {
+        let root = temporary_directory("cli-rerun").unwrap();
+        let path = root.join("record.json");
+        fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": 2,
+                "provenance": {"commit": "recorded"},
+                "inputs": [],
+                "config": "[bench]\ntg = 7\n",
+                "axes": {},
+                "results": [],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let command = parse_with(
+            [
+                "bench".to_owned(),
+                "--engine".to_owned(),
+                "/engine.wasm".to_owned(),
+                "--model-dir".to_owned(),
+                "/model".to_owned(),
+                "--rerun".to_owned(),
+                path.display().to_string(),
+            ],
+            |isolated| {
+                assert!(isolated);
+                Ok(Vec::new())
+            },
+        )
+        .unwrap();
+        let Command::Bench(options) = command else {
+            panic!("expected bench command");
+        };
+        assert_eq!(options.tg, 7);
+        assert!(options.rerun.is_some());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
