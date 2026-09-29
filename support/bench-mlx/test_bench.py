@@ -10,9 +10,13 @@ from unittest import mock
 
 import bench
 import compare
+import matmul
 
 
 class SuiteTests(unittest.TestCase):
+    def test_matmul_shape_classes_cover_one_decode_token(self) -> None:
+        self.assertEqual(sum(shape[3] for shape in matmul.SHAPES), 197)
+
     def test_main_uses_the_shared_suite_values(self) -> None:
         class FakeArray:
             dtype = "bf16"
