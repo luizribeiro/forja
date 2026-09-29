@@ -180,6 +180,7 @@ interface compute {
   }
 
   submit: async func(cmds: command-list) -> result<option<u64>, error>;
+  replay: async func(g: borrow<graph>, values: list<u32>) -> result<option<u64>, error>;
   open-weights: func(grant: string) -> result<weights, error>;
 }
 

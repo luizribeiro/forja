@@ -13,7 +13,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, OnceLock, Weak,
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     thread,
 };
@@ -915,10 +915,10 @@ pub struct CommandListEntry {
 /// Host-owned state behind a guest graph resource.
 #[derive(Debug)]
 pub struct GraphEntry {
-    #[expect(dead_code, reason = "the prepared graph is consumed by replay")]
     graph: Arc<GraphTemplate>,
     retained: Vec<TensorEntry>,
     retained_kernels: Vec<KernelEntry>,
+    in_flight: Arc<AtomicBool>,
     _lease: GraphLease,
 }
 
@@ -1589,6 +1589,7 @@ impl<B: Backend> Host<B> {
             graph: Arc::new(graph),
             retained: Vec::new(),
             retained_kernels: Vec::new(),
+            in_flight: Arc::new(AtomicBool::new(false)),
             _lease: lease,
         };
         let resource = match self.table.push(graph_entry) {
@@ -1621,8 +1622,38 @@ impl<B: Backend> Host<B> {
         let entry = self.table.delete(resource).map_err(invalid_handle)?;
         Ok(SubmitRequest {
             backend: Arc::clone(&self.backend),
-            commands: entry.commands,
+            work: SubmissionWork::Commands(entry.commands),
             retained: entry.retained,
+            flight: None,
+            timeout: self.limits.submission_timeout,
+            gpu_time_budget_ns: duration_ns(self.limits.gpu_time_budget),
+            gpu_time_ns: Arc::clone(&self.gpu_time_ns),
+            completed_submissions: Arc::clone(&self.completed_submissions),
+            timed_submissions: Arc::clone(&self.timed_submissions),
+            completed_gpu_time_ns: Arc::clone(&self.completed_gpu_time_ns),
+            profile: self.active_profile.clone(),
+        })
+    }
+
+    fn prepare_replay(
+        &self,
+        resource: &Resource<GraphEntry>,
+        values: Vec<u32>,
+    ) -> Result<SubmitRequest<B>, compute::Error> {
+        let entry = self.table.get(resource).map_err(invalid_handle)?;
+        entry
+            .graph
+            .values(values.clone())
+            .map_err(|error| graph_error(&error))?;
+        let flight = ReplayFlight::acquire(Arc::clone(&entry.in_flight))?;
+        Ok(SubmitRequest {
+            backend: Arc::clone(&self.backend),
+            work: SubmissionWork::Replay {
+                graph: Arc::clone(&entry.graph),
+                values,
+            },
+            retained: Vec::new(),
+            flight: Some(flight),
             timeout: self.limits.submission_timeout,
             gpu_time_budget_ns: duration_ns(self.limits.gpu_time_budget),
             gpu_time_ns: Arc::clone(&self.gpu_time_ns),
@@ -1807,8 +1838,9 @@ struct ReadRequest<B: Backend> {
 
 struct SubmitRequest<B: Backend> {
     backend: Arc<B>,
-    commands: CommandList,
+    work: SubmissionWork,
     retained: Vec<TensorEntry>,
+    flight: Option<ReplayFlight>,
     timeout: Duration,
     gpu_time_budget_ns: u64,
     gpu_time_ns: Arc<AtomicU64>,
@@ -1816,6 +1848,33 @@ struct SubmitRequest<B: Backend> {
     timed_submissions: Arc<AtomicU64>,
     completed_gpu_time_ns: Arc<AtomicU64>,
     profile: Option<Arc<Mutex<EngineStepProfile>>>,
+}
+
+enum SubmissionWork {
+    Commands(CommandList),
+    Replay {
+        graph: Arc<GraphTemplate>,
+        values: Vec<u32>,
+    },
+}
+
+struct ReplayFlight(Arc<AtomicBool>);
+
+impl ReplayFlight {
+    fn acquire(in_flight: Arc<AtomicBool>) -> Result<Self, compute::Error> {
+        in_flight
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| {
+                compute::Error::OpSignature("graph replay is already in flight".to_owned())
+            })?;
+        Ok(Self(in_flight))
+    }
+}
+
+impl Drop for ReplayFlight {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 struct GpuReservation {
@@ -1876,8 +1935,9 @@ where
         tokio::task::spawn_blocking(move || {
             let Self {
                 backend,
-                commands,
+                work,
                 retained,
+                flight,
                 timeout,
                 gpu_time_budget_ns: _,
                 gpu_time_ns: _,
@@ -1886,12 +1946,15 @@ where
                 completed_gpu_time_ns,
                 profile,
             } = self;
+            let _flight = flight;
             let result = match reservation {
                 Err(error) => Err(error),
-                Ok(reservation) => match if profile.is_some() {
-                    backend.submit_profiled(commands)
-                } else {
-                    backend.submit(commands)
+                Ok(reservation) => match match work {
+                    SubmissionWork::Commands(commands) if profile.is_some() => {
+                        backend.submit_profiled(commands)
+                    }
+                    SubmissionWork::Commands(commands) => backend.submit(commands),
+                    SubmissionWork::Replay { graph, values } => backend.replay(&graph, values),
                 } {
                     Err(error) => Err(error),
                     Ok(submission) => {
@@ -2249,6 +2312,22 @@ where
     ) -> wasmtime::Result<Result<Option<u64>, compute::Error>> {
         let timer = accessor.with(|mut access| access.get().import_timer(ImportKind::Submit));
         let request = accessor.with(|mut access| access.get().prepare_submit(resource));
+        let request = match request {
+            Ok(value) => value,
+            Err(error) => return Ok(Err(error)),
+        };
+        let result = Ok(request.run().await);
+        drop(timer);
+        result
+    }
+
+    async fn replay(
+        accessor: &Accessor<Host<B>, Self>,
+        resource: Resource<GraphEntry>,
+        values: Vec<u32>,
+    ) -> wasmtime::Result<Result<Option<u64>, compute::Error>> {
+        let timer = accessor.with(|mut access| access.get().import_timer(ImportKind::Submit));
+        let request = accessor.with(|mut access| access.get().prepare_replay(&resource, values));
         let request = match request {
             Ok(value) => value,
             Err(error) => return Ok(Err(error)),
@@ -2733,6 +2812,75 @@ mod tests {
         ));
         host.drop_graph(graph).unwrap();
         assert_eq!(host.live_kernels.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn replay_refuses_a_graph_already_in_flight() {
+        let gate = Arc::new(SubmitGate::default());
+        let backend = AccountingBackend::new(Some(Arc::clone(&gate)), None, Duration::ZERO);
+        let mut host = Host::new(backend, GENEROUS);
+        let graph = empty_graph(&mut host);
+        let first = host.prepare_replay(&graph, Vec::new()).unwrap();
+        let task = tokio::spawn(first.run());
+        gate.wait_for(1);
+        assert!(matches!(
+            host.prepare_replay(&graph, Vec::new()),
+            Err(compute::Error::OpSignature(_))
+        ));
+        gate.release();
+        task.await.unwrap().unwrap();
+        host.prepare_replay(&graph, Vec::new())
+            .unwrap()
+            .run()
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn replay_uses_gpu_budget_and_observes_intervening_writes() {
+        let backend = AccountingBackend::new(None, Some(Duration::from_nanos(60)), Duration::ZERO);
+        let limits = GENEROUS.with_gpu_limits(Duration::from_nanos(100), Duration::from_nanos(200));
+        let mut host = Host::new(backend, limits);
+        let input = host.alloc(compute::Dtype::F32, &[1]).unwrap();
+        let output = host.alloc(compute::Dtype::F32, &[1]).unwrap();
+        let commands = host.command_list().unwrap();
+        host.dispatch(
+            &commands,
+            compute::Op::Copy,
+            &[Resource::new_borrow(input.rep())],
+            &output,
+        )
+        .unwrap();
+        let graph = host.create_graph(commands).unwrap();
+
+        host.write(&input, &1.0_f32.to_le_bytes()).unwrap();
+        host.prepare_replay(&graph, Vec::new())
+            .unwrap()
+            .run()
+            .await
+            .unwrap();
+        assert_eq!(
+            host.backend
+                .read(&host.entry(&output).unwrap().tensor)
+                .unwrap(),
+            1.0_f32.to_le_bytes()
+        );
+        host.write(&input, &2.0_f32.to_le_bytes()).unwrap();
+        host.prepare_replay(&graph, Vec::new())
+            .unwrap()
+            .run()
+            .await
+            .unwrap();
+        assert_eq!(
+            host.backend
+                .read(&host.entry(&output).unwrap().tensor)
+                .unwrap(),
+            2.0_f32.to_le_bytes()
+        );
+        assert!(matches!(
+            host.prepare_replay(&graph, Vec::new()).unwrap().run().await,
+            Err(compute::Error::Quota(_))
+        ));
     }
 
     #[test]
