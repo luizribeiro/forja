@@ -692,6 +692,7 @@ dependencies = [
 name = "forja-config"
 version = "0.0.0"
 dependencies = [
+ "forja-testing",
  "serde",
  "toml",
 ]

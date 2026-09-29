@@ -5,7 +5,13 @@ pub mod representative;
 
 mod interval;
 
-use std::{error::Error, fmt};
+use std::{
+    error::Error,
+    fmt, fs, io,
+    path::PathBuf,
+    sync::atomic::{AtomicU64, Ordering},
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use forja_core::{Backend, BackendError, DType, Op, Slice, Submission, Tensor, ViewOp};
 use half::{bf16, f16};
@@ -18,6 +24,27 @@ pub const F16_TOLERANCE: f64 = 2e-3;
 pub const BF16_TOLERANCE: f64 = 1e-2;
 /// The quantized normwise relative-error limit.
 pub const QUANTIZED_TOLERANCE: f64 = 1e-2;
+
+static TEMPORARY_DIRECTORY_NONCE: AtomicU64 = AtomicU64::new(0);
+
+/// Creates a uniquely named temporary directory for a test.
+///
+/// # Errors
+///
+/// Returns an error when the clock is before the Unix epoch or the directory cannot be created.
+pub fn temporary_directory(label: &str) -> io::Result<PathBuf> {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(io::Error::other)?
+        .as_nanos();
+    let nonce = TEMPORARY_DIRECTORY_NONCE.fetch_add(1, Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!(
+        "forja-{label}-{}-{timestamp}-{nonce}",
+        std::process::id()
+    ));
+    fs::create_dir(&path)?;
+    Ok(path)
+}
 
 /// Prepares a validated program for the supplied concrete tensor bindings.
 ///

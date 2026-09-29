@@ -10,5 +10,8 @@ version.workspace = true
 serde = { workspace = true, features = ["derive"] }
 toml.workspace = true
 
+[dev-dependencies]
+forja-testing = { path = "../../support/forja-testing" }
+
 [lints]
 workspace = true

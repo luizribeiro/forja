@@ -7,6 +7,12 @@ use serde::{Serialize, de::DeserializeOwned};
 pub struct KeyPath(String);
 
 impl KeyPath {
+    /// Creates a dotted key path.
+    #[must_use]
+    pub fn new(path: impl Into<String>) -> Self {
+        Self(path.into())
+    }
+
     /// Returns the dotted path.
     #[must_use]
     pub fn as_str(&self) -> &str {
@@ -177,7 +183,7 @@ fn record_value_origins(
     if let toml::Value::Table(table) = value {
         record_origins(table, path, origin, origins);
     } else {
-        origins.insert(KeyPath(path.to_owned()), origin.clone());
+        origins.insert(KeyPath::new(path), origin.clone());
     }
 }
 

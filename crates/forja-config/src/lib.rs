@@ -2,13 +2,17 @@
 
 #![forbid(unsafe_code)]
 
+mod files;
 mod layer;
 mod set;
 mod units;
 
+pub use files::{dev_layers, file_layer, user_config_path};
 pub use layer::{ConfigError, KeyPath, Layer, Layered, Origin, Schema, layer};
 pub use set::set_layer;
 pub use units::{ByteSize, Duration, Unbounded};
+
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
@@ -16,8 +20,30 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DevConfig {
+    /// Developer filesystem locations.
+    pub paths: Paths,
     /// Host resource limits.
     pub limits: Limits,
+}
+
+/// Developer filesystem locations.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Paths {
+    /// Root used to resolve model names.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub models: Option<PathBuf>,
+    /// Directory for transient benchmark results.
+    pub scratch: PathBuf,
+}
+
+impl Default for Paths {
+    fn default() -> Self {
+        Self {
+            models: None,
+            scratch: PathBuf::from("target/forja-bench"),
+        }
+    }
 }
 
 /// Resource limits applied by the host to one guest instance.
