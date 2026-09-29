@@ -213,6 +213,8 @@ pub struct EngineStepProfile {
     pub allocations: ImportProfile,
     /// Backend buffer releases.
     pub releases: ImportProfile,
+    /// Host reads of returned tensors after the guest call.
+    pub output_read: ImportProfile,
     /// Detailed timing for the step's submission.
     pub submission: Option<SubmissionProfile>,
 }
@@ -619,14 +621,22 @@ where
     ///
     /// Returns an invalid-handle or backend read failure.
     pub async fn read(&mut self, tensor: &EngineTensor) -> Result<Vec<u8>, compute::Error> {
+        let started = self.last_profile.as_ref().map(|_| Instant::now());
         if tensor.runner_id != self.id {
             return Err(invalid_handle("engine tensor belongs to another runner"));
         }
         let resource = Resource::new_borrow(tensor.handle);
-        match self.store.data().prepare_read(&resource) {
+        let result = match self.store.data().prepare_read(&resource) {
             Ok(request) => request.run().await.map_err(guest_error),
             Err(error) => Err(error),
+        };
+        if let (Some(started), Some(profile)) = (started, self.last_profile.as_mut()) {
+            let elapsed = started.elapsed();
+            profile.output_read.count = profile.output_read.count.saturating_add(1);
+            profile.output_read.time = profile.output_read.time.saturating_add(elapsed);
+            profile.wall_time = profile.wall_time.saturating_add(elapsed);
         }
+        result
     }
 
     /// Returns cumulative backend execution counters.

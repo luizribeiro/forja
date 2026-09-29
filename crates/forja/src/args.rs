@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 pub(crate) const USAGE: &str = "usage:
   forja run --model-dir PATH --prompt TEXT [--max-tokens N] [--backend metal|cpu]
-  forja bench --model-dir PATH [--precision f32|bf16] [--pp N] [--tg N] [--reps N] [--json PATH] [--profile] [--no-replay] [--backend-option graph-replay=tier1|tier2]
+  forja bench --model-dir PATH [--precision f32|bf16] [--pp N] [--tg N] [--reps N] [--json PATH] [--profile] [--host-argmax] [--no-replay] [--backend-option graph-replay=tier1|tier2]
   forja verify --model-dir PATH --fixtures PATH [--backend metal|cpu] [--precision f32|bf16] [--prompts NAME,...]";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -48,6 +48,7 @@ pub(crate) struct Bench {
     pub(crate) reps: usize,
     pub(crate) json: Option<PathBuf>,
     pub(crate) profile: bool,
+    pub(crate) host_argmax: bool,
     pub(crate) no_replay: bool,
     pub(crate) precision: Option<Precision>,
     pub(crate) graph_replay: GraphReplay,
@@ -78,6 +79,7 @@ fn parse_bench(mut arguments: impl Iterator<Item = String>) -> Result<Bench, Str
     let mut reps = None;
     let mut json = None;
     let mut profile = false;
+    let mut host_argmax = false;
     let mut no_replay = false;
     let mut precision = None;
     let mut graph_replay = None;
@@ -88,6 +90,10 @@ fn parse_bench(mut arguments: impl Iterator<Item = String>) -> Result<Bench, Str
         }
         if option == "--no-replay" && !no_replay {
             no_replay = true;
+            continue;
+        }
+        if option == "--host-argmax" && !host_argmax {
+            host_argmax = true;
             continue;
         }
         let value = arguments
@@ -116,6 +122,7 @@ fn parse_bench(mut arguments: impl Iterator<Item = String>) -> Result<Bench, Str
         reps: reps.unwrap_or(30),
         json,
         profile,
+        host_argmax,
         no_replay,
         precision,
         graph_replay: graph_replay.unwrap_or(GraphReplay::Tier2),
@@ -261,6 +268,7 @@ mod tests {
                 reps: 2,
                 json: Some(PathBuf::from("/result.json")),
                 profile: false,
+                host_argmax: false,
                 no_replay: false,
                 precision: None,
                 graph_replay: GraphReplay::Tier2,
@@ -276,6 +284,7 @@ mod tests {
                 "--model-dir",
                 "/model",
                 "--profile",
+                "--host-argmax",
                 "--no-replay",
                 "--precision",
                 "bf16",
@@ -289,6 +298,7 @@ mod tests {
             panic!("expected bench command");
         };
         assert!(options.profile);
+        assert!(options.host_argmax);
         assert!(options.no_replay);
         assert_eq!(options.precision, Some(Precision::Bf16));
         assert_eq!(options.graph_replay, GraphReplay::Tier1);

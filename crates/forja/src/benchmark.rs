@@ -8,13 +8,16 @@ use std::{
 };
 
 use forja_core::Op;
-use forja_host::{EngineMetrics, EngineRunner, EngineStep, EngineStepProfile, ImportProfile};
-use golden_fixtures::sha256_file;
+use forja_host::{
+    EngineDecode, EngineMetrics, EngineOutput, EngineRunner, EngineStep, EngineStepProfile,
+    ImportProfile,
+};
+use golden_fixtures::{decode_f32_le, sha256_file};
 
 use crate::{
     args::{Bench, GraphReplay, Precision},
     benchmark_stats::{Stats, stats, synthetic_tokens},
-    engine::limits,
+    engine::{argmax, limits, read_token},
 };
 
 const WARMUPS: usize = 3;
@@ -46,6 +49,7 @@ struct ProfileMeasurement {
 
 struct ProfileReport {
     context_start: usize,
+    baseline: Summary,
     categories: Vec<ProfileCategory>,
     wall: Stats,
     wall_perturbation: Stats,
@@ -78,7 +82,7 @@ async fn run_metal(options: &Bench) -> Result<(), Box<dyn Error>> {
     let os = command_output("sw_vers", &["-productVersion"])?;
     let mut results = Vec::new();
     println!(
-        "precision\tmetric\twall tok/s (95% CI)\tGPU tok/s (95% CI)\twall ms\tGPU ms\tsubmissions"
+        "precision\tselection\tmetric\twall tok/s (95% CI)\tGPU tok/s (95% CI)\twall ms\tGPU ms\tsubmissions"
     );
     let precisions = options.precision.map_or_else(
         || vec![Precision::F32, Precision::Bf16],
@@ -87,8 +91,8 @@ async fn run_metal(options: &Bench) -> Result<(), Box<dyn Error>> {
     for precision in precisions {
         let (precision, component) = component(precision, !options.no_replay);
         let (pp, tg, device, profiles) = bench_precision(options, component).await?;
-        print_summary(precision, "pp", pp);
-        print_summary(precision, "tg", tg);
+        print_summary(precision, selection_name(options.host_argmax), "pp", pp);
+        print_summary(precision, selection_name(options.host_argmax), "tg", tg);
         let profile_reports = profiles
             .iter()
             .map(profile_report)
@@ -105,6 +109,7 @@ async fn run_metal(options: &Bench) -> Result<(), Box<dyn Error>> {
                 "precision": precision,
                 "replay": !options.no_replay,
                 "graph_replay": graph_replay_name(options.graph_replay),
+                "selection": selection_name(options.host_argmax),
             },
             "prompt_processing": summary_json(pp),
             "token_generation": summary_json(tg),
@@ -127,6 +132,7 @@ async fn run_metal(options: &Bench) -> Result<(), Box<dyn Error>> {
                 "repetitions": options.reps,
                 "replay": !options.no_replay,
                 "graph_replay": graph_replay_name(options.graph_replay),
+                "selection": selection_name(options.host_argmax),
             },
             "tg_context_start": TG_CONTEXT_START,
             "results": results,
@@ -194,16 +200,30 @@ async fn bench_precision(
     );
     for _ in 0..WARMUPS {
         measure_prefill(&mut runner, &tokens[..options.pp]).await?;
-        measure_decode(&mut runner, &tokens[..DECODE_PREFILL], options.tg).await?;
+        measure_decode(
+            &mut runner,
+            &tokens[..DECODE_PREFILL],
+            options.tg,
+            options.host_argmax,
+        )
+        .await?;
     }
     let mut pp = Vec::with_capacity(options.reps);
     let mut tg = Vec::with_capacity(options.reps);
     for _ in 0..options.reps {
         pp.push(measure_prefill(&mut runner, &tokens[..options.pp]).await?);
-        tg.push(measure_decode(&mut runner, &tokens[..DECODE_PREFILL], options.tg).await?);
+        tg.push(
+            measure_decode(
+                &mut runner,
+                &tokens[..DECODE_PREFILL],
+                options.tg,
+                options.host_argmax,
+            )
+            .await?,
+        );
     }
     let profiles = if options.profile {
-        measure_profiles(&mut runner, &tokens, options.reps).await?
+        measure_profiles(&mut runner, &tokens, options.reps, options.host_argmax).await?
     } else {
         Vec::new()
     };
@@ -222,6 +242,10 @@ const fn graph_replay_name(strategy: GraphReplay) -> &'static str {
     }
 }
 
+const fn selection_name(host_argmax: bool) -> &'static str {
+    if host_argmax { "host-argmax" } else { "gpu" }
+}
+
 #[cfg(target_os = "macos")]
 async fn measure_prefill(
     runner: &mut EngineRunner<forja_metal::MetalBackend>,
@@ -238,8 +262,9 @@ async fn measure_decode(
     runner: &mut EngineRunner<forja_metal::MetalBackend>,
     prompt: &[u32],
     steps: usize,
+    host_argmax: bool,
 ) -> Result<Sample, Box<dyn Error>> {
-    step(runner, prompt.to_vec(), 0).await?;
+    let mut token = select_from_tokens(runner, prompt.to_vec(), 0, host_argmax).await?;
     let mut schedule = Vec::with_capacity(steps.saturating_add(1));
     visit_decode_steps(u32::try_from(prompt.len())?, steps, |position, timed| {
         schedule.push((position, timed));
@@ -247,7 +272,7 @@ async fn measure_decode(
     let mut before = None;
     let mut started = None;
     for (position, timed) in schedule {
-        step(runner, vec![prompt[0]], position).await?;
+        token = select_next(runner, token, position, host_argmax).await?;
         if !timed {
             before = Some(runner.metrics());
             started = Some(Instant::now());
@@ -265,17 +290,18 @@ async fn measure_profiles(
     runner: &mut EngineRunner<forja_metal::MetalBackend>,
     tokens: &[u32],
     reps: usize,
+    host_argmax: bool,
 ) -> Result<Vec<ProfileMeasurement>, Box<dyn Error>> {
     let mut measurements = Vec::new();
     for context_start in PROFILE_CONTEXTS {
         let mut baseline = Vec::with_capacity(reps);
         let mut steps = Vec::with_capacity(reps);
         for repetition in 0..WARMUPS.saturating_add(reps) {
-            prepare_profile_context(runner, tokens, context_start).await?;
-            let unprofiled = measure_decode_step(runner, tokens[0], context_start).await?;
-            prepare_profile_context(runner, tokens, context_start).await?;
+            let token = prepare_profile_context(runner, tokens, context_start, host_argmax).await?;
+            let unprofiled = measure_decode_step(runner, token, context_start, host_argmax).await?;
+            let token = prepare_profile_context(runner, tokens, context_start, host_argmax).await?;
             runner.set_profiling(true);
-            let profiled = measure_decode_step(runner, tokens[0], context_start).await;
+            let profiled = measure_decode_step(runner, token, context_start, host_argmax).await;
             runner.set_profiling(false);
             let _ = profiled?;
             let profile = runner
@@ -300,12 +326,13 @@ async fn prepare_profile_context(
     runner: &mut EngineRunner<forja_metal::MetalBackend>,
     tokens: &[u32],
     context_start: usize,
-) -> Result<(), Box<dyn Error>> {
+    host_argmax: bool,
+) -> Result<u32, Box<dyn Error>> {
     let prefill = context_start
         .checked_sub(1)
         .ok_or("profile context must follow a prefill token")?;
-    step(runner, tokens[..prefill].to_vec(), 0).await?;
-    step(runner, vec![tokens[0]], u32::try_from(prefill)?).await
+    let token = select_from_tokens(runner, tokens[..prefill].to_vec(), 0, host_argmax).await?;
+    select_next(runner, token, u32::try_from(prefill)?, host_argmax).await
 }
 
 #[cfg(target_os = "macos")]
@@ -313,10 +340,11 @@ async fn measure_decode_step(
     runner: &mut EngineRunner<forja_metal::MetalBackend>,
     token: u32,
     context_start: usize,
+    host_argmax: bool,
 ) -> Result<Sample, Box<dyn Error>> {
     let before = runner.metrics();
     let started = Instant::now();
-    step(runner, vec![token], u32::try_from(context_start)?).await?;
+    select_next(runner, token, u32::try_from(context_start)?, host_argmax).await?;
     sample(before, runner.metrics(), started.elapsed())
 }
 
@@ -341,16 +369,65 @@ async fn step(
     runner: &mut EngineRunner<forja_metal::MetalBackend>,
     tokens: Vec<u32>,
     start_pos: u32,
-) -> Result<(), Box<dyn Error>> {
-    runner
+) -> Result<EngineOutput, Box<dyn Error>> {
+    Ok(runner
         .step(EngineStep {
             tokens,
             start_pos,
             taps: false,
         })
         .await?
-        .map_err(|error| format!("engine step failed: {error:?}"))?;
-    Ok(())
+        .map_err(|error| format!("engine step failed: {error:?}"))?)
+}
+
+#[cfg(target_os = "macos")]
+async fn select_from_tokens(
+    runner: &mut EngineRunner<forja_metal::MetalBackend>,
+    tokens: Vec<u32>,
+    start_pos: u32,
+    host_argmax: bool,
+) -> Result<u32, Box<dyn Error>> {
+    if host_argmax {
+        return host_select(runner, tokens, start_pos).await;
+    }
+    let output = runner
+        .decode(EngineDecode {
+            tokens: Some(tokens),
+            start_pos,
+        })
+        .await?
+        .map_err(|error| format!("engine decode failed: {error:?}"))?;
+    read_token(&runner.read(&output.token).await?)
+}
+
+#[cfg(target_os = "macos")]
+async fn select_next(
+    runner: &mut EngineRunner<forja_metal::MetalBackend>,
+    token: u32,
+    start_pos: u32,
+    host_argmax: bool,
+) -> Result<u32, Box<dyn Error>> {
+    if host_argmax {
+        return host_select(runner, vec![token], start_pos).await;
+    }
+    let output = runner
+        .decode(EngineDecode {
+            tokens: None,
+            start_pos,
+        })
+        .await?
+        .map_err(|error| format!("engine decode failed: {error:?}"))?;
+    read_token(&runner.read(&output.token).await?)
+}
+
+#[cfg(target_os = "macos")]
+async fn host_select(
+    runner: &mut EngineRunner<forja_metal::MetalBackend>,
+    tokens: Vec<u32>,
+    start_pos: u32,
+) -> Result<u32, Box<dyn Error>> {
+    let output = step(runner, tokens, start_pos).await?;
+    argmax(&decode_f32_le(&runner.read(&output.logits).await?)?)
 }
 
 fn sample(
@@ -394,9 +471,9 @@ fn summarize(samples: &[Sample], tokens: usize) -> Result<Summary, Box<dyn Error
     })
 }
 
-fn print_summary(precision: &str, metric: &str, summary: Summary) {
+fn print_summary(precision: &str, selection: &str, metric: &str, summary: Summary) {
     println!(
-        "{precision}\t{metric}\t{:.2} ({:.2}–{:.2})\t{:.2} ({:.2}–{:.2})\t{:.3}\t{:.3}\t{:.0}",
+        "{precision}\t{selection}\t{metric}\t{:.2} ({:.2}–{:.2})\t{:.2} ({:.2}–{:.2})\t{:.3}\t{:.3}\t{:.0}",
         summary.wall_tps.median,
         summary.wall_tps.low,
         summary.wall_tps.high,
@@ -462,6 +539,7 @@ fn profile_report(measurement: &ProfileMeasurement) -> Result<ProfileReport, Box
     let gpu_by_dispatch = gpu_by_dispatch(&submissions)?;
     Ok(ProfileReport {
         context_start: measurement.context_start,
+        baseline: summarize(&measurement.baseline, 1)?,
         categories,
         wall,
         wall_perturbation,
@@ -476,6 +554,13 @@ fn print_profile_report(precision: &str, report: &ProfileReport) {
     println!(
         "\n{precision} tg profile at context {}",
         report.context_start
+    );
+    println!(
+        "unprofiled\twall {:.2} tok/s\tGPU {:.2} tok/s\twall {:.3} ms\tGPU {:.3} ms",
+        report.baseline.wall_tps.median,
+        report.baseline.gpu_tps.median,
+        report.baseline.wall_seconds.median * 1_000.0,
+        report.baseline.gpu_seconds.median * 1_000.0,
     );
     println!("category\tcount/token\tms/token\t% wall");
     for category in &report.categories {
@@ -546,6 +631,7 @@ fn profile_json(report: &ProfileReport) -> serde_json::Value {
         .collect::<Vec<_>>();
     serde_json::json!({
         "context_start": report.context_start,
+        "unprofiled_token_generation": summary_json(report.baseline),
         "categories": categories,
         "timestamp_perturbation": {
             "wall_ratio": stats_json(report.wall_perturbation),
@@ -596,6 +682,7 @@ fn profile_categories(
         }),
         import_category("buffer.output", steps, |step| step.allocations),
         import_category("buffer.release", steps, |step| step.releases),
+        import_category("output.read", steps, |step| step.output_read),
         submission_category("submit.validation", submissions, |submission| {
             (1.0, submission.validation)
         }),
