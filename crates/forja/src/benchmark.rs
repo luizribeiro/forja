@@ -190,7 +190,7 @@ async fn bench_precision(
             .checked_add(options.tg)
             .ok_or("decode context length overflowed")?
             > max_context
-        || options.profile && profile_context >= max_context
+        || options.breakdown && profile_context >= max_context
     {
         return Err("benchmark shape exceeds the engine context".into());
     }
@@ -198,7 +198,7 @@ async fn bench_precision(
         .load()
         .await?
         .map_err(|error| format!("engine load failed: {error:?}"))?;
-    let profile_tokens = if options.profile {
+    let profile_tokens = if options.breakdown {
         profile_context - 1
     } else {
         0
@@ -233,7 +233,7 @@ async fn bench_precision(
             .await?,
         );
     }
-    let profiles = if options.profile {
+    let profiles = if options.breakdown {
         measure_profiles(
             &mut runner,
             &tokens,

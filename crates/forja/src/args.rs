@@ -83,7 +83,7 @@ pub(crate) struct Bench {
     pub(crate) json: Option<PathBuf>,
     /// Print a per-operation timing breakdown.
     #[arg(long)]
-    pub(crate) profile: bool,
+    pub(crate) breakdown: bool,
     /// Select tokens on the host instead of comparing selection modes.
     #[arg(long)]
     pub(crate) host_argmax: bool,
@@ -202,7 +202,7 @@ mod tests {
                 tg: 7,
                 reps: 2,
                 json: Some(PathBuf::from("/result.json")),
-                profile: false,
+                breakdown: false,
                 host_argmax: false,
                 no_replay: false,
                 precision: None,
@@ -212,13 +212,13 @@ mod tests {
     }
 
     #[test]
-    fn parses_benchmark_profile_flag() {
+    fn parses_benchmark_breakdown_flag() {
         let command = parse(
             [
                 "bench",
                 "--model-dir",
                 "/model",
-                "--profile",
+                "--breakdown",
                 "--host-argmax",
                 "--no-replay",
                 "--precision",
@@ -232,7 +232,7 @@ mod tests {
         let Command::Bench(options) = command else {
             panic!("expected bench command");
         };
-        assert!(options.profile);
+        assert!(options.breakdown);
         assert!(options.host_argmax);
         assert!(options.no_replay);
         assert_eq!(options.precision, Some(Precision::Bf16));
@@ -281,7 +281,13 @@ mod tests {
                 "--json",
                 "/two",
             ],
-            vec!["bench", "--model-dir", "/model", "--profile", "--profile"],
+            vec![
+                "bench",
+                "--model-dir",
+                "/model",
+                "--breakdown",
+                "--breakdown",
+            ],
             vec!["bench", "--model-dir", "/model", "--wat", "value"],
         ] {
             assert!(parse(arguments.into_iter().map(str::to_owned)).is_err());
