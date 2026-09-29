@@ -1,8 +1,9 @@
 use std::{
     collections::{BTreeMap, VecDeque},
     error::Error,
+    ffi::OsString,
     fs,
-    path::Path,
+    path::{Path, PathBuf},
     process::Command,
     time::{Duration, Instant},
 };
@@ -167,9 +168,15 @@ async fn run_metal(options: &Bench) -> Result<(), Box<dyn Error>> {
             "allow_diff": options.allow_diff.iter().map(KeyPath::as_str).collect::<Vec<_>>(),
             "results": results,
         });
-        let mut bytes = serde_json::to_vec_pretty(&report)?;
-        bytes.push(b'\n');
-        fs::write(path, bytes)?;
+        if options.breakdown {
+            let breakdown_path = breakdown_record_path(path, &options.config.paths.scratch)?;
+            if let Some(parent) = breakdown_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            write_json(&breakdown_path, &report)?;
+            println!("breakdown record: {}", breakdown_path.display());
+        }
+        write_json(path, &slim_record(&report))?;
     }
     Ok(())
 }
@@ -473,7 +480,10 @@ async fn measure_points(
                     "selection": selection,
                     "pp": summary_json(pp),
                     "tg": summary_json(tg),
-                    "breakdown": null,
+                    "sampling_fallbacks": profile_reports
+                        .iter()
+                        .filter_map(sampling_fallbacks_json)
+                        .collect::<Vec<_>>(),
                 });
                 if !profile_reports.is_empty() {
                     result["breakdown"] = serde_json::Value::Array(
@@ -488,6 +498,52 @@ async fn measure_points(
         results,
         record_device.ok_or("benchmark produced no results")?,
     ))
+}
+
+fn sampling_fallbacks_json(report: &ProfileReport) -> Option<serde_json::Value> {
+    report
+        .categories
+        .iter()
+        .find(|category| category.name == "sample.fallbacks")
+        .map(|category| {
+            serde_json::json!({
+                "context_start": report.context_start,
+                "count_per_token": stats_json(stats(
+                    category.values.iter().map(|(count, _)| *count),
+                )),
+            })
+        })
+}
+
+fn slim_record(report: &serde_json::Value) -> serde_json::Value {
+    let mut slim = report.clone();
+    if let Some(results) = slim["results"].as_array_mut() {
+        for result in results {
+            if let Some(result) = result.as_object_mut() {
+                result.remove("breakdown");
+            }
+        }
+    }
+    slim
+}
+
+fn breakdown_record_path(record: &Path, scratch: &Path) -> Result<PathBuf, String> {
+    let stem = record.file_stem().ok_or_else(|| {
+        format!(
+            "benchmark record path has no file name: {}",
+            record.display()
+        )
+    })?;
+    let mut name = OsString::from(stem);
+    name.push(".breakdown.json");
+    Ok(scratch.join(name))
+}
+
+fn write_json(path: &Path, value: &serde_json::Value) -> Result<(), Box<dyn Error>> {
+    let mut bytes = serde_json::to_vec_pretty(value)?;
+    bytes.push(b'\n');
+    fs::write(path, bytes)?;
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -1782,6 +1838,45 @@ mod tests {
             "pp": {"tokens_per_second": {"wall": {"median": 10.0, "ci95": [9.0, 11.0]}}}
         });
         assert_eq!(wall_stats(&result, "pp").unwrap(), (10.0, 9.0, 11.0));
+    }
+
+    #[test]
+    fn slim_records_keep_results_and_sampling_fallbacks() {
+        let report = serde_json::json!({
+            "schema_version": 2,
+            "provenance": {"commit": "abc"},
+            "results": [{
+                "input": 0,
+                "output_digest": "sha256:output",
+                "pp": {"tokens_per_second": {"wall": {"median": 10.0}}},
+                "sampling_fallbacks": [{
+                    "context_start": 33,
+                    "count_per_token": {"median": 1.0, "ci95": [1.0, 1.0]},
+                }],
+                "breakdown": [{"gpu_by_dispatch": [1, 2, 3]}],
+            }],
+        });
+        let slim = slim_record(&report);
+        assert_eq!(slim["schema_version"], 2);
+        assert_eq!(slim["results"][0]["output_digest"], "sha256:output");
+        assert_eq!(
+            slim["results"][0]["sampling_fallbacks"][0]["count_per_token"]["median"],
+            1.0
+        );
+        assert!(slim["results"][0].get("breakdown").is_none());
+        assert!(report["results"][0].get("breakdown").is_some());
+    }
+
+    #[test]
+    fn puts_detailed_records_in_the_scratch_directory() {
+        assert_eq!(
+            breakdown_record_path(
+                Path::new("bench/rejection-defaults.json"),
+                Path::new("target/forja-bench"),
+            )
+            .unwrap(),
+            Path::new("target/forja-bench/rejection-defaults.breakdown.json")
+        );
     }
 
     #[cfg(target_os = "macos")]
