@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     error::Error,
     fs,
     path::Path,
@@ -90,35 +90,43 @@ async fn run_metal(options: &Bench) -> Result<(), Box<dyn Error>> {
     );
     for precision in precisions {
         let (precision, component) = component(precision, !options.no_replay);
-        let (pp, tg, device, profiles) = bench_precision(options, component).await?;
-        print_summary(precision, selection_name(options.host_argmax), "pp", pp);
-        print_summary(precision, selection_name(options.host_argmax), "tg", tg);
-        let profile_reports = profiles
-            .iter()
-            .map(profile_report)
-            .collect::<Result<Vec<_>, _>>()?;
-        for report in &profile_reports {
-            print_profile_report(precision, report);
+        let modes: &[bool] = if options.host_argmax {
+            &[false]
+        } else {
+            &[false, true]
+        };
+        for &overlap in modes {
+            let selection = selection_name(options.host_argmax, overlap);
+            let (pp, tg, device, profiles) = bench_precision(options, component, overlap).await?;
+            print_summary(precision, selection, "pp", pp);
+            print_summary(precision, selection, "tg", tg);
+            let profile_reports = profiles
+                .iter()
+                .map(profile_report)
+                .collect::<Result<Vec<_>, _>>()?;
+            for report in &profile_reports {
+                print_profile_report(precision, selection, report);
+            }
+            let mut result = serde_json::json!({
+                "provenance": {
+                    "git_commit": commit,
+                    "engine_component_sha256": sha256_file(component)?,
+                    "device": device,
+                    "os": format!("macOS {os}"),
+                    "precision": precision,
+                    "replay": !options.no_replay,
+                    "graph_replay": graph_replay_name(options.graph_replay),
+                    "selection": selection,
+                },
+                "prompt_processing": summary_json(pp),
+                "token_generation": summary_json(tg),
+            });
+            if !profile_reports.is_empty() {
+                result["profile"] =
+                    serde_json::Value::Array(profile_reports.iter().map(profile_json).collect());
+            }
+            results.push(result);
         }
-        let mut result = serde_json::json!({
-            "provenance": {
-                "git_commit": commit,
-                "engine_component_sha256": sha256_file(component)?,
-                "device": device,
-                "os": format!("macOS {os}"),
-                "precision": precision,
-                "replay": !options.no_replay,
-                "graph_replay": graph_replay_name(options.graph_replay),
-                "selection": selection_name(options.host_argmax),
-            },
-            "prompt_processing": summary_json(pp),
-            "token_generation": summary_json(tg),
-        });
-        if !profile_reports.is_empty() {
-            result["profile"] =
-                serde_json::Value::Array(profile_reports.iter().map(profile_json).collect());
-        }
-        results.push(result);
     }
     if let Some(path) = &options.json {
         let report = serde_json::json!({
@@ -132,7 +140,7 @@ async fn run_metal(options: &Bench) -> Result<(), Box<dyn Error>> {
                 "repetitions": options.reps,
                 "replay": !options.no_replay,
                 "graph_replay": graph_replay_name(options.graph_replay),
-                "selection": selection_name(options.host_argmax),
+                "selection": if options.host_argmax { "host-argmax" } else { "compared" },
             },
             "tg_context_start": TG_CONTEXT_START,
             "results": results,
@@ -158,6 +166,7 @@ fn component(precision: Precision, replay: bool) -> (&'static str, &'static Path
 async fn bench_precision(
     options: &Bench,
     component: &Path,
+    overlap: bool,
 ) -> Result<(Summary, Summary, String, Vec<ProfileMeasurement>), Box<dyn Error>> {
     let backend = forja_metal::MetalBackend::with_graph_replay(match options.graph_replay {
         GraphReplay::Tier1 => forja_metal::MetalGraphReplay::Tier1,
@@ -205,6 +214,7 @@ async fn bench_precision(
             &tokens[..DECODE_PREFILL],
             options.tg,
             options.host_argmax,
+            overlap,
         )
         .await?;
     }
@@ -218,6 +228,7 @@ async fn bench_precision(
                 &tokens[..DECODE_PREFILL],
                 options.tg,
                 options.host_argmax,
+                overlap,
             )
             .await?,
         );
@@ -242,8 +253,14 @@ const fn graph_replay_name(strategy: GraphReplay) -> &'static str {
     }
 }
 
-const fn selection_name(host_argmax: bool) -> &'static str {
-    if host_argmax { "host-argmax" } else { "gpu" }
+const fn selection_name(host_argmax: bool, overlap: bool) -> &'static str {
+    if host_argmax {
+        "host-argmax"
+    } else if overlap {
+        "gpu-pipelined"
+    } else {
+        "gpu-sequential"
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -263,7 +280,11 @@ async fn measure_decode(
     prompt: &[u32],
     steps: usize,
     host_argmax: bool,
+    overlap: bool,
 ) -> Result<Sample, Box<dyn Error>> {
+    if overlap && !host_argmax {
+        return measure_pipelined_decode(runner, prompt, steps).await;
+    }
     let mut token = select_from_tokens(runner, prompt.to_vec(), 0, host_argmax).await?;
     let mut schedule = Vec::with_capacity(steps.saturating_add(1));
     visit_decode_steps(u32::try_from(prompt.len())?, steps, |position, timed| {
@@ -272,17 +293,125 @@ async fn measure_decode(
     let mut before = None;
     let mut started = None;
     for (position, timed) in schedule {
+        let submission_before = runner.metrics().submissions;
         token = select_next(runner, token, position, host_argmax).await?;
         if !timed {
+            wait_for_submissions(
+                runner,
+                submission_before
+                    .checked_add(1)
+                    .ok_or("submission count overflowed")?,
+            )
+            .await?;
             before = Some(runner.metrics());
             started = Some(Instant::now());
         }
     }
+    let before = before.ok_or("decode timing did not start")?;
+    wait_for_submissions(
+        runner,
+        before
+            .submissions
+            .checked_add(u64::try_from(steps)?)
+            .ok_or("submission count overflowed")?,
+    )
+    .await?;
     sample(
-        before.ok_or("decode timing did not start")?,
+        before,
         runner.metrics(),
         started.ok_or("decode timing did not start")?.elapsed(),
     )
+}
+
+#[cfg(target_os = "macos")]
+async fn measure_pipelined_decode(
+    runner: &mut EngineRunner<forja_metal::MetalBackend>,
+    prompt: &[u32],
+    steps: usize,
+) -> Result<Sample, Box<dyn Error>> {
+    let token = select_from_tokens(runner, prompt.to_vec(), 0, false).await?;
+    let context_start = u32::try_from(prompt.len())?;
+    let warmup_before = runner.metrics().submissions;
+    select_next(runner, token, context_start, false).await?;
+    wait_for_submissions(
+        runner,
+        warmup_before
+            .checked_add(1)
+            .ok_or("submission count overflowed")?,
+    )
+    .await?;
+    let before = runner.metrics();
+    let started = Instant::now();
+    let mut position = context_start
+        .checked_add(1)
+        .ok_or("decode position overflowed")?;
+    let end = position
+        .checked_add(u32::try_from(steps)?)
+        .ok_or("decode position overflowed")?;
+    let mut outputs = VecDeque::with_capacity(2);
+    let mut consumed = 0_u64;
+    while position < end || !outputs.is_empty() {
+        while position < end && outputs.len() < 2 {
+            outputs.push_back(
+                runner
+                    .enqueue_decode(EngineDecode {
+                        tokens: None,
+                        start_pos: position,
+                    })
+                    .await?
+                    .map_err(|error| format!("engine decode failed: {error:?}"))?,
+            );
+            position = position
+                .checked_add(1)
+                .ok_or("decode position overflowed")?;
+        }
+        let output = outputs.pop_front().ok_or("decode queue is empty")?;
+        read_token(&runner.read_queued_token(output).await?)?;
+        consumed = consumed
+            .checked_add(1)
+            .ok_or("submission count overflowed")?;
+        wait_for_submissions(
+            runner,
+            before
+                .submissions
+                .checked_add(consumed)
+                .ok_or("submission count overflowed")?,
+        )
+        .await?;
+    }
+    let expected = before
+        .submissions
+        .checked_add(u64::try_from(steps)?)
+        .ok_or("submission count overflowed")?;
+    wait_for_submissions(runner, expected).await?;
+    sample(before, runner.metrics(), started.elapsed())
+}
+
+#[cfg(target_os = "macos")]
+async fn wait_for_submissions(
+    runner: &EngineRunner<forja_metal::MetalBackend>,
+    expected: u64,
+) -> Result<(), Box<dyn Error>> {
+    let started = Instant::now();
+    while {
+        let metrics = runner.metrics();
+        metrics.submissions < expected
+            || metrics.timed_submissions < expected
+            || metrics.submissions != metrics.timed_submissions
+    } {
+        if started.elapsed() >= Duration::from_secs(60) {
+            return Err("replay completion accounting timed out".into());
+        }
+        tokio::task::yield_now().await;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+async fn settle_submission_metrics(
+    runner: &EngineRunner<forja_metal::MetalBackend>,
+) -> Result<(), Box<dyn Error>> {
+    wait_for_submissions(runner, runner.metrics().submissions).await
 }
 
 #[cfg(target_os = "macos")]
@@ -342,9 +471,18 @@ async fn measure_decode_step(
     context_start: usize,
     host_argmax: bool,
 ) -> Result<Sample, Box<dyn Error>> {
+    settle_submission_metrics(runner).await?;
     let before = runner.metrics();
     let started = Instant::now();
     select_next(runner, token, u32::try_from(context_start)?, host_argmax).await?;
+    wait_for_submissions(
+        runner,
+        before
+            .submissions
+            .checked_add(1)
+            .ok_or("submission count overflowed")?,
+    )
+    .await?;
     sample(before, runner.metrics(), started.elapsed())
 }
 
@@ -550,9 +688,9 @@ fn profile_report(measurement: &ProfileMeasurement) -> Result<ProfileReport, Box
     })
 }
 
-fn print_profile_report(precision: &str, report: &ProfileReport) {
+fn print_profile_report(precision: &str, selection: &str, report: &ProfileReport) {
     println!(
-        "\n{precision} tg profile at context {}",
+        "\n{precision} {selection} tg profile at context {}",
         report.context_start
     );
     println!(
