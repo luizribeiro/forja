@@ -564,6 +564,7 @@ fn graph_barriers<B: Backend>(host: &Host<B>, graph: &Resource<GraphEntry>) -> u
         .get(graph)
         .unwrap()
         .graph
+        .template()
         .required_barriers()
         .iter()
         .filter(|&&barrier| barrier)

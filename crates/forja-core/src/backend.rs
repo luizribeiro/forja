@@ -7,7 +7,8 @@ use std::{
 };
 
 use crate::{
-    BufferId, CommandList, DType, GraphTemplate, Layout, MappedRegion, Op, Slice, Tensor,
+    BufferId, CommandList, DType, GraphTemplate, Layout, MappedRegion, Op, PreparedGraph, Slice,
+    Tensor,
     program::{KernelSignature, ValidatedProgram},
 };
 
@@ -382,8 +383,8 @@ pub trait Backend {
     /// # Errors
     ///
     /// Returns a backend error when graph preparation cannot be completed.
-    fn prepare_graph(&self, graph: GraphTemplate) -> Result<GraphTemplate, BackendError> {
-        Ok(graph)
+    fn prepare_graph(&self, graph: GraphTemplate) -> Result<PreparedGraph, BackendError> {
+        Ok(PreparedGraph::new(graph))
     }
 
     /// Instantiates and submits a prepared graph through the prevalidated command path.
@@ -397,13 +398,14 @@ pub trait Backend {
     /// Returns invalid input for bad parameter values or a backend submission error.
     fn replay(
         &self,
-        graph: &GraphTemplate,
+        graph: &PreparedGraph,
         values: Vec<u32>,
     ) -> Result<Self::Submission, BackendError> {
         let values = graph
             .values(values)
             .map_err(|_| BackendError::InvalidInput)?;
         let commands = graph
+            .template()
             .instantiate(&values)
             .map_err(|_| BackendError::InvalidInput)?;
         self.submit(commands)
@@ -416,13 +418,14 @@ pub trait Backend {
     /// Returns invalid input for bad parameter values or a backend submission error.
     fn replay_profiled(
         &self,
-        graph: &GraphTemplate,
+        graph: &PreparedGraph,
         values: Vec<u32>,
     ) -> Result<Self::Submission, BackendError> {
         let values = graph
             .values(values)
             .map_err(|_| BackendError::InvalidInput)?;
         let commands = graph
+            .template()
             .instantiate(&values)
             .map_err(|_| BackendError::InvalidInput)?;
         self.submit_profiled(commands)

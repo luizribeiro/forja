@@ -1,4 +1,4 @@
-use std::{error::Error, fmt, sync::Arc};
+use std::{any::Any, collections::HashSet, error::Error, fmt, sync::Arc};
 
 use crate::{
     Affine, ByteHull, CommandList, Dispatch, Op, OpError, ParamError, ParamSpace, ParamValues,
@@ -482,6 +482,77 @@ pub struct GraphTemplate {
     required_barriers: Vec<bool>,
 }
 
+/// A validated graph template with optional backend-owned preparation state.
+#[derive(Clone)]
+pub struct PreparedGraph {
+    template: GraphTemplate,
+    backend_state: Option<Arc<dyn Any + Send + Sync>>,
+}
+
+impl fmt::Debug for PreparedGraph {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedGraph")
+            .field("template", &self.template)
+            .field("has_backend_state", &self.backend_state.is_some())
+            .finish()
+    }
+}
+
+impl PreparedGraph {
+    /// Retains a graph template without backend-specific preparation.
+    #[must_use]
+    pub const fn new(template: GraphTemplate) -> Self {
+        Self {
+            template,
+            backend_state: None,
+        }
+    }
+
+    /// Retains a graph template and type-erased backend preparation state.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_backend_state<T>(template: GraphTemplate, state: T) -> Self
+    where
+        T: Any + Send + Sync,
+    {
+        Self {
+            template,
+            backend_state: Some(Arc::new(state)),
+        }
+    }
+
+    /// Returns the validated portable template.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn template(&self) -> &GraphTemplate {
+        &self.template
+    }
+
+    /// Returns the resource bounds retained by the portable template.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn limits(&self) -> GraphLimits {
+        self.template.limits()
+    }
+
+    /// Returns backend preparation state when its concrete type matches.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn backend_state<T: Any + Send + Sync>(&self) -> Option<&T> {
+        self.backend_state.as_ref()?.downcast_ref()
+    }
+
+    /// Checks raw replay values against this graph's parameter space.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ParamError`] when the count differs or a value is out of range.
+    pub fn values(&self, values: Vec<u32>) -> Result<ParamValues, ParamError> {
+        self.template.values(values)
+    }
+}
+
 impl GraphTemplate {
     /// Creates an empty graph template governed by the supplied resource bounds.
     #[must_use]
@@ -514,12 +585,39 @@ impl GraphTemplate {
         &self.required_barriers
     }
 
+    /// Returns one tensor handle for every allocation retained by this template.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn retained_tensors(&self) -> Vec<Tensor> {
+        let mut seen = HashSet::new();
+        self.dispatches
+            .iter()
+            .flat_map(|dispatch| match dispatch {
+                TemplateDispatch::Static(dispatch) => dispatch
+                    .inputs()
+                    .iter()
+                    .chain(dispatch.outputs())
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                TemplateDispatch::Dynamic(dispatch) => dispatch
+                    .tensors()
+                    .map(|tensor| match tensor {
+                        TemplateTensor::Concrete(tensor)
+                        | TemplateTensor::Symbolic { base: tensor, .. } => tensor.clone(),
+                    })
+                    .collect(),
+            })
+            .filter(|tensor| seen.insert(tensor.buffer()))
+            .collect()
+    }
+
     /// Returns the resource bounds retained by this template.
     #[doc(hidden)]
     #[must_use]
     pub const fn limits(&self) -> GraphLimits {
         self.limits
     }
+
     /// Checks raw replay values against this template's parameter space.
     ///
     /// # Errors

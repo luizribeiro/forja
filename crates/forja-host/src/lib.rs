@@ -20,8 +20,8 @@ use std::{
 
 use forja_core::{
     Affine, Backend, BackendError, CommandList, DType, GraphLimits, GraphTemplate, Layout,
-    LayoutError, Op, OpError, ParamSpace, Slice, Submission, SubmissionProfile, SymbolicLayout,
-    SymbolicLayoutError, TemplateOp, TemplateTensor, Tensor, ViewOp,
+    LayoutError, Op, OpError, ParamSpace, PreparedGraph, Slice, Submission, SubmissionProfile,
+    SymbolicLayout, SymbolicLayoutError, TemplateOp, TemplateTensor, Tensor, ViewOp,
     program::{
         BinOp, Inst, KernelSignature, MAX_INSTRUCTIONS, MAX_OUTPUTS, PrepareError, PreparedProgram,
         Program, ProgramError, ProgramKind, RedOp, UnOp, ValidatedProgram, ValueType,
@@ -916,7 +916,7 @@ pub struct CommandListEntry {
 /// Host-owned state behind a guest graph resource.
 #[derive(Debug)]
 pub struct GraphEntry {
-    graph: Arc<GraphTemplate>,
+    graph: Arc<PreparedGraph>,
     retained: Vec<TensorEntry>,
     retained_kernels: Vec<KernelEntry>,
     in_flight: Arc<AtomicBool>,
@@ -1890,7 +1890,7 @@ struct SubmitRequest<B: Backend> {
 enum SubmissionWork {
     Commands(CommandList),
     Replay {
-        graph: Arc<GraphTemplate>,
+        graph: Arc<PreparedGraph>,
         values: Vec<u32>,
     },
 }

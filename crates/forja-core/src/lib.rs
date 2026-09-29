@@ -14,7 +14,9 @@ pub use backend::{
     SubmissionProfile, ViewOp,
 };
 pub use forja_mmap::MappedRegion;
-pub use graph::{GraphError, GraphLimits, GraphTemplate, TemplateOp, TemplateTensor};
+pub use graph::{
+    GraphError, GraphLimits, GraphTemplate, PreparedGraph, TemplateOp, TemplateTensor,
+};
 pub use layout::{Layout, LayoutError, MAX_RANK, Slice, byte_ranges_overlap, is_injective};
 pub use ops::{
     BufferId, CommandList, Dispatch, Op, OpError, Operand, Tensor, TensorError, required_barriers,
