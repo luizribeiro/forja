@@ -45,7 +45,7 @@ struct VerifyArgs {
     model_dir: PathBuf,
     /// Directory containing golden fixtures.
     #[arg(long)]
-    fixtures: PathBuf,
+    fixtures: Option<PathBuf>,
     /// Compute backend.
     #[arg(long, value_enum, default_value_t = Backend::Metal)]
     backend: Backend,
@@ -57,26 +57,33 @@ struct VerifyArgs {
     prompts: Vec<String>,
 }
 
-#[derive(Args, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub(crate) struct Run {
+    pub(crate) engine: PathBuf,
+    pub(crate) model_dir: PathBuf,
+    pub(crate) prompt: String,
+    pub(crate) max_tokens: usize,
+    pub(crate) backend: Backend,
+    pub(crate) limits: Limits,
+}
+
+#[derive(Args)]
+struct RunArgs {
     /// WebAssembly engine component.
     #[arg(long)]
-    pub(crate) engine: PathBuf,
+    engine: PathBuf,
     /// Directory containing model weights and tokenizer files.
     #[arg(long)]
-    pub(crate) model_dir: PathBuf,
+    model_dir: PathBuf,
     /// Text to continue.
     #[arg(long)]
-    pub(crate) prompt: String,
+    prompt: String,
     /// Maximum number of tokens to generate.
-    #[arg(long, default_value_t = 128)]
-    pub(crate) max_tokens: usize,
+    #[arg(long)]
+    max_tokens: Option<u32>,
     /// Compute backend.
     #[arg(long, value_enum, default_value_t = Backend::Metal)]
-    pub(crate) backend: Backend,
-    /// Host resource limits.
-    #[arg(skip)]
-    pub(crate) limits: Limits,
+    backend: Backend,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -199,7 +206,7 @@ enum ParsedCommand {
     /// Inspect configuration.
     Config(ConfigArgs),
     /// Generate a completion.
-    Run(Run),
+    Run(RunArgs),
     /// Compare engine outputs with golden fixtures.
     Verify(VerifyArgs),
 }
@@ -264,11 +271,10 @@ fn parse_with(
                 defaults: options.defaults,
             }),
         },
-        ParsedCommand::Run(mut options) => {
-            options.limits = limits;
-            Command::Run(options)
+        ParsedCommand::Run(options) => Command::Run(options.with_config(&layered.config, limits)?),
+        ParsedCommand::Verify(options) => {
+            Command::Verify(options.with_config(&layered.config, limits)?)
         }
-        ParsedCommand::Verify(options) => Command::Verify(options.with_limits(limits)),
     })
 }
 
@@ -326,27 +332,71 @@ const SUGAR: &[Sugar] = &[
         flag: "--host-argmax",
         key: "bench.selection",
     },
+    Sugar {
+        flag: "--max-tokens",
+        key: "run.max_tokens",
+    },
+    Sugar {
+        flag: "--prompts",
+        key: "verify.prompts",
+    },
+    Sugar {
+        flag: "--fixtures",
+        key: "verify.fixtures",
+    },
 ];
 
 impl ParsedCommand {
     fn sugar_layers(&self) -> Result<Vec<(Layer, KeyPath)>, clap::Error> {
-        let Self::Bench(options) = self else {
-            return Ok(Vec::new());
-        };
         let mut values = Vec::new();
-        values.extend(options.pp.map(|value| ("--pp", value.to_string())));
-        values.extend(options.tg.map(|value| ("--tg", value.to_string())));
-        values.extend(options.reps.map(|value| ("--reps", value.to_string())));
-        values.extend(
-            options
-                .breakdown
-                .then(|| ("--breakdown", "true".to_owned())),
-        );
-        values.extend(
-            options
-                .host_argmax
-                .then(|| ("--host-argmax", "[\"host-argmax\"]".to_owned())),
-        );
+        match self {
+            Self::Bench(options) => {
+                values.extend(options.pp.map(|value| ("--pp", value.to_string())));
+                values.extend(options.tg.map(|value| ("--tg", value.to_string())));
+                values.extend(options.reps.map(|value| ("--reps", value.to_string())));
+                values.extend(
+                    options
+                        .breakdown
+                        .then(|| ("--breakdown", "true".to_owned())),
+                );
+                values.extend(
+                    options
+                        .host_argmax
+                        .then(|| ("--host-argmax", "[\"host-argmax\"]".to_owned())),
+                );
+            }
+            Self::Run(options) => {
+                values.extend(
+                    options
+                        .max_tokens
+                        .map(|value| ("--max-tokens", value.to_string())),
+                );
+            }
+            Self::Verify(options) => {
+                if !options.prompts.is_empty() {
+                    let prompts = options
+                        .prompts
+                        .iter()
+                        .cloned()
+                        .map(toml::Value::String)
+                        .collect();
+                    values.push(("--prompts", toml::Value::Array(prompts).to_string()));
+                }
+                if let Some(path) = &options.fixtures {
+                    let Some(path) = path.to_str() else {
+                        return Err(Cli::command().error(
+                            clap::error::ErrorKind::InvalidUtf8,
+                            "--fixtures must be valid UTF-8",
+                        ));
+                    };
+                    values.push((
+                        "--fixtures",
+                        toml::Value::String(path.to_owned()).to_string(),
+                    ));
+                }
+            }
+            Self::Config(_) => {}
+        }
         values
             .into_iter()
             .map(|(flag, value)| sugar_layer(flag, &value))
@@ -399,6 +449,22 @@ impl BenchArgs {
     }
 }
 
+impl RunArgs {
+    fn with_config(self, config: &DevConfig, limits: Limits) -> Result<Run, clap::Error> {
+        let max_tokens = usize::try_from(config.run.max_tokens).map_err(|error| {
+            Cli::command().error(clap::error::ErrorKind::ValueValidation, error.to_string())
+        })?;
+        Ok(Run {
+            engine: self.engine,
+            model_dir: self.model_dir,
+            prompt: self.prompt,
+            max_tokens,
+            backend: self.backend,
+            limits,
+        })
+    }
+}
+
 fn parse_backend_option(value: &str) -> Result<GraphReplay, String> {
     match value {
         "graph-replay=tier1" => Ok(GraphReplay::Tier1),
@@ -416,17 +482,27 @@ fn parse_prompt_name(value: &str) -> Result<String, String> {
 }
 
 impl VerifyArgs {
-    fn with_limits(self, limits: Limits) -> Verify {
-        let options = self;
-        Verify {
-            engine: options.engine,
-            model_dir: options.model_dir,
-            fixtures: options.fixtures,
-            backend: options.backend,
-            precision: options.precision,
-            prompts: options.prompts,
+    fn with_config(self, config: &DevConfig, limits: Limits) -> Result<Verify, clap::Error> {
+        let fixtures = config.verify.fixtures.clone().ok_or_else(|| {
+            Cli::command().error(
+                clap::error::ErrorKind::MissingRequiredArgument,
+                "verify requires --fixtures or verify.fixtures in configuration",
+            )
+        })?;
+        Ok(Verify {
+            engine: self.engine,
+            model_dir: self.model_dir,
+            fixtures,
+            backend: self.backend,
+            precision: self.precision,
+            prompts: config
+                .verify
+                .prompts
+                .iter()
+                .map(|name| name.as_str().to_owned())
+                .collect(),
             limits,
-        }
+        })
     }
 }
 
@@ -739,6 +815,26 @@ selection = ["host-argmax"]
     }
 
     #[test]
+    fn reads_run_settings_from_config_without_flag_defaults() {
+        let command = parse_with_file(
+            &[
+                "run",
+                "--engine",
+                "/engine.wasm",
+                "--model-dir",
+                "/model",
+                "--prompt",
+                "Hello",
+            ],
+            "[run]\nmax_tokens = 7\n",
+        );
+        let Command::Run(options) = command else {
+            panic!("expected run command");
+        };
+        assert_eq!(options.max_tokens, 7);
+    }
+
+    #[test]
     fn rejects_invalid_run_options() {
         for arguments in [
             vec!["run", "--model-dir", "/model", "--prompt", "Hello"],
@@ -882,6 +978,28 @@ selection = ["host-argmax"]
         assert_eq!(options.backend, Backend::Metal);
         assert_eq!(options.precision, Precision::F32);
         assert!(options.prompts.is_empty());
+    }
+
+    #[test]
+    fn file_values_survive_without_verify_sugar_flags() {
+        let command = parse_with_file(
+            &[
+                "verify",
+                "--engine",
+                "/engine.wasm",
+                "--model-dir",
+                "/model",
+            ],
+            r#"[verify]
+prompts = ["short", "code"]
+fixtures = "/fixtures"
+"#,
+        );
+        let Command::Verify(options) = command else {
+            panic!("expected verify command");
+        };
+        assert_eq!(options.prompts, ["short", "code"]);
+        assert_eq!(options.fixtures, PathBuf::from("/fixtures"));
     }
 
     #[test]

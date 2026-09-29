@@ -26,6 +26,62 @@ pub struct DevConfig {
     pub limits: Limits,
     /// Benchmark workload and measurement settings.
     pub bench: Bench,
+    /// Text-generation settings.
+    pub run: Run,
+    /// Golden-fixture verification settings.
+    pub verify: Verify,
+}
+
+/// Text-generation settings.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Run {
+    /// Maximum number of tokens to generate.
+    pub max_tokens: u32,
+}
+
+impl Default for Run {
+    fn default() -> Self {
+        Self { max_tokens: 128 }
+    }
+}
+
+/// Golden-fixture verification settings.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Verify {
+    /// Fixture names to verify, or every available fixture when empty.
+    pub prompts: Vec<PromptName>,
+    /// Directory containing golden fixtures.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fixtures: Option<PathBuf>,
+}
+
+/// A non-empty golden-fixture name.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
+pub struct PromptName(String);
+
+impl PromptName {
+    /// Returns the fixture name.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for PromptName {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let name = String::deserialize(deserializer)?;
+        if name.is_empty() {
+            Err(de::Error::custom("prompt name cannot be empty"))
+        } else {
+            Ok(Self(name))
+        }
+    }
 }
 
 /// Benchmark workload and measurement settings.
@@ -308,6 +364,33 @@ selection = ["host-argmax"]
         ] {
             assert!(toml::from_str::<DevConfig>(source).is_err(), "{source}");
         }
+    }
+
+    #[test]
+    fn parses_run_and_verify_sections() {
+        let config: DevConfig = toml::from_str(
+            r#"[run]
+max_tokens = 0
+[verify]
+prompts = ["short", "code"]
+fixtures = "golden/qwen3-0.6b"
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.run.max_tokens, 0);
+        assert_eq!(
+            config
+                .verify
+                .prompts
+                .iter()
+                .map(PromptName::as_str)
+                .collect::<Vec<_>>(),
+            ["short", "code"]
+        );
+        assert_eq!(
+            config.verify.fixtures,
+            Some(PathBuf::from("golden/qwen3-0.6b"))
+        );
     }
 
     #[test]
