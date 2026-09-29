@@ -3,7 +3,7 @@ use std::{error::Error, fmt, sync::Arc};
 use crate::{
     Affine, ByteHull, CommandList, Dispatch, Op, OpError, ParamError, ParamSpace, ParamValues,
     SymbolicLayout, SymbolicLayoutError, Tensor, TensorError, byte_ranges_overlap,
-    ops::{BufferAccess, barriers_for_accesses},
+    ops::{BufferAccess, barriers_bounded_by, barriers_for_accesses},
     program::{BindError, Inst, PreparedProgram, ProgramKind},
 };
 
@@ -228,11 +228,22 @@ impl TemplateTensor {
     }
 
     fn access(&self, writes: bool) -> Result<BufferAccess, GraphError> {
-        Ok(BufferAccess {
-            buffer: self.buffer(),
-            bytes: self.byte_hull()?.byte_span(),
+        match self {
+            Self::Concrete(tensor) => Ok(BufferAccess::new(tensor, writes)),
+            Self::Symbolic { .. } => Ok(BufferAccess::hull(
+                self.buffer(),
+                self.byte_hull()?.byte_span(),
+                writes,
+            )),
+        }
+    }
+
+    fn hull_access(&self, writes: bool) -> Result<BufferAccess, GraphError> {
+        Ok(BufferAccess::hull(
+            self.buffer(),
+            self.byte_hull()?.byte_span(),
             writes,
-        })
+        ))
     }
 }
 
@@ -385,6 +396,17 @@ impl DynamicDispatch {
     }
 
     fn accesses(&self) -> Result<Vec<BufferAccess>, GraphError> {
+        self.collect_accesses(TemplateTensor::access)
+    }
+
+    fn hull_accesses(&self) -> Result<Vec<BufferAccess>, GraphError> {
+        self.collect_accesses(TemplateTensor::hull_access)
+    }
+
+    fn collect_accesses(
+        &self,
+        access: fn(&TemplateTensor, bool) -> Result<BufferAccess, GraphError>,
+    ) -> Result<Vec<BufferAccess>, GraphError> {
         let (inputs, outputs) = match self {
             Self::Operation { inputs, output, .. } => {
                 (inputs.as_slice(), std::slice::from_ref(output.as_ref()))
@@ -395,8 +417,8 @@ impl DynamicDispatch {
         };
         inputs
             .iter()
-            .map(|tensor| tensor.access(false))
-            .chain(outputs.iter().map(|tensor| tensor.access(true)))
+            .map(|tensor| access(tensor, false))
+            .chain(outputs.iter().map(|tensor| access(tensor, true)))
             .collect()
     }
 
@@ -456,6 +478,7 @@ pub struct GraphTemplate {
     limits: GraphLimits,
     dispatches: Vec<TemplateDispatch>,
     barrier_accesses: Vec<Vec<BufferAccess>>,
+    hull_barrier_accesses: Vec<Vec<BufferAccess>>,
     required_barriers: Vec<bool>,
 }
 
@@ -468,6 +491,7 @@ impl GraphTemplate {
             limits,
             dispatches: Vec::new(),
             barrier_accesses: Vec::new(),
+            hull_barrier_accesses: Vec::new(),
             required_barriers: Vec::new(),
         }
     }
@@ -571,6 +595,7 @@ impl GraphTemplate {
         }
         dispatch.check_hull_aliasing()?;
         let accesses = dispatch.accesses()?;
+        let hull_accesses = dispatch.hull_accesses()?;
         let mut corners = self.space.corners().into_iter();
         let first = corners
             .next()
@@ -586,7 +611,9 @@ impl GraphTemplate {
                 .push(TemplateDispatch::Static(Box::new(first)));
         }
         self.barrier_accesses.push(accesses);
-        self.required_barriers = barriers_for_accesses(self.barrier_accesses.iter().cloned());
+        self.hull_barrier_accesses.push(hull_accesses);
+        let upper = barriers_for_accesses(self.hull_barrier_accesses.iter().cloned());
+        self.required_barriers = barriers_bounded_by(&self.barrier_accesses, &upper);
         Ok(())
     }
 }
@@ -645,6 +672,7 @@ mod tests {
     use crate::{
         Affine, BufferId, CommandList, DType, Dispatch, Layout, Op, OpError, Operand, ParamError,
         ParamSpace, ParamValues, SymbolicLayout, Tensor,
+        ops::{BufferAccess, barriers_for_accesses},
         program::{
             Inst, KernelSignature, PreparedProgram, Program, ProgramKind, prepared_for_test,
         },
@@ -1251,7 +1279,7 @@ mod tests {
 
     proptest! {
         #[test]
-        fn hull_barriers_cover_every_concrete_instantiation(
+        fn exact_graph_barriers_are_bounded_and_cover_every_instantiation(
             hi in 0_u32..=3,
             write_offset in 0_u32..=4,
             write_scale in 0_u32..=2,
@@ -1272,27 +1300,79 @@ mod tests {
                 read_offset,
                 read_scale,
             );
+            let lanes = Tensor::from_allocation(
+                cache.buffer(),
+                Layout::new(DType::F32, 0, vec![4, 1], vec![2, 1], 64).unwrap(),
+                true,
+            ).unwrap();
+            let other_lane = TemplateTensor::from(Tensor::from_allocation(
+                cache.buffer(),
+                Layout::new(DType::F32, 1, vec![4, 1], vec![2, 1], 64).unwrap(),
+                true,
+            ).unwrap());
+            let lanes = TemplateTensor::from(lanes);
+            let lane_source = TemplateTensor::from(tensor(4, &[4, 1]));
+            let lane_sink = TemplateTensor::from(tensor(5, &[4, 1]));
             let source = TemplateTensor::from(tensor(2, &[1]));
             let sink = TemplateTensor::from(tensor(3, &[1]));
             let mut graph = GraphTemplate::new(space.clone(), GraphLimits::default());
+            graph.dispatch(Op::Copy, &[&lane_source], &lanes).unwrap();
+            graph.dispatch(Op::Copy, &[&other_lane], &lane_sink).unwrap();
             graph.dispatch(Op::Copy, &[&source], &cache_write).unwrap();
             graph.dispatch(Op::Copy, &[&cache_read], &sink).unwrap();
-            let hull = graph.required_barriers().to_vec();
+            let exact = graph.required_barriers().to_vec();
+            let hull = barriers_for_accesses([
+                vec![
+                    BufferAccess::hull(lane_source.buffer(), lane_source.byte_hull().unwrap().byte_span(), false),
+                    BufferAccess::hull(lanes.buffer(), lanes.byte_hull().unwrap().byte_span(), true),
+                ],
+                vec![
+                    BufferAccess::hull(other_lane.buffer(), other_lane.byte_hull().unwrap().byte_span(), false),
+                    BufferAccess::hull(lane_sink.buffer(), lane_sink.byte_hull().unwrap().byte_span(), true),
+                ],
+                vec![
+                    BufferAccess::hull(source.buffer(), source.byte_hull().unwrap().byte_span(), false),
+                    BufferAccess::hull(cache_write.buffer(), cache_write.byte_hull().unwrap().byte_span(), true),
+                ],
+                vec![
+                    BufferAccess::hull(cache_read.buffer(), cache_read.byte_hull().unwrap().byte_span(), false),
+                    BufferAccess::hull(sink.buffer(), sink.byte_hull().unwrap().byte_span(), true),
+                ],
+            ]);
+
+            for (exact_has_barrier, hull_has_barrier) in exact.iter().zip(&hull) {
+                prop_assert!(!exact_has_barrier || *hull_has_barrier);
+            }
 
             for value in 0..=hi {
                 let values = space.values(vec![value]).unwrap();
+                let lane_source = lane_source.instantiate(&values).unwrap();
+                let lanes = lanes.instantiate(&values).unwrap();
+                let other_lane = other_lane.instantiate(&values).unwrap();
+                let lane_sink = lane_sink.instantiate(&values).unwrap();
                 let source = source.instantiate(&values).unwrap();
                 let cache_write = cache_write.instantiate(&values).unwrap();
                 let cache_read = cache_read.instantiate(&values).unwrap();
                 let sink = sink.instantiate(&values).unwrap();
                 let mut concrete = CommandList::new();
+                concrete.dispatch(Op::Copy, &[&lane_source], &lanes).unwrap();
+                concrete.dispatch(Op::Copy, &[&other_lane], &lane_sink).unwrap();
                 concrete.dispatch(Op::Copy, &[&source], &cache_write).unwrap();
                 concrete.dispatch(Op::Copy, &[&cache_read], &sink).unwrap();
 
-                for (hull_has_barrier, concrete_has_barrier) in
-                    hull.iter().zip(required_barriers(&concrete))
-                {
-                    prop_assert!(*hull_has_barrier || !concrete_has_barrier);
+                let dispatches = concrete.into_dispatches();
+                let mut prior = Vec::new();
+                for (index, dispatch) in dispatches.iter().enumerate() {
+                    if exact[index] {
+                        prior.clear();
+                    }
+                    let current = crate::ops::dispatch_accesses(dispatch);
+                    for access in &current {
+                        for candidate in &prior {
+                            prop_assert!(!access.conflicts(candidate));
+                        }
+                    }
+                    prior.extend(current);
                 }
             }
         }

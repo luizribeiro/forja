@@ -484,8 +484,15 @@ pub fn required_barriers(commands: &CommandList) -> Vec<bool> {
 #[derive(Clone, Debug)]
 pub(crate) struct BufferAccess {
     pub(crate) buffer: BufferId,
-    pub(crate) bytes: Option<Range<u64>>,
+    region: AccessRegion,
     pub(crate) writes: bool,
+}
+
+#[derive(Clone, Debug)]
+enum AccessRegion {
+    Empty,
+    Exact(Layout),
+    Hull(Range<u64>),
 }
 
 pub(crate) fn dispatch_accesses(dispatch: &Dispatch) -> Vec<BufferAccess> {
@@ -521,25 +528,80 @@ pub(crate) fn barriers_for_accesses(
         .collect()
 }
 
+pub(crate) fn barriers_bounded_by(dispatches: &[Vec<BufferAccess>], upper: &[bool]) -> Vec<bool> {
+    let mut barriers = vec![false; dispatches.len()];
+    for (current_index, current) in dispatches.iter().enumerate() {
+        for (prior_index, prior) in dispatches[..current_index].iter().enumerate() {
+            if current
+                .iter()
+                .any(|access| prior.iter().any(|candidate| access.conflicts(candidate)))
+            {
+                let candidates = &upper[prior_index + 1..=current_index];
+                if let Some(offset) = candidates.iter().position(|&candidate| candidate) {
+                    barriers[prior_index + 1 + offset] = true;
+                } else {
+                    barriers[current_index] = true;
+                }
+            }
+        }
+    }
+    barriers
+}
+
 impl BufferAccess {
     pub(crate) fn new(tensor: &Tensor, writes: bool) -> Self {
-        let bytes = (tensor.layout().element_count() != 0).then(|| tensor.layout().byte_span());
+        let region = if tensor.layout().element_count() == 0 {
+            AccessRegion::Empty
+        } else {
+            AccessRegion::Exact(tensor.layout().clone())
+        };
         Self {
             buffer: tensor.buffer(),
-            bytes,
+            region,
             writes,
         }
     }
 
-    fn conflicts(&self, prior: &Self) -> bool {
+    pub(crate) fn hull(buffer: BufferId, bytes: Option<Range<u64>>, writes: bool) -> Self {
+        Self {
+            buffer,
+            region: bytes.map_or(AccessRegion::Empty, AccessRegion::Hull),
+            writes,
+        }
+    }
+
+    fn as_hull(&self) -> Self {
+        let bytes = match &self.region {
+            AccessRegion::Empty => None,
+            region => Some(region.byte_span()),
+        };
+        Self::hull(self.buffer, bytes, self.writes)
+    }
+
+    pub(crate) fn conflicts(&self, prior: &Self) -> bool {
         (self.writes || prior.writes)
             && self.buffer == prior.buffer
-            && self.bytes.as_ref().is_some_and(|current| {
-                prior
-                    .bytes
-                    .as_ref()
-                    .is_some_and(|other| current.start < other.end && other.start < current.end)
-            })
+            && match (&self.region, &prior.region) {
+                (AccessRegion::Exact(current), AccessRegion::Exact(other)) => {
+                    byte_ranges_overlap(current, other)
+                }
+                (AccessRegion::Empty, _) | (_, AccessRegion::Empty) => false,
+                (current, other) => {
+                    let current = current.byte_span();
+                    let other = other.byte_span();
+                    current.start < other.end && other.start < current.end
+                }
+            }
+    }
+}
+
+impl AccessRegion {
+    fn byte_span(&self) -> Range<u64> {
+        match self {
+            Self::Exact(layout) => layout.byte_span(),
+            Self::Hull(bytes) => bytes.clone(),
+            Self::Empty => 0..0,
+        }
     }
 }
 
@@ -840,6 +902,15 @@ mod tests {
         .unwrap()
     }
 
+    fn lane(buffer: u64, offset: u64) -> Tensor {
+        Tensor::from_allocation(
+            BufferId::new(1, buffer, 32),
+            Layout::new(DType::F32, offset, vec![4, 1], vec![2, 1], 32).unwrap(),
+            true,
+        )
+        .unwrap()
+    }
+
     #[test]
     fn independent_dispatches_need_no_barriers() {
         let mut commands = CommandList::new();
@@ -857,6 +928,33 @@ mod tests {
                 &slice(6, 0, 4),
             )
             .unwrap();
+
+        assert_eq!(required_barriers(&commands), [false, false]);
+    }
+
+    #[test]
+    fn bounded_barriers_fall_back_at_an_uncovered_dependency() {
+        let buffer = BufferId::new(1, 1, 16);
+        let accesses = [
+            vec![BufferAccess::hull(buffer, Some(0..16), true)],
+            vec![BufferAccess::hull(buffer, Some(0..16), false)],
+        ];
+
+        assert_eq!(
+            barriers_bounded_by(&accesses, &[false, false]),
+            [false, true]
+        );
+    }
+
+    #[test]
+    fn disjoint_strided_regions_need_no_barrier() {
+        let source = tensor(2, DType::F32, &[4, 1], &[1, 1]);
+        let sink = tensor(3, DType::F32, &[4, 1], &[1, 1]);
+        let mut commands = CommandList::new();
+        commands
+            .dispatch(Op::Copy, &[&source], &lane(1, 0))
+            .unwrap();
+        commands.dispatch(Op::Copy, &[&lane(1, 1)], &sink).unwrap();
 
         assert_eq!(required_barriers(&commands), [false, false]);
     }
