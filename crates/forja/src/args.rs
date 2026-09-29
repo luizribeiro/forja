@@ -13,7 +13,7 @@ pub(crate) enum Backend {
     Cpu,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub(crate) enum Precision {
     F32,
     Bf16,
@@ -50,17 +50,41 @@ pub(crate) struct Run {
     pub(crate) backend: Backend,
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Args, Debug, Eq, PartialEq)]
 pub(crate) struct Bench {
+    /// Directory containing model weights.
+    #[arg(long)]
     pub(crate) model_dir: PathBuf,
+    /// Number of prompt-processing tokens.
+    #[arg(long, default_value_t = 512, value_parser = parse_positive)]
     pub(crate) pp: usize,
+    /// Number of token-generation tokens.
+    #[arg(long, default_value_t = 128, value_parser = parse_positive)]
     pub(crate) tg: usize,
+    /// Number of measured repetitions.
+    #[arg(long, default_value_t = 30, value_parser = parse_positive)]
     pub(crate) reps: usize,
+    /// Path for the JSON report.
+    #[arg(long)]
     pub(crate) json: Option<PathBuf>,
+    /// Print a per-operation timing breakdown.
+    #[arg(long)]
     pub(crate) profile: bool,
+    /// Select tokens on the host instead of comparing selection modes.
+    #[arg(long)]
     pub(crate) host_argmax: bool,
+    /// Use an engine that records its graph lazily.
+    #[arg(long)]
     pub(crate) no_replay: bool,
+    /// Benchmark one precision instead of both.
+    #[arg(long, value_enum)]
     pub(crate) precision: Option<Precision>,
+    /// Set a Metal backend option.
+    #[arg(
+        long = "backend-option",
+        default_value = "graph-replay=tier2",
+        value_parser = parse_backend_option
+    )]
     pub(crate) graph_replay: GraphReplay,
 }
 
@@ -82,69 +106,20 @@ pub(crate) fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Comma
     }
 }
 
-fn parse_bench(mut arguments: impl Iterator<Item = String>) -> Result<Bench, String> {
-    let mut model_dir = None;
-    let mut pp = None;
-    let mut tg = None;
-    let mut reps = None;
-    let mut json = None;
-    let mut profile = false;
-    let mut host_argmax = false;
-    let mut no_replay = false;
-    let mut precision = None;
-    let mut graph_replay = None;
-    while let Some(option) = arguments.next() {
-        if option == "--profile" && !profile {
-            profile = true;
-            continue;
-        }
-        if option == "--no-replay" && !no_replay {
-            no_replay = true;
-            continue;
-        }
-        if option == "--host-argmax" && !host_argmax {
-            host_argmax = true;
-            continue;
-        }
-        let value = arguments
-            .next()
-            .ok_or_else(|| format!("{option} requires a value"))?;
-        match option.as_str() {
-            "--model-dir" if model_dir.is_none() => model_dir = Some(PathBuf::from(value)),
-            "--pp" if pp.is_none() => pp = Some(parse_count(&value, "prompt tokens")?),
-            "--tg" if tg.is_none() => tg = Some(parse_count(&value, "generated tokens")?),
-            "--reps" if reps.is_none() => reps = Some(parse_count(&value, "repetitions")?),
-            "--json" if json.is_none() => json = Some(PathBuf::from(value)),
-            "--precision" if precision.is_none() => precision = Some(parse_precision(&value)?),
-            "--backend-option" if graph_replay.is_none() => {
-                graph_replay = Some(parse_backend_option(&value)?);
-            }
-            _ if option.starts_with("--") => {
-                return Err(format!("unknown or repeated option {option:?}"));
-            }
-            _ => return Err(format!("unexpected argument {option:?}")),
-        }
-    }
-    Ok(Bench {
-        model_dir: model_dir.ok_or("--model-dir is required")?,
-        pp: pp.unwrap_or(512),
-        tg: tg.unwrap_or(128),
-        reps: reps.unwrap_or(30),
-        json,
-        profile,
-        host_argmax,
-        no_replay,
-        precision,
-        graph_replay: graph_replay.unwrap_or(GraphReplay::Tier2),
-    })
+fn parse_bench(arguments: impl Iterator<Item = String>) -> Result<Bench, String> {
+    let command = Bench::augment_args(clap::Command::new("bench"));
+    let matches = command
+        .try_get_matches_from(std::iter::once("bench".to_owned()).chain(arguments))
+        .map_err(|error| error.to_string())?;
+    Bench::from_arg_matches(&matches).map_err(|error| error.to_string())
 }
 
-fn parse_count(value: &str, name: &str) -> Result<usize, String> {
+fn parse_positive(value: &str) -> Result<usize, String> {
     value
         .parse()
         .ok()
         .filter(|&count| count > 0)
-        .ok_or_else(|| format!("{name} must be a positive integer"))
+        .ok_or_else(|| "value must be a positive integer".to_owned())
 }
 
 fn parse_run(mut arguments: impl Iterator<Item = String>) -> Result<Run, String> {
@@ -293,6 +268,48 @@ mod tests {
         assert!(
             parse(["bench", "--model-dir", "/model", "--reps", "0"].map(str::to_owned)).is_err()
         );
+    }
+
+    #[test]
+    fn parses_benchmark_defaults() {
+        let command = parse(["bench", "--model-dir", "/model"].map(str::to_owned)).unwrap();
+        let Command::Bench(options) = command else {
+            panic!("expected bench command");
+        };
+        assert_eq!(options.pp, 512);
+        assert_eq!(options.tg, 128);
+        assert_eq!(options.reps, 30);
+        assert_eq!(options.graph_replay, GraphReplay::Tier2);
+    }
+
+    #[test]
+    fn rejects_invalid_benchmark_options() {
+        for arguments in [
+            vec!["bench"],
+            vec!["bench", "--model-dir", "/model", "--pp", "many"],
+            vec!["bench", "--model-dir", "/model", "--tg", "0"],
+            vec!["bench", "--model-dir", "/model", "--precision", "int8"],
+            vec![
+                "bench",
+                "--model-dir",
+                "/model",
+                "--backend-option",
+                "graph-replay=tier3",
+            ],
+            vec![
+                "bench",
+                "--model-dir",
+                "/model",
+                "--json",
+                "/one",
+                "--json",
+                "/two",
+            ],
+            vec!["bench", "--model-dir", "/model", "--profile", "--profile"],
+            vec!["bench", "--model-dir", "/model", "--wat", "value"],
+        ] {
+            assert!(parse(arguments.into_iter().map(str::to_owned)).is_err());
+        }
     }
 
     #[test]
