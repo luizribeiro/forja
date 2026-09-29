@@ -76,13 +76,16 @@ pub(crate) async fn run(options: &Verify) -> Result<(), Box<dyn Error>> {
 async fn run_with_steps(options: &Verify, decode_steps: usize) -> Result<(), Box<dyn Error>> {
     let fixtures = FixtureDirectory::open(&options.fixtures)?;
     let weights = verify_model_hash(options, &fixtures)?;
-    let component = match options.precision {
-        Precision::F32 => test_guests::qwen3(),
-        Precision::Bf16 => test_guests::qwen3_bf16(),
-    };
-    run_with_component(options, &fixtures, &weights, component, decode_steps, true)
-        .await
-        .map(|_| ())
+    run_with_component(
+        options,
+        &fixtures,
+        &weights,
+        &options.engine,
+        decode_steps,
+        true,
+    )
+    .await
+    .map(|_| ())
 }
 async fn run_with_component(
     options: &Verify,
@@ -624,6 +627,7 @@ mod tests {
             ),
         )?;
         let options = Verify {
+            engine: PathBuf::from("unused.wasm"),
             model_dir: model,
             fixtures: fixtures_path.clone(),
             backend: BackendArg::Cpu,
@@ -660,6 +664,11 @@ mod tests {
     ) -> Result<Verify, Box<dyn Error>> {
         let root = PathBuf::from(env::var_os("FORJA_MODELS").ok_or("FORJA_MODELS is not set")?);
         Ok(Verify {
+            engine: match precision {
+                Precision::F32 => test_guests::qwen3(),
+                Precision::Bf16 => test_guests::qwen3_bf16(),
+            }
+            .to_owned(),
             model_dir: root.join("Qwen3-0.6B"),
             fixtures: root.join("golden/qwen3-0.6b"),
             backend,

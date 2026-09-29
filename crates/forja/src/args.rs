@@ -22,6 +22,7 @@ pub(crate) enum GraphReplay {
 
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct Verify {
+    pub(crate) engine: PathBuf,
     pub(crate) model_dir: PathBuf,
     pub(crate) fixtures: PathBuf,
     pub(crate) backend: Backend,
@@ -31,6 +32,9 @@ pub(crate) struct Verify {
 
 #[derive(Args)]
 struct VerifyArgs {
+    /// WebAssembly engine component.
+    #[arg(long)]
+    engine: PathBuf,
     /// Directory containing model weights.
     #[arg(long)]
     model_dir: PathBuf,
@@ -165,6 +169,7 @@ fn parse_prompt_name(value: &str) -> Result<String, String> {
 impl From<VerifyArgs> for Verify {
     fn from(options: VerifyArgs) -> Self {
         Self {
+            engine: options.engine,
             model_dir: options.model_dir,
             fixtures: options.fixtures,
             backend: options.backend.last().copied().unwrap_or(Backend::Metal),
@@ -410,6 +415,8 @@ mod tests {
         let command = parse(
             [
                 "verify",
+                "--engine",
+                "/engine.wasm",
                 "--model-dir",
                 "/model",
                 "--fixtures",
@@ -427,6 +434,7 @@ mod tests {
         assert_eq!(
             command,
             Command::Verify(Verify {
+                engine: PathBuf::from("/engine.wasm"),
                 model_dir: PathBuf::from("/model"),
                 fixtures: PathBuf::from("/fixtures"),
                 backend: Backend::Cpu,
@@ -441,6 +449,8 @@ mod tests {
         let command = parse(
             [
                 "verify",
+                "--engine",
+                "/engine.wasm",
                 "--model-dir",
                 "/model",
                 "--fixtures",
@@ -464,6 +474,7 @@ mod tests {
         assert_eq!(
             command,
             Command::Verify(Verify {
+                engine: PathBuf::from("/engine.wasm"),
                 model_dir: PathBuf::from("/model"),
                 fixtures: PathBuf::from("/fixtures"),
                 backend: Backend::Metal,
@@ -476,7 +487,16 @@ mod tests {
     #[test]
     fn parses_verify_defaults() {
         let command = parse(
-            ["verify", "--model-dir", "/model", "--fixtures", "/fixtures"].map(str::to_owned),
+            [
+                "verify",
+                "--engine",
+                "/engine.wasm",
+                "--model-dir",
+                "/model",
+                "--fixtures",
+                "/fixtures",
+            ]
+            .map(str::to_owned),
         )
         .unwrap();
         let Command::Verify(options) = command else {
@@ -508,6 +528,8 @@ mod tests {
             parse(
                 [
                     "verify",
+                    "--engine",
+                    "/engine.wasm",
                     "--model-dir",
                     "/model",
                     "--fixtures",
@@ -526,6 +548,8 @@ mod tests {
         for arguments in [
             vec![
                 "verify",
+                "--engine",
+                "/engine.wasm",
                 "--model-dir",
                 "/model",
                 "--fixtures",
@@ -535,6 +559,8 @@ mod tests {
             ],
             vec![
                 "verify",
+                "--engine",
+                "/engine.wasm",
                 "--model-dir",
                 "/model",
                 "--fixtures",
@@ -544,6 +570,8 @@ mod tests {
             ],
             vec![
                 "verify",
+                "--engine",
+                "/engine.wasm",
                 "--model-dir",
                 "/model",
                 "--model-dir",
