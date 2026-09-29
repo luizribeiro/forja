@@ -72,6 +72,9 @@ pub(crate) enum Op {
     RmsNorm(f32),
     Softmax,
     Argmax,
+    Sample {
+        position: Affine,
+    },
     Rope(f32),
     Embed,
     Matmul,
@@ -353,6 +356,9 @@ pub(crate) mod guest {
             Op::RmsNorm(eps) => compute::Op::RmsNorm(eps),
             Op::Softmax => compute::Op::Softmax,
             Op::Argmax => compute::Op::Argmax,
+            Op::Sample { position } => compute::Op::Sample(compute::SampleCfg {
+                position: wit_affine(position),
+            }),
             Op::Rope(theta) => compute::Op::Rope(compute::RopeCfg { theta }),
             Op::Embed => compute::Op::Embed,
             Op::Matmul => compute::Op::Matmul,
@@ -853,6 +859,9 @@ pub(crate) mod native {
             Op::RmsNorm(eps) => CoreOp::RmsNorm { eps },
             Op::Softmax => CoreOp::Softmax,
             Op::Argmax => CoreOp::Argmax,
+            Op::Sample { position } => CoreOp::Sample {
+                position: position.offset,
+            },
             Op::Rope(theta) => CoreOp::Rope { theta },
             Op::Embed => CoreOp::Embed,
             Op::Matmul => CoreOp::Matmul,

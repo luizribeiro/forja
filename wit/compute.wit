@@ -49,6 +49,10 @@ interface compute {
     q-start: affine,
   }
 
+  record sample-cfg {
+    position: affine,
+  }
+
   enum program-kind {
     %map,
     row,
@@ -129,6 +133,7 @@ interface compute {
     rms-norm(f32),
     softmax,
     argmax,
+    sample(sample-cfg),
     rope(rope-cfg),
     embed,
     matmul,

@@ -340,6 +340,33 @@ impl<T: Element> Tensor<T> {
         self.unary(sys::Op::Argmax, shape)
     }
 
+    /// Samples an index along the last dimension from a five-word parameter tensor.
+    ///
+    /// The words encode temperature bits, top-k, top-p bits, and the low and high seed halves.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an empty or scalar shape, invalid parameters, unsupported types, or a
+    /// refused dispatch.
+    pub fn sample(
+        &self,
+        params: &Tensor<u32>,
+        position: impl Into<crate::Dim>,
+    ) -> Result<Tensor<u32>> {
+        let mut shape = self.shape.clone();
+        shape
+            .pop()
+            .ok_or_else(|| Error::new("sampling requires at least one dimension"))?;
+        let output = Tensor::<u32>::empty(shape)?;
+        let position = graph::affine(&position.into())?;
+        graph::record(
+            sys::Op::Sample { position },
+            &[&self.handle, &params.handle],
+            &output.handle,
+        )?;
+        Ok(output)
+    }
+
     /// Copies the tensor while converting between floating-point types.
     ///
     /// # Errors

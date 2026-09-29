@@ -30,3 +30,17 @@ fn refusals_and_execution_failures_surface_as_results() {
     let output = table.embedding(&invalid_ids).unwrap();
     assert!(output.to_vec().is_err());
 }
+
+#[test]
+fn sampling_accepts_live_parameters_and_rejects_invalid_values() {
+    let logits = forja_sdk::Tensor::from_slice(&[1.0_f32, 3.0, 3.0, 2.0], &[1, 4]).unwrap();
+    let greedy =
+        forja_sdk::Tensor::from_slice(&[0.0_f32.to_bits(), 0, 1.0_f32.to_bits(), 7, 0], &[5])
+            .unwrap();
+    assert_eq!(logits.sample(&greedy, 9).unwrap().to_vec().unwrap(), [2]);
+
+    let invalid =
+        forja_sdk::Tensor::from_slice(&[f32::NAN.to_bits(), 0, 1.0_f32.to_bits(), 7, 0], &[5])
+            .unwrap();
+    assert!(logits.sample(&invalid, 9).unwrap().to_vec().is_err());
+}

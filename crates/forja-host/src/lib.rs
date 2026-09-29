@@ -3051,6 +3051,13 @@ fn core_op(operation: compute::Op) -> (TemplateOp, Option<Op>) {
         compute::Op::RmsNorm(eps) => concrete_template(Op::RmsNorm { eps }),
         compute::Op::Softmax => concrete_template(Op::Softmax),
         compute::Op::Argmax => concrete_template(Op::Argmax),
+        compute::Op::Sample(config) => {
+            let position = core_affine(config.position);
+            let concrete = position.is_constant().then_some(Op::Sample {
+                position: config.position.offset,
+            });
+            (TemplateOp::sample(position), concrete)
+        }
         compute::Op::Rope(config) => concrete_template(Op::Rope {
             theta: config.theta,
         }),
