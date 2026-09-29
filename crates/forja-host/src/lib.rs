@@ -2363,6 +2363,8 @@ const DEFAULT_REPLAY_DEPTH: usize = 2;
 #[derive(Debug, Default)]
 struct ReplayState {
     status: Mutex<ReplayStatus>,
+    #[cfg(test)]
+    drop_barrier: Mutex<Option<Arc<std::sync::Barrier>>>,
 }
 
 #[derive(Debug, Default)]
@@ -2402,6 +2404,14 @@ impl ReplayFlight {
 
 impl Drop for ReplayFlight {
     fn drop(&mut self) {
+        #[cfg(test)]
+        if let Ok(mut hook) = self.0.drop_barrier.lock()
+            && let Some(barrier) = hook.take()
+        {
+            drop(hook);
+            barrier.wait();
+            barrier.wait();
+        }
         if let Ok(mut status) = self.0.status.lock() {
             status.in_flight = status.in_flight.saturating_sub(1);
         }
@@ -2530,6 +2540,7 @@ where
                         Some(flight) => flight.finish(result),
                         None => result,
                     };
+                    drop(flight);
                     if let Some(started) = started {
                         let _ = started.send(result.as_ref().map(|_| ()).map_err(|error| *error));
                     }
@@ -2565,6 +2576,7 @@ where
                 None => result,
             };
             let result = taint.finish(result, true);
+            drop(flight);
             if let Ok(gpu_time) = result {
                 if let Some(gpu_time) = gpu_time {
                     saturating_increment(&timed_submissions);
@@ -2573,7 +2585,6 @@ where
                 saturating_increment(&completed_submissions);
                 submission_notify.notify_waiters();
             }
-            drop(flight);
             result
         })
     }
@@ -3345,7 +3356,7 @@ mod tests {
     use std::{
         fs,
         sync::{
-            Arc, Condvar, Mutex,
+            Arc, Barrier, Condvar, Mutex,
             atomic::{AtomicU64, AtomicUsize, Ordering},
         },
     };
@@ -3581,6 +3592,54 @@ mod tests {
             .run()
             .await
             .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn completion_releases_replay_depth_before_waking_waiters() {
+        let gate = Arc::new(SubmitGate::default());
+        let backend = AccountingBackend::new(Some(Arc::clone(&gate)), None, Duration::ZERO);
+        let mut runner = super::EngineRunner::new(
+            test_guests::engine_smoke(),
+            backend,
+            GENEROUS,
+            "unused.safetensors",
+        )
+        .await
+        .unwrap();
+        let graph = empty_graph(runner.store.data_mut());
+        let replay = Arc::clone(&runner.store.data().table.get(&graph).unwrap().replay);
+        let barrier = Arc::new(Barrier::new(2));
+        *replay.drop_barrier.lock().unwrap() = Some(Arc::clone(&barrier));
+
+        let first = runner
+            .store
+            .data()
+            .prepare_replay(&graph, Vec::new())
+            .unwrap();
+        let second = runner
+            .store
+            .data()
+            .prepare_replay(&graph, Vec::new())
+            .unwrap();
+        let first_task = tokio::spawn(first.run());
+        gate.wait_for(1);
+        let completed = Arc::clone(&runner.store.data().completed_submissions);
+
+        gate.release();
+        barrier.wait();
+        let published_before_release = completed.load(Ordering::Acquire);
+        barrier.wait();
+
+        assert_eq!(published_before_release, 0);
+        runner.wait_for_submissions(1).await.unwrap();
+        let third = runner
+            .store
+            .data()
+            .prepare_replay(&graph, Vec::new())
+            .unwrap();
+        first_task.await.unwrap().unwrap();
+        drop(third);
+        drop(second);
     }
 
     #[tokio::test(flavor = "multi_thread")]
