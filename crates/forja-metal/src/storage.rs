@@ -17,8 +17,8 @@ use crate::encoding::{
 };
 use block2::RcBlock;
 use forja_core::{
-    AllocationRegistry, Backend, BackendError, BufferId, CommandList, DType, Layout, MappedRegion,
-    Tensor, ViewOp,
+    AllocationRegistry, Backend, BackendError, BufferId, CommandList, DType, GraphTemplate, Layout,
+    MappedRegion, PreparedGraph, Tensor, ViewOp,
     program::{KernelSignature, ProgramHash, ValidatedProgram},
 };
 use objc2::{rc::Retained, runtime::ProtocolObject};
@@ -607,6 +607,27 @@ impl Backend for MetalBackend {
 
     fn submit_profiled(&self, commands: CommandList) -> Result<Self::Submission, BackendError> {
         self.submit_commands_profiled(commands)
+    }
+
+    fn prepare_graph(&self, graph: GraphTemplate) -> Result<PreparedGraph, BackendError> {
+        let state = self.prepare_metal_graph(&graph)?;
+        Ok(PreparedGraph::with_backend_state(graph, state))
+    }
+
+    fn replay(
+        &self,
+        graph: &PreparedGraph,
+        values: Vec<u32>,
+    ) -> Result<Self::Submission, BackendError> {
+        self.replay_graph(graph, values, false)
+    }
+
+    fn replay_profiled(
+        &self,
+        graph: &PreparedGraph,
+        values: Vec<u32>,
+    ) -> Result<Self::Submission, BackendError> {
+        self.replay_graph(graph, values, true)
     }
 }
 

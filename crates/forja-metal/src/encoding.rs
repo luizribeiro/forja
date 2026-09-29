@@ -13,8 +13,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use block2::RcBlock;
 use forja_core::{
-    BackendError, BufferId, CommandList, DType, Dispatch, DispatchProfile, Layout, Op,
-    ProfileCount, Slice, Submission, SubmissionProfile, Tensor,
+    BackendError, BufferId, CommandList, DType, Dispatch, DispatchProfile, GraphTemplate, Layout,
+    Op, PreparedGraph, ProfileCount, Slice, Submission, SubmissionProfile, Tensor,
     program::{KernelSignature, PreparedProgram, ProgramHash, ProgramKind, ValidatedProgram},
     required_barriers,
 };
@@ -597,7 +597,7 @@ unsafe impl Send for InFlightEvent {}
 unsafe impl Sync for InFlightEvent {}
 
 pub(super) struct InFlightResidency {
-    pub(super) _raw: Retained<ProtocolObject<dyn MTLResidencySet>>,
+    pub(super) _raw: Vec<Retained<ProtocolObject<dyn MTLResidencySet>>>,
 }
 
 // SAFETY: The residency set is committed before submission and remains immutable while shared
@@ -709,6 +709,18 @@ struct CommandResources {
     buffers: Vec<InFlightBuffer>,
     error_flags: Vec<(usize, usize)>,
 }
+
+pub(super) struct PreparedMetalGraph {
+    residency: Retained<ProtocolObject<dyn MTLResidencySet>>,
+    buffers: HashSet<BufferId>,
+}
+
+// SAFETY: The committed residency set remains immutable, and its allocations are retained by the
+// host graph for at least as long as this state.
+unsafe impl Send for PreparedMetalGraph {}
+
+// SAFETY: Shared access only submits the immutable committed residency set to command buffers.
+unsafe impl Sync for PreparedMetalGraph {}
 
 pub(super) struct Completion {
     state: Mutex<CompletionState>,
@@ -1282,20 +1294,72 @@ impl MetalBackend {
         &self,
         commands: CommandList,
     ) -> Result<MetalSubmission, BackendError> {
-        self.submit_commands_inner::<false>(commands)
+        self.submit_commands_inner::<false>(commands, None)
     }
 
     pub(super) fn submit_commands_profiled(
         &self,
         commands: CommandList,
     ) -> Result<MetalSubmission, BackendError> {
-        self.submit_commands_inner::<true>(commands)
+        self.submit_commands_inner::<true>(commands, None)
+    }
+
+    pub(super) fn prepare_metal_graph(
+        &self,
+        graph: &GraphTemplate,
+    ) -> Result<PreparedMetalGraph, BackendError> {
+        let residency = self
+            .device
+            .newResidencySetWithDescriptor_error(&MTLResidencySetDescriptor::new())
+            .map_err(|_| BackendError::ExecutionFailed)?;
+        let tensors = graph.retained_tensors();
+        let buffers = self
+            .buffers
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?;
+        let mut retained = HashSet::with_capacity(tensors.len());
+        for tensor in &tensors {
+            if retained.insert(tensor.buffer()) {
+                let buffer: &ProtocolObject<dyn MTLBuffer> = &buffers.get(tensor)?.raw;
+                let allocation: &ProtocolObject<dyn MTLAllocation> = buffer.as_ref();
+                residency.addAllocation(allocation);
+            }
+        }
+        residency.commit();
+        Ok(PreparedMetalGraph {
+            residency,
+            buffers: retained,
+        })
+    }
+
+    pub(super) fn replay_graph(
+        &self,
+        graph: &PreparedGraph,
+        values: Vec<u32>,
+        profile: bool,
+    ) -> Result<MetalSubmission, BackendError> {
+        let state = graph
+            .backend_state::<PreparedMetalGraph>()
+            .ok_or(BackendError::InvalidInput)?;
+        let values = graph
+            .values(values)
+            .map_err(|_| BackendError::InvalidInput)?;
+        let commands = graph
+            .template()
+            .instantiate(&values)
+            .map_err(|_| BackendError::InvalidInput)?;
+        if profile {
+            self.submit_commands_inner::<true>(commands, Some(state))
+        } else {
+            self.submit_commands_inner::<false>(commands, Some(state))
+        }
     }
 
     #[allow(clippy::too_many_lines)]
     fn submit_commands_inner<const PROFILE: bool>(
         &self,
         commands: CommandList,
+        graph: Option<&PreparedMetalGraph>,
     ) -> Result<MetalSubmission, BackendError> {
         #[cfg(test)]
         let submit_started = Instant::now();
@@ -1373,10 +1437,14 @@ impl MetalBackend {
             let encoding = encoding_started.map_or(Duration::ZERO, |started| started.elapsed());
             profile.encoding = encoding.saturating_sub(profile.metadata_buffers.time);
         }
-        let resources = self.command_resources(&tensors, encoded)?;
+        let resources =
+            self.command_resources(&tensors, encoded, graph.map(|prepared| &prepared.buffers))?;
         objects.programs = prepared_programs;
         let residency_started = PROFILE.then(Instant::now);
         let residency = self.make_resident(&command_buffer, &resources)?;
+        if let Some(graph) = graph {
+            command_buffer.useResidencySet(&graph.residency);
+        }
         if let Some(profile) = &mut profile {
             profile.residency =
                 residency_started.map_or(Duration::ZERO, |started| started.elapsed());
@@ -1393,7 +1461,10 @@ impl MetalBackend {
             &command_buffer,
             &tensors,
             resources,
-            residency,
+            graph.map_or_else(
+                || vec![residency.clone()],
+                |graph| vec![residency.clone(), graph.residency.clone()],
+            ),
             timestamps,
             &mut objects,
         )?;
@@ -3177,6 +3248,7 @@ impl MetalBackend {
         &self,
         tensors: &[Tensor],
         encoded: EncodedDispatches,
+        graph_buffers: Option<&HashSet<BufferId>>,
     ) -> Result<CommandResources, BackendError> {
         let EncodedDispatches {
             temporaries,
@@ -3203,7 +3275,11 @@ impl MetalBackend {
                 .map_err(|_| BackendError::ExecutionFailed)?;
             for tensor in tensors {
                 let buffer = buffers.get(tensor)?;
-                add(buffer.raw.clone(), buffer.pool_resident);
+                add(
+                    buffer.raw.clone(),
+                    buffer.pool_resident
+                        || graph_buffers.is_some_and(|buffers| buffers.contains(&tensor.buffer())),
+                );
             }
         }
         for temporary in temporaries {
@@ -3305,7 +3381,7 @@ impl MetalBackend {
         command_buffer: &Retained<ProtocolObject<dyn MTL4CommandBuffer>>,
         tensors: &[Tensor],
         resources: CommandResources,
-        residency: Retained<ProtocolObject<dyn MTLResidencySet>>,
+        residencies: Vec<Retained<ProtocolObject<dyn MTLResidencySet>>>,
         timestamps: GpuTimestamps,
         objects: &mut SubmissionObjects,
     ) -> Result<MetalSubmission, BackendError> {
@@ -3315,7 +3391,7 @@ impl MetalBackend {
                 raw: self.shared_event.clone(),
             },
             resources,
-            InFlightResidency { _raw: residency },
+            InFlightResidency { _raw: residencies },
             timestamps,
         )?;
         let registration = self
@@ -3840,7 +3916,7 @@ mod tests {
     };
 
     use forja_core::{
-        Backend, CommandList, DType, Op, Slice, Submission, ViewOp,
+        Backend, CommandList, DType, GraphLimits, Op, ParamSpace, Slice, Submission, ViewOp,
         program::{
             BinOp, BoundProgram, Inst, KernelSignature, Program, ProgramKind, RedOp,
             ValidatedProgram, bind_program, prepare_program,
@@ -4379,7 +4455,7 @@ mod tests {
             program_compile_fallbacks: 0,
         };
         assert!(matches!(
-            backend.command_resources(&[], unowned),
+            backend.command_resources(&[], unowned, None),
             Err(BackendError::ExecutionFailed)
         ));
 
@@ -4402,7 +4478,7 @@ mod tests {
             program_compile_fallbacks: 0,
         };
         assert!(matches!(
-            backend.command_resources(&[], unwritten),
+            backend.command_resources(&[], unwritten, None),
             Err(BackendError::ExecutionFailed)
         ));
     }
@@ -4535,6 +4611,25 @@ mod tests {
         assert!(profile.gpu_time > Duration::ZERO);
         assert!(profile.per_dispatch[0].gpu_time > Duration::ZERO);
         assert_eq!(profile.metadata_buffers.count, 1);
+    }
+
+    #[test]
+    fn prepared_graph_owns_one_persistent_residency_set() {
+        let backend = MetalBackend::new().unwrap();
+        let left = backend.alloc(DType::F32, &[7, 33]).unwrap();
+        let right = backend.alloc(DType::F32, &[7, 33]).unwrap();
+        let output = backend.alloc(DType::F32, &[7, 33]).unwrap();
+        let mut graph =
+            GraphTemplate::new(ParamSpace::new(Vec::new()).unwrap(), GraphLimits::default());
+        graph
+            .dispatch(Op::Add, &[&left.into(), &right.into()], &output.into())
+            .unwrap();
+
+        let graph = backend.prepare_graph(graph).unwrap();
+        let state = graph.backend_state::<PreparedMetalGraph>().unwrap();
+        assert_eq!(state.residency.allocationCount(), 3);
+        backend.replay(&graph, Vec::new()).unwrap().wait().unwrap();
+        backend.replay(&graph, Vec::new()).unwrap().wait().unwrap();
     }
 
     #[test]
@@ -4732,6 +4827,7 @@ mod tests {
                     program_encoding: ProfileCount::default(),
                     program_compile_fallbacks: 0,
                 },
+                None,
             )
             .unwrap();
         let residency = backend.make_resident(&command_buffer, &resources).unwrap();
@@ -4747,7 +4843,7 @@ mod tests {
                 &command_buffer,
                 &tensors,
                 resources,
-                residency,
+                vec![residency],
                 timestamps,
                 &mut objects,
             )
