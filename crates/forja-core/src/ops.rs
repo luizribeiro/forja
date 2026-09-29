@@ -146,6 +146,9 @@ pub enum Op {
     /// Selects the last greatest element of each row under IEEE total order.
     Argmax,
     /// Samples one index from each row using counter-based randomness.
+    ///
+    /// A seed reproduces tokens for the same forja build, backend, and kernel variant. Tokens are
+    /// not guaranteed to match across builds, backends, or variants.
     Sample {
         /// Absolute sequence position mixed into the random counter.
         position: u32,

@@ -343,6 +343,8 @@ impl<T: Element> Tensor<T> {
     /// Samples an index along the last dimension from a five-word parameter tensor.
     ///
     /// The words encode temperature bits, top-k, top-p bits, and the low and high seed halves.
+    /// A seed reproduces tokens for the same forja build, backend, and kernel variant, but not
+    /// necessarily across builds, backends, or variants.
     ///
     /// # Errors
     ///
