@@ -255,6 +255,11 @@ uint total_order_key(float value) {
     return (bits & 0x80000000u) != 0u ? ~bits : bits ^ 0x80000000u;
 }
 
+float total_order_value(uint key) {
+    uint bits = (key & 0x80000000u) != 0u ? key ^ 0x80000000u : ~key;
+    return as_type<float>(bits);
+}
+
 ulong argmax_candidate(float value, uint index) {
     return (ulong(total_order_key(value)) << 32) | ulong(index);
 }
@@ -286,6 +291,42 @@ ulong argmax_threadgroup_max(
     maximum_index = simd_max(
         partial_keys[simd_lane] == maximum_key ? partial_indices[simd_lane] : 0);
     return (ulong(maximum_key) << 32) | ulong(maximum_index);
+}
+
+ulong simd_candidate_max(ulong candidate) {
+    uint key = uint(candidate >> 32);
+    uint index = uint(candidate);
+    uint maximum_key = simd_max(key);
+    uint maximum_index = simd_max(key == maximum_key ? index : 0);
+    return (ulong(maximum_key) << 32) | ulong(maximum_index);
+}
+
+void order_candidates_descending(thread ulong &left, thread ulong &right) {
+    ulong high = max(left, right);
+    right = min(left, right);
+    left = high;
+}
+
+void sort_eight_candidates_descending(thread ulong (&candidates)[8]) {
+    order_candidates_descending(candidates[0], candidates[1]);
+    order_candidates_descending(candidates[2], candidates[3]);
+    order_candidates_descending(candidates[4], candidates[5]);
+    order_candidates_descending(candidates[6], candidates[7]);
+    order_candidates_descending(candidates[0], candidates[2]);
+    order_candidates_descending(candidates[1], candidates[3]);
+    order_candidates_descending(candidates[4], candidates[6]);
+    order_candidates_descending(candidates[5], candidates[7]);
+    order_candidates_descending(candidates[1], candidates[2]);
+    order_candidates_descending(candidates[5], candidates[6]);
+    order_candidates_descending(candidates[0], candidates[4]);
+    order_candidates_descending(candidates[3], candidates[7]);
+    order_candidates_descending(candidates[1], candidates[5]);
+    order_candidates_descending(candidates[2], candidates[6]);
+    order_candidates_descending(candidates[1], candidates[4]);
+    order_candidates_descending(candidates[3], candidates[6]);
+    order_candidates_descending(candidates[2], candidates[4]);
+    order_candidates_descending(candidates[3], candidates[5]);
+    order_candidates_descending(candidates[3], candidates[4]);
 }
 
 kernel void argmax_partials(
@@ -416,9 +457,11 @@ constant uint sample_status = 4;
 constant uint sample_proposal = 5;
 constant uint sample_maximum = 6;
 constant uint sample_state_words = 7;
+constant uint sample_fast_topk = 20;
 constant uint sample_pending = 0;
 constant uint sample_accepted = 1;
 constant uint sample_exact = 2;
+constant uint sample_refine = 3;
 
 bool sample_uses_exact(device atomic_uint *state, uint row) {
     return atomic_load_explicit(
@@ -698,8 +741,11 @@ kernel void sample_rejection_threshold_finalize(
                 logits, physical_index(logits_layout, row * width + maximum), input0_dtype);
             float candidate_weight = exp(
                 (candidate_value - maximum_value) / config.temperature);
-            float lower = prefix + candidate_weight;
-            float upper = prefix + float(cap - rank + 1) * candidate_weight;
+            float selected = prefix + candidate_weight;
+            float tail = max(total - selected, 0.0f);
+            float remaining = float(cap - rank);
+            float lower = selected + remaining * tail / float(width - rank);
+            float upper = selected + min(tail, remaining * candidate_weight);
             if (prefix < config.top_p * lower) {
                 allowed = true;
             } else if (prefix >= config.top_p * upper) {
@@ -715,9 +761,195 @@ kernel void sample_rejection_threshold_finalize(
             state + row * sample_state_words + sample_status,
             sample_accepted, memory_order_relaxed);
     } else if (!decided || round + 1 >= max_rounds) {
+        uint status = config.top_k != 0 && config.top_k <= sample_fast_topk && chunks <= 102
+            ? sample_refine
+            : sample_exact;
         atomic_store_explicit(
             state + row * sample_state_words + sample_status,
-            sample_exact, memory_order_relaxed);
+            status, memory_order_relaxed);
+    }
+}
+
+kernel void sample_topk_partials(
+    device const uchar *logits [[buffer(0)]],
+    device ulong *partials [[buffer(1)]],
+    device atomic_uint *state [[buffer(2)]],
+    constant TensorLayout &logits_layout [[buffer(3)]],
+    constant uint &width [[buffer(4)]],
+    constant uint &chunks [[buffer(5)]],
+    uint group [[threadgroup_position_in_grid]],
+    uint lane [[thread_position_in_threadgroup]],
+    uint group_width [[threads_per_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+    uint row = group / chunks;
+    if (atomic_load_explicit(
+            state + row * sample_state_words + sample_status,
+            memory_order_relaxed) != sample_refine) {
+        return;
+    }
+    threadgroup ulong simd_top[160];
+    uint chunk = group % chunks;
+    uint first = chunk * 2048u;
+    uint end = first + min(2048u, width - first);
+    ulong local_top[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    for (uint column = first + lane; column < end; column += group_width) {
+        float value = load_float(
+            logits, physical_index(logits_layout, row * width + column), input0_dtype);
+        local_top[(column - first) / group_width] = argmax_candidate(value, column);
+    }
+    sort_eight_candidates_descending(local_top);
+    uint local_cursor = 0;
+    for (uint rank = 0; rank < sample_fast_topk; ++rank) {
+        ulong best = local_cursor < 8 ? local_top[local_cursor] : 0;
+        ulong chosen = simd_candidate_max(best);
+        if (simd_lane == 0) {
+            simd_top[simd_group * sample_fast_topk + rank] = chosen;
+        }
+        if (best == chosen && local_cursor < 8) {
+            ++local_cursor;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_group == 0) {
+        ulong merged[8];
+        for (uint slot = 0; slot < 8; ++slot) {
+            merged[slot] = simd_top[simd_lane + slot * 32];
+        }
+        sort_eight_candidates_descending(merged);
+        uint merged_cursor = 0;
+        for (uint rank = 0; rank < sample_fast_topk; ++rank) {
+            ulong best = merged_cursor < 8 ? merged[merged_cursor] : 0;
+            ulong chosen = simd_candidate_max(best);
+            if (simd_lane == 0) {
+                partials[(row * chunks + chunk) * sample_fast_topk + rank] = chosen;
+            }
+            if (best == chosen && merged_cursor < 8) {
+                ++merged_cursor;
+            }
+        }
+    }
+}
+
+kernel void sample_topk_finalize(
+    device const uint *sampling [[buffer(0)]],
+    device const ulong *partials [[buffer(1)]],
+    device atomic_uint *state [[buffer(2)]],
+    device uint *output [[buffer(3)]],
+    constant TensorLayout &sampling_layout [[buffer(4)]],
+    constant TensorLayout &output_layout [[buffer(5)]],
+    constant uint &width [[buffer(6)]],
+    constant uint &position [[buffer(7)]],
+    constant uint &max_rounds [[buffer(8)]],
+    device atomic_uint *error_flag [[buffer(9)]],
+    constant uint &chunks [[buffer(10)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint lane [[thread_position_in_threadgroup]],
+    uint group_width [[threads_per_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+    if (atomic_load_explicit(
+            state + row * sample_state_words + sample_status,
+            memory_order_relaxed) != sample_refine) {
+        return;
+    }
+    threadgroup ulong simd_top[160];
+    threadgroup ulong ordered[20];
+    threadgroup float weights[20];
+    threadgroup uint keep;
+    SamplingConfig config = sampling_config(sampling, sampling_layout);
+    ulong local_top[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    uint partial_count = chunks * sample_fast_topk;
+    uint local_slot = 0;
+    for (uint slot = lane; slot < partial_count; slot += group_width) {
+        local_top[local_slot++] = partials[row * partial_count + slot];
+    }
+    sort_eight_candidates_descending(local_top);
+    uint local_cursor = 0;
+    for (uint rank = 0; rank < sample_fast_topk; ++rank) {
+        ulong best = local_cursor < 8 ? local_top[local_cursor] : 0;
+        ulong chosen = simd_candidate_max(best);
+        if (simd_lane == 0) {
+            simd_top[simd_group * sample_fast_topk + rank] = chosen;
+        }
+        if (best == chosen && local_cursor < 8) {
+            ++local_cursor;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_group == 0) {
+        ulong merged[8];
+        for (uint slot = 0; slot < 8; ++slot) {
+            merged[slot] = simd_top[simd_lane + slot * 32];
+        }
+        sort_eight_candidates_descending(merged);
+        uint merged_cursor = 0;
+        for (uint rank = 0; rank < sample_fast_topk; ++rank) {
+            ulong best = merged_cursor < 8 ? merged[merged_cursor] : 0;
+            ulong chosen = simd_candidate_max(best);
+            if (simd_lane == 0) {
+                ordered[rank] = chosen;
+            }
+            if (best == chosen && merged_cursor < 8) {
+                ++merged_cursor;
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint count = min(config.top_k, width);
+    float maximum = total_order_value(uint(ordered[0] >> 32));
+    for (uint slot = lane; slot < count; slot += group_width) {
+        float value = total_order_value(uint(ordered[slot] >> 32));
+        weights[slot] = exp((value - maximum) / config.temperature);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane == 0) {
+        atomic_fetch_add_explicit(error_flag + 1, 1, memory_order_relaxed);
+        keep = count;
+        if (config.top_p < 1.0f) {
+            float total = 0.0f;
+            for (uint slot = 0; slot < count; ++slot) {
+                total += weights[slot];
+            }
+            keep = 1;
+            if (isfinite(total) && total > 0.0f) {
+                float cumulative = 0.0f;
+                for (uint slot = 0; slot < count; ++slot) {
+                    cumulative += weights[slot] / total;
+                    keep = slot + 1;
+                    if (cumulative >= config.top_p) {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    ulong best = 0;
+    for (uint slot = lane; slot < keep; slot += group_width) {
+        uint column = uint(ordered[slot]);
+        float value = total_order_value(uint(ordered[slot] >> 32));
+        float score = value / config.temperature +
+                      gumbel_noise(config.seed, position, max_rounds, column);
+        best = max(best, argmax_candidate(score, column));
+    }
+    if (lane < 32) {
+        simd_top[lane] = 0;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    best = simd_candidate_max(best);
+    if (simd_lane == 0) {
+        simd_top[simd_group] = best;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_group == 0) {
+        best = simd_candidate_max(simd_top[simd_lane]);
+        if (lane == 0) {
+            output[physical_index(output_layout, row)] = uint(best);
+            atomic_store_explicit(
+                state + row * sample_state_words + sample_status,
+                sample_accepted, memory_order_relaxed);
+        }
     }
 }
 

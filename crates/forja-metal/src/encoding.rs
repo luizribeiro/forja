@@ -3471,6 +3471,7 @@ impl MetalBackend {
         let chunks = width.div_ceil(ARGMAX_CHUNK_WIDTH);
         let state = self.scratch_tensor(DType::U32, &[rows, 7])?;
         let rejection_partials = self.scratch_tensor(DType::U32, &[rows, chunks, 4])?;
+        let topk_partials = self.scratch_tensor(DType::U32, &[rows, chunks, 40])?;
         let partials = self.scratch_tensor(DType::U32, &[rows, chunks, 2])?;
         let dtype = [(0, dtype_code(logits.layout().dtype()))];
         let (
@@ -3479,6 +3480,8 @@ impl MetalBackend {
             rejection_proposal_finalize_pipeline,
             rejection_threshold_partials_pipeline,
             rejection_threshold_finalize_pipeline,
+            topk_partials_pipeline,
+            topk_finalize_pipeline,
             exact_fallback_pipeline,
             partials_pipeline,
             reduce_finalize_pipeline,
@@ -3493,6 +3496,8 @@ impl MetalBackend {
                 pipelines.get("sample_rejection_proposal_finalize", &[])?,
                 pipelines.get("sample_rejection_threshold_partials", &dtype)?,
                 pipelines.get("sample_rejection_threshold_finalize", &dtype)?,
+                pipelines.get("sample_topk_partials", &dtype)?,
+                pipelines.get("sample_topk_finalize", &[])?,
                 pipelines.get("sample_exact_fallback", &dtype)?,
                 pipelines.get("sample_partials", &dtype)?,
                 pipelines.get("sample_reduce_finalize", &[])?,
@@ -3529,7 +3534,6 @@ impl MetalBackend {
             height: 1,
             depth: 1,
         };
-
         set_pipeline(encoder, &prepare_pipeline);
         bindings.bind(table, 0, &sampling_buffer);
         bindings.bind(table, 1, &state.buffer);
@@ -3593,6 +3597,33 @@ impl MetalBackend {
             dispatch_threadgroups(encoder, row_groups, threads);
         }
         encode_dispatch_barrier(encoder);
+        set_pipeline(encoder, &topk_partials_pipeline);
+        bindings.bind(table, 0, &logits_buffer);
+        bindings.bind(table, 1, &topk_partials.buffer);
+        bindings.bind(table, 2, &state.buffer);
+        bindings.bind(table, 3, &temporaries[SAMPLE_LOGITS_LAYOUT]);
+        bindings.bind(table, 4, &temporaries[SAMPLE_WIDTH]);
+        bindings.bind(table, 5, &temporaries[SAMPLE_CHUNKS]);
+        set_argument_table(encoder, table);
+        dispatch_threadgroups(encoder, chunk_groups, threads);
+
+        encode_dispatch_barrier(encoder);
+        set_pipeline(encoder, &topk_finalize_pipeline);
+        bindings.bind(table, 0, &sampling_buffer);
+        bindings.bind(table, 1, &topk_partials.buffer);
+        bindings.bind(table, 2, &state.buffer);
+        bindings.bind(table, 3, &output_buffer);
+        bindings.bind(table, 4, &temporaries[SAMPLE_PARAMS_LAYOUT]);
+        bindings.bind(table, 5, &temporaries[SAMPLE_OUTPUT_LAYOUT]);
+        bindings.bind(table, 6, &temporaries[SAMPLE_WIDTH]);
+        bindings.bind(table, 7, &temporaries[SAMPLE_POSITION]);
+        bindings.bind(table, 8, &temporaries[SAMPLE_MAX_ROUNDS]);
+        bindings.bind(table, 9, &temporaries[SAMPLE_ERROR]);
+        bindings.bind(table, 10, &temporaries[SAMPLE_CHUNKS]);
+        set_argument_table(encoder, table);
+        dispatch_threadgroups(encoder, row_groups, threads);
+
+        encode_dispatch_barrier(encoder);
         set_pipeline(encoder, &exact_fallback_pipeline);
         bindings.bind(table, 0, &logits_buffer);
         bindings.bind(table, 1, &sampling_buffer);
@@ -3636,6 +3667,7 @@ impl MetalBackend {
             output_buffer,
             state.buffer,
             rejection_partials.buffer,
+            topk_partials.buffer,
             partials.buffer,
         ]);
         Ok((temporaries, error_flag))
@@ -4826,6 +4858,8 @@ fn nan_preserving_kernel(name: &str) -> bool {
             | "sample_rejection_proposal_partials"
             | "sample_rejection_threshold_partials"
             | "sample_rejection_threshold_finalize"
+            | "sample_topk_partials"
+            | "sample_topk_finalize"
             | "sample_exact_fallback"
             | "sample_radix_histogram"
             | "sample_index_histogram"
@@ -7071,6 +7105,8 @@ mod tests {
         for (name, temperature, top_k, top_p) in [
             ("greedy", 0.0, 0, 1.0),
             ("temperature", 0.7, 0, 1.0),
+            ("Qwen defaults", 0.6, 20, 0.95),
+            ("top-k 20", 0.7, 20, 1.0),
             ("top-k 5000", 0.7, 5000, 1.0),
             ("top-k 1024", 0.7, 1024, 1.0),
             ("top-p 0.9", 0.7, 0, 0.9),
