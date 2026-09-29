@@ -142,7 +142,8 @@ async fn verify<B>(
 where
     B: Backend + Send + Sync + 'static,
 {
-    let mut runner = EngineRunner::new(component, backend, limits()?, weights).await?;
+    let mut runner =
+        EngineRunner::new(component, backend, limits(&options.limits)?, weights).await?;
     let info = runner.describe().await?;
     if info.vocab != 151_936
         || info.max_context != 4_096
@@ -580,7 +581,7 @@ mod tests {
                 let mut runner = EngineRunner::new(
                     test_guests::engine_smoke(),
                     forja_cpu::CpuBackend::new(),
-                    limits()?,
+                    limits(&forja_config::Limits::default())?,
                     &weights,
                 )
                 .await?;
@@ -633,6 +634,7 @@ mod tests {
             backend: BackendArg::Cpu,
             precision: Precision::F32,
             prompts: Vec::new(),
+            limits: forja_config::Limits::default(),
         };
         let fixtures = FixtureDirectory::open(fixtures_path)?;
         let actual = sha256_file(options.model_dir.join("model.safetensors"))?;
@@ -674,6 +676,7 @@ mod tests {
             backend,
             precision,
             prompts,
+            limits: forja_config::Limits::default(),
         })
     }
 

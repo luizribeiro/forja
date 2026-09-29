@@ -62,7 +62,7 @@ where
     let mut runner = EngineRunner::new(
         component,
         backend,
-        limits()?,
+        limits(&options.limits)?,
         options.model_dir.join("model.safetensors"),
     )
     .await?;
@@ -261,6 +261,7 @@ mod tests {
             prompt: "A quiet forge glows beneath the mountain.".to_owned(),
             max_tokens: 32,
             backend: BackendArg::Metal,
+            limits: forja_config::Limits::default(),
         };
         let expected = FixtureDirectory::open(root.join("golden/qwen3-0.6b"))?
             .prompt("short-english")

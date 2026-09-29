@@ -1,6 +1,9 @@
 use std::path::PathBuf;
 
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
+use forja_config::{
+    ConfigError, DevConfig, Layer, Limits, dev_layers, file_layer, layer, set_layer,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub(crate) enum Backend {
@@ -28,6 +31,7 @@ pub(crate) struct Verify {
     pub(crate) backend: Backend,
     pub(crate) precision: Precision,
     pub(crate) prompts: Vec<String>,
+    pub(crate) limits: Limits,
 }
 
 #[derive(Args)]
@@ -69,6 +73,9 @@ pub(crate) struct Run {
     /// Compute backend.
     #[arg(long, value_enum, default_value_t = Backend::Metal)]
     pub(crate) backend: Backend,
+    /// Host resource limits.
+    #[arg(skip)]
+    pub(crate) limits: Limits,
 }
 
 #[derive(Args, Debug, Eq, PartialEq)]
@@ -104,6 +111,9 @@ pub(crate) struct Bench {
         value_parser = parse_backend_option
     )]
     pub(crate) graph_replay: GraphReplay,
+    /// Host resource limits.
+    #[arg(skip)]
+    pub(crate) limits: Limits,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -116,6 +126,12 @@ pub(crate) enum Command {
 #[derive(Parser)]
 #[command(name = "forja", about = "Run and inspect Forja inference engines")]
 struct Cli {
+    /// Add a configuration file. Files are layered in order before any --set values.
+    #[arg(short = 'c', long, global = true)]
+    config: Vec<PathBuf>,
+    /// Set one key after all configuration files. Values are layered in order.
+    #[arg(short = 's', long = "set", global = true)]
+    set: Vec<String>,
     #[command(subcommand)]
     command: ParsedCommand,
 }
@@ -131,12 +147,70 @@ enum ParsedCommand {
 }
 
 pub(crate) fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Command, clap::Error> {
-    let cli = Cli::try_parse_from(std::iter::once("forja".to_owned()).chain(arguments))?;
+    parse_with(arguments, || dev_layers(false))
+}
+
+fn parse_with(
+    arguments: impl IntoIterator<Item = String>,
+    base_layers: impl FnOnce() -> Result<Vec<Layer>, ConfigError>,
+) -> Result<Command, clap::Error> {
+    let arguments = std::iter::once("forja".to_owned())
+        .chain(arguments)
+        .collect::<Vec<_>>();
+    let mut matches = Cli::command().try_get_matches_from(arguments)?;
+    let overrides = ordered_overrides(&matches);
+    let cli = Cli::from_arg_matches_mut(&mut matches)?;
+    let mut layers = base_layers().map_err(|error| config_error(&error))?;
+    let mut set_index = 0;
+    for override_ in overrides {
+        match override_ {
+            Override::File(path) => {
+                layers.push(file_layer::<DevConfig>(&path).map_err(|error| config_error(&error))?);
+            }
+            Override::Set(expression) => {
+                set_index += 1;
+                layers.push(
+                    set_layer::<DevConfig>(set_index, &expression)
+                        .map_err(|error| config_error(&error))?,
+                );
+            }
+        }
+    }
+    let limits = layer::<DevConfig>(layers)
+        .map_err(|error| config_error(&error))?
+        .config
+        .limits;
     Ok(match cli.command {
-        ParsedCommand::Bench(options) => Command::Bench(options),
-        ParsedCommand::Run(options) => Command::Run(options),
-        ParsedCommand::Verify(options) => Command::Verify(options.into()),
+        ParsedCommand::Bench(mut options) => {
+            options.limits = limits;
+            Command::Bench(options)
+        }
+        ParsedCommand::Run(mut options) => {
+            options.limits = limits;
+            Command::Run(options)
+        }
+        ParsedCommand::Verify(options) => Command::Verify(options.with_limits(limits)),
     })
+}
+
+enum Override {
+    File(PathBuf),
+    Set(String),
+}
+
+fn ordered_overrides(matches: &clap::ArgMatches) -> Vec<Override> {
+    let mut overrides = Vec::new();
+    if let Some(paths) = matches.get_many::<PathBuf>("config") {
+        overrides.extend(paths.cloned().map(Override::File));
+    }
+    if let Some(expressions) = matches.get_many::<String>("set") {
+        overrides.extend(expressions.cloned().map(Override::Set));
+    }
+    overrides
+}
+
+fn config_error(error: &ConfigError) -> clap::Error {
+    Cli::command().error(clap::error::ErrorKind::ValueValidation, error.to_string())
 }
 
 fn parse_positive(value: &str) -> Result<usize, String> {
@@ -163,21 +237,27 @@ fn parse_prompt_name(value: &str) -> Result<String, String> {
     }
 }
 
-impl From<VerifyArgs> for Verify {
-    fn from(options: VerifyArgs) -> Self {
-        Self {
+impl VerifyArgs {
+    fn with_limits(self, limits: Limits) -> Verify {
+        let options = self;
+        Verify {
             engine: options.engine,
             model_dir: options.model_dir,
             fixtures: options.fixtures,
             backend: options.backend,
             precision: options.precision,
             prompts: options.prompts,
+            limits,
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
+    use forja_testing::temporary_directory;
+
     use super::*;
 
     #[test]
@@ -213,6 +293,7 @@ mod tests {
                 breakdown: false,
                 host_argmax: false,
                 graph_replay: GraphReplay::Tier2,
+                limits: Limits::default(),
             })
         );
     }
@@ -391,6 +472,7 @@ mod tests {
                 prompt: "Hello".to_owned(),
                 max_tokens: 7,
                 backend: Backend::Cpu,
+                limits: Limits::default(),
             })
         );
     }
@@ -502,6 +584,7 @@ mod tests {
                 backend: Backend::Cpu,
                 precision: Precision::Bf16,
                 prompts: vec!["one".to_owned(), "two".to_owned()],
+                limits: Limits::default(),
             })
         );
     }
@@ -534,6 +617,7 @@ mod tests {
                 backend: Backend::Metal,
                 precision: Precision::F32,
                 prompts: vec!["one".to_owned(), "two".to_owned(), "three".to_owned()],
+                limits: Limits::default(),
             })
         );
     }
@@ -662,6 +746,71 @@ mod tests {
         ] {
             assert!(parse(arguments.into_iter().map(str::to_owned)).is_err());
         }
+    }
+
+    #[test]
+    fn layers_config_files_before_set_values() {
+        let root = temporary_directory("cli-layers").unwrap();
+        let user_path = root.join("user.toml");
+        let first_path = root.join("first.toml");
+        let second_path = root.join("second.toml");
+        fs::write(&user_path, "[limits]\nlive_graphs = 33\ntensor_rank = 1\n").unwrap();
+        fs::write(&first_path, "[limits]\ntensor_rank = 7\n").unwrap();
+        fs::write(&second_path, "[limits]\ntensor_rank = 22\n").unwrap();
+        let mut user = file_layer::<DevConfig>(&user_path).unwrap();
+        user.origin = forja_config::Origin::UserFile(user_path);
+        let command = parse_with(
+            [
+                "--config".to_owned(),
+                first_path.display().to_string(),
+                "run".to_owned(),
+                "--engine".to_owned(),
+                "/engine.wasm".to_owned(),
+                "--model-dir".to_owned(),
+                "/model".to_owned(),
+                "--prompt".to_owned(),
+                "hello".to_owned(),
+                "--set".to_owned(),
+                "limits.tensor_rank=11".to_owned(),
+                "-c".to_owned(),
+                second_path.display().to_string(),
+                "-s".to_owned(),
+                "limits.live_kernels=4097".to_owned(),
+            ],
+            || Ok(vec![user]),
+        )
+        .unwrap();
+        let Command::Run(options) = command else {
+            panic!("expected run command");
+        };
+        assert_eq!(options.limits.live_graphs, 33);
+        assert_eq!(options.limits.tensor_rank, 11);
+        assert_eq!(options.limits.live_kernels, 4097);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn reports_numbered_set_errors_exactly() {
+        let error = parse_with(
+            [
+                "run",
+                "--engine",
+                "/engine.wasm",
+                "--model-dir",
+                "/model",
+                "--prompt",
+                "hello",
+                "--set",
+                "limits.tensor_ranks=5",
+            ]
+            .map(str::to_owned),
+            || Ok(Vec::new()),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string().lines().next().unwrap(),
+            "error: --set #1 limits.tensor_ranks=5: unknown field `tensor_ranks`, expected one of `live_bytes`, `tensor_rank`, `tensor_elements`, `live_tensor_handles`, `live_kernels`, `live_graphs`, `read_bytes`, `guest_memory_bytes`, `table_elements`, `instances`, `dispatches_per_list`, `work_per_dispatch`, `guest_call_timeout`, `submission_timeout`, `gpu_time_budget`"
+        );
     }
 
     #[test]

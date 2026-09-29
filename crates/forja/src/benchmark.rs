@@ -160,7 +160,7 @@ async fn bench_engine(
     let mut runner = EngineRunner::new(
         component,
         backend,
-        limits()?,
+        limits(&options.limits)?,
         options.model_dir.join("model.safetensors"),
     )
     .await?;

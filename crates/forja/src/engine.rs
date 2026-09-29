@@ -63,8 +63,8 @@ pub(crate) fn read_token(bytes: &[u8]) -> Result<u32, Box<dyn Error>> {
     Ok(u32::from_le_bytes(bytes))
 }
 
-pub(crate) fn limits() -> Result<forja_host::Limits, TryFromIntError> {
-    HostLimits::try_from(&ConfigLimits::default()).map(|limits| limits.0)
+pub(crate) fn limits(config: &ConfigLimits) -> Result<forja_host::Limits, TryFromIntError> {
+    HostLimits::try_from(config).map(|limits| limits.0)
 }
 
 #[cfg(test)]
@@ -91,7 +91,7 @@ mod tests {
         .with_command_limits(4_096, u64::MAX)
         .with_guest_call_timeout(Duration::from_secs(300))
         .with_gpu_limits(Duration::from_secs(60), Duration::from_secs(3_600));
-        assert_eq!(limits().unwrap(), expected);
+        assert_eq!(limits(&ConfigLimits::default()).unwrap(), expected);
     }
 
     #[test]
