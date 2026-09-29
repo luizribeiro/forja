@@ -1,6 +1,6 @@
-use std::{fmt, num::IntErrorKind, time};
+use std::{fmt, marker::PhantomData, num::IntErrorKind, time};
 
-use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de, de::IntoDeserializer};
 
 /// A byte count serialized as an integer or an IEC quantity such as `8GiB`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -150,6 +150,80 @@ fn parse_quantity(value: &str, units: &[(&str, u64)]) -> Result<u64, String> {
         .ok_or_else(|| format!("quantity {value:?} overflows u64"))
 }
 
+/// A finite value or an explicit absence of a limit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Unbounded<T> {
+    /// No limit is imposed.
+    Unlimited,
+    /// A finite limit.
+    Limited(T),
+}
+
+impl<T> Serialize for Unbounded<T>
+where
+    T: Serialize,
+{
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::Unlimited => serializer.serialize_str("unlimited"),
+            Self::Limited(value) => value.serialize(serializer),
+        }
+    }
+}
+
+impl<'de, T> Deserialize<'de> for Unbounded<T>
+where
+    T: Deserialize<'de>,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(UnboundedVisitor(PhantomData))
+    }
+}
+
+struct UnboundedVisitor<T>(PhantomData<T>);
+
+impl<'de, T> de::Visitor<'de> for UnboundedVisitor<T>
+where
+    T: Deserialize<'de>,
+{
+    type Value = Unbounded<T>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("\"unlimited\" or a finite value")
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        if value == "unlimited" {
+            Ok(Unbounded::Unlimited)
+        } else {
+            T::deserialize(value.into_deserializer()).map(Unbounded::Limited)
+        }
+    }
+
+    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        T::deserialize(value.into_deserializer()).map(Unbounded::Limited)
+    }
+
+    fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        T::deserialize(value.into_deserializer()).map(Unbounded::Limited)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use serde::de::value::{Error, I64Deserializer, StrDeserializer, U64Deserializer};
@@ -210,6 +284,18 @@ mod tests {
                 .unwrap_err()
                 .to_string(),
             format!("quantity {value:?} overflows u64")
+        );
+    }
+
+    #[test]
+    fn parses_unbounded_values() {
+        assert_eq!(
+            Unbounded::<u32>::deserialize(StrDeserializer::<Error>::new("unlimited")).unwrap(),
+            Unbounded::Unlimited
+        );
+        assert_eq!(
+            Unbounded::<u32>::deserialize(U64Deserializer::<Error>::new(4097)).unwrap(),
+            Unbounded::Limited(4097)
         );
     }
 }
