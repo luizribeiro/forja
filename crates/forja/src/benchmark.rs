@@ -125,6 +125,9 @@ async fn run_metal(options: &Bench) -> Result<(), Box<dyn Error>> {
         .collect::<Result<Vec<_>, _>>()?;
     let (results, device) = measure_points(options, &perf_hashes).await?;
     check_strategy_outputs(&options.strategy_axes, &results)?;
+    if let Some(record) = &options.rerun {
+        print_result_diff(record, &results)?;
+    }
     if let Some(path) = &options.json {
         let snapshot = benchmark_record::snapshot(options, &device, &os)?;
         let report = serde_json::json!({
@@ -294,6 +297,44 @@ fn stripped_key(key: &PerfKey, ignored: &[&str]) -> PerfKey {
         .filter(|(name, _)| !ignored.contains(&name.as_str()))
         .map(|(name, value)| (name.clone(), value.clone()))
         .collect()
+}
+
+fn print_result_diff(record: &Recorded, current: &[serde_json::Value]) -> Result<(), String> {
+    println!("rerun result diff (recorded -> current)");
+    for (index, (old, new)) in record.results.iter().zip(current).enumerate() {
+        for metric in ["pp", "tg"] {
+            let old_stats = wall_stats(old, metric)?;
+            let new_stats = wall_stats(new, metric)?;
+            let percent = if old_stats.0 == 0.0 {
+                f64::NAN
+            } else {
+                (new_stats.0 / old_stats.0 - 1.0) * 100.0
+            };
+            println!(
+                "result {index} {metric}: {:.2} ({:.2}–{:.2}) -> {:.2} ({:.2}–{:.2}) {percent:+.2}%",
+                old_stats.0, old_stats.1, old_stats.2, new_stats.0, new_stats.1, new_stats.2,
+            );
+        }
+    }
+    Ok(())
+}
+
+fn wall_stats(result: &serde_json::Value, metric: &str) -> Result<(f64, f64, f64), String> {
+    let stats = &result[metric]["tokens_per_second"]["wall"];
+    let median = stats["median"]
+        .as_f64()
+        .ok_or_else(|| format!("record result {metric} has no wall median"))?;
+    let interval = stats["ci95"]
+        .as_array()
+        .filter(|values| values.len() == 2)
+        .ok_or_else(|| format!("record result {metric} has no wall confidence interval"))?;
+    let low = interval[0]
+        .as_f64()
+        .ok_or_else(|| format!("record result {metric} has invalid confidence bounds"))?;
+    let high = interval[1]
+        .as_f64()
+        .ok_or_else(|| format!("record result {metric} has invalid confidence bounds"))?;
+    Ok((median, low, high))
 }
 
 fn check_strategy_outputs(
@@ -1331,6 +1372,10 @@ fn gpu_core_count() -> Result<u64, Box<dyn Error>> {
 
 #[cfg(test)]
 mod tests {
+    use std::{env, fs};
+
+    use forja_testing::temporary_directory;
+
     use super::*;
 
     #[test]
@@ -1566,5 +1611,75 @@ mod tests {
         assert!(error.contains("bench.reps"));
         current.allow_diff.push(KeyPath::new("bench.reps"));
         validate_comparability(&current, &record, &keys).unwrap();
+    }
+
+    #[test]
+    fn reads_result_confidence_intervals() {
+        let result = serde_json::json!({
+            "pp": {"tokens_per_second": {"wall": {"median": 10.0, "ci95": [9.0, 11.0]}}}
+        });
+        assert_eq!(wall_stats(&result, "pp").unwrap(), (10.0, 9.0, 11.0));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires FORJA_MODELS and runs in the pre-push hook"]
+    fn metal_vary_and_rerun_record() -> Result<(), Box<dyn Error>> {
+        let models =
+            std::path::PathBuf::from(env::var_os("FORJA_MODELS").ok_or("FORJA_MODELS is not set")?);
+        let root = temporary_directory("bench-rerun")?;
+        let record = root.join("record.json");
+        let record_path = record.display().to_string();
+        let engine = test_guests::qwen3().display().to_string();
+        let model = models.join("Qwen3-0.6B").display().to_string();
+        let crate::args::Command::Bench(first) = crate::args::parse(
+            [
+                "bench",
+                "--engine",
+                &engine,
+                "--model-dir",
+                &model,
+                "--pp",
+                "9",
+                "--tg",
+                "2",
+                "--reps",
+                "1",
+                "--set",
+                "bench.warmups=0",
+                "--set",
+                "bench.selection=[\"gpu-pipelined\"]",
+                "--vary",
+                "backend.metal.graph_replay=tier1,tier2",
+                "--json",
+                &record_path,
+            ]
+            .map(str::to_owned),
+        )?
+        else {
+            return Err("expected bench command".into());
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()?;
+        runtime.block_on(run(&first))?;
+        let crate::args::Command::Bench(second) = crate::args::parse(
+            [
+                "bench",
+                "--engine",
+                &engine,
+                "--model-dir",
+                &model,
+                "--rerun",
+                &record_path,
+            ]
+            .map(str::to_owned),
+        )?
+        else {
+            return Err("expected bench command".into());
+        };
+        runtime.block_on(run(&second))?;
+        fs::remove_dir_all(root)?;
+        Ok(())
     }
 }
