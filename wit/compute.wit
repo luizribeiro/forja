@@ -15,6 +15,23 @@ interface compute {
     step: u32,
   }
 
+  record param-range {
+    lo: u32,
+    hi: u32,
+  }
+
+  record affine {
+    param: option<u8>,
+    scale: u32,
+    offset: u32,
+  }
+
+  record param-slice {
+    start: affine,
+    len: affine,
+    step: u32,
+  }
+
   variant view-op {
     slice(list<slice-spec>),
     reshape(list<u32>),
@@ -133,6 +150,7 @@ interface compute {
   resource tensor {
     alloc: static func(dt: dtype, shape: list<u32>) -> result<tensor, error>;
     view: func(operation: view-op) -> result<tensor, error>;
+    view-param: func(space: borrow<params>, slices: list<param-slice>) -> result<tensor, error>;
     write: func(bytes: list<u8>) -> result<_, error>;
     read: async func() -> result<list<u8>, error>;
   }
@@ -145,6 +163,10 @@ interface compute {
 
   resource kernel {
     create: static func(src: program-source, sig: kernel-signature) -> result<kernel, error>;
+  }
+
+  resource params {
+    constructor(ranges: list<param-range>);
   }
 
   resource command-list {

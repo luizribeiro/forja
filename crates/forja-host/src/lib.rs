@@ -19,8 +19,9 @@ use std::{
 };
 
 use forja_core::{
-    Backend, BackendError, CommandList, DType, Layout, LayoutError, Op, OpError, Slice, Submission,
-    SubmissionProfile, Tensor, ViewOp,
+    Affine, Backend, BackendError, CommandList, DType, Layout, LayoutError, Op, OpError,
+    ParamSpace, Slice, Submission, SubmissionProfile, SymbolicLayout, SymbolicLayoutError, Tensor,
+    ViewOp,
     program::{
         BinOp, Inst, KernelSignature, MAX_INSTRUCTIONS, MAX_OUTPUTS, PrepareError, PreparedProgram,
         Program, ProgramError, ProgramKind, RedOp, UnOp, ValidatedProgram, ValueType,
@@ -47,6 +48,7 @@ pub mod bindings {
             "l9o:gpu/compute.kernel": crate::KernelEntry,
             "l9o:gpu/compute.command-list": crate::CommandListEntry,
             "l9o:gpu/compute.weights": crate::WeightsEntry,
+            "l9o:gpu/compute.params": crate::ParamsEntry,
         },
     });
 }
@@ -799,6 +801,7 @@ impl BufferHandle {
 #[derive(Clone, Debug)]
 pub struct TensorEntry {
     tensor: Tensor,
+    symbolic: Option<SymbolicLayout>,
     buffer: Arc<BufferHandle>,
 }
 
@@ -812,6 +815,12 @@ pub struct WeightsEntry {
 #[derive(Clone, Debug)]
 pub struct KernelEntry {
     program: Arc<PreparedProgram>,
+}
+
+/// Host-owned state behind a guest parameter-space resource.
+#[derive(Clone, Debug)]
+pub struct ParamsEntry {
+    space: ParamSpace,
 }
 
 #[derive(Debug)]
@@ -971,6 +980,7 @@ impl<B: Backend> Host<B> {
         drop(timer);
         let entry = TensorEntry {
             tensor: tensor.clone(),
+            symbolic: None,
             buffer: Arc::new(BufferHandle {
                 owner: tensor.clone(),
                 kind: BufferKind::Allocated {
@@ -1004,6 +1014,20 @@ impl<B: Backend> Host<B> {
         self.check_handle_quota()?;
         let entry = self.entry(resource)?.clone();
         let operation = core_view(operation).map_err(guest_error)?;
+        if let Some(layout) = &entry.symbolic {
+            let symbolic =
+                symbolic_view(layout, &operation).map_err(|error| graph_error(&error))?;
+            let view = self
+                .table
+                .push(TensorEntry {
+                    tensor: entry.tensor,
+                    symbolic: Some(symbolic),
+                    buffer: entry.buffer,
+                })
+                .map_err(invalid_handle)?;
+            self.live_handles += 1;
+            return Ok(view);
+        }
         let layout = validate_view(&entry.tensor, &operation).map_err(guest_error)?;
         self.check_tensor_shape(layout.shape())?;
         let tensor = self
@@ -1014,11 +1038,80 @@ impl<B: Backend> Host<B> {
             .table
             .push(TensorEntry {
                 tensor,
+                symbolic: None,
                 buffer: Arc::clone(&entry.buffer),
             })
             .map_err(invalid_handle)?;
         self.live_handles += 1;
         Ok(view)
+    }
+
+    fn view_param(
+        &mut self,
+        resource: &Resource<TensorEntry>,
+        space: &Resource<ParamsEntry>,
+        slices: Vec<compute::ParamSlice>,
+    ) -> Result<Resource<TensorEntry>, compute::Error> {
+        self.check_handle_quota()?;
+        let entry = self.entry(resource)?.clone();
+        let space = self.table.get(space).map_err(invalid_handle)?.space.clone();
+        if slices.len() != entry.tensor.layout().shape().len() {
+            return Err(compute::Error::Layout(
+                "parameterized slice rank does not match tensor rank".to_owned(),
+            ));
+        }
+        let mut layout = entry
+            .symbolic
+            .clone()
+            .unwrap_or_else(|| SymbolicLayout::new(entry.tensor.layout().clone(), space.clone()));
+        if layout.space() != &space {
+            return Err(compute::Error::Layout(
+                "parameterized view mixes parameter spaces".to_owned(),
+            ));
+        }
+        for (axis, slice) in slices.into_iter().enumerate() {
+            let axis = u8::try_from(axis)
+                .map_err(|_| compute::Error::Layout("tensor rank exceeds u8".to_owned()))?;
+            layout = layout
+                .slice(
+                    axis,
+                    core_affine(slice.start),
+                    core_affine(slice.len),
+                    slice.step,
+                )
+                .map_err(|error| graph_error(&error))?;
+        }
+        let view = self
+            .table
+            .push(TensorEntry {
+                tensor: entry.tensor,
+                symbolic: Some(layout),
+                buffer: entry.buffer,
+            })
+            .map_err(invalid_handle)?;
+        self.live_handles += 1;
+        Ok(view)
+    }
+
+    fn params(
+        &mut self,
+        ranges: Vec<compute::ParamRange>,
+    ) -> wasmtime::Result<Resource<ParamsEntry>> {
+        let ranges = ranges
+            .into_iter()
+            .map(|range| range.lo..=range.hi)
+            .collect();
+        let space = ParamSpace::new(ranges).map_err(wasmtime::Error::msg)?;
+        self.table
+            .push(ParamsEntry { space })
+            .map_err(wasmtime::Error::msg)
+    }
+
+    fn drop_params(&mut self, resource: Resource<ParamsEntry>) -> wasmtime::Result<()> {
+        self.table
+            .delete(resource)
+            .map(|_| ())
+            .map_err(wasmtime::Error::msg)
     }
 
     fn open_weights(&mut self, grant: &str) -> Result<Resource<WeightsEntry>, compute::Error> {
@@ -1093,7 +1186,11 @@ impl<B: Backend> Host<B> {
         let buffer = Arc::clone(&entry.buffer);
         let tensor = self
             .table
-            .push(TensorEntry { tensor, buffer })
+            .push(TensorEntry {
+                tensor,
+                symbolic: None,
+                buffer,
+            })
             .map_err(invalid_handle)?;
         self.live_handles += 1;
         Ok(tensor)
@@ -1704,6 +1801,16 @@ where
         std::future::ready(Ok(Host::view(self, &resource, operation)))
     }
 
+    fn view_param(
+        &mut self,
+        resource: Resource<TensorEntry>,
+        space: Resource<ParamsEntry>,
+        slices: Vec<compute::ParamSlice>,
+    ) -> impl Future<Output = wasmtime::Result<Result<Resource<TensorEntry>, compute::Error>>> + Send
+    {
+        std::future::ready(Ok(Host::view_param(self, &resource, &space, slices)))
+    }
+
     fn write(
         &mut self,
         resource: Resource<TensorEntry>,
@@ -1719,6 +1826,25 @@ where
     ) -> impl Future<Output = wasmtime::Result<()>> + Send {
         let _timer = self.import_timer(ImportKind::ResourceDrop);
         std::future::ready(Host::drop_tensor(self, resource).map_err(wasmtime::Error::msg))
+    }
+}
+
+impl<B> compute::HostParams for Host<B>
+where
+    B: Backend + Send + Sync + 'static,
+{
+    fn new(
+        &mut self,
+        ranges: Vec<compute::ParamRange>,
+    ) -> impl Future<Output = wasmtime::Result<Resource<ParamsEntry>>> + Send {
+        std::future::ready(self.params(ranges))
+    }
+
+    fn drop(
+        &mut self,
+        resource: Resource<ParamsEntry>,
+    ) -> impl Future<Output = wasmtime::Result<()>> + Send {
+        std::future::ready(self.drop_params(resource))
     }
 }
 
@@ -1965,6 +2091,19 @@ fn core_view(operation: compute::ViewOp) -> Result<ViewOp, LayoutError> {
     })
 }
 
+fn core_affine(affine: compute::Affine) -> Affine {
+    affine.param.map_or_else(
+        || Affine::constant(affine.offset),
+        |parameter| {
+            if affine.scale == 0 {
+                Affine::constant(affine.offset)
+            } else {
+                Affine::parameter(parameter, affine.offset, affine.scale)
+            }
+        },
+    )
+}
+
 fn core_op(operation: compute::Op) -> Op {
     match operation {
         compute::Op::Copy => Op::Copy,
@@ -1983,6 +2122,31 @@ fn core_op(operation: compute::Op) -> Op {
             q_start: config.q_start,
         },
     }
+}
+
+fn symbolic_view(
+    layout: &SymbolicLayout,
+    operation: &ViewOp,
+) -> Result<SymbolicLayout, SymbolicLayoutError> {
+    match operation {
+        ViewOp::Slice(slices) => {
+            let mut result = layout.clone();
+            for (axis, slice) in slices.iter().enumerate() {
+                let axis = u8::try_from(axis)
+                    .map_err(|_| SymbolicLayoutError::AxisOutOfRange { axis: u8::MAX })?;
+                result =
+                    result.slice(axis, slice.start().into(), slice.len().into(), slice.step())?;
+            }
+            Ok(result)
+        }
+        ViewOp::Reshape(shape) => layout.reshape(shape.clone()),
+        ViewOp::Permute(axes) => layout.permute(axes),
+        ViewOp::Broadcast(shape) => layout.broadcast(shape.clone()),
+    }
+}
+
+fn graph_error(error: &impl ToString) -> compute::Error {
+    compute::Error::OpSignature(error.to_string())
 }
 
 fn core_program(program: compute::ProgramSource) -> Result<ValidatedProgram, compute::Error> {
@@ -2285,6 +2449,56 @@ mod tests {
                 .bound_program()
                 .is_some()
         );
+    }
+
+    #[test]
+    fn parameterized_views_preserve_their_parameter_space() {
+        let mut host = Host::new(CpuBackend::new(), GENEROUS);
+        let tensor = host.alloc(compute::Dtype::F32, &[2, 4]).unwrap();
+        let params = host
+            .params(vec![compute::ParamRange { lo: 0, hi: 2 }])
+            .unwrap();
+        let view = host
+            .view_param(
+                &tensor,
+                &params,
+                vec![
+                    compute::ParamSlice {
+                        start: compute::Affine {
+                            param: None,
+                            scale: 0,
+                            offset: 0,
+                        },
+                        len: compute::Affine {
+                            param: None,
+                            scale: 0,
+                            offset: 2,
+                        },
+                        step: 1,
+                    },
+                    compute::ParamSlice {
+                        start: compute::Affine {
+                            param: Some(0),
+                            scale: 1,
+                            offset: 0,
+                        },
+                        len: compute::Affine {
+                            param: None,
+                            scale: 0,
+                            offset: 2,
+                        },
+                        step: 1,
+                    },
+                ],
+            )
+            .unwrap();
+        let permuted = host
+            .view(&view, compute::ViewOp::Permute(vec![1, 0]))
+            .unwrap();
+
+        let symbolic = host.entry(&permuted).unwrap().symbolic.as_ref().unwrap();
+        let values = symbolic.space().values(vec![2]).unwrap();
+        assert_eq!(symbolic.instantiate(&values).unwrap().shape(), &[2, 2]);
     }
 
     #[test]
