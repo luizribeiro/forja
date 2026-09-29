@@ -3,7 +3,7 @@
 use std::{collections::VecDeque, env, error::Error, path::PathBuf, time::Duration};
 
 use forja_core::Backend;
-use forja_host::{EngineDecode, EngineRunner, EngineStep, Limits};
+use forja_host::{EngineDecode, EngineRunner, EngineStep, Limits, bindings::l9o::gpu::compute};
 use forja_sdk::{Engine, Tensor, Weights};
 use golden_fixtures::{
     BF16_HIDDEN_STATE_TOLERANCE, FixtureDirectory, PromptFixture, decode_f32_le,
@@ -218,9 +218,28 @@ where
     sequential.load().await??;
     pipelined.load().await??;
     let prompt = (0_u32..8).collect::<Vec<_>>();
-    let expected = selected_tokens(&mut sequential, &prompt, token_count, false).await?;
-    let actual = selected_tokens(&mut pipelined, &prompt, token_count, true).await?;
+    let expected = selected_tokens(&mut sequential, &prompt, token_count, false, None)
+        .await
+        .map_err(|error| format!("sequential decode failed: {error}"))?;
+    let actual = selected_tokens(&mut pipelined, &prompt, token_count, true, None)
+        .await
+        .map_err(|error| format!("pipelined decode failed: {error}"))?;
     assert_eq!(actual, expected);
+    let eos = *expected.get(3).ok_or("sequential decode was incomplete")?;
+    let stopped = selected_tokens(&mut pipelined, &prompt, token_count, true, Some(eos))
+        .await
+        .map_err(|error| format!("EOS decode failed: {error}"))?;
+    assert_eq!(stopped, expected[..=3]);
+    let next_position = u32::try_from(prompt.len())?
+        .checked_add(u32::try_from(stopped.len())?.saturating_sub(1))
+        .ok_or("decode position overflowed")?;
+    let resumed = pipelined
+        .enqueue_decode(EngineDecode {
+            tokens: None,
+            start_pos: next_position,
+        })
+        .await?;
+    assert!(matches!(resumed, Err(compute::Error::OpSignature(_))));
     Ok(())
 }
 
@@ -229,6 +248,7 @@ async fn selected_tokens<B>(
     prompt: &[u32],
     token_count: u32,
     pipelined: bool,
+    eos: Option<u32>,
 ) -> Result<Vec<u32>, Box<dyn Error>>
 where
     B: Backend + Send + Sync + 'static,
@@ -242,8 +262,21 @@ where
     };
     let mut tokens = Vec::with_capacity(usize::try_from(token_count)?);
     if pipelined {
-        let output = runner.enqueue_decode(input).await??;
-        tokens.push(read_token(&runner.read_queued_token(output).await?)?);
+        let output = runner
+            .enqueue_decode(input)
+            .await?
+            .map_err(|error| format!("prefill enqueue failed: {error:?}"))?;
+        tokens.push(read_token(
+            &runner
+                .read_queued_token(output)
+                .await
+                .map_err(|error| format!("prefill read failed: {error:?}"))?,
+        )?);
+        if tokens.last() == eos.as_ref() {
+            return Ok(tokens);
+        }
+        let replay_base = runner.metrics().submissions;
+        let mut consumed = 0_u64;
         let mut outputs = VecDeque::with_capacity(2);
         let mut position = u32::try_from(prompt.len())?;
         let end = position
@@ -251,20 +284,47 @@ where
             .ok_or("decode position overflowed")?;
         while position < end || !outputs.is_empty() {
             while position < end && outputs.len() < 2 {
-                outputs.push_back(
-                    runner
-                        .enqueue_decode(EngineDecode {
-                            tokens: None,
-                            start_pos: position,
-                        })
-                        .await??,
-                );
+                let output = runner
+                    .enqueue_decode(EngineDecode {
+                        tokens: None,
+                        start_pos: position,
+                    })
+                    .await?
+                    .map_err(|error| format!("decode enqueue at {position} failed: {error:?}"))?;
+                outputs.push_back(output);
                 position = position
                     .checked_add(1)
                     .ok_or("decode position overflowed")?;
             }
             let output = outputs.pop_front().ok_or("decode queue is empty")?;
-            tokens.push(read_token(&runner.read_queued_token(output).await?)?);
+            tokens.push(read_token(
+                &runner
+                    .read_queued_token(output)
+                    .await
+                    .map_err(|error| format!("decode read failed: {error:?}"))?,
+            )?);
+            consumed = consumed
+                .checked_add(1)
+                .ok_or("submission count overflowed")?;
+            let expected = replay_base
+                .checked_add(consumed)
+                .ok_or("submission count overflowed")?;
+            let started = std::time::Instant::now();
+            while runner.metrics().submissions < expected {
+                if started.elapsed() >= Duration::from_secs(60) {
+                    return Err("replay completion accounting timed out".into());
+                }
+                tokio::task::yield_now().await;
+            }
+            if tokens.last() == eos.as_ref() {
+                if outputs.is_empty() {
+                    return Err("EOS did not leave a speculative replay queued".into());
+                }
+                for output in outputs.drain(..) {
+                    runner.discard_queued_decode(output).await?;
+                }
+                break;
+            }
         }
     } else {
         let output = runner.decode(input).await??;

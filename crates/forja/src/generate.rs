@@ -1,4 +1,11 @@
-use std::{error::Error, fs, io::Write, path::Path};
+use std::{
+    collections::VecDeque,
+    error::Error,
+    fs,
+    io::Write,
+    path::Path,
+    time::{Duration, Instant},
+};
 
 use forja_core::Backend;
 use forja_host::{EngineDecode, EngineRunner};
@@ -67,20 +74,7 @@ where
     )
     .await?;
     let info = runner.describe().await?;
-    if tokenizer
-        .get_vocab(true)
-        .values()
-        .any(|&token| token >= info.vocab)
-    {
-        return Err("tokenizer contains ids outside the engine vocabulary".into());
-    }
-    let occupied = prompt
-        .len()
-        .checked_add(options.max_tokens.saturating_sub(1))
-        .ok_or("requested context length overflowed")?;
-    if occupied > usize::try_from(info.max_context)? {
-        return Err("prompt and maximum generation exceed the engine context".into());
-    }
+    validate_generation_request(&tokenizer, &info, prompt.len(), options.max_tokens)?;
     runner
         .load()
         .await?
@@ -89,8 +83,8 @@ where
         return Ok(Vec::new());
     }
     let prompt_len = u32::try_from(prompt.len())?;
-    let mut result = runner
-        .decode(EngineDecode {
+    let first = runner
+        .enqueue_decode(EngineDecode {
             tokens: Some(prompt),
             start_pos: 0,
         })
@@ -98,32 +92,122 @@ where
         .map_err(|error| format!("engine decode failed: {error:?}"))?;
     let mut stream = tokenizer.decode_stream(true);
     let mut generated = Vec::with_capacity(options.max_tokens);
-    for index in 0..options.max_tokens {
-        let token = read_token(&runner.read(&result.token).await?)?;
-        generated.push(token);
-        if eos.contains(&token) {
-            break;
+    let mut pending = VecDeque::from([first]);
+    let mut issued = 1_usize;
+    let replay_base = runner.metrics().submissions;
+    let mut consumed = 0_usize;
+    let mut position = prompt_len;
+    let generation = async {
+        while !pending.is_empty() {
+            while pending.len() < 2 && issued < options.max_tokens {
+                pending.push_back(
+                    runner
+                        .enqueue_decode(EngineDecode {
+                            tokens: None,
+                            start_pos: position,
+                        })
+                        .await?
+                        .map_err(|error| format!("engine decode failed: {error:?}"))?,
+                );
+                position = position
+                    .checked_add(1)
+                    .ok_or("decode position overflowed")?;
+                issued += 1;
+            }
+            let result = pending.pop_front().ok_or("decode queue is empty")?;
+            let token = read_token(&runner.read_queued_token(result).await?)?;
+            consumed += 1;
+            if consumed > 1 {
+                let expected = replay_base
+                    .checked_add(u64::try_from(consumed - 1)?)
+                    .ok_or("submission count overflowed")?;
+                wait_for_submission(&runner, expected).await?;
+            }
+            generated.push(token);
+            if eos.contains(&token) {
+                discard_speculative_tail(&mut runner, &mut pending).await?;
+                break;
+            }
+            if let Some(text) = stream
+                .step(token)
+                .map_err(|error| format!("cannot decode token: {error}"))?
+            {
+                output.write_all(text.as_bytes())?;
+                output.flush()?;
+            }
         }
-        if let Some(text) = stream
-            .step(token)
-            .map_err(|error| format!("cannot decode token: {error}"))?
-        {
-            output.write_all(text.as_bytes())?;
-            output.flush()?;
-        }
-        if index + 1 < options.max_tokens {
-            result = runner
-                .decode(EngineDecode {
-                    tokens: None,
-                    start_pos: prompt_len
-                        .checked_add(u32::try_from(index)?)
-                        .ok_or("decode position overflowed")?,
-                })
-                .await?
-                .map_err(|error| format!("engine decode failed: {error:?}"))?;
-        }
+        Ok::<(), Box<dyn Error>>(())
+    }
+    .await;
+    if let Err(error) = generation {
+        return match discard_speculative_tail(&mut runner, &mut pending).await {
+            Ok(()) => Err(error),
+            Err(discard) => Err(format!("{error}; speculative drain failed: {discard:?}").into()),
+        };
     }
     Ok(generated)
+}
+
+async fn wait_for_submission<B>(
+    runner: &EngineRunner<B>,
+    expected: u64,
+) -> Result<(), Box<dyn Error>>
+where
+    B: Backend + Send + Sync + 'static,
+{
+    let started = Instant::now();
+    while runner.metrics().submissions < expected {
+        if started.elapsed() >= Duration::from_secs(60) {
+            return Err("replay completion accounting timed out".into());
+        }
+        tokio::task::yield_now().await;
+    }
+    Ok(())
+}
+
+fn validate_generation_request(
+    tokenizer: &Tokenizer,
+    info: &forja_host::EngineInfo,
+    prompt_len: usize,
+    max_tokens: usize,
+) -> Result<(), Box<dyn Error>> {
+    if tokenizer
+        .get_vocab(true)
+        .values()
+        .any(|&token| token >= info.vocab)
+    {
+        return Err("tokenizer contains ids outside the engine vocabulary".into());
+    }
+    let occupied = prompt_len
+        .checked_add(max_tokens.saturating_sub(1))
+        .ok_or("requested context length overflowed")?;
+    if occupied > usize::try_from(info.max_context)? {
+        return Err("prompt and maximum generation exceed the engine context".into());
+    }
+    Ok(())
+}
+
+/// Releases unread speculative outputs after every pipeline exit.
+///
+/// Speculative decodes after EOS may write KV entries past the emitted tokens. This is safe
+/// because a later prefill or step overwrites a position before attending to it. The current
+/// runner is invalidated after a discard because its retained feedback token also advanced.
+async fn discard_speculative_tail<B>(
+    runner: &mut EngineRunner<B>,
+    pending: &mut VecDeque<forja_host::EngineDecodeOutput>,
+) -> Result<(), forja_host::bindings::l9o::gpu::compute::Error>
+where
+    B: Backend + Send + Sync + 'static,
+{
+    let mut failure = None;
+    for output in pending.drain(..) {
+        if let Err(error) = runner.discard_queued_decode(output).await
+            && failure.is_none()
+        {
+            failure = Some(error);
+        }
+    }
+    failure.map_or(Ok(()), Err)
 }
 
 fn load_eos_token_ids(model_dir: &Path) -> Result<Vec<u32>, Box<dyn Error>> {

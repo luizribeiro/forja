@@ -324,6 +324,7 @@ pub struct EngineRunner<B: Backend + Send + Sync + 'static> {
     id: u64,
     info: Option<EngineInfo>,
     output_handles: Vec<u32>,
+    discarded_speculation: bool,
     profiling: bool,
     last_profile: Option<EngineStepProfile>,
 }
@@ -421,6 +422,7 @@ where
             id,
             info: None,
             output_handles: Vec::new(),
+            discarded_speculation: false,
             profiling: false,
             last_profile: None,
         })
@@ -580,6 +582,11 @@ where
         release_previous: bool,
     ) -> wasmtime::Result<Result<EngineDecodeOutput, compute::Error>> {
         use engine_bindings::exports::l9o::gpu::engine::{DecodeIn, DecodeOut};
+        if self.discarded_speculation {
+            return Ok(Err(compute::Error::OpSignature(
+                "discarded speculative decode invalidated this runner".to_owned(),
+            )));
+        }
         if release_previous && let Err(error) = self.release_outputs() {
             return Ok(Err(error));
         }
@@ -662,12 +669,13 @@ where
     ///
     /// # Errors
     ///
-    /// Returns an invalid-handle or backend release failure.
-    pub fn discard_queued_decode(
+    /// Returns an invalid-handle, replay, or backend release failure.
+    pub async fn discard_queued_decode(
         &mut self,
         output: EngineDecodeOutput,
     ) -> Result<(), compute::Error> {
-        self.release_decode_output(output)
+        self.discarded_speculation = true;
+        self.read_queued_token(output).await.map(drop)
     }
 
     fn release_decode_output(&mut self, output: EngineDecodeOutput) -> Result<(), compute::Error> {
