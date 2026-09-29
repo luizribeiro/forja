@@ -30,6 +30,33 @@ pub(crate) struct Slice {
     pub(crate) step: u32,
 }
 
+#[cfg_attr(
+    not(target_family = "wasm"),
+    allow(
+        dead_code,
+        reason = "affine fields are consumed by the WebAssembly host"
+    )
+)]
+#[derive(Clone, Copy)]
+pub(crate) struct Affine {
+    pub(crate) param: Option<u8>,
+    pub(crate) scale: u32,
+    pub(crate) offset: u32,
+}
+
+#[cfg_attr(
+    not(target_family = "wasm"),
+    allow(
+        dead_code,
+        reason = "parameter slices are consumed by the WebAssembly host"
+    )
+)]
+pub(crate) struct ParamSlice {
+    pub(crate) start: Affine,
+    pub(crate) len: Affine,
+    pub(crate) step: u32,
+}
+
 pub(crate) enum View {
     Slice(Vec<Slice>),
     Reshape(Vec<u32>),
@@ -74,14 +101,22 @@ pub(crate) enum ProgramInst {
     Reduce(ReduceOp, u32),
 }
 
+#[allow(dead_code, reason = "used by the graph capture layer")]
 pub(crate) trait Backend {
     type Tensor;
     type Commands;
     type Kernel;
+    type Params;
+    type Graph;
 
     fn alloc(dtype: DType, shape: &[u32]) -> Result<Self::Tensor>;
     fn write(tensor: &Self::Tensor, bytes: &[u8]) -> Result<()>;
     fn view(tensor: &Self::Tensor, operation: View) -> Result<Self::Tensor>;
+    fn view_param(
+        tensor: &Self::Tensor,
+        params: &Self::Params,
+        slices: &[ParamSlice],
+    ) -> Result<Self::Tensor>;
     fn read(tensor: &Self::Tensor) -> Result<Vec<u8>>;
     fn command_list() -> Result<Self::Commands>;
     fn dispatch(
@@ -103,6 +138,9 @@ pub(crate) trait Backend {
         outputs: &[&Self::Tensor],
     ) -> Result<()>;
     fn submit(commands: Self::Commands) -> Result<()>;
+    fn params(ranges: &[(u32, u32)]) -> Result<Self::Params>;
+    fn create_graph(commands: Self::Commands) -> Result<Self::Graph>;
+    fn replay(graph: &Self::Graph, values: &[u32]) -> Result<()>;
 }
 
 #[cfg(target_family = "wasm")]
@@ -114,7 +152,7 @@ pub(crate) mod guest {
         world: "host",
     });
 
-    use super::{Backend, DType, Error, Op, Program, ProgramInst, Result, View};
+    use super::{Backend, DType, Error, Op, ParamSlice, Program, ProgramInst, Result, View};
     use crate::program::{BinaryOp, ProgramKind, ReduceOp, UnaryOp, ValueType};
     use compute::{
         Binop as WitBinOp, Redop as WitRedOp, Unop as WitUnOp, ValueType as WitValueType,
@@ -160,6 +198,8 @@ pub(crate) mod guest {
         type Tensor = compute::Tensor;
         type Commands = compute::CommandList;
         type Kernel = compute::Kernel;
+        type Params = compute::Params;
+        type Graph = compute::Graph;
 
         fn alloc(dtype: DType, shape: &[u32]) -> Result<Self::Tensor> {
             compute::Tensor::alloc(wit_dtype(dtype), shape).map_err(|error| guest_error(&error))
@@ -172,6 +212,26 @@ pub(crate) mod guest {
         fn view(tensor: &Self::Tensor, operation: View) -> Result<Self::Tensor> {
             tensor
                 .view(&wit_view(operation))
+                .map_err(|error| guest_error(&error))
+        }
+
+        fn view_param(
+            tensor: &Self::Tensor,
+            params: &Self::Params,
+            slices: &[ParamSlice],
+        ) -> Result<Self::Tensor> {
+            tensor
+                .view_param(
+                    params,
+                    &slices
+                        .iter()
+                        .map(|slice| compute::ParamSlice {
+                            start: wit_affine(slice.start),
+                            len: wit_affine(slice.len),
+                            step: slice.step,
+                        })
+                        .collect::<Vec<_>>(),
+                )
                 .map_err(|error| guest_error(&error))
         }
 
@@ -227,6 +287,33 @@ pub(crate) mod guest {
             wit_bindgen::block_on(compute::submit(commands))
                 .map(|_| ())
                 .map_err(|error| guest_error(&error))
+        }
+
+        fn params(ranges: &[(u32, u32)]) -> Result<Self::Params> {
+            Ok(compute::Params::new(
+                &ranges
+                    .iter()
+                    .map(|&(lo, hi)| compute::ParamRange { lo, hi })
+                    .collect::<Vec<_>>(),
+            ))
+        }
+
+        fn create_graph(commands: Self::Commands) -> Result<Self::Graph> {
+            compute::Graph::create(commands).map_err(|error| guest_error(&error))
+        }
+
+        fn replay(graph: &Self::Graph, values: &[u32]) -> Result<()> {
+            wit_bindgen::block_on(compute::replay(graph, values.to_vec()))
+                .map(|_| ())
+                .map_err(|error| guest_error(&error))
+        }
+    }
+
+    fn wit_affine(affine: super::Affine) -> compute::Affine {
+        compute::Affine {
+            param: affine.param,
+            scale: affine.scale,
+            offset: affine.offset,
         }
     }
 
@@ -334,11 +421,13 @@ pub(crate) mod guest {
 
 #[cfg(all(not(target_family = "wasm"), not(feature = "native")))]
 pub(crate) mod unavailable {
-    use super::{Backend, DType, Error, Op, Program, Result, View};
+    use super::{Backend, DType, Error, Op, ParamSlice, Program, Result, View};
 
     pub(crate) enum UnavailableTensor {}
     pub(crate) enum UnavailableCommands {}
     pub(crate) enum UnavailableKernel {}
+    pub(crate) enum UnavailableParams {}
+    pub(crate) enum UnavailableGraph {}
 
     pub(crate) struct Unavailable;
     pub(crate) struct WeightSource;
@@ -358,6 +447,8 @@ pub(crate) mod unavailable {
         type Tensor = UnavailableTensor;
         type Commands = UnavailableCommands;
         type Kernel = UnavailableKernel;
+        type Params = UnavailableParams;
+        type Graph = UnavailableGraph;
 
         fn alloc(_dtype: DType, _shape: &[u32]) -> Result<Self::Tensor> {
             Err(error())
@@ -368,6 +459,14 @@ pub(crate) mod unavailable {
         }
 
         fn view(_tensor: &Self::Tensor, _operation: View) -> Result<Self::Tensor> {
+            Err(error())
+        }
+
+        fn view_param(
+            _tensor: &Self::Tensor,
+            _params: &Self::Params,
+            _slices: &[ParamSlice],
+        ) -> Result<Self::Tensor> {
             Err(error())
         }
 
@@ -409,6 +508,18 @@ pub(crate) mod unavailable {
         fn submit(_commands: Self::Commands) -> Result<()> {
             Err(error())
         }
+
+        fn params(_ranges: &[(u32, u32)]) -> Result<Self::Params> {
+            Err(error())
+        }
+
+        fn create_graph(_commands: Self::Commands) -> Result<Self::Graph> {
+            Err(error())
+        }
+
+        fn replay(_graph: &Self::Graph, _values: &[u32]) -> Result<()> {
+            Err(error())
+        }
     }
 
     fn error() -> Error {
@@ -431,7 +542,7 @@ pub(crate) mod native {
         NativeCommandList, NativeHost, NativeKernel, NativeTensor, Safetensors, WeightSource as _,
     };
 
-    use super::{Backend, DType, Error, Op, Program, ProgramInst, Result, View};
+    use super::{Backend, DType, Error, Op, ParamSlice, Program, ProgramInst, Result, View};
     use crate::NativeDevice;
     use crate::program::{BinaryOp, ProgramKind, ReduceOp, UnaryOp, ValueType};
 
@@ -473,6 +584,9 @@ pub(crate) mod native {
         #[cfg(all(feature = "native-metal", target_os = "macos"))]
         Metal(MetalKernel),
     }
+
+    pub(crate) enum Params {}
+    pub(crate) enum Graph {}
 
     pub(crate) struct Native;
 
@@ -527,6 +641,8 @@ pub(crate) mod native {
         type Tensor = Tensor;
         type Commands = Commands;
         type Kernel = Kernel;
+        type Params = Params;
+        type Graph = Graph;
 
         fn alloc(dtype: DType, shape: &[u32]) -> Result<Self::Tensor> {
             match DEVICE.get() {
@@ -568,6 +684,14 @@ pub(crate) mod native {
                         .map_err(error)
                 }),
             }
+        }
+
+        fn view_param(
+            _tensor: &Self::Tensor,
+            _params: &Self::Params,
+            _slices: &[ParamSlice],
+        ) -> Result<Self::Tensor> {
+            Err(Error::new("graph capture requires a WebAssembly host"))
         }
 
         fn read(tensor: &Self::Tensor) -> Result<Vec<u8>> {
@@ -658,6 +782,18 @@ pub(crate) mod native {
                 #[cfg(all(feature = "native-metal", target_os = "macos"))]
                 Commands::Metal(commands) => commands.submit().map(|_| ()).map_err(error),
             }
+        }
+
+        fn params(_ranges: &[(u32, u32)]) -> Result<Self::Params> {
+            Err(Error::new("graph capture requires a WebAssembly host"))
+        }
+
+        fn create_graph(_commands: Self::Commands) -> Result<Self::Graph> {
+            Err(Error::new("graph capture requires a WebAssembly host"))
+        }
+
+        fn replay(_graph: &Self::Graph, _values: &[u32]) -> Result<()> {
+            Err(Error::new("graph capture requires a WebAssembly host"))
         }
     }
 
@@ -799,6 +935,10 @@ pub(crate) use unavailable::Unavailable as Active;
 pub(crate) type Handle = <Active as Backend>::Tensor;
 pub(crate) type Commands = <Active as Backend>::Commands;
 pub(crate) type Kernel = <Active as Backend>::Kernel;
+#[allow(dead_code, reason = "used by the graph capture layer")]
+pub(crate) type Params = <Active as Backend>::Params;
+#[allow(dead_code, reason = "used by the graph capture layer")]
+pub(crate) type Graph = <Active as Backend>::Graph;
 
 pub(crate) fn dtype(dtype: u8) -> Result<DType> {
     match dtype {
@@ -821,6 +961,15 @@ pub(crate) fn write(tensor: &Handle, bytes: &[u8]) -> Result<()> {
 
 pub(crate) fn view(tensor: &Handle, operation: View) -> Result<Handle> {
     Active::view(tensor, operation)
+}
+
+#[allow(dead_code, reason = "used by the graph capture layer")]
+pub(crate) fn view_param(
+    tensor: &Handle,
+    params: &Params,
+    slices: &[ParamSlice],
+) -> Result<Handle> {
+    Active::view_param(tensor, params, slices)
 }
 
 pub(crate) fn read(tensor: &Handle) -> Result<Vec<u8>> {
@@ -860,6 +1009,21 @@ pub(crate) fn dispatch_kernel(
 
 pub(crate) fn submit(commands: Commands) -> Result<()> {
     Active::submit(commands)
+}
+
+#[allow(dead_code, reason = "used by the graph capture layer")]
+pub(crate) fn params(ranges: &[(u32, u32)]) -> Result<Params> {
+    Active::params(ranges)
+}
+
+#[allow(dead_code, reason = "used by the graph capture layer")]
+pub(crate) fn create_graph(commands: Commands) -> Result<Graph> {
+    Active::create_graph(commands)
+}
+
+#[allow(dead_code, reason = "used by the graph capture layer")]
+pub(crate) fn replay(graph: &Graph, values: &[u32]) -> Result<()> {
+    Active::replay(graph, values)
 }
 
 #[cfg(feature = "native")]
