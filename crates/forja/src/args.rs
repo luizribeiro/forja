@@ -116,7 +116,7 @@ pub(crate) struct Bench {
     pub(crate) limits: Limits,
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub(crate) enum Command {
     Bench(Bench),
     Config(ConfigShow),
@@ -152,7 +152,7 @@ struct ConfigShowArgs {
     defaults: bool,
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub(crate) struct ConfigShow {
     pub(crate) layered: Layered<DevConfig>,
     pub(crate) origin: bool,

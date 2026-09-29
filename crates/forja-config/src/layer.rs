@@ -1,9 +1,10 @@
 use std::{collections::BTreeMap, error::Error, fmt, path::PathBuf};
 
-use serde::{Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 /// A dotted path to one scalar or array configuration value.
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
 pub struct KeyPath(String);
 
 impl KeyPath {

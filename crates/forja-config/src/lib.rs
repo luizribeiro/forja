@@ -12,18 +12,136 @@ pub use layer::{ConfigError, KeyPath, Layer, Layered, Origin, Schema, layer};
 pub use set::set_layer;
 pub use units::{ByteSize, Duration, Unbounded};
 
-use std::path::PathBuf;
+use std::{collections::BTreeMap, num::NonZeroU32, path::PathBuf};
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de};
 
 /// Configuration used by development commands.
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DevConfig {
     /// Developer filesystem locations.
     pub paths: Paths,
     /// Host resource limits.
     pub limits: Limits,
+    /// Benchmark workload and measurement settings.
+    pub bench: Bench,
+}
+
+/// Benchmark workload and measurement settings.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Bench {
+    /// Number of prompt-processing tokens.
+    pub pp: NonZeroU32,
+    /// Number of token-generation tokens.
+    pub tg: NonZeroU32,
+    /// Number of measured repetitions.
+    pub reps: NonZeroU32,
+    /// Number of unmeasured warmup repetitions.
+    pub warmups: u32,
+    /// Prefill length used before timed decode.
+    pub decode_prefill: NonZeroU32,
+    /// Decode context lengths to measure.
+    pub contexts: ContextList,
+    /// Token-selection strategies to measure.
+    pub selection: SelectionList,
+    /// Whether to collect per-operation timings.
+    pub breakdown: bool,
+    /// Configuration axes parsed for later benchmark expansion.
+    pub vary: BTreeMap<KeyPath, Vec<toml::Value>>,
+}
+
+impl Default for Bench {
+    fn default() -> Self {
+        Self {
+            pp: nonzero(512),
+            tg: nonzero(128),
+            reps: nonzero(30),
+            warmups: 3,
+            decode_prefill: nonzero(8),
+            contexts: ContextList(vec![9, 512, 2_048, 4_000]),
+            selection: SelectionList(vec![Selection::GpuSequential, Selection::GpuPipelined]),
+            breakdown: false,
+            vary: BTreeMap::new(),
+        }
+    }
+}
+
+const fn nonzero(value: u32) -> NonZeroU32 {
+    match NonZeroU32::new(value) {
+        Some(value) => value,
+        None => NonZeroU32::MIN,
+    }
+}
+
+/// A non-empty list of benchmark token-selection strategies.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct SelectionList(Vec<Selection>);
+
+impl SelectionList {
+    /// Returns the validated selections.
+    #[must_use]
+    pub fn as_slice(&self) -> &[Selection] {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for SelectionList {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let selection = Vec::<Selection>::deserialize(deserializer)?;
+        if selection.is_empty() {
+            return Err(de::Error::custom("bench selection must not be empty"));
+        }
+        Ok(Self(selection))
+    }
+}
+
+/// A non-empty, strictly increasing list of benchmark contexts.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct ContextList(Vec<u32>);
+
+impl ContextList {
+    /// Returns the validated contexts.
+    #[must_use]
+    pub fn as_slice(&self) -> &[u32] {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for ContextList {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let contexts = Vec::<u32>::deserialize(deserializer)?;
+        if contexts.is_empty() {
+            return Err(de::Error::custom("bench contexts must not be empty"));
+        }
+        if contexts.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(de::Error::custom(
+                "bench contexts must be strictly increasing",
+            ));
+        }
+        Ok(Self(contexts))
+    }
+}
+
+/// Token-selection strategy measured by a benchmark.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Selection {
+    /// Read logits and select the token on the host.
+    HostArgmax,
+    /// Select tokens on the GPU and wait after each decode step.
+    GpuSequential,
+    /// Select tokens on the GPU while overlapping queued steps.
+    GpuPipelined,
 }
 
 /// Developer filesystem locations.
@@ -155,8 +273,47 @@ submission_timeout = "250ms"
     }
 
     #[test]
+    fn parses_bench_selection_and_vary_axes() {
+        let config: DevConfig = toml::from_str(
+            r#"[bench]
+contexts = [1, 7, 33, 4097]
+selection = ["host-argmax"]
+[bench.vary]
+"backend.metal.graph_replay" = ["tier1", "tier2"]
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.bench.contexts.as_slice(), [1, 7, 33, 4097]);
+        assert_eq!(config.bench.selection.as_slice(), [Selection::HostArgmax]);
+        assert_eq!(
+            config
+                .bench
+                .vary
+                .get(&KeyPath::new("backend.metal.graph_replay"))
+                .unwrap(),
+            &[
+                toml::Value::String("tier1".to_owned()),
+                toml::Value::String("tier2".to_owned())
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_bench_lists() {
+        for source in [
+            "[bench]\ncontexts = []\n",
+            "[bench]\ncontexts = [9, 7]\n",
+            "[bench]\ncontexts = [9, 9]\n",
+            "[bench]\nselection = []\n",
+        ] {
+            assert!(toml::from_str::<DevConfig>(source).is_err(), "{source}");
+        }
+    }
+
+    #[test]
     fn enum_leaves_serialize_as_scalars() {
         let value = toml::Value::try_from(DevConfig::default()).unwrap();
+        assert!(!value["bench"]["selection"][0].is_table());
         let limits = value.get("limits").unwrap();
         for key in [
             "dispatches_per_list",
