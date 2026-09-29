@@ -5,7 +5,7 @@ wit_bindgen::generate!({
     world: "engine-component",
 });
 
-use exports::l9o::gpu::engine::{EngineInfo, Guest, StepIn, StepOut};
+use exports::l9o::gpu::engine::{DecodeIn, DecodeOut, EngineInfo, Guest, StepIn, StepOut};
 use l9o::gpu::compute::{Dtype, Error, Tensor, Weights};
 
 struct Component;
@@ -58,6 +58,12 @@ impl Guest for Component {
             vec![]
         };
         Ok(StepOut { logits, taps })
+    }
+
+    async fn decode(_input: DecodeIn) -> Result<DecodeOut, Error> {
+        Err(Error::OpSignature(
+            "engine does not support retained-token decode".to_owned(),
+        ))
     }
 }
 

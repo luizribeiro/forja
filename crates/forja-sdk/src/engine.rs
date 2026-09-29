@@ -29,6 +29,22 @@ pub struct StepOutput {
     pub taps: Vec<Tensor<f32>>,
 }
 
+/// Input to greedy decode with an engine-retained feedback token.
+pub struct DecodeInput {
+    /// Tokens to process, or `None` to reuse the preceding selected token.
+    pub tokens: Option<Tensor<u32>>,
+    /// Position assigned to the first token, including a reused feedback token.
+    pub start_pos: u32,
+}
+
+/// Device-resident outputs from greedy decode.
+pub struct DecodeOutput {
+    /// Last-position logits with shape `[vocab]`.
+    pub logits: Tensor<f32>,
+    /// Selected token id with shape `[1]`.
+    pub token: Tensor<u32>,
+}
+
 /// A model implementation exported through the component engine contract.
 pub trait Engine: Sized + 'static {
     /// Returns static model metadata without loading weights.
@@ -47,4 +63,15 @@ pub trait Engine: Sized + 'static {
     ///
     /// Returns an error when the input is invalid or execution fails.
     fn step(&mut self, input: StepInput) -> Result<StepOutput>;
+
+    /// Runs greedy decode, optionally reusing the engine-retained token selected previously.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when this engine does not provide retained-token decode.
+    fn decode(&mut self, _input: DecodeInput) -> Result<DecodeOutput> {
+        Err(crate::Error::loading(
+            "engine does not support retained-token decode",
+        ))
+    }
 }

@@ -64,6 +64,7 @@ fn expand_engine(item: &ItemImpl) -> syn::Result<proc_macro2::TokenStream> {
         .strip_prefix("package l9o:gpu@0.1.0;\n")
         .ok_or_else(|| syn::Error::new_spanned(&item.self_ty, "engine WIT package changed"))?;
     let wit = format!("{COMPUTE_WIT}\n{engine_wit}");
+    let guest_impl = engine_guest_impl();
     Ok(quote! {
         #item
 
@@ -88,7 +89,7 @@ fn expand_engine(item: &ItemImpl) -> syn::Result<proc_macro2::TokenStream> {
             }
 
             use bindings::exports::l9o::gpu::engine::{
-                EngineInfo as WitEngineInfo, Guest, StepIn, StepOut,
+                DecodeIn, DecodeOut, EngineInfo as WitEngineInfo, Guest, StepIn, StepOut,
             };
             use ::forja_sdk::__private::compute;
 
@@ -98,61 +99,7 @@ fn expand_engine(item: &ItemImpl) -> syn::Result<proc_macro2::TokenStream> {
                 static ENGINE: RefCell<Option<ExportedEngine>> = const { RefCell::new(None) };
             }
 
-            impl Guest for Component {
-                fn describe() -> WitEngineInfo {
-                    let info = <ExportedEngine as ::forja_sdk::Engine>::describe();
-                    WitEngineInfo {
-                        vocab: info.vocab,
-                        max_context: info.max_context,
-                        tap_layers: info.tap_layers,
-                    }
-                }
-
-                async fn load(
-                    weights: &compute::Weights,
-                ) -> ::std::result::Result<(), compute::Error> {
-                    let weights = ::forja_sdk::Weights::from_guest(weights);
-                    let engine = <ExportedEngine as ::forja_sdk::Engine>::load(&weights)
-                        .map_err(wit_error)?;
-                    ENGINE.with(|slot| {
-                        let mut slot = slot.try_borrow_mut().map_err(|_| {
-                            compute::Error::OpSignature("engine state is already borrowed".into())
-                        })?;
-                        *slot = Some(engine);
-                        Ok(())
-                    })
-                }
-
-                async fn step(input: StepIn) -> ::std::result::Result<StepOut, compute::Error> {
-                    let tokens = ::forja_sdk::Tensor::from_slice(
-                        &input.tokens,
-                        &[u32::try_from(input.tokens.len()).map_err(|_| {
-                            compute::Error::Layout("token count exceeds u32".into())
-                        })?],
-                    ).map_err(wit_error)?;
-                    let output = ENGINE.with(|slot| {
-                        let mut slot = slot.try_borrow_mut().map_err(|_| {
-                            compute::Error::OpSignature("engine state is already borrowed".into())
-                        })?;
-                        let engine = slot.as_mut().ok_or_else(|| {
-                            compute::Error::InvalidHandle("engine is not loaded".into())
-                        })?;
-                        <ExportedEngine as ::forja_sdk::Engine>::step(
-                            engine,
-                            ::forja_sdk::StepInput {
-                                tokens,
-                                start_pos: input.start_pos,
-                                taps: input.taps,
-                            },
-                        ).map_err(wit_error)
-                    })?;
-                    ::forja_sdk::eval().map_err(wit_error)?;
-                    Ok(StepOut {
-                        logits: output.logits.into_guest(),
-                        taps: output.taps.into_iter().map(::forja_sdk::Tensor::into_guest).collect(),
-                    })
-                }
-            }
+            #guest_impl
 
             fn wit_error(error: ::forja_sdk::Error) -> compute::Error {
                 compute::Error::OpSignature(error.to_string())
@@ -161,6 +108,95 @@ fn expand_engine(item: &ItemImpl) -> syn::Result<proc_macro2::TokenStream> {
             bindings::export!(Component with_types_in bindings);
         }
     })
+}
+
+fn engine_guest_impl() -> proc_macro2::TokenStream {
+    quote! {
+        impl Guest for Component {
+            fn describe() -> WitEngineInfo {
+                let info = <ExportedEngine as ::forja_sdk::Engine>::describe();
+                WitEngineInfo {
+                    vocab: info.vocab,
+                    max_context: info.max_context,
+                    tap_layers: info.tap_layers,
+                }
+            }
+
+            async fn load(
+                weights: &compute::Weights,
+            ) -> ::std::result::Result<(), compute::Error> {
+                let weights = ::forja_sdk::Weights::from_guest(weights);
+                let engine = <ExportedEngine as ::forja_sdk::Engine>::load(&weights)
+                    .map_err(wit_error)?;
+                ENGINE.with(|slot| {
+                    let mut slot = slot.try_borrow_mut().map_err(|_| {
+                        compute::Error::OpSignature("engine state is already borrowed".into())
+                    })?;
+                    *slot = Some(engine);
+                    Ok(())
+                })
+            }
+
+            async fn step(input: StepIn) -> ::std::result::Result<StepOut, compute::Error> {
+                let tokens = token_tensor(&input.tokens)?;
+                let output = with_engine(|engine| {
+                    <ExportedEngine as ::forja_sdk::Engine>::step(
+                        engine,
+                        ::forja_sdk::StepInput {
+                            tokens,
+                            start_pos: input.start_pos,
+                            taps: input.taps,
+                        },
+                    )
+                })?;
+                ::forja_sdk::eval().map_err(wit_error)?;
+                Ok(StepOut {
+                    logits: output.logits.into_guest(),
+                    taps: output.taps.into_iter().map(::forja_sdk::Tensor::into_guest).collect(),
+                })
+            }
+
+            async fn decode(input: DecodeIn) -> ::std::result::Result<DecodeOut, compute::Error> {
+                let tokens = input.tokens.as_deref().map(token_tensor).transpose()?;
+                let output = with_engine(|engine| {
+                    <ExportedEngine as ::forja_sdk::Engine>::decode(
+                        engine,
+                        ::forja_sdk::DecodeInput {
+                            tokens,
+                            start_pos: input.start_pos,
+                        },
+                    )
+                })?;
+                ::forja_sdk::eval().map_err(wit_error)?;
+                Ok(DecodeOut {
+                    logits: output.logits.into_guest(),
+                    token: output.token.into_guest(),
+                })
+            }
+        }
+
+        fn with_engine<T>(
+            call: impl FnOnce(&mut ExportedEngine) -> ::forja_sdk::Result<T>,
+        ) -> ::std::result::Result<T, compute::Error> {
+            ENGINE.with(|slot| {
+                let mut slot = slot.try_borrow_mut().map_err(|_| {
+                    compute::Error::OpSignature("engine state is already borrowed".into())
+                })?;
+                let engine = slot.as_mut().ok_or_else(|| {
+                    compute::Error::InvalidHandle("engine is not loaded".into())
+                })?;
+                call(engine).map_err(wit_error)
+            })
+        }
+
+        fn token_tensor(
+            tokens: &[u32],
+        ) -> ::std::result::Result<::forja_sdk::Tensor<u32>, compute::Error> {
+            let len = u32::try_from(tokens.len())
+                .map_err(|_| compute::Error::Layout("token count exceeds u32".into()))?;
+            ::forja_sdk::Tensor::from_slice(tokens, &[len]).map_err(wit_error)
+        }
+    }
 }
 
 /// Derives recursive loading from a safetensors namespace.

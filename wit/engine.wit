@@ -20,9 +20,20 @@ interface engine {
     taps: list<tensor>,
   }
 
+  record decode-in {
+    tokens: option<list<u32>>,
+    start-pos: u32,
+  }
+
+  record decode-out {
+    logits: tensor,
+    token: tensor,
+  }
+
   describe: func() -> engine-info;
   load: async func(w: borrow<weights>) -> result<_, error>;
   step: async func(input: step-in) -> result<step-out, error>;
+  decode: async func(input: decode-in) -> result<decode-out, error>;
 }
 
 // This initial contract uses one sequence and engine-owned cache tensors.
