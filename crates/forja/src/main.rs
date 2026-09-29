@@ -7,6 +7,7 @@ mod benchmark_stats;
 mod config_show;
 mod engine;
 mod generate;
+mod profile;
 mod provenance;
 mod verify;
 
@@ -37,6 +38,7 @@ fn run(command: args::Command) -> Result<(), Box<dyn Error>> {
     match command {
         args::Command::Bench(options) => runtime.block_on(benchmark::run(&options)),
         args::Command::Config(_) => unreachable!("configuration commands return before runtime"),
+        args::Command::Profile(options) => runtime.block_on(profile::run(&options)),
         args::Command::Run(options) => runtime.block_on(generate::run(&options)),
         args::Command::Verify(options) => runtime.block_on(verify::run(&options)),
     }

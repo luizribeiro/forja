@@ -2,8 +2,8 @@ use std::{collections::BTreeMap, fs, path::PathBuf};
 
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use forja_config::{
-    BackendKind, ConfigError, DevConfig, GraphReplay, KeyPath, Layer, Layered, Limits, Origin,
-    Selection, dev_layers, file_layer, layer, set_layer,
+    BackendKind, BenchSampling, ConfigError, DevConfig, GraphReplay, KeyPath, Layer, Layered,
+    Limits, Origin, Selection, dev_layers, file_layer, layer, set_layer,
 };
 
 use crate::benchmark_record::{Recorded, SCHEMA_VERSION};
@@ -142,6 +142,35 @@ pub(crate) struct BenchPoint {
     pub(crate) values: BTreeMap<KeyPath, toml::Value>,
 }
 
+#[derive(Debug, PartialEq)]
+pub(crate) struct Profile {
+    pub(crate) engine: PathBuf,
+    pub(crate) model_dir: PathBuf,
+    pub(crate) context: usize,
+    pub(crate) warmups: usize,
+    pub(crate) sampling: BenchSampling,
+    pub(crate) json: bool,
+    pub(crate) scratch: PathBuf,
+    pub(crate) graph_replay: GraphReplay,
+    pub(crate) limits: Limits,
+}
+
+#[derive(Args)]
+struct ProfileArgs {
+    /// WebAssembly engine component.
+    #[arg(long)]
+    engine: PathBuf,
+    /// Directory containing model weights.
+    #[arg(long)]
+    model_dir: PathBuf,
+    /// Decode context length to profile.
+    #[arg(long, value_parser = parse_profile_context)]
+    context: u32,
+    /// Write JSON under the configured scratch directory instead of Markdown.
+    #[arg(long)]
+    json: bool,
+}
+
 #[derive(Args)]
 struct BenchArgs {
     /// WebAssembly engine component. Repeat to compare engines.
@@ -199,6 +228,7 @@ enum AxisClass {
 pub(crate) enum Command {
     Bench(Bench),
     Config(ConfigShow),
+    Profile(Profile),
     Run(Run),
     Verify(Verify),
 }
@@ -262,6 +292,8 @@ enum ParsedCommand {
     Bench(BenchArgs),
     /// Inspect configuration.
     Config(ConfigArgs),
+    /// Profile one decode token.
+    Profile(ProfileArgs),
     /// Generate a completion.
     Run(RunArgs),
     /// Compare engine outputs with golden fixtures.
@@ -341,6 +373,9 @@ fn parse_with(
                 defaults: options.defaults,
             }),
         },
+        ParsedCommand::Profile(options) => {
+            Command::Profile(options.with_config(&layered.config, limits)?)
+        }
         ParsedCommand::Run(options) => Command::Run(options.with_config(&layered.config, limits)?),
         ParsedCommand::Verify(options) => {
             Command::Verify(options.with_config(&layered.config, limits)?)
@@ -416,6 +451,14 @@ fn parse_positive(value: &str) -> Result<u32, String> {
         .ok()
         .filter(|&count| count > 0)
         .ok_or_else(|| "value must be a positive integer".to_owned())
+}
+
+fn parse_profile_context(value: &str) -> Result<u32, String> {
+    value
+        .parse()
+        .ok()
+        .filter(|&count| count > 1)
+        .ok_or_else(|| "value must be an integer greater than one".to_owned())
 }
 
 fn parse_key_path(value: &str) -> Result<KeyPath, String> {
@@ -564,7 +607,7 @@ impl ParsedCommand {
                 values.extend(backend_sugar(options.backend));
                 values.extend(graph_replay_sugar(options.graph_replay));
             }
-            Self::Config(_) => {}
+            Self::Config(_) | Self::Profile(_) => {}
         }
         values
             .into_iter()
@@ -836,6 +879,29 @@ fn validate_bench_sampling(config: &DevConfig) -> Result<(), String> {
     Ok(())
 }
 
+impl ProfileArgs {
+    fn with_config(self, config: &DevConfig, limits: Limits) -> Result<Profile, clap::Error> {
+        validate_bench_sampling(config).map_err(|error| {
+            Cli::command().error(clap::error::ErrorKind::ValueValidation, error)
+        })?;
+        Ok(Profile {
+            engine: self.engine,
+            model_dir: self.model_dir,
+            context: usize::try_from(self.context).map_err(|error| {
+                Cli::command().error(clap::error::ErrorKind::ValueValidation, error.to_string())
+            })?,
+            warmups: usize::try_from(config.bench.warmups).map_err(|error| {
+                Cli::command().error(clap::error::ErrorKind::ValueValidation, error.to_string())
+            })?,
+            sampling: config.bench.sampling,
+            json: self.json,
+            scratch: config.paths.scratch.clone(),
+            graph_replay: config.backend.metal.resolve().graph_replay,
+            limits,
+        })
+    }
+}
+
 impl RunArgs {
     fn with_config(self, config: &DevConfig, limits: Limits) -> Result<Run, clap::Error> {
         let max_tokens = usize::try_from(config.run.max_tokens).map_err(|error| {
@@ -968,6 +1034,35 @@ mod tests {
         assert_eq!(options.model_dir, PathBuf::from("/model"));
         assert_eq!((options.pp, options.tg, options.reps), (33, 7, 2));
         assert_eq!(options.json, Some(PathBuf::from("/result.json")));
+    }
+
+    #[test]
+    fn parses_profile_options_with_bench_configuration() {
+        let command = parse(
+            [
+                "--isolated",
+                "--set",
+                "bench.warmups=7",
+                "profile",
+                "--engine",
+                "/engine.wasm",
+                "--model-dir",
+                "/model",
+                "--context",
+                "512",
+                "--json",
+            ]
+            .map(str::to_owned),
+        )
+        .unwrap();
+        let Command::Profile(options) = command else {
+            panic!("expected profile command");
+        };
+        assert_eq!(options.engine, PathBuf::from("/engine.wasm"));
+        assert_eq!(options.context, 512);
+        assert_eq!(options.warmups, 7);
+        assert!(options.json);
+        assert_eq!(options.scratch, PathBuf::from("target/forja-bench"));
     }
 
     #[test]

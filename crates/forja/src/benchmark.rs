@@ -17,7 +17,7 @@ use forja_host::{
 use golden_fixtures::{decode_f32_le, sha256_file};
 
 use crate::{
-    args::{Bench, BenchPoint},
+    args::{Bench, BenchPoint, Profile},
     benchmark_record::{self, Input, PerfKey, Recorded},
     benchmark_stats::{Stats, stats, synthetic_tokens},
     engine::{argmax, limits, read_token},
@@ -40,6 +40,13 @@ struct Sample {
     wall_seconds: f64,
     gpu_seconds: f64,
     submissions: u32,
+}
+
+pub(crate) struct TokenProfile {
+    pub(crate) device: String,
+    pub(crate) baseline_wall: Duration,
+    pub(crate) baseline_gpu: Duration,
+    pub(crate) step: EngineStepProfile,
 }
 
 #[derive(Clone, Copy)]
@@ -78,6 +85,60 @@ pub(crate) async fn run(options: &Bench) -> Result<(), Box<dyn Error>> {
     return run_metal(options).await;
     #[cfg(not(target_os = "macos"))]
     Err("engine benchmarks require macOS and Metal".into())
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) async fn measure_token_profile(
+    options: &Profile,
+) -> Result<TokenProfile, Box<dyn Error>> {
+    let backend =
+        forja_metal::MetalBackend::with_graph_replay(metal_graph_replay(options.graph_replay))?;
+    let device = backend.device_name();
+    let mut runner = EngineRunner::new(
+        &options.engine,
+        backend,
+        limits(&options.limits)?,
+        options.model_dir.join("model.safetensors"),
+    )
+    .await?;
+    let info = runner.describe().await?;
+    if options.context >= usize::try_from(info.max_context)? {
+        return Err("profile context exceeds the engine context".into());
+    }
+    runner
+        .load()
+        .await?
+        .map_err(|error| format!("engine load failed: {error:?}"))?;
+    let tokens = synthetic_tokens(options.context - 1, info.vocab);
+    let decode = DecodeOptions {
+        host_argmax: false,
+        overlap: false,
+        sampling: SamplingParams {
+            temperature: options.sampling.temperature,
+            top_k: options.sampling.top_k,
+            top_p: options.sampling.top_p,
+            seed: options.sampling.seed,
+        },
+    };
+    for _ in 0..options.warmups {
+        let token = prepare_profile_context(&mut runner, &tokens, options.context, decode).await?;
+        measure_decode_step(&mut runner, token, options.context, decode).await?;
+    }
+    let token = prepare_profile_context(&mut runner, &tokens, options.context, decode).await?;
+    let baseline = measure_decode_step(&mut runner, token, options.context, decode).await?;
+    let token = prepare_profile_context(&mut runner, &tokens, options.context, decode).await?;
+    runner.set_profiling(true);
+    let measured = measure_decode_step(&mut runner, token, options.context, decode).await;
+    runner.set_profiling(false);
+    let _ = measured?;
+    Ok(TokenProfile {
+        device,
+        baseline_wall: Duration::from_secs_f64(baseline.wall_seconds),
+        baseline_gpu: Duration::from_secs_f64(baseline.gpu_seconds),
+        step: runner
+            .take_profile()
+            .ok_or("profiled step produced no timing detail")?,
+    })
 }
 
 #[cfg(target_os = "macos")]
