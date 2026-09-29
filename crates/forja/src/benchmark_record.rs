@@ -4,7 +4,7 @@ use forja_config::{Choice, GraphReplay, KeyPath, Origin, Selection};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-use crate::args::Bench;
+use crate::args::{Bench, BenchPoint};
 
 pub(crate) const SCHEMA_VERSION: u32 = 2;
 
@@ -96,16 +96,20 @@ pub(crate) fn config_hash(snapshot: &Snapshot, inputs: &[Input]) -> Result<Strin
     })
 }
 
-pub(crate) fn perf_hash(options: &Bench, input: &Input) -> Result<String, String> {
+pub(crate) fn perf_hash(
+    options: &Bench,
+    point: &BenchPoint,
+    input: &Input,
+) -> Result<String, String> {
     hash(&PerfKey {
-        backend: options.graph_replay,
-        pp: options.pp,
-        tg: options.tg,
+        backend: point.graph_replay,
+        pp: point.pp,
+        tg: point.tg,
         reps: options.reps,
         warmups: options.warmups,
         decode_prefill: options.decode_prefill,
-        contexts: &options.contexts,
-        selection: &options.selection,
+        contexts: &point.contexts,
+        selection: &point.selection,
         breakdown: options.breakdown,
         engine_sha256: &input.engine_sha256,
         weights_sha256: &input.weights_sha256,
@@ -166,12 +170,28 @@ mod tests {
             limits: config.limits.clone(),
             config: Box::new(config),
             origins: BTreeMap::new(),
+            axes: BTreeMap::new(),
+            points: Vec::new(),
+        }
+    }
+
+    fn point(options: &Bench) -> BenchPoint {
+        BenchPoint {
+            pp: options.pp,
+            tg: options.tg,
+            contexts: options.contexts.clone(),
+            selection: options.selection.clone(),
+            graph_replay: options.graph_replay,
+            config: options.config.clone(),
+            origins: options.origins.clone(),
+            values: BTreeMap::new(),
         }
     }
 
     #[test]
     fn config_and_performance_hashes_are_deterministic() {
         let options = options();
+        let point = point(&options);
         let snapshot = snapshot(&options, "Apple M3 Ultra", "26.6").unwrap();
         let inputs = vec![Input {
             engine_sha256: "engine".to_owned(),
@@ -184,7 +204,7 @@ mod tests {
             "sha256:95d94399d6e91a69d57e5a7236df00cd71becc644ed58068e954222579f4fe96"
         );
         assert_eq!(
-            perf_hash(&options, &inputs[0]).unwrap(),
+            perf_hash(&options, &point, &inputs[0]).unwrap(),
             "sha256:37cb92a99e577a083df83232c34cd1db744c181b3f232ed3fc1cc67c4eeccbc6"
         );
     }

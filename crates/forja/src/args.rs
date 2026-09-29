@@ -105,6 +105,20 @@ pub(crate) struct Bench {
     pub(crate) limits: Limits,
     pub(crate) config: Box<DevConfig>,
     pub(crate) origins: BTreeMap<KeyPath, Origin>,
+    pub(crate) axes: BTreeMap<KeyPath, Vec<toml::Value>>,
+    pub(crate) points: Vec<BenchPoint>,
+}
+
+#[derive(Debug, PartialEq)]
+pub(crate) struct BenchPoint {
+    pub(crate) pp: usize,
+    pub(crate) tg: usize,
+    pub(crate) contexts: Vec<usize>,
+    pub(crate) selection: Vec<Selection>,
+    pub(crate) graph_replay: GraphReplay,
+    pub(crate) config: Box<DevConfig>,
+    pub(crate) origins: BTreeMap<KeyPath, Origin>,
+    pub(crate) values: BTreeMap<KeyPath, toml::Value>,
 }
 
 #[derive(Args)]
@@ -506,6 +520,9 @@ impl BenchArgs {
                 Cli::command().error(clap::error::ErrorKind::ValueValidation, error.to_string())
             })
         };
+        let points = expand_points(layered).map_err(|error| {
+            Cli::command().error(clap::error::ErrorKind::ValueValidation, error)
+        })?;
         Ok(Bench {
             engines: self.engines,
             model_dir: self.model_dir,
@@ -529,8 +546,76 @@ impl BenchArgs {
             limits,
             config: Box::new(config.clone()),
             origins: layered.origins.clone(),
+            axes: config.bench.vary.clone(),
+            points,
         })
     }
+}
+
+fn expand_points(layered: &Layered<DevConfig>) -> Result<Vec<BenchPoint>, String> {
+    for (key, values) in &layered.config.bench.vary {
+        axis_class(key.as_str())?;
+        if values.is_empty() {
+            return Err(format!("vary axis {key} must not be empty"));
+        }
+    }
+    let mut combinations = vec![BTreeMap::new()];
+    for (key, values) in &layered.config.bench.vary {
+        combinations = combinations
+            .into_iter()
+            .flat_map(|point| {
+                values.iter().cloned().map(move |value| {
+                    let mut next = point.clone();
+                    next.insert(key.clone(), value);
+                    next
+                })
+            })
+            .collect();
+    }
+    combinations
+        .into_iter()
+        .map(|values| point(layered, values))
+        .collect()
+}
+
+fn point(
+    base: &Layered<DevConfig>,
+    values: BTreeMap<KeyPath, toml::Value>,
+) -> Result<BenchPoint, String> {
+    let base_table = toml::Value::try_from(&base.config)
+        .map_err(|error| format!("cannot serialize benchmark config: {error}"))?
+        .as_table()
+        .cloned()
+        .ok_or_else(|| "benchmark config is not a table".to_owned())?;
+    let mut layers = vec![Layer::new(Origin::Default, base_table)];
+    for (key, value) in &values {
+        let table = toml::from_str(&format!("{key} = {value}"))
+            .map_err(|error| format!("vary axis {key}: {error}"))?;
+        layers.push(Layer::new(Origin::Vary, table));
+    }
+    let resolved = layer::<DevConfig>(layers).map_err(|error| error.to_string())?;
+    let mut origins = base.origins.clone();
+    origins.extend(values.keys().cloned().map(|key| (key, Origin::Vary)));
+    let count =
+        |value: u32| usize::try_from(value).map_err(|error| format!("benchmark count: {error}"));
+    Ok(BenchPoint {
+        pp: count(resolved.config.bench.pp.get())?,
+        tg: count(resolved.config.bench.tg.get())?,
+        contexts: resolved
+            .config
+            .bench
+            .contexts
+            .as_slice()
+            .iter()
+            .copied()
+            .map(count)
+            .collect::<Result<_, _>>()?,
+        selection: resolved.config.bench.selection.as_slice().to_vec(),
+        graph_replay: resolved.config.backend.metal.resolve().graph_replay,
+        config: Box::new(resolved.config),
+        origins,
+        values,
+    })
 }
 
 fn parse_vary(expression: &str) -> Result<VaryArg, String> {
@@ -813,6 +898,48 @@ mod tests {
     }
 
     #[test]
+    fn expands_vary_axes_as_a_cartesian_product() {
+        let command = parse(
+            [
+                "bench",
+                "--engine",
+                "/engine.wasm",
+                "--model-dir",
+                "/model",
+                "--vary",
+                "backend.metal.graph_replay=tier1,tier2",
+                "--vary",
+                "bench.tg=7,33",
+            ]
+            .map(str::to_owned),
+        )
+        .unwrap();
+        let Command::Bench(options) = command else {
+            panic!("expected bench command");
+        };
+        assert_eq!(options.points.len(), 4);
+        assert_eq!(
+            options
+                .points
+                .iter()
+                .map(|point| (point.graph_replay, point.tg))
+                .collect::<Vec<_>>(),
+            [
+                (GraphReplay::Tier1, 7),
+                (GraphReplay::Tier1, 33),
+                (GraphReplay::Tier2, 7),
+                (GraphReplay::Tier2, 33),
+            ]
+        );
+        assert!(
+            options
+                .points
+                .iter()
+                .all(|point| point.origins.values().any(|origin| *origin == Origin::Vary))
+        );
+    }
+
+    #[test]
     fn parses_toml_array_axes_and_replaces_repeated_keys() {
         let command = parse(
             [
@@ -832,12 +959,8 @@ mod tests {
         let Command::Bench(options) = command else {
             panic!("expected bench command");
         };
-        assert_eq!(
-            options.config.bench.vary[&KeyPath::new("bench.selection")],
-            [toml::Value::Array(vec![toml::Value::String(
-                "gpu-sequential".to_owned()
-            )])]
-        );
+        assert_eq!(options.points.len(), 1);
+        assert_eq!(options.points[0].selection, [Selection::GpuSequential]);
     }
 
     #[test]

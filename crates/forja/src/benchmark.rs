@@ -16,7 +16,7 @@ use forja_host::{
 use golden_fixtures::{decode_f32_le, sha256_file};
 
 use crate::{
-    args::Bench,
+    args::{Bench, BenchPoint},
     benchmark_record::{self, Input},
     benchmark_stats::{Stats, stats, synthetic_tokens},
     engine::{argmax, limits, read_token},
@@ -93,54 +93,18 @@ async fn run_metal(options: &Bench) -> Result<(), Box<dyn Error>> {
             })
         })
         .collect::<Result<Vec<_>, std::io::Error>>()?;
-    let perf_hashes = inputs
+    let perf_hashes = options
+        .points
         .iter()
-        .map(|input| benchmark_record::perf_hash(options, input))
-        .collect::<Result<Vec<_>, _>>()?;
-    let mut results = Vec::new();
-    let mut record_device = None;
-    println!(
-        "engine\tselection\tmetric\twall tok/s (95% CI)\tGPU tok/s (95% CI)\twall ms\tGPU ms\tsubmissions"
-    );
-    for (input, component) in options.engines.iter().enumerate() {
-        let engine = component.display().to_string();
-        for &strategy in &options.selection {
-            let (host_argmax, overlap) = selection_mode(strategy);
-            let selection = selection_name(strategy);
-            let (pp, tg, device, profiles, output_digest) =
-                bench_engine(options, component, host_argmax, overlap).await?;
-            if record_device.as_ref().is_some_and(|known| known != &device) {
-                return Err("benchmark engines opened different Metal devices".into());
-            }
-            record_device = Some(device.clone());
-            print_summary(&engine, selection, "pp", pp);
-            print_summary(&engine, selection, "tg", tg);
-            let profile_reports = profiles
+        .map(|point| {
+            inputs
                 .iter()
-                .map(profile_report)
-                .collect::<Result<Vec<_>, _>>()?;
-            for report in &profile_reports {
-                print_profile_report(&engine, selection, report);
-            }
-            let mut result = serde_json::json!({
-                "input": input,
-                "point": {},
-                "perf_hash": perf_hashes[input],
-                "output_digest": output_digest,
-                "selection": selection,
-                "pp": summary_json(pp),
-                "tg": summary_json(tg),
-                "breakdown": null,
-            });
-            if !profile_reports.is_empty() {
-                result["breakdown"] =
-                    serde_json::Value::Array(profile_reports.iter().map(profile_json).collect());
-            }
-            results.push(result);
-        }
-    }
+                .map(|input| benchmark_record::perf_hash(options, point, input))
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let (results, device) = measure_points(options, &perf_hashes).await?;
     if let Some(path) = &options.json {
-        let device = record_device.ok_or("benchmark produced no results")?;
         let snapshot = benchmark_record::snapshot(options, &device, &os)?;
         let report = serde_json::json!({
             "schema_version": benchmark_record::SCHEMA_VERSION,
@@ -160,8 +124,8 @@ async fn run_metal(options: &Bench) -> Result<(), Box<dyn Error>> {
             "origins": snapshot.origins,
             "auto_notes": snapshot.auto_notes,
             "config_hash": benchmark_record::config_hash(&snapshot, &inputs)?,
-            "perf_hash": benchmark_record::combined_perf_hash(&perf_hashes)?,
-            "axes": {},
+            "perf_hash": benchmark_record::combined_perf_hash(&perf_hashes.iter().flatten().cloned().collect::<Vec<_>>())?,
+            "axes": options.axes,
             "results": results,
         });
         let mut bytes = serde_json::to_vec_pretty(&report)?;
@@ -172,14 +136,71 @@ async fn run_metal(options: &Bench) -> Result<(), Box<dyn Error>> {
 }
 
 #[cfg(target_os = "macos")]
+async fn measure_points(
+    options: &Bench,
+    perf_hashes: &[Vec<String>],
+) -> Result<(Vec<serde_json::Value>, String), Box<dyn Error>> {
+    let mut results = Vec::new();
+    let mut record_device = None;
+    println!(
+        "engine\tselection\tmetric\twall tok/s (95% CI)\tGPU tok/s (95% CI)\twall ms\tGPU ms\tsubmissions"
+    );
+    for (point_index, point) in options.points.iter().enumerate() {
+        for (input, component) in options.engines.iter().enumerate() {
+            let engine = component.display().to_string();
+            for &strategy in &point.selection {
+                let (host_argmax, overlap) = selection_mode(strategy);
+                let selection = selection_name(strategy);
+                let (pp, tg, device, profiles, output_digest) =
+                    bench_engine(options, point, component, host_argmax, overlap).await?;
+                if record_device.as_ref().is_some_and(|known| known != &device) {
+                    return Err("benchmark engines opened different Metal devices".into());
+                }
+                record_device = Some(device.clone());
+                print_summary(&engine, selection, "pp", pp);
+                print_summary(&engine, selection, "tg", tg);
+                let profile_reports = profiles
+                    .iter()
+                    .map(profile_report)
+                    .collect::<Result<Vec<_>, _>>()?;
+                for report in &profile_reports {
+                    print_profile_report(&engine, selection, report);
+                }
+                let mut result = serde_json::json!({
+                    "input": input,
+                    "point": point.values,
+                    "perf_hash": perf_hashes[point_index][input],
+                    "output_digest": output_digest,
+                    "selection": selection,
+                    "pp": summary_json(pp),
+                    "tg": summary_json(tg),
+                    "breakdown": null,
+                });
+                if !profile_reports.is_empty() {
+                    result["breakdown"] = serde_json::Value::Array(
+                        profile_reports.iter().map(profile_json).collect(),
+                    );
+                }
+                results.push(result);
+            }
+        }
+    }
+    Ok((
+        results,
+        record_device.ok_or("benchmark produced no results")?,
+    ))
+}
+
+#[cfg(target_os = "macos")]
 async fn bench_engine(
     options: &Bench,
+    point: &BenchPoint,
     component: &Path,
     host_argmax: bool,
     overlap: bool,
 ) -> Result<(Summary, Summary, String, Vec<ProfileMeasurement>, String), Box<dyn Error>> {
     let backend =
-        forja_metal::MetalBackend::with_graph_replay(metal_graph_replay(options.graph_replay))?;
+        forja_metal::MetalBackend::with_graph_replay(metal_graph_replay(point.graph_replay))?;
     let device = backend.device_name();
     let mut runner = EngineRunner::new(
         component,
@@ -190,7 +211,7 @@ async fn bench_engine(
     .await?;
     let info = runner.describe().await?;
     let max_context = usize::try_from(info.max_context)?;
-    let profile_context = *options
+    let profile_context = *point
         .contexts
         .last()
         .ok_or("no profile contexts configured")?;
@@ -198,9 +219,9 @@ async fn bench_engine(
         .decode_prefill
         .checked_add(1)
         .ok_or("decode context length overflowed")?;
-    if options.pp > max_context
+    if point.pp > max_context
         || tg_context_start
-            .checked_add(options.tg)
+            .checked_add(point.tg)
             .ok_or("decode context length overflowed")?
             > max_context
         || options.breakdown && profile_context >= max_context
@@ -217,15 +238,15 @@ async fn bench_engine(
         0
     };
     let tokens = synthetic_tokens(
-        options.pp.max(options.decode_prefill).max(profile_tokens),
+        point.pp.max(options.decode_prefill).max(profile_tokens),
         info.vocab,
     );
     for _ in 0..options.warmups {
-        measure_prefill(&mut runner, &tokens[..options.pp]).await?;
+        measure_prefill(&mut runner, &tokens[..point.pp]).await?;
         measure_decode(
             &mut runner,
             &tokens[..options.decode_prefill],
-            options.tg,
+            point.tg,
             host_argmax,
             overlap,
         )
@@ -234,12 +255,12 @@ async fn bench_engine(
     let mut pp = Vec::with_capacity(options.reps);
     let mut tg = Vec::with_capacity(options.reps);
     for _ in 0..options.reps {
-        pp.push(measure_prefill(&mut runner, &tokens[..options.pp]).await?);
+        pp.push(measure_prefill(&mut runner, &tokens[..point.pp]).await?);
         tg.push(
             measure_decode(
                 &mut runner,
                 &tokens[..options.decode_prefill],
-                options.tg,
+                point.tg,
                 host_argmax,
                 overlap,
             )
@@ -252,7 +273,7 @@ async fn bench_engine(
             &tokens,
             options.reps,
             options.warmups,
-            &options.contexts,
+            &point.contexts,
             host_argmax,
             overlap,
         )
@@ -261,10 +282,10 @@ async fn bench_engine(
         Vec::new()
     };
     let output_digest =
-        probe_output(&mut runner, &tokens[..options.decode_prefill], options.tg).await?;
+        probe_output(&mut runner, &tokens[..options.decode_prefill], point.tg).await?;
     Ok((
-        summarize(&pp, options.pp)?,
-        summarize(&tg, options.tg)?,
+        summarize(&pp, point.pp)?,
+        summarize(&tg, point.tg)?,
         device,
         profiles,
         output_digest,
