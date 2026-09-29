@@ -142,7 +142,7 @@ async fn verify<B>(
 where
     B: Backend + Send + Sync + 'static,
 {
-    let mut runner = EngineRunner::new(component, backend, limits(), weights).await?;
+    let mut runner = EngineRunner::new(component, backend, limits()?, weights).await?;
     let info = runner.describe().await?;
     if info.vocab != 151_936
         || info.max_context != 4_096
@@ -580,7 +580,7 @@ mod tests {
                 let mut runner = EngineRunner::new(
                     test_guests::engine_smoke(),
                     forja_cpu::CpuBackend::new(),
-                    limits(),
+                    limits()?,
                     &weights,
                 )
                 .await?;

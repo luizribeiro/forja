@@ -1,6 +1,46 @@
-use std::{error::Error, time::Duration};
+use std::{error::Error, num::TryFromIntError, time::Duration};
 
-use forja_host::Limits;
+use forja_config::{Limits as ConfigLimits, Unbounded};
+
+struct HostLimits(forja_host::Limits);
+
+impl TryFrom<&ConfigLimits> for HostLimits {
+    type Error = TryFromIntError;
+
+    fn try_from(limits: &ConfigLimits) -> Result<Self, Self::Error> {
+        let dispatches_per_list = match limits.dispatches_per_list {
+            Unbounded::Unlimited => usize::MAX,
+            Unbounded::Limited(value) => usize::try_from(value)?,
+        };
+        let work_per_dispatch = match limits.work_per_dispatch {
+            Unbounded::Unlimited => u64::MAX,
+            Unbounded::Limited(value) => value,
+        };
+        let gpu_time_budget = match limits.gpu_time_budget {
+            Unbounded::Unlimited => Duration::MAX,
+            Unbounded::Limited(value) => value.get(),
+        };
+        Ok(Self(
+            forja_host::Limits::new(
+                limits.live_bytes.get(),
+                usize::try_from(limits.tensor_rank)?,
+                limits.tensor_elements,
+                usize::try_from(limits.live_tensor_handles)?,
+                limits.read_bytes.get(),
+            )
+            .with_kernel_limit(usize::try_from(limits.live_kernels)?)
+            .with_graph_limit(usize::try_from(limits.live_graphs)?)
+            .with_store_limits(
+                usize::try_from(limits.guest_memory_bytes.get())?,
+                usize::try_from(limits.table_elements)?,
+                usize::try_from(limits.instances)?,
+            )
+            .with_command_limits(dispatches_per_list, work_per_dispatch)
+            .with_guest_call_timeout(limits.guest_call_timeout.get())
+            .with_gpu_limits(limits.submission_timeout.get(), gpu_time_budget),
+        ))
+    }
+}
 
 /// Selects the last greatest value under the IEEE total order.
 ///
@@ -23,17 +63,8 @@ pub(crate) fn read_token(bytes: &[u8]) -> Result<u32, Box<dyn Error>> {
     Ok(u32::from_le_bytes(bytes))
 }
 
-pub(crate) const fn limits() -> Limits {
-    Limits::new(
-        8 * 1024 * 1024 * 1024,
-        4,
-        1_000_000_000,
-        20_000,
-        1024 * 1024 * 1024,
-    )
-    .with_command_limits(4_096, u64::MAX)
-    .with_guest_call_timeout(Duration::from_secs(300))
-    .with_gpu_limits(Duration::from_secs(60), Duration::from_secs(3_600))
+pub(crate) fn limits() -> Result<forja_host::Limits, TryFromIntError> {
+    HostLimits::try_from(&ConfigLimits::default()).map(|limits| limits.0)
 }
 
 #[cfg(test)]
@@ -46,6 +77,21 @@ mod tests {
             argmax(&[]).unwrap_err().to_string(),
             "cannot take argmax of empty logits"
         );
+    }
+
+    #[test]
+    fn builds_the_existing_host_limits_from_config() {
+        let expected = forja_host::Limits::new(
+            8 * 1024 * 1024 * 1024,
+            4,
+            1_000_000_000,
+            20_000,
+            1024 * 1024 * 1024,
+        )
+        .with_command_limits(4_096, u64::MAX)
+        .with_guest_call_timeout(Duration::from_secs(300))
+        .with_gpu_limits(Duration::from_secs(60), Duration::from_secs(3_600));
+        assert_eq!(limits().unwrap(), expected);
     }
 
     #[test]

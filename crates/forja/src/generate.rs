@@ -62,7 +62,7 @@ where
     let mut runner = EngineRunner::new(
         component,
         backend,
-        limits(),
+        limits()?,
         options.model_dir.join("model.safetensors"),
     )
     .await?;

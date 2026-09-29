@@ -9,6 +9,7 @@ version.workspace = true
 [dependencies]
 clap.workspace = true
 forja-core = { path = "../forja-core" }
+forja-config = { path = "../forja-config" }
 forja-cpu = { path = "../forja-cpu" }
 forja-host = { path = "../forja-host" }
 golden-fixtures = { path = "../../support/golden-fixtures" }
