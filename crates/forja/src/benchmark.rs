@@ -73,11 +73,7 @@ pub(crate) async fn run(options: &Bench) -> Result<(), Box<dyn Error>> {
 
 #[cfg(target_os = "macos")]
 async fn run_metal(options: &Bench) -> Result<(), Box<dyn Error>> {
-    let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let commit = command_output(
-        "git",
-        &["-C", &repository.to_string_lossy(), "rev-parse", "HEAD"],
-    )?;
+    let commit = crate::provenance::commit();
     let os = command_output("sw_vers", &["-productVersion"])?;
     let mut results = Vec::new();
     println!(
@@ -102,6 +98,7 @@ async fn run_metal(options: &Bench) -> Result<(), Box<dyn Error>> {
             let mut result = serde_json::json!({
                 "provenance": {
                     "git_commit": commit,
+                    "dirty": crate::provenance::dirty(),
                     "engine_component_sha256": sha256_file(component)?,
                     "device": device,
                     "os": format!("macOS {os}"),

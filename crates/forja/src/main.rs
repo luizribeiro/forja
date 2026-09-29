@@ -6,6 +6,7 @@ mod benchmark_stats;
 mod config_show;
 mod engine;
 mod generate;
+mod provenance;
 mod verify;
 
 use std::{error::Error, process::ExitCode};
