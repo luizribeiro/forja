@@ -101,7 +101,6 @@ pub(crate) enum ProgramInst {
     Reduce(ReduceOp, u32),
 }
 
-#[allow(dead_code, reason = "used by the graph capture layer")]
 pub(crate) trait Backend {
     type Tensor;
     type Commands;
@@ -112,6 +111,7 @@ pub(crate) trait Backend {
     fn alloc(dtype: DType, shape: &[u32]) -> Result<Self::Tensor>;
     fn write(tensor: &Self::Tensor, bytes: &[u8]) -> Result<()>;
     fn view(tensor: &Self::Tensor, operation: View) -> Result<Self::Tensor>;
+    #[allow(dead_code, reason = "used by symbolic tensor views")]
     fn view_param(
         tensor: &Self::Tensor,
         params: &Self::Params,
@@ -935,9 +935,7 @@ pub(crate) use unavailable::Unavailable as Active;
 pub(crate) type Handle = <Active as Backend>::Tensor;
 pub(crate) type Commands = <Active as Backend>::Commands;
 pub(crate) type Kernel = <Active as Backend>::Kernel;
-#[allow(dead_code, reason = "used by the graph capture layer")]
 pub(crate) type Params = <Active as Backend>::Params;
-#[allow(dead_code, reason = "used by the graph capture layer")]
 pub(crate) type Graph = <Active as Backend>::Graph;
 
 pub(crate) fn dtype(dtype: u8) -> Result<DType> {
@@ -963,7 +961,7 @@ pub(crate) fn view(tensor: &Handle, operation: View) -> Result<Handle> {
     Active::view(tensor, operation)
 }
 
-#[allow(dead_code, reason = "used by the graph capture layer")]
+#[allow(dead_code, reason = "used by symbolic tensor views")]
 pub(crate) fn view_param(
     tensor: &Handle,
     params: &Params,
@@ -1011,17 +1009,14 @@ pub(crate) fn submit(commands: Commands) -> Result<()> {
     Active::submit(commands)
 }
 
-#[allow(dead_code, reason = "used by the graph capture layer")]
 pub(crate) fn params(ranges: &[(u32, u32)]) -> Result<Params> {
     Active::params(ranges)
 }
 
-#[allow(dead_code, reason = "used by the graph capture layer")]
 pub(crate) fn create_graph(commands: Commands) -> Result<Graph> {
     Active::create_graph(commands)
 }
 
-#[allow(dead_code, reason = "used by the graph capture layer")]
 pub(crate) fn replay(graph: &Graph, values: &[u32]) -> Result<()> {
     Active::replay(graph, values)
 }

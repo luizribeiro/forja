@@ -111,7 +111,7 @@ use std::{error, fmt};
 pub use element::{Element, FloatElement};
 pub use engine::{Engine, EngineInfo, StepInput, StepOutput};
 pub use forja_sdk_macros::{Load, export_engine, kernel};
-pub use graph::eval;
+pub use graph::{Dim, Graph, Param, Pos, capture, eval};
 pub use half::{bf16, f16};
 pub use load::{Load, Weights};
 pub use sys::DType;

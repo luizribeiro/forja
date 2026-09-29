@@ -1,10 +1,286 @@
-use std::{cell::RefCell, collections::VecDeque, rc::Rc};
+use std::{
+    cell::RefCell,
+    collections::VecDeque,
+    ops::{Add, RangeInclusive},
+    rc::Rc,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use crate::{Result, sys};
 
 thread_local! {
-    static CURRENT: RefCell<Option<sys::Commands>> = const { RefCell::new(None) };
+    static CURRENT: RefCell<Option<Recording>> = const { RefCell::new(None) };
     static KERNELS: RefCell<VecDeque<CachedKernel>> = const { RefCell::new(VecDeque::new()) };
+}
+
+static NEXT_PARAM_ID: AtomicU64 = AtomicU64::new(0);
+
+enum Recording {
+    Lazy(sys::Commands),
+    #[allow(dead_code, reason = "fields are used by symbolic tensor views")]
+    Capture {
+        commands: sys::Commands,
+        params: sys::Params,
+        ids: Vec<u64>,
+    },
+}
+
+/// A declared scalar parameter accepted by a captured graph.
+pub struct Param {
+    id: u64,
+    range: RangeInclusive<u32>,
+}
+
+impl Param {
+    /// Declares one nonempty inclusive parameter range.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an empty range or exhausted process identities.
+    pub fn new(range: RangeInclusive<u32>) -> Result<Self> {
+        if range.is_empty() {
+            return Err(crate::Error::new("parameter range cannot be empty"));
+        }
+        let id = NEXT_PARAM_ID
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .map_err(|_| crate::Error::new("parameter identities exhausted"))?;
+        Ok(Self { id, range })
+    }
+
+    /// Traces this parameter at one concrete value.
+    #[must_use]
+    pub fn at(&self, value: u32) -> Pos {
+        Pos {
+            id: self.id,
+            range: self.range.clone(),
+            value,
+        }
+    }
+}
+
+/// A traced position carrying both its parameter identity and concrete value.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Pos {
+    id: u64,
+    range: RangeInclusive<u32>,
+    value: u32,
+}
+
+/// A concrete or affine tensor dimension.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Dim {
+    id: Option<u64>,
+    range: Option<RangeInclusive<u32>>,
+    scale: u32,
+    offset: u32,
+    value: u32,
+}
+
+impl Dim {
+    #[allow(dead_code, reason = "used by symbolic tensor views")]
+    pub(crate) const fn value(&self) -> u32 {
+        self.value
+    }
+
+    #[allow(dead_code, reason = "used by symbolic tensor views")]
+    pub(crate) const fn is_symbolic(&self) -> bool {
+        self.id.is_some()
+    }
+
+    /// Adds a constant offset with checked arithmetic.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when either the trace value or affine offset overflows.
+    pub fn checked_add(mut self, offset: u32) -> Result<Self> {
+        self.offset = self
+            .offset
+            .checked_add(offset)
+            .ok_or_else(|| crate::Error::new("affine offset overflowed"))?;
+        self.value = self
+            .value
+            .checked_add(offset)
+            .ok_or_else(|| crate::Error::new("traced dimension overflowed"))?;
+        Ok(self)
+    }
+}
+
+impl From<u32> for Dim {
+    fn from(value: u32) -> Self {
+        Self {
+            id: None,
+            range: None,
+            scale: 0,
+            offset: value,
+            value,
+        }
+    }
+}
+
+impl From<Pos> for Dim {
+    fn from(position: Pos) -> Self {
+        Self {
+            id: Some(position.id),
+            range: Some(position.range),
+            scale: 1,
+            offset: 0,
+            value: position.value,
+        }
+    }
+}
+
+impl Add<u32> for Pos {
+    type Output = Result<Dim>;
+
+    fn add(self, offset: u32) -> Self::Output {
+        Dim::from(self).checked_add(offset)
+    }
+}
+
+/// A captured graph and the values produced while tracing it.
+pub struct Graph<T> {
+    graph: sys::Graph,
+    result: T,
+}
+
+impl<T> Graph<T> {
+    /// Replays the captured graph with concrete parameter values.
+    ///
+    /// # Errors
+    ///
+    /// Returns a host validation or execution error.
+    pub fn replay(&self, values: &[u32]) -> Result<()> {
+        sys::replay(&self.graph, values)
+    }
+
+    /// Returns the values produced while the graph was traced.
+    #[must_use]
+    pub const fn result(&self) -> &T {
+        &self.result
+    }
+}
+
+/// Captures lazy tensor operations into a replayable graph.
+///
+/// # Errors
+///
+/// Returns an error for nested capture, pending lazy work, a duplicate parameter,
+/// a trace failure, or a host-refused graph.
+pub fn capture<T>(params: &[&Param], trace: impl FnOnce() -> Result<T>) -> Result<Graph<T>> {
+    let mut ids = Vec::with_capacity(params.len());
+    for parameter in params {
+        if ids.contains(&parameter.id) {
+            return Err(crate::Error::new("capture parameters must be unique"));
+        }
+        ids.push(parameter.id);
+    }
+    let ranges = params
+        .iter()
+        .map(|parameter| (*parameter.range.start(), *parameter.range.end()))
+        .collect::<Vec<_>>();
+    let recording = Recording::Capture {
+        commands: sys::command_list()?,
+        params: sys::params(&ranges)?,
+        ids,
+    };
+    CURRENT.with(|current| {
+        let mut current = current.borrow_mut();
+        if current.is_some() {
+            return Err(crate::Error::new(
+                "capture requires the lazy graph to be empty",
+            ));
+        }
+        *current = Some(recording);
+        drop(current);
+
+        let result = trace();
+        let recording = CURRENT
+            .with(|current| current.borrow_mut().take())
+            .ok_or_else(|| crate::Error::new("capture recording was lost"))?;
+        let commands = match recording {
+            Recording::Capture { commands, .. } => commands,
+            Recording::Lazy(_) => return Err(crate::Error::new("capture recording was replaced")),
+        };
+        let result = result?;
+        Ok(Graph {
+            graph: sys::create_graph(commands)?,
+            result,
+        })
+    })
+}
+
+#[allow(dead_code, reason = "used by symbolic tensor views")]
+pub(crate) fn affine(dim: &Dim) -> Result<sys::Affine> {
+    let Some(id) = dim.id else {
+        return Ok(sys::Affine {
+            param: None,
+            scale: 0,
+            offset: dim.offset,
+        });
+    };
+    parameter_trace_value(dim)?;
+    CURRENT.with(|current| {
+        let current = current.borrow();
+        let Some(Recording::Capture { ids, .. }) = current.as_ref() else {
+            return Err(crate::Error::new(
+                "symbolic dimensions can only be used during capture",
+            ));
+        };
+        let slot = ids
+            .iter()
+            .position(|candidate| *candidate == id)
+            .ok_or_else(|| crate::Error::new("dimension parameter is not part of this capture"))?;
+        Ok(sys::Affine {
+            param: Some(
+                u8::try_from(slot).map_err(|_| crate::Error::new("parameter slot exceeds u8"))?,
+            ),
+            scale: dim.scale,
+            offset: dim.offset,
+        })
+    })
+}
+
+#[allow(dead_code, reason = "used by symbolic tensor views")]
+fn parameter_trace_value(dim: &Dim) -> Result<u32> {
+    let trace_value = dim
+        .value
+        .checked_sub(dim.offset)
+        .ok_or_else(|| crate::Error::new("affine offset exceeds the trace value"))?;
+    if dim
+        .range
+        .as_ref()
+        .is_none_or(|range| !range.contains(&trace_value))
+    {
+        return Err(crate::Error::new(
+            "trace value is outside its parameter range",
+        ));
+    }
+    Ok(trace_value)
+}
+
+#[allow(dead_code, reason = "used by symbolic tensor views")]
+pub(crate) fn view_param(tensor: &sys::Handle, slices: &[sys::ParamSlice]) -> Result<sys::Handle> {
+    CURRENT.with(|current| {
+        let current = current.borrow();
+        let Some(Recording::Capture { params, .. }) = current.as_ref() else {
+            return Err(crate::Error::new(
+                "parameterized views can only be used during capture",
+            ));
+        };
+        sys::view_param(tensor, params, slices)
+    })
+}
+
+pub(crate) fn refuse_during_capture(operation: &str) -> Result<()> {
+    CURRENT.with(|current| {
+        if matches!(current.borrow().as_ref(), Some(Recording::Capture { .. })) {
+            Err(crate::Error::new(format!(
+                "{operation} is not allowed during graph capture"
+            )))
+        } else {
+            Ok(())
+        }
+    })
 }
 
 const KERNEL_CACHE_CAPACITY: usize = 8;
@@ -30,11 +306,13 @@ pub(crate) fn record(
     CURRENT.with(|current| {
         let mut current = current.borrow_mut();
         if current.is_none() {
-            *current = Some(sys::command_list()?);
+            *current = Some(Recording::Lazy(sys::command_list()?));
         }
-        let commands = current
-            .as_mut()
-            .ok_or_else(|| crate::Error::new("current graph was not initialized"))?;
+        let Some(Recording::Lazy(commands) | Recording::Capture { commands, .. }) =
+            current.as_mut()
+        else {
+            return Err(crate::Error::new("current graph was not initialized"));
+        };
         sys::dispatch(commands, operation, inputs, output)
     })
 }
@@ -59,11 +337,13 @@ pub(crate) fn record_kernel(
     CURRENT.with(|current| {
         let mut current = current.borrow_mut();
         if current.is_none() {
-            *current = Some(sys::command_list()?);
+            *current = Some(Recording::Lazy(sys::command_list()?));
         }
-        let commands = current
-            .as_mut()
-            .ok_or_else(|| crate::Error::new("current graph was not initialized"))?;
+        let Some(Recording::Lazy(commands) | Recording::Capture { commands, .. }) =
+            current.as_mut()
+        else {
+            return Err(crate::Error::new("current graph was not initialized"));
+        };
         sys::dispatch_kernel(commands, kernel, inputs, outputs)
     })
 }
@@ -226,6 +506,13 @@ mod tests {
         }
         KERNELS.with(|kernels| assert_eq!(kernels.borrow().len(), KERNEL_CACHE_CAPACITY));
     }
+
+    #[test]
+    fn affine_offset_preserves_the_trace_value_at_the_range_end() {
+        let parameter = Param::new(0..=6).unwrap();
+        let dimension = (parameter.at(6) + 1).unwrap();
+        assert_eq!(parameter_trace_value(&dimension).unwrap(), 6);
+    }
 }
 
 /// Submits all operations recorded by the current thread.
@@ -234,8 +521,10 @@ mod tests {
 ///
 /// Returns a host validation or execution error.
 pub fn eval() -> Result<()> {
+    refuse_during_capture("eval")?;
     CURRENT.with(|current| match current.borrow_mut().take() {
-        Some(commands) => sys::submit(commands),
+        Some(Recording::Lazy(commands)) => sys::submit(commands),
+        Some(Recording::Capture { .. }) => Err(crate::Error::new("capture recording was lost")),
         None => Ok(()),
     })
 }
