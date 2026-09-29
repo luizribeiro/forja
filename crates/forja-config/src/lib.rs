@@ -4,4 +4,4 @@
 
 mod units;
 
-pub use units::ByteSize;
+pub use units::{ByteSize, Duration};

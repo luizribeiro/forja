@@ -1,4 +1,4 @@
-use std::{fmt, num::IntErrorKind};
+use std::{fmt, num::IntErrorKind, time};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
@@ -78,6 +78,54 @@ const BYTE_UNITS: &[(&str, u64)] = &[
     ("B", 1),
 ];
 
+/// A duration serialized with an integer value and unit suffix.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Duration(time::Duration);
+
+impl Duration {
+    /// Creates a duration from milliseconds.
+    #[must_use]
+    pub const fn from_millis(milliseconds: u64) -> Self {
+        Self(time::Duration::from_millis(milliseconds))
+    }
+
+    /// Creates a duration from seconds.
+    #[must_use]
+    pub const fn from_secs(seconds: u64) -> Self {
+        Self(time::Duration::from_secs(seconds))
+    }
+
+    /// Returns the standard-library duration.
+    #[must_use]
+    pub const fn get(self) -> time::Duration {
+        self.0
+    }
+}
+
+impl Serialize for Duration {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&format!("{}ms", self.0.as_millis()))
+    }
+}
+
+impl<'de> Deserialize<'de> for Duration {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        parse_quantity(&value, DURATION_UNITS)
+            .map(time::Duration::from_millis)
+            .map(Self)
+            .map_err(de::Error::custom)
+    }
+}
+
+const DURATION_UNITS: &[(&str, u64)] = &[("ms", 1), ("s", 1_000), ("m", 60_000), ("h", 3_600_000)];
+
 fn parse_quantity(value: &str, units: &[(&str, u64)]) -> Result<u64, String> {
     let Some((digits, multiplier)) = units
         .iter()
@@ -139,6 +187,26 @@ mod tests {
         let value = "18446744073709551616";
         assert_eq!(
             ByteSize::deserialize(StrDeserializer::<Error>::new(value))
+                .unwrap_err()
+                .to_string(),
+            format!("quantity {value:?} overflows u64")
+        );
+    }
+
+    #[test]
+    fn parses_duration_units_with_checked_arithmetic() {
+        for (value, milliseconds) in [
+            ("0s", 0),
+            ("250ms", 250),
+            ("300s", 300_000),
+            ("60m", 3_600_000),
+        ] {
+            let duration = Duration::deserialize(StrDeserializer::<Error>::new(value)).unwrap();
+            assert_eq!(duration.get(), time::Duration::from_millis(milliseconds));
+        }
+        let value = "18446744073709551615h";
+        assert_eq!(
+            Duration::deserialize(StrDeserializer::<Error>::new(value))
                 .unwrap_err()
                 .to_string(),
             format!("quantity {value:?} overflows u64")
