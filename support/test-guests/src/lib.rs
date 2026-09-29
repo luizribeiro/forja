@@ -69,6 +69,18 @@ pub fn qwen3_bf16() -> &'static Path {
     Path::new(env!("QWEN3_BF16_COMPONENT"))
 }
 
+/// Returns the path to Qwen3 with graph replay disabled.
+#[must_use]
+pub fn qwen3_no_replay() -> &'static Path {
+    Path::new(env!("QWEN3_NO_REPLAY_COMPONENT"))
+}
+
+/// Returns the path to bf16 Qwen3 with graph replay disabled.
+#[must_use]
+pub fn qwen3_bf16_no_replay() -> &'static Path {
+    Path::new(env!("QWEN3_BF16_NO_REPLAY_COMPONENT"))
+}
+
 /// Returns the path to Qwen3 with only fused residual normalization.
 #[must_use]
 pub fn qwen3_residual_norm() -> &'static Path {

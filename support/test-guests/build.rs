@@ -33,6 +33,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         qwen3_final_norm,
         qwen3_all_fusions,
         qwen3_bf16_all_fusions,
+        qwen3_no_replay,
+        qwen3_bf16_no_replay,
     ] = build_qwen_profiles(
         &guest_manifest,
         &guest_target_dir,
@@ -79,6 +81,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     emit_guest_path("QWEN3_FINAL_NORM_COMPONENT", &qwen3_final_norm);
     emit_guest_path("QWEN3_ALL_FUSIONS_COMPONENT", &qwen3_all_fusions);
     emit_guest_path("QWEN3_BF16_ALL_FUSIONS_COMPONENT", &qwen3_bf16_all_fusions);
+    emit_guest_path("QWEN3_NO_REPLAY_COMPONENT", &qwen3_no_replay);
+    emit_guest_path("QWEN3_BF16_NO_REPLAY_COMPONENT", &qwen3_bf16_no_replay);
     emit_guest_path(
         "WEIGHTS_SMOKE_COMPONENT",
         &release_dir.join("weights_smoke.wasm"),
@@ -107,7 +111,7 @@ fn build_qwen_profiles(
     target_dir: &Path,
     bf16_target_dir: &Path,
     out_dir: &Path,
-) -> io::Result<[PathBuf; 9]> {
+) -> io::Result<[PathBuf; 11]> {
     let release_dir = target_dir.join("wasm32-wasip2/release");
     let bf16_release_dir = bf16_target_dir.join("wasm32-wasip2/release");
     let qwen3 = copy_component(&release_dir.join("qwen3.wasm"), out_dir, "qwen3.wasm")?;
@@ -150,6 +154,18 @@ fn build_qwen_profiles(
         out_dir,
         "qwen3-bf16-all-fusions.wasm",
     )?;
+    build_qwen_profile(manifest, target_dir, "all-fusions,no-replay")?;
+    let qwen3_no_replay = copy_component(
+        &release_dir.join("qwen3.wasm"),
+        out_dir,
+        "qwen3-no-replay.wasm",
+    )?;
+    build_qwen_profile(manifest, bf16_target_dir, "bf16,all-fusions,no-replay")?;
+    let qwen3_bf16_no_replay = copy_component(
+        &bf16_release_dir.join("qwen3.wasm"),
+        out_dir,
+        "qwen3-bf16-no-replay.wasm",
+    )?;
     Ok([
         qwen3,
         qwen3_bf16,
@@ -160,6 +176,8 @@ fn build_qwen_profiles(
         qwen3_final_norm,
         qwen3_all_fusions,
         qwen3_bf16_all_fusions,
+        qwen3_no_replay,
+        qwen3_bf16_no_replay,
     ])
 }
 
