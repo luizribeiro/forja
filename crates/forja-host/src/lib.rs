@@ -1332,7 +1332,13 @@ impl<B: Backend> Host<B> {
         resource: &Resource<TensorEntry>,
         bytes: &[u8],
     ) -> Result<(), compute::Error> {
-        let tensor = &self.entry(resource)?.tensor;
+        let entry = self.entry(resource)?;
+        if entry.symbolic.is_some() {
+            return Err(compute::Error::Layout(
+                "cannot write a symbolic tensor".to_owned(),
+            ));
+        }
+        let tensor = &entry.tensor;
         if !tensor.layout().is_contiguous() {
             return Err(compute::Error::Layout(
                 "writes require a contiguous tensor".to_owned(),
@@ -1620,6 +1626,12 @@ impl<B: Backend> Host<B> {
         resource: Resource<CommandListEntry>,
     ) -> Result<SubmitRequest<B>, compute::Error> {
         let entry = self.table.delete(resource).map_err(invalid_handle)?;
+        if entry.parameterized {
+            self.release_retained(entry.retained)?;
+            return Err(compute::Error::OpSignature(
+                "submit does not accept parameterized command lists".to_owned(),
+            ));
+        }
         Ok(SubmitRequest {
             backend: Arc::clone(&self.backend),
             work: SubmissionWork::Commands(entry.commands),
@@ -1811,6 +1823,11 @@ impl<B: Backend> Host<B> {
         resource: &Resource<TensorEntry>,
     ) -> Result<ReadRequest<B>, compute::Error> {
         let entry = self.entry(resource)?;
+        if entry.symbolic.is_some() {
+            return Err(compute::Error::Layout(
+                "cannot read a symbolic tensor".to_owned(),
+            ));
+        }
         let byte_len = entry
             .tensor
             .layout()
@@ -2769,12 +2786,111 @@ mod tests {
         }
     }
 
+    fn f32_bytes(values: &[f32]) -> Vec<u8> {
+        values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect()
+    }
+
     fn empty_graph<B>(host: &mut Host<B>) -> Resource<super::GraphEntry>
     where
         B: Backend,
     {
         let commands = host.command_list().unwrap();
         host.create_graph(commands).unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn symbolic_graph_retains_tensors_and_replays_checked_values() {
+        let mut host = Host::new(CpuBackend::new(), GENEROUS);
+        let input = host.alloc(compute::Dtype::F32, &[4]).unwrap();
+        let output = host.alloc(compute::Dtype::F32, &[4]).unwrap();
+        host.write(&input, &f32_bytes(&[1.0, 2.0, 3.0, 4.0]))
+            .unwrap();
+        let output_tensor = host.entry(&output).unwrap().tensor.clone();
+        let params = host
+            .params(vec![compute::ParamRange { lo: 0, hi: 3 }])
+            .unwrap();
+        let slice = compute::ParamSlice {
+            start: wit_affine(None, 0, 0),
+            len: wit_affine(Some(0), 1, 1),
+            step: 1,
+        };
+        let symbolic_input = host
+            .view_param(
+                &Resource::new_borrow(input.rep()),
+                &Resource::new_borrow(params.rep()),
+                vec![slice],
+            )
+            .unwrap();
+        let symbolic_output = host
+            .view_param(
+                &Resource::new_borrow(output.rep()),
+                &Resource::new_borrow(params.rep()),
+                vec![slice],
+            )
+            .unwrap();
+        assert!(matches!(
+            host.write(&symbolic_input, &[0; 4]),
+            Err(compute::Error::Layout(_))
+        ));
+        assert!(matches!(
+            host.prepare_read(&symbolic_input),
+            Err(compute::Error::Layout(_))
+        ));
+
+        let rejected = host.command_list().unwrap();
+        host.dispatch(
+            &rejected,
+            compute::Op::Copy,
+            &[Resource::new_borrow(symbolic_input.rep())],
+            &Resource::new_borrow(symbolic_output.rep()),
+        )
+        .unwrap();
+        assert!(matches!(
+            host.prepare_submit(rejected),
+            Err(compute::Error::OpSignature(_))
+        ));
+
+        let commands = host.command_list().unwrap();
+        host.dispatch(
+            &commands,
+            compute::Op::Copy,
+            &[Resource::new_borrow(symbolic_input.rep())],
+            &Resource::new_borrow(symbolic_output.rep()),
+        )
+        .unwrap();
+        let graph = host.create_graph(commands).unwrap();
+        host.drop_params(params).unwrap();
+        host.drop_tensor(input).unwrap();
+        host.drop_tensor(output).unwrap();
+        host.drop_tensor(symbolic_input).unwrap();
+        host.drop_tensor(symbolic_output).unwrap();
+
+        assert!(matches!(
+            host.prepare_replay(&graph, Vec::new()),
+            Err(compute::Error::OpSignature(_))
+        ));
+        assert!(matches!(
+            host.prepare_replay(&graph, vec![4]),
+            Err(compute::Error::OpSignature(_))
+        ));
+        host.prepare_replay(&graph, vec![2])
+            .unwrap()
+            .run()
+            .await
+            .unwrap();
+        assert_eq!(
+            host.backend.read(&output_tensor).unwrap(),
+            f32_bytes(&[1.0, 2.0, 3.0, 0.0])
+        );
+
+        host.drop_graph(graph).unwrap();
+        assert_eq!(
+            host.backend.read(&output_tensor),
+            Err(BackendError::InvalidInput)
+        );
     }
 
     #[test]
