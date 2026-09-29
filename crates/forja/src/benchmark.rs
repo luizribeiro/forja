@@ -101,7 +101,14 @@ async fn run_metal(options: &Bench) -> Result<(), Box<dyn Error>> {
         })
         .collect::<Result<Vec<_>, std::io::Error>>()?;
     if let Some(record) = &options.rerun {
-        validate_rerun_inputs(record, &inputs)?;
+        validate_rerun_inputs(
+            record,
+            &inputs,
+            options
+                .allow_diff
+                .iter()
+                .any(|key| key.as_str() == "engine.sha256"),
+        )?;
         if record.provenance.commit != commit {
             println!(
                 "rerun binary commit differs: recorded {}, current {commit}",
@@ -167,13 +174,28 @@ async fn run_metal(options: &Bench) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn validate_rerun_inputs(record: &Recorded, inputs: &[Input]) -> Result<(), String> {
+fn validate_rerun_inputs(
+    record: &Recorded,
+    inputs: &[Input],
+    allow_engine_diff: bool,
+) -> Result<(), String> {
     if record.inputs.len() != inputs.len() {
         return Err(format!(
             "rerun input count mismatch: record has {}, command has {}",
             record.inputs.len(),
             inputs.len()
         ));
+    }
+    if allow_engine_diff {
+        for (recorded, current) in record.inputs.iter().zip(inputs) {
+            if recorded.weights_sha256 != current.weights_sha256 {
+                return Err(format!(
+                    "rerun weights sha256 mismatch: recorded {}, current {}",
+                    recorded.weights_sha256, current.weights_sha256
+                ));
+            }
+        }
+        return Ok(());
     }
     let mut unmatched = inputs.iter().collect::<Vec<_>>();
     for recorded in &record.inputs {
@@ -237,6 +259,9 @@ fn validate_comparability(
             ));
         }
     }
+    if ignored.contains(&"engine.sha256") {
+        return compare_perf_keys(&recorded, &current, &ignored);
+    }
     let recorded = perf_keys_by_engine(recorded)?;
     let current = perf_keys_by_engine(current)?;
     if recorded.keys().ne(current.keys()) {
@@ -252,28 +277,7 @@ fn validate_comparability(
             );
             continue;
         }
-        for (old, new) in old_keys.iter().zip(new_keys) {
-            let old = stripped_key(old, &ignored);
-            let new = stripped_key(new, &ignored);
-            if benchmark_record::comparison_hash(&old)? == benchmark_record::comparison_hash(&new)?
-            {
-                continue;
-            }
-            for key in old.keys().chain(new.keys()) {
-                if old.get(key) != new.get(key) {
-                    differences.insert(
-                        key.clone(),
-                        format!(
-                            "{} -> {}",
-                            old.get(key)
-                                .map_or("<missing>".to_owned(), ToString::to_string),
-                            new.get(key)
-                                .map_or("<missing>".to_owned(), ToString::to_string)
-                        ),
-                    );
-                }
-            }
-        }
+        collect_key_differences(old_keys, new_keys, &ignored, &mut differences)?;
     }
     if differences.is_empty() {
         return Ok(());
@@ -284,6 +288,54 @@ fn validate_comparability(
         .collect::<Vec<_>>()
         .join("\n");
     Err(format!("benchmark records are not comparable:\n{report}"))
+}
+
+fn compare_perf_keys(
+    recorded: &[PerfKey],
+    current: &[PerfKey],
+    ignored: &[&str],
+) -> Result<(), String> {
+    let mut differences = BTreeMap::new();
+    collect_key_differences(recorded, current, ignored, &mut differences)?;
+    if differences.is_empty() {
+        return Ok(());
+    }
+    let report = differences
+        .into_iter()
+        .map(|(key, values)| format!("  {key}: {values}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    Err(format!("benchmark records are not comparable:\n{report}"))
+}
+
+fn collect_key_differences(
+    recorded: &[PerfKey],
+    current: &[PerfKey],
+    ignored: &[&str],
+    differences: &mut BTreeMap<String, String>,
+) -> Result<(), String> {
+    for (old, new) in recorded.iter().zip(current) {
+        let old = stripped_key(old, ignored);
+        let new = stripped_key(new, ignored);
+        if benchmark_record::comparison_hash(&old)? == benchmark_record::comparison_hash(&new)? {
+            continue;
+        }
+        for key in old.keys().chain(new.keys()) {
+            if old.get(key) != new.get(key) {
+                differences.insert(
+                    key.clone(),
+                    format!(
+                        "{} -> {}",
+                        old.get(key)
+                            .map_or("<missing>".to_owned(), ToString::to_string),
+                        new.get(key)
+                            .map_or("<missing>".to_owned(), ToString::to_string)
+                    ),
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 fn perf_keys_by_engine(keys: Vec<PerfKey>) -> Result<BTreeMap<String, Vec<PerfKey>>, String> {
@@ -1496,7 +1548,7 @@ mod tests {
             model_revision: None,
         }];
         assert!(
-            validate_rerun_inputs(&record, &current)
+            validate_rerun_inputs(&record, &current, false)
                 .unwrap_err()
                 .contains("engine sha256 mismatch")
         );
@@ -1520,7 +1572,31 @@ mod tests {
             axes: BTreeMap::new(),
             results: Vec::new(),
         };
-        validate_rerun_inputs(&record, &[input("second"), input("first")]).unwrap();
+        validate_rerun_inputs(&record, &[input("second"), input("first")], false).unwrap();
+    }
+
+    #[test]
+    fn allow_diff_accepts_an_engine_revision_with_the_same_weights() {
+        let input = |engine: &str, weights: &str| Input {
+            engine_sha256: engine.to_owned(),
+            profile_hash: None,
+            weights_sha256: weights.to_owned(),
+            model_revision: None,
+        };
+        let record = Recorded {
+            schema_version: benchmark_record::SCHEMA_VERSION,
+            provenance: benchmark_record::RecordedProvenance {
+                commit: "recorded".to_owned(),
+            },
+            inputs: vec![input("old-engine", "weights")],
+            config: String::new(),
+            axes: BTreeMap::new(),
+            results: Vec::new(),
+        };
+        validate_rerun_inputs(&record, &[input("new-engine", "weights")], true).unwrap();
+        let error = validate_rerun_inputs(&record, &[input("new-engine", "other-weights")], true)
+            .unwrap_err();
+        assert!(error.contains("weights sha256 mismatch"));
     }
 
     #[test]
@@ -1645,6 +1721,55 @@ mod tests {
         let error = validate_comparability(&current, &record, &keys).unwrap_err();
         assert!(error.contains("bench.reps"));
         current.allow_diff.push(KeyPath::new("bench.reps"));
+        validate_comparability(&current, &record, &keys).unwrap();
+    }
+
+    #[test]
+    fn allow_diff_compares_performance_across_engine_revisions() {
+        let crate::args::Command::Bench(recorded_options) = crate::args::parse(
+            ["bench", "--engine", "/engine", "--model-dir", "/model"].map(str::to_owned),
+        )
+        .unwrap() else {
+            panic!("expected bench command");
+        };
+        let input = |engine: &str| Input {
+            engine_sha256: engine.to_owned(),
+            profile_hash: None,
+            weights_sha256: "weights".to_owned(),
+            model_revision: None,
+        };
+        let record = Recorded {
+            schema_version: benchmark_record::SCHEMA_VERSION,
+            provenance: benchmark_record::RecordedProvenance {
+                commit: "recorded".to_owned(),
+            },
+            inputs: vec![input("old-engine")],
+            config: benchmark_record::snapshot(&recorded_options, "device", "26.6")
+                .unwrap()
+                .config,
+            axes: BTreeMap::new(),
+            results: vec![
+                serde_json::json!({"input": 0, "point": {}}),
+                serde_json::json!({"input": 0, "point": {}}),
+            ],
+        };
+        let crate::args::Command::Bench(mut current) = crate::args::parse(
+            ["bench", "--engine", "/engine", "--model-dir", "/model"].map(str::to_owned),
+        )
+        .unwrap() else {
+            panic!("expected bench command");
+        };
+        let keys = current
+            .points
+            .iter()
+            .map(|point| vec![benchmark_record::perf_key(point, &input("new-engine")).unwrap()])
+            .collect::<Vec<_>>();
+        assert!(
+            validate_comparability(&current, &record, &keys)
+                .unwrap_err()
+                .contains("engine.sha256 differs")
+        );
+        current.allow_diff.push(KeyPath::new("engine.sha256"));
         validate_comparability(&current, &record, &keys).unwrap();
     }
 
