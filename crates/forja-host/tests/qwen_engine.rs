@@ -1,6 +1,6 @@
 //! Native Qwen3 engine checks against independent transformer fixtures.
 
-use std::{env, error::Error, path::PathBuf, time::Duration};
+use std::{collections::VecDeque, env, error::Error, path::PathBuf, time::Duration};
 
 use forja_core::Backend;
 use forja_host::{EngineDecode, EngineRunner, EngineStep, Limits};
@@ -173,6 +173,116 @@ async fn metal_greedy_selection_matches_host_argmax() -> Result<(), Box<dyn Erro
         128,
     )
     .await
+}
+
+#[tokio::test]
+#[ignore = "requires FORJA_MODELS and runs in the pre-push hook"]
+async fn cpu_pipelined_selection_matches_sequential() -> Result<(), Box<dyn Error>> {
+    compare_pipelined_selection(
+        forja_cpu::CpuBackend::new(),
+        forja_cpu::CpuBackend::new(),
+        test_guests::qwen3(),
+        8,
+    )
+    .await
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[ignore = "requires FORJA_MODELS and runs in the pre-push hook"]
+async fn metal_pipelined_selection_matches_sequential() -> Result<(), Box<dyn Error>> {
+    compare_pipelined_selection(
+        forja_metal::MetalBackend::new()?,
+        forja_metal::MetalBackend::new()?,
+        test_guests::qwen3_bf16(),
+        128,
+    )
+    .await
+}
+
+async fn compare_pipelined_selection<B>(
+    sequential_backend: B,
+    pipelined_backend: B,
+    component: &std::path::Path,
+    token_count: u32,
+) -> Result<(), Box<dyn Error>>
+where
+    B: Backend + Send + Sync + 'static,
+{
+    let root = PathBuf::from(env::var_os("FORJA_MODELS").ok_or("FORJA_MODELS is not set")?);
+    let weights = root.join("Qwen3-0.6B/model.safetensors");
+    let mut sequential =
+        EngineRunner::new(component, sequential_backend, REPLAY_LIMITS, &weights).await?;
+    let mut pipelined =
+        EngineRunner::new(component, pipelined_backend, REPLAY_LIMITS, weights).await?;
+    sequential.load().await??;
+    pipelined.load().await??;
+    let prompt = (0_u32..8).collect::<Vec<_>>();
+    let expected = selected_tokens(&mut sequential, &prompt, token_count, false).await?;
+    let actual = selected_tokens(&mut pipelined, &prompt, token_count, true).await?;
+    assert_eq!(actual, expected);
+    Ok(())
+}
+
+async fn selected_tokens<B>(
+    runner: &mut EngineRunner<B>,
+    prompt: &[u32],
+    token_count: u32,
+    pipelined: bool,
+) -> Result<Vec<u32>, Box<dyn Error>>
+where
+    B: Backend + Send + Sync + 'static,
+{
+    if token_count == 0 {
+        return Ok(Vec::new());
+    }
+    let input = EngineDecode {
+        tokens: Some(prompt.to_vec()),
+        start_pos: 0,
+    };
+    let mut tokens = Vec::with_capacity(usize::try_from(token_count)?);
+    if pipelined {
+        let output = runner.enqueue_decode(input).await??;
+        tokens.push(read_token(&runner.read_queued_token(output).await?)?);
+        let mut outputs = VecDeque::with_capacity(2);
+        let mut position = u32::try_from(prompt.len())?;
+        let end = position
+            .checked_add(token_count.saturating_sub(1))
+            .ok_or("decode position overflowed")?;
+        while position < end || !outputs.is_empty() {
+            while position < end && outputs.len() < 2 {
+                outputs.push_back(
+                    runner
+                        .enqueue_decode(EngineDecode {
+                            tokens: None,
+                            start_pos: position,
+                        })
+                        .await??,
+                );
+                position = position
+                    .checked_add(1)
+                    .ok_or("decode position overflowed")?;
+            }
+            let output = outputs.pop_front().ok_or("decode queue is empty")?;
+            tokens.push(read_token(&runner.read_queued_token(output).await?)?);
+        }
+    } else {
+        let output = runner.decode(input).await??;
+        tokens.push(read_token(&runner.read(&output.token).await?)?);
+        for offset in 0..token_count.saturating_sub(1) {
+            let position = u32::try_from(prompt.len())?
+                .checked_add(offset)
+                .ok_or("decode position overflowed")?;
+            let output = runner
+                .decode(EngineDecode {
+                    tokens: None,
+                    start_pos: position,
+                })
+                .await??;
+            tokens.push(read_token(&runner.read(&output.token).await?)?);
+        }
+    }
+    Ok(tokens)
 }
 
 async fn compare_greedy_selection<B>(

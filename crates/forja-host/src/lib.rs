@@ -557,16 +557,30 @@ where
         &mut self,
         input: EngineDecode,
     ) -> wasmtime::Result<Result<EngineDecodeOutput, compute::Error>> {
-        self.with_profile(move |runner| Box::pin(runner.decode_inner(input)))
+        self.with_profile(move |runner| Box::pin(runner.decode_inner(input, true)))
+            .await
+    }
+
+    /// Enqueues greedy decode while retaining outputs from earlier queued calls.
+    ///
+    /// # Errors
+    ///
+    /// Returns a component execution error or the engine's structured failure.
+    pub async fn enqueue_decode(
+        &mut self,
+        input: EngineDecode,
+    ) -> wasmtime::Result<Result<EngineDecodeOutput, compute::Error>> {
+        self.with_profile(move |runner| Box::pin(runner.decode_inner(input, false)))
             .await
     }
 
     async fn decode_inner(
         &mut self,
         input: EngineDecode,
+        release_previous: bool,
     ) -> wasmtime::Result<Result<EngineDecodeOutput, compute::Error>> {
         use engine_bindings::exports::l9o::gpu::engine::{DecodeIn, DecodeOut};
-        if let Err(error) = self.release_outputs() {
+        if release_previous && let Err(error) = self.release_outputs() {
             return Ok(Err(error));
         }
         let info = match &self.info {
@@ -602,7 +616,11 @@ where
                 Err(release_error) => release_error,
             }));
         }
-        self.output_handles = handles;
+        if release_previous {
+            self.output_handles = handles;
+        } else {
+            self.output_handles.extend(handles);
+        }
         Ok(Ok(EngineDecodeOutput {
             logits: EngineTensor {
                 handle: logits.rep(),
@@ -613,6 +631,26 @@ where
                 runner_id: self.id,
             },
         }))
+    }
+
+    /// Reads a queued decode token and releases that call's returned tensor handles.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-handle or backend read failure.
+    pub async fn read_queued_token(
+        &mut self,
+        output: EngineDecodeOutput,
+    ) -> Result<Vec<u8>, compute::Error> {
+        let result = self.read(&output.token).await;
+        let handles = [output.logits.handle, output.token.handle];
+        self.output_handles
+            .retain(|handle| !handles.contains(handle));
+        let release = self.release_handles(handles.into());
+        match (result, release) {
+            (Err(error), _) | (Ok(_), Err(error)) => Err(error),
+            (Ok(bytes), Ok(())) => Ok(bytes),
+        }
     }
 
     /// Reads a returned tensor through the selected backend.
