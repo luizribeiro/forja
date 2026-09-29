@@ -11,7 +11,7 @@ use forja_config::{KeyPath, Selection};
 use forja_core::Op;
 use forja_host::{
     EngineDecode, EngineMetrics, EngineOutput, EngineRunner, EngineStep, EngineStepProfile,
-    ImportProfile,
+    ImportProfile, SamplingParams,
 };
 use golden_fixtures::{decode_f32_le, sha256_file};
 
@@ -554,6 +554,7 @@ async fn probe_output(
                             .ok_or("decode position overflowed")?,
                     )?
                 },
+                sampling: SamplingParams::default(),
             })
             .await?
             .map_err(|error| format!("engine decode failed: {error:?}"))?;
@@ -675,6 +676,7 @@ async fn measure_pipelined_decode(
                     .enqueue_decode(EngineDecode {
                         tokens: None,
                         start_pos: position,
+                        sampling: SamplingParams::default(),
                     })
                     .await?
                     .map_err(|error| format!("engine decode failed: {error:?}"))?,
@@ -780,6 +782,7 @@ async fn measure_pipelined_profile_step(
                             .checked_add(offset)
                             .ok_or("decode position overflowed")?,
                     )?,
+                    sampling: SamplingParams::default(),
                 })
                 .await?
                 .map_err(|error| format!("engine decode failed: {error:?}"))?,
@@ -883,6 +886,7 @@ async fn select_from_tokens(
         .decode(EngineDecode {
             tokens: Some(tokens),
             start_pos,
+            sampling: SamplingParams::default(),
         })
         .await?
         .map_err(|error| format!("engine decode failed: {error:?}"))?;
@@ -903,6 +907,7 @@ async fn select_next(
         .decode(EngineDecode {
             tokens: None,
             start_pos,
+            sampling: SamplingParams::default(),
         })
         .await?
         .map_err(|error| format!("engine decode failed: {error:?}"))?;

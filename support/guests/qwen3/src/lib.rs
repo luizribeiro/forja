@@ -507,6 +507,14 @@ fn final_norm(
     input * ((input * input).row_mean() + RMS_EPSILON).rsqrt() * weight
 }
 
+#[cfg(target_family = "wasm")]
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum DecodeSelection {
+    None,
+    Greedy,
+    Sampled,
+}
+
 /// Qwen3-0.6B with a fixed 4096-token KV cache.
 pub struct Qwen3<T: Activation = f32> {
     weights: QwenWeights<T>,
@@ -519,9 +527,15 @@ pub struct Qwen3<T: Activation = f32> {
     #[cfg(target_family = "wasm")]
     output_tokens: Tensor<u32>,
     #[cfg(target_family = "wasm")]
+    sampling: Tensor<u32>,
+    #[cfg(target_family = "wasm")]
+    sampling_params: Option<forja_sdk::SamplingParams>,
+    #[cfg(target_family = "wasm")]
     decode: Option<Graph<Tensor<f32>>>,
     #[cfg(target_family = "wasm")]
-    selected_decode: Option<Graph<Tensor<f32>>>,
+    greedy_decode: Option<Graph<Tensor<f32>>>,
+    #[cfg(target_family = "wasm")]
+    sampled_decode: Option<Graph<Tensor<f32>>>,
 }
 
 impl<T: Activation> Qwen3<T> {
@@ -546,9 +560,15 @@ impl<T: Activation> Qwen3<T> {
             #[cfg(target_family = "wasm")]
             output_tokens: Tensor::zeros(&[MAX_CONTEXT])?,
             #[cfg(target_family = "wasm")]
+            sampling: Tensor::zeros(&[5])?,
+            #[cfg(target_family = "wasm")]
+            sampling_params: None,
+            #[cfg(target_family = "wasm")]
             decode: None,
             #[cfg(target_family = "wasm")]
-            selected_decode: None,
+            greedy_decode: None,
+            #[cfg(target_family = "wasm")]
+            sampled_decode: None,
         })
     }
 
@@ -637,7 +657,8 @@ impl Engine for ExportedQwen3 {
             .ok_or_else(|| forja_sdk::Error::loading("tokens exceed the 4096-token context"))?;
         #[cfg(target_family = "wasm")]
         if REPLAY_DECODE && sequence == 1 && !input.taps {
-            let logits = self.replay_decode(Some(&input.tokens), input.start_pos, false)?;
+            let logits =
+                self.replay_decode(Some(&input.tokens), input.start_pos, DecodeSelection::None)?;
             return Ok(StepOutput {
                 logits,
                 taps: Vec::new(),
@@ -654,6 +675,12 @@ impl Engine for ExportedQwen3 {
 
     #[cfg(target_family = "wasm")]
     fn decode(&mut self, input: forja_sdk::DecodeInput) -> Result<forja_sdk::DecodeOutput> {
+        self.update_sampling(input.sampling)?;
+        let selection = if sampling_is_greedy(input.sampling) {
+            DecodeSelection::Greedy
+        } else {
+            DecodeSelection::Sampled
+        };
         match input.tokens {
             Some(tokens) => {
                 let [sequence] = tokens
@@ -671,7 +698,7 @@ impl Engine for ExportedQwen3 {
                         forja_sdk::Error::loading("decode tokens exceed the 4096-token context")
                     })?;
                 if REPLAY_DECODE && sequence == 1 {
-                    self.decode_selected(Some(&tokens), input.start_pos)
+                    self.decode_selected(Some(&tokens), input.start_pos, selection)
                 } else {
                     let logits = self
                         .forward(&tokens, sequence, input.start_pos.into(), end.into(), false)?
@@ -680,7 +707,7 @@ impl Engine for ExportedQwen3 {
                 }
             }
             None if input.start_pos < MAX_CONTEXT && REPLAY_DECODE => {
-                self.decode_selected(None, input.start_pos)
+                self.decode_selected(None, input.start_pos, selection)
             }
             None if input.start_pos < MAX_CONTEXT => {
                 let token = self.token.alias()?;
@@ -781,48 +808,68 @@ impl<T: Activation> Qwen3<T> {
         &mut self,
         tokens: Option<&Tensor<u32>>,
         start_pos: u32,
-        selected: bool,
+        selection: DecodeSelection,
     ) -> Result<Tensor<f32>> {
         if let Some(tokens) = tokens {
             self.token.write(&tokens.to_vec()?)?;
         }
-        let missing = if selected {
-            self.selected_decode.is_none()
-        } else {
-            self.decode.is_none()
-        };
+        let missing = self.decode_graph(selection).is_none();
         if missing {
-            let graph = self.capture_decode(start_pos, selected)?;
-            if selected {
-                self.selected_decode = Some(graph);
-            } else {
-                self.decode = Some(graph);
-            }
+            let graph = self.capture_decode(start_pos, selection)?;
+            *self.decode_graph_mut(selection) = Some(graph);
         }
-        let graph = if selected {
-            self.selected_decode.as_ref()
-        } else {
-            self.decode.as_ref()
-        }
-        .ok_or_else(|| forja_sdk::Error::loading("decode graph was not captured"))?;
+        let graph = self
+            .decode_graph(selection)
+            .ok_or_else(|| forja_sdk::Error::loading("decode graph was not captured"))?;
         graph.replay(&[start_pos])?;
         graph.result().alias()
     }
 
     #[cfg(target_family = "wasm")]
-    fn capture_decode(&mut self, start_pos: u32, selected: bool) -> Result<Graph<Tensor<f32>>> {
+    fn decode_graph(&self, selection: DecodeSelection) -> Option<&Graph<Tensor<f32>>> {
+        match selection {
+            DecodeSelection::None => self.decode.as_ref(),
+            DecodeSelection::Greedy => self.greedy_decode.as_ref(),
+            DecodeSelection::Sampled => self.sampled_decode.as_ref(),
+        }
+    }
+
+    #[cfg(target_family = "wasm")]
+    fn decode_graph_mut(&mut self, selection: DecodeSelection) -> &mut Option<Graph<Tensor<f32>>> {
+        match selection {
+            DecodeSelection::None => &mut self.decode,
+            DecodeSelection::Greedy => &mut self.greedy_decode,
+            DecodeSelection::Sampled => &mut self.sampled_decode,
+        }
+    }
+
+    #[cfg(target_family = "wasm")]
+    fn capture_decode(
+        &mut self,
+        start_pos: u32,
+        selection: DecodeSelection,
+    ) -> Result<Graph<Tensor<f32>>> {
         let position = forja_sdk::Param::new(0..=MAX_CONTEXT - 1)?;
         let start = position.at(start_pos);
         let end = (start.clone() + 1)?;
         let token = self.token.alias()?;
         let mut feedback = self.token.alias()?;
         let output_tokens = self.output_tokens.alias()?;
+        let sampling = self.sampling.alias()?;
         forja_sdk::capture(&[&position], || {
             let logits = self
                 .forward(&token, 1, start.clone().into(), end, false)?
                 .logits;
-            if selected {
-                let selected = logits.reshape(&[1, VOCAB])?.argmax()?;
+            let selected = match selection {
+                DecodeSelection::None => None,
+                DecodeSelection::Greedy => Some(logits.reshape(&[1, VOCAB])?.argmax()?),
+                DecodeSelection::Sampled => Some(
+                    logits
+                        .reshape(&[1, VOCAB])?
+                        .sample(&sampling, start.clone())?,
+                ),
+            };
+            if let Some(selected) = selected {
                 selected.copy_into(&mut feedback)?;
                 selected.copy_into(&mut output_tokens.narrow(0, start, 1)?)?;
             }
@@ -835,8 +882,9 @@ impl<T: Activation> Qwen3<T> {
         &mut self,
         tokens: Option<&Tensor<u32>>,
         start_pos: u32,
+        selection: DecodeSelection,
     ) -> Result<forja_sdk::DecodeOutput> {
-        let logits = self.replay_decode(tokens, start_pos, true)?;
+        let logits = self.replay_decode(tokens, start_pos, selection)?;
         Ok(forja_sdk::DecodeOutput {
             logits,
             token: self.output_tokens.narrow(0, start_pos, 1)?,
@@ -845,7 +893,7 @@ impl<T: Activation> Qwen3<T> {
 
     #[cfg(target_family = "wasm")]
     fn select_token(&mut self, logits: Tensor<f32>, slot: u32) -> Result<forja_sdk::DecodeOutput> {
-        let selected = logits.reshape(&[1, VOCAB])?.argmax()?;
+        let selected = logits.reshape(&[1, VOCAB])?.sample(&self.sampling, slot)?;
         selected.copy_into(&mut self.token.alias()?)?;
         let mut output = self.output_tokens.narrow(0, slot, 1)?;
         selected.copy_into(&mut output)?;
@@ -854,6 +902,30 @@ impl<T: Activation> Qwen3<T> {
             token: output,
         })
     }
+
+    #[cfg(target_family = "wasm")]
+    fn update_sampling(&mut self, params: forja_sdk::SamplingParams) -> Result<()> {
+        if self.sampling_params == Some(params) {
+            return Ok(());
+        }
+        let words = [
+            params.temperature.to_bits(),
+            params.top_k,
+            params.top_p.to_bits(),
+            u32::try_from(params.seed & u64::from(u32::MAX))
+                .map_err(|_| forja_sdk::Error::loading("sampling seed low half overflowed"))?,
+            u32::try_from(params.seed >> 32)
+                .map_err(|_| forja_sdk::Error::loading("sampling seed high half overflowed"))?,
+        ];
+        self.sampling.write(&words)?;
+        self.sampling_params = Some(params);
+        Ok(())
+    }
+}
+
+#[cfg(target_family = "wasm")]
+fn sampling_is_greedy(params: forja_sdk::SamplingParams) -> bool {
+    params.temperature == 0.0 || params.top_k == 1
 }
 
 fn activation_position_table<T: Activation>() -> Result<Tensor<T>> {

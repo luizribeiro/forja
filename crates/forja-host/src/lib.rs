@@ -97,13 +97,39 @@ pub struct EngineStep {
     pub taps: bool,
 }
 
-/// Input to greedy decode with an engine-retained feedback token.
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// Sampling parameters applied during decode.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SamplingParams {
+    /// Logit temperature, where zero selects greedily.
+    pub temperature: f32,
+    /// Number of greatest logits retained, where zero disables top-k.
+    pub top_k: u32,
+    /// Cumulative probability retained after top-k.
+    pub top_p: f32,
+    /// Counter-based random seed.
+    pub seed: u64,
+}
+
+impl Default for SamplingParams {
+    fn default() -> Self {
+        Self {
+            temperature: 0.0,
+            top_k: 0,
+            top_p: 1.0,
+            seed: 0,
+        }
+    }
+}
+
+/// Input to decode with an engine-retained feedback token.
+#[derive(Clone, Debug, PartialEq)]
 pub struct EngineDecode {
     /// Tokens to process, or `None` to reuse the preceding selected token.
     pub tokens: Option<Vec<u32>>,
     /// Position assigned to the first token, including a reused feedback token.
     pub start_pos: u32,
+    /// Token sampling parameters.
+    pub sampling: SamplingParams,
 }
 
 /// A tensor returned by a component and owned by its runner.
@@ -606,6 +632,12 @@ where
                         DecodeIn {
                             tokens: input.tokens,
                             start_pos: input.start_pos,
+                            sampling: engine_bindings::exports::l9o::gpu::engine::SamplingParams {
+                                temperature: input.sampling.temperature,
+                                top_k: input.sampling.top_k,
+                                top_p: input.sampling.top_p,
+                                seed: input.sampling.seed,
+                            },
                         },
                     )
                     .await

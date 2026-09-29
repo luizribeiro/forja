@@ -109,7 +109,9 @@ mod tensor;
 use std::{error, fmt};
 
 pub use element::{Element, FloatElement};
-pub use engine::{DecodeInput, DecodeOutput, Engine, EngineInfo, StepInput, StepOutput};
+pub use engine::{
+    DecodeInput, DecodeOutput, Engine, EngineInfo, SamplingParams, StepInput, StepOutput,
+};
 pub use forja_sdk_macros::{Load, export_engine, kernel};
 pub use graph::{Dim, Graph, Param, Pos, capture, eval};
 pub use half::{bf16, f16};

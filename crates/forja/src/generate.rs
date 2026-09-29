@@ -1,7 +1,7 @@
 use std::{collections::VecDeque, error::Error, fs, io::Write, path::Path};
 
 use forja_core::Backend;
-use forja_host::{EngineDecode, EngineRunner};
+use forja_host::{EngineDecode, EngineRunner, SamplingParams};
 use tokenizers::Tokenizer;
 
 use crate::{
@@ -80,11 +80,13 @@ where
     if options.max_tokens == 0 {
         return Ok(Vec::new());
     }
+    let sampling = SamplingParams::default();
     let prompt_len = u32::try_from(prompt.len())?;
     let first = runner
         .enqueue_decode(EngineDecode {
             tokens: Some(prompt),
             start_pos: 0,
+            sampling,
         })
         .await?
         .map_err(|error| format!("engine decode failed: {error:?}"))?;
@@ -103,6 +105,7 @@ where
                         .enqueue_decode(EngineDecode {
                             tokens: None,
                             start_pos: position,
+                            sampling,
                         })
                         .await?
                         .map_err(|error| format!("engine decode failed: {error:?}"))?,

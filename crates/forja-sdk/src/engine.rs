@@ -29,12 +29,38 @@ pub struct StepOutput {
     pub taps: Vec<Tensor<f32>>,
 }
 
-/// Input to greedy decode with an engine-retained feedback token.
+/// Sampling parameters applied during decode.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SamplingParams {
+    /// Logit temperature, where zero selects greedily.
+    pub temperature: f32,
+    /// Number of greatest logits retained, where zero disables top-k.
+    pub top_k: u32,
+    /// Cumulative probability retained after top-k.
+    pub top_p: f32,
+    /// Counter-based random seed.
+    pub seed: u64,
+}
+
+impl Default for SamplingParams {
+    fn default() -> Self {
+        Self {
+            temperature: 0.0,
+            top_k: 0,
+            top_p: 1.0,
+            seed: 0,
+        }
+    }
+}
+
+/// Input to decode with an engine-retained feedback token.
 pub struct DecodeInput {
     /// Tokens to process, or `None` to reuse the preceding selected token.
     pub tokens: Option<Tensor<u32>>,
     /// Position assigned to the first token, including a reused feedback token.
     pub start_pos: u32,
+    /// Token sampling parameters.
+    pub sampling: SamplingParams,
 }
 
 /// Device-resident outputs from greedy decode.
@@ -64,7 +90,7 @@ pub trait Engine: Sized + 'static {
     /// Returns an error when the input is invalid or execution fails.
     fn step(&mut self, input: StepInput) -> Result<StepOutput>;
 
-    /// Runs greedy decode, optionally reusing the engine-retained token selected previously.
+    /// Runs decode, optionally reusing the engine-retained token selected previously.
     ///
     /// # Errors
     ///

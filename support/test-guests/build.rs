@@ -166,6 +166,8 @@ fn build_qwen_profiles(
         out_dir,
         "qwen3-bf16-no-replay.wasm",
     )?;
+    fs::copy(&qwen3, release_dir.join("qwen3.wasm"))?;
+    fs::copy(&qwen3_bf16, bf16_release_dir.join("qwen3.wasm"))?;
     Ok([
         qwen3,
         qwen3_bf16,

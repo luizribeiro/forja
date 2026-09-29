@@ -23,6 +23,14 @@ interface engine {
   record decode-in {
     tokens: option<list<u32>>,
     start-pos: u32,
+    sampling: sampling-params,
+  }
+
+  record sampling-params {
+    temperature: f32,
+    top-k: u32,
+    top-p: f32,
+    seed: u64,
   }
 
   record decode-out {

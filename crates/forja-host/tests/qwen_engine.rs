@@ -3,7 +3,9 @@
 use std::{collections::VecDeque, env, error::Error, path::PathBuf, time::Duration};
 
 use forja_core::Backend;
-use forja_host::{EngineDecode, EngineRunner, EngineStep, Limits, bindings::l9o::gpu::compute};
+use forja_host::{
+    EngineDecode, EngineRunner, EngineStep, Limits, SamplingParams, bindings::l9o::gpu::compute,
+};
 use forja_sdk::{Engine, Tensor, Weights};
 use golden_fixtures::{
     BF16_HIDDEN_STATE_TOLERANCE, FixtureDirectory, PromptFixture, decode_f32_le,
@@ -175,14 +177,55 @@ async fn metal_greedy_selection_matches_host_argmax() -> Result<(), Box<dyn Erro
     .await
 }
 
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[ignore = "requires FORJA_MODELS and runs in the pre-push hook"]
+async fn metal_sampled_selection_matches_sequential() -> Result<(), Box<dyn Error>> {
+    compare_pipelined_selection(
+        forja_metal::MetalBackend::new()?,
+        forja_metal::MetalBackend::new()?,
+        test_guests::qwen3_bf16_no_replay(),
+        test_guests::qwen3_bf16(),
+        128,
+        SamplingParams {
+            temperature: 0.7,
+            top_k: 0,
+            top_p: 0.9,
+            seed: 0xfeed_beef_dead_cafe,
+        },
+    )
+    .await
+}
+
 #[tokio::test]
 #[ignore = "requires FORJA_MODELS and runs in the pre-push hook"]
 async fn cpu_pipelined_selection_matches_sequential() -> Result<(), Box<dyn Error>> {
     compare_pipelined_selection(
         forja_cpu::CpuBackend::new(),
         forja_cpu::CpuBackend::new(),
+        test_guests::qwen3_no_replay(),
         test_guests::qwen3(),
         8,
+        SamplingParams::default(),
+    )
+    .await
+}
+
+#[tokio::test]
+#[ignore = "requires FORJA_MODELS and runs in the pre-push hook"]
+async fn cpu_sampled_selection_matches_sequential() -> Result<(), Box<dyn Error>> {
+    compare_pipelined_selection(
+        forja_cpu::CpuBackend::new(),
+        forja_cpu::CpuBackend::new(),
+        test_guests::qwen3_no_replay(),
+        test_guests::qwen3(),
+        8,
+        SamplingParams {
+            temperature: 0.7,
+            top_k: 0,
+            top_p: 0.9,
+            seed: 0xfeed_beef_dead_cafe,
+        },
     )
     .await
 }
@@ -190,12 +233,14 @@ async fn cpu_pipelined_selection_matches_sequential() -> Result<(), Box<dyn Erro
 #[cfg(target_os = "macos")]
 #[tokio::test]
 #[ignore = "requires FORJA_MODELS and runs in the pre-push hook"]
-async fn metal_pipelined_selection_matches_sequential() -> Result<(), Box<dyn Error>> {
+async fn metal_greedy_graph_matches_sample_at_zero_temperature() -> Result<(), Box<dyn Error>> {
     compare_pipelined_selection(
         forja_metal::MetalBackend::new()?,
         forja_metal::MetalBackend::new()?,
+        test_guests::qwen3_bf16_no_replay(),
         test_guests::qwen3_bf16(),
         128,
+        SamplingParams::default(),
     )
     .await
 }
@@ -203,32 +248,51 @@ async fn metal_pipelined_selection_matches_sequential() -> Result<(), Box<dyn Er
 async fn compare_pipelined_selection<B>(
     sequential_backend: B,
     pipelined_backend: B,
-    component: &std::path::Path,
+    sequential_component: &std::path::Path,
+    pipelined_component: &std::path::Path,
     token_count: u32,
+    sampling: SamplingParams,
 ) -> Result<(), Box<dyn Error>>
 where
     B: Backend + Send + Sync + 'static,
 {
     let root = PathBuf::from(env::var_os("FORJA_MODELS").ok_or("FORJA_MODELS is not set")?);
     let weights = root.join("Qwen3-0.6B/model.safetensors");
-    let mut sequential =
-        EngineRunner::new(component, sequential_backend, REPLAY_LIMITS, &weights).await?;
-    let mut pipelined =
-        EngineRunner::new(component, pipelined_backend, REPLAY_LIMITS, weights).await?;
+    let mut sequential = EngineRunner::new(
+        sequential_component,
+        sequential_backend,
+        REPLAY_LIMITS,
+        &weights,
+    )
+    .await?;
+    let mut pipelined = EngineRunner::new(
+        pipelined_component,
+        pipelined_backend,
+        REPLAY_LIMITS,
+        weights,
+    )
+    .await?;
     sequential.load().await??;
     pipelined.load().await??;
     let prompt = (0_u32..8).collect::<Vec<_>>();
-    let expected = selected_tokens(&mut sequential, &prompt, token_count, false, None)
+    let expected = selected_tokens(&mut sequential, &prompt, token_count, false, None, sampling)
         .await
         .map_err(|error| format!("sequential decode failed: {error}"))?;
-    let actual = selected_tokens(&mut pipelined, &prompt, token_count, true, None)
+    let actual = selected_tokens(&mut pipelined, &prompt, token_count, true, None, sampling)
         .await
         .map_err(|error| format!("pipelined decode failed: {error}"))?;
     assert_eq!(actual, expected);
     let eos = *expected.get(3).ok_or("sequential decode was incomplete")?;
-    let stopped = selected_tokens(&mut pipelined, &prompt, token_count, true, Some(eos))
-        .await
-        .map_err(|error| format!("EOS decode failed: {error}"))?;
+    let stopped = selected_tokens(
+        &mut pipelined,
+        &prompt,
+        token_count,
+        true,
+        Some(eos),
+        sampling,
+    )
+    .await
+    .map_err(|error| format!("EOS decode failed: {error}"))?;
     assert_eq!(stopped, expected[..=3]);
     let next_position = u32::try_from(prompt.len())?
         .checked_add(u32::try_from(stopped.len())?.saturating_sub(1))
@@ -237,6 +301,7 @@ where
         .enqueue_decode(EngineDecode {
             tokens: None,
             start_pos: next_position,
+            sampling: SamplingParams::default(),
         })
         .await?;
     assert!(matches!(resumed, Err(compute::Error::OpSignature(_))));
@@ -249,6 +314,7 @@ async fn selected_tokens<B>(
     token_count: u32,
     pipelined: bool,
     eos: Option<u32>,
+    sampling: SamplingParams,
 ) -> Result<Vec<u32>, Box<dyn Error>>
 where
     B: Backend + Send + Sync + 'static,
@@ -259,6 +325,7 @@ where
     let input = EngineDecode {
         tokens: Some(prompt.to_vec()),
         start_pos: 0,
+        sampling,
     };
     let mut tokens = Vec::with_capacity(usize::try_from(token_count)?);
     if pipelined {
@@ -277,6 +344,7 @@ where
         }
         let replay_base = runner.metrics().submissions;
         let mut consumed = 0_u64;
+        let mut replay_count = 0_u32;
         let mut outputs = VecDeque::with_capacity(2);
         let mut position = u32::try_from(prompt.len())?;
         let end = position
@@ -284,14 +352,24 @@ where
             .ok_or("decode position overflowed")?;
         while position < end || !outputs.is_empty() {
             while position < end && outputs.len() < 2 {
+                runner.set_profiling(replay_count > 0);
                 let output = runner
                     .enqueue_decode(EngineDecode {
                         tokens: None,
                         start_pos: position,
+                        sampling,
                     })
                     .await?
                     .map_err(|error| format!("decode enqueue at {position} failed: {error:?}"))?;
+                if replay_count > 0 {
+                    let profile = runner
+                        .take_profile()
+                        .ok_or("profiled replay did not produce a profile")?;
+                    assert_no_guest_buffer_io(&profile, position);
+                }
+                runner.set_profiling(false);
                 outputs.push_back(output);
+                replay_count = next_replay_count(replay_count)?;
                 position = position
                     .checked_add(1)
                     .ok_or("decode position overflowed")?;
@@ -331,12 +409,30 @@ where
                 .decode(EngineDecode {
                     tokens: None,
                     start_pos: position,
+                    sampling,
                 })
                 .await??;
             tokens.push(read_token(&runner.read(&output.token).await?)?);
         }
     }
     Ok(tokens)
+}
+
+fn assert_no_guest_buffer_io(profile: &forja_host::EngineStepProfile, position: u32) {
+    assert_eq!(
+        profile.imports.write.count, 0,
+        "replay at {position} issued a guest tensor write"
+    );
+    assert_eq!(
+        profile.imports.read.count, 0,
+        "replay at {position} issued a guest tensor read"
+    );
+}
+
+fn next_replay_count(count: u32) -> Result<u32, Box<dyn Error>> {
+    count
+        .checked_add(1)
+        .ok_or_else(|| "replay count overflowed".into())
 }
 
 async fn compare_greedy_selection<B>(
@@ -367,6 +463,7 @@ where
         .decode(EngineDecode {
             tokens: Some(prompt),
             start_pos: 0,
+            sampling: SamplingParams::default(),
         })
         .await??;
     let mut host_token = host_argmax(&host.read(&host_output.logits).await?)?;
@@ -391,6 +488,7 @@ where
             .decode(EngineDecode {
                 tokens: replacement.map(|token| vec![token]),
                 start_pos: position,
+                sampling: SamplingParams::default(),
             })
             .await??;
         host_token = host_argmax(&host.read(&host_output.logits).await?)?;
@@ -415,6 +513,7 @@ where
         .decode(EngineDecode {
             tokens: Some(vec![replacement]),
             start_pos: position,
+            sampling: SamplingParams::default(),
         })
         .await??;
     assert_eq!(

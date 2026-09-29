@@ -164,6 +164,12 @@ fn engine_guest_impl() -> proc_macro2::TokenStream {
                         ::forja_sdk::DecodeInput {
                             tokens,
                             start_pos: input.start_pos,
+                            sampling: ::forja_sdk::SamplingParams {
+                                temperature: input.sampling.temperature,
+                                top_k: input.sampling.top_k,
+                                top_p: input.sampling.top_p,
+                                seed: input.sampling.seed,
+                            },
                         },
                     )
                 })?;
