@@ -41,12 +41,12 @@ struct VerifyArgs {
     /// Directory containing golden fixtures.
     #[arg(long)]
     fixtures: PathBuf,
-    /// Compute backend. Repeating the option uses the last value.
-    #[arg(long, value_enum, default_value = "metal", action = clap::ArgAction::Append)]
-    backend: Vec<Backend>,
-    /// Engine precision. Repeating the option uses the last value.
-    #[arg(long, value_enum, default_value = "f32", action = clap::ArgAction::Append)]
-    precision: Vec<Precision>,
+    /// Compute backend.
+    #[arg(long, value_enum, default_value_t = Backend::Metal)]
+    backend: Backend,
+    /// Engine precision.
+    #[arg(long, value_enum, default_value_t = Precision::F32)]
+    precision: Precision,
     /// Comma-separated fixture names. Repeating the option appends names.
     #[arg(long, value_delimiter = ',', value_parser = parse_prompt_name)]
     prompts: Vec<String>,
@@ -169,8 +169,8 @@ impl From<VerifyArgs> for Verify {
             engine: options.engine,
             model_dir: options.model_dir,
             fixtures: options.fixtures,
-            backend: options.backend.last().copied().unwrap_or(Backend::Metal),
-            precision: options.precision.last().copied().unwrap_or(Precision::F32),
+            backend: options.backend,
+            precision: options.precision,
             prompts: options.prompts,
         }
     }
@@ -507,7 +507,7 @@ mod tests {
     }
 
     #[test]
-    fn preserves_repeated_verify_options() {
+    fn appends_repeated_verify_prompts() {
         let command = parse(
             [
                 "verify",
@@ -517,14 +517,6 @@ mod tests {
                 "/model",
                 "--fixtures",
                 "/fixtures",
-                "--backend",
-                "cpu",
-                "--backend",
-                "metal",
-                "--precision",
-                "bf16",
-                "--precision",
-                "f32",
                 "--prompts",
                 "one,two",
                 "--prompts",
@@ -618,6 +610,32 @@ mod tests {
                 "/fixtures",
                 "--backend",
                 "neural",
+            ],
+            vec![
+                "verify",
+                "--engine",
+                "/engine.wasm",
+                "--model-dir",
+                "/model",
+                "--fixtures",
+                "/fixtures",
+                "--backend",
+                "cpu",
+                "--backend",
+                "metal",
+            ],
+            vec![
+                "verify",
+                "--engine",
+                "/engine.wasm",
+                "--model-dir",
+                "/model",
+                "--fixtures",
+                "/fixtures",
+                "--precision",
+                "bf16",
+                "--precision",
+                "f32",
             ],
             vec![
                 "verify",
