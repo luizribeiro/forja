@@ -2453,6 +2453,7 @@ fn core_op(operation: compute::Op) -> (TemplateOp, Option<Op>) {
         compute::Op::SiluMul => concrete_template(Op::SiluMul),
         compute::Op::RmsNorm(eps) => concrete_template(Op::RmsNorm { eps }),
         compute::Op::Softmax => concrete_template(Op::Softmax),
+        compute::Op::Argmax => concrete_template(Op::Argmax),
         compute::Op::Rope(config) => concrete_template(Op::Rope {
             theta: config.theta,
         }),
@@ -3597,6 +3598,11 @@ mod tests {
                 (compute::Dtype::F32, vec![7, 33]),
             ),
             (
+                compute::Op::Argmax,
+                vec![(compute::Dtype::F32, vec![7, 33])],
+                (compute::Dtype::U32, vec![7]),
+            ),
+            (
                 compute::Op::Rope(compute::RopeCfg { theta: 10_000.0 }),
                 vec![
                     (compute::Dtype::F32, vec![7, 16, 128]),
@@ -3651,16 +3657,8 @@ mod tests {
             host.dispatch(&commands, operation, &input_borrows, &output)
                 .unwrap();
 
-            assert_eq!(
-                host.table
-                    .get(&commands)
-                    .unwrap()
-                    .commands
-                    .clone()
-                    .into_dispatches()
-                    .len(),
-                1
-            );
+            let recorded = host.table.get(&commands).unwrap();
+            assert_eq!(recorded.commands.clone().into_dispatches().len(), 1);
         }
     }
 
