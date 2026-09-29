@@ -77,7 +77,7 @@ pub(crate) enum Op {
     Sdpa {
         scale: f32,
         causal: bool,
-        q_start: u32,
+        q_start: Affine,
     },
 }
 
@@ -111,7 +111,6 @@ pub(crate) trait Backend {
     fn alloc(dtype: DType, shape: &[u32]) -> Result<Self::Tensor>;
     fn write(tensor: &Self::Tensor, bytes: &[u8]) -> Result<()>;
     fn view(tensor: &Self::Tensor, operation: View) -> Result<Self::Tensor>;
-    #[allow(dead_code, reason = "used by symbolic tensor views")]
     fn view_param(
         tensor: &Self::Tensor,
         params: &Self::Params,
@@ -362,11 +361,7 @@ pub(crate) mod guest {
             } => compute::Op::Sdpa(compute::SdpaCfg {
                 scale,
                 causal,
-                q_start: compute::Affine {
-                    param: None,
-                    scale: 0,
-                    offset: q_start,
-                },
+                q_start: wit_affine(q_start),
             }),
         }
     }
@@ -865,7 +860,7 @@ pub(crate) mod native {
             } => CoreOp::Sdpa {
                 scale,
                 causal,
-                q_start,
+                q_start: q_start.offset,
             },
         }
     }
@@ -961,7 +956,6 @@ pub(crate) fn view(tensor: &Handle, operation: View) -> Result<Handle> {
     Active::view(tensor, operation)
 }
 
-#[allow(dead_code, reason = "used by symbolic tensor views")]
 pub(crate) fn view_param(
     tensor: &Handle,
     params: &Params,

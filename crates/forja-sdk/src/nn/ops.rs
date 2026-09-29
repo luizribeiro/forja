@@ -1,6 +1,6 @@
 //! Free-form neural-network operations.
 
-use crate::{Element, Error, Result, Tensor, graph, sys};
+use crate::{Dim, Element, Error, Result, Tensor, graph, sys};
 
 /// Computes grouped-query scaled dot-product attention.
 ///
@@ -13,16 +13,17 @@ pub fn sdpa<T: Element>(
     value: &Tensor<T>,
     scale: f32,
     causal: bool,
-    q_start: u32,
+    q_start: impl Into<Dim>,
 ) -> Result<Tensor<T>> {
     let [query_heads, query_len, _] = shape3(query)?;
     let [_, _, value_width] = shape3(value)?;
     let output = Tensor::<T>::empty(vec![query_heads, query_len, value_width])?;
+    let q_start = q_start.into();
     graph::record(
         sys::Op::Sdpa {
             scale,
             causal,
-            q_start,
+            q_start: graph::affine(&q_start)?,
         },
         &[query.handle(), key.handle(), value.handle()],
         output.handle(),

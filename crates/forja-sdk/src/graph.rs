@@ -17,7 +17,6 @@ static NEXT_PARAM_ID: AtomicU64 = AtomicU64::new(0);
 
 enum Recording {
     Lazy(sys::Commands),
-    #[allow(dead_code, reason = "fields are used by symbolic tensor views")]
     Capture {
         commands: sys::Commands,
         params: sys::Params,
@@ -77,12 +76,10 @@ pub struct Dim {
 }
 
 impl Dim {
-    #[allow(dead_code, reason = "used by symbolic tensor views")]
     pub(crate) const fn value(&self) -> u32 {
         self.value
     }
 
-    #[allow(dead_code, reason = "used by symbolic tensor views")]
     pub(crate) const fn is_symbolic(&self) -> bool {
         self.id.is_some()
     }
@@ -209,7 +206,6 @@ pub fn capture<T>(params: &[&Param], trace: impl FnOnce() -> Result<T>) -> Resul
     })
 }
 
-#[allow(dead_code, reason = "used by symbolic tensor views")]
 pub(crate) fn affine(dim: &Dim) -> Result<sys::Affine> {
     let Some(id) = dim.id else {
         return Ok(sys::Affine {
@@ -240,7 +236,6 @@ pub(crate) fn affine(dim: &Dim) -> Result<sys::Affine> {
     })
 }
 
-#[allow(dead_code, reason = "used by symbolic tensor views")]
 fn parameter_trace_value(dim: &Dim) -> Result<u32> {
     let trace_value = dim
         .value
@@ -258,7 +253,6 @@ fn parameter_trace_value(dim: &Dim) -> Result<u32> {
     Ok(trace_value)
 }
 
-#[allow(dead_code, reason = "used by symbolic tensor views")]
 pub(crate) fn view_param(tensor: &sys::Handle, slices: &[sys::ParamSlice]) -> Result<sys::Handle> {
     CURRENT.with(|current| {
         let current = current.borrow();

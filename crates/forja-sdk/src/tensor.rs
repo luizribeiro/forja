@@ -7,10 +7,10 @@ use crate::{
 };
 
 /// A strided selection along one tensor axis.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Slice {
-    start: u32,
-    len: u32,
+    start: crate::Dim,
+    len: crate::Dim,
     step: u32,
 }
 
@@ -20,11 +20,19 @@ impl Slice {
     /// # Errors
     ///
     /// Returns an error when `step` is zero.
-    pub fn new(start: u32, len: u32, step: u32) -> Result<Self> {
+    pub fn new(
+        start: impl Into<crate::Dim>,
+        len: impl Into<crate::Dim>,
+        step: u32,
+    ) -> Result<Self> {
         if step == 0 {
             return Err(Error::new("slice step must be at least one"));
         }
-        Ok(Self { start, len, step })
+        Ok(Self {
+            start: start.into(),
+            len: len.into(),
+            step,
+        })
     }
 }
 
@@ -47,6 +55,7 @@ impl Slice {
 pub struct Tensor<T: Element> {
     handle: sys::Handle,
     shape: Vec<u32>,
+    symbolic_extents: Vec<bool>,
     element: PhantomData<T>,
     not_thread_safe: PhantomData<Rc<()>>,
 }
@@ -68,12 +77,42 @@ impl<T: Element> Tensor<T> {
     /// Returns an error when the shape size overflows, the value count differs,
     /// or the host refuses the allocation or write.
     pub fn from_slice(values: &[T], shape: &[u32]) -> Result<Self> {
+        graph::refuse_during_capture("from_slice")?;
+        Self::from_values(values, shape)
+    }
+
+    /// Allocates a tensor initialized from immutable table data.
+    ///
+    /// Constants must be constructed before graph capture begins.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error during capture, for mismatched sizes, or when allocation fails.
+    pub fn constant(values: &[T], shape: &[u32]) -> Result<Self> {
+        graph::refuse_during_capture("constant")?;
+        Self::from_values(values, shape)
+    }
+
+    fn from_values(values: &[T], shape: &[u32]) -> Result<Self> {
         if element_count(shape)? != u64::try_from(values.len()).map_err(|_| size_error())? {
             return Err(Error::new("data length does not match tensor shape"));
         }
         let handle = sys::alloc(T::DTYPE, shape)?;
         sys::write(&handle, &T::encode(values))?;
         Ok(Self::from_handle(handle, shape.to_vec()))
+    }
+
+    /// Replaces every logical tensor value from a contiguous slice.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error during capture, for mismatched sizes, or when the host refuses the write.
+    pub fn write(&self, values: &[T]) -> Result<()> {
+        graph::refuse_during_capture("write")?;
+        if element_count(&self.shape)? != u64::try_from(values.len()).map_err(|_| size_error())? {
+            return Err(Error::new("data length does not match tensor shape"));
+        }
+        sys::write(&self.handle, &T::encode(values))
     }
 
     /// Returns the extent of each tensor axis.
@@ -91,17 +130,49 @@ impl<T: Element> Tensor<T> {
         if slices.len() != self.shape.len() {
             return Err(Error::new("slice rank does not match tensor rank"));
         }
+        for (extent, slice) in self.shape.iter().zip(slices) {
+            if slice
+                .start
+                .value()
+                .checked_add(slice.len.value())
+                .is_none_or(|end| end > *extent)
+            {
+                return Err(Error::new("slice exceeds its axis"));
+            }
+        }
+        let shape = slices.iter().map(|slice| slice.len.value()).collect();
+        let mut symbolic_extents = self.symbolic_extents.clone();
+        for (symbolic, slice) in symbolic_extents.iter_mut().zip(slices) {
+            *symbolic = slice.len.is_symbolic();
+        }
+        if slices
+            .iter()
+            .any(|slice| slice.start.is_symbolic() || slice.len.is_symbolic())
+        {
+            let slices = slices
+                .iter()
+                .map(|slice| {
+                    Ok(sys::ParamSlice {
+                        start: graph::affine(&slice.start)?,
+                        len: graph::affine(&slice.len)?,
+                        step: slice.step,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let handle = graph::view_param(&self.handle, &slices)?;
+            return Ok(Self::from_symbolic_handle(handle, shape, symbolic_extents));
+        }
         let operation = sys::View::Slice(
             slices
                 .iter()
                 .map(|slice| sys::Slice {
-                    start: slice.start,
-                    len: slice.len,
+                    start: slice.start.value(),
+                    len: slice.len.value(),
                     step: slice.step,
                 })
                 .collect(),
         );
-        self.view(operation, slices.iter().map(|slice| slice.len).collect())
+        self.view(operation, shape, symbolic_extents)
     }
 
     /// Selects a contiguous range on one axis.
@@ -109,21 +180,32 @@ impl<T: Element> Tensor<T> {
     /// # Errors
     ///
     /// Returns an error when the axis or range is invalid.
-    pub fn narrow(&self, axis: usize, start: u32, len: u32) -> Result<Self> {
+    pub fn narrow(
+        &self,
+        axis: usize,
+        start: impl Into<crate::Dim>,
+        len: impl Into<crate::Dim>,
+    ) -> Result<Self> {
+        let start = start.into();
+        let len = len.into();
         let extent = self
             .shape
             .get(axis)
             .copied()
             .ok_or_else(|| Error::new("narrow axis is out of range"))?;
-        if start.checked_add(len).is_none_or(|end| end > extent) {
+        if start
+            .value()
+            .checked_add(len.value())
+            .is_none_or(|end| end > extent)
+        {
             return Err(Error::new("narrow range exceeds its axis"));
         }
         let mut slices = self
             .shape
             .iter()
             .map(|&extent| Slice {
-                start: 0,
-                len: extent,
+                start: 0.into(),
+                len: extent.into(),
                 step: 1,
             })
             .collect::<Vec<_>>();
@@ -162,7 +244,11 @@ impl<T: Element> Tensor<T> {
             .iter()
             .map(|&axis| self.shape[usize::from(axis)])
             .collect();
-        self.view(sys::View::Permute(axes), shape)
+        let symbolic_extents = axes
+            .iter()
+            .map(|&axis| self.symbolic_extents[usize::from(axis)])
+            .collect();
+        self.view(sys::View::Permute(axes), shape, symbolic_extents)
     }
 
     /// Swaps the last two axes.
@@ -186,7 +272,14 @@ impl<T: Element> Tensor<T> {
     ///
     /// Returns an error when the view is non-contiguous or sizes differ.
     pub fn reshape(&self, shape: &[u32]) -> Result<Self> {
-        self.view(sys::View::Reshape(shape.to_vec()), shape.to_vec())
+        if self.symbolic_extents.contains(&true) {
+            return Err(Error::new("reshape does not accept symbolic extents"));
+        }
+        self.view(
+            sys::View::Reshape(shape.to_vec()),
+            shape.to_vec(),
+            vec![false; shape.len()],
+        )
     }
 
     /// Broadcasts size-one axes to a target shape.
@@ -195,7 +288,16 @@ impl<T: Element> Tensor<T> {
     ///
     /// Returns an error when the source cannot broadcast to the target.
     pub fn broadcast_as(&self, shape: &[u32]) -> Result<Self> {
-        self.view(sys::View::Broadcast(shape.to_vec()), shape.to_vec())
+        if self.symbolic_extents.contains(&true) {
+            return Err(Error::new(
+                "broadcast_as does not accept automatic symbolic extents",
+            ));
+        }
+        self.view(
+            sys::View::Broadcast(shape.to_vec()),
+            shape.to_vec(),
+            vec![false; shape.len()],
+        )
     }
 
     /// Applies `SiLU` to this gate and multiplies it by `up`.
@@ -433,22 +535,47 @@ impl<T: Element> Tensor<T> {
     ///
     /// Returns an error when reading fails.
     pub fn to_vec(&self) -> Result<Vec<T>> {
+        graph::refuse_during_capture("to_vec")?;
         crate::eval()?;
         T::decode(&sys::read(&self.handle)?)
     }
 
-    fn view(&self, operation: sys::View, shape: Vec<u32>) -> Result<Self> {
+    fn view(
+        &self,
+        operation: sys::View,
+        shape: Vec<u32>,
+        symbolic_extents: Vec<bool>,
+    ) -> Result<Self> {
         let handle = sys::view(&self.handle, operation)?;
-        Ok(Self::from_handle(handle, shape))
+        Ok(Self::from_symbolic_handle(handle, shape, symbolic_extents))
     }
 
     pub(crate) fn from_handle(handle: sys::Handle, shape: Vec<u32>) -> Self {
+        let symbolic_extents = vec![false; shape.len()];
+        Self::from_symbolic_handle(handle, shape, symbolic_extents)
+    }
+
+    fn from_symbolic_handle(
+        handle: sys::Handle,
+        shape: Vec<u32>,
+        symbolic_extents: Vec<bool>,
+    ) -> Self {
         Self {
             handle,
             shape,
+            symbolic_extents,
             element: PhantomData,
             not_thread_safe: PhantomData,
         }
+    }
+
+    /// Creates another handle for this tensor's current view.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the host refuses the metadata-only view.
+    pub fn alias(&self) -> Result<Self> {
+        self.reshape(&self.shape)
     }
 
     pub(crate) fn empty<U: Element>(shape: Vec<u32>) -> Result<Tensor<U>> {
