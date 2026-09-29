@@ -618,6 +618,18 @@ impl GraphTemplate {
         self.limits
     }
 
+    /// Returns the concrete dispatches whose tensors and operation never depend on parameters.
+    #[doc(hidden)]
+    pub fn static_dispatches(&self) -> impl Iterator<Item = (usize, &Dispatch)> {
+        self.dispatches
+            .iter()
+            .enumerate()
+            .filter_map(|(index, dispatch)| match dispatch {
+                TemplateDispatch::Static(dispatch) => Some((index, dispatch.as_ref())),
+                TemplateDispatch::Dynamic(_) => None,
+            })
+    }
+
     /// Checks raw replay values against this template's parameter space.
     ///
     /// # Errors

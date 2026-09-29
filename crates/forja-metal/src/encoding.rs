@@ -300,10 +300,8 @@ struct PlanRecording {
     calls: Vec<PlanCall>,
 }
 
-#[allow(dead_code)]
 struct PlanRecorderScope(bool);
 
-#[allow(dead_code)]
 impl PlanRecorderScope {
     fn enter(arena_base: u64) -> Self {
         PLAN_RECORDER.with(|recorder| {
@@ -809,6 +807,25 @@ struct CommandResources {
 pub(super) struct PreparedMetalGraph {
     residency: Retained<ProtocolObject<dyn MTLResidencySet>>,
     buffers: HashSet<BufferId>,
+    #[allow(dead_code)]
+    tensors: Vec<Tensor>,
+    #[allow(dead_code)]
+    encoding: Option<MetalEncodingPlan>,
+}
+
+#[derive(Clone)]
+struct StaticEncodingPlan {
+    #[allow(dead_code)]
+    calls: Vec<PlanCall>,
+}
+
+struct MetalEncodingPlan {
+    #[allow(dead_code)]
+    dispatches: Vec<Option<StaticEncodingPlan>>,
+    #[allow(dead_code)]
+    arena: Vec<u8>,
+    #[allow(dead_code)]
+    argument_offset: usize,
 }
 
 // SAFETY: The committed residency set remains immutable, and its allocations are retained by the
@@ -1404,6 +1421,9 @@ impl MetalBackend {
         &self,
         graph: &GraphTemplate,
     ) -> Result<PreparedMetalGraph, BackendError> {
+        let encoding = (self.graph_replay == crate::storage::MetalGraphReplay::Tier2)
+            .then(|| self.prepare_encoding_plan(graph))
+            .transpose()?;
         let residency = self
             .device
             .newResidencySetWithDescriptor_error(&MTLResidencySetDescriptor::new())
@@ -1425,6 +1445,72 @@ impl MetalBackend {
         Ok(PreparedMetalGraph {
             residency,
             buffers: retained,
+            tensors,
+            encoding,
+        })
+    }
+
+    fn prepare_encoding_plan(
+        &self,
+        graph: &GraphTemplate,
+    ) -> Result<MetalEncodingPlan, BackendError> {
+        let static_dispatches = graph
+            .static_dispatches()
+            .filter(|(_, dispatch)| reusable_dispatch(dispatch))
+            .collect::<Vec<_>>();
+        let mut plans = vec![None; graph.len()];
+        if static_dispatches.is_empty() {
+            return Ok(MetalEncodingPlan {
+                dispatches: plans,
+                arena: Vec::new(),
+                argument_offset: 0,
+            });
+        }
+        let dispatches = static_dispatches
+            .iter()
+            .map(|(_, dispatch)| (*dispatch).clone())
+            .collect::<Vec<_>>();
+        let capacity = self.argument_capacity(&dispatches)?;
+        let objects = self.in_flight.checkout(&self.device, capacity)?;
+        let command_buffer = self.begin_command_buffer(objects.allocator()?)?;
+        let mut arguments = ArgumentWriter::new(objects.argument_buffer()?);
+        for (index, dispatch) in static_dispatches {
+            let recorder = PlanRecorderScope::enter(arguments.raw.gpuAddress());
+            let encoded = self.encode_dispatches(
+                &command_buffer,
+                objects.argument_table()?,
+                &DispatchEncoding {
+                    dispatches: std::slice::from_ref(dispatch),
+                    barriers: &[false],
+                },
+                None,
+                &mut arguments,
+            )?;
+            let calls = recorder.finish();
+            if !encoded.error_flags.is_empty()
+                || encoded
+                    .temporaries
+                    .iter()
+                    .any(|buffer| buffer.raw.gpuAddress() != arguments.raw.gpuAddress())
+            {
+                return Err(BackendError::ExecutionFailed);
+            }
+            plans[index] = Some(StaticEncodingPlan { calls });
+        }
+        command_buffer.endCommandBuffer();
+        let mut arena = vec![0_u8; arguments.offset];
+        // SAFETY: The arena length is the initialized prefix of the live shared argument buffer.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                arguments.raw.contents().cast::<u8>().as_ptr(),
+                arena.as_mut_ptr(),
+                arena.len(),
+            );
+        }
+        Ok(MetalEncodingPlan {
+            dispatches: plans,
+            argument_offset: arena.len(),
+            arena,
         })
     }
 
@@ -3538,6 +3624,22 @@ fn supported_dispatch(dispatch: &Dispatch) -> bool {
         | Op::Embed
         | Op::Matmul
         | Op::Sdpa { .. } => true,
+    }
+}
+
+fn reusable_dispatch(dispatch: &Dispatch) -> bool {
+    match dispatch.op() {
+        Op::Embed | Op::Sdpa { .. } => false,
+        Op::Matmul => {
+            dispatch
+                .inputs()
+                .iter()
+                .all(|tensor| classify(tensor.layout()).kernel_strides().is_some())
+                && classify(dispatch.output().layout())
+                    .kernel_strides()
+                    .is_some_and(|(column_major, _, _)| column_major == 0)
+        }
+        _ => true,
     }
 }
 
