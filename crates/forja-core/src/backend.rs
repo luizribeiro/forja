@@ -431,6 +431,11 @@ pub trait Backend {
         self.submit_profiled(commands)
     }
 
+    /// Reports whether graph submissions may complete asynchronously on this backend.
+    fn supports_replay_overlap(&self) -> bool {
+        false
+    }
+
     /// Submits work with detailed timing enabled.
     ///
     /// Backends without detailed instrumentation use the normal submission path.

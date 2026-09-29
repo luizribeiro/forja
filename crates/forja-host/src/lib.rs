@@ -2144,6 +2144,26 @@ where
     B: Backend + Send + Sync + 'static,
 {
     async fn run(self) -> Result<Option<u64>, compute::Error> {
+        self.spawn(None)
+            .await
+            .map_err(|_| guest_error(BackendError::ExecutionFailed))?
+            .map_err(guest_error)
+    }
+
+    async fn run_deferred(self) -> Result<Option<u64>, compute::Error> {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let task = self.spawn(Some(sender));
+        let started = receiver
+            .await
+            .map_err(|_| guest_error(BackendError::ExecutionFailed))?;
+        drop(task);
+        started.map(|()| None).map_err(guest_error)
+    }
+
+    fn spawn(
+        self,
+        started: Option<tokio::sync::oneshot::Sender<Result<(), BackendError>>>,
+    ) -> tokio::task::JoinHandle<Result<Option<u64>, BackendError>> {
         let reservation = GpuReservation::new(
             Arc::clone(&self.gpu_time_ns),
             self.gpu_time_budget_ns,
@@ -2163,7 +2183,7 @@ where
                 completed_gpu_time_ns,
                 profile,
             } = self;
-            let result = match reservation {
+            let submitted = match reservation {
                 Err(error) => Err(error),
                 Ok(reservation) => match match work {
                     SubmissionWork::Commands(commands) if profile.is_some() => {
@@ -2176,48 +2196,70 @@ where
                     SubmissionWork::Replay { graph, values } => backend.replay(&graph, values),
                 } {
                     Err(error) => Err(error),
-                    Ok(submission) => {
-                        let started = Instant::now();
-                        let wait = submission.wait_timeout(timeout);
-                        let wall_time = duration_ns(started.elapsed()).max(1);
-                        let gpu_time = submission.gpu_time().map(duration_ns);
-                        let submission_profile = submission.profile();
-                        let charged = if wait == Err(BackendError::Timeout) {
-                            reservation.amount()
-                        } else {
-                            gpu_time.unwrap_or(wall_time).max(1)
-                        };
-                        let accounting = reservation.settle(charged);
-                        match (wait, accounting) {
-                            (Err(error), _) | (Ok(()), Err(error)) => Err(error),
-                            (Ok(()), Ok(())) => {
-                                if let (Some(target), Some(submission_profile)) =
-                                    (&profile, submission_profile)
-                                    && let Ok(mut target) = target.lock()
-                                {
-                                    target.submission = Some(submission_profile);
-                                }
-                                saturating_increment(&completed_submissions);
-                                if let Some(gpu_time) = gpu_time {
-                                    saturating_increment(&timed_submissions);
-                                    saturating_add(&completed_gpu_time_ns, gpu_time);
-                                }
-                                Ok(gpu_time)
-                            }
-                        }
-                    }
+                    Ok(submission) => Ok((submission, reservation)),
                 },
             };
-            let release = release_retained(backend.as_ref(), retained, profile.as_ref());
-            let result = match (result, release) {
-                (Err(error), _) | (Ok(_), Err(error)) => Err(error),
-                (Ok(gpu_time), Ok(())) => Ok(gpu_time),
+            let (submission, reservation) = match submitted {
+                Ok(submitted) => {
+                    if let Some(started) = started {
+                        let _ = started.send(Ok(()));
+                    }
+                    submitted
+                }
+                Err(error) => {
+                    let release = release_retained(backend.as_ref(), retained, profile.as_ref());
+                    let result = combine_submission_release(Err(error), release);
+                    let result = flight.map_or(result, |flight| flight.finish(result));
+                    if let Some(started) = started {
+                        let _ = started.send(result.as_ref().map(|_| ()).map_err(|error| *error));
+                    }
+                    return result;
+                }
             };
-            flight.map_or(result, |flight| flight.finish(result))
+            let wait_started = Instant::now();
+            let wait = submission.wait_timeout(timeout);
+            let wall_time = duration_ns(wait_started.elapsed()).max(1);
+            let gpu_time = submission.gpu_time().map(duration_ns);
+            let submission_profile = submission.profile();
+            let charged = if wait == Err(BackendError::Timeout) {
+                reservation.amount()
+            } else {
+                gpu_time.unwrap_or(wall_time).max(1)
+            };
+            let accounting = reservation.settle(charged);
+            let result = match (wait, accounting) {
+                (Err(error), _) | (Ok(()), Err(error)) => Err(error),
+                (Ok(()), Ok(())) => {
+                    if let (Some(target), Some(submission_profile)) = (&profile, submission_profile)
+                        && let Ok(mut target) = target.lock()
+                    {
+                        target.submission = Some(submission_profile);
+                    }
+                    Ok(gpu_time)
+                }
+            };
+            let release = release_retained(backend.as_ref(), retained, profile.as_ref());
+            let result = combine_submission_release(result, release);
+            let result = flight.map_or(result, |flight| flight.finish(result));
+            if let Ok(gpu_time) = result {
+                saturating_increment(&completed_submissions);
+                if let Some(gpu_time) = gpu_time {
+                    saturating_increment(&timed_submissions);
+                    saturating_add(&completed_gpu_time_ns, gpu_time);
+                }
+            }
+            result
         })
-        .await
-        .map_err(|_| guest_error(BackendError::ExecutionFailed))?
-        .map_err(guest_error)
+    }
+}
+
+fn combine_submission_release<T>(
+    result: Result<T, BackendError>,
+    release: Result<(), BackendError>,
+) -> Result<T, BackendError> {
+    match (result, release) {
+        (Err(error), _) | (Ok(_), Err(error)) => Err(error),
+        (Ok(value), Ok(())) => Ok(value),
     }
 }
 
@@ -2552,7 +2594,12 @@ where
             Ok(value) => value,
             Err(error) => return Ok(Err(error)),
         };
-        let result = Ok(request.run().await);
+        let overlap = request.profile.is_none() && request.backend.supports_replay_overlap();
+        let result = Ok(if overlap {
+            request.run_deferred().await
+        } else {
+            request.run().await
+        });
         drop(timer);
         result
     }
@@ -3219,6 +3266,35 @@ mod tests {
         assert_eq!(host.live_graphs.load(Ordering::Acquire), 0);
         gate.release();
         task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn deferred_replay_returns_after_queue_submission() {
+        let gate = Arc::new(SubmitGate::default());
+        let backend = AccountingBackend::new(Some(Arc::clone(&gate)), None, Duration::ZERO);
+        let mut host = Host::new(backend, GENEROUS);
+        let graph = empty_graph(&mut host);
+        let replay = Arc::clone(&host.table.get(&graph).unwrap().replay);
+
+        assert_eq!(
+            host.prepare_replay(&graph, Vec::new())
+                .unwrap()
+                .run_deferred()
+                .await
+                .unwrap(),
+            None
+        );
+        gate.wait_for(1);
+        assert_eq!(replay.status.lock().unwrap().in_flight, 1);
+        gate.release();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while replay.status.lock().unwrap().in_flight != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(host.engine_metrics().submissions, 1);
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -686,6 +686,10 @@ impl Backend for MetalBackend {
     ) -> Result<Self::Submission, BackendError> {
         self.replay_graph(graph, values, true)
     }
+
+    fn supports_replay_overlap(&self) -> bool {
+        true
+    }
 }
 
 type BufferDeallocator = RcBlock<dyn Fn(NonNull<c_void>, usize)>;
