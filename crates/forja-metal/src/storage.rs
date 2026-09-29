@@ -87,6 +87,18 @@ impl MetalBuffer {
     pub(super) fn track(&mut self, completion: &Arc<Completion>) {
         self.pending.push(Arc::downgrade(completion));
     }
+
+    pub(super) fn pending_event_value(&mut self) -> Option<u64> {
+        let mut maximum = None;
+        self.pending.retain(|pending| {
+            let Some(completion) = pending.upgrade() else {
+                return false;
+            };
+            maximum = maximum.max(completion.event_value());
+            true
+        });
+        maximum
+    }
 }
 
 struct BufferPool {

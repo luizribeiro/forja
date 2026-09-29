@@ -574,8 +574,7 @@ impl MetalProgram {
 struct CompletionState {
     feedback: Option<CommitResult>,
     event_signaled: bool,
-    #[cfg(test)]
-    expected_event: Option<u64>,
+    event_value: Option<u64>,
     committed: Option<Instant>,
     feedback_elapsed: Option<Duration>,
     event_elapsed: Option<Duration>,
@@ -718,6 +717,11 @@ unsafe impl Sync for InFlightEvent {}
 
 pub(super) struct InFlightResidency {
     pub(super) _raw: Vec<Retained<ProtocolObject<dyn MTLResidencySet>>>,
+}
+
+struct CommitResidency {
+    sets: Vec<Retained<ProtocolObject<dyn MTLResidencySet>>>,
+    order_on_queue: bool,
 }
 
 // SAFETY: The residency set is committed before submission and remains immutable while shared
@@ -942,8 +946,7 @@ impl Completion {
                 state: Mutex::new(CompletionState {
                     feedback: None,
                     event_signaled: false,
-                    #[cfg(test)]
-                    expected_event: None,
+                    event_value: None,
                     committed: None,
                     feedback_elapsed: None,
                     event_elapsed: None,
@@ -1037,22 +1040,22 @@ impl Completion {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.committed = Some(Instant::now());
-        #[cfg(test)]
-        {
-            state.expected_event = Some(event_value);
-        }
-        #[cfg(not(test))]
-        {
-            let _ = event_value;
-        }
+        state.event_value = Some(event_value);
+    }
+
+    pub(super) fn event_value(&self) -> Option<u64> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .event_value
     }
 
     #[cfg(test)]
     fn log_timeout(&self, state: &CompletionState) {
         eprintln!(
             "Metal wait timed out: submission={:?} expected_event={:?} signaled_event={} listener_notified={} feedback_received={}",
-            state.expected_event,
-            state.expected_event,
+            state.event_value,
+            state.event_value,
             self.event.raw.signaledValue(),
             state.event_signaled,
             state.feedback.is_some(),
@@ -1719,10 +1722,13 @@ impl MetalBackend {
             &command_buffer,
             &tensors,
             resources,
-            graph.map_or_else(
-                || vec![residency.clone()],
-                |graph| vec![residency.clone(), graph.residency.clone()],
-            ),
+            CommitResidency {
+                sets: graph.map_or_else(
+                    || vec![residency.clone()],
+                    |graph| vec![residency.clone(), graph.residency.clone()],
+                ),
+                order_on_queue: graph.is_some(),
+            },
             timestamps,
             &mut objects,
         )?;
@@ -3776,7 +3782,8 @@ impl MetalBackend {
         resources: CommandResources,
         residency: InFlightResidency,
         timestamps: GpuTimestamps,
-    ) -> Result<Arc<Completion>, BackendError> {
+        order_on_queue: bool,
+    ) -> Result<(Arc<Completion>, Option<u64>), BackendError> {
         let mut seen = HashSet::<BufferId>::new();
         let unique = tensors
             .iter()
@@ -3786,9 +3793,14 @@ impl MetalBackend {
             .buffers
             .lock()
             .map_err(|_| BackendError::ExecutionFailed)?;
+        let mut dependency = None;
         for tensor in &unique {
             let buffer = buffers.get_mut(tensor)?;
-            buffer.wait_pending(self.gpu_timeout)?;
+            if order_on_queue {
+                dependency = dependency.max(buffer.pending_event_value());
+            } else {
+                buffer.wait_pending(self.gpu_timeout)?;
+            }
         }
         let completion = Completion::new(
             resources,
@@ -3800,7 +3812,7 @@ impl MetalBackend {
         for tensor in unique {
             buffers.get_mut(tensor)?.track(&completion);
         }
-        Ok(completion)
+        Ok((completion, dependency))
     }
 
     fn commit(
@@ -3808,28 +3820,31 @@ impl MetalBackend {
         command_buffer: &Retained<ProtocolObject<dyn MTL4CommandBuffer>>,
         tensors: &[Tensor],
         resources: CommandResources,
-        residencies: Vec<Retained<ProtocolObject<dyn MTLResidencySet>>>,
+        residency: CommitResidency,
         timestamps: GpuTimestamps,
         objects: &mut SubmissionObjects,
     ) -> Result<MetalSubmission, BackendError> {
-        let completion = self.retain_tensors(
+        let mut next_event_value = self
+            .next_event_value
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?;
+        let (completion, dependency) = self.retain_tensors(
             tensors,
             InFlightEvent {
                 raw: self.shared_event.clone(),
             },
             resources,
-            InFlightResidency { _raw: residencies },
+            InFlightResidency {
+                _raw: residency.sets,
+            },
             timestamps,
+            residency.order_on_queue,
         )?;
         let registration = self
             .in_flight
             .track(&completion, &self.event_listener, objects)?;
         let command_buffer_ref: &ProtocolObject<dyn MTL4CommandBuffer> = command_buffer;
         let mut command_buffers = [NonNull::from(command_buffer_ref)];
-        let Ok(mut next_event_value) = self.next_event_value.lock() else {
-            self.in_flight.cancel(&completion);
-            return Err(BackendError::ExecutionFailed);
-        };
         let event_value = *next_event_value;
         let Some(following_event_value) = event_value.checked_add(1) else {
             drop(next_event_value);
@@ -3837,6 +3852,11 @@ impl MetalBackend {
             return Err(BackendError::ExecutionFailed);
         };
         completion.mark_committed(event_value);
+        let shared_event: &ProtocolObject<dyn MTLSharedEvent> = &self.shared_event;
+        let event: &ProtocolObject<dyn MTLEvent> = shared_event.as_ref();
+        if let Some(dependency) = dependency {
+            self.queue.waitForEvent_value(event, dependency);
+        }
         // SAFETY: The pointer names one live command buffer and the count matches the array.
         unsafe {
             self.queue.commit_count_options(
@@ -3845,8 +3865,6 @@ impl MetalBackend {
                 &completion.commit.options,
             );
         }
-        let shared_event: &ProtocolObject<dyn MTLSharedEvent> = &self.shared_event;
-        let event: &ProtocolObject<dyn MTLEvent> = shared_event.as_ref();
         self.queue.signalEvent_value(event, event_value);
         *next_event_value = following_event_value;
         drop(next_event_value);
@@ -4404,6 +4422,7 @@ fn program_compile_failed(hash: ProgramHash) -> BackendError {
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::VecDeque,
         thread,
         time::{Duration, Instant},
     };
@@ -5187,9 +5206,51 @@ mod tests {
         let graph = backend.prepare_graph(template).unwrap();
         let state = graph.backend_state::<PreparedMetalGraph>().unwrap();
         assert!(state.encoding.as_ref().unwrap().dispatches[0].is_none());
-        backend.replay(&graph, Vec::new()).unwrap().wait().unwrap();
-        backend.replay(&graph, Vec::new()).unwrap().wait().unwrap();
+        let first = backend.replay(&graph, Vec::new()).unwrap();
+        let second = backend.replay(&graph, Vec::new()).unwrap();
+        second.wait().unwrap();
+        first.wait().unwrap();
         assert_eq!(backend.read(&output).unwrap(), 4096_u32.to_le_bytes());
+    }
+
+    #[test]
+    fn consecutive_replays_preserve_feedback() {
+        const REPLAYS: usize = 128;
+
+        let backend = MetalBackend::new().unwrap();
+        let feedback = backend.alloc(DType::F32, &[1]).unwrap();
+        let staged = backend.alloc(DType::F32, &[1]).unwrap();
+        let one = backend.alloc(DType::F32, &[1]).unwrap();
+        backend.write(&one, &1.0_f32.to_le_bytes()).unwrap();
+        let mut template =
+            GraphTemplate::new(ParamSpace::new(Vec::new()).unwrap(), GraphLimits::default());
+        template
+            .dispatch(
+                Op::Copy,
+                &[&feedback.clone().into()],
+                &staged.clone().into(),
+            )
+            .unwrap();
+        template
+            .dispatch(
+                Op::Add,
+                &[&staged.into(), &one.into()],
+                &feedback.clone().into(),
+            )
+            .unwrap();
+        let graph = backend.prepare_graph(template).unwrap();
+
+        let mut submissions = VecDeque::with_capacity(2);
+        for _ in 0..REPLAYS {
+            submissions.push_back(backend.replay(&graph, Vec::new()).unwrap());
+            if submissions.len() == 2 {
+                submissions.pop_front().unwrap().wait().unwrap();
+            }
+        }
+        for submission in submissions {
+            submission.wait().unwrap();
+        }
+        assert_eq!(backend.read(&feedback).unwrap(), 128.0_f32.to_le_bytes());
     }
 
     #[test]
@@ -5514,7 +5575,10 @@ mod tests {
                 &command_buffer,
                 &tensors,
                 resources,
-                vec![residency],
+                CommitResidency {
+                    sets: vec![residency],
+                    order_on_queue: false,
+                },
                 timestamps,
                 &mut objects,
             )
