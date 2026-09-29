@@ -15,7 +15,7 @@ use std::{
     pin::Pin,
     sync::{
         Arc, Mutex, OnceLock, Weak,
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     thread,
 };
@@ -1052,7 +1052,7 @@ pub struct GraphEntry {
     graph: Arc<PreparedGraph>,
     retained: Vec<TensorEntry>,
     retained_kernels: Vec<KernelEntry>,
-    in_flight: Arc<AtomicBool>,
+    replay: Arc<ReplayState>,
     _lease: GraphLease,
 }
 
@@ -1748,7 +1748,7 @@ impl<B: Backend> Host<B> {
             graph: Arc::new(graph),
             retained: Vec::new(),
             retained_kernels: Vec::new(),
-            in_flight: Arc::new(AtomicBool::new(false)),
+            replay: Arc::new(ReplayState::default()),
             _lease: lease,
         };
         let resource = match self.table.push(graph_entry) {
@@ -1810,7 +1810,7 @@ impl<B: Backend> Host<B> {
             .graph
             .values(values.clone())
             .map_err(|error| graph_error(&error))?;
-        let flight = ReplayFlight::acquire(Arc::clone(&entry.in_flight))?;
+        let flight = ReplayFlight::acquire(Arc::clone(&entry.replay))?;
         Ok(SubmitRequest {
             backend: Arc::clone(&self.backend),
             work: SubmissionWork::Replay {
@@ -2028,22 +2028,69 @@ enum SubmissionWork {
     },
 }
 
-struct ReplayFlight(Arc<AtomicBool>);
+const DEFAULT_REPLAY_DEPTH: usize = 2;
+
+#[derive(Debug, Default)]
+struct ReplayState {
+    status: Mutex<ReplayStatus>,
+}
+
+#[derive(Debug, Default)]
+struct ReplayStatus {
+    in_flight: usize,
+    failure: Option<BackendError>,
+}
+
+struct ReplayFlight(Arc<ReplayState>);
 
 impl ReplayFlight {
-    fn acquire(in_flight: Arc<AtomicBool>) -> Result<Self, compute::Error> {
-        in_flight
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .map_err(|_| {
-                compute::Error::OpSignature("graph replay is already in flight".to_owned())
+    fn acquire(replay: Arc<ReplayState>) -> Result<Self, compute::Error> {
+        let mut status = replay
+            .status
+            .lock()
+            .map_err(|_| guest_error(BackendError::ExecutionFailed))?;
+        if let Some(error) = status.failure {
+            return Err(guest_error(error));
+        }
+        status.in_flight = status
+            .in_flight
+            .checked_add(1)
+            .filter(|&depth| depth <= DEFAULT_REPLAY_DEPTH)
+            .ok_or_else(|| {
+                compute::Error::OpSignature("graph replay depth exceeds host limit".to_owned())
             })?;
-        Ok(Self(in_flight))
+        drop(status);
+        Ok(Self(replay))
+    }
+
+    fn finish<T>(self, result: Result<T, BackendError>) -> Result<T, BackendError> {
+        let mut status = self
+            .0
+            .status
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?;
+        if let Err(error) = result
+            && matches!(
+                error,
+                BackendError::ExecutionFailed
+                    | BackendError::Timeout
+                    | BackendError::IndexOutOfRange { .. }
+            )
+            && status.failure.is_none()
+        {
+            status.failure = Some(error);
+        }
+        let result = status.failure.map_or(result, Err);
+        drop(status);
+        result
     }
 }
 
 impl Drop for ReplayFlight {
     fn drop(&mut self) {
-        self.0.store(false, Ordering::Release);
+        if let Ok(mut status) = self.0.status.lock() {
+            status.in_flight = status.in_flight.saturating_sub(1);
+        }
     }
 }
 
@@ -2116,7 +2163,6 @@ where
                 completed_gpu_time_ns,
                 profile,
             } = self;
-            let _flight = flight;
             let result = match reservation {
                 Err(error) => Err(error),
                 Ok(reservation) => match match work {
@@ -2163,10 +2209,11 @@ where
                 },
             };
             let release = release_retained(backend.as_ref(), retained, profile.as_ref());
-            match (result, release) {
+            let result = match (result, release) {
                 (Err(error), _) | (Ok(_), Err(error)) => Err(error),
                 (Ok(gpu_time), Ok(())) => Ok(gpu_time),
-            }
+            };
+            flight.map_or(result, |flight| flight.finish(result))
         })
         .await
         .map_err(|_| guest_error(BackendError::ExecutionFailed))?
@@ -3106,17 +3153,48 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn replay_refuses_a_graph_already_in_flight() {
+    async fn replay_refuses_depth_above_host_limit() {
         let gate = Arc::new(SubmitGate::default());
         let backend = AccountingBackend::new(Some(Arc::clone(&gate)), None, Duration::ZERO);
         let mut host = Host::new(backend, GENEROUS);
         let graph = empty_graph(&mut host);
         let first = host.prepare_replay(&graph, Vec::new()).unwrap();
-        let task = tokio::spawn(first.run());
-        gate.wait_for(1);
+        let second = host.prepare_replay(&graph, Vec::new()).unwrap();
+        let first_task = tokio::spawn(first.run());
+        let second_task = tokio::spawn(second.run());
+        gate.wait_for(2);
         assert!(matches!(
             host.prepare_replay(&graph, Vec::new()),
             Err(compute::Error::OpSignature(_))
+        ));
+        gate.release();
+        first_task.await.unwrap().unwrap();
+        second_task.await.unwrap().unwrap();
+        host.prepare_replay(&graph, Vec::new())
+            .unwrap()
+            .run()
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pipelined_replays_reserve_gpu_budget_individually() {
+        let gate = Arc::new(SubmitGate::default());
+        let backend = AccountingBackend::new(
+            Some(Arc::clone(&gate)),
+            Some(Duration::from_nanos(10)),
+            Duration::ZERO,
+        );
+        let limits = GENEROUS.with_gpu_limits(Duration::from_nanos(100), Duration::from_nanos(150));
+        let mut host = Host::new(backend, limits);
+        let graph = empty_graph(&mut host);
+        let first = host.prepare_replay(&graph, Vec::new()).unwrap();
+        let task = tokio::spawn(first.run());
+        gate.wait_for(1);
+
+        assert!(matches!(
+            host.prepare_replay(&graph, Vec::new()).unwrap().run().await,
+            Err(compute::Error::Quota(_))
         ));
         gate.release();
         task.await.unwrap().unwrap();
@@ -3125,6 +3203,22 @@ mod tests {
             .run()
             .await
             .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dropping_a_graph_with_replays_in_flight_is_safe() {
+        let gate = Arc::new(SubmitGate::default());
+        let backend = AccountingBackend::new(Some(Arc::clone(&gate)), None, Duration::ZERO);
+        let mut host = Host::new(backend, GENEROUS);
+        let graph = empty_graph(&mut host);
+        let request = host.prepare_replay(&graph, Vec::new()).unwrap();
+        let task = tokio::spawn(request.run());
+        gate.wait_for(1);
+
+        host.drop_graph(graph).unwrap();
+        assert_eq!(host.live_graphs.load(Ordering::Acquire), 0);
+        gate.release();
+        task.await.unwrap().unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread")]
