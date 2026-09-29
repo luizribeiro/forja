@@ -355,6 +355,16 @@ float gumbel_noise(ulong seed, uint position, uint index) {
     return -log(-log(uniform));
 }
 
+bool sample_uses_parallel_reduction(
+    float temperature,
+    uint top_k,
+    float top_p,
+    uint width) {
+    bool greedy = temperature == 0.0f || top_k == 1;
+    bool unfiltered = top_p == 1.0f && (top_k == 0 || top_k >= width);
+    return greedy || unfiltered;
+}
+
 kernel void sample(
     device const uchar *logits [[buffer(0)]],
     device const uint *sampling [[buffer(1)]],
@@ -409,6 +419,10 @@ kernel void sample(
         ? (top_k == 0 ? min(width, 1024u) : min(width, min(top_k, 1024u)))
         : (top_k == 0 ? width : min(width, top_k));
     bool filter = candidate_count < width;
+
+    if (sample_uses_parallel_reduction(temperature, top_k, top_p, width)) {
+        return;
+    }
 
     if (filter && !greedy) {
         if (lane == 0) {
@@ -531,6 +545,85 @@ kernel void sample(
             float score = value / temperature + gumbel_noise(seed, position, column);
             best = max(best, argmax_candidate(score, column));
         }
+    }
+    best = argmax_threadgroup_max(
+        best, simd_lane, simd_group, partial_keys, partial_indices);
+    if (lane == 0) {
+        output[physical_index(output_layout, row)] = uint(best);
+    }
+}
+
+kernel void sample_partials(
+    device const uchar *logits [[buffer(0)]],
+    device const uint *sampling [[buffer(1)]],
+    device ulong *partials [[buffer(2)]],
+    constant TensorLayout &logits_layout [[buffer(3)]],
+    constant TensorLayout &sampling_layout [[buffer(4)]],
+    constant uint &width [[buffer(5)]],
+    constant uint &position [[buffer(6)]],
+    constant uint &chunks [[buffer(7)]],
+    uint group [[threadgroup_position_in_grid]],
+    uint lane [[thread_position_in_threadgroup]],
+    uint group_width [[threads_per_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+    float temperature = as_type<float>(sampling[physical_index(sampling_layout, 0)]);
+    uint top_k = sampling[physical_index(sampling_layout, 1)];
+    float top_p = as_type<float>(sampling[physical_index(sampling_layout, 2)]);
+    if (!sample_uses_parallel_reduction(temperature, top_k, top_p, width)) {
+        return;
+    }
+    ulong seed = ulong(sampling[physical_index(sampling_layout, 3)]) |
+                 (ulong(sampling[physical_index(sampling_layout, 4)]) << 32);
+    uint row = group / chunks;
+    uint chunk = group % chunks;
+    uint first = chunk * 2048u;
+    uint end = first + min(2048u, width - first);
+    bool greedy = temperature == 0.0f || top_k == 1;
+    threadgroup uint partial_keys[32];
+    threadgroup uint partial_indices[32];
+    ulong best = 0;
+    for (uint column = first + lane; column < end; column += group_width) {
+        float value = load_float(
+            logits, physical_index(logits_layout, row * width + column), input0_dtype);
+        if (greedy) {
+            best = max(best, argmax_candidate(value, column));
+        } else {
+            float score = value / temperature + gumbel_noise(seed, position, column);
+            best = max(best, argmax_candidate(score, column));
+        }
+    }
+    best = argmax_threadgroup_max(
+        best, simd_lane, simd_group, partial_keys, partial_indices);
+    if (lane == 0) {
+        partials[row * chunks + chunk] = best;
+    }
+}
+
+kernel void sample_reduce_finalize(
+    device const uint *sampling [[buffer(0)]],
+    device const ulong *partials [[buffer(1)]],
+    device uint *output [[buffer(2)]],
+    constant TensorLayout &sampling_layout [[buffer(3)]],
+    constant TensorLayout &output_layout [[buffer(4)]],
+    constant uint &width [[buffer(5)]],
+    constant uint &chunks [[buffer(6)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint lane [[thread_position_in_threadgroup]],
+    uint group_width [[threads_per_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+    float temperature = as_type<float>(sampling[physical_index(sampling_layout, 0)]);
+    uint top_k = sampling[physical_index(sampling_layout, 1)];
+    float top_p = as_type<float>(sampling[physical_index(sampling_layout, 2)]);
+    if (!sample_uses_parallel_reduction(temperature, top_k, top_p, width)) {
+        return;
+    }
+    threadgroup uint partial_keys[32];
+    threadgroup uint partial_indices[32];
+    ulong best = 0;
+    for (uint chunk = lane; chunk < chunks; chunk += group_width) {
+        best = max(best, partials[row * chunks + chunk]);
     }
     best = argmax_threadgroup_max(
         best, simd_lane, simd_group, partial_keys, partial_indices);

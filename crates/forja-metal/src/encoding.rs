@@ -3322,6 +3322,7 @@ impl MetalBackend {
         Ok(temporaries)
     }
 
+    #[allow(clippy::too_many_lines)]
     fn encode_sample(
         &self,
         encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
@@ -3340,41 +3341,50 @@ impl MetalBackend {
             .shape()
             .last()
             .ok_or(BackendError::InvalidInput)?;
-        let pipeline = self
-            .pipelines
-            .lock()
-            .map_err(|_| BackendError::ExecutionFailed)?
-            .get("sample", &[(0, dtype_code(logits.layout().dtype()))])?;
-        set_pipeline(encoder, &pipeline);
+        let rows = u32::try_from(output.layout().element_count())
+            .map_err(|_| BackendError::ExecutionFailed)?;
+        let chunks = width.div_ceil(ARGMAX_CHUNK_WIDTH);
+        let partials = self.scratch_tensor(DType::U32, &[rows, chunks, 2])?;
+        let (sample_pipeline, partials_pipeline, finalize_pipeline) = {
+            let mut pipelines = self
+                .pipelines
+                .lock()
+                .map_err(|_| BackendError::ExecutionFailed)?;
+            let dtype = [(0, dtype_code(logits.layout().dtype()))];
+            (
+                pipelines.get("sample", &dtype)?,
+                pipelines.get("sample_partials", &dtype)?,
+                pipelines.get("sample_reduce_finalize", &[])?,
+            )
+        };
         let error_flag = arguments.write(&[0_u8; 8])?;
-        let temporaries = vec![
+        let mut temporaries = vec![
             Self::layout_buffer(logits.layout(), arguments)?,
             Self::layout_buffer(sampling.layout(), arguments)?,
             Self::layout_buffer(output.layout(), arguments)?,
             arguments.write(&width.to_ne_bytes())?,
             arguments.write(&position.to_ne_bytes())?,
+            arguments.write(&chunks.to_ne_bytes())?,
             error_flag.clone(),
         ];
         let buffers = self
             .buffers
             .lock()
             .map_err(|_| BackendError::ExecutionFailed)?;
+        set_pipeline(encoder, &sample_pipeline);
         for (index, tensor) in [logits, sampling, output].into_iter().enumerate() {
             bindings.bind_raw(table, index, &buffers.get(tensor)?.raw);
             bindings.bind(table, index + 3, &temporaries[index]);
         }
-        drop(buffers);
         bindings.bind(table, 6, &temporaries[3]);
         bindings.bind(table, 7, &temporaries[4]);
-        bindings.bind(table, 8, &temporaries[5]);
+        bindings.bind(table, 8, &temporaries[6]);
         set_argument_table(encoder, table);
-        let rows = usize::try_from(output.layout().element_count())
-            .map_err(|_| BackendError::InvalidInput)?;
-        let threads = simd_thread_count(&pipeline, 256)?;
+        let threads = simd_thread_count(&sample_pipeline, 256)?;
         dispatch_threadgroups(
             encoder,
             MTLSize {
-                width: rows,
+                width: usize::try_from(rows).map_err(|_| BackendError::ExecutionFailed)?,
                 height: 1,
                 depth: 1,
             },
@@ -3384,6 +3394,73 @@ impl MetalBackend {
                 depth: 1,
             },
         );
+
+        encode_dispatch_barrier(encoder);
+        set_pipeline(encoder, &partials_pipeline);
+        bindings.bind_raw(table, 0, &buffers.get(logits)?.raw);
+        bindings.bind_raw(table, 1, &buffers.get(sampling)?.raw);
+        drop(buffers);
+        bindings.bind(table, 2, &partials.buffer);
+        bindings.bind(table, 3, &temporaries[0]);
+        bindings.bind(table, 4, &temporaries[1]);
+        bindings.bind(table, 5, &temporaries[3]);
+        bindings.bind(table, 6, &temporaries[4]);
+        bindings.bind(table, 7, &temporaries[5]);
+        set_argument_table(encoder, table);
+        let partial_threads = simd_thread_count(&partials_pipeline, 256)?;
+        dispatch_threadgroups(
+            encoder,
+            MTLSize {
+                width: usize::try_from(rows)
+                    .map_err(|_| BackendError::ExecutionFailed)?
+                    .checked_mul(
+                        usize::try_from(chunks).map_err(|_| BackendError::ExecutionFailed)?,
+                    )
+                    .ok_or(BackendError::ExecutionFailed)?,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: partial_threads,
+                height: 1,
+                depth: 1,
+            },
+        );
+
+        encode_dispatch_barrier(encoder);
+        set_pipeline(encoder, &finalize_pipeline);
+        let buffers = self
+            .buffers
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?;
+        bindings.bind_raw(table, 0, &buffers.get(sampling)?.raw);
+        bindings.bind(table, 1, &partials.buffer);
+        bindings.bind_raw(table, 2, &buffers.get(output)?.raw);
+        drop(buffers);
+        bindings.bind(table, 3, &temporaries[1]);
+        bindings.bind(table, 4, &temporaries[2]);
+        bindings.bind(table, 5, &temporaries[3]);
+        bindings.bind(table, 6, &temporaries[5]);
+        set_argument_table(encoder, table);
+        let requested_threads = usize::try_from(chunks)
+            .map_err(|_| BackendError::ExecutionFailed)?
+            .next_multiple_of(32)
+            .min(256);
+        let finalize_threads = simd_thread_count(&finalize_pipeline, requested_threads)?;
+        dispatch_threadgroups(
+            encoder,
+            MTLSize {
+                width: usize::try_from(rows).map_err(|_| BackendError::ExecutionFailed)?,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: finalize_threads,
+                height: 1,
+                depth: 1,
+            },
+        );
+        temporaries.push(partials.buffer);
         Ok((temporaries, error_flag))
     }
 
@@ -3650,7 +3727,7 @@ impl MetalBackend {
                 arguments.write(size_of::<u32>())?;
             }
             Op::Sample { .. } => {
-                for len in [8, 112, 112, 112, 4, 4] {
+                for len in [8, 112, 112, 112, 4, 4, 4] {
                     arguments.write(len)?;
                 }
             }
