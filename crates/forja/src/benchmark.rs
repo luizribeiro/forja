@@ -20,7 +20,7 @@ use crate::{
 const WARMUPS: usize = 3;
 const DECODE_PREFILL: usize = 8;
 const TG_CONTEXT_START: usize = DECODE_PREFILL + 1;
-const PROFILE_CONTEXTS: [usize; 2] = [TG_CONTEXT_START, 512];
+const PROFILE_CONTEXTS: [usize; 4] = [TG_CONTEXT_START, 512, 2048, 4000];
 
 #[derive(Clone, Copy)]
 pub(crate) struct Summary {
@@ -161,12 +161,16 @@ async fn bench_precision(
     )
     .await?;
     let info = runner.describe().await?;
-    if options.pp > usize::try_from(info.max_context)?
+    let max_context = usize::try_from(info.max_context)?;
+    let profile_context = *PROFILE_CONTEXTS
+        .last()
+        .ok_or("no profile contexts configured")?;
+    if options.pp > max_context
         || TG_CONTEXT_START
             .checked_add(options.tg)
             .ok_or("decode context length overflowed")?
-            > usize::try_from(info.max_context)?
-        || options.profile && PROFILE_CONTEXTS[1] >= usize::try_from(info.max_context)?
+            > max_context
+        || options.profile && profile_context >= max_context
     {
         return Err("benchmark shape exceeds the engine context".into());
     }
@@ -175,7 +179,7 @@ async fn bench_precision(
         .await?
         .map_err(|error| format!("engine load failed: {error:?}"))?;
     let profile_tokens = if options.profile {
-        PROFILE_CONTEXTS[1] - 1
+        profile_context - 1
     } else {
         0
     };
