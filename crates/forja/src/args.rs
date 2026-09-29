@@ -136,6 +136,22 @@ struct BenchArgs {
     /// Set a Metal backend option.
     #[arg(long = "backend-option", hide = true, value_parser = parse_backend_option)]
     graph_replay: Option<GraphReplay>,
+    /// Vary one configuration key over a comma list or TOML array.
+    #[arg(long = "vary", value_parser = parse_vary)]
+    vary: Vec<VaryArg>,
+}
+
+#[derive(Clone, Debug)]
+struct VaryArg {
+    key: KeyPath,
+    values: Vec<toml::Value>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AxisClass {
+    Strategy,
+    Tuning,
+    Workload,
 }
 
 #[derive(Debug, PartialEq)]
@@ -371,6 +387,18 @@ impl ParsedCommand {
                         .then(|| ("--host-argmax", "[\"host-argmax\"]".to_owned())),
                 );
                 values.extend(graph_replay_sugar(options.graph_replay));
+                for vary in &options.vary {
+                    let mut vary_table = toml::Table::new();
+                    vary_table.insert(
+                        vary.key.as_str().to_owned(),
+                        toml::Value::Array(vary.values.clone()),
+                    );
+                    let mut bench = toml::Table::new();
+                    bench.insert("vary".to_owned(), toml::Value::Table(vary_table));
+                    let mut table = toml::Table::new();
+                    table.insert("bench".to_owned(), toml::Value::Table(bench));
+                    values.push(("--vary", toml::Value::Table(table).to_string()));
+                }
             }
             Self::Run(options) => {
                 values.extend(
@@ -438,6 +466,22 @@ fn graph_replay_sugar(value: Option<GraphReplay>) -> Option<(&'static str, Strin
 }
 
 fn sugar_layer(flag: &'static str, value: &str) -> Result<(Layer, KeyPath), clap::Error> {
+    if flag == "--vary" {
+        let table = value
+            .parse::<toml::Value>()
+            .ok()
+            .and_then(|value| value.as_table().cloned())
+            .ok_or_else(|| {
+                Cli::command().error(
+                    clap::error::ErrorKind::InvalidValue,
+                    "cannot construct --vary layer",
+                )
+            })?;
+        return Ok((
+            Layer::new(Origin::Flag("--vary"), table),
+            KeyPath::new("bench.vary"),
+        ));
+    }
     let Some(sugar) = SUGAR.iter().find(|sugar| sugar.flag == flag) else {
         return Err(Cli::command().error(
             clap::error::ErrorKind::InvalidValue,
@@ -486,6 +530,78 @@ impl BenchArgs {
             config: Box::new(config.clone()),
             origins: layered.origins.clone(),
         })
+    }
+}
+
+fn parse_vary(expression: &str) -> Result<VaryArg, String> {
+    let (key, rhs) = expression
+        .split_once('=')
+        .ok_or_else(|| "--vary expects KEY=RHS".to_owned())?;
+    let key = KeyPath::new(key.trim());
+    axis_class(key.as_str())?;
+    if key.as_str() == "engine.tunings" {
+        return Err("tunings arrive with engine profiles".to_owned());
+    }
+    let rhs = rhs.trim();
+    let values = if rhs.contains(['[', ']', '"', '\'', '{', '}']) {
+        let table: toml::Table = toml::from_str(&format!("values = {rhs}"))
+            .map_err(|error| format!("invalid --vary array: {error}"))?;
+        table
+            .get("values")
+            .and_then(toml::Value::as_array)
+            .cloned()
+            .ok_or_else(|| "--vary RHS with TOML punctuation must be an array".to_owned())?
+    } else {
+        rhs.split(',')
+            .map(str::trim)
+            .map(parse_bare_vary_value)
+            .collect::<Result<_, _>>()?
+    };
+    if values.is_empty() {
+        return Err("--vary axis must not be empty".to_owned());
+    }
+    Ok(VaryArg { key, values })
+}
+
+fn parse_bare_vary_value(value: &str) -> Result<toml::Value, String> {
+    if value.is_empty() {
+        return Err("--vary bare scalar must not be empty".to_owned());
+    }
+    let source = format!("value = {value}");
+    let parsed = toml::from_str::<toml::Table>(&source)
+        .ok()
+        .and_then(|mut table| table.remove("value"));
+    if let Some(parsed) = parsed {
+        return Ok(parsed);
+    }
+    if value
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || "_-./~:".contains(character))
+    {
+        Ok(toml::Value::String(value.to_owned()))
+    } else {
+        Err(format!("invalid --vary scalar {value:?}"))
+    }
+}
+
+fn axis_class(key: &str) -> Result<AxisClass, String> {
+    if key.starts_with("backend.metal.") {
+        Ok(AxisClass::Strategy)
+    } else if key == "engine.tunings" {
+        Ok(AxisClass::Tuning)
+    } else if matches!(
+        key,
+        "bench.selection" | "bench.contexts" | "bench.pp" | "bench.tg"
+    ) {
+        Ok(AxisClass::Workload)
+    } else if ["limits", "paths", "run", "verify"]
+        .iter()
+        .any(|prefix| key == *prefix || key.starts_with(&format!("{prefix}.")))
+        || key == "backend.kind"
+    {
+        Err(format!("configuration key {key} cannot be varied"))
+    } else {
+        Err(format!("configuration key {key} is not a benchmark axis"))
     }
 }
 
@@ -694,6 +810,67 @@ mod tests {
         assert_eq!(options.tg, 128);
         assert_eq!(options.reps, 30);
         assert_eq!(options.graph_replay, GraphReplay::Tier2);
+    }
+
+    #[test]
+    fn parses_toml_array_axes_and_replaces_repeated_keys() {
+        let command = parse(
+            [
+                "bench",
+                "--engine",
+                "/engine.wasm",
+                "--model-dir",
+                "/model",
+                "--vary",
+                "bench.selection=[[\"host-argmax\"],[\"gpu-pipelined\"]]",
+                "--vary",
+                "bench.selection=[[\"gpu-sequential\"]]",
+            ]
+            .map(str::to_owned),
+        )
+        .unwrap();
+        let Command::Bench(options) = command else {
+            panic!("expected bench command");
+        };
+        assert_eq!(
+            options.config.bench.vary[&KeyPath::new("bench.selection")],
+            [toml::Value::Array(vec![toml::Value::String(
+                "gpu-sequential".to_owned()
+            )])]
+        );
+    }
+
+    #[test]
+    fn classifies_axes_and_refuses_non_axes() {
+        assert_eq!(
+            axis_class("backend.metal.graph_replay"),
+            Ok(AxisClass::Strategy)
+        );
+        assert_eq!(axis_class("engine.tunings"), Ok(AxisClass::Tuning));
+        assert_eq!(axis_class("bench.contexts"), Ok(AxisClass::Workload));
+        for key in [
+            "limits.live_bytes",
+            "paths.models",
+            "run.max_tokens",
+            "verify.prompts",
+            "backend.kind",
+            "bench.reps",
+        ] {
+            assert!(axis_class(key).is_err(), "accepted {key}");
+        }
+    }
+
+    #[test]
+    fn rejects_non_array_rhs_with_toml_punctuation() {
+        assert!(parse_vary("bench.tg=\"7\",\"33\"").is_err());
+        assert!(parse_vary("bench.tg=7,").is_err());
+        assert!(parse_vary("limits.tensor_rank=7,33").is_err());
+    }
+
+    #[test]
+    fn explains_that_tunings_require_engine_profiles() {
+        let error = parse_vary("engine.tunings=fast,small").unwrap_err();
+        assert_eq!(error, "tunings arrive with engine profiles");
     }
 
     #[test]
