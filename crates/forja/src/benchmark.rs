@@ -7,7 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use forja_config::{GraphReplay, Selection};
+use forja_config::Selection;
 use forja_core::Op;
 use forja_host::{
     EngineDecode, EngineMetrics, EngineOutput, EngineRunner, EngineStep, EngineStepProfile,
@@ -17,6 +17,7 @@ use golden_fixtures::{decode_f32_le, sha256_file};
 
 use crate::{
     args::Bench,
+    benchmark_record::{self, Input},
     benchmark_stats::{Stats, stats, synthetic_tokens},
     engine::{argmax, limits, read_token},
 };
@@ -73,19 +74,41 @@ pub(crate) async fn run(options: &Bench) -> Result<(), Box<dyn Error>> {
 
 #[cfg(target_os = "macos")]
 async fn run_metal(options: &Bench) -> Result<(), Box<dyn Error>> {
+    let started = Instant::now();
     let commit = crate::provenance::commit();
     let os = command_output("sw_vers", &["-productVersion"])?;
+    let date = command_output("date", &["-u", "+%Y-%m-%dT%H:%MZ"])?;
+    let gpu_cores = gpu_core_count()?;
+    let binary_sha256 = sha256_file(std::env::current_exe()?)?;
+    let weights_sha256 = sha256_file(options.model_dir.join("model.safetensors"))?;
+    let inputs = options
+        .engines
+        .iter()
+        .map(|component| {
+            Ok(Input {
+                engine_sha256: sha256_file(component)?,
+                profile_hash: None,
+                weights_sha256: weights_sha256.clone(),
+                model_revision: None,
+            })
+        })
+        .collect::<Result<Vec<_>, std::io::Error>>()?;
     let mut results = Vec::new();
+    let mut record_device = None;
     println!(
         "engine\tselection\tmetric\twall tok/s (95% CI)\tGPU tok/s (95% CI)\twall ms\tGPU ms\tsubmissions"
     );
-    for component in &options.engines {
+    for (input, component) in options.engines.iter().enumerate() {
         let engine = component.display().to_string();
         for &strategy in &options.selection {
             let (host_argmax, overlap) = selection_mode(strategy);
             let selection = selection_name(strategy);
             let (pp, tg, device, profiles) =
                 bench_engine(options, component, host_argmax, overlap).await?;
+            if record_device.as_ref().is_some_and(|known| known != &device) {
+                return Err("benchmark engines opened different Metal devices".into());
+            }
+            record_device = Some(device.clone());
             print_summary(&engine, selection, "pp", pp);
             print_summary(&engine, selection, "tg", tg);
             let profile_reports = profiles
@@ -96,40 +119,42 @@ async fn run_metal(options: &Bench) -> Result<(), Box<dyn Error>> {
                 print_profile_report(&engine, selection, report);
             }
             let mut result = serde_json::json!({
-                "provenance": {
-                    "git_commit": commit,
-                    "dirty": crate::provenance::dirty(),
-                    "engine_component_sha256": sha256_file(component)?,
-                    "device": device,
-                    "os": format!("macOS {os}"),
-                    "engine": component,
-                    "graph_replay": graph_replay_name(options.graph_replay),
-                    "selection": selection,
-                },
-                "prompt_processing": summary_json(pp),
-                "token_generation": summary_json(tg),
+                "input": input,
+                "point": {},
+                "selection": selection,
+                "pp": summary_json(pp),
+                "tg": summary_json(tg),
+                "breakdown": null,
             });
             if !profile_reports.is_empty() {
-                result["profile"] =
+                result["breakdown"] =
                     serde_json::Value::Array(profile_reports.iter().map(profile_json).collect());
             }
             results.push(result);
         }
     }
     if let Some(path) = &options.json {
+        let device = record_device.ok_or("benchmark produced no results")?;
+        let snapshot = benchmark_record::snapshot(options, &device, &os)?;
         let report = serde_json::json!({
-            "schema_version": 1,
+            "schema_version": benchmark_record::SCHEMA_VERSION,
             "implementation": "forja",
-            "model": options.model_dir,
-            "settings": {
-                "prompt_tokens": options.pp,
-                "generated_tokens": options.tg,
-                "warmups": options.warmups,
-                "repetitions": options.reps,
-                "graph_replay": graph_replay_name(options.graph_replay),
-                "selection": options.selection.iter().copied().map(selection_name).collect::<Vec<_>>(),
+            "provenance": {
+                "commit": commit,
+                "dirty": crate::provenance::dirty(),
+                "binary_sha256": binary_sha256,
+                "device": device,
+                "gpu_cores": gpu_cores,
+                "macos": os,
+                "date": date,
+                "duration_s": started.elapsed().as_secs(),
             },
-            "tg_context_start": options.decode_prefill + 1,
+            "inputs": inputs,
+            "config": snapshot.config,
+            "origins": snapshot.origins,
+            "auto_notes": snapshot.auto_notes,
+            "config_hash": benchmark_record::config_hash(&snapshot, &inputs)?,
+            "axes": {},
             "results": results,
         });
         let mut bytes = serde_json::to_vec_pretty(&report)?;
@@ -234,13 +259,6 @@ async fn bench_engine(
         device,
         profiles,
     ))
-}
-
-const fn graph_replay_name(strategy: GraphReplay) -> &'static str {
-    match strategy {
-        GraphReplay::Tier1 => "tier1",
-        GraphReplay::Tier2 => "tier2",
-    }
 }
 
 const fn selection_name(selection: Selection) -> &'static str {
@@ -1035,6 +1053,17 @@ fn command_output(program: &str, arguments: &[&str]) -> Result<String, Box<dyn E
         return Err(format!("{program} returned no output").into());
     }
     Ok(value)
+}
+
+fn gpu_core_count() -> Result<u64, Box<dyn Error>> {
+    let output = command_output("system_profiler", &["SPDisplaysDataType", "-json"])?;
+    let report: serde_json::Value = serde_json::from_str(&output)?;
+    report["SPDisplaysDataType"]
+        .as_array()
+        .and_then(|devices| devices.first())
+        .and_then(|device| device["sppci_cores"].as_str())
+        .ok_or_else(|| "system_profiler did not report GPU cores".into())
+        .and_then(|cores| cores.parse().map_err(Into::into))
 }
 
 #[cfg(test)]

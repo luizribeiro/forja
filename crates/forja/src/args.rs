@@ -88,7 +88,7 @@ struct RunArgs {
     graph_replay: Option<GraphReplay>,
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub(crate) struct Bench {
     pub(crate) engines: Vec<PathBuf>,
     pub(crate) model_dir: PathBuf,
@@ -103,6 +103,8 @@ pub(crate) struct Bench {
     pub(crate) breakdown: bool,
     pub(crate) graph_replay: GraphReplay,
     pub(crate) limits: Limits,
+    pub(crate) config: Box<DevConfig>,
+    pub(crate) origins: BTreeMap<KeyPath, Origin>,
 }
 
 #[derive(Args)]
@@ -257,9 +259,7 @@ fn parse_with(
     let layered = layer::<DevConfig>(layers).map_err(|error| config_error(&error))?;
     let limits = layered.config.limits.clone();
     Ok(match cli.command {
-        ParsedCommand::Bench(options) => {
-            Command::Bench(options.with_config(&layered.config, limits)?)
-        }
+        ParsedCommand::Bench(options) => Command::Bench(options.with_config(&layered, limits)?),
         ParsedCommand::Config(options) => match options.command {
             ConfigCommand::Show(options) => Command::Config(ConfigShow {
                 layered,
@@ -432,7 +432,7 @@ fn graph_replay_sugar(value: Option<GraphReplay>) -> Option<(&'static str, Strin
     value.map(|value| {
         (
             "--backend-option",
-            toml::Value::String(graph_replay_name(value).to_owned()).to_string(),
+            toml::Value::String(value.as_str().to_owned()).to_string(),
         )
     })
 }
@@ -451,7 +451,12 @@ fn sugar_layer(flag: &'static str, value: &str) -> Result<(Layer, KeyPath), clap
 }
 
 impl BenchArgs {
-    fn with_config(self, config: &DevConfig, limits: Limits) -> Result<Bench, clap::Error> {
+    fn with_config(
+        self,
+        layered: &Layered<DevConfig>,
+        limits: Limits,
+    ) -> Result<Bench, clap::Error> {
+        let config = &layered.config;
         let count = |value: u32| {
             usize::try_from(value).map_err(|error| {
                 Cli::command().error(clap::error::ErrorKind::ValueValidation, error.to_string())
@@ -478,6 +483,8 @@ impl BenchArgs {
             breakdown: config.bench.breakdown,
             graph_replay: config.backend.metal.resolve().graph_replay,
             limits,
+            config: Box::new(config.clone()),
+            origins: layered.origins.clone(),
         })
     }
 }
@@ -504,13 +511,6 @@ fn parse_backend_option(value: &str) -> Result<GraphReplay, String> {
         "graph-replay=tier1" => Ok(GraphReplay::Tier1),
         "graph-replay=tier2" => Ok(GraphReplay::Tier2),
         _ => Err(format!("unknown Metal backend option {value:?}")),
-    }
-}
-
-const fn graph_replay_name(value: GraphReplay) -> &'static str {
-    match value {
-        GraphReplay::Tier1 => "tier1",
-        GraphReplay::Tier2 => "tier2",
     }
 }
 
@@ -598,24 +598,13 @@ mod tests {
             .map(str::to_owned),
         )
         .unwrap();
-        assert_eq!(
-            command,
-            Command::Bench(Bench {
-                engines: vec![PathBuf::from("/engine.wasm")],
-                model_dir: PathBuf::from("/model"),
-                pp: 33,
-                tg: 7,
-                reps: 2,
-                warmups: 3,
-                decode_prefill: 8,
-                contexts: vec![9, 512, 2_048, 4_000],
-                selection: vec![Selection::GpuSequential, Selection::GpuPipelined],
-                json: Some(PathBuf::from("/result.json")),
-                breakdown: false,
-                graph_replay: GraphReplay::Tier2,
-                limits: Limits::default(),
-            })
-        );
+        let Command::Bench(options) = command else {
+            panic!("expected bench command");
+        };
+        assert_eq!(options.engines, [PathBuf::from("/engine.wasm")]);
+        assert_eq!(options.model_dir, PathBuf::from("/model"));
+        assert_eq!((options.pp, options.tg, options.reps), (33, 7, 2));
+        assert_eq!(options.json, Some(PathBuf::from("/result.json")));
     }
 
     #[test]

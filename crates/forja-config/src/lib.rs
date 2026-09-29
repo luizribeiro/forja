@@ -141,13 +141,33 @@ where
 }
 
 /// Metal command graph replay strategy.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub enum GraphReplay {
     /// Replay command structure while re-encoding resource bindings.
     Tier1,
     /// Replay commands with reusable indirect command buffers.
     Tier2,
+}
+
+impl GraphReplay {
+    /// Returns the configuration spelling of this strategy.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Tier1 => "tier1",
+            Self::Tier2 => "tier2",
+        }
+    }
+}
+
+impl Serialize for GraphReplay {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
 }
 
 /// Concrete Metal settings ready for backend construction.

@@ -2,6 +2,7 @@
 
 mod args;
 mod benchmark;
+mod benchmark_record;
 mod benchmark_stats;
 mod config_show;
 mod engine;

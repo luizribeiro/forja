@@ -3,6 +3,7 @@
 
 import argparse
 import json
+import tomllib
 from pathlib import Path
 
 
@@ -14,30 +15,65 @@ def arguments() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def rate(result: dict[str, object], metric: str) -> str:
+def rate(report: dict[str, object], result: dict[str, object], metric: str) -> str:
     """Format a wall throughput median and confidence interval."""
-    stats = result[metric]["tokens_per_second"]["wall"]
+    field = metric if report.get("schema_version") == 2 else {
+        "pp": "prompt_processing",
+        "tg": "token_generation",
+    }[metric]
+    stats = result[field]["tokens_per_second"]["wall"]
     return f"{stats['median']:.2f} ({stats['ci95'][0]:.2f}–{stats['ci95'][1]:.2f})"
+
+
+def settings(report: dict[str, object]) -> dict[str, object]:
+    """Return benchmark settings from either record schema."""
+    if report.get("schema_version") == 2:
+        values = tomllib.loads(report["config"])["bench"]
+    else:
+        values = report["settings"].copy()
+        for old, new in {
+            "prompt_tokens": "pp",
+            "generated_tokens": "tg",
+            "repetitions": "reps",
+        }.items():
+            if old in values:
+                values[new] = values.pop(old)
+    if values.get("breakdown") is False:
+        values.pop("breakdown")
+    if values.get("vary") == {}:
+        values.pop("vary")
+    return values
+
+
+def engine(report: dict[str, object], result: dict[str, object]) -> str:
+    """Return a path-free engine label from either record schema."""
+    if report.get("schema_version") == 2:
+        digest = report["inputs"][result["input"]]["engine_sha256"]
+        return digest[:12]
+    provenance = result["provenance"]
+    return provenance.get("engine", provenance.get("precision", "unknown"))
 
 
 def main() -> None:
     """Validate comparable settings and print one row per engine."""
     args = arguments()
     reports = [json.loads(args.forja.read_text()), json.loads(args.mlx.read_text())]
-    if reports[0]["settings"] != reports[1]["settings"]:
+    if settings(reports[0]) != settings(reports[1]):
         raise RuntimeError("benchmark settings differ")
-    depths = [report.get("tg_context_start") for report in reports]
-    if None in depths or depths[0] != depths[1]:
+    depths = [
+        report.get("tg_context_start", settings(report).get("decode_prefill", 0) + 1)
+        for report in reports
+    ]
+    if depths[0] != depths[1]:
         raise RuntimeError("token-generation context depths differ")
     print("implementation\tengine\tpp wall tok/s (95% CI)\ttg wall tok/s (95% CI)")
     for report in reports:
         for result in report["results"]:
-            provenance = result["provenance"]
             print(
                 report["implementation"],
-                provenance.get("engine", provenance.get("precision", "unknown")),
-                rate(result, "prompt_processing"),
-                rate(result, "token_generation"),
+                engine(report, result),
+                rate(report, result, "pp"),
+                rate(report, result, "tg"),
                 sep="\t",
             )
 

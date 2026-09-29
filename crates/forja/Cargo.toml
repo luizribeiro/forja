@@ -13,7 +13,9 @@ forja-config = { path = "../forja-config" }
 forja-cpu = { path = "../forja-cpu" }
 forja-host = { path = "../forja-host" }
 golden-fixtures = { path = "../../support/golden-fixtures" }
+serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 tokio.workspace = true
 tokenizers.workspace = true
 toml.workspace = true

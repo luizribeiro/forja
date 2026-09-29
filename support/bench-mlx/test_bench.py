@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest import mock
 
 import bench
+import compare
 
 
 class SuiteTests(unittest.TestCase):
@@ -94,6 +95,24 @@ selection = ["gpu-sequential"]
             path.write_text(source)
             with self.assertRaisesRegex(ValueError, "strictly increasing"):
                 bench.load_suite(path)
+
+    def test_compare_reads_both_record_schemas(self) -> None:
+        summary = {"tokens_per_second": {"wall": {"median": 1.0, "ci95": [0.5, 1.5]}}}
+        first = {
+            "schema_version": 1,
+            "settings": {"decode_prefill": 8},
+            "tg_context_start": 9,
+            "results": [{"provenance": {"engine": "old"}, "prompt_processing": summary, "token_generation": summary}],
+        }
+        second = {
+            "schema_version": 2,
+            "config": "[bench]\ndecode_prefill = 8\n",
+            "inputs": [{"engine_sha256": "abcdef0123456789"}],
+            "results": [{"input": 0, "pp": summary, "tg": summary}],
+        }
+        self.assertEqual(compare.settings(first), compare.settings(second))
+        self.assertEqual(compare.engine(second, second["results"][0]), "abcdef012345")
+        self.assertEqual(compare.rate(second, second["results"][0], "pp"), "1.00 (0.50–1.50)")
 
 
 if __name__ == "__main__":
