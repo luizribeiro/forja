@@ -25,3 +25,6 @@ Run the pp512/tg128 Forja and MLX-LM engine baselines and print their median wal
 ```console
 nix develop -c sh -c 'cargo run --release -p forja -- bench --model-dir "$FORJA_MODELS/Qwen3-0.6B" --json /tmp/forja-bench.json && uv run --locked --project support/bench-mlx support/bench-mlx/bench.py --model-dir "$FORJA_MODELS/Qwen3-0.6B" --json /tmp/mlx-bench.json && python3 support/bench-mlx/compare.py /tmp/forja-bench.json /tmp/mlx-bench.json'
 ```
+
+Qwen decode captures and replays its graph by default. Pass `--no-replay` to `forja bench` for
+the lazy-recording A/B baseline; the corresponding component uses Qwen's `no-replay` Cargo feature.

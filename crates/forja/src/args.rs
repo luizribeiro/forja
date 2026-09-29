@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 pub(crate) const USAGE: &str = "usage:
   forja run --model-dir PATH --prompt TEXT [--max-tokens N] [--backend metal|cpu]
-  forja bench --model-dir PATH [--pp N] [--tg N] [--reps N] [--json PATH] [--profile]
+  forja bench --model-dir PATH [--pp N] [--tg N] [--reps N] [--json PATH] [--profile] [--no-replay]
   forja verify --model-dir PATH --fixtures PATH [--backend metal|cpu] [--precision f32|bf16] [--prompts NAME,...]";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -42,6 +42,7 @@ pub(crate) struct Bench {
     pub(crate) reps: usize,
     pub(crate) json: Option<PathBuf>,
     pub(crate) profile: bool,
+    pub(crate) no_replay: bool,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -69,9 +70,14 @@ fn parse_bench(mut arguments: impl Iterator<Item = String>) -> Result<Bench, Str
     let mut reps = None;
     let mut json = None;
     let mut profile = false;
+    let mut no_replay = false;
     while let Some(option) = arguments.next() {
         if option == "--profile" && !profile {
             profile = true;
+            continue;
+        }
+        if option == "--no-replay" && !no_replay {
+            no_replay = true;
             continue;
         }
         let value = arguments
@@ -96,6 +102,7 @@ fn parse_bench(mut arguments: impl Iterator<Item = String>) -> Result<Bench, Str
         reps: reps.unwrap_or(30),
         json,
         profile,
+        no_replay,
     })
 }
 
@@ -226,18 +233,22 @@ mod tests {
                 reps: 2,
                 json: Some(PathBuf::from("/result.json")),
                 profile: false,
+                no_replay: false,
             })
         );
     }
 
     #[test]
     fn parses_benchmark_profile_flag() {
-        let command =
-            parse(["bench", "--model-dir", "/model", "--profile"].map(str::to_owned)).unwrap();
+        let command = parse(
+            ["bench", "--model-dir", "/model", "--profile", "--no-replay"].map(str::to_owned),
+        )
+        .unwrap();
         let Command::Bench(options) = command else {
             panic!("expected bench command");
         };
         assert!(options.profile);
+        assert!(options.no_replay);
     }
 
     #[test]
