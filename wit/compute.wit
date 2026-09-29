@@ -175,6 +175,10 @@ interface compute {
     dispatch-kernel: func(k: borrow<kernel>, ins: list<borrow<tensor>>, outs: list<borrow<tensor>>) -> result<_, error>;
   }
 
+  resource graph {
+    create: static func(cmds: command-list) -> result<graph, error>;
+  }
+
   submit: async func(cmds: command-list) -> result<option<u64>, error>;
   open-weights: func(grant: string) -> result<weights, error>;
 }

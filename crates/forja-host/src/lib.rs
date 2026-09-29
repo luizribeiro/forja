@@ -19,9 +19,9 @@ use std::{
 };
 
 use forja_core::{
-    Affine, Backend, BackendError, CommandList, DType, Layout, LayoutError, Op, OpError,
-    ParamSpace, Slice, Submission, SubmissionProfile, SymbolicLayout, SymbolicLayoutError,
-    TemplateOp, TemplateTensor, Tensor, ViewOp,
+    Affine, Backend, BackendError, CommandList, DType, GraphLimits, GraphTemplate, Layout,
+    LayoutError, Op, OpError, ParamSpace, Slice, Submission, SubmissionProfile, SymbolicLayout,
+    SymbolicLayoutError, TemplateOp, TemplateTensor, Tensor, ViewOp,
     program::{
         BinOp, Inst, KernelSignature, MAX_INSTRUCTIONS, MAX_OUTPUTS, PrepareError, PreparedProgram,
         Program, ProgramError, ProgramKind, RedOp, UnOp, ValidatedProgram, ValueType,
@@ -49,6 +49,7 @@ pub mod bindings {
             "l9o:gpu/compute.command-list": crate::CommandListEntry,
             "l9o:gpu/compute.weights": crate::WeightsEntry,
             "l9o:gpu/compute.params": crate::ParamsEntry,
+            "l9o:gpu/compute.graph": crate::GraphEntry,
         },
     });
 }
@@ -633,6 +634,7 @@ pub struct Limits {
     tensor_elements: u64,
     live_tensor_handles: usize,
     live_kernels: usize,
+    live_graphs: usize,
     read_bytes: u64,
     guest_memory_bytes: usize,
     table_elements: usize,
@@ -685,6 +687,7 @@ impl Limits {
             tensor_elements: max_tensor_elements,
             live_tensor_handles: max_live_tensor_handles,
             live_kernels: 64,
+            live_graphs: 16,
             read_bytes: max_read_bytes,
             guest_memory_bytes: 4 * 1024 * 1024 * 1024,
             table_elements: 10_000,
@@ -713,6 +716,13 @@ impl Limits {
     #[must_use]
     pub const fn with_kernel_limit(mut self, max_live_kernels: usize) -> Self {
         self.live_kernels = max_live_kernels;
+        self
+    }
+
+    /// Overrides the number of graphs that may remain alive.
+    #[must_use]
+    pub const fn with_graph_limit(mut self, max_live_graphs: usize) -> Self {
+        self.live_graphs = max_live_graphs;
         self
     }
 
@@ -857,10 +867,27 @@ impl KernelLease {
 }
 
 #[derive(Debug)]
-#[expect(
-    dead_code,
-    reason = "recorded commands are consumed by graph construction"
-)]
+struct GraphLease {
+    live: Arc<AtomicUsize>,
+}
+
+impl Drop for GraphLease {
+    fn drop(&mut self) {
+        self.live.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+impl GraphLease {
+    fn acquire(live: Arc<AtomicUsize>, limit: usize) -> Result<Self, compute::Error> {
+        live.fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+            count.checked_add(1).filter(|&next| next <= limit)
+        })
+        .map_err(|_| quota("live graphs exceed the guest limit"))?;
+        Ok(Self { live })
+    }
+}
+
+#[derive(Debug)]
 enum RecordedDispatch {
     Operation {
         op: TemplateOp,
@@ -882,6 +909,17 @@ pub struct CommandListEntry {
     space: Option<ParamSpace>,
     parameterized: bool,
     retained: Vec<TensorEntry>,
+    retained_kernels: Vec<KernelEntry>,
+}
+
+/// Host-owned state behind a guest graph resource.
+#[derive(Debug)]
+pub struct GraphEntry {
+    #[expect(dead_code, reason = "the prepared graph is consumed by replay")]
+    graph: Arc<GraphTemplate>,
+    retained: Vec<TensorEntry>,
+    retained_kernels: Vec<KernelEntry>,
+    _lease: GraphLease,
 }
 
 /// Store state implementing the guest compute interface over a trusted backend.
@@ -896,6 +934,7 @@ pub struct Host<B: Backend> {
     live_bytes: Arc<AtomicU64>,
     live_handles: usize,
     live_kernels: Arc<AtomicUsize>,
+    live_graphs: Arc<AtomicUsize>,
     gpu_time_ns: Arc<AtomicU64>,
     completed_submissions: Arc<AtomicU64>,
     timed_submissions: Arc<AtomicU64>,
@@ -926,6 +965,7 @@ impl<B: Backend> Host<B> {
             live_bytes: Arc::new(AtomicU64::new(0)),
             live_handles: 0,
             live_kernels: Arc::new(AtomicUsize::new(0)),
+            live_graphs: Arc::new(AtomicUsize::new(0)),
             gpu_time_ns: Arc::new(AtomicU64::new(0)),
             completed_submissions: Arc::new(AtomicU64::new(0)),
             timed_submissions: Arc::new(AtomicU64::new(0)),
@@ -1325,6 +1365,7 @@ impl<B: Backend> Host<B> {
                 space: None,
                 parameterized: false,
                 retained: Vec::new(),
+                retained_kernels: Vec::new(),
             })
             .map_err(invalid_handle)
     }
@@ -1432,6 +1473,9 @@ impl<B: Backend> Host<B> {
             .map(|resource| self.entry(resource).cloned())
             .collect::<Result<Vec<_>, _>>()?;
         let program = Arc::clone(&self.table.get(kernel).map_err(invalid_handle)?.program);
+        let retained_kernel = KernelEntry {
+            program: Arc::clone(&program),
+        };
         let entry = self.table.get(commands).map_err(invalid_handle)?;
         if entry.recorded.len() >= self.limits.dispatches_per_list {
             return Err(quota("command list dispatch count exceeds the guest limit"));
@@ -1475,6 +1519,7 @@ impl<B: Backend> Host<B> {
         });
         entry.retained.extend(input_entries);
         entry.retained.extend(output_entries);
+        entry.retained_kernels.push(retained_kernel);
         Ok(())
     }
 
@@ -1482,6 +1527,84 @@ impl<B: Backend> Host<B> {
         &mut self,
         resource: Resource<CommandListEntry>,
     ) -> Result<(), compute::Error> {
+        let entry = self.table.delete(resource).map_err(invalid_handle)?;
+        self.release_retained(entry.retained)
+    }
+
+    fn create_graph(
+        &mut self,
+        resource: Resource<CommandListEntry>,
+    ) -> Result<Resource<GraphEntry>, compute::Error> {
+        let entry = self.table.delete(resource).map_err(invalid_handle)?;
+        let space = match entry.space.clone() {
+            Some(space) => space,
+            None => ParamSpace::new(Vec::new()).map_err(|error| graph_error(&error))?,
+        };
+        let mut graph = GraphTemplate::new(
+            space,
+            GraphLimits::new(
+                self.limits.dispatches_per_list,
+                self.limits.tensor_elements,
+                self.limits.work_per_dispatch,
+            ),
+        );
+        let built = entry
+            .recorded
+            .iter()
+            .try_for_each(|dispatch| match dispatch {
+                RecordedDispatch::Operation { op, inputs, output } => {
+                    let inputs = inputs.iter().collect::<Vec<_>>();
+                    graph.dispatch(*op, &inputs, output)
+                }
+                RecordedDispatch::Program {
+                    program,
+                    inputs,
+                    outputs,
+                } => {
+                    let inputs = inputs.iter().collect::<Vec<_>>();
+                    let outputs = outputs.iter().collect::<Vec<_>>();
+                    graph.dispatch_kernel(program, &inputs, &outputs)
+                }
+            });
+        let graph = match built {
+            Ok(()) => self.backend.prepare_graph(graph).map_err(guest_error),
+            Err(error) => Err(graph_error(&error)),
+        };
+        let graph = match graph {
+            Ok(graph) => graph,
+            Err(error) => {
+                self.release_retained(entry.retained)?;
+                return Err(error);
+            }
+        };
+        let lease =
+            match GraphLease::acquire(Arc::clone(&self.live_graphs), self.limits.live_graphs) {
+                Ok(lease) => lease,
+                Err(error) => {
+                    self.release_retained(entry.retained)?;
+                    return Err(error);
+                }
+            };
+        let graph_entry = GraphEntry {
+            graph: Arc::new(graph),
+            retained: Vec::new(),
+            retained_kernels: Vec::new(),
+            _lease: lease,
+        };
+        let resource = match self.table.push(graph_entry) {
+            Ok(resource) => resource,
+            Err(error) => {
+                self.release_retained(entry.retained)?;
+                return Err(invalid_handle(error));
+            }
+        };
+        let graph = self.table.get_mut(&resource).map_err(invalid_handle)?;
+        graph.retained = entry.retained;
+        graph.retained_kernels = entry.retained_kernels;
+        Ok(resource)
+    }
+
+    fn drop_graph(&mut self, resource: Resource<GraphEntry>) -> Result<(), compute::Error> {
         let entry = self.table.delete(resource).map_err(invalid_handle)?;
         self.release_retained(entry.retained)
     }
@@ -1993,6 +2116,26 @@ where
         resource: Resource<KernelEntry>,
     ) -> impl Future<Output = wasmtime::Result<()>> + Send {
         std::future::ready(self.drop_kernel(resource).map_err(wasmtime::Error::msg))
+    }
+}
+
+impl<B> compute::HostGraph for Host<B>
+where
+    B: Backend + Send + Sync + 'static,
+{
+    fn create(
+        &mut self,
+        commands: Resource<CommandListEntry>,
+    ) -> impl Future<Output = wasmtime::Result<Result<Resource<GraphEntry>, compute::Error>>> + Send
+    {
+        std::future::ready(Ok(self.create_graph(commands)))
+    }
+
+    fn drop(
+        &mut self,
+        resource: Resource<GraphEntry>,
+    ) -> impl Future<Output = wasmtime::Result<()>> + Send {
+        std::future::ready(self.drop_graph(resource).map_err(wasmtime::Error::msg))
     }
 }
 
@@ -2545,6 +2688,51 @@ mod tests {
             scale,
             offset,
         }
+    }
+
+    fn empty_graph<B>(host: &mut Host<B>) -> Resource<super::GraphEntry>
+    where
+        B: Backend,
+    {
+        let commands = host.command_list().unwrap();
+        host.create_graph(commands).unwrap()
+    }
+
+    #[test]
+    fn graph_quota_counts_live_graphs() {
+        let mut host = Host::new(CpuBackend::new(), GENEROUS.with_graph_limit(1));
+        let graph = empty_graph(&mut host);
+        assert_eq!(host.live_graphs.load(Ordering::Acquire), 1);
+        let commands = host.command_list().unwrap();
+        assert!(matches!(
+            host.create_graph(commands),
+            Err(compute::Error::Quota(_))
+        ));
+        host.drop_graph(graph).unwrap();
+        assert_eq!(host.live_graphs.load(Ordering::Acquire), 0);
+        empty_graph(&mut host);
+    }
+
+    #[test]
+    fn graph_retains_prepared_kernels() {
+        let mut host = Host::new(CpuBackend::new(), GENEROUS.with_kernel_limit(1));
+        let input = host.alloc(compute::Dtype::F32, &[1]).unwrap();
+        let output = host.alloc(compute::Dtype::F32, &[1]).unwrap();
+        let kernel = host
+            .create_kernel(doubling_program(2.0), unary_f32_signature(1))
+            .unwrap();
+        let commands = host.command_list().unwrap();
+        host.dispatch_kernel(&commands, &kernel, &[input], &[output])
+            .unwrap();
+        let graph = host.create_graph(commands).unwrap();
+        host.drop_kernel(kernel).unwrap();
+        assert_eq!(host.live_kernels.load(Ordering::Acquire), 1);
+        assert!(matches!(
+            host.create_kernel(doubling_program(3.0), unary_f32_signature(1)),
+            Err(compute::Error::Quota(_))
+        ));
+        host.drop_graph(graph).unwrap();
+        assert_eq!(host.live_kernels.load(Ordering::Acquire), 0);
     }
 
     #[test]
