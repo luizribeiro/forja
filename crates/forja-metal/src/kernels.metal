@@ -341,6 +341,204 @@ kernel void argmax_finalize(
     }
 }
 
+ulong splitmix64(ulong value) {
+    value += 0x9e3779b97f4a7c15ul;
+    value = (value ^ (value >> 30)) * 0xbf58476d1ce4e5b9ul;
+    value = (value ^ (value >> 27)) * 0x94d049bb133111ebul;
+    return value ^ (value >> 31);
+}
+
+float gumbel_noise(ulong seed, uint position, uint index) {
+    ulong counter = seed ^ (ulong(position) << 32) ^ ulong(index);
+    uint mantissa = uint(splitmix64(counter) >> 40);
+    float uniform = (float(mantissa) + 0.5f) * (1.0f / 16777216.0f);
+    return -log(-log(uniform));
+}
+
+kernel void sample(
+    device const uchar *logits [[buffer(0)]],
+    device const uint *sampling [[buffer(1)]],
+    device uint *output [[buffer(2)]],
+    constant TensorLayout &logits_layout [[buffer(3)]],
+    constant TensorLayout &sampling_layout [[buffer(4)]],
+    constant TensorLayout &output_layout [[buffer(5)]],
+    constant uint &width [[buffer(6)]],
+    constant uint &position [[buffer(7)]],
+    device atomic_uint *error_flag [[buffer(8)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint lane [[thread_position_in_threadgroup]],
+    uint group_width [[threads_per_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+    threadgroup atomic_uint histogram[256];
+    threadgroup ulong candidates[1024];
+    threadgroup float weights[1024];
+    threadgroup atomic_uint selected_count_atomic;
+    threadgroup uint selected_count;
+    threadgroup uint remaining;
+    threadgroup uint keep;
+    threadgroup uint invalid;
+    threadgroup ulong prefix;
+    threadgroup uint partial_keys[32];
+    threadgroup uint partial_indices[32];
+
+    if (lane == 0) {
+        float temperature = as_type<float>(sampling[physical_index(sampling_layout, 0)]);
+        float top_p = as_type<float>(sampling[physical_index(sampling_layout, 2)]);
+        invalid = !isfinite(temperature) || temperature < 0.0f ||
+                  !isfinite(top_p) || top_p <= 0.0f || top_p > 1.0f;
+        atomic_store_explicit(&selected_count_atomic, 0, memory_order_relaxed);
+        prefix = 0;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (invalid != 0) {
+        if (lane == 0) {
+            output[physical_index(output_layout, row)] = 0;
+            atomic_store_explicit(error_flag, 2, memory_order_relaxed);
+        }
+        return;
+    }
+
+    float temperature = as_type<float>(sampling[physical_index(sampling_layout, 0)]);
+    uint top_k = sampling[physical_index(sampling_layout, 1)];
+    float top_p = as_type<float>(sampling[physical_index(sampling_layout, 2)]);
+    ulong seed = ulong(sampling[physical_index(sampling_layout, 3)]) |
+                 (ulong(sampling[physical_index(sampling_layout, 4)]) << 32);
+    bool greedy = temperature == 0.0f || top_k == 1;
+    uint candidate_count = top_p < 1.0f
+        ? (top_k == 0 ? min(width, 1024u) : min(width, min(top_k, 1024u)))
+        : (top_k == 0 ? width : min(width, top_k));
+    bool filter = candidate_count < width;
+
+    if (filter && !greedy) {
+        if (lane == 0) {
+            remaining = candidate_count;
+        }
+        for (int shift = 56; shift >= 0; shift -= 8) {
+            for (uint bucket = lane; bucket < 256; bucket += group_width) {
+                atomic_store_explicit(histogram + bucket, 0, memory_order_relaxed);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            ulong high_mask = shift == 56 ? 0 : (~0ul << (shift + 8));
+            for (uint column = lane; column < width; column += group_width) {
+                float value = load_float(
+                    logits, physical_index(logits_layout, row * width + column), input0_dtype);
+                ulong key = argmax_candidate(value, column);
+                if ((key & high_mask) == prefix) {
+                    uint bucket = uint((key >> shift) & 0xfful);
+                    atomic_fetch_add_explicit(
+                        histogram + bucket, 1, memory_order_relaxed);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (lane == 0) {
+                for (int bucket = 255; bucket >= 0; --bucket) {
+                    uint count = atomic_load_explicit(
+                        histogram + bucket, memory_order_relaxed);
+                    if (remaining > count) {
+                        remaining -= count;
+                    } else {
+                        prefix |= ulong(bucket) << shift;
+                        break;
+                    }
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    if (top_p < 1.0f && !greedy) {
+        for (uint column = lane; column < width; column += group_width) {
+            float value = load_float(
+                logits, physical_index(logits_layout, row * width + column), input0_dtype);
+            ulong key = argmax_candidate(value, column);
+            if (!filter || key >= prefix) {
+                uint slot = atomic_fetch_add_explicit(
+                    &selected_count_atomic, 1, memory_order_relaxed);
+                if (slot < 1024) {
+                    candidates[slot] = key;
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (lane == 0) {
+            selected_count = atomic_load_explicit(
+                &selected_count_atomic, memory_order_relaxed);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint slot = lane + selected_count; slot < 1024; slot += group_width) {
+            candidates[slot] = 0;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint span = 2; span <= 1024; span <<= 1) {
+            for (uint stride = span >> 1; stride > 0; stride >>= 1) {
+                for (uint slot = lane; slot < 1024; slot += group_width) {
+                    uint other = slot ^ stride;
+                    if (other > slot) {
+                        ulong left = candidates[slot];
+                        ulong right = candidates[other];
+                        bool descending = (slot & span) == 0;
+                        if ((descending && left < right) || (!descending && left > right)) {
+                            candidates[slot] = right;
+                            candidates[other] = left;
+                        }
+                    }
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+        }
+        float maximum = load_float(
+            logits,
+            physical_index(logits_layout, row * width + uint(candidates[0])),
+            input0_dtype);
+        for (uint slot = lane; slot < candidate_count; slot += group_width) {
+            uint column = uint(candidates[slot]);
+            float value = load_float(
+                logits, physical_index(logits_layout, row * width + column), input0_dtype);
+            weights[slot] = exp((value - maximum) / temperature);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (lane == 0) {
+            float total = 0.0f;
+            for (uint slot = 0; slot < candidate_count; ++slot) {
+                total += weights[slot];
+            }
+            keep = 1;
+            if (isfinite(total) && total > 0.0f) {
+                float cumulative = 0.0f;
+                for (uint slot = 0; slot < candidate_count; ++slot) {
+                    cumulative += weights[slot] / total;
+                    keep = slot + 1;
+                    if (cumulative >= top_p) {
+                        break;
+                    }
+                }
+            }
+            prefix = candidates[keep - 1];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        filter = keep < width;
+    }
+
+    ulong best = 0;
+    for (uint column = lane; column < width; column += group_width) {
+        float value = load_float(
+            logits, physical_index(logits_layout, row * width + column), input0_dtype);
+        ulong raw = argmax_candidate(value, column);
+        if (greedy) {
+            best = max(best, raw);
+        } else if (!filter || raw >= prefix) {
+            float score = value / temperature + gumbel_noise(seed, position, column);
+            best = max(best, argmax_candidate(score, column));
+        }
+    }
+    best = argmax_threadgroup_max(
+        best, simd_lane, simd_group, partial_keys, partial_indices);
+    if (lane == 0) {
+        output[physical_index(output_layout, row)] = uint(best);
+    }
+}
+
 struct RopeParams {
     uint heads;
     uint width;
