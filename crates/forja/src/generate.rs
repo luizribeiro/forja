@@ -17,7 +17,7 @@ pub(crate) async fn run(options: &Run) -> Result<(), Box<dyn Error>> {
             generate(
                 forja_cpu::CpuBackend::new(),
                 options,
-                test_guests::qwen3(),
+                &options.engine,
                 &mut output,
             )
             .await?;
@@ -28,7 +28,7 @@ pub(crate) async fn run(options: &Run) -> Result<(), Box<dyn Error>> {
                 forja_metal::MetalBackend::new()
                     .map_err(|error| format!("cannot create Metal backend: {error}"))?,
                 options,
-                test_guests::qwen3(),
+                &options.engine,
                 &mut output,
             )
             .await?;
@@ -256,6 +256,7 @@ mod tests {
     fn short_english_matches_the_golden_continuation() -> Result<(), Box<dyn Error>> {
         let root = PathBuf::from(env::var_os("FORJA_MODELS").ok_or("FORJA_MODELS is not set")?);
         let options = Run {
+            engine: test_guests::qwen3().to_owned(),
             model_dir: root.join("Qwen3-0.6B"),
             prompt: "A quiet forge glows beneath the mountain.".to_owned(),
             max_tokens: 32,

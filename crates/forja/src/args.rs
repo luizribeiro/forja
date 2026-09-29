@@ -50,6 +50,9 @@ struct VerifyArgs {
 
 #[derive(Args, Debug, Eq, PartialEq)]
 pub(crate) struct Run {
+    /// WebAssembly engine component.
+    #[arg(long)]
+    pub(crate) engine: PathBuf,
     /// Directory containing model weights and tokenizer files.
     #[arg(long)]
     pub(crate) model_dir: PathBuf,
@@ -299,6 +302,8 @@ mod tests {
         let command = parse(
             [
                 "run",
+                "--engine",
+                "/engine.wasm",
                 "--model-dir",
                 "/model",
                 "--prompt",
@@ -314,6 +319,7 @@ mod tests {
         assert_eq!(
             command,
             Command::Run(Run {
+                engine: PathBuf::from("/engine.wasm"),
                 model_dir: PathBuf::from("/model"),
                 prompt: "Hello".to_owned(),
                 max_tokens: 7,
@@ -324,9 +330,19 @@ mod tests {
 
     #[test]
     fn parses_run_defaults() {
-        let command =
-            parse(["run", "--model-dir", "/model", "--prompt", "Hello"].map(str::to_owned))
-                .unwrap();
+        let command = parse(
+            [
+                "run",
+                "--engine",
+                "/engine.wasm",
+                "--model-dir",
+                "/model",
+                "--prompt",
+                "Hello",
+            ]
+            .map(str::to_owned),
+        )
+        .unwrap();
         let Command::Run(options) = command else {
             panic!("expected run command");
         };
@@ -337,10 +353,13 @@ mod tests {
     #[test]
     fn rejects_invalid_run_options() {
         for arguments in [
-            vec!["run", "--prompt", "Hello"],
-            vec!["run", "--model-dir", "/model"],
+            vec!["run", "--model-dir", "/model", "--prompt", "Hello"],
+            vec!["run", "--engine", "/engine.wasm", "--prompt", "Hello"],
+            vec!["run", "--engine", "/engine.wasm", "--model-dir", "/model"],
             vec![
                 "run",
+                "--engine",
+                "/engine.wasm",
                 "--model-dir",
                 "/model",
                 "--prompt",
@@ -350,6 +369,8 @@ mod tests {
             ],
             vec![
                 "run",
+                "--engine",
+                "/engine.wasm",
                 "--model-dir",
                 "/model",
                 "--prompt",
@@ -359,6 +380,8 @@ mod tests {
             ],
             vec![
                 "run",
+                "--engine",
+                "/engine.wasm",
                 "--model-dir",
                 "/model",
                 "--model-dir",
@@ -368,6 +391,8 @@ mod tests {
             ],
             vec![
                 "run",
+                "--engine",
+                "/engine.wasm",
                 "--model-dir",
                 "/model",
                 "--prompt",
