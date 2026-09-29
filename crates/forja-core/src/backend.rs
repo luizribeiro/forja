@@ -362,6 +362,15 @@ pub trait Backend {
     ///
     /// Returns invalid input for a foreign tensor.
     fn read(&self, tensor: &Tensor) -> Result<Vec<u8>, BackendError>;
+
+    /// Reads a host-owned replay output after overlapping writes to its byte range complete.
+    ///
+    /// # Errors
+    ///
+    /// Returns invalid input for a foreign tensor or a pending replay failure.
+    fn read_replay_output(&self, tensor: &Tensor) -> Result<Vec<u8>, BackendError> {
+        self.read(tensor)
+    }
     /// Releases the allocation underlying a tensor and all of its views.
     ///
     /// # Errors

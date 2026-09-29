@@ -837,7 +837,6 @@ struct CommandResources {
 pub(super) struct PreparedMetalGraph {
     residency: Retained<ProtocolObject<dyn MTLResidencySet>>,
     buffers: HashSet<BufferId>,
-    tensors: Vec<Tensor>,
     encoding: Option<MetalEncodingPlan>,
 }
 
@@ -1495,7 +1494,6 @@ impl MetalBackend {
         Ok(PreparedMetalGraph {
             residency,
             buffers: retained,
-            tensors,
             encoding,
         })
     }
@@ -1624,16 +1622,11 @@ impl MetalBackend {
         }) {
             return Err(BackendError::UnsupportedOperation);
         }
-        let tensors = graph.map_or_else(
-            || {
-                dispatches
-                    .iter()
-                    .flat_map(|dispatch| dispatch.inputs().iter().chain(dispatch.outputs()))
-                    .cloned()
-                    .collect::<Vec<_>>()
-            },
-            |prepared| prepared.tensors.clone(),
-        );
+        let tensors = dispatches
+            .iter()
+            .flat_map(|dispatch| dispatch.inputs().iter().chain(dispatch.outputs()))
+            .cloned()
+            .collect::<Vec<_>>();
         if !retained_tensors_validated {
             for tensor in &tensors {
                 self.validate(tensor)?;
@@ -3809,8 +3802,8 @@ impl MetalBackend {
             Some(timestamps),
             Arc::downgrade(&self.in_flight),
         );
-        for tensor in unique {
-            buffers.get_mut(tensor)?.track(&completion);
+        for tensor in tensors {
+            buffers.get_mut(tensor)?.track(tensor, &completion);
         }
         Ok((completion, dependency))
     }

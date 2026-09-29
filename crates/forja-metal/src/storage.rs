@@ -34,7 +34,12 @@ pub(super) struct MetalBuffer {
     len: usize,
     pub(super) pooled: bool,
     pub(super) pool_resident: bool,
-    pending: Vec<Weak<Completion>>,
+    pending: Vec<PendingCompletion>,
+}
+
+struct PendingCompletion {
+    completion: Weak<Completion>,
+    range: std::ops::Range<u64>,
 }
 
 // SAFETY: Buffer access and pending-submission tracking are serialized by the backend registry
@@ -71,27 +76,54 @@ impl MetalBuffer {
     pub(super) fn wait_pending(&mut self, timeout: Duration) -> Result<(), BackendError> {
         let mut result = Ok(());
         for pending in std::mem::take(&mut self.pending) {
-            let Some(completion) = pending.upgrade() else {
+            let Some(completion) = pending.completion.upgrade() else {
                 continue;
             };
             if let Err(error) = completion.wait(timeout) {
                 result = Err(error);
                 if matches!(error, BackendError::ExecutionFailed | BackendError::Timeout) {
-                    self.pending.push(Arc::downgrade(&completion));
+                    self.pending.push(PendingCompletion {
+                        completion: Arc::downgrade(&completion),
+                        range: pending.range,
+                    });
                 }
             }
         }
         result
     }
 
-    pub(super) fn track(&mut self, completion: &Arc<Completion>) {
-        self.pending.push(Arc::downgrade(completion));
+    fn wait_pending_range(
+        &mut self,
+        range: &std::ops::Range<u64>,
+        timeout: Duration,
+    ) -> Result<(), BackendError> {
+        let mut result = Ok(());
+        self.pending.retain(|pending| {
+            let Some(completion) = pending.completion.upgrade() else {
+                return false;
+            };
+            if pending.range.start < range.end
+                && range.start < pending.range.end
+                && let Err(error) = completion.wait(timeout)
+            {
+                result = Err(error);
+            }
+            true
+        });
+        result
+    }
+
+    pub(super) fn track(&mut self, tensor: &Tensor, completion: &Arc<Completion>) {
+        self.pending.push(PendingCompletion {
+            completion: Arc::downgrade(completion),
+            range: tensor.layout().byte_span(),
+        });
     }
 
     pub(super) fn pending_event_value(&mut self) -> Option<u64> {
         let mut maximum = None;
         self.pending.retain(|pending| {
-            let Some(completion) = pending.upgrade() else {
+            let Some(completion) = pending.completion.upgrade() else {
                 return false;
             };
             maximum = maximum.max(completion.event_value());
@@ -638,6 +670,16 @@ impl Backend for MetalBackend {
             .map_err(|_| BackendError::ExecutionFailed)?;
         let buffer = buffers.get_mut(tensor)?;
         buffer.wait_pending(self.gpu_timeout)?;
+        gather(buffer.bytes(), tensor.layout())
+    }
+
+    fn read_replay_output(&self, tensor: &Tensor) -> Result<Vec<u8>, BackendError> {
+        let mut buffers = self
+            .buffers
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?;
+        let buffer = buffers.get_mut(tensor)?;
+        buffer.wait_pending_range(&tensor.layout().byte_span(), self.gpu_timeout)?;
         gather(buffer.bytes(), tensor.layout())
     }
 
