@@ -1,11 +1,13 @@
 use std::path::PathBuf;
 
+use clap::{Args, FromArgMatches, ValueEnum};
+
 pub(crate) const USAGE: &str = "usage:
   forja run --model-dir PATH --prompt TEXT [--max-tokens N] [--backend metal|cpu]
   forja bench --model-dir PATH [--precision f32|bf16] [--pp N] [--tg N] [--reps N] [--json PATH] [--profile] [--host-argmax] [--no-replay] [--backend-option graph-replay=tier1|tier2]
   forja verify --model-dir PATH --fixtures PATH [--backend metal|cpu] [--precision f32|bf16] [--prompts NAME,...]";
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub(crate) enum Backend {
     Metal,
     Cpu,
@@ -32,11 +34,19 @@ pub(crate) struct Verify {
     pub(crate) prompts: Vec<String>,
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Args, Debug, Eq, PartialEq)]
 pub(crate) struct Run {
+    /// Directory containing model weights and tokenizer files.
+    #[arg(long)]
     pub(crate) model_dir: PathBuf,
+    /// Text to continue.
+    #[arg(long)]
     pub(crate) prompt: String,
+    /// Maximum number of tokens to generate.
+    #[arg(long, default_value_t = 128)]
     pub(crate) max_tokens: usize,
+    /// Compute backend.
+    #[arg(long, value_enum, default_value_t = Backend::Metal)]
     pub(crate) backend: Backend,
 }
 
@@ -138,37 +148,11 @@ fn parse_count(value: &str, name: &str) -> Result<usize, String> {
 }
 
 fn parse_run(mut arguments: impl Iterator<Item = String>) -> Result<Run, String> {
-    let mut model_dir = None;
-    let mut prompt = None;
-    let mut max_tokens = None;
-    let mut backend = None;
-    while let Some(option) = arguments.next() {
-        let value = arguments
-            .next()
-            .ok_or_else(|| format!("{option} requires a value"))?;
-        match option.as_str() {
-            "--model-dir" if model_dir.is_none() => model_dir = Some(PathBuf::from(value)),
-            "--prompt" if prompt.is_none() => prompt = Some(value),
-            "--max-tokens" if max_tokens.is_none() => {
-                max_tokens = Some(
-                    value
-                        .parse()
-                        .map_err(|_| format!("invalid token count {value:?}"))?,
-                );
-            }
-            "--backend" if backend.is_none() => backend = Some(parse_backend(&value)?),
-            _ if option.starts_with("--") => {
-                return Err(format!("unknown or repeated option {option:?}"));
-            }
-            _ => return Err(format!("unexpected argument {option:?}")),
-        }
-    }
-    Ok(Run {
-        model_dir: model_dir.ok_or("--model-dir is required")?,
-        prompt: prompt.ok_or("--prompt is required")?,
-        max_tokens: max_tokens.unwrap_or(128),
-        backend: backend.unwrap_or(Backend::Metal),
-    })
+    let command = Run::augment_args(clap::Command::new("run"));
+    let matches = command
+        .try_get_matches_from(std::iter::once("run".to_owned()).chain(arguments.by_ref()))
+        .map_err(|error| error.to_string())?;
+    Run::from_arg_matches(&matches).map_err(|error| error.to_string())
 }
 
 fn parse_backend(value: &str) -> Result<Backend, String> {
@@ -337,6 +321,64 @@ mod tests {
                 backend: Backend::Cpu,
             })
         );
+    }
+
+    #[test]
+    fn parses_run_defaults() {
+        let command =
+            parse(["run", "--model-dir", "/model", "--prompt", "Hello"].map(str::to_owned))
+                .unwrap();
+        let Command::Run(options) = command else {
+            panic!("expected run command");
+        };
+        assert_eq!(options.max_tokens, 128);
+        assert_eq!(options.backend, Backend::Metal);
+    }
+
+    #[test]
+    fn rejects_invalid_run_options() {
+        for arguments in [
+            vec!["run", "--prompt", "Hello"],
+            vec!["run", "--model-dir", "/model"],
+            vec![
+                "run",
+                "--model-dir",
+                "/model",
+                "--prompt",
+                "Hello",
+                "--backend",
+                "neural",
+            ],
+            vec![
+                "run",
+                "--model-dir",
+                "/model",
+                "--prompt",
+                "Hello",
+                "--max-tokens",
+                "many",
+            ],
+            vec![
+                "run",
+                "--model-dir",
+                "/model",
+                "--model-dir",
+                "/other",
+                "--prompt",
+                "Hello",
+            ],
+            vec![
+                "run",
+                "--model-dir",
+                "/model",
+                "--prompt",
+                "Hello",
+                "--wat",
+                "value",
+            ],
+        ] {
+            assert!(parse(arguments.into_iter().map(str::to_owned)).is_err());
+        }
     }
 
     #[test]
