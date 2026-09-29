@@ -110,7 +110,6 @@ pub(crate) fn comparison_hash(key: &PerfKey) -> Result<String, String> {
     hash(key)
 }
 
-#[cfg_attr(not(test), expect(dead_code))]
 pub(crate) fn recorded_perf_keys(record: &Recorded) -> Result<Vec<PerfKey>, String> {
     let base = toml::from_str(&record.config)
         .map_err(|error| format!("record config is invalid: {error}"))?;
@@ -262,6 +261,7 @@ mod tests {
             strategy_axes: Vec::new(),
             points: Vec::new(),
             rerun: None,
+            allow_diff: Vec::new(),
         }
     }
 

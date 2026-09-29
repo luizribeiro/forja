@@ -111,6 +111,7 @@ pub(crate) struct Bench {
     pub(crate) strategy_axes: Vec<KeyPath>,
     pub(crate) points: Vec<BenchPoint>,
     pub(crate) rerun: Option<Recorded>,
+    pub(crate) allow_diff: Vec<KeyPath>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -160,6 +161,9 @@ struct BenchArgs {
     /// Re-run a schema-v2 benchmark record.
     #[arg(long)]
     rerun: Option<PathBuf>,
+    /// Permit one performance-key difference while re-running.
+    #[arg(long = "allow-diff", value_parser = parse_key_path)]
+    allow_diff: Vec<KeyPath>,
 }
 
 #[derive(Clone, Debug)]
@@ -398,6 +402,14 @@ fn parse_positive(value: &str) -> Result<u32, String> {
         .ok_or_else(|| "value must be a positive integer".to_owned())
 }
 
+fn parse_key_path(value: &str) -> Result<KeyPath, String> {
+    if value.is_empty() {
+        Err("configuration key must not be empty".to_owned())
+    } else {
+        Ok(KeyPath::new(value))
+    }
+}
+
 struct Sugar {
     flag: &'static str,
     key: &'static str,
@@ -579,6 +591,12 @@ impl BenchArgs {
         limits: Limits,
         rerun: Option<Recorded>,
     ) -> Result<Bench, clap::Error> {
+        if rerun.is_none() && !self.allow_diff.is_empty() {
+            return Err(Cli::command().error(
+                clap::error::ErrorKind::MissingRequiredArgument,
+                "--allow-diff requires --rerun",
+            ));
+        }
         let config = &layered.config;
         let count = |value: u32| {
             usize::try_from(value).map_err(|error| {
@@ -622,6 +640,7 @@ impl BenchArgs {
             strategy_axes,
             points,
             rerun,
+            allow_diff: self.allow_diff,
         })
     }
 }
@@ -1655,6 +1674,8 @@ fixtures = "/fixtures"
                 "/model".to_owned(),
                 "--rerun".to_owned(),
                 path.display().to_string(),
+                "--allow-diff".to_owned(),
+                "bench.reps".to_owned(),
             ],
             |isolated| {
                 assert!(isolated);
@@ -1667,7 +1688,26 @@ fixtures = "/fixtures"
         };
         assert_eq!(options.tg, 7);
         assert!(options.rerun.is_some());
+        assert_eq!(options.allow_diff, [KeyPath::new("bench.reps")]);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn allow_diff_requires_rerun() {
+        let error = parse(
+            [
+                "bench",
+                "--engine",
+                "/engine.wasm",
+                "--model-dir",
+                "/model",
+                "--allow-diff",
+                "bench.reps",
+            ]
+            .map(str::to_owned),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("--allow-diff requires --rerun"));
     }
 
     #[test]
