@@ -1971,6 +1971,9 @@ where
                         backend.submit_profiled(commands)
                     }
                     SubmissionWork::Commands(commands) => backend.submit(commands),
+                    SubmissionWork::Replay { graph, values } if profile.is_some() => {
+                        backend.replay_profiled(&graph, values)
+                    }
                     SubmissionWork::Replay { graph, values } => backend.replay(&graph, values),
                 } {
                     Err(error) => Err(error),

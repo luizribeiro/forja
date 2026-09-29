@@ -409,6 +409,25 @@ pub trait Backend {
         self.submit(commands)
     }
 
+    /// Instantiates and submits a prepared graph with detailed timing enabled.
+    ///
+    /// # Errors
+    ///
+    /// Returns invalid input for bad parameter values or a backend submission error.
+    fn replay_profiled(
+        &self,
+        graph: &GraphTemplate,
+        values: Vec<u32>,
+    ) -> Result<Self::Submission, BackendError> {
+        let values = graph
+            .values(values)
+            .map_err(|_| BackendError::InvalidInput)?;
+        let commands = graph
+            .instantiate(&values)
+            .map_err(|_| BackendError::InvalidInput)?;
+        self.submit_profiled(commands)
+    }
+
     /// Submits work with detailed timing enabled.
     ///
     /// Backends without detailed instrumentation use the normal submission path.
