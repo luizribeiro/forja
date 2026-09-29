@@ -1,0 +1,147 @@
+use std::{fmt, num::IntErrorKind};
+
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
+
+/// A byte count serialized as an integer or an IEC quantity such as `8GiB`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ByteSize(u64);
+
+impl ByteSize {
+    /// Creates a byte count.
+    #[must_use]
+    pub const fn new(bytes: u64) -> Self {
+        Self(bytes)
+    }
+
+    /// Returns the byte count.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl Serialize for ByteSize {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_u64(self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for ByteSize {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(ByteSizeVisitor)
+    }
+}
+
+struct ByteSizeVisitor;
+
+impl de::Visitor<'_> for ByteSizeVisitor {
+    type Value = ByteSize;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a non-negative byte count or IEC byte quantity")
+    }
+
+    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
+        Ok(ByteSize(value))
+    }
+
+    fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        u64::try_from(value)
+            .map(ByteSize)
+            .map_err(|_| E::custom(format!("quantity {value} overflows u64")))
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        parse_quantity(value, BYTE_UNITS)
+            .map(ByteSize)
+            .map_err(E::custom)
+    }
+}
+
+const BYTE_UNITS: &[(&str, u64)] = &[
+    ("TiB", 1024_u64.pow(4)),
+    ("GiB", 1024_u64.pow(3)),
+    ("MiB", 1024_u64.pow(2)),
+    ("KiB", 1024),
+    ("B", 1),
+];
+
+fn parse_quantity(value: &str, units: &[(&str, u64)]) -> Result<u64, String> {
+    let Some((digits, multiplier)) = units
+        .iter()
+        .find_map(|&(suffix, multiplier)| value.strip_suffix(suffix).map(|v| (v, multiplier)))
+    else {
+        return match value.parse::<u64>() {
+            Err(error) if matches!(error.kind(), IntErrorKind::PosOverflow) => {
+                Err(format!("quantity {value:?} overflows u64"))
+            }
+            _ => Err(format!("invalid quantity {value:?}")),
+        };
+    };
+    let count = match digits.parse::<u64>() {
+        Ok(count) => count,
+        Err(error) if matches!(error.kind(), IntErrorKind::PosOverflow) => {
+            return Err(format!("quantity {value:?} overflows u64"));
+        }
+        Err(_) => return Err(format!("invalid quantity {value:?}")),
+    };
+    count
+        .checked_mul(multiplier)
+        .ok_or_else(|| format!("quantity {value:?} overflows u64"))
+}
+
+#[cfg(test)]
+mod tests {
+    use serde::de::value::{Error, I64Deserializer, StrDeserializer, U64Deserializer};
+
+    use super::*;
+
+    #[test]
+    fn parses_byte_sizes_with_checked_arithmetic() {
+        let value = ByteSize::deserialize(StrDeserializer::<Error>::new("8GiB")).unwrap();
+        assert_eq!(value.get(), 8 * 1024 * 1024 * 1024);
+        let integer = ByteSize::deserialize(U64Deserializer::<Error>::new(4097)).unwrap();
+        assert_eq!(integer.get(), 4097);
+        let zero = ByteSize::deserialize(U64Deserializer::<Error>::new(0)).unwrap();
+        assert_eq!(zero.get(), 0);
+        assert_eq!(
+            ByteSize::deserialize(StrDeserializer::<Error>::new("18446744073709551615GiB"))
+                .unwrap_err()
+                .to_string(),
+            "quantity \"18446744073709551615GiB\" overflows u64"
+        );
+        assert_eq!(
+            ByteSize::deserialize(I64Deserializer::<Error>::new(-1))
+                .unwrap_err()
+                .to_string(),
+            "quantity -1 overflows u64"
+        );
+        for value in ["1.5GiB", " 1GiB", "1GiB "] {
+            assert_eq!(
+                ByteSize::deserialize(StrDeserializer::<Error>::new(value))
+                    .unwrap_err()
+                    .to_string(),
+                format!("invalid quantity {value:?}")
+            );
+        }
+        let value = "18446744073709551616";
+        assert_eq!(
+            ByteSize::deserialize(StrDeserializer::<Error>::new(value))
+                .unwrap_err()
+                .to_string(),
+            format!("quantity {value:?} overflows u64")
+        );
+    }
+}

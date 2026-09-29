@@ -688,6 +688,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "forja-config"
+version = "0.0.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "forja-core"
 version = "0.0.0"
 dependencies = [
