@@ -1,0 +1,100 @@
+import argparse
+import itertools
+import json
+import sys
+import tempfile
+import types
+import unittest
+from pathlib import Path
+from unittest import mock
+
+import bench
+
+
+class SuiteTests(unittest.TestCase):
+    def test_main_uses_the_shared_suite_values(self) -> None:
+        class FakeArray:
+            dtype = "bf16"
+
+        class FakeModel:
+            @staticmethod
+            def parameters() -> dict[str, FakeArray]:
+                return {"weight": FakeArray()}
+
+        class FakeTokenizer:
+            pass
+
+        response = types.SimpleNamespace(prompt_tps=256.0)
+        core = types.ModuleType("mlx.core")
+        core.__version__ = "0"
+        core.array = FakeArray
+        core.bfloat16 = "bf16"
+        core.floating = object()
+        core.device_info = lambda: {"device_name": "stub"}
+        core.eval = lambda _values: None
+        core.issubdtype = lambda _dtype, _kind: True
+        mlx = types.ModuleType("mlx")
+        mlx.__path__ = []
+        mlx.core = core
+        utils = types.ModuleType("mlx.utils")
+        utils.tree_flatten = lambda _values: [("weight", FakeArray())]
+        mlx_lm = types.ModuleType("mlx_lm")
+        mlx_lm.load = lambda *_args, **_kwargs: (
+            FakeModel(),
+            FakeTokenizer(),
+            {"vocab_size": 128},
+        )
+        mlx_lm.stream_generate = lambda *_args, max_tokens, **_kwargs: iter(
+            [response] * max_tokens
+        )
+
+        suite = Path(__file__).resolve().parents[2] / "bench/suites/default.toml"
+        with tempfile.TemporaryDirectory() as directory:
+            report_path = Path(directory) / "report.json"
+            arguments = argparse.Namespace(
+                model_dir=Path(directory) / "model",
+                suite=suite,
+                json=report_path,
+            )
+            modules = {"mlx": mlx, "mlx.core": core, "mlx.utils": utils, "mlx_lm": mlx_lm}
+            clock = (value / 100 for value in itertools.count())
+            with (
+                mock.patch.dict(sys.modules, modules),
+                mock.patch.object(bench, "arguments", return_value=arguments),
+                mock.patch.object(bench, "command_output", return_value="deadbeef"),
+                mock.patch.object(bench.importlib.metadata, "version", return_value="0"),
+                mock.patch.object(bench.platform, "mac_ver", return_value=("26.6", (), "")),
+                mock.patch.object(bench.time, "perf_counter", side_effect=clock),
+            ):
+                bench.main()
+            report = json.loads(report_path.read_text())
+            self.assertEqual(report["settings"]["pp"], 512)
+            self.assertEqual(report["settings"]["tg"], 128)
+            self.assertEqual(report["tg_context_start"], 9)
+
+    def test_reads_the_committed_default_suite(self) -> None:
+        path = Path(__file__).resolve().parents[2] / "bench/suites/default.toml"
+        suite = bench.load_suite(path)
+        self.assertEqual(suite["pp"], 512)
+        self.assertEqual(suite["decode_prefill"], 8)
+        self.assertEqual(suite["contexts"], [9, 512, 2048, 4000])
+
+    def test_rejects_non_increasing_contexts(self) -> None:
+        source = """[bench]
+pp = 512
+tg = 128
+reps = 30
+warmups = 3
+decode_prefill = 8
+contexts = [9, 9]
+selection = ["gpu-sequential"]
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "suite.toml"
+            path.write_text(source)
+            with self.assertRaisesRegex(ValueError, "strictly increasing"):
+                bench.load_suite(path)
+
+
+if __name__ == "__main__":
+    unittest.main()

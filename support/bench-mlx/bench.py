@@ -7,15 +7,9 @@ import json
 import platform
 import subprocess
 import time
+import tomllib
 from pathlib import Path
 
-import mlx.core as mx
-from mlx.utils import tree_flatten
-from mlx_lm import load, stream_generate
-
-WARMUPS = 3
-DECODE_PREFILL = 8
-TG_CONTEXT_START = DECODE_PREFILL + 1
 MASK64 = (1 << 64) - 1
 
 
@@ -23,19 +17,48 @@ def arguments() -> argparse.Namespace:
     """Parse benchmark options."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-dir", required=True, type=Path)
-    parser.add_argument("--pp", default=512, type=positive)
-    parser.add_argument("--tg", default=128, type=positive)
-    parser.add_argument("--reps", default=30, type=positive)
+    parser.add_argument("--suite", required=True, type=Path)
     parser.add_argument("--json", required=True, type=Path)
     return parser.parse_args()
 
 
-def positive(value: str) -> int:
-    """Parse a positive integer."""
-    parsed = int(value)
-    if parsed <= 0:
-        raise argparse.ArgumentTypeError("must be positive")
-    return parsed
+def load_suite(path: Path) -> dict[str, object]:
+    """Read and validate the benchmark table shared with Forja."""
+    with path.open("rb") as source:
+        document = tomllib.load(source)
+    if set(document) != {"bench"} or not isinstance(document["bench"], dict):
+        raise ValueError("suite must contain only a [bench] table")
+    bench = document["bench"]
+    required = {
+        "pp",
+        "tg",
+        "reps",
+        "warmups",
+        "decode_prefill",
+        "contexts",
+        "selection",
+    }
+    if set(bench) != required:
+        raise ValueError(f"bench keys must be exactly {sorted(required)}")
+    for key in ["pp", "tg", "reps", "decode_prefill"]:
+        if isinstance(bench[key], bool) or not isinstance(bench[key], int) or bench[key] <= 0:
+            raise ValueError(f"bench.{key} must be a positive integer")
+    warmups = bench["warmups"]
+    if isinstance(warmups, bool) or not isinstance(warmups, int) or warmups < 0:
+        raise ValueError("bench.warmups must be a non-negative integer")
+    contexts = bench["contexts"]
+    if (
+        not isinstance(contexts, list)
+        or not contexts
+        or any(isinstance(value, bool) or not isinstance(value, int) for value in contexts)
+        or any(left >= right for left, right in zip(contexts, contexts[1:]))
+    ):
+        raise ValueError("bench.contexts must be non-empty and strictly increasing")
+    selection = bench["selection"]
+    allowed = {"host-argmax", "gpu-sequential", "gpu-pipelined"}
+    if not isinstance(selection, list) or not selection or any(value not in allowed for value in selection):
+        raise ValueError("bench.selection contains an unknown selection")
+    return bench
 
 
 def synthetic_tokens(count: int, vocab: int) -> list[int]:
@@ -96,7 +119,7 @@ def command_output(arguments: list[str], cwd: Path | None = None) -> str:
     return value
 
 
-def validate_bf16(model) -> None:
+def validate_bf16(model, mx, tree_flatten) -> None:
     """Require every floating model parameter to retain checkpoint bf16."""
     dtypes = {
         value.dtype
@@ -109,18 +132,26 @@ def validate_bf16(model) -> None:
 
 def main() -> None:
     """Load the checkpoint, run MLX-LM generation trials, and write JSON."""
+    import mlx.core as mx
+    from mlx.utils import tree_flatten
+    from mlx_lm import load, stream_generate
+
     args = arguments()
+    bench = load_suite(args.suite)
     model, tokenizer, config = load(
         args.model_dir,
         return_config=True,
         tokenizer_config={"trust_remote_code": True},
     )
-    validate_bf16(model)
+    validate_bf16(model, mx, tree_flatten)
     mx.eval(model.parameters())
     tokenizer._eos_token_ids = set()
     vocab = config.get("vocab_size") or config["text_config"]["vocab_size"]
-    pp_prompt = synthetic_tokens(args.pp, vocab)
-    tg_prompt = synthetic_tokens(DECODE_PREFILL, vocab)
+    pp = bench["pp"]
+    tg = bench["tg"]
+    decode_prefill = bench["decode_prefill"]
+    pp_prompt = synthetic_tokens(pp, vocab)
+    tg_prompt = synthetic_tokens(decode_prefill, vocab)
 
     def pp_trial() -> float:
         response = next(
@@ -132,7 +163,7 @@ def main() -> None:
                 prefill_step_size=2048,
             )
         )
-        return args.pp / response.prompt_tps
+        return pp / response.prompt_tps
 
     def tg_trial() -> float:
         responses = iter(
@@ -140,23 +171,23 @@ def main() -> None:
                 model,
                 tokenizer,
                 tg_prompt,
-                max_tokens=args.tg + 2,
+                max_tokens=tg + 2,
                 prefill_step_size=2048,
             )
         )
         next(responses)
         next(responses)
         started = time.perf_counter()
-        for _ in range(args.tg):
+        for _ in range(tg):
             next(responses)
         return time.perf_counter() - started
 
-    for _ in range(WARMUPS):
+    for _ in range(bench["warmups"]):
         pp_trial()
         tg_trial()
     pp_times = []
     tg_times = []
-    for _ in range(args.reps):
+    for _ in range(bench["reps"]):
         pp_times.append(pp_trial())
         tg_times.append(tg_trial())
     repository = Path(__file__).resolve().parents[2]
@@ -165,13 +196,8 @@ def main() -> None:
         "schema_version": 1,
         "implementation": "mlx_lm",
         "model": str(args.model_dir),
-        "settings": {
-            "prompt_tokens": args.pp,
-            "generated_tokens": args.tg,
-            "warmups": WARMUPS,
-            "repetitions": args.reps,
-        },
-        "tg_context_start": TG_CONTEXT_START,
+        "settings": bench,
+        "tg_context_start": decode_prefill + 1,
         "results": [
             {
                 "provenance": {
@@ -183,8 +209,8 @@ def main() -> None:
                     "mlx": mx.__version__,
                     "mlx_lm": importlib.metadata.version("mlx-lm"),
                 },
-                "prompt_processing": summary(args.pp, pp_times),
-                "token_generation": summary(args.tg, tg_times),
+                "prompt_processing": summary(pp, pp_times),
+                "token_generation": summary(tg, tg_times),
             }
         ],
     }
