@@ -112,7 +112,8 @@ pub fn layer<C: Schema>(layers: Vec<Layer>) -> Result<Layered<C>, ConfigError> {
     let mut origins = BTreeMap::new();
     record_origins(&table, "", &Origin::Default, &mut origins);
     for next in layers {
-        validate::<C>(&next)?;
+        validate::<C>(&next.table)
+            .map_err(|message| ConfigError::new(format!("{}: {message}", next.origin)))?;
         merge_table(&mut table, next.table, "", &next.origin, &mut origins);
     }
     let config = toml::Value::Table(table)
@@ -129,11 +130,11 @@ fn schema_table<C: Serialize>(config: &C) -> Result<toml::Table, ConfigError> {
         .ok_or_else(|| ConfigError::new("configuration root must be a table"))
 }
 
-fn validate<C: Schema>(layer: &Layer) -> Result<(), ConfigError> {
-    toml::Value::Table(layer.table.clone())
+pub(crate) fn validate<C: Schema>(table: &toml::Table) -> Result<(), String> {
+    toml::Value::Table(table.clone())
         .try_into::<C>()
         .map(|_| ())
-        .map_err(|error| ConfigError::new(format!("{}: {error}", layer.origin)))
+        .map_err(|error: toml::de::Error| error.message().to_owned())
 }
 
 fn merge_table(

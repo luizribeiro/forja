@@ -3,9 +3,11 @@
 #![forbid(unsafe_code)]
 
 mod layer;
+mod set;
 mod units;
 
 pub use layer::{ConfigError, KeyPath, Layer, Layered, Origin, Schema, layer};
+pub use set::set_layer;
 pub use units::{ByteSize, Duration, Unbounded};
 
 use serde::{Deserialize, Serialize};
