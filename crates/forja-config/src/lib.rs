@@ -14,7 +14,7 @@ pub use units::{ByteSize, Duration, Unbounded};
 
 use std::{collections::BTreeMap, num::NonZeroU32, path::PathBuf};
 
-use serde::{Deserialize, Deserializer, Serialize, de};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
 /// Configuration used by development commands.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
@@ -30,6 +30,140 @@ pub struct DevConfig {
     pub run: Run,
     /// Golden-fixture verification settings.
     pub verify: Verify,
+    /// Compute backend settings.
+    pub backend: Backend,
+}
+
+/// Compute backend settings.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Backend {
+    /// Backend implementation used by run and verify.
+    pub kind: BackendKind,
+    /// Metal-specific settings.
+    pub metal: Metal,
+}
+
+impl Default for Backend {
+    fn default() -> Self {
+        Self {
+            kind: BackendKind::Metal,
+            metal: Metal::default(),
+        }
+    }
+}
+
+/// Compute backend implementation.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BackendKind {
+    /// Metal GPU backend.
+    Metal,
+    /// Portable CPU interpreter.
+    Cpu,
+}
+
+/// Metal backend settings.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Metal {
+    /// Command graph replay strategy.
+    pub graph_replay: Choice<GraphReplay>,
+}
+
+impl Default for Metal {
+    fn default() -> Self {
+        Self {
+            graph_replay: Choice::Auto,
+        }
+    }
+}
+
+impl Metal {
+    /// Resolves Metal settings, using the documented fallback until device tables are available.
+    #[must_use]
+    pub const fn resolve(&self) -> ResolvedMetal {
+        match self.graph_replay {
+            Choice::Auto => ResolvedMetal {
+                graph_replay: GraphReplay::Tier2,
+                auto: Some(AutoNote { fallback: true }),
+            },
+            Choice::Fixed(graph_replay) => ResolvedMetal {
+                graph_replay,
+                auto: None,
+            },
+        }
+    }
+}
+
+/// A value selected automatically or fixed explicitly.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Choice<T> {
+    /// Resolve the value for the active environment.
+    Auto,
+    /// Use one explicit value.
+    Fixed(T),
+}
+
+impl<T: Serialize> Serialize for Choice<T> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::Auto => serializer.serialize_str("auto"),
+            Self::Fixed(value) => value.serialize(serializer),
+        }
+    }
+}
+
+impl<'de, T> Deserialize<'de> for Choice<T>
+where
+    T: Deserialize<'de>,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Value<T> {
+            Fixed(T),
+            Auto(String),
+        }
+
+        match Value::deserialize(deserializer)? {
+            Value::Fixed(value) => Ok(Self::Fixed(value)),
+            Value::Auto(value) if value == "auto" => Ok(Self::Auto),
+            Value::Auto(value) => Err(de::Error::custom(format!("unknown choice {value:?}"))),
+        }
+    }
+}
+
+/// Metal command graph replay strategy.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum GraphReplay {
+    /// Replay command structure while re-encoding resource bindings.
+    Tier1,
+    /// Replay commands with reusable indirect command buffers.
+    Tier2,
+}
+
+/// Concrete Metal settings ready for backend construction.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResolvedMetal {
+    /// Resolved command graph replay strategy.
+    pub graph_replay: GraphReplay,
+    /// Automatic-resolution provenance when the input was `auto`.
+    pub auto: Option<AutoNote>,
+}
+
+/// Provenance for an automatically selected value.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AutoNote {
+    /// Whether resolution used the compiled fallback rather than a device-table row.
+    pub fallback: bool,
 }
 
 /// Text-generation settings.
@@ -394,6 +528,36 @@ fixtures = "golden/qwen3-0.6b"
     }
 
     #[test]
+    fn choices_are_strings_and_auto_falls_back_to_tier2() {
+        let config: DevConfig = toml::from_str(
+            "[backend]\nkind = \"cpu\"\n[backend.metal]\ngraph_replay = \"tier1\"\n",
+        )
+        .unwrap();
+        assert_eq!(config.backend.kind, BackendKind::Cpu);
+        assert_eq!(
+            config.backend.metal.resolve(),
+            ResolvedMetal {
+                graph_replay: GraphReplay::Tier1,
+                auto: None
+            }
+        );
+
+        let defaults = DevConfig::default();
+        assert_eq!(
+            defaults.backend.metal.resolve(),
+            ResolvedMetal {
+                graph_replay: GraphReplay::Tier2,
+                auto: Some(AutoNote { fallback: true })
+            }
+        );
+        let value = toml::Value::try_from(defaults).unwrap();
+        assert_eq!(
+            value["backend"]["metal"]["graph_replay"].as_str(),
+            Some("auto")
+        );
+    }
+
+    #[test]
     fn committed_default_suite_matches_bench_defaults() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../bench/suites/default.toml");
         let config: DevConfig = toml::from_str(&fs::read_to_string(path).unwrap()).unwrap();
@@ -403,6 +567,7 @@ fixtures = "golden/qwen3-0.6b"
     #[test]
     fn enum_leaves_serialize_as_scalars() {
         let value = toml::Value::try_from(DevConfig::default()).unwrap();
+        assert!(!value["backend"]["kind"].is_table());
         assert!(!value["bench"]["selection"][0].is_table());
         let limits = value.get("limits").unwrap();
         for key in [

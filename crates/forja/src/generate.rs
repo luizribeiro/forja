@@ -9,6 +9,9 @@ use crate::{
     engine::{limits, read_token},
 };
 
+#[cfg(target_os = "macos")]
+use crate::engine::metal_graph_replay;
+
 pub(crate) async fn run(options: &Run) -> Result<(), Box<dyn Error>> {
     let stdout = std::io::stdout();
     let mut output = stdout.lock();
@@ -25,8 +28,10 @@ pub(crate) async fn run(options: &Run) -> Result<(), Box<dyn Error>> {
         BackendArg::Metal => {
             #[cfg(target_os = "macos")]
             generate(
-                forja_metal::MetalBackend::new()
-                    .map_err(|error| format!("cannot create Metal backend: {error}"))?,
+                forja_metal::MetalBackend::with_graph_replay(metal_graph_replay(
+                    options.graph_replay,
+                ))
+                .map_err(|error| format!("cannot create Metal backend: {error}"))?,
                 options,
                 &options.engine,
                 &mut output,
@@ -261,6 +266,7 @@ mod tests {
             prompt: "A quiet forge glows beneath the mountain.".to_owned(),
             max_tokens: 32,
             backend: BackendArg::Metal,
+            graph_replay: forja_config::GraphReplay::Tier2,
             limits: forja_config::Limits::default(),
         };
         let expected = FixtureDirectory::open(root.join("golden/qwen3-0.6b"))?

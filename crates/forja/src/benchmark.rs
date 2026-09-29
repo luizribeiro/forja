@@ -7,7 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use forja_config::Selection;
+use forja_config::{GraphReplay, Selection};
 use forja_core::Op;
 use forja_host::{
     EngineDecode, EngineMetrics, EngineOutput, EngineRunner, EngineStep, EngineStepProfile,
@@ -16,10 +16,13 @@ use forja_host::{
 use golden_fixtures::{decode_f32_le, sha256_file};
 
 use crate::{
-    args::{Bench, GraphReplay},
+    args::Bench,
     benchmark_stats::{Stats, stats, synthetic_tokens},
     engine::{argmax, limits, read_token},
 };
+
+#[cfg(target_os = "macos")]
+use crate::engine::metal_graph_replay;
 
 #[derive(Clone, Copy)]
 pub(crate) struct Summary {
@@ -146,10 +149,8 @@ async fn bench_engine(
     host_argmax: bool,
     overlap: bool,
 ) -> Result<(Summary, Summary, String, Vec<ProfileMeasurement>), Box<dyn Error>> {
-    let backend = forja_metal::MetalBackend::with_graph_replay(match options.graph_replay {
-        GraphReplay::Tier1 => forja_metal::MetalGraphReplay::Tier1,
-        GraphReplay::Tier2 => forja_metal::MetalGraphReplay::Tier2,
-    })?;
+    let backend =
+        forja_metal::MetalBackend::with_graph_replay(metal_graph_replay(options.graph_replay))?;
     let device = backend.device_name();
     let mut runner = EngineRunner::new(
         component,

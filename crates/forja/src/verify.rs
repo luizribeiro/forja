@@ -10,6 +10,9 @@ use golden_fixtures::{
 use crate::args::{Backend as BackendArg, Precision, Verify};
 use crate::engine::{argmax, limits};
 
+#[cfg(target_os = "macos")]
+use crate::engine::metal_graph_replay;
+
 const F32_HIDDEN_STATE_TOLERANCE: f64 = 2e-2;
 const BF16_TOP1_PERCENT: u64 = 95;
 
@@ -111,8 +114,10 @@ async fn run_with_component(
         BackendArg::Metal => {
             #[cfg(target_os = "macos")]
             {
-                let backend = forja_metal::MetalBackend::new()
-                    .map_err(|error| format!("cannot create Metal backend: {error}"))?;
+                let backend = forja_metal::MetalBackend::with_graph_replay(metal_graph_replay(
+                    options.graph_replay,
+                ))
+                .map_err(|error| format!("cannot create Metal backend: {error}"))?;
                 verify(
                     backend,
                     options,
@@ -634,6 +639,7 @@ mod tests {
             backend: BackendArg::Cpu,
             precision: Precision::F32,
             prompts: Vec::new(),
+            graph_replay: forja_config::GraphReplay::Tier2,
             limits: forja_config::Limits::default(),
         };
         let fixtures = FixtureDirectory::open(fixtures_path)?;
@@ -676,6 +682,7 @@ mod tests {
             backend,
             precision,
             prompts,
+            graph_replay: forja_config::GraphReplay::Tier2,
             limits: forja_config::Limits::default(),
         })
     }

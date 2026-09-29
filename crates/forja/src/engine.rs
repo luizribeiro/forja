@@ -1,6 +1,6 @@
 use std::{error::Error, num::TryFromIntError, time::Duration};
 
-use forja_config::{Limits as ConfigLimits, Unbounded};
+use forja_config::{GraphReplay, Limits as ConfigLimits, Unbounded};
 
 struct HostLimits(forja_host::Limits);
 
@@ -67,6 +67,14 @@ pub(crate) fn limits(config: &ConfigLimits) -> Result<forja_host::Limits, TryFro
     HostLimits::try_from(config).map(|limits| limits.0)
 }
 
+#[cfg(target_os = "macos")]
+pub(crate) const fn metal_graph_replay(value: GraphReplay) -> forja_metal::MetalGraphReplay {
+    match value {
+        GraphReplay::Tier1 => forja_metal::MetalGraphReplay::Tier1,
+        GraphReplay::Tier2 => forja_metal::MetalGraphReplay::Tier2,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -111,5 +119,18 @@ mod tests {
         assert_eq!(read_token(&7_u32.to_le_bytes())?, 7);
         assert!(read_token(&[0; 8]).is_err());
         Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn maps_resolved_graph_replay_to_metal() {
+        assert_eq!(
+            metal_graph_replay(GraphReplay::Tier1),
+            forja_metal::MetalGraphReplay::Tier1
+        );
+        assert_eq!(
+            metal_graph_replay(GraphReplay::Tier2),
+            forja_metal::MetalGraphReplay::Tier2
+        );
     }
 }

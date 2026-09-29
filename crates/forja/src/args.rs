@@ -2,8 +2,8 @@ use std::{collections::BTreeMap, path::PathBuf};
 
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use forja_config::{
-    ConfigError, DevConfig, KeyPath, Layer, Layered, Limits, Origin, Selection, dev_layers,
-    file_layer, layer, set_layer,
+    BackendKind, ConfigError, DevConfig, GraphReplay, KeyPath, Layer, Layered, Limits, Origin,
+    Selection, dev_layers, file_layer, layer, set_layer,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -18,12 +18,6 @@ pub(crate) enum Precision {
     Bf16,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum GraphReplay {
-    Tier1,
-    Tier2,
-}
-
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct Verify {
     pub(crate) engine: PathBuf,
@@ -32,6 +26,7 @@ pub(crate) struct Verify {
     pub(crate) backend: Backend,
     pub(crate) precision: Precision,
     pub(crate) prompts: Vec<String>,
+    pub(crate) graph_replay: GraphReplay,
     pub(crate) limits: Limits,
 }
 
@@ -47,14 +42,17 @@ struct VerifyArgs {
     #[arg(long)]
     fixtures: Option<PathBuf>,
     /// Compute backend.
-    #[arg(long, value_enum, default_value_t = Backend::Metal)]
-    backend: Backend,
+    #[arg(long, value_enum)]
+    backend: Option<Backend>,
     /// Engine precision.
     #[arg(long, value_enum, default_value_t = Precision::F32)]
     precision: Precision,
     /// Comma-separated fixture names. Repeating the option appends names.
     #[arg(long, value_delimiter = ',', value_parser = parse_prompt_name)]
     prompts: Vec<String>,
+    /// Set a Metal backend option.
+    #[arg(long = "backend-option", hide = true, value_parser = parse_backend_option)]
+    graph_replay: Option<GraphReplay>,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -64,6 +62,7 @@ pub(crate) struct Run {
     pub(crate) prompt: String,
     pub(crate) max_tokens: usize,
     pub(crate) backend: Backend,
+    pub(crate) graph_replay: GraphReplay,
     pub(crate) limits: Limits,
 }
 
@@ -82,8 +81,11 @@ struct RunArgs {
     #[arg(long)]
     max_tokens: Option<u32>,
     /// Compute backend.
-    #[arg(long, value_enum, default_value_t = Backend::Metal)]
-    backend: Backend,
+    #[arg(long, value_enum)]
+    backend: Option<Backend>,
+    /// Set a Metal backend option.
+    #[arg(long = "backend-option", hide = true, value_parser = parse_backend_option)]
+    graph_replay: Option<GraphReplay>,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -130,12 +132,8 @@ struct BenchArgs {
     #[arg(long)]
     host_argmax: bool,
     /// Set a Metal backend option.
-    #[arg(
-        long = "backend-option",
-        default_value = "graph-replay=tier2",
-        value_parser = parse_backend_option
-    )]
-    graph_replay: GraphReplay,
+    #[arg(long = "backend-option", hide = true, value_parser = parse_backend_option)]
+    graph_replay: Option<GraphReplay>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -344,6 +342,14 @@ const SUGAR: &[Sugar] = &[
         flag: "--fixtures",
         key: "verify.fixtures",
     },
+    Sugar {
+        flag: "--backend",
+        key: "backend.kind",
+    },
+    Sugar {
+        flag: "--backend-option",
+        key: "backend.metal.graph_replay",
+    },
 ];
 
 impl ParsedCommand {
@@ -364,6 +370,7 @@ impl ParsedCommand {
                         .host_argmax
                         .then(|| ("--host-argmax", "[\"host-argmax\"]".to_owned())),
                 );
+                values.extend(graph_replay_sugar(options.graph_replay));
             }
             Self::Run(options) => {
                 values.extend(
@@ -371,6 +378,8 @@ impl ParsedCommand {
                         .max_tokens
                         .map(|value| ("--max-tokens", value.to_string())),
                 );
+                values.extend(backend_sugar(options.backend));
+                values.extend(graph_replay_sugar(options.graph_replay));
             }
             Self::Verify(options) => {
                 if !options.prompts.is_empty() {
@@ -394,6 +403,8 @@ impl ParsedCommand {
                         toml::Value::String(path.to_owned()).to_string(),
                     ));
                 }
+                values.extend(backend_sugar(options.backend));
+                values.extend(graph_replay_sugar(options.graph_replay));
             }
             Self::Config(_) => {}
         }
@@ -402,6 +413,28 @@ impl ParsedCommand {
             .map(|(flag, value)| sugar_layer(flag, &value))
             .collect()
     }
+}
+
+fn backend_sugar(backend: Option<Backend>) -> Option<(&'static str, String)> {
+    backend.map(|backend| {
+        let value = match backend {
+            Backend::Metal => "metal",
+            Backend::Cpu => "cpu",
+        };
+        (
+            "--backend",
+            toml::Value::String(value.to_owned()).to_string(),
+        )
+    })
+}
+
+fn graph_replay_sugar(value: Option<GraphReplay>) -> Option<(&'static str, String)> {
+    value.map(|value| {
+        (
+            "--backend-option",
+            toml::Value::String(graph_replay_name(value).to_owned()).to_string(),
+        )
+    })
 }
 
 fn sugar_layer(flag: &'static str, value: &str) -> Result<(Layer, KeyPath), clap::Error> {
@@ -443,7 +476,7 @@ impl BenchArgs {
             selection: config.bench.selection.as_slice().to_vec(),
             json: self.json,
             breakdown: config.bench.breakdown,
-            graph_replay: self.graph_replay,
+            graph_replay: config.backend.metal.resolve().graph_replay,
             limits,
         })
     }
@@ -459,7 +492,8 @@ impl RunArgs {
             model_dir: self.model_dir,
             prompt: self.prompt,
             max_tokens,
-            backend: self.backend,
+            backend: config.backend.kind.into(),
+            graph_replay: config.backend.metal.resolve().graph_replay,
             limits,
         })
     }
@@ -470,6 +504,22 @@ fn parse_backend_option(value: &str) -> Result<GraphReplay, String> {
         "graph-replay=tier1" => Ok(GraphReplay::Tier1),
         "graph-replay=tier2" => Ok(GraphReplay::Tier2),
         _ => Err(format!("unknown Metal backend option {value:?}")),
+    }
+}
+
+const fn graph_replay_name(value: GraphReplay) -> &'static str {
+    match value {
+        GraphReplay::Tier1 => "tier1",
+        GraphReplay::Tier2 => "tier2",
+    }
+}
+
+impl From<BackendKind> for Backend {
+    fn from(value: BackendKind) -> Self {
+        match value {
+            BackendKind::Metal => Self::Metal,
+            BackendKind::Cpu => Self::Cpu,
+        }
     }
 }
 
@@ -493,7 +543,7 @@ impl VerifyArgs {
             engine: self.engine,
             model_dir: self.model_dir,
             fixtures,
-            backend: self.backend,
+            backend: config.backend.kind.into(),
             precision: self.precision,
             prompts: config
                 .verify
@@ -501,6 +551,7 @@ impl VerifyArgs {
                 .iter()
                 .map(|name| name.as_str().to_owned())
                 .collect(),
+            graph_replay: config.backend.metal.resolve().graph_replay,
             limits,
         })
     }
@@ -787,6 +838,7 @@ selection = ["host-argmax"]
                 prompt: "Hello".to_owned(),
                 max_tokens: 7,
                 backend: Backend::Cpu,
+                graph_replay: GraphReplay::Tier2,
                 limits: Limits::default(),
             })
         );
@@ -812,6 +864,26 @@ selection = ["host-argmax"]
         };
         assert_eq!(options.max_tokens, 128);
         assert_eq!(options.backend, Backend::Metal);
+    }
+
+    #[test]
+    fn file_value_survives_without_backend_sugar_flag() {
+        let command = parse_with_file(
+            &[
+                "run",
+                "--engine",
+                "/engine.wasm",
+                "--model-dir",
+                "/model",
+                "--prompt",
+                "Hello",
+            ],
+            "[backend]\nkind = \"cpu\"\n",
+        );
+        let Command::Run(options) = command else {
+            panic!("expected run command");
+        };
+        assert_eq!(options.backend, Backend::Cpu);
     }
 
     #[test]
@@ -919,6 +991,7 @@ selection = ["host-argmax"]
                 backend: Backend::Cpu,
                 precision: Precision::Bf16,
                 prompts: vec!["one".to_owned(), "two".to_owned()],
+                graph_replay: GraphReplay::Tier2,
                 limits: Limits::default(),
             })
         );
@@ -952,6 +1025,7 @@ selection = ["host-argmax"]
                 backend: Backend::Metal,
                 precision: Precision::F32,
                 prompts: vec!["one".to_owned(), "two".to_owned(), "three".to_owned()],
+                graph_replay: GraphReplay::Tier2,
                 limits: Limits::default(),
             })
         );

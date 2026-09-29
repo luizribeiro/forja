@@ -103,13 +103,19 @@ fn render_toml(
 ) {
     let Some(table) = value.as_table() else {
         output.push_str(&value.to_string());
-        append_origin(output, origin_prefix, show_origins, origins);
+        append_origin(output, origin_prefix, value, show_origins, origins);
         output.push('\n');
         return;
     };
     for (key, value) in table.iter().filter(|(_, value)| !value.is_table()) {
         let _ = write!(output, "{} = {}", toml_key(key), value);
-        append_origin(output, &joined(origin_prefix, key), show_origins, origins);
+        append_origin(
+            output,
+            &joined(origin_prefix, key),
+            value,
+            show_origins,
+            origins,
+        );
         output.push('\n');
     }
     for (key, value) in table.iter().filter(|(_, value)| value.is_table()) {
@@ -129,8 +135,16 @@ fn render_toml(
     }
 }
 
-fn append_origin(output: &mut String, path: &str, show: bool, origins: &BTreeMap<KeyPath, Origin>) {
-    if show && let Some(origin) = origins.get(&KeyPath::new(path)) {
+fn append_origin(
+    output: &mut String,
+    path: &str,
+    value: &toml::Value,
+    show: bool,
+    origins: &BTreeMap<KeyPath, Origin>,
+) {
+    if show && path == "backend.metal.graph_replay" && value.as_str() == Some("auto") {
+        output.push_str("  # unresolved: no Metal device");
+    } else if show && let Some(origin) = origins.get(&KeyPath::new(path)) {
         let _ = write!(output, "  # {origin}");
     }
 }
@@ -197,5 +211,16 @@ mod tests {
         let output: serde_json::Value = serde_json::from_str(&render(&options).unwrap()).unwrap();
         assert_eq!(output["config"]["limits"]["tensor_rank"], 7);
         assert_eq!(output["origins"]["limits.tensor_rank"], "--set #1");
+    }
+
+    #[test]
+    fn leaves_auto_unresolved_without_a_metal_device() {
+        let mut options = options("");
+        options.key = Some("backend.metal.graph_replay".to_owned());
+        options.defaults = true;
+        assert_eq!(
+            render(&options).unwrap(),
+            "\"auto\"  # unresolved: no Metal device\n"
+        );
     }
 }
