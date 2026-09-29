@@ -1,5 +1,5 @@
 use std::{
-    cell::Cell,
+    cell::{Cell, RefCell},
     collections::{HashMap, HashSet},
     ffi::c_void,
     fmt::Write as _,
@@ -272,6 +272,97 @@ struct ArgumentUsage {
     written: HashSet<(usize, usize)>,
 }
 
+#[derive(Clone)]
+#[allow(dead_code)]
+enum PlannedRange {
+    Fixed(BoundRange),
+    Arena { offset: usize, len: usize },
+}
+
+#[derive(Clone)]
+#[allow(dead_code)]
+enum PlanCall {
+    Pipeline(Retained<ProtocolObject<dyn MTLComputePipelineState>>),
+    Bind {
+        index: usize,
+        range: PlannedRange,
+    },
+    ArgumentTable,
+    Dispatch {
+        threadgroups: MTLSize,
+        threads_per_threadgroup: MTLSize,
+    },
+    Barrier,
+}
+
+struct PlanRecording {
+    arena_base: u64,
+    calls: Vec<PlanCall>,
+}
+
+#[allow(dead_code)]
+struct PlanRecorderScope(bool);
+
+#[allow(dead_code)]
+impl PlanRecorderScope {
+    fn enter(arena_base: u64) -> Self {
+        PLAN_RECORDER.with(|recorder| {
+            debug_assert!(recorder.borrow().is_none());
+            *recorder.borrow_mut() = Some(PlanRecording {
+                arena_base,
+                calls: Vec::new(),
+            });
+        });
+        Self(true)
+    }
+
+    fn finish(mut self) -> Vec<PlanCall> {
+        self.0 = false;
+        PLAN_RECORDER.with(|recorder| {
+            recorder
+                .borrow_mut()
+                .take()
+                .map_or_else(Vec::new, |recording| recording.calls)
+        })
+    }
+}
+
+impl Drop for PlanRecorderScope {
+    fn drop(&mut self) {
+        if self.0 {
+            PLAN_RECORDER.with(|recorder| {
+                recorder.borrow_mut().take();
+            });
+        }
+    }
+}
+
+fn record_plan_call(call: PlanCall) {
+    PLAN_RECORDER.with(|recorder| {
+        if let Some(recording) = recorder.borrow_mut().as_mut() {
+            recording.calls.push(call);
+        }
+    });
+}
+
+fn record_plan_binding(index: usize, range: BoundRange) {
+    PLAN_RECORDER.with(|recorder| {
+        let mut recorder = recorder.borrow_mut();
+        let Some(recording) = recorder.as_mut() else {
+            return;
+        };
+        let range = if range.base == recording.arena_base {
+            PlannedRange::Arena {
+                offset: range.offset,
+                len: range.len,
+            }
+        } else {
+            PlannedRange::Fixed(range)
+        };
+        recording.calls.push(PlanCall::Bind { index, range });
+    });
+}
+
 impl ArgumentBindings {
     fn bind(
         &mut self,
@@ -284,12 +375,14 @@ impl ArgumentBindings {
         unsafe {
             table.setAddress_atIndex(buffer.address, index);
         }
-        self.ranges.insert(BoundRange {
+        let range = BoundRange {
             base: buffer.raw.gpuAddress(),
             offset: buffer.offset,
             len: buffer.len,
             address: buffer.address,
-        });
+        };
+        record_plan_binding(index, range);
+        self.ranges.insert(range);
     }
 
     fn bind_raw(
@@ -304,12 +397,14 @@ impl ArgumentBindings {
         unsafe {
             table.setAddress_atIndex(address, index);
         }
-        self.ranges.insert(BoundRange {
+        let range = BoundRange {
             base: address,
             offset: 0,
             len: buffer.length(),
             address,
-        });
+        };
+        record_plan_binding(index, range);
+        self.ranges.insert(range);
     }
 }
 
@@ -496,6 +591,7 @@ enum CommitResult {
 thread_local! {
     static IN_METAL_CALLBACK: Cell<bool> = const { Cell::new(false) };
     static TEMPORARY_PROFILE: Cell<Option<ProfileCount>> = const { Cell::new(None) };
+    static PLAN_RECORDER: RefCell<Option<PlanRecording>> = const { RefCell::new(None) };
 }
 
 struct TemporaryProfileScope {
@@ -1655,8 +1751,6 @@ impl MetalBackend {
         bindings: &mut ArgumentBindings,
         arguments: &mut ArgumentWriter,
     ) -> Result<Vec<BufferBinding>, BackendError> {
-        use objc2_metal::{MTL4CommandEncoder, MTL4VisibilityOptions, MTLStages};
-
         let [left_tensor, right_tensor] = dispatch.inputs() else {
             return Err(BackendError::InvalidInput);
         };
@@ -1680,11 +1774,7 @@ impl MetalBackend {
             arguments,
         )?;
         if left.copied || right.copied {
-            encoder.barrierAfterEncoderStages_beforeEncoderStages_visibilityOptions(
-                MTLStages::Dispatch,
-                MTLStages::Dispatch,
-                MTL4VisibilityOptions::Device,
-            );
+            encode_dispatch_barrier(encoder);
         }
         let final_output = self.encoder_tensor(output_tensor)?;
         let direct_output = classify(&final_output.layout)
@@ -1721,11 +1811,7 @@ impl MetalBackend {
             self.encode_matmul_kernel(encoder, table, &left, &right, &output, bindings, arguments)?;
         temporaries.push(parameter_buffer);
         if copy_output {
-            encoder.barrierAfterEncoderStages_beforeEncoderStages_visibilityOptions(
-                MTLStages::Dispatch,
-                MTLStages::Dispatch,
-                MTL4VisibilityOptions::Device,
-            );
+            encode_dispatch_barrier(encoder);
             temporaries.extend(self.encode_copy_tensors(
                 encoder,
                 table,
@@ -1779,7 +1865,7 @@ impl MetalBackend {
         bindings: &mut ArgumentBindings,
         arguments: &mut ArgumentWriter,
     ) -> Result<Vec<BufferBinding>, BackendError> {
-        use objc2_metal::{MTL4ComputeCommandEncoder, MTLSize};
+        use objc2_metal::MTLSize;
 
         let [query_tensor, key_tensor, value_tensor] = dispatch.inputs() else {
             return Err(BackendError::InvalidInput);
@@ -1814,13 +1900,14 @@ impl MetalBackend {
                 .lock()
                 .map_err(|_| BackendError::ExecutionFailed)?
                 .get(vector_kernel("mlx_sdpa_vector", width)?, &constants)?;
-            encoder.setComputePipelineState(&pipeline);
+            set_pipeline(encoder, &pipeline);
             for (index, tensor) in [&query, &key, &value, &output].into_iter().enumerate() {
                 bindings.bind(table, index, &tensor.buffer);
             }
             bindings.bind(table, 4, &params);
-            encoder.setArgumentTable(Some(table));
-            encoder.dispatchThreadgroups_threadsPerThreadgroup(
+            set_argument_table(encoder, table);
+            dispatch_threadgroups(
+                encoder,
                 MTLSize {
                     width: usize::try_from(query_heads).map_err(|_| BackendError::InvalidInput)?,
                     height: usize::try_from(query_length)
@@ -1847,7 +1934,7 @@ impl MetalBackend {
             .lock()
             .map_err(|_| BackendError::ExecutionFailed)?
             .get(vector_kernel("mlx_sdpa_vector_2pass_1", width)?, &constants)?;
-        encoder.setComputePipelineState(&first);
+        set_pipeline(encoder, &first);
         for (index, tensor) in [&query, &key, &value, &intermediate, &sums, &maxs]
             .into_iter()
             .enumerate()
@@ -1855,8 +1942,9 @@ impl MetalBackend {
             bindings.bind(table, index, &tensor.buffer);
         }
         bindings.bind(table, 6, &params);
-        encoder.setArgumentTable(Some(table));
-        encoder.dispatchThreadgroups_threadsPerThreadgroup(
+        set_argument_table(encoder, table);
+        dispatch_threadgroups(
+            encoder,
             MTLSize {
                 width: usize::try_from(kv_heads).map_err(|_| BackendError::InvalidInput)?,
                 height: 1,
@@ -1880,7 +1968,7 @@ impl MetalBackend {
             .lock()
             .map_err(|_| BackendError::ExecutionFailed)?
             .get(vector_kernel("mlx_sdpa_vector_2pass_2", width)?, &constants)?;
-        encoder.setComputePipelineState(&second);
+        set_pipeline(encoder, &second);
         for (index, tensor) in [&intermediate, &sums, &maxs, &output]
             .into_iter()
             .enumerate()
@@ -1888,8 +1976,9 @@ impl MetalBackend {
             bindings.bind(table, index, &tensor.buffer);
         }
         bindings.bind(table, 4, &params);
-        encoder.setArgumentTable(Some(table));
-        encoder.dispatchThreadgroups_threadsPerThreadgroup(
+        set_argument_table(encoder, table);
+        dispatch_threadgroups(
+            encoder,
             MTLSize {
                 width: usize::try_from(query_heads).map_err(|_| BackendError::InvalidInput)?,
                 height: usize::try_from(query_length).map_err(|_| BackendError::InvalidInput)?,
@@ -1958,7 +2047,7 @@ impl MetalBackend {
         bindings: &mut ArgumentBindings,
         arguments: &mut ArgumentWriter,
     ) -> Result<Vec<BufferBinding>, BackendError> {
-        use objc2_metal::{MTL4ComputeCommandEncoder, MTLSize};
+        use objc2_metal::MTLSize;
 
         let [query_tensor, key_tensor, value_tensor] = dispatch.inputs() else {
             return Err(BackendError::InvalidInput);
@@ -1988,13 +2077,14 @@ impl MetalBackend {
             .lock()
             .map_err(|_| BackendError::ExecutionFailed)?
             .get(steel_attention_kernel(width)?, &constants)?;
-        encoder.setComputePipelineState(&pipeline);
+        set_pipeline(encoder, &pipeline);
         for (index, tensor) in [&query, &key, &value, &output].into_iter().enumerate() {
             bindings.bind(table, index, &tensor.buffer);
         }
         bindings.bind(table, 4, &params);
-        encoder.setArgumentTable(Some(table));
-        encoder.dispatchThreadgroups_threadsPerThreadgroup(
+        set_argument_table(encoder, table);
+        dispatch_threadgroups(
+            encoder,
             MTLSize {
                 width: usize::try_from(query_length.div_ceil(block_query))
                     .map_err(|_| BackendError::InvalidInput)?,
@@ -2288,7 +2378,7 @@ impl MetalBackend {
         bindings: &mut ArgumentBindings,
         arguments: &mut ArgumentWriter,
     ) -> Result<BufferBinding, BackendError> {
-        use objc2_metal::{MTL4ComputeCommandEncoder, MTLSize};
+        use objc2_metal::MTLSize;
 
         let [_, query_length, key_length] = shape3(&scores.layout)?;
         let pipeline = self
@@ -2310,14 +2400,15 @@ impl MetalBackend {
             params.extend_from_slice(&value.to_ne_bytes());
         }
         let params = arguments.write(&params)?;
-        encoder.setComputePipelineState(&pipeline);
+        set_pipeline(encoder, &pipeline);
         bindings.bind(table, 0, &scores.buffer);
         bindings.bind(table, 1, &params);
-        encoder.setArgumentTable(Some(table));
+        set_argument_table(encoder, table);
         let count = usize::try_from(scores.layout.element_count())
             .map_err(|_| BackendError::InvalidInput)?;
         let width = pipeline.maxTotalThreadsPerThreadgroup().clamp(1, 256);
-        encoder.dispatchThreadgroups_threadsPerThreadgroup(
+        dispatch_threadgroups(
+            encoder,
             MTLSize {
                 width: count.div_ceil(width),
                 height: 1,
@@ -2343,7 +2434,7 @@ impl MetalBackend {
         bindings: &mut ArgumentBindings,
         arguments: &mut ArgumentWriter,
     ) -> Result<BufferBinding, BackendError> {
-        use objc2_metal::{MTL4ComputeCommandEncoder, MTLSize};
+        use objc2_metal::MTLSize;
 
         let shape = left.tensor.layout.shape();
         let rank = shape.len();
@@ -2395,13 +2486,14 @@ impl MetalBackend {
         };
         let launch = self.matmul_launch(shape)?;
         log_matmul_route(left, right, output, &launch, shape);
-        encoder.setComputePipelineState(&launch.pipeline);
+        set_pipeline(encoder, &launch.pipeline);
         bindings.bind(table, 0, &left.tensor.buffer);
         bindings.bind(table, 1, &right.tensor.buffer);
         bindings.bind(table, 2, &output.tensor.buffer);
         bindings.bind(table, 3, &parameter_buffer);
-        encoder.setArgumentTable(Some(table));
-        encoder.dispatchThreadgroups_threadsPerThreadgroup(
+        set_argument_table(encoder, table);
+        dispatch_threadgroups(
+            encoder,
             MTLSize {
                 width: usize::try_from(columns.div_ceil(launch.block_columns))
                     .map_err(|_| BackendError::InvalidInput)?,
@@ -2542,7 +2634,7 @@ impl MetalBackend {
         bindings: &mut ArgumentBindings,
         arguments: &mut ArgumentWriter,
     ) -> Result<Vec<BufferBinding>, BackendError> {
-        use objc2_metal::{MTL4ComputeCommandEncoder, MTLSize};
+        use objc2_metal::MTLSize;
 
         let kernel = if input.layout.is_contiguous() && output.layout.is_contiguous() {
             "copy_contiguous"
@@ -2560,7 +2652,7 @@ impl MetalBackend {
                     (2, dtype_code(output.layout.dtype())),
                 ],
             )?;
-        encoder.setComputePipelineState(&pipeline);
+        set_pipeline(encoder, &pipeline);
         let layouts = vec![
             Self::layout_buffer(&input.layout, arguments)?,
             Self::layout_buffer(&output.layout, arguments)?,
@@ -2569,11 +2661,12 @@ impl MetalBackend {
         bindings.bind(table, 1, &output.buffer);
         bindings.bind(table, 2, &layouts[0]);
         bindings.bind(table, 3, &layouts[1]);
-        encoder.setArgumentTable(Some(table));
+        set_argument_table(encoder, table);
         let count = usize::try_from(output.layout.element_count())
             .map_err(|_| BackendError::ExecutionFailed)?;
         let width = pipeline.maxTotalThreadsPerThreadgroup().clamp(1, 256);
-        encoder.dispatchThreadgroups_threadsPerThreadgroup(
+        dispatch_threadgroups(
+            encoder,
             MTLSize {
                 width: count.div_ceil(width),
                 height: 1,
@@ -2631,8 +2724,6 @@ impl MetalBackend {
         bindings: &mut ArgumentBindings,
         arguments: &mut ArgumentWriter,
     ) -> Result<Vec<BufferBinding>, BackendError> {
-        use objc2_metal::MTL4ComputeCommandEncoder;
-
         let [input, positions] = dispatch.inputs() else {
             return Err(BackendError::InvalidInput);
         };
@@ -2650,7 +2741,7 @@ impl MetalBackend {
             .lock()
             .map_err(|_| BackendError::ExecutionFailed)?
             .get("rope", &constants)?;
-        encoder.setComputePipelineState(&pipeline);
+        set_pipeline(encoder, &pipeline);
         let mut params = [0_u8; 12];
         params[..4].copy_from_slice(&heads.to_ne_bytes());
         params[4..8].copy_from_slice(&width.to_ne_bytes());
@@ -2681,7 +2772,7 @@ impl MetalBackend {
         bindings.bind(table, 6, &temporaries[3]);
         bindings.bind(table, 7, &temporaries[4]);
         drop(buffers);
-        encoder.setArgumentTable(Some(table));
+        set_argument_table(encoder, table);
         let pair_count = output
             .layout()
             .element_count()
@@ -2689,7 +2780,8 @@ impl MetalBackend {
             .ok_or(BackendError::InvalidInput)?;
         let thread_count = usize::try_from(pair_count).map_err(|_| BackendError::InvalidInput)?;
         let group_width = pipeline.maxTotalThreadsPerThreadgroup().clamp(1, 256);
-        encoder.dispatchThreadgroups_threadsPerThreadgroup(
+        dispatch_threadgroups(
+            encoder,
             MTLSize {
                 width: thread_count.div_ceil(group_width),
                 height: 1,
@@ -2712,8 +2804,6 @@ impl MetalBackend {
         bindings: &mut ArgumentBindings,
         arguments: &mut ArgumentWriter,
     ) -> Result<EncodedEmbed, BackendError> {
-        use objc2_metal::MTL4ComputeCommandEncoder;
-
         let [embeddings, ids] = dispatch.inputs() else {
             return Err(BackendError::InvalidInput);
         };
@@ -2729,7 +2819,7 @@ impl MetalBackend {
             .lock()
             .map_err(|_| BackendError::ExecutionFailed)?
             .get("embed", &constants)?;
-        encoder.setComputePipelineState(&pipeline);
+        set_pipeline(encoder, &pipeline);
         let mut params = [0_u8; 8];
         params[..4].copy_from_slice(&vocab.to_ne_bytes());
         params[4..].copy_from_slice(&width.to_ne_bytes());
@@ -2754,11 +2844,12 @@ impl MetalBackend {
         bindings.bind(table, 6, &temporaries[3]);
         bindings.bind(table, 7, &temporaries[4]);
         drop(buffers);
-        encoder.setArgumentTable(Some(table));
+        set_argument_table(encoder, table);
         let thread_count = usize::try_from(output.layout().element_count())
             .map_err(|_| BackendError::InvalidInput)?;
         let group_width = pipeline.maxTotalThreadsPerThreadgroup().clamp(1, 256);
-        encoder.dispatchThreadgroups_threadsPerThreadgroup(
+        dispatch_threadgroups(
+            encoder,
             MTLSize {
                 width: thread_count.div_ceil(group_width),
                 height: 1,
@@ -2798,8 +2889,6 @@ impl MetalBackend {
         bindings: &mut ArgumentBindings,
         arguments: &mut ArgumentWriter,
     ) -> Result<Vec<BufferBinding>, BackendError> {
-        use objc2_metal::MTL4ComputeCommandEncoder;
-
         let width = *input
             .layout
             .shape()
@@ -2819,7 +2908,7 @@ impl MetalBackend {
             .lock()
             .map_err(|_| BackendError::ExecutionFailed)?
             .get(kernel, &constants)?;
-        encoder.setComputePipelineState(&pipeline);
+        set_pipeline(encoder, &pipeline);
         let temporaries = vec![
             Self::layout_buffer(&input.layout, arguments)?,
             Self::layout_buffer(&output.layout, arguments)?,
@@ -2830,9 +2919,9 @@ impl MetalBackend {
         bindings.bind(table, 2, &temporaries[0]);
         bindings.bind(table, 3, &temporaries[1]);
         bindings.bind(table, 4, &temporaries[2]);
-        encoder.setArgumentTable(Some(table));
+        set_argument_table(encoder, table);
         let (threadgroups, threads) = row_dispatch_geometry(&pipeline, &output.layout, width)?;
-        encoder.dispatchThreadgroups_threadsPerThreadgroup(threadgroups, threads);
+        dispatch_threadgroups(encoder, threadgroups, threads);
         Ok(temporaries)
     }
 
@@ -2845,8 +2934,6 @@ impl MetalBackend {
         bindings: &mut ArgumentBindings,
         arguments: &mut ArgumentWriter,
     ) -> Result<Vec<BufferBinding>, BackendError> {
-        use objc2_metal::MTL4ComputeCommandEncoder;
-
         let [input, weight] = dispatch.inputs() else {
             return Err(BackendError::InvalidInput);
         };
@@ -2871,7 +2958,7 @@ impl MetalBackend {
             .lock()
             .map_err(|_| BackendError::ExecutionFailed)?
             .get(kernel, &constants)?;
-        encoder.setComputePipelineState(&pipeline);
+        set_pipeline(encoder, &pipeline);
         let mut temporaries = vec![
             Self::layout_buffer(input.layout(), arguments)?,
             Self::layout_buffer(weight.layout(), arguments)?,
@@ -2891,9 +2978,9 @@ impl MetalBackend {
         }
         bindings.bind(table, 6, &temporaries[3]);
         drop(buffers);
-        encoder.setArgumentTable(Some(table));
+        set_argument_table(encoder, table);
         let (threadgroups, threads) = row_dispatch_geometry(&pipeline, output.layout(), width)?;
-        encoder.dispatchThreadgroups_threadsPerThreadgroup(threadgroups, threads);
+        dispatch_threadgroups(encoder, threadgroups, threads);
         Ok(temporaries)
     }
 
@@ -2906,7 +2993,7 @@ impl MetalBackend {
         bindings: &mut ArgumentBindings,
         arguments: &mut ArgumentWriter,
     ) -> Result<Vec<BufferBinding>, BackendError> {
-        use objc2_metal::{MTL4ComputeCommandEncoder, MTLSize};
+        use objc2_metal::MTLSize;
 
         let operands = dispatch
             .inputs()
@@ -2933,7 +3020,7 @@ impl MetalBackend {
             .lock()
             .map_err(|_| BackendError::ExecutionFailed)?
             .get(kernel, &constants)?;
-        encoder.setComputePipelineState(&pipeline);
+        set_pipeline(encoder, &pipeline);
         let layouts = operands
             .iter()
             .map(|tensor| Self::layout_buffer(tensor.layout(), arguments))
@@ -2948,11 +3035,12 @@ impl MetalBackend {
             bindings.bind(table, index + operands.len(), &layouts[index]);
         }
         drop(buffers);
-        encoder.setArgumentTable(Some(table));
+        set_argument_table(encoder, table);
         let thread_count = usize::try_from(dispatch.output().layout().element_count())
             .map_err(|_| BackendError::ExecutionFailed)?;
         let group_width = pipeline.maxTotalThreadsPerThreadgroup().clamp(1, 256);
-        encoder.dispatchThreadgroups_threadsPerThreadgroup(
+        dispatch_threadgroups(
+            encoder,
             MTLSize {
                 width: thread_count.div_ceil(group_width),
                 height: 1,
@@ -2974,8 +3062,6 @@ impl MetalBackend {
         dispatch: &Dispatch,
         state: &mut ProgramEncodingState<'_>,
     ) -> Result<Vec<BufferBinding>, BackendError> {
-        use objc2_metal::MTL4ComputeCommandEncoder;
-
         let program = dispatch.bound_program().ok_or(BackendError::InvalidInput)?;
         let prepared = dispatch
             .prepared_program()
@@ -2994,7 +3080,7 @@ impl MetalBackend {
         if pipeline.compile_fallback {
             *state.compile_fallbacks = state.compile_fallbacks.saturating_add(1);
         }
-        encoder.setComputePipelineState(&pipeline.state);
+        set_pipeline(encoder, &pipeline.state);
         let operands = program
             .inputs()
             .iter()
@@ -3017,7 +3103,7 @@ impl MetalBackend {
                 .bind(table, index + operands.len(), &layouts[index]);
         }
         drop(buffers);
-        encoder.setArgumentTable(Some(table));
+        set_argument_table(encoder, table);
         let (threadgroups, threads_per_threadgroup) = match program.program().program().kind {
             ProgramKind::Map => map_dispatch_geometry(&pipeline.state, dispatch.output().layout())?,
             ProgramKind::Row => {
@@ -3036,7 +3122,7 @@ impl MetalBackend {
                 )?
             }
         };
-        encoder.dispatchThreadgroups_threadsPerThreadgroup(threadgroups, threads_per_threadgroup);
+        dispatch_threadgroups(encoder, threadgroups, threads_per_threadgroup);
         Ok(layouts)
     }
 
@@ -3590,9 +3676,44 @@ fn head_matrix(
     })
 }
 
+fn set_pipeline(
+    encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
+    pipeline: &Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+) {
+    use objc2_metal::MTL4ComputeCommandEncoder;
+
+    record_plan_call(PlanCall::Pipeline(pipeline.clone()));
+    encoder.setComputePipelineState(pipeline);
+}
+
+fn set_argument_table(
+    encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
+    table: &ProtocolObject<dyn MTL4ArgumentTable>,
+) {
+    use objc2_metal::MTL4ComputeCommandEncoder;
+
+    record_plan_call(PlanCall::ArgumentTable);
+    encoder.setArgumentTable(Some(table));
+}
+
+fn dispatch_threadgroups(
+    encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
+    threadgroups: MTLSize,
+    threads_per_threadgroup: MTLSize,
+) {
+    use objc2_metal::MTL4ComputeCommandEncoder;
+
+    record_plan_call(PlanCall::Dispatch {
+        threadgroups,
+        threads_per_threadgroup,
+    });
+    encoder.dispatchThreadgroups_threadsPerThreadgroup(threadgroups, threads_per_threadgroup);
+}
+
 fn encode_dispatch_barrier(encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>) {
     use objc2_metal::{MTL4CommandEncoder, MTL4VisibilityOptions, MTLStages};
 
+    record_plan_call(PlanCall::Barrier);
     encoder.barrierAfterEncoderStages_beforeEncoderStages_visibilityOptions(
         MTLStages::Dispatch,
         MTLStages::Dispatch,
@@ -3931,6 +4052,37 @@ mod tests {
     fn metal_compile_error_is_reported() {
         let backend = MetalBackend::new().unwrap();
         assert!(PipelineCache::new(&backend.device, "kernel void broken(").is_err());
+    }
+
+    #[test]
+    fn plan_recorder_is_scoped_and_preserves_call_order() {
+        record_plan_call(PlanCall::ArgumentTable);
+        let recorder = PlanRecorderScope::enter(0);
+        record_plan_call(PlanCall::ArgumentTable);
+        record_plan_call(PlanCall::Dispatch {
+            threadgroups: MTLSize {
+                width: 7,
+                height: 1,
+                depth: 1,
+            },
+            threads_per_threadgroup: MTLSize {
+                width: 33,
+                height: 1,
+                depth: 1,
+            },
+        });
+        record_plan_call(PlanCall::Barrier);
+        let calls = recorder.finish();
+
+        assert!(matches!(calls.as_slice(), [
+            PlanCall::ArgumentTable,
+            PlanCall::Dispatch { threadgroups, threads_per_threadgroup },
+            PlanCall::Barrier,
+        ] if threadgroups.width == 7 && threadgroups.height == 1 && threadgroups.depth == 1
+            && threads_per_threadgroup.width == 33
+            && threads_per_threadgroup.height == 1
+            && threads_per_threadgroup.depth == 1));
+        assert!(PlanRecorderScope::enter(0).finish().is_empty());
     }
 
     #[test]
