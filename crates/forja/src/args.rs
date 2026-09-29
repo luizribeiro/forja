@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 pub(crate) const USAGE: &str = "usage:
   forja run --model-dir PATH --prompt TEXT [--max-tokens N] [--backend metal|cpu]
-  forja bench --model-dir PATH [--precision f32|bf16] [--pp N] [--tg N] [--reps N] [--json PATH] [--profile] [--no-replay]
+  forja bench --model-dir PATH [--precision f32|bf16] [--pp N] [--tg N] [--reps N] [--json PATH] [--profile] [--no-replay] [--backend-option graph-replay=tier1|tier2]
   forja verify --model-dir PATH --fixtures PATH [--backend metal|cpu] [--precision f32|bf16] [--prompts NAME,...]";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -15,6 +15,12 @@ pub(crate) enum Backend {
 pub(crate) enum Precision {
     F32,
     Bf16,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum GraphReplay {
+    Tier1,
+    Tier2,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -44,6 +50,7 @@ pub(crate) struct Bench {
     pub(crate) profile: bool,
     pub(crate) no_replay: bool,
     pub(crate) precision: Option<Precision>,
+    pub(crate) graph_replay: GraphReplay,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -73,6 +80,7 @@ fn parse_bench(mut arguments: impl Iterator<Item = String>) -> Result<Bench, Str
     let mut profile = false;
     let mut no_replay = false;
     let mut precision = None;
+    let mut graph_replay = None;
     while let Some(option) = arguments.next() {
         if option == "--profile" && !profile {
             profile = true;
@@ -92,6 +100,9 @@ fn parse_bench(mut arguments: impl Iterator<Item = String>) -> Result<Bench, Str
             "--reps" if reps.is_none() => reps = Some(parse_count(&value, "repetitions")?),
             "--json" if json.is_none() => json = Some(PathBuf::from(value)),
             "--precision" if precision.is_none() => precision = Some(parse_precision(&value)?),
+            "--backend-option" if graph_replay.is_none() => {
+                graph_replay = Some(parse_backend_option(&value)?);
+            }
             _ if option.starts_with("--") => {
                 return Err(format!("unknown or repeated option {option:?}"));
             }
@@ -107,6 +118,7 @@ fn parse_bench(mut arguments: impl Iterator<Item = String>) -> Result<Bench, Str
         profile,
         no_replay,
         precision,
+        graph_replay: graph_replay.unwrap_or(GraphReplay::Tier2),
     })
 }
 
@@ -165,6 +177,14 @@ fn parse_precision(value: &str) -> Result<Precision, String> {
         "f32" => Ok(Precision::F32),
         "bf16" => Ok(Precision::Bf16),
         _ => Err(format!("unknown precision {value:?}")),
+    }
+}
+
+fn parse_backend_option(value: &str) -> Result<GraphReplay, String> {
+    match value {
+        "graph-replay=tier1" => Ok(GraphReplay::Tier1),
+        "graph-replay=tier2" => Ok(GraphReplay::Tier2),
+        _ => Err(format!("unknown Metal backend option {value:?}")),
     }
 }
 
@@ -243,6 +263,7 @@ mod tests {
                 profile: false,
                 no_replay: false,
                 precision: None,
+                graph_replay: GraphReplay::Tier2,
             })
         );
     }
@@ -258,6 +279,8 @@ mod tests {
                 "--no-replay",
                 "--precision",
                 "bf16",
+                "--backend-option",
+                "graph-replay=tier1",
             ]
             .map(str::to_owned),
         )
@@ -268,6 +291,7 @@ mod tests {
         assert!(options.profile);
         assert!(options.no_replay);
         assert_eq!(options.precision, Some(Precision::Bf16));
+        assert_eq!(options.graph_replay, GraphReplay::Tier1);
     }
 
     #[test]

@@ -12,7 +12,7 @@ use forja_host::{EngineMetrics, EngineRunner, EngineStep, EngineStepProfile, Imp
 use golden_fixtures::sha256_file;
 
 use crate::{
-    args::{Bench, Precision},
+    args::{Bench, GraphReplay, Precision},
     benchmark_stats::{Stats, stats, synthetic_tokens},
     engine::limits,
 };
@@ -104,6 +104,7 @@ async fn run_metal(options: &Bench) -> Result<(), Box<dyn Error>> {
                 "os": format!("macOS {os}"),
                 "precision": precision,
                 "replay": !options.no_replay,
+                "graph_replay": graph_replay_name(options.graph_replay),
             },
             "prompt_processing": summary_json(pp),
             "token_generation": summary_json(tg),
@@ -125,6 +126,7 @@ async fn run_metal(options: &Bench) -> Result<(), Box<dyn Error>> {
                 "warmups": WARMUPS,
                 "repetitions": options.reps,
                 "replay": !options.no_replay,
+                "graph_replay": graph_replay_name(options.graph_replay),
             },
             "tg_context_start": TG_CONTEXT_START,
             "results": results,
@@ -151,7 +153,10 @@ async fn bench_precision(
     options: &Bench,
     component: &Path,
 ) -> Result<(Summary, Summary, String, Vec<ProfileMeasurement>), Box<dyn Error>> {
-    let backend = forja_metal::MetalBackend::new()?;
+    let backend = forja_metal::MetalBackend::with_graph_replay(match options.graph_replay {
+        GraphReplay::Tier1 => forja_metal::MetalGraphReplay::Tier1,
+        GraphReplay::Tier2 => forja_metal::MetalGraphReplay::Tier2,
+    })?;
     let device = backend.device_name();
     let mut runner = EngineRunner::new(
         component,
@@ -208,6 +213,13 @@ async fn bench_precision(
         device,
         profiles,
     ))
+}
+
+const fn graph_replay_name(strategy: GraphReplay) -> &'static str {
+    match strategy {
+        GraphReplay::Tier1 => "tier1",
+        GraphReplay::Tier2 => "tier2",
+    }
 }
 
 #[cfg(target_os = "macos")]
