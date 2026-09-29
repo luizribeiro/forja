@@ -752,6 +752,7 @@ const fn op_name(operation: Op) -> &'static str {
         Op::SiluMul => "silu_mul",
         Op::RmsNorm { .. } => "rms_norm",
         Op::Softmax => "softmax",
+        Op::Argmax => "argmax",
         Op::Rope { .. } => "rope",
         Op::Embed => "embed",
         Op::Matmul => "matmul",

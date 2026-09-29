@@ -143,6 +143,8 @@ pub enum Op {
     ///
     /// A row containing only negative infinity produces all zeros.
     Softmax,
+    /// Selects the last greatest element of each row under IEEE total order.
+    Argmax,
     /// Applies half-split rotary position embeddings.
     Rope {
         /// The positive finite frequency base.
@@ -254,6 +256,7 @@ impl Dispatch {
             Op::Add | Op::SiluMul => check_binary(inputs, output)?,
             Op::RmsNorm { eps } => check_rms_norm(inputs, output, eps)?,
             Op::Softmax => check_softmax(inputs, output)?,
+            Op::Argmax => check_argmax(inputs, output)?,
             Op::Rope { theta } => check_rope(inputs, output, theta)?,
             Op::Embed => check_embed(inputs, output)?,
             Op::Matmul => check_matmul(inputs, output)?,
@@ -726,6 +729,33 @@ fn check_softmax(inputs: &[&Tensor], output: &Tensor) -> Result<(), OpError> {
     check_shape(output, inputs[0], Operand::Output)
 }
 
+fn check_argmax(inputs: &[&Tensor], output: &Tensor) -> Result<(), OpError> {
+    if inputs.len() != 1 {
+        return Err(OpError::Arity {
+            expected: 1,
+            actual: inputs.len(),
+        });
+    }
+    check_float(inputs[0], Operand::Input(0))?;
+    if output.layout.dtype() != DType::U32 {
+        return Err(OpError::DType {
+            operand: Operand::Output,
+            dtype: output.layout.dtype(),
+        });
+    }
+    let Some((_, rows)) = inputs[0].layout.shape().split_last() else {
+        return Err(OpError::Shape {
+            operand: Operand::Input(0),
+        });
+    };
+    if output.layout.shape() != rows {
+        return Err(OpError::Shape {
+            operand: Operand::Output,
+        });
+    }
+    Ok(())
+}
+
 fn check_rope(inputs: &[&Tensor], output: &Tensor, theta: f32) -> Result<(), OpError> {
     if inputs.len() != 2 {
         return Err(OpError::Arity {
@@ -1187,6 +1217,49 @@ mod tests {
             CommandList::new().dispatch(Op::Softmax, &[&input], &scalar),
             Err(OpError::Shape {
                 operand: Operand::Output
+            })
+        );
+    }
+
+    #[test]
+    fn argmax_rejects_invalid_signatures() {
+        let input = tensor(1, DType::F16, &[3, 7], &[7, 1]);
+        let integer = tensor(2, DType::U32, &[3, 7], &[7, 1]);
+        let output = tensor(3, DType::U32, &[3], &[1]);
+        let float_output = tensor(4, DType::F32, &[3], &[1]);
+        let wrong_output = tensor(5, DType::U32, &[1], &[1]);
+        let scalar = tensor(6, DType::F32, &[], &[]);
+        assert_eq!(
+            CommandList::new().dispatch(Op::Argmax, &[], &output),
+            Err(OpError::Arity {
+                expected: 1,
+                actual: 0
+            })
+        );
+        assert_eq!(
+            CommandList::new().dispatch(Op::Argmax, &[&integer], &output),
+            Err(OpError::DType {
+                operand: Operand::Input(0),
+                dtype: DType::U32
+            })
+        );
+        assert_eq!(
+            CommandList::new().dispatch(Op::Argmax, &[&input], &float_output),
+            Err(OpError::DType {
+                operand: Operand::Output,
+                dtype: DType::F32
+            })
+        );
+        assert_eq!(
+            CommandList::new().dispatch(Op::Argmax, &[&input], &wrong_output),
+            Err(OpError::Shape {
+                operand: Operand::Output
+            })
+        );
+        assert_eq!(
+            CommandList::new().dispatch(Op::Argmax, &[&scalar], &wrong_output),
+            Err(OpError::Shape {
+                operand: Operand::Input(0)
             })
         );
     }

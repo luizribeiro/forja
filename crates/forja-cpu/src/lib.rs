@@ -290,6 +290,39 @@ impl CpuBackend {
         self.write_output(output, &probabilities)
     }
 
+    fn execute_argmax(&self, inputs: &[Tensor], output: &Tensor) -> Result<(), BackendError> {
+        let values = decode(&self.read(&inputs[0])?, inputs[0].layout().dtype())
+            .ok_or(BackendError::ExecutionFailed)?;
+        let width = execution_usize(
+            inputs[0]
+                .layout()
+                .shape()
+                .last()
+                .copied()
+                .ok_or(BackendError::ExecutionFailed)?,
+        )?;
+        let indices = values
+            .chunks_exact(width)
+            .map(|row| {
+                row.iter()
+                    .enumerate()
+                    .max_by(|(_, left), (_, right)| left.total_cmp(right))
+                    .and_then(|(index, _)| u32::try_from(index).ok())
+                    .ok_or(BackendError::ExecutionFailed)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let bytes = indices
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect::<Vec<_>>();
+        let mut buffers = self
+            .buffers
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?;
+        let target = buffers.get_mut(output)?.bytes_mut()?;
+        scatter(target, output.layout(), &bytes)
+    }
+
     #[allow(clippy::cast_precision_loss)]
     fn execute_rope(
         &self,
@@ -561,6 +594,7 @@ impl Backend for CpuBackend {
                     self.execute_rms_norm(dispatch.inputs(), dispatch.output(), eps)
                 }
                 Op::Softmax => self.execute_softmax(dispatch.inputs(), dispatch.output()),
+                Op::Argmax => self.execute_argmax(dispatch.inputs(), dispatch.output()),
                 Op::Rope { theta } => {
                     self.execute_rope(dispatch.inputs(), dispatch.output(), theta)
                 }

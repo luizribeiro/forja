@@ -1925,7 +1925,7 @@ impl MetalBackend {
                 };
                 self.encode_elementwise(encoder, table, dispatch, kernel, bindings, arguments)?
             }
-            Op::Program(_) => return Err(BackendError::InvalidInput),
+            Op::Argmax | Op::Program(_) => return Err(BackendError::InvalidInput),
         };
         temporaries.extend(buffers);
         Ok(())
@@ -3387,6 +3387,7 @@ impl MetalBackend {
                 }
             }
             Op::Softmax => Self::size_softmax_arguments(arguments)?,
+            Op::Argmax => return Err(BackendError::InvalidInput),
             Op::Rope { .. } => {
                 for len in [112, 112, 112, 12] {
                     arguments.write(len)?;
@@ -3768,6 +3769,7 @@ fn supported_dispatch(dispatch: &Dispatch) -> bool {
         | Op::Embed
         | Op::Matmul
         | Op::Sdpa { .. } => true,
+        Op::Argmax => false,
     }
 }
 
