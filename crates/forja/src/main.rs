@@ -22,7 +22,9 @@ fn main() -> ExitCode {
 fn run() -> Result<(), Box<dyn Error>> {
     let command = args::parse(std::env::args().skip(1))
         .map_err(|error| format!("{error}\n{}", args::USAGE))?;
-    let runtime = tokio::runtime::Builder::new_current_thread().build()?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()?;
     match command {
         args::Command::Bench(options) => runtime.block_on(benchmark::run(&options)),
         args::Command::Run(options) => runtime.block_on(generate::run(&options)),

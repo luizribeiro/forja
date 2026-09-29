@@ -1,11 +1,4 @@
-use std::{
-    collections::VecDeque,
-    error::Error,
-    fs,
-    io::Write,
-    path::Path,
-    time::{Duration, Instant},
-};
+use std::{collections::VecDeque, error::Error, fs, io::Write, path::Path};
 
 use forja_core::Backend;
 use forja_host::{EngineDecode, EngineRunner};
@@ -121,7 +114,7 @@ where
                 let expected = replay_base
                     .checked_add(u64::try_from(consumed - 1)?)
                     .ok_or("submission count overflowed")?;
-                wait_for_submission(&runner, expected).await?;
+                runner.wait_for_submissions(expected).await?;
             }
             generated.push(token);
             if eos.contains(&token) {
@@ -146,23 +139,6 @@ where
         };
     }
     Ok(generated)
-}
-
-async fn wait_for_submission<B>(
-    runner: &EngineRunner<B>,
-    expected: u64,
-) -> Result<(), Box<dyn Error>>
-where
-    B: Backend + Send + Sync + 'static,
-{
-    let started = Instant::now();
-    while runner.metrics().submissions < expected {
-        if started.elapsed() >= Duration::from_secs(60) {
-            return Err("replay completion accounting timed out".into());
-        }
-        tokio::task::yield_now().await;
-    }
-    Ok(())
 }
 
 fn validate_generation_request(
@@ -293,6 +269,7 @@ mod tests {
             .map(|&token| u32::try_from(token))
             .collect::<Result<Vec<_>, _>>()?;
         let actual = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
             .build()?
             .block_on(generate(
                 forja_metal::MetalBackend::new()?,

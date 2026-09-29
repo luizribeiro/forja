@@ -717,6 +717,27 @@ where
         self.store.data().engine_metrics()
     }
 
+    /// Waits until the requested number of backend submissions has completed successfully.
+    ///
+    /// # Errors
+    ///
+    /// Returns a timeout if completion accounting does not advance within the backend deadline.
+    pub async fn wait_for_submissions(&self, expected: u64) -> Result<(), BackendError> {
+        let timeout = self.store.data().limits.submission_timeout;
+        let notify = Arc::clone(&self.store.data().submission_notify);
+        let started = Instant::now();
+        loop {
+            let notified = notify.notified();
+            if self.metrics().submissions >= expected {
+                return Ok(());
+            }
+            let remaining = timeout.saturating_sub(started.elapsed());
+            if remaining.is_zero() || tokio::time::timeout(remaining, notified).await.is_err() {
+                return Err(BackendError::Timeout);
+            }
+        }
+    }
+
     /// Enables or disables detailed profiling for subsequent steps.
     pub fn set_profiling(&mut self, enabled: bool) {
         self.profiling = enabled;
@@ -1149,6 +1170,7 @@ pub struct Host<B: Backend> {
     completed_submissions: Arc<AtomicU64>,
     timed_submissions: Arc<AtomicU64>,
     completed_gpu_time_ns: Arc<AtomicU64>,
+    submission_notify: Arc<tokio::sync::Notify>,
     taints: Arc<BufferTaints>,
     active_profile: Option<Arc<Mutex<EngineStepProfile>>>,
     epoch_registration: Option<Arc<()>>,
@@ -1181,6 +1203,7 @@ impl<B: Backend> Host<B> {
             completed_submissions: Arc::new(AtomicU64::new(0)),
             timed_submissions: Arc::new(AtomicU64::new(0)),
             completed_gpu_time_ns: Arc::new(AtomicU64::new(0)),
+            submission_notify: Arc::new(tokio::sync::Notify::new()),
             taints: Arc::new(BufferTaints::default()),
             active_profile: None,
             epoch_registration: None,
@@ -1888,6 +1911,7 @@ impl<B: Backend> Host<B> {
             completed_submissions: Arc::clone(&self.completed_submissions),
             timed_submissions: Arc::clone(&self.timed_submissions),
             completed_gpu_time_ns: Arc::clone(&self.completed_gpu_time_ns),
+            submission_notify: Arc::clone(&self.submission_notify),
             taints: Arc::clone(&self.taints),
             profile: self.active_profile.clone(),
         })
@@ -1919,6 +1943,7 @@ impl<B: Backend> Host<B> {
             completed_submissions: Arc::clone(&self.completed_submissions),
             timed_submissions: Arc::clone(&self.timed_submissions),
             completed_gpu_time_ns: Arc::clone(&self.completed_gpu_time_ns),
+            submission_notify: Arc::clone(&self.submission_notify),
             taints: Arc::clone(&self.taints),
             profile: self.active_profile.clone(),
         })
@@ -2124,6 +2149,7 @@ struct SubmitRequest<B: Backend> {
     completed_submissions: Arc<AtomicU64>,
     timed_submissions: Arc<AtomicU64>,
     completed_gpu_time_ns: Arc<AtomicU64>,
+    submission_notify: Arc<tokio::sync::Notify>,
     taints: Arc<BufferTaints>,
     profile: Option<Arc<Mutex<EngineStepProfile>>>,
 }
@@ -2470,6 +2496,7 @@ where
                 completed_submissions,
                 timed_submissions,
                 completed_gpu_time_ns,
+                submission_notify,
                 taints,
                 profile,
             } = self;
@@ -2539,11 +2566,12 @@ where
             };
             let result = taint.finish(result, true);
             if let Ok(gpu_time) = result {
-                saturating_increment(&completed_submissions);
                 if let Some(gpu_time) = gpu_time {
                     saturating_increment(&timed_submissions);
                     saturating_add(&completed_gpu_time_ns, gpu_time);
                 }
+                saturating_increment(&completed_submissions);
+                submission_notify.notify_waiters();
             }
             drop(flight);
             result

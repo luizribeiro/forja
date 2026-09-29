@@ -303,26 +303,26 @@ async fn measure_decode(
         let submission_before = runner.metrics().submissions;
         token = select_next(runner, token, position, host_argmax).await?;
         if !timed {
-            wait_for_submissions(
-                runner,
-                submission_before
-                    .checked_add(1)
-                    .ok_or("submission count overflowed")?,
-            )
-            .await?;
+            runner
+                .wait_for_submissions(
+                    submission_before
+                        .checked_add(1)
+                        .ok_or("submission count overflowed")?,
+                )
+                .await?;
             before = Some(runner.metrics());
             started = Some(Instant::now());
         }
     }
     let before = before.ok_or("decode timing did not start")?;
-    wait_for_submissions(
-        runner,
-        before
-            .submissions
-            .checked_add(u64::try_from(steps)?)
-            .ok_or("submission count overflowed")?,
-    )
-    .await?;
+    runner
+        .wait_for_submissions(
+            before
+                .submissions
+                .checked_add(u64::try_from(steps)?)
+                .ok_or("submission count overflowed")?,
+        )
+        .await?;
     sample(
         before,
         runner.metrics(),
@@ -340,13 +340,13 @@ async fn measure_pipelined_decode(
     let context_start = u32::try_from(prompt.len())?;
     let warmup_before = runner.metrics().submissions;
     select_next(runner, token, context_start, false).await?;
-    wait_for_submissions(
-        runner,
-        warmup_before
-            .checked_add(1)
-            .ok_or("submission count overflowed")?,
-    )
-    .await?;
+    runner
+        .wait_for_submissions(
+            warmup_before
+                .checked_add(1)
+                .ok_or("submission count overflowed")?,
+        )
+        .await?;
     let before = runner.metrics();
     let started = Instant::now();
     let mut position = context_start
@@ -377,48 +377,32 @@ async fn measure_pipelined_decode(
         consumed = consumed
             .checked_add(1)
             .ok_or("submission count overflowed")?;
-        wait_for_submissions(
-            runner,
-            before
-                .submissions
-                .checked_add(consumed)
-                .ok_or("submission count overflowed")?,
-        )
-        .await?;
+        runner
+            .wait_for_submissions(
+                before
+                    .submissions
+                    .checked_add(consumed)
+                    .ok_or("submission count overflowed")?,
+            )
+            .await?;
     }
     let expected = before
         .submissions
         .checked_add(u64::try_from(steps)?)
         .ok_or("submission count overflowed")?;
-    wait_for_submissions(runner, expected).await?;
+    runner.wait_for_submissions(expected).await?;
     sample(before, runner.metrics(), started.elapsed())
 }
 
 #[cfg(target_os = "macos")]
-async fn wait_for_submissions(
-    runner: &EngineRunner<forja_metal::MetalBackend>,
-    expected: u64,
-) -> Result<(), Box<dyn Error>> {
-    let started = Instant::now();
-    while {
-        let metrics = runner.metrics();
-        metrics.submissions < expected
-            || metrics.timed_submissions < expected
-            || metrics.submissions != metrics.timed_submissions
-    } {
-        if started.elapsed() >= Duration::from_secs(60) {
-            return Err("replay completion accounting timed out".into());
-        }
-        tokio::task::yield_now().await;
-    }
-    Ok(())
-}
-
 #[cfg(target_os = "macos")]
 async fn settle_submission_metrics(
     runner: &EngineRunner<forja_metal::MetalBackend>,
 ) -> Result<(), Box<dyn Error>> {
-    wait_for_submissions(runner, runner.metrics().submissions).await
+    runner
+        .wait_for_submissions(runner.metrics().submissions)
+        .await?;
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -495,7 +479,7 @@ async fn measure_pipelined_profile_step(
         .submissions
         .checked_add(2)
         .ok_or("submission count overflowed")?;
-    wait_for_submissions(runner, expected).await?;
+    runner.wait_for_submissions(expected).await?;
     let sample = sample(before, runner.metrics(), started.elapsed())?;
     Ok(Sample {
         wall_seconds: sample.wall_seconds / 2.0,
@@ -529,14 +513,14 @@ async fn measure_decode_step(
     let before = runner.metrics();
     let started = Instant::now();
     select_next(runner, token, u32::try_from(context_start)?, host_argmax).await?;
-    wait_for_submissions(
-        runner,
-        before
-            .submissions
-            .checked_add(1)
-            .ok_or("submission count overflowed")?,
-    )
-    .await?;
+    runner
+        .wait_for_submissions(
+            before
+                .submissions
+                .checked_add(1)
+                .ok_or("submission count overflowed")?,
+        )
+        .await?;
     sample(before, runner.metrics(), started.elapsed())
 }
 

@@ -309,13 +309,7 @@ where
             let expected = replay_base
                 .checked_add(consumed)
                 .ok_or("submission count overflowed")?;
-            let started = std::time::Instant::now();
-            while runner.metrics().submissions < expected {
-                if started.elapsed() >= Duration::from_secs(60) {
-                    return Err("replay completion accounting timed out".into());
-                }
-                tokio::task::yield_now().await;
-            }
+            runner.wait_for_submissions(expected).await?;
             if tokens.last() == eos.as_ref() {
                 if outputs.is_empty() {
                     return Err("EOS did not leave a speculative replay queued".into());
