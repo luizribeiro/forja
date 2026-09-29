@@ -57,12 +57,16 @@ struct VerifyArgs {
     graph_replay: Option<GraphReplay>,
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub(crate) struct Run {
     pub(crate) engine: PathBuf,
     pub(crate) model_dir: PathBuf,
     pub(crate) prompt: String,
     pub(crate) max_tokens: usize,
+    pub(crate) temperature: f32,
+    pub(crate) top_k: u32,
+    pub(crate) top_p: f32,
+    pub(crate) seed: Option<u64>,
     pub(crate) backend: Backend,
     pub(crate) graph_replay: GraphReplay,
     pub(crate) limits: Limits,
@@ -82,6 +86,18 @@ struct RunArgs {
     /// Maximum number of tokens to generate.
     #[arg(long)]
     max_tokens: Option<u32>,
+    /// Logit temperature, where zero selects greedily.
+    #[arg(long)]
+    temperature: Option<f32>,
+    /// Number of greatest logits retained, where zero disables top-k.
+    #[arg(long)]
+    top_k: Option<u32>,
+    /// Cumulative probability retained after top-k.
+    #[arg(long)]
+    top_p: Option<f32>,
+    /// Reproducible sampling seed.
+    #[arg(long)]
+    seed: Option<u64>,
     /// Compute backend.
     #[arg(long, value_enum)]
     backend: Option<Backend>,
@@ -441,6 +457,22 @@ const SUGAR: &[Sugar] = &[
         key: "run.max_tokens",
     },
     Sugar {
+        flag: "--temperature",
+        key: "run.temperature",
+    },
+    Sugar {
+        flag: "--top-k",
+        key: "run.top_k",
+    },
+    Sugar {
+        flag: "--top-p",
+        key: "run.top_p",
+    },
+    Sugar {
+        flag: "--seed",
+        key: "run.seed",
+    },
+    Sugar {
         flag: "--prompts",
         key: "verify.prompts",
     },
@@ -496,6 +528,14 @@ impl ParsedCommand {
                         .max_tokens
                         .map(|value| ("--max-tokens", value.to_string())),
                 );
+                values.extend(
+                    options
+                        .temperature
+                        .map(|value| ("--temperature", value.to_string())),
+                );
+                values.extend(options.top_k.map(|value| ("--top-k", value.to_string())));
+                values.extend(options.top_p.map(|value| ("--top-p", value.to_string())));
+                values.extend(options.seed.map(|value| ("--seed", value.to_string())));
                 values.extend(backend_sugar(options.backend));
                 values.extend(graph_replay_sugar(options.graph_replay));
             }
@@ -788,11 +828,27 @@ impl RunArgs {
         let max_tokens = usize::try_from(config.run.max_tokens).map_err(|error| {
             Cli::command().error(clap::error::ErrorKind::ValueValidation, error.to_string())
         })?;
+        if !config.run.temperature.is_finite() || config.run.temperature < 0.0 {
+            return Err(Cli::command().error(
+                clap::error::ErrorKind::ValueValidation,
+                "run.temperature must be finite and nonnegative",
+            ));
+        }
+        if !(config.run.top_p.is_finite() && 0.0 < config.run.top_p && config.run.top_p <= 1.0) {
+            return Err(Cli::command().error(
+                clap::error::ErrorKind::ValueValidation,
+                "run.top_p must be finite and in (0, 1]",
+            ));
+        }
         Ok(Run {
             engine: self.engine,
             model_dir: self.model_dir,
             prompt: self.prompt,
             max_tokens,
+            temperature: config.run.temperature,
+            top_k: config.run.top_k,
+            top_p: config.run.top_p,
+            seed: config.run.seed,
             backend: config.backend.kind.into(),
             graph_replay: config.backend.metal.resolve().graph_replay,
             limits,
@@ -1206,6 +1262,14 @@ selection = ["host-argmax"]
                 "Hello",
                 "--max-tokens",
                 "7",
+                "--temperature",
+                "0.7",
+                "--top-k",
+                "40",
+                "--top-p",
+                "0.9",
+                "--seed",
+                "42",
                 "--backend",
                 "cpu",
             ]
@@ -1219,6 +1283,10 @@ selection = ["host-argmax"]
                 model_dir: PathBuf::from("/model"),
                 prompt: "Hello".to_owned(),
                 max_tokens: 7,
+                temperature: 0.7,
+                top_k: 40,
+                top_p: 0.9,
+                seed: Some(42),
                 backend: Backend::Cpu,
                 graph_replay: GraphReplay::Tier2,
                 limits: Limits::default(),
@@ -1245,7 +1313,41 @@ selection = ["host-argmax"]
             panic!("expected run command");
         };
         assert_eq!(options.max_tokens, 128);
+        assert_eq!(options.temperature.to_bits(), 0.0_f32.to_bits());
+        assert_eq!(options.top_k, 0);
+        assert_eq!(options.top_p.to_bits(), 1.0_f32.to_bits());
+        assert_eq!(options.seed, None);
         assert_eq!(options.backend, Backend::Metal);
+    }
+
+    #[test]
+    fn rejects_invalid_sampling_values() {
+        for setting in [
+            "run.temperature=-1.0",
+            "run.temperature=nan",
+            "run.top_p=0.0",
+            "run.top_p=1.1",
+            "run.top_p=nan",
+        ] {
+            assert!(
+                parse(
+                    [
+                        "run",
+                        "--engine",
+                        "/engine.wasm",
+                        "--model-dir",
+                        "/model",
+                        "--prompt",
+                        "Hello",
+                        "--set",
+                        setting,
+                    ]
+                    .map(str::to_owned),
+                )
+                .is_err(),
+                "accepted {setting}"
+            );
+        }
     }
 
     #[test]

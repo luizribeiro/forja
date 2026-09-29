@@ -187,16 +187,31 @@ pub struct AutoNote {
 }
 
 /// Text-generation settings.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Run {
     /// Maximum number of tokens to generate.
     pub max_tokens: u32,
+    /// Sampling temperature, where zero selects greedily.
+    pub temperature: f32,
+    /// Number of greatest logits retained, where zero disables top-k.
+    pub top_k: u32,
+    /// Cumulative probability retained after top-k.
+    pub top_p: f32,
+    /// Reproducible sampling seed, or automatic entropy when absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seed: Option<u64>,
 }
 
 impl Default for Run {
     fn default() -> Self {
-        Self { max_tokens: 128 }
+        Self {
+            max_tokens: 128,
+            temperature: 0.0,
+            top_k: 0,
+            top_p: 1.0,
+            seed: None,
+        }
     }
 }
 
@@ -525,6 +540,10 @@ selection = ["host-argmax"]
         let config: DevConfig = toml::from_str(
             r#"[run]
 max_tokens = 0
+temperature = 0.7
+top_k = 40
+top_p = 0.9
+seed = 42
 [verify]
 prompts = ["short", "code"]
 fixtures = "golden/qwen3-0.6b"
@@ -532,6 +551,10 @@ fixtures = "golden/qwen3-0.6b"
         )
         .unwrap();
         assert_eq!(config.run.max_tokens, 0);
+        assert_eq!(config.run.temperature.to_bits(), 0.7_f32.to_bits());
+        assert_eq!(config.run.top_k, 40);
+        assert_eq!(config.run.top_p.to_bits(), 0.9_f32.to_bits());
+        assert_eq!(config.run.seed, Some(42));
         assert_eq!(
             config
                 .verify

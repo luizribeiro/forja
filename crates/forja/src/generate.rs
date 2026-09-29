@@ -1,4 +1,10 @@
-use std::{collections::VecDeque, error::Error, fs, io::Write, path::Path};
+use std::{
+    collections::VecDeque,
+    error::Error,
+    fs,
+    io::{Read, Write},
+    path::Path,
+};
 
 use forja_core::Backend;
 use forja_host::{EngineDecode, EngineRunner, SamplingParams};
@@ -80,7 +86,7 @@ where
     if options.max_tokens == 0 {
         return Ok(Vec::new());
     }
-    let sampling = SamplingParams::default();
+    let sampling = sampling_params(options)?;
     let prompt_len = u32::try_from(prompt.len())?;
     let first = runner
         .enqueue_decode(EngineDecode {
@@ -147,6 +153,26 @@ where
         };
     }
     Ok(generated)
+}
+
+fn sampling_params(options: &Run) -> Result<SamplingParams, Box<dyn Error>> {
+    let seed = match (options.seed, options.temperature > 0.0) {
+        (Some(seed), _) => seed,
+        (None, true) => {
+            let mut bytes = [0_u8; 8];
+            fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+            let seed = u64::from_ne_bytes(bytes);
+            eprintln!("sampling seed: {seed}");
+            seed
+        }
+        (None, false) => 0,
+    };
+    Ok(SamplingParams {
+        temperature: options.temperature,
+        top_k: options.top_k,
+        top_p: options.top_p,
+        seed,
+    })
 }
 
 fn validate_generation_request(
@@ -268,6 +294,10 @@ mod tests {
             model_dir: root.join("Qwen3-0.6B"),
             prompt: "A quiet forge glows beneath the mountain.".to_owned(),
             max_tokens: 32,
+            temperature: 0.0,
+            top_k: 0,
+            top_p: 1.0,
+            seed: None,
             backend: BackendArg::Metal,
             graph_replay: forja_config::GraphReplay::Tier2,
             limits: forja_config::Limits::default(),
