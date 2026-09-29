@@ -2,11 +2,21 @@
 
 #![forbid(unsafe_code)]
 
+mod layer;
 mod units;
 
+pub use layer::{ConfigError, KeyPath, Layer, Layered, Origin, Schema, layer};
 pub use units::{ByteSize, Duration, Unbounded};
 
 use serde::{Deserialize, Serialize};
+
+/// Configuration used by development commands.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DevConfig {
+    /// Host resource limits.
+    pub limits: Limits,
+}
 
 /// Resource limits applied by the host to one guest instance.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -114,5 +124,33 @@ submission_timeout = "250ms"
         assert_eq!(limits.tensor_rank, 4);
         assert_eq!(limits.dispatches_per_list, Unbounded::Unlimited);
         assert_eq!(limits.submission_timeout, Duration::from_millis(250));
+    }
+
+    #[test]
+    fn enum_leaves_serialize_as_scalars() {
+        let value = toml::Value::try_from(DevConfig::default()).unwrap();
+        let limits = value.get("limits").unwrap();
+        for key in [
+            "dispatches_per_list",
+            "work_per_dispatch",
+            "gpu_time_budget",
+        ] {
+            assert!(!limits.get(key).unwrap().is_table(), "{key}");
+        }
+    }
+
+    #[test]
+    fn every_section_rejects_unknown_keys() {
+        let toml::Value::Table(defaults) = toml::Value::try_from(DevConfig::default()).unwrap()
+        else {
+            panic!("configuration root must be a table");
+        };
+        for section in defaults.keys() {
+            let source = format!("[{section}]\nunknown = true\n");
+            let table = toml::from_str(&source).unwrap();
+            let error =
+                layer::<DevConfig>(vec![Layer::new(Origin::Flag("test"), table)]).unwrap_err();
+            assert!(error.to_string().contains("unknown field `unknown`"));
+        }
     }
 }
