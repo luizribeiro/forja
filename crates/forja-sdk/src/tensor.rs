@@ -327,6 +327,19 @@ impl<T: Element> Tensor<T> {
         self.unary::<T>(sys::Op::Softmax, self.shape.clone())
     }
 
+    /// Selects the last greatest index along the last dimension under IEEE total order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an empty or scalar shape, unsupported type, or refused dispatch.
+    pub fn argmax(&self) -> Result<Tensor<u32>> {
+        let mut shape = self.shape.clone();
+        shape
+            .pop()
+            .ok_or_else(|| Error::new("argmax requires at least one dimension"))?;
+        self.unary(sys::Op::Argmax, shape)
+    }
+
     /// Copies the tensor while converting between floating-point types.
     ///
     /// # Errors
