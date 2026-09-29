@@ -642,15 +642,40 @@ where
         &mut self,
         output: EngineDecodeOutput,
     ) -> Result<Vec<u8>, compute::Error> {
-        let result = self.read(&output.token).await;
-        let handles = [output.logits.handle, output.token.handle];
-        self.output_handles
-            .retain(|handle| !handles.contains(handle));
-        let release = self.release_handles(handles.into());
+        let result = if output.token.runner_id == self.id {
+            let resource = Resource::new_borrow(output.token.handle);
+            match self.store.data().prepare_replay_read(&resource) {
+                Ok(request) => request.run().await.map_err(guest_error),
+                Err(error) => Err(error),
+            }
+        } else {
+            Err(invalid_handle("engine tensor belongs to another runner"))
+        };
+        let release = self.release_decode_output(output);
         match (result, release) {
             (Err(error), _) | (Ok(_), Err(error)) => Err(error),
             (Ok(bytes), Ok(())) => Ok(bytes),
         }
+    }
+
+    /// Releases an unread queued decode output.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-handle or backend release failure.
+    pub fn discard_queued_decode(
+        &mut self,
+        output: EngineDecodeOutput,
+    ) -> Result<(), compute::Error> {
+        self.release_decode_output(output)
+    }
+
+    fn release_decode_output(&mut self, output: EngineDecodeOutput) -> Result<(), compute::Error> {
+        let EngineDecodeOutput { logits, token } = output;
+        let handles = [logits.handle, token.handle];
+        self.output_handles
+            .retain(|handle| !handles.contains(handle));
+        self.release_handles(handles.into())
     }
 
     /// Reads a returned tensor through the selected backend.
@@ -2033,7 +2058,17 @@ impl<B: Backend> Host<B> {
             tensor: entry.tensor.clone(),
             buffer: Arc::clone(&entry.buffer),
             profile: self.active_profile.clone(),
+            replay_output: false,
         })
+    }
+
+    fn prepare_replay_read(
+        &self,
+        resource: &Resource<TensorEntry>,
+    ) -> Result<ReadRequest<B>, compute::Error> {
+        let mut request = self.prepare_read(resource)?;
+        request.replay_output = true;
+        Ok(request)
     }
 }
 
@@ -2042,6 +2077,7 @@ struct ReadRequest<B: Backend> {
     tensor: Tensor,
     buffer: Arc<BufferHandle>,
     profile: Option<Arc<Mutex<EngineStepProfile>>>,
+    replay_output: bool,
 }
 
 struct SubmitRequest<B: Backend> {
@@ -2324,8 +2360,13 @@ where
                 tensor,
                 buffer,
                 profile,
+                replay_output,
             } = self;
-            let result = backend.read(&tensor);
+            let result = if replay_output {
+                backend.read_replay_output(&tensor)
+            } else {
+                backend.read(&tensor)
+            };
             let release = release_buffer(backend.as_ref(), buffer, profile.as_ref());
             match (result, release) {
                 (Err(error), _) | (Ok(_), Err(error)) => Err(error),
