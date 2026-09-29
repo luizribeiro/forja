@@ -151,6 +151,20 @@ impl ArgumentWriter {
     }
 }
 
+trait ArgumentSink {
+    type Written;
+
+    fn write_argument(&mut self, bytes: &[u8]) -> Result<Self::Written, BackendError>;
+}
+
+impl ArgumentSink for ArgumentWriter {
+    type Written = BufferBinding;
+
+    fn write_argument(&mut self, bytes: &[u8]) -> Result<Self::Written, BackendError> {
+        self.write(bytes)
+    }
+}
+
 #[derive(Default)]
 struct ArgumentSizer {
     offset: usize,
@@ -159,6 +173,14 @@ struct ArgumentSizer {
 impl ArgumentSizer {
     fn write(&mut self, len: usize) -> Result<(), BackendError> {
         reserve_argument(&mut self.offset, len, usize::MAX).map(|_| ())
+    }
+}
+
+impl ArgumentSink for ArgumentSizer {
+    type Written = ();
+
+    fn write_argument(&mut self, bytes: &[u8]) -> Result<Self::Written, BackendError> {
+        self.write(bytes.len())
     }
 }
 
@@ -272,6 +294,15 @@ const VECTOR_SELECTED_MIN_KEY_LENGTH: u32 = 512;
 const VECTOR_MAX_KEY_LENGTH: u32 = 65_536;
 const STEEL_SELECTED_MIN_QUERY_LENGTH: u32 = 512;
 const ARGMAX_CHUNK_WIDTH: u32 = 2048;
+const SAMPLE_RADIX_PASSES: [(u32, u32); 3] = [(21, 2047), (10, 2047), (0, 1023)];
+const SAMPLE_ERROR: usize = 0;
+const SAMPLE_LOGITS_LAYOUT: usize = 1;
+const SAMPLE_PARAMS_LAYOUT: usize = 2;
+const SAMPLE_OUTPUT_LAYOUT: usize = 3;
+const SAMPLE_WIDTH: usize = 4;
+const SAMPLE_POSITION: usize = 5;
+const SAMPLE_CHUNKS: usize = 6;
+const SAMPLE_RADIX_ARGUMENTS: usize = 7;
 
 struct EncodedDispatches {
     temporaries: Vec<BufferBinding>,
@@ -429,6 +460,32 @@ impl ArgumentBindings {
         };
         record_plan_binding(index, range);
         self.ranges.insert(range);
+    }
+}
+
+struct SampleCommonBindings<'a> {
+    logits: &'a BufferBinding,
+    sampling: &'a BufferBinding,
+    state: &'a BufferBinding,
+    logits_layout: &'a BufferBinding,
+    sampling_layout: &'a BufferBinding,
+    width: &'a BufferBinding,
+}
+
+impl SampleCommonBindings<'_> {
+    fn bind(
+        &self,
+        table: &ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>,
+        bindings: &mut ArgumentBindings,
+        workspace: &BufferBinding,
+    ) {
+        bindings.bind(table, 0, self.logits);
+        bindings.bind(table, 1, self.sampling);
+        bindings.bind(table, 2, workspace);
+        bindings.bind(table, 3, self.state);
+        bindings.bind(table, 4, self.logits_layout);
+        bindings.bind(table, 5, self.sampling_layout);
+        bindings.bind(table, 6, self.width);
     }
 }
 
@@ -3322,6 +3379,39 @@ impl MetalBackend {
         Ok(temporaries)
     }
 
+    fn write_sample_arguments<A: ArgumentSink>(
+        dispatch: &Dispatch,
+        position: u32,
+        arguments: &mut A,
+    ) -> Result<Vec<A::Written>, BackendError> {
+        let [logits, sampling] = dispatch.inputs() else {
+            return Err(BackendError::InvalidInput);
+        };
+        let width = *logits
+            .layout()
+            .shape()
+            .last()
+            .ok_or(BackendError::InvalidInput)?;
+        let chunks = width.div_ceil(ARGMAX_CHUNK_WIDTH);
+        let mut written = Vec::with_capacity(13);
+        written.push(arguments.write_argument(&[0_u8; 8])?);
+        for layout in [
+            logits.layout(),
+            sampling.layout(),
+            dispatch.output().layout(),
+        ] {
+            written.push(arguments.write_argument(&encode_layout(layout)?)?);
+        }
+        for value in [width, position, chunks] {
+            written.push(arguments.write_argument(&value.to_ne_bytes())?);
+        }
+        for (shift, mask) in SAMPLE_RADIX_PASSES {
+            written.push(arguments.write_argument(&shift.to_ne_bytes())?);
+            written.push(arguments.write_argument(&mask.to_ne_bytes())?);
+        }
+        Ok(written)
+    }
+
     #[allow(clippy::too_many_lines)]
     fn encode_sample(
         &self,
@@ -3344,123 +3434,174 @@ impl MetalBackend {
         let rows = u32::try_from(output.layout().element_count())
             .map_err(|_| BackendError::ExecutionFailed)?;
         let chunks = width.div_ceil(ARGMAX_CHUNK_WIDTH);
+        let histogram = self.scratch_tensor(DType::U32, &[rows, 2048])?;
+        let state = self.scratch_tensor(DType::U32, &[rows, 4])?;
+        let candidates = self.scratch_tensor(DType::U32, &[rows, 1024, 2])?;
         let partials = self.scratch_tensor(DType::U32, &[rows, chunks, 2])?;
-        let (sample_pipeline, partials_pipeline, finalize_pipeline) = {
+        let dtype = [(0, dtype_code(logits.layout().dtype()))];
+        let (
+            prepare_pipeline,
+            radix_histogram_pipeline,
+            radix_locate_pipeline,
+            index_histogram_pipeline,
+            index_locate_pipeline,
+            compact_pipeline,
+            partials_pipeline,
+            reduce_finalize_pipeline,
+            candidates_finalize_pipeline,
+        ) = {
             let mut pipelines = self
                 .pipelines
                 .lock()
                 .map_err(|_| BackendError::ExecutionFailed)?;
-            let dtype = [(0, dtype_code(logits.layout().dtype()))];
             (
-                pipelines.get("sample", &dtype)?,
+                pipelines.get("sample_prepare", &[])?,
+                pipelines.get("sample_radix_histogram", &dtype)?,
+                pipelines.get("sample_radix_locate", &[])?,
+                pipelines.get("sample_index_histogram", &dtype)?,
+                pipelines.get("sample_index_locate", &dtype)?,
+                pipelines.get("sample_compact", &dtype)?,
                 pipelines.get("sample_partials", &dtype)?,
                 pipelines.get("sample_reduce_finalize", &[])?,
+                pipelines.get("sample_candidates_finalize", &dtype)?,
             )
         };
-        let error_flag = arguments.write(&[0_u8; 8])?;
-        let mut temporaries = vec![
-            Self::layout_buffer(logits.layout(), arguments)?,
-            Self::layout_buffer(sampling.layout(), arguments)?,
-            Self::layout_buffer(output.layout(), arguments)?,
-            arguments.write(&width.to_ne_bytes())?,
-            arguments.write(&position.to_ne_bytes())?,
-            arguments.write(&chunks.to_ne_bytes())?,
-            error_flag.clone(),
-        ];
-        let buffers = self
-            .buffers
-            .lock()
-            .map_err(|_| BackendError::ExecutionFailed)?;
-        set_pipeline(encoder, &sample_pipeline);
-        for (index, tensor) in [logits, sampling, output].into_iter().enumerate() {
-            bindings.bind_raw(table, index, &buffers.get(tensor)?.raw);
-            bindings.bind(table, index + 3, &temporaries[index]);
-        }
-        bindings.bind(table, 6, &temporaries[3]);
-        bindings.bind(table, 7, &temporaries[4]);
-        bindings.bind(table, 8, &temporaries[6]);
+        let mut temporaries = Self::write_sample_arguments(dispatch, position, arguments)?;
+        let error_flag = temporaries[SAMPLE_ERROR].clone();
+        let (logits_buffer, sampling_buffer, output_buffer) = {
+            let buffers = self
+                .buffers
+                .lock()
+                .map_err(|_| BackendError::ExecutionFailed)?;
+            (
+                BufferBinding::whole(buffers.get(logits)?.raw.clone()),
+                BufferBinding::whole(buffers.get(sampling)?.raw.clone()),
+                BufferBinding::whole(buffers.get(output)?.raw.clone()),
+            )
+        };
+        let row_groups = MTLSize {
+            width: usize::try_from(rows).map_err(|_| BackendError::ExecutionFailed)?,
+            height: 1,
+            depth: 1,
+        };
+        let chunk_groups = MTLSize {
+            width: usize::try_from(rows)
+                .map_err(|_| BackendError::ExecutionFailed)?
+                .checked_mul(usize::try_from(chunks).map_err(|_| BackendError::ExecutionFailed)?)
+                .ok_or(BackendError::ExecutionFailed)?,
+            height: 1,
+            depth: 1,
+        };
+        let threads = MTLSize {
+            width: simd_thread_count(&radix_histogram_pipeline, 256)?,
+            height: 1,
+            depth: 1,
+        };
+
+        set_pipeline(encoder, &prepare_pipeline);
+        bindings.bind(table, 0, &sampling_buffer);
+        bindings.bind(table, 1, &histogram.buffer);
+        bindings.bind(table, 2, &state.buffer);
+        bindings.bind(table, 3, &temporaries[SAMPLE_PARAMS_LAYOUT]);
+        bindings.bind(table, 4, &temporaries[SAMPLE_WIDTH]);
+        bindings.bind(table, 5, &temporaries[SAMPLE_ERROR]);
         set_argument_table(encoder, table);
-        let threads = simd_thread_count(&sample_pipeline, 256)?;
-        dispatch_threadgroups(
-            encoder,
-            MTLSize {
-                width: usize::try_from(rows).map_err(|_| BackendError::ExecutionFailed)?,
-                height: 1,
-                depth: 1,
-            },
-            MTLSize {
-                width: threads,
-                height: 1,
-                depth: 1,
-            },
-        );
+        dispatch_threadgroups(encoder, row_groups, threads);
+
+        let common = SampleCommonBindings {
+            logits: &logits_buffer,
+            sampling: &sampling_buffer,
+            state: &state.buffer,
+            logits_layout: &temporaries[SAMPLE_LOGITS_LAYOUT],
+            sampling_layout: &temporaries[SAMPLE_PARAMS_LAYOUT],
+            width: &temporaries[SAMPLE_WIDTH],
+        };
+        for (pass, _) in SAMPLE_RADIX_PASSES.iter().enumerate() {
+            encode_dispatch_barrier(encoder);
+            let shift_buffer = &temporaries[SAMPLE_RADIX_ARGUMENTS + pass * 2];
+            let mask_buffer = &temporaries[SAMPLE_RADIX_ARGUMENTS + pass * 2 + 1];
+            set_pipeline(encoder, &radix_histogram_pipeline);
+            common.bind(table, bindings, &histogram.buffer);
+            bindings.bind(table, 7, shift_buffer);
+            bindings.bind(table, 8, mask_buffer);
+            bindings.bind(table, 9, &temporaries[SAMPLE_CHUNKS]);
+            set_argument_table(encoder, table);
+            dispatch_threadgroups(encoder, chunk_groups, threads);
+            encode_dispatch_barrier(encoder);
+            set_pipeline(encoder, &radix_locate_pipeline);
+            bindings.bind(table, 0, &sampling_buffer);
+            bindings.bind(table, 1, &histogram.buffer);
+            bindings.bind(table, 2, &state.buffer);
+            bindings.bind(table, 3, &temporaries[SAMPLE_PARAMS_LAYOUT]);
+            bindings.bind(table, 4, &temporaries[SAMPLE_WIDTH]);
+            bindings.bind(table, 5, shift_buffer);
+            bindings.bind(table, 6, mask_buffer);
+            set_argument_table(encoder, table);
+            dispatch_threadgroups(encoder, row_groups, threads);
+        }
+
+        encode_dispatch_barrier(encoder);
+        set_pipeline(encoder, &index_histogram_pipeline);
+        common.bind(table, bindings, &histogram.buffer);
+        bindings.bind(table, 7, &temporaries[SAMPLE_CHUNKS]);
+        set_argument_table(encoder, table);
+        dispatch_threadgroups(encoder, chunk_groups, threads);
+
+        encode_dispatch_barrier(encoder);
+        set_pipeline(encoder, &index_locate_pipeline);
+        common.bind(table, bindings, &histogram.buffer);
+        set_argument_table(encoder, table);
+        dispatch_threadgroups(encoder, row_groups, threads);
+
+        encode_dispatch_barrier(encoder);
+        set_pipeline(encoder, &compact_pipeline);
+        common.bind(table, bindings, &candidates.buffer);
+        bindings.bind(table, 7, &temporaries[SAMPLE_CHUNKS]);
+        set_argument_table(encoder, table);
+        dispatch_threadgroups(encoder, chunk_groups, threads);
 
         encode_dispatch_barrier(encoder);
         set_pipeline(encoder, &partials_pipeline);
-        bindings.bind_raw(table, 0, &buffers.get(logits)?.raw);
-        bindings.bind_raw(table, 1, &buffers.get(sampling)?.raw);
-        drop(buffers);
-        bindings.bind(table, 2, &partials.buffer);
-        bindings.bind(table, 3, &temporaries[0]);
-        bindings.bind(table, 4, &temporaries[1]);
-        bindings.bind(table, 5, &temporaries[3]);
-        bindings.bind(table, 6, &temporaries[4]);
-        bindings.bind(table, 7, &temporaries[5]);
+        common.bind(table, bindings, &partials.buffer);
+        bindings.bind(table, 7, &temporaries[SAMPLE_POSITION]);
+        bindings.bind(table, 8, &temporaries[SAMPLE_CHUNKS]);
         set_argument_table(encoder, table);
-        let partial_threads = simd_thread_count(&partials_pipeline, 256)?;
-        dispatch_threadgroups(
-            encoder,
-            MTLSize {
-                width: usize::try_from(rows)
-                    .map_err(|_| BackendError::ExecutionFailed)?
-                    .checked_mul(
-                        usize::try_from(chunks).map_err(|_| BackendError::ExecutionFailed)?,
-                    )
-                    .ok_or(BackendError::ExecutionFailed)?,
-                height: 1,
-                depth: 1,
-            },
-            MTLSize {
-                width: partial_threads,
-                height: 1,
-                depth: 1,
-            },
-        );
+        dispatch_threadgroups(encoder, chunk_groups, threads);
 
         encode_dispatch_barrier(encoder);
-        set_pipeline(encoder, &finalize_pipeline);
-        let buffers = self
-            .buffers
-            .lock()
-            .map_err(|_| BackendError::ExecutionFailed)?;
-        bindings.bind_raw(table, 0, &buffers.get(sampling)?.raw);
+        set_pipeline(encoder, &reduce_finalize_pipeline);
+        bindings.bind(table, 0, &sampling_buffer);
         bindings.bind(table, 1, &partials.buffer);
-        bindings.bind_raw(table, 2, &buffers.get(output)?.raw);
-        drop(buffers);
-        bindings.bind(table, 3, &temporaries[1]);
-        bindings.bind(table, 4, &temporaries[2]);
-        bindings.bind(table, 5, &temporaries[3]);
-        bindings.bind(table, 6, &temporaries[5]);
+        bindings.bind(table, 2, &output_buffer);
+        bindings.bind(table, 3, &temporaries[SAMPLE_PARAMS_LAYOUT]);
+        bindings.bind(table, 4, &temporaries[SAMPLE_OUTPUT_LAYOUT]);
+        bindings.bind(table, 5, &temporaries[SAMPLE_WIDTH]);
+        bindings.bind(table, 6, &temporaries[SAMPLE_CHUNKS]);
         set_argument_table(encoder, table);
-        let requested_threads = usize::try_from(chunks)
-            .map_err(|_| BackendError::ExecutionFailed)?
-            .next_multiple_of(32)
-            .min(256);
-        let finalize_threads = simd_thread_count(&finalize_pipeline, requested_threads)?;
-        dispatch_threadgroups(
-            encoder,
-            MTLSize {
-                width: usize::try_from(rows).map_err(|_| BackendError::ExecutionFailed)?,
-                height: 1,
-                depth: 1,
-            },
-            MTLSize {
-                width: finalize_threads,
-                height: 1,
-                depth: 1,
-            },
-        );
-        temporaries.push(partials.buffer);
+        dispatch_threadgroups(encoder, row_groups, threads);
+
+        set_pipeline(encoder, &candidates_finalize_pipeline);
+        bindings.bind(table, 0, &logits_buffer);
+        bindings.bind(table, 1, &sampling_buffer);
+        bindings.bind(table, 2, &candidates.buffer);
+        bindings.bind(table, 3, &output_buffer);
+        bindings.bind(table, 4, &temporaries[SAMPLE_LOGITS_LAYOUT]);
+        bindings.bind(table, 5, &temporaries[SAMPLE_PARAMS_LAYOUT]);
+        bindings.bind(table, 6, &temporaries[SAMPLE_OUTPUT_LAYOUT]);
+        bindings.bind(table, 7, &temporaries[SAMPLE_WIDTH]);
+        bindings.bind(table, 8, &temporaries[SAMPLE_POSITION]);
+        set_argument_table(encoder, table);
+        dispatch_threadgroups(encoder, row_groups, threads);
+
+        temporaries.extend([
+            logits_buffer,
+            sampling_buffer,
+            output_buffer,
+            histogram.buffer,
+            state.buffer,
+            candidates.buffer,
+            partials.buffer,
+        ]);
         Ok((temporaries, error_flag))
     }
 
@@ -3726,10 +3867,8 @@ impl MetalBackend {
                 Self::size_softmax_arguments(arguments)?;
                 arguments.write(size_of::<u32>())?;
             }
-            Op::Sample { .. } => {
-                for len in [8, 112, 112, 112, 4, 4, 4] {
-                    arguments.write(len)?;
-                }
+            Op::Sample { position } => {
+                Self::write_sample_arguments(dispatch, position, arguments)?;
             }
             Op::Rope { .. } => {
                 for len in [112, 112, 112, 12] {
@@ -4645,7 +4784,16 @@ impl PipelineCache {
 fn nan_preserving_kernel(name: &str) -> bool {
     matches!(
         name,
-        "softmax_single" | "softmax_looped" | "argmax_partials"
+        "softmax_single"
+            | "softmax_looped"
+            | "argmax_partials"
+            | "sample_radix_histogram"
+            | "sample_index_histogram"
+            | "sample_index_locate"
+            | "sample_compact"
+            | "sample_partials"
+            | "sample_reduce_finalize"
+            | "sample_candidates_finalize"
     )
 }
 
@@ -6729,7 +6877,35 @@ mod tests {
     }
 
     #[test]
-    fn metal_sample_is_deterministic_and_reports_gpu_time() {
+    fn metal_sample_matches_cpu_for_large_tied_populations() {
+        let reference = CpuBackend::new();
+        let candidate = MetalBackend::new().unwrap();
+        for width in [4_097_u32, 151_936] {
+            let logits = (0..usize::try_from(width).unwrap())
+                .flat_map(|index| [3.0_f32, 1.0, 3.0, 0.0, 2.0][index % 5].to_le_bytes())
+                .collect::<Vec<_>>();
+            for (top_k, top_p) in [(513, 1.0), (2_049, 1.0), (0, 0.9)] {
+                assert_backends_agree(
+                    &reference,
+                    &candidate,
+                    Op::Sample { position: 57 },
+                    &[
+                        TensorSpec::initialized(DType::F32, &[1, width], logits.clone()),
+                        TensorSpec::initialized(
+                            DType::U32,
+                            &[5],
+                            sample_params(0.7, top_k, top_p, 0xfeed_beef_dead_cafe),
+                        ),
+                    ],
+                    &TensorSpec::contiguous(DType::U32, &[1]),
+                )
+                .unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn metal_sample_is_deterministic_and_reports_gpu_phases() {
         let backend = MetalBackend::new().unwrap();
         let logits = (0_u32..151_936)
             .flat_map(|index| {
@@ -6743,20 +6919,35 @@ mod tests {
 
         let input = backend.alloc(DType::F32, &[1, 151_936]).unwrap();
         backend.write(&input, &logits).unwrap();
-        let params = backend.alloc(DType::U32, &[5]).unwrap();
-        backend
-            .write(&params, &sample_params(0.7, 0, 0.9, 91))
-            .unwrap();
         let output = backend.alloc(DType::U32, &[1]).unwrap();
-        let mut commands = CommandList::new();
-        commands
-            .dispatch(Op::Sample { position: 511 }, &[&input, &params], &output)
-            .unwrap();
-        let submission = backend.submit_profiled(commands).unwrap();
-        submission.wait().unwrap();
-        let elapsed = submission.profile().unwrap().per_dispatch[0].gpu_time;
-        eprintln!("sample width 151936 top-p 0.9: GPU {elapsed:?}");
-        assert!(elapsed > Duration::ZERO);
+        for (name, temperature, top_k, top_p) in [
+            ("greedy", 0.0, 0, 1.0),
+            ("temperature", 0.7, 0, 1.0),
+            ("top-k 5000", 0.7, 5000, 1.0),
+            ("top-k 1024", 0.7, 1024, 1.0),
+            ("top-p 0.9", 0.7, 0, 0.9),
+        ] {
+            let params = backend.alloc(DType::U32, &[5]).unwrap();
+            backend
+                .write(&params, &sample_params(temperature, top_k, top_p, 91))
+                .unwrap();
+            let mut timings = Vec::with_capacity(20);
+            for iteration in 0..23 {
+                let mut commands = CommandList::new();
+                commands
+                    .dispatch(Op::Sample { position: 511 }, &[&input, &params], &output)
+                    .unwrap();
+                let submission = backend.submit_profiled(commands).unwrap();
+                submission.wait().unwrap();
+                if iteration >= 3 {
+                    timings.push(submission.profile().unwrap().per_dispatch[0].gpu_time);
+                }
+            }
+            timings.sort_unstable();
+            let median = timings[timings.len() / 2];
+            eprintln!("sample width 151936 {name}: median GPU {median:?}");
+            assert!(median > Duration::ZERO);
+        }
     }
 
     #[test]
