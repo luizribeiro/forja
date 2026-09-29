@@ -517,7 +517,11 @@ pub struct Qwen3<T: Activation = f32> {
     #[cfg(target_family = "wasm")]
     token: Tensor<u32>,
     #[cfg(target_family = "wasm")]
+    output_tokens: Tensor<u32>,
+    #[cfg(target_family = "wasm")]
     decode: Option<Graph<Tensor<f32>>>,
+    #[cfg(target_family = "wasm")]
+    selected_decode: Option<Graph<Tensor<f32>>>,
 }
 
 impl<T: Activation> Qwen3<T> {
@@ -540,7 +544,11 @@ impl<T: Activation> Qwen3<T> {
             #[cfg(target_family = "wasm")]
             token: Tensor::zeros(&[1])?,
             #[cfg(target_family = "wasm")]
+            output_tokens: Tensor::zeros(&[MAX_CONTEXT])?,
+            #[cfg(target_family = "wasm")]
             decode: None,
+            #[cfg(target_family = "wasm")]
+            selected_decode: None,
         })
     }
 
@@ -629,7 +637,11 @@ impl Engine for ExportedQwen3 {
             .ok_or_else(|| forja_sdk::Error::loading("tokens exceed the 4096-token context"))?;
         #[cfg(target_family = "wasm")]
         if REPLAY_DECODE && sequence == 1 && !input.taps {
-            return self.decode_step(&input.tokens, input.start_pos);
+            let logits = self.replay_decode(Some(&input.tokens), input.start_pos, false)?;
+            return Ok(StepOutput {
+                logits,
+                taps: Vec::new(),
+            });
         }
         self.forward(
             &input.tokens,
@@ -638,6 +650,50 @@ impl Engine for ExportedQwen3 {
             end_pos.into(),
             input.taps,
         )
+    }
+
+    #[cfg(target_family = "wasm")]
+    fn decode(&mut self, input: forja_sdk::DecodeInput) -> Result<forja_sdk::DecodeOutput> {
+        match input.tokens {
+            Some(tokens) => {
+                let [sequence] = tokens
+                    .shape()
+                    .try_into()
+                    .map_err(|_| forja_sdk::Error::loading("decode tokens must have rank one"))?;
+                if sequence == 0 {
+                    return Err(forja_sdk::Error::loading("decode tokens cannot be empty"));
+                }
+                let end = input
+                    .start_pos
+                    .checked_add(sequence)
+                    .filter(|&end| end <= MAX_CONTEXT)
+                    .ok_or_else(|| {
+                        forja_sdk::Error::loading("decode tokens exceed the 4096-token context")
+                    })?;
+                if REPLAY_DECODE && sequence == 1 {
+                    self.decode_selected(Some(&tokens), input.start_pos)
+                } else {
+                    let logits = self
+                        .forward(&tokens, sequence, input.start_pos.into(), end.into(), false)?
+                        .logits;
+                    self.select_token(logits, end - 1)
+                }
+            }
+            None if input.start_pos < MAX_CONTEXT && REPLAY_DECODE => {
+                self.decode_selected(None, input.start_pos)
+            }
+            None if input.start_pos < MAX_CONTEXT => {
+                let token = self.token.alias()?;
+                let end = input.start_pos + 1;
+                let logits = self
+                    .forward(&token, 1, input.start_pos.into(), end.into(), false)?
+                    .logits;
+                self.select_token(logits, input.start_pos)
+            }
+            None => Err(forja_sdk::Error::loading(
+                "decode position exceeds the 4096-token context",
+            )),
+        }
     }
 }
 
@@ -721,28 +777,81 @@ impl<T: Activation> Qwen3<T> {
     }
 
     #[cfg(target_family = "wasm")]
-    fn decode_step(&mut self, tokens: &Tensor<u32>, start_pos: u32) -> Result<StepOutput> {
-        let values = tokens.to_vec()?;
-        self.token.write(&values)?;
-        if self.decode.is_none() {
-            let position = forja_sdk::Param::new(0..=MAX_CONTEXT - 1)?;
-            let start = position.at(start_pos);
-            let end = (start.clone() + 1)?;
-            let token = self.token.alias()?;
-            let graph = forja_sdk::capture(&[&position], || {
-                self.forward(&token, 1, start.into(), end, false)
-                    .map(|output| output.logits)
-            })?;
-            self.decode = Some(graph);
+    fn replay_decode(
+        &mut self,
+        tokens: Option<&Tensor<u32>>,
+        start_pos: u32,
+        selected: bool,
+    ) -> Result<Tensor<f32>> {
+        if let Some(tokens) = tokens {
+            self.token.write(&tokens.to_vec()?)?;
         }
-        let graph = self
-            .decode
-            .as_ref()
-            .ok_or_else(|| forja_sdk::Error::loading("decode graph was not captured"))?;
+        let missing = if selected {
+            self.selected_decode.is_none()
+        } else {
+            self.decode.is_none()
+        };
+        if missing {
+            let graph = self.capture_decode(start_pos, selected)?;
+            if selected {
+                self.selected_decode = Some(graph);
+            } else {
+                self.decode = Some(graph);
+            }
+        }
+        let graph = if selected {
+            self.selected_decode.as_ref()
+        } else {
+            self.decode.as_ref()
+        }
+        .ok_or_else(|| forja_sdk::Error::loading("decode graph was not captured"))?;
         graph.replay(&[start_pos])?;
-        Ok(StepOutput {
-            logits: graph.result().alias()?,
-            taps: Vec::new(),
+        graph.result().alias()
+    }
+
+    #[cfg(target_family = "wasm")]
+    fn capture_decode(&mut self, start_pos: u32, selected: bool) -> Result<Graph<Tensor<f32>>> {
+        let position = forja_sdk::Param::new(0..=MAX_CONTEXT - 1)?;
+        let start = position.at(start_pos);
+        let end = (start.clone() + 1)?;
+        let token = self.token.alias()?;
+        let mut feedback = self.token.alias()?;
+        let output_tokens = self.output_tokens.alias()?;
+        forja_sdk::capture(&[&position], || {
+            let logits = self
+                .forward(&token, 1, start.clone().into(), end, false)?
+                .logits;
+            if selected {
+                let selected = logits.reshape(&[1, VOCAB])?.argmax()?;
+                selected.copy_into(&mut feedback)?;
+                selected.copy_into(&mut output_tokens.narrow(0, start, 1)?)?;
+            }
+            Ok(logits)
+        })
+    }
+
+    #[cfg(target_family = "wasm")]
+    fn decode_selected(
+        &mut self,
+        tokens: Option<&Tensor<u32>>,
+        start_pos: u32,
+    ) -> Result<forja_sdk::DecodeOutput> {
+        let logits = self.replay_decode(tokens, start_pos, true)?;
+        Ok(forja_sdk::DecodeOutput {
+            logits,
+            token: self.output_tokens.narrow(0, start_pos, 1)?,
+        })
+    }
+
+    #[cfg(target_family = "wasm")]
+    fn select_token(&mut self, logits: Tensor<f32>, slot: u32) -> Result<forja_sdk::DecodeOutput> {
+        let selected = logits.reshape(&[1, VOCAB])?.argmax()?;
+        selected.copy_into(&mut self.token.alias()?)?;
+        let mut output = self.output_tokens.narrow(0, slot, 1)?;
+        selected.copy_into(&mut output)?;
+        Ok(forja_sdk::DecodeOutput {
+            logits,
+            token: output,
         })
     }
 }
