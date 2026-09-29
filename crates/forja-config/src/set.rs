@@ -1,4 +1,4 @@
-use crate::{ConfigError, Layer, Origin, Schema, layer::validate};
+use crate::{ConfigError, KeyPath, Layer, Origin, Schema, layer::validate};
 
 /// Parses and validates one `--set KEY=VALUE` argument as a TOML line.
 ///
@@ -8,7 +8,10 @@ use crate::{ConfigError, Layer, Origin, Schema, layer::validate};
 ///
 /// Returns an error that identifies the numbered argument when the expression is not one TOML
 /// line or does not match the schema.
-pub fn set_layer<C: Schema>(index: usize, expression: &str) -> Result<Layer, ConfigError> {
+pub fn set_layer<C: Schema>(
+    index: usize,
+    expression: &str,
+) -> Result<(Layer, KeyPath), ConfigError> {
     let context = format!("--set #{index} {expression}");
     if expression.contains(['\n', '\r']) {
         return Err(ConfigError::new(format!(
@@ -21,7 +24,26 @@ pub fn set_layer<C: Schema>(index: usize, expression: &str) -> Result<Layer, Con
             .map_err(|()| ConfigError::new(format!("{context}: {}", original.message())))?,
     };
     validate::<C>(&table).map_err(|message| ConfigError::new(format!("{context}: {message}")))?;
-    Ok(Layer::new(Origin::Set(index), table))
+    let key = only_leaf(&table)
+        .ok_or_else(|| ConfigError::new(format!("{context}: expected exactly one leaf value")))?;
+    Ok((Layer::new(Origin::Set(index), table), key))
+}
+
+fn only_leaf(table: &toml::Table) -> Option<KeyPath> {
+    let mut parts = Vec::new();
+    let mut table = table;
+    loop {
+        if table.len() != 1 {
+            return None;
+        }
+        let (key, value) = table.iter().next()?;
+        parts.push(key.as_str());
+        if let toml::Value::Table(next) = value {
+            table = next;
+        } else {
+            return Some(KeyPath::new(parts.join(".")));
+        }
+    }
 }
 
 fn parse_bare_word(expression: &str) -> Result<toml::Table, ()> {
@@ -86,8 +108,9 @@ mod tests {
 
     #[test]
     fn parses_dotted_and_quoted_keys_with_a_bare_word() {
-        let layer = set_layer::<SetConfig>(1, "labels.values.\"c.d\"=tier2").unwrap();
+        let (layer, key) = set_layer::<SetConfig>(1, "labels.values.\"c.d\"=tier2").unwrap();
         let layered = crate::layer::<SetConfig>(vec![layer]).unwrap();
+        assert_eq!(key.as_str(), "labels.values.c.d");
         assert_eq!(layered.config.labels.values["c.d"], "tier2");
     }
 
@@ -97,6 +120,17 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "--set #2 limits.tensor_ranks=5: unknown field `tensor_ranks`, expected one of `live_bytes`, `tensor_rank`, `tensor_elements`, `live_tensor_handles`, `live_kernels`, `live_graphs`, `read_bytes`, `guest_memory_bytes`, `table_elements`, `instances`, `dispatches_per_list`, `work_per_dispatch`, `guest_call_timeout`, `submission_timeout`, `gpu_time_budget`"
+        );
+    }
+
+    #[test]
+    fn rejects_more_than_one_leaf() {
+        let error =
+            set_layer::<crate::DevConfig>(1, "limits={tensor_rank=5,live_graphs=7}").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("expected exactly one leaf value")
         );
     }
 }

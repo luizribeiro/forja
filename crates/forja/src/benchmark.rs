@@ -7,6 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use forja_config::Selection;
 use forja_core::Op;
 use forja_host::{
     EngineDecode, EngineMetrics, EngineOutput, EngineRunner, EngineStep, EngineStepProfile,
@@ -19,11 +20,6 @@ use crate::{
     benchmark_stats::{Stats, stats, synthetic_tokens},
     engine::{argmax, limits, read_token},
 };
-
-const WARMUPS: usize = 3;
-const DECODE_PREFILL: usize = 8;
-const TG_CONTEXT_START: usize = DECODE_PREFILL + 1;
-const PROFILE_CONTEXTS: [usize; 4] = [TG_CONTEXT_START, 512, 2048, 4000];
 
 #[derive(Clone, Copy)]
 pub(crate) struct Summary {
@@ -86,14 +82,11 @@ async fn run_metal(options: &Bench) -> Result<(), Box<dyn Error>> {
     );
     for component in &options.engines {
         let engine = component.display().to_string();
-        let modes: &[bool] = if options.host_argmax {
-            &[false]
-        } else {
-            &[false, true]
-        };
-        for &overlap in modes {
-            let selection = selection_name(options.host_argmax, overlap);
-            let (pp, tg, device, profiles) = bench_engine(options, component, overlap).await?;
+        for &strategy in &options.selection {
+            let (host_argmax, overlap) = selection_mode(strategy);
+            let selection = selection_name(strategy);
+            let (pp, tg, device, profiles) =
+                bench_engine(options, component, host_argmax, overlap).await?;
             print_summary(&engine, selection, "pp", pp);
             print_summary(&engine, selection, "tg", tg);
             let profile_reports = profiles
@@ -131,12 +124,12 @@ async fn run_metal(options: &Bench) -> Result<(), Box<dyn Error>> {
             "settings": {
                 "prompt_tokens": options.pp,
                 "generated_tokens": options.tg,
-                "warmups": WARMUPS,
+                "warmups": options.warmups,
                 "repetitions": options.reps,
                 "graph_replay": graph_replay_name(options.graph_replay),
-                "selection": if options.host_argmax { "host-argmax" } else { "compared" },
+                "selection": options.selection.iter().copied().map(selection_name).collect::<Vec<_>>(),
             },
-            "tg_context_start": TG_CONTEXT_START,
+            "tg_context_start": options.decode_prefill + 1,
             "results": results,
         });
         let mut bytes = serde_json::to_vec_pretty(&report)?;
@@ -150,6 +143,7 @@ async fn run_metal(options: &Bench) -> Result<(), Box<dyn Error>> {
 async fn bench_engine(
     options: &Bench,
     component: &Path,
+    host_argmax: bool,
     overlap: bool,
 ) -> Result<(Summary, Summary, String, Vec<ProfileMeasurement>), Box<dyn Error>> {
     let backend = forja_metal::MetalBackend::with_graph_replay(match options.graph_replay {
@@ -166,11 +160,16 @@ async fn bench_engine(
     .await?;
     let info = runner.describe().await?;
     let max_context = usize::try_from(info.max_context)?;
-    let profile_context = *PROFILE_CONTEXTS
+    let profile_context = *options
+        .contexts
         .last()
         .ok_or("no profile contexts configured")?;
+    let tg_context_start = options
+        .decode_prefill
+        .checked_add(1)
+        .ok_or("decode context length overflowed")?;
     if options.pp > max_context
-        || TG_CONTEXT_START
+        || tg_context_start
             .checked_add(options.tg)
             .ok_or("decode context length overflowed")?
             > max_context
@@ -188,16 +187,16 @@ async fn bench_engine(
         0
     };
     let tokens = synthetic_tokens(
-        options.pp.max(DECODE_PREFILL).max(profile_tokens),
+        options.pp.max(options.decode_prefill).max(profile_tokens),
         info.vocab,
     );
-    for _ in 0..WARMUPS {
+    for _ in 0..options.warmups {
         measure_prefill(&mut runner, &tokens[..options.pp]).await?;
         measure_decode(
             &mut runner,
-            &tokens[..DECODE_PREFILL],
+            &tokens[..options.decode_prefill],
             options.tg,
-            options.host_argmax,
+            host_argmax,
             overlap,
         )
         .await?;
@@ -209,9 +208,9 @@ async fn bench_engine(
         tg.push(
             measure_decode(
                 &mut runner,
-                &tokens[..DECODE_PREFILL],
+                &tokens[..options.decode_prefill],
                 options.tg,
-                options.host_argmax,
+                host_argmax,
                 overlap,
             )
             .await?,
@@ -222,7 +221,9 @@ async fn bench_engine(
             &mut runner,
             &tokens,
             options.reps,
-            options.host_argmax,
+            options.warmups,
+            &options.contexts,
+            host_argmax,
             overlap,
         )
         .await?
@@ -244,13 +245,19 @@ const fn graph_replay_name(strategy: GraphReplay) -> &'static str {
     }
 }
 
-const fn selection_name(host_argmax: bool, overlap: bool) -> &'static str {
-    if host_argmax {
-        "host-argmax"
-    } else if overlap {
-        "gpu-pipelined"
-    } else {
-        "gpu-sequential"
+const fn selection_name(selection: Selection) -> &'static str {
+    match selection {
+        Selection::HostArgmax => "host-argmax",
+        Selection::GpuSequential => "gpu-sequential",
+        Selection::GpuPipelined => "gpu-pipelined",
+    }
+}
+
+const fn selection_mode(selection: Selection) -> (bool, bool) {
+    match selection {
+        Selection::HostArgmax => (true, false),
+        Selection::GpuSequential => (false, false),
+        Selection::GpuPipelined => (false, true),
     }
 }
 
@@ -394,14 +401,16 @@ async fn measure_profiles(
     runner: &mut EngineRunner<forja_metal::MetalBackend>,
     tokens: &[u32],
     reps: usize,
+    warmups: usize,
+    contexts: &[usize],
     host_argmax: bool,
     overlap: bool,
 ) -> Result<Vec<ProfileMeasurement>, Box<dyn Error>> {
     let mut measurements = Vec::new();
-    for context_start in PROFILE_CONTEXTS {
+    for &context_start in contexts {
         let mut baseline = Vec::with_capacity(reps);
         let mut steps = Vec::with_capacity(reps);
-        for repetition in 0..WARMUPS.saturating_add(reps) {
+        for repetition in 0..warmups.saturating_add(reps) {
             let unprofiled = if overlap && !host_argmax {
                 prepare_profile_context(runner, tokens, context_start, host_argmax).await?;
                 measure_pipelined_profile_step(runner, context_start).await?
@@ -418,7 +427,7 @@ async fn measure_profiles(
             let profile = runner
                 .take_profile()
                 .ok_or("profiled step produced no timing detail")?;
-            if repetition >= WARMUPS {
+            if repetition >= warmups {
                 baseline.push(unprofiled);
                 steps.push(profile);
             }

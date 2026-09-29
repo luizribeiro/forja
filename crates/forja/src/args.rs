@@ -1,8 +1,9 @@
-use std::path::PathBuf;
+use std::{collections::BTreeMap, path::PathBuf};
 
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use forja_config::{
-    ConfigError, DevConfig, Layer, Layered, Limits, dev_layers, file_layer, layer, set_layer,
+    ConfigError, DevConfig, KeyPath, Layer, Layered, Limits, Origin, Selection, dev_layers,
+    file_layer, layer, set_layer,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -78,42 +79,56 @@ pub(crate) struct Run {
     pub(crate) limits: Limits,
 }
 
-#[derive(Args, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub(crate) struct Bench {
+    pub(crate) engines: Vec<PathBuf>,
+    pub(crate) model_dir: PathBuf,
+    pub(crate) pp: usize,
+    pub(crate) tg: usize,
+    pub(crate) reps: usize,
+    pub(crate) warmups: usize,
+    pub(crate) decode_prefill: usize,
+    pub(crate) contexts: Vec<usize>,
+    pub(crate) selection: Vec<Selection>,
+    pub(crate) json: Option<PathBuf>,
+    pub(crate) breakdown: bool,
+    pub(crate) graph_replay: GraphReplay,
+    pub(crate) limits: Limits,
+}
+
+#[derive(Args)]
+struct BenchArgs {
     /// WebAssembly engine component. Repeat to compare engines.
     #[arg(long = "engine", required = true)]
-    pub(crate) engines: Vec<PathBuf>,
+    engines: Vec<PathBuf>,
     /// Directory containing model weights.
     #[arg(long)]
-    pub(crate) model_dir: PathBuf,
+    model_dir: PathBuf,
     /// Number of prompt-processing tokens.
-    #[arg(long, default_value_t = 512, value_parser = parse_positive)]
-    pub(crate) pp: usize,
+    #[arg(long, value_parser = parse_positive)]
+    pp: Option<u32>,
     /// Number of token-generation tokens.
-    #[arg(long, default_value_t = 128, value_parser = parse_positive)]
-    pub(crate) tg: usize,
+    #[arg(long, value_parser = parse_positive)]
+    tg: Option<u32>,
     /// Number of measured repetitions.
-    #[arg(long, default_value_t = 30, value_parser = parse_positive)]
-    pub(crate) reps: usize,
+    #[arg(long, value_parser = parse_positive)]
+    reps: Option<u32>,
     /// Path for the JSON report.
     #[arg(long)]
-    pub(crate) json: Option<PathBuf>,
+    json: Option<PathBuf>,
     /// Print a per-operation timing breakdown.
     #[arg(long)]
-    pub(crate) breakdown: bool,
+    breakdown: bool,
     /// Select tokens on the host instead of comparing selection modes.
     #[arg(long)]
-    pub(crate) host_argmax: bool,
+    host_argmax: bool,
     /// Set a Metal backend option.
     #[arg(
         long = "backend-option",
         default_value = "graph-replay=tier2",
         value_parser = parse_backend_option
     )]
-    pub(crate) graph_replay: GraphReplay,
-    /// Host resource limits.
-    #[arg(skip)]
-    pub(crate) limits: Limits,
+    graph_replay: GraphReplay,
 }
 
 #[derive(Debug, PartialEq)]
@@ -180,7 +195,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum ParsedCommand {
     /// Benchmark one or more engines.
-    Bench(Bench),
+    Bench(BenchArgs),
     /// Inspect configuration.
     Config(ConfigArgs),
     /// Generate a completion.
@@ -204,6 +219,8 @@ fn parse_with(
     let overrides = ordered_overrides(&matches);
     let cli = Cli::from_arg_matches_mut(&mut matches)?;
     let mut layers = base_layers(cli.isolated).map_err(|error| config_error(&error))?;
+    let mut set_layers = Vec::new();
+    let mut set_keys = BTreeMap::new();
     let mut set_index = 0;
     for override_ in overrides {
         match override_ {
@@ -212,19 +229,31 @@ fn parse_with(
             }
             Override::Set(expression) => {
                 set_index += 1;
-                layers.push(
-                    set_layer::<DevConfig>(set_index, &expression)
-                        .map_err(|error| config_error(&error))?,
-                );
+                let (layer, key) = set_layer::<DevConfig>(set_index, &expression)
+                    .map_err(|error| config_error(&error))?;
+                set_keys.insert(key, set_index);
+                set_layers.push(layer);
             }
         }
     }
+    for (layer, key) in cli.command.sugar_layers()? {
+        if let Some(index) = set_keys.get(&key) {
+            return Err(Cli::command().error(
+                clap::error::ErrorKind::ArgumentConflict,
+                format!(
+                    "configuration key {key} is set by both {} and --set #{index}",
+                    layer.origin
+                ),
+            ));
+        }
+        layers.push(layer);
+    }
+    layers.extend(set_layers);
     let layered = layer::<DevConfig>(layers).map_err(|error| config_error(&error))?;
     let limits = layered.config.limits.clone();
     Ok(match cli.command {
-        ParsedCommand::Bench(mut options) => {
-            options.limits = limits;
-            Command::Bench(options)
+        ParsedCommand::Bench(options) => {
+            Command::Bench(options.with_config(&layered.config, limits)?)
         }
         ParsedCommand::Config(options) => match options.command {
             ConfigCommand::Show(options) => Command::Config(ConfigShow {
@@ -263,12 +292,111 @@ fn config_error(error: &ConfigError) -> clap::Error {
     Cli::command().error(clap::error::ErrorKind::ValueValidation, error.to_string())
 }
 
-fn parse_positive(value: &str) -> Result<usize, String> {
+fn parse_positive(value: &str) -> Result<u32, String> {
     value
         .parse()
         .ok()
         .filter(|&count| count > 0)
         .ok_or_else(|| "value must be a positive integer".to_owned())
+}
+
+struct Sugar {
+    flag: &'static str,
+    key: &'static str,
+}
+
+const SUGAR: &[Sugar] = &[
+    Sugar {
+        flag: "--pp",
+        key: "bench.pp",
+    },
+    Sugar {
+        flag: "--tg",
+        key: "bench.tg",
+    },
+    Sugar {
+        flag: "--reps",
+        key: "bench.reps",
+    },
+    Sugar {
+        flag: "--breakdown",
+        key: "bench.breakdown",
+    },
+    Sugar {
+        flag: "--host-argmax",
+        key: "bench.selection",
+    },
+];
+
+impl ParsedCommand {
+    fn sugar_layers(&self) -> Result<Vec<(Layer, KeyPath)>, clap::Error> {
+        let Self::Bench(options) = self else {
+            return Ok(Vec::new());
+        };
+        let mut values = Vec::new();
+        values.extend(options.pp.map(|value| ("--pp", value.to_string())));
+        values.extend(options.tg.map(|value| ("--tg", value.to_string())));
+        values.extend(options.reps.map(|value| ("--reps", value.to_string())));
+        values.extend(
+            options
+                .breakdown
+                .then(|| ("--breakdown", "true".to_owned())),
+        );
+        values.extend(
+            options
+                .host_argmax
+                .then(|| ("--host-argmax", "[\"host-argmax\"]".to_owned())),
+        );
+        values
+            .into_iter()
+            .map(|(flag, value)| sugar_layer(flag, &value))
+            .collect()
+    }
+}
+
+fn sugar_layer(flag: &'static str, value: &str) -> Result<(Layer, KeyPath), clap::Error> {
+    let Some(sugar) = SUGAR.iter().find(|sugar| sugar.flag == flag) else {
+        return Err(Cli::command().error(
+            clap::error::ErrorKind::InvalidValue,
+            format!("unknown sugar flag {flag}"),
+        ));
+    };
+    let (mut layer, key) = set_layer::<DevConfig>(0, &format!("{}={value}", sugar.key))
+        .map_err(|error| config_error(&error))?;
+    layer.origin = Origin::Flag(flag);
+    Ok((layer, key))
+}
+
+impl BenchArgs {
+    fn with_config(self, config: &DevConfig, limits: Limits) -> Result<Bench, clap::Error> {
+        let count = |value: u32| {
+            usize::try_from(value).map_err(|error| {
+                Cli::command().error(clap::error::ErrorKind::ValueValidation, error.to_string())
+            })
+        };
+        Ok(Bench {
+            engines: self.engines,
+            model_dir: self.model_dir,
+            pp: count(config.bench.pp.get())?,
+            tg: count(config.bench.tg.get())?,
+            reps: count(config.bench.reps.get())?,
+            warmups: count(config.bench.warmups)?,
+            decode_prefill: count(config.bench.decode_prefill.get())?,
+            contexts: config
+                .bench
+                .contexts
+                .as_slice()
+                .iter()
+                .copied()
+                .map(count)
+                .collect::<Result<_, _>>()?,
+            selection: config.bench.selection.as_slice().to_vec(),
+            json: self.json,
+            breakdown: config.bench.breakdown,
+            graph_replay: self.graph_replay,
+            limits,
+        })
+    }
 }
 
 fn parse_backend_option(value: &str) -> Result<GraphReplay, String> {
@@ -310,6 +438,18 @@ mod tests {
 
     use super::*;
 
+    fn parse_with_file(arguments: &[&str], source: &str) -> Command {
+        let layer = Layer::new(
+            Origin::File("test.toml".into()),
+            toml::from_str(source).unwrap(),
+        );
+        parse_with(
+            arguments.iter().map(|argument| (*argument).to_owned()),
+            |_| Ok(vec![layer]),
+        )
+        .unwrap()
+    }
+
     #[test]
     fn parses_benchmark_options() {
         let command = parse(
@@ -339,9 +479,12 @@ mod tests {
                 pp: 33,
                 tg: 7,
                 reps: 2,
+                warmups: 3,
+                decode_prefill: 8,
+                contexts: vec![9, 512, 2_048, 4_000],
+                selection: vec![Selection::GpuSequential, Selection::GpuPipelined],
                 json: Some(PathBuf::from("/result.json")),
                 breakdown: false,
-                host_argmax: false,
                 graph_replay: GraphReplay::Tier2,
                 limits: Limits::default(),
             })
@@ -371,7 +514,7 @@ mod tests {
             panic!("expected bench command");
         };
         assert!(options.breakdown);
-        assert!(options.host_argmax);
+        assert_eq!(options.selection, [Selection::HostArgmax]);
         assert_eq!(
             options.engines,
             [PathBuf::from("/f32.wasm"), PathBuf::from("/bf16.wasm")]
@@ -399,6 +542,30 @@ mod tests {
     }
 
     #[test]
+    fn rejects_sugar_and_set_for_the_same_key() {
+        let error = parse(
+            [
+                "bench",
+                "--engine",
+                "/engine.wasm",
+                "--model-dir",
+                "/model",
+                "--reps",
+                "5",
+                "--set",
+                "bench.reps=7",
+            ]
+            .map(str::to_owned),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("bench.reps is set by both --reps and --set #1")
+        );
+    }
+
+    #[test]
     fn parses_benchmark_defaults() {
         let command = parse(
             ["bench", "--engine", "/engine.wasm", "--model-dir", "/model"].map(str::to_owned),
@@ -411,6 +578,28 @@ mod tests {
         assert_eq!(options.tg, 128);
         assert_eq!(options.reps, 30);
         assert_eq!(options.graph_replay, GraphReplay::Tier2);
+    }
+
+    #[test]
+    fn file_values_survive_without_bench_sugar_flags() {
+        let command = parse_with_file(
+            &["bench", "--engine", "/engine.wasm", "--model-dir", "/model"],
+            r#"[bench]
+pp = 33
+tg = 7
+reps = 2
+breakdown = true
+selection = ["host-argmax"]
+"#,
+        );
+        let Command::Bench(options) = command else {
+            panic!("expected bench command");
+        };
+        assert_eq!(options.pp, 33);
+        assert_eq!(options.tg, 7);
+        assert_eq!(options.reps, 2);
+        assert!(options.breakdown);
+        assert_eq!(options.selection, [Selection::HostArgmax]);
     }
 
     #[test]
