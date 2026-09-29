@@ -33,6 +33,90 @@ impl Guest for Component {
         )
         .map_err(|error| error.to_string())
     }
+
+    async fn capture_replay(value: u32) -> Result<Vec<u32>, String> {
+        capture_replay(value).map_err(|error| error.to_string())
+    }
+
+    async fn capture_refusals() -> Result<Vec<String>, String> {
+        capture_refusals().map_err(|error| error.to_string())
+    }
+}
+
+fn capture_replay(value: u32) -> forja_sdk::Result<Vec<u32>> {
+    let values = (10_u32..17).collect::<Vec<_>>();
+    let source = Tensor::constant(&values, &[7])?;
+    let replay_output = Tensor::zeros(&[7])?;
+    let lazy_output = Tensor::zeros(&[7])?;
+    let position = forja_sdk::Param::new(0..=6)?;
+    let graph = forja_sdk::capture(&[&position], || {
+        let end = (position.at(6) + 1)?;
+        let input = source.narrow(0, 0, end.clone())?;
+        let mut output = replay_output.narrow(0, 0, end)?;
+        input.copy_into(&mut output)
+    })?;
+    graph.replay(&[value])?;
+    let end = value
+        .checked_add(1)
+        .ok_or_else(|| forja_sdk::Error::loading("lazy prefix length overflowed"))?;
+    let input = source.narrow(0, 0, end)?;
+    let mut output = lazy_output.narrow(0, 0, end)?;
+    input.copy_into(&mut output)?;
+    let lazy = lazy_output.to_vec()?;
+    let replay = replay_output.to_vec()?;
+    if replay != lazy {
+        return Err(forja_sdk::Error::loading(
+            "captured prefix differs from lazy execution",
+        ));
+    }
+    Ok(replay)
+}
+
+fn capture_refusals() -> forja_sdk::Result<Vec<String>> {
+    let source = Tensor::constant(&(0_u32..7).collect::<Vec<_>>(), &[7])?;
+    let position = forja_sdk::Param::new(0..=6)?;
+    let mut errors = Vec::new();
+    errors.push(
+        forja_sdk::capture(&[&position], || Tensor::from_slice(&[1_u32], &[1]))
+            .err()
+            .ok_or_else(|| forja_sdk::Error::loading("from_slice was accepted"))?
+            .to_string(),
+    );
+    errors.push(
+        forja_sdk::capture(&[&position], || {
+            source.write(&(0_u32..7).collect::<Vec<_>>())?;
+            Ok(())
+        })
+        .err()
+        .ok_or_else(|| forja_sdk::Error::loading("write was accepted"))?
+        .to_string(),
+    );
+    errors.push(
+        forja_sdk::capture(&[&position], || source.to_vec())
+            .err()
+            .ok_or_else(|| forja_sdk::Error::loading("to_vec was accepted"))?
+            .to_string(),
+    );
+    errors.push(
+        forja_sdk::capture(&[&position], || {
+            forja_sdk::eval()?;
+            Ok(())
+        })
+        .err()
+        .ok_or_else(|| forja_sdk::Error::loading("eval was accepted"))?
+        .to_string(),
+    );
+    errors.push(
+        forja_sdk::capture(&[&position], || {
+            source
+                .narrow(0, 0, (position.at(2) + 1)?)?
+                .broadcast_as(&[7])
+        })
+        .err()
+        .ok_or_else(|| forja_sdk::Error::loading("symbolic broadcast was accepted"))?
+        .to_string(),
+    );
+    Ok(errors)
 }
 
 fn attention(

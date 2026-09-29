@@ -159,6 +159,44 @@ async fn metal_tensor_smoke_runs_sdk_attention_block() -> wasmtime::Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn cpu_sdk_capture_replays_affine_views() -> wasmtime::Result<()> {
+    run_sdk_capture(forja_cpu::CpuBackend::new()).await
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test(flavor = "multi_thread")]
+async fn metal_sdk_capture_replays_affine_views() -> wasmtime::Result<()> {
+    run_sdk_capture(forja_metal::MetalBackend::new().map_err(wasmtime::Error::msg)?).await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sdk_capture_refuses_data_dependent_actions() -> wasmtime::Result<()> {
+    let (mut store, instance) = instantiate(
+        forja_cpu::CpuBackend::new(),
+        test_guests::sdk_smoke(),
+        COMMAND_LIMITS,
+    )
+    .await?;
+    let refusals = instance
+        .get_typed_func::<(), (Result<Vec<String>, String>,)>(&mut store, "capture-refusals")?;
+    Host::reset_guest_deadline(&mut store);
+    let (errors,) = store
+        .run_concurrent(async move |accessor| refusals.call_concurrent(accessor, ()).await)
+        .await??;
+    assert_eq!(
+        errors.map_err(wasmtime::Error::msg)?,
+        [
+            "from_slice is not allowed during graph capture",
+            "write is not allowed during graph capture",
+            "to_vec is not allowed during graph capture",
+            "eval is not allowed during graph capture",
+            "broadcast_as does not accept automatic symbolic extents",
+        ]
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn adversarial_tensor_calls_return_errors() -> wasmtime::Result<()> {
     let (mut store, instance) = instantiate(
         forja_cpu::CpuBackend::new(),
@@ -395,6 +433,28 @@ where
         return Err(wasmtime::Error::msg(format!(
             "SDK attention relative error {error} exceeded {F32_TOLERANCE}"
         )));
+    }
+    Ok(())
+}
+
+async fn run_sdk_capture<B>(backend: B) -> wasmtime::Result<()>
+where
+    B: Backend + Send + Sync + 'static,
+{
+    let (mut store, instance) =
+        instantiate(backend, test_guests::sdk_smoke(), COMMAND_LIMITS).await?;
+    let replay = instance
+        .get_typed_func::<(u32,), (Result<Vec<u32>, String>,)>(&mut store, "capture-replay")?;
+    let expected = (10_u32..17).collect::<Vec<_>>();
+    for value in [0_u32, 3, 6] {
+        Host::reset_guest_deadline(&mut store);
+        let (actual,) = store
+            .run_concurrent(async |accessor| replay.call_concurrent(accessor, (value,)).await)
+            .await??;
+        let actual = actual.map_err(wasmtime::Error::msg)?;
+        let copied = usize::try_from(value + 1).map_err(wasmtime::Error::msg)?;
+        assert_eq!(&actual[..copied], &expected[..copied]);
+        assert!(actual[copied..].iter().all(|&element| element == 0));
     }
     Ok(())
 }

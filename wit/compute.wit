@@ -235,4 +235,6 @@ world sdk-smoke {
     v-weight: list<f32>,
     output-weight: list<f32>,
   ) -> result<list<f32>, string>;
+  export capture-replay: async func(value: u32) -> result<list<u32>, string>;
+  export capture-refusals: async func() -> result<list<string>, string>;
 }
