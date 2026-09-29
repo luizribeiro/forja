@@ -3,7 +3,7 @@ use std::{error::Error, fmt, sync::Arc};
 use crate::{
     Affine, ByteHull, CommandList, Dispatch, Op, OpError, ParamError, ParamSpace, ParamValues,
     SymbolicLayout, SymbolicLayoutError, Tensor, TensorError, byte_ranges_overlap,
-    ops::{BufferAccess, barriers_bounded_by, barriers_for_accesses},
+    ops::{BufferAccess, barriers_bounded_by, barriers_for_accesses, dispatch_accesses},
     program::{BindError, Inst, PreparedProgram, ProgramKind},
 };
 
@@ -514,6 +514,12 @@ impl GraphTemplate {
         &self.required_barriers
     }
 
+    /// Returns the resource bounds retained by this template.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn limits(&self) -> GraphLimits {
+        self.limits
+    }
     /// Checks raw replay values against this template's parameter space.
     ///
     /// # Errors
@@ -559,6 +565,21 @@ impl GraphTemplate {
             inputs: inputs.iter().map(|tensor| (*tensor).clone()).collect(),
             outputs: outputs.iter().map(|tensor| (*tensor).clone()).collect(),
         })
+    }
+
+    /// Records a concrete dispatch already validated at its command-list boundary.
+    #[doc(hidden)]
+    pub fn record_validated(&mut self, dispatch: Dispatch) -> Result<(), GraphError> {
+        // This relies on the host constructing the graph with its command-validation limits.
+        if self.dispatches.len() >= self.limits.dispatches {
+            return Err(GraphError::DispatchLimit);
+        }
+        let accesses = dispatch_accesses(&dispatch);
+        let hull_accesses = accesses.iter().map(BufferAccess::as_hull).collect();
+        self.dispatches
+            .push(TemplateDispatch::Static(Box::new(dispatch)));
+        self.record_accesses(accesses, hull_accesses);
+        Ok(())
     }
 
     /// Instantiates parameter-dependent dispatches and fully validates their concrete forms.
@@ -610,11 +631,15 @@ impl GraphTemplate {
             self.dispatches
                 .push(TemplateDispatch::Static(Box::new(first)));
         }
+        self.record_accesses(accesses, hull_accesses);
+        Ok(())
+    }
+
+    fn record_accesses(&mut self, accesses: Vec<BufferAccess>, hull_accesses: Vec<BufferAccess>) {
         self.barrier_accesses.push(accesses);
         self.hull_barrier_accesses.push(hull_accesses);
         let upper = barriers_for_accesses(self.hull_barrier_accesses.iter().cloned());
         self.required_barriers = barriers_bounded_by(&self.barrier_accesses, &upper);
-        Ok(())
     }
 }
 
@@ -668,7 +693,9 @@ fn sdpa_flops(inputs: &[Tensor]) -> Option<u64> {
 mod tests {
     use proptest::prelude::*;
 
-    use super::{GraphError, GraphLimits, GraphTemplate, TemplateOp, TemplateTensor};
+    use super::{
+        GraphError, GraphLimits, GraphTemplate, TemplateDispatch, TemplateOp, TemplateTensor,
+    };
     use crate::{
         Affine, BufferId, CommandList, DType, Dispatch, Layout, Op, OpError, Operand, ParamError,
         ParamSpace, ParamValues, SymbolicLayout, Tensor,
@@ -900,6 +927,55 @@ mod tests {
             Err(GraphError::WorkLimit)
         );
         assert!(GraphLimits::new(1, 4, 12).check_program(&program).is_ok());
+    }
+
+    #[test]
+    fn validated_recording_matches_regular_recording() {
+        let input = tensor(1, &[7]);
+        let middle = tensor(2, &[7]);
+        let output = tensor(3, &[7]);
+        let space = ParamSpace::new(Vec::new()).unwrap();
+        let limits = GraphLimits::new(2, 7, 21);
+        let mut regular = GraphTemplate::new(space.clone(), limits);
+        regular
+            .dispatch(
+                Op::Copy,
+                &[&TemplateTensor::from(input.clone())],
+                &TemplateTensor::from(middle.clone()),
+            )
+            .unwrap();
+        regular
+            .dispatch(
+                Op::Add,
+                &[
+                    &TemplateTensor::from(middle.clone()),
+                    &TemplateTensor::from(input.clone()),
+                ],
+                &TemplateTensor::from(output.clone()),
+            )
+            .unwrap();
+
+        let mut validated = GraphTemplate::new(space, limits);
+        validated
+            .record_validated(Dispatch::new(Op::Copy, &[&input], &middle).unwrap())
+            .unwrap();
+        validated
+            .record_validated(Dispatch::new(Op::Add, &[&middle, &input], &output).unwrap())
+            .unwrap();
+
+        assert_eq!(regular.required_barriers(), validated.required_barriers());
+        let split = |graph: &GraphTemplate| {
+            graph
+                .dispatches
+                .iter()
+                .map(|dispatch| matches!(dispatch, TemplateDispatch::Static(_)))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(split(&regular), split(&validated));
+        assert_eq!(
+            validated.record_validated(Dispatch::new(Op::Copy, &[&input], &middle).unwrap()),
+            Err(GraphError::DispatchLimit)
+        );
     }
 
     #[test]

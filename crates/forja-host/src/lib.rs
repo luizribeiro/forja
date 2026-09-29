@@ -889,6 +889,7 @@ impl GraphLease {
 
 #[derive(Debug)]
 enum RecordedDispatch {
+    Static(Box<forja_core::Dispatch>),
     Operation {
         op: TemplateOp,
         inputs: Vec<TemplateTensor>,
@@ -1444,15 +1445,23 @@ impl<B: Backend> Host<B> {
                 .commands
                 .dispatch(operation, &input_tensors, &output_entry.tensor)
                 .map_err(guest_error)?;
+            let dispatch = entry
+                .commands
+                .last_dispatch()
+                .cloned()
+                .ok_or_else(|| guest_error(BackendError::ExecutionFailed))?;
+            entry
+                .recorded
+                .push(RecordedDispatch::Static(Box::new(dispatch)));
         } else {
             entry.parameterized = true;
+            entry.recorded.push(RecordedDispatch::Operation {
+                op: template_op,
+                inputs: template_inputs,
+                output: Box::new(template_output),
+            });
         }
         entry.space = entry.space.take().or(dispatch_space);
-        entry.recorded.push(RecordedDispatch::Operation {
-            op: template_op,
-            inputs: template_inputs,
-            output: Box::new(template_output),
-        });
         entry.retained.extend(input_entries);
         entry.retained.push(output_entry);
         Ok(())
@@ -1514,15 +1523,23 @@ impl<B: Backend> Host<B> {
                 .commands
                 .dispatch_kernel(&program, &input_tensors, &output_tensors)
                 .map_err(guest_error)?;
+            let dispatch = entry
+                .commands
+                .last_dispatch()
+                .cloned()
+                .ok_or_else(|| guest_error(BackendError::ExecutionFailed))?;
+            entry
+                .recorded
+                .push(RecordedDispatch::Static(Box::new(dispatch)));
         } else {
             entry.parameterized = true;
+            entry.recorded.push(RecordedDispatch::Program {
+                program: Arc::clone(&program),
+                inputs: template_inputs,
+                outputs: template_outputs,
+            });
         }
         entry.space = entry.space.take().or(dispatch_space);
-        entry.recorded.push(RecordedDispatch::Program {
-            program,
-            inputs: template_inputs,
-            outputs: template_outputs,
-        });
         entry.retained.extend(input_entries);
         entry.retained.extend(output_entries);
         entry.retained_kernels.push(retained_kernel);
@@ -1558,6 +1575,9 @@ impl<B: Backend> Host<B> {
             .recorded
             .iter()
             .try_for_each(|dispatch| match dispatch {
+                RecordedDispatch::Static(dispatch) => {
+                    graph.record_validated(dispatch.as_ref().clone())
+                }
                 RecordedDispatch::Operation { op, inputs, output } => {
                     let inputs = inputs.iter().collect::<Vec<_>>();
                     graph.dispatch(*op, &inputs, output)
@@ -2909,6 +2929,24 @@ mod tests {
         host.drop_graph(graph).unwrap();
         assert_eq!(host.live_graphs.load(Ordering::Acquire), 0);
         empty_graph(&mut host);
+    }
+
+    #[test]
+    fn created_graph_uses_command_validation_limits() {
+        let limits = Limits::new(u64::MAX, 8, 17, 32, u64::MAX).with_command_limits(3, 29);
+        let mut host = Host::new(CpuBackend::new(), limits);
+        let commands = host.command_list().unwrap();
+        let graph = host.create_graph(commands).unwrap();
+        let entry = host.table.get(&graph).unwrap();
+
+        assert_eq!(
+            entry.graph.limits(),
+            forja_core::GraphLimits::new(
+                limits.dispatches_per_list,
+                limits.tensor_elements,
+                limits.work_per_dispatch,
+            )
+        );
     }
 
     #[test]

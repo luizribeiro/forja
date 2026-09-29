@@ -448,6 +448,13 @@ impl CommandList {
     pub fn into_dispatches(self) -> Vec<Dispatch> {
         self.dispatches
     }
+
+    /// Returns the most recently validated dispatch.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn last_dispatch(&self) -> Option<&Dispatch> {
+        self.dispatches.last()
+    }
 }
 
 fn check_kernel_signature(
@@ -570,7 +577,7 @@ impl BufferAccess {
         }
     }
 
-    fn as_hull(&self) -> Self {
+    pub(crate) fn as_hull(&self) -> Self {
         let bytes = match &self.region {
             AccessRegion::Empty => None,
             region => Some(region.byte_span()),
