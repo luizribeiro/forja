@@ -323,6 +323,40 @@ impl CpuBackend {
         scatter(target, output.layout(), &bytes)
     }
 
+    fn execute_sample(
+        &self,
+        inputs: &[Tensor],
+        output: &Tensor,
+        position: u32,
+    ) -> Result<(), BackendError> {
+        let values = decode(&self.read(&inputs[0])?, inputs[0].layout().dtype())
+            .ok_or(BackendError::ExecutionFailed)?;
+        let words = decode_u32(&self.read(&inputs[1])?).ok_or(BackendError::ExecutionFailed)?;
+        let parameters = SamplingParameters::from_words(&words)?;
+        let width = execution_usize(
+            inputs[0]
+                .layout()
+                .shape()
+                .last()
+                .copied()
+                .ok_or(BackendError::ExecutionFailed)?,
+        )?;
+        let indices = values
+            .chunks_exact(width)
+            .map(|row| sample_row(row, parameters, position))
+            .collect::<Result<Vec<_>, _>>()?;
+        let bytes = indices
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect::<Vec<_>>();
+        let mut buffers = self
+            .buffers
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?;
+        let target = buffers.get_mut(output)?.bytes_mut()?;
+        scatter(target, output.layout(), &bytes)
+    }
+
     #[allow(clippy::cast_precision_loss)]
     fn execute_rope(
         &self,
@@ -595,6 +629,9 @@ impl Backend for CpuBackend {
                 }
                 Op::Softmax => self.execute_softmax(dispatch.inputs(), dispatch.output()),
                 Op::Argmax => self.execute_argmax(dispatch.inputs(), dispatch.output()),
+                Op::Sample { position } => {
+                    self.execute_sample(dispatch.inputs(), dispatch.output(), position)
+                }
                 Op::Rope { theta } => {
                     self.execute_rope(dispatch.inputs(), dispatch.output(), theta)
                 }
@@ -613,6 +650,128 @@ impl Backend for CpuBackend {
             wall_time: started.elapsed(),
         })
     }
+}
+
+#[derive(Clone, Copy)]
+struct SamplingParameters {
+    temperature: f32,
+    top_k: u32,
+    top_p: f32,
+    seed: u64,
+}
+
+impl SamplingParameters {
+    fn from_words(words: &[u32]) -> Result<Self, BackendError> {
+        let [temperature, top_k, top_p, seed_low, seed_high] = words else {
+            return Err(BackendError::InvalidInput);
+        };
+        let temperature = f32::from_bits(*temperature);
+        let top_p = f32::from_bits(*top_p);
+        if !temperature.is_finite()
+            || temperature < 0.0
+            || !top_p.is_finite()
+            || !(0.0..=1.0).contains(&top_p)
+            || top_p == 0.0
+        {
+            return Err(BackendError::InvalidInput);
+        }
+        Ok(Self {
+            temperature,
+            top_k: *top_k,
+            top_p,
+            seed: u64::from(*seed_low) | (u64::from(*seed_high) << 32),
+        })
+    }
+}
+
+fn sample_row(
+    row: &[f32],
+    parameters: SamplingParameters,
+    position: u32,
+) -> Result<u32, BackendError> {
+    if parameters.temperature == 0.0 || parameters.top_k == 1 {
+        return row
+            .iter()
+            .enumerate()
+            .max_by(|(_, left), (_, right)| left.total_cmp(right))
+            .and_then(|(index, _)| u32::try_from(index).ok())
+            .ok_or(BackendError::ExecutionFailed);
+    }
+    let mut allowed = (0..row.len()).collect::<Vec<_>>();
+    allowed.sort_unstable_by(|&left, &right| {
+        row[right]
+            .total_cmp(&row[left])
+            .then_with(|| right.cmp(&left))
+    });
+    let requested = usize::try_from(parameters.top_k).map_err(|_| BackendError::InvalidInput)?;
+    let cap = if parameters.top_p < 1.0 {
+        if requested == 0 {
+            1024
+        } else {
+            requested.min(1024)
+        }
+    } else if requested == 0 {
+        allowed.len()
+    } else {
+        requested
+    };
+    allowed.truncate(cap.min(allowed.len()));
+    if parameters.top_p < 1.0 {
+        truncate_top_p(row, &mut allowed, parameters)?;
+    }
+    allowed
+        .into_iter()
+        .max_by(|&left, &right| {
+            sampled_score(row[left], parameters, position, left)
+                .total_cmp(&sampled_score(row[right], parameters, position, right))
+                .then_with(|| left.cmp(&right))
+        })
+        .and_then(|index| u32::try_from(index).ok())
+        .ok_or(BackendError::ExecutionFailed)
+}
+
+fn truncate_top_p(
+    row: &[f32],
+    allowed: &mut Vec<usize>,
+    parameters: SamplingParameters,
+) -> Result<(), BackendError> {
+    let maximum = *allowed.first().ok_or(BackendError::ExecutionFailed)?;
+    let weights = allowed
+        .iter()
+        .map(|&index| ((row[index] - row[maximum]) / parameters.temperature).exp())
+        .collect::<Vec<_>>();
+    let total = weights.iter().sum::<f32>();
+    if total.is_finite() && total > 0.0 {
+        let mut cumulative = 0.0;
+        let keep = weights
+            .iter()
+            .position(|weight| {
+                cumulative += weight / total;
+                cumulative >= parameters.top_p
+            })
+            .map_or(weights.len(), |index| index + 1);
+        allowed.truncate(keep.max(1));
+    } else {
+        allowed.truncate(1);
+    }
+    Ok(())
+}
+
+fn sampled_score(logit: f32, parameters: SamplingParameters, position: u32, index: usize) -> f32 {
+    let index = u64::try_from(index).unwrap_or(u64::MAX);
+    let counter = parameters.seed ^ (u64::from(position) << 32) ^ index;
+    let random = splitmix64(counter);
+    let mantissa = u32::try_from(random >> 40).unwrap_or(u32::MAX);
+    #[allow(clippy::cast_precision_loss)]
+    let uniform = (mantissa as f32 + 0.5) * (1.0 / 16_777_216.0);
+    logit / parameters.temperature - (-uniform.ln()).ln()
+}
+
+const fn splitmix64(mut value: u64) -> u64 {
+    value = value.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
 }
 
 fn element_count(shape: &[u32]) -> Result<u64, BackendError> {
@@ -1143,6 +1302,107 @@ mod tests {
     }
 
     #[test]
+    fn greedy_sampling_matches_argmax_for_edge_values_and_widths() {
+        for width in [1_u32, 7, 33, 4097, 151_936] {
+            let mut row = (0..width)
+                .map(|index| f32::from(u16::try_from(index % 19).unwrap()) - 9.0)
+                .collect::<Vec<_>>();
+            if width >= 7 {
+                row[..7].copy_from_slice(&[
+                    f32::NEG_INFINITY,
+                    -0.0,
+                    0.0,
+                    f32::INFINITY,
+                    f32::NAN,
+                    f32::NAN,
+                    f32::INFINITY,
+                ]);
+            }
+            let expected = row
+                .iter()
+                .enumerate()
+                .max_by(|(_, left), (_, right)| left.total_cmp(right))
+                .map(|(index, _)| u32::try_from(index).unwrap())
+                .unwrap();
+            for parameters in [
+                sampling_parameters(0.0, 0, 1.0, 7),
+                sampling_parameters(0.7, 1, 0.9, 7),
+            ] {
+                assert_eq!(sample_row(&row, parameters, 33).unwrap(), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn sampled_tokens_are_counter_deterministic() {
+        let row = [0.1, -0.3, 1.2, 0.7, 0.0, 0.9, -1.0];
+        let parameters = sampling_parameters(0.7, 0, 1.0, 0xfeed_beef_dead_cafe);
+        let first = (0..128)
+            .map(|position| sample_row(&row, parameters, position).unwrap())
+            .collect::<Vec<_>>();
+        let second = (0..128)
+            .map(|position| sample_row(&row, parameters, position).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(first, second);
+        assert!(first.windows(2).any(|pair| pair[0] != pair[1]));
+    }
+
+    #[test]
+    fn top_k_and_top_p_keep_only_the_exact_allowed_set() {
+        let row = [10.0, 9.0, 8.0, 1.0, 0.0, -1.0, -2.0];
+        let top_k = sampling_parameters(1.0, 3, 1.0, 11);
+        let top_p = sampling_parameters(1.0, 0, 0.7, 11);
+        let combined = sampling_parameters(1.0, 2, 0.999, 11);
+        for position in 0..4096 {
+            assert!(sample_row(&row, top_k, position).unwrap() <= 2);
+            assert!(sample_row(&row, top_p, position).unwrap() <= 1);
+            assert!(sample_row(&row, combined, position).unwrap() <= 1);
+        }
+    }
+
+    #[test]
+    fn sampling_distributions_match_known_probabilities() {
+        assert_chi_squared(
+            &[0.0, 0.0, 0.0, 0.0],
+            sampling_parameters(1.0, 0, 1.0, 91),
+            &[0.25; 4],
+        );
+        assert_chi_squared(
+            &[2.0, 1.0, 0.0],
+            sampling_parameters(1.0, 2, 1.0, 92),
+            &[0.731_058_6, 0.268_941_4, 0.0],
+        );
+        assert_chi_squared(
+            &[2.0, 1.0, 0.0],
+            sampling_parameters(1.0, 0, 0.8, 93),
+            &[0.731_058_6, 0.268_941_4, 0.0],
+        );
+    }
+
+    #[test]
+    fn sample_refuses_invalid_live_parameters() {
+        let backend = CpuBackend::new();
+        let logits = backend.alloc(DType::F32, &[7]).unwrap();
+        backend.write(&logits, &f32_bytes(&[0.0; 7])).unwrap();
+        let params = backend.alloc(DType::U32, &[5]).unwrap();
+        backend
+            .write(
+                &params,
+                &u32_bytes(&[f32::NAN.to_bits(), 0, 1.0_f32.to_bits(), 0, 0]),
+            )
+            .unwrap();
+        let output = backend.alloc(DType::U32, &[]).unwrap();
+        let mut commands = CommandList::new();
+        commands
+            .dispatch(Op::Sample { position: 0 }, &[&logits, &params], &output)
+            .unwrap();
+        assert_eq!(
+            backend.submit(commands).unwrap().wait(),
+            Err(BackendError::InvalidInput)
+        );
+    }
+
+    #[test]
     fn normalizes_qwen_hidden_rows_with_epsilon() {
         let backend = CpuBackend::new();
         let input = backend.alloc(DType::F32, &[3, 1024]).unwrap();
@@ -1487,6 +1747,45 @@ mod tests {
             .iter()
             .flat_map(|value| value.to_le_bytes())
             .collect()
+    }
+
+    fn sampling_parameters(
+        temperature: f32,
+        top_k: u32,
+        top_p: f32,
+        seed: u64,
+    ) -> SamplingParameters {
+        SamplingParameters {
+            temperature,
+            top_k,
+            top_p,
+            seed,
+        }
+    }
+
+    fn assert_chi_squared(row: &[f32], parameters: SamplingParameters, expected: &[f32]) {
+        let trials = 20_000_u32;
+        let mut counts = vec![0_u32; row.len()];
+        for position in 0..trials {
+            let token = sample_row(row, parameters, position).unwrap();
+            counts[usize::try_from(token).unwrap()] += 1;
+        }
+        let statistic = counts
+            .iter()
+            .zip(expected)
+            .filter(|(_, probability)| **probability > 0.0)
+            .map(|(&count, &probability)| {
+                let expected_count = probability * f32::from(u16::try_from(trials).unwrap());
+                let difference = f32::from(u16::try_from(count).unwrap()) - expected_count;
+                difference * difference / expected_count
+            })
+            .sum::<f32>();
+        assert!(statistic < 16.3, "chi-squared statistic was {statistic}");
+        for (&count, &probability) in counts.iter().zip(expected) {
+            if probability == 0.0 {
+                assert_eq!(count, 0);
+            }
+        }
     }
 
     fn assert_relative(actual: &[f32], expected: &[f32], tolerance: f32) {

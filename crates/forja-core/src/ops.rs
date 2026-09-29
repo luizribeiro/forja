@@ -145,6 +145,11 @@ pub enum Op {
     Softmax,
     /// Selects the last greatest element of each row under IEEE total order.
     Argmax,
+    /// Samples one index from each row using counter-based randomness.
+    Sample {
+        /// Absolute sequence position mixed into the random counter.
+        position: u32,
+    },
     /// Applies half-split rotary position embeddings.
     Rope {
         /// The positive finite frequency base.
@@ -257,6 +262,7 @@ impl Dispatch {
             Op::RmsNorm { eps } => check_rms_norm(inputs, output, eps)?,
             Op::Softmax => check_softmax(inputs, output)?,
             Op::Argmax => check_argmax(inputs, output)?,
+            Op::Sample { .. } => check_sample(inputs, output)?,
             Op::Rope { theta } => check_rope(inputs, output, theta)?,
             Op::Embed => check_embed(inputs, output)?,
             Op::Matmul => check_matmul(inputs, output)?,
@@ -754,6 +760,28 @@ fn check_argmax(inputs: &[&Tensor], output: &Tensor) -> Result<(), OpError> {
         });
     }
     Ok(())
+}
+
+fn check_sample(inputs: &[&Tensor], output: &Tensor) -> Result<(), OpError> {
+    if inputs.len() != 2 {
+        return Err(OpError::Arity {
+            expected: 2,
+            actual: inputs.len(),
+        });
+    }
+    check_float(inputs[0], Operand::Input(0))?;
+    if inputs[1].layout.dtype() != DType::U32 {
+        return Err(OpError::DType {
+            operand: Operand::Input(1),
+            dtype: inputs[1].layout.dtype(),
+        });
+    }
+    if inputs[1].layout.shape() != [5] {
+        return Err(OpError::Shape {
+            operand: Operand::Input(1),
+        });
+    }
+    check_argmax(&inputs[..1], output)
 }
 
 fn check_rope(inputs: &[&Tensor], output: &Tensor, theta: f32) -> Result<(), OpError> {
@@ -1260,6 +1288,62 @@ mod tests {
             CommandList::new().dispatch(Op::Argmax, &[&scalar], &wrong_output),
             Err(OpError::Shape {
                 operand: Operand::Input(0)
+            })
+        );
+    }
+
+    #[test]
+    fn selection_rejects_empty_rows_before_dispatch() {
+        let logits = tensor(1, DType::F32, &[1, 0], &[0, 1]);
+        let params = tensor(2, DType::U32, &[5], &[1]);
+        let output = tensor(3, DType::U32, &[1], &[1]);
+
+        for op in [Op::Argmax, Op::Sample { position: 9 }] {
+            let inputs = match op {
+                Op::Sample { .. } => vec![&logits, &params],
+                _ => vec![&logits],
+            };
+            assert_eq!(
+                CommandList::new().dispatch(op, &inputs, &output),
+                Err(OpError::EmptyOperand {
+                    operand: Operand::Input(0)
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn sample_requires_logits_five_parameter_words_and_row_outputs() {
+        let logits = tensor(1, DType::BF16, &[3, 7], &[7, 1]);
+        let params = tensor(2, DType::U32, &[5], &[1]);
+        let short_params = tensor(3, DType::U32, &[4], &[1]);
+        let output = tensor(4, DType::U32, &[3], &[1]);
+        let float_output = tensor(5, DType::F32, &[3], &[1]);
+
+        assert!(
+            CommandList::new()
+                .dispatch(Op::Sample { position: 9 }, &[&logits, &params], &output)
+                .is_ok()
+        );
+        assert_eq!(
+            CommandList::new().dispatch(
+                Op::Sample { position: 9 },
+                &[&logits, &short_params],
+                &output
+            ),
+            Err(OpError::Shape {
+                operand: Operand::Input(1)
+            })
+        );
+        assert_eq!(
+            CommandList::new().dispatch(
+                Op::Sample { position: 9 },
+                &[&logits, &params],
+                &float_output
+            ),
+            Err(OpError::DType {
+                operand: Operand::Output,
+                dtype: DType::F32
             })
         );
     }

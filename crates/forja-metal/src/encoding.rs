@@ -1972,6 +1972,7 @@ impl MetalBackend {
             }
             Op::Softmax => self.encode_softmax(encoder, table, dispatch, bindings, arguments)?,
             Op::Argmax => self.encode_argmax(encoder, table, dispatch, bindings, arguments)?,
+            Op::Sample { .. } => return Err(BackendError::UnsupportedOperation),
             Op::Rope { theta } => {
                 self.encode_rope(encoder, table, dispatch, theta, bindings, arguments)?
             }
@@ -3574,6 +3575,7 @@ impl MetalBackend {
                 Self::size_softmax_arguments(arguments)?;
                 arguments.write(size_of::<u32>())?;
             }
+            Op::Sample { .. } => return Err(BackendError::UnsupportedOperation),
             Op::Rope { .. } => {
                 for len in [112, 112, 112, 12] {
                     arguments.write(len)?;
@@ -3975,6 +3977,7 @@ fn shape3(layout: &Layout) -> Result<[u32; 3], BackendError> {
 fn supported_dispatch(dispatch: &Dispatch) -> bool {
     match dispatch.op() {
         Op::Program(_) => dispatch.bound_program().is_some(),
+        Op::Sample { .. } => false,
         Op::Copy
         | Op::Add
         | Op::SiluMul
@@ -3990,7 +3993,7 @@ fn supported_dispatch(dispatch: &Dispatch) -> bool {
 
 fn reusable_dispatch(dispatch: &Dispatch) -> bool {
     match dispatch.op() {
-        Op::Argmax | Op::Embed | Op::Sdpa { .. } => false,
+        Op::Argmax | Op::Sample { .. } | Op::Embed | Op::Sdpa { .. } => false,
         Op::Matmul => {
             dispatch
                 .inputs()

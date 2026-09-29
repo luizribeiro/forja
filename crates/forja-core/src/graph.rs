@@ -267,6 +267,11 @@ pub enum TemplateOp {
         /// The absolute position of the first query.
         q_start: Affine,
     },
+    /// Sampling with a parameterized absolute sequence position.
+    Sample {
+        /// Absolute sequence position mixed into the random counter.
+        position: Affine,
+    },
 }
 
 impl TemplateOp {
@@ -278,6 +283,12 @@ impl TemplateOp {
             causal,
             q_start,
         }
+    }
+
+    /// Creates a sampling configuration whose position may depend on one parameter.
+    #[must_use]
+    pub const fn sample(position: Affine) -> Self {
+        Self::Sample { position }
     }
 
     /// Resolves the operation to a concrete configuration.
@@ -297,13 +308,20 @@ impl TemplateOp {
                 causal,
                 q_start: q_start.evaluate(values)?,
             }),
+            Self::Sample { position } => Ok(Op::Sample {
+                position: position.evaluate(values)?,
+            }),
         }
     }
 
     /// Reports whether the configuration depends on graph parameters.
     #[must_use]
     pub const fn is_parameter_dependent(self) -> bool {
-        matches!(self, Self::Sdpa { q_start, .. } if !q_start.is_constant())
+        match self {
+            Self::Static(_) => false,
+            Self::Sdpa { q_start, .. } => !q_start.is_constant(),
+            Self::Sample { position } => !position.is_constant(),
+        }
     }
 }
 
@@ -315,6 +333,7 @@ impl From<Op> for TemplateOp {
                 causal,
                 q_start,
             } => Self::sdpa(scale, causal, Affine::constant(q_start)),
+            Op::Sample { position } => Self::sample(Affine::constant(position)),
             _ => Self::Static(op),
         }
     }
