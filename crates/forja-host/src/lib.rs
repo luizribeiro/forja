@@ -10,7 +10,9 @@ mod weights;
 use std::time::{Duration, Instant};
 use std::{
     collections::HashMap,
+    future::Future,
     path::{Path, PathBuf},
+    pin::Pin,
     sync::{
         Arc, Mutex, OnceLock, Weak,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
@@ -94,6 +96,15 @@ pub struct EngineStep {
     pub taps: bool,
 }
 
+/// Input to greedy decode with an engine-retained feedback token.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EngineDecode {
+    /// Tokens to process, or `None` to reuse the preceding selected token.
+    pub tokens: Option<Vec<u32>>,
+    /// Position assigned to the first token, including a reused feedback token.
+    pub start_pos: u32,
+}
+
 /// A tensor returned by a component and owned by its runner.
 ///
 /// The handle remains valid until the runner starts its next step, which releases every output
@@ -111,6 +122,15 @@ pub struct EngineOutput {
     pub logits: EngineTensor,
     /// Requested per-layer hidden states.
     pub taps: Vec<EngineTensor>,
+}
+
+/// Device-resident outputs from greedy decode.
+#[derive(Debug)]
+pub struct EngineDecodeOutput {
+    /// Last-position logits with shape `[vocab]`.
+    pub logits: EngineTensor,
+    /// Selected token id with shape `[1]`.
+    pub token: EngineTensor,
 }
 
 /// Cumulative execution counters for an engine runner.
@@ -306,6 +326,9 @@ pub struct EngineRunner<B: Backend + Send + Sync + 'static> {
     last_profile: Option<EngineStepProfile>,
 }
 
+type EngineCallFuture<'a, T> =
+    Pin<Box<dyn Future<Output = wasmtime::Result<Result<T, compute::Error>>> + Send + 'a>>;
+
 const EPOCH_TICK: Duration = Duration::from_millis(10);
 static EPOCH_ENGINES: Mutex<Vec<EpochEngine>> = Mutex::new(Vec::new());
 static EPOCH_TICKER: OnceLock<()> = OnceLock::new();
@@ -455,14 +478,8 @@ where
         &mut self,
         input: EngineStep,
     ) -> wasmtime::Result<Result<EngineOutput, compute::Error>> {
-        if !self.profiling {
-            return self.step_inner(input).await;
-        }
-        self.store.data_mut().begin_profile_step();
-        let started = Instant::now();
-        let result = self.step_inner(input).await;
-        self.last_profile = self.store.data_mut().finish_profile_step(started.elapsed());
-        result
+        self.with_profile(move |runner| Box::pin(runner.step_inner(input)))
+            .await
     }
 
     async fn step_inner(
@@ -529,6 +546,73 @@ where
         }))
     }
 
+    /// Runs greedy decode and retains its logits and selected-token tensors.
+    ///
+    /// # Errors
+    ///
+    /// Returns a component execution error or the engine's structured failure.
+    pub async fn decode(
+        &mut self,
+        input: EngineDecode,
+    ) -> wasmtime::Result<Result<EngineDecodeOutput, compute::Error>> {
+        self.with_profile(move |runner| Box::pin(runner.decode_inner(input)))
+            .await
+    }
+
+    async fn decode_inner(
+        &mut self,
+        input: EngineDecode,
+    ) -> wasmtime::Result<Result<EngineDecodeOutput, compute::Error>> {
+        use engine_bindings::exports::l9o::gpu::engine::{DecodeIn, DecodeOut};
+        if let Err(error) = self.release_outputs() {
+            return Ok(Err(error));
+        }
+        let info = match &self.info {
+            Some(info) => info.clone(),
+            None => self.describe().await?,
+        };
+        self.set_guest_deadline();
+        let engine = self.instance.l9o_gpu_engine();
+        let output = match self
+            .store
+            .run_concurrent(async move |accessor| {
+                engine
+                    .call_decode(
+                        accessor,
+                        DecodeIn {
+                            tokens: input.tokens,
+                            start_pos: input.start_pos,
+                        },
+                    )
+                    .await
+            })
+            .await
+        {
+            Ok(output) => output?,
+            Err(error) if is_epoch_timeout(&error) => return Ok(Err(guest_timeout())),
+            Err(error) => return Err(error),
+        }?;
+        let DecodeOut { logits, token } = output;
+        let handles = vec![logits.rep(), token.rep()];
+        if let Err(error) = self.validate_decode_output(&info, &logits, &token) {
+            return Ok(Err(match self.release_handles(handles) {
+                Ok(()) => error,
+                Err(release_error) => release_error,
+            }));
+        }
+        self.output_handles = handles;
+        Ok(Ok(EngineDecodeOutput {
+            logits: EngineTensor {
+                handle: logits.rep(),
+                runner_id: self.id,
+            },
+            token: EngineTensor {
+                handle: token.rep(),
+                runner_id: self.id,
+            },
+        }))
+    }
+
     /// Reads a returned tensor through the selected backend.
     ///
     /// # Errors
@@ -565,6 +649,20 @@ where
         Host::reset_guest_deadline(&mut self.store);
     }
 
+    async fn with_profile<T>(
+        &mut self,
+        call: impl for<'a> FnOnce(&'a mut Self) -> EngineCallFuture<'a, T>,
+    ) -> wasmtime::Result<Result<T, compute::Error>> {
+        if !self.profiling {
+            return call(self).await;
+        }
+        self.store.data_mut().begin_profile_step();
+        let started = Instant::now();
+        let result = call(self).await;
+        self.last_profile = self.store.data_mut().finish_profile_step(started.elapsed());
+        result
+    }
+
     fn release_outputs(&mut self) -> Result<(), compute::Error> {
         let handles = std::mem::take(&mut self.output_handles);
         self.release_handles(handles)
@@ -590,15 +688,7 @@ where
         logits: &Resource<TensorEntry>,
         taps: &[Resource<TensorEntry>],
     ) -> Result<(), compute::Error> {
-        let logits = self.store.data().entry(logits)?;
-        if logits.tensor.layout().dtype() != DType::F32
-            || logits.tensor.layout().shape() != [info.vocab]
-        {
-            return Err(compute::Error::Layout(format!(
-                "engine logits must be f32 [{}]",
-                info.vocab
-            )));
-        }
+        self.validate_logits(info, logits)?;
         let expected_taps = if taps_requested {
             info.tap_layers.len()
         } else {
@@ -621,6 +711,39 @@ where
                     "engine taps must be f32 [{sequence}, hidden]"
                 )));
             }
+        }
+        Ok(())
+    }
+
+    fn validate_decode_output(
+        &self,
+        info: &EngineInfo,
+        logits: &Resource<TensorEntry>,
+        token: &Resource<TensorEntry>,
+    ) -> Result<(), compute::Error> {
+        self.validate_logits(info, logits)?;
+        let token = self.store.data().entry(token)?;
+        if token.tensor.layout().dtype() != DType::U32 || token.tensor.layout().shape() != [1] {
+            return Err(compute::Error::Layout(
+                "engine selected token must be u32 [1]".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_logits(
+        &self,
+        info: &EngineInfo,
+        logits: &Resource<TensorEntry>,
+    ) -> Result<(), compute::Error> {
+        let logits = self.store.data().entry(logits)?;
+        if logits.tensor.layout().dtype() != DType::F32
+            || logits.tensor.layout().shape() != [info.vocab]
+        {
+            return Err(compute::Error::Layout(format!(
+                "engine logits must be f32 [{}]",
+                info.vocab
+            )));
         }
         Ok(())
     }
