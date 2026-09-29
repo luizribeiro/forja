@@ -10,8 +10,8 @@ mod quantized;
 mod symbolic;
 
 pub use backend::{
-    AllocationRegistry, Backend, BackendError, DispatchProfile, ProfileCount, Submission,
-    SubmissionProfile, ViewOp,
+    AllocationRegistry, Backend, BackendError, DispatchProfile, ProfileCount, ProfileTensor,
+    Submission, SubmissionProfile, ViewOp,
 };
 pub use forja_mmap::MappedRegion;
 pub use graph::{

@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use block2::RcBlock;
 use forja_core::{
     BackendError, BufferId, CommandList, DType, Dispatch, DispatchProfile, GraphTemplate, Layout,
-    Op, PreparedGraph, ProfileCount, Slice, Submission, SubmissionProfile, Tensor,
+    Op, PreparedGraph, ProfileCount, ProfileTensor, Slice, Submission, SubmissionProfile, Tensor,
     program::{KernelSignature, PreparedProgram, ProgramHash, ProgramKind, ValidatedProgram},
     required_barriers,
 };
@@ -1274,18 +1274,34 @@ impl Completion {
         self.timestamps.as_ref()?.elapsed()
     }
 
-    fn dispatch_times(&self, operations: &[Op]) -> Option<Vec<DispatchProfile>> {
-        let pairs = (0..operations.len())
-            .map(|index| (2 + index * 2, 3 + index * 2))
-            .collect::<Vec<_>>();
-        Some(
-            operations
-                .iter()
-                .copied()
-                .zip(self.timestamps.as_ref()?.elapsed_pairs(&pairs)?)
-                .map(|(op, gpu_time)| DispatchProfile { op, gpu_time })
-                .collect(),
-        )
+    fn dispatch_times(&self, metadata: &[DispatchProfile]) -> Option<Vec<DispatchProfile>> {
+        let timestamps = self.timestamps.as_ref()?;
+        metadata
+            .iter()
+            .enumerate()
+            .map(|(index, metadata)| {
+                let origin = 2;
+                let start = 2 + index * 2;
+                let end = start + 1;
+                let previous = if index == 0 { start } else { start - 1 };
+                let [gpu_start, gpu_end, gap_before, gpu_time] = timestamps
+                    .elapsed_pairs(&[
+                        (origin, start),
+                        (origin, end),
+                        (previous, start),
+                        (start, end),
+                    ])?
+                    .try_into()
+                    .ok()?;
+                Some(DispatchProfile {
+                    gpu_start,
+                    gpu_end,
+                    gap_before,
+                    gpu_time,
+                    ..metadata.clone()
+                })
+            })
+            .collect()
     }
 }
 
@@ -1521,7 +1537,7 @@ pub struct MetalSubmission {
     completion: Arc<Completion>,
     timeout: Duration,
     profile: Option<Mutex<SubmissionProfile>>,
-    dispatch_operations: Vec<Op>,
+    dispatch_profiles: Vec<DispatchProfile>,
 }
 
 impl Submission for MetalSubmission {
@@ -1540,7 +1556,7 @@ impl Submission for MetalSubmission {
     fn profile(&self) -> Option<SubmissionProfile> {
         let mut profile = self.profile.as_ref()?.lock().ok()?.clone();
         profile.sample_fallbacks = self.completion.sample_fallbacks();
-        profile.per_dispatch = self.completion.dispatch_times(&self.dispatch_operations)?;
+        profile.per_dispatch = self.completion.dispatch_times(&self.dispatch_profiles)?;
         Some(profile)
     }
 }
@@ -1889,7 +1905,11 @@ impl MetalBackend {
             command_buffer.writeTimestampIntoHeap_atIndex(&timestamps.heap, 1);
         }
         command_buffer.endCommandBuffer();
-        let operations = dispatches.iter().map(Dispatch::op).collect::<Vec<_>>();
+        let dispatch_profiles = dispatches
+            .iter()
+            .zip(&barriers)
+            .map(|(dispatch, &barrier)| dispatch_profile(dispatch, barrier))
+            .collect::<Result<Vec<_>, _>>()?;
         let commit_started = PROFILE.then(Instant::now);
         let mut submission = self.commit(
             &command_buffer,
@@ -1908,7 +1928,7 @@ impl MetalBackend {
         if let Some(mut profile) = profile {
             profile.commit = commit_started.map_or(Duration::ZERO, |started| started.elapsed());
             submission.profile = Some(Mutex::new(profile));
-            submission.dispatch_operations = operations;
+            submission.dispatch_profiles = dispatch_profiles;
         }
         #[cfg(test)]
         store_duration(&LAST_SUBMIT_NANOS, submit_started.elapsed());
@@ -4356,7 +4376,7 @@ impl MetalBackend {
             completion,
             timeout: self.gpu_timeout,
             profile: None,
-            dispatch_operations: Vec::new(),
+            dispatch_profiles: Vec::new(),
         })
     }
 }
@@ -4383,6 +4403,129 @@ fn supported_dispatch(dispatch: &Dispatch) -> bool {
         | Op::Sdpa { .. }
         | Op::Sample { .. } => true,
     }
+}
+
+fn dispatch_profile(dispatch: &Dispatch, barrier: bool) -> Result<DispatchProfile, BackendError> {
+    Ok(DispatchProfile {
+        op: dispatch.op(),
+        kernel: dispatch_kernel(dispatch)?,
+        inputs: dispatch.inputs().iter().map(ProfileTensor::from).collect(),
+        outputs: dispatch.outputs().iter().map(ProfileTensor::from).collect(),
+        barrier,
+        gpu_start: Duration::ZERO,
+        gpu_end: Duration::ZERO,
+        gap_before: Duration::ZERO,
+        gpu_time: Duration::ZERO,
+    })
+}
+
+fn dispatch_kernel(dispatch: &Dispatch) -> Result<&'static str, BackendError> {
+    Ok(match dispatch.op() {
+        Op::Program(_) => match dispatch
+            .bound_program()
+            .ok_or(BackendError::InvalidInput)?
+            .program()
+            .program()
+            .kind
+        {
+            ProgramKind::Map => "forja_map",
+            ProgramKind::Row => "forja_row",
+        },
+        Op::Copy => {
+            let [input] = dispatch.inputs() else {
+                return Err(BackendError::InvalidInput);
+            };
+            if input.layout().is_contiguous() && dispatch.output().layout().is_contiguous() {
+                "copy_contiguous"
+            } else {
+                "copy_strided"
+            }
+        }
+        Op::Add
+            if dispatch
+                .inputs()
+                .iter()
+                .chain(std::iter::once(dispatch.output()))
+                .all(|tensor| tensor.layout().is_contiguous()) =>
+        {
+            "add_contiguous"
+        }
+        Op::Add => "add_strided",
+        Op::SiluMul => "silu_mul",
+        Op::RmsNorm { .. } => row_kernel(dispatch, "rms_norm_single", "rms_norm_looped")?,
+        Op::Softmax => row_kernel(dispatch, "softmax_single", "softmax_looped")?,
+        Op::Argmax => "argmax_partials+finalize",
+        Op::Sample { .. } => "sample_rejection",
+        Op::Rope { .. } => "rope",
+        Op::Embed => "embed",
+        Op::Matmul => matmul_kernel(dispatch)?,
+        Op::Sdpa { .. } => sdpa_kernel(dispatch)?,
+    })
+}
+
+fn row_kernel(
+    dispatch: &Dispatch,
+    single: &'static str,
+    looped: &'static str,
+) -> Result<&'static str, BackendError> {
+    let [input, ..] = dispatch.inputs() else {
+        return Err(BackendError::InvalidInput);
+    };
+    Ok(
+        if input.layout().shape().last().copied().unwrap_or_default() <= 1024 {
+            single
+        } else {
+            looped
+        },
+    )
+}
+
+fn matmul_kernel(dispatch: &Dispatch) -> Result<&'static str, BackendError> {
+    let [left, right] = dispatch.inputs() else {
+        return Err(BackendError::InvalidInput);
+    };
+    let shape = left.layout().shape();
+    let rows = *shape
+        .get(
+            shape
+                .len()
+                .checked_sub(2)
+                .ok_or(BackendError::InvalidInput)?,
+        )
+        .ok_or(BackendError::InvalidInput)?;
+    let left_column_major = classify(left.layout())
+        .kernel_strides()
+        .is_some_and(|(column_major, _, _)| column_major != 0);
+    let right_column_major = classify(right.layout())
+        .kernel_strides()
+        .is_some_and(|(column_major, _, _)| column_major != 0);
+    if rows == 1 {
+        return Ok(if right_column_major && !left_column_major {
+            "gemv_transposed"
+        } else {
+            "gemv"
+        });
+    }
+    Ok("steel_gemm")
+}
+
+fn sdpa_kernel(dispatch: &Dispatch) -> Result<&'static str, BackendError> {
+    let [query, key, _] = dispatch.inputs() else {
+        return Err(BackendError::InvalidInput);
+    };
+    let width = shape3(query.layout())?[2];
+    Ok(match select_sdpa(dispatch)? {
+        SdpaKernel::Vector if shape3(key.layout())?[1] >= VECTOR_TWO_PASS_MIN_KEY_LENGTH => {
+            match width {
+                64 => "mlx_sdpa_vector_2pass_64",
+                128 => "mlx_sdpa_vector_2pass_128",
+                _ => return Err(BackendError::InvalidInput),
+            }
+        }
+        SdpaKernel::Vector => vector_kernel("mlx_sdpa_vector", width)?,
+        SdpaKernel::Steel => steel_attention_kernel(width)?,
+        SdpaKernel::Decomposed => "sdpa_decomposed",
+    })
 }
 
 fn reusable_dispatch(dispatch: &Dispatch) -> bool {
@@ -5785,9 +5928,16 @@ mod tests {
         let profile = submission.profile().unwrap();
         assert_eq!(profile.dispatches, 1);
         assert_eq!(profile.per_dispatch.len(), 1);
-        assert_eq!(profile.per_dispatch[0].op, Op::Add);
+        let dispatch = &profile.per_dispatch[0];
+        assert_eq!(dispatch.op, Op::Add);
+        assert_eq!(dispatch.kernel, "add_contiguous");
+        assert_eq!(dispatch.inputs[0].shape, [7, 33]);
+        assert_eq!(dispatch.outputs[0].dtype, DType::F32);
+        assert!(!dispatch.barrier);
         assert!(profile.gpu_time > Duration::ZERO);
-        assert!(profile.per_dispatch[0].gpu_time > Duration::ZERO);
+        assert!(dispatch.gpu_time > Duration::ZERO);
+        assert_eq!(dispatch.gap_before, dispatch.gpu_start);
+        assert_eq!(dispatch.gpu_end, dispatch.gpu_start + dispatch.gpu_time);
         assert_eq!(profile.metadata_buffers.count, 1);
     }
 

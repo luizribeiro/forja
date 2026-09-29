@@ -220,11 +220,43 @@ pub struct ProfileCount {
     pub time: Duration,
 }
 
-/// Device time attributed to one recorded dispatch.
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// Tensor metadata retained for device profiling.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProfileTensor {
+    /// Stored scalar type.
+    pub dtype: DType,
+    /// Logical extents in axis order.
+    pub shape: Vec<u32>,
+}
+
+impl From<&Tensor> for ProfileTensor {
+    fn from(tensor: &Tensor) -> Self {
+        Self {
+            dtype: tensor.layout().dtype(),
+            shape: tensor.layout().shape().to_vec(),
+        }
+    }
+}
+
+/// Device timeline attributed to one recorded dispatch.
+#[derive(Clone, Debug, PartialEq)]
 pub struct DispatchProfile {
     /// Operation recorded by the command list.
     pub op: Op,
+    /// Backend kernel or composite implementation selected for the operation.
+    pub kernel: &'static str,
+    /// Logical input metadata.
+    pub inputs: Vec<ProfileTensor>,
+    /// Logical output metadata.
+    pub outputs: Vec<ProfileTensor>,
+    /// Whether a dependency barrier precedes this dispatch.
+    pub barrier: bool,
+    /// Device time from submission start to dispatch start.
+    pub gpu_start: Duration,
+    /// Device time from submission start to dispatch end.
+    pub gpu_end: Duration,
+    /// Device time between the preceding dispatch and this dispatch.
+    pub gap_before: Duration,
     /// Elapsed device time surrounding that operation.
     pub gpu_time: Duration,
 }
