@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use forja_config::{Choice, KeyPath, Origin};
+use forja_config::{Choice, GraphReplay, KeyPath, Origin, Selection};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
@@ -28,6 +28,21 @@ struct ConfigKey<'a> {
     schema_version: u32,
     config: &'a toml::Value,
     inputs: &'a [Input],
+}
+
+#[derive(Serialize)]
+struct PerfKey<'a> {
+    backend: GraphReplay,
+    pp: usize,
+    tg: usize,
+    reps: usize,
+    warmups: usize,
+    decode_prefill: usize,
+    contexts: &'a [usize],
+    selection: &'a [Selection],
+    breakdown: bool,
+    engine_sha256: &'a str,
+    weights_sha256: &'a str,
 }
 
 pub(crate) fn snapshot(options: &Bench, device: &str, macos: &str) -> Result<Snapshot, String> {
@@ -81,6 +96,35 @@ pub(crate) fn config_hash(snapshot: &Snapshot, inputs: &[Input]) -> Result<Strin
     })
 }
 
+pub(crate) fn perf_hash(options: &Bench, input: &Input) -> Result<String, String> {
+    hash(&PerfKey {
+        backend: options.graph_replay,
+        pp: options.pp,
+        tg: options.tg,
+        reps: options.reps,
+        warmups: options.warmups,
+        decode_prefill: options.decode_prefill,
+        contexts: &options.contexts,
+        selection: &options.selection,
+        breakdown: options.breakdown,
+        engine_sha256: &input.engine_sha256,
+        weights_sha256: &input.weights_sha256,
+    })
+}
+
+pub(crate) fn combined_perf_hash(hashes: &[String]) -> Result<String, String> {
+    hash(hashes)
+}
+
+pub(crate) fn output_digest(tokens: &[u32], logits: &[u8]) -> String {
+    let mut digest = Sha256::new();
+    for token in tokens {
+        digest.update(token.to_le_bytes());
+    }
+    digest.update(logits);
+    format!("sha256:{:x}", digest.finalize())
+}
+
 fn hash(value: &(impl Serialize + ?Sized)) -> Result<String, String> {
     let bytes =
         serde_json::to_vec(value).map_err(|error| format!("cannot hash record: {error}"))?;
@@ -102,7 +146,7 @@ fn record_origin(origin: &Origin) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use forja_config::{DevConfig, GraphReplay, Selection};
+    use forja_config::DevConfig;
 
     fn options() -> Bench {
         let config = DevConfig::default();
@@ -139,6 +183,10 @@ mod tests {
             config_hash(&snapshot, &inputs).unwrap(),
             "sha256:95d94399d6e91a69d57e5a7236df00cd71becc644ed58068e954222579f4fe96"
         );
+        assert_eq!(
+            perf_hash(&options, &inputs[0]).unwrap(),
+            "sha256:37cb92a99e577a083df83232c34cd1db744c181b3f232ed3fc1cc67c4eeccbc6"
+        );
     }
 
     #[test]
@@ -151,5 +199,13 @@ mod tests {
         let table = toml::from_str(&snapshot.config).unwrap();
         forja_config::layer::<DevConfig>(vec![forja_config::Layer::new(Origin::Vary, table)])
             .unwrap();
+    }
+
+    #[test]
+    fn output_digest_has_a_stable_byte_order() {
+        assert_eq!(
+            output_digest(&[1, 0x1020_3040], &[5, 6]),
+            "sha256:b8097b75ea7e84e2fb279fc7d7f62b6dc2f19af32be084035b0b8b2906580404"
+        );
     }
 }

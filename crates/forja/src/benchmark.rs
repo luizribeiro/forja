@@ -93,6 +93,10 @@ async fn run_metal(options: &Bench) -> Result<(), Box<dyn Error>> {
             })
         })
         .collect::<Result<Vec<_>, std::io::Error>>()?;
+    let perf_hashes = inputs
+        .iter()
+        .map(|input| benchmark_record::perf_hash(options, input))
+        .collect::<Result<Vec<_>, _>>()?;
     let mut results = Vec::new();
     let mut record_device = None;
     println!(
@@ -103,7 +107,7 @@ async fn run_metal(options: &Bench) -> Result<(), Box<dyn Error>> {
         for &strategy in &options.selection {
             let (host_argmax, overlap) = selection_mode(strategy);
             let selection = selection_name(strategy);
-            let (pp, tg, device, profiles) =
+            let (pp, tg, device, profiles, output_digest) =
                 bench_engine(options, component, host_argmax, overlap).await?;
             if record_device.as_ref().is_some_and(|known| known != &device) {
                 return Err("benchmark engines opened different Metal devices".into());
@@ -121,6 +125,8 @@ async fn run_metal(options: &Bench) -> Result<(), Box<dyn Error>> {
             let mut result = serde_json::json!({
                 "input": input,
                 "point": {},
+                "perf_hash": perf_hashes[input],
+                "output_digest": output_digest,
                 "selection": selection,
                 "pp": summary_json(pp),
                 "tg": summary_json(tg),
@@ -154,6 +160,7 @@ async fn run_metal(options: &Bench) -> Result<(), Box<dyn Error>> {
             "origins": snapshot.origins,
             "auto_notes": snapshot.auto_notes,
             "config_hash": benchmark_record::config_hash(&snapshot, &inputs)?,
+            "perf_hash": benchmark_record::combined_perf_hash(&perf_hashes)?,
             "axes": {},
             "results": results,
         });
@@ -170,7 +177,7 @@ async fn bench_engine(
     component: &Path,
     host_argmax: bool,
     overlap: bool,
-) -> Result<(Summary, Summary, String, Vec<ProfileMeasurement>), Box<dyn Error>> {
+) -> Result<(Summary, Summary, String, Vec<ProfileMeasurement>, String), Box<dyn Error>> {
     let backend =
         forja_metal::MetalBackend::with_graph_replay(metal_graph_replay(options.graph_replay))?;
     let device = backend.device_name();
@@ -253,12 +260,48 @@ async fn bench_engine(
     } else {
         Vec::new()
     };
+    let output_digest =
+        probe_output(&mut runner, &tokens[..options.decode_prefill], options.tg).await?;
     Ok((
         summarize(&pp, options.pp)?,
         summarize(&tg, options.tg)?,
         device,
         profiles,
+        output_digest,
     ))
+}
+
+#[cfg(target_os = "macos")]
+async fn probe_output(
+    runner: &mut EngineRunner<forja_metal::MetalBackend>,
+    prompt: &[u32],
+    steps: usize,
+) -> Result<String, Box<dyn Error>> {
+    let mut tokens = Vec::with_capacity(steps);
+    let mut logits = Vec::new();
+    for index in 0..steps {
+        let output = runner
+            .decode(EngineDecode {
+                tokens: (index == 0).then(|| prompt.to_vec()),
+                start_pos: if index == 0 {
+                    0
+                } else {
+                    u32::try_from(
+                        prompt
+                            .len()
+                            .checked_add(index - 1)
+                            .ok_or("decode position overflowed")?,
+                    )?
+                },
+            })
+            .await?
+            .map_err(|error| format!("engine decode failed: {error:?}"))?;
+        tokens.push(read_token(&runner.read(&output.token).await?)?);
+        if index + 1 == steps {
+            logits = runner.read(&output.logits).await?;
+        }
+    }
+    Ok(benchmark_record::output_digest(&tokens, &logits))
 }
 
 const fn selection_name(selection: Selection) -> &'static str {
