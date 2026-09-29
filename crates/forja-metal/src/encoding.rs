@@ -847,6 +847,33 @@ struct MetalEncodingPlan {
     argument_offset: usize,
 }
 
+fn dedupe_plan_calls(plans: &mut [Option<StaticEncodingPlan>]) {
+    let mut pipeline = None::<Retained<ProtocolObject<dyn MTLComputePipelineState>>>;
+    let mut argument_table_set = false;
+    for plan in plans {
+        let Some(plan) = plan else {
+            pipeline = None;
+            argument_table_set = false;
+            continue;
+        };
+        plan.calls.retain(|call| match call {
+            PlanCall::Pipeline(next) => {
+                let repeated = pipeline
+                    .as_ref()
+                    .is_some_and(|current| std::ptr::eq(&raw const **current, &raw const **next));
+                pipeline = Some(next.clone());
+                !repeated
+            }
+            PlanCall::ArgumentTable => {
+                let repeated = argument_table_set;
+                argument_table_set = true;
+                !repeated
+            }
+            PlanCall::Bind { .. } | PlanCall::Dispatch { .. } | PlanCall::Barrier => true,
+        });
+    }
+}
+
 // SAFETY: The committed residency set remains immutable, and its allocations are retained by the
 // host graph for at least as long as this state.
 unsafe impl Send for PreparedMetalGraph {}
@@ -1517,6 +1544,7 @@ impl MetalBackend {
             }
             plans[index] = Some(StaticEncodingPlan { calls });
         }
+        dedupe_plan_calls(&mut plans);
         command_buffer.endCommandBuffer();
         let mut arena = vec![0_u8; arguments.offset];
         // SAFETY: The arena length is the initialized prefix of the live shared argument buffer.
@@ -5053,6 +5081,52 @@ mod tests {
             backend.replay(&corrupted, vec![7]),
             Err(BackendError::ExecutionFailed)
         ));
+    }
+
+    #[test]
+    fn static_plan_calls_are_deduplicated_within_dynamic_boundaries() {
+        let backend = MetalBackend::new().unwrap();
+        let static_input = backend.alloc(DType::F32, &[7]).unwrap();
+        let static_output = backend.alloc(DType::F32, &[7]).unwrap();
+        let dynamic_input = backend.alloc(DType::F32, &[7]).unwrap();
+        let dynamic_output = backend.alloc(DType::F32, &[7]).unwrap();
+        let space = ParamSpace::new(std::iter::once(1..=7).collect()).unwrap();
+        let dynamic_input =
+            symbolic_prefix(&dynamic_input, space.clone(), Affine::parameter(0, 0, 1));
+        let dynamic_output =
+            symbolic_prefix(&dynamic_output, space.clone(), Affine::parameter(0, 0, 1));
+        let input = TemplateTensor::from(static_input);
+        let output = TemplateTensor::from(static_output);
+        let mut template = GraphTemplate::new(space, GraphLimits::default());
+        template.dispatch(Op::Copy, &[&input], &output).unwrap();
+        template.dispatch(Op::Copy, &[&input], &output).unwrap();
+        template
+            .dispatch(Op::Copy, &[&dynamic_input], &dynamic_output)
+            .unwrap();
+        template.dispatch(Op::Copy, &[&input], &output).unwrap();
+
+        let state = backend.prepare_metal_graph(&template).unwrap();
+        let plans = &state.encoding.as_ref().unwrap().dispatches;
+        let has_pipeline = |index: usize| {
+            plans[index]
+                .as_ref()
+                .unwrap()
+                .calls
+                .iter()
+                .any(|call| matches!(call, PlanCall::Pipeline(_)))
+        };
+        let has_table = |index: usize| {
+            plans[index]
+                .as_ref()
+                .unwrap()
+                .calls
+                .iter()
+                .any(|call| matches!(call, PlanCall::ArgumentTable))
+        };
+        assert!(has_pipeline(0) && has_table(0));
+        assert!(!has_pipeline(1) && !has_table(1));
+        assert!(plans[2].is_none());
+        assert!(has_pipeline(3) && has_table(3));
     }
 
     #[test]
