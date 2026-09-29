@@ -234,7 +234,14 @@ async fn bench_precision(
         );
     }
     let profiles = if options.profile {
-        measure_profiles(&mut runner, &tokens, options.reps, options.host_argmax).await?
+        measure_profiles(
+            &mut runner,
+            &tokens,
+            options.reps,
+            options.host_argmax,
+            overlap,
+        )
+        .await?
     } else {
         Vec::new()
     };
@@ -420,14 +427,21 @@ async fn measure_profiles(
     tokens: &[u32],
     reps: usize,
     host_argmax: bool,
+    overlap: bool,
 ) -> Result<Vec<ProfileMeasurement>, Box<dyn Error>> {
     let mut measurements = Vec::new();
     for context_start in PROFILE_CONTEXTS {
         let mut baseline = Vec::with_capacity(reps);
         let mut steps = Vec::with_capacity(reps);
         for repetition in 0..WARMUPS.saturating_add(reps) {
-            let token = prepare_profile_context(runner, tokens, context_start, host_argmax).await?;
-            let unprofiled = measure_decode_step(runner, token, context_start, host_argmax).await?;
+            let unprofiled = if overlap && !host_argmax {
+                prepare_profile_context(runner, tokens, context_start, host_argmax).await?;
+                measure_pipelined_profile_step(runner, context_start).await?
+            } else {
+                let token =
+                    prepare_profile_context(runner, tokens, context_start, host_argmax).await?;
+                measure_decode_step(runner, token, context_start, host_argmax).await?
+            };
             let token = prepare_profile_context(runner, tokens, context_start, host_argmax).await?;
             runner.set_profiling(true);
             let profiled = measure_decode_step(runner, token, context_start, host_argmax).await;
@@ -448,6 +462,46 @@ async fn measure_profiles(
         });
     }
     Ok(measurements)
+}
+
+#[cfg(target_os = "macos")]
+async fn measure_pipelined_profile_step(
+    runner: &mut EngineRunner<forja_metal::MetalBackend>,
+    context_start: usize,
+) -> Result<Sample, Box<dyn Error>> {
+    settle_submission_metrics(runner).await?;
+    let before = runner.metrics();
+    let started = Instant::now();
+    let mut outputs = VecDeque::with_capacity(2);
+    for offset in 0..2 {
+        outputs.push_back(
+            runner
+                .enqueue_decode(EngineDecode {
+                    tokens: None,
+                    start_pos: u32::try_from(
+                        context_start
+                            .checked_add(offset)
+                            .ok_or("decode position overflowed")?,
+                    )?,
+                })
+                .await?
+                .map_err(|error| format!("engine decode failed: {error:?}"))?,
+        );
+    }
+    for output in outputs {
+        read_token(&runner.read_queued_token(output).await?)?;
+    }
+    let expected = before
+        .submissions
+        .checked_add(2)
+        .ok_or("submission count overflowed")?;
+    wait_for_submissions(runner, expected).await?;
+    let sample = sample(before, runner.metrics(), started.elapsed())?;
+    Ok(Sample {
+        wall_seconds: sample.wall_seconds / 2.0,
+        gpu_seconds: sample.gpu_seconds / 2.0,
+        submissions: sample.submissions / 2,
+    })
 }
 
 #[cfg(target_os = "macos")]
