@@ -1,13 +1,12 @@
 use std::{error::Error, fs, io::Write, path::Path};
 
 use forja_core::Backend;
-use forja_host::{EngineRunner, EngineStep};
-use golden_fixtures::decode_f32_le;
+use forja_host::{EngineDecode, EngineRunner};
 use tokenizers::Tokenizer;
 
 use crate::{
     args::{Backend as BackendArg, Run},
-    engine::{argmax, limits},
+    engine::{limits, read_token},
 };
 
 pub(crate) async fn run(options: &Run) -> Result<(), Box<dyn Error>> {
@@ -91,18 +90,16 @@ where
     }
     let prompt_len = u32::try_from(prompt.len())?;
     let mut result = runner
-        .step(EngineStep {
-            tokens: prompt,
+        .decode(EngineDecode {
+            tokens: Some(prompt),
             start_pos: 0,
-            taps: false,
         })
         .await?
-        .map_err(|error| format!("engine step failed: {error:?}"))?;
+        .map_err(|error| format!("engine decode failed: {error:?}"))?;
     let mut stream = tokenizer.decode_stream(true);
     let mut generated = Vec::with_capacity(options.max_tokens);
     for index in 0..options.max_tokens {
-        let logits = decode_f32_le(&runner.read(&result.logits).await?)?;
-        let token = argmax(&logits)?;
+        let token = read_token(&runner.read(&result.token).await?)?;
         generated.push(token);
         if eos.contains(&token) {
             break;
@@ -116,15 +113,14 @@ where
         }
         if index + 1 < options.max_tokens {
             result = runner
-                .step(EngineStep {
-                    tokens: vec![token],
+                .decode(EngineDecode {
+                    tokens: None,
                     start_pos: prompt_len
                         .checked_add(u32::try_from(index)?)
                         .ok_or("decode position overflowed")?,
-                    taps: false,
                 })
                 .await?
-                .map_err(|error| format!("engine step failed: {error:?}"))?;
+                .map_err(|error| format!("engine decode failed: {error:?}"))?;
         }
     }
     Ok(generated)

@@ -16,6 +16,13 @@ pub(crate) fn argmax(values: &[f32]) -> Result<u32, Box<dyn Error>> {
     Ok(u32::try_from(index)?)
 }
 
+pub(crate) fn read_token(bytes: &[u8]) -> Result<u32, Box<dyn Error>> {
+    let bytes: [u8; 4] = bytes
+        .try_into()
+        .map_err(|_| "selected token must contain exactly four bytes")?;
+    Ok(u32::from_le_bytes(bytes))
+}
+
 pub(crate) const fn limits() -> Limits {
     Limits::new(
         8 * 1024 * 1024 * 1024,
@@ -50,6 +57,13 @@ mod tests {
     #[test]
     fn argmax_uses_total_order_for_nan() -> Result<(), Box<dyn Error>> {
         assert_eq!(argmax(&[1.0, f32::NAN, 2.0])?, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn reads_one_selected_token() -> Result<(), Box<dyn Error>> {
+        assert_eq!(read_token(&7_u32.to_le_bytes())?, 7);
+        assert!(read_token(&[0; 8]).is_err());
         Ok(())
     }
 }
