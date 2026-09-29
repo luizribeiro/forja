@@ -16,7 +16,7 @@ mod storage;
 #[cfg(target_os = "macos")]
 pub use encoding::MetalProgramHandle;
 #[cfg(target_os = "macos")]
-pub use storage::{MetalBackend, ProgramCompileBudget};
+pub use storage::{MetalBackend, MetalGraphReplay, ProgramCompileBudget};
 
 #[cfg(target_os = "macos")]
 mod platform {

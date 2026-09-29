@@ -287,6 +287,16 @@ pub struct MetalBackend {
     pub(super) next_event_value: Mutex<u64>,
     pub(super) event_listener: Retained<MTLSharedEventListener>,
     pub(super) gpu_timeout: Duration,
+    pub(super) graph_replay: MetalGraphReplay,
+}
+
+/// Reusable graph execution strategy selected by the host operator.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MetalGraphReplay {
+    /// Instantiate and encode every dispatch through the prevalidated path.
+    Tier1,
+    /// Replay prepared static dispatch plans and encode dynamic work normally.
+    Tier2,
 }
 
 impl Drop for MetalBackend {
@@ -317,7 +327,28 @@ impl MetalBackend {
             Duration::from_secs(10),
             DEFAULT_POOL_CAPACITY,
             ProgramCompileBudget::default(),
+            MetalGraphReplay::Tier2,
         )
+    }
+
+    /// Creates a backend with an explicit reusable graph execution strategy.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BackendError::ExecutionFailed`] when Metal 4 is unavailable.
+    pub fn with_graph_replay(graph_replay: MetalGraphReplay) -> Result<Self, BackendError> {
+        Self::with_configuration(
+            Duration::from_secs(10),
+            DEFAULT_POOL_CAPACITY,
+            ProgramCompileBudget::default(),
+            graph_replay,
+        )
+    }
+
+    /// Returns the configured reusable graph execution strategy.
+    #[must_use]
+    pub const fn graph_replay(&self) -> MetalGraphReplay {
+        self.graph_replay
     }
 
     /// Creates a backend with a cumulative runtime scalar-program compile budget.
@@ -326,7 +357,12 @@ impl MetalBackend {
     ///
     /// Returns [`BackendError::ExecutionFailed`] when Metal 4 is unavailable.
     pub fn with_program_compile_budget(budget: ProgramCompileBudget) -> Result<Self, BackendError> {
-        Self::with_configuration(Duration::from_secs(10), DEFAULT_POOL_CAPACITY, budget)
+        Self::with_configuration(
+            Duration::from_secs(10),
+            DEFAULT_POOL_CAPACITY,
+            budget,
+            MetalGraphReplay::Tier2,
+        )
     }
 
     /// Creates a backend with the default GPU timeout and a free-buffer pool byte cap.
@@ -340,6 +376,7 @@ impl MetalBackend {
             Duration::from_secs(10),
             pool_capacity,
             ProgramCompileBudget::default(),
+            MetalGraphReplay::Tier2,
         )
     }
 
@@ -353,6 +390,7 @@ impl MetalBackend {
             gpu_timeout,
             DEFAULT_POOL_CAPACITY,
             ProgramCompileBudget::default(),
+            MetalGraphReplay::Tier2,
         )
     }
 
@@ -366,13 +404,19 @@ impl MetalBackend {
         gpu_timeout: Duration,
         pool_capacity: u64,
     ) -> Result<Self, BackendError> {
-        Self::with_configuration(gpu_timeout, pool_capacity, ProgramCompileBudget::default())
+        Self::with_configuration(
+            gpu_timeout,
+            pool_capacity,
+            ProgramCompileBudget::default(),
+            MetalGraphReplay::Tier2,
+        )
     }
 
     fn with_configuration(
         gpu_timeout: Duration,
         pool_capacity: u64,
         program_compile_budget: ProgramCompileBudget,
+        graph_replay: MetalGraphReplay,
     ) -> Result<Self, BackendError> {
         let device = MTLCreateSystemDefaultDevice().ok_or(BackendError::ExecutionFailed)?;
         if !device.supportsFamily(MTLGPUFamily::Metal4) {
@@ -424,6 +468,7 @@ impl MetalBackend {
             next_event_value: Mutex::new(1),
             event_listener,
             gpu_timeout,
+            graph_replay,
         };
         #[cfg(test)]
         {
