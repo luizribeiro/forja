@@ -138,6 +138,7 @@
                 fi
                 export FORJA_MODELS="''${FORJA_MODELS:-$HOME/.cache/forja/models}"
                 cargo nextest run --release -p forja-host --test qwen_weights --run-ignored only
+                cargo nextest run --release -p forja-sdk --features native-metal --test qwen_moe --run-ignored only
                 cargo nextest run --release -p forja-host --test qwen_engine --run-ignored only
                 cargo nextest run --release -p golden-fixtures --test qwen_fixtures --run-ignored only
                 cargo nextest run --release -p golden-fixtures --test mixture_fixtures --run-ignored only
