@@ -2335,7 +2335,7 @@ impl MetalBackend {
         }
         bindings.bind(table, 5, &params);
         set_argument_table(encoder, table);
-        let (column_tile, row_tile) = if rows == 1 { (32, 1) } else { (8, 8) };
+        let (column_tile, row_tile, threads) = if rows == 1 { (16, 1, 64) } else { (8, 8, 256) };
         dispatch_threadgroups(
             encoder,
             MTLSize {
@@ -2346,7 +2346,7 @@ impl MetalBackend {
                 depth: 1,
             },
             MTLSize {
-                width: 256,
+                width: threads,
                 height: 1,
                 depth: 1,
             },
