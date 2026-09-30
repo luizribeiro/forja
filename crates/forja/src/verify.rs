@@ -726,6 +726,30 @@ mod tests {
             .block_on(run_with_steps(&options, 32))
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires FORJA_MODELS and runs in the pre-push hook"]
+    fn metal_quantized_qwen3_coder_verification() -> Result<(), Box<dyn Error>> {
+        let root = PathBuf::from(env::var_os("FORJA_MODELS").ok_or("FORJA_MODELS is not set")?);
+        let limits = forja_config::Limits {
+            live_bytes: forja_config::ByteSize::new(24 * 1024 * 1024 * 1024),
+            ..forja_config::Limits::default()
+        };
+        let options = Verify {
+            engine: test_guests::qwen3_coder().to_owned(),
+            model_dir: root.join("Qwen3-Coder-30B-A3B-Instruct-4bit"),
+            fixtures: root.join("golden/Qwen3-Coder-30B-A3B-Instruct-4bit"),
+            backend: BackendArg::Metal,
+            precision: Precision::F32,
+            prompts: Vec::new(),
+            graph_replay: forja_config::GraphReplay::Tier2,
+            limits,
+        };
+        tokio::runtime::Builder::new_current_thread()
+            .build()?
+            .block_on(run_with_steps(&options, 8))
+    }
+
     #[test]
     fn teacher_forcing_uses_reference_tokens() -> Result<(), Box<dyn Error>> {
         let root = temporary_directory("teacher-forcing")?;
