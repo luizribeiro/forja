@@ -3784,6 +3784,62 @@ impl MetalBackend {
         Ok(temporaries)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn encode_top_k_single(
+        &self,
+        encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
+        table: &ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>,
+        input: &EncoderTensor,
+        values: &EncoderTensor,
+        indices: &EncoderTensor,
+        width: u32,
+        rows: u32,
+        k: u32,
+        constants: &[(u32, u32)],
+        bindings: &mut ArgumentBindings,
+        arguments: &mut ArgumentWriter,
+    ) -> Result<Vec<BufferBinding>, BackendError> {
+        let pipeline = self
+            .pipelines
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?
+            .get("topk_single", constants)?;
+        let temporaries = vec![
+            Self::layout_buffer(&input.layout, arguments)?,
+            Self::layout_buffer(&values.layout, arguments)?,
+            Self::layout_buffer(&indices.layout, arguments)?,
+            arguments.write(&width.to_ne_bytes())?,
+            arguments.write(&k.to_ne_bytes())?,
+        ];
+        for (index, tensor) in [input, values, indices].into_iter().enumerate() {
+            bindings.bind(table, index, &tensor.buffer);
+        }
+        for (index, temporary) in temporaries.iter().enumerate() {
+            bindings.bind(table, index + 3, temporary);
+        }
+        set_pipeline(encoder, &pipeline);
+        set_argument_table(encoder, table);
+        let requested_threads = usize::try_from(width)
+            .map_err(|_| BackendError::ExecutionFailed)?
+            .next_multiple_of(32)
+            .min(256);
+        let threads = simd_thread_count(&pipeline, requested_threads)?;
+        dispatch_threadgroups(
+            encoder,
+            MTLSize {
+                width: usize::try_from(rows).map_err(|_| BackendError::ExecutionFailed)?,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: threads,
+                height: 1,
+                depth: 1,
+            },
+        );
+        Ok(temporaries)
+    }
+
     fn encode_top_k(
         &self,
         encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
@@ -3810,11 +3866,17 @@ impl MetalBackend {
         let chunks = width.div_ceil(ARGMAX_CHUNK_WIDTH);
         let rows = u32::try_from(values.layout.element_count() / u64::from(k))
             .map_err(|_| BackendError::ExecutionFailed)?;
-        let scratch = self.scratch_tensor(DType::U32, &[rows, chunks, k, 2])?;
         let constants = [
             (0, dtype_code(input.layout.dtype())),
             (2, dtype_code(values.layout.dtype())),
         ];
+        if chunks == 1 && k == 8 {
+            return self.encode_top_k_single(
+                encoder, table, &input, &values, &indices, width, rows, k, &constants, bindings,
+                arguments,
+            );
+        }
+        let scratch = self.scratch_tensor(DType::U32, &[rows, chunks, k, 2])?;
         let (partials_pipeline, finalize_pipeline) = {
             let mut pipelines = self
                 .pipelines
@@ -4421,8 +4483,19 @@ impl MetalBackend {
                 Self::size_softmax_arguments(arguments)?;
                 arguments.write(size_of::<u32>())?;
             }
-            Op::TopK { .. } => {
-                for len in [112, 112, 112, 4, 4, 4] {
+            Op::TopK { k } => {
+                let width = dispatch.inputs()[0]
+                    .layout()
+                    .shape()
+                    .last()
+                    .copied()
+                    .ok_or(BackendError::InvalidInput)?;
+                let lengths: &[usize] = if width <= ARGMAX_CHUNK_WIDTH && k == 8 {
+                    &[112, 112, 112, 4, 4]
+                } else {
+                    &[112, 112, 112, 4, 4, 4]
+                };
+                for &len in lengths {
                     arguments.write(len)?;
                 }
             }
@@ -4907,7 +4980,19 @@ fn dispatch_kernel(dispatch: &Dispatch) -> Result<&'static str, BackendError> {
         Op::RmsNorm { .. } => row_kernel(dispatch, "rms_norm_single", "rms_norm_looped")?,
         Op::Softmax => row_kernel(dispatch, "softmax_single", "softmax_looped")?,
         Op::Argmax => "argmax_partials+finalize",
-        Op::TopK { .. } => "topk_partials+finalize",
+        Op::TopK { .. } => {
+            let width = dispatch.inputs()[0]
+                .layout()
+                .shape()
+                .last()
+                .copied()
+                .ok_or(BackendError::InvalidInput)?;
+            if width <= ARGMAX_CHUNK_WIDTH && matches!(dispatch.op(), Op::TopK { k: 8 }) {
+                "topk_single"
+            } else {
+                "topk_partials+finalize"
+            }
+        }
         Op::Sample { .. } => "sample_rejection",
         Op::Rope { .. } => "rope",
         Op::Embed => "embed",
@@ -5524,6 +5609,7 @@ fn nan_preserving_kernel(name: &str) -> bool {
         "softmax_single"
             | "softmax_looped"
             | "argmax_partials"
+            | "topk_single"
             | "topk_partials"
             | "topk_finalize"
             | "sample_rejection_proposal_partials"

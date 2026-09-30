@@ -396,6 +396,92 @@ void topk_insert(thread ulong (&selected)[64], uint k, ulong candidate) {
     }
 }
 
+kernel void topk_single(
+    device const uchar *input [[buffer(0)]],
+    device uchar *values [[buffer(1)]],
+    device uint *indices [[buffer(2)]],
+    constant TensorLayout &input_layout [[buffer(3)]],
+    constant TensorLayout &values_layout [[buffer(4)]],
+    constant TensorLayout &indices_layout [[buffer(5)]],
+    constant uint &width [[buffer(6)]],
+    constant uint &k [[buffer(7)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint lane [[thread_position_in_threadgroup]],
+    uint group_width [[threads_per_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+    threadgroup uint partial_keys[32];
+    threadgroup uint partial_indices[32];
+    threadgroup ulong group_candidates[64];
+    threadgroup ulong selected[64];
+    if (width <= group_width) {
+        ulong candidate = 0;
+        if (lane < width) {
+            float value = load_float(
+                input, physical_index(input_layout, row * width + lane), input0_dtype);
+            candidate = topk_candidate(value, lane);
+        }
+        for (uint slot = 0; slot < k; ++slot) {
+            ulong best = simd_candidate_max(candidate);
+            if (candidate == best) {
+                candidate = 0;
+            }
+            if (simd_lane == 0) {
+                group_candidates[simd_group * 8 + slot] = best;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (simd_group == 0) {
+            uint simd_groups = group_width / 32;
+            ulong finalists[2] = {
+                simd_lane < simd_groups * 8 ? group_candidates[simd_lane] : 0,
+                simd_lane + 32 < simd_groups * 8 ? group_candidates[simd_lane + 32] : 0,
+            };
+            order_candidates_descending(finalists[0], finalists[1]);
+            for (uint slot = 0; slot < k; ++slot) {
+                ulong best = simd_candidate_max(finalists[0]);
+                if (finalists[0] == best) {
+                    finalists[0] = finalists[1];
+                    finalists[1] = 0;
+                }
+                if (simd_lane == 0) {
+                    selected[slot] = best;
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    } else {
+        for (uint slot = 0; slot < k; ++slot) {
+            ulong best = 0;
+            for (uint column = lane; column < width; column += group_width) {
+                bool available = true;
+                for (uint prior = 0; prior < slot; ++prior) {
+                    available = available && column != ~uint(selected[prior]);
+                }
+                if (available) {
+                    float value = load_float(
+                        input, physical_index(input_layout, row * width + column), input0_dtype);
+                    best = max(best, topk_candidate(value, column));
+                }
+            }
+            best = argmax_threadgroup_max(
+                best, simd_lane, simd_group, partial_keys, partial_indices);
+            if (lane == 0) {
+                selected[slot] = best;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+    if (lane < k) {
+        uint index = ~uint(selected[lane]);
+        uint output_index = row * k + lane;
+        float value = load_float(
+            input, physical_index(input_layout, row * width + index), input0_dtype);
+        store_float(values, physical_index(values_layout, output_index), output_dtype, value);
+        indices[physical_index(indices_layout, output_index)] = index;
+    }
+}
+
 kernel void topk_partials(
     device const uchar *input [[buffer(0)]],
     device ulong *partials [[buffer(1)]],
