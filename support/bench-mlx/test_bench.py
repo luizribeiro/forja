@@ -52,6 +52,7 @@ class SuiteTests(unittest.TestCase):
         core.device_info = lambda: {"device_name": "stub"}
         core.eval = lambda _values: None
         core.issubdtype = lambda _dtype, _kind: True
+        core.random = types.SimpleNamespace(seed=lambda _seed: None)
         mlx = types.ModuleType("mlx")
         mlx.__path__ = []
         mlx.core = core
@@ -66,6 +67,8 @@ class SuiteTests(unittest.TestCase):
         mlx_lm.stream_generate = lambda *_args, max_tokens, **_kwargs: iter(
             [response] * max_tokens
         )
+        sample_utils = types.ModuleType("mlx_lm.sample_utils")
+        sample_utils.make_sampler = lambda **_kwargs: object()
 
         suite = Path(__file__).resolve().parents[2] / "bench/suites/default.toml"
         with tempfile.TemporaryDirectory() as directory:
@@ -76,9 +79,16 @@ class SuiteTests(unittest.TestCase):
             arguments = argparse.Namespace(
                 model_dir=model_dir,
                 suite=suite,
+                sampling="greedy",
                 json=report_path,
             )
-            modules = {"mlx": mlx, "mlx.core": core, "mlx.utils": utils, "mlx_lm": mlx_lm}
+            modules = {
+                "mlx": mlx,
+                "mlx.core": core,
+                "mlx.utils": utils,
+                "mlx_lm": mlx_lm,
+                "mlx_lm.sample_utils": sample_utils,
+            }
             clock = (value / 100 for value in itertools.count())
             with (
                 mock.patch.dict(sys.modules, modules),
@@ -92,6 +102,7 @@ class SuiteTests(unittest.TestCase):
             report = json.loads(report_path.read_text())
             self.assertEqual(report["settings"]["pp"], 512)
             self.assertEqual(report["settings"]["tg"], 128)
+            self.assertEqual(report["settings"]["sampling"]["temperature"], 0.0)
             self.assertEqual(report["tg_context_start"], 9)
 
     def test_reads_the_committed_default_suite(self) -> None:
@@ -106,6 +117,17 @@ class SuiteTests(unittest.TestCase):
             model = Path(directory)
             (model / "config.json").write_text('{"model_type":"olmoe"}')
             self.assertEqual(bench.model_overrides(model), {"rms_norm_eps": 1e-5})
+
+    def test_reads_generation_config_sampling(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            model = Path(directory)
+            (model / "generation_config.json").write_text(
+                '{"do_sample":true,"temperature":0.7,"top_k":20,"top_p":0.8}'
+            )
+            self.assertEqual(
+                bench.sampling_options(model, "generation-config"),
+                {"temperature": 0.7, "top_k": 20, "top_p": 0.8, "seed": 0},
+            )
 
     def test_rejects_non_increasing_contexts(self) -> None:
         source = """[bench]

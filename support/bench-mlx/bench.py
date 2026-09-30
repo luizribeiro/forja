@@ -18,6 +18,9 @@ def arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-dir", required=True, type=Path)
     parser.add_argument("--suite", required=True, type=Path)
+    parser.add_argument(
+        "--sampling", choices=("greedy", "generation-config"), default="greedy"
+    )
     parser.add_argument("--json", required=True, type=Path)
     return parser.parse_args()
 
@@ -130,6 +133,33 @@ def validate_bf16(model, mx, tree_flatten) -> None:
         raise RuntimeError(f"expected only bf16 model parameters, found {dtypes}")
 
 
+def model_precision(model_dir: Path, model, mx, tree_flatten) -> str:
+    """Validate and name the checkpoint precision used by MLX-LM."""
+    config = json.loads((model_dir / "config.json").read_text())
+    quantization = config.get("quantization_config")
+    if quantization is not None:
+        if quantization.get("bits") != 4:
+            raise RuntimeError("expected an MLX affine 4-bit checkpoint")
+        return "mlx-affine-q4"
+    validate_bf16(model, mx, tree_flatten)
+    return "bf16"
+
+
+def sampling_options(model_dir: Path, mode: str) -> dict[str, object]:
+    """Return the requested token-selection parameters."""
+    if mode == "greedy":
+        return {"temperature": 0.0, "top_k": 0, "top_p": 1.0, "seed": 0}
+    config = json.loads((model_dir / "generation_config.json").read_text())
+    if not config.get("do_sample"):
+        raise RuntimeError("generation config does not enable sampling")
+    return {
+        "temperature": config["temperature"],
+        "top_k": config["top_k"],
+        "top_p": config["top_p"],
+        "seed": 0,
+    }
+
+
 def model_overrides(model_dir: Path) -> dict[str, object]:
     """Fill required MLX-LM fields that Transformers supplies by default."""
     config = json.loads((model_dir / "config.json").read_text())
@@ -143,6 +173,7 @@ def main() -> None:
     import mlx.core as mx
     from mlx.utils import tree_flatten
     from mlx_lm import load, stream_generate
+    from mlx_lm.sample_utils import make_sampler
 
     args = arguments()
     bench = load_suite(args.suite)
@@ -152,9 +183,15 @@ def main() -> None:
         tokenizer_config={"trust_remote_code": True},
         model_config=model_overrides(args.model_dir),
     )
-    validate_bf16(model, mx, tree_flatten)
+    precision = model_precision(args.model_dir, model, mx, tree_flatten)
     mx.eval(model.parameters())
     tokenizer._eos_token_ids = set()
+    sampling = sampling_options(args.model_dir, args.sampling)
+    sampler = make_sampler(
+        temp=sampling["temperature"],
+        top_k=sampling["top_k"],
+        top_p=sampling["top_p"],
+    )
     vocab = config.get("vocab_size") or config["text_config"]["vocab_size"]
     pp = bench["pp"]
     tg = bench["tg"]
@@ -163,6 +200,7 @@ def main() -> None:
     tg_prompt = synthetic_tokens(decode_prefill, vocab)
 
     def pp_trial() -> float:
+        mx.random.seed(sampling["seed"])
         response = next(
             stream_generate(
                 model,
@@ -170,11 +208,13 @@ def main() -> None:
                 pp_prompt,
                 max_tokens=1,
                 prefill_step_size=2048,
+                sampler=sampler,
             )
         )
         return pp / response.prompt_tps
 
     def tg_trial() -> float:
+        mx.random.seed(sampling["seed"])
         responses = iter(
             stream_generate(
                 model,
@@ -182,6 +222,7 @@ def main() -> None:
                 tg_prompt,
                 max_tokens=tg + 2,
                 prefill_step_size=2048,
+                sampler=sampler,
             )
         )
         next(responses)
@@ -205,7 +246,7 @@ def main() -> None:
         "schema_version": 1,
         "implementation": "mlx_lm",
         "model": str(args.model_dir),
-        "settings": bench,
+        "settings": {**bench, "sampling": sampling},
         "tg_context_start": decode_prefill + 1,
         "results": [
             {
@@ -214,7 +255,7 @@ def main() -> None:
                     "engine_component_sha256": None,
                     "device": device,
                     "os": f"macOS {platform.mac_ver()[0]}",
-                    "precision": "bf16",
+                    "precision": precision,
                     "mlx": mx.__version__,
                     "mlx_lm": importlib.metadata.version("mlx-lm"),
                 },
