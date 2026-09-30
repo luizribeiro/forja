@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import statistics
 import sys
+import time
 from pathlib import Path
 
 import mlx.core as mx
@@ -12,6 +14,9 @@ from mlx_lm import load
 
 HIDDEN = 2048
 TOP_K = 8
+WARMUPS = 5
+REPETITIONS = 30
+BLOCKS_PER_SAMPLE = 20
 
 
 def fixed_input() -> mx.array:
@@ -41,11 +46,37 @@ def reference(model_path: Path) -> None:
     )
 
 
+def run(block, activation: mx.array) -> float:
+    """Return synchronized wall time with queue latency amortized."""
+    outputs = [block(activation) for _ in range(BLOCKS_PER_SAMPLE)]
+    started = time.perf_counter()
+    mx.eval(*outputs)
+    mx.synchronize()
+    return (time.perf_counter() - started) / BLOCKS_PER_SAMPLE
+
+
+def benchmark(model_path: Path) -> None:
+    """Print synchronized median microseconds per block."""
+    block = load_block(model_path)
+    activation = fixed_input()
+    for _ in range(WARMUPS):
+        run(block, activation)
+    elapsed = statistics.median(
+        run(block, activation) for _ in range(REPETITIONS)
+    )
+    print(f"{elapsed * 1_000_000.0:.3f}")
+
+
 def main() -> None:
-    """Run the reference operation for a local model directory."""
-    if len(sys.argv) != 2:
-        raise SystemExit(f"usage: {sys.argv[0]} MODEL")
-    reference(Path(sys.argv[1]))
+    """Run the selected operation for a local model directory."""
+    if len(sys.argv) != 3 or sys.argv[1] not in {"reference", "benchmark"}:
+        raise SystemExit(f"usage: {sys.argv[0]} reference|benchmark MODEL")
+    operation = sys.argv[1]
+    model_path = Path(sys.argv[2])
+    if operation == "reference":
+        reference(model_path)
+    else:
+        benchmark(model_path)
 
 
 if __name__ == "__main__":
