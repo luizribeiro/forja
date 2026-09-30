@@ -441,6 +441,46 @@ impl<T: Element> Tensor<T> {
         self.binary_with_shape(right, sys::Op::Matmul, shape)
     }
 
+    /// Multiplies rows by dense expert matrices selected by GPU indices.
+    ///
+    /// Activations are `[rows, input]`, weights are `[experts, input, output]`, indices are
+    /// `[rows, routes]`, and the result is `[rows, routes, output]`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for incompatible shapes or dtypes, an out-of-range expert index, or a
+    /// refused dispatch.
+    pub fn gather_matmul(&self, weights: &Self, indices: &Tensor<u32>) -> Result<Self>
+    where
+        T: FloatElement,
+    {
+        let [rows, inner]: [u32; 2] = self
+            .shape
+            .as_slice()
+            .try_into()
+            .map_err(|_| Error::new("gathered matmul input must have rank two"))?;
+        let [_, weight_inner, output]: [u32; 3] = weights
+            .shape
+            .as_slice()
+            .try_into()
+            .map_err(|_| Error::new("gathered matmul weights must have rank three"))?;
+        let [index_rows, routes]: [u32; 2] = indices
+            .shape
+            .as_slice()
+            .try_into()
+            .map_err(|_| Error::new("expert indices must have rank two"))?;
+        if index_rows != rows || weight_inner != inner {
+            return Err(Error::new("gathered matmul shapes are incompatible"));
+        }
+        let result = Self::empty(vec![rows, routes, output])?;
+        graph::record(
+            sys::Op::GatherMatmul,
+            &[&self.handle, &weights.handle, &indices.handle],
+            &result.handle,
+        )?;
+        Ok(result)
+    }
+
     /// Multiplies by affine-quantized weights stored in MLX packed order.
     ///
     /// The input is `[rows, input]`, packed weights are `[output, input * bits / 32]`, and scale

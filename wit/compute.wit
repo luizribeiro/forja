@@ -147,6 +147,7 @@ interface compute {
     rope(rope-cfg),
     embed,
     matmul,
+    gather-matmul,
     quant-matmul(quant-matmul-cfg),
     gather-quant-matmul(quant-matmul-cfg),
     sdpa(sdpa-cfg),

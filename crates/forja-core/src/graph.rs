@@ -3,7 +3,7 @@ use std::{any::Any, collections::HashSet, error::Error, fmt, sync::Arc};
 use crate::{
     Affine, ByteHull, CommandList, Dispatch, Op, OpError, ParamError, ParamSpace, ParamValues,
     SymbolicLayout, SymbolicLayoutError, Tensor, TensorError, byte_ranges_overlap,
-    gather_quant_matmul_flops, matmul_flops,
+    gather_matmul_flops, gather_quant_matmul_flops, matmul_flops,
     ops::{BufferAccess, barriers_bounded_by, barriers_for_accesses, dispatch_accesses},
     program::{BindError, Inst, PreparedProgram, ProgramKind},
     quant_matmul_flops, sdpa_flops,
@@ -105,6 +105,18 @@ impl GraphLimits {
                 .zip(dispatch.inputs().get(1))
                 .and_then(|(left, right)| {
                     matmul_flops(left.layout().shape(), right.layout().shape())
+                }),
+            Op::GatherMatmul => dispatch
+                .inputs()
+                .first()
+                .zip(dispatch.inputs().get(1))
+                .zip(dispatch.inputs().get(2))
+                .and_then(|((input, weights), indices)| {
+                    gather_matmul_flops(
+                        input.layout().shape(),
+                        weights.layout().shape(),
+                        indices.layout().shape(),
+                    )
                 }),
             Op::QuantMatmul { .. } => dispatch
                 .inputs()

@@ -501,6 +501,70 @@ impl CpuBackend {
         self.write_output(output, &values)
     }
 
+    fn execute_gather_matmul(
+        &self,
+        inputs: &[Tensor],
+        output: &Tensor,
+    ) -> Result<(), BackendError> {
+        let activations = decode(&self.read(&inputs[0])?, inputs[0].layout().dtype())
+            .ok_or(BackendError::ExecutionFailed)?;
+        let weights = decode(&self.read(&inputs[1])?, inputs[1].layout().dtype())
+            .ok_or(BackendError::ExecutionFailed)?;
+        let indices = decode_u32(&self.read(&inputs[2])?).ok_or(BackendError::ExecutionFailed)?;
+        let inner = execution_usize(inputs[0].layout().shape()[1])?;
+        let experts = execution_usize(inputs[1].layout().shape()[0])?;
+        let columns = execution_usize(inputs[1].layout().shape()[2])?;
+        let routes = execution_usize(inputs[2].layout().shape()[1])?;
+        let expert_elements = checked_product(inner, columns)?;
+        let capacity = execution_usize(output.layout().element_count())?;
+        let mut values = Vec::with_capacity(capacity);
+        let mut invalid_route = None;
+        for (row, activation) in activations.chunks_exact(inner).enumerate() {
+            let route = row
+                .checked_mul(routes)
+                .ok_or(BackendError::ExecutionFailed)?;
+            let end = route
+                .checked_add(routes)
+                .ok_or(BackendError::ExecutionFailed)?;
+            for &expert in indices
+                .get(route..end)
+                .ok_or(BackendError::ExecutionFailed)?
+            {
+                let expert_index = execution_usize(expert)?;
+                if expert_index >= experts {
+                    values.resize(
+                        values
+                            .len()
+                            .checked_add(columns)
+                            .ok_or(BackendError::ExecutionFailed)?,
+                        0.0,
+                    );
+                    record_invalid_route(&mut invalid_route, expert);
+                    continue;
+                }
+                let start = checked_product(expert_index, expert_elements)?;
+                let end = start
+                    .checked_add(expert_elements)
+                    .ok_or(BackendError::ExecutionFailed)?;
+                let expert_weights = weights
+                    .get(start..end)
+                    .ok_or(BackendError::ExecutionFailed)?;
+                for column in 0..columns {
+                    values.push(
+                        activation
+                            .iter()
+                            .zip(expert_weights.chunks_exact(columns))
+                            .fold(0.0, |sum, (input, weight_row)| {
+                                sum + input * weight_row[column]
+                            }),
+                    );
+                }
+            }
+        }
+        self.write_output(output, &values)?;
+        invalid_route.map_or(Ok(()), |index| Err(BackendError::IndexOutOfRange { index }))
+    }
+
     fn execute_quant_matmul(
         &self,
         inputs: &[Tensor],
@@ -849,6 +913,9 @@ impl Backend for CpuBackend {
                 }
                 Op::Embed => self.execute_embed(dispatch.inputs(), dispatch.output()),
                 Op::Matmul => self.execute_matmul(dispatch.inputs(), dispatch.output()),
+                Op::GatherMatmul => {
+                    self.execute_gather_matmul(dispatch.inputs(), dispatch.output())
+                }
                 Op::QuantMatmul { bits, group_size } => self.execute_quant_matmul(
                     dispatch.inputs(),
                     dispatch.output(),
@@ -1582,6 +1649,47 @@ mod tests {
                     .collect::<Vec<_>>()
             );
         }
+    }
+
+    #[test]
+    fn gathered_matmul_selects_duplicate_routes_and_reports_lowest_bad_index() {
+        let backend = CpuBackend::new();
+        let input = f32_tensor(&backend, &[2, 2], &[1.0, 2.0, 3.0, 4.0]);
+        let weights = f32_tensor(
+            &backend,
+            &[3, 2, 2],
+            &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 2.0, 0.0, 0.0, 3.0],
+        );
+        let indices = backend.alloc(DType::U32, &[2, 3]).unwrap();
+        backend
+            .write(&indices, &u32_bytes(&[2, 0, 2, 0, 2, 0]))
+            .unwrap();
+        let output = backend.alloc(DType::F32, &[2, 3, 2]).unwrap();
+        let mut commands = CommandList::new();
+        commands
+            .dispatch(Op::GatherMatmul, &[&input, &weights, &indices], &output)
+            .unwrap();
+        backend.submit(commands).unwrap().wait().unwrap();
+        assert_eq!(
+            decode(&backend.read(&output).unwrap(), DType::F32).unwrap(),
+            [2.0, 6.0, 1.0, 2.0, 2.0, 6.0, 3.0, 4.0, 6.0, 12.0, 3.0, 4.0]
+        );
+
+        let invalid = backend.alloc(DType::U32, &[2, 1]).unwrap();
+        backend.write(&invalid, &u32_bytes(&[99, 7])).unwrap();
+        let output = backend.alloc(DType::F32, &[2, 1, 2]).unwrap();
+        let mut commands = CommandList::new();
+        commands
+            .dispatch(Op::GatherMatmul, &[&input, &weights, &invalid], &output)
+            .unwrap();
+        assert_eq!(
+            backend.submit(commands).unwrap().wait(),
+            Err(BackendError::IndexOutOfRange { index: 7 })
+        );
+        assert_eq!(
+            backend.read(&output).unwrap(),
+            vec![0; 4 * std::mem::size_of::<f32>()]
+        );
     }
 
     #[test]

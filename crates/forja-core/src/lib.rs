@@ -20,7 +20,8 @@ pub use graph::{
 pub use layout::{Layout, LayoutError, MAX_RANK, Slice, byte_ranges_overlap, is_injective};
 pub use ops::{
     BufferId, CommandList, Dispatch, Op, OpError, Operand, Tensor, TensorError,
-    gather_quant_matmul_flops, matmul_flops, quant_matmul_flops, required_barriers, sdpa_flops,
+    gather_matmul_flops, gather_quant_matmul_flops, matmul_flops, quant_matmul_flops,
+    required_barriers, sdpa_flops,
 };
 pub use quantized::{QuantizedMatrix, QuantizedMatrixError, QuantizedMatrixPart};
 pub use symbolic::{

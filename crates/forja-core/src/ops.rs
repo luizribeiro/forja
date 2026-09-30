@@ -174,6 +174,8 @@ pub enum Op {
     Embed,
     /// Multiplies rank-two or rank-three matrices.
     Matmul,
+    /// Multiplies rows by dense expert matrices selected at run time.
+    GatherMatmul,
     /// Multiplies a matrix by affine-quantized transposed weights.
     QuantMatmul {
         /// Number of bits in each unsigned quantized value.
@@ -330,6 +332,7 @@ impl Dispatch {
             Op::Rope { theta } => check_rope(inputs, output, theta)?,
             Op::Embed => check_embed(inputs, output)?,
             Op::Matmul => check_matmul(inputs, output)?,
+            Op::GatherMatmul => check_gather_matmul(inputs, output)?,
             Op::QuantMatmul { bits, group_size } => {
                 check_quant_matmul(inputs, output, bits, group_size)?;
             }
@@ -1022,6 +1025,55 @@ fn check_matmul(inputs: &[&Tensor], output: &Tensor) -> Result<(), OpError> {
     Ok(())
 }
 
+fn check_gather_matmul(inputs: &[&Tensor], output: &Tensor) -> Result<(), OpError> {
+    if inputs.len() != 3 {
+        return Err(OpError::Arity {
+            expected: 3,
+            actual: inputs.len(),
+        });
+    }
+    check_float(inputs[0], Operand::Input(0))?;
+    check_float(inputs[1], Operand::Input(1))?;
+    check_float(output, Operand::Output)?;
+    if output.layout.dtype() != inputs[0].layout.dtype() {
+        return Err(OpError::DType {
+            operand: Operand::Output,
+            dtype: output.layout.dtype(),
+        });
+    }
+    if inputs[2].layout.dtype() != DType::U32 {
+        return Err(OpError::DType {
+            operand: Operand::Input(2),
+            dtype: inputs[2].layout.dtype(),
+        });
+    }
+    let [rows, inner]: [u32; 2] = inputs[0]
+        .layout
+        .shape()
+        .try_into()
+        .map_err(|_| shape_error(Operand::Input(0)))?;
+    let [_, weight_inner, columns]: [u32; 3] = inputs[1]
+        .layout
+        .shape()
+        .try_into()
+        .map_err(|_| shape_error(Operand::Input(1)))?;
+    if weight_inner != inner {
+        return Err(shape_error(Operand::Input(1)));
+    }
+    let [index_rows, routes]: [u32; 2] = inputs[2]
+        .layout
+        .shape()
+        .try_into()
+        .map_err(|_| shape_error(Operand::Input(2)))?;
+    if index_rows != rows {
+        return Err(shape_error(Operand::Input(2)));
+    }
+    if output.layout.shape() != [rows, routes, columns] {
+        return Err(shape_error(Operand::Output));
+    }
+    Ok(())
+}
+
 fn check_quant_matmul(
     inputs: &[&Tensor],
     output: &Tensor,
@@ -1185,6 +1237,20 @@ pub fn matmul_flops(left: &[u32], right: &[u32]) -> Option<u64> {
         .checked_mul(u64::from(*left.get(rank.checked_sub(2)?)?))?
         .checked_mul(u64::from(*left.last()?))?
         .checked_mul(u64::from(*right.last()?))?
+        .checked_mul(2)
+}
+
+/// Counts the floating-point operations in gathered dense matrix multiplication.
+#[must_use]
+pub fn gather_matmul_flops(input: &[u32], weights: &[u32], indices: &[u32]) -> Option<u64> {
+    let [rows, inner]: [u32; 2] = input.try_into().ok()?;
+    let [_, weight_inner, columns]: [u32; 3] = weights.try_into().ok()?;
+    let [index_rows, routes]: [u32; 2] = indices.try_into().ok()?;
+    (rows == index_rows && inner == weight_inner).then_some(())?;
+    u64::from(rows)
+        .checked_mul(u64::from(routes))?
+        .checked_mul(u64::from(inner))?
+        .checked_mul(u64::from(columns))?
         .checked_mul(2)
 }
 
@@ -1823,6 +1889,41 @@ mod tests {
             CommandList::new().dispatch(Op::Matmul, &[&a, &wrong_batch], &output),
             Err(OpError::Shape {
                 operand: Operand::Input(1)
+            })
+        );
+    }
+
+    #[test]
+    fn gathered_matmul_checks_expert_and_index_shapes() {
+        let input = tensor(1, DType::BF16, &[7, 33], &[33, 1]);
+        let weights = tensor(2, DType::F16, &[5, 33, 17], &[561, 17, 1]);
+        let indices = tensor(3, DType::U32, &[7, 3], &[3, 1]);
+        let output = tensor(4, DType::BF16, &[7, 3, 17], &[51, 17, 1]);
+        assert!(
+            CommandList::new()
+                .dispatch(Op::GatherMatmul, &[&input, &weights, &indices], &output)
+                .is_ok()
+        );
+        let wrong_weights = tensor(5, DType::F16, &[5, 32, 17], &[544, 17, 1]);
+        assert_eq!(
+            CommandList::new().dispatch(
+                Op::GatherMatmul,
+                &[&input, &wrong_weights, &indices],
+                &output,
+            ),
+            Err(OpError::Shape {
+                operand: Operand::Input(1)
+            })
+        );
+        let wrong_indices = tensor(6, DType::U32, &[6, 3], &[3, 1]);
+        assert_eq!(
+            CommandList::new().dispatch(
+                Op::GatherMatmul,
+                &[&input, &weights, &wrong_indices],
+                &output,
+            ),
+            Err(OpError::Shape {
+                operand: Operand::Input(2)
             })
         );
     }

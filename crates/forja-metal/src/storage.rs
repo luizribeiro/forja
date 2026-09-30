@@ -511,6 +511,8 @@ impl MetalBackend {
             "\n",
             include_str!("quant_matmul.metal"),
             "\n",
+            include_str!("gather_matmul.metal"),
+            "\n",
             include_str!("sdpa.metal"),
             "\n",
             include_str!("sdpa_vector.metal")
