@@ -181,6 +181,13 @@ pub enum Op {
         /// Number of input elements sharing one scale and bias.
         group_size: u32,
     },
+    /// Multiplies rows by affine-quantized expert weights selected at run time.
+    GatherQuantMatmul {
+        /// Number of bits in each unsigned quantized value.
+        bits: u8,
+        /// Number of input elements sharing one scale and bias.
+        group_size: u32,
+    },
     /// Computes grouped-query scaled dot-product attention.
     Sdpa {
         /// The score multiplier.
@@ -325,6 +332,9 @@ impl Dispatch {
             Op::Matmul => check_matmul(inputs, output)?,
             Op::QuantMatmul { bits, group_size } => {
                 check_quant_matmul(inputs, output, bits, group_size)?;
+            }
+            Op::GatherQuantMatmul { bits, group_size } => {
+                check_gather_quant_matmul(inputs, output, bits, group_size)?;
             }
             Op::Sdpa {
                 scale,
@@ -1051,37 +1061,115 @@ fn check_quant_matmul(
         inputs[2].layout.clone(),
         inputs[3].layout.clone(),
     )
-    .map_err(|error| match error {
+    .map_err(|error| quantized_matrix_error(error, inputs))?;
+    if output.layout.shape() != [m, out] {
+        return Err(shape_error(Operand::Output));
+    }
+    Ok(())
+}
+
+fn check_gather_quant_matmul(
+    inputs: &[&Tensor],
+    output: &Tensor,
+    bits: u8,
+    group_size: u32,
+) -> Result<(), OpError> {
+    if inputs.len() != 5 {
+        return Err(OpError::Arity {
+            expected: 5,
+            actual: inputs.len(),
+        });
+    }
+    check_float(inputs[0], Operand::Input(0))?;
+    check_float(output, Operand::Output)?;
+    if output.layout.dtype() != inputs[0].layout.dtype() {
+        return Err(OpError::DType {
+            operand: Operand::Output,
+            dtype: output.layout.dtype(),
+        });
+    }
+    if inputs[4].layout.dtype() != DType::U32 {
+        return Err(OpError::DType {
+            operand: Operand::Input(4),
+            dtype: inputs[4].layout.dtype(),
+        });
+    }
+    let [rows, inner]: [u32; 2] = inputs[0]
+        .layout
+        .shape()
+        .try_into()
+        .map_err(|_| shape_error(Operand::Input(0)))?;
+    let [experts, out, _]: [u32; 3] = inputs[1]
+        .layout
+        .shape()
+        .try_into()
+        .map_err(|_| shape_error(Operand::Input(1)))?;
+    for (index, part) in inputs[1..4].iter().enumerate() {
+        if part.layout.shape().first() != Some(&experts) {
+            return Err(shape_error(Operand::Input(index + 1)));
+        }
+    }
+    let packed =
+        expert_matrix_layout(inputs[1].layout()).map_err(|()| shape_error(Operand::Input(1)))?;
+    let scales =
+        expert_matrix_layout(inputs[2].layout()).map_err(|()| shape_error(Operand::Input(2)))?;
+    let biases =
+        expert_matrix_layout(inputs[3].layout()).map_err(|()| shape_error(Operand::Input(3)))?;
+    QuantizedMatrix::new(out, inner, bits, group_size, packed, scales, biases)
+        .map_err(|error| quantized_matrix_error(error, inputs))?;
+    let [index_rows, k]: [u32; 2] = inputs[4]
+        .layout
+        .shape()
+        .try_into()
+        .map_err(|_| shape_error(Operand::Input(4)))?;
+    if index_rows != rows {
+        return Err(shape_error(Operand::Input(4)));
+    }
+    if output.layout.shape() != [rows, k, out] {
+        return Err(shape_error(Operand::Output));
+    }
+    Ok(())
+}
+
+fn expert_matrix_layout(layout: &Layout) -> Result<Layout, ()> {
+    let [_, rows, columns]: [u32; 3] = layout.shape().try_into().map_err(|_| ())?;
+    Layout::new(
+        layout.dtype(),
+        layout.offset(),
+        vec![rows, columns],
+        layout.strides()[1..].to_vec(),
+        layout.buffer_len(),
+    )
+    .map_err(|_| ())
+}
+
+fn quantized_matrix_error(error: QuantizedMatrixError, inputs: &[&Tensor]) -> OpError {
+    match error {
         QuantizedMatrixError::UnsupportedBitWidth | QuantizedMatrixError::UnsupportedGroupSize => {
             OpError::InvalidQuantization
         }
         QuantizedMatrixError::ColumnsNotPackable | QuantizedMatrixError::ColumnsNotGrouped => {
             shape_error(Operand::Input(0))
         }
-        QuantizedMatrixError::DTypeMismatch { part } => match part {
-            QuantizedMatrixPart::Packed => OpError::DType {
-                operand: Operand::Input(1),
-                dtype: inputs[1].layout.dtype(),
-            },
-            QuantizedMatrixPart::Scales => OpError::DType {
-                operand: Operand::Input(2),
-                dtype: inputs[2].layout.dtype(),
-            },
-            QuantizedMatrixPart::Biases => OpError::DType {
-                operand: Operand::Input(3),
-                dtype: inputs[3].layout.dtype(),
-            },
-        },
-        QuantizedMatrixError::ShapeMismatch { part } => match part {
-            QuantizedMatrixPart::Packed => shape_error(Operand::Input(1)),
-            QuantizedMatrixPart::Scales => shape_error(Operand::Input(2)),
-            QuantizedMatrixPart::Biases => shape_error(Operand::Input(3)),
-        },
-    })?;
-    if output.layout.shape() != [m, out] {
-        return Err(shape_error(Operand::Output));
+        QuantizedMatrixError::DTypeMismatch { part } => {
+            let input = quantized_part_input(part);
+            OpError::DType {
+                operand: Operand::Input(input),
+                dtype: inputs[input].layout.dtype(),
+            }
+        }
+        QuantizedMatrixError::ShapeMismatch { part } => {
+            shape_error(Operand::Input(quantized_part_input(part)))
+        }
     }
-    Ok(())
+}
+
+const fn quantized_part_input(part: QuantizedMatrixPart) -> usize {
+    match part {
+        QuantizedMatrixPart::Packed => 1,
+        QuantizedMatrixPart::Scales => 2,
+        QuantizedMatrixPart::Biases => 3,
+    }
 }
 
 /// Counts the floating-point operations in a rank-2 or rank-3 matrix multiply.
@@ -1106,6 +1194,20 @@ pub fn quant_matmul_flops(input: &[u32], packed: &[u32]) -> Option<u64> {
     let [rows, inner]: [u32; 2] = input.try_into().ok()?;
     let [columns, _]: [u32; 2] = packed.try_into().ok()?;
     u64::from(rows)
+        .checked_mul(u64::from(inner))?
+        .checked_mul(u64::from(columns))?
+        .checked_mul(2)
+}
+
+/// Counts the multiply-add operations in gathered affine quantized matrix multiplication.
+#[must_use]
+pub fn gather_quant_matmul_flops(input: &[u32], packed: &[u32], indices: &[u32]) -> Option<u64> {
+    let [rows, inner]: [u32; 2] = input.try_into().ok()?;
+    let [_, columns, _]: [u32; 3] = packed.try_into().ok()?;
+    let [index_rows, k]: [u32; 2] = indices.try_into().ok()?;
+    (rows == index_rows).then_some(())?;
+    u64::from(rows)
+        .checked_mul(u64::from(k))?
         .checked_mul(u64::from(inner))?
         .checked_mul(u64::from(columns))?
         .checked_mul(2)
@@ -1826,6 +1928,47 @@ mod tests {
                 &output
             ),
             Err(OpError::InvalidQuantization)
+        );
+    }
+
+    #[test]
+    fn gathered_quant_matmul_checks_stacked_shapes_and_indices() {
+        let input = tensor(1, DType::BF16, &[7, 64], &[64, 1]);
+        let packed = tensor(2, DType::U32, &[5, 33, 8], &[264, 8, 1]);
+        let scales = tensor(3, DType::F16, &[5, 33, 1], &[33, 1, 1]);
+        let biases = tensor(4, DType::F16, &[5, 33, 1], &[33, 1, 1]);
+        let indices = tensor(5, DType::U32, &[7, 3], &[3, 1]);
+        let output = tensor(6, DType::BF16, &[7, 3, 33], &[99, 33, 1]);
+        let op = Op::GatherQuantMatmul {
+            bits: 4,
+            group_size: 64,
+        };
+        assert!(
+            CommandList::new()
+                .dispatch(op, &[&input, &packed, &scales, &biases, &indices], &output,)
+                .is_ok()
+        );
+        let wrong_indices = tensor(7, DType::U32, &[6, 3], &[3, 1]);
+        assert_eq!(
+            CommandList::new().dispatch(
+                op,
+                &[&input, &packed, &scales, &biases, &wrong_indices],
+                &output,
+            ),
+            Err(OpError::Shape {
+                operand: Operand::Input(4)
+            })
+        );
+        let wrong_experts = tensor(8, DType::F16, &[4, 33, 1], &[33, 1, 1]);
+        assert_eq!(
+            CommandList::new().dispatch(
+                op,
+                &[&input, &packed, &wrong_experts, &biases, &indices],
+                &output,
+            ),
+            Err(OpError::Shape {
+                operand: Operand::Input(2)
+            })
         );
     }
 

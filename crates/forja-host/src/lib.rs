@@ -24,7 +24,7 @@ use forja_core::{
     Affine, Backend, BackendError, BufferId, CommandList, DType, GraphLimits, GraphTemplate,
     Layout, LayoutError, Op, OpError, ParamSpace, PreparedGraph, Slice, Submission,
     SubmissionProfile, SymbolicLayout, SymbolicLayoutError, TemplateOp, TemplateTensor, Tensor,
-    ViewOp, matmul_flops,
+    ViewOp, gather_quant_matmul_flops, matmul_flops,
     program::{
         BinOp, Inst, KernelSignature, MAX_INSTRUCTIONS, MAX_OUTPUTS, PrepareError, PreparedProgram,
         Program, ProgramError, ProgramKind, RedOp, UnOp, ValidatedProgram, ValueType,
@@ -2159,6 +2159,17 @@ impl<B: Backend> Host<B> {
                         quant_matmul_flops(input.layout().shape(), packed.layout().shape())
                     })
             }
+            Op::GatherQuantMatmul { .. } => inputs
+                .first()
+                .zip(inputs.get(1))
+                .zip(inputs.get(4))
+                .and_then(|((input, packed), indices)| {
+                    gather_quant_matmul_flops(
+                        input.layout().shape(),
+                        packed.layout().shape(),
+                        indices.layout().shape(),
+                    )
+                }),
             Op::Sdpa { .. } => inputs
                 .first()
                 .zip(inputs.get(1))
@@ -3214,6 +3225,10 @@ fn core_op(operation: compute::Op) -> (TemplateOp, Option<Op>) {
         compute::Op::Embed => concrete_template(Op::Embed),
         compute::Op::Matmul => concrete_template(Op::Matmul),
         compute::Op::QuantMatmul(config) => concrete_template(Op::QuantMatmul {
+            bits: config.bits,
+            group_size: config.group_size,
+        }),
+        compute::Op::GatherQuantMatmul(config) => concrete_template(Op::GatherQuantMatmul {
             bits: config.bits,
             group_size: config.group_size,
         }),

@@ -443,7 +443,7 @@ impl CpuBackend {
         let width = execution_usize(shape[1])?;
         let capacity = execution_usize(output.layout().element_count())?;
         let mut values = Vec::with_capacity(capacity);
-        let mut first_bad = None;
+        let mut invalid_route = None;
         for id in ids {
             if let Ok(row) = execution_usize(id)
                 && row < vocab
@@ -462,11 +462,11 @@ impl CpuBackend {
                     .checked_add(width)
                     .ok_or(BackendError::ExecutionFailed)?;
                 values.resize(end, 0.0);
-                first_bad.get_or_insert(id);
+                record_invalid_route(&mut invalid_route, id);
             }
         }
         self.write_output(output, &values)?;
-        first_bad.map_or(Ok(()), |index| Err(BackendError::IndexOutOfRange { index }))
+        invalid_route.map_or(Ok(()), |index| Err(BackendError::IndexOutOfRange { index }))
     }
 
     fn execute_matmul(&self, inputs: &[Tensor], output: &Tensor) -> Result<(), BackendError> {
@@ -501,7 +501,6 @@ impl CpuBackend {
         self.write_output(output, &values)
     }
 
-    #[allow(clippy::cast_precision_loss)]
     fn execute_quant_matmul(
         &self,
         inputs: &[Tensor],
@@ -531,8 +530,6 @@ impl CpuBackend {
         let columns = execution_usize(columns)?;
         let packed_width = execution_usize(packed_width)?;
         let group_size = execution_usize(group_size)?;
-        let values_per_word = 32_usize / usize::from(bits);
-        let mask = (1_u32 << bits) - 1;
         let group_count = inner / group_size;
         let capacity = checked_product(rows, columns)?;
         let mut values = Vec::with_capacity(capacity);
@@ -544,32 +541,94 @@ impl CpuBackend {
                 let group_row = column
                     .checked_mul(group_count)
                     .ok_or(BackendError::ExecutionFailed)?;
-                let sum =
-                    activation
-                        .iter()
-                        .enumerate()
-                        .try_fold(0.0_f32, |sum, (index, input)| {
-                            let word = packed
-                                .get(packed_row + index / values_per_word)
-                                .copied()
-                                .ok_or(BackendError::ExecutionFailed)?;
-                            let shift = (index % values_per_word) * usize::from(bits);
-                            let quantized = (word >> shift) & mask;
-                            let group = group_row + index / group_size;
-                            let scale = scales
-                                .get(group)
-                                .copied()
-                                .ok_or(BackendError::ExecutionFailed)?;
-                            let quant_bias = biases
-                                .get(group)
-                                .copied()
-                                .ok_or(BackendError::ExecutionFailed)?;
-                            Ok(sum + input * (scale * quantized as f32 + quant_bias))
-                        })?;
-                values.push(sum);
+                values.push(affine_quant_dot(
+                    activation, &packed, &scales, &biases, packed_row, group_row, group_size, bits,
+                )?);
             }
         }
         self.write_output(output, &values)
+    }
+
+    fn execute_gather_quant_matmul(
+        &self,
+        inputs: &[Tensor],
+        output: &Tensor,
+        bits: u8,
+        group_size: u32,
+    ) -> Result<(), BackendError> {
+        let activations = decode(&self.read(&inputs[0])?, inputs[0].layout().dtype())
+            .ok_or(BackendError::ExecutionFailed)?;
+        let packed = decode_u32(&self.read(&inputs[1])?).ok_or(BackendError::ExecutionFailed)?;
+        let scales = decode(&self.read(&inputs[2])?, inputs[2].layout().dtype())
+            .ok_or(BackendError::ExecutionFailed)?;
+        let biases = decode(&self.read(&inputs[3])?, inputs[3].layout().dtype())
+            .ok_or(BackendError::ExecutionFailed)?;
+        let indices = decode_u32(&self.read(&inputs[4])?).ok_or(BackendError::ExecutionFailed)?;
+        let [_rows, inner]: [u32; 2] = inputs[0]
+            .layout()
+            .shape()
+            .try_into()
+            .map_err(|_| BackendError::ExecutionFailed)?;
+        let [experts, columns, packed_width]: [u32; 3] = inputs[1]
+            .layout()
+            .shape()
+            .try_into()
+            .map_err(|_| BackendError::ExecutionFailed)?;
+        let [_, k]: [u32; 2] = inputs[4]
+            .layout()
+            .shape()
+            .try_into()
+            .map_err(|_| BackendError::ExecutionFailed)?;
+        let inner = execution_usize(inner)?;
+        let experts = execution_usize(experts)?;
+        let columns = execution_usize(columns)?;
+        let packed_width = execution_usize(packed_width)?;
+        let group_size = execution_usize(group_size)?;
+        let k = execution_usize(k)?;
+        let group_count = inner / group_size;
+        let expert_packed = checked_product(columns, packed_width)?;
+        let expert_groups = checked_product(columns, group_count)?;
+        let capacity = execution_usize(output.layout().element_count())?;
+        let mut values = Vec::with_capacity(capacity);
+        let mut invalid_route = None;
+        for (row, activation) in activations.chunks_exact(inner).enumerate() {
+            let route = row.checked_mul(k).ok_or(BackendError::ExecutionFailed)?;
+            for &expert in indices
+                .get(route..route.checked_add(k).ok_or(BackendError::ExecutionFailed)?)
+                .ok_or(BackendError::ExecutionFailed)?
+            {
+                let Ok(expert_index) = execution_usize(expert) else {
+                    return Err(BackendError::ExecutionFailed);
+                };
+                if expert_index >= experts {
+                    values.resize(
+                        values
+                            .len()
+                            .checked_add(columns)
+                            .ok_or(BackendError::ExecutionFailed)?,
+                        0.0,
+                    );
+                    record_invalid_route(&mut invalid_route, expert);
+                    continue;
+                }
+                let packed_base = checked_product(expert_index, expert_packed)?;
+                let group_base = checked_product(expert_index, expert_groups)?;
+                for column in 0..columns {
+                    values.push(affine_quant_dot(
+                        activation,
+                        &packed,
+                        &scales,
+                        &biases,
+                        packed_base + column * packed_width,
+                        group_base + column * group_count,
+                        group_size,
+                        bits,
+                    )?);
+                }
+            }
+        }
+        self.write_output(output, &values)?;
+        invalid_route.map_or(Ok(()), |index| Err(BackendError::IndexOutOfRange { index }))
     }
 
     fn execute_sdpa(
@@ -640,6 +699,42 @@ impl CpuBackend {
         }
         self.write_output(output, &result)
     }
+}
+
+#[allow(clippy::cast_precision_loss, clippy::too_many_arguments)]
+fn affine_quant_dot(
+    activation: &[f32],
+    packed: &[u32],
+    scales: &[f32],
+    biases: &[f32],
+    packed_row: usize,
+    group_row: usize,
+    group_size: usize,
+    bits: u8,
+) -> Result<f32, BackendError> {
+    let values_per_word = 32_usize / usize::from(bits);
+    let mask = (1_u32 << bits) - 1;
+    activation
+        .iter()
+        .enumerate()
+        .try_fold(0.0_f32, |sum, (index, input)| {
+            let word = packed
+                .get(packed_row + index / values_per_word)
+                .copied()
+                .ok_or(BackendError::ExecutionFailed)?;
+            let shift = (index % values_per_word) * usize::from(bits);
+            let quantized = (word >> shift) & mask;
+            let group = group_row + index / group_size;
+            let scale = scales
+                .get(group)
+                .copied()
+                .ok_or(BackendError::ExecutionFailed)?;
+            let quant_bias = biases
+                .get(group)
+                .copied()
+                .ok_or(BackendError::ExecutionFailed)?;
+            Ok(sum + input * (scale * quantized as f32 + quant_bias))
+        })
 }
 
 impl Default for CpuBackend {
@@ -755,6 +850,12 @@ impl Backend for CpuBackend {
                 Op::Embed => self.execute_embed(dispatch.inputs(), dispatch.output()),
                 Op::Matmul => self.execute_matmul(dispatch.inputs(), dispatch.output()),
                 Op::QuantMatmul { bits, group_size } => self.execute_quant_matmul(
+                    dispatch.inputs(),
+                    dispatch.output(),
+                    bits,
+                    group_size,
+                ),
+                Op::GatherQuantMatmul { bits, group_size } => self.execute_gather_quant_matmul(
                     dispatch.inputs(),
                     dispatch.output(),
                     bits,
@@ -917,6 +1018,10 @@ where
     usize: TryFrom<T>,
 {
     usize::try_from(value).map_err(|_| BackendError::ExecutionFailed)
+}
+
+fn record_invalid_route(recorded: &mut Option<u32>, index: u32) {
+    *recorded = Some(recorded.map_or(index, |current| current.min(index)));
 }
 
 fn logical_byte_len(layout: &Layout) -> Result<usize, BackendError> {
@@ -1774,14 +1879,75 @@ mod tests {
     }
 
     #[test]
-    fn embed_zeros_bad_rows_and_reports_the_first_bad_id() {
+    fn gathered_quantized_matmul_selects_duplicate_routes_and_reports_lowest_bad_index() {
+        let backend = CpuBackend::new();
+        let input = f32_tensor(&backend, &[1, 64], &[1.0; 64]);
+        let packed_values = (0_u32..6)
+            .flat_map(|value| std::iter::repeat_n(value * 0x1111_1111, 8))
+            .collect::<Vec<_>>();
+        let packed = backend.alloc(DType::U32, &[3, 2, 8]).unwrap();
+        backend.write(&packed, &u32_bytes(&packed_values)).unwrap();
+        let scales = backend.alloc(DType::BF16, &[3, 2, 1]).unwrap();
+        backend
+            .write(&scales, &encode(&[1.0; 6], DType::BF16).unwrap())
+            .unwrap();
+        let biases = backend.alloc(DType::BF16, &[3, 2, 1]).unwrap();
+        backend
+            .write(&biases, &encode(&[0.0; 6], DType::BF16).unwrap())
+            .unwrap();
+        let indices = backend.alloc(DType::U32, &[1, 3]).unwrap();
+        backend.write(&indices, &u32_bytes(&[2, 0, 2])).unwrap();
+        let output = backend.alloc(DType::F32, &[1, 3, 2]).unwrap();
+        let mut commands = CommandList::new();
+        commands
+            .dispatch(
+                Op::GatherQuantMatmul {
+                    bits: 4,
+                    group_size: 64,
+                },
+                &[&input, &packed, &scales, &biases, &indices],
+                &output,
+            )
+            .unwrap();
+        backend.submit(commands).unwrap().wait().unwrap();
+        assert_eq!(
+            decode(&backend.read(&output).unwrap(), DType::F32).unwrap(),
+            [256.0, 320.0, 0.0, 64.0, 256.0, 320.0]
+        );
+
+        let invalid = backend.alloc(DType::U32, &[1, 2]).unwrap();
+        backend.write(&invalid, &u32_bytes(&[99, 7])).unwrap();
+        let output = backend.alloc(DType::F32, &[1, 2, 2]).unwrap();
+        let mut commands = CommandList::new();
+        commands
+            .dispatch(
+                Op::GatherQuantMatmul {
+                    bits: 4,
+                    group_size: 64,
+                },
+                &[&input, &packed, &scales, &biases, &invalid],
+                &output,
+            )
+            .unwrap();
+        assert_eq!(
+            backend.submit(commands).unwrap().wait(),
+            Err(BackendError::IndexOutOfRange { index: 7 })
+        );
+        assert_eq!(
+            backend.read(&output).unwrap(),
+            vec![0; 4 * std::mem::size_of::<f32>()]
+        );
+    }
+
+    #[test]
+    fn embed_zeros_bad_rows_and_reports_the_lowest_bad_id() {
         let backend = CpuBackend::new();
         let table = backend.alloc(DType::F32, &[3, 2]).unwrap();
         backend
             .write(&table, &f32_bytes(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]))
             .unwrap();
         let ids = backend.alloc(DType::U32, &[4]).unwrap();
-        backend.write(&ids, &u32_bytes(&[2, 99, 0, 100])).unwrap();
+        backend.write(&ids, &u32_bytes(&[2, 100, 0, 99])).unwrap();
         let output = backend.alloc(DType::F32, &[4, 2]).unwrap();
         let mut commands = CommandList::new();
         commands

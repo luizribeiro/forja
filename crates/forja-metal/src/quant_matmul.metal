@@ -167,6 +167,180 @@ kernel void quantized_gemv(
     }
 }
 
+struct GatherQuantMatmulParams {
+    ulong input_offset;
+    ulong packed_offset;
+    ulong scale_offset;
+    ulong bias_offset;
+    ulong indices_offset;
+    ulong output_offset;
+    ulong input_row_stride;
+    ulong input_inner_stride;
+    ulong packed_expert_stride;
+    ulong packed_row_stride;
+    ulong packed_word_stride;
+    ulong scale_expert_stride;
+    ulong scale_row_stride;
+    ulong scale_group_stride;
+    ulong bias_expert_stride;
+    ulong bias_row_stride;
+    ulong bias_group_stride;
+    ulong indices_row_stride;
+    ulong indices_slot_stride;
+    ulong output_row_stride;
+    ulong output_slot_stride;
+    ulong output_column_stride;
+    uint rows;
+    uint routes;
+    uint inner;
+    uint experts;
+    uint columns;
+    uint packed_width;
+    uint bits;
+    uint group_size;
+};
+
+kernel void gather_quantized_gemv(
+    device const uchar *input [[buffer(0)]],
+    device const uchar *packed [[buffer(1)]],
+    device const uchar *scales [[buffer(2)]],
+    device const uchar *biases [[buffer(3)]],
+    device const uint *indices [[buffer(4)]],
+    device uchar *output [[buffer(5)]],
+    constant GatherQuantMatmulParams &params [[buffer(6)]],
+    device atomic_uint *error_flag [[buffer(7)]],
+    ushort simdgroup [[simdgroup_index_in_threadgroup]],
+    ushort lane [[thread_index_in_simdgroup]],
+    uint2 tile [[threadgroup_position_in_grid]]) {
+    uint route = tile.y;
+    uint row = route / params.routes;
+    uint slot = route % params.routes;
+    uint expert = indices[
+        params.indices_offset + ulong(row) * params.indices_row_stride +
+        ulong(slot) * params.indices_slot_stride];
+    bool valid = expert < params.experts;
+    if (!valid && lane == 0 && simdgroup == 0) {
+        atomic_store_explicit(error_flag, 1, memory_order_relaxed);
+        atomic_fetch_min_explicit(error_flag + 1, expert, memory_order_relaxed);
+    }
+    uint first_column = tile.x * 16 + uint(simdgroup) * 8;
+    uint values_per_word = 32 / quant_bits;
+    uint words_per_group = quant_group_size / values_per_word;
+    uint mask = (1u << quant_bits) - 1u;
+    float sums[8] = {0.0f};
+    if (valid) {
+        for (uint first_word = uint(lane) * 4;
+             first_word < params.packed_width;
+             first_word += 128) {
+            uint group = first_word / words_per_group;
+            float input_sum = 0.0f;
+            float quantized_sums[8] = {0.0f};
+            uint4 quantized_words[8] = {uint4(0u)};
+            for (uint item = 0; item < 8; ++item) {
+                uint column = first_column + item;
+                if (column < params.columns) {
+                    ulong index = params.packed_offset +
+                        ulong(expert) * params.packed_expert_stride +
+                        ulong(column) * params.packed_row_stride +
+                        ulong(first_word) * params.packed_word_stride;
+                    if (params.packed_word_stride == 1 && (index & 3) == 0) {
+                        quantized_words[item] =
+                            *(device const uint4 *)(packed + index * sizeof(uint));
+                    } else {
+                        for (uint word = 0; word < 4; ++word) {
+                            quantized_words[item][word] = load_uint(
+                                packed,
+                                index + ulong(word) * params.packed_word_stride);
+                        }
+                    }
+                }
+            }
+            for (uint word = 0; word < 4; ++word) {
+                uint word_index = first_word + word;
+                uint inner = word_index * values_per_word;
+                if (params.input_inner_stride == 1 &&
+                    ((params.input_offset + ulong(row) * params.input_row_stride +
+                      ulong(inner)) & 3) == 0) {
+                    ulong input_index = params.input_offset +
+                        ulong(row) * params.input_row_stride + ulong(inner);
+                    float4 first = load_float4_contiguous(input, input_index, input0_dtype);
+                    input_sum += dot(first, float4(1.0f));
+                    if (quant_bits == 4) {
+                        float4 second = load_float4_contiguous(
+                            input, input_index + 4, input0_dtype);
+                        input_sum += dot(second, float4(1.0f));
+                        float4 shifts = float4(
+                            1.0f, 1.0f / 16.0f, 1.0f / 256.0f, 1.0f / 4096.0f);
+                        first *= shifts;
+                        second *= shifts;
+                        for (uint item = 0; item < 8; ++item) {
+                            ushort2 halves = as_type<ushort2>(quantized_words[item][word]);
+                            uint4 low = uint4(
+                                halves[0] & 0x000fu, halves[0] & 0x00f0u,
+                                halves[0] & 0x0f00u, halves[0] & 0xf000u);
+                            uint4 high = uint4(
+                                halves[1] & 0x000fu, halves[1] & 0x00f0u,
+                                halves[1] & 0x0f00u, halves[1] & 0xf000u);
+                            quantized_sums[item] +=
+                                dot(first, float4(low)) + dot(second, float4(high));
+                        }
+                    } else {
+                        for (uint item = 0; item < 8; ++item) {
+                            uchar4 values = as_type<uchar4>(quantized_words[item][word]);
+                            quantized_sums[item] += dot(first, float4(values));
+                        }
+                    }
+                } else {
+                    for (uint element = 0; element < values_per_word; ++element) {
+                        float value = load_float(
+                            input,
+                            params.input_offset + ulong(row) * params.input_row_stride +
+                                ulong(inner + element) * params.input_inner_stride,
+                            input0_dtype);
+                        input_sum += value;
+                        uint shift = element * quant_bits;
+                        for (uint item = 0; item < 8; ++item) {
+                            uint quantized = (quantized_words[item][word] >> shift) & mask;
+                            quantized_sums[item] += value * float(quantized);
+                        }
+                    }
+                }
+            }
+            for (uint item = 0; item < 8; ++item) {
+                uint column = first_column + item;
+                if (column < params.columns) {
+                    ulong scale_index = params.scale_offset +
+                        ulong(expert) * params.scale_expert_stride +
+                        ulong(column) * params.scale_row_stride +
+                        ulong(group) * params.scale_group_stride;
+                    ulong bias_index = params.bias_offset +
+                        ulong(expert) * params.bias_expert_stride +
+                        ulong(column) * params.bias_row_stride +
+                        ulong(group) * params.bias_group_stride;
+                    sums[item] += load_float(scales, scale_index, input1_dtype) *
+                        quantized_sums[item] +
+                        load_float(biases, bias_index, input1_dtype) * input_sum;
+                }
+            }
+        }
+    }
+    for (uint item = 0; item < 8; ++item) {
+        sums[item] = simd_sum(sums[item]);
+    }
+    if (lane == 0) {
+        for (uint item = 0; item < 8; ++item) {
+            uint column = first_column + item;
+            if (column < params.columns) {
+                ulong output_index = params.output_offset +
+                    ulong(row) * params.output_row_stride +
+                    ulong(slot) * params.output_slot_stride +
+                    ulong(column) * params.output_column_stride;
+                store_float(output, output_index, output_dtype, sums[item]);
+            }
+        }
+    }
+}
+
 kernel void quantized_gemm_small_m(
     device const uchar *input [[buffer(0)]],
     device const uchar *packed [[buffer(1)]],

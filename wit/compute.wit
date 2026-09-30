@@ -148,6 +148,7 @@ interface compute {
     embed,
     matmul,
     quant-matmul(quant-matmul-cfg),
+    gather-quant-matmul(quant-matmul-cfg),
     sdpa(sdpa-cfg),
   }
 

@@ -2131,6 +2131,13 @@ impl MetalBackend {
             Op::QuantMatmul { bits, group_size } => self.encode_quant_matmul(
                 encoder, table, dispatch, bits, group_size, bindings, arguments,
             )?,
+            Op::GatherQuantMatmul { bits, group_size } => {
+                let (buffers, flag) = self.encode_gather_quant_matmul(
+                    encoder, table, dispatch, bits, group_size, bindings, arguments,
+                )?;
+                error_flags.push(flag);
+                buffers
+            }
             Op::Sdpa { .. } => {
                 self.encode_sdpa_dispatch(encoder, table, dispatch, bindings, arguments)?
             }
@@ -2355,6 +2362,120 @@ impl MetalBackend {
             },
         );
         Ok(vec![params])
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    fn encode_gather_quant_matmul(
+        &self,
+        encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
+        table: &ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>,
+        dispatch: &Dispatch,
+        bits: u8,
+        group_size: u32,
+        bindings: &mut ArgumentBindings,
+        arguments: &mut ArgumentWriter,
+    ) -> Result<EncodedEmbed, BackendError> {
+        let [input, packed, scales, biases, indices] = dispatch.inputs() else {
+            return Err(BackendError::InvalidInput);
+        };
+        let input = self.encoder_tensor(input)?;
+        let packed = self.encoder_tensor(packed)?;
+        let scales = self.encoder_tensor(scales)?;
+        let biases = self.encoder_tensor(biases)?;
+        let indices = self.encoder_tensor(indices)?;
+        let output = self.encoder_tensor(dispatch.output())?;
+        let [rows, inner]: [u32; 2] = input
+            .layout
+            .shape()
+            .try_into()
+            .map_err(|_| BackendError::InvalidInput)?;
+        let [experts, columns, packed_width]: [u32; 3] = packed
+            .layout
+            .shape()
+            .try_into()
+            .map_err(|_| BackendError::InvalidInput)?;
+        let [_, routes]: [u32; 2] = indices
+            .layout
+            .shape()
+            .try_into()
+            .map_err(|_| BackendError::InvalidInput)?;
+        let mut params = Vec::with_capacity(208);
+        for value in [
+            input.layout.offset(),
+            packed.layout.offset(),
+            scales.layout.offset(),
+            biases.layout.offset(),
+            indices.layout.offset(),
+            output.layout.offset(),
+        ]
+        .into_iter()
+        .chain(input.layout.strides().iter().copied())
+        .chain(packed.layout.strides().iter().copied())
+        .chain(scales.layout.strides().iter().copied())
+        .chain(biases.layout.strides().iter().copied())
+        .chain(indices.layout.strides().iter().copied())
+        .chain(output.layout.strides().iter().copied())
+        {
+            params.extend_from_slice(&value.to_ne_bytes());
+        }
+        for value in [
+            rows,
+            routes,
+            inner,
+            experts,
+            columns,
+            packed_width,
+            u32::from(bits),
+            group_size,
+        ] {
+            params.extend_from_slice(&value.to_ne_bytes());
+        }
+        let params = arguments.write(&params)?;
+        let mut error_state = [0_u8; 8];
+        error_state[4..].copy_from_slice(&u32::MAX.to_ne_bytes());
+        let error_flag = arguments.write(&error_state)?;
+        let pipeline = self
+            .pipelines
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?
+            .get(
+                "gather_quantized_gemv",
+                &[
+                    (0, dtype_code(input.layout.dtype())),
+                    (1, dtype_code(scales.layout.dtype())),
+                    (2, dtype_code(output.layout.dtype())),
+                    (12, u32::from(bits)),
+                    (13, group_size),
+                ],
+            )?;
+        set_pipeline(encoder, &pipeline);
+        for (index, tensor) in [&input, &packed, &scales, &biases, &indices, &output]
+            .into_iter()
+            .enumerate()
+        {
+            bindings.bind(table, index, &tensor.buffer);
+        }
+        bindings.bind(table, 6, &params);
+        bindings.bind(table, 7, &error_flag);
+        set_argument_table(encoder, table);
+        dispatch_threadgroups(
+            encoder,
+            MTLSize {
+                width: usize::try_from(columns.div_ceil(16))
+                    .map_err(|_| BackendError::InvalidInput)?,
+                height: usize::try_from(
+                    rows.checked_mul(routes).ok_or(BackendError::InvalidInput)?,
+                )
+                .map_err(|_| BackendError::InvalidInput)?,
+                depth: 1,
+            },
+            MTLSize {
+                width: 64,
+                height: 1,
+                depth: 1,
+            },
+        );
+        Ok((vec![params, error_flag.clone()], error_flag))
     }
 
     fn encode_sdpa_dispatch(
@@ -4232,6 +4353,10 @@ impl MetalBackend {
             }
             Op::Matmul => Self::size_matmul_arguments(dispatch, arguments)?,
             Op::QuantMatmul { .. } => arguments.write(144)?,
+            Op::GatherQuantMatmul { .. } => {
+                arguments.write(208)?;
+                arguments.write(8)?;
+            }
             Op::Sdpa { .. } => self.size_sdpa_arguments(dispatch, arguments)?,
         }
         Ok(())
@@ -4621,6 +4746,7 @@ fn supported_dispatch(dispatch: &Dispatch) -> bool {
         | Op::Embed
         | Op::Matmul
         | Op::QuantMatmul { .. }
+        | Op::GatherQuantMatmul { .. }
         | Op::Sdpa { .. }
         | Op::Sample { .. } => true,
     }
@@ -4684,6 +4810,7 @@ fn dispatch_kernel(dispatch: &Dispatch) -> Result<&'static str, BackendError> {
         Op::QuantMatmul { .. } => {
             quant_matmul_kernel_name(dispatch.inputs()[0].layout().shape()[0])
         }
+        Op::GatherQuantMatmul { .. } => "gather_quantized_gemv",
         Op::Sdpa { .. } => sdpa_kernel(dispatch)?,
     })
 }
@@ -4763,7 +4890,12 @@ fn sdpa_kernel(dispatch: &Dispatch) -> Result<&'static str, BackendError> {
 
 fn reusable_dispatch(dispatch: &Dispatch) -> bool {
     match dispatch.op() {
-        Op::Argmax | Op::TopK { .. } | Op::Sample { .. } | Op::Embed | Op::Sdpa { .. } => false,
+        Op::Argmax
+        | Op::TopK { .. }
+        | Op::Sample { .. }
+        | Op::Embed
+        | Op::GatherQuantMatmul { .. }
+        | Op::Sdpa { .. } => false,
         Op::Matmul => {
             dispatch
                 .inputs()
