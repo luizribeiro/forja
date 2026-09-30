@@ -159,6 +159,12 @@ async fn run_metal(options: &Bench) -> Result<(), Box<dyn Error>> {
         .map(|component| {
             Ok(Input {
                 engine_sha256: sha256_file(component)?,
+                engine_variant: component
+                    .file_stem()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned(),
+                engine_build_profile: engine_build_profile(component).to_owned(),
                 profile_hash: None,
                 weights_sha256: weights_sha256.clone(),
                 model_revision: None,
@@ -264,6 +270,7 @@ fn validate_rerun_inputs(
     }
     if allow_engine_diff {
         for (recorded, current) in record.inputs.iter().zip(inputs) {
+            validate_engine_identity(recorded, current)?;
             if recorded.weights_sha256 != current.weights_sha256 {
                 return Err(format!(
                     "rerun weights sha256 mismatch: recorded {}, current {}",
@@ -285,6 +292,7 @@ fn validate_rerun_inputs(
             ));
         };
         let current = unmatched.remove(index);
+        validate_engine_identity(recorded, current)?;
         if recorded.weights_sha256 != current.weights_sha256 {
             return Err(format!(
                 "rerun weights sha256 mismatch for engine {}: recorded {}, current {}",
@@ -293,6 +301,48 @@ fn validate_rerun_inputs(
         }
     }
     Ok(())
+}
+
+fn validate_engine_identity(recorded: &Input, current: &Input) -> Result<(), String> {
+    for (name, recorded, current) in [
+        ("variant", &recorded.engine_variant, &current.engine_variant),
+        (
+            "build profile",
+            &recorded.engine_build_profile,
+            &current.engine_build_profile,
+        ),
+    ] {
+        if !recorded.is_empty() && recorded != current {
+            return Err(format!(
+                "rerun engine {name} mismatch: recorded {recorded}, current {current}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn engine_build_profile(component: &Path) -> &'static str {
+    let generated_release = component.ancestors().any(|path| {
+        path.file_name() == Some(std::ffi::OsStr::new("out"))
+            && path
+                .parent()
+                .and_then(Path::file_name)
+                .is_some_and(|name| name.to_string_lossy().starts_with("test-guests-"))
+    });
+    if generated_release
+        || component
+            .components()
+            .any(|part| part.as_os_str() == "release")
+    {
+        "release"
+    } else if component
+        .components()
+        .any(|part| part.as_os_str() == "debug")
+    {
+        "debug"
+    } else {
+        "unknown"
+    }
 }
 
 fn validate_comparability(
@@ -1667,6 +1717,8 @@ mod tests {
             },
             inputs: vec![Input {
                 engine_sha256: "old-engine".to_owned(),
+                engine_variant: "variant".to_owned(),
+                engine_build_profile: "release".to_owned(),
                 profile_hash: None,
                 weights_sha256: "weights".to_owned(),
                 model_revision: None,
@@ -1677,6 +1729,8 @@ mod tests {
         };
         let current = [Input {
             engine_sha256: "new-engine".to_owned(),
+            engine_variant: "variant".to_owned(),
+            engine_build_profile: "release".to_owned(),
             profile_hash: None,
             weights_sha256: "weights".to_owned(),
             model_revision: None,
@@ -1692,6 +1746,8 @@ mod tests {
     fn rerun_accepts_reordered_inputs() {
         let input = |engine: &str| Input {
             engine_sha256: engine.to_owned(),
+            engine_variant: "variant".to_owned(),
+            engine_build_profile: "release".to_owned(),
             profile_hash: None,
             weights_sha256: "weights".to_owned(),
             model_revision: None,
@@ -1713,6 +1769,8 @@ mod tests {
     fn allow_diff_accepts_an_engine_revision_with_the_same_weights() {
         let input = |engine: &str, weights: &str| Input {
             engine_sha256: engine.to_owned(),
+            engine_variant: "variant".to_owned(),
+            engine_build_profile: "release".to_owned(),
             profile_hash: None,
             weights_sha256: weights.to_owned(),
             model_revision: None,
@@ -1728,9 +1786,30 @@ mod tests {
             results: Vec::new(),
         };
         validate_rerun_inputs(&record, &[input("new-engine", "weights")], true).unwrap();
+        let mut wrong_variant = input("new-engine", "weights");
+        wrong_variant.engine_variant = "other".to_owned();
+        assert!(
+            validate_rerun_inputs(&record, &[wrong_variant], true)
+                .unwrap_err()
+                .contains("engine variant mismatch")
+        );
         let error = validate_rerun_inputs(&record, &[input("new-engine", "other-weights")], true)
             .unwrap_err();
         assert!(error.contains("weights sha256 mismatch"));
+    }
+
+    #[test]
+    fn identifies_generated_guest_builds_as_release() {
+        assert_eq!(
+            engine_build_profile(Path::new(
+                "/target/debug/build/test-guests-hash/out/qwen3-bf16.wasm"
+            )),
+            "release"
+        );
+        assert_eq!(
+            engine_build_profile(Path::new("/target/debug/custom.wasm")),
+            "debug"
+        );
     }
 
     #[test]
@@ -1752,6 +1831,8 @@ mod tests {
         };
         let input = |engine: &str| Input {
             engine_sha256: engine.to_owned(),
+            engine_variant: "variant".to_owned(),
+            engine_build_profile: "release".to_owned(),
             profile_hash: None,
             weights_sha256: "weights".to_owned(),
             model_revision: None,
@@ -1813,6 +1894,8 @@ mod tests {
         };
         let input = Input {
             engine_sha256: "engine".to_owned(),
+            engine_variant: "variant".to_owned(),
+            engine_build_profile: "release".to_owned(),
             profile_hash: None,
             weights_sha256: "weights".to_owned(),
             model_revision: None,
@@ -1868,6 +1951,8 @@ mod tests {
         };
         let input = |engine: &str| Input {
             engine_sha256: engine.to_owned(),
+            engine_variant: "variant".to_owned(),
+            engine_build_profile: "release".to_owned(),
             profile_hash: None,
             weights_sha256: "weights".to_owned(),
             model_revision: None,

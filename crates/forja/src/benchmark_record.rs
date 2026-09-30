@@ -11,6 +11,10 @@ pub(crate) const SCHEMA_VERSION: u32 = 2;
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub(crate) struct Input {
     pub(crate) engine_sha256: String,
+    #[serde(default)]
+    pub(crate) engine_variant: String,
+    #[serde(default)]
+    pub(crate) engine_build_profile: String,
     pub(crate) profile_hash: Option<String>,
     pub(crate) weights_sha256: String,
     pub(crate) model_revision: Option<String>,
@@ -290,13 +294,15 @@ mod tests {
         let snapshot = snapshot(&options, "Apple M3 Ultra", "26.6").unwrap();
         let inputs = vec![Input {
             engine_sha256: "engine".to_owned(),
+            engine_variant: "variant".to_owned(),
+            engine_build_profile: "release".to_owned(),
             profile_hash: None,
             weights_sha256: "weights".to_owned(),
             model_revision: None,
         }];
         assert_eq!(
             config_hash(&snapshot, &inputs).unwrap(),
-            "sha256:d35cf4e02a0dedf0bfe1a6b3b30ff55f3c21444d88d1f4153da83cb1328b6291"
+            "sha256:75bc50b3385f77f3e959ae4be0294aeaf417794889e9f75cb498f9837488d997"
         );
         assert_eq!(
             comparison_hash(&perf_key(&point, &inputs[0]).unwrap()).unwrap(),
@@ -330,6 +336,8 @@ mod tests {
         let point = point(&options);
         let input = Input {
             engine_sha256: "engine".to_owned(),
+            engine_variant: "variant".to_owned(),
+            engine_build_profile: "release".to_owned(),
             profile_hash: None,
             weights_sha256: "weights".to_owned(),
             model_revision: None,
