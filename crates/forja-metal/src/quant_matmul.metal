@@ -508,33 +508,28 @@ void load_quantized_weight_tile(
     uint thread_index,
     uint thread_count);
 
-kernel void bucket_expert_routes(
+kernel void count_expert_routes(
     device const uint *indices [[buffer(0)]],
-    device uint *sorted_routes [[buffer(1)]],
-    device uint *offsets [[buffer(2)]],
-    device uint3 *blocks [[buffer(3)]],
-    device uchar *output [[buffer(4)]],
-    constant GatherQuantMatmulParams &params [[buffer(5)]],
-    device atomic_uint *error_flag [[buffer(6)]],
-    uint thread_index [[thread_position_in_grid]]) {
-    if (thread_index != 0) {
-        return;
-    }
+    device atomic_uint *counts [[buffer(1)]],
+    device uchar *output [[buffer(2)]],
+    constant GatherQuantMatmulParams &params [[buffer(3)]],
+    device atomic_uint *error_flag [[buffer(4)]],
+    uint thread_index [[thread_position_in_threadgroup]],
+    uint thread_count [[threads_per_threadgroup]]) {
     uint route_count = params.rows * params.routes;
-    uint first_invalid = 0xffffffffu;
-    for (uint expert = 0; expert <= params.experts; ++expert) {
-        offsets[expert] = 0;
+    for (uint expert = thread_index; expert <= params.experts; expert += thread_count) {
+        atomic_store_explicit(counts + expert, 0, memory_order_relaxed);
     }
-    for (uint route = 0; route < route_count; ++route) {
+    threadgroup_barrier(mem_flags::mem_device);
+    for (uint route = thread_index; route < route_count; route += thread_count) {
         uint row = route / params.routes;
         uint slot = route % params.routes;
         uint selected = indices[
             params.indices_offset + ulong(row) * params.indices_row_stride +
             ulong(slot) * params.indices_slot_stride];
         if (selected < params.experts) {
-            ++offsets[selected + 1];
+            atomic_fetch_add_explicit(counts + selected, 1, memory_order_relaxed);
         } else {
-            first_invalid = min(first_invalid, selected);
             for (uint column = 0; column < params.columns; ++column) {
                 store_float(
                     output,
@@ -544,40 +539,74 @@ kernel void bucket_expert_routes(
                     output_dtype,
                     0.0f);
             }
+            atomic_store_explicit(error_flag, 1, memory_order_relaxed);
+            atomic_fetch_min_explicit(error_flag + 1, selected, memory_order_relaxed);
         }
     }
-    for (uint expert = 0; expert < params.experts; ++expert) {
-        offsets[expert + 1] += offsets[expert];
-    }
-    uint invalid_offset = offsets[params.experts];
-    for (uint route = 0; route < route_count; ++route) {
-        uint row = route / params.routes;
-        uint slot = route % params.routes;
-        uint selected = indices[
-            params.indices_offset + ulong(row) * params.indices_row_stride +
-            ulong(slot) * params.indices_slot_stride];
-        if (selected < params.experts) {
-            sorted_routes[offsets[selected]++] = route;
-        } else {
-            sorted_routes[invalid_offset++] = route;
+}
+
+kernel void arrange_expert_routes(
+    device const uint *indices [[buffer(0)]],
+    device uint *sorted_routes [[buffer(1)]],
+    device atomic_uint *counts [[buffer(2)]],
+    device uint3 *blocks [[buffer(3)]],
+    constant GatherQuantMatmulParams &params [[buffer(4)]],
+    uint thread_index [[thread_position_in_threadgroup]],
+    uint thread_count [[threads_per_threadgroup]]) {
+    threadgroup uint scan[256];
+    uint route_count = params.rows * params.routes;
+    uint count = thread_index < params.experts
+        ? atomic_load_explicit(counts + thread_index, memory_order_relaxed)
+        : 0;
+    scan[thread_index] = count;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint shift = 1; shift < 256; shift <<= 1) {
+        uint prefix = scan[thread_index];
+        if (thread_index >= shift) {
+            prefix += scan[thread_index - shift];
         }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        scan[thread_index] = prefix;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    for (uint block = 0; block < params.block_capacity; ++block) {
+    uint route_offset = thread_index == 0 ? 0 : scan[thread_index - 1];
+    if (thread_index < params.experts) {
+        atomic_store_explicit(counts + thread_index, route_offset, memory_order_relaxed);
+    }
+    if (thread_index + 1 == params.experts) {
+        atomic_store_explicit(counts + params.experts, scan[thread_index], memory_order_relaxed);
+    }
+    scan[thread_index] = count == 0 ? 0 : (count + 31) / 32;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint shift = 1; shift < 256; shift <<= 1) {
+        uint prefix = scan[thread_index];
+        if (thread_index >= shift) {
+            prefix += scan[thread_index - shift];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        scan[thread_index] = prefix;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for (uint block = thread_index; block < params.block_capacity; block += thread_count) {
         blocks[block] = uint3(0xffffffffu, 0, 0);
     }
-    uint block = 0;
-    uint start = 0;
-    for (uint expert = 0; expert < params.experts; ++expert) {
-        uint end = offsets[expert];
-        while (start < end) {
-            uint count = min(32u, end - start);
-            blocks[block++] = uint3(expert, start, count);
-            start += count;
+    threadgroup_barrier(mem_flags::mem_device);
+    if (thread_index < params.experts) {
+        uint sorted = route_offset;
+        for (uint route = 0; route < route_count; ++route) {
+            uint row = route / params.routes;
+            uint slot = route % params.routes;
+            uint selected = indices[
+                params.indices_offset + ulong(row) * params.indices_row_stride +
+                ulong(slot) * params.indices_slot_stride];
+            if (selected == thread_index) {
+                sorted_routes[sorted++] = route;
+            }
         }
-    }
-    if (first_invalid != 0xffffffffu) {
-        atomic_store_explicit(error_flag, 1, memory_order_relaxed);
-        atomic_fetch_min_explicit(error_flag + 1, first_invalid, memory_order_relaxed);
+        uint block = thread_index == 0 ? 0 : scan[thread_index - 1];
+        for (uint start = 0; start < count; start += 32) {
+            blocks[block++] = uint3(thread_index, route_offset + start, min(32u, count - start));
+        }
     }
 }
 

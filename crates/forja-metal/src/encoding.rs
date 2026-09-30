@@ -296,13 +296,20 @@ impl GroupedRouteShape {
 }
 
 fn grouped_gather_dispatch(dispatch: &Dispatch) -> bool {
+    const MAX_GROUPED_EXPERTS: u32 = 256;
     let Some(indices) = dispatch.inputs().last() else {
+        return false;
+    };
+    let Some(packed) = dispatch.inputs().get(1) else {
         return false;
     };
     let [rows, routes] = indices.layout().shape() else {
         return false;
     };
-    grouped_routes(*rows, *routes)
+    let [experts, ..] = packed.layout().shape() else {
+        return false;
+    };
+    grouped_routes(*rows, *routes) && *experts <= MAX_GROUPED_EXPERTS
 }
 
 fn grouped_error_flag(arguments: &mut ArgumentWriter) -> Result<BufferBinding, BackendError> {
@@ -3019,22 +3026,20 @@ impl MetalBackend {
         error_flag: &BufferBinding,
         bindings: &mut ArgumentBindings,
     ) -> Result<(), BackendError> {
-        let pipeline = self
+        let count_pipeline = self
             .pipelines
             .lock()
             .map_err(|_| BackendError::ExecutionFailed)?
             .get(
-                "bucket_expert_routes",
+                "count_expert_routes",
                 &[(2, dtype_code(output.layout.dtype()))],
             )?;
-        set_pipeline(encoder, &pipeline);
+        set_pipeline(encoder, &count_pipeline);
         bindings.bind(table, 0, &indices.buffer);
-        bindings.bind(table, 1, &sorted.buffer);
-        bindings.bind(table, 2, &offsets.buffer);
-        bindings.bind(table, 3, &blocks.buffer);
-        bindings.bind(table, 4, &output.buffer);
-        bindings.bind(table, 5, params);
-        bindings.bind(table, 6, error_flag);
+        bindings.bind(table, 1, &offsets.buffer);
+        bindings.bind(table, 2, &output.buffer);
+        bindings.bind(table, 3, params);
+        bindings.bind(table, 4, error_flag);
         set_argument_table(encoder, table);
         dispatch_threadgroups(
             encoder,
@@ -3044,7 +3049,33 @@ impl MetalBackend {
                 depth: 1,
             },
             MTLSize {
+                width: 256,
+                height: 1,
+                depth: 1,
+            },
+        );
+        encode_dispatch_barrier(encoder);
+        let arrange_pipeline = self
+            .pipelines
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?
+            .get("arrange_expert_routes", &[])?;
+        set_pipeline(encoder, &arrange_pipeline);
+        bindings.bind(table, 0, &indices.buffer);
+        bindings.bind(table, 1, &sorted.buffer);
+        bindings.bind(table, 2, &offsets.buffer);
+        bindings.bind(table, 3, &blocks.buffer);
+        bindings.bind(table, 4, params);
+        set_argument_table(encoder, table);
+        dispatch_threadgroups(
+            encoder,
+            MTLSize {
                 width: 1,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: 256,
                 height: 1,
                 depth: 1,
             },
