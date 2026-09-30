@@ -15,6 +15,8 @@ use crate::engine::metal_graph_replay;
 
 const F32_HIDDEN_STATE_TOLERANCE: f64 = 2e-2;
 const BF16_TOP1_PERCENT: u64 = 95;
+const ROUTER_TOP_K: usize = 8;
+const ROUTER_NEAR_TIE: f32 = 1.0e-3;
 
 #[derive(Clone, Copy, Default)]
 struct DecodeMetrics {
@@ -151,11 +153,17 @@ where
     let mut runner =
         EngineRunner::new(component, backend, limits(&options.limits)?, weights).await?;
     let info = runner.describe().await?;
-    if info.vocab != 151_936
-        || info.max_context != 4_096
-        || info.tap_layers != (1..=28).collect::<Vec<_>>()
+    let first = fixtures
+        .prompts()
+        .first()
+        .ok_or("fixtures contain no prompts")?;
+    let layers = first.hidden_states().len() - 1;
+    let router_layers = first.router_logits().map_or(0, |router| router.shape()[0]);
+    if usize::try_from(info.vocab)? != first.prompt_logits().values().len()
+        || info.tap_layers != (1..=u32::try_from(layers)?).collect::<Vec<_>>()
+        || info.router_layers != (1..=u32::try_from(router_layers)?).collect::<Vec<_>>()
     {
-        return Err("Qwen3 engine metadata is incompatible with the verifier".into());
+        return Err("engine metadata is incompatible with the fixtures".into());
     }
     runner
         .load()
@@ -232,6 +240,8 @@ where
     };
     let (maximum_layer_error, first_failing) =
         compare_layers(runner, fixture, &output.taps, layer_tolerance).await?;
+    let (routers_passed, first_router_mismatch) =
+        compare_routers(runner, fixture, &output.router_logits, layer_tolerance).await?;
     let input = DecodeInput {
         prompt: fixture.name(),
         expected_tokens: fixture.greedy_tokens(),
@@ -243,12 +253,118 @@ where
     };
     match precision {
         Precision::F32 => {
-            verify_f32_decode(runner, fixture, input, maximum_layer_error, first_failing).await
+            verify_f32_decode(
+                runner,
+                fixture,
+                input,
+                maximum_layer_error,
+                first_failing,
+                routers_passed,
+                first_router_mismatch,
+            )
+            .await
         }
         Precision::Bf16 => {
-            verify_bf16_decode(runner, input, tokens, maximum_layer_error, first_failing).await
+            verify_bf16_decode(
+                runner,
+                input,
+                tokens,
+                maximum_layer_error,
+                first_failing,
+                routers_passed,
+                first_router_mismatch,
+            )
+            .await
         }
     }
+}
+
+async fn compare_routers<B>(
+    runner: &mut EngineRunner<B>,
+    fixture: &golden_fixtures::PromptFixture,
+    routers: &[EngineTensor],
+    tolerance: f64,
+) -> Result<(bool, Option<String>), Box<dyn Error>>
+where
+    B: Backend + Send + Sync + 'static,
+{
+    let Some(expected) = fixture.router_logits() else {
+        return Ok((routers.is_empty(), None));
+    };
+    let [layers, rows, experts]: [usize; 3] = expected
+        .shape()
+        .try_into()
+        .map_err(|_| "router fixture must have rank three")?;
+    if routers.len() != layers || experts < ROUTER_TOP_K {
+        return Err("router output shape is incompatible with the fixture".into());
+    }
+    let layer_len = rows
+        .checked_mul(experts)
+        .ok_or("router fixture size overflowed")?;
+    let mut passed = true;
+    let mut first_mismatch = None;
+    for (layer, router) in routers.iter().enumerate() {
+        let actual = decode_f32_le(&runner.read(router).await?)?;
+        let start = layer
+            .checked_mul(layer_len)
+            .ok_or("router fixture offset overflowed")?;
+        let end = start
+            .checked_add(layer_len)
+            .ok_or("router fixture offset overflowed")?;
+        let reference = expected
+            .values()
+            .get(start..end)
+            .ok_or("router fixture is incomplete")?;
+        let error = normwise_relative_error(reference, &actual)?;
+        let layer_passed = error <= tolerance;
+        if !layer_passed && first_mismatch.is_none() {
+            first_mismatch = Some(format!("{}:*", layer + 1));
+        }
+        for (row, (reference, actual)) in reference
+            .chunks_exact(experts)
+            .zip(actual.chunks_exact(experts))
+            .enumerate()
+        {
+            if !router_sets_match(reference, actual) && first_mismatch.is_none() {
+                first_mismatch = Some(format!("{}:{row}", layer + 1));
+            }
+        }
+        passed &= layer_passed;
+        println!(
+            "{}\trouter-{}\t{error:.8e}\t{}",
+            fixture.name(),
+            layer + 1,
+            if layer_passed { "pass" } else { "FAIL" }
+        );
+    }
+    passed &= first_mismatch.is_none();
+    Ok((passed, first_mismatch))
+}
+
+fn router_sets_match(reference: &[f32], actual: &[f32]) -> bool {
+    let expected = top_k_set(reference);
+    let selected = top_k_set(actual);
+    expected == selected || near_tie_swap(reference, &expected, &selected)
+}
+
+fn top_k_set(values: &[f32]) -> Vec<usize> {
+    let mut indices = (0..values.len()).collect::<Vec<_>>();
+    indices.sort_unstable_by(|&left, &right| values[right].total_cmp(&values[left]));
+    indices.truncate(ROUTER_TOP_K);
+    indices.sort_unstable();
+    indices
+}
+
+fn near_tie_swap(reference: &[f32], expected: &[usize], actual: &[usize]) -> bool {
+    let changed = expected
+        .iter()
+        .filter(|index| !actual.contains(index))
+        .chain(actual.iter().filter(|index| !expected.contains(index)))
+        .map(|&index| reference[index])
+        .collect::<Vec<_>>();
+    let minimum = changed.iter().copied().reduce(f32::min);
+    let maximum = changed.iter().copied().reduce(f32::max);
+    matches!((minimum, maximum), (Some(minimum), Some(maximum)) if maximum - minimum <= ROUTER_NEAR_TIE)
 }
 
 async fn compare_layers<B>(
@@ -289,6 +405,8 @@ async fn verify_f32_decode<B>(
     input: DecodeInput<'_>,
     maximum_layer_error: f64,
     first_failing: Option<usize>,
+    routers_passed: bool,
+    first_router_mismatch: Option<String>,
 ) -> Result<PromptVerification, Box<dyn Error>>
 where
     B: Backend + Send + Sync + 'static,
@@ -297,13 +415,15 @@ where
         mean_logit_kl_divergence(fixture.prompt_logits().values(), &input.logits, input.vocab)?;
     let free_running = decode(runner, input, DecodeMode::FreeRunning, true).await?;
     let passed = first_failing.is_none()
+        && routers_passed
         && prompt_kl <= LOGIT_KL_TOLERANCE
         && free_running.mean_kl() <= LOGIT_KL_TOLERANCE
         && free_running.agreement == free_running.steps;
     println!(
-        "{}\tmax-layer={maximum_layer_error:.8e}\tfirst-failing={}\tprompt-kl={prompt_kl:.8e}\tfree-mean-kl={:.8e}\tfree-max-kl={:.8e}\ttop-1={}/{}\t{}",
+        "{}\tmax-layer={maximum_layer_error:.8e}\tfirst-failing={}\tfirst-router-mismatch={}\tprompt-kl={prompt_kl:.8e}\tfree-mean-kl={:.8e}\tfree-max-kl={:.8e}\ttop-1={}/{}\t{}",
         fixture.name(),
         layer_name(first_failing),
+        first_router_mismatch.as_deref().unwrap_or("-"),
         free_running.mean_kl(),
         free_running.maximum_kl,
         free_running.agreement,
@@ -312,7 +432,7 @@ where
     );
     Ok(PromptVerification {
         maximum_layer_error,
-        layers_passed: first_failing.is_none(),
+        layers_passed: first_failing.is_none() && routers_passed,
         passed,
         teacher_forced: DecodeMetrics::default(),
         free_running,
@@ -325,6 +445,8 @@ async fn verify_bf16_decode<B>(
     prompt_tokens: Vec<u32>,
     maximum_layer_error: f64,
     first_failing: Option<usize>,
+    routers_passed: bool,
+    first_router_mismatch: Option<String>,
 ) -> Result<PromptVerification, Box<dyn Error>>
 where
     B: Backend + Send + Sync + 'static,
@@ -337,12 +459,14 @@ where
     let steps = input.steps;
     let teacher_forced = decode(runner, input, DecodeMode::TeacherForced, true).await?;
     let prompt_passed = first_failing.is_none()
+        && routers_passed
         && teacher_forced.mean_kl() <= BF16_LOGIT_KL_TOLERANCE
         && top1_passes(teacher_forced);
     println!(
-        "{}\tmax-layer={maximum_layer_error:.8e}\tfirst-failing={}\tteacher-mean-kl={:.8e}\tteacher-max-kl={:.8e}\ttop-1={}/{}\t{}",
+        "{}\tmax-layer={maximum_layer_error:.8e}\tfirst-failing={}\tfirst-router-mismatch={}\tteacher-mean-kl={:.8e}\tteacher-max-kl={:.8e}\ttop-1={}/{}\t{}",
         prompt,
         layer_name(first_failing),
+        first_router_mismatch.as_deref().unwrap_or("-"),
         teacher_forced.mean_kl(),
         teacher_forced.maximum_kl,
         teacher_forced.agreement,
@@ -377,7 +501,7 @@ where
     );
     Ok(PromptVerification {
         maximum_layer_error,
-        layers_passed: first_failing.is_none(),
+        layers_passed: first_failing.is_none() && routers_passed,
         passed: prompt_passed,
         teacher_forced,
         free_running,
@@ -392,7 +516,7 @@ fn verify_model_hash(
     options: &Verify,
     fixtures: &FixtureDirectory,
 ) -> Result<std::path::PathBuf, Box<dyn Error>> {
-    let weights = options.model_dir.join("model.safetensors");
+    let weights = options.model_dir.join(fixtures.model_file());
     let actual = sha256_file(&weights)?;
     let expected = fixtures.model_sha256();
     if actual != expected {
@@ -576,6 +700,30 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires FORJA_MODELS and runs in the pre-push hook"]
+    fn metal_bf16_olmoe_verification() -> Result<(), Box<dyn Error>> {
+        let root = PathBuf::from(env::var_os("FORJA_MODELS").ok_or("FORJA_MODELS is not set")?);
+        let limits = forja_config::Limits {
+            live_bytes: forja_config::ByteSize::new(24 * 1024 * 1024 * 1024),
+            ..forja_config::Limits::default()
+        };
+        let options = Verify {
+            engine: test_guests::olmoe().to_owned(),
+            model_dir: root.join("OLMoE-1B-7B-0924"),
+            fixtures: root.join("golden/OLMoE-1B-7B-0924"),
+            backend: BackendArg::Metal,
+            precision: Precision::Bf16,
+            prompts: Vec::new(),
+            graph_replay: forja_config::GraphReplay::Tier2,
+            limits,
+        };
+        tokio::runtime::Builder::new_current_thread()
+            .build()?
+            .block_on(run_with_steps(&options, 32))
+    }
+
     #[test]
     fn teacher_forcing_uses_reference_tokens() -> Result<(), Box<dyn Error>> {
         let root = temporary_directory("teacher-forcing")?;
@@ -630,7 +778,7 @@ mod tests {
         fs::write(
             fixtures_path.join("manifest.json"),
             format!(
-                "{{\"schema_version\":1,\"model\":{{\"sha256\":\"{expected}\"}},\"prompts\":[]}}"
+                "{{\"schema_version\":1,\"model\":{{\"file\":\"model.safetensors\",\"sha256\":\"{expected}\"}},\"prompts\":[]}}"
             ),
         )?;
         let options = Verify {
@@ -704,5 +852,19 @@ mod tests {
         bytes.extend(header);
         bytes.extend_from_slice(&0_f32.to_le_bytes());
         bytes
+    }
+
+    #[test]
+    fn router_sets_allow_only_reference_near_ties() {
+        let reference = [9.0, 8.0, 7.0, 6.0, 5.0, 4.0, 3.0, 2.0005, 2.0];
+        let mut near_tie = reference;
+        near_tie[7] = 1.999;
+        near_tie[8] = 2.001;
+        assert!(router_sets_match(&reference, &near_tie));
+
+        let mut mismatch = reference;
+        mismatch[6] = 0.0;
+        mismatch[8] = 3.5;
+        assert!(!router_sets_match(&reference, &mismatch));
     }
 }

@@ -110,6 +110,7 @@ impl PromptFixture {
 #[derive(Clone, Debug)]
 pub struct FixtureDirectory {
     model_sha256: String,
+    model_file: String,
     num_hidden_layers: Option<usize>,
     prompts: Vec<PromptFixture>,
 }
@@ -147,6 +148,7 @@ impl FixtureDirectory {
         }
         Ok(Self {
             model_sha256: manifest.model.sha256,
+            model_file: manifest.model.file,
             num_hidden_layers: manifest.generation.num_hidden_layers,
             prompts,
         })
@@ -156,6 +158,12 @@ impl FixtureDirectory {
     #[must_use]
     pub fn model_sha256(&self) -> &str {
         &self.model_sha256
+    }
+
+    /// Returns the model weight file or shard-index name hashed by the manifest.
+    #[must_use]
+    pub fn model_file(&self) -> &str {
+        &self.model_file
     }
 
     /// Returns the configured layer limit, if the fixture is truncated.
@@ -242,6 +250,7 @@ struct GenerationMetadata {
 
 #[derive(Debug, Deserialize)]
 struct ModelMetadata {
+    file: String,
     sha256: String,
 }
 
@@ -642,7 +651,7 @@ mod tests {
     fn write_manifest(path: &Path, schema_version: u64, prompts: &[Value]) {
         let manifest = json!({
             "schema_version": schema_version,
-            "model": { "sha256": "model" },
+            "model": { "file": "model.safetensors", "sha256": "model" },
             "prompts": prompts
         });
         fs::write(
