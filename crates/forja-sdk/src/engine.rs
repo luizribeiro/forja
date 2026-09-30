@@ -9,6 +9,8 @@ pub struct EngineInfo {
     pub max_context: u32,
     /// Layer indices available as hidden-state taps.
     pub tap_layers: Vec<u32>,
+    /// Layer indices available as router-logit taps.
+    pub router_layers: Vec<u32>,
 }
 
 /// Input to one unbatched engine invocation.
@@ -27,6 +29,8 @@ pub struct StepOutput {
     pub logits: Tensor<f32>,
     /// Hidden states with shape `[sequence, hidden]` for declared tap layers.
     pub taps: Vec<Tensor<f32>>,
+    /// Router scores with shape `[sequence, experts]` for declared router layers.
+    pub router_logits: Vec<Tensor<f32>>,
 }
 
 /// Sampling parameters applied during decode.

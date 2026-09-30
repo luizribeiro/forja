@@ -86,6 +86,8 @@ pub struct EngineInfo {
     pub max_context: u32,
     /// Layers whose hidden states can be returned by a step.
     pub tap_layers: Vec<u32>,
+    /// Layers whose router logits can be returned by a step.
+    pub router_layers: Vec<u32>,
 }
 
 /// Input to one unbatched engine invocation.
@@ -151,6 +153,8 @@ pub struct EngineOutput {
     pub logits: EngineTensor,
     /// Requested per-layer hidden states.
     pub taps: Vec<EngineTensor>,
+    /// Requested per-layer router logits.
+    pub router_logits: Vec<EngineTensor>,
 }
 
 /// Device-resident outputs from greedy decode.
@@ -473,6 +477,7 @@ where
             vocab: info.vocab,
             max_context: info.max_context,
             tap_layers: info.tap_layers,
+            router_layers: info.router_layers,
         };
         self.info = Some(info.clone());
         Ok(info)
@@ -553,11 +558,23 @@ where
             Err(error) if is_epoch_timeout(&error) => return Ok(Err(guest_timeout())),
             Err(error) => return Err(error),
         }?;
-        let StepOut { logits, taps } = output;
+        let StepOut {
+            logits,
+            taps,
+            router_logits,
+        } = output;
         let handles = std::iter::once(logits.rep())
             .chain(taps.iter().map(Resource::rep))
+            .chain(router_logits.iter().map(Resource::rep))
             .collect::<Vec<_>>();
-        if let Err(error) = self.validate_output(&info, sequence, taps_requested, &logits, &taps) {
+        if let Err(error) = self.validate_output(
+            &info,
+            sequence,
+            taps_requested,
+            &logits,
+            &taps,
+            &router_logits,
+        ) {
             return Ok(Err(match self.release_handles(handles) {
                 Ok(()) => error,
                 Err(release_error) => release_error,
@@ -570,6 +587,13 @@ where
                 runner_id: self.id,
             },
             taps: taps
+                .into_iter()
+                .map(|tensor| EngineTensor {
+                    handle: tensor.rep(),
+                    runner_id: self.id,
+                })
+                .collect(),
+            router_logits: router_logits
                 .into_iter()
                 .map(|tensor| EngineTensor {
                     handle: tensor.rep(),
@@ -824,6 +848,7 @@ where
         taps_requested: bool,
         logits: &Resource<TensorEntry>,
         taps: &[Resource<TensorEntry>],
+        router_logits: &[Resource<TensorEntry>],
     ) -> Result<(), compute::Error> {
         self.validate_logits(info, logits)?;
         let expected_taps = if taps_requested {
@@ -846,6 +871,30 @@ where
             {
                 return Err(compute::Error::Layout(format!(
                     "engine taps must be f32 [{sequence}, hidden]"
+                )));
+            }
+        }
+        let expected_routers = if taps_requested {
+            info.router_layers.len()
+        } else {
+            0
+        };
+        if router_logits.len() != expected_routers {
+            return Err(compute::Error::Layout(format!(
+                "engine returned {} router taps, expected {expected_routers}",
+                router_logits.len()
+            )));
+        }
+        for router in router_logits {
+            let router = self.store.data().entry(router)?;
+            let shape = router.tensor.layout().shape();
+            if router.tensor.layout().dtype() != DType::F32
+                || shape.len() != 2
+                || shape.first() != Some(&sequence)
+                || shape.last() == Some(&0)
+            {
+                return Err(compute::Error::Layout(format!(
+                    "engine router taps must be f32 [{sequence}, experts]"
                 )));
             }
         }

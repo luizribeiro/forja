@@ -16,6 +16,7 @@ impl Guest for Component {
             vocab: 4,
             max_context: 33,
             tap_layers: vec![0],
+            router_layers: vec![],
         }
     }
 
@@ -57,7 +58,11 @@ impl Guest for Component {
         } else {
             vec![]
         };
-        Ok(StepOut { logits, taps })
+        Ok(StepOut {
+            logits,
+            taps,
+            router_logits: vec![],
+        })
     }
 
     async fn decode(_input: DecodeIn) -> Result<DecodeOut, Error> {

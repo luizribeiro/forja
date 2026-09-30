@@ -45,7 +45,7 @@
 //! #[export_engine]
 //! impl Engine for Llama {
 //!     fn describe() -> EngineInfo {
-//!         EngineInfo { vocab: VOCAB, max_context: 4096, tap_layers: vec![] }
+//!         EngineInfo { vocab: VOCAB, max_context: 4096, tap_layers: vec![], router_layers: vec![] }
 //!     }
 //!
 //!     fn load(weights: &Weights<'_>) -> Result<Self> {
@@ -65,7 +65,7 @@
 //!         let logits = self.lm_head.forward(&self.norm.forward(&hidden)?)?
 //!             .narrow(0, last, 1)?
 //!             .reshape(&[VOCAB])?;
-//!         Ok(StepOutput { logits, taps: vec![] })
+//!         Ok(StepOutput { logits, taps: vec![], router_logits: vec![] })
 //!     }
 //! }
 //! ```

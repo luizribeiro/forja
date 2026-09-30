@@ -61,6 +61,7 @@ impl Engine for ToyEngine {
             vocab: VOCAB,
             max_context: MAX_CONTEXT,
             tap_layers: vec![0, 1],
+            router_layers: Vec::new(),
         }
     }
 
@@ -91,6 +92,10 @@ impl Engine for ToyEngine {
             .forward(&self.norm.forward(&hidden)?)?
             .narrow(0, sequence, 1)?
             .reshape(&[VOCAB])?;
-        Ok(StepOutput { logits, taps })
+        Ok(StepOutput {
+            logits,
+            taps,
+            router_logits: Vec::new(),
+        })
     }
 }

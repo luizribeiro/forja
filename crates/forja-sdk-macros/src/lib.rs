@@ -119,6 +119,7 @@ fn engine_guest_impl() -> proc_macro2::TokenStream {
                     vocab: info.vocab,
                     max_context: info.max_context,
                     tap_layers: info.tap_layers,
+                    router_layers: info.router_layers,
                 }
             }
 
@@ -153,6 +154,7 @@ fn engine_guest_impl() -> proc_macro2::TokenStream {
                 Ok(StepOut {
                     logits: output.logits.into_guest(),
                     taps: output.taps.into_iter().map(::forja_sdk::Tensor::into_guest).collect(),
+                    router_logits: output.router_logits.into_iter().map(::forja_sdk::Tensor::into_guest).collect(),
                 })
             }
 

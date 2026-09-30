@@ -566,6 +566,7 @@ impl Engine for ExportedQwen3 {
             vocab: VOCAB,
             max_context: MAX_CONTEXT,
             tap_layers: (1..=28).collect(),
+            router_layers: Vec::new(),
         }
     }
 
@@ -594,6 +595,7 @@ impl Engine for ExportedQwen3 {
             return Ok(StepOutput {
                 logits,
                 taps: Vec::new(),
+                router_logits: Vec::new(),
             });
         }
         self.forward(
@@ -730,6 +732,7 @@ impl<T: Activation> Qwen3<T> {
         Ok(StepOutput {
             logits,
             taps: taps.finish(),
+            router_logits: Vec::new(),
         })
     }
 

@@ -13,6 +13,7 @@ impl Engine for ConstantEngine {
             vocab: 4,
             max_context: 33,
             tap_layers: vec![0],
+            router_layers: vec![],
         }
     }
 
@@ -30,6 +31,7 @@ impl Engine for ConstantEngine {
                 .transpose()?
                 .into_iter()
                 .collect(),
+            router_logits: Vec::new(),
         })
     }
 }
