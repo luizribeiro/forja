@@ -102,6 +102,12 @@
               fi
             '';
           };
+          guest-reproducibility = cargoHook {
+            name = "guest-reproducibility-hook";
+            files = "^(crates/forja-(program-conversions|sdk|sdk-macros)/|support/(guests|test-guests)/|wit/)";
+            stages = [ "pre-push" ];
+            text = "support/test-guests/check-reproducible.sh";
+          };
           cargo-deny = cargoHook {
             name = "cargo-deny-hook";
             runtimeInputs = [ pkgs.cargo-deny ];
