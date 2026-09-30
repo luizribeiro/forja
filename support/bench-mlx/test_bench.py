@@ -70,8 +70,11 @@ class SuiteTests(unittest.TestCase):
         suite = Path(__file__).resolve().parents[2] / "bench/suites/default.toml"
         with tempfile.TemporaryDirectory() as directory:
             report_path = Path(directory) / "report.json"
+            model_dir = Path(directory) / "model"
+            model_dir.mkdir()
+            (model_dir / "config.json").write_text("{}")
             arguments = argparse.Namespace(
-                model_dir=Path(directory) / "model",
+                model_dir=model_dir,
                 suite=suite,
                 json=report_path,
             )
@@ -97,6 +100,12 @@ class SuiteTests(unittest.TestCase):
         self.assertEqual(suite["pp"], 512)
         self.assertEqual(suite["decode_prefill"], 8)
         self.assertEqual(suite["contexts"], [9, 512, 2048, 4000])
+
+    def test_supplies_the_transformers_olmoe_norm_default(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            model = Path(directory)
+            (model / "config.json").write_text('{"model_type":"olmoe"}')
+            self.assertEqual(bench.model_overrides(model), {"rms_norm_eps": 1e-5})
 
     def test_rejects_non_increasing_contexts(self) -> None:
         source = """[bench]

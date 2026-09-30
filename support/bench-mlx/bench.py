@@ -130,6 +130,14 @@ def validate_bf16(model, mx, tree_flatten) -> None:
         raise RuntimeError(f"expected only bf16 model parameters, found {dtypes}")
 
 
+def model_overrides(model_dir: Path) -> dict[str, object]:
+    """Fill required MLX-LM fields that Transformers supplies by default."""
+    config = json.loads((model_dir / "config.json").read_text())
+    if config.get("model_type") == "olmoe" and config.get("rms_norm_eps") is None:
+        return {"rms_norm_eps": 1e-5}
+    return {}
+
+
 def main() -> None:
     """Load the checkpoint, run MLX-LM generation trials, and write JSON."""
     import mlx.core as mx
@@ -142,6 +150,7 @@ def main() -> None:
         args.model_dir,
         return_config=True,
         tokenizer_config={"trust_remote_code": True},
+        model_config=model_overrides(args.model_dir),
     )
     validate_bf16(model, mx, tree_flatten)
     mx.eval(model.parameters())
