@@ -1,0 +1,195 @@
+{
+  "allow_diff": [],
+  "auto_notes": [
+    "backend.metal.graph_replay: auto -> tier2 (Apple M3 Ultra/macOS 26.6.2 @8953c30a637732ce3a9e66f8489863939289bb42)"
+  ],
+  "axes": {},
+  "config": "[backend]\nkind = \"metal\"\n\n[backend.metal]\ngraph_replay = \"tier2\"\n\n[bench]\nbreakdown = true\ncontexts = [9, 512, 2048, 4000]\ndecode_prefill = 8\npp = 512\nreps = 30\nselection = [\"gpu-pipelined\"]\ntg = 128\nwarmups = 3\n\n[bench.sampling]\nseed = 0\ntemperature = 0.699999988079071\ntop_k = 20\ntop_p = 0.800000011920929\n\n[bench.vary]\n\n[limits]\ndispatches_per_list = 4096\ngpu_time_budget = \"3600000ms\"\nguest_call_timeout = \"300000ms\"\nguest_memory_bytes = 4294967296\ninstances = 10000\nlive_bytes = 137438953472\nlive_graphs = 16\nlive_kernels = 64\nlive_tensor_handles = 20000\nread_bytes = 1073741824\nsubmission_timeout = \"60000ms\"\ntable_elements = 10000\ntensor_elements = 1000000000\ntensor_rank = 4\nwork_per_dispatch = \"unlimited\"\n\n[run]\nmax_tokens = 128\ntemperature = 0.0\ntop_k = 0\ntop_p = 1.0\n\n[verify]\nprompts = []\n",
+  "config_hash": "sha256:5e8f193690e01ef0f5cc4822838b0537ca0089182043ed24f05138046bf80cda",
+  "implementation": "forja",
+  "inputs": [
+    {
+      "engine_sha256": "c10a391dbbb3ed424d64360fe48648294f5dbd2475e2126a1828f83367a41e4f",
+      "model_revision": null,
+      "profile_hash": null,
+      "weights_sha256": "c100efb419233c6be585014ebd9f5a8c2a4fe9de63be6271172f0f70f1c315ea"
+    }
+  ],
+  "origins": {
+    "backend.kind": "default",
+    "backend.metal.graph_replay": "auto",
+    "bench.breakdown": "--breakdown",
+    "bench.contexts": "default",
+    "bench.decode_prefill": "default",
+    "bench.pp": "default",
+    "bench.reps": "default",
+    "bench.sampling.seed": "default",
+    "bench.sampling.temperature": "--set #3",
+    "bench.sampling.top_k": "--set #4",
+    "bench.sampling.top_p": "--set #5",
+    "bench.selection": "--set #2",
+    "bench.tg": "default",
+    "bench.warmups": "default",
+    "limits.dispatches_per_list": "default",
+    "limits.gpu_time_budget": "default",
+    "limits.guest_call_timeout": "default",
+    "limits.guest_memory_bytes": "default",
+    "limits.instances": "default",
+    "limits.live_bytes": "--set #1",
+    "limits.live_graphs": "default",
+    "limits.live_kernels": "default",
+    "limits.live_tensor_handles": "default",
+    "limits.read_bytes": "default",
+    "limits.submission_timeout": "default",
+    "limits.table_elements": "default",
+    "limits.tensor_elements": "default",
+    "limits.tensor_rank": "default",
+    "limits.work_per_dispatch": "default",
+    "run.max_tokens": "default",
+    "run.temperature": "default",
+    "run.top_k": "default",
+    "run.top_p": "default",
+    "verify.prompts": "default"
+  },
+  "perf_hash": "sha256:bc42236e8989aa375c8faaecaadf58c70c3726da2e1b64edc241982928e0f093",
+  "provenance": {
+    "binary_sha256": "caa2d9fd47cbac2ae146d7b0438893b6e76a9ee91ac900681367271a1b55c6aa",
+    "commit": "8953c30a637732ce3a9e66f8489863939289bb42",
+    "date": "2026-09-30T15:15Z",
+    "device": "Apple M3 Ultra",
+    "dirty": false,
+    "duration_s": 3233,
+    "gpu_cores": 80,
+    "macos": "26.6.2"
+  },
+  "results": [
+    {
+      "input": 0,
+      "output_digest": "sha256:2cb5733e1d3476bdc584e8e8e4c62c8696feb1a3fc2b4919aad985e194c25557",
+      "perf_hash": "sha256:03789ec41843fe02376914b3832451d94c37e35527ab8284cffe4f8029b81166",
+      "point": {},
+      "pp": {
+        "gpu_time_seconds": {
+          "ci95": [
+            2.766245583,
+            2.7708987499999997
+          ],
+          "median": 2.7672729375
+        },
+        "submissions": {
+          "ci95": [
+            1.0,
+            1.0
+          ],
+          "median": 1.0
+        },
+        "tokens_per_second": {
+          "gpu": {
+            "ci95": [
+              184.77759246886956,
+              185.08841121934475
+            ],
+            "median": 185.01969698033417
+          },
+          "wall": {
+            "ci95": [
+              177.43748650268648,
+              177.79580942132054
+            ],
+            "median": 177.57343291435922
+          }
+        },
+        "wall_time_seconds": {
+          "ci95": [
+            2.879707917,
+            2.885523291
+          ],
+          "median": 2.8833142709999997
+        }
+      },
+      "sampling_fallbacks": [
+        {
+          "context_start": 9,
+          "count_per_token": {
+            "ci95": [
+              0.0,
+              0.0
+            ],
+            "median": 0.0
+          }
+        },
+        {
+          "context_start": 512,
+          "count_per_token": {
+            "ci95": [
+              1.0,
+              1.0
+            ],
+            "median": 1.0
+          }
+        },
+        {
+          "context_start": 2048,
+          "count_per_token": {
+            "ci95": [
+              0.0,
+              0.0
+            ],
+            "median": 0.0
+          }
+        },
+        {
+          "context_start": 4000,
+          "count_per_token": {
+            "ci95": [
+              0.0,
+              0.0
+            ],
+            "median": 0.0
+          }
+        }
+      ],
+      "selection": "gpu-pipelined",
+      "tg": {
+        "gpu_time_seconds": {
+          "ci95": [
+            1.8362633750000001,
+            1.84026621
+          ],
+          "median": 1.838464835
+        },
+        "submissions": {
+          "ci95": [
+            128.0,
+            128.0
+          ],
+          "median": 128.0
+        },
+        "tokens_per_second": {
+          "gpu": {
+            "ci95": [
+              69.55515419695719,
+              69.70677613171911
+            ],
+            "median": 69.6233062387447
+          },
+          "wall": {
+            "ci95": [
+              69.15921707984121,
+              69.34778006514087
+            ],
+            "median": 69.26984590358893
+          }
+        },
+        "wall_time_seconds": {
+          "ci95": [
+            1.84576925,
+            1.85080175
+          ],
+          "median": 1.8478459585
+        }
+      }
+    }
+  ],
+  "schema_version": 2
+}
