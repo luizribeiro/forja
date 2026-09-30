@@ -456,6 +456,77 @@ impl CpuBackend {
         self.write_output(output, &values)
     }
 
+    #[allow(clippy::cast_precision_loss)]
+    fn execute_quant_matmul(
+        &self,
+        inputs: &[Tensor],
+        output: &Tensor,
+        bits: u8,
+        group_size: u32,
+    ) -> Result<(), BackendError> {
+        let activations = decode(&self.read(&inputs[0])?, inputs[0].layout().dtype())
+            .ok_or(BackendError::ExecutionFailed)?;
+        let packed = decode_u32(&self.read(&inputs[1])?).ok_or(BackendError::ExecutionFailed)?;
+        let scales = decode(&self.read(&inputs[2])?, inputs[2].layout().dtype())
+            .ok_or(BackendError::ExecutionFailed)?;
+        let biases = decode(&self.read(&inputs[3])?, inputs[3].layout().dtype())
+            .ok_or(BackendError::ExecutionFailed)?;
+        let [rows, inner]: [u32; 2] = inputs[0]
+            .layout()
+            .shape()
+            .try_into()
+            .map_err(|_| BackendError::ExecutionFailed)?;
+        let [columns, packed_width]: [u32; 2] = inputs[1]
+            .layout()
+            .shape()
+            .try_into()
+            .map_err(|_| BackendError::ExecutionFailed)?;
+        let rows = execution_usize(rows)?;
+        let inner = execution_usize(inner)?;
+        let columns = execution_usize(columns)?;
+        let packed_width = execution_usize(packed_width)?;
+        let group_size = execution_usize(group_size)?;
+        let values_per_word = 32_usize / usize::from(bits);
+        let mask = (1_u32 << bits) - 1;
+        let group_count = inner / group_size;
+        let capacity = checked_product(rows, columns)?;
+        let mut values = Vec::with_capacity(capacity);
+        for activation in activations.chunks_exact(inner) {
+            for column in 0..columns {
+                let packed_row = column
+                    .checked_mul(packed_width)
+                    .ok_or(BackendError::ExecutionFailed)?;
+                let group_row = column
+                    .checked_mul(group_count)
+                    .ok_or(BackendError::ExecutionFailed)?;
+                let sum =
+                    activation
+                        .iter()
+                        .enumerate()
+                        .try_fold(0.0_f32, |sum, (index, input)| {
+                            let word = packed
+                                .get(packed_row + index / values_per_word)
+                                .copied()
+                                .ok_or(BackendError::ExecutionFailed)?;
+                            let shift = (index % values_per_word) * usize::from(bits);
+                            let quantized = (word >> shift) & mask;
+                            let group = group_row + index / group_size;
+                            let scale = scales
+                                .get(group)
+                                .copied()
+                                .ok_or(BackendError::ExecutionFailed)?;
+                            let quant_bias = biases
+                                .get(group)
+                                .copied()
+                                .ok_or(BackendError::ExecutionFailed)?;
+                            Ok(sum + input * (scale * quantized as f32 + quant_bias))
+                        })?;
+                values.push(sum);
+            }
+        }
+        self.write_output(output, &values)
+    }
+
     fn execute_sdpa(
         &self,
         inputs: &[Tensor],
@@ -637,6 +708,12 @@ impl Backend for CpuBackend {
                 }
                 Op::Embed => self.execute_embed(dispatch.inputs(), dispatch.output()),
                 Op::Matmul => self.execute_matmul(dispatch.inputs(), dispatch.output()),
+                Op::QuantMatmul { bits, group_size } => self.execute_quant_matmul(
+                    dispatch.inputs(),
+                    dispatch.output(),
+                    bits,
+                    group_size,
+                ),
                 Op::Sdpa {
                     scale,
                     causal,
@@ -1531,6 +1608,68 @@ mod tests {
             .flat_map(|row| values[row * 1024..(row + 1) * 1024].iter().copied())
             .collect::<Vec<_>>();
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn quant_matmul_dequantizes_q4_and_q8_in_mlx_order() {
+        for (bits, parameter_dtype) in [(4, DType::BF16), (8, DType::F16)] {
+            for rows in [1, 7, 33] {
+                let backend = CpuBackend::new();
+                let inner = 64_u32;
+                let activations = (0..rows * inner)
+                    .map(|index| f32::from(u16::try_from(index % 17).unwrap()) / 8.0 - 1.0)
+                    .collect::<Vec<_>>();
+                let input = backend.alloc(DType::F32, &[rows, inner]).unwrap();
+                backend.write(&input, &f32_bytes(&activations)).unwrap();
+                let values_per_word = 32_u32 / u32::from(bits);
+                let repeats = inner / values_per_word;
+                let pattern = if bits == 4 { 0x1111_1111 } else { 0x0101_0101 };
+                let maximum = (1_u32 << bits) - 1;
+                let words = [0, pattern, pattern * maximum]
+                    .into_iter()
+                    .flat_map(|word| std::iter::repeat_n(word, usize::try_from(repeats).unwrap()))
+                    .collect::<Vec<_>>();
+                let packed = backend.alloc(DType::U32, &[3, repeats]).unwrap();
+                backend.write(&packed, &u32_bytes(&words)).unwrap();
+                let scale_values = [0.5, -0.25, 0.125];
+                let bias_values = [1.0, 2.0, -1.0];
+                let scales = backend.alloc(parameter_dtype, &[3, 1]).unwrap();
+                backend
+                    .write(&scales, &encode(&scale_values, parameter_dtype).unwrap())
+                    .unwrap();
+                let biases = backend.alloc(parameter_dtype, &[3, 1]).unwrap();
+                backend
+                    .write(&biases, &encode(&bias_values, parameter_dtype).unwrap())
+                    .unwrap();
+                let output = backend.alloc(DType::F32, &[rows, 3]).unwrap();
+                let mut commands = CommandList::new();
+                commands
+                    .dispatch(
+                        Op::QuantMatmul {
+                            bits,
+                            group_size: 64,
+                        },
+                        &[&input, &packed, &scales, &biases],
+                        &output,
+                    )
+                    .unwrap();
+                backend.submit(commands).unwrap().wait().unwrap();
+                let expected = activations
+                    .chunks_exact(usize::try_from(inner).unwrap())
+                    .flat_map(|row| {
+                        let sum = row.iter().sum::<f32>();
+                        [
+                            sum * bias_values[0],
+                            sum * (scale_values[1] + bias_values[1]),
+                            sum * (scale_values[2] * f32::from(u16::try_from(maximum).unwrap())
+                                + bias_values[2]),
+                        ]
+                    })
+                    .collect::<Vec<_>>();
+                let actual = decode(&backend.read(&output).unwrap(), DType::F32).unwrap();
+                assert_relative(&actual, &expected, 1e-5);
+            }
+        }
     }
 
     #[test]

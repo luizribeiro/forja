@@ -2125,6 +2125,7 @@ impl MetalBackend {
             }
             Op::Copy => self.encode_copy(encoder, table, dispatch, bindings, arguments)?,
             Op::Matmul => self.encode_matmul(encoder, table, dispatch, bindings, arguments)?,
+            Op::QuantMatmul { .. } => return Err(BackendError::UnsupportedOperation),
             Op::Sdpa { .. } => {
                 self.encode_sdpa_dispatch(encoder, table, dispatch, bindings, arguments)?
             }
@@ -4013,6 +4014,7 @@ impl MetalBackend {
                 }
             }
             Op::Matmul => Self::size_matmul_arguments(dispatch, arguments)?,
+            Op::QuantMatmul { .. } => {}
             Op::Sdpa { .. } => self.size_sdpa_arguments(dispatch, arguments)?,
         }
         Ok(())
@@ -4402,6 +4404,7 @@ fn supported_dispatch(dispatch: &Dispatch) -> bool {
         | Op::Matmul
         | Op::Sdpa { .. }
         | Op::Sample { .. } => true,
+        Op::QuantMatmul { .. } => false,
     }
 }
 
@@ -4459,6 +4462,7 @@ fn dispatch_kernel(dispatch: &Dispatch) -> Result<&'static str, BackendError> {
         Op::Rope { .. } => "rope",
         Op::Embed => "embed",
         Op::Matmul => matmul_kernel(dispatch)?,
+        Op::QuantMatmul { .. } => "quant_matmul",
         Op::Sdpa { .. } => sdpa_kernel(dispatch)?,
     })
 }

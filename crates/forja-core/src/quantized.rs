@@ -105,6 +105,11 @@ impl QuantizedMatrix {
         )?;
         validate_parameter(&scales, [rows, cols / group], QuantizedMatrixPart::Scales)?;
         validate_parameter(&biases, [rows, cols / group], QuantizedMatrixPart::Biases)?;
+        if scales.dtype() != biases.dtype() {
+            return Err(QuantizedMatrixError::DTypeMismatch {
+                part: QuantizedMatrixPart::Biases,
+            });
+        }
         Ok(Self {
             shape: [rows, cols],
             bits,
@@ -250,9 +255,16 @@ mod tests {
         let wrong = layout(DType::U32, [3072, 127]);
         let params = layout(DType::F16, [3072, 16]);
         assert_eq!(
-            QuantizedMatrix::new(3072, 1024, 4, 64, wrong, params.clone(), params),
+            QuantizedMatrix::new(3072, 1024, 4, 64, wrong, params.clone(), params.clone(),),
             Err(QuantizedMatrixError::ShapeMismatch {
                 part: QuantizedMatrixPart::Packed
+            })
+        );
+        let biases = layout(DType::BF16, [3072, 16]);
+        assert_eq!(
+            QuantizedMatrix::new(3072, 1024, 4, 64, packed, params, biases),
+            Err(QuantizedMatrixError::DTypeMismatch {
+                part: QuantizedMatrixPart::Biases
             })
         );
     }

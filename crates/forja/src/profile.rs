@@ -142,6 +142,7 @@ fn op_name(operation: Op) -> &'static str {
         Op::Rope { .. } => "rope",
         Op::Embed => "embed",
         Op::Matmul => "matmul",
+        Op::QuantMatmul { .. } => "quant-matmul",
         Op::Sdpa { .. } => "sdpa",
     }
 }

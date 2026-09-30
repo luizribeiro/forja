@@ -2,9 +2,10 @@ use std::{any::Any, collections::HashSet, error::Error, fmt, sync::Arc};
 
 use crate::{
     Affine, ByteHull, CommandList, Dispatch, Op, OpError, ParamError, ParamSpace, ParamValues,
-    SymbolicLayout, SymbolicLayoutError, Tensor, TensorError, byte_ranges_overlap,
+    SymbolicLayout, SymbolicLayoutError, Tensor, TensorError, byte_ranges_overlap, matmul_flops,
     ops::{BufferAccess, barriers_bounded_by, barriers_for_accesses, dispatch_accesses},
     program::{BindError, Inst, PreparedProgram, ProgramKind},
+    quant_matmul_flops, sdpa_flops,
 };
 
 /// A reason graph-template construction or instantiation failed.
@@ -97,8 +98,32 @@ impl GraphLimits {
                 .ok_or(GraphError::WorkLimit)?;
         }
         let flops = match dispatch.op() {
-            Op::Matmul => matmul_flops(dispatch.inputs()),
-            Op::Sdpa { .. } => sdpa_flops(dispatch.inputs()),
+            Op::Matmul => dispatch
+                .inputs()
+                .first()
+                .zip(dispatch.inputs().get(1))
+                .and_then(|(left, right)| {
+                    matmul_flops(left.layout().shape(), right.layout().shape())
+                }),
+            Op::QuantMatmul { .. } => dispatch
+                .inputs()
+                .first()
+                .zip(dispatch.inputs().get(1))
+                .and_then(|(input, packed)| {
+                    quant_matmul_flops(input.layout().shape(), packed.layout().shape())
+                }),
+            Op::Sdpa { .. } => dispatch
+                .inputs()
+                .first()
+                .zip(dispatch.inputs().get(1))
+                .zip(dispatch.inputs().get(2))
+                .and_then(|((query, key), value)| {
+                    sdpa_flops(
+                        query.layout().shape(),
+                        key.layout().shape(),
+                        value.layout().shape(),
+                    )
+                }),
             _ => Some(0),
         }
         .ok_or(GraphError::WorkLimit)?;
@@ -791,33 +816,6 @@ fn instantiate_tensors(
         .map(|tensor| tensor.instantiate(values))
         .collect()
 }
-fn matmul_flops(inputs: &[Tensor]) -> Option<u64> {
-    let left = inputs.first()?.layout().shape();
-    let right = inputs.get(1)?.layout().shape();
-    let batch = if left.len() == 3 {
-        u64::from(*left.first()?)
-    } else {
-        1
-    };
-    let rank = left.len();
-    batch
-        .checked_mul(u64::from(*left.get(rank.checked_sub(2)?)?))?
-        .checked_mul(u64::from(*left.last()?))?
-        .checked_mul(u64::from(*right.last()?))?
-        .checked_mul(2)
-}
-
-fn sdpa_flops(inputs: &[Tensor]) -> Option<u64> {
-    let query = inputs.first()?.layout().shape();
-    let key = inputs.get(1)?.layout().shape();
-    let value = inputs.get(2)?.layout().shape();
-    u64::from(*query.first()?)
-        .checked_mul(u64::from(*query.get(1)?))?
-        .checked_mul(u64::from(*key.get(1)?))?
-        .checked_mul(u64::from(*query.get(2)?).checked_add(u64::from(*value.get(2)?))?)?
-        .checked_mul(2)
-}
-
 #[cfg(test)]
 mod tests {
     use proptest::prelude::*;

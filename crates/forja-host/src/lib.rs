@@ -24,12 +24,13 @@ use forja_core::{
     Affine, Backend, BackendError, BufferId, CommandList, DType, GraphLimits, GraphTemplate,
     Layout, LayoutError, Op, OpError, ParamSpace, PreparedGraph, Slice, Submission,
     SubmissionProfile, SymbolicLayout, SymbolicLayoutError, TemplateOp, TemplateTensor, Tensor,
-    ViewOp,
+    ViewOp, matmul_flops,
     program::{
         BinOp, Inst, KernelSignature, MAX_INSTRUCTIONS, MAX_OUTPUTS, PrepareError, PreparedProgram,
         Program, ProgramError, ProgramKind, RedOp, UnOp, ValidatedProgram, ValueType,
         prepare_program_retained,
     },
+    quant_matmul_flops, sdpa_flops,
 };
 use wasmtime::component::{Accessor, Component, HasData, Linker, Resource, ResourceTable};
 use wasmtime::{Config, Engine, Store, StoreLimits, StoreLimitsBuilder, Trap};
@@ -2064,8 +2065,28 @@ impl<B: Backend> Host<B> {
                 .ok_or_else(dispatch_work_quota)?;
         }
         let flops = match operation {
-            Op::Matmul => matmul_flops(inputs),
-            Op::Sdpa { .. } => sdpa_flops(inputs),
+            Op::Matmul => inputs.first().zip(inputs.get(1)).and_then(|(left, right)| {
+                matmul_flops(left.layout().shape(), right.layout().shape())
+            }),
+            Op::QuantMatmul { .. } => {
+                inputs
+                    .first()
+                    .zip(inputs.get(1))
+                    .and_then(|(input, packed)| {
+                        quant_matmul_flops(input.layout().shape(), packed.layout().shape())
+                    })
+            }
+            Op::Sdpa { .. } => inputs
+                .first()
+                .zip(inputs.get(1))
+                .zip(inputs.get(2))
+                .and_then(|((query, key), value)| {
+                    sdpa_flops(
+                        query.layout().shape(),
+                        key.layout().shape(),
+                        value.layout().shape(),
+                    )
+                }),
             _ => Some(0),
         }
         .ok_or_else(dispatch_work_quota)?;
@@ -3245,33 +3266,6 @@ fn program_error(error: &ProgramError) -> compute::Error {
         _ => error.to_string(),
     };
     compute::Error::OpSignature(message)
-}
-
-fn matmul_flops(inputs: &[&Tensor]) -> Option<u64> {
-    let left = inputs.first()?.layout().shape();
-    let right = inputs.get(1)?.layout().shape();
-    let batch = if left.len() == 3 {
-        u64::from(*left.first()?)
-    } else {
-        1
-    };
-    let rank = left.len();
-    batch
-        .checked_mul(u64::from(*left.get(rank.checked_sub(2)?)?))?
-        .checked_mul(u64::from(*left.last()?))?
-        .checked_mul(u64::from(*right.last()?))?
-        .checked_mul(2)
-}
-
-fn sdpa_flops(inputs: &[&Tensor]) -> Option<u64> {
-    let query = inputs.first()?.layout().shape();
-    let key = inputs.get(1)?.layout().shape();
-    let value = inputs.get(2)?.layout().shape();
-    u64::from(*query.first()?)
-        .checked_mul(u64::from(*query.get(1)?))?
-        .checked_mul(u64::from(*key.get(1)?))?
-        .checked_mul(u64::from(*query.get(2)?).checked_add(u64::from(*value.get(2)?))?)?
-        .checked_mul(2)
 }
 
 fn validate_view(tensor: &Tensor, operation: &ViewOp) -> Result<Layout, LayoutError> {
