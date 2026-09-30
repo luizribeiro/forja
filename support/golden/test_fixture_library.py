@@ -68,6 +68,7 @@ def test_fixtures_are_current_checks_manifest_and_hash(tmp_path: Path) -> None:
                 "file": fixture.name,
                 "sha256": fixture_library.sha256(fixture),
                 "prompt_tokens": 1,
+                "router_logits": {"shape": [2, 1, 4]},
             }
         ],
     }

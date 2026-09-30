@@ -1,4 +1,12 @@
-"""Build deterministic transformer reference fixtures."""
+"""Build deterministic transformer reference fixtures.
+
+To debug a layer reported by ``forja verify``, attach ``register_forward_hook``
+to ``model.model.layers[i].self_attn``, ``.mlp``, or the MoE ``.mlp.gate`` and
+save the hook output for the same prompt as a contiguous float32 safetensor.
+Compare that dump with the engine tap using normwise relative error, moving the
+hook inward until the first mismatch is isolated. Transformers returns the last
+hidden state after the final norm; router logits are captured before top-k.
+"""
 
 import hashlib
 import json
@@ -174,18 +182,27 @@ def set_determinism(settings: GenerationSettings) -> None:
 
 
 def prompt_tensors(
-    model: Any, token_ids: Any, settings: GenerationSettings
+    model: Any,
+    token_ids: Any,
+    settings: GenerationSettings,
+    *,
+    capture_router_logits: bool = False,
 ) -> dict[str, Any]:
     """Run a prompt and its greedy continuation."""
     import torch
 
     with torch.inference_mode():
+        prompt_options = {
+            "input_ids": token_ids,
+            "use_cache": True,
+            "output_hidden_states": True,
+            "return_dict": True,
+            "logits_to_keep": 1,
+        }
+        if capture_router_logits:
+            prompt_options["output_router_logits"] = True
         output = model(
-            input_ids=token_ids,
-            use_cache=True,
-            output_hidden_states=True,
-            return_dict=True,
-            logits_to_keep=1,
+            **prompt_options,
         )
         logits = output.logits[0, -1].float()
         tensors = {
@@ -194,6 +211,13 @@ def prompt_tensors(
         }
         for index, hidden_state in enumerate(output.hidden_states):
             tensors[f"hidden_state_{index}"] = hidden_state[0].float().contiguous()
+        if capture_router_logits:
+            tensors["router_logits"] = torch.stack(
+                [
+                    logits.reshape(token_ids.shape[1], -1)
+                    for logits in output.router_logits
+                ]
+            ).float().contiguous()
 
         cache = output.past_key_values
         generated = []
@@ -260,28 +284,37 @@ def generate(
         local_files_only=True,
     )
     model.eval()
+    capture_router_logits = getattr(model.config, "num_experts", 0) > 0
     output.mkdir(parents=True, exist_ok=True)
     fixture_prompts = []
     for name, text in prompts:
         token_ids = tokenizer(
             text, add_special_tokens=False, return_tensors="pt"
         ).input_ids
-        tensors = prompt_tensors(model, token_ids, settings)
+        tensors = prompt_tensors(
+            model,
+            token_ids,
+            settings,
+            capture_router_logits=capture_router_logits,
+        )
         if validate_fixture is not None:
             validate_fixture(name, token_ids, tensors)
         fixture = output / f"{name}.safetensors"
         temporary = fixture.with_suffix(".safetensors.tmp")
         save_file(tensors, temporary, metadata={"prompt": name})
         temporary.replace(fixture)
-        fixture_prompts.append(
-            {
-                "name": name,
-                "text": text,
-                "file": fixture.name,
-                "sha256": sha256(fixture),
-                "prompt_tokens": token_ids.shape[1],
+        prompt_manifest = {
+            "name": name,
+            "text": text,
+            "file": fixture.name,
+            "sha256": sha256(fixture),
+            "prompt_tokens": token_ids.shape[1],
+        }
+        if capture_router_logits:
+            prompt_manifest["router_logits"] = {
+                "shape": list(tensors["router_logits"].shape)
             }
-        )
+        fixture_prompts.append(prompt_manifest)
         print(f"wrote {fixture} ({token_ids.shape[1]} prompt tokens)")
 
     manifest["prompts"] = fixture_prompts
