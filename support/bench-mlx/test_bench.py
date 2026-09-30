@@ -11,11 +11,25 @@ from unittest import mock
 import bench
 import compare
 import matmul
+import quantized_matmul
 
 
 class SuiteTests(unittest.TestCase):
     def test_matmul_shape_classes_cover_one_decode_token(self) -> None:
         self.assertEqual(sum(shape[3] for shape in matmul.SHAPES), 197)
+
+    def test_quantized_shapes_cover_target_projections(self) -> None:
+        self.assertEqual(
+            quantized_matmul.SHAPES,
+            [
+                ("q", 2048, 4096, 4),
+                ("k/v", 2048, 512, 4),
+                ("o", 4096, 2048, 4),
+                ("expert gate/up", 2048, 768, 4),
+                ("expert down", 768, 2048, 4),
+                ("router", 2048, 128, 8),
+            ],
+        )
 
     def test_main_uses_the_shared_suite_values(self) -> None:
         class FakeArray:
