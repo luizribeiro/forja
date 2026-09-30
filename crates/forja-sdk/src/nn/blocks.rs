@@ -6,6 +6,40 @@ use crate::{Graph, SamplingParams};
 
 use super::ops::sdpa;
 
+/// Optional layer outputs collected for engine verification.
+pub struct Taps {
+    enabled: bool,
+    values: Vec<Tensor<f32>>,
+}
+
+impl Taps {
+    /// Creates a collector with capacity for every model layer when enabled.
+    #[must_use]
+    pub fn new(enabled: bool, layers: usize) -> Self {
+        Self {
+            enabled,
+            values: Vec::with_capacity(if enabled { layers } else { 0 }),
+        }
+    }
+
+    /// Reports whether layer outputs should be materialized.
+    #[must_use]
+    pub const fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// Records one contiguous f32 layer output.
+    pub fn push(&mut self, value: Tensor<f32>) {
+        self.values.push(value);
+    }
+
+    /// Returns the collected outputs in layer order.
+    #[must_use]
+    pub fn finish(self) -> Vec<Tensor<f32>> {
+        self.values
+    }
+}
+
 /// Fixed-capacity key/value cache with `[heads, context, width]` storage.
 pub struct KvCache<T: Element> {
     key: Tensor<T>,

@@ -31,7 +31,7 @@ use forja_sdk::{
     kernel::{Kernel, TensorRef},
     nn::{
         Embedding, EmbeddingConfig, Linear, LinearConfig, RmsNorm, RmsNormConfig, WeightElement,
-        blocks::{KvCache, cached_attention},
+        blocks::{KvCache, Taps, cached_attention},
     },
 };
 
@@ -673,7 +673,7 @@ impl<T: Activation> Qwen3<T> {
         let mut normalized = self.weights.model.layers[0]
             .input_layernorm
             .forward(&hidden)?;
-        let mut taps = Vec::with_capacity(if taps_enabled { LAYERS } else { 0 });
+        let mut taps = Taps::new(taps_enabled, LAYERS);
         for index in 0..LAYERS {
             let layer = &self.weights.model.layers[index];
             let following_norm = self
@@ -699,7 +699,7 @@ impl<T: Activation> Qwen3<T> {
                 },
             )?;
             hidden = next_hidden;
-            if taps_enabled && index + 1 < LAYERS {
+            if taps.enabled() && index + 1 < LAYERS {
                 taps.push(Self::output(hidden.contiguous()?)?);
             }
             if let Some(value) = next_normalized {
@@ -715,7 +715,7 @@ impl<T: Activation> Qwen3<T> {
         } else {
             self.weights.model.norm.forward(&hidden)?
         };
-        if taps_enabled {
+        if taps.enabled() {
             taps.push(Self::output(hidden.contiguous()?)?);
         }
         let logits = Self::output(
@@ -727,7 +727,10 @@ impl<T: Activation> Qwen3<T> {
                 .reshape(&[VOCAB])?
                 .contiguous()?,
         )?;
-        Ok(StepOutput { logits, taps })
+        Ok(StepOutput {
+            logits,
+            taps: taps.finish(),
+        })
     }
 
     #[cfg(target_family = "wasm")]
