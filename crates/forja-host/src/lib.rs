@@ -1100,7 +1100,7 @@ impl TensorEntry {
 /// Host-owned state behind a guest weights resource.
 #[derive(Debug)]
 pub struct WeightsEntry {
-    buffer: Arc<BufferHandle>,
+    buffers: Vec<Arc<BufferHandle>>,
 }
 
 /// Host-owned state behind a guest kernel resource.
@@ -1202,7 +1202,7 @@ pub struct Host<B: Backend> {
     wasi: WasiCtx,
     limits: Limits,
     grants: Grants,
-    weight_files: HashMap<String, Weak<BufferHandle>>,
+    weight_files: HashMap<String, Vec<Weak<BufferHandle>>>,
     store_limits: StoreLimits,
     live_bytes: Arc<AtomicU64>,
     live_handles: usize,
@@ -1470,49 +1470,75 @@ impl<B: Backend> Host<B> {
         let path = self
             .grants
             .weights_path(grant)
-            .ok_or_else(|| invalid_handle("weight grant is not configured"))?;
-        let buffer = if let Some(buffer) = self.weight_files.get(grant).and_then(Weak::upgrade) {
-            buffer
+            .ok_or_else(|| invalid_handle("weight grant is not configured"))?
+            .to_owned();
+        let buffers = if let Some(buffers) = self
+            .weight_files
+            .get(grant)
+            .and_then(|buffers| buffers.iter().map(Weak::upgrade).collect())
+        {
+            buffers
         } else {
-            let source = Safetensors::open(path).map_err(weight_error)?;
-            let first = source
-                .tensors()
-                .iter()
-                .find(|tensor| tensor.is_aligned())
-                .ok_or_else(|| {
-                    compute::Error::Layout("weight file contains no tensors".to_owned())
-                })?;
-            let region = source.mapped_region().map_err(weight_error)?;
-            let buffer_len = u64::try_from(region.len())
-                .map_err(|_| guest_error(BackendError::AllocationFailed))?;
-            let owner_layout = first.layout(buffer_len).map_err(guest_error)?;
-            let buffer_id = self.backend.import_readonly(region).map_err(guest_error)?;
-            let owner = self
-                .backend
-                .tensor(buffer_id, owner_layout)
-                .map_err(guest_error)?;
-            let buffer = Arc::new(BufferHandle {
-                owner,
-                kind: BufferKind::Weights(source),
-                taints: Arc::clone(&self.taints),
-            });
-            self.weight_files
-                .insert(grant.to_owned(), Arc::downgrade(&buffer));
-            buffer
+            let sources = Safetensors::open_all(path).map_err(weight_error)?;
+            let mut buffers = Vec::with_capacity(sources.len());
+            for source in sources {
+                match self.import_weight_source(source) {
+                    Ok(buffer) => buffers.push(buffer),
+                    Err(error) => {
+                        release_buffers(
+                            self.backend.as_ref(),
+                            buffers,
+                            self.active_profile.as_ref(),
+                        )
+                        .map_err(guest_error)?;
+                        return Err(error);
+                    }
+                }
+            }
+            self.weight_files.insert(
+                grant.to_owned(),
+                buffers.iter().map(Arc::downgrade).collect(),
+            );
+            buffers
         };
         match self.table.push(WeightsEntry {
-            buffer: Arc::clone(&buffer),
+            buffers: buffers.clone(),
         }) {
             Ok(resource) => {
                 self.live_handles += 1;
                 Ok(resource)
             }
             Err(error) => {
-                release_buffer(self.backend.as_ref(), buffer, self.active_profile.as_ref())
+                release_buffers(self.backend.as_ref(), buffers, self.active_profile.as_ref())
                     .map_err(guest_error)?;
                 Err(invalid_handle(error))
             }
         }
+    }
+
+    fn import_weight_source(
+        &self,
+        source: Safetensors,
+    ) -> Result<Arc<BufferHandle>, compute::Error> {
+        let first = source
+            .tensors()
+            .iter()
+            .find(|tensor| tensor.is_aligned())
+            .ok_or_else(|| compute::Error::Layout("weight file contains no tensors".to_owned()))?;
+        let region = source.mapped_region().map_err(weight_error)?;
+        let buffer_len =
+            u64::try_from(region.len()).map_err(|_| guest_error(BackendError::AllocationFailed))?;
+        let owner_layout = first.layout(buffer_len).map_err(guest_error)?;
+        let buffer_id = self.backend.import_readonly(region).map_err(guest_error)?;
+        let owner = self
+            .backend
+            .tensor(buffer_id, owner_layout)
+            .map_err(guest_error)?;
+        Ok(Arc::new(BufferHandle {
+            owner,
+            kind: BufferKind::Weights(source),
+            taints: Arc::clone(&self.taints),
+        }))
     }
 
     fn weight_tensor(
@@ -1522,25 +1548,28 @@ impl<B: Backend> Host<B> {
     ) -> Result<Resource<TensorEntry>, compute::Error> {
         self.check_handle_quota()?;
         let entry = self.table.get(resource).map_err(invalid_handle)?;
-        let source = entry
-            .buffer
-            .weights()
-            .ok_or_else(|| invalid_handle("weight handle has no metadata"))?;
-        let metadata = source
-            .tensors()
+        let (buffer, source, metadata) = entry
+            .buffers
             .iter()
-            .find(|tensor| tensor.name() == name)
+            .find_map(|buffer| {
+                let source = buffer.weights()?;
+                source
+                    .tensors()
+                    .iter()
+                    .find(|tensor| tensor.name() == name)
+                    .map(|metadata| (buffer, source, metadata))
+            })
             .ok_or_else(|| invalid_handle("weight tensor is not present"))?;
         self.check_tensor_shape(metadata.shape())?;
         let (tensor, buffer) = if metadata.is_aligned() {
             let layout = metadata
-                .layout(entry.buffer.owner.buffer().byte_len())
+                .layout(buffer.owner.buffer().byte_len())
                 .map_err(guest_error)?;
             let tensor = self
                 .backend
-                .tensor(entry.buffer.owner.buffer(), layout)
+                .tensor(buffer.owner.buffer(), layout)
                 .map_err(guest_error)?;
-            (tensor, Arc::clone(&entry.buffer))
+            (tensor, Arc::clone(buffer))
         } else {
             let byte_len = self.check_allocation(metadata.dtype(), metadata.shape())?;
             let region = source.mapped_region().map_err(weight_error)?;
@@ -1601,13 +1630,11 @@ impl<B: Backend> Host<B> {
         name: &str,
     ) -> Result<compute::TensorInfo, compute::Error> {
         let entry = self.table.get(resource).map_err(invalid_handle)?;
-        let source = entry
-            .buffer
-            .weights()
-            .ok_or_else(|| invalid_handle("weight handle has no metadata"))?;
-        let tensor = source
-            .tensors()
+        let tensor = entry
+            .buffers
             .iter()
+            .filter_map(|buffer| buffer.weights())
+            .flat_map(WeightSource::tensors)
             .find(|tensor| tensor.name() == name)
             .ok_or_else(|| invalid_handle("weight tensor is not present"))?;
         Ok(compute::TensorInfo {
@@ -1621,13 +1648,11 @@ impl<B: Backend> Host<B> {
         resource: &Resource<WeightsEntry>,
     ) -> Result<Vec<String>, wasmtime::Error> {
         let entry = self.table.get(resource).map_err(wasmtime::Error::msg)?;
-        let source = entry
-            .buffer
-            .weights()
-            .ok_or_else(|| wasmtime::Error::msg("weight handle has no metadata"))?;
-        Ok(source
-            .tensors()
+        Ok(entry
+            .buffers
             .iter()
+            .filter_map(|buffer| buffer.weights())
+            .flat_map(WeightSource::tensors)
             .map(|tensor| tensor.name().to_owned())
             .collect())
     }
@@ -1638,9 +1663,9 @@ impl<B: Backend> Host<B> {
             .live_handles
             .checked_sub(1)
             .ok_or_else(|| invalid_handle("live handle accounting underflowed"))?;
-        release_buffer(
+        release_buffers(
             self.backend.as_ref(),
-            entry.buffer,
+            entry.buffers,
             self.active_profile.as_ref(),
         )
         .map_err(guest_error)?;
@@ -3446,6 +3471,22 @@ fn release_buffer<B: Backend>(
     profile: Option<&Arc<Mutex<EngineStepProfile>>>,
 ) -> Result<(), BackendError> {
     Arc::into_inner(buffer).map_or(Ok(()), |buffer| buffer.release(backend, profile))
+}
+
+fn release_buffers<B: Backend>(
+    backend: &B,
+    buffers: Vec<Arc<BufferHandle>>,
+    profile: Option<&Arc<Mutex<EngineStepProfile>>>,
+) -> Result<(), BackendError> {
+    let mut failure = None;
+    for buffer in buffers {
+        if let Err(error) = release_buffer(backend, buffer, profile)
+            && failure.is_none()
+        {
+            failure = Some(error);
+        }
+    }
+    failure.map_or(Ok(()), Err)
 }
 
 fn quota(message: &str) -> compute::Error {

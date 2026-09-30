@@ -151,9 +151,62 @@ fn promotes_bf16_module_weights_to_f32() {
     assert_eq!(model.norm.forward(&input).unwrap().shape(), [1, 2]);
 }
 
+#[test]
+fn loads_indexed_weight_files() {
+    let weights = Weights::open(index_file()).unwrap();
+    let model = FlatModel::load(
+        &weights,
+        &Config {
+            vocab: 3,
+            hidden: 2,
+            layers: 2,
+        },
+    )
+    .unwrap();
+    let input = Tensor::from_slice(&[1.0_f32, 2.0], &[1, 2]).unwrap();
+    assert_eq!(
+        model
+            .block
+            .projection
+            .forward(&input)
+            .unwrap()
+            .to_vec()
+            .unwrap(),
+        [2.0, 6.0]
+    );
+}
+
 fn weight_file() -> PathBuf {
     static PATH: OnceLock<PathBuf> = OnceLock::new();
     PATH.get_or_init(write_weight_file).clone()
+}
+
+fn index_file() -> PathBuf {
+    static PATH: OnceLock<PathBuf> = OnceLock::new();
+    PATH.get_or_init(|| {
+        let shard = weight_file();
+        let file = shard.file_name().unwrap().to_string_lossy();
+        let names = [
+            "token.weight",
+            "blocks.0.projection.weight",
+            "blocks.1.projection.weight",
+            "norm.weight",
+            "projection.weight",
+            "bf16_token.weight",
+            "bf16_projection.weight",
+            "bf16_norm.weight",
+        ];
+        let map = names
+            .iter()
+            .map(|name| format!(r#""{name}":"{file}""#))
+            .collect::<Vec<_>>()
+            .join(",");
+        let path =
+            std::env::temp_dir().join(format!("forja-sdk-load-{}.index.json", std::process::id()));
+        std::fs::write(&path, format!(r#"{{"weight_map":{{{map}}}}}"#)).unwrap();
+        path
+    })
+    .clone()
 }
 
 fn write_weight_file() -> PathBuf {
@@ -220,7 +273,8 @@ fn write_weight_file() -> PathBuf {
             .iter()
             .flat_map(|(_, _, _, bytes)| bytes.iter().copied()),
     );
-    let path = std::env::temp_dir().join(format!("forja-sdk-load-{}", std::process::id()));
+    let path =
+        std::env::temp_dir().join(format!("forja-sdk-load-{}.safetensors", std::process::id()));
     std::fs::write(&path, bytes).unwrap();
     path
 }

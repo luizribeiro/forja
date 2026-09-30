@@ -648,25 +648,36 @@ pub(crate) mod native {
     pub(crate) struct Native;
 
     pub(crate) struct WeightSource {
-        source: Safetensors,
-        region: forja_core::MappedRegion,
+        shards: Vec<(Safetensors, forja_core::MappedRegion)>,
     }
 
     impl WeightSource {
         pub(crate) fn open(path: &std::path::Path) -> Result<Self> {
-            let source = Safetensors::open(path).map_err(|error| Error::new(error.to_string()))?;
-            let region = source
-                .mapped_region()
-                .map_err(|error| Error::new(error.to_string()))?;
-            Ok(Self { source, region })
+            let sources =
+                Safetensors::open_all(path).map_err(|error| Error::new(error.to_string()))?;
+            let shards = sources
+                .into_iter()
+                .map(|source| {
+                    let region = source
+                        .mapped_region()
+                        .map_err(|error| Error::new(error.to_string()))?;
+                    Ok((source, region))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(Self { shards })
         }
 
         pub(crate) fn tensor(&self, name: &str, dtype: DType, shape: &[u32]) -> Result<Tensor> {
-            let tensor = self
-                .source
-                .tensors()
+            let (tensor, region) = self
+                .shards
                 .iter()
-                .find(|tensor| tensor.name() == name)
+                .find_map(|(source, region)| {
+                    source
+                        .tensors()
+                        .iter()
+                        .find(|tensor| tensor.name() == name)
+                        .map(|tensor| (tensor, region))
+                })
                 .ok_or_else(|| Error::new(format!("weight {name:?} is missing")))?;
             if tensor.dtype() != core_dtype(dtype) || tensor.shape() != shape {
                 return Err(Error::new(format!(
@@ -683,8 +694,7 @@ pub(crate) mod native {
             let end = start
                 .checked_add(len)
                 .ok_or_else(|| Error::new(format!("weight {name:?} range overflowed")))?;
-            let bytes = self
-                .region
+            let bytes = region
                 .bytes()
                 .get(start..end)
                 .ok_or_else(|| Error::new(format!("weight {name:?} range is invalid")))?;
