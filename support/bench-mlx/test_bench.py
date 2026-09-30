@@ -104,6 +104,11 @@ class SuiteTests(unittest.TestCase):
             self.assertEqual(report["settings"]["tg"], 128)
             self.assertEqual(report["settings"]["sampling"]["temperature"], 0.0)
             self.assertEqual(report["tg_context_start"], 9)
+            contexts = report["results"][0]["context_token_generation"]
+            self.assertEqual(
+                [result["context_start"] for result in contexts],
+                [9, 512, 2048, 4000],
+            )
 
     def test_reads_the_committed_default_suite(self) -> None:
         path = Path(__file__).resolve().parents[2] / "bench/suites/default.toml"
@@ -126,7 +131,12 @@ class SuiteTests(unittest.TestCase):
             )
             self.assertEqual(
                 bench.sampling_options(model, "generation-config"),
-                {"temperature": 0.7, "top_k": 20, "top_p": 0.8, "seed": 0},
+                {
+                    "temperature": bench.float32(0.7),
+                    "top_k": 20,
+                    "top_p": bench.float32(0.8),
+                    "seed": 0,
+                },
             )
 
     def test_rejects_non_increasing_contexts(self) -> None:

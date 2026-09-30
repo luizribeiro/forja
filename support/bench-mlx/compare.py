@@ -76,6 +76,31 @@ def main() -> None:
                 rate(report, result, "tg"),
                 sep="\t",
             )
+    print("\nimplementation\tengine\tcontext\ttg wall tok/s (95% CI)")
+    for report in reports:
+        for result in report["results"]:
+            if report.get("schema_version") == 2:
+                contexts = [
+                    {
+                        "context_start": value["context_start"],
+                        "token_generation": value["unprofiled_token_generation"],
+                    }
+                    for value in result.get("breakdown", [])
+                ]
+            else:
+                contexts = result.get("context_token_generation", [])
+            for context in contexts:
+                print(
+                    report["implementation"],
+                    engine(report, result),
+                    context["context_start"],
+                    rate(
+                        {"schema_version": 1},
+                        context,
+                        "tg",
+                    ),
+                    sep="\t",
+                )
 
 
 if __name__ == "__main__":

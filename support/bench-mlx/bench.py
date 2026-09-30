@@ -5,6 +5,7 @@ import argparse
 import importlib.metadata
 import json
 import platform
+import struct
 import subprocess
 import time
 import tomllib
@@ -153,11 +154,16 @@ def sampling_options(model_dir: Path, mode: str) -> dict[str, object]:
     if not config.get("do_sample"):
         raise RuntimeError("generation config does not enable sampling")
     return {
-        "temperature": config["temperature"],
+        "temperature": float32(config["temperature"]),
         "top_k": config["top_k"],
-        "top_p": config["top_p"],
+        "top_p": float32(config["top_p"]),
         "seed": 0,
     }
+
+
+def float32(value: float) -> float:
+    """Round a JSON number exactly as Forja's f32 configuration does."""
+    return struct.unpack("f", struct.pack("f", value))[0]
 
 
 def model_overrides(model_dir: Path) -> dict[str, object]:
@@ -232,6 +238,24 @@ def main() -> None:
             next(responses)
         return time.perf_counter() - started
 
+    def context_trial(context: int) -> float:
+        mx.random.seed(sampling["seed"])
+        prompt = synthetic_tokens(context - 1, vocab)
+        responses = iter(
+            stream_generate(
+                model,
+                tokenizer,
+                prompt,
+                max_tokens=2,
+                prefill_step_size=2048,
+                sampler=sampler,
+            )
+        )
+        next(responses)
+        started = time.perf_counter()
+        next(responses)
+        return time.perf_counter() - started
+
     for _ in range(bench["warmups"]):
         pp_trial()
         tg_trial()
@@ -240,13 +264,31 @@ def main() -> None:
     for _ in range(bench["reps"]):
         pp_times.append(pp_trial())
         tg_times.append(tg_trial())
+    context_times = []
+    for context in bench["contexts"]:
+        for _ in range(bench["warmups"]):
+            context_trial(context)
+        context_times.append(
+            {
+                "context_start": context,
+                "token_generation": summary(
+                    1, [context_trial(context) for _ in range(bench["reps"])]
+                ),
+            }
+        )
     repository = Path(__file__).resolve().parents[2]
     device = mx.device_info()["device_name"]
     report = {
         "schema_version": 1,
         "implementation": "mlx_lm",
         "model": str(args.model_dir),
-        "settings": {**bench, "sampling": sampling},
+        "settings": {
+            **bench,
+            "selection": ["gpu-pipelined"],
+            "sampling": sampling,
+            "breakdown": True,
+            "vary": {},
+        },
         "tg_context_start": decode_prefill + 1,
         "results": [
             {
@@ -261,14 +303,21 @@ def main() -> None:
                 },
                 "prompt_processing": summary(pp, pp_times),
                 "token_generation": summary(tg, tg_times),
+                "context_token_generation": context_times,
             }
         ],
     }
     args.json.write_text(json.dumps(report, indent=2) + "\n")
     pp = report["results"][0]["prompt_processing"]["tokens_per_second"]["wall"]
     tg = report["results"][0]["token_generation"]["tokens_per_second"]["wall"]
-    print(f"mlx bf16\tpp\t{pp['median']:.2f} ({pp['ci95'][0]:.2f}–{pp['ci95'][1]:.2f})")
-    print(f"mlx bf16\ttg\t{tg['median']:.2f} ({tg['ci95'][0]:.2f}–{tg['ci95'][1]:.2f})")
+    print(f"mlx {precision}\tpp\t{pp['median']:.2f} ({pp['ci95'][0]:.2f}–{pp['ci95'][1]:.2f})")
+    print(f"mlx {precision}\ttg\t{tg['median']:.2f} ({tg['ci95'][0]:.2f}–{tg['ci95'][1]:.2f})")
+    for result in context_times:
+        rate = result["token_generation"]["tokens_per_second"]["wall"]
+        print(
+            f"mlx {precision}\ttg@{result['context_start']}\t"
+            f"{rate['median']:.2f} ({rate['ci95'][0]:.2f}–{rate['ci95'][1]:.2f})"
+        )
 
 
 if __name__ == "__main__":
