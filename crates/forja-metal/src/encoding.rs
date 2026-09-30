@@ -2125,7 +2125,9 @@ impl MetalBackend {
             }
             Op::Copy => self.encode_copy(encoder, table, dispatch, bindings, arguments)?,
             Op::Matmul => self.encode_matmul(encoder, table, dispatch, bindings, arguments)?,
-            Op::QuantMatmul { .. } => return Err(BackendError::UnsupportedOperation),
+            Op::QuantMatmul { bits, group_size } => self.encode_quant_matmul(
+                encoder, table, dispatch, bits, group_size, bindings, arguments,
+            )?,
             Op::Sdpa { .. } => {
                 self.encode_sdpa_dispatch(encoder, table, dispatch, bindings, arguments)?
             }
@@ -2247,6 +2249,109 @@ impl MetalBackend {
             )?);
         }
         Ok(temporaries)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn encode_quant_matmul(
+        &self,
+        encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
+        table: &ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>,
+        dispatch: &Dispatch,
+        bits: u8,
+        group_size: u32,
+        bindings: &mut ArgumentBindings,
+        arguments: &mut ArgumentWriter,
+    ) -> Result<Vec<BufferBinding>, BackendError> {
+        let [input, packed, scales, biases] = dispatch.inputs() else {
+            return Err(BackendError::InvalidInput);
+        };
+        let input = self.encoder_tensor(input)?;
+        let packed = self.encoder_tensor(packed)?;
+        let scales = self.encoder_tensor(scales)?;
+        let biases = self.encoder_tensor(biases)?;
+        let output = self.encoder_tensor(dispatch.output())?;
+        let [rows, inner]: [u32; 2] = input
+            .layout
+            .shape()
+            .try_into()
+            .map_err(|_| BackendError::InvalidInput)?;
+        let [columns, packed_width]: [u32; 2] = packed
+            .layout
+            .shape()
+            .try_into()
+            .map_err(|_| BackendError::InvalidInput)?;
+        let mut params = Vec::with_capacity(144);
+        for value in [
+            input.layout.offset(),
+            packed.layout.offset(),
+            scales.layout.offset(),
+            biases.layout.offset(),
+            output.layout.offset(),
+            input.layout.strides()[0],
+            input.layout.strides()[1],
+            packed.layout.strides()[0],
+            packed.layout.strides()[1],
+            scales.layout.strides()[0],
+            scales.layout.strides()[1],
+            biases.layout.strides()[0],
+            biases.layout.strides()[1],
+            output.layout.strides()[0],
+            output.layout.strides()[1],
+        ] {
+            params.extend_from_slice(&value.to_ne_bytes());
+        }
+        for value in [
+            rows,
+            inner,
+            columns,
+            packed_width,
+            u32::from(bits),
+            group_size,
+        ] {
+            params.extend_from_slice(&value.to_ne_bytes());
+        }
+        let params = arguments.write(&params)?;
+        let kernel = quant_matmul_kernel_name(rows);
+        let pipeline = self
+            .pipelines
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?
+            .get(
+                kernel,
+                &[
+                    (0, dtype_code(input.layout.dtype())),
+                    (1, dtype_code(scales.layout.dtype())),
+                    (2, dtype_code(output.layout.dtype())),
+                    (12, u32::from(bits)),
+                    (13, group_size),
+                ],
+            )?;
+        set_pipeline(encoder, &pipeline);
+        for (index, tensor) in [&input, &packed, &scales, &biases, &output]
+            .into_iter()
+            .enumerate()
+        {
+            bindings.bind(table, index, &tensor.buffer);
+        }
+        bindings.bind(table, 5, &params);
+        set_argument_table(encoder, table);
+        let (column_tile, row_tile) = if rows == 1 { (32, 1) } else { (8, 8) };
+        dispatch_threadgroups(
+            encoder,
+            MTLSize {
+                width: usize::try_from(columns.div_ceil(column_tile))
+                    .map_err(|_| BackendError::InvalidInput)?,
+                height: usize::try_from(rows.div_ceil(row_tile))
+                    .map_err(|_| BackendError::InvalidInput)?,
+                depth: 1,
+            },
+            MTLSize {
+                width: 256,
+                height: 1,
+                depth: 1,
+            },
+        );
+        Ok(vec![params])
     }
 
     fn encode_sdpa_dispatch(
@@ -4014,7 +4119,7 @@ impl MetalBackend {
                 }
             }
             Op::Matmul => Self::size_matmul_arguments(dispatch, arguments)?,
-            Op::QuantMatmul { .. } => {}
+            Op::QuantMatmul { .. } => arguments.write(144)?,
             Op::Sdpa { .. } => self.size_sdpa_arguments(dispatch, arguments)?,
         }
         Ok(())
@@ -4402,9 +4507,9 @@ fn supported_dispatch(dispatch: &Dispatch) -> bool {
         | Op::Rope { .. }
         | Op::Embed
         | Op::Matmul
+        | Op::QuantMatmul { .. }
         | Op::Sdpa { .. }
         | Op::Sample { .. } => true,
-        Op::QuantMatmul { .. } => false,
     }
 }
 
@@ -4462,9 +4567,19 @@ fn dispatch_kernel(dispatch: &Dispatch) -> Result<&'static str, BackendError> {
         Op::Rope { .. } => "rope",
         Op::Embed => "embed",
         Op::Matmul => matmul_kernel(dispatch)?,
-        Op::QuantMatmul { .. } => "quant_matmul",
+        Op::QuantMatmul { .. } => {
+            quant_matmul_kernel_name(dispatch.inputs()[0].layout().shape()[0])
+        }
         Op::Sdpa { .. } => sdpa_kernel(dispatch)?,
     })
+}
+
+const fn quant_matmul_kernel_name(rows: u32) -> &'static str {
+    if rows == 1 {
+        "quantized_gemv"
+    } else {
+        "quantized_gemm_small_m"
+    }
 }
 
 fn row_kernel(
