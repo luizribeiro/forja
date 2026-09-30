@@ -4,6 +4,7 @@ use std::{
     fs,
     io::{Read, Write},
     path::Path,
+    process::Command,
 };
 
 use forja_core::Backend;
@@ -60,6 +61,30 @@ where
     B: Backend + Send + Sync + 'static,
     W: Write,
 {
+    let report = generate_report(backend, options, component, output).await?;
+    eprintln!(
+        "engine memory: live={} bytes, RSS={} bytes",
+        report.live_bytes, report.rss_bytes
+    );
+    Ok(report.tokens)
+}
+
+struct GenerationReport {
+    tokens: Vec<u32>,
+    live_bytes: u64,
+    rss_bytes: u64,
+}
+
+async fn generate_report<B, W>(
+    backend: B,
+    options: &Run,
+    component: &Path,
+    output: &mut W,
+) -> Result<GenerationReport, Box<dyn Error>>
+where
+    B: Backend + Send + Sync + 'static,
+    W: Write,
+{
     let tokenizer = Tokenizer::from_file(options.model_dir.join("tokenizer.json"))
         .map_err(|error| format!("cannot load tokenizer: {error}"))?;
     let encoding = tokenizer
@@ -84,7 +109,7 @@ where
         .await?
         .map_err(|error| format!("engine load failed: {error:?}"))?;
     if options.max_tokens == 0 {
-        return Ok(Vec::new());
+        return generation_report(Vec::new(), &runner);
     }
     let sampling = sampling_params(options)?;
     let prompt_len = u32::try_from(prompt.len())?;
@@ -152,7 +177,31 @@ where
             Err(discard) => Err(format!("{error}; speculative drain failed: {discard:?}").into()),
         };
     }
-    Ok(generated)
+    generation_report(generated, &runner)
+}
+
+fn generation_report<B: Backend + Send + Sync + 'static>(
+    tokens: Vec<u32>,
+    runner: &EngineRunner<B>,
+) -> Result<GenerationReport, Box<dyn Error>> {
+    Ok(GenerationReport {
+        tokens,
+        live_bytes: runner.metrics().live_bytes,
+        rss_bytes: rss_bytes()?,
+    })
+}
+
+fn rss_bytes() -> Result<u64, Box<dyn Error>> {
+    let output = Command::new("ps")
+        .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+        .output()?;
+    if !output.status.success() {
+        return Err("ps failed while reading resident memory".into());
+    }
+    let kibibytes = String::from_utf8(output.stdout)?.trim().parse::<u64>()?;
+    Ok(kibibytes
+        .checked_mul(1024)
+        .ok_or("RSS byte count overflowed")?)
 }
 
 fn sampling_params(options: &Run) -> Result<SamplingParams, Box<dyn Error>> {
@@ -319,6 +368,52 @@ mod tests {
                 &mut Vec::new(),
             ))?;
         assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires FORJA_MODELS and runs in the pre-push hook"]
+    fn qwen3_coder_full_model_generates_code() -> Result<(), Box<dyn Error>> {
+        let root = PathBuf::from(env::var_os("FORJA_MODELS").ok_or("FORJA_MODELS is not set")?);
+        let options = Run {
+            engine: test_guests::qwen3_coder().to_owned(),
+            model_dir: root.join("Qwen3-Coder-30B-A3B-Instruct-4bit"),
+            prompt: "fn fibonacci(n: u64) -> u64 {\n".to_owned(),
+            max_tokens: 32,
+            temperature: 0.0,
+            top_k: 0,
+            top_p: 1.0,
+            seed: None,
+            backend: BackendArg::Metal,
+            graph_replay: forja_config::GraphReplay::Tier2,
+            limits: forja_config::Limits {
+                live_bytes: forja_config::ByteSize::new(64 * 1024 * 1024 * 1024),
+                ..forja_config::Limits::default()
+            },
+        };
+        let mut output = Vec::new();
+        let report = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()?
+            .block_on(generate_report(
+                forja_metal::MetalBackend::new()?,
+                &options,
+                test_guests::qwen3_coder(),
+                &mut output,
+            ))?;
+        let text = String::from_utf8(output)?;
+        eprintln!(
+            "Qwen3-Coder full model: live={} bytes, RSS={} bytes, output={text:?}",
+            report.live_bytes, report.rss_bytes,
+        );
+        assert!(!report.tokens.is_empty());
+        assert!(text.trim().len() >= 8);
+        assert!(
+            text.chars()
+                .any(|character| character.is_ascii_alphanumeric())
+        );
+        assert!(!text.contains('\u{fffd}'));
         Ok(())
     }
 }

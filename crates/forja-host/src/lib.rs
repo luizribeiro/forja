@@ -169,6 +169,8 @@ pub struct EngineDecodeOutput {
 /// Cumulative execution counters for an engine runner.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct EngineMetrics {
+    /// Bytes held by live guest tensor resources.
+    pub live_bytes: u64,
     /// Successfully completed backend submissions.
     pub submissions: u64,
     /// Completed submissions that supplied device timestamps.
@@ -1377,6 +1379,7 @@ impl<B: Backend> Host<B> {
 
     fn engine_metrics(&self) -> EngineMetrics {
         EngineMetrics {
+            live_bytes: self.live_bytes.load(Ordering::Acquire),
             submissions: self.completed_submissions.load(Ordering::Acquire),
             timed_submissions: self.timed_submissions.load(Ordering::Acquire),
             gpu_time: Duration::from_nanos(self.completed_gpu_time_ns.load(Ordering::Acquire)),
@@ -5293,6 +5296,7 @@ mod tests {
         assert_eq!(
             host.engine_metrics(),
             EngineMetrics {
+                live_bytes: 0,
                 submissions: 2,
                 timed_submissions: 2,
                 gpu_time: Duration::from_nanos(66),
