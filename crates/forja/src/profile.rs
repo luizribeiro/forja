@@ -5,6 +5,7 @@ use forja_core::{Backend, CommandList, DType, DispatchProfile, Op, ProfileTensor
 use crate::{
     args::Profile,
     benchmark::{TokenProfile, measure_token_profile},
+    machine_load,
 };
 
 const COPY_BYTES: u64 = 512 * 1024 * 1024;
@@ -25,9 +26,11 @@ pub(crate) async fn run(options: &Profile) -> Result<(), Box<dyn Error>> {
     }
     #[cfg(target_os = "macos")]
     {
+        let load_before = machine_load::capture("BEFORE PROFILE")?;
         let peak = measure_copy_peak()?;
         let measurement = measure_token_profile(options).await?;
-        let report = report(options, &measurement, peak)?;
+        let load_after = machine_load::capture("AFTER PROFILE")?;
+        let report = report(options, &measurement, peak, &load_before, &load_after)?;
         if options.json {
             fs::create_dir_all(&options.scratch)?;
             let path = options.scratch.join("profile.json");
@@ -288,6 +291,8 @@ fn report(
     options: &Profile,
     measurement: &TokenProfile,
     peak: f64,
+    load_before: &machine_load::Snapshot,
+    load_after: &machine_load::Snapshot,
 ) -> Result<serde_json::Value, Box<dyn Error>> {
     let submission = measurement
         .step
@@ -318,6 +323,14 @@ fn report(
         })
         .collect::<Result<Vec<_>, &'static str>>()?;
     Ok(serde_json::json!({
+        "provenance": {
+            "commit": crate::provenance::commit(),
+            "dirty": crate::provenance::dirty(),
+            "machine_load": {
+                "before": load_before,
+                "after": load_after,
+            },
+        },
         "device": measurement.device,
         "context": options.context,
         "measured_copy_peak_gigabytes_per_second": peak,

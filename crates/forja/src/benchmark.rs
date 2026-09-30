@@ -21,6 +21,7 @@ use crate::{
     benchmark_record::{self, Input, PerfKey, Recorded},
     benchmark_stats::{Stats, stats, synthetic_tokens},
     engine::{argmax, limits, read_token, weights_path},
+    machine_load,
 };
 
 #[cfg(target_os = "macos")]
@@ -142,8 +143,10 @@ pub(crate) async fn measure_token_profile(
 }
 
 #[cfg(target_os = "macos")]
+#[allow(clippy::too_many_lines)]
 async fn run_metal(options: &Bench) -> Result<(), Box<dyn Error>> {
     let started = Instant::now();
+    let load_before = machine_load::capture("BEFORE BENCHMARK")?;
     let commit = crate::provenance::commit();
     let os = command_output("sw_vers", &["-productVersion"])?;
     let date = command_output("date", &["-u", "+%Y-%m-%dT%H:%MZ"])?;
@@ -200,6 +203,7 @@ async fn run_metal(options: &Bench) -> Result<(), Box<dyn Error>> {
         })
         .collect::<Result<Vec<_>, _>>()?;
     let (results, device) = measure_points(options, &perf_hashes).await?;
+    let load_after = machine_load::capture("AFTER BENCHMARK")?;
     check_strategy_outputs(&options.strategy_axes, &results)?;
     if let Some(record) = &options.rerun {
         print_result_diff(record, &results)?;
@@ -218,6 +222,10 @@ async fn run_metal(options: &Bench) -> Result<(), Box<dyn Error>> {
                 "macos": os,
                 "date": date,
                 "duration_s": started.elapsed().as_secs(),
+                "machine_load": {
+                    "before": load_before,
+                    "after": load_after,
+                },
             },
             "inputs": inputs,
             "config": snapshot.config,

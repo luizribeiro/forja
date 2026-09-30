@@ -7,6 +7,7 @@ mod benchmark_stats;
 mod config_show;
 mod engine;
 mod generate;
+mod machine_load;
 mod profile;
 mod provenance;
 mod verify;
