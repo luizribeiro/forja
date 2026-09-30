@@ -1,0 +1,195 @@
+{
+  "allow_diff": [],
+  "auto_notes": [
+    "backend.metal.graph_replay: auto -> tier2 (Apple M3 Ultra/macOS 26.6.2 @cf6bb812199346006541f09b995582110d5d9e59)"
+  ],
+  "axes": {},
+  "config": "[backend]\nkind = \"metal\"\n\n[backend.metal]\ngraph_replay = \"tier2\"\n\n[bench]\nbreakdown = true\ncontexts = [9, 512, 2048, 4000]\ndecode_prefill = 8\npp = 512\nreps = 30\nselection = [\"gpu-pipelined\"]\ntg = 128\nwarmups = 3\n\n[bench.sampling]\nseed = 0\ntemperature = 0.0\ntop_k = 0\ntop_p = 1.0\n\n[bench.vary]\n\n[limits]\ndispatches_per_list = 4096\ngpu_time_budget = \"3600000ms\"\nguest_call_timeout = \"300000ms\"\nguest_memory_bytes = 4294967296\ninstances = 10000\nlive_bytes = 51539607552\nlive_graphs = 16\nlive_kernels = 64\nlive_tensor_handles = 20000\nread_bytes = 1073741824\nsubmission_timeout = \"60000ms\"\ntable_elements = 10000\ntensor_elements = 1000000000\ntensor_rank = 4\nwork_per_dispatch = \"unlimited\"\n\n[run]\nmax_tokens = 128\ntemperature = 0.0\ntop_k = 0\ntop_p = 1.0\n\n[verify]\nprompts = []\n",
+  "config_hash": "sha256:7a9c3aa0809ed740a77f2f9ad06325f195c80cb9c666169dcc58931532e37a0a",
+  "implementation": "forja",
+  "inputs": [
+    {
+      "engine_sha256": "7d3f6ad79afd8a48c2106611b3b15295adf866052bd4176bca6fdb47672254a8",
+      "model_revision": null,
+      "profile_hash": null,
+      "weights_sha256": "0e2e1e0d8d357ac7af817cff28410c3dbad398f060c517a433e4076b2aae5579"
+    }
+  ],
+  "origins": {
+    "backend.kind": "default",
+    "backend.metal.graph_replay": "auto",
+    "bench.breakdown": "--breakdown",
+    "bench.contexts": "default",
+    "bench.decode_prefill": "default",
+    "bench.pp": "default",
+    "bench.reps": "default",
+    "bench.sampling.seed": "default",
+    "bench.sampling.temperature": "default",
+    "bench.sampling.top_k": "default",
+    "bench.sampling.top_p": "default",
+    "bench.selection": "--set #1",
+    "bench.tg": "default",
+    "bench.warmups": "default",
+    "limits.dispatches_per_list": "default",
+    "limits.gpu_time_budget": "default",
+    "limits.guest_call_timeout": "default",
+    "limits.guest_memory_bytes": "default",
+    "limits.instances": "default",
+    "limits.live_bytes": "default",
+    "limits.live_graphs": "default",
+    "limits.live_kernels": "default",
+    "limits.live_tensor_handles": "default",
+    "limits.read_bytes": "default",
+    "limits.submission_timeout": "default",
+    "limits.table_elements": "default",
+    "limits.tensor_elements": "default",
+    "limits.tensor_rank": "default",
+    "limits.work_per_dispatch": "default",
+    "run.max_tokens": "default",
+    "run.temperature": "default",
+    "run.top_k": "default",
+    "run.top_p": "default",
+    "verify.prompts": "default"
+  },
+  "perf_hash": "sha256:b8d7c0a404778473734af2e586d825e89b8d25ef288559435ae20fb3d3e4ca21",
+  "provenance": {
+    "binary_sha256": "e35557d99dd531b6e367949afcb76c65199447925031f8c40fbd09a4c3103638",
+    "commit": "cf6bb812199346006541f09b995582110d5d9e59",
+    "date": "2026-09-30T08:44Z",
+    "device": "Apple M3 Ultra",
+    "dirty": false,
+    "duration_s": 567,
+    "gpu_cores": 80,
+    "macos": "26.6.2"
+  },
+  "results": [
+    {
+      "input": 0,
+      "output_digest": "sha256:fb526da16ebb3766a494aadeee19ecf1959bfad5fb34a4b7615407db45485198",
+      "perf_hash": "sha256:94a1b3aa6e5548ed2aae2995fd838f075e44f6c86392e6513b378220c125a2d0",
+      "point": {},
+      "pp": {
+        "gpu_time_seconds": {
+          "ci95": [
+            0.565637416,
+            0.568600916
+          ],
+          "median": 0.5675060205
+        },
+        "submissions": {
+          "ci95": [
+            1.0,
+            1.0
+          ],
+          "median": 1.0
+        },
+        "tokens_per_second": {
+          "gpu": {
+            "ci95": [
+              900.4558128429045,
+              905.1735007572414
+            ],
+            "median": 902.1930858582875
+          },
+          "wall": {
+            "ci95": [
+              844.5378237893274,
+              853.018487053157
+            ],
+            "median": 848.1990225406114
+          }
+        },
+        "wall_time_seconds": {
+          "ci95": [
+            0.600221458,
+            0.60624875
+          ],
+          "median": 0.6036319165
+        }
+      },
+      "sampling_fallbacks": [
+        {
+          "context_start": 9,
+          "count_per_token": {
+            "ci95": [
+              0.0,
+              0.0
+            ],
+            "median": 0.0
+          }
+        },
+        {
+          "context_start": 512,
+          "count_per_token": {
+            "ci95": [
+              0.0,
+              0.0
+            ],
+            "median": 0.0
+          }
+        },
+        {
+          "context_start": 2048,
+          "count_per_token": {
+            "ci95": [
+              0.0,
+              0.0
+            ],
+            "median": 0.0
+          }
+        },
+        {
+          "context_start": 4000,
+          "count_per_token": {
+            "ci95": [
+              0.0,
+              0.0
+            ],
+            "median": 0.0
+          }
+        }
+      ],
+      "selection": "gpu-pipelined",
+      "tg": {
+        "gpu_time_seconds": {
+          "ci95": [
+            1.34581854,
+            1.349459876
+          ],
+          "median": 1.3473166495
+        },
+        "submissions": {
+          "ci95": [
+            128.0,
+            128.0
+          ],
+          "median": 128.0
+        },
+        "tokens_per_second": {
+          "gpu": {
+            "ci95": [
+              94.85276463307012,
+              95.10940457099068
+            ],
+            "median": 95.00365103861604
+          },
+          "wall": {
+            "ci95": [
+              94.32417483325372,
+              94.5665600822729
+            ],
+            "median": 94.46540120030772
+          }
+        },
+        "wall_time_seconds": {
+          "ci95": [
+            1.353544,
+            1.357022208
+          ],
+          "median": 1.3549934585
+        }
+      }
+    }
+  ],
+  "schema_version": 2
+}
