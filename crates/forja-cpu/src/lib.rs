@@ -2,11 +2,11 @@
 
 pub mod interpreter;
 
-use std::{sync::Mutex, time::Duration};
+use std::{ops::Range, sync::Mutex, time::Duration};
 
 use forja_core::{
     AllocationRegistry, Backend, BackendError, BufferId, CommandList, DType, Layout, MappedRegion,
-    Op, Submission, Tensor, ViewOp,
+    Op, ReadonlyImport, Submission, Tensor, ViewOp,
     program::{BoundProgram, KernelSignature, ValidatedProgram},
 };
 use half::{bf16, f16};
@@ -955,12 +955,31 @@ impl Backend for CpuBackend {
         CpuBackend::alloc(self, dtype, shape)
     }
 
-    fn import_readonly(&self, bytes: MappedRegion) -> Result<BufferId, BackendError> {
+    fn import_readonly(&self, bytes: MappedRegion) -> Result<ReadonlyImport, BackendError> {
         let byte_len = u64::try_from(bytes.len()).map_err(|_| BackendError::AllocationFailed)?;
+        let buffer = self
+            .buffers
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?
+            .insert_read_only(CpuBuffer::Mapped(bytes), byte_len)?;
+        Ok(ReadonlyImport::Mapped(buffer))
+    }
+
+    fn read_buffer_range(
+        &self,
+        buffer: BufferId,
+        range: Range<u64>,
+    ) -> Result<Vec<u8>, BackendError> {
+        let start = usize::try_from(range.start).map_err(|_| BackendError::InvalidInput)?;
+        let end = usize::try_from(range.end).map_err(|_| BackendError::InvalidInput)?;
         self.buffers
             .lock()
             .map_err(|_| BackendError::ExecutionFailed)?
-            .insert_read_only(CpuBuffer::Mapped(bytes), byte_len)
+            .get_buffer(buffer)?
+            .bytes()
+            .get(start..end)
+            .map(<[u8]>::to_vec)
+            .ok_or(BackendError::InvalidInput)
     }
 
     fn tensor(&self, buffer: BufferId, layout: Layout) -> Result<Tensor, BackendError> {
@@ -1551,7 +1570,7 @@ mod tests {
         let region = MappedRegion::map(&fs::File::open(&path).unwrap()).unwrap();
         let mapped_pointer = region.as_ptr();
         let backend = CpuBackend::new();
-        let buffer = backend.import_readonly(region).unwrap();
+        let buffer = backend.import_readonly(region).unwrap().buffer();
         fs::remove_file(path).unwrap();
         let tensor = backend
             .tensor(
@@ -1611,7 +1630,8 @@ mod tests {
         fs::write(&path, [0; 24]).unwrap();
         let buffer = backend
             .import_readonly(MappedRegion::map(&fs::File::open(&path).unwrap()).unwrap())
-            .unwrap();
+            .unwrap()
+            .buffer();
         fs::remove_file(path).unwrap();
         let read_only = backend
             .tensor(

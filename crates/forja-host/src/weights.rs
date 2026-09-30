@@ -47,7 +47,7 @@ impl WeightTensor {
         &self.shape
     }
 
-    /// Returns the absolute byte offset in the source file.
+    /// Returns the byte offset in the safetensors data region.
     #[must_use]
     pub const fn byte_offset(&self) -> u64 {
         self.byte_offset
@@ -59,9 +59,11 @@ impl WeightTensor {
         self.byte_len
     }
 
-    /// Reports whether the tensor begins at its scalar type's alignment.
+    /// Reports whether the tensor offset is aligned for its dtype within the data region.
+    ///
+    /// This is independent of the GPU's 16-byte imported-buffer address requirement.
     #[must_use]
-    pub const fn is_aligned(&self) -> bool {
+    pub const fn is_dtype_aligned(&self) -> bool {
         self.byte_offset.is_multiple_of(self.dtype.byte_size())
     }
 
@@ -91,6 +93,7 @@ pub trait WeightSource {
 #[derive(Debug)]
 pub struct Safetensors {
     path: PathBuf,
+    data_start: u64,
     tensors: Vec<WeightTensor>,
 }
 
@@ -180,13 +183,16 @@ impl Safetensors {
         let data_start = 8_u64
             .checked_add(header_len)
             .ok_or(WeightError::InvalidRange)?;
+        let data_len = file_len
+            .checked_sub(data_start)
+            .ok_or(WeightError::Truncated)?;
         let entries = serde_json::from_slice::<HeaderEntries>(&header)
             .map_err(|error| WeightError::InvalidHeader(error.to_string()))?;
         let mut tensors = entries
             .0
             .into_iter()
             .filter(|(name, _)| name != "__metadata__")
-            .map(|(name, value)| parse_tensor(name, &value, data_start, file_len))
+            .map(|(name, value)| parse_tensor(name, &value, data_len))
             .collect::<Result<Vec<_>, _>>()?;
         tensors.sort_by_key(WeightTensor::byte_offset);
         if tensors.windows(2).any(|pair| {
@@ -199,6 +205,7 @@ impl Safetensors {
         }
         Ok(Self {
             path: path.to_owned(),
+            data_start,
             tensors,
         })
     }
@@ -286,7 +293,10 @@ impl WeightSource for Safetensors {
 
     fn mapped_region(&self) -> Result<MappedRegion, WeightError> {
         let file = File::open(&self.path).map_err(WeightError::Io)?;
-        MappedRegion::map(&file).map_err(WeightError::Mapping)
+        let offset = usize::try_from(self.data_start).map_err(|_| WeightError::InvalidRange)?;
+        MappedRegion::map(&file)
+            .and_then(|region| region.split_at(offset))
+            .map_err(WeightError::Mapping)
     }
 }
 
@@ -352,12 +362,7 @@ fn read_header_len(file: &mut File) -> Result<u64, WeightError> {
     Ok(u64::from_le_bytes(bytes))
 }
 
-fn parse_tensor(
-    name: String,
-    value: &Value,
-    data_start: u64,
-    file_len: u64,
-) -> Result<WeightTensor, WeightError> {
+fn parse_tensor(name: String, value: &Value, data_len: u64) -> Result<WeightTensor, WeightError> {
     let entry = value
         .as_object()
         .ok_or_else(|| invalid_header(&name, "entry is not an object"))?;
@@ -407,20 +412,17 @@ fn parse_tensor(
     if byte_len != expected {
         return Err(WeightError::InvalidRange);
     }
-    let byte_offset = data_start
-        .checked_add(relative_start)
-        .ok_or(WeightError::InvalidRange)?;
-    let byte_end = byte_offset
+    let byte_end = relative_start
         .checked_add(byte_len)
         .ok_or(WeightError::InvalidRange)?;
-    if byte_end > file_len {
+    if byte_end > data_len {
         return Err(WeightError::Truncated);
     }
     Ok(WeightTensor {
         name,
         dtype,
         shape,
-        byte_offset,
+        byte_offset: relative_start,
         byte_len,
     })
 }
@@ -534,15 +536,17 @@ mod tests {
     }
 
     #[test]
-    fn retains_unaligned_tensor_metadata_for_copying() {
-        let source = open(
+    fn aligns_tensor_offsets_to_the_data_region() {
+        let path = file(
             r#"{"a":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#,
             &[0; 4],
             false,
-        )
-        .unwrap();
+        );
+        let source = Safetensors::open(&path).unwrap();
 
-        assert!(!source.tensors()[0].is_aligned());
+        assert!(source.tensors()[0].is_dtype_aligned());
+        assert_eq!(source.mapped_region().unwrap().bytes(), &[0; 4]);
+        fs::remove_file(path).unwrap();
     }
 
     #[test]

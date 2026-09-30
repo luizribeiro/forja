@@ -18,7 +18,7 @@ use crate::encoding::{
 use block2::RcBlock;
 use forja_core::{
     AllocationRegistry, Backend, BackendError, BufferId, CommandList, DType, GraphTemplate, Layout,
-    MappedRegion, PreparedGraph, Tensor, ViewOp,
+    MappedRegion, PreparedGraph, ReadonlyImport, Tensor, ViewOp,
     program::{KernelSignature, ProgramHash, ValidatedProgram},
 };
 use objc2::{rc::Retained, runtime::ProtocolObject};
@@ -31,7 +31,8 @@ use objc2_metal::{
 
 pub(super) struct MetalBuffer {
     pub(super) raw: Retained<ProtocolObject<dyn MTLBuffer>>,
-    len: usize,
+    pub(super) len: usize,
+    pub(super) data_offset: usize,
     pub(super) pooled: bool,
     pub(super) pool_resident: bool,
     pending: Vec<PendingCompletion>,
@@ -62,7 +63,11 @@ impl MetalBuffer {
         unsafe {
             ptr::copy_nonoverlapping(
                 source.as_ptr(),
-                self.raw.contents().cast::<u8>().as_ptr().add(range.start),
+                self.raw
+                    .contents()
+                    .cast::<u8>()
+                    .as_ptr()
+                    .add(self.data_offset + range.start),
                 source.len(),
             );
         }
@@ -71,7 +76,16 @@ impl MetalBuffer {
     fn bytes(&self) -> &[u8] {
         // SAFETY: `raw` is retained for the returned borrow and Metal guarantees `contents()`
         // points to all `len` bytes of a shared-storage buffer.
-        unsafe { slice::from_raw_parts(self.raw.contents().cast::<u8>().as_ptr(), self.len) }
+        unsafe {
+            slice::from_raw_parts(
+                self.raw
+                    .contents()
+                    .cast::<u8>()
+                    .as_ptr()
+                    .add(self.data_offset),
+                self.len,
+            )
+        }
     }
 
     pub(super) fn wait_pending(&mut self, timeout: Duration) -> Result<(), BackendError> {
@@ -624,6 +638,7 @@ impl Backend for MetalBackend {
             MetalBuffer {
                 raw,
                 len,
+                data_offset: 0,
                 pooled: true,
                 pool_resident: false,
                 pending: Vec::new(),
@@ -640,13 +655,40 @@ impl Backend for MetalBackend {
         buffers.tensor(id, layout)
     }
 
-    fn import_readonly(&self, bytes: MappedRegion) -> Result<BufferId, BackendError> {
+    fn import_readonly(&self, bytes: MappedRegion) -> Result<ReadonlyImport, BackendError> {
         let byte_len = u64::try_from(bytes.len()).map_err(|_| BackendError::AllocationFailed)?;
-        let buffer = no_copy_buffer(&self.device, bytes)?;
-        self.buffers
+        let copied = !bytes.offset().is_multiple_of(GPU_ADDRESS_ALIGNMENT);
+        let buffer = readonly_buffer(&self.device, bytes)?;
+        let buffer = self
+            .buffers
             .lock()
             .map_err(|_| BackendError::ExecutionFailed)?
-            .insert_read_only(buffer, byte_len)
+            .insert_read_only(buffer, byte_len)?;
+        Ok(if copied {
+            ReadonlyImport::Copied(buffer)
+        } else {
+            ReadonlyImport::Mapped(buffer)
+        })
+    }
+
+    fn read_buffer_range(
+        &self,
+        buffer: BufferId,
+        range: std::ops::Range<u64>,
+    ) -> Result<Vec<u8>, BackendError> {
+        let start = usize::try_from(range.start).map_err(|_| BackendError::InvalidInput)?;
+        let end = usize::try_from(range.end).map_err(|_| BackendError::InvalidInput)?;
+        let mut buffers = self
+            .buffers
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?;
+        let buffer = buffers.get_buffer_mut(buffer)?;
+        buffer.wait_pending(self.gpu_timeout)?;
+        buffer
+            .bytes()
+            .get(start..end)
+            .map(<[u8]>::to_vec)
+            .ok_or(BackendError::InvalidInput)
     }
 
     fn tensor(&self, buffer: BufferId, layout: Layout) -> Result<Tensor, BackendError> {
@@ -763,13 +805,38 @@ impl Backend for MetalBackend {
 }
 
 type BufferDeallocator = RcBlock<dyn Fn(NonNull<c_void>, usize)>;
+const GPU_ADDRESS_ALIGNMENT: usize = 16;
 
-fn no_copy_buffer(
+fn readonly_buffer(
     device: &ProtocolObject<dyn MTLDevice>,
     region: MappedRegion,
 ) -> Result<MetalBuffer, BackendError> {
     let len = region.len();
-    let rounded_len = len
+    let data_offset = region.offset();
+    if !data_offset.is_multiple_of(GPU_ADDRESS_ALIGNMENT) {
+        let pointer = NonNull::new(region.bytes().as_ptr().cast_mut().cast::<c_void>())
+            .ok_or(BackendError::InvalidInput)?;
+        // SAFETY: The pointer covers `len` initialized bytes for the duration of this synchronous
+        // call, which copies them into a new shared-storage Metal allocation.
+        let raw = unsafe {
+            device.newBufferWithBytes_length_options(
+                pointer,
+                len,
+                MTLResourceOptions::StorageModeShared,
+            )
+        }
+        .ok_or(BackendError::AllocationFailed)?;
+        return Ok(MetalBuffer {
+            raw,
+            len,
+            data_offset: 0,
+            pooled: false,
+            pool_resident: false,
+            pending: Vec::new(),
+        });
+    }
+    let rounded_len = region
+        .mapped_len()
         .checked_add(NSPageSize().saturating_sub(1))
         .map(|bytes| bytes / NSPageSize() * NSPageSize())
         .ok_or(BackendError::AllocationFailed)?;
@@ -793,6 +860,7 @@ fn no_copy_buffer(
     Ok(MetalBuffer {
         raw,
         len,
+        data_offset,
         pooled: false,
         pool_resident: false,
         pending: Vec::new(),
@@ -873,10 +941,17 @@ mod mapped_tests {
             std::process::id(),
             NEXT_FILE.fetch_add(1, Ordering::Relaxed)
         ));
-        fs::write(&path, &expected).unwrap();
-        let region = MappedRegion::map(&fs::File::open(&path).unwrap()).unwrap();
+        let mut stored = vec![0xff];
+        stored.extend_from_slice(&expected);
+        fs::write(&path, stored).unwrap();
+        let region = MappedRegion::map(&fs::File::open(&path).unwrap())
+            .unwrap()
+            .split_at(1)
+            .unwrap();
         let backend = MetalBackend::new().unwrap();
-        let buffer = backend.import_readonly(region).unwrap();
+        let imported = backend.import_readonly(region).unwrap();
+        assert!(matches!(imported, ReadonlyImport::Copied(_)));
+        let buffer = imported.buffer();
         fs::remove_file(path).unwrap();
         let weight = backend
             .tensor(

@@ -84,7 +84,7 @@ fn qwen_weight_names_and_shapes_match_config() -> Result<(), Box<dyn Error>> {
     let region = source.mapped_region()?;
     let buffer_len = u64::try_from(region.len())?;
     let backend = forja_cpu::CpuBackend::new();
-    let buffer = backend.import_readonly(region)?;
+    let buffer = backend.import_readonly(region)?.buffer();
     let mut opened = Vec::new();
     let actual = source
         .tensors()

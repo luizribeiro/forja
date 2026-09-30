@@ -1123,7 +1123,11 @@ enum BufferKind {
         byte_len: u64,
         live_bytes: Arc<AtomicU64>,
     },
-    Weights(Safetensors),
+    Weights {
+        source: Safetensors,
+        copied_byte_len: Option<u64>,
+        live_bytes: Arc<AtomicU64>,
+    },
     CopiedWeight {
         byte_len: u64,
         live_bytes: Arc<AtomicU64>,
@@ -1153,14 +1157,25 @@ impl BufferHandle {
                 })
                 .map(|_| ())
                 .map_err(|_| BackendError::ExecutionFailed),
-            BufferKind::Weights(_) => Ok(()),
+            BufferKind::Weights {
+                copied_byte_len,
+                live_bytes,
+                ..
+            } => copied_byte_len.map_or(Ok(()), |byte_len| {
+                live_bytes
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |bytes| {
+                        bytes.checked_sub(byte_len)
+                    })
+                    .map(|_| ())
+                    .map_err(|_| BackendError::ExecutionFailed)
+            }),
         }
     }
 
     fn weights(&self) -> Option<&Safetensors> {
         match &self.kind {
             BufferKind::Allocated { .. } | BufferKind::CopiedWeight { .. } => None,
-            BufferKind::Weights(source) => Some(source),
+            BufferKind::Weights { source, .. } => Some(source),
         }
     }
 }
@@ -1561,17 +1576,22 @@ impl<B: Backend> Host<B> {
             .weights_path(grant)
             .ok_or_else(|| invalid_handle("weight grant is not configured"))?
             .to_owned();
-        let buffers = if let Some(buffers) = self
-            .weight_files
-            .get(grant)
-            .and_then(|buffers| buffers.iter().map(Weak::upgrade).collect())
-        {
+        let cached = self.weight_files.get(grant).cloned().unwrap_or_default();
+        let live_cached = (!cached.is_empty())
+            .then(|| cached.iter().map(Weak::upgrade).collect())
+            .flatten();
+        let buffers = if let Some(buffers) = live_cached {
             buffers
         } else {
             let sources = Safetensors::open_all(path).map_err(weight_error)?;
             let mut buffers = Vec::with_capacity(sources.len());
-            for source in sources {
-                match self.import_weight_source(source) {
+            let can_reuse = cached.len() == sources.len();
+            for (index, source) in sources.into_iter().enumerate() {
+                let imported = can_reuse
+                    .then(|| cached[index].upgrade())
+                    .flatten()
+                    .map_or_else(|| self.import_weight_source(source), Ok);
+                match imported {
                     Ok(buffer) => buffers.push(buffer),
                     Err(error) => {
                         release_buffers(
@@ -1612,22 +1632,38 @@ impl<B: Backend> Host<B> {
         let first = source
             .tensors()
             .iter()
-            .find(|tensor| tensor.is_aligned())
+            .find(|tensor| tensor.is_dtype_aligned())
             .ok_or_else(|| compute::Error::Layout("weight file contains no tensors".to_owned()))?;
         let region = source.mapped_region().map_err(weight_error)?;
         let buffer_len =
             u64::try_from(region.len()).map_err(|_| guest_error(BackendError::AllocationFailed))?;
         let owner_layout = first.layout(buffer_len).map_err(guest_error)?;
-        let buffer_id = self.backend.import_readonly(region).map_err(guest_error)?;
+        let imported = self.backend.import_readonly(region).map_err(guest_error)?;
+        let buffer_id = imported.buffer();
         let owner = self
             .backend
             .tensor(buffer_id, owner_layout)
             .map_err(guest_error)?;
-        Ok(Arc::new(BufferHandle {
+        let copied_byte_len = imported.copied_byte_len();
+        if let Some(byte_len) = copied_byte_len
+            && let Err(error) = self.check_byte_allocation(byte_len)
+        {
+            self.backend.release(&owner).map_err(guest_error)?;
+            return Err(error);
+        }
+        let buffer = Arc::new(BufferHandle {
             owner,
-            kind: BufferKind::Weights(source),
+            kind: BufferKind::Weights {
+                source,
+                copied_byte_len,
+                live_bytes: Arc::clone(&self.live_bytes),
+            },
             taints: Arc::clone(&self.taints),
-        }))
+        });
+        if let Some(byte_len) = copied_byte_len {
+            self.live_bytes.fetch_add(byte_len, Ordering::AcqRel);
+        }
+        Ok(buffer)
     }
 
     fn weight_tensor(
@@ -1637,7 +1673,7 @@ impl<B: Backend> Host<B> {
     ) -> Result<Resource<TensorEntry>, compute::Error> {
         self.check_handle_quota()?;
         let entry = self.table.get(resource).map_err(invalid_handle)?;
-        let (buffer, source, metadata) = entry
+        let (buffer, metadata) = entry
             .buffers
             .iter()
             .find_map(|buffer| {
@@ -1646,11 +1682,11 @@ impl<B: Backend> Host<B> {
                     .tensors()
                     .iter()
                     .find(|tensor| tensor.name() == name)
-                    .map(|metadata| (buffer, source, metadata))
+                    .map(|metadata| (buffer, metadata))
             })
             .ok_or_else(|| invalid_handle("weight tensor is not present"))?;
         self.check_tensor_shape(metadata.shape())?;
-        let (tensor, buffer) = if metadata.is_aligned() {
+        let (tensor, buffer) = if metadata.is_dtype_aligned() {
             let layout = metadata
                 .layout(buffer.owner.buffer().byte_len())
                 .map_err(guest_error)?;
@@ -1661,23 +1697,19 @@ impl<B: Backend> Host<B> {
             (tensor, Arc::clone(buffer))
         } else {
             let byte_len = self.check_allocation(metadata.dtype(), metadata.shape())?;
-            let region = source.mapped_region().map_err(weight_error)?;
-            let start = usize::try_from(metadata.byte_offset())
-                .map_err(|_| guest_error(BackendError::AllocationFailed))?;
-            let len = usize::try_from(metadata.byte_len())
-                .map_err(|_| guest_error(BackendError::AllocationFailed))?;
+            let start = metadata.byte_offset();
             let end = start
-                .checked_add(len)
+                .checked_add(metadata.byte_len())
                 .ok_or_else(|| guest_error(BackendError::AllocationFailed))?;
-            let bytes = region
-                .bytes()
-                .get(start..end)
-                .ok_or_else(|| guest_error(BackendError::InvalidInput))?;
+            let bytes = self
+                .backend
+                .read_buffer_range(buffer.owner.buffer(), start..end)
+                .map_err(guest_error)?;
             let tensor = self
                 .backend
                 .alloc(metadata.dtype(), metadata.shape())
                 .map_err(guest_error)?;
-            if let Err(error) = self.backend.write(&tensor, bytes) {
+            if let Err(error) = self.backend.write(&tensor, &bytes) {
                 let _ = self.backend.release(&tensor);
                 return Err(guest_error(error));
             }
@@ -2211,6 +2243,11 @@ impl<B: Backend> Host<B> {
         let byte_len = elements
             .checked_mul(dtype.byte_size())
             .ok_or_else(|| quota("tensor byte size exceeds the guest limit"))?;
+        self.check_byte_allocation(byte_len)?;
+        Ok(byte_len)
+    }
+
+    fn check_byte_allocation(&self, byte_len: u64) -> Result<(), compute::Error> {
         if self
             .live_bytes
             .load(Ordering::Acquire)
@@ -2219,7 +2256,7 @@ impl<B: Backend> Host<B> {
         {
             return Err(quota("live tensor bytes exceed the guest limit"));
         }
-        Ok(byte_len)
+        Ok(())
     }
 
     fn check_tensor_shape(&self, shape: &[u32]) -> Result<u64, compute::Error> {
@@ -4541,15 +4578,90 @@ mod tests {
         path
     }
 
-    struct ImportCountingBackend {
-        inner: CpuBackend,
+    fn test_forced_copy_weight_file() -> std::path::PathBuf {
+        let mut header = br#"{"aligned":{"dtype":"F16","shape":[1],"data_offsets":[0,2]},"unaligned":{"dtype":"U32","shape":[1],"data_offsets":[2,6]}}"#.to_vec();
+        while (header.len() + 8).is_multiple_of(16) {
+            header.push(b' ');
+        }
+        let mut bytes = u64::try_from(header.len()).unwrap().to_le_bytes().to_vec();
+        bytes.extend(header);
+        bytes.extend([0; 6]);
+        let path = std::env::temp_dir().join(format!(
+            "forja-copied-weight-{}-{}",
+            std::process::id(),
+            NEXT_WEIGHT_FILE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_copied_weight_imports_share_charge_and_release() {
+        let path = test_forced_copy_weight_file();
+        let imports = Arc::new(AtomicUsize::new(0));
+        let releases = Arc::new(AtomicUsize::new(0));
+        let backend = ImportCountingBackend {
+            inner: forja_metal::MetalBackend::new().unwrap(),
+            imports: Arc::clone(&imports),
+            releases: Arc::clone(&releases),
+        };
+        let grants = Grants::new().with_weights("model", &path);
+        let mut host =
+            Host::with_grants(backend, Limits::new(10, 8, u64::MAX, 8, u64::MAX), grants);
+
+        let first = host.open_weights("model").unwrap();
+        let second = host.open_weights("model").unwrap();
+        assert_eq!(imports.load(Ordering::Acquire), 1);
+        assert_eq!(host.live_bytes.load(Ordering::Acquire), 6);
+        fs::remove_file(path).unwrap();
+
+        let tensor = host
+            .weight_tensor(&Resource::new_borrow(first.rep()), "unaligned")
+            .unwrap();
+        assert_eq!(host.live_bytes.load(Ordering::Acquire), 10);
+        host.drop_tensor(tensor).unwrap();
+        assert_eq!(host.live_bytes.load(Ordering::Acquire), 6);
+        host.drop_weights(first).unwrap();
+        assert_eq!(host.live_bytes.load(Ordering::Acquire), 6);
+        host.drop_weights(second).unwrap();
+        assert_eq!(host.live_bytes.load(Ordering::Acquire), 0);
+        assert_eq!(releases.load(Ordering::Acquire), 2);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_copied_weight_import_refuses_byte_quota() {
+        let path = test_forced_copy_weight_file();
+        let imports = Arc::new(AtomicUsize::new(0));
+        let releases = Arc::new(AtomicUsize::new(0));
+        let backend = ImportCountingBackend {
+            inner: forja_metal::MetalBackend::new().unwrap(),
+            imports: Arc::clone(&imports),
+            releases: Arc::clone(&releases),
+        };
+        let grants = Grants::new().with_weights("model", &path);
+        let mut host = Host::with_grants(backend, Limits::new(5, 8, u64::MAX, 8, u64::MAX), grants);
+
+        assert!(matches!(
+            host.open_weights("model"),
+            Err(compute::Error::Quota(_))
+        ));
+        assert_eq!(host.live_bytes.load(Ordering::Acquire), 0);
+        assert_eq!(imports.load(Ordering::Acquire), 1);
+        assert_eq!(releases.load(Ordering::Acquire), 1);
+        fs::remove_file(path).unwrap();
+    }
+
+    struct ImportCountingBackend<B> {
+        inner: B,
         imports: Arc<AtomicUsize>,
         releases: Arc<AtomicUsize>,
     }
 
-    impl Backend for ImportCountingBackend {
-        type Submission = <CpuBackend as Backend>::Submission;
-        type ProgramHandle = <CpuBackend as Backend>::ProgramHandle;
+    impl<B: Backend> Backend for ImportCountingBackend<B> {
+        type Submission = B::Submission;
+        type ProgramHandle = B::ProgramHandle;
 
         fn prepare_program(
             &self,
@@ -4563,9 +4675,20 @@ mod tests {
             self.inner.alloc(dtype, shape)
         }
 
-        fn import_readonly(&self, bytes: MappedRegion) -> Result<BufferId, BackendError> {
+        fn import_readonly(
+            &self,
+            bytes: MappedRegion,
+        ) -> Result<forja_core::ReadonlyImport, BackendError> {
             self.imports.fetch_add(1, Ordering::AcqRel);
             self.inner.import_readonly(bytes)
+        }
+
+        fn read_buffer_range(
+            &self,
+            buffer: BufferId,
+            range: std::ops::Range<u64>,
+        ) -> Result<Vec<u8>, BackendError> {
+            self.inner.read_buffer_range(buffer, range)
         }
 
         fn tensor(&self, buffer: BufferId, layout: Layout) -> Result<Tensor, BackendError> {

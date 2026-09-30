@@ -12,6 +12,8 @@ use memmap2::Mmap;
 #[derive(Clone)]
 pub struct MappedRegion {
     mapping: Arc<Mmap>,
+    offset: usize,
+    len: usize,
 }
 
 impl MappedRegion {
@@ -24,33 +26,73 @@ impl MappedRegion {
         // SAFETY: The trusted host only passes operator-owned grant files whose documented
         // contract forbids truncation or mutation for the lifetime of the mapping.
         let mapping = unsafe { Mmap::map(file) }?;
+        let len = mapping.len();
         Ok(Self {
             mapping: Arc::new(mapping),
+            offset: 0,
+            len,
+        })
+    }
+
+    /// Returns a view beginning at `offset` while retaining the full file mapping.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `offset` lies outside this region.
+    pub fn split_at(self, offset: usize) -> io::Result<Self> {
+        if offset > self.len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "mapped region offset exceeds its length",
+            ));
+        }
+        let start = self.offset.checked_add(offset).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "mapped region offset overflowed",
+            )
+        })?;
+        Ok(Self {
+            mapping: self.mapping,
+            offset: start,
+            len: self.len - offset,
         })
     }
 
     /// Returns the mapped bytes.
     #[must_use]
     pub fn bytes(&self) -> &[u8] {
-        &self.mapping
+        &self.mapping[self.offset..self.offset + self.len]
     }
 
     /// Returns the mapped byte length.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.mapping.len()
+        self.len
     }
 
     /// Reports whether the mapping contains no bytes.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.mapping.is_empty()
+        self.len == 0
     }
 
-    /// Returns a pointer to the first mapped byte.
+    /// Returns a pointer to the page-aligned mapping base.
     #[must_use]
     pub fn as_ptr(&self) -> *const u8 {
         self.mapping.as_ptr()
+    }
+
+    /// Returns the byte displacement from the page-aligned mapping base.
+    #[must_use]
+    pub const fn offset(&self) -> usize {
+        self.offset
+    }
+
+    /// Returns the full page-aligned mapping length.
+    #[must_use]
+    pub fn mapped_len(&self) -> usize {
+        self.mapping.len()
     }
 }
 

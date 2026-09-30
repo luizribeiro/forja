@@ -32,7 +32,7 @@ use objc2_metal::{
 use crate::{
     map_codegen,
     matmul::{classify, select_gemm},
-    storage::MetalBackend,
+    storage::{MetalBackend, MetalBuffer},
 };
 
 type MetalBufferRef = Retained<ProtocolObject<dyn MTLBuffer>>;
@@ -504,22 +504,25 @@ impl ArgumentBindings {
         &mut self,
         table: &ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>,
         index: usize,
-        buffer: &MetalBufferRef,
-    ) {
-        let address = buffer.gpuAddress();
+        buffer: &MetalBuffer,
+    ) -> Result<(), BackendError> {
+        let base = buffer.raw.gpuAddress();
+        let offset = u64::try_from(buffer.data_offset).map_err(|_| BackendError::InvalidInput)?;
+        let address = base.checked_add(offset).ok_or(BackendError::InvalidInput)?;
         // SAFETY: Each caller uses an index within its argument-table descriptor and registers
         // the bound buffer in the command resource owner before submission.
         unsafe {
             table.setAddress_atIndex(address, index);
         }
         let range = BoundRange {
-            base: address,
-            offset: 0,
-            len: buffer.length(),
+            base,
+            offset: buffer.data_offset,
+            len: buffer.len,
             address,
         };
         record_plan_binding(index, range);
         self.ranges.insert(range);
+        Ok(())
     }
 }
 
@@ -3583,8 +3586,21 @@ impl MetalBackend {
             .buffers
             .lock()
             .map_err(|_| BackendError::ExecutionFailed)?;
+        let buffer = buffers.get(tensor)?;
+        let offset =
+            u64::try_from(buffer.data_offset).map_err(|_| BackendError::ExecutionFailed)?;
+        let address = buffer
+            .raw
+            .gpuAddress()
+            .checked_add(offset)
+            .ok_or(BackendError::ExecutionFailed)?;
         Ok(EncoderTensor {
-            buffer: BufferBinding::whole(buffers.get(tensor)?.raw.clone()),
+            buffer: BufferBinding {
+                raw: buffer.raw.clone(),
+                offset: buffer.data_offset,
+                len: buffer.len,
+                address,
+            },
             layout: tensor.layout().clone(),
         })
     }
@@ -3663,7 +3679,7 @@ impl MetalBackend {
             .lock()
             .map_err(|_| BackendError::ExecutionFailed)?;
         for (index, tensor) in [input, positions, output].into_iter().enumerate() {
-            bindings.bind_raw(table, index, &buffers.get(tensor)?.raw);
+            bindings.bind_raw(table, index, buffers.get(tensor)?)?;
             bindings.bind(table, index + 3, &temporaries[index]);
         }
         bindings.bind(table, 6, &temporaries[3]);
@@ -3735,7 +3751,7 @@ impl MetalBackend {
             .lock()
             .map_err(|_| BackendError::ExecutionFailed)?;
         for (index, tensor) in [embeddings, ids, output].into_iter().enumerate() {
-            bindings.bind_raw(table, index, &buffers.get(tensor)?.raw);
+            bindings.bind_raw(table, index, buffers.get(tensor)?)?;
             bindings.bind(table, index + 3, &temporaries[index]);
         }
         bindings.bind(table, 6, &temporaries[3]);
@@ -3815,7 +3831,7 @@ impl MetalBackend {
             .into_iter()
             .enumerate()
         {
-            bindings.bind_raw(table, index, &buffers.get(tensor)?.raw);
+            bindings.bind_raw(table, index, buffers.get(tensor)?)?;
             bindings.bind(table, index + 5, &temporaries[index]);
         }
         bindings.bind(table, 10, &temporaries[5]);
@@ -3946,7 +3962,7 @@ impl MetalBackend {
             .buffers
             .lock()
             .map_err(|_| BackendError::ExecutionFailed)?;
-        bindings.bind_raw(table, 0, &buffers.get(input)?.raw);
+        bindings.bind_raw(table, 0, buffers.get(input)?)?;
         drop(buffers);
         set_pipeline(encoder, &partials_pipeline);
         bindings.bind(table, 1, &scratch.buffer);
@@ -3980,7 +3996,7 @@ impl MetalBackend {
             .buffers
             .lock()
             .map_err(|_| BackendError::ExecutionFailed)?;
-        bindings.bind_raw(table, 1, &buffers.get(output)?.raw);
+        bindings.bind_raw(table, 1, buffers.get(output)?)?;
         drop(buffers);
         bindings.bind(table, 2, &temporaries[1]);
         bindings.bind(table, 3, &temporaries[3]);
@@ -4493,7 +4509,7 @@ impl MetalBackend {
             .lock()
             .map_err(|_| BackendError::ExecutionFailed)?;
         for (index, tensor) in [input, weight, output].into_iter().enumerate() {
-            bindings.bind_raw(table, index, &buffers.get(tensor)?.raw);
+            bindings.bind_raw(table, index, buffers.get(tensor)?)?;
             bindings.bind(table, index + 3, &temporaries[index]);
         }
         bindings.bind(table, 6, &temporaries[3]);
@@ -4551,7 +4567,7 @@ impl MetalBackend {
             .map_err(|_| BackendError::ExecutionFailed)?;
         for (index, tensor) in operands.iter().enumerate() {
             let buffer = buffers.get(tensor)?;
-            bindings.bind_raw(table, index, &buffer.raw);
+            bindings.bind_raw(table, index, buffer)?;
             bindings.bind(table, index + operands.len(), &layouts[index]);
         }
         drop(buffers);
@@ -4617,7 +4633,7 @@ impl MetalBackend {
         for (index, tensor) in operands.iter().enumerate() {
             state
                 .bindings
-                .bind_raw(table, index, &buffers.get(tensor)?.raw);
+                .bind_raw(table, index, buffers.get(tensor)?)?;
             state
                 .bindings
                 .bind(table, index + operands.len(), &layouts[index]);

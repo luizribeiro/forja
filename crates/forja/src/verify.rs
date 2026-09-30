@@ -708,7 +708,7 @@ mod tests {
     fn metal_bf16_olmoe_verification() -> Result<(), Box<dyn Error>> {
         let root = PathBuf::from(env::var_os("FORJA_MODELS").ok_or("FORJA_MODELS is not set")?);
         let limits = forja_config::Limits {
-            live_bytes: forja_config::ByteSize::new(24 * 1024 * 1024 * 1024),
+            live_bytes: forja_config::ByteSize::new(48 * 1024 * 1024 * 1024),
             ..forja_config::Limits::default()
         };
         let options = Verify {

@@ -2,6 +2,7 @@ use std::{
     collections::HashMap,
     error::Error,
     fmt,
+    ops::Range,
     sync::atomic::{AtomicU64, Ordering},
     time::Duration,
 };
@@ -11,6 +12,34 @@ use crate::{
     Tensor,
     program::{KernelSignature, ValidatedProgram},
 };
+
+/// Result of importing immutable bytes into backend storage.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReadonlyImport {
+    /// The backend directly uses the mapped bytes.
+    Mapped(BufferId),
+    /// The backend copied the bytes into an owned allocation.
+    Copied(BufferId),
+}
+
+impl ReadonlyImport {
+    /// Returns the imported allocation identity.
+    #[must_use]
+    pub const fn buffer(self) -> BufferId {
+        match self {
+            Self::Mapped(buffer) | Self::Copied(buffer) => buffer,
+        }
+    }
+
+    /// Returns the owned byte count when the backend copied the mapping.
+    #[must_use]
+    pub const fn copied_byte_len(self) -> Option<u64> {
+        match self {
+            Self::Mapped(_) => None,
+            Self::Copied(buffer) => Some(buffer.byte_len()),
+        }
+    }
+}
 
 static NEXT_BACKEND: AtomicU64 = AtomicU64::new(1);
 
@@ -115,6 +144,29 @@ impl<S> AllocationRegistry<S> {
     pub fn get(&self, tensor: &Tensor) -> Result<&S, BackendError> {
         let allocation = self.validate(tensor)?;
         Ok(&allocation.storage)
+    }
+
+    /// Returns storage after validating a live allocation identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BackendError::InvalidInput`] for a foreign or released allocation.
+    pub fn get_buffer(&self, buffer: BufferId) -> Result<&S, BackendError> {
+        self.validate_buffer(buffer, buffer.byte_len())
+            .map(|allocation| &allocation.storage)
+    }
+
+    /// Returns mutable storage after validating a live allocation identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BackendError::InvalidInput`] for a foreign or released allocation.
+    pub fn get_buffer_mut(&mut self, buffer: BufferId) -> Result<&mut S, BackendError> {
+        self.validate_buffer(buffer, buffer.byte_len())?;
+        self.allocations
+            .get_mut(&buffer.allocation())
+            .map(|allocation| &mut allocation.storage)
+            .ok_or(BackendError::InvalidInput)
     }
 
     /// Returns mutable storage after validating that the tensor names this live allocation.
@@ -365,8 +417,21 @@ pub trait Backend {
     /// # Errors
     ///
     /// Returns an allocation or invalid-input error when the mapping cannot be imported.
-    fn import_readonly(&self, bytes: MappedRegion) -> Result<BufferId, BackendError> {
+    fn import_readonly(&self, bytes: MappedRegion) -> Result<ReadonlyImport, BackendError> {
         let _ = bytes;
+        Err(BackendError::InvalidInput)
+    }
+    /// Reads one byte range from an imported allocation.
+    ///
+    /// # Errors
+    ///
+    /// Returns invalid input for a foreign allocation or out-of-range bytes.
+    fn read_buffer_range(
+        &self,
+        buffer: BufferId,
+        range: Range<u64>,
+    ) -> Result<Vec<u8>, BackendError> {
+        let _ = (buffer, range);
         Err(BackendError::InvalidInput)
     }
     /// Creates a validated tensor for an imported allocation.
