@@ -16,8 +16,6 @@ use safetensors::{SafeTensors, tensor::Dtype};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-const HIDDEN_STATE_COUNT: usize = 29;
-
 /// A validated owned float32 tensor.
 #[derive(Clone, Debug, PartialEq)]
 pub struct FloatTensor {
@@ -46,6 +44,7 @@ pub struct PromptFixture {
     text: String,
     prompt_ids: Vec<i64>,
     hidden_states: Vec<FloatTensor>,
+    router_logits: Option<FloatTensor>,
     prompt_logits: FloatTensor,
     greedy_tokens: Vec<i64>,
     greedy_step_logits: FloatTensor,
@@ -80,6 +79,12 @@ impl PromptFixture {
     #[must_use]
     pub fn hidden_state(&self, index: usize) -> Option<&FloatTensor> {
         self.hidden_states.get(index)
+    }
+
+    /// Returns prompt-pass router logits as layers by tokens by experts.
+    #[must_use]
+    pub const fn router_logits(&self) -> Option<&FloatTensor> {
+        self.router_logits.as_ref()
     }
 
     /// Returns the last-position prompt logits.
@@ -213,6 +218,12 @@ struct PromptMetadata {
     file: String,
     sha256: String,
     prompt_tokens: usize,
+    router_logits: Option<RouterMetadata>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RouterMetadata {
+    shape: Vec<usize>,
 }
 
 fn load_prompt(root: &Path, metadata: PromptMetadata) -> Result<PromptFixture, FixtureError> {
@@ -235,8 +246,19 @@ fn load_prompt(root: &Path, metadata: PromptMetadata) -> Result<PromptFixture, F
     if prompt_ids.len() != metadata.prompt_tokens {
         return Err(shape_error("prompt_token_ids"));
     }
-    let mut hidden_states = Vec::with_capacity(HIDDEN_STATE_COUNT);
-    for index in 0..HIDDEN_STATE_COUNT {
+    let hidden_state_count = tensors
+        .names()
+        .iter()
+        .filter(|name| {
+            name.strip_prefix("hidden_state_")
+                .is_some_and(|index| index.parse::<usize>().is_ok())
+        })
+        .count();
+    if hidden_state_count < 2 {
+        return Err(shape_error("hidden_states"));
+    }
+    let mut hidden_states = Vec::with_capacity(hidden_state_count);
+    for index in 0..hidden_state_count {
         let name = format!("hidden_state_{index}");
         let tensor = read_f32(&tensors, &name)?;
         if tensor.shape.len() != 2 || tensor.shape[0] != prompt_ids.len() {
@@ -250,6 +272,24 @@ fn load_prompt(root: &Path, metadata: PromptMetadata) -> Result<PromptFixture, F
         }
         hidden_states.push(tensor);
     }
+    let router_logits = match metadata.router_logits {
+        Some(router) => {
+            let tensor = read_f32(&tensors, "router_logits")?;
+            if router.shape != tensor.shape
+                || tensor.shape.len() != 3
+                || tensor.shape[0] != hidden_states.len() - 1
+                || tensor.shape[1] != prompt_ids.len()
+                || tensor.shape[2] == 0
+            {
+                return Err(shape_error("router_logits"));
+            }
+            Some(tensor)
+        }
+        None if tensors.names().contains(&"router_logits") => {
+            return Err(shape_error("router_logits"));
+        }
+        None => None,
+    };
     let prompt_logits = read_f32(&tensors, "prompt_last_logits")?;
     let greedy_tokens = read_i64(&tensors, "greedy_token_ids")?;
     let greedy_step_logits = read_f32(&tensors, "greedy_step_logits")?;
@@ -263,6 +303,7 @@ fn load_prompt(root: &Path, metadata: PromptMetadata) -> Result<PromptFixture, F
         text: metadata.text,
         prompt_ids,
         hidden_states,
+        router_logits,
         prompt_logits,
         greedy_tokens,
         greedy_step_logits,
@@ -412,6 +453,7 @@ mod tests {
         None,
         WrongDtype,
         InvalidShape,
+        InvalidRouterShape,
     }
 
     struct TensorBytes {
@@ -452,6 +494,15 @@ mod tests {
     fn reader_refuses_invalid_fixture_boundaries() {
         let temporary = TestDirectory::new();
 
+        let case = temporary.case("valid-router");
+        let hash = write_tensors(&case, TensorMutation::None);
+        write_manifest(&case, 1, &[prompt("fixture.safetensors", &hash)]);
+        let fixtures = FixtureDirectory::open(case).unwrap();
+        assert_eq!(
+            fixtures.prompts()[0].router_logits().unwrap().shape(),
+            [2, 1, 3]
+        );
+
         let case = temporary.case("hash-mismatch");
         let hash = write_tensors(&case, TensorMutation::None);
         write_manifest(&case, 1, &[prompt("fixture.safetensors", &hash)]);
@@ -477,6 +528,14 @@ mod tests {
         assert!(matches!(
             FixtureDirectory::open(case).unwrap_err(),
             FixtureError::InvalidShape(name) if name == "hidden_state_0"
+        ));
+
+        let case = temporary.case("invalid-router-shape");
+        let hash = write_tensors(&case, TensorMutation::InvalidRouterShape);
+        write_manifest(&case, 1, &[prompt("fixture.safetensors", &hash)]);
+        assert!(matches!(
+            FixtureDirectory::open(case).unwrap_err(),
+            FixtureError::InvalidShape(name) if name == "router_logits"
         ));
 
         let case = temporary.case("duplicate-prompt");
@@ -509,7 +568,8 @@ mod tests {
             "text": "x",
             "file": file,
             "sha256": sha256,
-            "prompt_tokens": 1
+            "prompt_tokens": 1,
+            "router_logits": { "shape": [2, 1, 3] }
         })
     }
 
@@ -541,7 +601,7 @@ mod tests {
                 vec![0; 8]
             },
         }];
-        for index in 0..HIDDEN_STATE_COUNT {
+        for index in 0..3 {
             tensors.push(TensorBytes {
                 name: format!("hidden_state_{index}"),
                 dtype: Dtype::F32,
@@ -554,6 +614,20 @@ mod tests {
             });
         }
         tensors.extend([
+            TensorBytes {
+                name: "router_logits".to_owned(),
+                dtype: Dtype::F32,
+                shape: if matches!(mutation, TensorMutation::InvalidRouterShape) {
+                    vec![2, 2, 3]
+                } else {
+                    vec![2, 1, 3]
+                },
+                data: if matches!(mutation, TensorMutation::InvalidRouterShape) {
+                    vec![0; 48]
+                } else {
+                    vec![0; 24]
+                },
+            },
             TensorBytes {
                 name: "prompt_last_logits".to_owned(),
                 dtype: Dtype::F32,
