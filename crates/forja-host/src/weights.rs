@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, HashSet},
     error::Error,
     fmt,
     fs::File,
@@ -15,6 +15,8 @@ use serde::{
 use serde_json::Value;
 
 const MAX_HEADER_BYTES: u64 = 100 * 1024 * 1024;
+const MAX_INDEX_BYTES: u64 = 100 * 1024 * 1024;
+const MAX_SHARDS: usize = 1_024;
 
 /// Metadata for one tensor in a weight source.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -93,6 +95,66 @@ pub struct Safetensors {
 }
 
 impl Safetensors {
+    /// Opens one safetensors file or every shard named by an index file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid index, missing shard, or invalid safetensors file.
+    pub fn open_all(path: impl AsRef<Path>) -> Result<Vec<Self>, WeightError> {
+        let path = path.as_ref();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+            return Self::open(path).map(|source| vec![source]);
+        }
+        let bytes = read_index(path)?;
+        let index = serde_json::from_slice::<ShardIndex>(&bytes)
+            .map_err(|error| WeightError::InvalidIndex(error.to_string()))?;
+        let mut shards = BTreeMap::<String, HashSet<String>>::new();
+        for (tensor, file) in index.weight_map.0 {
+            let file = file.as_str().ok_or_else(|| {
+                WeightError::InvalidIndex(format!("shard for tensor {tensor:?} is not a string"))
+            })?;
+            if !valid_shard_name(file) {
+                return Err(WeightError::InvalidIndex(format!(
+                    "invalid shard name {file:?}"
+                )));
+            }
+            if !shards.contains_key(file) && shards.len() == MAX_SHARDS {
+                return Err(WeightError::InvalidIndex(format!(
+                    "weight map exceeds the {MAX_SHARDS}-shard limit"
+                )));
+            }
+            shards.entry(file.to_owned()).or_default().insert(tensor);
+        }
+        if shards.is_empty() {
+            return Err(WeightError::InvalidIndex("weight map is empty".to_owned()));
+        }
+        let root = std::fs::canonicalize(path.parent().unwrap_or_else(|| Path::new("")))
+            .map_err(WeightError::Io)?;
+        shards
+            .into_iter()
+            .map(|(file, expected)| {
+                let shard = std::fs::canonicalize(root.join(&file)).map_err(WeightError::Io)?;
+                if !shard.starts_with(&root) {
+                    return Err(WeightError::InvalidIndex(format!(
+                        "shard {file:?} resolves outside its model directory"
+                    )));
+                }
+                let source = Self::open(shard)?;
+                let actual = source
+                    .tensors()
+                    .iter()
+                    .map(|tensor| tensor.name().to_owned())
+                    .collect::<HashSet<_>>();
+                if actual != expected {
+                    return Err(WeightError::InvalidIndex(format!(
+                        "shard {file:?} does not match its weight map"
+                    )));
+                }
+                Ok(source)
+            })
+            .collect()
+    }
+
     /// Opens and validates a safetensors file containing supported scalar types.
     ///
     /// # Errors
@@ -142,7 +204,44 @@ impl Safetensors {
     }
 }
 
+fn read_index(path: &Path) -> Result<Vec<u8>, WeightError> {
+    let file = File::open(path).map_err(WeightError::Io)?;
+    let file_len = file.metadata().map_err(WeightError::Io)?.len();
+    if file_len > MAX_INDEX_BYTES {
+        return Err(WeightError::InvalidIndex(format!(
+            "index has {file_len} bytes, exceeding the size cap"
+        )));
+    }
+    let index_len = usize::try_from(file_len)
+        .map_err(|_| WeightError::InvalidIndex("index size does not fit memory".to_owned()))?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(index_len)
+        .map_err(|_| WeightError::InvalidIndex("index size does not fit memory".to_owned()))?;
+    file.take(MAX_INDEX_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(WeightError::Io)?;
+    if bytes.len() > index_len {
+        return Err(WeightError::InvalidIndex(
+            "index size changed while being read".to_owned(),
+        ));
+    }
+    Ok(bytes)
+}
+
+fn valid_shard_name(file: &str) -> bool {
+    !file.contains('/')
+        && !file.contains('\\')
+        && Path::new(file).file_name().and_then(|name| name.to_str()) == Some(file)
+        && file.ends_with(".safetensors")
+}
+
 struct HeaderEntries(Vec<(String, Value)>);
+
+#[derive(Deserialize)]
+struct ShardIndex {
+    weight_map: HeaderEntries,
+}
 
 impl<'de> Deserialize<'de> for HeaderEntries {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
@@ -202,6 +301,8 @@ pub enum WeightError {
     Truncated,
     /// The JSON metadata is malformed or has an invalid schema.
     InvalidHeader(String),
+    /// A shard index is malformed or inconsistent with its files.
+    InvalidIndex(String),
     /// The declared JSON metadata exceeds the parser's bound.
     HeaderTooLarge(u64),
     /// A tensor uses a scalar type unsupported by plain weights.
@@ -219,6 +320,7 @@ impl fmt::Display for WeightError {
             Self::Mapping(error) => error.fmt(f),
             Self::Truncated => f.write_str("weight file is truncated"),
             Self::InvalidHeader(error) => write!(f, "invalid safetensors header: {error}"),
+            Self::InvalidIndex(error) => write!(f, "invalid safetensors index: {error}"),
             Self::HeaderTooLarge(bytes) => {
                 write!(
                     f,
@@ -365,6 +467,32 @@ mod tests {
         result
     }
 
+    fn index_directory() -> PathBuf {
+        let directory = std::env::temp_dir().join(format!(
+            "forja-safetensors-index-{}-{}",
+            std::process::id(),
+            NEXT_FILE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&directory).unwrap();
+        directory
+    }
+
+    fn write_index(directory: &Path, contents: impl AsRef<[u8]>) -> PathBuf {
+        let index = directory.join("model.safetensors.index.json");
+        fs::write(&index, contents).unwrap();
+        index
+    }
+
+    fn write_shard(directory: &Path, name: &str, header: &str, data: &[u8]) {
+        let source = file(header, data, true);
+        fs::rename(source, directory.join(name)).unwrap();
+    }
+
+    fn invalid_index(directory: &Path, contents: impl AsRef<[u8]>) -> WeightError {
+        let index = write_index(directory, contents);
+        Safetensors::open_all(index).unwrap_err()
+    }
+
     #[test]
     fn parses_supported_tensor_metadata() {
         let source = open(
@@ -474,5 +602,171 @@ mod tests {
         fs::remove_file(path).unwrap();
 
         assert!(matches!(result, Err(WeightError::HeaderTooLarge(_))));
+    }
+
+    #[test]
+    fn opens_validated_shard_indexes() {
+        let directory = index_directory();
+        write_shard(
+            &directory,
+            "first.safetensors",
+            r#"{"a":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#,
+            &[0; 4],
+        );
+        write_shard(
+            &directory,
+            "second.safetensors",
+            r#"{"b":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#,
+            &[0; 4],
+        );
+        let index = write_index(
+            &directory,
+            r#"{"weight_map":{"a":"first.safetensors","b":"second.safetensors"}}"#,
+        );
+
+        let sources = Safetensors::open_all(&index).unwrap();
+
+        assert_eq!(sources.len(), 2);
+        assert_eq!(sources[0].tensors()[0].name(), "a");
+        assert_eq!(sources[1].tensors()[0].name(), "b");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn rejects_parent_shard_paths() {
+        let directory = index_directory();
+        let error = invalid_index(&directory, r#"{"weight_map":{"a":"../x.safetensors"}}"#);
+        assert!(matches!(error, WeightError::InvalidIndex(_)));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn rejects_absolute_shard_paths() {
+        let directory = index_directory();
+        let outside = std::env::temp_dir().join("absolute.safetensors");
+        let contents = serde_json::json!({"weight_map": {"a": outside}}).to_string();
+        let error = invalid_index(&directory, contents);
+        assert!(matches!(error, WeightError::InvalidIndex(_)));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn rejects_shard_names_with_embedded_separators() {
+        let directory = index_directory();
+        let error = invalid_index(&directory, r#"{"weight_map":{"a":"nested/x.safetensors"}}"#);
+        assert!(matches!(error, WeightError::InvalidIndex(_)));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn rejects_non_safetensors_shards() {
+        let directory = index_directory();
+        let error = invalid_index(&directory, r#"{"weight_map":{"a":"shard.bin"}}"#);
+        assert!(matches!(error, WeightError::InvalidIndex(_)));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn rejects_shards_missing_declared_tensors() {
+        let directory = index_directory();
+        write_shard(
+            &directory,
+            "shard.safetensors",
+            r#"{"b":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#,
+            &[0; 4],
+        );
+        let error = invalid_index(&directory, r#"{"weight_map":{"a":"shard.safetensors"}}"#);
+        assert!(matches!(error, WeightError::InvalidIndex(_)));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn rejects_shards_with_undeclared_tensors() {
+        let directory = index_directory();
+        write_shard(
+            &directory,
+            "shard.safetensors",
+            r#"{"a":{"dtype":"F32","shape":[1],"data_offsets":[0,4]},"b":{"dtype":"F32","shape":[1],"data_offsets":[4,8]}}"#,
+            &[0; 8],
+        );
+        let error = invalid_index(&directory, r#"{"weight_map":{"a":"shard.safetensors"}}"#);
+        assert!(matches!(error, WeightError::InvalidIndex(_)));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn rejects_empty_weight_maps() {
+        let directory = index_directory();
+        let error = invalid_index(&directory, r#"{"weight_map":{}}"#);
+        assert!(matches!(error, WeightError::InvalidIndex(_)));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn rejects_non_string_shard_values() {
+        let directory = index_directory();
+        let error = invalid_index(&directory, r#"{"weight_map":{"a":7}}"#);
+        assert!(matches!(error, WeightError::InvalidIndex(_)));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn rejects_malformed_indexes() {
+        let directory = index_directory();
+        let error = invalid_index(&directory, b"{");
+        assert!(matches!(error, WeightError::InvalidIndex(_)));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn rejects_indexes_over_the_size_cap() {
+        let directory = index_directory();
+        let index = write_index(&directory, []);
+        File::options()
+            .write(true)
+            .open(&index)
+            .unwrap()
+            .set_len(MAX_INDEX_BYTES + 1)
+            .unwrap();
+        assert!(matches!(
+            Safetensors::open_all(index),
+            Err(WeightError::InvalidIndex(_))
+        ));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn rejects_too_many_shards() {
+        let directory = index_directory();
+        let weight_map = (0..=MAX_SHARDS)
+            .map(|index| {
+                (
+                    format!("tensor-{index}"),
+                    Value::String(format!("shard-{index}.safetensors")),
+                )
+            })
+            .collect::<serde_json::Map<_, _>>();
+        let contents = serde_json::json!({"weight_map": weight_map}).to_string();
+        let error = invalid_index(&directory, contents);
+        assert!(matches!(error, WeightError::InvalidIndex(_)));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_shards_symlinked_outside_the_model_directory() {
+        use std::os::unix::fs::symlink;
+
+        let directory = index_directory();
+        let outside = file(
+            r#"{"a":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#,
+            &[0; 4],
+            true,
+        );
+        symlink(&outside, directory.join("shard.safetensors")).unwrap();
+        let error = invalid_index(&directory, r#"{"weight_map":{"a":"shard.safetensors"}}"#);
+        assert!(matches!(error, WeightError::InvalidIndex(_)));
+        fs::remove_dir_all(directory).unwrap();
+        fs::remove_file(outside).unwrap();
     }
 }
