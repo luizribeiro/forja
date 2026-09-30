@@ -2,6 +2,8 @@
 """Generate four-layer Qwen3-Coder-30B-A3B-Instruct reference fixtures."""
 
 import argparse
+import json
+import re
 import time
 from pathlib import Path
 
@@ -23,12 +25,86 @@ TENSOR_DESCRIPTIONS = {
     "greedy_step_logits": "Truncated-model token logits, shape [32, 151936], F32.",
 }
 
+EXPERT_WEIGHT = re.compile(
+    r"^(model\.layers\.\d+\.mlp)\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight$"
+)
+
+
+def dequantize_affine(weight, scales, biases, bits: int, group_size: int):
+    """Dequantize MLX affine rows, whose first value occupies each word's low bits."""
+    import torch
+
+    values_per_word = 32 // bits
+    shifts = torch.arange(0, 32, bits, dtype=torch.int64)
+    values = ((weight.to(torch.int64).unsqueeze(-1) >> shifts) & ((1 << bits) - 1))
+    values = values.reshape(*weight.shape[:-1], weight.shape[-1] * values_per_word)
+    return (
+        values.float() * scales.float().repeat_interleave(group_size, dim=-1)
+        + biases.float().repeat_interleave(group_size, dim=-1)
+    )
+
+
+def mlx_state_dict(model_path: Path, config) -> dict[str, object]:
+    """Build the truncated Transformers state dict from the checkpoint's exact bytes."""
+    from safetensors import safe_open
+    from transformers import AutoModelForCausalLM
+    import torch
+
+    with torch.device("meta"):
+        model = AutoModelForCausalLM.from_config(config, attn_implementation="eager")
+    targets = model.state_dict()
+    index = json.loads((model_path / "model.safetensors.index.json").read_text())[
+        "weight_map"
+    ]
+    sources: dict[str, list[tuple[str, int | None]]] = {}
+    for target in targets:
+        match = EXPERT_WEIGHT.match(target)
+        if match:
+            prefix, expert, projection = match.groups()
+            source = f"{prefix}.switch_mlp.{projection}.weight"
+            sources.setdefault(source, []).append((target, int(expert)))
+        else:
+            sources.setdefault(target, []).append((target, None))
+
+    state: dict[str, object] = {}
+    by_shard: dict[str, list[str]] = {}
+    for source in sources:
+        by_shard.setdefault(index[source], []).append(source)
+    quantization = config.quantization_config
+    for shard_name, names in sorted(by_shard.items()):
+        with safe_open(model_path / shard_name, framework="pt", device="cpu") as shard:
+            for source in names:
+                weight = shard.get_tensor(source)
+                scale_name = source.removesuffix("weight") + "scales"
+                if scale_name in index:
+                    base = source.removesuffix(".weight")
+                    override = quantization.get(base, {})
+                    bits = override.get("bits", quantization["bits"])
+                    group_size = override.get("group_size", quantization["group_size"])
+                    weight = dequantize_affine(
+                        weight,
+                        shard.get_tensor(f"{base}.scales"),
+                        shard.get_tensor(f"{base}.biases"),
+                        bits,
+                        group_size,
+                    )
+                else:
+                    weight = weight.float()
+                for target, expert in sources[source]:
+                    state[target] = weight if expert is None else weight[expert].contiguous()
+    return state
+
 
 def main() -> None:
     """Parse command-line arguments and generate fixtures."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True, type=Path)
     parser.add_argument("--out", required=True, type=Path)
+    parser.add_argument(
+        "--same-bytes",
+        action="store_true",
+        help="dequantize an MLX affine checkpoint before running Transformers",
+    )
     args = parser.parse_args()
     started = time.monotonic()
     generate(
@@ -36,7 +112,13 @@ def main() -> None:
         args.out.resolve(),
         PROMPTS,
         TENSOR_DESCRIPTIONS,
-        settings=GenerationSettings(num_hidden_layers=4),
+        settings=GenerationSettings(
+            num_hidden_layers=4,
+            reference_weights=(
+                "mlx-affine-dequantized" if args.same_bytes else "native-float"
+            ),
+        ),
+        state_dict_loader=mlx_state_dict if args.same_bytes else None,
     )
     print(f"completed in {time.monotonic() - started:.1f} seconds")
 
