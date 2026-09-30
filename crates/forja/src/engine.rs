@@ -90,7 +90,7 @@ mod tests {
     #[test]
     fn builds_the_existing_host_limits_from_config() {
         let expected = forja_host::Limits::new(
-            8 * 1024 * 1024 * 1024,
+            48 * 1024 * 1024 * 1024,
             4,
             1_000_000_000,
             20_000,

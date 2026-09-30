@@ -456,7 +456,7 @@ pub struct Limits {
 impl Default for Limits {
     fn default() -> Self {
         Self {
-            live_bytes: ByteSize::new(8 * 1024 * 1024 * 1024),
+            live_bytes: ByteSize::new(48 * 1024 * 1024 * 1024),
             tensor_rank: 4,
             tensor_elements: 1_000_000_000,
             live_tensor_handles: 20_000,
@@ -484,7 +484,7 @@ mod tests {
     #[test]
     fn limit_defaults_match_the_cli_host_limits() {
         let limits = Limits::default();
-        assert_eq!(limits.live_bytes.get(), 8 * 1024 * 1024 * 1024);
+        assert_eq!(limits.live_bytes.get(), 48 * 1024 * 1024 * 1024);
         assert_eq!(limits.tensor_rank, 4);
         assert_eq!(limits.tensor_elements, 1_000_000_000);
         assert_eq!(limits.live_tensor_handles, 20_000);
