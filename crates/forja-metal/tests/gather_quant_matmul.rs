@@ -18,6 +18,14 @@ fn small_row_gathered_quantized_matmul_matches_cpu_with_duplicates() {
     let cpu = CpuBackend::new();
     let metal = MetalBackend::new().unwrap();
     assert_case(&cpu, &metal, 7, 3, 5, 64, 33);
+    assert_case(&cpu, &metal, 33, 3, 5, 64, 33);
+}
+
+#[test]
+fn grouped_qwen_projection_shape_matches_cpu() {
+    let cpu = CpuBackend::new();
+    let metal = MetalBackend::new().unwrap();
+    assert_case(&cpu, &metal, 16, 8, 128, 1024, 128);
 }
 
 #[test]
@@ -53,21 +61,64 @@ fn fused_gathered_gate_and_up_matches_cpu() {
 }
 
 #[test]
-fn gpu_written_out_of_range_expert_is_reported() {
+fn grouped_fused_gate_and_up_matches_cpu() {
+    let cpu = CpuBackend::new();
     let metal = MetalBackend::new().unwrap();
-    let input = metal.alloc(DType::F32, &[1, 64]).unwrap();
+    let rows = 16;
+    let routes = 8;
+    let experts = 128;
+    let inner = 1024;
+    let columns = 128;
+    let selected = (0..rows * routes)
+        .map(|route| route % experts)
+        .flat_map(u32::to_le_bytes)
+        .collect::<Vec<_>>();
+    let inputs = [
+        TensorSpec::contiguous(DType::BF16, &[rows, inner]),
+        TensorSpec::contiguous(DType::U32, &[experts, columns, inner / 8]),
+        TensorSpec::contiguous(DType::F16, &[experts, columns, inner / 64]),
+        TensorSpec::contiguous(DType::F16, &[experts, columns, inner / 64]),
+        TensorSpec::contiguous(DType::U32, &[experts, columns, inner / 8]),
+        TensorSpec::contiguous(DType::F16, &[experts, columns, inner / 64]),
+        TensorSpec::contiguous(DType::F16, &[experts, columns, inner / 64]),
+        TensorSpec::initialized(DType::U32, &[rows, routes], selected),
+    ];
+    let output = TensorSpec::contiguous(DType::BF16, &[rows, routes, columns]);
+    assert_backends_agree(
+        &cpu,
+        &metal,
+        Op::GatherQuantSiluMul {
+            bits: 4,
+            group_size: 64,
+        },
+        &inputs,
+        &output,
+    )
+    .unwrap();
+}
+
+#[test]
+fn grouped_matmul_zeros_gpu_written_out_of_range_routes() {
+    let metal = MetalBackend::new().unwrap();
+    let input = metal.alloc(DType::F32, &[33, 64]).unwrap();
     let packed = metal.alloc(DType::U32, &[3, 2, 8]).unwrap();
     let scales = metal.alloc(DType::F16, &[3, 2, 1]).unwrap();
     let biases = metal.alloc(DType::F16, &[3, 2, 1]).unwrap();
-    let source = metal.alloc(DType::U32, &[1, 2]).unwrap();
+    let source = metal.alloc(DType::U32, &[33, 2]).unwrap();
+    let mut selected = vec![0_u32; 66];
+    selected[..2].copy_from_slice(&[99, 7]);
     metal
         .write(
             &source,
-            &[99_u32.to_le_bytes(), 7_u32.to_le_bytes()].concat(),
+            &selected
+                .into_iter()
+                .flat_map(u32::to_le_bytes)
+                .collect::<Vec<_>>(),
         )
         .unwrap();
-    let indices = metal.alloc(DType::U32, &[1, 2]).unwrap();
-    let output = metal.alloc(DType::F32, &[1, 2, 2]).unwrap();
+    let indices = metal.alloc(DType::U32, &[33, 2]).unwrap();
+    let output = metal.alloc(DType::F32, &[33, 2, 2]).unwrap();
+    metal.write(&output, &[0xa5; 33 * 2 * 2 * 4]).unwrap();
     let mut commands = CommandList::new();
     commands.dispatch(Op::Copy, &[&source], &indices).unwrap();
     commands
@@ -82,6 +133,53 @@ fn gpu_written_out_of_range_expert_is_reported() {
         .unwrap();
     let error = metal.submit(commands).unwrap().wait();
     assert_eq!(error, Err(BackendError::IndexOutOfRange { index: 7 }));
+    assert_zero_output_after_error(&metal, &output, 33 * 2 * 2 * 4);
+}
+
+#[test]
+fn grouped_silu_zeros_gpu_written_out_of_range_routes() {
+    let metal = MetalBackend::new().unwrap();
+    let input = metal.alloc(DType::F32, &[33, 64]).unwrap();
+    let packed = metal.alloc(DType::U32, &[3, 2, 8]).unwrap();
+    let scales = metal.alloc(DType::F16, &[3, 2, 1]).unwrap();
+    let biases = metal.alloc(DType::F16, &[3, 2, 1]).unwrap();
+    let source = metal.alloc(DType::U32, &[33, 2]).unwrap();
+    let mut selected = vec![0_u32; 66];
+    selected[..2].copy_from_slice(&[99, 7]);
+    metal
+        .write(
+            &source,
+            &selected
+                .into_iter()
+                .flat_map(u32::to_le_bytes)
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+    let indices = metal.alloc(DType::U32, &[33, 2]).unwrap();
+    let output = metal.alloc(DType::F32, &[33, 2, 2]).unwrap();
+    metal.write(&output, &[0xa5; 33 * 2 * 2 * 4]).unwrap();
+    let mut commands = CommandList::new();
+    commands.dispatch(Op::Copy, &[&source], &indices).unwrap();
+    commands
+        .dispatch(
+            Op::GatherQuantSiluMul {
+                bits: 4,
+                group_size: 64,
+            },
+            &[
+                &input, &packed, &scales, &biases, &packed, &scales, &biases, &indices,
+            ],
+            &output,
+        )
+        .unwrap();
+    let error = metal.submit(commands).unwrap().wait();
+    assert_eq!(error, Err(BackendError::IndexOutOfRange { index: 7 }));
+    assert_zero_output_after_error(&metal, &output, 33 * 2 * 2 * 4);
+}
+
+fn assert_zero_output_after_error(metal: &MetalBackend, output: &forja_core::Tensor, len: usize) {
+    let _completion_error = metal.read(output);
+    assert_eq!(metal.read(output).unwrap(), vec![0; len]);
 }
 
 fn assert_case(

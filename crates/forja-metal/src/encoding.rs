@@ -226,7 +226,8 @@ fn gather_quant_params(
         .shape()
         .try_into()
         .map_err(|_| BackendError::InvalidInput)?;
-    let mut params = Vec::with_capacity(208);
+    let grouped = GroupedRouteShape::new(rows, routes, experts)?;
+    let mut params = Vec::with_capacity(212);
     for value in [
         input.layout.offset(),
         packed.layout.offset(),
@@ -254,10 +255,60 @@ fn gather_quant_params(
         packed_width,
         u32::from(bits),
         group_size,
+        grouped.block_capacity,
     ] {
         params.extend_from_slice(&value.to_ne_bytes());
     }
     Ok((params, [rows, routes, columns]))
+}
+
+fn grouped_routes(rows: u32, routes: u32) -> bool {
+    u64::from(rows) * u64::from(routes) >= 64
+}
+
+#[derive(Clone, Copy)]
+struct GroupedRouteShape {
+    route_count: u32,
+    block_capacity: u32,
+    block_elements: u32,
+}
+
+impl GroupedRouteShape {
+    fn new(rows: u32, routes: u32, experts: u32) -> Result<Self, BackendError> {
+        let route_count = u64::from(rows)
+            .checked_mul(u64::from(routes))
+            .ok_or(BackendError::InvalidInput)?;
+        let block_capacity = route_count
+            .div_ceil(32)
+            .checked_add(u64::from(experts))
+            .ok_or(BackendError::InvalidInput)?;
+        let block_elements = block_capacity
+            .checked_mul(4)
+            .ok_or(BackendError::InvalidInput)?;
+        Ok(Self {
+            route_count: u32::try_from(route_count).map_err(|_| BackendError::InvalidInput)?,
+            block_capacity: u32::try_from(block_capacity)
+                .map_err(|_| BackendError::InvalidInput)?,
+            block_elements: u32::try_from(block_elements)
+                .map_err(|_| BackendError::InvalidInput)?,
+        })
+    }
+}
+
+fn grouped_gather_dispatch(dispatch: &Dispatch) -> bool {
+    let Some(indices) = dispatch.inputs().last() else {
+        return false;
+    };
+    let [rows, routes] = indices.layout().shape() else {
+        return false;
+    };
+    grouped_routes(*rows, *routes)
+}
+
+fn grouped_error_flag(arguments: &mut ArgumentWriter) -> Result<BufferBinding, BackendError> {
+    let mut state = [0_u8; 8];
+    state[4..].copy_from_slice(&u32::MAX.to_ne_bytes());
+    arguments.write(&state)
 }
 
 #[derive(Clone, Copy)]
@@ -2569,6 +2620,18 @@ impl MetalBackend {
             [&input, &packed, &scales, &biases, &indices, &output],
             (bits, group_size),
         )?;
+        if grouped_routes(rows, routes) {
+            return self.encode_grouped_quant_matmul(
+                encoder,
+                table,
+                [&input, &packed, &scales, &biases, &indices, &output],
+                &params,
+                [rows, routes, columns],
+                (bits, group_size),
+                bindings,
+                arguments,
+            );
+        }
         let params = arguments.write(&params)?;
         let mut error_state = [0_u8; 8];
         error_state[4..].copy_from_slice(&u32::MAX.to_ne_bytes());
@@ -2617,7 +2680,7 @@ impl MetalBackend {
         Ok((vec![params, error_flag.clone()], error_flag))
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     fn encode_gather_quant_silu_mul(
         &self,
         encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
@@ -2668,6 +2731,28 @@ impl MetalBackend {
             ],
             config,
         )?;
+        if grouped_routes(rows, routes) {
+            return self.encode_grouped_quant_silu_mul(
+                encoder,
+                table,
+                [
+                    &input,
+                    &gate_packed,
+                    &gate_scales,
+                    &gate_biases,
+                    &up_packed,
+                    &up_scales,
+                    &up_biases,
+                    &indices,
+                    &output,
+                ],
+                &[gate_params, up_params],
+                [rows, routes, columns],
+                config,
+                bindings,
+                arguments,
+            );
+        }
         let gate_params = arguments.write(&gate_params)?;
         let up_params = arguments.write(&up_params)?;
         let mut error_state = [0_u8; 8];
@@ -2726,6 +2811,299 @@ impl MetalBackend {
             },
         );
         Ok((vec![gate_params, up_params, error_flag.clone()], error_flag))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn encode_grouped_quant_matmul(
+        &self,
+        encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
+        table: &ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>,
+        tensors: [&EncoderTensor; 6],
+        params: &[u8],
+        shape: [u32; 3],
+        config: (u8, u32),
+        bindings: &mut ArgumentBindings,
+        arguments: &mut ArgumentWriter,
+    ) -> Result<EncodedEmbed, BackendError> {
+        let [input, packed, scales, biases, indices, output] = tensors;
+        let params = arguments.write(params)?;
+        let error_flag = grouped_error_flag(arguments)?;
+        let experts = packed.layout.shape()[0];
+        let grouped = GroupedRouteShape::new(shape[0], shape[1], experts)?;
+        let sorted = self.scratch_tensor(DType::U32, &[grouped.route_count])?;
+        let offsets = self.scratch_tensor(
+            DType::U32,
+            &[experts.checked_add(1).ok_or(BackendError::InvalidInput)?],
+        )?;
+        let blocks = self.scratch_tensor(DType::U32, &[grouped.block_elements])?;
+        self.encode_expert_buckets(
+            encoder,
+            table,
+            indices,
+            &sorted,
+            &offsets,
+            &blocks,
+            output,
+            &params,
+            &error_flag,
+            bindings,
+        )?;
+        encode_dispatch_barrier(encoder);
+        self.encode_grouped_quantized_gemm(
+            encoder,
+            table,
+            [input, packed, scales, biases, &sorted, &blocks, output],
+            &params,
+            shape,
+            config,
+            bindings,
+        )?;
+        Ok((
+            vec![
+                params,
+                error_flag.clone(),
+                sorted.buffer,
+                offsets.buffer,
+                blocks.buffer,
+            ],
+            error_flag,
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    fn encode_grouped_quant_silu_mul(
+        &self,
+        encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
+        table: &ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>,
+        tensors: [&EncoderTensor; 9],
+        params: &[Vec<u8>; 2],
+        shape: [u32; 3],
+        config: (u8, u32),
+        bindings: &mut ArgumentBindings,
+        arguments: &mut ArgumentWriter,
+    ) -> Result<EncodedEmbed, BackendError> {
+        let [
+            input,
+            gate_packed,
+            gate_scales,
+            gate_biases,
+            up_packed,
+            up_scales,
+            up_biases,
+            indices,
+            output,
+        ] = tensors;
+        let experts = gate_packed.layout.shape()[0];
+        let grouped = GroupedRouteShape::new(shape[0], shape[1], experts)?;
+        let gate = self.scratch_tensor(DType::F32, &shape)?;
+        let up = self.scratch_tensor(DType::F32, &shape)?;
+        let sorted = self.scratch_tensor(DType::U32, &[grouped.route_count])?;
+        let offsets = self.scratch_tensor(
+            DType::U32,
+            &[experts.checked_add(1).ok_or(BackendError::InvalidInput)?],
+        )?;
+        let blocks = self.scratch_tensor(DType::U32, &[grouped.block_elements])?;
+        let (gate_qmm_params, _) = gather_quant_params(
+            [input, gate_packed, gate_scales, gate_biases, indices, &gate],
+            config,
+        )?;
+        let (up_qmm_params, _) = gather_quant_params(
+            [input, up_packed, up_scales, up_biases, indices, &up],
+            config,
+        )?;
+        let final_params = arguments.write(&params[0])?;
+        let gate_qmm_params = arguments.write(&gate_qmm_params)?;
+        let up_qmm_params = arguments.write(&up_qmm_params)?;
+        let error_flag = grouped_error_flag(arguments)?;
+        self.encode_expert_buckets(
+            encoder,
+            table,
+            indices,
+            &sorted,
+            &offsets,
+            &blocks,
+            output,
+            &final_params,
+            &error_flag,
+            bindings,
+        )?;
+        encode_dispatch_barrier(encoder);
+        self.encode_grouped_quantized_gemm(
+            encoder,
+            table,
+            [
+                input,
+                gate_packed,
+                gate_scales,
+                gate_biases,
+                &sorted,
+                &blocks,
+                &gate,
+            ],
+            &gate_qmm_params,
+            shape,
+            config,
+            bindings,
+        )?;
+        self.encode_grouped_quantized_gemm(
+            encoder,
+            table,
+            [
+                input, up_packed, up_scales, up_biases, &sorted, &blocks, &up,
+            ],
+            &up_qmm_params,
+            shape,
+            config,
+            bindings,
+        )?;
+        encode_dispatch_barrier(encoder);
+        let pipeline = self
+            .pipelines
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?
+            .get(
+                "gathered_silu_from_projections",
+                &[(2, dtype_code(output.layout.dtype()))],
+            )?;
+        set_pipeline(encoder, &pipeline);
+        for (index, tensor) in [&gate, &up, indices, output].into_iter().enumerate() {
+            bindings.bind(table, index, &tensor.buffer);
+        }
+        bindings.bind(table, 4, &final_params);
+        set_argument_table(encoder, table);
+        let elements = grouped
+            .route_count
+            .checked_mul(shape[2])
+            .ok_or(BackendError::InvalidInput)?;
+        dispatch_threadgroups(
+            encoder,
+            MTLSize {
+                width: usize::try_from(elements.div_ceil(256))
+                    .map_err(|_| BackendError::InvalidInput)?,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: 256,
+                height: 1,
+                depth: 1,
+            },
+        );
+        Ok((
+            vec![
+                final_params,
+                gate_qmm_params,
+                up_qmm_params,
+                error_flag.clone(),
+                sorted.buffer,
+                offsets.buffer,
+                blocks.buffer,
+                gate.buffer,
+                up.buffer,
+            ],
+            error_flag,
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn encode_expert_buckets(
+        &self,
+        encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
+        table: &ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>,
+        indices: &EncoderTensor,
+        sorted: &EncoderTensor,
+        offsets: &EncoderTensor,
+        blocks: &EncoderTensor,
+        output: &EncoderTensor,
+        params: &BufferBinding,
+        error_flag: &BufferBinding,
+        bindings: &mut ArgumentBindings,
+    ) -> Result<(), BackendError> {
+        let pipeline = self
+            .pipelines
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?
+            .get(
+                "bucket_expert_routes",
+                &[(2, dtype_code(output.layout.dtype()))],
+            )?;
+        set_pipeline(encoder, &pipeline);
+        bindings.bind(table, 0, &indices.buffer);
+        bindings.bind(table, 1, &sorted.buffer);
+        bindings.bind(table, 2, &offsets.buffer);
+        bindings.bind(table, 3, &blocks.buffer);
+        bindings.bind(table, 4, &output.buffer);
+        bindings.bind(table, 5, params);
+        bindings.bind(table, 6, error_flag);
+        set_argument_table(encoder, table);
+        dispatch_threadgroups(
+            encoder,
+            MTLSize {
+                width: 1,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: 1,
+                height: 1,
+                depth: 1,
+            },
+        );
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn encode_grouped_quantized_gemm(
+        &self,
+        encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
+        table: &ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>,
+        tensors: [&EncoderTensor; 7],
+        params: &BufferBinding,
+        shape: [u32; 3],
+        config: (u8, u32),
+        bindings: &mut ArgumentBindings,
+    ) -> Result<(), BackendError> {
+        let [input, packed, scales, biases, sorted, blocks, output] = tensors;
+        let pipeline = self
+            .pipelines
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?
+            .get(
+                "grouped_quantized_gemm",
+                &[
+                    (0, dtype_code(input.layout.dtype())),
+                    (1, dtype_code(scales.layout.dtype())),
+                    (2, dtype_code(output.layout.dtype())),
+                    (12, u32::from(config.0)),
+                    (13, config.1),
+                ],
+            )?;
+        set_pipeline(encoder, &pipeline);
+        for (index, tensor) in [input, packed, scales, biases, sorted, blocks, output]
+            .into_iter()
+            .enumerate()
+        {
+            bindings.bind(table, index, &tensor.buffer);
+        }
+        bindings.bind(table, 7, params);
+        set_argument_table(encoder, table);
+        let grouped = GroupedRouteShape::new(shape[0], shape[1], packed.layout.shape()[0])?;
+        dispatch_threadgroups(
+            encoder,
+            MTLSize {
+                width: usize::try_from(shape[2].div_ceil(32))
+                    .map_err(|_| BackendError::InvalidInput)?,
+                height: usize::try_from(grouped.block_capacity)
+                    .map_err(|_| BackendError::InvalidInput)?,
+                depth: 1,
+            },
+            MTLSize {
+                width: 128,
+                height: 1,
+                depth: 1,
+            },
+        );
+        Ok(())
     }
 
     fn encode_sdpa_dispatch(
@@ -4780,12 +5158,15 @@ impl MetalBackend {
             }
             Op::QuantMatmul { .. } => arguments.write(144)?,
             Op::GatherQuantMatmul { .. } => {
-                arguments.write(208)?;
+                arguments.write(212)?;
                 arguments.write(8)?;
             }
             Op::GatherQuantSiluMul { .. } => {
-                arguments.write(208)?;
-                arguments.write(208)?;
+                arguments.write(212)?;
+                arguments.write(212)?;
+                if grouped_gather_dispatch(dispatch) {
+                    arguments.write(212)?;
+                }
                 arguments.write(8)?;
             }
             Op::Sdpa { .. } => self.size_sdpa_arguments(dispatch, arguments)?,
@@ -5256,8 +5637,20 @@ fn dispatch_kernel(dispatch: &Dispatch) -> Result<&'static str, BackendError> {
         Op::Matmul => matmul_kernel(dispatch)?,
         Op::GatherMatmul => "gather_gemv",
         Op::QuantMatmul { .. } => quant_matmul_kernel(dispatch)?,
-        Op::GatherQuantMatmul { .. } => "gather_quantized_gemv",
-        Op::GatherQuantSiluMul { .. } => "gather_quantized_silu_mul",
+        Op::GatherQuantMatmul { .. } => {
+            if grouped_gather_dispatch(dispatch) {
+                "grouped_quantized_gemm"
+            } else {
+                "gather_quantized_gemv"
+            }
+        }
+        Op::GatherQuantSiluMul { .. } => {
+            if grouped_gather_dispatch(dispatch) {
+                "grouped_quantized_silu_mul"
+            } else {
+                "gather_quantized_silu_mul"
+            }
+        }
         Op::Sdpa { .. } => sdpa_kernel(dispatch)?,
     })
 }

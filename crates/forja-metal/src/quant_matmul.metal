@@ -255,6 +255,7 @@ struct GatherQuantMatmulParams {
     uint packed_width;
     uint bits;
     uint group_size;
+    uint block_capacity;
 };
 
 void gather_quantized_sums(
@@ -483,6 +484,239 @@ kernel void gather_quantized_silu_mul(
             }
         }
     }
+}
+
+template <typename T, uint block_inner, uint block_columns>
+void load_quantized_weight_tile(
+    device const uchar *packed,
+    device const uchar *scales,
+    device const uchar *biases,
+    ulong packed_base,
+    ulong scale_base,
+    ulong bias_base,
+    ulong packed_row_stride,
+    ulong packed_word_stride,
+    ulong scale_row_stride,
+    ulong scale_group_stride,
+    ulong bias_row_stride,
+    ulong bias_group_stride,
+    uint inner_origin,
+    uint column_origin,
+    uint inner_extent,
+    uint column_extent,
+    threadgroup T *tile,
+    uint thread_index,
+    uint thread_count);
+
+kernel void bucket_expert_routes(
+    device const uint *indices [[buffer(0)]],
+    device uint *sorted_routes [[buffer(1)]],
+    device uint *offsets [[buffer(2)]],
+    device uint3 *blocks [[buffer(3)]],
+    device uchar *output [[buffer(4)]],
+    constant GatherQuantMatmulParams &params [[buffer(5)]],
+    device atomic_uint *error_flag [[buffer(6)]],
+    uint thread_index [[thread_position_in_grid]]) {
+    if (thread_index != 0) {
+        return;
+    }
+    uint route_count = params.rows * params.routes;
+    uint first_invalid = 0xffffffffu;
+    for (uint expert = 0; expert <= params.experts; ++expert) {
+        offsets[expert] = 0;
+    }
+    for (uint route = 0; route < route_count; ++route) {
+        uint row = route / params.routes;
+        uint slot = route % params.routes;
+        uint selected = indices[
+            params.indices_offset + ulong(row) * params.indices_row_stride +
+            ulong(slot) * params.indices_slot_stride];
+        if (selected < params.experts) {
+            ++offsets[selected + 1];
+        } else {
+            first_invalid = min(first_invalid, selected);
+            for (uint column = 0; column < params.columns; ++column) {
+                store_float(
+                    output,
+                    params.output_offset + ulong(row) * params.output_row_stride +
+                        ulong(slot) * params.output_slot_stride +
+                        ulong(column) * params.output_column_stride,
+                    output_dtype,
+                    0.0f);
+            }
+        }
+    }
+    for (uint expert = 0; expert < params.experts; ++expert) {
+        offsets[expert + 1] += offsets[expert];
+    }
+    uint invalid_offset = offsets[params.experts];
+    for (uint route = 0; route < route_count; ++route) {
+        uint row = route / params.routes;
+        uint slot = route % params.routes;
+        uint selected = indices[
+            params.indices_offset + ulong(row) * params.indices_row_stride +
+            ulong(slot) * params.indices_slot_stride];
+        if (selected < params.experts) {
+            sorted_routes[offsets[selected]++] = route;
+        } else {
+            sorted_routes[invalid_offset++] = route;
+        }
+    }
+    for (uint block = 0; block < params.block_capacity; ++block) {
+        blocks[block] = uint3(0xffffffffu, 0, 0);
+    }
+    uint block = 0;
+    uint start = 0;
+    for (uint expert = 0; expert < params.experts; ++expert) {
+        uint end = offsets[expert];
+        while (start < end) {
+            uint count = min(32u, end - start);
+            blocks[block++] = uint3(expert, start, count);
+            start += count;
+        }
+    }
+    if (first_invalid != 0xffffffffu) {
+        atomic_store_explicit(error_flag, 1, memory_order_relaxed);
+        atomic_fetch_min_explicit(error_flag + 1, first_invalid, memory_order_relaxed);
+    }
+}
+
+kernel void grouped_quantized_gemm(
+    device const uchar *input [[buffer(0)]],
+    device const uchar *packed [[buffer(1)]],
+    device const uchar *scales [[buffer(2)]],
+    device const uchar *biases [[buffer(3)]],
+    device const uint *sorted_routes [[buffer(4)]],
+    device const uint3 *blocks [[buffer(5)]],
+    device uchar *output [[buffer(6)]],
+    constant GatherQuantMatmulParams &params [[buffer(7)]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint3 threadgroup_size [[threads_per_threadgroup]],
+    ushort simdgroup [[simdgroup_index_in_threadgroup]],
+    ushort lane [[thread_index_in_simdgroup]],
+    uint3 tile [[threadgroup_position_in_grid]]) {
+    constexpr uint block_rows = 32;
+    constexpr uint block_columns = 32;
+    constexpr uint block_inner = 32;
+    constexpr uint simdgroups_rows = 2;
+    constexpr uint simdgroups_columns = 2;
+    threadgroup float input_tile[block_rows * block_inner];
+    threadgroup float weight_tile[block_inner * block_columns];
+    uint3 block = blocks[tile.y];
+    if (block.x == 0xffffffffu) {
+        return;
+    }
+    uint expert = block.x;
+    uint sorted_origin = block.y;
+    uint column_origin = tile.x * block_columns;
+    uint row_count = block.z;
+    uint thread_count = threadgroup_size.x * threadgroup_size.y * threadgroup_size.z;
+    BlockMMA<
+        float, block_rows, block_columns, block_inner,
+        simdgroups_rows, simdgroups_columns> mma(simdgroup, lane);
+    for (uint inner_origin = 0; inner_origin < params.inner; inner_origin += block_inner) {
+            for (uint linear = thread_index;
+                 linear < block_rows * block_inner;
+                 linear += thread_count) {
+                uint local_row = linear / block_inner;
+                uint inner = inner_origin + linear % block_inner;
+                float value = 0.0f;
+                if (local_row < row_count && inner < params.inner) {
+                    uint route = sorted_routes[sorted_origin + local_row];
+                    uint input_row = route / params.routes;
+                    value = load_float(
+                        input,
+                        params.input_offset + ulong(input_row) * params.input_row_stride +
+                            ulong(inner) * params.input_inner_stride,
+                        input0_dtype);
+                }
+                input_tile[linear] = value;
+            }
+            load_quantized_weight_tile<float, block_inner, block_columns>(
+                packed, scales, biases,
+                params.packed_offset + ulong(expert) * params.packed_expert_stride,
+                params.scale_offset + ulong(expert) * params.scale_expert_stride,
+                params.bias_offset + ulong(expert) * params.bias_expert_stride,
+                params.packed_row_stride, params.packed_word_stride,
+                params.scale_row_stride, params.scale_group_stride,
+                params.bias_row_stride, params.bias_group_stride,
+                inner_origin, column_origin, params.inner, params.columns,
+                weight_tile, thread_index, thread_count);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            mma.multiply(input_tile, weight_tile);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for (uint row_fragment = 0;
+         row_fragment < block_rows / (8 * simdgroups_rows);
+         ++row_fragment) {
+            uint local_row = uint(mma.simdgroup_row) * 8 + uint(mma.fragment_row) +
+                row_fragment * 8 * simdgroups_rows;
+            if (local_row < row_count) {
+                uint route = sorted_routes[sorted_origin + local_row];
+                uint output_row = route / params.routes;
+                uint output_slot = route % params.routes;
+                for (uint column_fragment = 0;
+                     column_fragment < block_columns / (8 * simdgroups_columns);
+                     ++column_fragment) {
+                    uint column = column_origin + uint(mma.simdgroup_column) * 8 +
+                        uint(mma.fragment_column) +
+                        column_fragment * 8 * simdgroups_columns;
+                    uint fragment_index =
+                        row_fragment * (block_columns / (8 * simdgroups_columns)) +
+                        column_fragment;
+                    for (uint element = 0; element < 2; ++element) {
+                        if (column + element < params.columns) {
+                            ulong output_index = params.output_offset +
+                                ulong(output_row) * params.output_row_stride +
+                                ulong(output_slot) * params.output_slot_stride +
+                                ulong(column + element) * params.output_column_stride;
+                            store_float(
+                                output, output_index, output_dtype,
+                                float(mma.accumulators[fragment_index * 2 + element]));
+                        }
+                    }
+                }
+            }
+    }
+}
+
+kernel void gathered_silu_from_projections(
+    device const float *gate [[buffer(0)]],
+    device const float *up [[buffer(1)]],
+    device const uint *indices [[buffer(2)]],
+    device uchar *output [[buffer(3)]],
+    constant GatherQuantMatmulParams &params [[buffer(4)]],
+    uint index [[thread_position_in_grid]]) {
+    uint element_count = params.rows * params.routes * params.columns;
+    if (index >= element_count) {
+        return;
+    }
+    uint column = index % params.columns;
+    uint route = index / params.columns;
+    uint row = route / params.routes;
+    uint slot = route % params.routes;
+    uint expert = indices[
+        params.indices_offset + ulong(row) * params.indices_row_stride +
+        ulong(slot) * params.indices_slot_stride];
+    if (expert >= params.experts) {
+        store_float(
+            output,
+            params.output_offset + ulong(row) * params.output_row_stride +
+                ulong(slot) * params.output_slot_stride +
+                ulong(column) * params.output_column_stride,
+            output_dtype,
+            0.0f);
+        return;
+    }
+    float gate_value = gate[index];
+    float result = gate_value / (1.0f + exp(-gate_value)) * up[index];
+    store_float(
+        output,
+        params.output_offset + ulong(row) * params.output_row_stride +
+            ulong(slot) * params.output_slot_stride +
+            ulong(column) * params.output_column_stride,
+        output_dtype,
+        result);
 }
 
 kernel void quantized_gemm_small_m(
