@@ -53,6 +53,8 @@ def manifest_base(
     prompts: Sequence[Prompt],
     tensor_descriptions: dict[str, str],
     settings: GenerationSettings | None = None,
+    *,
+    model_file: str = "model.safetensors",
 ) -> dict[str, object]:
     """Build the invariant portion of a fixture manifest."""
     settings = settings or GenerationSettings()
@@ -60,7 +62,7 @@ def manifest_base(
         "schema_version": 1,
         "model": {
             "directory": model_path.name,
-            "file": "model.safetensors",
+            "file": model_file,
             "sha256": model_hash,
         },
         "libraries": versions(),
@@ -125,6 +127,41 @@ def validate_model_directory(model_path: Path) -> None:
     ]
     if unknown:
         raise ValueError(f"model config names custom architectures: {unknown}")
+
+
+def model_weight_file(model_path: Path) -> Path:
+    """Return the single weight file or validate and return a shard index."""
+    single = model_path / "model.safetensors"
+    if single.is_file():
+        return single
+
+    index_path = model_path / "model.safetensors.index.json"
+    index = json.loads(index_path.read_text())
+    weight_map = index.get("weight_map")
+    if not isinstance(weight_map, dict) or not weight_map:
+        raise ValueError(f"invalid safetensors shard index: {index_path}")
+
+    from safetensors import safe_open
+
+    shards: dict[str, set[str]] = {}
+    for tensor, file_name in weight_map.items():
+        if (
+            not isinstance(tensor, str)
+            or not isinstance(file_name, str)
+            or Path(file_name).name != file_name
+            or not file_name.endswith(".safetensors")
+        ):
+            raise ValueError(f"invalid safetensors shard index: {index_path}")
+        shards.setdefault(file_name, set()).add(tensor)
+    for file_name, expected_tensors in sorted(shards.items()):
+        shard = model_path / file_name
+        if not shard.is_file():
+            raise FileNotFoundError(f"model shard does not exist: {shard}")
+        with safe_open(shard, framework="pt", device="cpu") as source:
+            actual_tensors = set(source.keys())
+        if actual_tensors != expected_tensors:
+            raise ValueError(f"model shard does not match index: {shard}")
+    return index_path
 
 
 def set_determinism(settings: GenerationSettings) -> None:
@@ -199,12 +236,15 @@ def generate(
     from safetensors.torch import save_file
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    model_file = model_path / "model.safetensors"
-    if not model_file.is_file():
-        raise FileNotFoundError(f"model file does not exist: {model_file}")
+    model_file = model_weight_file(model_path)
     model_hash = sha256(model_file)
     manifest = manifest_base(
-        model_path, model_hash, prompts, tensor_descriptions, settings
+        model_path,
+        model_hash,
+        prompts,
+        tensor_descriptions,
+        settings,
+        model_file=model_file.name,
     )
     if fixtures_are_current(output, manifest):
         print(f"fixtures are current: {output}")

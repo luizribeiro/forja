@@ -132,3 +132,37 @@ def test_model_directory_rejects_custom_architecture(
 
     with pytest.raises(ValueError, match="custom architectures"):
         fixture_library.validate_model_directory(tmp_path)
+
+
+def test_model_weight_file_validates_shards(monkeypatch, tmp_path: Path) -> None:
+    class FakeSafetensors:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        @staticmethod
+        def keys():
+            return ["weight"]
+
+    shard = tmp_path / "model-00001-of-00001.safetensors"
+    shard.write_bytes(b"fixture")
+    index = {
+        "metadata": {"total_size": 4},
+        "weight_map": {"weight": shard.name},
+    }
+    index_path = tmp_path / "model.safetensors.index.json"
+    index_path.write_text(json.dumps(index))
+    monkeypatch.setitem(
+        sys.modules,
+        "safetensors",
+        SimpleNamespace(safe_open=lambda *args, **kwargs: FakeSafetensors()),
+    )
+
+    assert fixture_library.model_weight_file(tmp_path) == index_path
+
+    index["weight_map"]["missing"] = shard.name
+    index_path.write_text(json.dumps(index))
+    with pytest.raises(ValueError, match="does not match index"):
+        fixture_library.model_weight_file(tmp_path)
