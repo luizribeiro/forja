@@ -3,7 +3,7 @@ use std::{collections::BTreeMap, error::Error, fs, time::Duration};
 use forja_core::{Backend, CommandList, DType, DispatchProfile, Op, ProfileTensor, Submission};
 
 use crate::{
-    args::Profile,
+    args::{Profile, ProfileMode},
     benchmark::{TokenProfile, measure_token_profile},
     machine_load,
 };
@@ -218,15 +218,16 @@ fn print_markdown(
         .fold(Duration::ZERO, |sum, dispatch| sum + dispatch.gap_before);
     println!("# forja profile\n");
     println!("- Device: {}", measurement.device);
-    println!("- Context: {}", options.context);
+    println!("- Mode: {}", mode_name(options.mode));
+    println!("- Tokens: {}", options.context);
     println!("- Measured copy peak: {peak:.1} GB/s");
     println!(
-        "- Unprofiled token: {:.3} ms wall, {:.3} ms GPU",
+        "- Unprofiled step: {:.3} ms wall, {:.3} ms GPU",
         milliseconds(measurement.baseline_wall),
         milliseconds(measurement.baseline_gpu)
     );
     println!(
-        "- Profiled token: {:.3} ms wall, {:.3} ms GPU ({:.2}x timestamp perturbation)",
+        "- Profiled step: {:.3} ms wall, {:.3} ms GPU ({:.2}x timestamp perturbation)",
         milliseconds(measurement.step.wall_time),
         milliseconds(submission.gpu_time),
         submission.gpu_time.as_secs_f64() / measurement.baseline_gpu.as_secs_f64()
@@ -332,7 +333,8 @@ fn report(
             },
         },
         "device": measurement.device,
-        "context": options.context,
+        "mode": mode_name(options.mode),
+        "tokens": options.context,
         "measured_copy_peak_gigabytes_per_second": peak,
         "unprofiled": {
             "wall_time_seconds": measurement.baseline_wall.as_secs_f64(),
@@ -370,6 +372,13 @@ fn totals_json(totals: BTreeMap<&str, Total>, gpu_time: Duration) -> serde_json:
 
 fn milliseconds(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1e3
+}
+
+const fn mode_name(mode: ProfileMode) -> &'static str {
+    match mode {
+        ProfileMode::Decode => "decode",
+        ProfileMode::Prefill => "prefill",
+    }
 }
 
 #[cfg(test)]

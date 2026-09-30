@@ -17,7 +17,7 @@ use forja_host::{
 use golden_fixtures::{decode_f32_le, sha256_file};
 
 use crate::{
-    args::{Bench, BenchPoint, Profile},
+    args::{Bench, BenchPoint, Profile, ProfileMode},
     benchmark_record::{self, Input, PerfKey, Recorded},
     benchmark_stats::{Stats, stats, synthetic_tokens},
     engine::{argmax, limits, read_token, weights_path},
@@ -103,14 +103,23 @@ pub(crate) async fn measure_token_profile(
     )
     .await?;
     let info = runner.describe().await?;
-    if options.context >= usize::try_from(info.max_context)? {
-        return Err("profile context exceeds the engine context".into());
+    let max_context = usize::try_from(info.max_context)?;
+    let exceeds_context = match options.mode {
+        ProfileMode::Decode => options.context >= max_context,
+        ProfileMode::Prefill => options.context > max_context,
+    };
+    if exceeds_context {
+        return Err("profile shape exceeds the engine context".into());
     }
     runner
         .load()
         .await?
         .map_err(|error| format!("engine load failed: {error:?}"))?;
-    let tokens = synthetic_tokens(options.context - 1, info.vocab);
+    let token_count = match options.mode {
+        ProfileMode::Decode => options.context - 1,
+        ProfileMode::Prefill => options.context,
+    };
+    let tokens = synthetic_tokens(token_count, info.vocab);
     let decode = DecodeOptions {
         host_argmax: false,
         overlap: false,
@@ -122,14 +131,11 @@ pub(crate) async fn measure_token_profile(
         },
     };
     for _ in 0..options.warmups {
-        let token = prepare_profile_context(&mut runner, &tokens, options.context, decode).await?;
-        measure_decode_step(&mut runner, token, options.context, decode).await?;
+        measure_profile_phase(&mut runner, &tokens, options, decode).await?;
     }
-    let token = prepare_profile_context(&mut runner, &tokens, options.context, decode).await?;
-    let baseline = measure_decode_step(&mut runner, token, options.context, decode).await?;
-    let token = prepare_profile_context(&mut runner, &tokens, options.context, decode).await?;
+    let baseline = measure_profile_phase(&mut runner, &tokens, options, decode).await?;
     runner.set_profiling(true);
-    let measured = measure_decode_step(&mut runner, token, options.context, decode).await;
+    let measured = measure_profile_phase(&mut runner, &tokens, options, decode).await;
     runner.set_profiling(false);
     let _ = measured?;
     Ok(TokenProfile {
@@ -140,6 +146,22 @@ pub(crate) async fn measure_token_profile(
             .take_profile()
             .ok_or("profiled step produced no timing detail")?,
     })
+}
+
+#[cfg(target_os = "macos")]
+async fn measure_profile_phase(
+    runner: &mut EngineRunner<forja_metal::MetalBackend>,
+    tokens: &[u32],
+    options: &Profile,
+    decode: DecodeOptions,
+) -> Result<Sample, Box<dyn Error>> {
+    match options.mode {
+        ProfileMode::Prefill => measure_prefill(runner, tokens).await,
+        ProfileMode::Decode => {
+            let token = prepare_profile_context(runner, tokens, options.context, decode).await?;
+            measure_decode_step(runner, token, options.context, decode).await
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]

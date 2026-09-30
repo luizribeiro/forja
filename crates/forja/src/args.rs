@@ -20,6 +20,12 @@ pub(crate) enum Precision {
     Bf16,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub(crate) enum ProfileMode {
+    Decode,
+    Prefill,
+}
+
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct Verify {
     pub(crate) engine: PathBuf,
@@ -147,6 +153,7 @@ pub(crate) struct Profile {
     pub(crate) engine: PathBuf,
     pub(crate) model_dir: PathBuf,
     pub(crate) context: usize,
+    pub(crate) mode: ProfileMode,
     pub(crate) warmups: usize,
     pub(crate) sampling: BenchSampling,
     pub(crate) json: bool,
@@ -163,9 +170,12 @@ struct ProfileArgs {
     /// Directory containing model weights.
     #[arg(long)]
     model_dir: PathBuf,
-    /// Decode context length to profile.
+    /// Context length or prefill token count to profile.
     #[arg(long, value_parser = parse_profile_context)]
     context: u32,
+    /// Inference phase to profile.
+    #[arg(long, value_enum, default_value_t = ProfileMode::Decode)]
+    mode: ProfileMode,
     /// Write JSON under the configured scratch directory instead of Markdown.
     #[arg(long)]
     json: bool,
@@ -292,7 +302,7 @@ enum ParsedCommand {
     Bench(BenchArgs),
     /// Inspect configuration.
     Config(ConfigArgs),
-    /// Profile one decode token.
+    /// Profile one inference phase.
     Profile(ProfileArgs),
     /// Generate a completion.
     Run(RunArgs),
@@ -890,6 +900,7 @@ impl ProfileArgs {
             context: usize::try_from(self.context).map_err(|error| {
                 Cli::command().error(clap::error::ErrorKind::ValueValidation, error.to_string())
             })?,
+            mode: self.mode,
             warmups: usize::try_from(config.bench.warmups).map_err(|error| {
                 Cli::command().error(clap::error::ErrorKind::ValueValidation, error.to_string())
             })?,
@@ -1060,9 +1071,33 @@ mod tests {
         };
         assert_eq!(options.engine, PathBuf::from("/engine.wasm"));
         assert_eq!(options.context, 512);
+        assert_eq!(options.mode, ProfileMode::Decode);
         assert_eq!(options.warmups, 7);
         assert!(options.json);
         assert_eq!(options.scratch, PathBuf::from("target/forja-bench"));
+    }
+
+    #[test]
+    fn parses_prefill_profile_mode() {
+        let command = parse(
+            [
+                "profile",
+                "--engine",
+                "/engine.wasm",
+                "--model-dir",
+                "/model",
+                "--context",
+                "512",
+                "--mode",
+                "prefill",
+            ]
+            .map(str::to_owned),
+        )
+        .unwrap();
+        let Command::Profile(options) = command else {
+            panic!("expected profile command");
+        };
+        assert_eq!(options.mode, ProfileMode::Prefill);
     }
 
     #[test]
