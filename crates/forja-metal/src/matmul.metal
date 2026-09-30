@@ -47,6 +47,7 @@ void steel_gemm(
     ulong b_row_stride = params.b_column_major ? 1 : params.ldb;
     ulong b_column_stride = params.b_column_major ? params.ldb : 1;
     BlockMMA<
+        float,
         block_rows,
         block_columns,
         block_inner,

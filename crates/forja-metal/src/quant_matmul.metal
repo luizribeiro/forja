@@ -558,3 +558,110 @@ kernel void quantized_gemm_small_m(
         }
     }
 }
+
+template <typename T, uint block_inner, uint block_columns>
+void load_quantized_weight_tile(
+    device const uchar *packed,
+    device const uchar *scales,
+    device const uchar *biases,
+    ulong packed_base,
+    ulong scale_base,
+    ulong bias_base,
+    ulong packed_row_stride,
+    ulong packed_word_stride,
+    ulong scale_row_stride,
+    ulong scale_group_stride,
+    ulong bias_row_stride,
+    ulong bias_group_stride,
+    uint inner_origin,
+    uint column_origin,
+    uint inner_extent,
+    uint column_extent,
+    threadgroup T *tile,
+    uint thread_index,
+    uint thread_count) {
+    uint values_per_word = 32 / quant_bits;
+    uint words_per_column = block_inner / values_per_word;
+    uint mask = (1u << quant_bits) - 1u;
+    for (uint linear = thread_index;
+         linear < block_columns * words_per_column;
+         linear += thread_count) {
+        uint local_column = linear / words_per_column;
+        uint local_word = linear % words_per_column;
+        uint column = column_origin + local_column;
+        uint inner = inner_origin + local_word * values_per_word;
+        uint word = 0;
+        float scale = 0.0f;
+        float bias = 0.0f;
+        if (inner < inner_extent && column < column_extent) {
+            word = load_uint(
+                packed,
+                packed_base + ulong(column) * packed_row_stride +
+                    ulong(inner / values_per_word) * packed_word_stride);
+            uint group = inner / quant_group_size;
+            scale = load_float(
+                scales,
+                scale_base + ulong(column) * scale_row_stride +
+                    ulong(group) * scale_group_stride,
+                input1_dtype);
+            bias = load_float(
+                biases,
+                bias_base + ulong(column) * bias_row_stride +
+                    ulong(group) * bias_group_stride,
+                input1_dtype);
+        }
+        for (uint element = 0; element < values_per_word; ++element) {
+            uint local_inner = local_word * values_per_word + element;
+            float value = inner + element < inner_extent
+                ? scale * float((word >> (element * quant_bits)) & mask) + bias
+                : 0.0f;
+            tile[local_inner * block_columns + local_column] = T(value);
+        }
+    }
+}
+
+kernel void quantized_gemm_tiled(
+    device const uchar *input [[buffer(0)]],
+    device const uchar *packed [[buffer(1)]],
+    device const uchar *scales [[buffer(2)]],
+    device const uchar *biases [[buffer(3)]],
+    device uchar *output [[buffer(4)]],
+    constant QuantMatmulParams &params [[buffer(5)]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint3 threadgroup_size [[threads_per_threadgroup]],
+    ushort simdgroup [[simdgroup_index_in_threadgroup]],
+    ushort lane [[thread_index_in_simdgroup]],
+    uint3 tile [[threadgroup_position_in_grid]]) {
+    constexpr uint block_rows = 32;
+    constexpr uint block_columns = 32;
+    constexpr uint block_inner = 32;
+    threadgroup float input_tile[block_rows * block_inner];
+    threadgroup float weight_tile[block_inner * block_columns];
+    BlockMMA<float, block_rows, block_columns, block_inner, 2, 2> mma(simdgroup, lane);
+    uint row_origin = tile.y * block_rows;
+    uint column_origin = tile.x * block_columns;
+    uint thread_count = threadgroup_size.x * threadgroup_size.y * threadgroup_size.z;
+    for (uint inner_origin = 0; inner_origin < params.inner; inner_origin += block_inner) {
+        BlockLoader<block_rows, block_inner>::load(
+            input, params.input_offset,
+            params.input_row_stride, params.input_inner_stride, input0_dtype,
+            row_origin, inner_origin, params.rows, params.inner,
+            row_origin + block_rows <= params.rows,
+            inner_origin + block_inner <= params.inner,
+            input_tile, thread_index, thread_count);
+        load_quantized_weight_tile<float, block_inner, block_columns>(
+            packed, scales, biases,
+            params.packed_offset, params.scale_offset, params.bias_offset,
+            params.packed_row_stride, params.packed_word_stride,
+            params.scale_row_stride, params.scale_group_stride,
+            params.bias_row_stride, params.bias_group_stride,
+            inner_origin, column_origin, params.inner, params.columns,
+            weight_tile, thread_index, thread_count);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        mma.multiply(input_tile, weight_tile);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    mma.store(
+        output, params.output_offset, params.output_row_stride,
+        row_origin, column_origin, params.rows, params.columns, output_dtype);
+}

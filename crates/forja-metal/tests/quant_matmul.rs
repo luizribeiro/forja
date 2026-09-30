@@ -32,6 +32,13 @@ fn small_row_quantized_matmul_matches_cpu_at_odd_sizes() {
 }
 
 #[test]
+fn tiled_qwen_projection_shape_matches_cpu() {
+    let reference = CpuBackend::new();
+    let candidate = MetalBackend::new().unwrap();
+    assert_projection_case(&reference, &candidate, 16, 1024, 3072);
+}
+
+#[test]
 fn quantized_matmul_matches_cpu_for_strided_views() {
     let reference = CpuBackend::new();
     let candidate = MetalBackend::new().unwrap();
@@ -107,6 +114,32 @@ fn assert_case(
         TensorSpec::contiguous(DType::U32, &[columns, packed_width]),
         TensorSpec::contiguous(parameter_dtype, &[columns, groups]),
         TensorSpec::contiguous(parameter_dtype, &[columns, groups]),
+    ];
+    let output = TensorSpec::contiguous(DType::BF16, &[rows, columns]);
+    assert_backends_agree(
+        reference,
+        candidate,
+        Op::QuantMatmul { bits, group_size },
+        &inputs,
+        &output,
+    )
+    .unwrap();
+}
+
+fn assert_projection_case(
+    reference: &CpuBackend,
+    candidate: &MetalBackend,
+    rows: u32,
+    inner: u32,
+    columns: u32,
+) {
+    let bits = 4;
+    let group_size = 64;
+    let inputs = [
+        TensorSpec::contiguous(DType::BF16, &[rows, inner]),
+        TensorSpec::contiguous(DType::U32, &[columns, inner / 8]),
+        TensorSpec::contiguous(DType::BF16, &[columns, inner / group_size]),
+        TensorSpec::contiguous(DType::BF16, &[columns, inner / group_size]),
     ];
     let output = TensorSpec::contiguous(DType::BF16, &[rows, columns]);
     assert_backends_agree(

@@ -132,7 +132,7 @@ void steel_tile_multiply(
     }
 }
 
-template <int block_rows, int block_columns, int block_inner,
+template <typename T, int block_rows, int block_columns, int block_inner,
           int simdgroups_rows, int simdgroups_columns>
 struct BlockMMA {
     static constant constexpr int fragment_size = 8;
@@ -162,11 +162,11 @@ struct BlockMMA {
     }
 
     void multiply(
-        threadgroup const float *a,
-        threadgroup const float *b) thread {
+        threadgroup const T *a,
+        threadgroup const T *b) thread {
         for (int inner = 0; inner < block_inner; inner += fragment_size) {
             for (int row_fragment = 0; row_fragment < row_fragments; ++row_fragment) {
-                simdgroup_matrix<float, 8, 8> a_matrix;
+                simdgroup_matrix<T, 8, 8> a_matrix;
                 uint a_row = simdgroup_row * fragment_size + fragment_row +
                     row_fragment * fragment_size * simdgroups_rows;
                 for (int element = 0; element < 2; ++element) {
@@ -176,7 +176,7 @@ struct BlockMMA {
                 for (int column_fragment = 0;
                      column_fragment < column_fragments;
                      ++column_fragment) {
-                    simdgroup_matrix<float, 8, 8> b_matrix;
+                    simdgroup_matrix<T, 8, 8> b_matrix;
                     simdgroup_matrix<float, 8, 8> accumulator;
                     simdgroup_matrix<float, 8, 8> result;
                     uint b_column = simdgroup_column * fragment_size + fragment_column +
@@ -223,7 +223,8 @@ struct BlockMMA {
                         ulong index = base + ulong(row_origin + row) * leading_dimension +
                             ulong(column_origin + column + element);
                         store_float(
-                            output, index, dtype, accumulators[fragment_index * 2 + element]);
+                            output, index, dtype,
+                            float(accumulators[fragment_index * 2 + element]));
                     }
                 }
             }

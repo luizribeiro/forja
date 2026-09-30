@@ -2498,7 +2498,7 @@ impl MetalBackend {
             params.extend_from_slice(&value.to_ne_bytes());
         }
         let params = arguments.write(&params)?;
-        let kernel = quant_matmul_kernel_name(rows);
+        let kernel = quant_matmul_kernel(dispatch)?;
         let pipeline = self
             .pipelines
             .lock()
@@ -2522,7 +2522,11 @@ impl MetalBackend {
         }
         bindings.bind(table, 5, &params);
         set_argument_table(encoder, table);
-        let (column_tile, row_tile, threads) = if rows == 1 { (16, 1, 64) } else { (8, 8, 256) };
+        let (column_tile, row_tile, threads) = match kernel {
+            "quantized_gemv" => (16, 1, 64),
+            "quantized_gemm_tiled" => (32, 32, 128),
+            _ => (8, 8, 256),
+        };
         dispatch_threadgroups(
             encoder,
             MTLSize {
@@ -5251,20 +5255,29 @@ fn dispatch_kernel(dispatch: &Dispatch) -> Result<&'static str, BackendError> {
         Op::QuantEmbed { .. } => "quant-embed",
         Op::Matmul => matmul_kernel(dispatch)?,
         Op::GatherMatmul => "gather_gemv",
-        Op::QuantMatmul { .. } => {
-            quant_matmul_kernel_name(dispatch.inputs()[0].layout().shape()[0])
-        }
+        Op::QuantMatmul { .. } => quant_matmul_kernel(dispatch)?,
         Op::GatherQuantMatmul { .. } => "gather_quantized_gemv",
         Op::GatherQuantSiluMul { .. } => "gather_quantized_silu_mul",
         Op::Sdpa { .. } => sdpa_kernel(dispatch)?,
     })
 }
 
-const fn quant_matmul_kernel_name(rows: u32) -> &'static str {
+fn quant_matmul_kernel(dispatch: &Dispatch) -> Result<&'static str, BackendError> {
+    let [input, packed, scales, biases] = dispatch.inputs() else {
+        return Err(BackendError::InvalidInput);
+    };
+    let rows = input.layout().shape()[0];
     if rows == 1 {
-        "quantized_gemv"
+        return Ok("quantized_gemv");
+    }
+    if rows >= 16
+        && [input, packed, scales, biases, dispatch.output()]
+            .iter()
+            .all(|tensor| tensor.layout().is_contiguous())
+    {
+        Ok("quantized_gemm_tiled")
     } else {
-        "quantized_gemm_small_m"
+        Ok("quantized_gemm_small_m")
     }
 }
 
