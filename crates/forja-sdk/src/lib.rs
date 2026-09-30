@@ -48,7 +48,7 @@
 //!         EngineInfo { vocab: VOCAB, max_context: 4096, tap_layers: vec![], router_layers: vec![] }
 //!     }
 //!
-//!     fn load(weights: &Weights<'_>) -> Result<Self> {
+//!     fn load(weights: &Weights<'_>, _config: forja_sdk::EngineLoadConfig) -> Result<Self> {
 //!         <Self as Load<Config>>::load(weights, &Config)
 //!     }
 //!
@@ -112,7 +112,8 @@ use std::{error, fmt};
 
 pub use element::{Element, FloatElement};
 pub use engine::{
-    DecodeInput, DecodeOutput, Engine, EngineInfo, SamplingParams, StepInput, StepOutput,
+    DecodeInput, DecodeOutput, Engine, EngineInfo, EngineLoadConfig, SamplingParams, StepInput,
+    StepOutput,
 };
 pub use forja_sdk_macros::{Load, export_engine, kernel};
 pub use graph::{Dim, Graph, Param, Pos, capture, eval};

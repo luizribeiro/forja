@@ -5,7 +5,9 @@ wit_bindgen::generate!({
     world: "engine-component",
 });
 
-use exports::l9o::gpu::engine::{DecodeIn, DecodeOut, EngineInfo, Guest, StepIn, StepOut};
+use exports::l9o::gpu::engine::{
+    DecodeIn, DecodeOut, EngineInfo, Guest, LoadConfig, StepIn, StepOut,
+};
 use l9o::gpu::compute::{Dtype, Error, Tensor, Weights};
 
 struct Component;
@@ -20,7 +22,7 @@ impl Guest for Component {
         }
     }
 
-    async fn load(_weights: &Weights) -> Result<(), Error> {
+    async fn load(_weights: &Weights, _config: LoadConfig) -> Result<(), Error> {
         Ok(())
     }
 

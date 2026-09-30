@@ -356,6 +356,7 @@ pub struct EngineRunner<B: Backend + Send + Sync + 'static> {
     instance: engine_bindings::EngineComponent,
     id: u64,
     info: Option<EngineInfo>,
+    loaded_num_hidden_layers: Option<u32>,
     output_handles: Vec<u32>,
     discarded_speculation: bool,
     profiling: bool,
@@ -369,6 +370,15 @@ const EPOCH_TICK: Duration = Duration::from_millis(10);
 static EPOCH_ENGINES: Mutex<Vec<EpochEngine>> = Mutex::new(Vec::new());
 static EPOCH_TICKER: OnceLock<()> = OnceLock::new();
 static NEXT_RUNNER_ID: AtomicU64 = AtomicU64::new(1);
+
+fn expected_layer_outputs(layers: &[u32], loaded: Option<u32>, requested: bool) -> usize {
+    if !requested {
+        return 0;
+    }
+    loaded.map_or(layers.len(), |loaded| {
+        layers.iter().filter(|&&layer| layer <= loaded).count()
+    })
+}
 
 struct EpochEngine {
     engine: Engine,
@@ -454,6 +464,7 @@ where
             instance,
             id,
             info: None,
+            loaded_num_hidden_layers: None,
             output_handles: Vec::new(),
             discarded_speculation: false,
             profiling: false,
@@ -489,6 +500,18 @@ where
     ///
     /// Returns a host, component, or engine loading error.
     pub async fn load(&mut self) -> wasmtime::Result<Result<(), compute::Error>> {
+        self.load_with_config(None).await
+    }
+
+    /// Opens the configured weight grant and asks the engine to load a layer prefix.
+    ///
+    /// # Errors
+    ///
+    /// Returns a host, component, or engine loading error.
+    pub async fn load_with_config(
+        &mut self,
+        num_hidden_layers: Option<u32>,
+    ) -> wasmtime::Result<Result<(), compute::Error>> {
         self.set_guest_deadline();
         let weights = self
             .store
@@ -496,15 +519,29 @@ where
             .open_weights("engine")
             .map_err(wasmtime::Error::msg)?;
         let engine = self.instance.l9o_gpu_engine();
-        match self
+        let result = match self
             .store
-            .run_concurrent(async move |accessor| engine.call_load(accessor, weights).await)
+            .run_concurrent(async move |accessor| {
+                engine
+                    .call_load(
+                        accessor,
+                        weights,
+                        engine_bindings::exports::l9o::gpu::engine::LoadConfig {
+                            num_hidden_layers,
+                        },
+                    )
+                    .await
+            })
             .await
         {
             Ok(result) => result,
             Err(error) if is_epoch_timeout(&error) => Ok(Err(guest_timeout())),
             Err(error) => Err(error),
+        };
+        if matches!(result, Ok(Ok(()))) {
+            self.loaded_num_hidden_layers = num_hidden_layers;
         }
+        result
     }
 
     /// Runs one engine invocation and retains its device tensors.
@@ -851,11 +888,11 @@ where
         router_logits: &[Resource<TensorEntry>],
     ) -> Result<(), compute::Error> {
         self.validate_logits(info, logits)?;
-        let expected_taps = if taps_requested {
-            info.tap_layers.len()
-        } else {
-            0
-        };
+        let expected_taps = expected_layer_outputs(
+            &info.tap_layers,
+            self.loaded_num_hidden_layers,
+            taps_requested,
+        );
         if taps.len() != expected_taps {
             return Err(compute::Error::Layout(format!(
                 "engine returned {} taps, expected {expected_taps}",
@@ -874,11 +911,11 @@ where
                 )));
             }
         }
-        let expected_routers = if taps_requested {
-            info.router_layers.len()
-        } else {
-            0
-        };
+        let expected_routers = expected_layer_outputs(
+            &info.router_layers,
+            self.loaded_num_hidden_layers,
+            taps_requested,
+        );
         if router_logits.len() != expected_routers {
             return Err(compute::Error::Layout(format!(
                 "engine returned {} router taps, expected {expected_routers}",
@@ -3646,11 +3683,19 @@ mod tests {
     use super::{
         BackendEvent, BackendTimer, EngineMetrics, EngineStepProfile, Grants, Host, ImportKind,
         ImportTimer, Limits, MAX_INSTRUCTIONS, MAX_OUTPUTS, bindings::l9o::gpu::compute, core_op,
-        core_program,
+        core_program, expected_layer_outputs,
     };
 
     const GENEROUS: Limits = Limits::new(u64::MAX, 8, u64::MAX, 32, u64::MAX);
     static NEXT_WEIGHT_FILE: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn loaded_layer_count_limits_expected_taps() {
+        let layers = [1, 2, 4, 8];
+        assert_eq!(expected_layer_outputs(&layers, Some(4), true), 3);
+        assert_eq!(expected_layer_outputs(&layers, None, true), 4);
+        assert_eq!(expected_layer_outputs(&layers, Some(4), false), 0);
+    }
 
     fn doubling_program(value: f32) -> compute::ProgramSource {
         compute::ProgramSource {

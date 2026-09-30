@@ -644,7 +644,7 @@ fn prompt_case(
         .map(|&token| u32::try_from(token))
         .collect::<Result<Vec<_>, _>>()?;
     let weights = Weights::open(root.join("Qwen3-0.6B/model.safetensors"))?;
-    let engine = Qwen3::load(&weights)?;
+    let engine = Qwen3::load(&weights, forja_sdk::EngineLoadConfig::default())?;
     let length = u32::try_from(tokens.len())?;
     Ok((fixture, engine, Tensor::from_slice(&tokens, &[length])?))
 }

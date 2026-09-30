@@ -64,7 +64,8 @@ fn native_outputs(
 ) -> wasmtime::Result<(Vec<f32>, Vec<Vec<f32>>)> {
     set_native_device(device);
     let weights = Weights::open(path).map_err(wasmtime::Error::msg)?;
-    let mut engine = ToyEngine::load(&weights).map_err(wasmtime::Error::msg)?;
+    let mut engine = ToyEngine::load(&weights, forja_sdk::EngineLoadConfig::default())
+        .map_err(wasmtime::Error::msg)?;
     let output = engine
         .step(StepInput {
             tokens: Tensor::from_slice(&TOKENS, &[3]).map_err(wasmtime::Error::msg)?,

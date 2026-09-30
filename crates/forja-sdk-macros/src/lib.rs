@@ -89,7 +89,8 @@ fn expand_engine(item: &ItemImpl) -> syn::Result<proc_macro2::TokenStream> {
             }
 
             use bindings::exports::l9o::gpu::engine::{
-                DecodeIn, DecodeOut, EngineInfo as WitEngineInfo, Guest, StepIn, StepOut,
+                DecodeIn, DecodeOut, EngineInfo as WitEngineInfo, Guest, LoadConfig, StepIn,
+                StepOut,
             };
             use ::forja_sdk::__private::compute;
 
@@ -125,9 +126,15 @@ fn engine_guest_impl() -> proc_macro2::TokenStream {
 
             async fn load(
                 weights: &compute::Weights,
+                config: LoadConfig,
             ) -> ::std::result::Result<(), compute::Error> {
                 let weights = ::forja_sdk::Weights::from_guest(weights);
-                let engine = <ExportedEngine as ::forja_sdk::Engine>::load(&weights)
+                let engine = <ExportedEngine as ::forja_sdk::Engine>::load(
+                    &weights,
+                    ::forja_sdk::EngineLoadConfig {
+                        num_hidden_layers: config.num_hidden_layers,
+                    },
+                )
                     .map_err(wit_error)?;
                 ENGINE.with(|slot| {
                     let mut slot = slot.try_borrow_mut().map_err(|_| {

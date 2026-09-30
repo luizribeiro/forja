@@ -13,6 +13,13 @@ pub struct EngineInfo {
     pub router_layers: Vec<u32>,
 }
 
+/// Optional model dimensions selected when an engine loads.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct EngineLoadConfig {
+    /// Number of leading decoder layers to load, or all layers when absent.
+    pub num_hidden_layers: Option<u32>,
+}
+
 /// Input to one unbatched engine invocation.
 pub struct StepInput {
     /// Token ids for this invocation.
@@ -85,7 +92,7 @@ pub trait Engine: Sized + 'static {
     /// # Errors
     ///
     /// Returns an error when required weights are missing or incompatible.
-    fn load(weights: &Weights<'_>) -> Result<Self>;
+    fn load(weights: &Weights<'_>, config: EngineLoadConfig) -> Result<Self>;
 
     /// Runs one unbatched model invocation.
     ///

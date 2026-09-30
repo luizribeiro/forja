@@ -10,6 +10,10 @@ interface engine {
     router-layers: list<u32>,
   }
 
+  record load-config {
+    num-hidden-layers: option<u32>,
+  }
+
   record step-in {
     tokens: list<u32>,
     start-pos: u32,
@@ -41,7 +45,7 @@ interface engine {
   }
 
   describe: func() -> engine-info;
-  load: async func(w: borrow<weights>) -> result<_, error>;
+  load: async func(w: borrow<weights>, config: load-config) -> result<_, error>;
   step: async func(input: step-in) -> result<step-out, error>;
   decode: async func(input: decode-in) -> result<decode-out, error>;
 }

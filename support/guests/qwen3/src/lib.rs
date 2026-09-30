@@ -570,7 +570,7 @@ impl Engine for ExportedQwen3 {
         }
     }
 
-    fn load(weights: &Weights<'_>) -> Result<Self> {
+    fn load(weights: &Weights<'_>, _config: forja_sdk::EngineLoadConfig) -> Result<Self> {
         Self::load_from_weights(weights)
     }
 

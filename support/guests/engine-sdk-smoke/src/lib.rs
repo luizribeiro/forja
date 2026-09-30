@@ -1,7 +1,8 @@
 //! Minimal engine component exported through the SDK macro.
 
 use forja_sdk::{
-    Engine, EngineInfo, Result, StepInput, StepOutput, Tensor, Weights, export_engine,
+    Engine, EngineInfo, EngineLoadConfig, Result, StepInput, StepOutput, Tensor, Weights,
+    export_engine,
 };
 
 struct ConstantEngine;
@@ -17,7 +18,7 @@ impl Engine for ConstantEngine {
         }
     }
 
-    fn load(_weights: &Weights<'_>) -> Result<Self> {
+    fn load(_weights: &Weights<'_>, _config: EngineLoadConfig) -> Result<Self> {
         Ok(Self)
     }
 

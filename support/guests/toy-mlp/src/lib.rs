@@ -65,7 +65,7 @@ impl Engine for ToyEngine {
         }
     }
 
-    fn load(weights: &Weights<'_>) -> Result<Self> {
+    fn load(weights: &Weights<'_>, _config: forja_sdk::EngineLoadConfig) -> Result<Self> {
         <Self as Load<Config>>::load(weights, &Config)
     }
 
