@@ -1,0 +1,16 @@
+[package]
+name = "olmoe"
+edition.workspace = true
+license = "MIT OR Apache-2.0"
+publish = false
+rust-version.workspace = true
+version.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+no-replay = []
+
+[dependencies]
+forja-sdk = { path = "../../../crates/forja-sdk" }
