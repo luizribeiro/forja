@@ -3116,6 +3116,10 @@ fn core_op(operation: compute::Op) -> (TemplateOp, Option<Op>) {
         }),
         compute::Op::Embed => concrete_template(Op::Embed),
         compute::Op::Matmul => concrete_template(Op::Matmul),
+        compute::Op::QuantMatmul(config) => concrete_template(Op::QuantMatmul {
+            bits: config.bits,
+            group_size: config.group_size,
+        }),
         compute::Op::Sdpa(config) => {
             let q_start = core_affine(config.q_start);
             let concrete = q_start.is_constant().then_some(Op::Sdpa {

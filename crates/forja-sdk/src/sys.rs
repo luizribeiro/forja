@@ -78,6 +78,10 @@ pub(crate) enum Op {
     Rope(f32),
     Embed,
     Matmul,
+    QuantMatmul {
+        bits: u8,
+        group_size: u32,
+    },
     Sdpa {
         scale: f32,
         causal: bool,
@@ -362,6 +366,9 @@ pub(crate) mod guest {
             Op::Rope(theta) => compute::Op::Rope(compute::RopeCfg { theta }),
             Op::Embed => compute::Op::Embed,
             Op::Matmul => compute::Op::Matmul,
+            Op::QuantMatmul { bits, group_size } => {
+                compute::Op::QuantMatmul(compute::QuantMatmulCfg { bits, group_size })
+            }
             Op::Sdpa {
                 scale,
                 causal,
@@ -865,6 +872,7 @@ pub(crate) mod native {
             Op::Rope(theta) => CoreOp::Rope { theta },
             Op::Embed => CoreOp::Embed,
             Op::Matmul => CoreOp::Matmul,
+            Op::QuantMatmul { bits, group_size } => CoreOp::QuantMatmul { bits, group_size },
             Op::Sdpa {
                 scale,
                 causal,

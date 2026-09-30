@@ -1,7 +1,7 @@
 use std::{marker::PhantomData, ops::Add, rc::Rc};
 
 use crate::{
-    Element, Error, Result, graph,
+    Element, Error, FloatElement, Result, graph,
     program::{Kernel, Program},
     sys,
 };
@@ -408,6 +408,66 @@ impl<T: Element> Tensor<T> {
         let mut shape = self.shape[..batch].to_vec();
         shape.extend([self.shape[batch], right.shape[batch + 1]]);
         self.binary_with_shape(right, sys::Op::Matmul, shape)
+    }
+
+    /// Multiplies by affine-quantized weights stored in MLX packed order.
+    ///
+    /// The input is `[rows, input]`, packed weights are `[output, input * bits / 32]`, and scale
+    /// and bias tensors are `[output, input / group_size]`. The result is `[rows, output]`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for unsupported quantization parameters, incompatible shapes or dtypes,
+    /// or a refused dispatch.
+    pub fn quant_matmul<S: FloatElement>(
+        &self,
+        packed: &Tensor<u32>,
+        scales: &Tensor<S>,
+        biases: &Tensor<S>,
+        bits: u8,
+        group_size: u32,
+    ) -> Result<Self>
+    where
+        T: FloatElement,
+    {
+        if !matches!(bits, 4 | 8) || !matches!(group_size, 32 | 64 | 128) {
+            return Err(Error::new("unsupported affine quantization parameters"));
+        }
+        let [rows, inner]: [u32; 2] = self
+            .shape
+            .as_slice()
+            .try_into()
+            .map_err(|_| Error::new("quantized matmul input must have rank two"))?;
+        let [output, packed_width]: [u32; 2] = packed
+            .shape
+            .as_slice()
+            .try_into()
+            .map_err(|_| Error::new("quantized matmul weights must have rank two"))?;
+        if !inner.is_multiple_of(group_size) {
+            return Err(Error::new(
+                "quantized matmul group size must divide the input width",
+            ));
+        }
+        let expected_packed = inner
+            .checked_mul(u32::from(bits))
+            .and_then(|value| value.checked_div(32))
+            .ok_or_else(|| Error::new("quantized matmul packed width overflowed"))?;
+        if packed_width != expected_packed {
+            return Err(Error::new("quantized matmul packed width is invalid"));
+        }
+        let parameter_shape = [output, inner / group_size];
+        if scales.shape != parameter_shape || biases.shape != parameter_shape {
+            return Err(Error::new(
+                "quantized matmul scale and bias shapes are invalid",
+            ));
+        }
+        let result = Self::empty(vec![rows, output])?;
+        graph::record(
+            sys::Op::QuantMatmul { bits, group_size },
+            &[&self.handle, &packed.handle, &scales.handle, &biases.handle],
+            &result.handle,
+        )?;
+        Ok(result)
     }
 
     /// Applies half-split rotary position embeddings.

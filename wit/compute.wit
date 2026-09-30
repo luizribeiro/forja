@@ -53,6 +53,11 @@ interface compute {
     position: affine,
   }
 
+  record quant-matmul-cfg {
+    bits: u8,
+    group-size: u32,
+  }
+
   enum program-kind {
     %map,
     row,
@@ -137,6 +142,7 @@ interface compute {
     rope(rope-cfg),
     embed,
     matmul,
+    quant-matmul(quant-matmul-cfg),
     sdpa(sdpa-cfg),
   }
 

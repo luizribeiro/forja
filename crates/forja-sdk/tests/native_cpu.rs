@@ -44,3 +44,18 @@ fn sampling_accepts_live_parameters_and_rejects_invalid_values() {
             .unwrap();
     assert!(logits.sample(&invalid, 9).unwrap().to_vec().is_err());
 }
+
+#[test]
+fn affine_quantized_matmul_routes_through_the_sdk() {
+    use forja_sdk::{Tensor, bf16};
+
+    let input = Tensor::from_slice(&[1.0_f32; 64], &[1, 64]).unwrap();
+    let packed = Tensor::from_slice(&[0x1111_1111_u32; 16], &[2, 8]).unwrap();
+    let scales = Tensor::from_slice(&[bf16::from_f32(0.5), bf16::from_f32(0.25)], &[2, 1]).unwrap();
+    let biases = Tensor::from_slice(&[bf16::from_f32(1.0), bf16::from_f32(-1.0)], &[2, 1]).unwrap();
+
+    let output = input
+        .quant_matmul(&packed, &scales, &biases, 4, 64)
+        .unwrap();
+    assert_eq!(output.to_vec().unwrap(), [96.0, -48.0]);
+}
