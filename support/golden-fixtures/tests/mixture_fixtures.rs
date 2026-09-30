@@ -6,6 +6,8 @@ use golden_fixtures::FixtureDirectory;
 
 const OLMOE_GENERATE: &str = "uv run --project support/golden support/golden/olmoe.py";
 const QWEN_GENERATE: &str = "uv run --project support/golden support/golden/qwen3_coder.py";
+const QWEN_QUANTIZED_GENERATE: &str =
+    "uv run --project support/golden support/golden/qwen3_coder.py --same-bytes";
 
 #[test]
 #[ignore = "requires FORJA_MODELS and runs in the pre-push hook"]
@@ -23,6 +25,12 @@ fn mixture_fixtures_are_self_consistent() -> Result<(), Box<dyn Error>> {
         QWEN_GENERATE,
         "Qwen3-Coder-30B-A3B-Instruct",
     )?;
+    let qwen_quantized_path = required_fixture(
+        &root,
+        "golden/Qwen3-Coder-30B-A3B-Instruct-4bit",
+        QWEN_QUANTIZED_GENERATE,
+        "Qwen3-Coder-30B-A3B-Instruct-4bit",
+    )?;
 
     let olmoe = FixtureDirectory::open(olmoe_path)?;
     assert_eq!(olmoe.num_hidden_layers(), None);
@@ -32,6 +40,11 @@ fn mixture_fixtures_are_self_consistent() -> Result<(), Box<dyn Error>> {
     assert_eq!(qwen.num_hidden_layers(), Some(4));
     validate(&qwen, 2, 4, 2_048, 128);
     assert!(qwen.require_complete_model_outputs().is_err());
+
+    let qwen_quantized = FixtureDirectory::open(qwen_quantized_path)?;
+    assert_eq!(qwen_quantized.num_hidden_layers(), None);
+    validate(&qwen_quantized, 2, 48, 2_048, 128);
+    qwen_quantized.require_complete_model_outputs()?;
     Ok(())
 }
 

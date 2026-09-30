@@ -15,7 +15,8 @@ const LIMITS: Limits = Limits::new(
 .with_command_limits(4_096, u64::MAX)
 .with_guest_call_timeout(Duration::from_secs(300))
 .with_gpu_limits(Duration::from_secs(60), Duration::from_secs(3_600));
-const LAYERS: u32 = 4;
+const FULL_LAYERS: u32 = 48;
+const REPLAY_LAYERS: u32 = 4;
 const HIDDEN_TOLERANCE: f64 = 1.0e-5;
 
 #[cfg(target_os = "macos")]
@@ -37,13 +38,13 @@ async fn hidden_states_and_routing_match_same_byte_reference() -> Result<(), Box
     assert_eq!(info.vocab, qwen3_coder::VOCAB);
     assert!(
         info.tap_layers
-            .starts_with(&(1..=LAYERS).collect::<Vec<_>>())
+            .starts_with(&(1..=FULL_LAYERS).collect::<Vec<_>>())
     );
     assert!(
         info.router_layers
-            .starts_with(&(1..=LAYERS).collect::<Vec<_>>())
+            .starts_with(&(1..=FULL_LAYERS).collect::<Vec<_>>())
     );
-    runner.load_with_config(Some(LAYERS)).await??;
+    runner.load_with_config(Some(FULL_LAYERS)).await??;
     let output = runner
         .step(EngineStep {
             tokens,
@@ -105,7 +106,12 @@ async fn hidden_states_and_routing_match_same_byte_reference() -> Result<(), Box
     let float_fixture = float_fixtures
         .prompt("python")
         .ok_or("float-weight python fixture is missing")?;
-    for (index, tap) in output.taps.iter().enumerate() {
+    for (index, tap) in output
+        .taps
+        .iter()
+        .take(usize::try_from(REPLAY_LAYERS - 1)?)
+        .enumerate()
+    {
         let actual = decode_f32_le(&runner.read(tap).await?)?;
         let expected = float_fixture
             .hidden_state(index + 1)
@@ -134,7 +140,7 @@ async fn decode_outputs(
     component: &std::path::Path,
 ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, Box<dyn Error>> {
     let mut runner = runner(component).await?;
-    runner.load_with_config(Some(LAYERS)).await??;
+    runner.load_with_config(Some(REPLAY_LAYERS)).await??;
     let greedy = SamplingParams::default();
     let sampled = SamplingParams {
         temperature: 0.7,

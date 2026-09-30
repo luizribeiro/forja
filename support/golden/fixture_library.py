@@ -36,6 +36,7 @@ class GenerationSettings:
 
 Prompt = tuple[str, str]
 FixtureValidator = Callable[[str, Any, dict[str, Any]], None]
+ModelInitializer = Callable[[Any], None]
 UNSAFE_WEIGHT_SUFFIXES = frozenset({".bin", ".pt", ".pth"})
 
 
@@ -262,6 +263,7 @@ def generate(
     settings: GenerationSettings | None = None,
     validate_fixture: FixtureValidator | None = None,
     state_dict_loader: Callable[[Path, Any], dict[str, Any]] | None = None,
+    model_initializer: ModelInitializer | None = None,
 ) -> None:
     """Generate fixtures for every prompt and write the manifest last."""
     settings = settings or GenerationSettings()
@@ -302,12 +304,15 @@ def generate(
             local_files_only=True,
         )
     else:
-        model = AutoModelForCausalLM.from_config(
-            config,
-            attn_implementation="eager",
-        )
+        with torch.device("meta"):
+            model = AutoModelForCausalLM.from_config(
+                config,
+                attn_implementation="eager",
+            )
         state = state_dict_loader(model_path, config)
         model.load_state_dict(state, strict=True, assign=True)
+        if model_initializer is not None:
+            model_initializer(model)
     model.eval()
     capture_router_logits = getattr(model.config, "num_experts", 0) > 0
     output.mkdir(parents=True, exist_ok=True)
