@@ -328,6 +328,7 @@ impl CpuBackend {
         inputs: &[Tensor],
         outputs: &[Tensor],
         k: u32,
+        normalize: bool,
     ) -> Result<(), BackendError> {
         let values = decode(&self.read(&inputs[0])?, inputs[0].layout().dtype())
             .ok_or(BackendError::ExecutionFailed)?;
@@ -343,6 +344,7 @@ impl CpuBackend {
             Vec::with_capacity(execution_usize(outputs[0].layout().element_count())?);
         let mut selected_indices = Vec::with_capacity(selected_values.capacity());
         for row in values.chunks_exact(width) {
+            let selected_start = selected_values.len();
             let mut indices = (0..width).collect::<Vec<_>>();
             indices.sort_unstable_by(|&left, &right| {
                 row[right]
@@ -353,6 +355,13 @@ impl CpuBackend {
                 selected_values.push(row[index]);
                 selected_indices
                     .push(u32::try_from(index).map_err(|_| BackendError::ExecutionFailed)?);
+            }
+            if normalize {
+                let selected = &mut selected_values[selected_start..];
+                let sum = selected.iter().sum::<f32>();
+                for value in selected {
+                    *value /= sum;
+                }
             }
         }
         self.write_output(&outputs[0], &selected_values)?;
@@ -904,7 +913,9 @@ impl Backend for CpuBackend {
                 }
                 Op::Softmax => self.execute_softmax(dispatch.inputs(), dispatch.output()),
                 Op::Argmax => self.execute_argmax(dispatch.inputs(), dispatch.output()),
-                Op::TopK { k } => self.execute_top_k(dispatch.inputs(), dispatch.outputs(), k),
+                Op::TopK { k, normalize } => {
+                    self.execute_top_k(dispatch.inputs(), dispatch.outputs(), k, normalize)
+                }
                 Op::Sample { position } => {
                     self.execute_sample(dispatch.inputs(), dispatch.output(), position)
                 }
@@ -1630,7 +1641,7 @@ mod tests {
                     .then_with(|| left.cmp(&right))
             });
             let expected_indices = &expected_indices[..usize::try_from(k).unwrap()];
-            let (actual_values, actual_indices) = run_top_k(&backend, &values, width, k);
+            let (actual_values, actual_indices) = run_top_k(&backend, &values, width, k, false);
             assert_eq!(
                 actual_indices,
                 expected_indices
@@ -1649,6 +1660,9 @@ mod tests {
                     .collect::<Vec<_>>()
             );
         }
+        let (values, indices) = run_top_k(&backend, &[1.0, 4.0, 2.0, 3.0], 4, 2, true);
+        assert_relative(&values, &[4.0 / 7.0, 3.0 / 7.0], 1e-6);
+        assert_eq!(indices, [1, 3]);
     }
 
     #[test]
@@ -2237,14 +2251,20 @@ mod tests {
         decode(&backend.read(&output).unwrap(), DType::F32).unwrap()
     }
 
-    fn run_top_k(backend: &CpuBackend, values: &[f32], width: u32, k: u32) -> (Vec<f32>, Vec<u32>) {
+    fn run_top_k(
+        backend: &CpuBackend,
+        values: &[f32],
+        width: u32,
+        k: u32,
+        normalize: bool,
+    ) -> (Vec<f32>, Vec<u32>) {
         let input = f32_tensor(backend, &[1, width], values);
         let output_values = backend.alloc(DType::F32, &[1, k]).unwrap();
         let output_indices = backend.alloc(DType::U32, &[1, k]).unwrap();
         let mut commands = CommandList::new();
         commands
             .dispatch_many(
-                Op::TopK { k },
+                Op::TopK { k, normalize },
                 &[&input],
                 &[&output_values, &output_indices],
             )

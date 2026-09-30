@@ -3222,7 +3222,10 @@ fn core_op(operation: compute::Op) -> (TemplateOp, Option<Op>) {
         compute::Op::RmsNorm(eps) => concrete_template(Op::RmsNorm { eps }),
         compute::Op::Softmax => concrete_template(Op::Softmax),
         compute::Op::Argmax => concrete_template(Op::Argmax),
-        compute::Op::TopK(config) => concrete_template(Op::TopK { k: config.k }),
+        compute::Op::TopK(config) => concrete_template(Op::TopK {
+            k: config.k,
+            normalize: config.normalize,
+        }),
         compute::Op::Sample(config) => {
             let position = core_affine(config.position);
             let concrete = position.is_constant().then_some(Op::Sample {

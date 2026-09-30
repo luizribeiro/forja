@@ -60,6 +60,7 @@ interface compute {
 
   record top-k-cfg {
     k: u32,
+    normalize: bool,
   }
 
   enum program-kind {

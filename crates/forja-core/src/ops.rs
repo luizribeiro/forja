@@ -156,6 +156,8 @@ pub enum Op {
     TopK {
         /// Number of elements selected from each row.
         k: u32,
+        /// Whether selected values are divided by their row sum.
+        normalize: bool,
     },
     /// Samples one index from each row using counter-based randomness.
     ///
@@ -327,7 +329,7 @@ impl Dispatch {
             Op::RmsNorm { eps } => check_rms_norm(inputs, output, eps)?,
             Op::Softmax => check_softmax(inputs, output)?,
             Op::Argmax => check_argmax(inputs, output)?,
-            Op::TopK { k } => check_top_k(inputs, outputs, k)?,
+            Op::TopK { k, .. } => check_top_k(inputs, outputs, k)?,
             Op::Sample { .. } => check_sample(inputs, output)?,
             Op::Rope { theta } => check_rope(inputs, output, theta)?,
             Op::Embed => check_embed(inputs, output)?,
@@ -1701,19 +1703,47 @@ mod tests {
         let indices = tensor(3, DType::U32, &[3, 7], &[7, 1]);
         assert!(
             CommandList::new()
-                .dispatch_many(Op::TopK { k: 7 }, &[&input], &[&values, &indices])
+                .dispatch_many(
+                    Op::TopK {
+                        k: 7,
+                        normalize: false,
+                    },
+                    &[&input],
+                    &[&values, &indices],
+                )
                 .is_ok()
         );
         assert_eq!(
-            CommandList::new().dispatch_many(Op::TopK { k: 0 }, &[&input], &[&values, &indices]),
+            CommandList::new().dispatch_many(
+                Op::TopK {
+                    k: 0,
+                    normalize: false,
+                },
+                &[&input],
+                &[&values, &indices],
+            ),
             Err(OpError::InvalidTopK)
         );
         assert_eq!(
-            CommandList::new().dispatch_many(Op::TopK { k: 8 }, &[&input], &[&values, &indices]),
+            CommandList::new().dispatch_many(
+                Op::TopK {
+                    k: 8,
+                    normalize: false,
+                },
+                &[&input],
+                &[&values, &indices],
+            ),
             Err(OpError::InvalidTopK)
         );
         assert_eq!(
-            CommandList::new().dispatch_many(Op::TopK { k: 7 }, &[&input], &[&values]),
+            CommandList::new().dispatch_many(
+                Op::TopK {
+                    k: 7,
+                    normalize: false,
+                },
+                &[&input],
+                &[&values],
+            ),
             Err(OpError::OutputArity {
                 expected: 2,
                 actual: 1
@@ -1722,7 +1752,10 @@ mod tests {
         let wrong_indices = tensor(4, DType::U32, &[3, 1], &[1, 1]);
         assert_eq!(
             CommandList::new().dispatch_many(
-                Op::TopK { k: 7 },
+                Op::TopK {
+                    k: 7,
+                    normalize: false,
+                },
                 &[&input],
                 &[&values, &wrong_indices]
             ),

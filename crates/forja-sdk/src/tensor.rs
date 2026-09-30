@@ -351,6 +351,14 @@ impl<T: Element> Tensor<T> {
     /// Returns an error when `k` is zero, greater than 64, greater than the row width, or the
     /// dispatch is refused.
     pub fn top_k(&self, k: u32) -> Result<(Self, Tensor<u32>)> {
+        self.top_k_with_normalization(k, false)
+    }
+
+    pub(crate) fn top_k_with_normalization(
+        &self,
+        k: u32,
+        normalize: bool,
+    ) -> Result<(Self, Tensor<u32>)> {
         let mut shape = self.shape.clone();
         let width = shape
             .last_mut()
@@ -364,7 +372,7 @@ impl<T: Element> Tensor<T> {
         let values = Self::empty(shape.clone())?;
         let indices = Tensor::<u32>::empty(shape)?;
         graph::record_many(
-            sys::Op::TopK { k },
+            sys::Op::TopK { k, normalize },
             &[&self.handle],
             &[&values.handle, &indices.handle],
         )?;

@@ -2,19 +2,6 @@
 
 use crate::{Element, Error, FloatElement, Load, Result, Tensor, Weights, bf16};
 
-#[crate::kernel(row)]
-fn normalize_moe_route_weights(weights: crate::kernel::Row) -> crate::kernel::Row {
-    weights / weights.row_sum()
-}
-
-#[crate::kernel(row)]
-fn weighted_moe_sum(
-    experts: crate::kernel::Row,
-    weights: crate::kernel::Row,
-) -> crate::kernel::Row {
-    (experts * weights).row_sum()
-}
-
 /// Applies softmax and deterministic top-k selection to router logits.
 ///
 /// When `normalize` is true, the selected probabilities are renormalized to sum to one per row.
@@ -28,13 +15,7 @@ pub fn moe_router<T: FloatElement>(
     normalize: bool,
 ) -> Result<(Tensor<T>, Tensor<u32>)> {
     let probabilities = logits.softmax_last_dim()?;
-    let (weights, indices) = probabilities.top_k(k)?;
-    let weights = if normalize {
-        normalize_moe_route_weights(&weights)?
-    } else {
-        weights
-    };
-    Ok((weights, indices))
+    probabilities.top_k_with_normalization(k, normalize)
 }
 
 /// Combines routed expert outputs with their per-route weights.
@@ -43,7 +24,7 @@ pub fn moe_router<T: FloatElement>(
 ///
 /// # Errors
 ///
-/// Returns an error for incompatible shapes or a refused view or scalar-program dispatch.
+/// Returns an error for incompatible shapes or a refused view or matrix multiplication.
 pub fn moe_combine<T: FloatElement>(experts: &Tensor<T>, weights: &Tensor<T>) -> Result<Tensor<T>> {
     let [rows, routes, hidden]: [u32; 3] = experts
         .shape()
@@ -52,13 +33,9 @@ pub fn moe_combine<T: FloatElement>(experts: &Tensor<T>, weights: &Tensor<T>) ->
     if weights.shape() != [rows, routes] {
         return Err(Error::new("expert weights do not match routed outputs"));
     }
-    let experts = experts.permute(&[0, 2, 1])?;
-    let weights = weights
-        .reshape(&[rows, 1, routes])?
-        .broadcast_as(&[rows, hidden, routes])?;
-    weighted_moe_sum(&experts, &weights)?
-        .narrow(2, 0, 1)?
-        .contiguous()?
+    experts
+        .permute(&[0, 2, 1])?
+        .matmul(&weights.reshape(&[rows, routes, 1])?)?
         .reshape(&[rows, hidden])
 }
 

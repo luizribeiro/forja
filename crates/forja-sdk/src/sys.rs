@@ -74,6 +74,7 @@ pub(crate) enum Op {
     Argmax,
     TopK {
         k: u32,
+        normalize: bool,
     },
     Sample {
         position: Affine,
@@ -385,7 +386,7 @@ pub(crate) mod guest {
             Op::RmsNorm(eps) => compute::Op::RmsNorm(eps),
             Op::Softmax => compute::Op::Softmax,
             Op::Argmax => compute::Op::Argmax,
-            Op::TopK { k } => compute::Op::TopK(compute::TopKCfg { k }),
+            Op::TopK { k, normalize } => compute::Op::TopK(compute::TopKCfg { k, normalize }),
             Op::Sample { position } => compute::Op::Sample(compute::SampleCfg {
                 position: wit_affine(position),
             }),
@@ -930,7 +931,7 @@ pub(crate) mod native {
             Op::RmsNorm(eps) => CoreOp::RmsNorm { eps },
             Op::Softmax => CoreOp::Softmax,
             Op::Argmax => CoreOp::Argmax,
-            Op::TopK { k } => CoreOp::TopK { k },
+            Op::TopK { k, normalize } => CoreOp::TopK { k, normalize },
             Op::Sample { position } => CoreOp::Sample {
                 position: position.offset,
             },

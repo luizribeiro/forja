@@ -405,6 +405,7 @@ kernel void topk_single(
     constant TensorLayout &indices_layout [[buffer(5)]],
     constant uint &width [[buffer(6)]],
     constant uint &k [[buffer(7)]],
+    constant uint &normalize [[buffer(8)]],
     uint row [[threadgroup_position_in_grid]],
     uint lane [[thread_position_in_threadgroup]],
     uint group_width [[threads_per_threadgroup]],
@@ -414,6 +415,7 @@ kernel void topk_single(
     threadgroup uint partial_indices[32];
     threadgroup ulong group_candidates[64];
     threadgroup ulong selected[64];
+    threadgroup float denominator;
     if (width <= group_width) {
         ulong candidate = 0;
         if (lane < width) {
@@ -472,12 +474,29 @@ kernel void topk_single(
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
     }
+    if (lane == 0) {
+        denominator = 1.0f;
+        if (normalize != 0) {
+            denominator = 0.0f;
+            for (uint slot = 0; slot < k; ++slot) {
+                uint index = ~uint(selected[slot]);
+                denominator += load_float(
+                    input, physical_index(input_layout, row * width + index), input0_dtype);
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     if (lane < k) {
         uint index = ~uint(selected[lane]);
         uint output_index = row * k + lane;
-        float value = load_float(
-            input, physical_index(input_layout, row * width + index), input0_dtype);
-        store_float(values, physical_index(values_layout, output_index), output_dtype, value);
+        uint input_index = physical_index(input_layout, row * width + index);
+        uint value_index = physical_index(values_layout, output_index);
+        if (normalize != 0) {
+            float value = load_float(input, input_index, input0_dtype);
+            store_float(values, value_index, output_dtype, value / denominator);
+        } else {
+            copy_value(input, values, input_index, value_index);
+        }
         indices[physical_index(indices_layout, output_index)] = index;
     }
 }
@@ -520,6 +539,7 @@ kernel void topk_finalize(
     constant uint &width [[buffer(7)]],
     constant uint &chunks [[buffer(8)]],
     constant uint &k [[buffer(9)]],
+    constant uint &normalize [[buffer(10)]],
     uint row [[threadgroup_position_in_grid]],
     uint lane [[thread_position_in_threadgroup]]) {
     if (lane != 0) {
@@ -531,13 +551,26 @@ kernel void topk_finalize(
             topk_insert(selected, k, partials[(row * chunks + chunk) * k + slot]);
         }
     }
+    float denominator = 1.0f;
+    if (normalize != 0) {
+        denominator = 0.0f;
+        for (uint slot = 0; slot < k; ++slot) {
+            uint index = ~uint(selected[slot]);
+            denominator += load_float(
+                input, physical_index(input_layout, row * width + index), input0_dtype);
+        }
+    }
     for (uint slot = 0; slot < k; ++slot) {
         uint index = ~uint(selected[slot]);
         uint output_index = row * k + slot;
-        float value = load_float(
-            input, physical_index(input_layout, row * width + index), input0_dtype);
-        store_float(
-            values, physical_index(values_layout, output_index), output_dtype, value);
+        uint input_index = physical_index(input_layout, row * width + index);
+        uint value_index = physical_index(values_layout, output_index);
+        if (normalize != 0) {
+            float value = load_float(input, input_index, input0_dtype);
+            store_float(values, value_index, output_dtype, value / denominator);
+        } else {
+            copy_value(input, values, input_index, value_index);
+        }
         indices[physical_index(indices_layout, output_index)] = index;
     }
 }

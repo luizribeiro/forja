@@ -2108,9 +2108,14 @@ impl MetalBackend {
             }
             Op::Softmax => self.encode_softmax(encoder, table, dispatch, bindings, arguments)?,
             Op::Argmax => self.encode_argmax(encoder, table, dispatch, bindings, arguments)?,
-            Op::TopK { k } => {
-                self.encode_top_k(encoder, table, dispatch, k, bindings, arguments)?
-            }
+            Op::TopK { k, normalize } => self.encode_top_k(
+                encoder,
+                table,
+                dispatch,
+                (k, normalize),
+                bindings,
+                arguments,
+            )?,
             Op::Sample { position } => {
                 let (buffers, flag) =
                     self.encode_sample(encoder, table, dispatch, position, bindings, arguments)?;
@@ -3795,6 +3800,7 @@ impl MetalBackend {
         width: u32,
         rows: u32,
         k: u32,
+        normalize: bool,
         constants: &[(u32, u32)],
         bindings: &mut ArgumentBindings,
         arguments: &mut ArgumentWriter,
@@ -3810,6 +3816,7 @@ impl MetalBackend {
             Self::layout_buffer(&indices.layout, arguments)?,
             arguments.write(&width.to_ne_bytes())?,
             arguments.write(&k.to_ne_bytes())?,
+            arguments.write(&u32::from(normalize).to_ne_bytes())?,
         ];
         for (index, tensor) in [input, values, indices].into_iter().enumerate() {
             bindings.bind(table, index, &tensor.buffer);
@@ -3845,10 +3852,11 @@ impl MetalBackend {
         encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
         table: &ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>,
         dispatch: &Dispatch,
-        k: u32,
+        config: (u32, bool),
         bindings: &mut ArgumentBindings,
         arguments: &mut ArgumentWriter,
     ) -> Result<Vec<BufferBinding>, BackendError> {
+        let (k, normalize) = config;
         let [input] = dispatch.inputs() else {
             return Err(BackendError::InvalidInput);
         };
@@ -3872,8 +3880,8 @@ impl MetalBackend {
         ];
         if chunks == 1 && k == 8 {
             return self.encode_top_k_single(
-                encoder, table, &input, &values, &indices, width, rows, k, &constants, bindings,
-                arguments,
+                encoder, table, &input, &values, &indices, width, rows, k, normalize, &constants,
+                bindings, arguments,
             );
         }
         let scratch = self.scratch_tensor(DType::U32, &[rows, chunks, k, 2])?;
@@ -3895,6 +3903,7 @@ impl MetalBackend {
             arguments.write(&width.to_ne_bytes())?,
             arguments.write(&chunks.to_ne_bytes())?,
             arguments.write(&k.to_ne_bytes())?,
+            arguments.write(&u32::from(normalize).to_ne_bytes())?,
         ];
         set_pipeline(encoder, &partials_pipeline);
         bindings.bind(table, 0, &input.buffer);
@@ -3904,15 +3913,12 @@ impl MetalBackend {
         bindings.bind(table, 4, &temporaries[5]);
         bindings.bind(table, 5, &temporaries[6]);
         set_argument_table(encoder, table);
+        let partial_groups = usize::try_from(u64::from(rows) * u64::from(chunks))
+            .map_err(|_| BackendError::ExecutionFailed)?;
         dispatch_threadgroups(
             encoder,
             MTLSize {
-                width: usize::try_from(rows)
-                    .map_err(|_| BackendError::ExecutionFailed)?
-                    .checked_mul(
-                        usize::try_from(chunks).map_err(|_| BackendError::ExecutionFailed)?,
-                    )
-                    .ok_or(BackendError::ExecutionFailed)?,
+                width: partial_groups,
                 height: 1,
                 depth: 1,
             },
@@ -4483,7 +4489,7 @@ impl MetalBackend {
                 Self::size_softmax_arguments(arguments)?;
                 arguments.write(size_of::<u32>())?;
             }
-            Op::TopK { k } => {
+            Op::TopK { k, .. } => {
                 let width = dispatch.inputs()[0]
                     .layout()
                     .shape()
@@ -4491,9 +4497,9 @@ impl MetalBackend {
                     .copied()
                     .ok_or(BackendError::InvalidInput)?;
                 let lengths: &[usize] = if width <= ARGMAX_CHUNK_WIDTH && k == 8 {
-                    &[112, 112, 112, 4, 4]
-                } else {
                     &[112, 112, 112, 4, 4, 4]
+                } else {
+                    &[112, 112, 112, 4, 4, 4, 4]
                 };
                 for &len in lengths {
                     arguments.write(len)?;
@@ -4987,7 +4993,7 @@ fn dispatch_kernel(dispatch: &Dispatch) -> Result<&'static str, BackendError> {
                 .last()
                 .copied()
                 .ok_or(BackendError::InvalidInput)?;
-            if width <= ARGMAX_CHUNK_WIDTH && matches!(dispatch.op(), Op::TopK { k: 8 }) {
+            if width <= ARGMAX_CHUNK_WIDTH && matches!(dispatch.op(), Op::TopK { k: 8, .. }) {
                 "topk_single"
             } else {
                 "topk_partials+finalize"
