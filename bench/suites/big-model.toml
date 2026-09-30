@@ -1,0 +1,13 @@
+[bench]
+pp = 512
+tg = 128
+reps = 5
+warmups = 1
+decode_prefill = 8
+contexts = [
+  9,
+  512,
+  2048,
+  4000,
+] # A context above the manifest's max_context is a load error, never clipped.
+selection = ["gpu-sequential", "gpu-pipelined"]

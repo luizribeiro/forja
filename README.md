@@ -28,3 +28,7 @@ nix develop -c sh -c 'cargo run --release -p forja -- bench --engine "$FORJA_ENG
 
 Set `FORJA_ENGINE` to the Qwen WebAssembly component to measure. To compare replay behavior,
 pass the default and `no-replay` components with two `--engine` flags.
+
+Use `-c bench/suites/default.toml` for release-comparable measurements. For large models,
+`-c bench/suites/big-model.toml` keeps the same workloads and context probes with fewer
+repetitions for faster optimization-loop measurements.

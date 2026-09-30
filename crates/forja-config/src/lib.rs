@@ -648,6 +648,18 @@ fixtures = "golden/qwen3-0.6b"
     }
 
     #[test]
+    fn committed_big_model_suite_only_reduces_repetitions() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../bench/suites/big-model.toml");
+        let config: DevConfig = toml::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+        let expected = Bench {
+            reps: nonzero(5),
+            warmups: 1,
+            ..Bench::default()
+        };
+        assert_eq!(config.bench, expected);
+    }
+
+    #[test]
     fn enum_leaves_serialize_as_scalars() {
         let value = toml::Value::try_from(DevConfig::default()).unwrap();
         assert!(!value["backend"]["kind"].is_table());
