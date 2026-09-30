@@ -1,6 +1,8 @@
 {
   "allow_diff": [],
-  "auto_notes": [],
+  "auto_notes": [
+    "backend.metal.graph_replay: auto -> tier2 (Apple M3 Ultra/macOS 26.6.2 @39e10c039e3738fa8c4ac6e91bcbb4bfabb9d514)"
+  ],
   "axes": {},
   "config": "[backend]\nkind = \"metal\"\n\n[backend.metal]\ngraph_replay = \"tier2\"\n\n[bench]\nbreakdown = false\ncontexts = [9, 512, 2048, 4000]\ndecode_prefill = 8\npp = 512\nreps = 5\nselection = [\"gpu-sequential\", \"gpu-pipelined\"]\ntg = 128\nwarmups = 1\n\n[bench.sampling]\nseed = 0\ntemperature = 0.0\ntop_k = 0\ntop_p = 1.0\n\n[bench.vary]\n\n[limits]\ndispatches_per_list = 4096\ngpu_time_budget = \"3600000ms\"\nguest_call_timeout = \"300000ms\"\nguest_memory_bytes = 4294967296\ninstances = 10000\nlive_bytes = 51539607552\nlive_graphs = 16\nlive_kernels = 64\nlive_tensor_handles = 20000\nread_bytes = 1073741824\nsubmission_timeout = \"60000ms\"\ntable_elements = 10000\ntensor_elements = 1000000000\ntensor_rank = 4\nwork_per_dispatch = \"unlimited\"\n\n[run]\nmax_tokens = 128\ntemperature = 0.0\ntop_k = 0\ntop_p = 1.0\n\n[verify]\nprompts = []\n",
   "config_hash": "sha256:d01ff4fccce575c88b9eefbf59480bd9a41edb2588ce575cc04c2655be93f765",
@@ -16,61 +18,96 @@
     }
   ],
   "origins": {
-    "backend.kind": "config file",
-    "backend.metal.graph_replay": "config file",
-    "bench.breakdown": "config file",
+    "backend.kind": "default",
+    "backend.metal.graph_replay": "auto",
+    "bench.breakdown": "default",
     "bench.contexts": "config file",
     "bench.decode_prefill": "config file",
     "bench.pp": "config file",
     "bench.reps": "config file",
-    "bench.sampling.seed": "config file",
-    "bench.sampling.temperature": "config file",
-    "bench.sampling.top_k": "config file",
-    "bench.sampling.top_p": "config file",
+    "bench.sampling.seed": "default",
+    "bench.sampling.temperature": "default",
+    "bench.sampling.top_k": "default",
+    "bench.sampling.top_p": "default",
     "bench.selection": "config file",
     "bench.tg": "config file",
     "bench.warmups": "config file",
-    "limits.dispatches_per_list": "config file",
-    "limits.gpu_time_budget": "config file",
-    "limits.guest_call_timeout": "config file",
-    "limits.guest_memory_bytes": "config file",
-    "limits.instances": "config file",
-    "limits.live_bytes": "config file",
-    "limits.live_graphs": "config file",
-    "limits.live_kernels": "config file",
-    "limits.live_tensor_handles": "config file",
-    "limits.read_bytes": "config file",
-    "limits.submission_timeout": "config file",
-    "limits.table_elements": "config file",
-    "limits.tensor_elements": "config file",
-    "limits.tensor_rank": "config file",
-    "limits.work_per_dispatch": "config file",
-    "run.max_tokens": "config file",
-    "run.temperature": "config file",
-    "run.top_k": "config file",
-    "run.top_p": "config file",
-    "verify.prompts": "config file"
+    "limits.dispatches_per_list": "default",
+    "limits.gpu_time_budget": "default",
+    "limits.guest_call_timeout": "default",
+    "limits.guest_memory_bytes": "default",
+    "limits.instances": "default",
+    "limits.live_bytes": "default",
+    "limits.live_graphs": "default",
+    "limits.live_kernels": "default",
+    "limits.live_tensor_handles": "default",
+    "limits.read_bytes": "default",
+    "limits.submission_timeout": "default",
+    "limits.table_elements": "default",
+    "limits.tensor_elements": "default",
+    "limits.tensor_rank": "default",
+    "limits.work_per_dispatch": "default",
+    "run.max_tokens": "default",
+    "run.temperature": "default",
+    "run.top_k": "default",
+    "run.top_p": "default",
+    "verify.prompts": "default"
   },
   "perf_hash": "sha256:c54ec939b2713b51d4f974a22c7bebf388ff3fa6bd1e25a489836f740dfd07e1",
   "provenance": {
-    "binary_sha256": "4e06b36299b950fdbc07ce7bf8f1dfe042cc9695f50340136df6583153ad8ecd",
-    "commit": "752617033075633dfeeb05473b1fd23ebdc21614",
-    "date": "2026-09-30T21:41Z",
+    "binary_sha256": "e109bcfb02423b07afb05f7e70d4c39bdcd5f04f50483d7dc8c2cd75e8823949",
+    "commit": "39e10c039e3738fa8c4ac6e91bcbb4bfabb9d514",
+    "date": "2026-09-30T23:44Z",
     "device": "Apple M3 Ultra",
     "dirty": false,
-    "duration_s": 54,
+    "duration_s": 52,
     "gpu_cores": 80,
     "machine_load": {
       "after": {
         "busiest_processes": [
           {
             "command": "syspolicyd",
-            "cpu_percent": 23.7,
-            "pid": 673
+            "cpu_percent": 94.5,
+            "pid": 31081
           },
           {
             "command": "python3.13",
-            "cpu_percent": 3.9,
+            "cpu_percent": 3.8,
+            "pid": 905
+          },
+          {
+            "command": "python3.13",
+            "cpu_percent": 3.7,
+            "pid": 904
+          },
+          {
+            "command": "msb",
+            "cpu_percent": 2.8,
+            "pid": 29099
+          }
+        ],
+        "gpu_device_percent": 92.0,
+        "load_average": [
+          1.79,
+          1.77,
+          1.7
+        ]
+      },
+      "before": {
+        "busiest_processes": [
+          {
+            "command": "syspolicyd",
+            "cpu_percent": 91.6,
+            "pid": 31081
+          },
+          {
+            "command": "msb",
+            "cpu_percent": 37.5,
+            "pid": 29099
+          },
+          {
+            "command": "python3.13",
+            "cpu_percent": 3.8,
             "pid": 904
           },
           {
@@ -79,76 +116,21 @@
             "pid": 905
           },
           {
-            "command": "bluetoothd",
-            "cpu_percent": 1.7,
-            "pid": 580
-          },
-          {
-            "command": "msb",
-            "cpu_percent": 1.6,
-            "pid": 29099
-          },
-          {
             "command": "claude bg-spare",
-            "cpu_percent": 1.4,
+            "cpu_percent": 2.3,
             "pid": 17008
           },
           {
-            "command": "sleep",
-            "cpu_percent": 1.2,
-            "pid": 83315
-          }
-        ],
-        "gpu_device_percent": 92.0,
-        "load_average": [
-          2.21,
-          3.74,
-          3.49
-        ]
-      },
-      "before": {
-        "busiest_processes": [
-          {
-            "command": "XprotectService",
-            "cpu_percent": 57.3,
-            "pid": 18420
-          },
-          {
-            "command": "syspolicyd",
-            "cpu_percent": 21.0,
-            "pid": 673
-          },
-          {
-            "command": "msb",
-            "cpu_percent": 10.0,
-            "pid": 29099
-          },
-          {
-            "command": "python3.13",
-            "cpu_percent": 4.2,
-            "pid": 904
-          },
-          {
-            "command": "python3.13",
-            "cpu_percent": 4.2,
-            "pid": 905
-          },
-          {
-            "command": "trustd",
-            "cpu_percent": 1.6,
-            "pid": 18153
-          },
-          {
             "command": "claude",
-            "cpu_percent": 1.3,
-            "pid": 16967
+            "cpu_percent": 1.2,
+            "pid": 73061
           }
         ],
-        "gpu_device_percent": 81.0,
+        "gpu_device_percent": 0.0,
         "load_average": [
-          3.34,
-          4.19,
-          3.63
+          1.98,
+          1.78,
+          1.7
         ]
       }
     },
@@ -163,10 +145,10 @@
       "pp": {
         "gpu_time_seconds": {
           "ci95": [
-            0.692417541,
-            0.692758125
+            0.603081833,
+            0.608643083
           ],
-          "median": 0.692669541
+          "median": 0.603615375
         },
         "submissions": {
           "ci95": [
@@ -178,25 +160,25 @@
         "tokens_per_second": {
           "gpu": {
             "ci95": [
-              739.0746950820678,
-              739.4382286453371
+              841.2155075785195,
+              848.9726799646443
             ],
-            "median": 739.1692137362223
+            "median": 848.222264053496
           },
           "wall": {
             "ci95": [
-              606.1233851754296,
-              628.7995411846248
+              671.7642323348764,
+              698.2542230186975
             ],
-            "median": 628.3721369819054
+            "median": 692.5537570945961
           }
         },
         "wall_time_seconds": {
           "ci95": [
-            0.814249958,
-            0.8447125
+            0.733257291,
+            0.762172166
           ],
-          "median": 0.814803792
+          "median": 0.739292791
         }
       },
       "sampling_fallbacks": [],
@@ -204,10 +186,10 @@
       "tg": {
         "gpu_time_seconds": {
           "ci95": [
-            1.885450665,
-            1.892781207
+            1.807840248,
+            1.827594288
           ],
-          "median": 1.890904
+          "median": 1.8194347899999999
         },
         "submissions": {
           "ci95": [
@@ -219,25 +201,25 @@
         "tokens_per_second": {
           "gpu": {
             "ci95": [
-              67.62535443960586,
-              67.88827858298801
+              70.03742616205857,
+              70.80271619221081
             ],
-            "median": 67.69248994131908
+            "median": 70.35151834158344
           },
           "wall": {
             "ci95": [
-              54.02323918017459,
-              55.06783634026442
+              55.086836274229796,
+              56.72022605324976
             ],
-            "median": 54.961424300268945
+            "median": 56.5854473151381
           }
         },
         "wall_time_seconds": {
           "ci95": [
-            2.324405833,
-            2.369350708
+            2.256690583,
+            2.323604125
           ],
-          "median": 2.328906167
+          "median": 2.262065709
         }
       }
     },
@@ -249,10 +231,10 @@
       "pp": {
         "gpu_time_seconds": {
           "ci95": [
-            0.692084083,
-            0.69656625
+            0.604962166,
+            0.610578916
           ],
-          "median": 0.6924535
+          "median": 0.605684125
         },
         "submissions": {
           "ci95": [
@@ -264,25 +246,25 @@
         "tokens_per_second": {
           "gpu": {
             "ci95": [
-              735.0341765768869,
-              739.7945026861714
+              838.5484440802406,
+              846.3339176817217
             ],
-            "median": 739.3998297358595
+            "median": 845.3251106754697
           },
           "wall": {
             "ci95": [
-              604.4534167998501,
-              623.210988110455
+              671.1584250127112,
+              697.578808863747
             ],
-            "median": 618.3326575351895
+            "median": 688.2123589347472
           }
         },
         "wall_time_seconds": {
           "ci95": [
-            0.821551625,
-            0.84704625
+            0.73396725,
+            0.762860125
           ],
-          "median": 0.82803325
+          "median": 0.743956416
         }
       },
       "sampling_fallbacks": [],
@@ -290,10 +272,10 @@
       "tg": {
         "gpu_time_seconds": {
           "ci95": [
-            1.820773959,
-            1.841566499
+            1.7957542,
+            1.812632291
           ],
-          "median": 1.830010541
+          "median": 1.800164497
         },
         "submissions": {
           "ci95": [
@@ -305,25 +287,25 @@
         "tokens_per_second": {
           "gpu": {
             "ci95": [
-              69.50604285509431,
-              70.29977519576333
+              70.61553555872298,
+              71.27924300552938
             ],
-            "median": 69.94495230068732
+            "median": 71.10461305803655
           },
           "wall": {
             "ci95": [
-              69.14699393678156,
-              69.95205893023764
+              70.24949940083242,
+              70.92494628762391
             ],
-            "median": 69.56740082467262
+            "median": 70.69465248731576
           }
         },
         "wall_time_seconds": {
           "ci95": [
-            1.829824625,
-            1.851128917
+            1.804724666,
+            1.822077041
           ],
-          "median": 1.83994225
+          "median": 1.810603709
         }
       }
     }
