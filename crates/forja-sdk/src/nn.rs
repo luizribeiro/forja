@@ -39,6 +39,37 @@ pub fn moe_combine<T: FloatElement>(experts: &Tensor<T>, weights: &Tensor<T>) ->
         .reshape(&[rows, hidden])
 }
 
+/// Loads separate expert projections into `[experts, input, output]` storage.
+///
+/// Each source tensor is named `{expert}.{projection}.weight` and stored as `[output, input]`.
+///
+/// # Errors
+///
+/// Returns an error for invalid dimensions, missing weights, or a refused allocation or copy.
+pub fn stack_expert_weights<T: WeightElement>(
+    weights: &Weights<'_>,
+    experts: u32,
+    input: u32,
+    output: u32,
+    projection: &str,
+) -> Result<Tensor<T>> {
+    if experts == 0 || input == 0 || output == 0 {
+        return Err(Error::loading(
+            "expert projection dimensions must be nonzero",
+        ));
+    }
+    let stacked = Tensor::zeros(&[experts, input, output])?;
+    for expert in 0..experts {
+        let source = weights
+            .scoped(format!("{expert}.{projection}"))
+            .tensor::<T>("weight", &[output, input])?
+            .t()?;
+        let mut destination = stacked.narrow(0, expert, 1)?.reshape(&[input, output])?;
+        source.copy_into(&mut destination)?;
+    }
+    Ok(stacked)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum WeightStorage {
     Activation,

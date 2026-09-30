@@ -6,7 +6,10 @@ use std::{path::PathBuf, sync::OnceLock};
 
 use forja_sdk::{
     Load, Tensor, Weights, bf16,
-    nn::{Embedding, EmbeddingConfig, Linear, LinearConfig, RmsNorm, RmsNormConfig},
+    nn::{
+        Embedding, EmbeddingConfig, Linear, LinearConfig, RmsNorm, RmsNormConfig,
+        stack_expert_weights,
+    },
 };
 
 #[derive(Clone, Copy)]
@@ -176,6 +179,16 @@ fn loads_indexed_weight_files() {
     );
 }
 
+#[test]
+fn stacks_separate_expert_weights() {
+    let weights = Weights::open(weight_file()).unwrap().scoped("experts");
+    let stacked = stack_expert_weights::<f32>(&weights, 2, 2, 2, "up_proj").unwrap();
+    assert_eq!(
+        stacked.to_vec().unwrap(),
+        [1.0, 3.0, 2.0, 4.0, 5.0, 7.0, 6.0, 8.0]
+    );
+}
+
 fn weight_file() -> PathBuf {
     static PATH: OnceLock<PathBuf> = OnceLock::new();
     PATH.get_or_init(write_weight_file).clone()
@@ -195,6 +208,8 @@ fn index_file() -> PathBuf {
             "bf16_token.weight",
             "bf16_projection.weight",
             "bf16_norm.weight",
+            "experts.0.up_proj.weight",
+            "experts.1.up_proj.weight",
         ];
         let map = names
             .iter()
@@ -210,7 +225,7 @@ fn index_file() -> PathBuf {
 }
 
 fn write_weight_file() -> PathBuf {
-    let tensors: [(&str, &str, Vec<u32>, Vec<u8>); 8] = [
+    let tensors: [(&str, &str, Vec<u32>, Vec<u8>); 10] = [
         (
             "token.weight",
             "F32",
@@ -249,6 +264,18 @@ fn write_weight_file() -> PathBuf {
             bf16_bytes(&[1.0, 2.0, 3.0, 4.0]),
         ),
         ("bf16_norm.weight", "BF16", vec![2], bf16_bytes(&[1.0, 1.0])),
+        (
+            "experts.0.up_proj.weight",
+            "F32",
+            vec![2, 2],
+            f32_bytes(&[1.0, 2.0, 3.0, 4.0]),
+        ),
+        (
+            "experts.1.up_proj.weight",
+            "F32",
+            vec![2, 2],
+            f32_bytes(&[5.0, 6.0, 7.0, 8.0]),
+        ),
     ];
     let mut offset = 0_usize;
     let entries = tensors
