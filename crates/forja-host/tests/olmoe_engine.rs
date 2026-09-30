@@ -96,6 +96,51 @@ async fn prompt_hidden_states_and_routing_match_transformers() -> Result<(), Box
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[ignore = "requires FORJA_MODELS and runs in the pre-push hook"]
+async fn replay_matches_lazy_decode() -> Result<(), Box<dyn Error>> {
+    let weights = model_root()?.join("OLMoE-1B-7B-0924/model.safetensors.index.json");
+    let replay = decode_logits(test_guests::olmoe(), &weights).await?;
+    let lazy = decode_logits(test_guests::olmoe_no_replay(), &weights).await?;
+    assert_eq!(replay, lazy);
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+async fn decode_logits(
+    component: &std::path::Path,
+    weights: &std::path::Path,
+) -> Result<Vec<Vec<u8>>, Box<dyn Error>> {
+    let mut runner = EngineRunner::new(
+        component,
+        forja_metal::MetalBackend::new()?,
+        LIMITS,
+        weights,
+    )
+    .await?;
+    runner.load().await??;
+    runner
+        .step(EngineStep {
+            tokens: (0..8).collect(),
+            start_pos: 0,
+            taps: false,
+        })
+        .await??;
+    let mut logits = Vec::new();
+    for step in 0..4 {
+        let output = runner
+            .step(EngineStep {
+                tokens: vec![(step * 7_919 + 17) % olmoe::VOCAB],
+                start_pos: 8 + step,
+                taps: false,
+            })
+            .await??;
+        logits.push(runner.read(&output.logits).await?);
+    }
+    Ok(logits)
+}
+
 fn assert_selected_sets(
     expected: &[f32],
     actual: &[f32],
