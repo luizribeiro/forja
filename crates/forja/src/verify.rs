@@ -159,14 +159,16 @@ where
         .ok_or("fixtures contain no prompts")?;
     let layers = first.hidden_states().len() - 1;
     let router_layers = first.router_logits().map_or(0, |router| router.shape()[0]);
+    let expected_taps = (1..=u32::try_from(layers)?).collect::<Vec<_>>();
+    let expected_routers = (1..=u32::try_from(router_layers)?).collect::<Vec<_>>();
     if usize::try_from(info.vocab)? != first.prompt_logits().values().len()
-        || info.tap_layers != (1..=u32::try_from(layers)?).collect::<Vec<_>>()
-        || info.router_layers != (1..=u32::try_from(router_layers)?).collect::<Vec<_>>()
+        || !info.tap_layers.starts_with(&expected_taps)
+        || !info.router_layers.starts_with(&expected_routers)
     {
         return Err("engine metadata is incompatible with the fixtures".into());
     }
     runner
-        .load()
+        .load_with_config(Some(u32::try_from(layers)?))
         .await?
         .map_err(|error| format!("engine load failed: {error:?}"))?;
     let prompts = selected_prompts(fixtures, &options.prompts)?;
