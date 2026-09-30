@@ -382,6 +382,80 @@ kernel void argmax_finalize(
     }
 }
 
+ulong topk_candidate(float value, uint index) {
+    return (ulong(total_order_key(value)) << 32) | ulong(~index);
+}
+
+void topk_insert(thread ulong (&selected)[64], uint k, ulong candidate) {
+    for (uint slot = 0; slot < k; ++slot) {
+        if (candidate > selected[slot]) {
+            ulong displaced = selected[slot];
+            selected[slot] = candidate;
+            candidate = displaced;
+        }
+    }
+}
+
+kernel void topk_partials(
+    device const uchar *input [[buffer(0)]],
+    device ulong *partials [[buffer(1)]],
+    constant TensorLayout &input_layout [[buffer(2)]],
+    constant uint &width [[buffer(3)]],
+    constant uint &chunks [[buffer(4)]],
+    constant uint &k [[buffer(5)]],
+    uint group [[threadgroup_position_in_grid]],
+    uint lane [[thread_position_in_threadgroup]]) {
+    if (lane != 0) {
+        return;
+    }
+    uint row = group / chunks;
+    uint chunk = group % chunks;
+    uint first = chunk * 2048u;
+    uint end = first + min(2048u, width - first);
+    ulong selected[64] = {0};
+    for (uint column = first; column < end; ++column) {
+        float value = load_float(
+            input, physical_index(input_layout, row * width + column), input0_dtype);
+        topk_insert(selected, k, topk_candidate(value, column));
+    }
+    for (uint slot = 0; slot < k; ++slot) {
+        partials[(row * chunks + chunk) * k + slot] = selected[slot];
+    }
+}
+
+kernel void topk_finalize(
+    device const uchar *input [[buffer(0)]],
+    device const ulong *partials [[buffer(1)]],
+    device uchar *values [[buffer(2)]],
+    device uint *indices [[buffer(3)]],
+    constant TensorLayout &input_layout [[buffer(4)]],
+    constant TensorLayout &values_layout [[buffer(5)]],
+    constant TensorLayout &indices_layout [[buffer(6)]],
+    constant uint &width [[buffer(7)]],
+    constant uint &chunks [[buffer(8)]],
+    constant uint &k [[buffer(9)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint lane [[thread_position_in_threadgroup]]) {
+    if (lane != 0) {
+        return;
+    }
+    ulong selected[64] = {0};
+    for (uint chunk = 0; chunk < chunks; ++chunk) {
+        for (uint slot = 0; slot < k; ++slot) {
+            topk_insert(selected, k, partials[(row * chunks + chunk) * k + slot]);
+        }
+    }
+    for (uint slot = 0; slot < k; ++slot) {
+        uint index = ~uint(selected[slot]);
+        uint output_index = row * k + slot;
+        float value = load_float(
+            input, physical_index(input_layout, row * width + index), input0_dtype);
+        store_float(
+            values, physical_index(values_layout, output_index), output_dtype, value);
+        indices[physical_index(indices_layout, output_index)] = index;
+    }
+}
+
 ulong splitmix64(ulong value) {
     value += 0x9e3779b97f4a7c15ul;
     value = (value ^ (value >> 30)) * 0xbf58476d1ce4e5b9ul;

@@ -323,6 +323,51 @@ impl CpuBackend {
         scatter(target, output.layout(), &bytes)
     }
 
+    fn execute_top_k(
+        &self,
+        inputs: &[Tensor],
+        outputs: &[Tensor],
+        k: u32,
+    ) -> Result<(), BackendError> {
+        let values = decode(&self.read(&inputs[0])?, inputs[0].layout().dtype())
+            .ok_or(BackendError::ExecutionFailed)?;
+        let width = inputs[0]
+            .layout()
+            .shape()
+            .last()
+            .copied()
+            .ok_or(BackendError::ExecutionFailed)
+            .and_then(execution_usize)?;
+        let k = execution_usize(k)?;
+        let mut selected_values =
+            Vec::with_capacity(execution_usize(outputs[0].layout().element_count())?);
+        let mut selected_indices = Vec::with_capacity(selected_values.capacity());
+        for row in values.chunks_exact(width) {
+            let mut indices = (0..width).collect::<Vec<_>>();
+            indices.sort_unstable_by(|&left, &right| {
+                row[right]
+                    .total_cmp(&row[left])
+                    .then_with(|| left.cmp(&right))
+            });
+            for &index in &indices[..k] {
+                selected_values.push(row[index]);
+                selected_indices
+                    .push(u32::try_from(index).map_err(|_| BackendError::ExecutionFailed)?);
+            }
+        }
+        self.write_output(&outputs[0], &selected_values)?;
+        let bytes = selected_indices
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect::<Vec<_>>();
+        let mut buffers = self
+            .buffers
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?;
+        let target = buffers.get_mut(&outputs[1])?.bytes_mut()?;
+        scatter(target, outputs[1].layout(), &bytes)
+    }
+
     fn execute_sample(
         &self,
         inputs: &[Tensor],
@@ -700,6 +745,7 @@ impl Backend for CpuBackend {
                 }
                 Op::Softmax => self.execute_softmax(dispatch.inputs(), dispatch.output()),
                 Op::Argmax => self.execute_argmax(dispatch.inputs(), dispatch.output()),
+                Op::TopK { k } => self.execute_top_k(dispatch.inputs(), dispatch.outputs(), k),
                 Op::Sample { position } => {
                     self.execute_sample(dispatch.inputs(), dispatch.output(), position)
                 }
@@ -1379,6 +1425,61 @@ mod tests {
     }
 
     #[test]
+    fn argmax_prefers_the_last_equal_value() {
+        let backend = CpuBackend::new();
+        let input = f32_tensor(&backend, &[1, 5], &[1.0, 9.0, 2.0, 9.0, 3.0]);
+        let output = backend.alloc(DType::U32, &[1]).unwrap();
+        let mut commands = CommandList::new();
+        commands.dispatch(Op::Argmax, &[&input], &output).unwrap();
+        backend.submit(commands).unwrap().wait().unwrap();
+        assert_eq!(backend.read(&output).unwrap(), u32_bytes(&[3]));
+    }
+
+    #[test]
+    fn top_k_orders_cpu_rows_for_edge_widths_ties_and_nans() {
+        let backend = CpuBackend::new();
+        for (width, k) in [(1_u32, 1_u32), (64, 8), (128, 8), (2050, 64)] {
+            let mut values = (0..width)
+                .map(|index| f32::from(u16::try_from(index % 11).unwrap()))
+                .collect::<Vec<_>>();
+            if width >= 128 {
+                values[3] = f32::from_bits(0x7fc0_0001);
+                values[9] = f32::from_bits(0x7fc0_0002);
+                values[17] = f32::from_bits(0xffc0_0001);
+            }
+            if width == 2050 {
+                values[2048] = 1000.0;
+                values[2049] = 999.0;
+            }
+            let mut expected_indices = (0..usize::try_from(width).unwrap()).collect::<Vec<_>>();
+            expected_indices.sort_unstable_by(|&left, &right| {
+                values[right]
+                    .total_cmp(&values[left])
+                    .then_with(|| left.cmp(&right))
+            });
+            let expected_indices = &expected_indices[..usize::try_from(k).unwrap()];
+            let (actual_values, actual_indices) = run_top_k(&backend, &values, width, k);
+            assert_eq!(
+                actual_indices,
+                expected_indices
+                    .iter()
+                    .map(|&index| u32::try_from(index).unwrap())
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                actual_values
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                expected_indices
+                    .iter()
+                    .map(|&index| values[index].to_bits())
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
     fn greedy_sampling_matches_argmax_for_edge_values_and_widths() {
         for width in [1_u32, 7, 33, 4097, 151_936] {
             let mut row = (0..width)
@@ -1860,6 +1961,25 @@ mod tests {
             .unwrap();
         backend.submit(commands).unwrap().wait().unwrap();
         decode(&backend.read(&output).unwrap(), DType::F32).unwrap()
+    }
+
+    fn run_top_k(backend: &CpuBackend, values: &[f32], width: u32, k: u32) -> (Vec<f32>, Vec<u32>) {
+        let input = f32_tensor(backend, &[1, width], values);
+        let output_values = backend.alloc(DType::F32, &[1, k]).unwrap();
+        let output_indices = backend.alloc(DType::U32, &[1, k]).unwrap();
+        let mut commands = CommandList::new();
+        commands
+            .dispatch_many(
+                Op::TopK { k },
+                &[&input],
+                &[&output_values, &output_indices],
+            )
+            .unwrap();
+        backend.submit(commands).unwrap().wait().unwrap();
+        (
+            decode(&backend.read(&output_values).unwrap(), DType::F32).unwrap(),
+            decode_u32(&backend.read(&output_indices).unwrap()).unwrap(),
+        )
     }
 
     fn run_rope(values: &[f32], positions: &[u32], shape: &[u32], theta: f32) -> Vec<f32> {

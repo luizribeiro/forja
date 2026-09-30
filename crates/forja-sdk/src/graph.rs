@@ -317,6 +317,25 @@ pub(crate) fn record(
     })
 }
 
+pub(crate) fn record_many(
+    operation: sys::Op,
+    inputs: &[&sys::Handle],
+    outputs: &[&sys::Handle],
+) -> Result<()> {
+    CURRENT.with(|current| {
+        let mut current = current.borrow_mut();
+        if current.is_none() {
+            *current = Some(Recording::Lazy(sys::command_list()?));
+        }
+        let Some(Recording::Lazy(commands) | Recording::Capture { commands, .. }) =
+            current.as_mut()
+        else {
+            return Err(crate::Error::new("current graph was not initialized"));
+        };
+        sys::dispatch_many(commands, operation, inputs, outputs)
+    })
+}
+
 pub(crate) fn record_program(
     program: sys::Program,
     rank: u8,

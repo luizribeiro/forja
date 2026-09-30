@@ -58,6 +58,10 @@ interface compute {
     group-size: u32,
   }
 
+  record top-k-cfg {
+    k: u32,
+  }
+
   enum program-kind {
     %map,
     row,
@@ -138,6 +142,7 @@ interface compute {
     rms-norm(f32),
     softmax,
     argmax,
+    top-k(top-k-cfg),
     sample(sample-cfg),
     rope(rope-cfg),
     embed,
@@ -184,6 +189,7 @@ interface compute {
   resource command-list {
     constructor();
     dispatch: func(operation: op, ins: list<borrow<tensor>>, out: borrow<tensor>) -> result<_, error>;
+    dispatch-many: func(operation: op, ins: list<borrow<tensor>>, outs: list<borrow<tensor>>) -> result<_, error>;
     dispatch-kernel: func(k: borrow<kernel>, ins: list<borrow<tensor>>, outs: list<borrow<tensor>>) -> result<_, error>;
   }
 

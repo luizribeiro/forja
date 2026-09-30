@@ -146,8 +146,17 @@ pub enum Op {
     ///
     /// A row containing only negative infinity produces all zeros.
     Softmax,
-    /// Selects the last greatest element of each row under IEEE total order.
+    /// Selects the greatest element of each row under IEEE total order.
+    ///
+    /// Equal greatest values select the highest index.
     Argmax,
+    /// Selects the greatest elements of each row under IEEE total order.
+    ///
+    /// Results are sorted descending, with lower indices first for equal values.
+    TopK {
+        /// Number of elements selected from each row.
+        k: u32,
+    },
     /// Samples one index from each row using counter-based randomness.
     ///
     /// A seed reproduces tokens for the same forja build, backend, and kernel variant. Tokens are
@@ -208,6 +217,13 @@ pub enum OpError {
         /// The received count.
         actual: usize,
     },
+    /// The operation received the wrong number of outputs.
+    OutputArity {
+        /// The required count.
+        expected: usize,
+        /// The received count.
+        actual: usize,
+    },
     /// An operand has a scalar type unsupported by the operation.
     DType {
         /// The offending operand.
@@ -234,6 +250,13 @@ pub enum OpError {
         /// The overlapping input position.
         input: usize,
     },
+    /// Two outputs may touch the same bytes.
+    OutputAliasing {
+        /// The first overlapping output position.
+        first: usize,
+        /// The second overlapping output position.
+        second: usize,
+    },
     /// An RMS normalization epsilon is negative or non-finite.
     InvalidEpsilon,
     /// A rotary frequency base is non-positive or non-finite.
@@ -242,6 +265,8 @@ pub enum OpError {
     InvalidScale,
     /// Quantization parameters are outside the supported set.
     InvalidQuantization,
+    /// A top-k count is zero, exceeds the row width, or exceeds the supported limit.
+    InvalidTopK,
 }
 
 impl fmt::Display for OpError {
@@ -257,7 +282,7 @@ impl Error for OpError {}
 pub struct Dispatch {
     op: Op,
     inputs: Vec<Tensor>,
-    output: Tensor,
+    outputs: Vec<Tensor>,
     program: Option<ProgramDispatch>,
 }
 
@@ -269,7 +294,23 @@ struct ProgramDispatch {
 
 impl Dispatch {
     pub(crate) fn new(op: Op, inputs: &[&Tensor], output: &Tensor) -> Result<Self, OpError> {
-        check_common(inputs, output)?;
+        Self::new_many(op, inputs, &[output])
+    }
+
+    pub(crate) fn new_many(
+        op: Op,
+        inputs: &[&Tensor],
+        outputs: &[&Tensor],
+    ) -> Result<Self, OpError> {
+        check_common(inputs, outputs)?;
+        let expected_outputs = if matches!(op, Op::TopK { .. }) { 2 } else { 1 };
+        if outputs.len() != expected_outputs {
+            return Err(OpError::OutputArity {
+                expected: expected_outputs,
+                actual: outputs.len(),
+            });
+        }
+        let output = outputs[0];
         match op {
             Op::Program(_) => return Err(OpError::ProgramRequiresBinding),
             Op::Copy => check_copy(inputs, output)?,
@@ -277,6 +318,7 @@ impl Dispatch {
             Op::RmsNorm { eps } => check_rms_norm(inputs, output, eps)?,
             Op::Softmax => check_softmax(inputs, output)?,
             Op::Argmax => check_argmax(inputs, output)?,
+            Op::TopK { k } => check_top_k(inputs, outputs, k)?,
             Op::Sample { .. } => check_sample(inputs, output)?,
             Op::Rope { theta } => check_rope(inputs, output, theta)?,
             Op::Embed => check_embed(inputs, output)?,
@@ -293,7 +335,7 @@ impl Dispatch {
         Ok(Self {
             op,
             inputs: inputs.iter().map(|tensor| (*tensor).clone()).collect(),
-            output: output.clone(),
+            outputs: outputs.iter().map(|tensor| (*tensor).clone()).collect(),
             program: None,
         })
     }
@@ -303,23 +345,21 @@ impl Dispatch {
         inputs: &[&Tensor],
         outputs: &[&Tensor],
     ) -> Result<Self, OpError> {
-        let output = outputs
+        outputs
             .first()
-            .copied()
             .ok_or(OpError::ProgramBinding(BindError::NoOutputs))?;
-        check_common(inputs, output)?;
+        check_common(inputs, outputs)?;
         let bound =
             bind_program(program.validated(), inputs, outputs).map_err(OpError::ProgramBinding)?;
         check_kernel_signature(&bound, program.signature())?;
-        let output = bound
+        bound
             .outputs()
             .first()
-            .cloned()
             .ok_or(OpError::ProgramBinding(BindError::NoOutputs))?;
         Ok(Self {
             op: Op::Program(program.validated().content_hash()),
             inputs: bound.inputs().to_vec(),
-            output,
+            outputs: bound.outputs().to_vec(),
             program: Some(ProgramDispatch {
                 bound,
                 prepared: Arc::clone(program),
@@ -339,18 +379,14 @@ impl Dispatch {
     }
     /// Returns the output tensor.
     #[must_use]
-    pub const fn output(&self) -> &Tensor {
-        &self.output
+    pub fn output(&self) -> &Tensor {
+        &self.outputs[0]
     }
 
     /// Returns every output tensor in slot order.
     #[must_use]
     pub fn outputs(&self) -> &[Tensor] {
-        self.program
-            .as_ref()
-            .map_or(std::slice::from_ref(&self.output), |program| {
-                program.bound.outputs()
-            })
+        &self.outputs
     }
 
     /// Returns the bound scalar program, when this is a program dispatch.
@@ -416,6 +452,22 @@ impl CommandList {
     /// Returns [`OpError`] for an invalid signature or unsafe aliasing.
     pub fn dispatch(&mut self, op: Op, inputs: &[&Tensor], output: &Tensor) -> Result<(), OpError> {
         let dispatch = Dispatch::new(op, inputs, output)?;
+        self.push_and_reset_validation(dispatch);
+        Ok(())
+    }
+
+    /// Validates and records a trusted operation with multiple outputs.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OpError`] for an invalid signature or unsafe aliasing.
+    pub fn dispatch_many(
+        &mut self,
+        op: Op,
+        inputs: &[&Tensor],
+        outputs: &[&Tensor],
+    ) -> Result<(), OpError> {
+        let dispatch = Dispatch::new_many(op, inputs, outputs)?;
         self.push_and_reset_validation(dispatch);
         Ok(())
     }
@@ -639,7 +691,7 @@ impl AccessRegion {
     }
 }
 
-fn check_common(inputs: &[&Tensor], output: &Tensor) -> Result<(), OpError> {
+fn check_common(inputs: &[&Tensor], outputs: &[&Tensor]) -> Result<(), OpError> {
     for (input, tensor) in inputs.iter().enumerate() {
         if tensor.layout.element_count() == 0 {
             return Err(OpError::EmptyOperand {
@@ -647,20 +699,39 @@ fn check_common(inputs: &[&Tensor], output: &Tensor) -> Result<(), OpError> {
             });
         }
     }
-    if output.layout.element_count() == 0 {
-        return Err(OpError::EmptyOperand {
-            operand: Operand::Output,
+    if outputs.is_empty() {
+        return Err(OpError::OutputArity {
+            expected: 1,
+            actual: 0,
         });
     }
-    if !output.is_writable() {
-        return Err(OpError::ReadOnlyOutput);
+    for output in outputs {
+        if output.layout.element_count() == 0 {
+            return Err(OpError::EmptyOperand {
+                operand: Operand::Output,
+            });
+        }
+        if !output.is_writable() {
+            return Err(OpError::ReadOnlyOutput);
+        }
+        if !is_injective(output.layout()) {
+            return Err(OpError::NonInjectiveOutput);
+        }
+        for (input, tensor) in inputs.iter().enumerate() {
+            if tensor.buffer == output.buffer
+                && byte_ranges_overlap(tensor.layout(), output.layout())
+            {
+                return Err(OpError::Aliasing { input });
+            }
+        }
     }
-    if !is_injective(output.layout()) {
-        return Err(OpError::NonInjectiveOutput);
-    }
-    for (input, tensor) in inputs.iter().enumerate() {
-        if tensor.buffer == output.buffer && byte_ranges_overlap(tensor.layout(), output.layout()) {
-            return Err(OpError::Aliasing { input });
+    for (first, output) in outputs.iter().enumerate() {
+        for (second, candidate) in outputs.iter().enumerate().skip(first + 1) {
+            if output.buffer == candidate.buffer
+                && byte_ranges_overlap(output.layout(), candidate.layout())
+            {
+                return Err(OpError::OutputAliasing { first, second });
+            }
         }
     }
     Ok(())
@@ -776,6 +847,42 @@ fn check_argmax(inputs: &[&Tensor], output: &Tensor) -> Result<(), OpError> {
         return Err(OpError::Shape {
             operand: Operand::Output,
         });
+    }
+    Ok(())
+}
+
+fn check_top_k(inputs: &[&Tensor], outputs: &[&Tensor], k: u32) -> Result<(), OpError> {
+    if inputs.len() != 1 {
+        return Err(OpError::Arity {
+            expected: 1,
+            actual: inputs.len(),
+        });
+    }
+    check_float(inputs[0], Operand::Input(0))?;
+    if outputs[0].layout.dtype() != inputs[0].layout.dtype() {
+        return Err(OpError::DType {
+            operand: Operand::Output,
+            dtype: outputs[0].layout.dtype(),
+        });
+    }
+    if outputs[1].layout.dtype() != DType::U32 {
+        return Err(OpError::DType {
+            operand: Operand::Output,
+            dtype: outputs[1].layout.dtype(),
+        });
+    }
+    let Some((&width, rows)) = inputs[0].layout.shape().split_last() else {
+        return Err(shape_error(Operand::Input(0)));
+    };
+    if k == 0 || k > 64 || k > width {
+        return Err(OpError::InvalidTopK);
+    }
+    let expected = rows.iter().copied().chain([k]).collect::<Vec<_>>();
+    if outputs
+        .iter()
+        .any(|output| output.layout.shape() != expected)
+    {
+        return Err(shape_error(Operand::Output));
     }
     Ok(())
 }
@@ -1415,6 +1522,44 @@ mod tests {
             CommandList::new().dispatch(Op::Argmax, &[&scalar], &wrong_output),
             Err(OpError::Shape {
                 operand: Operand::Input(0)
+            })
+        );
+    }
+
+    #[test]
+    fn top_k_checks_count_outputs_and_shapes() {
+        let input = tensor(1, DType::F16, &[3, 7], &[7, 1]);
+        let values = tensor(2, DType::F16, &[3, 7], &[7, 1]);
+        let indices = tensor(3, DType::U32, &[3, 7], &[7, 1]);
+        assert!(
+            CommandList::new()
+                .dispatch_many(Op::TopK { k: 7 }, &[&input], &[&values, &indices])
+                .is_ok()
+        );
+        assert_eq!(
+            CommandList::new().dispatch_many(Op::TopK { k: 0 }, &[&input], &[&values, &indices]),
+            Err(OpError::InvalidTopK)
+        );
+        assert_eq!(
+            CommandList::new().dispatch_many(Op::TopK { k: 8 }, &[&input], &[&values, &indices]),
+            Err(OpError::InvalidTopK)
+        );
+        assert_eq!(
+            CommandList::new().dispatch_many(Op::TopK { k: 7 }, &[&input], &[&values]),
+            Err(OpError::OutputArity {
+                expected: 2,
+                actual: 1
+            })
+        );
+        let wrong_indices = tensor(4, DType::U32, &[3, 1], &[1, 1]);
+        assert_eq!(
+            CommandList::new().dispatch_many(
+                Op::TopK { k: 7 },
+                &[&input],
+                &[&values, &wrong_indices]
+            ),
+            Err(OpError::Shape {
+                operand: Operand::Output
             })
         );
     }

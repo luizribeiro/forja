@@ -1535,6 +1535,7 @@ const fn op_name(operation: Op) -> &'static str {
         Op::RmsNorm { .. } => "rms_norm",
         Op::Softmax => "softmax",
         Op::Argmax => "argmax",
+        Op::TopK { .. } => "top-k",
         Op::Sample { .. } => "sample",
         Op::Rope { .. } => "rope",
         Op::Embed => "embed",

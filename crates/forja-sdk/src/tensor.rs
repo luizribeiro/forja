@@ -327,7 +327,9 @@ impl<T: Element> Tensor<T> {
         self.unary::<T>(sys::Op::Softmax, self.shape.clone())
     }
 
-    /// Selects the last greatest index along the last dimension under IEEE total order.
+    /// Selects the greatest index along the last dimension under IEEE total order.
+    ///
+    /// Equal greatest values select the highest index.
     ///
     /// # Errors
     ///
@@ -338,6 +340,35 @@ impl<T: Element> Tensor<T> {
             .pop()
             .ok_or_else(|| Error::new("argmax requires at least one dimension"))?;
         self.unary(sys::Op::Argmax, shape)
+    }
+
+    /// Selects the greatest values and their indices along the last dimension.
+    ///
+    /// Values are sorted descending under IEEE total order. Equal values use lower indices first.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `k` is zero, greater than 64, greater than the row width, or the
+    /// dispatch is refused.
+    pub fn top_k(&self, k: u32) -> Result<(Self, Tensor<u32>)> {
+        let mut shape = self.shape.clone();
+        let width = shape
+            .last_mut()
+            .ok_or_else(|| Error::new("top-k requires at least one dimension"))?;
+        if k == 0 || k > 64 || k > *width {
+            return Err(Error::new(
+                "top-k count must be between one and the row width, up to 64",
+            ));
+        }
+        *width = k;
+        let values = Self::empty(shape.clone())?;
+        let indices = Tensor::<u32>::empty(shape)?;
+        graph::record_many(
+            sys::Op::TopK { k },
+            &[&self.handle],
+            &[&values.handle, &indices.handle],
+        )?;
+        Ok((values, indices))
     }
 
     /// Samples an index along the last dimension from a five-word parameter tensor.

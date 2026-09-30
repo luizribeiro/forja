@@ -1162,7 +1162,7 @@ enum RecordedDispatch {
     Operation {
         op: TemplateOp,
         inputs: Vec<TemplateTensor>,
-        output: Box<TemplateTensor>,
+        outputs: Vec<TemplateTensor>,
     },
     Program {
         program: Arc<PreparedProgram>,
@@ -1742,11 +1742,29 @@ impl<B: Backend> Host<B> {
         inputs: &[Resource<TensorEntry>],
         output: &Resource<TensorEntry>,
     ) -> Result<(), compute::Error> {
+        self.dispatch_many(commands, operation, inputs, std::slice::from_ref(output))
+    }
+
+    /// Validates and records one trusted operation with multiple outputs.
+    ///
+    /// # Errors
+    ///
+    /// Returns an operation, quota, or invalid-handle error before recording invalid work.
+    pub fn dispatch_many(
+        &mut self,
+        commands: &Resource<CommandListEntry>,
+        operation: compute::Op,
+        inputs: &[Resource<TensorEntry>],
+        outputs: &[Resource<TensorEntry>],
+    ) -> Result<(), compute::Error> {
         let input_entries = inputs
             .iter()
             .map(|resource| self.entry(resource).cloned())
             .collect::<Result<Vec<_>, _>>()?;
-        let output_entry = self.entry(output)?.clone();
+        let output_entries = outputs
+            .iter()
+            .map(|resource| self.entry(resource).cloned())
+            .collect::<Result<Vec<_>, _>>()?;
         let input_tensors = input_entries
             .iter()
             .map(|entry| &entry.tensor)
@@ -1756,15 +1774,22 @@ impl<B: Backend> Host<B> {
             .iter()
             .map(TensorEntry::template)
             .collect::<Result<Vec<_>, _>>()?;
-        let template_output = output_entry.template()?;
-        let dispatch_space = tensor_space(input_entries.iter().chain([&output_entry]))?;
+        let template_outputs = output_entries
+            .iter()
+            .map(TensorEntry::template)
+            .collect::<Result<Vec<_>, _>>()?;
+        let output_tensors = output_entries
+            .iter()
+            .map(|entry| &entry.tensor)
+            .collect::<Vec<_>>();
+        let dispatch_space = tensor_space(input_entries.iter().chain(&output_entries))?;
         let entry = self.table.get(commands).map_err(invalid_handle)?;
         if entry.recorded.len() >= self.limits.dispatches_per_list {
             return Err(quota("command list dispatch count exceeds the guest limit"));
         }
         merge_parameter_space(entry.space.as_ref(), dispatch_space.as_ref())?;
         if let Some(operation) = concrete_op {
-            self.check_dispatch_work(operation, &input_tensors, &output_entry.tensor)?;
+            self.check_dispatch_work(operation, &input_tensors, &output_tensors)?;
         }
 
         let entry = self.table.get_mut(commands).map_err(invalid_handle)?;
@@ -1773,7 +1798,7 @@ impl<B: Backend> Host<B> {
         {
             entry
                 .commands
-                .dispatch(operation, &input_tensors, &output_entry.tensor)
+                .dispatch_many(operation, &input_tensors, &output_tensors)
                 .map_err(guest_error)?;
             let dispatch = entry
                 .commands
@@ -1788,15 +1813,13 @@ impl<B: Backend> Host<B> {
             entry.recorded.push(RecordedDispatch::Operation {
                 op: template_op,
                 inputs: template_inputs,
-                output: Box::new(template_output),
+                outputs: template_outputs,
             });
         }
         entry.space = entry.space.take().or(dispatch_space);
-        entry
-            .access
-            .record(&input_entries, std::slice::from_ref(&output_entry));
+        entry.access.record(&input_entries, &output_entries);
         entry.retained.extend(input_entries);
-        entry.retained.push(output_entry);
+        entry.retained.extend(output_entries);
         Ok(())
     }
 
@@ -1912,9 +1935,14 @@ impl<B: Backend> Host<B> {
                 RecordedDispatch::Static(dispatch) => {
                     graph.record_validated(dispatch.as_ref().clone())
                 }
-                RecordedDispatch::Operation { op, inputs, output } => {
+                RecordedDispatch::Operation {
+                    op,
+                    inputs,
+                    outputs,
+                } => {
                     let inputs = inputs.iter().collect::<Vec<_>>();
-                    graph.dispatch(*op, &inputs, output)
+                    let outputs = outputs.iter().collect::<Vec<_>>();
+                    graph.dispatch_many(*op, &inputs, &outputs)
                 }
                 RecordedDispatch::Program {
                     program,
@@ -2111,12 +2139,12 @@ impl<B: Backend> Host<B> {
         &self,
         operation: Op,
         inputs: &[&Tensor],
-        output: &Tensor,
+        outputs: &[&Tensor],
     ) -> Result<(), compute::Error> {
-        let mut work = self.check_tensor_shape(output.layout().shape())?;
-        for input in inputs {
+        let mut work = 0_u64;
+        for tensor in inputs.iter().chain(outputs) {
             work = work
-                .checked_add(self.check_tensor_shape(input.layout().shape())?)
+                .checked_add(self.check_tensor_shape(tensor.layout().shape())?)
                 .ok_or_else(dispatch_work_quota)?;
         }
         let flops = match operation {
@@ -2876,6 +2904,19 @@ where
         )))
     }
 
+    fn dispatch_many(
+        &mut self,
+        resource: Resource<CommandListEntry>,
+        operation: compute::Op,
+        inputs: Vec<Resource<TensorEntry>>,
+        outputs: Vec<Resource<TensorEntry>>,
+    ) -> impl Future<Output = wasmtime::Result<Result<(), compute::Error>>> + Send {
+        let _timer = self.import_timer(ImportKind::Dispatch);
+        std::future::ready(Ok(Host::dispatch_many(
+            self, &resource, operation, &inputs, &outputs,
+        )))
+    }
+
     fn dispatch_kernel(
         &mut self,
         resource: Resource<CommandListEntry>,
@@ -3159,6 +3200,7 @@ fn core_op(operation: compute::Op) -> (TemplateOp, Option<Op>) {
         compute::Op::RmsNorm(eps) => concrete_template(Op::RmsNorm { eps }),
         compute::Op::Softmax => concrete_template(Op::Softmax),
         compute::Op::Argmax => concrete_template(Op::Argmax),
+        compute::Op::TopK(config) => concrete_template(Op::TopK { k: config.k }),
         compute::Op::Sample(config) => {
             let position = core_affine(config.position);
             let concrete = position.is_constant().then_some(Op::Sample {

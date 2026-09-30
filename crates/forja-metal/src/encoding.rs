@@ -2108,6 +2108,9 @@ impl MetalBackend {
             }
             Op::Softmax => self.encode_softmax(encoder, table, dispatch, bindings, arguments)?,
             Op::Argmax => self.encode_argmax(encoder, table, dispatch, bindings, arguments)?,
+            Op::TopK { k } => {
+                self.encode_top_k(encoder, table, dispatch, k, bindings, arguments)?
+            }
             Op::Sample { position } => {
                 let (buffers, flag) =
                     self.encode_sample(encoder, table, dispatch, position, bindings, arguments)?;
@@ -3560,6 +3563,110 @@ impl MetalBackend {
         Ok(temporaries)
     }
 
+    fn encode_top_k(
+        &self,
+        encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
+        table: &ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>,
+        dispatch: &Dispatch,
+        k: u32,
+        bindings: &mut ArgumentBindings,
+        arguments: &mut ArgumentWriter,
+    ) -> Result<Vec<BufferBinding>, BackendError> {
+        let [input] = dispatch.inputs() else {
+            return Err(BackendError::InvalidInput);
+        };
+        let [values, indices] = dispatch.outputs() else {
+            return Err(BackendError::InvalidInput);
+        };
+        let input = self.encoder_tensor(input)?;
+        let values = self.encoder_tensor(values)?;
+        let indices = self.encoder_tensor(indices)?;
+        let width = *input
+            .layout
+            .shape()
+            .last()
+            .ok_or(BackendError::InvalidInput)?;
+        let chunks = width.div_ceil(ARGMAX_CHUNK_WIDTH);
+        let rows = u32::try_from(values.layout.element_count() / u64::from(k))
+            .map_err(|_| BackendError::ExecutionFailed)?;
+        let scratch = self.scratch_tensor(DType::U32, &[rows, chunks, k, 2])?;
+        let constants = [
+            (0, dtype_code(input.layout.dtype())),
+            (2, dtype_code(values.layout.dtype())),
+        ];
+        let (partials_pipeline, finalize_pipeline) = {
+            let mut pipelines = self
+                .pipelines
+                .lock()
+                .map_err(|_| BackendError::ExecutionFailed)?;
+            (
+                pipelines.get("topk_partials", &constants)?,
+                pipelines.get("topk_finalize", &constants)?,
+            )
+        };
+        let temporaries = vec![
+            scratch.buffer.clone(),
+            Self::layout_buffer(&input.layout, arguments)?,
+            Self::layout_buffer(&values.layout, arguments)?,
+            Self::layout_buffer(&indices.layout, arguments)?,
+            arguments.write(&width.to_ne_bytes())?,
+            arguments.write(&chunks.to_ne_bytes())?,
+            arguments.write(&k.to_ne_bytes())?,
+        ];
+        set_pipeline(encoder, &partials_pipeline);
+        bindings.bind(table, 0, &input.buffer);
+        bindings.bind(table, 1, &scratch.buffer);
+        bindings.bind(table, 2, &temporaries[1]);
+        bindings.bind(table, 3, &temporaries[4]);
+        bindings.bind(table, 4, &temporaries[5]);
+        bindings.bind(table, 5, &temporaries[6]);
+        set_argument_table(encoder, table);
+        dispatch_threadgroups(
+            encoder,
+            MTLSize {
+                width: usize::try_from(rows)
+                    .map_err(|_| BackendError::ExecutionFailed)?
+                    .checked_mul(
+                        usize::try_from(chunks).map_err(|_| BackendError::ExecutionFailed)?,
+                    )
+                    .ok_or(BackendError::ExecutionFailed)?,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: 1,
+                height: 1,
+                depth: 1,
+            },
+        );
+        encode_dispatch_barrier(encoder);
+        set_pipeline(encoder, &finalize_pipeline);
+        for (index, tensor) in [&input, &scratch, &values, &indices]
+            .into_iter()
+            .enumerate()
+        {
+            bindings.bind(table, index, &tensor.buffer);
+        }
+        for (index, temporary) in temporaries[1..].iter().enumerate() {
+            bindings.bind(table, index + 4, temporary);
+        }
+        set_argument_table(encoder, table);
+        dispatch_threadgroups(
+            encoder,
+            MTLSize {
+                width: usize::try_from(rows).map_err(|_| BackendError::ExecutionFailed)?,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: 1,
+                height: 1,
+                depth: 1,
+            },
+        );
+        Ok(temporaries)
+    }
+
     fn write_sample_arguments<A: ArgumentSink>(
         dispatch: &Dispatch,
         position: u32,
@@ -4093,6 +4200,11 @@ impl MetalBackend {
                 Self::size_softmax_arguments(arguments)?;
                 arguments.write(size_of::<u32>())?;
             }
+            Op::TopK { .. } => {
+                for len in [112, 112, 112, 4, 4, 4] {
+                    arguments.write(len)?;
+                }
+            }
             Op::Sample { position } => {
                 Self::write_sample_arguments(dispatch, position, arguments)?;
             }
@@ -4504,6 +4616,7 @@ fn supported_dispatch(dispatch: &Dispatch) -> bool {
         | Op::RmsNorm { .. }
         | Op::Softmax
         | Op::Argmax
+        | Op::TopK { .. }
         | Op::Rope { .. }
         | Op::Embed
         | Op::Matmul
@@ -4563,6 +4676,7 @@ fn dispatch_kernel(dispatch: &Dispatch) -> Result<&'static str, BackendError> {
         Op::RmsNorm { .. } => row_kernel(dispatch, "rms_norm_single", "rms_norm_looped")?,
         Op::Softmax => row_kernel(dispatch, "softmax_single", "softmax_looped")?,
         Op::Argmax => "argmax_partials+finalize",
+        Op::TopK { .. } => "topk_partials+finalize",
         Op::Sample { .. } => "sample_rejection",
         Op::Rope { .. } => "rope",
         Op::Embed => "embed",
@@ -4649,7 +4763,7 @@ fn sdpa_kernel(dispatch: &Dispatch) -> Result<&'static str, BackendError> {
 
 fn reusable_dispatch(dispatch: &Dispatch) -> bool {
     match dispatch.op() {
-        Op::Argmax | Op::Sample { .. } | Op::Embed | Op::Sdpa { .. } => false,
+        Op::Argmax | Op::TopK { .. } | Op::Sample { .. } | Op::Embed | Op::Sdpa { .. } => false,
         Op::Matmul => {
             dispatch
                 .inputs()
@@ -5171,6 +5285,8 @@ fn nan_preserving_kernel(name: &str) -> bool {
         "softmax_single"
             | "softmax_looped"
             | "argmax_partials"
+            | "topk_partials"
+            | "topk_finalize"
             | "sample_rejection_proposal_partials"
             | "sample_rejection_threshold_partials"
             | "sample_rejection_threshold_finalize"

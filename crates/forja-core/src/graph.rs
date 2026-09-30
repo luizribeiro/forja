@@ -91,10 +91,10 @@ impl GraphLimits {
     }
 
     fn check_dispatch(&self, dispatch: &Dispatch) -> Result<(), GraphError> {
-        let mut work = self.tensor_work(dispatch.output())?;
-        for input in dispatch.inputs() {
+        let mut work = 0_u64;
+        for tensor in dispatch.inputs().iter().chain(dispatch.outputs()) {
             work = work
-                .checked_add(self.tensor_work(input)?)
+                .checked_add(self.tensor_work(tensor)?)
                 .ok_or(GraphError::WorkLimit)?;
         }
         let flops = match dispatch.op() {
@@ -369,7 +369,7 @@ enum DynamicDispatch {
     Operation {
         op: TemplateOp,
         inputs: Vec<TemplateTensor>,
-        output: Box<TemplateTensor>,
+        outputs: Vec<TemplateTensor>,
     },
     Program {
         program: Arc<PreparedProgram>,
@@ -381,10 +381,14 @@ enum DynamicDispatch {
 impl DynamicDispatch {
     fn is_parameter_dependent(&self) -> bool {
         match self {
-            Self::Operation { op, inputs, output } => {
+            Self::Operation {
+                op,
+                inputs,
+                outputs,
+            } => {
                 op.is_parameter_dependent()
                     || inputs.iter().any(TemplateTensor::is_parameter_dependent)
-                    || output.is_parameter_dependent()
+                    || outputs.iter().any(TemplateTensor::is_parameter_dependent)
             }
             Self::Program {
                 inputs, outputs, ..
@@ -402,10 +406,21 @@ impl DynamicDispatch {
 
     fn check_hull_aliasing(&self) -> Result<(), GraphError> {
         match self {
-            Self::Operation { inputs, output, .. } => {
+            Self::Operation {
+                inputs, outputs, ..
+            } => {
                 for (input, tensor) in inputs.iter().enumerate() {
-                    if hulls_overlap(tensor, output)? {
-                        return Err(OpError::Aliasing { input }.into());
+                    for output in outputs {
+                        if hulls_overlap(tensor, output)? {
+                            return Err(OpError::Aliasing { input }.into());
+                        }
+                    }
+                }
+                for (first, output) in outputs.iter().enumerate() {
+                    for (second, candidate) in outputs.iter().enumerate().skip(first + 1) {
+                        if hulls_overlap(output, candidate)? {
+                            return Err(OpError::OutputAliasing { first, second }.into());
+                        }
                     }
                 }
             }
@@ -452,10 +467,10 @@ impl DynamicDispatch {
         access: fn(&TemplateTensor, bool) -> Result<BufferAccess, GraphError>,
     ) -> Result<Vec<BufferAccess>, GraphError> {
         let (inputs, outputs) = match self {
-            Self::Operation { inputs, output, .. } => {
-                (inputs.as_slice(), std::slice::from_ref(output.as_ref()))
+            Self::Operation {
+                inputs, outputs, ..
             }
-            Self::Program {
+            | Self::Program {
                 inputs, outputs, ..
             } => (inputs.as_slice(), outputs.as_slice()),
         };
@@ -468,10 +483,10 @@ impl DynamicDispatch {
 
     fn tensors(&self) -> impl Iterator<Item = &TemplateTensor> {
         let (inputs, outputs) = match self {
-            Self::Operation { inputs, output, .. } => {
-                (inputs.as_slice(), std::slice::from_ref(output.as_ref()))
+            Self::Operation {
+                inputs, outputs, ..
             }
-            Self::Program {
+            | Self::Program {
                 inputs, outputs, ..
             } => (inputs.as_slice(), outputs.as_slice()),
         };
@@ -484,11 +499,17 @@ impl DynamicDispatch {
         limits: GraphLimits,
     ) -> Result<Dispatch, GraphError> {
         match self {
-            Self::Operation { op, inputs, output } => {
+            Self::Operation {
+                op,
+                inputs,
+                outputs,
+            } => {
                 let inputs = instantiate_tensors(inputs, values)?;
-                let output = output.instantiate(values)?;
+                let outputs = instantiate_tensors(outputs, values)?;
                 let input_refs = inputs.iter().collect::<Vec<_>>();
-                let dispatch = Dispatch::new(op.instantiate(values)?, &input_refs, &output)?;
+                let output_refs = outputs.iter().collect::<Vec<_>>();
+                let dispatch =
+                    Dispatch::new_many(op.instantiate(values)?, &input_refs, &output_refs)?;
                 limits.check_dispatch(&dispatch)?;
                 Ok(dispatch)
             }
@@ -695,10 +716,25 @@ impl GraphTemplate {
         inputs: &[&TemplateTensor],
         output: &TemplateTensor,
     ) -> Result<(), GraphError> {
+        self.dispatch_many(op, inputs, &[output])
+    }
+
+    /// Validates and records one trusted multi-output operation at every parameter-space corner.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GraphError`] for mixed parameter spaces, invalid concrete operations, or work
+    /// beyond the configured bounds.
+    pub fn dispatch_many(
+        &mut self,
+        op: impl Into<TemplateOp>,
+        inputs: &[&TemplateTensor],
+        outputs: &[&TemplateTensor],
+    ) -> Result<(), GraphError> {
         self.record(DynamicDispatch::Operation {
             op: op.into(),
             inputs: inputs.iter().map(|tensor| (*tensor).clone()).collect(),
-            output: Box::new(output.clone()),
+            outputs: outputs.iter().map(|tensor| (*tensor).clone()).collect(),
         })
     }
 

@@ -72,6 +72,9 @@ pub(crate) enum Op {
     RmsNorm(f32),
     Softmax,
     Argmax,
+    TopK {
+        k: u32,
+    },
     Sample {
         position: Affine,
     },
@@ -131,6 +134,12 @@ pub(crate) trait Backend {
         operation: Op,
         inputs: &[&Self::Tensor],
         output: &Self::Tensor,
+    ) -> Result<()>;
+    fn dispatch_many(
+        commands: &mut Self::Commands,
+        operation: Op,
+        inputs: &[&Self::Tensor],
+        outputs: &[&Self::Tensor],
     ) -> Result<()>;
     fn create_kernel(
         program: Program,
@@ -261,6 +270,17 @@ pub(crate) mod guest {
                 .map_err(|error| guest_error(&error))
         }
 
+        fn dispatch_many(
+            commands: &mut Self::Commands,
+            operation: Op,
+            inputs: &[&Self::Tensor],
+            outputs: &[&Self::Tensor],
+        ) -> Result<()> {
+            commands
+                .dispatch_many(wit_op(operation), inputs, outputs)
+                .map_err(|error| guest_error(&error))
+        }
+
         fn create_kernel(
             program: Program,
             rank: u8,
@@ -360,6 +380,7 @@ pub(crate) mod guest {
             Op::RmsNorm(eps) => compute::Op::RmsNorm(eps),
             Op::Softmax => compute::Op::Softmax,
             Op::Argmax => compute::Op::Argmax,
+            Op::TopK { k } => compute::Op::TopK(compute::TopKCfg { k }),
             Op::Sample { position } => compute::Op::Sample(compute::SampleCfg {
                 position: wit_affine(position),
             }),
@@ -493,6 +514,15 @@ pub(crate) mod unavailable {
             _operation: Op,
             _inputs: &[&Self::Tensor],
             _output: &Self::Tensor,
+        ) -> Result<()> {
+            Err(error())
+        }
+
+        fn dispatch_many(
+            _commands: &mut Self::Commands,
+            _operation: Op,
+            _inputs: &[&Self::Tensor],
+            _outputs: &[&Self::Tensor],
         ) -> Result<()> {
             Err(error())
         }
@@ -739,6 +769,31 @@ pub(crate) mod native {
             }
         }
 
+        fn dispatch_many(
+            commands: &mut Self::Commands,
+            operation: Op,
+            inputs: &[&Self::Tensor],
+            outputs: &[&Self::Tensor],
+        ) -> Result<()> {
+            match commands {
+                Commands::Cpu(commands) => commands
+                    .dispatch_many(
+                        core_op(operation),
+                        &cpu_inputs(inputs)?,
+                        &cpu_inputs(outputs)?,
+                    )
+                    .map_err(error),
+                #[cfg(all(feature = "native-metal", target_os = "macos"))]
+                Commands::Metal(commands) => commands
+                    .dispatch_many(
+                        core_op(operation),
+                        &metal_inputs(inputs)?,
+                        &metal_inputs(outputs)?,
+                    )
+                    .map_err(error),
+            }
+        }
+
         fn create_kernel(
             program: Program,
             rank: u8,
@@ -866,6 +921,7 @@ pub(crate) mod native {
             Op::RmsNorm(eps) => CoreOp::RmsNorm { eps },
             Op::Softmax => CoreOp::Softmax,
             Op::Argmax => CoreOp::Argmax,
+            Op::TopK { k } => CoreOp::TopK { k },
             Op::Sample { position } => CoreOp::Sample {
                 position: position.offset,
             },
@@ -999,6 +1055,15 @@ pub(crate) fn dispatch(
     output: &Handle,
 ) -> Result<()> {
     Active::dispatch(commands, operation, inputs, output)
+}
+
+pub(crate) fn dispatch_many(
+    commands: &mut Commands,
+    operation: Op,
+    inputs: &[&Handle],
+    outputs: &[&Handle],
+) -> Result<()> {
+    Active::dispatch_many(commands, operation, inputs, outputs)
 }
 
 pub(crate) fn create_kernel(

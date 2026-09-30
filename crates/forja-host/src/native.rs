@@ -195,6 +195,44 @@ impl<B: Backend> NativeCommandList<B> {
         Ok(())
     }
 
+    /// Validates and records one operation with multiple outputs.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for foreign tensors or an invalid operation signature.
+    pub fn dispatch_many(
+        &mut self,
+        operation: Op,
+        inputs: &[&NativeTensor<B>],
+        outputs: &[&NativeTensor<B>],
+    ) -> Result<(), BackendError> {
+        if inputs
+            .iter()
+            .chain(outputs)
+            .any(|tensor| !Arc::ptr_eq(&self.backend, &tensor.allocation.backend))
+        {
+            return Err(BackendError::InvalidInput);
+        }
+        self.commands
+            .dispatch_many(
+                operation,
+                &inputs
+                    .iter()
+                    .map(|tensor| &tensor.tensor)
+                    .collect::<Vec<_>>(),
+                &outputs
+                    .iter()
+                    .map(|tensor| &tensor.tensor)
+                    .collect::<Vec<_>>(),
+            )
+            .map_err(|_| BackendError::InvalidInput)?;
+        self.retained
+            .extend(inputs.iter().map(|tensor| (*tensor).clone()));
+        self.retained
+            .extend(outputs.iter().map(|tensor| (*tensor).clone()));
+        Ok(())
+    }
+
     /// Validates and records one prepared scalar program.
     ///
     /// # Errors
