@@ -478,6 +478,74 @@ impl CpuBackend {
         invalid_route.map_or(Ok(()), |index| Err(BackendError::IndexOutOfRange { index }))
     }
 
+    #[allow(clippy::cast_precision_loss)]
+    fn execute_quant_embed(
+        &self,
+        inputs: &[Tensor],
+        output: &Tensor,
+        bits: u8,
+        group_size: u32,
+    ) -> Result<(), BackendError> {
+        let packed = decode_u32(&self.read(&inputs[0])?).ok_or(BackendError::ExecutionFailed)?;
+        let scales = decode(&self.read(&inputs[1])?, inputs[1].layout().dtype())
+            .ok_or(BackendError::ExecutionFailed)?;
+        let biases = decode(&self.read(&inputs[2])?, inputs[2].layout().dtype())
+            .ok_or(BackendError::ExecutionFailed)?;
+        let ids = decode_u32(&self.read(&inputs[3])?).ok_or(BackendError::ExecutionFailed)?;
+        let [vocab, packed_width]: [u32; 2] = inputs[0]
+            .layout()
+            .shape()
+            .try_into()
+            .map_err(|_| BackendError::ExecutionFailed)?;
+        let vocab = execution_usize(vocab)?;
+        let packed_width = execution_usize(packed_width)?;
+        let values_per_word = 32_usize / usize::from(bits);
+        let width = checked_product(packed_width, values_per_word)?;
+        let group_size = execution_usize(group_size)?;
+        let groups = width / group_size;
+        let mask = (1_u32 << bits) - 1;
+        let capacity = execution_usize(output.layout().element_count())?;
+        let mut values = Vec::with_capacity(capacity);
+        let mut invalid_route = None;
+        for id in ids {
+            let Ok(row) = execution_usize(id) else {
+                return Err(BackendError::ExecutionFailed);
+            };
+            if row >= vocab {
+                values.resize(
+                    values
+                        .len()
+                        .checked_add(width)
+                        .ok_or(BackendError::ExecutionFailed)?,
+                    0.0,
+                );
+                record_invalid_route(&mut invalid_route, id);
+                continue;
+            }
+            let packed_base = checked_product(row, packed_width)?;
+            let group_base = checked_product(row, groups)?;
+            for column in 0..width {
+                let word = packed
+                    .get(packed_base + column / values_per_word)
+                    .copied()
+                    .ok_or(BackendError::ExecutionFailed)?;
+                let shift = (column % values_per_word) * usize::from(bits);
+                let quantized = (word >> shift) & mask;
+                let group = group_base + column / group_size;
+                values.push(
+                    scales
+                        .get(group)
+                        .copied()
+                        .zip(biases.get(group).copied())
+                        .map(|(scale, bias)| scale * quantized as f32 + bias)
+                        .ok_or(BackendError::ExecutionFailed)?,
+                );
+            }
+        }
+        self.write_output(output, &values)?;
+        invalid_route.map_or(Ok(()), |index| Err(BackendError::IndexOutOfRange { index }))
+    }
+
     fn execute_matmul(&self, inputs: &[Tensor], output: &Tensor) -> Result<(), BackendError> {
         let left = decode(&self.read(&inputs[0])?, inputs[0].layout().dtype())
             .ok_or(BackendError::ExecutionFailed)?;
@@ -961,6 +1029,9 @@ impl Backend for CpuBackend {
                     self.execute_rope(dispatch.inputs(), dispatch.output(), theta)
                 }
                 Op::Embed => self.execute_embed(dispatch.inputs(), dispatch.output()),
+                Op::QuantEmbed { bits, group_size } => {
+                    self.execute_quant_embed(dispatch.inputs(), dispatch.output(), bits, group_size)
+                }
                 Op::Matmul => self.execute_matmul(dispatch.inputs(), dispatch.output()),
                 Op::GatherMatmul => {
                     self.execute_gather_matmul(dispatch.inputs(), dispatch.output())

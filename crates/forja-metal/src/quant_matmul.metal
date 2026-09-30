@@ -4,6 +4,63 @@
 constant uint quant_bits [[function_constant(12)]];
 constant uint quant_group_size [[function_constant(13)]];
 
+struct QuantEmbedParams {
+    uint vocab;
+    uint width;
+};
+
+kernel void quant_embed(
+    device const uchar *packed [[buffer(0)]],
+    device const uchar *scales [[buffer(1)]],
+    device const uchar *biases [[buffer(2)]],
+    device const uint *ids [[buffer(3)]],
+    device uchar *output [[buffer(4)]],
+    constant TensorLayout &packed_layout [[buffer(5)]],
+    constant TensorLayout &scale_layout [[buffer(6)]],
+    constant TensorLayout &bias_layout [[buffer(7)]],
+    constant TensorLayout &ids_layout [[buffer(8)]],
+    constant TensorLayout &output_layout [[buffer(9)]],
+    constant QuantEmbedParams &params [[buffer(10)]],
+    device atomic_uint *error_flag [[buffer(11)]],
+    uint index [[thread_position_in_grid]]) {
+    if (index >= output_layout.element_count) {
+        return;
+    }
+    uint token = index / params.width;
+    uint column = index % params.width;
+    uint id = ids[physical_index(ids_layout, token)];
+    if (id >= params.vocab) {
+        store_float(output, physical_index(output_layout, index), output_dtype, 0.0f);
+        atomic_store_explicit(error_flag, 1, memory_order_relaxed);
+        atomic_fetch_min_explicit(error_flag + 1, id, memory_order_relaxed);
+        return;
+    }
+    uint values_per_word = 32 / quant_bits;
+    uint packed_width = params.width / values_per_word;
+    uint groups = params.width / quant_group_size;
+    ulong packed_index = ulong(id) * ulong(packed_width) + ulong(column / values_per_word);
+    ulong group_index = ulong(id) * ulong(groups) + ulong(column / quant_group_size);
+    if (packed_index > 0xfffffffful || group_index > 0xfffffffful) {
+        store_float(output, physical_index(output_layout, index), output_dtype, 0.0f);
+        atomic_store_explicit(error_flag, 2, memory_order_relaxed);
+        return;
+    }
+    uint word = load_uint(
+        packed,
+        physical_index(packed_layout, uint(packed_index)));
+    uint shift = (column % values_per_word) * quant_bits;
+    uint quantized = (word >> shift) & ((1u << quant_bits) - 1u);
+    float scale = load_float(
+        scales, physical_index(scale_layout, uint(group_index)), input1_dtype);
+    float bias = load_float(
+        biases, physical_index(bias_layout, uint(group_index)), input1_dtype);
+    store_float(
+        output,
+        physical_index(output_layout, index),
+        output_dtype,
+        scale * float(quantized) + bias);
+}
+
 struct QuantMatmulParams {
     ulong input_offset;
     ulong packed_offset;

@@ -174,6 +174,13 @@ pub enum Op {
     },
     /// Gathers embedding rows by token id.
     Embed,
+    /// Gathers and dequantizes affine-quantized embedding rows by token id.
+    QuantEmbed {
+        /// Number of bits in each unsigned quantized value.
+        bits: u8,
+        /// Number of embedding elements sharing one scale and bias.
+        group_size: u32,
+    },
     /// Multiplies rank-two or rank-three matrices.
     Matmul,
     /// Multiplies rows by dense expert matrices selected at run time.
@@ -340,6 +347,9 @@ impl Dispatch {
             Op::Sample { .. } => check_sample(inputs, output)?,
             Op::Rope { theta } => check_rope(inputs, output, theta)?,
             Op::Embed => check_embed(inputs, output)?,
+            Op::QuantEmbed { bits, group_size } => {
+                check_quant_embed(inputs, output, bits, group_size)?;
+            }
             Op::Matmul => check_matmul(inputs, output)?,
             Op::GatherMatmul => check_gather_matmul(inputs, output)?,
             Op::QuantMatmul { bits, group_size } => {
@@ -997,6 +1007,58 @@ fn check_embed(inputs: &[&Tensor], output: &Tensor) -> Result<(), OpError> {
         return Err(OpError::Shape {
             operand: Operand::Output,
         });
+    }
+    Ok(())
+}
+
+fn check_quant_embed(
+    inputs: &[&Tensor],
+    output: &Tensor,
+    bits: u8,
+    group_size: u32,
+) -> Result<(), OpError> {
+    if inputs.len() != 4 {
+        return Err(OpError::Arity {
+            expected: 4,
+            actual: inputs.len(),
+        });
+    }
+    if inputs[3].layout.dtype() != DType::U32 {
+        return Err(OpError::DType {
+            operand: Operand::Input(3),
+            dtype: inputs[3].layout.dtype(),
+        });
+    }
+    check_float(output, Operand::Output)?;
+    let [vocab, packed_width]: [u32; 2] = inputs[0]
+        .layout
+        .shape()
+        .try_into()
+        .map_err(|_| shape_error(Operand::Input(0)))?;
+    let values_per_word = 32_u32
+        .checked_div(u32::from(bits))
+        .filter(|_| matches!(bits, 4 | 8))
+        .ok_or(OpError::InvalidQuantization)?;
+    let hidden = packed_width
+        .checked_mul(values_per_word)
+        .ok_or(OpError::InvalidQuantization)?;
+    QuantizedMatrix::new(
+        vocab,
+        hidden,
+        bits,
+        group_size,
+        inputs[0].layout.clone(),
+        inputs[1].layout.clone(),
+        inputs[2].layout.clone(),
+    )
+    .map_err(|error| quantized_matrix_error(error, inputs))?;
+    let [tokens]: [u32; 1] = inputs[3]
+        .layout
+        .shape()
+        .try_into()
+        .map_err(|_| shape_error(Operand::Input(3)))?;
+    if output.layout.shape() != [tokens, hidden] {
+        return Err(shape_error(Operand::Output));
     }
     Ok(())
 }
@@ -1966,6 +2028,29 @@ mod tests {
             Err(OpError::DType {
                 operand: Operand::Input(1),
                 dtype: DType::F32
+            })
+        );
+    }
+
+    #[test]
+    fn quantized_embed_rejects_invalid_signatures() {
+        let packed = tensor(1, DType::U32, &[33, 128], &[128, 1]);
+        let scales = tensor(2, DType::BF16, &[33, 16], &[16, 1]);
+        let biases = tensor(3, DType::BF16, &[33, 16], &[16, 1]);
+        let ids = tensor(4, DType::U32, &[7], &[1]);
+        let output = tensor(5, DType::F32, &[7, 1024], &[1024, 1]);
+        let op = Op::QuantEmbed {
+            bits: 4,
+            group_size: 64,
+        };
+        CommandList::new()
+            .dispatch(op, &[&packed, &scales, &biases, &ids], &output)
+            .unwrap();
+        let wrong_output = tensor(6, DType::F32, &[7, 1023], &[1023, 1]);
+        assert_eq!(
+            CommandList::new().dispatch(op, &[&packed, &scales, &biases, &ids], &wrong_output,),
+            Err(OpError::Shape {
+                operand: Operand::Output
             })
         );
     }

@@ -1539,6 +1539,7 @@ const fn op_name(operation: Op) -> &'static str {
         Op::Sample { .. } => "sample",
         Op::Rope { .. } => "rope",
         Op::Embed => "embed",
+        Op::QuantEmbed { .. } => "quant-embed",
         Op::Matmul => "matmul",
         Op::GatherMatmul => "gather-matmul",
         Op::QuantMatmul { .. } => "quant-matmul",

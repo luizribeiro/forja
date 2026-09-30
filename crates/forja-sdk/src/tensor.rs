@@ -980,6 +980,58 @@ impl<T: Element> Tensor<T> {
     }
 }
 
+impl Tensor<u32> {
+    /// Gathers rows from an affine-quantized table and dequantizes them to `T`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for unsupported quantization parameters, incompatible shapes or dtypes,
+    /// an out-of-range token id, or a refused dispatch.
+    pub fn quant_embedding<T: FloatElement, S: FloatElement>(
+        &self,
+        packed: &Tensor<u32>,
+        scales: &Tensor<S>,
+        biases: &Tensor<S>,
+        bits: u8,
+        group_size: u32,
+    ) -> Result<Tensor<T>> {
+        if !matches!(bits, 4 | 8) || !matches!(group_size, 32 | 64 | 128) {
+            return Err(Error::new("unsupported affine quantization parameters"));
+        }
+        let [tokens] = self
+            .shape
+            .as_slice()
+            .try_into()
+            .map_err(|_| Error::new("embedding ids must have rank one"))?;
+        let [vocab, packed_width]: [u32; 2] = packed
+            .shape
+            .as_slice()
+            .try_into()
+            .map_err(|_| Error::new("quantized embedding weights must have rank two"))?;
+        let hidden = packed_width
+            .checked_mul(32 / u32::from(bits))
+            .ok_or_else(|| Error::new("quantized embedding width overflowed"))?;
+        if !hidden.is_multiple_of(group_size) {
+            return Err(Error::new(
+                "quantized embedding group size must divide the hidden width",
+            ));
+        }
+        let parameter_shape = [vocab, hidden / group_size];
+        if scales.shape != parameter_shape || biases.shape != parameter_shape {
+            return Err(Error::new(
+                "quantized embedding scale and bias shapes are invalid",
+            ));
+        }
+        let output = Tensor::<T>::empty(vec![tokens, hidden])?;
+        graph::record(
+            sys::Op::QuantEmbed { bits, group_size },
+            &[&packed.handle, &scales.handle, &biases.handle, &self.handle],
+            &output.handle,
+        )?;
+        Ok(output)
+    }
+}
+
 impl<T: Element> Add<&Tensor<T>> for &Tensor<T> {
     type Output = Result<Tensor<T>>;
 

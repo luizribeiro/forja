@@ -3323,6 +3323,10 @@ fn core_op(operation: compute::Op) -> (TemplateOp, Option<Op>) {
             theta: config.theta,
         }),
         compute::Op::Embed => concrete_template(Op::Embed),
+        compute::Op::QuantEmbed(config) => concrete_template(Op::QuantEmbed {
+            bits: config.bits,
+            group_size: config.group_size,
+        }),
         compute::Op::Matmul => concrete_template(Op::Matmul),
         compute::Op::GatherMatmul => concrete_template(Op::GatherMatmul),
         compute::Op::QuantMatmul(config) => concrete_template(Op::QuantMatmul {

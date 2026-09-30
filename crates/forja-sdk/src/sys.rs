@@ -81,6 +81,10 @@ pub(crate) enum Op {
     },
     Rope(f32),
     Embed,
+    QuantEmbed {
+        bits: u8,
+        group_size: u32,
+    },
     Matmul,
     GatherMatmul,
     QuantMatmul {
@@ -396,6 +400,9 @@ pub(crate) mod guest {
             }),
             Op::Rope(theta) => compute::Op::Rope(compute::RopeCfg { theta }),
             Op::Embed => compute::Op::Embed,
+            Op::QuantEmbed { bits, group_size } => {
+                compute::Op::QuantEmbed(compute::QuantMatmulCfg { bits, group_size })
+            }
             Op::Matmul => compute::Op::Matmul,
             Op::GatherMatmul => compute::Op::GatherMatmul,
             Op::QuantMatmul { bits, group_size } => {
@@ -954,6 +961,7 @@ pub(crate) mod native {
             },
             Op::Rope(theta) => CoreOp::Rope { theta },
             Op::Embed => CoreOp::Embed,
+            Op::QuantEmbed { bits, group_size } => CoreOp::QuantEmbed { bits, group_size },
             Op::Matmul => CoreOp::Matmul,
             Op::GatherMatmul => CoreOp::GatherMatmul,
             Op::QuantMatmul { bits, group_size } => CoreOp::QuantMatmul { bits, group_size },

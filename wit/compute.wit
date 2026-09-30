@@ -147,6 +147,7 @@ interface compute {
     sample(sample-cfg),
     rope(rope-cfg),
     embed,
+    quant-embed(quant-matmul-cfg),
     matmul,
     gather-matmul,
     quant-matmul(quant-matmul-cfg),

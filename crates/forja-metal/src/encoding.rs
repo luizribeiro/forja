@@ -2186,6 +2186,13 @@ impl MetalBackend {
                 error_flags.push(flag);
                 buffers
             }
+            Op::QuantEmbed { bits, group_size } => {
+                let (buffers, flag) = self.encode_quant_embed(
+                    encoder, table, dispatch, bits, group_size, bindings, arguments,
+                )?;
+                error_flags.push(flag);
+                buffers
+            }
             Op::Copy => self.encode_copy(encoder, table, dispatch, bindings, arguments)?,
             Op::Matmul => self.encode_matmul(encoder, table, dispatch, bindings, arguments)?,
             Op::GatherMatmul => {
@@ -3754,6 +3761,86 @@ impl MetalBackend {
         Ok((temporaries, error_flag))
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn encode_quant_embed(
+        &self,
+        encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
+        table: &ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>,
+        dispatch: &Dispatch,
+        bits: u8,
+        group_size: u32,
+        bindings: &mut ArgumentBindings,
+        arguments: &mut ArgumentWriter,
+    ) -> Result<EncodedEmbed, BackendError> {
+        let [packed, scales, biases, ids] = dispatch.inputs() else {
+            return Err(BackendError::InvalidInput);
+        };
+        let output = dispatch.output();
+        let vocab = packed.layout().shape()[0];
+        let width = output.layout().shape()[1];
+        let pipeline = self
+            .pipelines
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?
+            .get(
+                "quant_embed",
+                &[
+                    (1, dtype_code(scales.layout().dtype())),
+                    (2, dtype_code(output.layout().dtype())),
+                    (12, u32::from(bits)),
+                    (13, group_size),
+                ],
+            )?;
+        set_pipeline(encoder, &pipeline);
+        let mut params = [0_u8; 8];
+        params[..4].copy_from_slice(&vocab.to_ne_bytes());
+        params[4..].copy_from_slice(&width.to_ne_bytes());
+        let mut error_state = [0_u8; 8];
+        error_state[4..].copy_from_slice(&u32::MAX.to_ne_bytes());
+        let error_flag = arguments.write(&error_state)?;
+        let temporaries = vec![
+            Self::layout_buffer(packed.layout(), arguments)?,
+            Self::layout_buffer(scales.layout(), arguments)?,
+            Self::layout_buffer(biases.layout(), arguments)?,
+            Self::layout_buffer(ids.layout(), arguments)?,
+            Self::layout_buffer(output.layout(), arguments)?,
+            arguments.write(&params)?,
+            error_flag.clone(),
+        ];
+        let buffers = self
+            .buffers
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?;
+        for (index, tensor) in [packed, scales, biases, ids, output]
+            .into_iter()
+            .enumerate()
+        {
+            bindings.bind_raw(table, index, &buffers.get(tensor)?.raw);
+            bindings.bind(table, index + 5, &temporaries[index]);
+        }
+        bindings.bind(table, 10, &temporaries[5]);
+        bindings.bind(table, 11, &temporaries[6]);
+        drop(buffers);
+        set_argument_table(encoder, table);
+        let thread_count = usize::try_from(output.layout().element_count())
+            .map_err(|_| BackendError::InvalidInput)?;
+        let group_width = pipeline.maxTotalThreadsPerThreadgroup().clamp(1, 256);
+        dispatch_threadgroups(
+            encoder,
+            MTLSize {
+                width: thread_count.div_ceil(group_width),
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: group_width,
+                height: 1,
+                depth: 1,
+            },
+        );
+        Ok((temporaries, error_flag))
+    }
+
     fn encode_softmax(
         &self,
         encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
@@ -4661,6 +4748,11 @@ impl MetalBackend {
                     arguments.write(len)?;
                 }
             }
+            Op::QuantEmbed { .. } => {
+                for len in [8, 112, 112, 112, 112, 112, 8] {
+                    arguments.write(len)?;
+                }
+            }
             Op::Matmul => Self::size_matmul_arguments(dispatch, arguments)?,
             Op::GatherMatmul => {
                 arguments.write(136)?;
@@ -5063,6 +5155,7 @@ fn supported_dispatch(dispatch: &Dispatch) -> bool {
         | Op::TopK { .. }
         | Op::Rope { .. }
         | Op::Embed
+        | Op::QuantEmbed { .. }
         | Op::Matmul
         | Op::GatherMatmul
         | Op::QuantMatmul { .. }
@@ -5139,6 +5232,7 @@ fn dispatch_kernel(dispatch: &Dispatch) -> Result<&'static str, BackendError> {
         Op::Sample { .. } => "sample_rejection",
         Op::Rope { .. } => "rope",
         Op::Embed => "embed",
+        Op::QuantEmbed { .. } => "quant-embed",
         Op::Matmul => matmul_kernel(dispatch)?,
         Op::GatherMatmul => "gather_gemv",
         Op::QuantMatmul { .. } => {
@@ -5229,6 +5323,7 @@ fn reusable_dispatch(dispatch: &Dispatch) -> bool {
         | Op::TopK { .. }
         | Op::Sample { .. }
         | Op::Embed
+        | Op::QuantEmbed { .. }
         | Op::GatherMatmul
         | Op::GatherQuantMatmul { .. }
         | Op::GatherQuantSiluMul { .. }
