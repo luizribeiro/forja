@@ -99,6 +99,9 @@ impl WeightElement for f32 {
 /// Structured tensor operations.
 pub mod ops;
 
+/// Reusable transformer blocks.
+pub mod blocks;
+
 /// A linear projection with an `[output, input]` weight tensor.
 pub struct Linear<T: Element> {
     weight: Tensor<T>,

@@ -31,7 +31,7 @@ use forja_sdk::{
     kernel::{Kernel, TensorRef},
     nn::{
         Embedding, EmbeddingConfig, Linear, LinearConfig, RmsNorm, RmsNormConfig, WeightElement,
-        ops::sdpa,
+        blocks::KvCache, ops::sdpa,
     },
 };
 
@@ -194,11 +194,6 @@ struct QwenWeights<T: Activation> {
     model: Model<T>,
 }
 
-struct LayerCache<T: Activation> {
-    key: Tensor<T>,
-    value: Tensor<T>,
-}
-
 struct FusedKernels {
     silu_mul: Option<Kernel>,
     qk_norm_rope: Option<Kernel>,
@@ -251,7 +246,7 @@ fn required_kernel<'a>(kernel: &'a Option<Kernel>, name: &str) -> Result<&'a Ker
 }
 
 struct LayerResources<'a, T: Activation> {
-    cache: &'a mut LayerCache<T>,
+    cache: &'a mut KvCache<T>,
     following_norm: Option<&'a RmsNorm<T>>,
 }
 
@@ -261,21 +256,6 @@ struct LayerPosition<'a, T: Activation> {
     sequence: u32,
     start: &'a Dim,
     end: &'a Dim,
-}
-
-impl<T: Activation> LayerCache<T> {
-    fn new() -> Result<Self> {
-        let shape = [KEY_VALUE_HEADS, MAX_CONTEXT, HEAD_DIM];
-        let count = usize::try_from(
-            u64::from(KEY_VALUE_HEADS) * u64::from(MAX_CONTEXT) * u64::from(HEAD_DIM),
-        )
-        .map_err(|_| forja_sdk::Error::loading("KV cache size does not fit usize"))?;
-        let zeros = vec![T::ZERO; count];
-        Ok(Self {
-            key: Tensor::from_slice(&zeros, &shape)?,
-            value: Tensor::from_slice(&zeros, &shape)?,
-        })
-    }
 }
 
 impl<T: Activation> DecoderLayer<T> {
@@ -344,12 +324,11 @@ impl<T: Activation> DecoderLayer<T> {
         let value = value_projection
             .reshape(&[sequence, KEY_VALUE_HEADS, HEAD_DIM])?
             .permute(&[1, 0, 2])?;
-        key.copy_into(&mut cache.key.narrow(1, start, sequence)?)?;
-        value.copy_into(&mut cache.value.narrow(1, start, sequence)?)?;
+        let (cached_key, cached_value) = cache.append(&key, &value, start, sequence, end)?;
         let attended = sdpa(
             &query,
-            &cache.key.narrow(1, 0, end)?,
-            &cache.value.narrow(1, 0, end)?,
+            &cached_key,
+            &cached_value,
             ATTENTION_SCALE,
             true,
             start,
@@ -518,7 +497,7 @@ enum DecodeSelection {
 /// Qwen3-0.6B with a fixed 4096-token KV cache.
 pub struct Qwen3<T: Activation = f32> {
     weights: QwenWeights<T>,
-    caches: Vec<LayerCache<T>>,
+    caches: Vec<KvCache<T>>,
     kernels: FusedKernels,
     positions: Tensor<u32>,
     activation_positions: Option<Tensor<T>>,
@@ -542,7 +521,7 @@ impl<T: Activation> Qwen3<T> {
     fn load_from_weights(weights: &Weights<'_>) -> Result<Self> {
         let weights = QwenWeights::<_>::load(weights, &Config)?;
         let caches = (0..LAYERS)
-            .map(|_| LayerCache::new())
+            .map(|_| KvCache::new(KEY_VALUE_HEADS, MAX_CONTEXT, HEAD_DIM, T::ZERO))
             .collect::<Result<Vec<_>>>()?;
         let kernels = FusedKernels::load::<T>()?;
         let positions = Tensor::constant(&(0..MAX_CONTEXT).collect::<Vec<_>>(), &[MAX_CONTEXT])?;
