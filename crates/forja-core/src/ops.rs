@@ -192,6 +192,13 @@ pub enum Op {
         /// Number of input elements sharing one scale and bias.
         group_size: u32,
     },
+    /// Computes `SiLU(gate) * up` from two gathered affine-quantized projections.
+    GatherQuantSiluMul {
+        /// Number of bits in each unsigned quantized value.
+        bits: u8,
+        /// Number of input elements sharing one scale and bias.
+        group_size: u32,
+    },
     /// Computes grouped-query scaled dot-product attention.
     Sdpa {
         /// The score multiplier.
@@ -340,6 +347,9 @@ impl Dispatch {
             }
             Op::GatherQuantMatmul { bits, group_size } => {
                 check_gather_quant_matmul(inputs, output, bits, group_size)?;
+            }
+            Op::GatherQuantSiluMul { bits, group_size } => {
+                check_gather_quant_silu_mul(inputs, output, bits, group_size)?;
             }
             Op::Sdpa {
                 scale,
@@ -1134,50 +1144,99 @@ fn check_gather_quant_matmul(
             actual: inputs.len(),
         });
     }
-    check_float(inputs[0], Operand::Input(0))?;
+    check_gather_quant_projection(inputs, output, bits, group_size, [0, 1, 2, 3, 4])
+}
+
+fn check_gather_quant_silu_mul(
+    inputs: &[&Tensor],
+    output: &Tensor,
+    bits: u8,
+    group_size: u32,
+) -> Result<(), OpError> {
+    if inputs.len() != 8 {
+        return Err(OpError::Arity {
+            expected: 8,
+            actual: inputs.len(),
+        });
+    }
+    check_gather_quant_projection(inputs, output, bits, group_size, [0, 1, 2, 3, 7])?;
+    check_gather_quant_projection(inputs, output, bits, group_size, [0, 4, 5, 6, 7])?;
+    if inputs[5].layout.dtype() != inputs[2].layout.dtype() {
+        return Err(OpError::DType {
+            operand: Operand::Input(5),
+            dtype: inputs[5].layout.dtype(),
+        });
+    }
+    Ok(())
+}
+
+fn check_gather_quant_projection(
+    inputs: &[&Tensor],
+    output: &Tensor,
+    bits: u8,
+    group_size: u32,
+    positions: [usize; 5],
+) -> Result<(), OpError> {
+    let [
+        input_position,
+        packed_position,
+        scale_position,
+        bias_position,
+        index_position,
+    ] = positions;
+    let input = inputs[input_position];
+    let packed_input = inputs[packed_position];
+    let scale_input = inputs[scale_position];
+    let bias_input = inputs[bias_position];
+    let index_input = inputs[index_position];
+    check_float(input, Operand::Input(input_position))?;
     check_float(output, Operand::Output)?;
-    if output.layout.dtype() != inputs[0].layout.dtype() {
+    if output.layout.dtype() != input.layout.dtype() {
         return Err(OpError::DType {
             operand: Operand::Output,
             dtype: output.layout.dtype(),
         });
     }
-    if inputs[4].layout.dtype() != DType::U32 {
+    if index_input.layout.dtype() != DType::U32 {
         return Err(OpError::DType {
-            operand: Operand::Input(4),
-            dtype: inputs[4].layout.dtype(),
+            operand: Operand::Input(index_position),
+            dtype: index_input.layout.dtype(),
         });
     }
-    let [rows, inner]: [u32; 2] = inputs[0]
+    let [rows, inner]: [u32; 2] = input
         .layout
         .shape()
         .try_into()
-        .map_err(|_| shape_error(Operand::Input(0)))?;
-    let [experts, out, _]: [u32; 3] = inputs[1]
+        .map_err(|_| shape_error(Operand::Input(input_position)))?;
+    let [experts, out, _]: [u32; 3] = packed_input
         .layout
         .shape()
         .try_into()
-        .map_err(|_| shape_error(Operand::Input(1)))?;
-    for (index, part) in inputs[1..4].iter().enumerate() {
+        .map_err(|_| shape_error(Operand::Input(packed_position)))?;
+    for (position, part) in [
+        (packed_position, packed_input),
+        (scale_position, scale_input),
+        (bias_position, bias_input),
+    ] {
         if part.layout.shape().first() != Some(&experts) {
-            return Err(shape_error(Operand::Input(index + 1)));
+            return Err(shape_error(Operand::Input(position)));
         }
     }
-    let packed =
-        expert_matrix_layout(inputs[1].layout()).map_err(|()| shape_error(Operand::Input(1)))?;
-    let scales =
-        expert_matrix_layout(inputs[2].layout()).map_err(|()| shape_error(Operand::Input(2)))?;
-    let biases =
-        expert_matrix_layout(inputs[3].layout()).map_err(|()| shape_error(Operand::Input(3)))?;
+    let packed = expert_matrix_layout(packed_input.layout())
+        .map_err(|()| shape_error(Operand::Input(packed_position)))?;
+    let scales = expert_matrix_layout(scale_input.layout())
+        .map_err(|()| shape_error(Operand::Input(scale_position)))?;
+    let biases = expert_matrix_layout(bias_input.layout())
+        .map_err(|()| shape_error(Operand::Input(bias_position)))?;
     QuantizedMatrix::new(out, inner, bits, group_size, packed, scales, biases)
-        .map_err(|error| quantized_matrix_error(error, inputs))?;
-    let [index_rows, k]: [u32; 2] = inputs[4]
+        .map_err(|error| quantized_matrix_error_at(error, inputs, positions))?;
+    let [index_rows, k]: [u32; 2] = index_input
         .layout
         .shape()
         .try_into()
-        .map_err(|_| shape_error(Operand::Input(4)))?;
+        .map_err(|_| shape_error(Operand::Input(index_position)))?;
     if index_rows != rows {
-        return Err(shape_error(Operand::Input(4)));
+        return Err(shape_error(Operand::Input(index_position)));
     }
     if output.layout.shape() != [rows, k, out] {
         return Err(shape_error(Operand::Output));
@@ -1198,22 +1257,30 @@ fn expert_matrix_layout(layout: &Layout) -> Result<Layout, ()> {
 }
 
 fn quantized_matrix_error(error: QuantizedMatrixError, inputs: &[&Tensor]) -> OpError {
+    quantized_matrix_error_at(error, inputs, [0, 1, 2, 3, 0])
+}
+
+fn quantized_matrix_error_at(
+    error: QuantizedMatrixError,
+    inputs: &[&Tensor],
+    positions: [usize; 5],
+) -> OpError {
     match error {
         QuantizedMatrixError::UnsupportedBitWidth | QuantizedMatrixError::UnsupportedGroupSize => {
             OpError::InvalidQuantization
         }
         QuantizedMatrixError::ColumnsNotPackable | QuantizedMatrixError::ColumnsNotGrouped => {
-            shape_error(Operand::Input(0))
+            shape_error(Operand::Input(positions[0]))
         }
         QuantizedMatrixError::DTypeMismatch { part } => {
-            let input = quantized_part_input(part);
+            let input = positions[quantized_part_input(part)];
             OpError::DType {
                 operand: Operand::Input(input),
                 dtype: inputs[input].layout.dtype(),
             }
         }
         QuantizedMatrixError::ShapeMismatch { part } => {
-            shape_error(Operand::Input(quantized_part_input(part)))
+            shape_error(Operand::Input(positions[quantized_part_input(part)]))
         }
     }
 }
@@ -1279,6 +1346,12 @@ pub fn gather_quant_matmul_flops(input: &[u32], packed: &[u32], indices: &[u32])
         .checked_mul(u64::from(inner))?
         .checked_mul(u64::from(columns))?
         .checked_mul(2)
+}
+
+/// Counts the multiply-add operations in fused gathered gate and up projections.
+#[must_use]
+pub fn gather_quant_silu_mul_flops(input: &[u32], packed: &[u32], indices: &[u32]) -> Option<u64> {
+    gather_quant_matmul_flops(input, packed, indices)?.checked_mul(2)
 }
 
 /// Counts the floating-point operations in scaled dot-product attention.
@@ -2102,6 +2175,34 @@ mod tests {
             ),
             Err(OpError::Shape {
                 operand: Operand::Input(2)
+            })
+        );
+        let fused = Op::GatherQuantSiluMul {
+            bits: 4,
+            group_size: 64,
+        };
+        assert!(
+            CommandList::new()
+                .dispatch(
+                    fused,
+                    &[
+                        &input, &packed, &scales, &biases, &packed, &scales, &biases, &indices,
+                    ],
+                    &output,
+                )
+                .is_ok()
+        );
+        let wrong_up = tensor(9, DType::U32, &[5, 32, 8], &[256, 8, 1]);
+        assert_eq!(
+            CommandList::new().dispatch(
+                fused,
+                &[
+                    &input, &packed, &scales, &biases, &wrong_up, &scales, &biases, &indices,
+                ],
+                &output,
+            ),
+            Err(OpError::Shape {
+                operand: Operand::Input(5)
             })
         );
     }

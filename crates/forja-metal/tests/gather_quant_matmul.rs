@@ -21,6 +21,38 @@ fn small_row_gathered_quantized_matmul_matches_cpu_with_duplicates() {
 }
 
 #[test]
+fn fused_gathered_gate_and_up_matches_cpu() {
+    let cpu = CpuBackend::new();
+    let metal = MetalBackend::new().unwrap();
+    let selected = [7_u32, 0, 7]
+        .into_iter()
+        .flat_map(u32::to_le_bytes)
+        .collect::<Vec<_>>();
+    let inputs = [
+        TensorSpec::contiguous(DType::BF16, &[1, 64]),
+        TensorSpec::contiguous(DType::U32, &[8, 33, 8]),
+        TensorSpec::contiguous(DType::F16, &[8, 33, 1]),
+        TensorSpec::contiguous(DType::F16, &[8, 33, 1]),
+        TensorSpec::contiguous(DType::U32, &[8, 33, 8]),
+        TensorSpec::contiguous(DType::F16, &[8, 33, 1]),
+        TensorSpec::contiguous(DType::F16, &[8, 33, 1]),
+        TensorSpec::initialized(DType::U32, &[1, 3], selected),
+    ];
+    let output = TensorSpec::contiguous(DType::BF16, &[1, 3, 33]);
+    assert_backends_agree(
+        &cpu,
+        &metal,
+        Op::GatherQuantSiluMul {
+            bits: 4,
+            group_size: 64,
+        },
+        &inputs,
+        &output,
+    )
+    .unwrap();
+}
+
+#[test]
 fn gpu_written_out_of_range_expert_is_reported() {
     let metal = MetalBackend::new().unwrap();
     let input = metal.alloc(DType::F32, &[1, 64]).unwrap();

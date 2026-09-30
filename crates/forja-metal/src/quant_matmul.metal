@@ -200,6 +200,119 @@ struct GatherQuantMatmulParams {
     uint group_size;
 };
 
+void gather_quantized_sums(
+    device const uchar *input,
+    device const uchar *packed,
+    device const uchar *scales,
+    device const uchar *biases,
+    constant GatherQuantMatmulParams &params,
+    uint row,
+    uint expert,
+    uint first_column,
+    ushort lane,
+    thread float (&sums)[8]) {
+    uint values_per_word = 32 / quant_bits;
+    uint words_per_group = quant_group_size / values_per_word;
+    uint mask = (1u << quant_bits) - 1u;
+    for (uint first_word = uint(lane) * 4;
+         first_word < params.packed_width;
+         first_word += 128) {
+        uint group = first_word / words_per_group;
+        float input_sum = 0.0f;
+        float quantized_sums[8] = {0.0f};
+        uint4 quantized_words[8] = {uint4(0u)};
+        for (uint item = 0; item < 8; ++item) {
+            uint column = first_column + item;
+            if (column < params.columns) {
+                ulong index = params.packed_offset +
+                    ulong(expert) * params.packed_expert_stride +
+                    ulong(column) * params.packed_row_stride +
+                    ulong(first_word) * params.packed_word_stride;
+                if (params.packed_word_stride == 1 && (index & 3) == 0) {
+                    quantized_words[item] =
+                        *(device const uint4 *)(packed + index * sizeof(uint));
+                } else {
+                    for (uint word = 0; word < 4; ++word) {
+                        quantized_words[item][word] = load_uint(
+                            packed,
+                            index + ulong(word) * params.packed_word_stride);
+                    }
+                }
+            }
+        }
+        for (uint word = 0; word < 4; ++word) {
+            uint word_index = first_word + word;
+            uint inner = word_index * values_per_word;
+            if (params.input_inner_stride == 1 &&
+                ((params.input_offset + ulong(row) * params.input_row_stride +
+                  ulong(inner)) & 3) == 0) {
+                ulong input_index = params.input_offset +
+                    ulong(row) * params.input_row_stride + ulong(inner);
+                float4 first = load_float4_contiguous(input, input_index, input0_dtype);
+                input_sum += dot(first, float4(1.0f));
+                if (quant_bits == 4) {
+                    float4 second = load_float4_contiguous(
+                        input, input_index + 4, input0_dtype);
+                    input_sum += dot(second, float4(1.0f));
+                    float4 shifts = float4(
+                        1.0f, 1.0f / 16.0f, 1.0f / 256.0f, 1.0f / 4096.0f);
+                    first *= shifts;
+                    second *= shifts;
+                    for (uint item = 0; item < 8; ++item) {
+                        ushort2 halves = as_type<ushort2>(quantized_words[item][word]);
+                        uint4 low = uint4(
+                            halves[0] & 0x000fu, halves[0] & 0x00f0u,
+                            halves[0] & 0x0f00u, halves[0] & 0xf000u);
+                        uint4 high = uint4(
+                            halves[1] & 0x000fu, halves[1] & 0x00f0u,
+                            halves[1] & 0x0f00u, halves[1] & 0xf000u);
+                        quantized_sums[item] +=
+                            dot(first, float4(low)) + dot(second, float4(high));
+                    }
+                } else {
+                    for (uint item = 0; item < 8; ++item) {
+                        uchar4 values = as_type<uchar4>(quantized_words[item][word]);
+                        quantized_sums[item] += dot(first, float4(values));
+                    }
+                }
+            } else {
+                for (uint element = 0; element < values_per_word; ++element) {
+                    float value = load_float(
+                        input,
+                        params.input_offset + ulong(row) * params.input_row_stride +
+                            ulong(inner + element) * params.input_inner_stride,
+                        input0_dtype);
+                    input_sum += value;
+                    uint shift = element * quant_bits;
+                    for (uint item = 0; item < 8; ++item) {
+                        uint quantized = (quantized_words[item][word] >> shift) & mask;
+                        quantized_sums[item] += value * float(quantized);
+                    }
+                }
+            }
+        }
+        for (uint item = 0; item < 8; ++item) {
+            uint column = first_column + item;
+            if (column < params.columns) {
+                ulong scale_index = params.scale_offset +
+                    ulong(expert) * params.scale_expert_stride +
+                    ulong(column) * params.scale_row_stride +
+                    ulong(group) * params.scale_group_stride;
+                ulong bias_index = params.bias_offset +
+                    ulong(expert) * params.bias_expert_stride +
+                    ulong(column) * params.bias_row_stride +
+                    ulong(group) * params.bias_group_stride;
+                sums[item] += load_float(scales, scale_index, input1_dtype) *
+                    quantized_sums[item] +
+                    load_float(biases, bias_index, input1_dtype) * input_sum;
+            }
+        }
+    }
+    for (uint item = 0; item < 8; ++item) {
+        sums[item] = simd_sum(sums[item]);
+    }
+}
+
 kernel void gather_quantized_gemv(
     device const uchar *input [[buffer(0)]],
     device const uchar *packed [[buffer(1)]],
@@ -224,108 +337,10 @@ kernel void gather_quantized_gemv(
         atomic_fetch_min_explicit(error_flag + 1, expert, memory_order_relaxed);
     }
     uint first_column = tile.x * 16 + uint(simdgroup) * 8;
-    uint values_per_word = 32 / quant_bits;
-    uint words_per_group = quant_group_size / values_per_word;
-    uint mask = (1u << quant_bits) - 1u;
     float sums[8] = {0.0f};
     if (valid) {
-        for (uint first_word = uint(lane) * 4;
-             first_word < params.packed_width;
-             first_word += 128) {
-            uint group = first_word / words_per_group;
-            float input_sum = 0.0f;
-            float quantized_sums[8] = {0.0f};
-            uint4 quantized_words[8] = {uint4(0u)};
-            for (uint item = 0; item < 8; ++item) {
-                uint column = first_column + item;
-                if (column < params.columns) {
-                    ulong index = params.packed_offset +
-                        ulong(expert) * params.packed_expert_stride +
-                        ulong(column) * params.packed_row_stride +
-                        ulong(first_word) * params.packed_word_stride;
-                    if (params.packed_word_stride == 1 && (index & 3) == 0) {
-                        quantized_words[item] =
-                            *(device const uint4 *)(packed + index * sizeof(uint));
-                    } else {
-                        for (uint word = 0; word < 4; ++word) {
-                            quantized_words[item][word] = load_uint(
-                                packed,
-                                index + ulong(word) * params.packed_word_stride);
-                        }
-                    }
-                }
-            }
-            for (uint word = 0; word < 4; ++word) {
-                uint word_index = first_word + word;
-                uint inner = word_index * values_per_word;
-                if (params.input_inner_stride == 1 &&
-                    ((params.input_offset + ulong(row) * params.input_row_stride +
-                      ulong(inner)) & 3) == 0) {
-                    ulong input_index = params.input_offset +
-                        ulong(row) * params.input_row_stride + ulong(inner);
-                    float4 first = load_float4_contiguous(input, input_index, input0_dtype);
-                    input_sum += dot(first, float4(1.0f));
-                    if (quant_bits == 4) {
-                        float4 second = load_float4_contiguous(
-                            input, input_index + 4, input0_dtype);
-                        input_sum += dot(second, float4(1.0f));
-                        float4 shifts = float4(
-                            1.0f, 1.0f / 16.0f, 1.0f / 256.0f, 1.0f / 4096.0f);
-                        first *= shifts;
-                        second *= shifts;
-                        for (uint item = 0; item < 8; ++item) {
-                            ushort2 halves = as_type<ushort2>(quantized_words[item][word]);
-                            uint4 low = uint4(
-                                halves[0] & 0x000fu, halves[0] & 0x00f0u,
-                                halves[0] & 0x0f00u, halves[0] & 0xf000u);
-                            uint4 high = uint4(
-                                halves[1] & 0x000fu, halves[1] & 0x00f0u,
-                                halves[1] & 0x0f00u, halves[1] & 0xf000u);
-                            quantized_sums[item] +=
-                                dot(first, float4(low)) + dot(second, float4(high));
-                        }
-                    } else {
-                        for (uint item = 0; item < 8; ++item) {
-                            uchar4 values = as_type<uchar4>(quantized_words[item][word]);
-                            quantized_sums[item] += dot(first, float4(values));
-                        }
-                    }
-                } else {
-                    for (uint element = 0; element < values_per_word; ++element) {
-                        float value = load_float(
-                            input,
-                            params.input_offset + ulong(row) * params.input_row_stride +
-                                ulong(inner + element) * params.input_inner_stride,
-                            input0_dtype);
-                        input_sum += value;
-                        uint shift = element * quant_bits;
-                        for (uint item = 0; item < 8; ++item) {
-                            uint quantized = (quantized_words[item][word] >> shift) & mask;
-                            quantized_sums[item] += value * float(quantized);
-                        }
-                    }
-                }
-            }
-            for (uint item = 0; item < 8; ++item) {
-                uint column = first_column + item;
-                if (column < params.columns) {
-                    ulong scale_index = params.scale_offset +
-                        ulong(expert) * params.scale_expert_stride +
-                        ulong(column) * params.scale_row_stride +
-                        ulong(group) * params.scale_group_stride;
-                    ulong bias_index = params.bias_offset +
-                        ulong(expert) * params.bias_expert_stride +
-                        ulong(column) * params.bias_row_stride +
-                        ulong(group) * params.bias_group_stride;
-                    sums[item] += load_float(scales, scale_index, input1_dtype) *
-                        quantized_sums[item] +
-                        load_float(biases, bias_index, input1_dtype) * input_sum;
-                }
-            }
-        }
-    }
-    for (uint item = 0; item < 8; ++item) {
-        sums[item] = simd_sum(sums[item]);
+        gather_quantized_sums(
+            input, packed, scales, biases, params, row, expert, first_column, lane, sums);
     }
     if (lane == 0) {
         for (uint item = 0; item < 8; ++item) {
@@ -336,6 +351,78 @@ kernel void gather_quantized_gemv(
                     ulong(slot) * params.output_slot_stride +
                     ulong(column) * params.output_column_stride;
                 store_float(output, output_index, output_dtype, sums[item]);
+            }
+        }
+    }
+}
+
+kernel void gather_quantized_silu_mul(
+    device const uchar *input [[buffer(0)]],
+    device const uchar *gate_packed [[buffer(1)]],
+    device const uchar *gate_scales [[buffer(2)]],
+    device const uchar *gate_biases [[buffer(3)]],
+    device const uchar *up_packed [[buffer(4)]],
+    device const uchar *up_scales [[buffer(5)]],
+    device const uchar *up_biases [[buffer(6)]],
+    device const uint *indices [[buffer(7)]],
+    device uchar *output [[buffer(8)]],
+    constant GatherQuantMatmulParams &gate_params [[buffer(9)]],
+    constant GatherQuantMatmulParams &up_params [[buffer(10)]],
+    device atomic_uint *error_flag [[buffer(11)]],
+    ushort simdgroup [[simdgroup_index_in_threadgroup]],
+    ushort lane [[thread_index_in_simdgroup]],
+    uint2 tile [[threadgroup_position_in_grid]]) {
+    uint route = tile.y;
+    uint row = route / gate_params.routes;
+    uint slot = route % gate_params.routes;
+    uint expert = indices[
+        gate_params.indices_offset + ulong(row) * gate_params.indices_row_stride +
+        ulong(slot) * gate_params.indices_slot_stride];
+    bool valid = expert < gate_params.experts;
+    if (!valid && lane == 0 && simdgroup == 0) {
+        atomic_store_explicit(error_flag, 1, memory_order_relaxed);
+        atomic_fetch_min_explicit(error_flag + 1, expert, memory_order_relaxed);
+    }
+    bool gate_projection = simdgroup < 2;
+    uint projection_simdgroup = uint(simdgroup) & 1u;
+    uint first_column = tile.x * 16 + projection_simdgroup * 8;
+    float sums[8] = {0.0f};
+    if (valid) {
+        if (gate_projection) {
+            gather_quantized_sums(
+                input, gate_packed, gate_scales, gate_biases, gate_params,
+                row, expert, first_column, lane, sums);
+        } else {
+            gather_quantized_sums(
+                input, up_packed, up_scales, up_biases, up_params,
+                row, expert, first_column, lane, sums);
+        }
+    }
+    threadgroup float gate_values[16];
+    threadgroup float up_values[16];
+    if (lane == 0) {
+        for (uint item = 0; item < 8; ++item) {
+            uint local_column = projection_simdgroup * 8 + item;
+            if (gate_projection) {
+                gate_values[local_column] = sums[item];
+            } else {
+                up_values[local_column] = sums[item];
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane == 0 && simdgroup < 2) {
+        for (uint item = 0; item < 8; ++item) {
+            uint local_column = uint(simdgroup) * 8 + item;
+            uint column = tile.x * 16 + local_column;
+            if (column < gate_params.columns) {
+                float gate = gate_values[local_column];
+                float result = gate / (1.0f + exp(-gate)) * up_values[local_column];
+                ulong output_index = gate_params.output_offset +
+                    ulong(row) * gate_params.output_row_stride +
+                    ulong(slot) * gate_params.output_slot_stride +
+                    ulong(column) * gate_params.output_column_stride;
+                store_float(output, output_index, output_dtype, result);
             }
         }
     }

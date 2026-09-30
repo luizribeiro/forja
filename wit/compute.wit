@@ -151,6 +151,7 @@ interface compute {
     gather-matmul,
     quant-matmul(quant-matmul-cfg),
     gather-quant-matmul(quant-matmul-cfg),
+    gather-quant-silu-mul(quant-matmul-cfg),
     sdpa(sdpa-cfg),
   }
 

@@ -72,9 +72,19 @@ impl QwenMoe {
             64,
         )?;
         let (route_weights, indices) = nn::moe_router(&logits, TOP_K, true)?;
-        let gate = self.gate.apply(input, &indices)?;
-        let up = self.up.apply(input, &indices)?;
-        let hidden = gate.silu_mul(&up)?.reshape(&[TOP_K, INTERMEDIATE])?;
+        let hidden = input
+            .gather_quant_silu_mul(
+                &self.gate.packed,
+                &self.gate.scales,
+                &self.gate.biases,
+                &self.up.packed,
+                &self.up.scales,
+                &self.up.biases,
+                &indices,
+                4,
+                64,
+            )?
+            .reshape(&[TOP_K, INTERMEDIATE])?;
         let down_indices = indices.reshape(&[TOP_K, 1])?;
         let output = self
             .down

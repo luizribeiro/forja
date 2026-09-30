@@ -91,6 +91,10 @@ pub(crate) enum Op {
         bits: u8,
         group_size: u32,
     },
+    GatherQuantSiluMul {
+        bits: u8,
+        group_size: u32,
+    },
     Sdpa {
         scale: f32,
         causal: bool,
@@ -399,6 +403,9 @@ pub(crate) mod guest {
             }
             Op::GatherQuantMatmul { bits, group_size } => {
                 compute::Op::GatherQuantMatmul(compute::QuantMatmulCfg { bits, group_size })
+            }
+            Op::GatherQuantSiluMul { bits, group_size } => {
+                compute::Op::GatherQuantSiluMul(compute::QuantMatmulCfg { bits, group_size })
             }
             Op::Sdpa {
                 scale,
@@ -942,6 +949,9 @@ pub(crate) mod native {
             Op::QuantMatmul { bits, group_size } => CoreOp::QuantMatmul { bits, group_size },
             Op::GatherQuantMatmul { bits, group_size } => {
                 CoreOp::GatherQuantMatmul { bits, group_size }
+            }
+            Op::GatherQuantSiluMul { bits, group_size } => {
+                CoreOp::GatherQuantSiluMul { bits, group_size }
             }
             Op::Sdpa {
                 scale,

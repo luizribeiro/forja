@@ -704,6 +704,44 @@ impl CpuBackend {
         invalid_route.map_or(Ok(()), |index| Err(BackendError::IndexOutOfRange { index }))
     }
 
+    fn execute_gather_quant_silu_mul(
+        &self,
+        inputs: &[Tensor],
+        output: &Tensor,
+        bits: u8,
+        group_size: u32,
+    ) -> Result<(), BackendError> {
+        let gate = self.alloc(output.layout().dtype(), output.layout().shape())?;
+        self.execute_gather_quant_matmul(
+            &[
+                inputs[0].clone(),
+                inputs[1].clone(),
+                inputs[2].clone(),
+                inputs[3].clone(),
+                inputs[7].clone(),
+            ],
+            &gate,
+            bits,
+            group_size,
+        )?;
+        let up = self.alloc(output.layout().dtype(), output.layout().shape())?;
+        self.execute_gather_quant_matmul(
+            &[
+                inputs[0].clone(),
+                inputs[4].clone(),
+                inputs[5].clone(),
+                inputs[6].clone(),
+                inputs[7].clone(),
+            ],
+            &up,
+            bits,
+            group_size,
+        )?;
+        self.execute_binary(&[gate, up], output, |gate, up| {
+            gate / (1.0 + (-gate).exp()) * up
+        })
+    }
+
     fn execute_sdpa(
         &self,
         inputs: &[Tensor],
@@ -934,6 +972,12 @@ impl Backend for CpuBackend {
                     group_size,
                 ),
                 Op::GatherQuantMatmul { bits, group_size } => self.execute_gather_quant_matmul(
+                    dispatch.inputs(),
+                    dispatch.output(),
+                    bits,
+                    group_size,
+                ),
+                Op::GatherQuantSiluMul { bits, group_size } => self.execute_gather_quant_silu_mul(
                     dispatch.inputs(),
                     dispatch.output(),
                     bits,
@@ -2035,6 +2079,29 @@ mod tests {
         assert_eq!(
             decode(&backend.read(&output).unwrap(), DType::F32).unwrap(),
             [256.0, 320.0, 0.0, 64.0, 256.0, 320.0]
+        );
+
+        let fused = backend.alloc(DType::F32, &[1, 3, 2]).unwrap();
+        let mut commands = CommandList::new();
+        commands
+            .dispatch(
+                Op::GatherQuantSiluMul {
+                    bits: 4,
+                    group_size: 64,
+                },
+                &[
+                    &input, &packed, &scales, &biases, &packed, &scales, &biases, &indices,
+                ],
+                &fused,
+            )
+            .unwrap();
+        backend.submit(commands).unwrap().wait().unwrap();
+        let expected = [256.0_f32, 320.0, 0.0, 64.0, 256.0, 320.0]
+            .map(|value| value / (1.0 + (-value).exp()) * value);
+        assert_relative(
+            &decode(&backend.read(&fused).unwrap(), DType::F32).unwrap(),
+            &expected,
+            1e-5,
         );
 
         let invalid = backend.alloc(DType::U32, &[1, 2]).unwrap();

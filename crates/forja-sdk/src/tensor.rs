@@ -570,6 +570,86 @@ impl<T: Element> Tensor<T> {
     where
         T: FloatElement,
     {
+        let shape =
+            self.gather_quantized_shape(packed, scales, biases, indices, bits, group_size)?;
+        let result = Self::empty(shape.to_vec())?;
+        graph::record(
+            sys::Op::GatherQuantMatmul { bits, group_size },
+            &[
+                &self.handle,
+                &packed.handle,
+                &scales.handle,
+                &biases.handle,
+                &indices.handle,
+            ],
+            &result.handle,
+        )?;
+        Ok(result)
+    }
+
+    /// Computes `SiLU(gate) * up` from two affine-quantized expert projections selected by GPU
+    /// indices.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for unsupported quantization parameters, incompatible shapes or dtypes,
+    /// an out-of-range expert index, or a refused dispatch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gather_quant_silu_mul<S: FloatElement>(
+        &self,
+        gate_packed: &Tensor<u32>,
+        gate_scales: &Tensor<S>,
+        gate_biases: &Tensor<S>,
+        up_packed: &Tensor<u32>,
+        up_scales: &Tensor<S>,
+        up_biases: &Tensor<S>,
+        indices: &Tensor<u32>,
+        bits: u8,
+        group_size: u32,
+    ) -> Result<Self>
+    where
+        T: FloatElement,
+    {
+        let shape = self.gather_quantized_shape(
+            gate_packed,
+            gate_scales,
+            gate_biases,
+            indices,
+            bits,
+            group_size,
+        )?;
+        let up_shape = self
+            .gather_quantized_shape(up_packed, up_scales, up_biases, indices, bits, group_size)?;
+        if up_shape != shape {
+            return Err(Error::new("gate and up projection shapes differ"));
+        }
+        let result = Self::empty(shape.to_vec())?;
+        graph::record(
+            sys::Op::GatherQuantSiluMul { bits, group_size },
+            &[
+                &self.handle,
+                &gate_packed.handle,
+                &gate_scales.handle,
+                &gate_biases.handle,
+                &up_packed.handle,
+                &up_scales.handle,
+                &up_biases.handle,
+                &indices.handle,
+            ],
+            &result.handle,
+        )?;
+        Ok(result)
+    }
+
+    fn gather_quantized_shape<S: FloatElement>(
+        &self,
+        packed: &Tensor<u32>,
+        scales: &Tensor<S>,
+        biases: &Tensor<S>,
+        indices: &Tensor<u32>,
+        bits: u8,
+        group_size: u32,
+    ) -> Result<[u32; 3]> {
         if !matches!(bits, 4 | 8) || !matches!(group_size, 32 | 64 | 128) {
             return Err(Error::new("unsupported affine quantization parameters"));
         }
@@ -606,19 +686,7 @@ impl<T: Element> Tensor<T> {
                 "gathered quantized scale and bias shapes are invalid",
             ));
         }
-        let result = Self::empty(vec![rows, routes, output])?;
-        graph::record(
-            sys::Op::GatherQuantMatmul { bits, group_size },
-            &[
-                &self.handle,
-                &packed.handle,
-                &scales.handle,
-                &biases.handle,
-                &indices.handle,
-            ],
-            &result.handle,
-        )?;
-        Ok(result)
+        Ok([rows, routes, output])
     }
 
     /// Applies half-split rotary position embeddings.
