@@ -64,6 +64,13 @@ struct PromptVerification {
     free_running: DecodeMetrics,
 }
 
+struct PromptChecks {
+    maximum_layer_error: f64,
+    first_failing: Option<usize>,
+    routers_passed: bool,
+    first_router_mismatch: Option<String>,
+}
+
 struct DecodeInput<'a> {
     prompt: &'a str,
     expected_tokens: &'a [i64],
@@ -244,6 +251,12 @@ where
         compare_layers(runner, fixture, &output.taps, layer_tolerance).await?;
     let (routers_passed, first_router_mismatch) =
         compare_routers(runner, fixture, &output.router_logits, layer_tolerance).await?;
+    let checks = PromptChecks {
+        maximum_layer_error,
+        first_failing,
+        routers_passed,
+        first_router_mismatch,
+    };
     let input = DecodeInput {
         prompt: fixture.name(),
         expected_tokens: fixture.greedy_tokens(),
@@ -254,30 +267,8 @@ where
         steps: decode_steps,
     };
     match precision {
-        Precision::F32 => {
-            verify_f32_decode(
-                runner,
-                fixture,
-                input,
-                maximum_layer_error,
-                first_failing,
-                routers_passed,
-                first_router_mismatch,
-            )
-            .await
-        }
-        Precision::Bf16 => {
-            verify_bf16_decode(
-                runner,
-                input,
-                tokens,
-                maximum_layer_error,
-                first_failing,
-                routers_passed,
-                first_router_mismatch,
-            )
-            .await
-        }
+        Precision::F32 => verify_f32_decode(runner, fixture, input, tokens, checks).await,
+        Precision::Bf16 => verify_bf16_decode(runner, input, tokens, checks).await,
     }
 }
 
@@ -405,29 +396,67 @@ async fn verify_f32_decode<B>(
     runner: &mut EngineRunner<B>,
     fixture: &golden_fixtures::PromptFixture,
     input: DecodeInput<'_>,
-    maximum_layer_error: f64,
-    first_failing: Option<usize>,
-    routers_passed: bool,
-    first_router_mismatch: Option<String>,
+    prompt_tokens: Vec<u32>,
+    checks: PromptChecks,
 ) -> Result<PromptVerification, Box<dyn Error>>
 where
     B: Backend + Send + Sync + 'static,
 {
+    let PromptChecks {
+        maximum_layer_error,
+        first_failing,
+        routers_passed,
+        first_router_mismatch,
+    } = checks;
     let prompt_kl =
         mean_logit_kl_divergence(fixture.prompt_logits().values(), &input.logits, input.vocab)?;
-    let free_running = decode(runner, input, DecodeMode::FreeRunning, true).await?;
+    let prompt = input.prompt;
+    let expected_tokens = input.expected_tokens;
+    let reference_logits = input.reference_logits;
+    let prompt_length = input.prompt_tokens;
+    let vocab = input.vocab;
+    let steps = input.steps;
+    let teacher_forced = decode(runner, input, DecodeMode::TeacherForced, true).await?;
+    let output = runner
+        .step(EngineStep {
+            tokens: prompt_tokens,
+            start_pos: 0,
+            taps: false,
+        })
+        .await?
+        .map_err(|error| format!("engine step failed: {error:?}"))?;
+    let logits = decode_f32_le(&runner.read(&output.logits).await?)?;
+    let free_running = decode(
+        runner,
+        DecodeInput {
+            prompt,
+            expected_tokens,
+            reference_logits,
+            prompt_tokens: prompt_length,
+            logits,
+            vocab,
+            steps,
+        },
+        DecodeMode::FreeRunning,
+        false,
+    )
+    .await?;
     let passed = first_failing.is_none()
         && routers_passed
         && prompt_kl <= LOGIT_KL_TOLERANCE
+        && teacher_forced.mean_kl() <= LOGIT_KL_TOLERANCE
+        && teacher_forced.agreement == teacher_forced.steps
         && free_running.mean_kl() <= LOGIT_KL_TOLERANCE
         && free_running.agreement == free_running.steps;
     println!(
-        "{}\tmax-layer={maximum_layer_error:.8e}\tfirst-failing={}\tfirst-router-mismatch={}\tprompt-kl={prompt_kl:.8e}\tfree-mean-kl={:.8e}\tfree-max-kl={:.8e}\ttop-1={}/{}\t{}",
+        "{}\tmax-layer={maximum_layer_error:.8e}\tfirst-failing={}\tfirst-router-mismatch={}\tprompt-kl={prompt_kl:.8e}\tteacher-mean-kl={:.8e}\tteacher-max-kl={:.8e}\ttop-1={}/{}\tfree-top-1={}/{}\t{}",
         fixture.name(),
         layer_name(first_failing),
         first_router_mismatch.as_deref().unwrap_or("-"),
-        free_running.mean_kl(),
-        free_running.maximum_kl,
+        teacher_forced.mean_kl(),
+        teacher_forced.maximum_kl,
+        teacher_forced.agreement,
+        teacher_forced.steps,
         free_running.agreement,
         free_running.steps,
         if passed { "pass" } else { "FAIL" }
@@ -436,7 +465,7 @@ where
         maximum_layer_error,
         layers_passed: first_failing.is_none() && routers_passed,
         passed,
-        teacher_forced: DecodeMetrics::default(),
+        teacher_forced,
         free_running,
     })
 }
@@ -445,14 +474,17 @@ async fn verify_bf16_decode<B>(
     runner: &mut EngineRunner<B>,
     input: DecodeInput<'_>,
     prompt_tokens: Vec<u32>,
-    maximum_layer_error: f64,
-    first_failing: Option<usize>,
-    routers_passed: bool,
-    first_router_mismatch: Option<String>,
+    checks: PromptChecks,
 ) -> Result<PromptVerification, Box<dyn Error>>
 where
     B: Backend + Send + Sync + 'static,
 {
+    let PromptChecks {
+        maximum_layer_error,
+        first_failing,
+        routers_passed,
+        first_router_mismatch,
+    } = checks;
     let prompt = input.prompt;
     let expected_tokens = input.expected_tokens;
     let reference_logits = input.reference_logits;
