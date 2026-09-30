@@ -730,6 +730,7 @@ dependencies = [
  "forja-sdk",
  "forja-testing",
  "golden-fixtures",
+ "olmoe",
  "qwen3",
  "serde",
  "serde_json",
@@ -1366,6 +1367,13 @@ dependencies = [
  "hashbrown 0.17.1",
  "indexmap",
  "memchr",
+]
+
+[[package]]
+name = "olmoe"
+version = "0.0.0"
+dependencies = [
+ "forja-sdk",
 ]
 
 [[package]]

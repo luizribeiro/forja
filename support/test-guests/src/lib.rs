@@ -63,6 +63,18 @@ pub fn qwen3() -> &'static Path {
     Path::new(env!("QWEN3_COMPONENT"))
 }
 
+/// Returns the bf16 `OLMoE-1B-7B-0924` engine component.
+#[must_use]
+pub fn olmoe() -> &'static Path {
+    Path::new(env!("OLMOE_COMPONENT"))
+}
+
+/// Returns `OLMoE` with graph replay disabled.
+#[must_use]
+pub fn olmoe_no_replay() -> &'static Path {
+    Path::new(env!("OLMOE_NO_REPLAY_COMPONENT"))
+}
+
 /// Returns the path to the bf16 Qwen3-0.6B engine component.
 #[must_use]
 pub fn qwen3_bf16() -> &'static Path {

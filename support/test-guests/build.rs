@@ -42,6 +42,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &out_dir,
     )?;
     let release_dir = guest_target_dir.join("wasm32-wasip2/release");
+    let [olmoe, olmoe_no_replay] =
+        build_olmoe_profiles(&guest_manifest, &guest_target_dir, &out_dir)?;
     emit_guest_path("HELLO_COMPONENT", &release_dir.join("hello.wasm"));
     emit_guest_path(
         "ENGINE_SMOKE_COMPONENT",
@@ -70,6 +72,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     emit_guest_path("TOY_MLP_COMPONENT", &release_dir.join("toy_mlp.wasm"));
     emit_guest_path("QWEN3_COMPONENT", &qwen3);
+    emit_guest_path("OLMOE_COMPONENT", &olmoe);
+    emit_guest_path("OLMOE_NO_REPLAY_COMPONENT", &olmoe_no_replay);
     emit_guest_path("QWEN3_BF16_COMPONENT", &qwen3_bf16);
     emit_guest_path("QWEN3_RESIDUAL_NORM_COMPONENT", &qwen3_residual_norm);
     emit_guest_path(
@@ -104,6 +108,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         repository.join("wit").display()
     );
     Ok(())
+}
+
+fn build_olmoe_profiles(
+    manifest: &Path,
+    target_dir: &Path,
+    out_dir: &Path,
+) -> io::Result<[PathBuf; 2]> {
+    let component = target_dir.join("wasm32-wasip2/release/olmoe.wasm");
+    let default = copy_component(&component, out_dir, "olmoe.wasm")?;
+    build_guest_workspace(
+        manifest,
+        target_dir,
+        &["-p", "olmoe", "--features", "no-replay"],
+    )?;
+    let no_replay = copy_component(&component, out_dir, "olmoe-no-replay.wasm")?;
+    Ok([default, no_replay])
 }
 
 fn build_qwen_profiles(
