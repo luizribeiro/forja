@@ -25,6 +25,12 @@ class GenerationSettings:
 
     seed: int = 20250927
     generated_tokens: int = 32
+    num_hidden_layers: int | None = None
+
+    def __post_init__(self) -> None:
+        """Reject layer limits that cannot describe a model."""
+        if self.num_hidden_layers is not None and self.num_hidden_layers <= 0:
+            raise ValueError("num_hidden_layers must be positive")
 
 
 Prompt = tuple[str, str]
@@ -66,6 +72,16 @@ def manifest_base(
 ) -> dict[str, object]:
     """Build the invariant portion of a fixture manifest."""
     settings = settings or GenerationSettings()
+    generation = {
+        "attention": "eager",
+        "device": "cpu",
+        "dtype": "float32",
+        "generated_tokens": settings.generated_tokens,
+        "seed": settings.seed,
+        "tokenization": "raw text, add_special_tokens=False",
+    }
+    if settings.num_hidden_layers is not None:
+        generation["num_hidden_layers"] = settings.num_hidden_layers
     return {
         "schema_version": 1,
         "model": {
@@ -74,14 +90,7 @@ def manifest_base(
             "sha256": model_hash,
         },
         "libraries": versions(),
-        "generation": {
-            "attention": "eager",
-            "device": "cpu",
-            "dtype": "float32",
-            "generated_tokens": settings.generated_tokens,
-            "seed": settings.seed,
-            "tokenization": "raw text, add_special_tokens=False",
-        },
+        "generation": generation,
         "tensors": tensor_descriptions,
         "prompts": [{"name": name, "text": text} for name, text in prompts],
     }
@@ -258,7 +267,7 @@ def generate(
 
     import torch
     from safetensors.torch import save_file
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
     model_file = model_weight_file(model_path)
     model_hash = sha256(model_file)
@@ -276,8 +285,12 @@ def generate(
 
     set_determinism(settings)
     tokenizer = AutoTokenizer.from_pretrained(model_path, local_files_only=True)
+    config = AutoConfig.from_pretrained(model_path, local_files_only=True)
+    if settings.num_hidden_layers is not None:
+        config.num_hidden_layers = settings.num_hidden_layers
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
+        config=config,
         dtype=torch.float32,
         device_map=None,
         attn_implementation="eager",

@@ -55,6 +55,20 @@ def test_manifest_base(monkeypatch, tmp_path: Path) -> None:
     }
 
 
+def test_manifest_records_layer_limit(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(fixture_library, "versions", lambda: {})
+    settings = fixture_library.GenerationSettings(num_hidden_layers=4)
+
+    manifest = fixture_library.manifest_base(tmp_path / "model", "hash", [], {}, settings)
+
+    assert manifest["generation"]["num_hidden_layers"] == 4
+
+
+def test_generation_settings_reject_nonpositive_layer_limit() -> None:
+    with pytest.raises(ValueError, match="must be positive"):
+        fixture_library.GenerationSettings(num_hidden_layers=0)
+
+
 def test_fixtures_are_current_checks_manifest_and_hash(tmp_path: Path) -> None:
     fixture = tmp_path / "prompt.safetensors"
     fixture.write_bytes(b"fixture")
