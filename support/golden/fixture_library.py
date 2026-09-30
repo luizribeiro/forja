@@ -1,0 +1,216 @@
+"""Build deterministic transformer reference fixtures."""
+
+import hashlib
+import json
+import platform
+import random
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+
+@dataclass(frozen=True)
+class GenerationSettings:
+    """Settings that affect deterministic greedy generation."""
+
+    seed: int = 20250927
+    generated_tokens: int = 32
+
+
+Prompt = tuple[str, str]
+FixtureValidator = Callable[[str, Any, dict[str, Any]], None]
+
+
+def sha256(path: Path) -> str:
+    """Return the lowercase SHA-256 digest of a file."""
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        while chunk := source.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def versions() -> dict[str, str]:
+    """Return every runtime version that can affect fixture values."""
+    import safetensors
+    import torch
+    import transformers
+
+    return {
+        "python": platform.python_version(),
+        "safetensors": safetensors.__version__,
+        "torch": torch.__version__,
+        "transformers": transformers.__version__,
+    }
+
+
+def manifest_base(
+    model_path: Path,
+    model_hash: str,
+    prompts: Sequence[Prompt],
+    tensor_descriptions: dict[str, str],
+    settings: GenerationSettings | None = None,
+) -> dict[str, object]:
+    """Build the invariant portion of a fixture manifest."""
+    settings = settings or GenerationSettings()
+    return {
+        "schema_version": 1,
+        "model": {
+            "directory": model_path.name,
+            "file": "model.safetensors",
+            "sha256": model_hash,
+        },
+        "libraries": versions(),
+        "generation": {
+            "attention": "eager",
+            "device": "cpu",
+            "dtype": "float32",
+            "generated_tokens": settings.generated_tokens,
+            "seed": settings.seed,
+            "tokenization": "raw text, add_special_tokens=False",
+        },
+        "tensors": tensor_descriptions,
+        "prompts": [{"name": name, "text": text} for name, text in prompts],
+    }
+
+
+def fixtures_are_current(output: Path, expected: dict[str, object]) -> bool:
+    """Check the manifest identity and all fixture hashes."""
+    path = output / "manifest.json"
+    try:
+        actual = json.loads(path.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return False
+    expected_without_files = dict(expected)
+    actual_without_files = dict(actual)
+    prompts = actual_without_files.pop("prompts", [])
+    actual_without_files["prompts"] = [
+        {"name": prompt.get("name"), "text": prompt.get("text")} for prompt in prompts
+    ]
+    if actual_without_files != expected_without_files:
+        return False
+    for prompt in prompts:
+        fixture = output / prompt.get("file", "")
+        if not fixture.is_file() or sha256(fixture) != prompt.get("sha256"):
+            return False
+    return True
+
+
+def set_determinism(settings: GenerationSettings) -> None:
+    """Configure deterministic CPU execution before loading the model."""
+    import torch
+
+    random.seed(settings.seed)
+    torch.manual_seed(settings.seed)
+    torch.use_deterministic_algorithms(True)
+
+
+def prompt_tensors(
+    model: Any, token_ids: Any, settings: GenerationSettings
+) -> dict[str, Any]:
+    """Run a prompt and its greedy continuation."""
+    import torch
+
+    with torch.inference_mode():
+        output = model(
+            input_ids=token_ids,
+            use_cache=True,
+            output_hidden_states=True,
+            return_dict=True,
+            logits_to_keep=1,
+        )
+        logits = output.logits[0, -1].float()
+        tensors = {
+            "prompt_token_ids": token_ids[0].contiguous(),
+            "prompt_last_logits": logits.contiguous(),
+        }
+        for index, hidden_state in enumerate(output.hidden_states):
+            tensors[f"hidden_state_{index}"] = hidden_state[0].float().contiguous()
+
+        cache = output.past_key_values
+        generated = []
+        step_logits = []
+        for step in range(settings.generated_tokens):
+            next_token = logits.argmax(dim=-1)
+            step_logits.append(logits)
+            generated.append(next_token)
+            if step + 1 < settings.generated_tokens:
+                output = model(
+                    input_ids=next_token.reshape(1, 1),
+                    past_key_values=cache,
+                    use_cache=True,
+                    return_dict=True,
+                    logits_to_keep=1,
+                )
+                logits = output.logits[0, -1].float()
+                cache = output.past_key_values
+        tensors["greedy_token_ids"] = torch.stack(generated).to(torch.int64)
+        tensors["greedy_step_logits"] = torch.stack(step_logits)
+    return tensors
+
+
+def generate(
+    model_path: Path,
+    output: Path,
+    prompts: Sequence[Prompt],
+    tensor_descriptions: dict[str, str],
+    *,
+    settings: GenerationSettings | None = None,
+    validate_fixture: FixtureValidator | None = None,
+) -> None:
+    """Generate fixtures for every prompt and write the manifest last."""
+    import torch
+    from safetensors.torch import save_file
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    settings = settings or GenerationSettings()
+    model_file = model_path / "model.safetensors"
+    if not model_file.is_file():
+        raise FileNotFoundError(f"model file does not exist: {model_file}")
+    model_hash = sha256(model_file)
+    manifest = manifest_base(
+        model_path, model_hash, prompts, tensor_descriptions, settings
+    )
+    if fixtures_are_current(output, manifest):
+        print(f"fixtures are current: {output}")
+        return
+
+    set_determinism(settings)
+    tokenizer = AutoTokenizer.from_pretrained(model_path, local_files_only=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        dtype=torch.float32,
+        device_map=None,
+        attn_implementation="eager",
+        local_files_only=True,
+    )
+    model.eval()
+    output.mkdir(parents=True, exist_ok=True)
+    fixture_prompts = []
+    for name, text in prompts:
+        token_ids = tokenizer(
+            text, add_special_tokens=False, return_tensors="pt"
+        ).input_ids
+        tensors = prompt_tensors(model, token_ids, settings)
+        if validate_fixture is not None:
+            validate_fixture(name, token_ids, tensors)
+        fixture = output / f"{name}.safetensors"
+        temporary = fixture.with_suffix(".safetensors.tmp")
+        save_file(tensors, temporary, metadata={"prompt": name})
+        temporary.replace(fixture)
+        fixture_prompts.append(
+            {
+                "name": name,
+                "text": text,
+                "file": fixture.name,
+                "sha256": sha256(fixture),
+                "prompt_tokens": token_ids.shape[1],
+            }
+        )
+        print(f"wrote {fixture} ({token_ids.shape[1]} prompt tokens)")
+
+    manifest["prompts"] = fixture_prompts
+    temporary_manifest = output / "manifest.json.tmp"
+    temporary_manifest.write_text(json.dumps(manifest, indent=2) + "\n")
+    temporary_manifest.replace(output / "manifest.json")
