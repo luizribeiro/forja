@@ -1,4 +1,9 @@
-use std::{error::Error, num::TryFromIntError, time::Duration};
+use std::{
+    error::Error,
+    num::TryFromIntError,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use forja_config::{GraphReplay, Limits as ConfigLimits, Unbounded};
 
@@ -67,6 +72,49 @@ pub(crate) fn limits(config: &ConfigLimits) -> Result<forja_host::Limits, TryFro
     HostLimits::try_from(config).map(|limits| limits.0)
 }
 
+pub(crate) fn weights_path(model_dir: &Path) -> Result<PathBuf, String> {
+    let root = std::fs::canonicalize(model_dir).map_err(|error| {
+        format!(
+            "cannot resolve model directory {}: {error}",
+            model_dir.display()
+        )
+    })?;
+    for name in ["model.safetensors", "model.safetensors.index.json"] {
+        let candidate = model_dir.join(name);
+        if !candidate.try_exists().map_err(|error| {
+            format!(
+                "cannot inspect model weights {}: {error}",
+                candidate.display()
+            )
+        })? {
+            continue;
+        }
+        let resolved = std::fs::canonicalize(&candidate).map_err(|error| {
+            format!(
+                "cannot resolve model weights {}: {error}",
+                candidate.display()
+            )
+        })?;
+        if !resolved.starts_with(&root) {
+            return Err(format!(
+                "model weights resolve outside the model directory: {}",
+                candidate.display()
+            ));
+        }
+        if !resolved.is_file() {
+            return Err(format!(
+                "model weights are not a file: {}",
+                candidate.display()
+            ));
+        }
+        return Ok(resolved);
+    }
+    Err(format!(
+        "model directory has no model.safetensors or model.safetensors.index.json: {}",
+        model_dir.display()
+    ))
+}
+
 #[cfg(target_os = "macos")]
 pub(crate) const fn metal_graph_replay(value: GraphReplay) -> forja_metal::MetalGraphReplay {
     match value {
@@ -78,6 +126,7 @@ pub(crate) const fn metal_graph_replay(value: GraphReplay) -> forja_metal::Metal
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{fs, time::SystemTime, time::UNIX_EPOCH};
 
     #[test]
     fn argmax_rejects_empty_values() {
@@ -119,6 +168,51 @@ mod tests {
         assert_eq!(read_token(&7_u32.to_le_bytes())?, 7);
         assert!(read_token(&[0; 8]).is_err());
         Ok(())
+    }
+
+    #[test]
+    fn selects_single_or_indexed_model_weights() -> Result<(), Box<dyn Error>> {
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let root = std::env::temp_dir().join(format!("forja-weights-path-{nonce}"));
+        fs::create_dir(&root)?;
+        let index = root.join("model.safetensors.index.json");
+        fs::write(&index, b"index")?;
+        assert_eq!(weights_path(&root)?, fs::canonicalize(index)?);
+        let single = root.join("model.safetensors");
+        fs::write(&single, b"single")?;
+        assert_eq!(weights_path(&root)?, fs::canonicalize(single)?);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn assert_outside_weight_symlink_is_rejected(name: &str) -> Result<(), Box<dyn Error>> {
+        use std::os::unix::fs::symlink;
+
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let root = std::env::temp_dir().join(format!("forja-weights-root-{name}-{nonce}"));
+        let outside = std::env::temp_dir().join(format!("forja-weights-outside-{name}-{nonce}"));
+        fs::create_dir(&root)?;
+        fs::create_dir(&outside)?;
+        let target = outside.join("weights");
+        fs::write(&target, b"weights")?;
+        symlink(target, root.join(name))?;
+        assert!(weights_path(&root).unwrap_err().contains("outside"));
+        fs::remove_dir_all(root)?;
+        fs::remove_dir_all(outside)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_single_file_weights_symlinked_outside() -> Result<(), Box<dyn Error>> {
+        assert_outside_weight_symlink_is_rejected("model.safetensors")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_weight_indexes_symlinked_outside() -> Result<(), Box<dyn Error>> {
+        assert_outside_weight_symlink_is_rejected("model.safetensors.index.json")
     }
 
     #[cfg(target_os = "macos")]

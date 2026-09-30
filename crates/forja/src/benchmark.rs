@@ -20,7 +20,7 @@ use crate::{
     args::{Bench, BenchPoint, Profile},
     benchmark_record::{self, Input, PerfKey, Recorded},
     benchmark_stats::{Stats, stats, synthetic_tokens},
-    engine::{argmax, limits, read_token},
+    engine::{argmax, limits, read_token, weights_path},
 };
 
 #[cfg(target_os = "macos")]
@@ -98,7 +98,7 @@ pub(crate) async fn measure_token_profile(
         &options.engine,
         backend,
         limits(&options.limits)?,
-        options.model_dir.join("model.safetensors"),
+        weights_path(&options.model_dir)?,
     )
     .await?;
     let info = runner.describe().await?;
@@ -149,7 +149,7 @@ async fn run_metal(options: &Bench) -> Result<(), Box<dyn Error>> {
     let date = command_output("date", &["-u", "+%Y-%m-%dT%H:%MZ"])?;
     let gpu_cores = gpu_core_count()?;
     let binary_sha256 = sha256_file(std::env::current_exe()?)?;
-    let weights_sha256 = sha256_file(options.model_dir.join("model.safetensors"))?;
+    let weights_sha256 = sha256_file(weights_path(&options.model_dir)?)?;
     let inputs = options
         .engines
         .iter()
@@ -638,7 +638,7 @@ async fn bench_engine(
         component,
         backend,
         limits(&options.limits)?,
-        options.model_dir.join("model.safetensors"),
+        weights_path(&options.model_dir)?,
     )
     .await?;
     let info = runner.describe().await?;

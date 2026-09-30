@@ -12,7 +12,7 @@ use tokenizers::Tokenizer;
 
 use crate::{
     args::{Backend as BackendArg, Run},
-    engine::{limits, read_token},
+    engine::{limits, read_token, weights_path},
 };
 
 #[cfg(target_os = "macos")]
@@ -74,7 +74,7 @@ where
         component,
         backend,
         limits(&options.limits)?,
-        options.model_dir.join("model.safetensors"),
+        weights_path(&options.model_dir)?,
     )
     .await?;
     let info = runner.describe().await?;
