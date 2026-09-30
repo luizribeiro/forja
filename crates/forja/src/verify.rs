@@ -78,6 +78,7 @@ pub(crate) async fn run(options: &Verify) -> Result<(), Box<dyn Error>> {
 
 async fn run_with_steps(options: &Verify, decode_steps: usize) -> Result<(), Box<dyn Error>> {
     let fixtures = FixtureDirectory::open(&options.fixtures)?;
+    fixtures.require_complete_model_outputs()?;
     let weights = verify_model_hash(options, &fixtures)?;
     run_with_component(
         options,

@@ -110,6 +110,7 @@ impl PromptFixture {
 #[derive(Clone, Debug)]
 pub struct FixtureDirectory {
     model_sha256: String,
+    num_hidden_layers: Option<usize>,
     prompts: Vec<PromptFixture>,
 }
 
@@ -127,6 +128,9 @@ impl FixtureDirectory {
         if manifest.schema_version != 1 {
             return Err(FixtureError::UnsupportedSchema(manifest.schema_version));
         }
+        if manifest.generation.num_hidden_layers == Some(0) {
+            return Err(FixtureError::InvalidLayerLimit);
+        }
         let mut prompts = Vec::with_capacity(manifest.prompts.len());
         for prompt in manifest.prompts {
             if prompts
@@ -135,10 +139,15 @@ impl FixtureDirectory {
             {
                 return Err(FixtureError::DuplicatePrompt(prompt.name));
             }
-            prompts.push(load_prompt(path, prompt)?);
+            prompts.push(load_prompt(
+                path,
+                prompt,
+                manifest.generation.num_hidden_layers,
+            )?);
         }
         Ok(Self {
             model_sha256: manifest.model.sha256,
+            num_hidden_layers: manifest.generation.num_hidden_layers,
             prompts,
         })
     }
@@ -147,6 +156,24 @@ impl FixtureDirectory {
     #[must_use]
     pub fn model_sha256(&self) -> &str {
         &self.model_sha256
+    }
+
+    /// Returns the configured layer limit, if the fixture is truncated.
+    #[must_use]
+    pub const fn num_hidden_layers(&self) -> Option<usize> {
+        self.num_hidden_layers
+    }
+
+    /// Refuses full-model logit and greedy-token comparisons for truncated fixtures.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when generation used a layer limit.
+    pub fn require_complete_model_outputs(&self) -> Result<(), FixtureError> {
+        match self.num_hidden_layers {
+            Some(layers) => Err(FixtureError::TruncatedModelOutputs(layers)),
+            None => Ok(()),
+        }
     }
 
     /// Returns every prompt fixture in manifest order.
@@ -203,7 +230,14 @@ impl Error for DecodeError {}
 struct Manifest {
     schema_version: u64,
     model: ModelMetadata,
+    #[serde(default)]
+    generation: GenerationMetadata,
     prompts: Vec<PromptMetadata>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct GenerationMetadata {
+    num_hidden_layers: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -226,7 +260,11 @@ struct RouterMetadata {
     shape: Vec<usize>,
 }
 
-fn load_prompt(root: &Path, metadata: PromptMetadata) -> Result<PromptFixture, FixtureError> {
+fn load_prompt(
+    root: &Path,
+    metadata: PromptMetadata,
+    num_hidden_layers: Option<usize>,
+) -> Result<PromptFixture, FixtureError> {
     let file_name = Path::new(&metadata.file);
     if file_name.file_name() != Some(file_name.as_os_str()) {
         return Err(FixtureError::InvalidFileName(metadata.file));
@@ -255,6 +293,11 @@ fn load_prompt(root: &Path, metadata: PromptMetadata) -> Result<PromptFixture, F
         })
         .count();
     if hidden_state_count < 2 {
+        return Err(shape_error("hidden_states"));
+    }
+    if let Some(layers) = num_hidden_layers
+        && layers.checked_add(1) != Some(hidden_state_count)
+    {
         return Err(shape_error("hidden_states"));
     }
     let mut hidden_states = Vec::with_capacity(hidden_state_count);
@@ -379,6 +422,10 @@ pub enum FixtureError {
     Manifest(String),
     /// The manifest schema is not supported.
     UnsupportedSchema(u64),
+    /// A manifest layer limit is zero.
+    InvalidLayerLimit,
+    /// Full-model outputs cannot be compared after loading fewer layers.
+    TruncatedModelOutputs(usize),
     /// Two prompts have the same stable name.
     DuplicatePrompt(String),
     /// A fixture path is not a plain file name.
@@ -408,6 +455,11 @@ impl fmt::Display for FixtureError {
             Self::UnsupportedSchema(version) => {
                 write!(formatter, "unsupported fixture schema {version}")
             }
+            Self::InvalidLayerLimit => formatter.write_str("fixture layer limit must be positive"),
+            Self::TruncatedModelOutputs(layers) => write!(
+                formatter,
+                "cannot compare full-model outputs from a {layers}-layer fixture"
+            ),
             Self::DuplicatePrompt(name) => write!(formatter, "duplicate prompt {name:?}"),
             Self::InvalidFileName(name) => write!(formatter, "invalid fixture file name {name:?}"),
             Self::HashMismatch {
@@ -502,6 +554,20 @@ mod tests {
             fixtures.prompts()[0].router_logits().unwrap().shape(),
             [2, 1, 3]
         );
+
+        let case = temporary.case("truncated");
+        let hash = write_tensors(&case, TensorMutation::None);
+        write_manifest(&case, 1, &[prompt("fixture.safetensors", &hash)]);
+        let manifest = case.join("manifest.json");
+        let mut contents: Value = serde_json::from_slice(&fs::read(&manifest).unwrap()).unwrap();
+        contents["generation"] = json!({ "num_hidden_layers": 2 });
+        fs::write(&manifest, serde_json::to_vec(&contents).unwrap()).unwrap();
+        let fixtures = FixtureDirectory::open(case).unwrap();
+        assert_eq!(fixtures.num_hidden_layers(), Some(2));
+        assert!(matches!(
+            fixtures.require_complete_model_outputs().unwrap_err(),
+            FixtureError::TruncatedModelOutputs(2)
+        ));
 
         let case = temporary.case("hash-mismatch");
         let hash = write_tensors(&case, TensorMutation::None);
