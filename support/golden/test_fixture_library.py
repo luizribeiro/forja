@@ -1,9 +1,12 @@
 """Tests for the pure fixture-library operations."""
 
 import json
+import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import fixture_library
+import pytest
 
 
 def test_sha256(tmp_path: Path) -> None:
@@ -82,3 +85,50 @@ def test_fixtures_are_current_rejects_missing_or_invalid_manifest(
     assert not fixture_library.fixtures_are_current(tmp_path, {})
     (tmp_path / "manifest.json").write_text("not json")
     assert not fixture_library.fixtures_are_current(tmp_path, {})
+
+
+def write_model_config(tmp_path: Path, config: dict[str, object]) -> None:
+    """Write the only file needed by model-directory validation."""
+    (tmp_path / "config.json").write_text(json.dumps(config))
+
+
+@pytest.mark.parametrize("suffix", [".bin", ".pt", ".pth"])
+def test_model_directory_rejects_unsafe_weights(
+    tmp_path: Path, suffix: str
+) -> None:
+    write_model_config(tmp_path, {})
+    nested = tmp_path / "nested"
+    nested.mkdir()
+    (nested / f"weights{suffix}").write_bytes(b"")
+
+    with pytest.raises(ValueError, match="unsafe model weight"):
+        fixture_library.validate_model_directory(tmp_path)
+
+
+def test_model_directory_rejects_python(tmp_path: Path) -> None:
+    write_model_config(tmp_path, {})
+    (tmp_path / "modeling.py").write_text("")
+
+    with pytest.raises(ValueError, match="contains Python code"):
+        fixture_library.validate_model_directory(tmp_path)
+
+
+def test_model_directory_rejects_auto_map(tmp_path: Path) -> None:
+    write_model_config(tmp_path, {"auto_map": {"AutoModel": "modeling.Model"}})
+
+    with pytest.raises(ValueError, match="requires remote code"):
+        fixture_library.validate_model_directory(tmp_path)
+
+
+def test_model_directory_rejects_custom_architecture(
+    monkeypatch, tmp_path: Path
+) -> None:
+    write_model_config(tmp_path, {"architectures": ["CustomForCausalLM"]})
+    monkeypatch.setitem(
+        sys.modules,
+        "transformers",
+        SimpleNamespace(KnownForCausalLM=object()),
+    )
+
+    with pytest.raises(ValueError, match="custom architectures"):
+        fixture_library.validate_model_directory(tmp_path)

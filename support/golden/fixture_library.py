@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import os
 import platform
 import random
 from collections.abc import Callable, Sequence
@@ -20,6 +21,7 @@ class GenerationSettings:
 
 Prompt = tuple[str, str]
 FixtureValidator = Callable[[str, Any, dict[str, Any]], None]
+UNSAFE_WEIGHT_SUFFIXES = frozenset({".bin", ".pt", ".pth"})
 
 
 def sha256(path: Path) -> str:
@@ -97,6 +99,34 @@ def fixtures_are_current(output: Path, expected: dict[str, object]) -> bool:
     return True
 
 
+def validate_model_directory(model_path: Path) -> None:
+    """Refuse model files that can execute code or use unsafe serialization."""
+    for path in sorted(model_path.rglob("*")):
+        if not path.is_file():
+            continue
+        if path.suffix.lower() in UNSAFE_WEIGHT_SUFFIXES:
+            raise ValueError(f"unsafe model weight file: {path}")
+        if path.suffix.lower() == ".py":
+            raise ValueError(f"model directory contains Python code: {path}")
+
+    config_path = model_path / "config.json"
+    config = json.loads(config_path.read_text())
+    if config.get("auto_map") is not None:
+        raise ValueError(f"model config requires remote code: {config_path}")
+
+    import transformers
+
+    architectures = config.get("architectures", [])
+    unknown = [
+        architecture
+        for architecture in architectures
+        if not isinstance(architecture, str)
+        or getattr(transformers, architecture, None) is None
+    ]
+    if unknown:
+        raise ValueError(f"model config names custom architectures: {unknown}")
+
+
 def set_determinism(settings: GenerationSettings) -> None:
     """Configure deterministic CPU execution before loading the model."""
     import torch
@@ -160,11 +190,15 @@ def generate(
     validate_fixture: FixtureValidator | None = None,
 ) -> None:
     """Generate fixtures for every prompt and write the manifest last."""
+    settings = settings or GenerationSettings()
+    os.environ["HF_HUB_OFFLINE"] = "1"
+    os.environ["TRANSFORMERS_OFFLINE"] = "1"
+    validate_model_directory(model_path)
+
     import torch
     from safetensors.torch import save_file
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    settings = settings or GenerationSettings()
     model_file = model_path / "model.safetensors"
     if not model_file.is_file():
         raise FileNotFoundError(f"model file does not exist: {model_file}")
