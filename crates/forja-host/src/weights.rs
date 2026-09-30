@@ -87,7 +87,7 @@ pub struct Safetensors {
 }
 
 impl Safetensors {
-    /// Opens and validates an unquantized safetensors file.
+    /// Opens and validates a safetensors file containing supported scalar types.
     ///
     /// # Errors
     ///
@@ -264,6 +264,7 @@ fn parse_tensor(
         "F32" => DType::F32,
         "F16" => DType::F16,
         "BF16" => DType::BF16,
+        "U32" => DType::U32,
         other => return Err(WeightError::UnsupportedDtype(other.to_owned())),
     };
     let shape = entry
@@ -367,16 +368,17 @@ mod tests {
     #[test]
     fn parses_supported_tensor_metadata() {
         let source = open(
-            r#"{"a":{"dtype":"F32","shape":[1],"data_offsets":[0,4]},"b":{"dtype":"BF16","shape":[2],"data_offsets":[4,8]}}"#,
-            &[0; 8],
+            r#"{"a":{"dtype":"F32","shape":[1],"data_offsets":[0,4]},"b":{"dtype":"BF16","shape":[2],"data_offsets":[4,8]},"c":{"dtype":"U32","shape":[1],"data_offsets":[8,12]}}"#,
+            &[0; 12],
             true,
         )
         .unwrap();
 
-        assert_eq!(source.tensors().len(), 2);
+        assert_eq!(source.tensors().len(), 3);
         assert_eq!(source.tensors()[0].name(), "a");
         assert_eq!(source.tensors()[0].dtype(), DType::F32);
         assert_eq!(source.tensors()[1].shape(), [2]);
+        assert_eq!(source.tensors()[2].dtype(), DType::U32);
     }
 
     #[test]
