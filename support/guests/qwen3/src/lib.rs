@@ -31,7 +31,7 @@ use forja_sdk::{
     kernel::{Kernel, TensorRef},
     nn::{
         Embedding, EmbeddingConfig, Linear, LinearConfig, RmsNorm, RmsNormConfig, WeightElement,
-        blocks::KvCache, ops::sdpa,
+        blocks::{KvCache, cached_attention},
     },
 };
 
@@ -319,23 +319,8 @@ impl<T: Activation> DecoderLayer<T> {
                     .rope(positions, ROPE_THETA)?,
             )
         };
-        let query = query.permute(&[1, 0, 2])?;
-        let key = key.permute(&[1, 0, 2])?;
-        let value = value_projection
-            .reshape(&[sequence, KEY_VALUE_HEADS, HEAD_DIM])?
-            .permute(&[1, 0, 2])?;
-        let (cached_key, cached_value) = cache.append(&key, &value, start, sequence, end)?;
-        let attended = sdpa(
-            &query,
-            &cached_key,
-            &cached_value,
-            ATTENTION_SCALE,
-            true,
-            start,
-        )?
-        .permute(&[1, 0, 2])?
-        .contiguous()?
-        .reshape(&[sequence, QUERY_HEADS * HEAD_DIM])?;
+        let value = value_projection.reshape(&[sequence, KEY_VALUE_HEADS, HEAD_DIM])?;
+        let attended = cached_attention(&query, &key, &value, cache, ATTENTION_SCALE, start, end)?;
         let attention = self.self_attn.o_proj.forward(&attended)?;
         let (hidden, normalized) = if FUSE_RESIDUAL_NORM {
             run_residual_norm(

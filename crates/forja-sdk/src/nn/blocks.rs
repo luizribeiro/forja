@@ -4,6 +4,8 @@ use crate::{Dim, Element, Error, Result, Tensor};
 #[cfg(target_family = "wasm")]
 use crate::{Graph, SamplingParams};
 
+use super::ops::sdpa;
+
 /// Fixed-capacity key/value cache with `[heads, context, width]` storage.
 pub struct KvCache<T: Element> {
     key: Tensor<T>,
@@ -167,4 +169,46 @@ impl<T: Element> KvCache<T> {
         value.copy_into(&mut self.value.narrow(1, start, sequence)?)?;
         Ok((self.key.narrow(1, 0, end)?, self.value.narrow(1, 0, end)?))
     }
+}
+
+/// Applies cached causal attention to sequence-major query, key, and value tensors.
+///
+/// Inputs use `[sequence, heads, width]`; the result is `[sequence, query_heads * width]`.
+///
+/// # Errors
+///
+/// Returns an error for incompatible shapes, an invalid cache range, overflow, or refused work.
+pub fn cached_attention<T: Element>(
+    query: &Tensor<T>,
+    key: &Tensor<T>,
+    value: &Tensor<T>,
+    cache: &mut KvCache<T>,
+    scale: f32,
+    start: &Dim,
+    end: &Dim,
+) -> Result<Tensor<T>> {
+    let [sequence, query_heads, width]: [u32; 3] = query
+        .shape()
+        .try_into()
+        .map_err(|_| Error::loading("attention query must have rank three"))?;
+    let key_shape: [u32; 3] = key
+        .shape()
+        .try_into()
+        .map_err(|_| Error::loading("attention key must have rank three"))?;
+    if key_shape[0] != sequence || key_shape[2] != width || value.shape() != key.shape() {
+        return Err(Error::loading(
+            "attention key and value shapes are incompatible",
+        ));
+    }
+    let query = query.permute(&[1, 0, 2])?;
+    let key = key.permute(&[1, 0, 2])?;
+    let value = value.permute(&[1, 0, 2])?;
+    let (cached_key, cached_value) = cache.append(&key, &value, start, sequence, end)?;
+    let hidden = query_heads
+        .checked_mul(width)
+        .ok_or_else(|| Error::loading("attention output width overflowed"))?;
+    sdpa(&query, &cached_key, &cached_value, scale, true, start)?
+        .permute(&[1, 0, 2])?
+        .contiguous()?
+        .reshape(&[sequence, hidden])
 }
