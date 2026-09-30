@@ -21,7 +21,7 @@ use proptest::{
     test_runner::{FileFailurePersistence, RngSeed, TestCaseError},
 };
 
-use common::{median_gpu_time, report_intervals};
+use common::{comparative_gpu_times, report_intervals};
 
 proptest! {
     #![proptest_config(general_row_program_config())]
@@ -352,17 +352,18 @@ fn fused_residual_norm_matches_and_beats_two_dispatches() {
         &backend.read(&program_output).unwrap(),
     )
     .unwrap();
-    let unfused = median_gpu_time(&backend, || {
-        residual_norm_commands(&residual, &update, &weight, &intermediate, &trusted_output)
-    });
-    let fused = median_gpu_time(&backend, || {
-        program_commands(
-            &backend,
-            &program,
-            &[&residual, &update, &broadcast_weight],
-            &[&program_residual, &program_output],
-        )
-    });
+    let (unfused, fused) = comparative_gpu_times(
+        &backend,
+        || residual_norm_commands(&residual, &update, &weight, &intermediate, &trusted_output),
+        || {
+            program_commands(
+                &backend,
+                &program,
+                &[&residual, &update, &broadcast_weight],
+                &[&program_residual, &program_output],
+            )
+        },
+    );
     let ratio = fused.as_secs_f64() / unfused.as_secs_f64();
     eprintln!("operation,unfused_ns,fused_ns,ratio");
     eprintln!(
@@ -432,8 +433,7 @@ fn fused_qk_norm_rope_matches_and_beats_two_dispatches() {
         &backend.read(&actual).unwrap(),
     )
     .unwrap();
-    let unfused = median_gpu_time(&backend, trusted);
-    let fused = median_gpu_time(&backend, fused);
+    let (unfused, fused) = comparative_gpu_times(&backend, trusted, fused);
     let ratio = fused.as_secs_f64() / unfused.as_secs_f64();
     eprintln!("operation,unfused_ns,fused_ns,ratio");
     eprintln!(
@@ -477,14 +477,15 @@ fn rms_timing(backend: &MetalBackend) -> Timing {
         &backend.read(&actual).unwrap(),
     )
     .unwrap();
+    let (trusted, program) = comparative_gpu_times(
+        backend,
+        || trusted_commands(Op::RmsNorm { eps: 1.0e-6 }, &[&input, &weight], &expected),
+        || program_commands(backend, &program, &[&input, &broadcast_weight], &[&actual]),
+    );
     Timing {
         name: "rms-norm",
-        trusted: median_gpu_time(backend, || {
-            trusted_commands(Op::RmsNorm { eps: 1.0e-6 }, &[&input, &weight], &expected)
-        }),
-        program: median_gpu_time(backend, || {
-            program_commands(backend, &program, &[&input, &broadcast_weight], &[&actual])
-        }),
+        trusted,
+        program,
     }
 }
 
@@ -507,14 +508,15 @@ fn softmax_timing(backend: &MetalBackend) -> Timing {
         &backend.read(&actual).unwrap(),
     )
     .unwrap();
+    let (trusted, program) = comparative_gpu_times(
+        backend,
+        || trusted_commands(Op::Softmax, &[&input], &expected),
+        || program_commands(backend, &program, &[&input], &[&actual]),
+    );
     Timing {
         name: "softmax",
-        trusted: median_gpu_time(backend, || {
-            trusted_commands(Op::Softmax, &[&input], &expected)
-        }),
-        program: median_gpu_time(backend, || {
-            program_commands(backend, &program, &[&input], &[&actual])
-        }),
+        trusted,
+        program,
     }
 }
 

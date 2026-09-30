@@ -20,7 +20,7 @@ use proptest::{
     test_runner::{RngSeed, TestCaseError},
 };
 
-use common::{median_gpu_time, report_intervals};
+use common::{comparative_gpu_times, report_intervals};
 
 proptest! {
     #![proptest_config(ProptestConfig {
@@ -429,14 +429,15 @@ fn binary_timing(
         &backend.read(&program_output).unwrap(),
     )
     .unwrap();
+    let (trusted, program) = comparative_gpu_times(
+        backend,
+        || trusted_commands(op, &[&left, &right], &trusted_output),
+        || program_commands(backend, &program, &[&left, &right], &[&program_output]),
+    );
     Timing {
         name,
-        trusted: median_gpu_time(backend, || {
-            trusted_commands(op, &[&left, &right], &trusted_output)
-        }),
-        program: median_gpu_time(backend, || {
-            program_commands(backend, &program, &[&left, &right], &[&program_output])
-        }),
+        trusted,
+        program,
     }
 }
 
@@ -498,23 +499,28 @@ fn rope_timing(backend: &MetalBackend) -> Timing {
         )
         .unwrap();
     }
-    Timing {
-        name: "rope",
-        trusted: median_gpu_time(backend, || {
+    let (trusted, program) = comparative_gpu_times(
+        backend,
+        || {
             trusted_commands(
                 Op::Rope { theta: 1_000_000.0 },
                 &[&values, &positions],
                 &trusted_output,
             )
-        }),
-        program: median_gpu_time(backend, || {
+        },
+        || {
             program_commands(
                 backend,
                 &program,
                 &[&first, &second],
                 &[&program_first, &program_second],
             )
-        }),
+        },
+    );
+    Timing {
+        name: "rope",
+        trusted,
+        program,
     }
 }
 
