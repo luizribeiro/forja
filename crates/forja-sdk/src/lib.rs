@@ -96,6 +96,8 @@
 
 #![forbid(unsafe_code)]
 
+extern crate self as forja_sdk;
+
 mod element;
 mod engine;
 mod graph;

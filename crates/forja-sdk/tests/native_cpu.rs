@@ -59,3 +59,25 @@ fn affine_quantized_matmul_routes_through_the_sdk() {
         .unwrap();
     assert_eq!(output.to_vec().unwrap(), [96.0, -48.0]);
 }
+
+#[test]
+fn moe_helpers_route_and_combine_experts() {
+    use forja_sdk::{Tensor, nn};
+
+    let logits = Tensor::from_slice(&[0.0_f32, 2.0_f32.ln(), 4.0_f32.ln()], &[1, 3]).unwrap();
+    let (weights, indices) = nn::moe_router(&logits, 2, true).unwrap();
+    assert_eq!(indices.to_vec().unwrap(), [2, 1]);
+    let weights = weights.to_vec().unwrap();
+    assert!((weights[0] - 2.0 / 3.0).abs() < 1.0e-6);
+    assert!((weights[1] - 1.0 / 3.0).abs() < 1.0e-6);
+
+    let experts = Tensor::from_slice(&[1.0_f32, 2.0, 3.0, 5.0, 6.0, 7.0], &[1, 2, 3]).unwrap();
+    let route_weights = Tensor::from_slice(&[0.25_f32, 0.75], &[1, 2]).unwrap();
+    assert_eq!(
+        nn::moe_combine(&experts, &route_weights)
+            .unwrap()
+            .to_vec()
+            .unwrap(),
+        [4.0, 5.0, 6.0]
+    );
+}
