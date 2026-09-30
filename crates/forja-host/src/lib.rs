@@ -1035,6 +1035,10 @@ enum BufferKind {
         live_bytes: Arc<AtomicU64>,
     },
     Weights(Safetensors),
+    CopiedWeight {
+        byte_len: u64,
+        live_bytes: Arc<AtomicU64>,
+    },
 }
 
 impl BufferHandle {
@@ -1047,7 +1051,11 @@ impl BufferHandle {
         backend.release(&self.owner)?;
         self.taints.release(self.owner.buffer());
         match &self.kind {
-            BufferKind::Allocated {
+            BufferKind::CopiedWeight {
+                byte_len,
+                live_bytes,
+            }
+            | BufferKind::Allocated {
                 byte_len,
                 live_bytes,
             } => live_bytes
@@ -1062,7 +1070,7 @@ impl BufferHandle {
 
     fn weights(&self) -> Option<&Safetensors> {
         match &self.kind {
-            BufferKind::Allocated { .. } => None,
+            BufferKind::Allocated { .. } | BufferKind::CopiedWeight { .. } => None,
             BufferKind::Weights(source) => Some(source),
         }
     }
@@ -1466,9 +1474,13 @@ impl<B: Backend> Host<B> {
             buffer
         } else {
             let source = Safetensors::open(path).map_err(weight_error)?;
-            let first = source.tensors().first().ok_or_else(|| {
-                compute::Error::Layout("weight file contains no tensors".to_owned())
-            })?;
+            let first = source
+                .tensors()
+                .iter()
+                .find(|tensor| tensor.is_aligned())
+                .ok_or_else(|| {
+                    compute::Error::Layout("weight file contains no tensors".to_owned())
+                })?;
             let region = source.mapped_region().map_err(weight_error)?;
             let buffer_len = u64::try_from(region.len())
                 .map_err(|_| guest_error(BackendError::AllocationFailed))?;
@@ -1519,22 +1531,65 @@ impl<B: Backend> Host<B> {
             .find(|tensor| tensor.name() == name)
             .ok_or_else(|| invalid_handle("weight tensor is not present"))?;
         self.check_tensor_shape(metadata.shape())?;
-        let layout = metadata
-            .layout(entry.buffer.owner.buffer().byte_len())
-            .map_err(guest_error)?;
-        let tensor = self
-            .backend
-            .tensor(entry.buffer.owner.buffer(), layout)
-            .map_err(guest_error)?;
-        let buffer = Arc::clone(&entry.buffer);
-        let tensor = self
-            .table
-            .push(TensorEntry {
-                tensor,
-                symbolic: None,
-                buffer,
-            })
-            .map_err(invalid_handle)?;
+        let (tensor, buffer) = if metadata.is_aligned() {
+            let layout = metadata
+                .layout(entry.buffer.owner.buffer().byte_len())
+                .map_err(guest_error)?;
+            let tensor = self
+                .backend
+                .tensor(entry.buffer.owner.buffer(), layout)
+                .map_err(guest_error)?;
+            (tensor, Arc::clone(&entry.buffer))
+        } else {
+            let byte_len = self.check_allocation(metadata.dtype(), metadata.shape())?;
+            let region = source.mapped_region().map_err(weight_error)?;
+            let start = usize::try_from(metadata.byte_offset())
+                .map_err(|_| guest_error(BackendError::AllocationFailed))?;
+            let len = usize::try_from(metadata.byte_len())
+                .map_err(|_| guest_error(BackendError::AllocationFailed))?;
+            let end = start
+                .checked_add(len)
+                .ok_or_else(|| guest_error(BackendError::AllocationFailed))?;
+            let bytes = region
+                .bytes()
+                .get(start..end)
+                .ok_or_else(|| guest_error(BackendError::InvalidInput))?;
+            let tensor = self
+                .backend
+                .alloc(metadata.dtype(), metadata.shape())
+                .map_err(guest_error)?;
+            if let Err(error) = self.backend.write(&tensor, bytes) {
+                let _ = self.backend.release(&tensor);
+                return Err(guest_error(error));
+            }
+            let buffer = Arc::new(BufferHandle {
+                owner: tensor.clone(),
+                kind: BufferKind::CopiedWeight {
+                    byte_len,
+                    live_bytes: Arc::clone(&self.live_bytes),
+                },
+                taints: Arc::clone(&self.taints),
+            });
+            self.live_bytes.fetch_add(byte_len, Ordering::AcqRel);
+            (tensor, buffer)
+        };
+        let retained_buffer = Arc::clone(&buffer);
+        let tensor = match self.table.push(TensorEntry {
+            tensor,
+            symbolic: None,
+            buffer,
+        }) {
+            Ok(resource) => resource,
+            Err(error) => {
+                release_buffer(
+                    self.backend.as_ref(),
+                    retained_buffer,
+                    self.active_profile.as_ref(),
+                )
+                .map_err(guest_error)?;
+                return Err(invalid_handle(error));
+            }
+        };
         self.live_handles += 1;
         Ok(tensor)
     }
@@ -4195,6 +4250,33 @@ mod tests {
         fs::remove_file(path).unwrap();
     }
 
+    #[test]
+    fn copied_weights_obey_and_release_the_byte_quota() {
+        let path = test_unaligned_weight_file();
+        let grants = Grants::new().with_weights("model", &path);
+        let limits = Limits::new(4, 8, u64::MAX, 8, u64::MAX);
+        let mut host = Host::with_grants(CpuBackend::new(), limits, grants);
+        let weights = host.open_weights("model").unwrap();
+
+        let first = host
+            .weight_tensor(&Resource::new_borrow(weights.rep()), "unaligned")
+            .unwrap();
+        assert_eq!(host.live_bytes.load(Ordering::Acquire), 4);
+        assert!(matches!(
+            host.weight_tensor(&Resource::new_borrow(weights.rep()), "unaligned"),
+            Err(compute::Error::Quota(_))
+        ));
+
+        host.drop_tensor(first).unwrap();
+        assert_eq!(host.live_bytes.load(Ordering::Acquire), 0);
+        let second = host
+            .weight_tensor(&Resource::new_borrow(weights.rep()), "unaligned")
+            .unwrap();
+        host.drop_tensor(second).unwrap();
+        host.drop_weights(weights).unwrap();
+        fs::remove_file(path).unwrap();
+    }
+
     fn test_weight_file() -> std::path::PathBuf {
         let mut header = br#"{"value":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#.to_vec();
         while !(header.len() + 8).is_multiple_of(8) {
@@ -4205,6 +4287,23 @@ mod tests {
         bytes.extend(1.0_f32.to_le_bytes());
         let path = std::env::temp_dir().join(format!(
             "forja-weight-cache-{}-{}",
+            std::process::id(),
+            NEXT_WEIGHT_FILE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    fn test_unaligned_weight_file() -> std::path::PathBuf {
+        let mut header = br#"{"aligned":{"dtype":"F16","shape":[1],"data_offsets":[0,2]},"unaligned":{"dtype":"U32","shape":[1],"data_offsets":[2,6]}}"#.to_vec();
+        while !(header.len() + 8).is_multiple_of(8) {
+            header.push(b' ');
+        }
+        let mut bytes = u64::try_from(header.len()).unwrap().to_le_bytes().to_vec();
+        bytes.extend(header);
+        bytes.extend([0; 6]);
+        let path = std::env::temp_dir().join(format!(
+            "forja-unaligned-weight-{}-{}",
             std::process::id(),
             NEXT_WEIGHT_FILE.fetch_add(1, Ordering::Relaxed)
         ));

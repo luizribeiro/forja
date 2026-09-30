@@ -57,6 +57,12 @@ impl WeightTensor {
         self.byte_len
     }
 
+    /// Reports whether the tensor begins at its scalar type's alignment.
+    #[must_use]
+    pub const fn is_aligned(&self) -> bool {
+        self.byte_offset.is_multiple_of(self.dtype.byte_size())
+    }
+
     pub(crate) fn layout(&self, buffer_len: u64) -> Result<Layout, LayoutError> {
         Layout::contiguous(
             self.dtype,
@@ -204,8 +210,6 @@ pub enum WeightError {
     InvalidRange,
     /// Two tensor byte ranges overlap.
     OverlappingRanges,
-    /// A tensor begins at an address not aligned for its scalar type.
-    MisalignedData,
 }
 
 impl fmt::Display for WeightError {
@@ -226,7 +230,6 @@ impl fmt::Display for WeightError {
             }
             Self::InvalidRange => f.write_str("invalid safetensors tensor byte range"),
             Self::OverlappingRanges => f.write_str("safetensors tensor byte ranges overlap"),
-            Self::MisalignedData => f.write_str("safetensors tensor data is not element-aligned"),
         }
     }
 }
@@ -310,9 +313,6 @@ fn parse_tensor(
         .ok_or(WeightError::InvalidRange)?;
     if byte_end > file_len {
         return Err(WeightError::Truncated);
-    }
-    if byte_offset % dtype.byte_size() != 0 {
-        return Err(WeightError::MisalignedData);
     }
     Ok(WeightTensor {
         name,
@@ -406,15 +406,15 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unaligned_data_start() {
-        assert!(matches!(
-            open(
-                r#"{"a":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#,
-                &[0; 4],
-                false
-            ),
-            Err(WeightError::MisalignedData)
-        ));
+    fn retains_unaligned_tensor_metadata_for_copying() {
+        let source = open(
+            r#"{"a":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#,
+            &[0; 4],
+            false,
+        )
+        .unwrap();
+
+        assert!(!source.tensors()[0].is_aligned());
     }
 
     #[test]
