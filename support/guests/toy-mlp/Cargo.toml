@@ -11,3 +11,6 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 forja-sdk = { path = "../../../crates/forja-sdk" }
+
+[lints]
+workspace = true

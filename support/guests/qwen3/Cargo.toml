@@ -21,3 +21,6 @@ silu-mul-only = []
 
 [dependencies]
 forja-sdk = { path = "../../../crates/forja-sdk" }
+
+[lints]
+workspace = true

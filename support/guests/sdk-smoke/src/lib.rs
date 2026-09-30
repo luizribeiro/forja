@@ -1,7 +1,9 @@
 //! Component running a Qwen-shaped attention block through the guest SDK.
 
 #![allow(
+    clippy::same_length_and_capacity,
     clippy::too_many_arguments,
+    clippy::unused_async_trait_impl,
     reason = "wit-bindgen lowers each exported list into a pointer-length pair"
 )]
 

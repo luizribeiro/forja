@@ -1,5 +1,11 @@
 //! Component exercising command recording, submission, and tensor retention.
 
+#![allow(
+    clippy::needless_pass_by_value,
+    clippy::same_length_and_capacity,
+    clippy::unused_async_trait_impl
+)]
+
 wit_bindgen::generate!({
     path: "../../../wit",
     world: "rmsnorm-smoke",

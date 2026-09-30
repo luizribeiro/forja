@@ -10,3 +10,6 @@ crate-type = ["cdylib"]
 [dependencies]
 forja-sdk.workspace = true
 wit-bindgen.workspace = true
+
+[lints]
+workspace = true

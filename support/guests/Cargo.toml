@@ -23,3 +23,6 @@ version = "0.0.0"
 [workspace.dependencies]
 forja-sdk = { path = "../../crates/forja-sdk" }
 wit-bindgen = "0.62"
+
+[workspace.lints.clippy]
+pedantic = "warn"

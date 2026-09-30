@@ -1,5 +1,11 @@
 //! Component probing refusals and resource lifetime checks at the host boundary.
 
+#![allow(
+    clippy::needless_pass_by_value,
+    clippy::same_length_and_capacity,
+    clippy::unused_async_trait_impl
+)]
+
 wit_bindgen::generate!({
     path: "../../../wit",
     world: "tensor-abuse",

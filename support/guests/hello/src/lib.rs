@@ -1,7 +1,7 @@
 //! Greeting component used to verify the guest build and host harness.
 //! It has no imports and returns a deterministic greeting for its caller.
 
-#![allow(clippy::same_length_and_capacity)]
+#![allow(clippy::same_length_and_capacity, clippy::unused_async_trait_impl)]
 
 wit_bindgen::generate!({
     path: "wit",

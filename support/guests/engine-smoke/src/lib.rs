@@ -1,5 +1,7 @@
 //! Minimal hand-written engine component used to test the host contract.
 
+#![allow(clippy::same_length_and_capacity, clippy::unused_async_trait_impl)]
+
 wit_bindgen::generate!({
     path: "../../../wit",
     world: "engine-component",

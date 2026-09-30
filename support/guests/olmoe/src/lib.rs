@@ -199,14 +199,14 @@ impl Olmoe {
         &mut self,
         tokens: &Tensor<u32>,
         sequence: u32,
-        start: Dim,
-        end: Dim,
+        start: &Dim,
+        end: &Dim,
         taps_enabled: bool,
     ) -> Result<StepOutput> {
         let last = sequence
             .checked_sub(1)
             .ok_or_else(|| forja_sdk::Error::loading("tokens cannot be empty"))?;
-        let positions = self.positions.narrow(0, &start, sequence)?;
+        let positions = self.positions.narrow(0, start, sequence)?;
         let mut hidden = self.weights.model.embed_tokens.forward(tokens)?;
         let mut taps = Taps::new(taps_enabled, LAYERS);
         let mut routers = Vec::with_capacity(if taps_enabled { LAYERS } else { 0 });
@@ -215,8 +215,8 @@ impl Olmoe {
                 &hidden,
                 &positions,
                 &mut self.caches[index],
-                &start,
-                &end,
+                start,
+                end,
             )?;
             hidden = next;
             if taps.enabled() {
@@ -285,13 +285,9 @@ impl Engine for Olmoe {
                 router_logits: Vec::new(),
             });
         }
-        self.forward(
-            &input.tokens,
-            sequence,
-            input.start_pos.into(),
-            end.into(),
-            input.taps,
-        )
+        let start = input.start_pos.into();
+        let end = end.into();
+        self.forward(&input.tokens, sequence, &start, &end, input.taps)
     }
 
     #[cfg(target_family = "wasm")]
@@ -316,8 +312,10 @@ impl Engine for Olmoe {
                 if REPLAY_DECODE && sequence == 1 {
                     self.decode_selected(Some(&tokens), input.start_pos, selection)
                 } else {
+                    let start = input.start_pos.into();
+                    let end_dim = end.into();
                     let logits = self
-                        .forward(&tokens, sequence, input.start_pos.into(), end.into(), false)?
+                        .forward(&tokens, sequence, &start, &end_dim, false)?
                         .logits;
                     self.select_token(logits, end - 1)
                 }
@@ -327,15 +325,9 @@ impl Engine for Olmoe {
             }
             None if input.start_pos < MAX_CONTEXT => {
                 let token = self.decode.token()?;
-                let logits = self
-                    .forward(
-                        &token,
-                        1,
-                        input.start_pos.into(),
-                        (input.start_pos + 1).into(),
-                        false,
-                    )?
-                    .logits;
+                let start = input.start_pos.into();
+                let end = (input.start_pos + 1).into();
+                let logits = self.forward(&token, 1, &start, &end, false)?.logits;
                 self.select_token(logits, input.start_pos)
             }
             None => Err(forja_sdk::Error::loading(
@@ -376,14 +368,13 @@ impl Olmoe {
         let position = forja_sdk::Param::new(0..=MAX_CONTEXT - 1)?;
         let start = position.at(start_pos);
         let end = (start.clone() + 1)?;
+        let start_dim = start.clone().into();
         let token = self.decode.token()?;
         let mut feedback = self.decode.token()?;
         let output_tokens = self.decode.output_tokens()?;
         let sampling = self.decode.sampling()?;
         forja_sdk::capture(&[&position], || {
-            let logits = self
-                .forward(&token, 1, start.clone().into(), end, false)?
-                .logits;
+            let logits = self.forward(&token, 1, &start_dim, &end, false)?.logits;
             let selected = match selection {
                 DecodeSelection::None => None,
                 DecodeSelection::Greedy => Some(logits.reshape(&[1, VOCAB])?.argmax()?),

@@ -1,5 +1,7 @@
 //! Component running fused residual addition and RMS normalization.
 
+#![allow(clippy::same_length_and_capacity, clippy::unused_async_trait_impl)]
+
 wit_bindgen::generate!({
     path: "../../../wit",
     world: "program-smoke",

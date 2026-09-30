@@ -70,6 +70,8 @@ fn expand_engine(item: &ItemImpl) -> syn::Result<proc_macro2::TokenStream> {
 
         #[cfg(target_family = "wasm")]
         mod __forja_engine_export {
+            #![allow(clippy::same_length_and_capacity, clippy::unused_async_trait_impl)]
+
             use ::std::cell::RefCell;
             use ::forja_sdk::__private::wit_bindgen as wit_bindgen;
 

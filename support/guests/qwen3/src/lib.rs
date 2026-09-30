@@ -82,6 +82,10 @@ pub trait Activation: WeightElement + FloatElement {
     fn embedding_config(vocab: u32, hidden: u32) -> EmbeddingConfig;
 
     /// Converts an engine result to the component's f32 output type.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when conversion or materialization fails.
     fn output(tensor: Tensor<Self>) -> Result<Tensor<f32>>;
 }
 
@@ -154,6 +158,7 @@ struct Attention<T: Activation> {
 
 #[derive(Load)]
 #[load(config = Config)]
+#[allow(clippy::struct_field_names)]
 struct Mlp<T: Activation> {
     #[load(prefix, config = T::linear_config(HIDDEN, INTERMEDIATE))]
     gate_proj: Linear<T>,
@@ -219,19 +224,19 @@ impl FusedKernels {
     }
 
     fn silu_mul(&self) -> Result<&Kernel> {
-        required_kernel(&self.silu_mul, "silu_mul")
+        required_kernel(self.silu_mul.as_ref(), "silu_mul")
     }
 
     fn qk_norm_rope(&self) -> Result<&Kernel> {
-        required_kernel(&self.qk_norm_rope, "qk_norm_rope")
+        required_kernel(self.qk_norm_rope.as_ref(), "qk_norm_rope")
     }
 
     fn residual_norm(&self) -> Result<&Kernel> {
-        required_kernel(&self.residual_norm, "residual_norm")
+        required_kernel(self.residual_norm.as_ref(), "residual_norm")
     }
 
     fn final_norm(&self) -> Result<&Kernel> {
-        required_kernel(&self.final_norm, "final_norm")
+        required_kernel(self.final_norm.as_ref(), "final_norm")
     }
 }
 
@@ -239,10 +244,8 @@ fn load_kernel(enabled: bool, build: impl FnOnce() -> Result<Kernel>) -> Result<
     enabled.then(build).transpose()
 }
 
-fn required_kernel<'a>(kernel: &'a Option<Kernel>, name: &str) -> Result<&'a Kernel> {
-    kernel
-        .as_ref()
-        .ok_or_else(|| forja_sdk::Error::loading(format!("fused kernel `{name}` is unavailable")))
+fn required_kernel<'a>(kernel: Option<&'a Kernel>, name: &str) -> Result<&'a Kernel> {
+    kernel.ok_or_else(|| forja_sdk::Error::loading(format!("fused kernel `{name}` is unavailable")))
 }
 
 struct LayerResources<'a, T: Activation> {
@@ -250,6 +253,7 @@ struct LayerResources<'a, T: Activation> {
     following_norm: Option<&'a RmsNorm<T>>,
 }
 
+#[derive(Clone, Copy)]
 struct LayerPosition<'a, T: Activation> {
     positions: &'a Tensor<u32>,
     activation_positions: Option<&'a Tensor<T>>,
@@ -598,13 +602,9 @@ impl Engine for ExportedQwen3 {
                 router_logits: Vec::new(),
             });
         }
-        self.forward(
-            &input.tokens,
-            sequence,
-            input.start_pos.into(),
-            end_pos.into(),
-            input.taps,
-        )
+        let start = input.start_pos.into();
+        let end = end_pos.into();
+        self.forward(&input.tokens, sequence, &start, &end, input.taps)
     }
 
     #[cfg(target_family = "wasm")]
@@ -629,8 +629,10 @@ impl Engine for ExportedQwen3 {
                 if REPLAY_DECODE && sequence == 1 {
                     self.decode_selected(Some(&tokens), input.start_pos, selection)
                 } else {
+                    let start = input.start_pos.into();
+                    let end_dim = end.into();
                     let logits = self
-                        .forward(&tokens, sequence, input.start_pos.into(), end.into(), false)?
+                        .forward(&tokens, sequence, &start, &end_dim, false)?
                         .logits;
                     self.select_token(logits, end - 1)
                 }
@@ -641,9 +643,9 @@ impl Engine for ExportedQwen3 {
             None if input.start_pos < MAX_CONTEXT => {
                 let token = self.decode.token()?;
                 let end = input.start_pos + 1;
-                let logits = self
-                    .forward(&token, 1, input.start_pos.into(), end.into(), false)?
-                    .logits;
+                let start_dim = input.start_pos.into();
+                let end_dim = end.into();
+                let logits = self.forward(&token, 1, &start_dim, &end_dim, false)?.logits;
                 self.select_token(logits, input.start_pos)
             }
             None => Err(forja_sdk::Error::loading(
@@ -658,18 +660,18 @@ impl<T: Activation> Qwen3<T> {
         &mut self,
         tokens: &Tensor<u32>,
         sequence: u32,
-        start: Dim,
-        end: Dim,
+        start: &Dim,
+        end: &Dim,
         taps_enabled: bool,
     ) -> Result<StepOutput> {
         let last = sequence
             .checked_sub(1)
             .ok_or_else(|| forja_sdk::Error::loading("tokens cannot be empty"))?;
-        let positions = self.positions.narrow(0, &start, sequence)?;
+        let positions = self.positions.narrow(0, start, sequence)?;
         let program_positions = self
             .activation_positions
             .as_ref()
-            .map(|positions| positions.narrow(0, &start, sequence))
+            .map(|positions| positions.narrow(0, start, sequence))
             .transpose()?;
         let mut hidden = self.weights.model.embed_tokens.forward(tokens)?;
         let mut normalized = self.weights.model.layers[0]
@@ -692,8 +694,8 @@ impl<T: Activation> Qwen3<T> {
                     positions: &positions,
                     activation_positions: program_positions.as_ref(),
                     sequence,
-                    start: &start,
-                    end: &end,
+                    start,
+                    end,
                 },
                 LayerResources {
                     cache: &mut self.caches[index],
@@ -772,14 +774,13 @@ impl<T: Activation> Qwen3<T> {
         let position = forja_sdk::Param::new(0..=MAX_CONTEXT - 1)?;
         let start = position.at(start_pos);
         let end = (start.clone() + 1)?;
+        let start_dim = start.clone().into();
         let token = self.decode.token()?;
         let mut feedback = self.decode.token()?;
         let output_tokens = self.decode.output_tokens()?;
         let sampling = self.decode.sampling()?;
         forja_sdk::capture(&[&position], || {
-            let logits = self
-                .forward(&token, 1, start.clone().into(), end, false)?
-                .logits;
+            let logits = self.forward(&token, 1, &start_dim, &end, false)?.logits;
             let selected = match selection {
                 DecodeSelection::None => None,
                 DecodeSelection::Greedy => Some(logits.reshape(&[1, VOCAB])?.argmax()?),
