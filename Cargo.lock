@@ -732,6 +732,7 @@ dependencies = [
  "golden-fixtures",
  "olmoe",
  "qwen3",
+ "qwen3-coder",
  "serde",
  "serde_json",
  "test-guests",
@@ -1514,6 +1515,13 @@ dependencies = [
 
 [[package]]
 name = "qwen3"
+version = "0.0.0"
+dependencies = [
+ "forja-sdk",
+]
+
+[[package]]
+name = "qwen3-coder"
 version = "0.0.0"
 dependencies = [
  "forja-sdk",

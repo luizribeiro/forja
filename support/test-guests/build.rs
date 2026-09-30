@@ -7,6 +7,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[allow(clippy::too_many_lines)]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let crate_dir = PathBuf::from(required_var("CARGO_MANIFEST_DIR")?);
     let repository = crate_dir.join("../..");
@@ -44,6 +45,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let release_dir = guest_target_dir.join("wasm32-wasip2/release");
     let [olmoe, olmoe_no_replay] =
         build_olmoe_profiles(&guest_manifest, &guest_target_dir, &out_dir)?;
+    let [qwen3_coder, qwen3_coder_no_replay] =
+        build_qwen3_coder_profiles(&guest_manifest, &guest_target_dir, &out_dir)?;
     emit_guest_path("HELLO_COMPONENT", &release_dir.join("hello.wasm"));
     emit_guest_path(
         "ENGINE_SMOKE_COMPONENT",
@@ -74,6 +77,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     emit_guest_path("QWEN3_COMPONENT", &qwen3);
     emit_guest_path("OLMOE_COMPONENT", &olmoe);
     emit_guest_path("OLMOE_NO_REPLAY_COMPONENT", &olmoe_no_replay);
+    emit_qwen3_coder_paths(&qwen3_coder, &qwen3_coder_no_replay);
     emit_guest_path("QWEN3_BF16_COMPONENT", &qwen3_bf16);
     emit_guest_path("QWEN3_RESIDUAL_NORM_COMPONENT", &qwen3_residual_norm);
     emit_guest_path(
@@ -108,6 +112,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         repository.join("wit").display()
     );
     Ok(())
+}
+
+fn emit_qwen3_coder_paths(default: &Path, no_replay: &Path) {
+    emit_guest_path("QWEN3_CODER_COMPONENT", default);
+    emit_guest_path("QWEN3_CODER_NO_REPLAY_COMPONENT", no_replay);
+}
+
+fn build_qwen3_coder_profiles(
+    manifest: &Path,
+    target_dir: &Path,
+    out_dir: &Path,
+) -> io::Result<[PathBuf; 2]> {
+    let component = target_dir.join("wasm32-wasip2/release/qwen3_coder.wasm");
+    let default = copy_component(&component, out_dir, "qwen3-coder.wasm")?;
+    build_guest_workspace(
+        manifest,
+        target_dir,
+        &["-p", "qwen3-coder", "--features", "no-replay"],
+    )?;
+    let no_replay = copy_component(&component, out_dir, "qwen3-coder-no-replay.wasm")?;
+    Ok([default, no_replay])
 }
 
 fn build_olmoe_profiles(

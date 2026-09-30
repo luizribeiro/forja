@@ -212,6 +212,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "qwen3-coder"
+version = "0.0.0"
+dependencies = [
+ "forja-sdk",
+]
+
+[[package]]
 name = "rmsnorm-smoke"
 version = "0.0.0"
 dependencies = [
