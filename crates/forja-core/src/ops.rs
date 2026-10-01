@@ -199,6 +199,15 @@ pub enum Op {
         /// Number of input elements sharing one scale and bias.
         group_size: u32,
     },
+    /// Multiplies routed rows by affine-quantized expert weights, combines routes, and adds a
+    /// residual. Unlike `GatherQuantMatmul`, invalid routes are skipped while their request row
+    /// remains in the output.
+    GatherQuantMatmulCombine {
+        /// Number of bits in each unsigned quantized value.
+        bits: u8,
+        /// Number of input elements sharing one scale and bias.
+        group_size: u32,
+    },
     /// Computes `SiLU(gate) * up` from two gathered affine-quantized projections.
     GatherQuantSiluMul {
         /// Number of bits in each unsigned quantized value.
@@ -357,6 +366,9 @@ impl Dispatch {
             }
             Op::GatherQuantMatmul { bits, group_size } => {
                 check_gather_quant_matmul(inputs, output, bits, group_size)?;
+            }
+            Op::GatherQuantMatmulCombine { bits, group_size } => {
+                check_gather_quant_matmul_combine(inputs, output, bits, group_size)?;
             }
             Op::GatherQuantSiluMul { bits, group_size } => {
                 check_gather_quant_silu_mul(inputs, output, bits, group_size)?;
@@ -1209,6 +1221,64 @@ fn check_gather_quant_matmul(
     check_gather_quant_projection(inputs, output, bits, group_size, [0, 1, 2, 3, 4])
 }
 
+fn check_gather_quant_matmul_combine(
+    inputs: &[&Tensor],
+    output: &Tensor,
+    bits: u8,
+    group_size: u32,
+) -> Result<(), OpError> {
+    if inputs.len() != 7 {
+        return Err(OpError::Arity {
+            expected: 7,
+            actual: inputs.len(),
+        });
+    }
+    for position in [0, 5, 6] {
+        check_float(inputs[position], Operand::Input(position))?;
+        if inputs[position].layout.dtype() != inputs[0].layout.dtype() {
+            return Err(OpError::DType {
+                operand: Operand::Input(position),
+                dtype: inputs[position].layout.dtype(),
+            });
+        }
+    }
+    check_float(output, Operand::Output)?;
+    if output.layout.dtype() != inputs[0].layout.dtype() {
+        return Err(OpError::DType {
+            operand: Operand::Output,
+            dtype: output.layout.dtype(),
+        });
+    }
+    if inputs[4].layout.dtype() != DType::U32 {
+        return Err(OpError::DType {
+            operand: Operand::Input(4),
+            dtype: inputs[4].layout.dtype(),
+        });
+    }
+    let [rows, routes, inner]: [u32; 3] = inputs[0]
+        .layout
+        .shape()
+        .try_into()
+        .map_err(|_| shape_error(Operand::Input(0)))?;
+    if !(1..=8).contains(&routes) {
+        return Err(shape_error(Operand::Input(0)));
+    }
+    let (_, columns) =
+        check_quantized_expert_weights(inputs, bits, group_size, [0, 1, 2, 3], inner)?;
+    for position in [4, 5] {
+        if inputs[position].layout.shape() != [rows, routes] {
+            return Err(shape_error(Operand::Input(position)));
+        }
+    }
+    if inputs[6].layout.shape() != [rows, columns] {
+        return Err(shape_error(Operand::Input(6)));
+    }
+    if output.layout.shape() != [rows, columns] {
+        return Err(shape_error(Operand::Output));
+    }
+    Ok(())
+}
+
 fn check_gather_quant_silu_mul(
     inputs: &[&Tensor],
     output: &Tensor,
@@ -1247,9 +1317,6 @@ fn check_gather_quant_projection(
         index_position,
     ] = positions;
     let input = inputs[input_position];
-    let packed_input = inputs[packed_position];
-    let scale_input = inputs[scale_position];
-    let bias_input = inputs[bias_position];
     let index_input = inputs[index_position];
     check_float(input, Operand::Input(input_position))?;
     check_float(output, Operand::Output)?;
@@ -1270,6 +1337,48 @@ fn check_gather_quant_projection(
         .shape()
         .try_into()
         .map_err(|_| shape_error(Operand::Input(input_position)))?;
+    let (_, out) = check_quantized_expert_weights(
+        inputs,
+        bits,
+        group_size,
+        [
+            input_position,
+            packed_position,
+            scale_position,
+            bias_position,
+        ],
+        inner,
+    )?;
+    let [index_rows, k]: [u32; 2] = index_input
+        .layout
+        .shape()
+        .try_into()
+        .map_err(|_| shape_error(Operand::Input(index_position)))?;
+    if index_rows != rows {
+        return Err(shape_error(Operand::Input(index_position)));
+    }
+    if output.layout.shape() != [rows, k, out] {
+        return Err(shape_error(Operand::Output));
+    }
+    Ok(())
+}
+
+fn check_quantized_expert_weights(
+    inputs: &[&Tensor],
+    bits: u8,
+    group_size: u32,
+    positions: [usize; 4],
+    inner: u32,
+) -> Result<(u32, u32), OpError> {
+    let [
+        input_position,
+        packed_position,
+        scale_position,
+        bias_position,
+    ] = positions;
+    let packed_input = inputs[packed_position];
+    let scale_input = inputs[scale_position];
+    let bias_input = inputs[bias_position];
     let [experts, out, _]: [u32; 3] = packed_input
         .layout
         .shape()
@@ -1290,20 +1399,21 @@ fn check_gather_quant_projection(
         .map_err(|()| shape_error(Operand::Input(scale_position)))?;
     let biases = expert_matrix_layout(bias_input.layout())
         .map_err(|()| shape_error(Operand::Input(bias_position)))?;
-    QuantizedMatrix::new(out, inner, bits, group_size, packed, scales, biases)
-        .map_err(|error| quantized_matrix_error_at(error, inputs, positions))?;
-    let [index_rows, k]: [u32; 2] = index_input
-        .layout
-        .shape()
-        .try_into()
-        .map_err(|_| shape_error(Operand::Input(index_position)))?;
-    if index_rows != rows {
-        return Err(shape_error(Operand::Input(index_position)));
-    }
-    if output.layout.shape() != [rows, k, out] {
-        return Err(shape_error(Operand::Output));
-    }
-    Ok(())
+    QuantizedMatrix::new(out, inner, bits, group_size, packed, scales, biases).map_err(
+        |error| {
+            quantized_matrix_error_at(
+                error,
+                inputs,
+                [
+                    input_position,
+                    packed_position,
+                    scale_position,
+                    bias_position,
+                ],
+            )
+        },
+    )?;
+    Ok((experts, out))
 }
 
 fn expert_matrix_layout(layout: &Layout) -> Result<Layout, ()> {
@@ -1319,13 +1429,13 @@ fn expert_matrix_layout(layout: &Layout) -> Result<Layout, ()> {
 }
 
 fn quantized_matrix_error(error: QuantizedMatrixError, inputs: &[&Tensor]) -> OpError {
-    quantized_matrix_error_at(error, inputs, [0, 1, 2, 3, 0])
+    quantized_matrix_error_at(error, inputs, [0, 1, 2, 3])
 }
 
 fn quantized_matrix_error_at(
     error: QuantizedMatrixError,
     inputs: &[&Tensor],
-    positions: [usize; 5],
+    positions: [usize; 4],
 ) -> OpError {
     match error {
         QuantizedMatrixError::UnsupportedBitWidth | QuantizedMatrixError::UnsupportedGroupSize => {
@@ -1405,6 +1515,24 @@ pub fn gather_quant_matmul_flops(input: &[u32], packed: &[u32], indices: &[u32])
     (rows == index_rows).then_some(())?;
     u64::from(rows)
         .checked_mul(u64::from(k))?
+        .checked_mul(u64::from(inner))?
+        .checked_mul(u64::from(columns))?
+        .checked_mul(2)
+}
+
+/// Counts the multiply-add operations in a combined gathered affine quantized projection.
+#[must_use]
+pub fn gather_quant_matmul_combine_flops(
+    input: &[u32],
+    packed: &[u32],
+    indices: &[u32],
+) -> Option<u64> {
+    let [rows, routes, inner]: [u32; 3] = input.try_into().ok()?;
+    let [_, columns, _]: [u32; 3] = packed.try_into().ok()?;
+    let [index_rows, index_routes]: [u32; 2] = indices.try_into().ok()?;
+    (rows == index_rows && routes == index_routes).then_some(())?;
+    u64::from(rows)
+        .checked_mul(u64::from(routes))?
         .checked_mul(u64::from(inner))?
         .checked_mul(u64::from(columns))?
         .checked_mul(2)

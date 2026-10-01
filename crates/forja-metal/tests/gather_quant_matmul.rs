@@ -3,7 +3,7 @@
 use forja_core::{Backend, BackendError, CommandList, DType, Op, Slice, Submission};
 use forja_cpu::CpuBackend;
 use forja_metal::MetalBackend;
-use forja_testing::{TensorSpec, assert_backends_agree};
+use forja_testing::{TensorSpec, assert_backends_agree, assert_outputs_agree};
 
 #[test]
 fn qwen_expert_projection_shapes_match_cpu() {
@@ -12,6 +12,15 @@ fn qwen_expert_projection_shapes_match_cpu() {
     for dtype in [DType::F16, DType::BF16, DType::F32] {
         assert_case(&cpu, &metal, [1, 8, 128, 2048, 768], dtype);
         assert_case(&cpu, &metal, [1, 8, 128, 768, 2048], dtype);
+    }
+}
+
+#[test]
+fn qwen_combined_down_projection_matches_cpu() {
+    let cpu = CpuBackend::new();
+    let metal = MetalBackend::new().unwrap();
+    for dtype in [DType::F16, DType::BF16, DType::F32] {
+        assert_combine_case(&cpu, &metal, dtype);
     }
 }
 
@@ -339,6 +348,123 @@ fn qwen_decode_silu_zeros_gpu_written_out_of_range_routes() {
     }
 }
 
+#[test]
+fn qwen_combined_down_projection_zeros_gpu_written_out_of_range_routes() {
+    for dtype in [DType::F16, DType::BF16, DType::F32] {
+        let metal = MetalBackend::new().unwrap();
+        let input = metal.alloc(dtype, &[1, 8, 768]).unwrap();
+        let packed = metal.alloc(DType::U32, &[128, 2048, 96]).unwrap();
+        let scales = metal.alloc(DType::F16, &[128, 2048, 12]).unwrap();
+        let biases = metal.alloc(DType::F16, &[128, 2048, 12]).unwrap();
+        let indices = copied_invalid_indices(&metal, &[1, 8]);
+        let weights = metal.alloc(dtype, &[1, 8]).unwrap();
+        let residual = metal.alloc(dtype, &[1, 2048]).unwrap();
+        let output = metal.alloc(dtype, &[1, 2048]).unwrap();
+        let output_bytes = usize::try_from(2048 * dtype.byte_size()).unwrap();
+        metal.write(&output, &vec![0xa5; output_bytes]).unwrap();
+        let mut commands = CommandList::new();
+        commands
+            .dispatch(
+                Op::GatherQuantMatmulCombine {
+                    bits: 4,
+                    group_size: 64,
+                },
+                &[
+                    &input, &packed, &scales, &biases, &indices, &weights, &residual,
+                ],
+                &output,
+            )
+            .unwrap();
+        assert_eq!(
+            metal.submit(commands).unwrap().wait(),
+            Err(BackendError::IndexOutOfRange { index: 129 })
+        );
+        assert_zero_output_after_error(&metal, &output, output_bytes);
+    }
+}
+
+#[test]
+fn combined_projection_keeps_nonzero_valid_routes_in_a_mixed_row() {
+    let cpu = CpuBackend::new();
+    let metal = MetalBackend::new().unwrap();
+    let (cpu_error, expected) = run_mixed_combine(&cpu);
+    let (metal_error, actual) = run_mixed_combine(&metal);
+
+    assert_eq!(cpu_error, Err(BackendError::IndexOutOfRange { index: 7 }));
+    assert_eq!(metal_error, cpu_error);
+    assert_outputs_agree(DType::F32, &expected, &actual).unwrap();
+}
+
+fn run_mixed_combine<B: Backend>(backend: &B) -> (Result<(), BackendError>, Vec<u8>) {
+    let activations = (1_u16..=5)
+        .flat_map(|value| std::iter::repeat_n(f32::from(value), 64))
+        .collect::<Vec<_>>();
+    let packed = (1_u32..=6)
+        .flat_map(|value| std::iter::repeat_n(value * 0x1111_1111, 8))
+        .collect::<Vec<_>>();
+    let input = initialized(backend, DType::F32, &[1, 5, 64], &f32_bytes(&activations));
+    let packed = initialized(backend, DType::U32, &[3, 2, 8], &u32_bytes(&packed));
+    let scales = initialized(backend, DType::BF16, &[3, 2, 1], &bf16_bytes(&[0.5; 6]));
+    let biases = initialized(backend, DType::BF16, &[3, 2, 1], &bf16_bytes(&[0.25; 6]));
+    let indices = initialized(backend, DType::U32, &[1, 5], &u32_bytes(&[2, 99, 0, 7, 1]));
+    let weights = initialized(
+        backend,
+        DType::F32,
+        &[1, 5],
+        &f32_bytes(&[0.5, 1.0, -0.25, 2.0, 0.75]),
+    );
+    let residual = initialized(backend, DType::F32, &[1, 2], &f32_bytes(&[1.5, -2.0]));
+    let output = backend.alloc(DType::F32, &[1, 2]).unwrap();
+    let mut commands = CommandList::new();
+    commands
+        .dispatch(
+            Op::GatherQuantMatmulCombine {
+                bits: 4,
+                group_size: 64,
+            },
+            &[
+                &input, &packed, &scales, &biases, &indices, &weights, &residual,
+            ],
+            &output,
+        )
+        .unwrap();
+    let error = backend.submit(commands).unwrap().wait();
+    let _ = backend.read(&output);
+    (error, backend.read(&output).unwrap())
+}
+
+fn initialized<B: Backend>(
+    backend: &B,
+    dtype: DType,
+    shape: &[u32],
+    bytes: &[u8],
+) -> forja_core::Tensor {
+    let tensor = backend.alloc(dtype, shape).unwrap();
+    backend.write(&tensor, bytes).unwrap();
+    tensor
+}
+
+fn f32_bytes(values: &[f32]) -> Vec<u8> {
+    values
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect()
+}
+
+fn bf16_bytes(values: &[f32]) -> Vec<u8> {
+    values
+        .iter()
+        .flat_map(|value| u16::try_from(value.to_bits() >> 16).unwrap().to_le_bytes())
+        .collect()
+}
+
+fn u32_bytes(values: &[u32]) -> Vec<u8> {
+    values
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect()
+}
+
 fn copied_invalid_indices(metal: &MetalBackend, shape: &[u32]) -> forja_core::Tensor {
     let source = metal.alloc(DType::U32, shape).unwrap();
     let indices = metal.alloc(DType::U32, shape).unwrap();
@@ -386,6 +512,39 @@ fn assert_case(cpu: &CpuBackend, metal: &MetalBackend, shape: [u32; 5], dtype: D
         cpu,
         metal,
         Op::GatherQuantMatmul { bits, group_size },
+        &inputs,
+        &output,
+    )
+    .unwrap();
+}
+
+fn assert_combine_case(cpu: &CpuBackend, metal: &MetalBackend, dtype: DType) {
+    let rows = 1;
+    let routes = 8;
+    let experts = 128;
+    let inner = 768;
+    let columns = 2048;
+    let selected = [7_u32, 0, 7, 1, 1, 2, 2, 7]
+        .into_iter()
+        .flat_map(u32::to_le_bytes)
+        .collect::<Vec<_>>();
+    let inputs = [
+        TensorSpec::contiguous(dtype, &[rows, routes, inner]),
+        TensorSpec::contiguous(DType::U32, &[experts, columns, inner / 8]),
+        TensorSpec::contiguous(DType::F16, &[experts, columns, inner / 64]),
+        TensorSpec::contiguous(DType::F16, &[experts, columns, inner / 64]),
+        TensorSpec::initialized(DType::U32, &[rows, routes], selected),
+        TensorSpec::contiguous(dtype, &[rows, routes]),
+        TensorSpec::contiguous(dtype, &[rows, columns]),
+    ];
+    let output = TensorSpec::contiguous(dtype, &[rows, columns]);
+    assert_backends_agree(
+        cpu,
+        metal,
+        Op::GatherQuantMatmulCombine {
+            bits: 4,
+            group_size: 64,
+        },
         &inputs,
         &output,
     )

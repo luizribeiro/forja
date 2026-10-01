@@ -776,6 +776,98 @@ impl CpuBackend {
         invalid_route.map_or(Ok(()), |index| Err(BackendError::IndexOutOfRange { index }))
     }
 
+    fn execute_gather_quant_matmul_combine(
+        &self,
+        inputs: &[Tensor],
+        output: &Tensor,
+        bits: u8,
+        group_size: u32,
+    ) -> Result<(), BackendError> {
+        let activations = decode(&self.read(&inputs[0])?, inputs[0].layout().dtype())
+            .ok_or(BackendError::ExecutionFailed)?;
+        let packed = decode_u32(&self.read(&inputs[1])?).ok_or(BackendError::ExecutionFailed)?;
+        let scales = decode(&self.read(&inputs[2])?, inputs[2].layout().dtype())
+            .ok_or(BackendError::ExecutionFailed)?;
+        let biases = decode(&self.read(&inputs[3])?, inputs[3].layout().dtype())
+            .ok_or(BackendError::ExecutionFailed)?;
+        let indices = decode_u32(&self.read(&inputs[4])?).ok_or(BackendError::ExecutionFailed)?;
+        let weights = decode(&self.read(&inputs[5])?, inputs[5].layout().dtype())
+            .ok_or(BackendError::ExecutionFailed)?;
+        let mut values = decode(&self.read(&inputs[6])?, inputs[6].layout().dtype())
+            .ok_or(BackendError::ExecutionFailed)?;
+        let [rows, routes, inner]: [u32; 3] = inputs[0]
+            .layout()
+            .shape()
+            .try_into()
+            .map_err(|_| BackendError::ExecutionFailed)?;
+        let [experts, columns, packed_width]: [u32; 3] = inputs[1]
+            .layout()
+            .shape()
+            .try_into()
+            .map_err(|_| BackendError::ExecutionFailed)?;
+        let rows = execution_usize(rows)?;
+        let routes = execution_usize(routes)?;
+        let inner = execution_usize(inner)?;
+        let experts = execution_usize(experts)?;
+        let columns = execution_usize(columns)?;
+        let packed_width = execution_usize(packed_width)?;
+        let group_size = execution_usize(group_size)?;
+        let group_count = inner / group_size;
+        let expert_packed = checked_product(columns, packed_width)?;
+        let expert_groups = checked_product(columns, group_count)?;
+        let mut invalid_route = None;
+        for row in 0..rows {
+            let output_base = checked_product(row, columns)?;
+            for route in 0..routes {
+                let route_offset = checked_product(row, routes)?
+                    .checked_add(route)
+                    .ok_or(BackendError::ExecutionFailed)?;
+                let expert = *indices
+                    .get(route_offset)
+                    .ok_or(BackendError::ExecutionFailed)?;
+                let Ok(expert_index) = execution_usize(expert) else {
+                    return Err(BackendError::ExecutionFailed);
+                };
+                if expert_index >= experts {
+                    record_invalid_route(&mut invalid_route, expert);
+                    continue;
+                }
+                let activation_base = checked_product(route_offset, inner)?;
+                let activation = activations
+                    .get(
+                        activation_base
+                            ..activation_base
+                                .checked_add(inner)
+                                .ok_or(BackendError::ExecutionFailed)?,
+                    )
+                    .ok_or(BackendError::ExecutionFailed)?;
+                let route_weight = *weights
+                    .get(route_offset)
+                    .ok_or(BackendError::ExecutionFailed)?;
+                let packed_base = checked_product(expert_index, expert_packed)?;
+                let group_base = checked_product(expert_index, expert_groups)?;
+                for column in 0..columns {
+                    let value = affine_quant_dot(
+                        activation,
+                        &packed,
+                        &scales,
+                        &biases,
+                        packed_base + column * packed_width,
+                        group_base + column * group_count,
+                        group_size,
+                        bits,
+                    )?;
+                    let destination = values
+                        .get_mut(output_base + column)
+                        .ok_or(BackendError::ExecutionFailed)?;
+                    *destination += route_weight * value;
+                }
+            }
+        }
+        self.write_output(output, &values)?;
+        invalid_route.map_or(Ok(()), |index| Err(BackendError::IndexOutOfRange { index }))
+    }
+
     fn execute_gather_quant_silu_mul(
         &self,
         inputs: &[Tensor],
@@ -1071,6 +1163,13 @@ impl Backend for CpuBackend {
                     bits,
                     group_size,
                 ),
+                Op::GatherQuantMatmulCombine { bits, group_size } => self
+                    .execute_gather_quant_matmul_combine(
+                        dispatch.inputs(),
+                        dispatch.output(),
+                        bits,
+                        group_size,
+                    ),
                 Op::GatherQuantSiluMul { bits, group_size } => self.execute_gather_quant_silu_mul(
                     dispatch.inputs(),
                     dispatch.output(),
@@ -2225,6 +2324,57 @@ mod tests {
         assert_eq!(
             backend.read(&output).unwrap(),
             vec![0; 4 * std::mem::size_of::<f32>()]
+        );
+    }
+
+    #[test]
+    fn combined_quantized_matmul_keeps_valid_routes_and_reports_lowest_bad_index() {
+        let backend = CpuBackend::new();
+        let activations = (1_u16..=5)
+            .flat_map(|value| std::iter::repeat_n(f32::from(value), 64))
+            .collect::<Vec<_>>();
+        let input = f32_tensor(&backend, &[1, 5, 64], &activations);
+        let packed_values = (1_u32..=6)
+            .flat_map(|value| std::iter::repeat_n(value * 0x1111_1111, 8))
+            .collect::<Vec<_>>();
+        let packed = backend.alloc(DType::U32, &[3, 2, 8]).unwrap();
+        backend.write(&packed, &u32_bytes(&packed_values)).unwrap();
+        let scales = backend.alloc(DType::BF16, &[3, 2, 1]).unwrap();
+        backend
+            .write(&scales, &encode(&[0.5; 6], DType::BF16).unwrap())
+            .unwrap();
+        let biases = backend.alloc(DType::BF16, &[3, 2, 1]).unwrap();
+        backend
+            .write(&biases, &encode(&[0.25; 6], DType::BF16).unwrap())
+            .unwrap();
+        let indices = backend.alloc(DType::U32, &[1, 5]).unwrap();
+        backend
+            .write(&indices, &u32_bytes(&[2, 99, 0, 7, 1]))
+            .unwrap();
+        let weights = f32_tensor(&backend, &[1, 5], &[0.5, 1.0, -0.25, 2.0, 0.75]);
+        let residual = f32_tensor(&backend, &[1, 2], &[1.5, -2.0]);
+        let output = backend.alloc(DType::F32, &[1, 2]).unwrap();
+        let mut commands = CommandList::new();
+        commands
+            .dispatch(
+                Op::GatherQuantMatmulCombine {
+                    bits: 4,
+                    group_size: 64,
+                },
+                &[
+                    &input, &packed, &scales, &biases, &indices, &weights, &residual,
+                ],
+                &output,
+            )
+            .unwrap();
+
+        assert_eq!(
+            backend.submit(commands).unwrap().wait(),
+            Err(BackendError::IndexOutOfRange { index: 7 })
+        );
+        assert_eq!(
+            decode(&backend.read(&output).unwrap(), DType::F32).unwrap(),
+            [473.5, 582.0]
         );
     }
 

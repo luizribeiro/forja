@@ -587,6 +587,66 @@ impl<T: Element> Tensor<T> {
         Ok(result)
     }
 
+    /// Projects routed rows through affine-quantized experts, combines them with route weights,
+    /// and adds a residual.
+    ///
+    /// Activations are `[rows, routes, input]`; indices and weights are `[rows, routes]`; the
+    /// residual and result are `[rows, output]`.
+    /// Unlike gathered projection, invalid routes are skipped while the row retains its residual
+    /// and valid contributions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for incompatible shapes or dtypes, unsupported quantization parameters,
+    /// an out-of-range expert index, or a refused dispatch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gather_quant_matmul_combine<S: FloatElement>(
+        &self,
+        packed: &Tensor<u32>,
+        scales: &Tensor<S>,
+        biases: &Tensor<S>,
+        indices: &Tensor<u32>,
+        weights: &Self,
+        residual: &Self,
+        bits: u8,
+        group_size: u32,
+    ) -> Result<Self>
+    where
+        T: FloatElement,
+    {
+        let [rows, routes, _]: [u32; 3] = self
+            .shape()
+            .try_into()
+            .map_err(|_| Error::new("routed activations must have rank three"))?;
+        let [_, output, _]: [u32; 3] = packed
+            .shape()
+            .try_into()
+            .map_err(|_| Error::new("expert weights must have rank three"))?;
+        if indices.shape() != [rows, routes] || weights.shape() != [rows, routes] {
+            return Err(Error::new(
+                "route indices and weights must match activations",
+            ));
+        }
+        if residual.shape() != [rows, output] {
+            return Err(Error::new("residual shape does not match expert output"));
+        }
+        let result = Self::empty(vec![rows, output])?;
+        graph::record(
+            sys::Op::GatherQuantMatmulCombine { bits, group_size },
+            &[
+                &self.handle,
+                &packed.handle,
+                &scales.handle,
+                &biases.handle,
+                &indices.handle,
+                &weights.handle,
+                &residual.handle,
+            ],
+            &result.handle,
+        )?;
+        Ok(result)
+    }
+
     /// Computes `SiLU(gate) * up` from two affine-quantized expert projections selected by GPU
     /// indices.
     ///

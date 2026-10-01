@@ -434,6 +434,117 @@ kernel void gather_quantized_gemv(
     }
 }
 
+struct GatherQuantMatmulCombineParams {
+    ulong input_offset;
+    ulong packed_offset;
+    ulong scale_offset;
+    ulong bias_offset;
+    ulong indices_offset;
+    ulong weights_offset;
+    ulong residual_offset;
+    ulong output_offset;
+    ulong input_row_stride;
+    ulong input_route_stride;
+    ulong input_inner_stride;
+    ulong packed_expert_stride;
+    ulong packed_row_stride;
+    ulong packed_word_stride;
+    ulong scale_expert_stride;
+    ulong scale_row_stride;
+    ulong scale_group_stride;
+    ulong bias_expert_stride;
+    ulong bias_row_stride;
+    ulong bias_group_stride;
+    ulong indices_row_stride;
+    ulong indices_route_stride;
+    ulong weights_row_stride;
+    ulong weights_route_stride;
+    ulong residual_row_stride;
+    ulong residual_column_stride;
+    ulong output_row_stride;
+    ulong output_column_stride;
+    uint rows;
+    uint routes;
+    uint inner;
+    uint experts;
+    uint columns;
+    uint packed_width;
+    uint bits;
+    uint group_size;
+};
+
+kernel void gather_quantized_gemv_combine(
+    device const uchar *input [[buffer(0)]],
+    device const uchar *packed [[buffer(1)]],
+    device const uchar *scales [[buffer(2)]],
+    device const uchar *biases [[buffer(3)]],
+    device const uint *indices [[buffer(4)]],
+    device const uchar *weights [[buffer(5)]],
+    device const uchar *residual [[buffer(6)]],
+    device uchar *output [[buffer(7)]],
+    constant GatherQuantMatmulCombineParams &params [[buffer(8)]],
+    device atomic_uint *error_flag [[buffer(9)]],
+    ushort simdgroup [[simdgroup_index_in_threadgroup]],
+    ushort lane [[thread_index_in_simdgroup]],
+    uint2 tile [[threadgroup_position_in_grid]]) {
+    threadgroup float partials[32];
+    uint route = uint(simdgroup);
+    uint expert = indices[
+        params.indices_offset + ulong(tile.y) * params.indices_row_stride +
+        ulong(route) * params.indices_route_stride];
+    bool valid = expert < params.experts;
+    if (!valid && lane == 0) {
+        atomic_store_explicit(error_flag, 1, memory_order_relaxed);
+        atomic_fetch_min_explicit(error_flag + 1, expert, memory_order_relaxed);
+    }
+    uint first_column = tile.x * 4;
+    float sums[4] = {0.0f};
+    if (valid) {
+        quantized_qmv_sums(
+            input, packed, scales, biases,
+            params.input_offset + ulong(tile.y) * params.input_row_stride +
+                ulong(route) * params.input_route_stride,
+            params.packed_offset + ulong(expert) * params.packed_expert_stride,
+            params.scale_offset + ulong(expert) * params.scale_expert_stride,
+            params.bias_offset + ulong(expert) * params.bias_expert_stride,
+            params.input_inner_stride, params.packed_row_stride,
+            params.packed_word_stride, params.scale_row_stride,
+            params.scale_group_stride, params.bias_row_stride,
+            params.bias_group_stride, params.inner, params.columns,
+            first_column, lane, gather_words_per_thread, sums);
+    }
+    if (lane == 0) {
+        float weight = load_float(
+            weights,
+            params.weights_offset + ulong(tile.y) * params.weights_row_stride +
+                ulong(route) * params.weights_route_stride,
+            input0_dtype);
+        for (uint item = 0; item < 4; ++item) {
+            partials[route * 4 + item] = weight * sums[item];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simdgroup == 0 && lane < 4) {
+        uint column = first_column + uint(lane);
+        if (column < params.columns) {
+            float value = load_float(
+                residual,
+                params.residual_offset + ulong(tile.y) * params.residual_row_stride +
+                    ulong(column) * params.residual_column_stride,
+                input0_dtype);
+            for (uint slot = 0; slot < params.routes; ++slot) {
+                value += partials[slot * 4 + uint(lane)];
+            }
+            store_float(
+                output,
+                params.output_offset + ulong(tile.y) * params.output_row_stride +
+                    ulong(column) * params.output_column_stride,
+                output_dtype,
+                value);
+        }
+    }
+}
+
 kernel void gather_quantized_silu_mul(
     device const uchar *input [[buffer(0)]],
     device const uchar *gate_packed [[buffer(1)]],

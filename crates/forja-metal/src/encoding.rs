@@ -262,6 +262,69 @@ fn gather_quant_params(
     Ok((params, [rows, routes, columns]))
 }
 
+fn gather_quant_combine_params(
+    tensors: [&EncoderTensor; 8],
+    config: (u8, u32),
+) -> Result<(Vec<u8>, [u32; 3]), BackendError> {
+    let [
+        input,
+        packed,
+        scales,
+        biases,
+        indices,
+        weights,
+        residual,
+        output,
+    ] = tensors;
+    let (bits, group_size) = config;
+    let [rows, routes, inner]: [u32; 3] = input
+        .layout
+        .shape()
+        .try_into()
+        .map_err(|_| BackendError::InvalidInput)?;
+    let [experts, columns, packed_width]: [u32; 3] = packed
+        .layout
+        .shape()
+        .try_into()
+        .map_err(|_| BackendError::InvalidInput)?;
+    let mut params = Vec::with_capacity(256);
+    for value in [
+        input.layout.offset(),
+        packed.layout.offset(),
+        scales.layout.offset(),
+        biases.layout.offset(),
+        indices.layout.offset(),
+        weights.layout.offset(),
+        residual.layout.offset(),
+        output.layout.offset(),
+    ]
+    .into_iter()
+    .chain(input.layout.strides().iter().copied())
+    .chain(packed.layout.strides().iter().copied())
+    .chain(scales.layout.strides().iter().copied())
+    .chain(biases.layout.strides().iter().copied())
+    .chain(indices.layout.strides().iter().copied())
+    .chain(weights.layout.strides().iter().copied())
+    .chain(residual.layout.strides().iter().copied())
+    .chain(output.layout.strides().iter().copied())
+    {
+        params.extend_from_slice(&value.to_ne_bytes());
+    }
+    for value in [
+        rows,
+        routes,
+        inner,
+        experts,
+        columns,
+        packed_width,
+        u32::from(bits),
+        group_size,
+    ] {
+        params.extend_from_slice(&value.to_ne_bytes());
+    }
+    Ok((params, [rows, routes, columns]))
+}
+
 fn grouped_routes(rows: u32, routes: u32) -> bool {
     u64::from(rows) * u64::from(routes) >= 64
 }
@@ -2190,7 +2253,7 @@ impl MetalBackend {
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     fn encode_dispatch(
         &self,
         encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
@@ -2267,6 +2330,13 @@ impl MetalBackend {
             )?,
             Op::GatherQuantMatmul { bits, group_size } => {
                 let (buffers, flag) = self.encode_gather_quant_matmul(
+                    encoder, table, dispatch, bits, group_size, bindings, arguments,
+                )?;
+                error_flags.push(flag);
+                buffers
+            }
+            Op::GatherQuantMatmulCombine { bits, group_size } => {
+                let (buffers, flag) = self.encode_gather_quant_matmul_combine(
                     encoder, table, dispatch, bits, group_size, bindings, arguments,
                 )?;
                 error_flags.push(flag);
@@ -2691,6 +2761,77 @@ impl MetalBackend {
             },
             MTLSize {
                 width: 64,
+                height: 1,
+                depth: 1,
+            },
+        );
+        Ok((vec![params, error_flag.clone()], error_flag))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn encode_gather_quant_matmul_combine(
+        &self,
+        encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
+        table: &ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>,
+        dispatch: &Dispatch,
+        bits: u8,
+        group_size: u32,
+        bindings: &mut ArgumentBindings,
+        arguments: &mut ArgumentWriter,
+    ) -> Result<EncodedEmbed, BackendError> {
+        let [input, packed, scales, biases, indices, weights, residual] = dispatch.inputs() else {
+            return Err(BackendError::InvalidInput);
+        };
+        let input = self.encoder_tensor(input)?;
+        let packed = self.encoder_tensor(packed)?;
+        let scales = self.encoder_tensor(scales)?;
+        let biases = self.encoder_tensor(biases)?;
+        let indices = self.encoder_tensor(indices)?;
+        let weights = self.encoder_tensor(weights)?;
+        let residual = self.encoder_tensor(residual)?;
+        let output = self.encoder_tensor(dispatch.output())?;
+        let tensors = [
+            &input, &packed, &scales, &biases, &indices, &weights, &residual, &output,
+        ];
+        let (params, [rows, routes, columns]) =
+            gather_quant_combine_params(tensors, (bits, group_size))?;
+        let inner = input.layout.shape()[2];
+        let words_per_thread = u32::from(columns % 4 == 0 && inner % 512 == 0) + 1;
+        let params = arguments.write(&params)?;
+        let error_flag = grouped_error_flag(arguments)?;
+        let pipeline = self
+            .pipelines
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?
+            .get(
+                "gather_quantized_gemv_combine",
+                &[
+                    (0, dtype_code(input.layout.dtype())),
+                    (1, dtype_code(scales.layout.dtype())),
+                    (2, dtype_code(output.layout.dtype())),
+                    (12, u32::from(bits)),
+                    (13, group_size),
+                    (14, words_per_thread),
+                ],
+            )?;
+        set_pipeline(encoder, &pipeline);
+        for (index, tensor) in tensors.into_iter().enumerate() {
+            bindings.bind(table, index, &tensor.buffer);
+        }
+        bindings.bind(table, 8, &params);
+        bindings.bind(table, 9, &error_flag);
+        set_argument_table(encoder, table);
+        dispatch_threadgroups(
+            encoder,
+            MTLSize {
+                width: usize::try_from(columns.div_ceil(4))
+                    .map_err(|_| BackendError::InvalidInput)?,
+                height: usize::try_from(rows).map_err(|_| BackendError::InvalidInput)?,
+                depth: 1,
+            },
+            MTLSize {
+                width: usize::try_from(routes.checked_mul(32).ok_or(BackendError::InvalidInput)?)
+                    .map_err(|_| BackendError::InvalidInput)?,
                 height: 1,
                 depth: 1,
             },
@@ -5214,6 +5355,10 @@ impl MetalBackend {
                 arguments.write(212)?;
                 arguments.write(8)?;
             }
+            Op::GatherQuantMatmulCombine { .. } => {
+                arguments.write(256)?;
+                arguments.write(8)?;
+            }
             Op::GatherQuantSiluMul { .. } => {
                 arguments.write(212)?;
                 arguments.write(212)?;
@@ -5614,6 +5759,7 @@ fn supported_dispatch(dispatch: &Dispatch) -> bool {
         | Op::GatherMatmul
         | Op::QuantMatmul { .. }
         | Op::GatherQuantMatmul { .. }
+        | Op::GatherQuantMatmulCombine { .. }
         | Op::GatherQuantSiluMul { .. }
         | Op::Sdpa { .. }
         | Op::Sample { .. } => true,
@@ -5697,6 +5843,7 @@ fn dispatch_kernel(dispatch: &Dispatch) -> Result<&'static str, BackendError> {
                 "gather_quantized_gemv"
             }
         }
+        Op::GatherQuantMatmulCombine { .. } => "gather_quantized_gemv_combine",
         Op::GatherQuantSiluMul { .. } => {
             if grouped_gather_dispatch(dispatch) {
                 "grouped_quantized_silu_mul"
@@ -5806,6 +5953,7 @@ fn reusable_dispatch(dispatch: &Dispatch) -> bool {
         | Op::QuantEmbed { .. }
         | Op::GatherMatmul
         | Op::GatherQuantMatmul { .. }
+        | Op::GatherQuantMatmulCombine { .. }
         | Op::GatherQuantSiluMul { .. }
         | Op::Sdpa { .. } => false,
         Op::Matmul => {

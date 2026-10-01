@@ -24,8 +24,8 @@ use forja_core::{
     Affine, Backend, BackendError, BufferId, CommandList, DType, GraphLimits, GraphTemplate,
     Layout, LayoutError, Op, OpError, ParamSpace, PreparedGraph, Slice, Submission,
     SubmissionProfile, SymbolicLayout, SymbolicLayoutError, TemplateOp, TemplateTensor, Tensor,
-    ViewOp, gather_matmul_flops, gather_quant_matmul_flops, gather_quant_silu_mul_flops,
-    matmul_flops,
+    ViewOp, gather_matmul_flops, gather_quant_matmul_combine_flops, gather_quant_matmul_flops,
+    gather_quant_silu_mul_flops, matmul_flops,
     program::{
         BinOp, Inst, KernelSignature, MAX_INSTRUCTIONS, MAX_OUTPUTS, PrepareError, PreparedProgram,
         Program, ProgramError, ProgramKind, RedOp, UnOp, ValidatedProgram, ValueType,
@@ -2347,6 +2347,17 @@ impl<B: Backend> Host<B> {
                         indices.layout().shape(),
                     )
                 }),
+            Op::GatherQuantMatmulCombine { .. } => inputs
+                .first()
+                .zip(inputs.get(1))
+                .zip(inputs.get(4))
+                .and_then(|((input, packed), indices)| {
+                    gather_quant_matmul_combine_flops(
+                        input.layout().shape(),
+                        packed.layout().shape(),
+                        indices.layout().shape(),
+                    )
+                }),
             Op::GatherQuantSiluMul { .. } => inputs
                 .first()
                 .zip(inputs.get(1))
@@ -3438,6 +3449,12 @@ fn core_op(operation: compute::Op) -> (TemplateOp, Option<Op>) {
             bits: config.bits,
             group_size: config.group_size,
         }),
+        compute::Op::GatherQuantMatmulCombine(config) => {
+            concrete_template(Op::GatherQuantMatmulCombine {
+                bits: config.bits,
+                group_size: config.group_size,
+            })
+        }
         compute::Op::GatherQuantSiluMul(config) => concrete_template(Op::GatherQuantSiluMul {
             bits: config.bits,
             group_size: config.group_size,
