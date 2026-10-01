@@ -2641,6 +2641,13 @@ impl MetalBackend {
                 arguments,
             );
         }
+        let inner = input
+            .layout
+            .shape()
+            .last()
+            .copied()
+            .ok_or(BackendError::InvalidInput)?;
+        let words_per_thread = u32::from(columns % 8 == 0 && inner % 512 == 0) + 1;
         let params = arguments.write(&params)?;
         let mut error_state = [0_u8; 8];
         error_state[4..].copy_from_slice(&u32::MAX.to_ne_bytes());
@@ -2657,6 +2664,7 @@ impl MetalBackend {
                     (2, dtype_code(output.layout.dtype())),
                     (12, u32::from(bits)),
                     (13, group_size),
+                    (14, words_per_thread),
                 ],
             )?;
         set_pipeline(encoder, &pipeline);
@@ -2672,7 +2680,7 @@ impl MetalBackend {
         dispatch_threadgroups(
             encoder,
             MTLSize {
-                width: usize::try_from(columns.div_ceil(16))
+                width: usize::try_from(columns.div_ceil(8))
                     .map_err(|_| BackendError::InvalidInput)?,
                 height: usize::try_from(
                     rows.checked_mul(routes).ok_or(BackendError::InvalidInput)?,
@@ -2762,6 +2770,13 @@ impl MetalBackend {
                 arguments,
             );
         }
+        let inner = input
+            .layout
+            .shape()
+            .last()
+            .copied()
+            .ok_or(BackendError::InvalidInput)?;
+        let words_per_thread = u32::from(columns % 8 == 0 && inner % 512 == 0) + 1;
         let gate_params = arguments.write(&gate_params)?;
         let up_params = arguments.write(&up_params)?;
         let mut error_state = [0_u8; 8];
@@ -2779,6 +2794,7 @@ impl MetalBackend {
                     (2, dtype_code(output.layout.dtype())),
                     (12, u32::from(bits)),
                     (13, group_size),
+                    (14, words_per_thread),
                 ],
             )?;
         set_pipeline(encoder, &pipeline);
@@ -2805,7 +2821,7 @@ impl MetalBackend {
         dispatch_threadgroups(
             encoder,
             MTLSize {
-                width: usize::try_from(columns.div_ceil(16))
+                width: usize::try_from(columns.div_ceil(8))
                     .map_err(|_| BackendError::InvalidInput)?,
                 height: usize::try_from(
                     rows.checked_mul(routes).ok_or(BackendError::InvalidInput)?,
