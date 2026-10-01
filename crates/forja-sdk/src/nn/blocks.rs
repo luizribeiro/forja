@@ -14,6 +14,8 @@ pub const DEFAULT_PREFILL_CHUNK: u32 = 512;
 
 const MIN_PREFILL_BUCKET: u32 = 16;
 const PREFILL_REPLAYS_PER_GRAPH: u32 = 2;
+const QK_HEAD_DIM: f32 = 128.0;
+const QK_RMS_EPSILON: f32 = 1.0e-6;
 
 /// Builds the row program that combines a residual addition with RMS normalization.
 ///
@@ -45,6 +47,53 @@ pub fn residual_norm<T: FloatElement>(
     Ok((value, normalized))
 }
 
+/// Builds the Qwen head-width-128 row program that combines RMS normalization with rotary
+/// embedding.
+///
+/// # Errors
+///
+/// Returns an error when the kernel definition is refused.
+pub fn qk_norm_rope_kernel(dtype: DType, theta: f32) -> Result<Kernel> {
+    qk_norm_rope_rows_program(3, &[dtype; 5], &[dtype; 2], theta)
+}
+
+/// Applies per-head RMS normalization and rotary embedding to a Q/K projection.
+///
+/// # Errors
+///
+/// Returns an error for an invalid projection shape or a refused view or kernel dispatch.
+pub fn qk_norm_rope<T: FloatElement>(
+    kernel: &Kernel,
+    input: &Tensor<T>,
+    weight: &Tensor<T>,
+    positions: &Tensor<T>,
+) -> Result<Tensor<T>> {
+    let [sequence, heads, head_dim]: [u32; 3] = input
+        .shape()
+        .try_into()
+        .map_err(|_| Error::loading("QK projection must have rank three"))?;
+    let half = head_dim / 2;
+    let shape = [sequence, heads, half];
+    let lo = input.narrow(2, 0, half)?;
+    let hi = input.narrow(2, half, half)?;
+    let weight_lo = weight.narrow(0, 0, half)?.broadcast_as(&shape)?;
+    let weight_hi = weight.narrow(0, half, half)?.broadcast_as(&shape)?;
+    let positions = positions.reshape(&[sequence, 1, 1])?.broadcast_as(&shape)?;
+    let output = Tensor::<T>::zeros(input.shape())?;
+    let output_lo = output.narrow(2, 0, half)?;
+    let output_hi = output.narrow(2, half, half)?;
+    let inputs = [
+        TensorRef::new(&lo)?,
+        TensorRef::new(&hi)?,
+        TensorRef::new(&weight_lo)?,
+        TensorRef::new(&weight_hi)?,
+        TensorRef::new(&positions)?,
+    ];
+    let outputs = [TensorRef::new(&output_lo)?, TensorRef::new(&output_hi)?];
+    crate::kernel::run_into(kernel, &inputs, &outputs)?;
+    Ok(output)
+}
+
 #[crate::kernel::kernel(row)]
 fn residual_norm_rows(
     residual: crate::kernel::Row,
@@ -55,6 +104,29 @@ fn residual_norm_rows(
     let value = residual + update;
     let inverse_rms = (value * value).row_mean() + epsilon;
     (value, value * inverse_rms.rsqrt() * weight)
+}
+
+#[crate::kernel::kernel(row)]
+fn qk_norm_rope_rows(
+    lo: crate::kernel::Row,
+    hi: crate::kernel::Row,
+    weight_lo: crate::kernel::Row,
+    weight_hi: crate::kernel::Row,
+    positions: crate::kernel::Row,
+    theta: f32,
+) -> (crate::kernel::Row, crate::kernel::Row) {
+    let square_sum = (lo * lo + hi * hi).row_sum();
+    let inverse_rms = (square_sum / QK_HEAD_DIM + QK_RMS_EPSILON).rsqrt();
+    let normalized_lo = lo * inverse_rms * weight_lo;
+    let normalized_hi = hi * inverse_rms * weight_hi;
+    let exponent = crate::kernel::index(-1) as f32 * (-2.0 / QK_HEAD_DIM);
+    let angle = positions * theta.powf(exponent);
+    let cosine = angle.cos();
+    let sine = angle.sin();
+    (
+        normalized_lo * cosine - normalized_hi * sine,
+        normalized_hi * cosine + normalized_lo * sine,
+    )
 }
 
 struct CapturedPrefill<T: Element> {

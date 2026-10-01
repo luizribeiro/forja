@@ -31,7 +31,10 @@ use forja_sdk::{
     kernel::{Kernel, TensorRef},
     nn::{
         Embedding, EmbeddingConfig, Linear, LinearConfig, RmsNorm, RmsNormConfig, WeightElement,
-        blocks::{KvCache, Taps, cached_attention, residual_norm, residual_norm_kernel},
+        blocks::{
+            KvCache, Taps, cached_attention, qk_norm_rope, qk_norm_rope_kernel, residual_norm,
+            residual_norm_kernel,
+        },
     },
 };
 
@@ -212,7 +215,7 @@ impl FusedKernels {
         Ok(Self {
             silu_mul: load_kernel(FUSE_SILU_MUL, || silu_mul_program(2, &[dtype; 2], &[dtype]))?,
             qk_norm_rope: load_kernel(FUSE_QK_NORM_ROPE, || {
-                qk_norm_rope_program(3, &[dtype; 5], &[dtype; 2])
+                qk_norm_rope_kernel(dtype, ROPE_THETA)
             })?,
             residual_norm: load_kernel(FUSE_RESIDUAL_NORM, || {
                 residual_norm_kernel(dtype, RMS_EPSILON)
@@ -298,16 +301,16 @@ impl<T: Activation> DecoderLayer<T> {
                 forja_sdk::Error::loading("fused rotary positions are unavailable")
             })?;
             (
-                apply_qk_norm_rope(
+                qk_norm_rope(
                     kernels.qk_norm_rope()?,
                     &query_projection,
-                    &self.self_attn.q_norm,
+                    self.self_attn.q_norm.weight(),
                     program_positions,
                 )?,
-                apply_qk_norm_rope(
+                qk_norm_rope(
                     kernels.qk_norm_rope()?,
                     &key_projection,
-                    &self.self_attn.k_norm,
+                    self.self_attn.k_norm.weight(),
                     program_positions,
                 )?,
             )
@@ -365,38 +368,6 @@ fn silu_mul(gate: forja_sdk::kernel::Elem, up: forja_sdk::kernel::Elem) -> forja
     gate * gate.sigmoid() * up
 }
 
-fn apply_qk_norm_rope<T: Activation>(
-    kernel: &Kernel,
-    input: &Tensor<T>,
-    norm: &RmsNorm<T>,
-    positions: &Tensor<T>,
-) -> Result<Tensor<T>> {
-    let [sequence, heads, head_dim]: [u32; 3] = input
-        .shape()
-        .try_into()
-        .map_err(|_| forja_sdk::Error::loading("QK projection must have rank three"))?;
-    let half = head_dim / 2;
-    let shape = [sequence, heads, half];
-    let lo = input.narrow(2, 0, half)?;
-    let hi = input.narrow(2, half, half)?;
-    let weight_lo = norm.weight().narrow(0, 0, half)?.broadcast_as(&shape)?;
-    let weight_hi = norm.weight().narrow(0, half, half)?.broadcast_as(&shape)?;
-    let positions = positions.reshape(&[sequence, 1, 1])?.broadcast_as(&shape)?;
-    let output = Tensor::<T>::zeros(input.shape())?;
-    let output_lo = output.narrow(2, 0, half)?;
-    let output_hi = output.narrow(2, half, half)?;
-    let inputs = [
-        TensorRef::new(&lo)?,
-        TensorRef::new(&hi)?,
-        TensorRef::new(&weight_lo)?,
-        TensorRef::new(&weight_hi)?,
-        TensorRef::new(&positions)?,
-    ];
-    let outputs = [TensorRef::new(&output_lo)?, TensorRef::new(&output_hi)?];
-    forja_sdk::kernel::run_into(kernel, &inputs, &outputs)?;
-    Ok(output)
-}
-
 fn run_silu_mul<T: Activation>(
     kernel: &Kernel,
     gate: &Tensor<T>,
@@ -416,28 +387,6 @@ fn run_final_norm<T: Activation>(
     let inputs = [TensorRef::new(input)?, TensorRef::new(&weight)?];
     let [output] = forja_sdk::kernel::run::<T, 1>(kernel, &inputs)?;
     Ok(output)
-}
-
-#[forja_sdk::kernel(row)]
-fn qk_norm_rope(
-    lo: forja_sdk::kernel::Row,
-    hi: forja_sdk::kernel::Row,
-    weight_lo: forja_sdk::kernel::Row,
-    weight_hi: forja_sdk::kernel::Row,
-    positions: forja_sdk::kernel::Row,
-) -> (forja_sdk::kernel::Row, forja_sdk::kernel::Row) {
-    let square_sum = (lo * lo + hi * hi).row_sum();
-    let inverse_rms = (square_sum / 128.0 + RMS_EPSILON).rsqrt();
-    let normalized_lo = lo * inverse_rms * weight_lo;
-    let normalized_hi = hi * inverse_rms * weight_hi;
-    let exponent = forja_sdk::kernel::index(-1) as f32 * (-2.0 / 128.0);
-    let angle = positions * ROPE_THETA.powf(exponent);
-    let cosine = angle.cos();
-    let sine = angle.sin();
-    (
-        normalized_lo * cosine - normalized_hi * sine,
-        normalized_hi * cosine + normalized_lo * sine,
-    )
 }
 
 #[forja_sdk::kernel(row)]

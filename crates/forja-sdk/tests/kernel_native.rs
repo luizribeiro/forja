@@ -95,28 +95,6 @@ fn macro_final_norm(
     input * ((input * input).row_mean() + QWEN_RMS_EPSILON).rsqrt() * weight
 }
 
-#[forja_sdk::kernel(row)]
-fn macro_qk_norm_rope(
-    lo: forja_sdk::kernel::Row,
-    hi: forja_sdk::kernel::Row,
-    weight_lo: forja_sdk::kernel::Row,
-    weight_hi: forja_sdk::kernel::Row,
-    positions: forja_sdk::kernel::Row,
-) -> (forja_sdk::kernel::Row, forja_sdk::kernel::Row) {
-    let square_sum = (lo * lo + hi * hi).row_sum();
-    let inverse_rms = (square_sum / 128.0 + QWEN_RMS_EPSILON).rsqrt();
-    let normalized_lo = lo * inverse_rms * weight_lo;
-    let normalized_hi = hi * inverse_rms * weight_hi;
-    let exponent = forja_sdk::kernel::index(-1) as f32 * (-2.0 / 128.0);
-    let angle = positions * QWEN_ROPE_THETA.powf(exponent);
-    let cosine = angle.cos();
-    let sine = angle.sin();
-    (
-        normalized_lo * cosine - normalized_hi * sine,
-        normalized_hi * cosine + normalized_lo * sine,
-    )
-}
-
 #[forja_sdk::kernel(helper)]
 fn helper_square(x: f32) -> f32 {
     x * x
@@ -497,11 +475,7 @@ fn qwen_norm_programs_preserve_interpreter_bits() -> Result<(), Box<dyn Error>> 
 
 #[test]
 fn qwen_qk_norm_rope_preserves_interpreter_bits() -> Result<(), Box<dyn Error>> {
-    let macro_kernel = macro_qk_norm_rope_program(
-        3,
-        &[DType::F32, DType::F32, DType::F32, DType::F32, DType::F32],
-        &[DType::F32, DType::F32],
-    )?;
+    let macro_kernel = forja_sdk::nn::blocks::qk_norm_rope_kernel(DType::F32, QWEN_ROPE_THETA)?;
     let hand = qk_norm_rope_builder()?;
     let shape = [1, 8, 64];
     let values = (0..5)
