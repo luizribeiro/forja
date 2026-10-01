@@ -4,8 +4,17 @@ use std::{env, process::Command};
 
 fn main() {
     println!("cargo::rerun-if-env-changed=FORJA_BUILD_REV");
-    println!("cargo::rerun-if-changed=../../.git/HEAD");
+    track_git_path("HEAD");
+    if let Some(reference) = git_output(&["symbolic-ref", "--quiet", "HEAD"]) {
+        track_git_path(&reference);
+    }
     println!("cargo::rustc-env=FORJA_BUILD_REV={}", revision());
+}
+
+fn track_git_path(path: &str) {
+    if let Some(path) = git_output(&["rev-parse", "--git-path", path]) {
+        println!("cargo::rerun-if-changed={path}");
+    }
 }
 
 fn revision() -> String {
@@ -17,10 +26,11 @@ fn revision() -> String {
 }
 
 fn git_revision() -> Option<String> {
-    let output = Command::new("git")
-        .args(["describe", "--always", "--dirty"])
-        .output()
-        .ok()?;
+    git_output(&["describe", "--always", "--dirty"])
+}
+
+fn git_output(arguments: &[&str]) -> Option<String> {
+    let output = Command::new("git").args(arguments).output().ok()?;
     output
         .status
         .success()
