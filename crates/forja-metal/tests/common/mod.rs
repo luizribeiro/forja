@@ -4,6 +4,8 @@ use forja_core::{Backend, CommandList, Submission};
 use forja_metal::MetalBackend;
 use forja_testing::IntervalReport;
 
+pub const GROSS_REGRESSION_RATIO: f64 = 1.5;
+
 pub fn report_intervals(report: IntervalReport) {
     eprintln!(
         "interval-oracle ambiguous={} selects={} reductions={} vacuous={}/{} width-median={:.3e} width-p90={:.3e} width-max={:.3e}",

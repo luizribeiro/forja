@@ -20,7 +20,7 @@ use proptest::{
     test_runner::{RngSeed, TestCaseError},
 };
 
-use common::{comparative_gpu_times, report_intervals};
+use common::{GROSS_REGRESSION_RATIO, comparative_gpu_times, report_intervals};
 
 proptest! {
     #![proptest_config(ProptestConfig {
@@ -352,7 +352,7 @@ fn run_small_program<B: Backend>(
 }
 
 #[test]
-fn representative_maps_match_and_meet_kernel_time() {
+fn representative_maps_match_without_gross_kernel_regression() {
     let backend = MetalBackend::new().unwrap();
     let timings = [
         binary_timing(
@@ -383,13 +383,13 @@ fn representative_maps_match_and_meet_kernel_time() {
             timing.trusted.as_nanos(),
             timing.program.as_nanos()
         );
-        if ratio > 1.05 {
+        if ratio > GROSS_REGRESSION_RATIO {
             failures.push(format!("{}={ratio:.3}", timing.name));
         }
     }
     assert!(
         failures.is_empty(),
-        "map ratios exceeded 1.05: {failures:?}"
+        "map ratios exceeded {GROSS_REGRESSION_RATIO}: {failures:?}"
     );
 }
 

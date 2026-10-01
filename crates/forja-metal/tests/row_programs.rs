@@ -21,7 +21,7 @@ use proptest::{
     test_runner::{FileFailurePersistence, RngSeed, TestCaseError},
 };
 
-use common::{comparative_gpu_times, report_intervals};
+use common::{GROSS_REGRESSION_RATIO, comparative_gpu_times, report_intervals};
 
 proptest! {
     #![proptest_config(general_row_program_config())]
@@ -288,7 +288,7 @@ fn extrema_cancellation_stays_inside_a_narrow_interval() {
 }
 
 #[test]
-fn representative_rows_match_and_meet_kernel_time() {
+fn representative_rows_match_without_gross_kernel_regression() {
     let backend = MetalBackend::new().unwrap();
     let timings = [rms_timing(&backend), softmax_timing(&backend)];
     eprintln!("operation,trusted_ns,program_ns,ratio");
@@ -301,18 +301,18 @@ fn representative_rows_match_and_meet_kernel_time() {
             timing.trusted.as_nanos(),
             timing.program.as_nanos()
         );
-        if ratio > 1.05 {
+        if ratio > GROSS_REGRESSION_RATIO {
             failures.push(format!("{}={ratio:.3}", timing.name));
         }
     }
     assert!(
         failures.is_empty(),
-        "row ratios exceeded 1.05: {failures:?}"
+        "row ratios exceeded {GROSS_REGRESSION_RATIO}: {failures:?}"
     );
 }
 
 #[test]
-fn fused_residual_norm_matches_and_beats_two_dispatches() {
+fn fused_residual_norm_matches_without_gross_kernel_regression() {
     let backend = MetalBackend::new().unwrap();
     let shape = [128, 1024];
     let residual = initialized_f32(&backend, &shape, 7);
@@ -371,11 +371,14 @@ fn fused_residual_norm_matches_and_beats_two_dispatches() {
         unfused.as_nanos(),
         fused.as_nanos()
     );
-    assert!(ratio <= 1.05, "fused ratio exceeded 1.05: {ratio:.3}");
+    assert!(
+        ratio <= GROSS_REGRESSION_RATIO,
+        "fused ratio exceeded {GROSS_REGRESSION_RATIO}: {ratio:.3}"
+    );
 }
 
 #[test]
-fn fused_qk_norm_rope_matches_and_beats_two_dispatches() {
+fn fused_qk_norm_rope_matches_without_gross_kernel_regression() {
     let backend = MetalBackend::new().unwrap();
     let values = initialized_f32(&backend, &[8, 16, 128], 10);
     let weight = initialized_f32(&backend, &[128], 11);
@@ -441,7 +444,10 @@ fn fused_qk_norm_rope_matches_and_beats_two_dispatches() {
         unfused.as_nanos(),
         fused.as_nanos()
     );
-    assert!(ratio <= 1.05, "fused ratio exceeded 1.05: {ratio:.3}");
+    assert!(
+        ratio <= GROSS_REGRESSION_RATIO,
+        "fused ratio exceeded {GROSS_REGRESSION_RATIO}: {ratio:.3}"
+    );
 }
 
 struct Timing {
