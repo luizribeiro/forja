@@ -8,7 +8,10 @@ use forja_sdk::{
     kernel::Kernel,
     nn::{
         RmsNorm, RmsNormConfig,
-        blocks::{KvCache, Taps, cached_attention, residual_norm, residual_norm_kernel},
+        blocks::{
+            KvCache, Taps, cached_attention, qk_norm_rope, qk_norm_rope_kernel, residual_norm,
+            residual_norm_kernel,
+        },
         moe_combine, moe_router,
     },
 };
@@ -229,11 +232,13 @@ struct DecoderLayer {
 struct LayerResources<'a> {
     cache: &'a mut KvCache<f32>,
     following_norm: &'a RmsNorm<f32>,
+    qk_norm_rope: &'a Kernel,
 }
 
 #[derive(Clone, Copy)]
 struct LayerPosition<'a> {
-    positions: &'a Tensor<u32>,
+    activation_positions: &'a Tensor<f32>,
+    sequence: u32,
     start: &'a Dim,
     end: &'a Dim,
 }
@@ -250,31 +255,34 @@ impl DecoderLayer {
         let LayerResources {
             cache,
             following_norm,
+            qk_norm_rope: qk_kernel,
         } = resources;
         let LayerPosition {
-            positions,
+            activation_positions,
+            sequence,
             start,
             end,
         } = position;
-        let sequence = positions.shape()[0];
-        let query = self
-            .self_attn
-            .q_norm
-            .forward(&self.self_attn.q_proj.forward(normalized_input)?.reshape(&[
+        let query = qk_norm_rope(
+            qk_kernel,
+            &self.self_attn.q_proj.forward(normalized_input)?.reshape(&[
                 sequence,
                 QUERY_HEADS,
                 HEAD_DIM,
-            ])?)?
-            .rope(positions, ROPE_THETA)?;
-        let key = self
-            .self_attn
-            .k_norm
-            .forward(&self.self_attn.k_proj.forward(normalized_input)?.reshape(&[
+            ])?,
+            self.self_attn.q_norm.weight(),
+            activation_positions,
+        )?;
+        let key = qk_norm_rope(
+            qk_kernel,
+            &self.self_attn.k_proj.forward(normalized_input)?.reshape(&[
                 sequence,
                 KEY_VALUE_HEADS,
                 HEAD_DIM,
-            ])?)?
-            .rope(positions, ROPE_THETA)?;
+            ])?,
+            self.self_attn.k_norm.weight(),
+            activation_positions,
+        )?;
         let value = self.self_attn.v_proj.forward(normalized_input)?.reshape(&[
             sequence,
             KEY_VALUE_HEADS,
@@ -335,7 +343,8 @@ pub struct Qwen3Coder {
     weights: QwenWeights,
     caches: Vec<KvCache<f32>>,
     residual_norm: Kernel,
-    positions: Tensor<u32>,
+    qk_norm_rope: Kernel,
+    activation_positions: Tensor<f32>,
     #[cfg(target_family = "wasm")]
     decode: DecodeState,
     #[cfg(target_family = "wasm")]
@@ -352,7 +361,17 @@ impl Qwen3Coder {
             weights,
             caches,
             residual_norm: residual_norm_kernel(DType::F32, RMS_EPSILON)?,
-            positions: Tensor::constant(&(0..MAX_CONTEXT).collect::<Vec<_>>(), &[MAX_CONTEXT])?,
+            qk_norm_rope: qk_norm_rope_kernel(DType::F32, ROPE_THETA)?,
+            activation_positions: Tensor::constant(
+                &(0..MAX_CONTEXT)
+                    .map(|position| {
+                        u16::try_from(position)
+                            .map(f32::from)
+                            .map_err(|_| forja_sdk::Error::loading("position exceeds f32 range"))
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+                &[MAX_CONTEXT],
+            )?,
             #[cfg(target_family = "wasm")]
             decode: DecodeState::new(MAX_CONTEXT)?,
             #[cfg(target_family = "wasm")]
@@ -390,7 +409,7 @@ impl Qwen3Coder {
         end: &Dim,
         taps_enabled: bool,
     ) -> Result<SequenceOutput> {
-        let positions = self.positions.narrow(0, start, sequence)?;
+        let activation_positions = self.activation_positions.narrow(0, start, sequence)?;
         let mut hidden = self.weights.embed_tokens.forward(tokens)?;
         let layers = self.weights.layers.len();
         let mut normalized = self.weights.layers[0].input_layernorm.forward(&hidden)?;
@@ -407,13 +426,15 @@ impl Qwen3Coder {
                 &hidden,
                 &normalized,
                 LayerPosition {
-                    positions: &positions,
+                    activation_positions: &activation_positions,
+                    sequence,
                     start,
                     end,
                 },
                 LayerResources {
                     cache: &mut self.caches[index],
                     following_norm,
+                    qk_norm_rope: &self.qk_norm_rope,
                 },
             )?;
             hidden = next;
