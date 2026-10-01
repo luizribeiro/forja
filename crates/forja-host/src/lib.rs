@@ -3745,9 +3745,9 @@ mod tests {
     use wasmtime::component::Resource;
 
     use super::{
-        BackendEvent, BackendTimer, EngineMetrics, EngineStepProfile, Grants, Host, ImportKind,
-        ImportTimer, Limits, MAX_INSTRUCTIONS, MAX_OUTPUTS, bindings::l9o::gpu::compute, core_op,
-        core_program, expected_layer_outputs,
+        BackendEvent, BackendTimer, EngineMetrics, EngineRunner, EngineStep, EngineStepProfile,
+        Grants, Host, ImportKind, ImportTimer, Limits, MAX_INSTRUCTIONS, MAX_OUTPUTS,
+        bindings::l9o::gpu::compute, core_op, core_program, expected_layer_outputs,
     };
 
     const GENEROUS: Limits = Limits::new(u64::MAX, 8, u64::MAX, 32, u64::MAX);
@@ -4098,6 +4098,42 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(host.engine_metrics().submissions, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn chunked_prefill_queues_without_intervening_host_access() {
+        let gate = Arc::new(SubmitGate::default());
+        let backend = AccountingBackend::new(Some(Arc::clone(&gate)), None, Duration::ZERO);
+        let weights = test_weight_file();
+        let mut runner =
+            EngineRunner::new(test_guests::engine_sdk_smoke(), backend, GENEROUS, &weights)
+                .await
+                .unwrap();
+        runner.load().await.unwrap().unwrap();
+        let task = tokio::spawn(async move {
+            let result = runner
+                .step(EngineStep {
+                    tokens: (0..1_024).map(|value| value % 4).collect(),
+                    start_pos: 0,
+                    taps: false,
+                })
+                .await;
+            (runner, result)
+        });
+        let queued = tokio::time::timeout(Duration::from_secs(1), async {
+            while gate.count() < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        gate.release();
+        let (mut runner, output) = task.await.unwrap();
+        let output = output.unwrap().unwrap();
+        runner.wait_for_queued_submissions().await.unwrap();
+        assert!(queued.is_ok(), "second prefill chunk waited on the host");
+        assert_eq!(runner.read(&output.logits).await.unwrap().len(), 16);
+        drop(runner);
+        fs::remove_file(weights).unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -5506,6 +5542,10 @@ mod tests {
     }
 
     impl SubmitGate {
+        fn count(&self) -> usize {
+            self.state.lock().unwrap().0
+        }
+
         fn wait(&self) {
             let mut state = self.state.lock().unwrap();
             state.0 += 1;
@@ -5621,6 +5661,25 @@ mod tests {
             self.inner.alloc(dtype, shape)
         }
 
+        fn import_readonly(
+            &self,
+            bytes: MappedRegion,
+        ) -> Result<forja_core::ReadonlyImport, BackendError> {
+            self.inner.import_readonly(bytes)
+        }
+
+        fn read_buffer_range(
+            &self,
+            buffer: BufferId,
+            range: std::ops::Range<u64>,
+        ) -> Result<Vec<u8>, BackendError> {
+            self.inner.read_buffer_range(buffer, range)
+        }
+
+        fn tensor(&self, buffer: BufferId, layout: Layout) -> Result<Tensor, BackendError> {
+            self.inner.tensor(buffer, layout)
+        }
+
         fn view(&self, tensor: &Tensor, op: CoreViewOp) -> Result<Tensor, BackendError> {
             self.inner.view(tensor, op)
         }
@@ -5654,6 +5713,10 @@ mod tests {
                 sequence,
                 fail_submission: self.fail_submission,
             })
+        }
+
+        fn supports_replay_overlap(&self) -> bool {
+            true
         }
     }
 
