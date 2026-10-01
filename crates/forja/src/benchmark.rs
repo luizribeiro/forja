@@ -1619,6 +1619,7 @@ const fn op_name(operation: Op) -> &'static str {
         Op::TopK { .. } => "top-k",
         Op::Sample { .. } => "sample",
         Op::Rope { .. } => "rope",
+        Op::QkvRopeCache { .. } => "qkv-rope-cache",
         Op::Embed => "embed",
         Op::QuantEmbed { .. } => "quant-embed",
         Op::Matmul => "matmul",

@@ -8,6 +8,7 @@ use forja_core::{
     AllocationRegistry, Backend, BackendError, BufferId, CommandList, DType, Layout, MappedRegion,
     Op, ReadonlyImport, Submission, Tensor, ViewOp,
     program::{BoundProgram, KernelSignature, ValidatedProgram},
+    split_qkv_heads,
 };
 use half::{bf16, f16};
 
@@ -445,6 +446,93 @@ impl CpuBackend {
             }
         }
         self.write_output(output, &values)
+    }
+
+    #[allow(clippy::cast_precision_loss, clippy::too_many_lines)]
+    fn execute_qkv_rope_cache(
+        &self,
+        inputs: &[Tensor],
+        outputs: &[Tensor],
+        eps: f32,
+        theta: f32,
+    ) -> Result<(), BackendError> {
+        let qkv = decode(&self.read(&inputs[0])?, inputs[0].layout().dtype())
+            .ok_or(BackendError::ExecutionFailed)?;
+        let norm = decode(&self.read(&inputs[1])?, inputs[1].layout().dtype())
+            .ok_or(BackendError::ExecutionFailed)?;
+        let positions = decode(&self.read(&inputs[2])?, inputs[2].layout().dtype())
+            .ok_or(BackendError::ExecutionFailed)?;
+        let [sequence, total_heads, width]: [u32; 3] = inputs[0]
+            .layout()
+            .shape()
+            .try_into()
+            .map_err(|_| BackendError::ExecutionFailed)?;
+        let norm_heads = inputs[1].layout().shape()[0];
+        let (query_heads, kv_heads) =
+            split_qkv_heads(total_heads, norm_heads).map_err(|_| BackendError::ExecutionFailed)?;
+        let [
+            sequence,
+            total_heads,
+            width,
+            norm_heads,
+            kv_heads,
+            query_heads,
+        ] = [
+            sequence,
+            total_heads,
+            width,
+            norm_heads,
+            kv_heads,
+            query_heads,
+        ]
+        .map(execution_usize)
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()?
+        .try_into()
+        .map_err(|_| BackendError::ExecutionFailed)?;
+        let mut query = vec![0.0; checked_product(checked_product(query_heads, sequence)?, width)?];
+        let cache_count = checked_product(checked_product(kv_heads, sequence)?, width)?;
+        let mut key = vec![0.0; cache_count];
+        let mut value = vec![0.0; cache_count];
+        let half = width / 2;
+        for (row, &position) in positions.iter().enumerate().take(sequence) {
+            for head in 0..norm_heads {
+                let source = checked_product(row * total_heads + head, width)?;
+                let norm_base = checked_product(head, width)?;
+                let square_sum = qkv[source..source + width]
+                    .iter()
+                    .map(|value| value * value)
+                    .sum::<f32>();
+                let inverse_rms = (square_sum / width as f32 + eps).sqrt().recip();
+                let target = if head < query_heads {
+                    checked_product(head * sequence + row, width)?
+                } else {
+                    checked_product((head - query_heads) * sequence + row, width)?
+                };
+                let output = if head < query_heads {
+                    &mut query
+                } else {
+                    &mut key
+                };
+                for column in 0..half {
+                    let angle = position * theta.powf(-(2.0 * column as f32 / width as f32));
+                    let (sin, cos) = angle.sin_cos();
+                    let lo = qkv[source + column] * inverse_rms * norm[norm_base + column];
+                    let hi =
+                        qkv[source + half + column] * inverse_rms * norm[norm_base + half + column];
+                    output[target + column] = lo * cos - hi * sin;
+                    output[target + half + column] = hi * cos + lo * sin;
+                }
+            }
+            for head in 0..kv_heads {
+                let source = checked_product(row * total_heads + norm_heads + head, width)?;
+                let target = checked_product(head * sequence + row, width)?;
+                value[target..target + width].copy_from_slice(&qkv[source..source + width]);
+            }
+        }
+        self.write_output(&outputs[0], &query)?;
+        self.write_output(&outputs[1], &key)?;
+        self.write_output(&outputs[2], &value)
     }
 
     fn execute_embed(&self, inputs: &[Tensor], output: &Tensor) -> Result<(), BackendError> {
@@ -1158,6 +1246,9 @@ impl Backend for CpuBackend {
                 }
                 Op::Rope { theta } => {
                     self.execute_rope(dispatch.inputs(), dispatch.output(), theta)
+                }
+                Op::QkvRopeCache { eps, theta } => {
+                    self.execute_qkv_rope_cache(dispatch.inputs(), dispatch.outputs(), eps, theta)
                 }
                 Op::Embed => self.execute_embed(dispatch.inputs(), dispatch.output()),
                 Op::QuantEmbed { bits, group_size } => {

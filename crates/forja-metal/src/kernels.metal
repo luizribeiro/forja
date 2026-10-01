@@ -1823,6 +1823,93 @@ kernel void rope(
                 second * cosine + first * sine);
 }
 
+struct QkvRopeCacheParams {
+    float eps;
+    uint sequence;
+    uint query_heads;
+    uint kv_heads;
+    uint width;
+};
+
+kernel void qkv_rope_cache(
+    device const uchar *qkv [[buffer(0)]],
+    device const uchar *norm [[buffer(1)]],
+    device const uchar *positions [[buffer(2)]],
+    device uchar *query [[buffer(3)]],
+    device uchar *key [[buffer(4)]],
+    device uchar *value [[buffer(5)]],
+    constant TensorLayout &qkv_layout [[buffer(6)]],
+    constant TensorLayout &norm_layout [[buffer(7)]],
+    constant TensorLayout &position_layout [[buffer(8)]],
+    constant TensorLayout &query_layout [[buffer(9)]],
+    constant TensorLayout &key_layout [[buffer(10)]],
+    constant TensorLayout &value_layout [[buffer(11)]],
+    constant QkvRopeCacheParams &params [[buffer(12)]],
+    device const float *inverse_frequencies [[buffer(13)]],
+    uint group [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    uint norm_heads = params.query_heads + params.kv_heads;
+    uint total_heads = norm_heads + params.kv_heads;
+    uint output_heads = params.query_heads + 2 * params.kv_heads;
+    uint row = group / output_heads;
+    uint head = group % output_heads;
+    if (row >= params.sequence || head >= total_heads) {
+        return;
+    }
+    uint source_base = (row * total_heads + head) * params.width;
+    if (head >= norm_heads) {
+        uint value_head = head - norm_heads;
+        uint output_base = (value_head * params.sequence + row) * params.width;
+        for (uint column = lane; column < params.width; column += 32) {
+            float item = load_float(
+                qkv, physical_index(qkv_layout, source_base + column), input0_dtype);
+            store_float(
+                value, physical_index(value_layout, output_base + column), output_dtype, item);
+        }
+        return;
+    }
+    float square_sum = 0.0f;
+    for (uint column = lane; column < params.width; column += 32) {
+        float item = load_float(
+            qkv, physical_index(qkv_layout, source_base + column), input0_dtype);
+        square_sum += item * item;
+    }
+    float inverse_rms = rsqrt(simd_sum(square_sum) / float(params.width) + params.eps);
+    uint half_width = params.width / 2;
+    uint output_head = head < params.query_heads ? head : head - params.query_heads;
+    uint output_base = (output_head * params.sequence + row) * params.width;
+    for (uint column = lane; column < half_width; column += 32) {
+        float lo = load_float(
+            qkv, physical_index(qkv_layout, source_base + column), input0_dtype);
+        float hi = load_float(
+            qkv, physical_index(qkv_layout, source_base + half_width + column), input0_dtype);
+        lo *= inverse_rms * load_float(
+            norm, physical_index(norm_layout, head * params.width + column), input1_dtype);
+        hi *= inverse_rms * load_float(
+            norm, physical_index(norm_layout, head * params.width + half_width + column), input1_dtype);
+        float angle = load_float(
+            positions, physical_index(position_layout, row), input2_dtype) *
+            inverse_frequencies[column];
+        float cosine = cos(angle);
+        float sine = sin(angle);
+        if (head < params.query_heads) {
+            store_float(
+                query, physical_index(query_layout, output_base + column), output_dtype,
+                lo * cosine - hi * sine);
+            store_float(
+                query, physical_index(query_layout, output_base + half_width + column), output_dtype,
+                hi * cosine + lo * sine);
+        } else {
+            store_float(
+                key, physical_index(key_layout, output_base + column), output_dtype,
+                lo * cosine - hi * sine);
+            store_float(
+                key, physical_index(key_layout, output_base + half_width + column), output_dtype,
+                hi * cosine + lo * sine);
+        }
+    }
+}
+
 struct EmbedParams {
     uint vocab;
     uint width;

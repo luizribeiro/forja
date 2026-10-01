@@ -16,7 +16,7 @@ use forja_core::{
     BackendError, BufferId, CommandList, DType, Dispatch, DispatchProfile, GraphTemplate, Layout,
     Op, PreparedGraph, ProfileCount, ProfileTensor, Slice, Submission, SubmissionProfile, Tensor,
     program::{KernelSignature, PreparedProgram, ProgramHash, ProgramKind, ValidatedProgram},
-    required_barriers,
+    required_barriers, split_qkv_heads,
 };
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_foundation::{NSRange, NSString};
@@ -2304,6 +2304,8 @@ impl MetalBackend {
             Op::Rope { theta } => {
                 self.encode_rope(encoder, table, dispatch, theta, bindings, arguments)?
             }
+            Op::QkvRopeCache { eps, theta } => self
+                .encode_qkv_rope_cache(encoder, table, dispatch, eps, theta, bindings, arguments)?,
             Op::Embed => {
                 let (buffers, flag) =
                     self.encode_embed(encoder, table, dispatch, bindings, arguments)?;
@@ -4389,6 +4391,106 @@ impl MetalBackend {
         Ok(temporaries)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn encode_qkv_rope_cache(
+        &self,
+        encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
+        table: &ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>,
+        dispatch: &Dispatch,
+        eps: f32,
+        theta: f32,
+        bindings: &mut ArgumentBindings,
+        arguments: &mut ArgumentWriter,
+    ) -> Result<Vec<BufferBinding>, BackendError> {
+        use objc2_metal::MTLSize;
+
+        let [qkv, norm, positions] = dispatch.inputs() else {
+            return Err(BackendError::InvalidInput);
+        };
+        let [query, key, value] = dispatch.outputs() else {
+            return Err(BackendError::InvalidInput);
+        };
+        let qkv = self.encoder_tensor(qkv)?;
+        let norm = self.encoder_tensor(norm)?;
+        let positions = self.encoder_tensor(positions)?;
+        let query = self.encoder_tensor(query)?;
+        let key = self.encoder_tensor(key)?;
+        let value = self.encoder_tensor(value)?;
+        let [sequence, total_heads, width] = shape3(&qkv.layout)?;
+        let norm_heads = norm.layout.shape()[0];
+        let (query_heads, kv_heads) =
+            split_qkv_heads(total_heads, norm_heads).map_err(|_| BackendError::InvalidInput)?;
+        let mut params = Vec::with_capacity(20);
+        params.extend_from_slice(&eps.to_ne_bytes());
+        for item in [sequence, query_heads, kv_heads, width] {
+            params.extend_from_slice(&item.to_ne_bytes());
+        }
+        let mut frequencies = Vec::with_capacity(
+            usize::try_from(width / 2).map_err(|_| BackendError::AllocationFailed)?,
+        );
+        for index in 0..width / 2 {
+            #[allow(clippy::cast_precision_loss)]
+            frequencies.push(theta.powf(2.0 * index as f32 / width as f32).recip());
+        }
+        let frequency_capacity = frequencies
+            .len()
+            .checked_mul(size_of::<f32>())
+            .ok_or(BackendError::AllocationFailed)?;
+        let mut frequency_bytes = Vec::with_capacity(frequency_capacity);
+        for frequency in frequencies {
+            frequency_bytes.extend_from_slice(&frequency.to_ne_bytes());
+        }
+        let mut temporaries = Vec::with_capacity(8);
+        for tensor in [&qkv, &norm, &positions, &query, &key, &value] {
+            temporaries.push(Self::layout_buffer(&tensor.layout, arguments)?);
+        }
+        temporaries.push(arguments.write(&params)?);
+        temporaries.push(arguments.write(&frequency_bytes)?);
+        let pipeline = self
+            .pipelines
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?
+            .get(
+                "qkv_rope_cache",
+                &[
+                    (0, dtype_code(qkv.layout.dtype())),
+                    (1, dtype_code(norm.layout.dtype())),
+                    (2, dtype_code(query.layout.dtype())),
+                    (3, dtype_code(positions.layout.dtype())),
+                ],
+            )?;
+        set_pipeline(encoder, &pipeline);
+        for (index, tensor) in [&qkv, &norm, &positions, &query, &key, &value]
+            .into_iter()
+            .enumerate()
+        {
+            bindings.bind(table, index, &tensor.buffer);
+        }
+        for (index, temporary) in temporaries.iter().enumerate() {
+            bindings.bind(table, index + 6, temporary);
+        }
+        set_argument_table(encoder, table);
+        dispatch_threadgroups(
+            encoder,
+            MTLSize {
+                width: usize::try_from(
+                    sequence
+                        .checked_mul(total_heads)
+                        .ok_or(BackendError::InvalidInput)?,
+                )
+                .map_err(|_| BackendError::InvalidInput)?,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: 32,
+                height: 1,
+                depth: 1,
+            },
+        );
+        Ok(temporaries)
+    }
+
     fn encode_embed(
         &self,
         encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
@@ -5439,6 +5541,7 @@ impl MetalBackend {
                     .ok_or(BackendError::AllocationFailed)?;
                 arguments.write(frequency_bytes)?;
             }
+            Op::QkvRopeCache { .. } => Self::size_qkv_rope_cache_arguments(dispatch, arguments)?,
             Op::Embed => {
                 for len in [8, 112, 112, 112, 8] {
                     arguments.write(len)?;
@@ -5490,6 +5593,22 @@ impl MetalBackend {
         arguments.write(112)?;
         arguments.write(112)?;
         arguments.write(size_of::<u32>())
+    }
+
+    fn size_qkv_rope_cache_arguments(
+        dispatch: &Dispatch,
+        arguments: &mut ArgumentSizer,
+    ) -> Result<(), BackendError> {
+        for _ in 0..6 {
+            arguments.write(112)?;
+        }
+        arguments.write(20)?;
+        let width = dispatch.inputs()[0].layout().shape()[2];
+        let frequency_bytes = usize::try_from(width / 2)
+            .map_err(|_| BackendError::AllocationFailed)?
+            .checked_mul(size_of::<f32>())
+            .ok_or(BackendError::AllocationFailed)?;
+        arguments.write(frequency_bytes)
     }
 
     fn size_matmul_arguments(
@@ -5862,6 +5981,7 @@ fn supported_dispatch(dispatch: &Dispatch) -> bool {
         | Op::Argmax
         | Op::TopK { .. }
         | Op::Rope { .. }
+        | Op::QkvRopeCache { .. }
         | Op::Embed
         | Op::QuantEmbed { .. }
         | Op::Matmul
@@ -5941,6 +6061,7 @@ fn dispatch_kernel(dispatch: &Dispatch) -> Result<&'static str, BackendError> {
         }
         Op::Sample { .. } => "sample_rejection",
         Op::Rope { .. } => "rope",
+        Op::QkvRopeCache { .. } => "qkv_rope_cache",
         Op::Embed => "embed",
         Op::QuantEmbed { .. } => "quant-embed",
         Op::Matmul => matmul_kernel(dispatch)?,

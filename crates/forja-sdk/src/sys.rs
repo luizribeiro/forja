@@ -80,6 +80,10 @@ pub(crate) enum Op {
         position: Affine,
     },
     Rope(f32),
+    QkvRopeCache {
+        eps: f32,
+        theta: f32,
+    },
     Embed,
     QuantEmbed {
         bits: u8,
@@ -408,6 +412,9 @@ pub(crate) mod guest {
                 position: wit_affine(position),
             }),
             Op::Rope(theta) => compute::Op::Rope(compute::RopeCfg { theta }),
+            Op::QkvRopeCache { eps, theta } => {
+                compute::Op::QkvRopeCache(compute::QkvRopeCacheCfg { eps, theta })
+            }
             Op::Embed => compute::Op::Embed,
             Op::QuantEmbed { bits, group_size } => {
                 compute::Op::QuantEmbed(compute::QuantMatmulCfg { bits, group_size })
@@ -981,6 +988,7 @@ pub(crate) mod native {
                 position: position.offset,
             },
             Op::Rope(theta) => CoreOp::Rope { theta },
+            Op::QkvRopeCache { eps, theta } => CoreOp::QkvRopeCache { eps, theta },
             Op::Embed => CoreOp::Embed,
             Op::QuantEmbed { bits, group_size } => CoreOp::QuantEmbed { bits, group_size },
             Op::Matmul => CoreOp::Matmul,

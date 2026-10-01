@@ -7,7 +7,7 @@ use crate::{
     kernel::{Kernel, TensorRef},
 };
 
-use super::ops::{sdpa, sdpa_into};
+use super::ops::{qkv_rope_cache_into, sdpa, sdpa_into};
 
 /// Default number of tokens recorded in a full prefill graph.
 pub const DEFAULT_PREFILL_CHUNK: u32 = 512;
@@ -676,6 +676,108 @@ impl<T: Element> KvCache<T> {
     }
 }
 
+impl<T: FloatElement> KvCache<T> {
+    /// Normalizes projected Q/K rows, applies rotary embeddings, and writes K/V cache slots.
+    ///
+    /// The returned tensors are head-major query and cache prefixes for attention.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for incompatible projection shapes, cache ranges, parameters, or refused
+    /// work.
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_projected(
+        &mut self,
+        qkv: &Tensor<T>,
+        norm: &Tensor<T>,
+        positions: &Tensor<T>,
+        query_heads: u32,
+        eps: f32,
+        theta: f32,
+        start: &Dim,
+        end: &Dim,
+    ) -> Result<(Tensor<T>, Tensor<T>, Tensor<T>)> {
+        let [sequence, total_heads, width]: [u32; 3] = qkv
+            .shape()
+            .try_into()
+            .map_err(|_| Error::loading("QKV projection must have rank three"))?;
+        let kv_heads = total_heads
+            .checked_sub(query_heads)
+            .and_then(|heads| heads.checked_div(2))
+            .filter(|&heads| query_heads + heads * 2 == total_heads)
+            .ok_or_else(|| Error::loading("QKV projection head counts are incompatible"))?;
+        if self.key.shape()[0] != kv_heads {
+            return Err(Error::loading("QKV projection does not match the cache"));
+        }
+        let query = Tensor::<T>::empty(vec![query_heads, sequence, width])?;
+        let key_slot = self.key.narrow(1, start, sequence)?;
+        let value_slot = self.value.narrow(1, start, sequence)?;
+        qkv_rope_cache_into(
+            qkv,
+            norm,
+            positions,
+            [&query, &key_slot, &value_slot],
+            eps,
+            theta,
+        )?;
+        Ok((
+            query,
+            self.key.narrow(1, 0, end)?,
+            self.value.narrow(1, 0, end)?,
+        ))
+    }
+}
+
+fn attend_cached<T: Element>(
+    query: &Tensor<T>,
+    key: &Tensor<T>,
+    value: &Tensor<T>,
+    scale: f32,
+    start: &Dim,
+) -> Result<Tensor<T>> {
+    let [query_heads, sequence, width]: [u32; 3] = query
+        .shape()
+        .try_into()
+        .map_err(|_| Error::loading("attention query must have rank three"))?;
+    let hidden = query_heads
+        .checked_mul(width)
+        .ok_or_else(|| Error::loading("attention output width overflowed"))?;
+    let output = Tensor::<T>::empty(vec![sequence, query_heads, width])?;
+    sdpa_into(
+        query,
+        key,
+        value,
+        &output.permute(&[1, 0, 2])?,
+        scale,
+        true,
+        start,
+    )?;
+    output.reshape(&[sequence, hidden])
+}
+
+/// Applies normalized rotary Q/K projection, cache insertion, and cached decode attention.
+///
+/// # Errors
+///
+/// Returns an error for incompatible projections, cache ranges, parameters, or refused work.
+#[allow(clippy::too_many_arguments)]
+pub fn projected_cached_attention<T: FloatElement>(
+    qkv: &Tensor<T>,
+    norm: &Tensor<T>,
+    positions: &Tensor<T>,
+    cache: &mut KvCache<T>,
+    query_heads: u32,
+    eps: f32,
+    theta: f32,
+    scale: f32,
+    start: &Dim,
+    end: &Dim,
+) -> Result<Tensor<T>> {
+    let (query, key, value) =
+        cache.append_projected(qkv, norm, positions, query_heads, eps, theta, start, end)?;
+    attend_cached(&query, &key, &value, scale, start)
+}
+
 /// Applies cached causal attention to sequence-major query, key, and value tensors.
 ///
 /// Inputs use `[sequence, heads, width]`; the result is `[sequence, query_heads * width]`.
@@ -709,26 +811,16 @@ pub fn cached_attention<T: Element>(
     let key = key.permute(&[1, 0, 2])?;
     let value = value.permute(&[1, 0, 2])?;
     let (cached_key, cached_value) = cache.append(&key, &value, start, sequence, end)?;
-    let hidden = query_heads
-        .checked_mul(width)
-        .ok_or_else(|| Error::loading("attention output width overflowed"))?;
     if sequence != 1 {
+        let hidden = query_heads
+            .checked_mul(width)
+            .ok_or_else(|| Error::loading("attention output width overflowed"))?;
         return sdpa(&query, &cached_key, &cached_value, scale, true, start)?
             .permute(&[1, 0, 2])?
             .contiguous()?
             .reshape(&[sequence, hidden]);
     }
-    let output = Tensor::<T>::empty(vec![sequence, query_heads, width])?;
-    sdpa_into(
-        &query,
-        &cached_key,
-        &cached_value,
-        &output.permute(&[1, 0, 2])?,
-        scale,
-        true,
-        start,
-    )?;
-    output.reshape(&[sequence, hidden])
+    attend_cached(&query, &cached_key, &cached_value, scale, start)
 }
 
 #[cfg(test)]

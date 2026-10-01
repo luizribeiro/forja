@@ -172,6 +172,13 @@ pub enum Op {
         /// The positive finite frequency base.
         theta: f32,
     },
+    /// Normalizes and rotates projected queries and keys while writing keys and values to cache.
+    QkvRopeCache {
+        /// The nonnegative stabilizer added before the root mean square.
+        eps: f32,
+        /// The positive finite rotary frequency base.
+        theta: f32,
+    },
     /// Gathers embedding rows by token id.
     Embed,
     /// Gathers and dequantizes affine-quantized embedding rows by token id.
@@ -348,7 +355,7 @@ impl Dispatch {
         check_common(inputs, outputs)?;
         let expected_outputs = match op {
             Op::TopK { .. } => 2,
-            Op::QuantizedRouter { .. } => 3,
+            Op::QuantizedRouter { .. } | Op::QkvRopeCache { .. } => 3,
             _ => 1,
         };
         if outputs.len() != expected_outputs {
@@ -368,6 +375,9 @@ impl Dispatch {
             Op::TopK { k, .. } => check_top_k(inputs, outputs, k)?,
             Op::Sample { .. } => check_sample(inputs, output)?,
             Op::Rope { theta } => check_rope(inputs, output, theta)?,
+            Op::QkvRopeCache { eps, theta } => {
+                check_qkv_rope_cache(inputs, outputs, eps, theta)?;
+            }
             Op::Embed => check_embed(inputs, output)?,
             Op::QuantEmbed { bits, group_size } => {
                 check_quant_embed(inputs, output, bits, group_size)?;
@@ -1004,6 +1014,82 @@ fn check_rope(inputs: &[&Tensor], output: &Tensor, theta: f32) -> Result<(), OpE
         });
     }
     check_shape(output, inputs[0], Operand::Output)
+}
+
+fn check_qkv_rope_cache(
+    inputs: &[&Tensor],
+    outputs: &[&Tensor],
+    eps: f32,
+    theta: f32,
+) -> Result<(), OpError> {
+    if inputs.len() != 3 {
+        return Err(OpError::Arity {
+            expected: 3,
+            actual: inputs.len(),
+        });
+    }
+    if !eps.is_finite() || eps < 0.0 {
+        return Err(OpError::InvalidEpsilon);
+    }
+    if !theta.is_finite() || theta <= 0.0 {
+        return Err(OpError::InvalidTheta);
+    }
+    for (position, input) in inputs.iter().enumerate() {
+        check_float(input, Operand::Input(position))?;
+    }
+    for output in outputs {
+        check_float(output, Operand::Output)?;
+        if output.layout.dtype() != inputs[0].layout.dtype() {
+            return Err(OpError::DType {
+                operand: Operand::Output,
+                dtype: output.layout.dtype(),
+            });
+        }
+    }
+    let [sequence, total_heads, width]: [u32; 3] = inputs[0]
+        .layout
+        .shape()
+        .try_into()
+        .map_err(|_| shape_error(Operand::Input(0)))?;
+    let [norm_heads, norm_width]: [u32; 2] = inputs[1]
+        .layout
+        .shape()
+        .try_into()
+        .map_err(|_| shape_error(Operand::Input(1)))?;
+    if norm_width != width {
+        return Err(shape_error(Operand::Input(1)));
+    }
+    if inputs[2].layout.shape() != [sequence] {
+        return Err(shape_error(Operand::Input(2)));
+    }
+    if !width.is_multiple_of(2) {
+        return Err(shape_error(Operand::Input(0)));
+    }
+    let (query_heads, kv_heads) = split_qkv_heads(total_heads, norm_heads)?;
+    if outputs[0].layout.shape() != [query_heads, sequence, width]
+        || outputs[1].layout.shape() != [kv_heads, sequence, width]
+        || outputs[2].layout.shape() != [kv_heads, sequence, width]
+    {
+        return Err(shape_error(Operand::Output));
+    }
+    Ok(())
+}
+
+/// Splits projected QKV heads from the count covered by Q/K normalization.
+///
+/// # Errors
+///
+/// Returns a shape error when either the query or key/value head count is zero or underflows.
+pub fn split_qkv_heads(total_heads: u32, norm_heads: u32) -> Result<(u32, u32), OpError> {
+    let kv_heads = total_heads
+        .checked_sub(norm_heads)
+        .filter(|&heads| heads > 0)
+        .ok_or_else(|| shape_error(Operand::Input(0)))?;
+    let query_heads = norm_heads
+        .checked_sub(kv_heads)
+        .filter(|&heads| heads > 0)
+        .ok_or_else(|| shape_error(Operand::Input(0)))?;
+    Ok((query_heads, kv_heads))
 }
 
 fn check_embed(inputs: &[&Tensor], output: &Tensor) -> Result<(), OpError> {
@@ -2095,6 +2181,61 @@ mod tests {
             ),
             Err(OpError::InvalidTopK)
         );
+    }
+
+    #[test]
+    fn qkv_rope_cache_checks_projection_boundary() {
+        let qkv = tensor(1, DType::F32, &[1, 40, 128], &[5_120, 128, 1]);
+        let norm = tensor(2, DType::F32, &[36, 128], &[128, 1]);
+        let positions = tensor(3, DType::F32, &[1], &[1]);
+        let query = tensor(4, DType::F32, &[32, 1, 128], &[128, 128, 1]);
+        let key = tensor(5, DType::F32, &[4, 1, 128], &[128, 128, 1]);
+        let value = tensor(6, DType::F32, &[4, 1, 128], &[128, 128, 1]);
+        let op = Op::QkvRopeCache {
+            eps: 1.0e-6,
+            theta: 10_000.0,
+        };
+        assert!(
+            CommandList::new()
+                .dispatch_many(op, &[&qkv, &norm, &positions], &[&query, &key, &value],)
+                .is_ok()
+        );
+
+        let wrong_norm = tensor(7, DType::F32, &[36, 64], &[64, 1]);
+        assert_eq!(
+            CommandList::new().dispatch_many(
+                op,
+                &[&qkv, &wrong_norm, &positions],
+                &[&query, &key, &value],
+            ),
+            Err(OpError::Shape {
+                operand: Operand::Input(1)
+            })
+        );
+        let wrong_key = tensor(8, DType::F32, &[4, 2, 128], &[256, 128, 1]);
+        assert_eq!(
+            CommandList::new().dispatch_many(
+                op,
+                &[&qkv, &norm, &positions],
+                &[&query, &wrong_key, &value],
+            ),
+            Err(OpError::Shape {
+                operand: Operand::Output
+            })
+        );
+    }
+
+    #[test]
+    fn qkv_head_split_rejects_underflow_and_empty_partitions() {
+        assert_eq!(split_qkv_heads(40, 36), Ok((32, 4)));
+        for (total_heads, norm_heads) in [(35, 36), (40, 10), (40, 40)] {
+            assert_eq!(
+                split_qkv_heads(total_heads, norm_heads),
+                Err(OpError::Shape {
+                    operand: Operand::Input(0)
+                })
+            );
+        }
     }
 
     #[test]

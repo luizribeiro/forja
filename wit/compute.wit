@@ -43,6 +43,11 @@ interface compute {
     theta: f32,
   }
 
+  record qkv-rope-cache-cfg {
+    eps: f32,
+    theta: f32,
+  }
+
   record sdpa-cfg {
     scale: f32,
     causal: bool,
@@ -152,6 +157,7 @@ interface compute {
     top-k(top-k-cfg),
     sample(sample-cfg),
     rope(rope-cfg),
+    qkv-rope-cache(qkv-rope-cache-cfg),
     embed,
     quant-embed(quant-matmul-cfg),
     matmul,

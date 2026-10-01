@@ -3442,6 +3442,10 @@ fn core_op(operation: compute::Op) -> (TemplateOp, Option<Op>) {
         compute::Op::Rope(config) => concrete_template(Op::Rope {
             theta: config.theta,
         }),
+        compute::Op::QkvRopeCache(config) => concrete_template(Op::QkvRopeCache {
+            eps: config.eps,
+            theta: config.theta,
+        }),
         compute::Op::Embed => concrete_template(Op::Embed),
         compute::Op::QuantEmbed(config) => concrete_template(Op::QuantEmbed {
             bits: config.bits,

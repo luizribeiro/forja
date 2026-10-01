@@ -1,6 +1,6 @@
 //! Free-form neural-network operations.
 
-use crate::{Dim, Element, Error, Result, Tensor, graph, sys};
+use crate::{Dim, Element, Error, FloatElement, Result, Tensor, graph, sys};
 
 /// Computes grouped-query scaled dot-product attention.
 ///
@@ -45,6 +45,32 @@ pub fn sdpa_into<T: Element>(
         },
         &[query.handle(), key.handle(), value.handle()],
         output.handle(),
+    )?;
+    Ok(())
+}
+
+/// Normalizes and rotates projected queries and keys while writing keys and values into cache
+/// slot views.
+///
+/// # Errors
+///
+/// Returns an error for incompatible shapes, types, parameters, aliasing, or refused work.
+pub fn qkv_rope_cache_into<T: FloatElement>(
+    qkv: &Tensor<T>,
+    norm: &Tensor<T>,
+    positions: &Tensor<T>,
+    outputs: [&Tensor<T>; 3],
+    eps: f32,
+    theta: f32,
+) -> Result<()> {
+    graph::record_many(
+        sys::Op::QkvRopeCache { eps, theta },
+        &[qkv.handle(), norm.handle(), positions.handle()],
+        &[
+            outputs[0].handle(),
+            outputs[1].handle(),
+            outputs[2].handle(),
+        ],
     )?;
     Ok(())
 }
