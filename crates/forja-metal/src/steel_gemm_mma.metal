@@ -133,7 +133,9 @@ void steel_tile_multiply(
 }
 
 template <typename T, int block_rows, int block_columns, int block_inner,
-          int simdgroups_rows, int simdgroups_columns>
+          int simdgroups_rows, int simdgroups_columns,
+          int left_stride = block_inner, int right_stride = block_columns,
+          bool right_transposed = false, typename mma_type = T>
 struct BlockMMA {
     static constant constexpr int fragment_size = 8;
     static constant constexpr int row_fragments =
@@ -166,25 +168,27 @@ struct BlockMMA {
         threadgroup const T *b) thread {
         for (int inner = 0; inner < block_inner; inner += fragment_size) {
             for (int row_fragment = 0; row_fragment < row_fragments; ++row_fragment) {
-                simdgroup_matrix<T, 8, 8> a_matrix;
+                simdgroup_matrix<mma_type, 8, 8> a_matrix;
                 uint a_row = simdgroup_row * fragment_size + fragment_row +
                     row_fragment * fragment_size * simdgroups_rows;
                 for (int element = 0; element < 2; ++element) {
-                    a_matrix.thread_elements()[element] =
-                        a[a_row * block_inner + inner + fragment_column + element];
+                    a_matrix.thread_elements()[element] = mma_type(
+                        a[a_row * left_stride + inner + fragment_column + element]);
                 }
                 for (int column_fragment = 0;
                      column_fragment < column_fragments;
                      ++column_fragment) {
-                    simdgroup_matrix<T, 8, 8> b_matrix;
+                    simdgroup_matrix<mma_type, 8, 8> b_matrix;
                     simdgroup_matrix<float, 8, 8> accumulator;
                     simdgroup_matrix<float, 8, 8> result;
                     uint b_column = simdgroup_column * fragment_size + fragment_column +
                         column_fragment * fragment_size * simdgroups_columns;
                     int fragment_index = row_fragment * column_fragments + column_fragment;
                     for (int element = 0; element < 2; ++element) {
-                        b_matrix.thread_elements()[element] =
-                            b[(inner + fragment_row) * block_columns + b_column + element];
+                        b_matrix.thread_elements()[element] = mma_type(
+                            right_transposed
+                                ? b[(b_column + element) * right_stride + inner + fragment_row]
+                                : b[(inner + fragment_row) * right_stride + b_column + element]);
                         accumulator.thread_elements()[element] =
                             accumulators[fragment_index * 2 + element];
                     }
