@@ -81,8 +81,7 @@ impl<T: Element> ChunkedPrefill<T> {
     /// Padding follows real tokens, so causal attention and per-token `MoE` routing
     /// cannot change real outputs. Padded cache entries are safe because the next
     /// prefill or decode writes its position before attending to it. `forward`
-    /// must return logits shaped `[bucket, vocab]`; this method selects the last
-    /// real row after replay.
+    /// must return the last real token's logits.
     ///
     /// # Errors
     ///
@@ -92,7 +91,7 @@ impl<T: Element> ChunkedPrefill<T> {
         &mut self,
         tokens: &Tensor<u32>,
         start: u32,
-        mut forward: impl FnMut(&Tensor<u32>, u32, &Dim, &Dim) -> Result<Tensor<T>>,
+        mut forward: impl FnMut(&Tensor<u32>, u32, &Dim, &Dim, &Dim) -> Result<Tensor<T>>,
     ) -> Result<Tensor<T>> {
         let [sequence] = tokens
             .shape()
@@ -120,17 +119,18 @@ impl<T: Element> ChunkedPrefill<T> {
             let bucket = &mut self.buckets[bucket_index];
             if bucket.captured.is_none() {
                 let position_parameter = Param::new(0..=self.max_context - bucket_size)?;
+                let last_parameter = Param::new(0..=bucket_size - 1)?;
                 let trace_start = position_parameter.at(position);
                 let trace_end = (trace_start.clone() + bucket_size)?;
                 let start_dim = trace_start.into();
+                let last_dim = last_parameter.at(real - 1).into();
                 let input = self.tokens.narrow(0, 0, bucket_size)?;
-                let graph = crate::capture(&[&position_parameter], || {
-                    forward(&input, bucket_size, &start_dim, &trace_end)
+                let graph = crate::capture(&[&position_parameter, &last_parameter], || {
+                    forward(&input, bucket_size, &last_dim, &start_dim, &trace_end)
                 })?;
-                let shape = graph.result().shape();
-                if shape.len() != 2 || shape[0] != bucket_size {
+                if graph.result().shape().len() != 1 {
                     return Err(Error::loading(
-                        "prefill forward must return [bucket, vocab] logits",
+                        "prefill forward must return rank-one logits",
                     ));
                 }
                 bucket.captured = Some(CapturedPrefill { graph });
@@ -140,9 +140,8 @@ impl<T: Element> ChunkedPrefill<T> {
                 .as_ref()
                 .ok_or_else(|| Error::loading("prefill graph was not captured"))?
                 .graph;
-            graph.replay(&[position])?;
-            let vocab = graph.result().shape()[1];
-            result = Some(graph.result().narrow(0, real - 1, 1)?.reshape(&[vocab])?);
+            graph.replay(&[position, real - 1])?;
+            result = Some(graph.result().alias()?);
             consumed = consumed
                 .checked_add(real)
                 .ok_or_else(|| Error::loading("prefill progress overflowed"))?;
@@ -153,6 +152,7 @@ impl<T: Element> ChunkedPrefill<T> {
                 crate::eval()?;
             }
         }
+        crate::eval()?;
         result.ok_or_else(|| Error::loading("prefill produced no logits"))
     }
 
@@ -166,7 +166,7 @@ impl<T: Element> ChunkedPrefill<T> {
         &self,
         tokens: &Tensor<u32>,
         start: u32,
-        forward: impl FnMut(&Tensor<u32>, u32, &Dim, &Dim) -> Result<Tensor<T>>,
+        forward: impl FnMut(&Tensor<u32>, u32, &Dim, &Dim, &Dim) -> Result<Tensor<T>>,
     ) -> Result<Tensor<T>> {
         run_lazy_chunked_prefill(tokens, start, self.chunk, &self.tokens, forward)
     }
@@ -175,8 +175,7 @@ impl<T: Element> ChunkedPrefill<T> {
 /// Records the same fixed-size prefill chunks without capturing graphs.
 ///
 /// Remainders use the same padded bucket plan as [`ChunkedPrefill`]. `forward`
-/// must return logits shaped `[bucket, vocab]`; this function selects the last
-/// real row.
+/// must return the last real token's logits.
 ///
 /// # Errors
 ///
@@ -186,7 +185,7 @@ pub fn lazy_chunked_prefill<T: Element>(
     tokens: &Tensor<u32>,
     start: u32,
     chunk: u32,
-    forward: impl FnMut(&Tensor<u32>, u32, &Dim, &Dim) -> Result<Tensor<T>>,
+    forward: impl FnMut(&Tensor<u32>, u32, &Dim, &Dim, &Dim) -> Result<Tensor<T>>,
 ) -> Result<Tensor<T>> {
     let retained = Tensor::zeros(&[chunk])?;
     run_lazy_chunked_prefill(tokens, start, chunk, &retained, forward)
@@ -197,7 +196,7 @@ fn run_lazy_chunked_prefill<T: Element>(
     start: u32,
     chunk: u32,
     retained: &Tensor<u32>,
-    mut forward: impl FnMut(&Tensor<u32>, u32, &Dim, &Dim) -> Result<Tensor<T>>,
+    mut forward: impl FnMut(&Tensor<u32>, u32, &Dim, &Dim, &Dim) -> Result<Tensor<T>>,
 ) -> Result<Tensor<T>> {
     let [sequence] = tokens
         .shape()
@@ -214,14 +213,19 @@ fn run_lazy_chunked_prefill<T: Element>(
         let end = position
             .checked_add(bucket_size)
             .ok_or_else(|| Error::loading("prefill position overflowed"))?;
-        let logits = forward(&input, bucket_size, &position.into(), &end.into())?;
-        let shape = logits.shape();
-        if shape.len() != 2 || shape[0] != bucket_size {
+        let logits = forward(
+            &input,
+            bucket_size,
+            &(real - 1).into(),
+            &position.into(),
+            &end.into(),
+        )?;
+        if logits.shape().len() != 1 {
             return Err(Error::loading(
-                "prefill forward must return [bucket, vocab] logits",
+                "prefill forward must return rank-one logits",
             ));
         }
-        result = Some(logits.narrow(0, real - 1, 1)?.reshape(&[shape[1]])?);
+        result = Some(logits);
         consumed = consumed
             .checked_add(real)
             .ok_or_else(|| Error::loading("prefill progress overflowed"))?;
@@ -232,6 +236,7 @@ fn run_lazy_chunked_prefill<T: Element>(
             crate::eval()?;
         }
     }
+    crate::eval()?;
     result.ok_or_else(|| Error::loading("prefill produced no logits"))
 }
 

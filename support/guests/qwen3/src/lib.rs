@@ -24,7 +24,7 @@
 compile_error!("select at most one fusion profile");
 
 #[cfg(target_family = "wasm")]
-use forja_sdk::nn::blocks::{DecodeSelection, DecodeState};
+use forja_sdk::nn::blocks::{ChunkedPrefill, DEFAULT_PREFILL_CHUNK, DecodeSelection, DecodeState};
 use forja_sdk::{
     DType, Dim, Engine, EngineInfo, FloatElement, Load, Result, StepInput, StepOutput, Tensor,
     Weights, bf16, export_engine,
@@ -484,6 +484,8 @@ pub struct Qwen3<T: Activation = f32> {
     activation_positions: Option<Tensor<T>>,
     #[cfg(target_family = "wasm")]
     decode: DecodeState,
+    #[cfg(target_family = "wasm")]
+    prefill: Option<ChunkedPrefill<f32>>,
 }
 
 impl<T: Activation> Qwen3<T> {
@@ -505,6 +507,8 @@ impl<T: Activation> Qwen3<T> {
             activation_positions,
             #[cfg(target_family = "wasm")]
             decode: DecodeState::new(MAX_CONTEXT)?,
+            #[cfg(target_family = "wasm")]
+            prefill: Some(ChunkedPrefill::new(MAX_CONTEXT, DEFAULT_PREFILL_CHUNK)?),
         })
     }
 
@@ -602,6 +606,19 @@ impl Engine for ExportedQwen3 {
                 router_logits: Vec::new(),
             });
         }
+        #[cfg(target_family = "wasm")]
+        if sequence > 1 && !input.taps && self.prefill_supports(input.start_pos, sequence) {
+            let logits = if REPLAY_DECODE {
+                self.replay_prefill(&input.tokens, input.start_pos)?
+            } else {
+                self.lazy_prefill(&input.tokens, input.start_pos)?
+            };
+            return Ok(StepOutput {
+                logits,
+                taps: Vec::new(),
+                router_logits: Vec::new(),
+            });
+        }
         let start = input.start_pos.into();
         let end = end_pos.into();
         self.forward(&input.tokens, sequence, &start, &end, input.taps)
@@ -626,7 +643,14 @@ impl Engine for ExportedQwen3 {
                     .ok_or_else(|| {
                         forja_sdk::Error::loading("decode tokens exceed the 4096-token context")
                     })?;
-                if REPLAY_DECODE && sequence == 1 {
+                if self.prefill_supports(input.start_pos, sequence) {
+                    let logits = if REPLAY_DECODE {
+                        self.replay_prefill(&tokens, input.start_pos)?
+                    } else {
+                        self.lazy_prefill(&tokens, input.start_pos)?
+                    };
+                    self.select_token(logits, end - 1)
+                } else if REPLAY_DECODE && sequence == 1 {
                     self.decode_selected(Some(&tokens), input.start_pos, selection)
                 } else {
                     let start = input.start_pos.into();
@@ -664,9 +688,27 @@ impl<T: Activation> Qwen3<T> {
         end: &Dim,
         taps_enabled: bool,
     ) -> Result<StepOutput> {
-        let last = sequence
-            .checked_sub(1)
-            .ok_or_else(|| forja_sdk::Error::loading("tokens cannot be empty"))?;
+        let (logits, taps) = self.forward_sequence(tokens, sequence, start, end, taps_enabled)?;
+        Ok(StepOutput {
+            logits: Self::last_logits(
+                &logits,
+                sequence
+                    .checked_sub(1)
+                    .ok_or_else(|| forja_sdk::Error::loading("tokens cannot be empty"))?,
+            )?,
+            taps,
+            router_logits: Vec::new(),
+        })
+    }
+
+    fn forward_sequence(
+        &mut self,
+        tokens: &Tensor<u32>,
+        sequence: u32,
+        start: &Dim,
+        end: &Dim,
+        taps_enabled: bool,
+    ) -> Result<(Tensor<T>, Vec<Tensor<f32>>)> {
         let positions = self.positions.narrow(0, start, sequence)?;
         let program_positions = self
             .activation_positions
@@ -722,20 +764,58 @@ impl<T: Activation> Qwen3<T> {
         if taps.enabled() {
             taps.push(Self::output(hidden.contiguous()?)?);
         }
-        let logits = Self::output(
-            self.weights
-                .model
-                .embed_tokens
-                .project(&hidden)?
-                .narrow(0, last, 1)?
-                .reshape(&[VOCAB])?
-                .contiguous()?,
-        )?;
-        Ok(StepOutput {
-            logits,
-            taps: taps.finish(),
-            router_logits: Vec::new(),
-        })
+        let logits = self.weights.model.embed_tokens.project(&hidden)?;
+        Ok((logits, taps.finish()))
+    }
+
+    fn last_logits(logits: &Tensor<T>, last: impl Into<Dim>) -> Result<Tensor<f32>> {
+        Self::output(logits.narrow(0, last, 1)?.reshape(&[VOCAB])?.contiguous()?)
+    }
+
+    #[cfg(target_family = "wasm")]
+    fn forward_prefill_chunk(
+        &mut self,
+        tokens: &Tensor<u32>,
+        sequence: u32,
+        last: &Dim,
+        start: &Dim,
+        end: &Dim,
+    ) -> Result<Tensor<f32>> {
+        let (logits, _) = self.forward_sequence(tokens, sequence, start, end, false)?;
+        Self::last_logits(&logits, last)
+    }
+
+    #[cfg(target_family = "wasm")]
+    fn prefill_supports(&self, start: u32, sequence: u32) -> bool {
+        self.prefill
+            .as_ref()
+            .is_some_and(|prefill| prefill.supports(start, sequence))
+    }
+
+    #[cfg(target_family = "wasm")]
+    fn replay_prefill(&mut self, tokens: &Tensor<u32>, start: u32) -> Result<Tensor<f32>> {
+        let mut prefill = self
+            .prefill
+            .take()
+            .ok_or_else(|| forja_sdk::Error::loading("prefill state is unavailable"))?;
+        let result = prefill.replay(tokens, start, |tokens, sequence, last, start, end| {
+            self.forward_prefill_chunk(tokens, sequence, last, start, end)
+        });
+        self.prefill = Some(prefill);
+        result
+    }
+
+    #[cfg(target_family = "wasm")]
+    fn lazy_prefill(&mut self, tokens: &Tensor<u32>, start: u32) -> Result<Tensor<f32>> {
+        let prefill = self
+            .prefill
+            .take()
+            .ok_or_else(|| forja_sdk::Error::loading("prefill state is unavailable"))?;
+        let result = prefill.lazy(tokens, start, |tokens, sequence, last, start, end| {
+            self.forward_prefill_chunk(tokens, sequence, last, start, end)
+        });
+        self.prefill = Some(prefill);
+        result
     }
 
     #[cfg(target_family = "wasm")]

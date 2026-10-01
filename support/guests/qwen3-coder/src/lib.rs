@@ -1,7 +1,7 @@
 //! Qwen3-Coder-30B-A3B-Instruct MLX 4-bit inference engine.
 
 #[cfg(target_family = "wasm")]
-use forja_sdk::nn::blocks::{DecodeSelection, DecodeState};
+use forja_sdk::nn::blocks::{ChunkedPrefill, DEFAULT_PREFILL_CHUNK, DecodeSelection, DecodeState};
 use forja_sdk::{
     Dim, Engine, EngineInfo, EngineLoadConfig, Load, Result, StepInput, StepOutput, Tensor,
     Weights, bf16, export_engine,
@@ -40,6 +40,8 @@ const REPLAY_DECODE: bool = !cfg!(feature = "no-replay");
 
 #[derive(Clone, Copy)]
 struct Config;
+
+type SequenceOutput = (Tensor<f32>, Vec<Tensor<f32>>, Vec<Tensor<f32>>);
 
 #[derive(Clone, Copy)]
 struct QuantConfig {
@@ -304,6 +306,8 @@ pub struct Qwen3Coder {
     positions: Tensor<u32>,
     #[cfg(target_family = "wasm")]
     decode: DecodeState,
+    #[cfg(target_family = "wasm")]
+    prefill: Option<ChunkedPrefill<f32>>,
 }
 
 impl Qwen3Coder {
@@ -318,6 +322,8 @@ impl Qwen3Coder {
             positions: Tensor::constant(&(0..MAX_CONTEXT).collect::<Vec<_>>(), &[MAX_CONTEXT])?,
             #[cfg(target_family = "wasm")]
             decode: DecodeState::new(MAX_CONTEXT)?,
+            #[cfg(target_family = "wasm")]
+            prefill: Some(ChunkedPrefill::new(MAX_CONTEXT, DEFAULT_PREFILL_CHUNK)?),
         })
     }
 
@@ -329,9 +335,28 @@ impl Qwen3Coder {
         end: &Dim,
         taps_enabled: bool,
     ) -> Result<StepOutput> {
-        let last = sequence
-            .checked_sub(1)
-            .ok_or_else(|| forja_sdk::Error::loading("tokens cannot be empty"))?;
+        let (logits, taps, router_logits) =
+            self.forward_sequence(tokens, sequence, start, end, taps_enabled)?;
+        Ok(StepOutput {
+            logits: Self::last_logits(
+                &logits,
+                sequence
+                    .checked_sub(1)
+                    .ok_or_else(|| forja_sdk::Error::loading("tokens cannot be empty"))?,
+            )?,
+            taps,
+            router_logits,
+        })
+    }
+
+    fn forward_sequence(
+        &mut self,
+        tokens: &Tensor<u32>,
+        sequence: u32,
+        start: &Dim,
+        end: &Dim,
+        taps_enabled: bool,
+    ) -> Result<SequenceOutput> {
         let positions = self.positions.narrow(0, start, sequence)?;
         let mut hidden = self.weights.embed_tokens.forward(tokens)?;
         let layers = self.weights.layers.len();
@@ -357,18 +382,25 @@ impl Qwen3Coder {
         if taps.enabled() {
             taps.push(hidden.contiguous()?);
         }
-        let logits = self
-            .weights
-            .lm_head
-            .forward(&hidden)?
-            .narrow(0, last, 1)?
-            .reshape(&[VOCAB])?
-            .contiguous()?;
-        Ok(StepOutput {
-            logits,
-            taps: taps.finish(),
-            router_logits: routers,
-        })
+        let logits = self.weights.lm_head.forward(&hidden)?;
+        Ok((logits, taps.finish(), routers))
+    }
+
+    fn last_logits(logits: &Tensor<f32>, last: impl Into<Dim>) -> Result<Tensor<f32>> {
+        logits.narrow(0, last, 1)?.reshape(&[VOCAB])?.contiguous()
+    }
+
+    #[cfg(target_family = "wasm")]
+    fn forward_prefill_chunk(
+        &mut self,
+        tokens: &Tensor<u32>,
+        sequence: u32,
+        last: &Dim,
+        start: &Dim,
+        end: &Dim,
+    ) -> Result<Tensor<f32>> {
+        let (logits, _, _) = self.forward_sequence(tokens, sequence, start, end, false)?;
+        Self::last_logits(&logits, last)
     }
 }
 
@@ -420,6 +452,19 @@ impl Engine for Qwen3Coder {
                 router_logits: Vec::new(),
             });
         }
+        #[cfg(target_family = "wasm")]
+        if sequence > 1 && !input.taps && self.prefill_supports(input.start_pos, sequence) {
+            let logits = if REPLAY_DECODE {
+                self.replay_prefill(&input.tokens, input.start_pos)?
+            } else {
+                self.lazy_prefill(&input.tokens, input.start_pos)?
+            };
+            return Ok(StepOutput {
+                logits,
+                taps: Vec::new(),
+                router_logits: Vec::new(),
+            });
+        }
         let start = input.start_pos.into();
         let end = end.into();
         self.forward(&input.tokens, sequence, &start, &end, input.taps)
@@ -444,7 +489,14 @@ impl Engine for Qwen3Coder {
                     .ok_or_else(|| {
                         forja_sdk::Error::loading("decode tokens exceed the 4096-token context")
                     })?;
-                if REPLAY_DECODE && sequence == 1 {
+                if self.prefill_supports(input.start_pos, sequence) {
+                    let logits = if REPLAY_DECODE {
+                        self.replay_prefill(&tokens, input.start_pos)?
+                    } else {
+                        self.lazy_prefill(&tokens, input.start_pos)?
+                    };
+                    self.select_token(logits, end - 1)
+                } else if REPLAY_DECODE && sequence == 1 {
                     self.decode_selected(Some(&tokens), input.start_pos, selection)
                 } else {
                     let start = input.start_pos.into();
@@ -474,6 +526,36 @@ impl Engine for Qwen3Coder {
 
 #[cfg(target_family = "wasm")]
 impl Qwen3Coder {
+    fn prefill_supports(&self, start: u32, sequence: u32) -> bool {
+        self.prefill
+            .as_ref()
+            .is_some_and(|prefill| prefill.supports(start, sequence))
+    }
+
+    fn replay_prefill(&mut self, tokens: &Tensor<u32>, start: u32) -> Result<Tensor<f32>> {
+        let mut prefill = self
+            .prefill
+            .take()
+            .ok_or_else(|| forja_sdk::Error::loading("prefill state is unavailable"))?;
+        let result = prefill.replay(tokens, start, |tokens, sequence, last, start, end| {
+            self.forward_prefill_chunk(tokens, sequence, last, start, end)
+        });
+        self.prefill = Some(prefill);
+        result
+    }
+
+    fn lazy_prefill(&mut self, tokens: &Tensor<u32>, start: u32) -> Result<Tensor<f32>> {
+        let prefill = self
+            .prefill
+            .take()
+            .ok_or_else(|| forja_sdk::Error::loading("prefill state is unavailable"))?;
+        let result = prefill.lazy(tokens, start, |tokens, sequence, last, start, end| {
+            self.forward_prefill_chunk(tokens, sequence, last, start, end)
+        });
+        self.prefill = Some(prefill);
+        result
+    }
+
     fn replay_decode(
         &mut self,
         tokens: Option<&Tensor<u32>>,
