@@ -8,6 +8,7 @@ mod ops;
 pub mod program;
 mod quantized;
 mod symbolic;
+mod variants;
 
 pub use backend::{
     AllocationRegistry, Backend, BackendError, DispatchProfile, ProfileCount, ProfileTensor,
@@ -28,6 +29,10 @@ pub use quantized::{QuantizedMatrix, QuantizedMatrixError, QuantizedMatrixPart};
 pub use symbolic::{
     Affine, ByteHull, MAX_PARAMS, ParamError, ParamSpace, ParamValues, SymbolicLayout,
     SymbolicLayoutError,
+};
+pub use variants::{
+    Axis, Constraint, DeviceCapability, Dimension, Guarantee, LayoutClass, Lifecycle,
+    OperationKind, OperationValue, Relation, TensorRef, TensorSlot, ValueRef, operation_value,
 };
 
 /// A scalar type stored in an unquantized tensor.
