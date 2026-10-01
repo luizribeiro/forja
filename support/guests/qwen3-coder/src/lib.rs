@@ -3,11 +3,12 @@
 #[cfg(target_family = "wasm")]
 use forja_sdk::nn::blocks::{ChunkedPrefill, DEFAULT_PREFILL_CHUNK, DecodeSelection, DecodeState};
 use forja_sdk::{
-    Dim, Engine, EngineInfo, EngineLoadConfig, Load, Result, StepInput, StepOutput, Tensor,
+    DType, Dim, Engine, EngineInfo, EngineLoadConfig, Load, Result, StepInput, StepOutput, Tensor,
     Weights, bf16, export_engine,
+    kernel::Kernel,
     nn::{
         RmsNorm, RmsNormConfig,
-        blocks::{KvCache, Taps, cached_attention},
+        blocks::{KvCache, Taps, cached_attention, residual_norm, residual_norm_kernel},
         moe_combine, moe_router,
     },
 };
@@ -225,21 +226,41 @@ struct DecoderLayer {
     mlp: SparseMoe,
 }
 
+struct LayerResources<'a> {
+    cache: &'a mut KvCache<f32>,
+    following_norm: &'a RmsNorm<f32>,
+}
+
+#[derive(Clone, Copy)]
+struct LayerPosition<'a> {
+    positions: &'a Tensor<u32>,
+    start: &'a Dim,
+    end: &'a Dim,
+}
+
 impl DecoderLayer {
     fn forward(
         &self,
+        residual_kernel: &Kernel,
         input: &Tensor<f32>,
-        positions: &Tensor<u32>,
-        cache: &mut KvCache<f32>,
-        start: &Dim,
-        end: &Dim,
-    ) -> Result<(Tensor<f32>, Tensor<f32>)> {
+        normalized_input: &Tensor<f32>,
+        position: LayerPosition<'_>,
+        resources: LayerResources<'_>,
+    ) -> Result<(Tensor<f32>, Tensor<f32>, Tensor<f32>)> {
+        let LayerResources {
+            cache,
+            following_norm,
+        } = resources;
+        let LayerPosition {
+            positions,
+            start,
+            end,
+        } = position;
         let sequence = positions.shape()[0];
-        let normalized = self.input_layernorm.forward(input)?;
         let query = self
             .self_attn
             .q_norm
-            .forward(&self.self_attn.q_proj.forward(&normalized)?.reshape(&[
+            .forward(&self.self_attn.q_proj.forward(normalized_input)?.reshape(&[
                 sequence,
                 QUERY_HEADS,
                 HEAD_DIM,
@@ -248,22 +269,32 @@ impl DecoderLayer {
         let key = self
             .self_attn
             .k_norm
-            .forward(&self.self_attn.k_proj.forward(&normalized)?.reshape(&[
+            .forward(&self.self_attn.k_proj.forward(normalized_input)?.reshape(&[
                 sequence,
                 KEY_VALUE_HEADS,
                 HEAD_DIM,
             ])?)?
             .rope(positions, ROPE_THETA)?;
-        let value = self.self_attn.v_proj.forward(&normalized)?.reshape(&[
+        let value = self.self_attn.v_proj.forward(normalized_input)?.reshape(&[
             sequence,
             KEY_VALUE_HEADS,
             HEAD_DIM,
         ])?;
         let attended = cached_attention(&query, &key, &value, cache, ATTENTION_SCALE, start, end)?;
-        let hidden = (input + &self.self_attn.o_proj.forward(&attended)?)?;
-        let normalized = self.post_attention_layernorm.forward(&hidden)?;
+        let (hidden, normalized) = residual_norm(
+            residual_kernel,
+            input,
+            &self.self_attn.o_proj.forward(&attended)?,
+            self.post_attention_layernorm.weight(),
+        )?;
         let (projected, router_logits) = self.mlp.forward(&normalized)?;
-        Ok(((&hidden + &projected)?, router_logits))
+        let (hidden, normalized) = residual_norm(
+            residual_kernel,
+            &hidden,
+            &projected,
+            following_norm.weight(),
+        )?;
+        Ok((hidden, normalized, router_logits))
     }
 }
 
@@ -303,6 +334,7 @@ impl QwenWeights {
 pub struct Qwen3Coder {
     weights: QwenWeights,
     caches: Vec<KvCache<f32>>,
+    residual_norm: Kernel,
     positions: Tensor<u32>,
     #[cfg(target_family = "wasm")]
     decode: DecodeState,
@@ -319,6 +351,7 @@ impl Qwen3Coder {
         Ok(Self {
             weights,
             caches,
+            residual_norm: residual_norm_kernel(DType::F32, RMS_EPSILON)?,
             positions: Tensor::constant(&(0..MAX_CONTEXT).collect::<Vec<_>>(), &[MAX_CONTEXT])?,
             #[cfg(target_family = "wasm")]
             decode: DecodeState::new(MAX_CONTEXT)?,
@@ -360,17 +393,31 @@ impl Qwen3Coder {
         let positions = self.positions.narrow(0, start, sequence)?;
         let mut hidden = self.weights.embed_tokens.forward(tokens)?;
         let layers = self.weights.layers.len();
+        let mut normalized = self.weights.layers[0].input_layernorm.forward(&hidden)?;
         let mut taps = Taps::new(taps_enabled, layers);
         let mut routers = Vec::with_capacity(if taps_enabled { layers } else { 0 });
         for index in 0..layers {
-            let (next, router) = self.weights.layers[index].forward(
+            let following_norm = self
+                .weights
+                .layers
+                .get(index + 1)
+                .map_or(&self.weights.norm, |layer| &layer.input_layernorm);
+            let (next, next_normalized, router) = self.weights.layers[index].forward(
+                &self.residual_norm,
                 &hidden,
-                &positions,
-                &mut self.caches[index],
-                start,
-                end,
+                &normalized,
+                LayerPosition {
+                    positions: &positions,
+                    start,
+                    end,
+                },
+                LayerResources {
+                    cache: &mut self.caches[index],
+                    following_norm,
+                },
             )?;
             hidden = next;
+            normalized = next_normalized;
             if taps.enabled() {
                 routers.push(router.contiguous()?);
                 if index + 1 < layers {
@@ -378,11 +425,10 @@ impl Qwen3Coder {
                 }
             }
         }
-        hidden = self.weights.norm.forward(&hidden)?;
         if taps.enabled() {
-            taps.push(hidden.contiguous()?);
+            taps.push(normalized.contiguous()?);
         }
-        let logits = self.weights.lm_head.forward(&hidden)?;
+        let logits = self.weights.lm_head.forward(&normalized)?;
         Ok((logits, taps.finish(), routers))
     }
 
