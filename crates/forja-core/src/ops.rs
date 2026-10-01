@@ -192,6 +192,15 @@ pub enum Op {
         /// Number of input elements sharing one scale and bias.
         group_size: u32,
     },
+    /// Multiplies one or more rows by q8 affine router weights and selects the top routes.
+    QuantizedRouter {
+        /// Number of input elements sharing one scale and bias.
+        group_size: u32,
+        /// Number of routes selected from each row.
+        k: u32,
+        /// Whether selected logits are softmax-normalized over the selected set.
+        normalize: bool,
+    },
     /// Multiplies rows by affine-quantized expert weights selected at run time.
     GatherQuantMatmul {
         /// Number of bits in each unsigned quantized value.
@@ -337,7 +346,11 @@ impl Dispatch {
         outputs: &[&Tensor],
     ) -> Result<Self, OpError> {
         check_common(inputs, outputs)?;
-        let expected_outputs = if matches!(op, Op::TopK { .. }) { 2 } else { 1 };
+        let expected_outputs = match op {
+            Op::TopK { .. } => 2,
+            Op::QuantizedRouter { .. } => 3,
+            _ => 1,
+        };
         if outputs.len() != expected_outputs {
             return Err(OpError::OutputArity {
                 expected: expected_outputs,
@@ -364,6 +377,11 @@ impl Dispatch {
             Op::QuantMatmul { bits, group_size } => {
                 check_quant_matmul(inputs, output, bits, group_size)?;
             }
+            Op::QuantizedRouter {
+                group_size,
+                k,
+                normalize: _,
+            } => check_quantized_router(inputs, outputs, group_size, k)?,
             Op::GatherQuantMatmul { bits, group_size } => {
                 check_gather_quant_matmul(inputs, output, bits, group_size)?;
             }
@@ -1206,6 +1224,20 @@ fn check_quant_matmul(
     Ok(())
 }
 
+fn check_quantized_router(
+    inputs: &[&Tensor],
+    outputs: &[&Tensor],
+    group_size: u32,
+    k: u32,
+) -> Result<(), OpError> {
+    check_quant_matmul(inputs, outputs[0], 8, group_size)?;
+    let columns = outputs[0].layout.shape()[1];
+    if columns > 128 || k > 8 {
+        return Err(OpError::InvalidTopK);
+    }
+    check_top_k(&[outputs[0]], &outputs[1..], k)
+}
+
 fn check_gather_quant_matmul(
     inputs: &[&Tensor],
     output: &Tensor,
@@ -2025,6 +2057,43 @@ mod tests {
             Err(OpError::Shape {
                 operand: Operand::Output
             })
+        );
+    }
+
+    #[test]
+    fn quantized_router_checks_fused_shape_boundary() {
+        let input = tensor(1, DType::F32, &[1, 256], &[256, 1]);
+        let packed = tensor(2, DType::U32, &[128, 64], &[64, 1]);
+        let scales = tensor(3, DType::BF16, &[128, 4], &[4, 1]);
+        let biases = tensor(4, DType::BF16, &[128, 4], &[4, 1]);
+        let logits = tensor(5, DType::F32, &[1, 128], &[128, 1]);
+        let weights = tensor(6, DType::F32, &[1, 8], &[8, 1]);
+        let indices = tensor(7, DType::U32, &[1, 8], &[8, 1]);
+        let op = Op::QuantizedRouter {
+            group_size: 64,
+            k: 8,
+            normalize: true,
+        };
+        assert!(
+            CommandList::new()
+                .dispatch_many(
+                    op,
+                    &[&input, &packed, &scales, &biases],
+                    &[&logits, &weights, &indices],
+                )
+                .is_ok()
+        );
+        let too_wide = tensor(8, DType::U32, &[129, 64], &[64, 1]);
+        let wide_scales = tensor(9, DType::BF16, &[129, 4], &[4, 1]);
+        let wide_biases = tensor(10, DType::BF16, &[129, 4], &[4, 1]);
+        let wide_logits = tensor(11, DType::F32, &[1, 129], &[129, 1]);
+        assert_eq!(
+            CommandList::new().dispatch_many(
+                op,
+                &[&input, &too_wide, &wide_scales, &wide_biases],
+                &[&wide_logits, &weights, &indices],
+            ),
+            Err(OpError::InvalidTopK)
         );
     }
 

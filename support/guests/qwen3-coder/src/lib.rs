@@ -12,7 +12,7 @@ use forja_sdk::{
             KvCache, Taps, cached_attention, qk_norm_rope, qk_norm_rope_kernel, residual_norm,
             residual_norm_kernel, rms_norm, rms_norm_kernel,
         },
-        moe_combine, moe_router,
+        moe_combine,
     },
 };
 
@@ -337,8 +337,14 @@ impl Load<Config> for SparseMoe {
 
 impl SparseMoe {
     fn route(&self, input: &Tensor<f32>) -> Result<RoutedMoe> {
-        let logits = self.gate.forward(input)?;
-        let (weights, indices) = moe_router(&logits, TOP_K, true)?;
+        let (logits, weights, indices) = input.quantized_router(
+            &self.gate.packed,
+            &self.gate.scales,
+            &self.gate.biases,
+            QUANT_GROUP,
+            TOP_K,
+            true,
+        )?;
         let activated = input.gather_quant_silu_mul(
             &self.gate_proj.packed,
             &self.gate_proj.scales,

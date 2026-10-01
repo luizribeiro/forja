@@ -97,6 +97,7 @@ float4 load_float4_contiguous(device const uchar *buffer, ulong index, uint dtyp
     return float4(*reinterpret_cast<device const bfloat4 *>(buffer + index * 2));
 }
 
+template <uint output_count>
 void quantized_qmv_sums(
     device const uchar *input,
     device const uchar *packed,
@@ -118,7 +119,7 @@ void quantized_qmv_sums(
     uint first_column,
     ushort lane,
     uint words_per_thread,
-    thread float (&sums)[4]) {
+    thread float (&sums)[output_count]) {
     uint values_per_word = 32 / quant_bits;
     uint values_per_thread = values_per_word * words_per_thread;
     uint block_size = values_per_thread * 32;
@@ -150,7 +151,7 @@ void quantized_qmv_sums(
                 activations[element + item] = values[item];
             }
         }
-        for (uint item = 0; item < 4; ++item) {
+        for (uint item = 0; item < output_count; ++item) {
             uint column = first_column + item;
             if (column < columns) {
                 uint first_word = first_inner / values_per_word;
@@ -208,8 +209,84 @@ void quantized_qmv_sums(
             }
         }
     }
-    for (uint item = 0; item < 4; ++item) {
+    for (uint item = 0; item < output_count; ++item) {
         sums[item] = simd_sum(sums[item]);
+    }
+}
+
+void quantized_q8_sums(
+    device const uchar *input,
+    device const uchar *packed,
+    device const uchar *scales,
+    device const uchar *biases,
+    constant QuantMatmulParams &params,
+    ulong input_base,
+    uint first_column,
+    ushort lane,
+    thread float (&sums)[8]) {
+    uint words_per_group = quant_group_size / 4;
+    for (uint first_word = uint(lane) * 4;
+         first_word < params.packed_width;
+         first_word += 128) {
+        uint group = first_word / words_per_group;
+        float input_sum = 0.0f;
+        float quantized_sums[8] = {0.0f};
+        uint4 quantized_words[8] = {uint4(0u)};
+        for (uint row = 0; row < 8; ++row) {
+            uint column = first_column + row;
+            if (column < params.columns) {
+                ulong index = params.packed_offset +
+                    ulong(column) * params.packed_row_stride +
+                    ulong(first_word) * params.packed_word_stride;
+                if (params.packed_word_stride == 1 && (index & 3) == 0) {
+                    quantized_words[row] =
+                        *(device const uint4 *)(packed + index * sizeof(uint));
+                } else {
+                    for (uint word = 0; word < 4; ++word) {
+                        quantized_words[row][word] = load_uint(
+                            packed,
+                            index + ulong(word) * params.packed_word_stride);
+                    }
+                }
+            }
+        }
+        for (uint word = 0; word < 4; ++word) {
+            uint inner = (first_word + word) * 4;
+            float4 values;
+            ulong input_index = input_base + ulong(inner) * params.input_inner_stride;
+            if (params.input_inner_stride == 1 && (input_index & 3) == 0) {
+                values = load_float4_contiguous(input, input_index, input0_dtype);
+            } else {
+                for (uint element = 0; element < 4; ++element) {
+                    values[element] = load_float(
+                        input,
+                        input_index + ulong(element) * params.input_inner_stride,
+                        input0_dtype);
+                }
+            }
+            input_sum += dot(values, float4(1.0f));
+            for (uint row = 0; row < 8; ++row) {
+                uchar4 quantized = as_type<uchar4>(quantized_words[row][word]);
+                quantized_sums[row] += dot(values, float4(quantized));
+            }
+        }
+        for (uint row = 0; row < 8; ++row) {
+            uint column = first_column + row;
+            if (column < params.columns) {
+                ulong scale_index = params.scale_offset +
+                    ulong(column) * params.scale_row_stride +
+                    ulong(group) * params.scale_group_stride;
+                ulong bias_index = params.bias_offset +
+                    ulong(column) * params.bias_row_stride +
+                    ulong(group) * params.bias_group_stride;
+                sums[row] += load_float(scales, scale_index, input1_dtype) *
+                    quantized_sums[row] +
+                    load_float(biases, bias_index, input1_dtype) * input_sum;
+            }
+        }
+    }
+    for (uint row = 0; row < 8; ++row) {
+        sums[row] = simd_sum(sums[row]);
     }
 }
 
@@ -225,73 +302,11 @@ kernel void quantized_gemv(
     uint2 tile [[threadgroup_position_in_grid]]) {
     if (quant_bits == 8) {
         uint first_column = tile.x * 16 + uint(simdgroup) * 8;
-        uint words_per_group = quant_group_size / 4;
         float sums[8] = {0.0f};
-        for (uint first_word = uint(lane) * 4;
-             first_word < params.packed_width;
-             first_word += 128) {
-            uint group = first_word / words_per_group;
-            float input_sum = 0.0f;
-            float quantized_sums[8] = {0.0f};
-            uint4 quantized_words[8] = {uint4(0u)};
-            for (uint row = 0; row < 8; ++row) {
-                uint column = first_column + row;
-                if (column < params.columns) {
-                    ulong index = params.packed_offset +
-                        ulong(column) * params.packed_row_stride +
-                        ulong(first_word) * params.packed_word_stride;
-                    if (params.packed_word_stride == 1 && (index & 3) == 0) {
-                        quantized_words[row] =
-                            *(device const uint4 *)(packed + index * sizeof(uint));
-                    } else {
-                        for (uint word = 0; word < 4; ++word) {
-                            quantized_words[row][word] = load_uint(
-                                packed,
-                                index + ulong(word) * params.packed_word_stride);
-                        }
-                    }
-                }
-            }
-            for (uint word = 0; word < 4; ++word) {
-                uint inner = (first_word + word) * 4;
-                float4 values;
-                ulong input_index = params.input_offset +
-                    ulong(tile.y) * params.input_row_stride +
-                    ulong(inner) * params.input_inner_stride;
-                if (params.input_inner_stride == 1 && (input_index & 3) == 0) {
-                    values = load_float4_contiguous(input, input_index, input0_dtype);
-                } else {
-                    for (uint element = 0; element < 4; ++element) {
-                        values[element] = load_float(
-                            input,
-                            input_index + ulong(element) * params.input_inner_stride,
-                            input0_dtype);
-                    }
-                }
-                input_sum += dot(values, float4(1.0f));
-                for (uint row = 0; row < 8; ++row) {
-                    uchar4 quantized = as_type<uchar4>(quantized_words[row][word]);
-                    quantized_sums[row] += dot(values, float4(quantized));
-                }
-            }
-            for (uint row = 0; row < 8; ++row) {
-                uint column = first_column + row;
-                if (column < params.columns) {
-                    ulong scale_index = params.scale_offset +
-                        ulong(column) * params.scale_row_stride +
-                        ulong(group) * params.scale_group_stride;
-                    ulong bias_index = params.bias_offset +
-                        ulong(column) * params.bias_row_stride +
-                        ulong(group) * params.bias_group_stride;
-                    sums[row] += load_float(scales, scale_index, input1_dtype) *
-                        quantized_sums[row] +
-                        load_float(biases, bias_index, input1_dtype) * input_sum;
-                }
-            }
-        }
-        for (uint row = 0; row < 8; ++row) {
-            sums[row] = simd_sum(sums[row]);
-        }
+        quantized_q8_sums(
+            input, packed, scales, biases, params,
+            params.input_offset + ulong(tile.y) * params.input_row_stride,
+            first_column, lane, sums);
         if (lane == 0) {
             for (uint row = 0; row < 8; ++row) {
                 uint column = first_column + row;
@@ -388,6 +403,107 @@ kernel void quantized_gemv_q8_fast(
                     sums[item]);
             }
         }
+    }
+}
+
+kernel void quantized_router_q8(
+    device const uchar *input [[buffer(0)]],
+    device const uchar *packed [[buffer(1)]],
+    device const uchar *scales [[buffer(2)]],
+    device const uchar *biases [[buffer(3)]],
+    device uchar *logit_output [[buffer(4)]],
+    device uchar *route_weights [[buffer(5)]],
+    device uint *route_indices [[buffer(6)]],
+    constant QuantMatmulParams &params [[buffer(7)]],
+    constant TensorLayout &weight_layout [[buffer(8)]],
+    constant TensorLayout &index_layout [[buffer(9)]],
+    constant uint &top_k [[buffer(10)]],
+    constant uint &normalize [[buffer(11)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint lane [[thread_position_in_threadgroup]],
+    ushort simdgroup [[simdgroup_index_in_threadgroup]],
+    ushort simd_lane [[thread_index_in_simdgroup]]) {
+    threadgroup float logits[128];
+    threadgroup ulong group_candidates[32];
+    threadgroup ulong selected[8];
+    threadgroup float normalization_maximum;
+    threadgroup float denominator;
+    uint first_column = uint(simdgroup) * 8;
+    float sums[8] = {0.0f};
+    quantized_q8_sums(
+        input, packed, scales, biases, params,
+        params.input_offset + ulong(row) * params.input_row_stride,
+        first_column, simd_lane, sums);
+    if (simd_lane == 0) {
+        for (uint item = 0; item < 8; ++item) {
+            uint column = first_column + item;
+            if (column < params.columns) {
+                logits[column] = sums[item];
+                store_float(
+                    logit_output,
+                    params.output_offset + ulong(row) * params.output_row_stride +
+                        ulong(column) * params.output_column_stride,
+                    output_dtype,
+                    sums[item]);
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    ulong candidate = lane < params.columns ? topk_candidate(logits[lane], lane) : 0;
+    if (simdgroup < 4) {
+        if (simd_lane == 0) {
+            for (uint slot = top_k; slot < 8; ++slot) {
+                group_candidates[uint(simdgroup) * 8 + slot] = 0;
+            }
+        }
+        for (uint slot = 0; slot < top_k; ++slot) {
+            ulong best = simd_candidate_max(candidate);
+            if (candidate == best) {
+                candidate = 0;
+            }
+            if (simd_lane == 0) {
+                group_candidates[uint(simdgroup) * 8 + slot] = best;
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simdgroup == 0) {
+        candidate = group_candidates[simd_lane];
+        for (uint slot = 0; slot < top_k; ++slot) {
+            ulong best = simd_candidate_max(candidate);
+            if (candidate == best) {
+                candidate = 0;
+            }
+            if (simd_lane == 0) {
+                selected[slot] = best;
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane == 0) {
+        denominator = 1.0f;
+        if (normalize != 0) {
+            normalization_maximum = logits[~uint(selected[0])];
+            denominator = 0.0f;
+            for (uint slot = 0; slot < top_k; ++slot) {
+                denominator += exp(logits[~uint(selected[slot])] - normalization_maximum);
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane < top_k) {
+        uint column = ~uint(selected[lane]);
+        uint output_index = row * top_k + lane;
+        float value = logits[column];
+        if (normalize != 0) {
+            value = exp(value - normalization_maximum) / denominator;
+        }
+        store_float(
+            route_weights,
+            physical_index(weight_layout, output_index),
+            output_dtype,
+            value);
+        route_indices[physical_index(index_layout, output_index)] = column;
     }
 }
 

@@ -63,6 +63,12 @@ interface compute {
     normalize: bool,
   }
 
+  record quantized-router-cfg {
+    group-size: u32,
+    k: u32,
+    normalize: bool,
+  }
+
   enum program-kind {
     %map,
     row,
@@ -151,6 +157,7 @@ interface compute {
     matmul,
     gather-matmul,
     quant-matmul(quant-matmul-cfg),
+    quantized-router(quantized-router-cfg),
     gather-quant-matmul(quant-matmul-cfg),
     gather-quant-matmul-combine(quant-matmul-cfg),
     gather-quant-silu-mul(quant-matmul-cfg),

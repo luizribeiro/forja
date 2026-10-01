@@ -3,7 +3,7 @@
 use forja_core::{DType, Op, Slice};
 use forja_cpu::CpuBackend;
 use forja_metal::MetalBackend;
-use forja_testing::{TensorSpec, assert_backends_agree};
+use forja_testing::{TensorSpec, assert_backends_agree, assert_backends_agree_many};
 
 #[test]
 fn decode_quantized_matmul_matches_cpu_for_formats_and_groups() {
@@ -46,6 +46,110 @@ fn qwen_router_shape_matches_cpu() {
     let candidate = MetalBackend::new().unwrap();
     for dtype in [DType::F16, DType::BF16, DType::F32] {
         assert_decode_projection_case(&reference, &candidate, dtype);
+    }
+}
+
+#[test]
+fn fused_qwen_router_matches_cpu() {
+    let reference = CpuBackend::new();
+    let candidate = MetalBackend::new().unwrap();
+    for rows in [1, 7] {
+        let inputs = [
+            TensorSpec::contiguous(DType::F32, &[rows, 2048]),
+            TensorSpec::contiguous(DType::U32, &[128, 512]),
+            TensorSpec::contiguous(DType::BF16, &[128, 32]),
+            TensorSpec::contiguous(DType::BF16, &[128, 32]),
+        ];
+        let outputs = [
+            TensorSpec::contiguous(DType::F32, &[rows, 128]),
+            TensorSpec::contiguous(DType::F32, &[rows, 8]),
+            TensorSpec::contiguous(DType::U32, &[rows, 8]),
+        ];
+        assert_backends_agree_many(
+            &reference,
+            &candidate,
+            Op::QuantizedRouter {
+                group_size: 64,
+                k: 8,
+                normalize: true,
+            },
+            &inputs,
+            &outputs,
+        )
+        .unwrap();
+    }
+}
+
+#[test]
+fn fused_qwen_router_matches_cpu_for_partial_top_k_ties_and_nan() {
+    let reference = CpuBackend::new();
+    let candidate = MetalBackend::new().unwrap();
+    let inner = 256_usize;
+    let columns = 128_usize;
+    let groups = inner / 64;
+    let input = TensorSpec::initialized(
+        DType::F32,
+        &[1, u32::try_from(inner).unwrap()],
+        std::iter::repeat_n(1.0_f32, inner)
+            .flat_map(f32::to_le_bytes)
+            .collect(),
+    );
+    let packed = TensorSpec::initialized(
+        DType::U32,
+        &[
+            u32::try_from(columns).unwrap(),
+            u32::try_from(inner / 4).unwrap(),
+        ],
+        vec![0; columns * inner],
+    );
+    let scales = TensorSpec::initialized(
+        DType::BF16,
+        &[
+            u32::try_from(columns).unwrap(),
+            u32::try_from(groups).unwrap(),
+        ],
+        vec![0; columns * groups * 2],
+    );
+    for nan_expert in [None, Some(17_usize)] {
+        let mut biases = vec![0_u8; columns * groups * 2];
+        if let Some(expert) = nan_expert {
+            for group in 0..groups {
+                let offset = (expert * groups + group) * 2;
+                biases[offset..offset + 2].copy_from_slice(&0x7fc0_u16.to_le_bytes());
+            }
+        }
+        let inputs = [
+            input.clone(),
+            packed.clone(),
+            scales.clone(),
+            TensorSpec::initialized(
+                DType::BF16,
+                &[
+                    u32::try_from(columns).unwrap(),
+                    u32::try_from(groups).unwrap(),
+                ],
+                biases,
+            ),
+        ];
+        for k in [1, 3, 7, 8] {
+            let outputs = [
+                TensorSpec::contiguous(DType::F32, &[1, 128]),
+                TensorSpec::contiguous(DType::F32, &[1, k]),
+                TensorSpec::contiguous(DType::U32, &[1, k]),
+            ];
+            assert_backends_agree_many(
+                &reference,
+                &candidate,
+                Op::QuantizedRouter {
+                    group_size: 64,
+                    k,
+                    normalize: true,
+                },
+                &inputs,
+                &outputs,
+            )
+            .unwrap();
+        }
     }
 }
 

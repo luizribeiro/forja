@@ -474,6 +474,53 @@ where
     assert_outputs_agree(output.dtype, &expected_bytes, &actual_bytes)
 }
 
+/// Runs identical initialized multi-output work on two backends and checks every output.
+///
+/// # Errors
+///
+/// Returns a backend, encoding, size, dtype, or tolerance error.
+pub fn assert_backends_agree_many<R, C>(
+    reference: &R,
+    candidate: &C,
+    op: Op,
+    inputs: &[TensorSpec],
+    outputs: &[TensorSpec],
+) -> Result<(), AgreementError>
+where
+    R: Backend,
+    C: Backend,
+{
+    let mut values = DeterministicValues::new(0x6a09_e667_f3bc_c909);
+    let mut reference_inputs = Vec::with_capacity(inputs.len());
+    let mut candidate_inputs = Vec::with_capacity(inputs.len());
+    for input in inputs {
+        let bytes = generated_bytes(input, &mut values)?;
+        reference_inputs.push(allocate_initialized(reference, input, &bytes)?);
+        candidate_inputs.push(allocate_initialized(candidate, input, &bytes)?);
+    }
+    let reference_outputs = outputs
+        .iter()
+        .map(|output| allocate(reference, output))
+        .collect::<Result<Vec<_>, _>>()?;
+    let candidate_outputs = outputs
+        .iter()
+        .map(|output| allocate(candidate, output))
+        .collect::<Result<Vec<_>, _>>()?;
+    run_many(reference, op, &reference_inputs, &reference_outputs)?;
+    run_many(candidate, op, &candidate_inputs, &candidate_outputs)?;
+    for (spec, (expected, actual)) in outputs
+        .iter()
+        .zip(reference_outputs.iter().zip(&candidate_outputs))
+    {
+        assert_outputs_agree(
+            spec.dtype,
+            &reference.read(expected)?,
+            &candidate.read(actual)?,
+        )?;
+    }
+    Ok(())
+}
+
 /// Runs a generated scalar program and checks each candidate output against an f64 interval.
 ///
 /// The reference backend parameter is retained so differential-test call sites can share setup;
@@ -684,6 +731,22 @@ fn run<B: Backend>(
     let inputs = inputs.iter().collect::<Vec<_>>();
     commands
         .dispatch(op, &inputs, output)
+        .map_err(|_| BackendError::InvalidInput)?;
+    backend.submit(commands)?.wait()?;
+    Ok(())
+}
+
+fn run_many<B: Backend>(
+    backend: &B,
+    op: Op,
+    inputs: &[Tensor],
+    outputs: &[Tensor],
+) -> Result<(), AgreementError> {
+    let mut commands = forja_core::CommandList::new();
+    let inputs = inputs.iter().collect::<Vec<_>>();
+    let outputs = outputs.iter().collect::<Vec<_>>();
+    commands
+        .dispatch_many(op, &inputs, &outputs)
         .map_err(|_| BackendError::InvalidInput)?;
     backend.submit(commands)?.wait()?;
     Ok(())

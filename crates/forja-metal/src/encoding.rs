@@ -2328,6 +2328,18 @@ impl MetalBackend {
             Op::QuantMatmul { bits, group_size } => self.encode_quant_matmul(
                 encoder, table, dispatch, bits, group_size, bindings, arguments,
             )?,
+            Op::QuantizedRouter {
+                group_size,
+                k,
+                normalize,
+            } => self.encode_quantized_router(
+                encoder,
+                table,
+                dispatch,
+                (group_size, k, normalize),
+                bindings,
+                arguments,
+            )?,
             Op::GatherQuantMatmul { bits, group_size } => {
                 let (buffers, flag) = self.encode_gather_quant_matmul(
                     encoder, table, dispatch, bits, group_size, bindings, arguments,
@@ -2585,46 +2597,11 @@ impl MetalBackend {
         let scales = self.encoder_tensor(scales)?;
         let biases = self.encoder_tensor(biases)?;
         let output = self.encoder_tensor(dispatch.output())?;
-        let [rows, inner]: [u32; 2] = input
-            .layout
-            .shape()
-            .try_into()
-            .map_err(|_| BackendError::InvalidInput)?;
-        let [columns, packed_width]: [u32; 2] = packed
-            .layout
-            .shape()
-            .try_into()
-            .map_err(|_| BackendError::InvalidInput)?;
-        let mut params = Vec::with_capacity(144);
-        for value in [
-            input.layout.offset(),
-            packed.layout.offset(),
-            scales.layout.offset(),
-            biases.layout.offset(),
-            output.layout.offset(),
-            input.layout.strides()[0],
-            input.layout.strides()[1],
-            packed.layout.strides()[0],
-            packed.layout.strides()[1],
-            scales.layout.strides()[0],
-            scales.layout.strides()[1],
-            biases.layout.strides()[0],
-            biases.layout.strides()[1],
-            output.layout.strides()[0],
-            output.layout.strides()[1],
-        ] {
-            params.extend_from_slice(&value.to_ne_bytes());
-        }
-        for value in [
-            rows,
-            inner,
-            columns,
-            packed_width,
-            u32::from(bits),
+        let (params, [rows, inner, columns]) = Self::quant_matmul_params(
+            [&input, &packed, &scales, &biases, &output],
+            bits,
             group_size,
-        ] {
-            params.extend_from_slice(&value.to_ne_bytes());
-        }
+        )?;
         let params = arguments.write(&params)?;
         let kernel = quant_matmul_kernel(dispatch)?;
         let pipeline = self
@@ -2675,6 +2652,132 @@ impl MetalBackend {
             },
         );
         Ok(vec![params])
+    }
+
+    fn quant_matmul_params(
+        tensors: [&EncoderTensor; 5],
+        bits: u8,
+        group_size: u32,
+    ) -> Result<(Vec<u8>, [u32; 3]), BackendError> {
+        let [input, packed, scales, biases, output] = tensors;
+        let [rows, inner]: [u32; 2] = input
+            .layout
+            .shape()
+            .try_into()
+            .map_err(|_| BackendError::InvalidInput)?;
+        let [columns, packed_width]: [u32; 2] = packed
+            .layout
+            .shape()
+            .try_into()
+            .map_err(|_| BackendError::InvalidInput)?;
+        let mut params = Vec::with_capacity(144);
+        for value in [
+            input.layout.offset(),
+            packed.layout.offset(),
+            scales.layout.offset(),
+            biases.layout.offset(),
+            output.layout.offset(),
+            input.layout.strides()[0],
+            input.layout.strides()[1],
+            packed.layout.strides()[0],
+            packed.layout.strides()[1],
+            scales.layout.strides()[0],
+            scales.layout.strides()[1],
+            biases.layout.strides()[0],
+            biases.layout.strides()[1],
+            output.layout.strides()[0],
+            output.layout.strides()[1],
+        ] {
+            params.extend_from_slice(&value.to_ne_bytes());
+        }
+        for value in [
+            rows,
+            inner,
+            columns,
+            packed_width,
+            u32::from(bits),
+            group_size,
+        ] {
+            params.extend_from_slice(&value.to_ne_bytes());
+        }
+        Ok((params, [rows, inner, columns]))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn encode_quantized_router(
+        &self,
+        encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
+        table: &ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>,
+        dispatch: &Dispatch,
+        config: (u32, u32, bool),
+        bindings: &mut ArgumentBindings,
+        arguments: &mut ArgumentWriter,
+    ) -> Result<Vec<BufferBinding>, BackendError> {
+        use objc2_metal::MTLSize;
+
+        let [input, packed, scales, biases] = dispatch.inputs() else {
+            return Err(BackendError::InvalidInput);
+        };
+        let [logits, weights, indices] = dispatch.outputs() else {
+            return Err(BackendError::InvalidInput);
+        };
+        let tensors = [input, packed, scales, biases, logits, weights, indices]
+            .map(|tensor| self.encoder_tensor(tensor))
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()?;
+        let [input, packed, scales, biases, logits, weights, indices] = tensors.as_slice() else {
+            return Err(BackendError::InvalidInput);
+        };
+        let (group_size, k, normalize) = config;
+        let (params, [rows, inner, _]) =
+            Self::quant_matmul_params([input, packed, scales, biases, logits], 8, group_size)?;
+        let temporaries = vec![
+            arguments.write(&params)?,
+            Self::layout_buffer(&weights.layout, arguments)?,
+            Self::layout_buffer(&indices.layout, arguments)?,
+            arguments.write(&k.to_ne_bytes())?,
+            arguments.write(&u32::from(normalize).to_ne_bytes())?,
+        ];
+        let pipeline = self
+            .pipelines
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?
+            .get(
+                "quantized_router_q8",
+                &[
+                    (0, dtype_code(input.layout.dtype())),
+                    (1, dtype_code(scales.layout.dtype())),
+                    (2, dtype_code(logits.layout.dtype())),
+                    (12, 8),
+                    (13, group_size),
+                    (15, u32::from(inner % 512 == 0) + 1),
+                ],
+            )?;
+        set_pipeline(encoder, &pipeline);
+        for (index, tensor) in [input, packed, scales, biases, logits, weights, indices]
+            .into_iter()
+            .enumerate()
+        {
+            bindings.bind(table, index, &tensor.buffer);
+        }
+        for (index, temporary) in temporaries.iter().enumerate() {
+            bindings.bind(table, index + 7, temporary);
+        }
+        set_argument_table(encoder, table);
+        dispatch_threadgroups(
+            encoder,
+            MTLSize {
+                width: usize::try_from(rows).map_err(|_| BackendError::InvalidInput)?,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: 512,
+                height: 1,
+                depth: 1,
+            },
+        );
+        Ok(temporaries)
     }
 
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -5352,6 +5455,11 @@ impl MetalBackend {
                 arguments.write(8)?;
             }
             Op::QuantMatmul { .. } => arguments.write(144)?,
+            Op::QuantizedRouter { .. } => {
+                for len in [144, 112, 112, 4, 4] {
+                    arguments.write(len)?;
+                }
+            }
             Op::GatherQuantMatmul { .. } => {
                 arguments.write(212)?;
                 arguments.write(8)?;
@@ -5759,6 +5867,7 @@ fn supported_dispatch(dispatch: &Dispatch) -> bool {
         | Op::Matmul
         | Op::GatherMatmul
         | Op::QuantMatmul { .. }
+        | Op::QuantizedRouter { .. }
         | Op::GatherQuantMatmul { .. }
         | Op::GatherQuantMatmulCombine { .. }
         | Op::GatherQuantSiluMul { .. }
@@ -5837,6 +5946,7 @@ fn dispatch_kernel(dispatch: &Dispatch) -> Result<&'static str, BackendError> {
         Op::Matmul => matmul_kernel(dispatch)?,
         Op::GatherMatmul => "gather_gemv",
         Op::QuantMatmul { .. } => quant_matmul_kernel(dispatch)?,
+        Op::QuantizedRouter { .. } => "quantized_router_q8",
         Op::GatherQuantMatmul { .. } => {
             if grouped_gather_dispatch(dispatch) {
                 "grouped_quantized_gemm"
@@ -6496,6 +6606,7 @@ fn nan_preserving_kernel(name: &str) -> bool {
             | "topk_single"
             | "topk_partials"
             | "topk_finalize"
+            | "quantized_router_q8"
             | "sample_rejection_proposal_partials"
             | "sample_rejection_threshold_partials"
             | "sample_rejection_threshold_finalize"

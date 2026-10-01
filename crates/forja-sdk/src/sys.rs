@@ -91,6 +91,11 @@ pub(crate) enum Op {
         bits: u8,
         group_size: u32,
     },
+    QuantizedRouter {
+        group_size: u32,
+        k: u32,
+        normalize: bool,
+    },
     GatherQuantMatmul {
         bits: u8,
         group_size: u32,
@@ -412,6 +417,15 @@ pub(crate) mod guest {
             Op::QuantMatmul { bits, group_size } => {
                 compute::Op::QuantMatmul(compute::QuantMatmulCfg { bits, group_size })
             }
+            Op::QuantizedRouter {
+                group_size,
+                k,
+                normalize,
+            } => compute::Op::QuantizedRouter(compute::QuantizedRouterCfg {
+                group_size,
+                k,
+                normalize,
+            }),
             Op::GatherQuantMatmul { bits, group_size } => {
                 compute::Op::GatherQuantMatmul(compute::QuantMatmulCfg { bits, group_size })
             }
@@ -972,6 +986,15 @@ pub(crate) mod native {
             Op::Matmul => CoreOp::Matmul,
             Op::GatherMatmul => CoreOp::GatherMatmul,
             Op::QuantMatmul { bits, group_size } => CoreOp::QuantMatmul { bits, group_size },
+            Op::QuantizedRouter {
+                group_size,
+                k,
+                normalize,
+            } => CoreOp::QuantizedRouter {
+                group_size,
+                k,
+                normalize,
+            },
             Op::GatherQuantMatmul { bits, group_size } => {
                 CoreOp::GatherQuantMatmul { bits, group_size }
             }

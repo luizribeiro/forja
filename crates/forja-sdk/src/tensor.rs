@@ -509,6 +509,26 @@ impl<T: Element> Tensor<T> {
     where
         T: FloatElement,
     {
+        let result = self.empty_quant_matmul_output(packed, scales, biases, bits, group_size)?;
+        graph::record(
+            sys::Op::QuantMatmul { bits, group_size },
+            &[&self.handle, &packed.handle, &scales.handle, &biases.handle],
+            &result.handle,
+        )?;
+        Ok(result)
+    }
+
+    fn empty_quant_matmul_output<S: FloatElement>(
+        &self,
+        packed: &Tensor<u32>,
+        scales: &Tensor<S>,
+        biases: &Tensor<S>,
+        bits: u8,
+        group_size: u32,
+    ) -> Result<Self>
+    where
+        T: FloatElement,
+    {
         if !matches!(bits, 4 | 8) || !matches!(group_size, 32 | 64 | 128) {
             return Err(Error::new("unsupported affine quantization parameters"));
         }
@@ -540,13 +560,46 @@ impl<T: Element> Tensor<T> {
                 "quantized matmul scale and bias shapes are invalid",
             ));
         }
-        let result = Self::empty(vec![rows, output])?;
-        graph::record(
-            sys::Op::QuantMatmul { bits, group_size },
+        Self::empty(vec![rows, output])
+    }
+
+    /// Multiplies by q8 affine router weights and selects the top routes in one operation.
+    ///
+    /// Returns the full logits, selected weights, and selected indices.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for incompatible q8 weights, more than 128 experts, an invalid route
+    /// count, or a refused dispatch.
+    pub fn quantized_router<S: FloatElement>(
+        &self,
+        packed: &Tensor<u32>,
+        scales: &Tensor<S>,
+        biases: &Tensor<S>,
+        group_size: u32,
+        k: u32,
+        normalize: bool,
+    ) -> Result<(Self, Self, Tensor<u32>)>
+    where
+        T: FloatElement,
+    {
+        let logits = self.empty_quant_matmul_output(packed, scales, biases, 8, group_size)?;
+        let columns = logits.shape[1];
+        if columns > 128 || k == 0 || k > 8 || k > columns {
+            return Err(Error::new("quantized router shape is unsupported"));
+        }
+        let weights = Self::empty(vec![self.shape[0], k])?;
+        let indices = Tensor::<u32>::empty(vec![self.shape[0], k])?;
+        graph::record_many(
+            sys::Op::QuantizedRouter {
+                group_size,
+                k,
+                normalize,
+            },
             &[&self.handle, &packed.handle, &scales.handle, &biases.handle],
-            &result.handle,
+            &[&logits.handle, &weights.handle, &indices.handle],
         )?;
-        Ok(result)
+        Ok((logits, weights, indices))
     }
 
     /// Multiplies rows by affine-quantized expert weights selected by GPU indices.

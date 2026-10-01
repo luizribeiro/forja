@@ -2336,6 +2336,14 @@ impl<B: Backend> Host<B> {
                         quant_matmul_flops(input.layout().shape(), packed.layout().shape())
                     })
             }
+            Op::QuantizedRouter { .. } => {
+                inputs
+                    .first()
+                    .zip(inputs.get(1))
+                    .and_then(|(input, packed)| {
+                        quant_matmul_flops(input.layout().shape(), packed.layout().shape())
+                    })
+            }
             Op::GatherQuantMatmul { .. } => inputs
                 .first()
                 .zip(inputs.get(1))
@@ -3444,6 +3452,11 @@ fn core_op(operation: compute::Op) -> (TemplateOp, Option<Op>) {
         compute::Op::QuantMatmul(config) => concrete_template(Op::QuantMatmul {
             bits: config.bits,
             group_size: config.group_size,
+        }),
+        compute::Op::QuantizedRouter(config) => concrete_template(Op::QuantizedRouter {
+            group_size: config.group_size,
+            k: config.k,
+            normalize: config.normalize,
         }),
         compute::Op::GatherQuantMatmul(config) => concrete_template(Op::GatherQuantMatmul {
             bits: config.bits,

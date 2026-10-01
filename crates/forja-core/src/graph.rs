@@ -126,6 +126,13 @@ impl GraphLimits {
                 .and_then(|(input, packed)| {
                     quant_matmul_flops(input.layout().shape(), packed.layout().shape())
                 }),
+            Op::QuantizedRouter { .. } => dispatch
+                .inputs()
+                .first()
+                .zip(dispatch.inputs().get(1))
+                .and_then(|(input, packed)| {
+                    quant_matmul_flops(input.layout().shape(), packed.layout().shape())
+                }),
             Op::GatherQuantMatmul { .. } => dispatch
                 .inputs()
                 .first()

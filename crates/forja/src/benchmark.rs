@@ -1624,6 +1624,7 @@ const fn op_name(operation: Op) -> &'static str {
         Op::Matmul => "matmul",
         Op::GatherMatmul => "gather-matmul",
         Op::QuantMatmul { .. } => "quant-matmul",
+        Op::QuantizedRouter { .. } => "quantized-router",
         Op::GatherQuantMatmul { .. } => "gather-quant-matmul",
         Op::GatherQuantMatmulCombine { .. } => "gather-quant-matmul-combine",
         Op::GatherQuantSiluMul { .. } => "gather-quant-silu-mul",

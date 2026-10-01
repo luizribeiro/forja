@@ -694,6 +694,22 @@ impl CpuBackend {
         self.write_output(output, &values)
     }
 
+    fn execute_quantized_router(
+        &self,
+        dispatch: &forja_core::Dispatch,
+        group_size: u32,
+        k: u32,
+        normalize: bool,
+    ) -> Result<(), BackendError> {
+        self.execute_quant_matmul(dispatch.inputs(), &dispatch.outputs()[0], 8, group_size)?;
+        self.execute_top_k(
+            &dispatch.outputs()[..1],
+            &dispatch.outputs()[1..],
+            k,
+            normalize,
+        )
+    }
+
     fn execute_gather_quant_matmul(
         &self,
         inputs: &[Tensor],
@@ -1157,6 +1173,11 @@ impl Backend for CpuBackend {
                     bits,
                     group_size,
                 ),
+                Op::QuantizedRouter {
+                    group_size,
+                    k,
+                    normalize,
+                } => self.execute_quantized_router(&dispatch, group_size, k, normalize),
                 Op::GatherQuantMatmul { bits, group_size } => self.execute_gather_quant_matmul(
                     dispatch.inputs(),
                     dispatch.output(),
