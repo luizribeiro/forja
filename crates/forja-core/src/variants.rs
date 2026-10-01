@@ -469,3 +469,242 @@ fn append_display_list<T: fmt::Display>(output: &mut String, values: &[T]) {
         let _ = write!(output, "{value}");
     }
 }
+
+/// Renders stable unversioned JSON from registry definitions.
+#[must_use]
+pub fn render_catalog_json<I>(
+    backend: &str,
+    device: &str,
+    capabilities: &[DeviceCapability],
+    variants: &[VariantDef<I>],
+) -> String {
+    let variants = variants
+        .iter()
+        .map(|variant| {
+            serde_json::json!({
+                "name": variant.name,
+                "computes": variant.operation.to_string(),
+                "constraints": variant.constraints.iter().map(json_constraint).collect::<Vec<_>>(),
+                "use_when": variant.use_when,
+                "avoid_when": variant.avoid_when,
+                "notes": variant.notes,
+                "guarantees": variant.guarantees.to_string(),
+                "lifecycle": variant.lifecycle.to_string(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut output = serde_json::json!({
+        "backend": backend,
+        "device": device,
+        "capabilities": capabilities.iter().map(ToString::to_string).collect::<Vec<_>>(),
+        "variants": variants,
+    })
+    .to_string();
+    output.push('\n');
+    output
+}
+
+fn json_constraint(constraint: &Constraint) -> serde_json::Value {
+    let mut object = serde_json::Map::from_iter([
+        ("kind".to_owned(), constraint_kind(constraint).into()),
+        ("id".to_owned(), constraint.to_string().into()),
+    ]);
+    match constraint {
+        Constraint::DType { tensor, allowed } => {
+            object.insert("tensor".to_owned(), tensor.name.into());
+            object.insert(
+                "allowed".to_owned(),
+                allowed
+                    .iter()
+                    .copied()
+                    .map(dtype_name)
+                    .collect::<Vec<_>>()
+                    .into(),
+            );
+        }
+        Constraint::Rank { tensor, rank } => {
+            object.insert("tensor".to_owned(), tensor.name.into());
+            object.insert("rank".to_owned(), (*rank).into());
+        }
+        Constraint::Value { value, relation } => {
+            append_json_value_ref(&mut object, *value);
+            append_json_relation(&mut object, *relation);
+        }
+        Constraint::DimensionsEqual { left, right } => {
+            object.insert("left".to_owned(), json_dimension(*left));
+            object.insert("right".to_owned(), json_dimension(*right));
+        }
+        Constraint::Layout { tensor, class } => {
+            object.insert("tensor".to_owned(), tensor.name.into());
+            object.insert("layout".to_owned(), class.to_string().into());
+        }
+        Constraint::ByteOffsetAligned { tensor, alignment } => {
+            object.insert("tensor".to_owned(), tensor.name.into());
+            object.insert("alignment".to_owned(), (*alignment).into());
+        }
+        Constraint::Capability(capability) => {
+            object.insert("capability".to_owned(), capability.to_string().into());
+        }
+    }
+    object.into()
+}
+
+const fn constraint_kind(constraint: &Constraint) -> &'static str {
+    match constraint {
+        Constraint::DType { .. } => "dtype",
+        Constraint::Rank { .. } => "rank",
+        Constraint::Value {
+            value: ValueRef::Dimension(_),
+            relation: Relation::Equal(_),
+        } => "dim-equal",
+        Constraint::Value {
+            value: ValueRef::Dimension(_),
+            relation: Relation::Range { .. },
+        } => "dim-range",
+        Constraint::Value {
+            value: ValueRef::Dimension(_),
+            relation: Relation::OneOf(_),
+        } => "dim-one-of",
+        Constraint::Value {
+            value: ValueRef::Dimension(_),
+            relation: Relation::MultipleOf(_),
+        } => "dim-divisible",
+        Constraint::Value {
+            value: ValueRef::Product { .. },
+            ..
+        } => "dim-product",
+        Constraint::Value {
+            value: ValueRef::Quotient { .. },
+            ..
+        } => "dim-quotient",
+        Constraint::Value {
+            value: ValueRef::Operation(_),
+            ..
+        } => "operation-value",
+        Constraint::DimensionsEqual { .. } => "dims-equal",
+        Constraint::Layout { .. } => "layout",
+        Constraint::ByteOffsetAligned { .. } => "offset-alignment",
+        Constraint::Capability(_) => "capability",
+    }
+}
+
+fn append_json_value_ref(output: &mut serde_json::Map<String, serde_json::Value>, value: ValueRef) {
+    match value {
+        ValueRef::Dimension(dimension) => {
+            output.insert("dimension".to_owned(), json_dimension(dimension));
+        }
+        ValueRef::Product { name, left, right } => {
+            output.insert("value".to_owned(), name.into());
+            output.insert("left".to_owned(), json_dimension(left));
+            output.insert("right".to_owned(), json_dimension(right));
+        }
+        ValueRef::Quotient {
+            name,
+            numerator,
+            denominator,
+        } => {
+            output.insert("value".to_owned(), name.into());
+            output.insert("numerator".to_owned(), json_dimension(numerator));
+            output.insert("denominator".to_owned(), json_dimension(denominator));
+        }
+        ValueRef::Operation(value) => {
+            output.insert("value".to_owned(), value.to_string().into());
+        }
+    }
+}
+
+fn json_dimension(dimension: Dimension) -> serde_json::Value {
+    let mut output = serde_json::Map::from_iter([
+        ("name".to_owned(), dimension.name.into()),
+        ("tensor".to_owned(), dimension.tensor.name.into()),
+    ]);
+    match dimension.axis {
+        Axis::Index(axis) => {
+            output.insert("axis".to_owned(), axis.into());
+        }
+        Axis::FromEnd(axis) => {
+            output.insert("axis_from_end".to_owned(), axis.into());
+        }
+    }
+    output.into()
+}
+
+fn append_json_relation(
+    output: &mut serde_json::Map<String, serde_json::Value>,
+    relation: Relation,
+) {
+    match relation {
+        Relation::Equal(value) => {
+            output.insert("equal".to_owned(), value.into());
+        }
+        Relation::Range { min, max } => {
+            output.insert("min".to_owned(), min.into());
+            output.insert("max".to_owned(), max.into());
+        }
+        Relation::OneOf(values) => {
+            output.insert("one_of".to_owned(), serde_json::json!(values));
+        }
+        Relation::MultipleOf(divisor) => {
+            output.insert("multiple_of".to_owned(), divisor.into());
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const INPUT: TensorRef = TensorRef::input("input", 0);
+    const WIDTH: Dimension = Dimension {
+        name: "width",
+        tensor: INPUT,
+        axis: Axis::FromEnd(1),
+    };
+    const CONSTRAINTS: &[Constraint] = &[Constraint::Value {
+        value: ValueRef::Dimension(WIDTH),
+        relation: Relation::Range { min: 1, max: 33 },
+    }];
+    const VARIANTS: &[VariantDef<()>] = &[VariantDef {
+        name: "test.reference",
+        operation: OperationKind::TopK,
+        implementation: (),
+        availability: &[DeviceCapability::Metal4],
+        constraints: CONSTRAINTS,
+        guarantees: Guarantee::Deterministic,
+        use_when: &["testing stable output"],
+        avoid_when: &["production"],
+        notes: &["quotes are escaped: \"yes\""],
+        lifecycle: Lifecycle::Active,
+    }];
+
+    #[test]
+    fn renders_stable_catalogs() {
+        let markdown =
+            render_catalog_markdown("metal", "Test GPU", &[DeviceCapability::Metal4], VARIANTS);
+        assert!(markdown.contains("**Name:** `test.reference`"));
+        assert!(markdown.contains("width is in 1..=33"));
+
+        let json = render_catalog_json(
+            "metal",
+            "Test \\\"GPU",
+            &[DeviceCapability::Metal4],
+            VARIANTS,
+        );
+        assert!(json.contains("\"kind\":\"dim-range\""));
+        assert!(json.contains("Test \\\\\\\"GPU"));
+        assert!(!json.contains("schema_version"));
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["variants"][0]["constraints"][0]["min"], 1);
+        assert_eq!(value["variants"][0]["constraints"][0]["max"], 33);
+        assert_eq!(
+            value["variants"][0]["guarantees"],
+            VARIANTS[0].guarantees.to_string()
+        );
+        assert_eq!(
+            value["variants"][0]["lifecycle"],
+            VARIANTS[0].lifecycle.to_string()
+        );
+        assert!(markdown.contains(&format!("Guarantee: {}", VARIANTS[0].guarantees)));
+        assert!(markdown.contains(&format!("Lifecycle: {}", VARIANTS[0].lifecycle)));
+    }
+}
