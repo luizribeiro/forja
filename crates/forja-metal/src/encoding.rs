@@ -325,8 +325,9 @@ fn gather_quant_combine_params(
     Ok((params, [rows, routes, columns]))
 }
 
-fn grouped_routes(rows: u32, routes: u32) -> bool {
-    u64::from(rows) * u64::from(routes) >= 64
+fn grouped_routes(rows: u32, routes: u32, experts: u32) -> bool {
+    const MAX_GROUPED_EXPERTS: u32 = 256;
+    u64::from(rows) * u64::from(routes) >= 64 && experts <= MAX_GROUPED_EXPERTS
 }
 
 #[derive(Clone, Copy)]
@@ -359,7 +360,6 @@ impl GroupedRouteShape {
 }
 
 fn grouped_gather_dispatch(dispatch: &Dispatch) -> bool {
-    const MAX_GROUPED_EXPERTS: u32 = 256;
     let Some(indices) = dispatch.inputs().last() else {
         return false;
     };
@@ -372,7 +372,7 @@ fn grouped_gather_dispatch(dispatch: &Dispatch) -> bool {
     let [experts, ..] = packed.layout().shape() else {
         return false;
     };
-    grouped_routes(*rows, *routes) && *experts <= MAX_GROUPED_EXPERTS
+    grouped_routes(*rows, *routes, *experts)
 }
 
 fn grouped_error_flag(arguments: &mut ArgumentWriter) -> Result<BufferBinding, BackendError> {
@@ -2806,7 +2806,8 @@ impl MetalBackend {
             [&input, &packed, &scales, &biases, &indices, &output],
             (bits, group_size),
         )?;
-        if grouped_routes(rows, routes) {
+        let experts = packed.layout.shape()[0];
+        if grouped_routes(rows, routes, experts) {
             return self.encode_grouped_quant_matmul(
                 encoder,
                 table,
@@ -2996,7 +2997,8 @@ impl MetalBackend {
             ],
             config,
         )?;
-        if grouped_routes(rows, routes) {
+        let experts = gate_packed.layout.shape()[0];
+        if grouped_routes(rows, routes, experts) {
             return self.encode_grouped_quant_silu_mul(
                 encoder,
                 table,
@@ -6842,6 +6844,13 @@ mod tests {
     use forja_testing::{TensorSpec, assert_backends_agree, assert_outputs_agree};
 
     use super::*;
+
+    #[test]
+    fn grouped_routes_cap_expert_count() {
+        assert!(grouped_routes(8, 8, 256));
+        assert!(!grouped_routes(8, 8, 257));
+        assert!(!grouped_routes(7, 8, 256));
+    }
 
     fn symbolic_prefix(base: &Tensor, space: ParamSpace, len: Affine) -> TemplateTensor {
         let layout = SymbolicLayout::new(base.layout().clone(), space)
