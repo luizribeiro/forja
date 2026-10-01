@@ -238,9 +238,13 @@ fn grouped_matmul_zeros_gpu_written_out_of_range_routes() {
             &output,
         )
         .unwrap();
-    let error = metal.submit(commands).unwrap().wait();
-    assert_eq!(error, Err(BackendError::IndexOutOfRange { index: 7 }));
-    assert_zero_output_after_error(&metal, &output, 33 * 2 * 2 * 4);
+    assert_error_and_zero_output(
+        &metal,
+        metal.submit(commands).unwrap(),
+        &output,
+        33 * 2 * 2 * 4,
+        7,
+    );
 }
 
 #[test]
@@ -279,9 +283,13 @@ fn grouped_silu_zeros_gpu_written_out_of_range_routes() {
             &output,
         )
         .unwrap();
-    let error = metal.submit(commands).unwrap().wait();
-    assert_eq!(error, Err(BackendError::IndexOutOfRange { index: 7 }));
-    assert_zero_output_after_error(&metal, &output, 33 * 2 * 2 * 4);
+    assert_error_and_zero_output(
+        &metal,
+        metal.submit(commands).unwrap(),
+        &output,
+        33 * 2 * 2 * 4,
+        7,
+    );
 }
 
 #[test]
@@ -307,11 +315,13 @@ fn qwen_decode_matmul_zeros_gpu_written_out_of_range_routes() {
                 &output,
             )
             .unwrap();
-        assert_eq!(
-            metal.submit(commands).unwrap().wait(),
-            Err(BackendError::IndexOutOfRange { index: 129 })
+        assert_error_and_zero_output(
+            &metal,
+            metal.submit(commands).unwrap(),
+            &output,
+            output_bytes,
+            129,
         );
-        assert_zero_output_after_error(&metal, &output, output_bytes);
     }
 }
 
@@ -340,11 +350,13 @@ fn qwen_decode_silu_zeros_gpu_written_out_of_range_routes() {
                 &output,
             )
             .unwrap();
-        assert_eq!(
-            metal.submit(commands).unwrap().wait(),
-            Err(BackendError::IndexOutOfRange { index: 129 })
+        assert_error_and_zero_output(
+            &metal,
+            metal.submit(commands).unwrap(),
+            &output,
+            output_bytes,
+            129,
         );
-        assert_zero_output_after_error(&metal, &output, output_bytes);
     }
 }
 
@@ -375,11 +387,13 @@ fn qwen_combined_down_projection_zeros_gpu_written_out_of_range_routes() {
                 &output,
             )
             .unwrap();
-        assert_eq!(
-            metal.submit(commands).unwrap().wait(),
-            Err(BackendError::IndexOutOfRange { index: 129 })
+        assert_error_and_zero_output(
+            &metal,
+            metal.submit(commands).unwrap(),
+            &output,
+            output_bytes,
+            129,
         );
-        assert_zero_output_after_error(&metal, &output, output_bytes);
     }
 }
 
@@ -485,8 +499,18 @@ fn copied_invalid_indices(metal: &MetalBackend, shape: &[u32]) -> forja_core::Te
     indices
 }
 
-fn assert_zero_output_after_error(metal: &MetalBackend, output: &forja_core::Tensor, len: usize) {
-    let _completion_error = metal.read(output);
+fn assert_error_and_zero_output(
+    metal: &MetalBackend,
+    submission: impl Submission,
+    output: &forja_core::Tensor,
+    len: usize,
+    index: u32,
+) {
+    assert_eq!(
+        submission.wait(),
+        Err(BackendError::IndexOutOfRange { index })
+    );
+    drop(submission);
     assert_eq!(metal.read(output).unwrap(), vec![0; len]);
 }
 
