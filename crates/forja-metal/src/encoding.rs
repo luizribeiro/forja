@@ -3459,6 +3459,7 @@ impl MetalBackend {
         let [query_heads, query_length, width] = shape3(&query.layout)?;
         let [kv_heads, key_length, _] = shape3(&key.layout)?;
         let [_, _, value_width] = shape3(&value.layout)?;
+        let fast_f32 = vector_f32_supported(dispatch);
         let two_pass = key_length >= VECTOR_TWO_PASS_MIN_KEY_LENGTH;
         let heads_per_group = query_heads / kv_heads;
         let blocks = if two_pass {
@@ -3481,7 +3482,17 @@ impl MetalBackend {
                 .pipelines
                 .lock()
                 .map_err(|_| BackendError::ExecutionFailed)?
-                .get(vector_kernel("mlx_sdpa_vector", width)?, &constants)?;
+                .get(
+                    vector_kernel(
+                        if fast_f32 {
+                            "mlx_sdpa_vector_f32"
+                        } else {
+                            "mlx_sdpa_vector"
+                        },
+                        width,
+                    )?,
+                    &constants,
+                )?;
             set_pipeline(encoder, &pipeline);
             for (index, tensor) in [&query, &key, &value, &output].into_iter().enumerate() {
                 bindings.bind(table, index, &tensor.buffer);
@@ -3515,7 +3526,17 @@ impl MetalBackend {
             .pipelines
             .lock()
             .map_err(|_| BackendError::ExecutionFailed)?
-            .get(vector_kernel("mlx_sdpa_vector_2pass_1", width)?, &constants)?;
+            .get(
+                vector_kernel(
+                    if fast_f32 {
+                        "mlx_sdpa_vector_2pass_1_f32"
+                    } else {
+                        "mlx_sdpa_vector_2pass_1"
+                    },
+                    width,
+                )?,
+                &constants,
+            )?;
         set_pipeline(encoder, &first);
         for (index, tensor) in [&query, &key, &value, &intermediate, &sums, &maxs]
             .into_iter()
@@ -3549,7 +3570,17 @@ impl MetalBackend {
             .pipelines
             .lock()
             .map_err(|_| BackendError::ExecutionFailed)?
-            .get(vector_kernel("mlx_sdpa_vector_2pass_2", width)?, &constants)?;
+            .get(
+                vector_kernel(
+                    if fast_f32 {
+                        "mlx_sdpa_vector_2pass_2_f32"
+                    } else {
+                        "mlx_sdpa_vector_2pass_2"
+                    },
+                    width,
+                )?,
+                &constants,
+            )?;
         set_pipeline(encoder, &second);
         for (index, tensor) in [&intermediate, &sums, &maxs, &output]
             .into_iter()
@@ -6177,15 +6208,26 @@ fn sdpa_kernel(dispatch: &Dispatch) -> Result<&'static str, BackendError> {
         return Err(BackendError::InvalidInput);
     };
     let width = shape3(query.layout())?[2];
+    let fast_f32 = vector_f32_supported(dispatch);
     Ok(match select_sdpa(dispatch)? {
         SdpaKernel::Vector if shape3(key.layout())?[1] >= VECTOR_TWO_PASS_MIN_KEY_LENGTH => {
-            match width {
-                64 => "mlx_sdpa_vector_2pass_64",
-                128 => "mlx_sdpa_vector_2pass_128",
-                _ => return Err(BackendError::InvalidInput),
-            }
+            vector_kernel(
+                if fast_f32 {
+                    "mlx_sdpa_vector_2pass_f32"
+                } else {
+                    "mlx_sdpa_vector_2pass"
+                },
+                width,
+            )?
         }
-        SdpaKernel::Vector => vector_kernel("mlx_sdpa_vector", width)?,
+        SdpaKernel::Vector => vector_kernel(
+            if fast_f32 {
+                "mlx_sdpa_vector_f32"
+            } else {
+                "mlx_sdpa_vector"
+            },
+            width,
+        )?,
         SdpaKernel::Steel => steel_attention_kernel(width)?,
         SdpaKernel::Decomposed => "sdpa_decomposed",
     })
@@ -6232,6 +6274,17 @@ fn vector_sdpa_supported(dispatch: &Dispatch) -> Result<bool, BackendError> {
         && key_length <= VECTOR_MAX_KEY_LENGTH)
 }
 
+fn vector_f32_supported(dispatch: &Dispatch) -> bool {
+    dispatch
+        .inputs()
+        .iter()
+        .chain(std::iter::once(dispatch.output()))
+        .all(|tensor| {
+            tensor.layout().dtype() == DType::F32
+                && tensor.layout().strides().last().copied() == Some(1)
+        })
+}
+
 fn vector_kernel(prefix: &str, width: u32) -> Result<&'static str, BackendError> {
     match (prefix, width) {
         ("mlx_sdpa_vector", 64) => Ok("mlx_sdpa_vector_64"),
@@ -6240,6 +6293,16 @@ fn vector_kernel(prefix: &str, width: u32) -> Result<&'static str, BackendError>
         ("mlx_sdpa_vector_2pass_1", 128) => Ok("mlx_sdpa_vector_2pass_1_128"),
         ("mlx_sdpa_vector_2pass_2", 64) => Ok("mlx_sdpa_vector_2pass_2_64"),
         ("mlx_sdpa_vector_2pass_2", 128) => Ok("mlx_sdpa_vector_2pass_2_128"),
+        ("mlx_sdpa_vector_2pass", 64) => Ok("mlx_sdpa_vector_2pass_64"),
+        ("mlx_sdpa_vector_2pass", 128) => Ok("mlx_sdpa_vector_2pass_128"),
+        ("mlx_sdpa_vector_f32", 64) => Ok("mlx_sdpa_vector_f32_64"),
+        ("mlx_sdpa_vector_f32", 128) => Ok("mlx_sdpa_vector_f32_128"),
+        ("mlx_sdpa_vector_2pass_f32", 64) => Ok("mlx_sdpa_vector_2pass_f32_64"),
+        ("mlx_sdpa_vector_2pass_f32", 128) => Ok("mlx_sdpa_vector_2pass_f32_128"),
+        ("mlx_sdpa_vector_2pass_1_f32", 64) => Ok("mlx_sdpa_vector_2pass_1_f32_64"),
+        ("mlx_sdpa_vector_2pass_1_f32", 128) => Ok("mlx_sdpa_vector_2pass_1_f32_128"),
+        ("mlx_sdpa_vector_2pass_2_f32", 64) => Ok("mlx_sdpa_vector_2pass_2_f32_64"),
+        ("mlx_sdpa_vector_2pass_2_f32", 128) => Ok("mlx_sdpa_vector_2pass_2_f32_128"),
         _ => Err(BackendError::InvalidInput),
     }
 }
@@ -8293,6 +8356,27 @@ mod tests {
                 TensorSpec::contiguous(DType::F32, &[2, 37, 64]),
             ],
             &TensorSpec::contiguous(DType::F32, &[4, 8, 64]),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn metal_vector_attention_falls_back_for_permuted_f32_inputs() {
+        let _override = SdpaOverride::set(SdpaKernel::Vector);
+        assert_backends_agree(
+            &CpuBackend::new(),
+            &MetalBackend::new().unwrap(),
+            Op::Sdpa {
+                scale: 128.0_f32.sqrt().recip(),
+                causal: true,
+                q_start: 36,
+            },
+            &[
+                TensorSpec::permuted(DType::F32, &[128, 1, 16], &[2, 1, 0]),
+                TensorSpec::permuted(DType::F32, &[128, 37, 8], &[2, 1, 0]),
+                TensorSpec::permuted(DType::F32, &[128, 37, 8], &[2, 1, 0]),
+            ],
+            &TensorSpec::contiguous(DType::F32, &[16, 1, 128]),
         )
         .unwrap();
     }
