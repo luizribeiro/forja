@@ -9,10 +9,10 @@ use forja_sdk::{
     nn::{
         RmsNorm, RmsNormConfig,
         blocks::{
-            KvCache, Taps, cached_attention, projected_cached_attention, qk_norm_rope,
-            qk_norm_rope_kernel, residual_norm, residual_norm_kernel, rms_norm, rms_norm_kernel,
+            KvCache, Taps, cached_attention, qk_norm_rope, qk_norm_rope_kernel, residual_norm,
+            residual_norm_kernel, rms_norm, rms_norm_kernel,
         },
-        moe_combine,
+        moe_combine, moe_router,
     },
 };
 
@@ -228,6 +228,26 @@ impl Attention {
         kernel: &Kernel,
         positions: &Tensor<f32>,
     ) -> Result<(Tensor<f32>, Tensor<f32>, Tensor<f32>)> {
+        if sequence == 1 {
+            let qkv = self.qkv_proj.forward(input)?;
+            let qk = qk_norm_rope(
+                kernel,
+                &qkv.narrow(1, 0, (QUERY_HEADS + KEY_VALUE_HEADS) * HEAD_DIM)?
+                    .reshape(&[sequence, QUERY_HEADS + KEY_VALUE_HEADS, HEAD_DIM])?,
+                &self.decode_norm,
+                positions,
+            )?;
+            return Ok((
+                qk.narrow(1, 0, QUERY_HEADS)?,
+                qk.narrow(1, QUERY_HEADS, KEY_VALUE_HEADS)?,
+                qkv.narrow(
+                    1,
+                    (QUERY_HEADS + KEY_VALUE_HEADS) * HEAD_DIM,
+                    KEY_VALUE_HEADS * HEAD_DIM,
+                )?
+                .reshape(&[sequence, KEY_VALUE_HEADS, HEAD_DIM])?,
+            ));
+        }
         let query = self.q_proj.forward(input)?;
         let key = self.k_proj.forward(input)?;
         Ok((
@@ -317,14 +337,8 @@ impl Load<Config> for SparseMoe {
 
 impl SparseMoe {
     fn route(&self, input: &Tensor<f32>) -> Result<RoutedMoe> {
-        let (logits, weights, indices) = input.quantized_router(
-            &self.gate.packed,
-            &self.gate.scales,
-            &self.gate.biases,
-            QUANT_GROUP,
-            TOP_K,
-            true,
-        )?;
+        let logits = self.gate.forward(input)?;
+        let (weights, indices) = moe_router(&logits, TOP_K, true)?;
         let activated = input.gather_quant_silu_mul(
             &self.gate_proj.packed,
             &self.gate_proj.scales,
@@ -437,33 +451,13 @@ impl DecoderLayer {
             start,
             end,
         } = position;
-        let attended = if sequence == 1 {
-            let qkv = self
-                .self_attn
-                .qkv_proj
-                .forward(normalized_input)?
-                .reshape(&[sequence, QUERY_HEADS + KEY_VALUE_HEADS * 2, HEAD_DIM])?;
-            projected_cached_attention(
-                &qkv,
-                &self.self_attn.decode_norm,
-                activation_positions,
-                cache,
-                QUERY_HEADS,
-                RMS_EPSILON,
-                ROPE_THETA,
-                ATTENTION_SCALE,
-                start,
-                end,
-            )?
-        } else {
-            let (query, key, value) = self.self_attn.project_normalized(
-                normalized_input,
-                sequence,
-                qk_kernel,
-                activation_positions,
-            )?;
-            cached_attention(&query, &key, &value, cache, ATTENTION_SCALE, start, end)?
-        };
+        let (query, key, value) = self.self_attn.project_normalized(
+            normalized_input,
+            sequence,
+            qk_kernel,
+            activation_positions,
+        )?;
+        let attended = cached_attention(&query, &key, &value, cache, ATTENTION_SCALE, start, end)?;
         let (hidden, normalized) = residual_norm(
             residual_kernel,
             input,
