@@ -10,14 +10,15 @@ use super::ops::sdpa;
 pub const DEFAULT_PREFILL_CHUNK: u32 = 512;
 
 const MIN_PREFILL_BUCKET: u32 = 16;
-
-struct PrefillBucket<T: Element> {
-    size: u32,
-    captured: Option<CapturedPrefill<T>>,
-}
+const PREFILL_REPLAYS_PER_GRAPH: u32 = 2;
 
 struct CapturedPrefill<T: Element> {
     graph: Graph<Tensor<T>>,
+}
+
+struct PrefillTail<T: Element> {
+    size: u32,
+    captured: Option<CapturedPrefill<T>>,
 }
 
 /// Lazily captured prefill graphs and their retained token buffer.
@@ -25,11 +26,12 @@ pub struct ChunkedPrefill<T: Element> {
     max_context: u32,
     chunk: u32,
     tokens: Tensor<u32>,
-    buckets: Vec<PrefillBucket<T>>,
+    slots: Vec<Option<CapturedPrefill<T>>>,
+    tails: Vec<PrefillTail<T>>,
 }
 
 impl<T: Element> ChunkedPrefill<T> {
-    /// Allocates a retained token buffer and power-of-two buckets through `chunk`.
+    /// Allocates a retained token buffer and bounded replay slots for each chunk.
     ///
     /// # Errors
     ///
@@ -44,16 +46,16 @@ impl<T: Element> ChunkedPrefill<T> {
                 "prefill chunk must be a power of two from 16 through 512 within the context",
             ));
         }
-        let mut buckets = Vec::new();
+        let slot_count = max_context
+            .div_ceil(chunk)
+            .div_ceil(PREFILL_REPLAYS_PER_GRAPH);
+        let mut tails = Vec::new();
         let mut size = MIN_PREFILL_BUCKET;
-        loop {
-            buckets.push(PrefillBucket {
+        while size < chunk {
+            tails.push(PrefillTail {
                 size,
                 captured: None,
             });
-            if size == chunk {
-                break;
-            }
             size = size
                 .checked_mul(2)
                 .ok_or_else(|| Error::loading("prefill bucket size overflowed"))?;
@@ -61,8 +63,9 @@ impl<T: Element> ChunkedPrefill<T> {
         Ok(Self {
             max_context,
             chunk,
-            tokens: Tensor::zeros(&[chunk])?,
-            buckets,
+            tokens: Tensor::zeros(&[max_context])?,
+            slots: (0..slot_count).map(|_| None).collect(),
+            tails,
         })
     }
 
@@ -75,7 +78,7 @@ impl<T: Element> ChunkedPrefill<T> {
                 .is_some_and(|end| end <= self.max_context)
     }
 
-    /// Writes and replays each chunk, capturing a missing bucket on first use.
+    /// Writes the prompt once and replays each chunk, capturing missing slots on first use.
     ///
     /// Capture is lazy: the first use records one graph for the entire bucket.
     /// Padding follows real tokens, so causal attention and per-token `MoE` routing
@@ -105,27 +108,34 @@ impl<T: Element> ChunkedPrefill<T> {
         }
         let values = tokens.to_vec()?;
         let plan = prefill_plan(sequence, self.chunk)?;
+        self.tokens
+            .write(&staged_tokens(&values, start, self.max_context)?)?;
         let mut consumed = 0_u32;
         let mut position = start;
         let mut result = None;
-        for (real, bucket_size) in plan {
-            let bucket_index = self
-                .buckets
-                .iter()
-                .position(|bucket| bucket.size == bucket_size)
-                .ok_or_else(|| Error::loading("prefill bucket was not allocated"))?;
-            let padded = padded_tokens(&values, consumed, real, self.chunk)?;
-            self.tokens.write(&padded)?;
-            let bucket = &mut self.buckets[bucket_index];
-            if bucket.captured.is_none() {
+        for (slot_index, (real, bucket_size)) in plan.into_iter().enumerate() {
+            let captured = if bucket_size == self.chunk {
+                let slot_index = slot_index % self.slots.len();
+                self.slots
+                    .get_mut(slot_index)
+                    .ok_or_else(|| Error::loading("prefill slot was not allocated"))?
+            } else {
+                &mut self
+                    .tails
+                    .iter_mut()
+                    .find(|tail| tail.size == bucket_size)
+                    .ok_or_else(|| Error::loading("prefill tail was not allocated"))?
+                    .captured
+            };
+            if captured.is_none() {
                 let position_parameter = Param::new(0..=self.max_context - bucket_size)?;
                 let last_parameter = Param::new(0..=bucket_size - 1)?;
                 let trace_start = position_parameter.at(position);
                 let trace_end = (trace_start.clone() + bucket_size)?;
-                let start_dim = trace_start.into();
+                let start_dim: Dim = trace_start.into();
                 let last_dim = last_parameter.at(real - 1).into();
-                let input = self.tokens.narrow(0, 0, bucket_size)?;
                 let graph = crate::capture(&[&position_parameter, &last_parameter], || {
+                    let input = self.tokens.narrow(0, &start_dim, bucket_size)?;
                     forward(&input, bucket_size, &last_dim, &start_dim, &trace_end)
                 })?;
                 if graph.result().shape().len() != 1 {
@@ -133,12 +143,11 @@ impl<T: Element> ChunkedPrefill<T> {
                         "prefill forward must return rank-one logits",
                     ));
                 }
-                bucket.captured = Some(CapturedPrefill { graph });
+                *captured = Some(CapturedPrefill { graph });
             }
-            let graph = &bucket
-                .captured
+            let graph = &captured
                 .as_ref()
-                .ok_or_else(|| Error::loading("prefill graph was not captured"))?
+                .ok_or_else(|| Error::loading("prefill slot was not captured"))?
                 .graph;
             graph.replay(&[position, real - 1])?;
             result = Some(graph.result().alias()?);
@@ -148,11 +157,7 @@ impl<T: Element> ChunkedPrefill<T> {
             position = position
                 .checked_add(real)
                 .ok_or_else(|| Error::loading("prefill position overflowed"))?;
-            if consumed < sequence {
-                crate::eval()?;
-            }
         }
-        crate::eval()?;
         result.ok_or_else(|| Error::loading("prefill produced no logits"))
     }
 
@@ -187,7 +192,17 @@ pub fn lazy_chunked_prefill<T: Element>(
     chunk: u32,
     forward: impl FnMut(&Tensor<u32>, u32, &Dim, &Dim, &Dim) -> Result<Tensor<T>>,
 ) -> Result<Tensor<T>> {
-    let retained = Tensor::zeros(&[chunk])?;
+    let [sequence] = tokens
+        .shape()
+        .try_into()
+        .map_err(|_| Error::loading("prefill tokens must have rank one"))?;
+    let capacity = start
+        .checked_add(
+            padded_prefill_len(sequence, chunk)
+                .ok_or_else(|| Error::loading("prefill capacity overflowed"))?,
+        )
+        .ok_or_else(|| Error::loading("prefill capacity overflowed"))?;
+    let retained = Tensor::zeros(&[capacity])?;
     run_lazy_chunked_prefill(tokens, start, chunk, &retained, forward)
 }
 
@@ -204,12 +219,12 @@ fn run_lazy_chunked_prefill<T: Element>(
         .map_err(|_| Error::loading("prefill tokens must have rank one"))?;
     let values = tokens.to_vec()?;
     let plan = prefill_plan(sequence, chunk)?;
+    retained.write(&staged_tokens(&values, start, retained.shape()[0])?)?;
     let mut consumed = 0_u32;
     let mut position = start;
     let mut result = None;
     for (real, bucket_size) in plan {
-        retained.write(&padded_tokens(&values, consumed, real, chunk)?)?;
-        let input = retained.narrow(0, 0, bucket_size)?;
+        let input = retained.narrow(0, position, bucket_size)?;
         let end = position
             .checked_add(bucket_size)
             .ok_or_else(|| Error::loading("prefill position overflowed"))?;
@@ -250,28 +265,28 @@ fn padded_prefill_len(sequence: u32, chunk: u32) -> Option<u32> {
     })
 }
 
-fn padded_tokens(values: &[u32], consumed: u32, real: u32, capacity: u32) -> Result<Vec<u32>> {
-    let begin = usize::try_from(consumed)
-        .map_err(|_| Error::loading("prefill offset does not fit usize"))?;
+fn staged_tokens(values: &[u32], start: u32, capacity: u32) -> Result<Vec<u32>> {
+    let begin =
+        usize::try_from(start).map_err(|_| Error::loading("prefill offset does not fit usize"))?;
     let end = usize::try_from(
-        consumed
-            .checked_add(real)
+        start
+            .checked_add(
+                u32::try_from(values.len())
+                    .map_err(|_| Error::loading("prefill length does not fit u32"))?,
+            )
             .ok_or_else(|| Error::loading("prefill offset overflowed"))?,
     )
     .map_err(|_| Error::loading("prefill end does not fit usize"))?;
-    let mut padded = vec![
+    let mut staged = vec![
         0_u32;
         usize::try_from(capacity)
-            .map_err(|_| Error::loading("prefill chunk does not fit usize"))?
+            .map_err(|_| Error::loading("prefill capacity does not fit usize"))?
     ];
-    padded[..usize::try_from(real)
-        .map_err(|_| Error::loading("prefill length does not fit usize"))?]
-        .copy_from_slice(
-            values
-                .get(begin..end)
-                .ok_or_else(|| Error::loading("prefill token range is invalid"))?,
-        );
-    Ok(padded)
+    staged
+        .get_mut(begin..end)
+        .ok_or_else(|| Error::loading("prefill token range is invalid"))?
+        .copy_from_slice(values);
+    Ok(staged)
 }
 
 fn prefill_bucket(sequence: u32, chunk: u32) -> Result<u32> {
@@ -596,5 +611,14 @@ mod tests {
                 "sequence {sequence}"
             );
         }
+    }
+
+    #[test]
+    fn staged_tokens_preserve_the_prompt_offset_and_padding() {
+        assert_eq!(
+            staged_tokens(&[7, 11, 13], 2, 8).unwrap(),
+            [0, 0, 7, 11, 13, 0, 0, 0]
+        );
+        assert!(staged_tokens(&[7, 11, 13], 6, 8).is_err());
     }
 }
