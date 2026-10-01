@@ -865,6 +865,7 @@ async fn measure_prefill(
     let before = runner.metrics();
     let started = Instant::now();
     step(runner, tokens.to_vec(), 0).await?;
+    runner.wait_for_queued_submissions().await?;
     sample(before, runner.metrics(), started.elapsed())
 }
 

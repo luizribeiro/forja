@@ -835,6 +835,16 @@ where
         }
     }
 
+    /// Waits for every backend submission queued before this call to complete.
+    ///
+    /// # Errors
+    ///
+    /// Returns a timeout if completion accounting does not advance within the backend deadline.
+    pub async fn wait_for_queued_submissions(&self) -> Result<(), BackendError> {
+        let expected = self.store.data().queued_submissions.load(Ordering::Acquire);
+        self.wait_for_submissions(expected).await
+    }
+
     /// Enables or disables detailed profiling for subsequent steps.
     pub fn set_profiling(&mut self, enabled: bool) {
         self.profiling = enabled;
@@ -1312,6 +1322,7 @@ pub struct Host<B: Backend> {
     live_kernels: Arc<AtomicUsize>,
     live_graphs: Arc<AtomicUsize>,
     gpu_time_ns: Arc<AtomicU64>,
+    queued_submissions: Arc<AtomicU64>,
     completed_submissions: Arc<AtomicU64>,
     timed_submissions: Arc<AtomicU64>,
     completed_gpu_time_ns: Arc<AtomicU64>,
@@ -1345,6 +1356,7 @@ impl<B: Backend> Host<B> {
             live_kernels: Arc::new(AtomicUsize::new(0)),
             live_graphs: Arc::new(AtomicUsize::new(0)),
             gpu_time_ns: Arc::new(AtomicU64::new(0)),
+            queued_submissions: Arc::new(AtomicU64::new(0)),
             completed_submissions: Arc::new(AtomicU64::new(0)),
             timed_submissions: Arc::new(AtomicU64::new(0)),
             completed_gpu_time_ns: Arc::new(AtomicU64::new(0)),
@@ -2171,6 +2183,7 @@ impl<B: Backend> Host<B> {
             timeout: self.limits.submission_timeout,
             gpu_time_budget_ns: duration_ns(self.limits.gpu_time_budget),
             gpu_time_ns: Arc::clone(&self.gpu_time_ns),
+            queued_submissions: Arc::clone(&self.queued_submissions),
             completed_submissions: Arc::clone(&self.completed_submissions),
             timed_submissions: Arc::clone(&self.timed_submissions),
             completed_gpu_time_ns: Arc::clone(&self.completed_gpu_time_ns),
@@ -2203,6 +2216,7 @@ impl<B: Backend> Host<B> {
             timeout: self.limits.submission_timeout,
             gpu_time_budget_ns: duration_ns(self.limits.gpu_time_budget),
             gpu_time_ns: Arc::clone(&self.gpu_time_ns),
+            queued_submissions: Arc::clone(&self.queued_submissions),
             completed_submissions: Arc::clone(&self.completed_submissions),
             timed_submissions: Arc::clone(&self.timed_submissions),
             completed_gpu_time_ns: Arc::clone(&self.completed_gpu_time_ns),
@@ -2467,6 +2481,7 @@ struct SubmitRequest<B: Backend> {
     timeout: Duration,
     gpu_time_budget_ns: u64,
     gpu_time_ns: Arc<AtomicU64>,
+    queued_submissions: Arc<AtomicU64>,
     completed_submissions: Arc<AtomicU64>,
     timed_submissions: Arc<AtomicU64>,
     completed_gpu_time_ns: Arc<AtomicU64>,
@@ -2824,6 +2839,7 @@ where
                 timeout,
                 gpu_time_budget_ns: _,
                 gpu_time_ns: _,
+                queued_submissions,
                 completed_submissions,
                 timed_submissions,
                 completed_gpu_time_ns,
@@ -2849,9 +2865,7 @@ where
             };
             let (submission, reservation, taint) = match submitted {
                 Ok(submitted) => {
-                    if let Some(started) = started {
-                        let _ = started.send(Ok(()));
-                    }
+                    publish_queued_submission(&queued_submissions, started);
                     submitted
                 }
                 Err(error) => {
@@ -2940,6 +2954,16 @@ fn saturating_increment(counter: &AtomicU64) {
     let _ = counter.fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
         Some(value.saturating_add(1))
     });
+}
+
+fn publish_queued_submission(
+    queued_submissions: &AtomicU64,
+    started: Option<tokio::sync::oneshot::Sender<Result<(), BackendError>>>,
+) {
+    saturating_increment(queued_submissions);
+    if let Some(started) = started {
+        let _ = started.send(Ok(()));
+    }
 }
 
 fn saturating_add(counter: &AtomicU64, value: u64) {
@@ -4063,6 +4087,8 @@ mod tests {
         );
         gate.wait_for(1);
         assert_eq!(replay.status.lock().unwrap().in_flight, 1);
+        assert_eq!(host.queued_submissions.load(Ordering::Acquire), 1);
+        assert_eq!(host.engine_metrics().submissions, 0);
         gate.release();
         tokio::time::timeout(Duration::from_secs(1), async {
             while replay.status.lock().unwrap().in_flight != 0 {
