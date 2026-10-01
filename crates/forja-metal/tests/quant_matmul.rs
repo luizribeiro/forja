@@ -41,6 +41,15 @@ fn tiled_qwen_projection_shape_matches_cpu() {
 }
 
 #[test]
+fn qwen_router_shape_matches_cpu() {
+    let reference = CpuBackend::new();
+    let candidate = MetalBackend::new().unwrap();
+    for dtype in [DType::F16, DType::BF16, DType::F32] {
+        assert_decode_projection_case(&reference, &candidate, dtype);
+    }
+}
+
+#[test]
 fn quantized_matmul_matches_cpu_for_strided_views() {
     let reference = CpuBackend::new();
     let candidate = MetalBackend::new().unwrap();
@@ -145,6 +154,28 @@ fn assert_projection_case(
         TensorSpec::contiguous(DType::BF16, &[columns, inner / group_size]),
     ];
     let output = TensorSpec::contiguous(dtype, &[rows, columns]);
+    assert_backends_agree(
+        reference,
+        candidate,
+        Op::QuantMatmul { bits, group_size },
+        &inputs,
+        &output,
+    )
+    .unwrap();
+}
+
+fn assert_decode_projection_case(reference: &CpuBackend, candidate: &MetalBackend, dtype: DType) {
+    let inner = 2048;
+    let columns = 128;
+    let bits = 8;
+    let group_size = 64;
+    let inputs = [
+        TensorSpec::contiguous(dtype, &[1, inner]),
+        TensorSpec::contiguous(DType::U32, &[columns, inner / 4]),
+        TensorSpec::contiguous(DType::BF16, &[columns, inner / group_size]),
+        TensorSpec::contiguous(DType::BF16, &[columns, inner / group_size]),
+    ];
+    let output = TensorSpec::contiguous(dtype, &[1, columns]);
     assert_backends_agree(
         reference,
         candidate,

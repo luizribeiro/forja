@@ -2569,6 +2569,7 @@ impl MetalBackend {
                     (2, dtype_code(output.layout.dtype())),
                     (12, u32::from(bits)),
                     (13, group_size),
+                    (15, u32::from(columns % 8 == 0 && inner % 512 == 0) + 1),
                 ],
             )?;
         set_pipeline(encoder, &pipeline);
@@ -2581,7 +2582,7 @@ impl MetalBackend {
         bindings.bind(table, 5, &params);
         set_argument_table(encoder, table);
         let (column_tile, row_tile, threads) = match kernel {
-            "quantized_gemv" => (16, 1, 64),
+            "quantized_gemv" => (if bits == 8 { 16 } else { 8 }, 1, 64),
             "quantized_gemm_tiled_f32"
             | "quantized_gemm_tiled_f16"
             | "quantized_gemm_tiled_bf16" => (32, 32, 128),
