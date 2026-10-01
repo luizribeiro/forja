@@ -88,17 +88,6 @@ const QWEN_RMS_EPSILON: f32 = 1.0e-6;
 const QWEN_ROPE_THETA: f32 = 1.0e6;
 
 #[forja_sdk::kernel(row)]
-fn macro_residual_norm(
-    residual: forja_sdk::kernel::Row,
-    update: forja_sdk::kernel::Row,
-    weight: forja_sdk::kernel::Row,
-) -> (forja_sdk::kernel::Row, forja_sdk::kernel::Row) {
-    let value = residual + update;
-    let inverse_rms = (value * value).row_mean() + QWEN_RMS_EPSILON;
-    (value, value * inverse_rms.rsqrt() * weight)
-}
-
-#[forja_sdk::kernel(row)]
 fn macro_final_norm(
     input: forja_sdk::kernel::Row,
     weight: forja_sdk::kernel::Row,
@@ -474,11 +463,7 @@ fn helper_expansion_caps_name_the_kernel() {
 
 #[test]
 fn qwen_norm_programs_preserve_interpreter_bits() -> Result<(), Box<dyn Error>> {
-    let residual = macro_residual_norm_program(
-        2,
-        &[DType::F32, DType::F32, DType::F32],
-        &[DType::F32, DType::F32],
-    )?;
+    let residual = forja_sdk::nn::blocks::residual_norm_kernel(DType::F32, QWEN_RMS_EPSILON)?;
     let hand = RowCtx::new();
     let value = hand.input(0) + hand.input(1);
     hand.output(0, value);

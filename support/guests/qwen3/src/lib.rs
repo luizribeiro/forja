@@ -31,7 +31,7 @@ use forja_sdk::{
     kernel::{Kernel, TensorRef},
     nn::{
         Embedding, EmbeddingConfig, Linear, LinearConfig, RmsNorm, RmsNormConfig, WeightElement,
-        blocks::{KvCache, Taps, cached_attention},
+        blocks::{KvCache, Taps, cached_attention, residual_norm, residual_norm_kernel},
     },
 };
 
@@ -215,7 +215,7 @@ impl FusedKernels {
                 qk_norm_rope_program(3, &[dtype; 5], &[dtype; 2])
             })?,
             residual_norm: load_kernel(FUSE_RESIDUAL_NORM, || {
-                residual_norm_program(2, &[dtype; 3], &[dtype; 2])
+                residual_norm_kernel(dtype, RMS_EPSILON)
             })?,
             final_norm: load_kernel(FUSE_FINAL_NORM, || {
                 final_norm_program(2, &[dtype; 2], &[dtype])
@@ -327,7 +327,7 @@ impl<T: Activation> DecoderLayer<T> {
         let attended = cached_attention(&query, &key, &value, cache, ATTENTION_SCALE, start, end)?;
         let attention = self.self_attn.o_proj.forward(&attended)?;
         let (hidden, normalized) = if FUSE_RESIDUAL_NORM {
-            run_residual_norm(
+            residual_norm(
                 kernels.residual_norm()?,
                 input,
                 &attention,
@@ -348,7 +348,7 @@ impl<T: Activation> DecoderLayer<T> {
         let projected = self.mlp.down_proj.forward(&activated)?;
         if FUSE_RESIDUAL_NORM && let Some(norm) = following_norm {
             let (residual, normalized) =
-                run_residual_norm(kernels.residual_norm()?, &hidden, &projected, norm.weight())?;
+                residual_norm(kernels.residual_norm()?, &hidden, &projected, norm.weight())?;
             Ok((residual, Some(normalized)))
         } else {
             let residual = (&hidden + &projected)?;
@@ -407,22 +407,6 @@ fn run_silu_mul<T: Activation>(
     Ok(output)
 }
 
-fn run_residual_norm<T: Activation>(
-    kernel: &Kernel,
-    residual: &Tensor<T>,
-    update: &Tensor<T>,
-    weight: &Tensor<T>,
-) -> Result<(Tensor<T>, Tensor<T>)> {
-    let weight = weight.broadcast_as(residual.shape())?;
-    let inputs = [
-        TensorRef::new(residual)?,
-        TensorRef::new(update)?,
-        TensorRef::new(&weight)?,
-    ];
-    let [value, normalized] = forja_sdk::kernel::run::<T, 2>(kernel, &inputs)?;
-    Ok((value, normalized))
-}
-
 fn run_final_norm<T: Activation>(
     kernel: &Kernel,
     input: &Tensor<T>,
@@ -454,17 +438,6 @@ fn qk_norm_rope(
         normalized_lo * cosine - normalized_hi * sine,
         normalized_hi * cosine + normalized_lo * sine,
     )
-}
-
-#[forja_sdk::kernel(row)]
-fn residual_norm(
-    residual: forja_sdk::kernel::Row,
-    update: forja_sdk::kernel::Row,
-    weight: forja_sdk::kernel::Row,
-) -> (forja_sdk::kernel::Row, forja_sdk::kernel::Row) {
-    let value = residual + update;
-    let inverse_rms = (value * value).row_mean() + RMS_EPSILON;
-    (value, value * inverse_rms.rsqrt() * weight)
 }
 
 #[forja_sdk::kernel(row)]

@@ -2,7 +2,10 @@
 
 #[cfg(target_family = "wasm")]
 use crate::SamplingParams;
-use crate::{Dim, Element, Error, Graph, Param, Result, Tensor};
+use crate::{
+    DType, Dim, Element, Error, FloatElement, Graph, Param, Result, Tensor,
+    kernel::{Kernel, TensorRef},
+};
 
 use super::ops::sdpa;
 
@@ -11,6 +14,48 @@ pub const DEFAULT_PREFILL_CHUNK: u32 = 512;
 
 const MIN_PREFILL_BUCKET: u32 = 16;
 const PREFILL_REPLAYS_PER_GRAPH: u32 = 2;
+
+/// Builds the row program that combines a residual addition with RMS normalization.
+///
+/// # Errors
+///
+/// Returns an error when the kernel definition is refused.
+pub fn residual_norm_kernel(dtype: DType, epsilon: f32) -> Result<Kernel> {
+    residual_norm_rows_program(2, &[dtype; 3], &[dtype; 2], epsilon)
+}
+
+/// Adds an update to a residual and returns both the sum and its RMS-normalized value.
+///
+/// # Errors
+///
+/// Returns an error for incompatible tensors or a refused kernel dispatch.
+pub fn residual_norm<T: FloatElement>(
+    kernel: &Kernel,
+    residual: &Tensor<T>,
+    update: &Tensor<T>,
+    weight: &Tensor<T>,
+) -> Result<(Tensor<T>, Tensor<T>)> {
+    let weight = weight.broadcast_as(residual.shape())?;
+    let inputs = [
+        TensorRef::new(residual)?,
+        TensorRef::new(update)?,
+        TensorRef::new(&weight)?,
+    ];
+    let [value, normalized] = crate::kernel::run::<T, 2>(kernel, &inputs)?;
+    Ok((value, normalized))
+}
+
+#[crate::kernel::kernel(row)]
+fn residual_norm_rows(
+    residual: crate::kernel::Row,
+    update: crate::kernel::Row,
+    weight: crate::kernel::Row,
+    epsilon: f32,
+) -> (crate::kernel::Row, crate::kernel::Row) {
+    let value = residual + update;
+    let inverse_rms = (value * value).row_mean() + epsilon;
+    (value, value * inverse_rms.rsqrt() * weight)
+}
 
 struct CapturedPrefill<T: Element> {
     graph: Graph<Tensor<T>>,
