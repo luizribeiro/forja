@@ -2582,7 +2582,9 @@ impl MetalBackend {
         set_argument_table(encoder, table);
         let (column_tile, row_tile, threads) = match kernel {
             "quantized_gemv" => (16, 1, 64),
-            "quantized_gemm_tiled" => (32, 32, 128),
+            "quantized_gemm_tiled_f32"
+            | "quantized_gemm_tiled_f16"
+            | "quantized_gemm_tiled_bf16" => (32, 32, 128),
             _ => (8, 8, 256),
         };
         dispatch_threadgroups(
@@ -5699,7 +5701,12 @@ fn quant_matmul_kernel(dispatch: &Dispatch) -> Result<&'static str, BackendError
             .iter()
             .all(|tensor| tensor.layout().is_contiguous())
     {
-        Ok("quantized_gemm_tiled")
+        match input.layout().dtype() {
+            DType::F32 => Ok("quantized_gemm_tiled_f32"),
+            DType::F16 => Ok("quantized_gemm_tiled_f16"),
+            DType::BF16 => Ok("quantized_gemm_tiled_bf16"),
+            DType::I32 | DType::U32 => Err(BackendError::InvalidInput),
+        }
     } else {
         Ok("quantized_gemm_small_m")
     }

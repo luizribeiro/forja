@@ -883,43 +883,145 @@ void load_quantized_weight_tile(
     }
 }
 
-kernel void quantized_gemm_tiled(
+template <typename T, uint block_inner, uint block_columns, uint tile_stride>
+void load_transposed_quantized_weight_tile(
+    device const uchar *packed,
+    device const uchar *scales,
+    device const uchar *biases,
+    constant QuantMatmulParams &params,
+    uint inner_origin,
+    uint column_origin,
+    threadgroup T *tile,
+    uint thread_index,
+    uint thread_count) {
+    uint values_per_word = 32 / quant_bits;
+    uint words_per_column = block_inner / values_per_word;
+    uint mask = (1u << quant_bits) - 1u;
+    for (uint linear = thread_index;
+         linear < block_columns * words_per_column;
+         linear += thread_count) {
+        uint local_column = linear / words_per_column;
+        uint local_word = linear % words_per_column;
+        uint column = column_origin + local_column;
+        uint inner = inner_origin + local_word * values_per_word;
+        uint word = 0;
+        float scale = 0.0f;
+        float bias = 0.0f;
+        if (inner < params.inner && column < params.columns) {
+            word = load_uint(
+                packed,
+                params.packed_offset + ulong(column) * params.packed_row_stride +
+                    ulong(inner / values_per_word) * params.packed_word_stride);
+            uint group = inner / quant_group_size;
+            scale = load_float(
+                scales,
+                params.scale_offset + ulong(column) * params.scale_row_stride +
+                    ulong(group) * params.scale_group_stride,
+                input1_dtype);
+            bias = load_float(
+                biases,
+                params.bias_offset + ulong(column) * params.bias_row_stride +
+                    ulong(group) * params.bias_group_stride,
+                input1_dtype);
+        }
+        #pragma clang loop unroll(full)
+        for (uint element = 0; element < values_per_word; ++element) {
+            float value = inner + element < params.inner
+                ? scale * float((word >> (element * quant_bits)) & mask) + bias
+                : 0.0f;
+            tile[local_column * tile_stride + local_word * values_per_word + element] =
+                T(value);
+        }
+    }
+}
+
+struct alignas(16) QuantizedGemmRead16 {
+    uchar bytes[16];
+};
+
+template <typename T, uint tile_stride>
+void load_quantized_gemm_input_tile(
+    device const uchar *input,
+    constant QuantMatmulParams &params,
+    uint row_origin,
+    uint inner_origin,
+    threadgroup T *tile,
+    uint thread_index,
+    uint thread_count) {
+    constexpr uint block_rows = 32;
+    constexpr uint block_inner = 32;
+    constexpr uint elements_per_thread = block_rows * block_inner / 128;
+    constexpr uint vector_elements = 16 / sizeof(T);
+    constexpr uint reads_per_thread = elements_per_thread / vector_elements;
+    if (thread_count == 128 && row_origin + block_rows <= params.rows &&
+        inner_origin + block_inner <= params.inner &&
+        params.input_offset % vector_elements == 0 &&
+        params.input_row_stride % vector_elements == 0) {
+        uint local_row = thread_index / 4;
+        uint local_inner = (thread_index % 4) * elements_per_thread;
+        device const T *source = reinterpret_cast<device const T *>(input) +
+            params.input_offset + ulong(row_origin + local_row) * params.input_row_stride +
+            inner_origin + local_inner;
+        threadgroup T *destination = tile + local_row * tile_stride + local_inner;
+        #pragma clang loop unroll(full)
+        for (uint read = 0; read < reads_per_thread; ++read) {
+            *reinterpret_cast<threadgroup QuantizedGemmRead16 *>(
+                destination + read * vector_elements) =
+                *reinterpret_cast<device const QuantizedGemmRead16 *>(
+                    source + read * vector_elements);
+        }
+        return;
+    }
+    for (uint linear = thread_index;
+         linear < block_rows * block_inner;
+         linear += thread_count) {
+        uint local_row = linear / block_inner;
+        uint local_inner = linear % block_inner;
+        uint row = row_origin + local_row;
+        uint inner = inner_origin + local_inner;
+        tile[local_row * tile_stride + local_inner] =
+            row < params.rows && inner < params.inner
+                ? T(load_float(
+                    input,
+                    params.input_offset + ulong(row) * params.input_row_stride +
+                        ulong(inner) * params.input_inner_stride,
+                    input0_dtype))
+                : T(0.0f);
+    }
+}
+
+template <typename T>
+void quantized_gemm_tiled_impl(
     device const uchar *input [[buffer(0)]],
     device const uchar *packed [[buffer(1)]],
     device const uchar *scales [[buffer(2)]],
     device const uchar *biases [[buffer(3)]],
     device uchar *output [[buffer(4)]],
     constant QuantMatmulParams &params [[buffer(5)]],
-    uint thread_index [[thread_index_in_threadgroup]],
-    uint3 threadgroup_size [[threads_per_threadgroup]],
-    ushort simdgroup [[simdgroup_index_in_threadgroup]],
-    ushort lane [[thread_index_in_simdgroup]],
-    uint3 tile [[threadgroup_position_in_grid]]) {
+    uint thread_index,
+    uint thread_count,
+    ushort simdgroup,
+    ushort lane,
+    uint3 tile,
+    threadgroup T *input_tile,
+    threadgroup T *weight_tile) {
     constexpr uint block_rows = 32;
     constexpr uint block_columns = 32;
     constexpr uint block_inner = 32;
-    threadgroup float input_tile[block_rows * block_inner];
-    threadgroup float weight_tile[block_inner * block_columns];
-    BlockMMA<float, block_rows, block_columns, block_inner, 2, 2> mma(simdgroup, lane);
+    constexpr uint tile_stride = block_inner + 16 / sizeof(T);
+    BlockMMA<
+        T, block_rows, block_columns, block_inner, 2, 2,
+        tile_stride, tile_stride, true, float> mma(simdgroup, lane);
     uint row_origin = tile.y * block_rows;
     uint column_origin = tile.x * block_columns;
-    uint thread_count = threadgroup_size.x * threadgroup_size.y * threadgroup_size.z;
     for (uint inner_origin = 0; inner_origin < params.inner; inner_origin += block_inner) {
-        BlockLoader<block_rows, block_inner>::load(
-            input, params.input_offset,
-            params.input_row_stride, params.input_inner_stride, input0_dtype,
-            row_origin, inner_origin, params.rows, params.inner,
-            row_origin + block_rows <= params.rows,
-            inner_origin + block_inner <= params.inner,
+        load_quantized_gemm_input_tile<T, tile_stride>(
+            input, params, row_origin, inner_origin,
             input_tile, thread_index, thread_count);
-        load_quantized_weight_tile<float, block_inner, block_columns>(
-            packed, scales, biases,
-            params.packed_offset, params.scale_offset, params.bias_offset,
-            params.packed_row_stride, params.packed_word_stride,
-            params.scale_row_stride, params.scale_group_stride,
-            params.bias_row_stride, params.bias_group_stride,
-            inner_origin, column_origin, params.inner, params.columns,
-            weight_tile, thread_index, thread_count);
+        load_transposed_quantized_weight_tile<
+            T, block_inner, block_columns, tile_stride>(
+            packed, scales, biases, params,
+            inner_origin, column_origin, weight_tile, thread_index, thread_count);
         threadgroup_barrier(mem_flags::mem_threadgroup);
         mma.multiply(input_tile, weight_tile);
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -928,3 +1030,29 @@ kernel void quantized_gemm_tiled(
         output, params.output_offset, params.output_row_stride,
         row_origin, column_origin, params.rows, params.columns, output_dtype);
 }
+
+#define quantized_gemm_tiled_kernel(name, type)                                    \
+kernel void name(                                                                  \
+    device const uchar *input [[buffer(0)]],                                        \
+    device const uchar *packed [[buffer(1)]],                                       \
+    device const uchar *scales [[buffer(2)]],                                       \
+    device const uchar *biases [[buffer(3)]],                                       \
+    device uchar *output [[buffer(4)]],                                             \
+    constant QuantMatmulParams &params [[buffer(5)]],                               \
+    uint thread_index [[thread_index_in_threadgroup]],                              \
+    uint3 threadgroup_size [[threads_per_threadgroup]],                             \
+    ushort simdgroup [[simdgroup_index_in_threadgroup]],                            \
+    ushort lane [[thread_index_in_simdgroup]],                                      \
+    uint3 tile [[threadgroup_position_in_grid]]) {                                  \
+    constexpr uint tile_stride = 32 + 16 / sizeof(type);                            \
+    threadgroup type input_tile[32 * tile_stride];                                  \
+    threadgroup type weight_tile[32 * tile_stride];                                 \
+    quantized_gemm_tiled_impl<type>(                                                \
+        input, packed, scales, biases, output, params, thread_index,                \
+        threadgroup_size.x * threadgroup_size.y * threadgroup_size.z,               \
+        simdgroup, lane, tile, input_tile, weight_tile);                            \
+}
+
+quantized_gemm_tiled_kernel(quantized_gemm_tiled_f32, float)
+quantized_gemm_tiled_kernel(quantized_gemm_tiled_f16, half)
+quantized_gemm_tiled_kernel(quantized_gemm_tiled_bf16, bfloat)
