@@ -29,6 +29,24 @@ fn main() -> ExitCode {
 }
 
 fn run(command: args::Command) -> Result<(), Box<dyn Error>> {
+    if let args::Command::Catalog(options) = command {
+        if options.backend == args::Backend::Cpu {
+            return Err("cpu exposes no selectable algorithm variants".into());
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let backend = forja_metal::MetalBackend::new()?;
+            let output = if options.json {
+                backend.variant_catalog_json()
+            } else {
+                backend.variant_catalog_markdown()
+            };
+            print!("{output}");
+            return Ok(());
+        }
+        #[cfg(not(target_os = "macos"))]
+        return Err("metal is available only on macOS".into());
+    }
     if let args::Command::Config(options) = command {
         print!("{}", config_show::render(&options)?);
         return Ok(());
@@ -38,6 +56,7 @@ fn run(command: args::Command) -> Result<(), Box<dyn Error>> {
         .build()?;
     match command {
         args::Command::Bench(options) => runtime.block_on(benchmark::run(&options)),
+        args::Command::Catalog(_) => unreachable!("catalog commands return before runtime"),
         args::Command::Config(_) => unreachable!("configuration commands return before runtime"),
         args::Command::Profile(options) => runtime.block_on(profile::run(&options)),
         args::Command::Run(options) => runtime.block_on(generate::run(&options)),

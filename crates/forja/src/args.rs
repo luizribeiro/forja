@@ -237,10 +237,24 @@ enum AxisClass {
 #[derive(Debug, PartialEq)]
 pub(crate) enum Command {
     Bench(Bench),
+    Catalog(Catalog),
     Config(ConfigShow),
     Profile(Profile),
     Run(Run),
     Verify(Verify),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct Catalog {
+    pub(crate) backend: Backend,
+    pub(crate) json: bool,
+}
+
+#[derive(Args)]
+struct CatalogArgs {
+    /// Print JSON instead of Markdown.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Args)]
@@ -300,6 +314,8 @@ struct Cli {
 enum ParsedCommand {
     /// Benchmark one or more engines.
     Bench(BenchArgs),
+    /// List selectable backend algorithms and their constraints.
+    Catalog(CatalogArgs),
     /// Inspect configuration.
     Config(ConfigArgs),
     /// Profile one inference phase.
@@ -374,6 +390,13 @@ fn parse_with(
             limits,
             rerun.map(|(_, record)| record),
         )?),
+        ParsedCommand::Catalog(options) => Command::Catalog(Catalog {
+            backend: match layered.config.backend.kind {
+                BackendKind::Metal => Backend::Metal,
+                BackendKind::Cpu => Backend::Cpu,
+            },
+            json: options.json,
+        }),
         ParsedCommand::Config(options) => match options.command {
             ConfigCommand::Show(options) => Command::Config(ConfigShow {
                 layered,
@@ -617,7 +640,7 @@ impl ParsedCommand {
                 values.extend(backend_sugar(options.backend));
                 values.extend(graph_replay_sugar(options.graph_replay));
             }
-            Self::Config(_) | Self::Profile(_) => {}
+            Self::Catalog(_) | Self::Config(_) | Self::Profile(_) => {}
         }
         values
             .into_iter()
@@ -1015,6 +1038,25 @@ mod tests {
             |_| Ok(vec![layer]),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn parses_catalog_format_and_backend() {
+        assert_eq!(
+            parse(["--isolated", "catalog", "--json"].map(str::to_owned)).unwrap(),
+            Command::Catalog(Catalog {
+                backend: Backend::Metal,
+                json: true,
+            })
+        );
+        assert_eq!(
+            parse(["--isolated", "--set", "backend.kind=\"cpu\"", "catalog"].map(str::to_owned))
+                .unwrap(),
+            Command::Catalog(Catalog {
+                backend: Backend::Cpu,
+                json: false,
+            })
+        );
     }
 
     #[test]
