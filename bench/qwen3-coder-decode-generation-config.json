@@ -5,12 +5,12 @@
   "auto_notes": [],
   "axes": {},
   "config": "[backend]\nkind = \"metal\"\n\n[backend.metal]\ngraph_replay = \"tier2\"\n\n[bench]\nbreakdown = true\ncontexts = [9, 512, 2048, 4000]\ndecode_prefill = 8\npp = 512\nreps = 5\nselection = [\"gpu-pipelined\"]\ntg = 128\nwarmups = 1\n\n[bench.sampling]\nseed = 0\ntemperature = 0.699999988079071\ntop_k = 20\ntop_p = 0.800000011920929\n\n[bench.vary]\n\n[limits]\ndispatches_per_list = 4096\ngpu_time_budget = \"3600000ms\"\nguest_call_timeout = \"300000ms\"\nguest_memory_bytes = 4294967296\ninstances = 10000\nlive_bytes = 51539607552\nlive_graphs = 16\nlive_kernels = 64\nlive_tensor_handles = 20000\nread_bytes = 1073741824\nsubmission_timeout = \"60000ms\"\ntable_elements = 10000\ntensor_elements = 1000000000\ntensor_rank = 4\nwork_per_dispatch = \"unlimited\"\n\n[run]\nmax_tokens = 128\ntemperature = 0.0\ntop_k = 0\ntop_p = 1.0\n\n[verify]\nprompts = []\n",
-  "config_hash": "sha256:feda3e4cabe1a1c4c23e1d3165426241a6d29fb63ff012fc02577015af7a3cc0",
+  "config_hash": "sha256:bfbf9e8fd9adc87196a94caf39177b17f62671abe11147e8c0cd8d33ef0d752d",
   "implementation": "forja",
   "inputs": [
     {
       "engine_build_profile": "release",
-      "engine_sha256": "d1d263530d3306f42beff1df38ac58ac4aad4a1c3f34e4e96f16939e88e93411",
+      "engine_sha256": "417b66e8ef3a52eafb1fae18e069a8011deb57dadc3b47b15b21bca7b126ae51",
       "engine_variant": "qwen3-coder",
       "model_revision": null,
       "profile_hash": null,
@@ -53,137 +53,102 @@
     "run.top_p": "config file",
     "verify.prompts": "config file"
   },
-  "perf_hash": "sha256:9a4a90394d53be9a33db94beabd92f7ba4917bb9727a9ee0ec488745b0cc5bd0",
+  "perf_hash": "sha256:b6ad355579c4834e607220cf5bdc39aa17a63a8e49bf2ea9a1edf8f5385c097a",
   "provenance": {
-    "binary_sha256": "25e1f52238d0fb4d5766cb83e41e7fd94d7692c0116633a9ebaa0231a97066bd",
-    "commit": "edd1187807dc14222f92a0b8fce178742f27880c",
-    "date": "2026-10-01T16:24Z",
+    "binary_sha256": "df7f753e4f7b14b4331b20b47d1989f68100f726a02f4b76ca24f6e0efce85ad",
+    "commit": "63bc886ee90e39e007621933718e80c58943c563",
+    "date": "2026-10-01T18:20Z",
     "device": "Apple M3 Ultra",
-    "dirty": false,
-    "duration_s": 128,
+    "dirty": true,
+    "duration_s": 126,
     "gpu_cores": 80,
     "machine_load": {
       "after": {
         "busiest_processes": [
           {
             "command": "WindowServer",
-            "cpu_percent": 20.0,
+            "cpu_percent": 17.6,
             "pid": 588
           },
           {
             "command": "ScreensharingAgent",
-            "cpu_percent": 14.5,
+            "cpu_percent": 10.8,
             "pid": 98939
           },
           {
             "command": "python3.13",
-            "cpu_percent": 4.9,
+            "cpu_percent": 4.2,
             "pid": 904
           },
           {
             "command": "python3.13",
-            "cpu_percent": 4.9,
+            "cpu_percent": 4.2,
             "pid": 905
           },
           {
-            "command": "tccd",
-            "cpu_percent": 4.8,
-            "pid": 18155
-          },
-          {
-            "command": "XprotectService",
-            "cpu_percent": 2.8,
-            "pid": 39889
-          },
-          {
             "command": "replayd",
-            "cpu_percent": 2.5,
+            "cpu_percent": 4.2,
             "pid": 39057
           },
           {
             "command": "msb",
-            "cpu_percent": 1.2,
+            "cpu_percent": 2.1,
             "pid": 29099
           },
           {
-            "command": "screensharingd",
-            "cpu_percent": 1.1,
-            "pid": 98938
+            "command": "codex",
+            "cpu_percent": 2.0,
+            "pid": 42243
           }
         ],
         "gpu_device_percent": 99.0,
         "load_average": [
-          4.52,
-          4.3,
-          4.77
+          2.1,
+          6.42,
+          8.01
         ]
       },
       "before": {
         "busiest_processes": [
           {
+            "command": "msb",
+            "cpu_percent": 43.4,
+            "pid": 29099
+          },
+          {
             "command": "WindowServer",
-            "cpu_percent": 27.9,
+            "cpu_percent": 20.5,
             "pid": 588
           },
           {
             "command": "ScreensharingAgent",
-            "cpu_percent": 16.5,
+            "cpu_percent": 13.4,
             "pid": 98939
           },
           {
             "command": "python3.13",
-            "cpu_percent": 6.4,
+            "cpu_percent": 6.0,
             "pid": 904
           },
           {
             "command": "python3.13",
-            "cpu_percent": 6.4,
+            "cpu_percent": 6.0,
             "pid": 905
           },
           {
-            "command": "claude bg-spare",
-            "cpu_percent": 4.5,
-            "pid": 17008
-          },
-          {
-            "command": "msb",
-            "cpu_percent": 3.9,
-            "pid": 29099
+            "command": "codex",
+            "cpu_percent": 3.8,
+            "pid": 42243
           },
           {
             "command": "replayd",
-            "cpu_percent": 3.5,
+            "cpu_percent": 2.7,
             "pid": 39057
           },
           {
-            "command": "codex",
-            "cpu_percent": 2.8,
-            "pid": 72424
-          },
-          {
             "command": "claude",
-            "cpu_percent": 1.8,
+            "cpu_percent": 2.3,
             "pid": 9990
-          },
-          {
-            "command": "screensharingd",
-            "cpu_percent": 1.7,
-            "pid": 98938
-          },
-          {
-            "command": "claude bg-pty-host",
-            "cpu_percent": 1.4,
-            "pid": 16992
-          },
-          {
-            "command": "tmux",
-            "cpu_percent": 1.3,
-            "pid": 1236
-          },
-          {
-            "command": "node",
-            "cpu_percent": 1.3,
-            "pid": 27299
           },
           {
             "command": "python3.13",
@@ -191,16 +156,16 @@
             "pid": 903
           },
           {
-            "command": "claude",
-            "cpu_percent": 1.0,
-            "pid": 73061
+            "command": "screensharingd",
+            "cpu_percent": 1.1,
+            "pid": 98938
           }
         ],
-        "gpu_device_percent": 8.0,
+        "gpu_device_percent": 31.0,
         "load_average": [
-          1.85,
-          3.52,
-          4.59
+          4.43,
+          8.94,
+          9.04
         ]
       }
     },
@@ -209,16 +174,16 @@
   "results": [
     {
       "input": 0,
-      "output_digest": "sha256:c4a039bc11b978b2ef6c33c55fa7d473e22e8af136fc185c0f5836d1a44f0789",
-      "perf_hash": "sha256:29143d7bb43646d29079b8dd93d9eee2826536f2b43362afa47a46506b6b7eb9",
+      "output_digest": "sha256:fa1d856e74d10a653a65e9b8ff34fa8cd7cd613265caf74455c7f60e47c44267",
+      "perf_hash": "sha256:e614cab5e8b6381d60422508373f63d491bf26d27b73f9b4fa01d8bdba4f2ca7",
       "point": {},
       "pp": {
         "gpu_time_seconds": {
           "ci95": [
-            0.391057083,
-            0.391661708
+            0.391859916,
+            0.39241125
           ],
-          "median": 0.391205
+          "median": 0.392322583
         },
         "submissions": {
           "ci95": [
@@ -230,25 +195,25 @@
         "tokens_per_second": {
           "gpu": {
             "ci95": [
-              1307.2505929019744,
-              1309.271771967879
+              1304.7536226344173,
+              1306.589368023036
             ],
-            "median": 1308.7767283137996
+            "median": 1305.048503924639
           },
           "wall": {
             "ci95": [
-              1132.983056426484,
-              1229.957636127123
+              1116.4682226900277,
+              1233.4747449491028
             ],
-            "median": 1225.5405503913144
+            "median": 1222.7317038487836
           }
         },
         "wall_time_seconds": {
           "ci95": [
-            0.4162745,
-            0.451904375
+            0.415087542,
+            0.458588959
           ],
-          "median": 0.417774834
+          "median": 0.418734542
         }
       },
       "sampling_fallbacks": [
@@ -297,10 +262,10 @@
       "tg": {
         "gpu_time_seconds": {
           "ci95": [
-            1.313501371,
-            1.333253665
+            1.337749418,
+            1.348554375
           ],
-          "median": 1.316541991
+          "median": 1.345174914
         },
         "submissions": {
           "ci95": [
@@ -312,25 +277,25 @@
         "tokens_per_second": {
           "gpu": {
             "ci95": [
-              96.00573646276082,
-              97.4494605228699
+              94.91645451819471,
+              95.6830915249929
             ],
-            "median": 97.22439608840399
+            "median": 95.15491157903053
           },
           "wall": {
             "ci95": [
-              95.30525147370604,
-              96.78750548919372
+              94.38582251206944,
+              95.09735370186702
             ],
-            "median": 96.58932469670228
+            "median": 94.52587198039917
           }
         },
         "wall_time_seconds": {
           "ci95": [
-            1.32248475,
-            1.343052959
+            1.345989084,
+            1.356135875
           ],
-          "median": 1.325198208
+          "median": 1.354126625
         }
       }
     }
