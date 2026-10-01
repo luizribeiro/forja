@@ -14,8 +14,11 @@ pub fn moe_router<T: FloatElement>(
     k: u32,
     normalize: bool,
 ) -> Result<(Tensor<T>, Tensor<u32>)> {
-    let probabilities = logits.softmax_last_dim()?;
-    probabilities.top_k_with_normalization(k, normalize)
+    if normalize {
+        logits.top_k_with_normalization(k, true)
+    } else {
+        logits.softmax_last_dim()?.top_k(k)
+    }
 }
 
 /// Combines routed expert outputs with their per-route weights.

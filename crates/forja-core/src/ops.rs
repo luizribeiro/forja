@@ -156,7 +156,7 @@ pub enum Op {
     TopK {
         /// Number of elements selected from each row.
         k: u32,
-        /// Whether selected values are divided by their row sum.
+        /// Whether selected logits are softmax-normalized over the selected set.
         normalize: bool,
     },
     /// Samples one index from each row using counter-based randomness.

@@ -415,6 +415,7 @@ kernel void topk_single(
     threadgroup uint partial_indices[32];
     threadgroup ulong group_candidates[64];
     threadgroup ulong selected[64];
+    threadgroup float normalization_maximum;
     threadgroup float denominator;
     if (width <= group_width) {
         ulong candidate = 0;
@@ -477,11 +478,15 @@ kernel void topk_single(
     if (lane == 0) {
         denominator = 1.0f;
         if (normalize != 0) {
+            uint maximum_index = ~uint(selected[0]);
+            normalization_maximum = load_float(
+                input, physical_index(input_layout, row * width + maximum_index), input0_dtype);
             denominator = 0.0f;
             for (uint slot = 0; slot < k; ++slot) {
                 uint index = ~uint(selected[slot]);
-                denominator += load_float(
+                float value = load_float(
                     input, physical_index(input_layout, row * width + index), input0_dtype);
+                denominator += exp(value - normalization_maximum);
             }
         }
     }
@@ -493,7 +498,11 @@ kernel void topk_single(
         uint value_index = physical_index(values_layout, output_index);
         if (normalize != 0) {
             float value = load_float(input, input_index, input0_dtype);
-            store_float(values, value_index, output_dtype, value / denominator);
+            store_float(
+                values,
+                value_index,
+                output_dtype,
+                exp(value - normalization_maximum) / denominator);
         } else {
             copy_value(input, values, input_index, value_index);
         }
@@ -552,12 +561,17 @@ kernel void topk_finalize(
         }
     }
     float denominator = 1.0f;
+    float maximum = 0.0f;
     if (normalize != 0) {
+        uint maximum_index = ~uint(selected[0]);
+        maximum = load_float(
+            input, physical_index(input_layout, row * width + maximum_index), input0_dtype);
         denominator = 0.0f;
         for (uint slot = 0; slot < k; ++slot) {
             uint index = ~uint(selected[slot]);
-            denominator += load_float(
+            float value = load_float(
                 input, physical_index(input_layout, row * width + index), input0_dtype);
+            denominator += exp(value - maximum);
         }
     }
     for (uint slot = 0; slot < k; ++slot) {
@@ -567,7 +581,7 @@ kernel void topk_finalize(
         uint value_index = physical_index(values_layout, output_index);
         if (normalize != 0) {
             float value = load_float(input, input_index, input0_dtype);
-            store_float(values, value_index, output_dtype, value / denominator);
+            store_float(values, value_index, output_dtype, exp(value - maximum) / denominator);
         } else {
             copy_value(input, values, input_index, value_index);
         }

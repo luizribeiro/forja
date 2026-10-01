@@ -358,6 +358,10 @@ impl CpuBackend {
             }
             if normalize {
                 let selected = &mut selected_values[selected_start..];
+                let maximum = selected[0];
+                for value in &mut *selected {
+                    *value = (*value - maximum).exp();
+                }
                 let sum = selected.iter().sum::<f32>();
                 for value in selected {
                     *value /= sum;
@@ -1796,7 +1800,12 @@ mod tests {
             );
         }
         let (values, indices) = run_top_k(&backend, &[1.0, 4.0, 2.0, 3.0], 4, 2, true);
-        assert_relative(&values, &[4.0 / 7.0, 3.0 / 7.0], 1e-6);
+        let denominator = 1.0 + (-1.0_f32).exp();
+        assert_relative(
+            &values,
+            &[1.0 / denominator, (-1.0_f32).exp() / denominator],
+            1e-6,
+        );
         assert_eq!(indices, [1, 3]);
     }
 
