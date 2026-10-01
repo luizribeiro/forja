@@ -1,0 +1,1228 @@
+{
+  "allow_diff": [],
+  "auto_notes": [
+    "backend.metal.graph_replay: auto -> tier2 (Apple M3 Ultra/macOS 26.6.2 @b057d0da5a659f99036a696d7efcbfe4f26f3105)"
+  ],
+  "axes": {
+    "bench.pp": [
+      37,
+      512,
+      700,
+      1500,
+      2048,
+      4000
+    ]
+  },
+  "config": "[backend]\nkind = \"metal\"\n\n[backend.metal]\ngraph_replay = \"tier2\"\n\n[bench]\nbreakdown = false\ncontexts = [9, 512, 2048, 4000]\ndecode_prefill = 8\npp = 512\nreps = 5\nselection = [\"gpu-sequential\", \"gpu-pipelined\"]\ntg = 128\nwarmups = 1\n\n[bench.sampling]\nseed = 0\ntemperature = 0.0\ntop_k = 0\ntop_p = 1.0\n\n[bench.vary]\n\"bench.pp\" = [37, 512, 700, 1500, 2048, 4000]\n\n[limits]\ndispatches_per_list = 4096\ngpu_time_budget = \"3600000ms\"\nguest_call_timeout = \"300000ms\"\nguest_memory_bytes = 4294967296\ninstances = 10000\nlive_bytes = 51539607552\nlive_graphs = 16\nlive_kernels = 64\nlive_tensor_handles = 20000\nread_bytes = 1073741824\nsubmission_timeout = \"60000ms\"\ntable_elements = 10000\ntensor_elements = 1000000000\ntensor_rank = 4\nwork_per_dispatch = \"unlimited\"\n\n[run]\nmax_tokens = 128\ntemperature = 0.0\ntop_k = 0\ntop_p = 1.0\n\n[verify]\nprompts = []\n",
+  "config_hash": "sha256:19d570916e705d32222396f44fef67aad9face1cd4c7735b5c8f8116751c72e2",
+  "implementation": "forja",
+  "inputs": [
+    {
+      "engine_build_profile": "release",
+      "engine_sha256": "d90301fa21636be994917320961413134311035a1a6e7271903be29de9f8cce9",
+      "engine_variant": "olmoe",
+      "model_revision": null,
+      "profile_hash": null,
+      "weights_sha256": "0e2e1e0d8d357ac7af817cff28410c3dbad398f060c517a433e4076b2aae5579"
+    }
+  ],
+  "origins": {
+    "backend.kind": "default",
+    "backend.metal.graph_replay": "auto",
+    "bench.breakdown": "default",
+    "bench.contexts": "config file",
+    "bench.decode_prefill": "config file",
+    "bench.pp": "config file",
+    "bench.reps": "config file",
+    "bench.sampling.seed": "default",
+    "bench.sampling.temperature": "default",
+    "bench.sampling.top_k": "default",
+    "bench.sampling.top_p": "default",
+    "bench.selection": "config file",
+    "bench.tg": "config file",
+    "bench.vary.bench.pp": "--vary",
+    "bench.warmups": "config file",
+    "limits.dispatches_per_list": "default",
+    "limits.gpu_time_budget": "default",
+    "limits.guest_call_timeout": "default",
+    "limits.guest_memory_bytes": "default",
+    "limits.instances": "default",
+    "limits.live_bytes": "--set #1",
+    "limits.live_graphs": "default",
+    "limits.live_kernels": "default",
+    "limits.live_tensor_handles": "default",
+    "limits.read_bytes": "default",
+    "limits.submission_timeout": "default",
+    "limits.table_elements": "default",
+    "limits.tensor_elements": "default",
+    "limits.tensor_rank": "default",
+    "limits.work_per_dispatch": "default",
+    "run.max_tokens": "default",
+    "run.temperature": "default",
+    "run.top_k": "default",
+    "run.top_p": "default",
+    "verify.prompts": "default"
+  },
+  "perf_hash": "sha256:54d459f2da66bfca48ad638ca21274622df56beaa138432f34897f88515b0119",
+  "provenance": {
+    "binary_sha256": "97000fd8e55b3e15373a19fd1f40df5d5db3216d827351da2f6389b7c28302d7",
+    "commit": "b057d0da5a659f99036a696d7efcbfe4f26f3105",
+    "date": "2026-10-01T09:06Z",
+    "device": "Apple M3 Ultra",
+    "dirty": false,
+    "duration_s": 305,
+    "gpu_cores": 80,
+    "machine_load": {
+      "after": {
+        "busiest_processes": [
+          {
+            "command": "XprotectService",
+            "cpu_percent": 83.5,
+            "pid": 39889
+          },
+          {
+            "command": "syspolicyd",
+            "cpu_percent": 46.3,
+            "pid": 39558
+          },
+          {
+            "command": "tccd",
+            "cpu_percent": 13.3,
+            "pid": 18155
+          },
+          {
+            "command": "msb",
+            "cpu_percent": 5.4,
+            "pid": 29099
+          },
+          {
+            "command": "python3.13",
+            "cpu_percent": 3.9,
+            "pid": 904
+          },
+          {
+            "command": "python3.13",
+            "cpu_percent": 3.9,
+            "pid": 905
+          }
+        ],
+        "gpu_device_percent": 96.0,
+        "load_average": [
+          9.23,
+          5.98,
+          4.77
+        ]
+      },
+      "before": {
+        "busiest_processes": [
+          {
+            "command": "XprotectService",
+            "cpu_percent": 69.0,
+            "pid": 39889
+          },
+          {
+            "command": "syspolicyd",
+            "cpu_percent": 50.7,
+            "pid": 39558
+          },
+          {
+            "command": "tccd",
+            "cpu_percent": 9.1,
+            "pid": 18155
+          },
+          {
+            "command": "msb",
+            "cpu_percent": 8.4,
+            "pid": 29099
+          },
+          {
+            "command": "python3.13",
+            "cpu_percent": 4.0,
+            "pid": 904
+          },
+          {
+            "command": "python3.13",
+            "cpu_percent": 4.0,
+            "pid": 905
+          },
+          {
+            "command": "sleep",
+            "cpu_percent": 1.6,
+            "pid": 92540
+          },
+          {
+            "command": "codex",
+            "cpu_percent": 1.5,
+            "pid": 82566
+          }
+        ],
+        "gpu_device_percent": 0.0,
+        "load_average": [
+          5.34,
+          3.62,
+          3.79
+        ]
+      }
+    },
+    "macos": "26.6.2"
+  },
+  "results": [
+    {
+      "input": 0,
+      "output_digest": "sha256:fb526da16ebb3766a494aadeee19ecf1959bfad5fb34a4b7615407db45485198",
+      "perf_hash": "sha256:b30f07dd76a20e709736907c755f5c32ba927573d0abf4b53024e001be89d6a1",
+      "point": {
+        "bench.pp": 37
+      },
+      "pp": {
+        "gpu_time_seconds": {
+          "ci95": [
+            0.142135041,
+            0.142868541
+          ],
+          "median": 0.142392166
+        },
+        "submissions": {
+          "ci95": [
+            1.0,
+            1.0
+          ],
+          "median": 1.0
+        },
+        "tokens_per_second": {
+          "gpu": {
+            "ci95": [
+              258.97933681565354,
+              260.31582176839845
+            ],
+            "median": 259.8457558402476
+          },
+          "wall": {
+            "ci95": [
+              255.07580690973748,
+              256.28889127645465
+            ],
+            "median": 255.58259565691537
+          }
+        },
+        "wall_time_seconds": {
+          "ci95": [
+            0.144368333,
+            0.145054917
+          ],
+          "median": 0.144767291
+        }
+      },
+      "sampling_fallbacks": [],
+      "selection": "gpu-sequential",
+      "tg": {
+        "gpu_time_seconds": {
+          "ci95": [
+            1.3408352080000001,
+            1.356197579
+          ],
+          "median": 1.344149541
+        },
+        "submissions": {
+          "ci95": [
+            128.0,
+            128.0
+          ],
+          "median": 128.0
+        },
+        "tokens_per_second": {
+          "gpu": {
+            "ci95": [
+              94.38152816522613,
+              95.46288703958317
+            ],
+            "median": 95.22749969082496
+          },
+          "wall": {
+            "ci95": [
+              79.9721472006078,
+              81.99066719195696
+            ],
+            "median": 81.66040270345286
+          }
+        },
+        "wall_time_seconds": {
+          "ci95": [
+            1.561153292,
+            1.60055725
+          ],
+          "median": 1.5674671660000001
+        }
+      }
+    },
+    {
+      "input": 0,
+      "output_digest": "sha256:fb526da16ebb3766a494aadeee19ecf1959bfad5fb34a4b7615407db45485198",
+      "perf_hash": "sha256:b30f07dd76a20e709736907c755f5c32ba927573d0abf4b53024e001be89d6a1",
+      "point": {
+        "bench.pp": 37
+      },
+      "pp": {
+        "gpu_time_seconds": {
+          "ci95": [
+            0.143442916,
+            0.144910041
+          ],
+          "median": 0.144106291
+        },
+        "submissions": {
+          "ci95": [
+            1.0,
+            1.0
+          ],
+          "median": 1.0
+        },
+        "tokens_per_second": {
+          "gpu": {
+            "ci95": [
+              255.33082279646862,
+              257.9423301740464
+            ],
+            "median": 256.7549254320896
+          },
+          "wall": {
+            "ci95": [
+              246.79699028535674,
+              254.30412655251038
+            ],
+            "median": 252.94295366627892
+          }
+        },
+        "wall_time_seconds": {
+          "ci95": [
+            0.145495083,
+            0.149920791
+          ],
+          "median": 0.146278042
+        }
+      },
+      "sampling_fallbacks": [],
+      "selection": "gpu-pipelined",
+      "tg": {
+        "gpu_time_seconds": {
+          "ci95": [
+            1.337288543,
+            1.3655169169999999
+          ],
+          "median": 1.344952875
+        },
+        "submissions": {
+          "ci95": [
+            128.0,
+            128.0
+          ],
+          "median": 128.0
+        },
+        "tokens_per_second": {
+          "gpu": {
+            "ci95": [
+              93.73739600473951,
+              95.71606716442196
+            ],
+            "median": 95.17062075502088
+          },
+          "wall": {
+            "ci95": [
+              91.84645086808221,
+              95.20283101862017
+            ],
+            "median": 94.62957447874147
+          }
+        },
+        "wall_time_seconds": {
+          "ci95": [
+            1.344497833,
+            1.393630334
+          ],
+          "median": 1.352642667
+        }
+      }
+    },
+    {
+      "input": 0,
+      "output_digest": "sha256:fb526da16ebb3766a494aadeee19ecf1959bfad5fb34a4b7615407db45485198",
+      "perf_hash": "sha256:34baafde976051380cba5eab3c75664d9df792fc518dd4f54f5b7481a0bbf57b",
+      "point": {
+        "bench.pp": 512
+      },
+      "pp": {
+        "gpu_time_seconds": {
+          "ci95": [
+            0.566226708,
+            0.570458125
+          ],
+          "median": 0.567142041
+        },
+        "submissions": {
+          "ci95": [
+            1.0,
+            1.0
+          ],
+          "median": 1.0
+        },
+        "tokens_per_second": {
+          "gpu": {
+            "ci95": [
+              897.5242486028225,
+              904.231454938717
+            ],
+            "median": 902.772079984104
+          },
+          "wall": {
+            "ci95": [
+              895.3362299512185,
+              901.9072387524175
+            ],
+            "median": 900.736862568138
+          }
+        },
+        "wall_time_seconds": {
+          "ci95": [
+            0.567685875,
+            0.571852208
+          ],
+          "median": 0.5684235
+        }
+      },
+      "sampling_fallbacks": [],
+      "selection": "gpu-sequential",
+      "tg": {
+        "gpu_time_seconds": {
+          "ci95": [
+            1.34106733,
+            1.343567041
+          ],
+          "median": 1.341998163
+        },
+        "submissions": {
+          "ci95": [
+            128.0,
+            128.0
+          ],
+          "median": 128.0
+        },
+        "tokens_per_second": {
+          "gpu": {
+            "ci95": [
+              95.26878532591215,
+              95.44636360651631
+            ],
+            "median": 95.38016036762637
+          },
+          "wall": {
+            "ci95": [
+              80.86229315600718,
+              82.59093572545935
+            ],
+            "median": 82.07887844342537
+          }
+        },
+        "wall_time_seconds": {
+          "ci95": [
+            1.549806875,
+            1.5829380419999999
+          ],
+          "median": 1.5594755
+        }
+      }
+    },
+    {
+      "input": 0,
+      "output_digest": "sha256:fb526da16ebb3766a494aadeee19ecf1959bfad5fb34a4b7615407db45485198",
+      "perf_hash": "sha256:34baafde976051380cba5eab3c75664d9df792fc518dd4f54f5b7481a0bbf57b",
+      "point": {
+        "bench.pp": 512
+      },
+      "pp": {
+        "gpu_time_seconds": {
+          "ci95": [
+            0.567536625,
+            0.574336083
+          ],
+          "median": 0.568490416
+        },
+        "submissions": {
+          "ci95": [
+            1.0,
+            1.0
+          ],
+          "median": 1.0
+        },
+        "tokens_per_second": {
+          "gpu": {
+            "ci95": [
+              891.4641011680959,
+              902.1444210759086
+            ],
+            "median": 900.6308384273623
+          },
+          "wall": {
+            "ci95": [
+              889.1917821895831,
+              899.895224601413
+            ],
+            "median": 898.2068099250976
+          }
+        },
+        "wall_time_seconds": {
+          "ci95": [
+            0.568955125,
+            0.575803792
+          ],
+          "median": 0.570024625
+        }
+      },
+      "sampling_fallbacks": [],
+      "selection": "gpu-pipelined",
+      "tg": {
+        "gpu_time_seconds": {
+          "ci95": [
+            1.340898707,
+            1.352557715
+          ],
+          "median": 1.345109039
+        },
+        "submissions": {
+          "ci95": [
+            128.0,
+            128.0
+          ],
+          "median": 128.0
+        },
+        "tokens_per_second": {
+          "gpu": {
+            "ci95": [
+              94.63551801188757,
+              95.45836634176126
+            ],
+            "median": 95.1595716694905
+          },
+          "wall": {
+            "ci95": [
+              94.10220267319538,
+              94.91219648604276
+            ],
+            "median": 94.61003664660639
+          }
+        },
+        "wall_time_seconds": {
+          "ci95": [
+            1.348614875,
+            1.360223208
+          ],
+          "median": 1.352922
+        }
+      }
+    },
+    {
+      "input": 0,
+      "output_digest": "sha256:fb526da16ebb3766a494aadeee19ecf1959bfad5fb34a4b7615407db45485198",
+      "perf_hash": "sha256:eca42d5235e3504b826e5bea2056fe032a9732ecd42d6b17c0b68ec9a73de854",
+      "point": {
+        "bench.pp": 700
+      },
+      "pp": {
+        "gpu_time_seconds": {
+          "ci95": [
+            0.900537707,
+            0.904685082
+          ],
+          "median": 0.904446624
+        },
+        "submissions": {
+          "ci95": [
+            2.0,
+            2.0
+          ],
+          "median": 2.0
+        },
+        "tokens_per_second": {
+          "gpu": {
+            "ci95": [
+              773.749909142417,
+              777.3133701774022
+            ],
+            "median": 773.9539088599661
+          },
+          "wall": {
+            "ci95": [
+              730.7021245314587,
+              776.0080121807362
+            ],
+            "median": 772.63776896332
+          }
+        },
+        "wall_time_seconds": {
+          "ci95": [
+            0.902052542,
+            0.957982708
+          ],
+          "median": 0.905987292
+        }
+      },
+      "sampling_fallbacks": [],
+      "selection": "gpu-sequential",
+      "tg": {
+        "gpu_time_seconds": {
+          "ci95": [
+            1.339996503,
+            1.341459796
+          ],
+          "median": 1.340263539
+        },
+        "submissions": {
+          "ci95": [
+            128.0,
+            128.0
+          ],
+          "median": 128.0
+        },
+        "tokens_per_second": {
+          "gpu": {
+            "ci95": [
+              95.41843921202391,
+              95.52263734527074
+            ],
+            "median": 95.50360528012544
+          },
+          "wall": {
+            "ci95": [
+              81.96532354530761,
+              82.57503804983564
+            ],
+            "median": 82.35064332103819
+          }
+        },
+        "wall_time_seconds": {
+          "ci95": [
+            1.55010525,
+            1.561636
+          ],
+          "median": 1.554329084
+        }
+      }
+    },
+    {
+      "input": 0,
+      "output_digest": "sha256:fb526da16ebb3766a494aadeee19ecf1959bfad5fb34a4b7615407db45485198",
+      "perf_hash": "sha256:eca42d5235e3504b826e5bea2056fe032a9732ecd42d6b17c0b68ec9a73de854",
+      "point": {
+        "bench.pp": 700
+      },
+      "pp": {
+        "gpu_time_seconds": {
+          "ci95": [
+            0.903253708,
+            0.912463291
+          ],
+          "median": 0.904566082
+        },
+        "submissions": {
+          "ci95": [
+            2.0,
+            2.0
+          ],
+          "median": 2.0
+        },
+        "tokens_per_second": {
+          "gpu": {
+            "ci95": [
+              767.1541495470419,
+              774.9760602145238
+            ],
+            "median": 773.8516996484067
+          },
+          "wall": {
+            "ci95": [
+              765.7624686015099,
+              773.5702723380446
+            ],
+            "median": 771.340867107001
+          }
+        },
+        "wall_time_seconds": {
+          "ci95": [
+            0.904895166,
+            0.914121583
+          ],
+          "median": 0.907510583
+        }
+      },
+      "sampling_fallbacks": [],
+      "selection": "gpu-pipelined",
+      "tg": {
+        "gpu_time_seconds": {
+          "ci95": [
+            1.339373625,
+            1.352051581
+          ],
+          "median": 1.3443763309999999
+        },
+        "submissions": {
+          "ci95": [
+            128.0,
+            128.0
+          ],
+          "median": 128.0
+        },
+        "tokens_per_second": {
+          "gpu": {
+            "ci95": [
+              94.67094436243997,
+              95.5670603114945
+            ],
+            "median": 95.21143525696304
+          },
+          "wall": {
+            "ci95": [
+              94.101447425457,
+              95.0363021968792
+            ],
+            "median": 94.65395567569706
+          }
+        },
+        "wall_time_seconds": {
+          "ci95": [
+            1.34685375,
+            1.360234125
+          ],
+          "median": 1.35229425
+        }
+      }
+    },
+    {
+      "input": 0,
+      "output_digest": "sha256:fb526da16ebb3766a494aadeee19ecf1959bfad5fb34a4b7615407db45485198",
+      "perf_hash": "sha256:f04959127212cba1068d695fb77fdeba8131225956922207b344feb4c0c5ed7a",
+      "point": {
+        "bench.pp": 1500
+      },
+      "pp": {
+        "gpu_time_seconds": {
+          "ci95": [
+            1.754362708,
+            1.767089957
+          ],
+          "median": 1.756459124
+        },
+        "submissions": {
+          "ci95": [
+            3.0,
+            3.0
+          ],
+          "median": 3.0
+        },
+        "tokens_per_second": {
+          "gpu": {
+            "ci95": [
+              848.8532199835257,
+              855.0113344064539
+            ],
+            "median": 853.9908384454951
+          },
+          "wall": {
+            "ci95": [
+              839.720535094288,
+              848.4216882036155
+            ],
+            "median": 846.9880751137258
+          }
+        },
+        "wall_time_seconds": {
+          "ci95": [
+            1.76798875,
+            1.786308584
+          ],
+          "median": 1.77098125
+        }
+      },
+      "sampling_fallbacks": [],
+      "selection": "gpu-sequential",
+      "tg": {
+        "gpu_time_seconds": {
+          "ci95": [
+            1.341449827,
+            1.355231208
+          ],
+          "median": 1.342079705
+        },
+        "submissions": {
+          "ci95": [
+            128.0,
+            128.0
+          ],
+          "median": 128.0
+        },
+        "tokens_per_second": {
+          "gpu": {
+            "ci95": [
+              94.44882854262016,
+              95.41914831526532
+            ],
+            "median": 95.37436526543705
+          },
+          "wall": {
+            "ci95": [
+              75.98587968645138,
+              82.25946176605923
+            ],
+            "median": 81.48512797868312
+          }
+        },
+        "wall_time_seconds": {
+          "ci95": [
+            1.556052,
+            1.6845235
+          ],
+          "median": 1.570838792
+        }
+      }
+    },
+    {
+      "input": 0,
+      "output_digest": "sha256:fb526da16ebb3766a494aadeee19ecf1959bfad5fb34a4b7615407db45485198",
+      "perf_hash": "sha256:f04959127212cba1068d695fb77fdeba8131225956922207b344feb4c0c5ed7a",
+      "point": {
+        "bench.pp": 1500
+      },
+      "pp": {
+        "gpu_time_seconds": {
+          "ci95": [
+            1.753861999,
+            1.7697179159999998
+          ],
+          "median": 1.759223833
+        },
+        "submissions": {
+          "ci95": [
+            3.0,
+            3.0
+          ],
+          "median": 3.0
+        },
+        "tokens_per_second": {
+          "gpu": {
+            "ci95": [
+              847.592707537465,
+              855.2554310745403
+            ],
+            "median": 852.648748762148
+          },
+          "wall": {
+            "ci95": [
+              840.5214456530898,
+              848.2820062632902
+            ],
+            "median": 845.4094793651398
+          }
+        },
+        "wall_time_seconds": {
+          "ci95": [
+            1.768279875,
+            1.7846064579999998
+          ],
+          "median": 1.774288125
+        }
+      },
+      "sampling_fallbacks": [],
+      "selection": "gpu-pipelined",
+      "tg": {
+        "gpu_time_seconds": {
+          "ci95": [
+            1.3437552529999999,
+            1.352342873
+          ],
+          "median": 1.3462169529999999
+        },
+        "submissions": {
+          "ci95": [
+            128.0,
+            128.0
+          ],
+          "median": 128.0
+        },
+        "tokens_per_second": {
+          "gpu": {
+            "ci95": [
+              94.65055242687703,
+              95.25544158003007
+            ],
+            "median": 95.08125693615449
+          },
+          "wall": {
+            "ci95": [
+              94.0635719862204,
+              94.70778036083958
+            ],
+            "median": 94.55008040276608
+          }
+        },
+        "wall_time_seconds": {
+          "ci95": [
+            1.3515257090000001,
+            1.360781834
+          ],
+          "median": 1.353779917
+        }
+      }
+    },
+    {
+      "input": 0,
+      "output_digest": "sha256:fb526da16ebb3766a494aadeee19ecf1959bfad5fb34a4b7615407db45485198",
+      "perf_hash": "sha256:04e2f893d37b1d2f05b082f856ea56217fdd33a6a39216d0ba7b9c575657c417",
+      "point": {
+        "bench.pp": 2048
+      },
+      "pp": {
+        "gpu_time_seconds": {
+          "ci95": [
+            2.365706957,
+            2.378854998
+          ],
+          "median": 2.371889291
+        },
+        "submissions": {
+          "ci95": [
+            4.0,
+            4.0
+          ],
+          "median": 4.0
+        },
+        "tokens_per_second": {
+          "gpu": {
+            "ci95": [
+              860.9183837273969,
+              865.7031649419121
+            ],
+            "median": 863.4467079770629
+          },
+          "wall": {
+            "ci95": [
+              854.0454677593515,
+              859.5325478069296
+            ],
+            "median": 856.8400555093789
+          }
+        },
+        "wall_time_seconds": {
+          "ci95": [
+            2.382690458,
+            2.397998792
+          ],
+          "median": 2.390177708
+        }
+      },
+      "sampling_fallbacks": [],
+      "selection": "gpu-sequential",
+      "tg": {
+        "gpu_time_seconds": {
+          "ci95": [
+            1.342946621,
+            1.351009001
+          ],
+          "median": 1.343554163
+        },
+        "submissions": {
+          "ci95": [
+            128.0,
+            128.0
+          ],
+          "median": 128.0
+        },
+        "tokens_per_second": {
+          "gpu": {
+            "ci95": [
+              94.74400237545123,
+              95.31279799094858
+            ],
+            "median": 95.26969847958411
+          },
+          "wall": {
+            "ci95": [
+              80.03197527512164,
+              82.12439777112459
+            ],
+            "median": 81.76834481344072
+          }
+        },
+        "wall_time_seconds": {
+          "ci95": [
+            1.558611125,
+            1.59936075
+          ],
+          "median": 1.5653979580000001
+        }
+      }
+    },
+    {
+      "input": 0,
+      "output_digest": "sha256:fb526da16ebb3766a494aadeee19ecf1959bfad5fb34a4b7615407db45485198",
+      "perf_hash": "sha256:04e2f893d37b1d2f05b082f856ea56217fdd33a6a39216d0ba7b9c575657c417",
+      "point": {
+        "bench.pp": 2048
+      },
+      "pp": {
+        "gpu_time_seconds": {
+          "ci95": [
+            2.36812504,
+            2.387535248
+          ],
+          "median": 2.370764791
+        },
+        "submissions": {
+          "ci95": [
+            4.0,
+            4.0
+          ],
+          "median": 4.0
+        },
+        "tokens_per_second": {
+          "gpu": {
+            "ci95": [
+              857.7883831099779,
+              864.8191989051389
+            ],
+            "median": 863.8562575986898
+          },
+          "wall": {
+            "ci95": [
+              850.8115336197612,
+              858.034528468275
+            ],
+            "median": 855.7687084494625
+          }
+        },
+        "wall_time_seconds": {
+          "ci95": [
+            2.386850333,
+            2.407113584
+          ],
+          "median": 2.39317
+        }
+      },
+      "sampling_fallbacks": [],
+      "selection": "gpu-pipelined",
+      "tg": {
+        "gpu_time_seconds": {
+          "ci95": [
+            1.341143748,
+            1.3512547480000001
+          ],
+          "median": 1.341962245
+        },
+        "submissions": {
+          "ci95": [
+            128.0,
+            128.0
+          ],
+          "median": 128.0
+        },
+        "tokens_per_second": {
+          "gpu": {
+            "ci95": [
+              94.72677168346941,
+              95.44092509910429
+            ],
+            "median": 95.3827132446636
+          },
+          "wall": {
+            "ci95": [
+              94.17507536601363,
+              94.92184503102295
+            ],
+            "median": 94.84075263662238
+          }
+        },
+        "wall_time_seconds": {
+          "ci95": [
+            1.348477792,
+            1.3591706669999999
+          ],
+          "median": 1.349630791
+        }
+      }
+    },
+    {
+      "input": 0,
+      "output_digest": "sha256:fb526da16ebb3766a494aadeee19ecf1959bfad5fb34a4b7615407db45485198",
+      "perf_hash": "sha256:8a4fe0305a620b40ee60705c0bddb90de09f13828ad3c3a59540641c36b72b0a",
+      "point": {
+        "bench.pp": 4000
+      },
+      "pp": {
+        "gpu_time_seconds": {
+          "ci95": [
+            4.92218833,
+            4.954756664
+          ],
+          "median": 4.9341711230000005
+        },
+        "submissions": {
+          "ci95": [
+            8.0,
+            8.0
+          ],
+          "median": 8.0
+        },
+        "tokens_per_second": {
+          "gpu": {
+            "ci95": [
+              807.3050345868611,
+              812.646679043262
+            ],
+            "median": 810.6731404905106
+          },
+          "wall": {
+            "ci95": [
+              799.5885250284767,
+              806.7071447102284
+            ],
+            "median": 805.5377227236762
+          }
+        },
+        "wall_time_seconds": {
+          "ci95": [
+            4.958428875,
+            5.002573042
+          ],
+          "median": 4.965627167
+        }
+      },
+      "sampling_fallbacks": [],
+      "selection": "gpu-sequential",
+      "tg": {
+        "gpu_time_seconds": {
+          "ci95": [
+            1.341871629,
+            1.3430456290000001
+          ],
+          "median": 1.342638124
+        },
+        "submissions": {
+          "ci95": [
+            128.0,
+            128.0
+          ],
+          "median": 128.0
+        },
+        "tokens_per_second": {
+          "gpu": {
+            "ci95": [
+              95.30577162542554,
+              95.3891543972721
+            ],
+            "median": 95.33469794426901
+          },
+          "wall": {
+            "ci95": [
+              80.57255826775767,
+              82.1102022796829
+            ],
+            "median": 81.87989195372539
+          }
+        },
+        "wall_time_seconds": {
+          "ci95": [
+            1.558880583,
+            1.588630208
+          ],
+          "median": 1.5632653749999998
+        }
+      }
+    },
+    {
+      "input": 0,
+      "output_digest": "sha256:fb526da16ebb3766a494aadeee19ecf1959bfad5fb34a4b7615407db45485198",
+      "perf_hash": "sha256:8a4fe0305a620b40ee60705c0bddb90de09f13828ad3c3a59540641c36b72b0a",
+      "point": {
+        "bench.pp": 4000
+      },
+      "pp": {
+        "gpu_time_seconds": {
+          "ci95": [
+            4.920977416,
+            4.977918873
+          ],
+          "median": 4.930298123
+        },
+        "submissions": {
+          "ci95": [
+            8.0,
+            8.0
+          ],
+          "median": 8.0
+        },
+        "tokens_per_second": {
+          "gpu": {
+            "ci95": [
+              803.5486519669522,
+              812.8466485122352
+            ],
+            "median": 811.3099654846166
+          },
+          "wall": {
+            "ci95": [
+              797.0113469260132,
+              807.059782239525
+            ],
+            "median": 804.8292369914507
+          }
+        },
+        "wall_time_seconds": {
+          "ci95": [
+            4.956262334,
+            5.018749125
+          ],
+          "median": 4.969998375
+        }
+      },
+      "sampling_fallbacks": [],
+      "selection": "gpu-pipelined",
+      "tg": {
+        "gpu_time_seconds": {
+          "ci95": [
+            1.338020326,
+            1.373158412
+          ],
+          "median": 1.339039126
+        },
+        "submissions": {
+          "ci95": [
+            128.0,
+            128.0
+          ],
+          "median": 128.0
+        },
+        "tokens_per_second": {
+          "gpu": {
+            "ci95": [
+              93.2157563769853,
+              95.66371863920398
+            ],
+            "median": 95.59093346462826
+          },
+          "wall": {
+            "ci95": [
+              87.0854070174519,
+              95.15046102632172
+            ],
+            "median": 95.05816667887792
+          }
+        },
+        "wall_time_seconds": {
+          "ci95": [
+            1.345237833,
+            1.469821459
+          ],
+          "median": 1.346543958
+        }
+      }
+    }
+  ],
+  "schema_version": 2
+}
