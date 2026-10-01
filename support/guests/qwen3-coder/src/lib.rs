@@ -87,6 +87,57 @@ impl QuantLinear {
             QUANT_GROUP,
         )
     }
+
+    fn load_stacked(
+        weights: &Weights<'_>,
+        projections: &[(&str, u32)],
+        input: u32,
+        bits: u8,
+    ) -> Result<Self> {
+        let packed_width = input
+            .checked_mul(u32::from(bits))
+            .and_then(|width| width.checked_div(32))
+            .ok_or_else(|| forja_sdk::Error::loading("quantized width overflowed"))?;
+        Ok(Self {
+            packed: stack_projection(weights, projections, "weight", packed_width)?,
+            scales: stack_projection(weights, projections, "scales", input / QUANT_GROUP)?,
+            biases: stack_projection(weights, projections, "biases", input / QUANT_GROUP)?,
+            bits,
+        })
+    }
+
+    fn output_slice(&self, offset: u32, output: u32) -> Result<Self> {
+        Ok(Self {
+            packed: self.packed.narrow(0, offset, output)?,
+            scales: self.scales.narrow(0, offset, output)?,
+            biases: self.biases.narrow(0, offset, output)?,
+            bits: self.bits,
+        })
+    }
+}
+
+fn stack_projection<T: forja_sdk::Element>(
+    weights: &Weights<'_>,
+    projections: &[(&str, u32)],
+    name: &str,
+    width: u32,
+) -> Result<Tensor<T>> {
+    let rows = projections.iter().try_fold(0_u32, |total, (_, rows)| {
+        total
+            .checked_add(*rows)
+            .ok_or_else(|| forja_sdk::Error::loading("stacked projection height overflowed"))
+    })?;
+    let output = Tensor::zeros(&[rows, width])?;
+    let mut offset = 0_u32;
+    for (prefix, rows) in projections {
+        let source = weights.scoped(prefix).tensor(name, &[*rows, width])?;
+        let mut destination = output.narrow(0, offset, *rows)?;
+        source.copy_into(&mut destination)?;
+        offset = offset
+            .checked_add(*rows)
+            .ok_or_else(|| forja_sdk::Error::loading("stacked projection offset overflowed"))?;
+    }
+    Ok(output)
 }
 
 struct QuantEmbedding(QuantLinear);
@@ -114,21 +165,80 @@ impl QuantEmbedding {
     }
 }
 
-#[derive(Load)]
-#[load(config = Config)]
 struct Attention {
-    #[load(prefix, config = QuantConfig { input: HIDDEN, output: QUERY_HEADS * HEAD_DIM, bits: Q4_BITS })]
+    qkv_proj: QuantLinear,
     q_proj: QuantLinear,
-    #[load(prefix, config = QuantConfig { input: HIDDEN, output: KEY_VALUE_HEADS * HEAD_DIM, bits: Q4_BITS })]
     k_proj: QuantLinear,
-    #[load(prefix, config = QuantConfig { input: HIDDEN, output: KEY_VALUE_HEADS * HEAD_DIM, bits: Q4_BITS })]
     v_proj: QuantLinear,
-    #[load(prefix, config = QuantConfig { input: QUERY_HEADS * HEAD_DIM, output: HIDDEN, bits: Q4_BITS })]
     o_proj: QuantLinear,
-    #[load(prefix, config = RmsNormConfig::promoted_bf16(HEAD_DIM, RMS_EPSILON))]
     q_norm: RmsNorm<f32>,
-    #[load(prefix, config = RmsNormConfig::promoted_bf16(HEAD_DIM, RMS_EPSILON))]
     k_norm: RmsNorm<f32>,
+}
+
+impl Load<Config> for Attention {
+    fn load(weights: &Weights<'_>, _config: &Config) -> Result<Self> {
+        let qkv_proj = QuantLinear::load_stacked(
+            weights,
+            &[
+                ("q_proj", QUERY_HEADS * HEAD_DIM),
+                ("k_proj", KEY_VALUE_HEADS * HEAD_DIM),
+                ("v_proj", KEY_VALUE_HEADS * HEAD_DIM),
+            ],
+            HIDDEN,
+            Q4_BITS,
+        )?;
+        Ok(Self {
+            q_proj: qkv_proj.output_slice(0, QUERY_HEADS * HEAD_DIM)?,
+            k_proj: qkv_proj.output_slice(QUERY_HEADS * HEAD_DIM, KEY_VALUE_HEADS * HEAD_DIM)?,
+            v_proj: qkv_proj.output_slice(
+                (QUERY_HEADS + KEY_VALUE_HEADS) * HEAD_DIM,
+                KEY_VALUE_HEADS * HEAD_DIM,
+            )?,
+            qkv_proj,
+            o_proj: QuantLinear::load(
+                &weights.scoped("o_proj"),
+                &QuantConfig {
+                    input: QUERY_HEADS * HEAD_DIM,
+                    output: HIDDEN,
+                    bits: Q4_BITS,
+                },
+            )?,
+            q_norm: RmsNorm::load(
+                &weights.scoped("q_norm"),
+                &RmsNormConfig::promoted_bf16(HEAD_DIM, RMS_EPSILON),
+            )?,
+            k_norm: RmsNorm::load(
+                &weights.scoped("k_norm"),
+                &RmsNormConfig::promoted_bf16(HEAD_DIM, RMS_EPSILON),
+            )?,
+        })
+    }
+}
+
+impl Attention {
+    fn project(
+        &self,
+        input: &Tensor<f32>,
+        sequence: u32,
+    ) -> Result<(Tensor<f32>, Tensor<f32>, Tensor<f32>)> {
+        if sequence == 1 {
+            let qkv = self.qkv_proj.forward(input)?;
+            return Ok((
+                qkv.narrow(1, 0, QUERY_HEADS * HEAD_DIM)?,
+                qkv.narrow(1, QUERY_HEADS * HEAD_DIM, KEY_VALUE_HEADS * HEAD_DIM)?,
+                qkv.narrow(
+                    1,
+                    (QUERY_HEADS + KEY_VALUE_HEADS) * HEAD_DIM,
+                    KEY_VALUE_HEADS * HEAD_DIM,
+                )?,
+            ));
+        }
+        Ok((
+            self.q_proj.forward(input)?,
+            self.k_proj.forward(input)?,
+            self.v_proj.forward(input)?,
+        ))
+    }
 }
 
 struct QuantExperts {
@@ -263,31 +373,20 @@ impl DecoderLayer {
             start,
             end,
         } = position;
+        let (query, key, value) = self.self_attn.project(normalized_input, sequence)?;
         let query = qk_norm_rope(
             qk_kernel,
-            &self.self_attn.q_proj.forward(normalized_input)?.reshape(&[
-                sequence,
-                QUERY_HEADS,
-                HEAD_DIM,
-            ])?,
+            &query.reshape(&[sequence, QUERY_HEADS, HEAD_DIM])?,
             self.self_attn.q_norm.weight(),
             activation_positions,
         )?;
         let key = qk_norm_rope(
             qk_kernel,
-            &self.self_attn.k_proj.forward(normalized_input)?.reshape(&[
-                sequence,
-                KEY_VALUE_HEADS,
-                HEAD_DIM,
-            ])?,
+            &key.reshape(&[sequence, KEY_VALUE_HEADS, HEAD_DIM])?,
             self.self_attn.k_norm.weight(),
             activation_positions,
         )?;
-        let value = self.self_attn.v_proj.forward(normalized_input)?.reshape(&[
-            sequence,
-            KEY_VALUE_HEADS,
-            HEAD_DIM,
-        ])?;
+        let value = value.reshape(&[sequence, KEY_VALUE_HEADS, HEAD_DIM])?;
         let attended = cached_attention(&query, &key, &value, cache, ATTENTION_SCALE, start, end)?;
         let (hidden, normalized) = residual_norm(
             residual_kernel,
