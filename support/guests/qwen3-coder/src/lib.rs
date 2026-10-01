@@ -173,6 +173,7 @@ struct Attention {
     o_proj: QuantLinear,
     q_norm: RmsNorm<f32>,
     k_norm: RmsNorm<f32>,
+    decode_norm: Tensor<f32>,
 }
 
 impl Load<Config> for Attention {
@@ -187,6 +188,15 @@ impl Load<Config> for Attention {
             HIDDEN,
             Q4_BITS,
         )?;
+        let q_norm = RmsNorm::load(
+            &weights.scoped("q_norm"),
+            &RmsNormConfig::promoted_bf16(HEAD_DIM, RMS_EPSILON),
+        )?;
+        let k_norm = RmsNorm::load(
+            &weights.scoped("k_norm"),
+            &RmsNormConfig::promoted_bf16(HEAD_DIM, RMS_EPSILON),
+        )?;
+        let decode_norm = stack_decode_norm(q_norm.weight(), k_norm.weight())?;
         Ok(Self {
             q_proj: qkv_proj.output_slice(0, QUERY_HEADS * HEAD_DIM)?,
             k_proj: qkv_proj.output_slice(QUERY_HEADS * HEAD_DIM, KEY_VALUE_HEADS * HEAD_DIM)?,
@@ -203,42 +213,73 @@ impl Load<Config> for Attention {
                     bits: Q4_BITS,
                 },
             )?,
-            q_norm: RmsNorm::load(
-                &weights.scoped("q_norm"),
-                &RmsNormConfig::promoted_bf16(HEAD_DIM, RMS_EPSILON),
-            )?,
-            k_norm: RmsNorm::load(
-                &weights.scoped("k_norm"),
-                &RmsNormConfig::promoted_bf16(HEAD_DIM, RMS_EPSILON),
-            )?,
+            q_norm,
+            k_norm,
+            decode_norm,
         })
     }
 }
 
 impl Attention {
-    fn project(
+    fn project_normalized(
         &self,
         input: &Tensor<f32>,
         sequence: u32,
+        kernel: &Kernel,
+        positions: &Tensor<f32>,
     ) -> Result<(Tensor<f32>, Tensor<f32>, Tensor<f32>)> {
         if sequence == 1 {
             let qkv = self.qkv_proj.forward(input)?;
+            let qk = qk_norm_rope(
+                kernel,
+                &qkv.narrow(1, 0, (QUERY_HEADS + KEY_VALUE_HEADS) * HEAD_DIM)?
+                    .reshape(&[sequence, QUERY_HEADS + KEY_VALUE_HEADS, HEAD_DIM])?,
+                &self.decode_norm,
+                positions,
+            )?;
             return Ok((
-                qkv.narrow(1, 0, QUERY_HEADS * HEAD_DIM)?,
-                qkv.narrow(1, QUERY_HEADS * HEAD_DIM, KEY_VALUE_HEADS * HEAD_DIM)?,
+                qk.narrow(1, 0, QUERY_HEADS)?,
+                qk.narrow(1, QUERY_HEADS, KEY_VALUE_HEADS)?,
                 qkv.narrow(
                     1,
                     (QUERY_HEADS + KEY_VALUE_HEADS) * HEAD_DIM,
                     KEY_VALUE_HEADS * HEAD_DIM,
-                )?,
+                )?
+                .reshape(&[sequence, KEY_VALUE_HEADS, HEAD_DIM])?,
             ));
         }
+        let query = self.q_proj.forward(input)?;
+        let key = self.k_proj.forward(input)?;
         Ok((
-            self.q_proj.forward(input)?,
-            self.k_proj.forward(input)?,
-            self.v_proj.forward(input)?,
+            qk_norm_rope(
+                kernel,
+                &query.reshape(&[sequence, QUERY_HEADS, HEAD_DIM])?,
+                self.q_norm.weight(),
+                positions,
+            )?,
+            qk_norm_rope(
+                kernel,
+                &key.reshape(&[sequence, KEY_VALUE_HEADS, HEAD_DIM])?,
+                self.k_norm.weight(),
+                positions,
+            )?,
+            self.v_proj
+                .forward(input)?
+                .reshape(&[sequence, KEY_VALUE_HEADS, HEAD_DIM])?,
         ))
     }
+}
+
+fn stack_decode_norm(query: &Tensor<f32>, key: &Tensor<f32>) -> Result<Tensor<f32>> {
+    let output = Tensor::zeros(&[QUERY_HEADS + KEY_VALUE_HEADS, HEAD_DIM])?;
+    let mut query_output = output.narrow(0, 0, QUERY_HEADS)?;
+    query
+        .broadcast_as(&[QUERY_HEADS, HEAD_DIM])?
+        .copy_into(&mut query_output)?;
+    let mut key_output = output.narrow(0, QUERY_HEADS, KEY_VALUE_HEADS)?;
+    key.broadcast_as(&[KEY_VALUE_HEADS, HEAD_DIM])?
+        .copy_into(&mut key_output)?;
+    Ok(output)
 }
 
 struct QuantExperts {
@@ -410,20 +451,12 @@ impl DecoderLayer {
             start,
             end,
         } = position;
-        let (query, key, value) = self.self_attn.project(normalized_input, sequence)?;
-        let query = qk_norm_rope(
+        let (query, key, value) = self.self_attn.project_normalized(
+            normalized_input,
+            sequence,
             qk_kernel,
-            &query.reshape(&[sequence, QUERY_HEADS, HEAD_DIM])?,
-            self.self_attn.q_norm.weight(),
             activation_positions,
         )?;
-        let key = qk_norm_rope(
-            qk_kernel,
-            &key.reshape(&[sequence, KEY_VALUE_HEADS, HEAD_DIM])?,
-            self.self_attn.k_norm.weight(),
-            activation_positions,
-        )?;
-        let value = value.reshape(&[sequence, KEY_VALUE_HEADS, HEAD_DIM])?;
         let attended = cached_attention(&query, &key, &value, cache, ATTENTION_SCALE, start, end)?;
         let (hidden, normalized) = residual_norm(
             residual_kernel,

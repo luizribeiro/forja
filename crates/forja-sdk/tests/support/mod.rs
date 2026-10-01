@@ -122,6 +122,31 @@ pub fn attention_and_cache_copy_match_cpu() {
             .copy_from_slice(&key_values[source_start..source_start + 7 * 128]);
     }
     assert_eq!(copied, expected);
+
+    let qk_values = values(3 * 128, 17);
+    let qk_weights = values(3 * 128, 18);
+    let qk = Tensor::from_slice(&qk_values, &[1, 3, 128]).unwrap();
+    let weights = Tensor::from_slice(&qk_weights, &[3, 128]).unwrap();
+    let positions = Tensor::from_slice(&[7.0_f32], &[1]).unwrap();
+    let kernel =
+        forja_sdk::nn::blocks::qk_norm_rope_kernel(forja_sdk::DType::F32, 1_000_000.0).unwrap();
+    let combined = forja_sdk::nn::blocks::qk_norm_rope(&kernel, &qk, &weights, &positions)
+        .unwrap()
+        .to_vec()
+        .unwrap();
+    for head in 0..3 {
+        let separate = forja_sdk::nn::blocks::qk_norm_rope(
+            &kernel,
+            &qk.narrow(1, head, 1).unwrap(),
+            &weights.narrow(0, head, 1).unwrap().reshape(&[128]).unwrap(),
+            &positions,
+        )
+        .unwrap()
+        .to_vec()
+        .unwrap();
+        let start = usize::try_from(head * 128).unwrap();
+        assert_eq!(separate, combined[start..start + 128]);
+    }
 }
 
 pub fn neural_network_modules_match_cpu() {

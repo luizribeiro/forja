@@ -101,8 +101,20 @@ pub fn qk_norm_rope<T: FloatElement>(
     let shape = [sequence, heads, half];
     let lo = input.narrow(2, 0, half)?;
     let hi = input.narrow(2, half, half)?;
-    let weight_lo = weight.narrow(0, 0, half)?.broadcast_as(&shape)?;
-    let weight_hi = weight.narrow(0, half, half)?.broadcast_as(&shape)?;
+    let (weight_lo, weight_hi) = match weight.shape() {
+        [width] if *width == head_dim => (
+            weight.narrow(0, 0, half)?.broadcast_as(&shape)?,
+            weight.narrow(0, half, half)?.broadcast_as(&shape)?,
+        ),
+        [weight_heads, width] if *weight_heads == heads && *width == head_dim => {
+            let weight = weight.reshape(&[1, heads, head_dim])?;
+            (
+                weight.narrow(2, 0, half)?.broadcast_as(&shape)?,
+                weight.narrow(2, half, half)?.broadcast_as(&shape)?,
+            )
+        }
+        _ => return Err(Error::loading("QK norm weight shape is incompatible")),
+    };
     let positions = positions.reshape(&[sequence, 1, 1])?.broadcast_as(&shape)?;
     let output = Tensor::<T>::zeros(input.shape())?;
     let output_lo = output.narrow(2, 0, half)?;
