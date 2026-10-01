@@ -279,7 +279,7 @@ impl GroupedRouteShape {
             .checked_mul(u64::from(routes))
             .ok_or(BackendError::InvalidInput)?;
         let block_capacity = route_count
-            .div_ceil(32)
+            .div_ceil(16)
             .checked_add(u64::from(experts))
             .ok_or(BackendError::InvalidInput)?;
         let block_elements = block_capacity
@@ -2864,6 +2864,7 @@ impl MetalBackend {
             [input, packed, scales, biases, &sorted, &blocks, output],
             &params,
             shape,
+            grouped,
             config,
             bindings,
         )?;
@@ -2951,6 +2952,7 @@ impl MetalBackend {
             ],
             &gate_qmm_params,
             shape,
+            grouped,
             config,
             bindings,
         )?;
@@ -2962,6 +2964,7 @@ impl MetalBackend {
             ],
             &up_qmm_params,
             shape,
+            grouped,
             config,
             bindings,
         )?;
@@ -3093,6 +3096,7 @@ impl MetalBackend {
         tensors: [&EncoderTensor; 7],
         params: &BufferBinding,
         shape: [u32; 3],
+        grouped: GroupedRouteShape,
         config: (u8, u32),
         bindings: &mut ArgumentBindings,
     ) -> Result<(), BackendError> {
@@ -3120,7 +3124,6 @@ impl MetalBackend {
         }
         bindings.bind(table, 7, params);
         set_argument_table(encoder, table);
-        let grouped = GroupedRouteShape::new(shape[0], shape[1], packed.layout.shape()[0])?;
         dispatch_threadgroups(
             encoder,
             MTLSize {
@@ -3131,7 +3134,7 @@ impl MetalBackend {
                 depth: 1,
             },
             MTLSize {
-                width: 128,
+                width: 64,
                 height: 1,
                 depth: 1,
             },

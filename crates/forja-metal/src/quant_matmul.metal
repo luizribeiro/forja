@@ -486,7 +486,9 @@ kernel void gather_quantized_silu_mul(
     }
 }
 
-template <typename T, uint block_inner, uint block_columns>
+template <
+    typename T, uint block_inner, uint block_columns,
+    uint tile_stride, bool transpose>
 void load_quantized_weight_tile(
     device const uchar *packed,
     device const uchar *scales,
@@ -576,7 +578,7 @@ kernel void arrange_expert_routes(
     if (thread_index + 1 == params.experts) {
         atomic_store_explicit(counts + params.experts, scan[thread_index], memory_order_relaxed);
     }
-    scan[thread_index] = count == 0 ? 0 : (count + 31) / 32;
+    scan[thread_index] = count == 0 ? 0 : (count + 15) / 16;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint shift = 1; shift < 256; shift <<= 1) {
         uint prefix = scan[thread_index];
@@ -604,8 +606,8 @@ kernel void arrange_expert_routes(
             }
         }
         uint block = thread_index == 0 ? 0 : scan[thread_index - 1];
-        for (uint start = 0; start < count; start += 32) {
-            blocks[block++] = uint3(thread_index, route_offset + start, min(32u, count - start));
+        for (uint start = 0; start < count; start += 16) {
+            blocks[block++] = uint3(thread_index, route_offset + start, min(16u, count - start));
         }
     }
 }
@@ -624,13 +626,14 @@ kernel void grouped_quantized_gemm(
     ushort simdgroup [[simdgroup_index_in_threadgroup]],
     ushort lane [[thread_index_in_simdgroup]],
     uint3 tile [[threadgroup_position_in_grid]]) {
-    constexpr uint block_rows = 32;
+    constexpr uint block_rows = 16;
     constexpr uint block_columns = 32;
     constexpr uint block_inner = 32;
-    constexpr uint simdgroups_rows = 2;
+    constexpr uint simdgroups_rows = 1;
     constexpr uint simdgroups_columns = 2;
-    threadgroup float input_tile[block_rows * block_inner];
-    threadgroup float weight_tile[block_inner * block_columns];
+    constexpr uint tile_stride = block_inner + 4;
+    threadgroup float input_tile[block_rows * tile_stride];
+    threadgroup float weight_tile[block_columns * tile_stride];
     uint3 block = blocks[tile.y];
     if (block.x == 0xffffffffu) {
         return;
@@ -642,13 +645,44 @@ kernel void grouped_quantized_gemm(
     uint thread_count = threadgroup_size.x * threadgroup_size.y * threadgroup_size.z;
     BlockMMA<
         float, block_rows, block_columns, block_inner,
-        simdgroups_rows, simdgroups_columns> mma(simdgroup, lane);
+        simdgroups_rows, simdgroups_columns,
+        tile_stride, tile_stride, true> mma(simdgroup, lane);
     for (uint inner_origin = 0; inner_origin < params.inner; inner_origin += block_inner) {
+        if (thread_count == 64 && input0_dtype == 0 &&
+            inner_origin + block_inner <= params.inner &&
+            params.input_offset % 4 == 0 && params.input_row_stride % 4 == 0 &&
+            params.input_inner_stride == 1) {
+            uint local_row = thread_index / 4;
+            uint local_inner = (thread_index % 4) * 8;
+            threadgroup float *destination =
+                input_tile + local_row * tile_stride + local_inner;
+            if (local_row < row_count) {
+                uint route = sorted_routes[sorted_origin + local_row];
+                uint input_row = route / params.routes;
+                device const float *source = reinterpret_cast<device const float *>(input) +
+                    params.input_offset + ulong(input_row) * params.input_row_stride +
+                    inner_origin + local_inner;
+                device const float4 *source_vectors =
+                    reinterpret_cast<device const float4 *>(source);
+                threadgroup float4 *destination_vectors =
+                    reinterpret_cast<threadgroup float4 *>(destination);
+#pragma clang loop unroll(full)
+                for (uint read = 0; read < 2; ++read) {
+                    destination_vectors[read] = source_vectors[read];
+                }
+            } else {
+#pragma clang loop unroll(full)
+                for (uint element = 0; element < 8; ++element) {
+                    destination[element] = 0.0f;
+                }
+            }
+        } else {
             for (uint linear = thread_index;
                  linear < block_rows * block_inner;
                  linear += thread_count) {
                 uint local_row = linear / block_inner;
-                uint inner = inner_origin + linear % block_inner;
+                uint local_inner = linear % block_inner;
+                uint inner = inner_origin + local_inner;
                 float value = 0.0f;
                 if (local_row < row_count && inner < params.inner) {
                     uint route = sorted_routes[sorted_origin + local_row];
@@ -659,21 +693,23 @@ kernel void grouped_quantized_gemm(
                             ulong(inner) * params.input_inner_stride,
                         input0_dtype);
                 }
-                input_tile[linear] = value;
+                input_tile[local_row * tile_stride + local_inner] = value;
             }
-            load_quantized_weight_tile<float, block_inner, block_columns>(
-                packed, scales, biases,
-                params.packed_offset + ulong(expert) * params.packed_expert_stride,
-                params.scale_offset + ulong(expert) * params.scale_expert_stride,
-                params.bias_offset + ulong(expert) * params.bias_expert_stride,
-                params.packed_row_stride, params.packed_word_stride,
-                params.scale_row_stride, params.scale_group_stride,
-                params.bias_row_stride, params.bias_group_stride,
-                inner_origin, column_origin, params.inner, params.columns,
-                weight_tile, thread_index, thread_count);
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            mma.multiply(input_tile, weight_tile);
-            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        load_quantized_weight_tile<
+            float, block_inner, block_columns, tile_stride, true>(
+            packed, scales, biases,
+            params.packed_offset + ulong(expert) * params.packed_expert_stride,
+            params.scale_offset + ulong(expert) * params.scale_expert_stride,
+            params.bias_offset + ulong(expert) * params.bias_expert_stride,
+            params.packed_row_stride, params.packed_word_stride,
+            params.scale_row_stride, params.scale_group_stride,
+            params.bias_row_stride, params.bias_group_stride,
+            inner_origin, column_origin, params.inner, params.columns,
+            weight_tile, thread_index, thread_count);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        mma.multiply(input_tile, weight_tile);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     for (uint row_fragment = 0;
          row_fragment < block_rows / (8 * simdgroups_rows);
@@ -822,7 +858,9 @@ kernel void quantized_gemm_small_m(
     }
 }
 
-template <typename T, uint block_inner, uint block_columns>
+template <
+    typename T, uint block_inner, uint block_columns,
+    uint tile_stride, bool transpose>
 void load_quantized_weight_tile(
     device const uchar *packed,
     device const uchar *scales,
@@ -878,7 +916,10 @@ void load_quantized_weight_tile(
             float value = inner + element < inner_extent
                 ? scale * float((word >> (element * quant_bits)) & mask) + bias
                 : 0.0f;
-            tile[local_inner * block_columns + local_column] = T(value);
+            uint tile_index = transpose
+                ? local_column * tile_stride + local_inner
+                : local_inner * tile_stride + local_column;
+            tile[tile_index] = T(value);
         }
     }
 }
@@ -956,7 +997,8 @@ void load_quantized_gemm_input_tile(
     if (thread_count == 128 && row_origin + block_rows <= params.rows &&
         inner_origin + block_inner <= params.inner &&
         params.input_offset % vector_elements == 0 &&
-        params.input_row_stride % vector_elements == 0) {
+        params.input_row_stride % vector_elements == 0 &&
+        params.input_inner_stride == 1) {
         uint local_row = thread_index / 4;
         uint local_inner = (thread_index % 4) * elements_per_thread;
         device const T *source = reinterpret_cast<device const T *>(input) +

@@ -158,6 +158,25 @@ impl TensorSpec {
         }
     }
 
+    /// Describes a tensor viewed through an axis slice followed by broadcasting.
+    #[must_use]
+    pub fn sliced_broadcast(
+        dtype: DType,
+        allocation_shape: &[u32],
+        slices: &[Slice],
+        shape: &[u32],
+    ) -> Self {
+        Self {
+            dtype,
+            allocation_shape: allocation_shape.to_vec(),
+            views: vec![
+                ViewOp::Slice(slices.to_vec()),
+                ViewOp::Broadcast(shape.to_vec()),
+            ],
+            initialized: None,
+        }
+    }
+
     /// Describes a tensor viewed through zero-stride broadcasting.
     #[must_use]
     pub fn broadcast(dtype: DType, allocation_shape: &[u32], shape: &[u32]) -> Self {
