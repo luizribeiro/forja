@@ -2653,6 +2653,7 @@ impl MetalBackend {
         set_argument_table(encoder, table);
         let (column_tile, row_tile, threads) = match kernel {
             "quantized_gemv" => (if bits == 8 { 16 } else { 8 }, 1, 64),
+            "quantized_gemv_q8_fast" => (8, 1, 64),
             "quantized_gemm_tiled_f32"
             | "quantized_gemm_tiled_f16"
             | "quantized_gemm_tiled_bf16" => (32, 32, 128),
@@ -5861,6 +5862,21 @@ fn quant_matmul_kernel(dispatch: &Dispatch) -> Result<&'static str, BackendError
     };
     let rows = input.layout().shape()[0];
     if rows == 1 {
+        let q8_fast = matches!(
+            dispatch.op(),
+            Op::QuantMatmul {
+                bits: 8,
+                group_size
+            } if group_size % 8 == 0
+        ) && input.layout().shape()[1] % 256 == 0
+            && input.layout().offset() % 4 == 0
+            && packed.layout().offset() % 2 == 0
+            && [input, packed, scales, biases, dispatch.output()]
+                .iter()
+                .all(|tensor| tensor.layout().is_contiguous());
+        if q8_fast {
+            return Ok("quantized_gemv_q8_fast");
+        }
         return Ok("quantized_gemv");
     }
     if rows >= 16

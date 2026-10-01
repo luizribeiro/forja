@@ -333,6 +333,64 @@ kernel void quantized_gemv(
     }
 }
 
+kernel void quantized_gemv_q8_fast(
+    device const uchar *input [[buffer(0)]],
+    device const uchar *packed [[buffer(1)]],
+    device const uchar *scales [[buffer(2)]],
+    device const uchar *biases [[buffer(3)]],
+    device uchar *output [[buffer(4)]],
+    constant QuantMatmulParams &params [[buffer(5)]],
+    ushort simdgroup [[simdgroup_index_in_threadgroup]],
+    ushort lane [[thread_index_in_simdgroup]],
+    uint2 tile [[threadgroup_position_in_grid]]) {
+    uint first_column = tile.x * 8 + uint(simdgroup) * 4;
+    float sums[4] = {0.0f};
+    for (uint block = 0; block < params.inner; block += 256) {
+        uint first_inner = block + uint(lane) * 8;
+        float4 activations0 = load_float4_contiguous(
+            input, params.input_offset + ulong(first_inner), input0_dtype);
+        float4 activations1 = load_float4_contiguous(
+            input, params.input_offset + ulong(first_inner + 4), input0_dtype);
+        float input_sum = dot(activations0, float4(1.0f)) +
+            dot(activations1, float4(1.0f));
+        uint group = first_inner / quant_group_size;
+        uint first_word = first_inner / 4;
+        for (uint item = 0; item < 4; ++item) {
+            uint column = first_column + item;
+            if (column < params.columns) {
+                ulong packed_index = params.packed_offset +
+                    ulong(column) * params.packed_width + ulong(first_word);
+                uint2 words = *(device const uint2 *)(
+                    packed + packed_index * sizeof(uint));
+                float quantized_sum = dot(
+                    activations0, float4(as_type<uchar4>(words[0]))) +
+                    dot(activations1, float4(as_type<uchar4>(words[1])));
+                ulong group_index = ulong(column) *
+                    ulong(params.inner / quant_group_size) + ulong(group);
+                sums[item] += load_float(
+                    scales, params.scale_offset + group_index, input1_dtype) *
+                    quantized_sum +
+                    load_float(
+                        biases, params.bias_offset + group_index, input1_dtype) *
+                    input_sum;
+            }
+        }
+    }
+    for (uint item = 0; item < 4; ++item) {
+        sums[item] = simd_sum(sums[item]);
+    }
+    if (lane == 0) {
+        for (uint item = 0; item < 4; ++item) {
+            uint column = first_column + item;
+            if (column < params.columns) {
+                store_float(
+                    output, params.output_offset + ulong(column), output_dtype,
+                    sums[item]);
+            }
+        }
+    }
+}
+
 struct GatherQuantMatmulParams {
     ulong input_offset;
     ulong packed_offset;
