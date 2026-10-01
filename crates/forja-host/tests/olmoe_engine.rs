@@ -8,7 +8,7 @@ use golden_fixtures::{
 };
 
 const LIMITS: Limits = Limits::new(
-    24 * 1024 * 1024 * 1024,
+    48 * 1024 * 1024 * 1024,
     4,
     1_000_000_000,
     20_000,
