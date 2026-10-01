@@ -1,4 +1,4 @@
-use std::fmt;
+use std::{fmt, fmt::Write as _};
 
 use crate::{DType, Op};
 
@@ -389,5 +389,83 @@ impl fmt::Display for Lifecycle {
         formatter.write_str(match self {
             Self::Active => "active",
         })
+    }
+}
+
+/// A backend algorithm and its machine-checkable contract.
+#[derive(Clone, Copy, Debug)]
+pub struct VariantDef<I> {
+    /// Stable algorithm identity.
+    pub name: &'static str,
+    /// Portable operation computed by the algorithm.
+    pub operation: OperationKind,
+    /// Backend-private implementation tag.
+    pub implementation: I,
+    /// Capabilities required before the algorithm can be selected.
+    pub availability: &'static [DeviceCapability],
+    /// Additional requirements beyond the operation contract.
+    pub constraints: &'static [Constraint],
+    /// Execution guarantee placeholder.
+    pub guarantees: Guarantee,
+    /// Shapes and workloads where this algorithm is useful.
+    pub use_when: &'static [&'static str],
+    /// Shapes and workloads where another algorithm is preferable.
+    pub avoid_when: &'static [&'static str],
+    /// Implementation trade-offs and operational details.
+    pub notes: &'static [&'static str],
+    /// Lifecycle placeholder.
+    pub lifecycle: Lifecycle,
+}
+
+/// Renders a stable Markdown catalog from registry definitions.
+#[must_use]
+pub fn render_catalog_markdown<I>(
+    backend: &str,
+    device: &str,
+    capabilities: &[DeviceCapability],
+    variants: &[VariantDef<I>],
+) -> String {
+    let mut output =
+        format!("# {backend} variant catalog\n\n**Device:** {device}\n\n**Capabilities:** ");
+    append_display_list(&mut output, capabilities);
+    output.push('\n');
+    for variant in variants {
+        let _ = write!(
+            output,
+            "\n## {}\n\n**Name:** `{}`\n\n**Computes:** `{}`\n\n**Constraints:**\n",
+            variant.name, variant.name, variant.operation
+        );
+        if variant.constraints.is_empty() {
+            output.push_str("\n- None beyond the operation contract.\n");
+        } else {
+            for constraint in variant.constraints {
+                let _ = write!(output, "\n- {constraint}\n");
+            }
+        }
+        append_markdown_sentences(&mut output, "Use when", variant.use_when);
+        append_markdown_sentences(&mut output, "Avoid when", variant.avoid_when);
+        append_markdown_sentences(&mut output, "Notes", variant.notes);
+        let _ = write!(
+            output,
+            "\n- Guarantee: {}.\n\n- Lifecycle: {}.\n",
+            variant.guarantees, variant.lifecycle
+        );
+    }
+    output
+}
+
+fn append_markdown_sentences(output: &mut String, heading: &str, sentences: &[&str]) {
+    let _ = write!(output, "\n**{heading}:**\n");
+    for sentence in sentences {
+        let _ = write!(output, "\n- {sentence}\n");
+    }
+}
+
+fn append_display_list<T: fmt::Display>(output: &mut String, values: &[T]) {
+    for (index, value) in values.iter().enumerate() {
+        if index != 0 {
+            output.push_str(", ");
+        }
+        let _ = write!(output, "{value}");
     }
 }

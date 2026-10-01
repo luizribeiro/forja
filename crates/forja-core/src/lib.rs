@@ -32,7 +32,8 @@ pub use symbolic::{
 };
 pub use variants::{
     Axis, Constraint, DeviceCapability, Dimension, Guarantee, LayoutClass, Lifecycle,
-    OperationKind, OperationValue, Relation, TensorRef, TensorSlot, ValueRef, operation_value,
+    OperationKind, OperationValue, Relation, TensorRef, TensorSlot, ValueRef, VariantDef,
+    operation_value, render_catalog_markdown,
 };
 
 /// A scalar type stored in an unquantized tensor.
