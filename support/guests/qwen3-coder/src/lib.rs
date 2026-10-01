@@ -10,7 +10,7 @@ use forja_sdk::{
         RmsNorm, RmsNormConfig,
         blocks::{
             KvCache, Taps, cached_attention, qk_norm_rope, qk_norm_rope_kernel, residual_norm,
-            residual_norm_kernel,
+            residual_norm_kernel, rms_norm, rms_norm_kernel,
         },
         moe_combine, moe_router,
     },
@@ -295,9 +295,9 @@ impl Load<Config> for SparseMoe {
 }
 
 impl SparseMoe {
-    fn forward(&self, input: &Tensor<f32>) -> Result<(Tensor<f32>, Tensor<f32>)> {
+    fn route(&self, input: &Tensor<f32>) -> Result<RoutedMoe> {
         let logits = self.gate.forward(input)?;
-        let (route_weights, indices) = moe_router(&logits, TOP_K, true)?;
+        let (weights, indices) = moe_router(&logits, TOP_K, true)?;
         let activated = input.gather_quant_silu_mul(
             &self.gate_proj.packed,
             &self.gate_proj.scales,
@@ -309,6 +309,16 @@ impl SparseMoe {
             Q4_BITS,
             QUANT_GROUP,
         )?;
+        Ok(RoutedMoe {
+            logits,
+            weights,
+            indices,
+            activated,
+        })
+    }
+
+    fn forward(&self, input: &Tensor<f32>) -> Result<(Tensor<f32>, Tensor<f32>)> {
+        let routed = self.route(input)?;
         let rows = input
             .shape()
             .first()
@@ -318,12 +328,38 @@ impl SparseMoe {
         let output = self
             .down_proj
             .forward(
-                &activated.reshape(&[rows, INTERMEDIATE])?,
-                &indices.reshape(&[rows, 1])?,
+                &routed.activated.reshape(&[rows, INTERMEDIATE])?,
+                &routed.indices.reshape(&[rows, 1])?,
             )?
             .reshape(&[rows / TOP_K, TOP_K, HIDDEN])?;
-        Ok((moe_combine(&output, &route_weights)?, logits))
+        Ok((moe_combine(&output, &routed.weights)?, routed.logits))
     }
+
+    fn forward_decode(
+        &self,
+        input: &Tensor<f32>,
+        residual: &Tensor<f32>,
+    ) -> Result<(Tensor<f32>, Tensor<f32>)> {
+        let routed = self.route(input)?;
+        let output = routed.activated.gather_quant_matmul_combine(
+            &self.down_proj.packed,
+            &self.down_proj.scales,
+            &self.down_proj.biases,
+            &routed.indices,
+            &routed.weights,
+            residual,
+            Q4_BITS,
+            QUANT_GROUP,
+        )?;
+        Ok((output, routed.logits))
+    }
+}
+
+struct RoutedMoe {
+    logits: Tensor<f32>,
+    weights: Tensor<f32>,
+    indices: Tensor<u32>,
+    activated: Tensor<f32>,
 }
 
 #[derive(Load)]
@@ -357,6 +393,7 @@ impl DecoderLayer {
     fn forward(
         &self,
         residual_kernel: &Kernel,
+        norm_kernel: &Kernel,
         input: &Tensor<f32>,
         normalized_input: &Tensor<f32>,
         position: LayerPosition<'_>,
@@ -394,13 +431,20 @@ impl DecoderLayer {
             &self.self_attn.o_proj.forward(&attended)?,
             self.post_attention_layernorm.weight(),
         )?;
-        let (projected, router_logits) = self.mlp.forward(&normalized)?;
-        let (hidden, normalized) = residual_norm(
-            residual_kernel,
-            &hidden,
-            &projected,
-            following_norm.weight(),
-        )?;
+        let (hidden, normalized, router_logits) = if sequence == 1 {
+            let (hidden, router_logits) = self.mlp.forward_decode(&normalized, &hidden)?;
+            let normalized = rms_norm(norm_kernel, &hidden, following_norm.weight())?;
+            (hidden, normalized, router_logits)
+        } else {
+            let (projected, router_logits) = self.mlp.forward(&normalized)?;
+            let (hidden, normalized) = residual_norm(
+                residual_kernel,
+                &hidden,
+                &projected,
+                following_norm.weight(),
+            )?;
+            (hidden, normalized, router_logits)
+        };
         Ok((hidden, normalized, router_logits))
     }
 }
@@ -442,6 +486,7 @@ pub struct Qwen3Coder {
     weights: QwenWeights,
     caches: Vec<KvCache<f32>>,
     residual_norm: Kernel,
+    rms_norm: Kernel,
     qk_norm_rope: Kernel,
     activation_positions: Tensor<f32>,
     #[cfg(target_family = "wasm")]
@@ -460,6 +505,7 @@ impl Qwen3Coder {
             weights,
             caches,
             residual_norm: residual_norm_kernel(DType::F32, RMS_EPSILON)?,
+            rms_norm: rms_norm_kernel(DType::F32, RMS_EPSILON)?,
             qk_norm_rope: qk_norm_rope_kernel(DType::F32, ROPE_THETA)?,
             activation_positions: Tensor::constant(
                 &(0..MAX_CONTEXT)
@@ -522,6 +568,7 @@ impl Qwen3Coder {
                 .map_or(&self.weights.norm, |layer| &layer.input_layernorm);
             let (next, next_normalized, router) = self.weights.layers[index].forward(
                 &self.residual_norm,
+                &self.rms_norm,
                 &hidden,
                 &normalized,
                 LayerPosition {

@@ -17,6 +17,31 @@ const PREFILL_REPLAYS_PER_GRAPH: u32 = 2;
 const QK_HEAD_DIM: f32 = 128.0;
 const QK_RMS_EPSILON: f32 = 1.0e-6;
 
+/// Builds the row program for RMS normalization.
+///
+/// # Errors
+///
+/// Returns an error when the kernel definition is refused.
+pub fn rms_norm_kernel(dtype: DType, epsilon: f32) -> Result<Kernel> {
+    rms_norm_rows_program(2, &[dtype; 2], &[dtype], epsilon)
+}
+
+/// Applies RMS normalization with a prebuilt row kernel.
+///
+/// # Errors
+///
+/// Returns an error for incompatible tensors or a refused kernel dispatch.
+pub fn rms_norm<T: FloatElement>(
+    kernel: &Kernel,
+    input: &Tensor<T>,
+    weight: &Tensor<T>,
+) -> Result<Tensor<T>> {
+    let weight = weight.broadcast_as(input.shape())?;
+    let inputs = [TensorRef::new(input)?, TensorRef::new(&weight)?];
+    let [output] = crate::kernel::run::<T, 1>(kernel, &inputs)?;
+    Ok(output)
+}
+
 /// Builds the row program that combines a residual addition with RMS normalization.
 ///
 /// # Errors
@@ -104,6 +129,16 @@ fn residual_norm_rows(
     let value = residual + update;
     let inverse_rms = (value * value).row_mean() + epsilon;
     (value, value * inverse_rms.rsqrt() * weight)
+}
+
+#[crate::kernel::kernel(row)]
+fn rms_norm_rows(
+    input: crate::kernel::Row,
+    weight: crate::kernel::Row,
+    epsilon: f32,
+) -> crate::kernel::Row {
+    let inverse_rms = (input * input).row_mean() + epsilon;
+    input * inverse_rms.rsqrt() * weight
 }
 
 #[crate::kernel::kernel(row)]
