@@ -86,6 +86,29 @@ pub fn attention_and_cache_copy_match_cpu() {
     );
     assert_agrees(&expected, &attended);
 
+    let sequence_major = Tensor::zeros(&[7, 16, 128]).unwrap();
+    forja_sdk::nn::ops::sdpa_into(
+        &query,
+        &key,
+        &value,
+        &sequence_major.permute(&[1, 0, 2]).unwrap(),
+        scale,
+        true,
+        0,
+    )
+    .unwrap();
+    let sequence_major = sequence_major.to_vec().unwrap();
+    for sequence in 0..7 {
+        for head in 0..16 {
+            let source = (head * 7 + sequence) * 128;
+            let destination = (sequence * 16 + head) * 128;
+            assert_agrees(
+                &expected[source..source + 128],
+                &sequence_major[destination..destination + 128],
+            );
+        }
+    }
+
     let source = Tensor::from_slice(&key_values, &[8, 7, 128]).unwrap();
     let cache = Tensor::from_slice(&vec![0.0_f32; 8 * 33 * 128], &[8, 33, 128]).unwrap();
     let mut destination = cache.narrow(1, 5, 7).unwrap();

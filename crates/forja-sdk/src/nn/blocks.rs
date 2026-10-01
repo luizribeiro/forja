@@ -7,7 +7,7 @@ use crate::{
     kernel::{Kernel, TensorRef},
 };
 
-use super::ops::sdpa;
+use super::ops::{sdpa, sdpa_into};
 
 /// Default number of tokens recorded in a full prefill graph.
 pub const DEFAULT_PREFILL_CHUNK: u32 = 512;
@@ -665,10 +665,23 @@ pub fn cached_attention<T: Element>(
     let hidden = query_heads
         .checked_mul(width)
         .ok_or_else(|| Error::loading("attention output width overflowed"))?;
-    sdpa(&query, &cached_key, &cached_value, scale, true, start)?
-        .permute(&[1, 0, 2])?
-        .contiguous()?
-        .reshape(&[sequence, hidden])
+    if sequence != 1 {
+        return sdpa(&query, &cached_key, &cached_value, scale, true, start)?
+            .permute(&[1, 0, 2])?
+            .contiguous()?
+            .reshape(&[sequence, hidden]);
+    }
+    let output = Tensor::<T>::empty(vec![sequence, query_heads, width])?;
+    sdpa_into(
+        &query,
+        &cached_key,
+        &cached_value,
+        &output.permute(&[1, 0, 2])?,
+        scale,
+        true,
+        start,
+    )?;
+    output.reshape(&[sequence, hidden])
 }
 
 #[cfg(test)]
