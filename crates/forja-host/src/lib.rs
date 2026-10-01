@@ -5433,24 +5433,23 @@ mod tests {
             let commands = host.command_list().unwrap();
             requests.push(host.prepare_submit(commands).unwrap());
         }
-        let tasks = requests
-            .into_iter()
-            .map(|request| tokio::spawn(request.run()))
-            .collect::<Vec<_>>();
+        let mut tasks = tokio::task::JoinSet::new();
+        for request in requests {
+            tasks.spawn(request.run());
+        }
 
         gate.wait_for(SUBMITS - 1);
+        let refused = tasks.join_next().await.unwrap().unwrap();
         gate.release();
+        assert!(matches!(refused, Err(compute::Error::Quota(_))));
         let mut accepted = 0;
-        let mut refused = 0;
-        for task in tasks {
-            match task.await.unwrap() {
+        while let Some(task) = tasks.join_next().await {
+            match task.unwrap() {
                 Ok(_) => accepted += 1,
-                Err(compute::Error::Quota(_)) => refused += 1,
                 Err(error) => panic!("unexpected submit error: {error:?}"),
             }
         }
         assert_eq!(accepted, SUBMITS - 1);
-        assert_eq!(refused, 1);
     }
 
     #[tokio::test(flavor = "multi_thread")]
