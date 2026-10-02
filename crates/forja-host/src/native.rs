@@ -284,6 +284,55 @@ impl<B: Backend> NativeCommandList<B> {
     }
 }
 
+#[cfg(target_os = "macos")]
+impl NativeCommandList<forja_metal::MetalBackend> {
+    /// Validates and records one operation with a fixed Metal algorithm.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for foreign tensors, an invalid operation, or a refused variant.
+    pub fn dispatch_variant(
+        &mut self,
+        operation: Op,
+        inputs: &[&NativeTensor<forja_metal::MetalBackend>],
+        outputs: &[&NativeTensor<forja_metal::MetalBackend>],
+        name: &str,
+    ) -> Result<(), BackendError> {
+        if inputs
+            .iter()
+            .chain(outputs)
+            .any(|tensor| !Arc::ptr_eq(&self.backend, &tensor.allocation.backend))
+        {
+            return Err(BackendError::InvalidInput);
+        }
+        let input_tensors = inputs
+            .iter()
+            .map(|tensor| &tensor.tensor)
+            .collect::<Vec<_>>();
+        let output_tensors = outputs
+            .iter()
+            .map(|tensor| &tensor.tensor)
+            .collect::<Vec<_>>();
+        let variant = self
+            .backend
+            .validate_variant_for_op(operation, &input_tensors, &output_tensors, name)
+            .map_err(|_| BackendError::InvalidInput)?;
+        self.commands
+            .dispatch_many_with_backend_data(
+                operation,
+                &input_tensors,
+                &output_tensors,
+                forja_core::BackendDispatchData::new(variant),
+            )
+            .map_err(|_| BackendError::InvalidInput)?;
+        self.retained
+            .extend(inputs.iter().map(|tensor| (*tensor).clone()));
+        self.retained
+            .extend(outputs.iter().map(|tensor| (*tensor).clone()));
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
