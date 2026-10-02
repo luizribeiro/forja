@@ -1,10 +1,10 @@
 use std::{any::Any, collections::HashSet, error::Error, fmt, sync::Arc};
 
 use crate::{
-    Affine, ByteHull, CommandList, Dispatch, Op, OpError, ParamError, ParamSpace, ParamValues,
-    SymbolicLayout, SymbolicLayoutError, Tensor, TensorError, byte_ranges_overlap,
-    gather_matmul_flops, gather_quant_matmul_combine_flops, gather_quant_matmul_flops,
-    gather_quant_silu_mul_flops, matmul_flops,
+    Affine, BackendDispatchData, ByteHull, CommandList, Dispatch, Op, OpError, ParamError,
+    ParamSpace, ParamValues, SymbolicLayout, SymbolicLayoutError, Tensor, TensorError,
+    byte_ranges_overlap, gather_matmul_flops, gather_quant_matmul_combine_flops,
+    gather_quant_matmul_flops, gather_quant_silu_mul_flops, matmul_flops,
     ops::{BufferAccess, barriers_bounded_by, barriers_for_accesses, dispatch_accesses},
     program::{BindError, Inst, PreparedProgram, ProgramKind},
     quant_matmul_flops, sdpa_flops,
@@ -590,7 +590,15 @@ impl DynamicDispatch {
 #[derive(Clone, Debug)]
 enum TemplateDispatch {
     Static(Box<Dispatch>),
-    Dynamic(DynamicDispatch),
+    Dynamic {
+        dispatch: DynamicDispatch,
+        backend_data: Option<BackendDispatchData>,
+    },
+    Rule {
+        dispatch: DynamicDispatch,
+        parameter: u8,
+        arms: Vec<(u32, BackendDispatchData)>,
+    },
 }
 
 /// A validated command sequence over one parameter space.
@@ -721,7 +729,8 @@ impl GraphTemplate {
                     .chain(dispatch.outputs())
                     .cloned()
                     .collect::<Vec<_>>(),
-                TemplateDispatch::Dynamic(dispatch) => dispatch
+                TemplateDispatch::Dynamic { dispatch, .. }
+                | TemplateDispatch::Rule { dispatch, .. } => dispatch
                     .tensors()
                     .map(|tensor| match tensor {
                         TemplateTensor::Concrete(tensor)
@@ -748,7 +757,7 @@ impl GraphTemplate {
             .enumerate()
             .filter_map(|(index, dispatch)| match dispatch {
                 TemplateDispatch::Static(dispatch) => Some((index, dispatch.as_ref())),
-                TemplateDispatch::Dynamic(_) => None,
+                TemplateDispatch::Dynamic { .. } | TemplateDispatch::Rule { .. } => None,
             })
     }
 
@@ -788,11 +797,54 @@ impl GraphTemplate {
         inputs: &[&TemplateTensor],
         outputs: &[&TemplateTensor],
     ) -> Result<(), GraphError> {
-        self.record(DynamicDispatch::Operation {
-            op: op.into(),
-            inputs: inputs.iter().map(|tensor| (*tensor).clone()).collect(),
-            outputs: outputs.iter().map(|tensor| (*tensor).clone()).collect(),
-        })
+        self.record(
+            DynamicDispatch::Operation {
+                op: op.into(),
+                inputs: inputs.iter().map(|tensor| (*tensor).clone()).collect(),
+                outputs: outputs.iter().map(|tensor| (*tensor).clone()).collect(),
+            },
+            None,
+        )
+    }
+
+    /// Validates and records an operation with a fixed backend selection.
+    #[doc(hidden)]
+    pub fn dispatch_variant_many(
+        &mut self,
+        op: impl Into<TemplateOp>,
+        inputs: &[&TemplateTensor],
+        outputs: &[&TemplateTensor],
+        data: BackendDispatchData,
+    ) -> Result<(), GraphError> {
+        self.record(
+            DynamicDispatch::Operation {
+                op: op.into(),
+                inputs: inputs.iter().map(|tensor| (*tensor).clone()).collect(),
+                outputs: outputs.iter().map(|tensor| (*tensor).clone()).collect(),
+            },
+            Some(data),
+        )
+    }
+
+    /// Validates and records an operation selected by replay parameter intervals.
+    #[doc(hidden)]
+    pub fn dispatch_variant_rule_many(
+        &mut self,
+        op: impl Into<TemplateOp>,
+        inputs: &[&TemplateTensor],
+        outputs: &[&TemplateTensor],
+        parameter: u8,
+        arms: Vec<(u32, BackendDispatchData)>,
+    ) -> Result<(), GraphError> {
+        self.record_rule(
+            DynamicDispatch::Operation {
+                op: op.into(),
+                inputs: inputs.iter().map(|tensor| (*tensor).clone()).collect(),
+                outputs: outputs.iter().map(|tensor| (*tensor).clone()).collect(),
+            },
+            parameter,
+            arms,
+        )
     }
 
     /// Validates and records one prepared scalar-program dispatch at every corner.
@@ -807,11 +859,14 @@ impl GraphTemplate {
         inputs: &[&TemplateTensor],
         outputs: &[&TemplateTensor],
     ) -> Result<(), GraphError> {
-        self.record(DynamicDispatch::Program {
-            program: Arc::clone(program),
-            inputs: inputs.iter().map(|tensor| (*tensor).clone()).collect(),
-            outputs: outputs.iter().map(|tensor| (*tensor).clone()).collect(),
-        })
+        self.record(
+            DynamicDispatch::Program {
+                program: Arc::clone(program),
+                inputs: inputs.iter().map(|tensor| (*tensor).clone()).collect(),
+                outputs: outputs.iter().map(|tensor| (*tensor).clone()).collect(),
+            },
+            None,
+        )
     }
 
     /// Records a concrete dispatch already validated at its command-list boundary.
@@ -846,7 +901,33 @@ impl GraphTemplate {
         for dispatch in &self.dispatches {
             let concrete = match dispatch {
                 TemplateDispatch::Static(dispatch) => dispatch.as_ref().clone(),
-                TemplateDispatch::Dynamic(dispatch) => dispatch.instantiate(values, self.limits)?,
+                TemplateDispatch::Dynamic {
+                    dispatch,
+                    backend_data,
+                } => {
+                    let concrete = dispatch.instantiate(values, self.limits)?;
+                    backend_data
+                        .clone()
+                        .map_or(concrete.clone(), |data| concrete.with_backend_data(data))
+                }
+                TemplateDispatch::Rule {
+                    dispatch,
+                    parameter,
+                    arms,
+                } => {
+                    let value = values
+                        .as_slice()
+                        .get(usize::from(*parameter))
+                        .ok_or(GraphError::ParameterSpaceMismatch)?;
+                    let data = arms
+                        .iter()
+                        .find(|(hi, _)| value <= hi)
+                        .map(|(_, data)| data.clone())
+                        .ok_or(GraphError::ParameterSpaceMismatch)?;
+                    dispatch
+                        .instantiate(values, self.limits)?
+                        .with_backend_data(data)
+                }
             };
             commands.push_and_reset_validation(concrete);
         }
@@ -854,7 +935,11 @@ impl GraphTemplate {
         Ok(commands)
     }
 
-    fn record(&mut self, dispatch: DynamicDispatch) -> Result<(), GraphError> {
+    fn record(
+        &mut self,
+        dispatch: DynamicDispatch,
+        backend_data: Option<BackendDispatchData>,
+    ) -> Result<(), GraphError> {
         if self.dispatches.len() >= self.limits.dispatches {
             return Err(GraphError::DispatchLimit);
         }
@@ -873,11 +958,45 @@ impl GraphTemplate {
             dispatch.instantiate(&values, self.limits)?;
         }
         if dispatch.is_parameter_dependent() {
-            self.dispatches.push(TemplateDispatch::Dynamic(dispatch));
+            self.dispatches.push(TemplateDispatch::Dynamic {
+                dispatch,
+                backend_data,
+            });
         } else {
+            let first = backend_data.map_or(first.clone(), |data| first.with_backend_data(data));
             self.dispatches
                 .push(TemplateDispatch::Static(Box::new(first)));
         }
+        self.record_accesses(accesses, hull_accesses);
+        Ok(())
+    }
+
+    fn record_rule(
+        &mut self,
+        dispatch: DynamicDispatch,
+        parameter: u8,
+        arms: Vec<(u32, BackendDispatchData)>,
+    ) -> Result<(), GraphError> {
+        if self.dispatches.len() >= self.limits.dispatches {
+            return Err(GraphError::DispatchLimit);
+        }
+        if arms.is_empty()
+            || !dispatch.uses_only(&self.space)
+            || usize::from(parameter) >= self.space.ranges().len()
+        {
+            return Err(GraphError::ParameterSpaceMismatch);
+        }
+        dispatch.check_hull_aliasing()?;
+        let accesses = dispatch.accesses()?;
+        let hull_accesses = dispatch.hull_accesses()?;
+        for values in self.space.corners() {
+            dispatch.instantiate(&values, self.limits)?;
+        }
+        self.dispatches.push(TemplateDispatch::Rule {
+            dispatch,
+            parameter,
+            arms,
+        });
         self.record_accesses(accesses, hull_accesses);
         Ok(())
     }
@@ -917,8 +1036,8 @@ mod tests {
         GraphError, GraphLimits, GraphTemplate, TemplateDispatch, TemplateOp, TemplateTensor,
     };
     use crate::{
-        Affine, BufferId, CommandList, DType, Dispatch, Layout, Op, OpError, Operand, ParamError,
-        ParamSpace, ParamValues, SymbolicLayout, Tensor,
+        Affine, BackendDispatchData, BufferId, CommandList, DType, Dispatch, Layout, Op, OpError,
+        Operand, ParamError, ParamSpace, ParamValues, SymbolicLayout, Tensor,
         ops::{BufferAccess, barriers_for_accesses},
         program::{
             Inst, KernelSignature, PreparedProgram, Program, ProgramKind, prepared_for_test,
@@ -934,6 +1053,38 @@ mod tests {
             * DType::F32.byte_size();
         let layout = Layout::contiguous(DType::F32, 0, shape.to_vec(), bytes).unwrap();
         Tensor::from_allocation(BufferId::new(1, buffer, bytes), layout, true).unwrap()
+    }
+
+    #[test]
+    fn variant_rules_select_inclusive_boundary_arms() {
+        let space = ParamSpace::new(std::iter::once(1..=33).collect()).unwrap();
+        let left = TemplateTensor::from(tensor(1, &[1, 7]));
+        let right = TemplateTensor::from(tensor(2, &[7, 33]));
+        let output = TemplateTensor::from(tensor(3, &[1, 33]));
+        let mut graph = GraphTemplate::new(space.clone(), GraphLimits::default());
+        graph
+            .dispatch_variant_rule_many(
+                Op::Matmul,
+                &[&left, &right],
+                &[&output],
+                0,
+                vec![
+                    (7, BackendDispatchData::new("low")),
+                    (33, BackendDispatchData::new("high")),
+                ],
+            )
+            .unwrap();
+
+        let at_seven = graph.instantiate(&space.values(vec![7]).unwrap()).unwrap();
+        let at_eight = graph.instantiate(&space.values(vec![8]).unwrap()).unwrap();
+        assert_eq!(
+            at_seven.dispatches()[0].backend_data::<&str>(),
+            Some(&"low")
+        );
+        assert_eq!(
+            at_eight.dispatches()[0].backend_data::<&str>(),
+            Some(&"high")
+        );
     }
 
     fn symbolic_prefix(
