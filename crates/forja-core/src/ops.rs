@@ -1,4 +1,5 @@
 use std::{
+    any::Any,
     error::Error,
     fmt,
     ops::Range,
@@ -328,12 +329,51 @@ impl fmt::Display for OpError {
 impl Error for OpError {}
 
 /// A dispatch whose signature and aliasing have been validated.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Dispatch {
     op: Op,
     inputs: Vec<Tensor>,
     outputs: Vec<Tensor>,
     program: Option<ProgramDispatch>,
+    backend_data: Option<BackendDispatchData>,
+}
+
+/// Type-erased backend selection retained with a validated dispatch.
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct BackendDispatchData(Arc<dyn Any + Send + Sync>);
+
+impl fmt::Debug for BackendDispatchData {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("BackendDispatchData")
+    }
+}
+
+impl BackendDispatchData {
+    /// Erases backend-owned dispatch data while retaining its concrete type.
+    #[must_use]
+    pub fn new<T: Any + Send + Sync>(data: T) -> Self {
+        Self(Arc::new(data))
+    }
+
+    /// Returns the retained data when its concrete type matches.
+    #[must_use]
+    pub fn get<T: Any + Send + Sync>(&self) -> Option<&T> {
+        self.0.downcast_ref()
+    }
+}
+
+impl fmt::Debug for Dispatch {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Dispatch")
+            .field("op", &self.op)
+            .field("inputs", &self.inputs)
+            .field("outputs", &self.outputs)
+            .field("program", &self.program)
+            .field("backend_data", &self.backend_data)
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -412,6 +452,7 @@ impl Dispatch {
             inputs: inputs.iter().map(|tensor| (*tensor).clone()).collect(),
             outputs: outputs.iter().map(|tensor| (*tensor).clone()).collect(),
             program: None,
+            backend_data: None,
         })
     }
 
@@ -439,6 +480,7 @@ impl Dispatch {
                 bound,
                 prepared: Arc::clone(program),
             }),
+            backend_data: None,
         })
     }
 
@@ -477,6 +519,27 @@ impl Dispatch {
     #[must_use]
     pub fn prepared_program(&self) -> Option<&Arc<PreparedProgram>> {
         self.program.as_ref().map(|program| &program.prepared)
+    }
+
+    /// Attaches backend-owned selection data to this validated dispatch.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_backend_data(mut self, data: BackendDispatchData) -> Self {
+        self.backend_data = Some(data);
+        self
+    }
+
+    /// Replaces backend-owned selection data after validation.
+    #[doc(hidden)]
+    pub fn set_backend_data(&mut self, data: BackendDispatchData) {
+        self.backend_data = Some(data);
+    }
+
+    /// Returns backend-owned selection data when its concrete type matches.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn backend_data<T: Any + Send + Sync>(&self) -> Option<&T> {
+        self.backend_data.as_ref()?.get()
     }
 }
 
@@ -547,6 +610,35 @@ impl CommandList {
         Ok(())
     }
 
+    /// Records a dispatch carrying a backend-owned validated selection.
+    #[doc(hidden)]
+    pub fn dispatch_many_with_backend_data(
+        &mut self,
+        op: Op,
+        inputs: &[&Tensor],
+        outputs: &[&Tensor],
+        data: BackendDispatchData,
+    ) -> Result<(), OpError> {
+        let dispatch = Dispatch::new_many(op, inputs, outputs)?.with_backend_data(data);
+        self.push_and_reset_validation(dispatch);
+        Ok(())
+    }
+
+    /// Records a dispatch that was already validated through this command boundary.
+    #[doc(hidden)]
+    pub fn record_validated(&mut self, dispatch: Dispatch) {
+        self.push_and_reset_validation(dispatch);
+    }
+
+    /// Attaches backend-owned selection data to the most recent dispatch.
+    #[doc(hidden)]
+    pub fn set_last_backend_data(&mut self, data: BackendDispatchData) -> bool {
+        self.dispatches.last_mut().is_some_and(|dispatch| {
+            dispatch.set_backend_data(data);
+            true
+        })
+    }
+
     /// Binds, validates, and records a prepared scalar-program dispatch.
     ///
     /// # Errors
@@ -608,6 +700,13 @@ impl CommandList {
     #[must_use]
     pub fn last_dispatch(&self) -> Option<&Dispatch> {
         self.dispatches.last()
+    }
+
+    /// Returns the validated dispatch sequence.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn dispatches(&self) -> &[Dispatch] {
+        &self.dispatches
     }
 }
 
