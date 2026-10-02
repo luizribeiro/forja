@@ -15,7 +15,7 @@ const TOKENS: [u32; 3] = [1, 7, 32];
 
 #[tokio::test(flavor = "multi_thread")]
 async fn cpu_toy_mlp_matches_native_sdk() -> wasmtime::Result<()> {
-    compare(forja_cpu::CpuBackend::new(), NativeDevice::Cpu, "cpu").await
+    compare(forja_cpu::CpuBackend::new(), NativeDevice::Cpu, "cpu", None).await
 }
 
 #[cfg(target_os = "macos")]
@@ -25,17 +25,24 @@ async fn metal_toy_mlp_matches_native_sdk() -> wasmtime::Result<()> {
         forja_metal::MetalBackend::new().map_err(wasmtime::Error::msg)?,
         NativeDevice::Metal,
         "metal",
+        Some("steel_gemm_64_32_32_2_2"),
     )
     .await
 }
 
-async fn compare<B>(backend: B, device: NativeDevice, label: &str) -> wasmtime::Result<()>
+async fn compare<B>(
+    backend: B,
+    device: NativeDevice,
+    label: &str,
+    portable_matmul_kernel: Option<&str>,
+) -> wasmtime::Result<()>
 where
     B: Backend + Send + Sync + 'static,
 {
     let path = weight_file(label)?;
     let expected = native_outputs(&path, device)?;
     let mut runner = EngineRunner::new(test_guests::toy_mlp(), backend, LIMITS, &path).await?;
+    runner.set_profiling(portable_matmul_kernel.is_some());
     let info = runner.describe().await?;
     assert_eq!(info.vocab, VOCAB);
     assert_eq!(info.max_context, MAX_CONTEXT);
@@ -54,6 +61,22 @@ where
     assert_eq!(output.taps.len(), expected.1.len());
     for (tensor, expected) in output.taps.iter().zip(&expected.1) {
         assert_agrees(expected, &decode(&runner.read(tensor).await?)?);
+    }
+    if let Some(expected_kernel) = portable_matmul_kernel {
+        let profile = runner
+            .take_profile()
+            .ok_or_else(|| wasmtime::Error::msg("Metal step profile is missing"))?;
+        let submission = profile
+            .submission
+            .ok_or_else(|| wasmtime::Error::msg("Metal submission profile is missing"))?;
+        let kernels = submission
+            .per_dispatch
+            .iter()
+            .filter(|dispatch| matches!(dispatch.op, forja_core::Op::Matmul))
+            .map(|dispatch| dispatch.kernel)
+            .collect::<Vec<_>>();
+        assert!(!kernels.is_empty());
+        assert!(kernels.iter().all(|kernel| *kernel == expected_kernel));
     }
     Ok(())
 }
