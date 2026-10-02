@@ -1,6 +1,7 @@
 use std::{collections::BTreeMap, num::NonZeroU32};
 
 use serde::{Deserialize, Deserializer, Serialize, de};
+use sha2::{Digest, Sha256};
 
 /// A validated engine build profile.
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -75,6 +76,16 @@ impl Profile {
     /// Returns an error if the typed profile cannot be represented as TOML.
     pub fn canonical_toml(&self) -> Result<String, toml::ser::Error> {
         toml::to_string(self)
+    }
+
+    /// Returns the SHA-256 identity of the canonical profile.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the typed profile cannot be represented as TOML.
+    pub fn sha256(&self) -> Result<String, toml::ser::Error> {
+        let canonical = self.canonical_toml()?;
+        Ok(format!("sha256:{:x}", Sha256::digest(canonical)))
     }
 }
 

@@ -33,6 +33,10 @@ tokenizers = { version = "0.22", default-features = false, features = [
   "fancy-regex",
 ] }
 toml = "1.0"
+wasmparser = { version = "0.258", default-features = false, features = [
+  "component-model",
+  "std",
+] }
 wasmtime = { version = "49", default-features = false, features = [
   "component-model-async",
   "component-model",

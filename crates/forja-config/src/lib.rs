@@ -2,6 +2,7 @@
 
 #![forbid(unsafe_code)]
 
+mod component;
 mod files;
 mod layer;
 mod profile;
@@ -9,6 +10,7 @@ mod set;
 mod units;
 mod weights;
 
+pub use component::{ProfileSectionError, embed_profile, read_profile};
 pub use files::{dev_layers, file_layer, user_config_path};
 pub use layer::{ConfigError, KeyPath, Layer, Layered, Origin, Schema, layer};
 pub use profile::{

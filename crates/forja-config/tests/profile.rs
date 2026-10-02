@@ -58,8 +58,11 @@ fn parses_and_canonicalizes_a_dense_profile() {
     assert!(profile.quantization().is_none());
 
     let canonical = profile.canonical_toml().unwrap();
-    assert_eq!(toml::from_str::<Profile>(&canonical).unwrap(), profile);
+    let reparsed = toml::from_str::<Profile>(&canonical).unwrap();
+    assert_eq!(reparsed, profile);
     assert_eq!(canonical, profile.canonical_toml().unwrap());
+    assert_eq!(profile.sha256().unwrap().len(), 71);
+    assert_eq!(profile.sha256().unwrap(), reparsed.sha256().unwrap());
 }
 
 #[test]
