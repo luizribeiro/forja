@@ -219,6 +219,7 @@ fn engine_load_config() -> proc_macro2::TokenStream {
     quote! {
         ::forja_sdk::EngineLoadConfig {
             num_hidden_layers: config.num_hidden_layers,
+            replay: config.replay,
             tunings: config.tunings,
             fixed_variant_picks: config.fixed_variant_picks.into_iter().map(|pick| {
                 ::forja_sdk::FixedVariantPick { site: pick.site, name: pick.name }

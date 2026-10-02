@@ -24,7 +24,6 @@ crate-type = ["cdylib", "rlib"]
 [features]
 bf16 = []
 default = []
-no-replay = []
 
 [dependencies]
 forja-sdk = { path = "../../crates/forja-sdk", features = ["metal-variants"] }

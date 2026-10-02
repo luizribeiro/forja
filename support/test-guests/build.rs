@@ -45,8 +45,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         qwen3_final_norm,
         qwen3_all_fusions,
         qwen3_bf16_all_fusions,
-        qwen3_no_replay,
-        qwen3_bf16_no_replay,
     ] = build_qwen_profiles(
         &qwen3_manifest,
         &guest_target_dir,
@@ -54,10 +52,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &out_dir,
     )?;
     let release_dir = guest_target_dir.join("wasm32-wasip2/release");
-    let [olmoe, olmoe_no_replay] =
-        build_olmoe_profiles(&olmoe_manifest, &guest_target_dir, &out_dir)?;
-    let [qwen3_coder, qwen3_coder_no_replay] =
-        build_qwen3_coder_profiles(&qwen3_coder_manifest, &guest_target_dir, &out_dir)?;
+    let olmoe = build_olmoe_profile(&olmoe_manifest, &guest_target_dir, &out_dir)?;
+    let qwen3_coder =
+        build_qwen3_coder_profile(&qwen3_coder_manifest, &guest_target_dir, &out_dir)?;
     emit_guest_path("HELLO_COMPONENT", &release_dir.join("hello.wasm"));
     emit_guest_path(
         "METAL_VARIANT_SMOKE_COMPONENT",
@@ -91,8 +88,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     emit_guest_path("TOY_MLP_COMPONENT", &release_dir.join("toy_mlp.wasm"));
     emit_guest_path("QWEN3_COMPONENT", &qwen3);
     emit_guest_path("OLMOE_COMPONENT", &olmoe);
-    emit_guest_path("OLMOE_NO_REPLAY_COMPONENT", &olmoe_no_replay);
-    emit_qwen3_coder_paths(&qwen3_coder, &qwen3_coder_no_replay);
+    emit_guest_path("QWEN3_CODER_COMPONENT", &qwen3_coder);
     emit_guest_path("QWEN3_BF16_COMPONENT", &qwen3_bf16);
     emit_guest_path("QWEN3_RESIDUAL_NORM_COMPONENT", &qwen3_residual_norm);
     emit_guest_path(
@@ -104,8 +100,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     emit_guest_path("QWEN3_FINAL_NORM_COMPONENT", &qwen3_final_norm);
     emit_guest_path("QWEN3_ALL_FUSIONS_COMPONENT", &qwen3_all_fusions);
     emit_guest_path("QWEN3_BF16_ALL_FUSIONS_COMPONENT", &qwen3_bf16_all_fusions);
-    emit_guest_path("QWEN3_NO_REPLAY_COMPONENT", &qwen3_no_replay);
-    emit_guest_path("QWEN3_BF16_NO_REPLAY_COMPONENT", &qwen3_bf16_no_replay);
     emit_guest_path(
         "WEIGHTS_SMOKE_COMPONENT",
         &release_dir.join("weights_smoke.wasm"),
@@ -141,43 +135,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn emit_qwen3_coder_paths(default: &Path, no_replay: &Path) {
-    emit_guest_path("QWEN3_CODER_COMPONENT", default);
-    emit_guest_path("QWEN3_CODER_NO_REPLAY_COMPONENT", no_replay);
-}
-
-fn build_qwen3_coder_profiles(
+fn build_qwen3_coder_profile(
     manifest: &Path,
     target_dir: &Path,
     out_dir: &Path,
-) -> io::Result<[PathBuf; 2]> {
+) -> io::Result<PathBuf> {
     let component = target_dir.join("wasm32-wasip2/release/qwen3_coder.wasm");
     forja_build::build_component(manifest, target_dir, &[])?;
     let profile = manifest
         .parent()
         .ok_or_else(|| io::Error::other("Qwen3-Coder manifest has no parent"))?
         .join("profiles/qwen3-coder-30b-a3b-instruct-4bit.metal-apple-m3-ultra.q4.toml");
-    let default = copy_profiled_component(&component, &profile, out_dir, "qwen3-coder.wasm")?;
-    forja_build::build_component(manifest, target_dir, &["--features", "no-replay"])?;
-    let no_replay = copy_component(&component, out_dir, "qwen3-coder-no-replay.wasm")?;
-    Ok([default, no_replay])
+    copy_profiled_component(&component, &profile, out_dir, "qwen3-coder.wasm")
 }
 
-fn build_olmoe_profiles(
-    manifest: &Path,
-    target_dir: &Path,
-    out_dir: &Path,
-) -> io::Result<[PathBuf; 2]> {
+fn build_olmoe_profile(manifest: &Path, target_dir: &Path, out_dir: &Path) -> io::Result<PathBuf> {
     let component = target_dir.join("wasm32-wasip2/release/olmoe.wasm");
     forja_build::build_component(manifest, target_dir, &[])?;
     let profile = manifest
         .parent()
         .ok_or_else(|| io::Error::other("OLMoE manifest has no parent"))?
         .join("profiles/olmoe-1b-7b-0924.metal-apple-m3-ultra.bf16.toml");
-    let default = copy_profiled_component(&component, &profile, out_dir, "olmoe.wasm")?;
-    forja_build::build_component(manifest, target_dir, &["--features", "no-replay"])?;
-    let no_replay = copy_component(&component, out_dir, "olmoe-no-replay.wasm")?;
-    Ok([default, no_replay])
+    copy_profiled_component(&component, &profile, out_dir, "olmoe.wasm")
 }
 
 fn build_qwen_profiles(
@@ -185,7 +164,7 @@ fn build_qwen_profiles(
     target_dir: &Path,
     bf16_target_dir: &Path,
     out_dir: &Path,
-) -> io::Result<[PathBuf; 11]> {
+) -> io::Result<[PathBuf; 9]> {
     let release_dir = target_dir.join("wasm32-wasip2/release");
     let bf16_release_dir = bf16_target_dir.join("wasm32-wasip2/release");
     let profiles = manifest
@@ -227,20 +206,6 @@ fn build_qwen_profiles(
         copy_component(&qwen3_bf16, out_dir, "qwen3-bf16-residual-norm.wasm")?;
     let qwen3_bf16_all_fusions =
         copy_component(&qwen3_bf16, out_dir, "qwen3-bf16-all-fusions.wasm")?;
-    build_qwen_profile(manifest, target_dir, "no-replay")?;
-    let qwen3_no_replay = copy_component(
-        &release_dir.join("qwen3.wasm"),
-        out_dir,
-        "qwen3-no-replay.wasm",
-    )?;
-    build_qwen_profile(manifest, bf16_target_dir, "bf16,no-replay")?;
-    let qwen3_bf16_no_replay = copy_component(
-        &bf16_release_dir.join("qwen3.wasm"),
-        out_dir,
-        "qwen3-bf16-no-replay.wasm",
-    )?;
-    fs::copy(&qwen3, release_dir.join("qwen3.wasm"))?;
-    fs::copy(&qwen3_bf16, bf16_release_dir.join("qwen3.wasm"))?;
     Ok([
         qwen3,
         qwen3_bf16,
@@ -251,17 +216,7 @@ fn build_qwen_profiles(
         qwen3_final_norm,
         qwen3_all_fusions,
         qwen3_bf16_all_fusions,
-        qwen3_no_replay,
-        qwen3_bf16_no_replay,
     ])
-}
-
-fn build_qwen_profile(manifest: &Path, target_dir: &Path, features: &str) -> io::Result<()> {
-    forja_build::build_component(
-        manifest,
-        target_dir,
-        &["--no-default-features", "--features", features],
-    )
 }
 
 fn copy_component(source: &Path, out_dir: &Path, name: &str) -> io::Result<PathBuf> {

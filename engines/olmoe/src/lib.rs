@@ -35,9 +35,6 @@ pub const TOP_K: u32 = 8;
 const RMS_EPSILON: f32 = 1.0e-5;
 const ROPE_THETA: f32 = 10_000.0;
 const ATTENTION_SCALE: f32 = 0.088_388_35;
-#[cfg(target_family = "wasm")]
-const REPLAY_DECODE: bool = !cfg!(feature = "no-replay");
-
 #[derive(Clone, Copy)]
 struct Config;
 
@@ -267,6 +264,8 @@ pub struct Olmoe {
     caches: Vec<KvCache<f32>>,
     positions: Tensor<u32>,
     #[cfg(target_family = "wasm")]
+    replay: bool,
+    #[cfg(target_family = "wasm")]
     decode: DecodeState,
     #[cfg(target_family = "wasm")]
     prefill: Option<ChunkedPrefill<f32>>,
@@ -287,6 +286,8 @@ impl Olmoe {
             variants,
             caches,
             positions: Tensor::constant(&(0..MAX_CONTEXT).collect::<Vec<_>>(), &[MAX_CONTEXT])?,
+            #[cfg(target_family = "wasm")]
+            replay: config.replay,
             #[cfg(target_family = "wasm")]
             decode: DecodeState::new(MAX_CONTEXT)?,
             #[cfg(target_family = "wasm")]
@@ -430,7 +431,7 @@ impl Engine for Olmoe {
             .filter(|&end| end <= MAX_CONTEXT)
             .ok_or_else(|| forja_sdk::Error::loading("tokens exceed the 4096-token context"))?;
         #[cfg(target_family = "wasm")]
-        if REPLAY_DECODE && sequence == 1 && !input.taps {
+        if self.replay && sequence == 1 && !input.taps {
             let logits =
                 self.replay_decode(Some(&input.tokens), input.start_pos, DecodeSelection::None)?;
             return Ok(StepOutput {
@@ -441,7 +442,7 @@ impl Engine for Olmoe {
         }
         #[cfg(target_family = "wasm")]
         if sequence > 1 && !input.taps && self.prefill_supports(input.start_pos, sequence) {
-            let logits = if REPLAY_DECODE {
+            let logits = if self.replay {
                 self.replay_prefill(&input.tokens, input.start_pos)?
             } else {
                 self.lazy_prefill(&input.tokens, input.start_pos)?
@@ -485,13 +486,13 @@ impl Engine for Olmoe {
                         forja_sdk::Error::loading("decode tokens exceed the 4096-token context")
                     })?;
                 if self.prefill_supports(input.start_pos, sequence) {
-                    let logits = if REPLAY_DECODE {
+                    let logits = if self.replay {
                         self.replay_prefill(&tokens, input.start_pos)?
                     } else {
                         self.lazy_prefill(&tokens, input.start_pos)?
                     };
                     self.select_token(logits, end - 1)
-                } else if REPLAY_DECODE && sequence == 1 {
+                } else if self.replay && sequence == 1 {
                     self.decode_selected(Some(&tokens), input.start_pos, selection)
                 } else {
                     let start = input.start_pos.into();
@@ -503,7 +504,7 @@ impl Engine for Olmoe {
                     self.select_token(logits, end - 1)
                 }
             }
-            None if input.start_pos < MAX_CONTEXT && REPLAY_DECODE => {
+            None if input.start_pos < MAX_CONTEXT && self.replay => {
                 self.decode_selected(None, input.start_pos, selection)
             }
             None if input.start_pos < MAX_CONTEXT => {

@@ -6,6 +6,7 @@ use forja_host::{EngineLoadConfig, FixedVariantPick, VariantPickArm, VariantRule
 pub fn load_config(component: &Path) -> Result<EngineLoadConfig, Box<dyn Error>> {
     let profile = read_profile(&fs::read(component)?)?;
     Ok(EngineLoadConfig {
+        replay: true,
         tunings: profile.default_tunings().to_vec(),
         fixed_variant_picks: profile
             .variants()

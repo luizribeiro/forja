@@ -12,6 +12,7 @@ interface engine {
 
   record load-config {
     num-hidden-layers: option<u32>,
+    replay: bool,
     tunings: list<string>,
     fixed-variant-picks: list<fixed-variant-pick>,
     variant-rule-picks: list<variant-rule-pick>,

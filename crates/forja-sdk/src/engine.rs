@@ -14,16 +14,30 @@ pub struct EngineInfo {
 }
 
 /// Optional model dimensions selected when an engine loads.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EngineLoadConfig {
     /// Number of leading decoder layers to load, or all layers when absent.
     pub num_hidden_layers: Option<u32>,
+    /// Whether to capture and replay reusable graphs.
+    pub replay: bool,
     /// Effective registered tuning names.
     pub tunings: Vec<String>,
     /// Effective fixed variant picks.
     pub fixed_variant_picks: Vec<FixedVariantPick>,
     /// Effective parameter-dependent variant picks.
     pub variant_rule_picks: Vec<VariantRulePick>,
+}
+
+impl Default for EngineLoadConfig {
+    fn default() -> Self {
+        Self {
+            num_hidden_layers: None,
+            replay: true,
+            tunings: Vec::new(),
+            fixed_variant_picks: Vec::new(),
+            variant_rule_picks: Vec::new(),
+        }
+    }
 }
 
 /// One fixed engine dispatch-site selection.

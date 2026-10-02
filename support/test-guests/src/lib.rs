@@ -75,40 +75,16 @@ pub fn olmoe() -> &'static Path {
     Path::new(env!("OLMOE_COMPONENT"))
 }
 
-/// Returns `OLMoE` with graph replay disabled.
-#[must_use]
-pub fn olmoe_no_replay() -> &'static Path {
-    Path::new(env!("OLMOE_NO_REPLAY_COMPONENT"))
-}
-
 /// Returns the Qwen3-Coder-30B-A3B-Instruct MLX 4-bit engine component.
 #[must_use]
 pub fn qwen3_coder() -> &'static Path {
     Path::new(env!("QWEN3_CODER_COMPONENT"))
 }
 
-/// Returns the Qwen3-Coder engine with graph replay disabled.
-#[must_use]
-pub fn qwen3_coder_no_replay() -> &'static Path {
-    Path::new(env!("QWEN3_CODER_NO_REPLAY_COMPONENT"))
-}
-
 /// Returns the path to the bf16 Qwen3-0.6B engine component.
 #[must_use]
 pub fn qwen3_bf16() -> &'static Path {
     Path::new(env!("QWEN3_BF16_COMPONENT"))
-}
-
-/// Returns the path to Qwen3 with graph replay disabled.
-#[must_use]
-pub fn qwen3_no_replay() -> &'static Path {
-    Path::new(env!("QWEN3_NO_REPLAY_COMPONENT"))
-}
-
-/// Returns the path to bf16 Qwen3 with graph replay disabled.
-#[must_use]
-pub fn qwen3_bf16_no_replay() -> &'static Path {
-    Path::new(env!("QWEN3_BF16_NO_REPLAY_COMPONENT"))
 }
 
 /// Returns the path to Qwen3 with only fused residual normalization.

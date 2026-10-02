@@ -143,7 +143,7 @@ async fn metal_replay_matches_lazy_decode() -> Result<(), Box<dyn Error>> {
                 forja_metal::MetalBackend::with_graph_replay(forja_metal::MetalGraphReplay::Tier2)?,
             ),
         ],
-        forja_metal::MetalBackend::new()?,
+        forja_metal::MetalBackend::with_graph_replay(forja_metal::MetalGraphReplay::Tier1)?,
         128,
     )
     .await
@@ -167,9 +167,9 @@ async fn metal_greedy_selection_matches_host_argmax() -> Result<(), Box<dyn Erro
 #[ignore = "requires FORJA_MODELS and runs in the pre-push hook"]
 async fn metal_sampled_selection_matches_sequential() -> Result<(), Box<dyn Error>> {
     compare_pipelined_selection(
+        forja_metal::MetalBackend::with_graph_replay(forja_metal::MetalGraphReplay::Tier1)?,
         forja_metal::MetalBackend::new()?,
-        forja_metal::MetalBackend::new()?,
-        test_guests::qwen3_bf16_no_replay(),
+        test_guests::qwen3_bf16(),
         test_guests::qwen3_bf16(),
         128,
         SamplingParams {
@@ -187,9 +187,9 @@ async fn metal_sampled_selection_matches_sequential() -> Result<(), Box<dyn Erro
 #[ignore = "requires FORJA_MODELS and runs in the pre-push hook"]
 async fn metal_greedy_graph_matches_sample_at_zero_temperature() -> Result<(), Box<dyn Error>> {
     compare_pipelined_selection(
+        forja_metal::MetalBackend::with_graph_replay(forja_metal::MetalGraphReplay::Tier1)?,
         forja_metal::MetalBackend::new()?,
-        forja_metal::MetalBackend::new()?,
-        test_guests::qwen3_bf16_no_replay(),
+        test_guests::qwen3_bf16(),
         test_guests::qwen3_bf16(),
         128,
         SamplingParams::default(),
@@ -511,7 +511,7 @@ where
         ));
     }
     let mut lazy = EngineRunner::new(
-        test_guests::qwen3_bf16_no_replay(),
+        test_guests::qwen3_bf16(),
         lazy_backend,
         REPLAY_LIMITS,
         weights,
@@ -521,7 +521,9 @@ where
     for (_, replay) in &mut replays {
         replay.load_with_selections(None, &config).await??;
     }
-    lazy.load_with_selections(None, &config).await??;
+    let mut lazy_config = config;
+    lazy_config.replay = false;
+    lazy.load_with_selections(None, &lazy_config).await??;
     let prompt = (0_u32..8).collect::<Vec<_>>();
     for (_, replay) in &mut replays {
         replay
@@ -608,6 +610,7 @@ fn native_load_config() -> Result<forja_sdk::EngineLoadConfig, Box<dyn Error>> {
     let config = common::load_config(test_guests::qwen3())?;
     Ok(forja_sdk::EngineLoadConfig {
         num_hidden_layers: None,
+        replay: config.replay,
         tunings: config.tunings,
         fixed_variant_picks: config
             .fixed_variant_picks

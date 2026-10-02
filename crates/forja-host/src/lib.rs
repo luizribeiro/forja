@@ -110,14 +110,27 @@ pub struct EngineInfo {
 }
 
 /// Effective engine-side selections supplied during load.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EngineLoadConfig {
+    /// Whether the guest captures and replays reusable graphs.
+    pub replay: bool,
     /// Registered tuning names.
     pub tunings: Vec<String>,
     /// Fixed variant selections.
     pub fixed_variant_picks: Vec<FixedVariantPick>,
     /// Parameter-dependent variant selections.
     pub variant_rule_picks: Vec<VariantRulePick>,
+}
+
+impl Default for EngineLoadConfig {
+    fn default() -> Self {
+        Self {
+            replay: true,
+            tunings: Vec::new(),
+            fixed_variant_picks: Vec::new(),
+            variant_rule_picks: Vec::new(),
+        }
+    }
 }
 
 /// One fixed engine dispatch-site selection.
@@ -606,6 +619,7 @@ where
                         weights,
                         engine_bindings::exports::l9o::gpu::engine::LoadConfig {
                             num_hidden_layers,
+                            replay: config.replay,
                             tunings: config.tunings.clone(),
                             fixed_variant_picks: config
                                 .fixed_variant_picks

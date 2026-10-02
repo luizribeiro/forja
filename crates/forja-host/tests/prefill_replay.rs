@@ -26,7 +26,7 @@ const LIMITS: Limits = Limits::new(
 async fn cpu_small_prefill_replay_matches_lazy() -> Result<(), Box<dyn Error>> {
     compare_prefill(
         test_guests::qwen3_bf16(),
-        test_guests::qwen3_bf16_no_replay(),
+        test_guests::qwen3_bf16(),
         &model_root()?.join("Qwen3-0.6B/model.safetensors"),
         None,
         qwen3::VOCAB,
@@ -44,12 +44,12 @@ async fn cpu_small_prefill_replay_matches_lazy() -> Result<(), Box<dyn Error>> {
 async fn metal_qwen3_prefill_replay_matches_lazy() -> Result<(), Box<dyn Error>> {
     compare_prefill(
         test_guests::qwen3_bf16(),
-        test_guests::qwen3_bf16_no_replay(),
+        test_guests::qwen3_bf16(),
         &model_root()?.join("Qwen3-0.6B/model.safetensors"),
         None,
         qwen3::VOCAB,
         &LENGTHS,
-        forja_metal::MetalBackend::new()?,
+        forja_metal::MetalBackend::with_graph_replay(forja_metal::MetalGraphReplay::Tier2)?,
         forja_metal::MetalBackend::new()?,
         forja_metal::MetalBackend::new()?,
     )
@@ -90,12 +90,12 @@ async fn metal_olmoe_prefill_replay_matches_lazy_near_context_limit() -> Result<
 async fn compare_olmoe_prefill(lengths: &[u32]) -> Result<(), Box<dyn Error>> {
     compare_prefill(
         test_guests::olmoe(),
-        test_guests::olmoe_no_replay(),
+        test_guests::olmoe(),
         &model_root()?.join("OLMoE-1B-7B-0924/model.safetensors.index.json"),
         None,
         olmoe::VOCAB,
         lengths,
-        forja_metal::MetalBackend::new()?,
+        forja_metal::MetalBackend::with_graph_replay(forja_metal::MetalGraphReplay::Tier2)?,
         forja_metal::MetalBackend::new()?,
         forja_metal::MetalBackend::new()?,
     )
@@ -108,12 +108,12 @@ async fn compare_olmoe_prefill(lengths: &[u32]) -> Result<(), Box<dyn Error>> {
 async fn metal_qwen3_coder_prefill_replay_matches_lazy() -> Result<(), Box<dyn Error>> {
     compare_prefill(
         test_guests::qwen3_coder(),
-        test_guests::qwen3_coder_no_replay(),
+        test_guests::qwen3_coder(),
         &model_root()?.join("Qwen3-Coder-30B-A3B-Instruct-4bit/model.safetensors.index.json"),
         Some(4),
         qwen3_coder::VOCAB,
         &LENGTHS,
-        forja_metal::MetalBackend::new()?,
+        forja_metal::MetalBackend::with_graph_replay(forja_metal::MetalGraphReplay::Tier2)?,
         forja_metal::MetalBackend::new()?,
         forja_metal::MetalBackend::new()?,
     )
@@ -136,12 +136,15 @@ where
     B: Backend + Send + Sync + 'static,
 {
     let load_config = common::load_config(replay_component)?;
+    let mut lazy_load_config = load_config.clone();
+    lazy_load_config.replay = false;
     let mut replay = EngineRunner::new(replay_component, replay_backend, LIMITS, weights).await?;
     let mut lazy = EngineRunner::new(lazy_component, lazy_backend, LIMITS, weights).await?;
     let mut reference =
         EngineRunner::new(lazy_component, reference_backend, LIMITS, weights).await?;
     replay.load_with_selections(layers, &load_config).await??;
-    lazy.load_with_selections(layers, &load_config).await??;
+    lazy.load_with_selections(layers, &lazy_load_config)
+        .await??;
     reference
         .load_with_selections(layers, &load_config)
         .await??;

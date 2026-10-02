@@ -230,6 +230,7 @@ fn profile_load_config(profile: &Profile) -> forja_host::EngineLoadConfig {
         }
     }
     forja_host::EngineLoadConfig {
+        replay: true,
         tunings: profile.default_tunings().to_vec(),
         fixed_variant_picks: variants
             .fixed

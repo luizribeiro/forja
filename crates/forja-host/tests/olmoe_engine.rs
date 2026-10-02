@@ -105,27 +105,27 @@ async fn prompt_hidden_states_and_routing_match_transformers() -> Result<(), Box
 #[ignore = "requires FORJA_MODELS and runs in the pre-push hook"]
 async fn replay_matches_lazy_decode() -> Result<(), Box<dyn Error>> {
     let weights = model_root()?.join("OLMoE-1B-7B-0924/model.safetensors.index.json");
-    let replay = decode_logits(test_guests::olmoe(), &weights).await?;
-    let lazy = decode_logits(test_guests::olmoe_no_replay(), &weights).await?;
+    let replay = decode_logits(&weights, true).await?;
+    let lazy = decode_logits(&weights, false).await?;
     assert_eq!(replay, lazy);
     Ok(())
 }
 
 #[cfg(target_os = "macos")]
 async fn decode_logits(
-    component: &std::path::Path,
     weights: &std::path::Path,
+    replay: bool,
 ) -> Result<Vec<Vec<u8>>, Box<dyn Error>> {
     let mut runner = EngineRunner::new(
-        component,
-        forja_metal::MetalBackend::new()?,
+        test_guests::olmoe(),
+        forja_metal::MetalBackend::with_graph_replay(forja_metal::MetalGraphReplay::Tier2)?,
         LIMITS,
         weights,
     )
     .await?;
-    runner
-        .load_with_selections(None, &common::load_config(test_guests::olmoe())?)
-        .await??;
+    let mut config = common::load_config(test_guests::olmoe())?;
+    config.replay = replay;
+    runner.load_with_selections(None, &config).await??;
     runner
         .step(EngineStep {
             tokens: (0..8).collect(),

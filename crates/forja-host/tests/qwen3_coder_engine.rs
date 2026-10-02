@@ -133,19 +133,19 @@ async fn hidden_states_and_routing_match_same_byte_reference() -> Result<(), Box
 #[tokio::test]
 #[ignore = "requires FORJA_MODELS and runs in the pre-push hook"]
 async fn replay_matches_lazy_greedy_and_sampled_decode() -> Result<(), Box<dyn Error>> {
-    let replay = decode_outputs(test_guests::qwen3_coder()).await?;
-    let lazy = decode_outputs(test_guests::qwen3_coder_no_replay()).await?;
+    let replay = decode_outputs(true).await?;
+    let lazy = decode_outputs(false).await?;
     assert_eq!(replay, lazy);
     Ok(())
 }
 
 #[cfg(target_os = "macos")]
-async fn decode_outputs(
-    component: &std::path::Path,
-) -> Result<Vec<(Vec<u8>, Vec<u8>)>, Box<dyn Error>> {
-    let mut runner = runner(component).await?;
+async fn decode_outputs(replay: bool) -> Result<Vec<(Vec<u8>, Vec<u8>)>, Box<dyn Error>> {
+    let mut runner = runner_with_graph_replay(forja_metal::MetalGraphReplay::Tier2).await?;
+    let mut config = load_config()?;
+    config.replay = replay;
     runner
-        .load_with_selections(Some(REPLAY_LAYERS), &load_config()?)
+        .load_with_selections(Some(REPLAY_LAYERS), &config)
         .await??;
     let greedy = SamplingParams::default();
     let sampled = SamplingParams {
@@ -189,6 +189,19 @@ async fn runner(
     Ok(EngineRunner::new(
         component,
         forja_metal::MetalBackend::new()?,
+        LIMITS,
+        model_root()?.join("Qwen3-Coder-30B-A3B-Instruct-4bit/model.safetensors.index.json"),
+    )
+    .await?)
+}
+
+#[cfg(target_os = "macos")]
+async fn runner_with_graph_replay(
+    graph_replay: forja_metal::MetalGraphReplay,
+) -> Result<EngineRunner<forja_metal::MetalBackend>, Box<dyn Error>> {
+    Ok(EngineRunner::new(
+        test_guests::qwen3_coder(),
+        forja_metal::MetalBackend::with_graph_replay(graph_replay)?,
         LIMITS,
         model_root()?.join("Qwen3-Coder-30B-A3B-Instruct-4bit/model.safetensors.index.json"),
     )

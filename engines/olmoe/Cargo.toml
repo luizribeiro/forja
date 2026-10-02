@@ -21,9 +21,6 @@ version.workspace = true
 [lib]
 crate-type = ["cdylib", "rlib"]
 
-[features]
-no-replay = []
-
 [dependencies]
 forja-sdk = { path = "../../crates/forja-sdk", features = ["metal-variants"] }
 
