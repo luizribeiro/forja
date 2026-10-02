@@ -35,6 +35,9 @@ use crate::{
     storage::{MetalBackend, MetalBuffer},
 };
 
+#[cfg(test)]
+use crate::variants::MetalVariant;
+
 type MetalBufferRef = Retained<ProtocolObject<dyn MTLBuffer>>;
 type EncodedEmbed = (Vec<BufferBinding>, BufferBinding);
 
@@ -6349,6 +6352,69 @@ fn steel_sdpa_supported(dispatch: &Dispatch) -> Result<bool, BackendError> {
     let [_, query_length, width] = shape3(query.layout())?;
     let [_, _, value_width] = shape3(value.layout())?;
     Ok(query_length > 1 && width == value_width && matches!(width, 64 | 128))
+}
+
+#[cfg(test)]
+pub(super) fn variant_supported(
+    dispatch: &Dispatch,
+    variant: MetalVariant,
+) -> Result<bool, BackendError> {
+    let rows = || {
+        dispatch
+            .inputs()
+            .first()
+            .and_then(|tensor| tensor.layout().shape().first().copied())
+            .ok_or(BackendError::InvalidInput)
+    };
+    Ok(match variant {
+        MetalVariant::MatmulGemv => matmul_rows(dispatch)? == 1,
+        MetalVariant::MatmulGemvTransposed => matmul_kernel(dispatch)? == "gemv_transposed",
+        MetalVariant::MatmulSteel64x64x16_2x2
+        | MetalVariant::MatmulSteel64x64x16_1x2
+        | MetalVariant::MatmulSteel64x32x32_2x2
+        | MetalVariant::MatmulSteel32x64x16_1x2 => matmul_rows(dispatch)? > 1,
+        MetalVariant::QuantMatmulGemv => rows()? == 1,
+        MetalVariant::QuantMatmulQ8FastGemv => {
+            quant_matmul_kernel(dispatch)? == "quantized_gemv_q8_fast"
+        }
+        MetalVariant::QuantMatmulSmallM => rows()? > 1,
+        MetalVariant::QuantMatmulTiled => {
+            quant_matmul_kernel(dispatch)?.starts_with("quantized_gemm_tiled_")
+        }
+        MetalVariant::GatherQuantMatmulRouteGemv
+        | MetalVariant::GatherQuantSiluMulRouteGemv
+        | MetalVariant::SdpaDecomposed
+        | MetalVariant::TopKPartials => true,
+        MetalVariant::GatherQuantMatmulGrouped | MetalVariant::GatherQuantSiluMulGrouped => {
+            grouped_gather_dispatch(dispatch)
+        }
+        MetalVariant::SdpaVectorSinglePass => {
+            vector_sdpa_supported(dispatch)?
+                && shape3(dispatch.inputs()[1].layout())?[1] < VECTOR_TWO_PASS_MIN_KEY_LENGTH
+        }
+        MetalVariant::SdpaVectorTwoPass => {
+            vector_sdpa_supported(dispatch)?
+                && shape3(dispatch.inputs()[1].layout())?[1] >= VECTOR_TWO_PASS_MIN_KEY_LENGTH
+        }
+        MetalVariant::SdpaSteel => steel_sdpa_supported(dispatch)?,
+        MetalVariant::TopKSingleK8 => dispatch_kernel(dispatch)? == "topk_single",
+    })
+}
+
+#[cfg(test)]
+fn matmul_rows(dispatch: &Dispatch) -> Result<u32, BackendError> {
+    let shape = dispatch
+        .inputs()
+        .first()
+        .ok_or(BackendError::InvalidInput)?
+        .layout()
+        .shape();
+    shape
+        .len()
+        .checked_sub(2)
+        .and_then(|index| shape.get(index))
+        .copied()
+        .ok_or(BackendError::InvalidInput)
 }
 
 fn head_group(

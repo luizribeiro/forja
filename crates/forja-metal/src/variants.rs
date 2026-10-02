@@ -771,8 +771,9 @@ pub(crate) fn json(device: &str) -> String {
 mod tests {
     use std::collections::HashSet;
 
-    use forja_core::{CommandList, DType, Op};
+    use forja_core::{CommandList, DType, Op, Slice, ViewOp};
     use forja_cpu::CpuBackend;
+    use proptest::prelude::*;
 
     use super::*;
 
@@ -787,6 +788,24 @@ mod tests {
             .unwrap();
         commands.into_dispatches().remove(0)
     }
+
+    fn matmul_case(dtype: DType, rows: u32, inner: u32, columns: u32, nt: bool) -> Dispatch {
+        let backend = CpuBackend::new();
+        let left = backend.alloc(dtype, &[rows, inner]).unwrap();
+        let right = if nt {
+            let stored = backend.alloc(dtype, &[columns, inner]).unwrap();
+            backend.view(&stored, ViewOp::Permute(vec![1, 0])).unwrap()
+        } else {
+            backend.alloc(dtype, &[inner, columns]).unwrap()
+        };
+        let output = backend.alloc(dtype, &[rows, columns]).unwrap();
+        let mut commands = CommandList::new();
+        commands
+            .dispatch(Op::Matmul, &[&left, &right], &output)
+            .unwrap();
+        commands.into_dispatches().remove(0)
+    }
+
     fn top_k_dispatch(width: u32) -> Dispatch {
         let backend = CpuBackend::new();
         let input = backend.alloc(DType::F32, &[width]).unwrap();
@@ -805,6 +824,158 @@ mod tests {
             .unwrap();
         commands.into_dispatches().remove(0)
     }
+
+    fn quant_dispatch(dtype: DType, rows: u32, inner: u32, strided: bool) -> Dispatch {
+        let backend = CpuBackend::new();
+        let columns = 33;
+        let bits = 8;
+        let group_size = 64;
+        let input = if strided {
+            let allocation = backend.alloc(dtype, &[rows, inner * 2]).unwrap();
+            backend
+                .view(
+                    &allocation,
+                    ViewOp::Slice(vec![
+                        Slice::new(0, rows, 1).unwrap(),
+                        Slice::new(0, inner, 2).unwrap(),
+                    ]),
+                )
+                .unwrap()
+        } else {
+            backend.alloc(dtype, &[rows, inner]).unwrap()
+        };
+        let packed = backend
+            .alloc(DType::U32, &[columns, inner * u32::from(bits) / 32])
+            .unwrap();
+        let parameter_dtype = if dtype == DType::F32 {
+            DType::F16
+        } else {
+            dtype
+        };
+        let scales = backend
+            .alloc(parameter_dtype, &[columns, inner / group_size])
+            .unwrap();
+        let biases = backend
+            .alloc(parameter_dtype, &[columns, inner / group_size])
+            .unwrap();
+        let output = backend.alloc(dtype, &[rows, columns]).unwrap();
+        let mut commands = CommandList::new();
+        commands
+            .dispatch(
+                Op::QuantMatmul { bits, group_size },
+                &[&input, &packed, &scales, &biases],
+                &output,
+            )
+            .unwrap();
+        commands.into_dispatches().remove(0)
+    }
+
+    fn gathered_dispatch(silu: bool, rows: u32, routes: u32, experts: u32) -> Dispatch {
+        let backend = CpuBackend::new();
+        let (dtype, inner, columns, bits, group_size) = (DType::BF16, 64, 33, 4, 64);
+        let input = backend.alloc(dtype, &[rows, inner]).unwrap();
+        let weights = || {
+            (
+                backend
+                    .alloc(
+                        DType::U32,
+                        &[experts, columns, inner * u32::from(bits) / 32],
+                    )
+                    .unwrap(),
+                backend
+                    .alloc(dtype, &[experts, columns, inner / group_size])
+                    .unwrap(),
+                backend
+                    .alloc(dtype, &[experts, columns, inner / group_size])
+                    .unwrap(),
+            )
+        };
+        let (packed, scales, biases) = weights();
+        let indices = backend.alloc(DType::U32, &[rows, routes]).unwrap();
+        let output = backend.alloc(dtype, &[rows, routes, columns]).unwrap();
+        let mut commands = CommandList::new();
+        if silu {
+            let (up_packed, up_scales, up_biases) = weights();
+            commands
+                .dispatch(
+                    Op::GatherQuantSiluMul { bits, group_size },
+                    &[
+                        &input, &packed, &scales, &biases, &up_packed, &up_scales, &up_biases,
+                        &indices,
+                    ],
+                    &output,
+                )
+                .unwrap();
+        } else {
+            commands
+                .dispatch(
+                    Op::GatherQuantMatmul { bits, group_size },
+                    &[&input, &packed, &scales, &biases, &indices],
+                    &output,
+                )
+                .unwrap();
+        }
+        commands.into_dispatches().remove(0)
+    }
+
+    fn sdpa_dispatch(
+        dtype: DType,
+        group: u32,
+        query_length: u32,
+        key_length: u32,
+        width: u32,
+        value_width: u32,
+    ) -> Dispatch {
+        let backend = CpuBackend::new();
+        let kv_heads = 8;
+        let query_heads = kv_heads * group;
+        let query = backend
+            .alloc(dtype, &[query_heads, query_length, width])
+            .unwrap();
+        let key = backend
+            .alloc(dtype, &[kv_heads, key_length, width])
+            .unwrap();
+        let value = backend
+            .alloc(dtype, &[kv_heads, key_length, value_width])
+            .unwrap();
+        let output = backend
+            .alloc(dtype, &[query_heads, query_length, value_width])
+            .unwrap();
+        let mut commands = CommandList::new();
+        commands
+            .dispatch(
+                Op::Sdpa {
+                    scale: 1.0,
+                    causal: false,
+                    q_start: 0,
+                },
+                &[&query, &key, &value],
+                &output,
+            )
+            .unwrap();
+        commands.into_dispatches().remove(0)
+    }
+
+    fn assert_registry_implies_encoder_support(dispatch: &Dispatch) {
+        for definition in REGISTRY
+            .iter()
+            .filter(|definition| definition.operation == OperationKind::of(dispatch.op()))
+        {
+            if resolve(dispatch, definition.name, METAL4).is_ok() {
+                assert!(
+                    crate::encoding::variant_supported(dispatch, definition.implementation)
+                        .unwrap(),
+                    "{} accepted a dispatch its encoder gate refused",
+                    definition.name
+                );
+            }
+        }
+    }
+
+    fn float_dtype(index: usize) -> DType {
+        [DType::F32, DType::F16, DType::BF16][index % 3]
+    }
+
     #[test]
     fn registry_names_and_guidance_are_stable_and_complete() {
         let mut names = HashSet::new();
@@ -886,5 +1057,174 @@ mod tests {
         assert!(relation_accepts(Relation::MultipleOf(8), 64));
         assert!(!relation_accepts(Relation::MultipleOf(8), 65));
         assert!(!relation_accepts(Relation::MultipleOf(0), 0));
+    }
+
+    #[test]
+    fn every_variant_has_an_encoder_accepted_fixture() {
+        let fixtures = [
+            ("matmul.gemv", matmul_case(DType::F32, 1, 7, 33, false)),
+            (
+                "matmul.gemv-transposed",
+                matmul_case(DType::F32, 1, 7, 33, true),
+            ),
+            (
+                "matmul.steel-64x64x16-2x2",
+                matmul_case(DType::F32, 2, 7, 33, false),
+            ),
+            (
+                "matmul.steel-64x64x16-1x2",
+                matmul_case(DType::F16, 2, 7, 33, false),
+            ),
+            (
+                "matmul.steel-64x32x32-2x2",
+                matmul_case(DType::BF16, 2, 7, 33, true),
+            ),
+            (
+                "matmul.steel-32x64x16-1x2",
+                matmul_case(DType::F16, 2, 33, 7, false),
+            ),
+            (
+                "quant-matmul.gemv",
+                quant_dispatch(DType::F32, 1, 64, false),
+            ),
+            (
+                "quant-matmul.q8-fast-gemv",
+                quant_dispatch(DType::F16, 1, 256, false),
+            ),
+            (
+                "quant-matmul.small-m",
+                quant_dispatch(DType::BF16, 7, 64, true),
+            ),
+            (
+                "quant-matmul.tiled",
+                quant_dispatch(DType::BF16, 16, 64, false),
+            ),
+            (
+                "gather-quant-matmul.route-gemv",
+                gathered_dispatch(false, 1, 1, 257),
+            ),
+            (
+                "gather-quant-matmul.grouped",
+                gathered_dispatch(false, 64, 1, 256),
+            ),
+            (
+                "gather-quant-silu-mul.route-gemv",
+                gathered_dispatch(true, 1, 1, 257),
+            ),
+            (
+                "gather-quant-silu-mul.grouped",
+                gathered_dispatch(true, 64, 1, 256),
+            ),
+            (
+                "sdpa.decomposed",
+                sdpa_dispatch(DType::F32, 1, 7, 33, 33, 7),
+            ),
+            (
+                "sdpa.vector-single-pass",
+                sdpa_dispatch(DType::F16, 2, 1, 33, 128, 128),
+            ),
+            (
+                "sdpa.vector-two-pass",
+                sdpa_dispatch(DType::BF16, 2, 1, 1024, 128, 128),
+            ),
+            ("sdpa.steel", sdpa_dispatch(DType::F32, 8, 2, 2, 64, 64)),
+            ("top-k.single-k8", top_k_dispatch(2048)),
+            ("top-k.partials", top_k_dispatch(2049)),
+        ];
+        assert_eq!(fixtures.len(), REGISTRY.len());
+        for (name, dispatch) in fixtures {
+            let definition = REGISTRY
+                .iter()
+                .find(|definition| definition.name == name)
+                .unwrap();
+            assert!(resolve(&dispatch, name, METAL4).is_ok(), "{name}");
+            assert!(
+                crate::encoding::variant_supported(&dispatch, definition.implementation).unwrap(),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn specialized_boundaries_match_encoder_gates() {
+        for (dispatch, name, accepted) in [
+            (
+                quant_dispatch(DType::BF16, 15, 64, false),
+                "quant-matmul.tiled",
+                false,
+            ),
+            (
+                quant_dispatch(DType::BF16, 16, 64, false),
+                "quant-matmul.tiled",
+                true,
+            ),
+            (
+                quant_dispatch(DType::BF16, 16, 64, true),
+                "quant-matmul.tiled",
+                false,
+            ),
+            (
+                gathered_dispatch(false, 63, 1, 256),
+                "gather-quant-matmul.grouped",
+                false,
+            ),
+            (
+                gathered_dispatch(false, 64, 1, 256),
+                "gather-quant-matmul.grouped",
+                true,
+            ),
+            (
+                gathered_dispatch(false, 64, 1, 257),
+                "gather-quant-matmul.grouped",
+                false,
+            ),
+            (
+                sdpa_dispatch(DType::F16, 32, 1, 1023, 64, 64),
+                "sdpa.vector-single-pass",
+                true,
+            ),
+            (
+                sdpa_dispatch(DType::F16, 33, 1, 1023, 64, 64),
+                "sdpa.vector-single-pass",
+                false,
+            ),
+            (
+                sdpa_dispatch(DType::F16, 8, 2, 1023, 64, 64),
+                "sdpa.vector-single-pass",
+                false,
+            ),
+            (
+                sdpa_dispatch(DType::F16, 8, 1, 1024, 64, 64),
+                "sdpa.vector-two-pass",
+                true,
+            ),
+            (top_k_dispatch(2048), "top-k.single-k8", true),
+            (top_k_dispatch(2049), "top-k.single-k8", false),
+        ] {
+            assert_eq!(resolve(&dispatch, name, METAL4).is_ok(), accepted, "{name}");
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(48))]
+
+        #[test]
+        fn accepted_registry_variants_pass_real_encoder_gates(
+            family in 0_usize..5,
+            dtype in 0_usize..3,
+            size in prop::sample::select(vec![1_u32, 7, 16, 33]),
+            odd in prop::sample::select(vec![7_u32, 33, 64, 128, 256, 1024]),
+            alternate in any::<bool>(),
+        ) {
+            let dtype = float_dtype(dtype);
+            let dispatch = match family {
+                0 => matmul_case(dtype, size, odd, 33, alternate),
+                1 => quant_dispatch(dtype, size, if odd < 64 { 64 } else { odd }, alternate),
+                2 => gathered_dispatch(alternate, size, if alternate { 7 } else { 1 }, if odd == 256 { 257 } else { odd }),
+                3 => sdpa_dispatch(dtype, (size % 32).max(1), if alternate { 1 } else { 7 }, odd.max(33), 64, 64),
+                _ => top_k_dispatch(odd.max(8)),
+            };
+            assert_registry_implies_encoder_support(&dispatch);
+        }
     }
 }
