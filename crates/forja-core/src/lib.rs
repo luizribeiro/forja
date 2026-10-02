@@ -8,6 +8,7 @@ mod ops;
 pub mod program;
 mod quantized;
 mod symbolic;
+mod variant_proof;
 mod variants;
 
 pub use backend::{
@@ -30,6 +31,7 @@ pub use symbolic::{
     Affine, ByteHull, MAX_PARAMS, ParamError, ParamSpace, ParamValues, SymbolicLayout,
     SymbolicLayoutError,
 };
+pub use variant_proof::{ConstraintProofError, prove_constraints};
 pub use variants::{
     Axis, Constraint, DeviceCapability, Dimension, Guarantee, LayoutClass, Lifecycle,
     OperationKind, OperationValue, Relation, TensorRef, TensorSlot, ValueRef, VariantDef,

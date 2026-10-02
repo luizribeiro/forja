@@ -530,7 +530,6 @@ impl SymbolicLayout {
         }
     }
 
-    #[allow(dead_code)]
     pub(crate) fn constraint_facts(&self) -> Result<SymbolicLayoutFacts, SymbolicLayoutError> {
         let mut dimensions = self
             .base
@@ -588,7 +587,6 @@ impl SymbolicLayout {
 }
 
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 pub(crate) struct SymbolicLayoutFacts {
     pub(crate) dtype: crate::DType,
     pub(crate) dimensions: Vec<Affine>,
@@ -597,7 +595,6 @@ pub(crate) struct SymbolicLayoutFacts {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[allow(dead_code)]
 pub(crate) struct LinearAffine {
     pub(crate) offset: u64,
     pub(crate) coefficients: [u64; MAX_PARAMS],
