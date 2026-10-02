@@ -66,12 +66,33 @@ async fn metal_host_exposes_variant_recording() -> wasmtime::Result<()> {
     add_metal_to_linker(&mut linker)?;
     let backend = forja_metal::MetalBackend::new().map_err(wasmtime::Error::msg)?;
     let mut store = Host::new_store(&engine, backend, LIMITS);
+    Host::configure_component_mode(&mut store, &engine, &component);
     let instance = linker.instantiate_async(&mut store, &component).await?;
     let run = instance.get_typed_func::<(), (Result<(), String>,)>(&mut store, "run")?;
     let (result,) = store
         .run_concurrent(async move |accessor| run.call_concurrent(accessor, ()).await)
         .await??;
     result.map_err(wasmtime::Error::msg)
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test(flavor = "multi_thread")]
+async fn metal_explicit_component_refuses_bare_multi_variant_dispatch() -> wasmtime::Result<()> {
+    let engine = component_engine()?;
+    let component = Component::from_file(&engine, test_guests::metal_variant_smoke())?;
+    let mut linker = Linker::new(&engine);
+    add_metal_to_linker(&mut linker)?;
+    let backend = forja_metal::MetalBackend::new().map_err(wasmtime::Error::msg)?;
+    let mut store = Host::new_store(&engine, backend, LIMITS);
+    Host::configure_component_mode(&mut store, &engine, &component);
+    let instance = linker.instantiate_async(&mut store, &component).await?;
+    let run = instance.get_typed_func::<(), (Result<(), String>,)>(&mut store, "run-bare")?;
+    let (result,) = store
+        .run_concurrent(async move |accessor| run.call_concurrent(accessor, ()).await)
+        .await??;
+    let error = result.expect_err("bare matmul unexpectedly succeeded");
+    assert!(error.contains("metal matmul requires an explicit variant"));
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]

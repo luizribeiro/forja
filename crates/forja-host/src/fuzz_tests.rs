@@ -491,7 +491,7 @@ where
     }
 }
 
-fn initialized_tensor<B: Backend>(
+fn initialized_tensor<B: Backend + 'static>(
     host: &mut Host<B>,
     dtype: compute::Dtype,
     shape: &[u32],

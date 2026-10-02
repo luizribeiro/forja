@@ -3,7 +3,10 @@
 #![allow(clippy::same_length_and_capacity, clippy::unused_async_trait_impl)]
 
 wit_bindgen::generate!({
-    inline: "package smoke:metal; world smoke { export run: async func() -> result<_, string>; }",
+    inline: "package smoke:metal; world smoke {
+        export run: async func() -> result<_, string>;
+        export run-bare: async func() -> result<_, string>;
+    }",
 });
 
 use forja_sdk::{
@@ -16,6 +19,14 @@ struct Component;
 impl Guest for Component {
     async fn run() -> Result<(), String> {
         exercise_sdk().map_err(|error| error.to_string())
+    }
+
+    async fn run_bare() -> Result<(), String> {
+        let left = Tensor::from_slice(&[2.0_f32], &[1, 1]).map_err(|error| error.to_string())?;
+        let right = Tensor::from_slice(&[3.0_f32], &[1, 1]).map_err(|error| error.to_string())?;
+        left.matmul(&right)
+            .and_then(|_| eval())
+            .map_err(|error| error.to_string())
     }
 }
 

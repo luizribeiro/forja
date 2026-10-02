@@ -474,6 +474,7 @@ where
         add_engine_to_linker(&mut linker, &backend)?;
         let grants = Grants::new().with_weights("engine", weights_path);
         let mut store = Host::new_store_with_grants(&engine, backend, limits, grants);
+        Host::configure_component_mode(&mut store, &engine, &component);
         let instance =
             engine_bindings::EngineComponent::instantiate_async(&mut store, &component, &linker)
                 .await?;
@@ -1410,9 +1411,10 @@ pub struct Host<B: Backend> {
     taints: Arc<BufferTaints>,
     active_profile: Option<Arc<Mutex<EngineStepProfile>>>,
     epoch_registration: Option<Arc<()>>,
+    explicit_metal_variants: bool,
 }
 
-impl<B: Backend> Host<B> {
+impl<B: Backend + 'static> Host<B> {
     fn new(backend: B, limits: Limits) -> Self {
         Self::with_grants(backend, limits, Grants::new())
     }
@@ -1444,6 +1446,7 @@ impl<B: Backend> Host<B> {
             taints: Arc::new(BufferTaints::default()),
             active_profile: None,
             epoch_registration: None,
+            explicit_metal_variants: false,
         }
     }
 
@@ -1476,6 +1479,18 @@ impl<B: Backend> Host<B> {
         store.limiter(|host| &mut host.store_limits);
         Self::reset_guest_deadline(&mut store);
         store
+    }
+
+    /// Configures component-specific recording policy after creating a store.
+    pub fn configure_component_mode(
+        store: &mut Store<Self>,
+        engine: &Engine,
+        component: &Component,
+    ) {
+        store.data_mut().explicit_metal_variants = component
+            .component_type()
+            .get_import(engine, "l9o:gpu/metal-variants@0.1.0")
+            .is_some();
     }
 
     /// Starts a fresh CPU-time budget for the next guest export call.
@@ -1997,6 +2012,20 @@ impl<B: Backend> Host<B> {
         outputs: &[Resource<TensorEntry>],
     ) -> Result<(), compute::Error> {
         let (template_op, concrete_op) = core_op(operation);
+        #[cfg(target_os = "macos")]
+        if (self.backend.as_ref() as &dyn Any).is::<forja_metal::MetalBackend>()
+            && let Some(name) = forja_metal::MetalBackend::portable_variant_name(
+                template_operation_kind(template_op),
+            )
+        {
+            if self.explicit_metal_variants {
+                return Err(compute::Error::OpSignature(format!(
+                    "metal {} requires an explicit variant",
+                    template_operation_kind(template_op)
+                )));
+            }
+            return self.record_metal_variant(commands, operation, inputs, outputs, name);
+        }
         self.dispatch_core(commands, template_op, concrete_op, inputs, outputs)
     }
 
@@ -2553,10 +2582,7 @@ impl<B: Backend> Host<B> {
 }
 
 #[cfg(target_os = "macos")]
-impl<B> Host<B>
-where
-    B: Backend + Send + Sync + 'static,
-{
+impl<B: Backend + 'static> Host<B> {
     fn metal_backend(&self) -> Result<&forja_metal::MetalBackend, compute::Error> {
         (self.backend.as_ref() as &dyn Any)
             .downcast_ref()
@@ -3779,6 +3805,14 @@ fn core_affine(affine: compute::Affine) -> Affine {
     )
 }
 
+fn template_operation_kind(operation: TemplateOp) -> forja_core::OperationKind {
+    match operation {
+        TemplateOp::Static(operation) => forja_core::OperationKind::of(operation),
+        TemplateOp::Sdpa { .. } => forja_core::OperationKind::Sdpa,
+        TemplateOp::Sample { .. } => forja_core::OperationKind::Other,
+    }
+}
+
 fn core_op(operation: compute::Op) -> (TemplateOp, Option<Op>) {
     match operation {
         compute::Op::Copy => concrete_template(Op::Copy),
@@ -4444,7 +4478,7 @@ mod tests {
 
     fn empty_graph<B>(host: &mut Host<B>) -> Resource<super::GraphEntry>
     where
-        B: Backend,
+        B: Backend + 'static,
     {
         let commands = host.command_list().unwrap();
         host.create_graph(commands).unwrap()
@@ -5458,7 +5492,7 @@ mod tests {
         );
     }
 
-    fn assert_empty_tensors_are_layout_errors<B: Backend>(backend: B) {
+    fn assert_empty_tensors_are_layout_errors<B: Backend + 'static>(backend: B) {
         let mut host = Host::new(backend, GENEROUS);
         assert!(matches!(
             host.alloc(compute::Dtype::F32, &[0]),
