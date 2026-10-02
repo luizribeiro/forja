@@ -698,6 +698,7 @@ version = "0.0.0"
 dependencies = [
  "forja-testing",
  "serde",
+ "sha2",
  "toml",
 ]
 

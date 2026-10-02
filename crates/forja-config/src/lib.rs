@@ -7,6 +7,7 @@ mod layer;
 mod profile;
 mod set;
 mod units;
+mod weights;
 
 pub use files::{dev_layers, file_layer, user_config_path};
 pub use layer::{ConfigError, KeyPath, Layer, Layered, Origin, Schema, layer};
@@ -17,6 +18,7 @@ pub use profile::{
 };
 pub use set::set_layer;
 pub use units::{ByteSize, Duration, Unbounded};
+pub use weights::{sharded_weights_sha256, single_weights_sha256};
 
 use std::{collections::BTreeMap, num::NonZeroU32, path::PathBuf};
 
