@@ -13,7 +13,9 @@ crate-type = ["cdylib", "rlib"]
 no-replay = []
 
 [dependencies]
-forja-sdk = { path = "../../../crates/forja-sdk" }
+forja-sdk = { path = "../../../crates/forja-sdk", features = [
+  "metal-variants",
+] }
 
 [lints]
 workspace = true

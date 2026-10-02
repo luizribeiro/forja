@@ -31,6 +31,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "qwen3",
             "--exclude",
             "olmoe",
+            "--exclude",
+            "qwen3-coder",
         ],
     )?;
     build_guest_workspace(
@@ -150,6 +152,7 @@ fn build_qwen3_coder_profiles(
     out_dir: &Path,
 ) -> io::Result<[PathBuf; 2]> {
     let component = target_dir.join("wasm32-wasip2/release/qwen3_coder.wasm");
+    build_guest_workspace(manifest, target_dir, &["-p", "qwen3-coder"])?;
     let default = copy_component(&component, out_dir, "qwen3-coder.wasm")?;
     build_guest_workspace(
         manifest,
