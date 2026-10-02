@@ -12,6 +12,8 @@ mod matmul;
 mod rounding_program;
 #[cfg(target_os = "macos")]
 mod storage;
+#[cfg(target_os = "macos")]
+mod variants;
 
 #[cfg(target_os = "macos")]
 pub use encoding::MetalProgramHandle;

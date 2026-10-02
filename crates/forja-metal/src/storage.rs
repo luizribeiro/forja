@@ -399,6 +399,18 @@ impl MetalBackend {
         self.device.name().to_string()
     }
 
+    /// Renders the selectable algorithms available on this device as Markdown.
+    #[must_use]
+    pub fn variant_catalog_markdown(&self) -> String {
+        crate::variants::markdown(&self.device_name())
+    }
+
+    /// Renders the selectable algorithms available on this device as JSON.
+    #[must_use]
+    pub fn variant_catalog_json(&self) -> String {
+        crate::variants::json(&self.device_name())
+    }
+
     /// Creates a backend on the system default Metal 4 device.
     ///
     /// # Errors
