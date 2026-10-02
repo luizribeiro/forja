@@ -1,11 +1,12 @@
 //! Native Qwen3 engine checks against independent transformer fixtures.
 
+mod common;
+
 use std::{collections::VecDeque, env, error::Error, path::PathBuf, time::Duration};
 
 use forja_core::Backend;
 use forja_host::{
-    EngineDecode, EngineLoadConfig, EngineRunner, EngineStep, Limits, SamplingParams,
-    bindings::l9o::gpu::compute,
+    EngineDecode, EngineRunner, EngineStep, Limits, SamplingParams, bindings::l9o::gpu::compute,
 };
 use forja_sdk::{Engine, Tensor, Weights};
 use golden_fixtures::{
@@ -223,8 +224,9 @@ where
         weights,
     )
     .await?;
-    sequential.load().await??;
-    pipelined.load().await??;
+    let config = common::load_config(test_guests::qwen3_bf16())?;
+    sequential.load_with_selections(None, &config).await??;
+    pipelined.load_with_selections(None, &config).await??;
     let prompt = (0_u32..8).collect::<Vec<_>>();
     let expected = selected_tokens(&mut sequential, &prompt, token_count, false, None, sampling)
         .await
@@ -400,8 +402,9 @@ where
     let mut host = EngineRunner::new(component, host_backend, REPLAY_LIMITS, &weights).await?;
     let mut selected =
         EngineRunner::new(component, selected_backend, REPLAY_LIMITS, weights).await?;
-    host.load().await??;
-    selected.load().await??;
+    let config = common::load_config(test_guests::qwen3_bf16())?;
+    host.load_with_selections(None, &config).await??;
+    selected.load_with_selections(None, &config).await??;
     let prompt = (0_u32..8).collect::<Vec<_>>();
     let host_output = host
         .step(EngineStep {
@@ -514,12 +517,7 @@ where
         weights,
     )
     .await?;
-    let config = EngineLoadConfig {
-        tunings: ["residual-norm", "qk-norm-rope", "silu-mul", "final-norm"]
-            .map(str::to_owned)
-            .to_vec(),
-        ..EngineLoadConfig::default()
-    };
+    let config = common::load_config(test_guests::qwen3_bf16())?;
     for (_, replay) in &mut replays {
         replay.load_with_selections(None, &config).await??;
     }
@@ -601,7 +599,40 @@ fn prompt_case(
         .map(|&token| u32::try_from(token))
         .collect::<Result<Vec<_>, _>>()?;
     let weights = Weights::open(root.join("Qwen3-0.6B/model.safetensors"))?;
-    let engine = Qwen3::load(&weights, forja_sdk::EngineLoadConfig::default())?;
+    let engine = Qwen3::load(&weights, native_load_config()?)?;
     let length = u32::try_from(tokens.len())?;
     Ok((fixture, engine, Tensor::from_slice(&tokens, &[length])?))
+}
+
+fn native_load_config() -> Result<forja_sdk::EngineLoadConfig, Box<dyn Error>> {
+    let config = common::load_config(test_guests::qwen3())?;
+    Ok(forja_sdk::EngineLoadConfig {
+        num_hidden_layers: None,
+        tunings: config.tunings,
+        fixed_variant_picks: config
+            .fixed_variant_picks
+            .into_iter()
+            .map(|pick| forja_sdk::FixedVariantPick {
+                site: pick.site,
+                name: pick.name,
+            })
+            .collect(),
+        variant_rule_picks: config
+            .variant_rule_picks
+            .into_iter()
+            .map(|pick| forja_sdk::VariantRulePick {
+                site: pick.site,
+                parameter: pick.parameter,
+                arms: pick
+                    .arms
+                    .into_iter()
+                    .map(|arm| forja_sdk::VariantPickArm {
+                        lo: arm.lo,
+                        hi: arm.hi,
+                        name: arm.name,
+                    })
+                    .collect(),
+            })
+            .collect(),
+    })
 }

@@ -375,13 +375,18 @@ mod tests {
         let actual = tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .build()?
-            .block_on(generate(
-                forja_metal::MetalBackend::new()?,
-                &options,
-                test_guests::qwen3(),
-                None,
-                &mut Vec::new(),
-            ))?;
+            .block_on(async {
+                let component = test_guests::qwen3();
+                let config = engine_load_config(component)?;
+                generate(
+                    forja_metal::MetalBackend::new()?,
+                    &options,
+                    component,
+                    Some(&config),
+                    &mut Vec::new(),
+                )
+                .await
+            })?;
         assert_eq!(actual, expected);
         Ok(())
     }

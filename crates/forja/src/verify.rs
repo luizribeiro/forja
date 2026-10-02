@@ -716,7 +716,7 @@ mod tests {
         ];
         let runtime = tokio::runtime::Builder::new_current_thread().build()?;
         for (component, tunings) in cases {
-            let config = qwen_tunings(tunings);
+            let config = qwen_tunings(component, tunings)?;
             runtime.block_on(run_with_component(
                 &options,
                 &fixtures,
@@ -742,8 +742,10 @@ mod tests {
         let summary = tokio::runtime::Builder::new_current_thread()
             .build()?
             .block_on(async {
-                let config =
-                    qwen_tunings(&["residual-norm", "qk-norm-rope", "silu-mul", "final-norm"]);
+                let config = qwen_tunings(
+                    test_guests::qwen3_bf16(),
+                    &["residual-norm", "qk-norm-rope", "silu-mul", "final-norm"],
+                )?;
                 run_with_component(
                     &options,
                     &fixtures,
@@ -904,11 +906,13 @@ mod tests {
             .block_on(run_with_steps(&options, decode_steps))
     }
 
-    fn qwen_tunings(names: &[&str]) -> forja_host::EngineLoadConfig {
-        forja_host::EngineLoadConfig {
-            tunings: names.iter().map(|name| (*name).to_owned()).collect(),
-            ..forja_host::EngineLoadConfig::default()
-        }
+    fn qwen_tunings(
+        component: &Path,
+        names: &[&str],
+    ) -> Result<forja_host::EngineLoadConfig, Box<dyn Error>> {
+        let mut config = engine_load_config(component)?;
+        config.tunings = names.iter().map(|name| (*name).to_owned()).collect();
+        Ok(config)
     }
 
     fn model_options(
