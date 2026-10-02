@@ -13,7 +13,7 @@ pub(super) struct GemmConfig {
     pub(super) thread_count: usize,
 }
 
-pub(super) fn select_gemm(
+pub(super) fn select_internal_gemm(
     dtype: DType,
     batch: u32,
     rows: u32,
@@ -155,33 +155,33 @@ mod tests {
 
     use super::{
         GEMM_32_64, GEMM_64_32, GEMM_64_64_FLOAT, GEMM_64_64_HALF, MatrixLayout, classify,
-        select_gemm,
+        select_internal_gemm,
     };
 
     #[test]
-    fn selects_m3_tile_configs_by_shape_and_dtype() {
+    fn selects_internal_tile_configs_by_shape_and_dtype() {
         assert_eq!(
-            select_gemm(DType::BF16, 1, 512, 3072, 1024, false, true),
+            select_internal_gemm(DType::BF16, 1, 512, 3072, 1024, false, true),
             Some(GEMM_64_64_HALF)
         );
         assert_eq!(
-            select_gemm(DType::F16, 1, 128, 3072, 1024, false, true),
+            select_internal_gemm(DType::F16, 1, 128, 3072, 1024, false, true),
             Some(GEMM_64_32)
         );
         assert_eq!(
-            select_gemm(DType::BF16, 1, 512, 3072, 8192, false, false),
+            select_internal_gemm(DType::BF16, 1, 512, 3072, 8192, false, false),
             Some(GEMM_32_64)
         );
         assert_eq!(
-            select_gemm(DType::F32, 1, 128, 3072, 1024, false, true),
+            select_internal_gemm(DType::F32, 1, 128, 3072, 1024, false, true),
             Some(GEMM_32_64)
         );
         assert_eq!(
-            select_gemm(DType::F32, 1, 128, 3072, 1024, false, false),
+            select_internal_gemm(DType::F32, 1, 128, 3072, 1024, false, false),
             Some(GEMM_64_32)
         );
         assert_eq!(
-            select_gemm(DType::F32, 16, 128, 1024, 1024, false, false),
+            select_internal_gemm(DType::F32, 16, 128, 1024, 1024, false, false),
             Some(GEMM_64_64_FLOAT)
         );
     }

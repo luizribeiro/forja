@@ -393,6 +393,14 @@ impl Drop for MetalBackend {
 }
 
 impl MetalBackend {
+    /// Returns the fixed compatibility variant for a portable core operation.
+    #[must_use]
+    pub const fn portable_variant_name(
+        operation: forja_core::OperationKind,
+    ) -> Option<&'static str> {
+        crate::variants::portable_name(operation)
+    }
+
     /// Returns the selected Metal device name.
     #[must_use]
     pub fn device_name(&self) -> String {

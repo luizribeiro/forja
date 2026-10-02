@@ -11,24 +11,30 @@ use crate::matmul::{MatrixLayout, classify};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum MetalVariant {
+    MatmulPortable,
     MatmulGemv,
     MatmulGemvTransposed,
     MatmulSteel64x64x16_2x2,
     MatmulSteel64x64x16_1x2,
     MatmulSteel64x32x32_2x2,
     MatmulSteel32x64x16_1x2,
+    QuantMatmulPortable,
     QuantMatmulGemv,
     QuantMatmulQ8FastGemv,
     QuantMatmulSmallM,
     QuantMatmulTiled,
+    GatherQuantMatmulPortable,
     GatherQuantMatmulRouteGemv,
     GatherQuantMatmulGrouped,
+    GatherQuantSiluMulPortable,
     GatherQuantSiluMulRouteGemv,
     GatherQuantSiluMulGrouped,
+    SdpaPortable,
     SdpaDecomposed,
     SdpaVectorSinglePass,
     SdpaVectorTwoPass,
     SdpaSteel,
+    TopKPortable,
     TopKSingleK8,
     TopKPartials,
 }
@@ -411,6 +417,15 @@ macro_rules! variant {
 
 pub(crate) static REGISTRY: &[VariantDef<MetalVariant>] = &[
     variant!(
+        "matmul.portable",
+        Matmul,
+        MatmulPortable,
+        &[],
+        &["portable source that does not select a backend-specific algorithm."],
+        &["an engine can pin a shape-specific algorithm."],
+        &["Uses one fixed broad Steel tile for every valid shape."]
+    ),
+    variant!(
         "matmul.gemv",
         Matmul,
         MatmulGemv,
@@ -465,6 +480,15 @@ pub(crate) static REGISTRY: &[VariantDef<MetalVariant>] = &[
         &["A 32 by 64 Steel tile with 16-wide reduction blocks."]
     ),
     variant!(
+        "quant-matmul.portable",
+        QuantMatmul,
+        QuantMatmulPortable,
+        &[],
+        &["portable source that does not select a backend-specific algorithm."],
+        &["decode and large contiguous batches have faster specialized algorithms."],
+        &["Uses the general small-m algorithm for every valid shape."]
+    ),
+    variant!(
         "quant-matmul.gemv",
         QuantMatmul,
         QuantMatmulGemv,
@@ -501,6 +525,15 @@ pub(crate) static REGISTRY: &[VariantDef<MetalVariant>] = &[
         &["One algorithm supports f32, f16, and bf16 activations."]
     ),
     variant!(
+        "gather-quant-matmul.portable",
+        GatherQuantMatmul,
+        GatherQuantMatmulPortable,
+        &[],
+        &["portable source that does not select a backend-specific algorithm."],
+        &["large routed batches can amortize grouping."],
+        &["Uses route GEMV for every valid shape."]
+    ),
+    variant!(
         "gather-quant-matmul.route-gemv",
         GatherQuantMatmul,
         GatherQuantMatmulRouteGemv,
@@ -519,6 +552,15 @@ pub(crate) static REGISTRY: &[VariantDef<MetalVariant>] = &[
         &["Sorts routes into bounded expert groups."]
     ),
     variant!(
+        "gather-quant-silu-mul.portable",
+        GatherQuantSiluMul,
+        GatherQuantSiluMulPortable,
+        &[],
+        &["portable source that does not select a backend-specific algorithm."],
+        &["large routed batches can amortize grouping."],
+        &["Uses route GEMV for every valid shape."]
+    ),
+    variant!(
         "gather-quant-silu-mul.route-gemv",
         GatherQuantSiluMul,
         GatherQuantSiluMulRouteGemv,
@@ -535,6 +577,15 @@ pub(crate) static REGISTRY: &[VariantDef<MetalVariant>] = &[
         &["at least 64 routed rows with at most 256 experts."],
         &["small route counts."],
         &["Groups routes before both quantized projections."]
+    ),
+    variant!(
+        "sdpa.portable",
+        Sdpa,
+        SdpaPortable,
+        &[],
+        &["portable source that does not select a backend-specific algorithm."],
+        &["supported decode and prefill shapes have faster specialized algorithms."],
+        &["Uses decomposed attention for every valid shape."]
     ),
     variant!(
         "sdpa.decomposed",
@@ -573,6 +624,15 @@ pub(crate) static REGISTRY: &[VariantDef<MetalVariant>] = &[
         &["Uses tiled matrix operations for prefill-shaped work."]
     ),
     variant!(
+        "top-k.portable",
+        TopK,
+        TopKPortable,
+        &[],
+        &["portable source that does not select a backend-specific algorithm."],
+        &["k = 8 with narrow rows has a faster single-pass algorithm."],
+        &["Uses partial reductions for every valid shape."]
+    ),
+    variant!(
         "top-k.single-k8",
         TopK,
         TopKSingleK8,
@@ -591,6 +651,30 @@ pub(crate) static REGISTRY: &[VariantDef<MetalVariant>] = &[
         &["Reduces chunk partials in a finalize pass."]
     ),
 ];
+
+pub(crate) const fn portable_name(operation: OperationKind) -> Option<&'static str> {
+    match operation {
+        OperationKind::Matmul => Some("matmul.portable"),
+        OperationKind::QuantMatmul => Some("quant-matmul.portable"),
+        OperationKind::GatherQuantMatmul => Some("gather-quant-matmul.portable"),
+        OperationKind::GatherQuantSiluMul => Some("gather-quant-silu-mul.portable"),
+        OperationKind::Sdpa => Some("sdpa.portable"),
+        OperationKind::TopK => Some("top-k.portable"),
+        OperationKind::Other => None,
+    }
+}
+
+pub(crate) const fn portable_implementation(operation: OperationKind) -> Option<MetalVariant> {
+    match operation {
+        OperationKind::Matmul => Some(MetalVariant::MatmulPortable),
+        OperationKind::QuantMatmul => Some(MetalVariant::QuantMatmulPortable),
+        OperationKind::GatherQuantMatmul => Some(MetalVariant::GatherQuantMatmulPortable),
+        OperationKind::GatherQuantSiluMul => Some(MetalVariant::GatherQuantSiluMulPortable),
+        OperationKind::Sdpa => Some(MetalVariant::SdpaPortable),
+        OperationKind::TopK => Some(MetalVariant::TopKPortable),
+        OperationKind::Other => None,
+    }
+}
 
 pub(crate) fn resolve(
     dispatch: &Dispatch,
@@ -1107,9 +1191,12 @@ mod tests {
             .iter()
             .filter(|definition| definition.operation == OperationKind::of(dispatch.op()))
         {
-            if resolve(dispatch, definition.name, METAL4).is_ok() {
+            if let Ok(validated) = resolve(dispatch, definition.name, METAL4) {
+                let selected = dispatch
+                    .clone()
+                    .with_backend_data(forja_core::BackendDispatchData::new(validated));
                 assert!(
-                    crate::encoding::variant_supported(dispatch, definition.implementation)
+                    crate::encoding::variant_supported(&selected, definition.implementation)
                         .unwrap(),
                     "{} accepted a dispatch its encoder gate refused",
                     definition.name
@@ -1233,88 +1320,150 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn every_variant_has_an_encoder_accepted_fixture() {
         let fixtures = [
-            ("matmul.gemv", matmul_case(DType::F32, 1, 7, 33, false)),
+            (
+                "matmul.portable",
+                matmul_case(DType::F32, 1, 7, 33, true),
+                "steel_gemm_64_32_32_2_2",
+            ),
+            (
+                "matmul.gemv",
+                matmul_case(DType::F32, 1, 7, 33, false),
+                "gemv",
+            ),
             (
                 "matmul.gemv-transposed",
                 matmul_case(DType::F32, 1, 7, 33, true),
+                "gemv_transposed",
             ),
             (
                 "matmul.steel-64x64x16-2x2",
                 matmul_case(DType::F32, 2, 7, 33, false),
+                "steel_gemm_64_64_16_2_2",
             ),
             (
                 "matmul.steel-64x64x16-1x2",
                 matmul_case(DType::F16, 2, 7, 33, false),
+                "steel_gemm_64_64_16_1_2",
             ),
             (
                 "matmul.steel-64x32x32-2x2",
                 matmul_case(DType::BF16, 2, 7, 33, true),
+                "steel_gemm_64_32_32_2_2",
             ),
             (
                 "matmul.steel-32x64x16-1x2",
                 matmul_case(DType::F16, 2, 33, 7, false),
+                "steel_gemm_32_64_16_1_2",
+            ),
+            (
+                "quant-matmul.portable",
+                quant_dispatch(DType::F32, 1, 64, false),
+                "quantized_gemm_small_m",
             ),
             (
                 "quant-matmul.gemv",
                 quant_dispatch(DType::F32, 1, 64, false),
+                "quantized_gemv",
             ),
             (
                 "quant-matmul.q8-fast-gemv",
                 quant_dispatch(DType::F16, 1, 256, false),
+                "quantized_gemv_q8_fast",
             ),
             (
                 "quant-matmul.small-m",
                 quant_dispatch(DType::BF16, 7, 64, true),
+                "quantized_gemm_small_m",
             ),
             (
                 "quant-matmul.tiled",
                 quant_dispatch(DType::BF16, 16, 64, false),
+                "quantized_gemm_tiled_bf16",
+            ),
+            (
+                "gather-quant-matmul.portable",
+                gathered_dispatch(false, 64, 1, 256),
+                "gather_quantized_gemv",
             ),
             (
                 "gather-quant-matmul.route-gemv",
                 gathered_dispatch(false, 1, 1, 257),
+                "gather_quantized_gemv",
             ),
             (
                 "gather-quant-matmul.grouped",
                 gathered_dispatch(false, 64, 1, 256),
+                "grouped_quantized_gemm",
+            ),
+            (
+                "gather-quant-silu-mul.portable",
+                gathered_dispatch(true, 64, 1, 256),
+                "gather_quantized_silu_mul",
             ),
             (
                 "gather-quant-silu-mul.route-gemv",
                 gathered_dispatch(true, 1, 1, 257),
+                "gather_quantized_silu_mul",
             ),
             (
                 "gather-quant-silu-mul.grouped",
                 gathered_dispatch(true, 64, 1, 256),
+                "grouped_quantized_silu_mul",
+            ),
+            (
+                "sdpa.portable",
+                sdpa_dispatch(DType::F16, 2, 1, 1024, 128, 128),
+                "sdpa_decomposed",
             ),
             (
                 "sdpa.decomposed",
                 sdpa_dispatch(DType::F32, 1, 7, 33, 33, 7),
+                "sdpa_decomposed",
             ),
             (
                 "sdpa.vector-single-pass",
                 sdpa_dispatch(DType::F16, 2, 1, 33, 128, 128),
+                "mlx_sdpa_vector_128",
             ),
             (
                 "sdpa.vector-two-pass",
                 sdpa_dispatch(DType::BF16, 2, 1, 1024, 128, 128),
+                "mlx_sdpa_vector_2pass_128",
             ),
-            ("sdpa.steel", sdpa_dispatch(DType::F32, 8, 2, 2, 64, 64)),
-            ("top-k.single-k8", top_k_dispatch(2048)),
-            ("top-k.partials", top_k_dispatch(2049)),
+            (
+                "sdpa.steel",
+                sdpa_dispatch(DType::F32, 8, 2, 2, 64, 64),
+                "steel_attention_64",
+            ),
+            (
+                "top-k.portable",
+                top_k_dispatch(2048),
+                "topk_partials+finalize",
+            ),
+            ("top-k.single-k8", top_k_dispatch(2048), "topk_single"),
+            (
+                "top-k.partials",
+                top_k_dispatch(2049),
+                "topk_partials+finalize",
+            ),
         ];
         assert_eq!(fixtures.len(), REGISTRY.len());
-        for (name, dispatch) in fixtures {
+        for (name, dispatch, kernel) in fixtures {
             let definition = REGISTRY
                 .iter()
                 .find(|definition| definition.name == name)
                 .unwrap();
-            assert!(resolve(&dispatch, name, METAL4).is_ok(), "{name}");
+            let validated = resolve(&dispatch, name, METAL4).unwrap();
+            let selected =
+                dispatch.with_backend_data(forja_core::BackendDispatchData::new(validated));
             assert!(
-                crate::encoding::variant_supported(&dispatch, definition.implementation).unwrap(),
+                crate::encoding::variant_supported(&selected, definition.implementation).unwrap(),
                 "{name}"
             );
+            assert_eq!(crate::encoding::dispatch_kernel(&selected).unwrap(), kernel);
         }
     }
 
