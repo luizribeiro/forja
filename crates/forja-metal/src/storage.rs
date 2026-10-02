@@ -411,6 +411,20 @@ impl MetalBackend {
         crate::variants::json(&self.device_name())
     }
 
+    /// Resolves and validates one concrete algorithm choice.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::VariantError`] when the name is unknown, belongs to another operation,
+    /// is unavailable, or its first failing constraint rejects the dispatch.
+    pub fn validate_variant(
+        &self,
+        dispatch: &forja_core::Dispatch,
+        name: &str,
+    ) -> Result<crate::ValidatedVariant, crate::VariantError> {
+        crate::variants::resolve(dispatch, name, &[forja_core::DeviceCapability::Metal4])
+    }
+
     /// Creates a backend on the system default Metal 4 device.
     ///
     /// # Errors

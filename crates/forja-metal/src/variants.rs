@@ -1,8 +1,12 @@
+use std::{error::Error, fmt};
+
 use forja_core::{
-    Axis, Constraint, DeviceCapability, Dimension, Guarantee, LayoutClass, Lifecycle,
-    OperationKind, OperationValue, Relation, TensorRef, ValueRef, VariantDef, render_catalog_json,
-    render_catalog_markdown,
+    Axis, Constraint, DeviceCapability, Dimension, Dispatch, Guarantee, Layout, LayoutClass,
+    Lifecycle, OperationKind, OperationValue, Relation, TensorRef, TensorSlot, ValueRef,
+    VariantDef, operation_value, render_catalog_json, render_catalog_markdown,
 };
+
+use crate::matmul::{MatrixLayout, classify};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum MetalVariant {
@@ -27,6 +31,107 @@ pub(crate) enum MetalVariant {
     TopKSingleK8,
     TopKPartials,
 }
+
+/// A registry variant resolved and checked for one concrete dispatch.
+#[derive(Clone, Copy, Debug)]
+pub struct ValidatedVariant {
+    index: usize,
+}
+
+impl ValidatedVariant {
+    /// Returns the stable algorithm name.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        REGISTRY[self.index].name
+    }
+
+    /// Returns the operation family computed by the algorithm.
+    #[must_use]
+    pub fn operation(self) -> OperationKind {
+        REGISTRY[self.index].operation
+    }
+}
+
+/// A reason a concrete Metal algorithm variant was refused.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum VariantError {
+    /// No registry entry has the requested stable name.
+    Unknown {
+        /// Requested operation family.
+        operation: OperationKind,
+        /// Requested stable name.
+        name: String,
+    },
+    /// The stable name belongs to another operation family.
+    WrongOperation {
+        /// Requested operation family.
+        operation: OperationKind,
+        /// Requested stable name.
+        name: String,
+        /// Operation family owning the name.
+        actual: OperationKind,
+    },
+    /// A required capability is absent.
+    Unavailable {
+        /// Requested operation family.
+        operation: OperationKind,
+        /// Requested stable name.
+        name: String,
+        /// First unavailable capability.
+        capability: DeviceCapability,
+    },
+    /// The first canonical constraint that the dispatch violates.
+    Constraint {
+        /// Requested operation family.
+        operation: OperationKind,
+        /// Requested stable name.
+        name: String,
+        /// Canonical constraint text.
+        constraint: String,
+        /// Concrete fact that caused the refusal.
+        actual: String,
+    },
+}
+
+impl fmt::Display for VariantError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unknown { operation, name } => {
+                write!(
+                    formatter,
+                    "metal {operation} variant '{name}': unknown variant"
+                )
+            }
+            Self::WrongOperation {
+                operation,
+                name,
+                actual,
+            } => write!(
+                formatter,
+                "metal {operation} variant '{name}': computes {actual}, not {operation}"
+            ),
+            Self::Unavailable {
+                operation,
+                name,
+                capability,
+            } => write!(
+                formatter,
+                "metal {operation} variant '{name}': unavailable without {capability}"
+            ),
+            Self::Constraint {
+                operation,
+                name,
+                constraint,
+                actual,
+            } => write!(
+                formatter,
+                "metal {operation} variant '{name}': constraint '{constraint}' failed ({actual})"
+            ),
+        }
+    }
+}
+
+impl Error for VariantError {}
 
 const METAL4: &[DeviceCapability] = &[DeviceCapability::Metal4];
 const ACTIVE: Lifecycle = Lifecycle::Active;
@@ -459,6 +564,201 @@ pub(crate) static REGISTRY: &[VariantDef<MetalVariant>] = &[
     ),
 ];
 
+pub(crate) fn resolve(
+    dispatch: &Dispatch,
+    name: &str,
+    capabilities: &[DeviceCapability],
+) -> Result<ValidatedVariant, VariantError> {
+    let operation = OperationKind::of(dispatch.op());
+    let Some((index, definition)) = REGISTRY
+        .iter()
+        .enumerate()
+        .find(|(_, definition)| definition.name == name)
+    else {
+        return Err(VariantError::Unknown {
+            operation,
+            name: name.to_owned(),
+        });
+    };
+    if definition.operation != operation {
+        return Err(VariantError::WrongOperation {
+            operation,
+            name: name.to_owned(),
+            actual: definition.operation,
+        });
+    }
+    if let Some(&capability) = definition
+        .availability
+        .iter()
+        .find(|capability| !capabilities.contains(capability))
+    {
+        return Err(VariantError::Unavailable {
+            operation,
+            name: name.to_owned(),
+            capability,
+        });
+    }
+    for constraint in definition.constraints {
+        if let Err(actual) = check_constraint(dispatch, capabilities, constraint) {
+            return Err(VariantError::Constraint {
+                operation,
+                name: name.to_owned(),
+                constraint: constraint.to_string(),
+                actual,
+            });
+        }
+    }
+    Ok(ValidatedVariant { index })
+}
+
+fn check_constraint(
+    dispatch: &Dispatch,
+    capabilities: &[DeviceCapability],
+    constraint: &Constraint,
+) -> Result<(), String> {
+    match constraint {
+        Constraint::DType { tensor, allowed } => {
+            let dtype = tensor_layout(dispatch, *tensor)?.dtype();
+            if allowed.contains(&dtype) {
+                Ok(())
+            } else {
+                Err(format!("{} dtype was {dtype:?}", tensor.name))
+            }
+        }
+        Constraint::Rank { tensor, rank } => {
+            let actual = tensor_layout(dispatch, *tensor)?.shape().len();
+            if actual == usize::from(*rank) {
+                Ok(())
+            } else {
+                Err(format!("{} rank was {actual}", tensor.name))
+            }
+        }
+        Constraint::Value { value, relation } => {
+            let actual = concrete_value(dispatch, *value)?;
+            if relation_accepts(*relation, actual) {
+                Ok(())
+            } else {
+                Err(format!("{} was {actual}", value.name()))
+            }
+        }
+        Constraint::DimensionsEqual { left, right } => {
+            let left_value = dimension(dispatch, *left)?;
+            let right_value = dimension(dispatch, *right)?;
+            if left_value == right_value {
+                Ok(())
+            } else {
+                Err(format!(
+                    "{} was {left_value}, {} was {right_value}",
+                    left.name, right.name
+                ))
+            }
+        }
+        Constraint::Layout { tensor, class } => {
+            let layout = tensor_layout(dispatch, *tensor)?;
+            if layout_matches(layout, *class) {
+                Ok(())
+            } else {
+                Err(format!("{} layout did not match {class}", tensor.name))
+            }
+        }
+        Constraint::ByteOffsetAligned { tensor, alignment } => {
+            let layout = tensor_layout(dispatch, *tensor)?;
+            let offset = layout
+                .offset()
+                .checked_mul(layout.dtype().byte_size())
+                .ok_or_else(|| format!("{} byte offset overflowed", tensor.name))?;
+            if *alignment != 0 && offset.is_multiple_of(*alignment) {
+                Ok(())
+            } else {
+                Err(format!("{} byte offset was {offset}", tensor.name))
+            }
+        }
+        Constraint::Capability(capability) => {
+            if capabilities.contains(capability) {
+                Ok(())
+            } else {
+                Err(format!("capability {capability} was unavailable"))
+            }
+        }
+    }
+}
+
+fn concrete_value(dispatch: &Dispatch, value: ValueRef) -> Result<u64, String> {
+    match value {
+        ValueRef::Dimension(dimension_ref) => dimension(dispatch, dimension_ref),
+        ValueRef::Product { name, left, right } => dimension(dispatch, left)?
+            .checked_mul(dimension(dispatch, right)?)
+            .ok_or_else(|| format!("{name} overflowed")),
+        ValueRef::Quotient {
+            name,
+            numerator,
+            denominator,
+        } => {
+            let numerator = dimension(dispatch, numerator)?;
+            let denominator = dimension(dispatch, denominator)?;
+            if denominator == 0 || !numerator.is_multiple_of(denominator) {
+                return Err(format!("{name} was not an exact quotient"));
+            }
+            Ok(numerator / denominator)
+        }
+        ValueRef::Operation(value) => {
+            operation_value(dispatch.op(), value).ok_or_else(|| format!("operation has no {value}"))
+        }
+    }
+}
+
+fn dimension(dispatch: &Dispatch, dimension: Dimension) -> Result<u64, String> {
+    let shape = tensor_layout(dispatch, dimension.tensor)?.shape();
+    let index = match dimension.axis {
+        Axis::Index(index) => usize::from(index),
+        Axis::FromEnd(distance) => shape
+            .len()
+            .checked_sub(usize::from(distance))
+            .ok_or_else(|| format!("{} axis was absent", dimension.name))?,
+    };
+    shape
+        .get(index)
+        .copied()
+        .map(u64::from)
+        .ok_or_else(|| format!("{} axis was absent", dimension.name))
+}
+
+fn tensor_layout(dispatch: &Dispatch, tensor: TensorRef) -> Result<&Layout, String> {
+    let candidate = match tensor.slot {
+        TensorSlot::Input(index) => dispatch.inputs().get(usize::from(index)),
+        TensorSlot::Output(index) => dispatch.outputs().get(usize::from(index)),
+    };
+    candidate
+        .map(forja_core::Tensor::layout)
+        .ok_or_else(|| format!("{} tensor was absent", tensor.name))
+}
+
+const fn relation_accepts(relation: Relation, actual: u64) -> bool {
+    match relation {
+        Relation::Equal(expected) => actual == expected,
+        Relation::Range { min, max } => actual >= min && actual <= max,
+        Relation::OneOf(values) => {
+            let mut index = 0;
+            while index < values.len() {
+                if actual == values[index] {
+                    return true;
+                }
+                index += 1;
+            }
+            false
+        }
+        Relation::MultipleOf(divisor) => divisor != 0 && actual.is_multiple_of(divisor),
+    }
+}
+
+fn layout_matches(layout: &Layout, class: LayoutClass) -> bool {
+    match class {
+        LayoutClass::Contiguous => layout.is_contiguous(),
+        LayoutClass::RowMajor => matches!(classify(layout), MatrixLayout::RowMajor { .. }),
+        LayoutClass::ColumnMajor => matches!(classify(layout), MatrixLayout::ColumnMajor { .. }),
+    }
+}
+
 pub(crate) fn markdown(device: &str) -> String {
     render_catalog_markdown("metal", device, METAL4, REGISTRY)
 }
@@ -471,8 +771,40 @@ pub(crate) fn json(device: &str) -> String {
 mod tests {
     use std::collections::HashSet;
 
+    use forja_core::{CommandList, DType, Op};
+    use forja_cpu::CpuBackend;
+
     use super::*;
 
+    fn matmul_dispatch(rows: u32) -> Dispatch {
+        let backend = CpuBackend::new();
+        let left = backend.alloc(DType::F32, &[rows, 7]).unwrap();
+        let right = backend.alloc(DType::F32, &[7, 33]).unwrap();
+        let output = backend.alloc(DType::F32, &[rows, 33]).unwrap();
+        let mut commands = CommandList::new();
+        commands
+            .dispatch(Op::Matmul, &[&left, &right], &output)
+            .unwrap();
+        commands.into_dispatches().remove(0)
+    }
+    fn top_k_dispatch(width: u32) -> Dispatch {
+        let backend = CpuBackend::new();
+        let input = backend.alloc(DType::F32, &[width]).unwrap();
+        let values = backend.alloc(DType::F32, &[8]).unwrap();
+        let indices = backend.alloc(DType::U32, &[8]).unwrap();
+        let mut commands = CommandList::new();
+        commands
+            .dispatch_many(
+                Op::TopK {
+                    k: 8,
+                    normalize: false,
+                },
+                &[&input],
+                &[&values, &indices],
+            )
+            .unwrap();
+        commands.into_dispatches().remove(0)
+    }
     #[test]
     fn registry_names_and_guidance_are_stable_and_complete() {
         let mut names = HashSet::new();
@@ -505,5 +837,54 @@ mod tests {
             json_position += next_json + variant.name.len();
         }
         assert!(!json.contains("schema_version"));
+    }
+
+    #[test]
+    fn resolves_concrete_variants_and_reports_refusal_kinds() {
+        let gemv = matmul_dispatch(1);
+        let validated = resolve(&gemv, "matmul.gemv", METAL4).unwrap();
+        assert_eq!(validated.name(), "matmul.gemv");
+        assert_eq!(
+            REGISTRY[validated.index].implementation,
+            MetalVariant::MatmulGemv
+        );
+
+        assert!(matches!(
+            resolve(&gemv, "matmul.missing", METAL4),
+            Err(VariantError::Unknown { .. })
+        ));
+        assert!(matches!(
+            resolve(&gemv, "top-k.partials", METAL4),
+            Err(VariantError::WrongOperation { .. })
+        ));
+        assert!(matches!(
+            resolve(&gemv, "matmul.gemv", &[]),
+            Err(VariantError::Unavailable { .. })
+        ));
+
+        let matrix = matmul_dispatch(2);
+        let error = resolve(&matrix, "matmul.gemv", METAL4).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "metal matmul variant 'matmul.gemv': constraint 'm = 1' failed (m was 2)"
+        );
+    }
+
+    #[test]
+    fn validates_inclusive_top_k_width_boundary() {
+        assert!(resolve(&top_k_dispatch(2048), "top-k.single-k8", METAL4).is_ok());
+        let error = resolve(&top_k_dispatch(2049), "top-k.single-k8", METAL4).unwrap_err();
+        assert!(error.to_string().contains("width is in 8..=2048"));
+        assert!(resolve(&top_k_dispatch(2049), "top-k.partials", METAL4).is_ok());
+    }
+
+    #[test]
+    fn relation_boundaries_are_inclusive_and_checked() {
+        assert!(relation_accepts(Relation::Range { min: 7, max: 33 }, 7));
+        assert!(relation_accepts(Relation::Range { min: 7, max: 33 }, 33));
+        assert!(!relation_accepts(Relation::Range { min: 7, max: 33 }, 6));
+        assert!(relation_accepts(Relation::MultipleOf(8), 64));
+        assert!(!relation_accepts(Relation::MultipleOf(8), 65));
+        assert!(!relation_accepts(Relation::MultipleOf(0), 0));
     }
 }
