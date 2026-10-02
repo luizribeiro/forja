@@ -1,0 +1,24 @@
+package l9o:gpu@0.1.0;
+
+interface metal-variants {
+  use compute.{command-list, error, op, tensor};
+
+  record-variant: func(
+    cmds: borrow<command-list>,
+    operation: op,
+    ins: list<borrow<tensor>>,
+    outs: list<borrow<tensor>>,
+    name: string,
+  ) -> result<_, error>;
+}
+
+world metal-host {
+  import compute;
+  import metal-variants;
+}
+
+world metal-variant-smoke {
+  import compute;
+  import metal-variants;
+  export run: func() -> result<_, string>;
+}

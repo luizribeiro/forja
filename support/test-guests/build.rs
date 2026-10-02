@@ -52,6 +52,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         build_qwen3_coder_profiles(&guest_manifest, &guest_target_dir, &out_dir)?;
     emit_guest_path("HELLO_COMPONENT", &release_dir.join("hello.wasm"));
     emit_guest_path(
+        "METAL_VARIANT_SMOKE_COMPONENT",
+        &release_dir.join("metal_variant_smoke.wasm"),
+    );
+    emit_guest_path(
         "ENGINE_SMOKE_COMPONENT",
         &release_dir.join("engine_smoke.wasm"),
     );

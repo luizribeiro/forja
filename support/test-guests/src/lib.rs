@@ -21,6 +21,12 @@ pub fn hello() -> &'static Path {
     Path::new(env!("HELLO_COMPONENT"))
 }
 
+/// Returns the path to a component importing the optional Metal variant interface.
+#[must_use]
+pub fn metal_variant_smoke() -> &'static Path {
+    Path::new(env!("METAL_VARIANT_SMOKE_COMPONENT"))
+}
+
 /// Returns the path to the guest that submits normalization and activation operations.
 #[must_use]
 pub fn rmsnorm_smoke() -> &'static Path {

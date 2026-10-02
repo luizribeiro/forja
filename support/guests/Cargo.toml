@@ -3,6 +3,7 @@ members = [
   "engine-smoke",
   "engine-sdk-smoke",
   "hello",
+  "metal-variant-smoke",
   "olmoe",
   "program-smoke",
   "rmsnorm-smoke",

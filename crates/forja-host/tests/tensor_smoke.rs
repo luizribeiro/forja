@@ -1,6 +1,8 @@
 //! End-to-end component tests for the guest tensor surface.
 
 use forja_core::{Backend, CommandList, DType, Op, Submission, ViewOp};
+#[cfg(target_os = "macos")]
+use forja_host::add_metal_to_linker;
 use forja_host::{Grants, Host, Limits, add_to_linker, component_engine};
 use forja_testing::{DeterministicValues, F32_TOLERANCE, normwise_relative_error};
 use golden_fixtures::decode_f32_le;
@@ -29,6 +31,23 @@ async fn cpu_tensor_smoke() -> wasmtime::Result<()> {
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn cpu_host_does_not_expose_metal_variants() -> wasmtime::Result<()> {
+    let result = instantiate(
+        forja_cpu::CpuBackend::new(),
+        test_guests::metal_variant_smoke(),
+        LIMITS,
+    )
+    .await;
+    let Err(error) = result else {
+        return Err(wasmtime::Error::msg(
+            "the CPU linker satisfied Metal variant imports",
+        ));
+    };
+    assert!(error.to_string().contains("metal-variants"));
+    Ok(())
+}
+
 #[cfg(target_os = "macos")]
 #[tokio::test(flavor = "multi_thread")]
 async fn metal_tensor_smoke() -> wasmtime::Result<()> {
@@ -36,6 +55,23 @@ async fn metal_tensor_smoke() -> wasmtime::Result<()> {
     let checksum = run(backend).await?;
     assert_eq!(checksum, expected_checksum());
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test(flavor = "multi_thread")]
+async fn metal_host_exposes_variant_recording() -> wasmtime::Result<()> {
+    let engine = component_engine()?;
+    let component = Component::from_file(&engine, test_guests::metal_variant_smoke())?;
+    let mut linker = Linker::new(&engine);
+    add_metal_to_linker(&mut linker)?;
+    let backend = forja_metal::MetalBackend::new().map_err(wasmtime::Error::msg)?;
+    let mut store = Host::new_store(&engine, backend, LIMITS);
+    let instance = linker.instantiate_async(&mut store, &component).await?;
+    let run = instance.get_typed_func::<(), (Result<(), String>,)>(&mut store, "run")?;
+    let (result,) = store
+        .run_concurrent(async move |accessor| run.call_concurrent(accessor, ()).await)
+        .await??;
+    result.map_err(wasmtime::Error::msg)
 }
 
 #[tokio::test(flavor = "multi_thread")]
