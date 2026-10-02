@@ -24,7 +24,7 @@ forja-testing = { path = "../../support/forja-testing" }
 golden-fixtures = { path = "../../support/golden-fixtures" }
 olmoe = { path = "../../engines/olmoe" }
 qwen3 = { path = "../../engines/qwen3" }
-qwen3-coder = { path = "../../support/guests/qwen3-coder" }
+qwen3-coder = { path = "../../engines/qwen3-coder" }
 forja-sdk = { path = "../forja-sdk", features = ["native-metal"] }
 test-guests = { path = "../../support/test-guests" }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

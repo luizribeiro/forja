@@ -6,7 +6,6 @@ members = [
   "metal-variant-smoke",
   "program-smoke",
   "rmsnorm-smoke",
-  "qwen3-coder",
   "sdk-smoke",
   "tensor-abuse",
   "tensor-smoke",

@@ -27,20 +27,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "460fbee9c2c2f33933d720630a6a0bac33ba7053db5344fac858d4b8952d77d5"
 
 [[package]]
-name = "engine-sdk-smoke"
-version = "0.0.0"
-dependencies = [
- "forja-sdk",
-]
-
-[[package]]
-name = "engine-smoke"
-version = "0.0.0"
-dependencies = [
- "wit-bindgen",
-]
-
-[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -102,13 +88,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
-name = "hello"
-version = "0.0.0"
-dependencies = [
- "wit-bindgen",
-]
-
-[[package]]
 name = "id-arena"
 version = "2.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -162,14 +141,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
-name = "metal-variant-smoke"
-version = "0.0.0"
-dependencies = [
- "forja-sdk",
- "wit-bindgen",
-]
-
-[[package]]
 name = "prettyplease"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -189,14 +160,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "program-smoke"
-version = "0.0.0"
-dependencies = [
- "forja-sdk",
- "wit-bindgen",
-]
-
-[[package]]
 name = "quote"
 version = "1.0.47"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -206,18 +169,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "rmsnorm-smoke"
-version = "0.0.0"
-dependencies = [
- "wit-bindgen",
-]
-
-[[package]]
-name = "sdk-smoke"
+name = "qwen3-coder"
 version = "0.0.0"
 dependencies = [
  "forja-sdk",
- "wit-bindgen",
 ]
 
 [[package]]
@@ -291,27 +246,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "tensor-abuse"
-version = "0.0.0"
-dependencies = [
- "wit-bindgen",
-]
-
-[[package]]
-name = "tensor-smoke"
-version = "0.0.0"
-dependencies = [
- "wit-bindgen",
-]
-
-[[package]]
-name = "toy-mlp"
-version = "0.0.0"
-dependencies = [
- "forja-sdk",
-]
-
-[[package]]
 name = "unicode-ident"
 version = "1.0.26"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -349,13 +283,6 @@ dependencies = [
  "hashbrown",
  "indexmap",
  "semver",
-]
-
-[[package]]
-name = "weights-smoke"
-version = "0.0.0"
-dependencies = [
- "wit-bindgen",
 ]
 
 [[package]]
