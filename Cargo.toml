@@ -1,4 +1,5 @@
 [workspace]
+exclude = ["engines/qwen3"]
 members = [
   "crates/*",
   "support/forja-testing",

@@ -15,6 +15,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let crate_dir = PathBuf::from(required_var("CARGO_MANIFEST_DIR")?);
     let repository = fs::canonicalize(crate_dir.join("../.."))?;
     let guest_manifest = repository.join("support/guests/Cargo.toml");
+    let qwen3_manifest = repository.join("engines/qwen3/Cargo.toml");
     let out_dir = PathBuf::from(required_var("OUT_DIR")?);
     let main_target_dir = main_target_dir(&repository, &out_dir)?;
     let guest_target_dir = main_target_dir.join("guest-build");
@@ -28,8 +29,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--exclude",
             "metal-variant-smoke",
             "--exclude",
-            "qwen3",
-            "--exclude",
             "olmoe",
             "--exclude",
             "qwen3-coder",
@@ -40,12 +39,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &guest_target_dir,
         &["-p", "metal-variant-smoke"],
     )?;
-    build_guest_workspace(&guest_manifest, &guest_target_dir, &["-p", "qwen3"])?;
-    build_guest_workspace(
-        &guest_manifest,
-        &bf16_target_dir,
-        &["-p", "qwen3", "--features", "bf16"],
-    )?;
+    build_guest_workspace(&qwen3_manifest, &guest_target_dir, &[])?;
+    build_guest_workspace(&qwen3_manifest, &bf16_target_dir, &["--features", "bf16"])?;
 
     let [
         qwen3,
@@ -60,7 +55,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         qwen3_no_replay,
         qwen3_bf16_no_replay,
     ] = build_qwen_profiles(
-        &guest_manifest,
+        &qwen3_manifest,
         &guest_target_dir,
         &bf16_target_dir,
         &out_dir,
@@ -125,6 +120,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "cargo::rerun-if-changed={}",
         repository.join("support/guests").display()
+    );
+    println!(
+        "cargo::rerun-if-changed={}",
+        repository.join("engines/qwen3").display()
     );
     println!(
         "cargo::rerun-if-changed={}",
@@ -261,13 +260,7 @@ fn build_qwen_profile(manifest: &Path, target_dir: &Path, features: &str) -> io:
     build_guest_workspace(
         manifest,
         target_dir,
-        &[
-            "-p",
-            "qwen3",
-            "--no-default-features",
-            "--features",
-            features,
-        ],
+        &["--no-default-features", "--features", features],
     )
 }
 
@@ -382,6 +375,9 @@ fn run_rustc_wrapper() -> Result<(), Box<dyn std::error::Error>> {
         ] {
             args.push(format!("--remap-path-prefix={}={to}", Path::new(from).display()).into());
         }
+        if env::var("CARGO_PKG_NAME").as_deref() == Ok("qwen3") {
+            args.push("--remap-path-prefix=src=qwen3/src".into());
+        }
     }
     let status = Command::new(rustc).args(args).status()?;
     if status.success() {
@@ -416,6 +412,13 @@ fn stable_metadata(args: &[std::ffi::OsString], roots: [&std::ffi::OsString; 3])
     }
     for (root, replacement) in roots.into_iter().zip(["/workspace", "/cargo", "/target"]) {
         identity = identity.replace(&*root.to_string_lossy(), replacement);
+    }
+    identity = identity.replace(
+        "/workspace/engines/qwen3",
+        "/workspace/support/guests/qwen3",
+    );
+    if env::var("CARGO_PKG_NAME").as_deref() == Ok("qwen3") {
+        identity = identity.replace("\0src/lib.rs\0", "\0qwen3/src/lib.rs\0");
     }
     let hash = identity
         .bytes()

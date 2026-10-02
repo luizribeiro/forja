@@ -7,7 +7,6 @@ members = [
   "olmoe",
   "program-smoke",
   "rmsnorm-smoke",
-  "qwen3",
   "qwen3-coder",
   "sdk-smoke",
   "tensor-abuse",

@@ -23,7 +23,7 @@ forja-cpu = { path = "../forja-cpu" }
 forja-testing = { path = "../../support/forja-testing" }
 golden-fixtures = { path = "../../support/golden-fixtures" }
 olmoe = { path = "../../support/guests/olmoe" }
-qwen3 = { path = "../../support/guests/qwen3" }
+qwen3 = { path = "../../engines/qwen3" }
 qwen3-coder = { path = "../../support/guests/qwen3-coder" }
 forja-sdk = { path = "../forja-sdk", features = ["native-metal"] }
 test-guests = { path = "../../support/test-guests" }
