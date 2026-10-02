@@ -49,28 +49,28 @@ pub(super) fn select_gemm(
     Some(GEMM_64_64_FLOAT)
 }
 
-const GEMM_64_64_FLOAT: GemmConfig = GemmConfig {
+pub(super) const GEMM_64_64_FLOAT: GemmConfig = GemmConfig {
     kernel: "steel_gemm_64_64_16_2_2",
     block_rows: 64,
     block_columns: 64,
     block_inner: 16,
     thread_count: 128,
 };
-const GEMM_64_64_HALF: GemmConfig = GemmConfig {
+pub(super) const GEMM_64_64_HALF: GemmConfig = GemmConfig {
     kernel: "steel_gemm_64_64_16_1_2",
     block_rows: 64,
     block_columns: 64,
     block_inner: 16,
     thread_count: 64,
 };
-const GEMM_64_32: GemmConfig = GemmConfig {
+pub(super) const GEMM_64_32: GemmConfig = GemmConfig {
     kernel: "steel_gemm_64_32_32_2_2",
     block_rows: 64,
     block_columns: 32,
     block_inner: 32,
     thread_count: 128,
 };
-const GEMM_32_64: GemmConfig = GemmConfig {
+pub(super) const GEMM_32_64: GemmConfig = GemmConfig {
     kernel: "steel_gemm_32_64_16_1_2",
     block_rows: 32,
     block_columns: 64,

@@ -51,6 +51,10 @@ impl ValidatedVariant {
     pub fn operation(self) -> OperationKind {
         REGISTRY[self.index].operation
     }
+
+    pub(crate) const fn implementation(self) -> MetalVariant {
+        REGISTRY[self.index].implementation
+    }
 }
 
 /// A reason a concrete Metal algorithm variant was refused.

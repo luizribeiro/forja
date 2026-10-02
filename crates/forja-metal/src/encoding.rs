@@ -31,12 +31,10 @@ use objc2_metal::{
 
 use crate::{
     map_codegen,
-    matmul::{classify, select_gemm},
+    matmul::{GEMM_32_64, GEMM_64_32, GEMM_64_64_FLOAT, GEMM_64_64_HALF, classify, select_gemm},
     storage::{MetalBackend, MetalBuffer},
+    variants::MetalVariant,
 };
-
-#[cfg(test)]
-use crate::variants::MetalVariant;
 
 type MetalBufferRef = Retained<ProtocolObject<dyn MTLBuffer>>;
 type EncodedEmbed = (Vec<BufferBinding>, BufferBinding);
@@ -363,6 +361,15 @@ impl GroupedRouteShape {
 }
 
 fn grouped_gather_dispatch(dispatch: &Dispatch) -> bool {
+    match pinned_variant(dispatch) {
+        Some(MetalVariant::GatherQuantMatmulGrouped | MetalVariant::GatherQuantSiluMulGrouped) => {
+            return true;
+        }
+        Some(
+            MetalVariant::GatherQuantMatmulRouteGemv | MetalVariant::GatherQuantSiluMulRouteGemv,
+        ) => return false,
+        Some(_) | None => {}
+    }
     let Some(indices) = dispatch.inputs().last() else {
         return false;
     };
@@ -1942,6 +1949,16 @@ impl MetalBackend {
             .template()
             .instantiate(&values)
             .map_err(|_| BackendError::InvalidInput)?;
+        for dispatch in commands.dispatches() {
+            if let Some(variant) = dispatch.backend_data::<crate::ValidatedVariant>() {
+                let validated = self
+                    .validate_variant(dispatch, variant.name())
+                    .map_err(|_| BackendError::InvalidInput)?;
+                if validated.implementation() != variant.implementation() {
+                    return Err(BackendError::InvalidInput);
+                }
+            }
+        }
         if profile {
             self.submit_commands_inner::<true>(commands, Some(state))
         } else {
@@ -2472,8 +2489,16 @@ impl MetalBackend {
                     true,
                 )
             };
-        let parameter_buffer =
-            self.encode_matmul_kernel(encoder, table, &left, &right, &output, bindings, arguments)?;
+        let parameter_buffer = self.encode_matmul_kernel(
+            encoder,
+            table,
+            pinned_variant(dispatch),
+            &left,
+            &right,
+            &output,
+            bindings,
+            arguments,
+        )?;
         temporaries.push(parameter_buffer);
         if copy_output {
             encode_dispatch_barrier(encoder);
@@ -2810,7 +2835,9 @@ impl MetalBackend {
             (bits, group_size),
         )?;
         let experts = packed.layout.shape()[0];
-        if grouped_routes(rows, routes, experts) {
+        if pinned_variant(dispatch) == Some(MetalVariant::GatherQuantMatmulGrouped)
+            || (pinned_variant(dispatch).is_none() && grouped_routes(rows, routes, experts))
+        {
             return self.encode_grouped_quant_matmul(
                 encoder,
                 table,
@@ -3001,7 +3028,9 @@ impl MetalBackend {
             config,
         )?;
         let experts = gate_packed.layout.shape()[0];
-        if grouped_routes(rows, routes, experts) {
+        if pinned_variant(dispatch) == Some(MetalVariant::GatherQuantSiluMulGrouped)
+            || (pinned_variant(dispatch).is_none() && grouped_routes(rows, routes, experts))
+        {
             return self.encode_grouped_quant_silu_mul(
                 encoder,
                 table,
@@ -3874,6 +3903,7 @@ impl MetalBackend {
             temporaries.push(self.encode_matmul_kernel(
                 encoder,
                 table,
+                None,
                 &left,
                 &right,
                 &PreparedMatmulOutput {
@@ -3963,6 +3993,7 @@ impl MetalBackend {
             temporaries.push(self.encode_matmul_kernel(
                 encoder,
                 table,
+                None,
                 &left,
                 &right,
                 &prepared_output,
@@ -4046,6 +4077,7 @@ impl MetalBackend {
         &self,
         encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
         table: &ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>,
+        pinned: Option<MetalVariant>,
         left: &PreparedMatmulInput,
         right: &PreparedMatmulInput,
         output: &PreparedMatmulOutput,
@@ -4102,7 +4134,7 @@ impl MetalBackend {
             left_column_major: left.column_major != 0,
             right_column_major: right.column_major != 0,
         };
-        let launch = self.matmul_launch(shape)?;
+        let launch = self.matmul_launch(shape, pinned)?;
         log_matmul_route(left, right, output, &launch, shape);
         set_pipeline(encoder, &launch.pipeline);
         bindings.bind(table, 0, &left.tensor.buffer);
@@ -4178,14 +4210,23 @@ impl MetalBackend {
         })
     }
 
-    fn matmul_launch(&self, shape: MatmulShape) -> Result<MatmulLaunch, BackendError> {
+    fn matmul_launch(
+        &self,
+        shape: MatmulShape,
+        pinned: Option<MetalVariant>,
+    ) -> Result<MatmulLaunch, BackendError> {
         let (kernel, block_rows, block_columns, thread_count, constants) = if shape.rows == 1 {
-            let (kernel, block_columns, thread_count) =
-                if shape.right_column_major && !shape.left_column_major {
-                    ("gemv_transposed", 32, 256)
-                } else {
-                    ("gemv", 4, 32)
-                };
+            let transposed = match pinned {
+                Some(MetalVariant::MatmulGemv) => false,
+                Some(MetalVariant::MatmulGemvTransposed) => true,
+                Some(_) => return Err(BackendError::InvalidInput),
+                None => shape.right_column_major && !shape.left_column_major,
+            };
+            let (kernel, block_columns, thread_count) = if transposed {
+                ("gemv_transposed", 32, 256)
+            } else {
+                ("gemv", 4, 32)
+            };
             (
                 kernel,
                 1,
@@ -4198,16 +4239,23 @@ impl MetalBackend {
                 ],
             )
         } else {
-            let config = select_gemm(
-                shape.left_dtype,
-                shape.batch,
-                shape.rows,
-                shape.columns,
-                shape.inner,
-                shape.left_column_major,
-                shape.right_column_major,
-            )
-            .ok_or(BackendError::InvalidInput)?;
+            let config = match pinned {
+                Some(MetalVariant::MatmulSteel64x64x16_2x2) => GEMM_64_64_FLOAT,
+                Some(MetalVariant::MatmulSteel64x64x16_1x2) => GEMM_64_64_HALF,
+                Some(MetalVariant::MatmulSteel64x32x32_2x2) => GEMM_64_32,
+                Some(MetalVariant::MatmulSteel32x64x16_1x2) => GEMM_32_64,
+                Some(_) => return Err(BackendError::InvalidInput),
+                None => select_gemm(
+                    shape.left_dtype,
+                    shape.batch,
+                    shape.rows,
+                    shape.columns,
+                    shape.inner,
+                    shape.left_column_major,
+                    shape.right_column_major,
+                )
+                .ok_or(BackendError::InvalidInput)?,
+            };
             (
                 config.kernel,
                 config.block_rows,
@@ -4930,7 +4978,9 @@ impl MetalBackend {
             (0, dtype_code(input.layout.dtype())),
             (2, dtype_code(values.layout.dtype())),
         ];
-        if chunks == 1 && k == 8 {
+        if pinned_variant(dispatch) == Some(MetalVariant::TopKSingleK8)
+            || (pinned_variant(dispatch).is_none() && chunks == 1 && k == 8)
+        {
             return self.encode_top_k_single(
                 encoder, table, &input, &values, &indices, width, rows, k, normalize, &constants,
                 bindings, arguments,
@@ -5542,20 +5592,7 @@ impl MetalBackend {
                 arguments.write(size_of::<u32>())?;
             }
             Op::TopK { k, .. } => {
-                let width = dispatch.inputs()[0]
-                    .layout()
-                    .shape()
-                    .last()
-                    .copied()
-                    .ok_or(BackendError::InvalidInput)?;
-                let lengths: &[usize] = if width <= ARGMAX_CHUNK_WIDTH && k == 8 {
-                    &[112, 112, 112, 4, 4, 4]
-                } else {
-                    &[112, 112, 112, 4, 4, 4, 4]
-                };
-                for &len in lengths {
-                    arguments.write(len)?;
-                }
+                Self::size_top_k_arguments(dispatch, k, arguments)?;
             }
             Op::Sample { position } => {
                 Self::write_sample_arguments(dispatch, position, arguments)?;
@@ -5616,6 +5653,30 @@ impl MetalBackend {
                 arguments.write(8)?;
             }
             Op::Sdpa { .. } => self.size_sdpa_arguments(dispatch, arguments)?,
+        }
+        Ok(())
+    }
+
+    fn size_top_k_arguments(
+        dispatch: &Dispatch,
+        k: u32,
+        arguments: &mut ArgumentSizer,
+    ) -> Result<(), BackendError> {
+        let width = dispatch.inputs()[0]
+            .layout()
+            .shape()
+            .last()
+            .copied()
+            .ok_or(BackendError::InvalidInput)?;
+        let single = pinned_variant(dispatch) == Some(MetalVariant::TopKSingleK8)
+            || (pinned_variant(dispatch).is_none() && width <= ARGMAX_CHUNK_WIDTH && k == 8);
+        let lengths: &[usize] = if single {
+            &[112, 112, 112, 4, 4, 4]
+        } else {
+            &[112, 112, 112, 4, 4, 4, 4]
+        };
+        for &len in lengths {
+            arguments.write(len)?;
         }
         Ok(())
     }
@@ -6083,6 +6144,13 @@ fn dispatch_kernel(dispatch: &Dispatch) -> Result<&'static str, BackendError> {
         Op::Softmax => row_kernel(dispatch, "softmax_single", "softmax_looped")?,
         Op::Argmax => "argmax_partials+finalize",
         Op::TopK { .. } => {
+            if let Some(variant) = pinned_variant(dispatch) {
+                return match variant {
+                    MetalVariant::TopKSingleK8 => Ok("topk_single"),
+                    MetalVariant::TopKPartials => Ok("topk_partials+finalize"),
+                    _ => Err(BackendError::InvalidInput),
+                };
+            }
             let width = dispatch.inputs()[0]
                 .layout()
                 .shape()
@@ -6128,6 +6196,20 @@ fn quant_matmul_kernel(dispatch: &Dispatch) -> Result<&'static str, BackendError
         return Err(BackendError::InvalidInput);
     };
     let rows = input.layout().shape()[0];
+    if let Some(variant) = pinned_variant(dispatch) {
+        return match variant {
+            MetalVariant::QuantMatmulGemv => Ok("quantized_gemv"),
+            MetalVariant::QuantMatmulQ8FastGemv => Ok("quantized_gemv_q8_fast"),
+            MetalVariant::QuantMatmulSmallM => Ok("quantized_gemm_small_m"),
+            MetalVariant::QuantMatmulTiled => match input.layout().dtype() {
+                DType::F32 => Ok("quantized_gemm_tiled_f32"),
+                DType::F16 => Ok("quantized_gemm_tiled_f16"),
+                DType::BF16 => Ok("quantized_gemm_tiled_bf16"),
+                DType::I32 | DType::U32 => Err(BackendError::InvalidInput),
+            },
+            _ => Err(BackendError::InvalidInput),
+        };
+    }
     if rows == 1 {
         let q8_fast = matches!(
             dispatch.op(),
@@ -6192,6 +6274,17 @@ fn matmul_kernel(dispatch: &Dispatch) -> Result<&'static str, BackendError> {
                 .ok_or(BackendError::InvalidInput)?,
         )
         .ok_or(BackendError::InvalidInput)?;
+    if let Some(variant) = pinned_variant(dispatch) {
+        return match variant {
+            MetalVariant::MatmulGemv => Ok("gemv"),
+            MetalVariant::MatmulGemvTransposed => Ok("gemv_transposed"),
+            MetalVariant::MatmulSteel64x64x16_2x2 => Ok("steel_gemm_64_64_16_2_2"),
+            MetalVariant::MatmulSteel64x64x16_1x2 => Ok("steel_gemm_64_64_16_1_2"),
+            MetalVariant::MatmulSteel64x32x32_2x2 => Ok("steel_gemm_64_32_32_2_2"),
+            MetalVariant::MatmulSteel32x64x16_1x2 => Ok("steel_gemm_32_64_16_1_2"),
+            _ => Err(BackendError::InvalidInput),
+        };
+    }
     let left_column_major = classify(left.layout())
         .kernel_strides()
         .is_some_and(|(column_major, _, _)| column_major != 0);
@@ -6325,6 +6418,16 @@ fn select_sdpa(dispatch: &Dispatch) -> Result<SdpaKernel, BackendError> {
     if let Some(kernel) = FORCED_SDPA_KERNEL.with(Cell::get) {
         return Ok(kernel);
     }
+    if let Some(variant) = pinned_variant(dispatch) {
+        return match variant {
+            MetalVariant::SdpaDecomposed => Ok(SdpaKernel::Decomposed),
+            MetalVariant::SdpaVectorSinglePass | MetalVariant::SdpaVectorTwoPass => {
+                Ok(SdpaKernel::Vector)
+            }
+            MetalVariant::SdpaSteel => Ok(SdpaKernel::Steel),
+            _ => Err(BackendError::InvalidInput),
+        };
+    }
     let [query, key, _] = dispatch.inputs() else {
         return Err(BackendError::InvalidInput);
     };
@@ -6343,6 +6446,13 @@ fn select_sdpa(dispatch: &Dispatch) -> Result<SdpaKernel, BackendError> {
     } else {
         Ok(SdpaKernel::Decomposed)
     }
+}
+
+fn pinned_variant(dispatch: &Dispatch) -> Option<MetalVariant> {
+    dispatch
+        .backend_data::<crate::ValidatedVariant>()
+        .copied()
+        .map(crate::ValidatedVariant::implementation)
 }
 
 fn steel_sdpa_supported(dispatch: &Dispatch) -> Result<bool, BackendError> {
@@ -6899,8 +7009,8 @@ mod tests {
     };
 
     use forja_core::{
-        Affine, Backend, CommandList, DType, GraphLimits, Op, ParamSpace, Slice, Submission,
-        SymbolicLayout, TemplateTensor, ViewOp,
+        Affine, Backend, BackendDispatchData, CommandList, DType, GraphLimits, Op, ParamSpace,
+        Slice, Submission, SymbolicLayout, TemplateTensor, ViewOp,
         program::{
             BinOp, BoundProgram, Inst, KernelSignature, Program, ProgramKind, RedOp,
             ValidatedProgram, bind_program, prepare_program,
@@ -7781,6 +7891,75 @@ mod tests {
         );
         backend.replay(&graph, Vec::new()).unwrap().wait().unwrap();
         backend.replay(&graph, Vec::new()).unwrap().wait().unwrap();
+    }
+
+    #[test]
+    fn tier_two_preencodes_a_pinned_static_dispatch() {
+        let backend = MetalBackend::new().unwrap();
+        let left = backend.alloc(DType::F32, &[7, 33]).unwrap();
+        let right = backend.alloc(DType::F32, &[33, 7]).unwrap();
+        let output = backend.alloc(DType::F32, &[7, 7]).unwrap();
+        let variant = backend
+            .validate_variant_for_op(
+                Op::Matmul,
+                &[&left, &right],
+                &[&output],
+                "matmul.steel-64x64x16-2x2",
+            )
+            .unwrap();
+        let mut commands = CommandList::new();
+        commands
+            .dispatch(Op::Matmul, &[&left, &right], &output)
+            .unwrap();
+        assert!(commands.set_last_backend_data(BackendDispatchData::new(variant)));
+        let mut graph =
+            GraphTemplate::new(ParamSpace::new(Vec::new()).unwrap(), GraphLimits::default());
+        graph
+            .record_validated(commands.into_dispatches().remove(0))
+            .unwrap();
+
+        let graph = backend.prepare_graph(graph).unwrap();
+        let state = graph.backend_state::<PreparedMetalGraph>().unwrap();
+        assert!(state.encoding.as_ref().unwrap().dispatches[0].is_some());
+    }
+
+    #[test]
+    fn replay_refuses_a_resolved_variant_that_fails_concrete_constraints() {
+        let backend = MetalBackend::new().unwrap();
+        let valid_left = backend.alloc(DType::F32, &[1, 33]).unwrap();
+        let right = backend.alloc(DType::F32, &[33, 7]).unwrap();
+        let valid_output = backend.alloc(DType::F32, &[1, 7]).unwrap();
+        let variant = backend
+            .validate_variant_for_op(
+                Op::Matmul,
+                &[&valid_left, &right],
+                &[&valid_output],
+                "matmul.gemv",
+            )
+            .unwrap();
+        let space = ParamSpace::new(std::iter::once(1..=2).collect()).unwrap();
+        let left = backend.alloc(DType::F32, &[2, 33]).unwrap();
+        let output = backend.alloc(DType::F32, &[2, 7]).unwrap();
+        let left = symbolic_prefix(&left, space.clone(), Affine::parameter(0, 0, 1));
+        let output = symbolic_prefix(&output, space.clone(), Affine::parameter(0, 0, 1));
+        let right = TemplateTensor::from(right);
+        let mut template = GraphTemplate::new(space, GraphLimits::default());
+        template
+            .dispatch_variant_rule_many(
+                Op::Matmul,
+                &[&left, &right],
+                &[&output],
+                0,
+                vec![(2, BackendDispatchData::new(variant))],
+            )
+            .unwrap();
+
+        let graph = backend.prepare_graph(template).unwrap();
+        backend.replay(&graph, vec![1]).unwrap().wait().unwrap();
+        assert!(matches!(
+            backend.replay(&graph, vec![2]),
+            Err(BackendError::InvalidInput)
+        ));
     }
 
     #[test]
