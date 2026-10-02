@@ -577,12 +577,57 @@ impl<T: Element> Tensor<T> {
     where
         T: FloatElement,
     {
+        self.quant_matmul_selected(packed, scales, biases, bits, group_size, None)
+    }
+
+    /// Multiplies by affine-quantized weights with an explicit Metal algorithm selection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for incompatible weights, rule context, or a host-refused selection.
+    #[allow(clippy::too_many_arguments)]
+    pub fn quant_matmul_with<'a, S: FloatElement>(
+        &self,
+        packed: &Tensor<u32>,
+        scales: &Tensor<S>,
+        biases: &Tensor<S>,
+        bits: u8,
+        group_size: u32,
+        selection: impl Into<crate::target::metal::VariantChoice<'a>>,
+    ) -> Result<Self>
+    where
+        T: FloatElement,
+    {
+        self.quant_matmul_selected(
+            packed,
+            scales,
+            biases,
+            bits,
+            group_size,
+            Some(selection.into()),
+        )
+    }
+
+    fn quant_matmul_selected<S: FloatElement>(
+        &self,
+        packed: &Tensor<u32>,
+        scales: &Tensor<S>,
+        biases: &Tensor<S>,
+        bits: u8,
+        group_size: u32,
+        selection: Option<crate::target::metal::VariantChoice<'_>>,
+    ) -> Result<Self>
+    where
+        T: FloatElement,
+    {
         let result = self.empty_quant_matmul_output(packed, scales, biases, bits, group_size)?;
-        graph::record(
-            sys::Op::QuantMatmul { bits, group_size },
-            &[&self.handle, &packed.handle, &scales.handle, &biases.handle],
-            &result.handle,
-        )?;
+        let operation = sys::Op::QuantMatmul { bits, group_size };
+        let inputs = [&self.handle, &packed.handle, &scales.handle, &biases.handle];
+        if let Some(selection) = selection {
+            graph::record_variant(operation, &inputs, &result.handle, selection)?;
+        } else {
+            graph::record(operation, &inputs, &result.handle)?;
+        }
         Ok(result)
     }
 
@@ -691,20 +736,69 @@ impl<T: Element> Tensor<T> {
     where
         T: FloatElement,
     {
+        self.gather_quant_matmul_selected(packed, scales, biases, indices, bits, group_size, None)
+    }
+
+    /// Multiplies routed rows with an explicit Metal algorithm selection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for incompatible weights, rule context, or a host-refused selection.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gather_quant_matmul_with<'a, S: FloatElement>(
+        &self,
+        packed: &Tensor<u32>,
+        scales: &Tensor<S>,
+        biases: &Tensor<S>,
+        indices: &Tensor<u32>,
+        bits: u8,
+        group_size: u32,
+        selection: impl Into<crate::target::metal::VariantChoice<'a>>,
+    ) -> Result<Self>
+    where
+        T: FloatElement,
+    {
+        self.gather_quant_matmul_selected(
+            packed,
+            scales,
+            biases,
+            indices,
+            bits,
+            group_size,
+            Some(selection.into()),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn gather_quant_matmul_selected<S: FloatElement>(
+        &self,
+        packed: &Tensor<u32>,
+        scales: &Tensor<S>,
+        biases: &Tensor<S>,
+        indices: &Tensor<u32>,
+        bits: u8,
+        group_size: u32,
+        selection: Option<crate::target::metal::VariantChoice<'_>>,
+    ) -> Result<Self>
+    where
+        T: FloatElement,
+    {
         let shape =
             self.gather_quantized_shape(packed, scales, biases, indices, bits, group_size)?;
         let result = Self::empty(shape.to_vec())?;
-        graph::record(
-            sys::Op::GatherQuantMatmul { bits, group_size },
-            &[
-                &self.handle,
-                &packed.handle,
-                &scales.handle,
-                &biases.handle,
-                &indices.handle,
-            ],
-            &result.handle,
-        )?;
+        let operation = sys::Op::GatherQuantMatmul { bits, group_size };
+        let inputs = [
+            &self.handle,
+            &packed.handle,
+            &scales.handle,
+            &biases.handle,
+            &indices.handle,
+        ];
+        if let Some(selection) = selection {
+            graph::record_variant(operation, &inputs, &result.handle, selection)?;
+        } else {
+            graph::record(operation, &inputs, &result.handle)?;
+        }
         Ok(result)
     }
 
@@ -791,6 +885,73 @@ impl<T: Element> Tensor<T> {
     where
         T: FloatElement,
     {
+        self.gather_quant_silu_mul_selected(
+            gate_packed,
+            gate_scales,
+            gate_biases,
+            up_packed,
+            up_scales,
+            up_biases,
+            indices,
+            bits,
+            group_size,
+            None,
+        )
+    }
+
+    /// Computes routed fused projections with an explicit Metal algorithm selection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for incompatible weights, rule context, or a host-refused selection.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gather_quant_silu_mul_with<'a, S: FloatElement>(
+        &self,
+        gate_packed: &Tensor<u32>,
+        gate_scales: &Tensor<S>,
+        gate_biases: &Tensor<S>,
+        up_packed: &Tensor<u32>,
+        up_scales: &Tensor<S>,
+        up_biases: &Tensor<S>,
+        indices: &Tensor<u32>,
+        bits: u8,
+        group_size: u32,
+        selection: impl Into<crate::target::metal::VariantChoice<'a>>,
+    ) -> Result<Self>
+    where
+        T: FloatElement,
+    {
+        self.gather_quant_silu_mul_selected(
+            gate_packed,
+            gate_scales,
+            gate_biases,
+            up_packed,
+            up_scales,
+            up_biases,
+            indices,
+            bits,
+            group_size,
+            Some(selection.into()),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn gather_quant_silu_mul_selected<S: FloatElement>(
+        &self,
+        gate_packed: &Tensor<u32>,
+        gate_scales: &Tensor<S>,
+        gate_biases: &Tensor<S>,
+        up_packed: &Tensor<u32>,
+        up_scales: &Tensor<S>,
+        up_biases: &Tensor<S>,
+        indices: &Tensor<u32>,
+        bits: u8,
+        group_size: u32,
+        selection: Option<crate::target::metal::VariantChoice<'_>>,
+    ) -> Result<Self>
+    where
+        T: FloatElement,
+    {
         let shape = self.gather_quantized_shape(
             gate_packed,
             gate_scales,
@@ -805,20 +966,22 @@ impl<T: Element> Tensor<T> {
             return Err(Error::new("gate and up projection shapes differ"));
         }
         let result = Self::empty(shape.to_vec())?;
-        graph::record(
-            sys::Op::GatherQuantSiluMul { bits, group_size },
-            &[
-                &self.handle,
-                &gate_packed.handle,
-                &gate_scales.handle,
-                &gate_biases.handle,
-                &up_packed.handle,
-                &up_scales.handle,
-                &up_biases.handle,
-                &indices.handle,
-            ],
-            &result.handle,
-        )?;
+        let operation = sys::Op::GatherQuantSiluMul { bits, group_size };
+        let inputs = [
+            &self.handle,
+            &gate_packed.handle,
+            &gate_scales.handle,
+            &gate_biases.handle,
+            &up_packed.handle,
+            &up_scales.handle,
+            &up_biases.handle,
+            &indices.handle,
+        ];
+        if let Some(selection) = selection {
+            graph::record_variant(operation, &inputs, &result.handle, selection)?;
+        } else {
+            graph::record(operation, &inputs, &result.handle)?;
+        }
         Ok(result)
     }
 
