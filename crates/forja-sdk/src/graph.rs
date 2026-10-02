@@ -344,7 +344,6 @@ pub(crate) fn record_many(
     })
 }
 
-#[expect(dead_code)]
 pub(crate) fn record_variant(
     operation: sys::Op,
     inputs: &[&sys::Handle],
@@ -354,7 +353,6 @@ pub(crate) fn record_variant(
     record_variant_many(operation, inputs, &[output], selection)
 }
 
-#[expect(dead_code)]
 pub(crate) fn record_variant_many(
     operation: sys::Op,
     inputs: &[&sys::Handle],

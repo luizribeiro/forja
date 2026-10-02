@@ -1308,7 +1308,6 @@ pub(crate) fn dispatch_many(
     Active::dispatch_many(commands, operation, inputs, outputs)
 }
 
-#[expect(dead_code)]
 pub(crate) fn dispatch_variant(
     commands: &mut Commands,
     operation: Op,
@@ -1319,7 +1318,6 @@ pub(crate) fn dispatch_variant(
     Active::dispatch_variant(commands, operation, inputs, outputs, name)
 }
 
-#[expect(dead_code)]
 pub(crate) fn dispatch_variant_rule(
     commands: &mut Commands,
     params: &Params,

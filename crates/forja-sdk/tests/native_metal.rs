@@ -2,7 +2,10 @@
 
 //! Metal-backed native SDK coverage.
 
-use forja_sdk::{NativeDevice, Slice, Tensor, set_native_device};
+use forja_sdk::{
+    NativeDevice, Slice, Tensor, set_native_device,
+    target::metal::{Variant, VariantRule},
+};
 
 mod support;
 
@@ -36,4 +39,25 @@ fn metal_attention_and_cache_copy_match_the_cpu_backend() {
 fn metal_neural_network_modules_match_the_cpu_backend() {
     set_native_device(NativeDevice::Metal);
     support::neural_network_modules_match_cpu();
+}
+
+#[test]
+fn explicit_metal_variant_matches_native_and_rule_syntax() {
+    set_native_device(NativeDevice::Metal);
+    let variant = Variant::new("matmul.gemv").unwrap();
+    let left = Tensor::from_slice(&[2.0_f32], &[1, 1]).unwrap();
+    let right = Tensor::from_slice(&[3.0_f32], &[1, 1]).unwrap();
+    assert_eq!(
+        left.matmul_with(&right, &variant)
+            .unwrap()
+            .to_vec()
+            .unwrap(),
+        [6.0]
+    );
+
+    let parameter = forja_sdk::Param::new(1..=33).unwrap();
+    let low = Variant::new("sdpa.decomposed").unwrap();
+    let high = Variant::new("sdpa.vector-single-pass").unwrap();
+    assert!(VariantRule::new(&parameter, vec![(1..=7, low), (8..=33, high)]).is_ok());
+    assert!(Variant::new("Matmul.Gemv").is_err());
 }

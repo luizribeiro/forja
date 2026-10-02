@@ -351,13 +351,35 @@ impl<T: Element> Tensor<T> {
     /// Returns an error when `k` is zero, greater than 64, greater than the row width, or the
     /// dispatch is refused.
     pub fn top_k(&self, k: u32) -> Result<(Self, Tensor<u32>)> {
-        self.top_k_with_normalization(k, false)
+        self.top_k_selected(k, false, None)
+    }
+
+    /// Selects greatest values with an explicit Metal algorithm selection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid count, rule context, or host-refused selection.
+    pub fn top_k_with<'a>(
+        &self,
+        k: u32,
+        selection: impl Into<crate::target::metal::VariantChoice<'a>>,
+    ) -> Result<(Self, Tensor<u32>)> {
+        self.top_k_selected(k, false, Some(selection.into()))
     }
 
     pub(crate) fn top_k_with_normalization(
         &self,
         k: u32,
         normalize: bool,
+    ) -> Result<(Self, Tensor<u32>)> {
+        self.top_k_selected(k, normalize, None)
+    }
+
+    fn top_k_selected(
+        &self,
+        k: u32,
+        normalize: bool,
+        selection: Option<crate::target::metal::VariantChoice<'_>>,
     ) -> Result<(Self, Tensor<u32>)> {
         let mut shape = self.shape.clone();
         let width = shape
@@ -371,11 +393,21 @@ impl<T: Element> Tensor<T> {
         *width = k;
         let values = Self::empty(shape.clone())?;
         let indices = Tensor::<u32>::empty(shape)?;
-        graph::record_many(
-            sys::Op::TopK { k, normalize },
-            &[&self.handle],
-            &[&values.handle, &indices.handle],
-        )?;
+        let operation = sys::Op::TopK { k, normalize };
+        if let Some(selection) = selection {
+            graph::record_variant_many(
+                operation,
+                &[&self.handle],
+                &[&values.handle, &indices.handle],
+                selection,
+            )?;
+        } else {
+            graph::record_many(
+                operation,
+                &[&self.handle],
+                &[&values.handle, &indices.handle],
+            )?;
+        }
         Ok((values, indices))
     }
 
@@ -432,6 +464,27 @@ impl<T: Element> Tensor<T> {
     ///
     /// Returns an error for incompatible ranks, shapes, types, or dispatches.
     pub fn matmul(&self, right: &Self) -> Result<Self> {
+        self.matmul_selected(right, None)
+    }
+
+    /// Multiplies tensors with an explicit Metal algorithm selection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for incompatible shapes, rule context, or a host-refused selection.
+    pub fn matmul_with<'a>(
+        &self,
+        right: &Self,
+        selection: impl Into<crate::target::metal::VariantChoice<'a>>,
+    ) -> Result<Self> {
+        self.matmul_selected(right, Some(selection.into()))
+    }
+
+    fn matmul_selected(
+        &self,
+        right: &Self,
+        selection: Option<crate::target::metal::VariantChoice<'_>>,
+    ) -> Result<Self> {
         let rank = self.shape.len();
         if !matches!(rank, 2 | 3) || right.shape.len() != rank {
             return Err(Error::new(
@@ -446,7 +499,22 @@ impl<T: Element> Tensor<T> {
         }
         let mut shape = self.shape[..batch].to_vec();
         shape.extend([self.shape[batch], right.shape[batch + 1]]);
-        self.binary_with_shape(right, sys::Op::Matmul, shape)
+        let output = Self::empty(shape)?;
+        if let Some(selection) = selection {
+            graph::record_variant(
+                sys::Op::Matmul,
+                &[&self.handle, &right.handle],
+                &output.handle,
+                selection,
+            )?;
+        } else {
+            graph::record(
+                sys::Op::Matmul,
+                &[&self.handle, &right.handle],
+                &output.handle,
+            )?;
+        }
+        Ok(output)
     }
 
     /// Multiplies rows by dense expert matrices selected by GPU indices.
