@@ -67,7 +67,9 @@
             stages = allLocalStages;
             text = ''
               cargo fmt --all -- --check
-              cargo fmt --all --manifest-path support/guests/Cargo.toml -- --check
+              for manifest in support/guests/Cargo.toml engines/*/Cargo.toml; do
+                cargo fmt --all --manifest-path "$manifest" -- --check
+              done
             '';
           };
           host-clippy = cargoHook {
@@ -77,9 +79,13 @@
           };
           wasm-clippy = cargoHook {
             name = "wasm-clippy-hook";
-            files = "^support/guests/";
+            files = "^(support/guests/|engines/)";
             stages = allLocalStages;
-            text = "cargo clippy --manifest-path support/guests/Cargo.toml --workspace --all-targets --target wasm32-wasip2 --locked -- -D warnings";
+            text = ''
+              for manifest in support/guests/Cargo.toml engines/*/Cargo.toml; do
+                cargo clippy --manifest-path "$manifest" --workspace --all-targets --target wasm32-wasip2 --locked -- -D warnings
+              done
+            '';
           };
           cargo-nextest = cargoHook {
             name = "cargo-nextest-hook";
@@ -104,7 +110,7 @@
           };
           guest-reproducibility = cargoHook {
             name = "guest-reproducibility-hook";
-            files = "^(crates/forja-(program-conversions|sdk|sdk-macros)/|support/(guests|test-guests)/|wit/)";
+            files = "^(crates/forja-(program-conversions|sdk|sdk-macros)/|engines/|support/(guests|test-guests)/|wit/)";
             stages = [ "pre-push" ];
             text = "support/test-guests/check-reproducible.sh";
           };
@@ -113,7 +119,11 @@
             runtimeInputs = [ pkgs.cargo-deny ];
             files = "(^|/)(Cargo\\.(toml|lock)|deny\\.toml)$";
             stages = allLocalStages;
-            text = "cargo deny check bans licenses sources";
+            text = ''
+              for manifest in Cargo.toml engines/*/Cargo.toml; do
+                cargo deny --manifest-path "$manifest" check bans licenses sources
+              done
+            '';
           };
           doctests =
             (cargoHook {

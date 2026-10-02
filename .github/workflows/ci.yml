@@ -30,4 +30,7 @@ jobs:
       - name: Run pre-push hooks
         run: nix develop -c pre-commit run --all-files --hook-stage pre-push --show-diff-on-failure
       - name: Check dependency advisories
-        run: nix develop -c cargo deny check advisories
+        run: |
+          for manifest in Cargo.toml engines/*/Cargo.toml; do
+            nix develop -c cargo deny --manifest-path "$manifest" check advisories
+          done
