@@ -731,6 +731,7 @@ dependencies = [
 name = "forja-host"
 version = "0.0.0"
 dependencies = [
+ "forja-config",
  "forja-core",
  "forja-cpu",
  "forja-metal",

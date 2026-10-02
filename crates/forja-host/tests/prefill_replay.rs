@@ -1,5 +1,7 @@
 //! Chunked prefill differential checks across the bundled engines.
 
+mod common;
+
 use std::{env, error::Error, path::Path, path::PathBuf, time::Duration};
 
 use forja_core::Backend;
@@ -133,13 +135,16 @@ async fn compare_prefill<B>(
 where
     B: Backend + Send + Sync + 'static,
 {
+    let load_config = common::load_config(replay_component)?;
     let mut replay = EngineRunner::new(replay_component, replay_backend, LIMITS, weights).await?;
     let mut lazy = EngineRunner::new(lazy_component, lazy_backend, LIMITS, weights).await?;
     let mut reference =
         EngineRunner::new(lazy_component, reference_backend, LIMITS, weights).await?;
-    replay.load_with_config(layers).await??;
-    lazy.load_with_config(layers).await??;
-    reference.load_with_config(layers).await??;
+    replay.load_with_selections(layers, &load_config).await??;
+    lazy.load_with_selections(layers, &load_config).await??;
+    reference
+        .load_with_selections(layers, &load_config)
+        .await??;
     for &length in lengths {
         let tokens = (0..length)
             .map(|index| (index.wrapping_mul(7_919).wrapping_add(17)) % vocab)

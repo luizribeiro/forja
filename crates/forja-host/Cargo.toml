@@ -19,6 +19,7 @@ wasmtime-wasi.workspace = true
 forja-metal = { path = "../forja-metal" }
 
 [dev-dependencies]
+forja-config = { path = "../forja-config" }
 forja-cpu = { path = "../forja-cpu" }
 forja-testing = { path = "../../support/forja-testing" }
 golden-fixtures = { path = "../../support/golden-fixtures" }

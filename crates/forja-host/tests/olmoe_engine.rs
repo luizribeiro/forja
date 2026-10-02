@@ -1,5 +1,7 @@
 //! `OLMoE` engine checks against independent transformer fixtures.
 
+mod common;
+
 use std::{env, error::Error, path::PathBuf, time::Duration};
 
 use forja_host::{EngineRunner, EngineStep, Limits};
@@ -44,7 +46,9 @@ async fn prompt_hidden_states_and_routing_match_transformers() -> Result<(), Box
     assert_eq!(info.vocab, olmoe::VOCAB);
     assert_eq!(info.tap_layers, (1..=16).collect::<Vec<_>>());
     assert_eq!(info.router_layers, (1..=16).collect::<Vec<_>>());
-    runner.load().await??;
+    runner
+        .load_with_selections(None, &common::load_config(test_guests::olmoe())?)
+        .await??;
     let output = runner
         .step(EngineStep {
             tokens,
@@ -119,7 +123,9 @@ async fn decode_logits(
         weights,
     )
     .await?;
-    runner.load().await??;
+    runner
+        .load_with_selections(None, &common::load_config(test_guests::olmoe())?)
+        .await??;
     runner
         .step(EngineStep {
             tokens: (0..8).collect(),
