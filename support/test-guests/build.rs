@@ -20,7 +20,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let guest_target_dir = main_target_dir.join("guest-build");
     let bf16_target_dir = main_target_dir.join("guest-build-bf16");
 
-    build_guest_workspace(&guest_manifest, &guest_target_dir, &[])?;
+    build_guest_workspace(
+        &guest_manifest,
+        &guest_target_dir,
+        &["--workspace", "--exclude", "metal-variant-smoke"],
+    )?;
+    build_guest_workspace(
+        &guest_manifest,
+        &guest_target_dir,
+        &["-p", "metal-variant-smoke"],
+    )?;
     build_guest_workspace(
         &guest_manifest,
         &bf16_target_dir,
