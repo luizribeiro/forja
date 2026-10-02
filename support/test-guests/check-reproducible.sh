@@ -9,7 +9,7 @@ mkdir "$scratch/source"
 tar -C "$repository" -cf - \
   Cargo.toml Cargo.lock \
   crates support/forja-testing support/golden-fixtures \
-  engines/qwen3 \
+  engines/olmoe engines/qwen3 \
   support/guests support/test-guests wit \
   | tar -C "$scratch/source" -xf -
 

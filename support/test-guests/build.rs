@@ -15,6 +15,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let crate_dir = PathBuf::from(required_var("CARGO_MANIFEST_DIR")?);
     let repository = fs::canonicalize(crate_dir.join("../.."))?;
     let guest_manifest = repository.join("support/guests/Cargo.toml");
+    let olmoe_manifest = repository.join("engines/olmoe/Cargo.toml");
     let qwen3_manifest = repository.join("engines/qwen3/Cargo.toml");
     let out_dir = PathBuf::from(required_var("OUT_DIR")?);
     let main_target_dir = main_target_dir(&repository, &out_dir)?;
@@ -28,8 +29,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--workspace",
             "--exclude",
             "metal-variant-smoke",
-            "--exclude",
-            "olmoe",
             "--exclude",
             "qwen3-coder",
         ],
@@ -62,7 +61,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     let release_dir = guest_target_dir.join("wasm32-wasip2/release");
     let [olmoe, olmoe_no_replay] =
-        build_olmoe_profiles(&guest_manifest, &guest_target_dir, &out_dir)?;
+        build_olmoe_profiles(&olmoe_manifest, &guest_target_dir, &out_dir)?;
     let [qwen3_coder, qwen3_coder_no_replay] =
         build_qwen3_coder_profiles(&guest_manifest, &guest_target_dir, &out_dir)?;
     emit_guest_path("HELLO_COMPONENT", &release_dir.join("hello.wasm"));
@@ -123,6 +122,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     println!(
         "cargo::rerun-if-changed={}",
+        repository.join("engines/olmoe").display()
+    );
+    println!(
+        "cargo::rerun-if-changed={}",
         repository.join("engines/qwen3").display()
     );
     println!(
@@ -168,13 +171,9 @@ fn build_olmoe_profiles(
     out_dir: &Path,
 ) -> io::Result<[PathBuf; 2]> {
     let component = target_dir.join("wasm32-wasip2/release/olmoe.wasm");
-    build_guest_workspace(manifest, target_dir, &["-p", "olmoe"])?;
+    build_guest_workspace(manifest, target_dir, &[])?;
     let default = copy_component(&component, out_dir, "olmoe.wasm")?;
-    build_guest_workspace(
-        manifest,
-        target_dir,
-        &["-p", "olmoe", "--features", "no-replay"],
-    )?;
+    build_guest_workspace(manifest, target_dir, &["--features", "no-replay"])?;
     let no_replay = copy_component(&component, out_dir, "olmoe-no-replay.wasm")?;
     Ok([default, no_replay])
 }
@@ -377,6 +376,8 @@ fn run_rustc_wrapper() -> Result<(), Box<dyn std::error::Error>> {
         }
         if env::var("CARGO_PKG_NAME").as_deref() == Ok("qwen3") {
             args.push("--remap-path-prefix=src=qwen3/src".into());
+        } else if env::var("CARGO_PKG_NAME").as_deref() == Ok("olmoe") {
+            args.push("--remap-path-prefix=src=olmoe/src".into());
         }
     }
     let status = Command::new(rustc).args(args).status()?;
@@ -417,8 +418,14 @@ fn stable_metadata(args: &[std::ffi::OsString], roots: [&std::ffi::OsString; 3])
         "/workspace/engines/qwen3",
         "/workspace/support/guests/qwen3",
     );
-    if env::var("CARGO_PKG_NAME").as_deref() == Ok("qwen3") {
-        identity = identity.replace("\0src/lib.rs\0", "\0qwen3/src/lib.rs\0");
+    identity = identity.replace(
+        "/workspace/engines/olmoe",
+        "/workspace/support/guests/olmoe",
+    );
+    if let Ok(package) = env::var("CARGO_PKG_NAME")
+        && matches!(package.as_str(), "qwen3" | "olmoe")
+    {
+        identity = identity.replace("\0src/lib.rs\0", &format!("\0{package}/src/lib.rs\0"));
     }
     let hash = identity
         .bytes()
