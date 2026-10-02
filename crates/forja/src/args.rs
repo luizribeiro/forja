@@ -831,8 +831,7 @@ fn point(
         .ok_or_else(|| "benchmark config is not a table".to_owned())?;
     let mut layers = vec![Layer::new(Origin::Default, base_table)];
     for (key, value) in &values {
-        let table = toml::from_str(&format!("{key} = {value}"))
-            .map_err(|error| format!("vary axis {key}: {error}"))?;
+        let table = vary_point_layer(key, value)?;
         layers.push(Layer::new(Origin::Vary, table));
     }
     let resolved = layer::<DevConfig>(layers).map_err(|error| error.to_string())?;
@@ -861,15 +860,52 @@ fn point(
     })
 }
 
+fn vary_point_layer(key: &KeyPath, value: &toml::Value) -> Result<toml::Table, String> {
+    if key.as_str() == "engine.tunings" {
+        let names = match value {
+            toml::Value::String(name) => vec![toml::Value::String(name.clone())],
+            toml::Value::Array(names)
+                if names
+                    .iter()
+                    .all(|name| matches!(name, toml::Value::String(_))) =>
+            {
+                names.clone()
+            }
+            _ => return Err("engine.tunings vary values must be a string array".to_owned()),
+        };
+        let tunings = toml::Table::from_iter([
+            ("base".to_owned(), toml::Value::String("none".to_owned())),
+            ("add".to_owned(), toml::Value::Array(names)),
+        ]);
+        return Ok(toml::Table::from_iter([(
+            "engine".to_owned(),
+            toml::Value::Table(toml::Table::from_iter([(
+                "tunings".to_owned(),
+                toml::Value::Table(tunings),
+            )])),
+        )]));
+    }
+    for prefix in ["engine.variant-picks.", "engine.variant-rules."] {
+        if let Some(site) = key.as_str().strip_prefix(prefix) {
+            let field = prefix.trim_start_matches("engine.").trim_end_matches('.');
+            return Ok(toml::Table::from_iter([(
+                "engine".to_owned(),
+                toml::Value::Table(toml::Table::from_iter([(
+                    field.to_owned(),
+                    toml::Value::Table(toml::Table::from_iter([(site.to_owned(), value.clone())])),
+                )])),
+            )]));
+        }
+    }
+    toml::from_str(&format!("{key} = {value}")).map_err(|error| format!("vary axis {key}: {error}"))
+}
+
 fn parse_vary(expression: &str) -> Result<VaryArg, String> {
     let (key, rhs) = expression
         .split_once('=')
         .ok_or_else(|| "--vary expects KEY=RHS".to_owned())?;
     let key = KeyPath::new(key.trim());
     axis_class(key.as_str())?;
-    if key.as_str() == "engine.tunings" {
-        return Err("tunings arrive with engine profiles".to_owned());
-    }
     let rhs = rhs.trim();
     let values = if rhs.contains(['[', ']', '"', '\'', '{', '}']) {
         let table: toml::Table = toml::from_str(&format!("values = {rhs}"))
@@ -913,9 +949,12 @@ fn parse_bare_vary_value(value: &str) -> Result<toml::Value, String> {
 }
 
 fn axis_class(key: &str) -> Result<AxisClass, String> {
-    if key.starts_with("backend.metal.") {
+    if key.starts_with("backend.metal.") || key == "engine.replay" {
         Ok(AxisClass::Strategy)
-    } else if key == "engine.tunings" {
+    } else if key == "engine.tunings"
+        || key.starts_with("engine.variant-picks.")
+        || key.starts_with("engine.variant-rules.")
+    {
         Ok(AxisClass::Tuning)
     } else if matches!(
         key,
@@ -1430,7 +1469,16 @@ mod tests {
             axis_class("backend.metal.graph_replay"),
             Ok(AxisClass::Strategy)
         );
+        assert_eq!(axis_class("engine.replay"), Ok(AxisClass::Strategy));
         assert_eq!(axis_class("engine.tunings"), Ok(AxisClass::Tuning));
+        assert_eq!(
+            axis_class("engine.variant-picks.dense.decode"),
+            Ok(AxisClass::Tuning)
+        );
+        assert_eq!(
+            axis_class("engine.variant-rules.attention.decode"),
+            Ok(AxisClass::Tuning)
+        );
         assert_eq!(axis_class("bench.contexts"), Ok(AxisClass::Workload));
         assert_eq!(
             axis_class("bench.sampling.temperature"),
@@ -1456,9 +1504,68 @@ mod tests {
     }
 
     #[test]
-    fn explains_that_tunings_require_engine_profiles() {
-        let error = parse_vary("engine.tunings=fast,small").unwrap_err();
-        assert_eq!(error, "tunings arrive with engine profiles");
+    fn varies_engine_tuning_sets_and_dotted_pick_sites() {
+        let command = parse(
+            [
+                "bench",
+                "--engine",
+                "/engine.wasm",
+                "--model",
+                "/model",
+                "--vary",
+                "engine.tunings=[[\"residual-norm\"],[\"qk-norm-rope\",\"final-norm\"]]",
+                "--vary",
+                "engine.variant-picks.dense.decode=[\"matmul.gemv\"]",
+                "--vary",
+                "engine.variant-rules.attention.decode=[{parameter=\"position\",arms=[{lo=0,hi=4095,name=\"sdpa.vector\"}]}]",
+            ]
+            .map(str::to_owned),
+        )
+        .unwrap();
+        let Command::Bench(options) = command else {
+            panic!("expected bench command");
+        };
+        assert_eq!(options.points.len(), 2);
+        assert_eq!(
+            options.points[0].config.engine.tunings.add,
+            ["residual-norm"]
+        );
+        assert_eq!(
+            options.points[1].config.engine.tunings.add,
+            ["qk-norm-rope", "final-norm"]
+        );
+        assert_eq!(
+            options.points[0].config.engine.variant_picks["dense.decode"],
+            "matmul.gemv"
+        );
+        assert_eq!(
+            options.points[0].config.engine.variant_rules["attention.decode"].arms[0].hi,
+            4095
+        );
+    }
+
+    #[test]
+    fn varies_guest_replay_as_a_strategy() {
+        let command = parse(
+            [
+                "bench",
+                "--engine",
+                "/engine.wasm",
+                "--model",
+                "/model",
+                "--vary",
+                "engine.replay=[true,false]",
+            ]
+            .map(str::to_owned),
+        )
+        .unwrap();
+        let Command::Bench(options) = command else {
+            panic!("expected bench command");
+        };
+        assert_eq!(options.points.len(), 2);
+        assert!(options.points[0].config.engine.replay);
+        assert!(!options.points[1].config.engine.replay);
+        assert_eq!(options.strategy_axes, [KeyPath::new("engine.replay")]);
     }
 
     #[test]
