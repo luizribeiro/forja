@@ -1285,6 +1285,33 @@ enum RecordedDispatch {
     },
 }
 
+fn record_graph_dispatch(
+    graph: &mut GraphTemplate,
+    dispatch: &RecordedDispatch,
+) -> Result<(), forja_core::GraphError> {
+    match dispatch {
+        RecordedDispatch::Static(dispatch) => graph.record_validated(dispatch.as_ref().clone()),
+        RecordedDispatch::Operation {
+            op,
+            inputs,
+            outputs,
+        } => {
+            let inputs = inputs.iter().collect::<Vec<_>>();
+            let outputs = outputs.iter().collect::<Vec<_>>();
+            graph.dispatch_many(*op, &inputs, &outputs)
+        }
+        RecordedDispatch::Program {
+            program,
+            inputs,
+            outputs,
+        } => {
+            let inputs = inputs.iter().collect::<Vec<_>>();
+            let outputs = outputs.iter().collect::<Vec<_>>();
+            graph.dispatch_kernel(program, &inputs, &outputs)
+        }
+    }
+}
+
 /// Host-owned state behind a guest command-list resource.
 #[derive(Debug)]
 pub struct CommandListEntry {
@@ -1916,6 +1943,18 @@ impl<B: Backend> Host<B> {
         inputs: &[Resource<TensorEntry>],
         outputs: &[Resource<TensorEntry>],
     ) -> Result<(), compute::Error> {
+        let (template_op, concrete_op) = core_op(operation);
+        self.dispatch_core(commands, template_op, concrete_op, inputs, outputs)
+    }
+
+    fn dispatch_core(
+        &mut self,
+        commands: &Resource<CommandListEntry>,
+        template_op: TemplateOp,
+        concrete_op: Option<Op>,
+        inputs: &[Resource<TensorEntry>],
+        outputs: &[Resource<TensorEntry>],
+    ) -> Result<(), compute::Error> {
         let input_entries = inputs
             .iter()
             .map(|resource| self.entry(resource).cloned())
@@ -1928,7 +1967,6 @@ impl<B: Backend> Host<B> {
             .iter()
             .map(|entry| &entry.tensor)
             .collect::<Vec<_>>();
-        let (template_op, concrete_op) = core_op(operation);
         let template_inputs = input_entries
             .iter()
             .map(TensorEntry::template)
@@ -2090,29 +2128,7 @@ impl<B: Backend> Host<B> {
         let built = entry
             .recorded
             .iter()
-            .try_for_each(|dispatch| match dispatch {
-                RecordedDispatch::Static(dispatch) => {
-                    graph.record_validated(dispatch.as_ref().clone())
-                }
-                RecordedDispatch::Operation {
-                    op,
-                    inputs,
-                    outputs,
-                } => {
-                    let inputs = inputs.iter().collect::<Vec<_>>();
-                    let outputs = outputs.iter().collect::<Vec<_>>();
-                    graph.dispatch_many(*op, &inputs, &outputs)
-                }
-                RecordedDispatch::Program {
-                    program,
-                    inputs,
-                    outputs,
-                } => {
-                    let inputs = inputs.iter().collect::<Vec<_>>();
-                    let outputs = outputs.iter().collect::<Vec<_>>();
-                    graph.dispatch_kernel(program, &inputs, &outputs)
-                }
-            });
+            .try_for_each(|dispatch| record_graph_dispatch(&mut graph, dispatch));
         let graph = match built {
             Ok(()) => self.backend.prepare_graph(graph).map_err(guest_error),
             Err(error) => Err(graph_error(&error)),
