@@ -375,7 +375,7 @@ impl<T: Element> Tensor<T> {
         self.top_k_selected(k, normalize, None)
     }
 
-    fn top_k_selected(
+    pub(crate) fn top_k_selected(
         &self,
         k: u32,
         normalize: bool,

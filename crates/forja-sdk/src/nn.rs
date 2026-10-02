@@ -21,6 +21,24 @@ pub fn moe_router<T: FloatElement>(
     }
 }
 
+/// Applies softmax and top-k routing with an explicit Metal algorithm selection.
+///
+/// # Errors
+///
+/// Returns an error for an invalid count, rule context, incompatible shape, or refused selection.
+pub fn moe_router_with<'a, T: FloatElement>(
+    logits: &Tensor<T>,
+    k: u32,
+    normalize: bool,
+    selection: impl Into<crate::target::metal::VariantChoice<'a>>,
+) -> Result<(Tensor<T>, Tensor<u32>)> {
+    if normalize {
+        logits.top_k_selected(k, true, Some(selection.into()))
+    } else {
+        logits.softmax_last_dim()?.top_k_with(k, selection.into())
+    }
+}
+
 /// Combines routed expert outputs with their per-route weights.
 ///
 /// Expert outputs are `[rows, routes, hidden]` and weights are `[rows, routes]`.
@@ -29,6 +47,27 @@ pub fn moe_router<T: FloatElement>(
 ///
 /// Returns an error for incompatible shapes or a refused view or matrix multiplication.
 pub fn moe_combine<T: FloatElement>(experts: &Tensor<T>, weights: &Tensor<T>) -> Result<Tensor<T>> {
+    moe_combine_selected(experts, weights, None)
+}
+
+/// Combines routed expert outputs with an explicit Metal matmul selection.
+///
+/// # Errors
+///
+/// Returns an error for incompatible shapes, rule context, or a refused selection.
+pub fn moe_combine_with<'a, T: FloatElement>(
+    experts: &Tensor<T>,
+    weights: &Tensor<T>,
+    selection: impl Into<crate::target::metal::VariantChoice<'a>>,
+) -> Result<Tensor<T>> {
+    moe_combine_selected(experts, weights, Some(selection.into()))
+}
+
+fn moe_combine_selected<T: FloatElement>(
+    experts: &Tensor<T>,
+    weights: &Tensor<T>,
+    selection: Option<crate::target::metal::VariantChoice<'_>>,
+) -> Result<Tensor<T>> {
     let [rows, routes, hidden]: [u32; 3] = experts
         .shape()
         .try_into()
@@ -36,10 +75,14 @@ pub fn moe_combine<T: FloatElement>(experts: &Tensor<T>, weights: &Tensor<T>) ->
     if weights.shape() != [rows, routes] {
         return Err(Error::new("expert weights do not match routed outputs"));
     }
-    experts
-        .permute(&[0, 2, 1])?
-        .matmul(&weights.reshape(&[rows, routes, 1])?)?
-        .reshape(&[rows, hidden])
+    let experts = experts.permute(&[0, 2, 1])?;
+    let weights = weights.reshape(&[rows, routes, 1])?;
+    let combined = if let Some(selection) = selection {
+        experts.matmul_with(&weights, selection)?
+    } else {
+        experts.matmul(&weights)?
+    };
+    combined.reshape(&[rows, hidden])
 }
 
 /// Loads separate expert projections into `[experts, input, output]` storage.

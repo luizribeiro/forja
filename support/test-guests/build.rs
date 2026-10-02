@@ -29,6 +29,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "metal-variant-smoke",
             "--exclude",
             "qwen3",
+            "--exclude",
+            "olmoe",
         ],
     )?;
     build_guest_workspace(
@@ -164,6 +166,7 @@ fn build_olmoe_profiles(
     out_dir: &Path,
 ) -> io::Result<[PathBuf; 2]> {
     let component = target_dir.join("wasm32-wasip2/release/olmoe.wasm");
+    build_guest_workspace(manifest, target_dir, &["-p", "olmoe"])?;
     let default = copy_component(&component, out_dir, "olmoe.wasm")?;
     build_guest_workspace(
         manifest,

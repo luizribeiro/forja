@@ -3,13 +3,14 @@
 #[cfg(target_family = "wasm")]
 use forja_sdk::nn::blocks::{ChunkedPrefill, DEFAULT_PREFILL_CHUNK, DecodeSelection, DecodeState};
 use forja_sdk::{
-    Dim, Engine, EngineInfo, Load, Result, StepInput, StepOutput, Tensor, Weights, bf16,
-    export_engine,
+    DType, Dim, Engine, EngineInfo, Load, Param, Result, StepInput, StepOutput, Tensor, Weights,
+    bf16, export_engine,
     nn::{
         Embedding, EmbeddingConfig, Linear, LinearConfig, RmsNorm, RmsNormConfig,
-        blocks::{KvCache, Taps, cached_attention},
-        moe_combine, moe_router, stack_expert_weights,
+        blocks::{KvCache, Taps, cached_attention_with},
+        moe_combine_with, moe_router_with, stack_expert_weights,
     },
+    target::metal::{Variant, VariantChoice, VariantRule},
 };
 
 /// Vocabulary size of OLMoE-1B-7B-0924.
@@ -38,6 +39,121 @@ const REPLAY_DECODE: bool = !cfg!(feature = "no-replay");
 struct Config;
 
 type SequenceOutput = (Tensor<bf16>, Vec<Tensor<f32>>, Vec<Tensor<f32>>);
+
+enum AttentionVariant {
+    Fixed(Variant),
+    Rule(VariantRule),
+}
+
+impl AttentionVariant {
+    fn choice(&self) -> VariantChoice<'_> {
+        match self {
+            Self::Fixed(variant) => variant.into(),
+            Self::Rule(rule) => rule.into(),
+        }
+    }
+}
+
+#[cfg(target_family = "wasm")]
+#[derive(Clone, Copy)]
+struct PrefillVariant<'a> {
+    start: u32,
+    parameter: Option<&'a Param>,
+}
+
+fn variant(name: &str) -> Result<Variant> {
+    Variant::new(name)
+}
+
+fn matmul_variant(
+    dtype: DType,
+    batch: u32,
+    rows: u32,
+    columns: u32,
+    inner: u32,
+    transposed_right: bool,
+) -> Result<Variant> {
+    if rows == 1 {
+        return variant(if transposed_right {
+            "matmul.gemv-transposed"
+        } else {
+            "matmul.gemv"
+        });
+    }
+    let large = u64::from(batch)
+        .checked_mul(u64::from(rows))
+        .and_then(|elements| elements.checked_mul(u64::from(columns)))
+        .ok_or_else(|| forja_sdk::Error::loading("matmul output size overflowed"))?
+        >= 1 << 20;
+    let half = matches!(dtype, DType::F16 | DType::BF16);
+    let name = if half && large && u64::from(rows.max(columns)) * 2 > u64::from(inner) {
+        "matmul.steel-64x64x16-1x2"
+    } else if half && transposed_right {
+        "matmul.steel-64x32x32-2x2"
+    } else if half && large {
+        "matmul.steel-32x64x16-1x2"
+    } else if half {
+        "matmul.steel-64x64x16-1x2"
+    } else if !large && transposed_right {
+        "matmul.steel-32x64x16-1x2"
+    } else if !large {
+        "matmul.steel-64x32x32-2x2"
+    } else {
+        "matmul.steel-64x64x16-2x2"
+    };
+    variant(name)
+}
+
+fn linear<T: forja_sdk::Element>(
+    projection: &Linear<T>,
+    input: &Tensor<T>,
+    dtype: DType,
+    rows: u32,
+    inner: u32,
+    columns: u32,
+) -> Result<Tensor<T>> {
+    let selection = matmul_variant(dtype, 1, rows, columns, inner, true)?;
+    projection.forward_with(input, &selection)
+}
+
+fn attention_variant(
+    sequence: u32,
+    start: u32,
+    parameter: Option<&Param>,
+) -> Result<AttentionVariant> {
+    if let Some(parameter) = parameter {
+        let arms = if sequence == 1 {
+            vec![
+                (0..=510, variant("sdpa.decomposed")?),
+                (511..=1022, variant("sdpa.vector-single-pass")?),
+                (1023..=MAX_CONTEXT - 1, variant("sdpa.vector-two-pass")?),
+            ]
+        } else if sequence >= 512 {
+            vec![
+                (0..=0, variant("sdpa.steel")?),
+                (1..=MAX_CONTEXT - sequence, variant("sdpa.decomposed")?),
+            ]
+        } else {
+            vec![(0..=MAX_CONTEXT - sequence, variant("sdpa.decomposed")?)]
+        };
+        return Ok(AttentionVariant::Rule(VariantRule::new(parameter, arms)?));
+    }
+    let key_length = start
+        .checked_add(sequence)
+        .ok_or_else(|| forja_sdk::Error::loading("attention cache length overflowed"))?;
+    let name = if sequence == 1 {
+        match key_length {
+            ..512 => "sdpa.decomposed",
+            512..1024 => "sdpa.vector-single-pass",
+            _ => "sdpa.vector-two-pass",
+        }
+    } else if sequence >= 512 && key_length == sequence {
+        "sdpa.steel"
+    } else {
+        "sdpa.decomposed"
+    };
+    Ok(AttentionVariant::Fixed(variant(name)?))
+}
 
 #[derive(Load)]
 #[load(config = Config)]
@@ -80,24 +196,28 @@ impl Load<Config> for SparseMoe {
 
 impl SparseMoe {
     fn forward(&self, input: &Tensor<f32>) -> Result<(Tensor<f32>, Tensor<f32>)> {
-        let logits = self.gate.forward(input)?;
-        let (route_weights, indices) = moe_router(&logits, TOP_K, false)?;
-        let expert_input = input.to_dtype::<bf16>()?;
-        let gate = expert_input.gather_matmul(&self.gate_proj, &indices)?;
-        let up = expert_input.gather_matmul(&self.up_proj, &indices)?;
-        let activated = gate.silu_mul(&up)?;
         let rows = input
             .shape()
             .first()
             .copied()
-            .and_then(|rows| rows.checked_mul(TOP_K))
+            .ok_or_else(|| forja_sdk::Error::loading("MoE input must have rank two"))?;
+        let logits = linear(&self.gate, input, DType::F32, rows, HIDDEN, EXPERTS)?;
+        let top_k = variant("top-k.single-k8")?;
+        let (route_weights, indices) = moe_router_with(&logits, TOP_K, false, &top_k)?;
+        let expert_input = input.to_dtype::<bf16>()?;
+        let gate = expert_input.gather_matmul(&self.gate_proj, &indices)?;
+        let up = expert_input.gather_matmul(&self.up_proj, &indices)?;
+        let activated = gate.silu_mul(&up)?;
+        let routed_rows = rows
+            .checked_mul(TOP_K)
             .ok_or_else(|| forja_sdk::Error::loading("routed row count overflowed"))?;
         let output = activated
-            .reshape(&[rows, INTERMEDIATE])?
-            .gather_matmul(&self.down_proj, &indices.reshape(&[rows, 1])?)?
-            .reshape(&[rows / TOP_K, TOP_K, HIDDEN])?;
+            .reshape(&[routed_rows, INTERMEDIATE])?
+            .gather_matmul(&self.down_proj, &indices.reshape(&[routed_rows, 1])?)?
+            .reshape(&[rows, TOP_K, HIDDEN])?;
+        let combine = matmul_variant(DType::BF16, rows, HIDDEN, 1, TOP_K, false)?;
         Ok((
-            moe_combine(&output, &route_weights.to_dtype()?)?.to_dtype()?,
+            moe_combine_with(&output, &route_weights.to_dtype()?, &combine)?.to_dtype()?,
             logits,
         ))
     }
@@ -124,28 +244,65 @@ impl DecoderLayer {
         cache: &mut KvCache<f32>,
         start: &Dim,
         end: &Dim,
+        attention_variant: &AttentionVariant,
     ) -> Result<(Tensor<f32>, Tensor<f32>)> {
         let sequence = positions.shape()[0];
         let normalized = self.input_layernorm.forward(input)?;
+        let query_projection = linear(
+            &self.self_attn.q_proj,
+            &normalized,
+            DType::F32,
+            sequence,
+            HIDDEN,
+            HIDDEN,
+        )?;
         let query = self
             .self_attn
             .q_norm
-            .forward(&self.self_attn.q_proj.forward(&normalized)?)?
+            .forward(&query_projection)?
             .reshape(&[sequence, HEADS, HEAD_DIM])?
             .rope(positions, ROPE_THETA)?;
+        let key_projection = linear(
+            &self.self_attn.k_proj,
+            &normalized,
+            DType::F32,
+            sequence,
+            HIDDEN,
+            HIDDEN,
+        )?;
         let key = self
             .self_attn
             .k_norm
-            .forward(&self.self_attn.k_proj.forward(&normalized)?)?
+            .forward(&key_projection)?
             .reshape(&[sequence, HEADS, HEAD_DIM])?
             .rope(positions, ROPE_THETA)?;
-        let value = self
-            .self_attn
-            .v_proj
-            .forward(&normalized)?
-            .reshape(&[sequence, HEADS, HEAD_DIM])?;
-        let attended = cached_attention(&query, &key, &value, cache, ATTENTION_SCALE, start, end)?;
-        let attention = self.self_attn.o_proj.forward(&attended)?;
+        let value = linear(
+            &self.self_attn.v_proj,
+            &normalized,
+            DType::F32,
+            sequence,
+            HIDDEN,
+            HIDDEN,
+        )?
+        .reshape(&[sequence, HEADS, HEAD_DIM])?;
+        let attended = cached_attention_with(
+            &query,
+            &key,
+            &value,
+            cache,
+            ATTENTION_SCALE,
+            start,
+            end,
+            attention_variant.choice(),
+        )?;
+        let attention = linear(
+            &self.self_attn.o_proj,
+            &attended,
+            DType::F32,
+            sequence,
+            HIDDEN,
+            HIDDEN,
+        )?;
         let hidden = (input + &attention)?;
         let normalized = self.post_attention_layernorm.forward(&hidden)?;
         let (projected, router_logits) = self.mlp.forward(&normalized)?;
@@ -208,9 +365,16 @@ impl Olmoe {
         start: &Dim,
         end: &Dim,
         taps_enabled: bool,
+        attention_variant: &AttentionVariant,
     ) -> Result<StepOutput> {
-        let (logits, taps, router_logits) =
-            self.forward_sequence(tokens, sequence, start, end, taps_enabled)?;
+        let (logits, taps, router_logits) = self.forward_sequence(
+            tokens,
+            sequence,
+            start,
+            end,
+            taps_enabled,
+            attention_variant,
+        )?;
         Ok(StepOutput {
             logits: Self::last_logits(
                 &logits,
@@ -230,6 +394,7 @@ impl Olmoe {
         start: &Dim,
         end: &Dim,
         taps_enabled: bool,
+        attention_variant: &AttentionVariant,
     ) -> Result<SequenceOutput> {
         let positions = self.positions.narrow(0, start, sequence)?;
         let mut hidden = self.weights.model.embed_tokens.forward(tokens)?;
@@ -242,6 +407,7 @@ impl Olmoe {
                 &mut self.caches[index],
                 start,
                 end,
+                attention_variant,
             )?;
             hidden = next;
             if taps.enabled() {
@@ -255,7 +421,14 @@ impl Olmoe {
         if taps.enabled() {
             taps.push(hidden.contiguous()?);
         }
-        let logits = self.weights.lm_head.forward(&hidden.to_dtype()?)?;
+        let logits = linear(
+            &self.weights.lm_head,
+            &hidden.to_dtype()?,
+            DType::BF16,
+            sequence,
+            HIDDEN,
+            VOCAB,
+        )?;
         Ok((logits, taps.finish(), routers))
     }
 
@@ -275,8 +448,11 @@ impl Olmoe {
         last: &Dim,
         start: &Dim,
         end: &Dim,
+        selection: PrefillVariant<'_>,
     ) -> Result<Tensor<f32>> {
-        let (logits, _, _) = self.forward_sequence(tokens, sequence, start, end, false)?;
+        let attention = attention_variant(sequence, selection.start, selection.parameter)?;
+        let (logits, _, _) =
+            self.forward_sequence(tokens, sequence, start, end, false, &attention)?;
         Self::last_logits(&logits, last)
     }
 }
@@ -335,7 +511,15 @@ impl Engine for Olmoe {
         }
         let start = input.start_pos.into();
         let end = end.into();
-        self.forward(&input.tokens, sequence, &start, &end, input.taps)
+        let attention = attention_variant(sequence, input.start_pos, None)?;
+        self.forward(
+            &input.tokens,
+            sequence,
+            &start,
+            &end,
+            input.taps,
+            &attention,
+        )
     }
 
     #[cfg(target_family = "wasm")]
@@ -369,8 +553,9 @@ impl Engine for Olmoe {
                 } else {
                     let start = input.start_pos.into();
                     let end_dim = end.into();
+                    let attention = attention_variant(sequence, input.start_pos, None)?;
                     let logits = self
-                        .forward(&tokens, sequence, &start, &end_dim, false)?
+                        .forward(&tokens, sequence, &start, &end_dim, false, &attention)?
                         .logits;
                     self.select_token(logits, end - 1)
                 }
@@ -382,7 +567,10 @@ impl Engine for Olmoe {
                 let token = self.decode.token()?;
                 let start = input.start_pos.into();
                 let end = (input.start_pos + 1).into();
-                let logits = self.forward(&token, 1, &start, &end, false)?.logits;
+                let attention = attention_variant(1, input.start_pos, None)?;
+                let logits = self
+                    .forward(&token, 1, &start, &end, false, &attention)?
+                    .logits;
                 self.select_token(logits, input.start_pos)
             }
             None => Err(forja_sdk::Error::loading(
@@ -405,9 +593,23 @@ impl Olmoe {
             .prefill
             .take()
             .ok_or_else(|| forja_sdk::Error::loading("prefill state is unavailable"))?;
-        let result = prefill.replay(tokens, start, |tokens, sequence, last, start, end, _| {
-            self.forward_prefill_chunk(tokens, sequence, last, start, end)
-        });
+        let result = prefill.replay(
+            tokens,
+            start,
+            |tokens, sequence, last, start, end, parameter| {
+                self.forward_prefill_chunk(
+                    tokens,
+                    sequence,
+                    last,
+                    start,
+                    end,
+                    PrefillVariant {
+                        start: 0,
+                        parameter: Some(parameter),
+                    },
+                )
+            },
+        );
         self.prefill = Some(prefill);
         result
     }
@@ -417,9 +619,23 @@ impl Olmoe {
             .prefill
             .take()
             .ok_or_else(|| forja_sdk::Error::loading("prefill state is unavailable"))?;
-        let result = prefill.lazy(tokens, start, |tokens, sequence, last, start, end, _| {
-            self.forward_prefill_chunk(tokens, sequence, last, start, end)
-        });
+        let result = prefill.lazy(
+            tokens,
+            start,
+            |tokens, sequence, last, start, end, start_value| {
+                self.forward_prefill_chunk(
+                    tokens,
+                    sequence,
+                    last,
+                    start,
+                    end,
+                    PrefillVariant {
+                        start: start_value,
+                        parameter: None,
+                    },
+                )
+            },
+        );
         self.prefill = Some(prefill);
         result
     }
@@ -459,7 +675,10 @@ impl Olmoe {
         let output_tokens = self.decode.output_tokens()?;
         let sampling = self.decode.sampling()?;
         forja_sdk::capture(&[&position], || {
-            let logits = self.forward(&token, 1, &start_dim, &end, false)?.logits;
+            let attention = attention_variant(1, start_pos, Some(&position))?;
+            let logits = self
+                .forward(&token, 1, &start_dim, &end, false, &attention)?
+                .logits;
             let selected = match selection {
                 DecodeSelection::None => None,
                 DecodeSelection::Greedy => Some(logits.reshape(&[1, VOCAB])?.argmax()?),
@@ -510,5 +729,51 @@ mod tests {
         assert_eq!(info.max_context, MAX_CONTEXT);
         assert_eq!(info.tap_layers, (1..=16).collect::<Vec<_>>());
         assert_eq!(info.router_layers, (1..=16).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn selects_dense_variants_at_algorithm_boundaries() {
+        assert_eq!(
+            matmul_variant(DType::F32, 1, 1, HIDDEN, HIDDEN, true)
+                .unwrap()
+                .name(),
+            "matmul.gemv-transposed"
+        );
+        assert_eq!(
+            matmul_variant(DType::F32, 1, 511, HIDDEN, HIDDEN, true)
+                .unwrap()
+                .name(),
+            "matmul.steel-32x64x16-1x2"
+        );
+        assert_eq!(
+            matmul_variant(DType::F32, 1, 512, HIDDEN, HIDDEN, true)
+                .unwrap()
+                .name(),
+            "matmul.steel-64x64x16-2x2"
+        );
+        assert_eq!(
+            matmul_variant(DType::BF16, 1, 512, VOCAB, HIDDEN, true)
+                .unwrap()
+                .name(),
+            "matmul.steel-64x64x16-1x2"
+        );
+    }
+
+    #[test]
+    fn selects_attention_variants_at_cache_boundaries() {
+        let names = [510, 511, 1022, 1023].map(|start| match attention_variant(1, start, None) {
+            Ok(AttentionVariant::Fixed(variant)) => variant.name().to_owned(),
+            Ok(AttentionVariant::Rule(_)) => panic!("expected a concrete variant"),
+            Err(error) => panic!("variant selection failed: {error}"),
+        });
+        assert_eq!(
+            names,
+            [
+                "sdpa.decomposed",
+                "sdpa.vector-single-pass",
+                "sdpa.vector-single-pass",
+                "sdpa.vector-two-pass",
+            ]
+        );
     }
 }
