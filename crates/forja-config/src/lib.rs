@@ -4,11 +4,17 @@
 
 mod files;
 mod layer;
+mod profile;
 mod set;
 mod units;
 
 pub use files::{dev_layers, file_layer, user_config_path};
 pub use layer::{ConfigError, KeyPath, Layer, Layered, Origin, Schema, layer};
+pub use profile::{
+    ActivationFormat, ComponentTarget, DeviceFamily, Model, Numerics, Profile, ProfileBackend,
+    Quantization, QuantizationOverride, QuantizationScheme, Target, VariantArm, VariantRule,
+    Variants, WeightFormat, Workload, WorkloadKind,
+};
 pub use set::set_layer;
 pub use units::{ByteSize, Duration, Unbounded};
 
