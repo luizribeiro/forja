@@ -109,6 +109,48 @@ pub struct EngineInfo {
     pub router_layers: Vec<u32>,
 }
 
+/// Effective engine-side selections supplied during load.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct EngineLoadConfig {
+    /// Registered tuning names.
+    pub tunings: Vec<String>,
+    /// Fixed variant selections.
+    pub fixed_variant_picks: Vec<FixedVariantPick>,
+    /// Parameter-dependent variant selections.
+    pub variant_rule_picks: Vec<VariantRulePick>,
+}
+
+/// One fixed engine dispatch-site selection.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FixedVariantPick {
+    /// Stable engine-owned dispatch site.
+    pub site: String,
+    /// Stable backend algorithm name.
+    pub name: String,
+}
+
+/// One parameter-dependent engine dispatch-site selection.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VariantRulePick {
+    /// Stable engine-owned dispatch site.
+    pub site: String,
+    /// Replay parameter name.
+    pub parameter: String,
+    /// Complete ordered rule arms.
+    pub arms: Vec<VariantPickArm>,
+}
+
+/// One inclusive variant-rule interval.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VariantPickArm {
+    /// Inclusive lower bound.
+    pub lo: u32,
+    /// Inclusive upper bound.
+    pub hi: u32,
+    /// Stable backend algorithm name.
+    pub name: String,
+}
+
 /// Input to one unbatched engine invocation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EngineStep {
@@ -534,6 +576,20 @@ where
         &mut self,
         num_hidden_layers: Option<u32>,
     ) -> wasmtime::Result<Result<(), compute::Error>> {
+        self.load_with_selections(num_hidden_layers, &EngineLoadConfig::default())
+            .await
+    }
+
+    /// Opens the configured weight grant and loads effective engine-side selections.
+    ///
+    /// # Errors
+    ///
+    /// Returns a host, component, or engine loading error.
+    pub async fn load_with_selections(
+        &mut self,
+        num_hidden_layers: Option<u32>,
+        config: &EngineLoadConfig,
+    ) -> wasmtime::Result<Result<(), compute::Error>> {
         self.set_guest_deadline();
         let weights = self
             .store
@@ -550,6 +606,34 @@ where
                         weights,
                         engine_bindings::exports::l9o::gpu::engine::LoadConfig {
                             num_hidden_layers,
+                            tunings: config.tunings.clone(),
+                            fixed_variant_picks: config
+                                .fixed_variant_picks
+                                .iter()
+                                .map(|pick| {
+                                    engine_bindings::exports::l9o::gpu::engine::FixedVariantPick {
+                                        site: pick.site.clone(),
+                                        name: pick.name.clone(),
+                                    }
+                                })
+                                .collect(),
+                            variant_rule_picks: config
+                                .variant_rule_picks
+                                .iter()
+                                .map(|pick| {
+                                    engine_bindings::exports::l9o::gpu::engine::VariantRulePick {
+                                    site: pick.site.clone(),
+                                    parameter: pick.parameter.clone(),
+                                    arms: pick.arms.iter().map(|arm| {
+                                        engine_bindings::exports::l9o::gpu::engine::VariantArm {
+                                            lo: arm.lo,
+                                            hi: arm.hi,
+                                            name: arm.name.clone(),
+                                        }
+                                    }).collect(),
+                                }
+                                })
+                                .collect(),
                         },
                     )
                     .await

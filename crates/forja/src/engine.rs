@@ -9,7 +9,7 @@ use std::{
 
 use forja_config::{
     ComponentTarget, DeviceFamily, GraphReplay, Limits as ConfigLimits, Profile, ProfileBackend,
-    Target, Unbounded, sharded_weights_sha256, single_weights_sha256,
+    Target, Unbounded, Variants, sharded_weights_sha256, single_weights_sha256,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -215,6 +215,56 @@ fn weight_cache_path(scratch: &Path, weights: &Path) -> PathBuf {
         Sha256::digest(weights.as_os_str().as_encoded_bytes())
     );
     scratch.join("weights-sha256").join(name)
+}
+
+pub(crate) fn engine_load_config(component: &Path) -> Result<forja_host::EngineLoadConfig, String> {
+    let profile = read_embedded_profile(component)?;
+    Ok(profile_load_config(&profile))
+}
+
+fn profile_load_config(profile: &Profile) -> forja_host::EngineLoadConfig {
+    let mut variants = profile.variants().clone();
+    for tuning in profile.default_tunings() {
+        if let Some(overrides) = profile.tuning_variants().get(tuning) {
+            overlay_variants(&mut variants, overrides);
+        }
+    }
+    forja_host::EngineLoadConfig {
+        tunings: profile.default_tunings().to_vec(),
+        fixed_variant_picks: variants
+            .fixed
+            .into_iter()
+            .map(|(site, name)| forja_host::FixedVariantPick { site, name })
+            .collect(),
+        variant_rule_picks: variants
+            .rules
+            .into_iter()
+            .map(|(site, rule)| forja_host::VariantRulePick {
+                site,
+                parameter: rule.parameter,
+                arms: rule
+                    .arms
+                    .into_iter()
+                    .map(|arm| forja_host::VariantPickArm {
+                        lo: arm.lo,
+                        hi: arm.hi,
+                        name: arm.name,
+                    })
+                    .collect(),
+            })
+            .collect(),
+    }
+}
+
+fn overlay_variants(base: &mut Variants, overrides: &Variants) {
+    for (site, name) in &overrides.fixed {
+        base.rules.remove(site);
+        base.fixed.insert(site.clone(), name.clone());
+    }
+    for (site, rule) in &overrides.rules {
+        base.fixed.remove(site);
+        base.rules.insert(site.clone(), rule.clone());
+    }
 }
 
 struct HostLimits(forja_host::Limits);
@@ -477,6 +527,21 @@ mod tests {
         assert!(!strong_weights_sha256(&index, &scratch)?.1);
         fs::remove_dir_all(root)?;
         Ok(())
+    }
+
+    #[test]
+    fn converts_profiles_to_deterministic_guest_load_config() {
+        let config = profile_load_config(&profile());
+        assert_eq!(
+            config.tunings,
+            ["residual-norm", "qk-norm-rope", "silu-mul", "final-norm"]
+        );
+        assert_eq!(
+            config.fixed_variant_picks[0].site,
+            "attention.prefill-small"
+        );
+        assert_eq!(config.variant_rule_picks[0].site, "attention.decode");
+        assert_eq!(config.variant_rule_picks[0].arms[2].hi, 4095);
     }
 
     #[test]

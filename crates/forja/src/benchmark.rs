@@ -20,7 +20,7 @@ use crate::{
     args::{Bench, BenchPoint, Profile, ProfileMode},
     benchmark_record::{self, Input, PerfKey, Recorded},
     benchmark_stats::{Stats, stats, synthetic_tokens},
-    engine::{argmax, limits, read_token, validate_engine, weights_path},
+    engine::{argmax, engine_load_config, limits, read_token, validate_engine, weights_path},
     machine_load,
 };
 
@@ -120,7 +120,7 @@ pub(crate) async fn measure_token_profile(
         return Err("profile shape exceeds the engine context".into());
     }
     runner
-        .load()
+        .load_with_selections(None, &engine_load_config(&options.engine)?)
         .await?
         .map_err(|error| format!("engine load failed: {error:?}"))?;
     let token_count = match options.mode {
@@ -749,7 +749,7 @@ async fn bench_engine(
         return Err("benchmark shape exceeds the engine context".into());
     }
     runner
-        .load()
+        .load_with_selections(None, &engine_load_config(component)?)
         .await?
         .map_err(|error| format!("engine load failed: {error:?}"))?;
     let profile_tokens = if options.breakdown {

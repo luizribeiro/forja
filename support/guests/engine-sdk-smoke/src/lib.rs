@@ -24,7 +24,24 @@ impl Engine for ConstantEngine {
         }
     }
 
-    fn load(_weights: &Weights<'_>, _config: EngineLoadConfig) -> Result<Self> {
+    fn load(_weights: &Weights<'_>, config: EngineLoadConfig) -> Result<Self> {
+        if !config.tunings.is_empty()
+            && (config.tunings != ["fused"]
+                || config.fixed_variant_picks.len() != 1
+                || config.fixed_variant_picks[0].site != "dense.decode"
+                || config.fixed_variant_picks[0].name != "matmul.gemv-transposed"
+                || config.variant_rule_picks.len() != 1
+                || config.variant_rule_picks[0].site != "attention.decode"
+                || config.variant_rule_picks[0].parameter != "position"
+                || config.variant_rule_picks[0].arms.len() != 1
+                || config.variant_rule_picks[0].arms[0].lo != 0
+                || config.variant_rule_picks[0].arms[0].hi != 1023
+                || config.variant_rule_picks[0].arms[0].name != "sdpa.decomposed")
+        {
+            return Err(forja_sdk::Error::loading(
+                "load selections did not round trip",
+            ));
+        }
         Ok(Self {
             embeddings: Tensor::from_slice(&[1.0; 16], &[4, 4])?,
             prefill: Some(ChunkedPrefill::new(MAX_CONTEXT, PREFILL_CHUNK)?),

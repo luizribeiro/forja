@@ -13,7 +13,7 @@ use tokenizers::Tokenizer;
 
 use crate::{
     args::{Backend as BackendArg, Run},
-    engine::{limits, read_token, validate_engine, weights_path},
+    engine::{engine_load_config, limits, read_token, validate_engine, weights_path},
 };
 
 #[cfg(target_os = "macos")]
@@ -26,6 +26,7 @@ pub(crate) async fn run(options: &Run) -> Result<(), Box<dyn Error>> {
         options.backend,
         &options.scratch,
     )?;
+    let load_config = engine_load_config(&options.engine)?;
     let stdout = std::io::stdout();
     let mut output = stdout.lock();
     match options.backend {
@@ -34,6 +35,7 @@ pub(crate) async fn run(options: &Run) -> Result<(), Box<dyn Error>> {
                 forja_cpu::CpuBackend::new(),
                 options,
                 &options.engine,
+                Some(&load_config),
                 &mut output,
             )
             .await?;
@@ -47,6 +49,7 @@ pub(crate) async fn run(options: &Run) -> Result<(), Box<dyn Error>> {
                 .map_err(|error| format!("cannot create Metal backend: {error}"))?,
                 options,
                 &options.engine,
+                Some(&load_config),
                 &mut output,
             )
             .await?;
@@ -61,13 +64,14 @@ async fn generate<B, W>(
     backend: B,
     options: &Run,
     component: &Path,
+    load_config: Option<&forja_host::EngineLoadConfig>,
     output: &mut W,
 ) -> Result<Vec<u32>, Box<dyn Error>>
 where
     B: Backend + Send + Sync + 'static,
     W: Write,
 {
-    let report = generate_report(backend, options, component, output).await?;
+    let report = generate_report(backend, options, component, load_config, output).await?;
     eprintln!(
         "engine memory: live={} bytes, RSS={} bytes",
         report.live_bytes, report.rss_bytes
@@ -85,6 +89,7 @@ async fn generate_report<B, W>(
     backend: B,
     options: &Run,
     component: &Path,
+    load_config: Option<&forja_host::EngineLoadConfig>,
     output: &mut W,
 ) -> Result<GenerationReport, Box<dyn Error>>
 where
@@ -110,10 +115,12 @@ where
     .await?;
     let info = runner.describe().await?;
     validate_generation_request(&tokenizer, &info, prompt.len(), options.max_tokens)?;
-    runner
-        .load()
-        .await?
-        .map_err(|error| format!("engine load failed: {error:?}"))?;
+    let loaded = if let Some(config) = load_config {
+        runner.load_with_selections(None, config).await?
+    } else {
+        runner.load().await?
+    };
+    loaded.map_err(|error| format!("engine load failed: {error:?}"))?;
     if options.max_tokens == 0 {
         return generation_report(Vec::new(), &runner);
     }
@@ -372,6 +379,7 @@ mod tests {
                 forja_metal::MetalBackend::new()?,
                 &options,
                 test_guests::qwen3(),
+                None,
                 &mut Vec::new(),
             ))?;
         assert_eq!(actual, expected);
@@ -408,6 +416,7 @@ mod tests {
                 forja_metal::MetalBackend::new()?,
                 &options,
                 test_guests::qwen3_coder(),
+                None,
                 &mut output,
             ))?;
         let text = String::from_utf8(output)?;

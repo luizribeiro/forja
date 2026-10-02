@@ -114,6 +114,7 @@ fn expand_engine(item: &ItemImpl) -> syn::Result<proc_macro2::TokenStream> {
 }
 
 fn engine_guest_impl() -> proc_macro2::TokenStream {
+    let load_config = engine_load_config();
     quote! {
         impl Guest for Component {
             fn describe() -> WitEngineInfo {
@@ -133,9 +134,7 @@ fn engine_guest_impl() -> proc_macro2::TokenStream {
                 let weights = ::forja_sdk::Weights::from_guest(weights);
                 let engine = <ExportedEngine as ::forja_sdk::Engine>::load(
                     &weights,
-                    ::forja_sdk::EngineLoadConfig {
-                        num_hidden_layers: config.num_hidden_layers,
-                    },
+                    #load_config,
                 )
                     .map_err(wit_error)?;
                 ENGINE.with(|slot| {
@@ -212,6 +211,31 @@ fn engine_guest_impl() -> proc_macro2::TokenStream {
             let len = u32::try_from(tokens.len())
                 .map_err(|_| compute::Error::Layout("token count exceeds u32".into()))?;
             ::forja_sdk::Tensor::from_slice(tokens, &[len]).map_err(wit_error)
+        }
+    }
+}
+
+fn engine_load_config() -> proc_macro2::TokenStream {
+    quote! {
+        ::forja_sdk::EngineLoadConfig {
+            num_hidden_layers: config.num_hidden_layers,
+            tunings: config.tunings,
+            fixed_variant_picks: config.fixed_variant_picks.into_iter().map(|pick| {
+                ::forja_sdk::FixedVariantPick { site: pick.site, name: pick.name }
+            }).collect(),
+            variant_rule_picks: config.variant_rule_picks.into_iter().map(|pick| {
+                ::forja_sdk::VariantRulePick {
+                    site: pick.site,
+                    parameter: pick.parameter,
+                    arms: pick.arms.into_iter().map(|arm| {
+                        ::forja_sdk::VariantPickArm {
+                            lo: arm.lo,
+                            hi: arm.hi,
+                            name: arm.name,
+                        }
+                    }).collect(),
+                }
+            }).collect(),
         }
     }
 }

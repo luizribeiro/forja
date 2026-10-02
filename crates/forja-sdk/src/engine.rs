@@ -14,10 +14,47 @@ pub struct EngineInfo {
 }
 
 /// Optional model dimensions selected when an engine loads.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct EngineLoadConfig {
     /// Number of leading decoder layers to load, or all layers when absent.
     pub num_hidden_layers: Option<u32>,
+    /// Effective registered tuning names.
+    pub tunings: Vec<String>,
+    /// Effective fixed variant picks.
+    pub fixed_variant_picks: Vec<FixedVariantPick>,
+    /// Effective parameter-dependent variant picks.
+    pub variant_rule_picks: Vec<VariantRulePick>,
+}
+
+/// One fixed engine dispatch-site selection.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FixedVariantPick {
+    /// Stable engine-owned dispatch site.
+    pub site: String,
+    /// Stable backend algorithm name.
+    pub name: String,
+}
+
+/// One parameter-dependent engine dispatch-site selection.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VariantRulePick {
+    /// Stable engine-owned dispatch site.
+    pub site: String,
+    /// Replay parameter name.
+    pub parameter: String,
+    /// Complete ordered rule arms.
+    pub arms: Vec<VariantPickArm>,
+}
+
+/// One inclusive arm in an engine variant rule.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VariantPickArm {
+    /// Inclusive lower bound.
+    pub lo: u32,
+    /// Inclusive upper bound.
+    pub hi: u32,
+    /// Stable backend algorithm name.
+    pub name: String,
 }
 
 /// Input to one unbatched engine invocation.

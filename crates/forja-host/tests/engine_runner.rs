@@ -8,7 +8,10 @@ use std::{
 };
 
 use forja_cpu::CpuBackend;
-use forja_host::{EngineRunner, EngineStep, Limits, bindings::l9o::gpu::compute::Error};
+use forja_host::{
+    EngineLoadConfig, EngineRunner, EngineStep, FixedVariantPick, Limits, VariantPickArm,
+    VariantRulePick, bindings::l9o::gpu::compute::Error,
+};
 use golden_fixtures::decode_f32_le;
 
 const LIMITS: Limits = Limits::new(1024 * 1024, 4, 1024, 128, 1024 * 1024);
@@ -22,6 +25,36 @@ async fn runs_an_engine_and_reads_its_logits() -> wasmtime::Result<()> {
 #[tokio::test]
 async fn runs_an_sdk_exported_engine() -> wasmtime::Result<()> {
     run_engine(test_guests::engine_sdk_smoke(), true, "sdk-engine").await
+}
+
+#[tokio::test]
+async fn passes_engine_selections_through_load_config() -> wasmtime::Result<()> {
+    let weights = weight_file("load-config")?;
+    let mut runner = EngineRunner::new(
+        test_guests::engine_sdk_smoke(),
+        CpuBackend::new(),
+        LIMITS,
+        weights.path(),
+    )
+    .await?;
+    let config = EngineLoadConfig {
+        tunings: vec!["fused".to_owned()],
+        fixed_variant_picks: vec![FixedVariantPick {
+            site: "dense.decode".to_owned(),
+            name: "matmul.gemv-transposed".to_owned(),
+        }],
+        variant_rule_picks: vec![VariantRulePick {
+            site: "attention.decode".to_owned(),
+            parameter: "position".to_owned(),
+            arms: vec![VariantPickArm {
+                lo: 0,
+                hi: 1023,
+                name: "sdpa.decomposed".to_owned(),
+            }],
+        }],
+    };
+    runner.load_with_selections(None, &config).await??;
+    Ok(())
 }
 
 #[tokio::test]

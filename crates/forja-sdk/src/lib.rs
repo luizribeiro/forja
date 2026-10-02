@@ -105,6 +105,7 @@ pub mod kernel;
 mod load;
 pub mod nn;
 pub mod program;
+mod selections;
 mod sys;
 pub mod target;
 mod tensor;
@@ -113,13 +114,14 @@ use std::{error, fmt};
 
 pub use element::{Element, FloatElement};
 pub use engine::{
-    DecodeInput, DecodeOutput, Engine, EngineInfo, EngineLoadConfig, SamplingParams, StepInput,
-    StepOutput,
+    DecodeInput, DecodeOutput, Engine, EngineInfo, EngineLoadConfig, FixedVariantPick,
+    SamplingParams, StepInput, StepOutput, VariantPickArm, VariantRulePick,
 };
 pub use forja_sdk_macros::{Load, export_engine, kernel};
 pub use graph::{Dim, Graph, Param, Pos, capture, eval};
 pub use half::{bf16, f16};
 pub use load::{Load, Weights};
+pub use selections::{EngineSelections, EngineTunings, Tuning, VariantSelection};
 pub use sys::DType;
 pub use tensor::{Slice, Tensor};
 

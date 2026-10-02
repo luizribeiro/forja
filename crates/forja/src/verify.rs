@@ -8,7 +8,7 @@ use golden_fixtures::{
 };
 
 use crate::args::{Backend as BackendArg, Precision, Verify};
-use crate::engine::{argmax, limits, validate_engine};
+use crate::engine::{argmax, engine_load_config, limits, validate_engine};
 
 #[cfg(target_os = "macos")]
 use crate::engine::metal_graph_replay;
@@ -81,6 +81,12 @@ struct DecodeInput<'a> {
     steps: usize,
 }
 
+struct EngineSource<'a> {
+    weights: &'a Path,
+    component: &'a Path,
+    load_config: Option<&'a forja_host::EngineLoadConfig>,
+}
+
 pub(crate) async fn run(options: &Verify) -> Result<(), Box<dyn Error>> {
     run_with_steps(options, 32).await
 }
@@ -92,14 +98,18 @@ async fn run_with_steps(options: &Verify, decode_steps: usize) -> Result<(), Box
         options.backend,
         &options.scratch,
     )?;
+    let load_config = engine_load_config(&options.engine)?;
     let fixtures = FixtureDirectory::open(&options.fixtures)?;
     fixtures.require_complete_model_outputs()?;
     let weights = verify_model_hash(options, &fixtures)?;
     run_with_component(
         options,
         &fixtures,
-        &weights,
-        &options.engine,
+        EngineSource {
+            weights: &weights,
+            component: &options.engine,
+            load_config: Some(&load_config),
+        },
         decode_steps,
         true,
     )
@@ -109,8 +119,7 @@ async fn run_with_steps(options: &Verify, decode_steps: usize) -> Result<(), Box
 async fn run_with_component(
     options: &Verify,
     fixtures: &FixtureDirectory,
-    weights: &Path,
-    component: &Path,
+    source: EngineSource<'_>,
     decode_steps: usize,
     enforce_tolerances: bool,
 ) -> Result<VerificationSummary, Box<dyn Error>> {
@@ -120,8 +129,7 @@ async fn run_with_component(
                 forja_cpu::CpuBackend::new(),
                 options,
                 fixtures,
-                weights,
-                component,
+                &source,
                 decode_steps,
                 enforce_tolerances,
             )
@@ -138,8 +146,7 @@ async fn run_with_component(
                     backend,
                     options,
                     fixtures,
-                    weights,
-                    component,
+                    &source,
                     decode_steps,
                     enforce_tolerances,
                 )
@@ -155,16 +162,20 @@ async fn verify<B>(
     backend: B,
     options: &Verify,
     fixtures: &FixtureDirectory,
-    weights: &Path,
-    component: &Path,
+    source: &EngineSource<'_>,
     decode_steps: usize,
     enforce_tolerances: bool,
 ) -> Result<VerificationSummary, Box<dyn Error>>
 where
     B: Backend + Send + Sync + 'static,
 {
-    let mut runner =
-        EngineRunner::new(component, backend, limits(&options.limits)?, weights).await?;
+    let mut runner = EngineRunner::new(
+        source.component,
+        backend,
+        limits(&options.limits)?,
+        source.weights,
+    )
+    .await?;
     let info = runner.describe().await?;
     let first = fixtures
         .prompts()
@@ -180,10 +191,13 @@ where
     {
         return Err("engine metadata is incompatible with the fixtures".into());
     }
-    runner
-        .load_with_config(Some(u32::try_from(layers)?))
-        .await?
-        .map_err(|error| format!("engine load failed: {error:?}"))?;
+    let layers = Some(u32::try_from(layers)?);
+    let loaded = if let Some(config) = source.load_config {
+        runner.load_with_selections(layers, config).await?
+    } else {
+        runner.load_with_config(layers).await?
+    };
+    loaded.map_err(|error| format!("engine load failed: {error:?}"))?;
     let prompts = selected_prompts(fixtures, &options.prompts)?;
     let mut passed = true;
     let mut summary = VerificationSummary::default();
@@ -700,7 +714,15 @@ mod tests {
         let runtime = tokio::runtime::Builder::new_current_thread().build()?;
         for component in components {
             runtime.block_on(run_with_component(
-                &options, &fixtures, &weights, component, 32, true,
+                &options,
+                &fixtures,
+                EngineSource {
+                    weights: &weights,
+                    component,
+                    load_config: None,
+                },
+                32,
+                true,
             ))?;
         }
         Ok(())
@@ -718,8 +740,11 @@ mod tests {
             .block_on(run_with_component(
                 &options,
                 &fixtures,
-                &weights,
-                test_guests::qwen3_bf16(),
+                EngineSource {
+                    weights: &weights,
+                    component: test_guests::qwen3_bf16(),
+                    load_config: None,
+                },
                 32,
                 true,
             ))?;

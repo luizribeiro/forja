@@ -12,6 +12,26 @@ interface engine {
 
   record load-config {
     num-hidden-layers: option<u32>,
+    tunings: list<string>,
+    fixed-variant-picks: list<fixed-variant-pick>,
+    variant-rule-picks: list<variant-rule-pick>,
+  }
+
+  record fixed-variant-pick {
+    site: string,
+    name: string,
+  }
+
+  record variant-rule-pick {
+    site: string,
+    parameter: string,
+    arms: list<variant-arm>,
+  }
+
+  record variant-arm {
+    lo: u32,
+    hi: u32,
+    name: string,
   }
 
   record step-in {
