@@ -26,16 +26,17 @@ compile_error!("select at most one fusion profile");
 #[cfg(target_family = "wasm")]
 use forja_sdk::nn::blocks::{ChunkedPrefill, DEFAULT_PREFILL_CHUNK, DecodeSelection, DecodeState};
 use forja_sdk::{
-    DType, Dim, Engine, EngineInfo, FloatElement, Load, Result, StepInput, StepOutput, Tensor,
-    Weights, bf16, export_engine,
+    DType, Dim, Engine, EngineInfo, FloatElement, Load, Param, Result, StepInput, StepOutput,
+    Tensor, Weights, bf16, export_engine,
     kernel::{Kernel, TensorRef},
     nn::{
         Embedding, EmbeddingConfig, Linear, LinearConfig, RmsNorm, RmsNormConfig, WeightElement,
         blocks::{
-            KvCache, Taps, cached_attention, qk_norm_rope, qk_norm_rope_kernel, residual_norm,
+            KvCache, Taps, cached_attention_with, qk_norm_rope, qk_norm_rope_kernel, residual_norm,
             residual_norm_kernel,
         },
     },
+    target::metal::{Variant, VariantChoice, VariantRule},
 };
 
 /// Vocabulary size reported by Qwen3-0.6B.
@@ -142,6 +143,80 @@ impl Activation for bf16 {
     }
 }
 
+fn variant(name: &str) -> Result<Variant> {
+    Variant::new(name)
+}
+
+fn matmul_variant<T: Activation>(rows: u32, inner: u32, columns: u32) -> Result<Variant> {
+    if rows == 1 {
+        return variant("matmul.gemv-transposed");
+    }
+    let large = u64::from(rows)
+        .checked_mul(u64::from(columns))
+        .is_some_and(|elements| elements >= 1 << 20);
+    let half = matches!(T::KERNEL_DTYPE, DType::F16 | DType::BF16);
+    let name = if half && large && u64::from(rows.max(columns)) * 2 > u64::from(inner) {
+        "matmul.steel-64x64x16-1x2"
+    } else if half {
+        "matmul.steel-64x32x32-2x2"
+    } else if large {
+        "matmul.steel-64x64x16-2x2"
+    } else {
+        "matmul.steel-32x64x16-1x2"
+    };
+    variant(name)
+}
+
+fn linear<T: Activation>(
+    projection: &Linear<T>,
+    input: &Tensor<T>,
+    rows: u32,
+    inner: u32,
+    columns: u32,
+) -> Result<Tensor<T>> {
+    let selection = matmul_variant::<T>(rows, inner, columns)?;
+    projection.forward_with(input, &selection)
+}
+
+fn attention_variant(
+    sequence: u32,
+    start: u32,
+    parameter: Option<&Param>,
+) -> Result<AttentionVariant> {
+    if let Some(parameter) = parameter {
+        let arms = if sequence == 1 {
+            vec![
+                (0..=510, variant("sdpa.decomposed")?),
+                (511..=1022, variant("sdpa.vector-single-pass")?),
+                (1023..=MAX_CONTEXT - 1, variant("sdpa.vector-two-pass")?),
+            ]
+        } else if sequence >= 512 {
+            vec![
+                (0..=0, variant("sdpa.steel")?),
+                (1..=MAX_CONTEXT - sequence, variant("sdpa.decomposed")?),
+            ]
+        } else {
+            vec![(0..=MAX_CONTEXT - sequence, variant("sdpa.decomposed")?)]
+        };
+        return Ok(AttentionVariant::Rule(VariantRule::new(parameter, arms)?));
+    }
+    let name = if sequence == 1 {
+        match start
+            .checked_add(1)
+            .ok_or_else(|| forja_sdk::Error::loading("attention cache length overflowed"))?
+        {
+            ..512 => "sdpa.decomposed",
+            512..1024 => "sdpa.vector-single-pass",
+            _ => "sdpa.vector-two-pass",
+        }
+    } else if sequence >= 512 && start == 0 {
+        "sdpa.steel"
+    } else {
+        "sdpa.decomposed"
+    };
+    Ok(AttentionVariant::Fixed(variant(name)?))
+}
+
 #[derive(Load)]
 #[load(config = Config)]
 struct Attention<T: Activation> {
@@ -169,6 +244,53 @@ struct Mlp<T: Activation> {
     up_proj: Linear<T>,
     #[load(prefix, config = T::linear_config(INTERMEDIATE, HIDDEN))]
     down_proj: Linear<T>,
+}
+
+impl<T: Activation> Attention<T> {
+    fn project(&self, input: &Tensor<T>, sequence: u32) -> Result<[Tensor<T>; 3]> {
+        let query = linear(
+            &self.q_proj,
+            input,
+            sequence,
+            HIDDEN,
+            QUERY_HEADS * HEAD_DIM,
+        )?
+        .reshape(&[sequence, QUERY_HEADS, HEAD_DIM])?;
+        let key = linear(
+            &self.k_proj,
+            input,
+            sequence,
+            HIDDEN,
+            KEY_VALUE_HEADS * HEAD_DIM,
+        )?
+        .reshape(&[sequence, KEY_VALUE_HEADS, HEAD_DIM])?;
+        let value = linear(
+            &self.v_proj,
+            input,
+            sequence,
+            HIDDEN,
+            KEY_VALUE_HEADS * HEAD_DIM,
+        )?;
+        Ok([query, key, value])
+    }
+}
+
+impl<T: Activation> Mlp<T> {
+    fn forward(
+        &self,
+        kernels: &FusedKernels,
+        input: &Tensor<T>,
+        sequence: u32,
+    ) -> Result<Tensor<T>> {
+        let gate = linear(&self.gate_proj, input, sequence, HIDDEN, INTERMEDIATE)?;
+        let up = linear(&self.up_proj, input, sequence, HIDDEN, INTERMEDIATE)?;
+        let activated = if FUSE_SILU_MUL {
+            run_silu_mul(kernels.silu_mul()?, &gate, &up)?
+        } else {
+            gate.silu_mul(&up)?
+        };
+        linear(&self.down_proj, &activated, sequence, INTERMEDIATE, HIDDEN)
+    }
 }
 
 #[derive(Load)]
@@ -263,6 +385,28 @@ struct LayerPosition<'a, T: Activation> {
     sequence: u32,
     start: &'a Dim,
     end: &'a Dim,
+    attention: &'a AttentionVariant,
+}
+
+enum AttentionVariant {
+    Fixed(Variant),
+    Rule(VariantRule),
+}
+
+#[cfg(target_family = "wasm")]
+#[derive(Clone, Copy)]
+struct PrefillVariant<'a> {
+    start: u32,
+    parameter: Option<&'a Param>,
+}
+
+impl AttentionVariant {
+    fn choice(&self) -> VariantChoice<'_> {
+        match self {
+            Self::Fixed(variant) => variant.into(),
+            Self::Rule(rule) => rule.into(),
+        }
+    }
 }
 
 impl<T: Activation> DecoderLayer<T> {
@@ -284,18 +428,10 @@ impl<T: Activation> DecoderLayer<T> {
             sequence,
             start,
             end,
+            attention,
         } = position;
-        let query_projection = self.self_attn.q_proj.forward(normalized_input)?.reshape(&[
-            sequence,
-            QUERY_HEADS,
-            HEAD_DIM,
-        ])?;
-        let key_projection = self.self_attn.k_proj.forward(normalized_input)?.reshape(&[
-            sequence,
-            KEY_VALUE_HEADS,
-            HEAD_DIM,
-        ])?;
-        let value_projection = self.self_attn.v_proj.forward(normalized_input)?;
+        let [query_projection, key_projection, value_projection] =
+            self.self_attn.project(normalized_input, sequence)?;
         let (query, key) = if FUSE_QK_NORM_ROPE {
             let program_positions = activation_positions.ok_or_else(|| {
                 forja_sdk::Error::loading("fused rotary positions are unavailable")
@@ -327,8 +463,23 @@ impl<T: Activation> DecoderLayer<T> {
             )
         };
         let value = value_projection.reshape(&[sequence, KEY_VALUE_HEADS, HEAD_DIM])?;
-        let attended = cached_attention(&query, &key, &value, cache, ATTENTION_SCALE, start, end)?;
-        let attention = self.self_attn.o_proj.forward(&attended)?;
+        let attended = cached_attention_with(
+            &query,
+            &key,
+            &value,
+            cache,
+            ATTENTION_SCALE,
+            start,
+            end,
+            attention.choice(),
+        )?;
+        let attention = linear(
+            &self.self_attn.o_proj,
+            &attended,
+            sequence,
+            QUERY_HEADS * HEAD_DIM,
+            HIDDEN,
+        )?;
         let (hidden, normalized) = if FUSE_RESIDUAL_NORM {
             residual_norm(
                 kernels.residual_norm()?,
@@ -341,14 +492,7 @@ impl<T: Activation> DecoderLayer<T> {
             let normalized = self.post_attention_layernorm.forward(&hidden)?;
             (hidden, normalized)
         };
-        let gate = self.mlp.gate_proj.forward(&normalized)?;
-        let up = self.mlp.up_proj.forward(&normalized)?;
-        let activated = if FUSE_SILU_MUL {
-            run_silu_mul(kernels.silu_mul()?, &gate, &up)?
-        } else {
-            gate.silu_mul(&up)?
-        };
-        let projected = self.mlp.down_proj.forward(&activated)?;
+        let projected = self.mlp.forward(kernels, &normalized, sequence)?;
         if FUSE_RESIDUAL_NORM && let Some(norm) = following_norm {
             let (residual, normalized) =
                 residual_norm(kernels.residual_norm()?, &hidden, &projected, norm.weight())?;
@@ -461,6 +605,7 @@ impl<T: Activation> Qwen3<T> {
             .forward(&hidden)?;
         let start = 0.into();
         let end = sequence.into();
+        let attention = attention_variant(sequence, 0, None)?;
         self.weights.model.layers[0]
             .forward(
                 &self.kernels,
@@ -472,6 +617,7 @@ impl<T: Activation> Qwen3<T> {
                     sequence,
                     start: &start,
                     end: &end,
+                    attention: &attention,
                 },
                 LayerResources {
                     cache: &mut self.caches[0],
@@ -543,7 +689,15 @@ impl Engine for ExportedQwen3 {
         }
         let start = input.start_pos.into();
         let end = end_pos.into();
-        self.forward(&input.tokens, sequence, &start, &end, input.taps)
+        let attention = attention_variant(sequence, input.start_pos, None)?;
+        self.forward(
+            &input.tokens,
+            sequence,
+            &start,
+            &end,
+            &attention,
+            input.taps,
+        )
     }
 
     #[cfg(target_family = "wasm")]
@@ -577,8 +731,9 @@ impl Engine for ExportedQwen3 {
                 } else {
                     let start = input.start_pos.into();
                     let end_dim = end.into();
+                    let attention = attention_variant(sequence, input.start_pos, None)?;
                     let logits = self
-                        .forward(&tokens, sequence, &start, &end_dim, false)?
+                        .forward(&tokens, sequence, &start, &end_dim, &attention, false)?
                         .logits;
                     self.select_token(logits, end - 1)
                 }
@@ -591,7 +746,10 @@ impl Engine for ExportedQwen3 {
                 let end = input.start_pos + 1;
                 let start_dim = input.start_pos.into();
                 let end_dim = end.into();
-                let logits = self.forward(&token, 1, &start_dim, &end_dim, false)?.logits;
+                let attention = attention_variant(1, input.start_pos, None)?;
+                let logits = self
+                    .forward(&token, 1, &start_dim, &end_dim, &attention, false)?
+                    .logits;
                 self.select_token(logits, input.start_pos)
             }
             None => Err(forja_sdk::Error::loading(
@@ -608,9 +766,11 @@ impl<T: Activation> Qwen3<T> {
         sequence: u32,
         start: &Dim,
         end: &Dim,
+        attention: &AttentionVariant,
         taps_enabled: bool,
     ) -> Result<StepOutput> {
-        let (logits, taps) = self.forward_sequence(tokens, sequence, start, end, taps_enabled)?;
+        let (logits, taps) =
+            self.forward_sequence(tokens, sequence, start, end, attention, taps_enabled)?;
         Ok(StepOutput {
             logits: Self::last_logits(
                 &logits,
@@ -629,6 +789,7 @@ impl<T: Activation> Qwen3<T> {
         sequence: u32,
         start: &Dim,
         end: &Dim,
+        attention: &AttentionVariant,
         taps_enabled: bool,
     ) -> Result<(Tensor<T>, Vec<Tensor<f32>>)> {
         let positions = self.positions.narrow(0, start, sequence)?;
@@ -660,6 +821,7 @@ impl<T: Activation> Qwen3<T> {
                     sequence,
                     start,
                     end,
+                    attention,
                 },
                 LayerResources {
                     cache: &mut self.caches[index],
@@ -686,7 +848,12 @@ impl<T: Activation> Qwen3<T> {
         if taps.enabled() {
             taps.push(Self::output(hidden.contiguous()?)?);
         }
-        let logits = self.weights.model.embed_tokens.project(&hidden)?;
+        let selection = matmul_variant::<T>(sequence, HIDDEN, VOCAB)?;
+        let logits = self
+            .weights
+            .model
+            .embed_tokens
+            .project_with(&hidden, &selection)?;
         Ok((logits, taps.finish()))
     }
 
@@ -702,8 +869,10 @@ impl<T: Activation> Qwen3<T> {
         last: &Dim,
         start: &Dim,
         end: &Dim,
+        variant: PrefillVariant<'_>,
     ) -> Result<Tensor<f32>> {
-        let (logits, _) = self.forward_sequence(tokens, sequence, start, end, false)?;
+        let attention = attention_variant(sequence, variant.start, variant.parameter)?;
+        let (logits, _) = self.forward_sequence(tokens, sequence, start, end, &attention, false)?;
         Self::last_logits(&logits, last)
     }
 
@@ -720,9 +889,23 @@ impl<T: Activation> Qwen3<T> {
             .prefill
             .take()
             .ok_or_else(|| forja_sdk::Error::loading("prefill state is unavailable"))?;
-        let result = prefill.replay(tokens, start, |tokens, sequence, last, start, end| {
-            self.forward_prefill_chunk(tokens, sequence, last, start, end)
-        });
+        let result = prefill.replay(
+            tokens,
+            start,
+            |tokens, sequence, last, start, end, parameter| {
+                self.forward_prefill_chunk(
+                    tokens,
+                    sequence,
+                    last,
+                    start,
+                    end,
+                    PrefillVariant {
+                        start: 0,
+                        parameter: Some(parameter),
+                    },
+                )
+            },
+        );
         self.prefill = Some(prefill);
         result
     }
@@ -733,9 +916,23 @@ impl<T: Activation> Qwen3<T> {
             .prefill
             .take()
             .ok_or_else(|| forja_sdk::Error::loading("prefill state is unavailable"))?;
-        let result = prefill.lazy(tokens, start, |tokens, sequence, last, start, end| {
-            self.forward_prefill_chunk(tokens, sequence, last, start, end)
-        });
+        let result = prefill.lazy(
+            tokens,
+            start,
+            |tokens, sequence, last, start, end, start_value| {
+                self.forward_prefill_chunk(
+                    tokens,
+                    sequence,
+                    last,
+                    start,
+                    end,
+                    PrefillVariant {
+                        start: start_value,
+                        parameter: None,
+                    },
+                )
+            },
+        );
         self.prefill = Some(prefill);
         result
     }
@@ -781,8 +978,11 @@ impl<T: Activation> Qwen3<T> {
         let mut feedback = self.decode.token()?;
         let output_tokens = self.decode.output_tokens()?;
         let sampling = self.decode.sampling()?;
+        let attention = attention_variant(1, start_pos, Some(&position))?;
         forja_sdk::capture(&[&position], || {
-            let logits = self.forward(&token, 1, &start_dim, &end, false)?.logits;
+            let logits = self
+                .forward(&token, 1, &start_dim, &end, &attention, false)?
+                .logits;
             let selected = match selection {
                 DecodeSelection::None => None,
                 DecodeSelection::Greedy => Some(logits.reshape(&[1, VOCAB])?.argmax()?),
@@ -836,4 +1036,73 @@ fn activation_position_table<T: Activation>() -> Result<Tensor<T>> {
         })
         .collect::<Result<Vec<_>>>()?;
     Tensor::constant(&values, &[MAX_CONTEXT])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixed_name(selection: AttentionVariant) -> String {
+        match selection {
+            AttentionVariant::Fixed(variant) => variant.name().to_owned(),
+            AttentionVariant::Rule(_) => panic!("expected a fixed attention variant"),
+        }
+    }
+
+    #[test]
+    fn preserves_dense_matmul_routing() {
+        assert_eq!(
+            matmul_variant::<bf16>(1, HIDDEN, INTERMEDIATE)
+                .unwrap()
+                .name(),
+            "matmul.gemv-transposed"
+        );
+        assert_eq!(
+            matmul_variant::<bf16>(512, HIDDEN, INTERMEDIATE)
+                .unwrap()
+                .name(),
+            "matmul.steel-64x64x16-1x2"
+        );
+        assert_eq!(
+            matmul_variant::<bf16>(512, HIDDEN, KEY_VALUE_HEADS * HEAD_DIM)
+                .unwrap()
+                .name(),
+            "matmul.steel-64x32x32-2x2"
+        );
+        assert_eq!(
+            matmul_variant::<f32>(16, HIDDEN, INTERMEDIATE)
+                .unwrap()
+                .name(),
+            "matmul.steel-32x64x16-1x2"
+        );
+    }
+
+    #[test]
+    fn preserves_attention_boundaries() {
+        assert_eq!(
+            fixed_name(attention_variant(1, 510, None).unwrap()),
+            "sdpa.decomposed"
+        );
+        assert_eq!(
+            fixed_name(attention_variant(1, 511, None).unwrap()),
+            "sdpa.vector-single-pass"
+        );
+        assert_eq!(
+            fixed_name(attention_variant(1, 1023, None).unwrap()),
+            "sdpa.vector-two-pass"
+        );
+        assert_eq!(
+            fixed_name(attention_variant(512, 0, None).unwrap()),
+            "sdpa.steel"
+        );
+        assert_eq!(
+            fixed_name(attention_variant(512, 1, None).unwrap()),
+            "sdpa.decomposed"
+        );
+        let parameter = Param::new(0..=MAX_CONTEXT - 1).unwrap();
+        assert!(matches!(
+            attention_variant(1, 0, Some(&parameter)).unwrap(),
+            AttentionVariant::Rule(_)
+        ));
+    }
 }

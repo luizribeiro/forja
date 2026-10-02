@@ -9,6 +9,7 @@ mod weights;
 
 use std::time::{Duration, Instant};
 use std::{
+    any::Any,
     collections::{HashMap, HashSet},
     future::Future,
     path::{Path, PathBuf},
@@ -470,7 +471,7 @@ where
         let engine = component_engine()?;
         let component = Component::from_file(&engine, component_path)?;
         let mut linker = Linker::new(&engine);
-        add_engine_to_linker(&mut linker)?;
+        add_engine_to_linker(&mut linker, &backend)?;
         let grants = Grants::new().with_weights("engine", weights_path);
         let mut store = Host::new_store_with_grants(&engine, backend, limits, grants);
         let instance =
@@ -2552,7 +2553,16 @@ impl<B: Backend> Host<B> {
 }
 
 #[cfg(target_os = "macos")]
-impl Host<forja_metal::MetalBackend> {
+impl<B> Host<B>
+where
+    B: Backend + Send + Sync + 'static,
+{
+    fn metal_backend(&self) -> Result<&forja_metal::MetalBackend, compute::Error> {
+        (self.backend.as_ref() as &dyn Any)
+            .downcast_ref()
+            .ok_or_else(|| compute::Error::OpSignature("Metal variants are unavailable".to_owned()))
+    }
+
     fn record_metal_variant(
         &mut self,
         commands: &Resource<CommandListEntry>,
@@ -2599,7 +2609,7 @@ impl Host<forja_metal::MetalBackend> {
         let variant = if let Some(operation) = concrete_op
             && dispatch_space.is_none()
         {
-            self.backend
+            self.metal_backend()?
                 .validate_variant_for_op(operation, &input_tensors, &output_tensors, name)
                 .map_err(|error| match error {
                     forja_metal::VariantValidationError::Operation(error) => guest_error(error),
@@ -2624,7 +2634,7 @@ impl Host<forja_metal::MetalBackend> {
             graph
                 .dispatch_many(template_op, &input_refs, &output_refs)
                 .map_err(|error| graph_error(&error))?;
-            self.backend
+            self.metal_backend()?
                 .validate_template_variant(space, template_op, &input_refs, &output_refs, name)
                 .map_err(|error| variant_error(&error))?
         };
@@ -2729,7 +2739,7 @@ impl Host<forja_metal::MetalBackend> {
             .dispatch_many(template_op, &input_refs, &output_refs)
             .map_err(|error| graph_error(&error))?;
         let variants = self
-            .backend
+            .metal_backend()?
             .validate_variant_rule(&space, &rule, template_op, &input_refs, &output_refs)
             .map_err(|error| variant_error(&error))?;
         self.dispatch_core(commands, template_op, concrete_op, inputs, outputs)?;
@@ -3458,7 +3468,10 @@ where
 }
 
 #[cfg(target_os = "macos")]
-impl metal_bindings::l9o::gpu::metal_variants::Host for Host<forja_metal::MetalBackend> {
+impl<B> metal_bindings::l9o::gpu::metal_variants::Host for Host<B>
+where
+    B: Backend + Send + Sync + 'static,
+{
     fn record_variant(
         &mut self,
         commands: Resource<CommandListEntry>,
@@ -3701,12 +3714,22 @@ pub fn add_metal_to_linker(
     >(linker, |host| host)
 }
 
-fn add_engine_to_linker<B>(linker: &mut Linker<Host<B>>) -> wasmtime::Result<()>
+fn add_engine_to_linker<B>(linker: &mut Linker<Host<B>>, backend: &B) -> wasmtime::Result<()>
 where
     B: Backend + Send + Sync + 'static,
 {
     add_wasi_to_linker(linker)?;
-    engine_bindings::EngineComponent::add_to_linker::<Host<B>, HostBindings<B>>(linker, |host| host)
+    engine_bindings::EngineComponent::add_to_linker::<Host<B>, HostBindings<B>>(linker, |host| {
+        host
+    })?;
+    #[cfg(target_os = "macos")]
+    if (backend as &dyn Any).is::<forja_metal::MetalBackend>() {
+        metal_bindings::l9o::gpu::metal_variants::add_to_linker::<Host<B>, HostBindings<B>>(
+            linker,
+            |host| host,
+        )?;
+    }
+    Ok(())
 }
 
 fn core_dtype(dtype: compute::Dtype) -> DType {

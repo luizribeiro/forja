@@ -37,13 +37,17 @@ impl Engine for ConstantEngine {
                 .prefill
                 .take()
                 .ok_or_else(|| forja_sdk::Error::loading("prefill state is unavailable"))?;
-            let logits = prefill.replay(&input.tokens, input.start_pos, |tokens, _, last, _, _| {
-                self.embeddings
-                    .embedding(tokens)?
-                    .narrow(0, last, 1)?
-                    .reshape(&[4])?
-                    .contiguous()
-            });
+            let logits = prefill.replay(
+                &input.tokens,
+                input.start_pos,
+                |tokens, _, last, _, _, _| {
+                    self.embeddings
+                        .embedding(tokens)?
+                        .narrow(0, last, 1)?
+                        .reshape(&[4])?
+                        .contiguous()
+                },
+            );
             self.prefill = Some(prefill);
             return Ok(StepOutput {
                 logits: logits?,

@@ -25,8 +25,10 @@ const REPLAY_LIMITS: Limits = Limits::new(
 .with_gpu_limits(Duration::from_secs(60), Duration::from_secs(3_600));
 
 #[test]
+#[cfg(target_os = "macos")]
 #[ignore = "requires FORJA_MODELS and runs in the pre-push hook"]
 fn first_layer_matches_transformers() -> Result<(), Box<dyn Error>> {
+    forja_sdk::set_native_device(forja_sdk::NativeDevice::Metal);
     let (fixture, mut engine, tokens) = single_token_case()?;
     let actual = engine.first_layer(&tokens)?.to_vec()?;
     let expected = fixture
@@ -42,8 +44,10 @@ fn first_layer_matches_transformers() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
+#[cfg(target_os = "macos")]
 #[ignore = "requires FORJA_MODELS and runs in the pre-push hook"]
 fn all_layers_match_transformers() -> Result<(), Box<dyn Error>> {
+    forja_sdk::set_native_device(forja_sdk::NativeDevice::Metal);
     let (fixture, mut engine, tokens) = single_token_case()?;
     let output = engine.step(forja_sdk::StepInput {
         tokens,
@@ -68,8 +72,10 @@ fn all_layers_match_transformers() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
+#[cfg(target_os = "macos")]
 #[ignore = "requires FORJA_MODELS and runs in the pre-push hook"]
 fn chunked_prefill_matches_single_pass_and_transformers() -> Result<(), Box<dyn Error>> {
+    forja_sdk::set_native_device(forja_sdk::NativeDevice::Metal);
     let (fixture, mut engine, tokens) = prompt_case("short-english", 7)?;
     let single = engine.step(forja_sdk::StepInput {
         tokens,
@@ -120,17 +126,6 @@ fn chunked_prefill_matches_single_pass_and_transformers() -> Result<(), Box<dyn 
     Ok(())
 }
 
-#[tokio::test]
-#[ignore = "requires FORJA_MODELS and runs in the pre-push hook"]
-async fn replay_matches_lazy_decode_on_cpu() -> Result<(), Box<dyn Error>> {
-    compare_replay(
-        vec![("cpu replay", forja_cpu::CpuBackend::new())],
-        forja_cpu::CpuBackend::new(),
-        8,
-    )
-    .await
-}
-
 #[cfg(target_os = "macos")]
 #[tokio::test]
 #[ignore = "requires FORJA_MODELS and runs in the pre-push hook"]
@@ -148,18 +143,6 @@ async fn metal_replay_matches_lazy_decode() -> Result<(), Box<dyn Error>> {
         ],
         forja_metal::MetalBackend::new()?,
         128,
-    )
-    .await
-}
-
-#[tokio::test]
-#[ignore = "requires FORJA_MODELS and runs in the pre-push hook"]
-async fn cpu_greedy_selection_matches_host_argmax() -> Result<(), Box<dyn Error>> {
-    compare_greedy_selection(
-        forja_cpu::CpuBackend::new(),
-        forja_cpu::CpuBackend::new(),
-        test_guests::qwen3(),
-        8,
     )
     .await
 }
@@ -187,39 +170,6 @@ async fn metal_sampled_selection_matches_sequential() -> Result<(), Box<dyn Erro
         test_guests::qwen3_bf16_no_replay(),
         test_guests::qwen3_bf16(),
         128,
-        SamplingParams {
-            temperature: 0.7,
-            top_k: 0,
-            top_p: 0.9,
-            seed: 0xfeed_beef_dead_cafe,
-        },
-    )
-    .await
-}
-
-#[tokio::test]
-#[ignore = "requires FORJA_MODELS and runs in the pre-push hook"]
-async fn cpu_pipelined_selection_matches_sequential() -> Result<(), Box<dyn Error>> {
-    compare_pipelined_selection(
-        forja_cpu::CpuBackend::new(),
-        forja_cpu::CpuBackend::new(),
-        test_guests::qwen3_no_replay(),
-        test_guests::qwen3(),
-        8,
-        SamplingParams::default(),
-    )
-    .await
-}
-
-#[tokio::test]
-#[ignore = "requires FORJA_MODELS and runs in the pre-push hook"]
-async fn cpu_sampled_selection_matches_sequential() -> Result<(), Box<dyn Error>> {
-    compare_pipelined_selection(
-        forja_cpu::CpuBackend::new(),
-        forja_cpu::CpuBackend::new(),
-        test_guests::qwen3_no_replay(),
-        test_guests::qwen3(),
-        8,
         SamplingParams {
             temperature: 0.7,
             top_k: 0,

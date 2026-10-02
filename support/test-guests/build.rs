@@ -23,13 +23,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     build_guest_workspace(
         &guest_manifest,
         &guest_target_dir,
-        &["--workspace", "--exclude", "metal-variant-smoke"],
+        &[
+            "--workspace",
+            "--exclude",
+            "metal-variant-smoke",
+            "--exclude",
+            "qwen3",
+        ],
     )?;
     build_guest_workspace(
         &guest_manifest,
         &guest_target_dir,
         &["-p", "metal-variant-smoke"],
     )?;
+    build_guest_workspace(&guest_manifest, &guest_target_dir, &["-p", "qwen3"])?;
     build_guest_workspace(
         &guest_manifest,
         &bf16_target_dir,

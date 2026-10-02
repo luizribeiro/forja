@@ -197,6 +197,19 @@ impl<T: Element> Linear<T> {
     pub fn forward(&self, input: &Tensor<T>) -> Result<Tensor<T>> {
         input.matmul(&self.weight.t()?)
     }
+
+    /// Applies the projection with an explicit Metal algorithm selection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid weight or input shape, rule context, or refused selection.
+    pub fn forward_with<'a>(
+        &self,
+        input: &Tensor<T>,
+        selection: impl Into<crate::target::metal::VariantChoice<'a>>,
+    ) -> Result<Tensor<T>> {
+        input.matmul_with(&self.weight.t()?, selection)
+    }
 }
 
 /// Root-mean-square normalization with a learned weight.
@@ -341,5 +354,18 @@ impl<T: Element> Embedding<T> {
     /// Returns an error for an invalid weight or input shape or a refused dispatch.
     pub fn project(&self, input: &Tensor<T>) -> Result<Tensor<T>> {
         input.matmul(&self.weight.t()?)
+    }
+
+    /// Projects hidden states with an explicit Metal algorithm selection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid weight or input shape, rule context, or refused selection.
+    pub fn project_with<'a>(
+        &self,
+        input: &Tensor<T>,
+        selection: impl Into<crate::target::metal::VariantChoice<'a>>,
+    ) -> Result<Tensor<T>> {
+        input.matmul_with(&self.weight.t()?, selection)
     }
 }

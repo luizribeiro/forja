@@ -405,7 +405,7 @@ impl Olmoe {
             .prefill
             .take()
             .ok_or_else(|| forja_sdk::Error::loading("prefill state is unavailable"))?;
-        let result = prefill.replay(tokens, start, |tokens, sequence, last, start, end| {
+        let result = prefill.replay(tokens, start, |tokens, sequence, last, start, end, _| {
             self.forward_prefill_chunk(tokens, sequence, last, start, end)
         });
         self.prefill = Some(prefill);
@@ -417,7 +417,7 @@ impl Olmoe {
             .prefill
             .take()
             .ok_or_else(|| forja_sdk::Error::loading("prefill state is unavailable"))?;
-        let result = prefill.lazy(tokens, start, |tokens, sequence, last, start, end| {
+        let result = prefill.lazy(tokens, start, |tokens, sequence, last, start, end, _| {
             self.forward_prefill_chunk(tokens, sequence, last, start, end)
         });
         self.prefill = Some(prefill);

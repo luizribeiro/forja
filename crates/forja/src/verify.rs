@@ -666,17 +666,6 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    #[ignore = "requires FORJA_MODELS and runs in the pre-push hook"]
-    fn cpu_qwen_verification() -> Result<(), Box<dyn Error>> {
-        run_model_test(
-            BackendArg::Cpu,
-            Precision::F32,
-            vec!["single-token".to_owned()],
-            2,
-        )
-    }
-
     #[cfg(target_os = "macos")]
     #[test]
     #[ignore = "requires FORJA_MODELS and runs in the pre-push hook"]

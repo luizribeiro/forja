@@ -20,7 +20,9 @@ residual-norm-only = []
 silu-mul-only = []
 
 [dependencies]
-forja-sdk = { path = "../../../crates/forja-sdk" }
+forja-sdk = { path = "../../../crates/forja-sdk", features = [
+  "metal-variants",
+] }
 
 [lints]
 workspace = true

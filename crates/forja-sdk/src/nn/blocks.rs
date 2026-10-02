@@ -7,7 +7,7 @@ use crate::{
     kernel::{Kernel, TensorRef},
 };
 
-use super::ops::{qkv_rope_cache_into, sdpa, sdpa_into};
+use super::ops::{qkv_rope_cache_into, sdpa, sdpa_into, sdpa_into_with};
 
 /// Default number of tokens recorded in a full prefill graph.
 pub const DEFAULT_PREFILL_CHUNK: u32 = 512;
@@ -258,7 +258,7 @@ impl<T: Element> ChunkedPrefill<T> {
         &mut self,
         tokens: &Tensor<u32>,
         start: u32,
-        mut forward: impl FnMut(&Tensor<u32>, u32, &Dim, &Dim, &Dim) -> Result<Tensor<T>>,
+        mut forward: impl FnMut(&Tensor<u32>, u32, &Dim, &Dim, &Dim, &Param) -> Result<Tensor<T>>,
     ) -> Result<Tensor<T>> {
         let [sequence] = tokens
             .shape()
@@ -300,7 +300,14 @@ impl<T: Element> ChunkedPrefill<T> {
                 let last_dim = last_parameter.at(real - 1).into();
                 let graph = crate::capture(&[&position_parameter, &last_parameter], || {
                     let input = self.tokens.narrow(0, &start_dim, bucket_size)?;
-                    forward(&input, bucket_size, &last_dim, &start_dim, &trace_end)
+                    forward(
+                        &input,
+                        bucket_size,
+                        &last_dim,
+                        &start_dim,
+                        &trace_end,
+                        &position_parameter,
+                    )
                 })?;
                 if graph.result().shape().len() != 1 {
                     return Err(Error::loading(
@@ -335,7 +342,7 @@ impl<T: Element> ChunkedPrefill<T> {
         &self,
         tokens: &Tensor<u32>,
         start: u32,
-        forward: impl FnMut(&Tensor<u32>, u32, &Dim, &Dim, &Dim) -> Result<Tensor<T>>,
+        forward: impl FnMut(&Tensor<u32>, u32, &Dim, &Dim, &Dim, u32) -> Result<Tensor<T>>,
     ) -> Result<Tensor<T>> {
         run_lazy_chunked_prefill(tokens, start, self.chunk, &self.tokens, forward)
     }
@@ -354,7 +361,7 @@ pub fn lazy_chunked_prefill<T: Element>(
     tokens: &Tensor<u32>,
     start: u32,
     chunk: u32,
-    forward: impl FnMut(&Tensor<u32>, u32, &Dim, &Dim, &Dim) -> Result<Tensor<T>>,
+    forward: impl FnMut(&Tensor<u32>, u32, &Dim, &Dim, &Dim, u32) -> Result<Tensor<T>>,
 ) -> Result<Tensor<T>> {
     let [sequence] = tokens
         .shape()
@@ -375,7 +382,7 @@ fn run_lazy_chunked_prefill<T: Element>(
     start: u32,
     chunk: u32,
     retained: &Tensor<u32>,
-    mut forward: impl FnMut(&Tensor<u32>, u32, &Dim, &Dim, &Dim) -> Result<Tensor<T>>,
+    mut forward: impl FnMut(&Tensor<u32>, u32, &Dim, &Dim, &Dim, u32) -> Result<Tensor<T>>,
 ) -> Result<Tensor<T>> {
     let [sequence] = tokens
         .shape()
@@ -398,6 +405,7 @@ fn run_lazy_chunked_prefill<T: Element>(
             &(real - 1).into(),
             &position.into(),
             &end.into(),
+            position,
         )?;
         if logits.shape().len() != 1 {
             return Err(Error::loading(
@@ -794,6 +802,48 @@ pub fn cached_attention<T: Element>(
     start: &Dim,
     end: &Dim,
 ) -> Result<Tensor<T>> {
+    cached_attention_selected(query, key, value, cache, scale, start, end, None)
+}
+
+/// Applies cached causal attention with an explicit Metal algorithm selection.
+///
+/// # Errors
+///
+/// Returns an error for incompatible shapes, cache ranges, rule context, or a refused selection.
+#[allow(clippy::too_many_arguments)]
+pub fn cached_attention_with<'a, T: Element>(
+    query: &Tensor<T>,
+    key: &Tensor<T>,
+    value: &Tensor<T>,
+    cache: &mut KvCache<T>,
+    scale: f32,
+    start: &Dim,
+    end: &Dim,
+    selection: impl Into<crate::target::metal::VariantChoice<'a>>,
+) -> Result<Tensor<T>> {
+    cached_attention_selected(
+        query,
+        key,
+        value,
+        cache,
+        scale,
+        start,
+        end,
+        Some(selection.into()),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cached_attention_selected<T: Element>(
+    query: &Tensor<T>,
+    key: &Tensor<T>,
+    value: &Tensor<T>,
+    cache: &mut KvCache<T>,
+    scale: f32,
+    start: &Dim,
+    end: &Dim,
+    selection: Option<crate::target::metal::VariantChoice<'_>>,
+) -> Result<Tensor<T>> {
     let [sequence, query_heads, width]: [u32; 3] = query
         .shape()
         .try_into()
@@ -815,12 +865,47 @@ pub fn cached_attention<T: Element>(
         let hidden = query_heads
             .checked_mul(width)
             .ok_or_else(|| Error::loading("attention output width overflowed"))?;
-        return sdpa(&query, &cached_key, &cached_value, scale, true, start)?
+        let attended = if let Some(selection) = selection {
+            super::ops::sdpa_with(
+                &query,
+                &cached_key,
+                &cached_value,
+                scale,
+                true,
+                start,
+                selection,
+            )?
+        } else {
+            sdpa(&query, &cached_key, &cached_value, scale, true, start)?
+        };
+        return attended
             .permute(&[1, 0, 2])?
             .contiguous()?
             .reshape(&[sequence, hidden]);
     }
-    attend_cached(&query, &cached_key, &cached_value, scale, start)
+    if let Some(selection) = selection {
+        let [query_heads, _, width]: [u32; 3] = query
+            .shape()
+            .try_into()
+            .map_err(|_| Error::loading("attention query must have rank three"))?;
+        let hidden = query_heads
+            .checked_mul(width)
+            .ok_or_else(|| Error::loading("attention output width overflowed"))?;
+        let output = Tensor::<T>::empty(vec![1, query_heads, width])?;
+        sdpa_into_with(
+            &query,
+            &cached_key,
+            &cached_value,
+            &output.permute(&[1, 0, 2])?,
+            scale,
+            true,
+            start,
+            selection,
+        )?;
+        output.reshape(&[1, hidden])
+    } else {
+        attend_cached(&query, &cached_key, &cached_value, scale, start)
+    }
 }
 
 #[cfg(test)]
