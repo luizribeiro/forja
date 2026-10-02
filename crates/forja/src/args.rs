@@ -34,6 +34,7 @@ pub(crate) struct Verify {
     pub(crate) backend: Backend,
     pub(crate) precision: Precision,
     pub(crate) prompts: Vec<String>,
+    pub(crate) each_tuning: bool,
     pub(crate) graph_replay: GraphReplay,
     pub(crate) limits: Limits,
     pub(crate) scratch: PathBuf,
@@ -60,6 +61,9 @@ struct VerifyArgs {
     /// Comma-separated fixture names. Repeating the option appends names.
     #[arg(long, value_delimiter = ',', value_parser = parse_prompt_name)]
     prompts: Vec<String>,
+    /// Verify profile defaults and every one-tuning exclusion.
+    #[arg(long)]
+    each_tuning: bool,
     /// Set a Metal backend option.
     #[arg(long = "backend-option", hide = true, value_parser = parse_backend_option)]
     graph_replay: Option<GraphReplay>,
@@ -1224,6 +1228,7 @@ impl VerifyArgs {
                 .iter()
                 .map(|name| name.as_str().to_owned())
                 .collect(),
+            each_tuning: self.each_tuning,
             graph_replay: config.backend.metal.resolve().graph_replay,
             limits,
             scratch: config.paths.scratch.clone(),
@@ -2097,6 +2102,7 @@ selection = ["host-argmax"]
                 "bf16",
                 "--prompts",
                 "one,two",
+                "--each-tuning",
             ]
             .map(str::to_owned),
         )
@@ -2110,6 +2116,7 @@ selection = ["host-argmax"]
                 backend: Backend::Cpu,
                 precision: Precision::Bf16,
                 prompts: vec!["one".to_owned(), "two".to_owned()],
+                each_tuning: true,
                 graph_replay: GraphReplay::Tier2,
                 limits: Limits::default(),
                 scratch: PathBuf::from("target/forja-bench"),
@@ -2146,6 +2153,7 @@ selection = ["host-argmax"]
                 backend: Backend::Metal,
                 precision: Precision::F32,
                 prompts: vec!["one".to_owned(), "two".to_owned(), "three".to_owned()],
+                each_tuning: false,
                 graph_replay: GraphReplay::Tier2,
                 limits: Limits::default(),
                 scratch: PathBuf::from("target/forja-bench"),

@@ -102,19 +102,61 @@ async fn run_with_steps(options: &Verify, decode_steps: usize) -> Result<(), Box
     let fixtures = FixtureDirectory::open(&options.fixtures)?;
     fixtures.require_complete_model_outputs()?;
     let weights = verify_model_hash(options, &fixtures)?;
-    run_with_component(
-        options,
-        &fixtures,
-        EngineSource {
-            weights: &weights,
-            component: &options.engine,
-            load_config: Some(&load_config),
-        },
-        decode_steps,
-        true,
-    )
-    .await
-    .map(|_| ())
+    if !options.each_tuning {
+        return run_with_component(
+            options,
+            &fixtures,
+            EngineSource {
+                weights: &weights,
+                component: &options.engine,
+                load_config: Some(&load_config),
+            },
+            decode_steps,
+            true,
+        )
+        .await
+        .map(|_| ());
+    }
+    let profile = crate::resolution::read_embedded_profile(&options.engine)?;
+    for tunings in tuning_sets(profile.default_tunings()) {
+        println!("tuning-set\t{}", tuning_label(&tunings));
+        let mut engine_config = options.engine_config.clone();
+        engine_config.tunings.base = forja_config::TuningBase::None;
+        engine_config.tunings.add = tunings.clone();
+        engine_config.tunings.remove.clear();
+        let load_config = engine_load_config(&options.engine, &engine_config)?;
+        run_with_component(
+            options,
+            &fixtures,
+            EngineSource {
+                weights: &weights,
+                component: &options.engine,
+                load_config: Some(&load_config),
+            },
+            decode_steps,
+            true,
+        )
+        .await
+        .map_err(|error| format!("tuning set {} failed: {error}", tuning_label(&tunings)))?;
+    }
+    Ok(())
+}
+
+fn tuning_sets(defaults: &[String]) -> Vec<Vec<String>> {
+    std::iter::once(defaults.to_vec())
+        .chain((0..defaults.len()).map(|removed| {
+            defaults
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| *index != removed)
+                .map(|(_, name)| name.clone())
+                .collect()
+        }))
+        .collect()
+}
+
+fn tuning_label(tunings: &[String]) -> String {
+    format!("[{}]", tunings.join(","))
 }
 async fn run_with_component(
     options: &Verify,
@@ -199,6 +241,8 @@ where
     };
     loaded.map_err(|error| format!("engine load failed: {error:?}"))?;
     let prompts = selected_prompts(fixtures, &options.prompts)?;
+    let first_fixture = prompts.first().map(|fixture| fixture.name().to_owned());
+    let mut first_failure = None;
     let mut passed = true;
     let mut summary = VerificationSummary::default();
     println!("prompt\tlayer\trelative-error\tresult");
@@ -214,10 +258,14 @@ where
         summary.maximum_layer_error = summary.maximum_layer_error.max(prompt.maximum_layer_error);
         summary.teacher_forced.include(prompt.teacher_forced);
         summary.free_running.include(prompt.free_running);
-        passed &= match options.precision {
+        let fixture_passed = match options.precision {
             Precision::F32 => prompt.passed,
             Precision::Bf16 => prompt.layers_passed,
         };
+        if !fixture_passed && first_failure.is_none() {
+            first_failure = Some(fixture.name().to_owned());
+        }
+        passed &= fixture_passed;
     }
     if options.precision == Precision::Bf16 {
         let teacher_passed = summary.teacher_forced.mean_kl() <= BF16_LOGIT_KL_TOLERANCE
@@ -235,7 +283,10 @@ where
     if passed || !enforce_tolerances {
         Ok(summary)
     } else {
-        Err("verification failed".into())
+        let fixture = first_failure
+            .or(first_fixture)
+            .unwrap_or_else(|| "unknown".to_owned());
+        Err(format!("verification failed for fixture {fixture:?}").into())
     }
 }
 
@@ -781,6 +832,7 @@ mod tests {
             backend: BackendArg::Metal,
             precision: Precision::Bf16,
             prompts: Vec::new(),
+            each_tuning: false,
             graph_replay: forja_config::GraphReplay::Tier2,
             limits,
             scratch: root.join("scratch"),
@@ -807,6 +859,7 @@ mod tests {
             backend: BackendArg::Metal,
             precision: Precision::F32,
             prompts: Vec::new(),
+            each_tuning: false,
             graph_replay: forja_config::GraphReplay::Tier2,
             limits,
             scratch: root.join("scratch"),
@@ -859,6 +912,20 @@ mod tests {
     }
 
     #[test]
+    fn includes_profile_defaults_and_each_one_tuning_exclusion() {
+        let defaults = ["one".to_owned(), "two".to_owned(), "three".to_owned()];
+        assert_eq!(
+            tuning_sets(&defaults),
+            [
+                vec!["one".to_owned(), "two".to_owned(), "three".to_owned()],
+                vec!["two".to_owned(), "three".to_owned()],
+                vec!["one".to_owned(), "three".to_owned()],
+                vec!["one".to_owned(), "two".to_owned()],
+            ]
+        );
+    }
+
+    #[test]
     fn rejects_a_model_hash_that_differs_from_the_manifest() -> Result<(), Box<dyn Error>> {
         let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
         let root = env::temp_dir().join(format!("forja-verify-hash-{nonce}"));
@@ -881,6 +948,7 @@ mod tests {
             backend: BackendArg::Cpu,
             precision: Precision::F32,
             prompts: Vec::new(),
+            each_tuning: false,
             graph_replay: forja_config::GraphReplay::Tier2,
             limits: forja_config::Limits::default(),
             scratch: root.join("scratch"),
@@ -935,6 +1003,7 @@ mod tests {
             backend,
             precision,
             prompts,
+            each_tuning: false,
             graph_replay: forja_config::GraphReplay::Tier2,
             limits: forja_config::Limits::default(),
             scratch: root.join("scratch"),
