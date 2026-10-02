@@ -195,6 +195,17 @@ pub(crate) mod guest {
         world: "host",
     });
 
+    #[cfg(feature = "metal-variants")]
+    mod variants {
+        wit_bindgen::generate!({
+            path: "../../wit",
+            world: "metal-host",
+            with: {
+                "l9o:gpu/compute@0.1.0": super::l9o::gpu::compute,
+            },
+        });
+    }
+
     use super::{Backend, DType, Error, Op, ParamSlice, Program, ProgramInst, Result, View};
     use crate::program::{BinaryOp, ProgramKind, ReduceOp, UnaryOp, ValueType};
     use compute::{

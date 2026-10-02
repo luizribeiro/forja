@@ -7,8 +7,9 @@ rust-version.workspace = true
 version.workspace = true
 
 [features]
+metal-variants = []
 native = ["dep:forja-core", "dep:forja-cpu", "dep:forja-host"]
-native-metal = ["native", "dep:forja-metal"]
+native-metal = ["native", "metal-variants", "dep:forja-metal"]
 
 [dependencies]
 forja-sdk-macros = { path = "../forja-sdk-macros" }
