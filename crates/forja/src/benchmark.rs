@@ -120,7 +120,10 @@ pub(crate) async fn measure_token_profile(
         return Err("profile shape exceeds the engine context".into());
     }
     runner
-        .load_with_selections(None, &engine_load_config(&options.engine)?)
+        .load_with_selections(
+            None,
+            &engine_load_config(&options.engine, &options.engine_config)?,
+        )
         .await?
         .map_err(|error| format!("engine load failed: {error:?}"))?;
     let token_count = match options.mode {
@@ -749,7 +752,7 @@ async fn bench_engine(
         return Err("benchmark shape exceeds the engine context".into());
     }
     runner
-        .load_with_selections(None, &engine_load_config(component)?)
+        .load_with_selections(None, &engine_load_config(component, &point.config.engine)?)
         .await?
         .map_err(|error| format!("engine load failed: {error:?}"))?;
     let profile_tokens = if options.breakdown {

@@ -26,7 +26,7 @@ pub(crate) async fn run(options: &Run) -> Result<(), Box<dyn Error>> {
         options.backend,
         &options.scratch,
     )?;
-    let load_config = engine_load_config(&options.engine)?;
+    let load_config = engine_load_config(&options.engine, &options.engine_config)?;
     let stdout = std::io::stdout();
     let mut output = stdout.lock();
     match options.backend {
@@ -364,6 +364,7 @@ mod tests {
             graph_replay: forja_config::GraphReplay::Tier2,
             limits: forja_config::Limits::default(),
             scratch: root.join("scratch"),
+            engine_config: forja_config::Engine::default(),
         };
         let expected = FixtureDirectory::open(root.join("golden/qwen3-0.6b"))?
             .prompt("short-english")
@@ -377,7 +378,7 @@ mod tests {
             .build()?
             .block_on(async {
                 let component = test_guests::qwen3();
-                let config = engine_load_config(component)?;
+                let config = engine_load_config(component, &forja_config::Engine::default())?;
                 generate(
                     forja_metal::MetalBackend::new()?,
                     &options,
@@ -412,6 +413,7 @@ mod tests {
                 ..forja_config::Limits::default()
             },
             scratch: root.join("scratch"),
+            engine_config: forja_config::Engine::default(),
         };
         let mut output = Vec::new();
         let report = tokio::runtime::Builder::new_current_thread()
@@ -419,7 +421,7 @@ mod tests {
             .build()?
             .block_on(async {
                 let component = test_guests::qwen3_coder();
-                let config = engine_load_config(component)?;
+                let config = engine_load_config(component, &forja_config::Engine::default())?;
                 generate_report(
                     forja_metal::MetalBackend::new()?,
                     &options,

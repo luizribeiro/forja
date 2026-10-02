@@ -8,8 +8,8 @@ use std::{
 };
 
 use forja_config::{
-    ComponentTarget, DeviceFamily, GraphReplay, Limits as ConfigLimits, Profile, ProfileBackend,
-    Target, Unbounded, Variants, sharded_weights_sha256, single_weights_sha256,
+    ComponentTarget, DeviceFamily, Engine, GraphReplay, Limits as ConfigLimits, Profile,
+    ProfileBackend, Target, Unbounded, sharded_weights_sha256, single_weights_sha256,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -217,27 +217,30 @@ fn weight_cache_path(scratch: &Path, weights: &Path) -> PathBuf {
     scratch.join("weights-sha256").join(name)
 }
 
-pub(crate) fn engine_load_config(component: &Path) -> Result<forja_host::EngineLoadConfig, String> {
+pub(crate) fn engine_load_config(
+    component: &Path,
+    overrides: &Engine,
+) -> Result<forja_host::EngineLoadConfig, String> {
     let profile = read_embedded_profile(component)?;
-    Ok(profile_load_config(&profile))
+    profile_load_config(&profile, overrides)
 }
 
-fn profile_load_config(profile: &Profile) -> forja_host::EngineLoadConfig {
-    let mut variants = profile.variants().clone();
-    for tuning in profile.default_tunings() {
-        if let Some(overrides) = profile.tuning_variants().get(tuning) {
-            overlay_variants(&mut variants, overrides);
-        }
-    }
-    forja_host::EngineLoadConfig {
-        replay: true,
-        tunings: profile.default_tunings().to_vec(),
-        fixed_variant_picks: variants
+fn profile_load_config(
+    profile: &Profile,
+    overrides: &Engine,
+) -> Result<forja_host::EngineLoadConfig, String> {
+    let selection = overrides.resolve(profile)?;
+    Ok(forja_host::EngineLoadConfig {
+        replay: overrides.replay,
+        tunings: selection.tunings,
+        fixed_variant_picks: selection
+            .variants
             .fixed
             .into_iter()
             .map(|(site, name)| forja_host::FixedVariantPick { site, name })
             .collect(),
-        variant_rule_picks: variants
+        variant_rule_picks: selection
+            .variants
             .rules
             .into_iter()
             .map(|(site, rule)| forja_host::VariantRulePick {
@@ -254,18 +257,7 @@ fn profile_load_config(profile: &Profile) -> forja_host::EngineLoadConfig {
                     .collect(),
             })
             .collect(),
-    }
-}
-
-fn overlay_variants(base: &mut Variants, overrides: &Variants) {
-    for (site, name) in &overrides.fixed {
-        base.rules.remove(site);
-        base.fixed.insert(site.clone(), name.clone());
-    }
-    for (site, rule) in &overrides.rules {
-        base.fixed.remove(site);
-        base.rules.insert(site.clone(), rule.clone());
-    }
+    })
 }
 
 struct HostLimits(forja_host::Limits);
@@ -532,7 +524,7 @@ mod tests {
 
     #[test]
     fn converts_profiles_to_deterministic_guest_load_config() {
-        let config = profile_load_config(&profile());
+        let config = profile_load_config(&profile(), &Engine::default()).unwrap();
         assert_eq!(
             config.tunings,
             ["residual-norm", "qk-norm-rope", "silu-mul", "final-norm"]

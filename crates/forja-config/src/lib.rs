@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 mod component;
+mod engine;
 mod files;
 mod layer;
 mod profile;
@@ -11,6 +12,7 @@ mod units;
 mod weights;
 
 pub use component::{ProfileSectionError, embed_profile, read_profile};
+pub use engine::{Engine, EngineSelection, TuningBase, TuningOverrides};
 pub use files::{dev_layers, file_layer, user_config_path};
 pub use layer::{ConfigError, KeyPath, Layer, Layered, Origin, Schema, layer};
 pub use profile::{
@@ -42,6 +44,8 @@ pub struct DevConfig {
     pub verify: Verify,
     /// Compute backend settings.
     pub backend: Backend,
+    /// Engine-owned performance choices.
+    pub engine: Engine,
 }
 
 /// Compute backend settings.

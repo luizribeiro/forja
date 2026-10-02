@@ -98,7 +98,7 @@ async fn run_with_steps(options: &Verify, decode_steps: usize) -> Result<(), Box
         options.backend,
         &options.scratch,
     )?;
-    let load_config = engine_load_config(&options.engine)?;
+    let load_config = engine_load_config(&options.engine, &options.engine_config)?;
     let fixtures = FixtureDirectory::open(&options.fixtures)?;
     fixtures.require_complete_model_outputs()?;
     let weights = verify_model_hash(options, &fixtures)?;
@@ -784,6 +784,7 @@ mod tests {
             graph_replay: forja_config::GraphReplay::Tier2,
             limits,
             scratch: root.join("scratch"),
+            engine_config: forja_config::Engine::default(),
         };
         tokio::runtime::Builder::new_current_thread()
             .build()?
@@ -809,6 +810,7 @@ mod tests {
             graph_replay: forja_config::GraphReplay::Tier2,
             limits,
             scratch: root.join("scratch"),
+            engine_config: forja_config::Engine::default(),
         };
         tokio::runtime::Builder::new_current_thread()
             .build()?
@@ -882,6 +884,7 @@ mod tests {
             graph_replay: forja_config::GraphReplay::Tier2,
             limits: forja_config::Limits::default(),
             scratch: root.join("scratch"),
+            engine_config: forja_config::Engine::default(),
         };
         let fixtures = FixtureDirectory::open(fixtures_path)?;
         let actual = sha256_file(options.model_dir.join("model.safetensors"))?;
@@ -910,7 +913,7 @@ mod tests {
         component: &Path,
         names: &[&str],
     ) -> Result<forja_host::EngineLoadConfig, Box<dyn Error>> {
-        let mut config = engine_load_config(component)?;
+        let mut config = engine_load_config(component, &forja_config::Engine::default())?;
         config.tunings = names.iter().map(|name| (*name).to_owned()).collect();
         Ok(config)
     }
@@ -935,6 +938,7 @@ mod tests {
             graph_replay: forja_config::GraphReplay::Tier2,
             limits: forja_config::Limits::default(),
             scratch: root.join("scratch"),
+            engine_config: forja_config::Engine::default(),
         })
     }
 

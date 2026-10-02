@@ -2,8 +2,8 @@ use std::{collections::BTreeMap, fs, path::PathBuf};
 
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use forja_config::{
-    BackendKind, BenchSampling, ConfigError, DevConfig, GraphReplay, KeyPath, Layer, Layered,
-    Limits, Origin, Selection, dev_layers, file_layer, layer, set_layer,
+    BackendKind, BenchSampling, ConfigError, DevConfig, Engine, GraphReplay, KeyPath, Layer,
+    Layered, Limits, Origin, Selection, dev_layers, file_layer, layer, set_layer,
 };
 
 use crate::benchmark_record::{Recorded, SCHEMA_VERSION};
@@ -37,6 +37,7 @@ pub(crate) struct Verify {
     pub(crate) graph_replay: GraphReplay,
     pub(crate) limits: Limits,
     pub(crate) scratch: PathBuf,
+    pub(crate) engine_config: Engine,
 }
 
 #[derive(Args)]
@@ -78,6 +79,7 @@ pub(crate) struct Run {
     pub(crate) graph_replay: GraphReplay,
     pub(crate) limits: Limits,
     pub(crate) scratch: PathBuf,
+    pub(crate) engine_config: Engine,
 }
 
 #[derive(Args)]
@@ -162,6 +164,7 @@ pub(crate) struct Profile {
     pub(crate) scratch: PathBuf,
     pub(crate) graph_replay: GraphReplay,
     pub(crate) limits: Limits,
+    pub(crate) engine_config: Engine,
 }
 
 #[derive(Args)]
@@ -967,6 +970,7 @@ impl ProfileArgs {
             sampling: config.bench.sampling,
             json: self.json,
             scratch: config.paths.scratch.clone(),
+            engine_config: config.engine.clone(),
             graph_replay: config.backend.metal.resolve().graph_replay,
             limits,
         })
@@ -1010,6 +1014,7 @@ impl RunArgs {
             graph_replay: config.backend.metal.resolve().graph_replay,
             limits,
             scratch: config.paths.scratch.clone(),
+            engine_config: config.engine.clone(),
         })
     }
 }
@@ -1069,6 +1074,7 @@ impl VerifyArgs {
             graph_replay: config.backend.metal.resolve().graph_replay,
             limits,
             scratch: config.paths.scratch.clone(),
+            engine_config: config.engine.clone(),
         })
     }
 }
@@ -1601,6 +1607,7 @@ selection = ["host-argmax"]
                 graph_replay: GraphReplay::Tier2,
                 limits: Limits::default(),
                 scratch: PathBuf::from("target/forja-bench"),
+                engine_config: Engine::default(),
             })
         );
     }
@@ -1789,6 +1796,7 @@ selection = ["host-argmax"]
                 graph_replay: GraphReplay::Tier2,
                 limits: Limits::default(),
                 scratch: PathBuf::from("target/forja-bench"),
+                engine_config: Engine::default(),
             })
         );
     }
@@ -1824,6 +1832,7 @@ selection = ["host-argmax"]
                 graph_replay: GraphReplay::Tier2,
                 limits: Limits::default(),
                 scratch: PathBuf::from("target/forja-bench"),
+                engine_config: Engine::default(),
             })
         );
     }
