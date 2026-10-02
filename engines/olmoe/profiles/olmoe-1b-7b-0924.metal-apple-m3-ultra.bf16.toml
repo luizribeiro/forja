@@ -1,0 +1,50 @@
+schema-version = 1
+family = "olmoe"
+
+[model]
+id = "allenai/OLMoE-1B-7B-0924"
+revision = "6d84c48581ece794365f2b8e9cfb043c68ade9c5"
+weights-sha256 = "sha256:82c42b2f2c011c4530c6b85287933ca59461242fb1917763f02807702bbb9d86"
+
+[target]
+component = "wasm32-wasip2"
+backend = "metal"
+device-family = "apple-m3-ultra"
+
+[numerics]
+activations = "bf16"
+weights = "bf16"
+
+[workload]
+kind = "causal-lm"
+batch = 1
+max-context = 4096
+prefill-chunk = 512
+
+[variants.fixed]
+"dense.decode" = "matmul.gemv"
+"dense.decode-transposed" = "matmul.gemv-transposed"
+"dense.prefill-bf16-large-wide" = "matmul.steel-64x64x16-1x2"
+"dense.prefill-bf16-large" = "matmul.steel-32x64x16-1x2"
+"dense.prefill-bf16-small" = "matmul.steel-64x64x16-1x2"
+"dense.prefill-bf16-transposed" = "matmul.steel-64x32x32-2x2"
+"dense.prefill-f32-large" = "matmul.steel-64x64x16-2x2"
+"dense.prefill-f32-small" = "matmul.steel-64x32x32-2x2"
+"dense.prefill-f32-transposed" = "matmul.steel-32x64x16-1x2"
+"top-k" = "top-k.single-k8"
+"attention.prefill-small" = "sdpa.decomposed"
+
+[variants.rules."attention.decode"]
+parameter = "position"
+arms = [
+  { lo = 0, hi = 510, name = "sdpa.decomposed" },
+  { lo = 511, hi = 1022, name = "sdpa.vector-single-pass" },
+  { lo = 1023, hi = 4095, name = "sdpa.vector-two-pass" },
+]
+
+[variants.rules."attention.prefill-large"]
+parameter = "position"
+arms = [
+  { lo = 0, hi = 0, name = "sdpa.steel" },
+  { lo = 1, hi = 4095, name = "sdpa.decomposed" },
+]

@@ -3,6 +3,12 @@ use std::{collections::BTreeMap, num::NonZeroU32};
 use serde::{Deserialize, Deserializer, Serialize, de};
 use sha2::{Digest, Sha256};
 
+const MAX_DEFAULT_TUNINGS: usize = 64;
+const MAX_FIXED_PICKS: usize = 1_024;
+const MAX_VARIANT_RULES: usize = 1_024;
+const MAX_TUNING_VARIANTS: usize = 64;
+const MAX_NAME_BYTES: usize = 64;
+
 /// A validated engine build profile.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(transparent)]
@@ -317,6 +323,7 @@ fn validate(profile: &ProfileData) -> Result<(), String> {
     }
     require_name("family", &profile.family)?;
     require_name("model.id", &profile.model.id)?;
+    validate_model_id(&profile.model.id)?;
     validate_hex("model.revision", &profile.model.revision, 40, "")?;
     validate_hex(
         "model.weights-sha256",
@@ -329,6 +336,11 @@ fn validate(profile: &ProfileData) -> Result<(), String> {
     }
     validate_tunings(&profile.default_tunings)?;
     validate_variants(&profile.variants, profile.workload.max_context)?;
+    require_count(
+        "tuning-variants",
+        profile.tuning_variants.len(),
+        MAX_TUNING_VARIANTS,
+    )?;
     for (tuning, variants) in &profile.tuning_variants {
         require_name("tuning-variants name", tuning)?;
         validate_variants(variants, profile.workload.max_context)?;
@@ -339,9 +351,32 @@ fn validate(profile: &ProfileData) -> Result<(), String> {
 fn require_name(field: &str, value: &str) -> Result<(), String> {
     if value.is_empty() {
         Err(format!("{field} must not be empty"))
+    } else if value.len() > MAX_NAME_BYTES {
+        Err(format!(
+            "{field} exceeds the {MAX_NAME_BYTES}-byte name limit"
+        ))
     } else {
         Ok(())
     }
+}
+
+fn require_count(field: &str, count: usize, maximum: usize) -> Result<(), String> {
+    if count > maximum {
+        Err(format!("{field} exceeds the {maximum}-entry limit"))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_model_id(id: &str) -> Result<(), String> {
+    if id.starts_with('/')
+        || id
+            .split('/')
+            .any(|segment| segment.is_empty() || matches!(segment, "." | ".."))
+    {
+        return Err("model.id must contain only nonempty relative segments".to_owned());
+    }
+    Ok(())
 }
 
 fn validate_hex(field: &str, value: &str, digits: usize, prefix: &str) -> Result<(), String> {
@@ -361,6 +396,7 @@ fn validate_hex(field: &str, value: &str, digits: usize, prefix: &str) -> Result
 }
 
 fn validate_tunings(tunings: &[String]) -> Result<(), String> {
+    require_count("default-tunings", tunings.len(), MAX_DEFAULT_TUNINGS)?;
     let mut sorted = tunings.to_vec();
     sorted.sort();
     for tuning in &sorted {
@@ -373,6 +409,8 @@ fn validate_tunings(tunings: &[String]) -> Result<(), String> {
 }
 
 fn validate_variants(variants: &Variants, max_context: NonZeroU32) -> Result<(), String> {
+    require_count("fixed variant picks", variants.fixed.len(), MAX_FIXED_PICKS)?;
+    require_count("variant rules", variants.rules.len(), MAX_VARIANT_RULES)?;
     for (site, name) in &variants.fixed {
         require_name("variant site", site)?;
         require_name("variant name", name)?;

@@ -23,7 +23,7 @@ nix develop -c sh -c 'uv run --project support/golden support/golden/generate.py
 Run the pp512/tg128 Forja and MLX-LM engine baselines and print their median wall throughput with 95% confidence intervals:
 
 ```console
-nix develop -c sh -c 'cargo run --release -p forja -- bench --engine "$FORJA_ENGINE" --model-dir "$FORJA_MODELS/Qwen3-0.6B" --json /tmp/forja-bench.json && uv run --locked --project support/bench-mlx support/bench-mlx/bench.py --model-dir "$FORJA_MODELS/Qwen3-0.6B" --json /tmp/mlx-bench.json && python3 support/bench-mlx/compare.py /tmp/forja-bench.json /tmp/mlx-bench.json'
+nix develop -c sh -c 'cargo run --release -p forja -- bench --engine "$FORJA_ENGINE" --model "$FORJA_MODELS/Qwen3-0.6B" --json /tmp/forja-bench.json && uv run --locked --project support/bench-mlx support/bench-mlx/bench.py --model-dir "$FORJA_MODELS/Qwen3-0.6B" --json /tmp/mlx-bench.json && python3 support/bench-mlx/compare.py /tmp/forja-bench.json /tmp/mlx-bench.json'
 ```
 
 Set `FORJA_ENGINE` to the Qwen WebAssembly component to measure. To compare replay behavior,

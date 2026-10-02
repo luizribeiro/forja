@@ -8,6 +8,8 @@ version.workspace = true
 
 [build-dependencies]
 forja-build = { path = "../../crates/forja-build" }
+forja-config = { path = "../../crates/forja-config" }
+toml.workspace = true
 
 [dev-dependencies]
 wasmtime.workspace = true

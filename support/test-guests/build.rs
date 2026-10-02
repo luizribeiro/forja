@@ -153,7 +153,11 @@ fn build_qwen3_coder_profiles(
 ) -> io::Result<[PathBuf; 2]> {
     let component = target_dir.join("wasm32-wasip2/release/qwen3_coder.wasm");
     forja_build::build_component(manifest, target_dir, &[])?;
-    let default = copy_component(&component, out_dir, "qwen3-coder.wasm")?;
+    let profile = manifest
+        .parent()
+        .ok_or_else(|| io::Error::other("Qwen3-Coder manifest has no parent"))?
+        .join("profiles/qwen3-coder-30b-a3b-instruct-4bit.metal-apple-m3-ultra.q4.toml");
+    let default = copy_profiled_component(&component, &profile, out_dir, "qwen3-coder.wasm")?;
     forja_build::build_component(manifest, target_dir, &["--features", "no-replay"])?;
     let no_replay = copy_component(&component, out_dir, "qwen3-coder-no-replay.wasm")?;
     Ok([default, no_replay])
@@ -166,7 +170,11 @@ fn build_olmoe_profiles(
 ) -> io::Result<[PathBuf; 2]> {
     let component = target_dir.join("wasm32-wasip2/release/olmoe.wasm");
     forja_build::build_component(manifest, target_dir, &[])?;
-    let default = copy_component(&component, out_dir, "olmoe.wasm")?;
+    let profile = manifest
+        .parent()
+        .ok_or_else(|| io::Error::other("OLMoE manifest has no parent"))?
+        .join("profiles/olmoe-1b-7b-0924.metal-apple-m3-ultra.bf16.toml");
+    let default = copy_profiled_component(&component, &profile, out_dir, "olmoe.wasm")?;
     forja_build::build_component(manifest, target_dir, &["--features", "no-replay"])?;
     let no_replay = copy_component(&component, out_dir, "olmoe-no-replay.wasm")?;
     Ok([default, no_replay])
@@ -180,9 +188,19 @@ fn build_qwen_profiles(
 ) -> io::Result<[PathBuf; 11]> {
     let release_dir = target_dir.join("wasm32-wasip2/release");
     let bf16_release_dir = bf16_target_dir.join("wasm32-wasip2/release");
-    let qwen3 = copy_component(&release_dir.join("qwen3.wasm"), out_dir, "qwen3.wasm")?;
-    let qwen3_bf16 = copy_component(
+    let profiles = manifest
+        .parent()
+        .ok_or_else(|| io::Error::other("Qwen3 manifest has no parent"))?
+        .join("profiles");
+    let qwen3 = copy_profiled_component(
+        &release_dir.join("qwen3.wasm"),
+        &profiles.join("qwen3-0.6b.metal-apple-m3-ultra.f32.toml"),
+        out_dir,
+        "qwen3.wasm",
+    )?;
+    let qwen3_bf16 = copy_profiled_component(
         &bf16_release_dir.join("qwen3.wasm"),
+        &profiles.join("qwen3-0.6b.metal-apple-m3-ultra.bf16.toml"),
         out_dir,
         "qwen3-bf16.wasm",
     )?;
@@ -260,6 +278,21 @@ fn build_qwen_profile(manifest: &Path, target_dir: &Path, features: &str) -> io:
 fn copy_component(source: &Path, out_dir: &Path, name: &str) -> io::Result<PathBuf> {
     let destination = out_dir.join(name);
     fs::copy(source, &destination)?;
+    Ok(destination)
+}
+
+fn copy_profiled_component(
+    source: &Path,
+    profile: &Path,
+    out_dir: &Path,
+    name: &str,
+) -> io::Result<PathBuf> {
+    let profile = toml::from_str::<forja_config::Profile>(&fs::read_to_string(profile)?)
+        .map_err(io::Error::other)?;
+    let component =
+        forja_config::embed_profile(&fs::read(source)?, &profile).map_err(io::Error::other)?;
+    let destination = out_dir.join(name);
+    fs::write(&destination, component)?;
     Ok(destination)
 }
 

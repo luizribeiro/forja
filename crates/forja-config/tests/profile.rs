@@ -80,6 +80,12 @@ fn rejects_unknown_fields_and_invalid_identity() {
             .contains("64 lowercase hexadecimal digits")
     );
     assert!(error(&PROFILE.replace("sha256:f47f", "f47f")).contains("must start with \"sha256:\""));
+    for id in ["..", "a/..", "/abs", "a//b"] {
+        assert!(
+            error(&PROFILE.replace("Qwen/Qwen3-0.6B", id)).contains("relative segments"),
+            "{id}"
+        );
+    }
 }
 
 #[test]
@@ -149,4 +155,74 @@ bits = 8
 
     let missing = PROFILE.replace("weights = \"bf16\"", "weights = \"q4\"");
     assert!(error(&missing).contains("q4 weights require"));
+}
+
+#[test]
+fn enforces_profile_collection_and_name_bounds() {
+    fn strings(count: usize, prefix: &str) -> String {
+        (0..count)
+            .map(|index| format!("\"{prefix}{index}\""))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    let at_tuning_limit = PROFILE.replace(
+        "[\"residual-norm\", \"qk-norm-rope\"]",
+        &format!("[{}]", strings(64, "t")),
+    );
+    assert!(toml::from_str::<Profile>(&at_tuning_limit).is_ok());
+    assert!(
+        error(&at_tuning_limit.replace(&strings(64, "t"), &strings(65, "t"))).contains("64-entry")
+    );
+
+    let fixed = |count| {
+        (0..count)
+            .map(|index| format!("site-{index} = \"variant\""))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let fixed_profile = PROFILE.replace(
+        "\"dense.decode\" = \"matmul.gemv-transposed\"\n\"top-k\" = \"top-k.single-k8\"",
+        &fixed(1_024),
+    );
+    assert!(toml::from_str::<Profile>(&fixed_profile).is_ok());
+    assert!(error(&fixed_profile.replace(&fixed(1_024), &fixed(1_025))).contains("1024-entry"));
+
+    let rules = |count| {
+        (0..count)
+            .map(|index| {
+                format!(
+                    "[variants.rules.site-{index}]\nparameter = \"position\"\narms = [{{ lo = 0, hi = 4095, name = \"variant\" }}]"
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let rules_profile = PROFILE
+        .split("[variants.rules.\"attention.decode\"]")
+        .next()
+        .unwrap()
+        .to_owned()
+        + &rules(1_024);
+    assert!(toml::from_str::<Profile>(&rules_profile).is_ok());
+    assert!(
+        error(
+            &(rules_profile[..rules_profile.len() - rules(1_024).len()].to_owned() + &rules(1_025))
+        )
+        .contains("1024-entry")
+    );
+
+    let tuning_variants = |count| {
+        (0..count)
+            .map(|index| format!("[tuning-variants.t{index}]"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let variants_profile = format!("{PROFILE}\n{}", tuning_variants(64));
+    assert!(toml::from_str::<Profile>(&variants_profile).is_ok());
+    assert!(error(&format!("{PROFILE}\n{}", tuning_variants(65))).contains("64-entry"));
+
+    let name = "n".repeat(64);
+    assert!(toml::from_str::<Profile>(&PROFILE.replace("residual-norm", &name)).is_ok());
+    assert!(error(&PROFILE.replace("residual-norm", &(name + "n"))).contains("64-byte"));
 }

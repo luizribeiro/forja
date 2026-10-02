@@ -10,11 +10,20 @@ mod generate;
 mod machine_load;
 mod profile;
 mod provenance;
+mod resolution;
 mod verify;
 
 use std::{error::Error, process::ExitCode};
 
 fn main() -> ExitCode {
+    match forja_build::run_rustc_wrapper() {
+        Ok(true) => return ExitCode::SUCCESS,
+        Ok(false) => {}
+        Err(error) => {
+            eprintln!("{error}");
+            return ExitCode::FAILURE;
+        }
+    }
     let command = match args::parse(std::env::args().skip(1)) {
         Ok(command) => command,
         Err(error) => error.exit(),
@@ -29,6 +38,10 @@ fn main() -> ExitCode {
 }
 
 fn run(command: args::Command) -> Result<(), Box<dyn Error>> {
+    if let args::Command::Build(options) = command {
+        println!("{}", resolution::build(&options.profile)?.display());
+        return Ok(());
+    }
     if let args::Command::Catalog(options) = command {
         if options.backend == args::Backend::Cpu {
             return Err("cpu exposes no selectable algorithm variants".into());
@@ -56,6 +69,7 @@ fn run(command: args::Command) -> Result<(), Box<dyn Error>> {
         .build()?;
     match command {
         args::Command::Bench(options) => runtime.block_on(benchmark::run(&options)),
+        args::Command::Build(_) => unreachable!("build commands return before runtime"),
         args::Command::Catalog(_) => unreachable!("catalog commands return before runtime"),
         args::Command::Config(_) => unreachable!("configuration commands return before runtime"),
         args::Command::Profile(options) => runtime.block_on(profile::run(&options)),

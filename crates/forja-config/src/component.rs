@@ -6,6 +6,7 @@ use crate::Profile;
 
 const PROFILE_SECTION: &str = "forja.profile.v1";
 const PROFILE_SECTION_PREFIX: &str = "forja.profile.";
+const MAX_PROFILE_BYTES: usize = 1024 * 1024;
 
 /// A failure to encode or read an embedded engine profile.
 #[derive(Debug, Eq, PartialEq)]
@@ -88,6 +89,11 @@ fn scan_profile(component: &[u8]) -> Result<Option<&[u8]>, ProfileSectionError> 
             Payload::Version { encoding, .. } if depth == 0 => root_encoding = Some(encoding),
             Payload::CustomSection(section) if depth == 0 => match section.name() {
                 PROFILE_SECTION if profile.is_some() => return Err(ProfileSectionError::Duplicate),
+                PROFILE_SECTION if section.data().len() > MAX_PROFILE_BYTES => {
+                    return Err(ProfileSectionError::Malformed(format!(
+                        "profile section exceeds the {MAX_PROFILE_BYTES}-byte limit"
+                    )));
+                }
                 PROFILE_SECTION => profile = Some(section.data()),
                 name if name.starts_with(PROFILE_SECTION_PREFIX) => {
                     return Err(ProfileSectionError::UnknownVersion(name.to_owned()));
@@ -214,5 +220,23 @@ weights-sha256 = "sha256:0000000000000000000000000000000000000000000000000000000
                 "forja.profile.v2".to_owned()
             ))
         );
+    }
+
+    #[test]
+    fn bounds_embedded_profile_bytes_before_parsing() {
+        let at_limit =
+            append_custom_section(COMPONENT, PROFILE_SECTION, &vec![0; MAX_PROFILE_BYTES]).unwrap();
+        assert_eq!(
+            scan_profile(&at_limit).unwrap().unwrap().len(),
+            MAX_PROFILE_BYTES
+        );
+
+        let over_limit =
+            append_custom_section(COMPONENT, PROFILE_SECTION, &vec![0; MAX_PROFILE_BYTES + 1])
+                .unwrap();
+        assert!(matches!(
+            scan_profile(&over_limit),
+            Err(ProfileSectionError::Malformed(message)) if message.contains("byte limit")
+        ));
     }
 }

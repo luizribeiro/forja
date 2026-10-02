@@ -45,7 +45,7 @@ struct VerifyArgs {
     engine: PathBuf,
     /// Directory containing model weights.
     #[arg(long)]
-    model_dir: PathBuf,
+    model: Option<PathBuf>,
     /// Directory containing golden fixtures.
     #[arg(long)]
     fixtures: Option<PathBuf>,
@@ -85,7 +85,7 @@ struct RunArgs {
     engine: PathBuf,
     /// Directory containing model weights and tokenizer files.
     #[arg(long)]
-    model_dir: PathBuf,
+    model: Option<PathBuf>,
     /// Text to continue.
     #[arg(long)]
     prompt: String,
@@ -169,7 +169,7 @@ struct ProfileArgs {
     engine: PathBuf,
     /// Directory containing model weights.
     #[arg(long)]
-    model_dir: PathBuf,
+    model: Option<PathBuf>,
     /// Context length or prefill token count to profile.
     #[arg(long, value_parser = parse_profile_context)]
     context: u32,
@@ -188,7 +188,7 @@ struct BenchArgs {
     engines: Vec<PathBuf>,
     /// Directory containing model weights.
     #[arg(long)]
-    model_dir: PathBuf,
+    model: Option<PathBuf>,
     /// Number of prompt-processing tokens.
     #[arg(long, value_parser = parse_positive)]
     pp: Option<u32>,
@@ -237,11 +237,23 @@ enum AxisClass {
 #[derive(Debug, PartialEq)]
 pub(crate) enum Command {
     Bench(Bench),
+    Build(Build),
     Catalog(Catalog),
     Config(ConfigShow),
     Profile(Profile),
     Run(Run),
     Verify(Verify),
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct Build {
+    pub(crate) profile: PathBuf,
+}
+
+#[derive(Args)]
+struct BuildArgs {
+    /// Engine profile name or path.
+    profile: PathBuf,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -314,6 +326,8 @@ struct Cli {
 enum ParsedCommand {
     /// Benchmark one or more engines.
     Bench(BenchArgs),
+    /// Build a reproducible profile-backed engine component.
+    Build(BuildArgs),
     /// List selectable backend algorithms and their constraints.
     Catalog(CatalogArgs),
     /// Inspect configuration.
@@ -390,6 +404,9 @@ fn parse_with(
             limits,
             rerun.map(|(_, record)| record),
         )?),
+        ParsedCommand::Build(options) => Command::Build(Build {
+            profile: options.profile,
+        }),
         ParsedCommand::Catalog(options) => Command::Catalog(Catalog {
             backend: match layered.config.backend.kind {
                 BackendKind::Metal => Backend::Metal,
@@ -640,7 +657,7 @@ impl ParsedCommand {
                 values.extend(backend_sugar(options.backend));
                 values.extend(graph_replay_sugar(options.graph_replay));
             }
-            Self::Catalog(_) | Self::Config(_) | Self::Profile(_) => {}
+            Self::Build(_) | Self::Catalog(_) | Self::Config(_) | Self::Profile(_) => {}
         }
         values
             .into_iter()
@@ -729,9 +746,20 @@ impl BenchArgs {
             .filter(|key| axis_class(key.as_str()) == Ok(AxisClass::Strategy))
             .cloned()
             .collect();
+        let engines = self
+            .engines
+            .iter()
+            .map(|engine| crate::resolution::engine(engine))
+            .collect::<Vec<_>>();
+        let model_dir = crate::resolution::model(
+            self.model.as_deref(),
+            config.paths.models.as_deref(),
+            &engines,
+        )
+        .map_err(|error| Cli::command().error(clap::error::ErrorKind::ValueValidation, error))?;
         Ok(Bench {
-            engines: self.engines,
-            model_dir: self.model_dir,
+            engines,
+            model_dir,
             pp: count(config.bench.pp.get())?,
             tg: count(config.bench.tg.get())?,
             reps: count(config.bench.reps.get())?,
@@ -917,9 +945,16 @@ impl ProfileArgs {
         validate_bench_sampling(config).map_err(|error| {
             Cli::command().error(clap::error::ErrorKind::ValueValidation, error)
         })?;
+        let engine = crate::resolution::engine(&self.engine);
+        let model_dir = crate::resolution::model(
+            self.model.as_deref(),
+            config.paths.models.as_deref(),
+            std::slice::from_ref(&engine),
+        )
+        .map_err(|error| Cli::command().error(clap::error::ErrorKind::ValueValidation, error))?;
         Ok(Profile {
-            engine: self.engine,
-            model_dir: self.model_dir,
+            engine,
+            model_dir,
             context: usize::try_from(self.context).map_err(|error| {
                 Cli::command().error(clap::error::ErrorKind::ValueValidation, error.to_string())
             })?,
@@ -953,9 +988,16 @@ impl RunArgs {
                 "run.top_p must be finite and in (0, 1]",
             ));
         }
+        let engine = crate::resolution::engine(&self.engine);
+        let model_dir = crate::resolution::model(
+            self.model.as_deref(),
+            config.paths.models.as_deref(),
+            std::slice::from_ref(&engine),
+        )
+        .map_err(|error| Cli::command().error(clap::error::ErrorKind::ValueValidation, error))?;
         Ok(Run {
-            engine: self.engine,
-            model_dir: self.model_dir,
+            engine,
+            model_dir,
             prompt: self.prompt,
             max_tokens,
             temperature: config.run.temperature,
@@ -1002,9 +1044,16 @@ impl VerifyArgs {
                 "verify requires --fixtures or verify.fixtures in configuration",
             )
         })?;
+        let engine = crate::resolution::engine(&self.engine);
+        let model_dir = crate::resolution::model(
+            self.model.as_deref(),
+            config.paths.models.as_deref(),
+            std::slice::from_ref(&engine),
+        )
+        .map_err(|error| Cli::command().error(clap::error::ErrorKind::ValueValidation, error))?;
         Ok(Verify {
-            engine: self.engine,
-            model_dir: self.model_dir,
+            engine,
+            model_dir,
             fixtures,
             backend: config.backend.kind.into(),
             precision: self.precision,
@@ -1066,7 +1115,7 @@ mod tests {
                 "bench",
                 "--engine",
                 "/engine.wasm",
-                "--model-dir",
+                "--model",
                 "/model",
                 "--pp",
                 "33",
@@ -1099,7 +1148,7 @@ mod tests {
                 "profile",
                 "--engine",
                 "/engine.wasm",
-                "--model-dir",
+                "--model",
                 "/model",
                 "--context",
                 "512",
@@ -1126,7 +1175,7 @@ mod tests {
                 "profile",
                 "--engine",
                 "/engine.wasm",
-                "--model-dir",
+                "--model",
                 "/model",
                 "--context",
                 "512",
@@ -1151,7 +1200,7 @@ mod tests {
                 "/f32.wasm",
                 "--engine",
                 "/bf16.wasm",
-                "--model-dir",
+                "--model",
                 "/model",
                 "--breakdown",
                 "--host-argmax",
@@ -1181,7 +1230,7 @@ mod tests {
                     "bench",
                     "--engine",
                     "/engine.wasm",
-                    "--model-dir",
+                    "--model",
                     "/model",
                     "--reps",
                     "0",
@@ -1199,7 +1248,7 @@ mod tests {
                 "bench",
                 "--engine",
                 "/engine.wasm",
-                "--model-dir",
+                "--model",
                 "/model",
                 "--reps",
                 "5",
@@ -1218,10 +1267,9 @@ mod tests {
 
     #[test]
     fn parses_benchmark_defaults() {
-        let command = parse(
-            ["bench", "--engine", "/engine.wasm", "--model-dir", "/model"].map(str::to_owned),
-        )
-        .unwrap();
+        let command =
+            parse(["bench", "--engine", "/engine.wasm", "--model", "/model"].map(str::to_owned))
+                .unwrap();
         let Command::Bench(options) = command else {
             panic!("expected bench command");
         };
@@ -1238,7 +1286,7 @@ mod tests {
                 "bench",
                 "--engine",
                 "/engine.wasm",
-                "--model-dir",
+                "--model",
                 "/model",
                 "--vary",
                 "backend.metal.graph_replay=tier1,tier2",
@@ -1280,7 +1328,7 @@ mod tests {
                 "bench",
                 "--engine",
                 "/engine.wasm",
-                "--model-dir",
+                "--model",
                 "/model",
                 "--vary",
                 "bench.selection=[[\"host-argmax\"],[\"gpu-pipelined\"]]",
@@ -1304,7 +1352,7 @@ mod tests {
                 "bench",
                 "--engine",
                 "/engine.wasm",
-                "--model-dir",
+                "--model",
                 "/model",
                 "--vary",
                 "bench.sampling.temperature=0.0,0.7",
@@ -1353,7 +1401,7 @@ mod tests {
                         "bench",
                         "--engine",
                         "/engine.wasm",
-                        "--model-dir",
+                        "--model",
                         "/model",
                         "--set",
                         setting,
@@ -1406,7 +1454,7 @@ mod tests {
     #[test]
     fn file_values_survive_without_bench_sugar_flags() {
         let command = parse_with_file(
-            &["bench", "--engine", "/engine.wasm", "--model-dir", "/model"],
+            &["bench", "--engine", "/engine.wasm", "--model", "/model"],
             r#"[bench]
 pp = 33
 tg = 7
@@ -1428,12 +1476,12 @@ selection = ["host-argmax"]
     #[test]
     fn rejects_invalid_benchmark_options() {
         for arguments in [
-            vec!["bench", "--model-dir", "/model"],
+            vec!["bench", "--model", "/model"],
             vec![
                 "bench",
                 "--engine",
                 "/engine.wasm",
-                "--model-dir",
+                "--model",
                 "/model",
                 "--pp",
                 "many",
@@ -1442,7 +1490,7 @@ selection = ["host-argmax"]
                 "bench",
                 "--engine",
                 "/engine.wasm",
-                "--model-dir",
+                "--model",
                 "/model",
                 "--tg",
                 "0",
@@ -1451,7 +1499,7 @@ selection = ["host-argmax"]
                 "bench",
                 "--engine",
                 "/engine.wasm",
-                "--model-dir",
+                "--model",
                 "/model",
                 "--precision",
                 "bf16",
@@ -1460,7 +1508,7 @@ selection = ["host-argmax"]
                 "bench",
                 "--engine",
                 "/engine.wasm",
-                "--model-dir",
+                "--model",
                 "/model",
                 "--no-replay",
             ],
@@ -1468,7 +1516,7 @@ selection = ["host-argmax"]
                 "bench",
                 "--engine",
                 "/engine.wasm",
-                "--model-dir",
+                "--model",
                 "/model",
                 "--backend-option",
                 "graph-replay=tier3",
@@ -1477,7 +1525,7 @@ selection = ["host-argmax"]
                 "bench",
                 "--engine",
                 "/engine.wasm",
-                "--model-dir",
+                "--model",
                 "/model",
                 "--json",
                 "/one",
@@ -1488,7 +1536,7 @@ selection = ["host-argmax"]
                 "bench",
                 "--engine",
                 "/engine.wasm",
-                "--model-dir",
+                "--model",
                 "/model",
                 "--breakdown",
                 "--breakdown",
@@ -1497,7 +1545,7 @@ selection = ["host-argmax"]
                 "bench",
                 "--engine",
                 "/engine.wasm",
-                "--model-dir",
+                "--model",
                 "/model",
                 "--wat",
                 "value",
@@ -1514,7 +1562,7 @@ selection = ["host-argmax"]
                 "run",
                 "--engine",
                 "/engine.wasm",
-                "--model-dir",
+                "--model",
                 "/model",
                 "--prompt",
                 "Hello",
@@ -1559,7 +1607,7 @@ selection = ["host-argmax"]
                 "run",
                 "--engine",
                 "/engine.wasm",
-                "--model-dir",
+                "--model",
                 "/model",
                 "--prompt",
                 "Hello",
@@ -1593,7 +1641,7 @@ selection = ["host-argmax"]
                         "run",
                         "--engine",
                         "/engine.wasm",
-                        "--model-dir",
+                        "--model",
                         "/model",
                         "--prompt",
                         "Hello",
@@ -1615,7 +1663,7 @@ selection = ["host-argmax"]
                 "run",
                 "--engine",
                 "/engine.wasm",
-                "--model-dir",
+                "--model",
                 "/model",
                 "--prompt",
                 "Hello",
@@ -1635,7 +1683,7 @@ selection = ["host-argmax"]
                 "run",
                 "--engine",
                 "/engine.wasm",
-                "--model-dir",
+                "--model",
                 "/model",
                 "--prompt",
                 "Hello",
@@ -1651,14 +1699,14 @@ selection = ["host-argmax"]
     #[test]
     fn rejects_invalid_run_options() {
         for arguments in [
-            vec!["run", "--model-dir", "/model", "--prompt", "Hello"],
+            vec!["run", "--model", "/model", "--prompt", "Hello"],
             vec!["run", "--engine", "/engine.wasm", "--prompt", "Hello"],
-            vec!["run", "--engine", "/engine.wasm", "--model-dir", "/model"],
+            vec!["run", "--engine", "/engine.wasm", "--model", "/model"],
             vec![
                 "run",
                 "--engine",
                 "/engine.wasm",
-                "--model-dir",
+                "--model",
                 "/model",
                 "--prompt",
                 "Hello",
@@ -1669,7 +1717,7 @@ selection = ["host-argmax"]
                 "run",
                 "--engine",
                 "/engine.wasm",
-                "--model-dir",
+                "--model",
                 "/model",
                 "--prompt",
                 "Hello",
@@ -1680,9 +1728,9 @@ selection = ["host-argmax"]
                 "run",
                 "--engine",
                 "/engine.wasm",
-                "--model-dir",
+                "--model",
                 "/model",
-                "--model-dir",
+                "--model",
                 "/other",
                 "--prompt",
                 "Hello",
@@ -1691,7 +1739,7 @@ selection = ["host-argmax"]
                 "run",
                 "--engine",
                 "/engine.wasm",
-                "--model-dir",
+                "--model",
                 "/model",
                 "--prompt",
                 "Hello",
@@ -1710,7 +1758,7 @@ selection = ["host-argmax"]
                 "verify",
                 "--engine",
                 "/engine.wasm",
-                "--model-dir",
+                "--model",
                 "/model",
                 "--fixtures",
                 "/fixtures",
@@ -1746,7 +1794,7 @@ selection = ["host-argmax"]
                 "verify",
                 "--engine",
                 "/engine.wasm",
-                "--model-dir",
+                "--model",
                 "/model",
                 "--fixtures",
                 "/fixtures",
@@ -1780,7 +1828,7 @@ selection = ["host-argmax"]
                 "verify",
                 "--engine",
                 "/engine.wasm",
-                "--model-dir",
+                "--model",
                 "/model",
                 "--fixtures",
                 "/fixtures",
@@ -1799,13 +1847,7 @@ selection = ["host-argmax"]
     #[test]
     fn file_values_survive_without_verify_sugar_flags() {
         let command = parse_with_file(
-            &[
-                "verify",
-                "--engine",
-                "/engine.wasm",
-                "--model-dir",
-                "/model",
-            ],
+            &["verify", "--engine", "/engine.wasm", "--model", "/model"],
             r#"[verify]
 prompts = ["short", "code"]
 fixtures = "/fixtures"
@@ -1822,15 +1864,14 @@ fixtures = "/fixtures"
     fn rejects_missing_and_unknown_options() {
         assert!(parse(["verify"].map(str::to_owned)).is_err());
         assert!(
-            parse(["verify", "--model-dir", "/model", "--wat", "value"].map(str::to_owned))
-                .is_err()
+            parse(["verify", "--model", "/model", "--wat", "value"].map(str::to_owned)).is_err()
         );
     }
 
     #[test]
     fn rejects_an_option_without_a_value() {
-        let error = parse(["verify", "--model-dir"].map(str::to_owned)).unwrap_err();
-        assert!(error.to_string().contains("--model-dir"));
+        let error = parse(["verify", "--model"].map(str::to_owned)).unwrap_err();
+        assert!(error.to_string().contains("--model"));
     }
 
     #[test]
@@ -1841,7 +1882,7 @@ fixtures = "/fixtures"
                     "verify",
                     "--engine",
                     "/engine.wasm",
-                    "--model-dir",
+                    "--model",
                     "/model",
                     "--fixtures",
                     "/fixtures",
@@ -1861,7 +1902,7 @@ fixtures = "/fixtures"
                 "verify",
                 "--engine",
                 "/engine.wasm",
-                "--model-dir",
+                "--model",
                 "/model",
                 "--fixtures",
                 "/fixtures",
@@ -1872,7 +1913,7 @@ fixtures = "/fixtures"
                 "verify",
                 "--engine",
                 "/engine.wasm",
-                "--model-dir",
+                "--model",
                 "/model",
                 "--fixtures",
                 "/fixtures",
@@ -1885,7 +1926,7 @@ fixtures = "/fixtures"
                 "verify",
                 "--engine",
                 "/engine.wasm",
-                "--model-dir",
+                "--model",
                 "/model",
                 "--fixtures",
                 "/fixtures",
@@ -1898,7 +1939,7 @@ fixtures = "/fixtures"
                 "verify",
                 "--engine",
                 "/engine.wasm",
-                "--model-dir",
+                "--model",
                 "/model",
                 "--fixtures",
                 "/fixtures",
@@ -1909,9 +1950,9 @@ fixtures = "/fixtures"
                 "verify",
                 "--engine",
                 "/engine.wasm",
-                "--model-dir",
+                "--model",
                 "/model",
-                "--model-dir",
+                "--model",
                 "/other",
                 "--fixtures",
                 "/fixtures",
@@ -1939,7 +1980,7 @@ fixtures = "/fixtures"
                 "run".to_owned(),
                 "--engine".to_owned(),
                 "/engine.wasm".to_owned(),
-                "--model-dir".to_owned(),
+                "--model".to_owned(),
                 "/model".to_owned(),
                 "--prompt".to_owned(),
                 "hello".to_owned(),
@@ -1969,7 +2010,7 @@ fixtures = "/fixtures"
                 "run",
                 "--engine",
                 "/engine.wasm",
-                "--model-dir",
+                "--model",
                 "/model",
                 "--prompt",
                 "hello",
@@ -1994,7 +2035,7 @@ fixtures = "/fixtures"
                 "run",
                 "--engine",
                 "/engine.wasm",
-                "--model-dir",
+                "--model",
                 "/model",
                 "--prompt",
                 "hello",
@@ -2030,7 +2071,7 @@ fixtures = "/fixtures"
                 "bench".to_owned(),
                 "--engine".to_owned(),
                 "/engine.wasm".to_owned(),
-                "--model-dir".to_owned(),
+                "--model".to_owned(),
                 "/model".to_owned(),
                 "--rerun".to_owned(),
                 path.display().to_string(),
@@ -2059,7 +2100,7 @@ fixtures = "/fixtures"
                 "bench",
                 "--engine",
                 "/engine.wasm",
-                "--model-dir",
+                "--model",
                 "/model",
                 "--allow-diff",
                 "bench.reps",
@@ -2082,7 +2123,7 @@ fixtures = "/fixtures"
         for command in ["bench", "run", "verify"] {
             let help = parse([command, "--help"].map(str::to_owned)).unwrap_err();
             assert_eq!(help.kind(), clap::error::ErrorKind::DisplayHelp);
-            assert!(help.to_string().contains("--model-dir"));
+            assert!(help.to_string().contains("--model"));
         }
     }
 }

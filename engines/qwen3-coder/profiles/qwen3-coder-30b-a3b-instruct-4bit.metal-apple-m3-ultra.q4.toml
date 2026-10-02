@@ -1,0 +1,59 @@
+schema-version = 1
+family = "qwen3-coder"
+
+[model]
+id = "mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit"
+revision = "6e302ea604ad9ab206367e2c501d1571023e7b6d"
+weights-sha256 = "sha256:2f0797714404ba75a18599829d8ab96e316ef0088aa6f49e7cb7eb301043f5ec"
+
+[target]
+component = "wasm32-wasip2"
+backend = "metal"
+device-family = "apple-m3-ultra"
+
+[numerics]
+activations = "bf16"
+weights = "q4"
+
+[workload]
+kind = "causal-lm"
+batch = 1
+max-context = 4096
+prefill-chunk = 512
+
+[variants.fixed]
+"quant.decode-q4" = "quant-matmul.gemv"
+"quant.decode-q8" = "quant-matmul.q8-fast-gemv"
+"quant.prefill-small" = "quant-matmul.small-m"
+"quant.prefill-tiled" = "quant-matmul.tiled"
+"gather-quant-matmul.small" = "gather-quant-matmul.route-gemv"
+"gather-quant-matmul.grouped" = "gather-quant-matmul.grouped"
+"gather-quant-silu-mul.small" = "gather-quant-silu-mul.route-gemv"
+"gather-quant-silu-mul.grouped" = "gather-quant-silu-mul.grouped"
+"moe.combine-small" = "matmul.steel-64x32x32-2x2"
+"moe.combine-large" = "matmul.steel-64x64x16-2x2"
+"top-k" = "top-k.single-k8"
+"attention.prefill-small" = "sdpa.decomposed"
+
+[variants.rules."attention.decode"]
+parameter = "position"
+arms = [
+  { lo = 0, hi = 510, name = "sdpa.decomposed" },
+  { lo = 511, hi = 1022, name = "sdpa.vector-single-pass" },
+  { lo = 1023, hi = 4095, name = "sdpa.vector-two-pass" },
+]
+
+[variants.rules."attention.prefill-large"]
+parameter = "position"
+arms = [
+  { lo = 0, hi = 0, name = "sdpa.steel" },
+  { lo = 1, hi = 4095, name = "sdpa.decomposed" },
+]
+
+[quantization]
+scheme = "mlx-affine"
+default-bits = 4
+group-size = 64
+
+[quantization.overrides."model.layers.*.mlp.gate"]
+bits = 8

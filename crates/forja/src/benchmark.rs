@@ -1842,13 +1842,7 @@ mod tests {
     fn comparability_accepts_reordered_engines() {
         let crate::args::Command::Bench(recorded_options) = crate::args::parse(
             [
-                "bench",
-                "--engine",
-                "/first",
-                "--engine",
-                "/second",
-                "--model-dir",
-                "/model",
+                "bench", "--engine", "/first", "--engine", "/second", "--model", "/model",
             ]
             .map(str::to_owned),
         )
@@ -1884,13 +1878,7 @@ mod tests {
         };
         let crate::args::Command::Bench(current) = crate::args::parse(
             [
-                "bench",
-                "--engine",
-                "/second",
-                "--engine",
-                "/first",
-                "--model-dir",
-                "/model",
+                "bench", "--engine", "/second", "--engine", "/first", "--model", "/model",
             ]
             .map(str::to_owned),
         )
@@ -1913,7 +1901,7 @@ mod tests {
     #[test]
     fn allow_diff_overrides_a_structural_performance_difference() {
         let crate::args::Command::Bench(recorded_options) = crate::args::parse(
-            ["bench", "--engine", "/engine", "--model-dir", "/model"].map(str::to_owned),
+            ["bench", "--engine", "/engine", "--model", "/model"].map(str::to_owned),
         )
         .unwrap() else {
             panic!("expected bench command");
@@ -1943,13 +1931,7 @@ mod tests {
         };
         let crate::args::Command::Bench(mut current) = crate::args::parse(
             [
-                "bench",
-                "--engine",
-                "/engine",
-                "--model-dir",
-                "/model",
-                "--reps",
-                "7",
+                "bench", "--engine", "/engine", "--model", "/model", "--reps", "7",
             ]
             .map(str::to_owned),
         )
@@ -1970,7 +1952,7 @@ mod tests {
     #[test]
     fn allow_diff_compares_performance_across_engine_revisions() {
         let crate::args::Command::Bench(recorded_options) = crate::args::parse(
-            ["bench", "--engine", "/engine", "--model-dir", "/model"].map(str::to_owned),
+            ["bench", "--engine", "/engine", "--model", "/model"].map(str::to_owned),
         )
         .unwrap() else {
             panic!("expected bench command");
@@ -1999,7 +1981,7 @@ mod tests {
             ],
         };
         let crate::args::Command::Bench(mut current) = crate::args::parse(
-            ["bench", "--engine", "/engine", "--model-dir", "/model"].map(str::to_owned),
+            ["bench", "--engine", "/engine", "--model", "/model"].map(str::to_owned),
         )
         .unwrap() else {
             panic!("expected bench command");
@@ -2081,7 +2063,7 @@ mod tests {
                 "bench",
                 "--engine",
                 &engine,
-                "--model-dir",
+                "--model",
                 &model,
                 "--pp",
                 "9",
@@ -2112,7 +2094,7 @@ mod tests {
                 "bench",
                 "--engine",
                 &engine,
-                "--model-dir",
+                "--model",
                 &model,
                 "--rerun",
                 &record_path,

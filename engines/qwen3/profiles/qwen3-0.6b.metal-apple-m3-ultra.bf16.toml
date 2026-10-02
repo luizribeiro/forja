@@ -1,0 +1,44 @@
+schema-version = 1
+family = "qwen3"
+default-tunings = ["residual-norm", "qk-norm-rope", "silu-mul", "final-norm"]
+
+[model]
+id = "Qwen/Qwen3-0.6B"
+revision = "c1899de289a04d12100db370d81485cdf75e47ca"
+weights-sha256 = "sha256:f47f71177f32bcd101b7573ec9171e6a57f4f4d31148d38e382306f42996874b"
+
+[target]
+component = "wasm32-wasip2"
+backend = "metal"
+device-family = "apple-m3-ultra"
+
+[numerics]
+activations = "bf16"
+weights = "bf16"
+
+[workload]
+kind = "causal-lm"
+batch = 1
+max-context = 4096
+prefill-chunk = 512
+
+[variants.fixed]
+"dense.decode" = "matmul.gemv-transposed"
+"dense.prefill.large-wide" = "matmul.steel-64x64x16-1x2"
+"dense.prefill.other" = "matmul.steel-64x32x32-2x2"
+"attention.prefill-small" = "sdpa.decomposed"
+
+[variants.rules."attention.decode"]
+parameter = "position"
+arms = [
+  { lo = 0, hi = 510, name = "sdpa.decomposed" },
+  { lo = 511, hi = 1022, name = "sdpa.vector-single-pass" },
+  { lo = 1023, hi = 4095, name = "sdpa.vector-two-pass" },
+]
+
+[variants.rules."attention.prefill-large"]
+parameter = "position"
+arms = [
+  { lo = 0, hi = 0, name = "sdpa.steel" },
+  { lo = 1, hi = 4095, name = "sdpa.decomposed" },
+]

@@ -676,6 +676,7 @@ name = "forja"
 version = "0.0.0"
 dependencies = [
  "clap",
+ "forja-build",
  "forja-config",
  "forja-core",
  "forja-cpu",
@@ -1963,6 +1964,8 @@ name = "test-guests"
 version = "0.0.0"
 dependencies = [
  "forja-build",
+ "forja-config",
+ "toml",
  "wasmtime",
  "wasmtime-wasi",
 ]
