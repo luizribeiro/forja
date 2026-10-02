@@ -412,13 +412,18 @@ mod tests {
         let report = tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .build()?
-            .block_on(generate_report(
-                forja_metal::MetalBackend::new()?,
-                &options,
-                test_guests::qwen3_coder(),
-                None,
-                &mut output,
-            ))?;
+            .block_on(async {
+                let component = test_guests::qwen3_coder();
+                let config = engine_load_config(component)?;
+                generate_report(
+                    forja_metal::MetalBackend::new()?,
+                    &options,
+                    component,
+                    Some(&config),
+                    &mut output,
+                )
+                .await
+            })?;
         let text = String::from_utf8(output)?;
         eprintln!(
             "Qwen3-Coder full model: live={} bytes, RSS={} bytes, output={text:?}",

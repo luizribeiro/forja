@@ -1,5 +1,7 @@
 //! Qwen3-Coder quantized engine checks against independent transformer fixtures.
 
+mod common;
+
 use std::{env, error::Error, path::PathBuf, time::Duration};
 
 use forja_host::{EngineDecode, EngineRunner, EngineStep, Limits, SamplingParams};
@@ -44,7 +46,9 @@ async fn hidden_states_and_routing_match_same_byte_reference() -> Result<(), Box
         info.router_layers
             .starts_with(&(1..=FULL_LAYERS).collect::<Vec<_>>())
     );
-    runner.load_with_config(Some(FULL_LAYERS)).await??;
+    runner
+        .load_with_selections(Some(FULL_LAYERS), &load_config()?)
+        .await??;
     let output = runner
         .step(EngineStep {
             tokens,
@@ -140,7 +144,9 @@ async fn decode_outputs(
     component: &std::path::Path,
 ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, Box<dyn Error>> {
     let mut runner = runner(component).await?;
-    runner.load_with_config(Some(REPLAY_LAYERS)).await??;
+    runner
+        .load_with_selections(Some(REPLAY_LAYERS), &load_config()?)
+        .await??;
     let greedy = SamplingParams::default();
     let sampled = SamplingParams {
         temperature: 0.7,
@@ -187,6 +193,10 @@ async fn runner(
         model_root()?.join("Qwen3-Coder-30B-A3B-Instruct-4bit/model.safetensors.index.json"),
     )
     .await?)
+}
+
+fn load_config() -> Result<forja_host::EngineLoadConfig, Box<dyn Error>> {
+    common::load_config(test_guests::qwen3_coder())
 }
 
 fn assert_selected_sets(

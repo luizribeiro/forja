@@ -1,10 +1,14 @@
 //! Qwen3-Coder-30B-A3B-Instruct MLX 4-bit inference engine.
 
+mod variants;
+
+#[cfg(target_family = "wasm")]
+use forja_sdk::Param;
 #[cfg(target_family = "wasm")]
 use forja_sdk::nn::blocks::{ChunkedPrefill, DEFAULT_PREFILL_CHUNK, DecodeSelection, DecodeState};
 use forja_sdk::{
-    DType, Dim, Engine, EngineInfo, EngineLoadConfig, Load, Param, Result, StepInput, StepOutput,
-    Tensor, Weights, bf16, export_engine,
+    DType, Dim, Engine, EngineInfo, EngineLoadConfig, Load, Result, StepInput, StepOutput, Tensor,
+    VariantSelection, Weights, bf16, export_engine,
     kernel::Kernel,
     nn::{
         RmsNorm, RmsNormConfig,
@@ -14,7 +18,6 @@ use forja_sdk::{
         },
         moe_combine_with, moe_router_with,
     },
-    target::metal::{Variant, VariantChoice, VariantRule},
 };
 
 /// Vocabulary size of Qwen3-Coder-30B-A3B-Instruct.
@@ -48,98 +51,11 @@ struct Config;
 
 type SequenceOutput = (Tensor<f32>, Vec<Tensor<f32>>, Vec<Tensor<f32>>);
 
-enum AttentionVariant {
-    Fixed(Variant),
-    Rule(VariantRule),
-}
-
-impl AttentionVariant {
-    fn choice(&self) -> VariantChoice<'_> {
-        match self {
-            Self::Fixed(variant) => variant.into(),
-            Self::Rule(rule) => rule.into(),
-        }
-    }
-}
-
 #[cfg(target_family = "wasm")]
 #[derive(Clone, Copy)]
 struct PrefillVariant<'a> {
     start: u32,
     parameter: Option<&'a Param>,
-}
-
-fn variant(name: &str) -> Result<Variant> {
-    Variant::new(name)
-}
-
-fn quant_variant(rows: u32, bits: u8) -> Result<Variant> {
-    let name = if rows == 1 && bits == Q8_BITS {
-        "quant-matmul.q8-fast-gemv"
-    } else if rows == 1 {
-        "quant-matmul.gemv"
-    } else if rows >= 16 {
-        "quant-matmul.tiled"
-    } else {
-        "quant-matmul.small-m"
-    };
-    variant(name)
-}
-
-fn gathered_variant(operation: &str, routed_rows: u32) -> Result<Variant> {
-    let algorithm = if routed_rows >= 64 {
-        "grouped"
-    } else {
-        "route-gemv"
-    };
-    variant(&format!("{operation}.{algorithm}"))
-}
-
-fn combine_variant(sequence: u32) -> Result<Variant> {
-    variant(if u64::from(sequence) * u64::from(HIDDEN) >= 1 << 20 {
-        "matmul.steel-64x64x16-2x2"
-    } else {
-        "matmul.steel-64x32x32-2x2"
-    })
-}
-
-fn attention_variant(
-    sequence: u32,
-    start: u32,
-    parameter: Option<&Param>,
-) -> Result<AttentionVariant> {
-    if let Some(parameter) = parameter {
-        let arms = if sequence == 1 {
-            vec![
-                (0..=510, variant("sdpa.decomposed")?),
-                (511..=1022, variant("sdpa.vector-single-pass")?),
-                (1023..=MAX_CONTEXT - 1, variant("sdpa.vector-two-pass")?),
-            ]
-        } else if sequence >= 512 {
-            vec![
-                (0..=0, variant("sdpa.steel")?),
-                (1..=MAX_CONTEXT - sequence, variant("sdpa.decomposed")?),
-            ]
-        } else {
-            vec![(0..=MAX_CONTEXT - sequence, variant("sdpa.decomposed")?)]
-        };
-        return Ok(AttentionVariant::Rule(VariantRule::new(parameter, arms)?));
-    }
-    let key_length = start
-        .checked_add(sequence)
-        .ok_or_else(|| forja_sdk::Error::loading("attention cache length overflowed"))?;
-    let name = if sequence == 1 {
-        match key_length {
-            ..512 => "sdpa.decomposed",
-            512..1024 => "sdpa.vector-single-pass",
-            _ => "sdpa.vector-two-pass",
-        }
-    } else if sequence >= 512 && key_length == sequence {
-        "sdpa.steel"
-    } else {
-        "sdpa.decomposed"
-    };
-    Ok(AttentionVariant::Fixed(variant(name)?))
 }
 
 #[derive(Clone, Copy)]
@@ -173,11 +89,11 @@ impl Load<QuantConfig> for QuantLinear {
 }
 
 impl QuantLinear {
-    fn forward(&self, input: &Tensor<f32>) -> Result<Tensor<f32>> {
+    fn forward(&self, variants: &variants::Variants, input: &Tensor<f32>) -> Result<Tensor<f32>> {
         let rows = input.shape().first().copied().ok_or_else(|| {
             forja_sdk::Error::loading("quantized linear input must have rank two")
         })?;
-        let selection = quant_variant(rows, self.bits)?;
+        let selection = variants.quant(rows, self.bits)?;
         input.quant_matmul_with(
             &self.packed,
             &self.scales,
@@ -323,13 +239,14 @@ impl Load<Config> for Attention {
 impl Attention {
     fn project_normalized(
         &self,
+        variants: &variants::Variants,
         input: &Tensor<f32>,
         sequence: u32,
         kernel: &Kernel,
         positions: &Tensor<f32>,
     ) -> Result<(Tensor<f32>, Tensor<f32>, Tensor<f32>)> {
         if sequence == 1 {
-            let qkv = self.qkv_proj.forward(input)?;
+            let qkv = self.qkv_proj.forward(variants, input)?;
             let qk = qk_norm_rope(
                 kernel,
                 &qkv.narrow(1, 0, (QUERY_HEADS + KEY_VALUE_HEADS) * HEAD_DIM)?
@@ -348,8 +265,8 @@ impl Attention {
                 .reshape(&[sequence, KEY_VALUE_HEADS, HEAD_DIM])?,
             ));
         }
-        let query = self.q_proj.forward(input)?;
-        let key = self.k_proj.forward(input)?;
+        let query = self.q_proj.forward(variants, input)?;
+        let key = self.k_proj.forward(variants, input)?;
         Ok((
             qk_norm_rope(
                 kernel,
@@ -363,9 +280,11 @@ impl Attention {
                 self.k_norm.weight(),
                 positions,
             )?,
-            self.v_proj
-                .forward(input)?
-                .reshape(&[sequence, KEY_VALUE_HEADS, HEAD_DIM])?,
+            self.v_proj.forward(variants, input)?.reshape(&[
+                sequence,
+                KEY_VALUE_HEADS,
+                HEAD_DIM,
+            ])?,
         ))
     }
 }
@@ -397,14 +316,19 @@ impl QuantExperts {
         })
     }
 
-    fn forward(&self, input: &Tensor<f32>, indices: &Tensor<u32>) -> Result<Tensor<f32>> {
+    fn forward(
+        &self,
+        variants: &variants::Variants,
+        input: &Tensor<f32>,
+        indices: &Tensor<u32>,
+    ) -> Result<Tensor<f32>> {
         let [rows, routes]: [u32; 2] = indices.shape().try_into().map_err(|_| {
             forja_sdk::Error::loading("gathered quantized indices must have rank two")
         })?;
         let routed_rows = rows
             .checked_mul(routes)
             .ok_or_else(|| forja_sdk::Error::loading("routed row count overflowed"))?;
-        let selection = gathered_variant("gather-quant-matmul", routed_rows)?;
+        let selection = variants.gather_matmul(routed_rows)?;
         input.gather_quant_matmul_with(
             &self.packed,
             &self.scales,
@@ -444,9 +368,9 @@ impl Load<Config> for SparseMoe {
 }
 
 impl SparseMoe {
-    fn route(&self, input: &Tensor<f32>) -> Result<RoutedMoe> {
-        let logits = self.gate.forward(input)?;
-        let top_k = variant("top-k.single-k8")?;
+    fn route(&self, variants: &variants::Variants, input: &Tensor<f32>) -> Result<RoutedMoe> {
+        let logits = self.gate.forward(variants, input)?;
+        let top_k = variants.top_k()?;
         let (weights, indices) = moe_router_with(&logits, TOP_K, true, &top_k)?;
         let rows = input
             .shape()
@@ -456,7 +380,7 @@ impl SparseMoe {
         let routed_rows = rows
             .checked_mul(TOP_K)
             .ok_or_else(|| forja_sdk::Error::loading("routed row count overflowed"))?;
-        let selection = gathered_variant("gather-quant-silu-mul", routed_rows)?;
+        let selection = variants.gather_silu_mul(routed_rows)?;
         let activated = input.gather_quant_silu_mul_with(
             &self.gate_proj.packed,
             &self.gate_proj.scales,
@@ -477,8 +401,12 @@ impl SparseMoe {
         })
     }
 
-    fn forward(&self, input: &Tensor<f32>) -> Result<(Tensor<f32>, Tensor<f32>)> {
-        let routed = self.route(input)?;
+    fn forward(
+        &self,
+        variants: &variants::Variants,
+        input: &Tensor<f32>,
+    ) -> Result<(Tensor<f32>, Tensor<f32>)> {
+        let routed = self.route(variants, input)?;
         let rows = input
             .shape()
             .first()
@@ -488,11 +416,12 @@ impl SparseMoe {
         let output = self
             .down_proj
             .forward(
+                variants,
                 &routed.activated.reshape(&[rows, INTERMEDIATE])?,
                 &routed.indices.reshape(&[rows, 1])?,
             )?
             .reshape(&[rows / TOP_K, TOP_K, HIDDEN])?;
-        let selection = combine_variant(rows / TOP_K)?;
+        let selection = variants.combine(rows / TOP_K)?;
         Ok((
             moe_combine_with(&output, &routed.weights, &selection)?,
             routed.logits,
@@ -501,10 +430,11 @@ impl SparseMoe {
 
     fn forward_decode(
         &self,
+        variants: &variants::Variants,
         input: &Tensor<f32>,
         residual: &Tensor<f32>,
     ) -> Result<(Tensor<f32>, Tensor<f32>)> {
-        let routed = self.route(input)?;
+        let routed = self.route(variants, input)?;
         let output = routed.activated.gather_quant_matmul_combine(
             &self.down_proj.packed,
             &self.down_proj.scales,
@@ -551,7 +481,8 @@ struct LayerPosition<'a> {
     sequence: u32,
     start: &'a Dim,
     end: &'a Dim,
-    attention_variant: &'a AttentionVariant,
+    variants: &'a variants::Variants,
+    attention_variant: &'a VariantSelection,
 }
 
 impl DecoderLayer {
@@ -574,9 +505,11 @@ impl DecoderLayer {
             sequence,
             start,
             end,
+            variants,
             attention_variant,
         } = position;
         let (query, key, value) = self.self_attn.project_normalized(
+            variants,
             normalized_input,
             sequence,
             qk_kernel,
@@ -595,15 +528,16 @@ impl DecoderLayer {
         let (hidden, normalized) = residual_norm(
             residual_kernel,
             input,
-            &self.self_attn.o_proj.forward(&attended)?,
+            &self.self_attn.o_proj.forward(variants, &attended)?,
             self.post_attention_layernorm.weight(),
         )?;
         let (hidden, normalized, router_logits) = if sequence == 1 {
-            let (hidden, router_logits) = self.mlp.forward_decode(&normalized, &hidden)?;
+            let (hidden, router_logits) =
+                self.mlp.forward_decode(variants, &normalized, &hidden)?;
             let normalized = rms_norm(norm_kernel, &hidden, following_norm.weight())?;
             (hidden, normalized, router_logits)
         } else {
-            let (projected, router_logits) = self.mlp.forward(&normalized)?;
+            let (projected, router_logits) = self.mlp.forward(variants, &normalized)?;
             let (hidden, normalized) = residual_norm(
                 residual_kernel,
                 &hidden,
@@ -651,6 +585,7 @@ impl QwenWeights {
 /// Qwen3-Coder-30B-A3B-Instruct with a fixed 4096-token KV cache.
 pub struct Qwen3Coder {
     weights: QwenWeights,
+    variants: variants::Variants,
     caches: Vec<KvCache<f32>>,
     residual_norm: Kernel,
     rms_norm: Kernel,
@@ -663,13 +598,19 @@ pub struct Qwen3Coder {
 }
 
 impl Qwen3Coder {
-    fn load_from_weights(weights: &Weights<'_>, layers: usize) -> Result<Self> {
+    fn load_from_weights(
+        weights: &Weights<'_>,
+        layers: usize,
+        config: &EngineLoadConfig,
+    ) -> Result<Self> {
+        let variants = variants::Variants::new(config)?;
         let weights = QwenWeights::load(weights, layers)?;
         let caches = (0..layers)
             .map(|_| KvCache::new(KEY_VALUE_HEADS, MAX_CONTEXT, HEAD_DIM, 0.0))
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             weights,
+            variants,
             caches,
             residual_norm: residual_norm_kernel(DType::F32, RMS_EPSILON)?,
             rms_norm: rms_norm_kernel(DType::F32, RMS_EPSILON)?,
@@ -698,7 +639,7 @@ impl Qwen3Coder {
         start: &Dim,
         end: &Dim,
         taps_enabled: bool,
-        attention_variant: &AttentionVariant,
+        attention_variant: &VariantSelection,
     ) -> Result<StepOutput> {
         let (logits, taps, router_logits) = self.forward_sequence(
             tokens,
@@ -727,7 +668,7 @@ impl Qwen3Coder {
         start: &Dim,
         end: &Dim,
         taps_enabled: bool,
-        attention_variant: &AttentionVariant,
+        attention_variant: &VariantSelection,
     ) -> Result<SequenceOutput> {
         let activation_positions = self.activation_positions.narrow(0, start, sequence)?;
         let mut hidden = self.weights.embed_tokens.forward(tokens)?;
@@ -751,6 +692,7 @@ impl Qwen3Coder {
                     sequence,
                     start,
                     end,
+                    variants: &self.variants,
                     attention_variant,
                 },
                 LayerResources {
@@ -771,7 +713,7 @@ impl Qwen3Coder {
         if taps.enabled() {
             taps.push(normalized.contiguous()?);
         }
-        let logits = self.weights.lm_head.forward(&normalized)?;
+        let logits = self.weights.lm_head.forward(&self.variants, &normalized)?;
         Ok((logits, taps.finish(), routers))
     }
 
@@ -789,7 +731,9 @@ impl Qwen3Coder {
         end: &Dim,
         selection: PrefillVariant<'_>,
     ) -> Result<Tensor<f32>> {
-        let attention = attention_variant(sequence, selection.start, selection.parameter)?;
+        let attention = self
+            .variants
+            .attention(sequence, selection.start, selection.parameter)?;
         let (logits, _, _) =
             self.forward_sequence(tokens, sequence, start, end, false, &attention)?;
         Self::last_logits(&logits, last)
@@ -817,7 +761,7 @@ impl Engine for Qwen3Coder {
                 "layer count must be between 1 and 48",
             ));
         }
-        Self::load_from_weights(weights, layers)
+        Self::load_from_weights(weights, layers, &config)
     }
 
     fn step(&mut self, input: StepInput) -> Result<StepOutput> {
@@ -859,7 +803,7 @@ impl Engine for Qwen3Coder {
         }
         let start = input.start_pos.into();
         let end = end.into();
-        let attention = attention_variant(sequence, input.start_pos, None)?;
+        let attention = self.variants.attention(sequence, input.start_pos, None)?;
         self.forward(
             &input.tokens,
             sequence,
@@ -901,7 +845,7 @@ impl Engine for Qwen3Coder {
                 } else {
                     let start = input.start_pos.into();
                     let end_dim = end.into();
-                    let attention = attention_variant(sequence, input.start_pos, None)?;
+                    let attention = self.variants.attention(sequence, input.start_pos, None)?;
                     let logits = self
                         .forward(&tokens, sequence, &start, &end_dim, false, &attention)?
                         .logits;
@@ -915,7 +859,7 @@ impl Engine for Qwen3Coder {
                 let token = self.decode.token()?;
                 let start = input.start_pos.into();
                 let end = (input.start_pos + 1).into();
-                let attention = attention_variant(1, input.start_pos, None)?;
+                let attention = self.variants.attention(1, input.start_pos, None)?;
                 let logits = self
                     .forward(&token, 1, &start, &end, false, &attention)?
                     .logits;
@@ -1023,7 +967,7 @@ impl Qwen3Coder {
         let output_tokens = self.decode.output_tokens()?;
         let sampling = self.decode.sampling()?;
         forja_sdk::capture(&[&position], || {
-            let attention = attention_variant(1, start_pos, Some(&position))?;
+            let attention = self.variants.attention(1, start_pos, Some(&position))?;
             let logits = self
                 .forward(&token, 1, &start_dim, &end, false, &attention)?
                 .logits;
@@ -1077,51 +1021,5 @@ mod tests {
         assert_eq!(info.max_context, MAX_CONTEXT);
         assert_eq!(info.tap_layers, (1..=48).collect::<Vec<_>>());
         assert_eq!(info.router_layers, (1..=48).collect::<Vec<_>>());
-    }
-
-    #[test]
-    fn selects_quantized_variants_at_route_boundaries() {
-        assert_eq!(
-            quant_variant(1, Q4_BITS).unwrap().name(),
-            "quant-matmul.gemv"
-        );
-        assert_eq!(
-            quant_variant(1, Q8_BITS).unwrap().name(),
-            "quant-matmul.q8-fast-gemv"
-        );
-        assert_eq!(
-            quant_variant(15, Q4_BITS).unwrap().name(),
-            "quant-matmul.small-m"
-        );
-        assert_eq!(
-            quant_variant(16, Q4_BITS).unwrap().name(),
-            "quant-matmul.tiled"
-        );
-        assert_eq!(
-            gathered_variant("gather-quant-matmul", 63).unwrap().name(),
-            "gather-quant-matmul.route-gemv"
-        );
-        assert_eq!(
-            gathered_variant("gather-quant-matmul", 64).unwrap().name(),
-            "gather-quant-matmul.grouped"
-        );
-    }
-
-    #[test]
-    fn selects_attention_variants_at_cache_boundaries() {
-        let names = [510, 511, 1022, 1023].map(|start| match attention_variant(1, start, None) {
-            Ok(AttentionVariant::Fixed(variant)) => variant.name().to_owned(),
-            Ok(AttentionVariant::Rule(_)) => panic!("expected a concrete variant"),
-            Err(error) => panic!("variant selection failed: {error}"),
-        });
-        assert_eq!(
-            names,
-            [
-                "sdpa.decomposed",
-                "sdpa.vector-single-pass",
-                "sdpa.vector-single-pass",
-                "sdpa.vector-two-pass",
-            ]
-        );
     }
 }
