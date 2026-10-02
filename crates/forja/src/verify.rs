@@ -8,7 +8,7 @@ use golden_fixtures::{
 };
 
 use crate::args::{Backend as BackendArg, Precision, Verify};
-use crate::engine::{argmax, limits};
+use crate::engine::{argmax, limits, validate_engine};
 
 #[cfg(target_os = "macos")]
 use crate::engine::metal_graph_replay;
@@ -86,6 +86,12 @@ pub(crate) async fn run(options: &Verify) -> Result<(), Box<dyn Error>> {
 }
 
 async fn run_with_steps(options: &Verify, decode_steps: usize) -> Result<(), Box<dyn Error>> {
+    validate_engine(
+        &options.engine,
+        &options.model_dir,
+        options.backend,
+        &options.scratch,
+    )?;
     let fixtures = FixtureDirectory::open(&options.fixtures)?;
     fixtures.require_complete_model_outputs()?;
     let weights = verify_model_hash(options, &fixtures)?;
@@ -741,6 +747,7 @@ mod tests {
             prompts: Vec::new(),
             graph_replay: forja_config::GraphReplay::Tier2,
             limits,
+            scratch: root.join("scratch"),
         };
         tokio::runtime::Builder::new_current_thread()
             .build()?
@@ -765,6 +772,7 @@ mod tests {
             prompts: Vec::new(),
             graph_replay: forja_config::GraphReplay::Tier2,
             limits,
+            scratch: root.join("scratch"),
         };
         tokio::runtime::Builder::new_current_thread()
             .build()?
@@ -837,6 +845,7 @@ mod tests {
             prompts: Vec::new(),
             graph_replay: forja_config::GraphReplay::Tier2,
             limits: forja_config::Limits::default(),
+            scratch: root.join("scratch"),
         };
         let fixtures = FixtureDirectory::open(fixtures_path)?;
         let actual = sha256_file(options.model_dir.join("model.safetensors"))?;
@@ -880,6 +889,7 @@ mod tests {
             prompts,
             graph_replay: forja_config::GraphReplay::Tier2,
             limits: forja_config::Limits::default(),
+            scratch: root.join("scratch"),
         })
     }
 

@@ -1,11 +1,221 @@
 use std::{
     error::Error,
+    fs,
     num::TryFromIntError,
+    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     time::Duration,
 };
 
-use forja_config::{GraphReplay, Limits as ConfigLimits, Unbounded};
+use forja_config::{
+    ComponentTarget, DeviceFamily, GraphReplay, Limits as ConfigLimits, Profile, ProfileBackend,
+    Target, Unbounded, sharded_weights_sha256, single_weights_sha256,
+};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+use crate::{args::Backend, resolution::read_embedded_profile};
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct WeightFileIdentity {
+    canonical_path: PathBuf,
+    size: u64,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+    inode: u64,
+}
+
+#[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct WeightHashCache {
+    index_sha256: Option<String>,
+    files: Vec<WeightFileIdentity>,
+    weights_sha256: String,
+}
+
+#[derive(Clone, Copy)]
+struct TargetIdentity<'a> {
+    component: &'a str,
+    backend: &'a str,
+    device_family: Option<&'a str>,
+}
+
+pub(crate) fn validate_engine(
+    component: &Path,
+    model_dir: &Path,
+    backend: Backend,
+    scratch: &Path,
+) -> Result<(Profile, PathBuf), Box<dyn Error>> {
+    let profile = read_embedded_profile(component)?;
+    let weights = weights_path(model_dir)?;
+    let (weights_hash, _) = strong_weights_sha256(&weights, scratch)?;
+    let backend = match backend {
+        Backend::Metal => "metal",
+        Backend::Cpu => "cpu",
+    };
+    let device = if backend == "metal" {
+        #[cfg(target_os = "macos")]
+        {
+            let name = forja_metal::device_name()?;
+            Some(device_family(&name)?)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            None
+        }
+    } else {
+        None
+    };
+    validate_identity(
+        &profile,
+        &weights_hash,
+        TargetIdentity {
+            component: "wasm32-wasip2",
+            backend,
+            device_family: device,
+        },
+    )?;
+    Ok((profile, weights))
+}
+
+fn validate_identity(
+    profile: &Profile,
+    weights_hash: &str,
+    host: TargetIdentity<'_>,
+) -> Result<(), String> {
+    if profile.model().weights_sha256 != weights_hash {
+        return Err(format!(
+            "model weights hash mismatch: profile requires {}, found {weights_hash}",
+            profile.model().weights_sha256
+        ));
+    }
+    let required = target_identity(profile.target());
+    if host.component != required.component {
+        return Err(format!(
+            "component target mismatch: profile requires {}, found {}",
+            required.component, host.component
+        ));
+    }
+    if host.backend != required.backend {
+        return Err(format!(
+            "backend mismatch: profile requires {}, found {}",
+            required.backend, host.backend
+        ));
+    }
+    if host.device_family != required.device_family {
+        return Err(format!(
+            "device family mismatch: profile requires {}, found {}",
+            required.device_family.unwrap_or("unavailable"),
+            host.device_family.unwrap_or("unavailable")
+        ));
+    }
+    Ok(())
+}
+
+const fn target_identity(target: &Target) -> TargetIdentity<'static> {
+    TargetIdentity {
+        component: match target.component {
+            ComponentTarget::Wasm32Wasip2 => "wasm32-wasip2",
+        },
+        backend: match target.backend {
+            ProfileBackend::Metal => "metal",
+            ProfileBackend::Cpu => "cpu",
+        },
+        device_family: Some(match target.device_family {
+            DeviceFamily::AppleM3Ultra => "apple-m3-ultra",
+        }),
+    }
+}
+
+fn device_family(name: &str) -> Result<&'static str, String> {
+    if name == "Apple M3 Ultra" {
+        Ok("apple-m3-ultra")
+    } else {
+        Err(format!("unsupported Metal device family: {name}"))
+    }
+}
+
+fn strong_weights_sha256(weights: &Path, scratch: &Path) -> Result<(String, bool), Box<dyn Error>> {
+    let sources = forja_host::Safetensors::open_all(weights)?;
+    let index_sha256 = if sources.iter().any(|source| source.shard_name().is_some()) {
+        let length = weights.metadata()?.len();
+        Some(single_weights_sha256(weights, length)?)
+    } else {
+        None
+    };
+    let before = sources
+        .iter()
+        .map(weight_file_identity)
+        .collect::<Result<Vec<_>, _>>()?;
+    let cache_path = weight_cache_path(scratch, weights);
+    if let Ok(bytes) = fs::read(&cache_path)
+        && let Ok(cache) = serde_json::from_slice::<WeightHashCache>(&bytes)
+        && cache.index_sha256 == index_sha256
+        && cache.files == before
+    {
+        // Scratch is trusted local user state; model directories and component profiles are not.
+        return Ok((cache.weights_sha256, true));
+    }
+    let weights_sha256 = if sources.len() == 1 && sources[0].shard_name().is_none() {
+        single_weights_sha256(sources[0].path(), sources[0].file_len())?
+    } else {
+        let shards = sources
+            .iter()
+            .map(|source| {
+                Ok((
+                    source
+                        .shard_name()
+                        .ok_or("indexed weight has no shard name")?,
+                    source.path(),
+                    source.file_len(),
+                ))
+            })
+            .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+        sharded_weights_sha256(&shards)?
+    };
+    let after = sources
+        .iter()
+        .map(weight_file_identity)
+        .collect::<Result<Vec<_>, _>>()?;
+    if after != before {
+        return Err("model weights changed while hashing".into());
+    }
+    let cache = WeightHashCache {
+        index_sha256,
+        files: after,
+        weights_sha256: weights_sha256.clone(),
+    };
+    let parent = cache_path.parent().ok_or("weights cache has no parent")?;
+    fs::create_dir_all(parent)?;
+    let mut bytes = serde_json::to_vec(&cache)?;
+    bytes.push(b'\n');
+    fs::write(cache_path, bytes)?;
+    Ok((weights_sha256, false))
+}
+
+fn weight_file_identity(
+    source: &forja_host::Safetensors,
+) -> Result<WeightFileIdentity, Box<dyn Error>> {
+    let path = fs::canonicalize(source.path())?;
+    let metadata = path.symlink_metadata()?;
+    if !metadata.is_file() || metadata.len() != source.file_len() {
+        return Err(format!("weight source changed after validation: {}", path.display()).into());
+    }
+    Ok(WeightFileIdentity {
+        canonical_path: path,
+        size: metadata.len(),
+        modified_seconds: metadata.mtime(),
+        modified_nanoseconds: metadata.mtime_nsec(),
+        inode: metadata.ino(),
+    })
+}
+
+fn weight_cache_path(scratch: &Path, weights: &Path) -> PathBuf {
+    let name = format!(
+        "{:x}.json",
+        Sha256::digest(weights.as_os_str().as_encoded_bytes())
+    );
+    scratch.join("weights-sha256").join(name)
+}
 
 struct HostLimits(forja_host::Limits);
 
@@ -127,6 +337,147 @@ pub(crate) const fn metal_graph_replay(value: GraphReplay) -> forja_metal::Metal
 mod tests {
     use super::*;
     use std::{fs, time::SystemTime, time::UNIX_EPOCH};
+
+    fn profile() -> Profile {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../engines/qwen3/profiles/qwen3-0.6b.metal-apple-m3-ultra.bf16.toml");
+        toml::from_str(&fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    fn host_target(
+        backend: &'static str,
+        device_family: Option<&'static str>,
+    ) -> TargetIdentity<'static> {
+        TargetIdentity {
+            component: "wasm32-wasip2",
+            backend,
+            device_family,
+        }
+    }
+
+    #[test]
+    fn rejects_every_engine_identity_mismatch() {
+        let profile = profile();
+        let weights = &profile.model().weights_sha256;
+        assert!(
+            validate_identity(
+                &profile,
+                "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+                host_target("metal", Some("apple-m3-ultra")),
+            )
+            .unwrap_err()
+            .contains("weights hash mismatch")
+        );
+        assert!(
+            validate_identity(
+                &profile,
+                weights,
+                TargetIdentity {
+                    component: "wasm32-unknown-unknown",
+                    ..host_target("metal", Some("apple-m3-ultra"))
+                },
+            )
+            .unwrap_err()
+            .contains("component target mismatch")
+        );
+        assert!(
+            validate_identity(
+                &profile,
+                weights,
+                host_target("cpu", Some("apple-m3-ultra")),
+            )
+            .unwrap_err()
+            .contains("backend mismatch")
+        );
+        assert!(
+            validate_identity(&profile, weights, host_target("metal", Some("apple-m4")),)
+                .unwrap_err()
+                .contains("device family mismatch")
+        );
+    }
+
+    #[test]
+    fn identity_requirements_come_from_the_profile_target() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../engines/qwen3/profiles/qwen3-0.6b.metal-apple-m3-ultra.bf16.toml");
+        let source = fs::read_to_string(path)
+            .unwrap()
+            .replace("backend = \"metal\"", "backend = \"cpu\"");
+        let profile: Profile = toml::from_str(&source).unwrap();
+        let error = validate_identity(
+            &profile,
+            &profile.model().weights_sha256,
+            host_target("metal", Some("apple-m3-ultra")),
+        )
+        .unwrap_err();
+        assert!(error.contains("requires cpu, found metal"), "{error}");
+    }
+
+    #[test]
+    fn metal_device_names_match_exactly() {
+        assert_eq!(device_family("Apple M3 Ultra").unwrap(), "apple-m3-ultra");
+        assert!(device_family("Apple M3 Ultra (80 cores)").is_err());
+    }
+
+    fn safetensors(data: &[u8]) -> Vec<u8> {
+        let mut header = format!(
+            r#"{{"weight":{{"dtype":"U32","shape":[{}],"data_offsets":[0,{}]}}}}"#,
+            data.len() / 4,
+            data.len()
+        )
+        .into_bytes();
+        while !(header.len() + 8).is_multiple_of(8) {
+            header.push(b' ');
+        }
+        let mut bytes = u64::try_from(header.len()).unwrap().to_le_bytes().to_vec();
+        bytes.extend(header);
+        bytes.extend(data);
+        bytes
+    }
+
+    #[test]
+    fn caches_weight_hashes_and_misses_after_metadata_changes() -> Result<(), Box<dyn Error>> {
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let root = std::env::temp_dir().join(format!("forja-weight-cache-{nonce}"));
+        let scratch = root.join("scratch");
+        fs::create_dir(&root)?;
+        let weights = root.join("model.safetensors");
+        fs::write(&weights, safetensors(&[0; 4]))?;
+
+        let (first, first_hit) = strong_weights_sha256(&weights, &scratch)?;
+        let (second, second_hit) = strong_weights_sha256(&weights, &scratch)?;
+        assert!(!first_hit);
+        assert!(second_hit);
+        assert_eq!(first, second);
+
+        fs::write(&weights, safetensors(&[0; 8]))?;
+        let (third, third_hit) = strong_weights_sha256(&weights, &scratch)?;
+        assert!(!third_hit);
+        assert_ne!(first, third);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn index_content_participates_in_the_weight_cache_key() -> Result<(), Box<dyn Error>> {
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let root = std::env::temp_dir().join(format!("forja-index-cache-{nonce}"));
+        let scratch = root.join("scratch");
+        fs::create_dir(&root)?;
+        fs::write(root.join("shard.safetensors"), safetensors(&[0; 4]))?;
+        let index = root.join("model.safetensors.index.json");
+        fs::write(&index, r#"{"weight_map":{"weight":"shard.safetensors"}}"#)?;
+
+        assert!(!strong_weights_sha256(&index, &scratch)?.1);
+        assert!(strong_weights_sha256(&index, &scratch)?.1);
+        fs::write(
+            &index,
+            r#"{ "weight_map": { "weight": "shard.safetensors" } }"#,
+        )?;
+        assert!(!strong_weights_sha256(&index, &scratch)?.1);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
 
     #[test]
     fn argmax_rejects_empty_values() {

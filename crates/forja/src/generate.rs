@@ -13,13 +13,19 @@ use tokenizers::Tokenizer;
 
 use crate::{
     args::{Backend as BackendArg, Run},
-    engine::{limits, read_token, weights_path},
+    engine::{limits, read_token, validate_engine, weights_path},
 };
 
 #[cfg(target_os = "macos")]
 use crate::engine::metal_graph_replay;
 
 pub(crate) async fn run(options: &Run) -> Result<(), Box<dyn Error>> {
+    validate_engine(
+        &options.engine,
+        &options.model_dir,
+        options.backend,
+        &options.scratch,
+    )?;
     let stdout = std::io::stdout();
     let mut output = stdout.lock();
     match options.backend {
@@ -350,6 +356,7 @@ mod tests {
             backend: BackendArg::Metal,
             graph_replay: forja_config::GraphReplay::Tier2,
             limits: forja_config::Limits::default(),
+            scratch: root.join("scratch"),
         };
         let expected = FixtureDirectory::open(root.join("golden/qwen3-0.6b"))?
             .prompt("short-english")
@@ -391,6 +398,7 @@ mod tests {
                 live_bytes: forja_config::ByteSize::new(64 * 1024 * 1024 * 1024),
                 ..forja_config::Limits::default()
             },
+            scratch: root.join("scratch"),
         };
         let mut output = Vec::new();
         let report = tokio::runtime::Builder::new_current_thread()

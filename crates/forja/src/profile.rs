@@ -5,6 +5,7 @@ use forja_core::{Backend, CommandList, DType, DispatchProfile, Op, ProfileTensor
 use crate::{
     args::{Profile, ProfileMode},
     benchmark::{TokenProfile, measure_token_profile},
+    engine::validate_engine,
     machine_load,
 };
 
@@ -26,6 +27,12 @@ pub(crate) async fn run(options: &Profile) -> Result<(), Box<dyn Error>> {
     }
     #[cfg(target_os = "macos")]
     {
+        validate_engine(
+            &options.engine,
+            &options.model_dir,
+            crate::args::Backend::Metal,
+            &options.scratch,
+        )?;
         let load_before = machine_load::capture("BEFORE PROFILE")?;
         let peak = measure_copy_peak()?;
         let measurement = measure_token_profile(options).await?;

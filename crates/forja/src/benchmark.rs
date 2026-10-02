@@ -20,7 +20,7 @@ use crate::{
     args::{Bench, BenchPoint, Profile, ProfileMode},
     benchmark_record::{self, Input, PerfKey, Recorded},
     benchmark_stats::{Stats, stats, synthetic_tokens},
-    engine::{argmax, limits, read_token, weights_path},
+    engine::{argmax, limits, read_token, validate_engine, weights_path},
     machine_load,
 };
 
@@ -82,6 +82,14 @@ struct DispatchProfile {
 }
 
 pub(crate) async fn run(options: &Bench) -> Result<(), Box<dyn Error>> {
+    for engine in &options.engines {
+        validate_engine(
+            engine,
+            &options.model_dir,
+            crate::args::Backend::Metal,
+            &options.config.paths.scratch,
+        )?;
+    }
     #[cfg(target_os = "macos")]
     return run_metal(options).await;
     #[cfg(not(target_os = "macos"))]

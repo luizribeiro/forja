@@ -72,6 +72,28 @@ mod platform {
 
         Ok((name, supports_metal4))
     }
+
+    pub(super) fn device_name() -> Result<String, String> {
+        MTLCreateSystemDefaultDevice()
+            .map(|device| device.name().to_string())
+            .ok_or_else(|| "Metal has no system default device".to_owned())
+    }
+}
+
+/// Returns the system default Metal device name without submitting GPU work.
+///
+/// # Errors
+///
+/// Returns an error when Metal has no system default device or on non-macOS hosts.
+pub fn device_name() -> Result<String, String> {
+    #[cfg(target_os = "macos")]
+    {
+        platform::device_name()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err("Metal is available only on macOS".to_owned())
+    }
 }
 
 /// Submits an empty Metal 4 command buffer and returns the device name and Metal 4 support.

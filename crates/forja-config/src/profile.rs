@@ -161,6 +161,8 @@ pub enum ProfileBackend {
     /// Metal GPU backend.
     #[default]
     Metal,
+    /// Portable CPU backend.
+    Cpu,
 }
 
 /// Supported device family.

@@ -93,6 +93,8 @@ pub trait WeightSource {
 #[derive(Debug)]
 pub struct Safetensors {
     path: PathBuf,
+    shard_name: Option<String>,
+    file_len: u64,
     data_start: u64,
     tensors: Vec<WeightTensor>,
 }
@@ -142,7 +144,7 @@ impl Safetensors {
                         "shard {file:?} resolves outside its model directory"
                     )));
                 }
-                let source = Self::open(shard)?;
+                let mut source = Self::open(shard)?;
                 let actual = source
                     .tensors()
                     .iter()
@@ -153,6 +155,7 @@ impl Safetensors {
                         "shard {file:?} does not match its weight map"
                     )));
                 }
+                source.shard_name = Some(file);
                 Ok(source)
             })
             .collect()
@@ -165,6 +168,9 @@ impl Safetensors {
     /// Returns an error for malformed metadata, unsupported scalar types, or invalid byte ranges.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, WeightError> {
         let path = path.as_ref();
+        if !path.symlink_metadata().map_err(WeightError::Io)?.is_file() {
+            return Err(WeightError::NotRegularFile(path.to_owned()));
+        }
         let mut file = File::open(path).map_err(WeightError::Io)?;
         let file_len = file.metadata().map_err(WeightError::Io)?.len();
         let header_len = read_header_len(&mut file)?;
@@ -205,9 +211,29 @@ impl Safetensors {
         }
         Ok(Self {
             path: path.to_owned(),
+            shard_name: None,
+            file_len,
             data_start,
             tensors,
         })
+    }
+
+    /// Returns the validated canonical source path.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Returns the shard name declared by the index, or `None` for an unsharded file.
+    #[must_use]
+    pub fn shard_name(&self) -> Option<&str> {
+        self.shard_name.as_deref()
+    }
+
+    /// Returns the file length observed while validating the safetensors header.
+    #[must_use]
+    pub const fn file_len(&self) -> u64 {
+        self.file_len
     }
 }
 
@@ -305,6 +331,8 @@ impl WeightSource for Safetensors {
 pub enum WeightError {
     /// The file could not be read.
     Io(std::io::Error),
+    /// The source path does not identify a regular file.
+    NotRegularFile(PathBuf),
     /// The validated file could not be mapped.
     Mapping(std::io::Error),
     /// The file ended before its declared metadata or tensor data.
@@ -327,6 +355,9 @@ impl fmt::Display for WeightError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io(error) => write!(f, "weight file I/O failed: {error}"),
+            Self::NotRegularFile(path) => {
+                write!(f, "weight source is not a regular file: {}", path.display())
+            }
             Self::Mapping(error) => error.fmt(f),
             Self::Truncated => f.write_str("weight file is truncated"),
             Self::InvalidHeader(error) => write!(f, "invalid safetensors header: {error}"),
@@ -772,5 +803,24 @@ mod tests {
         assert!(matches!(error, WeightError::InvalidIndex(_)));
         fs::remove_dir_all(directory).unwrap();
         fs::remove_file(outside).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_fifo_shards_without_opening_them() {
+        use std::process::Command;
+
+        let directory = index_directory();
+        let fifo = directory.join("shard.safetensors");
+        assert!(
+            Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let error = invalid_index(&directory, r#"{"weight_map":{"a":"shard.safetensors"}}"#);
+        assert!(matches!(error, WeightError::NotRegularFile(_)));
+        fs::remove_dir_all(directory).unwrap();
     }
 }

@@ -36,6 +36,7 @@ pub(crate) struct Verify {
     pub(crate) prompts: Vec<String>,
     pub(crate) graph_replay: GraphReplay,
     pub(crate) limits: Limits,
+    pub(crate) scratch: PathBuf,
 }
 
 #[derive(Args)]
@@ -76,6 +77,7 @@ pub(crate) struct Run {
     pub(crate) backend: Backend,
     pub(crate) graph_replay: GraphReplay,
     pub(crate) limits: Limits,
+    pub(crate) scratch: PathBuf,
 }
 
 #[derive(Args)]
@@ -1007,6 +1009,7 @@ impl RunArgs {
             backend: config.backend.kind.into(),
             graph_replay: config.backend.metal.resolve().graph_replay,
             limits,
+            scratch: config.paths.scratch.clone(),
         })
     }
 }
@@ -1065,6 +1068,7 @@ impl VerifyArgs {
                 .collect(),
             graph_replay: config.backend.metal.resolve().graph_replay,
             limits,
+            scratch: config.paths.scratch.clone(),
         })
     }
 }
@@ -1596,6 +1600,7 @@ selection = ["host-argmax"]
                 backend: Backend::Cpu,
                 graph_replay: GraphReplay::Tier2,
                 limits: Limits::default(),
+                scratch: PathBuf::from("target/forja-bench"),
             })
         );
     }
@@ -1783,6 +1788,7 @@ selection = ["host-argmax"]
                 prompts: vec!["one".to_owned(), "two".to_owned()],
                 graph_replay: GraphReplay::Tier2,
                 limits: Limits::default(),
+                scratch: PathBuf::from("target/forja-bench"),
             })
         );
     }
@@ -1817,6 +1823,7 @@ selection = ["host-argmax"]
                 prompts: vec!["one".to_owned(), "two".to_owned(), "three".to_owned()],
                 graph_replay: GraphReplay::Tier2,
                 limits: Limits::default(),
+                scratch: PathBuf::from("target/forja-bench"),
             })
         );
     }
