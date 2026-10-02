@@ -344,6 +344,65 @@ pub(crate) fn record_many(
     })
 }
 
+#[expect(dead_code)]
+pub(crate) fn record_variant(
+    operation: sys::Op,
+    inputs: &[&sys::Handle],
+    output: &sys::Handle,
+    selection: crate::target::metal::VariantChoice<'_>,
+) -> Result<()> {
+    record_variant_many(operation, inputs, &[output], selection)
+}
+
+#[expect(dead_code)]
+pub(crate) fn record_variant_many(
+    operation: sys::Op,
+    inputs: &[&sys::Handle],
+    outputs: &[&sys::Handle],
+    selection: crate::target::metal::VariantChoice<'_>,
+) -> Result<()> {
+    CURRENT.with(|current| {
+        let mut current = current.borrow_mut();
+        if current.is_none() {
+            if matches!(selection, crate::target::metal::VariantChoice::Rule(_)) {
+                return Err(crate::Error::new(
+                    "Metal variant rules can only be used during capture",
+                ));
+            }
+            *current = Some(Recording::Lazy(sys::command_list()?));
+        }
+        match (current.as_mut(), selection) {
+            (
+                Some(Recording::Lazy(commands) | Recording::Capture { commands, .. }),
+                crate::target::metal::VariantChoice::Variant(variant),
+            ) => sys::dispatch_variant(commands, operation, inputs, outputs, variant.name()),
+            (
+                Some(Recording::Capture {
+                    commands,
+                    params,
+                    ids,
+                }),
+                crate::target::metal::VariantChoice::Rule(rule),
+            ) => {
+                let parameter = ids
+                    .iter()
+                    .position(|candidate| *candidate == rule.parameter_id)
+                    .and_then(|slot| u8::try_from(slot).ok())
+                    .ok_or_else(|| {
+                        crate::Error::new("variant rule parameter is not part of this capture")
+                    })?;
+                sys::dispatch_variant_rule(
+                    commands, params, parameter, &rule.arms, operation, inputs, outputs,
+                )
+            }
+            (Some(Recording::Lazy(_)), crate::target::metal::VariantChoice::Rule(_)) => Err(
+                crate::Error::new("Metal variant rules can only be used during capture"),
+            ),
+            (None, _) => Err(crate::Error::new("current graph was not initialized")),
+        }
+    })
+}
+
 pub(crate) fn record_program(
     program: sys::Program,
     rank: u8,
