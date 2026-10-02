@@ -244,6 +244,13 @@ async fn run_metal(options: &Bench) -> Result<(), Box<dyn Error>> {
     let (results, device) = measure_points(options, &perf_hashes).await?;
     let load_after = machine_load::capture("AFTER BENCHMARK")?;
     check_strategy_outputs(&options.strategy_axes, &results)?;
+    if options
+        .axes
+        .get(&KeyPath::new("engine.tunings"))
+        .is_some_and(|values| values.len() > 1)
+    {
+        print_tuning_contributions(&results)?;
+    }
     if let Some(record) = &options.rerun {
         print_result_diff(record, &results)?;
     }
@@ -535,6 +542,82 @@ fn print_result_diff(record: &Recorded, current: &[serde_json::Value]) -> Result
         }
     }
     Ok(())
+}
+
+fn print_tuning_contributions(results: &[serde_json::Value]) -> Result<(), String> {
+    let mut baselines = BTreeMap::<(u64, String), &serde_json::Value>::new();
+    println!("tuning\tinput\tselection\tmetric\tcontribution (95% CI)");
+    for result in results {
+        let input = result["input"]
+            .as_u64()
+            .ok_or_else(|| "benchmark result input is invalid".to_owned())?;
+        let selection = result["selection"]
+            .as_str()
+            .ok_or_else(|| "benchmark result selection is invalid".to_owned())?;
+        let key = (input, selection.to_owned());
+        let Some(baseline) = baselines.get(&key) else {
+            baselines.insert(key, result);
+            continue;
+        };
+        let (name, base_is_tuned) = tuning_difference(baseline, result)?;
+        for metric in ["pp", "tg"] {
+            let base = wall_stats(baseline, metric)?;
+            let candidate = wall_stats(result, metric)?;
+            let (with, without) = if base_is_tuned {
+                (base, candidate)
+            } else {
+                (candidate, base)
+            };
+            let median = ratio_percent(with.0, without.0);
+            let low = ratio_percent(with.1, without.2);
+            let high = ratio_percent(with.2, without.1);
+            println!(
+                "{name}\t{input}\t{selection}\t{metric}\t{median:+.2}% ({low:+.2}%–{high:+.2}%)"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn tuning_difference(
+    baseline: &serde_json::Value,
+    candidate: &serde_json::Value,
+) -> Result<(String, bool), String> {
+    let baseline = tuning_names(baseline)?;
+    let candidate = tuning_names(candidate)?;
+    let removed = baseline
+        .iter()
+        .filter(|name| !candidate.contains(name))
+        .cloned()
+        .collect::<Vec<_>>();
+    let added = candidate
+        .iter()
+        .filter(|name| !baseline.contains(name))
+        .cloned()
+        .collect::<Vec<_>>();
+    match (removed.as_slice(), added.as_slice()) {
+        ([name], []) => Ok((name.clone(), true)),
+        ([], [name]) => Ok((name.clone(), false)),
+        _ => Err("tuning comparison points must differ by exactly one tuning".to_owned()),
+    }
+}
+
+fn tuning_names(result: &serde_json::Value) -> Result<Vec<String>, String> {
+    result["point"]["engine.tunings"]
+        .as_array()
+        .ok_or_else(|| "tuning comparison point is not an array".to_owned())?
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| "tuning comparison name is not a string".to_owned())
+        })
+        .collect()
+}
+
+fn ratio_percent(numerator: f64, denominator: f64) -> f64 {
+    (numerator / denominator - 1.0) * 100.0
 }
 
 fn wall_stats(result: &serde_json::Value, metric: &str) -> Result<(f64, f64, f64), String> {
@@ -2017,6 +2100,27 @@ mod tests {
             "pp": {"tokens_per_second": {"wall": {"median": 10.0, "ci95": [9.0, 11.0]}}}
         });
         assert_eq!(wall_stats(&result, "pp").unwrap(), (10.0, 9.0, 11.0));
+    }
+
+    #[test]
+    fn identifies_leave_one_out_and_from_default_tuning_changes() {
+        let defaults = serde_json::json!({
+            "point": {"engine.tunings": ["one", "two"]}
+        });
+        let without = serde_json::json!({
+            "point": {"engine.tunings": ["one"]}
+        });
+        assert_eq!(
+            tuning_difference(&defaults, &without).unwrap(),
+            ("two".to_owned(), true)
+        );
+
+        let empty = serde_json::json!({"point": {"engine.tunings": []}});
+        assert_eq!(
+            tuning_difference(&empty, &without).unwrap(),
+            ("one".to_owned(), false)
+        );
+        assert!((ratio_percent(110.0, 100.0) - 10.0).abs() < 1.0e-12);
     }
 
     #[test]

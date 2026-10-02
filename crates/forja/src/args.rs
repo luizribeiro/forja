@@ -218,12 +218,30 @@ struct BenchArgs {
     /// Vary one configuration key over a comma list or TOML array.
     #[arg(long = "vary", value_parser = parse_vary)]
     vary: Vec<VaryArg>,
+    #[command(flatten)]
+    tuning: TuningBenchArgs,
     /// Re-run a schema-v2 benchmark record.
     #[arg(long)]
     rerun: Option<PathBuf>,
     /// Permit one performance-key difference while re-running.
     #[arg(long = "allow-diff", value_parser = parse_key_path)]
     allow_diff: Vec<KeyPath>,
+}
+
+#[derive(Args)]
+struct TuningBenchArgs {
+    /// Compare the profile tuning set with each leave-one-out set.
+    #[arg(long, conflicts_with_all = ["without_tuning", "only"])]
+    compare_tunings: bool,
+    /// Compare each tuning alone with the empty tuning set.
+    #[arg(long, requires = "compare_tunings")]
+    from_default: bool,
+    /// Benchmark the profile set without these tunings.
+    #[arg(long, value_delimiter = ',', value_parser = parse_tuning_name, conflicts_with_all = ["compare_tunings", "only"])]
+    without_tuning: Vec<String>,
+    /// Benchmark exactly these tunings.
+    #[arg(long, value_delimiter = ',', value_parser = parse_tuning_name, conflicts_with_all = ["compare_tunings", "without_tuning"])]
+    only: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -607,7 +625,8 @@ impl ParsedCommand {
                         .then(|| ("--host-argmax", "[\"host-argmax\"]".to_owned())),
                 );
                 values.extend(graph_replay_sugar(options.graph_replay));
-                for vary in &options.vary {
+                let tuning = options.tuning_axis()?;
+                for vary in tuning.iter().chain(&options.vary) {
                     let mut vary_table = toml::Table::new();
                     vary_table.insert(
                         vary.key.as_str().to_owned(),
@@ -723,6 +742,81 @@ fn sugar_layer(flag: &'static str, value: &str) -> Result<(Layer, KeyPath), clap
 }
 
 impl BenchArgs {
+    fn tuning_axis(&self) -> Result<Option<VaryArg>, clap::Error> {
+        let tuning = &self.tuning;
+        let requested =
+            tuning.compare_tunings || !tuning.without_tuning.is_empty() || !tuning.only.is_empty();
+        if !requested {
+            return Ok(None);
+        }
+        if self
+            .vary
+            .iter()
+            .any(|vary| vary.key.as_str() == "engine.tunings")
+        {
+            return Err(Cli::command().error(
+                clap::error::ErrorKind::ArgumentConflict,
+                "engine.tunings is selected by both tuning sugar and --vary",
+            ));
+        }
+        let [engine] = self.engines.as_slice() else {
+            return Err(Cli::command().error(
+                clap::error::ErrorKind::ArgumentConflict,
+                "tuning selection sugar requires exactly one engine",
+            ));
+        };
+        let engine = crate::resolution::engine(engine);
+        let profile = crate::resolution::read_embedded_profile(&engine).map_err(|error| {
+            Cli::command().error(clap::error::ErrorKind::ValueValidation, error)
+        })?;
+        let defaults = profile.default_tunings();
+        let sets = if tuning.compare_tunings && tuning.from_default {
+            std::iter::once(Vec::new())
+                .chain(defaults.iter().cloned().map(|name| vec![name]))
+                .collect()
+        } else if tuning.compare_tunings {
+            std::iter::once(defaults.to_vec())
+                .chain((0..defaults.len()).map(|removed| {
+                    defaults
+                        .iter()
+                        .enumerate()
+                        .filter(|(index, _)| *index != removed)
+                        .map(|(_, name)| name.clone())
+                        .collect()
+                }))
+                .collect()
+        } else if !tuning.without_tuning.is_empty() {
+            validate_tuning_list(&tuning.without_tuning)?;
+            for name in &tuning.without_tuning {
+                if !defaults.contains(name) {
+                    return Err(Cli::command().error(
+                        clap::error::ErrorKind::ValueValidation,
+                        format!("profile does not select tuning {name:?}"),
+                    ));
+                }
+            }
+            vec![
+                defaults
+                    .iter()
+                    .filter(|name| !tuning.without_tuning.contains(name))
+                    .cloned()
+                    .collect(),
+            ]
+        } else {
+            validate_tuning_list(&tuning.only)?;
+            vec![tuning.only.clone()]
+        };
+        Ok(Some(VaryArg {
+            key: KeyPath::new("engine.tunings"),
+            values: sets
+                .into_iter()
+                .map(|names: Vec<String>| {
+                    toml::Value::Array(names.into_iter().map(toml::Value::String).collect())
+                })
+                .collect(),
+        }))
+    }
+
     fn with_config(
         self,
         layered: &Layered<DevConfig>,
@@ -1080,6 +1174,26 @@ fn parse_prompt_name(value: &str) -> Result<String, String> {
         Err("prompt name cannot be empty".to_owned())
     } else {
         Ok(value.to_owned())
+    }
+}
+
+fn parse_tuning_name(value: &str) -> Result<String, String> {
+    if value.is_empty() {
+        Err("tuning name cannot be empty".to_owned())
+    } else {
+        Ok(value.to_owned())
+    }
+}
+
+fn validate_tuning_list(names: &[String]) -> Result<(), clap::Error> {
+    let unique = names.iter().collect::<std::collections::BTreeSet<_>>();
+    if unique.len() == names.len() {
+        Ok(())
+    } else {
+        Err(Cli::command().error(
+            clap::error::ErrorKind::ValueValidation,
+            "tuning names must be unique",
+        ))
     }
 }
 
@@ -1566,6 +1680,102 @@ mod tests {
         assert!(options.points[0].config.engine.replay);
         assert!(!options.points[1].config.engine.replay);
         assert_eq!(options.strategy_axes, [KeyPath::new("engine.replay")]);
+    }
+
+    #[test]
+    fn generates_profile_tuning_comparison_axes() {
+        let engine = test_guests::qwen3().display().to_string();
+        let command = parse(
+            [
+                "bench",
+                "--engine",
+                &engine,
+                "--model",
+                "/model",
+                "--compare-tunings",
+            ]
+            .map(str::to_owned),
+        )
+        .unwrap();
+        let Command::Bench(options) = command else {
+            panic!("expected bench command");
+        };
+        assert_eq!(options.points.len(), 5);
+        assert_eq!(options.points[0].config.engine.tunings.add.len(), 4);
+        assert!(
+            options
+                .points
+                .iter()
+                .skip(1)
+                .all(|point| point.config.engine.tunings.add.len() == 3)
+        );
+
+        let Command::Bench(options) = parse(
+            [
+                "bench",
+                "--engine",
+                &engine,
+                "--model",
+                "/model",
+                "--compare-tunings",
+                "--from-default",
+            ]
+            .map(str::to_owned),
+        )
+        .unwrap() else {
+            panic!("expected bench command");
+        };
+        assert!(options.points[0].config.engine.tunings.add.is_empty());
+        assert!(
+            options
+                .points
+                .iter()
+                .skip(1)
+                .all(|point| point.config.engine.tunings.add.len() == 1)
+        );
+    }
+
+    #[test]
+    fn generates_one_value_tuning_selection_axes_and_rejects_conflicts() {
+        let engine = test_guests::qwen3().display().to_string();
+        for arguments in [
+            vec!["--without-tuning", "residual-norm,qk-norm-rope"],
+            vec!["--only", "residual-norm,final-norm"],
+        ] {
+            let command = parse(
+                ["bench", "--engine", &engine, "--model", "/model"]
+                    .into_iter()
+                    .chain(arguments)
+                    .map(str::to_owned),
+            )
+            .unwrap();
+            let Command::Bench(options) = command else {
+                panic!("expected bench command");
+            };
+            assert_eq!(options.points.len(), 1);
+            assert_eq!(options.axes[&KeyPath::new("engine.tunings")].len(), 1);
+        }
+
+        for arguments in [
+            vec!["--from-default"],
+            vec!["--compare-tunings", "--only", "residual-norm"],
+            vec![
+                "--only",
+                "residual-norm",
+                "--vary",
+                "engine.tunings=[[\"final-norm\"]]",
+            ],
+        ] {
+            assert!(
+                parse(
+                    ["bench", "--engine", &engine, "--model", "/model"]
+                        .into_iter()
+                        .chain(arguments)
+                        .map(str::to_owned)
+                )
+                .is_err()
+            );
+        }
     }
 
     #[test]
