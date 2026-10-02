@@ -58,13 +58,41 @@ async fn metal_qwen3_prefill_replay_matches_lazy() -> Result<(), Box<dyn Error>>
 #[tokio::test]
 #[ignore = "requires FORJA_MODELS and runs in the pre-push hook"]
 async fn metal_olmoe_prefill_replay_matches_lazy() -> Result<(), Box<dyn Error>> {
+    compare_olmoe_prefill(&[1, 7, 16, 33]).await
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[ignore = "requires FORJA_MODELS and runs in the pre-push hook"]
+async fn metal_olmoe_prefill_replay_matches_lazy_at_chunk_boundaries() -> Result<(), Box<dyn Error>>
+{
+    compare_olmoe_prefill(&[511, 512, 513]).await
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[ignore = "requires FORJA_MODELS and runs in the pre-push hook"]
+async fn metal_olmoe_prefill_replay_matches_lazy_at_long_context() -> Result<(), Box<dyn Error>> {
+    compare_olmoe_prefill(&[1_500]).await
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[ignore = "requires FORJA_MODELS and runs in the pre-push hook"]
+async fn metal_olmoe_prefill_replay_matches_lazy_near_context_limit() -> Result<(), Box<dyn Error>>
+{
+    compare_olmoe_prefill(&[4_000]).await
+}
+
+#[cfg(target_os = "macos")]
+async fn compare_olmoe_prefill(lengths: &[u32]) -> Result<(), Box<dyn Error>> {
     compare_prefill(
         test_guests::olmoe(),
         test_guests::olmoe_no_replay(),
         &model_root()?.join("OLMoE-1B-7B-0924/model.safetensors.index.json"),
         None,
         olmoe::VOCAB,
-        &LENGTHS,
+        lengths,
         forja_metal::MetalBackend::new()?,
         forja_metal::MetalBackend::new()?,
         forja_metal::MetalBackend::new()?,
