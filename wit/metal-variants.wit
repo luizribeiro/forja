@@ -1,7 +1,13 @@
 package l9o:gpu@0.1.0;
 
 interface metal-variants {
-  use compute.{command-list, error, op, tensor};
+  use compute.{command-list, error, op, params, tensor};
+
+  record arm {
+    lo: u32,
+    hi: u32,
+    name: string,
+  }
 
   record-variant: func(
     cmds: borrow<command-list>,
@@ -9,6 +15,16 @@ interface metal-variants {
     ins: list<borrow<tensor>>,
     outs: list<borrow<tensor>>,
     name: string,
+  ) -> result<_, error>;
+
+  record-variant-rule: func(
+    cmds: borrow<command-list>,
+    space: borrow<params>,
+    parameter: u8,
+    arms: list<arm>,
+    operation: op,
+    ins: list<borrow<tensor>>,
+    outs: list<borrow<tensor>>,
   ) -> result<_, error>;
 }
 

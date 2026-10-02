@@ -22,10 +22,10 @@ use std::{
 
 use forja_core::{
     Affine, Backend, BackendDispatchData, BackendError, BufferId, CommandList, DType, GraphLimits,
-    GraphTemplate, Layout, LayoutError, Op, OpError, ParamSpace, PreparedGraph, Slice, Submission,
-    SubmissionProfile, SymbolicLayout, SymbolicLayoutError, TemplateOp, TemplateTensor, Tensor,
-    ViewOp, gather_matmul_flops, gather_quant_matmul_combine_flops, gather_quant_matmul_flops,
-    gather_quant_silu_mul_flops, matmul_flops,
+    GraphTemplate, Layout, LayoutError, Op, OpError, ParamSpace, PreparedGraph, RuleArm, Slice,
+    Submission, SubmissionProfile, SymbolicLayout, SymbolicLayoutError, TemplateOp, TemplateTensor,
+    Tensor, ViewOp, gather_matmul_flops, gather_quant_matmul_combine_flops,
+    gather_quant_matmul_flops, gather_quant_silu_mul_flops, matmul_flops,
     program::{
         BinOp, Inst, KernelSignature, MAX_INSTRUCTIONS, MAX_OUTPUTS, PrepareError, PreparedProgram,
         Program, ProgramError, ProgramKind, RedOp, UnOp, ValidatedProgram, ValueType,
@@ -38,6 +38,7 @@ use wasmtime::{Config, Engine, Store, StoreLimits, StoreLimitsBuilder, Trap};
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
 const MAX_VARIANT_NAME_BYTES: usize = 64;
+const MAX_VARIANT_RULE_ARMS: usize = 64;
 
 pub use native::{NativeCommandList, NativeHost, NativeKernel, NativeTensor};
 pub use weights::{Safetensors, WeightError, WeightSource, WeightTensor};
@@ -1301,6 +1302,13 @@ enum RecordedDispatch {
         outputs: Vec<TemplateTensor>,
         data: BackendDispatchData,
     },
+    VariantRule {
+        op: TemplateOp,
+        inputs: Vec<TemplateTensor>,
+        outputs: Vec<TemplateTensor>,
+        parameter: u8,
+        arms: Vec<(u32, BackendDispatchData)>,
+    },
     Program {
         program: Arc<PreparedProgram>,
         inputs: Vec<TemplateTensor>,
@@ -1332,6 +1340,17 @@ fn record_graph_dispatch(
             let inputs = inputs.iter().collect::<Vec<_>>();
             let outputs = outputs.iter().collect::<Vec<_>>();
             graph.dispatch_variant_many(*op, &inputs, &outputs, data.clone())
+        }
+        RecordedDispatch::VariantRule {
+            op,
+            inputs,
+            outputs,
+            parameter,
+            arms,
+        } => {
+            let inputs = inputs.iter().collect::<Vec<_>>();
+            let outputs = outputs.iter().collect::<Vec<_>>();
+            graph.dispatch_variant_rule_many(*op, &inputs, &outputs, *parameter, arms.clone())
         }
         RecordedDispatch::Program {
             program,
@@ -2638,6 +2657,117 @@ impl Host<forja_metal::MetalBackend> {
         }
         Ok(())
     }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_metal_variant_rule(
+        &mut self,
+        commands: &Resource<CommandListEntry>,
+        params: &Resource<ParamsEntry>,
+        parameter: u8,
+        arms: &[metal_bindings::l9o::gpu::metal_variants::Arm],
+        operation: compute::Op,
+        inputs: &[Resource<TensorEntry>],
+        outputs: &[Resource<TensorEntry>],
+    ) -> Result<(), compute::Error> {
+        validate_variant_rule_boundary(arms)?;
+        let space = self
+            .table
+            .get(params)
+            .map_err(invalid_handle)?
+            .space
+            .clone();
+        let rule = forja_core::VariantRule::new(
+            &space,
+            parameter,
+            arms.iter()
+                .map(|arm| RuleArm::new(arm.lo, arm.hi, &arm.name))
+                .collect(),
+        )
+        .map_err(|error| variant_error(&error))?;
+        let input_entries = inputs
+            .iter()
+            .map(|resource| self.entry(resource).cloned())
+            .collect::<Result<Vec<_>, _>>()?;
+        let output_entries = outputs
+            .iter()
+            .map(|resource| self.entry(resource).cloned())
+            .collect::<Result<Vec<_>, _>>()?;
+        let input_tensors = entry_tensors(&input_entries);
+        let output_tensors = entry_tensors(&output_entries);
+        validate_variant_rule_space(
+            tensor_space(input_entries.iter().chain(&output_entries))?,
+            &space,
+        )?;
+        let template_inputs = input_entries
+            .iter()
+            .map(TensorEntry::template)
+            .collect::<Result<Vec<_>, _>>()?;
+        let template_outputs = output_entries
+            .iter()
+            .map(TensorEntry::template)
+            .collect::<Result<Vec<_>, _>>()?;
+        let input_refs = template_inputs.iter().collect::<Vec<_>>();
+        let output_refs = template_outputs.iter().collect::<Vec<_>>();
+        let (template_op, concrete_op) = core_op(operation);
+        let entry = self.table.get(commands).map_err(invalid_handle)?;
+        if entry.recorded.len() >= self.limits.dispatches_per_list {
+            return Err(quota("command list dispatch count exceeds the guest limit"));
+        }
+        merge_parameter_space(entry.space.as_ref(), Some(&space))?;
+        if let Some(operation) = concrete_op {
+            self.check_dispatch_work(operation, &input_tensors, &output_tensors)?;
+        }
+        let mut graph = GraphTemplate::new(
+            space.clone(),
+            GraphLimits::new(
+                self.limits.dispatches_per_list,
+                self.limits.tensor_elements,
+                self.limits.work_per_dispatch,
+            ),
+        );
+        graph
+            .dispatch_many(template_op, &input_refs, &output_refs)
+            .map_err(|error| graph_error(&error))?;
+        let variants = self
+            .backend
+            .validate_variant_rule(&space, &rule, template_op, &input_refs, &output_refs)
+            .map_err(|error| variant_error(&error))?;
+        self.dispatch_core(commands, template_op, concrete_op, inputs, outputs)?;
+        let entry = self.table.get_mut(commands).map_err(invalid_handle)?;
+        merge_parameter_space(entry.space.as_ref(), Some(&space))?;
+        let recorded = entry
+            .recorded
+            .pop()
+            .ok_or_else(|| guest_error(BackendError::ExecutionFailed))?;
+        let (op, inputs, outputs) = match recorded {
+            RecordedDispatch::Static(dispatch) => (
+                TemplateOp::from(dispatch.op()),
+                template_inputs,
+                template_outputs,
+            ),
+            RecordedDispatch::Operation {
+                op,
+                inputs,
+                outputs,
+            } => (op, inputs, outputs),
+            _ => return Err(guest_error(BackendError::ExecutionFailed)),
+        };
+        entry.recorded.push(RecordedDispatch::VariantRule {
+            op,
+            inputs,
+            outputs,
+            parameter,
+            arms: rule
+                .arms()
+                .iter()
+                .zip(variants)
+                .map(|(arm, variant)| (arm.hi(), BackendDispatchData::new(variant)))
+                .collect(),
+        });
+        entry.parameterized = true;
+        entry.space = Some(space);
+        Ok(())
+    }
 }
 
 struct ReadRequest<B: Backend> {
@@ -3342,6 +3472,22 @@ impl metal_bindings::l9o::gpu::metal_variants::Host for Host<forja_metal::MetalB
             self.record_metal_variant(&commands, operation, &inputs, &outputs, &name)
         ))
     }
+
+    fn record_variant_rule(
+        &mut self,
+        commands: Resource<CommandListEntry>,
+        space: Resource<ParamsEntry>,
+        parameter: u8,
+        arms: Vec<metal_bindings::l9o::gpu::metal_variants::Arm>,
+        operation: compute::Op,
+        inputs: Vec<Resource<TensorEntry>>,
+        outputs: Vec<Resource<TensorEntry>>,
+    ) -> impl Future<Output = wasmtime::Result<Result<(), compute::Error>>> + Send {
+        let _timer = self.import_timer(ImportKind::Dispatch);
+        std::future::ready(Ok(self.record_metal_variant_rule(
+            &commands, &space, parameter, &arms, operation, &inputs, &outputs,
+        )))
+    }
 }
 
 impl<B> compute::HostKernel for Host<B>
@@ -3706,6 +3852,10 @@ fn symbolic_view(
     }
 }
 
+fn entry_tensors(entries: &[TensorEntry]) -> Vec<&Tensor> {
+    entries.iter().map(|entry| &entry.tensor).collect()
+}
+
 fn tensor_space<'a>(
     entries: impl Iterator<Item = &'a TensorEntry>,
 ) -> Result<Option<ParamSpace>, compute::Error> {
@@ -3744,6 +3894,36 @@ fn validate_variant_name_length(name: &str) -> Result<(), compute::Error> {
     if name.len() > MAX_VARIANT_NAME_BYTES {
         return Err(compute::Error::OpSignature(
             "Metal variant name exceeds 64 bytes".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn validate_variant_rule_boundary(
+    arms: &[metal_bindings::l9o::gpu::metal_variants::Arm],
+) -> Result<(), compute::Error> {
+    if arms.len() > MAX_VARIANT_RULE_ARMS {
+        return Err(quota("Metal variant rule has too many arms"));
+    }
+    for arm in arms {
+        validate_variant_name_length(&arm.name)?;
+    }
+    Ok(())
+}
+
+fn validate_variant_rule_space(
+    candidate: Option<ParamSpace>,
+    expected: &ParamSpace,
+) -> Result<(), compute::Error> {
+    let candidate = candidate.ok_or_else(|| {
+        compute::Error::OpSignature(
+            "variant rule requires tensors from its parameter space".to_owned(),
+        )
+    })?;
+    if &candidate != expected {
+        return Err(compute::Error::OpSignature(
+            "variant rule parameter space does not match its tensors".to_owned(),
         ));
     }
     Ok(())
@@ -3983,8 +4163,8 @@ mod tests {
 
     use super::{
         BackendEvent, BackendTimer, EngineMetrics, EngineRunner, EngineStep, EngineStepProfile,
-        Grants, Host, ImportKind, ImportTimer, Limits, MAX_INSTRUCTIONS, MAX_OUTPUTS, TensorEntry,
-        bindings::l9o::gpu::compute, core_op, core_program, expected_layer_outputs,
+        Grants, Host, ImportKind, ImportTimer, Limits, MAX_INSTRUCTIONS, MAX_OUTPUTS, ParamsEntry,
+        TensorEntry, bindings::l9o::gpu::compute, core_op, core_program, expected_layer_outputs,
     };
 
     const GENEROUS: Limits = Limits::new(u64::MAX, 8, u64::MAX, 32, u64::MAX);
@@ -4042,6 +4222,59 @@ mod tests {
     }
 
     #[cfg(target_os = "macos")]
+    fn metal_symbolic_matmul(
+        host: &mut Host<forja_metal::MetalBackend>,
+    ) -> (
+        Resource<ParamsEntry>,
+        [Resource<TensorEntry>; 2],
+        Resource<TensorEntry>,
+    ) {
+        let params = host
+            .params(vec![compute::ParamRange { lo: 2, hi: 3 }])
+            .unwrap();
+        let left = host.alloc(compute::Dtype::F32, &[3, 33]).unwrap();
+        let right = host.alloc(compute::Dtype::F32, &[33, 7]).unwrap();
+        let output = host.alloc(compute::Dtype::F32, &[3, 7]).unwrap();
+        let slices = |width| {
+            vec![
+                compute::ParamSlice {
+                    start: wit_affine(None, 0, 0),
+                    len: wit_affine(Some(0), 1, 0),
+                    step: 1,
+                },
+                compute::ParamSlice {
+                    start: wit_affine(None, 0, 0),
+                    len: wit_affine(None, 0, width),
+                    step: 1,
+                },
+            ]
+        };
+        let left = host
+            .view_param(
+                &Resource::new_borrow(left.rep()),
+                &Resource::new_borrow(params.rep()),
+                slices(33),
+            )
+            .unwrap();
+        let output = host
+            .view_param(
+                &Resource::new_borrow(output.rep()),
+                &Resource::new_borrow(params.rep()),
+                slices(7),
+            )
+            .unwrap();
+        (params, [left, right], output)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn metal_rule_arm() -> super::metal_bindings::l9o::gpu::metal_variants::Arm {
+        super::metal_bindings::l9o::gpu::metal_variants::Arm {
+            lo: 2,
+            hi: 3,
+            name: "matmul.steel-64x64x16-2x2".to_owned(),
+        }
+    }
+
     #[cfg(target_os = "macos")]
     fn borrowed_tensors(tensors: &[Resource<TensorEntry>]) -> Vec<Resource<TensorEntry>> {
         tensors
@@ -4052,7 +4285,7 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn metal_variant_name_is_bounded_before_handles() {
+    fn metal_variant_entry_points_bound_guest_collections_first() {
         let mut host = Host::new(forja_metal::MetalBackend::new().unwrap(), GENEROUS);
         let invalid_commands = Resource::new_borrow(41);
         assert!(matches!(
@@ -4065,11 +4298,79 @@ mod tests {
             ),
             Err(compute::Error::OpSignature(_))
         ));
+        let oversized = (0..65).map(|_| metal_rule_arm()).collect::<Vec<_>>();
+        assert!(matches!(
+            host.record_metal_variant_rule(
+                &invalid_commands,
+                &Resource::new_borrow(42),
+                0,
+                &oversized,
+                compute::Op::Matmul,
+                &[],
+                &[],
+            ),
+            Err(compute::Error::Quota(_))
+        ));
+        let oversized_name = [super::metal_bindings::l9o::gpu::metal_variants::Arm {
+            lo: 2,
+            hi: 3,
+            name: "a".repeat(65),
+        }];
+        assert!(matches!(
+            host.record_metal_variant_rule(
+                &invalid_commands,
+                &Resource::new_borrow(42),
+                0,
+                &oversized_name,
+                compute::Op::Matmul,
+                &[],
+                &[],
+            ),
+            Err(compute::Error::OpSignature(_))
+        ));
     }
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn metal_variant_enforces_dispatch_and_work_quotas() {
+    fn metal_variant_rules_require_the_tensor_parameter_space() {
+        let mut host = Host::new(forja_metal::MetalBackend::new().unwrap(), GENEROUS);
+        let (params, inputs, output) = metal_symbolic_matmul(&mut host);
+        let other = host
+            .params(vec![compute::ParamRange { lo: 2, hi: 3 }])
+            .unwrap();
+        let commands = host.command_list().unwrap();
+        assert!(matches!(
+            host.record_metal_variant_rule(
+                &commands,
+                &other,
+                0,
+                &[metal_rule_arm()],
+                compute::Op::Matmul,
+                &borrowed_tensors(&inputs),
+                &[Resource::new_borrow(output.rep())],
+            ),
+            Err(compute::Error::OpSignature(_))
+        ));
+
+        let (inputs, output) = metal_matmul_tensors(&mut host, 7);
+        let commands = host.command_list().unwrap();
+        assert!(matches!(
+            host.record_metal_variant_rule(
+                &commands,
+                &params,
+                0,
+                &[metal_rule_arm()],
+                compute::Op::Matmul,
+                &borrowed_tensors(&inputs),
+                &[Resource::new_borrow(output.rep())],
+            ),
+            Err(compute::Error::OpSignature(_))
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_variant_entry_points_enforce_dispatch_and_work_quotas() {
         for limits in [
             GENEROUS.with_command_limits(0, u64::MAX),
             GENEROUS.with_command_limits(usize::MAX, 1),
@@ -4084,6 +4385,27 @@ mod tests {
                     &borrowed_tensors(&inputs),
                     &[Resource::new_borrow(output.rep())],
                     "matmul.steel-64x64x16-2x2",
+                ),
+                Err(compute::Error::Quota(_))
+            ));
+        }
+
+        for limits in [
+            GENEROUS.with_command_limits(0, u64::MAX),
+            GENEROUS.with_command_limits(usize::MAX, 1),
+        ] {
+            let mut host = Host::new(forja_metal::MetalBackend::new().unwrap(), limits);
+            let (params, inputs, output) = metal_symbolic_matmul(&mut host);
+            let commands = host.command_list().unwrap();
+            assert!(matches!(
+                host.record_metal_variant_rule(
+                    &commands,
+                    &params,
+                    0,
+                    &[metal_rule_arm()],
+                    compute::Op::Matmul,
+                    &borrowed_tensors(&inputs),
+                    &[Resource::new_borrow(output.rep())],
                 ),
                 Err(compute::Error::Quota(_))
             ));
