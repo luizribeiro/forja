@@ -15,10 +15,51 @@ pub fn sdpa<T: Element>(
     causal: bool,
     q_start: impl Into<Dim>,
 ) -> Result<Tensor<T>> {
+    let q_start = q_start.into();
+    sdpa_selected(query, key, value, scale, causal, &q_start, None)
+}
+
+/// Computes attention with an explicit Metal algorithm selection.
+///
+/// # Errors
+///
+/// Returns an error for incompatible inputs, rule context, or a host-refused selection.
+pub fn sdpa_with<'a, T: Element>(
+    query: &Tensor<T>,
+    key: &Tensor<T>,
+    value: &Tensor<T>,
+    scale: f32,
+    causal: bool,
+    q_start: impl Into<Dim>,
+    selection: impl Into<crate::target::metal::VariantChoice<'a>>,
+) -> Result<Tensor<T>> {
+    let q_start = q_start.into();
+    sdpa_selected(
+        query,
+        key,
+        value,
+        scale,
+        causal,
+        &q_start,
+        Some(selection.into()),
+    )
+}
+
+fn sdpa_selected<T: Element>(
+    query: &Tensor<T>,
+    key: &Tensor<T>,
+    value: &Tensor<T>,
+    scale: f32,
+    causal: bool,
+    q_start: &Dim,
+    selection: Option<crate::target::metal::VariantChoice<'_>>,
+) -> Result<Tensor<T>> {
     let [query_heads, query_len, _] = shape3(query)?;
     let [_, _, value_width] = shape3(value)?;
     let output = Tensor::<T>::empty(vec![query_heads, query_len, value_width])?;
-    sdpa_into(query, key, value, &output, scale, causal, q_start)?;
+    sdpa_into_selected(
+        query, key, value, &output, scale, causal, q_start, selection,
+    )?;
     Ok(output)
 }
 
@@ -37,15 +78,60 @@ pub fn sdpa_into<T: Element>(
     q_start: impl Into<Dim>,
 ) -> Result<()> {
     let q_start = q_start.into();
-    graph::record(
-        sys::Op::Sdpa {
-            scale,
-            causal,
-            q_start: graph::affine(&q_start)?,
-        },
-        &[query.handle(), key.handle(), value.handle()],
-        output.handle(),
-    )?;
+    sdpa_into_selected(query, key, value, output, scale, causal, &q_start, None)
+}
+
+/// Computes attention into a supplied output with an explicit Metal algorithm selection.
+///
+/// # Errors
+///
+/// Returns an error for incompatible inputs, rule context, or a host-refused selection.
+#[allow(clippy::too_many_arguments)]
+pub fn sdpa_into_with<'a, T: Element>(
+    query: &Tensor<T>,
+    key: &Tensor<T>,
+    value: &Tensor<T>,
+    output: &Tensor<T>,
+    scale: f32,
+    causal: bool,
+    q_start: impl Into<Dim>,
+    selection: impl Into<crate::target::metal::VariantChoice<'a>>,
+) -> Result<()> {
+    let q_start = q_start.into();
+    sdpa_into_selected(
+        query,
+        key,
+        value,
+        output,
+        scale,
+        causal,
+        &q_start,
+        Some(selection.into()),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sdpa_into_selected<T: Element>(
+    query: &Tensor<T>,
+    key: &Tensor<T>,
+    value: &Tensor<T>,
+    output: &Tensor<T>,
+    scale: f32,
+    causal: bool,
+    q_start: &Dim,
+    selection: Option<crate::target::metal::VariantChoice<'_>>,
+) -> Result<()> {
+    let operation = sys::Op::Sdpa {
+        scale,
+        causal,
+        q_start: graph::affine(q_start)?,
+    };
+    let inputs = [query.handle(), key.handle(), value.handle()];
+    if let Some(selection) = selection {
+        graph::record_variant(operation, &inputs, output.handle(), selection)?;
+    } else {
+        graph::record(operation, &inputs, output.handle())?;
+    }
     Ok(())
 }
 
