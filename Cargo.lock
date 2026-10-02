@@ -693,6 +693,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "forja-build"
+version = "0.0.0"
+
+[[package]]
 name = "forja-config"
 version = "0.0.0"
 dependencies = [
@@ -1957,6 +1961,7 @@ dependencies = [
 name = "test-guests"
 version = "0.0.0"
 dependencies = [
+ "forja-build",
  "wasmtime",
  "wasmtime-wasi",
 ]

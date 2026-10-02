@@ -6,6 +6,9 @@ publish.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
+[build-dependencies]
+forja-build = { path = "../../crates/forja-build" }
+
 [dev-dependencies]
 wasmtime.workspace = true
 wasmtime-wasi.workspace = true
