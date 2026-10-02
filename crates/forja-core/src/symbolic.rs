@@ -237,6 +237,10 @@ impl Affine {
             .and_then(|result| u32::try_from(result).ok())
             .ok_or(ParamError::ArithmeticOverflow)
     }
+
+    pub(crate) const fn parts(self) -> (u32, Option<(u8, u32)>) {
+        (self.offset, self.term)
+    }
 }
 
 impl From<u32> for Affine {
@@ -524,6 +528,106 @@ impl SymbolicLayout {
             RecipeOp::Broadcast(shape) => Ok(layout.broadcast(shape)?),
             RecipeOp::Reshape(shape) => Ok(layout.reshape(shape)?),
         }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn constraint_facts(&self) -> Result<SymbolicLayoutFacts, SymbolicLayoutError> {
+        let mut dimensions = self
+            .base
+            .shape()
+            .iter()
+            .copied()
+            .map(Affine::constant)
+            .collect::<Vec<_>>();
+        let mut strides = self.base.strides().to_vec();
+        let mut offset = LinearAffine::constant(self.base.offset());
+        let lower = self.space.endpoint_values(false);
+        let mut representative = self.base.clone();
+        for operation in &self.recipe {
+            representative = Self::apply_op(&representative, operation, &lower)?;
+            match operation {
+                RecipeOp::Slice {
+                    axis,
+                    start,
+                    len,
+                    step,
+                } => {
+                    let index = usize::from(*axis);
+                    let stride = *strides
+                        .get(index)
+                        .ok_or(SymbolicLayoutError::AxisOutOfRange { axis: *axis })?;
+                    offset = offset.checked_add_scaled(*start, stride)?;
+                    dimensions[index] = *len;
+                    strides[index] = stride
+                        .checked_mul(u64::from(*step))
+                        .ok_or(ParamError::ArithmeticOverflow)?;
+                }
+                RecipeOp::Permute(axes) => {
+                    dimensions = axes
+                        .iter()
+                        .map(|&axis| dimensions[usize::from(axis)])
+                        .collect();
+                    strides = axes
+                        .iter()
+                        .map(|&axis| strides[usize::from(axis)])
+                        .collect();
+                }
+                RecipeOp::Broadcast(shape) | RecipeOp::Reshape(shape) => {
+                    dimensions = shape.iter().copied().map(Affine::constant).collect();
+                    strides = representative.strides().to_vec();
+                }
+            }
+        }
+        Ok(SymbolicLayoutFacts {
+            dtype: self.base.dtype(),
+            dimensions,
+            strides,
+            offset,
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+pub(crate) struct SymbolicLayoutFacts {
+    pub(crate) dtype: crate::DType,
+    pub(crate) dimensions: Vec<Affine>,
+    pub(crate) strides: Vec<u64>,
+    pub(crate) offset: LinearAffine,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+pub(crate) struct LinearAffine {
+    pub(crate) offset: u64,
+    pub(crate) coefficients: [u64; MAX_PARAMS],
+}
+
+impl LinearAffine {
+    const fn constant(value: u64) -> Self {
+        Self {
+            offset: value,
+            coefficients: [0; MAX_PARAMS],
+        }
+    }
+
+    fn checked_add_scaled(mut self, affine: Affine, scale: u64) -> Result<Self, ParamError> {
+        let (constant, term) = affine.parts();
+        self.offset = u64::from(constant)
+            .checked_mul(scale)
+            .and_then(|value| self.offset.checked_add(value))
+            .ok_or(ParamError::ArithmeticOverflow)?;
+        if let Some((parameter, coefficient)) = term {
+            let slot = self
+                .coefficients
+                .get_mut(usize::from(parameter))
+                .ok_or(ParamError::UnknownParameter { index: parameter })?;
+            *slot = u64::from(coefficient)
+                .checked_mul(scale)
+                .and_then(|value| slot.checked_add(value))
+                .ok_or(ParamError::ArithmeticOverflow)?;
+        }
+        Ok(self)
     }
 }
 
@@ -828,6 +932,44 @@ mod tests {
                 .is_contiguous()
         );
     }
+
+    #[test]
+    fn constraint_facts_follow_shape_transforms() {
+        let empty = ParamSpace::new(Vec::new()).unwrap();
+        let permuted = SymbolicLayout::new(
+            Layout::contiguous(DType::F32, 0, vec![2, 3, 4], 96).unwrap(),
+            empty.clone(),
+        )
+        .permute(&[1, 0, 2])
+        .unwrap()
+        .constraint_facts()
+        .unwrap();
+        assert_eq!(permuted.dimensions, [3.into(), 2.into(), 4.into()]);
+        assert_eq!(permuted.strides, [4, 12, 1]);
+
+        let broadcast = SymbolicLayout::new(
+            Layout::contiguous(DType::F16, 0, vec![1, 4], 8).unwrap(),
+            empty.clone(),
+        )
+        .broadcast(vec![7, 4])
+        .unwrap()
+        .constraint_facts()
+        .unwrap();
+        assert_eq!(broadcast.dimensions, [7.into(), 4.into()]);
+        assert_eq!(broadcast.strides, [0, 1]);
+
+        let reshaped = SymbolicLayout::new(
+            Layout::contiguous(DType::BF16, 0, vec![2, 3, 4], 48).unwrap(),
+            empty,
+        )
+        .reshape(vec![6, 4])
+        .unwrap()
+        .constraint_facts()
+        .unwrap();
+        assert_eq!(reshaped.dimensions, [6.into(), 4.into()]);
+        assert_eq!(reshaped.strides, [4, 1]);
+    }
+
     fn chained_recipe(
         hi0: u32,
         hi1: u32,
