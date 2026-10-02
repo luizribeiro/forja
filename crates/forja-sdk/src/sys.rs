@@ -119,6 +119,13 @@ pub(crate) enum Op {
     },
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct VariantArm {
+    pub(crate) lo: u32,
+    pub(crate) hi: u32,
+    pub(crate) name: String,
+}
+
 #[derive(Clone)]
 pub(crate) struct Program {
     pub(crate) kind: ProgramKind,
@@ -168,6 +175,22 @@ pub(crate) trait Backend {
         inputs: &[&Self::Tensor],
         outputs: &[&Self::Tensor],
     ) -> Result<()>;
+    fn dispatch_variant(
+        commands: &mut Self::Commands,
+        operation: Op,
+        inputs: &[&Self::Tensor],
+        outputs: &[&Self::Tensor],
+        name: &str,
+    ) -> Result<()>;
+    fn dispatch_variant_rule(
+        commands: &mut Self::Commands,
+        params: &Self::Params,
+        parameter: u8,
+        arms: &[VariantArm],
+        operation: Op,
+        inputs: &[&Self::Tensor],
+        outputs: &[&Self::Tensor],
+    ) -> Result<()>;
     fn create_kernel(
         program: Program,
         rank: u8,
@@ -206,12 +229,16 @@ pub(crate) mod guest {
         });
     }
 
-    use super::{Backend, DType, Error, Op, ParamSlice, Program, ProgramInst, Result, View};
+    use super::{
+        Backend, DType, Error, Op, ParamSlice, Program, ProgramInst, Result, VariantArm, View,
+    };
     use crate::program::{BinaryOp, ProgramKind, ReduceOp, UnaryOp, ValueType};
     use compute::{
         Binop as WitBinOp, Redop as WitRedOp, Unop as WitUnOp, ValueType as WitValueType,
     };
     pub use l9o::gpu::compute;
+    #[cfg(feature = "metal-variants")]
+    use variants::l9o::gpu::metal_variants;
 
     pub(crate) struct Guest;
 
@@ -317,6 +344,68 @@ pub(crate) mod guest {
             commands
                 .dispatch_many(wit_op(operation), inputs, outputs)
                 .map_err(|error| guest_error(&error))
+        }
+
+        fn dispatch_variant(
+            commands: &mut Self::Commands,
+            operation: Op,
+            inputs: &[&Self::Tensor],
+            outputs: &[&Self::Tensor],
+            name: &str,
+        ) -> Result<()> {
+            #[cfg(feature = "metal-variants")]
+            {
+                metal_variants::record_variant(commands, wit_op(operation), inputs, outputs, name)
+                    .map_err(|error| guest_error(&error))
+            }
+            #[cfg(not(feature = "metal-variants"))]
+            {
+                let _ = (commands, operation, inputs, outputs, name);
+                Err(Error::new(
+                    "Metal variant operations require the `metal-variants` feature",
+                ))
+            }
+        }
+
+        fn dispatch_variant_rule(
+            commands: &mut Self::Commands,
+            params: &Self::Params,
+            parameter: u8,
+            arms: &[VariantArm],
+            operation: Op,
+            inputs: &[&Self::Tensor],
+            outputs: &[&Self::Tensor],
+        ) -> Result<()> {
+            #[cfg(feature = "metal-variants")]
+            {
+                let arms = arms
+                    .iter()
+                    .map(|arm| metal_variants::Arm {
+                        lo: arm.lo,
+                        hi: arm.hi,
+                        name: arm.name.clone(),
+                    })
+                    .collect::<Vec<_>>();
+                metal_variants::record_variant_rule(
+                    commands,
+                    params,
+                    parameter,
+                    &arms,
+                    wit_op(operation),
+                    inputs,
+                    outputs,
+                )
+                .map_err(|error| guest_error(&error))
+            }
+            #[cfg(not(feature = "metal-variants"))]
+            {
+                let _ = (
+                    commands, params, parameter, arms, operation, inputs, outputs,
+                );
+                Err(Error::new(
+                    "Metal variant operations require the `metal-variants` feature",
+                ))
+            }
         }
 
         fn create_kernel(
@@ -515,7 +604,7 @@ pub(crate) mod guest {
 
 #[cfg(all(not(target_family = "wasm"), not(feature = "native")))]
 pub(crate) mod unavailable {
-    use super::{Backend, DType, Error, Op, ParamSlice, Program, Result, View};
+    use super::{Backend, DType, Error, Op, ParamSlice, Program, Result, VariantArm, View};
 
     pub(crate) enum UnavailableTensor {}
     pub(crate) enum UnavailableCommands {}
@@ -590,6 +679,28 @@ pub(crate) mod unavailable {
             Err(error())
         }
 
+        fn dispatch_variant(
+            _commands: &mut Self::Commands,
+            _operation: Op,
+            _inputs: &[&Self::Tensor],
+            _outputs: &[&Self::Tensor],
+            _name: &str,
+        ) -> Result<()> {
+            Err(error())
+        }
+
+        fn dispatch_variant_rule(
+            _commands: &mut Self::Commands,
+            _params: &Self::Params,
+            _parameter: u8,
+            _arms: &[VariantArm],
+            _operation: Op,
+            _inputs: &[&Self::Tensor],
+            _outputs: &[&Self::Tensor],
+        ) -> Result<()> {
+            Err(error())
+        }
+
         fn create_kernel(
             _program: Program,
             _rank: u8,
@@ -645,7 +756,9 @@ pub(crate) mod native {
         NativeCommandList, NativeHost, NativeKernel, NativeTensor, Safetensors, WeightSource as _,
     };
 
-    use super::{Backend, DType, Error, Op, ParamSlice, Program, ProgramInst, Result, View};
+    use super::{
+        Backend, DType, Error, Op, ParamSlice, Program, ProgramInst, Result, VariantArm, View,
+    };
     use crate::NativeDevice;
     use crate::program::{BinaryOp, ProgramKind, ReduceOp, UnaryOp, ValueType};
 
@@ -865,6 +978,41 @@ pub(crate) mod native {
                     )
                     .map_err(error),
             }
+        }
+
+        fn dispatch_variant(
+            commands: &mut Self::Commands,
+            operation: Op,
+            inputs: &[&Self::Tensor],
+            outputs: &[&Self::Tensor],
+            name: &str,
+        ) -> Result<()> {
+            #[cfg(not(all(feature = "native-metal", target_os = "macos")))]
+            let _ = (operation, inputs, outputs, name);
+            match commands {
+                Commands::Cpu(_) => Err(Error::new("Metal variants require the Metal backend")),
+                #[cfg(all(feature = "native-metal", target_os = "macos"))]
+                Commands::Metal(commands) => commands
+                    .dispatch_variant(
+                        core_op(operation),
+                        &metal_inputs(inputs)?,
+                        &metal_inputs(outputs)?,
+                        name,
+                    )
+                    .map_err(error),
+            }
+        }
+
+        fn dispatch_variant_rule(
+            _commands: &mut Self::Commands,
+            _params: &Self::Params,
+            _parameter: u8,
+            _arms: &[VariantArm],
+            _operation: Op,
+            _inputs: &[&Self::Tensor],
+            _outputs: &[&Self::Tensor],
+        ) -> Result<()> {
+            Err(Error::new("graph capture requires a WebAssembly host"))
         }
 
         fn create_kernel(
@@ -1158,6 +1306,32 @@ pub(crate) fn dispatch_many(
     outputs: &[&Handle],
 ) -> Result<()> {
     Active::dispatch_many(commands, operation, inputs, outputs)
+}
+
+#[expect(dead_code)]
+pub(crate) fn dispatch_variant(
+    commands: &mut Commands,
+    operation: Op,
+    inputs: &[&Handle],
+    outputs: &[&Handle],
+    name: &str,
+) -> Result<()> {
+    Active::dispatch_variant(commands, operation, inputs, outputs, name)
+}
+
+#[expect(dead_code)]
+pub(crate) fn dispatch_variant_rule(
+    commands: &mut Commands,
+    params: &Params,
+    parameter: u8,
+    arms: &[VariantArm],
+    operation: Op,
+    inputs: &[&Handle],
+    outputs: &[&Handle],
+) -> Result<()> {
+    Active::dispatch_variant_rule(
+        commands, params, parameter, arms, operation, inputs, outputs,
+    )
 }
 
 pub(crate) fn create_kernel(

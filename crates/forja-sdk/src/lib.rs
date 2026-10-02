@@ -106,6 +106,7 @@ mod load;
 pub mod nn;
 pub mod program;
 mod sys;
+pub mod target;
 mod tensor;
 
 use std::{error, fmt};

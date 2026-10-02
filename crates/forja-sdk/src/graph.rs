@@ -55,6 +55,14 @@ impl Param {
             value,
         }
     }
+
+    pub(crate) const fn id(&self) -> u64 {
+        self.id
+    }
+
+    pub(crate) const fn range(&self) -> &RangeInclusive<u32> {
+        &self.range
+    }
 }
 
 /// A traced position carrying both its parameter identity and concrete value.
