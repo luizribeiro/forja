@@ -761,6 +761,18 @@ impl GraphTemplate {
             })
     }
 
+    /// Returns indices whose concrete operation or tensor layout is instantiated per replay.
+    #[doc(hidden)]
+    pub fn parameter_dependent_dispatch_indices(&self) -> impl Iterator<Item = usize> + '_ {
+        self.dispatches
+            .iter()
+            .enumerate()
+            .filter_map(|(index, dispatch)| match dispatch {
+                TemplateDispatch::Static(_) => None,
+                TemplateDispatch::Dynamic { .. } | TemplateDispatch::Rule { .. } => Some(index),
+            })
+    }
+
     /// Checks raw replay values against this template's parameter space.
     ///
     /// # Errors

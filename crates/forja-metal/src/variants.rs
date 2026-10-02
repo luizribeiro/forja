@@ -1,5 +1,8 @@
 use std::{error::Error, fmt};
 
+#[cfg(test)]
+use std::cell::Cell;
+
 use forja_core::{
     Axis, Constraint, ConstraintProofError, DeviceCapability, Dimension, Dispatch, Guarantee,
     Layout, LayoutClass, Lifecycle, OpError, OperationKind, OperationValue, ParamSpace, Relation,
@@ -43,6 +46,7 @@ pub(crate) enum MetalVariant {
 #[derive(Clone, Copy, Debug)]
 pub struct ValidatedVariant {
     index: usize,
+    replay_constraints: u64,
 }
 
 impl ValidatedVariant {
@@ -61,6 +65,35 @@ impl ValidatedVariant {
     pub(crate) const fn implementation(self) -> MetalVariant {
         REGISTRY[self.index].implementation
     }
+
+    pub(crate) const fn needs_replay_validation(self) -> bool {
+        self.replay_constraints != 0
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_all_replay_constraints(mut self) -> Self {
+        self.replay_constraints = REGISTRY[self.index]
+            .constraints
+            .iter()
+            .enumerate()
+            .fold(0, |mask, (index, _)| mask | replay_constraint_bit(index));
+        self
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static REPLAY_VALIDATIONS: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_replay_validation_count() {
+    REPLAY_VALIDATIONS.set(0);
+}
+
+#[cfg(test)]
+pub(crate) fn replay_validation_count() -> usize {
+    REPLAY_VALIDATIONS.get()
 }
 
 /// A reason a concrete Metal algorithm variant was refused.
@@ -720,7 +753,10 @@ pub(crate) fn resolve(
             });
         }
     }
-    Ok(ValidatedVariant { index })
+    Ok(ValidatedVariant {
+        index,
+        replay_constraints: 0,
+    })
 }
 
 pub(crate) fn resolve_template(
@@ -741,7 +777,10 @@ pub(crate) fn resolve_template(
         definition.constraints,
     )
     .map_err(|error| proof_error(kind, name, error))?;
-    Ok(ValidatedVariant { index })
+    Ok(ValidatedVariant {
+        index,
+        replay_constraints: replay_constraint_mask(inputs, outputs, definition.constraints),
+    })
 }
 
 pub(crate) fn resolve_rule(
@@ -756,8 +795,16 @@ pub(crate) fn resolve_rule(
         .arms()
         .iter()
         .map(|arm| {
-            definition(kind, arm.name(), &[DeviceCapability::Metal4])
-                .map(|(index, _)| ValidatedVariant { index })
+            definition(kind, arm.name(), &[DeviceCapability::Metal4]).map(|(index, definition)| {
+                ValidatedVariant {
+                    index,
+                    replay_constraints: replay_constraint_mask(
+                        inputs,
+                        outputs,
+                        definition.constraints,
+                    ),
+                }
+            })
         })
         .collect::<Result<Vec<_>, _>>()?;
     rule.prove(
@@ -775,6 +822,113 @@ pub(crate) fn resolve_rule(
     )
     .map_err(VariantError::Rule)?;
     Ok(variants)
+}
+
+pub(crate) fn revalidate_replay(
+    dispatch: &Dispatch,
+    variant: ValidatedVariant,
+    capabilities: &[DeviceCapability],
+) -> Result<(), VariantError> {
+    if !variant.needs_replay_validation() {
+        return Ok(());
+    }
+    #[cfg(test)]
+    REPLAY_VALIDATIONS.set(REPLAY_VALIDATIONS.get().saturating_add(1));
+    let definition = &REGISTRY[variant.index];
+    for (index, constraint) in definition.constraints.iter().enumerate() {
+        if variant.replay_constraints & replay_constraint_bit(index) == 0 {
+            continue;
+        }
+        if let Err(actual) = check_constraint(dispatch, capabilities, constraint) {
+            return Err(VariantError::Constraint {
+                operation: definition.operation,
+                name: definition.name.to_owned(),
+                constraint: constraint.to_string(),
+                actual,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn replay_constraint_mask(
+    inputs: &[&TemplateTensor],
+    outputs: &[&TemplateTensor],
+    constraints: &[Constraint],
+) -> u64 {
+    constraints
+        .iter()
+        .enumerate()
+        .filter(|(_, constraint)| constraint_references_parameters(inputs, outputs, constraint))
+        .fold(0, |mask, (index, _)| mask | replay_constraint_bit(index))
+}
+
+const fn replay_constraint_bit(index: usize) -> u64 {
+    if index < u64::BITS as usize {
+        1 << index
+    } else {
+        0
+    }
+}
+
+fn constraint_references_parameters(
+    inputs: &[&TemplateTensor],
+    outputs: &[&TemplateTensor],
+    constraint: &Constraint,
+) -> bool {
+    match constraint {
+        Constraint::DType { .. } | Constraint::Rank { .. } | Constraint::Capability(_) => false,
+        Constraint::Value { value, .. } => value_references_parameters(inputs, outputs, *value),
+        Constraint::DimensionsEqual { left, right } => {
+            dimension_references_parameters(inputs, outputs, *left)
+                || dimension_references_parameters(inputs, outputs, *right)
+        }
+        Constraint::Layout { tensor, .. } | Constraint::ByteOffsetAligned { tensor, .. } => {
+            tensor_references_parameters(inputs, outputs, *tensor)
+        }
+    }
+}
+
+fn value_references_parameters(
+    inputs: &[&TemplateTensor],
+    outputs: &[&TemplateTensor],
+    value: ValueRef,
+) -> bool {
+    match value {
+        ValueRef::Dimension(dimension) => {
+            dimension_references_parameters(inputs, outputs, dimension)
+        }
+        ValueRef::Product { left, right, .. }
+        | ValueRef::Quotient {
+            numerator: left,
+            denominator: right,
+            ..
+        } => {
+            dimension_references_parameters(inputs, outputs, left)
+                || dimension_references_parameters(inputs, outputs, right)
+        }
+        ValueRef::Operation(_) => false,
+    }
+}
+
+fn dimension_references_parameters(
+    inputs: &[&TemplateTensor],
+    outputs: &[&TemplateTensor],
+    dimension: Dimension,
+) -> bool {
+    tensor_references_parameters(inputs, outputs, dimension.tensor)
+}
+
+fn tensor_references_parameters(
+    inputs: &[&TemplateTensor],
+    outputs: &[&TemplateTensor],
+    tensor: TensorRef,
+) -> bool {
+    let tensor = match tensor.slot {
+        TensorSlot::Input(index) => inputs.get(usize::from(index)),
+        TensorSlot::Output(index) => outputs.get(usize::from(index)),
+    };
+    tensor.is_some_and(|tensor| matches!(tensor, TemplateTensor::Symbolic { .. }))
 }
 
 fn definition(
@@ -1218,6 +1372,7 @@ mod tests {
             assert!(variant.name.bytes().all(|byte| byte.is_ascii_lowercase()
                 || byte.is_ascii_digit()
                 || matches!(byte, b'.' | b'-')));
+            assert!(variant.constraints.len() <= u64::BITS as usize);
             assert!(!variant.use_when.is_empty(), "{} use_when", variant.name);
             assert!(
                 !variant.avoid_when.is_empty(),
@@ -1299,6 +1454,30 @@ mod tests {
             error.to_string(),
             "metal matmul variant 'matmul.gemv': constraint 'm = 1' failed (m spans 1..=2)"
         );
+    }
+
+    #[test]
+    fn symbolic_pins_precompute_replay_constraints() {
+        let backend = CpuBackend::new();
+        let space = ParamSpace::new(std::iter::once(2..=3).collect()).unwrap();
+        let symbolic_rows = |tensor: forja_core::Tensor| {
+            let layout = SymbolicLayout::new(tensor.layout().clone(), space.clone())
+                .slice(0, 0.into(), Affine::parameter(0, 0, 1), 1)
+                .unwrap();
+            TemplateTensor::symbolic(tensor, layout).unwrap()
+        };
+        let left = symbolic_rows(backend.alloc(DType::F32, &[3, 7]).unwrap());
+        let right = TemplateTensor::from(backend.alloc(DType::F32, &[7, 33]).unwrap());
+        let output = symbolic_rows(backend.alloc(DType::F32, &[3, 33]).unwrap());
+        let variant = resolve_template(
+            &space,
+            Op::Matmul.into(),
+            &[&left, &right],
+            &[&output],
+            "matmul.steel-64x64x16-2x2",
+        )
+        .unwrap();
+        assert!(variant.needs_replay_validation());
     }
 
     #[test]

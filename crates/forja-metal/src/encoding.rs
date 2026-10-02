@@ -1078,6 +1078,7 @@ pub(super) struct PreparedMetalGraph {
     residency: Retained<ProtocolObject<dyn MTLResidencySet>>,
     buffers: HashSet<BufferId>,
     encoding: Option<MetalEncodingPlan>,
+    variant_rechecks: Vec<usize>,
 }
 
 #[derive(Clone)]
@@ -1842,6 +1843,7 @@ impl MetalBackend {
             residency,
             buffers: retained,
             encoding,
+            variant_rechecks: graph.parameter_dependent_dispatch_indices().collect(),
         })
     }
 
@@ -1927,14 +1929,18 @@ impl MetalBackend {
             .template()
             .instantiate(&values)
             .map_err(|_| BackendError::InvalidInput)?;
-        for dispatch in commands.dispatches() {
-            if let Some(variant) = dispatch.backend_data::<crate::ValidatedVariant>() {
-                let validated = self
-                    .validate_variant(dispatch, variant.name())
-                    .map_err(|_| BackendError::InvalidInput)?;
-                if validated.implementation() != variant.implementation() {
-                    return Err(BackendError::InvalidInput);
-                }
+        for &index in &state.variant_rechecks {
+            let dispatch = commands
+                .dispatches()
+                .get(index)
+                .ok_or(BackendError::InvalidInput)?;
+            if let Some(&variant) = dispatch.backend_data::<crate::ValidatedVariant>() {
+                crate::variants::revalidate_replay(
+                    dispatch,
+                    variant,
+                    &[forja_core::DeviceCapability::Metal4],
+                )
+                .map_err(|_| BackendError::InvalidInput)?;
             }
         }
         if profile {
@@ -7803,6 +7809,11 @@ mod tests {
         let graph = backend.prepare_graph(graph).unwrap();
         let state = graph.backend_state::<PreparedMetalGraph>().unwrap();
         assert!(state.encoding.as_ref().unwrap().dispatches[0].is_some());
+        assert!(state.variant_rechecks.is_empty());
+        crate::variants::reset_replay_validation_count();
+        backend.replay(&graph, Vec::new()).unwrap().wait().unwrap();
+        backend.replay(&graph, Vec::new()).unwrap().wait().unwrap();
+        assert_eq!(crate::variants::replay_validation_count(), 0);
     }
 
     #[test]
@@ -7818,7 +7829,8 @@ mod tests {
                 &[&valid_output],
                 "matmul.gemv",
             )
-            .unwrap();
+            .unwrap()
+            .with_all_replay_constraints();
         let space = ParamSpace::new(std::iter::once(1..=2).collect()).unwrap();
         let left = backend.alloc(DType::F32, &[2, 33]).unwrap();
         let output = backend.alloc(DType::F32, &[2, 7]).unwrap();
@@ -7837,11 +7849,21 @@ mod tests {
             .unwrap();
 
         let graph = backend.prepare_graph(template).unwrap();
+        assert_eq!(
+            graph
+                .backend_state::<PreparedMetalGraph>()
+                .unwrap()
+                .variant_rechecks,
+            [0]
+        );
+        crate::variants::reset_replay_validation_count();
         backend.replay(&graph, vec![1]).unwrap().wait().unwrap();
+        assert_eq!(crate::variants::replay_validation_count(), 1);
         assert!(matches!(
             backend.replay(&graph, vec![2]),
             Err(BackendError::InvalidInput)
         ));
+        assert_eq!(crate::variants::replay_validation_count(), 2);
     }
 
     #[test]
