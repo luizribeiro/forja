@@ -1,9 +1,10 @@
 use std::{error::Error, fmt};
 
 use forja_core::{
-    Axis, Constraint, DeviceCapability, Dimension, Dispatch, Guarantee, Layout, LayoutClass,
-    Lifecycle, OperationKind, OperationValue, Relation, TensorRef, TensorSlot, ValueRef,
-    VariantDef, operation_value, render_catalog_json, render_catalog_markdown,
+    Axis, Constraint, ConstraintProofError, DeviceCapability, Dimension, Dispatch, Guarantee,
+    Layout, LayoutClass, Lifecycle, OpError, OperationKind, OperationValue, ParamSpace, Relation,
+    RuleError, TemplateOp, TemplateTensor, TensorRef, TensorSlot, ValueRef, VariantDef,
+    VariantRule, operation_value, prove_constraints, render_catalog_json, render_catalog_markdown,
 };
 
 use crate::matmul::{MatrixLayout, classify};
@@ -91,6 +92,8 @@ pub enum VariantError {
         /// Concrete fact that caused the refusal.
         actual: String,
     },
+    /// A rule is not an exact, valid partition of its replay range.
+    Rule(RuleError),
 }
 
 impl fmt::Display for VariantError {
@@ -127,11 +130,32 @@ impl fmt::Display for VariantError {
                 formatter,
                 "metal {operation} variant '{name}': constraint '{constraint}' failed ({actual})"
             ),
+            Self::Rule(error) => write!(formatter, "metal variant rule: {error}"),
         }
     }
 }
 
 impl Error for VariantError {}
+
+/// A failure while validating an operation and its requested Metal variant.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum VariantValidationError {
+    /// The core operation contract rejected the dispatch.
+    Operation(OpError),
+    /// The Metal registry rejected the requested algorithm.
+    Variant(VariantError),
+}
+
+impl fmt::Display for VariantValidationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Operation(error) => error.fmt(formatter),
+            Self::Variant(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl Error for VariantValidationError {}
 
 const METAL4: &[DeviceCapability] = &[DeviceCapability::Metal4];
 const ACTIVE: Lifecycle = Lifecycle::Active;
@@ -611,6 +635,122 @@ pub(crate) fn resolve(
     Ok(ValidatedVariant { index })
 }
 
+pub(crate) fn resolve_template(
+    space: &ParamSpace,
+    operation: TemplateOp,
+    inputs: &[&TemplateTensor],
+    outputs: &[&TemplateTensor],
+    name: &str,
+) -> Result<ValidatedVariant, VariantError> {
+    let kind = template_operation(operation);
+    let (index, definition) = definition(kind, name, &[DeviceCapability::Metal4])?;
+    prove_constraints(
+        space,
+        operation,
+        inputs,
+        outputs,
+        &[DeviceCapability::Metal4],
+        definition.constraints,
+    )
+    .map_err(|error| proof_error(kind, name, error))?;
+    Ok(ValidatedVariant { index })
+}
+
+pub(crate) fn resolve_rule(
+    space: &ParamSpace,
+    rule: &VariantRule,
+    operation: TemplateOp,
+    inputs: &[&TemplateTensor],
+    outputs: &[&TemplateTensor],
+) -> Result<Vec<ValidatedVariant>, VariantError> {
+    let kind = template_operation(operation);
+    let variants = rule
+        .arms()
+        .iter()
+        .map(|arm| {
+            definition(kind, arm.name(), &[DeviceCapability::Metal4])
+                .map(|(index, _)| ValidatedVariant { index })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    rule.prove(
+        space,
+        operation,
+        inputs,
+        outputs,
+        &[DeviceCapability::Metal4],
+        |name| {
+            REGISTRY
+                .iter()
+                .find(|definition| definition.name == name)
+                .map(|definition| definition.constraints)
+        },
+    )
+    .map_err(VariantError::Rule)?;
+    Ok(variants)
+}
+
+fn definition(
+    operation: OperationKind,
+    name: &str,
+    capabilities: &[DeviceCapability],
+) -> Result<(usize, &'static VariantDef<MetalVariant>), VariantError> {
+    let Some((index, definition)) = REGISTRY
+        .iter()
+        .enumerate()
+        .find(|(_, definition)| definition.name == name)
+    else {
+        return Err(VariantError::Unknown {
+            operation,
+            name: name.to_owned(),
+        });
+    };
+    if definition.operation != operation {
+        return Err(VariantError::WrongOperation {
+            operation,
+            name: name.to_owned(),
+            actual: definition.operation,
+        });
+    }
+    if let Some(&capability) = definition
+        .availability
+        .iter()
+        .find(|capability| !capabilities.contains(capability))
+    {
+        return Err(VariantError::Unavailable {
+            operation,
+            name: name.to_owned(),
+            capability,
+        });
+    }
+    Ok((index, definition))
+}
+
+const fn template_operation(operation: TemplateOp) -> OperationKind {
+    match operation {
+        TemplateOp::Static(operation) => OperationKind::of(operation),
+        TemplateOp::Sdpa { .. } => OperationKind::Sdpa,
+        TemplateOp::Sample { .. } => OperationKind::Other,
+    }
+}
+
+fn proof_error(operation: OperationKind, name: &str, error: ConstraintProofError) -> VariantError {
+    let (constraint, actual) = match error {
+        ConstraintProofError::Violated { constraint, actual } => (constraint, actual),
+        ConstraintProofError::Unsupported { constraint } => {
+            (constraint, "no sound replay-range proof".to_owned())
+        }
+        ConstraintProofError::ArithmeticOverflow { constraint } => {
+            (constraint, "replay-range arithmetic overflowed".to_owned())
+        }
+    };
+    VariantError::Constraint {
+        operation,
+        name: name.to_owned(),
+        constraint,
+        actual,
+    }
+}
+
 fn check_constraint(
     dispatch: &Dispatch,
     capabilities: &[DeviceCapability],
@@ -771,7 +911,9 @@ pub(crate) fn json(device: &str) -> String {
 mod tests {
     use std::collections::HashSet;
 
-    use forja_core::{CommandList, DType, Op, Slice, ViewOp};
+    use forja_core::{
+        Affine, CommandList, DType, Op, ParamSpace, Slice, SymbolicLayout, TemplateTensor, ViewOp,
+    };
     use forja_cpu::CpuBackend;
     use proptest::prelude::*;
 
@@ -1038,6 +1180,33 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "metal matmul variant 'matmul.gemv': constraint 'm = 1' failed (m was 2)"
+        );
+    }
+
+    #[test]
+    fn symbolic_pins_report_the_failing_replay_range() {
+        let backend = CpuBackend::new();
+        let space = ParamSpace::new(std::iter::once(1..=2).collect()).unwrap();
+        let symbolic_rows = |tensor: forja_core::Tensor| {
+            let layout = SymbolicLayout::new(tensor.layout().clone(), space.clone())
+                .slice(0, 0.into(), Affine::parameter(0, 0, 1), 1)
+                .unwrap();
+            TemplateTensor::symbolic(tensor, layout).unwrap()
+        };
+        let left = symbolic_rows(backend.alloc(DType::F32, &[2, 7]).unwrap());
+        let right = TemplateTensor::from(backend.alloc(DType::F32, &[7, 33]).unwrap());
+        let output = symbolic_rows(backend.alloc(DType::F32, &[2, 33]).unwrap());
+        let error = resolve_template(
+            &space,
+            Op::Matmul.into(),
+            &[&left, &right],
+            &[&output],
+            "matmul.gemv",
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "metal matmul variant 'matmul.gemv': constraint 'm = 1' failed (m spans 1..=2)"
         );
     }
 

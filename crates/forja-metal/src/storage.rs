@@ -425,6 +425,68 @@ impl MetalBackend {
         crate::variants::resolve(dispatch, name, &[forja_core::DeviceCapability::Metal4])
     }
 
+    /// Validates a core operation and resolves one concrete algorithm choice for it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::VariantValidationError`] when the operation contract or variant rejects
+    /// the dispatch.
+    pub fn validate_variant_for_op(
+        &self,
+        operation: forja_core::Op,
+        inputs: &[&forja_core::Tensor],
+        outputs: &[&forja_core::Tensor],
+        name: &str,
+    ) -> Result<crate::ValidatedVariant, crate::VariantValidationError> {
+        let mut commands = forja_core::CommandList::new();
+        commands
+            .dispatch_many(operation, inputs, outputs)
+            .map_err(crate::VariantValidationError::Operation)?;
+        self.validate_variant(
+            commands
+                .last_dispatch()
+                .ok_or(forja_core::OpError::Arity {
+                    expected: 1,
+                    actual: 0,
+                })
+                .map_err(crate::VariantValidationError::Operation)?,
+            name,
+        )
+        .map_err(crate::VariantValidationError::Variant)
+    }
+
+    /// Resolves and proves one algorithm choice over a complete replay parameter box.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::VariantError`] when lookup, availability, or a range proof fails.
+    pub fn validate_template_variant(
+        &self,
+        space: &forja_core::ParamSpace,
+        operation: forja_core::TemplateOp,
+        inputs: &[&forja_core::TemplateTensor],
+        outputs: &[&forja_core::TemplateTensor],
+        name: &str,
+    ) -> Result<crate::ValidatedVariant, crate::VariantError> {
+        crate::variants::resolve_template(space, operation, inputs, outputs, name)
+    }
+
+    /// Resolves and proves every arm of a replay algorithm rule.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::VariantError`] when rule syntax, lookup, availability, or a proof fails.
+    pub fn validate_variant_rule(
+        &self,
+        space: &forja_core::ParamSpace,
+        rule: &forja_core::VariantRule,
+        operation: forja_core::TemplateOp,
+        inputs: &[&forja_core::TemplateTensor],
+        outputs: &[&forja_core::TemplateTensor],
+    ) -> Result<Vec<crate::ValidatedVariant>, crate::VariantError> {
+        crate::variants::resolve_rule(space, rule, operation, inputs, outputs)
+    }
+
     /// Creates a backend on the system default Metal 4 device.
     ///
     /// # Errors

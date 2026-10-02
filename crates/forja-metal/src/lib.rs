@@ -20,7 +20,7 @@ pub use encoding::MetalProgramHandle;
 #[cfg(target_os = "macos")]
 pub use storage::{MetalBackend, MetalGraphReplay, ProgramCompileBudget};
 #[cfg(target_os = "macos")]
-pub use variants::{ValidatedVariant, VariantError};
+pub use variants::{ValidatedVariant, VariantError, VariantValidationError};
 
 #[cfg(target_os = "macos")]
 mod platform {
