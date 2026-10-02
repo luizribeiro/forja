@@ -109,6 +109,10 @@ impl ParamSpace {
         &self.ranges
     }
 
+    pub(crate) const fn identity(&self) -> u64 {
+        self.id
+    }
+
     /// Checks concrete values against this parameter space.
     ///
     /// # Errors

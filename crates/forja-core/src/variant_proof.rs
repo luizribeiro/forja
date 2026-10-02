@@ -53,6 +53,213 @@ impl fmt::Display for ConstraintProofError {
 impl Error for ConstraintProofError {}
 
 /// One inclusive parameter interval selecting a stable variant name.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuleArm {
+    lo: u32,
+    hi: u32,
+    name: String,
+}
+
+impl RuleArm {
+    /// Creates one inclusive rule arm.
+    #[must_use]
+    pub fn new(lo: u32, hi: u32, name: impl Into<String>) -> Self {
+        Self {
+            lo,
+            hi,
+            name: name.into(),
+        }
+    }
+
+    /// Returns the inclusive lower boundary.
+    #[must_use]
+    pub const fn lo(&self) -> u32 {
+        self.lo
+    }
+
+    /// Returns the inclusive upper boundary.
+    #[must_use]
+    pub const fn hi(&self) -> u32 {
+        self.hi
+    }
+
+    /// Returns the selected stable variant name.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+/// A reason a parameterized variant rule was refused.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RuleError {
+    /// The rule and proof use different parameter-space identities.
+    ParameterSpaceMismatch,
+    /// The selected parameter does not exist.
+    UnknownParameter,
+    /// No arms were supplied.
+    Empty,
+    /// An arm's inclusive interval is empty.
+    EmptyArm {
+        /// Zero-based arm position.
+        index: usize,
+    },
+    /// Arms overlap, are unordered, or leave a gap.
+    Coverage {
+        /// Zero-based arm position where coverage first differs.
+        index: usize,
+        /// Boundary required for exact coverage.
+        expected: u32,
+        /// Boundary supplied by the arm.
+        actual: u32,
+    },
+    /// The final arm does not end at the declared parameter maximum.
+    Incomplete {
+        /// Required inclusive maximum.
+        expected: u32,
+        /// Supplied inclusive maximum.
+        actual: u32,
+    },
+    /// An arm names no known definition.
+    UnknownVariant {
+        /// Stable name supplied by the arm.
+        name: String,
+    },
+    /// A selected definition is not valid over its complete parameter box.
+    Constraint {
+        /// Stable name supplied by the arm.
+        name: String,
+        /// Underlying proof refusal.
+        source: ConstraintProofError,
+    },
+}
+
+impl fmt::Display for RuleError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "invalid variant rule: {self:?}")
+    }
+}
+
+impl Error for RuleError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Constraint { source, .. } => Some(source),
+            _ => None,
+        }
+    }
+}
+
+/// An ordered, exact partition of one replay parameter range.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VariantRule {
+    space_id: u64,
+    parameter: u8,
+    arms: Vec<RuleArm>,
+}
+
+impl VariantRule {
+    /// Validates ordered, non-overlapping arms that exactly cover one declared range.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuleError`] for an absent parameter, empty arm list, empty interval, gap,
+    /// overlap, ordering error, or incomplete final arm.
+    pub fn new(space: &ParamSpace, parameter: u8, arms: Vec<RuleArm>) -> Result<Self, RuleError> {
+        let range = space
+            .ranges()
+            .get(usize::from(parameter))
+            .ok_or(RuleError::UnknownParameter)?;
+        if arms.is_empty() {
+            return Err(RuleError::Empty);
+        }
+        let mut expected = *range.start();
+        for (index, arm) in arms.iter().enumerate() {
+            if arm.lo > arm.hi {
+                return Err(RuleError::EmptyArm { index });
+            }
+            if arm.lo != expected {
+                return Err(RuleError::Coverage {
+                    index,
+                    expected,
+                    actual: arm.lo,
+                });
+            }
+            if index + 1 < arms.len() {
+                expected = arm.hi.checked_add(1).ok_or(RuleError::Coverage {
+                    index: index + 1,
+                    expected: arm.hi,
+                    actual: arms[index + 1].lo,
+                })?;
+            }
+        }
+        let actual = arms.last().map_or(0, |arm| arm.hi);
+        if actual != *range.end() {
+            return Err(RuleError::Incomplete {
+                expected: *range.end(),
+                actual,
+            });
+        }
+        Ok(Self {
+            space_id: space.identity(),
+            parameter,
+            arms,
+        })
+    }
+
+    /// Returns the selected parameter index.
+    #[must_use]
+    pub const fn parameter(&self) -> u8 {
+        self.parameter
+    }
+
+    /// Returns the validated boundary table.
+    #[must_use]
+    pub fn arms(&self) -> &[RuleArm] {
+        &self.arms
+    }
+
+    /// Proves each selected definition over its arm crossed with all other parameter ranges.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuleError::UnknownVariant`] when lookup fails, or [`RuleError::Constraint`] when
+    /// an atom is false, overflows, or lacks a sound range proof.
+    pub fn prove<'a>(
+        &self,
+        space: &ParamSpace,
+        operation: TemplateOp,
+        inputs: &[&TemplateTensor],
+        outputs: &[&TemplateTensor],
+        capabilities: &[DeviceCapability],
+        mut constraints_for: impl FnMut(&str) -> Option<&'a [Constraint]>,
+    ) -> Result<(), RuleError> {
+        if self.space_id != space.identity() {
+            return Err(RuleError::ParameterSpaceMismatch);
+        }
+        for arm in &self.arms {
+            let constraints =
+                constraints_for(&arm.name).ok_or_else(|| RuleError::UnknownVariant {
+                    name: arm.name.clone(),
+                })?;
+            let mut ranges = space.ranges().to_vec();
+            ranges[usize::from(self.parameter)] = arm.lo..=arm.hi;
+            prove_with_ranges(
+                operation,
+                inputs,
+                outputs,
+                capabilities,
+                constraints,
+                &ranges,
+            )
+            .map_err(|source| RuleError::Constraint {
+                name: arm.name.clone(),
+                source,
+            })?;
+        }
+        Ok(())
+    }
+}
+
 /// Proves constraints over the complete declared parameter box.
 ///
 /// # Errors
@@ -600,6 +807,19 @@ mod tests {
         left: INPUT_WIDTH,
         right: OTHER_WIDTH,
     };
+    const LOW: &[Constraint] = &[Constraint::Value {
+        value: PRODUCT,
+        relation: Relation::Range { min: 1, max: 10 },
+    }];
+    const HIGH: &[Constraint] = &[Constraint::Value {
+        value: PRODUCT,
+        relation: Relation::Range { min: 3, max: 15 },
+    }];
+    const TOO_LOW: &[Constraint] = &[Constraint::Value {
+        value: PRODUCT,
+        relation: Relation::Range { min: 1, max: 9 },
+    }];
+
     fn tensor(buffer: u64, layout: Layout) -> Tensor {
         Tensor::from_allocation(BufferId::new(7, buffer, layout.buffer_len()), layout, true)
             .unwrap()
@@ -649,6 +869,87 @@ mod tests {
             Err(ConstraintProofError::Violated { .. })
         ));
     }
+
+    #[test]
+    fn rule_arms_must_exactly_partition_the_declared_range() {
+        let space = ParamSpace::new(std::iter::once(1..=33).collect()).unwrap();
+        assert!(
+            VariantRule::new(
+                &space,
+                0,
+                vec![RuleArm::new(1, 7, "a"), RuleArm::new(8, 33, "b")]
+            )
+            .is_ok()
+        );
+        assert!(matches!(
+            VariantRule::new(
+                &space,
+                0,
+                vec![RuleArm::new(1, 7, "a"), RuleArm::new(9, 33, "b")]
+            ),
+            Err(RuleError::Coverage { .. })
+        ));
+        assert!(matches!(
+            VariantRule::new(
+                &space,
+                0,
+                vec![RuleArm::new(1, 8, "a"), RuleArm::new(8, 33, "b")]
+            ),
+            Err(RuleError::Coverage { .. })
+        ));
+        assert!(matches!(
+            VariantRule::new(&space, 0, vec![RuleArm::new(1, 7, "a")]),
+            Err(RuleError::Incomplete { .. })
+        ));
+        assert!(matches!(
+            VariantRule::new(&space, 0, vec![RuleArm::new(8, 7, "a")]),
+            Err(RuleError::EmptyArm { .. })
+        ));
+    }
+
+    #[test]
+    fn proves_each_arm_across_other_parameters_full_ranges() {
+        let space = ParamSpace::new(vec![1..=3, 1..=5]).unwrap();
+        let left = symbolic_vector(1, &space, 0, 3);
+        let right = symbolic_vector(2, &space, 1, 5);
+        let rule = VariantRule::new(
+            &space,
+            0,
+            vec![RuleArm::new(1, 2, "low"), RuleArm::new(3, 3, "high")],
+        )
+        .unwrap();
+
+        rule.prove(
+            &space,
+            TemplateOp::Static(Op::Add),
+            &[&left, &right],
+            &[],
+            &[],
+            |name| match name {
+                "low" => Some(LOW),
+                "high" => Some(HIGH),
+                _ => None,
+            },
+        )
+        .unwrap();
+
+        assert!(matches!(
+            rule.prove(
+                &space,
+                TemplateOp::Static(Op::Add),
+                &[&left, &right],
+                &[],
+                &[],
+                |name| match name {
+                    "low" => Some(TOO_LOW),
+                    "high" => Some(HIGH),
+                    _ => None,
+                },
+            ),
+            Err(RuleError::Constraint { name, .. }) if name == "low"
+        ));
+    }
+
     #[test]
     fn checked_range_arithmetic_reports_overflow() {
         let expression = Expression {
@@ -688,6 +989,21 @@ mod tests {
             Err(ConstraintProofError::Unsupported { .. })
         ));
     }
+
+    #[test]
+    fn rules_reject_a_different_parameter_space_before_indexing() {
+        let space = ParamSpace::new(std::iter::once(1..=3).collect()).unwrap();
+        let foreign = ParamSpace::new(Vec::new()).unwrap();
+        let rule = VariantRule::new(&space, 0, vec![RuleArm::new(1, 3, "low")]).unwrap();
+
+        assert_eq!(
+            rule.prove(&foreign, TemplateOp::Static(Op::Add), &[], &[], &[], |_| {
+                Some(LOW)
+            },),
+            Err(RuleError::ParameterSpaceMismatch)
+        );
+    }
+
     #[test]
     fn divisibility_of_dimension_products_is_unsupported() {
         let space = ParamSpace::new(vec![1..=3, 1..=5]).unwrap();
