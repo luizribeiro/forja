@@ -205,16 +205,13 @@ fn build_qwen_profiles(
         "qwen3-bf16.wasm",
     )?;
     let variants = [
-        ("residual-norm-only", "qwen3-residual-norm.wasm"),
-        ("qk-norm-rope-only", "qwen3-qk-norm-rope.wasm"),
-        ("silu-mul-only", "qwen3-silu-mul.wasm"),
-        ("final-norm-only", "qwen3-final-norm.wasm"),
-        ("all-fusions", "qwen3-all-fusions.wasm"),
+        "qwen3-residual-norm.wasm",
+        "qwen3-qk-norm-rope.wasm",
+        "qwen3-silu-mul.wasm",
+        "qwen3-final-norm.wasm",
+        "qwen3-all-fusions.wasm",
     ]
-    .map(|(feature, name)| {
-        build_qwen_profile(manifest, target_dir, feature)?;
-        copy_component(&release_dir.join("qwen3.wasm"), out_dir, name)
-    })
+    .map(|name| copy_component(&qwen3, out_dir, name))
     .into_iter()
     .collect::<io::Result<Vec<_>>>()?;
     let [
@@ -226,25 +223,17 @@ fn build_qwen_profiles(
     ] = variants
         .try_into()
         .map_err(|_| io::Error::other("fusion profile count changed"))?;
-    build_qwen_profile(manifest, bf16_target_dir, "bf16,residual-norm-only")?;
-    let qwen3_bf16_residual_norm = copy_component(
-        &bf16_release_dir.join("qwen3.wasm"),
-        out_dir,
-        "qwen3-bf16-residual-norm.wasm",
-    )?;
-    build_qwen_profile(manifest, bf16_target_dir, "bf16,all-fusions")?;
-    let qwen3_bf16_all_fusions = copy_component(
-        &bf16_release_dir.join("qwen3.wasm"),
-        out_dir,
-        "qwen3-bf16-all-fusions.wasm",
-    )?;
-    build_qwen_profile(manifest, target_dir, "all-fusions,no-replay")?;
+    let qwen3_bf16_residual_norm =
+        copy_component(&qwen3_bf16, out_dir, "qwen3-bf16-residual-norm.wasm")?;
+    let qwen3_bf16_all_fusions =
+        copy_component(&qwen3_bf16, out_dir, "qwen3-bf16-all-fusions.wasm")?;
+    build_qwen_profile(manifest, target_dir, "no-replay")?;
     let qwen3_no_replay = copy_component(
         &release_dir.join("qwen3.wasm"),
         out_dir,
         "qwen3-no-replay.wasm",
     )?;
-    build_qwen_profile(manifest, bf16_target_dir, "bf16,all-fusions,no-replay")?;
+    build_qwen_profile(manifest, bf16_target_dir, "bf16,no-replay")?;
     let qwen3_bf16_no_replay = copy_component(
         &bf16_release_dir.join("qwen3.wasm"),
         out_dir,

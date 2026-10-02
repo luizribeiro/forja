@@ -704,22 +704,26 @@ mod tests {
         )?;
         let fixtures = FixtureDirectory::open(&options.fixtures)?;
         let weights = verify_model_hash(&options, &fixtures)?;
-        let components = [
-            test_guests::qwen3_residual_norm(),
-            test_guests::qwen3_qk_norm_rope(),
-            test_guests::qwen3_silu_mul(),
-            test_guests::qwen3_final_norm(),
-            test_guests::qwen3_all_fusions(),
+        let cases = [
+            (test_guests::qwen3_residual_norm(), &["residual-norm"][..]),
+            (test_guests::qwen3_qk_norm_rope(), &["qk-norm-rope"][..]),
+            (test_guests::qwen3_silu_mul(), &["silu-mul"][..]),
+            (test_guests::qwen3_final_norm(), &["final-norm"][..]),
+            (
+                test_guests::qwen3_all_fusions(),
+                &["residual-norm", "qk-norm-rope", "silu-mul", "final-norm"][..],
+            ),
         ];
         let runtime = tokio::runtime::Builder::new_current_thread().build()?;
-        for component in components {
+        for (component, tunings) in cases {
+            let config = qwen_tunings(tunings);
             runtime.block_on(run_with_component(
                 &options,
                 &fixtures,
                 EngineSource {
                     weights: &weights,
                     component,
-                    load_config: None,
+                    load_config: Some(&config),
                 },
                 32,
                 true,
@@ -737,17 +741,22 @@ mod tests {
         let weights = verify_model_hash(&options, &fixtures)?;
         let summary = tokio::runtime::Builder::new_current_thread()
             .build()?
-            .block_on(run_with_component(
-                &options,
-                &fixtures,
-                EngineSource {
-                    weights: &weights,
-                    component: test_guests::qwen3_bf16(),
-                    load_config: None,
-                },
-                32,
-                true,
-            ))?;
+            .block_on(async {
+                let config =
+                    qwen_tunings(&["residual-norm", "qk-norm-rope", "silu-mul", "final-norm"]);
+                run_with_component(
+                    &options,
+                    &fixtures,
+                    EngineSource {
+                        weights: &weights,
+                        component: test_guests::qwen3_bf16(),
+                        load_config: Some(&config),
+                    },
+                    32,
+                    true,
+                )
+                .await
+            })?;
         assert!(summary.maximum_layer_error <= BF16_HIDDEN_STATE_TOLERANCE);
         assert!(summary.teacher_forced.mean_kl() <= BF16_LOGIT_KL_TOLERANCE);
         assert!(top1_passes(summary.teacher_forced));
@@ -893,6 +902,13 @@ mod tests {
         tokio::runtime::Builder::new_current_thread()
             .build()?
             .block_on(run_with_steps(&options, decode_steps))
+    }
+
+    fn qwen_tunings(names: &[&str]) -> forja_host::EngineLoadConfig {
+        forja_host::EngineLoadConfig {
+            tunings: names.iter().map(|name| (*name).to_owned()).collect(),
+            ..forja_host::EngineLoadConfig::default()
+        }
     }
 
     fn model_options(

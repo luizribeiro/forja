@@ -4,7 +4,8 @@ use std::{collections::VecDeque, env, error::Error, path::PathBuf, time::Duratio
 
 use forja_core::Backend;
 use forja_host::{
-    EngineDecode, EngineRunner, EngineStep, Limits, SamplingParams, bindings::l9o::gpu::compute,
+    EngineDecode, EngineLoadConfig, EngineRunner, EngineStep, Limits, SamplingParams,
+    bindings::l9o::gpu::compute,
 };
 use forja_sdk::{Engine, Tensor, Weights};
 use golden_fixtures::{
@@ -513,10 +514,16 @@ where
         weights,
     )
     .await?;
+    let config = EngineLoadConfig {
+        tunings: ["residual-norm", "qk-norm-rope", "silu-mul", "final-norm"]
+            .map(str::to_owned)
+            .to_vec(),
+        ..EngineLoadConfig::default()
+    };
     for (_, replay) in &mut replays {
-        replay.load().await??;
+        replay.load_with_selections(None, &config).await??;
     }
-    lazy.load().await??;
+    lazy.load_with_selections(None, &config).await??;
     let prompt = (0_u32..8).collect::<Vec<_>>();
     for (_, replay) in &mut replays {
         replay

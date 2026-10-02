@@ -22,14 +22,9 @@ version.workspace = true
 crate-type = ["cdylib", "rlib"]
 
 [features]
-all-fusions = []
 bf16 = []
-default = ["all-fusions"]
-final-norm-only = []
+default = []
 no-replay = []
-qk-norm-rope-only = []
-residual-norm-only = []
-silu-mul-only = []
 
 [dependencies]
 forja-sdk = { path = "../../crates/forja-sdk", features = ["metal-variants"] }
