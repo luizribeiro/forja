@@ -224,7 +224,7 @@ struct BenchArgs {
     vary: Vec<VaryArg>,
     #[command(flatten)]
     tuning: TuningBenchArgs,
-    /// Re-run a schema-v2 benchmark record.
+    /// Re-run a schema-v1, v2, or v3 benchmark record.
     #[arg(long)]
     rerun: Option<PathBuf>,
     /// Permit one performance-key difference while re-running.
@@ -483,11 +483,11 @@ fn load_record(path: &PathBuf) -> Result<(PathBuf, Recorded), clap::Error> {
         )
     })?;
     let schema_version = value["schema_version"].as_u64().unwrap_or_default();
-    if schema_version != u64::from(SCHEMA_VERSION) {
+    if !(1..=u64::from(SCHEMA_VERSION)).contains(&schema_version) {
         return Err(Cli::command().error(
             clap::error::ErrorKind::ValueValidation,
             format!(
-                "{}: rerun requires schema version {SCHEMA_VERSION}, found {}",
+                "{}: rerun supports schema versions 1 through {SCHEMA_VERSION}, found {}",
                 path.display(),
                 schema_version
             ),
@@ -499,6 +499,23 @@ fn load_record(path: &PathBuf) -> Result<(PathBuf, Recorded), clap::Error> {
             format!("{}: invalid benchmark record: {error}", path.display()),
         )
     })?;
+    if record.schema_version == SCHEMA_VERSION
+        && record.inputs.iter().any(|input| {
+            input.profile_hash.is_none()
+                || input.profile_name.is_empty()
+                || input.profile_family.is_empty()
+                || input.numerics.is_none()
+                || input.model_revision.is_none()
+        })
+    {
+        return Err(Cli::command().error(
+            clap::error::ErrorKind::ValueValidation,
+            format!(
+                "{}: schema-v3 inputs require complete profile identity",
+                path.display()
+            ),
+        ));
+    }
     Ok((path.clone(), record))
 }
 

@@ -185,22 +185,30 @@ async fn run_metal(options: &Bench) -> Result<(), Box<dyn Error>> {
     let date = command_output("date", &["-u", "+%Y-%m-%dT%H:%MZ"])?;
     let gpu_cores = gpu_core_count()?;
     let binary_sha256 = sha256_file(std::env::current_exe()?)?;
-    let weights_sha256 = sha256_file(weights_path(&options.model_dir)?)?;
+    let profiles = options
+        .engines
+        .iter()
+        .map(|component| crate::resolution::read_embedded_profile(component))
+        .collect::<Result<Vec<_>, _>>()?;
     let inputs = options
         .engines
         .iter()
-        .map(|component| {
+        .zip(&profiles)
+        .map(|(component, profile)| {
             Ok(Input {
                 engine_sha256: sha256_file(component)?,
-                engine_variant: component
+                engine_variant: String::new(),
+                engine_build_profile: String::new(),
+                profile_name: component
                     .file_stem()
                     .unwrap_or_default()
                     .to_string_lossy()
                     .into_owned(),
-                engine_build_profile: engine_build_profile(component).to_owned(),
-                profile_hash: None,
-                weights_sha256: weights_sha256.clone(),
-                model_revision: None,
+                profile_family: profile.family().to_owned(),
+                numerics: Some(*profile.numerics()),
+                profile_hash: Some(profile.sha256().map_err(std::io::Error::other)?),
+                weights_sha256: profile.model().weights_sha256.clone(),
+                model_revision: Some(profile.model().revision.clone()),
             })
         })
         .collect::<Result<Vec<_>, std::io::Error>>()?;
@@ -226,7 +234,8 @@ async fn run_metal(options: &Bench) -> Result<(), Box<dyn Error>> {
         .map(|point| {
             inputs
                 .iter()
-                .map(|input| benchmark_record::perf_key(point, input))
+                .zip(&profiles)
+                .map(|(input, profile)| benchmark_record::perf_key(point, input, profile))
                 .collect::<Result<Vec<_>, _>>()
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -241,7 +250,7 @@ async fn run_metal(options: &Bench) -> Result<(), Box<dyn Error>> {
                 .collect::<Result<Vec<_>, _>>()
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let (results, device) = measure_points(options, &perf_hashes).await?;
+    let (results, device) = measure_points(options, &perf_keys, &perf_hashes).await?;
     let load_after = machine_load::capture("AFTER BENCHMARK")?;
     check_strategy_outputs(&options.strategy_axes, &results)?;
     if options
@@ -352,37 +361,34 @@ fn validate_engine_identity(recorded: &Input, current: &Input) -> Result<(), Str
             &current.engine_build_profile,
         ),
     ] {
+        if !recorded.is_empty() && !current.is_empty() && recorded != current {
+            return Err(format!(
+                "rerun engine {name} mismatch: recorded {recorded}, current {current}"
+            ));
+        }
+    }
+    for (name, recorded, current) in [
+        (
+            "profile name",
+            &recorded.profile_name,
+            &current.profile_name,
+        ),
+        (
+            "profile family",
+            &recorded.profile_family,
+            &current.profile_family,
+        ),
+    ] {
         if !recorded.is_empty() && recorded != current {
             return Err(format!(
                 "rerun engine {name} mismatch: recorded {recorded}, current {current}"
             ));
         }
     }
-    Ok(())
-}
-
-fn engine_build_profile(component: &Path) -> &'static str {
-    let generated_release = component.ancestors().any(|path| {
-        path.file_name() == Some(std::ffi::OsStr::new("out"))
-            && path
-                .parent()
-                .and_then(Path::file_name)
-                .is_some_and(|name| name.to_string_lossy().starts_with("test-guests-"))
-    });
-    if generated_release
-        || component
-            .components()
-            .any(|part| part.as_os_str() == "release")
-    {
-        "release"
-    } else if component
-        .components()
-        .any(|part| part.as_os_str() == "debug")
-    {
-        "debug"
-    } else {
-        "unknown"
+    if recorded.profile_hash.is_some() && recorded.profile_hash != current.profile_hash {
+        return Err("rerun engine profile hash mismatch".to_owned());
     }
+    Ok(())
 }
 
 fn validate_comparability(
@@ -391,7 +397,7 @@ fn validate_comparability(
     perf_keys: &[Vec<PerfKey>],
 ) -> Result<(), String> {
     let recorded = benchmark_record::recorded_perf_keys(record)?;
-    let current = options
+    let mut current = options
         .points
         .iter()
         .zip(perf_keys)
@@ -400,6 +406,12 @@ fn validate_comparability(
                 .flat_map(|key| std::iter::repeat_n(key.clone(), point.selection.len()))
         })
         .collect::<Vec<_>>();
+    if record.schema_version < 3 {
+        for key in &mut current {
+            key.remove("engine.tunings");
+            key.remove("engine.picks_hash");
+        }
+    }
     if recorded.len() != current.len() {
         return Err(format!(
             "benchmark records are not comparable:\n  results.count: {} -> {}",
@@ -679,6 +691,7 @@ fn check_strategy_outputs(
 #[cfg(target_os = "macos")]
 async fn measure_points(
     options: &Bench,
+    perf_keys: &[Vec<PerfKey>],
     perf_hashes: &[Vec<String>],
 ) -> Result<(Vec<serde_json::Value>, String), Box<dyn Error>> {
     let mut results = Vec::new();
@@ -719,6 +732,8 @@ async fn measure_points(
                         .iter()
                         .filter_map(sampling_fallbacks_json)
                         .collect::<Vec<_>>(),
+                    "engine.tunings": perf_keys[point_index][input]["engine.tunings"],
+                    "engine.picks_hash": perf_keys[point_index][input]["engine.picks_hash"],
                 });
                 if !profile_reports.is_empty() {
                     result["breakdown"] = serde_json::Value::Array(
@@ -1769,6 +1784,10 @@ mod tests {
 
     use super::*;
 
+    fn test_profile() -> forja_config::Profile {
+        crate::resolution::read_embedded_profile(test_guests::qwen3()).unwrap()
+    }
+
     #[test]
     fn decode_timing_excludes_one_step_after_prefill() -> Result<(), Box<dyn Error>> {
         let mut visited = Vec::new();
@@ -1839,6 +1858,9 @@ mod tests {
                 engine_sha256: "old-engine".to_owned(),
                 engine_variant: "variant".to_owned(),
                 engine_build_profile: "release".to_owned(),
+                profile_name: String::new(),
+                profile_family: String::new(),
+                numerics: None,
                 profile_hash: None,
                 weights_sha256: "weights".to_owned(),
                 model_revision: None,
@@ -1851,6 +1873,9 @@ mod tests {
             engine_sha256: "new-engine".to_owned(),
             engine_variant: "variant".to_owned(),
             engine_build_profile: "release".to_owned(),
+            profile_name: String::new(),
+            profile_family: String::new(),
+            numerics: None,
             profile_hash: None,
             weights_sha256: "weights".to_owned(),
             model_revision: None,
@@ -1868,6 +1893,9 @@ mod tests {
             engine_sha256: engine.to_owned(),
             engine_variant: "variant".to_owned(),
             engine_build_profile: "release".to_owned(),
+            profile_name: String::new(),
+            profile_family: String::new(),
+            numerics: None,
             profile_hash: None,
             weights_sha256: "weights".to_owned(),
             model_revision: None,
@@ -1891,6 +1919,9 @@ mod tests {
             engine_sha256: engine.to_owned(),
             engine_variant: "variant".to_owned(),
             engine_build_profile: "release".to_owned(),
+            profile_name: String::new(),
+            profile_family: String::new(),
+            numerics: None,
             profile_hash: None,
             weights_sha256: weights.to_owned(),
             model_revision: None,
@@ -1919,20 +1950,6 @@ mod tests {
     }
 
     #[test]
-    fn identifies_generated_guest_builds_as_release() {
-        assert_eq!(
-            engine_build_profile(Path::new(
-                "/target/debug/build/test-guests-hash/out/qwen3-bf16.wasm"
-            )),
-            "release"
-        );
-        assert_eq!(
-            engine_build_profile(Path::new("/target/debug/custom.wasm")),
-            "debug"
-        );
-    }
-
-    #[test]
     fn comparability_accepts_reordered_engines() {
         let crate::args::Command::Bench(recorded_options) = crate::args::parse(
             [
@@ -1947,6 +1964,9 @@ mod tests {
             engine_sha256: engine.to_owned(),
             engine_variant: "variant".to_owned(),
             engine_build_profile: "release".to_owned(),
+            profile_name: String::new(),
+            profile_family: String::new(),
+            numerics: None,
             profile_hash: None,
             weights_sha256: "weights".to_owned(),
             model_revision: None,
@@ -1954,7 +1974,7 @@ mod tests {
         let first = input("first");
         let second = input("second");
         let record = Recorded {
-            schema_version: benchmark_record::SCHEMA_VERSION,
+            schema_version: 2,
             provenance: benchmark_record::RecordedProvenance {
                 commit: "recorded".to_owned(),
             },
@@ -1985,7 +2005,7 @@ mod tests {
             .map(|point| {
                 [&second, &first]
                     .into_iter()
-                    .map(|input| benchmark_record::perf_key(point, input).unwrap())
+                    .map(|input| benchmark_record::perf_key(point, input, &test_profile()).unwrap())
                     .collect()
             })
             .collect::<Vec<_>>();
@@ -2004,12 +2024,15 @@ mod tests {
             engine_sha256: "engine".to_owned(),
             engine_variant: "variant".to_owned(),
             engine_build_profile: "release".to_owned(),
+            profile_name: String::new(),
+            profile_family: String::new(),
+            numerics: None,
             profile_hash: None,
             weights_sha256: "weights".to_owned(),
             model_revision: None,
         };
         let record = Recorded {
-            schema_version: benchmark_record::SCHEMA_VERSION,
+            schema_version: 2,
             provenance: benchmark_record::RecordedProvenance {
                 commit: "recorded".to_owned(),
             },
@@ -2035,7 +2058,7 @@ mod tests {
         let keys = current
             .points
             .iter()
-            .map(|point| vec![benchmark_record::perf_key(point, &input).unwrap()])
+            .map(|point| vec![benchmark_record::perf_key(point, &input, &test_profile()).unwrap()])
             .collect::<Vec<_>>();
         let error = validate_comparability(&current, &record, &keys).unwrap_err();
         assert!(error.contains("bench.reps"));
@@ -2055,12 +2078,15 @@ mod tests {
             engine_sha256: engine.to_owned(),
             engine_variant: "variant".to_owned(),
             engine_build_profile: "release".to_owned(),
+            profile_name: String::new(),
+            profile_family: String::new(),
+            numerics: None,
             profile_hash: None,
             weights_sha256: "weights".to_owned(),
             model_revision: None,
         };
         let record = Recorded {
-            schema_version: benchmark_record::SCHEMA_VERSION,
+            schema_version: 2,
             provenance: benchmark_record::RecordedProvenance {
                 commit: "recorded".to_owned(),
             },
@@ -2083,7 +2109,12 @@ mod tests {
         let keys = current
             .points
             .iter()
-            .map(|point| vec![benchmark_record::perf_key(point, &input("new-engine")).unwrap()])
+            .map(|point| {
+                vec![
+                    benchmark_record::perf_key(point, &input("new-engine"), &test_profile())
+                        .unwrap(),
+                ]
+            })
             .collect::<Vec<_>>();
         assert!(
             validate_comparability(&current, &record, &keys)

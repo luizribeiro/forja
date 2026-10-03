@@ -1,22 +1,30 @@
 use std::collections::BTreeMap;
 
-use forja_config::{Choice, DevConfig, GraphReplay, KeyPath, Origin};
+use forja_config::{Choice, DevConfig, GraphReplay, KeyPath, Numerics, Origin, Profile};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::args::{Bench, BenchPoint};
 
-pub(crate) const SCHEMA_VERSION: u32 = 2;
+pub(crate) const SCHEMA_VERSION: u32 = 3;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub(crate) struct Input {
     pub(crate) engine_sha256: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub(crate) engine_variant: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub(crate) engine_build_profile: String,
+    #[serde(default)]
+    pub(crate) profile_name: String,
+    #[serde(default)]
+    pub(crate) profile_family: String,
+    #[serde(default)]
+    pub(crate) numerics: Option<Numerics>,
+    #[serde(default)]
     pub(crate) profile_hash: Option<String>,
     pub(crate) weights_sha256: String,
+    #[serde(default)]
     pub(crate) model_revision: Option<String>,
 }
 
@@ -30,8 +38,11 @@ pub(crate) struct Recorded {
     pub(crate) schema_version: u32,
     pub(crate) provenance: RecordedProvenance,
     pub(crate) inputs: Vec<Input>,
+    #[serde(default)]
     pub(crate) config: String,
+    #[serde(default)]
     pub(crate) axes: BTreeMap<KeyPath, Vec<toml::Value>>,
+    #[serde(default)]
     pub(crate) results: Vec<serde_json::Value>,
 }
 
@@ -102,8 +113,22 @@ pub(crate) fn config_hash(snapshot: &Snapshot, inputs: &[Input]) -> Result<Strin
     })
 }
 
-pub(crate) fn perf_key(point: &BenchPoint, input: &Input) -> Result<PerfKey, String> {
-    perf_key_from(&point.config, point.graph_replay, input)
+pub(crate) fn perf_key(
+    point: &BenchPoint,
+    input: &Input,
+    profile: &Profile,
+) -> Result<PerfKey, String> {
+    let mut key = perf_key_from(&point.config, point.graph_replay, input)?;
+    let selection = point.config.engine.resolve(profile)?;
+    key.insert(
+        "engine.tunings".to_owned(),
+        serde_json::json!(selection.tunings),
+    );
+    key.insert(
+        "engine.picks_hash".to_owned(),
+        serde_json::json!(hash(&selection.variants)?),
+    );
+    Ok(key)
 }
 
 pub(crate) fn combined_perf_hash(hashes: &[String]) -> Result<String, String> {
@@ -149,7 +174,17 @@ fn recorded_perf_key(
         .and_then(|index| record.inputs.get(index))
         .ok_or_else(|| "record result input is invalid".to_owned())?;
     let replay = config.backend.metal.resolve().graph_replay;
-    perf_key_from(&config, replay, input)
+    let mut key = perf_key_from(&config, replay, input)?;
+    if record.schema_version >= 3 {
+        for field in ["engine.tunings", "engine.picks_hash"] {
+            let value = result[field].clone();
+            if value.is_null() {
+                return Err(format!("record result is missing {field}"));
+            }
+            key.insert(field.to_owned(), value);
+        }
+    }
+    Ok(key)
 }
 
 fn perf_key_from(
@@ -237,6 +272,10 @@ fn record_origin(origin: &Origin) -> String {
 mod tests {
     use super::*;
 
+    fn profile() -> Profile {
+        crate::resolution::read_embedded_profile(test_guests::qwen3()).unwrap()
+    }
+
     fn options() -> Bench {
         let mut config = DevConfig::default();
         config.bench.tg = std::num::NonZeroU32::new(7).unwrap();
@@ -296,17 +335,20 @@ mod tests {
             engine_sha256: "engine".to_owned(),
             engine_variant: "variant".to_owned(),
             engine_build_profile: "release".to_owned(),
+            profile_name: String::new(),
+            profile_family: String::new(),
+            numerics: None,
             profile_hash: None,
             weights_sha256: "weights".to_owned(),
             model_revision: None,
         }];
         assert_eq!(
             config_hash(&snapshot, &inputs).unwrap(),
-            "sha256:29bcb05279acdd205817bf66fa3dc54061077ca6c9e75b5b2c8a3981fb757a0e"
+            "sha256:f65725041f3d0b6b5e8d34201039ab0d3662e56599e88c65e57c8838be69e9f4"
         );
         assert_eq!(
-            comparison_hash(&perf_key(&point, &inputs[0]).unwrap()).unwrap(),
-            "sha256:ac6dce17a2ee57b6ffe4d8aac6388e9af2adf1a630073750632e88be013a94cb"
+            comparison_hash(&perf_key(&point, &inputs[0], &profile()).unwrap()).unwrap(),
+            "sha256:c03d73dae7a2ee964e660e751afb218b21bc15ae1309ef9391485c1d2b9d563f"
         );
     }
 
@@ -338,10 +380,14 @@ mod tests {
             engine_sha256: "engine".to_owned(),
             engine_variant: "variant".to_owned(),
             engine_build_profile: "release".to_owned(),
+            profile_name: String::new(),
+            profile_family: String::new(),
+            numerics: None,
             profile_hash: None,
             weights_sha256: "weights".to_owned(),
             model_revision: None,
         };
+        let expected = perf_key(&point, &input, &profile()).unwrap();
         let record = Recorded {
             schema_version: SCHEMA_VERSION,
             provenance: RecordedProvenance {
@@ -350,11 +396,32 @@ mod tests {
             inputs: vec![input.clone()],
             config: snapshot(&options, "Apple M3 Ultra", "26.6").unwrap().config,
             axes: BTreeMap::new(),
-            results: vec![serde_json::json!({"input": 0, "point": {}})],
+            results: vec![serde_json::json!({
+                "input": 0,
+                "point": {},
+                "engine.tunings": expected["engine.tunings"],
+                "engine.picks_hash": expected["engine.picks_hash"],
+            })],
         };
-        assert_eq!(
-            recorded_perf_keys(&record).unwrap(),
-            [perf_key(&point, &input).unwrap()]
-        );
+        assert_eq!(recorded_perf_keys(&record).unwrap(), [expected]);
+    }
+
+    #[test]
+    fn v3_inputs_omit_legacy_filename_and_path_identity() {
+        let input = Input {
+            engine_sha256: "engine".to_owned(),
+            engine_variant: "filename".to_owned(),
+            engine_build_profile: "path-derived".to_owned(),
+            profile_name: "qwen3-test".to_owned(),
+            profile_family: "qwen3".to_owned(),
+            numerics: Some(*profile().numerics()),
+            profile_hash: Some("sha256:profile".to_owned()),
+            weights_sha256: "sha256:weights".to_owned(),
+            model_revision: Some("revision".to_owned()),
+        };
+        let value = serde_json::to_value(input).unwrap();
+        assert!(value.get("engine_variant").is_none());
+        assert!(value.get("engine_build_profile").is_none());
+        assert_eq!(value["profile_name"], "qwen3-test");
     }
 }
