@@ -1,6 +1,6 @@
 schema-version = 1
 family = "qwen3"
-default-tunings = ["residual-norm", "qk-norm-rope", "silu-mul", "final-norm"]
+default-tunings = ["residual-norm", "qk-norm-rope", "silu-mul"]
 
 [model]
 id = "Qwen/Qwen3-0.6B"
@@ -23,22 +23,40 @@ max-context = 4096
 prefill-chunk = 512
 
 [variants.fixed]
+"attention.prefill-small" = "sdpa.decomposed"
 "dense.decode" = "matmul.gemv-transposed"
 "dense.prefill.large-wide" = "matmul.steel-64x64x16-1x2"
 "dense.prefill.other" = "matmul.steel-64x32x32-2x2"
-"attention.prefill-small" = "sdpa.decomposed"
 
 [variants.rules."attention.decode"]
 parameter = "position"
-arms = [
-  { lo = 0, hi = 510, name = "sdpa.decomposed" },
-  { lo = 511, hi = 1022, name = "sdpa.vector-single-pass" },
-  { lo = 1023, hi = 4095, name = "sdpa.vector-two-pass" },
-]
+
+[[variants.rules."attention.decode".arms]]
+lo = 0
+hi = 510
+name = "sdpa.decomposed"
+
+[[variants.rules."attention.decode".arms]]
+lo = 511
+hi = 1022
+name = "sdpa.vector-single-pass"
+
+[[variants.rules."attention.decode".arms]]
+lo = 1023
+hi = 4095
+name = "sdpa.vector-two-pass"
 
 [variants.rules."attention.prefill-large"]
 parameter = "position"
-arms = [
-  { lo = 0, hi = 0, name = "sdpa.steel" },
-  { lo = 1, hi = 4095, name = "sdpa.decomposed" },
-]
+
+[[variants.rules."attention.prefill-large".arms]]
+lo = 0
+hi = 0
+name = "sdpa.steel"
+
+[[variants.rules."attention.prefill-large".arms]]
+lo = 1
+hi = 4095
+name = "sdpa.decomposed"
+
+[tuning-variants]

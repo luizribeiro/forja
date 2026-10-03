@@ -527,7 +527,7 @@ mod tests {
         let config = profile_load_config(&profile(), &Engine::default()).unwrap();
         assert_eq!(
             config.tunings,
-            ["residual-norm", "qk-norm-rope", "silu-mul", "final-norm"]
+            ["residual-norm", "qk-norm-rope", "silu-mul"]
         );
         assert_eq!(
             config.fixed_variant_picks[0].site,

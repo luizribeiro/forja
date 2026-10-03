@@ -257,13 +257,13 @@ add = ["residual-norm"]
     #[test]
     fn resolves_tunings_and_variant_picks_against_profile() {
         let mut overrides = Engine::default();
-        overrides.tunings.remove.push("final-norm".to_owned());
+        overrides.tunings.remove.push("silu-mul".to_owned());
         overrides.variant_picks.insert(
             "attention.prefill-small".to_owned(),
             "sdpa.portable".to_owned(),
         );
         let selection = overrides.resolve(&profile()).unwrap();
-        assert!(!selection.tunings.contains(&"final-norm".to_owned()));
+        assert!(!selection.tunings.contains(&"silu-mul".to_owned()));
         assert_eq!(
             selection.variants.fixed["attention.prefill-small"],
             "sdpa.portable"

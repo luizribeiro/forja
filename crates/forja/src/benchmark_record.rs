@@ -310,6 +310,7 @@ mod tests {
             points: Vec::new(),
             rerun: None,
             allow_diff: Vec::new(),
+            accept: false,
         }
     }
 

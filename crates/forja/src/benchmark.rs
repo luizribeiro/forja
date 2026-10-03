@@ -8,7 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use forja_config::{KeyPath, Selection};
+use forja_config::{KeyPath, Origin, Selection};
 use forja_core::Op;
 use forja_host::{
     EngineDecode, EngineMetrics, EngineOutput, EngineRunner, EngineStep, EngineStepProfile,
@@ -73,6 +73,13 @@ struct ProfileReport {
     dispatch_coverage: Stats,
     gpu_by_op: Vec<ProfileCategory>,
     gpu_by_dispatch: Vec<DispatchProfile>,
+}
+
+struct Acceptance {
+    profile_path: PathBuf,
+    profile_name: String,
+    base_profile_hash: String,
+    tuning_choice: bool,
 }
 
 struct DispatchProfile {
@@ -178,6 +185,7 @@ async fn measure_profile_phase(
 #[cfg(target_os = "macos")]
 #[allow(clippy::too_many_lines)]
 async fn run_metal(options: &Bench) -> Result<(), Box<dyn Error>> {
+    let acceptance = prepare_acceptance(options)?;
     let started = Instant::now();
     let load_before = machine_load::capture("BEFORE BENCHMARK")?;
     let commit = crate::provenance::commit();
@@ -263,7 +271,7 @@ async fn run_metal(options: &Bench) -> Result<(), Box<dyn Error>> {
     if let Some(record) = &options.rerun {
         print_result_diff(record, &results)?;
     }
-    if let Some(path) = &options.json {
+    if options.json.is_some() || acceptance.is_some() {
         let snapshot = benchmark_record::snapshot(options, &device, &os)?;
         let report = serde_json::json!({
             "schema_version": benchmark_record::SCHEMA_VERSION,
@@ -292,16 +300,206 @@ async fn run_metal(options: &Bench) -> Result<(), Box<dyn Error>> {
             "allow_diff": options.allow_diff.iter().map(KeyPath::as_str).collect::<Vec<_>>(),
             "results": results,
         });
-        if options.breakdown {
-            let breakdown_path = breakdown_record_path(path, &options.config.paths.scratch)?;
-            if let Some(parent) = breakdown_path.parent() {
-                fs::create_dir_all(parent)?;
+        if let Some(path) = &options.json {
+            if options.breakdown {
+                let breakdown_path = breakdown_record_path(path, &options.config.paths.scratch)?;
+                if let Some(parent) = breakdown_path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                write_json(&breakdown_path, &report)?;
+                println!("breakdown record: {}", breakdown_path.display());
             }
-            write_json(&breakdown_path, &report)?;
-            println!("breakdown record: {}", breakdown_path.display());
+            write_json(path, &slim_record(&report))?;
         }
-        write_json(path, &slim_record(&report))?;
+        if let Some(acceptance) = acceptance {
+            accept_report(options, &acceptance, &report)?;
+        }
     }
+    Ok(())
+}
+
+fn prepare_acceptance(options: &Bench) -> Result<Option<Acceptance>, String> {
+    if !options.accept {
+        return Ok(None);
+    }
+    let [component] = options.engines.as_slice() else {
+        return Err("--accept requires exactly one engine".to_owned());
+    };
+    if crate::provenance::dirty() || live_worktree_dirty()? {
+        return Err("--accept requires clean provenance at measurement start".to_owned());
+    }
+    if crate::provenance::commit().is_empty() || crate::provenance::commit() == "unknown" {
+        return Err("--accept requires a known source commit".to_owned());
+    }
+    if options.origins.iter().any(|(key, origin)| {
+        matches!(origin, Origin::UserFile(_)) && !key.as_str().starts_with("paths.")
+    }) {
+        return Err("--accept refuses user-file values outside paths".to_owned());
+    }
+    let mut tuning_choice = false;
+    for (key, values) in &options.axes {
+        if is_tuning_axis(key) {
+            if values.len() != 1 {
+                return Err("--accept requires one-value Tuning-class axes".to_owned());
+            }
+            tuning_choice = true;
+        } else if key.as_str().starts_with("backend.metal.") || key.as_str() == "engine.replay" {
+            return Err("--accept refuses Strategy-class axes".to_owned());
+        }
+    }
+    let profile = crate::resolution::read_embedded_profile(component)?;
+    let base_profile_hash = profile
+        .sha256()
+        .map_err(|error| format!("cannot hash engine profile: {error}"))?;
+    let profile_path = source_profile(&base_profile_hash)?;
+    let profile_name = profile_path
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "source profile name is not valid UTF-8".to_owned())?
+        .to_owned();
+    Ok(Some(Acceptance {
+        profile_path,
+        profile_name,
+        base_profile_hash,
+        tuning_choice,
+    }))
+}
+
+fn live_worktree_dirty() -> Result<bool, String> {
+    let output = Command::new("git")
+        .args(["status", "--porcelain", "--untracked-files=normal"])
+        .output()
+        .map_err(|error| format!("cannot inspect worktree provenance: {error}"))?;
+    if !output.status.success() {
+        return Err("cannot inspect worktree provenance".to_owned());
+    }
+    Ok(!output.stdout.is_empty())
+}
+
+fn is_tuning_axis(key: &KeyPath) -> bool {
+    key.as_str() == "engine.tunings"
+        || key.as_str().starts_with("engine.variant-picks.")
+        || key.as_str().starts_with("engine.variant-rules.")
+}
+
+fn source_profile(hash: &str) -> Result<PathBuf, String> {
+    let families =
+        fs::read_dir("engines").map_err(|error| format!("cannot read engine families: {error}"))?;
+    let mut matched = Vec::new();
+    for family in families {
+        let profiles = family
+            .map_err(|error| format!("cannot read engine family: {error}"))?
+            .path()
+            .join("profiles");
+        let Ok(entries) = fs::read_dir(profiles) else {
+            continue;
+        };
+        for entry in entries {
+            let path = entry
+                .map_err(|error| format!("cannot read engine profile: {error}"))?
+                .path();
+            if path.extension().and_then(|value| value.to_str()) != Some("toml") {
+                continue;
+            }
+            let source = fs::read_to_string(&path)
+                .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+            let profile: forja_config::Profile = toml::from_str(&source)
+                .map_err(|error| format!("cannot parse {}: {error}", path.display()))?;
+            if profile.sha256().map_err(|error| error.to_string())? == hash {
+                matched.push(path);
+            }
+        }
+    }
+    match matched.as_slice() {
+        [path] => Ok(path.clone()),
+        [] => Err("--accept requires an engine with one matching source profile".to_owned()),
+        _ => Err("--accept found multiple matching source profiles".to_owned()),
+    }
+}
+
+fn accept_report(
+    options: &Bench,
+    acceptance: &Acceptance,
+    report: &serde_json::Value,
+) -> Result<(), Box<dyn Error>> {
+    let family = acceptance
+        .profile_path
+        .parent()
+        .and_then(Path::parent)
+        .ok_or("source profile has no engine family directory")?;
+    let directory = family.join("bench").join(&acceptance.profile_name);
+    fs::create_dir_all(&directory)?;
+    let mut record = slim_record(report);
+    if acceptance.tuning_choice {
+        let source = fs::read_to_string(&acceptance.profile_path)?;
+        let profile: forja_config::Profile = toml::from_str(&source)?;
+        let point = options
+            .points
+            .first()
+            .ok_or("benchmark has no acceptance point")?;
+        let accepted = accepted_profile(&source, &profile, &point.config.engine)?;
+        let accepted_source = accepted.canonical_toml()?;
+        let accepted_hash = accepted.sha256()?;
+        record["acceptance"] = serde_json::json!({
+            "base_profile_hash": acceptance.base_profile_hash,
+            "accepted_profile_hash": accepted_hash,
+            "measured_component_hash": report["inputs"][0]["engine_sha256"],
+        });
+        write_atomic(&acceptance.profile_path, accepted_source.as_bytes())?;
+        write_json_atomic(&directory.join("tunings.json"), &record)?;
+        println!("accepted profile: {}", acceptance.profile_path.display());
+    } else {
+        write_json_atomic(&directory.join("accepted.json"), &record)?;
+    }
+    println!("accepted record: {}", directory.display());
+    Ok(())
+}
+
+fn accepted_profile(
+    source: &str,
+    profile: &forja_config::Profile,
+    engine: &forja_config::Engine,
+) -> Result<forja_config::Profile, Box<dyn Error>> {
+    let selection = engine.resolve(profile)?;
+    let mut value: toml::Value = toml::from_str(source)?;
+    let table = value
+        .as_table_mut()
+        .ok_or("source profile is not a table")?;
+    table.insert(
+        "default-tunings".to_owned(),
+        toml::Value::Array(
+            selection
+                .tunings
+                .iter()
+                .cloned()
+                .map(toml::Value::String)
+                .collect(),
+        ),
+    );
+    table.insert(
+        "variants".to_owned(),
+        toml::Value::try_from(selection.variants)?,
+    );
+    Ok(toml::from_str(&toml::to_string(&value)?)?)
+}
+
+fn write_json_atomic(path: &Path, value: &serde_json::Value) -> Result<(), Box<dyn Error>> {
+    let mut bytes = serde_json::to_vec_pretty(value)?;
+    bytes.push(b'\n');
+    write_atomic(path, &bytes)
+}
+
+fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), Box<dyn Error>> {
+    let name = path
+        .file_name()
+        .ok_or("atomic write target has no file name")?;
+    let temporary = path.with_file_name(format!(
+        ".{}.{}.tmp",
+        name.to_string_lossy(),
+        std::process::id()
+    ));
+    fs::write(&temporary, bytes)?;
+    fs::rename(&temporary, path)?;
     Ok(())
 }
 
@@ -1796,6 +1994,29 @@ mod tests {
         assert_eq!(visited.iter().filter(|(_, timed)| *timed).count(), 7);
         assert_eq!(visited.last(), Some(&(15, true)));
         Ok(())
+    }
+
+    #[test]
+    fn acceptance_materializes_effective_tunings_and_picks() {
+        let profile = test_profile();
+        let source = profile.canonical_toml().unwrap();
+        let mut engine = forja_config::Engine::default();
+        engine.tunings.base = forja_config::TuningBase::None;
+        engine.tunings.add = vec!["final-norm".to_owned()];
+        let expected = engine.resolve(&profile).unwrap();
+        let accepted = accepted_profile(&source, &profile, &engine).unwrap();
+        assert_eq!(accepted.default_tunings(), ["final-norm"]);
+        assert_eq!(accepted.variants(), &expected.variants);
+    }
+
+    #[test]
+    fn atomic_writer_replaces_complete_files() {
+        let root = temporary_directory("atomic-accept").unwrap();
+        let path = root.join("record.json");
+        fs::write(&path, b"old").unwrap();
+        write_atomic(&path, b"new\n").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"new\n");
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

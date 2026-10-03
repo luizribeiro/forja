@@ -142,6 +142,7 @@ pub(crate) struct Bench {
     pub(crate) points: Vec<BenchPoint>,
     pub(crate) rerun: Option<Recorded>,
     pub(crate) allow_diff: Vec<KeyPath>,
+    pub(crate) accept: bool,
 }
 
 #[derive(Debug, PartialEq)]
@@ -230,6 +231,9 @@ struct BenchArgs {
     /// Permit one performance-key difference while re-running.
     #[arg(long = "allow-diff", value_parser = parse_key_path)]
     allow_diff: Vec<KeyPath>,
+    /// Accept a default baseline or one-value engine choice.
+    #[arg(long, conflicts_with = "rerun")]
+    accept: bool,
 }
 
 #[derive(Args)]
@@ -905,6 +909,7 @@ impl BenchArgs {
             points,
             rerun,
             allow_diff: self.allow_diff,
+            accept: self.accept,
         })
     }
 }
@@ -2467,6 +2472,31 @@ fixtures = "/fixtures"
         )
         .unwrap_err();
         assert!(error.to_string().contains("--allow-diff requires --rerun"));
+    }
+
+    #[test]
+    fn parses_accept_and_refuses_rerun_combination() {
+        let arguments = [
+            "bench",
+            "--engine",
+            "/engine.wasm",
+            "--model",
+            "/model",
+            "--accept",
+        ];
+        let Command::Bench(options) = parse(arguments.map(str::to_owned)).unwrap() else {
+            panic!("expected bench command");
+        };
+        assert!(options.accept);
+        assert!(
+            parse(
+                arguments
+                    .into_iter()
+                    .chain(["--rerun", "/record.json"])
+                    .map(str::to_owned)
+            )
+            .is_err()
+        );
     }
 
     #[test]
