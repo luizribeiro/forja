@@ -93,6 +93,41 @@ pub(crate) fn read_embedded_profile(path: &Path) -> Result<Profile, String> {
     read_profile(&bytes).map_err(|error| format!("engine {}: {error}", path.display()))
 }
 
+pub(crate) fn source_profile(hash: &str) -> Result<PathBuf, String> {
+    let families =
+        fs::read_dir("engines").map_err(|error| format!("cannot read engine families: {error}"))?;
+    let mut matched = Vec::new();
+    for family in families {
+        let profiles = family
+            .map_err(|error| format!("cannot read engine family: {error}"))?
+            .path()
+            .join("profiles");
+        let Ok(entries) = fs::read_dir(profiles) else {
+            continue;
+        };
+        for entry in entries {
+            let path = entry
+                .map_err(|error| format!("cannot read engine profile: {error}"))?
+                .path();
+            if path.extension().and_then(|value| value.to_str()) != Some("toml") {
+                continue;
+            }
+            let source = fs::read_to_string(&path)
+                .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+            let profile: Profile = toml::from_str(&source)
+                .map_err(|error| format!("cannot parse {}: {error}", path.display()))?;
+            if profile.sha256().map_err(|error| error.to_string())? == hash {
+                matched.push(path);
+            }
+        }
+    }
+    match matched.as_slice() {
+        [path] => Ok(path.clone()),
+        [] => Err("engine has no matching source profile".to_owned()),
+        _ => Err("engine has multiple matching source profiles".to_owned()),
+    }
+}
+
 fn is_safe_component(path: &Path) -> bool {
     matches!(
         path.components().collect::<Vec<_>>().as_slice(),

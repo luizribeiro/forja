@@ -225,14 +225,23 @@ struct BenchArgs {
     vary: Vec<VaryArg>,
     #[command(flatten)]
     tuning: TuningBenchArgs,
+    #[command(flatten)]
+    record: RecordBenchArgs,
+}
+
+#[derive(Args)]
+struct RecordBenchArgs {
     /// Re-run a schema-v1, v2, or v3 benchmark record.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "against")]
     rerun: Option<PathBuf>,
+    /// Compare with this engine profile's accepted baseline.
+    #[arg(long, conflicts_with = "rerun")]
+    against: bool,
     /// Permit one performance-key difference while re-running.
     #[arg(long = "allow-diff", value_parser = parse_key_path)]
     allow_diff: Vec<KeyPath>,
     /// Accept a default baseline or one-value engine choice.
-    #[arg(long, conflicts_with = "rerun")]
+    #[arg(long, conflicts_with_all = ["rerun", "against"])]
     accept: bool,
 }
 
@@ -469,7 +478,47 @@ impl ParsedCommand {
         let Self::Bench(options) = self else {
             return Ok(None);
         };
-        options.rerun.as_ref().map(load_record).transpose()
+        if let Some(path) = &options.record.rerun {
+            return load_record(path).map(Some);
+        }
+        if !options.record.against {
+            return Ok(None);
+        }
+        let [engine] = options.engines.as_slice() else {
+            return Err(Cli::command().error(
+                clap::error::ErrorKind::ArgumentConflict,
+                "--against requires exactly one engine",
+            ));
+        };
+        let component = crate::resolution::engine(engine);
+        let profile = crate::resolution::read_embedded_profile(&component).map_err(|error| {
+            Cli::command().error(clap::error::ErrorKind::ValueValidation, error)
+        })?;
+        let hash = profile.sha256().map_err(|error| {
+            Cli::command().error(clap::error::ErrorKind::ValueValidation, error.to_string())
+        })?;
+        let source = crate::resolution::source_profile(&hash).map_err(|error| {
+            Cli::command().error(clap::error::ErrorKind::ValueValidation, error)
+        })?;
+        let name = source.file_stem().ok_or_else(|| {
+            Cli::command().error(
+                clap::error::ErrorKind::ValueValidation,
+                "source profile has no file name",
+            )
+        })?;
+        let record = source
+            .parent()
+            .and_then(|path| path.parent())
+            .ok_or_else(|| {
+                Cli::command().error(
+                    clap::error::ErrorKind::ValueValidation,
+                    "source profile has no engine family directory",
+                )
+            })?
+            .join("bench")
+            .join(name)
+            .join("accepted.json");
+        load_record(&record).map(Some)
     }
 }
 
@@ -848,7 +897,7 @@ impl BenchArgs {
         limits: Limits,
         rerun: Option<Recorded>,
     ) -> Result<Bench, clap::Error> {
-        if rerun.is_none() && !self.allow_diff.is_empty() {
+        if rerun.is_none() && !self.record.allow_diff.is_empty() {
             return Err(Cli::command().error(
                 clap::error::ErrorKind::MissingRequiredArgument,
                 "--allow-diff requires --rerun",
@@ -908,8 +957,8 @@ impl BenchArgs {
             strategy_axes,
             points,
             rerun,
-            allow_diff: self.allow_diff,
-            accept: self.accept,
+            allow_diff: self.record.allow_diff,
+            accept: self.record.accept,
         })
     }
 }

@@ -351,7 +351,7 @@ fn prepare_acceptance(options: &Bench) -> Result<Option<Acceptance>, String> {
     let base_profile_hash = profile
         .sha256()
         .map_err(|error| format!("cannot hash engine profile: {error}"))?;
-    let profile_path = source_profile(&base_profile_hash)?;
+    let profile_path = crate::resolution::source_profile(&base_profile_hash)?;
     let profile_name = profile_path
         .file_stem()
         .and_then(|name| name.to_str())
@@ -380,41 +380,6 @@ fn is_tuning_axis(key: &KeyPath) -> bool {
     key.as_str() == "engine.tunings"
         || key.as_str().starts_with("engine.variant-picks.")
         || key.as_str().starts_with("engine.variant-rules.")
-}
-
-fn source_profile(hash: &str) -> Result<PathBuf, String> {
-    let families =
-        fs::read_dir("engines").map_err(|error| format!("cannot read engine families: {error}"))?;
-    let mut matched = Vec::new();
-    for family in families {
-        let profiles = family
-            .map_err(|error| format!("cannot read engine family: {error}"))?
-            .path()
-            .join("profiles");
-        let Ok(entries) = fs::read_dir(profiles) else {
-            continue;
-        };
-        for entry in entries {
-            let path = entry
-                .map_err(|error| format!("cannot read engine profile: {error}"))?
-                .path();
-            if path.extension().and_then(|value| value.to_str()) != Some("toml") {
-                continue;
-            }
-            let source = fs::read_to_string(&path)
-                .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
-            let profile: forja_config::Profile = toml::from_str(&source)
-                .map_err(|error| format!("cannot parse {}: {error}", path.display()))?;
-            if profile.sha256().map_err(|error| error.to_string())? == hash {
-                matched.push(path);
-            }
-        }
-    }
-    match matched.as_slice() {
-        [path] => Ok(path.clone()),
-        [] => Err("--accept requires an engine with one matching source profile".to_owned()),
-        _ => Err("--accept found multiple matching source profiles".to_owned()),
-    }
 }
 
 fn accept_report(
