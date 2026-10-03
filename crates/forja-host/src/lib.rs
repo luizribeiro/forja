@@ -792,7 +792,9 @@ where
         release_previous: bool,
     ) -> wasmtime::Result<Result<EngineDecodeOutput, compute::Error>> {
         use engine_bindings::exports::l9o::gpu::engine::{DecodeIn, DecodeOut};
-        if self.discarded_speculation {
+        if input.tokens.is_some() {
+            self.discarded_speculation = false;
+        } else if self.discarded_speculation {
             return Ok(Err(compute::Error::OpSignature(
                 "discarded speculative decode invalidated this runner".to_owned(),
             )));

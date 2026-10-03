@@ -258,6 +258,17 @@ where
         })
         .await?;
     assert!(matches!(resumed, Err(compute::Error::OpSignature(_))));
+    let stopped_again = selected_tokens(
+        &mut pipelined,
+        &prompt,
+        token_count,
+        true,
+        Some(eos),
+        sampling,
+    )
+    .await
+    .map_err(|error| format!("second EOS decode failed: {error}"))?;
+    assert_eq!(stopped_again, expected[..=3]);
     Ok(())
 }
 
