@@ -43,6 +43,17 @@ const ATTENTION_SCALE: f32 = 0.088_388_35;
 const Q4_BITS: u8 = 4;
 const Q8_BITS: u8 = 8;
 const QUANT_GROUP: u32 = 64;
+
+fn exact_position(position: u32) -> Result<f32> {
+    if position > 1 << f32::MANTISSA_DIGITS {
+        return Err(forja_sdk::Error::loading(
+            "position exceeds the exact f32 integer range",
+        ));
+    }
+    #[allow(clippy::cast_precision_loss)]
+    Ok(position as f32)
+}
+
 #[derive(Clone, Copy)]
 struct Config;
 
@@ -616,11 +627,7 @@ impl Qwen3Coder {
             qk_norm_rope: qk_norm_rope_kernel(DType::F32, ROPE_THETA)?,
             activation_positions: Tensor::constant(
                 &(0..MAX_CONTEXT)
-                    .map(|position| {
-                        u16::try_from(position)
-                            .map(f32::from)
-                            .map_err(|_| forja_sdk::Error::loading("position exceeds f32 range"))
-                    })
+                    .map(exact_position)
                     .collect::<Result<Vec<_>>>()?,
                 &[MAX_CONTEXT],
             )?,
@@ -1022,5 +1029,18 @@ mod tests {
         assert_eq!(info.max_context, MAX_CONTEXT);
         assert_eq!(info.tap_layers, (1..=48).collect::<Vec<_>>());
         assert_eq!(info.router_layers, (1..=48).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn builds_exact_positions_past_u16() {
+        assert_eq!(
+            exact_position(u32::from(u16::MAX) + 1).unwrap().to_bits(),
+            65_536.0_f32.to_bits()
+        );
+        assert_eq!(
+            exact_position(1 << f32::MANTISSA_DIGITS).unwrap().to_bits(),
+            16_777_216.0_f32.to_bits()
+        );
+        assert!(exact_position((1 << f32::MANTISSA_DIGITS) + 1).is_err());
     }
 }
