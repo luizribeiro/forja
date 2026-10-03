@@ -103,8 +103,14 @@ fn quantized_embedding_reports_a_gpu_produced_bad_id() {
         )
         .unwrap();
 
-    assert_eq!(
+    assert!(matches!(
         backend.submit(commands).unwrap().wait(),
-        Err(forja_core::BackendError::IndexOutOfRange { index: 33 })
-    );
+        Err(forja_core::BackendError::DeviceErrorFlag {
+            dispatch: 1,
+            operation: "quant-embed",
+            flag: 1,
+            value: 33,
+            ..
+        })
+    ));
 }

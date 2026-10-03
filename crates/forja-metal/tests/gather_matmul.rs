@@ -48,7 +48,16 @@ fn dense_gather_reports_gpu_written_out_of_range_expert() {
         .dispatch(Op::GatherMatmul, &[&input, &weights, &indices], &output)
         .unwrap();
     let error = metal.submit(commands).unwrap().wait();
-    assert_eq!(error, Err(BackendError::IndexOutOfRange { index: 7 }));
+    assert!(matches!(
+        error,
+        Err(BackendError::DeviceErrorFlag {
+            dispatch: 1,
+            operation: "gather-matmul",
+            flag: 1,
+            value: 7,
+            ..
+        })
+    ));
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -244,6 +244,7 @@ fn grouped_matmul_zeros_gpu_written_out_of_range_routes() {
         &output,
         33 * 2 * 2 * 4,
         7,
+        "gather-quant-matmul",
     );
 }
 
@@ -289,6 +290,7 @@ fn grouped_silu_zeros_gpu_written_out_of_range_routes() {
         &output,
         33 * 2 * 2 * 4,
         7,
+        "gather-quant-silu-mul",
     );
 }
 
@@ -321,6 +323,7 @@ fn qwen_decode_matmul_zeros_gpu_written_out_of_range_routes() {
             &output,
             output_bytes,
             129,
+            "gather-quant-matmul",
         );
     }
 }
@@ -356,6 +359,7 @@ fn qwen_decode_silu_zeros_gpu_written_out_of_range_routes() {
             &output,
             output_bytes,
             129,
+            "gather-quant-silu-mul",
         );
     }
 }
@@ -393,6 +397,7 @@ fn qwen_combined_down_projection_zeros_gpu_written_out_of_range_routes() {
             &output,
             output_bytes,
             129,
+            "gather-quant-matmul-combine",
         );
     }
 }
@@ -405,7 +410,15 @@ fn combined_projection_keeps_nonzero_valid_routes_in_a_mixed_row() {
     let (metal_error, actual) = run_mixed_combine(&metal);
 
     assert_eq!(cpu_error, Err(BackendError::IndexOutOfRange { index: 7 }));
-    assert_eq!(metal_error, cpu_error);
+    assert!(matches!(
+        metal_error,
+        Err(BackendError::DeviceErrorFlag {
+            operation: "gather-quant-matmul-combine",
+            flag: 1,
+            value: 7,
+            ..
+        })
+    ));
     assert_outputs_agree(DType::F32, &expected, &actual).unwrap();
 }
 
@@ -505,11 +518,17 @@ fn assert_error_and_zero_output(
     output: &forja_core::Tensor,
     len: usize,
     index: u32,
+    operation: &'static str,
 ) {
-    assert_eq!(
+    assert!(matches!(
         submission.wait(),
-        Err(BackendError::IndexOutOfRange { index })
-    );
+        Err(BackendError::DeviceErrorFlag {
+            operation: actual_operation,
+            flag: 1,
+            value,
+            ..
+        }) if actual_operation == operation && value == index
+    ));
     drop(submission);
     assert_eq!(metal.read(output).unwrap(), vec![0; len]);
 }

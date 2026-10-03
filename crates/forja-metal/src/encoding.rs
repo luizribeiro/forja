@@ -471,11 +471,27 @@ const SAMPLE_ROUND_ARGUMENTS: usize = 8;
 
 struct EncodedDispatches {
     temporaries: Vec<BufferBinding>,
-    error_flags: Vec<BufferBinding>,
+    error_flags: Vec<EncodedErrorFlag>,
     bindings: ArgumentBindings,
     arguments: Option<ArgumentUsage>,
     program_encoding: ProfileCount,
     program_compile_fallbacks: u64,
+}
+
+struct EncodedErrorFlag {
+    binding: BufferBinding,
+    dispatch: usize,
+    operation: &'static str,
+}
+
+impl EncodedErrorFlag {
+    const fn new(binding: BufferBinding, dispatch: usize, operation: &'static str) -> Self {
+        Self {
+            binding,
+            dispatch,
+            operation,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -919,12 +935,23 @@ fn assert_not_in_metal_callback() {
     });
 }
 
-fn commit_result(feedback: &CommitResult) -> Result<(), BackendError> {
+fn commit_result(feedback: &CommitResult, submission: Option<u64>) -> Result<(), BackendError> {
     match feedback {
         CommitResult::Feedback(feedback) => {
             assert_not_in_metal_callback();
-            if feedback.0.error().is_some() {
-                Err(BackendError::ExecutionFailed)
+            if let Some(error) = feedback.0.error() {
+                eprintln!(
+                    "Metal execution failed: submission={submission:?} domain={} code={} description={}",
+                    error.domain(),
+                    error.code(),
+                    error.localizedDescription(),
+                );
+                submission.map_or(Err(BackendError::ExecutionFailed), |submission| {
+                    Err(BackendError::DeviceExecutionFailed {
+                        submission,
+                        code: error.code() as i64,
+                    })
+                })
             } else {
                 Ok(())
             }
@@ -1071,7 +1098,7 @@ impl GpuTimestamps {
 
 struct CommandResources {
     buffers: Vec<InFlightBuffer>,
-    error_flags: Vec<(usize, usize)>,
+    error_flags: Vec<(usize, usize, usize, &'static str)>,
 }
 
 pub(super) struct PreparedMetalGraph {
@@ -1257,7 +1284,7 @@ impl Completion {
             if state.event_signaled
                 && let Some(feedback) = &state.feedback
             {
-                let mut result = commit_result(feedback);
+                let mut result = commit_result(feedback, state.event_value);
                 state.resolving = true;
                 drop(state);
                 if let Some(tracker) = self.tracker.upgrade() {
@@ -1379,7 +1406,7 @@ impl Completion {
     }
 
     fn check_error_flags(&self) -> Result<(), BackendError> {
-        for &(flag, offset) in &self.resources.error_flags {
+        for &(flag, offset, dispatch, operation) in &self.resources.error_flags {
             // SAFETY: The queue event has signaled GPU completion, and each indexed retained
             // shared buffer contains two aligned u32 values initialized by the host.
             let bytes = unsafe {
@@ -1404,11 +1431,17 @@ impl Completion {
                     .map_err(|_| BackendError::ExecutionFailed)?,
             );
             if has_error != 0 {
-                return if has_error == 1 {
-                    Err(BackendError::IndexOutOfRange { index })
-                } else {
-                    Err(BackendError::InvalidInput)
-                };
+                eprintln!(
+                    "Metal error flag: submission={:?} dispatch={dispatch} operation={operation} flag={has_error} value={index}",
+                    self.event_value(),
+                );
+                return Err(BackendError::DeviceErrorFlag {
+                    submission: self.event_value().ok_or(BackendError::ExecutionFailed)?,
+                    dispatch: u32::try_from(dispatch).unwrap_or(u32::MAX),
+                    operation,
+                    flag: has_error,
+                    value: index,
+                });
             }
         }
         Ok(())
@@ -1418,7 +1451,7 @@ impl Completion {
         self.resources
             .error_flags
             .iter()
-            .fold(0_u64, |count, &(flag, offset)| {
+            .fold(0_u64, |count, &(flag, offset, _, _)| {
                 // SAFETY: Profiles are read only after GPU completion, and every error flag owns two
                 // aligned u32 words in a retained shared buffer.
                 let value = unsafe {
@@ -2156,6 +2189,7 @@ impl MetalBackend {
                 &encoder,
                 table,
                 dispatch,
+                index,
                 timestamps.is_some(),
                 &mut temporaries,
                 &mut error_flags,
@@ -2263,9 +2297,10 @@ impl MetalBackend {
         encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
         table: &ProtocolObject<dyn MTL4ArgumentTable>,
         dispatch: &Dispatch,
+        dispatch_index: usize,
         profile: bool,
         temporaries: &mut Vec<BufferBinding>,
-        error_flags: &mut Vec<BufferBinding>,
+        error_flags: &mut Vec<EncodedErrorFlag>,
         bindings: &mut ArgumentBindings,
         arguments: &mut ArgumentWriter,
         program_encoding: &mut ProfileCount,
@@ -2302,7 +2337,7 @@ impl MetalBackend {
             Op::Sample { position } => {
                 let (buffers, flag) =
                     self.encode_sample(encoder, table, dispatch, position, bindings, arguments)?;
-                error_flags.push(flag);
+                error_flags.push(EncodedErrorFlag::new(flag, dispatch_index, "sample"));
                 buffers
             }
             Op::Rope { theta } => {
@@ -2313,14 +2348,14 @@ impl MetalBackend {
             Op::Embed => {
                 let (buffers, flag) =
                     self.encode_embed(encoder, table, dispatch, bindings, arguments)?;
-                error_flags.push(flag);
+                error_flags.push(EncodedErrorFlag::new(flag, dispatch_index, "embed"));
                 buffers
             }
             Op::QuantEmbed { bits, group_size } => {
                 let (buffers, flag) = self.encode_quant_embed(
                     encoder, table, dispatch, bits, group_size, bindings, arguments,
                 )?;
-                error_flags.push(flag);
+                error_flags.push(EncodedErrorFlag::new(flag, dispatch_index, "quant-embed"));
                 buffers
             }
             Op::Copy => self.encode_copy(encoder, table, dispatch, bindings, arguments)?,
@@ -2328,7 +2363,7 @@ impl MetalBackend {
             Op::GatherMatmul => {
                 let (buffers, flag) =
                     self.encode_gather_matmul(encoder, table, dispatch, bindings, arguments)?;
-                error_flags.push(flag);
+                error_flags.push(EncodedErrorFlag::new(flag, dispatch_index, "gather-matmul"));
                 buffers
             }
             Op::QuantMatmul { bits, group_size } => self.encode_quant_matmul(
@@ -2350,21 +2385,33 @@ impl MetalBackend {
                 let (buffers, flag) = self.encode_gather_quant_matmul(
                     encoder, table, dispatch, bits, group_size, bindings, arguments,
                 )?;
-                error_flags.push(flag);
+                error_flags.push(EncodedErrorFlag::new(
+                    flag,
+                    dispatch_index,
+                    "gather-quant-matmul",
+                ));
                 buffers
             }
             Op::GatherQuantMatmulCombine { bits, group_size } => {
                 let (buffers, flag) = self.encode_gather_quant_matmul_combine(
                     encoder, table, dispatch, bits, group_size, bindings, arguments,
                 )?;
-                error_flags.push(flag);
+                error_flags.push(EncodedErrorFlag::new(
+                    flag,
+                    dispatch_index,
+                    "gather-quant-matmul-combine",
+                ));
                 buffers
             }
             Op::GatherQuantSiluMul { bits, group_size } => {
                 let (buffers, flag) = self.encode_gather_quant_silu_mul(
                     encoder, table, dispatch, bits, group_size, bindings, arguments,
                 )?;
-                error_flags.push(flag);
+                error_flags.push(EncodedErrorFlag::new(
+                    flag,
+                    dispatch_index,
+                    "gather-quant-silu-mul",
+                ));
                 buffers
             }
             Op::Sdpa { .. } => {
@@ -5858,9 +5905,9 @@ impl MetalBackend {
             .iter()
             .map(|flag| {
                 indices
-                    .get(&flag.raw.gpuAddress())
+                    .get(&flag.binding.raw.gpuAddress())
                     .copied()
-                    .map(|index| (index, flag.offset))
+                    .map(|index| (index, flag.binding.offset, flag.dispatch, flag.operation))
                     .ok_or(BackendError::ExecutionFailed)
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -8030,10 +8077,16 @@ mod tests {
             .unwrap();
         let graph = backend.prepare_graph(graph).unwrap();
 
-        assert_eq!(
+        assert!(matches!(
             backend.replay(&graph, Vec::new()).unwrap().wait(),
-            Err(BackendError::IndexOutOfRange { index: 99 })
-        );
+            Err(BackendError::DeviceErrorFlag {
+                dispatch: 0,
+                operation: "embed",
+                flag: 1,
+                value: 99,
+                ..
+            })
+        ));
         backend.write(&ids, &1_u32.to_le_bytes()).unwrap();
         backend.replay(&graph, Vec::new()).unwrap().wait().unwrap();
     }
@@ -8066,18 +8119,18 @@ mod tests {
         let failed = backend.replay(&failing, Vec::new()).unwrap();
         let same = backend.replay(&failing, Vec::new()).unwrap();
         let shared = backend.replay(&consumer, Vec::new()).unwrap();
-        assert_eq!(
-            failed.wait(),
-            Err(BackendError::IndexOutOfRange { index: 99 })
-        );
-        assert_eq!(
-            same.wait(),
-            Err(BackendError::IndexOutOfRange { index: 99 })
-        );
-        assert_eq!(
-            shared.wait(),
-            Err(BackendError::IndexOutOfRange { index: 99 })
-        );
+        for result in [failed.wait(), same.wait(), shared.wait()] {
+            assert!(matches!(
+                result,
+                Err(BackendError::DeviceErrorFlag {
+                    dispatch: 0,
+                    operation: "embed",
+                    flag: 1,
+                    value: 99,
+                    ..
+                })
+            ));
+        }
     }
 
     #[test]
@@ -9260,10 +9313,16 @@ mod tests {
     fn metal_sample_refuses_invalid_live_parameters() {
         let backend = MetalBackend::new().unwrap();
         let logits = vec![0_u8; 7 * 4];
-        assert_eq!(
+        assert!(matches!(
             run_sample(&backend, &logits, 7, f32::NAN, 0, 1.0, 0, 0),
-            Err(BackendError::InvalidInput)
-        );
+            Err(BackendError::DeviceErrorFlag {
+                dispatch: 0,
+                operation: "sample",
+                flag: 2,
+                value: 0,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -9411,10 +9470,16 @@ mod tests {
                 .dispatch(Op::Embed, &[&table, &ids], &output)
                 .unwrap();
 
-            assert_eq!(
+            assert!(matches!(
                 backend.submit(commands).unwrap().wait(),
-                Err(BackendError::IndexOutOfRange { index: expected })
-            );
+                Err(BackendError::DeviceErrorFlag {
+                    dispatch: 0,
+                    operation: "embed",
+                    flag: 1,
+                    value,
+                    ..
+                }) if value == expected
+            ));
             let _completion_error = backend.read(&output);
             assert_eq!(backend.read(&output).unwrap(), vec![0_u8; bytes.len() * 7]);
         }

@@ -4254,6 +4254,10 @@ fn guest_error(error: impl Into<GuestFailure>) -> compute::Error {
         GuestFailure::Backend(BackendError::ExecutionFailed) => {
             compute::Error::BackendExecution("backend execution failed".to_owned())
         }
+        GuestFailure::Backend(
+            error @ (BackendError::DeviceExecutionFailed { .. }
+            | BackendError::DeviceErrorFlag { .. }),
+        ) => compute::Error::BackendExecution(error.to_string()),
         GuestFailure::Backend(BackendError::UnsupportedOperation) => {
             compute::Error::BackendExecution("backend operation is unsupported".to_owned())
         }
@@ -6084,6 +6088,18 @@ mod tests {
         assert!(matches!(
             super::guest_error(BackendError::ExecutionFailed),
             compute::Error::BackendExecution(_)
+        ));
+        let diagnostic = super::guest_error(BackendError::DeviceErrorFlag {
+            submission: 17,
+            dispatch: 3,
+            operation: "gather-matmul",
+            flag: 1,
+            value: 7,
+        });
+        assert!(matches!(
+            diagnostic,
+            compute::Error::BackendExecution(message)
+                if message == "backend error: DeviceErrorFlag { submission: 17, dispatch: 3, operation: \"gather-matmul\", flag: 1, value: 7 }"
         ));
         assert!(matches!(
             super::guest_error(BackendError::Timeout),

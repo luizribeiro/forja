@@ -250,6 +250,26 @@ pub enum BackendError {
     AllocationFailed,
     /// Validated work failed while executing.
     ExecutionFailed,
+    /// The device rejected a submitted command buffer.
+    DeviceExecutionFailed {
+        /// Monotonic queue submission index.
+        submission: u64,
+        /// Backend-provided device error code.
+        code: i64,
+    },
+    /// A device operator reported a data-dependent error.
+    DeviceErrorFlag {
+        /// Monotonic queue submission index.
+        submission: u64,
+        /// Dispatch index within the submission.
+        dispatch: u32,
+        /// Operator that reported the error.
+        operation: &'static str,
+        /// Operator-specific error flag value.
+        flag: u32,
+        /// Operator-specific offending value.
+        value: u32,
+    },
     /// Submitted work did not complete before its configured deadline.
     Timeout,
     /// An argument does not belong to this backend or violates an API rule.
