@@ -1,0 +1,27 @@
+[
+  {
+    "name": "plain",
+    "messages": [{ "role": "user", "content": "Hello!" }],
+    "rendered": "<|im_start|>user\nHello!<|im_end|>\n<|im_start|>assistant\n",
+    "token_ids": [151644, 872, 198, 9707, 0, 151645, 198, 151644, 77091, 198]
+  },
+  {
+    "name": "system",
+    "messages": [
+      { "role": "system", "content": "You are terse." },
+      { "role": "user", "content": "Hello!" }
+    ],
+    "rendered": "<|im_start|>system\nYou are terse.<|im_end|>\n<|im_start|>user\nHello!<|im_end|>\n<|im_start|>assistant\n",
+    "token_ids": [151644, 8948, 198, 2610, 525, 50537, 13, 151645, 198, 151644, 872, 198, 9707, 0, 151645, 198, 151644, 77091, 198]
+  },
+  {
+    "name": "tool-result",
+    "messages": [
+      { "role": "user", "content": "Weather in Paris?" },
+      { "role": "assistant", "content": "", "tool_calls": [{ "function": { "name": "get_weather", "arguments": { "city": "Paris" } } }] },
+      { "role": "tool", "content": "18 C and sunny" }
+    ],
+    "rendered": "<|im_start|>user\nWeather in Paris?<|im_end|>\n<|im_start|>assistant\n<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n18 C and sunny\n</tool_response>\n<|im_end|>\n<|im_start|>assistant\n",
+    "token_ids": [151644, 872, 198, 28981, 304, 12095, 30, 151645, 198, 151644, 77091, 198, 151657, 198, 27, 1688, 28280, 69364, 397, 27, 16181, 28, 8926, 397, 59604, 198, 522, 16181, 397, 522, 1688, 397, 151658, 151645, 198, 151644, 872, 198, 151665, 198, 16, 23, 356, 323, 39698, 198, 151666, 198, 151645, 198, 151644, 77091, 198]
+  }
+]
