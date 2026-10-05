@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 mod request;
+mod stop;
 
 use std::{error::Error, fs::File, path::Path};
 
@@ -14,6 +15,7 @@ pub use request::{
     ChatCompletionRequest, CompletionParams, CompletionRequest, Message, ResolvedParams, Stop,
     ValidationError, validate_chat, validate_completion,
 };
+pub use stop::{StopMatcher, StopOutput};
 
 /// A compiled publisher-provided chat template.
 pub struct ChatTemplate {
