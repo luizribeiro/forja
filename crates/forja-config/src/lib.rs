@@ -7,6 +7,7 @@ mod engine;
 mod files;
 mod layer;
 mod profile;
+mod serving;
 mod set;
 mod units;
 mod weights;
@@ -20,6 +21,7 @@ pub use profile::{
     Quantization, QuantizationOverride, QuantizationScheme, Target, VariantArm, VariantRule,
     Variants, WeightFormat, Workload, WorkloadKind,
 };
+pub use serving::{HostConfig, RequestCeiling, ServedModel, Server};
 pub use set::set_layer;
 pub use units::{ByteSize, Duration, Unbounded};
 pub use weights::{sharded_weights_sha256, single_weights_sha256};
