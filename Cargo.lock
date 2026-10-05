@@ -807,6 +807,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "forja-serve"
+version = "0.0.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "forja-testing"
 version = "0.0.0"
 dependencies = [
