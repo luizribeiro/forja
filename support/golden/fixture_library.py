@@ -342,7 +342,8 @@ def generate(
         }
         if capture_router_logits:
             prompt_manifest["router_logits"] = {
-                "shape": list(tensors["router_logits"].shape)
+                "shape": list(tensors["router_logits"].shape),
+                "experts_per_token": config.num_experts_per_tok,
             }
         fixture_prompts.append(prompt_manifest)
         print(f"wrote {fixture} ({token_ids.shape[1]} prompt tokens)")

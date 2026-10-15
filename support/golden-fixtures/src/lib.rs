@@ -45,6 +45,7 @@ pub struct PromptFixture {
     prompt_ids: Vec<i64>,
     hidden_states: Vec<FloatTensor>,
     router_logits: Option<FloatTensor>,
+    router_experts_per_token: Option<usize>,
     prompt_logits: FloatTensor,
     greedy_tokens: Vec<i64>,
     greedy_step_logits: FloatTensor,
@@ -85,6 +86,12 @@ impl PromptFixture {
     #[must_use]
     pub const fn router_logits(&self) -> Option<&FloatTensor> {
         self.router_logits.as_ref()
+    }
+
+    /// Returns the number of experts selected for each routed token.
+    #[must_use]
+    pub const fn router_experts_per_token(&self) -> Option<usize> {
+        self.router_experts_per_token
     }
 
     /// Returns the last-position prompt logits.
@@ -267,6 +274,7 @@ struct PromptMetadata {
 #[derive(Debug, Deserialize)]
 struct RouterMetadata {
     shape: Vec<usize>,
+    experts_per_token: usize,
 }
 
 fn load_prompt(
@@ -324,7 +332,7 @@ fn load_prompt(
         }
         hidden_states.push(tensor);
     }
-    let router_logits = match metadata.router_logits {
+    let (router_logits, router_experts_per_token) = match metadata.router_logits {
         Some(router) => {
             let tensor = read_f32(&tensors, "router_logits")?;
             if router.shape != tensor.shape
@@ -332,15 +340,17 @@ fn load_prompt(
                 || tensor.shape[0] != hidden_states.len() - 1
                 || tensor.shape[1] != prompt_ids.len()
                 || tensor.shape[2] == 0
+                || router.experts_per_token == 0
+                || router.experts_per_token > tensor.shape[2]
             {
                 return Err(shape_error("router_logits"));
             }
-            Some(tensor)
+            (Some(tensor), Some(router.experts_per_token))
         }
         None if tensors.names().contains(&"router_logits") => {
             return Err(shape_error("router_logits"));
         }
-        None => None,
+        None => (None, None),
     };
     let prompt_logits = read_f32(&tensors, "prompt_last_logits")?;
     let greedy_tokens = read_i64(&tensors, "greedy_token_ids")?;
@@ -356,6 +366,7 @@ fn load_prompt(
         prompt_ids,
         hidden_states,
         router_logits,
+        router_experts_per_token,
         prompt_logits,
         greedy_tokens,
         greedy_step_logits,
@@ -644,7 +655,7 @@ mod tests {
             "file": file,
             "sha256": sha256,
             "prompt_tokens": 1,
-            "router_logits": { "shape": [2, 1, 3] }
+            "router_logits": { "shape": [2, 1, 3], "experts_per_token": 2 }
         })
     }
 

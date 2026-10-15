@@ -15,7 +15,6 @@ use crate::engine::metal_graph_replay;
 
 const F32_HIDDEN_STATE_TOLERANCE: f64 = 2e-2;
 const BF16_TOP1_PERCENT: u64 = 95;
-const ROUTER_TOP_K: usize = 8;
 const ROUTER_NEAR_TIE: f32 = 1.0e-3;
 
 #[derive(Clone, Copy, Default)]
@@ -359,7 +358,10 @@ where
         .shape()
         .try_into()
         .map_err(|_| "router fixture must have rank three")?;
-    if routers.len() != layers || experts < ROUTER_TOP_K {
+    let experts_per_token = fixture
+        .router_experts_per_token()
+        .ok_or("router fixture has no experts-per-token")?;
+    if routers.len() != layers || experts < experts_per_token {
         return Err("router output shape is incompatible with the fixture".into());
     }
     let layer_len = rows
@@ -389,7 +391,8 @@ where
             .zip(actual.chunks_exact(experts))
             .enumerate()
         {
-            if !router_sets_match(reference, actual) && first_mismatch.is_none() {
+            if !router_sets_match(reference, actual, experts_per_token) && first_mismatch.is_none()
+            {
                 first_mismatch = Some(format!("{}:{row}", layer + 1));
             }
         }
@@ -405,16 +408,16 @@ where
     Ok((passed, first_mismatch))
 }
 
-fn router_sets_match(reference: &[f32], actual: &[f32]) -> bool {
-    let expected = top_k_set(reference);
-    let selected = top_k_set(actual);
+fn router_sets_match(reference: &[f32], actual: &[f32], experts_per_token: usize) -> bool {
+    let expected = top_k_set(reference, experts_per_token);
+    let selected = top_k_set(actual, experts_per_token);
     expected == selected || near_tie_swap(reference, &expected, &selected)
 }
 
-fn top_k_set(values: &[f32]) -> Vec<usize> {
+fn top_k_set(values: &[f32], experts_per_token: usize) -> Vec<usize> {
     let mut indices = (0..values.len()).collect::<Vec<_>>();
     indices.sort_unstable_by(|&left, &right| values[right].total_cmp(&values[left]));
-    indices.truncate(ROUTER_TOP_K);
+    indices.truncate(experts_per_token);
     indices.sort_unstable();
     indices
 }
@@ -1035,11 +1038,11 @@ mod tests {
         let mut near_tie = reference;
         near_tie[7] = 1.999;
         near_tie[8] = 2.001;
-        assert!(router_sets_match(&reference, &near_tie));
+        assert!(router_sets_match(&reference, &near_tie, 8));
 
         let mut mismatch = reference;
         mismatch[6] = 0.0;
         mismatch[8] = 3.5;
-        assert!(!router_sets_match(&reference, &mismatch));
+        assert!(!router_sets_match(&reference, &mismatch, 8));
     }
 }

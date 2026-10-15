@@ -84,5 +84,6 @@ fn validate(
             prompt.router_logits().unwrap().shape(),
             [layers, prompt.prompt_ids().len(), experts]
         );
+        assert_eq!(prompt.router_experts_per_token(), Some(8));
     }
 }
