@@ -14,14 +14,41 @@ use crate::{
 #[derive(Debug)]
 pub struct GenerationError {
     message: String,
+    kind: ErrorKind,
 }
 
 impl GenerationError {
     pub(crate) fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            kind: ErrorKind::Internal,
         }
     }
+
+    pub(crate) fn invalid(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            kind: ErrorKind::Invalid,
+        }
+    }
+
+    fn unavailable(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            kind: ErrorKind::Unavailable,
+        }
+    }
+
+    pub(crate) const fn kind(&self) -> ErrorKind {
+        self.kind
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ErrorKind {
+    Invalid,
+    Internal,
+    Unavailable,
 }
 
 impl fmt::Display for GenerationError {
@@ -52,7 +79,7 @@ impl PromptRenderer for ChatFormat {
     fn render_prompt(&mut self, messages: &str) -> Result<String, GenerationError> {
         self.render(messages, "null", r#"{"add_generation_prompt":true}"#)
             .map_err(|error| GenerationError::new(format!("chat format failed: {error}")))?
-            .map_err(GenerationError::new)
+            .map_err(GenerationError::invalid)
     }
 }
 
@@ -87,6 +114,7 @@ pub struct Completion {
 
 /// One loaded engine, tokenizer, and model-declared chat format.
 pub struct ServingEngine<B: Backend + Send + Sync + 'static> {
+    model: String,
     runner: EngineRunner<B>,
     tokenizer: Tokenizer,
     chat_format: ChatFormat,
@@ -105,6 +133,7 @@ where
     ///
     /// Returns an error when the profile or tokenizer exceeds the engine contract.
     pub fn new(
+        model: String,
         runner: EngineRunner<B>,
         tokenizer: Tokenizer,
         chat_format: ChatFormat,
@@ -128,6 +157,7 @@ where
             ));
         }
         Ok(Self {
+            model,
             runner,
             tokenizer,
             chat_format,
@@ -135,6 +165,12 @@ where
             info,
             max_context,
         })
+    }
+
+    /// Returns the only model identifier accepted by this engine.
+    #[must_use]
+    pub fn model(&self) -> &str {
+        &self.model
     }
 
     /// Renders, tokenizes, validates, and prefills one chat request at position zero.
@@ -170,8 +206,12 @@ where
                 sampling,
             })
             .await
-            .map_err(|error| GenerationError::new(format!("engine prefill failed: {error}")))?
-            .map_err(|error| GenerationError::new(format!("engine prefill failed: {error:?}")))?;
+            .map_err(|error| {
+                GenerationError::unavailable(format!("engine prefill failed: {error}"))
+            })?
+            .map_err(|error| {
+                GenerationError::unavailable(format!("engine prefill failed: {error:?}"))
+            })?;
         Ok(PrefilledPrompt {
             first,
             params,
@@ -214,10 +254,14 @@ where
                             })
                             .await
                             .map_err(|error| {
-                                GenerationError::new(format!("engine decode failed: {error}"))
+                                GenerationError::unavailable(format!(
+                                    "engine decode failed: {error}"
+                                ))
                             })?
                             .map_err(|error| {
-                                GenerationError::new(format!("engine decode failed: {error:?}"))
+                                GenerationError::unavailable(format!(
+                                    "engine decode failed: {error:?}"
+                                ))
                             })?,
                     );
                     position = position
@@ -230,7 +274,9 @@ where
                     .read_queued_token(output)
                     .await
                     .map_err(|error| {
-                        GenerationError::new(format!("selected-token read failed: {error:?}"))
+                        GenerationError::unavailable(format!(
+                            "selected-token read failed: {error:?}"
+                        ))
                     })?;
                 let token = read_token(&bytes)?;
                 consumed += 1;
@@ -242,7 +288,9 @@ where
                         .wait_for_submissions(expected)
                         .await
                         .map_err(|error| {
-                            GenerationError::new(format!("engine synchronization failed: {error}"))
+                            GenerationError::unavailable(format!(
+                                "engine synchronization failed: {error}"
+                            ))
                         })?;
                 }
                 if self.chat_format.info().stop_token_ids.contains(&token) {
@@ -306,7 +354,7 @@ where
         }
     }
     failure.map_or(Ok(()), |error| {
-        Err(GenerationError::new(format!(
+        Err(GenerationError::unavailable(format!(
             "speculative decode cleanup failed: {error:?}"
         )))
     })
@@ -322,14 +370,14 @@ fn prepare_chat_prompt<R: PromptRenderer>(
     renderer: &mut R,
 ) -> Result<(Vec<u32>, u32, ResolvedParams), GenerationError> {
     let params = validate_chat_input(request, config, chat_info, vocab)
-        .map_err(|error| GenerationError::new(error.to_string()))?;
+        .map_err(|error| GenerationError::invalid(error.to_string()))?;
     let messages = serde_json::to_string(&request.messages)
         .map_err(|error| GenerationError::new(format!("cannot encode messages: {error}")))?;
     let prompt_text = renderer.render_prompt(&messages)?;
     let rendered_bytes = u64::try_from(prompt_text.len())
-        .map_err(|_| GenerationError::new("rendered prompt size exceeds u64"))?;
+        .map_err(|_| GenerationError::invalid("rendered prompt size exceeds u64"))?;
     if rendered_bytes > config.request.max_text_bytes.get() {
-        return Err(GenerationError::new(
+        return Err(GenerationError::invalid(
             "rendered prompt exceeds the configured byte ceiling",
         ));
     }
@@ -338,14 +386,14 @@ fn prepare_chat_prompt<R: PromptRenderer>(
         .map(|encoding| encoding.get_ids().to_vec())
         .map_err(|error| GenerationError::new(format!("cannot tokenize prompt: {error}")))?;
     let prompt_tokens = u32::try_from(tokens.len())
-        .map_err(|_| GenerationError::new("prompt token count exceeds u32"))?;
+        .map_err(|_| GenerationError::invalid("prompt token count exceeds u32"))?;
     if tokens.is_empty() {
-        return Err(GenerationError::new(
+        return Err(GenerationError::invalid(
             "rendered prompt tokenized to an empty sequence",
         ));
     }
     let params = validate_prompt(params, prompt_tokens, max_context)
-        .map_err(|error| GenerationError::new(error.to_string()))?;
+        .map_err(|error| GenerationError::invalid(error.to_string()))?;
     Ok((tokens, prompt_tokens, params))
 }
 
