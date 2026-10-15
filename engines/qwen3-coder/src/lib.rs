@@ -27,7 +27,7 @@ pub const HIDDEN: u32 = 2_048;
 /// Number of decoder layers in the full model.
 pub const LAYERS: usize = 48;
 /// Largest context accepted by this engine.
-pub const MAX_CONTEXT: u32 = 4_096;
+pub const MAX_CONTEXT: u32 = 32_768;
 
 const QUERY_HEADS: u32 = 32;
 const KEY_VALUE_HEADS: u32 = 4;
@@ -590,7 +590,7 @@ impl QwenWeights {
     }
 }
 
-/// Qwen3-Coder-30B-A3B-Instruct with a fixed 4096-token KV cache.
+/// Qwen3-Coder-30B-A3B-Instruct with a fixed 32768-token KV cache.
 pub struct Qwen3Coder {
     weights: QwenWeights,
     variants: variants::Variants,
@@ -785,7 +785,7 @@ impl Engine for Qwen3Coder {
             .start_pos
             .checked_add(sequence)
             .filter(|&end| end <= MAX_CONTEXT)
-            .ok_or_else(|| forja_sdk::Error::loading("tokens exceed the 4096-token context"))?;
+            .ok_or_else(|| forja_sdk::Error::loading("tokens exceed the 32768-token context"))?;
         #[cfg(target_family = "wasm")]
         if self.replay && sequence == 1 && !input.taps {
             let logits =
@@ -839,7 +839,7 @@ impl Engine for Qwen3Coder {
                     .checked_add(sequence)
                     .filter(|&end| end <= MAX_CONTEXT)
                     .ok_or_else(|| {
-                        forja_sdk::Error::loading("decode tokens exceed the 4096-token context")
+                        forja_sdk::Error::loading("decode tokens exceed the 32768-token context")
                     })?;
                 if self.prefill_supports(input.start_pos, sequence) {
                     let logits = if self.replay {
@@ -874,7 +874,7 @@ impl Engine for Qwen3Coder {
                 self.select_token(logits, input.start_pos)
             }
             None => Err(forja_sdk::Error::loading(
-                "decode position exceeds the 4096-token context",
+                "decode position exceeds the 32768-token context",
             )),
         }
     }

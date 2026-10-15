@@ -18,7 +18,7 @@ weights = "q4"
 [workload]
 kind = "causal-lm"
 batch = 1
-max-context = 4096
+max-context = 32768
 prefill-chunk = 512
 
 [variants.fixed]
@@ -40,15 +40,12 @@ parameter = "position"
 arms = [
   { lo = 0, hi = 510, name = "sdpa.decomposed" },
   { lo = 511, hi = 1022, name = "sdpa.vector-single-pass" },
-  { lo = 1023, hi = 4095, name = "sdpa.vector-two-pass" },
+  { lo = 1023, hi = 32767, name = "sdpa.vector-two-pass" },
 ]
 
 [variants.rules."attention.prefill-large"]
 parameter = "position"
-arms = [
-  { lo = 0, hi = 0, name = "sdpa.steel" },
-  { lo = 1, hi = 4095, name = "sdpa.decomposed" },
-]
+arms = [{ lo = 0, hi = 32767, name = "sdpa.steel" }]
 
 [quantization]
 scheme = "mlx-affine"

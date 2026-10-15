@@ -1,7 +1,7 @@
 # Qwen3-Coder
 
 Forja's Qwen3-Coder engine targets Qwen3-Coder-30B-A3B-Instruct with affine four-bit weights and
-q8 router gates on Metal for Apple M3 Ultra. The profile supports a 4096-token context and
+q8 router gates on Metal for Apple M3 Ultra. The profile supports a 32768-token context and
 512-token prefill chunks.
 
 ```console
@@ -18,7 +18,7 @@ Accepted pp512/tg128 results use 30 measured repetitions on an 80-core Apple M3 
 
 | Selection | PP tok/s | TG tok/s |
 | --- | ---: | ---: |
-| GPU sequential | 1232.33 | 75.11 |
-| GPU pipelined | 1232.79 | 98.12 |
+| GPU sequential | 1235.43 | 71.45 |
+| GPU pipelined | 1231.99 | 97.83 |
 
 The complete confidence intervals and provenance are in the profile's `bench` directory.
