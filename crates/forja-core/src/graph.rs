@@ -12,7 +12,7 @@ use crate::{
     byte_ranges_overlap, gather_matmul_flops, gather_quant_matmul_combine_flops,
     gather_quant_matmul_flops, gather_quant_silu_mul_flops, matmul_flops,
     ops::{BufferAccess, barriers_bounded_by, barriers_for_accesses, dispatch_accesses},
-    program::{BindError, Inst, PreparedProgram, ProgramKind},
+    program::{BindError, Inst, PreparedEpilogue, PreparedProgram, ProgramKind},
     quant_matmul_flops, sdpa_flops,
 };
 
@@ -467,6 +467,13 @@ enum DynamicDispatch {
         inputs: Vec<TemplateTensor>,
         outputs: Vec<TemplateTensor>,
     },
+    Epilogue {
+        op: TemplateOp,
+        inputs: Vec<TemplateTensor>,
+        outputs: Vec<TemplateTensor>,
+        epilogue: Arc<PreparedEpilogue>,
+        primitive_input_count: usize,
+    },
 }
 
 impl DynamicDispatch {
@@ -476,6 +483,12 @@ impl DynamicDispatch {
                 op,
                 inputs,
                 outputs,
+            }
+            | Self::Epilogue {
+                op,
+                inputs,
+                outputs,
+                ..
             } => {
                 op.is_parameter_dependent()
                     || inputs.iter().any(TemplateTensor::is_parameter_dependent)
@@ -498,6 +511,9 @@ impl DynamicDispatch {
     fn check_hull_aliasing(&self) -> Result<(), GraphError> {
         match self {
             Self::Operation {
+                inputs, outputs, ..
+            }
+            | Self::Epilogue {
                 inputs, outputs, ..
             } => {
                 for (input, tensor) in inputs.iter().enumerate() {
@@ -561,6 +577,9 @@ impl DynamicDispatch {
             Self::Operation {
                 inputs, outputs, ..
             }
+            | Self::Epilogue {
+                inputs, outputs, ..
+            }
             | Self::Program {
                 inputs, outputs, ..
             } => (inputs.as_slice(), outputs.as_slice()),
@@ -575,6 +594,9 @@ impl DynamicDispatch {
     fn tensors(&self) -> impl Iterator<Item = &TemplateTensor> {
         let (inputs, outputs) = match self {
             Self::Operation {
+                inputs, outputs, ..
+            }
+            | Self::Epilogue {
                 inputs, outputs, ..
             }
             | Self::Program {
@@ -615,6 +637,30 @@ impl DynamicDispatch {
                 let output_refs = outputs.iter().collect::<Vec<_>>();
                 let dispatch = Dispatch::kernel(program, &input_refs, &output_refs)?;
                 limits.check_program(&dispatch)?;
+                Ok(dispatch)
+            }
+            Self::Epilogue {
+                op,
+                inputs,
+                outputs,
+                epilogue,
+                primitive_input_count,
+            } => {
+                let inputs = instantiate_tensors(inputs, values)?;
+                let outputs = instantiate_tensors(outputs, values)?;
+                let input_refs = inputs.iter().collect::<Vec<_>>();
+                let output = outputs.first().ok_or(OpError::OutputArity {
+                    expected: 1,
+                    actual: 0,
+                })?;
+                let dispatch = Dispatch::with_epilogue(
+                    op.instantiate(values)?,
+                    &input_refs[..*primitive_input_count],
+                    output,
+                    epilogue,
+                    &input_refs[*primitive_input_count..],
+                )?;
+                limits.check_dispatch(&dispatch)?;
                 Ok(dispatch)
             }
         }
@@ -661,6 +707,19 @@ impl TemplateDispatch {
                     program: Arc::clone(program),
                     inputs: inputs.iter().map(tensor).collect::<Result<_, _>>()?,
                     outputs: outputs.iter().map(tensor).collect::<Result<_, _>>()?,
+                },
+                DynamicDispatch::Epilogue {
+                    op,
+                    inputs,
+                    outputs,
+                    epilogue,
+                    primitive_input_count,
+                } => DynamicDispatch::Epilogue {
+                    op: *op,
+                    inputs: inputs.iter().map(tensor).collect::<Result<_, _>>()?,
+                    outputs: outputs.iter().map(tensor).collect::<Result<_, _>>()?,
+                    epilogue: Arc::clone(epilogue),
+                    primitive_input_count: *primitive_input_count,
                 },
             })
         };
@@ -1079,6 +1138,36 @@ impl GraphTemplate {
         )
     }
 
+    /// Validates and records an epilogue-bearing primitive at every parameter-space corner.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GraphError`] for mixed parameter spaces, invalid bindings, or excessive work.
+    pub fn dispatch_epilogue(
+        &mut self,
+        op: impl Into<TemplateOp>,
+        inputs: &[&TemplateTensor],
+        output: &TemplateTensor,
+        epilogue: &Arc<PreparedEpilogue>,
+        extras: &[&TemplateTensor],
+    ) -> Result<(), GraphError> {
+        let mut all_inputs = inputs
+            .iter()
+            .map(|tensor| (*tensor).clone())
+            .collect::<Vec<_>>();
+        all_inputs.extend(extras.iter().map(|tensor| (*tensor).clone()));
+        self.record(
+            DynamicDispatch::Epilogue {
+                op: op.into(),
+                inputs: all_inputs,
+                outputs: vec![output.clone()],
+                epilogue: Arc::clone(epilogue),
+                primitive_input_count: inputs.len(),
+            },
+            None,
+        )
+    }
+
     /// Records a concrete dispatch already validated at its command-list boundary.
     #[doc(hidden)]
     pub fn record_validated(&mut self, dispatch: Dispatch) -> Result<(), GraphError> {
@@ -1362,6 +1451,9 @@ fn template_dispatch_buffers(
                 DynamicDispatch::Operation {
                     inputs, outputs, ..
                 }
+                | DynamicDispatch::Epilogue {
+                    inputs, outputs, ..
+                }
                 | DynamicDispatch::Program {
                     inputs, outputs, ..
                 } => (
@@ -1403,7 +1495,8 @@ mod tests {
         Operand, ParamError, ParamSpace, ParamValues, SymbolicLayout, Tensor,
         ops::{BufferAccess, barriers_for_accesses},
         program::{
-            Inst, KernelSignature, PreparedProgram, Program, ProgramKind, prepared_for_test,
+            BinOp, EpilogueSignature, Inst, KernelSignature, PreparedProgram, Program, ProgramKind,
+            prepare_epilogue, prepared_for_test,
         },
         required_barriers,
     };
@@ -1563,6 +1656,41 @@ mod tests {
             .slice(axis, start, len, 1)
             .unwrap();
         TemplateTensor::symbolic(base, layout).unwrap()
+    }
+
+    #[test]
+    fn epilogue_views_follow_symbolic_replay_shapes() {
+        let space = ParamSpace::new(std::iter::once(0..=6).collect()).unwrap();
+        let rows = Affine::parameter(0, 1, 1);
+        let left = symbolic_prefix(30, &[7, 3], space.clone(), rows);
+        let right = TemplateTensor::from(tensor(31, &[3, 5]));
+        let output = symbolic_prefix(32, &[7, 5], space.clone(), rows);
+        let extra = symbolic_prefix(33, &[7, 5], space.clone(), rows);
+        let epilogue = prepare_epilogue(
+            Program {
+                kind: ProgramKind::Map,
+                insts: vec![
+                    Inst::Input(0),
+                    Inst::Input(1),
+                    Inst::Binary(BinOp::Add, 0, 1),
+                ],
+                outputs: vec![(0, 2)],
+            }
+            .validate()
+            .unwrap(),
+            EpilogueSignature::new(1, 2, vec![DType::F32], DType::F32),
+        )
+        .unwrap();
+        let mut graph = GraphTemplate::new(space.clone(), GraphLimits::default());
+        graph
+            .dispatch_epilogue(Op::Matmul, &[&left, &right], &output, &epilogue, &[&extra])
+            .unwrap();
+
+        let replay = graph.instantiate(&space.values(vec![6]).unwrap()).unwrap();
+        let dispatch = &replay.dispatches()[0];
+        assert_eq!(dispatch.output().layout().shape(), &[7, 5]);
+        assert_eq!(dispatch.inputs()[2].layout().shape(), &[7, 5]);
+        assert!(dispatch.prepared_epilogue().is_some());
     }
 
     fn fresh_operation_succeeds(
