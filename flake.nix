@@ -33,7 +33,10 @@
             "rust-src"
             "rustfmt"
           ];
-          targets = [ "wasm32-wasip2" ];
+          targets = [
+            "wasm32-unknown-unknown"
+            "wasm32-wasip2"
+          ];
         };
         cargoFiles = "(^|/)(Cargo\\.(toml|lock)|.*\\.rs)$";
         pythonFiles = "^support/.*\\.py$";

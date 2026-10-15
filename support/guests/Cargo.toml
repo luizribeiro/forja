@@ -1,5 +1,6 @@
 [workspace]
 members = [
+  "chat-format-smoke",
   "engine-smoke",
   "engine-sdk-smoke",
   "hello",

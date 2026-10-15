@@ -3,6 +3,12 @@
 
 use std::path::Path;
 
+/// Returns the path to the zero-import chat-format test component.
+#[must_use]
+pub fn chat_format_smoke() -> &'static Path {
+    Path::new(env!("CHAT_FORMAT_SMOKE_COMPONENT"))
+}
+
 /// Returns the path to the minimal engine component.
 #[must_use]
 pub fn engine_smoke() -> &'static Path {
