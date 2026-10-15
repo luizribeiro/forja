@@ -347,6 +347,11 @@ mod tests {
     use super::*;
     use crate::program::Ctx;
 
+    #[crate::kernel(map)]
+    fn add_bias(accumulator: Elem, bias: Elem) -> Elem {
+        accumulator + bias
+    }
+
     fn kernel(rank: u8, inputs: &[DType], outputs: &[DType]) -> Result<Kernel> {
         let context = Ctx::new();
         context.output(0, context.input(0));
@@ -374,6 +379,15 @@ mod tests {
         assert!(Rc::ptr_eq(&first.handle, &hit.handle));
         assert!(!Rc::ptr_eq(&first.handle, &scalar_miss.handle));
         assert_eq!(builds.get(), 5);
+    }
+
+    #[test]
+    fn generated_map_builds_an_epilogue() {
+        let epilogue = add_bias_epilogue(1, 2, &[DType::F32], DType::BF16).unwrap();
+        assert_eq!(epilogue.accumulator_count, 1);
+        assert_eq!(epilogue.rank, 2);
+        assert_eq!(epilogue.extras, [DType::F32]);
+        assert_eq!(epilogue.output, DType::BF16);
     }
 
     #[test]

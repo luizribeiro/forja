@@ -273,6 +273,7 @@ impl KernelFunction {
         let name = &item.sig.ident;
         let into_name = format_ident!("{name}_into");
         let program_name = format_ident!("{name}_program");
+        let epilogue_name = format_ident!("{name}_epilogue");
         let out_argument = internal("__forja_out");
         let rank_argument = internal("__forja_rank_argument");
         let input_dtypes_argument = internal("__forja_input_dtypes_argument");
@@ -313,6 +314,25 @@ impl KernelFunction {
             &output_dtypes_argument,
         )?;
         let scalar_program_arguments = self.scalars.iter().map(scalar_argument).collect::<Vec<_>>();
+        let epilogue = if self.kind == KernelKind::Map && self.output_count == 1 {
+            let scalar_epilogue_arguments =
+                self.scalars.iter().map(scalar_argument).collect::<Vec<_>>();
+            let body = self.epilogue_body(name)?;
+            Some(quote! {
+                #[doc = "Prepares this generated Map expression as a primitive epilogue."]
+                #visibility fn #epilogue_name(
+                    __forja_accumulator_count: u8,
+                    __forja_rank: u8,
+                    __forja_extra_dtypes: &[::forja_sdk::DType],
+                    __forja_output_dtype: ::forja_sdk::DType,
+                    #(#scalar_epilogue_arguments),*
+                ) -> ::forja_sdk::Result<::forja_sdk::kernel::Epilogue> {
+                    #body
+                }
+            })
+        } else {
+            None
+        };
 
         Ok(quote! {
             #(#attributes)*
@@ -344,6 +364,68 @@ impl KernelFunction {
             ) -> ::forja_sdk::Result<::forja_sdk::kernel::Kernel> {
                 #program
             }
+
+            #epilogue
+        })
+    }
+
+    fn epilogue_body(&self, name: &Ident) -> syn::Result<TokenStream> {
+        let context = internal("__forja_context");
+        let program = internal("__forja_program");
+        let parameters = self
+            .tensors
+            .iter()
+            .map(|tensor| {
+                (
+                    tensor.ident.to_string(),
+                    Parameter::Tensor {
+                        slot: tensor.slot,
+                        compute: tensor.compute,
+                        span: tensor.ident.span(),
+                    },
+                )
+            })
+            .chain(
+                self.scalars
+                    .iter()
+                    .map(|scalar| (scalar.ident.to_string(), Parameter::Scalar(scalar.compute))),
+            )
+            .collect::<HashMap<_, _>>();
+        let lowered = lower(&self.item.block, parameters, &context, self.kind, None)?;
+        let output = &lowered.outputs[0];
+        let statements = &lowered.statements;
+        let scalar_checks = self.scalars.iter().map(|scalar| {
+            let ident = &scalar.ident;
+            match scalar.compute {
+                ComputeType::F32 => quote! {
+                    if !#ident.is_finite() {
+                        return Err(::forja_sdk::Error::loading(concat!(
+                            "kernel `", stringify!(#name), "`: scalar `", stringify!(#ident), "` is not finite"
+                        )));
+                    }
+                },
+                ComputeType::U32 => quote! {
+                    if #ident > 16_777_216 {
+                        return Err(::forja_sdk::Error::loading(concat!(
+                            "kernel `", stringify!(#name), "`: scalar `", stringify!(#ident), "` is not exactly representable"
+                        )));
+                    }
+                },
+            }
+        });
+        Ok(quote! {
+            #(#scalar_checks)*
+            let #context = ::forja_sdk::program::Ctx::new();
+            #(#statements)*
+            #context.output(0, #output);
+            let #program = #context.finish();
+            ::forja_sdk::kernel::Epilogue::new(
+                &#program,
+                __forja_accumulator_count,
+                __forja_rank,
+                __forja_extra_dtypes,
+                __forja_output_dtype,
+            )
         })
     }
 
