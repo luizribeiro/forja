@@ -2,7 +2,10 @@ use std::{sync::Arc, time::Duration};
 
 use forja_core::{
     Backend, BackendError, CommandList, DType, Op, Submission, Tensor, ViewOp,
-    program::{KernelSignature, PreparedProgram, ValidatedProgram, prepare_program},
+    program::{
+        EpilogueSignature, KernelSignature, PreparedEpilogue, PreparedProgram, ValidatedProgram,
+        prepare_epilogue, prepare_program,
+    },
 };
 
 /// An in-process host used by trusted native development and tests.
@@ -98,6 +101,24 @@ impl<B: Backend> NativeHost<B> {
         })
     }
 
+    /// Validates an epilogue program for repeated primitive dispatches.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the program or signature violates the epilogue contract.
+    pub fn prepare_epilogue(
+        &self,
+        program: ValidatedProgram,
+        signature: EpilogueSignature,
+    ) -> Result<NativeEpilogue<B>, BackendError> {
+        let epilogue =
+            prepare_epilogue(program, signature).map_err(|_| BackendError::InvalidInput)?;
+        Ok(NativeEpilogue {
+            backend: Arc::clone(&self.backend),
+            epilogue,
+        })
+    }
+
     fn validate(&self, tensor: &NativeTensor<B>) -> Result<(), BackendError> {
         Arc::ptr_eq(&self.backend, &tensor.allocation.backend)
             .then_some(())
@@ -110,6 +131,13 @@ impl<B: Backend> NativeHost<B> {
 pub struct NativeKernel<B: Backend> {
     backend: Arc<B>,
     program: Arc<PreparedProgram>,
+}
+
+/// A prepared epilogue owned by one native host.
+#[derive(Debug)]
+pub struct NativeEpilogue<B: Backend> {
+    backend: Arc<B>,
+    epilogue: Arc<PreparedEpilogue>,
 }
 
 /// A refcounted native tensor handle.
@@ -269,6 +297,51 @@ impl<B: Backend> NativeCommandList<B> {
             .extend(inputs.iter().map(|tensor| (*tensor).clone()));
         self.retained
             .extend(outputs.iter().map(|tensor| (*tensor).clone()));
+        Ok(())
+    }
+
+    /// Validates and records a primitive with a scalar epilogue.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for foreign resources or an invalid epilogue binding.
+    pub fn dispatch_epilogue(
+        &mut self,
+        operation: Op,
+        inputs: &[&NativeTensor<B>],
+        output: &NativeTensor<B>,
+        epilogue: &NativeEpilogue<B>,
+        extras: &[&NativeTensor<B>],
+    ) -> Result<(), BackendError> {
+        if !Arc::ptr_eq(&self.backend, &epilogue.backend)
+            || inputs
+                .iter()
+                .chain(extras)
+                .chain(std::iter::once(&output))
+                .any(|tensor| !Arc::ptr_eq(&self.backend, &tensor.allocation.backend))
+        {
+            return Err(BackendError::InvalidInput);
+        }
+        self.commands
+            .dispatch_epilogue(
+                operation,
+                &inputs
+                    .iter()
+                    .map(|tensor| &tensor.tensor)
+                    .collect::<Vec<_>>(),
+                &output.tensor,
+                &epilogue.epilogue,
+                &extras
+                    .iter()
+                    .map(|tensor| &tensor.tensor)
+                    .collect::<Vec<_>>(),
+            )
+            .map_err(|_| BackendError::InvalidInput)?;
+        self.retained
+            .extend(inputs.iter().map(|tensor| (*tensor).clone()));
+        self.retained
+            .extend(extras.iter().map(|tensor| (*tensor).clone()));
+        self.retained.push(output.clone());
         Ok(())
     }
 

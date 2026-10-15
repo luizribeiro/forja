@@ -42,7 +42,7 @@ use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 const MAX_VARIANT_NAME_BYTES: usize = 64;
 const MAX_VARIANT_RULE_ARMS: usize = 64;
 
-pub use native::{NativeCommandList, NativeHost, NativeKernel, NativeTensor};
+pub use native::{NativeCommandList, NativeEpilogue, NativeHost, NativeKernel, NativeTensor};
 pub use weights::{Safetensors, WeightError, WeightSource, WeightTensor};
 
 /// Host bindings for the guest-facing compute interface.
