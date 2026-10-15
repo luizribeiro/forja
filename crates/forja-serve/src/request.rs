@@ -1,13 +1,13 @@
 use std::{collections::BTreeMap, error::Error, fmt};
 
 use forja_config::HostConfig;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{ChatInfo, SamplingDefaults};
 
 /// One chat message with string content.
-#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Message {
     /// OpenAI-compatible message role.
@@ -144,6 +144,20 @@ pub fn validate_chat(
     max_context: u32,
     vocab: u32,
 ) -> Result<ResolvedParams, ValidationError> {
+    let params = validate_chat_input(request, config, defaults, vocab)?;
+    validate_prompt(
+        params,
+        prompt_tokens,
+        configured_context(config, max_context),
+    )
+}
+
+pub(crate) fn validate_chat_input(
+    request: &ChatCompletionRequest,
+    config: &HostConfig,
+    defaults: &ChatInfo,
+    vocab: u32,
+) -> Result<ResolvedParams, ValidationError> {
     if request.messages.len() > ceiling_usize(config.request.max_messages) {
         return invalid("messages exceed the configured ceiling");
     }
@@ -151,15 +165,7 @@ pub fn validate_chat(
         checked_text_bytes(request.messages.iter().map(|message| message.content.len()))?,
         config,
     )?;
-    resolve(
-        &request.params,
-        config,
-        &defaults.sampling,
-        prompt_tokens,
-        configured_context(config, max_context),
-        vocab,
-        true,
-    )
+    resolve(&request.params, config, &defaults.sampling, vocab, true)
 }
 
 /// Validates and resolves a text-completion request.
@@ -175,16 +181,22 @@ pub fn validate_completion(
     max_context: u32,
     vocab: u32,
 ) -> Result<ResolvedParams, ValidationError> {
-    validate_text(checked_text_bytes([request.prompt.len()])?, config)?;
-    resolve(
-        &request.params,
-        config,
-        &defaults.sampling,
+    let params = validate_completion_input(request, config, defaults, vocab)?;
+    validate_prompt(
+        params,
         prompt_tokens,
         configured_context(config, max_context),
-        vocab,
-        false,
     )
+}
+
+pub(crate) fn validate_completion_input(
+    request: &CompletionRequest,
+    config: &HostConfig,
+    defaults: &ChatInfo,
+    vocab: u32,
+) -> Result<ResolvedParams, ValidationError> {
+    validate_text(checked_text_bytes([request.prompt.len()])?, config)?;
+    resolve(&request.params, config, &defaults.sampling, vocab, false)
 }
 
 /// Resolves request values against model and host defaults.
@@ -196,8 +208,6 @@ fn resolve(
     params: &CompletionParams,
     config: &HostConfig,
     defaults: &SamplingDefaults,
-    prompt_tokens: u32,
-    max_context: u32,
     vocab: u32,
     chat: bool,
 ) -> Result<ResolvedParams, ValidationError> {
@@ -207,9 +217,6 @@ fn resolve(
     }
     if !chat && params.max_completion_tokens.is_some() {
         return invalid("max_completion_tokens is only supported for chat completions");
-    }
-    if prompt_tokens >= max_context {
-        return invalid("prompt exceeds the configured context ceiling");
     }
     let requested = params
         .max_completion_tokens
@@ -227,17 +234,12 @@ fn resolve(
     if !(top_p.is_finite() && 0.0 < top_p && top_p <= 1.0) {
         return invalid("top_p must be finite and in (0, 1]");
     }
-    let remaining_context = max_context.checked_sub(prompt_tokens).ok_or_else(|| {
-        ValidationError("prompt exceeds the configured context ceiling".to_owned())
-    })?;
     let stops = normalize_stops(params.stop.as_ref());
     if stops.len() > ceiling_usize(config.request.max_stops) || stops.iter().any(String::is_empty) {
         return invalid("stop strings exceed the configured ceiling or are empty");
     }
     Ok(ResolvedParams {
-        max_tokens: requested
-            .min(config.request.max_output_tokens)
-            .min(remaining_context),
+        max_tokens: requested.min(config.request.max_output_tokens),
         temperature,
         top_p,
         top_k: params.top_k.or(defaults.top_k).unwrap_or(0).min(vocab),
@@ -245,6 +247,21 @@ fn resolve(
         stops,
         stream: params.stream,
     })
+}
+
+pub(crate) fn validate_prompt(
+    mut params: ResolvedParams,
+    prompt_tokens: u32,
+    max_context: u32,
+) -> Result<ResolvedParams, ValidationError> {
+    let remaining_context = max_context
+        .checked_sub(prompt_tokens)
+        .filter(|&remaining| remaining > 0)
+        .ok_or_else(|| {
+            ValidationError("prompt exceeds the configured context ceiling".to_owned())
+        })?;
+    params.max_tokens = params.max_tokens.min(remaining_context);
+    Ok(params)
 }
 
 fn configured_context(config: &HostConfig, engine_profile_context: u32) -> u32 {
@@ -357,15 +374,14 @@ mod tests {
         prompt_tokens: u32,
         max_context: u32,
     ) -> Result<ResolvedParams, ValidationError> {
-        resolve(
+        let resolved = resolve(
             params,
             &HostConfig::default(),
             &defaults.sampling,
-            prompt_tokens,
-            max_context,
             151_936,
             true,
-        )
+        )?;
+        validate_prompt(resolved, prompt_tokens, max_context)
     }
 
     fn info(sampling: SamplingDefaults) -> ChatInfo {
@@ -616,8 +632,6 @@ mod tests {
             &CompletionParams::default(),
             &HostConfig::default(),
             &defaults,
-            1,
-            32_768,
             100,
             true,
         )

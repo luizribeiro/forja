@@ -835,6 +835,8 @@ name = "forja-serve"
 version = "0.0.0"
 dependencies = [
  "forja-config",
+ "forja-core",
+ "forja-host",
  "serde",
  "serde_json",
  "test-guests",
