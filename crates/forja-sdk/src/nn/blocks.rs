@@ -13,8 +13,6 @@ use super::ops::{qkv_rope_cache_into, sdpa, sdpa_into, sdpa_into_with};
 pub const DEFAULT_PREFILL_CHUNK: u32 = 512;
 
 const MIN_PREFILL_BUCKET: u32 = 16;
-const QK_HEAD_DIM: f32 = 128.0;
-const QK_RMS_EPSILON: f32 = 1.0e-6;
 
 /// Builds the row program for RMS normalization.
 ///
@@ -71,14 +69,29 @@ pub fn residual_norm<T: FloatElement>(
     Ok((value, normalized))
 }
 
-/// Builds the Qwen head-width-128 row program that combines RMS normalization with rotary
-/// embedding.
+/// Builds the row program that combines RMS normalization with rotary embedding.
 ///
 /// # Errors
 ///
 /// Returns an error when the kernel definition is refused.
-pub fn qk_norm_rope_kernel(dtype: DType, theta: f32) -> Result<Kernel> {
-    qk_norm_rope_rows_program(3, &[dtype; 5], &[dtype; 2], theta)
+#[allow(clippy::cast_precision_loss)]
+pub fn qk_norm_rope_kernel(
+    dtype: DType,
+    head_dim: u32,
+    epsilon: f32,
+    theta: f32,
+) -> Result<Kernel> {
+    if head_dim == 0 || !head_dim.is_multiple_of(2) {
+        return Err(Error::loading("QK head width must be positive and even"));
+    }
+    qk_norm_rope_program::qk_norm_rope_rows_program(
+        3,
+        &[dtype; 5],
+        &[dtype; 2],
+        head_dim as f32,
+        epsilon,
+        theta,
+    )
 }
 
 /// Applies per-head RMS normalization and rotary embedding to a Q/K projection.
@@ -96,6 +109,9 @@ pub fn qk_norm_rope<T: FloatElement>(
         .shape()
         .try_into()
         .map_err(|_| Error::loading("QK projection must have rank three"))?;
+    if head_dim == 0 || !head_dim.is_multiple_of(2) {
+        return Err(Error::loading("QK head width must be positive and even"));
+    }
     let half = head_dim / 2;
     let shape = [sequence, heads, half];
     let lo = input.narrow(2, 0, half)?;
@@ -152,27 +168,32 @@ fn rms_norm_rows(
     input * inverse_rms.rsqrt() * weight
 }
 
-#[crate::kernel::kernel(row)]
-fn qk_norm_rope_rows(
-    lo: crate::kernel::Row,
-    hi: crate::kernel::Row,
-    weight_lo: crate::kernel::Row,
-    weight_hi: crate::kernel::Row,
-    positions: crate::kernel::Row,
-    theta: f32,
-) -> (crate::kernel::Row, crate::kernel::Row) {
-    let square_sum = (lo * lo + hi * hi).row_sum();
-    let inverse_rms = (square_sum / QK_HEAD_DIM + QK_RMS_EPSILON).rsqrt();
-    let normalized_lo = lo * inverse_rms * weight_lo;
-    let normalized_hi = hi * inverse_rms * weight_hi;
-    let exponent = crate::kernel::index(-1) as f32 * (-2.0 / QK_HEAD_DIM);
-    let angle = positions * theta.powf(exponent);
-    let cosine = angle.cos();
-    let sine = angle.sin();
-    (
-        normalized_lo * cosine - normalized_hi * sine,
-        normalized_hi * cosine + normalized_lo * sine,
-    )
+#[allow(clippy::too_many_arguments)]
+mod qk_norm_rope_program {
+    #[crate::kernel::kernel(row)]
+    pub(super) fn qk_norm_rope_rows(
+        lo: crate::kernel::Row,
+        hi: crate::kernel::Row,
+        weight_lo: crate::kernel::Row,
+        weight_hi: crate::kernel::Row,
+        positions: crate::kernel::Row,
+        head_dim: f32,
+        epsilon: f32,
+        theta: f32,
+    ) -> (crate::kernel::Row, crate::kernel::Row) {
+        let square_sum = (lo * lo + hi * hi).row_sum();
+        let inverse_rms = (square_sum / head_dim + epsilon).rsqrt();
+        let normalized_lo = lo * inverse_rms * weight_lo;
+        let normalized_hi = hi * inverse_rms * weight_hi;
+        let exponent = crate::kernel::index(-1) as f32 * (-2.0 / head_dim);
+        let angle = positions * theta.powf(exponent);
+        let cosine = angle.cos();
+        let sine = angle.sin();
+        (
+            normalized_lo * cosine - normalized_hi * sine,
+            normalized_hi * cosine + normalized_lo * sine,
+        )
+    }
 }
 
 struct CapturedPrefill<T: Element> {

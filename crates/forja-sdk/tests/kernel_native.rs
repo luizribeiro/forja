@@ -475,17 +475,27 @@ fn qwen_norm_programs_preserve_interpreter_bits() -> Result<(), Box<dyn Error>> 
 
 #[test]
 fn qwen_qk_norm_rope_preserves_interpreter_bits() -> Result<(), Box<dyn Error>> {
-    let macro_kernel = forja_sdk::nn::blocks::qk_norm_rope_kernel(DType::F32, QWEN_ROPE_THETA)?;
-    let hand = qk_norm_rope_builder()?;
-    let shape = [1, 8, 64];
-    let values = (0..5)
-        .map(|input| random_values(512, 0xcafe + input))
-        .collect::<Vec<_>>();
-    let inputs = values
-        .iter()
-        .map(|values| Input::F32(values))
-        .collect::<Vec<_>>();
-    assert_interpreter_bits_equal(&macro_kernel, &hand, &shape, &inputs)
+    for (half_width, head_dim, head_dim_f32, epsilon) in
+        [(64, 128, 128.0, QWEN_RMS_EPSILON), (32, 64, 64.0, 1.0e-5)]
+    {
+        let macro_kernel = forja_sdk::nn::blocks::qk_norm_rope_kernel(
+            DType::F32,
+            head_dim,
+            epsilon,
+            QWEN_ROPE_THETA,
+        )?;
+        let hand = qk_norm_rope_builder(head_dim_f32, epsilon)?;
+        let shape = [1, 8, half_width];
+        let values = (0..5)
+            .map(|input| random_values(usize::try_from(8 * half_width).unwrap(), 0xcafe + input))
+            .collect::<Vec<_>>();
+        let inputs = values
+            .iter()
+            .map(|values| Input::F32(values))
+            .collect::<Vec<_>>();
+        assert_interpreter_bits_equal(&macro_kernel, &hand, &shape, &inputs)?;
+    }
+    Ok(())
 }
 
 fn assert_interpreter_bits_equal(
@@ -524,15 +534,15 @@ fn rms_normalize<'a>(
     value * inverse_rms * weight
 }
 
-fn qk_norm_rope_builder() -> forja_sdk::Result<Kernel> {
+fn qk_norm_rope_builder(head_dim: f32, epsilon: f32) -> forja_sdk::Result<Kernel> {
     let context = RowCtx::new();
     let lo = context.input(0);
     let hi = context.input(1);
     let square_sum = context.row_sum(lo * lo + hi * hi);
-    let inverse_rms = (square_sum / 128.0 + QWEN_RMS_EPSILON).rsqrt();
+    let inverse_rms = (square_sum / head_dim + epsilon).rsqrt();
     let normalized_lo = lo * inverse_rms * context.input(2);
     let normalized_hi = hi * inverse_rms * context.input(3);
-    let exponent = context.index(-1).cast_f32() * (-2.0 / 128.0);
+    let exponent = context.index(-1).cast_f32() * (-2.0 / head_dim);
     let angle = context.input(4) * context.constant(QWEN_ROPE_THETA).powf(exponent);
     let cosine = angle.cos();
     let sine = angle.sin();

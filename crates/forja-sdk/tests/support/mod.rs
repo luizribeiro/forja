@@ -129,7 +129,8 @@ pub fn attention_and_cache_copy_match_cpu() {
     let weights = Tensor::from_slice(&qk_weights, &[3, 128]).unwrap();
     let positions = Tensor::from_slice(&[7.0_f32], &[1]).unwrap();
     let kernel =
-        forja_sdk::nn::blocks::qk_norm_rope_kernel(forja_sdk::DType::F32, 1_000_000.0).unwrap();
+        forja_sdk::nn::blocks::qk_norm_rope_kernel(forja_sdk::DType::F32, 128, 1.0e-6, 1_000_000.0)
+            .unwrap();
     let combined = forja_sdk::nn::blocks::qk_norm_rope(&kernel, &qk, &weights, &positions)
         .unwrap()
         .to_vec()

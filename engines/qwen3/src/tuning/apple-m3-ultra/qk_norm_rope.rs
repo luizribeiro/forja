@@ -10,5 +10,10 @@ pub(crate) const META: Tuning = Tuning {
 };
 
 pub(crate) fn kernel(dtype: DType) -> Result<Kernel> {
-    qk_norm_rope_kernel(dtype, crate::ROPE_THETA)
+    qk_norm_rope_kernel(
+        dtype,
+        crate::HEAD_DIM,
+        crate::RMS_EPSILON,
+        crate::ROPE_THETA,
+    )
 }

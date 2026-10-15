@@ -624,7 +624,7 @@ impl Qwen3Coder {
             caches,
             residual_norm: residual_norm_kernel(DType::F32, RMS_EPSILON)?,
             rms_norm: rms_norm_kernel(DType::F32, RMS_EPSILON)?,
-            qk_norm_rope: qk_norm_rope_kernel(DType::F32, ROPE_THETA)?,
+            qk_norm_rope: qk_norm_rope_kernel(DType::F32, HEAD_DIM, RMS_EPSILON, ROPE_THETA)?,
             activation_positions: Tensor::constant(
                 &(0..MAX_CONTEXT)
                     .map(exact_position)
