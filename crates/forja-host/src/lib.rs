@@ -4753,6 +4753,128 @@ mod tests {
     }
 
     #[cfg(target_os = "macos")]
+    fn captured_copy_chain(
+        host: &mut Host<forja_metal::MetalBackend>,
+        input: &Resource<TensorEntry>,
+        bridge: &Resource<TensorEntry>,
+        output: &Resource<TensorEntry>,
+    ) -> Resource<super::GraphEntry> {
+        let first = host.alloc(compute::Dtype::F32, &[4]).unwrap();
+        let second = host.alloc(compute::Dtype::F32, &[4]).unwrap();
+        let commands = host.command_list().unwrap();
+        for (source, target) in [
+            (input, &first),
+            (&first, bridge),
+            (bridge, &second),
+            (&second, output),
+        ] {
+            host.dispatch(
+                &commands,
+                compute::Op::Copy,
+                &[Resource::new_borrow(source.rep())],
+                &Resource::new_borrow(target.rep()),
+            )
+            .unwrap();
+        }
+        host.drop_tensor(first).unwrap();
+        host.drop_tensor(second).unwrap();
+        host.create_graph(commands).unwrap()
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn captured_graphs_share_two_transient_arenas_and_match_lazy_execution() {
+        let mut host = Host::new(forja_metal::MetalBackend::new().unwrap(), GENEROUS);
+        let input = host.alloc(compute::Dtype::F32, &[4]).unwrap();
+        let bridge = host.alloc(compute::Dtype::F32, &[4]).unwrap();
+        let output = host.alloc(compute::Dtype::F32, &[4]).unwrap();
+        host.write(&input, &f32_bytes(&[1.0, 2.0, 3.0, 4.0]))
+            .unwrap();
+
+        let mut graphs = Vec::new();
+        for _ in 0..8 {
+            graphs.push(captured_copy_chain(&mut host, &input, &bridge, &output));
+            assert_eq!(host.live_bytes.load(Ordering::Acquire), 80);
+        }
+        host.prepare_replay(&graphs[0], Vec::new())
+            .unwrap()
+            .run()
+            .await
+            .unwrap();
+        let planned = host.prepare_read(&output).unwrap().run().await.unwrap();
+
+        let lazy_output = host.alloc(compute::Dtype::F32, &[4]).unwrap();
+        let lazy_first = host.alloc(compute::Dtype::F32, &[4]).unwrap();
+        let lazy_second = host.alloc(compute::Dtype::F32, &[4]).unwrap();
+        let commands = host.command_list().unwrap();
+        for (source, target) in [
+            (&input, &lazy_first),
+            (&lazy_first, &bridge),
+            (&bridge, &lazy_second),
+            (&lazy_second, &lazy_output),
+        ] {
+            host.dispatch(
+                &commands,
+                compute::Op::Copy,
+                &[Resource::new_borrow(source.rep())],
+                &Resource::new_borrow(target.rep()),
+            )
+            .unwrap();
+        }
+        host.prepare_submit(commands).unwrap().run().await.unwrap();
+        let unplanned = host
+            .prepare_read(&lazy_output)
+            .unwrap()
+            .run()
+            .await
+            .unwrap();
+        assert_eq!(planned, unplanned);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pipelined_graphs_use_distinct_arena_slots() {
+        let mut host = Host::new(forja_metal::MetalBackend::new().unwrap(), GENEROUS);
+        let first_input = host.alloc(compute::Dtype::F32, &[4]).unwrap();
+        let first_bridge = host.alloc(compute::Dtype::F32, &[4]).unwrap();
+        let first_output = host.alloc(compute::Dtype::F32, &[4]).unwrap();
+        let second_input = host.alloc(compute::Dtype::F32, &[4]).unwrap();
+        let second_bridge = host.alloc(compute::Dtype::F32, &[4]).unwrap();
+        let second_output = host.alloc(compute::Dtype::F32, &[4]).unwrap();
+        host.write(&first_input, &f32_bytes(&[1.0, 2.0, 3.0, 4.0]))
+            .unwrap();
+        host.write(&second_input, &f32_bytes(&[5.0, 6.0, 7.0, 8.0]))
+            .unwrap();
+        let first = captured_copy_chain(&mut host, &first_input, &first_bridge, &first_output);
+        let second = captured_copy_chain(&mut host, &second_input, &second_bridge, &second_output);
+
+        host.prepare_replay(&first, Vec::new())
+            .unwrap()
+            .run_deferred()
+            .await
+            .unwrap();
+        host.prepare_replay(&second, Vec::new())
+            .unwrap()
+            .run_deferred()
+            .await
+            .unwrap();
+        let first_bytes = host
+            .prepare_replay_read(&first_output)
+            .unwrap()
+            .run()
+            .await
+            .unwrap();
+        let second_bytes = host
+            .prepare_replay_read(&second_output)
+            .unwrap()
+            .run()
+            .await
+            .unwrap();
+        assert_eq!(first_bytes, f32_bytes(&[1.0, 2.0, 3.0, 4.0]));
+        assert_eq!(second_bytes, f32_bytes(&[5.0, 6.0, 7.0, 8.0]));
+    }
+
+    #[cfg(target_os = "macos")]
     #[test]
     fn graph_creation_refuses_two_arenas_over_the_quota() {
         let limits = Limits::new(80, 8, u64::MAX, 32, u64::MAX);
