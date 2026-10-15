@@ -147,6 +147,13 @@ interface compute {
     scalars: u8,
   }
 
+  record epilogue-signature {
+    accumulator-count: u8,
+    logical-rank: u8,
+    extras: list<dtype>,
+    output: dtype,
+  }
+
   variant op {
     copy,
     add,
@@ -199,6 +206,10 @@ interface compute {
 
   resource kernel {
     create: static func(src: program-source, sig: kernel-signature) -> result<kernel, error>;
+  }
+
+  resource epilogue {
+    create: static func(src: program-source, sig: epilogue-signature) -> result<epilogue, error>;
   }
 
   resource params {

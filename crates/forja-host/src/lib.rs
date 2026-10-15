@@ -28,8 +28,9 @@ use forja_core::{
     TemplateTensor, Tensor, ViewOp, gather_matmul_flops, gather_quant_matmul_combine_flops,
     gather_quant_matmul_flops, gather_quant_silu_mul_flops, matmul_flops,
     program::{
-        BinOp, Inst, KernelSignature, MAX_INSTRUCTIONS, MAX_OUTPUTS, PrepareError, PreparedProgram,
-        Program, ProgramError, ProgramKind, RedOp, UnOp, ValidatedProgram, ValueType,
+        BinOp, EpilogueError, EpilogueSignature, Inst, KernelSignature, MAX_INSTRUCTIONS,
+        MAX_OUTPUTS, PrepareError, PreparedEpilogue, PreparedProgram, Program, ProgramError,
+        ProgramKind, RedOp, UnOp, ValidatedProgram, ValueType, prepare_epilogue_retained,
         prepare_program_retained,
     },
     quant_matmul_flops, sdpa_flops,
@@ -55,6 +56,7 @@ pub mod bindings {
         with: {
             "l9o:gpu/compute.tensor": crate::TensorEntry,
             "l9o:gpu/compute.kernel": crate::KernelEntry,
+            "l9o:gpu/compute.epilogue": crate::EpilogueEntry,
             "l9o:gpu/compute.command-list": crate::CommandListEntry,
             "l9o:gpu/compute.weights": crate::WeightsEntry,
             "l9o:gpu/compute.params": crate::ParamsEntry,
@@ -1407,6 +1409,21 @@ pub struct KernelEntry {
     program: Arc<PreparedProgram>,
 }
 
+/// Host-owned state behind a guest epilogue resource.
+#[derive(Clone, Debug)]
+pub struct EpilogueEntry {
+    epilogue: Arc<PreparedEpilogue>,
+}
+
+impl EpilogueEntry {
+    /// Returns the validated epilogue retained by this resource.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn prepared(&self) -> &Arc<PreparedEpilogue> {
+        &self.epilogue
+    }
+}
+
 /// Host-owned state behind a guest parameter-space resource.
 #[derive(Clone, Debug)]
 pub struct ParamsEntry {
@@ -2217,6 +2234,33 @@ impl<B: Backend + 'static> Host<B> {
     }
 
     fn drop_kernel(&mut self, resource: Resource<KernelEntry>) -> Result<(), compute::Error> {
+        self.table
+            .delete(resource)
+            .map(|_| ())
+            .map_err(invalid_handle)
+    }
+
+    fn create_epilogue(
+        &mut self,
+        source: compute::ProgramSource,
+        signature: compute::EpilogueSignature,
+    ) -> Result<Resource<EpilogueEntry>, compute::Error> {
+        let validated = core_program(source)?;
+        let signature = EpilogueSignature::new(
+            signature.accumulator_count,
+            signature.logical_rank,
+            signature.extras.into_iter().map(core_dtype).collect(),
+            core_dtype(signature.output),
+        );
+        let lease = KernelLease::acquire(Arc::clone(&self.live_kernels), self.limits.live_kernels)?;
+        let epilogue = prepare_epilogue_retained(validated, signature, Box::new(lease))
+            .map_err(|error| epilogue_error(&error))?;
+        self.table
+            .push(EpilogueEntry { epilogue })
+            .map_err(invalid_handle)
+    }
+
+    fn drop_epilogue(&mut self, resource: Resource<EpilogueEntry>) -> Result<(), compute::Error> {
         self.table
             .delete(resource)
             .map(|_| ())
@@ -3906,6 +3950,27 @@ where
     }
 }
 
+impl<B> compute::HostEpilogue for Host<B>
+where
+    B: Backend + Send + Sync + 'static,
+{
+    fn create(
+        &mut self,
+        source: compute::ProgramSource,
+        signature: compute::EpilogueSignature,
+    ) -> impl Future<Output = wasmtime::Result<Result<Resource<EpilogueEntry>, compute::Error>>> + Send
+    {
+        std::future::ready(Ok(self.create_epilogue(source, signature)))
+    }
+
+    fn drop(
+        &mut self,
+        resource: Resource<EpilogueEntry>,
+    ) -> impl Future<Output = wasmtime::Result<()>> + Send {
+        std::future::ready(self.drop_epilogue(resource).map_err(wasmtime::Error::msg))
+    }
+}
+
 impl<B> compute::HostGraph for Host<B>
 where
     B: Backend + Send + Sync + 'static,
@@ -4390,6 +4455,10 @@ fn prepare_error(error: PrepareError) -> compute::Error {
     }
 }
 
+fn epilogue_error(error: &EpilogueError) -> compute::Error {
+    compute::Error::OpSignature(error.to_string())
+}
+
 fn core_inst(instruction: compute::Inst) -> Inst {
     match instruction {
         compute::Inst::Input(slot) => Inst::Input(slot),
@@ -4627,6 +4696,15 @@ mod tests {
             inputs: vec![compute::Dtype::F32],
             outputs: vec![compute::Dtype::F32],
             scalars: 0,
+        }
+    }
+
+    fn unary_f32_epilogue(rank: u8) -> compute::EpilogueSignature {
+        compute::EpilogueSignature {
+            accumulator_count: 1,
+            logical_rank: rank,
+            extras: vec![],
+            output: compute::Dtype::F32,
         }
     }
 
@@ -5687,6 +5765,39 @@ mod tests {
         assert_eq!(host.live_kernels.load(Ordering::Acquire), 0);
         host.create_kernel(doubling_program(3.0), unary_f32_signature(1))
             .unwrap();
+    }
+
+    #[test]
+    fn epilogues_share_the_prepared_program_quota() {
+        let mut host = Host::new(CpuBackend::new(), GENEROUS.with_kernel_limit(1));
+        let epilogue = host
+            .create_epilogue(doubling_program(2.0), unary_f32_epilogue(1))
+            .unwrap();
+        let prepared = host.table.get(&epilogue).unwrap().prepared();
+        assert_eq!(prepared.signature().accumulator_count(), 1);
+        assert_eq!(host.live_kernels.load(Ordering::Acquire), 1);
+        assert!(matches!(
+            host.create_kernel(doubling_program(3.0), unary_f32_signature(1)),
+            Err(compute::Error::Quota(_))
+        ));
+
+        host.drop_epilogue(epilogue).unwrap();
+        assert_eq!(host.live_kernels.load(Ordering::Acquire), 0);
+        host.create_kernel(doubling_program(3.0), unary_f32_signature(1))
+            .unwrap();
+    }
+
+    #[test]
+    fn rejected_epilogue_releases_its_quota_lease() {
+        let mut host = Host::new(CpuBackend::new(), GENEROUS.with_kernel_limit(1));
+        let mut signature = unary_f32_epilogue(1);
+        signature.accumulator_count = 0;
+
+        assert!(matches!(
+            host.create_epilogue(doubling_program(2.0), signature),
+            Err(compute::Error::OpSignature(_))
+        ));
+        assert_eq!(host.live_kernels.load(Ordering::Acquire), 0);
     }
 
     #[test]
