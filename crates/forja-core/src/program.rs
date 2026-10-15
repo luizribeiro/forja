@@ -236,6 +236,215 @@ pub struct KernelSignature {
     scalars: u8,
 }
 
+/// The immutable tensor and accumulator signature of an epilogue program.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct EpilogueSignature {
+    accumulator_count: u8,
+    logical_rank: u8,
+    extra_dtypes: Vec<DType>,
+    output_dtype: DType,
+}
+
+impl EpilogueSignature {
+    /// Describes the virtual accumulators and physical tensor inputs of an epilogue.
+    #[must_use]
+    pub const fn new(
+        accumulator_count: u8,
+        logical_rank: u8,
+        extra_dtypes: Vec<DType>,
+        output_dtype: DType,
+    ) -> Self {
+        Self {
+            accumulator_count,
+            logical_rank,
+            extra_dtypes,
+            output_dtype,
+        }
+    }
+
+    /// Returns the number of leading virtual f32 accumulator inputs.
+    #[must_use]
+    pub const fn accumulator_count(&self) -> u8 {
+        self.accumulator_count
+    }
+
+    /// Returns the primitive's logical output rank.
+    #[must_use]
+    pub const fn logical_rank(&self) -> u8 {
+        self.logical_rank
+    }
+
+    /// Returns physical input storage types in slot order.
+    #[must_use]
+    pub fn extra_dtypes(&self) -> &[DType] {
+        &self.extra_dtypes
+    }
+
+    /// Returns the primitive output storage type.
+    #[must_use]
+    pub const fn output_dtype(&self) -> DType {
+        self.output_dtype
+    }
+}
+
+/// A validated Map program paired with its immutable epilogue signature.
+pub struct PreparedEpilogue {
+    validated: ValidatedProgram,
+    signature: EpilogueSignature,
+    _retained: Option<Box<dyn Any + Send + Sync>>,
+}
+
+impl fmt::Debug for PreparedEpilogue {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedEpilogue")
+            .field("validated", &self.validated)
+            .field("signature", &self.signature)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PreparedEpilogue {
+    /// Returns the validated scalar program.
+    #[must_use]
+    pub const fn validated(&self) -> &ValidatedProgram {
+        &self.validated
+    }
+
+    /// Returns the checked epilogue signature.
+    #[must_use]
+    pub const fn signature(&self) -> &EpilogueSignature {
+        &self.signature
+    }
+}
+
+/// A reason a scalar program cannot be used as a primitive epilogue.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum EpilogueError {
+    /// Epilogues must use independent Map evaluation.
+    ProgramKind,
+    /// At least one virtual accumulator is required.
+    AccumulatorCount,
+    /// The program input count differs from the accumulator and extra-view count.
+    InputCount,
+    /// Epilogues produce exactly one value in output slot zero.
+    OutputCount,
+    /// The logical output rank cannot satisfy the program.
+    Rank,
+    /// A physical input storage type is unsupported.
+    InputDType {
+        /// The rejected physical input slot.
+        slot: usize,
+    },
+    /// Input types violate the program's scalar constraints.
+    InputType {
+        /// The mismatched program input slot.
+        slot: usize,
+    },
+    /// The primitive output storage type is not floating-point.
+    OutputDType,
+}
+
+impl fmt::Display for EpilogueError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "invalid epilogue: {self:?}")
+    }
+}
+
+impl Error for EpilogueError {}
+
+/// Validates an immutable epilogue signature.
+///
+/// # Errors
+///
+/// Returns [`EpilogueError`] when the program or signature violates the epilogue contract.
+pub fn prepare_epilogue(
+    validated: ValidatedProgram,
+    signature: EpilogueSignature,
+) -> Result<Arc<PreparedEpilogue>, EpilogueError> {
+    prepare_epilogue_inner(validated, signature, None)
+}
+
+/// Validates an epilogue while retaining host-owned lifetime state.
+///
+/// # Errors
+///
+/// Returns [`EpilogueError`] when the program or signature violates the epilogue contract.
+#[doc(hidden)]
+pub fn prepare_epilogue_retained(
+    validated: ValidatedProgram,
+    signature: EpilogueSignature,
+    retained: Box<dyn Any + Send + Sync>,
+) -> Result<Arc<PreparedEpilogue>, EpilogueError> {
+    prepare_epilogue_inner(validated, signature, Some(retained))
+}
+
+fn prepare_epilogue_inner(
+    validated: ValidatedProgram,
+    signature: EpilogueSignature,
+    retained: Option<Box<dyn Any + Send + Sync>>,
+) -> Result<Arc<PreparedEpilogue>, EpilogueError> {
+    validate_epilogue_signature(&validated, &signature)?;
+    Ok(Arc::new(PreparedEpilogue {
+        validated,
+        signature,
+        _retained: retained,
+    }))
+}
+
+fn validate_epilogue_signature(
+    validated: &ValidatedProgram,
+    signature: &EpilogueSignature,
+) -> Result<(), EpilogueError> {
+    if validated.program.kind != ProgramKind::Map {
+        return Err(EpilogueError::ProgramKind);
+    }
+    if signature.accumulator_count == 0 {
+        return Err(EpilogueError::AccumulatorCount);
+    }
+    let accumulator_count = usize::from(signature.accumulator_count);
+    if accumulator_count
+        .checked_add(signature.extra_dtypes.len())
+        .is_none_or(|count| count != validated.input_count)
+    {
+        return Err(EpilogueError::InputCount);
+    }
+    if validated.output_count != 1 {
+        return Err(EpilogueError::OutputCount);
+    }
+    let rank = usize::from(signature.logical_rank);
+    if rank > MAX_RANK
+        || validated.program.insts.iter().any(
+            |inst| matches!(inst, Inst::Index(axis) | Inst::Extent(axis) if usize::from(*axis) >= rank),
+        )
+    {
+        return Err(EpilogueError::Rank);
+    }
+    let mut input_types = vec![ValueType::F32; accumulator_count];
+    input_types.extend(
+        signature
+            .extra_dtypes
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(slot, dtype)| {
+                input_value_type(slot, dtype).map_err(|_| EpilogueError::InputDType { slot })
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+    );
+    check_input_types(&validated.program, &input_types).map_err(|error| match error {
+        BindError::InputTypeMismatch { slot } => EpilogueError::InputType { slot },
+        _ => EpilogueError::InputType { slot: 0 },
+    })?;
+    if !matches!(
+        signature.output_dtype,
+        DType::F32 | DType::F16 | DType::BF16
+    ) {
+        return Err(EpilogueError::OutputDType);
+    }
+    Ok(())
+}
+
 impl KernelSignature {
     /// Describes the tensor operands accepted by a prepared program.
     #[must_use]
@@ -1303,6 +1512,94 @@ mod tests {
         assert_eq!(
             validate_signature(&float, &signature(1, vec![DType::F32], vec![DType::U32], 0)),
             Err(PrepareError::OutputDType { slot: 0 })
+        );
+    }
+
+    #[test]
+    fn epilogue_signature_validates_virtual_accumulators() {
+        let fused = program(
+            vec![
+                Inst::Input(0),
+                Inst::Input(1),
+                Inst::Binary(BinOp::Add, 0, 1),
+            ],
+            vec![(0, 2)],
+        )
+        .validate()
+        .unwrap();
+        let signature = EpilogueSignature::new(1, 2, vec![DType::BF16], DType::F16);
+        let prepared = prepare_epilogue(fused, signature.clone()).unwrap();
+
+        assert_eq!(prepared.signature(), &signature);
+        assert_eq!(prepared.signature().accumulator_count(), 1);
+        assert_eq!(prepared.signature().logical_rank(), 2);
+        assert_eq!(prepared.signature().extra_dtypes(), [DType::BF16]);
+        assert_eq!(prepared.signature().output_dtype(), DType::F16);
+    }
+
+    #[test]
+    fn epilogue_signature_refuses_invalid_programs_and_types() {
+        let identity = program(vec![Inst::Input(0)], vec![(0, 0)])
+            .validate()
+            .unwrap();
+        let signature = |accumulators, rank, extras, output| {
+            EpilogueSignature::new(accumulators, rank, extras, output)
+        };
+
+        assert_eq!(
+            validate_epilogue_signature(&identity, &signature(0, 1, vec![DType::F32], DType::F32)),
+            Err(EpilogueError::AccumulatorCount)
+        );
+        assert_eq!(
+            validate_epilogue_signature(&identity, &signature(1, 1, vec![DType::F32], DType::F32)),
+            Err(EpilogueError::InputCount)
+        );
+        assert_eq!(
+            validate_epilogue_signature(&identity, &signature(1, 9, vec![], DType::F32)),
+            Err(EpilogueError::Rank)
+        );
+        assert_eq!(
+            validate_epilogue_signature(&identity, &signature(1, 1, vec![], DType::U32)),
+            Err(EpilogueError::OutputDType)
+        );
+
+        let row = Program {
+            kind: ProgramKind::Row,
+            insts: vec![Inst::Input(0), Inst::Reduce(RedOp::Sum, 0)],
+            outputs: vec![(0, 1)],
+        }
+        .validate()
+        .unwrap();
+        assert_eq!(
+            validate_epilogue_signature(&row, &signature(1, 1, vec![], DType::F32)),
+            Err(EpilogueError::ProgramKind)
+        );
+
+        let multiple = program(vec![Inst::Input(0)], vec![(0, 0), (1, 0)])
+            .validate()
+            .unwrap();
+        assert_eq!(
+            validate_epilogue_signature(&multiple, &signature(1, 1, vec![], DType::F32)),
+            Err(EpilogueError::OutputCount)
+        );
+
+        let unsigned_accumulator = program(
+            vec![
+                Inst::Input(0),
+                Inst::Index(0),
+                Inst::Binary(BinOp::Add, 0, 1),
+                Inst::Cast(ValueType::F32, 2),
+            ],
+            vec![(0, 3)],
+        )
+        .validate()
+        .unwrap();
+        assert_eq!(
+            validate_epilogue_signature(
+                &unsigned_accumulator,
+                &signature(1, 1, vec![], DType::F32)
+            ),
+            Err(EpilogueError::InputType { slot: 0 })
         );
     }
 
