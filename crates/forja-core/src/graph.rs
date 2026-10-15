@@ -883,6 +883,22 @@ impl GraphTemplate {
             .collect()
     }
 
+    /// Plans graph-private allocations by inclusive dispatch lifetime.
+    ///
+    /// `externally_reachable` must contain every allocation for which the guest still owns a
+    /// tensor handle at graph creation. Such allocations are never placed in the arena.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GraphError::MemoryPlanningOverflow`] when byte accounting or placement exceeds
+    /// 64-bit arithmetic.
+    pub fn plan_memory(
+        &self,
+        externally_reachable: &HashSet<crate::BufferId>,
+    ) -> Result<GraphMemoryPlan, GraphError> {
+        plan_graph_memory(self, externally_reachable)
+    }
+
     /// Rebinds graph-private allocations into one physical execution arena.
     ///
     /// # Errors
@@ -1222,6 +1238,106 @@ fn instantiate_tensors(
         .map(|tensor| tensor.instantiate(values))
         .collect()
 }
+
+#[derive(Clone, Copy)]
+struct Lifetime {
+    start: usize,
+    bytes: u64,
+    begins_with_write: bool,
+    consumed: bool,
+}
+
+fn plan_graph_memory(
+    graph: &GraphTemplate,
+    externally_reachable: &HashSet<crate::BufferId>,
+) -> Result<GraphMemoryPlan, GraphError> {
+    let mut lifetimes = HashMap::<crate::BufferId, Lifetime>::new();
+    for (index, dispatch) in graph.dispatches.iter().enumerate() {
+        let (inputs, outputs) = template_dispatch_buffers(dispatch);
+        for buffer in inputs {
+            lifetimes
+                .entry(buffer)
+                .and_modify(|lifetime| {
+                    lifetime.consumed |= lifetime.begins_with_write;
+                })
+                .or_insert(Lifetime {
+                    start: index,
+                    bytes: buffer.byte_len(),
+                    begins_with_write: false,
+                    consumed: false,
+                });
+        }
+        for buffer in outputs {
+            lifetimes.entry(buffer).or_insert(Lifetime {
+                start: index,
+                bytes: buffer.byte_len(),
+                begins_with_write: true,
+                consumed: false,
+            });
+        }
+    }
+    let mut candidates = lifetimes
+        .into_iter()
+        .filter(|(buffer, lifetime)| {
+            !externally_reachable.contains(buffer)
+                && lifetime.begins_with_write
+                && lifetime.consumed
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|(buffer, lifetime)| (lifetime.start, buffer.allocation()));
+
+    let transient_bytes = candidates.iter().try_fold(0_u64, |sum, (_, lifetime)| {
+        sum.checked_add(lifetime.bytes)
+            .ok_or(GraphError::MemoryPlanningOverflow)
+    })?;
+    let mut placements = HashMap::with_capacity(candidates.len());
+    let mut offset = 0_u64;
+    for (buffer, lifetime) in candidates {
+        offset = align_up(offset, 16)?;
+        placements.insert(buffer, offset);
+        offset = offset
+            .checked_add(lifetime.bytes)
+            .ok_or(GraphError::MemoryPlanningOverflow)?;
+    }
+    let arena_bytes = align_up(offset, 4)?;
+    Ok(GraphMemoryPlan {
+        placements,
+        arena_bytes,
+        transient_bytes,
+        peak_live_bytes: transient_bytes,
+    })
+}
+
+fn template_dispatch_buffers(
+    dispatch: &TemplateDispatch,
+) -> (Vec<crate::BufferId>, Vec<crate::BufferId>) {
+    match dispatch {
+        TemplateDispatch::Static(dispatch) => (
+            dispatch.inputs().iter().map(Tensor::buffer).collect(),
+            dispatch.outputs().iter().map(Tensor::buffer).collect(),
+        ),
+        TemplateDispatch::Dynamic { dispatch, .. } | TemplateDispatch::Rule { dispatch, .. } => {
+            match dispatch {
+                DynamicDispatch::Operation {
+                    inputs, outputs, ..
+                }
+                | DynamicDispatch::Program {
+                    inputs, outputs, ..
+                } => (
+                    inputs.iter().map(TemplateTensor::buffer).collect(),
+                    outputs.iter().map(TemplateTensor::buffer).collect(),
+                ),
+            }
+        }
+    }
+}
+
+fn align_up(value: u64, alignment: u64) -> Result<u64, GraphError> {
+    value
+        .checked_add(alignment - 1)
+        .map(|value| value / alignment * alignment)
+        .ok_or(GraphError::MemoryPlanningOverflow)
+}
 #[cfg(test)]
 mod tests {
     use proptest::prelude::*;
@@ -1247,6 +1363,47 @@ mod tests {
             * DType::F32.byte_size();
         let layout = Layout::contiguous(DType::F32, 0, shape.to_vec(), bytes).unwrap();
         Tensor::from_allocation(BufferId::new(1, buffer, bytes), layout, true).unwrap()
+    }
+
+    fn memory_graph(read_first_after_second_write: bool) -> (GraphTemplate, [Tensor; 7]) {
+        let tensors = [
+            tensor(1, &[4]),
+            tensor(2, &[4]),
+            tensor(3, &[4]),
+            tensor(4, &[4]),
+            tensor(5, &[4]),
+            tensor(6, &[4]),
+            tensor(7, &[4]),
+        ];
+        let mut graph =
+            GraphTemplate::new(ParamSpace::new(Vec::new()).unwrap(), GraphLimits::default());
+        graph
+            .record_validated(Dispatch::new(Op::Copy, &[&tensors[0]], &tensors[1]).unwrap())
+            .unwrap();
+        graph
+            .record_validated(Dispatch::new(Op::Copy, &[&tensors[1]], &tensors[2]).unwrap())
+            .unwrap();
+        graph
+            .record_validated(Dispatch::new(Op::Copy, &[&tensors[2]], &tensors[3]).unwrap())
+            .unwrap();
+        if read_first_after_second_write {
+            graph
+                .record_validated(Dispatch::new(Op::Copy, &[&tensors[1]], &tensors[4]).unwrap())
+                .unwrap();
+        }
+        graph
+            .record_validated(Dispatch::new(Op::Copy, &[&tensors[3]], &tensors[5]).unwrap())
+            .unwrap();
+        (graph, tensors)
+    }
+
+    #[test]
+    fn memory_plan_never_places_guest_reachable_allocations() {
+        let (graph, tensors) = memory_graph(false);
+        let reachable = tensors.iter().map(Tensor::buffer).collect();
+        let plan = graph.plan_memory(&reachable).unwrap();
+        assert_eq!(plan.arena_bytes(), 0);
+        assert!(!plan.contains(tensors[1].buffer()));
     }
 
     #[test]
