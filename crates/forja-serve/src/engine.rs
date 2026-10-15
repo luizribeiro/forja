@@ -6,7 +6,7 @@ use std::{
     future::{Future, poll_fn},
     io::Read,
     sync::{
-        Arc,
+        Arc, Mutex as StdMutex,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
@@ -129,8 +129,13 @@ pub struct PrefilledPrompt {
     pub sampling: SamplingParams,
 }
 
-trait PromptRenderer {
+trait PromptRenderer: Send {
     fn render_prompt(&mut self, messages: &str) -> Result<String, GenerationError>;
+}
+
+struct PromptArtifacts<R> {
+    tokenizer: Tokenizer,
+    renderer: R,
 }
 
 impl PromptRenderer for ChatFormat {
@@ -191,8 +196,8 @@ pub enum GenerationEvent {
 pub struct ServingEngine<B: Backend + Send + Sync + 'static> {
     model: String,
     runner: EngineRunner<B>,
-    tokenizer: Tokenizer,
-    chat_format: ChatFormat,
+    prompt: Arc<StdMutex<PromptArtifacts<ChatFormat>>>,
+    chat_info: crate::ChatInfo,
     config: HostConfig,
     info: EngineInfo,
     max_context: u32,
@@ -231,11 +236,15 @@ where
                 "tokenizer contains ids outside the engine vocabulary",
             ));
         }
+        let chat_info = chat_format.info().clone();
         Ok(Self {
             model,
             runner,
-            tokenizer,
-            chat_format,
+            prompt: Arc::new(StdMutex::new(PromptArtifacts {
+                tokenizer,
+                renderer: chat_format,
+            })),
+            chat_info,
             config,
             info,
             max_context,
@@ -264,6 +273,13 @@ where
         self.config.server.sse_write_stall_timeout.get()
     }
 
+    fn tokenizer(&self) -> Result<Tokenizer, GenerationError> {
+        self.prompt
+            .lock()
+            .map(|prompt| prompt.tokenizer.clone())
+            .map_err(|_| GenerationError::new("prompt processor lock is poisoned"))
+    }
+
     /// Renders, tokenizes, validates, and prefills one chat request at position zero.
     ///
     /// # Errors
@@ -273,33 +289,44 @@ where
         &mut self,
         request: &ChatCompletionRequest,
     ) -> Result<PrefilledPrompt, GenerationError> {
-        let chat_info = self.chat_format.info().clone();
+        let control = GenerationControl::new(self.write_stall_timeout());
+        self.prefill_chat_controlled(request, &control).await
+    }
+
+    async fn prefill_chat_controlled(
+        &mut self,
+        request: &ChatCompletionRequest,
+        control: &GenerationControl,
+    ) -> Result<PrefilledPrompt, GenerationError> {
         let (tokens, prompt_tokens, params) = prepare_chat_prompt(
             request,
             &self.config,
-            &chat_info,
+            &self.chat_info,
             self.max_context,
             self.info.vocab,
-            &self.tokenizer,
-            &mut self.chat_format,
-        )?;
-        self.prefill(tokens, prompt_tokens, params).await
+            Arc::clone(&self.prompt),
+            control,
+        )
+        .await?;
+        self.prefill(tokens, prompt_tokens, params, control).await
     }
 
     async fn prefill_completion(
         &mut self,
         request: &CompletionRequest,
+        control: &GenerationControl,
     ) -> Result<PrefilledPrompt, GenerationError> {
-        let chat_info = self.chat_format.info().clone();
         let (tokens, prompt_tokens, params) = prepare_completion_prompt(
             request,
             &self.config,
-            &chat_info,
+            &self.chat_info,
             self.max_context,
             self.info.vocab,
-            &self.tokenizer,
-        )?;
-        self.prefill(tokens, prompt_tokens, params).await
+            Arc::clone(&self.prompt),
+            control,
+        )
+        .await?;
+        self.prefill(tokens, prompt_tokens, params, control).await
     }
 
     async fn prefill(
@@ -307,13 +334,17 @@ where
         tokens: Vec<u32>,
         prompt_tokens: u32,
         params: ResolvedParams,
+        control: &GenerationControl,
     ) -> Result<PrefilledPrompt, GenerationError> {
         let sampling = SamplingParams {
             temperature: params.temperature,
             top_k: params.top_k,
             top_p: params.top_p,
-            seed: sampling_seed(params.seed, params.temperature)?,
+            seed: sampling_seed(params.seed, params.temperature).await?,
         };
+        if control.is_cancelled() {
+            return Err(GenerationError::cancelled());
+        }
         let first = self
             .runner
             .enqueue_decode(EngineDecode {
@@ -354,7 +385,7 @@ where
         request: &ChatCompletionRequest,
         control: &GenerationControl,
     ) -> Result<Completion, GenerationError> {
-        let prefill = self.prefill_chat(request).await?;
+        let prefill = self.prefill_chat_controlled(request, control).await?;
         self.decode(prefill, None, control).await
     }
 
@@ -376,7 +407,7 @@ where
         request: &CompletionRequest,
         control: &GenerationControl,
     ) -> Result<Completion, GenerationError> {
-        let prefill = self.prefill_completion(request).await?;
+        let prefill = self.prefill_completion(request, control).await?;
         self.decode(prefill, None, control).await
     }
 
@@ -400,7 +431,7 @@ where
         sender: &mpsc::Sender<GenerationEvent>,
         control: &GenerationControl,
     ) -> Result<(), GenerationError> {
-        let prefill = self.prefill_chat(request).await?;
+        let prefill = self.prefill_chat_controlled(request, control).await?;
         let completion = self.decode(prefill, Some(sender), control).await?;
         send_terminal(sender, &request.params, completion, control).await
     }
@@ -425,7 +456,7 @@ where
         sender: &mpsc::Sender<GenerationEvent>,
         control: &GenerationControl,
     ) -> Result<(), GenerationError> {
-        let prefill = self.prefill_completion(request).await?;
+        let prefill = self.prefill_completion(request, control).await?;
         let completion = self.decode(prefill, Some(sender), control).await?;
         send_terminal(sender, &request.params, completion, control).await
     }
@@ -441,7 +472,8 @@ where
         let mut consumed = 0_u32;
         let mut position = prefill.prompt_tokens;
         let replay_base = self.runner.metrics().submissions;
-        let mut decoder = self.tokenizer.decode_stream(true);
+        let tokenizer = self.tokenizer()?;
+        let mut decoder = tokenizer.decode_stream(true);
         let mut matcher = StopMatcher::new(&prefill.params.stops);
         let mut text = String::new();
         let generation = async {
@@ -498,7 +530,7 @@ where
                             ))
                         })?;
                 }
-                if self.chat_format.info().stop_token_ids.contains(&token) {
+                if self.chat_info.stop_token_ids.contains(&token) {
                     return Ok(FinishReason::Stop);
                 }
                 if let Some(piece) = decoder.step(token).map_err(|error| {
@@ -633,76 +665,116 @@ where
     })
 }
 
-fn prepare_chat_prompt<R: PromptRenderer>(
+async fn prepare_chat_prompt<R>(
     request: &ChatCompletionRequest,
     config: &HostConfig,
     chat_info: &crate::ChatInfo,
     max_context: u32,
     vocab: u32,
-    tokenizer: &Tokenizer,
-    renderer: &mut R,
-) -> Result<(Vec<u32>, u32, ResolvedParams), GenerationError> {
+    prompt: Arc<StdMutex<PromptArtifacts<R>>>,
+    control: &GenerationControl,
+) -> Result<(Vec<u32>, u32, ResolvedParams), GenerationError>
+where
+    R: PromptRenderer + 'static,
+{
     let params = validate_chat_input(request, config, chat_info, vocab)
         .map_err(|error| GenerationError::invalid(error.to_string()))?;
+    if control.is_cancelled() {
+        return Err(GenerationError::cancelled());
+    }
     let messages = serde_json::to_string(&request.messages)
         .map_err(|error| GenerationError::new(format!("cannot encode messages: {error}")))?;
-    let prompt_text = renderer.render_prompt(&messages)?;
-    let rendered_bytes = u64::try_from(prompt_text.len())
-        .map_err(|_| GenerationError::invalid("rendered prompt size exceeds u64"))?;
-    if rendered_bytes > config.request.max_text_bytes.get() {
-        return Err(GenerationError::invalid(
-            "rendered prompt exceeds the configured byte ceiling",
-        ));
-    }
-    let tokens = tokenizer
-        .encode(prompt_text, false)
-        .map(|encoding| encoding.get_ids().to_vec())
-        .map_err(|error| GenerationError::new(format!("cannot tokenize prompt: {error}")))?;
-    let prompt_tokens = u32::try_from(tokens.len())
-        .map_err(|_| GenerationError::invalid("prompt token count exceeds u32"))?;
-    if tokens.is_empty() {
-        return Err(GenerationError::invalid(
-            "rendered prompt tokenized to an empty sequence",
-        ));
-    }
-    let params = validate_prompt(params, prompt_tokens, max_context)
-        .map_err(|error| GenerationError::invalid(error.to_string()))?;
-    Ok((tokens, prompt_tokens, params))
+    let max_rendered_bytes = config.request.max_text_bytes.get();
+    let tokens = tokio::task::spawn_blocking(move || {
+        let mut prompt = prompt
+            .lock()
+            .map_err(|_| GenerationError::new("prompt processor lock is poisoned"))?;
+        let prompt_text = prompt.renderer.render_prompt(&messages)?;
+        let rendered_bytes = u64::try_from(prompt_text.len())
+            .map_err(|_| GenerationError::invalid("rendered prompt size exceeds u64"))?;
+        if rendered_bytes > max_rendered_bytes {
+            return Err(GenerationError::invalid(
+                "rendered prompt exceeds the configured byte ceiling",
+            ));
+        }
+        prompt
+            .tokenizer
+            .encode(prompt_text, false)
+            .map(|encoding| encoding.get_ids().to_vec())
+            .map_err(|error| GenerationError::new(format!("cannot tokenize prompt: {error}")))
+    })
+    .await
+    .map_err(|error| GenerationError::new(format!("prompt worker failed: {error}")))??;
+    finish_prompt(tokens, params, max_context, control, "rendered prompt")
 }
 
-fn prepare_completion_prompt(
+async fn prepare_completion_prompt<R>(
     request: &CompletionRequest,
     config: &HostConfig,
     chat_info: &crate::ChatInfo,
     max_context: u32,
     vocab: u32,
-    tokenizer: &Tokenizer,
-) -> Result<(Vec<u32>, u32, ResolvedParams), GenerationError> {
+    prompt: Arc<StdMutex<PromptArtifacts<R>>>,
+    control: &GenerationControl,
+) -> Result<(Vec<u32>, u32, ResolvedParams), GenerationError>
+where
+    R: PromptRenderer + 'static,
+{
     let params = validate_completion_input(request, config, chat_info, vocab)
         .map_err(|error| GenerationError::invalid(error.to_string()))?;
-    let tokens = tokenizer
-        .encode(request.prompt.as_str(), false)
-        .map(|encoding| encoding.get_ids().to_vec())
-        .map_err(|error| GenerationError::invalid(format!("cannot tokenize prompt: {error}")))?;
+    if control.is_cancelled() {
+        return Err(GenerationError::cancelled());
+    }
+    let text = request.prompt.clone();
+    let tokens = tokio::task::spawn_blocking(move || {
+        prompt
+            .lock()
+            .map_err(|_| GenerationError::new("prompt processor lock is poisoned"))?
+            .tokenizer
+            .encode(text, false)
+            .map(|encoding| encoding.get_ids().to_vec())
+            .map_err(|error| GenerationError::invalid(format!("cannot tokenize prompt: {error}")))
+    })
+    .await
+    .map_err(|error| GenerationError::new(format!("prompt worker failed: {error}")))??;
+    finish_prompt(tokens, params, max_context, control, "prompt")
+}
+
+fn finish_prompt(
+    tokens: Vec<u32>,
+    params: ResolvedParams,
+    max_context: u32,
+    control: &GenerationControl,
+    description: &str,
+) -> Result<(Vec<u32>, u32, ResolvedParams), GenerationError> {
+    if control.is_cancelled() {
+        return Err(GenerationError::cancelled());
+    }
     let prompt_tokens = u32::try_from(tokens.len())
         .map_err(|_| GenerationError::invalid("prompt token count exceeds u32"))?;
     if tokens.is_empty() {
-        return Err(GenerationError::invalid(
-            "prompt tokenized to an empty sequence",
-        ));
+        return Err(GenerationError::invalid(format!(
+            "{description} tokenized to an empty sequence"
+        )));
     }
     let params = validate_prompt(params, prompt_tokens, max_context)
         .map_err(|error| GenerationError::invalid(error.to_string()))?;
     Ok((tokens, prompt_tokens, params))
 }
 
-fn sampling_seed(requested: Option<u64>, temperature: f32) -> Result<u64, GenerationError> {
+async fn sampling_seed(requested: Option<u64>, temperature: f32) -> Result<u64, GenerationError> {
     if let Some(seed) = requested {
         return Ok(seed);
     }
     if temperature == 0.0 {
         return Ok(0);
     }
+    tokio::task::spawn_blocking(random_seed)
+        .await
+        .map_err(|error| GenerationError::new(format!("sampling worker failed: {error}")))?
+}
+
+fn random_seed() -> Result<u64, GenerationError> {
     let mut bytes = [0_u8; 8];
     File::open("/dev/urandom")
         .and_then(|mut file| file.read_exact(&mut bytes))
@@ -724,11 +796,13 @@ mod tests {
         }
     }
 
-    #[test]
-    fn invalid_message_count_never_calls_chat_format() {
+    #[tokio::test]
+    async fn invalid_message_count_never_calls_chat_format() {
         let calls = Arc::new(AtomicUsize::new(0));
-        let mut renderer = CountingRenderer(Arc::clone(&calls));
-        let tokenizer = Tokenizer::new(tokenizers::models::bpe::BPE::default());
+        let prompt = Arc::new(StdMutex::new(PromptArtifacts {
+            tokenizer: Tokenizer::new(tokenizers::models::bpe::BPE::default()),
+            renderer: CountingRenderer(Arc::clone(&calls)),
+        }));
         let mut config = HostConfig::default();
         config.request.max_messages = 0;
         let request = ChatCompletionRequest {
@@ -743,25 +817,19 @@ mod tests {
             stop_token_ids: Vec::new(),
             sampling: crate::SamplingDefaults::default(),
         };
+        let control = GenerationControl::new(Duration::from_secs(1));
 
-        let result = prepare_chat_prompt(
-            &request,
-            &config,
-            &info,
-            32_768,
-            151_936,
-            &tokenizer,
-            &mut renderer,
-        );
+        let result =
+            prepare_chat_prompt(&request, &config, &info, 32_768, 151_936, prompt, &control).await;
 
         assert!(result.is_err());
         assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 0);
     }
 
-    #[test]
-    fn greedy_sampling_needs_no_entropy() {
-        assert_eq!(sampling_seed(None, 0.0).unwrap(), 0);
-        assert_eq!(sampling_seed(Some(17), 0.7).unwrap(), 17);
+    #[tokio::test]
+    async fn greedy_sampling_needs_no_entropy() {
+        assert_eq!(sampling_seed(None, 0.0).await.unwrap(), 0);
+        assert_eq!(sampling_seed(Some(17), 0.7).await.unwrap(), 17);
     }
 
     #[tokio::test]
