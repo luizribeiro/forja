@@ -24,6 +24,11 @@ enum CpuBuffer {
     Mapped(MappedRegion),
 }
 
+enum DecodedInput {
+    F32(Vec<f32>),
+    U32(Vec<u32>),
+}
+
 impl CpuBuffer {
     fn bytes(&self) -> &[u8] {
         match self {
@@ -195,26 +200,7 @@ impl CpuBackend {
     }
 
     fn execute_program(&self, program: &BoundProgram) -> Result<(), BackendError> {
-        enum DecodedInput {
-            F32(Vec<f32>),
-            U32(Vec<u32>),
-        }
-
-        let decoded = program
-            .inputs()
-            .iter()
-            .map(|input| match input.layout().dtype() {
-                DType::F32 | DType::F16 | DType::BF16 => {
-                    decode(&self.read(input)?, input.layout().dtype())
-                        .map(DecodedInput::F32)
-                        .ok_or(BackendError::ExecutionFailed)
-                }
-                DType::U32 => decode_u32(&self.read(input)?)
-                    .map(DecodedInput::U32)
-                    .ok_or(BackendError::ExecutionFailed),
-                DType::I32 => Err(BackendError::ExecutionFailed),
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let decoded = self.decode_inputs(program.inputs())?;
         let inputs = decoded
             .iter()
             .map(|input| match input {
@@ -234,6 +220,52 @@ impl CpuBackend {
             .iter()
             .zip(values)
             .try_for_each(|(output, values)| self.write_output(output, &values))
+    }
+
+    fn decode_inputs(&self, inputs: &[Tensor]) -> Result<Vec<DecodedInput>, BackendError> {
+        inputs
+            .iter()
+            .map(|input| match input.layout().dtype() {
+                DType::F32 | DType::F16 | DType::BF16 => {
+                    decode(&self.read(input)?, input.layout().dtype())
+                        .map(DecodedInput::F32)
+                        .ok_or(BackendError::ExecutionFailed)
+                }
+                DType::U32 => decode_u32(&self.read(input)?)
+                    .map(DecodedInput::U32)
+                    .ok_or(BackendError::ExecutionFailed),
+                DType::I32 => Err(BackendError::ExecutionFailed),
+            })
+            .collect()
+    }
+
+    fn apply_epilogue(
+        &self,
+        dispatch: Option<&forja_core::Dispatch>,
+        accumulators: Vec<f32>,
+    ) -> Result<Vec<f32>, BackendError> {
+        let Some(dispatch) = dispatch else {
+            return Ok(accumulators);
+        };
+        let Some(epilogue) = dispatch.prepared_epilogue() else {
+            return Ok(accumulators);
+        };
+        let extras = &dispatch.inputs()[dispatch.primitive_inputs().len()..];
+        let mut decoded = vec![DecodedInput::F32(accumulators)];
+        decoded.extend(self.decode_inputs(extras)?);
+        let inputs = decoded
+            .iter()
+            .map(|input| match input {
+                DecodedInput::F32(values) => interpreter::Input::F32(values),
+                DecodedInput::U32(values) => interpreter::Input::U32(values),
+            })
+            .collect::<Vec<_>>();
+        let mut outputs = interpreter::interpret_map(
+            epilogue.validated(),
+            dispatch.output().layout().shape(),
+            &inputs,
+        )?;
+        outputs.pop().ok_or(BackendError::ExecutionFailed)
     }
 
     fn write_output(&self, output: &Tensor, values: &[f32]) -> Result<(), BackendError> {
@@ -638,7 +670,9 @@ impl CpuBackend {
         invalid_route.map_or(Ok(()), |index| Err(BackendError::IndexOutOfRange { index }))
     }
 
-    fn execute_matmul(&self, inputs: &[Tensor], output: &Tensor) -> Result<(), BackendError> {
+    fn execute_matmul(&self, dispatch: &forja_core::Dispatch) -> Result<(), BackendError> {
+        let inputs = dispatch.primitive_inputs();
+        let output = dispatch.output();
         let left = decode(&self.read(&inputs[0])?, inputs[0].layout().dtype())
             .ok_or(BackendError::ExecutionFailed)?;
         let right = decode(&self.read(&inputs[1])?, inputs[1].layout().dtype())
@@ -667,6 +701,7 @@ impl CpuBackend {
                 }
             }
         }
+        let values = self.apply_epilogue(Some(dispatch), values)?;
         self.write_output(output, &values)
     }
 
@@ -740,6 +775,7 @@ impl CpuBackend {
         output: &Tensor,
         bits: u8,
         group_size: u32,
+        epilogue_dispatch: Option<&forja_core::Dispatch>,
     ) -> Result<(), BackendError> {
         let activations = decode(&self.read(&inputs[0])?, inputs[0].layout().dtype())
             .ok_or(BackendError::ExecutionFailed)?;
@@ -779,6 +815,7 @@ impl CpuBackend {
                 )?);
             }
         }
+        let values = self.apply_epilogue(epilogue_dispatch, values)?;
         self.write_output(output, &values)
     }
 
@@ -789,7 +826,13 @@ impl CpuBackend {
         k: u32,
         normalize: bool,
     ) -> Result<(), BackendError> {
-        self.execute_quant_matmul(dispatch.inputs(), &dispatch.outputs()[0], 8, group_size)?;
+        self.execute_quant_matmul(
+            dispatch.inputs(),
+            &dispatch.outputs()[0],
+            8,
+            group_size,
+            None,
+        )?;
         self.execute_top_k(
             &dispatch.outputs()[..1],
             &dispatch.outputs()[1..],
@@ -804,6 +847,7 @@ impl CpuBackend {
         output: &Tensor,
         bits: u8,
         group_size: u32,
+        epilogue_dispatch: Option<&forja_core::Dispatch>,
     ) -> Result<(), BackendError> {
         let activations = decode(&self.read(&inputs[0])?, inputs[0].layout().dtype())
             .ok_or(BackendError::ExecutionFailed)?;
@@ -876,6 +920,7 @@ impl CpuBackend {
                 }
             }
         }
+        let values = self.apply_epilogue(epilogue_dispatch, values)?;
         self.write_output(output, &values)?;
         invalid_route.map_or(Ok(()), |index| Err(BackendError::IndexOutOfRange { index }))
     }
@@ -991,6 +1036,7 @@ impl CpuBackend {
             &gate,
             bits,
             group_size,
+            None,
         )?;
         let up = self.alloc(output.layout().dtype(), output.layout().shape())?;
         self.execute_gather_quant_matmul(
@@ -1004,6 +1050,7 @@ impl CpuBackend {
             &up,
             bits,
             group_size,
+            None,
         )?;
         self.execute_binary(&[gate, up], output, |gate, up| {
             gate / (1.0 + (-gate).exp()) * up
@@ -1254,15 +1301,16 @@ impl Backend for CpuBackend {
                 Op::QuantEmbed { bits, group_size } => {
                     self.execute_quant_embed(dispatch.inputs(), dispatch.output(), bits, group_size)
                 }
-                Op::Matmul => self.execute_matmul(dispatch.inputs(), dispatch.output()),
+                Op::Matmul => self.execute_matmul(&dispatch),
                 Op::GatherMatmul => {
                     self.execute_gather_matmul(dispatch.inputs(), dispatch.output())
                 }
                 Op::QuantMatmul { bits, group_size } => self.execute_quant_matmul(
-                    dispatch.inputs(),
+                    dispatch.primitive_inputs(),
                     dispatch.output(),
                     bits,
                     group_size,
+                    Some(&dispatch),
                 ),
                 Op::QuantizedRouter {
                     group_size,
@@ -1270,10 +1318,11 @@ impl Backend for CpuBackend {
                     normalize,
                 } => self.execute_quantized_router(&dispatch, group_size, k, normalize),
                 Op::GatherQuantMatmul { bits, group_size } => self.execute_gather_quant_matmul(
-                    dispatch.inputs(),
+                    dispatch.primitive_inputs(),
                     dispatch.output(),
                     bits,
                     group_size,
+                    Some(&dispatch),
                 ),
                 Op::GatherQuantMatmulCombine { bits, group_size } => self
                     .execute_gather_quant_matmul_combine(
@@ -1577,14 +1626,88 @@ mod tests {
     use super::*;
     use forja_core::{
         Affine, GraphLimits, GraphTemplate, Op, ParamSpace, Slice, SymbolicLayout, TemplateTensor,
-        program::{BinOp, Inst, KernelSignature, Program, ProgramKind, ValueType, prepare_program},
+        program::{
+            BinOp, EpilogueSignature, Inst, KernelSignature, Program, ProgramKind, ValueType,
+            prepare_epilogue, prepare_program,
+        },
     };
+    use forja_testing::{DifferentialComparison, assert_fused_decomposed};
     use std::{
         fs,
         sync::atomic::{AtomicU64, Ordering},
     };
 
     static NEXT_FILE: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn fused_matmul_epilogue_matches_decomposed_broadcast_add() {
+        let backend = CpuBackend::new();
+        let left = backend.alloc(DType::F32, &[7, 33]).unwrap();
+        let right = backend.alloc(DType::F32, &[33, 17]).unwrap();
+        let bias = backend.alloc(DType::F32, &[17]).unwrap();
+        let left_values = (0_u16..7 * 33)
+            .map(|index| f32::from(index) / 97.0 - 1.0)
+            .collect::<Vec<_>>();
+        let right_values = (0_u16..33 * 17)
+            .map(|index| f32::from(index) / 113.0 - 2.0)
+            .collect::<Vec<_>>();
+        let bias_values = (0_u16..17)
+            .map(|index| f32::from(index) / 17.0)
+            .collect::<Vec<_>>();
+        backend.write(&left, &f32_bytes(&left_values)).unwrap();
+        backend.write(&right, &f32_bytes(&right_values)).unwrap();
+        backend.write(&bias, &f32_bytes(&bias_values)).unwrap();
+        let bias = backend.view(&bias, ViewOp::Broadcast(vec![7, 17])).unwrap();
+        let fused_output = backend.alloc(DType::F32, &[7, 17]).unwrap();
+        let decomposed_accumulator = backend.alloc(DType::F32, &[7, 17]).unwrap();
+        let decomposed_output = backend.alloc(DType::F32, &[7, 17]).unwrap();
+        let epilogue = prepare_epilogue(
+            Program {
+                kind: ProgramKind::Map,
+                insts: vec![
+                    Inst::Input(0),
+                    Inst::Input(1),
+                    Inst::Binary(BinOp::Add, 0, 1),
+                ],
+                outputs: vec![(0, 2)],
+            }
+            .validate()
+            .unwrap(),
+            EpilogueSignature::new(1, 2, vec![DType::F32], DType::F32),
+        )
+        .unwrap();
+        let mut fused = CommandList::new();
+        fused
+            .dispatch_epilogue(
+                Op::Matmul,
+                &[&left, &right],
+                &fused_output,
+                &epilogue,
+                &[&bias],
+            )
+            .unwrap();
+        let mut decomposed = CommandList::new();
+        decomposed
+            .dispatch(Op::Matmul, &[&left, &right], &decomposed_accumulator)
+            .unwrap();
+        decomposed
+            .dispatch(
+                Op::Add,
+                &[&decomposed_accumulator, &bias],
+                &decomposed_output,
+            )
+            .unwrap();
+
+        assert_fused_decomposed(
+            &backend,
+            fused,
+            &fused_output,
+            decomposed,
+            &decomposed_output,
+            DifferentialComparison::Exact,
+        )
+        .unwrap();
+    }
 
     #[test]
     fn replays_graphs_through_the_prevalidated_path() {

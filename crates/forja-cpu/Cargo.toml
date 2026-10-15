@@ -14,4 +14,5 @@ forja-core = { path = "../forja-core" }
 half = "2"
 
 [dev-dependencies]
+forja-testing = { path = "../../support/forja-testing" }
 proptest = "1"

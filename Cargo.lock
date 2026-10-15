@@ -801,6 +801,7 @@ name = "forja-cpu"
 version = "0.0.0"
 dependencies = [
  "forja-core",
+ "forja-testing",
  "half",
  "proptest",
 ]
