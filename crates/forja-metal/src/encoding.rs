@@ -1695,19 +1695,26 @@ impl InFlightTracker {
         use objc2_metal::MTL4ArgumentTableDescriptor;
 
         let device = &backend.device;
-        let allocator = device
-            .newCommandAllocator()
-            .ok_or(BackendError::ExecutionFailed)?;
+        let allocator = backend.allocate_device_object(|| {
+            device
+                .newCommandAllocator()
+                .ok_or(BackendError::ExecutionFailed)
+        })?;
         let descriptor = MTL4ArgumentTableDescriptor::new();
         descriptor.setMaxBufferBindCount(24);
-        let argument_table = device
-            .newArgumentTableWithDescriptor_error(&descriptor)
-            .map_err(|_| BackendError::ExecutionFailed)?;
+        let argument_table = backend.allocate_device_object(|| {
+            device
+                .newArgumentTableWithDescriptor_error(&descriptor)
+                .map_err(|_| BackendError::ExecutionFailed)
+        })?;
         let raw = backend.new_buffer(argument_capacity)?;
-        let residency = device
-            .newResidencySetWithDescriptor_error(&MTLResidencySetDescriptor::new())
-            .map_err(|_| BackendError::ExecutionFailed)?;
-        residency.commit();
+        let residency = backend.allocate_device_object(|| {
+            let residency = device
+                .newResidencySetWithDescriptor_error(&MTLResidencySetDescriptor::new())
+                .map_err(|_| BackendError::ExecutionFailed)?;
+            residency.commit();
+            Ok(residency)
+        })?;
         let timestamps = backend.make_timestamps(2)?;
         Ok(ReusableSubmissionObjects {
             allocator,
@@ -1969,6 +1976,7 @@ impl MetalBackend {
         let encoding = (self.graph_replay == crate::storage::MetalGraphReplay::Tier2)
             .then(|| self.prepare_encoding_plan(graph))
             .transpose()?;
+        let _reservation = self.reserve_allocation(0)?;
         let residency = self
             .device
             .newResidencySetWithDescriptor_error(&MTLResidencySetDescriptor::new())
@@ -1987,6 +1995,7 @@ impl MetalBackend {
             }
         }
         residency.commit();
+        self.check_allocation_limit()?;
         Ok(PreparedMetalGraph {
             residency,
             buffers: retained,
@@ -5952,10 +5961,11 @@ impl MetalBackend {
         unsafe {
             descriptor.setCount(count);
         }
-        let heap = self
-            .device
-            .newCounterHeapWithDescriptor_error(&descriptor)
-            .map_err(|_| BackendError::ExecutionFailed)?;
+        let heap = self.allocate_device_object(|| {
+            self.device
+                .newCounterHeapWithDescriptor_error(&descriptor)
+                .map_err(|_| BackendError::ExecutionFailed)
+        })?;
         let frequency = self.device.queryTimestampFrequency();
         let entry_size = self
             .device
@@ -8226,6 +8236,66 @@ mod tests {
         }
 
         assert_eq!(backend.debug_state().allocation_requests, warm);
+    }
+
+    fn exercise_graph_lifetime(
+        backend: &MetalBackend,
+        hidden: &Tensor,
+        update: &Tensor,
+        output: &Tensor,
+    ) {
+        let mut template =
+            GraphTemplate::new(ParamSpace::new(Vec::new()).unwrap(), GraphLimits::default());
+        template
+            .dispatch(
+                Op::Add,
+                &[&hidden.clone().into(), &update.clone().into()],
+                &output.clone().into(),
+            )
+            .unwrap();
+        let graph = backend.prepare_graph(template).unwrap();
+        let mut submissions = VecDeque::new();
+        for _ in 0..16 {
+            submissions.push_back(backend.replay(&graph, Vec::new()).unwrap());
+            if submissions.len() == MAX_IN_FLIGHT_SUBMISSIONS {
+                submissions.pop_front().unwrap().wait().unwrap();
+            }
+        }
+        for submission in submissions {
+            submission.wait().unwrap();
+        }
+    }
+
+    #[test]
+    fn graph_replay_allocation_reaches_a_bounded_steady_state() {
+        const FIXED_BACKEND_BYTES: u64 = 1024 * 1024;
+        const WARMUP_ITERATIONS: usize = 16;
+        const CHECK_ITERATIONS: usize = 64;
+
+        let backend = MetalBackend::new().unwrap();
+        let hidden = backend.alloc(DType::F32, &[1, 1024]).unwrap();
+        let update = backend.alloc(DType::F32, &[1, 1024]).unwrap();
+        let output = backend.alloc(DType::F32, &[1, 1024]).unwrap();
+        for _ in 0..WARMUP_ITERATIONS {
+            exercise_graph_lifetime(&backend, &hidden, &update, &output);
+        }
+        let settled = backend.memory_usage().device_bytes.unwrap();
+
+        for _ in 0..CHECK_ITERATIONS {
+            exercise_graph_lifetime(&backend, &hidden, &update, &output);
+            let memory = backend.memory_usage();
+            let device = memory.device_bytes.unwrap();
+            assert!(
+                device <= memory.charged_bytes + FIXED_BACKEND_BYTES,
+                "device allocation {device} exceeds {} accounted bytes plus fixed overhead",
+                memory.charged_bytes
+            );
+            assert_eq!(device, settled);
+        }
+        assert_eq!(
+            backend.debug_state().submission_slots,
+            MAX_IN_FLIGHT_SUBMISSIONS
+        );
     }
 
     #[test]

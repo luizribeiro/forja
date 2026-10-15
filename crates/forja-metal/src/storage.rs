@@ -759,6 +759,16 @@ impl MetalBackend {
         Ok(())
     }
 
+    pub(super) fn allocate_device_object<T>(
+        &self,
+        create: impl FnOnce() -> Result<T, BackendError>,
+    ) -> Result<T, BackendError> {
+        let _reservation = self.reserve_allocation(0)?;
+        let object = create()?;
+        self.check_allocation_limit()?;
+        Ok(object)
+    }
+
     fn charged_device_bytes(&self) -> u64 {
         u64::try_from(self.device.currentAllocatedSize())
             .unwrap_or(u64::MAX)
