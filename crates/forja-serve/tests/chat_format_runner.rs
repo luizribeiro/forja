@@ -11,7 +11,7 @@ fn runs_a_bounded_zero_import_chat_format() {
         ..ChatFormatLimits::default()
     };
     let mut format = ChatFormat::load(test_guests::chat_format_smoke(), limits).unwrap();
-    let info = format.info().unwrap();
+    let info = format.info();
     assert_eq!(info.stop_token_ids, [2]);
     assert_eq!(
         format.render("[]", "[]", "{}").unwrap().unwrap(),
@@ -66,9 +66,11 @@ fn runs_the_qwen3_coder_chat_format() {
         ChatFormatLimits::default(),
     )
     .unwrap();
-    let info = format.info().unwrap();
+    let info = format.info();
     assert_eq!(info.stop_token_ids, [151_645, 151_643]);
     assert_eq!(info.sampling.top_k, Some(20));
+    assert_eq!(format.load_warnings().len(), 1);
+    assert!(format.load_warnings()[0].contains("will not be applied"));
     let rendered = format
         .render(
             r#"[{"role":"user","content":"A & <B>"}]"#,

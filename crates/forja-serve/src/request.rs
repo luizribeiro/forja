@@ -4,7 +4,7 @@ use forja_config::HostConfig;
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::GenerationConfig;
+use crate::{ChatInfo, SamplingDefaults};
 
 /// One chat message with string content.
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -139,7 +139,7 @@ impl Error for ValidationError {}
 pub fn validate_chat(
     request: &ChatCompletionRequest,
     config: &HostConfig,
-    defaults: &GenerationConfig,
+    defaults: &ChatInfo,
     prompt_tokens: u32,
     max_context: u32,
     vocab: u32,
@@ -154,7 +154,7 @@ pub fn validate_chat(
     resolve(
         &request.params,
         config,
-        defaults,
+        &defaults.sampling,
         prompt_tokens,
         configured_context(config, max_context),
         vocab,
@@ -170,7 +170,7 @@ pub fn validate_chat(
 pub fn validate_completion(
     request: &CompletionRequest,
     config: &HostConfig,
-    defaults: &GenerationConfig,
+    defaults: &ChatInfo,
     prompt_tokens: u32,
     max_context: u32,
     vocab: u32,
@@ -179,7 +179,7 @@ pub fn validate_completion(
     resolve(
         &request.params,
         config,
-        defaults,
+        &defaults.sampling,
         prompt_tokens,
         configured_context(config, max_context),
         vocab,
@@ -195,7 +195,7 @@ pub fn validate_completion(
 fn resolve(
     params: &CompletionParams,
     config: &HostConfig,
-    defaults: &GenerationConfig,
+    defaults: &SamplingDefaults,
     prompt_tokens: u32,
     max_context: u32,
     vocab: u32,
@@ -214,16 +214,12 @@ fn resolve(
     let requested = params
         .max_completion_tokens
         .or(params.max_tokens)
+        .or(defaults.max_new_tokens)
         .unwrap_or(config.request.max_output_tokens);
     if requested == 0 {
         return invalid("output token limit must be positive");
     }
-    let explicit_sampling =
-        params.temperature.is_some() || params.top_p.is_some() || params.top_k.is_some();
-    let mut temperature = params.temperature.or(defaults.temperature).unwrap_or(1.0);
-    if defaults.do_sample == Some(false) && !explicit_sampling {
-        temperature = 0.0;
-    }
+    let temperature = params.temperature.or(defaults.temperature).unwrap_or(1.0);
     let top_p = params.top_p.or(defaults.top_p).unwrap_or(1.0);
     if !temperature.is_finite() || temperature < 0.0 {
         return invalid("temperature must be finite and nonnegative");
@@ -357,19 +353,30 @@ mod tests {
 
     fn resolve_chat(
         params: &CompletionParams,
-        defaults: &GenerationConfig,
+        defaults: &ChatInfo,
         prompt_tokens: u32,
         max_context: u32,
     ) -> Result<ResolvedParams, ValidationError> {
         resolve(
             params,
             &HostConfig::default(),
-            defaults,
+            &defaults.sampling,
             prompt_tokens,
             max_context,
             151_936,
             true,
         )
+    }
+
+    fn info(sampling: SamplingDefaults) -> ChatInfo {
+        ChatInfo {
+            stop_token_ids: Vec::new(),
+            sampling,
+        }
+    }
+
+    fn default_info() -> ChatInfo {
+        info(SamplingDefaults::default())
     }
 
     #[test]
@@ -387,14 +394,13 @@ mod tests {
 
     #[test]
     fn request_values_override_defaults_and_context_clamps_output() {
-        let defaults = GenerationConfig {
-            do_sample: Some(true),
+        let defaults = info(SamplingDefaults {
             temperature: Some(0.7),
             top_p: Some(0.8),
             top_k: Some(20),
             repetition_penalty: Some(1.05),
-            ..GenerationConfig::default()
-        };
+            max_new_tokens: None,
+        });
         let params = CompletionParams {
             max_completion_tokens: Some(100),
             temperature: Some(0.2),
@@ -415,7 +421,7 @@ mod tests {
             max_completion_tokens: Some(1),
             ..CompletionParams::default()
         };
-        let error = resolve_chat(&params, &GenerationConfig::default(), 1, 32_768).unwrap_err();
+        let error = resolve_chat(&params, &default_info(), 1, 32_768).unwrap_err();
         assert_eq!(
             error.to_string(),
             "max_tokens and max_completion_tokens conflict"
@@ -423,14 +429,13 @@ mod tests {
     }
 
     #[test]
-    fn false_model_sampling_default_is_greedy_without_request_sampling() {
-        let defaults = GenerationConfig {
-            do_sample: Some(false),
-            temperature: Some(0.7),
-            ..GenerationConfig::default()
-        };
+    fn component_output_limit_is_used_as_the_request_default() {
+        let defaults = info(SamplingDefaults {
+            max_new_tokens: Some(7),
+            ..SamplingDefaults::default()
+        });
         let resolved = resolve_chat(&CompletionParams::default(), &defaults, 1, 32_768).unwrap();
-        assert_eq!(resolved.temperature.to_bits(), 0.0_f32.to_bits());
+        assert_eq!(resolved.max_tokens, 7);
     }
 
     #[test]
@@ -439,7 +444,7 @@ mod tests {
             n: Some(2),
             ..CompletionParams::default()
         };
-        let error = resolve_chat(&params, &GenerationConfig::default(), 1, 32_768).unwrap_err();
+        let error = resolve_chat(&params, &default_info(), 1, 32_768).unwrap_err();
         assert_eq!(
             error.to_string(),
             "request contains an unsupported non-default field"
@@ -452,7 +457,7 @@ mod tests {
             repetition_penalty: Some(1.05),
             ..CompletionParams::default()
         };
-        let error = resolve_chat(&params, &GenerationConfig::default(), 1, 32_768).unwrap_err();
+        let error = resolve_chat(&params, &default_info(), 1, 32_768).unwrap_err();
         assert_eq!(
             error.to_string(),
             "request contains an unsupported non-default field"
@@ -472,7 +477,7 @@ mod tests {
         let resolved = validate_completion(
             &request,
             &HostConfig::default(),
-            &GenerationConfig::default(),
+            &default_info(),
             1,
             32_768,
             151_936,
@@ -494,7 +499,7 @@ mod tests {
         let error = validate_chat(
             &chat(CompletionParams::default()),
             &config,
-            &GenerationConfig::default(),
+            &default_info(),
             1,
             32_768,
             151_936,
@@ -521,15 +526,8 @@ mod tests {
             ],
             params: CompletionParams::default(),
         };
-        let error = validate_chat(
-            &request,
-            &config,
-            &GenerationConfig::default(),
-            1,
-            32_768,
-            151_936,
-        )
-        .unwrap_err();
+        let error =
+            validate_chat(&request, &config, &default_info(), 1, 32_768, 151_936).unwrap_err();
         assert_eq!(
             error.to_string(),
             "request text exceeds the configured ceiling"
@@ -541,7 +539,7 @@ mod tests {
         let error = validate_chat(
             &chat(CompletionParams::default()),
             &HostConfig::default(),
-            &GenerationConfig::default(),
+            &default_info(),
             32_768,
             32_768,
             151_936,
@@ -562,7 +560,7 @@ mod tests {
         let error = validate_chat(
             &chat(params),
             &HostConfig::default(),
-            &GenerationConfig::default(),
+            &default_info(),
             1,
             32_768,
             151_936,
@@ -583,7 +581,7 @@ mod tests {
         let error = validate_chat(
             &chat(params),
             &HostConfig::default(),
-            &GenerationConfig::default(),
+            &default_info(),
             1,
             32_768,
             151_936,
@@ -610,9 +608,9 @@ mod tests {
 
     #[test]
     fn top_k_is_clamped_to_the_engine_vocabulary() {
-        let defaults = GenerationConfig {
+        let defaults = SamplingDefaults {
             top_k: Some(200),
-            ..GenerationConfig::default()
+            ..SamplingDefaults::default()
         };
         let resolved = resolve(
             &CompletionParams::default(),

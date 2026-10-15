@@ -61,8 +61,8 @@ pub struct ServedModel {
     pub profile: PathBuf,
     /// Model directory path.
     pub model: PathBuf,
-    /// Optional chat-template path.
-    pub template: Option<PathBuf>,
+    /// Chat-format component path.
+    pub chat_format: PathBuf,
 }
 
 /// Per-request admission ceilings.
@@ -111,7 +111,7 @@ queue_length = 8
 engine = "/srv/engine.wasm"
 profile = "/srv/profile.toml"
 model = "/models/qwen"
-template = "/srv/chat.jinja"
+chat_format = "/srv/chat-format.wasm"
 
 [backend.metal]
 graph_replay = "tier1"

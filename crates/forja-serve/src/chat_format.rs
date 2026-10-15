@@ -81,6 +81,8 @@ pub struct ChatFormat {
     store: Store<State>,
     instance: bindings::ChatFormatComponent,
     render: Func,
+    info: ChatInfo,
+    load_warnings: Vec<String>,
     limits: ChatFormatLimits,
 }
 
@@ -116,20 +118,43 @@ impl ChatFormat {
             .get_func(&mut store, render_index)
             .ok_or_else(|| wasmtime::Error::msg("chat format render function is missing"))?;
         let instance = bindings::ChatFormatComponent::new(&mut store, &instance)?;
-        Ok(Self {
+        let mut format = Self {
             store,
             instance,
             render,
+            info: ChatInfo {
+                stop_token_ids: Vec::new(),
+                sampling: SamplingDefaults::default(),
+            },
+            load_warnings: Vec::new(),
             limits,
-        })
+        };
+        format.info = format.call_info()?;
+        if let Some(penalty) = format.info.sampling.repetition_penalty
+            && penalty.to_bits() != 1.0_f32.to_bits()
+        {
+            let warning = format!(
+                "chat-format repetition-penalty default {penalty} is unsupported and will not be applied"
+            );
+            eprintln!("warning: {warning}");
+            format.load_warnings.push(warning);
+        }
+        Ok(format)
     }
 
-    /// Reads model defaults from the component.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when execution traps or exceeds a resource limit.
-    pub fn info(&mut self) -> wasmtime::Result<ChatInfo> {
+    /// Returns model defaults read while loading the component.
+    #[must_use]
+    pub const fn info(&self) -> &ChatInfo {
+        &self.info
+    }
+
+    /// Returns warnings discovered while loading the component.
+    #[must_use]
+    pub fn load_warnings(&self) -> &[String] {
+        &self.load_warnings
+    }
+
+    fn call_info(&mut self) -> wasmtime::Result<ChatInfo> {
         self.prepare_call()?;
         let info = self
             .instance

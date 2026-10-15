@@ -833,7 +833,6 @@ dependencies = [
 name = "forja-serve"
 version = "0.0.0"
 dependencies = [
- "forja-chat-format",
  "forja-config",
  "serde",
  "serde_json",

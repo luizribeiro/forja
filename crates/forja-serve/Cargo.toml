@@ -7,7 +7,6 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
-forja-chat-format = { path = "../forja-chat-format" }
 forja-config = { path = "../forja-config" }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
