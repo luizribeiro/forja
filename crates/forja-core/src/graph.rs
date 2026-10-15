@@ -1151,21 +1151,51 @@ impl GraphTemplate {
         epilogue: &Arc<PreparedEpilogue>,
         extras: &[&TemplateTensor],
     ) -> Result<(), GraphError> {
-        let mut all_inputs = inputs
-            .iter()
-            .map(|tensor| (*tensor).clone())
-            .collect::<Vec<_>>();
-        all_inputs.extend(extras.iter().map(|tensor| (*tensor).clone()));
-        self.record(
-            DynamicDispatch::Epilogue {
-                op: op.into(),
-                inputs: all_inputs,
-                outputs: vec![output.clone()],
-                epilogue: Arc::clone(epilogue),
-                primitive_input_count: inputs.len(),
-            },
-            None,
-        )
+        self.record_epilogue(op, inputs, output, epilogue, extras, None)
+    }
+
+    /// Records an epilogue-bearing primitive with a fixed backend selection.
+    #[doc(hidden)]
+    pub fn dispatch_epilogue_variant(
+        &mut self,
+        op: impl Into<TemplateOp>,
+        inputs: &[&TemplateTensor],
+        output: &TemplateTensor,
+        epilogue: &Arc<PreparedEpilogue>,
+        extras: &[&TemplateTensor],
+        data: BackendDispatchData,
+    ) -> Result<(), GraphError> {
+        self.record_epilogue(op, inputs, output, epilogue, extras, Some(data))
+    }
+
+    /// Records an epilogue-bearing primitive selected by replay parameter intervals.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn dispatch_epilogue_variant_rule(
+        &mut self,
+        op: impl Into<TemplateOp>,
+        inputs: &[&TemplateTensor],
+        output: &TemplateTensor,
+        epilogue: &Arc<PreparedEpilogue>,
+        extras: &[&TemplateTensor],
+        parameter: u8,
+        arms: Vec<(u32, BackendDispatchData)>,
+    ) -> Result<(), GraphError> {
+        let dispatch = epilogue_dispatch(op, inputs, output, epilogue, extras);
+        self.record_rule(dispatch, parameter, arms)
+    }
+
+    fn record_epilogue(
+        &mut self,
+        op: impl Into<TemplateOp>,
+        inputs: &[&TemplateTensor],
+        output: &TemplateTensor,
+        epilogue: &Arc<PreparedEpilogue>,
+        extras: &[&TemplateTensor],
+        backend_data: Option<BackendDispatchData>,
+    ) -> Result<(), GraphError> {
+        let dispatch = epilogue_dispatch(op, inputs, output, epilogue, extras);
+        self.record(dispatch, backend_data)
     }
 
     /// Records a concrete dispatch already validated at its command-list boundary.
@@ -1305,6 +1335,27 @@ impl GraphTemplate {
         self.hull_barrier_accesses.push(hull_accesses);
         let upper = barriers_for_accesses(self.hull_barrier_accesses.iter().cloned());
         self.required_barriers = barriers_bounded_by(&self.barrier_accesses, &upper);
+    }
+}
+
+fn epilogue_dispatch(
+    op: impl Into<TemplateOp>,
+    inputs: &[&TemplateTensor],
+    output: &TemplateTensor,
+    epilogue: &Arc<PreparedEpilogue>,
+    extras: &[&TemplateTensor],
+) -> DynamicDispatch {
+    let mut all_inputs = inputs
+        .iter()
+        .map(|tensor| (*tensor).clone())
+        .collect::<Vec<_>>();
+    all_inputs.extend(extras.iter().map(|tensor| (*tensor).clone()));
+    DynamicDispatch::Epilogue {
+        op: op.into(),
+        inputs: all_inputs,
+        outputs: vec![output.clone()],
+        epilogue: Arc::clone(epilogue),
+        primitive_input_count: inputs.len(),
     }
 }
 
@@ -1691,6 +1742,56 @@ mod tests {
         assert_eq!(dispatch.output().layout().shape(), &[7, 5]);
         assert_eq!(dispatch.inputs()[2].layout().shape(), &[7, 5]);
         assert!(dispatch.prepared_epilogue().is_some());
+    }
+
+    #[test]
+    fn epilogue_variant_rules_preserve_bindings_and_select_arms() {
+        let space = ParamSpace::new(std::iter::once(1..=7).collect()).unwrap();
+        let rows = Affine::parameter(0, 0, 1);
+        let left = symbolic_prefix(40, &[7, 3], space.clone(), rows);
+        let right = TemplateTensor::from(tensor(41, &[3, 5]));
+        let output = symbolic_prefix(42, &[7, 5], space.clone(), rows);
+        let extra = symbolic_prefix(43, &[7, 5], space.clone(), rows);
+        let epilogue = prepare_epilogue(
+            Program {
+                kind: ProgramKind::Map,
+                insts: vec![
+                    Inst::Input(0),
+                    Inst::Input(1),
+                    Inst::Binary(BinOp::Add, 0, 1),
+                ],
+                outputs: vec![(0, 2)],
+            }
+            .validate()
+            .unwrap(),
+            EpilogueSignature::new(1, 2, vec![DType::F32], DType::F32),
+        )
+        .unwrap();
+        let mut graph = GraphTemplate::new(space.clone(), GraphLimits::default());
+        graph
+            .dispatch_epilogue_variant_rule(
+                Op::Matmul,
+                &[&left, &right],
+                &output,
+                &epilogue,
+                &[&extra],
+                0,
+                vec![
+                    (1, BackendDispatchData::new("single")),
+                    (7, BackendDispatchData::new("batch")),
+                ],
+            )
+            .unwrap();
+
+        for (rows, expected) in [(1, "single"), (7, "batch")] {
+            let replay = graph
+                .instantiate(&space.values(vec![rows]).unwrap())
+                .unwrap();
+            let dispatch = &replay.dispatches()[0];
+            assert_eq!(dispatch.backend_data::<&str>(), Some(&expected));
+            assert!(dispatch.prepared_epilogue().is_some());
+            assert_eq!(dispatch.inputs()[2].layout().shape(), &[rows, 5]);
+        }
     }
 
     fn fresh_operation_succeeds(
