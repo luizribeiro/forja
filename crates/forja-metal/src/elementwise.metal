@@ -90,6 +90,40 @@ float load_bfloat_bits(device const uchar *buffer, ulong index) {
     return as_type<float>(bits);
 }
 
+#define FORJA_EPILOGUE_ARGUMENTS                                                   \
+    device const uchar *epilogue_input0 [[buffer(16)]],                           \
+    device const uchar *epilogue_input1 [[buffer(17)]],                           \
+    device const uchar *epilogue_input2 [[buffer(18)]],                           \
+    device const uchar *epilogue_input3 [[buffer(19)]],                           \
+    device const uchar *epilogue_input4 [[buffer(20)]],                           \
+    device const uchar *epilogue_input5 [[buffer(21)]],                           \
+    device const uchar *epilogue_input6 [[buffer(22)]],                           \
+    constant TensorLayout *epilogue_layouts [[buffer(23)]],
+
+#define FORJA_EPILOGUE_VALUES                                                     \
+    epilogue_input0, epilogue_input1, epilogue_input2, epilogue_input3,           \
+    epilogue_input4, epilogue_input5, epilogue_input6, epilogue_layouts
+
+inline float forja_epilogue(
+    float accumulator0,
+    float accumulator1,
+    uint coordinate0,
+    uint coordinate1,
+    uint coordinate2,
+    uint extent0,
+    uint extent1,
+    uint extent2,
+    device const uchar *epilogue_input0,
+    device const uchar *epilogue_input1,
+    device const uchar *epilogue_input2,
+    device const uchar *epilogue_input3,
+    device const uchar *epilogue_input4,
+    device const uchar *epilogue_input5,
+    device const uchar *epilogue_input6,
+    constant TensorLayout *epilogue_layouts) {
+    return accumulator0;
+}
+
 // NaN payloads are intentionally canonicalized to one quiet NaN.
 ushort f32_to_f16_rne_bits(float value) {
     uint bits = as_type<uint>(value);
