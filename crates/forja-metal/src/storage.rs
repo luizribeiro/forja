@@ -1356,7 +1356,7 @@ mod mapped_tests {
 
 #[cfg(test)]
 mod tests {
-    use forja_core::{Op, Submission};
+    use forja_core::{Op, Slice, Submission};
 
     use super::*;
 
@@ -1494,6 +1494,31 @@ mod tests {
         second.release(&isolated).unwrap();
         let reused = second.alloc(DType::U32, &[33]).unwrap();
         assert_eq!(second.read(&reused).unwrap(), [0; 33 * 4]);
+    }
+
+    #[test]
+    fn graph_arenas_do_not_cross_backend_boundaries() {
+        let first = MetalBackend::new().unwrap();
+        first.ensure_graph_arenas(16).unwrap();
+        let first_arena = first.acquire_graph_arena().unwrap();
+        first.write(first_arena.tensor(), &[0xa5; 16]).unwrap();
+        first.release_graph_arena(&first_arena);
+
+        let second = MetalBackend::new().unwrap();
+        second.ensure_graph_arenas(16).unwrap();
+        let second_arena = second.acquire_graph_arena().unwrap();
+        let prefix = second
+            .view(
+                second_arena.tensor(),
+                ViewOp::Slice(vec![Slice::new(0, 1, 1).unwrap()]),
+            )
+            .unwrap();
+        second.write(&prefix, &[0x5a; 4]).unwrap();
+        assert_eq!(
+            second.read(second_arena.tensor()).unwrap(),
+            [0x5a, 0x5a, 0x5a, 0x5a, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        );
+        second.release_graph_arena(&second_arena);
     }
 
     #[test]
