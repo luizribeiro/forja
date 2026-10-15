@@ -1030,6 +1030,60 @@ impl GraphTemplate {
             })
     }
 
+    /// Instantiates one backend-preparation candidate for every fixed selection and rule arm.
+    #[doc(hidden)]
+    pub fn backend_dispatch_candidates(&self) -> Result<Vec<(usize, bool, Dispatch)>, GraphError> {
+        let lower = self.space.values(
+            self.space
+                .ranges()
+                .iter()
+                .map(|range| *range.start())
+                .collect(),
+        )?;
+        let mut candidates = Vec::new();
+        for (index, candidate) in self.dispatches.iter().enumerate() {
+            match candidate {
+                TemplateDispatch::Static(dispatch) => {
+                    candidates.push((index, false, dispatch.as_ref().clone()));
+                }
+                TemplateDispatch::Dynamic {
+                    dispatch,
+                    backend_data,
+                } => {
+                    let concrete = dispatch.instantiate(&lower, self.limits)?;
+                    candidates.push((
+                        index,
+                        true,
+                        backend_data
+                            .clone()
+                            .map_or(concrete.clone(), |data| concrete.with_backend_data(data)),
+                    ));
+                }
+                TemplateDispatch::Rule {
+                    dispatch,
+                    parameter,
+                    arms,
+                } => {
+                    let slot = usize::from(*parameter);
+                    let mut values = lower.as_slice().to_vec();
+                    let mut lo = *self.space.ranges()[slot].start();
+                    for (hi, data) in arms {
+                        if lo > *hi || !self.space.ranges()[slot].contains(&lo) {
+                            return Err(GraphError::ParameterSpaceMismatch);
+                        }
+                        values[slot] = lo;
+                        let concrete = dispatch
+                            .instantiate(&self.space.values(values.clone())?, self.limits)?
+                            .with_backend_data(data.clone());
+                        candidates.push((index, true, concrete));
+                        lo = hi.saturating_add(1);
+                    }
+                }
+            }
+        }
+        Ok(candidates)
+    }
+
     /// Checks raw replay values against this template's parameter space.
     ///
     /// # Errors
@@ -1792,6 +1846,19 @@ mod tests {
             assert!(dispatch.prepared_epilogue().is_some());
             assert_eq!(dispatch.inputs()[2].layout().shape(), &[rows, 5]);
         }
+
+        let candidates = graph.backend_dispatch_candidates().unwrap();
+        assert_eq!(candidates.len(), 2);
+        assert!(candidates.iter().all(|(site, dynamic, dispatch)| {
+            *site == 0 && *dynamic && dispatch.prepared_epilogue().is_some()
+        }));
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|(_, _, dispatch)| *dispatch.backend_data::<&str>().unwrap())
+                .collect::<Vec<_>>(),
+            ["single", "batch"]
+        );
     }
 
     fn fresh_operation_succeeds(
