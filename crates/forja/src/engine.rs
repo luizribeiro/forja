@@ -8,8 +8,8 @@ use std::{
 };
 
 use forja_config::{
-    ComponentTarget, DeviceFamily, Engine, GraphReplay, Limits as ConfigLimits, Profile,
-    ProfileBackend, Target, Unbounded, sharded_weights_sha256, single_weights_sha256,
+    ComponentTarget, Engine, GraphReplay, Limits as ConfigLimits, Profile, ProfileBackend, Target,
+    Unbounded, sharded_weights_sha256, single_weights_sha256,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -56,7 +56,7 @@ pub(crate) fn validate_engine(
         #[cfg(target_os = "macos")]
         {
             let name = forja_metal::device_name()?;
-            Some(device_family(&name)?)
+            Some(device_family(&name))
         }
         #[cfg(not(target_os = "macos"))]
         {
@@ -71,7 +71,7 @@ pub(crate) fn validate_engine(
         TargetIdentity {
             component: "wasm32-wasip2",
             backend,
-            device_family: device,
+            device_family: device.as_deref(),
         },
     )?;
     Ok((profile, weights))
@@ -103,7 +103,7 @@ fn validate_identity(
     }
     if host.device_family != required.device_family {
         return Err(format!(
-            "device family mismatch: profile requires {}, found {}",
+            "no profile for device: profile requires {}, found {}",
             required.device_family.unwrap_or("unavailable"),
             host.device_family.unwrap_or("unavailable")
         ));
@@ -111,7 +111,7 @@ fn validate_identity(
     Ok(())
 }
 
-const fn target_identity(target: &Target) -> TargetIdentity<'static> {
+fn target_identity(target: &Target) -> TargetIdentity<'_> {
     TargetIdentity {
         component: match target.component {
             ComponentTarget::Wasm32Wasip2 => "wasm32-wasip2",
@@ -120,18 +120,16 @@ const fn target_identity(target: &Target) -> TargetIdentity<'static> {
             ProfileBackend::Metal => "metal",
             ProfileBackend::Cpu => "cpu",
         },
-        device_family: Some(match target.device_family {
-            DeviceFamily::AppleM3Ultra => "apple-m3-ultra",
-        }),
+        device_family: Some(target.device_family.as_str()),
     }
 }
 
-fn device_family(name: &str) -> Result<&'static str, String> {
-    if name == "Apple M3 Ultra" {
-        Ok("apple-m3-ultra")
-    } else {
-        Err(format!("unsupported Metal device family: {name}"))
-    }
+fn device_family(name: &str) -> String {
+    name.split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|part| !part.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect::<Vec<_>>()
+        .join("-")
 }
 
 fn strong_weights_sha256(weights: &Path, scratch: &Path) -> Result<(String, bool), Box<dyn Error>> {
@@ -387,10 +385,7 @@ mod tests {
         toml::from_str(&fs::read_to_string(path).unwrap()).unwrap()
     }
 
-    fn host_target(
-        backend: &'static str,
-        device_family: Option<&'static str>,
-    ) -> TargetIdentity<'static> {
+    fn host_target<'a>(backend: &'a str, device_family: Option<&'a str>) -> TargetIdentity<'a> {
         TargetIdentity {
             component: "wasm32-wasip2",
             backend,
@@ -435,7 +430,7 @@ mod tests {
         assert!(
             validate_identity(&profile, weights, host_target("metal", Some("apple-m4")),)
                 .unwrap_err()
-                .contains("device family mismatch")
+                .contains("no profile for device")
         );
     }
 
@@ -458,8 +453,24 @@ mod tests {
 
     #[test]
     fn metal_device_names_match_exactly() {
-        assert_eq!(device_family("Apple M3 Ultra").unwrap(), "apple-m3-ultra");
-        assert!(device_family("Apple M3 Ultra (80 cores)").is_err());
+        assert_eq!(device_family("Apple M3 Ultra"), "apple-m3-ultra");
+        assert_eq!(device_family("Apple M4 (80 cores)"), "apple-m4-80-cores");
+    }
+
+    #[test]
+    fn unknown_devices_report_a_missing_profile() {
+        let profile = profile();
+        let device = device_family("Apple M4 Ultra");
+        let error = validate_identity(
+            &profile,
+            &profile.model().weights_sha256,
+            host_target("metal", Some(&device)),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            "no profile for device: profile requires apple-m3-ultra, found apple-m4-ultra"
+        );
     }
 
     fn safetensors(data: &[u8]) -> Vec<u8> {

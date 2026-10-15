@@ -86,6 +86,10 @@ fn rejects_unknown_fields_and_invalid_identity() {
             "{id}"
         );
     }
+    assert!(
+        error(&PROFILE.replace("apple-m3-ultra", "Apple M3 Ultra"))
+            .contains("lowercase ASCII letters and digits")
+    );
 }
 
 #[test]

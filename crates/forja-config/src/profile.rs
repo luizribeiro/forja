@@ -165,13 +165,23 @@ pub enum ProfileBackend {
     Cpu,
 }
 
-/// Supported device family.
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum DeviceFamily {
-    /// Apple M3 Ultra.
-    #[default]
-    AppleM3Ultra,
+/// Validated backend device-family slug.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct DeviceFamily(String);
+
+impl Default for DeviceFamily {
+    fn default() -> Self {
+        Self("apple-m3-ultra".to_owned())
+    }
+}
+
+impl DeviceFamily {
+    /// Returns the device-family slug.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 /// Activation and weight formats.
@@ -333,6 +343,10 @@ fn validate(profile: &ProfileData) -> Result<(), String> {
         64,
         "sha256:",
     )?;
+    validate_slug(
+        "target.device-family",
+        profile.target.device_family.as_str(),
+    )?;
     if profile.workload.prefill_chunk > profile.workload.max_context {
         return Err("workload.prefill-chunk must not exceed max-context".to_owned());
     }
@@ -348,6 +362,21 @@ fn validate(profile: &ProfileData) -> Result<(), String> {
         validate_variants(variants, profile.workload.max_context)?;
     }
     validate_quantization(profile)
+}
+
+fn validate_slug(field: &str, value: &str) -> Result<(), String> {
+    require_name(field, value)?;
+    if value.split('-').any(|part| {
+        part.is_empty()
+            || !part
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+    }) {
+        return Err(format!(
+            "{field} must contain lowercase ASCII letters and digits separated by single hyphens"
+        ));
+    }
+    Ok(())
 }
 
 fn require_name(field: &str, value: &str) -> Result<(), String> {
