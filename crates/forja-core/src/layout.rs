@@ -520,13 +520,15 @@ fn disjoint_inner_blocks(left: &Layout, right: &Layout) -> bool {
     let width = u64::from(*left.shape.last().unwrap_or(&0));
     let left_start = left.offset % period;
     let right_start = right.offset % period;
-    let Some(left_end) = left_start.checked_add(width).filter(|&end| end <= period) else {
+    if width > period {
         return false;
+    }
+    let distance = if right_start >= left_start {
+        right_start - left_start
+    } else {
+        period - (left_start - right_start)
     };
-    let Some(right_end) = right_start.checked_add(width).filter(|&end| end <= period) else {
-        return false;
-    };
-    left_end <= right_start || right_end <= left_start
+    distance >= width && period - distance >= width
 }
 
 const fn greatest_common_divisor(mut left: u64, mut right: u64) -> u64 {
@@ -760,6 +762,12 @@ mod tests {
         let other_half =
             Layout::new(DType::F32, 64, vec![7, 16, 64], vec![2048, 128, 1], 57_344).unwrap();
         assert!(!byte_ranges_overlap(&halves, &other_half));
+
+        let shifted_halves =
+            Layout::new(DType::F32, 16, vec![7, 16, 64], vec![2048, 128, 1], 57_408).unwrap();
+        let shifted_other_half =
+            Layout::new(DType::F32, 80, vec![7, 16, 64], vec![2048, 128, 1], 57_408).unwrap();
+        assert!(!byte_ranges_overlap(&shifted_halves, &shifted_other_half));
     }
 
     proptest! {
