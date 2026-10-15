@@ -8,7 +8,8 @@ use std::{
 };
 
 use crate::program::{
-    BindError, BoundProgram, KernelSignature, PreparedProgram, ProgramHash, bind_program,
+    BindError, BoundProgram, KernelSignature, PreparedEpilogue, PreparedProgram, ProgramHash,
+    bind_program,
 };
 use crate::{
     DType, Layout, LayoutError, QuantizedMatrix, QuantizedMatrixError, QuantizedMatrixPart,
@@ -269,6 +270,8 @@ pub enum OpError {
     ProgramBinding(BindError),
     /// Tensor types or rank differ from a prepared program's signature.
     ProgramSignature,
+    /// The primitive family or bound tensors do not match an epilogue signature.
+    EpilogueSignature,
     /// The operation received the wrong number of inputs.
     Arity {
         /// The required count.
@@ -343,6 +346,7 @@ pub struct Dispatch {
     inputs: Vec<Tensor>,
     outputs: Vec<Tensor>,
     program: Option<ProgramDispatch>,
+    epilogue: Option<EpilogueDispatch>,
     backend_data: Option<BackendDispatchData>,
 }
 
@@ -379,6 +383,7 @@ impl fmt::Debug for Dispatch {
             .field("inputs", &self.inputs)
             .field("outputs", &self.outputs)
             .field("program", &self.program)
+            .field("epilogue", &self.epilogue)
             .field("backend_data", &self.backend_data)
             .finish()
     }
@@ -388,6 +393,12 @@ impl fmt::Debug for Dispatch {
 struct ProgramDispatch {
     bound: BoundProgram,
     prepared: Arc<PreparedProgram>,
+}
+
+#[derive(Clone, Debug)]
+struct EpilogueDispatch {
+    prepared: Arc<PreparedEpilogue>,
+    primitive_input_count: usize,
 }
 
 impl Dispatch {
@@ -409,10 +420,20 @@ impl Dispatch {
             .map_err(OpError::Layout)?;
         let input_refs = inputs.iter().collect::<Vec<_>>();
         let output_refs = outputs.iter().collect::<Vec<_>>();
-        let mut rebound = self.prepared_program().map_or_else(
-            || Self::new_many(self.op, &input_refs, &output_refs),
-            |program| Self::kernel(program, &input_refs, &output_refs),
-        )?;
+        let mut rebound = if let Some(program) = self.prepared_program() {
+            Self::kernel(program, &input_refs, &output_refs)?
+        } else if let Some(epilogue) = self.prepared_epilogue() {
+            let primitive_count = self.primitive_input_count();
+            Self::with_epilogue(
+                self.op,
+                &input_refs[..primitive_count],
+                output_refs[0],
+                epilogue,
+                &input_refs[primitive_count..],
+            )?
+        } else {
+            Self::new_many(self.op, &input_refs, &output_refs)?
+        };
         if let Some(data) = self.backend_data.clone() {
             rebound.set_backend_data(data);
         }
@@ -487,8 +508,49 @@ impl Dispatch {
             inputs: inputs.iter().map(|tensor| (*tensor).clone()).collect(),
             outputs: outputs.iter().map(|tensor| (*tensor).clone()).collect(),
             program: None,
+            epilogue: None,
             backend_data: None,
         })
+    }
+
+    pub(crate) fn with_epilogue(
+        op: Op,
+        inputs: &[&Tensor],
+        output: &Tensor,
+        epilogue: &Arc<PreparedEpilogue>,
+        extras: &[&Tensor],
+    ) -> Result<Self, OpError> {
+        let mut dispatch = Self::new(op, inputs, output)?;
+        let signature = epilogue.signature();
+        if signature.accumulator_count() != 1
+            || usize::from(signature.logical_rank()) != output.layout().shape().len()
+            || signature.output_dtype() != output.layout().dtype()
+            || !matches!(
+                op,
+                Op::Matmul | Op::QuantMatmul { .. } | Op::GatherQuantMatmul { .. }
+            )
+            || extras.len() != signature.extra_dtypes().len()
+            || extras
+                .iter()
+                .zip(signature.extra_dtypes())
+                .any(|(extra, &dtype)| {
+                    extra.layout().dtype() != dtype
+                        || extra.layout().shape() != output.layout().shape()
+                })
+        {
+            return Err(OpError::EpilogueSignature);
+        }
+        let mut all_inputs = inputs.to_vec();
+        all_inputs.extend_from_slice(extras);
+        check_common(&all_inputs, &[output])?;
+        dispatch
+            .inputs
+            .extend(extras.iter().map(|tensor| (*tensor).clone()));
+        dispatch.epilogue = Some(EpilogueDispatch {
+            prepared: Arc::clone(epilogue),
+            primitive_input_count: inputs.len(),
+        });
+        Ok(dispatch)
     }
 
     pub(crate) fn kernel(
@@ -515,6 +577,7 @@ impl Dispatch {
                 bound,
                 prepared: Arc::clone(program),
             }),
+            epilogue: None,
             backend_data: None,
         })
     }
@@ -554,6 +617,24 @@ impl Dispatch {
     #[must_use]
     pub fn prepared_program(&self) -> Option<&Arc<PreparedProgram>> {
         self.program.as_ref().map(|program| &program.prepared)
+    }
+
+    /// Returns retained epilogue preparation state, when present.
+    #[must_use]
+    pub fn prepared_epilogue(&self) -> Option<&Arc<PreparedEpilogue>> {
+        self.epilogue.as_ref().map(|epilogue| &epilogue.prepared)
+    }
+
+    /// Returns physical primitive operands without the epilogue's extra views.
+    #[must_use]
+    pub fn primitive_inputs(&self) -> &[Tensor] {
+        &self.inputs[..self.primitive_input_count()]
+    }
+
+    fn primitive_input_count(&self) -> usize {
+        self.epilogue
+            .as_ref()
+            .map_or(self.inputs.len(), |epilogue| epilogue.primitive_input_count)
     }
 
     /// Attaches backend-owned selection data to this validated dispatch.
@@ -655,6 +736,24 @@ impl CommandList {
         data: BackendDispatchData,
     ) -> Result<(), OpError> {
         let dispatch = Dispatch::new_many(op, inputs, outputs)?.with_backend_data(data);
+        self.push_and_reset_validation(dispatch);
+        Ok(())
+    }
+
+    /// Validates and records a primitive with a guest-authored scalar epilogue.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OpError`] for an invalid primitive or epilogue binding.
+    pub fn dispatch_epilogue(
+        &mut self,
+        op: Op,
+        inputs: &[&Tensor],
+        output: &Tensor,
+        epilogue: &Arc<PreparedEpilogue>,
+        extras: &[&Tensor],
+    ) -> Result<(), OpError> {
+        let dispatch = Dispatch::with_epilogue(op, inputs, output, epilogue, extras)?;
         self.push_and_reset_validation(dispatch);
         Ok(())
     }
@@ -1866,6 +1965,7 @@ fn check_float(tensor: &Tensor, operand: Operand) -> Result<(), OpError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::program::{BinOp, EpilogueSignature, Inst, Program, ProgramKind, prepare_epilogue};
 
     fn tensor(buffer: u64, dtype: DType, shape: &[u32], strides: &[u64]) -> Tensor {
         let bytes = u64::from(shape.iter().product::<u32>()) * dtype.byte_size();
@@ -1891,6 +1991,24 @@ mod tests {
             BufferId::new(1, buffer, 32),
             Layout::new(DType::F32, offset, vec![4, 1], vec![2, 1], 32).unwrap(),
             true,
+        )
+        .unwrap()
+    }
+
+    fn bias_epilogue(rank: u8, dtype: DType) -> Arc<PreparedEpilogue> {
+        prepare_epilogue(
+            Program {
+                kind: ProgramKind::Map,
+                insts: vec![
+                    Inst::Input(0),
+                    Inst::Input(1),
+                    Inst::Binary(BinOp::Add, 0, 1),
+                ],
+                outputs: vec![(0, 2)],
+            }
+            .validate()
+            .unwrap(),
+            EpilogueSignature::new(1, rank, vec![dtype], dtype),
         )
         .unwrap()
     }
@@ -2553,6 +2671,81 @@ mod tests {
             Err(OpError::Shape {
                 operand: Operand::Input(1)
             })
+        );
+    }
+
+    #[test]
+    fn matmul_epilogue_retains_extra_views_as_inputs() {
+        let left = tensor(20, DType::F32, &[7, 33], &[33, 1]);
+        let right = tensor(21, DType::F32, &[33, 17], &[17, 1]);
+        let output = tensor(22, DType::F32, &[7, 17], &[17, 1]);
+        let bias = tensor(23, DType::F32, &[7, 17], &[0, 1]);
+        let epilogue = bias_epilogue(2, DType::F32);
+        let mut commands = CommandList::new();
+
+        commands
+            .dispatch_epilogue(Op::Matmul, &[&left, &right], &output, &epilogue, &[&bias])
+            .unwrap();
+        let dispatch = commands.last_dispatch().unwrap();
+        assert_eq!(
+            dispatch.inputs(),
+            [left.clone(), right.clone(), bias.clone()]
+        );
+        assert_eq!(dispatch.primitive_inputs(), [left, right]);
+        assert!(dispatch.prepared_epilogue().is_some());
+
+        let source = tensor(24, DType::F32, &[7, 17], &[17, 1]);
+        let bias_write = Tensor::from_allocation(
+            bias.buffer(),
+            Layout::new(DType::F32, 0, vec![7, 17], vec![17, 1], 476).unwrap(),
+            true,
+        )
+        .unwrap();
+        commands
+            .dispatch(Op::Copy, &[&source], &bias_write)
+            .unwrap();
+        assert_eq!(required_barriers(&commands), [false, true]);
+    }
+
+    #[test]
+    fn epilogue_binding_refuses_mismatched_views_and_aliases() {
+        let left = tensor(30, DType::F32, &[7, 33], &[33, 1]);
+        let right = tensor(31, DType::F32, &[33, 17], &[17, 1]);
+        let output = tensor(32, DType::F32, &[7, 17], &[17, 1]);
+        let epilogue = bias_epilogue(2, DType::F32);
+        let wrong_shape = tensor(33, DType::F32, &[1, 17], &[0, 1]);
+        assert_eq!(
+            CommandList::new().dispatch_epilogue(
+                Op::Matmul,
+                &[&left, &right],
+                &output,
+                &epilogue,
+                &[&wrong_shape],
+            ),
+            Err(OpError::EpilogueSignature)
+        );
+
+        let aliased =
+            Tensor::from_allocation(output.buffer(), output.layout().clone(), true).unwrap();
+        assert_eq!(
+            CommandList::new().dispatch_epilogue(
+                Op::Matmul,
+                &[&left, &right],
+                &output,
+                &epilogue,
+                &[&aliased],
+            ),
+            Err(OpError::Aliasing { input: 2 })
+        );
+        assert_eq!(
+            CommandList::new().dispatch_epilogue(
+                Op::Add,
+                &[&output, &output],
+                &tensor(34, DType::F32, &[7, 17], &[17, 1]),
+                &epilogue,
+                &[&output],
+            ),
+            Err(OpError::EpilogueSignature)
         );
     }
 
