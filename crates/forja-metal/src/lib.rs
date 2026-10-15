@@ -12,6 +12,7 @@ mod memory;
 #[cfg(all(test, target_os = "macos"))]
 #[path = "../tests/common/rounding_program.rs"]
 mod rounding_program;
+mod scalar_codegen;
 #[cfg(target_os = "macos")]
 mod storage;
 #[cfg(target_os = "macos")]
