@@ -52,7 +52,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let qwen_chat_format = forja_build::encode_component(&fs::read(
         qwen_chat_target_dir.join("wasm32-unknown-unknown/release/qwen3_coder_chat_format.wasm"),
     )?)?;
-    let qwen_chat_format_path = out_dir.join("qwen3-coder-chat-format.wasm");
+    let qwen_chat_format_path = out_dir.join("qwen3-coder.chat-format.wasm");
     fs::write(&qwen_chat_format_path, qwen_chat_format)?;
     forja_build::build_component(&qwen3_manifest, &guest_target_dir, &[])?;
     forja_build::build_component(&qwen3_manifest, &bf16_target_dir, &["--features", "bf16"])?;

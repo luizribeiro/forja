@@ -13,6 +13,7 @@ forja-build = { path = "../forja-build" }
 forja-config = { path = "../forja-config" }
 forja-cpu = { path = "../forja-cpu" }
 forja-host = { path = "../forja-host" }
+forja-serve = { path = "../forja-serve" }
 golden-fixtures = { path = "../../support/golden-fixtures" }
 serde.workspace = true
 serde_json.workspace = true

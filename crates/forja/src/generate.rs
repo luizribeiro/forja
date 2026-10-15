@@ -105,7 +105,7 @@ where
     if prompt.is_empty() {
         return Err("the prompt tokenized to an empty sequence".into());
     }
-    let eos = load_eos_token_ids(&options.model_dir)?;
+    let stop_token_ids = load_stop_token_ids(component)?;
     let mut runner = EngineRunner::new(
         component,
         backend,
@@ -169,7 +169,7 @@ where
                 runner.wait_for_submissions(expected).await?;
             }
             generated.push(token);
-            if eos.contains(&token) {
+            if stop_token_ids.contains(&token) {
                 discard_speculative_tail(&mut runner, &mut pending).await?;
                 break;
             }
@@ -282,68 +282,33 @@ where
     failure.map_or(Ok(()), Err)
 }
 
-fn load_eos_token_ids(model_dir: &Path) -> Result<Vec<u32>, Box<dyn Error>> {
-    let bytes = fs::read(model_dir.join("generation_config.json"))?;
-    let config: serde_json::Value = serde_json::from_slice(&bytes)?;
-    eos_token_ids(&config)
-}
-
-fn eos_token_ids(config: &serde_json::Value) -> Result<Vec<u32>, Box<dyn Error>> {
-    let value = config
-        .get("eos_token_id")
-        .ok_or("generation config has no eos_token_id")?;
-    let values = value
-        .as_array()
-        .map_or_else(|| vec![value], |ids| ids.iter().collect());
-    let ids = values
-        .into_iter()
-        .map(|id| {
-            id.as_u64()
-                .ok_or("eos_token_id must contain unsigned integers")
-                .and_then(|id| u32::try_from(id).map_err(|_| "eos_token_id exceeds u32"))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    if ids.is_empty() {
-        return Err("eos_token_id cannot be empty".into());
+fn load_stop_token_ids(engine: &Path) -> Result<Vec<u32>, Box<dyn Error>> {
+    let profile = crate::resolution::read_embedded_profile(engine)?;
+    if profile.serving().chat_format.is_none() {
+        return Ok(Vec::new());
     }
-    Ok(ids)
+    let format = forja_serve::ChatFormat::load(
+        &engine.with_extension("chat-format.wasm"),
+        forja_serve::ChatFormatLimits::default(),
+    )?;
+    Ok(format.info().stop_token_ids.clone())
 }
 
 #[cfg(test)]
 mod tests {
     use std::{env, path::PathBuf};
 
-    use golden_fixtures::FixtureDirectory;
-    use serde_json::json;
-
     use super::*;
+    use golden_fixtures::FixtureDirectory;
 
     #[test]
-    fn parses_scalar_and_array_eos_ids() -> Result<(), Box<dyn Error>> {
-        assert_eq!(eos_token_ids(&json!({ "eos_token_id": 7 }))?, [7]);
-        assert_eq!(eos_token_ids(&json!({ "eos_token_id": [7, 33] }))?, [7, 33]);
+    fn loads_declared_stop_tokens_from_the_sibling_component() -> Result<(), Box<dyn Error>> {
+        assert_eq!(
+            load_stop_token_ids(test_guests::qwen3_coder())?,
+            [151_645, 151_643]
+        );
+        assert!(load_stop_token_ids(test_guests::qwen3())?.is_empty());
         Ok(())
-    }
-
-    #[test]
-    fn rejects_missing_eos_ids() {
-        assert!(eos_token_ids(&json!({})).is_err());
-    }
-
-    #[test]
-    fn rejects_non_integer_eos_ids() {
-        assert!(eos_token_ids(&json!({ "eos_token_id": 1.5 })).is_err());
-    }
-
-    #[test]
-    fn rejects_an_empty_eos_array() {
-        assert!(eos_token_ids(&json!({ "eos_token_id": [] })).is_err());
-    }
-
-    #[test]
-    fn rejects_eos_ids_over_u32() {
-        let overflow = u64::from(u32::MAX) + 1;
-        assert!(eos_token_ids(&json!({ "eos_token_id": overflow })).is_err());
     }
 
     #[cfg(target_os = "macos")]

@@ -691,6 +691,7 @@ dependencies = [
  "forja-cpu",
  "forja-host",
  "forja-metal",
+ "forja-serve",
  "forja-testing",
  "golden-fixtures",
  "serde",
