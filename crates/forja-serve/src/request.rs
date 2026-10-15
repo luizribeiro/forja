@@ -142,6 +142,7 @@ pub fn validate_chat(
     defaults: &GenerationConfig,
     prompt_tokens: u32,
     max_context: u32,
+    vocab: u32,
 ) -> Result<ResolvedParams, ValidationError> {
     if request.messages.len() > ceiling_usize(config.request.max_messages) {
         return invalid("messages exceed the configured ceiling");
@@ -155,7 +156,8 @@ pub fn validate_chat(
         config,
         defaults,
         prompt_tokens,
-        max_context,
+        configured_context(config, max_context),
+        vocab,
         true,
     )
 }
@@ -171,6 +173,7 @@ pub fn validate_completion(
     defaults: &GenerationConfig,
     prompt_tokens: u32,
     max_context: u32,
+    vocab: u32,
 ) -> Result<ResolvedParams, ValidationError> {
     validate_text(checked_text_bytes([request.prompt.len()])?, config)?;
     resolve(
@@ -178,7 +181,8 @@ pub fn validate_completion(
         config,
         defaults,
         prompt_tokens,
-        max_context,
+        configured_context(config, max_context),
+        vocab,
         false,
     )
 }
@@ -194,6 +198,7 @@ fn resolve(
     defaults: &GenerationConfig,
     prompt_tokens: u32,
     max_context: u32,
+    vocab: u32,
     chat: bool,
 ) -> Result<ResolvedParams, ValidationError> {
     reject_unsupported(params)?;
@@ -203,7 +208,7 @@ fn resolve(
     if !chat && params.max_completion_tokens.is_some() {
         return invalid("max_completion_tokens is only supported for chat completions");
     }
-    if prompt_tokens > config.request.max_prompt_tokens || prompt_tokens >= max_context {
+    if prompt_tokens >= max_context {
         return invalid("prompt exceeds the configured context ceiling");
     }
     let requested = params
@@ -239,11 +244,37 @@ fn resolve(
             .min(remaining_context),
         temperature,
         top_p,
-        top_k: params.top_k.or(defaults.top_k).unwrap_or(0),
+        top_k: params.top_k.or(defaults.top_k).unwrap_or(0).min(vocab),
         seed: params.seed,
         stops,
         stream: params.stream,
     })
+}
+
+fn configured_context(config: &HostConfig, engine_profile_context: u32) -> u32 {
+    config
+        .request
+        .max_prompt_tokens
+        .unwrap_or(engine_profile_context)
+        .min(engine_profile_context)
+}
+
+/// Resolves the context supported jointly by an engine, profile, and host configuration.
+///
+/// # Errors
+///
+/// Returns an error when the profile claims a context larger than the engine supports.
+pub fn serving_context_ceiling(
+    engine_max_context: u32,
+    profile_max_context: u32,
+    configured: Option<u32>,
+) -> Result<u32, ValidationError> {
+    if profile_max_context > engine_max_context {
+        return invalid("profile max-context exceeds the engine maximum");
+    }
+    Ok(configured
+        .unwrap_or(engine_max_context)
+        .min(profile_max_context))
 }
 
 fn checked_text_bytes<T>(lengths: impl IntoIterator<Item = T>) -> Result<u64, ValidationError>
@@ -336,6 +367,7 @@ mod tests {
             defaults,
             prompt_tokens,
             max_context,
+            151_936,
             true,
         )
     }
@@ -443,6 +475,7 @@ mod tests {
             &GenerationConfig::default(),
             1,
             32_768,
+            151_936,
         )
         .unwrap();
         assert_eq!(resolved.max_tokens, 7);
@@ -464,6 +497,7 @@ mod tests {
             &GenerationConfig::default(),
             1,
             32_768,
+            151_936,
         )
         .unwrap_err();
         assert_eq!(error.to_string(), "messages exceed the configured ceiling");
@@ -487,8 +521,15 @@ mod tests {
             ],
             params: CompletionParams::default(),
         };
-        let error =
-            validate_chat(&request, &config, &GenerationConfig::default(), 1, 32_768).unwrap_err();
+        let error = validate_chat(
+            &request,
+            &config,
+            &GenerationConfig::default(),
+            1,
+            32_768,
+            151_936,
+        )
+        .unwrap_err();
         assert_eq!(
             error.to_string(),
             "request text exceeds the configured ceiling"
@@ -503,6 +544,7 @@ mod tests {
             &GenerationConfig::default(),
             32_768,
             32_768,
+            151_936,
         )
         .unwrap_err();
         assert_eq!(
@@ -523,6 +565,7 @@ mod tests {
             &GenerationConfig::default(),
             1,
             32_768,
+            151_936,
         )
         .unwrap_err();
         assert_eq!(
@@ -543,11 +586,44 @@ mod tests {
             &GenerationConfig::default(),
             1,
             32_768,
+            151_936,
         )
         .unwrap_err();
         assert_eq!(
             error.to_string(),
             "stop strings exceed the configured ceiling or are empty"
         );
+    }
+
+    #[test]
+    fn context_ceiling_uses_every_loaded_boundary() {
+        assert_eq!(
+            serving_context_ceiling(32_768, 16_384, None).unwrap(),
+            16_384
+        );
+        assert_eq!(
+            serving_context_ceiling(32_768, 16_384, Some(8_192)).unwrap(),
+            8_192
+        );
+        assert!(serving_context_ceiling(4_096, 8_192, None).is_err());
+    }
+
+    #[test]
+    fn top_k_is_clamped_to_the_engine_vocabulary() {
+        let defaults = GenerationConfig {
+            top_k: Some(200),
+            ..GenerationConfig::default()
+        };
+        let resolved = resolve(
+            &CompletionParams::default(),
+            &HostConfig::default(),
+            &defaults,
+            1,
+            32_768,
+            100,
+            true,
+        )
+        .unwrap();
+        assert_eq!(resolved.top_k, 100);
     }
 }

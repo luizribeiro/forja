@@ -13,7 +13,7 @@ use serde_json::{Map, Value};
 
 pub use request::{
     ChatCompletionRequest, CompletionParams, CompletionRequest, Message, ResolvedParams, Stop,
-    ValidationError, validate_chat, validate_completion,
+    ValidationError, serving_context_ceiling, validate_chat, validate_completion,
 };
 pub use stop::{StopMatcher, StopOutput};
 

@@ -75,8 +75,8 @@ pub struct RequestCeiling {
     pub max_messages: u32,
     /// Maximum aggregate request text size.
     pub max_text_bytes: ByteSize,
-    /// Maximum prompt tokens.
-    pub max_prompt_tokens: u32,
+    /// Optional maximum prompt tokens; absent uses the loaded engine maximum.
+    pub max_prompt_tokens: Option<u32>,
     /// Maximum generated tokens.
     pub max_output_tokens: u32,
     /// Maximum stop strings.
@@ -89,7 +89,7 @@ impl Default for RequestCeiling {
             max_body_bytes: ByteSize::new(1024 * 1024),
             max_messages: 256,
             max_text_bytes: ByteSize::new(1024 * 1024),
-            max_prompt_tokens: 32_768,
+            max_prompt_tokens: None,
             max_output_tokens: 8_192,
             max_stops: 4,
         }
@@ -145,7 +145,7 @@ max_output_tokens = 4096
         assert_eq!(config.request.max_body_bytes, ByteSize::new(1024 * 1024));
         assert_eq!(config.request.max_messages, 256);
         assert_eq!(config.request.max_text_bytes, ByteSize::new(1024 * 1024));
-        assert_eq!(config.request.max_prompt_tokens, 32_768);
+        assert_eq!(config.request.max_prompt_tokens, None);
         assert_eq!(config.request.max_output_tokens, 8_192);
         assert_eq!(config.request.max_stops, 4);
     }
