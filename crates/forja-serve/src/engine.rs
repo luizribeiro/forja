@@ -1,10 +1,22 @@
-use std::{collections::VecDeque, error::Error, fmt, fs::File, io::Read, time::Duration};
+use std::{
+    collections::VecDeque,
+    error::Error,
+    fmt,
+    fs::File,
+    future::{Future, poll_fn},
+    io::Read,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 use forja_config::HostConfig;
 use forja_core::Backend;
 use forja_host::{EngineDecode, EngineDecodeOutput, EngineInfo, EngineRunner, SamplingParams};
 use tokenizers::Tokenizer;
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 
 use crate::request::{validate_chat_input, validate_completion_input, validate_prompt};
 use crate::{
@@ -41,6 +53,13 @@ impl GenerationError {
         }
     }
 
+    fn cancelled() -> Self {
+        Self {
+            message: "generation cancelled".to_owned(),
+            kind: ErrorKind::Unavailable,
+        }
+    }
+
     pub(crate) const fn kind(&self) -> ErrorKind {
         self.kind
     }
@@ -60,6 +79,43 @@ impl fmt::Display for GenerationError {
 }
 
 impl Error for GenerationError {}
+
+/// Idempotent cancellation and stream-stall policy for one admitted sequence.
+#[derive(Clone)]
+pub struct GenerationControl {
+    cancellation: Arc<Cancellation>,
+    write_stall_timeout: Duration,
+}
+
+struct Cancellation {
+    cancelled: AtomicBool,
+    notify: Notify,
+}
+
+impl GenerationControl {
+    /// Creates request control with the configured write-stall timeout.
+    #[must_use]
+    pub fn new(write_stall_timeout: Duration) -> Self {
+        Self {
+            cancellation: Arc::new(Cancellation {
+                cancelled: AtomicBool::new(false),
+                notify: Notify::new(),
+            }),
+            write_stall_timeout,
+        }
+    }
+
+    /// Requests cancellation. Repeated calls have no additional effect.
+    pub fn cancel(&self) {
+        if !self.cancellation.cancelled.swap(true, Ordering::AcqRel) {
+            self.cancellation.notify.notify_one();
+        }
+    }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.cancellation.cancelled.load(Ordering::Acquire)
+    }
+}
 
 /// Device-resident first-token selection and its validated request policy.
 pub struct PrefilledPrompt {
@@ -204,6 +260,10 @@ where
         self.config.server.request_deadline.get()
     }
 
+    pub(crate) const fn write_stall_timeout(&self) -> Duration {
+        self.config.server.sse_write_stall_timeout.get()
+    }
+
     /// Renders, tokenizes, validates, and prefills one chat request at position zero.
     ///
     /// # Errors
@@ -285,8 +345,17 @@ where
         &mut self,
         request: &ChatCompletionRequest,
     ) -> Result<Completion, GenerationError> {
+        let control = GenerationControl::new(self.write_stall_timeout());
+        self.complete_chat_controlled(request, &control).await
+    }
+
+    pub(crate) async fn complete_chat_controlled(
+        &mut self,
+        request: &ChatCompletionRequest,
+        control: &GenerationControl,
+    ) -> Result<Completion, GenerationError> {
         let prefill = self.prefill_chat(request).await?;
-        self.decode(prefill, None).await
+        self.decode(prefill, None, control).await
     }
 
     /// Generates a complete response from an unformatted text prompt.
@@ -298,8 +367,17 @@ where
         &mut self,
         request: &CompletionRequest,
     ) -> Result<Completion, GenerationError> {
+        let control = GenerationControl::new(self.write_stall_timeout());
+        self.complete_text_controlled(request, &control).await
+    }
+
+    pub(crate) async fn complete_text_controlled(
+        &mut self,
+        request: &CompletionRequest,
+        control: &GenerationControl,
+    ) -> Result<Completion, GenerationError> {
         let prefill = self.prefill_completion(request).await?;
-        self.decode(prefill, None).await
+        self.decode(prefill, None, control).await
     }
 
     /// Streams chat content and terminal events in generation order.
@@ -312,9 +390,19 @@ where
         request: &ChatCompletionRequest,
         sender: &mpsc::Sender<GenerationEvent>,
     ) -> Result<(), GenerationError> {
+        let control = GenerationControl::new(self.write_stall_timeout());
+        self.stream_chat_controlled(request, sender, &control).await
+    }
+
+    pub(crate) async fn stream_chat_controlled(
+        &mut self,
+        request: &ChatCompletionRequest,
+        sender: &mpsc::Sender<GenerationEvent>,
+        control: &GenerationControl,
+    ) -> Result<(), GenerationError> {
         let prefill = self.prefill_chat(request).await?;
-        let completion = self.decode(prefill, Some(sender)).await?;
-        send_terminal(sender, &request.params, completion).await
+        let completion = self.decode(prefill, Some(sender), control).await?;
+        send_terminal(sender, &request.params, completion, control).await
     }
 
     /// Streams text-completion content and terminal events in generation order.
@@ -327,15 +415,26 @@ where
         request: &CompletionRequest,
         sender: &mpsc::Sender<GenerationEvent>,
     ) -> Result<(), GenerationError> {
+        let control = GenerationControl::new(self.write_stall_timeout());
+        self.stream_text_controlled(request, sender, &control).await
+    }
+
+    pub(crate) async fn stream_text_controlled(
+        &mut self,
+        request: &CompletionRequest,
+        sender: &mpsc::Sender<GenerationEvent>,
+        control: &GenerationControl,
+    ) -> Result<(), GenerationError> {
         let prefill = self.prefill_completion(request).await?;
-        let completion = self.decode(prefill, Some(sender)).await?;
-        send_terminal(sender, &request.params, completion).await
+        let completion = self.decode(prefill, Some(sender), control).await?;
+        send_terminal(sender, &request.params, completion, control).await
     }
 
     async fn decode(
         &mut self,
         prefill: PrefilledPrompt,
         sender: Option<&mpsc::Sender<GenerationEvent>>,
+        control: &GenerationControl,
     ) -> Result<Completion, GenerationError> {
         let mut pending = VecDeque::from([prefill.first]);
         let mut issued = 1_u32;
@@ -347,6 +446,9 @@ where
         let mut text = String::new();
         let generation = async {
             while let Some(output) = pending.pop_front() {
+                if control.is_cancelled() {
+                    return Err(GenerationError::cancelled());
+                }
                 while pending.len() < 2 && issued < prefill.params.max_tokens {
                     pending.push_back(
                         self.runner
@@ -405,7 +507,7 @@ where
                     let output = matcher.push(piece.as_bytes()).map_err(|error| {
                         GenerationError::new(format!("decoded invalid UTF-8: {error}"))
                     })?;
-                    if emit_output(&mut text, output, sender).await? {
+                    if emit_output(&mut text, output, sender, control).await? {
                         return Ok(FinishReason::Stop);
                     }
                 }
@@ -413,11 +515,11 @@ where
             let output = matcher
                 .finish()
                 .map_err(|error| GenerationError::new(format!("decoded invalid UTF-8: {error}")))?;
-            emit_output(&mut text, output, sender).await?;
+            emit_output(&mut text, output, sender, control).await?;
             Ok(FinishReason::Length)
         }
         .await;
-        let discard = discard_pending(&mut self.runner, &mut pending).await;
+        let discard = finalize_sequence(&mut self.runner, &mut pending).await;
         let finish_reason = match (generation, discard) {
             (Ok(reason), Ok(())) => reason,
             (Err(error), _) | (Ok(_), Err(error)) => return Err(error),
@@ -437,15 +539,13 @@ async fn emit_output(
     text: &mut String,
     output: crate::StopOutput,
     sender: Option<&mpsc::Sender<GenerationEvent>>,
+    control: &GenerationControl,
 ) -> Result<bool, GenerationError> {
     text.push_str(&output.text);
     if let Some(sender) = sender
         && !output.text.is_empty()
     {
-        sender
-            .send(GenerationEvent::Content(output.text))
-            .await
-            .map_err(|_| GenerationError::unavailable("stream receiver closed"))?;
+        send_event(sender, GenerationEvent::Content(output.text), control).await?;
     }
     Ok(output.matched)
 }
@@ -454,27 +554,54 @@ async fn send_terminal(
     sender: &mpsc::Sender<GenerationEvent>,
     params: &crate::CompletionParams,
     completion: Completion,
+    control: &GenerationControl,
 ) -> Result<(), GenerationError> {
-    sender
-        .send(GenerationEvent::Finished(
-            completion.finish_reason,
-            completion.usage,
-        ))
-        .await
-        .map_err(|_| GenerationError::unavailable("stream receiver closed"))?;
+    send_event(
+        sender,
+        GenerationEvent::Finished(completion.finish_reason, completion.usage),
+        control,
+    )
+    .await?;
     if params
         .stream_options
         .is_some_and(|options| options.include_usage)
     {
-        sender
-            .send(GenerationEvent::Usage(completion.usage))
-            .await
-            .map_err(|_| GenerationError::unavailable("stream receiver closed"))?;
+        send_event(sender, GenerationEvent::Usage(completion.usage), control).await?;
     }
-    sender
-        .send(GenerationEvent::Done)
-        .await
-        .map_err(|_| GenerationError::unavailable("stream receiver closed"))
+    send_event(sender, GenerationEvent::Done, control).await
+}
+
+async fn send_event(
+    sender: &mpsc::Sender<GenerationEvent>,
+    event: GenerationEvent,
+    control: &GenerationControl,
+) -> Result<(), GenerationError> {
+    if control.is_cancelled() {
+        return Err(GenerationError::cancelled());
+    }
+    let send = sender.send(event);
+    let cancelled = control.cancellation.notify.notified();
+    let stalled = tokio::time::sleep(control.write_stall_timeout);
+    let mut send = std::pin::pin!(send);
+    let mut cancelled = std::pin::pin!(cancelled);
+    let mut stalled = std::pin::pin!(stalled);
+    poll_fn(|context| {
+        if let std::task::Poll::Ready(result) = send.as_mut().poll(context) {
+            return std::task::Poll::Ready(result.map_err(|_| {
+                control.cancel();
+                GenerationError::cancelled()
+            }));
+        }
+        if cancelled.as_mut().poll(context).is_ready() {
+            return std::task::Poll::Ready(Err(GenerationError::cancelled()));
+        }
+        if stalled.as_mut().poll(context).is_ready() {
+            control.cancel();
+            return std::task::Poll::Ready(Err(GenerationError::cancelled()));
+        }
+        std::task::Poll::Pending
+    })
+    .await
 }
 
 fn read_token(bytes: &[u8]) -> Result<u32, GenerationError> {
@@ -484,7 +611,7 @@ fn read_token(bytes: &[u8]) -> Result<u32, GenerationError> {
     Ok(u32::from_le_bytes(bytes))
 }
 
-async fn discard_pending<B>(
+async fn finalize_sequence<B>(
     runner: &mut EngineRunner<B>,
     pending: &mut VecDeque<EngineDecodeOutput>,
 ) -> Result<(), GenerationError>
@@ -635,5 +762,20 @@ mod tests {
     fn greedy_sampling_needs_no_entropy() {
         assert_eq!(sampling_seed(None, 0.0).unwrap(), 0);
         assert_eq!(sampling_seed(Some(17), 0.7).unwrap(), 17);
+    }
+
+    #[tokio::test]
+    async fn write_stall_cancels_idempotently() {
+        let (sender, _receiver) = mpsc::channel(1);
+        sender.try_send(GenerationEvent::Role).unwrap();
+        let control = GenerationControl::new(Duration::from_millis(1));
+        assert!(
+            send_event(&sender, GenerationEvent::Done, &control)
+                .await
+                .is_err()
+        );
+        assert!(control.is_cancelled());
+        control.cancel();
+        assert!(control.is_cancelled());
     }
 }

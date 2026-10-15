@@ -11,8 +11,8 @@ mod stop;
 
 pub use chat_format::{ChatFormat, ChatFormatLimits, ChatInfo, SamplingDefaults};
 pub use engine::{
-    Completion, FinishReason, GenerationError, GenerationEvent, PrefilledPrompt, ServingEngine,
-    Usage,
+    Completion, FinishReason, GenerationControl, GenerationError, GenerationEvent, PrefilledPrompt,
+    ServingEngine, Usage,
 };
 pub use http::{ChatService, chat_router};
 pub use request::{
