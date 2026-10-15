@@ -340,6 +340,18 @@ pub struct SymbolicLayout {
 }
 
 impl SymbolicLayout {
+    #[expect(dead_code, reason = "reserved for graph arena binding")]
+    pub(crate) fn rebase(
+        &self,
+        byte_offset: u64,
+        buffer_len: u64,
+    ) -> Result<Self, SymbolicLayoutError> {
+        let mut result = self.clone();
+        result.base = result.base.rebase(byte_offset, buffer_len)?;
+        result.validate_corners()?;
+        Ok(result)
+    }
+
     /// Starts an empty recipe from a validated concrete layout.
     #[must_use]
     pub fn new(base: Layout, space: ParamSpace) -> Self {

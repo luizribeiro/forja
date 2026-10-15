@@ -11,8 +11,8 @@ use crate::program::{
     BindError, BoundProgram, KernelSignature, PreparedProgram, ProgramHash, bind_program,
 };
 use crate::{
-    DType, Layout, QuantizedMatrix, QuantizedMatrixError, QuantizedMatrixPart, byte_ranges_overlap,
-    is_injective,
+    DType, Layout, LayoutError, QuantizedMatrix, QuantizedMatrixError, QuantizedMatrixPart,
+    byte_ranges_overlap, is_injective,
 };
 
 /// An opaque allocation identity unique to one backend instance.
@@ -124,6 +124,13 @@ impl Tensor {
     #[must_use]
     pub const fn is_writable(&self) -> bool {
         self.writable
+    }
+
+    #[expect(dead_code, reason = "reserved for graph arena binding")]
+    pub(crate) fn rebase(&self, buffer: BufferId, byte_offset: u64) -> Result<Self, LayoutError> {
+        let layout = self.layout.rebase(byte_offset, buffer.byte_len())?;
+        Self::from_allocation(buffer, layout, self.writable)
+            .map_err(|_| LayoutError::ArithmeticOverflow)
     }
 }
 
@@ -255,6 +262,8 @@ pub enum Operand {
 /// A reason an operation could not be recorded.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum OpError {
+    /// Rebinding a validated tensor layout to another allocation failed.
+    Layout(LayoutError),
     /// Scalar programs must be recorded with [`CommandList::dispatch_kernel`].
     ProgramRequiresBinding,
     /// Tensor views do not satisfy a scalar program's signature.
@@ -383,6 +392,34 @@ struct ProgramDispatch {
 }
 
 impl Dispatch {
+    #[expect(dead_code, reason = "reserved for graph arena binding")]
+    pub(crate) fn rebase_tensors(
+        &self,
+        mut rebase: impl FnMut(&Tensor) -> Result<Tensor, LayoutError>,
+    ) -> Result<Self, OpError> {
+        let inputs = self
+            .inputs
+            .iter()
+            .map(&mut rebase)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(OpError::Layout)?;
+        let outputs = self
+            .outputs
+            .iter()
+            .map(rebase)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(OpError::Layout)?;
+        let input_refs = inputs.iter().collect::<Vec<_>>();
+        let output_refs = outputs.iter().collect::<Vec<_>>();
+        let mut rebound = self.prepared_program().map_or_else(
+            || Self::new_many(self.op, &input_refs, &output_refs),
+            |program| Self::kernel(program, &input_refs, &output_refs),
+        )?;
+        if let Some(data) = self.backend_data.clone() {
+            rebound.set_backend_data(data);
+        }
+        Ok(rebound)
+    }
     pub(crate) fn new(op: Op, inputs: &[&Tensor], output: &Tensor) -> Result<Self, OpError> {
         Self::new_many(op, inputs, &[output])
     }

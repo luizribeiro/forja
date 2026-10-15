@@ -176,6 +176,25 @@ pub struct Layout {
 }
 
 impl Layout {
+    #[expect(dead_code, reason = "reserved for graph arena binding")]
+    pub(crate) fn rebase(&self, byte_offset: u64, buffer_len: u64) -> Result<Self, LayoutError> {
+        let element_offset = byte_offset
+            .checked_div(self.dtype.byte_size())
+            .filter(|_| byte_offset.is_multiple_of(self.dtype.byte_size()))
+            .ok_or(LayoutError::ArithmeticOverflow)?;
+        let offset = self
+            .offset
+            .checked_add(element_offset)
+            .ok_or(LayoutError::ArithmeticOverflow)?;
+        Self::new(
+            self.dtype,
+            offset,
+            self.shape.clone(),
+            self.strides.clone(),
+            buffer_len,
+        )
+    }
+
     /// Creates and validates a layout with explicit element strides.
     ///
     /// # Errors
