@@ -26,6 +26,18 @@ interface metal-variants {
     ins: list<borrow<tensor>>,
     outs: list<borrow<tensor>>,
   ) -> result<_, error>;
+
+  select-epilogue-variant: func(
+    cmds: borrow<command-list>,
+    name: string,
+  ) -> result<_, error>;
+
+  select-epilogue-variant-rule: func(
+    cmds: borrow<command-list>,
+    space: borrow<params>,
+    parameter: u8,
+    arms: list<arm>,
+  ) -> result<_, error>;
 }
 
 world metal-host {

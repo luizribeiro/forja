@@ -1505,6 +1505,23 @@ enum RecordedDispatch {
         epilogue: Arc<PreparedEpilogue>,
         extras: Vec<TemplateTensor>,
     },
+    EpilogueVariant {
+        op: TemplateOp,
+        inputs: Vec<TemplateTensor>,
+        output: Box<TemplateTensor>,
+        epilogue: Arc<PreparedEpilogue>,
+        extras: Vec<TemplateTensor>,
+        data: BackendDispatchData,
+    },
+    EpilogueVariantRule {
+        op: TemplateOp,
+        inputs: Vec<TemplateTensor>,
+        output: Box<TemplateTensor>,
+        epilogue: Arc<PreparedEpilogue>,
+        extras: Vec<TemplateTensor>,
+        parameter: u8,
+        arms: Vec<(u32, BackendDispatchData)>,
+    },
 }
 
 fn record_graph_dispatch(
@@ -1562,6 +1579,46 @@ fn record_graph_dispatch(
             let inputs = inputs.iter().collect::<Vec<_>>();
             let extras = extras.iter().collect::<Vec<_>>();
             graph.dispatch_epilogue(*op, &inputs, output.as_ref(), epilogue, &extras)
+        }
+        RecordedDispatch::EpilogueVariant {
+            op,
+            inputs,
+            output,
+            epilogue,
+            extras,
+            data,
+        } => {
+            let inputs = inputs.iter().collect::<Vec<_>>();
+            let extras = extras.iter().collect::<Vec<_>>();
+            graph.dispatch_epilogue_variant(
+                *op,
+                &inputs,
+                output.as_ref(),
+                epilogue,
+                &extras,
+                data.clone(),
+            )
+        }
+        RecordedDispatch::EpilogueVariantRule {
+            op,
+            inputs,
+            output,
+            epilogue,
+            extras,
+            parameter,
+            arms,
+        } => {
+            let inputs = inputs.iter().collect::<Vec<_>>();
+            let extras = extras.iter().collect::<Vec<_>>();
+            graph.dispatch_epilogue_variant_rule(
+                *op,
+                &inputs,
+                output.as_ref(),
+                epilogue,
+                &extras,
+                *parameter,
+                arms.clone(),
+            )
         }
     }
 }
@@ -3286,6 +3343,162 @@ impl<B: Backend + 'static> Host<B> {
         entry.space = Some(space);
         Ok(())
     }
+
+    fn select_metal_epilogue_variant(
+        &mut self,
+        commands: &Resource<CommandListEntry>,
+        name: &str,
+    ) -> Result<(), compute::Error> {
+        validate_variant_name_length(name)?;
+        let variant = {
+            let entry = self.table.get(commands).map_err(invalid_handle)?;
+            match entry.recorded.last() {
+                Some(RecordedDispatch::Static(dispatch))
+                    if dispatch.prepared_epilogue().is_some() =>
+                {
+                    self.metal_backend()?
+                        .validate_variant_for_op(
+                            dispatch.op(),
+                            &dispatch.primitive_inputs().iter().collect::<Vec<_>>(),
+                            &dispatch.outputs().iter().collect::<Vec<_>>(),
+                            name,
+                        )
+                        .map_err(|error| match error {
+                            forja_metal::VariantValidationError::Operation(error) => {
+                                guest_error(error)
+                            }
+                            forja_metal::VariantValidationError::Variant(error) => {
+                                variant_error(&error)
+                            }
+                        })?
+                }
+                Some(RecordedDispatch::Epilogue {
+                    op, inputs, output, ..
+                }) => {
+                    let space = entry.space.as_ref().ok_or_else(|| {
+                        compute::Error::OpSignature(
+                            "epilogue variant requires replay parameters".to_owned(),
+                        )
+                    })?;
+                    self.metal_backend()?
+                        .validate_template_variant(
+                            space,
+                            *op,
+                            &inputs.iter().collect::<Vec<_>>(),
+                            &[output.as_ref()],
+                            name,
+                        )
+                        .map_err(|error| variant_error(&error))?
+                }
+                _ => return Err(guest_error(BackendError::InvalidInput)),
+            }
+        };
+        let data = BackendDispatchData::new(variant);
+        let entry = self.table.get_mut(commands).map_err(invalid_handle)?;
+        let recorded = entry
+            .recorded
+            .pop()
+            .ok_or_else(|| guest_error(BackendError::ExecutionFailed))?;
+        match recorded {
+            RecordedDispatch::Static(mut dispatch) => {
+                dispatch.set_backend_data(data.clone());
+                if !entry.commands.set_last_backend_data(data) {
+                    return Err(guest_error(BackendError::ExecutionFailed));
+                }
+                entry.recorded.push(RecordedDispatch::Static(dispatch));
+            }
+            RecordedDispatch::Epilogue {
+                op,
+                inputs,
+                output,
+                epilogue,
+                extras,
+            } => entry.recorded.push(RecordedDispatch::EpilogueVariant {
+                op,
+                inputs,
+                output,
+                epilogue,
+                extras,
+                data,
+            }),
+            _ => return Err(guest_error(BackendError::ExecutionFailed)),
+        }
+        Ok(())
+    }
+
+    fn select_metal_epilogue_variant_rule(
+        &mut self,
+        commands: &Resource<CommandListEntry>,
+        params: &Resource<ParamsEntry>,
+        parameter: u8,
+        arms: &[metal_bindings::l9o::gpu::metal_variants::Arm],
+    ) -> Result<(), compute::Error> {
+        validate_variant_rule_boundary(arms)?;
+        let space = self
+            .table
+            .get(params)
+            .map_err(invalid_handle)?
+            .space
+            .clone();
+        let rule = forja_core::VariantRule::new(
+            &space,
+            parameter,
+            arms.iter()
+                .map(|arm| RuleArm::new(arm.lo, arm.hi, &arm.name))
+                .collect(),
+        )
+        .map_err(|error| variant_error(&error))?;
+        let variants = {
+            let entry = self.table.get(commands).map_err(invalid_handle)?;
+            validate_variant_rule_space(entry.space.clone(), &space)?;
+            let Some(RecordedDispatch::Epilogue {
+                op, inputs, output, ..
+            }) = entry.recorded.last()
+            else {
+                return Err(guest_error(BackendError::InvalidInput));
+            };
+            self.metal_backend()?
+                .validate_variant_rule(
+                    &space,
+                    &rule,
+                    *op,
+                    &inputs.iter().collect::<Vec<_>>(),
+                    &[output.as_ref()],
+                )
+                .map_err(|error| variant_error(&error))?
+        };
+        let entry = self.table.get_mut(commands).map_err(invalid_handle)?;
+        let recorded = entry
+            .recorded
+            .pop()
+            .ok_or_else(|| guest_error(BackendError::ExecutionFailed))?;
+        let RecordedDispatch::Epilogue {
+            op,
+            inputs,
+            output,
+            epilogue,
+            extras,
+        } = recorded
+        else {
+            return Err(guest_error(BackendError::ExecutionFailed));
+        };
+        entry.recorded.push(RecordedDispatch::EpilogueVariantRule {
+            op,
+            inputs,
+            output,
+            epilogue,
+            extras,
+            parameter,
+            arms: rule
+                .arms()
+                .iter()
+                .zip(variants)
+                .map(|(arm, variant)| (arm.hi(), BackendDispatchData::new(variant)))
+                .collect(),
+        });
+        entry.parameterized = true;
+        Ok(())
+    }
 }
 
 struct ReadRequest<B: Backend> {
@@ -4061,6 +4274,28 @@ where
         std::future::ready(Ok(self.record_metal_variant_rule(
             &commands, &space, parameter, &arms, operation, &inputs, &outputs,
         )))
+    }
+
+    fn select_epilogue_variant(
+        &mut self,
+        commands: Resource<CommandListEntry>,
+        name: String,
+    ) -> impl Future<Output = wasmtime::Result<Result<(), compute::Error>>> + Send {
+        let _timer = self.import_timer(ImportKind::Dispatch);
+        std::future::ready(Ok(self.select_metal_epilogue_variant(&commands, &name)))
+    }
+
+    fn select_epilogue_variant_rule(
+        &mut self,
+        commands: Resource<CommandListEntry>,
+        space: Resource<ParamsEntry>,
+        parameter: u8,
+        arms: Vec<metal_bindings::l9o::gpu::metal_variants::Arm>,
+    ) -> impl Future<Output = wasmtime::Result<Result<(), compute::Error>>> + Send {
+        let _timer = self.import_timer(ImportKind::Dispatch);
+        std::future::ready(Ok(
+            self.select_metal_epilogue_variant_rule(&commands, &space, parameter, &arms)
+        ))
     }
 }
 
@@ -5008,6 +5243,129 @@ mod tests {
                 &borrowed_tensors(&inputs),
                 &[Resource::new_borrow(output.rep())],
             ),
+            Err(compute::Error::OpSignature(_))
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_epilogue_variants_preserve_the_epilogue_binding() {
+        let mut host = Host::new(forja_metal::MetalBackend::new().unwrap(), GENEROUS);
+        let (inputs, output) = metal_matmul_tensors(&mut host, 7);
+        let epilogue = host
+            .create_epilogue(doubling_program(2.0), unary_f32_epilogue(2))
+            .unwrap();
+        let prepared = Arc::clone(host.table.get(&epilogue).unwrap().prepared());
+        let commands = host.command_list().unwrap();
+        host.dispatch_epilogue(
+            &commands,
+            compute::Op::Matmul,
+            &borrowed_tensors(&inputs),
+            &Resource::new_borrow(output.rep()),
+            &epilogue,
+            &[],
+        )
+        .unwrap();
+        host.select_metal_epilogue_variant(&commands, "matmul.steel-64x64x16-2x2")
+            .unwrap();
+
+        let super::RecordedDispatch::Static(dispatch) =
+            host.table.get(&commands).unwrap().recorded.last().unwrap()
+        else {
+            panic!("expected a static epilogue dispatch");
+        };
+        assert!(Arc::ptr_eq(
+            dispatch.prepared_epilogue().unwrap(),
+            &prepared
+        ));
+        assert_eq!(
+            dispatch
+                .backend_data::<forja_metal::ValidatedVariant>()
+                .unwrap()
+                .name(),
+            "matmul.steel-64x64x16-2x2"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_epilogue_variant_rules_preserve_every_arm() {
+        let mut host = Host::new(forja_metal::MetalBackend::new().unwrap(), GENEROUS);
+        let (params, inputs, output) = metal_symbolic_matmul(&mut host);
+        let epilogue = host
+            .create_epilogue(doubling_program(2.0), unary_f32_epilogue(2))
+            .unwrap();
+        let prepared = Arc::clone(host.table.get(&epilogue).unwrap().prepared());
+        let commands = host.command_list().unwrap();
+        host.dispatch_epilogue(
+            &commands,
+            compute::Op::Matmul,
+            &borrowed_tensors(&inputs),
+            &Resource::new_borrow(output.rep()),
+            &epilogue,
+            &[],
+        )
+        .unwrap();
+        host.select_metal_epilogue_variant_rule(&commands, &params, 0, &[metal_rule_arm()])
+            .unwrap();
+
+        let super::RecordedDispatch::EpilogueVariantRule {
+            epilogue,
+            extras,
+            parameter,
+            arms,
+            ..
+        } = host.table.get(&commands).unwrap().recorded.last().unwrap()
+        else {
+            panic!("expected an epilogue variant rule");
+        };
+        assert!(Arc::ptr_eq(epilogue, &prepared));
+        assert!(extras.is_empty());
+        assert_eq!(*parameter, 0);
+        assert_eq!(arms.len(), 1);
+        assert_eq!(
+            arms[0]
+                .1
+                .get::<forja_metal::ValidatedVariant>()
+                .unwrap()
+                .name(),
+            "matmul.steel-64x64x16-2x2"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_epilogue_variant_selection_refuses_invalid_bindings() {
+        let mut host = Host::new(forja_metal::MetalBackend::new().unwrap(), GENEROUS);
+        let (inputs, output) = metal_matmul_tensors(&mut host, 7);
+        let commands = host.command_list().unwrap();
+        host.dispatch_many(
+            &commands,
+            compute::Op::Matmul,
+            &borrowed_tensors(&inputs),
+            &[Resource::new_borrow(output.rep())],
+        )
+        .unwrap();
+        assert!(matches!(
+            host.select_metal_epilogue_variant(&commands, "matmul.steel-64x64x16-2x2"),
+            Err(compute::Error::InvalidHandle(_))
+        ));
+
+        let epilogue = host
+            .create_epilogue(doubling_program(2.0), unary_f32_epilogue(2))
+            .unwrap();
+        let commands = host.command_list().unwrap();
+        host.dispatch_epilogue(
+            &commands,
+            compute::Op::Matmul,
+            &borrowed_tensors(&inputs),
+            &Resource::new_borrow(output.rep()),
+            &epilogue,
+            &[],
+        )
+        .unwrap();
+        assert!(matches!(
+            host.select_metal_epilogue_variant(&commands, "quant-matmul.tiled"),
             Err(compute::Error::OpSignature(_))
         ));
     }
