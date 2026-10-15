@@ -18,7 +18,7 @@ use crate::encoding::{
 use block2::RcBlock;
 use forja_core::{
     AllocationRegistry, Backend, BackendError, BufferId, CommandList, DType, GraphTemplate, Layout,
-    MappedRegion, PreparedGraph, ReadonlyImport, Tensor, ViewOp,
+    MappedRegion, MemoryUsage, PreparedGraph, ReadonlyImport, Tensor, ViewOp,
     program::{KernelSignature, ProgramHash, ValidatedProgram},
 };
 use objc2::{rc::Retained, runtime::ProtocolObject};
@@ -701,6 +701,19 @@ impl MetalBackend {
 impl Backend for MetalBackend {
     type Submission = MetalSubmission;
     type ProgramHandle = MetalProgramHandle;
+
+    fn memory_usage(&self) -> MemoryUsage {
+        let (physical_footprint, peak_physical_footprint) = crate::memory::physical_footprint()
+            .map_or((None, None), |(current, peak)| (Some(current), peak));
+        MemoryUsage {
+            charged_bytes: 0,
+            device_bytes: Some(
+                u64::try_from(self.device.currentAllocatedSize()).unwrap_or(u64::MAX),
+            ),
+            physical_footprint,
+            peak_physical_footprint,
+        }
+    }
 
     fn prepare_program(
         &self,

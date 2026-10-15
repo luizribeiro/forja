@@ -7,6 +7,19 @@ use std::{
     time::Duration,
 };
 
+/// Memory attributed by a trusted backend.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct MemoryUsage {
+    /// Bytes charged beyond live guest tensor storage.
+    pub charged_bytes: u64,
+    /// Bytes currently allocated by the device API, when available.
+    pub device_bytes: Option<u64>,
+    /// Current process physical footprint, when available.
+    pub physical_footprint: Option<u64>,
+    /// Peak process physical footprint, when available.
+    pub peak_physical_footprint: Option<u64>,
+}
+
 use crate::{
     BufferId, CommandList, DType, GraphTemplate, Layout, MappedRegion, Op, PreparedGraph, Slice,
     Tensor,
@@ -414,6 +427,11 @@ pub trait Backend {
     type Submission: Submission;
     /// Backend state retained by a prepared scalar program.
     type ProgramHandle: Send + Sync + 'static;
+
+    /// Returns the backend and process memory visible to this backend.
+    fn memory_usage(&self) -> MemoryUsage {
+        MemoryUsage::default()
+    }
 
     /// Prepares a validated scalar program for repeated dispatch.
     ///
