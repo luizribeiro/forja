@@ -1,4 +1,4 @@
-use std::{collections::VecDeque, error::Error, fmt, fs::File, io::Read};
+use std::{collections::VecDeque, error::Error, fmt, fs::File, io::Read, time::Duration};
 
 use forja_config::HostConfig;
 use forja_core::Backend;
@@ -172,6 +172,18 @@ where
     #[must_use]
     pub fn model(&self) -> &str {
         &self.model
+    }
+
+    pub(crate) fn max_body_bytes(&self) -> usize {
+        usize::try_from(self.config.request.max_body_bytes.get()).unwrap_or(usize::MAX)
+    }
+
+    pub(crate) const fn queue_length(&self) -> u32 {
+        self.config.server.queue_length
+    }
+
+    pub(crate) const fn request_deadline(&self) -> Duration {
+        self.config.server.request_deadline.get()
     }
 
     /// Renders, tokenizes, validates, and prefills one chat request at position zero.
