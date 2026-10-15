@@ -7960,6 +7960,28 @@ mod tests {
     }
 
     #[test]
+    fn replayed_decode_reuses_every_device_allocation_after_warmup() {
+        let backend = MetalBackend::new().unwrap();
+        let hidden = backend.alloc(DType::F32, &[1, 1024]).unwrap();
+        let update = backend.alloc(DType::F32, &[1, 1024]).unwrap();
+        let output = backend.alloc(DType::F32, &[1, 1024]).unwrap();
+        let mut template =
+            GraphTemplate::new(ParamSpace::new(Vec::new()).unwrap(), GraphLimits::default());
+        template
+            .dispatch(Op::Add, &[&hidden.into(), &update.into()], &output.into())
+            .unwrap();
+        let graph = backend.prepare_graph(template).unwrap();
+        backend.replay(&graph, Vec::new()).unwrap().wait().unwrap();
+        let warm = backend.debug_state().allocation_requests;
+
+        for _ in 0..128 {
+            backend.replay(&graph, Vec::new()).unwrap().wait().unwrap();
+        }
+
+        assert_eq!(backend.debug_state().allocation_requests, warm);
+    }
+
+    #[test]
     fn tier_two_replay_checks_mixed_plan_argument_capacity() {
         let backend = MetalBackend::new().unwrap();
         let static_input = backend.alloc(DType::F32, &[7]).unwrap();
@@ -8460,6 +8482,35 @@ mod tests {
             TensorSpec::contiguous(DType::F32, &[2, 7, 3]),
             &TensorSpec::contiguous(DType::F32, &[4, 3, 3]),
         );
+    }
+
+    #[test]
+    fn decomposed_attention_refuses_scratch_over_the_guest_quota() {
+        let backend = MetalBackend::new().unwrap();
+        let query = backend.alloc(DType::F32, &[16, 7, 128]).unwrap();
+        let key = backend.alloc(DType::F32, &[8, 4097, 128]).unwrap();
+        let value = backend.alloc(DType::F32, &[8, 4097, 128]).unwrap();
+        let output = backend.alloc(DType::F32, &[16, 7, 128]).unwrap();
+        let resident = backend.memory_usage().charged_bytes;
+        backend.set_memory_limit(resident.checked_add(1 << 20).unwrap());
+        let mut commands = CommandList::new();
+        commands
+            .dispatch(
+                Op::Sdpa {
+                    scale: 128.0_f32.sqrt().recip(),
+                    causal: true,
+                    q_start: 4090,
+                },
+                &[&query, &key, &value],
+                &output,
+            )
+            .unwrap();
+        let _override = SdpaOverride::set(SdpaKernel::Decomposed);
+
+        assert!(matches!(
+            backend.submit(commands),
+            Err(BackendError::QuotaExceeded)
+        ));
     }
 
     #[test]

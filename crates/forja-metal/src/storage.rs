@@ -3,12 +3,15 @@ use std::{
     ffi::c_void,
     ptr::{self, NonNull},
     slice,
-    sync::{Arc, Mutex, Weak},
+    sync::{
+        Arc, Mutex, MutexGuard, Weak,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
 #[cfg(test)]
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::AtomicUsize;
 
 #[cfg(test)]
 use crate::encoding::last_submission_timing;
@@ -271,6 +274,7 @@ pub(super) struct BackendDebugState {
     pub(super) pooled_bytes: u64,
     pub(super) residency_allocations: usize,
     pub(super) residency_bytes: u64,
+    pub(super) allocation_requests: usize,
     pub(super) last_submit: Duration,
     pub(super) last_wait: Duration,
 }
@@ -370,6 +374,11 @@ pub struct MetalBackend {
     pub(super) event_listener: Retained<MTLSharedEventListener>,
     pub(super) gpu_timeout: Duration,
     pub(super) graph_replay: MetalGraphReplay,
+    allocation_limit: AtomicU64,
+    allocation_lock: Mutex<()>,
+    baseline_device_bytes: u64,
+    #[cfg(test)]
+    allocation_requests: AtomicUsize,
 }
 
 /// Reusable graph execution strategy selected by the host operator.
@@ -632,6 +641,8 @@ impl MetalBackend {
             .newSharedEvent()
             .ok_or(BackendError::ExecutionFailed)?;
         let event_listener = MTLSharedEventListener::new();
+        let baseline_device_bytes =
+            u64::try_from(device.currentAllocatedSize()).unwrap_or(u64::MAX);
         let backend = Self {
             device,
             queue,
@@ -651,6 +662,11 @@ impl MetalBackend {
             event_listener,
             gpu_timeout,
             graph_replay,
+            allocation_limit: AtomicU64::new(u64::MAX),
+            allocation_lock: Mutex::new(()),
+            baseline_device_bytes,
+            #[cfg(test)]
+            allocation_requests: AtomicUsize::new(0),
         };
         #[cfg(test)]
         {
@@ -676,6 +692,7 @@ impl MetalBackend {
             pooled_bytes: pool.bytes,
             residency_allocations: pool.residency.raw.allocationCount(),
             residency_bytes: pool.residency.raw.allocatedSize(),
+            allocation_requests: self.allocation_requests.load(Ordering::Relaxed),
             last_submit,
             last_wait,
         }
@@ -701,9 +718,47 @@ impl MetalBackend {
         &self,
         len: usize,
     ) -> Result<Retained<ProtocolObject<dyn MTLBuffer>>, BackendError> {
-        self.device
+        let _reservation = self.reserve_allocation(len)?;
+        let buffer = self
+            .device
             .newBufferWithLength_options(len, MTLResourceOptions::StorageModeShared)
-            .ok_or(BackendError::AllocationFailed)
+            .ok_or(BackendError::AllocationFailed)?;
+        self.check_allocation_limit()?;
+        Ok(buffer)
+    }
+
+    pub(super) fn reserve_allocation(
+        &self,
+        len: usize,
+    ) -> Result<MutexGuard<'_, ()>, BackendError> {
+        #[cfg(test)]
+        self.allocation_requests.fetch_add(1, Ordering::Relaxed);
+        let reservation = self
+            .allocation_lock
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?;
+        let requested = u64::try_from(len).map_err(|_| BackendError::AllocationFailed)?;
+        let projected = self
+            .charged_device_bytes()
+            .checked_add(requested)
+            .ok_or(BackendError::QuotaExceeded)?;
+        if projected > self.allocation_limit.load(Ordering::Acquire) {
+            return Err(BackendError::QuotaExceeded);
+        }
+        Ok(reservation)
+    }
+
+    pub(super) fn check_allocation_limit(&self) -> Result<(), BackendError> {
+        if self.charged_device_bytes() > self.allocation_limit.load(Ordering::Acquire) {
+            return Err(BackendError::QuotaExceeded);
+        }
+        Ok(())
+    }
+
+    fn charged_device_bytes(&self) -> u64 {
+        u64::try_from(self.device.currentAllocatedSize())
+            .unwrap_or(u64::MAX)
+            .saturating_sub(self.baseline_device_bytes)
     }
 }
 
@@ -715,13 +770,17 @@ impl Backend for MetalBackend {
         let (physical_footprint, peak_physical_footprint) = crate::memory::physical_footprint()
             .map_or((None, None), |(current, peak)| (Some(current), peak));
         MemoryUsage {
-            charged_bytes: 0,
+            charged_bytes: self.charged_device_bytes(),
             device_bytes: Some(
                 u64::try_from(self.device.currentAllocatedSize()).unwrap_or(u64::MAX),
             ),
             physical_footprint,
             peak_physical_footprint,
         }
+    }
+
+    fn set_memory_limit(&self, bytes: u64) {
+        self.allocation_limit.store(bytes, Ordering::Release);
     }
 
     fn prepare_program(
@@ -933,6 +992,7 @@ fn readonly_buffer(
             .ok_or(BackendError::InvalidInput)?;
         // SAFETY: The pointer covers `len` initialized bytes for the duration of this synchronous
         // call, which copies them into a new shared-storage Metal allocation.
+        let _reservation = backend.reserve_allocation(len)?;
         let raw = unsafe {
             backend.device.newBufferWithBytes_length_options(
                 pointer,
@@ -941,6 +1001,7 @@ fn readonly_buffer(
             )
         }
         .ok_or(BackendError::AllocationFailed)?;
+        backend.check_allocation_limit()?;
         return Ok(MetalBuffer {
             raw,
             len,
@@ -960,6 +1021,7 @@ fn readonly_buffer(
     let deallocator: BufferDeallocator = RcBlock::new(move |_pointer, _length| {
         let _ = region.len();
     });
+    let _reservation = backend.reserve_allocation(rounded_len)?;
     // SAFETY: The full-file mapping starts at a page-aligned address and remains alive in the
     // sendable deallocator block until Metal releases the buffer. The OS mapping covers the final
     // partial page, and validated tensor layouts expose only the file's actual byte length.
@@ -974,6 +1036,7 @@ fn readonly_buffer(
             )
     }
     .ok_or(BackendError::AllocationFailed)?;
+    backend.check_allocation_limit()?;
     Ok(MetalBuffer {
         raw,
         len,
@@ -1038,6 +1101,7 @@ fn gather(source: &[u8], layout: &Layout) -> Result<Vec<u8>, BackendError> {
 mod mapped_tests {
     use std::{
         fs,
+        path::PathBuf,
         sync::atomic::{AtomicU64, Ordering},
     };
 
@@ -1046,6 +1110,46 @@ mod mapped_tests {
     use super::*;
 
     static NEXT_FILE: AtomicU64 = AtomicU64::new(0);
+
+    fn mapped_region(offset: usize) -> (PathBuf, MappedRegion) {
+        let path = std::env::temp_dir().join(format!(
+            "forja-metal-mapping-{}-{}",
+            std::process::id(),
+            NEXT_FILE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::write(&path, vec![0xa5; 4097]).unwrap();
+        let region = MappedRegion::map(&fs::File::open(&path).unwrap()).unwrap();
+        let region = if offset == 0 {
+            region
+        } else {
+            region.split_at(offset).unwrap()
+        };
+        (path, region)
+    }
+
+    #[test]
+    fn copied_readonly_buffer_refuses_a_tight_quota() {
+        let (path, region) = mapped_region(1);
+        let backend = MetalBackend::new().unwrap();
+        backend.set_memory_limit(backend.memory_usage().charged_bytes);
+        assert!(matches!(
+            backend.import_readonly(region),
+            Err(BackendError::QuotaExceeded)
+        ));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn mapped_readonly_buffer_refuses_a_tight_quota() {
+        let (path, region) = mapped_region(0);
+        let backend = MetalBackend::new().unwrap();
+        backend.set_memory_limit(backend.memory_usage().charged_bytes);
+        assert!(matches!(
+            backend.import_readonly(region),
+            Err(BackendError::QuotaExceeded)
+        ));
+        fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn mapped_weights_are_read_only_gpu_inputs() {
@@ -1113,6 +1217,7 @@ mod tests {
                 pooled_bytes: 0,
                 residency_allocations: 0,
                 residency_bytes: 0,
+                allocation_requests: 0,
                 last_submit: Duration::ZERO,
                 last_wait: Duration::ZERO,
             }

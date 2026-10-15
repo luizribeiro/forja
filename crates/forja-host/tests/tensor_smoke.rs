@@ -18,6 +18,8 @@ use wasmtime::component::{Component, Instance, Linker};
 const LIMITS: Limits = Limits::new(64 * 1024, 8, 16 * 1024, 8, 64 * 1024);
 const COMMAND_LIMITS: Limits = Limits::new(128 * 1024, 8, 16 * 1024, 8, 64 * 1024);
 const WEIGHT_LIMITS: Limits = Limits::new(20, 8, 16 * 1024, 4, 64 * 1024);
+#[cfg(target_os = "macos")]
+const METAL_WEIGHT_LIMITS: Limits = Limits::new(64 * 1024, 8, 16 * 1024, 4, 64 * 1024);
 const SDK_LIMITS: Limits = Limits::new(64 * 1024 * 1024, 8, 2_100_000, 128, 7 * 1024 * 4)
     .with_command_limits(32, 64 * 1024 * 1024)
     .with_gpu_limits(Duration::from_secs(30), Duration::MAX)
@@ -191,13 +193,17 @@ async fn metal_tensor_smoke_submits_commands() -> wasmtime::Result<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn cpu_guest_uses_granted_weights() -> wasmtime::Result<()> {
-    run_weights(forja_cpu::CpuBackend::new()).await
+    run_weights(forja_cpu::CpuBackend::new(), WEIGHT_LIMITS).await
 }
 
 #[cfg(target_os = "macos")]
 #[tokio::test(flavor = "multi_thread")]
 async fn metal_guest_uses_granted_weights() -> wasmtime::Result<()> {
-    run_weights(forja_metal::MetalBackend::new().map_err(wasmtime::Error::msg)?).await
+    run_weights(
+        forja_metal::MetalBackend::new().map_err(wasmtime::Error::msg)?,
+        METAL_WEIGHT_LIMITS,
+    )
+    .await
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -439,7 +445,7 @@ where
     result.map_err(wasmtime::Error::msg)
 }
 
-async fn run_weights<B>(backend: B) -> wasmtime::Result<()>
+async fn run_weights<B>(backend: B, limits: Limits) -> wasmtime::Result<()>
 where
     B: Backend + Send + Sync + 'static,
 {
@@ -447,8 +453,7 @@ where
     let grants = Grants::new().with_weights("model", &path);
     let result = async {
         let (mut store, instance) =
-            instantiate_with_grants(backend, test_guests::weights_smoke(), WEIGHT_LIMITS, grants)
-                .await?;
+            instantiate_with_grants(backend, test_guests::weights_smoke(), limits, grants).await?;
         let run = instance.get_typed_func::<(), (Result<Vec<u8>, String>,)>(&mut store, "run")?;
         Host::reset_guest_deadline(&mut store);
         let (result,) = store

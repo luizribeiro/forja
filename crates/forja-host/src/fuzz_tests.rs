@@ -27,6 +27,9 @@ static NEXT_PROGRAM_WEIGHT: AtomicU64 = AtomicU64::new(0);
 const FUZZ_LIMITS: Limits = Limits::new(8 * 1024 * 1024, 8, 1_000_000, 128, 8 * 1024 * 1024)
     .with_command_limits(16, 1_000_000_000)
     .with_gpu_limits(Duration::from_secs(60), Duration::MAX);
+const GRAPH_FUZZ_LIMITS: Limits = Limits::new(64 * 1024 * 1024, 8, 1_000_000, 128, 8 * 1024 * 1024)
+    .with_command_limits(16, 1_000_000_000)
+    .with_gpu_limits(Duration::from_secs(60), Duration::MAX);
 
 #[tokio::test(flavor = "multi_thread")]
 async fn symbolic_graphs_match_fresh_cpu_lists() {
@@ -143,7 +146,7 @@ where
     let rank = 1 + usize::try_from((seed / 4) % 2).unwrap();
     let shape = if rank == 1 { vec![17] } else { vec![7, 17] };
     let axis = rank - 1;
-    let mut host = Host::new(backend, FUZZ_LIMITS);
+    let mut host = Host::new(backend, GRAPH_FUZZ_LIMITS);
     let left = initialized_tensor(&mut host, dtype, &shape, seed);
     let right = initialized_tensor(&mut host, dtype, &shape, seed.wrapping_add(1));
     let scratch = host.alloc(dtype, &shape).unwrap();
@@ -222,7 +225,7 @@ where
     } else {
         (vec![2, 4, 7], vec![2, 7, 5], vec![2, 4, 5], 1)
     };
-    let mut host = Host::new(backend, FUZZ_LIMITS);
+    let mut host = Host::new(backend, GRAPH_FUZZ_LIMITS);
     let left = initialized_tensor(&mut host, dtype, &left_shape, seed);
     let right = initialized_tensor(&mut host, dtype, &right_shape, seed.wrapping_add(1));
     let scratch = host.alloc(dtype, &output_shape).unwrap();
@@ -312,7 +315,7 @@ where
     let rank = 1 + usize::try_from((seed / 4) % 2).unwrap();
     let shape = if rank == 1 { vec![17] } else { vec![7, 17] };
     let axis = rank - 1;
-    let mut host = Host::new(backend, FUZZ_LIMITS);
+    let mut host = Host::new(backend, GRAPH_FUZZ_LIMITS);
     let input = initialized_tensor(&mut host, dtype, &shape, seed);
     let scratch = host.alloc(dtype, &shape).unwrap();
     let graph_output = host.alloc(dtype, &shape).unwrap();
@@ -401,7 +404,7 @@ async fn graph_sdpa_case<B>(
 where
     B: Backend + Send + Sync + 'static,
 {
-    let mut host = Host::new(backend, FUZZ_LIMITS);
+    let mut host = Host::new(backend, GRAPH_FUZZ_LIMITS);
     let query = initialized_tensor(&mut host, dtype, &[2, 1, 128], seed);
     let source_key = initialized_tensor(&mut host, dtype, &[1, 1, 128], seed.wrapping_add(1));
     let key_cache = initialized_tensor(&mut host, dtype, &[1, 7, 128], seed.wrapping_add(2));

@@ -12,6 +12,8 @@ use toy_mlp::{HIDDEN, INTERMEDIATE, LAYERS, MAX_CONTEXT, ToyEngine, VOCAB};
 const LIMITS: Limits = Limits::new(16 * 1024 * 1024, 8, 1024 * 1024, 512, 1024 * 1024)
     .with_command_limits(64, 64 * 1024 * 1024);
 const TOKENS: [u32; 3] = [1, 7, 32];
+// Backend construction precedes the guest quota baseline and stays below one MiB on Metal 4.
+const METAL_FIXED_OVERHEAD: u64 = 1024 * 1024;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn cpu_toy_mlp_matches_native_sdk() -> wasmtime::Result<()> {
@@ -66,6 +68,21 @@ where
         let profile = runner
             .take_profile()
             .ok_or_else(|| wasmtime::Error::msg("Metal step profile is missing"))?;
+        let accounted = profile
+            .memory
+            .accounted_bytes()
+            .ok_or_else(|| wasmtime::Error::msg("Metal memory accounting overflowed"))?;
+        let device = profile
+            .memory
+            .device_bytes
+            .ok_or_else(|| wasmtime::Error::msg("Metal device allocation is missing"))?;
+        let bound = accounted
+            .checked_add(METAL_FIXED_OVERHEAD)
+            .ok_or_else(|| wasmtime::Error::msg("Metal memory bound overflowed"))?;
+        assert!(
+            device <= bound,
+            "device allocation {device} exceeds {accounted} accounted bytes plus fixed overhead"
+        );
         let submission = profile
             .submission
             .ok_or_else(|| wasmtime::Error::msg("Metal submission profile is missing"))?;
