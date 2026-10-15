@@ -349,7 +349,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     #[ignore = "requires FORJA_MODELS and runs in the pre-push hook"]
-    fn short_english_matches_the_golden_continuation() -> Result<(), Box<dyn Error>> {
+    fn metal_short_english_matches_the_golden_continuation() -> Result<(), Box<dyn Error>> {
         let root = PathBuf::from(env::var_os("FORJA_MODELS").ok_or("FORJA_MODELS is not set")?);
         let options = Run {
             engine: test_guests::qwen3().to_owned(),
@@ -395,7 +395,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     #[ignore = "requires FORJA_MODELS and runs in the pre-push hook"]
-    fn qwen3_coder_full_model_generates_code() -> Result<(), Box<dyn Error>> {
+    fn metal_qwen3_coder_full_model_generates_code() -> Result<(), Box<dyn Error>> {
         let root = PathBuf::from(env::var_os("FORJA_MODELS").ok_or("FORJA_MODELS is not set")?);
         let options = Run {
             engine: test_guests::qwen3_coder().to_owned(),

@@ -24,7 +24,7 @@ const ROUTER_NEAR_TIE: f32 = 1.0e-3;
 #[cfg(target_os = "macos")]
 #[tokio::test]
 #[ignore = "requires FORJA_MODELS and runs in the pre-push hook"]
-async fn prompt_hidden_states_and_routing_match_transformers() -> Result<(), Box<dyn Error>> {
+async fn metal_prompt_hidden_states_and_routing_match_transformers() -> Result<(), Box<dyn Error>> {
     let root = model_root()?;
     let fixtures = FixtureDirectory::open(root.join("golden/OLMoE-1B-7B-0924"))?;
     let fixture = fixtures

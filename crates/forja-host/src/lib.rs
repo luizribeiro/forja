@@ -4883,7 +4883,7 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[tokio::test(flavor = "multi_thread")]
-    async fn captured_graphs_share_two_transient_arenas_and_match_lazy_execution() {
+    async fn metal_captured_graphs_share_two_transient_arenas_and_match_lazy_execution() {
         let mut host = Host::new(forja_metal::MetalBackend::new().unwrap(), GENEROUS);
         let input = host.alloc(compute::Dtype::F32, &[4]).unwrap();
         let bridge = host.alloc(compute::Dtype::F32, &[4]).unwrap();
@@ -4933,7 +4933,7 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[tokio::test(flavor = "multi_thread")]
-    async fn dropped_graph_output_remains_stable_across_replays() {
+    async fn metal_dropped_graph_output_remains_stable_across_replays() {
         let mut host = Host::new(forja_metal::MetalBackend::new().unwrap(), GENEROUS);
         let input = host.alloc(compute::Dtype::F32, &[4]).unwrap();
         let transient = host.alloc(compute::Dtype::F32, &[4]).unwrap();
@@ -4973,7 +4973,7 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[tokio::test(flavor = "multi_thread")]
-    async fn interleaved_planned_graphs_wait_for_shared_arena_slots() {
+    async fn metal_interleaved_planned_graphs_wait_for_shared_arena_slots() {
         let mut host = Host::new(forja_metal::MetalBackend::new().unwrap(), GENEROUS);
         let first_input = host.alloc(compute::Dtype::F32, &[4]).unwrap();
         let first_bridge = host.alloc(compute::Dtype::F32, &[4]).unwrap();
@@ -5061,7 +5061,7 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn graph_creation_refuses_two_arenas_over_the_quota() {
+    fn metal_graph_creation_refuses_two_arenas_over_the_quota() {
         let limits = Limits::new(80, 8, u64::MAX, 32, u64::MAX);
         let mut host = Host::new(forja_metal::MetalBackend::new().unwrap(), limits);
         host.backend.set_memory_limit(u64::MAX);
