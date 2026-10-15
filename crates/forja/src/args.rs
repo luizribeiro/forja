@@ -2,8 +2,8 @@ use std::{collections::BTreeMap, fs, path::PathBuf};
 
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use forja_config::{
-    BackendKind, BenchSampling, ConfigError, DevConfig, Engine, GraphReplay, KeyPath, Layer,
-    Layered, Limits, Origin, Selection, dev_layers, file_layer, layer, set_layer,
+    BackendKind, BenchSampling, ConfigError, DevConfig, Engine, GraphReplay, HostConfig, KeyPath,
+    Layer, Layered, Limits, Origin, Selection, dev_layers, file_layer, layer, set_layer,
 };
 
 use crate::benchmark_record::{Recorded, SCHEMA_VERSION};
@@ -282,7 +282,13 @@ pub(crate) enum Command {
     Config(ConfigShow),
     Profile(Profile),
     Run(Run),
+    Serve(Serve),
     Verify(Verify),
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct Serve {
+    pub(crate) config: HostConfig,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -376,9 +382,14 @@ enum ParsedCommand {
     Profile(ProfileArgs),
     /// Generate a completion.
     Run(RunArgs),
+    /// Serve OpenAI-compatible inference requests.
+    Serve(ServeArgs),
     /// Compare engine outputs with golden fixtures.
     Verify(VerifyArgs),
 }
+
+#[derive(Args)]
+struct ServeArgs {}
 
 pub(crate) fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Command, clap::Error> {
     parse_with(arguments, dev_layers)
@@ -394,6 +405,9 @@ fn parse_with(
     let mut matches = Cli::command().try_get_matches_from(arguments)?;
     let overrides = ordered_overrides(&matches);
     let cli = Cli::from_arg_matches_mut(&mut matches)?;
+    if matches!(&cli.command, ParsedCommand::Serve(_)) {
+        return serve_config(overrides).map(Command::Serve);
+    }
     let rerun = cli.command.rerun_record()?;
     let mut layers =
         base_layers(cli.isolated || rerun.is_some()).map_err(|error| config_error(&error))?;
@@ -467,6 +481,7 @@ fn parse_with(
             Command::Profile(options.with_config(&layered.config, limits)?)
         }
         ParsedCommand::Run(options) => Command::Run(options.with_config(&layered.config, limits)?),
+        ParsedCommand::Serve(_) => unreachable!("serve commands return before development config"),
         ParsedCommand::Verify(options) => {
             Command::Verify(options.with_config(&layered.config, limits)?)
         }
@@ -575,6 +590,30 @@ fn load_record(path: &PathBuf) -> Result<(PathBuf, Recorded), clap::Error> {
 enum Override {
     File(PathBuf),
     Set(String),
+}
+
+fn serve_config(overrides: Vec<Override>) -> Result<Serve, clap::Error> {
+    let mut files = Vec::new();
+    let mut sets = Vec::new();
+    for override_ in overrides {
+        match override_ {
+            Override::File(path) => {
+                files.push(file_layer::<HostConfig>(&path).map_err(|error| config_error(&error))?);
+            }
+            Override::Set(expression) => sets.push(expression),
+        }
+    }
+    for (index, expression) in sets.into_iter().enumerate() {
+        files.push(
+            set_layer::<HostConfig>(index + 1, &expression)
+                .map_err(|error| config_error(&error))?
+                .0,
+        );
+    }
+    let config = layer::<HostConfig>(files)
+        .map_err(|error| config_error(&error))?
+        .config;
+    Ok(Serve { config })
 }
 
 fn ordered_overrides(matches: &clap::ArgMatches) -> Vec<Override> {
@@ -755,7 +794,11 @@ impl ParsedCommand {
                 values.extend(backend_sugar(options.backend));
                 values.extend(graph_replay_sugar(options.graph_replay));
             }
-            Self::Build(_) | Self::Catalog(_) | Self::Config(_) | Self::Profile(_) => {}
+            Self::Build(_)
+            | Self::Catalog(_)
+            | Self::Config(_)
+            | Self::Profile(_)
+            | Self::Serve(_) => {}
         }
         values
             .into_iter()
@@ -1326,6 +1369,35 @@ mod tests {
             |_| Ok(vec![layer]),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn serve_uses_only_explicit_host_configuration() {
+        let root = temporary_directory("serve-config").unwrap();
+        let path = root.join("host.toml");
+        fs::write(
+            &path,
+            "[model]\nengine='engine.wasm'\nprofile='profile.toml'\nmodel='model'\nchat_format='chat.wasm'\n",
+        )
+        .unwrap();
+        let Command::Serve(serve) = parse_with(
+            [
+                "-c",
+                path.to_str().unwrap(),
+                "--set",
+                "server.queue_length=3",
+                "serve",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+            |_| panic!("serve must not read development or user configuration"),
+        )
+        .unwrap() else {
+            panic!("expected serve command");
+        };
+        assert_eq!(serve.config.server.queue_length, 3);
+        assert_eq!(serve.config.model.engine, PathBuf::from("engine.wasm"));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

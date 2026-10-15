@@ -11,6 +11,7 @@ mod machine_load;
 mod profile;
 mod provenance;
 mod resolution;
+mod serve;
 mod verify;
 
 use std::{error::Error, process::ExitCode};
@@ -64,6 +65,12 @@ fn run(command: args::Command) -> Result<(), Box<dyn Error>> {
         print!("{}", config_show::render(&options)?);
         return Ok(());
     }
+    if let args::Command::Serve(options) = command {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?;
+        return runtime.block_on(serve::run(&options));
+    }
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_time()
         .build()?;
@@ -74,6 +81,7 @@ fn run(command: args::Command) -> Result<(), Box<dyn Error>> {
         args::Command::Config(_) => unreachable!("configuration commands return before runtime"),
         args::Command::Profile(options) => runtime.block_on(profile::run(&options)),
         args::Command::Run(options) => runtime.block_on(generate::run(&options)),
+        args::Command::Serve(_) => unreachable!("serve commands use the network runtime"),
         args::Command::Verify(options) => runtime.block_on(verify::run(&options)),
     }
 }
