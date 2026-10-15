@@ -181,6 +181,33 @@ struct BufferPool {
     residency: PoolResidency,
 }
 
+pub(super) const GRAPH_ARENA_DEPTH: usize = 2;
+
+struct GraphArenaSlot {
+    tensor: Tensor,
+    reserved: bool,
+    completion: Option<Weak<Completion>>,
+}
+
+#[derive(Default)]
+struct GraphArenaPool {
+    bytes: u64,
+    slots: Vec<GraphArenaSlot>,
+}
+
+pub(super) struct GraphArenaReservation {
+    slot: usize,
+    tensor: Tensor,
+    committed: bool,
+}
+
+impl GraphArenaReservation {
+    #[expect(dead_code, reason = "reserved for graph replay binding")]
+    pub(super) const fn tensor(&self) -> &Tensor {
+        &self.tensor
+    }
+}
+
 struct PoolResidency {
     raw: Retained<ProtocolObject<dyn MTLResidencySet>>,
 }
@@ -376,6 +403,7 @@ pub struct MetalBackend {
     pub(super) event_listener: Retained<MTLSharedEventListener>,
     pub(super) gpu_timeout: Duration,
     pub(super) graph_replay: MetalGraphReplay,
+    graph_arenas: Mutex<GraphArenaPool>,
     allocation_limit: AtomicU64,
     allocation_lock: Mutex<()>,
     baseline_device_bytes: u64,
@@ -664,6 +692,7 @@ impl MetalBackend {
             event_listener,
             gpu_timeout,
             graph_replay,
+            graph_arenas: Mutex::new(GraphArenaPool::default()),
             allocation_limit: AtomicU64::new(u64::MAX),
             allocation_lock: Mutex::new(()),
             baseline_device_bytes,
@@ -757,6 +786,112 @@ impl MetalBackend {
             return Err(BackendError::QuotaExceeded);
         }
         Ok(())
+    }
+
+    #[expect(dead_code, reason = "reserved for graph replay binding")]
+    pub(super) fn ensure_graph_arenas(&self, bytes: u64) -> Result<(), BackendError> {
+        let mut arenas = self
+            .graph_arenas
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?;
+        if bytes <= arenas.bytes {
+            return Ok(());
+        }
+        for slot in &arenas.slots {
+            if slot.reserved {
+                return Err(BackendError::QuotaExceeded);
+            }
+            if let Some(completion) = slot.completion.as_ref().and_then(Weak::upgrade) {
+                completion.wait(self.gpu_timeout)?;
+            }
+        }
+        let elements = bytes
+            .checked_add(DType::U32.byte_size() - 1)
+            .map(|bytes| bytes / DType::U32.byte_size())
+            .and_then(|elements| u32::try_from(elements).ok())
+            .ok_or(BackendError::AllocationFailed)?;
+        let mut replacements = Vec::with_capacity(GRAPH_ARENA_DEPTH);
+        for _ in 0..GRAPH_ARENA_DEPTH {
+            match self.alloc(DType::U32, &[elements]) {
+                Ok(tensor) => replacements.push(tensor),
+                Err(error) => {
+                    for tensor in replacements {
+                        let _ = self.release(&tensor);
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        for slot in &arenas.slots {
+            self.release(&slot.tensor)?;
+        }
+        arenas.bytes = bytes;
+        arenas.slots = replacements
+            .into_iter()
+            .map(|tensor| GraphArenaSlot {
+                tensor,
+                reserved: false,
+                completion: None,
+            })
+            .collect();
+        Ok(())
+    }
+
+    #[expect(dead_code, reason = "reserved for graph replay binding")]
+    pub(super) fn acquire_graph_arena(&self) -> Result<GraphArenaReservation, BackendError> {
+        let mut arenas = self
+            .graph_arenas
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?;
+        let Some((slot, arena)) = arenas.slots.iter_mut().enumerate().find(|(_, slot)| {
+            !slot.reserved
+                && slot
+                    .completion
+                    .as_ref()
+                    .and_then(Weak::upgrade)
+                    .is_none_or(|completion| completion.result().is_some())
+        }) else {
+            return Err(BackendError::QuotaExceeded);
+        };
+        arena.reserved = true;
+        arena.completion = None;
+        Ok(GraphArenaReservation {
+            slot,
+            tensor: arena.tensor.clone(),
+            committed: false,
+        })
+    }
+
+    #[expect(dead_code, reason = "reserved for graph replay binding")]
+    pub(super) fn commit_graph_arena(
+        &self,
+        reservation: &mut GraphArenaReservation,
+        completion: &Arc<Completion>,
+    ) -> Result<(), BackendError> {
+        let mut arenas = self
+            .graph_arenas
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?;
+        let slot = arenas
+            .slots
+            .get_mut(reservation.slot)
+            .ok_or(BackendError::ExecutionFailed)?;
+        slot.reserved = false;
+        slot.completion = Some(Arc::downgrade(completion));
+        reservation.committed = true;
+        Ok(())
+    }
+
+    #[expect(dead_code, reason = "reserved for graph replay binding")]
+    pub(super) fn release_graph_arena(&self, reservation: &GraphArenaReservation) {
+        if reservation.committed {
+            return;
+        }
+        if let Ok(mut arenas) = self.graph_arenas.lock()
+            && let Some(slot) = arenas.slots.get_mut(reservation.slot)
+        {
+            slot.reserved = false;
+        }
     }
 
     pub(super) fn allocate_device_object<T>(
