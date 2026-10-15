@@ -8,7 +8,9 @@ mod request;
 mod stop;
 
 pub use chat_format::{ChatFormat, ChatFormatLimits, ChatInfo, SamplingDefaults};
-pub use engine::{GenerationError, PrefilledPrompt, ServingEngine};
+pub use engine::{
+    Completion, FinishReason, GenerationError, PrefilledPrompt, ServingEngine, Usage,
+};
 pub use request::{
     ChatCompletionRequest, CompletionParams, CompletionRequest, Message, ResolvedParams, Stop,
     ValidationError, serving_context_ceiling, validate_chat, validate_completion,

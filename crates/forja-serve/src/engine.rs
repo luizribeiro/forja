@@ -1,4 +1,4 @@
-use std::{error::Error, fmt, fs::File, io::Read};
+use std::{collections::VecDeque, error::Error, fmt, fs::File, io::Read};
 
 use forja_config::HostConfig;
 use forja_core::Backend;
@@ -6,7 +6,9 @@ use forja_host::{EngineDecode, EngineDecodeOutput, EngineInfo, EngineRunner, Sam
 use tokenizers::Tokenizer;
 
 use crate::request::{validate_chat_input, validate_prompt};
-use crate::{ChatCompletionRequest, ChatFormat, ResolvedParams, serving_context_ceiling};
+use crate::{
+    ChatCompletionRequest, ChatFormat, ResolvedParams, StopMatcher, serving_context_ceiling,
+};
 
 /// A failure while preparing or running a generation.
 #[derive(Debug)]
@@ -52,6 +54,35 @@ impl PromptRenderer for ChatFormat {
             .map_err(|error| GenerationError::new(format!("chat format failed: {error}")))?
             .map_err(GenerationError::new)
     }
+}
+
+/// Why token generation ended.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FinishReason {
+    /// A model-declared token or request stop string matched.
+    Stop,
+    /// The validated output-token limit was reached.
+    Length,
+}
+
+/// Token counts for one completed request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Usage {
+    /// Tokens in the rendered prompt.
+    pub prompt_tokens: u32,
+    /// Sampled tokens, including a token that caused a stop.
+    pub completion_tokens: u32,
+}
+
+/// Fully decoded output from one request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Completion {
+    /// Decoded text before any matched stop.
+    pub text: String,
+    /// Why generation ended.
+    pub finish_reason: FinishReason,
+    /// Request token counts.
+    pub usage: Usage,
 }
 
 /// One loaded engine, tokenizer, and model-declared chat format.
@@ -148,6 +179,137 @@ where
             sampling,
         })
     }
+
+    /// Generates a complete chat response with two decode calls in flight.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when decoding, backend synchronization, or detokenization fails.
+    pub async fn complete_chat(
+        &mut self,
+        request: &ChatCompletionRequest,
+    ) -> Result<Completion, GenerationError> {
+        let prefill = self.prefill_chat(request).await?;
+        self.decode(prefill).await
+    }
+
+    async fn decode(&mut self, prefill: PrefilledPrompt) -> Result<Completion, GenerationError> {
+        let mut pending = VecDeque::from([prefill.first]);
+        let mut issued = 1_u32;
+        let mut consumed = 0_u32;
+        let mut position = prefill.prompt_tokens;
+        let replay_base = self.runner.metrics().submissions;
+        let mut decoder = self.tokenizer.decode_stream(true);
+        let mut matcher = StopMatcher::new(&prefill.params.stops);
+        let mut text = String::new();
+        let generation = async {
+            while let Some(output) = pending.pop_front() {
+                while pending.len() < 2 && issued < prefill.params.max_tokens {
+                    pending.push_back(
+                        self.runner
+                            .enqueue_decode(EngineDecode {
+                                tokens: None,
+                                start_pos: position,
+                                sampling: prefill.sampling,
+                            })
+                            .await
+                            .map_err(|error| {
+                                GenerationError::new(format!("engine decode failed: {error}"))
+                            })?
+                            .map_err(|error| {
+                                GenerationError::new(format!("engine decode failed: {error:?}"))
+                            })?,
+                    );
+                    position = position
+                        .checked_add(1)
+                        .ok_or_else(|| GenerationError::new("decode position overflowed"))?;
+                    issued += 1;
+                }
+                let bytes = self
+                    .runner
+                    .read_queued_token(output)
+                    .await
+                    .map_err(|error| {
+                        GenerationError::new(format!("selected-token read failed: {error:?}"))
+                    })?;
+                let token = read_token(&bytes)?;
+                consumed += 1;
+                if consumed > 1 {
+                    let expected = replay_base
+                        .checked_add(u64::from(consumed - 1))
+                        .ok_or_else(|| GenerationError::new("submission count overflowed"))?;
+                    self.runner
+                        .wait_for_submissions(expected)
+                        .await
+                        .map_err(|error| {
+                            GenerationError::new(format!("engine synchronization failed: {error}"))
+                        })?;
+                }
+                if self.chat_format.info().stop_token_ids.contains(&token) {
+                    return Ok(FinishReason::Stop);
+                }
+                if let Some(piece) = decoder.step(token).map_err(|error| {
+                    GenerationError::new(format!("cannot decode token: {error}"))
+                })? {
+                    let output = matcher.push(piece.as_bytes()).map_err(|error| {
+                        GenerationError::new(format!("decoded invalid UTF-8: {error}"))
+                    })?;
+                    text.push_str(&output.text);
+                    if output.matched {
+                        return Ok(FinishReason::Stop);
+                    }
+                }
+            }
+            let output = matcher
+                .finish()
+                .map_err(|error| GenerationError::new(format!("decoded invalid UTF-8: {error}")))?;
+            text.push_str(&output.text);
+            Ok(FinishReason::Length)
+        }
+        .await;
+        let discard = discard_pending(&mut self.runner, &mut pending).await;
+        let finish_reason = match (generation, discard) {
+            (Ok(reason), Ok(())) => reason,
+            (Err(error), _) | (Ok(_), Err(error)) => return Err(error),
+        };
+        Ok(Completion {
+            text,
+            finish_reason,
+            usage: Usage {
+                prompt_tokens: prefill.prompt_tokens,
+                completion_tokens: consumed,
+            },
+        })
+    }
+}
+
+fn read_token(bytes: &[u8]) -> Result<u32, GenerationError> {
+    let bytes: [u8; 4] = bytes
+        .try_into()
+        .map_err(|_| GenerationError::new("selected token is not one u32"))?;
+    Ok(u32::from_le_bytes(bytes))
+}
+
+async fn discard_pending<B>(
+    runner: &mut EngineRunner<B>,
+    pending: &mut VecDeque<EngineDecodeOutput>,
+) -> Result<(), GenerationError>
+where
+    B: Backend + Send + Sync + 'static,
+{
+    let mut failure = None;
+    for output in pending.drain(..) {
+        if let Err(error) = runner.discard_queued_decode(output).await
+            && failure.is_none()
+        {
+            failure = Some(error);
+        }
+    }
+    failure.map_or(Ok(()), |error| {
+        Err(GenerationError::new(format!(
+            "speculative decode cleanup failed: {error:?}"
+        )))
+    })
 }
 
 fn prepare_chat_prompt<R: PromptRenderer>(
