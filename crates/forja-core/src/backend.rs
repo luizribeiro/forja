@@ -21,8 +21,8 @@ pub struct MemoryUsage {
 }
 
 use crate::{
-    BufferId, CommandList, DType, GraphTemplate, Layout, MappedRegion, Op, PreparedGraph, Slice,
-    Tensor,
+    BufferId, CommandList, DType, GraphMemoryPlan, GraphTemplate, Layout, MappedRegion, Op,
+    PreparedGraph, Slice, Tensor,
     program::{KernelSignature, ValidatedProgram},
 };
 
@@ -536,6 +536,26 @@ pub trait Backend {
     /// Returns a backend error when graph preparation cannot be completed.
     fn prepare_graph(&self, graph: GraphTemplate) -> Result<PreparedGraph, BackendError> {
         Ok(PreparedGraph::new(graph))
+    }
+
+    /// Returns the number of reusable execution arenas available to captured graphs.
+    fn graph_memory_depth(&self) -> usize {
+        0
+    }
+
+    /// Prepares a graph whose private tensors are assigned to reusable execution arenas.
+    ///
+    /// # Errors
+    ///
+    /// Returns unsupported operation when this backend does not provide graph arenas, or a
+    /// backend allocation/preparation error.
+    fn prepare_graph_memory(
+        &self,
+        graph: GraphTemplate,
+        plan: GraphMemoryPlan,
+    ) -> Result<PreparedGraph, BackendError> {
+        let _ = (graph, plan);
+        Err(BackendError::UnsupportedOperation)
     }
 
     /// Instantiates and submits a prepared graph through the prevalidated command path.
