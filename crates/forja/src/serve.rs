@@ -92,6 +92,44 @@ where
         profile.workload().max_context.get(),
     )?;
     let listener = tokio::net::TcpListener::bind(config.server.listen).await?;
-    axum::serve(listener, forja_serve::chat_router(engine)).await?;
+    let (router, drain) = forja_serve::serving_router(engine);
+    axum::serve(listener, router)
+        .with_graceful_shutdown(async move {
+            if let Err(error) = shutdown_signal().await {
+                eprintln!("cannot listen for shutdown: {error}");
+            }
+            drain.drain().await;
+        })
+        .await?;
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn shutdown_signal() -> Result<(), Box<dyn Error>> {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let mut interrupt = signal(SignalKind::interrupt())?;
+    let mut terminate = signal(SignalKind::terminate())?;
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+    let interrupt_sender = sender.clone();
+    tokio::spawn(async move {
+        if interrupt.recv().await.is_some() {
+            let _ = interrupt_sender.send(()).await;
+        }
+    });
+    tokio::spawn(async move {
+        if terminate.recv().await.is_some() {
+            let _ = sender.send(()).await;
+        }
+    });
+    receiver
+        .recv()
+        .await
+        .ok_or_else(|| "shutdown signal listeners closed".into())
+}
+
+#[cfg(not(unix))]
+async fn shutdown_signal() -> Result<(), Box<dyn Error>> {
+    tokio::signal::ctrl_c().await?;
     Ok(())
 }

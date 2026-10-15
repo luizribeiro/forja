@@ -14,7 +14,7 @@ pub use engine::{
     Completion, FinishReason, GenerationControl, GenerationError, GenerationEvent, PrefilledPrompt,
     ServingEngine, Usage,
 };
-pub use http::{ChatService, chat_router};
+pub use http::{ChatService, DrainHandle, chat_router, serving_router};
 pub use request::{
     ChatCompletionRequest, CompletionParams, CompletionRequest, Message, ResolvedParams, Stop,
     StreamOptions, ValidationError, serving_context_ceiling, validate_chat, validate_completion,

@@ -3,7 +3,7 @@ use std::{
     future::Future,
     pin::Pin,
     sync::{
-        Arc,
+        Arc, Mutex as StdMutex,
         atomic::{AtomicU32, Ordering},
     },
     time::{Duration, UNIX_EPOCH},
@@ -146,6 +146,11 @@ where
 
 /// Builds the OpenAI-compatible chat-completions router.
 pub fn chat_router<S: ChatService>(service: S) -> Router {
+    serving_router(service).0
+}
+
+/// Builds a serving router and a handle that drains its admitted work.
+pub fn serving_router<S: ChatService>(service: S) -> (Router, DrainHandle<S>) {
     let max_body_bytes = service.max_body_bytes();
     let state = Arc::new(HttpState {
         queue_limit: service.queue_length(),
@@ -154,23 +159,73 @@ pub fn chat_router<S: ChatService>(service: S) -> Router {
         service: Mutex::new(service),
         sequence: Arc::new(Semaphore::new(1)),
         queued: AtomicU32::new(0),
+        draining: std::sync::atomic::AtomicBool::new(false),
+        active: StdMutex::new(None),
+        drained: tokio::sync::Notify::new(),
     });
-    Router::new()
+    let router = Router::new()
         .route("/v1/chat/completions", post(chat::<S>))
         .route("/v1/completions", post(text::<S>))
         .route("/v1/models", get(models::<S>))
         .route("/v1/models/{model}", get(model::<S>))
         .layer(DefaultBodyLimit::max(max_body_bytes))
-        .with_state(state)
+        .with_state(Arc::clone(&state));
+    (router, DrainHandle { state })
 }
 
 struct HttpState<S> {
     service: Mutex<S>,
     sequence: Arc<Semaphore>,
     queued: AtomicU32,
+    draining: std::sync::atomic::AtomicBool,
+    active: StdMutex<Option<GenerationControl>>,
+    drained: tokio::sync::Notify,
     queue_limit: u32,
     deadline: Duration,
     write_stall_timeout: Duration,
+}
+
+/// Stops admission, cancels active generation, and waits for its finalizer.
+pub struct DrainHandle<S> {
+    state: Arc<HttpState<S>>,
+}
+
+impl<S> DrainHandle<S> {
+    /// Drains all admitted serving work.
+    pub async fn drain(&self) {
+        self.state.draining.store(true, Ordering::Release);
+        self.state.sequence.close();
+        if let Ok(active) = self.state.active.lock()
+            && let Some(control) = active.as_ref()
+        {
+            control.cancel();
+        }
+        loop {
+            let notified = self.state.drained.notified();
+            let done = self
+                .state
+                .active
+                .lock()
+                .map_or(true, |active| active.is_none());
+            if done {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+struct ActiveGuard<S> {
+    state: Arc<HttpState<S>>,
+}
+
+impl<S> Drop for ActiveGuard<S> {
+    fn drop(&mut self) {
+        if let Ok(mut active) = self.state.active.lock() {
+            *active = None;
+        }
+        self.state.drained.notify_waiters();
+    }
 }
 
 type Body = Result<Bytes, BytesRejection>;
@@ -205,9 +260,14 @@ async fn chat<S: ChatService>(
     }
     let model = request.model.clone();
     let control = GenerationControl::new(state.write_stall_timeout);
+    let active = match activate(&state, &control) {
+        Ok(active) => active,
+        Err(response) => return *response,
+    };
     let (sender, receiver) = oneshot::channel();
     let task_control = control.clone();
     tokio::spawn(async move {
+        let _active = active;
         let _permit = permit;
         let result = {
             let mut service = state.service.lock().await;
@@ -261,9 +321,14 @@ async fn text<S: ChatService>(
     }
     let model = request.model.clone();
     let control = GenerationControl::new(state.write_stall_timeout);
+    let active = match activate(&state, &control) {
+        Ok(active) => active,
+        Err(response) => return *response,
+    };
     let (sender, receiver) = oneshot::channel();
     let task_control = control.clone();
     tokio::spawn(async move {
+        let _active = active;
         let _permit = permit;
         let result = {
             let mut service = state.service.lock().await;
@@ -315,7 +380,12 @@ async fn stream_chat_response<S: ChatService>(
         );
     }
     let control = GenerationControl::new(state.write_stall_timeout);
+    let active = match activate(&state, &control) {
+        Ok(active) => active,
+        Err(response) => return *response,
+    };
     tokio::spawn(async move {
+        let _active = active;
         let _permit = permit;
         let result = {
             let mut service = state.service.lock().await;
@@ -345,7 +415,12 @@ async fn stream_text_response<S: ChatService>(
     let id = format!("cmpl-{created}");
     let (sender, receiver) = mpsc::channel(16);
     let control = GenerationControl::new(state.write_stall_timeout);
+    let active = match activate(&state, &control) {
+        Ok(active) => active,
+        Err(response) => return *response,
+    };
     tokio::spawn(async move {
+        let _active = active;
         let _permit = permit;
         let result = {
             let mut service = state.service.lock().await;
@@ -504,6 +579,12 @@ fn unix_time() -> u64 {
 }
 
 async fn admit<S>(state: &Arc<HttpState<S>>) -> Result<OwnedSemaphorePermit, Box<Response>> {
+    if state.draining.load(Ordering::Acquire) {
+        return Err(Box::new(api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "server is draining",
+        )));
+    }
     if let Ok(permit) = Arc::clone(&state.sequence).try_acquire_owned() {
         return Ok(permit);
     }
@@ -522,11 +603,40 @@ async fn admit<S>(state: &Arc<HttpState<S>>) -> Result<OwnedSemaphorePermit, Box
     let reservation = QueueReservation(&state.queued);
     let permit = Arc::clone(&state.sequence).acquire_owned().await;
     drop(reservation);
+    if state.draining.load(Ordering::Acquire) {
+        return Err(Box::new(api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "server is draining",
+        )));
+    }
     permit.map_err(|_| {
         Box::new(api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "server is draining",
         ))
+    })
+}
+
+fn activate<S>(
+    state: &Arc<HttpState<S>>,
+    control: &GenerationControl,
+) -> Result<ActiveGuard<S>, Box<Response>> {
+    let mut active = state.active.lock().map_err(|_| {
+        Box::new(api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "admission state failed",
+        ))
+    })?;
+    if state.draining.load(Ordering::Acquire) {
+        return Err(Box::new(api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "server is draining",
+        )));
+    }
+    *active = Some(control.clone());
+    drop(active);
+    Ok(ActiveGuard {
+        state: Arc::clone(state),
     })
 }
 
@@ -773,6 +883,31 @@ mod tests {
         assert!(disconnected.is_cancelled());
     }
 
+    #[tokio::test]
+    async fn drain_stops_admission_and_waits_for_finalization() {
+        let state = state();
+        let permit = admit(&state).await.unwrap();
+        let control = GenerationControl::new(Duration::from_secs(1));
+        let active = activate(&state, &control).unwrap();
+        let handle = DrainHandle {
+            state: Arc::clone(&state),
+        };
+        let drain = handle.drain();
+        tokio::pin!(drain);
+        assert!(matches!(
+            futures_poll_once(drain.as_mut()),
+            std::task::Poll::Pending
+        ));
+        assert!(control.is_cancelled());
+        drop(active);
+        drop(permit);
+        drain.await;
+        assert_eq!(
+            admit(&state).await.unwrap_err().status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
     fn state() -> Arc<HttpState<Smoke>> {
         Arc::new(HttpState {
             service: Mutex::new(Smoke),
@@ -781,6 +916,9 @@ mod tests {
             queue_limit: 1,
             deadline: Duration::from_secs(1),
             write_stall_timeout: Duration::from_secs(1),
+            draining: std::sync::atomic::AtomicBool::new(false),
+            active: StdMutex::new(None),
+            drained: tokio::sync::Notify::new(),
         })
     }
 
