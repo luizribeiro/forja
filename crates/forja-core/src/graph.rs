@@ -1242,6 +1242,7 @@ fn instantiate_tensors(
 #[derive(Clone, Copy)]
 struct Lifetime {
     start: usize,
+    end: usize,
     bytes: u64,
     begins_with_write: bool,
     consumed: bool,
@@ -1258,22 +1259,30 @@ fn plan_graph_memory(
             lifetimes
                 .entry(buffer)
                 .and_modify(|lifetime| {
+                    lifetime.end = index;
                     lifetime.consumed |= lifetime.begins_with_write;
                 })
                 .or_insert(Lifetime {
                     start: index,
+                    end: index,
                     bytes: buffer.byte_len(),
                     begins_with_write: false,
                     consumed: false,
                 });
         }
         for buffer in outputs {
-            lifetimes.entry(buffer).or_insert(Lifetime {
-                start: index,
-                bytes: buffer.byte_len(),
-                begins_with_write: true,
-                consumed: false,
-            });
+            lifetimes
+                .entry(buffer)
+                .and_modify(|lifetime| {
+                    lifetime.end = index;
+                })
+                .or_insert(Lifetime {
+                    start: index,
+                    end: index,
+                    bytes: buffer.byte_len(),
+                    begins_with_write: true,
+                    consumed: false,
+                });
         }
     }
     let mut candidates = lifetimes
@@ -1290,21 +1299,53 @@ fn plan_graph_memory(
         sum.checked_add(lifetime.bytes)
             .ok_or(GraphError::MemoryPlanningOverflow)
     })?;
+    let peak_live_bytes = (0..graph.dispatches.len()).try_fold(0_u64, |peak, index| {
+        let live = candidates.iter().try_fold(0_u64, |sum, (_, lifetime)| {
+            if lifetime.start <= index && index <= lifetime.end {
+                sum.checked_add(lifetime.bytes)
+                    .ok_or(GraphError::MemoryPlanningOverflow)
+            } else {
+                Ok(sum)
+            }
+        })?;
+        Ok::<_, GraphError>(peak.max(live))
+    })?;
+
+    let mut placed = Vec::<(Lifetime, std::ops::Range<u64>)>::new();
     let mut placements = HashMap::with_capacity(candidates.len());
-    let mut offset = 0_u64;
+    let mut arena_bytes = 0_u64;
     for (buffer, lifetime) in candidates {
+        let mut conflicts = placed
+            .iter()
+            .filter(|(prior, _)| lifetimes_conflict(graph, *prior, lifetime))
+            .map(|(_, range)| (range.start, range.end))
+            .collect::<Vec<_>>();
+        conflicts.sort_unstable();
+        let mut offset = 0_u64;
+        for (start, end) in conflicts {
+            offset = align_up(offset, 16)?;
+            if offset
+                .checked_add(lifetime.bytes)
+                .is_some_and(|candidate_end| candidate_end <= start)
+            {
+                break;
+            }
+            offset = offset.max(end);
+        }
         offset = align_up(offset, 16)?;
-        placements.insert(buffer, offset);
-        offset = offset
+        let end = offset
             .checked_add(lifetime.bytes)
             .ok_or(GraphError::MemoryPlanningOverflow)?;
+        arena_bytes = arena_bytes.max(end);
+        placements.insert(buffer, offset);
+        placed.push((lifetime, offset..end));
     }
-    let arena_bytes = align_up(offset, 4)?;
+    arena_bytes = align_up(arena_bytes, 4)?;
     Ok(GraphMemoryPlan {
         placements,
         arena_bytes,
         transient_bytes,
-        peak_live_bytes: transient_bytes,
+        peak_live_bytes,
     })
 }
 
@@ -1332,6 +1373,16 @@ fn template_dispatch_buffers(
     }
 }
 
+fn lifetimes_conflict(graph: &GraphTemplate, first: Lifetime, second: Lifetime) -> bool {
+    if first.end >= second.start {
+        return true;
+    }
+    let Some(after_first) = first.end.checked_add(1) else {
+        return true;
+    };
+    !(after_first..=second.start).any(|index| graph.required_barriers.get(index) == Some(&true))
+}
+
 fn align_up(value: u64, alignment: u64) -> Result<u64, GraphError> {
     value
         .checked_add(alignment - 1)
@@ -1340,6 +1391,8 @@ fn align_up(value: u64, alignment: u64) -> Result<u64, GraphError> {
 }
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use proptest::prelude::*;
 
     use super::{
@@ -1398,12 +1451,58 @@ mod tests {
     }
 
     #[test]
+    fn memory_plan_aliases_barrier_separated_transients() {
+        let (graph, tensors) = memory_graph(false);
+        let reachable = [
+            tensors[0].buffer(),
+            tensors[2].buffer(),
+            tensors[5].buffer(),
+        ]
+        .into_iter()
+        .collect();
+        let plan = graph.plan_memory(&reachable).unwrap();
+
+        assert_eq!(plan.offset(tensors[1].buffer()), Some(0));
+        assert_eq!(plan.offset(tensors[3].buffer()), Some(0));
+        assert_eq!(plan.transient_bytes(), 32);
+        assert_eq!(plan.peak_live_bytes(), 16);
+        assert!(plan.arena_bytes() >= plan.peak_live_bytes());
+        assert!(plan.arena_bytes() <= plan.transient_bytes());
+
+        let arena = tensor(8, &[4]);
+        let rebound = graph.bind_memory(&plan, &arena).unwrap();
+        assert_eq!(rebound.memory_arena(), Some(arena.buffer()));
+        assert_eq!(rebound.required_barriers(), graph.required_barriers());
+    }
+
+    #[test]
     fn memory_plan_never_places_guest_reachable_allocations() {
         let (graph, tensors) = memory_graph(false);
         let reachable = tensors.iter().map(Tensor::buffer).collect();
         let plan = graph.plan_memory(&reachable).unwrap();
         assert_eq!(plan.arena_bytes(), 0);
         assert!(!plan.contains(tensors[1].buffer()));
+    }
+
+    #[test]
+    fn memory_plan_keeps_a_value_live_through_its_last_read() {
+        let (graph, tensors) = memory_graph(true);
+        let reachable = [
+            tensors[0].buffer(),
+            tensors[2].buffer(),
+            tensors[4].buffer(),
+            tensors[5].buffer(),
+        ]
+        .into_iter()
+        .collect::<HashSet<_>>();
+        let plan = graph.plan_memory(&reachable).unwrap();
+        assert_ne!(
+            plan.offset(tensors[1].buffer()),
+            plan.offset(tensors[3].buffer())
+        );
+        assert_eq!(plan.peak_live_bytes(), 32);
+        assert!(plan.arena_bytes() >= plan.peak_live_bytes());
+        assert!(plan.arena_bytes() <= plan.transient_bytes());
     }
 
     #[test]
