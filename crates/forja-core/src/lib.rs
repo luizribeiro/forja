@@ -17,7 +17,8 @@ pub use backend::{
 };
 pub use forja_mmap::MappedRegion;
 pub use graph::{
-    GraphError, GraphLimits, GraphTemplate, PreparedGraph, TemplateOp, TemplateTensor,
+    GraphError, GraphLimits, GraphMemoryPlan, GraphTemplate, PreparedGraph, TemplateOp,
+    TemplateTensor,
 };
 pub use layout::{Layout, LayoutError, MAX_RANK, Slice, byte_ranges_overlap, is_injective};
 pub use ops::{

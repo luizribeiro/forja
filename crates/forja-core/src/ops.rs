@@ -126,7 +126,6 @@ impl Tensor {
         self.writable
     }
 
-    #[expect(dead_code, reason = "reserved for graph arena binding")]
     pub(crate) fn rebase(&self, buffer: BufferId, byte_offset: u64) -> Result<Self, LayoutError> {
         let layout = self.layout.rebase(byte_offset, buffer.byte_len())?;
         Self::from_allocation(buffer, layout, self.writable)
@@ -392,7 +391,6 @@ struct ProgramDispatch {
 }
 
 impl Dispatch {
-    #[expect(dead_code, reason = "reserved for graph arena binding")]
     pub(crate) fn rebase_tensors(
         &self,
         mut rebase: impl FnMut(&Tensor) -> Result<Tensor, LayoutError>,

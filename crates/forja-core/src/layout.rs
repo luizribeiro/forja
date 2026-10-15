@@ -176,7 +176,6 @@ pub struct Layout {
 }
 
 impl Layout {
-    #[expect(dead_code, reason = "reserved for graph arena binding")]
     pub(crate) fn rebase(&self, byte_offset: u64, buffer_len: u64) -> Result<Self, LayoutError> {
         let element_offset = byte_offset
             .checked_div(self.dtype.byte_size())

@@ -340,7 +340,6 @@ pub struct SymbolicLayout {
 }
 
 impl SymbolicLayout {
-    #[expect(dead_code, reason = "reserved for graph arena binding")]
     pub(crate) fn rebase(
         &self,
         byte_offset: u64,

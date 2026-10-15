@@ -1,4 +1,10 @@
-use std::{any::Any, collections::HashSet, error::Error, fmt, sync::Arc};
+use std::{
+    any::Any,
+    collections::{HashMap, HashSet},
+    error::Error,
+    fmt,
+    sync::Arc,
+};
 
 use crate::{
     Affine, BackendDispatchData, ByteHull, CommandList, Dispatch, Op, OpError, ParamError,
@@ -19,6 +25,8 @@ pub enum GraphError {
     SymbolicLayout(SymbolicLayoutError),
     /// A tensor and symbolic layout name incompatible allocations.
     Tensor(TensorError),
+    /// A tensor layout could not be rebound into planned storage.
+    Layout(crate::LayoutError),
     /// Concrete operation validation failed.
     Operation(OpError),
     /// A symbolic tensor belongs to another parameter space.
@@ -29,6 +37,8 @@ pub enum GraphError {
     TensorElementsLimit,
     /// A dispatch exceeds the configured work limit.
     WorkLimit,
+    /// Static graph memory planning exceeded 64-bit address arithmetic.
+    MemoryPlanningOverflow,
 }
 
 impl fmt::Display for GraphError {
@@ -43,6 +53,7 @@ impl Error for GraphError {
             Self::Parameter(error) => Some(error),
             Self::SymbolicLayout(error) => Some(error),
             Self::Tensor(error) => Some(error),
+            Self::Layout(error) => Some(error),
             Self::Operation(error) => Some(error),
             _ => None,
         }
@@ -64,6 +75,12 @@ impl From<SymbolicLayoutError> for GraphError {
 impl From<TensorError> for GraphError {
     fn from(error: TensorError) -> Self {
         Self::Tensor(error)
+    }
+}
+
+impl From<crate::LayoutError> for GraphError {
+    fn from(error: crate::LayoutError) -> Self {
+        Self::Layout(error)
     }
 }
 
@@ -317,6 +334,23 @@ impl TemplateTensor {
                 self.byte_hull()?.byte_span(),
                 writes,
             )),
+        }
+    }
+
+    fn rebase(
+        &self,
+        placements: &HashMap<crate::BufferId, u64>,
+        arena: crate::BufferId,
+    ) -> Result<Self, GraphError> {
+        let Some(&offset) = placements.get(&self.buffer()) else {
+            return Ok(self.clone());
+        };
+        match self {
+            Self::Concrete(tensor) => Ok(Self::Concrete(tensor.rebase(arena, offset)?)),
+            Self::Symbolic { base, layout } => Ok(Self::Symbolic {
+                base: base.rebase(arena, offset)?,
+                layout: layout.rebase(offset, arena.byte_len())?,
+            }),
         }
     }
 
@@ -601,6 +635,111 @@ enum TemplateDispatch {
     },
 }
 
+impl TemplateDispatch {
+    fn rebase(
+        &self,
+        placements: &HashMap<crate::BufferId, u64>,
+        arena: crate::BufferId,
+    ) -> Result<Self, GraphError> {
+        let tensor = |tensor: &TemplateTensor| tensor.rebase(placements, arena);
+        let dynamic = |dispatch: &DynamicDispatch| -> Result<DynamicDispatch, GraphError> {
+            Ok(match dispatch {
+                DynamicDispatch::Operation {
+                    op,
+                    inputs,
+                    outputs,
+                } => DynamicDispatch::Operation {
+                    op: *op,
+                    inputs: inputs.iter().map(tensor).collect::<Result<_, _>>()?,
+                    outputs: outputs.iter().map(tensor).collect::<Result<_, _>>()?,
+                },
+                DynamicDispatch::Program {
+                    program,
+                    inputs,
+                    outputs,
+                } => DynamicDispatch::Program {
+                    program: Arc::clone(program),
+                    inputs: inputs.iter().map(tensor).collect::<Result<_, _>>()?,
+                    outputs: outputs.iter().map(tensor).collect::<Result<_, _>>()?,
+                },
+            })
+        };
+        Ok(match self {
+            Self::Static(dispatch) => {
+                Self::Static(Box::new(dispatch.rebase_tensors(|tensor| {
+                    placements.get(&tensor.buffer()).map_or_else(
+                        || Ok(tensor.clone()),
+                        |&offset| tensor.rebase(arena, offset),
+                    )
+                })?))
+            }
+            Self::Dynamic {
+                dispatch,
+                backend_data,
+            } => Self::Dynamic {
+                dispatch: dynamic(dispatch)?,
+                backend_data: backend_data.clone(),
+            },
+            Self::Rule {
+                dispatch,
+                parameter,
+                arms,
+            } => Self::Rule {
+                dispatch: dynamic(dispatch)?,
+                parameter: *parameter,
+                arms: arms.clone(),
+            },
+        })
+    }
+}
+
+/// Static storage assignment for graph-private tensor allocations.
+///
+/// A placement only names tensors whose guest handles were gone at capture and whose complete
+/// lifetime is inside the graph. Rebinding those allocations cannot expose aliasing to guest code:
+/// the guest has no resource handle with which to read, write, or create another view of them.
+/// Placements share bytes only when their inclusive dispatch lifetimes do not overlap and an
+/// already-required graph barrier separates the two lifetimes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GraphMemoryPlan {
+    placements: HashMap<crate::BufferId, u64>,
+    arena_bytes: u64,
+    transient_bytes: u64,
+    peak_live_bytes: u64,
+}
+
+impl GraphMemoryPlan {
+    /// Returns the storage required by one execution arena.
+    #[must_use]
+    pub const fn arena_bytes(&self) -> u64 {
+        self.arena_bytes
+    }
+
+    /// Returns the sum of the original graph-private allocation lengths.
+    #[must_use]
+    pub const fn transient_bytes(&self) -> u64 {
+        self.transient_bytes
+    }
+
+    /// Returns the largest simultaneous live set before placement constraints.
+    #[must_use]
+    pub const fn peak_live_bytes(&self) -> u64 {
+        self.peak_live_bytes
+    }
+
+    /// Reports whether the allocation is graph-private and placed in the arena.
+    #[must_use]
+    pub fn contains(&self, buffer: crate::BufferId) -> bool {
+        self.placements.contains_key(&buffer)
+    }
+
+    /// Returns the assigned byte offset for a graph-private allocation.
+    #[must_use]
+    pub fn offset(&self, buffer: crate::BufferId) -> Option<u64> {
+        self.placements.get(&buffer).copied()
+    }
+}
+
 /// A validated command sequence over one parameter space.
 #[derive(Clone, Debug)]
 pub struct GraphTemplate {
@@ -610,6 +749,7 @@ pub struct GraphTemplate {
     barrier_accesses: Vec<Vec<BufferAccess>>,
     hull_barrier_accesses: Vec<Vec<BufferAccess>>,
     required_barriers: Vec<bool>,
+    memory_arena: Option<crate::BufferId>,
 }
 
 /// A validated graph template with optional backend-owned preparation state.
@@ -694,6 +834,7 @@ impl GraphTemplate {
             barrier_accesses: Vec::new(),
             hull_barrier_accesses: Vec::new(),
             required_barriers: Vec::new(),
+            memory_arena: None,
         }
     }
 
@@ -740,6 +881,47 @@ impl GraphTemplate {
             })
             .filter(|tensor| seen.insert(tensor.buffer()))
             .collect()
+    }
+
+    /// Rebinds graph-private allocations into one physical execution arena.
+    ///
+    /// # Errors
+    ///
+    /// Returns an operation or layout error if the supplied arena cannot hold every placement.
+    pub fn bind_memory(&self, plan: &GraphMemoryPlan, arena: &Tensor) -> Result<Self, GraphError> {
+        if arena.buffer().byte_len() < plan.arena_bytes || !arena.is_writable() {
+            return Err(GraphError::MemoryPlanningOverflow);
+        }
+        let mut rebound = Self::new(self.space.clone(), self.limits);
+        rebound.memory_arena = Some(arena.buffer());
+        for dispatch in &self.dispatches {
+            let dispatch = dispatch.rebase(&plan.placements, arena.buffer())?;
+            let (accesses, hull_accesses) = match &dispatch {
+                TemplateDispatch::Static(dispatch) => {
+                    let accesses = dispatch_accesses(dispatch);
+                    let hulls = accesses.iter().map(BufferAccess::as_hull).collect();
+                    (accesses, hulls)
+                }
+                TemplateDispatch::Dynamic { dispatch, .. }
+                | TemplateDispatch::Rule { dispatch, .. } => {
+                    (dispatch.accesses()?, dispatch.hull_accesses()?)
+                }
+            };
+            rebound.dispatches.push(dispatch);
+            rebound.barrier_accesses.push(accesses);
+            rebound.hull_barrier_accesses.push(hull_accesses);
+        }
+        rebound
+            .required_barriers
+            .clone_from(&self.required_barriers);
+        Ok(rebound)
+    }
+
+    /// Returns the physical arena allocation used by this bound template.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn memory_arena(&self) -> Option<crate::BufferId> {
+        self.memory_arena
     }
 
     /// Returns the resource bounds retained by this template.
