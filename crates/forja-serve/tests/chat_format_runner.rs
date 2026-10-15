@@ -58,3 +58,24 @@ fn component_declares_no_imports() {
             .unwrap();
     assert_eq!(component.component_type().imports(&engine).count(), 0);
 }
+
+#[test]
+fn runs_the_qwen3_coder_chat_format() {
+    let mut format = ChatFormat::load(
+        test_guests::qwen3_coder_chat_format(),
+        ChatFormatLimits::default(),
+    )
+    .unwrap();
+    let info = format.info().unwrap();
+    assert_eq!(info.stop_token_ids, [151_645, 151_643]);
+    assert_eq!(info.sampling.top_k, Some(20));
+    let rendered = format
+        .render(
+            r#"[{"role":"user","content":"A & <B>"}]"#,
+            "null",
+            r#"{"add_generation_prompt":true}"#,
+        )
+        .unwrap()
+        .unwrap();
+    assert!(rendered.contains("A & <B>"));
+}

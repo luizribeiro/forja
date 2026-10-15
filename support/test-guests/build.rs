@@ -46,6 +46,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?)?;
     let chat_format_path = out_dir.join("chat-format-smoke.wasm");
     fs::write(&chat_format_path, chat_format)?;
+    let qwen_chat_manifest = repository.join("chat-formats/qwen3-coder/Cargo.toml");
+    let qwen_chat_target_dir = main_target_dir.join("qwen-chat-format-build");
+    forja_build::build_core_module(&qwen_chat_manifest, &qwen_chat_target_dir, &[])?;
+    let qwen_chat_format = forja_build::encode_component(&fs::read(
+        qwen_chat_target_dir.join("wasm32-unknown-unknown/release/qwen3_coder_chat_format.wasm"),
+    )?)?;
+    let qwen_chat_format_path = out_dir.join("qwen3-coder-chat-format.wasm");
+    fs::write(&qwen_chat_format_path, qwen_chat_format)?;
     forja_build::build_component(&qwen3_manifest, &guest_target_dir, &[])?;
     forja_build::build_component(&qwen3_manifest, &bf16_target_dir, &["--features", "bf16"])?;
 
@@ -71,6 +79,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         build_qwen3_coder_profile(&qwen3_coder_manifest, &guest_target_dir, &out_dir)?;
     emit_guest_path("HELLO_COMPONENT", &release_dir.join("hello.wasm"));
     emit_guest_path("CHAT_FORMAT_SMOKE_COMPONENT", &chat_format_path);
+    emit_guest_path("QWEN3_CODER_CHAT_FORMAT", &qwen_chat_format_path);
     emit_guest_path(
         "METAL_VARIANT_SMOKE_COMPONENT",
         &release_dir.join("metal_variant_smoke.wasm"),
@@ -118,6 +127,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     emit_guest_path(
         "WEIGHTS_SMOKE_COMPONENT",
         &release_dir.join("weights_smoke.wasm"),
+    );
+    println!(
+        "cargo::rerun-if-changed={}",
+        repository.join("chat-formats/qwen3-coder").display()
     );
     println!(
         "cargo::rerun-if-changed={}",

@@ -82,11 +82,14 @@
           };
           wasm-clippy = cargoHook {
             name = "wasm-clippy-hook";
-            files = "^(support/guests/|engines/)";
+            files = "^(chat-formats/|support/guests/|engines/)";
             stages = allLocalStages;
             text = ''
               for manifest in support/guests/Cargo.toml engines/*/Cargo.toml; do
                 cargo clippy --manifest-path "$manifest" --workspace --all-targets --target wasm32-wasip2 --locked -- -D warnings
+              done
+              for manifest in chat-formats/*/Cargo.toml; do
+                cargo clippy --manifest-path "$manifest" --all-targets --target wasm32-unknown-unknown --locked -- -D warnings
               done
             '';
           };
@@ -113,7 +116,7 @@
           };
           guest-reproducibility = cargoHook {
             name = "guest-reproducibility-hook";
-            files = "^(crates/forja-(program-conversions|sdk|sdk-macros)/|engines/|support/(guests|test-guests)/|wit/)";
+            files = "^(chat-formats/|crates/forja-(chat-format|program-conversions|sdk|sdk-macros)/|engines/|support/(guests|test-guests)/|wit/)";
             stages = [ "pre-push" ];
             text = "support/test-guests/check-reproducible.sh";
           };
