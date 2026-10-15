@@ -46,6 +46,12 @@ impl Profile {
         &self.0.build
     }
 
+    /// Returns optional serving artifacts declared by the profile.
+    #[must_use]
+    pub const fn serving(&self) -> &Serving {
+        &self.0.serving
+    }
+
     /// Returns the numeric formats.
     #[must_use]
     pub const fn numerics(&self) -> &Numerics {
@@ -122,6 +128,7 @@ struct ProfileData {
     model: Model,
     target: Target,
     build: Build,
+    serving: Serving,
     numerics: Numerics,
     workload: Workload,
     variants: Variants,
@@ -135,6 +142,14 @@ struct ProfileData {
 pub struct Build {
     /// Cargo features enabled for the engine component.
     pub features: Vec<String>,
+}
+
+/// Model-specific serving artifacts declared by a profile.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
+pub struct Serving {
+    /// Zero-import chat-format component name.
+    pub chat_format: Option<String>,
 }
 
 /// Model identity pinned by a profile.
@@ -364,6 +379,9 @@ fn validate(profile: &ProfileData) -> Result<(), String> {
         profile.target.device_family.as_str(),
     )?;
     validate_build_features(&profile.build.features)?;
+    if let Some(format) = &profile.serving.chat_format {
+        validate_slug("serving.chat-format", format)?;
+    }
     if profile.workload.prefill_chunk > profile.workload.max_context {
         return Err("workload.prefill-chunk must not exceed max-context".to_owned());
     }

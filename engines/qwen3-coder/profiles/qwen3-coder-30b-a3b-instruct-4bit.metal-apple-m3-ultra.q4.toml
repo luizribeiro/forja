@@ -11,6 +11,9 @@ component = "wasm32-wasip2"
 backend = "metal"
 device-family = "apple-m3-ultra"
 
+[serving]
+chat-format = "qwen3-coder"
+
 [numerics]
 activations = "bf16"
 weights = "q4"

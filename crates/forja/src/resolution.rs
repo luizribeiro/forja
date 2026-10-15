@@ -86,7 +86,29 @@ pub(crate) fn build(profile: &Path) -> Result<PathBuf, Box<dyn std::error::Error
     let output = Path::new("target/engines").join(with_wasm_suffix(OsStr::new(name)));
     fs::create_dir_all(output.parent().ok_or("engine output has no parent")?)?;
     fs::write(&output, component)?;
+    if let Some(format) = &profile.serving().chat_format {
+        build_chat_format(format, &build_dir, &output)?;
+    }
     Ok(output)
+}
+
+fn build_chat_format(
+    format: &str,
+    build_dir: &Path,
+    engine_output: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let manifest = fs::canonicalize(Path::new("chat-formats").join(format).join("Cargo.toml"))?;
+    let target_dir = build_dir.join("chat-format");
+    forja_build::build_core_module(&manifest, &target_dir, &[])?;
+    let module = fs::read(
+        target_dir
+            .join("wasm32-unknown-unknown/release")
+            .join(format!("{}_chat_format", format.replace('-', "_")))
+            .with_extension("wasm"),
+    )?;
+    let component = forja_build::encode_component(&module)?;
+    fs::write(engine_output.with_extension("chat-format.wasm"), component)?;
+    Ok(())
 }
 
 pub(crate) fn read_embedded_profile(path: &Path) -> Result<Profile, String> {
@@ -227,5 +249,20 @@ mod tests {
             let source = fs::read_to_string(path).unwrap();
             toml::from_str::<Profile>(&source).unwrap();
         }
+    }
+
+    #[test]
+    fn serving_profiles_name_their_chat_format() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let path = resolve_profile_from(
+            &root,
+            Path::new("qwen3-coder-30b-a3b-instruct-4bit.metal-apple-m3-ultra.q4"),
+        )
+        .unwrap();
+        let profile: Profile = toml::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(
+            profile.serving().chat_format.as_deref(),
+            Some("qwen3-coder")
+        );
     }
 }
