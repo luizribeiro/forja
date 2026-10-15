@@ -56,6 +56,7 @@ wasmtime = { version = "49", default-features = false, features = [
   "runtime",
 ] }
 wasmtime-wasi = { version = "49", default-features = false, features = ["p2"] }
+wit-component = "0.258"
 
 [workspace.lints.rust]
 missing_docs = "warn"

@@ -696,6 +696,9 @@ dependencies = [
 [[package]]
 name = "forja-build"
 version = "0.0.0"
+dependencies = [
+ "wit-component 0.258.3",
+]
 
 [[package]]
 name = "forja-config"

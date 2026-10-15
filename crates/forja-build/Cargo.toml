@@ -6,5 +6,8 @@ publish.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
+[dependencies]
+wit-component.workspace = true
+
 [lints]
 workspace = true

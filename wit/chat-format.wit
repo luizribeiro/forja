@@ -1,0 +1,26 @@
+package l9o:gpu@0.1.0;
+
+interface chat-format {
+  record sampling-defaults {
+    temperature: option<f32>,
+    top-p: option<f32>,
+    top-k: option<u32>,
+    repetition-penalty: option<f32>,
+    max-new-tokens: option<u32>,
+  }
+
+  record chat-info {
+    stop-token-ids: list<u32>,
+    sampling: sampling-defaults,
+  }
+
+  info: func() -> chat-info;
+  /// Formats a prompt from JSON inputs. The host inserts `now_unix_seconds` and
+  /// `now_utc_offset_seconds` into the options object so an import-free guest can
+  /// implement `strftime_now`.
+  render: func(messages-json: string, tools-json: string, options-json: string) -> result<string, string>;
+}
+
+world chat-format-component {
+  export chat-format;
+}

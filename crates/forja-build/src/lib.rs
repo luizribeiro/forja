@@ -15,6 +15,20 @@ use std::{
 /// Returns an error when required environment state is unavailable, Cargo cannot be launched, or
 /// the build fails.
 pub fn build_component(manifest: &Path, target_dir: &Path, args: &[&str]) -> io::Result<()> {
+    build_target(manifest, target_dir, "wasm32-wasip2", args)
+}
+
+/// Builds one zero-import core WebAssembly module with reproducible compiler inputs.
+///
+/// # Errors
+///
+/// Returns an error when required environment state is unavailable, Cargo cannot be launched, or
+/// the build fails.
+pub fn build_core_module(manifest: &Path, target_dir: &Path, args: &[&str]) -> io::Result<()> {
+    build_target(manifest, target_dir, "wasm32-unknown-unknown", args)
+}
+
+fn build_target(manifest: &Path, target_dir: &Path, target: &str, args: &[&str]) -> io::Result<()> {
     let cargo = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let repository = manifest
         .parent()
@@ -31,7 +45,7 @@ pub fn build_component(manifest: &Path, target_dir: &Path, args: &[&str]) -> io:
         OsStr::new("build"),
         OsStr::new("--release"),
         OsStr::new("--target"),
-        OsStr::new("wasm32-wasip2"),
+        OsStr::new(target),
         OsStr::new("--manifest-path"),
         manifest.as_os_str(),
         OsStr::new("--target-dir"),
@@ -60,6 +74,20 @@ pub fn build_component(manifest: &Path, target_dir: &Path, args: &[&str]) -> io:
             "component build failed with {status}"
         )))
     }
+}
+
+/// Encodes a wit-bindgen core module as a zero-import component.
+///
+/// # Errors
+///
+/// Returns an error when the module or its embedded component metadata is invalid.
+pub fn encode_component(module: &[u8]) -> io::Result<Vec<u8>> {
+    wit_component::ComponentEncoder::default()
+        .module(module)
+        .map_err(io::Error::other)?
+        .validate(true)
+        .encode()
+        .map_err(io::Error::other)
 }
 
 /// Runs the current process as the reproducible rustc wrapper when requested.
