@@ -17,6 +17,9 @@ component = "wasm32-wasip2"
 backend = "metal"
 device-family = "apple-m3-ultra"
 
+[build]
+features = ["bf16"]
+
 [numerics]
 activations = "bf16"
 weights = "bf16"
@@ -55,6 +58,7 @@ fn parses_and_canonicalizes_a_dense_profile() {
     assert_eq!(profile.numerics().activations, ActivationFormat::Bf16);
     assert_eq!(profile.numerics().weights, WeightFormat::Bf16);
     assert_eq!(profile.default_tunings(), ["residual-norm", "qk-norm-rope"]);
+    assert_eq!(profile.build().features, ["bf16"]);
     assert!(profile.quantization().is_none());
 
     let canonical = profile.canonical_toml().unwrap();
@@ -89,6 +93,10 @@ fn rejects_unknown_fields_and_invalid_identity() {
     assert!(
         error(&PROFILE.replace("apple-m3-ultra", "Apple M3 Ultra"))
             .contains("lowercase ASCII letters and digits")
+    );
+    assert!(
+        error(&PROFILE.replace("features = [\"bf16\"]", "features = [\"bf16\", \"bf16\"]"))
+            .contains("must be unique")
     );
 }
 

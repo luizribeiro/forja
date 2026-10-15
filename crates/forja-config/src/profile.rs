@@ -4,6 +4,7 @@ use serde::{Deserialize, Deserializer, Serialize, de};
 use sha2::{Digest, Sha256};
 
 const MAX_DEFAULT_TUNINGS: usize = 64;
+const MAX_BUILD_FEATURES: usize = 64;
 const MAX_FIXED_PICKS: usize = 1_024;
 const MAX_VARIANT_RULES: usize = 1_024;
 const MAX_TUNING_VARIANTS: usize = 64;
@@ -37,6 +38,12 @@ impl Profile {
     #[must_use]
     pub const fn target(&self) -> &Target {
         &self.0.target
+    }
+
+    /// Returns the component build settings.
+    #[must_use]
+    pub const fn build(&self) -> &Build {
+        &self.0.build
     }
 
     /// Returns the numeric formats.
@@ -114,11 +121,20 @@ struct ProfileData {
     default_tunings: Vec<String>,
     model: Model,
     target: Target,
+    build: Build,
     numerics: Numerics,
     workload: Workload,
     variants: Variants,
     tuning_variants: BTreeMap<String, Variants>,
     quantization: Option<Quantization>,
+}
+
+/// Component build settings declared by a profile.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
+pub struct Build {
+    /// Cargo features enabled for the engine component.
+    pub features: Vec<String>,
 }
 
 /// Model identity pinned by a profile.
@@ -347,6 +363,7 @@ fn validate(profile: &ProfileData) -> Result<(), String> {
         "target.device-family",
         profile.target.device_family.as_str(),
     )?;
+    validate_build_features(&profile.build.features)?;
     if profile.workload.prefill_chunk > profile.workload.max_context {
         return Err("workload.prefill-chunk must not exceed max-context".to_owned());
     }
@@ -362,6 +379,19 @@ fn validate(profile: &ProfileData) -> Result<(), String> {
         validate_variants(variants, profile.workload.max_context)?;
     }
     validate_quantization(profile)
+}
+
+fn validate_build_features(features: &[String]) -> Result<(), String> {
+    require_count("build.features", features.len(), MAX_BUILD_FEATURES)?;
+    let mut sorted = features.to_vec();
+    sorted.sort();
+    for feature in &sorted {
+        require_name("build feature", feature)?;
+    }
+    if sorted.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err("build.features must be unique".to_owned());
+    }
+    Ok(())
 }
 
 fn validate_slug(field: &str, value: &str) -> Result<(), String> {

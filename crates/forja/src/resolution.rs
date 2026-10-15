@@ -4,7 +4,7 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
-use forja_config::{ActivationFormat, Profile, embed_profile, read_profile};
+use forja_config::{Profile, embed_profile, read_profile};
 
 pub(crate) fn engine(path: &Path) -> PathBuf {
     if path.extension() == Some(OsStr::new("wasm")) || path.components().count() != 1 {
@@ -68,9 +68,11 @@ pub(crate) fn build(profile: &Path) -> Result<PathBuf, Box<dyn std::error::Error
         return Err(format!("engine family manifest is missing: {}", manifest.display()).into());
     }
     let build_dir = Path::new("target/engine-build").join(name);
-    let args = match (profile.family(), profile.numerics().activations) {
-        ("qwen3", ActivationFormat::Bf16) => vec!["--features", "bf16"],
-        _ => Vec::new(),
+    let features = profile.build().features.join(",");
+    let args = if features.is_empty() {
+        Vec::new()
+    } else {
+        vec!["--features", features.as_str()]
     };
     forja_build::build_component(&manifest, &build_dir, &args)?;
     let crate_name = profile.family().replace('-', "_");

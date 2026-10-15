@@ -17,9 +17,9 @@ pub use engine::{Engine, EngineSelection, TuningBase, TuningOverrides};
 pub use files::{dev_layers, file_layer, user_config_path};
 pub use layer::{ConfigError, KeyPath, Layer, Layered, Origin, Schema, layer};
 pub use profile::{
-    ActivationFormat, ComponentTarget, DeviceFamily, Model, Numerics, Profile, ProfileBackend,
-    Quantization, QuantizationOverride, QuantizationScheme, Target, VariantArm, VariantRule,
-    Variants, WeightFormat, Workload, WorkloadKind,
+    ActivationFormat, Build, ComponentTarget, DeviceFamily, Model, Numerics, Profile,
+    ProfileBackend, Quantization, QuantizationOverride, QuantizationScheme, Target, VariantArm,
+    VariantRule, Variants, WeightFormat, Workload, WorkloadKind,
 };
 pub use serving::{HostConfig, RequestCeiling, ServedModel, Server};
 pub use set::set_layer;

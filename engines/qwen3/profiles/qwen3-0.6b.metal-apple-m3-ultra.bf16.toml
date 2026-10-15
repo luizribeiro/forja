@@ -12,6 +12,9 @@ component = "wasm32-wasip2"
 backend = "metal"
 device-family = "apple-m3-ultra"
 
+[build]
+features = ["bf16"]
+
 [numerics]
 activations = "bf16"
 weights = "bf16"
