@@ -1318,7 +1318,6 @@ impl BufferHandle {
             .map_err(|_| invalid_handle("guest tensor handle accounting underflowed"))
     }
 
-    #[expect(dead_code, reason = "reserved for graph memory planning")]
     fn guest_reachable(&self) -> bool {
         self.guest_handles.load(Ordering::Acquire) != 0
     }
@@ -1560,6 +1559,7 @@ pub struct Host<B: Backend> {
     live_handles: usize,
     live_kernels: Arc<AtomicUsize>,
     live_graphs: Arc<AtomicUsize>,
+    graph_arena_bytes: u64,
     gpu_time_ns: Arc<AtomicU64>,
     queued_submissions: Arc<AtomicU64>,
     completed_submissions: Arc<AtomicU64>,
@@ -1596,6 +1596,7 @@ impl<B: Backend + 'static> Host<B> {
             live_handles: 0,
             live_kernels: Arc::new(AtomicUsize::new(0)),
             live_graphs: Arc::new(AtomicUsize::new(0)),
+            graph_arena_bytes: 0,
             gpu_time_ns: Arc::new(AtomicU64::new(0)),
             queued_submissions: Arc::new(AtomicU64::new(0)),
             completed_submissions: Arc::new(AtomicU64::new(0)),
@@ -2395,11 +2396,67 @@ impl<B: Backend + 'static> Host<B> {
         self.release_retained(entry.retained)
     }
 
+    fn prepare_captured_graph(
+        &mut self,
+        graph: GraphTemplate,
+        entry: &mut CommandListEntry,
+    ) -> Result<PreparedGraph, compute::Error> {
+        let reachable = entry
+            .retained
+            .iter()
+            .filter(|entry| entry.buffer.guest_reachable())
+            .map(|entry| entry.tensor.buffer())
+            .collect::<HashSet<_>>();
+        let depth = self.backend.graph_memory_depth();
+        if depth == 0 {
+            return self.backend.prepare_graph(graph).map_err(guest_error);
+        }
+        let plan = graph
+            .plan_memory(&reachable)
+            .map_err(|error| graph_error(&error))?;
+        if plan.arena_bytes() == 0 {
+            return self.backend.prepare_graph(graph).map_err(guest_error);
+        }
+        let next_arena_bytes = self.graph_arena_bytes.max(plan.arena_bytes());
+        let depth =
+            u64::try_from(depth).map_err(|_| quota("graph arena depth exceeds the guest limit"))?;
+        let old_charge = self
+            .graph_arena_bytes
+            .checked_mul(depth)
+            .ok_or_else(|| quota("graph arena bytes exceed the guest limit"))?;
+        let new_charge = next_arena_bytes
+            .checked_mul(depth)
+            .ok_or_else(|| quota("graph arena bytes exceed the guest limit"))?;
+        let projected = self
+            .live_bytes
+            .load(Ordering::Acquire)
+            .checked_sub(plan.transient_bytes())
+            .and_then(|bytes| bytes.checked_sub(old_charge))
+            .and_then(|bytes| bytes.checked_add(new_charge))
+            .ok_or_else(|| quota("graph arena bytes exceed the guest limit"))?;
+        if projected > self.limits.live_bytes {
+            return Err(quota("graph arena bytes exceed the guest limit"));
+        }
+        let prepared = self
+            .backend
+            .prepare_graph_memory(graph, plan.clone())
+            .map_err(guest_error)?;
+        let (transient, retained): (Vec<_>, Vec<_>) = std::mem::take(&mut entry.retained)
+            .into_iter()
+            .partition(|entry| plan.contains(entry.tensor.buffer()));
+        self.release_retained(transient)?;
+        self.live_bytes
+            .fetch_add(new_charge - old_charge, Ordering::AcqRel);
+        self.graph_arena_bytes = next_arena_bytes;
+        entry.retained = retained;
+        Ok(prepared)
+    }
+
     fn create_graph(
         &mut self,
         resource: Resource<CommandListEntry>,
     ) -> Result<Resource<GraphEntry>, compute::Error> {
-        let entry = self.table.delete(resource).map_err(invalid_handle)?;
+        let mut entry = self.table.delete(resource).map_err(invalid_handle)?;
         let space = match entry.space.clone() {
             Some(space) => space,
             None => ParamSpace::new(Vec::new()).map_err(|error| graph_error(&error))?,
@@ -2417,7 +2474,7 @@ impl<B: Backend + 'static> Host<B> {
             .iter()
             .try_for_each(|dispatch| record_graph_dispatch(&mut graph, dispatch));
         let graph = match built {
-            Ok(()) => self.backend.prepare_graph(graph).map_err(guest_error),
+            Ok(()) => self.prepare_captured_graph(graph, &mut entry),
             Err(error) => Err(graph_error(&error)),
         };
         let graph = match graph {
@@ -4693,6 +4750,58 @@ mod tests {
     {
         let commands = host.command_list().unwrap();
         host.create_graph(commands).unwrap()
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn graph_creation_refuses_two_arenas_over_the_quota() {
+        let limits = Limits::new(80, 8, u64::MAX, 32, u64::MAX);
+        let mut host = Host::new(forja_metal::MetalBackend::new().unwrap(), limits);
+        host.backend.set_memory_limit(u64::MAX);
+        let input = host.alloc(compute::Dtype::F32, &[4]).unwrap();
+        let first = host.alloc(compute::Dtype::F32, &[4]).unwrap();
+        let second = host.alloc(compute::Dtype::F32, &[4]).unwrap();
+        let output = host.alloc(compute::Dtype::F32, &[4]).unwrap();
+        let final_output = host.alloc(compute::Dtype::F32, &[4]).unwrap();
+        let commands = host.command_list().unwrap();
+        host.dispatch(
+            &commands,
+            compute::Op::Copy,
+            &[Resource::new_borrow(input.rep())],
+            &Resource::new_borrow(first.rep()),
+        )
+        .unwrap();
+        host.dispatch(
+            &commands,
+            compute::Op::Copy,
+            &[Resource::new_borrow(first.rep())],
+            &Resource::new_borrow(second.rep()),
+        )
+        .unwrap();
+        host.dispatch(
+            &commands,
+            compute::Op::Add,
+            &[
+                Resource::new_borrow(first.rep()),
+                Resource::new_borrow(second.rep()),
+            ],
+            &Resource::new_borrow(output.rep()),
+        )
+        .unwrap();
+        host.dispatch(
+            &commands,
+            compute::Op::Copy,
+            &[Resource::new_borrow(second.rep())],
+            &Resource::new_borrow(final_output.rep()),
+        )
+        .unwrap();
+        host.drop_tensor(first).unwrap();
+        host.drop_tensor(second).unwrap();
+
+        assert!(matches!(
+            host.create_graph(commands),
+            Err(compute::Error::Quota(_))
+        ));
     }
 
     #[tokio::test(flavor = "multi_thread")]
