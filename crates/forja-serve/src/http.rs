@@ -272,12 +272,17 @@ async fn chat<S: ChatService>(
     tokio::spawn(async move {
         let _active = active;
         let _permit = permit;
-        let result = {
-            let mut service = state.service.lock().await;
-            let generation = service.complete(request, task_control.clone());
-            controlled_deadline(deadline, &task_control, generation).await
-        };
-        let _ = sender.send(result);
+        let mut service = state.service.lock().await;
+        let generation = service.complete(request, task_control.clone());
+        controlled_deadline(
+            deadline,
+            &task_control,
+            generation,
+            move |result| async move {
+                let _ = sender.send(result);
+            },
+        )
+        .await;
     });
     let mut disconnect = CancelOnDrop(Some(control));
     let Ok(result) = receiver.await else {
@@ -333,12 +338,17 @@ async fn text<S: ChatService>(
     tokio::spawn(async move {
         let _active = active;
         let _permit = permit;
-        let result = {
-            let mut service = state.service.lock().await;
-            let generation = service.complete_text(request, task_control.clone());
-            controlled_deadline(deadline, &task_control, generation).await
-        };
-        let _ = sender.send(result);
+        let mut service = state.service.lock().await;
+        let generation = service.complete_text(request, task_control.clone());
+        controlled_deadline(
+            deadline,
+            &task_control,
+            generation,
+            move |result| async move {
+                let _ = sender.send(result);
+            },
+        )
+        .await;
     });
     let mut disconnect = CancelOnDrop(Some(control));
     let Ok(result) = receiver.await else {
@@ -390,12 +400,12 @@ async fn stream_chat_response<S: ChatService>(
     tokio::spawn(async move {
         let _active = active;
         let _permit = permit;
-        let result = {
-            let mut service = state.service.lock().await;
-            let generation = service.stream_chat(request, sender.clone(), control.clone());
-            controlled_deadline(deadline, &control, generation).await
-        };
-        send_stream_error(result, &sender).await;
+        let mut service = state.service.lock().await;
+        let generation = service.stream_chat(request, sender.clone(), control.clone());
+        controlled_deadline(deadline, &control, generation, move |result| async move {
+            send_stream_error(result, &sender).await;
+        })
+        .await;
     });
     sse_response(receiver, id, created, model, true)
 }
@@ -425,12 +435,12 @@ async fn stream_text_response<S: ChatService>(
     tokio::spawn(async move {
         let _active = active;
         let _permit = permit;
-        let result = {
-            let mut service = state.service.lock().await;
-            let generation = service.stream_text(request, sender.clone(), control.clone());
-            controlled_deadline(deadline, &control, generation).await
-        };
-        send_stream_error(result, &sender).await;
+        let mut service = state.service.lock().await;
+        let generation = service.stream_text(request, sender.clone(), control.clone());
+        controlled_deadline(deadline, &control, generation, move |result| async move {
+            send_stream_error(result, &sender).await;
+        })
+        .await;
     });
     sse_response(receiver, id, created, model, false)
 }
@@ -450,13 +460,15 @@ impl Drop for CancelOnDrop {
     }
 }
 
-async fn controlled_deadline<T, F>(
+async fn controlled_deadline<T, F, N, NF>(
     deadline: tokio::time::Instant,
     control: &GenerationControl,
     future: F,
-) -> DeadlineResult<T>
-where
+    notify: N,
+) where
     F: Future<Output = Result<T, GenerationError>>,
+    N: FnOnce(DeadlineResult<T>) -> NF,
+    NF: Future<Output = ()>,
 {
     let timer = tokio::time::sleep_until(deadline);
     let mut future = std::pin::pin!(future);
@@ -472,11 +484,11 @@ where
     })
     .await;
     if let Some(result) = completed {
-        DeadlineResult::Completed(result)
+        notify(DeadlineResult::Completed(result)).await;
     } else {
         control.cancel();
+        notify(DeadlineResult::TimedOut).await;
         let _ = future.await;
-        DeadlineResult::TimedOut
     }
 }
 
@@ -787,6 +799,91 @@ mod tests {
         }
     }
 
+    struct DeadlineSmoke {
+        release: Arc<tokio::sync::Notify>,
+        block_next: bool,
+    }
+
+    impl ChatService for DeadlineSmoke {
+        fn model(&self) -> &'static str {
+            "smoke"
+        }
+
+        fn max_body_bytes(&self) -> usize {
+            1024
+        }
+
+        fn queue_length(&self) -> u32 {
+            1
+        }
+
+        fn request_deadline(&self) -> Duration {
+            Duration::from_millis(30)
+        }
+
+        fn write_stall_timeout(&self) -> Duration {
+            Duration::from_secs(1)
+        }
+
+        fn complete(
+            &mut self,
+            _: ChatCompletionRequest,
+            _: GenerationControl,
+        ) -> Pin<Box<dyn Future<Output = Result<Completion, GenerationError>> + Send + '_>>
+        {
+            let block = self.block_next;
+            self.block_next = false;
+            let release = Arc::clone(&self.release);
+            Box::pin(async move {
+                if block {
+                    release.notified().await;
+                }
+                Ok(Completion {
+                    text: "forged".to_owned(),
+                    finish_reason: FinishReason::Stop,
+                    usage: Usage {
+                        prompt_tokens: 4,
+                        completion_tokens: 1,
+                    },
+                })
+            })
+        }
+
+        fn complete_text(
+            &mut self,
+            _: CompletionRequest,
+            control: GenerationControl,
+        ) -> Pin<Box<dyn Future<Output = Result<Completion, GenerationError>> + Send + '_>>
+        {
+            self.complete(
+                ChatCompletionRequest {
+                    model: "smoke".to_owned(),
+                    messages: Vec::new(),
+                    params: crate::CompletionParams::default(),
+                },
+                control,
+            )
+        }
+
+        fn stream_chat(
+            &mut self,
+            _: ChatCompletionRequest,
+            _: mpsc::Sender<GenerationEvent>,
+            _: GenerationControl,
+        ) -> Pin<Box<dyn Future<Output = Result<(), GenerationError>> + Send + '_>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn stream_text(
+            &mut self,
+            _: CompletionRequest,
+            _: mpsc::Sender<GenerationEvent>,
+            _: GenerationControl,
+        ) -> Pin<Box<dyn Future<Output = Result<(), GenerationError>> + Send + '_>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
     #[tokio::test]
     async fn handles_one_chat_request() {
         let body = br#"{"model":"smoke","messages":[{"role":"user","content":"hi"}]}"#;
@@ -892,19 +989,67 @@ mod tests {
     async fn deadline_and_disconnect_cancel_idempotently() {
         let control = GenerationControl::new(Duration::from_secs(1));
         let observed = control.clone();
-        let result = controlled_deadline(tokio::time::Instant::now(), &control, async move {
-            while !observed.is_cancelled() {
-                tokio::task::yield_now().await;
-            }
-            Ok(())
-        })
+        let (sender, receiver) = oneshot::channel();
+        controlled_deadline(
+            tokio::time::Instant::now(),
+            &control,
+            async move {
+                while !observed.is_cancelled() {
+                    tokio::task::yield_now().await;
+                }
+                Ok(())
+            },
+            move |result| async move {
+                let _ = sender.send(matches!(result, DeadlineResult::TimedOut));
+            },
+        )
         .await;
-        assert!(matches!(result, DeadlineResult::TimedOut));
+        assert!(receiver.await.unwrap());
 
         let disconnected = GenerationControl::new(Duration::from_secs(1));
         drop(CancelOnDrop(Some(disconnected.clone())));
         drop(CancelOnDrop(Some(disconnected.clone())));
         assert!(disconnected.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn deadline_replies_before_finalization_and_retains_admission() {
+        let release = Arc::new(tokio::sync::Notify::new());
+        let state = Arc::new(HttpState {
+            model: "smoke".to_owned(),
+            service: Mutex::new(DeadlineSmoke {
+                release: Arc::clone(&release),
+                block_next: true,
+            }),
+            sequence: Arc::new(Semaphore::new(1)),
+            queued: AtomicU32::new(0),
+            queue_limit: 1,
+            deadline: Duration::from_millis(30),
+            write_stall_timeout: Duration::from_secs(1),
+            draining: std::sync::atomic::AtomicBool::new(false),
+            active: StdMutex::new(None),
+            drained: tokio::sync::Notify::new(),
+        });
+        let body = br#"{"model":"smoke","messages":[]}"#;
+        let started = tokio::time::Instant::now();
+
+        let first = chat::<DeadlineSmoke>(State(Arc::clone(&state)), request(body)).await;
+
+        assert_eq!(first.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert!(started.elapsed() < Duration::from_millis(250));
+        assert_eq!(state.sequence.available_permits(), 0);
+        let next = tokio::spawn(chat::<DeadlineSmoke>(
+            State(Arc::clone(&state)),
+            request(body),
+        ));
+        tokio::task::yield_now().await;
+        assert!(!next.is_finished());
+        release.notify_one();
+        let next = tokio::time::timeout(Duration::from_secs(1), next)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(next.status(), StatusCode::OK);
     }
 
     #[tokio::test]
