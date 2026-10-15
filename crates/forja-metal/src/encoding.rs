@@ -2698,7 +2698,7 @@ impl MetalBackend {
         bindings: &mut ArgumentBindings,
         arguments: &mut ArgumentWriter,
     ) -> Result<Vec<BufferBinding>, BackendError> {
-        let [left_tensor, right_tensor] = dispatch.inputs() else {
+        let [left_tensor, right_tensor] = dispatch.primitive_inputs() else {
             return Err(BackendError::InvalidInput);
         };
         let output_tensor = dispatch.output();
@@ -2754,10 +2754,14 @@ impl MetalBackend {
                     true,
                 )
             };
+        if let Some(layouts) = self.bind_epilogue_arguments(dispatch, table, bindings, arguments)? {
+            temporaries.push(layouts);
+        }
         let parameter_buffer = self.encode_matmul_kernel(
             encoder,
             table,
             Some(selected_variant(dispatch).ok_or(BackendError::InvalidInput)?),
+            dispatch.prepared_epilogue().map(AsRef::as_ref),
             &left,
             &right,
             &output,
@@ -2777,6 +2781,34 @@ impl MetalBackend {
             )?);
         }
         Ok(temporaries)
+    }
+
+    fn bind_epilogue_arguments(
+        &self,
+        dispatch: &Dispatch,
+        table: &ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>,
+        bindings: &mut ArgumentBindings,
+        arguments: &mut ArgumentWriter,
+    ) -> Result<Option<BufferBinding>, BackendError> {
+        if dispatch.prepared_epilogue().is_none() {
+            return Ok(None);
+        }
+        let extras = &dispatch.inputs()[dispatch.primitive_inputs().len()..];
+        if extras.len() > epilogue_codegen::EXTRA_CAPACITY {
+            return Err(BackendError::InvalidInput);
+        }
+        let mut layouts = Vec::with_capacity(extras.len().saturating_mul(112));
+        for (slot, extra) in extras.iter().enumerate() {
+            let extra = self.encoder_tensor(extra)?;
+            bindings.bind(table, 16 + slot, &extra.buffer);
+            layouts.extend_from_slice(&encode_layout(&extra.layout)?);
+        }
+        if layouts.is_empty() {
+            return Ok(None);
+        }
+        let layouts = arguments.write(&layouts)?;
+        bindings.bind(table, 23, &layouts);
+        Ok(Some(layouts))
     }
 
     fn encode_gather_matmul(
@@ -4163,6 +4195,7 @@ impl MetalBackend {
                 encoder,
                 table,
                 None,
+                None,
                 &left,
                 &right,
                 &PreparedMatmulOutput {
@@ -4253,6 +4286,7 @@ impl MetalBackend {
                 encoder,
                 table,
                 None,
+                None,
                 &left,
                 &right,
                 &prepared_output,
@@ -4337,6 +4371,7 @@ impl MetalBackend {
         encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
         table: &ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>,
         selected: Option<MetalVariant>,
+        epilogue: Option<&PreparedEpilogue>,
         left: &PreparedMatmulInput,
         right: &PreparedMatmulInput,
         output: &PreparedMatmulOutput,
@@ -4377,7 +4412,7 @@ impl MetalBackend {
             inner,
             left.column_major,
             right.column_major,
-            0,
+            batch,
         ] {
             params.extend_from_slice(&value.to_ne_bytes());
         }
@@ -4393,7 +4428,7 @@ impl MetalBackend {
             left_column_major: left.column_major != 0,
             right_column_major: right.column_major != 0,
         };
-        let launch = self.matmul_launch(shape, selected)?;
+        let launch = self.matmul_launch(shape, selected, epilogue)?;
         log_matmul_route(left, right, output, &launch, shape);
         set_pipeline(encoder, &launch.pipeline);
         bindings.bind(table, 0, &left.tensor.buffer);
@@ -4473,6 +4508,7 @@ impl MetalBackend {
         &self,
         shape: MatmulShape,
         selected: Option<MetalVariant>,
+        epilogue: Option<&PreparedEpilogue>,
     ) -> Result<MatmulLaunch, BackendError> {
         let (kernel, block_rows, block_columns, thread_count, constants) =
             if shape.rows == 1 && selected != Some(MetalVariant::MatmulPortable) {
@@ -4539,11 +4575,20 @@ impl MetalBackend {
                     ],
                 )
             };
-        let pipeline = self
+        let mut pipelines = self
             .pipelines
             .lock()
-            .map_err(|_| BackendError::ExecutionFailed)?
-            .get(kernel, &constants)?;
+            .map_err(|_| BackendError::ExecutionFailed)?;
+        let pipeline = if let Some(epilogue) = epilogue {
+            pipelines.get_epilogue(
+                epilogue_codegen::FamilySourceTag::Dense,
+                epilogue,
+                kernel,
+                &constants,
+            )?
+        } else {
+            pipelines.get(kernel, &constants)?
+        };
         Ok(MatmulLaunch {
             pipeline,
             kernel,
@@ -5959,11 +6004,18 @@ impl MetalBackend {
         dispatch: &Dispatch,
         arguments: &mut ArgumentSizer,
     ) -> Result<(), BackendError> {
-        let [left, right] = dispatch.inputs() else {
+        let [left, right] = dispatch.primitive_inputs() else {
             return Err(BackendError::InvalidInput);
         };
         Self::size_prepared_matmul_input(left.layout(), arguments)?;
         Self::size_prepared_matmul_input(right.layout(), arguments)?;
+        let extra_count = dispatch
+            .inputs()
+            .len()
+            .saturating_sub(dispatch.primitive_inputs().len());
+        if extra_count > 0 {
+            arguments.write(extra_count.saturating_mul(112))?;
+        }
         arguments.write(96)?;
         if classify(dispatch.output().layout())
             .kernel_strides()
@@ -6311,6 +6363,14 @@ fn shape3(layout: &Layout) -> Result<[u32; 3], BackendError> {
 }
 
 fn supported_dispatch(dispatch: &Dispatch) -> bool {
+    if dispatch.prepared_epilogue().is_some()
+        && !matches!(
+            selected_variant(dispatch),
+            Some(MetalVariant::MatmulGemv | MetalVariant::MatmulGemvTransposed)
+        )
+    {
+        return false;
+    }
     match dispatch.op() {
         Op::Program(_) => dispatch.bound_program().is_some(),
         Op::Copy
@@ -7082,7 +7142,6 @@ impl PipelineCache {
         Ok(pipeline)
     }
 
-    #[allow(dead_code)]
     fn get_epilogue(
         &mut self,
         family: epilogue_codegen::FamilySourceTag,
@@ -7256,12 +7315,15 @@ mod tests {
         Affine, Backend, BackendDispatchData, CommandList, DType, GraphLimits, Op, ParamSpace,
         Slice, Submission, SymbolicLayout, TemplateTensor, ViewOp,
         program::{
-            BinOp, BoundProgram, Inst, KernelSignature, Program, ProgramKind, RedOp,
-            ValidatedProgram, bind_program, prepare_program,
+            BinOp, BoundProgram, EpilogueSignature, Inst, KernelSignature, Program, ProgramKind,
+            RedOp, ValidatedProgram, bind_program, prepare_epilogue, prepare_program,
         },
     };
     use forja_cpu::CpuBackend;
-    use forja_testing::{TensorSpec, assert_backends_agree, assert_outputs_agree};
+    use forja_testing::{
+        DifferentialComparison, TensorSpec, assert_backends_agree, assert_fused_decomposed,
+        assert_outputs_agree,
+    };
 
     use super::*;
 
@@ -8887,6 +8949,170 @@ mod tests {
             state.last_submit,
             state.last_wait,
         );
+    }
+
+    #[test]
+    fn metal_dense_gemv_epilogues_match_decomposed_bias_and_residual() {
+        for (variant, transposed, broadcast) in [
+            ("matmul.gemv", false, true),
+            ("matmul.gemv-transposed", true, false),
+        ] {
+            assert_dense_epilogue(variant, transposed, broadcast);
+        }
+    }
+
+    #[test]
+    fn metal_unspliced_epilogue_variant_is_refused() {
+        let backend = MetalBackend::new().unwrap();
+        let left = backend.alloc(DType::F32, &[7, 33]).unwrap();
+        let right = backend.alloc(DType::F32, &[33, 17]).unwrap();
+        let output = backend.alloc(DType::F32, &[7, 17]).unwrap();
+        let program = Program {
+            kind: ProgramKind::Map,
+            insts: vec![Inst::Input(0)],
+            outputs: vec![(0, 0)],
+        }
+        .validate()
+        .unwrap();
+        let epilogue = prepare_epilogue(
+            program,
+            EpilogueSignature::new(1, 2, Vec::new(), DType::F32),
+        )
+        .unwrap();
+        let mut commands = CommandList::new();
+        commands
+            .dispatch_epilogue(Op::Matmul, &[&left, &right], &output, &epilogue, &[])
+            .unwrap();
+        assert!(matches!(
+            backend.submit(commands),
+            Err(BackendError::UnsupportedOperation)
+        ));
+    }
+
+    fn assert_dense_epilogue(variant: &str, transposed: bool, broadcast: bool) {
+        let backend = MetalBackend::new().unwrap();
+        let left = backend.alloc(DType::F32, &[1, 33]).unwrap();
+        let right_storage = backend
+            .alloc(DType::F32, if transposed { &[17, 33] } else { &[33, 17] })
+            .unwrap();
+        let right = if transposed {
+            backend
+                .view(&right_storage, ViewOp::Permute(vec![1, 0]))
+                .unwrap()
+        } else {
+            right_storage.clone()
+        };
+        let extra_storage = backend
+            .alloc(DType::F32, if broadcast { &[17] } else { &[1, 17] })
+            .unwrap();
+        let extra = if broadcast {
+            backend
+                .view(&extra_storage, ViewOp::Broadcast(vec![1, 17]))
+                .unwrap()
+        } else {
+            extra_storage.clone()
+        };
+        backend.write(&left, &f32_pattern(33, 19)).unwrap();
+        backend
+            .write(&right_storage, &f32_pattern(33 * 17, 23))
+            .unwrap();
+        backend.write(&extra_storage, &f32_pattern(17, 11)).unwrap();
+        let fused_output = backend.alloc(DType::F32, &[1, 17]).unwrap();
+        let decomposed_output = backend.alloc(DType::F32, &[1, 17]).unwrap();
+        let accumulator = backend.alloc(DType::F32, &[1, 17]).unwrap();
+        let program = add_program();
+        let epilogue = prepare_epilogue(
+            program.clone(),
+            EpilogueSignature::new(1, 2, vec![DType::F32], DType::F32),
+        )
+        .unwrap();
+        let map = prepare_program(
+            &backend,
+            program,
+            KernelSignature::new(2, vec![DType::F32, DType::F32], vec![DType::F32], 0),
+        )
+        .unwrap();
+        let selection = backend
+            .validate_variant_for_op(Op::Matmul, &[&left, &right], &[&fused_output], variant)
+            .unwrap();
+
+        let mut fused = CommandList::new();
+        fused
+            .dispatch_epilogue(
+                Op::Matmul,
+                &[&left, &right],
+                &fused_output,
+                &epilogue,
+                &[&extra],
+            )
+            .unwrap();
+        assert!(fused.set_last_backend_data(BackendDispatchData::new(selection)));
+        let mut template =
+            GraphTemplate::new(ParamSpace::new(Vec::new()).unwrap(), GraphLimits::default());
+        template
+            .record_validated(fused.last_dispatch().unwrap().clone())
+            .unwrap();
+        let graph = backend.prepare_graph(template).unwrap();
+        {
+            let pipelines = backend.pipelines.lock().unwrap();
+            assert_eq!(pipelines.epilogue_libraries.len(), 1);
+            assert_eq!(pipelines.epilogue_pipelines.len(), 1);
+        }
+        drop(graph);
+        let fused_again = fused.clone();
+        let mut decomposed = CommandList::new();
+        decomposed
+            .dispatch(Op::Matmul, &[&left, &right], &accumulator)
+            .unwrap();
+        assert!(decomposed.set_last_backend_data(BackendDispatchData::new(selection)));
+        decomposed
+            .dispatch_kernel(&map, &[&accumulator, &extra], &[&decomposed_output])
+            .unwrap();
+        assert_fused_decomposed(
+            &backend,
+            fused,
+            &fused_output,
+            decomposed,
+            &decomposed_output,
+            DifferentialComparison::Exact,
+        )
+        .unwrap();
+        let profiled = backend.submit_profiled(fused_again).unwrap();
+        profiled.wait().unwrap();
+        let profile = profiled.profile().unwrap();
+        assert_eq!(profile.epilogue_library_compilations, 1);
+        assert_eq!(profile.epilogue_pipeline_specializations, 1);
+        assert_eq!(profile.epilogue_cache_hits, 2);
+        assert_eq!(profile.epilogue_compile_fallbacks, 0);
+        let pipelines = backend.pipelines.lock().unwrap();
+        assert_eq!(pipelines.epilogue_libraries.len(), 1);
+        assert_eq!(pipelines.epilogue_pipelines.len(), 1);
+        assert_eq!(pipelines.epilogue_counts, EpilogueCompileCounts::default());
+    }
+
+    fn f32_pattern(count: usize, modulus: u16) -> Vec<u8> {
+        (0..count)
+            .flat_map(|index| {
+                let value = f32::from(u16::try_from(index % usize::from(modulus)).unwrap())
+                    / f32::from(modulus)
+                    - 0.5;
+                value.to_ne_bytes()
+            })
+            .collect()
+    }
+
+    fn add_program() -> ValidatedProgram {
+        Program {
+            kind: ProgramKind::Map,
+            insts: vec![
+                Inst::Input(0),
+                Inst::Input(1),
+                Inst::Binary(BinOp::Add, 0, 1),
+            ],
+            outputs: vec![(0, 2)],
+        }
+        .validate()
+        .unwrap()
     }
 
     #[test]

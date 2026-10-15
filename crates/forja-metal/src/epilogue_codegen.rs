@@ -369,4 +369,21 @@ mod tests {
         );
     }
 
+    #[test]
+    fn dense_splices_are_after_reductions_and_inside_edges() {
+        let source = generate_source(&bias_epilogue()).unwrap();
+        for kernel in ["kernel void gemv(", "kernel void gemv_transposed("] {
+            let start = source.find(kernel).unwrap();
+            let body = &source[start..];
+            let next = body[1..]
+                .find("kernel void ")
+                .map_or(body.len(), |offset| offset + 1);
+            let body = &body[..next];
+            let call = body.rfind("forja_epilogue(").unwrap();
+            let reduction = body.rfind("simd_sum(").unwrap();
+            let edge = body[..call].rfind("if (column < params.n)").unwrap();
+            let store = body[call..].find("store_float(").unwrap() + call;
+            assert!(reduction < edge && edge < call && call < store);
+        }
+    }
 }

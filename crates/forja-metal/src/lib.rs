@@ -4,7 +4,6 @@
 #[cfg(target_os = "macos")]
 mod encoding;
 #[cfg(target_os = "macos")]
-#[allow(dead_code)]
 mod epilogue_codegen;
 #[cfg(target_os = "macos")]
 mod map_codegen;

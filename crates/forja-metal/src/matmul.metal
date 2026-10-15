@@ -20,7 +20,7 @@ struct MatmulParams {
     uint k;
     uint a_column_major;
     uint b_column_major;
-    uint padding;
+    uint batch;
 };
 
 template <int block_rows, int block_columns, int block_inner,
@@ -102,6 +102,7 @@ kernel void gemv(
     device const uchar *b [[buffer(1)]],
     device uchar *d [[buffer(2)]],
     constant MatmulParams &params [[buffer(3)]],
+    FORJA_EPILOGUE_ARGUMENTS
     ushort lane [[thread_index_in_simdgroup]],
     uint3 tile [[threadgroup_position_in_grid]]) {
     ulong a_base = params.a_offset + ulong(tile.z) * params.batch_stride_a;
@@ -131,7 +132,11 @@ kernel void gemv(
         for (uint element = 0; element < 4; ++element) {
             uint column = tile.x * 4 + element;
             if (column < params.n) {
-                store_float(d, d_base + ulong(column), output_dtype, sums[element]);
+                float value = forja_epilogue(
+                    sums[element], 0.0f,
+                    tile.z, 0, column, params.batch, params.m, params.n,
+                    FORJA_EPILOGUE_VALUES);
+                store_float(d, d_base + ulong(column), output_dtype, value);
             }
         }
     }
@@ -142,6 +147,7 @@ kernel void gemv_transposed(
     device const uchar *b [[buffer(1)]],
     device uchar *d [[buffer(2)]],
     constant MatmulParams &params [[buffer(3)]],
+    FORJA_EPILOGUE_ARGUMENTS
     ushort simdgroup [[simdgroup_index_in_threadgroup]],
     ushort lane [[thread_index_in_simdgroup]],
     uint3 tile [[threadgroup_position_in_grid]]) {
@@ -178,7 +184,11 @@ kernel void gemv_transposed(
         for (uint row = 0; row < 4; ++row) {
             uint column = first_column + row;
             if (column < params.n) {
-                store_float(d, d_base + column, output_dtype, sums[row]);
+                float value = forja_epilogue(
+                    sums[row], 0.0f,
+                    tile.z, 0, column, params.batch, params.m, params.n,
+                    FORJA_EPILOGUE_VALUES);
+                store_float(d, d_base + column, output_dtype, value);
             }
         }
     }
