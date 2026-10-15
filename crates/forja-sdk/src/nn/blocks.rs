@@ -13,7 +13,6 @@ use super::ops::{qkv_rope_cache_into, sdpa, sdpa_into, sdpa_into_with};
 pub const DEFAULT_PREFILL_CHUNK: u32 = 512;
 
 const MIN_PREFILL_BUCKET: u32 = 16;
-const PREFILL_REPLAYS_PER_GRAPH: u32 = 2;
 const QK_HEAD_DIM: f32 = 128.0;
 const QK_RMS_EPSILON: f32 = 1.0e-6;
 
@@ -190,12 +189,12 @@ pub struct ChunkedPrefill<T: Element> {
     max_context: u32,
     chunk: u32,
     tokens: Tensor<u32>,
-    slots: Vec<Option<CapturedPrefill<T>>>,
+    full: Option<CapturedPrefill<T>>,
     tails: Vec<PrefillTail<T>>,
 }
 
 impl<T: Element> ChunkedPrefill<T> {
-    /// Allocates a retained token buffer and bounded replay slots for each chunk.
+    /// Allocates a retained token buffer and one replay graph slot per chunk shape.
     ///
     /// # Errors
     ///
@@ -210,9 +209,6 @@ impl<T: Element> ChunkedPrefill<T> {
                 "prefill chunk must be a power of two from 16 through 512 within the context",
             ));
         }
-        let slot_count = max_context
-            .div_ceil(chunk)
-            .div_ceil(PREFILL_REPLAYS_PER_GRAPH);
         let mut tails = Vec::new();
         let mut size = MIN_PREFILL_BUCKET;
         while size < chunk {
@@ -228,7 +224,7 @@ impl<T: Element> ChunkedPrefill<T> {
             max_context,
             chunk,
             tokens: Tensor::zeros(&[max_context])?,
-            slots: (0..slot_count).map(|_| None).collect(),
+            full: None,
             tails,
         })
     }
@@ -242,7 +238,7 @@ impl<T: Element> ChunkedPrefill<T> {
                 .is_some_and(|end| end <= self.max_context)
     }
 
-    /// Writes the prompt once and replays each chunk, capturing missing slots on first use.
+    /// Writes the prompt once and replays one graph for every chunk of the same shape.
     ///
     /// Capture is lazy: the first use records one graph for the entire bucket.
     /// Padding follows real tokens, so causal attention and per-token `MoE` routing
@@ -277,12 +273,9 @@ impl<T: Element> ChunkedPrefill<T> {
         let mut consumed = 0_u32;
         let mut position = start;
         let mut result = None;
-        for (slot_index, (real, bucket_size)) in plan.into_iter().enumerate() {
+        for (real, bucket_size) in plan {
             let captured = if bucket_size == self.chunk {
-                let slot_index = slot_index % self.slots.len();
-                self.slots
-                    .get_mut(slot_index)
-                    .ok_or_else(|| Error::loading("prefill slot was not allocated"))?
+                &mut self.full
             } else {
                 &mut self
                     .tails
@@ -318,7 +311,7 @@ impl<T: Element> ChunkedPrefill<T> {
             }
             let graph = &captured
                 .as_ref()
-                .ok_or_else(|| Error::loading("prefill slot was not captured"))?
+                .ok_or_else(|| Error::loading("prefill graph was not captured"))?
                 .graph;
             graph.replay(&[position, real - 1])?;
             result = Some(graph.result().alias()?);

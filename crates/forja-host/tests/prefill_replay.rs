@@ -120,6 +120,55 @@ async fn metal_qwen3_coder_prefill_replay_matches_lazy() -> Result<(), Box<dyn E
     .await
 }
 
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[ignore = "requires FORJA_MODELS and runs in the pre-push hook"]
+async fn metal_qwen3_coder_reuses_prefill_graph_across_offsets() -> Result<(), Box<dyn Error>> {
+    let component = test_guests::qwen3_coder();
+    let weights =
+        model_root()?.join("Qwen3-Coder-30B-A3B-Instruct-4bit/model.safetensors.index.json");
+    let load_config = common::load_config(component)?;
+    let mut lazy_config = load_config.clone();
+    lazy_config.replay = false;
+    let mut replay = EngineRunner::new(
+        component,
+        forja_metal::MetalBackend::with_graph_replay(forja_metal::MetalGraphReplay::Tier2)?,
+        LIMITS,
+        &weights,
+    )
+    .await?;
+    let mut lazy = EngineRunner::new(
+        component,
+        forja_metal::MetalBackend::new()?,
+        LIMITS,
+        &weights,
+    )
+    .await?;
+    replay.load_with_selections(Some(1), &load_config).await??;
+    lazy.load_with_selections(Some(1), &lazy_config).await??;
+
+    for offset in [0, 512, 4_096, 32_256] {
+        let tokens = (0..512)
+            .map(|index| (index + offset) % qwen3_coder::VOCAB)
+            .collect::<Vec<_>>();
+        let input = EngineDecode {
+            tokens: Some(tokens),
+            start_pos: offset,
+            sampling: SamplingParams::default(),
+        };
+        let replay_output = replay.decode(input.clone()).await??;
+        let lazy_output = lazy.decode(input).await??;
+        assert_eq!(
+            read_decode_output(&mut replay, &replay_output).await?,
+            read_decode_output(&mut lazy, &lazy_output).await?,
+            "prefill differed at offset {offset}"
+        );
+        assert_eq!(replay.metrics().live_graphs, 1);
+    }
+    assert!(replay.metrics().live_graphs <= 16);
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn compare_prefill<B>(
     replay_component: &Path,
