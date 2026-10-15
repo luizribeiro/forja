@@ -21,7 +21,7 @@ Accepted pp512/tg128 results use 30 measured repetitions on an 80-core Apple M3 
 | --- | --- | ---: | ---: |
 | f32 | GPU sequential | 4443.06 | 98.63 |
 | f32 | GPU pipelined | 4428.78 | 120.63 |
-| bf16 | GPU sequential | 5520.28 | 110.17 |
-| bf16 | GPU pipelined | 5539.65 | 141.23 |
+| bf16 | GPU sequential | 5518.63 | 105.99 |
+| bf16 | GPU pipelined | 5473.33 | 139.35 |
 
 The complete confidence intervals and provenance are in each profile's `bench` directory.
