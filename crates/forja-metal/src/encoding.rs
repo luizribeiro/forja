@@ -8867,6 +8867,34 @@ mod tests {
         assert_sdpa(op, query, key, value, output);
     }
 
+    fn patterned_bf16(count: usize, modulus: u16) -> Vec<u8> {
+        (0..count)
+            .flat_map(|index| {
+                let value = f32::from(u16::try_from(index % usize::from(modulus)).unwrap())
+                    / f32::from(modulus)
+                    - 0.5;
+                u16::try_from(value.to_bits() >> 16).unwrap().to_le_bytes()
+            })
+            .collect()
+    }
+
+    fn run_sdpa_kernel(
+        backend: &MetalBackend,
+        kernel: SdpaKernel,
+        op: Op,
+        inputs: &[&Tensor],
+        output: &Tensor,
+    ) -> Vec<u8> {
+        let mut commands = CommandList::new();
+        commands.dispatch(op, inputs, output).unwrap();
+        let submission = {
+            let _override = SdpaOverride::set(kernel);
+            backend.submit(commands).unwrap()
+        };
+        submission.wait().unwrap();
+        backend.read(output).unwrap()
+    }
+
     #[test]
     fn metal_decomposed_attention_matches_hand_sized_cases() {
         assert_sdpa_with(
@@ -9235,6 +9263,77 @@ mod tests {
             TensorSpec::contiguous(DType::F32, &[2, 33, 64]),
             &TensorSpec::contiguous(DType::F32, &[4, 1, 64]),
         );
+    }
+
+    #[test]
+    fn metal_steel_attention_matches_decomposed_at_long_offsets() {
+        const WIDTH: u32 = 128;
+        const QUERY_HEADS: u32 = 16;
+        const KV_HEADS: u32 = 8;
+        const MAX_KEY_LENGTH: u32 = 32_767;
+
+        let backend = MetalBackend::new().unwrap();
+        let key_cache = backend
+            .alloc(DType::BF16, &[KV_HEADS, MAX_KEY_LENGTH, WIDTH])
+            .unwrap();
+        let value_cache = backend
+            .alloc(DType::BF16, &[KV_HEADS, MAX_KEY_LENGTH, WIDTH])
+            .unwrap();
+        let cache_elements = usize::try_from(KV_HEADS * MAX_KEY_LENGTH * WIDTH).unwrap();
+        backend
+            .write(&key_cache, &patterned_bf16(cache_elements, 31))
+            .unwrap();
+        backend
+            .write(&value_cache, &patterned_bf16(cache_elements, 37))
+            .unwrap();
+
+        for (offset, chunk) in [(0, 1), (511, 7), (4_097, 33), (32_255, 512)] {
+            let key_length = offset + chunk;
+            let cache_slice = ViewOp::Slice(vec![
+                Slice::new(0, KV_HEADS, 1).unwrap(),
+                Slice::new(0, key_length, 1).unwrap(),
+                Slice::new(0, WIDTH, 1).unwrap(),
+            ]);
+            let key = backend.view(&key_cache, cache_slice.clone()).unwrap();
+            let value = backend.view(&value_cache, cache_slice).unwrap();
+            let query = backend
+                .alloc(DType::BF16, &[QUERY_HEADS, chunk, WIDTH])
+                .unwrap();
+            let query_elements = usize::try_from(QUERY_HEADS * chunk * WIDTH).unwrap();
+            backend
+                .write(&query, &patterned_bf16(query_elements, 29))
+                .unwrap();
+            let steel = backend
+                .alloc(DType::BF16, &[QUERY_HEADS, chunk, WIDTH])
+                .unwrap();
+            let decomposed = backend
+                .alloc(DType::BF16, &[QUERY_HEADS, chunk, WIDTH])
+                .unwrap();
+            let op = Op::Sdpa {
+                scale: 128.0_f32.sqrt().recip(),
+                causal: true,
+                q_start: offset,
+            };
+
+            let steel_bytes = run_sdpa_kernel(
+                &backend,
+                SdpaKernel::Steel,
+                op,
+                &[&query, &key, &value],
+                &steel,
+            );
+            let decomposed_bytes = run_sdpa_kernel(
+                &backend,
+                SdpaKernel::Decomposed,
+                op,
+                &[&query, &key, &value],
+                &decomposed,
+            );
+            assert_outputs_agree(DType::BF16, &decomposed_bytes, &steel_bytes).unwrap();
+            backend.release(&query).unwrap();
+            backend.release(&steel).unwrap();
+            backend.release(&decomposed).unwrap();
+        }
     }
 
     #[test]
