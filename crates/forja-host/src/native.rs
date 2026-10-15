@@ -404,6 +404,30 @@ impl NativeCommandList<forja_metal::MetalBackend> {
             .extend(outputs.iter().map(|tensor| (*tensor).clone()));
         Ok(())
     }
+
+    /// Selects a fixed Metal algorithm for the last epilogue-bearing dispatch.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when there is no epilogue dispatch or the variant is refused.
+    pub fn select_epilogue_variant(&mut self, name: &str) -> Result<(), BackendError> {
+        let dispatch = self
+            .commands
+            .last_dispatch()
+            .filter(|dispatch| dispatch.prepared_epilogue().is_some())
+            .ok_or(BackendError::InvalidInput)?;
+        let variant = self
+            .backend
+            .validate_variant(dispatch, name)
+            .map_err(|_| BackendError::InvalidInput)?;
+        if !self
+            .commands
+            .set_last_backend_data(forja_core::BackendDispatchData::new(variant))
+        {
+            return Err(BackendError::ExecutionFailed);
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
