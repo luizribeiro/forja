@@ -149,6 +149,7 @@ fn resolve(
     max_context: u32,
     max_output_tokens: u32,
 ) -> Result<ResolvedParams, ValidationError> {
+    reject_unsupported(params)?;
     if params.max_tokens.is_some() && params.max_completion_tokens.is_some() {
         return invalid("max_tokens and max_completion_tokens conflict");
     }
@@ -183,6 +184,32 @@ fn resolve(
         stops: normalize_stops(params.stop.as_ref()),
         stream: params.stream,
     })
+}
+
+fn reject_unsupported(params: &CompletionParams) -> Result<(), ValidationError> {
+    let unsupported = params.n.is_some_and(|value| value != 1)
+        || params.presence_penalty.is_some_and(|value| value != 0.0)
+        || params.frequency_penalty.is_some_and(|value| value != 0.0)
+        || params
+            .repetition_penalty
+            .is_some_and(|value| value.to_bits() != 1.0_f32.to_bits())
+        || params.logprobs == Some(true)
+        || params.top_logprobs.is_some_and(|value| value != 0)
+        || params
+            .logit_bias
+            .as_ref()
+            .is_some_and(|value| !value.is_empty())
+        || params.best_of.is_some_and(|value| value != 1)
+        || params.echo == Some(true)
+        || params.suffix.is_some()
+        || params.tools.as_ref().is_some_and(|value| !value.is_empty())
+        || params.tool_choice.is_some()
+        || params.response_format.is_some();
+    if unsupported {
+        invalid("request contains an unsupported non-default field")
+    } else {
+        Ok(())
+    }
 }
 
 #[cfg_attr(
@@ -274,5 +301,31 @@ mod tests {
         };
         let resolved = resolve(&CompletionParams::default(), &defaults, 1, 32_768, 8_192).unwrap();
         assert_eq!(resolved.temperature.to_bits(), 0.0_f32.to_bits());
+    }
+
+    #[test]
+    fn nondefault_completion_count_is_rejected() {
+        let params = CompletionParams {
+            n: Some(2),
+            ..CompletionParams::default()
+        };
+        let error = resolve(&params, &GenerationConfig::default(), 1, 32_768, 8_192).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "request contains an unsupported non-default field"
+        );
+    }
+
+    #[test]
+    fn nondefault_repetition_penalty_is_rejected() {
+        let params = CompletionParams {
+            repetition_penalty: Some(1.05),
+            ..CompletionParams::default()
+        };
+        let error = resolve(&params, &GenerationConfig::default(), 1, 32_768, 8_192).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "request contains an unsupported non-default field"
+        );
     }
 }
