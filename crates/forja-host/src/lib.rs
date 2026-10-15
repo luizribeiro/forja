@@ -967,6 +967,12 @@ where
         self.store.data().engine_metrics()
     }
 
+    /// Returns memory currently attributed to this engine runner.
+    #[must_use]
+    pub fn memory_usage(&self) -> EngineMemory {
+        self.store.data().engine_memory()
+    }
+
     /// Waits until the requested number of backend submissions has completed successfully.
     ///
     /// # Errors
@@ -1641,6 +1647,22 @@ impl<B: Backend + 'static> Host<B> {
         }
     }
 
+    fn engine_memory(&self) -> EngineMemory {
+        let MemoryUsage {
+            charged_bytes,
+            device_bytes,
+            physical_footprint,
+            peak_physical_footprint,
+        } = self.backend.memory_usage();
+        EngineMemory {
+            live_bytes: self.live_bytes.load(Ordering::Acquire),
+            charged_bytes,
+            device_bytes,
+            physical_footprint,
+            peak_physical_footprint,
+        }
+    }
+
     fn begin_profile_step(&mut self) {
         self.active_profile = Some(Arc::new(Mutex::new(EngineStepProfile::default())));
     }
@@ -1650,19 +1672,7 @@ impl<B: Backend + 'static> Host<B> {
         let mut profile = profile.lock().ok()?.clone();
         profile.wall_time = wall_time;
         profile.guest_time = wall_time.saturating_sub(profile.imports.total_time());
-        let MemoryUsage {
-            charged_bytes,
-            device_bytes,
-            physical_footprint,
-            peak_physical_footprint,
-        } = self.backend.memory_usage();
-        profile.memory = EngineMemory {
-            live_bytes: self.live_bytes.load(Ordering::Acquire),
-            charged_bytes,
-            device_bytes,
-            physical_footprint,
-            peak_physical_footprint,
-        };
+        profile.memory = self.engine_memory();
         Some(profile)
     }
 

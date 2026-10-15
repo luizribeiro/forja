@@ -75,6 +75,15 @@ struct ProfileReport {
     gpu_by_dispatch: Vec<DispatchProfile>,
 }
 
+struct BenchMeasurement {
+    pp: Summary,
+    tg: Summary,
+    device: String,
+    profiles: Vec<ProfileMeasurement>,
+    output_digest: String,
+    peak_footprint: u64,
+}
+
 struct Acceptance {
     profile_path: PathBuf,
     profile_name: String,
@@ -868,8 +877,14 @@ async fn measure_points(
             for &strategy in &point.selection {
                 let (host_argmax, overlap) = selection_mode(strategy);
                 let selection = selection_name(strategy);
-                let (pp, tg, device, profiles, output_digest) =
-                    bench_engine(options, point, component, host_argmax, overlap).await?;
+                let BenchMeasurement {
+                    pp,
+                    tg,
+                    device,
+                    profiles,
+                    output_digest,
+                    peak_footprint,
+                } = bench_engine(options, point, component, host_argmax, overlap).await?;
                 if record_device.as_ref().is_some_and(|known| known != &device) {
                     return Err("benchmark engines opened different Metal devices".into());
                 }
@@ -888,6 +903,7 @@ async fn measure_points(
                     "point": point.values,
                     "perf_hash": perf_hashes[point_index][input],
                     "output_digest": output_digest,
+                    "peak_physical_footprint_bytes": peak_footprint,
                     "selection": selection,
                     "pp": summary_json(pp),
                     "tg": summary_json(tg),
@@ -971,18 +987,23 @@ fn sampling_params(point: &BenchPoint) -> SamplingParams {
 }
 
 #[cfg(target_os = "macos")]
+fn decode_options(point: &BenchPoint, host_argmax: bool, overlap: bool) -> DecodeOptions {
+    DecodeOptions {
+        host_argmax,
+        overlap,
+        sampling: sampling_params(point),
+    }
+}
+
+#[cfg(target_os = "macos")]
 async fn bench_engine(
     options: &Bench,
     point: &BenchPoint,
     component: &Path,
     host_argmax: bool,
     overlap: bool,
-) -> Result<(Summary, Summary, String, Vec<ProfileMeasurement>, String), Box<dyn Error>> {
-    let decode = DecodeOptions {
-        host_argmax,
-        overlap,
-        sampling: sampling_params(point),
-    };
+) -> Result<BenchMeasurement, Box<dyn Error>> {
+    let decode = decode_options(point, host_argmax, overlap);
     let backend =
         forja_metal::MetalBackend::with_graph_replay(metal_graph_replay(point.graph_replay))?;
     let device = backend.device_name();
@@ -1062,20 +1083,36 @@ async fn bench_engine(
     } else {
         Vec::new()
     };
-    let output_digest = probe_output(
+    let (output_digest, peak_footprint) = benchmark_output(
         &mut runner,
         &tokens[..options.decode_prefill],
         point.tg,
         decode.sampling,
     )
     .await?;
-    Ok((
-        summarize(&pp, point.pp)?,
-        summarize(&tg, point.tg)?,
+    Ok(BenchMeasurement {
+        pp: summarize(&pp, point.pp)?,
+        tg: summarize(&tg, point.tg)?,
         device,
         profiles,
         output_digest,
-    ))
+        peak_footprint,
+    })
+}
+
+#[cfg(target_os = "macos")]
+async fn benchmark_output(
+    runner: &mut EngineRunner<forja_metal::MetalBackend>,
+    prompt: &[u32],
+    steps: usize,
+    sampling: SamplingParams,
+) -> Result<(String, u64), Box<dyn Error>> {
+    let digest = probe_output(runner, prompt, steps, sampling).await?;
+    let peak = runner
+        .memory_usage()
+        .peak_physical_footprint
+        .ok_or("peak physical footprint is unavailable")?;
+    Ok((digest, peak))
 }
 
 #[cfg(target_os = "macos")]
@@ -2348,6 +2385,7 @@ mod tests {
             "results": [{
                 "input": 0,
                 "output_digest": "sha256:output",
+                "peak_physical_footprint_bytes": 4096,
                 "pp": {"tokens_per_second": {"wall": {"median": 10.0}}},
                 "sampling_fallbacks": [{
                     "context_start": 33,
@@ -2359,6 +2397,7 @@ mod tests {
         let slim = slim_record(&report);
         assert_eq!(slim["schema_version"], 2);
         assert_eq!(slim["results"][0]["output_digest"], "sha256:output");
+        assert_eq!(slim["results"][0]["peak_physical_footprint_bytes"], 4096);
         assert_eq!(
             slim["results"][0]["sampling_fallbacks"][0]["count_per_token"]["median"],
             1.0
