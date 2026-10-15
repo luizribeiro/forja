@@ -6,14 +6,14 @@ use forja_metal::MetalBackend;
 use forja_testing::{TensorSpec, assert_backends_agree};
 
 #[test]
-fn olmoe_gate_and_up_projection_shape_matches_cpu() {
+fn eight_expert_2048_by_1024_projection_matches_cpu() {
     let cpu = CpuBackend::new();
     let metal = MetalBackend::new().unwrap();
     assert_case(&cpu, &metal, DType::BF16, 1, 8, 8, 2048, 1024);
 }
 
 #[test]
-fn olmoe_down_projection_shape_matches_cpu() {
+fn eight_expert_1024_by_2048_projection_matches_cpu() {
     let cpu = CpuBackend::new();
     let metal = MetalBackend::new().unwrap();
     assert_case(&cpu, &metal, DType::BF16, 1, 8, 8, 1024, 2048);

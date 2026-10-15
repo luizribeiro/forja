@@ -8980,7 +8980,7 @@ mod tests {
     }
 
     #[test]
-    fn metal_attention_reads_strided_qwen_cache_views() {
+    fn metal_attention_reads_strided_grouped_cache_views() {
         let cache_slice = [
             Slice::new(0, 8, 1).unwrap(),
             Slice::new(0, 7, 1).unwrap(),
@@ -9376,7 +9376,7 @@ mod tests {
     }
 
     #[test]
-    fn metal_gemm_matches_qwen_projection_shapes() {
+    fn metal_gemm_matches_transformer_projection_shapes() {
         let backend = MetalBackend::new().unwrap();
         for m in [7, 128, 512] {
             for (k, n) in [
@@ -9397,7 +9397,7 @@ mod tests {
     }
 
     #[test]
-    fn metal_gemv_matches_qwen_decode_shapes() {
+    fn metal_gemv_matches_transformer_decode_shapes() {
         for (inner, columns) in [
             (1024, 2048),
             (1024, 1024),
@@ -9671,7 +9671,7 @@ mod tests {
     }
 
     #[test]
-    fn metal_greedy_sample_matches_argmax_edges_and_qwen_width() {
+    fn metal_greedy_sample_matches_argmax_edges_and_large_vocabulary_width() {
         let params = sample_params(0.0, 0, 1.0, 7);
         for dtype in [DType::F32, DType::F16, DType::BF16] {
             for width in [1, 7, 33, 4097, 151_936] {
@@ -9913,7 +9913,7 @@ mod tests {
     }
 
     #[test]
-    fn metal_rope_matches_cpu_for_qwen_shapes_and_position() {
+    fn metal_rope_matches_cpu_for_grouped_attention_shapes_and_position() {
         let reference = CpuBackend::new();
         let candidate = MetalBackend::new().unwrap();
         let query_positions = (4089_u32..=4095)

@@ -1521,7 +1521,7 @@ mod tests {
     }
 
     #[test]
-    fn binds_float_and_unsigned_inputs_to_qwen_shapes() {
+    fn binds_float_and_unsigned_inputs_to_transformer_shapes() {
         let float_program = program(
             vec![Inst::Input(0), Inst::Unary(UnOp::Abs, 0)],
             vec![(0, 1)],

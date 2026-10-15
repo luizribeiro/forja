@@ -776,7 +776,7 @@ mod tests {
     }
 
     #[test]
-    fn instantiates_qwen_cache_views_through_layout_validation() {
+    fn instantiates_grouped_attention_cache_views_through_layout_validation() {
         let range = RangeInclusive::new(0, 4095);
         let space = ParamSpace::new(vec![range]).unwrap();
         let base = Layout::contiguous(DType::F16, 0, vec![8, 4096, 128], 8_388_608).unwrap();

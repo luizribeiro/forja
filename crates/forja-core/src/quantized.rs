@@ -197,7 +197,7 @@ mod tests {
     use crate::{DType, Layout};
 
     #[test]
-    fn constructs_qwen_mlp_weights() {
+    fn constructs_3072_by_1024_quantized_weights() {
         let q4 = matrix(4, 64, DType::F16).unwrap();
         assert_eq!(q4.shape(), [3072, 1024]);
         assert_eq!(q4.packed().shape(), [3072, 128]);

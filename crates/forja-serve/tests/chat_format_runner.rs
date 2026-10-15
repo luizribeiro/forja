@@ -60,7 +60,7 @@ fn component_declares_no_imports() {
 }
 
 #[test]
-fn runs_the_qwen3_coder_chat_format() {
+fn runs_a_profile_chat_format() {
     let mut format = ChatFormat::load(
         test_guests::qwen3_coder_chat_format(),
         ChatFormatLimits::default(),

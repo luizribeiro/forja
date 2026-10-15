@@ -440,7 +440,7 @@ fn helper_expansion_caps_name_the_kernel() {
 }
 
 #[test]
-fn qwen_norm_programs_preserve_interpreter_bits() -> Result<(), Box<dyn Error>> {
+fn normalization_programs_preserve_interpreter_bits() -> Result<(), Box<dyn Error>> {
     let residual = forja_sdk::nn::blocks::residual_norm_kernel(DType::F32, QWEN_RMS_EPSILON)?;
     let hand = RowCtx::new();
     let value = hand.input(0) + hand.input(1);
@@ -474,7 +474,7 @@ fn qwen_norm_programs_preserve_interpreter_bits() -> Result<(), Box<dyn Error>> 
 }
 
 #[test]
-fn qwen_qk_norm_rope_preserves_interpreter_bits() -> Result<(), Box<dyn Error>> {
+fn qk_norm_rope_preserves_interpreter_bits_across_head_widths() -> Result<(), Box<dyn Error>> {
     for (half_width, head_dim, head_dim_f32, epsilon) in
         [(64, 128, 128.0, QWEN_RMS_EPSILON), (32, 64, 64.0, 1.0e-5)]
     {

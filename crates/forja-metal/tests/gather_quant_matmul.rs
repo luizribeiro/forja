@@ -6,7 +6,7 @@ use forja_metal::MetalBackend;
 use forja_testing::{TensorSpec, assert_backends_agree, assert_outputs_agree};
 
 #[test]
-fn qwen_expert_projection_shapes_match_cpu() {
+fn expert_128_projection_shapes_match_cpu() {
     let cpu = CpuBackend::new();
     let metal = MetalBackend::new().unwrap();
     for dtype in [DType::F16, DType::BF16, DType::F32] {
@@ -16,7 +16,7 @@ fn qwen_expert_projection_shapes_match_cpu() {
 }
 
 #[test]
-fn qwen_combined_down_projection_matches_cpu() {
+fn combined_2048_by_768_down_projection_matches_cpu() {
     let cpu = CpuBackend::new();
     let metal = MetalBackend::new().unwrap();
     for dtype in [DType::F16, DType::BF16, DType::F32] {
@@ -33,7 +33,7 @@ fn small_row_gathered_quantized_matmul_matches_cpu_with_duplicates() {
 }
 
 #[test]
-fn grouped_qwen_projection_shape_matches_cpu() {
+fn grouped_1024_by_128_projection_matches_cpu() {
     let cpu = CpuBackend::new();
     let metal = MetalBackend::new().unwrap();
     for dtype in [DType::F16, DType::BF16, DType::F32] {
@@ -83,7 +83,7 @@ fn grouped_fused_gate_and_up_matches_cpu() {
 }
 
 #[test]
-fn qwen_fused_gate_and_up_matches_cpu() {
+fn fused_2048_by_768_gate_and_up_matches_cpu() {
     let cpu = CpuBackend::new();
     let metal = MetalBackend::new().unwrap();
     for dtype in [DType::F16, DType::BF16, DType::F32] {
@@ -295,7 +295,7 @@ fn grouped_silu_zeros_gpu_written_out_of_range_routes() {
 }
 
 #[test]
-fn qwen_decode_matmul_zeros_gpu_written_out_of_range_routes() {
+fn decode_matmul_zeros_gpu_written_out_of_range_routes() {
     for dtype in [DType::F16, DType::BF16, DType::F32] {
         let metal = MetalBackend::new().unwrap();
         let input = metal.alloc(dtype, &[8, 768]).unwrap();
@@ -329,7 +329,7 @@ fn qwen_decode_matmul_zeros_gpu_written_out_of_range_routes() {
 }
 
 #[test]
-fn qwen_decode_silu_zeros_gpu_written_out_of_range_routes() {
+fn decode_silu_zeros_gpu_written_out_of_range_routes() {
     for dtype in [DType::F16, DType::BF16, DType::F32] {
         let metal = MetalBackend::new().unwrap();
         let input = metal.alloc(dtype, &[1, 2048]).unwrap();
@@ -365,7 +365,7 @@ fn qwen_decode_silu_zeros_gpu_written_out_of_range_routes() {
 }
 
 #[test]
-fn qwen_combined_down_projection_zeros_gpu_written_out_of_range_routes() {
+fn combined_down_projection_zeros_gpu_written_out_of_range_routes() {
     for dtype in [DType::F16, DType::BF16, DType::F32] {
         let metal = MetalBackend::new().unwrap();
         let input = metal.alloc(dtype, &[1, 8, 768]).unwrap();

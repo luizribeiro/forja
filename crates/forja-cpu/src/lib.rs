@@ -1870,7 +1870,7 @@ mod tests {
     }
 
     #[test]
-    fn copies_permuted_qwen_heads_to_contiguous_bf16() {
+    fn copies_permuted_attention_heads_to_contiguous_bf16() {
         let backend = CpuBackend::new();
         let source = backend.alloc(DType::F32, &[7, 16, 128]).unwrap();
         let values = (0_u16..14_336)
@@ -2168,7 +2168,7 @@ mod tests {
     }
 
     #[test]
-    fn normalizes_qwen_hidden_rows_with_epsilon() {
+    fn normalizes_1024_wide_rows_with_epsilon() {
         let backend = CpuBackend::new();
         let input = backend.alloc(DType::F32, &[3, 1024]).unwrap();
         let mut values = vec![2.0; 1024];
@@ -2241,7 +2241,7 @@ mod tests {
 
     #[test]
     #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
-    fn rope_matches_independent_qwen_shape_computation() {
+    fn rope_matches_independent_16_head_computation() {
         let values = (0_u16..14_336)
             .map(|index| f32::from(index % 33) / 16.0 - 1.0)
             .collect::<Vec<_>>();
@@ -2268,7 +2268,7 @@ mod tests {
     }
 
     #[test]
-    fn embeds_rows_near_both_ends_of_a_qwen_width_table() {
+    fn embeds_rows_near_both_ends_of_a_1024_wide_table() {
         let backend = CpuBackend::new();
         let table = backend.alloc(DType::F32, &[1000, 1024]).unwrap();
         let values = (0_u16..251)
@@ -2512,7 +2512,7 @@ mod tests {
 
     #[test]
     #[allow(clippy::cast_possible_truncation)]
-    fn multiplies_by_a_permuted_qwen_weight() {
+    fn multiplies_by_a_permuted_1024_by_3072_weight() {
         let backend = CpuBackend::new();
         let x = (0_u16..33)
             .cycle()
@@ -2581,7 +2581,7 @@ mod tests {
     }
 
     #[test]
-    fn sdpa_groups_qwen_heads_over_strided_cache_views() {
+    fn sdpa_groups_16_query_heads_over_8_strided_cache_heads() {
         let backend = CpuBackend::new();
         let keys = backend.alloc(DType::F32, &[8, 4096, 128]).unwrap();
         let values = backend.alloc(DType::F32, &[8, 4096, 128]).unwrap();

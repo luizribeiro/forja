@@ -32,7 +32,7 @@ fn small_row_quantized_matmul_matches_cpu_at_odd_sizes() {
 }
 
 #[test]
-fn tiled_qwen_projection_shape_matches_cpu() {
+fn tiled_1024_by_3072_projection_matches_cpu() {
     let reference = CpuBackend::new();
     let candidate = MetalBackend::new().unwrap();
     for dtype in [DType::F16, DType::BF16, DType::F32] {
@@ -41,7 +41,7 @@ fn tiled_qwen_projection_shape_matches_cpu() {
 }
 
 #[test]
-fn qwen_router_shape_matches_cpu() {
+fn quantized_2048_by_128_router_matches_cpu() {
     let reference = CpuBackend::new();
     let candidate = MetalBackend::new().unwrap();
     for dtype in [DType::F16, DType::BF16, DType::F32] {
@@ -50,7 +50,7 @@ fn qwen_router_shape_matches_cpu() {
 }
 
 #[test]
-fn fused_qwen_router_matches_cpu() {
+fn fused_128_expert_router_matches_cpu() {
     let reference = CpuBackend::new();
     let candidate = MetalBackend::new().unwrap();
     for rows in [1, 7] {
@@ -81,7 +81,7 @@ fn fused_qwen_router_matches_cpu() {
 }
 
 #[test]
-fn fused_qwen_router_matches_cpu_for_partial_top_k_ties_and_nan() {
+fn fused_router_matches_cpu_for_partial_top_k_ties_and_nan() {
     let reference = CpuBackend::new();
     let candidate = MetalBackend::new().unwrap();
     let inner = 256_usize;
