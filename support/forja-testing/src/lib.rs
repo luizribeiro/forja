@@ -13,7 +13,9 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use forja_core::{Backend, BackendError, DType, Op, Slice, Submission, Tensor, ViewOp};
+use forja_core::{
+    Backend, BackendError, CommandList, DType, Op, Slice, Submission, Tensor, ViewOp,
+};
 use half::{bf16, f16};
 
 /// The f32 normwise relative-error limit.
@@ -339,6 +341,112 @@ impl From<BackendError> for AgreementError {
     }
 }
 
+/// Output comparison used by fused-versus-decomposed operation differentials.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DifferentialComparison {
+    /// Requires identical output bytes.
+    Exact,
+    /// Uses the shared tolerance for the output storage type.
+    DType(DType),
+    /// Uses the shared quantized-operation tolerance.
+    Quantized(DType),
+}
+
+/// Executes fused and decomposed command lists and compares their outputs.
+///
+/// Both command lists are expected to have been built from identical initialized bytes and view
+/// metadata. Keeping submission and comparison here gives every primitive family the same
+/// differential behavior.
+///
+/// # Errors
+///
+/// Returns a backend, decoding, length, or tolerance error.
+pub fn assert_fused_decomposed<B: Backend>(
+    backend: &B,
+    fused: CommandList,
+    fused_output: &Tensor,
+    decomposed: CommandList,
+    decomposed_output: &Tensor,
+    comparison: DifferentialComparison,
+) -> Result<(), AgreementError> {
+    let fused_submission = backend.submit(fused)?;
+    fused_submission.wait()?;
+    let decomposed_submission = backend.submit(decomposed)?;
+    decomposed_submission.wait()?;
+    let fused = backend.read(fused_output)?;
+    let decomposed = backend.read(decomposed_output)?;
+    let result = match comparison {
+        DifferentialComparison::Exact => (fused == decomposed)
+            .then_some(())
+            .ok_or(AgreementError::OutputMismatch),
+        DifferentialComparison::DType(dtype) => assert_encoded_float_values_agree_with_max(
+            dtype,
+            &decomposed,
+            &fused,
+            dtype_tolerance(dtype)?,
+        ),
+        DifferentialComparison::Quantized(dtype) => assert_encoded_float_values_agree_with_max(
+            dtype,
+            &decomposed,
+            &fused,
+            QUANTIZED_TOLERANCE,
+        ),
+    };
+    result?;
+    assert_edge_columns_agree(
+        comparison,
+        fused_output.layout().shape(),
+        &decomposed,
+        &fused,
+    )
+}
+
+fn assert_encoded_float_values_agree_with_max(
+    dtype: DType,
+    reference: &[u8],
+    candidate: &[u8],
+    tolerance: f64,
+) -> Result<(), AgreementError> {
+    let reference = decode(reference, dtype)?;
+    let candidate = decode(candidate, dtype)?;
+    assert_float_values_agree_with_max(&reference, &candidate, tolerance)
+}
+
+fn assert_edge_columns_agree(
+    comparison: DifferentialComparison,
+    shape: &[u32],
+    reference: &[u8],
+    candidate: &[u8],
+) -> Result<(), AgreementError> {
+    let (dtype, tolerance) = match comparison {
+        DifferentialComparison::Exact => return Ok(()),
+        DifferentialComparison::DType(dtype) => (dtype, dtype_tolerance(dtype)?),
+        DifferentialComparison::Quantized(dtype) => (dtype, QUANTIZED_TOLERANCE),
+    };
+    let width = usize::try_from(*shape.last().ok_or(AgreementError::InvalidOutput)?)
+        .map_err(|_| AgreementError::SizeOverflow)?;
+    if width == 0 {
+        return Err(AgreementError::InvalidOutput);
+    }
+    let reference = decode(reference, dtype)?;
+    let candidate = decode(candidate, dtype)?;
+    if reference.len() != candidate.len() || !reference.len().is_multiple_of(width) {
+        return Err(AgreementError::OutputMismatch);
+    }
+    let indices = (0..reference.len() / width)
+        .flat_map(|row| [row * width, row * width + width - 1])
+        .collect::<Vec<_>>();
+    let reference = indices
+        .iter()
+        .map(|&index| reference[index])
+        .collect::<Vec<_>>();
+    let candidate = indices
+        .iter()
+        .map(|&index| candidate[index])
+        .collect::<Vec<_>>();
+    assert_float_values_agree_with_max(&reference, &candidate, tolerance)
+}
+
 /// Returns the accepted normwise relative error for an unquantized dtype.
 ///
 /// # Errors
@@ -359,7 +467,7 @@ pub fn normwise_relative_error(reference: &[f32], candidate: &[f32]) -> f64 {
     if reference.len() != candidate.len() {
         return f64::INFINITY;
     }
-    let (error, class_mismatches) = compare_float_values(reference, candidate);
+    let (error, _, class_mismatches) = compare_float_values(reference, candidate);
     if class_mismatches == 0 {
         error
     } else {
@@ -367,9 +475,10 @@ pub fn normwise_relative_error(reference: &[f32], candidate: &[f32]) -> f64 {
     }
 }
 
-fn compare_float_values(reference: &[f32], candidate: &[f32]) -> (f64, usize) {
+fn compare_float_values(reference: &[f32], candidate: &[f32]) -> (f64, f64, usize) {
     let mut difference = 0.0_f64;
     let mut norm = 0.0_f64;
+    let mut maximum = 0.0_f64;
     let mut class_mismatches = 0;
     for (&expected, &actual) in reference.iter().zip(candidate) {
         if expected.is_finite() && actual.is_finite() {
@@ -377,6 +486,7 @@ fn compare_float_values(reference: &[f32], candidate: &[f32]) -> (f64, usize) {
             let delta = f64::from(actual) - expected;
             difference = delta.mul_add(delta, difference);
             norm = expected.mul_add(expected, norm);
+            maximum = maximum.max(delta.abs() / expected.abs().max(1.0));
         } else if !nonfinite_values_agree(expected, actual) {
             class_mismatches += 1;
         }
@@ -390,7 +500,51 @@ fn compare_float_values(reference: &[f32], candidate: &[f32]) -> (f64, usize) {
     } else {
         (difference / norm).sqrt()
     };
-    (error, class_mismatches)
+    (error, maximum, class_mismatches)
+}
+
+fn assert_float_values_agree(
+    reference: &[f32],
+    candidate: &[f32],
+    tolerance: f64,
+) -> Result<(), AgreementError> {
+    assert_float_values_agree_inner(reference, candidate, tolerance, false)
+}
+
+fn assert_float_values_agree_with_max(
+    reference: &[f32],
+    candidate: &[f32],
+    tolerance: f64,
+) -> Result<(), AgreementError> {
+    assert_float_values_agree_inner(reference, candidate, tolerance, true)
+}
+
+fn assert_float_values_agree_inner(
+    reference: &[f32],
+    candidate: &[f32],
+    tolerance: f64,
+    check_maximum: bool,
+) -> Result<(), AgreementError> {
+    if reference.len() != candidate.len() {
+        return Err(AgreementError::OutputMismatch);
+    }
+    let (normwise, maximum, count) = compare_float_values(reference, candidate);
+    if count != 0 {
+        return Err(AgreementError::ClassMismatch { count });
+    }
+    if normwise > tolerance {
+        return Err(AgreementError::OutsideTolerance {
+            error: normwise,
+            tolerance,
+        });
+    }
+    if check_maximum && maximum > tolerance {
+        return Err(AgreementError::OutsideTolerance {
+            error: maximum,
+            tolerance,
+        });
+    }
+    Ok(())
 }
 
 /// Compares non-finite classes while admitting rounding at the f32 overflow edge.
@@ -428,17 +582,7 @@ pub fn assert_f32_values_agree(reference: &[f32], candidate: &[f32]) -> Result<(
     if reference.len() != candidate.len() {
         return Err(AgreementError::OutputMismatch);
     }
-    let (error, count) = compare_float_values(reference, candidate);
-    if count != 0 {
-        return Err(AgreementError::ClassMismatch { count });
-    }
-    if error > F32_TOLERANCE {
-        return Err(AgreementError::OutsideTolerance {
-            error,
-            tolerance: F32_TOLERANCE,
-        });
-    }
-    Ok(())
+    assert_float_values_agree(reference, candidate, F32_TOLERANCE)
 }
 
 /// Runs identical initialized work on two backends and checks the output tolerance.
@@ -710,15 +854,8 @@ pub fn assert_outputs_agree(
     if expected.len() != actual.len() {
         return Err(AgreementError::OutputMismatch);
     }
-    let (error, count) = compare_float_values(&expected, &actual);
-    if count != 0 {
-        return Err(AgreementError::ClassMismatch { count });
-    }
     let tolerance = dtype_tolerance(dtype)?;
-    if error > tolerance {
-        return Err(AgreementError::OutsideTolerance { error, tolerance });
-    }
-    Ok(())
+    assert_float_values_agree(&expected, &actual, tolerance)
 }
 
 fn run<B: Backend>(
@@ -953,6 +1090,21 @@ mod tests {
             Err(AgreementError::ClassMismatch { count: 2 })
         );
         assert!((compare_float_values(&reference, &candidate).0 - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn elementwise_error_rejects_one_bad_column_hidden_by_the_global_norm() {
+        let reference = vec![1.0; 2 * 151_936];
+        let mut candidate = reference.clone();
+        candidate[151_935] = 2.0;
+        assert!(normwise_relative_error(&reference, &candidate) < QUANTIZED_TOLERANCE);
+        assert_eq!(
+            assert_float_values_agree_with_max(&reference, &candidate, QUANTIZED_TOLERANCE),
+            Err(AgreementError::OutsideTolerance {
+                error: 1.0,
+                tolerance: QUANTIZED_TOLERANCE,
+            })
+        );
     }
 
     #[test]
