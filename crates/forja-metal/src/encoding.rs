@@ -3130,7 +3130,7 @@ impl MetalBackend {
         bindings: &mut ArgumentBindings,
         arguments: &mut ArgumentWriter,
     ) -> Result<EncodedEmbed, BackendError> {
-        let [input, packed, scales, biases, indices] = dispatch.inputs() else {
+        let [input, packed, scales, biases, indices] = dispatch.primitive_inputs() else {
             return Err(BackendError::InvalidInput);
         };
         let input = self.encoder_tensor(input)?;
@@ -3147,6 +3147,7 @@ impl MetalBackend {
             return self.encode_grouped_quant_matmul(
                 encoder,
                 table,
+                dispatch,
                 [&input, &packed, &scales, &biases, &indices, &output],
                 &params,
                 [rows, routes, columns],
@@ -3166,21 +3167,29 @@ impl MetalBackend {
         let mut error_state = [0_u8; 8];
         error_state[4..].copy_from_slice(&u32::MAX.to_ne_bytes());
         let error_flag = arguments.write(&error_state)?;
-        let pipeline = self
+        let constants = [
+            (0, dtype_code(input.layout.dtype())),
+            (1, dtype_code(scales.layout.dtype())),
+            (2, dtype_code(output.layout.dtype())),
+            (12, u32::from(bits)),
+            (13, group_size),
+            (14, words_per_thread),
+        ];
+        let mut pipelines = self
             .pipelines
             .lock()
-            .map_err(|_| BackendError::ExecutionFailed)?
-            .get(
+            .map_err(|_| BackendError::ExecutionFailed)?;
+        let pipeline = if let Some(epilogue) = dispatch.prepared_epilogue() {
+            pipelines.get_epilogue(
+                epilogue_codegen::FamilySourceTag::GatherQuant,
+                epilogue,
                 "gather_quantized_gemv",
-                &[
-                    (0, dtype_code(input.layout.dtype())),
-                    (1, dtype_code(scales.layout.dtype())),
-                    (2, dtype_code(output.layout.dtype())),
-                    (12, u32::from(bits)),
-                    (13, group_size),
-                    (14, words_per_thread),
-                ],
-            )?;
+                &constants,
+            )?
+        } else {
+            pipelines.get("gather_quantized_gemv", &constants)?
+        };
+        drop(pipelines);
         set_pipeline(encoder, &pipeline);
         for (index, tensor) in [&input, &packed, &scales, &biases, &indices, &output]
             .into_iter()
@@ -3190,6 +3199,10 @@ impl MetalBackend {
         }
         bindings.bind(table, 6, &params);
         bindings.bind(table, 7, &error_flag);
+        let mut temporaries = vec![params, error_flag.clone()];
+        if let Some(layouts) = self.bind_epilogue_arguments(dispatch, table, bindings, arguments)? {
+            temporaries.push(layouts);
+        }
         set_argument_table(encoder, table);
         dispatch_threadgroups(
             encoder,
@@ -3208,7 +3221,7 @@ impl MetalBackend {
                 depth: 1,
             },
         );
-        Ok((vec![params, error_flag.clone()], error_flag))
+        Ok((temporaries, error_flag))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3428,6 +3441,7 @@ impl MetalBackend {
         &self,
         encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
         table: &ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>,
+        dispatch: &Dispatch,
         tensors: [&EncoderTensor; 6],
         params: &[u8],
         shape: [u32; 3],
@@ -3459,6 +3473,7 @@ impl MetalBackend {
             bindings,
         )?;
         encode_dispatch_barrier(encoder);
+        let layouts = self.bind_epilogue_arguments(dispatch, table, bindings, arguments)?;
         self.encode_grouped_quantized_gemm(
             encoder,
             table,
@@ -3467,18 +3482,18 @@ impl MetalBackend {
             shape,
             grouped,
             config,
+            dispatch.prepared_epilogue().map(AsRef::as_ref),
             bindings,
         )?;
-        Ok((
-            vec![
-                params,
-                error_flag.clone(),
-                sorted.buffer,
-                offsets.buffer,
-                blocks.buffer,
-            ],
-            error_flag,
-        ))
+        let mut temporaries = vec![
+            params,
+            error_flag.clone(),
+            sorted.buffer,
+            offsets.buffer,
+            blocks.buffer,
+        ];
+        temporaries.extend(layouts);
+        Ok((temporaries, error_flag))
     }
 
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -3555,6 +3570,7 @@ impl MetalBackend {
             shape,
             grouped,
             config,
+            None,
             bindings,
         )?;
         self.encode_grouped_quantized_gemm(
@@ -3567,6 +3583,7 @@ impl MetalBackend {
             shape,
             grouped,
             config,
+            None,
             bindings,
         )?;
         encode_dispatch_barrier(encoder);
@@ -3699,23 +3716,32 @@ impl MetalBackend {
         shape: [u32; 3],
         grouped: GroupedRouteShape,
         config: (u8, u32),
+        epilogue: Option<&PreparedEpilogue>,
         bindings: &mut ArgumentBindings,
     ) -> Result<(), BackendError> {
         let [input, packed, scales, biases, sorted, blocks, output] = tensors;
-        let pipeline = self
+        let constants = [
+            (0, dtype_code(input.layout.dtype())),
+            (1, dtype_code(scales.layout.dtype())),
+            (2, dtype_code(output.layout.dtype())),
+            (12, u32::from(config.0)),
+            (13, config.1),
+        ];
+        let mut pipelines = self
             .pipelines
             .lock()
-            .map_err(|_| BackendError::ExecutionFailed)?
-            .get(
+            .map_err(|_| BackendError::ExecutionFailed)?;
+        let pipeline = if let Some(epilogue) = epilogue {
+            pipelines.get_epilogue(
+                epilogue_codegen::FamilySourceTag::GatherQuant,
+                epilogue,
                 "grouped_quantized_gemm",
-                &[
-                    (0, dtype_code(input.layout.dtype())),
-                    (1, dtype_code(scales.layout.dtype())),
-                    (2, dtype_code(output.layout.dtype())),
-                    (12, u32::from(config.0)),
-                    (13, config.1),
-                ],
-            )?;
+                &constants,
+            )?
+        } else {
+            pipelines.get("grouped_quantized_gemm", &constants)?
+        };
+        drop(pipelines);
         set_pipeline(encoder, &pipeline);
         for (index, tensor) in [input, packed, scales, biases, sorted, blocks, output]
             .into_iter()
@@ -5944,13 +5970,7 @@ impl MetalBackend {
             }
             Op::QuantMatmul { .. } => {
                 arguments.write(144)?;
-                let extra_count = dispatch
-                    .inputs()
-                    .len()
-                    .saturating_sub(dispatch.primitive_inputs().len());
-                if extra_count > 0 {
-                    arguments.write(extra_count.saturating_mul(112))?;
-                }
+                Self::size_epilogue_arguments(dispatch, arguments)?;
             }
             Op::QuantizedRouter { .. } => {
                 for len in [144, 112, 112, 4, 4] {
@@ -5960,6 +5980,7 @@ impl MetalBackend {
             Op::GatherQuantMatmul { .. } => {
                 arguments.write(212)?;
                 arguments.write(8)?;
+                Self::size_epilogue_arguments(dispatch, arguments)?;
             }
             Op::GatherQuantMatmulCombine { .. } => {
                 arguments.write(256)?;
@@ -6030,19 +6051,27 @@ impl MetalBackend {
         };
         Self::size_prepared_matmul_input(left.layout(), arguments)?;
         Self::size_prepared_matmul_input(right.layout(), arguments)?;
-        let extra_count = dispatch
-            .inputs()
-            .len()
-            .saturating_sub(dispatch.primitive_inputs().len());
-        if extra_count > 0 {
-            arguments.write(extra_count.saturating_mul(112))?;
-        }
+        Self::size_epilogue_arguments(dispatch, arguments)?;
         arguments.write(96)?;
         if classify(dispatch.output().layout())
             .kernel_strides()
             .is_none_or(|(column_major, _, _)| column_major != 0)
         {
             Self::size_copy_arguments(arguments)?;
+        }
+        Ok(())
+    }
+
+    fn size_epilogue_arguments(
+        dispatch: &Dispatch,
+        arguments: &mut ArgumentSizer,
+    ) -> Result<(), BackendError> {
+        let extra_count = dispatch
+            .inputs()
+            .len()
+            .saturating_sub(dispatch.primitive_inputs().len());
+        if extra_count > 0 {
+            arguments.write(extra_count.saturating_mul(112))?;
         }
         Ok(())
     }
@@ -6400,6 +6429,9 @@ fn supported_dispatch(dispatch: &Dispatch) -> bool {
                     | MetalVariant::QuantMatmulQ8FastGemv
                     | MetalVariant::QuantMatmulSmallM
                     | MetalVariant::QuantMatmulTiled
+                    | MetalVariant::GatherQuantMatmulPortable
+                    | MetalVariant::GatherQuantMatmulRouteGemv
+                    | MetalVariant::GatherQuantMatmulGrouped
             )
         )
     {
@@ -9090,6 +9122,161 @@ mod tests {
             128,
             true,
         );
+    }
+
+    #[test]
+    fn metal_gather_quant_route_epilogues_cover_formats_and_route_broadcasts() {
+        let backend = MetalBackend::new().unwrap();
+        for dtype in [DType::F32, DType::F16, DType::BF16] {
+            for bits in [4, 8] {
+                assert_gather_quant_epilogue(
+                    &backend,
+                    "gather-quant-matmul.route-gemv",
+                    dtype,
+                    bits,
+                    [7, 3, 33],
+                    true,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn metal_gather_quant_grouped_epilogues_preserve_unsorted_coordinates() {
+        let backend = MetalBackend::new().unwrap();
+        for dtype in [DType::F32, DType::F16, DType::BF16] {
+            for bits in [4, 8] {
+                assert_gather_quant_epilogue(
+                    &backend,
+                    "gather-quant-matmul.grouped",
+                    dtype,
+                    bits,
+                    [8, 8, 33],
+                    false,
+                );
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    fn assert_gather_quant_epilogue(
+        backend: &MetalBackend,
+        variant: &str,
+        dtype: DType,
+        bits: u8,
+        [rows, routes, columns]: [u32; 3],
+        broadcast: bool,
+    ) {
+        let inner = 128;
+        let experts = 4;
+        let group_size = 64;
+        let packed_width = inner * u32::from(bits) / 32;
+        let groups = inner / group_size;
+        let parameter_dtype = if dtype == DType::F32 {
+            DType::F16
+        } else {
+            dtype
+        };
+        let input = backend.alloc(dtype, &[rows, inner]).unwrap();
+        let packed = backend
+            .alloc(DType::U32, &[experts, columns, packed_width])
+            .unwrap();
+        let scales = backend
+            .alloc(parameter_dtype, &[experts, columns, groups])
+            .unwrap();
+        let biases = backend
+            .alloc(parameter_dtype, &[experts, columns, groups])
+            .unwrap();
+        backend
+            .write(&input, &float_pattern(dtype, rows * inner))
+            .unwrap();
+        let packed_bytes = (0..experts * columns * packed_width)
+            .flat_map(|index| index.wrapping_mul(0x0101_0101).to_ne_bytes())
+            .collect::<Vec<_>>();
+        backend.write(&packed, &packed_bytes).unwrap();
+        let parameter_count = experts * columns * groups;
+        backend
+            .write(&scales, &float_pattern(parameter_dtype, parameter_count))
+            .unwrap();
+        backend
+            .write(&biases, &float_pattern(parameter_dtype, parameter_count))
+            .unwrap();
+        let index_storage = backend.alloc(DType::U32, &[routes, rows]).unwrap();
+        let indices = backend
+            .view(&index_storage, ViewOp::Permute(vec![1, 0]))
+            .unwrap();
+        let index_bytes = (0..rows * routes)
+            .flat_map(|index| (index % experts).to_ne_bytes())
+            .collect::<Vec<_>>();
+        backend.write(&index_storage, &index_bytes).unwrap();
+        let extra_storage = if broadcast {
+            backend.alloc(dtype, &[rows, routes, 1]).unwrap()
+        } else {
+            backend.alloc(dtype, &[routes, rows, columns]).unwrap()
+        };
+        let extra = if broadcast {
+            backend
+                .view(
+                    &extra_storage,
+                    ViewOp::Broadcast(vec![rows, routes, columns]),
+                )
+                .unwrap()
+        } else {
+            backend
+                .view(&extra_storage, ViewOp::Permute(vec![1, 0, 2]))
+                .unwrap()
+        };
+        let extra_count = if broadcast {
+            rows * routes
+        } else {
+            rows * routes * columns
+        };
+        backend
+            .write(&extra_storage, &float_pattern(dtype, extra_count))
+            .unwrap();
+        let output_shape = [rows, routes, columns];
+        let fused_output = backend.alloc(dtype, &output_shape).unwrap();
+        let decomposed_output = backend.alloc(dtype, &output_shape).unwrap();
+        let accumulator = backend.alloc(dtype, &output_shape).unwrap();
+        let program = multiply_program();
+        let epilogue = prepare_epilogue(
+            program.clone(),
+            EpilogueSignature::new(1, 3, vec![dtype], dtype),
+        )
+        .unwrap();
+        let map = prepare_program(
+            backend,
+            program,
+            KernelSignature::new(3, vec![dtype, dtype], vec![dtype], 0),
+        )
+        .unwrap();
+        let op = Op::GatherQuantMatmul { bits, group_size };
+        let primitive_inputs = [&input, &packed, &scales, &biases, &indices];
+        let selection = backend
+            .validate_variant_for_op(op, &primitive_inputs, &[&fused_output], variant)
+            .unwrap();
+        let mut fused = CommandList::new();
+        fused
+            .dispatch_epilogue(op, &primitive_inputs, &fused_output, &epilogue, &[&extra])
+            .unwrap();
+        assert!(fused.set_last_backend_data(BackendDispatchData::new(selection)));
+        let mut decomposed = CommandList::new();
+        decomposed
+            .dispatch(op, &primitive_inputs, &accumulator)
+            .unwrap();
+        assert!(decomposed.set_last_backend_data(BackendDispatchData::new(selection)));
+        decomposed
+            .dispatch_kernel(&map, &[&accumulator, &extra], &[&decomposed_output])
+            .unwrap();
+        assert_fused_decomposed(
+            backend,
+            fused,
+            &fused_output,
+            decomposed,
+            &decomposed_output,
+            DifferentialComparison::Quantized(dtype),
+        )
+        .unwrap();
     }
 
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]

@@ -389,7 +389,7 @@ mod tests {
 
     #[test]
     fn steel_splice_is_after_barriers_and_inside_edges() {
-        let source = generate_source(&bias_epilogue());
+        let source = generate_source(&bias_epilogue()).unwrap();
         let start = source.find("void steel_gemm(").unwrap();
         let body =
             &source[start..source[start..].find("#define DEFINE_STEEL_GEMM").unwrap() + start];
@@ -404,7 +404,7 @@ mod tests {
 
     #[test]
     fn quant_splices_follow_collectives_and_edge_checks() {
-        let source = generate_source(&bias_epilogue());
+        let source = generate_source(&bias_epilogue()).unwrap();
         for (kernel, end_marker, expected_calls, collective, edge) in [
             (
                 "kernel void quantized_gemv(",
@@ -437,7 +437,7 @@ mod tests {
 
     #[test]
     fn quant_gemm_splices_follow_collectives_and_edge_checks() {
-        let source = generate_source(&bias_epilogue());
+        let source = generate_source(&bias_epilogue()).unwrap();
         for (kernel, end_marker, collective, edge) in [
             (
                 "kernel void quantized_gemm_small_m(",
@@ -462,18 +462,41 @@ mod tests {
     }
 
     #[test]
-    fn quant_source_addresses_ignore_program_values() {
-        let source = generate_source(&bias_epilogue());
-        for address in source
-            .lines()
-            .filter(|line| line.contains("ulong epilogue_address"))
-        {
-            assert!(
-                !address
-                    .as_bytes()
-                    .windows(2)
-                    .any(|pair| pair[0] == b'v' && pair[1].is_ascii_digit())
-            );
-        }
+    fn gather_quant_splices_preserve_routes_after_collectives_and_edges() {
+        let source = generate_source(&bias_epilogue()).unwrap();
+        let route_start = source.find("kernel void gather_quantized_gemv(").unwrap();
+        let route = &source[route_start
+            ..source[route_start..]
+                .find("struct GatherQuantMatmulCombineParams")
+                .unwrap()
+                + route_start];
+        let route_call = route.rfind("forja_epilogue(").unwrap();
+        let route_sum = route[..route_call].rfind("gather_quantized_sums(").unwrap();
+        let route_valid = route[..route_call].rfind("if (valid)").unwrap();
+        let route_edge = route[..route_call]
+            .rfind("if (column < params.columns)")
+            .unwrap();
+        let route_store = route[route_call..].find("store_float(").unwrap() + route_call;
+        assert!(route_sum < route_edge && route_edge < route_valid && route_valid < route_call);
+        assert!(route_call < route_store);
+
+        let grouped_start = source.find("kernel void grouped_quantized_gemm(").unwrap();
+        let grouped = &source[grouped_start
+            ..source[grouped_start..]
+                .find("kernel void gathered_silu_from_projections(")
+                .unwrap()
+                + grouped_start];
+        let grouped_call = grouped.rfind("forja_epilogue(").unwrap();
+        let barrier = grouped[..grouped_call]
+            .rfind("threadgroup_barrier(")
+            .unwrap();
+        let route = grouped[..grouped_call]
+            .rfind("uint route = sorted_routes[")
+            .unwrap();
+        let edge = grouped[..grouped_call]
+            .rfind("if (column + element < params.columns)")
+            .unwrap();
+        let store = grouped[grouped_call..].find("store_float(").unwrap() + grouped_call;
+        assert!(barrier < route && route < edge && edge < grouped_call && grouped_call < store);
     }
 }

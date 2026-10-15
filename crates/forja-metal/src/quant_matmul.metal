@@ -585,6 +585,7 @@ kernel void gather_quantized_gemv(
     device uchar *output [[buffer(5)]],
     constant GatherQuantMatmulParams &params [[buffer(6)]],
     device atomic_uint *error_flag [[buffer(7)]],
+    FORJA_EPILOGUE_ARGUMENTS
     ushort simdgroup [[simdgroup_index_in_threadgroup]],
     ushort lane [[thread_index_in_simdgroup]],
     uint2 tile [[threadgroup_position_in_grid]]) {
@@ -609,11 +610,18 @@ kernel void gather_quantized_gemv(
         for (uint item = 0; item < 4; ++item) {
             uint column = first_column + item;
             if (column < params.columns) {
+                float value = 0.0f;
+                if (valid) {
+                    value = forja_epilogue(
+                        sums[item], 0.0f, row, slot, column,
+                        params.rows, params.routes, params.columns,
+                        FORJA_EPILOGUE_VALUES);
+                }
                 ulong output_index = params.output_offset +
                     ulong(row) * params.output_row_stride +
                     ulong(slot) * params.output_slot_stride +
                     ulong(column) * params.output_column_stride;
-                store_float(output, output_index, output_dtype, sums[item]);
+                store_float(output, output_index, output_dtype, value);
             }
         }
     }
@@ -937,6 +945,7 @@ kernel void grouped_quantized_gemm(
     device const uint3 *blocks [[buffer(5)]],
     device uchar *output [[buffer(6)]],
     constant GatherQuantMatmulParams &params [[buffer(7)]],
+    FORJA_EPILOGUE_ARGUMENTS
     uint thread_index [[thread_index_in_threadgroup]],
     uint3 threadgroup_size [[threads_per_threadgroup]],
     ushort simdgroup [[simdgroup_index_in_threadgroup]],
@@ -1047,13 +1056,17 @@ kernel void grouped_quantized_gemm(
                         column_fragment;
                     for (uint element = 0; element < 2; ++element) {
                         if (column + element < params.columns) {
+                            float value = forja_epilogue(
+                                float(mma.accumulators[fragment_index * 2 + element]), 0.0f,
+                                output_row, output_slot, column + element,
+                                params.rows, params.routes, params.columns,
+                                FORJA_EPILOGUE_VALUES);
                             ulong output_index = params.output_offset +
                                 ulong(output_row) * params.output_row_stride +
                                 ulong(output_slot) * params.output_slot_stride +
                                 ulong(column + element) * params.output_column_stride;
                             store_float(
-                                output, output_index, output_dtype,
-                                float(mma.accumulators[fragment_index * 2 + element]));
+                                output, output_index, output_dtype, value);
                         }
                     }
                 }
