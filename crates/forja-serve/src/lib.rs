@@ -10,7 +10,10 @@ use minijinja::{AutoEscape, Environment, UndefinedBehavior};
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
-pub use request::{ChatCompletionRequest, CompletionParams, CompletionRequest, Message, Stop};
+pub use request::{
+    ChatCompletionRequest, CompletionParams, CompletionRequest, Message, ResolvedParams, Stop,
+    ValidationError,
+};
 
 /// A compiled publisher-provided chat template.
 pub struct ChatTemplate {
