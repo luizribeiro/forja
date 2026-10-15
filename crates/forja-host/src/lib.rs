@@ -1284,6 +1284,7 @@ struct BufferHandle {
     owner: Tensor,
     kind: BufferKind,
     taints: Arc<BufferTaints>,
+    guest_handles: AtomicUsize,
 }
 
 #[derive(Debug)]
@@ -1304,6 +1305,24 @@ enum BufferKind {
 }
 
 impl BufferHandle {
+    fn retain_guest_handle(&self) {
+        self.guest_handles.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn release_guest_handle(&self) -> Result<(), compute::Error> {
+        self.guest_handles
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                count.checked_sub(1)
+            })
+            .map(|_| ())
+            .map_err(|_| invalid_handle("guest tensor handle accounting underflowed"))
+    }
+
+    #[expect(dead_code, reason = "reserved for graph memory planning")]
+    fn guest_reachable(&self) -> bool {
+        self.guest_handles.load(Ordering::Acquire) != 0
+    }
+
     fn release<B: Backend>(
         &self,
         backend: &B,
@@ -1703,6 +1722,7 @@ impl<B: Backend + 'static> Host<B> {
             buffer: Arc::new(BufferHandle {
                 owner: tensor.clone(),
                 taints: Arc::clone(&self.taints),
+                guest_handles: AtomicUsize::new(0),
                 kind: BufferKind::Allocated {
                     byte_len,
                     live_bytes: Arc::clone(&self.live_bytes),
@@ -1716,6 +1736,11 @@ impl<B: Backend + 'static> Host<B> {
                 return Err(invalid_handle(error));
             }
         };
+        self.table
+            .get(&resource)
+            .map_err(invalid_handle)?
+            .buffer
+            .retain_guest_handle();
         self.live_bytes.fetch_add(byte_len, Ordering::AcqRel);
         self.live_handles += 1;
         Ok(resource)
@@ -1745,6 +1770,11 @@ impl<B: Backend + 'static> Host<B> {
                     buffer: entry.buffer,
                 })
                 .map_err(invalid_handle)?;
+            self.table
+                .get(&view)
+                .map_err(invalid_handle)?
+                .buffer
+                .retain_guest_handle();
             self.live_handles += 1;
             return Ok(view);
         }
@@ -1762,6 +1792,11 @@ impl<B: Backend + 'static> Host<B> {
                 buffer: Arc::clone(&entry.buffer),
             })
             .map_err(invalid_handle)?;
+        self.table
+            .get(&view)
+            .map_err(invalid_handle)?
+            .buffer
+            .retain_guest_handle();
         self.live_handles += 1;
         Ok(view)
     }
@@ -1809,6 +1844,11 @@ impl<B: Backend + 'static> Host<B> {
                 buffer: entry.buffer,
             })
             .map_err(invalid_handle)?;
+        self.table
+            .get(&view)
+            .map_err(invalid_handle)?
+            .buffer
+            .retain_guest_handle();
         self.live_handles += 1;
         Ok(view)
     }
@@ -1924,6 +1964,7 @@ impl<B: Backend + 'static> Host<B> {
                 live_bytes: Arc::clone(&self.live_bytes),
             },
             taints: Arc::clone(&self.taints),
+            guest_handles: AtomicUsize::new(0),
         });
         if let Some(byte_len) = copied_byte_len {
             self.live_bytes.fetch_add(byte_len, Ordering::AcqRel);
@@ -1985,6 +2026,7 @@ impl<B: Backend + 'static> Host<B> {
                     live_bytes: Arc::clone(&self.live_bytes),
                 },
                 taints: Arc::clone(&self.taints),
+                guest_handles: AtomicUsize::new(0),
             });
             self.live_bytes.fetch_add(byte_len, Ordering::AcqRel);
             (tensor, buffer)
@@ -2006,6 +2048,11 @@ impl<B: Backend + 'static> Host<B> {
                 return Err(invalid_handle(error));
             }
         };
+        self.table
+            .get(&tensor)
+            .map_err(invalid_handle)?
+            .buffer
+            .retain_guest_handle();
         self.live_handles += 1;
         Ok(tensor)
     }
@@ -2489,6 +2536,7 @@ impl<B: Backend + 'static> Host<B> {
     /// Returns an invalid-handle error, or a backend error on final release.
     pub fn drop_tensor(&mut self, resource: Resource<TensorEntry>) -> Result<(), compute::Error> {
         let entry = self.table.delete(resource).map_err(invalid_handle)?;
+        entry.buffer.release_guest_handle()?;
         let live_handles = self
             .live_handles
             .checked_sub(1)
