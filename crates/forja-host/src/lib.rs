@@ -980,18 +980,24 @@ where
     /// # Errors
     ///
     /// Returns a timeout if completion accounting does not advance within the backend deadline.
-    pub async fn wait_for_submissions(&self, expected: u64) -> Result<(), BackendError> {
+    pub fn wait_for_submissions(
+        &self,
+        expected: u64,
+    ) -> impl Future<Output = Result<(), BackendError>> + Send + 'static {
         let timeout = self.store.data().limits.submission_timeout;
         let notify = Arc::clone(&self.store.data().submission_notify);
-        let started = Instant::now();
-        loop {
-            let notified = notify.notified();
-            if self.metrics().submissions >= expected {
-                return Ok(());
-            }
-            let remaining = timeout.saturating_sub(started.elapsed());
-            if remaining.is_zero() || tokio::time::timeout(remaining, notified).await.is_err() {
-                return Err(BackendError::Timeout);
+        let completed = Arc::clone(&self.store.data().completed_submissions);
+        async move {
+            let started = Instant::now();
+            loop {
+                let notified = notify.notified();
+                if completed.load(Ordering::Acquire) >= expected {
+                    return Ok(());
+                }
+                let remaining = timeout.saturating_sub(started.elapsed());
+                if remaining.is_zero() || tokio::time::timeout(remaining, notified).await.is_err() {
+                    return Err(BackendError::Timeout);
+                }
             }
         }
     }
