@@ -1,6 +1,7 @@
 use std::{collections::BTreeMap, error::Error, fs, time::Duration};
 
 use forja_core::{Backend, CommandList, DType, DispatchProfile, Op, ProfileTensor, Submission};
+use forja_host::EngineMemory;
 
 use crate::{
     args::{Profile, ProfileMode},
@@ -17,6 +18,37 @@ struct Total {
     idle: Duration,
     dispatches: u64,
     barriers: u64,
+}
+
+#[derive(Clone, Copy)]
+struct MemoryReport {
+    live_bytes: u64,
+    charged_bytes: u64,
+    accounted_bytes: u64,
+    device_bytes: u64,
+    physical_footprint: u64,
+    peak_physical_footprint: u64,
+    unaccounted_bytes: u64,
+}
+
+fn memory_report(memory: EngineMemory) -> Result<MemoryReport, &'static str> {
+    Ok(MemoryReport {
+        live_bytes: memory.live_bytes,
+        charged_bytes: memory.charged_bytes,
+        accounted_bytes: memory
+            .accounted_bytes()
+            .ok_or("accounted memory overflowed")?,
+        device_bytes: memory.device_bytes.ok_or("device memory is unavailable")?,
+        physical_footprint: memory
+            .physical_footprint
+            .ok_or("physical footprint is unavailable")?,
+        peak_physical_footprint: memory
+            .peak_physical_footprint
+            .ok_or("peak physical footprint is unavailable")?,
+        unaccounted_bytes: memory
+            .unaccounted_bytes()
+            .ok_or("unaccounted memory is unavailable")?,
+    })
 }
 
 pub(crate) async fn run(options: &Profile) -> Result<(), Box<dyn Error>> {
@@ -213,6 +245,7 @@ fn print_markdown(
     measurement: &TokenProfile,
     peak: f64,
 ) -> Result<(), Box<dyn Error>> {
+    let memory = memory_report(measurement.step.memory)?;
     let submission = measurement
         .step
         .submission
@@ -231,6 +264,22 @@ fn print_markdown(
     println!("- Mode: {}", mode_name(options.mode));
     println!("- Tokens: {}", options.context);
     println!("- Measured copy peak: {peak:.1} GB/s");
+    println!(
+        "- Step memory: {} bytes accounted ({} live tensors + {} backend), {} bytes device, {} bytes footprint",
+        memory.accounted_bytes,
+        memory.live_bytes,
+        memory.charged_bytes,
+        memory.device_bytes,
+        memory.physical_footprint,
+    );
+    println!(
+        "- Unaccounted device gap: {} bytes",
+        memory.unaccounted_bytes
+    );
+    println!(
+        "- Run peak physical footprint: {} bytes",
+        memory.peak_physical_footprint
+    );
     println!(
         "- Unprofiled step: {:.3} ms wall, {:.3} ms GPU",
         milliseconds(measurement.baseline_wall),
@@ -305,6 +354,7 @@ fn report(
     load_before: &machine_load::Snapshot,
     load_after: &machine_load::Snapshot,
 ) -> Result<serde_json::Value, Box<dyn Error>> {
+    let memory = memory_report(measurement.step.memory)?;
     let submission = measurement
         .step
         .submission
@@ -355,7 +405,16 @@ fn report(
             "gpu_time_seconds": submission.gpu_time.as_secs_f64(),
             "dispatches": submission.dispatches,
             "barriers": submission.barriers,
+            "memory": {
+                "live_bytes": memory.live_bytes,
+                "backend_charged_bytes": memory.charged_bytes,
+                "accounted_bytes": memory.accounted_bytes,
+                "device_bytes": memory.device_bytes,
+                "physical_footprint_bytes": memory.physical_footprint,
+                "unaccounted_bytes": memory.unaccounted_bytes,
+            },
         },
+        "peak_physical_footprint_bytes": memory.peak_physical_footprint,
         "timeline": timeline,
         "by_op": totals_json(aggregate(&submission.per_dispatch, |item| op_name(item.op)), submission.gpu_time),
         "by_kernel": totals_json(aggregate(&submission.per_dispatch, |item| item.kernel), submission.gpu_time),
@@ -469,5 +528,20 @@ mod tests {
         assert_eq!(copy.barriers, 2);
         assert_eq!(copy.time, Duration::from_micros(14));
         assert_eq!(copy.idle, Duration::from_micros(4));
+    }
+
+    #[test]
+    fn reports_accounted_actual_and_process_memory() {
+        let report = memory_report(EngineMemory {
+            live_bytes: 11,
+            charged_bytes: 2,
+            device_bytes: Some(17),
+            physical_footprint: Some(23),
+            peak_physical_footprint: Some(29),
+        })
+        .unwrap();
+        assert_eq!(report.accounted_bytes, 13);
+        assert_eq!(report.unaccounted_bytes, 4);
+        assert_eq!(report.peak_physical_footprint, 29);
     }
 }
