@@ -23,9 +23,9 @@ use std::{
 
 use forja_core::{
     Affine, Backend, BackendDispatchData, BackendError, BufferId, CommandList, DType, GraphLimits,
-    GraphTemplate, Layout, LayoutError, Op, OpError, ParamSpace, PreparedGraph, RuleArm, Slice,
-    Submission, SubmissionProfile, SymbolicLayout, SymbolicLayoutError, TemplateOp, TemplateTensor,
-    Tensor, ViewOp, gather_matmul_flops, gather_quant_matmul_combine_flops,
+    GraphTemplate, Layout, LayoutError, MemoryUsage, Op, OpError, ParamSpace, PreparedGraph,
+    RuleArm, Slice, Submission, SubmissionProfile, SymbolicLayout, SymbolicLayoutError, TemplateOp,
+    TemplateTensor, Tensor, ViewOp, gather_matmul_flops, gather_quant_matmul_combine_flops,
     gather_quant_matmul_flops, gather_quant_silu_mul_flops, matmul_flops,
     program::{
         BinOp, Inst, KernelSignature, MAX_INSTRUCTIONS, MAX_OUTPUTS, PrepareError, PreparedProgram,
@@ -253,6 +253,37 @@ pub struct EngineMetrics {
     pub gpu_time: Duration,
 }
 
+/// Memory observed after one profiled engine step.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct EngineMemory {
+    /// Bytes held by live guest tensor resources.
+    pub live_bytes: u64,
+    /// Additional bytes charged by the backend.
+    pub charged_bytes: u64,
+    /// Bytes currently allocated by the device API, when available.
+    pub device_bytes: Option<u64>,
+    /// Current process physical footprint, when available.
+    pub physical_footprint: Option<u64>,
+    /// Peak process physical footprint for this run, when available.
+    pub peak_physical_footprint: Option<u64>,
+}
+
+impl EngineMemory {
+    /// Returns the total bytes charged to the guest quota.
+    #[must_use]
+    pub fn accounted_bytes(self) -> Option<u64> {
+        self.live_bytes.checked_add(self.charged_bytes)
+    }
+
+    /// Returns device allocation not covered by quota accounting.
+    #[must_use]
+    pub fn unaccounted_bytes(self) -> Option<u64> {
+        self.device_bytes
+            .zip(self.accounted_bytes())
+            .map(|(actual, accounted)| actual.saturating_sub(accounted))
+    }
+}
+
 /// Count and wall time for calls to one guest import.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ImportProfile {
@@ -326,6 +357,8 @@ pub struct EngineStepProfile {
     pub output_read: ImportProfile,
     /// Detailed timing for the step's submission.
     pub submission: Option<SubmissionProfile>,
+    /// Memory observed after the step completed.
+    pub memory: EngineMemory,
 }
 
 #[derive(Clone, Copy)]
@@ -1617,6 +1650,19 @@ impl<B: Backend + 'static> Host<B> {
         let mut profile = profile.lock().ok()?.clone();
         profile.wall_time = wall_time;
         profile.guest_time = wall_time.saturating_sub(profile.imports.total_time());
+        let MemoryUsage {
+            charged_bytes,
+            device_bytes,
+            physical_footprint,
+            peak_physical_footprint,
+        } = self.backend.memory_usage();
+        profile.memory = EngineMemory {
+            live_bytes: self.live_bytes.load(Ordering::Acquire),
+            charged_bytes,
+            device_bytes,
+            physical_footprint,
+            peak_physical_footprint,
+        };
         Some(profile)
     }
 
@@ -4323,9 +4369,10 @@ mod tests {
     use wasmtime::component::Resource;
 
     use super::{
-        BackendEvent, BackendTimer, EngineMetrics, EngineRunner, EngineStep, EngineStepProfile,
-        Grants, Host, ImportKind, ImportTimer, Limits, MAX_INSTRUCTIONS, MAX_OUTPUTS, ParamsEntry,
-        TensorEntry, bindings::l9o::gpu::compute, core_op, core_program, expected_layer_outputs,
+        BackendEvent, BackendTimer, EngineMemory, EngineMetrics, EngineRunner, EngineStep,
+        EngineStepProfile, Grants, Host, ImportKind, ImportTimer, Limits, MAX_INSTRUCTIONS,
+        MAX_OUTPUTS, ParamsEntry, TensorEntry, bindings::l9o::gpu::compute, core_op, core_program,
+        expected_layer_outputs,
     };
 
     const GENEROUS: Limits = Limits::new(u64::MAX, 8, u64::MAX, 32, u64::MAX);
@@ -5317,6 +5364,26 @@ mod tests {
         let profile = profile.lock().unwrap();
         assert_eq!(profile.allocations.count, 1);
         assert_eq!(profile.releases.count, 1);
+    }
+
+    #[test]
+    fn memory_profile_combines_quota_charges_and_reports_the_gap() {
+        let memory = EngineMemory {
+            live_bytes: 4,
+            charged_bytes: 7,
+            device_bytes: Some(17),
+            physical_footprint: Some(23),
+            peak_physical_footprint: Some(29),
+        };
+        assert_eq!(memory.accounted_bytes(), Some(11));
+        assert_eq!(memory.unaccounted_bytes(), Some(6));
+
+        let overflow = EngineMemory {
+            live_bytes: u64::MAX,
+            charged_bytes: 1,
+            ..EngineMemory::default()
+        };
+        assert_eq!(overflow.accounted_bytes(), None);
     }
 
     #[test]
