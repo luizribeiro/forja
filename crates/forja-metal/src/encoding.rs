@@ -39,7 +39,7 @@ use crate::{
     matmul::{
         GEMM_32_64, GEMM_64_32, GEMM_64_64_FLOAT, GEMM_64_64_HALF, classify, select_internal_gemm,
     },
-    storage::{MetalBackend, MetalBuffer},
+    storage::{GraphArenaReservation, MetalBackend, MetalBuffer},
     variants::MetalVariant,
 };
 
@@ -521,6 +521,7 @@ struct ArgumentUsage {
 enum PlannedRange {
     Fixed(BoundRange),
     Arena { offset: usize, len: usize },
+    GraphArena { offset: usize, len: usize },
 }
 
 #[derive(Clone)]
@@ -544,17 +545,19 @@ enum PlanCall {
 
 struct PlanRecording {
     arena_base: u64,
+    graph_arena_base: Option<u64>,
     calls: Vec<PlanCall>,
 }
 
 struct PlanRecorderScope(bool);
 
 impl PlanRecorderScope {
-    fn enter(arena_base: u64) -> Self {
+    fn enter(arena_base: u64, graph_arena_base: Option<u64>) -> Self {
         PLAN_RECORDER.with(|recorder| {
             debug_assert!(recorder.borrow().is_none());
             *recorder.borrow_mut() = Some(PlanRecording {
                 arena_base,
+                graph_arena_base,
                 calls: Vec::new(),
             });
         });
@@ -598,6 +601,11 @@ fn record_plan_binding(index: usize, range: BoundRange) {
         };
         let range = if range.base == recording.arena_base {
             PlannedRange::Arena {
+                offset: range.offset,
+                len: range.len,
+            }
+        } else if Some(range.base) == recording.graph_arena_base {
+            PlannedRange::GraphArena {
                 offset: range.offset,
                 len: range.len,
             }
@@ -1147,6 +1155,7 @@ pub(super) struct PreparedMetalGraph {
     buffers: HashSet<BufferId>,
     encoding: Option<MetalEncodingPlan>,
     variant_rechecks: Vec<usize>,
+    memory_plan: Option<forja_core::GraphMemoryPlan>,
 }
 
 #[derive(Clone)]
@@ -1959,14 +1968,14 @@ impl MetalBackend {
         &self,
         commands: CommandList,
     ) -> Result<MetalSubmission, BackendError> {
-        self.submit_commands_inner::<false>(commands, None)
+        self.submit_commands_inner::<false>(commands, None, None)
     }
 
     pub(super) fn submit_commands_profiled(
         &self,
         commands: CommandList,
     ) -> Result<MetalSubmission, BackendError> {
-        self.submit_commands_inner::<true>(commands, None)
+        self.submit_commands_inner::<true>(commands, None, None)
     }
 
     pub(super) fn prepare_metal_graph(
@@ -1982,13 +1991,14 @@ impl MetalBackend {
             .newResidencySetWithDescriptor_error(&MTLResidencySetDescriptor::new())
             .map_err(|_| BackendError::ExecutionFailed)?;
         let tensors = graph.retained_tensors();
+        let graph_arena = graph.memory_arena();
         let buffers = self
             .buffers
             .lock()
             .map_err(|_| BackendError::ExecutionFailed)?;
         let mut retained = HashSet::with_capacity(tensors.len());
         for tensor in &tensors {
-            if retained.insert(tensor.buffer()) {
+            if Some(tensor.buffer()) != graph_arena && retained.insert(tensor.buffer()) {
                 let buffer: &ProtocolObject<dyn MTLBuffer> = &buffers.get(tensor)?.raw;
                 let allocation: &ProtocolObject<dyn MTLAllocation> = buffer.as_ref();
                 residency.addAllocation(allocation);
@@ -2001,7 +2011,25 @@ impl MetalBackend {
             buffers: retained,
             encoding,
             variant_rechecks: graph.parameter_dependent_dispatch_indices().collect(),
+            memory_plan: None,
         })
+    }
+
+    pub(super) fn prepare_metal_graph_memory(
+        &self,
+        graph: GraphTemplate,
+        plan: forja_core::GraphMemoryPlan,
+    ) -> Result<PreparedGraph, BackendError> {
+        self.ensure_graph_arenas(plan.arena_bytes())?;
+        let arena = self.acquire_graph_arena()?;
+        let bound = graph
+            .bind_memory(&plan, arena.tensor())
+            .map_err(|_| BackendError::InvalidInput);
+        let state = bound.and_then(|bound| self.prepare_metal_graph(&bound));
+        self.release_graph_arena(&arena);
+        let mut state = state?;
+        state.memory_plan = Some(plan);
+        Ok(PreparedGraph::with_backend_state(graph, state))
     }
 
     fn prepare_encoding_plan(
@@ -2028,8 +2056,18 @@ impl MetalBackend {
         let objects = self.in_flight.checkout(self, capacity)?;
         let command_buffer = self.begin_command_buffer(objects.allocator()?)?;
         let mut arguments = ArgumentWriter::new(objects.argument_buffer()?);
+        let graph_arena_base = graph
+            .memory_arena()
+            .map(|arena| {
+                self.buffers
+                    .lock()
+                    .map_err(|_| BackendError::ExecutionFailed)?
+                    .get_buffer(arena)
+                    .map(|buffer| buffer.raw.gpuAddress())
+            })
+            .transpose()?;
         for (index, dispatch) in static_dispatches {
-            let recorder = PlanRecorderScope::enter(arguments.raw.gpuAddress());
+            let recorder = PlanRecorderScope::enter(arguments.raw.gpuAddress(), graph_arena_base);
             let encoded = self.encode_dispatches(
                 &command_buffer,
                 objects.argument_table()?,
@@ -2039,6 +2077,7 @@ impl MetalBackend {
                 },
                 None,
                 &mut arguments,
+                None,
                 None,
             )?;
             let calls = recorder.finish();
@@ -2082,8 +2121,22 @@ impl MetalBackend {
         let values = graph
             .values(values)
             .map_err(|_| BackendError::InvalidInput)?;
-        let commands = graph
-            .template()
+        let mut arena = state
+            .memory_plan
+            .as_ref()
+            .map(|_| self.acquire_graph_arena())
+            .transpose()?;
+        let bound;
+        let template = if let (Some(plan), Some(arena)) = (&state.memory_plan, &arena) {
+            bound = graph
+                .template()
+                .bind_memory(plan, arena.tensor())
+                .map_err(|_| BackendError::InvalidInput)?;
+            &bound
+        } else {
+            graph.template()
+        };
+        let commands = template
             .instantiate(&values)
             .map_err(|_| BackendError::InvalidInput)?;
         for &index in &state.variant_rechecks {
@@ -2100,10 +2153,24 @@ impl MetalBackend {
                 .map_err(|_| BackendError::InvalidInput)?;
             }
         }
-        if profile {
-            self.submit_commands_inner::<true>(commands, Some(state))
+        let submission = if profile {
+            self.submit_commands_inner::<true>(commands, Some(state), arena.as_ref())
         } else {
-            self.submit_commands_inner::<false>(commands, Some(state))
+            self.submit_commands_inner::<false>(commands, Some(state), arena.as_ref())
+        };
+        match submission {
+            Ok(submission) => {
+                if let Some(arena) = &mut arena {
+                    self.commit_graph_arena(arena, &submission.completion)?;
+                }
+                Ok(submission)
+            }
+            Err(error) => {
+                if let Some(arena) = arena {
+                    self.release_graph_arena(&arena);
+                }
+                Err(error)
+            }
         }
     }
 
@@ -2112,6 +2179,7 @@ impl MetalBackend {
         &self,
         commands: CommandList,
         graph: Option<&PreparedMetalGraph>,
+        graph_arena: Option<&GraphArenaReservation>,
     ) -> Result<MetalSubmission, BackendError> {
         #[cfg(test)]
         let submit_started = Instant::now();
@@ -2200,6 +2268,15 @@ impl MetalBackend {
         let encoding_started = PROFILE.then(Instant::now);
         let mut temporary_profile = TemporaryProfileScope::enter(PROFILE);
         let mut argument_writer = ArgumentWriter::new(objects.argument_buffer()?);
+        let graph_arena_binding = graph_arena
+            .map(|arena| {
+                self.buffers
+                    .lock()
+                    .map_err(|_| BackendError::ExecutionFailed)?
+                    .get(arena.tensor())
+                    .map(|buffer| BufferBinding::whole(buffer.raw.clone()))
+            })
+            .transpose()?;
         if let Some(encoding) = graph.and_then(|graph| graph.encoding.as_ref()) {
             argument_writer.copy_image(&encoding.arena)?;
         }
@@ -2218,6 +2295,7 @@ impl MetalBackend {
                     .as_ref()
                     .map(|encoding| encoding.dispatches.as_slice())
             }),
+            graph_arena_binding.as_ref(),
         )?;
         argument_writer.validate_capacity(argument_capacity, dispatches.is_empty())?;
         if let Some(profile) = &mut profile {
@@ -2277,6 +2355,7 @@ impl MetalBackend {
     }
 
     #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_arguments)]
     fn encode_dispatches(
         &self,
         command_buffer: &ProtocolObject<dyn MTL4CommandBuffer>,
@@ -2285,6 +2364,7 @@ impl MetalBackend {
         timestamps: Option<&GpuTimestamps>,
         arguments: &mut ArgumentWriter,
         prepared: Option<&[Option<StaticEncodingPlan>]>,
+        graph_arena: Option<&BufferBinding>,
     ) -> Result<EncodedDispatches, BackendError> {
         use objc2_metal::MTL4CommandEncoder;
         let encoder = command_buffer
@@ -2307,7 +2387,7 @@ impl MetalBackend {
                 .and_then(|plans| plans.get(index))
                 .and_then(Option::as_ref)
             {
-                Self::encode_plan(&encoder, table, plan, &mut bindings, arguments)?;
+                Self::encode_plan(&encoder, table, plan, &mut bindings, arguments, graph_arena)?;
                 continue;
             }
             self.encode_dispatch(
@@ -2351,6 +2431,7 @@ impl MetalBackend {
         plan: &StaticEncodingPlan,
         bindings: &mut ArgumentBindings,
         arguments: &mut ArgumentWriter,
+        graph_arena: Option<&BufferBinding>,
     ) -> Result<(), BackendError> {
         use objc2_metal::MTL4ComputeCommandEncoder;
 
@@ -2376,6 +2457,22 @@ impl MetalBackend {
                             arguments.written.push((*offset, *len));
                             BoundRange {
                                 base: arguments.raw.gpuAddress(),
+                                offset: *offset,
+                                len: *len,
+                                address,
+                            }
+                        }
+                        PlannedRange::GraphArena { offset, len } => {
+                            let arena = graph_arena.ok_or(BackendError::ExecutionFailed)?;
+                            let address = arena
+                                .address
+                                .checked_add(
+                                    u64::try_from(*offset)
+                                        .map_err(|_| BackendError::ExecutionFailed)?,
+                                )
+                                .ok_or(BackendError::ExecutionFailed)?;
+                            BoundRange {
+                                base: arena.raw.gpuAddress(),
                                 offset: *offset,
                                 len: *len,
                                 address,
@@ -7202,7 +7299,7 @@ mod tests {
     #[test]
     fn plan_recorder_is_scoped_and_preserves_call_order() {
         record_plan_call(PlanCall::ArgumentTable);
-        let recorder = PlanRecorderScope::enter(0);
+        let recorder = PlanRecorderScope::enter(0, None);
         record_plan_call(PlanCall::ArgumentTable);
         record_plan_call(PlanCall::Dispatch {
             threadgroups: MTLSize {
@@ -7227,7 +7324,7 @@ mod tests {
             && threads_per_threadgroup.width == 33
             && threads_per_threadgroup.height == 1
             && threads_per_threadgroup.depth == 1));
-        assert!(PlanRecorderScope::enter(0).finish().is_empty());
+        assert!(PlanRecorderScope::enter(0, None).finish().is_empty());
     }
 
     #[test]

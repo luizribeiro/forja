@@ -20,8 +20,9 @@ use crate::encoding::{
 };
 use block2::RcBlock;
 use forja_core::{
-    AllocationRegistry, Backend, BackendError, BufferId, CommandList, DType, GraphTemplate, Layout,
-    MappedRegion, MemoryUsage, PreparedGraph, ReadonlyImport, Tensor, ViewOp,
+    AllocationRegistry, Backend, BackendError, BufferId, CommandList, DType, GraphMemoryPlan,
+    GraphTemplate, Layout, MappedRegion, MemoryUsage, PreparedGraph, ReadonlyImport, Tensor,
+    ViewOp,
     program::{KernelSignature, ProgramHash, ValidatedProgram},
 };
 use objc2::{rc::Retained, runtime::ProtocolObject};
@@ -202,7 +203,6 @@ pub(super) struct GraphArenaReservation {
 }
 
 impl GraphArenaReservation {
-    #[expect(dead_code, reason = "reserved for graph replay binding")]
     pub(super) const fn tensor(&self) -> &Tensor {
         &self.tensor
     }
@@ -788,7 +788,6 @@ impl MetalBackend {
         Ok(())
     }
 
-    #[expect(dead_code, reason = "reserved for graph replay binding")]
     pub(super) fn ensure_graph_arenas(&self, bytes: u64) -> Result<(), BackendError> {
         let mut arenas = self
             .graph_arenas
@@ -837,7 +836,6 @@ impl MetalBackend {
         Ok(())
     }
 
-    #[expect(dead_code, reason = "reserved for graph replay binding")]
     pub(super) fn acquire_graph_arena(&self) -> Result<GraphArenaReservation, BackendError> {
         let mut arenas = self
             .graph_arenas
@@ -862,7 +860,6 @@ impl MetalBackend {
         })
     }
 
-    #[expect(dead_code, reason = "reserved for graph replay binding")]
     pub(super) fn commit_graph_arena(
         &self,
         reservation: &mut GraphArenaReservation,
@@ -882,7 +879,6 @@ impl MetalBackend {
         Ok(())
     }
 
-    #[expect(dead_code, reason = "reserved for graph replay binding")]
     pub(super) fn release_graph_arena(&self, reservation: &GraphArenaReservation) {
         if reservation.committed {
             return;
@@ -1104,6 +1100,18 @@ impl Backend for MetalBackend {
     fn prepare_graph(&self, graph: GraphTemplate) -> Result<PreparedGraph, BackendError> {
         let state = self.prepare_metal_graph(&graph)?;
         Ok(PreparedGraph::with_backend_state(graph, state))
+    }
+
+    fn graph_memory_depth(&self) -> usize {
+        GRAPH_ARENA_DEPTH
+    }
+
+    fn prepare_graph_memory(
+        &self,
+        graph: GraphTemplate,
+        plan: GraphMemoryPlan,
+    ) -> Result<PreparedGraph, BackendError> {
+        self.prepare_metal_graph_memory(graph, plan)
     }
 
     fn replay(
