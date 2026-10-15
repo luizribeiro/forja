@@ -1007,6 +1007,8 @@ struct ReusableSubmissionObjects {
     allocator: Retained<ProtocolObject<dyn MTL4CommandAllocator>>,
     argument_table: Retained<ProtocolObject<dyn MTL4ArgumentTable>>,
     argument_buffer: ArgumentBuffer,
+    residency: Retained<ProtocolObject<dyn MTLResidencySet>>,
+    timestamps: GpuTimestamps,
 }
 
 // SAFETY: Ownership moves between the encoding thread and the completion tracker, and the
@@ -1041,6 +1043,20 @@ impl SubmissionObjects {
             .ok_or(BackendError::ExecutionFailed)
     }
 
+    fn residency(&self) -> Result<Retained<ProtocolObject<dyn MTLResidencySet>>, BackendError> {
+        self.reusable
+            .as_ref()
+            .map(|objects| objects.residency.clone())
+            .ok_or(BackendError::ExecutionFailed)
+    }
+
+    fn timestamps(&self) -> Result<GpuTimestamps, BackendError> {
+        self.reusable
+            .as_ref()
+            .map(|objects| objects.timestamps.clone())
+            .ok_or(BackendError::ExecutionFailed)
+    }
+
     fn take(&mut self) -> Result<ReusableSubmissionObjects, BackendError> {
         self.reusable.take().ok_or(BackendError::ExecutionFailed)
     }
@@ -1059,6 +1075,7 @@ fn reset_allocator(allocator: &ProtocolObject<dyn MTL4CommandAllocator>) {
     allocator.reset();
 }
 
+#[derive(Clone)]
 struct GpuTimestamps {
     heap: Retained<ProtocolObject<dyn MTL4CounterHeap>>,
     frequency: u64,
@@ -1066,29 +1083,48 @@ struct GpuTimestamps {
     count: usize,
 }
 
-// SAFETY: Counter heaps remain immutable on the CPU while the retained submission is in flight,
-// and timestamp resolution happens only after the shared event establishes GPU completion.
+// SAFETY: The heap is encoded by the checkout owner, then resolved after GPU completion and before
+// the owning slot returns to the pool. The completion retains only the resulting owned bytes.
 unsafe impl Send for GpuTimestamps {}
 
-// SAFETY: Shared access only resolves completed timestamp data and does not mutate the heap.
+// SAFETY: Shared access only retains the heap; resolution is serialized by the completion.
 unsafe impl Sync for GpuTimestamps {}
 
 impl GpuTimestamps {
+    fn resolve(self) -> Option<ResolvedTimestamps> {
+        // SAFETY: The range covers the heap, GPU completion has been observed, and the tracker
+        // resolves the data before returning the heap's slot to the reusable pool.
+        let data = unsafe { self.heap.resolveCounterRange(NSRange::new(0, self.count)) }?;
+        Some(ResolvedTimestamps {
+            bytes: data.to_vec(),
+            frequency: self.frequency,
+            entry_size: self.entry_size,
+        })
+    }
+}
+
+struct ResolvedTimestamps {
+    bytes: Vec<u8>,
+    frequency: u64,
+    entry_size: usize,
+}
+
+impl ResolvedTimestamps {
     fn elapsed(&self) -> Option<Duration> {
         self.elapsed_pairs(&[(0, 1)])?.pop()
     }
 
     fn elapsed_pairs(&self, pairs: &[(usize, usize)]) -> Option<Vec<Duration>> {
-        // SAFETY: The requested range covers the heap and resolution follows GPU completion.
-        let data = unsafe { self.heap.resolveCounterRange(NSRange::new(0, self.count)) }?;
-        let bytes = data.to_vec();
         pairs
             .iter()
             .map(|&(start, end)| {
                 let read = |index: usize| {
                     let offset = self.entry_size.checked_mul(index)?;
                     Some(u64::from_ne_bytes(
-                        bytes.get(offset..offset.checked_add(8)?)?.try_into().ok()?,
+                        self.bytes
+                            .get(offset..offset.checked_add(8)?)?
+                            .try_into()
+                            .ok()?,
                     ))
                 };
                 let ticks = read(end)?.checked_sub(read(start)?)?;
@@ -1167,7 +1203,8 @@ pub(super) struct Completion {
     event: InFlightEvent,
     resources: CommandResources,
     _residency: InFlightResidency,
-    timestamps: Option<GpuTimestamps>,
+    timestamps: Mutex<Option<GpuTimestamps>>,
+    resolved_timestamps: OnceLock<Option<ResolvedTimestamps>>,
     tracker: Weak<InFlightTracker>,
     dependencies: Mutex<Vec<Arc<Completion>>>,
     commit: CommitRetention,
@@ -1234,7 +1271,8 @@ impl Completion {
                 event,
                 resources,
                 _residency: residency,
-                timestamps,
+                timestamps: Mutex::new(timestamps),
+                resolved_timestamps: OnceLock::new(),
                 tracker,
                 dependencies: Mutex::new(dependencies),
                 commit: CommitRetention {
@@ -1292,6 +1330,7 @@ impl Completion {
                 let mut result = commit_result(feedback, state.event_value);
                 state.resolving = true;
                 drop(state);
+                self.resolve_timestamps();
                 if let Some(tracker) = self.tracker.upgrade() {
                     tracker.drain_done();
                 }
@@ -1476,12 +1515,22 @@ impl Completion {
             })
     }
 
+    fn resolve_timestamps(&self) {
+        self.resolved_timestamps.get_or_init(|| {
+            self.timestamps
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+                .and_then(GpuTimestamps::resolve)
+        });
+    }
+
     fn gpu_time(&self) -> Option<Duration> {
-        self.timestamps.as_ref()?.elapsed()
+        self.resolved_timestamps.get()?.as_ref()?.elapsed()
     }
 
     fn dispatch_times(&self, metadata: &[DispatchProfile]) -> Option<Vec<DispatchProfile>> {
-        let timestamps = self.timestamps.as_ref()?;
+        let timestamps = self.resolved_timestamps.get()?.as_ref()?;
         metadata
             .iter()
             .enumerate()
@@ -1655,6 +1704,11 @@ impl InFlightTracker {
             .newArgumentTableWithDescriptor_error(&descriptor)
             .map_err(|_| BackendError::ExecutionFailed)?;
         let raw = backend.new_buffer(argument_capacity)?;
+        let residency = device
+            .newResidencySetWithDescriptor_error(&MTLResidencySetDescriptor::new())
+            .map_err(|_| BackendError::ExecutionFailed)?;
+        residency.commit();
+        let timestamps = backend.make_timestamps(2)?;
         Ok(ReusableSubmissionObjects {
             allocator,
             argument_table,
@@ -1662,6 +1716,8 @@ impl InFlightTracker {
                 raw,
                 capacity: argument_capacity,
             },
+            residency,
+            timestamps,
         })
     }
 
@@ -1732,6 +1788,9 @@ impl InFlightTracker {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
         );
+        for completed in &done {
+            completed.completion.resolve_timestamps();
+        }
         let mut pool = self
             .pool
             .lock()
@@ -2114,16 +2173,16 @@ impl MetalBackend {
         )?;
         let mut objects = self.in_flight.checkout(self, argument_capacity)?;
         let command_buffer = self.begin_command_buffer(objects.allocator()?)?;
-        let timestamp_count = if PROFILE {
-            dispatches
+        let timestamps = if PROFILE {
+            let count = dispatches
                 .len()
                 .checked_mul(2)
                 .and_then(|count| count.checked_add(2))
-                .ok_or(BackendError::ExecutionFailed)?
+                .ok_or(BackendError::ExecutionFailed)?;
+            self.make_timestamps(count)?
         } else {
-            2
+            objects.timestamps()?
         };
-        let timestamps = self.make_timestamps(timestamp_count)?;
         // SAFETY: `make_timestamps` always reserves at least two entries, so indices 0 and 1 are
         // in range.
         unsafe {
@@ -2163,7 +2222,8 @@ impl MetalBackend {
             self.command_resources(&tensors, encoded, graph.map(|prepared| &prepared.buffers))?;
         objects.programs = prepared_programs;
         let residency_started = PROFILE.then(Instant::now);
-        let residency = self.make_resident(&command_buffer, &resources)?;
+        let residency = objects.residency()?;
+        Self::make_resident(&command_buffer, &residency, &resources);
         if let Some(graph) = graph {
             command_buffer.useResidencySet(&graph.residency);
         }
@@ -5987,15 +6047,11 @@ impl MetalBackend {
     }
 
     fn make_resident(
-        &self,
         command_buffer: &ProtocolObject<dyn MTL4CommandBuffer>,
+        residency: &ProtocolObject<dyn MTLResidencySet>,
         resources: &CommandResources,
-    ) -> Result<Retained<ProtocolObject<dyn MTLResidencySet>>, BackendError> {
-        let descriptor = MTLResidencySetDescriptor::new();
-        let residency = self
-            .device
-            .newResidencySetWithDescriptor_error(&descriptor)
-            .map_err(|_| BackendError::ExecutionFailed)?;
+    ) {
+        residency.removeAllAllocations();
         for buffer in &resources.buffers {
             if buffer.pool_resident {
                 continue;
@@ -6005,8 +6061,7 @@ impl MetalBackend {
             residency.addAllocation(allocation);
         }
         residency.commit();
-        command_buffer.useResidencySet(&residency);
-        Ok(residency)
+        command_buffer.useResidencySet(residency);
     }
 
     fn retain_tensors(
@@ -7919,6 +7974,37 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_submission_gpu_times_survive_slot_reuse() {
+        let backend = Arc::new(MetalBackend::new().unwrap());
+        let workloads = submission_workloads(&backend, MAX_IN_FLIGHT_SUBMISSIONS);
+        let pooled = (0..MAX_IN_FLIGHT_SUBMISSIONS)
+            .map(|_| backend.in_flight.checkout(&backend, 4096).unwrap())
+            .collect::<Vec<_>>();
+        drop(pooled);
+
+        let counts = [1, 16, 256, 4096];
+        let original = run_submission_wave(&backend, &workloads, &counts);
+        let shortest = original[0].1;
+        let longest = original[3].1;
+        assert!(shortest > Duration::ZERO);
+        assert!(longest >= shortest.saturating_mul(4));
+        for (_, gpu, wall) in &original {
+            assert!(*gpu <= *wall, "GPU {gpu:?}, wall {wall:?}");
+        }
+
+        for _ in 0..4 {
+            drop(run_submission_wave(
+                &backend,
+                &workloads,
+                &[4096, 256, 16, 1],
+            ));
+        }
+        for (submission, expected, _) in original {
+            assert_eq!(submission.gpu_time(), Some(expected));
+        }
+    }
+
+    #[test]
     fn profiled_submission_reports_phases_and_dispatches() {
         let backend = MetalBackend::new().unwrap();
         let left = backend.alloc(DType::F32, &[7, 33]).unwrap();
@@ -8499,7 +8585,8 @@ mod tests {
                 None,
             )
             .unwrap();
-        let residency = backend.make_resident(&command_buffer, &resources).unwrap();
+        let residency = objects.residency().unwrap();
+        MetalBackend::make_resident(&command_buffer, &residency, &resources);
         let timestamps = backend.make_timestamps(2).unwrap();
         // SAFETY: The heap has two entries and remains live through completion.
         unsafe {
