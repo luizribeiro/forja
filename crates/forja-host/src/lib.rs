@@ -1498,6 +1498,13 @@ enum RecordedDispatch {
         inputs: Vec<TemplateTensor>,
         outputs: Vec<TemplateTensor>,
     },
+    Epilogue {
+        op: TemplateOp,
+        inputs: Vec<TemplateTensor>,
+        output: Box<TemplateTensor>,
+        epilogue: Arc<PreparedEpilogue>,
+        extras: Vec<TemplateTensor>,
+    },
 }
 
 fn record_graph_dispatch(
@@ -1545,6 +1552,17 @@ fn record_graph_dispatch(
             let outputs = outputs.iter().collect::<Vec<_>>();
             graph.dispatch_kernel(program, &inputs, &outputs)
         }
+        RecordedDispatch::Epilogue {
+            op,
+            inputs,
+            output,
+            epilogue,
+            extras,
+        } => {
+            let inputs = inputs.iter().collect::<Vec<_>>();
+            let extras = extras.iter().collect::<Vec<_>>();
+            graph.dispatch_epilogue(*op, &inputs, output.as_ref(), epilogue, &extras)
+        }
     }
 }
 
@@ -1559,6 +1577,7 @@ pub struct CommandListEntry {
     parameterized: bool,
     retained: Vec<TensorEntry>,
     retained_kernels: Vec<KernelEntry>,
+    retained_epilogues: Vec<EpilogueEntry>,
 }
 
 /// Host-owned state behind a guest graph resource.
@@ -1568,6 +1587,7 @@ pub struct GraphEntry {
     access: SubmissionAccess,
     retained: Vec<TensorEntry>,
     retained_kernels: Vec<KernelEntry>,
+    retained_epilogues: Vec<EpilogueEntry>,
     _lease: GraphLease,
 }
 
@@ -2193,6 +2213,7 @@ impl<B: Backend + 'static> Host<B> {
                 parameterized: false,
                 retained: Vec::new(),
                 retained_kernels: Vec::new(),
+                retained_epilogues: Vec::new(),
             })
             .map_err(invalid_handle)
     }
@@ -2465,6 +2486,103 @@ impl<B: Backend + 'static> Host<B> {
         Ok(())
     }
 
+    /// Validates and records a primitive with a guest-authored scalar epilogue.
+    ///
+    /// # Errors
+    ///
+    /// Returns an operation, quota, or invalid-handle error before recording invalid work.
+    pub fn dispatch_epilogue(
+        &mut self,
+        commands: &Resource<CommandListEntry>,
+        operation: compute::Op,
+        inputs: &[Resource<TensorEntry>],
+        output: &Resource<TensorEntry>,
+        epilogue: &Resource<EpilogueEntry>,
+        extras: &[Resource<TensorEntry>],
+    ) -> Result<(), compute::Error> {
+        let (template_op, concrete_op) = core_op(operation);
+        let operation = concrete_op.ok_or_else(|| {
+            compute::Error::OpSignature("epilogue operation must be static".to_owned())
+        })?;
+        let input_entries = inputs
+            .iter()
+            .map(|resource| self.entry(resource).cloned())
+            .collect::<Result<Vec<_>, _>>()?;
+        let extra_entries = extras
+            .iter()
+            .map(|resource| self.entry(resource).cloned())
+            .collect::<Result<Vec<_>, _>>()?;
+        let output_entry = self.entry(output)?.clone();
+        let prepared = Arc::clone(self.table.get(epilogue).map_err(invalid_handle)?.prepared());
+        let input_tensors = input_entries
+            .iter()
+            .map(|entry| &entry.tensor)
+            .collect::<Vec<_>>();
+        let extra_tensors = extra_entries
+            .iter()
+            .map(|entry| &entry.tensor)
+            .collect::<Vec<_>>();
+        let mut all_entries = input_entries.clone();
+        all_entries.extend(extra_entries.clone());
+        let dispatch_space = tensor_space(all_entries.iter().chain([&output_entry]))?;
+        let entry = self.table.get(commands).map_err(invalid_handle)?;
+        if entry.recorded.len() >= self.limits.dispatches_per_list {
+            return Err(quota("command list dispatch count exceeds the guest limit"));
+        }
+        merge_parameter_space(entry.space.as_ref(), dispatch_space.as_ref())?;
+        self.check_dispatch_work(operation, &input_tensors, &[&output_entry.tensor])?;
+        let template_inputs = input_entries
+            .iter()
+            .map(TensorEntry::template)
+            .collect::<Result<Vec<_>, _>>()?;
+        let template_extras = extra_entries
+            .iter()
+            .map(TensorEntry::template)
+            .collect::<Result<Vec<_>, _>>()?;
+        let template_output = output_entry.template()?;
+
+        let entry = self.table.get_mut(commands).map_err(invalid_handle)?;
+        if dispatch_space.is_none() {
+            entry
+                .commands
+                .dispatch_epilogue(
+                    operation,
+                    &input_tensors,
+                    &output_entry.tensor,
+                    &prepared,
+                    &extra_tensors,
+                )
+                .map_err(guest_error)?;
+            let dispatch = entry
+                .commands
+                .last_dispatch()
+                .cloned()
+                .ok_or_else(|| guest_error(BackendError::ExecutionFailed))?;
+            entry
+                .recorded
+                .push(RecordedDispatch::Static(Box::new(dispatch)));
+        } else {
+            entry.parameterized = true;
+            entry.recorded.push(RecordedDispatch::Epilogue {
+                op: template_op,
+                inputs: template_inputs,
+                output: Box::new(template_output),
+                epilogue: Arc::clone(&prepared),
+                extras: template_extras,
+            });
+        }
+        entry.space = entry.space.take().or(dispatch_space);
+        entry
+            .access
+            .record(&all_entries, std::slice::from_ref(&output_entry));
+        entry.retained.extend(all_entries);
+        entry.retained.push(output_entry);
+        entry
+            .retained_epilogues
+            .push(EpilogueEntry { epilogue: prepared });
+        Ok(())
+    }
+
     fn drop_command_list(
         &mut self,
         resource: Resource<CommandListEntry>,
@@ -2578,6 +2696,7 @@ impl<B: Backend + 'static> Host<B> {
             access: entry.access,
             retained: Vec::new(),
             retained_kernels: Vec::new(),
+            retained_epilogues: Vec::new(),
             _lease: lease,
         };
         let resource = match self.table.push(graph_entry) {
@@ -2590,6 +2709,7 @@ impl<B: Backend + 'static> Host<B> {
         let graph = self.table.get_mut(&resource).map_err(invalid_handle)?;
         graph.retained = entry.retained;
         graph.retained_kernels = entry.retained_kernels;
+        graph.retained_epilogues = entry.retained_epilogues;
         Ok(resource)
     }
 
@@ -3878,6 +3998,21 @@ where
         let _timer = self.import_timer(ImportKind::Dispatch);
         std::future::ready(Ok(Host::dispatch_kernel(
             self, &resource, &kernel, &inputs, &outputs,
+        )))
+    }
+
+    fn dispatch_epilogue(
+        &mut self,
+        resource: Resource<CommandListEntry>,
+        operation: compute::Op,
+        inputs: Vec<Resource<TensorEntry>>,
+        output: Resource<TensorEntry>,
+        epilogue: Resource<EpilogueEntry>,
+        extras: Vec<Resource<TensorEntry>>,
+    ) -> impl Future<Output = wasmtime::Result<Result<(), compute::Error>>> + Send {
+        let _timer = self.import_timer(ImportKind::Dispatch);
+        std::future::ready(Ok(Host::dispatch_epilogue(
+            self, &resource, operation, &inputs, &output, &epilogue, &extras,
         )))
     }
 
@@ -5797,6 +5932,43 @@ mod tests {
             host.create_epilogue(doubling_program(2.0), signature),
             Err(compute::Error::OpSignature(_))
         ));
+        assert_eq!(host.live_kernels.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn command_list_retains_bound_epilogues() {
+        let mut host = Host::new(CpuBackend::new(), GENEROUS.with_kernel_limit(1));
+        let left = host.alloc(compute::Dtype::F32, &[7, 33]).unwrap();
+        let right = host.alloc(compute::Dtype::F32, &[33, 17]).unwrap();
+        let output = host.alloc(compute::Dtype::F32, &[7, 17]).unwrap();
+        let commands = host.command_list().unwrap();
+        let epilogue = host
+            .create_epilogue(doubling_program(2.0), unary_f32_epilogue(2))
+            .unwrap();
+
+        host.dispatch_epilogue(
+            &commands,
+            compute::Op::Matmul,
+            &[left, right],
+            &output,
+            &epilogue,
+            &[],
+        )
+        .unwrap();
+        assert!(
+            host.table
+                .get(&commands)
+                .unwrap()
+                .commands
+                .last_dispatch()
+                .unwrap()
+                .prepared_epilogue()
+                .is_some()
+        );
+
+        host.drop_epilogue(epilogue).unwrap();
+        assert_eq!(host.live_kernels.load(Ordering::Acquire), 1);
+        host.drop_command_list(commands).unwrap();
         assert_eq!(host.live_kernels.load(Ordering::Acquire), 0);
     }
 
