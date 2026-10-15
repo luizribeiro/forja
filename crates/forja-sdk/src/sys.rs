@@ -163,6 +163,7 @@ pub(crate) trait Backend {
     ) -> Result<Self::Tensor>;
     fn read(tensor: &Self::Tensor) -> Result<Vec<u8>>;
     fn command_list() -> Result<Self::Commands>;
+    fn graph_output(commands: &mut Self::Commands, tensor: &Self::Tensor) -> Result<()>;
     fn dispatch(
         commands: &mut Self::Commands,
         operation: Op,
@@ -322,6 +323,10 @@ pub(crate) mod guest {
 
         fn command_list() -> Result<Self::Commands> {
             Ok(compute::CommandList::new())
+        }
+
+        fn graph_output(commands: &mut Self::Commands, tensor: &Self::Tensor) -> Result<()> {
+            commands.output(tensor).map_err(|error| guest_error(&error))
         }
 
         fn dispatch(
@@ -661,6 +666,10 @@ pub(crate) mod unavailable {
             Err(error())
         }
 
+        fn graph_output(_commands: &mut Self::Commands, _tensor: &Self::Tensor) -> Result<()> {
+            Err(error())
+        }
+
         fn dispatch(
             _commands: &mut Self::Commands,
             _operation: Op,
@@ -934,6 +943,10 @@ pub(crate) mod native {
                 #[cfg(all(feature = "native-metal", target_os = "macos"))]
                 NativeDevice::Metal => with_metal(|host| Ok(Commands::Metal(host.command_list()))),
             }
+        }
+
+        fn graph_output(_commands: &mut Self::Commands, _tensor: &Self::Tensor) -> Result<()> {
+            Err(Error::new("graph capture requires a WebAssembly host"))
         }
 
         fn dispatch(
@@ -1288,6 +1301,10 @@ pub(crate) fn read(tensor: &Handle) -> Result<Vec<u8>> {
 
 pub(crate) fn command_list() -> Result<Commands> {
     Active::command_list()
+}
+
+pub(crate) fn graph_output(commands: &mut Commands, tensor: &Handle) -> Result<()> {
+    Active::graph_output(commands, tensor)
 }
 
 pub(crate) fn dispatch(

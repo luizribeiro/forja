@@ -6,7 +6,7 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use crate::{Result, sys};
+use crate::{Element, Result, Tensor, sys};
 
 thread_local! {
     static CURRENT: RefCell<Option<Recording>> = const { RefCell::new(None) };
@@ -154,6 +154,56 @@ pub struct Graph<T> {
     result: T,
 }
 
+/// Values whose tensor storage remains valid after a captured graph replays.
+pub trait GraphResult {
+    #[doc(hidden)]
+    fn protect_graph_result(&self) -> Result<()>;
+}
+
+impl<T: Element> GraphResult for Tensor<T> {
+    fn protect_graph_result(&self) -> Result<()> {
+        CURRENT.with(|current| {
+            let mut current = current.borrow_mut();
+            let Some(Recording::Capture { commands, .. }) = current.as_mut() else {
+                return Err(crate::Error::new("graph result requires active capture"));
+            };
+            sys::graph_output(commands, self.handle())
+        })
+    }
+}
+
+impl GraphResult for () {
+    fn protect_graph_result(&self) -> Result<()> {
+        Ok(())
+    }
+}
+
+impl<T: GraphResult> GraphResult for Vec<T> {
+    fn protect_graph_result(&self) -> Result<()> {
+        self.iter().try_for_each(GraphResult::protect_graph_result)
+    }
+}
+
+impl<T: GraphResult> GraphResult for Option<T> {
+    fn protect_graph_result(&self) -> Result<()> {
+        self.as_ref()
+            .map_or(Ok(()), GraphResult::protect_graph_result)
+    }
+}
+
+impl<T: Element> GraphResult for T {
+    fn protect_graph_result(&self) -> Result<()> {
+        Ok(())
+    }
+}
+
+impl<A: GraphResult, B: GraphResult> GraphResult for (A, B) {
+    fn protect_graph_result(&self) -> Result<()> {
+        self.0.protect_graph_result()?;
+        self.1.protect_graph_result()
+    }
+}
+
 impl<T> Graph<T> {
     /// Replays the captured graph with concrete parameter values.
     ///
@@ -177,7 +227,10 @@ impl<T> Graph<T> {
 ///
 /// Returns an error for nested capture, pending lazy work, a duplicate parameter,
 /// a trace failure, or a host-refused graph.
-pub fn capture<T>(params: &[&Param], trace: impl FnOnce() -> Result<T>) -> Result<Graph<T>> {
+pub fn capture<T: GraphResult>(
+    params: &[&Param],
+    trace: impl FnOnce() -> Result<T>,
+) -> Result<Graph<T>> {
     let mut ids = Vec::with_capacity(params.len());
     for parameter in params {
         if ids.contains(&parameter.id) {
@@ -205,6 +258,9 @@ pub fn capture<T>(params: &[&Param], trace: impl FnOnce() -> Result<T>) -> Resul
         drop(current);
 
         let result = trace();
+        let protection = result
+            .as_ref()
+            .map_or(Ok(()), GraphResult::protect_graph_result);
         let recording = CURRENT
             .with(|current| current.borrow_mut().take())
             .ok_or_else(|| crate::Error::new("capture recording was lost"))?;
@@ -213,6 +269,7 @@ pub fn capture<T>(params: &[&Param], trace: impl FnOnce() -> Result<T>) -> Resul
             Recording::Lazy(_) => return Err(crate::Error::new("capture recording was replaced")),
         };
         let result = result?;
+        protection?;
         Ok(Graph {
             graph: sys::create_graph(commands)?,
             result,

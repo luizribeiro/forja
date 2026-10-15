@@ -207,6 +207,7 @@ interface compute {
 
   resource command-list {
     constructor();
+    output: func(value: borrow<tensor>) -> result<_, error>;
     dispatch: func(operation: op, ins: list<borrow<tensor>>, out: borrow<tensor>) -> result<_, error>;
     dispatch-many: func(operation: op, ins: list<borrow<tensor>>, outs: list<borrow<tensor>>) -> result<_, error>;
     dispatch-kernel: func(k: borrow<kernel>, ins: list<borrow<tensor>>, outs: list<borrow<tensor>>) -> result<_, error>;

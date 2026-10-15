@@ -118,7 +118,7 @@ pub use engine::{
     SamplingParams, StepInput, StepOutput, VariantPickArm, VariantRulePick,
 };
 pub use forja_sdk_macros::{Load, export_engine, kernel};
-pub use graph::{Dim, Graph, Param, Pos, capture, eval};
+pub use graph::{Dim, Graph, GraphResult, Param, Pos, capture, eval};
 pub use half::{bf16, f16};
 pub use load::{Load, Weights};
 pub use selections::{EngineSelections, EngineTunings, Tuning, VariantSelection};

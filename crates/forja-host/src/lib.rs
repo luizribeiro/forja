@@ -1531,6 +1531,7 @@ pub struct CommandListEntry {
     commands: CommandList,
     recorded: Vec<RecordedDispatch>,
     access: SubmissionAccess,
+    protected: HashSet<BufferId>,
     space: Option<ParamSpace>,
     parameterized: bool,
     retained: Vec<TensorEntry>,
@@ -2164,12 +2165,33 @@ impl<B: Backend + 'static> Host<B> {
                 commands: CommandList::new(),
                 recorded: Vec::new(),
                 access: SubmissionAccess::default(),
+                protected: HashSet::new(),
                 space: None,
                 parameterized: false,
                 retained: Vec::new(),
                 retained_kernels: Vec::new(),
             })
             .map_err(invalid_handle)
+    }
+
+    fn graph_output(
+        &mut self,
+        commands: &Resource<CommandListEntry>,
+        tensor: &Resource<TensorEntry>,
+    ) -> Result<(), compute::Error> {
+        let buffer = self.entry(tensor)?.tensor.buffer();
+        let entry = self.table.get_mut(commands).map_err(invalid_handle)?;
+        if !entry
+            .retained
+            .iter()
+            .any(|retained| retained.tensor.buffer() == buffer)
+        {
+            return Err(compute::Error::OpSignature(
+                "graph output was not used by the command list".to_owned(),
+            ));
+        }
+        entry.protected.insert(buffer);
+        Ok(())
     }
 
     fn create_kernel(
@@ -2409,7 +2431,11 @@ impl<B: Backend + 'static> Host<B> {
         let reachable = entry
             .retained
             .iter()
-            .filter(|entry| entry.buffer.guest_reachable())
+            .filter(|retained| {
+                retained.buffer.guest_reachable()
+                    || retained.symbolic.is_some()
+                    || entry.protected.contains(&retained.tensor.buffer())
+            })
             .map(|entry| entry.tensor.buffer())
             .collect::<HashSet<_>>();
         let depth = self.backend.graph_memory_depth();
@@ -3758,6 +3784,14 @@ where
         std::future::ready(Host::command_list(self).map_err(wasmtime::Error::msg))
     }
 
+    fn output(
+        &mut self,
+        resource: Resource<CommandListEntry>,
+        value: Resource<TensorEntry>,
+    ) -> impl Future<Output = wasmtime::Result<Result<(), compute::Error>>> + Send {
+        std::future::ready(Ok(self.graph_output(&resource, &value)))
+    }
+
     fn dispatch(
         &mut self,
         resource: Resource<CommandListEntry>,
@@ -4895,6 +4929,46 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(planned, unplanned);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dropped_graph_output_remains_stable_across_replays() {
+        let mut host = Host::new(forja_metal::MetalBackend::new().unwrap(), GENEROUS);
+        let input = host.alloc(compute::Dtype::F32, &[4]).unwrap();
+        let transient = host.alloc(compute::Dtype::F32, &[4]).unwrap();
+        let output = host.alloc(compute::Dtype::F32, &[4]).unwrap();
+        let sink = host.alloc(compute::Dtype::F32, &[4]).unwrap();
+        let expected = f32_bytes(&[1.0, 2.0, 3.0, 4.0]);
+        host.write(&input, &expected).unwrap();
+        let output_tensor = host.entry(&output).unwrap().tensor.clone();
+        let commands = host.command_list().unwrap();
+        for (source, target) in [
+            (&input, &transient),
+            (&transient, &output),
+            (&output, &sink),
+        ] {
+            host.dispatch(
+                &commands,
+                compute::Op::Copy,
+                &[Resource::new_borrow(source.rep())],
+                &Resource::new_borrow(target.rep()),
+            )
+            .unwrap();
+        }
+        host.graph_output(&commands, &output).unwrap();
+        host.drop_tensor(transient).unwrap();
+        host.drop_tensor(output).unwrap();
+        let graph = host.create_graph(commands).unwrap();
+
+        for _ in 0..16 {
+            host.prepare_replay(&graph, Vec::new())
+                .unwrap()
+                .run()
+                .await
+                .unwrap();
+            assert_eq!(host.backend.read(&output_tensor).unwrap(), expected);
+        }
     }
 
     #[cfg(target_os = "macos")]
