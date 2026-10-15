@@ -12,9 +12,11 @@ minijinja.workspace = true
 minijinja-contrib.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
+wasmtime.workspace = true
 
 [dev-dependencies]
 tokenizers.workspace = true
+test-guests = { path = "../../support/test-guests" }
 
 [lints]
 workspace = true

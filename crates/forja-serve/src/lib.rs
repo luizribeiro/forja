@@ -2,6 +2,7 @@
 
 #![forbid(unsafe_code)]
 
+mod chat_format;
 mod request;
 mod stop;
 
@@ -11,6 +12,7 @@ use minijinja::{AutoEscape, Environment, UndefinedBehavior};
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
+pub use chat_format::{ChatFormat, ChatFormatLimits, ChatInfo, SamplingDefaults};
 pub use request::{
     ChatCompletionRequest, CompletionParams, CompletionRequest, Message, ResolvedParams, Stop,
     ValidationError, serving_context_ceiling, validate_chat, validate_completion,

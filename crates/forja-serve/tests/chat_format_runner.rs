@@ -1,0 +1,60 @@
+//! Sandboxing checks for chat-format components.
+
+use forja_serve::{ChatFormat, ChatFormatLimits};
+
+#[test]
+fn runs_a_bounded_zero_import_chat_format() {
+    let limits = ChatFormatLimits {
+        fuel: 10_000_000,
+        input_bytes: 4096,
+        output_bytes: 4096,
+        ..ChatFormatLimits::default()
+    };
+    let mut format = ChatFormat::load(test_guests::chat_format_smoke(), limits).unwrap();
+    let info = format.info().unwrap();
+    assert_eq!(info.stop_token_ids, [2]);
+    assert_eq!(
+        format.render("[]", "[]", "{}").unwrap().unwrap(),
+        "rendered:[]"
+    );
+    let output_error = format.render("[]", "[]", r#"{"large":true}"#).unwrap_err();
+    assert_eq!(
+        output_error.to_string(),
+        "chat format output exceeds its byte limit"
+    );
+    let input_error = ChatFormat::load(
+        test_guests::chat_format_smoke(),
+        ChatFormatLimits {
+            input_bytes: 5,
+            ..ChatFormatLimits::default()
+        },
+    )
+    .unwrap()
+    .render("[]", "[]", "{}")
+    .unwrap_err();
+    assert_eq!(
+        input_error.to_string(),
+        "chat format input exceeds its byte limit"
+    );
+
+    let clock: serde_json::Value = serde_json::from_str(
+        &format
+            .render_at("[]", "[]", r#"{"clock":true}"#, 1_798_761_600, 3600)
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(clock["now_unix_seconds"], 1_798_761_600);
+    assert_eq!(clock["now_utc_offset_seconds"], 3600);
+
+    assert!(format.render("[]", "[]", r#"{"loop":true}"#).is_err());
+}
+
+#[test]
+fn component_declares_no_imports() {
+    let engine = wasmtime::Engine::default();
+    let component =
+        wasmtime::component::Component::from_file(&engine, test_guests::chat_format_smoke())
+            .unwrap();
+    assert_eq!(component.component_type().imports(&engine).count(), 0);
+}

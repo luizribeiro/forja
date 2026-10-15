@@ -28,13 +28,16 @@ impl Guest for Component {
         _tools_json: String,
         options_json: String,
     ) -> Result<String, String> {
-        if options_json == "loop" {
+        if options_json.contains(r#""loop":true"#) {
             loop {
                 std::hint::black_box(());
             }
         }
-        if options_json == "large" {
+        if options_json.contains(r#""large":true"#) {
             return Ok("x".repeat(4097));
+        }
+        if options_json.contains(r#""clock":true"#) {
+            return Ok(options_json);
         }
         Ok(format!("rendered:{messages_json}"))
     }

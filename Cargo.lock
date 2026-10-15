@@ -819,7 +819,9 @@ dependencies = [
  "minijinja-contrib",
  "serde",
  "serde_json",
+ "test-guests",
  "tokenizers",
+ "wasmtime",
 ]
 
 [[package]]
