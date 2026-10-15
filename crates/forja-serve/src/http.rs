@@ -1,4 +1,5 @@
 use std::{
+    convert::Infallible,
     future::Future,
     pin::Pin,
     sync::{
@@ -13,17 +14,21 @@ use axum::{
     body::Bytes,
     extract::{DefaultBodyLimit, FromRequest, Path, Request, State, rejection::BytesRejection},
     http::StatusCode,
-    response::{IntoResponse, Response},
+    response::{
+        IntoResponse, Response,
+        sse::{Event, Sse},
+    },
     routing::{get, post},
 };
 use forja_core::Backend;
 use serde_json::{Value, json};
-use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc};
+use tokio_stream::{StreamExt, wrappers::ReceiverStream};
 
 use crate::engine::ErrorKind;
 use crate::{
-    ChatCompletionRequest, Completion, CompletionRequest, GenerationError, ServingEngine,
-    chat_response, text_response,
+    ChatCompletionRequest, Completion, CompletionRequest, GenerationError, GenerationEvent,
+    ServingEngine, Usage, chat_response, text_response,
 };
 
 /// Asynchronous chat generation used by the HTTP transport.
@@ -51,6 +56,20 @@ pub trait ChatService: Send + 'static {
         &mut self,
         request: CompletionRequest,
     ) -> Pin<Box<dyn Future<Output = Result<Completion, GenerationError>> + Send + '_>>;
+
+    /// Streams one chat request.
+    fn stream_chat(
+        &mut self,
+        request: ChatCompletionRequest,
+        sender: mpsc::Sender<GenerationEvent>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), GenerationError>> + Send + '_>>;
+
+    /// Streams one unformatted text request.
+    fn stream_text(
+        &mut self,
+        request: CompletionRequest,
+        sender: mpsc::Sender<GenerationEvent>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), GenerationError>> + Send + '_>>;
 }
 
 impl<B> ChatService for ServingEngine<B>
@@ -85,6 +104,22 @@ where
         request: CompletionRequest,
     ) -> Pin<Box<dyn Future<Output = Result<Completion, GenerationError>> + Send + '_>> {
         Box::pin(async move { self.complete_text(&request).await })
+    }
+
+    fn stream_chat(
+        &mut self,
+        request: ChatCompletionRequest,
+        sender: mpsc::Sender<GenerationEvent>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), GenerationError>> + Send + '_>> {
+        Box::pin(async move { self.stream_chat(&request, &sender).await })
+    }
+
+    fn stream_text(
+        &mut self,
+        request: CompletionRequest,
+        sender: mpsc::Sender<GenerationEvent>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), GenerationError>> + Send + '_>> {
+        Box::pin(async move { self.stream_text(&request, &sender).await })
     }
 }
 
@@ -135,10 +170,7 @@ async fn chat<S: ChatService>(
         Err(error) => return api_error(StatusCode::BAD_REQUEST, &error.to_string()),
     };
     if request.params.stream {
-        return api_error(
-            StatusCode::BAD_REQUEST,
-            "streaming is not available on this route",
-        );
+        return stream_chat_response(state, request, deadline).await;
     }
     let _permit = match tokio::time::timeout_at(deadline, admit(&state)).await {
         Ok(Ok(permit)) => permit,
@@ -176,10 +208,7 @@ async fn text<S: ChatService>(
         Err(error) => return api_error(StatusCode::BAD_REQUEST, &error.to_string()),
     };
     if request.params.stream {
-        return api_error(
-            StatusCode::BAD_REQUEST,
-            "streaming is not available on this route",
-        );
+        return stream_text_response(state, request, deadline).await;
     }
     let _permit = match tokio::time::timeout_at(deadline, admit(&state)).await {
         Ok(Ok(permit)) => permit,
@@ -201,6 +230,145 @@ async fn text<S: ChatService>(
         Ok(body) => Json(body).into_response(),
         Err(error) => generation_error(&error),
     }
+}
+
+async fn stream_chat_response<S: ChatService>(
+    state: Arc<HttpState<S>>,
+    request: ChatCompletionRequest,
+    deadline: tokio::time::Instant,
+) -> Response {
+    if request.model != state.service.lock().await.model() {
+        return api_error(StatusCode::NOT_FOUND, "model is not loaded");
+    }
+    let permit = match tokio::time::timeout_at(deadline, admit(&state)).await {
+        Ok(Ok(permit)) => permit,
+        Ok(Err(response)) => return *response,
+        Err(_) => return api_error(StatusCode::GATEWAY_TIMEOUT, "request deadline exceeded"),
+    };
+    let model = request.model.clone();
+    let created = unix_time();
+    let id = format!("chatcmpl-{created}");
+    let (sender, receiver) = mpsc::channel(16);
+    if sender.send(GenerationEvent::Role).await.is_err() {
+        return api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "cannot start response stream",
+        );
+    }
+    tokio::spawn(async move {
+        let _permit = permit;
+        let result = {
+            let mut service = state.service.lock().await;
+            tokio::time::timeout_at(deadline, service.stream_chat(request, sender.clone())).await
+        };
+        send_stream_error(result, &sender).await;
+    });
+    sse_response(receiver, id, created, model, true)
+}
+
+async fn stream_text_response<S: ChatService>(
+    state: Arc<HttpState<S>>,
+    request: CompletionRequest,
+    deadline: tokio::time::Instant,
+) -> Response {
+    if request.model != state.service.lock().await.model() {
+        return api_error(StatusCode::NOT_FOUND, "model is not loaded");
+    }
+    let permit = match tokio::time::timeout_at(deadline, admit(&state)).await {
+        Ok(Ok(permit)) => permit,
+        Ok(Err(response)) => return *response,
+        Err(_) => return api_error(StatusCode::GATEWAY_TIMEOUT, "request deadline exceeded"),
+    };
+    let model = request.model.clone();
+    let created = unix_time();
+    let id = format!("cmpl-{created}");
+    let (sender, receiver) = mpsc::channel(16);
+    tokio::spawn(async move {
+        let _permit = permit;
+        let result = {
+            let mut service = state.service.lock().await;
+            tokio::time::timeout_at(deadline, service.stream_text(request, sender.clone())).await
+        };
+        send_stream_error(result, &sender).await;
+    });
+    sse_response(receiver, id, created, model, false)
+}
+
+async fn send_stream_error(
+    result: Result<Result<(), GenerationError>, tokio::time::error::Elapsed>,
+    sender: &mpsc::Sender<GenerationEvent>,
+) {
+    let message = match result {
+        Ok(Ok(())) => return,
+        Ok(Err(error)) => error.to_string(),
+        Err(_) => "request deadline exceeded".to_owned(),
+    };
+    let _ = sender.send(GenerationEvent::Error(message)).await;
+}
+
+fn sse_response(
+    receiver: mpsc::Receiver<GenerationEvent>,
+    id: String,
+    created: u64,
+    model: String,
+    chat: bool,
+) -> Response {
+    let stream = ReceiverStream::new(receiver).map(move |event| {
+        Ok::<Event, Infallible>(
+            Event::default().data(stream_data(event, &id, created, &model, chat)),
+        )
+    });
+    Sse::new(stream).into_response()
+}
+
+fn stream_data(event: GenerationEvent, id: &str, created: u64, model: &str, chat: bool) -> String {
+    let object = if chat {
+        "chat.completion.chunk"
+    } else {
+        "text_completion"
+    };
+    match event {
+        GenerationEvent::Role => json!({
+            "id": id, "object": object, "created": created, "model": model,
+            "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": Value::Null}],
+        })
+        .to_string(),
+        GenerationEvent::Content(text) if chat => json!({
+            "id": id, "object": object, "created": created, "model": model,
+            "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": Value::Null}],
+        })
+        .to_string(),
+        GenerationEvent::Content(text) => json!({
+            "id": id, "object": object, "created": created, "model": model,
+            "choices": [{"index": 0, "text": text, "finish_reason": Value::Null}],
+        })
+        .to_string(),
+        GenerationEvent::Finished(reason, _) if chat => json!({
+            "id": id, "object": object, "created": created, "model": model,
+            "choices": [{"index": 0, "delta": {}, "finish_reason": crate::response::finish_reason(reason)}],
+        })
+        .to_string(),
+        GenerationEvent::Finished(reason, _) => json!({
+            "id": id, "object": object, "created": created, "model": model,
+            "choices": [{"index": 0, "text": "", "finish_reason": crate::response::finish_reason(reason)}],
+        })
+        .to_string(),
+        GenerationEvent::Usage(usage) => json!({
+            "id": id, "object": object, "created": created, "model": model,
+            "choices": [], "usage": stream_usage(usage),
+        })
+        .to_string(),
+        GenerationEvent::Done => "[DONE]".to_owned(),
+        GenerationEvent::Error(message) => error_value(&message, "server_error").to_string(),
+    }
+}
+
+fn stream_usage(usage: Usage) -> Value {
+    json!({
+        "prompt_tokens": usage.prompt_tokens,
+        "completion_tokens": usage.completion_tokens,
+        "total_tokens": u64::from(usage.prompt_tokens) + u64::from(usage.completion_tokens),
+    })
 }
 
 async fn models<S: ChatService>(State(state): State<Arc<HttpState<S>>>) -> Response {
@@ -290,16 +458,16 @@ fn api_error(status: StatusCode, message: &str) -> Response {
     } else {
         "server_error"
     };
-    (
-        status,
-        Json(json!({"error": {
-            "message": message,
-            "type": error_type,
-            "param": Value::Null,
-            "code": Value::Null,
-        }})),
-    )
-        .into_response()
+    (status, Json(error_value(message, error_type))).into_response()
+}
+
+fn error_value(message: &str, error_type: &str) -> Value {
+    json!({"error": {
+        "message": message,
+        "type": error_type,
+        "param": Value::Null,
+        "code": Value::Null,
+    }})
 }
 
 #[cfg(test)]
@@ -354,6 +522,42 @@ mod tests {
                 params: crate::CompletionParams::default(),
             })
         }
+
+        fn stream_chat(
+            &mut self,
+            _: ChatCompletionRequest,
+            sender: mpsc::Sender<GenerationEvent>,
+        ) -> Pin<Box<dyn Future<Output = Result<(), GenerationError>> + Send + '_>> {
+            Box::pin(async move {
+                sender
+                    .send(GenerationEvent::Content("forged".to_owned()))
+                    .await
+                    .unwrap();
+                sender
+                    .send(GenerationEvent::Finished(
+                        FinishReason::Stop,
+                        Usage {
+                            prompt_tokens: 4,
+                            completion_tokens: 1,
+                        },
+                    ))
+                    .await
+                    .unwrap();
+                sender.send(GenerationEvent::Done).await.unwrap();
+                Ok(())
+            })
+        }
+
+        fn stream_text(
+            &mut self,
+            _: CompletionRequest,
+            sender: mpsc::Sender<GenerationEvent>,
+        ) -> Pin<Box<dyn Future<Output = Result<(), GenerationError>> + Send + '_>> {
+            Box::pin(async move {
+                sender.send(GenerationEvent::Done).await.unwrap();
+                Ok(())
+            })
+        }
     }
 
     #[tokio::test]
@@ -400,6 +604,38 @@ mod tests {
         );
         drop(active);
         assert!(waiting.await.is_ok());
+    }
+
+    #[test]
+    fn serializes_stream_chunks_and_clean_termination() {
+        let usage = Usage {
+            prompt_tokens: 7,
+            completion_tokens: 3,
+        };
+        let role = stream_data(GenerationEvent::Role, "id", 1, "model", true);
+        let content = stream_data(
+            GenerationEvent::Content("hi".to_owned()),
+            "id",
+            1,
+            "model",
+            true,
+        );
+        let finish = stream_data(
+            GenerationEvent::Finished(FinishReason::Stop, usage),
+            "id",
+            1,
+            "model",
+            true,
+        );
+        let usage = stream_data(GenerationEvent::Usage(usage), "id", 1, "model", true);
+        assert!(role.contains("assistant"));
+        assert!(content.contains("hi"));
+        assert!(finish.contains("stop"));
+        assert!(usage.contains("total_tokens\":10"));
+        assert_eq!(
+            stream_data(GenerationEvent::Done, "id", 1, "model", true),
+            "[DONE]"
+        );
     }
 
     fn state() -> Arc<HttpState<Smoke>> {
