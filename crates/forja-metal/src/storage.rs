@@ -696,6 +696,15 @@ impl MetalBackend {
             .get(tensor)
             .map(|_| ())
     }
+
+    pub(super) fn new_buffer(
+        &self,
+        len: usize,
+    ) -> Result<Retained<ProtocolObject<dyn MTLBuffer>>, BackendError> {
+        self.device
+            .newBufferWithLength_options(len, MTLResourceOptions::StorageModeShared)
+            .ok_or(BackendError::AllocationFailed)
+    }
 }
 
 impl Backend for MetalBackend {
@@ -740,10 +749,7 @@ impl Backend for MetalBackend {
             buffer.clear();
             buffer
         } else {
-            let raw = self
-                .device
-                .newBufferWithLength_options(len, MTLResourceOptions::StorageModeShared)
-                .ok_or(BackendError::AllocationFailed)?;
+            let raw = self.new_buffer(len)?;
             MetalBuffer {
                 raw,
                 len,
@@ -767,7 +773,7 @@ impl Backend for MetalBackend {
     fn import_readonly(&self, bytes: MappedRegion) -> Result<ReadonlyImport, BackendError> {
         let byte_len = u64::try_from(bytes.len()).map_err(|_| BackendError::AllocationFailed)?;
         let copied = !bytes.offset().is_multiple_of(GPU_ADDRESS_ALIGNMENT);
-        let buffer = readonly_buffer(&self.device, bytes)?;
+        let buffer = readonly_buffer(self, bytes)?;
         let buffer = self
             .buffers
             .lock()
@@ -917,7 +923,7 @@ type BufferDeallocator = RcBlock<dyn Fn(NonNull<c_void>, usize)>;
 const GPU_ADDRESS_ALIGNMENT: usize = 16;
 
 fn readonly_buffer(
-    device: &ProtocolObject<dyn MTLDevice>,
+    backend: &MetalBackend,
     region: MappedRegion,
 ) -> Result<MetalBuffer, BackendError> {
     let len = region.len();
@@ -928,7 +934,7 @@ fn readonly_buffer(
         // SAFETY: The pointer covers `len` initialized bytes for the duration of this synchronous
         // call, which copies them into a new shared-storage Metal allocation.
         let raw = unsafe {
-            device.newBufferWithBytes_length_options(
+            backend.device.newBufferWithBytes_length_options(
                 pointer,
                 len,
                 MTLResourceOptions::StorageModeShared,
@@ -958,12 +964,14 @@ fn readonly_buffer(
     // sendable deallocator block until Metal releases the buffer. The OS mapping covers the final
     // partial page, and validated tensor layouts expose only the file's actual byte length.
     let raw = unsafe {
-        device.newBufferWithBytesNoCopy_length_options_deallocator(
-            pointer,
-            rounded_len,
-            MTLResourceOptions::StorageModeShared,
-            Some(&deallocator),
-        )
+        backend
+            .device
+            .newBufferWithBytesNoCopy_length_options_deallocator(
+                pointer,
+                rounded_len,
+                MTLResourceOptions::StorageModeShared,
+                Some(&deallocator),
+            )
     }
     .ok_or(BackendError::AllocationFailed)?;
     Ok(MetalBuffer {

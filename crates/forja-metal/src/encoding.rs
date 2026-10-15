@@ -20,13 +20,15 @@ use forja_core::{
 };
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_foundation::{NSRange, NSString};
+#[cfg(test)]
+use objc2_metal::MTLResourceOptions;
 use objc2_metal::{
     MTL4ArgumentTable, MTL4CommandAllocator, MTL4CommandBuffer, MTL4CommandQueue,
     MTL4CommitFeedback, MTL4CommitOptions, MTL4CounterHeap, MTL4CounterHeapDescriptor,
     MTL4CounterHeapType, MTL4TimestampGranularity, MTLAllocation, MTLBuffer, MTLCompileOptions,
     MTLComputePipelineState, MTLDataType, MTLDevice, MTLEvent, MTLFunctionConstantValues,
-    MTLLibrary, MTLMathMode, MTLResidencySet, MTLResidencySetDescriptor, MTLResourceOptions,
-    MTLSharedEvent, MTLSharedEventListener, MTLSize,
+    MTLLibrary, MTLMathMode, MTLResidencySet, MTLResidencySetDescriptor, MTLSharedEvent,
+    MTLSharedEventListener, MTLSize,
 };
 
 use crate::{
@@ -1562,11 +1564,12 @@ impl InFlightTracker {
 
     fn checkout(
         self: &Arc<Self>,
-        device: &ProtocolObject<dyn MTLDevice>,
+        backend: &MetalBackend,
         argument_capacity: usize,
     ) -> Result<SubmissionObjects, BackendError> {
         use objc2_metal::MTL4ArgumentTableDescriptor;
 
+        let device = &backend.device;
         self.drain_done();
         let reusable = self
             .pool
@@ -1585,12 +1588,7 @@ impl InFlightTracker {
             let argument_table = device
                 .newArgumentTableWithDescriptor_error(&descriptor)
                 .map_err(|_| BackendError::ExecutionFailed)?;
-            let raw = device
-                .newBufferWithLength_options(
-                    argument_capacity,
-                    MTLResourceOptions::StorageModeShared,
-                )
-                .ok_or(BackendError::AllocationFailed)?;
+            let raw = backend.new_buffer(argument_capacity)?;
             ReusableSubmissionObjects {
                 allocator,
                 argument_table,
@@ -1601,12 +1599,7 @@ impl InFlightTracker {
             }
         };
         if reusable.argument_buffer.capacity != argument_capacity {
-            let raw = device
-                .newBufferWithLength_options(
-                    argument_capacity,
-                    MTLResourceOptions::StorageModeShared,
-                )
-                .ok_or(BackendError::AllocationFailed)?;
+            let raw = backend.new_buffer(argument_capacity)?;
             reusable.argument_buffer = ArgumentBuffer {
                 raw,
                 capacity: argument_capacity,
@@ -1901,7 +1894,7 @@ impl MetalBackend {
             .map(|(_, dispatch)| (*dispatch).clone())
             .collect::<Vec<_>>();
         let capacity = self.argument_capacity(&dispatches)?;
-        let objects = self.in_flight.checkout(&self.device, capacity)?;
+        let objects = self.in_flight.checkout(self, capacity)?;
         let command_buffer = self.begin_command_buffer(objects.allocator()?)?;
         let mut arguments = ArgumentWriter::new(objects.argument_buffer()?);
         for (index, dispatch) in static_dispatches {
@@ -2056,7 +2049,7 @@ impl MetalBackend {
             &dispatches,
             graph.and_then(|prepared| prepared.encoding.as_ref()),
         )?;
-        let mut objects = self.in_flight.checkout(&self.device, argument_capacity)?;
+        let mut objects = self.in_flight.checkout(self, argument_capacity)?;
         let command_buffer = self.begin_command_buffer(objects.allocator()?)?;
         let timestamp_count = if PROFILE {
             dispatches
@@ -4400,8 +4393,6 @@ impl MetalBackend {
     }
 
     fn scratch_tensor(&self, dtype: DType, shape: &[u32]) -> Result<EncoderTensor, BackendError> {
-        use objc2_metal::MTLResourceOptions;
-
         let elements = shape
             .iter()
             .try_fold(1_u64, |count, &extent| count.checked_mul(u64::from(extent)));
@@ -4409,10 +4400,7 @@ impl MetalBackend {
             .and_then(|count| count.checked_mul(dtype.byte_size()))
             .ok_or(BackendError::AllocationFailed)?;
         let len = usize::try_from(byte_len).map_err(|_| BackendError::AllocationFailed)?;
-        let buffer = self
-            .device
-            .newBufferWithLength_options(len, MTLResourceOptions::StorageModeShared)
-            .ok_or(BackendError::AllocationFailed)?;
+        let buffer = self.new_buffer(len)?;
         let layout = Layout::contiguous(dtype, 0, shape.to_vec(), byte_len)
             .map_err(|_| BackendError::InvalidInput)?;
         Ok(EncoderTensor {
@@ -7604,10 +7592,7 @@ mod tests {
         let capacity = pool[0].argument_buffer.capacity;
         let address = pool[0].argument_buffer.raw.gpuAddress();
         drop(pool);
-        let objects = backend
-            .in_flight
-            .checkout(&backend.device, capacity)
-            .unwrap();
+        let objects = backend.in_flight.checkout(&backend, capacity).unwrap();
         assert_eq!(objects.argument_buffer().unwrap().raw.gpuAddress(), address);
     }
 
@@ -8270,7 +8255,7 @@ mod tests {
             .collect::<Vec<_>>();
         backend.write(&source, &bytes).unwrap();
 
-        let mut objects = backend.in_flight.checkout(&backend.device, 4096).unwrap();
+        let mut objects = backend.in_flight.checkout(&backend, 4096).unwrap();
         let command_buffer = backend
             .begin_command_buffer(objects.allocator().unwrap())
             .unwrap();
