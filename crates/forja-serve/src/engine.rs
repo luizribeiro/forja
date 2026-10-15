@@ -5,9 +5,10 @@ use forja_core::Backend;
 use forja_host::{EngineDecode, EngineDecodeOutput, EngineInfo, EngineRunner, SamplingParams};
 use tokenizers::Tokenizer;
 
-use crate::request::{validate_chat_input, validate_prompt};
+use crate::request::{validate_chat_input, validate_completion_input, validate_prompt};
 use crate::{
-    ChatCompletionRequest, ChatFormat, ResolvedParams, StopMatcher, serving_context_ceiling,
+    ChatCompletionRequest, ChatFormat, CompletionRequest, ResolvedParams, StopMatcher,
+    serving_context_ceiling,
 };
 
 /// A failure while preparing or running a generation.
@@ -192,6 +193,31 @@ where
             &self.tokenizer,
             &mut self.chat_format,
         )?;
+        self.prefill(tokens, prompt_tokens, params).await
+    }
+
+    async fn prefill_completion(
+        &mut self,
+        request: &CompletionRequest,
+    ) -> Result<PrefilledPrompt, GenerationError> {
+        let chat_info = self.chat_format.info().clone();
+        let (tokens, prompt_tokens, params) = prepare_completion_prompt(
+            request,
+            &self.config,
+            &chat_info,
+            self.max_context,
+            self.info.vocab,
+            &self.tokenizer,
+        )?;
+        self.prefill(tokens, prompt_tokens, params).await
+    }
+
+    async fn prefill(
+        &mut self,
+        tokens: Vec<u32>,
+        prompt_tokens: u32,
+        params: ResolvedParams,
+    ) -> Result<PrefilledPrompt, GenerationError> {
         let sampling = SamplingParams {
             temperature: params.temperature,
             top_k: params.top_k,
@@ -230,6 +256,19 @@ where
         request: &ChatCompletionRequest,
     ) -> Result<Completion, GenerationError> {
         let prefill = self.prefill_chat(request).await?;
+        self.decode(prefill).await
+    }
+
+    /// Generates a complete response from an unformatted text prompt.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when validation, tokenization, or engine execution fails.
+    pub async fn complete_text(
+        &mut self,
+        request: &CompletionRequest,
+    ) -> Result<Completion, GenerationError> {
+        let prefill = self.prefill_completion(request).await?;
         self.decode(prefill).await
     }
 
@@ -390,6 +429,32 @@ fn prepare_chat_prompt<R: PromptRenderer>(
     if tokens.is_empty() {
         return Err(GenerationError::invalid(
             "rendered prompt tokenized to an empty sequence",
+        ));
+    }
+    let params = validate_prompt(params, prompt_tokens, max_context)
+        .map_err(|error| GenerationError::invalid(error.to_string()))?;
+    Ok((tokens, prompt_tokens, params))
+}
+
+fn prepare_completion_prompt(
+    request: &CompletionRequest,
+    config: &HostConfig,
+    chat_info: &crate::ChatInfo,
+    max_context: u32,
+    vocab: u32,
+    tokenizer: &Tokenizer,
+) -> Result<(Vec<u32>, u32, ResolvedParams), GenerationError> {
+    let params = validate_completion_input(request, config, chat_info, vocab)
+        .map_err(|error| GenerationError::invalid(error.to_string()))?;
+    let tokens = tokenizer
+        .encode(request.prompt.as_str(), false)
+        .map(|encoding| encoding.get_ids().to_vec())
+        .map_err(|error| GenerationError::invalid(format!("cannot tokenize prompt: {error}")))?;
+    let prompt_tokens = u32::try_from(tokens.len())
+        .map_err(|_| GenerationError::invalid("prompt token count exceeds u32"))?;
+    if tokens.is_empty() {
+        return Err(GenerationError::invalid(
+            "prompt tokenized to an empty sequence",
         ));
     }
     let params = validate_prompt(params, prompt_tokens, max_context)
