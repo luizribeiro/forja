@@ -1559,6 +1559,7 @@ impl<B: Backend + 'static> Host<B> {
     }
 
     fn with_grants(backend: B, limits: Limits, grants: Grants) -> Self {
+        backend.set_memory_limit(limits.live_bytes);
         let store_limits = StoreLimitsBuilder::new()
             .memory_size(limits.guest_memory_bytes)
             .table_elements(limits.table_elements)
@@ -1654,9 +1655,10 @@ impl<B: Backend + 'static> Host<B> {
             physical_footprint,
             peak_physical_footprint,
         } = self.backend.memory_usage();
+        let live_bytes = self.live_bytes.load(Ordering::Acquire);
         EngineMemory {
-            live_bytes: self.live_bytes.load(Ordering::Acquire),
-            charged_bytes,
+            live_bytes,
+            charged_bytes: charged_bytes.saturating_sub(live_bytes),
             device_bytes,
             physical_footprint,
             peak_physical_footprint,
@@ -4371,8 +4373,8 @@ mod tests {
     };
 
     use forja_core::{
-        Backend, BackendError, BufferId, CommandList, DType, Layout, LayoutError, MappedRegion, Op,
-        OpError, Submission, Tensor, ViewOp as CoreViewOp,
+        Backend, BackendError, BufferId, CommandList, DType, Layout, LayoutError, MappedRegion,
+        MemoryUsage, Op, OpError, Submission, Tensor, ViewOp as CoreViewOp,
         program::{KernelSignature, ValidatedProgram},
     };
     use forja_cpu::CpuBackend;
@@ -5394,6 +5396,43 @@ mod tests {
             ..EngineMemory::default()
         };
         assert_eq!(overflow.accounted_bytes(), None);
+    }
+
+    #[test]
+    fn host_configures_the_backend_memory_limit() {
+        let backend = AccountingBackend::new(None, None, Duration::ZERO);
+        let configured = Arc::clone(&backend.memory_limit);
+        let limits = Limits::new(4097, 8, u64::MAX, 32, u64::MAX);
+
+        let _host = Host::new(backend, limits);
+
+        assert_eq!(configured.load(Ordering::Acquire), 4097);
+    }
+
+    #[test]
+    fn engine_memory_subtracts_live_storage_from_backend_charges() {
+        let backend = AccountingBackend::with_memory_usage(MemoryUsage {
+            charged_bytes: 13,
+            ..MemoryUsage::default()
+        });
+        let mut host = Host::new(backend, GENEROUS);
+        host.alloc(compute::Dtype::F32, &[1]).unwrap();
+        assert_eq!(
+            host.engine_memory(),
+            EngineMemory {
+                live_bytes: 4,
+                charged_bytes: 9,
+                ..EngineMemory::default()
+            }
+        );
+
+        let backend = AccountingBackend::with_memory_usage(MemoryUsage {
+            charged_bytes: 3,
+            ..MemoryUsage::default()
+        });
+        let mut host = Host::new(backend, GENEROUS);
+        host.alloc(compute::Dtype::F32, &[1]).unwrap();
+        assert_eq!(host.engine_memory().charged_bytes, 0);
     }
 
     #[test]
@@ -6447,6 +6486,8 @@ mod tests {
         wait_error: Option<BackendError>,
         fail_submission: Option<u64>,
         submissions: AtomicU64,
+        memory_usage: MemoryUsage,
+        memory_limit: Arc<AtomicU64>,
     }
 
     impl AccountingBackend {
@@ -6459,6 +6500,15 @@ mod tests {
                 wait_error: None,
                 fail_submission: None,
                 submissions: AtomicU64::new(0),
+                memory_usage: MemoryUsage::default(),
+                memory_limit: Arc::new(AtomicU64::new(u64::MAX)),
+            }
+        }
+
+        fn with_memory_usage(memory_usage: MemoryUsage) -> Self {
+            Self {
+                memory_usage,
+                ..Self::new(None, None, Duration::ZERO)
             }
         }
 
@@ -6471,6 +6521,8 @@ mod tests {
                 wait_error: None,
                 fail_submission: Some(submission),
                 submissions: AtomicU64::new(0),
+                memory_usage: MemoryUsage::default(),
+                memory_limit: Arc::new(AtomicU64::new(u64::MAX)),
             }
         }
 
@@ -6483,6 +6535,8 @@ mod tests {
                 wait_error: Some(BackendError::Timeout),
                 fail_submission: None,
                 submissions: AtomicU64::new(0),
+                memory_usage: MemoryUsage::default(),
+                memory_limit: Arc::new(AtomicU64::new(u64::MAX)),
             }
         }
     }
@@ -6519,6 +6573,14 @@ mod tests {
     impl Backend for AccountingBackend {
         type Submission = AccountingSubmission;
         type ProgramHandle = <CpuBackend as Backend>::ProgramHandle;
+
+        fn memory_usage(&self) -> MemoryUsage {
+            self.memory_usage
+        }
+
+        fn set_memory_limit(&self, bytes: u64) {
+            self.memory_limit.store(bytes, Ordering::Release);
+        }
 
         fn prepare_program(
             &self,

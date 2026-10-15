@@ -10,7 +10,7 @@ use std::{
 /// Memory attributed by a trusted backend.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct MemoryUsage {
-    /// Bytes charged beyond live guest tensor storage.
+    /// Total bytes charged by the backend, including guest tensor storage.
     pub charged_bytes: u64,
     /// Bytes currently allocated by the device API, when available.
     pub device_bytes: Option<u64>,
@@ -431,6 +431,11 @@ pub trait Backend {
     /// Returns the backend and process memory visible to this backend.
     fn memory_usage(&self) -> MemoryUsage {
         MemoryUsage::default()
+    }
+
+    /// Sets the byte quota covering allocations made for one guest.
+    fn set_memory_limit(&self, bytes: u64) {
+        let _ = bytes;
     }
 
     /// Prepares a validated scalar program for repeated dispatch.
