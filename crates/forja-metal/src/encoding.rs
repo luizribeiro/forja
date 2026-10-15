@@ -18,7 +18,10 @@ use block2::RcBlock;
 use forja_core::{
     BackendError, BufferId, CommandList, DType, Dispatch, DispatchProfile, GraphTemplate, Layout,
     Op, PreparedGraph, ProfileCount, ProfileTensor, Slice, Submission, SubmissionProfile, Tensor,
-    program::{KernelSignature, PreparedProgram, ProgramHash, ProgramKind, ValidatedProgram},
+    program::{
+        KernelSignature, PreparedEpilogue, PreparedProgram, ProgramHash, ProgramKind,
+        ValidatedProgram,
+    },
     required_barriers, split_qkv_heads,
 };
 use objc2::{rc::Retained, runtime::ProtocolObject};
@@ -35,7 +38,7 @@ use objc2_metal::{
 };
 
 use crate::{
-    map_codegen,
+    epilogue_codegen, map_codegen,
     matmul::{
         GEMM_32_64, GEMM_64_32, GEMM_64_64_FLOAT, GEMM_64_64_HALF, classify, select_internal_gemm,
     },
@@ -2299,9 +2302,18 @@ impl MetalBackend {
         )?;
         argument_writer.validate_capacity(argument_capacity, dispatches.is_empty())?;
         if let Some(profile) = &mut profile {
+            let epilogue = self
+                .pipelines
+                .lock()
+                .map_err(|_| BackendError::ExecutionFailed)?
+                .take_epilogue_counts();
             profile.metadata_buffers = temporary_profile.finish();
             profile.program_encoding = encoded.program_encoding;
             profile.program_compile_fallbacks = encoded.program_compile_fallbacks;
+            profile.epilogue_library_compilations = epilogue.libraries;
+            profile.epilogue_pipeline_specializations = epilogue.pipelines;
+            profile.epilogue_cache_hits = epilogue.cache_hits;
+            profile.epilogue_compile_fallbacks = epilogue.fallbacks;
             let encoding = encoding_started.map_or(Duration::ZERO, |started| started.elapsed());
             profile.encoding = encoding.saturating_sub(profile.metadata_buffers.time);
         }
@@ -6504,7 +6516,7 @@ fn reusable_dispatch(dispatch: &Dispatch) -> bool {
         | Op::Sdpa { .. } => false,
         Op::Matmul => {
             dispatch
-                .inputs()
+                .primitive_inputs()
                 .iter()
                 .all(|tensor| classify(tensor.layout()).kernel_strides().is_some())
                 && classify(dispatch.output().layout())
@@ -6998,6 +7010,21 @@ pub(super) struct PipelineCache {
     fast_library: Retained<ProtocolObject<dyn MTLLibrary>>,
     nan_preserving_library: Retained<ProtocolObject<dyn MTLLibrary>>,
     pipelines: HashMap<PipelineKey, Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
+    epilogue_libraries:
+        HashMap<epilogue_codegen::SourceKey, Retained<ProtocolObject<dyn MTLLibrary>>>,
+    epilogue_pipelines: HashMap<
+        epilogue_codegen::PipelineKey,
+        Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    >,
+    epilogue_counts: EpilogueCompileCounts,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct EpilogueCompileCounts {
+    libraries: u64,
+    pipelines: u64,
+    cache_hits: u64,
+    fallbacks: u64,
 }
 
 impl PipelineCache {
@@ -7019,6 +7046,9 @@ impl PipelineCache {
             fast_library,
             nan_preserving_library,
             pipelines: HashMap::new(),
+            epilogue_libraries: HashMap::new(),
+            epilogue_pipelines: HashMap::new(),
+            epilogue_counts: EpilogueCompileCounts::default(),
         })
     }
 
@@ -7034,18 +7064,7 @@ impl PipelineCache {
         if let Some(pipeline) = self.pipelines.get(&key) {
             return Ok(pipeline.clone());
         }
-        let values = MTLFunctionConstantValues::new();
-        for &(index, value) in constants {
-            // SAFETY: `value` is live for the call, its type matches `MTLDataType::UInt`, and
-            // the caller supplies indices declared by the selected embedded kernel.
-            unsafe {
-                values.setConstantValue_type_atIndex(
-                    NonNull::from(&value).cast::<c_void>(),
-                    MTLDataType::UInt,
-                    usize::try_from(index).map_err(|_| BackendError::ExecutionFailed)?,
-                );
-            }
-        }
+        let values = function_constants(constants)?;
         let library = if nan_preserving_kernel(name) {
             &self.nan_preserving_library
         } else {
@@ -7061,6 +7080,57 @@ impl PipelineCache {
             .map_err(|_| BackendError::ExecutionFailed)?;
         self.pipelines.insert(key, pipeline.clone());
         Ok(pipeline)
+    }
+
+    #[allow(dead_code)]
+    fn get_epilogue(
+        &mut self,
+        family: epilogue_codegen::FamilySourceTag,
+        epilogue: &PreparedEpilogue,
+        name: &str,
+        constants: &[(u32, u32)],
+    ) -> Result<Retained<ProtocolObject<dyn MTLComputePipelineState>>, BackendError> {
+        let source_key = epilogue_codegen::SourceKey::new(family, epilogue);
+        let pipeline_key =
+            epilogue_codegen::PipelineKey::new(source_key.clone(), name, constants.to_vec());
+        if let Some(pipeline) = self.epilogue_pipelines.get(&pipeline_key) {
+            self.epilogue_counts.cache_hits = self.epilogue_counts.cache_hits.saturating_add(1);
+            return Ok(pipeline.clone());
+        }
+        if self.epilogue_libraries.contains_key(&source_key) {
+            self.epilogue_counts.cache_hits = self.epilogue_counts.cache_hits.saturating_add(1);
+        } else {
+            let generated = epilogue_codegen::generate_source(epilogue)
+                .map_err(|_| program_compile_failed(source_key.hash))?;
+            let source = NSString::from_str(&generated);
+            let options = compile_options(MTLMathMode::Safe);
+            let library = self
+                .device
+                .newLibraryWithSource_options_error(&source, Some(&options))
+                .map_err(|_| program_compile_failed(source_key.hash))?;
+            self.epilogue_libraries.insert(source_key.clone(), library);
+            self.epilogue_counts.libraries = self.epilogue_counts.libraries.saturating_add(1);
+        }
+        let library = self
+            .epilogue_libraries
+            .get(&source_key)
+            .ok_or(BackendError::ExecutionFailed)?;
+        let values = function_constants(&pipeline_key.constants)?;
+        let function = library
+            .newFunctionWithName_constantValues_error(&NSString::from_str(name), &values)
+            .map_err(|_| program_compile_failed(source_key.hash))?;
+        let pipeline = self
+            .device
+            .newComputePipelineStateWithFunction_error(&function)
+            .map_err(|_| program_compile_failed(source_key.hash))?;
+        self.epilogue_pipelines
+            .insert(pipeline_key, pipeline.clone());
+        self.epilogue_counts.pipelines = self.epilogue_counts.pipelines.saturating_add(1);
+        Ok(pipeline)
+    }
+
+    fn take_epilogue_counts(&mut self) -> EpilogueCompileCounts {
+        std::mem::take(&mut self.epilogue_counts)
     }
 
     fn compile_program_source(
@@ -7112,6 +7182,24 @@ impl PipelineCache {
             .newComputePipelineStateWithFunction_error(&function)
             .map_err(|_| program_compile_failed(key.hash))
     }
+}
+
+fn function_constants(
+    constants: &[(u32, u32)],
+) -> Result<Retained<MTLFunctionConstantValues>, BackendError> {
+    let values = MTLFunctionConstantValues::new();
+    for &(index, value) in constants {
+        // SAFETY: `value` is live for the call, its type matches `MTLDataType::UInt`, and the
+        // caller supplies indices declared by the selected kernel.
+        unsafe {
+            values.setConstantValue_type_atIndex(
+                NonNull::from(&value).cast::<c_void>(),
+                MTLDataType::UInt,
+                usize::try_from(index).map_err(|_| BackendError::ExecutionFailed)?,
+            );
+        }
+    }
+    Ok(values)
 }
 
 fn nan_preserving_kernel(name: &str) -> bool {
