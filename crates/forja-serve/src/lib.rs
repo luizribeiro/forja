@@ -8,59 +8,15 @@ mod stop;
 
 use std::{error::Error, fs::File, path::Path};
 
-use minijinja::{AutoEscape, Environment, UndefinedBehavior};
 use serde::Deserialize;
-use serde_json::{Map, Value};
 
 pub use chat_format::{ChatFormat, ChatFormatLimits, ChatInfo, SamplingDefaults};
+pub use forja_chat_format::ChatTemplate;
 pub use request::{
     ChatCompletionRequest, CompletionParams, CompletionRequest, Message, ResolvedParams, Stop,
     ValidationError, serving_context_ceiling, validate_chat, validate_completion,
 };
 pub use stop::{StopMatcher, StopOutput};
-
-/// A compiled publisher-provided chat template.
-pub struct ChatTemplate {
-    environment: Environment<'static>,
-}
-
-impl ChatTemplate {
-    /// Compiles a chat template with Hugging Face-compatible helpers.
-    ///
-    /// # Errors
-    ///
-    /// Returns a template syntax error.
-    pub fn compile(source: String) -> Result<Self, minijinja::Error> {
-        let mut environment = Environment::new();
-        environment.set_auto_escape_callback(|_| AutoEscape::None);
-        environment.set_undefined_behavior(UndefinedBehavior::Strict);
-        environment
-            .set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
-        environment.set_fuel(Some(1_000_000));
-        environment.add_template_owned("chat", source)?;
-        Ok(Self { environment })
-    }
-
-    /// Renders messages, optional tools, and model special-token globals.
-    ///
-    /// # Errors
-    ///
-    /// Returns a template lookup or rendering error.
-    pub fn render(
-        &self,
-        messages: &[Value],
-        tools: Option<&Value>,
-        special_tokens: &Map<String, Value>,
-    ) -> Result<String, minijinja::Error> {
-        let mut context = special_tokens.clone();
-        context.insert("messages".to_owned(), Value::Array(messages.to_vec()));
-        context.insert("add_generation_prompt".to_owned(), Value::Bool(true));
-        if let Some(tools) = tools {
-            context.insert("tools".to_owned(), tools.clone());
-        }
-        self.environment.get_template("chat")?.render(context)
-    }
-}
 
 /// One or several token identifiers read from a model generation config.
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -122,15 +78,5 @@ mod tests {
         assert_eq!(config.temperature, Some(0.7));
         assert_eq!(config.top_p, Some(0.8));
         assert_eq!(config.top_k, Some(20));
-    }
-
-    #[test]
-    fn enables_python_mapping_methods() {
-        let template =
-            ChatTemplate::compile("{{ value.keys() | list | join(',') }}".to_owned()).unwrap();
-        let messages = Vec::new();
-        let mut globals = Map::new();
-        globals.insert("value".to_owned(), serde_json::json!({"key": 1}));
-        assert_eq!(template.render(&messages, None, &globals).unwrap(), "key");
     }
 }

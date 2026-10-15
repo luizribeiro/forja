@@ -4,7 +4,7 @@ use std::{env, error::Error, fs, path::PathBuf};
 
 use forja_serve::ChatTemplate;
 use serde::Deserialize;
-use serde_json::{Map, Value};
+use serde_json::Value;
 use tokenizers::Tokenizer;
 
 #[derive(Deserialize)]
@@ -25,7 +25,10 @@ fn qwen3_coder_matches_hugging_face_chat_goldens() -> Result<(), Box<dyn Error +
     let goldens: Vec<Golden> =
         serde_json::from_str(include_str!("fixtures/qwen3-coder-chat-template.json"))?;
     for golden in goldens {
-        let rendered = template.render(&golden.messages, None, &Map::new())?;
+        let messages = serde_json::to_string(&golden.messages)?;
+        let rendered = template
+            .render(&messages, "null", r#"{"add_generation_prompt":true}"#)
+            .map_err(std::io::Error::other)?;
         assert_eq!(rendered, golden.rendered, "{} rendering", golden.name);
         let encoded = tokenizer.encode(rendered, false)?;
         assert_eq!(
