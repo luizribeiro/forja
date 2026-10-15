@@ -245,6 +245,8 @@ pub struct EngineDecodeOutput {
 pub struct EngineMetrics {
     /// Bytes held by live guest tensor resources.
     pub live_bytes: u64,
+    /// Command graphs currently retained by the guest.
+    pub live_graphs: usize,
     /// Successfully completed backend submissions.
     pub submissions: u64,
     /// Completed submissions that supplied device timestamps.
@@ -1662,6 +1664,7 @@ impl<B: Backend + 'static> Host<B> {
     fn engine_metrics(&self) -> EngineMetrics {
         EngineMetrics {
             live_bytes: self.live_bytes.load(Ordering::Acquire),
+            live_graphs: self.live_graphs.load(Ordering::Acquire),
             submissions: self.completed_submissions.load(Ordering::Acquire),
             timed_submissions: self.timed_submissions.load(Ordering::Acquire),
             gpu_time: Duration::from_nanos(self.completed_gpu_time_ns.load(Ordering::Acquire)),
@@ -5022,14 +5025,14 @@ mod tests {
     fn graph_quota_counts_live_graphs() {
         let mut host = Host::new(CpuBackend::new(), GENEROUS.with_graph_limit(1));
         let graph = empty_graph(&mut host);
-        assert_eq!(host.live_graphs.load(Ordering::Acquire), 1);
+        assert_eq!(host.engine_metrics().live_graphs, 1);
         let commands = host.command_list().unwrap();
         assert!(matches!(
             host.create_graph(commands),
             Err(compute::Error::Quota(_))
         ));
         host.drop_graph(graph).unwrap();
-        assert_eq!(host.live_graphs.load(Ordering::Acquire), 0);
+        assert_eq!(host.engine_metrics().live_graphs, 0);
         empty_graph(&mut host);
     }
 
@@ -6671,6 +6674,7 @@ mod tests {
             host.engine_metrics(),
             EngineMetrics {
                 live_bytes: 0,
+                live_graphs: 0,
                 submissions: 2,
                 timed_submissions: 2,
                 gpu_time: Duration::from_nanos(66),
