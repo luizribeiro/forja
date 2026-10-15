@@ -1,6 +1,7 @@
 [workspace]
 exclude = ["engines/olmoe", "engines/qwen3", "engines/qwen3-coder"]
 members = [
+  "chat-formats/*",
   "crates/*",
   "support/forja-testing",
   "support/golden-fixtures",

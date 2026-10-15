@@ -1,0 +1,25 @@
+[package]
+name = "qwen3-coder-chat-format"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+forja-chat-format = { path = "../../crates/forja-chat-format" }
+
+[target.'cfg(target_family = "wasm")'.dependencies]
+wit-bindgen = "0.62"
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints.rust]
+missing_docs = "warn"
+
+[lints.clippy]
+pedantic = "warn"

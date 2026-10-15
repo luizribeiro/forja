@@ -1600,6 +1600,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "qwen3-coder-chat-format"
+version = "0.0.0"
+dependencies = [
+ "forja-chat-format",
+ "serde_json",
+ "wit-bindgen 0.62.0",
+]
+
+[[package]]
 name = "r-efi"
 version = "5.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
