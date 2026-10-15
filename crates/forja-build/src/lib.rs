@@ -98,8 +98,10 @@ pub fn run_rustc_wrapper() -> io::Result<bool> {
         ] {
             args.push(format!("--remap-path-prefix={}={to}", Path::new(from).display()).into());
         }
-        if let Ok(package) = env::var("CARGO_PKG_NAME")
-            && matches!(package.as_str(), "qwen3" | "olmoe" | "qwen3-coder")
+        if let (Ok(package), Some(manifest_dir)) = (
+            env::var("CARGO_PKG_NAME"),
+            env::var_os("CARGO_MANIFEST_DIR"),
+        ) && is_engine_package(Path::new(&repository), Path::new(&manifest_dir), &package)
         {
             args.push(format!("--remap-path-prefix=src={package}/src").into());
         }
@@ -138,22 +140,8 @@ fn stable_metadata(args: &[OsString], roots: [&OsString; 3]) -> String {
     for (root, replacement) in roots.into_iter().zip(["/workspace", "/cargo", "/target"]) {
         identity = identity.replace(&*root.to_string_lossy(), replacement);
     }
-    identity = identity.replace(
-        "/workspace/engines/qwen3",
-        "/workspace/support/guests/qwen3",
-    );
-    identity = identity.replace(
-        "/workspace/engines/olmoe",
-        "/workspace/support/guests/olmoe",
-    );
-    identity = identity.replace(
-        "/workspace/engines/qwen3-coder",
-        "/workspace/support/guests/qwen3-coder",
-    );
-    if let Ok(package) = env::var("CARGO_PKG_NAME")
-        && matches!(package.as_str(), "qwen3" | "olmoe" | "qwen3-coder")
-    {
-        identity = identity.replace("\0src/lib.rs\0", &format!("\0{package}/src/lib.rs\0"));
+    if let Ok(package) = env::var("CARGO_PKG_NAME") {
+        identity = normalize_engine_identity(identity, &package);
     }
     let hash = identity
         .bytes()
@@ -163,6 +151,48 @@ fn stable_metadata(args: &[OsString], roots: [&OsString; 3]) -> String {
     format!("metadata={hash:016x}")
 }
 
+fn is_engine_package(repository: &Path, manifest_dir: &Path, package: &str) -> bool {
+    manifest_dir
+        .strip_prefix(repository)
+        .ok()
+        .and_then(|path| path.to_str())
+        == Some(&format!("engines/{package}"))
+}
+
+fn normalize_engine_identity(mut identity: String, package: &str) -> String {
+    let engine_root = format!("/workspace/engines/{package}");
+    if identity.contains(&engine_root) {
+        identity = identity.replace(
+            &engine_root,
+            &format!("/workspace/support/guests/{package}"),
+        );
+        identity = identity.replace("\0src/lib.rs\0", &format!("\0{package}/src/lib.rs\0"));
+    }
+    identity
+}
+
 fn required_var(name: &str) -> io::Result<OsString> {
     env::var_os(name).ok_or_else(|| io::Error::other(format!("{name} is not set")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remaps_any_engine_package() {
+        let repository = Path::new("/repo");
+        assert!(is_engine_package(
+            repository,
+            Path::new("/repo/engines/synthetic"),
+            "synthetic"
+        ));
+        assert_eq!(
+            normalize_engine_identity(
+                "synthetic:0:/workspace/engines/synthetic/Cargo.toml\0src/lib.rs\0".to_owned(),
+                "synthetic"
+            ),
+            "synthetic:0:/workspace/support/guests/synthetic/Cargo.toml\0synthetic/src/lib.rs\0"
+        );
+    }
 }
