@@ -111,6 +111,23 @@ impl Guest for Component {
         }
     }
 
+    async fn submission_churn() -> Result<u32, String> {
+        let input = Tensor::alloc(Dtype::F32, &[1]).map_err(error)?;
+        let output = Tensor::alloc(Dtype::F32, &[1]).map_err(error)?;
+        let mut graphs = Vec::new();
+        for _ in 0..16 {
+            let commands = CommandList::new();
+            commands
+                .dispatch(Op::Copy, &[&input], &output)
+                .map_err(error)?;
+            graphs.push(Graph::create(commands).map_err(error)?);
+        }
+        for graph in &graphs {
+            replay(graph, Vec::new()).await.map_err(error)?;
+        }
+        u32::try_from(graphs.len()).map_err(|_| "graph count exceeded u32".to_owned())
+    }
+
     async fn exhaust_graphs() -> Result<u32, String> {
         let mut graphs = Vec::new();
         loop {

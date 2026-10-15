@@ -355,6 +355,27 @@ async fn graph_abuse_hits_time_and_live_graph_quotas() -> wasmtime::Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
+#[tokio::test(flavor = "multi_thread")]
+async fn metal_guest_submissions_apply_bounded_backpressure() -> wasmtime::Result<()> {
+    let limits = Limits::new(16 * 1024 * 1024, 8, 16 * 1024, 8, 64 * 1024)
+        .with_gpu_limits(Duration::from_secs(30), Duration::MAX);
+    let (mut store, instance) = instantiate(
+        forja_metal::MetalBackend::new().map_err(wasmtime::Error::msg)?,
+        test_guests::tensor_abuse(),
+        limits,
+    )
+    .await?;
+    let churn =
+        instance.get_typed_func::<(), (Result<u32, String>,)>(&mut store, "submission-churn")?;
+    Host::reset_guest_deadline(&mut store);
+    let (completed,) = store
+        .run_concurrent(async move |accessor| churn.call_concurrent(accessor, ()).await)
+        .await??;
+    assert_eq!(completed.map_err(wasmtime::Error::msg)?, 16);
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn guest_graphs_retain_buffers_and_allow_completed_writes() -> wasmtime::Result<()> {
     let (mut store, instance) = instantiate(

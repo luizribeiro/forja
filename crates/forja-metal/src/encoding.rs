@@ -4,12 +4,15 @@ use std::{
     ffi::c_void,
     fmt::Write as _,
     ptr::NonNull,
-    sync::{Arc, Condvar, Mutex, OnceLock, Weak},
+    sync::{
+        Arc, Condvar, Mutex, OnceLock, Weak,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::{Duration, Instant},
 };
 
 #[cfg(test)]
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 
 use block2::RcBlock;
 use forja_core::{
@@ -1551,7 +1554,13 @@ pub(super) struct InFlightTracker {
     completions: Mutex<Vec<InFlightCompletion>>,
     done: Mutex<Vec<InFlightCompletion>>,
     pool: Mutex<Vec<ReusableSubmissionObjects>>,
+    slots: AtomicUsize,
+    #[cfg(test)]
+    backpressure_waits: AtomicUsize,
 }
+
+// The host permits two overlapping replays per graph; two extra slots keep unrelated work moving.
+const MAX_IN_FLIGHT_SUBMISSIONS: usize = 4;
 
 impl InFlightTracker {
     pub(super) const fn new() -> Self {
@@ -1559,6 +1568,9 @@ impl InFlightTracker {
             completions: Mutex::new(Vec::new()),
             done: Mutex::new(Vec::new()),
             pool: Mutex::new(Vec::new()),
+            slots: AtomicUsize::new(0),
+            #[cfg(test)]
+            backpressure_waits: AtomicUsize::new(0),
         }
     }
 
@@ -1567,39 +1579,54 @@ impl InFlightTracker {
         backend: &MetalBackend,
         argument_capacity: usize,
     ) -> Result<SubmissionObjects, BackendError> {
-        use objc2_metal::MTL4ArgumentTableDescriptor;
-
-        let device = &backend.device;
-        self.drain_done();
-        let reusable = self
-            .pool
-            .lock()
-            .map_err(|_| BackendError::ExecutionFailed)?
-            .pop();
-        let mut reusable = if let Some(objects) = reusable {
-            reset_allocator(&objects.allocator);
-            objects
-        } else {
-            let allocator = device
-                .newCommandAllocator()
-                .ok_or(BackendError::ExecutionFailed)?;
-            let descriptor = MTL4ArgumentTableDescriptor::new();
-            descriptor.setMaxBufferBindCount(24);
-            let argument_table = device
-                .newArgumentTableWithDescriptor_error(&descriptor)
-                .map_err(|_| BackendError::ExecutionFailed)?;
-            let raw = backend.new_buffer(argument_capacity)?;
-            ReusableSubmissionObjects {
-                allocator,
-                argument_table,
-                argument_buffer: ArgumentBuffer {
-                    raw,
-                    capacity: argument_capacity,
-                },
+        assert_not_in_metal_callback();
+        let mut reusable = loop {
+            self.drain_done();
+            if let Some(objects) = self
+                .pool
+                .lock()
+                .map_err(|_| BackendError::ExecutionFailed)?
+                .pop()
+            {
+                break objects;
             }
+            if self
+                .slots
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |slots| {
+                    (slots < MAX_IN_FLIGHT_SUBMISSIONS).then_some(slots + 1)
+                })
+                .is_ok()
+            {
+                match Self::new_slot(backend, argument_capacity) {
+                    Ok(objects) => break objects,
+                    Err(error) => {
+                        self.slots.fetch_sub(1, Ordering::AcqRel);
+                        return Err(error);
+                    }
+                }
+            }
+            let pending = self
+                .completions
+                .lock()
+                .map_err(|_| BackendError::ExecutionFailed)?
+                .first()
+                .map(|entry| Arc::clone(&entry.completion));
+            let Some(pending) = pending else {
+                return Err(BackendError::QuotaExceeded);
+            };
+            #[cfg(test)]
+            self.backpressure_waits.fetch_add(1, Ordering::Relaxed);
+            pending.wait(backend.gpu_timeout)?;
         };
+        reset_allocator(&reusable.allocator);
         if reusable.argument_buffer.capacity != argument_capacity {
-            let raw = backend.new_buffer(argument_capacity)?;
+            let raw = match backend.new_buffer(argument_capacity) {
+                Ok(raw) => raw,
+                Err(error) => {
+                    self.return_dirty(reusable);
+                    return Err(error);
+                }
+            };
             reusable.argument_buffer = ArgumentBuffer {
                 raw,
                 capacity: argument_capacity,
@@ -1609,6 +1636,32 @@ impl InFlightTracker {
             reusable: Some(reusable),
             owner: Arc::downgrade(self),
             programs: Vec::new(),
+        })
+    }
+
+    fn new_slot(
+        backend: &MetalBackend,
+        argument_capacity: usize,
+    ) -> Result<ReusableSubmissionObjects, BackendError> {
+        use objc2_metal::MTL4ArgumentTableDescriptor;
+
+        let device = &backend.device;
+        let allocator = device
+            .newCommandAllocator()
+            .ok_or(BackendError::ExecutionFailed)?;
+        let descriptor = MTL4ArgumentTableDescriptor::new();
+        descriptor.setMaxBufferBindCount(24);
+        let argument_table = device
+            .newArgumentTableWithDescriptor_error(&descriptor)
+            .map_err(|_| BackendError::ExecutionFailed)?;
+        let raw = backend.new_buffer(argument_capacity)?;
+        Ok(ReusableSubmissionObjects {
+            allocator,
+            argument_table,
+            argument_buffer: ArgumentBuffer {
+                raw,
+                capacity: argument_capacity,
+            },
         })
     }
 
@@ -1723,6 +1776,16 @@ impl InFlightTracker {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .len()
+    }
+
+    #[cfg(test)]
+    pub(super) fn slot_count(&self) -> usize {
+        self.slots.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(super) fn backpressure_wait_count(&self) -> usize {
+        self.backpressure_waits.load(Ordering::Relaxed)
     }
 }
 
@@ -6934,6 +6997,7 @@ fn program_compile_failed(hash: ProgramHash) -> BackendError {
 mod tests {
     use std::{
         collections::VecDeque,
+        sync::Barrier,
         thread,
         time::{Duration, Instant},
     };
@@ -7581,6 +7645,61 @@ mod tests {
         }
     }
 
+    fn repeated_silu_mul_commands(tensors: &[Tensor; 3], dispatches: usize) -> CommandList {
+        let mut commands = CommandList::new();
+        for _ in 0..dispatches {
+            commands
+                .dispatch(Op::SiluMul, &[&tensors[0], &tensors[1]], &tensors[2])
+                .unwrap();
+        }
+        commands
+    }
+
+    fn submission_workloads(backend: &MetalBackend, count: usize) -> Vec<[Tensor; 3]> {
+        (0..count)
+            .map(|_| {
+                [
+                    backend.alloc(DType::F32, &[1024, 4097]).unwrap(),
+                    backend.alloc(DType::F32, &[1024, 4097]).unwrap(),
+                    backend.alloc(DType::F32, &[1024, 4097]).unwrap(),
+                ]
+            })
+            .collect()
+    }
+
+    fn run_submission_wave(
+        backend: &Arc<MetalBackend>,
+        workloads: &[[Tensor; 3]],
+        dispatch_counts: &[usize],
+    ) -> Vec<(MetalSubmission, Duration, Duration)> {
+        assert_eq!(workloads.len(), dispatch_counts.len());
+        let submitted = Arc::new(Barrier::new(workloads.len()));
+        thread::scope(|scope| {
+            let workers = workloads
+                .iter()
+                .zip(dispatch_counts)
+                .map(|(tensors, &dispatches)| {
+                    let backend = Arc::clone(backend);
+                    let submitted = Arc::clone(&submitted);
+                    scope.spawn(move || {
+                        let commands = repeated_silu_mul_commands(tensors, dispatches);
+                        let started = Instant::now();
+                        let submission = backend.submit(commands).unwrap();
+                        submitted.wait();
+                        submission.wait().unwrap();
+                        let wall = started.elapsed();
+                        let gpu = submission.gpu_time().unwrap();
+                        (submission, gpu, wall)
+                    })
+                })
+                .collect::<Vec<_>>();
+            workers
+                .into_iter()
+                .map(|worker| worker.join().unwrap())
+                .collect()
+        })
+    }
+
     #[test]
     fn pooled_submission_objects_survive_waits_and_drops() {
         let backend = MetalBackend::new().unwrap();
@@ -7699,10 +7818,10 @@ mod tests {
     #[test]
     fn concurrent_submissions_share_one_backend() {
         let backend = Arc::new(MetalBackend::new().unwrap());
-        let workers = (0..8)
+        let workers = (0..MAX_IN_FLIGHT_SUBMISSIONS)
             .map(|worker| {
                 let backend = Arc::clone(&backend);
-                thread::spawn(move || run_varying_submissions(&backend, 200, worker * 200))
+                thread::spawn(move || run_varying_submissions(&backend, 400, worker * 400))
             })
             .collect::<Vec<_>>();
         for worker in workers {
@@ -7715,6 +7834,48 @@ mod tests {
         }
         backend.in_flight.drain_done();
         assert!(backend.in_flight.pooled_len() >= 1);
+    }
+
+    #[test]
+    fn concurrent_submissions_apply_backpressure_without_allocation_growth() {
+        const WORKERS: usize = MAX_IN_FLIGHT_SUBMISSIONS * 2;
+        const DISPATCHES: usize = 4096;
+
+        let backend = Arc::new(MetalBackend::new().unwrap());
+        let workloads = submission_workloads(&backend, WORKERS);
+        backend
+            .submit(repeated_silu_mul_commands(&workloads[0], 1))
+            .unwrap()
+            .wait()
+            .unwrap();
+        let outstanding = workloads[..MAX_IN_FLIGHT_SUBMISSIONS]
+            .iter()
+            .map(|tensors| {
+                backend
+                    .submit(repeated_silu_mul_commands(tensors, DISPATCHES))
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(backend.in_flight.len(), MAX_IN_FLIGHT_SUBMISSIONS);
+        let allocated = backend.debug_state().allocation_requests;
+
+        let completed = run_submission_wave(
+            &backend,
+            &workloads[MAX_IN_FLIGHT_SUBMISSIONS..],
+            &[DISPATCHES; MAX_IN_FLIGHT_SUBMISSIONS],
+        );
+        for submission in &outstanding {
+            submission.wait().unwrap();
+        }
+        drop(completed);
+        drop(outstanding);
+        backend.in_flight.drain_done();
+
+        let state = backend.debug_state();
+        assert!(state.submission_waits >= MAX_IN_FLIGHT_SUBMISSIONS);
+        assert_eq!(state.submission_slots, MAX_IN_FLIGHT_SUBMISSIONS);
+        assert_eq!(state.pooled_submissions, MAX_IN_FLIGHT_SUBMISSIONS);
+        assert_eq!(state.allocation_requests, allocated);
     }
 
     #[test]
