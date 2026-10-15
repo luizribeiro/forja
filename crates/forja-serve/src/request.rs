@@ -46,6 +46,8 @@ pub struct CompletionParams {
     pub stop: Option<Stop>,
     /// Whether to stream response events.
     pub stream: bool,
+    /// Optional streaming response controls.
+    pub stream_options: Option<StreamOptions>,
     /// Number of completions.
     pub n: Option<u32>,
     /// Unsupported presence penalty.
@@ -72,6 +74,14 @@ pub struct CompletionParams {
     pub tool_choice: Option<Value>,
     /// Unsupported structured response selection.
     pub response_format: Option<Value>,
+}
+
+/// Optional controls for streaming usage emission.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct StreamOptions {
+    /// Emit an empty-choices usage chunk before the terminal marker.
+    pub include_usage: bool,
 }
 
 /// An OpenAI-compatible chat-completion request.
@@ -316,6 +326,9 @@ fn ceiling_usize(value: u32) -> usize {
 }
 
 fn reject_unsupported(params: &CompletionParams) -> Result<(), ValidationError> {
+    if params.stream_options.is_some() && !params.stream {
+        return invalid("stream_options requires stream=true");
+    }
     let unsupported = params.n.is_some_and(|value| value != 1)
         || params.presence_penalty.is_some_and(|value| value != 0.0)
         || params.frequency_penalty.is_some_and(|value| value != 0.0)

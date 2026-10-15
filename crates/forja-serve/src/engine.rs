@@ -4,6 +4,7 @@ use forja_config::HostConfig;
 use forja_core::Backend;
 use forja_host::{EngineDecode, EngineDecodeOutput, EngineInfo, EngineRunner, SamplingParams};
 use tokenizers::Tokenizer;
+use tokio::sync::mpsc;
 
 use crate::request::{validate_chat_input, validate_completion_input, validate_prompt};
 use crate::{
@@ -111,6 +112,23 @@ pub struct Completion {
     pub finish_reason: FinishReason,
     /// Request token counts.
     pub usage: Usage,
+}
+
+/// One logical event produced during a streamed generation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum GenerationEvent {
+    /// Initial assistant role for a chat stream.
+    Role,
+    /// Decoded content safe to expose to the client.
+    Content(String),
+    /// The terminal choice chunk.
+    Finished(FinishReason, Usage),
+    /// Optional usage-only chunk.
+    Usage(Usage),
+    /// Clean stream terminator.
+    Done,
+    /// One terminal error emitted after response headers.
+    Error(String),
 }
 
 /// One loaded engine, tokenizer, and model-declared chat format.
@@ -268,7 +286,7 @@ where
         request: &ChatCompletionRequest,
     ) -> Result<Completion, GenerationError> {
         let prefill = self.prefill_chat(request).await?;
-        self.decode(prefill).await
+        self.decode(prefill, None).await
     }
 
     /// Generates a complete response from an unformatted text prompt.
@@ -281,10 +299,44 @@ where
         request: &CompletionRequest,
     ) -> Result<Completion, GenerationError> {
         let prefill = self.prefill_completion(request).await?;
-        self.decode(prefill).await
+        self.decode(prefill, None).await
     }
 
-    async fn decode(&mut self, prefill: PrefilledPrompt) -> Result<Completion, GenerationError> {
+    /// Streams chat content and terminal events in generation order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when generation fails or the receiver is abandoned.
+    pub async fn stream_chat(
+        &mut self,
+        request: &ChatCompletionRequest,
+        sender: &mpsc::Sender<GenerationEvent>,
+    ) -> Result<(), GenerationError> {
+        let prefill = self.prefill_chat(request).await?;
+        let completion = self.decode(prefill, Some(sender)).await?;
+        send_terminal(sender, &request.params, completion).await
+    }
+
+    /// Streams text-completion content and terminal events in generation order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when generation fails or the receiver is abandoned.
+    pub async fn stream_text(
+        &mut self,
+        request: &CompletionRequest,
+        sender: &mpsc::Sender<GenerationEvent>,
+    ) -> Result<(), GenerationError> {
+        let prefill = self.prefill_completion(request).await?;
+        let completion = self.decode(prefill, Some(sender)).await?;
+        send_terminal(sender, &request.params, completion).await
+    }
+
+    async fn decode(
+        &mut self,
+        prefill: PrefilledPrompt,
+        sender: Option<&mpsc::Sender<GenerationEvent>>,
+    ) -> Result<Completion, GenerationError> {
         let mut pending = VecDeque::from([prefill.first]);
         let mut issued = 1_u32;
         let mut consumed = 0_u32;
@@ -353,8 +405,7 @@ where
                     let output = matcher.push(piece.as_bytes()).map_err(|error| {
                         GenerationError::new(format!("decoded invalid UTF-8: {error}"))
                     })?;
-                    text.push_str(&output.text);
-                    if output.matched {
+                    if emit_output(&mut text, output, sender).await? {
                         return Ok(FinishReason::Stop);
                     }
                 }
@@ -362,7 +413,7 @@ where
             let output = matcher
                 .finish()
                 .map_err(|error| GenerationError::new(format!("decoded invalid UTF-8: {error}")))?;
-            text.push_str(&output.text);
+            emit_output(&mut text, output, sender).await?;
             Ok(FinishReason::Length)
         }
         .await;
@@ -380,6 +431,50 @@ where
             },
         })
     }
+}
+
+async fn emit_output(
+    text: &mut String,
+    output: crate::StopOutput,
+    sender: Option<&mpsc::Sender<GenerationEvent>>,
+) -> Result<bool, GenerationError> {
+    text.push_str(&output.text);
+    if let Some(sender) = sender
+        && !output.text.is_empty()
+    {
+        sender
+            .send(GenerationEvent::Content(output.text))
+            .await
+            .map_err(|_| GenerationError::unavailable("stream receiver closed"))?;
+    }
+    Ok(output.matched)
+}
+
+async fn send_terminal(
+    sender: &mpsc::Sender<GenerationEvent>,
+    params: &crate::CompletionParams,
+    completion: Completion,
+) -> Result<(), GenerationError> {
+    sender
+        .send(GenerationEvent::Finished(
+            completion.finish_reason,
+            completion.usage,
+        ))
+        .await
+        .map_err(|_| GenerationError::unavailable("stream receiver closed"))?;
+    if params
+        .stream_options
+        .is_some_and(|options| options.include_usage)
+    {
+        sender
+            .send(GenerationEvent::Usage(completion.usage))
+            .await
+            .map_err(|_| GenerationError::unavailable("stream receiver closed"))?;
+    }
+    sender
+        .send(GenerationEvent::Done)
+        .await
+        .map_err(|_| GenerationError::unavailable("stream receiver closed"))
 }
 
 fn read_token(bytes: &[u8]) -> Result<u32, GenerationError> {
