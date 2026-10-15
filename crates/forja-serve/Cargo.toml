@@ -7,6 +7,7 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+forja-config = { path = "../forja-config" }
 minijinja.workspace = true
 minijinja-contrib.workspace = true
 serde = { workspace = true, features = ["derive"] }

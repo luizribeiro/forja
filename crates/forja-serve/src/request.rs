@@ -1,5 +1,6 @@
 use std::{collections::BTreeMap, error::Error, fmt};
 
+use forja_config::HostConfig;
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -130,33 +131,85 @@ impl fmt::Display for ValidationError {
 
 impl Error for ValidationError {}
 
+/// Validates and resolves a chat-completion request.
+///
+/// # Errors
+///
+/// Returns an error when a field is invalid, unsupported, or exceeds a configured ceiling.
+pub fn validate_chat(
+    request: &ChatCompletionRequest,
+    config: &HostConfig,
+    defaults: &GenerationConfig,
+    prompt_tokens: u32,
+    max_context: u32,
+) -> Result<ResolvedParams, ValidationError> {
+    if request.messages.len() > ceiling_usize(config.request.max_messages) {
+        return invalid("messages exceed the configured ceiling");
+    }
+    validate_text(
+        checked_text_bytes(request.messages.iter().map(|message| message.content.len()))?,
+        config,
+    )?;
+    resolve(
+        &request.params,
+        config,
+        defaults,
+        prompt_tokens,
+        max_context,
+        true,
+    )
+}
+
+/// Validates and resolves a text-completion request.
+///
+/// # Errors
+///
+/// Returns an error when a field is invalid, unsupported, or exceeds a configured ceiling.
+pub fn validate_completion(
+    request: &CompletionRequest,
+    config: &HostConfig,
+    defaults: &GenerationConfig,
+    prompt_tokens: u32,
+    max_context: u32,
+) -> Result<ResolvedParams, ValidationError> {
+    validate_text(checked_text_bytes([request.prompt.len()])?, config)?;
+    resolve(
+        &request.params,
+        config,
+        defaults,
+        prompt_tokens,
+        max_context,
+        false,
+    )
+}
+
 /// Resolves request values against model and host defaults.
 ///
 /// # Errors
 ///
 /// Returns an error when a value is internally inconsistent or outside its valid range.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "request admission applies ceilings before resolution"
-    )
-)]
 fn resolve(
     params: &CompletionParams,
+    config: &HostConfig,
     defaults: &GenerationConfig,
     prompt_tokens: u32,
     max_context: u32,
-    max_output_tokens: u32,
+    chat: bool,
 ) -> Result<ResolvedParams, ValidationError> {
     reject_unsupported(params)?;
     if params.max_tokens.is_some() && params.max_completion_tokens.is_some() {
         return invalid("max_tokens and max_completion_tokens conflict");
     }
+    if !chat && params.max_completion_tokens.is_some() {
+        return invalid("max_completion_tokens is only supported for chat completions");
+    }
+    if prompt_tokens > config.request.max_prompt_tokens || prompt_tokens >= max_context {
+        return invalid("prompt exceeds the configured context ceiling");
+    }
     let requested = params
         .max_completion_tokens
         .or(params.max_tokens)
-        .unwrap_or(max_output_tokens);
+        .unwrap_or(config.request.max_output_tokens);
     if requested == 0 {
         return invalid("output token limit must be positive");
     }
@@ -173,17 +226,49 @@ fn resolve(
     if !(top_p.is_finite() && 0.0 < top_p && top_p <= 1.0) {
         return invalid("top_p must be finite and in (0, 1]");
     }
+    let remaining_context = max_context.checked_sub(prompt_tokens).ok_or_else(|| {
+        ValidationError("prompt exceeds the configured context ceiling".to_owned())
+    })?;
+    let stops = normalize_stops(params.stop.as_ref());
+    if stops.len() > ceiling_usize(config.request.max_stops) || stops.iter().any(String::is_empty) {
+        return invalid("stop strings exceed the configured ceiling or are empty");
+    }
     Ok(ResolvedParams {
         max_tokens: requested
-            .min(max_output_tokens)
-            .min(max_context.saturating_sub(prompt_tokens)),
+            .min(config.request.max_output_tokens)
+            .min(remaining_context),
         temperature,
         top_p,
         top_k: params.top_k.or(defaults.top_k).unwrap_or(0),
         seed: params.seed,
-        stops: normalize_stops(params.stop.as_ref()),
+        stops,
         stream: params.stream,
     })
+}
+
+fn checked_text_bytes<T>(lengths: impl IntoIterator<Item = T>) -> Result<u64, ValidationError>
+where
+    T: TryInto<u64>,
+{
+    lengths.into_iter().try_fold(0_u64, |sum, length| {
+        let length = length
+            .try_into()
+            .map_err(|_| ValidationError("request text size overflowed".to_owned()))?;
+        sum.checked_add(length)
+            .ok_or_else(|| ValidationError("request text size overflowed".to_owned()))
+    })
+}
+
+fn validate_text(bytes: u64, config: &HostConfig) -> Result<(), ValidationError> {
+    if bytes > config.request.max_text_bytes.get() {
+        invalid("request text exceeds the configured ceiling")
+    } else {
+        Ok(())
+    }
+}
+
+fn ceiling_usize(value: u32) -> usize {
+    usize::try_from(value).unwrap_or(usize::MAX)
 }
 
 fn reject_unsupported(params: &CompletionParams) -> Result<(), ValidationError> {
@@ -212,13 +297,6 @@ fn reject_unsupported(params: &CompletionParams) -> Result<(), ValidationError> 
     }
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "request admission applies ceilings before resolution"
-    )
-)]
 fn normalize_stops(stop: Option<&Stop>) -> Vec<String> {
     match stop {
         None => Vec::new(),
@@ -227,13 +305,6 @@ fn normalize_stops(stop: Option<&Stop>) -> Vec<String> {
     }
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "request admission applies ceilings before resolution"
-    )
-)]
 fn invalid<T>(message: &str) -> Result<T, ValidationError> {
     Err(ValidationError(message.to_owned()))
 }
@@ -241,6 +312,33 @@ fn invalid<T>(message: &str) -> Result<T, ValidationError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn chat(params: CompletionParams) -> ChatCompletionRequest {
+        ChatCompletionRequest {
+            model: "qwen".to_owned(),
+            messages: vec![Message {
+                role: "user".to_owned(),
+                content: "hello".to_owned(),
+            }],
+            params,
+        }
+    }
+
+    fn resolve_chat(
+        params: &CompletionParams,
+        defaults: &GenerationConfig,
+        prompt_tokens: u32,
+        max_context: u32,
+    ) -> Result<ResolvedParams, ValidationError> {
+        resolve(
+            params,
+            &HostConfig::default(),
+            defaults,
+            prompt_tokens,
+            max_context,
+            true,
+        )
+    }
 
     #[test]
     fn request_json_is_strict_and_accepts_top_k() {
@@ -271,7 +369,7 @@ mod tests {
             top_k: Some(7),
             ..CompletionParams::default()
         };
-        let resolved = resolve(&params, &defaults, 32_700, 32_768, 8_192).unwrap();
+        let resolved = resolve_chat(&params, &defaults, 32_700, 32_768).unwrap();
         assert_eq!(resolved.max_tokens, 68);
         assert_eq!(resolved.temperature.to_bits(), 0.2_f32.to_bits());
         assert_eq!(resolved.top_p.to_bits(), 0.8_f32.to_bits());
@@ -285,7 +383,7 @@ mod tests {
             max_completion_tokens: Some(1),
             ..CompletionParams::default()
         };
-        let error = resolve(&params, &GenerationConfig::default(), 1, 32_768, 8_192).unwrap_err();
+        let error = resolve_chat(&params, &GenerationConfig::default(), 1, 32_768).unwrap_err();
         assert_eq!(
             error.to_string(),
             "max_tokens and max_completion_tokens conflict"
@@ -299,7 +397,7 @@ mod tests {
             temperature: Some(0.7),
             ..GenerationConfig::default()
         };
-        let resolved = resolve(&CompletionParams::default(), &defaults, 1, 32_768, 8_192).unwrap();
+        let resolved = resolve_chat(&CompletionParams::default(), &defaults, 1, 32_768).unwrap();
         assert_eq!(resolved.temperature.to_bits(), 0.0_f32.to_bits());
     }
 
@@ -309,7 +407,7 @@ mod tests {
             n: Some(2),
             ..CompletionParams::default()
         };
-        let error = resolve(&params, &GenerationConfig::default(), 1, 32_768, 8_192).unwrap_err();
+        let error = resolve_chat(&params, &GenerationConfig::default(), 1, 32_768).unwrap_err();
         assert_eq!(
             error.to_string(),
             "request contains an unsupported non-default field"
@@ -322,10 +420,134 @@ mod tests {
             repetition_penalty: Some(1.05),
             ..CompletionParams::default()
         };
-        let error = resolve(&params, &GenerationConfig::default(), 1, 32_768, 8_192).unwrap_err();
+        let error = resolve_chat(&params, &GenerationConfig::default(), 1, 32_768).unwrap_err();
         assert_eq!(
             error.to_string(),
             "request contains an unsupported non-default field"
+        );
+    }
+
+    #[test]
+    fn validates_text_completions() {
+        let request = CompletionRequest {
+            model: "qwen".to_owned(),
+            prompt: "hello".to_owned(),
+            params: CompletionParams {
+                max_tokens: Some(7),
+                ..CompletionParams::default()
+            },
+        };
+        let resolved = validate_completion(
+            &request,
+            &HostConfig::default(),
+            &GenerationConfig::default(),
+            1,
+            32_768,
+        )
+        .unwrap();
+        assert_eq!(resolved.max_tokens, 7);
+    }
+
+    #[test]
+    fn aggregate_text_size_overflow_is_rejected() {
+        let error = checked_text_bytes([u64::MAX, 1]).unwrap_err();
+        assert_eq!(error.to_string(), "request text size overflowed");
+    }
+
+    #[test]
+    fn message_count_ceiling_is_rejected() {
+        let mut config = HostConfig::default();
+        config.request.max_messages = 0;
+        let error = validate_chat(
+            &chat(CompletionParams::default()),
+            &config,
+            &GenerationConfig::default(),
+            1,
+            32_768,
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "messages exceed the configured ceiling");
+    }
+
+    #[test]
+    fn aggregate_text_size_ceiling_is_rejected() {
+        let config = HostConfig::default();
+        let limit = usize::try_from(config.request.max_text_bytes.get()).unwrap();
+        let request = ChatCompletionRequest {
+            model: "qwen".to_owned(),
+            messages: vec![
+                Message {
+                    role: "user".to_owned(),
+                    content: "a".repeat(limit),
+                },
+                Message {
+                    role: "user".to_owned(),
+                    content: "b".to_owned(),
+                },
+            ],
+            params: CompletionParams::default(),
+        };
+        let error =
+            validate_chat(&request, &config, &GenerationConfig::default(), 1, 32_768).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "request text exceeds the configured ceiling"
+        );
+    }
+
+    #[test]
+    fn context_ceiling_is_rejected() {
+        let error = validate_chat(
+            &chat(CompletionParams::default()),
+            &HostConfig::default(),
+            &GenerationConfig::default(),
+            32_768,
+            32_768,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "prompt exceeds the configured context ceiling"
+        );
+    }
+
+    #[test]
+    fn stop_count_ceiling_is_rejected() {
+        let params = CompletionParams {
+            stop: Some(Stop::Many(vec!["stop".to_owned(); 5])),
+            ..CompletionParams::default()
+        };
+        let error = validate_chat(
+            &chat(params),
+            &HostConfig::default(),
+            &GenerationConfig::default(),
+            1,
+            32_768,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "stop strings exceed the configured ceiling or are empty"
+        );
+    }
+
+    #[test]
+    fn empty_stop_is_rejected() {
+        let params = CompletionParams {
+            stop: Some(Stop::One(String::new())),
+            ..CompletionParams::default()
+        };
+        let error = validate_chat(
+            &chat(params),
+            &HostConfig::default(),
+            &GenerationConfig::default(),
+            1,
+            32_768,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "stop strings exceed the configured ceiling or are empty"
         );
     }
 }

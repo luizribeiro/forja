@@ -12,7 +12,7 @@ use serde_json::{Map, Value};
 
 pub use request::{
     ChatCompletionRequest, CompletionParams, CompletionRequest, Message, ResolvedParams, Stop,
-    ValidationError,
+    ValidationError, validate_chat, validate_completion,
 };
 
 /// A compiled publisher-provided chat template.

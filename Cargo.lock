@@ -810,6 +810,7 @@ dependencies = [
 name = "forja-serve"
 version = "0.0.0"
 dependencies = [
+ "forja-config",
  "minijinja",
  "minijinja-contrib",
  "serde",
