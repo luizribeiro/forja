@@ -2,11 +2,15 @@
 
 #![forbid(unsafe_code)]
 
+mod request;
+
 use std::{error::Error, fs::File, path::Path};
 
 use minijinja::{AutoEscape, Environment, UndefinedBehavior};
 use serde::Deserialize;
 use serde_json::{Map, Value};
+
+pub use request::{ChatCompletionRequest, CompletionParams, CompletionRequest, Message, Stop};
 
 /// A compiled publisher-provided chat template.
 pub struct ChatTemplate {
