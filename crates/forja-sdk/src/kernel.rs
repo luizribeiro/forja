@@ -61,6 +61,7 @@ pub(crate) fn run_epilogue(
     output: TensorRef<'_>,
     epilogue: &Epilogue,
     extras: &[TensorRef<'_>],
+    selection: Option<crate::target::metal::VariantChoice<'_>>,
 ) -> Result<()> {
     let rank = u8::try_from(output.shape.len())
         .map_err(|_| Error::new("epilogue output rank is too large"))?;
@@ -82,6 +83,7 @@ pub(crate) fn run_epilogue(
         output.handle,
         &epilogue.handle,
         &extra_handles,
+        selection,
     )
 }
 

@@ -479,6 +479,31 @@ impl<T: Element> Tensor<T> {
         epilogue: &Epilogue,
         extras: &[TensorRef<'_>],
     ) -> Result<Self> {
+        self.matmul_epilogue_selected(right, epilogue, extras, None)
+    }
+
+    /// Multiplies matrices with a scalar epilogue and explicit Metal algorithm selection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for incompatible bindings, rule context, or a refused selection.
+    pub fn matmul_epilogue_with<'a>(
+        &self,
+        right: &Self,
+        epilogue: &Epilogue,
+        extras: &[TensorRef<'_>],
+        selection: impl Into<crate::target::metal::VariantChoice<'a>>,
+    ) -> Result<Self> {
+        self.matmul_epilogue_selected(right, epilogue, extras, Some(selection.into()))
+    }
+
+    fn matmul_epilogue_selected(
+        &self,
+        right: &Self,
+        epilogue: &Epilogue,
+        extras: &[TensorRef<'_>],
+        selection: Option<crate::target::metal::VariantChoice<'_>>,
+    ) -> Result<Self> {
         let output = self.empty_matmul_output(right)?;
         crate::kernel::run_epilogue(
             sys::Op::Matmul,
@@ -486,6 +511,7 @@ impl<T: Element> Tensor<T> {
             TensorRef::new(&output)?,
             epilogue,
             extras,
+            selection,
         )?;
         Ok(output)
     }
@@ -626,6 +652,58 @@ impl<T: Element> Tensor<T> {
     where
         T: FloatElement,
     {
+        self.quant_matmul_epilogue_selected(
+            packed, scales, biases, bits, group_size, epilogue, extras, None,
+        )
+    }
+
+    /// Multiplies quantized weights with an epilogue and explicit Metal algorithm selection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for incompatible bindings, rule context, or a refused selection.
+    #[allow(clippy::too_many_arguments)]
+    pub fn quant_matmul_epilogue_with<'a, S: FloatElement>(
+        &self,
+        packed: &Tensor<u32>,
+        scales: &Tensor<S>,
+        biases: &Tensor<S>,
+        bits: u8,
+        group_size: u32,
+        epilogue: &Epilogue,
+        extras: &[TensorRef<'_>],
+        selection: impl Into<crate::target::metal::VariantChoice<'a>>,
+    ) -> Result<Self>
+    where
+        T: FloatElement,
+    {
+        self.quant_matmul_epilogue_selected(
+            packed,
+            scales,
+            biases,
+            bits,
+            group_size,
+            epilogue,
+            extras,
+            Some(selection.into()),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn quant_matmul_epilogue_selected<S: FloatElement>(
+        &self,
+        packed: &Tensor<u32>,
+        scales: &Tensor<S>,
+        biases: &Tensor<S>,
+        bits: u8,
+        group_size: u32,
+        epilogue: &Epilogue,
+        extras: &[TensorRef<'_>],
+        selection: Option<crate::target::metal::VariantChoice<'_>>,
+    ) -> Result<Self>
+    where
+        T: FloatElement,
+    {
         let output = self.empty_quant_matmul_output(packed, scales, biases, bits, group_size)?;
         crate::kernel::run_epilogue(
             sys::Op::QuantMatmul { bits, group_size },
@@ -633,6 +711,7 @@ impl<T: Element> Tensor<T> {
             TensorRef::new(&output)?,
             epilogue,
             extras,
+            selection,
         )?;
         Ok(output)
     }
@@ -816,6 +895,61 @@ impl<T: Element> Tensor<T> {
     where
         T: FloatElement,
     {
+        self.gather_quant_matmul_epilogue_selected(
+            packed, scales, biases, indices, bits, group_size, epilogue, extras, None,
+        )
+    }
+
+    /// Multiplies gathered quantized rows with an epilogue and explicit Metal selection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for incompatible bindings, rule context, or a refused selection.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gather_quant_matmul_epilogue_with<'a, S: FloatElement>(
+        &self,
+        packed: &Tensor<u32>,
+        scales: &Tensor<S>,
+        biases: &Tensor<S>,
+        indices: &Tensor<u32>,
+        bits: u8,
+        group_size: u32,
+        epilogue: &Epilogue,
+        extras: &[TensorRef<'_>],
+        selection: impl Into<crate::target::metal::VariantChoice<'a>>,
+    ) -> Result<Self>
+    where
+        T: FloatElement,
+    {
+        self.gather_quant_matmul_epilogue_selected(
+            packed,
+            scales,
+            biases,
+            indices,
+            bits,
+            group_size,
+            epilogue,
+            extras,
+            Some(selection.into()),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn gather_quant_matmul_epilogue_selected<S: FloatElement>(
+        &self,
+        packed: &Tensor<u32>,
+        scales: &Tensor<S>,
+        biases: &Tensor<S>,
+        indices: &Tensor<u32>,
+        bits: u8,
+        group_size: u32,
+        epilogue: &Epilogue,
+        extras: &[TensorRef<'_>],
+        selection: Option<crate::target::metal::VariantChoice<'_>>,
+    ) -> Result<Self>
+    where
+        T: FloatElement,
+    {
         let shape =
             self.gather_quantized_shape(packed, scales, biases, indices, bits, group_size)?;
         let output = Self::empty(shape.to_vec())?;
@@ -831,6 +965,7 @@ impl<T: Element> Tensor<T> {
             TensorRef::new(&output)?,
             epilogue,
             extras,
+            selection,
         )?;
         Ok(output)
     }

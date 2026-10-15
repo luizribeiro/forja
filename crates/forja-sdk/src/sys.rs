@@ -220,6 +220,13 @@ pub(crate) trait Backend {
         epilogue: &Self::Epilogue,
         extras: &[&Self::Tensor],
     ) -> Result<()>;
+    fn select_epilogue_variant(commands: &mut Self::Commands, name: &str) -> Result<()>;
+    fn select_epilogue_variant_rule(
+        commands: &mut Self::Commands,
+        params: &Self::Params,
+        parameter: u8,
+        arms: &[VariantArm],
+    ) -> Result<()>;
     fn submit(commands: Self::Commands) -> Result<()>;
     fn params(ranges: &[(u32, u32)]) -> Result<Self::Params>;
     fn create_graph(commands: Self::Commands) -> Result<Self::Graph>;
@@ -489,6 +496,49 @@ pub(crate) mod guest {
             commands
                 .dispatch_epilogue(wit_op(operation), inputs, output, epilogue, extras)
                 .map_err(|error| guest_error(&error))
+        }
+
+        fn select_epilogue_variant(commands: &mut Self::Commands, name: &str) -> Result<()> {
+            #[cfg(feature = "metal-variants")]
+            {
+                metal_variants::select_epilogue_variant(commands, name)
+                    .map_err(|error| guest_error(&error))
+            }
+            #[cfg(not(feature = "metal-variants"))]
+            {
+                let _ = (commands, name);
+                Err(Error::new(
+                    "Metal variant operations require the `metal-variants` feature",
+                ))
+            }
+        }
+
+        fn select_epilogue_variant_rule(
+            commands: &mut Self::Commands,
+            params: &Self::Params,
+            parameter: u8,
+            arms: &[VariantArm],
+        ) -> Result<()> {
+            #[cfg(feature = "metal-variants")]
+            {
+                let arms = arms
+                    .iter()
+                    .map(|arm| metal_variants::Arm {
+                        lo: arm.lo,
+                        hi: arm.hi,
+                        name: arm.name.clone(),
+                    })
+                    .collect::<Vec<_>>();
+                metal_variants::select_epilogue_variant_rule(commands, params, parameter, &arms)
+                    .map_err(|error| guest_error(&error))
+            }
+            #[cfg(not(feature = "metal-variants"))]
+            {
+                let _ = (commands, params, parameter, arms);
+                Err(Error::new(
+                    "Metal variant operations require the `metal-variants` feature",
+                ))
+            }
         }
 
         fn submit(commands: Self::Commands) -> Result<()> {
@@ -796,6 +846,19 @@ pub(crate) mod unavailable {
             _output: &Self::Tensor,
             _epilogue: &Self::Epilogue,
             _extras: &[&Self::Tensor],
+        ) -> Result<()> {
+            Err(error())
+        }
+
+        fn select_epilogue_variant(_commands: &mut Self::Commands, _name: &str) -> Result<()> {
+            Err(error())
+        }
+
+        fn select_epilogue_variant_rule(
+            _commands: &mut Self::Commands,
+            _params: &Self::Params,
+            _parameter: u8,
+            _arms: &[VariantArm],
         ) -> Result<()> {
             Err(error())
         }
@@ -1224,6 +1287,25 @@ pub(crate) mod native {
             }
         }
 
+        fn select_epilogue_variant(commands: &mut Self::Commands, name: &str) -> Result<()> {
+            #[cfg(not(all(feature = "native-metal", target_os = "macos")))]
+            let _ = name;
+            match commands {
+                Commands::Cpu(_) => Err(Error::new("Metal variants require the Metal backend")),
+                #[cfg(all(feature = "native-metal", target_os = "macos"))]
+                Commands::Metal(commands) => commands.select_epilogue_variant(name).map_err(error),
+            }
+        }
+
+        fn select_epilogue_variant_rule(
+            _commands: &mut Self::Commands,
+            _params: &Self::Params,
+            _parameter: u8,
+            _arms: &[VariantArm],
+        ) -> Result<()> {
+            Err(Error::new("graph capture requires a WebAssembly host"))
+        }
+
         fn submit(commands: Self::Commands) -> Result<()> {
             match commands {
                 Commands::Cpu(commands) => commands.submit().map(|_| ()).map_err(error),
@@ -1536,6 +1618,19 @@ pub(crate) fn dispatch_epilogue(
     extras: &[&Handle],
 ) -> Result<()> {
     Active::dispatch_epilogue(commands, operation, inputs, output, epilogue, extras)
+}
+
+pub(crate) fn select_epilogue_variant(commands: &mut Commands, name: &str) -> Result<()> {
+    Active::select_epilogue_variant(commands, name)
+}
+
+pub(crate) fn select_epilogue_variant_rule(
+    commands: &mut Commands,
+    params: &Params,
+    parameter: u8,
+    arms: &[VariantArm],
+) -> Result<()> {
+    Active::select_epilogue_variant_rule(commands, params, parameter, arms)
 }
 
 pub(crate) fn submit(commands: Commands) -> Result<()> {

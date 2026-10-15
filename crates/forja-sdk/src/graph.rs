@@ -510,18 +510,55 @@ pub(crate) fn record_epilogue(
     output: &sys::Handle,
     epilogue: &sys::Epilogue,
     extras: &[&sys::Handle],
+    selection: Option<crate::target::metal::VariantChoice<'_>>,
 ) -> Result<()> {
     CURRENT.with(|current| {
         let mut current = current.borrow_mut();
         if current.is_none() {
+            if matches!(
+                selection,
+                Some(crate::target::metal::VariantChoice::Rule(_))
+            ) {
+                return Err(crate::Error::new(
+                    "Metal variant rules can only be used during capture",
+                ));
+            }
             *current = Some(Recording::Lazy(sys::command_list()?));
         }
-        let Some(Recording::Lazy(commands) | Recording::Capture { commands, .. }) =
-            current.as_mut()
-        else {
-            return Err(crate::Error::new("current graph was not initialized"));
-        };
-        sys::dispatch_epilogue(commands, operation, inputs, output, epilogue, extras)
+        match (current.as_mut(), selection) {
+            (Some(Recording::Lazy(commands) | Recording::Capture { commands, .. }), None) => {
+                sys::dispatch_epilogue(commands, operation, inputs, output, epilogue, extras)
+            }
+            (
+                Some(Recording::Lazy(commands) | Recording::Capture { commands, .. }),
+                Some(crate::target::metal::VariantChoice::Variant(variant)),
+            ) => {
+                sys::dispatch_epilogue(commands, operation, inputs, output, epilogue, extras)?;
+                sys::select_epilogue_variant(commands, variant.name())
+            }
+            (
+                Some(Recording::Capture {
+                    commands,
+                    params,
+                    ids,
+                }),
+                Some(crate::target::metal::VariantChoice::Rule(rule)),
+            ) => {
+                let parameter = ids
+                    .iter()
+                    .position(|candidate| *candidate == rule.parameter_id)
+                    .and_then(|slot| u8::try_from(slot).ok())
+                    .ok_or_else(|| {
+                        crate::Error::new("variant rule parameter is not part of this capture")
+                    })?;
+                sys::dispatch_epilogue(commands, operation, inputs, output, epilogue, extras)?;
+                sys::select_epilogue_variant_rule(commands, params, parameter, &rule.arms)
+            }
+            (Some(Recording::Lazy(_)), Some(crate::target::metal::VariantChoice::Rule(_))) => Err(
+                crate::Error::new("Metal variant rules can only be used during capture"),
+            ),
+            (None, _) => Err(crate::Error::new("current graph was not initialized")),
+        }
     })
 }
 

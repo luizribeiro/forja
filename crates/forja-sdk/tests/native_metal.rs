@@ -3,11 +3,16 @@
 //! Metal-backed native SDK coverage.
 
 use forja_sdk::{
-    NativeDevice, Slice, Tensor, set_native_device,
+    DType, NativeDevice, Slice, Tensor, set_native_device,
     target::metal::{Variant, VariantRule},
 };
 
 mod support;
+
+#[forja_sdk::kernel(map)]
+fn double_epilogue_value(accumulator: forja_sdk::kernel::Elem) -> forja_sdk::kernel::Elem {
+    accumulator * 2.0
+}
 
 #[test]
 fn metal_views_round_trip_non_contiguous_values() {
@@ -60,4 +65,31 @@ fn explicit_metal_variant_matches_native_and_rule_syntax() {
     let high = Variant::new("sdpa.vector-single-pass").unwrap();
     assert!(VariantRule::new(&parameter, vec![(1..=7, low), (8..=33, high)]).is_ok());
     assert!(Variant::new("Matmul.Gemv").is_err());
+}
+
+#[test]
+fn metal_epilogue_selection_is_explicit_and_rules_require_capture() {
+    set_native_device(NativeDevice::Metal);
+    let epilogue = double_epilogue_value_epilogue(1, 2, &[], DType::F32).unwrap();
+    let left = Tensor::from_slice(&[2.0_f32], &[1, 1]).unwrap();
+    let right = Tensor::from_slice(&[3.0_f32], &[1, 1]).unwrap();
+    let variant = Variant::new("matmul.gemv").unwrap();
+    assert_eq!(
+        left.matmul_epilogue_with(&right, &epilogue, &[], &variant)
+            .unwrap()
+            .to_vec()
+            .unwrap(),
+        [12.0]
+    );
+
+    let parameter = forja_sdk::Param::new(1..=1).unwrap();
+    let rule = VariantRule::new(&parameter, vec![(1..=1, variant)]).unwrap();
+    let error = left
+        .matmul_epilogue_with(&right, &epilogue, &[], &rule)
+        .err()
+        .unwrap();
+    assert_eq!(
+        error.to_string(),
+        "Metal variant rules can only be used during capture"
+    );
 }
