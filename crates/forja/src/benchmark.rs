@@ -1738,7 +1738,7 @@ fn profile_categories(
     steps: &[EngineStepProfile],
     submissions: &[&forja_core::SubmissionProfile],
 ) -> Vec<ProfileCategory> {
-    vec![
+    let mut categories = vec![
         category("wall", steps, |step| (1.0, step.wall_time)),
         category("guest", steps, |step| (1.0, step.guest_time)),
         import_category("import.alloc", steps, |step| step.imports.alloc),
@@ -1812,6 +1812,40 @@ fn profile_categories(
         }),
         submission_category("barriers", submissions, |submission| {
             (count_as_f64(submission.barriers), Duration::ZERO)
+        }),
+    ];
+    categories.extend(epilogue_profile_categories(submissions));
+    categories
+}
+
+fn epilogue_profile_categories(
+    submissions: &[&forja_core::SubmissionProfile],
+) -> [ProfileCategory; 4] {
+    [
+        submission_category("epilogue.library-compilations", submissions, |submission| {
+            (
+                count_as_f64(submission.epilogue_library_compilations),
+                Duration::ZERO,
+            )
+        }),
+        submission_category(
+            "epilogue.pipeline-specializations",
+            submissions,
+            |submission| {
+                (
+                    count_as_f64(submission.epilogue_pipeline_specializations),
+                    Duration::ZERO,
+                )
+            },
+        ),
+        submission_category("epilogue.cache-hits", submissions, |submission| {
+            (count_as_f64(submission.epilogue_cache_hits), Duration::ZERO)
+        }),
+        submission_category("epilogue.compile-fallbacks", submissions, |submission| {
+            (
+                count_as_f64(submission.epilogue_compile_fallbacks),
+                Duration::ZERO,
+            )
         }),
     ]
 }

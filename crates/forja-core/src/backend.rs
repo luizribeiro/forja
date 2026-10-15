@@ -355,6 +355,14 @@ pub struct SubmissionProfile {
     pub program_encoding: ProfileCount,
     /// Resident program compilations skipped because no compile token was available.
     pub program_compile_fallbacks: u64,
+    /// Epilogue source libraries compiled while preparing or encoding work.
+    pub epilogue_library_compilations: u64,
+    /// Epilogue pipeline specializations compiled while preparing or encoding work.
+    pub epilogue_pipeline_specializations: u64,
+    /// Epilogue source or pipeline cache hits.
+    pub epilogue_cache_hits: u64,
+    /// Epilogue pipelines requested after graph preparation.
+    pub epilogue_compile_fallbacks: u64,
     /// Sampling rows that exhausted rejection rounds and used the exact fallback.
     pub sample_fallbacks: u64,
     /// Command validation and hazard analysis.
