@@ -22,13 +22,13 @@ use axum::{
 };
 use forja_core::Backend;
 use serde_json::{Value, json};
-use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tokio_stream::{StreamExt, wrappers::ReceiverStream};
 
 use crate::engine::ErrorKind;
 use crate::{
-    ChatCompletionRequest, Completion, CompletionRequest, GenerationError, GenerationEvent,
-    ServingEngine, Usage, chat_response, text_response,
+    ChatCompletionRequest, Completion, CompletionRequest, GenerationControl, GenerationError,
+    GenerationEvent, ServingEngine, Usage, chat_response, text_response,
 };
 
 /// Asynchronous chat generation used by the HTTP transport.
@@ -45,16 +45,21 @@ pub trait ChatService: Send + 'static {
     /// End-to-end request deadline.
     fn request_deadline(&self) -> Duration;
 
+    /// Maximum time a streaming event may remain backpressured.
+    fn write_stall_timeout(&self) -> Duration;
+
     /// Completes one chat request.
     fn complete(
         &mut self,
         request: ChatCompletionRequest,
+        control: GenerationControl,
     ) -> Pin<Box<dyn Future<Output = Result<Completion, GenerationError>> + Send + '_>>;
 
     /// Completes one unformatted text request.
     fn complete_text(
         &mut self,
         request: CompletionRequest,
+        control: GenerationControl,
     ) -> Pin<Box<dyn Future<Output = Result<Completion, GenerationError>> + Send + '_>>;
 
     /// Streams one chat request.
@@ -62,6 +67,7 @@ pub trait ChatService: Send + 'static {
         &mut self,
         request: ChatCompletionRequest,
         sender: mpsc::Sender<GenerationEvent>,
+        control: GenerationControl,
     ) -> Pin<Box<dyn Future<Output = Result<(), GenerationError>> + Send + '_>>;
 
     /// Streams one unformatted text request.
@@ -69,6 +75,7 @@ pub trait ChatService: Send + 'static {
         &mut self,
         request: CompletionRequest,
         sender: mpsc::Sender<GenerationEvent>,
+        control: GenerationControl,
     ) -> Pin<Box<dyn Future<Output = Result<(), GenerationError>> + Send + '_>>;
 }
 
@@ -92,34 +99,48 @@ where
         self.request_deadline()
     }
 
+    fn write_stall_timeout(&self) -> Duration {
+        self.write_stall_timeout()
+    }
+
     fn complete(
         &mut self,
         request: ChatCompletionRequest,
+        control: GenerationControl,
     ) -> Pin<Box<dyn Future<Output = Result<Completion, GenerationError>> + Send + '_>> {
-        Box::pin(async move { self.complete_chat(&request).await })
+        Box::pin(async move { self.complete_chat_controlled(&request, &control).await })
     }
 
     fn complete_text(
         &mut self,
         request: CompletionRequest,
+        control: GenerationControl,
     ) -> Pin<Box<dyn Future<Output = Result<Completion, GenerationError>> + Send + '_>> {
-        Box::pin(async move { self.complete_text(&request).await })
+        Box::pin(async move { self.complete_text_controlled(&request, &control).await })
     }
 
     fn stream_chat(
         &mut self,
         request: ChatCompletionRequest,
         sender: mpsc::Sender<GenerationEvent>,
+        control: GenerationControl,
     ) -> Pin<Box<dyn Future<Output = Result<(), GenerationError>> + Send + '_>> {
-        Box::pin(async move { self.stream_chat(&request, &sender).await })
+        Box::pin(async move {
+            self.stream_chat_controlled(&request, &sender, &control)
+                .await
+        })
     }
 
     fn stream_text(
         &mut self,
         request: CompletionRequest,
         sender: mpsc::Sender<GenerationEvent>,
+        control: GenerationControl,
     ) -> Pin<Box<dyn Future<Output = Result<(), GenerationError>> + Send + '_>> {
-        Box::pin(async move { self.stream_text(&request, &sender).await })
+        Box::pin(async move {
+            self.stream_text_controlled(&request, &sender, &control)
+                .await
+        })
     }
 }
 
@@ -129,6 +150,7 @@ pub fn chat_router<S: ChatService>(service: S) -> Router {
     let state = Arc::new(HttpState {
         queue_limit: service.queue_length(),
         deadline: service.request_deadline(),
+        write_stall_timeout: service.write_stall_timeout(),
         service: Mutex::new(service),
         sequence: Arc::new(Semaphore::new(1)),
         queued: AtomicU32::new(0),
@@ -148,6 +170,7 @@ struct HttpState<S> {
     queued: AtomicU32,
     queue_limit: u32,
     deadline: Duration,
+    write_stall_timeout: Duration,
 }
 
 type Body = Result<Bytes, BytesRejection>;
@@ -172,20 +195,38 @@ async fn chat<S: ChatService>(
     if request.params.stream {
         return stream_chat_response(state, request, deadline).await;
     }
-    let _permit = match tokio::time::timeout_at(deadline, admit(&state)).await {
+    let permit = match tokio::time::timeout_at(deadline, admit(&state)).await {
         Ok(Ok(permit)) => permit,
         Ok(Err(response)) => return *response,
         Err(_) => return api_error(StatusCode::GATEWAY_TIMEOUT, "request deadline exceeded"),
     };
-    let mut service = state.service.lock().await;
-    if request.model != service.model() {
+    if request.model != state.service.lock().await.model() {
         return api_error(StatusCode::NOT_FOUND, "model is not loaded");
     }
     let model = request.model.clone();
-    let completion = match tokio::time::timeout_at(deadline, service.complete(request)).await {
-        Ok(Ok(completion)) => completion,
-        Ok(Err(error)) => return generation_error(&error),
-        Err(_) => return api_error(StatusCode::GATEWAY_TIMEOUT, "request deadline exceeded"),
+    let control = GenerationControl::new(state.write_stall_timeout);
+    let (sender, receiver) = oneshot::channel();
+    let task_control = control.clone();
+    tokio::spawn(async move {
+        let _permit = permit;
+        let result = {
+            let mut service = state.service.lock().await;
+            let generation = service.complete(request, task_control.clone());
+            controlled_deadline(deadline, &task_control, generation).await
+        };
+        let _ = sender.send(result);
+    });
+    let mut disconnect = CancelOnDrop(Some(control));
+    let Ok(result) = receiver.await else {
+        return api_error(StatusCode::INTERNAL_SERVER_ERROR, "generation task failed");
+    };
+    disconnect.0 = None;
+    let completion = match result {
+        DeadlineResult::Completed(Ok(completion)) => completion,
+        DeadlineResult::Completed(Err(error)) => return generation_error(&error),
+        DeadlineResult::TimedOut => {
+            return api_error(StatusCode::GATEWAY_TIMEOUT, "request deadline exceeded");
+        }
     };
     let created = unix_time();
     match chat_response(&format!("chatcmpl-{created}"), created, &model, &completion) {
@@ -210,20 +251,38 @@ async fn text<S: ChatService>(
     if request.params.stream {
         return stream_text_response(state, request, deadline).await;
     }
-    let _permit = match tokio::time::timeout_at(deadline, admit(&state)).await {
+    let permit = match tokio::time::timeout_at(deadline, admit(&state)).await {
         Ok(Ok(permit)) => permit,
         Ok(Err(response)) => return *response,
         Err(_) => return api_error(StatusCode::GATEWAY_TIMEOUT, "request deadline exceeded"),
     };
-    let mut service = state.service.lock().await;
-    if request.model != service.model() {
+    if request.model != state.service.lock().await.model() {
         return api_error(StatusCode::NOT_FOUND, "model is not loaded");
     }
     let model = request.model.clone();
-    let completion = match tokio::time::timeout_at(deadline, service.complete_text(request)).await {
-        Ok(Ok(completion)) => completion,
-        Ok(Err(error)) => return generation_error(&error),
-        Err(_) => return api_error(StatusCode::GATEWAY_TIMEOUT, "request deadline exceeded"),
+    let control = GenerationControl::new(state.write_stall_timeout);
+    let (sender, receiver) = oneshot::channel();
+    let task_control = control.clone();
+    tokio::spawn(async move {
+        let _permit = permit;
+        let result = {
+            let mut service = state.service.lock().await;
+            let generation = service.complete_text(request, task_control.clone());
+            controlled_deadline(deadline, &task_control, generation).await
+        };
+        let _ = sender.send(result);
+    });
+    let mut disconnect = CancelOnDrop(Some(control));
+    let Ok(result) = receiver.await else {
+        return api_error(StatusCode::INTERNAL_SERVER_ERROR, "generation task failed");
+    };
+    disconnect.0 = None;
+    let completion = match result {
+        DeadlineResult::Completed(Ok(completion)) => completion,
+        DeadlineResult::Completed(Err(error)) => return generation_error(&error),
+        DeadlineResult::TimedOut => {
+            return api_error(StatusCode::GATEWAY_TIMEOUT, "request deadline exceeded");
+        }
     };
     let created = unix_time();
     match text_response(&format!("cmpl-{created}"), created, &model, &completion) {
@@ -255,11 +314,13 @@ async fn stream_chat_response<S: ChatService>(
             "cannot start response stream",
         );
     }
+    let control = GenerationControl::new(state.write_stall_timeout);
     tokio::spawn(async move {
         let _permit = permit;
         let result = {
             let mut service = state.service.lock().await;
-            tokio::time::timeout_at(deadline, service.stream_chat(request, sender.clone())).await
+            let generation = service.stream_chat(request, sender.clone(), control.clone());
+            controlled_deadline(deadline, &control, generation).await
         };
         send_stream_error(result, &sender).await;
     });
@@ -283,25 +344,69 @@ async fn stream_text_response<S: ChatService>(
     let created = unix_time();
     let id = format!("cmpl-{created}");
     let (sender, receiver) = mpsc::channel(16);
+    let control = GenerationControl::new(state.write_stall_timeout);
     tokio::spawn(async move {
         let _permit = permit;
         let result = {
             let mut service = state.service.lock().await;
-            tokio::time::timeout_at(deadline, service.stream_text(request, sender.clone())).await
+            let generation = service.stream_text(request, sender.clone(), control.clone());
+            controlled_deadline(deadline, &control, generation).await
         };
         send_stream_error(result, &sender).await;
     });
     sse_response(receiver, id, created, model, false)
 }
 
-async fn send_stream_error(
-    result: Result<Result<(), GenerationError>, tokio::time::error::Elapsed>,
-    sender: &mpsc::Sender<GenerationEvent>,
-) {
+enum DeadlineResult<T> {
+    Completed(Result<T, GenerationError>),
+    TimedOut,
+}
+
+struct CancelOnDrop(Option<GenerationControl>);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        if let Some(control) = &self.0 {
+            control.cancel();
+        }
+    }
+}
+
+async fn controlled_deadline<T, F>(
+    deadline: tokio::time::Instant,
+    control: &GenerationControl,
+    future: F,
+) -> DeadlineResult<T>
+where
+    F: Future<Output = Result<T, GenerationError>>,
+{
+    let timer = tokio::time::sleep_until(deadline);
+    let mut future = std::pin::pin!(future);
+    let mut timer = std::pin::pin!(timer);
+    let completed = std::future::poll_fn(|context| {
+        if let std::task::Poll::Ready(result) = future.as_mut().poll(context) {
+            return std::task::Poll::Ready(Some(result));
+        }
+        if timer.as_mut().poll(context).is_ready() {
+            return std::task::Poll::Ready(None);
+        }
+        std::task::Poll::Pending
+    })
+    .await;
+    if let Some(result) = completed {
+        DeadlineResult::Completed(result)
+    } else {
+        control.cancel();
+        let _ = future.await;
+        DeadlineResult::TimedOut
+    }
+}
+
+async fn send_stream_error(result: DeadlineResult<()>, sender: &mpsc::Sender<GenerationEvent>) {
     let message = match result {
-        Ok(Ok(())) => return,
-        Ok(Err(error)) => error.to_string(),
-        Err(_) => "request deadline exceeded".to_owned(),
+        DeadlineResult::Completed(Ok(())) => return,
+        DeadlineResult::Completed(Err(error)) => error.to_string(),
+        DeadlineResult::TimedOut => "request deadline exceeded".to_owned(),
     };
     let _ = sender.send(GenerationEvent::Error(message)).await;
 }
@@ -494,9 +599,14 @@ mod tests {
             Duration::from_secs(1)
         }
 
+        fn write_stall_timeout(&self) -> Duration {
+            Duration::from_secs(1)
+        }
+
         fn complete(
             &mut self,
             _: ChatCompletionRequest,
+            _: GenerationControl,
         ) -> Pin<Box<dyn Future<Output = Result<Completion, GenerationError>> + Send + '_>>
         {
             Box::pin(async {
@@ -514,19 +624,24 @@ mod tests {
         fn complete_text(
             &mut self,
             _: CompletionRequest,
+            control: GenerationControl,
         ) -> Pin<Box<dyn Future<Output = Result<Completion, GenerationError>> + Send + '_>>
         {
-            self.complete(ChatCompletionRequest {
-                model: "smoke".to_owned(),
-                messages: Vec::new(),
-                params: crate::CompletionParams::default(),
-            })
+            self.complete(
+                ChatCompletionRequest {
+                    model: "smoke".to_owned(),
+                    messages: Vec::new(),
+                    params: crate::CompletionParams::default(),
+                },
+                control,
+            )
         }
 
         fn stream_chat(
             &mut self,
             _: ChatCompletionRequest,
             sender: mpsc::Sender<GenerationEvent>,
+            _: GenerationControl,
         ) -> Pin<Box<dyn Future<Output = Result<(), GenerationError>> + Send + '_>> {
             Box::pin(async move {
                 sender
@@ -552,6 +667,7 @@ mod tests {
             &mut self,
             _: CompletionRequest,
             sender: mpsc::Sender<GenerationEvent>,
+            _: GenerationControl,
         ) -> Pin<Box<dyn Future<Output = Result<(), GenerationError>> + Send + '_>> {
             Box::pin(async move {
                 sender.send(GenerationEvent::Done).await.unwrap();
@@ -638,6 +754,25 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn deadline_and_disconnect_cancel_idempotently() {
+        let control = GenerationControl::new(Duration::from_secs(1));
+        let observed = control.clone();
+        let result = controlled_deadline(tokio::time::Instant::now(), &control, async move {
+            while !observed.is_cancelled() {
+                tokio::task::yield_now().await;
+            }
+            Ok(())
+        })
+        .await;
+        assert!(matches!(result, DeadlineResult::TimedOut));
+
+        let disconnected = GenerationControl::new(Duration::from_secs(1));
+        drop(CancelOnDrop(Some(disconnected.clone())));
+        drop(CancelOnDrop(Some(disconnected.clone())));
+        assert!(disconnected.is_cancelled());
+    }
+
     fn state() -> Arc<HttpState<Smoke>> {
         Arc::new(HttpState {
             service: Mutex::new(Smoke),
@@ -645,6 +780,7 @@ mod tests {
             queued: AtomicU32::new(0),
             queue_limit: 1,
             deadline: Duration::from_secs(1),
+            write_stall_timeout: Duration::from_secs(1),
         })
     }
 
