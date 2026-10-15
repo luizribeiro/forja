@@ -152,7 +152,9 @@ pub fn chat_router<S: ChatService>(service: S) -> Router {
 /// Builds a serving router and a handle that drains its admitted work.
 pub fn serving_router<S: ChatService>(service: S) -> (Router, DrainHandle<S>) {
     let max_body_bytes = service.max_body_bytes();
+    let served_model = service.model().to_owned();
     let state = Arc::new(HttpState {
+        model: served_model,
         queue_limit: service.queue_length(),
         deadline: service.request_deadline(),
         write_stall_timeout: service.write_stall_timeout(),
@@ -174,6 +176,7 @@ pub fn serving_router<S: ChatService>(service: S) -> (Router, DrainHandle<S>) {
 }
 
 struct HttpState<S> {
+    model: String,
     service: Mutex<S>,
     sequence: Arc<Semaphore>,
     queued: AtomicU32,
@@ -247,6 +250,9 @@ async fn chat<S: ChatService>(
         Ok(request) => request,
         Err(error) => return api_error(StatusCode::BAD_REQUEST, &error.to_string()),
     };
+    if request.model != state.model {
+        return api_error(StatusCode::NOT_FOUND, "model is not loaded");
+    }
     if request.params.stream {
         return stream_chat_response(state, request, deadline).await;
     }
@@ -255,9 +261,6 @@ async fn chat<S: ChatService>(
         Ok(Err(response)) => return *response,
         Err(_) => return api_error(StatusCode::GATEWAY_TIMEOUT, "request deadline exceeded"),
     };
-    if request.model != state.service.lock().await.model() {
-        return api_error(StatusCode::NOT_FOUND, "model is not loaded");
-    }
     let model = request.model.clone();
     let control = GenerationControl::new(state.write_stall_timeout);
     let active = match activate(&state, &control) {
@@ -308,6 +311,9 @@ async fn text<S: ChatService>(
         Ok(request) => request,
         Err(error) => return api_error(StatusCode::BAD_REQUEST, &error.to_string()),
     };
+    if request.model != state.model {
+        return api_error(StatusCode::NOT_FOUND, "model is not loaded");
+    }
     if request.params.stream {
         return stream_text_response(state, request, deadline).await;
     }
@@ -316,9 +322,6 @@ async fn text<S: ChatService>(
         Ok(Err(response)) => return *response,
         Err(_) => return api_error(StatusCode::GATEWAY_TIMEOUT, "request deadline exceeded"),
     };
-    if request.model != state.service.lock().await.model() {
-        return api_error(StatusCode::NOT_FOUND, "model is not loaded");
-    }
     let model = request.model.clone();
     let control = GenerationControl::new(state.write_stall_timeout);
     let active = match activate(&state, &control) {
@@ -361,7 +364,7 @@ async fn stream_chat_response<S: ChatService>(
     request: ChatCompletionRequest,
     deadline: tokio::time::Instant,
 ) -> Response {
-    if request.model != state.service.lock().await.model() {
+    if request.model != state.model {
         return api_error(StatusCode::NOT_FOUND, "model is not loaded");
     }
     let permit = match tokio::time::timeout_at(deadline, admit(&state)).await {
@@ -402,7 +405,7 @@ async fn stream_text_response<S: ChatService>(
     request: CompletionRequest,
     deadline: tokio::time::Instant,
 ) -> Response {
-    if request.model != state.service.lock().await.model() {
+    if request.model != state.model {
         return api_error(StatusCode::NOT_FOUND, "model is not loaded");
     }
     let permit = match tokio::time::timeout_at(deadline, admit(&state)).await {
@@ -552,17 +555,15 @@ fn stream_usage(usage: Usage) -> Value {
 }
 
 async fn models<S: ChatService>(State(state): State<Arc<HttpState<S>>>) -> Response {
-    let model = state.service.lock().await.model().to_owned();
-    Json(json!({"object": "list", "data": [model_object(&model)]})).into_response()
+    Json(json!({"object": "list", "data": [model_object(&state.model)]})).into_response()
 }
 
 async fn model<S: ChatService>(
     State(state): State<Arc<HttpState<S>>>,
     Path(requested): Path<String>,
 ) -> Response {
-    let model = state.service.lock().await.model().to_owned();
-    if requested == model {
-        Json(model_object(&model)).into_response()
+    if requested == state.model {
+        Json(model_object(&state.model)).into_response()
     } else {
         api_error(StatusCode::NOT_FOUND, "model is not loaded")
     }
@@ -832,6 +833,29 @@ mod tests {
         assert!(waiting.await.is_ok());
     }
 
+    #[tokio::test]
+    async fn wrong_model_never_enters_admission() {
+        let state = state();
+        let _active = Arc::clone(&state.sequence).try_acquire_owned().unwrap();
+        let chat_request = br#"{"model":"missing","messages":[]}"#;
+        let text_request = br#"{"model":"missing","prompt":"hi"}"#;
+
+        let chat_response = chat::<Smoke>(State(Arc::clone(&state)), request(chat_request)).await;
+        let text_response = text::<Smoke>(State(Arc::clone(&state)), request(text_request)).await;
+        let stream_chat = serde_json::from_slice(chat_request).unwrap();
+        let stream_text = serde_json::from_slice(text_request).unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        let stream_chat_response =
+            stream_chat_response(Arc::clone(&state), stream_chat, deadline).await;
+        let stream_text_response = stream_text_response(state.clone(), stream_text, deadline).await;
+
+        assert_eq!(chat_response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(text_response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(stream_chat_response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(stream_text_response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(state.queued.load(Ordering::Acquire), 0);
+    }
+
     #[test]
     fn serializes_stream_chunks_and_clean_termination() {
         let usage = Usage {
@@ -910,6 +934,7 @@ mod tests {
 
     fn state() -> Arc<HttpState<Smoke>> {
         Arc::new(HttpState {
+            model: "smoke".to_owned(),
             service: Mutex::new(Smoke),
             sequence: Arc::new(Semaphore::new(1)),
             queued: AtomicU32::new(0),
