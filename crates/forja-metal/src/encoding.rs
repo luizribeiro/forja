@@ -6366,7 +6366,15 @@ fn supported_dispatch(dispatch: &Dispatch) -> bool {
     if dispatch.prepared_epilogue().is_some()
         && !matches!(
             selected_variant(dispatch),
-            Some(MetalVariant::MatmulGemv | MetalVariant::MatmulGemvTransposed)
+            Some(
+                MetalVariant::MatmulGemv
+                    | MetalVariant::MatmulGemvTransposed
+                    | MetalVariant::MatmulPortable
+                    | MetalVariant::MatmulSteel64x64x16_2x2
+                    | MetalVariant::MatmulSteel64x64x16_1x2
+                    | MetalVariant::MatmulSteel64x32x32_2x2
+                    | MetalVariant::MatmulSteel32x64x16_1x2
+            )
         )
     {
         return false;
@@ -8957,44 +8965,39 @@ mod tests {
             ("matmul.gemv", false, true),
             ("matmul.gemv-transposed", true, false),
         ] {
-            assert_dense_epilogue(variant, transposed, broadcast);
+            assert_dense_epilogue(variant, transposed, broadcast, 1, 33, 17);
         }
     }
 
     #[test]
-    fn metal_unspliced_epilogue_variant_is_refused() {
-        let backend = MetalBackend::new().unwrap();
-        let left = backend.alloc(DType::F32, &[7, 33]).unwrap();
-        let right = backend.alloc(DType::F32, &[33, 17]).unwrap();
-        let output = backend.alloc(DType::F32, &[7, 17]).unwrap();
-        let program = Program {
-            kind: ProgramKind::Map,
-            insts: vec![Inst::Input(0)],
-            outputs: vec![(0, 0)],
+    fn metal_steel_epilogues_cover_every_tile_and_edges() {
+        for variant in [
+            "matmul.steel-64x64x16-2x2",
+            "matmul.steel-64x64x16-1x2",
+            "matmul.steel-64x32x32-2x2",
+            "matmul.steel-32x64x16-1x2",
+        ] {
+            assert_dense_epilogue(variant, false, true, 33, 33, 33);
         }
-        .validate()
-        .unwrap();
-        let epilogue = prepare_epilogue(
-            program,
-            EpilogueSignature::new(1, 2, Vec::new(), DType::F32),
-        )
-        .unwrap();
-        let mut commands = CommandList::new();
-        commands
-            .dispatch_epilogue(Op::Matmul, &[&left, &right], &output, &epilogue, &[])
-            .unwrap();
-        assert!(matches!(
-            backend.submit(commands),
-            Err(BackendError::UnsupportedOperation)
-        ));
     }
 
-    fn assert_dense_epilogue(variant: &str, transposed: bool, broadcast: bool) {
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    fn assert_dense_epilogue(
+        variant: &str,
+        transposed: bool,
+        broadcast: bool,
+        rows: u32,
+        inner: u32,
+        columns: u32,
+    ) {
         let backend = MetalBackend::new().unwrap();
-        let left = backend.alloc(DType::F32, &[1, 33]).unwrap();
-        let right_storage = backend
-            .alloc(DType::F32, if transposed { &[17, 33] } else { &[33, 17] })
-            .unwrap();
+        let left = backend.alloc(DType::F32, &[rows, inner]).unwrap();
+        let right_shape = if transposed {
+            [columns, inner]
+        } else {
+            [inner, columns]
+        };
+        let right_storage = backend.alloc(DType::F32, &right_shape).unwrap();
         let right = if transposed {
             backend
                 .view(&right_storage, ViewOp::Permute(vec![1, 0]))
@@ -9002,24 +9005,37 @@ mod tests {
         } else {
             right_storage.clone()
         };
-        let extra_storage = backend
-            .alloc(DType::F32, if broadcast { &[17] } else { &[1, 17] })
-            .unwrap();
+        let extra_shape = if broadcast {
+            vec![columns]
+        } else {
+            vec![rows, columns]
+        };
+        let extra_storage = backend.alloc(DType::F32, &extra_shape).unwrap();
         let extra = if broadcast {
             backend
-                .view(&extra_storage, ViewOp::Broadcast(vec![1, 17]))
+                .view(&extra_storage, ViewOp::Broadcast(vec![rows, columns]))
                 .unwrap()
         } else {
             extra_storage.clone()
         };
-        backend.write(&left, &f32_pattern(33, 19)).unwrap();
+        let left_count = usize::try_from(rows * inner).unwrap();
+        let right_count = usize::try_from(inner * columns).unwrap();
+        let output_count = usize::try_from(rows * columns).unwrap();
+        backend.write(&left, &f32_pattern(left_count, 19)).unwrap();
         backend
-            .write(&right_storage, &f32_pattern(33 * 17, 23))
+            .write(&right_storage, &f32_pattern(right_count, 23))
             .unwrap();
-        backend.write(&extra_storage, &f32_pattern(17, 11)).unwrap();
-        let fused_output = backend.alloc(DType::F32, &[1, 17]).unwrap();
-        let decomposed_output = backend.alloc(DType::F32, &[1, 17]).unwrap();
-        let accumulator = backend.alloc(DType::F32, &[1, 17]).unwrap();
+        let extra_count = if broadcast {
+            usize::try_from(columns).unwrap()
+        } else {
+            output_count
+        };
+        backend
+            .write(&extra_storage, &f32_pattern(extra_count, 11))
+            .unwrap();
+        let fused_output = backend.alloc(DType::F32, &[rows, columns]).unwrap();
+        let decomposed_output = backend.alloc(DType::F32, &[rows, columns]).unwrap();
+        let accumulator = backend.alloc(DType::F32, &[rows, columns]).unwrap();
         let program = add_program();
         let epilogue = prepare_epilogue(
             program.clone(),

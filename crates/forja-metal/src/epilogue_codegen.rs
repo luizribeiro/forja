@@ -386,4 +386,19 @@ mod tests {
             assert!(reduction < edge && edge < call && call < store);
         }
     }
+
+    #[test]
+    fn steel_splice_is_after_barriers_and_inside_edges() {
+        let source = generate_source(&bias_epilogue());
+        let start = source.find("void steel_gemm(").unwrap();
+        let body =
+            &source[start..source[start..].find("#define DEFINE_STEEL_GEMM").unwrap() + start];
+        let call = body.rfind("forja_epilogue(").unwrap();
+        let barrier = body.rfind("threadgroup_barrier(").unwrap();
+        let edge = body[..call]
+            .rfind("if (output_row < params.m && output_column < params.n)")
+            .unwrap();
+        let store = body[call..].find("store_float(").unwrap() + call;
+        assert!(barrier < edge && edge < call && call < store);
+    }
 }

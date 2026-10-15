@@ -30,6 +30,7 @@ void steel_gemm(
     device const uchar *b,
     device uchar *d,
     constant MatmulParams &params,
+    FORJA_EPILOGUE_PARAMETERS
     threadgroup float *a_tile,
     threadgroup float *b_tile,
     uint thread_index,
@@ -69,9 +70,29 @@ void steel_gemm(
         mma.multiply(a_tile, b_tile);
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    mma.store(
-        d, d_base, params.ldd, row_origin, column_origin,
-        params.m, params.n, output_dtype);
+    for (int row_fragment = 0; row_fragment < mma.row_fragments; ++row_fragment) {
+        uint row = mma.simdgroup_row * mma.fragment_size + mma.fragment_row +
+            row_fragment * mma.fragment_size * simdgroups_rows;
+        for (int column_fragment = 0;
+             column_fragment < mma.column_fragments;
+             ++column_fragment) {
+            uint column = mma.simdgroup_column * mma.fragment_size + mma.fragment_column +
+                column_fragment * mma.fragment_size * simdgroups_columns;
+            int fragment_index = row_fragment * mma.column_fragments + column_fragment;
+            for (int element = 0; element < 2; ++element) {
+                uint output_row = row_origin + row;
+                uint output_column = column_origin + column + element;
+                if (output_row < params.m && output_column < params.n) {
+                    ulong index = d_base + ulong(output_row) * params.ldd + output_column;
+                    float value = forja_epilogue(
+                        float(mma.accumulators[fragment_index * 2 + element]), 0.0f,
+                        tile.z, output_row, output_column, params.batch, params.m, params.n,
+                        FORJA_EPILOGUE_VALUES);
+                    store_float(d, index, output_dtype, value);
+                }
+            }
+        }
+    }
 }
 #define DEFINE_STEEL_GEMM(name, bm, bn, bk, wm, wn)                         \
 kernel void name(                                                            \
@@ -79,6 +100,7 @@ kernel void name(                                                            \
     device const uchar *b [[buffer(1)]],                                     \
     device uchar *d [[buffer(2)]],                                           \
     constant MatmulParams &params [[buffer(3)]],                             \
+    FORJA_EPILOGUE_ARGUMENTS                                                 \
     uint thread_index [[thread_index_in_threadgroup]],                       \
     uint3 threadgroup_size [[threads_per_threadgroup]],                     \
     ushort simdgroup_index [[simdgroup_index_in_threadgroup]],               \
@@ -87,7 +109,7 @@ kernel void name(                                                            \
     threadgroup float a_tile[bm * bk];                                       \
     threadgroup float b_tile[bk * bn];                                       \
     steel_gemm<bm, bn, bk, wm, wn>(                                         \
-        a, b, d, params, a_tile, b_tile, thread_index,                      \
+        a, b, d, params, FORJA_EPILOGUE_VALUES, a_tile, b_tile, thread_index, \
         threadgroup_size.x * threadgroup_size.y * threadgroup_size.z,       \
         simdgroup_index, lane, tile);                                        \
 }

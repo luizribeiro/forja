@@ -104,6 +104,16 @@ float load_bfloat_bits(device const uchar *buffer, ulong index) {
     epilogue_input0, epilogue_input1, epilogue_input2, epilogue_input3,           \
     epilogue_input4, epilogue_input5, epilogue_input6, epilogue_layouts
 
+#define FORJA_EPILOGUE_PARAMETERS                                                 \
+    device const uchar *epilogue_input0,                                          \
+    device const uchar *epilogue_input1,                                          \
+    device const uchar *epilogue_input2,                                          \
+    device const uchar *epilogue_input3,                                          \
+    device const uchar *epilogue_input4,                                          \
+    device const uchar *epilogue_input5,                                          \
+    device const uchar *epilogue_input6,                                          \
+    constant TensorLayout *epilogue_layouts,
+
 inline float forja_epilogue(
     float accumulator0,
     float accumulator1,
