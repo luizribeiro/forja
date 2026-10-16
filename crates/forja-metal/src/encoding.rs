@@ -1985,9 +1985,26 @@ impl MetalBackend {
         &self,
         graph: &GraphTemplate,
     ) -> Result<PreparedMetalGraph, BackendError> {
+        let fallback_count = self
+            .pipelines
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?
+            .epilogue_counts
+            .fallbacks;
+        self.prepare_graph_epilogues(graph)?;
         let encoding = (self.graph_replay == crate::storage::MetalGraphReplay::Tier2)
             .then(|| self.prepare_encoding_plan(graph))
-            .transpose()?;
+            .transpose();
+        let fallback_count_after = self
+            .pipelines
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?
+            .epilogue_counts
+            .fallbacks;
+        if fallback_count_after != fallback_count {
+            return Err(BackendError::ExecutionFailed);
+        }
+        let encoding = encoding?;
         let _reservation = self.reserve_allocation(0)?;
         let residency = self
             .device
@@ -2016,6 +2033,53 @@ impl MetalBackend {
             variant_rechecks: graph.parameter_dependent_dispatch_indices().collect(),
             memory_plan: None,
         })
+    }
+
+    fn prepare_graph_epilogues(&self, graph: &GraphTemplate) -> Result<(), BackendError> {
+        let mut requests = Vec::new();
+        for (_, parameter_dependent, dispatch) in graph
+            .backend_dispatch_candidates()
+            .map_err(|_| BackendError::InvalidInput)?
+        {
+            if dispatch.prepared_epilogue().is_some() {
+                requests.extend(epilogue_pipeline_requests(&dispatch, parameter_dependent)?);
+            }
+        }
+        self.prepare_epilogue_requests(&requests)
+    }
+
+    fn prepare_dispatch_epilogues(&self, dispatches: &[Dispatch]) -> Result<(), BackendError> {
+        let mut requests = Vec::new();
+        for dispatch in dispatches {
+            if dispatch.prepared_epilogue().is_some() {
+                requests.extend(epilogue_pipeline_requests(dispatch, false)?);
+            }
+        }
+        self.prepare_epilogue_requests(&requests)
+    }
+
+    fn prepare_epilogue_requests(
+        &self,
+        requests: &[EpiloguePipelineRequest],
+    ) -> Result<(), BackendError> {
+        if requests.is_empty() {
+            return Ok(());
+        }
+        let required = self
+            .pipelines
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?
+            .missing_epilogue_pipelines(requests);
+        self.program_compile_tokens
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?
+            .consume(required)
+            .then_some(())
+            .ok_or(BackendError::QuotaExceeded)?;
+        self.pipelines
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?
+            .prepare_epilogue_pipelines(requests)
     }
 
     pub(super) fn prepare_metal_graph_memory(
@@ -2192,6 +2256,9 @@ impl MetalBackend {
         let retained_tensors_validated = commands.retained_tensors_validated();
         let barriers = required_barriers(&commands);
         let dispatches = commands.into_dispatches();
+        if graph.is_none() {
+            self.prepare_dispatch_epilogues(&dispatches)?;
+        }
         let prepared_programs = dispatches
             .iter()
             .enumerate()
@@ -2944,7 +3011,7 @@ impl MetalBackend {
             .lock()
             .map_err(|_| BackendError::ExecutionFailed)?;
         let pipeline = if let Some(epilogue) = dispatch.prepared_epilogue() {
-            pipelines.get_epilogue(
+            pipelines.lookup_epilogue(
                 epilogue_codegen::FamilySourceTag::Quant,
                 epilogue,
                 kernel,
@@ -3180,7 +3247,7 @@ impl MetalBackend {
             .lock()
             .map_err(|_| BackendError::ExecutionFailed)?;
         let pipeline = if let Some(epilogue) = dispatch.prepared_epilogue() {
-            pipelines.get_epilogue(
+            pipelines.lookup_epilogue(
                 epilogue_codegen::FamilySourceTag::GatherQuant,
                 epilogue,
                 "gather_quantized_gemv",
@@ -3732,7 +3799,7 @@ impl MetalBackend {
             .lock()
             .map_err(|_| BackendError::ExecutionFailed)?;
         let pipeline = if let Some(epilogue) = epilogue {
-            pipelines.get_epilogue(
+            pipelines.lookup_epilogue(
                 epilogue_codegen::FamilySourceTag::GatherQuant,
                 epilogue,
                 "grouped_quantized_gemm",
@@ -4618,7 +4685,7 @@ impl MetalBackend {
             .lock()
             .map_err(|_| BackendError::ExecutionFailed)?;
         let pipeline = if let Some(epilogue) = epilogue {
-            pipelines.get_epilogue(
+            pipelines.lookup_epilogue(
                 epilogue_codegen::FamilySourceTag::Dense,
                 epilogue,
                 kernel,
@@ -7108,6 +7175,25 @@ const fn dtype_key(dtype: DType) -> u8 {
     }
 }
 
+struct EpiloguePipelineRequest {
+    family: epilogue_codegen::FamilySourceTag,
+    epilogue: Arc<PreparedEpilogue>,
+    implementation: &'static str,
+    constants: Vec<(u32, u32)>,
+}
+
+fn epilogue_pipeline_requests(
+    dispatch: &Dispatch,
+    _parameter_dependent: bool,
+) -> Result<Vec<EpiloguePipelineRequest>, BackendError> {
+    match dispatch.op() {
+        Op::Matmul | Op::QuantMatmul { .. } | Op::GatherQuantMatmul { .. } => {
+            Err(BackendError::UnsupportedOperation)
+        }
+        _ => Err(BackendError::UnsupportedOperation),
+    }
+}
+
 fn encode_layout(layout: &Layout) -> Result<[u8; 112], BackendError> {
     let mut bytes = [0_u8; 112];
     bytes[0..8].copy_from_slice(&layout.offset().to_ne_bytes());
@@ -7208,7 +7294,7 @@ impl PipelineCache {
         Ok(pipeline)
     }
 
-    fn get_epilogue(
+    fn prepare_epilogue(
         &mut self,
         family: epilogue_codegen::FamilySourceTag,
         epilogue: &PreparedEpilogue,
@@ -7252,6 +7338,67 @@ impl PipelineCache {
             .insert(pipeline_key, pipeline.clone());
         self.epilogue_counts.pipelines = self.epilogue_counts.pipelines.saturating_add(1);
         Ok(pipeline)
+    }
+
+    fn lookup_epilogue(
+        &mut self,
+        family: epilogue_codegen::FamilySourceTag,
+        epilogue: &PreparedEpilogue,
+        name: &str,
+        constants: &[(u32, u32)],
+    ) -> Result<Retained<ProtocolObject<dyn MTLComputePipelineState>>, BackendError> {
+        let result = self.lookup_prepared_epilogue(family, epilogue, name, constants);
+        debug_assert!(result.is_ok(), "epilogue pipeline was not prepared");
+        result
+    }
+
+    fn lookup_prepared_epilogue(
+        &mut self,
+        family: epilogue_codegen::FamilySourceTag,
+        epilogue: &PreparedEpilogue,
+        name: &str,
+        constants: &[(u32, u32)],
+    ) -> Result<Retained<ProtocolObject<dyn MTLComputePipelineState>>, BackendError> {
+        let source = epilogue_codegen::SourceKey::new(family, epilogue);
+        let key = epilogue_codegen::PipelineKey::new(source, name, constants.to_vec());
+        if let Some(pipeline) = self.epilogue_pipelines.get(&key) {
+            self.epilogue_counts.cache_hits = self.epilogue_counts.cache_hits.saturating_add(1);
+            return Ok(pipeline.clone());
+        }
+        self.epilogue_counts.fallbacks = self.epilogue_counts.fallbacks.saturating_add(1);
+        Err(BackendError::ExecutionFailed)
+    }
+
+    fn missing_epilogue_pipelines(&self, requests: &[EpiloguePipelineRequest]) -> usize {
+        requests
+            .iter()
+            .map(|request| {
+                let source = epilogue_codegen::SourceKey::new(request.family, &request.epilogue);
+                epilogue_codegen::PipelineKey::new(
+                    source,
+                    request.implementation,
+                    request.constants.clone(),
+                )
+            })
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .filter(|key| !self.epilogue_pipelines.contains_key(key))
+            .count()
+    }
+
+    fn prepare_epilogue_pipelines(
+        &mut self,
+        requests: &[EpiloguePipelineRequest],
+    ) -> Result<(), BackendError> {
+        for request in requests {
+            self.prepare_epilogue(
+                request.family,
+                &request.epilogue,
+                request.implementation,
+                &request.constants,
+            )?;
+        }
+        Ok(())
     }
 
     fn take_epilogue_counts(&mut self) -> EpilogueCompileCounts {
