@@ -9,7 +9,7 @@ use forja_sdk::nn::blocks::{ChunkedPrefill, DEFAULT_PREFILL_CHUNK, DecodeSelecti
 use forja_sdk::{
     DType, Dim, Engine, EngineInfo, EngineLoadConfig, Load, Result, StepInput, StepOutput, Tensor,
     VariantSelection, Weights, bf16, export_engine,
-    kernel::Kernel,
+    kernel::{Epilogue, Kernel, TensorRef},
     nn::{
         RmsNorm, RmsNormConfig,
         blocks::{
@@ -19,6 +19,22 @@ use forja_sdk::{
         moe_combine_with, moe_router_with,
     },
 };
+
+#[forja_sdk::kernel(map)]
+fn moe_gate_up(
+    gate: forja_sdk::kernel::Elem,
+    up: forja_sdk::kernel::Elem,
+) -> forja_sdk::kernel::Elem {
+    gate * gate.sigmoid() * up
+}
+
+#[forja_sdk::kernel(map)]
+fn moe_add_residual(
+    accumulator: forja_sdk::kernel::Elem,
+    residual: forja_sdk::kernel::Elem,
+) -> forja_sdk::kernel::Elem {
+    accumulator + residual
+}
 
 /// Vocabulary size of Qwen3-Coder-30B-A3B-Instruct.
 pub const VOCAB: u32 = 151_936;
@@ -356,6 +372,20 @@ struct SparseMoe {
     down_proj: QuantExperts,
 }
 
+struct MoeEpilogues {
+    gate_up: Epilogue,
+    add_residual: Epilogue,
+}
+
+impl MoeEpilogues {
+    fn load() -> Result<Self> {
+        Ok(Self {
+            gate_up: moe_gate_up_epilogue(2, 3, &[], DType::F32)?,
+            add_residual: moe_add_residual_epilogue(1, 2, &[DType::F32], DType::F32)?,
+        })
+    }
+}
+
 impl Load<Config> for SparseMoe {
     fn load(weights: &Weights<'_>, _config: &Config) -> Result<Self> {
         let switch = weights.scoped("switch_mlp");
@@ -376,7 +406,12 @@ impl Load<Config> for SparseMoe {
 }
 
 impl SparseMoe {
-    fn route(&self, variants: &variants::Variants, input: &Tensor<f32>) -> Result<RoutedMoe> {
+    fn route(
+        &self,
+        variants: &variants::Variants,
+        epilogues: &MoeEpilogues,
+        input: &Tensor<f32>,
+    ) -> Result<RoutedMoe> {
         let logits = self.gate.forward(variants, input)?;
         let top_k = variants.top_k()?;
         let (weights, indices) = moe_router_with(&logits, TOP_K, true, &top_k)?;
@@ -388,17 +423,25 @@ impl SparseMoe {
         let routed_rows = rows
             .checked_mul(TOP_K)
             .ok_or_else(|| forja_sdk::Error::loading("routed row count overflowed"))?;
-        let selection = variants.gather_silu_mul(routed_rows)?;
-        let activated = input.gather_quant_silu_mul_with(
-            &self.gate_proj.packed,
-            &self.gate_proj.scales,
-            &self.gate_proj.biases,
-            &self.up_proj.packed,
-            &self.up_proj.scales,
-            &self.up_proj.biases,
+        let selection = variants.gate_up(routed_rows)?;
+        let activated = input.gather_quant_matmul_pair_epilogue_with(
+            [
+                (
+                    &self.gate_proj.packed,
+                    &self.gate_proj.scales,
+                    &self.gate_proj.biases,
+                ),
+                (
+                    &self.up_proj.packed,
+                    &self.up_proj.scales,
+                    &self.up_proj.biases,
+                ),
+            ],
             &indices,
             Q4_BITS,
             QUANT_GROUP,
+            &epilogues.gate_up,
+            &[],
             &selection,
         )?;
         Ok(RoutedMoe {
@@ -412,9 +455,10 @@ impl SparseMoe {
     fn forward(
         &self,
         variants: &variants::Variants,
+        epilogues: &MoeEpilogues,
         input: &Tensor<f32>,
     ) -> Result<(Tensor<f32>, Tensor<f32>)> {
-        let routed = self.route(variants, input)?;
+        let routed = self.route(variants, epilogues, input)?;
         let rows = input
             .shape()
             .first()
@@ -439,20 +483,26 @@ impl SparseMoe {
     fn forward_decode(
         &self,
         variants: &variants::Variants,
+        epilogues: &MoeEpilogues,
         input: &Tensor<f32>,
         residual: &Tensor<f32>,
     ) -> Result<(Tensor<f32>, Tensor<f32>)> {
-        let routed = self.route(variants, input)?;
-        let output = routed.activated.gather_quant_matmul_combine(
-            &self.down_proj.packed,
-            &self.down_proj.scales,
-            &self.down_proj.biases,
-            &routed.indices,
-            &routed.weights,
-            residual,
-            Q4_BITS,
-            QUANT_GROUP,
-        )?;
+        let routed = self.route(variants, epilogues, input)?;
+        let selection = variants.down_combine()?;
+        let output = routed
+            .activated
+            .gather_quant_matmul_weighted_epilogue_with(
+                &self.down_proj.packed,
+                &self.down_proj.scales,
+                &self.down_proj.biases,
+                &routed.indices,
+                &routed.weights,
+                Q4_BITS,
+                QUANT_GROUP,
+                &epilogues.add_residual,
+                &[TensorRef::new(residual)?],
+                &selection,
+            )?;
         Ok((output, routed.logits))
     }
 }
@@ -481,6 +531,7 @@ struct LayerResources<'a> {
     cache: &'a mut KvCache<f32>,
     following_norm: &'a RmsNorm<f32>,
     qk_norm_rope: &'a Kernel,
+    moe_epilogues: &'a MoeEpilogues,
 }
 
 #[derive(Clone, Copy)]
@@ -507,6 +558,7 @@ impl DecoderLayer {
             cache,
             following_norm,
             qk_norm_rope: qk_kernel,
+            moe_epilogues,
         } = resources;
         let LayerPosition {
             activation_positions,
@@ -541,11 +593,13 @@ impl DecoderLayer {
         )?;
         let (hidden, normalized, router_logits) = if sequence == 1 {
             let (hidden, router_logits) =
-                self.mlp.forward_decode(variants, &normalized, &hidden)?;
+                self.mlp
+                    .forward_decode(variants, moe_epilogues, &normalized, &hidden)?;
             let normalized = rms_norm(norm_kernel, &hidden, following_norm.weight())?;
             (hidden, normalized, router_logits)
         } else {
-            let (projected, router_logits) = self.mlp.forward(variants, &normalized)?;
+            let (projected, router_logits) =
+                self.mlp.forward(variants, moe_epilogues, &normalized)?;
             let (hidden, normalized) = residual_norm(
                 residual_kernel,
                 &hidden,
@@ -598,6 +652,7 @@ pub struct Qwen3Coder {
     residual_norm: Kernel,
     rms_norm: Kernel,
     qk_norm_rope: Kernel,
+    moe_epilogues: MoeEpilogues,
     activation_positions: Tensor<f32>,
     #[cfg(target_family = "wasm")]
     replay: bool,
@@ -625,6 +680,7 @@ impl Qwen3Coder {
             residual_norm: residual_norm_kernel(DType::F32, RMS_EPSILON)?,
             rms_norm: rms_norm_kernel(DType::F32, RMS_EPSILON)?,
             qk_norm_rope: qk_norm_rope_kernel(DType::F32, HEAD_DIM, RMS_EPSILON, ROPE_THETA)?,
+            moe_epilogues: MoeEpilogues::load()?,
             activation_positions: Tensor::constant(
                 &(0..MAX_CONTEXT)
                     .map(exact_position)
@@ -707,6 +763,7 @@ impl Qwen3Coder {
                     cache: &mut self.caches[index],
                     following_norm,
                     qk_norm_rope: &self.qk_norm_rope,
+                    moe_epilogues: &self.moe_epilogues,
                 },
             )?;
             hidden = next;

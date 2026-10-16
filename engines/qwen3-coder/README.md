@@ -14,6 +14,10 @@ The port implements Qwen3-Coder GQA, QK normalization, RoPE, sparse expert routi
 quantized embeddings and grouped quantized expert projections. Kernel choices are profile data and
 the same component supports replay and lazy execution as runtime strategies.
 
+The profiled decode graph eagerly compiles two epilogue libraries and three pipeline
+specializations. The prefill graph compiles one library and one specialization. Replay requires
+zero compile fallbacks in both modes.
+
 Accepted pp512/tg128 results use 30 measured repetitions on an 80-core Apple M3 Ultra:
 
 | Selection | PP tok/s | TG tok/s |

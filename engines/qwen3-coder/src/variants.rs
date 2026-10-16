@@ -9,8 +9,9 @@ const SITES: &[&str] = &[
     "quant.prefill-tiled",
     "gather-quant-matmul.small",
     "gather-quant-matmul.grouped",
-    "gather-quant-silu-mul.small",
-    "gather-quant-silu-mul.grouped",
+    "moe.gate-up.small",
+    "moe.gate-up.grouped",
+    "moe.down-combine",
     "moe.combine-small",
     "moe.combine-large",
     "top-k",
@@ -39,8 +40,12 @@ impl Variants {
         self.gathered("gather-quant-matmul", routed_rows)
     }
 
-    pub(crate) fn gather_silu_mul(&self, routed_rows: u32) -> Result<Variant> {
-        self.gathered("gather-quant-silu-mul", routed_rows)
+    pub(crate) fn gate_up(&self, routed_rows: u32) -> Result<Variant> {
+        self.gathered("moe.gate-up", routed_rows)
+    }
+
+    pub(crate) fn down_combine(&self) -> Result<Variant> {
+        self.0.at("moe.down-combine", 0)
     }
 
     pub(crate) fn combine(&self, sequence: u32) -> Result<Variant> {
