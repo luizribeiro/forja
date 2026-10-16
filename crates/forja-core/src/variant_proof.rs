@@ -921,7 +921,7 @@ mod tests {
 
         rule.prove(
             &space,
-            TemplateOp::Static(Op::Add),
+            TemplateOp::Static(Op::Copy),
             &[&left, &right],
             &[],
             &[],
@@ -936,7 +936,7 @@ mod tests {
         assert!(matches!(
             rule.prove(
                 &space,
-                TemplateOp::Static(Op::Add),
+                TemplateOp::Static(Op::Copy),
                 &[&left, &right],
                 &[],
                 &[],
@@ -980,7 +980,7 @@ mod tests {
         assert!(matches!(
             prove_constraints(
                 &space,
-                TemplateOp::Static(Op::Add),
+                TemplateOp::Static(Op::Copy),
                 &[&left, &right],
                 &[],
                 &[],
@@ -997,9 +997,14 @@ mod tests {
         let rule = VariantRule::new(&space, 0, vec![RuleArm::new(1, 3, "low")]).unwrap();
 
         assert_eq!(
-            rule.prove(&foreign, TemplateOp::Static(Op::Add), &[], &[], &[], |_| {
-                Some(LOW)
-            },),
+            rule.prove(
+                &foreign,
+                TemplateOp::Static(Op::Copy),
+                &[],
+                &[],
+                &[],
+                |_| { Some(LOW) },
+            ),
             Err(RuleError::ParameterSpaceMismatch)
         );
     }
@@ -1017,7 +1022,7 @@ mod tests {
         assert!(matches!(
             prove_constraints(
                 &space,
-                TemplateOp::Static(Op::Add),
+                TemplateOp::Static(Op::Copy),
                 &[&left, &right],
                 &[],
                 &[],

@@ -141,19 +141,11 @@ pub enum Op {
     Program(ProgramHash),
     /// Copies and optionally casts one tensor.
     Copy,
-    /// Adds two tensors elementwise.
-    Add,
-    /// Applies `SiLU` to a gate and multiplies it by an up tensor.
-    SiluMul,
     /// Normalizes rows by their root mean square and applies a weight.
     RmsNorm {
         /// The nonnegative stabilizer added before the square root.
         eps: f32,
     },
-    /// Applies stable softmax over the last axis.
-    ///
-    /// A row containing only negative infinity produces all zeros.
-    Softmax,
     /// Selects the greatest element of each row under IEEE total order.
     ///
     /// Equal greatest values select the highest index.
@@ -431,9 +423,7 @@ impl Dispatch {
         match op {
             Op::Program(_) => return Err(OpError::ProgramRequiresBinding),
             Op::Copy => check_copy(inputs, output)?,
-            Op::Add | Op::SiluMul => check_binary(inputs, output)?,
             Op::RmsNorm { eps } => check_rms_norm(inputs, output, eps)?,
-            Op::Softmax => check_softmax(inputs, output)?,
             Op::Argmax => check_argmax(inputs, output)?,
             Op::TopK { k, .. } => check_top_k(inputs, outputs, k)?,
             Op::Sample { .. } => check_sample(inputs, output)?,
@@ -1025,20 +1015,6 @@ fn check_copy(inputs: &[&Tensor], output: &Tensor) -> Result<(), OpError> {
     Ok(())
 }
 
-fn check_binary(inputs: &[&Tensor], output: &Tensor) -> Result<(), OpError> {
-    if inputs.len() != 2 {
-        return Err(OpError::Arity {
-            expected: 2,
-            actual: inputs.len(),
-        });
-    }
-    check_float(inputs[0], Operand::Input(0))?;
-    check_float(inputs[1], Operand::Input(1))?;
-    check_float(output, Operand::Output)?;
-    check_shape(inputs[1], inputs[0], Operand::Input(1))?;
-    check_shape(output, inputs[0], Operand::Output)
-}
-
 fn check_shape(tensor: &Tensor, expected: &Tensor, operand: Operand) -> Result<(), OpError> {
     if tensor.layout.shape() != expected.layout.shape() {
         return Err(OpError::Shape { operand });
@@ -1067,23 +1043,6 @@ fn check_rms_norm(inputs: &[&Tensor], output: &Tensor, eps: f32) -> Result<(), O
     if inputs[1].layout.shape() != [width] {
         return Err(OpError::Shape {
             operand: Operand::Input(1),
-        });
-    }
-    check_shape(output, inputs[0], Operand::Output)
-}
-
-fn check_softmax(inputs: &[&Tensor], output: &Tensor) -> Result<(), OpError> {
-    if inputs.len() != 1 {
-        return Err(OpError::Arity {
-            expected: 1,
-            actual: inputs.len(),
-        });
-    }
-    check_float(inputs[0], Operand::Input(0))?;
-    check_float(output, Operand::Output)?;
-    if inputs[0].layout.shape().last().is_none() {
-        return Err(OpError::Shape {
-            operand: Operand::Input(0),
         });
     }
     check_shape(output, inputs[0], Operand::Output)
@@ -1903,18 +1862,10 @@ mod tests {
     fn independent_dispatches_need_no_barriers() {
         let mut commands = CommandList::new();
         commands
-            .dispatch(
-                Op::Add,
-                &[&slice(1, 0, 4), &slice(2, 0, 4)],
-                &slice(3, 0, 4),
-            )
+            .dispatch(Op::Copy, &[&slice(1, 0, 4)], &slice(3, 0, 4))
             .unwrap();
         commands
-            .dispatch(
-                Op::Add,
-                &[&slice(4, 0, 4), &slice(5, 0, 4)],
-                &slice(6, 0, 4),
-            )
+            .dispatch(Op::Copy, &[&slice(4, 0, 4)], &slice(6, 0, 4))
             .unwrap();
 
         assert_eq!(required_barriers(&commands), [false, false]);
@@ -1950,14 +1901,13 @@ mod tests {
     #[test]
     fn dependency_chain_needs_a_barrier_at_each_link() {
         let a = slice(1, 0, 4);
-        let b = slice(2, 0, 4);
         let first = slice(3, 0, 4);
         let second = slice(4, 0, 4);
         let third = slice(5, 0, 4);
         let mut commands = CommandList::new();
-        commands.dispatch(Op::Add, &[&a, &b], &first).unwrap();
-        commands.dispatch(Op::Add, &[&first, &b], &second).unwrap();
-        commands.dispatch(Op::Add, &[&second, &b], &third).unwrap();
+        commands.dispatch(Op::Copy, &[&a], &first).unwrap();
+        commands.dispatch(Op::Copy, &[&first], &second).unwrap();
+        commands.dispatch(Op::Copy, &[&second], &third).unwrap();
 
         assert_eq!(required_barriers(&commands), [false, true, true]);
     }
@@ -2045,55 +1995,6 @@ mod tests {
     }
 
     #[test]
-    fn add_rejects_invalid_signatures() {
-        let input = tensor(1, DType::F32, &[2], &[1]);
-        let integer = tensor(2, DType::U32, &[2], &[1]);
-        let wrong_shape = tensor(3, DType::F32, &[1], &[1]);
-        let output = tensor(4, DType::F32, &[2], &[1]);
-        assert_eq!(
-            CommandList::new().dispatch(Op::Add, &[&input], &output),
-            Err(OpError::Arity {
-                expected: 2,
-                actual: 1
-            })
-        );
-        assert_eq!(
-            CommandList::new().dispatch(Op::Add, &[&input, &integer], &output),
-            Err(OpError::DType {
-                operand: Operand::Input(1),
-                dtype: DType::U32
-            })
-        );
-        assert_eq!(
-            CommandList::new().dispatch(Op::Add, &[&input, &wrong_shape], &output),
-            Err(OpError::Shape {
-                operand: Operand::Input(1)
-            })
-        );
-    }
-
-    #[test]
-    fn silu_mul_rejects_invalid_signatures() {
-        let input = tensor(1, DType::F16, &[2], &[1]);
-        let integer = tensor(2, DType::I32, &[2], &[1]);
-        let output = tensor(3, DType::BF16, &[2], &[1]);
-        assert_eq!(
-            CommandList::new().dispatch(Op::SiluMul, &[&input], &output),
-            Err(OpError::Arity {
-                expected: 2,
-                actual: 1
-            })
-        );
-        assert_eq!(
-            CommandList::new().dispatch(Op::SiluMul, &[&input, &integer], &output),
-            Err(OpError::DType {
-                operand: Operand::Input(1),
-                dtype: DType::I32
-            })
-        );
-    }
-
-    #[test]
     fn rms_norm_rejects_invalid_signatures() {
         let input = tensor(1, DType::F32, &[3, 2], &[2, 1]);
         let weight = tensor(2, DType::F32, &[3], &[1]);
@@ -2131,41 +2032,6 @@ mod tests {
                 &[&input, &good_weight],
                 &wrong_output
             ),
-            Err(OpError::Shape {
-                operand: Operand::Output
-            })
-        );
-    }
-
-    #[test]
-    fn softmax_rejects_invalid_signatures() {
-        let input = tensor(1, DType::F16, &[2], &[1]);
-        let integer = tensor(2, DType::U32, &[2], &[1]);
-        let output = tensor(3, DType::F32, &[2], &[1]);
-        let scalar = tensor(4, DType::F32, &[], &[]);
-        let scalar_output = tensor(5, DType::F32, &[], &[]);
-        assert_eq!(
-            CommandList::new().dispatch(Op::Softmax, &[], &output),
-            Err(OpError::Arity {
-                expected: 1,
-                actual: 0
-            })
-        );
-        assert_eq!(
-            CommandList::new().dispatch(Op::Softmax, &[&integer], &output),
-            Err(OpError::DType {
-                operand: Operand::Input(0),
-                dtype: DType::U32
-            })
-        );
-        assert_eq!(
-            CommandList::new().dispatch(Op::Softmax, &[&scalar], &scalar_output),
-            Err(OpError::Shape {
-                operand: Operand::Input(0)
-            })
-        );
-        assert_eq!(
-            CommandList::new().dispatch(Op::Softmax, &[&input], &scalar),
             Err(OpError::Shape {
                 operand: Operand::Output
             })
@@ -2548,8 +2414,8 @@ mod tests {
         );
         assert_eq!(
             CommandList::new().dispatch_epilogue(
-                Op::Add,
-                &[&output, &output],
+                Op::Copy,
+                &[&output],
                 &tensor(34, DType::F32, &[7, 17], &[17, 1]),
                 &epilogue,
                 &[&output],

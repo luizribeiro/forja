@@ -2037,11 +2037,8 @@ mod tests {
             .unwrap();
         regular
             .dispatch(
-                Op::Add,
-                &[
-                    &TemplateTensor::from(middle.clone()),
-                    &TemplateTensor::from(input.clone()),
-                ],
+                Op::Copy,
+                &[&TemplateTensor::from(middle.clone())],
                 &TemplateTensor::from(output.clone()),
             )
             .unwrap();
@@ -2051,7 +2048,7 @@ mod tests {
             .record_validated(Dispatch::new(Op::Copy, &[&input], &middle).unwrap())
             .unwrap();
         validated
-            .record_validated(Dispatch::new(Op::Add, &[&middle, &input], &output).unwrap())
+            .record_validated(Dispatch::new(Op::Copy, &[&middle], &output).unwrap())
             .unwrap();
 
         assert_eq!(regular.required_barriers(), validated.required_barriers());
@@ -2270,19 +2267,6 @@ mod tests {
                 0..=hi,
                 Op::Copy.into(),
                 &[&copy_input],
-                &cache_write,
-            ));
-
-            let add_input = TemplateTensor::from(tensor(2, &[8, 1, 128]));
-            let mut add = GraphTemplate::new(space.clone(), GraphLimits::default());
-            add.dispatch(Op::Add, &[&copy_input, &add_input], &cache_write)
-                .unwrap();
-            prop_assert!(operation_replay_matches_fresh(
-                &add,
-                &space,
-                0..=hi,
-                Op::Add.into(),
-                &[&copy_input, &add_input],
                 &cache_write,
             ));
 
