@@ -436,6 +436,32 @@ mod tests {
     }
 
     #[test]
+    fn quant_gemm_splices_follow_collectives_and_edge_checks() {
+        let source = generate_source(&bias_epilogue());
+        for (kernel, end_marker, collective, edge) in [
+            (
+                "kernel void quantized_gemm_small_m(",
+                "template <\n    typename T, uint block_inner",
+                "simd_sum(",
+                "if (output_row < params.rows)",
+            ),
+            (
+                "void quantized_gemm_tiled_impl(",
+                "#define quantized_gemm_tiled_kernel",
+                "threadgroup_barrier(",
+                "if (output_row < params.rows && output_column < params.columns)",
+            ),
+        ] {
+            let start = source.find(kernel).unwrap();
+            let body = &source[start..source[start..].find(end_marker).unwrap() + start];
+            let call = body.rfind("forja_epilogue(").unwrap();
+            let before = &body[..call];
+            assert!(before.rfind(collective).unwrap() < before.rfind(edge).unwrap());
+            assert!(body[call..].find("store_float(").is_some());
+        }
+    }
+
+    #[test]
     fn quant_source_addresses_ignore_program_values() {
         let source = generate_source(&bias_epilogue());
         for address in source

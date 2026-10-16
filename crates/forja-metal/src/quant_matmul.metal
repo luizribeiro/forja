@@ -1107,6 +1107,7 @@ kernel void quantized_gemm_small_m(
     device const uchar *biases [[buffer(3)]],
     device uchar *output [[buffer(4)]],
     constant QuantMatmulParams &params [[buffer(5)]],
+    FORJA_EPILOGUE_ARGUMENTS
     ushort simdgroup [[simdgroup_index_in_threadgroup]],
     ushort lane [[thread_index_in_simdgroup]],
     uint2 tile [[threadgroup_position_in_grid]]) {
@@ -1165,10 +1166,13 @@ kernel void quantized_gemm_small_m(
         for (uint row = 0; row < 8; ++row) {
             uint output_row = first_row + row;
             if (output_row < params.rows) {
+                float value = forja_epilogue(
+                    sums[row], 0.0f, 0u, output_row, column,
+                    1u, params.rows, params.columns, FORJA_EPILOGUE_VALUES);
                 ulong output_index = params.output_offset +
                     ulong(output_row) * params.output_row_stride +
                     ulong(column) * params.output_column_stride;
-                store_float(output, output_index, output_dtype, sums[row]);
+                store_float(output, output_index, output_dtype, value);
             }
         }
     }
@@ -1356,6 +1360,7 @@ void quantized_gemm_tiled_impl(
     device const uchar *biases [[buffer(3)]],
     device uchar *output [[buffer(4)]],
     constant QuantMatmulParams &params [[buffer(5)]],
+    FORJA_EPILOGUE_PARAMETERS
     uint thread_index,
     uint thread_count,
     ushort simdgroup,
@@ -1384,9 +1389,31 @@ void quantized_gemm_tiled_impl(
         mma.multiply(input_tile, weight_tile);
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    mma.store(
-        output, params.output_offset, params.output_row_stride,
-        row_origin, column_origin, params.rows, params.columns, output_dtype);
+    for (int row_fragment = 0; row_fragment < mma.row_fragments; ++row_fragment) {
+        uint row = mma.simdgroup_row * mma.fragment_size + mma.fragment_row +
+            row_fragment * mma.fragment_size * 2;
+        for (int column_fragment = 0;
+             column_fragment < mma.column_fragments;
+             ++column_fragment) {
+            uint column = mma.simdgroup_column * mma.fragment_size + mma.fragment_column +
+                column_fragment * mma.fragment_size * 2;
+            int fragment_index = row_fragment * mma.column_fragments + column_fragment;
+            for (int element = 0; element < 2; ++element) {
+                uint output_row = row_origin + row;
+                uint output_column = column_origin + column + element;
+                if (output_row < params.rows && output_column < params.columns) {
+                    float value = forja_epilogue(
+                        float(mma.accumulators[fragment_index * 2 + element]), 0.0f,
+                        0u, output_row, output_column, 1u, params.rows, params.columns,
+                        FORJA_EPILOGUE_VALUES);
+                    ulong output_index = params.output_offset +
+                        ulong(output_row) * params.output_row_stride +
+                        ulong(output_column) * params.output_column_stride;
+                    store_float(output, output_index, output_dtype, value);
+                }
+            }
+        }
+    }
 }
 
 #define quantized_gemm_tiled_kernel(name, type)                                    \
@@ -1397,6 +1424,7 @@ kernel void name(                                                               
     device const uchar *biases [[buffer(3)]],                                       \
     device uchar *output [[buffer(4)]],                                             \
     constant QuantMatmulParams &params [[buffer(5)]],                               \
+    FORJA_EPILOGUE_ARGUMENTS                                                        \
     uint thread_index [[thread_index_in_threadgroup]],                              \
     uint3 threadgroup_size [[threads_per_threadgroup]],                             \
     ushort simdgroup [[simdgroup_index_in_threadgroup]],                            \
@@ -1406,7 +1434,8 @@ kernel void name(                                                               
     threadgroup type input_tile[32 * tile_stride];                                  \
     threadgroup type weight_tile[32 * tile_stride];                                 \
     quantized_gemm_tiled_impl<type>(                                                \
-        input, packed, scales, biases, output, params, thread_index,                \
+        input, packed, scales, biases, output, params, FORJA_EPILOGUE_VALUES,       \
+        thread_index,                                                               \
         threadgroup_size.x * threadgroup_size.y * threadgroup_size.z,               \
         simdgroup, lane, tile, input_tile, weight_tile);                            \
 }

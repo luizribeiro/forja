@@ -9044,6 +9044,54 @@ mod tests {
         }
     }
 
+    #[test]
+    fn metal_quant_small_m_epilogues_cover_formats_and_noncontiguous_extras() {
+        let backend = MetalBackend::new().unwrap();
+        for dtype in [DType::F32, DType::F16, DType::BF16] {
+            for bits in [4, 8] {
+                assert_quant_epilogue(
+                    &backend,
+                    "quant-matmul.small-m",
+                    dtype,
+                    bits,
+                    7,
+                    256,
+                    33,
+                    false,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn metal_quant_tiled_epilogues_cover_formats_dtypes_and_edge_tiles() {
+        let backend = MetalBackend::new().unwrap();
+        for dtype in [DType::F32, DType::F16, DType::BF16] {
+            for bits in [4, 8] {
+                assert_quant_epilogue(
+                    &backend,
+                    "quant-matmul.tiled",
+                    dtype,
+                    bits,
+                    33,
+                    128,
+                    33,
+                    false,
+                );
+            }
+        }
+        assert_quant_epilogue(
+            &backend,
+            "quant-matmul.tiled",
+            DType::BF16,
+            8,
+            16,
+            1024,
+            128,
+            true,
+        );
+    }
+
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     fn assert_quant_epilogue(
         backend: &MetalBackend,
