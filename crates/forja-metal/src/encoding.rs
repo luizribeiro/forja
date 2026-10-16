@@ -8849,6 +8849,152 @@ mod tests {
     }
 
     #[test]
+    fn metal_encode_time_epilogue_miss_never_compiles() {
+        let backend = MetalBackend::new().unwrap();
+        let epilogue = prepare_epilogue(
+            Program {
+                kind: ProgramKind::Map,
+                insts: vec![Inst::Input(0)],
+                outputs: vec![(0, 0)],
+            }
+            .validate()
+            .unwrap(),
+            EpilogueSignature::new(1, 2, vec![], DType::F32),
+        )
+        .unwrap();
+        let mut pipelines = backend.pipelines.lock().unwrap();
+        assert!(matches!(
+            pipelines.lookup_prepared_epilogue(
+                epilogue_codegen::FamilySourceTag::Dense,
+                &epilogue,
+                "gemv",
+                &[(0, 0), (1, 0), (2, 0)],
+            ),
+            Err(BackendError::ExecutionFailed)
+        ));
+        assert_eq!(pipelines.epilogue_counts.fallbacks, 1);
+        assert!(pipelines.epilogue_libraries.is_empty());
+        assert!(pipelines.epilogue_pipelines.is_empty());
+
+        let assertion = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            pipelines.lookup_epilogue(
+                epilogue_codegen::FamilySourceTag::Dense,
+                &epilogue,
+                "gemv",
+                &[(0, 0), (1, 0), (2, 0)],
+            )
+        }));
+        assert!(match assertion {
+            Err(_) => cfg!(debug_assertions),
+            Ok(Err(BackendError::ExecutionFailed)) => !cfg!(debug_assertions),
+            _ => false,
+        });
+        assert_eq!(pipelines.epilogue_counts.fallbacks, 2);
+        assert!(pipelines.epilogue_libraries.is_empty());
+        assert!(pipelines.epilogue_pipelines.is_empty());
+    }
+
+    #[test]
+    fn metal_eager_epilogue_specializations_cover_every_boundary_arm() {
+        let backend = MetalBackend::new().unwrap();
+        let epilogue = prepare_epilogue(
+            Program {
+                kind: ProgramKind::Map,
+                insts: vec![Inst::Input(0)],
+                outputs: vec![(0, 0)],
+            }
+            .validate()
+            .unwrap(),
+            EpilogueSignature::new(1, 2, vec![], DType::F32),
+        )
+        .unwrap();
+        let mut requests = Vec::new();
+        let dense_constants = vec![(0, 0), (1, 0), (2, 0)];
+        for implementation in ["gemv", "gemv_transposed"] {
+            requests.push(EpiloguePipelineRequest {
+                family: epilogue_codegen::FamilySourceTag::Dense,
+                epilogue: Arc::clone(&epilogue),
+                implementation,
+                constants: dense_constants.clone(),
+            });
+        }
+        for config in [GEMM_64_64_FLOAT, GEMM_64_64_HALF, GEMM_64_32, GEMM_32_64] {
+            for specialization in dense_epilogue_specializations(config) {
+                let mut constants = dense_constants.clone();
+                constants.extend(specialization);
+                requests.push(EpiloguePipelineRequest {
+                    family: epilogue_codegen::FamilySourceTag::Dense,
+                    epilogue: Arc::clone(&epilogue),
+                    implementation: config.kernel,
+                    constants,
+                });
+            }
+        }
+        let quant_constants = vec![(0, 0), (1, 1), (2, 0), (12, 8), (13, 64)];
+        for implementation in [
+            "quantized_gemv",
+            "quantized_gemv_q8_fast",
+            "quantized_gemm_small_m",
+            "quantized_gemm_tiled_f32",
+            "quantized_gemm_tiled_f16",
+            "quantized_gemm_tiled_bf16",
+        ] {
+            for words in [
+                quant_epilogue_specialization(7, 511),
+                quant_epilogue_specialization(8, 512),
+            ] {
+                let mut constants = quant_constants.clone();
+                constants.push((15, words));
+                requests.push(EpiloguePipelineRequest {
+                    family: epilogue_codegen::FamilySourceTag::Quant,
+                    epilogue: Arc::clone(&epilogue),
+                    implementation,
+                    constants,
+                });
+            }
+        }
+        let gather_constants = vec![(0, 0), (1, 1), (2, 0), (12, 8), (13, 64)];
+        for words in [
+            gather_epilogue_specialization(7, 511),
+            gather_epilogue_specialization(8, 512),
+        ] {
+            let mut constants = gather_constants.clone();
+            constants.push((14, words));
+            requests.push(EpiloguePipelineRequest {
+                family: epilogue_codegen::FamilySourceTag::GatherQuant,
+                epilogue: Arc::clone(&epilogue),
+                implementation: "gather_quantized_gemv",
+                constants,
+            });
+        }
+        requests.push(EpiloguePipelineRequest {
+            family: epilogue_codegen::FamilySourceTag::GatherQuant,
+            epilogue,
+            implementation: "grouped_quantized_gemm",
+            constants: gather_constants,
+        });
+
+        let mut pipelines = backend.pipelines.lock().unwrap();
+        pipelines.prepare_epilogue_pipelines(&requests).unwrap();
+        let preparation_hits = pipelines.epilogue_counts.cache_hits;
+        for request in &requests {
+            pipelines
+                .lookup_epilogue(
+                    request.family,
+                    &request.epilogue,
+                    request.implementation,
+                    &request.constants,
+                )
+                .unwrap();
+        }
+        assert_eq!(pipelines.epilogue_counts.fallbacks, 0);
+        assert_eq!(
+            pipelines.epilogue_counts.cache_hits,
+            preparation_hits + u64::try_from(requests.len()).unwrap()
+        );
+    }
+
+    #[test]
     fn tier_two_preencodes_a_pinned_static_dispatch() {
         let backend = MetalBackend::new().unwrap();
         let left = backend.alloc(DType::F32, &[7, 33]).unwrap();
@@ -9961,7 +10107,7 @@ mod tests {
         let profile = profiled.profile().unwrap();
         assert_eq!(profile.epilogue_library_compilations, 1);
         assert_eq!(profile.epilogue_pipeline_specializations, 1);
-        assert_eq!(profile.epilogue_cache_hits, 3);
+        assert_eq!(profile.epilogue_cache_hits, 5);
         assert_eq!(profile.epilogue_compile_fallbacks, 0);
         let pipelines = backend.pipelines.lock().unwrap();
         assert_eq!(pipelines.epilogue_libraries.len(), 1);
