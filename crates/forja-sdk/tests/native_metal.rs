@@ -7,7 +7,7 @@ use forja_sdk::{
     target::metal::{Variant, VariantRule},
 };
 
-mod support;
+use crate::support;
 
 #[forja_sdk::kernel(map)]
 fn double_epilogue_value(accumulator: forja_sdk::kernel::Elem) -> forja_sdk::kernel::Elem {

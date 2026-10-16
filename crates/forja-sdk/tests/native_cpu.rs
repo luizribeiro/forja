@@ -2,7 +2,7 @@
 
 //! CPU-backed native SDK coverage.
 
-mod support;
+use crate::support;
 
 #[forja_sdk::kernel(map)]
 fn paired_silu(
