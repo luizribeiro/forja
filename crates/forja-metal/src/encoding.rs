@@ -7240,6 +7240,9 @@ fn epilogue_pipeline_requests(
                 }])
             }
         }
+        Op::GatherQuantMatmul { bits, group_size } => {
+            gather_epilogue_requests(dispatch, epilogue, bits, group_size, parameter_dependent)
+        }
         _ => Err(BackendError::UnsupportedOperation),
     }
 }
@@ -7315,6 +7318,72 @@ fn dense_epilogue_requests(
         family: epilogue_codegen::FamilySourceTag::Dense,
         epilogue,
         implementation,
+        constants,
+    }])
+}
+
+fn gather_epilogue_requests(
+    dispatch: &Dispatch,
+    epilogue: Arc<PreparedEpilogue>,
+    bits: u8,
+    group_size: u32,
+    parameter_dependent: bool,
+) -> Result<Vec<EpiloguePipelineRequest>, BackendError> {
+    let [input, _, scales, _, _] = dispatch.primitive_inputs() else {
+        return Err(BackendError::InvalidInput);
+    };
+    let mut constants = vec![
+        (0, dtype_code(input.layout().dtype())),
+        (1, dtype_code(scales.layout().dtype())),
+        (2, dtype_code(dispatch.output().layout().dtype())),
+        (12, u32::from(bits)),
+        (13, group_size),
+    ];
+    if selected_variant(dispatch) == Some(MetalVariant::GatherQuantMatmulGrouped) {
+        return Ok(vec![EpiloguePipelineRequest {
+            family: epilogue_codegen::FamilySourceTag::GatherQuant,
+            epilogue,
+            implementation: "grouped_quantized_gemm",
+            constants,
+        }]);
+    }
+    if !matches!(
+        selected_variant(dispatch),
+        Some(MetalVariant::GatherQuantMatmulPortable | MetalVariant::GatherQuantMatmulRouteGemv)
+    ) {
+        return Err(BackendError::UnsupportedOperation);
+    }
+    if parameter_dependent {
+        return Ok([1, 2]
+            .into_iter()
+            .map(|words| {
+                let mut constants = constants.clone();
+                constants.push((14, words));
+                EpiloguePipelineRequest {
+                    family: epilogue_codegen::FamilySourceTag::GatherQuant,
+                    epilogue: Arc::clone(&epilogue),
+                    implementation: "gather_quantized_gemv",
+                    constants,
+                }
+            })
+            .collect());
+    }
+    let inner = *input
+        .layout()
+        .shape()
+        .last()
+        .ok_or(BackendError::InvalidInput)?;
+    let columns = *dispatch
+        .output()
+        .layout()
+        .shape()
+        .last()
+        .ok_or(BackendError::InvalidInput)?;
+    constants.push((14, u32::from(columns % 8 == 0 && inner % 512 == 0) + 1));
+    Ok(vec![EpiloguePipelineRequest {
+        family: epilogue_codegen::FamilySourceTag::GatherQuant,
+        epilogue,
+        implementation: "gather_quantized_gemv",
         constants,
     }])
 }
