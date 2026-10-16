@@ -1567,11 +1567,14 @@ fn check_gather_quant_matmul(
     bits: u8,
     group_size: u32,
 ) -> Result<(), OpError> {
-    if !matches!(inputs.len(), 5 | 8) {
+    if !matches!(inputs.len(), 5 | 6 | 8) {
         return Err(OpError::Arity {
             expected: 5,
             actual: inputs.len(),
         });
+    }
+    if inputs.len() == 6 {
+        return check_gather_quant_weighted_sum(inputs, output, bits, group_size);
     }
     let index_position = inputs.len() - 1;
     check_gather_quant_projection(
@@ -1594,6 +1597,55 @@ fn check_gather_quant_matmul(
                 return Err(shape_error(Operand::Input(second)));
             }
         }
+    }
+    Ok(())
+}
+
+fn check_gather_quant_weighted_sum(
+    inputs: &[&Tensor],
+    output: &Tensor,
+    bits: u8,
+    group_size: u32,
+) -> Result<(), OpError> {
+    for position in [0, 5] {
+        check_float(inputs[position], Operand::Input(position))?;
+        if inputs[position].layout.dtype() != inputs[0].layout.dtype() {
+            return Err(OpError::DType {
+                operand: Operand::Input(position),
+                dtype: inputs[position].layout.dtype(),
+            });
+        }
+    }
+    check_float(output, Operand::Output)?;
+    if output.layout.dtype() != inputs[0].layout.dtype() {
+        return Err(OpError::DType {
+            operand: Operand::Output,
+            dtype: output.layout.dtype(),
+        });
+    }
+    if inputs[4].layout.dtype() != DType::U32 {
+        return Err(OpError::DType {
+            operand: Operand::Input(4),
+            dtype: inputs[4].layout.dtype(),
+        });
+    }
+    let [rows, routes, inner]: [u32; 3] = inputs[0]
+        .layout
+        .shape()
+        .try_into()
+        .map_err(|_| shape_error(Operand::Input(0)))?;
+    if routes == 0 {
+        return Err(shape_error(Operand::Input(0)));
+    }
+    let (_, columns) =
+        check_quantized_expert_weights(inputs, bits, group_size, [0, 1, 2, 3], inner)?;
+    for position in [4, 5] {
+        if inputs[position].layout.shape() != [rows, routes] {
+            return Err(shape_error(Operand::Input(position)));
+        }
+    }
+    if output.layout.shape() != [rows, columns] {
+        return Err(shape_error(Operand::Output));
     }
     Ok(())
 }
@@ -3025,6 +3077,32 @@ mod tests {
             Err(OpError::Shape {
                 operand: Operand::Input(5)
             })
+        );
+    }
+
+    #[test]
+    fn gathered_quant_matmul_accepts_weighted_sum_with_residual_epilogue() {
+        let routed = tensor(1, DType::BF16, &[7, 3, 64], &[192, 64, 1]);
+        let packed = tensor(2, DType::U32, &[5, 33, 8], &[264, 8, 1]);
+        let scales = tensor(3, DType::F16, &[5, 33, 1], &[33, 1, 1]);
+        let biases = tensor(4, DType::F16, &[5, 33, 1], &[33, 1, 1]);
+        let indices = tensor(5, DType::U32, &[7, 3], &[3, 1]);
+        let weights = tensor(6, DType::BF16, &[7, 3], &[3, 1]);
+        let output = tensor(7, DType::BF16, &[7, 33], &[33, 1]);
+        let residual = tensor(8, DType::BF16, &[7, 33], &[33, 1]);
+        assert!(
+            CommandList::new()
+                .dispatch_epilogue(
+                    Op::GatherQuantMatmul {
+                        bits: 4,
+                        group_size: 64,
+                    },
+                    &[&routed, &packed, &scales, &biases, &indices, &weights],
+                    &output,
+                    &bias_epilogue(2, DType::BF16),
+                    &[&residual],
+                )
+                .is_ok()
         );
     }
 
