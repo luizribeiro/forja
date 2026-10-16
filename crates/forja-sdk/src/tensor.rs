@@ -1089,6 +1089,108 @@ impl<T: Element> Tensor<T> {
         Ok(output)
     }
 
+    /// Projects routed rows through affine-quantized experts, combines them with route weights,
+    /// and applies an epilogue after the weighted sum.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for incompatible weights, routes, or epilogue bindings.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gather_quant_matmul_weighted_epilogue<S: FloatElement>(
+        &self,
+        packed: &Tensor<u32>,
+        scales: &Tensor<S>,
+        biases: &Tensor<S>,
+        indices: &Tensor<u32>,
+        weights: &Self,
+        bits: u8,
+        group_size: u32,
+        epilogue: &Epilogue,
+        extras: &[TensorRef<'_>],
+    ) -> Result<Self>
+    where
+        T: FloatElement,
+    {
+        self.gather_quant_matmul_weighted_epilogue_selected(
+            packed, scales, biases, indices, weights, bits, group_size, epilogue, extras, None,
+        )
+    }
+
+    /// Projects and combines routed rows with an epilogue and explicit Metal selection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for incompatible bindings, rule context, or a refused selection.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gather_quant_matmul_weighted_epilogue_with<'a, S: FloatElement>(
+        &self,
+        packed: &Tensor<u32>,
+        scales: &Tensor<S>,
+        biases: &Tensor<S>,
+        indices: &Tensor<u32>,
+        weights: &Self,
+        bits: u8,
+        group_size: u32,
+        epilogue: &Epilogue,
+        extras: &[TensorRef<'_>],
+        selection: impl Into<crate::target::metal::VariantChoice<'a>>,
+    ) -> Result<Self>
+    where
+        T: FloatElement,
+    {
+        self.gather_quant_matmul_weighted_epilogue_selected(
+            packed,
+            scales,
+            biases,
+            indices,
+            weights,
+            bits,
+            group_size,
+            epilogue,
+            extras,
+            Some(selection.into()),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn gather_quant_matmul_weighted_epilogue_selected<S: FloatElement>(
+        &self,
+        packed: &Tensor<u32>,
+        scales: &Tensor<S>,
+        biases: &Tensor<S>,
+        indices: &Tensor<u32>,
+        weights: &Self,
+        bits: u8,
+        group_size: u32,
+        epilogue: &Epilogue,
+        extras: &[TensorRef<'_>],
+        selection: Option<crate::target::metal::VariantChoice<'_>>,
+    ) -> Result<Self>
+    where
+        T: FloatElement,
+    {
+        let shape = self.gather_quantized_weighted_shape(
+            packed, scales, biases, indices, weights, bits, group_size,
+        )?;
+        let output = Self::empty(shape.to_vec())?;
+        crate::kernel::run_epilogue(
+            sys::Op::GatherQuantMatmul { bits, group_size },
+            &[
+                &self.handle,
+                &packed.handle,
+                &scales.handle,
+                &biases.handle,
+                &indices.handle,
+                &weights.handle,
+            ],
+            TensorRef::new(&output)?,
+            epilogue,
+            extras,
+            selection,
+        )?;
+        Ok(output)
+    }
+
     /// Multiplies routed rows with an explicit Metal algorithm selection.
     ///
     /// # Errors
@@ -1179,19 +1281,9 @@ impl<T: Element> Tensor<T> {
     where
         T: FloatElement,
     {
-        let [rows, routes, _]: [u32; 3] = self
-            .shape()
-            .try_into()
-            .map_err(|_| Error::new("routed activations must have rank three"))?;
-        let [_, output, _]: [u32; 3] = packed
-            .shape()
-            .try_into()
-            .map_err(|_| Error::new("expert weights must have rank three"))?;
-        if indices.shape() != [rows, routes] || weights.shape() != [rows, routes] {
-            return Err(Error::new(
-                "route indices and weights must match activations",
-            ));
-        }
+        let [rows, output] = self.gather_quantized_weighted_shape(
+            packed, scales, biases, indices, weights, bits, group_size,
+        )?;
         if residual.shape() != [rows, output] {
             return Err(Error::new("residual shape does not match expert output"));
         }
@@ -1210,6 +1302,55 @@ impl<T: Element> Tensor<T> {
             &result.handle,
         )?;
         Ok(result)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn gather_quantized_weighted_shape<S: FloatElement>(
+        &self,
+        packed: &Tensor<u32>,
+        scales: &Tensor<S>,
+        biases: &Tensor<S>,
+        indices: &Tensor<u32>,
+        weights: &Self,
+        bits: u8,
+        group_size: u32,
+    ) -> Result<[u32; 2]>
+    where
+        T: FloatElement,
+    {
+        if !matches!(bits, 4 | 8) || !matches!(group_size, 32 | 64 | 128) {
+            return Err(Error::new("unsupported affine quantization parameters"));
+        }
+        let [rows, routes, inner]: [u32; 3] = self
+            .shape()
+            .try_into()
+            .map_err(|_| Error::new("routed activations must have rank three"))?;
+        let [experts, output, packed_width]: [u32; 3] = packed
+            .shape()
+            .try_into()
+            .map_err(|_| Error::new("expert weights must have rank three"))?;
+        if indices.shape() != [rows, routes]
+            || weights.shape() != [rows, routes]
+            || !inner.is_multiple_of(group_size)
+        {
+            return Err(Error::new(
+                "route indices and weights must match activations",
+            ));
+        }
+        let expected_packed = inner
+            .checked_mul(u32::from(bits))
+            .and_then(|value| value.checked_div(32))
+            .ok_or_else(|| Error::new("gathered quantized packed width overflowed"))?;
+        if packed_width != expected_packed {
+            return Err(Error::new("gathered quantized packed width is invalid"));
+        }
+        let parameter_shape = [experts, output, inner / group_size];
+        if scales.shape() != parameter_shape || biases.shape() != parameter_shape {
+            return Err(Error::new(
+                "gathered quantized scale and bias shapes are invalid",
+            ));
+        }
+        Ok([rows, output])
     }
 
     /// Computes `SiLU(gate) * up` from two affine-quantized expert projections selected by GPU

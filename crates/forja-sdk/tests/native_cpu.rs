@@ -12,6 +12,14 @@ fn paired_silu(
     first * first.sigmoid() * second
 }
 
+#[forja_sdk::kernel(map)]
+fn add_residual(
+    accumulator: forja_sdk::kernel::Elem,
+    residual: forja_sdk::kernel::Elem,
+) -> forja_sdk::kernel::Elem {
+    accumulator + residual
+}
+
 #[test]
 fn structured_ops_match_the_cpu_backend() {
     support::matmul_rope_embedding_match_cpu();
@@ -108,6 +116,37 @@ fn paired_gathered_projections_route_through_the_sdk() {
     for (actual, expected) in output.into_iter().zip(expected) {
         assert!((actual - expected).abs() < 1.0e-4);
     }
+}
+
+#[test]
+fn weighted_gathered_projection_routes_through_the_sdk() {
+    use forja_sdk::{DType, Tensor, bf16, kernel::TensorRef};
+
+    let input = Tensor::from_slice(&[1.0_f32; 128], &[1, 2, 64]).unwrap();
+    let packed = Tensor::from_slice(&[0x1111_1111_u32; 16], &[1, 2, 8]).unwrap();
+    let scales =
+        Tensor::from_slice(&[bf16::from_f32(0.5), bf16::from_f32(0.25)], &[1, 2, 1]).unwrap();
+    let biases =
+        Tensor::from_slice(&[bf16::from_f32(1.0), bf16::from_f32(-1.0)], &[1, 2, 1]).unwrap();
+    let indices = Tensor::from_slice(&[0_u32, 0], &[1, 2]).unwrap();
+    let weights = Tensor::from_slice(&[0.25_f32, 0.75], &[1, 2]).unwrap();
+    let residual = Tensor::from_slice(&[3.0_f32, -4.0], &[1, 2]).unwrap();
+    let epilogue = add_residual_epilogue(1, 2, &[DType::F32], DType::F32).unwrap();
+    let output = input
+        .gather_quant_matmul_weighted_epilogue(
+            &packed,
+            &scales,
+            &biases,
+            &indices,
+            &weights,
+            4,
+            64,
+            &epilogue,
+            &[TensorRef::new(&residual).unwrap()],
+        )
+        .unwrap();
+
+    assert_eq!(output.to_vec().unwrap(), [99.0, -52.0]);
 }
 
 #[test]
