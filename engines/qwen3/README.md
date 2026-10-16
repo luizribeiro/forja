@@ -6,14 +6,13 @@ chunks.
 
 ```console
 forja build qwen3-0.6b.metal-apple-m3-ultra.bf16
-forja verify --engine qwen3-0.6b.metal-apple-m3-ultra.bf16 --each-tuning
+forja verify --engine qwen3-0.6b.metal-apple-m3-ultra.bf16
 forja bench --engine qwen3-0.6b.metal-apple-m3-ultra.bf16 --against
 ```
 
 The port uses Qwen3 GQA, QK normalization, RoPE, gated MLP blocks, retained KV caches, chunked
-prefill and guest-side graph replay. The profiles select fused residual norm, QK-norm/RoPE and
-SiLU-multiply slots (f32 also keeps the final-norm fusion; bf16 dropped it after measuring it
-neutral) plus shape-specific Metal algorithm picks.
+prefill and guest-side graph replay. The guest builds scalar elementwise and row programs while
+the profiles retain shape-specific Metal algorithm picks.
 
 Accepted pp512/tg128 results use 30 measured repetitions on an 80-core Apple M3 Ultra:
 

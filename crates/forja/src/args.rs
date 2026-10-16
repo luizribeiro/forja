@@ -1832,7 +1832,7 @@ mod tests {
 
     #[test]
     fn generates_profile_tuning_comparison_axes() {
-        let engine = test_guests::qwen3().display().to_string();
+        let engine = test_guests::qwen3_tuning_profile().display().to_string();
         let command = parse(
             [
                 "bench",
@@ -1885,7 +1885,7 @@ mod tests {
 
     #[test]
     fn generates_one_value_tuning_selection_axes_and_rejects_conflicts() {
-        let engine = test_guests::qwen3().display().to_string();
+        let engine = test_guests::qwen3_tuning_profile().display().to_string();
         for arguments in [
             vec!["--without-tuning", "residual-norm,qk-norm-rope"],
             vec!["--only", "residual-norm,final-norm"],

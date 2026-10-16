@@ -141,6 +141,12 @@ pub fn qwen3_bf16_all_fusions() -> &'static Path {
     Path::new(env!("QWEN3_BF16_ALL_FUSIONS_COMPONENT"))
 }
 
+/// Returns a Qwen3 component carrying synthetic tuning defaults for CLI tests.
+#[must_use]
+pub fn qwen3_tuning_profile() -> &'static Path {
+    Path::new(env!("QWEN3_TUNING_PROFILE_COMPONENT"))
+}
+
 /// Returns the path to the guest that consumes host-granted weights.
 #[must_use]
 pub fn weights_smoke() -> &'static Path {

@@ -536,10 +536,7 @@ mod tests {
     #[test]
     fn converts_profiles_to_deterministic_guest_load_config() {
         let config = profile_load_config(&profile(), &Engine::default()).unwrap();
-        assert_eq!(
-            config.tunings,
-            ["residual-norm", "qk-norm-rope", "silu-mul"]
-        );
+        assert!(config.tunings.is_empty());
         assert_eq!(
             config.fixed_variant_picks[0].site,
             "attention.prefill-small"

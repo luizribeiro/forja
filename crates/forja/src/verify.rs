@@ -750,69 +750,24 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     #[ignore = "requires FORJA_MODELS and runs in the pre-push hook"]
-    fn metal_qwen_fusion_profiles() -> Result<(), Box<dyn Error>> {
-        let options = model_options(
-            BackendArg::Metal,
-            Precision::F32,
-            vec!["short-english".to_owned()],
-        )?;
-        let fixtures = FixtureDirectory::open(&options.fixtures)?;
-        let weights = verify_model_hash(&options, &fixtures)?;
-        let cases = [
-            (test_guests::qwen3_residual_norm(), &["residual-norm"][..]),
-            (test_guests::qwen3_qk_norm_rope(), &["qk-norm-rope"][..]),
-            (test_guests::qwen3_silu_mul(), &["silu-mul"][..]),
-            (test_guests::qwen3_final_norm(), &["final-norm"][..]),
-            (
-                test_guests::qwen3_all_fusions(),
-                &["residual-norm", "qk-norm-rope", "silu-mul", "final-norm"][..],
-            ),
-        ];
-        let runtime = tokio::runtime::Builder::new_current_thread().build()?;
-        for (component, tunings) in cases {
-            let config = qwen_tunings(component, tunings)?;
-            runtime.block_on(run_with_component(
-                &options,
-                &fixtures,
-                EngineSource {
-                    weights: &weights,
-                    component,
-                    load_config: Some(&config),
-                },
-                32,
-                true,
-            ))?;
-        }
-        Ok(())
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    #[ignore = "requires FORJA_MODELS and runs in the pre-push hook"]
     fn metal_bf16_qwen_verification() -> Result<(), Box<dyn Error>> {
         let options = model_options(BackendArg::Metal, Precision::Bf16, Vec::new())?;
         let fixtures = FixtureDirectory::open(&options.fixtures)?;
         let weights = verify_model_hash(&options, &fixtures)?;
+        let load_config = engine_load_config(&options.engine, &options.engine_config)?;
         let summary = tokio::runtime::Builder::new_current_thread()
             .build()?
-            .block_on(async {
-                let config = qwen_tunings(
-                    test_guests::qwen3_bf16(),
-                    &["residual-norm", "qk-norm-rope", "silu-mul", "final-norm"],
-                )?;
-                run_with_component(
-                    &options,
-                    &fixtures,
-                    EngineSource {
-                        weights: &weights,
-                        component: test_guests::qwen3_bf16(),
-                        load_config: Some(&config),
-                    },
-                    32,
-                    true,
-                )
-                .await
-            })?;
+            .block_on(run_with_component(
+                &options,
+                &fixtures,
+                EngineSource {
+                    weights: &weights,
+                    component: test_guests::qwen3_bf16(),
+                    load_config: Some(&load_config),
+                },
+                32,
+                true,
+            ))?;
         assert!(summary.maximum_layer_error <= BF16_HIDDEN_STATE_TOLERANCE);
         assert!(summary.teacher_forced.mean_kl() <= BF16_LOGIT_KL_TOLERANCE);
         assert!(top1_passes(summary.teacher_forced));
@@ -978,15 +933,6 @@ mod tests {
         tokio::runtime::Builder::new_current_thread()
             .build()?
             .block_on(run_with_steps(&options, decode_steps))
-    }
-
-    fn qwen_tunings(
-        component: &Path,
-        names: &[&str],
-    ) -> Result<forja_host::EngineLoadConfig, Box<dyn Error>> {
-        let mut config = engine_load_config(component, &forja_config::Engine::default())?;
-        config.tunings = names.iter().map(|name| (*name).to_owned()).collect();
-        Ok(config)
     }
 
     fn model_options(

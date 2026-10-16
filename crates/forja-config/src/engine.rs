@@ -223,7 +223,12 @@ mod tests {
     fn profile() -> Profile {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../engines/qwen3/profiles/qwen3-0.6b.metal-apple-m3-ultra.bf16.toml");
-        toml::from_str(&fs::read_to_string(path).unwrap()).unwrap()
+        let source = fs::read_to_string(path).unwrap().replacen(
+            "family = \"qwen3\"\n",
+            "family = \"qwen3\"\ndefault-tunings = [\"residual-norm\", \"qk-norm-rope\", \"silu-mul\"]\n",
+            1,
+        );
+        toml::from_str(&source).unwrap()
     }
 
     #[test]

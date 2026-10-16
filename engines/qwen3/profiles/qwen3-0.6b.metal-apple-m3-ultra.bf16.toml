@@ -1,6 +1,5 @@
 schema-version = 1
 family = "qwen3"
-default-tunings = ["residual-norm", "qk-norm-rope", "silu-mul"]
 
 [model]
 id = "Qwen/Qwen3-0.6B"
@@ -61,5 +60,3 @@ name = "sdpa.steel"
 lo = 1
 hi = 4095
 name = "sdpa.decomposed"
-
-[tuning-variants]

@@ -23,7 +23,7 @@ impl Variants {
         };
         Ok(Self(EngineSelections::new(
             config,
-            crate::tuning::REGISTRY,
+            &[],
             &sites,
             crate::MAX_CONTEXT,
         )?))

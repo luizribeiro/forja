@@ -1,7 +1,5 @@
 //! Qwen3-0.6B inference engine.
 
-mod slots;
-mod tuning;
 mod variants;
 
 #[cfg(target_family = "wasm")]
@@ -11,10 +9,14 @@ use forja_sdk::nn::blocks::{ChunkedPrefill, DEFAULT_PREFILL_CHUNK, DecodeSelecti
 use forja_sdk::{
     DType, Dim, Engine, EngineInfo, FloatElement, Load, Result, StepInput, StepOutput, Tensor,
     VariantSelection, Weights, bf16, export_engine,
-    kernel::{Kernel, TensorRef},
+    kernel::Kernel,
     nn::{
         Embedding, EmbeddingConfig, Linear, LinearConfig, RmsNorm, RmsNormConfig, WeightElement,
-        blocks::{KvCache, Taps, cached_attention_with, qk_norm_rope, residual_norm},
+        blocks::{
+            KvCache, Taps, add, add_kernel, cached_attention_with, qk_norm_rope,
+            qk_norm_rope_kernel, residual_norm, residual_norm_kernel, rms_norm, rms_norm_kernel,
+            silu_mul, silu_mul_kernel,
+        },
     },
 };
 
@@ -196,7 +198,7 @@ impl<T: Activation> Attention<T> {
 impl<T: Activation> Mlp<T> {
     fn forward(
         &self,
-        kernels: &FusedKernels,
+        kernels: &GuestKernels,
         variants: &variants::Variants,
         input: &Tensor<T>,
         sequence: u32,
@@ -217,11 +219,7 @@ impl<T: Activation> Mlp<T> {
             HIDDEN,
             INTERMEDIATE,
         )?;
-        let activated = if kernels.has_silu_mul() {
-            run_silu_mul(kernels.silu_mul()?, &gate, &up)?
-        } else {
-            gate.silu_mul(&up)?
-        };
+        let activated = silu_mul(&kernels.silu_mul, &gate, &up)?;
         linear(
             variants,
             &self.down_proj,
@@ -264,71 +262,25 @@ struct QwenWeights<T: Activation> {
     model: Model<T>,
 }
 
-struct FusedKernels {
-    silu_mul: Option<Kernel>,
-    qk_norm_rope: Option<Kernel>,
-    residual_norm: Option<Kernel>,
-    final_norm: Option<Kernel>,
+struct GuestKernels {
+    add: Kernel,
+    silu_mul: Kernel,
+    qk_norm_rope: Kernel,
+    residual_norm: Kernel,
+    rms_norm: Kernel,
 }
 
-impl FusedKernels {
-    fn load<T: Activation>(slots: slots::Slots) -> Result<Self> {
+impl GuestKernels {
+    fn load<T: Activation>() -> Result<Self> {
         let dtype = T::KERNEL_DTYPE;
         Ok(Self {
-            silu_mul: load_kernel(slots.silu_mul.is_tuned(), || {
-                tuning::silu_mul::kernel(dtype)
-            })?,
-            qk_norm_rope: load_kernel(slots.qk_norm_rope.is_tuned(), || {
-                tuning::qk_norm_rope::kernel(dtype)
-            })?,
-            residual_norm: load_kernel(slots.residual_norm.is_tuned(), || {
-                tuning::residual_norm::kernel(dtype)
-            })?,
-            final_norm: load_kernel(slots.final_norm.is_tuned(), || {
-                tuning::final_norm::kernel(dtype)
-            })?,
+            add: add_kernel(dtype)?,
+            silu_mul: silu_mul_kernel(dtype)?,
+            qk_norm_rope: qk_norm_rope_kernel(dtype, HEAD_DIM, RMS_EPSILON, ROPE_THETA)?,
+            residual_norm: residual_norm_kernel(dtype, RMS_EPSILON)?,
+            rms_norm: rms_norm_kernel(dtype, RMS_EPSILON)?,
         })
     }
-
-    const fn has_silu_mul(&self) -> bool {
-        self.silu_mul.is_some()
-    }
-
-    const fn has_qk_norm_rope(&self) -> bool {
-        self.qk_norm_rope.is_some()
-    }
-
-    const fn has_residual_norm(&self) -> bool {
-        self.residual_norm.is_some()
-    }
-
-    const fn has_final_norm(&self) -> bool {
-        self.final_norm.is_some()
-    }
-
-    fn silu_mul(&self) -> Result<&Kernel> {
-        required_kernel(self.silu_mul.as_ref(), "silu_mul")
-    }
-
-    fn qk_norm_rope(&self) -> Result<&Kernel> {
-        required_kernel(self.qk_norm_rope.as_ref(), "qk_norm_rope")
-    }
-
-    fn residual_norm(&self) -> Result<&Kernel> {
-        required_kernel(self.residual_norm.as_ref(), "residual_norm")
-    }
-
-    fn final_norm(&self) -> Result<&Kernel> {
-        required_kernel(self.final_norm.as_ref(), "final_norm")
-    }
-}
-
-fn load_kernel(enabled: bool, build: impl FnOnce() -> Result<Kernel>) -> Result<Option<Kernel>> {
-    enabled.then(build).transpose()
-}
-
-fn required_kernel<'a>(kernel: Option<&'a Kernel>, name: &str) -> Result<&'a Kernel> {
-    kernel.ok_or_else(|| forja_sdk::Error::loading(format!("fused kernel `{name}` is unavailable")))
 }
 
 struct LayerResources<'a, T: Activation> {
@@ -338,8 +290,7 @@ struct LayerResources<'a, T: Activation> {
 
 #[derive(Clone, Copy)]
 struct LayerPosition<'a, T: Activation> {
-    positions: &'a Tensor<u32>,
-    activation_positions: Option<&'a Tensor<T>>,
+    positions: &'a Tensor<T>,
     sequence: u32,
     start: &'a Dim,
     end: &'a Dim,
@@ -357,7 +308,7 @@ struct PrefillVariant<'a> {
 impl<T: Activation> DecoderLayer<T> {
     fn forward(
         &self,
-        kernels: &FusedKernels,
+        kernels: &GuestKernels,
         input: &Tensor<T>,
         normalized_input: &Tensor<T>,
         position: LayerPosition<'_, T>,
@@ -369,7 +320,6 @@ impl<T: Activation> DecoderLayer<T> {
         } = resources;
         let LayerPosition {
             positions,
-            activation_positions,
             sequence,
             start,
             end,
@@ -379,36 +329,18 @@ impl<T: Activation> DecoderLayer<T> {
         let [query_projection, key_projection, value_projection] =
             self.self_attn
                 .project(variants, normalized_input, sequence)?;
-        let (query, key) = if kernels.has_qk_norm_rope() {
-            let program_positions = activation_positions.ok_or_else(|| {
-                forja_sdk::Error::loading("fused rotary positions are unavailable")
-            })?;
-            (
-                qk_norm_rope(
-                    kernels.qk_norm_rope()?,
-                    &query_projection,
-                    self.self_attn.q_norm.weight(),
-                    program_positions,
-                )?,
-                qk_norm_rope(
-                    kernels.qk_norm_rope()?,
-                    &key_projection,
-                    self.self_attn.k_norm.weight(),
-                    program_positions,
-                )?,
-            )
-        } else {
-            (
-                self.self_attn
-                    .q_norm
-                    .forward(&query_projection)?
-                    .rope(positions, ROPE_THETA)?,
-                self.self_attn
-                    .k_norm
-                    .forward(&key_projection)?
-                    .rope(positions, ROPE_THETA)?,
-            )
-        };
+        let query = qk_norm_rope(
+            &kernels.qk_norm_rope,
+            &query_projection,
+            self.self_attn.q_norm.weight(),
+            positions,
+        )?;
+        let key = qk_norm_rope(
+            &kernels.qk_norm_rope,
+            &key_projection,
+            self.self_attn.k_norm.weight(),
+            positions,
+        )?;
         let value = value_projection.reshape(&[sequence, KEY_VALUE_HEADS, HEAD_DIM])?;
         let attended = cached_attention_with(
             &query,
@@ -428,54 +360,21 @@ impl<T: Activation> DecoderLayer<T> {
             QUERY_HEADS * HEAD_DIM,
             HIDDEN,
         )?;
-        let (hidden, normalized) = if kernels.has_residual_norm() {
-            residual_norm(
-                kernels.residual_norm()?,
-                input,
-                &attention,
-                self.post_attention_layernorm.weight(),
-            )?
-        } else {
-            let hidden = (input + &attention)?;
-            let normalized = self.post_attention_layernorm.forward(&hidden)?;
-            (hidden, normalized)
-        };
+        let (hidden, normalized) = residual_norm(
+            &kernels.residual_norm,
+            input,
+            &attention,
+            self.post_attention_layernorm.weight(),
+        )?;
         let projected = self.mlp.forward(kernels, variants, &normalized, sequence)?;
-        if kernels.has_residual_norm()
-            && let Some(norm) = following_norm
-        {
+        if let Some(norm) = following_norm {
             let (residual, normalized) =
-                residual_norm(kernels.residual_norm()?, &hidden, &projected, norm.weight())?;
+                residual_norm(&kernels.residual_norm, &hidden, &projected, norm.weight())?;
             Ok((residual, Some(normalized)))
         } else {
-            let residual = (&hidden + &projected)?;
-            let normalized = following_norm
-                .map(|norm| norm.forward(&residual))
-                .transpose()?;
-            Ok((residual, normalized))
+            Ok((add(&kernels.add, &hidden, &projected)?, None))
         }
     }
-}
-
-fn run_silu_mul<T: Activation>(
-    kernel: &Kernel,
-    gate: &Tensor<T>,
-    up: &Tensor<T>,
-) -> Result<Tensor<T>> {
-    let inputs = [TensorRef::new(gate)?, TensorRef::new(up)?];
-    let [output] = forja_sdk::kernel::run::<T, 1>(kernel, &inputs)?;
-    Ok(output)
-}
-
-fn run_final_norm<T: Activation>(
-    kernel: &Kernel,
-    input: &Tensor<T>,
-    weight: &Tensor<T>,
-) -> Result<Tensor<T>> {
-    let weight = weight.broadcast_as(input.shape())?;
-    let inputs = [TensorRef::new(input)?, TensorRef::new(&weight)?];
-    let [output] = forja_sdk::kernel::run::<T, 1>(kernel, &inputs)?;
-    Ok(output)
 }
 
 /// Qwen3-0.6B with a fixed 4096-token KV cache.
@@ -483,9 +382,8 @@ pub struct Qwen3<T: Activation = f32> {
     weights: QwenWeights<T>,
     variants: variants::Variants,
     caches: Vec<KvCache<T>>,
-    kernels: FusedKernels,
-    positions: Tensor<u32>,
-    activation_positions: Option<Tensor<T>>,
+    kernels: GuestKernels,
+    positions: Tensor<T>,
     #[cfg(target_family = "wasm")]
     replay: bool,
     #[cfg(target_family = "wasm")]
@@ -499,25 +397,19 @@ impl<T: Activation> Qwen3<T> {
         weights: &Weights<'_>,
         config: &forja_sdk::EngineLoadConfig,
     ) -> Result<Self> {
-        let slots = slots::Slots::new(config)?;
         let variants = variants::Variants::new(config, T::KERNEL_DTYPE)?;
         let weights = QwenWeights::<_>::load(weights, &Config)?;
         let caches = (0..LAYERS)
             .map(|_| KvCache::new(KEY_VALUE_HEADS, MAX_CONTEXT, HEAD_DIM, T::ZERO))
             .collect::<Result<Vec<_>>>()?;
-        let kernels = FusedKernels::load::<T>(slots)?;
-        let positions = Tensor::constant(&(0..MAX_CONTEXT).collect::<Vec<_>>(), &[MAX_CONTEXT])?;
-        let activation_positions = kernels
-            .has_qk_norm_rope()
-            .then(|| activation_position_table::<T>())
-            .transpose()?;
+        let kernels = GuestKernels::load::<T>()?;
+        let positions = activation_position_table::<T>()?;
         Ok(Self {
             weights,
             variants,
             caches,
             kernels,
             positions,
-            activation_positions,
             #[cfg(target_family = "wasm")]
             replay: config.replay,
             #[cfg(target_family = "wasm")]
@@ -543,15 +435,12 @@ impl<T: Activation> Qwen3<T> {
             .copied()
             .ok_or_else(|| forja_sdk::Error::loading("tokens must have rank one"))?;
         let positions = self.positions.narrow(0, 0, sequence)?;
-        let program_positions = self
-            .activation_positions
-            .as_ref()
-            .map(|positions| positions.narrow(0, 0, sequence))
-            .transpose()?;
         let hidden = self.weights.model.embed_tokens.forward(tokens)?;
-        let normalized = self.weights.model.layers[0]
-            .input_layernorm
-            .forward(&hidden)?;
+        let normalized = rms_norm(
+            &self.kernels.rms_norm,
+            &hidden,
+            self.weights.model.layers[0].input_layernorm.weight(),
+        )?;
         let start = 0.into();
         let end = sequence.into();
         let attention = self.variants.attention(sequence, 0, None)?;
@@ -562,7 +451,6 @@ impl<T: Activation> Qwen3<T> {
                 &normalized,
                 LayerPosition {
                     positions: &positions,
-                    activation_positions: program_positions.as_ref(),
                     sequence,
                     start: &start,
                     end: &end,
@@ -743,15 +631,12 @@ impl<T: Activation> Qwen3<T> {
         taps_enabled: bool,
     ) -> Result<(Tensor<T>, Vec<Tensor<f32>>)> {
         let positions = self.positions.narrow(0, start, sequence)?;
-        let program_positions = self
-            .activation_positions
-            .as_ref()
-            .map(|positions| positions.narrow(0, start, sequence))
-            .transpose()?;
         let mut hidden = self.weights.model.embed_tokens.forward(tokens)?;
-        let mut normalized = self.weights.model.layers[0]
-            .input_layernorm
-            .forward(&hidden)?;
+        let mut normalized = rms_norm(
+            &self.kernels.rms_norm,
+            &hidden,
+            self.weights.model.layers[0].input_layernorm.weight(),
+        )?;
         let mut taps = Taps::new(taps_enabled, LAYERS);
         for index in 0..LAYERS {
             let layer = &self.weights.model.layers[index];
@@ -767,7 +652,6 @@ impl<T: Activation> Qwen3<T> {
                 &normalized,
                 LayerPosition {
                     positions: &positions,
-                    activation_positions: program_positions.as_ref(),
                     sequence,
                     start,
                     end,
@@ -787,15 +671,11 @@ impl<T: Activation> Qwen3<T> {
                 normalized = value;
             }
         }
-        hidden = if self.kernels.has_final_norm() {
-            run_final_norm(
-                self.kernels.final_norm()?,
-                &hidden,
-                self.weights.model.norm.weight(),
-            )?
-        } else {
-            self.weights.model.norm.forward(&hidden)?
-        };
+        hidden = rms_norm(
+            &self.kernels.rms_norm,
+            &hidden,
+            self.weights.model.norm.weight(),
+        )?;
         if taps.enabled() {
             taps.push(Self::output(hidden.contiguous()?)?);
         }

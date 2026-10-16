@@ -1,6 +1,5 @@
 schema-version = 1
 family = "qwen3"
-default-tunings = ["residual-norm", "qk-norm-rope", "silu-mul", "final-norm"]
 
 [model]
 id = "Qwen/Qwen3-0.6B"
