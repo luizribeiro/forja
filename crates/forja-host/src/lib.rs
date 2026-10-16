@@ -4594,10 +4594,7 @@ fn template_operation_kind(operation: TemplateOp) -> forja_core::OperationKind {
 fn core_op(operation: compute::Op) -> (TemplateOp, Option<Op>) {
     match operation {
         compute::Op::Copy => concrete_template(Op::Copy),
-        compute::Op::Add => concrete_template(Op::Add),
-        compute::Op::SiluMul => concrete_template(Op::SiluMul),
         compute::Op::RmsNorm(eps) => concrete_template(Op::RmsNorm { eps }),
-        compute::Op::Softmax => concrete_template(Op::Softmax),
         compute::Op::Argmax => concrete_template(Op::Argmax),
         compute::Op::TopK(config) => concrete_template(Op::TopK {
             k: config.k,
@@ -5619,11 +5616,8 @@ mod tests {
         .unwrap();
         host.dispatch(
             &commands,
-            compute::Op::Add,
-            &[
-                Resource::new_borrow(first.rep()),
-                Resource::new_borrow(second.rep()),
-            ],
+            compute::Op::Copy,
+            &[Resource::new_borrow(first.rep())],
             &Resource::new_borrow(output.rep()),
         )
         .unwrap();
@@ -6871,33 +6865,12 @@ mod tests {
                 (compute::Dtype::F32, vec![7]),
             ),
             (
-                compute::Op::Add,
-                vec![
-                    (compute::Dtype::F16, vec![7]),
-                    (compute::Dtype::F16, vec![7]),
-                ],
-                (compute::Dtype::F16, vec![7]),
-            ),
-            (
-                compute::Op::SiluMul,
-                vec![
-                    (compute::Dtype::Bf16, vec![33]),
-                    (compute::Dtype::Bf16, vec![33]),
-                ],
-                (compute::Dtype::Bf16, vec![33]),
-            ),
-            (
                 compute::Op::RmsNorm(0.00001),
                 vec![
                     (compute::Dtype::F32, vec![7, 1024]),
                     (compute::Dtype::F32, vec![1024]),
                 ],
                 (compute::Dtype::F32, vec![7, 1024]),
-            ),
-            (
-                compute::Op::Softmax,
-                vec![(compute::Dtype::F32, vec![7, 33])],
-                (compute::Dtype::F32, vec![7, 33]),
             ),
             (
                 compute::Op::Argmax,

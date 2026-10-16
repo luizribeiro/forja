@@ -145,10 +145,7 @@ interface compute {
 
   variant op {
     copy,
-    add,
-    silu-mul,
     rms-norm(f32),
-    softmax,
     argmax,
     top-k(top-k-cfg),
     sample(sample-cfg),

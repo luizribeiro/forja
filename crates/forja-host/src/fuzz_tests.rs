@@ -153,6 +153,25 @@ where
     let graph_output = host.alloc(dtype, &shape).unwrap();
     let fresh_scratch = host.alloc(dtype, &shape).unwrap();
     let fresh_output = host.alloc(dtype, &shape).unwrap();
+    let add = host
+        .create_kernel(
+            compute::ProgramSource {
+                kind: compute::ProgramKind::Map,
+                insts: vec![
+                    compute::Inst::Input(0),
+                    compute::Inst::Input(1),
+                    compute::Inst::Binary((compute::Binop::Add, 0, 1)),
+                ],
+                outputs: vec![(0, 2)],
+            },
+            compute::KernelSignature {
+                rank: u8::try_from(rank).unwrap(),
+                inputs: vec![dtype, dtype],
+                outputs: vec![dtype],
+                scalars: 0,
+            },
+        )
+        .unwrap();
     let params = host
         .params(vec![compute::ParamRange { lo: 0, hi: 10 }])
         .unwrap();
@@ -166,11 +185,11 @@ where
     let commands = host.command_list().unwrap();
     host.dispatch(&commands, compute::Op::Copy, &[left_view], &scratch_view)
         .unwrap();
-    host.dispatch(
+    host.dispatch_kernel(
         &commands,
-        compute::Op::Add,
+        &add,
         &[scratch_view, right_view],
-        &output_view,
+        &[Resource::new_borrow(output_view.rep())],
     )
     .unwrap();
     let graph = host.create_graph(commands).unwrap();
@@ -190,11 +209,11 @@ where
         let fresh = host.command_list().unwrap();
         host.dispatch(&fresh, compute::Op::Copy, &[left_view], &scratch_view)
             .unwrap();
-        host.dispatch(
+        host.dispatch_kernel(
             &fresh,
-            compute::Op::Add,
+            &add,
             &[scratch_view, right_view],
-            &output_view,
+            &[Resource::new_borrow(output_view.rep())],
         )
         .unwrap();
         host.prepare_submit(fresh).unwrap().run().await.unwrap();
@@ -1002,10 +1021,7 @@ fn canonical_actions() -> Vec<Action> {
     actions.push(Action::NewList);
     actions.extend([
         dispatch(0, compute::Op::Copy, &[0], 1),
-        dispatch(0, compute::Op::Add, &[2, 3], 4),
-        dispatch(0, compute::Op::SiluMul, &[5, 6], 7),
         dispatch(0, compute::Op::RmsNorm(0.00001), &[8, 9], 10),
-        dispatch(0, compute::Op::Softmax, &[11], 12),
         dispatch(
             0,
             compute::Op::Rope(compute::RopeCfg { theta: 10_000.0 }),
@@ -1155,17 +1171,14 @@ fn random_view(values: &mut Values) -> compute::ViewOp {
 }
 
 fn random_op(values: &mut Values) -> compute::Op {
-    match values.index(9) {
+    match values.index(6) {
         0 => compute::Op::Copy,
-        1 => compute::Op::Add,
-        2 => compute::Op::SiluMul,
-        3 => compute::Op::RmsNorm(random_config(values)),
-        4 => compute::Op::Softmax,
-        5 => compute::Op::Rope(compute::RopeCfg {
+        1 => compute::Op::RmsNorm(random_config(values)),
+        2 => compute::Op::Rope(compute::RopeCfg {
             theta: random_config(values),
         }),
-        6 => compute::Op::Embed,
-        7 => compute::Op::Matmul,
+        3 => compute::Op::Embed,
+        4 => compute::Op::Matmul,
         _ => compute::Op::Sdpa(compute::SdpaCfg {
             scale: random_config(values),
             causal: values.next().is_multiple_of(2),
