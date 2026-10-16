@@ -205,6 +205,11 @@ fn projected_cache_composition_matches_the_trusted_operation() {
 }
 
 #[test]
+fn guest_softmax_matches_the_trusted_operation() {
+    support::guest_softmax_matches_trusted_operation();
+}
+
+#[test]
 fn moe_helpers_route_and_combine_experts() {
     use forja_sdk::{Tensor, nn};
 

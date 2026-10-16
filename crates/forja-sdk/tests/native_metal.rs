@@ -89,6 +89,12 @@ fn metal_projected_cache_composition_matches_trusted_operation() {
     support::projected_cache_composition_matches_trusted_operation();
 }
 
+#[test]
+fn metal_guest_softmax_matches_trusted_operation() {
+    set_native_device(NativeDevice::Metal);
+    support::guest_softmax_matches_trusted_operation();
+}
+
 #[allow(clippy::cast_precision_loss)]
 fn interleaved_rope_reference(
     values: &[f32],

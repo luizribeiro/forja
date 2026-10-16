@@ -204,6 +204,17 @@ pub fn projected_cache_composition_matches_trusted_operation() {
     }
 }
 
+pub fn guest_softmax_matches_trusted_operation() {
+    let values = (0..7 * 33)
+        .map(|index| f32::from(u16::try_from(index).unwrap()) / 32.0 - 2.0)
+        .collect::<Vec<_>>();
+    let input = Tensor::from_slice(&values, &[7, 33]).unwrap();
+    let expected = input.softmax_last_dim().unwrap();
+    let kernel = forja_sdk::nn::blocks::softmax_kernel(forja_sdk::DType::F32).unwrap();
+    let actual = forja_sdk::nn::blocks::softmax(&kernel, &input).unwrap();
+    assert_f32_values_agree(&expected.to_vec().unwrap(), &actual.to_vec().unwrap()).unwrap();
+}
+
 pub fn neural_network_modules_match_cpu() {
     let input_values = values(7 * 1024, 10);
     let weight_values = values(2048 * 1024, 11);

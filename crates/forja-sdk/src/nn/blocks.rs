@@ -14,6 +14,25 @@ pub const DEFAULT_PREFILL_CHUNK: u32 = 512;
 
 const MIN_PREFILL_BUCKET: u32 = 16;
 
+/// Builds the row program for stable softmax.
+///
+/// # Errors
+///
+/// Returns an error when the kernel definition is refused.
+pub fn softmax_kernel(dtype: DType) -> Result<Kernel> {
+    softmax_rows_program(2, &[dtype], &[dtype])
+}
+
+/// Applies stable softmax over the final tensor dimension.
+///
+/// # Errors
+///
+/// Returns an error for an incompatible tensor or a refused kernel dispatch.
+pub fn softmax<T: FloatElement>(kernel: &Kernel, input: &Tensor<T>) -> Result<Tensor<T>> {
+    let [output] = crate::kernel::run::<T, 1>(kernel, &[TensorRef::new(input)?])?;
+    Ok(output)
+}
+
 /// Builds the row program for RMS normalization.
 ///
 /// # Errors
@@ -318,6 +337,12 @@ fn rms_norm_rows(
 ) -> crate::kernel::Row {
     let inverse_rms = (input * input).row_mean() + epsilon;
     input * inverse_rms.rsqrt() * weight
+}
+
+#[crate::kernel::kernel(row)]
+fn softmax_rows(input: crate::kernel::Row) -> crate::kernel::Row {
+    let exponent = (input - input.row_max()).exp();
+    exponent / exponent.row_sum()
 }
 
 #[allow(clippy::too_many_arguments)]
