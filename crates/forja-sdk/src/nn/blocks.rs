@@ -3,7 +3,7 @@
 #[cfg(target_family = "wasm")]
 use crate::SamplingParams;
 use crate::{
-    DType, Dim, Element, Error, FloatElement, Graph, Param, Result, Tensor,
+    DType, Dim, Element, Error, FloatElement, Graph, Param, Result, Slice, Tensor,
     kernel::{Kernel, TensorRef},
 };
 
@@ -146,6 +146,158 @@ pub fn qk_norm_rope<T: FloatElement>(
     Ok(output)
 }
 
+/// Pairing convention for rotary position embeddings.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RopeStyle {
+    /// Pairs the lower and upper halves of the rotary prefix.
+    HalfSplit,
+    /// Pairs adjacent even and odd elements of the rotary prefix.
+    Interleaved,
+}
+
+/// Guest rotary-embedding configuration.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RopeConfig {
+    /// Element pairing convention.
+    pub style: RopeStyle,
+    /// Rotated prefix width, or the full head width when omitted.
+    pub rotary_dim: Option<u32>,
+    /// Frequency base.
+    pub theta: f32,
+}
+
+impl RopeConfig {
+    /// Configures full-width rotary embeddings.
+    #[must_use]
+    pub const fn new(style: RopeStyle, theta: f32) -> Self {
+        Self {
+            style,
+            rotary_dim: None,
+            theta,
+        }
+    }
+
+    /// Restricts rotation to a prefix of each head.
+    #[must_use]
+    pub const fn with_rotary_dim(mut self, rotary_dim: u32) -> Self {
+        self.rotary_dim = Some(rotary_dim);
+        self
+    }
+
+    fn validate(self, head_dim: u32) -> Result<u32> {
+        let rotary_dim = self.rotary_dim.unwrap_or(head_dim);
+        if rotary_dim == 0 || !rotary_dim.is_multiple_of(2) || rotary_dim > head_dim {
+            return Err(Error::loading(
+                "rotary width must be positive, even, and within the head width",
+            ));
+        }
+        if !self.theta.is_finite() || self.theta <= 0.0 {
+            return Err(Error::loading("rotary theta must be finite and positive"));
+        }
+        Ok(rotary_dim)
+    }
+}
+
+/// Builds a guest Map program for rotary position embeddings.
+///
+/// # Errors
+///
+/// Returns an error for invalid head or rotary widths, theta, or kernel definition.
+#[allow(clippy::cast_precision_loss)]
+pub fn rope_kernel(dtype: DType, head_dim: u32, config: RopeConfig) -> Result<Kernel> {
+    let rotary_dim = config.validate(head_dim)?;
+    rope_program::rope_pairs_program(3, &[dtype; 3], &[dtype; 2], rotary_dim as f32, config.theta)
+}
+
+/// Applies a guest rotary Map program to a sequence-major head tensor.
+///
+/// # Errors
+///
+/// Returns an error for incompatible shapes or configuration, or a refused view, copy, or kernel
+/// dispatch.
+pub fn rope<T: FloatElement>(
+    kernel: &Kernel,
+    input: &Tensor<T>,
+    positions: &Tensor<T>,
+    config: RopeConfig,
+) -> Result<Tensor<T>> {
+    let [sequence, heads, head_dim]: [u32; 3] = input
+        .shape()
+        .try_into()
+        .map_err(|_| Error::loading("rotary input must have rank three"))?;
+    if positions.shape() != [sequence] {
+        return Err(Error::loading(
+            "rotary positions must match the sequence width",
+        ));
+    }
+    let rotary_dim = config.validate(head_dim)?;
+    let mut output = Tensor::<T>::empty(input.shape().to_vec())?;
+    if rotary_dim < head_dim {
+        input.copy_into(&mut output)?;
+    }
+    let (input_first, input_second) = rotary_pair_views(input, config.style, rotary_dim)?;
+    let pair_shape = [sequence, heads, rotary_dim / 2];
+    let positions = positions
+        .reshape(&[sequence, 1, 1])?
+        .broadcast_as(&pair_shape)?;
+    let (output_first, output_second, copy_outputs) = match config.style {
+        RopeStyle::HalfSplit => {
+            let (first, second) = rotary_pair_views(&output, config.style, rotary_dim)?;
+            (first, second, false)
+        }
+        RopeStyle::Interleaved => (
+            Tensor::<T>::empty(pair_shape.to_vec())?,
+            Tensor::<T>::empty(pair_shape.to_vec())?,
+            true,
+        ),
+    };
+    crate::kernel::run_into(
+        kernel,
+        &[
+            TensorRef::new(&input_first)?,
+            TensorRef::new(&input_second)?,
+            TensorRef::new(&positions)?,
+        ],
+        &[
+            TensorRef::new(&output_first)?,
+            TensorRef::new(&output_second)?,
+        ],
+    )?;
+    if copy_outputs {
+        let (mut first, mut second) = rotary_pair_views(&output, config.style, rotary_dim)?;
+        output_first.copy_into(&mut first)?;
+        output_second.copy_into(&mut second)?;
+    }
+    Ok(output)
+}
+
+fn rotary_pair_views<T: Element>(
+    tensor: &Tensor<T>,
+    style: RopeStyle,
+    rotary_dim: u32,
+) -> Result<(Tensor<T>, Tensor<T>)> {
+    let [sequence, heads, _]: [u32; 3] = tensor
+        .shape()
+        .try_into()
+        .map_err(|_| Error::loading("rotary tensor must have rank three"))?;
+    let half = rotary_dim / 2;
+    match style {
+        RopeStyle::HalfSplit => Ok((tensor.narrow(2, 0, half)?, tensor.narrow(2, half, half)?)),
+        RopeStyle::Interleaved => Ok((
+            tensor.slice(&[
+                Slice::new(0, sequence, 1)?,
+                Slice::new(0, heads, 1)?,
+                Slice::new(0, half, 2)?,
+            ])?,
+            tensor.slice(&[
+                Slice::new(0, sequence, 1)?,
+                Slice::new(0, heads, 1)?,
+                Slice::new(1, half, 2)?,
+            ])?,
+        )),
+    }
+}
+
 #[crate::kernel::kernel(row)]
 fn residual_norm_rows(
     residual: crate::kernel::Row,
@@ -192,6 +344,26 @@ mod qk_norm_rope_program {
         (
             normalized_lo * cosine - normalized_hi * sine,
             normalized_hi * cosine + normalized_lo * sine,
+        )
+    }
+}
+
+mod rope_program {
+    #[crate::kernel::kernel(map)]
+    pub(super) fn rope_pairs(
+        first: crate::kernel::Elem,
+        second: crate::kernel::Elem,
+        positions: crate::kernel::Elem,
+        rotary_dim: f32,
+        theta: f32,
+    ) -> (crate::kernel::Elem, crate::kernel::Elem) {
+        let exponent = crate::kernel::index(-1) as f32 * (-2.0 / rotary_dim);
+        let angle = positions * theta.powf(exponent);
+        let cosine = angle.cos();
+        let sine = angle.sin();
+        (
+            first * cosine - second * sine,
+            second * cosine + first * sine,
         )
     }
 }

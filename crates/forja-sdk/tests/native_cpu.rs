@@ -150,6 +150,56 @@ fn weighted_gathered_projection_routes_through_the_sdk() {
 }
 
 #[test]
+fn guest_rope_supports_both_styles_and_partial_prefixes() {
+    use forja_sdk::{
+        DType, Tensor,
+        nn::blocks::{RopeConfig, RopeStyle, rope, rope_kernel},
+    };
+
+    let input = Tensor::from_slice(&[1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0], &[1, 1, 6]).unwrap();
+    let positions = Tensor::from_slice(&[1.0_f32], &[1]).unwrap();
+    let half_config = RopeConfig::new(RopeStyle::HalfSplit, 10.0);
+    let half = rope(
+        &rope_kernel(DType::F32, 6, half_config).unwrap(),
+        &input,
+        &positions,
+        half_config,
+    )
+    .unwrap();
+    let trusted = input
+        .rope(&Tensor::from_slice(&[1_u32], &[1]).unwrap(), 10.0)
+        .unwrap()
+        .to_vec()
+        .unwrap();
+    forja_testing::assert_f32_values_agree(&trusted, &half.to_vec().unwrap()).unwrap();
+
+    let partial = RopeConfig::new(RopeStyle::Interleaved, 10.0).with_rotary_dim(4);
+    let actual = rope(
+        &rope_kernel(DType::F32, 6, partial).unwrap(),
+        &input,
+        &positions,
+        partial,
+    )
+    .unwrap()
+    .to_vec()
+    .unwrap();
+    let angles = [1.0_f32, 10.0_f32.powf(-0.5)];
+    let input_values = input.to_vec().unwrap();
+    let mut expected = [0.0; 6];
+    for (pair, angle) in angles.into_iter().enumerate() {
+        let first = input_values[pair * 2];
+        let second = input_values[pair * 2 + 1];
+        expected[pair * 2] = first * angle.cos() - second * angle.sin();
+        expected[pair * 2 + 1] = second * angle.cos() + first * angle.sin();
+    }
+    expected[4..].copy_from_slice(&[5.0, 6.0]);
+    forja_testing::assert_f32_values_agree(&expected[..4], &actual[..4]).unwrap();
+    assert_eq!(actual[4..], expected[4..]);
+
+    assert!(rope_kernel(DType::F32, 6, partial.with_rotary_dim(5)).is_err());
+}
+
+#[test]
 fn moe_helpers_route_and_combine_experts() {
     use forja_sdk::{Tensor, nn};
 

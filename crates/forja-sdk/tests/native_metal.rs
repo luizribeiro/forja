@@ -29,6 +29,83 @@ fn metal_views_round_trip_non_contiguous_values() {
 }
 
 #[test]
+fn metal_guest_rope_covers_styles_and_partial_prefixes() {
+    use forja_sdk::nn::blocks::{RopeConfig, RopeStyle, rope, rope_kernel};
+
+    set_native_device(NativeDevice::Metal);
+    for (style, head_dim, rotary_dim) in [
+        (RopeStyle::HalfSplit, 6, None),
+        (RopeStyle::Interleaved, 7, Some(6)),
+    ] {
+        let config = RopeConfig {
+            style,
+            rotary_dim,
+            theta: 10_000.0,
+        };
+        let values = (0..2 * head_dim)
+            .map(|index| f32::from(u16::try_from(index).unwrap()) / 8.0 - 0.5)
+            .collect::<Vec<_>>();
+        let input = Tensor::from_slice(&values, &[2, 1, head_dim]).unwrap();
+        let metal = rope(
+            &rope_kernel(DType::F32, head_dim, config).unwrap(),
+            &input,
+            &Tensor::from_slice(&[3.0_f32, 7.0], &[2]).unwrap(),
+            config,
+        )
+        .unwrap_or_else(|error| panic!("{style:?}: {error}"))
+        .to_vec()
+        .unwrap();
+        let expected = match style {
+            RopeStyle::HalfSplit => input
+                .rope(
+                    &Tensor::from_slice(&[3_u32, 7], &[2]).unwrap(),
+                    config.theta,
+                )
+                .unwrap()
+                .to_vec()
+                .unwrap(),
+            RopeStyle::Interleaved => interleaved_rope_reference(
+                &values,
+                2,
+                head_dim,
+                rotary_dim.unwrap(),
+                &[3.0, 7.0],
+                config.theta,
+            ),
+        };
+        forja_testing::assert_f32_values_agree(&expected, &metal).unwrap();
+        if let Some(rotary_dim) = rotary_dim {
+            for row in 0..2 {
+                let tail = usize::try_from(row * head_dim + rotary_dim).unwrap();
+                assert_eq!(metal[tail].to_bits(), values[tail].to_bits());
+            }
+        }
+    }
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn interleaved_rope_reference(
+    values: &[f32],
+    rows: u32,
+    head_dim: u32,
+    rotary_dim: u32,
+    positions: &[f32],
+    theta: f32,
+) -> Vec<f32> {
+    let mut output = values.to_vec();
+    for row in 0..rows {
+        for pair in 0..rotary_dim / 2 {
+            let index = usize::try_from(row * head_dim + pair * 2).unwrap();
+            let exponent = -2.0 * pair as f32 / rotary_dim as f32;
+            let angle = positions[usize::try_from(row).unwrap()] * theta.powf(exponent);
+            output[index] = values[index] * angle.cos() - values[index + 1] * angle.sin();
+            output[index + 1] = values[index + 1] * angle.cos() + values[index] * angle.sin();
+        }
+    }
+    output
+}
+
+#[test]
 fn metal_structured_ops_match_the_cpu_backend() {
     set_native_device(NativeDevice::Metal);
     support::matmul_rope_embedding_match_cpu();
