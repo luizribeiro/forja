@@ -18,7 +18,7 @@ use proptest::{
     test_runner::{RngSeed, TestCaseError},
 };
 
-use crate::common::{GROSS_REGRESSION_RATIO, comparative_gpu_times, report_intervals};
+use crate::common::{D5_RATIO, comparative_gpu_times, report_intervals};
 
 proptest! {
     #![proptest_config(ProptestConfig {
@@ -350,7 +350,7 @@ fn run_small_program<B: Backend>(
 }
 
 #[test]
-fn representative_maps_match_without_gross_kernel_regression() {
+fn metal_representative_maps_meet_d5_bar() {
     let backend = MetalBackend::new().unwrap();
     let timings = [
         binary_timing(
@@ -381,13 +381,13 @@ fn representative_maps_match_without_gross_kernel_regression() {
             timing.trusted.as_nanos(),
             timing.program.as_nanos()
         );
-        if ratio > GROSS_REGRESSION_RATIO {
+        if ratio > D5_RATIO {
             failures.push(format!("{}={ratio:.3}", timing.name));
         }
     }
     assert!(
         failures.is_empty(),
-        "map ratios exceeded {GROSS_REGRESSION_RATIO}: {failures:?}"
+        "map ratios exceeded the D5 bar {D5_RATIO}: {failures:?}"
     );
 }
 

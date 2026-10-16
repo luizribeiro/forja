@@ -19,7 +19,7 @@ use proptest::{
     test_runner::{FileFailurePersistence, RngSeed, TestCaseError},
 };
 
-use crate::common::{GROSS_REGRESSION_RATIO, comparative_gpu_times, report_intervals};
+use crate::common::{D5_RATIO, GROSS_REGRESSION_RATIO, comparative_gpu_times, report_intervals};
 
 proptest! {
     #![proptest_config(general_row_program_config())]
@@ -286,9 +286,14 @@ fn extrema_cancellation_stays_inside_a_narrow_interval() {
 }
 
 #[test]
-fn representative_rows_match_without_gross_kernel_regression() {
+fn metal_representative_rows_meet_d5_bar() {
     let backend = MetalBackend::new().unwrap();
-    let timings = [rms_timing(&backend), softmax_timing(&backend)];
+    let timings = [
+        rms_timing(&backend),
+        softmax_timing(&backend, "softmax-attention-4096", &[16, 4_096], 3),
+        softmax_timing(&backend, "softmax-attention-32768", &[32, 32_768], 4),
+        softmax_timing(&backend, "softmax-vocab-151936", &[1, 151_936], 5),
+    ];
     eprintln!("operation,trusted_ns,program_ns,ratio");
     let mut failures = Vec::new();
     for timing in timings {
@@ -299,13 +304,13 @@ fn representative_rows_match_without_gross_kernel_regression() {
             timing.trusted.as_nanos(),
             timing.program.as_nanos()
         );
-        if ratio > GROSS_REGRESSION_RATIO {
+        if ratio > D5_RATIO {
             failures.push(format!("{}={ratio:.3}", timing.name));
         }
     }
     assert!(
         failures.is_empty(),
-        "row ratios exceeded {GROSS_REGRESSION_RATIO}: {failures:?}"
+        "row ratios exceeded the D5 bar {D5_RATIO}: {failures:?}"
     );
 }
 
@@ -493,11 +498,10 @@ fn rms_timing(backend: &MetalBackend) -> Timing {
     }
 }
 
-fn softmax_timing(backend: &MetalBackend) -> Timing {
-    let shape = [128, 1024];
-    let input = initialized_f32(backend, &shape, 3);
-    let expected = backend.alloc(DType::F32, &shape).unwrap();
-    let actual = backend.alloc(DType::F32, &shape).unwrap();
+fn softmax_timing(backend: &MetalBackend, name: &'static str, shape: &[u32], seed: u64) -> Timing {
+    let input = initialized_f32(backend, shape, seed);
+    let expected = backend.alloc(DType::F32, shape).unwrap();
+    let actual = backend.alloc(DType::F32, shape).unwrap();
     let program = softmax().validate().unwrap();
     let _prepared =
         forja_testing::prepare_program(backend, &program, &[&input], &[&actual]).unwrap();
@@ -518,7 +522,7 @@ fn softmax_timing(backend: &MetalBackend) -> Timing {
         || program_commands(backend, &program, &[&input], &[&actual]),
     );
     Timing {
-        name: "softmax",
+        name,
         trusted,
         program,
     }

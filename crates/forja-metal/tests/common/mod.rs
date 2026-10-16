@@ -5,6 +5,7 @@ use forja_metal::MetalBackend;
 use forja_testing::IntervalReport;
 
 pub const GROSS_REGRESSION_RATIO: f64 = 1.5;
+pub const D5_RATIO: f64 = 1.05;
 
 pub fn report_intervals(report: IntervalReport) {
     eprintln!(
