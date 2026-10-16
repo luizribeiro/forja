@@ -135,13 +135,13 @@ impl Epilogue {
         output_dtype: DType,
     ) -> Result<Self> {
         let definition = program.definition(usize::from(rank))?;
-        let handle = Rc::new(sys::create_epilogue(
+        let handle = crate::graph::cached_epilogue(
             definition,
             accumulator_count,
             rank,
-            extra_dtypes,
+            extra_dtypes.to_vec(),
             output_dtype,
-        )?);
+        )?;
         Ok(Self {
             handle,
             accumulator_count,

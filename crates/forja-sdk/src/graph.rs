@@ -11,6 +11,7 @@ use crate::{Element, Result, Tensor, sys};
 thread_local! {
     static CURRENT: RefCell<Option<Recording>> = const { RefCell::new(None) };
     static KERNELS: RefCell<VecDeque<CachedKernel>> = const { RefCell::new(VecDeque::new()) };
+    static EPILOGUES: RefCell<VecDeque<CachedEpilogue>> = const { RefCell::new(VecDeque::new()) };
 }
 
 static NEXT_PARAM_ID: AtomicU64 = AtomicU64::new(0);
@@ -363,6 +364,20 @@ struct CachedKernel {
     kernel: Rc<sys::Kernel>,
 }
 
+#[derive(Eq, PartialEq)]
+struct EpilogueKey {
+    source: Vec<u8>,
+    accumulator_count: u8,
+    rank: u8,
+    extras: Vec<sys::DType>,
+    output: sys::DType,
+}
+
+struct CachedEpilogue {
+    key: EpilogueKey,
+    epilogue: Rc<sys::Epilogue>,
+}
+
 pub(crate) fn record(
     operation: sys::Op,
     inputs: &[&sys::Handle],
@@ -510,6 +525,47 @@ pub(crate) fn record_epilogue(
     })
 }
 
+pub(crate) fn cached_epilogue(
+    program: sys::Program,
+    accumulator_count: u8,
+    rank: u8,
+    extras: Vec<sys::DType>,
+    output: sys::DType,
+) -> Result<Rc<sys::Epilogue>> {
+    let key = EpilogueKey {
+        source: program_bytes(&program),
+        accumulator_count,
+        rank,
+        extras,
+        output,
+    };
+    EPILOGUES.with(|epilogues| {
+        let mut epilogues = epilogues.borrow_mut();
+        if let Some(index) = epilogues.iter().position(|entry| entry.key == key)
+            && let Some(entry) = epilogues.remove(index)
+        {
+            let epilogue = Rc::clone(&entry.epilogue);
+            epilogues.push_back(entry);
+            return Ok(epilogue);
+        }
+        if epilogues.len() == KERNEL_CACHE_CAPACITY {
+            epilogues.pop_front();
+        }
+        let epilogue = Rc::new(sys::create_epilogue(
+            program,
+            accumulator_count,
+            rank,
+            &key.extras,
+            output,
+        )?);
+        epilogues.push_back(CachedEpilogue {
+            key,
+            epilogue: Rc::clone(&epilogue),
+        });
+        Ok(epilogue)
+    })
+}
+
 fn cached_kernel(
     program: sys::Program,
     rank: u8,
@@ -619,6 +675,7 @@ fn encode_axis(bytes: &mut Vec<u8>, tag: u8, axis: u8) {
 #[cfg(feature = "native")]
 pub(crate) fn clear_kernel_cache() {
     KERNELS.with(|kernels| kernels.borrow_mut().clear());
+    EPILOGUES.with(|epilogues| epilogues.borrow_mut().clear());
 }
 
 #[cfg(all(test, feature = "native"))]
@@ -667,6 +724,32 @@ mod tests {
             .unwrap();
         }
         KERNELS.with(|kernels| assert_eq!(kernels.borrow().len(), KERNEL_CACHE_CAPACITY));
+    }
+
+    #[test]
+    fn epilogue_cache_keys_accumulator_count_and_signature() {
+        clear_kernel_cache();
+        let first = cached_epilogue(program(1.0), 1, 2, vec![], sys::DType::F32).unwrap();
+        let repeated = cached_epilogue(program(1.0), 1, 2, vec![], sys::DType::F32).unwrap();
+        let different = cached_epilogue(
+            sys::Program {
+                kind: ProgramKind::Map,
+                instructions: vec![
+                    sys::ProgramInst::Input(0),
+                    sys::ProgramInst::Input(1),
+                    sys::ProgramInst::Binary(crate::program::BinaryOp::Add, 0, 1),
+                ],
+                outputs: vec![(0, 2)],
+            },
+            2,
+            2,
+            vec![],
+            sys::DType::F32,
+        )
+        .unwrap();
+
+        assert!(Rc::ptr_eq(&first, &repeated));
+        assert!(!Rc::ptr_eq(&first, &different));
     }
 
     #[test]
