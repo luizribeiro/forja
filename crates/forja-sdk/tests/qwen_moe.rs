@@ -96,7 +96,7 @@ impl QwenMoe {
 
 #[test]
 #[ignore = "requires FORJA_MODELS and runs in the pre-push hook"]
-fn qwen_layer_zero_moe_matches_mlx() -> Result<(), Box<dyn Error>> {
+fn metal_qwen_layer_zero_moe_matches_mlx() -> Result<(), Box<dyn Error>> {
     set_native_device(NativeDevice::Metal);
     let model = model_path()?;
     let moe = QwenMoe::load(&model.join("model-00001-of-00004.safetensors"))?;
@@ -125,7 +125,7 @@ fn qwen_layer_zero_moe_matches_mlx() -> Result<(), Box<dyn Error>> {
 
 #[test]
 #[ignore = "requires FORJA_MODELS and runs in the pre-push hook"]
-fn qwen_layer_zero_moe_synchronized_timing() -> Result<(), Box<dyn Error>> {
+fn metal_qwen_layer_zero_moe_synchronized_timing() -> Result<(), Box<dyn Error>> {
     set_native_device(NativeDevice::Metal);
     let model = model_path()?;
     let moe = QwenMoe::load(&model.join("model-00001-of-00004.safetensors"))?;

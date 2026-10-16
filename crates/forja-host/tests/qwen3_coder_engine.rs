@@ -24,7 +24,7 @@ const HIDDEN_TOLERANCE: f64 = 1.0e-5;
 #[cfg(target_os = "macos")]
 #[tokio::test]
 #[ignore = "requires FORJA_MODELS and runs in the pre-push hook"]
-async fn hidden_states_and_routing_match_same_byte_reference() -> Result<(), Box<dyn Error>> {
+async fn metal_hidden_states_and_routing_match_same_byte_reference() -> Result<(), Box<dyn Error>> {
     let root = model_root()?;
     let fixtures = FixtureDirectory::open(root.join("golden/Qwen3-Coder-30B-A3B-Instruct-4bit"))?;
     let fixture = fixtures
@@ -132,7 +132,7 @@ async fn hidden_states_and_routing_match_same_byte_reference() -> Result<(), Box
 #[cfg(target_os = "macos")]
 #[tokio::test]
 #[ignore = "requires FORJA_MODELS and runs in the pre-push hook"]
-async fn replay_matches_lazy_greedy_and_sampled_decode() -> Result<(), Box<dyn Error>> {
+async fn metal_replay_matches_lazy_greedy_and_sampled_decode() -> Result<(), Box<dyn Error>> {
     let replay = decode_outputs(true).await?;
     let lazy = decode_outputs(false).await?;
     assert_eq!(replay, lazy);

@@ -29,7 +29,7 @@ const REPLAY_LIMITS: Limits = Limits::new(
 #[test]
 #[cfg(target_os = "macos")]
 #[ignore = "requires FORJA_MODELS and runs in the pre-push hook"]
-fn first_layer_matches_transformers() -> Result<(), Box<dyn Error>> {
+fn metal_first_layer_matches_transformers() -> Result<(), Box<dyn Error>> {
     forja_sdk::set_native_device(forja_sdk::NativeDevice::Metal);
     let (fixture, mut engine, tokens) = single_token_case()?;
     let actual = engine.first_layer(&tokens)?.to_vec()?;
@@ -48,7 +48,7 @@ fn first_layer_matches_transformers() -> Result<(), Box<dyn Error>> {
 #[test]
 #[cfg(target_os = "macos")]
 #[ignore = "requires FORJA_MODELS and runs in the pre-push hook"]
-fn all_layers_match_transformers() -> Result<(), Box<dyn Error>> {
+fn metal_all_layers_match_transformers() -> Result<(), Box<dyn Error>> {
     forja_sdk::set_native_device(forja_sdk::NativeDevice::Metal);
     let (fixture, mut engine, tokens) = single_token_case()?;
     let output = engine.step(forja_sdk::StepInput {
@@ -76,7 +76,7 @@ fn all_layers_match_transformers() -> Result<(), Box<dyn Error>> {
 #[test]
 #[cfg(target_os = "macos")]
 #[ignore = "requires FORJA_MODELS and runs in the pre-push hook"]
-fn chunked_prefill_matches_single_pass_and_transformers() -> Result<(), Box<dyn Error>> {
+fn metal_chunked_prefill_matches_single_pass_and_transformers() -> Result<(), Box<dyn Error>> {
     forja_sdk::set_native_device(forja_sdk::NativeDevice::Metal);
     let (fixture, mut engine, tokens) = prompt_case("short-english", 7)?;
     let single = engine.step(forja_sdk::StepInput {

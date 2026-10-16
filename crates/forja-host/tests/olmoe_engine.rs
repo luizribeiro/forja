@@ -103,7 +103,7 @@ async fn metal_prompt_hidden_states_and_routing_match_transformers() -> Result<(
 #[cfg(target_os = "macos")]
 #[tokio::test]
 #[ignore = "requires FORJA_MODELS and runs in the pre-push hook"]
-async fn replay_matches_lazy_decode() -> Result<(), Box<dyn Error>> {
+async fn metal_replay_matches_lazy_decode() -> Result<(), Box<dyn Error>> {
     let weights = model_root()?.join("OLMoE-1B-7B-0924/model.safetensors.index.json");
     let replay = decode_logits(&weights, true).await?;
     let lazy = decode_logits(&weights, false).await?;
