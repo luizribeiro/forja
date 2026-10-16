@@ -1,10 +1,15 @@
 [package]
 name = "golden-fixtures"
+autotests = false
 edition.workspace = true
 license.workspace = true
 publish = false
 rust-version.workspace = true
 version.workspace = true
+
+[[test]]
+name = "fixtures"
+path = "tests/fixtures/main.rs"
 
 [dependencies]
 safetensors.workspace = true
