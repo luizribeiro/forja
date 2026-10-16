@@ -14,6 +14,12 @@ The port implements Qwen3-Coder GQA, QK normalization, RoPE, sparse expert routi
 quantized embeddings and grouped quantized expert projections. Kernel choices are profile data and
 the same component supports replay and lazy execution as runtime strategies.
 
+Q/K RMS normalization and RoPE run as one guest Row program in this engine. Its different reduction
+grouping and program-computed precise trigonometry remain within the quantized model's verification
+tolerance: Python and Rust layer checks pass and all 32 teacher-forced and free-running tokens match.
+The trusted RMSNorm and RoPE operations remain available for OLMoE, whose near-tie routing is
+sensitive to those f32 rounding differences; the Coder does not depend on the trusted variants.
+
 The profiled decode graph eagerly compiles two epilogue libraries and three pipeline
 specializations. The prefill graph compiles one library and one specialization. Replay requires
 zero compile fallbacks in both modes.

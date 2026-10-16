@@ -11,9 +11,15 @@ forja bench --engine olmoe-1b-7b-0924.metal-apple-m3-ultra.bf16 --against
 
 The port implements grouped-query attention, rotary embeddings, sparse expert routing and grouped
 expert projections. Addition, SiLU multiplication and router softmax are built by the guest, while
-the profile carries the verified attention, dense projection and MoE kernel picks. RMS normalization
-and RoPE retain their host paths because guest substitution perturbed near-tie expert routing beyond
-the accepted end-to-end tolerance.
+the profile carries the verified attention, dense projection and MoE kernel picks. Q/K RMS
+normalization and RoPE retain their host paths. Substituting either one independently changed f32
+rounding enough to flip a valid near-tie expert route and raise the maximum final-hidden-state
+relative error to about 0.056, above the 0.05 acceptance limit. The generic guest Row pipeline can
+use a different threadgroup reduction grouping, while guest RoPE computes inverse frequencies and precise
+trigonometric functions in the program instead of consuming the host kernel's precomputed f32
+frequencies. This is not an expressiveness limit of guest programs: a future builder can expose the
+same reduction schedule and precomputed frequency inputs, but the current builders do not promise
+bitwise parity with those host kernels.
 
 Accepted pp512/tg128 results use 30 measured repetitions on an 80-core Apple M3 Ultra:
 
