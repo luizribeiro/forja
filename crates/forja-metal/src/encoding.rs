@@ -7184,14 +7184,95 @@ struct EpiloguePipelineRequest {
 
 fn epilogue_pipeline_requests(
     dispatch: &Dispatch,
-    _parameter_dependent: bool,
+    parameter_dependent: bool,
 ) -> Result<Vec<EpiloguePipelineRequest>, BackendError> {
+    let epilogue = Arc::clone(
+        dispatch
+            .prepared_epilogue()
+            .ok_or(BackendError::InvalidInput)?,
+    );
     match dispatch.op() {
-        Op::Matmul | Op::QuantMatmul { .. } | Op::GatherQuantMatmul { .. } => {
+        Op::Matmul => dense_epilogue_requests(dispatch, epilogue, parameter_dependent),
+        Op::QuantMatmul { .. } | Op::GatherQuantMatmul { .. } => {
             Err(BackendError::UnsupportedOperation)
         }
         _ => Err(BackendError::UnsupportedOperation),
     }
+}
+
+fn dense_epilogue_requests(
+    dispatch: &Dispatch,
+    epilogue: Arc<PreparedEpilogue>,
+    parameter_dependent: bool,
+) -> Result<Vec<EpiloguePipelineRequest>, BackendError> {
+    let [left, right] = dispatch.primitive_inputs() else {
+        return Err(BackendError::InvalidInput);
+    };
+    let implementation = matmul_kernel(dispatch)?;
+    let constants = vec![
+        (0, dtype_code(left.layout().dtype())),
+        (1, dtype_code(right.layout().dtype())),
+        (2, dtype_code(dispatch.output().layout().dtype())),
+    ];
+    if matches!(
+        selected_variant(dispatch),
+        Some(MetalVariant::MatmulGemv | MetalVariant::MatmulGemvTransposed)
+    ) {
+        return Ok(vec![EpiloguePipelineRequest {
+            family: epilogue_codegen::FamilySourceTag::Dense,
+            epilogue,
+            implementation,
+            constants,
+        }]);
+    }
+    let config = match selected_variant(dispatch) {
+        Some(MetalVariant::MatmulPortable | MetalVariant::MatmulSteel64x32x32_2x2) => GEMM_64_32,
+        Some(MetalVariant::MatmulSteel64x64x16_2x2) => GEMM_64_64_FLOAT,
+        Some(MetalVariant::MatmulSteel64x64x16_1x2) => GEMM_64_64_HALF,
+        Some(MetalVariant::MatmulSteel32x64x16_1x2) => GEMM_32_64,
+        _ => return Err(BackendError::UnsupportedOperation),
+    };
+    if parameter_dependent {
+        let mut requests = Vec::with_capacity(8);
+        for rows in 0..=1 {
+            for columns in 0..=1 {
+                for inner in 0..=1 {
+                    let mut constants = constants.clone();
+                    constants.extend([(200, rows), (201, columns), (202, inner)]);
+                    requests.push(EpiloguePipelineRequest {
+                        family: epilogue_codegen::FamilySourceTag::Dense,
+                        epilogue: Arc::clone(&epilogue),
+                        implementation,
+                        constants,
+                    });
+                }
+            }
+        }
+        return Ok(requests);
+    }
+    let left_shape = left.layout().shape();
+    let right_shape = right.layout().shape();
+    let mut constants = constants;
+    constants.extend([
+        (
+            200,
+            u32::from(left_shape[left_shape.len() - 2].is_multiple_of(config.block_rows)),
+        ),
+        (
+            201,
+            u32::from(right_shape[right_shape.len() - 1].is_multiple_of(config.block_columns)),
+        ),
+        (
+            202,
+            u32::from(left_shape[left_shape.len() - 1].is_multiple_of(config.block_inner)),
+        ),
+    ]);
+    Ok(vec![EpiloguePipelineRequest {
+        family: epilogue_codegen::FamilySourceTag::Dense,
+        epilogue,
+        implementation,
+        constants,
+    }])
 }
 
 fn encode_layout(layout: &Layout) -> Result<[u8; 112], BackendError> {
@@ -7526,7 +7607,7 @@ mod tests {
 
     use forja_core::{
         Affine, Backend, BackendDispatchData, CommandList, DType, GraphLimits, Op, ParamSpace,
-        Slice, Submission, SymbolicLayout, TemplateTensor, ViewOp,
+        RuleArm, Slice, Submission, SymbolicLayout, TemplateTensor, VariantRule, ViewOp,
         program::{
             BinOp, BoundProgram, EpilogueSignature, Inst, KernelSignature, Program, ProgramKind,
             RedOp, ValidatedProgram, bind_program, prepare_epilogue, prepare_program,
@@ -7545,6 +7626,66 @@ mod tests {
             .slice(0, 0.into(), len, 1)
             .unwrap();
         TemplateTensor::symbolic(base.clone(), layout).unwrap()
+    }
+
+    fn dynamic_epilogue_variant_graph(backend: &MetalBackend) -> GraphTemplate {
+        let space = ParamSpace::new(std::iter::once(1..=7).collect()).unwrap();
+        let rows = Affine::parameter(0, 0, 1);
+        let left = backend.alloc(DType::F32, &[7, 33]).unwrap();
+        let right = TemplateTensor::from(backend.alloc(DType::F32, &[33, 7]).unwrap());
+        let output = backend.alloc(DType::F32, &[7, 7]).unwrap();
+        let left = symbolic_prefix(&left, space.clone(), rows);
+        let output = symbolic_prefix(&output, space.clone(), rows);
+        let epilogue = prepare_epilogue(
+            Program {
+                kind: ProgramKind::Map,
+                insts: vec![
+                    Inst::Input(0),
+                    Inst::Const(2.0),
+                    Inst::Binary(BinOp::Mul, 0, 1),
+                ],
+                outputs: vec![(0, 2)],
+            }
+            .validate()
+            .unwrap(),
+            EpilogueSignature::new(1, 2, vec![], DType::F32),
+        )
+        .unwrap();
+        let rule = VariantRule::new(
+            &space,
+            0,
+            vec![
+                RuleArm::new(1, 1, "matmul.gemv"),
+                RuleArm::new(2, 7, "matmul.steel-64x64x16-2x2"),
+            ],
+        )
+        .unwrap();
+        let variants = backend
+            .validate_variant_rule(
+                &space,
+                &rule,
+                Op::Matmul.into(),
+                &[&left, &right],
+                &[&output],
+            )
+            .unwrap();
+        let mut graph = GraphTemplate::new(space, GraphLimits::default());
+        graph
+            .dispatch_epilogue_variant_rule(
+                Op::Matmul,
+                &[&left, &right],
+                &output,
+                &epilogue,
+                &[],
+                0,
+                rule.arms()
+                    .iter()
+                    .zip(variants)
+                    .map(|(arm, variant)| (arm.hi(), BackendDispatchData::new(variant)))
+                    .collect(),
+            )
+            .unwrap();
+        graph
     }
 
     fn sample_params(temperature: f32, top_k: u32, top_p: f32, seed: u64) -> Vec<u8> {
@@ -8528,6 +8669,41 @@ mod tests {
         );
         backend.replay(&graph, Vec::new()).unwrap().wait().unwrap();
         backend.replay(&graph, Vec::new()).unwrap().wait().unwrap();
+    }
+
+    #[test]
+    fn metal_graph_prepares_every_epilogue_variant_specialization() {
+        let backend = MetalBackend::new().unwrap();
+        let graph = backend
+            .prepare_graph(dynamic_epilogue_variant_graph(&backend))
+            .unwrap();
+        {
+            let pipelines = backend.pipelines.lock().unwrap();
+            assert_eq!(pipelines.epilogue_libraries.len(), 1);
+            assert_eq!(pipelines.epilogue_pipelines.len(), 9);
+            assert_eq!(pipelines.epilogue_counts.libraries, 1);
+            assert_eq!(pipelines.epilogue_counts.pipelines, 9);
+        }
+
+        backend.replay(&graph, vec![1]).unwrap().wait().unwrap();
+        backend.replay(&graph, vec![7]).unwrap().wait().unwrap();
+        let pipelines = backend.pipelines.lock().unwrap();
+        assert_eq!(pipelines.epilogue_pipelines.len(), 9);
+        assert_eq!(pipelines.epilogue_counts.cache_hits, 10);
+        assert_eq!(pipelines.epilogue_counts.fallbacks, 0);
+    }
+
+    #[test]
+    fn metal_graph_refuses_epilogue_specializations_beyond_compile_quota() {
+        let budget = crate::ProgramCompileBudget::new(8, Duration::from_hours(24)).unwrap();
+        let backend = MetalBackend::with_program_compile_budget(budget).unwrap();
+        assert!(matches!(
+            backend.prepare_graph(dynamic_epilogue_variant_graph(&backend)),
+            Err(BackendError::QuotaExceeded)
+        ));
+        let pipelines = backend.pipelines.lock().unwrap();
+        assert!(pipelines.epilogue_libraries.is_empty());
+        assert!(pipelines.epilogue_pipelines.is_empty());
     }
 
     #[test]
@@ -9643,7 +9819,7 @@ mod tests {
         let profile = profiled.profile().unwrap();
         assert_eq!(profile.epilogue_library_compilations, 1);
         assert_eq!(profile.epilogue_pipeline_specializations, 1);
-        assert_eq!(profile.epilogue_cache_hits, 2);
+        assert_eq!(profile.epilogue_cache_hits, 3);
         assert_eq!(profile.epilogue_compile_fallbacks, 0);
         let pipelines = backend.pipelines.lock().unwrap();
         assert_eq!(pipelines.epilogue_libraries.len(), 1);
