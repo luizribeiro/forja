@@ -651,6 +651,11 @@ pub(crate) static REGISTRY: &[VariantDef<MetalVariant>] = &[
     ),
 ];
 
+#[allow(
+    clippy::match_same_arms,
+    clippy::match_wildcard_for_single_variants,
+    unreachable_patterns
+)]
 pub(crate) const fn portable_name(operation: OperationKind) -> Option<&'static str> {
     match operation {
         OperationKind::Matmul => Some("matmul.portable"),
@@ -658,10 +663,16 @@ pub(crate) const fn portable_name(operation: OperationKind) -> Option<&'static s
         OperationKind::GatherQuantMatmul => Some("gather-quant-matmul.portable"),
         OperationKind::Sdpa => Some("sdpa.portable"),
         OperationKind::TopK => Some("top-k.portable"),
-        OperationKind::GatherQuantSiluMul | OperationKind::Other => None,
+        OperationKind::Other => None,
+        _ => None,
     }
 }
 
+#[allow(
+    clippy::match_same_arms,
+    clippy::match_wildcard_for_single_variants,
+    unreachable_patterns
+)]
 pub(crate) const fn portable_implementation(operation: OperationKind) -> Option<MetalVariant> {
     match operation {
         OperationKind::Matmul => Some(MetalVariant::MatmulPortable),
@@ -669,7 +680,8 @@ pub(crate) const fn portable_implementation(operation: OperationKind) -> Option<
         OperationKind::GatherQuantMatmul => Some(MetalVariant::GatherQuantMatmulPortable),
         OperationKind::Sdpa => Some(MetalVariant::SdpaPortable),
         OperationKind::TopK => Some(MetalVariant::TopKPortable),
-        OperationKind::GatherQuantSiluMul | OperationKind::Other => None,
+        OperationKind::Other => None,
+        _ => None,
     }
 }
 

@@ -2579,7 +2579,12 @@ impl MetalBackend {
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    #[allow(
+        clippy::match_same_arms,
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        unreachable_patterns
+    )]
     fn encode_dispatch(
         &self,
         encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
@@ -2672,11 +2677,7 @@ impl MetalBackend {
                 ));
                 buffers
             }
-            Op::QkvRopeCache { .. }
-            | Op::QuantizedRouter { .. }
-            | Op::GatherQuantMatmulCombine { .. }
-            | Op::GatherQuantSiluMul { .. }
-            | Op::Program(_) => return Err(BackendError::InvalidInput),
+            Op::Program(_) => return Err(BackendError::InvalidInput),
             Op::Sdpa { .. } => {
                 self.encode_sdpa_dispatch(encoder, table, dispatch, bindings, arguments)?
             }
@@ -2697,6 +2698,7 @@ impl MetalBackend {
                 };
                 self.encode_elementwise(encoder, table, dispatch, kernel, bindings, arguments)?
             }
+            _ => return Err(BackendError::InvalidInput),
         };
         temporaries.extend(buffers);
         Ok(())
@@ -5782,6 +5784,7 @@ impl MetalBackend {
         Ok(arguments.offset.max(1))
     }
 
+    #[allow(unreachable_patterns)]
     fn size_dispatch_arguments(
         &self,
         dispatch: &Dispatch,
@@ -5855,11 +5858,8 @@ impl MetalBackend {
             Op::GatherQuantMatmul { .. } => {
                 Self::size_gather_quant_arguments(dispatch, arguments)?;
             }
-            Op::QkvRopeCache { .. }
-            | Op::QuantizedRouter { .. }
-            | Op::GatherQuantMatmulCombine { .. }
-            | Op::GatherQuantSiluMul { .. } => {}
             Op::Sdpa { .. } => self.size_sdpa_arguments(dispatch, arguments)?,
+            _ => return Err(BackendError::InvalidInput),
         }
         Ok(())
     }
@@ -6280,6 +6280,7 @@ fn shape3(layout: &Layout) -> Result<[u32; 3], BackendError> {
         .map_err(|_| BackendError::InvalidInput)
 }
 
+#[allow(unreachable_patterns)]
 fn supported_dispatch(dispatch: &Dispatch) -> bool {
     if dispatch.prepared_epilogue().is_some()
         && !matches!(
@@ -6315,18 +6316,15 @@ fn supported_dispatch(dispatch: &Dispatch) -> bool {
         | Op::Argmax
         | Op::TopK { .. }
         | Op::Rope { .. }
-        | Op::QkvRopeCache { .. }
         | Op::Embed
         | Op::QuantEmbed { .. }
         | Op::Matmul
         | Op::GatherMatmul
         | Op::QuantMatmul { .. }
-        | Op::QuantizedRouter { .. }
         | Op::GatherQuantMatmul { .. }
-        | Op::GatherQuantMatmulCombine { .. }
-        | Op::GatherQuantSiluMul { .. }
         | Op::Sdpa { .. }
         | Op::Sample { .. } => true,
+        _ => false,
     }
 }
 
@@ -6344,6 +6342,7 @@ fn dispatch_profile(dispatch: &Dispatch, barrier: bool) -> Result<DispatchProfil
     })
 }
 
+#[allow(unreachable_patterns)]
 pub(super) fn dispatch_kernel(dispatch: &Dispatch) -> Result<&'static str, BackendError> {
     Ok(match dispatch.op() {
         Op::Program(_) => match dispatch
@@ -6407,11 +6406,8 @@ pub(super) fn dispatch_kernel(dispatch: &Dispatch) -> Result<&'static str, Backe
                 "gather_quantized_gemv"
             }
         }
-        Op::QkvRopeCache { .. }
-        | Op::QuantizedRouter { .. }
-        | Op::GatherQuantMatmulCombine { .. }
-        | Op::GatherQuantSiluMul { .. } => return Err(BackendError::InvalidInput),
         Op::Sdpa { .. } => sdpa_kernel(dispatch)?,
+        _ => return Err(BackendError::InvalidInput),
     })
 }
 
@@ -6505,8 +6501,6 @@ fn reusable_dispatch(dispatch: &Dispatch) -> bool {
         | Op::QuantEmbed { .. }
         | Op::GatherMatmul
         | Op::GatherQuantMatmul { .. }
-        | Op::GatherQuantMatmulCombine { .. }
-        | Op::GatherQuantSiluMul { .. }
         | Op::Sdpa { .. } => false,
         Op::Matmul => {
             dispatch
