@@ -496,7 +496,22 @@ pub fn is_injective(layout: &Layout) -> bool {
 pub fn byte_ranges_overlap(left: &Layout, right: &Layout) -> bool {
     left.byte_span.start < right.byte_span.end
         && right.byte_span.start < left.byte_span.end
+        && !disjoint_stride_lattices(left, right)
         && !disjoint_inner_blocks(left, right)
+}
+
+fn disjoint_stride_lattices(left: &Layout, right: &Layout) -> bool {
+    if left.dtype != right.dtype || left.shape != right.shape || left.strides != right.strides {
+        return false;
+    }
+    let period = left
+        .shape
+        .iter()
+        .zip(&left.strides)
+        .filter(|&(extent, stride)| *extent > 1 && *stride > 0)
+        .map(|(_, &stride)| stride)
+        .reduce(greatest_common_divisor);
+    period.is_some_and(|period| left.offset % period != right.offset % period)
 }
 
 fn disjoint_inner_blocks(left: &Layout, right: &Layout) -> bool {
@@ -768,6 +783,13 @@ mod tests {
         let shifted_other_half =
             Layout::new(DType::F32, 80, vec![7, 16, 64], vec![2048, 128, 1], 57_408).unwrap();
         assert!(!byte_ranges_overlap(&shifted_halves, &shifted_other_half));
+
+        let even = Layout::new(DType::F32, 0, vec![7, 16, 64], vec![2048, 128, 2], 57_352).unwrap();
+        let odd = Layout::new(DType::F32, 1, vec![7, 16, 64], vec![2048, 128, 2], 57_352).unwrap();
+        let shifted_even =
+            Layout::new(DType::F32, 2, vec![7, 16, 64], vec![2048, 128, 2], 57_352).unwrap();
+        assert!(!byte_ranges_overlap(&even, &odd));
+        assert!(byte_ranges_overlap(&even, &shifted_even));
     }
 
     proptest! {
