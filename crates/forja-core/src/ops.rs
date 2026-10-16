@@ -1139,7 +1139,7 @@ fn check_top_k(inputs: &[&Tensor], outputs: &[&Tensor], k: u32) -> Result<(), Op
     let Some((&width, rows)) = inputs[0].layout.shape().split_last() else {
         return Err(shape_error(Operand::Input(0)));
     };
-    if k == 0 || k > 64 || k > width {
+    if k == 0 || k > width {
         return Err(OpError::InvalidTopK);
     }
     let expected = rows.iter().copied().chain([k]).collect::<Vec<_>>();
@@ -2232,6 +2232,21 @@ mod tests {
                 )
                 .is_ok()
         );
+        let wide_input = tensor(4, DType::F16, &[1, 65], &[65, 1]);
+        let wide_values = tensor(5, DType::F16, &[1, 65], &[65, 1]);
+        let wide_indices = tensor(6, DType::U32, &[1, 65], &[65, 1]);
+        assert!(
+            CommandList::new()
+                .dispatch_many(
+                    Op::TopK {
+                        k: 65,
+                        normalize: false,
+                    },
+                    &[&wide_input],
+                    &[&wide_values, &wide_indices],
+                )
+                .is_ok()
+        );
         assert_eq!(
             CommandList::new().dispatch_many(
                 Op::TopK {
@@ -2268,7 +2283,7 @@ mod tests {
                 actual: 1
             })
         );
-        let wrong_indices = tensor(4, DType::U32, &[3, 1], &[1, 1]);
+        let wrong_indices = tensor(7, DType::U32, &[3, 1], &[1, 1]);
         assert_eq!(
             CommandList::new().dispatch_many(
                 Op::TopK {
