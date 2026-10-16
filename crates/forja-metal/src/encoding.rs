@@ -2579,12 +2579,7 @@ impl MetalBackend {
         Ok(())
     }
 
-    #[allow(
-        clippy::match_same_arms,
-        clippy::too_many_arguments,
-        clippy::too_many_lines,
-        unreachable_patterns
-    )]
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     fn encode_dispatch(
         &self,
         encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
@@ -2698,7 +2693,6 @@ impl MetalBackend {
                 };
                 self.encode_elementwise(encoder, table, dispatch, kernel, bindings, arguments)?
             }
-            _ => return Err(BackendError::InvalidInput),
         };
         temporaries.extend(buffers);
         Ok(())
@@ -5784,7 +5778,6 @@ impl MetalBackend {
         Ok(arguments.offset.max(1))
     }
 
-    #[allow(unreachable_patterns)]
     fn size_dispatch_arguments(
         &self,
         dispatch: &Dispatch,
@@ -5859,7 +5852,6 @@ impl MetalBackend {
                 Self::size_gather_quant_arguments(dispatch, arguments)?;
             }
             Op::Sdpa { .. } => self.size_sdpa_arguments(dispatch, arguments)?,
-            _ => return Err(BackendError::InvalidInput),
         }
         Ok(())
     }
@@ -6280,7 +6272,6 @@ fn shape3(layout: &Layout) -> Result<[u32; 3], BackendError> {
         .map_err(|_| BackendError::InvalidInput)
 }
 
-#[allow(unreachable_patterns)]
 fn supported_dispatch(dispatch: &Dispatch) -> bool {
     if dispatch.prepared_epilogue().is_some()
         && !matches!(
@@ -6324,7 +6315,6 @@ fn supported_dispatch(dispatch: &Dispatch) -> bool {
         | Op::GatherQuantMatmul { .. }
         | Op::Sdpa { .. }
         | Op::Sample { .. } => true,
-        _ => false,
     }
 }
 
@@ -6342,7 +6332,6 @@ fn dispatch_profile(dispatch: &Dispatch, barrier: bool) -> Result<DispatchProfil
     })
 }
 
-#[allow(unreachable_patterns)]
 pub(super) fn dispatch_kernel(dispatch: &Dispatch) -> Result<&'static str, BackendError> {
     Ok(match dispatch.op() {
         Op::Program(_) => match dispatch
@@ -6407,7 +6396,6 @@ pub(super) fn dispatch_kernel(dispatch: &Dispatch) -> Result<&'static str, Backe
             }
         }
         Op::Sdpa { .. } => sdpa_kernel(dispatch)?,
-        _ => return Err(BackendError::InvalidInput),
     })
 }
 

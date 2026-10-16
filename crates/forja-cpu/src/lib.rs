@@ -1202,9 +1202,9 @@ impl Backend for CpuBackend {
                 }
             }
         }
-        let result = dispatches.into_iter().try_for_each(|dispatch| {
-            #[allow(unreachable_patterns)]
-            match dispatch.op() {
+        let result = dispatches
+            .into_iter()
+            .try_for_each(|dispatch| match dispatch.op() {
                 Op::Program(_) => dispatch
                     .bound_program()
                     .ok_or(BackendError::ExecutionFailed)
@@ -1255,9 +1255,7 @@ impl Backend for CpuBackend {
                 } => {
                     self.execute_sdpa(dispatch.inputs(), dispatch.output(), scale, causal, q_start)
                 }
-                _ => Err(BackendError::InvalidInput),
-            }
-        });
+            });
         Ok(CpuSubmission {
             result,
             wall_time: started.elapsed(),
