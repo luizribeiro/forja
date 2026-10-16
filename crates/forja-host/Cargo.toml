@@ -1,10 +1,15 @@
 [package]
 name = "forja-host"
+autotests = false
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
 rust-version.workspace = true
 version.workspace = true
+
+[[test]]
+name = "host"
+path = "tests/host/main.rs"
 
 [dependencies]
 forja-core = { path = "../forja-core" }

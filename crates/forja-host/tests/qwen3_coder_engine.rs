@@ -1,6 +1,6 @@
 //! Qwen3-Coder quantized engine checks against independent transformer fixtures.
 
-mod common;
+use crate::common;
 
 use std::{env, error::Error, path::PathBuf, time::Duration};
 

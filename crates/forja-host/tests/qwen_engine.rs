@@ -1,6 +1,6 @@
 //! Native Qwen3 engine checks against independent transformer fixtures.
 
-mod common;
+use crate::common;
 
 use std::{collections::VecDeque, env, error::Error, path::PathBuf, time::Duration};
 

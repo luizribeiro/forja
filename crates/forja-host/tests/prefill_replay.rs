@@ -1,6 +1,6 @@
 //! Chunked prefill differential checks across the bundled engines.
 
-mod common;
+use crate::common;
 
 use std::{env, error::Error, path::Path, path::PathBuf, time::Duration};
 
