@@ -1949,6 +1949,22 @@ pub fn gather_quant_matmul_flops(input: &[u32], packed: &[u32], indices: &[u32])
         .checked_mul(2)
 }
 
+/// Counts a generic gathered quantized dispatch, including paired projections or weighted sum.
+#[must_use]
+pub fn gather_quant_matmul_dispatch_flops(
+    input: &[u32],
+    packed: &[u32],
+    indices: &[u32],
+    input_count: usize,
+) -> Option<u64> {
+    match input_count {
+        5 => gather_quant_matmul_flops(input, packed, indices),
+        6 => gather_quant_matmul_combine_flops(input, packed, indices),
+        8 => gather_quant_matmul_flops(input, packed, indices)?.checked_mul(2),
+        _ => None,
+    }
+}
+
 /// Counts the multiply-add operations in a combined gathered affine quantized projection.
 #[must_use]
 pub fn gather_quant_matmul_combine_flops(
@@ -3077,6 +3093,29 @@ mod tests {
             Err(OpError::Shape {
                 operand: Operand::Input(5)
             })
+        );
+    }
+
+    #[test]
+    fn gathered_quant_work_counts_generic_dispatch_modes() {
+        let packed = [5, 33, 8];
+        let indices = [7, 3];
+
+        assert_eq!(
+            gather_quant_matmul_dispatch_flops(&[7, 64], &packed, &indices, 5),
+            Some(88_704)
+        );
+        assert_eq!(
+            gather_quant_matmul_dispatch_flops(&[7, 64], &packed, &indices, 8),
+            Some(177_408)
+        );
+        assert_eq!(
+            gather_quant_matmul_dispatch_flops(&[7, 3, 64], &packed, &indices, 6),
+            Some(88_704)
+        );
+        assert_eq!(
+            gather_quant_matmul_dispatch_flops(&[7, 64], &packed, &indices, 7),
+            None
         );
     }
 

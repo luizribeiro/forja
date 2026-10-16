@@ -10,7 +10,7 @@ use crate::{
     Affine, BackendDispatchData, ByteHull, CommandList, Dispatch, Op, OpError, ParamError,
     ParamSpace, ParamValues, SymbolicLayout, SymbolicLayoutError, Tensor, TensorError,
     byte_ranges_overlap, gather_matmul_flops, gather_quant_matmul_combine_flops,
-    gather_quant_matmul_flops, gather_quant_silu_mul_flops, matmul_flops,
+    gather_quant_matmul_dispatch_flops, gather_quant_silu_mul_flops, matmul_flops,
     ops::{BufferAccess, barriers_bounded_by, barriers_for_accesses, dispatch_accesses},
     program::{BindError, Inst, PreparedEpilogue, PreparedProgram, ProgramKind},
     quant_matmul_flops, sdpa_flops,
@@ -90,6 +90,23 @@ impl From<OpError> for GraphError {
     }
 }
 
+fn generic_gather_quant_flops(dispatch: &Dispatch) -> Option<u64> {
+    let inputs = dispatch.primitive_inputs();
+    let indices = if inputs.len() == 8 { 7 } else { 4 };
+    inputs
+        .first()
+        .zip(inputs.get(1))
+        .zip(inputs.get(indices))
+        .and_then(|((input, packed), indices)| {
+            gather_quant_matmul_dispatch_flops(
+                input.layout().shape(),
+                packed.layout().shape(),
+                indices.layout().shape(),
+                inputs.len(),
+            )
+        })
+}
+
 /// Resource bounds applied to graph dispatches at creation and instantiation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct GraphLimits {
@@ -150,18 +167,7 @@ impl GraphLimits {
                 .and_then(|(input, packed)| {
                     quant_matmul_flops(input.layout().shape(), packed.layout().shape())
                 }),
-            Op::GatherQuantMatmul { .. } => dispatch
-                .inputs()
-                .first()
-                .zip(dispatch.inputs().get(1))
-                .zip(dispatch.inputs().get(4))
-                .and_then(|((input, packed), indices)| {
-                    gather_quant_matmul_flops(
-                        input.layout().shape(),
-                        packed.layout().shape(),
-                        indices.layout().shape(),
-                    )
-                }),
+            Op::GatherQuantMatmul { .. } => generic_gather_quant_flops(dispatch),
             Op::GatherQuantMatmulCombine { .. } => dispatch
                 .inputs()
                 .first()
