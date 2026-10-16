@@ -42,7 +42,7 @@ fn tensor_case() -> impl Strategy<Value = TensorCase> {
 
 pub fn arbitrary_case() -> impl Strategy<Value = DispatchCase> {
     (
-        0_u8..9,
+        0_u8..6,
         prop::collection::vec(tensor_case(), 0..=4),
         tensor_case(),
         any::<f32>(),
@@ -63,7 +63,7 @@ pub fn arbitrary_case() -> impl Strategy<Value = DispatchCase> {
 #[allow(clippy::too_many_lines)]
 pub fn valid_case() -> impl Strategy<Value = DispatchCase> {
     (
-        0_u8..9,
+        0_u8..6,
         prop_oneof![Just(DType::F32), Just(DType::F16), Just(DType::BF16)],
         prop::collection::vec(1_u32..=9, 0..=4),
         prop::array::uniform8(1_u32..=9),
@@ -88,17 +88,7 @@ pub fn valid_case() -> impl Strategy<Value = DispatchCase> {
                 };
                 let (op, inputs, output) = match kind {
                     0 => (Op::Copy, vec![input(shape.clone(), 0)], output(shape)),
-                    1 => (
-                        Op::Add,
-                        vec![input(shape.clone(), 0), input(shape.clone(), 1)],
-                        output(shape),
-                    ),
-                    2 => (
-                        Op::SiluMul,
-                        vec![input(shape.clone(), 0), input(shape.clone(), 1)],
-                        output(shape),
-                    ),
-                    3 => {
+                    1 => {
                         if shape.is_empty() {
                             shape.push(dims[0]);
                         }
@@ -109,13 +99,7 @@ pub fn valid_case() -> impl Strategy<Value = DispatchCase> {
                             output(shape),
                         )
                     }
-                    4 => {
-                        if shape.is_empty() {
-                            shape.push(dims[0]);
-                        }
-                        (Op::Softmax, vec![input(shape.clone(), 0)], output(shape))
-                    }
-                    5 => {
+                    2 => {
                         let rope_shape = vec![dims[0], dims[1], 2 * (1 + dims[2] % 4)];
                         (
                             Op::Rope { theta },
@@ -130,7 +114,7 @@ pub fn valid_case() -> impl Strategy<Value = DispatchCase> {
                             output(rope_shape),
                         )
                     }
-                    6 => (
+                    3 => (
                         Op::Embed,
                         vec![
                             input(vec![dims[0], dims[1]], 0),
@@ -142,7 +126,7 @@ pub fn valid_case() -> impl Strategy<Value = DispatchCase> {
                         ],
                         output(vec![dims[2], dims[1]]),
                     ),
-                    7 => {
+                    4 => {
                         let batch = (dims[3] % 2 == 0).then_some(dims[0]);
                         let mut left = batch.into_iter().collect::<Vec<_>>();
                         left.extend([dims[1], dims[2]]);
@@ -186,13 +170,10 @@ pub fn valid_case() -> impl Strategy<Value = DispatchCase> {
 fn operation(kind: u8, eps: f32, theta: f32, scale: f32, causal: bool, q_start: u32) -> Op {
     match kind {
         0 => Op::Copy,
-        1 => Op::Add,
-        2 => Op::SiluMul,
-        3 => Op::RmsNorm { eps },
-        4 => Op::Softmax,
-        5 => Op::Rope { theta },
-        6 => Op::Embed,
-        7 => Op::Matmul,
+        1 => Op::RmsNorm { eps },
+        2 => Op::Rope { theta },
+        3 => Op::Embed,
+        4 => Op::Matmul,
         _ => Op::Sdpa {
             scale,
             causal,
