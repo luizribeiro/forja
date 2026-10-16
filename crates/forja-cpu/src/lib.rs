@@ -180,24 +180,6 @@ impl CpuBackend {
         self.write_output(output, &values)
     }
 
-    fn execute_binary(
-        &self,
-        inputs: &[Tensor],
-        output: &Tensor,
-        function: impl Fn(f32, f32) -> f32,
-    ) -> Result<(), BackendError> {
-        let left = decode(&self.read(&inputs[0])?, inputs[0].layout().dtype())
-            .ok_or(BackendError::ExecutionFailed)?;
-        let right = decode(&self.read(&inputs[1])?, inputs[1].layout().dtype())
-            .ok_or(BackendError::ExecutionFailed)?;
-        let values = left
-            .into_iter()
-            .zip(right)
-            .map(|(a, b)| function(a, b))
-            .collect::<Vec<_>>();
-        self.write_output(output, &values)
-    }
-
     fn execute_program(&self, program: &BoundProgram) -> Result<(), BackendError> {
         let decoded = self.decode_inputs(program.inputs())?;
         let inputs = decoded
@@ -320,26 +302,6 @@ impl CpuBackend {
             );
         }
         self.write_output(output, &normalized)
-    }
-
-    fn execute_softmax(&self, inputs: &[Tensor], output: &Tensor) -> Result<(), BackendError> {
-        let values = decode(&self.read(&inputs[0])?, inputs[0].layout().dtype())
-            .ok_or(BackendError::ExecutionFailed)?;
-        let width = execution_usize(
-            inputs[0]
-                .layout()
-                .shape()
-                .last()
-                .copied()
-                .ok_or(BackendError::ExecutionFailed)?,
-        )?;
-        let mut probabilities = Vec::with_capacity(values.len());
-        for row in values.chunks_exact(width) {
-            let start = probabilities.len();
-            probabilities.extend_from_slice(row);
-            softmax(&mut probabilities[start..]);
-        }
-        self.write_output(output, &probabilities)
     }
 
     fn execute_argmax(&self, inputs: &[Tensor], output: &Tensor) -> Result<(), BackendError> {
@@ -1210,16 +1172,10 @@ impl Backend for CpuBackend {
                     .ok_or(BackendError::ExecutionFailed)
                     .and_then(|program| self.execute_program(program)),
                 Op::Copy => self.execute_copy(dispatch.inputs(), dispatch.output()),
-                Op::Add => self.execute_binary(dispatch.inputs(), dispatch.output(), |a, b| a + b),
-                Op::SiluMul => {
-                    self.execute_binary(dispatch.inputs(), dispatch.output(), |gate, up| {
-                        gate / (1.0 + (-gate).exp()) * up
-                    })
-                }
+                Op::Add | Op::SiluMul | Op::Softmax => Err(BackendError::UnsupportedOperation),
                 Op::RmsNorm { eps } => {
                     self.execute_rms_norm(dispatch.inputs(), dispatch.output(), eps)
                 }
-                Op::Softmax => self.execute_softmax(dispatch.inputs(), dispatch.output()),
                 Op::Argmax => self.execute_argmax(dispatch.inputs(), dispatch.output()),
                 Op::TopK { k, normalize } => {
                     self.execute_top_k(dispatch.inputs(), dispatch.outputs(), k, normalize)
@@ -1566,19 +1522,26 @@ mod tests {
         let fused_output = backend.alloc(DType::F32, &[7, 17]).unwrap();
         let decomposed_accumulator = backend.alloc(DType::F32, &[7, 17]).unwrap();
         let decomposed_output = backend.alloc(DType::F32, &[7, 17]).unwrap();
+        let add = Program {
+            kind: ProgramKind::Map,
+            insts: vec![
+                Inst::Input(0),
+                Inst::Input(1),
+                Inst::Binary(BinOp::Add, 0, 1),
+            ],
+            outputs: vec![(0, 2)],
+        }
+        .validate()
+        .unwrap();
         let epilogue = prepare_epilogue(
-            Program {
-                kind: ProgramKind::Map,
-                insts: vec![
-                    Inst::Input(0),
-                    Inst::Input(1),
-                    Inst::Binary(BinOp::Add, 0, 1),
-                ],
-                outputs: vec![(0, 2)],
-            }
-            .validate()
-            .unwrap(),
+            add.clone(),
             EpilogueSignature::new(1, 2, vec![DType::F32], DType::F32),
+        )
+        .unwrap();
+        let add = prepare_program(
+            &backend,
+            add,
+            KernelSignature::new(2, vec![DType::F32, DType::F32], vec![DType::F32], 0),
         )
         .unwrap();
         let mut fused = CommandList::new();
@@ -1596,10 +1559,10 @@ mod tests {
             .dispatch(Op::Matmul, &[&left, &right], &decomposed_accumulator)
             .unwrap();
         decomposed
-            .dispatch(
-                Op::Add,
+            .dispatch_kernel(
+                &add,
                 &[&decomposed_accumulator, &bias],
-                &decomposed_output,
+                &[&decomposed_output],
             )
             .unwrap();
 
@@ -1940,52 +1903,6 @@ mod tests {
     }
 
     #[test]
-    fn adds_a_broadcast_operand() {
-        let backend = CpuBackend::new();
-        let left = backend.alloc(DType::F32, &[2, 3]).unwrap();
-        backend
-            .write(&left, &f32_bytes(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]))
-            .unwrap();
-        let row = backend.alloc(DType::F32, &[1, 3]).unwrap();
-        backend
-            .write(&row, &f32_bytes(&[10.0, 20.0, 30.0]))
-            .unwrap();
-        let right = backend.view(&row, ViewOp::Broadcast(vec![2, 3])).unwrap();
-        let output = backend.alloc(DType::F32, &[2, 3]).unwrap();
-        let mut commands = CommandList::new();
-        commands
-            .dispatch(Op::Add, &[&left, &right], &output)
-            .unwrap();
-        backend.submit(commands).unwrap().wait().unwrap();
-        assert_eq!(
-            backend.read(&output).unwrap(),
-            f32_bytes(&[11.0, 22.0, 33.0, 14.0, 25.0, 36.0])
-        );
-    }
-
-    #[test]
-    fn computes_silu_mul_into_bf16() {
-        let backend = CpuBackend::new();
-        let gate = backend.alloc(DType::F32, &[5]).unwrap();
-        backend
-            .write(&gate, &f32_bytes(&[-10.0, -1.0, 0.0, 1.0, 10.0]))
-            .unwrap();
-        let up = backend.alloc(DType::F32, &[5]).unwrap();
-        backend.write(&up, &f32_bytes(&[1.0; 5])).unwrap();
-        let output = backend.alloc(DType::BF16, &[5]).unwrap();
-        let mut commands = CommandList::new();
-        commands
-            .dispatch(Op::SiluMul, &[&gate, &up], &output)
-            .unwrap();
-        backend.submit(commands).unwrap().wait().unwrap();
-        let expected = [-0.000_453_978_7, -0.268_941_43, 0.0, 0.731_058_6, 9.999_546]
-            .into_iter()
-            .flat_map(|value| bf16::from_f32(value).to_le_bytes())
-            .collect::<Vec<_>>();
-        assert_eq!(backend.read(&output).unwrap(), expected);
-    }
-
-    #[test]
     fn argmax_prefers_the_last_equal_value() {
         let backend = CpuBackend::new();
         let input = f32_tensor(&backend, &[1, 5], &[1.0, 9.0, 2.0, 9.0, 3.0]);
@@ -2227,35 +2144,6 @@ mod tests {
         expected.extend((0..512).flat_map(|_| [1.5 / 12.75_f32.sqrt(), 2.0 / 12.75_f32.sqrt()]));
         let actual = decode(&backend.read(&output).unwrap(), DType::F32).unwrap();
         assert_relative(&actual, &expected, 1e-5);
-    }
-
-    #[test]
-    fn computes_masked_softmax_and_zeros_an_all_masked_row() {
-        let backend = CpuBackend::new();
-        let input = backend.alloc(DType::F32, &[2, 4]).unwrap();
-        backend
-            .write(
-                &input,
-                &f32_bytes(&[
-                    1.0,
-                    f32::NEG_INFINITY,
-                    3.0,
-                    f32::NEG_INFINITY,
-                    f32::NEG_INFINITY,
-                    f32::NEG_INFINITY,
-                    f32::NEG_INFINITY,
-                    f32::NEG_INFINITY,
-                ]),
-            )
-            .unwrap();
-        let output = backend.alloc(DType::F32, &[2, 4]).unwrap();
-        let mut commands = CommandList::new();
-        commands.dispatch(Op::Softmax, &[&input], &output).unwrap();
-        backend.submit(commands).unwrap().wait().unwrap();
-        let low = (-2.0_f32).exp() / (1.0 + (-2.0_f32).exp());
-        let high = 1.0 / (1.0 + (-2.0_f32).exp());
-        let actual = decode(&backend.read(&output).unwrap(), DType::F32).unwrap();
-        assert_relative(&actual, &[low, 0.0, high, 0.0, 0.0, 0.0, 0.0, 0.0], 1e-5);
     }
 
     #[test]
