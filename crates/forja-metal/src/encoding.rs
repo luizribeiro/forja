@@ -1622,6 +1622,8 @@ pub(super) struct InFlightTracker {
     completions: Mutex<Vec<InFlightCompletion>>,
     done: Mutex<Vec<InFlightCompletion>>,
     pool: Mutex<Vec<ReusableSubmissionObjects>>,
+    progress: Condvar,
+    progress_lock: Mutex<()>,
     slots: AtomicUsize,
     #[cfg(test)]
     backpressure_waits: AtomicUsize,
@@ -1636,6 +1638,8 @@ impl InFlightTracker {
             completions: Mutex::new(Vec::new()),
             done: Mutex::new(Vec::new()),
             pool: Mutex::new(Vec::new()),
+            progress: Condvar::new(),
+            progress_lock: Mutex::new(()),
             slots: AtomicUsize::new(0),
             #[cfg(test)]
             backpressure_waits: AtomicUsize::new(0),
@@ -1669,6 +1673,7 @@ impl InFlightTracker {
                     Ok(objects) => break objects,
                     Err(error) => {
                         self.slots.fetch_sub(1, Ordering::AcqRel);
+                        self.notify_progress();
                         return Err(error);
                     }
                 }
@@ -1679,12 +1684,37 @@ impl InFlightTracker {
                 .map_err(|_| BackendError::ExecutionFailed)?
                 .first()
                 .map(|entry| Arc::clone(&entry.completion));
-            let Some(pending) = pending else {
-                return Err(BackendError::QuotaExceeded);
-            };
             #[cfg(test)]
             self.backpressure_waits.fetch_add(1, Ordering::Relaxed);
-            pending.wait(backend.gpu_timeout)?;
+            if let Some(pending) = pending {
+                pending.wait(backend.gpu_timeout)?;
+            } else {
+                let progress = self
+                    .progress_lock
+                    .lock()
+                    .map_err(|_| BackendError::ExecutionFailed)?;
+                if !self
+                    .pool
+                    .lock()
+                    .map_err(|_| BackendError::ExecutionFailed)?
+                    .is_empty()
+                    || self.slots.load(Ordering::Acquire) < MAX_IN_FLIGHT_SUBMISSIONS
+                    || !self
+                        .completions
+                        .lock()
+                        .map_err(|_| BackendError::ExecutionFailed)?
+                        .is_empty()
+                {
+                    continue;
+                }
+                let (_progress, wait) = self
+                    .progress
+                    .wait_timeout(progress, backend.gpu_timeout)
+                    .map_err(|_| BackendError::ExecutionFailed)?;
+                if wait.timed_out() {
+                    return Err(BackendError::QuotaExceeded);
+                }
+            }
         };
         reset_allocator(&reusable.allocator);
         if reusable.argument_buffer.capacity != argument_capacity {
@@ -1772,6 +1802,7 @@ impl InFlightTracker {
                 _listener: listener.clone(),
                 _notification: notification.clone(),
             });
+        self.notify_progress();
         Ok(ListenerRegistration {
             event: completion.event.raw.clone(),
             listener: listener.clone(),
@@ -1814,6 +1845,9 @@ impl InFlightTracker {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
         );
+        if done.is_empty() {
+            return;
+        }
         for completed in &done {
             completed.completion.resolve_timestamps();
         }
@@ -1824,6 +1858,8 @@ impl InFlightTracker {
         for completed in done {
             pool.push(completed.objects);
         }
+        drop(pool);
+        self.notify_progress();
     }
 
     fn return_dirty(&self, objects: ReusableSubmissionObjects) {
@@ -1831,6 +1867,15 @@ impl InFlightTracker {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push(objects);
+        self.notify_progress();
+    }
+
+    fn notify_progress(&self) {
+        let _progress = self
+            .progress_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.progress.notify_all();
     }
 
     pub(super) fn drain(&self, timeout: Duration) {
@@ -8444,6 +8489,27 @@ mod tests {
         }
         backend.in_flight.drain_done();
         assert!(backend.in_flight.pooled_len() >= 1);
+    }
+
+    #[test]
+    fn submission_checkout_waits_for_a_reserved_slot() {
+        let backend = Arc::new(MetalBackend::new().unwrap());
+        let mut held = (0..MAX_IN_FLIGHT_SUBMISSIONS)
+            .map(|_| backend.in_flight.checkout(&backend, 4096).unwrap())
+            .collect::<Vec<_>>();
+        let waiting_backend = Arc::clone(&backend);
+        let waiter =
+            thread::spawn(move || waiting_backend.in_flight.checkout(&waiting_backend, 4096));
+
+        let started = Instant::now();
+        while backend.in_flight.backpressure_wait_count() == 0 {
+            assert!(started.elapsed() < backend.gpu_timeout);
+            thread::yield_now();
+        }
+        drop(held.pop());
+
+        let returned = waiter.join().unwrap().unwrap();
+        drop(returned);
     }
 
     #[test]
