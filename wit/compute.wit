@@ -43,11 +43,6 @@ interface compute {
     theta: f32,
   }
 
-  record qkv-rope-cache-cfg {
-    eps: f32,
-    theta: f32,
-  }
-
   record sdpa-cfg {
     scale: f32,
     causal: bool,
@@ -64,12 +59,6 @@ interface compute {
   }
 
   record top-k-cfg {
-    k: u32,
-    normalize: bool,
-  }
-
-  record quantized-router-cfg {
-    group-size: u32,
     k: u32,
     normalize: bool,
   }
@@ -164,16 +153,12 @@ interface compute {
     top-k(top-k-cfg),
     sample(sample-cfg),
     rope(rope-cfg),
-    qkv-rope-cache(qkv-rope-cache-cfg),
     embed,
     quant-embed(quant-matmul-cfg),
     matmul,
     gather-matmul,
     quant-matmul(quant-matmul-cfg),
-    quantized-router(quantized-router-cfg),
     gather-quant-matmul(quant-matmul-cfg),
-    gather-quant-matmul-combine(quant-matmul-cfg),
-    gather-quant-silu-mul(quant-matmul-cfg),
     sdpa(sdpa-cfg),
   }
 
