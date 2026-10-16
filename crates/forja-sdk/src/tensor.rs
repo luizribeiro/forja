@@ -306,8 +306,12 @@ impl<T: Element> Tensor<T> {
     /// # Errors
     ///
     /// Returns an error for incompatible tensors or a refused dispatch.
-    pub fn silu_mul(&self, up: &Self) -> Result<Self> {
-        self.binary(up, sys::Op::SiluMul)
+    pub fn silu_mul(&self, up: &Self) -> Result<Self>
+    where
+        T: FloatElement,
+    {
+        let kernel = crate::nn::blocks::silu_mul_kernel(sys::dtype(T::DTYPE)?)?;
+        crate::nn::blocks::silu_mul(&kernel, self, up)
     }
 
     /// Normalizes each row and applies a one-dimensional weight.
@@ -324,8 +328,12 @@ impl<T: Element> Tensor<T> {
     /// # Errors
     ///
     /// Returns an error for an invalid shape, type, or dispatch.
-    pub fn softmax_last_dim(&self) -> Result<Self> {
-        self.unary::<T>(sys::Op::Softmax, self.shape.clone())
+    pub fn softmax_last_dim(&self) -> Result<Self>
+    where
+        T: FloatElement,
+    {
+        let kernel = crate::nn::blocks::softmax_kernel(sys::dtype(T::DTYPE)?)?;
+        crate::nn::blocks::softmax(&kernel, self)
     }
 
     /// Selects the greatest index along the last dimension under IEEE total order.
@@ -1655,11 +1663,12 @@ impl Tensor<u32> {
     }
 }
 
-impl<T: Element> Add<&Tensor<T>> for &Tensor<T> {
+impl<T: FloatElement> Add<&Tensor<T>> for &Tensor<T> {
     type Output = Result<Tensor<T>>;
 
     fn add(self, other: &Tensor<T>) -> Self::Output {
-        self.binary(other, sys::Op::Add)
+        let kernel = crate::nn::blocks::add_kernel(sys::dtype(T::DTYPE)?)?;
+        crate::nn::blocks::add(&kernel, self, other)
     }
 }
 

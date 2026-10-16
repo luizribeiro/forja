@@ -67,10 +67,7 @@ pub(crate) enum View {
 #[derive(Clone, Copy)]
 pub(crate) enum Op {
     Copy,
-    Add,
-    SiluMul,
     RmsNorm(f32),
-    Softmax,
     Argmax,
     TopK {
         k: u32,
@@ -589,10 +586,7 @@ pub(crate) mod guest {
     fn wit_op(operation: Op) -> compute::Op {
         match operation {
             Op::Copy => compute::Op::Copy,
-            Op::Add => compute::Op::Add,
-            Op::SiluMul => compute::Op::SiluMul,
             Op::RmsNorm(eps) => compute::Op::RmsNorm(eps),
-            Op::Softmax => compute::Op::Softmax,
             Op::Argmax => compute::Op::Argmax,
             Op::TopK { k, normalize } => compute::Op::TopK(compute::TopKCfg { k, normalize }),
             Op::Sample { position } => compute::Op::Sample(compute::SampleCfg {
@@ -1346,10 +1340,7 @@ pub(crate) mod native {
     fn core_op(operation: Op) -> CoreOp {
         match operation {
             Op::Copy => CoreOp::Copy,
-            Op::Add => CoreOp::Add,
-            Op::SiluMul => CoreOp::SiluMul,
             Op::RmsNorm(eps) => CoreOp::RmsNorm { eps },
-            Op::Softmax => CoreOp::Softmax,
             Op::Argmax => CoreOp::Argmax,
             Op::TopK { k, normalize } => CoreOp::TopK { k, normalize },
             Op::Sample { position } => CoreOp::Sample {
