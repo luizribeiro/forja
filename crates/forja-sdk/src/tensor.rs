@@ -2,6 +2,7 @@ use std::{marker::PhantomData, ops::Add, rc::Rc};
 
 use crate::{
     Element, Error, FloatElement, Result, graph,
+    kernel::{Epilogue, TensorRef},
     program::{Kernel, Program},
     sys,
 };
@@ -467,6 +468,28 @@ impl<T: Element> Tensor<T> {
         self.matmul_selected(right, None)
     }
 
+    /// Multiplies matrices and evaluates a scalar epilogue before storing each result.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for incompatible matrix or epilogue bindings.
+    pub fn matmul_epilogue(
+        &self,
+        right: &Self,
+        epilogue: &Epilogue,
+        extras: &[TensorRef<'_>],
+    ) -> Result<Self> {
+        let output = self.empty_matmul_output(right)?;
+        crate::kernel::run_epilogue(
+            sys::Op::Matmul,
+            &[&self.handle, &right.handle],
+            TensorRef::new(&output)?,
+            epilogue,
+            extras,
+        )?;
+        Ok(output)
+    }
+
     /// Multiplies tensors with an explicit Metal algorithm selection.
     ///
     /// # Errors
@@ -485,21 +508,7 @@ impl<T: Element> Tensor<T> {
         right: &Self,
         selection: Option<crate::target::metal::VariantChoice<'_>>,
     ) -> Result<Self> {
-        let rank = self.shape.len();
-        if !matches!(rank, 2 | 3) || right.shape.len() != rank {
-            return Err(Error::new(
-                "matmul requires equal rank-two or rank-three tensors",
-            ));
-        }
-        let batch = rank - 2;
-        if self.shape[..batch] != right.shape[..batch]
-            || self.shape[batch + 1] != right.shape[batch]
-        {
-            return Err(Error::new("matmul shapes are incompatible"));
-        }
-        let mut shape = self.shape[..batch].to_vec();
-        shape.extend([self.shape[batch], right.shape[batch + 1]]);
-        let output = Self::empty(shape)?;
+        let output = self.empty_matmul_output(right)?;
         if let Some(selection) = selection {
             graph::record_variant(
                 sys::Op::Matmul,
@@ -515,6 +524,24 @@ impl<T: Element> Tensor<T> {
             )?;
         }
         Ok(output)
+    }
+
+    fn empty_matmul_output(&self, right: &Self) -> Result<Self> {
+        let rank = self.shape.len();
+        if !matches!(rank, 2 | 3) || right.shape.len() != rank {
+            return Err(Error::new(
+                "matmul requires equal rank-two or rank-three tensors",
+            ));
+        }
+        let batch = rank - 2;
+        if self.shape[..batch] != right.shape[..batch]
+            || self.shape[batch + 1] != right.shape[batch]
+        {
+            return Err(Error::new("matmul shapes are incompatible"));
+        }
+        let mut shape = self.shape[..batch].to_vec();
+        shape.extend([self.shape[batch], right.shape[batch + 1]]);
+        Self::empty(shape)
     }
 
     /// Multiplies rows by dense expert matrices selected by GPU indices.
@@ -578,6 +605,36 @@ impl<T: Element> Tensor<T> {
         T: FloatElement,
     {
         self.quant_matmul_selected(packed, scales, biases, bits, group_size, None)
+    }
+
+    /// Multiplies by affine-quantized weights and evaluates an epilogue before storage.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for incompatible weights or epilogue bindings.
+    #[allow(clippy::too_many_arguments)]
+    pub fn quant_matmul_epilogue<S: FloatElement>(
+        &self,
+        packed: &Tensor<u32>,
+        scales: &Tensor<S>,
+        biases: &Tensor<S>,
+        bits: u8,
+        group_size: u32,
+        epilogue: &Epilogue,
+        extras: &[TensorRef<'_>],
+    ) -> Result<Self>
+    where
+        T: FloatElement,
+    {
+        let output = self.empty_quant_matmul_output(packed, scales, biases, bits, group_size)?;
+        crate::kernel::run_epilogue(
+            sys::Op::QuantMatmul { bits, group_size },
+            &[&self.handle, &packed.handle, &scales.handle, &biases.handle],
+            TensorRef::new(&output)?,
+            epilogue,
+            extras,
+        )?;
+        Ok(output)
     }
 
     /// Multiplies by affine-quantized weights with an explicit Metal algorithm selection.
@@ -737,6 +794,45 @@ impl<T: Element> Tensor<T> {
         T: FloatElement,
     {
         self.gather_quant_matmul_selected(packed, scales, biases, indices, bits, group_size, None)
+    }
+
+    /// Multiplies gathered quantized rows and evaluates an epilogue before storage.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for incompatible weights, routes, or epilogue bindings.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gather_quant_matmul_epilogue<S: FloatElement>(
+        &self,
+        packed: &Tensor<u32>,
+        scales: &Tensor<S>,
+        biases: &Tensor<S>,
+        indices: &Tensor<u32>,
+        bits: u8,
+        group_size: u32,
+        epilogue: &Epilogue,
+        extras: &[TensorRef<'_>],
+    ) -> Result<Self>
+    where
+        T: FloatElement,
+    {
+        let shape =
+            self.gather_quantized_shape(packed, scales, biases, indices, bits, group_size)?;
+        let output = Self::empty(shape.to_vec())?;
+        crate::kernel::run_epilogue(
+            sys::Op::GatherQuantMatmul { bits, group_size },
+            &[
+                &self.handle,
+                &packed.handle,
+                &scales.handle,
+                &biases.handle,
+                &indices.handle,
+            ],
+            TensorRef::new(&output)?,
+            epilogue,
+            extras,
+        )?;
+        Ok(output)
     }
 
     /// Multiplies routed rows with an explicit Metal algorithm selection.

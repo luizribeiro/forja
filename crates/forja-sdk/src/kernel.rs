@@ -15,7 +15,7 @@ use std::{cell::RefCell, collections::VecDeque, marker::PhantomData};
 
 use crate::{DType, Element, Error, FloatElement, Result, Tensor, graph, sys};
 
-pub use crate::program::Kernel;
+pub use crate::program::{Epilogue, Kernel};
 pub use forja_sdk_macros::kernel;
 
 /// Maximum number of prepared signatures retained by one kernel definition.
@@ -53,6 +53,36 @@ impl<'a> TensorRef<'a> {
     pub const fn dtype(self) -> DType {
         self.dtype
     }
+}
+
+pub(crate) fn run_epilogue(
+    operation: sys::Op,
+    primitive_inputs: &[&sys::Handle],
+    output: TensorRef<'_>,
+    epilogue: &Epilogue,
+    extras: &[TensorRef<'_>],
+) -> Result<()> {
+    let rank = u8::try_from(output.shape.len())
+        .map_err(|_| Error::new("epilogue output rank is too large"))?;
+    if epilogue.accumulator_count != 1
+        || epilogue.rank != rank
+        || epilogue.output != output.dtype
+        || epilogue.extras.len() != extras.len()
+        || extras
+            .iter()
+            .zip(&epilogue.extras)
+            .any(|(extra, dtype)| extra.dtype != *dtype || extra.shape != output.shape)
+    {
+        return Err(Error::new("epilogue tensor signature does not match"));
+    }
+    let extra_handles = extras.iter().map(|extra| extra.handle).collect::<Vec<_>>();
+    graph::record_epilogue(
+        operation,
+        primitive_inputs,
+        output.handle,
+        &epilogue.handle,
+        &extra_handles,
+    )
 }
 
 /// Dispatches a generated kernel into newly allocated outputs.

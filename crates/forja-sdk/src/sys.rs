@@ -205,7 +205,6 @@ pub(crate) trait Backend {
         inputs: &[&Self::Tensor],
         outputs: &[&Self::Tensor],
     ) -> Result<()>;
-    #[allow(dead_code)]
     fn create_epilogue(
         program: Program,
         accumulator_count: u8,
@@ -213,7 +212,6 @@ pub(crate) trait Backend {
         extras: &[DType],
         output: DType,
     ) -> Result<Self::Epilogue>;
-    #[allow(dead_code)]
     fn dispatch_epilogue(
         commands: &mut Self::Commands,
         operation: Op,
@@ -888,7 +886,6 @@ pub(crate) mod native {
         Metal(MetalKernel),
     }
 
-    #[allow(dead_code)]
     pub(crate) enum Epilogue {
         Cpu(CpuEpilogue),
         #[cfg(all(feature = "native-metal", target_os = "macos"))]
@@ -1413,7 +1410,6 @@ pub(crate) use unavailable::Unavailable as Active;
 pub(crate) type Handle = <Active as Backend>::Tensor;
 pub(crate) type Commands = <Active as Backend>::Commands;
 pub(crate) type Kernel = <Active as Backend>::Kernel;
-#[allow(dead_code)]
 pub(crate) type Epilogue = <Active as Backend>::Epilogue;
 pub(crate) type Params = <Active as Backend>::Params;
 pub(crate) type Graph = <Active as Backend>::Graph;
@@ -1521,7 +1517,6 @@ pub(crate) fn dispatch_kernel(
     Active::dispatch_kernel(commands, kernel, inputs, outputs)
 }
 
-#[allow(dead_code)]
 pub(crate) fn create_epilogue(
     program: Program,
     accumulator_count: u8,
@@ -1532,7 +1527,6 @@ pub(crate) fn create_epilogue(
     Active::create_epilogue(program, accumulator_count, rank, extras, output)
 }
 
-#[allow(dead_code)]
 pub(crate) fn dispatch_epilogue(
     commands: &mut Commands,
     operation: Op,

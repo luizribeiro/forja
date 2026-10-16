@@ -489,6 +489,27 @@ pub(crate) fn record_kernel(
     })
 }
 
+pub(crate) fn record_epilogue(
+    operation: sys::Op,
+    inputs: &[&sys::Handle],
+    output: &sys::Handle,
+    epilogue: &sys::Epilogue,
+    extras: &[&sys::Handle],
+) -> Result<()> {
+    CURRENT.with(|current| {
+        let mut current = current.borrow_mut();
+        if current.is_none() {
+            *current = Some(Recording::Lazy(sys::command_list()?));
+        }
+        let Some(Recording::Lazy(commands) | Recording::Capture { commands, .. }) =
+            current.as_mut()
+        else {
+            return Err(crate::Error::new("current graph was not initialized"));
+        };
+        sys::dispatch_epilogue(commands, operation, inputs, output, epilogue, extras)
+    })
+}
+
 fn cached_kernel(
     program: sys::Program,
     rank: u8,

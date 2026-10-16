@@ -107,6 +107,51 @@ pub struct Kernel {
     validated: forja_core::program::ValidatedProgram,
 }
 
+/// A prepared Map program evaluated on primitive accumulators and extra views.
+#[derive(Clone)]
+pub struct Epilogue {
+    pub(crate) handle: Rc<sys::Epilogue>,
+    /// Number of leading virtual f32 accumulator inputs.
+    pub accumulator_count: u8,
+    /// Rank of the primitive's logical output domain.
+    pub rank: u8,
+    /// Storage types of physical extra views.
+    pub extras: Vec<DType>,
+    /// Storage type of the primitive output.
+    pub output: DType,
+}
+
+impl Epilogue {
+    /// Prepares a Map program for a primitive output signature.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the program or signature violates the epilogue contract.
+    pub fn new(
+        program: &Program,
+        accumulator_count: u8,
+        rank: u8,
+        extra_dtypes: &[DType],
+        output_dtype: DType,
+    ) -> Result<Self> {
+        let definition = program.definition(usize::from(rank))?;
+        let handle = Rc::new(sys::create_epilogue(
+            definition,
+            accumulator_count,
+            rank,
+            extra_dtypes,
+            output_dtype,
+        )?);
+        Ok(Self {
+            handle,
+            accumulator_count,
+            rank,
+            extras: extra_dtypes.to_vec(),
+            output: output_dtype,
+        })
+    }
+}
+
 impl Kernel {
     /// Prepares a program for tensors with the given rank and element types.
     ///
