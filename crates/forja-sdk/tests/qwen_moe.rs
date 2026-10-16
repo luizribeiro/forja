@@ -4,7 +4,9 @@
 
 use std::{env, error::Error, path::Path, process::Command, time::Instant};
 
-use forja_sdk::{NativeDevice, Tensor, Weights, bf16, eval, nn, set_native_device};
+use forja_sdk::{
+    DType, NativeDevice, Tensor, Weights, bf16, eval, kernel::Epilogue, nn, set_native_device,
+};
 use forja_testing::{QUANTIZED_TOLERANCE, normwise_relative_error};
 
 const EXPERTS: u32 = 128;
@@ -14,6 +16,14 @@ const TOP_K: u32 = 8;
 const WARMUPS: usize = 5;
 const REPETITIONS: usize = 30;
 const BLOCKS_PER_SAMPLE: u32 = 20;
+
+#[forja_sdk::kernel(map)]
+fn moe_gate_up(
+    gate: forja_sdk::kernel::Elem,
+    up: forja_sdk::kernel::Elem,
+) -> forja_sdk::kernel::Elem {
+    gate * gate.sigmoid() * up
+}
 
 struct QuantizedProjection {
     packed: Tensor<u32>,
@@ -46,6 +56,7 @@ struct QwenMoe {
     gate: QuantizedProjection,
     up: QuantizedProjection,
     down: QuantizedProjection,
+    gate_up: Epilogue,
 }
 
 impl QwenMoe {
@@ -60,6 +71,7 @@ impl QwenMoe {
             gate: QuantizedProjection::load(&experts.scoped("gate_proj"), INTERMEDIATE, HIDDEN)?,
             up: QuantizedProjection::load(&experts.scoped("up_proj"), INTERMEDIATE, HIDDEN)?,
             down: QuantizedProjection::load(&experts.scoped("down_proj"), HIDDEN, INTERMEDIATE)?,
+            gate_up: moe_gate_up_epilogue(2, 3, &[], DType::BF16)?,
         })
     }
 
@@ -73,16 +85,16 @@ impl QwenMoe {
         )?;
         let (route_weights, indices) = nn::moe_router(&logits, TOP_K, true)?;
         let hidden = input
-            .gather_quant_silu_mul(
-                &self.gate.packed,
-                &self.gate.scales,
-                &self.gate.biases,
-                &self.up.packed,
-                &self.up.scales,
-                &self.up.biases,
+            .gather_quant_matmul_pair_epilogue(
+                [
+                    (&self.gate.packed, &self.gate.scales, &self.gate.biases),
+                    (&self.up.packed, &self.up.scales, &self.up.biases),
+                ],
                 &indices,
                 4,
                 64,
+                &self.gate_up,
+                &[],
             )?
             .reshape(&[TOP_K, INTERMEDIATE])?;
         let down_indices = indices.reshape(&[TOP_K, 1])?;
