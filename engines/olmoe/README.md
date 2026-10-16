@@ -25,7 +25,7 @@ Accepted pp512/tg128 results use 30 measured repetitions on an 80-core Apple M3 
 
 | Selection | PP tok/s | TG tok/s |
 | --- | ---: | ---: |
-| GPU sequential | 902.07 | 82.83 |
-| GPU pipelined | 898.60 | 95.31 |
+| GPU sequential | 919.36 | 80.90 |
+| GPU pipelined | 914.81 | 95.53 |
 
 The complete confidence intervals and provenance are in the profile's `bench` directory.
