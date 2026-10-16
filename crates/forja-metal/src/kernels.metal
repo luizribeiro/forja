@@ -732,6 +732,7 @@ constant uint sample_status = 4;
 constant uint sample_proposal = 5;
 constant uint sample_maximum = 6;
 constant uint sample_state_words = 7;
+// Partial and threadgroup workspaces bound fast refinement; larger top-k values use the exact fallback.
 constant uint sample_fast_topk = 20;
 constant uint sample_pending = 0;
 constant uint sample_accepted = 1;
