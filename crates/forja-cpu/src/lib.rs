@@ -897,6 +897,31 @@ impl CpuBackend {
         invalid_route.map_or(Ok(()), |index| Err(BackendError::IndexOutOfRange { index }))
     }
 
+    fn execute_gather_quant_dispatch(
+        &self,
+        dispatch: &forja_core::Dispatch,
+        bits: u8,
+        group_size: u32,
+    ) -> Result<(), BackendError> {
+        if dispatch.primitive_inputs().len() == 6 {
+            self.execute_gather_quant_weighted_sum(
+                dispatch.primitive_inputs(),
+                dispatch.output(),
+                bits,
+                group_size,
+                Some(dispatch),
+            )
+        } else {
+            self.execute_gather_quant_matmul(
+                dispatch.primitive_inputs(),
+                dispatch.output(),
+                bits,
+                group_size,
+                Some(dispatch),
+            )
+        }
+    }
+
     fn gather_quant_projection_values(
         &self,
         inputs: &[Tensor],
@@ -980,12 +1005,13 @@ impl CpuBackend {
         Ok((values, invalid_route))
     }
 
-    fn execute_gather_quant_matmul_combine(
+    fn execute_gather_quant_weighted_sum(
         &self,
         inputs: &[Tensor],
         output: &Tensor,
         bits: u8,
         group_size: u32,
+        epilogue_dispatch: Option<&forja_core::Dispatch>,
     ) -> Result<(), BackendError> {
         let activations = decode(&self.read(&inputs[0])?, inputs[0].layout().dtype())
             .ok_or(BackendError::ExecutionFailed)?;
@@ -997,8 +1023,12 @@ impl CpuBackend {
         let indices = decode_u32(&self.read(&inputs[4])?).ok_or(BackendError::ExecutionFailed)?;
         let weights = decode(&self.read(&inputs[5])?, inputs[5].layout().dtype())
             .ok_or(BackendError::ExecutionFailed)?;
-        let mut values = decode(&self.read(&inputs[6])?, inputs[6].layout().dtype())
-            .ok_or(BackendError::ExecutionFailed)?;
+        let mut values = if let Some(residual) = inputs.get(6) {
+            decode(&self.read(residual)?, residual.layout().dtype())
+                .ok_or(BackendError::ExecutionFailed)?
+        } else {
+            vec![0.0; execution_usize(output.layout().element_count())?]
+        };
         let [rows, routes, inner]: [u32; 3] = inputs[0]
             .layout()
             .shape()
@@ -1068,6 +1098,7 @@ impl CpuBackend {
                 }
             }
         }
+        let values = self.apply_epilogue(epilogue_dispatch, values)?;
         self.write_output(output, &values)?;
         invalid_route.map_or(Ok(()), |index| Err(BackendError::IndexOutOfRange { index }))
     }
@@ -1372,19 +1403,16 @@ impl Backend for CpuBackend {
                     k,
                     normalize,
                 } => self.execute_quantized_router(&dispatch, group_size, k, normalize),
-                Op::GatherQuantMatmul { bits, group_size } => self.execute_gather_quant_matmul(
-                    dispatch.primitive_inputs(),
-                    dispatch.output(),
-                    bits,
-                    group_size,
-                    Some(&dispatch),
-                ),
+                Op::GatherQuantMatmul { bits, group_size } => {
+                    self.execute_gather_quant_dispatch(&dispatch, bits, group_size)
+                }
                 Op::GatherQuantMatmulCombine { bits, group_size } => self
-                    .execute_gather_quant_matmul_combine(
+                    .execute_gather_quant_weighted_sum(
                         dispatch.inputs(),
                         dispatch.output(),
                         bits,
                         group_size,
+                        None,
                     ),
                 Op::GatherQuantSiluMul { bits, group_size } => self.execute_gather_quant_silu_mul(
                     dispatch.inputs(),
@@ -2666,17 +2694,32 @@ mod tests {
         let weights = f32_tensor(&backend, &[1, 5], &[0.5, 1.0, -0.25, 2.0, 0.75]);
         let residual = f32_tensor(&backend, &[1, 2], &[1.5, -2.0]);
         let output = backend.alloc(DType::F32, &[1, 2]).unwrap();
+        let epilogue = prepare_epilogue(
+            Program {
+                kind: ProgramKind::Map,
+                insts: vec![
+                    Inst::Input(0),
+                    Inst::Input(1),
+                    Inst::Binary(BinOp::Add, 0, 1),
+                ],
+                outputs: vec![(0, 2)],
+            }
+            .validate()
+            .unwrap(),
+            EpilogueSignature::new(1, 2, vec![DType::F32], DType::F32),
+        )
+        .unwrap();
         let mut commands = CommandList::new();
         commands
-            .dispatch(
-                Op::GatherQuantMatmulCombine {
+            .dispatch_epilogue(
+                Op::GatherQuantMatmul {
                     bits: 4,
                     group_size: 64,
                 },
-                &[
-                    &input, &packed, &scales, &biases, &indices, &weights, &residual,
-                ],
+                &[&input, &packed, &scales, &biases, &indices, &weights],
                 &output,
+                &epilogue,
+                &[&residual],
             )
             .unwrap();
 
