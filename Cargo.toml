@@ -9,9 +9,6 @@ members = [
 ]
 resolver = "3"
 
-[profile.dev]
-debug = "line-tables-only"
-
 [workspace.package]
 edition = "2024"
 license = "MIT OR Apache-2.0"
