@@ -2599,7 +2599,11 @@ impl MetalBackend {
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        unreachable_patterns
+    )]
     fn encode_dispatch(
         &self,
         encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
@@ -2632,7 +2636,6 @@ impl MetalBackend {
             Op::RmsNorm { eps } => {
                 self.encode_rms_norm(encoder, table, dispatch, eps, bindings, arguments)?
             }
-            Op::Softmax => self.encode_softmax(encoder, table, dispatch, bindings, arguments)?,
             Op::Argmax => self.encode_argmax(encoder, table, dispatch, bindings, arguments)?,
             Op::TopK { k, normalize } => self.encode_top_k(
                 encoder,
@@ -2696,23 +2699,7 @@ impl MetalBackend {
             Op::Sdpa { .. } => {
                 self.encode_sdpa_dispatch(encoder, table, dispatch, bindings, arguments)?
             }
-            Op::Add | Op::SiluMul => {
-                let kernel = match dispatch.op() {
-                    Op::Add
-                        if dispatch
-                            .inputs()
-                            .iter()
-                            .chain(std::iter::once(dispatch.output()))
-                            .all(|tensor| tensor.layout().is_contiguous()) =>
-                    {
-                        "add_contiguous"
-                    }
-                    Op::Add => "add_strided",
-                    Op::SiluMul => "silu_mul",
-                    _ => return Err(BackendError::InvalidInput),
-                };
-                self.encode_elementwise(encoder, table, dispatch, kernel, bindings, arguments)?
-            }
+            _ => return Err(BackendError::UnsupportedOperation),
         };
         temporaries.extend(buffers);
         Ok(())
@@ -4961,22 +4948,6 @@ impl MetalBackend {
         Ok((temporaries, error_flag))
     }
 
-    fn encode_softmax(
-        &self,
-        encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
-        table: &ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>,
-        dispatch: &Dispatch,
-        bindings: &mut ArgumentBindings,
-        arguments: &mut ArgumentWriter,
-    ) -> Result<Vec<BufferBinding>, BackendError> {
-        let [input] = dispatch.inputs() else {
-            return Err(BackendError::InvalidInput);
-        };
-        let input = self.encoder_tensor(input)?;
-        let output = self.encoder_tensor(dispatch.output())?;
-        self.encode_softmax_tensors(encoder, table, &input, &output, bindings, arguments)
-    }
-
     fn encode_softmax_tensors(
         &self,
         encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
@@ -5661,77 +5632,6 @@ impl MetalBackend {
         Ok(temporaries)
     }
 
-    fn encode_elementwise(
-        &self,
-        encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
-        table: &ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>,
-        dispatch: &Dispatch,
-        kernel: &str,
-        bindings: &mut ArgumentBindings,
-        arguments: &mut ArgumentWriter,
-    ) -> Result<Vec<BufferBinding>, BackendError> {
-        use objc2_metal::MTLSize;
-
-        let operands = dispatch
-            .inputs()
-            .iter()
-            .chain(std::iter::once(dispatch.output()))
-            .collect::<Vec<_>>();
-        let constants = dispatch
-            .inputs()
-            .iter()
-            .enumerate()
-            .map(|(index, tensor)| {
-                Ok((
-                    u32::try_from(index).map_err(|_| BackendError::InvalidInput)?,
-                    dtype_code(tensor.layout().dtype()),
-                ))
-            })
-            .chain(std::iter::once(Ok((
-                2,
-                dtype_code(dispatch.output().layout().dtype()),
-            ))))
-            .collect::<Result<Vec<_>, BackendError>>()?;
-        let pipeline = self
-            .pipelines
-            .lock()
-            .map_err(|_| BackendError::ExecutionFailed)?
-            .get(kernel, &constants)?;
-        set_pipeline(encoder, &pipeline);
-        let layouts = operands
-            .iter()
-            .map(|tensor| Self::layout_buffer(tensor.layout(), arguments))
-            .collect::<Result<Vec<_>, _>>()?;
-        let buffers = self
-            .buffers
-            .lock()
-            .map_err(|_| BackendError::ExecutionFailed)?;
-        for (index, tensor) in operands.iter().enumerate() {
-            let buffer = buffers.get(tensor)?;
-            bindings.bind_raw(table, index, buffer)?;
-            bindings.bind(table, index + operands.len(), &layouts[index]);
-        }
-        drop(buffers);
-        set_argument_table(encoder, table);
-        let thread_count = usize::try_from(dispatch.output().layout().element_count())
-            .map_err(|_| BackendError::ExecutionFailed)?;
-        let group_width = pipeline.maxTotalThreadsPerThreadgroup().clamp(1, 256);
-        dispatch_threadgroups(
-            encoder,
-            MTLSize {
-                width: thread_count.div_ceil(group_width),
-                height: 1,
-                depth: 1,
-            },
-            MTLSize {
-                width: group_width,
-                height: 1,
-                depth: 1,
-            },
-        );
-        Ok(layouts)
-    }
-
     fn encode_program(
         &self,
         encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
@@ -5836,6 +5736,7 @@ impl MetalBackend {
         Ok(arguments.offset.max(1))
     }
 
+    #[allow(unreachable_patterns)]
     fn size_dispatch_arguments(
         &self,
         dispatch: &Dispatch,
@@ -5849,17 +5750,11 @@ impl MetalBackend {
                 }
             }
             Op::Copy => Self::size_copy_arguments(arguments)?,
-            Op::Add | Op::SiluMul => {
-                for _ in 0..=dispatch.inputs().len() {
-                    arguments.write(112)?;
-                }
-            }
             Op::RmsNorm { .. } => {
                 for len in [112, 112, 112, 8] {
                     arguments.write(len)?;
                 }
             }
-            Op::Softmax => Self::size_softmax_arguments(arguments)?,
             Op::Argmax => {
                 Self::size_softmax_arguments(arguments)?;
                 arguments.write(size_of::<u32>())?;
@@ -5910,6 +5805,7 @@ impl MetalBackend {
                 Self::size_gather_quant_arguments(dispatch, arguments)?;
             }
             Op::Sdpa { .. } => self.size_sdpa_arguments(dispatch, arguments)?,
+            _ => return Err(BackendError::UnsupportedOperation),
         }
         Ok(())
     }
@@ -6333,6 +6229,7 @@ fn shape3(layout: &Layout) -> Result<[u32; 3], BackendError> {
         .map_err(|_| BackendError::InvalidInput)
 }
 
+#[allow(unreachable_patterns)]
 fn supported_dispatch(dispatch: &Dispatch) -> bool {
     if dispatch.prepared_epilogue().is_some()
         && !matches!(
@@ -6361,10 +6258,7 @@ fn supported_dispatch(dispatch: &Dispatch) -> bool {
     match dispatch.op() {
         Op::Program(_) => dispatch.bound_program().is_some(),
         Op::Copy
-        | Op::Add
-        | Op::SiluMul
         | Op::RmsNorm { .. }
-        | Op::Softmax
         | Op::Argmax
         | Op::TopK { .. }
         | Op::Rope { .. }
@@ -6376,6 +6270,7 @@ fn supported_dispatch(dispatch: &Dispatch) -> bool {
         | Op::GatherQuantMatmul { .. }
         | Op::Sdpa { .. }
         | Op::Sample { .. } => true,
+        _ => false,
     }
 }
 
@@ -6393,6 +6288,7 @@ fn dispatch_profile(dispatch: &Dispatch, barrier: bool) -> Result<DispatchProfil
     })
 }
 
+#[allow(unreachable_patterns)]
 pub(super) fn dispatch_kernel(dispatch: &Dispatch) -> Result<&'static str, BackendError> {
     Ok(match dispatch.op() {
         Op::Program(_) => match dispatch
@@ -6415,19 +6311,7 @@ pub(super) fn dispatch_kernel(dispatch: &Dispatch) -> Result<&'static str, Backe
                 "copy_strided"
             }
         }
-        Op::Add
-            if dispatch
-                .inputs()
-                .iter()
-                .chain(std::iter::once(dispatch.output()))
-                .all(|tensor| tensor.layout().is_contiguous()) =>
-        {
-            "add_contiguous"
-        }
-        Op::Add => "add_strided",
-        Op::SiluMul => "silu_mul",
         Op::RmsNorm { .. } => row_kernel(dispatch, "rms_norm_single", "rms_norm_looped")?,
-        Op::Softmax => row_kernel(dispatch, "softmax_single", "softmax_looped")?,
         Op::Argmax => "argmax_partials+finalize",
         Op::TopK { .. } => match selected_variant(dispatch) {
             Some(MetalVariant::TopKSingleK8) => "topk_single",
@@ -6461,6 +6345,7 @@ pub(super) fn dispatch_kernel(dispatch: &Dispatch) -> Result<&'static str, Backe
             }
         }
         Op::Sdpa { .. } => sdpa_kernel(dispatch)?,
+        _ => return Err(BackendError::UnsupportedOperation),
     })
 }
 
@@ -8362,9 +8247,7 @@ mod tests {
             backend.write(&left, &left_bytes).unwrap();
             backend.write(&right, &right_bytes).unwrap();
             let mut commands = CommandList::new();
-            commands
-                .dispatch(Op::Add, &[&left, &right], &output)
-                .unwrap();
+            commands.dispatch(Op::Copy, &[&left], &output).unwrap();
             let submission = backend.submit(commands).unwrap();
             if sequence % 2 == 0 {
                 submission.wait().unwrap();
@@ -8372,7 +8255,7 @@ mod tests {
                 drop(submission);
             }
             let actual = backend.read(&output).unwrap();
-            let expected = vec![3.0_f32; len]
+            let expected = vec![1.0_f32; len]
                 .into_iter()
                 .flat_map(f32::to_le_bytes)
                 .collect::<Vec<_>>();
@@ -8383,11 +8266,11 @@ mod tests {
         }
     }
 
-    fn repeated_silu_mul_commands(tensors: &[Tensor; 3], dispatches: usize) -> CommandList {
+    fn repeated_copy_commands(tensors: &[Tensor; 3], dispatches: usize) -> CommandList {
         let mut commands = CommandList::new();
         for _ in 0..dispatches {
             commands
-                .dispatch(Op::SiluMul, &[&tensors[0], &tensors[1]], &tensors[2])
+                .dispatch(Op::Copy, &[&tensors[0]], &tensors[2])
                 .unwrap();
         }
         commands
@@ -8420,7 +8303,7 @@ mod tests {
                     let backend = Arc::clone(backend);
                     let submitted = Arc::clone(&submitted);
                     scope.spawn(move || {
-                        let commands = repeated_silu_mul_commands(tensors, dispatches);
+                        let commands = repeated_copy_commands(tensors, dispatches);
                         let started = Instant::now();
                         let submission = backend.submit(commands).unwrap();
                         submitted.wait();
@@ -8582,7 +8465,7 @@ mod tests {
         let backend = Arc::new(MetalBackend::new().unwrap());
         let workloads = submission_workloads(&backend, WORKERS);
         backend
-            .submit(repeated_silu_mul_commands(&workloads[0], 1))
+            .submit(repeated_copy_commands(&workloads[0], 1))
             .unwrap()
             .wait()
             .unwrap();
@@ -8590,7 +8473,7 @@ mod tests {
             .iter()
             .map(|tensors| {
                 backend
-                    .submit(repeated_silu_mul_commands(tensors, DISPATCHES))
+                    .submit(repeated_copy_commands(tensors, DISPATCHES))
                     .unwrap()
             })
             .collect::<Vec<_>>();
@@ -8635,13 +8518,10 @@ mod tests {
     fn metal_submission_reports_gpu_time() {
         let backend = MetalBackend::new().unwrap();
         let shape = [1024, 4097];
-        let gate = backend.alloc(DType::F32, &shape).unwrap();
-        let up = backend.alloc(DType::F32, &shape).unwrap();
+        let input = backend.alloc(DType::F32, &shape).unwrap();
         let output = backend.alloc(DType::F32, &shape).unwrap();
         let mut commands = CommandList::new();
-        commands
-            .dispatch(Op::SiluMul, &[&gate, &up], &output)
-            .unwrap();
+        commands.dispatch(Op::Copy, &[&input], &output).unwrap();
 
         let started = Instant::now();
         let submission = backend.submit(commands).unwrap();
@@ -8691,20 +8571,17 @@ mod tests {
     fn profiled_submission_reports_phases_and_dispatches() {
         let backend = MetalBackend::new().unwrap();
         let left = backend.alloc(DType::F32, &[7, 33]).unwrap();
-        let right = backend.alloc(DType::F32, &[7, 33]).unwrap();
         let output = backend.alloc(DType::F32, &[7, 33]).unwrap();
         let mut commands = CommandList::new();
-        commands
-            .dispatch(Op::Add, &[&left, &right], &output)
-            .unwrap();
+        commands.dispatch(Op::Copy, &[&left], &output).unwrap();
         let submission = backend.submit_profiled(commands).unwrap();
         submission.wait().unwrap();
         let profile = submission.profile().unwrap();
         assert_eq!(profile.dispatches, 1);
         assert_eq!(profile.per_dispatch.len(), 1);
         let dispatch = &profile.per_dispatch[0];
-        assert_eq!(dispatch.op, Op::Add);
-        assert_eq!(dispatch.kernel, "add_contiguous");
+        assert_eq!(dispatch.op, Op::Copy);
+        assert_eq!(dispatch.kernel, "copy_contiguous");
         assert_eq!(dispatch.inputs[0].shape, [7, 33]);
         assert_eq!(dispatch.outputs[0].dtype, DType::F32);
         assert!(!dispatch.barrier);
@@ -8719,17 +8596,16 @@ mod tests {
     fn prepared_graph_owns_one_persistent_residency_set() {
         let backend = MetalBackend::new().unwrap();
         let left = backend.alloc(DType::F32, &[7, 33]).unwrap();
-        let right = backend.alloc(DType::F32, &[7, 33]).unwrap();
         let output = backend.alloc(DType::F32, &[7, 33]).unwrap();
         let mut graph =
             GraphTemplate::new(ParamSpace::new(Vec::new()).unwrap(), GraphLimits::default());
         graph
-            .dispatch(Op::Add, &[&left.into(), &right.into()], &output.into())
+            .dispatch(Op::Copy, &[&left.into()], &output.into())
             .unwrap();
 
         let graph = backend.prepare_graph(graph).unwrap();
         let state = graph.backend_state::<PreparedMetalGraph>().unwrap();
-        assert_eq!(state.residency.allocationCount(), 3);
+        assert_eq!(state.residency.allocationCount(), 2);
         assert!(
             state
                 .encoding
@@ -9039,6 +8915,23 @@ mod tests {
         let staged = backend.alloc(DType::F32, &[1]).unwrap();
         let one = backend.alloc(DType::F32, &[1]).unwrap();
         backend.write(&one, &1.0_f32.to_le_bytes()).unwrap();
+        let add = Program {
+            kind: ProgramKind::Map,
+            insts: vec![
+                Inst::Input(0),
+                Inst::Input(1),
+                Inst::Binary(BinOp::Add, 0, 1),
+            ],
+            outputs: vec![(0, 2)],
+        }
+        .validate()
+        .unwrap();
+        let add = prepare_program(
+            &backend,
+            add,
+            KernelSignature::new(1, vec![DType::F32, DType::F32], vec![DType::F32], 0),
+        )
+        .unwrap();
         let mut template =
             GraphTemplate::new(ParamSpace::new(Vec::new()).unwrap(), GraphLimits::default());
         template
@@ -9049,10 +8942,10 @@ mod tests {
             )
             .unwrap();
         template
-            .dispatch(
-                Op::Add,
+            .dispatch_kernel(
+                &add,
                 &[&staged.into(), &one.into()],
-                &feedback.clone().into(),
+                &[&feedback.clone().into()],
             )
             .unwrap();
         let graph = backend.prepare_graph(template).unwrap();
@@ -9074,12 +8967,11 @@ mod tests {
     fn replayed_decode_reuses_every_device_allocation_after_warmup() {
         let backend = MetalBackend::new().unwrap();
         let hidden = backend.alloc(DType::F32, &[1, 1024]).unwrap();
-        let update = backend.alloc(DType::F32, &[1, 1024]).unwrap();
         let output = backend.alloc(DType::F32, &[1, 1024]).unwrap();
         let mut template =
             GraphTemplate::new(ParamSpace::new(Vec::new()).unwrap(), GraphLimits::default());
         template
-            .dispatch(Op::Add, &[&hidden.into(), &update.into()], &output.into())
+            .dispatch(Op::Copy, &[&hidden.into()], &output.into())
             .unwrap();
         let graph = backend.prepare_graph(template).unwrap();
         backend.replay(&graph, Vec::new()).unwrap().wait().unwrap();
@@ -9092,20 +8984,11 @@ mod tests {
         assert_eq!(backend.debug_state().allocation_requests, warm);
     }
 
-    fn exercise_graph_lifetime(
-        backend: &MetalBackend,
-        hidden: &Tensor,
-        update: &Tensor,
-        output: &Tensor,
-    ) {
+    fn exercise_graph_lifetime(backend: &MetalBackend, hidden: &Tensor, output: &Tensor) {
         let mut template =
             GraphTemplate::new(ParamSpace::new(Vec::new()).unwrap(), GraphLimits::default());
         template
-            .dispatch(
-                Op::Add,
-                &[&hidden.clone().into(), &update.clone().into()],
-                &output.clone().into(),
-            )
+            .dispatch(Op::Copy, &[&hidden.clone().into()], &output.clone().into())
             .unwrap();
         let graph = backend.prepare_graph(template).unwrap();
         let mut submissions = VecDeque::new();
@@ -9128,15 +9011,14 @@ mod tests {
 
         let backend = MetalBackend::new().unwrap();
         let hidden = backend.alloc(DType::F32, &[1, 1024]).unwrap();
-        let update = backend.alloc(DType::F32, &[1, 1024]).unwrap();
         let output = backend.alloc(DType::F32, &[1, 1024]).unwrap();
         for _ in 0..WARMUP_ITERATIONS {
-            exercise_graph_lifetime(&backend, &hidden, &update, &output);
+            exercise_graph_lifetime(&backend, &hidden, &output);
         }
         let settled = backend.memory_usage().device_bytes.unwrap();
 
         for _ in 0..CHECK_ITERATIONS {
-            exercise_graph_lifetime(&backend, &hidden, &update, &output);
+            exercise_graph_lifetime(&backend, &hidden, &output);
             let memory = backend.memory_usage();
             let device = memory.device_bytes.unwrap();
             assert!(
@@ -9315,17 +9197,13 @@ mod tests {
     fn dropped_submissions_retain_released_buffers() {
         let backend = MetalBackend::new().unwrap();
         for _ in 0..100 {
-            let gate = backend.alloc(DType::F32, &[4097]).unwrap();
-            let up = backend.alloc(DType::F32, &[4097]).unwrap();
+            let input = backend.alloc(DType::F32, &[4097]).unwrap();
             let output = backend.alloc(DType::F32, &[4097]).unwrap();
             let mut commands = CommandList::new();
-            commands
-                .dispatch(Op::SiluMul, &[&gate, &up], &output)
-                .unwrap();
+            commands.dispatch(Op::Copy, &[&input], &output).unwrap();
             let submission = backend.submit(commands).unwrap();
             drop(submission);
-            backend.release(&gate).unwrap();
-            backend.release(&up).unwrap();
+            backend.release(&input).unwrap();
             backend.release(&output).unwrap();
         }
         drop(backend);
@@ -9335,13 +9213,10 @@ mod tests {
     fn timed_out_work_never_exposes_an_active_output() {
         let backend = MetalBackend::with_gpu_timeout(Duration::from_micros(1)).unwrap();
         let shape = [1024, 4097];
-        let gate = backend.alloc(DType::F32, &shape).unwrap();
-        let up = backend.alloc(DType::F32, &shape).unwrap();
+        let input = backend.alloc(DType::F32, &shape).unwrap();
         let output = backend.alloc(DType::F32, &shape).unwrap();
         let mut commands = CommandList::new();
-        commands
-            .dispatch(Op::SiluMul, &[&gate, &up], &output)
-            .unwrap();
+        commands.dispatch(Op::Copy, &[&input], &output).unwrap();
 
         assert_eq!(
             backend.submit(commands).unwrap().wait(),
@@ -9351,49 +9226,6 @@ mod tests {
             Ok(bytes) => assert_eq!(bytes.len(), 1024 * 4097 * 4),
             Err(error) => assert_eq!(error, BackendError::Timeout),
         }
-    }
-
-    #[test]
-    fn metal_silu_mul_matches_cpu_for_dtypes_shapes_and_views() {
-        let reference = CpuBackend::new();
-        let candidate = MetalBackend::new().unwrap();
-        for dtype in [DType::F32, DType::F16, DType::BF16] {
-            for shape in [&[7, 3072][..], &[1, 3072], &[33, 4097]] {
-                let inputs = [
-                    TensorSpec::contiguous(dtype, shape),
-                    TensorSpec::contiguous(dtype, shape),
-                ];
-                let output = TensorSpec::contiguous(dtype, shape);
-                assert_backends_agree(&reference, &candidate, Op::SiluMul, &inputs, &output)
-                    .unwrap();
-            }
-        }
-
-        let permuted = [
-            TensorSpec::permuted(DType::F32, &[3072, 7], &[1, 0]),
-            TensorSpec::contiguous(DType::F32, &[7, 3072]),
-        ];
-        assert_backends_agree(
-            &reference,
-            &candidate,
-            Op::SiluMul,
-            &permuted,
-            &TensorSpec::contiguous(DType::F32, &[7, 3072]),
-        )
-        .unwrap();
-
-        let mixed = [
-            TensorSpec::contiguous(DType::F16, &[7, 3072]),
-            TensorSpec::contiguous(DType::BF16, &[7, 3072]),
-        ];
-        assert_backends_agree(
-            &reference,
-            &candidate,
-            Op::SiluMul,
-            &mixed,
-            &TensorSpec::contiguous(DType::F32, &[7, 3072]),
-        )
-        .unwrap();
     }
 
     #[test]
@@ -11035,36 +10867,6 @@ mod tests {
     }
 
     #[test]
-    fn metal_add_matches_cpu_for_dtypes_shapes_and_views() {
-        let reference = CpuBackend::new();
-        let candidate = MetalBackend::new().unwrap();
-        for dtype in [DType::F32, DType::F16, DType::BF16] {
-            for width in [1, 7, 33, 4097] {
-                let input = TensorSpec::contiguous(dtype, &[width]);
-                assert_backends_agree(
-                    &reference,
-                    &candidate,
-                    Op::Add,
-                    &[input.clone(), input],
-                    &TensorSpec::contiguous(dtype, &[width]),
-                )
-                .unwrap();
-            }
-            assert_backends_agree(
-                &reference,
-                &candidate,
-                Op::Add,
-                &[
-                    TensorSpec::permuted(dtype, &[7, 33], &[1, 0]),
-                    TensorSpec::broadcast(dtype, &[1, 7], &[33, 7]),
-                ],
-                &TensorSpec::contiguous(dtype, &[33, 7]),
-            )
-            .unwrap();
-        }
-    }
-
-    #[test]
     fn metal_rms_norm_matches_cpu_for_dtypes_rows_and_views() {
         let reference = CpuBackend::new();
         let candidate = MetalBackend::new().unwrap();
@@ -11105,32 +10907,6 @@ mod tests {
             &TensorSpec::contiguous(DType::F16, &[7, 1024]),
         )
         .unwrap();
-    }
-
-    #[test]
-    fn metal_softmax_matches_cpu_for_dtypes_rows_and_views() {
-        let reference = CpuBackend::new();
-        let candidate = MetalBackend::new().unwrap();
-        for dtype in [DType::F32, DType::F16, DType::BF16] {
-            for width in [1, 7, 33, 4097] {
-                assert_backends_agree(
-                    &reference,
-                    &candidate,
-                    Op::Softmax,
-                    &[TensorSpec::contiguous(dtype, &[7, width])],
-                    &TensorSpec::contiguous(dtype, &[7, width]),
-                )
-                .unwrap();
-            }
-            assert_backends_agree(
-                &reference,
-                &candidate,
-                Op::Softmax,
-                &[TensorSpec::permuted(dtype, &[33, 7], &[1, 0])],
-                &TensorSpec::contiguous(dtype, &[7, 33]),
-            )
-            .unwrap();
-        }
     }
 
     #[test]
@@ -11428,43 +11204,6 @@ mod tests {
                 ..
             })
         ));
-    }
-
-    #[test]
-    fn metal_softmax_handles_masked_and_all_masked_rows() {
-        let reference = CpuBackend::new();
-        let candidate = MetalBackend::new().unwrap();
-        let masked = [
-            0.0_f32,
-            f32::NEG_INFINITY,
-            1.0,
-            -1.0,
-            f32::NEG_INFINITY,
-            2.0,
-            0.5,
-        ]
-        .into_iter()
-        .flat_map(f32::to_le_bytes)
-        .collect::<Vec<_>>();
-        assert_backends_agree(
-            &reference,
-            &candidate,
-            Op::Softmax,
-            &[TensorSpec::initialized(DType::F32, &[1, 7], masked)],
-            &TensorSpec::contiguous(DType::F32, &[1, 7]),
-        )
-        .unwrap();
-        let all_masked = std::iter::repeat_n(f32::NEG_INFINITY, 33)
-            .flat_map(f32::to_le_bytes)
-            .collect::<Vec<_>>();
-        assert_backends_agree(
-            &reference,
-            &candidate,
-            Op::Softmax,
-            &[TensorSpec::initialized(DType::F32, &[1, 33], all_masked)],
-            &TensorSpec::contiguous(DType::F32, &[1, 33]),
-        )
-        .unwrap();
     }
 
     #[test]

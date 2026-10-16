@@ -1,10 +1,10 @@
 //! Row-program GPU differential and performance tests.
 
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use forja_core::{
     Backend, CommandList, DType, Op, Slice, Submission, Tensor, ViewOp,
-    program::{BinOp, Inst, Program, ProgramKind, RedOp, UnOp, ValidatedProgram},
+    program::{BinOp, Inst, PreparedProgram, Program, ProgramKind, RedOp, UnOp, ValidatedProgram},
 };
 use forja_cpu::CpuBackend;
 use forja_metal::MetalBackend;
@@ -12,7 +12,7 @@ use forja_testing::{
     DeterministicValues, TensorSpec, assert_outputs_agree, assert_program_backends_agree,
     program::{ProgramCase, row_programs, stable_row_programs},
     program_interval_report,
-    representative::{qk_norm_rope, residual_rms_norm, rms_norm, softmax},
+    representative::{qk_norm_rope, residual_add, residual_rms_norm, rms_norm},
 };
 use proptest::{
     prelude::*,
@@ -288,12 +288,7 @@ fn extrema_cancellation_stays_inside_a_narrow_interval() {
 #[test]
 fn metal_representative_rows_meet_d5_bar() {
     let backend = MetalBackend::new().unwrap();
-    let timings = [
-        rms_timing(&backend),
-        softmax_timing(&backend, "softmax-attention-4096", &[16, 4_096], 3),
-        softmax_timing(&backend, "softmax-attention-32768", &[32, 32_768], 4),
-        softmax_timing(&backend, "softmax-vocab-151936", &[1, 151_936], 5),
-    ];
+    let timings = [rms_timing(&backend)];
     eprintln!("operation,trusted_ns,program_ns,ratio");
     let mut failures = Vec::new();
     for timing in timings {
@@ -329,6 +324,10 @@ fn fused_residual_norm_matches_without_gross_kernel_regression() {
     let program_residual = backend.alloc(DType::F32, &shape).unwrap();
     let program_output = backend.alloc(DType::F32, &shape).unwrap();
     let program = residual_rms_norm(1.0e-6).validate().unwrap();
+    let add = residual_add().validate().unwrap();
+    let prepared_add =
+        forja_testing::prepare_program(&backend, &add, &[&residual, &update], &[&intermediate])
+            .unwrap();
     let _prepared = forja_testing::prepare_program(
         &backend,
         &program,
@@ -338,7 +337,14 @@ fn fused_residual_norm_matches_without_gross_kernel_regression() {
     .unwrap();
     run(
         &backend,
-        residual_norm_commands(&residual, &update, &weight, &intermediate, &trusted_output),
+        residual_norm_commands(
+            &prepared_add,
+            &residual,
+            &update,
+            &weight,
+            &intermediate,
+            &trusted_output,
+        ),
     );
     run(
         &backend,
@@ -357,7 +363,16 @@ fn fused_residual_norm_matches_without_gross_kernel_regression() {
     .unwrap();
     let (unfused, fused) = comparative_gpu_times(
         &backend,
-        || residual_norm_commands(&residual, &update, &weight, &intermediate, &trusted_output),
+        || {
+            residual_norm_commands(
+                &prepared_add,
+                &residual,
+                &update,
+                &weight,
+                &intermediate,
+                &trusted_output,
+            )
+        },
         || {
             program_commands(
                 &backend,
@@ -498,36 +513,6 @@ fn rms_timing(backend: &MetalBackend) -> Timing {
     }
 }
 
-fn softmax_timing(backend: &MetalBackend, name: &'static str, shape: &[u32], seed: u64) -> Timing {
-    let input = initialized_f32(backend, shape, seed);
-    let expected = backend.alloc(DType::F32, shape).unwrap();
-    let actual = backend.alloc(DType::F32, shape).unwrap();
-    let program = softmax().validate().unwrap();
-    let _prepared =
-        forja_testing::prepare_program(backend, &program, &[&input], &[&actual]).unwrap();
-    run(backend, trusted_commands(Op::Softmax, &[&input], &expected));
-    run(
-        backend,
-        program_commands(backend, &program, &[&input], &[&actual]),
-    );
-    assert_outputs_agree(
-        DType::F32,
-        &backend.read(&expected).unwrap(),
-        &backend.read(&actual).unwrap(),
-    )
-    .unwrap();
-    let (trusted, program) = comparative_gpu_times(
-        backend,
-        || trusted_commands(Op::Softmax, &[&input], &expected),
-        || program_commands(backend, &program, &[&input], &[&actual]),
-    );
-    Timing {
-        name,
-        trusted,
-        program,
-    }
-}
-
 fn run_with_values<B: Backend>(
     backend: &B,
     program: &ValidatedProgram,
@@ -589,6 +574,7 @@ fn program_commands<B: Backend>(
 }
 
 fn residual_norm_commands(
+    add: &Arc<PreparedProgram>,
     residual: &Tensor,
     update: &Tensor,
     weight: &Tensor,
@@ -597,7 +583,7 @@ fn residual_norm_commands(
 ) -> CommandList {
     let mut commands = CommandList::new();
     commands
-        .dispatch(Op::Add, &[residual, update], intermediate)
+        .dispatch_kernel(add, &[residual, update], &[intermediate])
         .unwrap();
     commands
         .dispatch(Op::RmsNorm { eps: 1.0e-6 }, &[intermediate, weight], output)

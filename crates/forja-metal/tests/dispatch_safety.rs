@@ -12,15 +12,7 @@ mod common;
 fn supported(op: Op) -> bool {
     matches!(
         op,
-        Op::Copy
-            | Op::Add
-            | Op::SiluMul
-            | Op::RmsNorm { .. }
-            | Op::Softmax
-            | Op::Rope { .. }
-            | Op::Embed
-            | Op::Matmul
-            | Op::Sdpa { .. }
+        Op::Copy | Op::RmsNorm { .. } | Op::Rope { .. } | Op::Embed | Op::Matmul | Op::Sdpa { .. }
     )
 }
 

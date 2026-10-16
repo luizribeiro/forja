@@ -54,8 +54,7 @@ fn print_completion_timing(backend: &MetalBackend) {
 
 fn main() {
     let backend = MetalBackend::new().unwrap();
-    let gate = backend.alloc(DType::F32, &[1]).unwrap();
-    let up = backend.alloc(DType::F32, &[1]).unwrap();
+    let input = backend.alloc(DType::F32, &[1]).unwrap();
     let output = backend.alloc(DType::F32, &[1]).unwrap();
 
     print_result(
@@ -63,12 +62,10 @@ fn main() {
         measure(|| backend.submit(CommandList::new()).unwrap().wait().unwrap()),
     );
     print_result(
-        "tiny SiluMul",
+        "tiny Copy",
         measure(|| {
             let mut commands = CommandList::new();
-            commands
-                .dispatch(Op::SiluMul, &[&gate, &up], &output)
-                .unwrap();
+            commands.dispatch(Op::Copy, &[&input], &output).unwrap();
             backend.submit(commands).unwrap().wait().unwrap();
         }),
     );

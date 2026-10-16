@@ -10,8 +10,7 @@ use forja_cpu::CpuBackend;
 use forja_metal::MetalBackend;
 use forja_testing::{
     DeterministicValues, assert_outputs_agree, assert_program_backends_agree,
-    program::map_programs,
-    representative::{half_split_rope, residual_add, silu_mul},
+    program::map_programs, representative::half_split_rope,
 };
 use proptest::{
     prelude::*,
@@ -352,25 +351,7 @@ fn run_small_program<B: Backend>(
 #[test]
 fn metal_representative_maps_meet_d5_bar() {
     let backend = MetalBackend::new().unwrap();
-    let timings = [
-        binary_timing(
-            &backend,
-            "residual-add",
-            Op::Add,
-            &residual_add(),
-            &[128, 1024],
-            1,
-        ),
-        binary_timing(
-            &backend,
-            "silu-mul",
-            Op::SiluMul,
-            &silu_mul(),
-            &[33, 3072],
-            2,
-        ),
-        rope_timing(&backend),
-    ];
+    let timings = [rope_timing(&backend)];
     eprintln!("operation,trusted_ns,program_ns,ratio");
     let mut failures = Vec::new();
     for timing in timings {
@@ -395,48 +376,6 @@ struct Timing {
     name: &'static str,
     trusted: Duration,
     program: Duration,
-}
-
-fn binary_timing(
-    backend: &MetalBackend,
-    name: &'static str,
-    op: Op,
-    source: &Program,
-    shape: &[u32],
-    seed: u64,
-) -> Timing {
-    let left = initialized_f32(backend, shape, seed);
-    let right = initialized_f32(backend, shape, seed + 1);
-    let trusted_output = backend.alloc(DType::F32, shape).unwrap();
-    let program_output = backend.alloc(DType::F32, shape).unwrap();
-    let program = source.validate().unwrap();
-    let _prepared =
-        forja_testing::prepare_program(backend, &program, &[&left, &right], &[&program_output])
-            .unwrap();
-    run(
-        backend,
-        trusted_commands(op, &[&left, &right], &trusted_output),
-    );
-    run(
-        backend,
-        program_commands(backend, &program, &[&left, &right], &[&program_output]),
-    );
-    assert_outputs_agree(
-        DType::F32,
-        &backend.read(&trusted_output).unwrap(),
-        &backend.read(&program_output).unwrap(),
-    )
-    .unwrap();
-    let (trusted, program) = comparative_gpu_times(
-        backend,
-        || trusted_commands(op, &[&left, &right], &trusted_output),
-        || program_commands(backend, &program, &[&left, &right], &[&program_output]),
-    );
-    Timing {
-        name,
-        trusted,
-        program,
-    }
 }
 
 fn rope_timing(backend: &MetalBackend) -> Timing {
