@@ -1315,13 +1315,7 @@ fn sample_row(
             .then_with(|| right.cmp(&left))
     });
     let requested = usize::try_from(parameters.top_k).map_err(|_| BackendError::InvalidInput)?;
-    let cap = if parameters.top_p < 1.0 {
-        if requested == 0 {
-            1024
-        } else {
-            requested.min(1024)
-        }
-    } else if requested == 0 {
+    let cap = if requested == 0 {
         allowed.len()
     } else {
         requested
@@ -2152,6 +2146,15 @@ mod tests {
             assert!(sample_row(&row, top_p, position).unwrap() <= 1);
             assert!(sample_row(&row, combined, position).unwrap() <= 1);
         }
+    }
+
+    #[test]
+    fn top_p_uses_the_full_candidate_set_beyond_1024_values() {
+        let row = vec![0.0; 1025];
+        let parameters = sampling_parameters(1.0, 0, 0.9995, 11);
+        let mut allowed = (0..row.len()).collect::<Vec<_>>();
+        truncate_top_p(&row, &mut allowed, parameters).unwrap();
+        assert_eq!(allowed.len(), 1025);
     }
 
     #[test]

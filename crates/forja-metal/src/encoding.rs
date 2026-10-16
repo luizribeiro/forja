@@ -7761,13 +7761,7 @@ mod tests {
                 .then_with(|| right.cmp(&left))
         });
         let requested = usize::try_from(top_k).unwrap();
-        let cap = if top_p < 1.0 {
-            if requested == 0 {
-                1024
-            } else {
-                requested.min(1024)
-            }
-        } else if requested == 0 {
+        let cap = if requested == 0 {
             allowed.len()
         } else {
             requested
