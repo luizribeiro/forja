@@ -9651,6 +9651,32 @@ mod tests {
     }
 
     #[test]
+    fn metal_epilogue_families_check_both_edge_columns_at_required_widths() {
+        let backend = MetalBackend::new().unwrap();
+        for columns in [1, 7, 33, 4097, 151_936] {
+            assert_dense_epilogue("matmul.steel-64x32x32-2x2", false, true, 2, 64, columns);
+            assert_quant_epilogue(
+                &backend,
+                "quant-matmul.small-m",
+                DType::F32,
+                4,
+                2,
+                64,
+                columns,
+                true,
+            );
+            assert_gather_quant_epilogue(
+                &backend,
+                "gather-quant-matmul.route-gemv",
+                DType::F32,
+                4,
+                [2, 2, columns],
+                true,
+            );
+        }
+    }
+
+    #[test]
     fn metal_quant_gemv_epilogues_cover_formats_dtypes_and_odd_columns() {
         let backend = MetalBackend::new().unwrap();
         for dtype in [DType::F32, DType::F16, DType::BF16] {
