@@ -244,14 +244,34 @@ impl CpuBackend {
         dispatch: Option<&forja_core::Dispatch>,
         accumulators: Vec<f32>,
     ) -> Result<Vec<f32>, BackendError> {
+        self.apply_epilogue_accumulators(dispatch, vec![accumulators])
+    }
+
+    fn apply_epilogue_accumulators(
+        &self,
+        dispatch: Option<&forja_core::Dispatch>,
+        accumulators: Vec<Vec<f32>>,
+    ) -> Result<Vec<f32>, BackendError> {
         let Some(dispatch) = dispatch else {
-            return Ok(accumulators);
+            return accumulators
+                .into_iter()
+                .next()
+                .ok_or(BackendError::ExecutionFailed);
         };
         let Some(epilogue) = dispatch.prepared_epilogue() else {
-            return Ok(accumulators);
+            if accumulators.len() != 1 {
+                return Err(BackendError::ExecutionFailed);
+            }
+            return accumulators
+                .into_iter()
+                .next()
+                .ok_or(BackendError::ExecutionFailed);
         };
         let extras = &dispatch.inputs()[dispatch.primitive_inputs().len()..];
-        let mut decoded = vec![DecodedInput::F32(accumulators)];
+        let mut decoded = accumulators
+            .into_iter()
+            .map(DecodedInput::F32)
+            .collect::<Vec<_>>();
         decoded.extend(self.decode_inputs(extras)?);
         let inputs = decoded
             .iter()
@@ -849,25 +869,62 @@ impl CpuBackend {
         group_size: u32,
         epilogue_dispatch: Option<&forja_core::Dispatch>,
     ) -> Result<(), BackendError> {
-        let activations = decode(&self.read(&inputs[0])?, inputs[0].layout().dtype())
+        let index_position = inputs
+            .len()
+            .checked_sub(1)
             .ok_or(BackendError::ExecutionFailed)?;
-        let packed = decode_u32(&self.read(&inputs[1])?).ok_or(BackendError::ExecutionFailed)?;
-        let scales = decode(&self.read(&inputs[2])?, inputs[2].layout().dtype())
+        let (first, invalid_route) = self.gather_quant_projection_values(
+            inputs,
+            output,
+            bits,
+            group_size,
+            [0, 1, 2, 3, index_position],
+        )?;
+        let accumulators = if inputs.len() == 8 {
+            let (second, _) = self.gather_quant_projection_values(
+                inputs,
+                output,
+                bits,
+                group_size,
+                [0, 4, 5, 6, 7],
+            )?;
+            vec![first, second]
+        } else {
+            vec![first]
+        };
+        let values = self.apply_epilogue_accumulators(epilogue_dispatch, accumulators)?;
+        self.write_output(output, &values)?;
+        invalid_route.map_or(Ok(()), |index| Err(BackendError::IndexOutOfRange { index }))
+    }
+
+    fn gather_quant_projection_values(
+        &self,
+        inputs: &[Tensor],
+        output: &Tensor,
+        bits: u8,
+        group_size: u32,
+        positions: [usize; 5],
+    ) -> Result<(Vec<f32>, Option<u32>), BackendError> {
+        let [input, packed, scales, biases, indices] = positions.map(|position| &inputs[position]);
+        let activations = decode(&self.read(input)?, input.layout().dtype())
             .ok_or(BackendError::ExecutionFailed)?;
-        let biases = decode(&self.read(&inputs[3])?, inputs[3].layout().dtype())
+        let packed_values = decode_u32(&self.read(packed)?).ok_or(BackendError::ExecutionFailed)?;
+        let scale_values = decode(&self.read(scales)?, scales.layout().dtype())
             .ok_or(BackendError::ExecutionFailed)?;
-        let indices = decode_u32(&self.read(&inputs[4])?).ok_or(BackendError::ExecutionFailed)?;
-        let [_rows, inner]: [u32; 2] = inputs[0]
+        let bias_values = decode(&self.read(biases)?, biases.layout().dtype())
+            .ok_or(BackendError::ExecutionFailed)?;
+        let index_values = decode_u32(&self.read(indices)?).ok_or(BackendError::ExecutionFailed)?;
+        let [_rows, inner]: [u32; 2] = input
             .layout()
             .shape()
             .try_into()
             .map_err(|_| BackendError::ExecutionFailed)?;
-        let [experts, columns, packed_width]: [u32; 3] = inputs[1]
+        let [experts, columns, packed_width]: [u32; 3] = packed
             .layout()
             .shape()
             .try_into()
             .map_err(|_| BackendError::ExecutionFailed)?;
-        let [_, k]: [u32; 2] = inputs[4]
+        let [_, k]: [u32; 2] = indices
             .layout()
             .shape()
             .try_into()
@@ -886,7 +943,7 @@ impl CpuBackend {
         let mut invalid_route = None;
         for (row, activation) in activations.chunks_exact(inner).enumerate() {
             let route = row.checked_mul(k).ok_or(BackendError::ExecutionFailed)?;
-            for &expert in indices
+            for &expert in index_values
                 .get(route..route.checked_add(k).ok_or(BackendError::ExecutionFailed)?)
                 .ok_or(BackendError::ExecutionFailed)?
             {
@@ -909,9 +966,9 @@ impl CpuBackend {
                 for column in 0..columns {
                     values.push(affine_quant_dot(
                         activation,
-                        &packed,
-                        &scales,
-                        &biases,
+                        &packed_values,
+                        &scale_values,
+                        &bias_values,
                         packed_base + column * packed_width,
                         group_base + column * group_count,
                         group_size,
@@ -920,9 +977,7 @@ impl CpuBackend {
                 }
             }
         }
-        let values = self.apply_epilogue(epilogue_dispatch, values)?;
-        self.write_output(output, &values)?;
-        invalid_route.map_or(Ok(()), |index| Err(BackendError::IndexOutOfRange { index }))
+        Ok((values, invalid_route))
     }
 
     fn execute_gather_quant_matmul_combine(
@@ -1627,7 +1682,7 @@ mod tests {
     use forja_core::{
         Affine, GraphLimits, GraphTemplate, Op, ParamSpace, Slice, SymbolicLayout, TemplateTensor,
         program::{
-            BinOp, EpilogueSignature, Inst, KernelSignature, Program, ProgramKind, ValueType,
+            BinOp, EpilogueSignature, Inst, KernelSignature, Program, ProgramKind, UnOp, ValueType,
             prepare_epilogue, prepare_program,
         },
     };
@@ -2516,10 +2571,30 @@ mod tests {
         );
 
         let fused = backend.alloc(DType::F32, &[1, 3, 2]).unwrap();
+        let epilogue = prepare_epilogue(
+            Program {
+                kind: ProgramKind::Map,
+                insts: vec![
+                    Inst::Input(0),
+                    Inst::Input(1),
+                    Inst::Unary(UnOp::Neg, 0),
+                    Inst::Unary(UnOp::Exp, 2),
+                    Inst::Const(1.0),
+                    Inst::Binary(BinOp::Add, 4, 3),
+                    Inst::Binary(BinOp::Div, 0, 5),
+                    Inst::Binary(BinOp::Mul, 6, 1),
+                ],
+                outputs: vec![(0, 7)],
+            }
+            .validate()
+            .unwrap(),
+            EpilogueSignature::new(2, 3, vec![], DType::F32),
+        )
+        .unwrap();
         let mut commands = CommandList::new();
         commands
-            .dispatch(
-                Op::GatherQuantSiluMul {
+            .dispatch_epilogue(
+                Op::GatherQuantMatmul {
                     bits: 4,
                     group_size: 64,
                 },
@@ -2527,6 +2602,8 @@ mod tests {
                     &input, &packed, &scales, &biases, &packed, &scales, &biases, &indices,
                 ],
                 &fused,
+                &epilogue,
+                &[],
             )
             .unwrap();
         backend.submit(commands).unwrap().wait().unwrap();
