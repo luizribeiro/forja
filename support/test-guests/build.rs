@@ -57,18 +57,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     forja_build::build_component(&qwen3_manifest, &guest_target_dir, &[])?;
     forja_build::build_component(&qwen3_manifest, &bf16_target_dir, &["--features", "bf16"])?;
 
-    let [
-        qwen3,
-        qwen3_bf16,
-        qwen3_residual_norm,
-        qwen3_bf16_residual_norm,
-        qwen3_qk_norm_rope,
-        qwen3_silu_mul,
-        qwen3_final_norm,
-        qwen3_all_fusions,
-        qwen3_bf16_all_fusions,
-        qwen3_tuning_profile,
-    ] = build_qwen_profiles(
+    let [qwen3, qwen3_bf16, qwen3_tuning_profile] = build_qwen_profiles(
         &qwen3_manifest,
         &guest_target_dir,
         &bf16_target_dir,
@@ -115,16 +104,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     emit_guest_path("OLMOE_COMPONENT", &olmoe);
     emit_guest_path("QWEN3_CODER_COMPONENT", &qwen3_coder);
     emit_guest_path("QWEN3_BF16_COMPONENT", &qwen3_bf16);
-    emit_guest_path("QWEN3_RESIDUAL_NORM_COMPONENT", &qwen3_residual_norm);
-    emit_guest_path(
-        "QWEN3_BF16_RESIDUAL_NORM_COMPONENT",
-        &qwen3_bf16_residual_norm,
-    );
-    emit_guest_path("QWEN3_QK_NORM_ROPE_COMPONENT", &qwen3_qk_norm_rope);
-    emit_guest_path("QWEN3_SILU_MUL_COMPONENT", &qwen3_silu_mul);
-    emit_guest_path("QWEN3_FINAL_NORM_COMPONENT", &qwen3_final_norm);
-    emit_guest_path("QWEN3_ALL_FUSIONS_COMPONENT", &qwen3_all_fusions);
-    emit_guest_path("QWEN3_BF16_ALL_FUSIONS_COMPONENT", &qwen3_bf16_all_fusions);
     emit_guest_path("QWEN3_TUNING_PROFILE_COMPONENT", &qwen3_tuning_profile);
     emit_guest_path(
         "WEIGHTS_SMOKE_COMPONENT",
@@ -194,7 +173,7 @@ fn build_qwen_profiles(
     target_dir: &Path,
     bf16_target_dir: &Path,
     out_dir: &Path,
-) -> io::Result<[PathBuf; 10]> {
+) -> io::Result<[PathBuf; 3]> {
     let release_dir = target_dir.join("wasm32-wasip2/release");
     let bf16_release_dir = bf16_target_dir.join("wasm32-wasip2/release");
     let profiles = manifest
@@ -213,46 +192,12 @@ fn build_qwen_profiles(
         out_dir,
         "qwen3-bf16.wasm",
     )?;
-    let variants = [
-        "qwen3-residual-norm.wasm",
-        "qwen3-qk-norm-rope.wasm",
-        "qwen3-silu-mul.wasm",
-        "qwen3-final-norm.wasm",
-        "qwen3-all-fusions.wasm",
-    ]
-    .map(|name| copy_component(&qwen3, out_dir, name))
-    .into_iter()
-    .collect::<io::Result<Vec<_>>>()?;
-    let [
-        qwen3_residual_norm,
-        qwen3_qk_norm_rope,
-        qwen3_silu_mul,
-        qwen3_final_norm,
-        qwen3_all_fusions,
-    ] = variants
-        .try_into()
-        .map_err(|_| io::Error::other("fusion profile count changed"))?;
-    let qwen3_bf16_residual_norm =
-        copy_component(&qwen3_bf16, out_dir, "qwen3-bf16-residual-norm.wasm")?;
-    let qwen3_bf16_all_fusions =
-        copy_component(&qwen3_bf16, out_dir, "qwen3-bf16-all-fusions.wasm")?;
     let qwen3_tuning_profile = copy_tuning_profiled_component(
         &release_dir.join("qwen3.wasm"),
         &profiles.join("qwen3-0.6b.metal-apple-m3-ultra.f32.toml"),
         out_dir,
     )?;
-    Ok([
-        qwen3,
-        qwen3_bf16,
-        qwen3_residual_norm,
-        qwen3_bf16_residual_norm,
-        qwen3_qk_norm_rope,
-        qwen3_silu_mul,
-        qwen3_final_norm,
-        qwen3_all_fusions,
-        qwen3_bf16_all_fusions,
-        qwen3_tuning_profile,
-    ])
+    Ok([qwen3, qwen3_bf16, qwen3_tuning_profile])
 }
 
 fn copy_tuning_profiled_component(
@@ -270,12 +215,6 @@ fn copy_tuning_profiled_component(
         forja_config::embed_profile(&fs::read(source)?, &profile).map_err(io::Error::other)?;
     let destination = out_dir.join("qwen3-tuning-profile.wasm");
     fs::write(&destination, component)?;
-    Ok(destination)
-}
-
-fn copy_component(source: &Path, out_dir: &Path, name: &str) -> io::Result<PathBuf> {
-    let destination = out_dir.join(name);
-    fs::copy(source, &destination)?;
     Ok(destination)
 }
 
