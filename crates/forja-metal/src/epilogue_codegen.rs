@@ -480,6 +480,29 @@ mod tests {
         assert!(route_sum < route_edge && route_edge < route_valid && route_valid < route_call);
         assert!(route_call < route_store);
 
+        let weighted_start = source
+            .find("kernel void gather_quantized_weighted_sum(")
+            .unwrap();
+        let weighted = &source[weighted_start
+            ..source[weighted_start..]
+                .find("kernel void gather_quantized_pair(")
+                .unwrap()
+                + weighted_start];
+        let weighted_call = weighted.rfind("forja_epilogue(").unwrap();
+        let weighted_barrier = weighted[..weighted_call]
+            .rfind("threadgroup_barrier(")
+            .unwrap();
+        let weighted_edge = weighted[..weighted_call]
+            .rfind("if (column < params.columns)")
+            .unwrap();
+        let weighted_store =
+            weighted[weighted_call..].find("store_float(").unwrap() + weighted_call;
+        assert!(
+            weighted_barrier < weighted_edge
+                && weighted_edge < weighted_call
+                && weighted_call < weighted_store
+        );
+
         let grouped_start = source.find("kernel void grouped_quantized_gemm(").unwrap();
         let grouped = &source[grouped_start
             ..source[grouped_start..]

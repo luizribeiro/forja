@@ -6,6 +6,7 @@ constant uint quant_group_size [[function_constant(13)]];
 constant uint gather_words_per_thread [[function_constant(14)]];
 constant uint quant_words_per_thread [[function_constant(15)]];
 constant uint paired_legacy_silu [[function_constant(16)]];
+constant uint weighted_sum_legacy_residual [[function_constant(17)]];
 
 struct QuantEmbedParams {
     uint vocab;
@@ -667,7 +668,7 @@ struct GatherQuantMatmulCombineParams {
     uint group_size;
 };
 
-kernel void gather_quantized_gemv_combine(
+kernel void gather_quantized_weighted_sum(
     device const uchar *input [[buffer(0)]],
     device const uchar *packed [[buffer(1)]],
     device const uchar *scales [[buffer(2)]],
@@ -678,6 +679,7 @@ kernel void gather_quantized_gemv_combine(
     device uchar *output [[buffer(7)]],
     constant GatherQuantMatmulCombineParams &params [[buffer(8)]],
     device atomic_uint *error_flag [[buffer(9)]],
+    FORJA_EPILOGUE_ARGUMENTS
     ushort simdgroup [[simdgroup_index_in_threadgroup]],
     ushort lane [[thread_index_in_simdgroup]],
     uint2 tile [[threadgroup_position_in_grid]]) {
@@ -721,13 +723,21 @@ kernel void gather_quantized_gemv_combine(
     if (simdgroup == 0 && lane < 4) {
         uint column = first_column + uint(lane);
         if (column < params.columns) {
-            float value = load_float(
-                residual,
-                params.residual_offset + ulong(tile.y) * params.residual_row_stride +
-                    ulong(column) * params.residual_column_stride,
-                input0_dtype);
+            float value = weighted_sum_legacy_residual
+                ? load_float(
+                    residual,
+                    params.residual_offset + ulong(tile.y) * params.residual_row_stride +
+                        ulong(column) * params.residual_column_stride,
+                    input0_dtype)
+                : 0.0f;
             for (uint slot = 0; slot < params.routes; ++slot) {
                 value += partials[slot * 4 + uint(lane)];
+            }
+            if (!weighted_sum_legacy_residual) {
+                value = forja_epilogue(
+                    value, 0.0f, 0u, tile.y, column,
+                    1u, params.rows, params.columns,
+                    FORJA_EPILOGUE_VALUES);
             }
             store_float(
                 output,
