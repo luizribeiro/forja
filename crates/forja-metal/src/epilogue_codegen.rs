@@ -313,6 +313,25 @@ mod tests {
         .unwrap()
     }
 
+    fn function_definition<'a>(source: &'a str, declaration: &str) -> &'a str {
+        let start = source.find(declaration).unwrap();
+        let open = source[start..].find('{').unwrap() + start;
+        let mut depth = 0_u32;
+        for (offset, byte) in source[open..].bytes().enumerate() {
+            match byte {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &source[start..=open + offset];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("unclosed function definition for {declaration}");
+    }
+
     #[test]
     fn helper_addresses_depend_only_on_coordinates_and_layouts() {
         let source = generate_helper(&bias_epilogue()).unwrap();
@@ -405,32 +424,28 @@ mod tests {
     #[test]
     fn quant_splices_follow_collectives_and_edge_checks() {
         let source = generate_source(&bias_epilogue()).unwrap();
-        for (kernel, end_marker, expected_calls, collective, edge) in [
+        for (kernel, collectives, edge) in [
             (
                 "kernel void quantized_gemv(",
-                "kernel void quantized_gemv_q8_fast(",
-                2,
-                "quantized_q",
+                &["quantized_q8_sums(", "quantized_qmv_sums("][..],
                 "if (column < params.columns)",
             ),
             (
                 "kernel void quantized_gemv_q8_fast(",
-                "kernel void quantized_router_q8(",
-                1,
-                "simd_sum(",
+                &["simd_sum("][..],
                 "if (column < params.columns)",
             ),
         ] {
-            let start = source.find(kernel).unwrap();
-            let body = &source[start..source[start..].find(end_marker).unwrap() + start];
-            assert_eq!(body.matches("forja_epilogue(").count(), expected_calls);
-            let mut end = 0;
-            while let Some(offset) = body[end..].find("forja_epilogue(") {
-                let call = end + offset;
+            let body = function_definition(&source, kernel);
+            let calls = body
+                .match_indices("forja_epilogue(")
+                .map(|(offset, _)| offset)
+                .collect::<Vec<_>>();
+            assert_eq!(calls.len(), collectives.len());
+            for (&call, collective) in calls.iter().zip(collectives) {
                 let before = &body[..call];
                 assert!(before.rfind(collective).unwrap() < before.rfind(edge).unwrap());
                 assert!(body[call..].find("store_float(").is_some());
-                end = call + 1;
             }
         }
     }
@@ -467,7 +482,7 @@ mod tests {
         let route_start = source.find("kernel void gather_quantized_gemv(").unwrap();
         let route = &source[route_start
             ..source[route_start..]
-                .find("struct GatherQuantMatmulCombineParams")
+                .find("struct GatherQuantMatmulWeightedParams")
                 .unwrap()
                 + route_start];
         let route_call = route.rfind("forja_epilogue(").unwrap();

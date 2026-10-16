@@ -5,8 +5,6 @@ constant uint quant_bits [[function_constant(12)]];
 constant uint quant_group_size [[function_constant(13)]];
 constant uint gather_words_per_thread [[function_constant(14)]];
 constant uint quant_words_per_thread [[function_constant(15)]];
-constant uint paired_legacy_silu [[function_constant(16)]];
-constant uint weighted_sum_legacy_residual [[function_constant(17)]];
 
 struct QuantEmbedParams {
     uint vocab;
@@ -419,107 +417,6 @@ kernel void quantized_gemv_q8_fast(
     }
 }
 
-kernel void quantized_router_q8(
-    device const uchar *input [[buffer(0)]],
-    device const uchar *packed [[buffer(1)]],
-    device const uchar *scales [[buffer(2)]],
-    device const uchar *biases [[buffer(3)]],
-    device uchar *logit_output [[buffer(4)]],
-    device uchar *route_weights [[buffer(5)]],
-    device uint *route_indices [[buffer(6)]],
-    constant QuantMatmulParams &params [[buffer(7)]],
-    constant TensorLayout &weight_layout [[buffer(8)]],
-    constant TensorLayout &index_layout [[buffer(9)]],
-    constant uint &top_k [[buffer(10)]],
-    constant uint &normalize [[buffer(11)]],
-    uint row [[threadgroup_position_in_grid]],
-    uint lane [[thread_position_in_threadgroup]],
-    ushort simdgroup [[simdgroup_index_in_threadgroup]],
-    ushort simd_lane [[thread_index_in_simdgroup]]) {
-    threadgroup float logits[128];
-    threadgroup ulong group_candidates[32];
-    threadgroup ulong selected[8];
-    threadgroup float normalization_maximum;
-    threadgroup float denominator;
-    uint first_column = uint(simdgroup) * 8;
-    float sums[8] = {0.0f};
-    quantized_q8_sums(
-        input, packed, scales, biases, params,
-        params.input_offset + ulong(row) * params.input_row_stride,
-        first_column, simd_lane, sums);
-    if (simd_lane == 0) {
-        for (uint item = 0; item < 8; ++item) {
-            uint column = first_column + item;
-            if (column < params.columns) {
-                logits[column] = sums[item];
-                store_float(
-                    logit_output,
-                    params.output_offset + ulong(row) * params.output_row_stride +
-                        ulong(column) * params.output_column_stride,
-                    output_dtype,
-                    sums[item]);
-            }
-        }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    ulong candidate = lane < params.columns ? topk_candidate(logits[lane], lane) : 0;
-    if (simdgroup < 4) {
-        if (simd_lane == 0) {
-            for (uint slot = top_k; slot < 8; ++slot) {
-                group_candidates[uint(simdgroup) * 8 + slot] = 0;
-            }
-        }
-        for (uint slot = 0; slot < top_k; ++slot) {
-            ulong best = simd_candidate_max(candidate);
-            if (candidate == best) {
-                candidate = 0;
-            }
-            if (simd_lane == 0) {
-                group_candidates[uint(simdgroup) * 8 + slot] = best;
-            }
-        }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (simdgroup == 0) {
-        candidate = group_candidates[simd_lane];
-        for (uint slot = 0; slot < top_k; ++slot) {
-            ulong best = simd_candidate_max(candidate);
-            if (candidate == best) {
-                candidate = 0;
-            }
-            if (simd_lane == 0) {
-                selected[slot] = best;
-            }
-        }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (lane == 0) {
-        denominator = 1.0f;
-        if (normalize != 0) {
-            normalization_maximum = logits[~uint(selected[0])];
-            denominator = 0.0f;
-            for (uint slot = 0; slot < top_k; ++slot) {
-                denominator += exp(logits[~uint(selected[slot])] - normalization_maximum);
-            }
-        }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (lane < top_k) {
-        uint column = ~uint(selected[lane]);
-        uint output_index = row * top_k + lane;
-        float value = logits[column];
-        if (normalize != 0) {
-            value = exp(value - normalization_maximum) / denominator;
-        }
-        store_float(
-            route_weights,
-            physical_index(weight_layout, output_index),
-            output_dtype,
-            value);
-        route_indices[physical_index(index_layout, output_index)] = column;
-    }
-}
-
 struct GatherQuantMatmulParams {
     ulong input_offset;
     ulong packed_offset;
@@ -629,14 +526,13 @@ kernel void gather_quantized_gemv(
     }
 }
 
-struct GatherQuantMatmulCombineParams {
+struct GatherQuantMatmulWeightedParams {
     ulong input_offset;
     ulong packed_offset;
     ulong scale_offset;
     ulong bias_offset;
     ulong indices_offset;
     ulong weights_offset;
-    ulong residual_offset;
     ulong output_offset;
     ulong input_row_stride;
     ulong input_route_stride;
@@ -654,8 +550,6 @@ struct GatherQuantMatmulCombineParams {
     ulong indices_route_stride;
     ulong weights_row_stride;
     ulong weights_route_stride;
-    ulong residual_row_stride;
-    ulong residual_column_stride;
     ulong output_row_stride;
     ulong output_column_stride;
     uint rows;
@@ -675,10 +569,9 @@ kernel void gather_quantized_weighted_sum(
     device const uchar *biases [[buffer(3)]],
     device const uint *indices [[buffer(4)]],
     device const uchar *weights [[buffer(5)]],
-    device const uchar *residual [[buffer(6)]],
-    device uchar *output [[buffer(7)]],
-    constant GatherQuantMatmulCombineParams &params [[buffer(8)]],
-    device atomic_uint *error_flag [[buffer(9)]],
+    device uchar *output [[buffer(6)]],
+    constant GatherQuantMatmulWeightedParams &params [[buffer(7)]],
+    device atomic_uint *error_flag [[buffer(8)]],
     FORJA_EPILOGUE_ARGUMENTS
     ushort simdgroup [[simdgroup_index_in_threadgroup]],
     ushort lane [[thread_index_in_simdgroup]],
@@ -723,22 +616,14 @@ kernel void gather_quantized_weighted_sum(
     if (simdgroup == 0 && lane < 4) {
         uint column = first_column + uint(lane);
         if (column < params.columns) {
-            float value = weighted_sum_legacy_residual
-                ? load_float(
-                    residual,
-                    params.residual_offset + ulong(tile.y) * params.residual_row_stride +
-                        ulong(column) * params.residual_column_stride,
-                    input0_dtype)
-                : 0.0f;
+            float value = 0.0f;
             for (uint slot = 0; slot < params.routes; ++slot) {
                 value += partials[slot * 4 + uint(lane)];
             }
-            if (!weighted_sum_legacy_residual) {
-                value = forja_epilogue(
-                    value, 0.0f, 0u, tile.y, column,
-                    1u, params.rows, params.columns,
-                    FORJA_EPILOGUE_VALUES);
-            }
+            value = forja_epilogue(
+                value, 0.0f, 0u, tile.y, column,
+                1u, params.rows, params.columns,
+                FORJA_EPILOGUE_VALUES);
             store_float(
                 output,
                 params.output_offset + ulong(tile.y) * params.output_row_stride +
@@ -810,13 +695,10 @@ kernel void gather_quantized_pair(
             uint local_column = uint(simdgroup) * 4 + item;
             uint column = tile.x * 8 + local_column;
             if (column < gate_params.columns) {
-                float gate = gate_values[local_column];
-                float result = paired_legacy_silu
-                    ? gate / (1.0f + exp(-gate)) * up_values[local_column]
-                    : forja_epilogue(
-                        gate, up_values[local_column], row, slot, column,
-                        gate_params.rows, gate_params.routes, gate_params.columns,
-                        FORJA_EPILOGUE_VALUES);
+                float result = forja_epilogue(
+                    gate_values[local_column], up_values[local_column], row, slot, column,
+                    gate_params.rows, gate_params.routes, gate_params.columns,
+                    FORJA_EPILOGUE_VALUES);
                 ulong output_index = gate_params.output_offset +
                     ulong(row) * gate_params.output_row_stride +
                     ulong(slot) * gate_params.output_slot_stride +
@@ -1120,13 +1002,10 @@ kernel void gathered_pair_from_projections(
             0.0f);
         return;
     }
-    float gate_value = gate[index];
-    float result = paired_legacy_silu
-        ? gate_value / (1.0f + exp(-gate_value)) * up[index]
-        : forja_epilogue(
-            gate_value, up[index], row, slot, column,
-            params.rows, params.routes, params.columns,
-            FORJA_EPILOGUE_VALUES);
+    float result = forja_epilogue(
+        gate[index], up[index], row, slot, column,
+        params.rows, params.routes, params.columns,
+        FORJA_EPILOGUE_VALUES);
     store_float(
         output,
         params.output_offset + ulong(row) * params.output_row_stride +

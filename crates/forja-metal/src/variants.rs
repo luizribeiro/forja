@@ -29,9 +29,6 @@ pub(crate) enum MetalVariant {
     GatherQuantMatmulPortable,
     GatherQuantMatmulRouteGemv,
     GatherQuantMatmulGrouped,
-    GatherQuantSiluMulPortable,
-    GatherQuantSiluMulRouteGemv,
-    GatherQuantSiluMulGrouped,
     SdpaPortable,
     SdpaDecomposed,
     SdpaVectorSinglePass,
@@ -211,7 +208,6 @@ const PACKED: TensorRef = TensorRef::input("packed weights", 1);
 const SCALES: TensorRef = TensorRef::input("scales", 2);
 const BIASES: TensorRef = TensorRef::input("biases", 3);
 const INDICES_MATMUL: TensorRef = TensorRef::input("route indices", 4);
-const INDICES_SILU: TensorRef = TensorRef::input("route indices", 7);
 const OUTPUT: TensorRef = TensorRef::output("output", 0);
 const QUERY: TensorRef = TensorRef::input("query", 0);
 const KEY: TensorRef = TensorRef::input("key", 1);
@@ -223,8 +219,6 @@ const INNER: Dimension = dim("inner", INPUT, Axis::Index(1));
 const EXPERTS: Dimension = dim("experts", PACKED, Axis::Index(0));
 const MATMUL_ROWS: Dimension = dim("rows", INDICES_MATMUL, Axis::Index(0));
 const MATMUL_ROUTES: Dimension = dim("routes", INDICES_MATMUL, Axis::Index(1));
-const SILU_ROWS: Dimension = dim("rows", INDICES_SILU, Axis::Index(0));
-const SILU_ROUTES: Dimension = dim("routes", INDICES_SILU, Axis::Index(1));
 const QUERY_HEADS: Dimension = dim("query heads", QUERY, Axis::Index(0));
 const QUERY_LENGTH: Dimension = dim("query length", QUERY, Axis::Index(1));
 const KEY_HEADS: Dimension = dim("key/value heads", KEY, Axis::Index(0));
@@ -369,7 +363,6 @@ const fn grouped(rows: Dimension, routes: Dimension) -> [Constraint; 2] {
 }
 
 const GROUPED_MATMUL: &[Constraint] = &grouped(MATMUL_ROWS, MATMUL_ROUTES);
-const GROUPED_SILU: &[Constraint] = &grouped(SILU_ROWS, SILU_ROUTES);
 const WIDTHS: &[u64] = &[64, 128];
 const VECTOR_COMMON: &[Constraint] = &[
     value(QUERY_LENGTH, Relation::Equal(1)),
@@ -585,33 +578,6 @@ pub(crate) static REGISTRY: &[VariantDef<MetalVariant>] = &[
         &["Sorts routes into bounded expert groups."]
     ),
     variant!(
-        "gather-quant-silu-mul.portable",
-        GatherQuantSiluMul,
-        GatherQuantSiluMulPortable,
-        &[],
-        &["portable source that does not select a backend-specific algorithm."],
-        &["large routed batches can amortize grouping."],
-        &["Uses route GEMV for every valid shape."]
-    ),
-    variant!(
-        "gather-quant-silu-mul.route-gemv",
-        GatherQuantSiluMul,
-        GatherQuantSiluMulRouteGemv,
-        &[],
-        &["fewer than 64 routed rows or more than 256 experts."],
-        &["enough routes to amortize grouping."],
-        &["Executes both projections per routed row."]
-    ),
-    variant!(
-        "gather-quant-silu-mul.grouped",
-        GatherQuantSiluMul,
-        GatherQuantSiluMulGrouped,
-        GROUPED_SILU,
-        &["at least 64 routed rows with at most 256 experts."],
-        &["small route counts."],
-        &["Groups routes before both quantized projections."]
-    ),
-    variant!(
         "sdpa.portable",
         Sdpa,
         SdpaPortable,
@@ -690,10 +656,9 @@ pub(crate) const fn portable_name(operation: OperationKind) -> Option<&'static s
         OperationKind::Matmul => Some("matmul.portable"),
         OperationKind::QuantMatmul => Some("quant-matmul.portable"),
         OperationKind::GatherQuantMatmul => Some("gather-quant-matmul.portable"),
-        OperationKind::GatherQuantSiluMul => Some("gather-quant-silu-mul.portable"),
         OperationKind::Sdpa => Some("sdpa.portable"),
         OperationKind::TopK => Some("top-k.portable"),
-        OperationKind::Other => None,
+        OperationKind::GatherQuantSiluMul | OperationKind::Other => None,
     }
 }
 
@@ -702,10 +667,9 @@ pub(crate) const fn portable_implementation(operation: OperationKind) -> Option<
         OperationKind::Matmul => Some(MetalVariant::MatmulPortable),
         OperationKind::QuantMatmul => Some(MetalVariant::QuantMatmulPortable),
         OperationKind::GatherQuantMatmul => Some(MetalVariant::GatherQuantMatmulPortable),
-        OperationKind::GatherQuantSiluMul => Some(MetalVariant::GatherQuantSiluMulPortable),
         OperationKind::Sdpa => Some(MetalVariant::SdpaPortable),
         OperationKind::TopK => Some(MetalVariant::TopKPortable),
-        OperationKind::Other => None,
+        OperationKind::GatherQuantSiluMul | OperationKind::Other => None,
     }
 }
 
@@ -1254,7 +1218,7 @@ mod tests {
         commands.into_dispatches().remove(0)
     }
 
-    fn gathered_dispatch(silu: bool, rows: u32, routes: u32, experts: u32) -> Dispatch {
+    fn gathered_dispatch(rows: u32, routes: u32, experts: u32) -> Dispatch {
         let backend = CpuBackend::new();
         let (dtype, inner, columns, bits, group_size) = (DType::BF16, 64, 33, 4, 64);
         let input = backend.alloc(dtype, &[rows, inner]).unwrap();
@@ -1278,27 +1242,13 @@ mod tests {
         let indices = backend.alloc(DType::U32, &[rows, routes]).unwrap();
         let output = backend.alloc(dtype, &[rows, routes, columns]).unwrap();
         let mut commands = CommandList::new();
-        if silu {
-            let (up_packed, up_scales, up_biases) = weights();
-            commands
-                .dispatch(
-                    Op::GatherQuantSiluMul { bits, group_size },
-                    &[
-                        &input, &packed, &scales, &biases, &up_packed, &up_scales, &up_biases,
-                        &indices,
-                    ],
-                    &output,
-                )
-                .unwrap();
-        } else {
-            commands
-                .dispatch(
-                    Op::GatherQuantMatmul { bits, group_size },
-                    &[&input, &packed, &scales, &biases, &indices],
-                    &output,
-                )
-                .unwrap();
-        }
+        commands
+            .dispatch(
+                Op::GatherQuantMatmul { bits, group_size },
+                &[&input, &packed, &scales, &biases, &indices],
+                &output,
+            )
+            .unwrap();
         commands.into_dispatches().remove(0)
     }
 
@@ -1564,33 +1514,18 @@ mod tests {
             ),
             (
                 "gather-quant-matmul.portable",
-                gathered_dispatch(false, 64, 1, 256),
+                gathered_dispatch(64, 1, 256),
                 "gather_quantized_gemv",
             ),
             (
                 "gather-quant-matmul.route-gemv",
-                gathered_dispatch(false, 1, 1, 257),
+                gathered_dispatch(1, 1, 257),
                 "gather_quantized_gemv",
             ),
             (
                 "gather-quant-matmul.grouped",
-                gathered_dispatch(false, 64, 1, 256),
+                gathered_dispatch(64, 1, 256),
                 "grouped_quantized_gemm",
-            ),
-            (
-                "gather-quant-silu-mul.portable",
-                gathered_dispatch(true, 64, 1, 256),
-                "gather_quantized_pair",
-            ),
-            (
-                "gather-quant-silu-mul.route-gemv",
-                gathered_dispatch(true, 1, 1, 257),
-                "gather_quantized_pair",
-            ),
-            (
-                "gather-quant-silu-mul.grouped",
-                gathered_dispatch(true, 64, 1, 256),
-                "gathered_pair_from_projections",
             ),
             (
                 "sdpa.portable",
@@ -1665,17 +1600,17 @@ mod tests {
                 false,
             ),
             (
-                gathered_dispatch(false, 63, 1, 256),
+                gathered_dispatch(63, 1, 256),
                 "gather-quant-matmul.grouped",
                 false,
             ),
             (
-                gathered_dispatch(false, 64, 1, 256),
+                gathered_dispatch(64, 1, 256),
                 "gather-quant-matmul.grouped",
                 true,
             ),
             (
-                gathered_dispatch(false, 64, 1, 257),
+                gathered_dispatch(64, 1, 257),
                 "gather-quant-matmul.grouped",
                 false,
             ),
@@ -1721,7 +1656,7 @@ mod tests {
             let dispatch = match family {
                 0 => matmul_case(dtype, size, odd, 33, alternate),
                 1 => quant_dispatch(dtype, size, if odd < 64 { 64 } else { odd }, alternate),
-                2 => gathered_dispatch(alternate, size, if alternate { 7 } else { 1 }, if odd == 256 { 257 } else { odd }),
+                2 => gathered_dispatch(size, if alternate { 7 } else { 1 }, if odd == 256 { 257 } else { odd }),
                 3 => sdpa_dispatch(dtype, (size % 32).max(1), if alternate { 1 } else { 7 }, odd.max(33), 64, 64),
                 _ => top_k_dispatch(odd.max(8)),
             };
