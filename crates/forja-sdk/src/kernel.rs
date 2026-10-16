@@ -65,7 +65,11 @@ pub(crate) fn run_epilogue(
 ) -> Result<()> {
     let rank = u8::try_from(output.shape.len())
         .map_err(|_| Error::new("epilogue output rank is too large"))?;
-    if epilogue.accumulator_count != 1
+    let accumulator_count = match operation {
+        sys::Op::GatherQuantMatmul { .. } if primitive_inputs.len() == 8 => 2,
+        _ => 1,
+    };
+    if epilogue.accumulator_count != accumulator_count
         || epilogue.rank != rank
         || epilogue.output != output.dtype
         || epilogue.extras.len() != extras.len()

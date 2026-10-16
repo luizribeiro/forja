@@ -4,6 +4,14 @@
 
 mod support;
 
+#[forja_sdk::kernel(map)]
+fn paired_silu(
+    first: forja_sdk::kernel::Elem,
+    second: forja_sdk::kernel::Elem,
+) -> forja_sdk::kernel::Elem {
+    first * first.sigmoid() * second
+}
+
 #[test]
 fn structured_ops_match_the_cpu_backend() {
     support::matmul_rope_embedding_match_cpu();
@@ -58,6 +66,48 @@ fn affine_quantized_matmul_routes_through_the_sdk() {
         .quant_matmul(&packed, &scales, &biases, 4, 64)
         .unwrap();
     assert_eq!(output.to_vec().unwrap(), [96.0, -48.0]);
+}
+
+#[test]
+fn paired_gathered_projections_route_through_the_sdk() {
+    use forja_sdk::{DType, Tensor, bf16};
+
+    let input = Tensor::from_slice(&[1.0_f32; 64], &[1, 64]).unwrap();
+    let first_packed = Tensor::from_slice(&[0x1111_1111_u32; 16], &[1, 2, 8]).unwrap();
+    let first_scales =
+        Tensor::from_slice(&[bf16::from_f32(0.5), bf16::from_f32(0.25)], &[1, 2, 1]).unwrap();
+    let first_biases =
+        Tensor::from_slice(&[bf16::from_f32(1.0), bf16::from_f32(-1.0)], &[1, 2, 1]).unwrap();
+    let second_packed = Tensor::from_slice(&[0x2222_2222_u32; 16], &[1, 2, 8]).unwrap();
+    let second_scales =
+        Tensor::from_slice(&[bf16::from_f32(0.25), bf16::from_f32(0.5)], &[1, 2, 1]).unwrap();
+    let second_biases =
+        Tensor::from_slice(&[bf16::from_f32(0.0), bf16::from_f32(1.0)], &[1, 2, 1]).unwrap();
+    let indices = Tensor::from_slice(&[0_u32], &[1, 1]).unwrap();
+    let epilogue = paired_silu_epilogue(2, 3, &[], DType::F32).unwrap();
+    let output = input
+        .gather_quant_matmul_pair_epilogue(
+            [
+                (&first_packed, &first_scales, &first_biases),
+                (&second_packed, &second_scales, &second_biases),
+            ],
+            &indices,
+            4,
+            64,
+            &epilogue,
+            &[],
+        )
+        .unwrap()
+        .to_vec()
+        .unwrap();
+    let expected = [96.0_f32, -48.0]
+        .into_iter()
+        .zip([32.0_f32, 128.0])
+        .map(|(first, second)| first / (1.0 + (-first).exp()) * second)
+        .collect::<Vec<_>>();
+    for (actual, expected) in output.into_iter().zip(expected) {
+        assert!((actual - expected).abs() < 1.0e-4);
+    }
 }
 
 #[test]

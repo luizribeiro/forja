@@ -970,6 +970,125 @@ impl<T: Element> Tensor<T> {
         Ok(output)
     }
 
+    /// Multiplies two gathered quantized projections and combines their accumulators with an
+    /// epilogue before storage.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for incompatible weights, routes, or epilogue bindings.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gather_quant_matmul_pair_epilogue<S: FloatElement>(
+        &self,
+        projections: [(&Tensor<u32>, &Tensor<S>, &Tensor<S>); 2],
+        indices: &Tensor<u32>,
+        bits: u8,
+        group_size: u32,
+        epilogue: &Epilogue,
+        extras: &[TensorRef<'_>],
+    ) -> Result<Self>
+    where
+        T: FloatElement,
+    {
+        self.gather_quant_matmul_pair_epilogue_selected(
+            projections,
+            indices,
+            bits,
+            group_size,
+            epilogue,
+            extras,
+            None,
+        )
+    }
+
+    /// Multiplies two gathered quantized projections with an epilogue and explicit Metal
+    /// selection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for incompatible bindings, rule context, or a refused selection.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gather_quant_matmul_pair_epilogue_with<'a, S: FloatElement>(
+        &self,
+        projections: [(&Tensor<u32>, &Tensor<S>, &Tensor<S>); 2],
+        indices: &Tensor<u32>,
+        bits: u8,
+        group_size: u32,
+        epilogue: &Epilogue,
+        extras: &[TensorRef<'_>],
+        selection: impl Into<crate::target::metal::VariantChoice<'a>>,
+    ) -> Result<Self>
+    where
+        T: FloatElement,
+    {
+        self.gather_quant_matmul_pair_epilogue_selected(
+            projections,
+            indices,
+            bits,
+            group_size,
+            epilogue,
+            extras,
+            Some(selection.into()),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn gather_quant_matmul_pair_epilogue_selected<S: FloatElement>(
+        &self,
+        projections: [(&Tensor<u32>, &Tensor<S>, &Tensor<S>); 2],
+        indices: &Tensor<u32>,
+        bits: u8,
+        group_size: u32,
+        epilogue: &Epilogue,
+        extras: &[TensorRef<'_>],
+        selection: Option<crate::target::metal::VariantChoice<'_>>,
+    ) -> Result<Self>
+    where
+        T: FloatElement,
+    {
+        let [
+            (first_packed, first_scales, first_biases),
+            (second_packed, second_scales, second_biases),
+        ] = projections;
+        let shape = self.gather_quantized_shape(
+            first_packed,
+            first_scales,
+            first_biases,
+            indices,
+            bits,
+            group_size,
+        )?;
+        if self.gather_quantized_shape(
+            second_packed,
+            second_scales,
+            second_biases,
+            indices,
+            bits,
+            group_size,
+        )? != shape
+        {
+            return Err(Error::new("gathered projection shapes differ"));
+        }
+        let output = Self::empty(shape.to_vec())?;
+        crate::kernel::run_epilogue(
+            sys::Op::GatherQuantMatmul { bits, group_size },
+            &[
+                &self.handle,
+                &first_packed.handle,
+                &first_scales.handle,
+                &first_biases.handle,
+                &second_packed.handle,
+                &second_scales.handle,
+                &second_biases.handle,
+                &indices.handle,
+            ],
+            TensorRef::new(&output)?,
+            epilogue,
+            extras,
+            selection,
+        )?;
+        Ok(output)
+    }
+
     /// Multiplies routed rows with an explicit Metal algorithm selection.
     ///
     /// # Errors
