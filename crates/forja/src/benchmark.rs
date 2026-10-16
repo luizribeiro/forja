@@ -1981,17 +1981,15 @@ const fn op_name(operation: Op) -> &'static str {
         Op::TopK { .. } => "top-k",
         Op::Sample { .. } => "sample",
         Op::Rope { .. } => "rope",
-        Op::QkvRopeCache { .. } => "qkv-rope-cache",
         Op::Embed => "embed",
         Op::QuantEmbed { .. } => "quant-embed",
         Op::Matmul => "matmul",
         Op::GatherMatmul => "gather-matmul",
         Op::QuantMatmul { .. } => "quant-matmul",
-        Op::QuantizedRouter { .. } => "quantized-router",
         Op::GatherQuantMatmul { .. } => "gather-quant-matmul",
-        Op::GatherQuantMatmulCombine { .. } => "gather-quant-matmul-combine",
-        Op::GatherQuantSiluMul { .. } => "gather-quant-silu-mul",
         Op::Sdpa { .. } => "sdpa",
+        #[allow(unreachable_patterns)]
+        _ => "unsupported",
     }
 }
 
