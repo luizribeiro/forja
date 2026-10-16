@@ -200,11 +200,6 @@ fn guest_rope_supports_both_styles_and_partial_prefixes() {
 }
 
 #[test]
-fn projected_cache_composition_matches_the_trusted_operation() {
-    support::projected_cache_composition_matches_trusted_operation();
-}
-
-#[test]
 fn guest_softmax_matches_the_trusted_operation() {
     support::guest_softmax_matches_trusted_operation();
 }

@@ -84,12 +84,6 @@ fn metal_guest_rope_covers_styles_and_partial_prefixes() {
 }
 
 #[test]
-fn metal_projected_cache_composition_matches_trusted_operation() {
-    set_native_device(NativeDevice::Metal);
-    support::projected_cache_composition_matches_trusted_operation();
-}
-
-#[test]
 fn metal_guest_softmax_matches_trusted_operation() {
     set_native_device(NativeDevice::Metal);
     support::guest_softmax_matches_trusted_operation();

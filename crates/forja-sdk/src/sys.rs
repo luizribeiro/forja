@@ -80,10 +80,6 @@ pub(crate) enum Op {
         position: Affine,
     },
     Rope(f32),
-    QkvRopeCache {
-        eps: f32,
-        theta: f32,
-    },
     Embed,
     QuantEmbed {
         bits: u8,
@@ -95,20 +91,7 @@ pub(crate) enum Op {
         bits: u8,
         group_size: u32,
     },
-    QuantizedRouter {
-        group_size: u32,
-        k: u32,
-        normalize: bool,
-    },
     GatherQuantMatmul {
-        bits: u8,
-        group_size: u32,
-    },
-    GatherQuantMatmulCombine {
-        bits: u8,
-        group_size: u32,
-    },
-    GatherQuantSiluMul {
         bits: u8,
         group_size: u32,
     },
@@ -616,9 +599,6 @@ pub(crate) mod guest {
                 position: wit_affine(position),
             }),
             Op::Rope(theta) => compute::Op::Rope(compute::RopeCfg { theta }),
-            Op::QkvRopeCache { eps, theta } => {
-                compute::Op::QkvRopeCache(compute::QkvRopeCacheCfg { eps, theta })
-            }
             Op::Embed => compute::Op::Embed,
             Op::QuantEmbed { bits, group_size } => {
                 compute::Op::QuantEmbed(compute::QuantMatmulCfg { bits, group_size })
@@ -628,23 +608,8 @@ pub(crate) mod guest {
             Op::QuantMatmul { bits, group_size } => {
                 compute::Op::QuantMatmul(compute::QuantMatmulCfg { bits, group_size })
             }
-            Op::QuantizedRouter {
-                group_size,
-                k,
-                normalize,
-            } => compute::Op::QuantizedRouter(compute::QuantizedRouterCfg {
-                group_size,
-                k,
-                normalize,
-            }),
             Op::GatherQuantMatmul { bits, group_size } => {
                 compute::Op::GatherQuantMatmul(compute::QuantMatmulCfg { bits, group_size })
-            }
-            Op::GatherQuantMatmulCombine { bits, group_size } => {
-                compute::Op::GatherQuantMatmulCombine(compute::QuantMatmulCfg { bits, group_size })
-            }
-            Op::GatherQuantSiluMul { bits, group_size } => {
-                compute::Op::GatherQuantSiluMul(compute::QuantMatmulCfg { bits, group_size })
             }
             Op::Sdpa {
                 scale,
@@ -1391,29 +1356,13 @@ pub(crate) mod native {
                 position: position.offset,
             },
             Op::Rope(theta) => CoreOp::Rope { theta },
-            Op::QkvRopeCache { eps, theta } => CoreOp::QkvRopeCache { eps, theta },
             Op::Embed => CoreOp::Embed,
             Op::QuantEmbed { bits, group_size } => CoreOp::QuantEmbed { bits, group_size },
             Op::Matmul => CoreOp::Matmul,
             Op::GatherMatmul => CoreOp::GatherMatmul,
             Op::QuantMatmul { bits, group_size } => CoreOp::QuantMatmul { bits, group_size },
-            Op::QuantizedRouter {
-                group_size,
-                k,
-                normalize,
-            } => CoreOp::QuantizedRouter {
-                group_size,
-                k,
-                normalize,
-            },
             Op::GatherQuantMatmul { bits, group_size } => {
                 CoreOp::GatherQuantMatmul { bits, group_size }
-            }
-            Op::GatherQuantMatmulCombine { bits, group_size } => {
-                CoreOp::GatherQuantMatmulCombine { bits, group_size }
-            }
-            Op::GatherQuantSiluMul { bits, group_size } => {
-                CoreOp::GatherQuantSiluMul { bits, group_size }
             }
             Op::Sdpa {
                 scale,
