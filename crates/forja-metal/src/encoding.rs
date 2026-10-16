@@ -40,7 +40,8 @@ use objc2_metal::{
 use crate::{
     epilogue_codegen, map_codegen,
     matmul::{
-        GEMM_32_64, GEMM_64_32, GEMM_64_64_FLOAT, GEMM_64_64_HALF, classify, select_internal_gemm,
+        GEMM_32_64, GEMM_64_32, GEMM_64_64_FLOAT, GEMM_64_64_HALF, GemmConfig, classify,
+        select_internal_gemm,
     },
     storage::{GraphArenaReservation, MetalBackend, MetalBuffer},
     variants::MetalVariant,
@@ -3004,7 +3005,7 @@ impl MetalBackend {
             (2, dtype_code(output.layout.dtype())),
             (12, u32::from(bits)),
             (13, group_size),
-            (15, u32::from(columns % 8 == 0 && inner % 512 == 0) + 1),
+            (15, quant_epilogue_specialization(columns, inner)),
         ];
         let mut pipelines = self
             .pipelines
@@ -3229,7 +3230,7 @@ impl MetalBackend {
             .last()
             .copied()
             .ok_or(BackendError::InvalidInput)?;
-        let words_per_thread = u32::from(columns % 8 == 0 && inner % 512 == 0) + 1;
+        let words_per_thread = gather_epilogue_specialization(columns, inner);
         let params = arguments.write(&params)?;
         let mut error_state = [0_u8; 8];
         error_state[4..].copy_from_slice(&u32::MAX.to_ne_bytes());
@@ -4659,25 +4660,23 @@ impl MetalBackend {
                     )
                     .ok_or(BackendError::InvalidInput)?,
                 };
+                let mut constants = vec![
+                    (0, dtype_code(shape.left_dtype)),
+                    (1, dtype_code(shape.right_dtype)),
+                    (2, dtype_code(shape.output_dtype)),
+                ];
+                constants.extend(dense_epilogue_specialization(
+                    config,
+                    shape.rows,
+                    shape.columns,
+                    shape.inner,
+                ));
                 (
                     config.kernel,
                     config.block_rows,
                     config.block_columns,
                     config.thread_count,
-                    vec![
-                        (0, dtype_code(shape.left_dtype)),
-                        (1, dtype_code(shape.right_dtype)),
-                        (2, dtype_code(shape.output_dtype)),
-                        (200, u32::from(shape.rows.is_multiple_of(config.block_rows))),
-                        (
-                            201,
-                            u32::from(shape.columns.is_multiple_of(config.block_columns)),
-                        ),
-                        (
-                            202,
-                            u32::from(shape.inner.is_multiple_of(config.block_inner)),
-                        ),
-                    ],
+                    constants,
                 )
             };
         let mut pipelines = self
@@ -7175,6 +7174,41 @@ const fn dtype_key(dtype: DType) -> u8 {
     }
 }
 
+fn dense_epilogue_specialization(
+    config: GemmConfig,
+    rows: u32,
+    columns: u32,
+    inner: u32,
+) -> [(u32, u32); 3] {
+    [
+        (200, u32::from(rows.is_multiple_of(config.block_rows))),
+        (201, u32::from(columns.is_multiple_of(config.block_columns))),
+        (202, u32::from(inner.is_multiple_of(config.block_inner))),
+    ]
+}
+
+fn dense_epilogue_specializations(config: GemmConfig) -> [[(u32, u32); 3]; 8] {
+    let mut values = [[(0, 0); 3]; 8];
+    let mut index = 0;
+    for rows in [config.block_rows - 1, config.block_rows] {
+        for columns in [config.block_columns - 1, config.block_columns] {
+            for inner in [config.block_inner - 1, config.block_inner] {
+                values[index] = dense_epilogue_specialization(config, rows, columns, inner);
+                index += 1;
+            }
+        }
+    }
+    values
+}
+
+fn quant_epilogue_specialization(columns: u32, inner: u32) -> u32 {
+    u32::from(columns.is_multiple_of(8) && inner.is_multiple_of(512)) + 1
+}
+
+fn gather_epilogue_specialization(columns: u32, inner: u32) -> u32 {
+    u32::from(columns.is_multiple_of(8) && inner.is_multiple_of(512)) + 1
+}
+
 struct EpiloguePipelineRequest {
     family: epilogue_codegen::FamilySourceTag,
     epilogue: Arc<PreparedEpilogue>,
@@ -7206,19 +7240,22 @@ fn epilogue_pipeline_requests(
             ];
             let implementation = quant_matmul_kernel(dispatch)?;
             if parameter_dependent {
-                Ok([1, 2]
-                    .into_iter()
-                    .map(|words| {
-                        let mut constants = constants.clone();
-                        constants.push((15, words));
-                        EpiloguePipelineRequest {
-                            family: epilogue_codegen::FamilySourceTag::Quant,
-                            epilogue: Arc::clone(&epilogue),
-                            implementation,
-                            constants,
-                        }
-                    })
-                    .collect())
+                Ok([
+                    quant_epilogue_specialization(7, 511),
+                    quant_epilogue_specialization(8, 512),
+                ]
+                .into_iter()
+                .map(|words| {
+                    let mut constants = constants.clone();
+                    constants.push((15, words));
+                    EpiloguePipelineRequest {
+                        family: epilogue_codegen::FamilySourceTag::Quant,
+                        epilogue: Arc::clone(&epilogue),
+                        implementation,
+                        constants,
+                    }
+                })
+                .collect())
             } else {
                 let inner = *input
                     .layout()
@@ -7231,7 +7268,7 @@ fn epilogue_pipeline_requests(
                     .shape()
                     .last()
                     .ok_or(BackendError::InvalidInput)?;
-                constants.push((15, u32::from(columns % 8 == 0 && inner % 512 == 0) + 1));
+                constants.push((15, quant_epilogue_specialization(columns, inner)));
                 Ok(vec![EpiloguePipelineRequest {
                     family: epilogue_codegen::FamilySourceTag::Quant,
                     epilogue,
@@ -7280,40 +7317,29 @@ fn dense_epilogue_requests(
         _ => return Err(BackendError::UnsupportedOperation),
     };
     if parameter_dependent {
-        let mut requests = Vec::with_capacity(8);
-        for rows in 0..=1 {
-            for columns in 0..=1 {
-                for inner in 0..=1 {
-                    let mut constants = constants.clone();
-                    constants.extend([(200, rows), (201, columns), (202, inner)]);
-                    requests.push(EpiloguePipelineRequest {
-                        family: epilogue_codegen::FamilySourceTag::Dense,
-                        epilogue: Arc::clone(&epilogue),
-                        implementation,
-                        constants,
-                    });
+        return Ok(dense_epilogue_specializations(config)
+            .into_iter()
+            .map(|specialization| {
+                let mut constants = constants.clone();
+                constants.extend(specialization);
+                EpiloguePipelineRequest {
+                    family: epilogue_codegen::FamilySourceTag::Dense,
+                    epilogue: Arc::clone(&epilogue),
+                    implementation,
+                    constants,
                 }
-            }
-        }
-        return Ok(requests);
+            })
+            .collect());
     }
     let left_shape = left.layout().shape();
     let right_shape = right.layout().shape();
     let mut constants = constants;
-    constants.extend([
-        (
-            200,
-            u32::from(left_shape[left_shape.len() - 2].is_multiple_of(config.block_rows)),
-        ),
-        (
-            201,
-            u32::from(right_shape[right_shape.len() - 1].is_multiple_of(config.block_columns)),
-        ),
-        (
-            202,
-            u32::from(left_shape[left_shape.len() - 1].is_multiple_of(config.block_inner)),
-        ),
-    ]);
+    constants.extend(dense_epilogue_specialization(
+        config,
+        left_shape[left_shape.len() - 2],
+        right_shape[right_shape.len() - 1],
+        left_shape[left_shape.len() - 1],
+    ));
     Ok(vec![EpiloguePipelineRequest {
         family: epilogue_codegen::FamilySourceTag::Dense,
         epilogue,
@@ -7354,19 +7380,22 @@ fn gather_epilogue_requests(
         return Err(BackendError::UnsupportedOperation);
     }
     if parameter_dependent {
-        return Ok([1, 2]
-            .into_iter()
-            .map(|words| {
-                let mut constants = constants.clone();
-                constants.push((14, words));
-                EpiloguePipelineRequest {
-                    family: epilogue_codegen::FamilySourceTag::GatherQuant,
-                    epilogue: Arc::clone(&epilogue),
-                    implementation: "gather_quantized_gemv",
-                    constants,
-                }
-            })
-            .collect());
+        return Ok([
+            gather_epilogue_specialization(7, 511),
+            gather_epilogue_specialization(8, 512),
+        ]
+        .into_iter()
+        .map(|words| {
+            let mut constants = constants.clone();
+            constants.push((14, words));
+            EpiloguePipelineRequest {
+                family: epilogue_codegen::FamilySourceTag::GatherQuant,
+                epilogue: Arc::clone(&epilogue),
+                implementation: "gather_quantized_gemv",
+                constants,
+            }
+        })
+        .collect());
     }
     let inner = *input
         .layout()
@@ -7379,7 +7408,7 @@ fn gather_epilogue_requests(
         .shape()
         .last()
         .ok_or(BackendError::InvalidInput)?;
-    constants.push((14, u32::from(columns % 8 == 0 && inner % 512 == 0) + 1));
+    constants.push((14, gather_epilogue_specialization(columns, inner)));
     Ok(vec![EpiloguePipelineRequest {
         family: epilogue_codegen::FamilySourceTag::GatherQuant,
         epilogue,
