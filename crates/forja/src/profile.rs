@@ -175,10 +175,7 @@ fn op_name(operation: Op) -> &'static str {
     match operation {
         Op::Program(_) => "program",
         Op::Copy => "copy",
-        Op::Add => "add",
-        Op::SiluMul => "silu_mul",
         Op::RmsNorm { .. } => "rms_norm",
-        Op::Softmax => "softmax",
         Op::Argmax => "argmax",
         Op::TopK { .. } => "top-k",
         Op::Sample { .. } => "sample",
@@ -190,6 +187,8 @@ fn op_name(operation: Op) -> &'static str {
         Op::QuantMatmul { .. } => "quant-matmul",
         Op::GatherQuantMatmul { .. } => "gather-quant-matmul",
         Op::Sdpa { .. } => "sdpa",
+        #[allow(unreachable_patterns)]
+        _ => "unsupported",
     }
 }
 
