@@ -95,6 +95,12 @@ fn metal_guest_softmax_matches_trusted_operation() {
     support::guest_softmax_matches_trusted_operation();
 }
 
+#[test]
+fn metal_guest_elementwise_operations_match_trusted_operations() {
+    set_native_device(NativeDevice::Metal);
+    support::guest_elementwise_operations_match_trusted_operations();
+}
+
 #[allow(clippy::cast_precision_loss)]
 fn interleaved_rope_reference(
     values: &[f32],

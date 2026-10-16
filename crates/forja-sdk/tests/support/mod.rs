@@ -215,6 +215,33 @@ pub fn guest_softmax_matches_trusted_operation() {
     assert_f32_values_agree(&expected.to_vec().unwrap(), &actual.to_vec().unwrap()).unwrap();
 }
 
+pub fn guest_elementwise_operations_match_trusted_operations() {
+    let left = Tensor::from_slice(&[-2.0_f32, -0.5, 0.0, 1.5, 3.0], &[1, 5]).unwrap();
+    let right = Tensor::from_slice(&[0.25_f32, 2.0, -1.0, 0.5, -3.0], &[1, 5]).unwrap();
+    for (expected, actual) in [
+        (
+            (&left + &right).unwrap(),
+            forja_sdk::nn::blocks::add(
+                &forja_sdk::nn::blocks::add_kernel(forja_sdk::DType::F32).unwrap(),
+                &left,
+                &right,
+            )
+            .unwrap(),
+        ),
+        (
+            left.silu_mul(&right).unwrap(),
+            forja_sdk::nn::blocks::silu_mul(
+                &forja_sdk::nn::blocks::silu_mul_kernel(forja_sdk::DType::F32).unwrap(),
+                &left,
+                &right,
+            )
+            .unwrap(),
+        ),
+    ] {
+        assert_f32_values_agree(&expected.to_vec().unwrap(), &actual.to_vec().unwrap()).unwrap();
+    }
+}
+
 pub fn neural_network_modules_match_cpu() {
     let input_values = values(7 * 1024, 10);
     let weight_values = values(2048 * 1024, 11);

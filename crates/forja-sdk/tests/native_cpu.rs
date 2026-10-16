@@ -210,6 +210,11 @@ fn guest_softmax_matches_the_trusted_operation() {
 }
 
 #[test]
+fn guest_elementwise_operations_match_the_trusted_operations() {
+    support::guest_elementwise_operations_match_trusted_operations();
+}
+
+#[test]
 fn moe_helpers_route_and_combine_experts() {
     use forja_sdk::{Tensor, nn};
 

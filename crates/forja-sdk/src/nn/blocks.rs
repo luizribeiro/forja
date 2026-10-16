@@ -14,6 +14,54 @@ pub const DEFAULT_PREFILL_CHUNK: u32 = 512;
 
 const MIN_PREFILL_BUCKET: u32 = 16;
 
+/// Builds the Map program for elementwise addition.
+///
+/// # Errors
+///
+/// Returns an error when the kernel definition is refused.
+pub fn add_kernel(dtype: DType) -> Result<Kernel> {
+    add_elements_program(2, &[dtype; 2], &[dtype])
+}
+
+/// Adds two tensors with a prebuilt Map kernel.
+///
+/// # Errors
+///
+/// Returns an error for incompatible tensors or a refused kernel dispatch.
+pub fn add<T: FloatElement>(
+    kernel: &Kernel,
+    left: &Tensor<T>,
+    right: &Tensor<T>,
+) -> Result<Tensor<T>> {
+    let inputs = [TensorRef::new(left)?, TensorRef::new(right)?];
+    let [output] = crate::kernel::run::<T, 1>(kernel, &inputs)?;
+    Ok(output)
+}
+
+/// Builds the Map program for SiLU-gated multiplication.
+///
+/// # Errors
+///
+/// Returns an error when the kernel definition is refused.
+pub fn silu_mul_kernel(dtype: DType) -> Result<Kernel> {
+    silu_mul_elements_program(2, &[dtype; 2], &[dtype])
+}
+
+/// Applies `SiLU` to `gate` and multiplies it by `up` with a prebuilt Map kernel.
+///
+/// # Errors
+///
+/// Returns an error for incompatible tensors or a refused kernel dispatch.
+pub fn silu_mul<T: FloatElement>(
+    kernel: &Kernel,
+    gate: &Tensor<T>,
+    up: &Tensor<T>,
+) -> Result<Tensor<T>> {
+    let inputs = [TensorRef::new(gate)?, TensorRef::new(up)?];
+    let [output] = crate::kernel::run::<T, 1>(kernel, &inputs)?;
+    Ok(output)
+}
+
 /// Builds the row program for stable softmax.
 ///
 /// # Errors
@@ -343,6 +391,16 @@ fn rms_norm_rows(
 fn softmax_rows(input: crate::kernel::Row) -> crate::kernel::Row {
     let exponent = (input - input.row_max()).exp();
     exponent / exponent.row_sum()
+}
+
+#[crate::kernel::kernel(map)]
+fn add_elements(left: crate::kernel::Elem, right: crate::kernel::Elem) -> crate::kernel::Elem {
+    left + right
+}
+
+#[crate::kernel::kernel(map)]
+fn silu_mul_elements(gate: crate::kernel::Elem, up: crate::kernel::Elem) -> crate::kernel::Elem {
+    gate * gate.sigmoid() * up
 }
 
 #[allow(clippy::too_many_arguments)]
