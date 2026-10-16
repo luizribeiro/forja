@@ -216,7 +216,7 @@ pub enum Op {
         /// Whether selected logits are softmax-normalized over the selected set.
         normalize: bool,
     },
-    /// Multiplies rows by affine-quantized expert weights selected at run time.
+    /// Multiplies rows by one or two affine-quantized expert projections selected at run time.
     GatherQuantMatmul {
         /// Number of bits in each unsigned quantized value.
         bits: u8,
@@ -522,7 +522,11 @@ impl Dispatch {
     ) -> Result<Self, OpError> {
         let mut dispatch = Self::new(op, inputs, output)?;
         let signature = epilogue.signature();
-        if signature.accumulator_count() != 1
+        let accumulator_count = match op {
+            Op::GatherQuantMatmul { .. } if inputs.len() == 8 => 2,
+            _ => 1,
+        };
+        if signature.accumulator_count() != accumulator_count
             || usize::from(signature.logical_rank()) != output.layout().shape().len()
             || signature.output_dtype() != output.layout().dtype()
             || !matches!(
@@ -1563,13 +1567,35 @@ fn check_gather_quant_matmul(
     bits: u8,
     group_size: u32,
 ) -> Result<(), OpError> {
-    if inputs.len() != 5 {
+    if !matches!(inputs.len(), 5 | 8) {
         return Err(OpError::Arity {
             expected: 5,
             actual: inputs.len(),
         });
     }
-    check_gather_quant_projection(inputs, output, bits, group_size, [0, 1, 2, 3, 4])
+    let index_position = inputs.len() - 1;
+    check_gather_quant_projection(
+        inputs,
+        output,
+        bits,
+        group_size,
+        [0, 1, 2, 3, index_position],
+    )?;
+    if inputs.len() == 8 {
+        check_gather_quant_projection(inputs, output, bits, group_size, [0, 4, 5, 6, 7])?;
+        for (second, first) in [(4, 1), (5, 2), (6, 3)] {
+            if inputs[second].layout.dtype() != inputs[first].layout.dtype() {
+                return Err(OpError::DType {
+                    operand: Operand::Input(second),
+                    dtype: inputs[second].layout.dtype(),
+                });
+            }
+            if inputs[second].layout.shape() != inputs[first].layout.shape() {
+                return Err(shape_error(Operand::Input(second)));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn check_gather_quant_matmul_combine(
@@ -2009,6 +2035,24 @@ mod tests {
             .validate()
             .unwrap(),
             EpilogueSignature::new(1, rank, vec![dtype], dtype),
+        )
+        .unwrap()
+    }
+
+    fn paired_epilogue(rank: u8, dtype: DType) -> Arc<PreparedEpilogue> {
+        prepare_epilogue(
+            Program {
+                kind: ProgramKind::Map,
+                insts: vec![
+                    Inst::Input(0),
+                    Inst::Input(1),
+                    Inst::Binary(BinOp::Mul, 0, 1),
+                ],
+                outputs: vec![(0, 2)],
+            }
+            .validate()
+            .unwrap(),
+            EpilogueSignature::new(2, rank, vec![], dtype),
         )
         .unwrap()
     }
@@ -2904,6 +2948,33 @@ mod tests {
             CommandList::new()
                 .dispatch(op, &[&input, &packed, &scales, &biases, &indices], &output,)
                 .is_ok()
+        );
+        assert!(
+            CommandList::new()
+                .dispatch_epilogue(
+                    op,
+                    &[
+                        &input, &packed, &scales, &biases, &packed, &scales, &biases, &indices,
+                    ],
+                    &output,
+                    &paired_epilogue(3, DType::BF16),
+                    &[],
+                )
+                .is_ok()
+        );
+        assert_eq!(
+            CommandList::new().dispatch(
+                op,
+                &[
+                    &input, &packed, &scales, &biases, &packed, &scales, &biases, &packed, &scales,
+                    &biases, &indices,
+                ],
+                &output,
+            ),
+            Err(OpError::Arity {
+                expected: 5,
+                actual: 11,
+            })
         );
         let wrong_indices = tensor(7, DType::U32, &[6, 3], &[3, 1]);
         assert_eq!(
