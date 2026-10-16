@@ -483,7 +483,7 @@ mod tests {
         let grouped_start = source.find("kernel void grouped_quantized_gemm(").unwrap();
         let grouped = &source[grouped_start
             ..source[grouped_start..]
-                .find("kernel void gathered_silu_from_projections(")
+                .find("kernel void gathered_pair_from_projections(")
                 .unwrap()
                 + grouped_start];
         let grouped_call = grouped.rfind("forja_epilogue(").unwrap();
@@ -498,5 +498,28 @@ mod tests {
             .unwrap();
         let store = grouped[grouped_call..].find("store_float(").unwrap() + grouped_call;
         assert!(barrier < route && route < edge && edge < grouped_call && grouped_call < store);
+
+        for (kernel, end_marker, collective, edge) in [
+            (
+                "kernel void gather_quantized_pair(",
+                "template <\n    typename T, uint block_inner",
+                "threadgroup_barrier(",
+                "if (column < gate_params.columns)",
+            ),
+            (
+                "kernel void gathered_pair_from_projections(",
+                "kernel void quantized_gemm_small_m(",
+                "if (index >= element_count)",
+                "if (expert >= params.experts)",
+            ),
+        ] {
+            let start = source.find(kernel).unwrap();
+            let body = &source[start..source[start..].find(end_marker).unwrap() + start];
+            let call = body.rfind("forja_epilogue(").unwrap();
+            let collective = body[..call].rfind(collective).unwrap();
+            let edge = body[..call].rfind(edge).unwrap();
+            let store = body[call..].find("store_float(").unwrap() + call;
+            assert!(collective < edge && edge < call && call < store);
+        }
     }
 }

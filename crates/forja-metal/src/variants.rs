@@ -1580,17 +1580,17 @@ mod tests {
             (
                 "gather-quant-silu-mul.portable",
                 gathered_dispatch(true, 64, 1, 256),
-                "gather_quantized_silu_mul",
+                "gather_quantized_pair",
             ),
             (
                 "gather-quant-silu-mul.route-gemv",
                 gathered_dispatch(true, 1, 1, 257),
-                "gather_quantized_silu_mul",
+                "gather_quantized_pair",
             ),
             (
                 "gather-quant-silu-mul.grouped",
                 gathered_dispatch(true, 64, 1, 256),
-                "grouped_quantized_silu_mul",
+                "gathered_pair_from_projections",
             ),
             (
                 "sdpa.portable",

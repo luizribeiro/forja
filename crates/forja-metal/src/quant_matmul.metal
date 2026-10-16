@@ -5,6 +5,7 @@ constant uint quant_bits [[function_constant(12)]];
 constant uint quant_group_size [[function_constant(13)]];
 constant uint gather_words_per_thread [[function_constant(14)]];
 constant uint quant_words_per_thread [[function_constant(15)]];
+constant uint paired_legacy_silu [[function_constant(16)]];
 
 struct QuantEmbedParams {
     uint vocab;
@@ -738,7 +739,7 @@ kernel void gather_quantized_gemv_combine(
     }
 }
 
-kernel void gather_quantized_silu_mul(
+kernel void gather_quantized_pair(
     device const uchar *input [[buffer(0)]],
     device const uchar *gate_packed [[buffer(1)]],
     device const uchar *gate_scales [[buffer(2)]],
@@ -751,6 +752,7 @@ kernel void gather_quantized_silu_mul(
     constant GatherQuantMatmulParams &gate_params [[buffer(9)]],
     constant GatherQuantMatmulParams &up_params [[buffer(10)]],
     device atomic_uint *error_flag [[buffer(11)]],
+    FORJA_EPILOGUE_ARGUMENTS
     ushort simdgroup [[simdgroup_index_in_threadgroup]],
     ushort lane [[thread_index_in_simdgroup]],
     uint2 tile [[threadgroup_position_in_grid]]) {
@@ -799,7 +801,12 @@ kernel void gather_quantized_silu_mul(
             uint column = tile.x * 8 + local_column;
             if (column < gate_params.columns) {
                 float gate = gate_values[local_column];
-                float result = gate / (1.0f + exp(-gate)) * up_values[local_column];
+                float result = paired_legacy_silu
+                    ? gate / (1.0f + exp(-gate)) * up_values[local_column]
+                    : forja_epilogue(
+                        gate, up_values[local_column], row, slot, column,
+                        gate_params.rows, gate_params.routes, gate_params.columns,
+                        FORJA_EPILOGUE_VALUES);
                 ulong output_index = gate_params.output_offset +
                     ulong(row) * gate_params.output_row_stride +
                     ulong(slot) * gate_params.output_slot_stride +
@@ -1074,12 +1081,13 @@ kernel void grouped_quantized_gemm(
     }
 }
 
-kernel void gathered_silu_from_projections(
+kernel void gathered_pair_from_projections(
     device const float *gate [[buffer(0)]],
     device const float *up [[buffer(1)]],
     device const uint *indices [[buffer(2)]],
     device uchar *output [[buffer(3)]],
     constant GatherQuantMatmulParams &params [[buffer(4)]],
+    FORJA_EPILOGUE_ARGUMENTS
     uint index [[thread_position_in_grid]]) {
     uint element_count = params.rows * params.routes * params.columns;
     if (index >= element_count) {
@@ -1103,7 +1111,12 @@ kernel void gathered_silu_from_projections(
         return;
     }
     float gate_value = gate[index];
-    float result = gate_value / (1.0f + exp(-gate_value)) * up[index];
+    float result = paired_legacy_silu
+        ? gate_value / (1.0f + exp(-gate_value)) * up[index]
+        : forja_epilogue(
+            gate_value, up[index], row, slot, column,
+            params.rows, params.routes, params.columns,
+            FORJA_EPILOGUE_VALUES);
     store_float(
         output,
         params.output_offset + ulong(row) * params.output_row_stride +
