@@ -39,6 +39,10 @@
           ];
         };
         cargoFiles = "(^|/)(Cargo\\.(toml|lock)|.*\\.rs)$";
+        runEverythingFiles = "(Cargo\\.lock|flake\\.lock|rust-toolchain(\\.toml)?)$";
+        metalFiles = "^(${runEverythingFiles}|(wit|engines|chat-formats|support/(guests|test-guests)|crates/forja-(core|host|metal|sdk[^/]*))/|.*\\.metal$)";
+        guestFiles = "^(${runEverythingFiles}|(wit|engines|chat-formats|support/(guests|test-guests)|crates/forja-(chat-format|program-conversions|sdk[^/]*))/)";
+        qwenFiles = "^(${runEverythingFiles}|(wit|engines|chat-formats|support/(golden-fixtures|guests|test-guests)|crates/forja-(core|host|metal|sdk[^/]*))/|.*\\.metal$)";
         pythonFiles = "^support/.*\\.py$";
         allLocalStages = [
           "pre-commit"
@@ -100,7 +104,11 @@
           };
           cargo-nextest-full = cargoHook {
             name = "cargo-nextest-full-hook";
-            runtimeInputs = [ pkgs.cargo-nextest ];
+            runtimeInputs = [
+              pkgs.cargo-nextest
+              pkgs.git
+            ];
+            files = "(${cargoFiles}|${metalFiles})";
             stages = [ "pre-push" ];
             text = ''
               if [[ "''${FORJA_NO_GPU:-}" == "1" ]]; then
@@ -108,15 +116,55 @@
                   echo "FORJA_NO_GPU is reserved for GitHub Actions" >&2
                   exit 1
                 fi
-                cargo nextest run --profile ci --release --workspace --all-features --locked --no-tests pass
+              fi
+
+              run_everything=false
+              run_non_metal=false
+              run_metal=false
+
+              classify_path() {
+                local path="$1"
+                case "$path" in
+                  Cargo.lock | flake.lock | rust-toolchain | rust-toolchain.toml)
+                    run_everything=true
+                    ;;
+                esac
+                case "$path" in
+                  Cargo.toml | */Cargo.toml | *.rs)
+                    run_non_metal=true
+                    ;;
+                esac
+                case "$path" in
+                  wit/* | engines/* | chat-formats/* | support/guests/* | support/test-guests/* | crates/forja-core/* | crates/forja-host/* | crates/forja-metal/* | crates/forja-sdk*/* | *.metal)
+                    run_metal=true
+                    ;;
+                esac
+              }
+
+              if [[ -n "''${PRE_COMMIT_FROM_REF:-}" && -n "''${PRE_COMMIT_TO_REF:-}" ]]; then
+                while IFS= read -r -d "" path; do
+                  classify_path "$path"
+                done < <(git diff --name-only -z "$PRE_COMMIT_FROM_REF" "$PRE_COMMIT_TO_REF")
               else
-                cargo nextest run --release --workspace --all-features --locked --no-tests pass
+                run_everything=true
+              fi
+
+              if $run_everything || { $run_non_metal && $run_metal; }; then
+                if [[ "''${FORJA_NO_GPU:-}" == "1" ]]; then
+                  cargo nextest run --profile ci --release --workspace --all-features --locked --no-tests pass
+                else
+                  cargo nextest run --release --workspace --all-features --locked --no-tests pass
+                fi
+              elif $run_non_metal; then
+                cargo nextest run --profile ci --release --workspace --all-features --locked --no-tests pass
+              elif $run_metal && [[ "''${FORJA_NO_GPU:-}" != "1" ]]; then
+                cargo nextest run --release --workspace --all-features --locked --no-tests pass -E 'package(forja-metal) or test(/^native_metal::/) or test(/^kernel_ui::/) or test(/(^|::)metal_/)'
               fi
             '';
           };
           guest-reproducibility = cargoHook {
             name = "guest-reproducibility-hook";
-            files = "^(chat-formats/|crates/forja-(chat-format|program-conversions|sdk|sdk-macros)/|engines/|support/(guests|test-guests)/|wit/)";
+            files = guestFiles;
             stages = [ "pre-push" ];
             text = "support/test-guests/check-reproducible.sh";
           };
@@ -153,6 +201,7 @@
             (cargoHook {
               name = "qwen-weights-hook";
               runtimeInputs = [ pkgs.cargo-nextest ];
+              files = qwenFiles;
               text = ''
                 if [[ "''${GITHUB_ACTIONS:-}" == "true" ]]; then
                   echo "skipping model tests: GitHub Actions runners have no model weights"
