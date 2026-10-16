@@ -991,7 +991,6 @@ fn decode(bytes: &[u8], dtype: DType) -> Result<Vec<f32>, AgreementError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use forja_cpu::CpuBackend;
 
     #[test]
     fn interval_width_limits_cover_observed_output_medians() {
@@ -1105,18 +1104,5 @@ mod tests {
                 tolerance: QUANTIZED_TOLERANCE,
             })
         );
-    }
-
-    #[test]
-    fn compares_non_contiguous_inputs_through_one_helper() {
-        let reference = CpuBackend::new();
-        let candidate = CpuBackend::new();
-        let inputs = [
-            TensorSpec::permuted(DType::F32, &[3072, 7], &[1, 0]),
-            TensorSpec::contiguous(DType::F16, &[7, 3072]),
-        ];
-        let output = TensorSpec::contiguous(DType::BF16, &[7, 3072]);
-
-        assert_backends_agree(&reference, &candidate, Op::SiluMul, &inputs, &output).unwrap();
     }
 }

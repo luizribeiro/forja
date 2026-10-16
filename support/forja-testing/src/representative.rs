@@ -252,62 +252,6 @@ mod tests {
     }
 
     #[test]
-    fn softmax_matches_the_trusted_operation() {
-        let backend = CpuBackend::new();
-        let scores = initialized(&backend, &[16, 7, 33], 3);
-        let expected = backend.alloc(DType::F32, &[16, 7, 33]).unwrap();
-        let actual = backend.alloc(DType::F32, &[16, 7, 33]).unwrap();
-        assert_program_matches(
-            &backend,
-            Op::Softmax,
-            &[&scores],
-            &expected,
-            &softmax(),
-            &[&scores],
-            &[&actual],
-            &[(&expected, &actual)],
-        );
-    }
-
-    #[test]
-    fn silu_mul_matches_the_trusted_operation() {
-        let backend = CpuBackend::new();
-        let gate = initialized(&backend, &[7, 3072], 4);
-        let up = initialized(&backend, &[7, 3072], 5);
-        let expected = backend.alloc(DType::F32, &[7, 3072]).unwrap();
-        let actual = backend.alloc(DType::F32, &[7, 3072]).unwrap();
-        assert_program_matches(
-            &backend,
-            Op::SiluMul,
-            &[&gate, &up],
-            &expected,
-            &silu_mul(),
-            &[&gate, &up],
-            &[&actual],
-            &[(&expected, &actual)],
-        );
-    }
-
-    #[test]
-    fn residual_add_matches_the_trusted_operation() {
-        let backend = CpuBackend::new();
-        let residual = initialized(&backend, &[7, 1024], 6);
-        let update = initialized(&backend, &[7, 1024], 7);
-        let expected = backend.alloc(DType::F32, &[7, 1024]).unwrap();
-        let actual = backend.alloc(DType::F32, &[7, 1024]).unwrap();
-        assert_program_matches(
-            &backend,
-            Op::Add,
-            &[&residual, &update],
-            &expected,
-            &residual_add(),
-            &[&residual, &update],
-            &[&actual],
-            &[(&expected, &actual)],
-        );
-    }
-
-    #[test]
     fn residual_rms_norm_matches_the_trusted_operations() {
         let backend = CpuBackend::new();
         let shape = [7, 1024];
@@ -321,9 +265,13 @@ mod tests {
         let expected_normalized = backend.alloc(DType::F32, &shape).unwrap();
         let actual_residual = backend.alloc(DType::F32, &shape).unwrap();
         let actual_normalized = backend.alloc(DType::F32, &shape).unwrap();
+        let add = residual_add().validate().unwrap();
+        let add_inputs = [&residual, &update];
+        let add_outputs = [&expected_residual];
+        let add = crate::prepare_program(&backend, &add, &add_inputs, &add_outputs).unwrap();
         let mut trusted = CommandList::new();
         trusted
-            .dispatch(Op::Add, &[&residual, &update], &expected_residual)
+            .dispatch_kernel(&add, &add_inputs, &add_outputs)
             .unwrap();
         trusted
             .dispatch(

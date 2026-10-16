@@ -703,7 +703,8 @@ fn direct_attention<B: Backend>(
         projected,
         result,
     };
-    let commands = record_attention(&tensors)?;
+    let add = prepare_residual_add(backend, &tensors)?;
+    let commands = record_attention(&tensors, &add)?;
     backend
         .submit(commands)
         .map_err(backend_error)?
@@ -713,7 +714,26 @@ fn direct_attention<B: Backend>(
     Ok(decode_f32_le(&bytes)?)
 }
 
-fn record_attention(tensors: &AttentionTensors) -> wasmtime::Result<CommandList> {
+fn prepare_residual_add<B: Backend>(
+    backend: &B,
+    tensors: &AttentionTensors,
+) -> wasmtime::Result<std::sync::Arc<forja_core::program::PreparedProgram>> {
+    let program = representative::residual_add()
+        .validate()
+        .map_err(wasmtime::Error::msg)?;
+    prepare_program(
+        backend,
+        &program,
+        &[&tensors.input, &tensors.projected],
+        &[&tensors.result],
+    )
+    .map_err(wasmtime::Error::msg)
+}
+
+fn record_attention(
+    tensors: &AttentionTensors,
+    add: &std::sync::Arc<forja_core::program::PreparedProgram>,
+) -> wasmtime::Result<CommandList> {
     let mut commands = CommandList::new();
     commands
         .dispatch(
@@ -779,10 +799,10 @@ fn record_attention(tensors: &AttentionTensors) -> wasmtime::Result<CommandList>
         )
         .map_err(wasmtime::Error::msg)?;
     commands
-        .dispatch(
-            Op::Add,
+        .dispatch_kernel(
+            add,
             &[&tensors.input, &tensors.projected],
-            &tensors.result,
+            &[&tensors.result],
         )
         .map_err(wasmtime::Error::msg)?;
     Ok(commands)
@@ -842,14 +862,28 @@ fn direct_fused_values() -> wasmtime::Result<Vec<f32>> {
     let residual = f32_tensor(&backend, &[7, 1024], &residual_values)?;
     let update = f32_tensor(&backend, &[7, 1024], &update_values)?;
     let weight = f32_tensor(&backend, &[1024], &weight_values)?;
+    let weight = backend
+        .view(&weight, ViewOp::Broadcast(vec![7, 1024]))
+        .map_err(backend_error)?;
     let sum = f32_output(&backend, &[7, 1024])?;
     let normalized = f32_output(&backend, &[7, 1024])?;
+    let program = representative::residual_rms_norm(1.0e-6)
+        .validate()
+        .map_err(wasmtime::Error::msg)?;
+    let program = prepare_program(
+        &backend,
+        &program,
+        &[&residual, &update, &weight],
+        &[&sum, &normalized],
+    )
+    .map_err(wasmtime::Error::msg)?;
     let mut commands = CommandList::new();
     commands
-        .dispatch(Op::Add, &[&residual, &update], &sum)
-        .map_err(wasmtime::Error::msg)?;
-    commands
-        .dispatch(Op::RmsNorm { eps: 1.0e-6 }, &[&sum, &weight], &normalized)
+        .dispatch_kernel(
+            &program,
+            &[&residual, &update, &weight],
+            &[&sum, &normalized],
+        )
         .map_err(wasmtime::Error::msg)?;
     backend
         .submit(commands)
