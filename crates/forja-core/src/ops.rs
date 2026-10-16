@@ -180,13 +180,6 @@ pub enum Op {
         /// The positive finite frequency base.
         theta: f32,
     },
-    /// Normalizes and rotates projected queries and keys while writing keys and values to cache.
-    QkvRopeCache {
-        /// The nonnegative stabilizer added before the root mean square.
-        eps: f32,
-        /// The positive finite rotary frequency base.
-        theta: f32,
-    },
     /// Gathers embedding rows by token id.
     Embed,
     /// Gathers and dequantizes affine-quantized embedding rows by token id.
@@ -207,33 +200,8 @@ pub enum Op {
         /// Number of input elements sharing one scale and bias.
         group_size: u32,
     },
-    /// Multiplies one or more rows by q8 affine router weights and selects the top routes.
-    QuantizedRouter {
-        /// Number of input elements sharing one scale and bias.
-        group_size: u32,
-        /// Number of routes selected from each row.
-        k: u32,
-        /// Whether selected logits are softmax-normalized over the selected set.
-        normalize: bool,
-    },
     /// Multiplies rows by one or two affine-quantized expert projections selected at run time.
     GatherQuantMatmul {
-        /// Number of bits in each unsigned quantized value.
-        bits: u8,
-        /// Number of input elements sharing one scale and bias.
-        group_size: u32,
-    },
-    /// Multiplies routed rows by affine-quantized expert weights, combines routes, and adds a
-    /// residual. Unlike `GatherQuantMatmul`, invalid routes are skipped while their request row
-    /// remains in the output.
-    GatherQuantMatmulCombine {
-        /// Number of bits in each unsigned quantized value.
-        bits: u8,
-        /// Number of input elements sharing one scale and bias.
-        group_size: u32,
-    },
-    /// Computes `SiLU(gate) * up` from two gathered affine-quantized projections.
-    GatherQuantSiluMul {
         /// Number of bits in each unsigned quantized value.
         bits: u8,
         /// Number of input elements sharing one scale and bias.
@@ -451,7 +419,6 @@ impl Dispatch {
         check_common(inputs, outputs)?;
         let expected_outputs = match op {
             Op::TopK { .. } => 2,
-            Op::QuantizedRouter { .. } | Op::QkvRopeCache { .. } => 3,
             _ => 1,
         };
         if outputs.len() != expected_outputs {
@@ -471,9 +438,6 @@ impl Dispatch {
             Op::TopK { k, .. } => check_top_k(inputs, outputs, k)?,
             Op::Sample { .. } => check_sample(inputs, output)?,
             Op::Rope { theta } => check_rope(inputs, output, theta)?,
-            Op::QkvRopeCache { eps, theta } => {
-                check_qkv_rope_cache(inputs, outputs, eps, theta)?;
-            }
             Op::Embed => check_embed(inputs, output)?,
             Op::QuantEmbed { bits, group_size } => {
                 check_quant_embed(inputs, output, bits, group_size)?;
@@ -483,19 +447,8 @@ impl Dispatch {
             Op::QuantMatmul { bits, group_size } => {
                 check_quant_matmul(inputs, output, bits, group_size)?;
             }
-            Op::QuantizedRouter {
-                group_size,
-                k,
-                normalize: _,
-            } => check_quantized_router(inputs, outputs, group_size, k)?,
             Op::GatherQuantMatmul { bits, group_size } => {
                 check_gather_quant_matmul(inputs, output, bits, group_size)?;
-            }
-            Op::GatherQuantMatmulCombine { bits, group_size } => {
-                check_gather_quant_matmul_combine(inputs, output, bits, group_size)?;
-            }
-            Op::GatherQuantSiluMul { bits, group_size } => {
-                check_gather_quant_silu_mul(inputs, output, bits, group_size)?;
             }
             Op::Sdpa {
                 scale,
@@ -1253,82 +1206,6 @@ fn check_rope(inputs: &[&Tensor], output: &Tensor, theta: f32) -> Result<(), OpE
     check_shape(output, inputs[0], Operand::Output)
 }
 
-fn check_qkv_rope_cache(
-    inputs: &[&Tensor],
-    outputs: &[&Tensor],
-    eps: f32,
-    theta: f32,
-) -> Result<(), OpError> {
-    if inputs.len() != 3 {
-        return Err(OpError::Arity {
-            expected: 3,
-            actual: inputs.len(),
-        });
-    }
-    if !eps.is_finite() || eps < 0.0 {
-        return Err(OpError::InvalidEpsilon);
-    }
-    if !theta.is_finite() || theta <= 0.0 {
-        return Err(OpError::InvalidTheta);
-    }
-    for (position, input) in inputs.iter().enumerate() {
-        check_float(input, Operand::Input(position))?;
-    }
-    for output in outputs {
-        check_float(output, Operand::Output)?;
-        if output.layout.dtype() != inputs[0].layout.dtype() {
-            return Err(OpError::DType {
-                operand: Operand::Output,
-                dtype: output.layout.dtype(),
-            });
-        }
-    }
-    let [sequence, total_heads, width]: [u32; 3] = inputs[0]
-        .layout
-        .shape()
-        .try_into()
-        .map_err(|_| shape_error(Operand::Input(0)))?;
-    let [norm_heads, norm_width]: [u32; 2] = inputs[1]
-        .layout
-        .shape()
-        .try_into()
-        .map_err(|_| shape_error(Operand::Input(1)))?;
-    if norm_width != width {
-        return Err(shape_error(Operand::Input(1)));
-    }
-    if inputs[2].layout.shape() != [sequence] {
-        return Err(shape_error(Operand::Input(2)));
-    }
-    if !width.is_multiple_of(2) {
-        return Err(shape_error(Operand::Input(0)));
-    }
-    let (query_heads, kv_heads) = split_qkv_heads(total_heads, norm_heads)?;
-    if outputs[0].layout.shape() != [query_heads, sequence, width]
-        || outputs[1].layout.shape() != [kv_heads, sequence, width]
-        || outputs[2].layout.shape() != [kv_heads, sequence, width]
-    {
-        return Err(shape_error(Operand::Output));
-    }
-    Ok(())
-}
-
-/// Splits projected QKV heads from the count covered by Q/K normalization.
-///
-/// # Errors
-///
-/// Returns a shape error when either the query or key/value head count is zero or underflows.
-pub fn split_qkv_heads(total_heads: u32, norm_heads: u32) -> Result<(u32, u32), OpError> {
-    let kv_heads = total_heads
-        .checked_sub(norm_heads)
-        .filter(|&heads| heads > 0)
-        .ok_or_else(|| shape_error(Operand::Input(0)))?;
-    let query_heads = norm_heads
-        .checked_sub(kv_heads)
-        .filter(|&heads| heads > 0)
-        .ok_or_else(|| shape_error(Operand::Input(0)))?;
-    Ok((query_heads, kv_heads))
-}
-
 fn check_embed(inputs: &[&Tensor], output: &Tensor) -> Result<(), OpError> {
     if inputs.len() != 2 {
         return Err(OpError::Arity {
@@ -1547,20 +1424,6 @@ fn check_quant_matmul(
     Ok(())
 }
 
-fn check_quantized_router(
-    inputs: &[&Tensor],
-    outputs: &[&Tensor],
-    group_size: u32,
-    k: u32,
-) -> Result<(), OpError> {
-    check_quant_matmul(inputs, outputs[0], 8, group_size)?;
-    let columns = outputs[0].layout.shape()[1];
-    if columns > 128 || k > 8 {
-        return Err(OpError::InvalidTopK);
-    }
-    check_top_k(&[outputs[0]], &outputs[1..], k)
-}
-
 fn check_gather_quant_matmul(
     inputs: &[&Tensor],
     output: &Tensor,
@@ -1646,87 +1509,6 @@ fn check_gather_quant_weighted_sum(
     }
     if output.layout.shape() != [rows, columns] {
         return Err(shape_error(Operand::Output));
-    }
-    Ok(())
-}
-
-fn check_gather_quant_matmul_combine(
-    inputs: &[&Tensor],
-    output: &Tensor,
-    bits: u8,
-    group_size: u32,
-) -> Result<(), OpError> {
-    if inputs.len() != 7 {
-        return Err(OpError::Arity {
-            expected: 7,
-            actual: inputs.len(),
-        });
-    }
-    for position in [0, 5, 6] {
-        check_float(inputs[position], Operand::Input(position))?;
-        if inputs[position].layout.dtype() != inputs[0].layout.dtype() {
-            return Err(OpError::DType {
-                operand: Operand::Input(position),
-                dtype: inputs[position].layout.dtype(),
-            });
-        }
-    }
-    check_float(output, Operand::Output)?;
-    if output.layout.dtype() != inputs[0].layout.dtype() {
-        return Err(OpError::DType {
-            operand: Operand::Output,
-            dtype: output.layout.dtype(),
-        });
-    }
-    if inputs[4].layout.dtype() != DType::U32 {
-        return Err(OpError::DType {
-            operand: Operand::Input(4),
-            dtype: inputs[4].layout.dtype(),
-        });
-    }
-    let [rows, routes, inner]: [u32; 3] = inputs[0]
-        .layout
-        .shape()
-        .try_into()
-        .map_err(|_| shape_error(Operand::Input(0)))?;
-    if !(1..=8).contains(&routes) {
-        return Err(shape_error(Operand::Input(0)));
-    }
-    let (_, columns) =
-        check_quantized_expert_weights(inputs, bits, group_size, [0, 1, 2, 3], inner)?;
-    for position in [4, 5] {
-        if inputs[position].layout.shape() != [rows, routes] {
-            return Err(shape_error(Operand::Input(position)));
-        }
-    }
-    if inputs[6].layout.shape() != [rows, columns] {
-        return Err(shape_error(Operand::Input(6)));
-    }
-    if output.layout.shape() != [rows, columns] {
-        return Err(shape_error(Operand::Output));
-    }
-    Ok(())
-}
-
-fn check_gather_quant_silu_mul(
-    inputs: &[&Tensor],
-    output: &Tensor,
-    bits: u8,
-    group_size: u32,
-) -> Result<(), OpError> {
-    if inputs.len() != 8 {
-        return Err(OpError::Arity {
-            expected: 8,
-            actual: inputs.len(),
-        });
-    }
-    check_gather_quant_projection(inputs, output, bits, group_size, [0, 1, 2, 3, 7])?;
-    check_gather_quant_projection(inputs, output, bits, group_size, [0, 4, 5, 6, 7])?;
-    if inputs[5].layout.dtype() != inputs[2].layout.dtype() {
-        return Err(OpError::DType {
-            operand: Operand::Input(5),
-            dtype: inputs[5].layout.dtype(),
-        });
     }
     Ok(())
 }
@@ -1959,15 +1741,13 @@ pub fn gather_quant_matmul_dispatch_flops(
 ) -> Option<u64> {
     match input_count {
         5 => gather_quant_matmul_flops(input, packed, indices),
-        6 => gather_quant_matmul_combine_flops(input, packed, indices),
+        6 => gather_quant_matmul_weighted_flops(input, packed, indices),
         8 => gather_quant_matmul_flops(input, packed, indices)?.checked_mul(2),
         _ => None,
     }
 }
 
-/// Counts the multiply-add operations in a combined gathered affine quantized projection.
-#[must_use]
-pub fn gather_quant_matmul_combine_flops(
+fn gather_quant_matmul_weighted_flops(
     input: &[u32],
     packed: &[u32],
     indices: &[u32],
@@ -1981,12 +1761,6 @@ pub fn gather_quant_matmul_combine_flops(
         .checked_mul(u64::from(inner))?
         .checked_mul(u64::from(columns))?
         .checked_mul(2)
-}
-
-/// Counts the multiply-add operations in fused gathered gate and up projections.
-#[must_use]
-pub fn gather_quant_silu_mul_flops(input: &[u32], packed: &[u32], indices: &[u32]) -> Option<u64> {
-    gather_quant_matmul_flops(input, packed, indices)?.checked_mul(2)
 }
 
 /// Counts the floating-point operations in scaled dot-product attention.
@@ -2511,98 +2285,6 @@ mod tests {
     }
 
     #[test]
-    fn quantized_router_checks_fused_shape_boundary() {
-        let input = tensor(1, DType::F32, &[1, 256], &[256, 1]);
-        let packed = tensor(2, DType::U32, &[128, 64], &[64, 1]);
-        let scales = tensor(3, DType::BF16, &[128, 4], &[4, 1]);
-        let biases = tensor(4, DType::BF16, &[128, 4], &[4, 1]);
-        let logits = tensor(5, DType::F32, &[1, 128], &[128, 1]);
-        let weights = tensor(6, DType::F32, &[1, 8], &[8, 1]);
-        let indices = tensor(7, DType::U32, &[1, 8], &[8, 1]);
-        let op = Op::QuantizedRouter {
-            group_size: 64,
-            k: 8,
-            normalize: true,
-        };
-        assert!(
-            CommandList::new()
-                .dispatch_many(
-                    op,
-                    &[&input, &packed, &scales, &biases],
-                    &[&logits, &weights, &indices],
-                )
-                .is_ok()
-        );
-        let too_wide = tensor(8, DType::U32, &[129, 64], &[64, 1]);
-        let wide_scales = tensor(9, DType::BF16, &[129, 4], &[4, 1]);
-        let wide_biases = tensor(10, DType::BF16, &[129, 4], &[4, 1]);
-        let wide_logits = tensor(11, DType::F32, &[1, 129], &[129, 1]);
-        assert_eq!(
-            CommandList::new().dispatch_many(
-                op,
-                &[&input, &too_wide, &wide_scales, &wide_biases],
-                &[&wide_logits, &weights, &indices],
-            ),
-            Err(OpError::InvalidTopK)
-        );
-    }
-
-    #[test]
-    fn qkv_rope_cache_checks_projection_boundary() {
-        let qkv = tensor(1, DType::F32, &[1, 40, 128], &[5_120, 128, 1]);
-        let norm = tensor(2, DType::F32, &[36, 128], &[128, 1]);
-        let positions = tensor(3, DType::F32, &[1], &[1]);
-        let query = tensor(4, DType::F32, &[32, 1, 128], &[128, 128, 1]);
-        let key = tensor(5, DType::F32, &[4, 1, 128], &[128, 128, 1]);
-        let value = tensor(6, DType::F32, &[4, 1, 128], &[128, 128, 1]);
-        let op = Op::QkvRopeCache {
-            eps: 1.0e-6,
-            theta: 10_000.0,
-        };
-        assert!(
-            CommandList::new()
-                .dispatch_many(op, &[&qkv, &norm, &positions], &[&query, &key, &value],)
-                .is_ok()
-        );
-
-        let wrong_norm = tensor(7, DType::F32, &[36, 64], &[64, 1]);
-        assert_eq!(
-            CommandList::new().dispatch_many(
-                op,
-                &[&qkv, &wrong_norm, &positions],
-                &[&query, &key, &value],
-            ),
-            Err(OpError::Shape {
-                operand: Operand::Input(1)
-            })
-        );
-        let wrong_key = tensor(8, DType::F32, &[4, 2, 128], &[256, 128, 1]);
-        assert_eq!(
-            CommandList::new().dispatch_many(
-                op,
-                &[&qkv, &norm, &positions],
-                &[&query, &wrong_key, &value],
-            ),
-            Err(OpError::Shape {
-                operand: Operand::Output
-            })
-        );
-    }
-
-    #[test]
-    fn qkv_head_split_rejects_underflow_and_empty_partitions() {
-        assert_eq!(split_qkv_heads(40, 36), Ok((32, 4)));
-        for (total_heads, norm_heads) in [(35, 36), (40, 10), (40, 40)] {
-            assert_eq!(
-                split_qkv_heads(total_heads, norm_heads),
-                Err(OpError::Shape {
-                    operand: Operand::Input(0)
-                })
-            );
-        }
-    }
-
-    #[test]
     fn selection_rejects_empty_rows_before_dispatch() {
         let logits = tensor(1, DType::F32, &[1, 0], &[0, 1]);
         let params = tensor(2, DType::U32, &[5], &[1]);
@@ -3066,7 +2748,7 @@ mod tests {
                 operand: Operand::Input(2)
             })
         );
-        let fused = Op::GatherQuantSiluMul {
+        let fused = Op::GatherQuantMatmul {
             bits: 4,
             group_size: 64,
         };

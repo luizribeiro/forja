@@ -11,8 +11,6 @@ pub enum OperationKind {
     QuantMatmul,
     /// Routed affine-quantized matrix multiplication.
     GatherQuantMatmul,
-    /// Routed fused affine-quantized projections with `SiLU`.
-    GatherQuantSiluMul,
     /// Scaled dot-product attention.
     Sdpa,
     /// Greatest-element selection.
@@ -29,7 +27,6 @@ impl OperationKind {
             Op::Matmul => Self::Matmul,
             Op::QuantMatmul { .. } => Self::QuantMatmul,
             Op::GatherQuantMatmul { .. } => Self::GatherQuantMatmul,
-            Op::GatherQuantSiluMul { .. } => Self::GatherQuantSiluMul,
             Op::Sdpa { .. } => Self::Sdpa,
             Op::TopK { .. } => Self::TopK,
             _ => Self::Other,
@@ -43,7 +40,6 @@ impl fmt::Display for OperationKind {
             Self::Matmul => "matmul",
             Self::QuantMatmul => "quant-matmul",
             Self::GatherQuantMatmul => "gather-quant-matmul",
-            Self::GatherQuantSiluMul => "gather-quant-silu-mul",
             Self::Sdpa => "sdpa",
             Self::TopK => "top-k",
             Self::Other => "other",
@@ -135,15 +131,11 @@ impl fmt::Display for OperationValue {
 pub fn operation_value(op: Op, value: OperationValue) -> Option<u64> {
     match (op, value) {
         (
-            Op::QuantMatmul { bits, .. }
-            | Op::GatherQuantMatmul { bits, .. }
-            | Op::GatherQuantSiluMul { bits, .. },
+            Op::QuantMatmul { bits, .. } | Op::GatherQuantMatmul { bits, .. },
             OperationValue::Bits,
         ) => Some(u64::from(bits)),
         (
-            Op::QuantMatmul { group_size, .. }
-            | Op::GatherQuantMatmul { group_size, .. }
-            | Op::GatherQuantSiluMul { group_size, .. },
+            Op::QuantMatmul { group_size, .. } | Op::GatherQuantMatmul { group_size, .. },
             OperationValue::GroupSize,
         ) => Some(u64::from(group_size)),
         (Op::TopK { k, .. }, OperationValue::TopK) => Some(u64::from(k)),
