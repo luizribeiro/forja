@@ -26,7 +26,7 @@ use forja_core::{
     GraphTemplate, Layout, LayoutError, MemoryUsage, Op, OpError, ParamSpace, PreparedGraph,
     RuleArm, Slice, Submission, SubmissionProfile, SymbolicLayout, SymbolicLayoutError, TemplateOp,
     TemplateTensor, Tensor, ViewOp, gather_matmul_flops, gather_quant_matmul_combine_flops,
-    gather_quant_matmul_flops, gather_quant_silu_mul_flops, matmul_flops,
+    gather_quant_matmul_dispatch_flops, gather_quant_silu_mul_flops, matmul_flops,
     program::{
         BinOp, EpilogueError, EpilogueSignature, Inst, KernelSignature, MAX_INSTRUCTIONS,
         MAX_OUTPUTS, PrepareError, PreparedEpilogue, PreparedProgram, Program, ProgramError,
@@ -2981,17 +2981,21 @@ impl<B: Backend + 'static> Host<B> {
                         quant_matmul_flops(input.layout().shape(), packed.layout().shape())
                     })
             }
-            Op::GatherQuantMatmul { .. } => inputs
-                .first()
-                .zip(inputs.get(1))
-                .zip(inputs.get(4))
-                .and_then(|((input, packed), indices)| {
-                    gather_quant_matmul_flops(
-                        input.layout().shape(),
-                        packed.layout().shape(),
-                        indices.layout().shape(),
-                    )
-                }),
+            Op::GatherQuantMatmul { .. } => {
+                let indices = if inputs.len() == 8 { 7 } else { 4 };
+                inputs
+                    .first()
+                    .zip(inputs.get(1))
+                    .zip(inputs.get(indices))
+                    .and_then(|((input, packed), indices)| {
+                        gather_quant_matmul_dispatch_flops(
+                            input.layout().shape(),
+                            packed.layout().shape(),
+                            indices.layout().shape(),
+                            inputs.len(),
+                        )
+                    })
+            }
             Op::GatherQuantMatmulCombine { .. } => inputs
                 .first()
                 .zip(inputs.get(1))
