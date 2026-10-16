@@ -83,6 +83,12 @@ fn metal_guest_rope_covers_styles_and_partial_prefixes() {
     }
 }
 
+#[test]
+fn metal_projected_cache_composition_matches_trusted_operation() {
+    set_native_device(NativeDevice::Metal);
+    support::projected_cache_composition_matches_trusted_operation();
+}
+
 #[allow(clippy::cast_precision_loss)]
 fn interleaved_rope_reference(
     values: &[f32],

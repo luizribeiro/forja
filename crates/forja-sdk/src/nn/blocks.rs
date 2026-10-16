@@ -7,7 +7,7 @@ use crate::{
     kernel::{Kernel, TensorRef},
 };
 
-use super::ops::{qkv_rope_cache_into, sdpa, sdpa_into, sdpa_into_with};
+use super::ops::{sdpa, sdpa_into, sdpa_into_with};
 
 /// Default number of tokens recorded in a full prefill graph.
 pub const DEFAULT_PREFILL_CHUNK: u32 = 512;
@@ -903,22 +903,32 @@ impl<T: FloatElement> KvCache<T> {
         if self.key.shape()[0] != kv_heads {
             return Err(Error::loading("QKV projection does not match the cache"));
         }
-        let query = Tensor::<T>::empty(vec![query_heads, sequence, width])?;
-        let key_slot = self.key.narrow(1, start, sequence)?;
-        let value_slot = self.value.narrow(1, start, sequence)?;
-        qkv_rope_cache_into(
-            qkv,
-            norm,
+        let norm_heads = query_heads
+            .checked_add(kv_heads)
+            .ok_or_else(|| Error::loading("QKV normalization head count overflowed"))?;
+        if norm.shape() != [norm_heads, width] || positions.shape() != [sequence] {
+            return Err(Error::loading(
+                "QKV normalization or position shape is incompatible",
+            ));
+        }
+        let kernel = qk_norm_rope_kernel(crate::sys::dtype(T::DTYPE)?, width, eps, theta)?;
+        let query = qk_norm_rope(
+            &kernel,
+            &qkv.narrow(1, 0, query_heads)?,
+            &norm.narrow(0, 0, query_heads)?,
             positions,
-            [&query, &key_slot, &value_slot],
-            eps,
-            theta,
-        )?;
-        Ok((
-            query,
-            self.key.narrow(1, 0, end)?,
-            self.value.narrow(1, 0, end)?,
-        ))
+        )?
+        .permute(&[1, 0, 2])?;
+        let key = qk_norm_rope(
+            &kernel,
+            &qkv.narrow(1, query_heads, kv_heads)?,
+            &norm.narrow(0, query_heads, kv_heads)?,
+            positions,
+        )?
+        .permute(&[1, 0, 2])?;
+        let value = qkv.narrow(1, norm_heads, kv_heads)?.permute(&[1, 0, 2])?;
+        let (key, value) = self.append(&key, &value, start, sequence, end)?;
+        Ok((query, key, value))
     }
 }
 

@@ -200,6 +200,11 @@ fn guest_rope_supports_both_styles_and_partial_prefixes() {
 }
 
 #[test]
+fn projected_cache_composition_matches_the_trusted_operation() {
+    support::projected_cache_composition_matches_trusted_operation();
+}
+
+#[test]
 fn moe_helpers_route_and_combine_experts() {
     use forja_sdk::{Tensor, nn};
 

@@ -1,6 +1,8 @@
 use forja_core::{Backend, CommandList, DType, Op, Submission};
 use forja_sdk::Tensor;
-use forja_testing::{DeterministicValues, F32_TOLERANCE, normwise_relative_error};
+use forja_testing::{
+    DeterministicValues, F32_TOLERANCE, assert_f32_values_agree, normwise_relative_error,
+};
 use golden_fixtures::decode_f32_le;
 
 pub fn matmul_rope_embedding_match_cpu() {
@@ -147,6 +149,58 @@ pub fn attention_and_cache_copy_match_cpu() {
         .unwrap();
         let start = usize::try_from(head * 128).unwrap();
         assert_eq!(separate, combined[start..start + 128]);
+    }
+}
+
+pub fn projected_cache_composition_matches_trusted_operation() {
+    let sequence = 2;
+    let query_heads = 2;
+    let kv_heads = 1;
+    let width = 4;
+    let qkv = Tensor::from_slice(
+        &(0..sequence * (query_heads + 2 * kv_heads) * width)
+            .map(|index| f32::from(u16::try_from(index).unwrap()) / 16.0 - 1.0)
+            .collect::<Vec<_>>(),
+        &[sequence, query_heads + 2 * kv_heads, width],
+    )
+    .unwrap();
+    let norm = Tensor::from_slice(&[1.0_f32; 12], &[query_heads + kv_heads, width]).unwrap();
+    let positions = Tensor::from_slice(&[3.0_f32, 7.0], &[sequence]).unwrap();
+    let trusted_query = Tensor::zeros(&[query_heads, sequence, width]).unwrap();
+    let trusted_key = Tensor::zeros(&[kv_heads, sequence, width]).unwrap();
+    let trusted_value = Tensor::zeros(&[kv_heads, sequence, width]).unwrap();
+    forja_sdk::nn::ops::qkv_rope_cache_into(
+        &qkv,
+        &norm,
+        &positions,
+        [&trusted_query, &trusted_key, &trusted_value],
+        1.0e-6,
+        10_000.0,
+    )
+    .unwrap();
+
+    let mut cache =
+        forja_sdk::nn::blocks::KvCache::new(kv_heads, sequence, width, 0.0_f32).unwrap();
+    let start = forja_sdk::Dim::from(0);
+    let end = forja_sdk::Dim::from(sequence);
+    let (query, key, value) = cache
+        .append_projected(
+            &qkv,
+            &norm,
+            &positions,
+            query_heads,
+            1.0e-6,
+            10_000.0,
+            &start,
+            &end,
+        )
+        .unwrap();
+    for (trusted, actual) in [
+        (trusted_query, query),
+        (trusted_key, key),
+        (trusted_value, value),
+    ] {
+        assert_f32_values_agree(&trusted.to_vec().unwrap(), &actual.to_vec().unwrap()).unwrap();
     }
 }
 
