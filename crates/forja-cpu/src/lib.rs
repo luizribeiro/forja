@@ -1164,15 +1164,14 @@ impl Backend for CpuBackend {
                 }
             }
         }
-        let result = dispatches
-            .into_iter()
-            .try_for_each(|dispatch| match dispatch.op() {
+        let result = dispatches.into_iter().try_for_each(|dispatch| {
+            #[allow(unreachable_patterns)]
+            match dispatch.op() {
                 Op::Program(_) => dispatch
                     .bound_program()
                     .ok_or(BackendError::ExecutionFailed)
                     .and_then(|program| self.execute_program(program)),
                 Op::Copy => self.execute_copy(dispatch.inputs(), dispatch.output()),
-                Op::Add | Op::SiluMul | Op::Softmax => Err(BackendError::UnsupportedOperation),
                 Op::RmsNorm { eps } => {
                     self.execute_rms_norm(dispatch.inputs(), dispatch.output(), eps)
                 }
@@ -1211,7 +1210,9 @@ impl Backend for CpuBackend {
                 } => {
                     self.execute_sdpa(dispatch.inputs(), dispatch.output(), scale, causal, q_start)
                 }
-            });
+                _ => Err(BackendError::UnsupportedOperation),
+            }
+        });
         Ok(CpuSubmission {
             result,
             wall_time: started.elapsed(),
