@@ -4,7 +4,9 @@ use forja_core::{Backend, CommandList, DType, Op, Submission, ViewOp};
 #[cfg(target_os = "macos")]
 use forja_host::add_metal_to_linker;
 use forja_host::{Grants, Host, Limits, add_to_linker, component_engine};
-use forja_testing::{DeterministicValues, F32_TOLERANCE, normwise_relative_error};
+use forja_testing::{
+    DeterministicValues, F32_TOLERANCE, normwise_relative_error, prepare_program, representative,
+};
 use golden_fixtures::decode_f32_le;
 use std::{
     fs,
@@ -889,8 +891,13 @@ fn direct_checksums<B: Backend>(backend: &B) -> wasmtime::Result<(u64, u64)> {
             &normalized,
         )
         .map_err(wasmtime::Error::msg)?;
+    let silu_mul = representative::silu_mul()
+        .validate()
+        .map_err(wasmtime::Error::msg)?;
+    let silu_mul = prepare_program(backend, &silu_mul, &[&normalized, &input], &[&activated])
+        .map_err(wasmtime::Error::msg)?;
     commands
-        .dispatch(Op::SiluMul, &[&normalized, &input], &activated)
+        .dispatch_kernel(&silu_mul, &[&normalized, &input], &[&activated])
         .map_err(wasmtime::Error::msg)?;
     let submission = backend.submit(commands).map_err(backend_error)?;
     submission.wait().map_err(backend_error)?;

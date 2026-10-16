@@ -11,7 +11,10 @@ wit_bindgen::generate!({
     world: "rmsnorm-smoke",
 });
 
-use l9o::gpu::compute::{CommandList, Dtype, Op, Tensor, submit};
+use l9o::gpu::compute::{
+    Binop, CommandList, Dtype, Inst, Kernel, KernelSignature, Op, ProgramKind, ProgramSource,
+    Tensor, Unop, submit,
+};
 
 struct Component;
 
@@ -28,8 +31,9 @@ impl Guest for Component {
         commands
             .dispatch(Op::RmsNorm(0.00001), &[&input, &weight], &normalized)
             .map_err(error)?;
+        let silu_mul = silu_mul_kernel().map_err(error)?;
         commands
-            .dispatch(Op::SiluMul, &[&normalized, &input], &activated)
+            .dispatch_kernel(&silu_mul, &[&normalized, &input], &[&activated])
             .map_err(error)?;
         drop(input);
         drop(weight);
@@ -39,6 +43,28 @@ impl Guest for Component {
         let activated = activated.read().await.map_err(error)?;
         Ok((checksum(&normalized), checksum(&activated)))
     }
+}
+
+fn silu_mul_kernel() -> Result<Kernel, l9o::gpu::compute::Error> {
+    Kernel::create(
+        &ProgramSource {
+            kind: ProgramKind::Map,
+            insts: vec![
+                Inst::Input(0),
+                Inst::Unary((Unop::Sigmoid, 0)),
+                Inst::Binary((Binop::Mul, 0, 1)),
+                Inst::Input(1),
+                Inst::Binary((Binop::Mul, 2, 3)),
+            ],
+            outputs: vec![(0, 4)],
+        },
+        &KernelSignature {
+            rank: 2,
+            inputs: vec![Dtype::F32, Dtype::F32],
+            outputs: vec![Dtype::F32],
+            scalars: 0,
+        },
+    )
 }
 
 fn input_bytes() -> Vec<u8> {
