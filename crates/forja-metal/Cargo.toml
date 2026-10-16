@@ -1,10 +1,15 @@
 [package]
 name = "forja-metal"
+autotests = false
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
 rust-version.workspace = true
 version.workspace = true
+
+[[test]]
+name = "metal"
+path = "tests/metal/main.rs"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 block2 = "0.6"

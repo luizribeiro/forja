@@ -1,7 +1,5 @@
 //! Map-program GPU differential tests.
 
-mod common;
-
 use std::time::Duration;
 
 use forja_core::{
@@ -20,7 +18,7 @@ use proptest::{
     test_runner::{RngSeed, TestCaseError},
 };
 
-use common::{GROSS_REGRESSION_RATIO, comparative_gpu_times, report_intervals};
+use crate::common::{GROSS_REGRESSION_RATIO, comparative_gpu_times, report_intervals};
 
 proptest! {
     #![proptest_config(ProptestConfig {
