@@ -9,10 +9,14 @@ use forja_sdk::nn::blocks::{ChunkedPrefill, DEFAULT_PREFILL_CHUNK, DecodeSelecti
 use forja_sdk::{
     DType, Dim, Engine, EngineInfo, Load, Result, StepInput, StepOutput, Tensor, VariantSelection,
     Weights, bf16, export_engine,
+    kernel::Kernel,
     nn::{
         Embedding, EmbeddingConfig, Linear, LinearConfig, RmsNorm, RmsNormConfig,
-        blocks::{KvCache, Taps, cached_attention_with},
-        moe_combine_with, moe_router_with, stack_expert_weights,
+        blocks::{
+            KvCache, Taps, add, add_kernel, cached_attention_with, silu_mul, silu_mul_kernel,
+            softmax, softmax_kernel,
+        },
+        moe_combine_with, stack_expert_weights,
     },
 };
 
@@ -43,7 +47,24 @@ type SequenceOutput = (Tensor<bf16>, Vec<Tensor<f32>>, Vec<Tensor<f32>>);
 #[derive(Clone, Copy)]
 struct Dispatch<'a> {
     variants: &'a variants::Variants,
+    kernels: &'a GuestKernels,
     attention: &'a VariantSelection,
+}
+
+struct GuestKernels {
+    add: Kernel,
+    silu_mul: Kernel,
+    softmax: Kernel,
+}
+
+impl GuestKernels {
+    fn load() -> Result<Self> {
+        Ok(Self {
+            add: add_kernel(DType::F32)?,
+            silu_mul: silu_mul_kernel(DType::BF16)?,
+            softmax: softmax_kernel(DType::F32)?,
+        })
+    }
 }
 
 #[cfg(target_family = "wasm")]
@@ -109,6 +130,7 @@ impl SparseMoe {
     fn forward(
         &self,
         variants: &variants::Variants,
+        kernels: &GuestKernels,
         input: &Tensor<f32>,
     ) -> Result<(Tensor<f32>, Tensor<f32>)> {
         let rows = input
@@ -126,16 +148,20 @@ impl SparseMoe {
             EXPERTS,
         )?;
         let top_k = variants.top_k()?;
-        let (route_weights, indices) = moe_router_with(&logits, TOP_K, false, &top_k)?;
+        let (route_weights, indices) =
+            softmax(&kernels.softmax, &logits)?.top_k_with(TOP_K, &top_k)?;
         let expert_input = input.to_dtype::<bf16>()?;
         let gate = expert_input.gather_matmul(&self.gate_proj, &indices)?;
         let up = expert_input.gather_matmul(&self.up_proj, &indices)?;
-        let activated = gate.silu_mul(&up)?;
         let routed_rows = rows
             .checked_mul(TOP_K)
             .ok_or_else(|| forja_sdk::Error::loading("routed row count overflowed"))?;
+        let activated = silu_mul(
+            &kernels.silu_mul,
+            &gate.reshape(&[routed_rows, INTERMEDIATE])?,
+            &up.reshape(&[routed_rows, INTERMEDIATE])?,
+        )?;
         let output = activated
-            .reshape(&[routed_rows, INTERMEDIATE])?
             .gather_matmul(&self.down_proj, &indices.reshape(&[routed_rows, 1])?)?
             .reshape(&[rows, TOP_K, HIDDEN])?;
         let combine = variants.matmul(DType::BF16, rows, HIDDEN, 1, TOP_K, false)?;
@@ -230,10 +256,15 @@ impl DecoderLayer {
             HIDDEN,
             HIDDEN,
         )?;
-        let hidden = (input + &attention)?;
+        let hidden = add(&dispatch.kernels.add, input, &attention)?;
         let normalized = self.post_attention_layernorm.forward(&hidden)?;
-        let (projected, router_logits) = self.mlp.forward(dispatch.variants, &normalized)?;
-        Ok(((&hidden + &projected)?, router_logits))
+        let (projected, router_logits) =
+            self.mlp
+                .forward(dispatch.variants, dispatch.kernels, &normalized)?;
+        Ok((
+            add(&dispatch.kernels.add, &hidden, &projected)?,
+            router_logits,
+        ))
     }
 }
 
@@ -261,6 +292,7 @@ struct OlmoeWeights {
 pub struct Olmoe {
     weights: OlmoeWeights,
     variants: variants::Variants,
+    kernels: GuestKernels,
     caches: Vec<KvCache<f32>>,
     positions: Tensor<u32>,
     #[cfg(target_family = "wasm")]
@@ -284,6 +316,7 @@ impl Olmoe {
         Ok(Self {
             weights,
             variants,
+            kernels: GuestKernels::load()?,
             caches,
             positions: Tensor::constant(&(0..MAX_CONTEXT).collect::<Vec<_>>(), &[MAX_CONTEXT])?,
             #[cfg(target_family = "wasm")]
@@ -339,6 +372,7 @@ impl Olmoe {
         let mut routers = Vec::with_capacity(if taps_enabled { LAYERS } else { 0 });
         let dispatch = Dispatch {
             variants: &self.variants,
+            kernels: &self.kernels,
             attention: attention_variant,
         };
         for index in 0..LAYERS {

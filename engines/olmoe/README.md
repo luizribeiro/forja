@@ -5,13 +5,15 @@ Apple M3 Ultra. The profile supports a 4096-token context and 512-token prefill 
 
 ```console
 forja build olmoe-1b-7b-0924.metal-apple-m3-ultra.bf16
-forja verify --engine olmoe-1b-7b-0924.metal-apple-m3-ultra.bf16 --each-tuning
+forja verify --engine olmoe-1b-7b-0924.metal-apple-m3-ultra.bf16
 forja bench --engine olmoe-1b-7b-0924.metal-apple-m3-ultra.bf16 --against
 ```
 
 The port implements grouped-query attention, rotary embeddings, sparse expert routing and grouped
-expert projections. Its profile carries the verified attention, dense projection and MoE kernel
-picks used by the single runtime-selectable component.
+expert projections. Addition, SiLU multiplication and router softmax are built by the guest, while
+the profile carries the verified attention, dense projection and MoE kernel picks. RMS normalization
+and RoPE retain their host paths because guest substitution perturbed near-tie expert routing beyond
+the accepted end-to-end tolerance.
 
 Accepted pp512/tg128 results use 30 measured repetitions on an 80-core Apple M3 Ultra:
 
