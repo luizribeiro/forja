@@ -150,6 +150,7 @@ pub(crate) trait Backend {
     type Tensor;
     type Commands;
     type Kernel;
+    type Epilogue;
     type Params;
     type Graph;
 
@@ -203,6 +204,23 @@ pub(crate) trait Backend {
         kernel: &Self::Kernel,
         inputs: &[&Self::Tensor],
         outputs: &[&Self::Tensor],
+    ) -> Result<()>;
+    #[allow(dead_code)]
+    fn create_epilogue(
+        program: Program,
+        accumulator_count: u8,
+        rank: u8,
+        extras: &[DType],
+        output: DType,
+    ) -> Result<Self::Epilogue>;
+    #[allow(dead_code)]
+    fn dispatch_epilogue(
+        commands: &mut Self::Commands,
+        operation: Op,
+        inputs: &[&Self::Tensor],
+        output: &Self::Tensor,
+        epilogue: &Self::Epilogue,
+        extras: &[&Self::Tensor],
     ) -> Result<()>;
     fn submit(commands: Self::Commands) -> Result<()>;
     fn params(ranges: &[(u32, u32)]) -> Result<Self::Params>;
@@ -280,6 +298,7 @@ pub(crate) mod guest {
         type Tensor = compute::Tensor;
         type Commands = compute::CommandList;
         type Kernel = compute::Kernel;
+        type Epilogue = compute::Epilogue;
         type Params = compute::Params;
         type Graph = compute::Graph;
 
@@ -439,6 +458,38 @@ pub(crate) mod guest {
         ) -> Result<()> {
             commands
                 .dispatch_kernel(kernel, inputs, outputs)
+                .map_err(|error| guest_error(&error))
+        }
+
+        fn create_epilogue(
+            program: Program,
+            accumulator_count: u8,
+            rank: u8,
+            extras: &[DType],
+            output: DType,
+        ) -> Result<Self::Epilogue> {
+            compute::Epilogue::create(
+                &wit_program(program),
+                &compute::EpilogueSignature {
+                    accumulator_count,
+                    logical_rank: rank,
+                    extras: extras.iter().copied().map(wit_dtype).collect(),
+                    output: wit_dtype(output),
+                },
+            )
+            .map_err(|error| guest_error(&error))
+        }
+
+        fn dispatch_epilogue(
+            commands: &mut Self::Commands,
+            operation: Op,
+            inputs: &[&Self::Tensor],
+            output: &Self::Tensor,
+            epilogue: &Self::Epilogue,
+            extras: &[&Self::Tensor],
+        ) -> Result<()> {
+            commands
+                .dispatch_epilogue(wit_op(operation), inputs, output, epilogue, extras)
                 .map_err(|error| guest_error(&error))
         }
 
@@ -614,6 +665,7 @@ pub(crate) mod unavailable {
     pub(crate) enum UnavailableTensor {}
     pub(crate) enum UnavailableCommands {}
     pub(crate) enum UnavailableKernel {}
+    pub(crate) enum UnavailableEpilogue {}
     pub(crate) enum UnavailableParams {}
     pub(crate) enum UnavailableGraph {}
 
@@ -635,6 +687,7 @@ pub(crate) mod unavailable {
         type Tensor = UnavailableTensor;
         type Commands = UnavailableCommands;
         type Kernel = UnavailableKernel;
+        type Epilogue = UnavailableEpilogue;
         type Params = UnavailableParams;
         type Graph = UnavailableGraph;
 
@@ -728,6 +781,27 @@ pub(crate) mod unavailable {
             Err(error())
         }
 
+        fn create_epilogue(
+            _program: Program,
+            _accumulator_count: u8,
+            _rank: u8,
+            _extras: &[DType],
+            _output: DType,
+        ) -> Result<Self::Epilogue> {
+            Err(error())
+        }
+
+        fn dispatch_epilogue(
+            _commands: &mut Self::Commands,
+            _operation: Op,
+            _inputs: &[&Self::Tensor],
+            _output: &Self::Tensor,
+            _epilogue: &Self::Epilogue,
+            _extras: &[&Self::Tensor],
+        ) -> Result<()> {
+            Err(error())
+        }
+
         fn submit(_commands: Self::Commands) -> Result<()> {
             Err(error())
         }
@@ -757,12 +831,13 @@ pub(crate) mod native {
     use forja_core::{
         DType as CoreDType, Op as CoreOp, Slice as CoreSlice, ViewOp,
         program::{
-            BinOp, Inst, Program as CoreProgram, ProgramKind as CoreProgramKind, RedOp, UnOp,
-            ValueType as CoreValueType,
+            BinOp, EpilogueSignature, Inst, Program as CoreProgram, ProgramKind as CoreProgramKind,
+            RedOp, UnOp, ValueType as CoreValueType,
         },
     };
     use forja_host::{
-        NativeCommandList, NativeHost, NativeKernel, NativeTensor, Safetensors, WeightSource as _,
+        NativeCommandList, NativeEpilogue, NativeHost, NativeKernel, NativeTensor, Safetensors,
+        WeightSource as _,
     };
 
     use super::{
@@ -775,6 +850,7 @@ pub(crate) mod native {
     type CpuTensor = NativeTensor<CpuBackend>;
     type CpuCommands = NativeCommandList<CpuBackend>;
     type CpuKernel = NativeKernel<CpuBackend>;
+    type CpuEpilogue = NativeEpilogue<CpuBackend>;
     #[cfg(all(feature = "native-metal", target_os = "macos"))]
     type MetalBackend = forja_metal::MetalBackend;
     #[cfg(all(feature = "native-metal", target_os = "macos"))]
@@ -783,6 +859,8 @@ pub(crate) mod native {
     type MetalCommands = NativeCommandList<MetalBackend>;
     #[cfg(all(feature = "native-metal", target_os = "macos"))]
     type MetalKernel = NativeKernel<MetalBackend>;
+    #[cfg(all(feature = "native-metal", target_os = "macos"))]
+    type MetalEpilogue = NativeEpilogue<MetalBackend>;
 
     thread_local! {
         static DEVICE: Cell<NativeDevice> = const { Cell::new(NativeDevice::Cpu) };
@@ -808,6 +886,13 @@ pub(crate) mod native {
         Cpu(CpuKernel),
         #[cfg(all(feature = "native-metal", target_os = "macos"))]
         Metal(MetalKernel),
+    }
+
+    #[allow(dead_code)]
+    pub(crate) enum Epilogue {
+        Cpu(CpuEpilogue),
+        #[cfg(all(feature = "native-metal", target_os = "macos"))]
+        Metal(MetalEpilogue),
     }
 
     pub(crate) enum Params {}
@@ -876,6 +961,7 @@ pub(crate) mod native {
         type Tensor = Tensor;
         type Commands = Commands;
         type Kernel = Kernel;
+        type Epilogue = Epilogue;
         type Params = Params;
         type Graph = Graph;
 
@@ -1075,6 +1161,72 @@ pub(crate) mod native {
             }
         }
 
+        fn create_epilogue(
+            program: Program,
+            accumulator_count: u8,
+            rank: u8,
+            extras: &[DType],
+            output: DType,
+        ) -> Result<Self::Epilogue> {
+            let program = core_program(program)?;
+            let signature = EpilogueSignature::new(
+                accumulator_count,
+                rank,
+                extras.iter().copied().map(core_dtype).collect(),
+                core_dtype(output),
+            );
+            match DEVICE.get() {
+                NativeDevice::Cpu => CPU_HOST.with(|host| {
+                    host.prepare_epilogue(program, signature)
+                        .map(Epilogue::Cpu)
+                        .map_err(error)
+                }),
+                #[cfg(all(feature = "native-metal", target_os = "macos"))]
+                NativeDevice::Metal => with_metal(|host| {
+                    host.prepare_epilogue(program, signature)
+                        .map(Epilogue::Metal)
+                        .map_err(error)
+                }),
+            }
+        }
+
+        fn dispatch_epilogue(
+            commands: &mut Self::Commands,
+            operation: Op,
+            inputs: &[&Self::Tensor],
+            output: &Self::Tensor,
+            epilogue: &Self::Epilogue,
+            extras: &[&Self::Tensor],
+        ) -> Result<()> {
+            match (commands, output, epilogue) {
+                (Commands::Cpu(commands), Tensor::Cpu(output), Epilogue::Cpu(epilogue)) => commands
+                    .dispatch_epilogue(
+                        core_op(operation),
+                        &cpu_inputs(inputs)?,
+                        output,
+                        epilogue,
+                        &cpu_inputs(extras)?,
+                    )
+                    .map_err(error),
+                #[cfg(all(feature = "native-metal", target_os = "macos"))]
+                (Commands::Metal(commands), Tensor::Metal(output), Epilogue::Metal(epilogue)) => {
+                    commands
+                        .dispatch_epilogue(
+                            core_op(operation),
+                            &metal_inputs(inputs)?,
+                            output,
+                            epilogue,
+                            &metal_inputs(extras)?,
+                        )
+                        .map_err(error)
+                }
+                #[cfg(all(feature = "native-metal", target_os = "macos"))]
+                _ => Err(Error::new("native resources belong to different backends")),
+                #[cfg(not(all(feature = "native-metal", target_os = "macos")))]
+                _ => Err(Error::new("native resources belong to different backends")),
+            }
+        }
+
         fn submit(commands: Self::Commands) -> Result<()> {
             match commands {
                 Commands::Cpu(commands) => commands.submit().map(|_| ()).map_err(error),
@@ -1261,6 +1413,8 @@ pub(crate) use unavailable::Unavailable as Active;
 pub(crate) type Handle = <Active as Backend>::Tensor;
 pub(crate) type Commands = <Active as Backend>::Commands;
 pub(crate) type Kernel = <Active as Backend>::Kernel;
+#[allow(dead_code)]
+pub(crate) type Epilogue = <Active as Backend>::Epilogue;
 pub(crate) type Params = <Active as Backend>::Params;
 pub(crate) type Graph = <Active as Backend>::Graph;
 
@@ -1365,6 +1519,29 @@ pub(crate) fn dispatch_kernel(
     outputs: &[&Handle],
 ) -> Result<()> {
     Active::dispatch_kernel(commands, kernel, inputs, outputs)
+}
+
+#[allow(dead_code)]
+pub(crate) fn create_epilogue(
+    program: Program,
+    accumulator_count: u8,
+    rank: u8,
+    extras: &[DType],
+    output: DType,
+) -> Result<Epilogue> {
+    Active::create_epilogue(program, accumulator_count, rank, extras, output)
+}
+
+#[allow(dead_code)]
+pub(crate) fn dispatch_epilogue(
+    commands: &mut Commands,
+    operation: Op,
+    inputs: &[&Handle],
+    output: &Handle,
+    epilogue: &Epilogue,
+    extras: &[&Handle],
+) -> Result<()> {
+    Active::dispatch_epilogue(commands, operation, inputs, output, epilogue, extras)
 }
 
 pub(crate) fn submit(commands: Commands) -> Result<()> {
