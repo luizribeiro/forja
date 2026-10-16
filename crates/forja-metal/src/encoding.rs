@@ -7193,8 +7193,52 @@ fn epilogue_pipeline_requests(
     );
     match dispatch.op() {
         Op::Matmul => dense_epilogue_requests(dispatch, epilogue, parameter_dependent),
-        Op::QuantMatmul { .. } | Op::GatherQuantMatmul { .. } => {
-            Err(BackendError::UnsupportedOperation)
+        Op::QuantMatmul { bits, group_size } => {
+            let [input, _, scales, _] = dispatch.primitive_inputs() else {
+                return Err(BackendError::InvalidInput);
+            };
+            let mut constants = vec![
+                (0, dtype_code(input.layout().dtype())),
+                (1, dtype_code(scales.layout().dtype())),
+                (2, dtype_code(dispatch.output().layout().dtype())),
+                (12, u32::from(bits)),
+                (13, group_size),
+            ];
+            let implementation = quant_matmul_kernel(dispatch)?;
+            if parameter_dependent {
+                Ok([1, 2]
+                    .into_iter()
+                    .map(|words| {
+                        let mut constants = constants.clone();
+                        constants.push((15, words));
+                        EpiloguePipelineRequest {
+                            family: epilogue_codegen::FamilySourceTag::Quant,
+                            epilogue: Arc::clone(&epilogue),
+                            implementation,
+                            constants,
+                        }
+                    })
+                    .collect())
+            } else {
+                let inner = *input
+                    .layout()
+                    .shape()
+                    .last()
+                    .ok_or(BackendError::InvalidInput)?;
+                let columns = *dispatch
+                    .output()
+                    .layout()
+                    .shape()
+                    .last()
+                    .ok_or(BackendError::InvalidInput)?;
+                constants.push((15, u32::from(columns % 8 == 0 && inner % 512 == 0) + 1));
+                Ok(vec![EpiloguePipelineRequest {
+                    family: epilogue_codegen::FamilySourceTag::Quant,
+                    epilogue,
+                    implementation,
+                    constants,
+                }])
+            }
         }
         _ => Err(BackendError::UnsupportedOperation),
     }
