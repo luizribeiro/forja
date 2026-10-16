@@ -401,4 +401,53 @@ mod tests {
         let store = body[call..].find("store_float(").unwrap() + call;
         assert!(barrier < edge && edge < call && call < store);
     }
+
+    #[test]
+    fn quant_splices_follow_collectives_and_edge_checks() {
+        let source = generate_source(&bias_epilogue());
+        for (kernel, end_marker, expected_calls, collective, edge) in [
+            (
+                "kernel void quantized_gemv(",
+                "kernel void quantized_gemv_q8_fast(",
+                2,
+                "quantized_q",
+                "if (column < params.columns)",
+            ),
+            (
+                "kernel void quantized_gemv_q8_fast(",
+                "kernel void quantized_router_q8(",
+                1,
+                "simd_sum(",
+                "if (column < params.columns)",
+            ),
+        ] {
+            let start = source.find(kernel).unwrap();
+            let body = &source[start..source[start..].find(end_marker).unwrap() + start];
+            assert_eq!(body.matches("forja_epilogue(").count(), expected_calls);
+            let mut end = 0;
+            while let Some(offset) = body[end..].find("forja_epilogue(") {
+                let call = end + offset;
+                let before = &body[..call];
+                assert!(before.rfind(collective).unwrap() < before.rfind(edge).unwrap());
+                assert!(body[call..].find("store_float(").is_some());
+                end = call + 1;
+            }
+        }
+    }
+
+    #[test]
+    fn quant_source_addresses_ignore_program_values() {
+        let source = generate_source(&bias_epilogue());
+        for address in source
+            .lines()
+            .filter(|line| line.contains("ulong epilogue_address"))
+        {
+            assert!(
+                !address
+                    .as_bytes()
+                    .windows(2)
+                    .any(|pair| pair[0] == b'v' && pair[1].is_ascii_digit())
+            );
+        }
+    }
 }

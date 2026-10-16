@@ -2916,7 +2916,7 @@ impl MetalBackend {
         bindings: &mut ArgumentBindings,
         arguments: &mut ArgumentWriter,
     ) -> Result<Vec<BufferBinding>, BackendError> {
-        let [input, packed, scales, biases] = dispatch.inputs() else {
+        let [input, packed, scales, biases] = dispatch.primitive_inputs() else {
             return Err(BackendError::InvalidInput);
         };
         let input = self.encoder_tensor(input)?;
@@ -2931,21 +2931,29 @@ impl MetalBackend {
         )?;
         let params = arguments.write(&params)?;
         let kernel = quant_matmul_kernel(dispatch)?;
-        let pipeline = self
+        let constants = [
+            (0, dtype_code(input.layout.dtype())),
+            (1, dtype_code(scales.layout.dtype())),
+            (2, dtype_code(output.layout.dtype())),
+            (12, u32::from(bits)),
+            (13, group_size),
+            (15, u32::from(columns % 8 == 0 && inner % 512 == 0) + 1),
+        ];
+        let mut pipelines = self
             .pipelines
             .lock()
-            .map_err(|_| BackendError::ExecutionFailed)?
-            .get(
+            .map_err(|_| BackendError::ExecutionFailed)?;
+        let pipeline = if let Some(epilogue) = dispatch.prepared_epilogue() {
+            pipelines.get_epilogue(
+                epilogue_codegen::FamilySourceTag::Quant,
+                epilogue,
                 kernel,
-                &[
-                    (0, dtype_code(input.layout.dtype())),
-                    (1, dtype_code(scales.layout.dtype())),
-                    (2, dtype_code(output.layout.dtype())),
-                    (12, u32::from(bits)),
-                    (13, group_size),
-                    (15, u32::from(columns % 8 == 0 && inner % 512 == 0) + 1),
-                ],
-            )?;
+                &constants,
+            )?
+        } else {
+            pipelines.get(kernel, &constants)?
+        };
+        drop(pipelines);
         set_pipeline(encoder, &pipeline);
         for (index, tensor) in [&input, &packed, &scales, &biases, &output]
             .into_iter()
@@ -2954,6 +2962,10 @@ impl MetalBackend {
             bindings.bind(table, index, &tensor.buffer);
         }
         bindings.bind(table, 5, &params);
+        let mut temporaries = vec![params];
+        if let Some(layouts) = self.bind_epilogue_arguments(dispatch, table, bindings, arguments)? {
+            temporaries.push(layouts);
+        }
         set_argument_table(encoder, table);
         let (column_tile, row_tile, threads) = match kernel {
             "quantized_gemv" => (if bits == 8 { 16 } else { 8 }, 1, 64),
@@ -2978,7 +2990,7 @@ impl MetalBackend {
                 depth: 1,
             },
         );
-        Ok(vec![params])
+        Ok(temporaries)
     }
 
     fn quant_matmul_params(
@@ -5930,7 +5942,16 @@ impl MetalBackend {
                 arguments.write(136)?;
                 arguments.write(8)?;
             }
-            Op::QuantMatmul { .. } => arguments.write(144)?,
+            Op::QuantMatmul { .. } => {
+                arguments.write(144)?;
+                let extra_count = dispatch
+                    .inputs()
+                    .len()
+                    .saturating_sub(dispatch.primitive_inputs().len());
+                if extra_count > 0 {
+                    arguments.write(extra_count.saturating_mul(112))?;
+                }
+            }
             Op::QuantizedRouter { .. } => {
                 for len in [144, 112, 112, 4, 4] {
                     arguments.write(len)?;
@@ -6374,6 +6395,11 @@ fn supported_dispatch(dispatch: &Dispatch) -> bool {
                     | MetalVariant::MatmulSteel64x64x16_1x2
                     | MetalVariant::MatmulSteel64x32x32_2x2
                     | MetalVariant::MatmulSteel32x64x16_1x2
+                    | MetalVariant::QuantMatmulPortable
+                    | MetalVariant::QuantMatmulGemv
+                    | MetalVariant::QuantMatmulQ8FastGemv
+                    | MetalVariant::QuantMatmulSmallM
+                    | MetalVariant::QuantMatmulTiled
             )
         )
     {
@@ -6490,7 +6516,7 @@ pub(super) fn dispatch_kernel(dispatch: &Dispatch) -> Result<&'static str, Backe
 }
 
 fn quant_matmul_kernel(dispatch: &Dispatch) -> Result<&'static str, BackendError> {
-    let [input, _, _, _] = dispatch.inputs() else {
+    let [input, _, _, _] = dispatch.primitive_inputs() else {
         return Err(BackendError::InvalidInput);
     };
     match selected_variant(dispatch) {
@@ -8981,6 +9007,143 @@ mod tests {
         }
     }
 
+    #[test]
+    fn metal_quant_gemv_epilogues_cover_formats_dtypes_and_odd_columns() {
+        let backend = MetalBackend::new().unwrap();
+        for dtype in [DType::F32, DType::F16, DType::BF16] {
+            for bits in [4, 8] {
+                assert_quant_epilogue(&backend, "quant-matmul.gemv", dtype, bits, 1, 256, 33, true);
+            }
+        }
+        assert_quant_epilogue(
+            &backend,
+            "quant-matmul.gemv",
+            DType::F32,
+            4,
+            1,
+            256,
+            4097,
+            true,
+        );
+    }
+
+    #[test]
+    fn metal_quant_q8_fast_epilogues_cover_every_dtype() {
+        let backend = MetalBackend::new().unwrap();
+        for dtype in [DType::F32, DType::F16, DType::BF16] {
+            assert_quant_epilogue(
+                &backend,
+                "quant-matmul.q8-fast-gemv",
+                dtype,
+                8,
+                1,
+                256,
+                33,
+                true,
+            );
+        }
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    fn assert_quant_epilogue(
+        backend: &MetalBackend,
+        variant: &str,
+        dtype: DType,
+        bits: u8,
+        rows: u32,
+        inner: u32,
+        columns: u32,
+        broadcast: bool,
+    ) {
+        let group_size = 64;
+        let packed_width = inner * u32::from(bits) / 32;
+        let groups = inner / group_size;
+        let parameter_dtype = if dtype == DType::F32 {
+            DType::F16
+        } else {
+            dtype
+        };
+        let input = backend.alloc(dtype, &[rows, inner]).unwrap();
+        let packed = backend.alloc(DType::U32, &[columns, packed_width]).unwrap();
+        let scales = backend.alloc(parameter_dtype, &[columns, groups]).unwrap();
+        let biases = backend.alloc(parameter_dtype, &[columns, groups]).unwrap();
+        backend
+            .write(&input, &float_pattern(dtype, rows * inner))
+            .unwrap();
+        let packed_bytes = (0..columns * packed_width)
+            .flat_map(|index| index.wrapping_mul(0x0101_0101).to_ne_bytes())
+            .collect::<Vec<_>>();
+        backend.write(&packed, &packed_bytes).unwrap();
+        backend
+            .write(&scales, &float_pattern(parameter_dtype, columns * groups))
+            .unwrap();
+        backend
+            .write(&biases, &float_pattern(parameter_dtype, columns * groups))
+            .unwrap();
+        let extra_storage = if broadcast {
+            backend.alloc(dtype, &[columns]).unwrap()
+        } else {
+            backend.alloc(dtype, &[columns, rows]).unwrap()
+        };
+        let extra = if broadcast {
+            backend
+                .view(&extra_storage, ViewOp::Broadcast(vec![rows, columns]))
+                .unwrap()
+        } else {
+            backend
+                .view(&extra_storage, ViewOp::Permute(vec![1, 0]))
+                .unwrap()
+        };
+        backend
+            .write(
+                &extra_storage,
+                &float_pattern(dtype, if broadcast { columns } else { rows * columns }),
+            )
+            .unwrap();
+        let fused_output = backend.alloc(dtype, &[rows, columns]).unwrap();
+        let decomposed_output = backend.alloc(dtype, &[rows, columns]).unwrap();
+        let accumulator = backend.alloc(dtype, &[rows, columns]).unwrap();
+        let program = multiply_program();
+        let epilogue = prepare_epilogue(
+            program.clone(),
+            EpilogueSignature::new(1, 2, vec![dtype], dtype),
+        )
+        .unwrap();
+        let map = prepare_program(
+            backend,
+            program,
+            KernelSignature::new(2, vec![dtype, dtype], vec![dtype], 0),
+        )
+        .unwrap();
+        let op = Op::QuantMatmul { bits, group_size };
+        let primitive_inputs = [&input, &packed, &scales, &biases];
+        let selection = backend
+            .validate_variant_for_op(op, &primitive_inputs, &[&fused_output], variant)
+            .unwrap();
+        let mut fused = CommandList::new();
+        fused
+            .dispatch_epilogue(op, &primitive_inputs, &fused_output, &epilogue, &[&extra])
+            .unwrap();
+        assert!(fused.set_last_backend_data(BackendDispatchData::new(selection)));
+        let mut decomposed = CommandList::new();
+        decomposed
+            .dispatch(op, &primitive_inputs, &accumulator)
+            .unwrap();
+        assert!(decomposed.set_last_backend_data(BackendDispatchData::new(selection)));
+        decomposed
+            .dispatch_kernel(&map, &[&accumulator, &extra], &[&decomposed_output])
+            .unwrap();
+        assert_fused_decomposed(
+            backend,
+            fused,
+            &fused_output,
+            decomposed,
+            &decomposed_output,
+            DifferentialComparison::Quantized(dtype),
+        )
+        .unwrap();
+    }
+
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     fn assert_dense_epilogue(
         variant: &str,
@@ -9117,6 +9280,25 @@ mod tests {
             .collect()
     }
 
+    fn float_pattern(dtype: DType, count: u32) -> Vec<u8> {
+        const F16_VALUES: [u16; 7] = [0xb600, 0xb400, 0xb000, 0, 0x3000, 0x3400, 0x3600];
+        (0..count)
+            .flat_map(|index| {
+                let slot = usize::try_from(index % 7).unwrap();
+                let value = (f32::from(u16::try_from(slot).unwrap()) - 3.0) / 8.0;
+                match dtype {
+                    DType::F32 => value.to_ne_bytes().to_vec(),
+                    DType::F16 => F16_VALUES[slot].to_ne_bytes().to_vec(),
+                    DType::BF16 => u16::try_from(value.to_bits() >> 16)
+                        .unwrap()
+                        .to_ne_bytes()
+                        .to_vec(),
+                    DType::I32 | DType::U32 => unreachable!(),
+                }
+            })
+            .collect()
+    }
+
     fn add_program() -> ValidatedProgram {
         Program {
             kind: ProgramKind::Map,
@@ -9124,6 +9306,20 @@ mod tests {
                 Inst::Input(0),
                 Inst::Input(1),
                 Inst::Binary(BinOp::Add, 0, 1),
+            ],
+            outputs: vec![(0, 2)],
+        }
+        .validate()
+        .unwrap()
+    }
+
+    fn multiply_program() -> ValidatedProgram {
+        Program {
+            kind: ProgramKind::Map,
+            insts: vec![
+                Inst::Input(0),
+                Inst::Input(1),
+                Inst::Binary(BinOp::Mul, 0, 1),
             ],
             outputs: vec![(0, 2)],
         }
