@@ -333,6 +333,26 @@ struct GroupedRouteShape {
     block_elements: u32,
 }
 
+#[derive(Clone, Copy)]
+struct WeightedGatherSchedule {
+    implementation: &'static str,
+    threadgroup_width: u32,
+}
+
+fn weighted_gather_schedule(routes: u32) -> Result<WeightedGatherSchedule, BackendError> {
+    if routes <= 8 {
+        Ok(WeightedGatherSchedule {
+            implementation: "gather_quantized_weighted_sum",
+            threadgroup_width: routes.checked_mul(32).ok_or(BackendError::InvalidInput)?,
+        })
+    } else {
+        Ok(WeightedGatherSchedule {
+            implementation: "gather_quantized_weighted_sum_broad",
+            threadgroup_width: 32,
+        })
+    }
+}
+
 impl GroupedRouteShape {
     fn new(rows: u32, routes: u32, experts: u32) -> Result<Self, BackendError> {
         let route_count = u64::from(rows)
@@ -3204,6 +3224,7 @@ impl MetalBackend {
             gather_quant_combine_params(tensors, (bits, group_size))?;
         let inner = input.layout.shape()[2];
         let words_per_thread = u32::from(columns % 4 == 0 && inner % 512 == 0) + 1;
+        let schedule = weighted_gather_schedule(routes)?;
         let params = arguments.write(&params)?;
         let error_flag = grouped_error_flag(arguments)?;
         let constants = [
@@ -3223,7 +3244,7 @@ impl MetalBackend {
                 dispatch
                     .prepared_epilogue()
                     .ok_or(BackendError::InvalidInput)?,
-                "gather_quantized_weighted_sum",
+                schedule.implementation,
                 &constants,
             )?;
         set_pipeline(encoder, &pipeline);
@@ -3243,7 +3264,7 @@ impl MetalBackend {
                 depth: 1,
             },
             MTLSize {
-                width: usize::try_from(routes.checked_mul(32).ok_or(BackendError::InvalidInput)?)
+                width: usize::try_from(schedule.threadgroup_width)
                     .map_err(|_| BackendError::InvalidInput)?,
                 height: 1,
                 depth: 1,
@@ -6423,7 +6444,12 @@ pub(super) fn dispatch_kernel(dispatch: &Dispatch) -> Result<&'static str, Backe
         Op::QuantMatmul { .. } => quant_matmul_kernel(dispatch)?,
         Op::GatherQuantMatmul { .. } => {
             if dispatch.primitive_inputs().len() == 6 {
-                "gather_quantized_weighted_sum"
+                let routes = dispatch
+                    .primitive_inputs()
+                    .first()
+                    .and_then(|input| input.layout().shape().get(1))
+                    .ok_or(BackendError::InvalidInput)?;
+                weighted_gather_schedule(*routes)?.implementation
             } else if dispatch.primitive_inputs().len() == 8 && grouped_gather_dispatch(dispatch) {
                 "gathered_pair_from_projections"
             } else if dispatch.primitive_inputs().len() == 8 {
@@ -7196,11 +7222,16 @@ fn gather_epilogue_requests(
             .shape()
             .last()
             .ok_or(BackendError::InvalidInput)?;
+        let routes = *input
+            .layout()
+            .shape()
+            .get(1)
+            .ok_or(BackendError::InvalidInput)?;
         constants.push((14, u32::from(columns % 4 == 0 && inner % 512 == 0) + 1));
         return Ok(vec![EpiloguePipelineRequest {
             family: epilogue_codegen::FamilySourceTag::GatherQuant,
             epilogue,
-            implementation: "gather_quantized_weighted_sum",
+            implementation: weighted_gather_schedule(routes)?.implementation,
             constants,
         }]);
     }
@@ -9751,13 +9782,67 @@ mod tests {
     }
 
     #[test]
-    fn metal_weighted_gather_epilogue_executes_with_a_residual() {
+    fn metal_weighted_gather_epilogue_executes_optimized_and_broad_schedules() {
+        let backend = MetalBackend::new().unwrap();
+        for routes in [5, 33] {
+            let rows = 1;
+            let experts = 8;
+            let inner = 64;
+            let columns = 7;
+            let input = backend.alloc(DType::F32, &[rows, routes, inner]).unwrap();
+            let packed = backend
+                .alloc(DType::U32, &[experts, columns, inner / 8])
+                .unwrap();
+            let scales = backend
+                .alloc(DType::F16, &[experts, columns, inner / 64])
+                .unwrap();
+            let biases = backend
+                .alloc(DType::F16, &[experts, columns, inner / 64])
+                .unwrap();
+            let indices = backend.alloc(DType::U32, &[rows, routes]).unwrap();
+            let weights = backend.alloc(DType::F32, &[rows, routes]).unwrap();
+            let residual = backend.alloc(DType::F32, &[rows, columns]).unwrap();
+            let output = backend.alloc(DType::F32, &[rows, columns]).unwrap();
+            backend
+                .write(
+                    &indices,
+                    &(0..routes)
+                        .flat_map(|index| (index % experts).to_ne_bytes())
+                        .collect::<Vec<_>>(),
+                )
+                .unwrap();
+            let epilogue = prepare_epilogue(
+                add_program(),
+                EpilogueSignature::new(1, 2, vec![DType::F32], DType::F32),
+            )
+            .unwrap();
+            let mut commands = CommandList::new();
+            commands
+                .dispatch_epilogue(
+                    Op::GatherQuantMatmul {
+                        bits: 4,
+                        group_size: 64,
+                    },
+                    &[&input, &packed, &scales, &biases, &indices, &weights],
+                    &output,
+                    &epilogue,
+                    &[&residual],
+                )
+                .unwrap();
+            backend.submit(commands).unwrap().wait().unwrap();
+        }
+    }
+
+    #[test]
+    fn metal_broad_weighted_gather_zeros_invalid_route_and_reports_error() {
         let backend = MetalBackend::new().unwrap();
         let rows = 1;
-        let routes = 5;
+        let routes = 33;
         let experts = 8;
         let inner = 64;
         let columns = 7;
+        let invalid_route = 17;
+        let invalid_expert = 99_u32;
         let input = backend.alloc(DType::F32, &[rows, routes, inner]).unwrap();
         let packed = backend
             .alloc(DType::U32, &[experts, columns, inner / 8])
@@ -9774,11 +9859,44 @@ mod tests {
         let output = backend.alloc(DType::F32, &[rows, columns]).unwrap();
         backend
             .write(
-                &indices,
-                &(0..routes)
-                    .flat_map(|index| (index % experts).to_ne_bytes())
+                &input,
+                &(0..routes * inner)
+                    .flat_map(|_| 1.0_f32.to_ne_bytes())
                     .collect::<Vec<_>>(),
             )
+            .unwrap();
+        backend
+            .write(
+                &biases,
+                &(0..experts * columns * (inner / 64))
+                    .flat_map(|_| 0x3c00_u16.to_ne_bytes())
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        let mut selected = vec![0_u32; usize::try_from(routes).unwrap()];
+        selected[invalid_route] = invalid_expert;
+        backend
+            .write(
+                &indices,
+                &selected
+                    .into_iter()
+                    .flat_map(u32::to_ne_bytes)
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        let mut route_weights = vec![0.0_f32; usize::try_from(routes).unwrap()];
+        route_weights[invalid_route] = 1.0;
+        backend
+            .write(
+                &weights,
+                &route_weights
+                    .into_iter()
+                    .flat_map(f32::to_ne_bytes)
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        backend
+            .write(&output, &vec![0xa5; usize::try_from(columns * 4).unwrap()])
             .unwrap();
         let epilogue = prepare_epilogue(
             add_program(),
@@ -9798,7 +9916,21 @@ mod tests {
                 &[&residual],
             )
             .unwrap();
-        backend.submit(commands).unwrap().wait().unwrap();
+        let submission = backend.submit(commands).unwrap();
+        assert!(matches!(
+            submission.wait(),
+            Err(BackendError::DeviceErrorFlag {
+                operation: "gather-quant-matmul",
+                flag: 1,
+                value,
+                ..
+            }) if value == invalid_expert
+        ));
+        drop(submission);
+        assert_eq!(
+            backend.read(&output).unwrap(),
+            vec![0; usize::try_from(columns * 4).unwrap()]
+        );
     }
 
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]

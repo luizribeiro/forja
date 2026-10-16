@@ -634,6 +634,73 @@ kernel void gather_quantized_weighted_sum(
     }
 }
 
+kernel void gather_quantized_weighted_sum_broad(
+    device const uchar *input [[buffer(0)]],
+    device const uchar *packed [[buffer(1)]],
+    device const uchar *scales [[buffer(2)]],
+    device const uchar *biases [[buffer(3)]],
+    device const uint *indices [[buffer(4)]],
+    device const uchar *weights [[buffer(5)]],
+    device uchar *output [[buffer(6)]],
+    constant GatherQuantMatmulWeightedParams &params [[buffer(7)]],
+    device atomic_uint *error_flag [[buffer(8)]],
+    FORJA_EPILOGUE_ARGUMENTS
+    ushort lane [[thread_index_in_simdgroup]],
+    uint2 tile [[threadgroup_position_in_grid]]) {
+    uint first_column = tile.x * 4;
+    float accumulated[4] = {0.0f};
+    for (uint route = 0; route < params.routes; ++route) {
+        uint expert = indices[
+            params.indices_offset + ulong(tile.y) * params.indices_row_stride +
+            ulong(route) * params.indices_route_stride];
+        bool valid = expert < params.experts;
+        if (!valid && lane == 0) {
+            atomic_store_explicit(error_flag, 1, memory_order_relaxed);
+            atomic_fetch_min_explicit(error_flag + 1, expert, memory_order_relaxed);
+        }
+        float sums[4] = {0.0f};
+        if (valid) {
+            quantized_qmv_sums(
+                input, packed, scales, biases,
+                params.input_offset + ulong(tile.y) * params.input_row_stride +
+                    ulong(route) * params.input_route_stride,
+                params.packed_offset + ulong(expert) * params.packed_expert_stride,
+                params.scale_offset + ulong(expert) * params.scale_expert_stride,
+                params.bias_offset + ulong(expert) * params.bias_expert_stride,
+                params.input_inner_stride, params.packed_row_stride,
+                params.packed_word_stride, params.scale_row_stride,
+                params.scale_group_stride, params.bias_row_stride,
+                params.bias_group_stride, params.inner, params.columns,
+                first_column, lane, gather_words_per_thread, sums);
+        }
+        float weight = load_float(
+            weights,
+            params.weights_offset + ulong(tile.y) * params.weights_row_stride +
+                ulong(route) * params.weights_route_stride,
+            input0_dtype);
+        for (uint item = 0; item < 4; ++item) {
+            accumulated[item] += weight * sums[item];
+        }
+    }
+    if (lane == 0) {
+        for (uint item = 0; item < 4; ++item) {
+            uint column = first_column + item;
+            if (column < params.columns) {
+                float value = forja_epilogue(
+                    accumulated[item], 0.0f, 0u, tile.y, column,
+                    1u, params.rows, params.columns,
+                    FORJA_EPILOGUE_VALUES);
+                store_float(
+                    output,
+                    params.output_offset + ulong(tile.y) * params.output_row_stride +
+                        ulong(column) * params.output_column_stride,
+                    output_dtype,
+                    value);
+            }
+        }
+    }
+}
+
 kernel void gather_quantized_pair(
     device const uchar *input [[buffer(0)]],
     device const uchar *gate_packed [[buffer(1)]],

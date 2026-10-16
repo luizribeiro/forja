@@ -208,6 +208,7 @@ const PACKED: TensorRef = TensorRef::input("packed weights", 1);
 const SCALES: TensorRef = TensorRef::input("scales", 2);
 const BIASES: TensorRef = TensorRef::input("biases", 3);
 const INDICES_MATMUL: TensorRef = TensorRef::input("route indices", 4);
+const PAIRED_INDICES_MATMUL: TensorRef = TensorRef::input("route indices", 7);
 const OUTPUT: TensorRef = TensorRef::output("output", 0);
 const QUERY: TensorRef = TensorRef::input("query", 0);
 const KEY: TensorRef = TensorRef::input("key", 1);
@@ -219,6 +220,7 @@ const INNER: Dimension = dim("inner", INPUT, Axis::Index(1));
 const EXPERTS: Dimension = dim("experts", PACKED, Axis::Index(0));
 const MATMUL_ROWS: Dimension = dim("rows", INDICES_MATMUL, Axis::Index(0));
 const MATMUL_ROUTES: Dimension = dim("routes", INDICES_MATMUL, Axis::Index(1));
+const PAIRED_MATMUL_ROUTES: Dimension = dim("routes", PAIRED_INDICES_MATMUL, Axis::Index(1));
 const QUERY_HEADS: Dimension = dim("query heads", QUERY, Axis::Index(0));
 const QUERY_LENGTH: Dimension = dim("query length", QUERY, Axis::Index(1));
 const KEY_HEADS: Dimension = dim("key/value heads", KEY, Axis::Index(0));
@@ -363,6 +365,11 @@ const fn grouped(rows: Dimension, routes: Dimension) -> [Constraint; 2] {
 }
 
 const GROUPED_MATMUL: &[Constraint] = &grouped(MATMUL_ROWS, MATMUL_ROUTES);
+const ROUTE_GEMV: &[Constraint] = &[value(MATMUL_ROUTES, Relation::Range { min: 1, max: 8 })];
+const PAIRED_ROUTE_GEMV: &[Constraint] = &[value(
+    PAIRED_MATMUL_ROUTES,
+    Relation::Range { min: 1, max: 8 },
+)];
 const WIDTHS: &[u64] = &[64, 128];
 const VECTOR_COMMON: &[Constraint] = &[
     value(QUERY_LENGTH, Relation::Equal(1)),
@@ -567,7 +574,7 @@ pub(crate) static REGISTRY: &[VariantDef<MetalVariant>] = &[
         "gather-quant-matmul.route-gemv",
         GatherQuantMatmul,
         GatherQuantMatmulRouteGemv,
-        &[],
+        ROUTE_GEMV,
         &["fewer than 64 routed rows or more than 256 experts."],
         &["enough routes to amortize grouping."],
         &["Executes each routed row directly."]
@@ -711,7 +718,7 @@ pub(crate) fn resolve(
             capability,
         });
     }
-    for constraint in definition.constraints {
+    for constraint in variant_constraints(definition, dispatch.primitive_inputs().len()) {
         if let Err(actual) = check_constraint(dispatch, capabilities, constraint) {
             return Err(VariantError::Constraint {
                 operation,
@@ -727,6 +734,17 @@ pub(crate) fn resolve(
     })
 }
 
+fn variant_constraints(
+    definition: &'static VariantDef<MetalVariant>,
+    input_count: usize,
+) -> &'static [Constraint] {
+    if definition.implementation == MetalVariant::GatherQuantMatmulRouteGemv && input_count == 8 {
+        PAIRED_ROUTE_GEMV
+    } else {
+        definition.constraints
+    }
+}
+
 pub(crate) fn resolve_template(
     space: &ParamSpace,
     operation: TemplateOp,
@@ -736,18 +754,19 @@ pub(crate) fn resolve_template(
 ) -> Result<ValidatedVariant, VariantError> {
     let kind = template_operation(operation);
     let (index, definition) = definition(kind, name, &[DeviceCapability::Metal4])?;
+    let constraints = variant_constraints(definition, inputs.len());
     prove_constraints(
         space,
         operation,
         inputs,
         outputs,
         &[DeviceCapability::Metal4],
-        definition.constraints,
+        constraints,
     )
     .map_err(|error| proof_error(kind, name, error))?;
     Ok(ValidatedVariant {
         index,
-        replay_constraints: replay_constraint_mask(inputs, outputs, definition.constraints),
+        replay_constraints: replay_constraint_mask(inputs, outputs, constraints),
     })
 }
 
@@ -764,13 +783,10 @@ pub(crate) fn resolve_rule(
         .iter()
         .map(|arm| {
             definition(kind, arm.name(), &[DeviceCapability::Metal4]).map(|(index, definition)| {
+                let constraints = variant_constraints(definition, inputs.len());
                 ValidatedVariant {
                     index,
-                    replay_constraints: replay_constraint_mask(
-                        inputs,
-                        outputs,
-                        definition.constraints,
-                    ),
+                    replay_constraints: replay_constraint_mask(inputs, outputs, constraints),
                 }
             })
         })
@@ -785,7 +801,7 @@ pub(crate) fn resolve_rule(
             REGISTRY
                 .iter()
                 .find(|definition| definition.name == name)
-                .map(|definition| definition.constraints)
+                .map(|definition| variant_constraints(definition, inputs.len()))
         },
     )
     .map_err(VariantError::Rule)?;
@@ -803,7 +819,10 @@ pub(crate) fn revalidate_replay(
     #[cfg(test)]
     REPLAY_VALIDATIONS.set(REPLAY_VALIDATIONS.get().saturating_add(1));
     let definition = &REGISTRY[variant.index];
-    for (index, constraint) in definition.constraints.iter().enumerate() {
+    for (index, constraint) in variant_constraints(definition, dispatch.primitive_inputs().len())
+        .iter()
+        .enumerate()
+    {
         if variant.replay_constraints & replay_constraint_bit(index) == 0 {
             continue;
         }
@@ -1226,7 +1245,7 @@ mod tests {
         commands.into_dispatches().remove(0)
     }
 
-    fn gathered_dispatch(rows: u32, routes: u32, experts: u32) -> Dispatch {
+    fn gathered_dispatch(rows: u32, routes: u32, experts: u32, projections: u8) -> Dispatch {
         let backend = CpuBackend::new();
         let (dtype, inner, columns, bits, group_size) = (DType::BF16, 64, 33, 4, 64);
         let input = backend.alloc(dtype, &[rows, inner]).unwrap();
@@ -1247,16 +1266,36 @@ mod tests {
             )
         };
         let (packed, scales, biases) = weights();
+        let (second_packed, second_scales, second_biases) = weights();
         let indices = backend.alloc(DType::U32, &[rows, routes]).unwrap();
         let output = backend.alloc(dtype, &[rows, routes, columns]).unwrap();
         let mut commands = CommandList::new();
-        commands
-            .dispatch(
-                Op::GatherQuantMatmul { bits, group_size },
-                &[&input, &packed, &scales, &biases, &indices],
-                &output,
-            )
-            .unwrap();
+        if projections == 2 {
+            commands
+                .dispatch(
+                    Op::GatherQuantMatmul { bits, group_size },
+                    &[
+                        &input,
+                        &packed,
+                        &scales,
+                        &biases,
+                        &second_packed,
+                        &second_scales,
+                        &second_biases,
+                        &indices,
+                    ],
+                    &output,
+                )
+                .unwrap();
+        } else {
+            commands
+                .dispatch(
+                    Op::GatherQuantMatmul { bits, group_size },
+                    &[&input, &packed, &scales, &biases, &indices],
+                    &output,
+                )
+                .unwrap();
+        }
         commands.into_dispatches().remove(0)
     }
 
@@ -1450,6 +1489,33 @@ mod tests {
     }
 
     #[test]
+    fn route_gemv_caps_routes_while_portable_accepts_broad_shapes() {
+        assert!(
+            resolve(
+                &gathered_dispatch(1, 8, 257, 1),
+                "gather-quant-matmul.route-gemv",
+                METAL4
+            )
+            .is_ok()
+        );
+        let broad = gathered_dispatch(1, 9, 257, 1);
+        assert!(resolve(&broad, "gather-quant-matmul.portable", METAL4).is_ok());
+        let error = resolve(&broad, "gather-quant-matmul.route-gemv", METAL4).unwrap_err();
+        assert!(error.to_string().contains("routes is in 1..=8"));
+        assert!(
+            resolve(
+                &gathered_dispatch(1, 8, 257, 2),
+                "gather-quant-matmul.route-gemv",
+                METAL4
+            )
+            .is_ok()
+        );
+        let paired_broad = gathered_dispatch(1, 9, 257, 2);
+        let error = resolve(&paired_broad, "gather-quant-matmul.route-gemv", METAL4).unwrap_err();
+        assert!(error.to_string().contains("routes is in 1..=8"));
+    }
+
+    #[test]
     fn relation_boundaries_are_inclusive_and_checked() {
         assert!(relation_accepts(Relation::Range { min: 7, max: 33 }, 7));
         assert!(relation_accepts(Relation::Range { min: 7, max: 33 }, 33));
@@ -1525,17 +1591,17 @@ mod tests {
             ),
             (
                 "gather-quant-matmul.portable",
-                gathered_dispatch(64, 1, 256),
+                gathered_dispatch(64, 1, 256, 1),
                 "gather_quantized_gemv",
             ),
             (
                 "gather-quant-matmul.route-gemv",
-                gathered_dispatch(1, 1, 257),
+                gathered_dispatch(1, 1, 257, 1),
                 "gather_quantized_gemv",
             ),
             (
                 "gather-quant-matmul.grouped",
-                gathered_dispatch(64, 1, 256),
+                gathered_dispatch(64, 1, 256, 1),
                 "grouped_quantized_gemm",
             ),
             (
@@ -1611,17 +1677,17 @@ mod tests {
                 false,
             ),
             (
-                gathered_dispatch(63, 1, 256),
+                gathered_dispatch(63, 1, 256, 1),
                 "gather-quant-matmul.grouped",
                 false,
             ),
             (
-                gathered_dispatch(64, 1, 256),
+                gathered_dispatch(64, 1, 256, 1),
                 "gather-quant-matmul.grouped",
                 true,
             ),
             (
-                gathered_dispatch(64, 1, 257),
+                gathered_dispatch(64, 1, 257, 1),
                 "gather-quant-matmul.grouped",
                 false,
             ),
@@ -1667,7 +1733,12 @@ mod tests {
             let dispatch = match family {
                 0 => matmul_case(dtype, size, odd, 33, alternate),
                 1 => quant_dispatch(dtype, size, if odd < 64 { 64 } else { odd }, alternate),
-                2 => gathered_dispatch(size, if alternate { 7 } else { 1 }, if odd == 256 { 257 } else { odd }),
+                2 => gathered_dispatch(
+                    size,
+                    if alternate { 7 } else { 1 },
+                    if odd == 256 { 257 } else { odd },
+                    1,
+                ),
                 3 => sdpa_dispatch(dtype, (size % 32).max(1), if alternate { 1 } else { 7 }, odd.max(33), 64, 64),
                 _ => top_k_dispatch(odd.max(8)),
             };

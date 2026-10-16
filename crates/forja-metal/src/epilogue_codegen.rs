@@ -500,7 +500,7 @@ mod tests {
             .unwrap();
         let weighted = &source[weighted_start
             ..source[weighted_start..]
-                .find("kernel void gather_quantized_pair(")
+                .find("kernel void gather_quantized_weighted_sum_broad(")
                 .unwrap()
                 + weighted_start];
         let weighted_call = weighted.rfind("forja_epilogue(").unwrap();
@@ -516,6 +516,24 @@ mod tests {
             weighted_barrier < weighted_edge
                 && weighted_edge < weighted_call
                 && weighted_call < weighted_store
+        );
+
+        let broad_start = source
+            .find("kernel void gather_quantized_weighted_sum_broad(")
+            .unwrap();
+        let broad = &source[broad_start
+            ..source[broad_start..]
+                .find("kernel void gather_quantized_pair(")
+                .unwrap()
+                + broad_start];
+        let broad_call = broad.rfind("forja_epilogue(").unwrap();
+        let broad_collective = broad[..broad_call].rfind("quantized_qmv_sums(").unwrap();
+        let broad_edge = broad[..broad_call]
+            .rfind("if (column < params.columns)")
+            .unwrap();
+        let broad_store = broad[broad_call..].find("store_float(").unwrap() + broad_call;
+        assert!(
+            broad_collective < broad_edge && broad_edge < broad_call && broad_call < broad_store
         );
 
         let grouped_start = source.find("kernel void grouped_quantized_gemm(").unwrap();
