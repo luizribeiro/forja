@@ -161,10 +161,7 @@ pub(crate) async fn measure_token_profile(
         measure_profile_phase(&mut runner, &tokens, options, decode).await?;
     }
     let baseline = measure_profile_phase(&mut runner, &tokens, options, decode).await?;
-    runner.set_profiling(true);
-    let measured = measure_profile_phase(&mut runner, &tokens, options, decode).await;
-    runner.set_profiling(false);
-    let _ = measured?;
+    measure_profiled_phase(&mut runner, &tokens, options, decode).await?;
     Ok(TokenProfile {
         device,
         baseline_wall: Duration::from_secs_f64(baseline.wall_seconds),
@@ -173,6 +170,28 @@ pub(crate) async fn measure_token_profile(
             .take_profile()
             .ok_or("profiled step produced no timing detail")?,
     })
+}
+
+#[cfg(target_os = "macos")]
+async fn measure_profiled_phase(
+    runner: &mut EngineRunner<forja_metal::MetalBackend>,
+    tokens: &[u32],
+    options: &Profile,
+    decode: DecodeOptions,
+) -> Result<Sample, Box<dyn Error>> {
+    let result = match options.mode {
+        ProfileMode::Prefill => {
+            runner.set_profiling(true);
+            measure_prefill(runner, tokens).await
+        }
+        ProfileMode::Decode => {
+            let token = prepare_profile_context(runner, tokens, options.context, decode).await?;
+            runner.set_profiling(true);
+            measure_decode_step(runner, token, options.context, decode).await
+        }
+    };
+    runner.set_profiling(false);
+    result
 }
 
 #[cfg(target_os = "macos")]

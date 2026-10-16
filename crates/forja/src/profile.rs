@@ -298,6 +298,13 @@ fn print_markdown(
         submission.dispatches,
         submission.barriers
     );
+    println!(
+        "- Eager epilogues: {} library compilations, {} pipeline specializations, {} cache hits, {} compile fallbacks\n",
+        submission.epilogue_library_compilations,
+        submission.epilogue_pipeline_specializations,
+        submission.epilogue_cache_hits,
+        submission.epilogue_compile_fallbacks,
+    );
     println!("## Dispatch timeline\n");
     println!(
         "| # | op | kernel | shape | start ms | end ms | gap us | bytes | GB/s | peak | barrier |"
@@ -405,6 +412,12 @@ fn report(
             "gpu_time_seconds": submission.gpu_time.as_secs_f64(),
             "dispatches": submission.dispatches,
             "barriers": submission.barriers,
+            "epilogues": {
+                "library_compilations": submission.epilogue_library_compilations,
+                "pipeline_specializations": submission.epilogue_pipeline_specializations,
+                "cache_hits": submission.epilogue_cache_hits,
+                "compile_fallbacks": submission.epilogue_compile_fallbacks,
+            },
             "memory": {
                 "live_bytes": memory.live_bytes,
                 "backend_charged_bytes": memory.charged_bytes,
