@@ -5107,7 +5107,7 @@ impl MetalBackend {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn encode_top_k_single(
+    fn encode_top_k_direct(
         &self,
         encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
         table: &ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>,
@@ -5118,6 +5118,8 @@ impl MetalBackend {
         rows: u32,
         k: u32,
         normalize: bool,
+        kernel: &str,
+        requested_threads: usize,
         constants: &[(u32, u32)],
         bindings: &mut ArgumentBindings,
         arguments: &mut ArgumentWriter,
@@ -5126,7 +5128,7 @@ impl MetalBackend {
             .pipelines
             .lock()
             .map_err(|_| BackendError::ExecutionFailed)?
-            .get("topk_single", constants)?;
+            .get(kernel, constants)?;
         let temporaries = vec![
             Self::layout_buffer(&input.layout, arguments)?,
             Self::layout_buffer(&values.layout, arguments)?,
@@ -5143,10 +5145,6 @@ impl MetalBackend {
         }
         set_pipeline(encoder, &pipeline);
         set_argument_table(encoder, table);
-        let requested_threads = usize::try_from(width)
-            .map_err(|_| BackendError::ExecutionFailed)?
-            .next_multiple_of(32)
-            .min(256);
         let threads = simd_thread_count(&pipeline, requested_threads)?;
         dispatch_threadgroups(
             encoder,
@@ -5164,6 +5162,7 @@ impl MetalBackend {
         Ok(temporaries)
     }
 
+    #[allow(clippy::too_many_lines)]
     fn encode_top_k(
         &self,
         encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
@@ -5195,10 +5194,48 @@ impl MetalBackend {
             (0, dtype_code(input.layout.dtype())),
             (2, dtype_code(values.layout.dtype())),
         ];
+        if selected_variant(dispatch) == Some(MetalVariant::TopKPortable) {
+            let requested_threads = usize::try_from(width)
+                .map_err(|_| BackendError::ExecutionFailed)?
+                .next_multiple_of(32)
+                .min(256);
+            return self.encode_top_k_direct(
+                encoder,
+                table,
+                &input,
+                &values,
+                &indices,
+                width,
+                rows,
+                k,
+                normalize,
+                "topk_exact_fallback",
+                requested_threads,
+                &constants,
+                bindings,
+                arguments,
+            );
+        }
         if selected_variant(dispatch) == Some(MetalVariant::TopKSingleK8) {
-            return self.encode_top_k_single(
-                encoder, table, &input, &values, &indices, width, rows, k, normalize, &constants,
-                bindings, arguments,
+            let requested_threads = usize::try_from(width)
+                .map_err(|_| BackendError::ExecutionFailed)?
+                .next_multiple_of(32)
+                .min(256);
+            return self.encode_top_k_direct(
+                encoder,
+                table,
+                &input,
+                &values,
+                &indices,
+                width,
+                rows,
+                k,
+                normalize,
+                "topk_single",
+                requested_threads,
+                &constants,
+                bindings,
+                arguments,
             );
         }
         let scratch = self.scratch_tensor(DType::U32, &[rows, chunks, k, 2])?;
@@ -5860,8 +5897,11 @@ impl MetalBackend {
         dispatch: &Dispatch,
         arguments: &mut ArgumentSizer,
     ) -> Result<(), BackendError> {
-        let single = selected_variant(dispatch) == Some(MetalVariant::TopKSingleK8);
-        let lengths: &[usize] = if single {
+        let direct = matches!(
+            selected_variant(dispatch),
+            Some(MetalVariant::TopKPortable | MetalVariant::TopKSingleK8)
+        );
+        let lengths: &[usize] = if direct {
             &[112, 112, 112, 4, 4, 4]
         } else {
             &[112, 112, 112, 4, 4, 4, 4]
@@ -6370,9 +6410,8 @@ pub(super) fn dispatch_kernel(dispatch: &Dispatch) -> Result<&'static str, Backe
         Op::Argmax => "argmax_partials+finalize",
         Op::TopK { .. } => match selected_variant(dispatch) {
             Some(MetalVariant::TopKSingleK8) => "topk_single",
-            Some(MetalVariant::TopKPortable | MetalVariant::TopKPartials) => {
-                "topk_partials+finalize"
-            }
+            Some(MetalVariant::TopKPortable) => "topk_exact_fallback",
+            Some(MetalVariant::TopKPartials) => "topk_partials+finalize",
             _ => return Err(BackendError::InvalidInput),
         },
         Op::Sample { .. } => "sample_rejection",
@@ -7570,6 +7609,7 @@ fn nan_preserving_kernel(name: &str) -> bool {
             | "softmax_looped"
             | "argmax_partials"
             | "topk_single"
+            | "topk_exact_fallback"
             | "topk_partials"
             | "topk_finalize"
             | "sample_rejection_proposal_partials"

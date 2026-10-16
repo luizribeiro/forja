@@ -510,6 +510,74 @@ kernel void topk_single(
     }
 }
 
+kernel void topk_exact_fallback(
+    device const uchar *input [[buffer(0)]],
+    device uchar *values [[buffer(1)]],
+    device uint *indices [[buffer(2)]],
+    constant TensorLayout &input_layout [[buffer(3)]],
+    constant TensorLayout &values_layout [[buffer(4)]],
+    constant TensorLayout &indices_layout [[buffer(5)]],
+    constant uint &width [[buffer(6)]],
+    constant uint &k [[buffer(7)]],
+    constant uint &normalize [[buffer(8)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint lane [[thread_position_in_threadgroup]],
+    uint group_width [[threads_per_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+    threadgroup uint partial_keys[32];
+    threadgroup uint partial_indices[32];
+    for (uint slot = 0; slot < k; ++slot) {
+        ulong best = 0;
+        for (uint column = lane; column < width; column += group_width) {
+            bool available = true;
+            for (uint prior = 0; prior < slot; ++prior) {
+                uint output_index = physical_index(indices_layout, row * k + prior);
+                available = available && column != indices[output_index];
+            }
+            if (available) {
+                float value = load_float(
+                    input, physical_index(input_layout, row * width + column), input0_dtype);
+                best = max(best, topk_candidate(value, column));
+            }
+        }
+        best = argmax_threadgroup_max(
+            best, simd_lane, simd_group, partial_keys, partial_indices);
+        if (lane == 0) {
+            indices[physical_index(indices_layout, row * k + slot)] = ~uint(best);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (lane == 0) {
+        float maximum = 0.0f;
+        float denominator = 1.0f;
+        if (normalize != 0) {
+            uint maximum_index = indices[physical_index(indices_layout, row * k)];
+            maximum = load_float(
+                input, physical_index(input_layout, row * width + maximum_index), input0_dtype);
+            denominator = 0.0f;
+            for (uint slot = 0; slot < k; ++slot) {
+                uint index = indices[physical_index(indices_layout, row * k + slot)];
+                float value = load_float(
+                    input, physical_index(input_layout, row * width + index), input0_dtype);
+                denominator += exp(value - maximum);
+            }
+        }
+        for (uint slot = 0; slot < k; ++slot) {
+            uint index = indices[physical_index(indices_layout, row * k + slot)];
+            uint input_index = physical_index(input_layout, row * width + index);
+            uint output_index = physical_index(values_layout, row * k + slot);
+            if (normalize != 0) {
+                float value = load_float(input, input_index, input0_dtype);
+                store_float(
+                    values, output_index, output_dtype,
+                    exp(value - maximum) / denominator);
+            } else {
+                copy_value(input, values, input_index, output_index);
+            }
+        }
+    }
+}
 kernel void topk_partials(
     device const uchar *input [[buffer(0)]],
     device ulong *partials [[buffer(1)]],

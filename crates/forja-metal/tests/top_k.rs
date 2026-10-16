@@ -22,6 +22,14 @@ fn top_k_matches_cpu_for_router_and_edge_widths() {
 }
 
 #[test]
+fn top_k_portable_accepts_more_than_sixty_four_values() {
+    let cpu = CpuBackend::new();
+    let metal = MetalBackend::new().unwrap();
+    let values = (0_u16..127).map(f32::from).collect::<Vec<_>>();
+    assert_case(&cpu, &metal, DType::F32, &values, 127, 65);
+}
+
+#[test]
 fn top_k_orders_ties_and_nan_payloads_deterministically() {
     let cpu = CpuBackend::new();
     let metal = MetalBackend::new().unwrap();
@@ -91,7 +99,8 @@ fn run<B: Backend>(
     commands
         .dispatch_many(Op::TopK { k, normalize }, &[&input], &[&values, &indices])
         .unwrap();
-    backend.submit(commands).unwrap().wait().unwrap();
+    let submission = backend.submit(commands).unwrap();
+    submission.wait().unwrap();
     (
         backend.read(&values).unwrap(),
         backend.read(&indices).unwrap(),

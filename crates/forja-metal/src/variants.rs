@@ -422,6 +422,10 @@ const TOP_K_SINGLE: &[Constraint] = &[
     operation(OperationValue::TopK, Relation::Equal(8)),
     value(TOP_K_WIDTH, Relation::Range { min: 8, max: 2048 }),
 ];
+const TOP_K_PARTIALS: &[Constraint] = &[operation(
+    OperationValue::TopK,
+    Relation::Range { min: 1, max: 64 },
+)];
 
 macro_rules! variant {
     ($name:literal, $operation:ident, $implementation:ident, $constraints:expr,
@@ -628,8 +632,8 @@ pub(crate) static REGISTRY: &[VariantDef<MetalVariant>] = &[
         TopKPortable,
         &[],
         &["portable source that does not select a backend-specific algorithm."],
-        &["k = 8 with narrow rows has a faster single-pass algorithm."],
-        &["Uses partial reductions for every valid shape."]
+        &["selection counts at most 64 have faster bounded algorithms."],
+        &["Uses an exact parallel fallback for every valid shape."]
     ),
     variant!(
         "top-k.single-k8",
@@ -644,10 +648,10 @@ pub(crate) static REGISTRY: &[VariantDef<MetalVariant>] = &[
         "top-k.partials",
         TopK,
         TopKPartials,
-        &[],
-        &["the full core TopK range."],
-        &["k = 8 with width at most 2048."],
-        &["Reduces chunk partials in a finalize pass."]
+        TOP_K_PARTIALS,
+        &["k at most 64 outside the single-pass shape."],
+        &["larger selection counts or k = 8 with width at most 2048."],
+        &["Reduces fixed-capacity chunk partials in a finalize pass."]
     ),
 ];
 
@@ -1155,15 +1159,19 @@ mod tests {
     }
 
     fn top_k_dispatch(width: u32) -> Dispatch {
+        top_k_dispatch_with(width, 8)
+    }
+
+    fn top_k_dispatch_with(width: u32, k: u32) -> Dispatch {
         let backend = CpuBackend::new();
         let input = backend.alloc(DType::F32, &[width]).unwrap();
-        let values = backend.alloc(DType::F32, &[8]).unwrap();
-        let indices = backend.alloc(DType::U32, &[8]).unwrap();
+        let values = backend.alloc(DType::F32, &[k]).unwrap();
+        let indices = backend.alloc(DType::U32, &[k]).unwrap();
         let mut commands = CommandList::new();
         commands
             .dispatch_many(
                 Op::TopK {
-                    k: 8,
+                    k,
                     normalize: false,
                 },
                 &[&input],
@@ -1436,6 +1444,9 @@ mod tests {
         let error = resolve(&top_k_dispatch(2049), "top-k.single-k8", METAL4).unwrap_err();
         assert!(error.to_string().contains("width is in 8..=2048"));
         assert!(resolve(&top_k_dispatch(2049), "top-k.partials", METAL4).is_ok());
+        assert!(resolve(&top_k_dispatch_with(127, 65), "top-k.portable", METAL4).is_ok());
+        let error = resolve(&top_k_dispatch_with(127, 65), "top-k.partials", METAL4).unwrap_err();
+        assert!(error.to_string().contains("k is in 1..=64"));
     }
 
     #[test]
@@ -1554,8 +1565,8 @@ mod tests {
             ),
             (
                 "top-k.portable",
-                top_k_dispatch(2048),
-                "topk_partials+finalize",
+                top_k_dispatch_with(127, 65),
+                "topk_exact_fallback",
             ),
             ("top-k.single-k8", top_k_dispatch(2048), "topk_single"),
             (
