@@ -22,7 +22,7 @@ use tokenizers::Tokenizer;
 use tokio::sync::{Notify, mpsc};
 
 use crate::guidance::{GuidanceSession, GuidanceWorker};
-use crate::prefix::{PrefixIdentity, PrefixNamespace};
+use crate::prefix::{LivePrefix, PrefixIdentity, PrefixLedger, PrefixNamespace, replace_live};
 use crate::request::{ToolChoice, validate_chat_input, validate_completion_input, validate_prompt};
 use crate::tool_output::{GeneratedToolCall, ToolDelta, ToolOutput};
 use crate::{
@@ -143,6 +143,7 @@ pub struct PrefilledPrompt {
     pub prompt_tokens: u32,
     /// Engine sampling parameters used by every decode step.
     pub sampling: SamplingParams,
+    ledger: PrefixLedger,
     constraint: Option<ConstraintPlan>,
 }
 
@@ -414,7 +415,8 @@ pub struct ServingEngine<B: Backend + Send + Sync + 'static> {
     info: EngineInfo,
     max_context: u32,
     guidance: GuidanceWorker,
-    _prefix_namespace: PrefixNamespace,
+    prefix_namespace: PrefixNamespace,
+    live_prefix: Option<LivePrefix>,
 }
 
 impl<B> ServingEngine<B>
@@ -470,7 +472,8 @@ where
             info,
             max_context,
             guidance,
-            _prefix_namespace: prefix_identity.into_namespace(),
+            prefix_namespace: prefix_identity.into_namespace(),
+            live_prefix: None,
         })
     }
 
@@ -569,8 +572,10 @@ where
             seed: sampling_seed(params.seed, params.temperature).await?,
         };
         if control.is_cancelled() {
+            self.live_prefix = None;
             return Err(GenerationError::cancelled());
         }
+        let ledger = PrefixLedger::new(tokens.clone());
         let first = self
             .runner
             .enqueue_decode(EngineDecode {
@@ -581,15 +586,25 @@ where
             .await
             .map_err(|error| {
                 GenerationError::unavailable(format!("engine prefill failed: {error}"))
-            })?
-            .map_err(|error| {
-                GenerationError::unavailable(format!("engine prefill failed: {error:?}"))
-            })?;
+            })
+            .and_then(|result| {
+                result.map_err(|error| {
+                    GenerationError::unavailable(format!("engine prefill failed: {error:?}"))
+                })
+            });
+        let first = match first {
+            Ok(first) => first,
+            Err(error) => {
+                self.live_prefix = None;
+                return Err(error);
+            }
+        };
         Ok(PrefilledPrompt {
             first,
             params,
             prompt_tokens,
             sampling,
+            ledger,
             constraint,
         })
     }
@@ -712,6 +727,7 @@ where
         sender: Option<&mpsc::Sender<GenerationEvent>>,
         control: &GenerationControl,
     ) -> Result<Completion, GenerationError> {
+        let start = self.start_decode(prefill, sender, control).await;
         let DecodeStart {
             params,
             prompt_tokens,
@@ -722,11 +738,23 @@ where
             mut allow,
             mut pipeline,
             mut tool_parser,
-        } = self.start_decode(prefill, sender, control).await?;
+        } = match start {
+            Ok(start) => start,
+            Err(error) => {
+                self.live_prefix = None;
+                return Err(error);
+            }
+        };
         let mut consumed = 0_u32;
         let mut unconstrained_consumed = 0_u32;
         let replay_base = self.runner.metrics().submissions;
-        let tokenizer = self.tokenizer()?;
+        let tokenizer = match self.tokenizer() {
+            Ok(tokenizer) => tokenizer,
+            Err(error) => {
+                self.live_prefix = None;
+                return Err(error);
+            }
+        };
         let skip_special_tokens = constraint.as_ref().is_none_or(|plan| plan.forced);
         let mut decoder = tokenizer.decode_stream(skip_special_tokens);
         let mut boundary = BoundaryState::new(&params.stops, constraint.as_ref());
@@ -759,6 +787,7 @@ where
                     )
                     .await?;
                 }
+                pipeline.ledger.record(token, has_successor);
                 if self.chat_info.stop_token_ids.contains(&token) {
                     return Ok(FinishReason::Stop);
                 }
@@ -814,7 +843,7 @@ where
             Ok(FinishReason::Length)
         }
         .await;
-        finish_decode_request(
+        let result = finish_decode_request(
             generation,
             &mut pipeline,
             &mut self.runner,
@@ -823,7 +852,11 @@ where
             prompt_tokens,
             consumed,
         )
-        .await
+        .await;
+        let ledger = result.is_ok().then(|| std::mem::take(&mut pipeline.ledger));
+        let ledger = self.config.serving.prefix_reuse.then_some(ledger).flatten();
+        replace_live(&mut self.live_prefix, self.prefix_namespace, ledger);
+        result
     }
 }
 
@@ -909,6 +942,7 @@ where
         params,
         prompt_tokens,
         sampling,
+        ledger,
         constraint,
     } = prefill;
     let first_pos = prompt_tokens
@@ -941,7 +975,7 @@ where
         guidance,
         constrained,
         allow,
-        pipeline: DecodePipeline::new(first, first_pos, prompt_tokens),
+        pipeline: DecodePipeline::new(first, first_pos, prompt_tokens, ledger),
         tool_parser,
     })
 }
@@ -951,15 +985,17 @@ struct DecodePipeline {
     active: Option<PendingDecode>,
     forward: Option<(EngineTensor, u32)>,
     position: u32,
+    ledger: PrefixLedger,
 }
 
 impl DecodePipeline {
-    fn new(first: EngineDecodeOutput, first_pos: u32, position: u32) -> Self {
+    fn new(first: EngineDecodeOutput, first_pos: u32, position: u32, ledger: PrefixLedger) -> Self {
         Self {
             pending: VecDeque::from([(first, first_pos)]),
             active: None,
             forward: None,
             position,
+            ledger,
         }
     }
 

@@ -54,6 +54,28 @@ pub(crate) struct LivePrefix {
     tokens: Vec<u32>,
     chain: Vec<[u8; 32]>,
 }
+#[derive(Default)]
+pub(crate) struct PrefixLedger(Vec<u32>);
+impl PrefixLedger {
+    pub(crate) fn new(prompt: Vec<u32>) -> Self {
+        Self(prompt)
+    }
+    pub(crate) fn record(&mut self, token: u32, forwarded: bool) {
+        if forwarded {
+            self.0.push(token);
+        }
+    }
+    pub(crate) fn finish(self, namespace: PrefixNamespace) -> LivePrefix {
+        LivePrefix::new(namespace, self.0)
+    }
+}
+pub(crate) fn replace_live(
+    entry: &mut Option<LivePrefix>,
+    namespace: PrefixNamespace,
+    ledger: Option<PrefixLedger>,
+) {
+    *entry = ledger.map(|ledger| ledger.finish(namespace));
+}
 impl LivePrefix {
     pub(crate) fn new(namespace: PrefixNamespace, tokens: Vec<u32>) -> Self {
         let mut previous = namespace.0;
@@ -157,5 +179,21 @@ mod tests {
             PrefixIdentity::new(base).unwrap().namespace_with_nonce(8),
             expected
         );
+    }
+    #[test]
+    fn ledger_contains_only_completed_inputs() {
+        let mut ledger = PrefixLedger::new(vec![1, 2]);
+        ledger.record(3, true);
+        ledger.record(4, false);
+        ledger.record(99, false);
+        assert_eq!(ledger.finish(PrefixNamespace([0; 32])).tokens, [1, 2, 3]);
+    }
+    #[test]
+    fn failed_or_cancelled_requests_invalidate_the_live_entry() {
+        let namespace = PrefixNamespace([0; 32]);
+        let mut entry = None;
+        replace_live(&mut entry, namespace, Some(PrefixLedger::new(vec![1])));
+        replace_live(&mut entry, namespace, None);
+        assert!(entry.is_none());
     }
 }
