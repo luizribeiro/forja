@@ -4609,6 +4609,13 @@ fn core_op(operation: compute::Op) -> (TemplateOp, Option<Op>) {
             });
             (TemplateOp::sample(position), concrete)
         }
+        compute::Op::SampleMasked(config) => {
+            let position = core_affine(config.position);
+            let concrete = position.is_constant().then_some(Op::SampleMasked {
+                position: config.position.offset,
+            });
+            (TemplateOp::sample_masked(position), concrete)
+        }
         compute::Op::Rope(config) => concrete_template(Op::Rope {
             theta: config.theta,
         }),

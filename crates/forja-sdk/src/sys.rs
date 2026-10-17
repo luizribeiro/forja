@@ -76,6 +76,9 @@ pub(crate) enum Op {
     Sample {
         position: Affine,
     },
+    SampleMasked {
+        position: Affine,
+    },
     Rope(f32),
     Embed,
     QuantEmbed {
@@ -590,6 +593,9 @@ pub(crate) mod guest {
             Op::Argmax => compute::Op::Argmax,
             Op::TopK { k, normalize } => compute::Op::TopK(compute::TopKCfg { k, normalize }),
             Op::Sample { position } => compute::Op::Sample(compute::SampleCfg {
+                position: wit_affine(position),
+            }),
+            Op::SampleMasked { position } => compute::Op::SampleMasked(compute::SampleCfg {
                 position: wit_affine(position),
             }),
             Op::Rope(theta) => compute::Op::Rope(compute::RopeCfg { theta }),
@@ -1344,6 +1350,9 @@ pub(crate) mod native {
             Op::Argmax => CoreOp::Argmax,
             Op::TopK { k, normalize } => CoreOp::TopK { k, normalize },
             Op::Sample { position } => CoreOp::Sample {
+                position: position.offset,
+            },
+            Op::SampleMasked { position } => CoreOp::SampleMasked {
                 position: position.offset,
             },
             Op::Rope(theta) => CoreOp::Rope { theta },

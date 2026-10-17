@@ -149,6 +149,7 @@ interface compute {
     argmax,
     top-k(top-k-cfg),
     sample(sample-cfg),
+    sample-masked(sample-cfg),
     rope(rope-cfg),
     embed,
     quant-embed(quant-matmul-cfg),

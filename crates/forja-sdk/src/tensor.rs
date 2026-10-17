@@ -449,6 +449,35 @@ impl<T: Element> Tensor<T> {
         Ok(output)
     }
 
+    /// Samples one permitted index from each row.
+    ///
+    /// The allow mask has one bit per vocabulary entry, packed least-significant bit first into a
+    /// contiguous `u32` tensor. Bits beyond the vocabulary size must be zero.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an empty or scalar shape, invalid parameters or mask, unsupported
+    /// types, or a refused dispatch.
+    pub fn sample_masked(
+        &self,
+        params: &Tensor<u32>,
+        allow: &Tensor<u32>,
+        position: impl Into<crate::Dim>,
+    ) -> Result<Tensor<u32>> {
+        let mut shape = self.shape.clone();
+        shape
+            .pop()
+            .ok_or_else(|| Error::new("sampling requires at least one dimension"))?;
+        let output = Tensor::<u32>::empty(shape)?;
+        let position = graph::affine(&position.into())?;
+        graph::record(
+            sys::Op::SampleMasked { position },
+            &[&self.handle, &params.handle, &allow.handle],
+            &output.handle,
+        )?;
+        Ok(output)
+    }
+
     /// Copies the tensor while converting between floating-point types.
     ///
     /// # Errors
