@@ -151,14 +151,15 @@
 
               if $run_everything || { $run_non_metal && $run_metal; }; then
                 if [[ "''${FORJA_NO_GPU:-}" == "1" ]]; then
-                  cargo nextest run --profile ci --release --workspace --all-features --locked --no-tests pass
+                  CARGO_INCREMENTAL=1 cargo nextest run --profile ci --release --workspace --all-features --locked --no-tests pass
                 else
-                  cargo nextest run --release --workspace --all-features --locked --no-tests pass
+                  CARGO_INCREMENTAL=1 cargo nextest run --profile ci --release --workspace --all-features --locked --no-tests pass
+                  CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=target/non-incremental cargo nextest run --release --workspace --all-features --locked --no-tests pass -E 'package(forja-metal) or test(/^native_metal::/) or test(/^kernel_ui::/) or test(/(^|::)metal_/)'
                 fi
               elif $run_non_metal; then
-                cargo nextest run --profile ci --release --workspace --all-features --locked --no-tests pass
+                CARGO_INCREMENTAL=1 cargo nextest run --profile ci --release --workspace --all-features --locked --no-tests pass
               elif $run_metal && [[ "''${FORJA_NO_GPU:-}" != "1" ]]; then
-                cargo nextest run --release --workspace --all-features --locked --no-tests pass -E 'package(forja-metal) or test(/^native_metal::/) or test(/^kernel_ui::/) or test(/(^|::)metal_/)'
+                CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=target/non-incremental cargo nextest run --release --workspace --all-features --locked --no-tests pass -E 'package(forja-metal) or test(/^native_metal::/) or test(/^kernel_ui::/) or test(/(^|::)metal_/)'
               fi
             '';
           };
@@ -208,6 +209,8 @@
                   exit 0
                 fi
                 export FORJA_MODELS="''${FORJA_MODELS:-$HOME/.cache/forja/models}"
+                export CARGO_INCREMENTAL=0
+                export CARGO_TARGET_DIR=target/non-incremental
                 cargo nextest run --release -p forja-host --test host -E 'test(qwen_weights::)' --run-ignored only
                 cargo nextest run --release -p forja-sdk --features native-metal --test sdk -E 'test(qwen_moe::)' --run-ignored only
                 cargo nextest run --release -p forja-host --test host -E 'test(qwen_engine::)' --run-ignored only
