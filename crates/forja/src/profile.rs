@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, error::Error, fs, time::Duration};
 
-use forja_core::{Backend, CommandList, DType, DispatchProfile, Op, ProfileTensor, Submission};
+use forja_core::{DType, DispatchProfile, Op, ProfileTensor};
 use forja_host::EngineMemory;
 
 use crate::{
@@ -9,8 +9,6 @@ use crate::{
     engine::validate_engine,
     machine_load,
 };
-
-const COPY_BYTES: u64 = 512 * 1024 * 1024;
 
 #[derive(Clone, Copy, Default)]
 struct Total {
@@ -66,10 +64,10 @@ pub(crate) async fn run(options: &Profile) -> Result<(), Box<dyn Error>> {
             &options.scratch,
         )?;
         let load_before = machine_load::capture("BEFORE PROFILE")?;
-        let peak = measure_copy_peak()?;
+        let bandwidth = forja_metal::MetalBackend::new()?.measure_memory_bandwidth()?;
         let measurement = measure_token_profile(options).await?;
         let load_after = machine_load::capture("AFTER PROFILE")?;
-        let report = report(options, &measurement, peak, &load_before, &load_after)?;
+        let report = report(options, &measurement, bandwidth, &load_before, &load_after)?;
         if options.json {
             fs::create_dir_all(&options.scratch)?;
             let path = options.scratch.join("profile.json");
@@ -78,36 +76,10 @@ pub(crate) async fn run(options: &Profile) -> Result<(), Box<dyn Error>> {
             fs::write(&path, bytes)?;
             println!("profile JSON: {}", path.display());
         } else {
-            print_markdown(options, &measurement, peak)?;
+            print_markdown(options, &measurement, bandwidth)?;
         }
         Ok(())
     }
-}
-
-#[cfg(target_os = "macos")]
-#[allow(clippy::cast_precision_loss)]
-fn measure_copy_peak() -> Result<f64, Box<dyn Error>> {
-    let backend = forja_metal::MetalBackend::new()?;
-    let elements = u32::try_from(COPY_BYTES / DType::U32.byte_size())?;
-    let input = backend.alloc(DType::U32, &[elements])?;
-    let output = backend.alloc(DType::U32, &[elements])?;
-    let commands = || {
-        let mut commands = CommandList::new();
-        commands.dispatch(Op::Copy, &[&input], &output)?;
-        Ok::<_, forja_core::OpError>(commands)
-    };
-    let warmup = backend.submit(commands()?)?;
-    warmup.wait()?;
-    let submission = backend.submit(commands()?)?;
-    submission.wait()?;
-    let elapsed = submission
-        .gpu_time()
-        .ok_or("copy GPU timing is unavailable")?
-        .as_secs_f64();
-    if elapsed == 0.0 {
-        return Err("copy profile reported zero device time".into());
-    }
-    Ok(COPY_BYTES as f64 * 2.0 / elapsed / 1e9)
 }
 
 fn dispatch_bytes(dispatch: &DispatchProfile) -> Result<u64, &'static str> {
@@ -237,8 +209,9 @@ fn throughput(bytes: u64, elapsed: Duration) -> f64 {
 fn print_markdown(
     options: &Profile,
     measurement: &TokenProfile,
-    peak: f64,
+    bandwidth: forja_metal::MemoryBandwidth,
 ) -> Result<(), Box<dyn Error>> {
+    let peak = bandwidth.read_gigabytes_per_second;
     let memory = memory_report(measurement.step.memory)?;
     let submission = measurement
         .step
@@ -257,7 +230,11 @@ fn print_markdown(
     println!("- Device: {}", measurement.device);
     println!("- Mode: {}", mode_name(options.mode));
     println!("- Tokens: {}", options.context);
-    println!("- Measured copy peak: {peak:.1} GB/s");
+    println!("- Streaming read roofline: {peak:.1} GB/s");
+    println!(
+        "- Streaming copy traffic: {:.1} GB/s",
+        bandwidth.copy_gigabytes_per_second
+    );
     println!(
         "- Step memory: {} bytes accounted ({} live tensors + {} backend), {} bytes device, {} bytes footprint",
         memory.accounted_bytes,
@@ -351,10 +328,11 @@ fn print_totals(title: &str, totals: BTreeMap<&str, Total>, gpu_time: Duration) 
 fn report(
     options: &Profile,
     measurement: &TokenProfile,
-    peak: f64,
+    bandwidth: forja_metal::MemoryBandwidth,
     load_before: &machine_load::Snapshot,
     load_after: &machine_load::Snapshot,
 ) -> Result<serde_json::Value, Box<dyn Error>> {
+    let peak = bandwidth.read_gigabytes_per_second;
     let memory = memory_report(measurement.step.memory)?;
     let submission = measurement
         .step
@@ -396,7 +374,8 @@ fn report(
         "device": measurement.device,
         "mode": mode_name(options.mode),
         "tokens": options.context,
-        "measured_copy_peak_gigabytes_per_second": peak,
+        "streaming_read_gigabytes_per_second": peak,
+        "streaming_copy_gigabytes_per_second": bandwidth.copy_gigabytes_per_second,
         "unprofiled": {
             "wall_time_seconds": measurement.baseline_wall.as_secs_f64(),
             "gpu_time_seconds": measurement.baseline_gpu.as_secs_f64(),

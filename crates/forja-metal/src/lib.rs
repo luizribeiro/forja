@@ -2,6 +2,8 @@
 //! This is the sole crate permitted to contain the unsafe code required by Objective-C interop.
 
 #[cfg(target_os = "macos")]
+mod bandwidth;
+#[cfg(target_os = "macos")]
 mod encoding;
 #[cfg(target_os = "macos")]
 mod epilogue_codegen;
@@ -20,6 +22,8 @@ mod storage;
 #[cfg(target_os = "macos")]
 mod variants;
 
+#[cfg(target_os = "macos")]
+pub use bandwidth::MemoryBandwidth;
 #[cfg(target_os = "macos")]
 pub use encoding::MetalProgramHandle;
 #[cfg(target_os = "macos")]
