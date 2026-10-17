@@ -254,6 +254,68 @@ mod tests {
     }
 
     #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires FORJA_MODELS and runs in the pre-push hook"]
+    fn metal_qwen3_coder_reuses_repeated_agent_prefix() -> Result<(), Box<dyn Error>> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()?;
+        runtime.block_on(async {
+            let root = PathBuf::from(env::var_os("FORJA_MODELS").ok_or("FORJA_MODELS is not set")?);
+            let model = root.join("Qwen3-Coder-30B-A3B-Instruct-4bit");
+            let tokenizer = Tokenizer::from_file(model.join("tokenizer.json"))
+                .map_err(|error| format!("cannot load tokenizer: {error}"))?;
+            let prefix = " x".repeat(2_048);
+            let prompt = format!("{prefix}{}", " token".repeat(33));
+            let token_count = |text: String| {
+                tokenizer
+                    .encode(text, false)
+                    .map(|encoding| encoding.len())
+                    .map_err(|error| error.to_string())
+            };
+            if token_count(prefix.clone())? != 2_048 || token_count(prompt.clone())? != 2_081 {
+                return Err("repeated-agent fixture does not have 2,048 + 33 tokens".into());
+            }
+            let mut engine = agent_engine().await?;
+            for (temperature, seed) in [(0.0, 0), (0.7, 17)] {
+                compare_prefix_reuse(&mut engine, &prefix, &prompt, temperature, seed).await?;
+            }
+            Ok(())
+        })
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn compare_prefix_reuse(
+        engine: &mut forja_serve::ServingEngine<forja_metal::MetalBackend>,
+        prefix: &str,
+        prompt: &str,
+        temperature: f32,
+        seed: u64,
+    ) -> Result<(), Box<dyn Error>> {
+        let model = engine.model().to_owned();
+        let request = |prompt: &str, max_tokens| {
+            serde_json::from_value::<forja_serve::CompletionRequest>(serde_json::json!({
+                "model": &model, "prompt": prompt, "max_tokens": max_tokens,
+                "temperature": temperature, "top_k": 20, "top_p": 0.8, "seed": seed
+            }))
+        };
+        engine.complete_text(&request(prefix, 1)?).await?;
+        let cached = engine.complete_text(&request(prompt, 8)?).await?;
+        engine.complete_text(&request(" unrelated", 1)?).await?;
+        let uncached = engine.complete_text(&request(prompt, 8)?).await?;
+        if cached.usage.cached_tokens != 2_048 || uncached.usage.cached_tokens != 0 {
+            return Err("prefix reuse did not report the expected cached tokens".into());
+        }
+        if cached.token_ids() != uncached.token_ids()
+            || cached.finish_reason != uncached.finish_reason
+            || cached.usage.completion_tokens != uncached.usage.completion_tokens
+        {
+            return Err("cached and uncached continuations differ".into());
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
     async fn agent_engine()
     -> Result<forja_serve::ServingEngine<forja_metal::MetalBackend>, Box<dyn Error>> {
         let root = PathBuf::from(env::var_os("FORJA_MODELS").ok_or("FORJA_MODELS is not set")?);

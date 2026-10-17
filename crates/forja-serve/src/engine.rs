@@ -387,6 +387,15 @@ pub struct Completion {
     pub finish_reason: FinishReason,
     /// Request token counts.
     pub usage: Usage,
+    pub(crate) token_ids: Vec<u32>,
+}
+
+impl Completion {
+    /// Returns the selected completion token ids.
+    #[must_use]
+    pub fn token_ids(&self) -> &[u32] {
+        &self.token_ids
+    }
 }
 
 /// One logical event produced during a streamed generation.
@@ -829,6 +838,7 @@ where
         let mut decoder = tokenizer.decode_stream(skip_special_tokens);
         let mut boundary = BoundaryState::new(&params.stops, constraint.as_ref());
         let mut text = String::new();
+        let mut token_ids = Vec::new();
         let generation = async {
             while consumed < params.max_tokens && !pipeline.pending.is_empty() {
                 pipeline.activate_next();
@@ -847,6 +857,7 @@ where
                     allow.as_deref(),
                 )
                 .await?;
+                token_ids.push(token);
                 if consumed == 0 {
                     let ttft = started.elapsed();
                     observe(&mut self.metrics.ttft, ttft);
@@ -926,6 +937,7 @@ where
             &mut self.runner,
             tool_parser,
             text,
+            token_ids,
             Usage {
                 prompt_tokens,
                 cached_tokens,
@@ -950,6 +962,7 @@ async fn finish_decode_request<B>(
     runner: &mut EngineRunner<B>,
     parser: Option<ToolParser>,
     text: String,
+    token_ids: Vec<u32>,
     usage: Usage,
 ) -> Result<Completion, GenerationError>
 where
@@ -957,7 +970,7 @@ where
 {
     let cleanup = pipeline.cleanup(runner).await;
     let tool_call = finish_tool_parser(&generation, parser).await;
-    finish_completion(generation, cleanup, tool_call, text, usage)
+    finish_completion(generation, cleanup, tool_call, text, token_ids, usage)
 }
 
 fn finish_completion(
@@ -965,6 +978,7 @@ fn finish_completion(
     cleanup: Result<(), GenerationError>,
     tool_call: Result<Option<GeneratedToolCall>, GenerationError>,
     text: String,
+    token_ids: Vec<u32>,
     usage: Usage,
 ) -> Result<Completion, GenerationError> {
     let finish_reason = match (generation, cleanup) {
@@ -977,6 +991,7 @@ fn finish_completion(
         tool_call,
         finish_reason,
         usage,
+        token_ids,
     })
 }
 

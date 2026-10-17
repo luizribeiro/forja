@@ -103,6 +103,7 @@ mod tests {
                 cached_tokens: 5,
                 completion_tokens: 3,
             },
+            token_ids: vec![1, 2, 3],
         }
     }
 

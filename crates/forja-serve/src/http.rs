@@ -762,6 +762,7 @@ mod tests {
                         cached_tokens: 0,
                         completion_tokens: 1,
                     },
+                    token_ids: vec![1],
                 })
             })
         }
@@ -870,6 +871,7 @@ mod tests {
                         cached_tokens: 0,
                         completion_tokens: 1,
                     },
+                    token_ids: vec![1],
                 })
             })
         }
