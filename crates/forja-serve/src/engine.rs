@@ -494,7 +494,7 @@ where
         let replay_base = self.runner.metrics().submissions;
         let tokenizer = self.tokenizer()?;
         let mut decoder = tokenizer.decode_stream(true);
-        let mut matcher = StopMatcher::new(&prefill.params.stops);
+        let mut boundary = BoundaryState::new(&prefill.params.stops, None);
         let mut text = String::new();
         let generation = async {
             while let Some(output) = pipeline.take_next() {
@@ -529,21 +529,19 @@ where
                 if self.chat_info.stop_token_ids.contains(&token) {
                     return Ok(FinishReason::Stop);
                 }
-                if let Some(piece) = decoder.step(token).map_err(|error| {
+                let piece = decoder.step(token).map_err(|error| {
                     GenerationError::new(format!("cannot decode token: {error}"))
-                })? {
-                    let output = matcher.push(piece.as_bytes()).map_err(|error| {
-                        GenerationError::new(format!("decoded invalid UTF-8: {error}"))
-                    })?;
-                    if emit_output(&mut text, output, sender, control).await? {
-                        return Ok(FinishReason::Stop);
-                    }
+                })?;
+                if matches!(
+                    boundary
+                        .process(token, piece, &mut text, sender, control)
+                        .await?,
+                    BoundaryAction::Stop
+                ) {
+                    return Ok(FinishReason::Stop);
                 }
             }
-            let output = matcher
-                .finish()
-                .map_err(|error| GenerationError::new(format!("decoded invalid UTF-8: {error}")))?;
-            emit_output(&mut text, output, sender, control).await?;
+            boundary.finish(&mut text, sender, control).await?;
             Ok(FinishReason::Length)
         }
         .await;
@@ -626,6 +624,124 @@ impl DecodePipeline {
 
 fn needs_successor(pending: usize, issued: u32, limit: u32) -> bool {
     pending < 2 && issued < limit
+}
+
+enum BoundaryAction {
+    Continue,
+    Stop,
+    Activate,
+}
+
+struct BoundaryState {
+    trigger: Option<TokenMatcher>,
+    matcher: StopMatcher,
+    trigger_stop: Option<usize>,
+}
+
+impl BoundaryState {
+    fn new(stops: &[String], trigger: Option<(&str, &[u32])>) -> Self {
+        let mut stops = stops.to_vec();
+        let trigger_stop = trigger.map(|(text, _)| {
+            let index = stops.len();
+            stops.push(text.to_owned());
+            index
+        });
+        Self {
+            trigger: trigger.map(|(_, tokens)| TokenMatcher::new(tokens)),
+            matcher: StopMatcher::new(&stops),
+            trigger_stop,
+        }
+    }
+
+    async fn process(
+        &mut self,
+        token: u32,
+        piece: Option<String>,
+        text: &mut String,
+        sender: Option<&mpsc::Sender<GenerationEvent>>,
+        control: &GenerationControl,
+    ) -> Result<BoundaryAction, GenerationError> {
+        let activated = self
+            .trigger
+            .as_mut()
+            .is_some_and(|matcher| matcher.push(token));
+        let Some(piece) = piece else {
+            return Ok(BoundaryAction::Continue);
+        };
+        let output = self
+            .matcher
+            .push(piece.as_bytes())
+            .map_err(|error| GenerationError::new(format!("decoded invalid UTF-8: {error}")))?;
+        if output.matched && activated && self.matcher.matched_index() == self.trigger_stop {
+            text.push_str(&output.text);
+            if let Some(sender) = sender
+                && !output.text.is_empty()
+            {
+                send_event(sender, GenerationEvent::Content(output.text), control).await?;
+            }
+            Ok(BoundaryAction::Activate)
+        } else if emit_output(text, output, sender, control).await? {
+            Ok(BoundaryAction::Stop)
+        } else {
+            Ok(BoundaryAction::Continue)
+        }
+    }
+
+    async fn finish(
+        &mut self,
+        text: &mut String,
+        sender: Option<&mpsc::Sender<GenerationEvent>>,
+        control: &GenerationControl,
+    ) -> Result<(), GenerationError> {
+        let output = self
+            .matcher
+            .finish()
+            .map_err(|error| GenerationError::new(format!("decoded invalid UTF-8: {error}")))?;
+        emit_output(text, output, sender, control).await?;
+        Ok(())
+    }
+}
+
+struct TokenMatcher {
+    pattern: Vec<u32>,
+    failure: Vec<usize>,
+    matched: usize,
+}
+
+impl TokenMatcher {
+    fn new(pattern: &[u32]) -> Self {
+        let mut failure = vec![0; pattern.len()];
+        for index in 1..pattern.len() {
+            let mut prefix = failure[index - 1];
+            while prefix > 0 && pattern[index] != pattern[prefix] {
+                prefix = failure[prefix - 1];
+            }
+            if pattern[index] == pattern[prefix] {
+                prefix += 1;
+            }
+            failure[index] = prefix;
+        }
+        Self {
+            pattern: pattern.to_vec(),
+            failure,
+            matched: 0,
+        }
+    }
+
+    fn push(&mut self, token: u32) -> bool {
+        while self.matched > 0 && token != self.pattern[self.matched] {
+            self.matched = self.failure[self.matched - 1];
+        }
+        if token == self.pattern[self.matched] {
+            self.matched += 1;
+        }
+        if self.matched == self.pattern.len() {
+            self.matched = self.failure[self.matched - 1];
+            true
+        } else {
+            false
+        }
+    }
 }
 
 async fn emit_output(
@@ -877,6 +993,13 @@ mod tests {
         assert!(needs_successor(1, 2, 4));
         assert!(!needs_successor(2, 3, 4));
         assert!(!needs_successor(0, 4, 4));
+    }
+
+    #[test]
+    fn token_trigger_matcher_preserves_overlapping_prefixes() {
+        let mut matcher = TokenMatcher::new(&[1, 2, 1]);
+        let hits = [1, 2, 1, 2, 1].map(|token| matcher.push(token));
+        assert_eq!(hits, [false, false, true, false, true]);
     }
 
     #[tokio::test]

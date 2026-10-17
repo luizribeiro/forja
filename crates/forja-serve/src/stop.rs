@@ -4,7 +4,7 @@ use std::str::Utf8Error;
 pub struct StopMatcher {
     stops: Vec<Vec<u8>>,
     pending: Vec<u8>,
-    matched: bool,
+    matched: Option<usize>,
 }
 
 /// Text released by one stop-matcher update.
@@ -27,8 +27,14 @@ impl StopMatcher {
                 .map(|stop| stop.as_bytes().to_vec())
                 .collect(),
             pending: Vec::new(),
-            matched: false,
+            matched: None,
         }
+    }
+
+    /// Returns the index of the matched stop, if any.
+    #[must_use]
+    pub const fn matched_index(&self) -> Option<usize> {
+        self.matched
     }
 
     /// Adds decoded bytes and returns text that cannot become part of a stop.
@@ -37,7 +43,7 @@ impl StopMatcher {
     ///
     /// Returns an error when the bytes cannot form UTF-8.
     pub fn push(&mut self, bytes: &[u8]) -> Result<StopOutput, Utf8Error> {
-        if self.matched {
+        if self.matched.is_some() {
             return Ok(StopOutput {
                 text: String::new(),
                 matched: true,
@@ -46,10 +52,14 @@ impl StopMatcher {
         self.pending.extend_from_slice(bytes);
         for start in 0..self.pending.len() {
             let candidate = &self.pending[start..];
-            if self.stops.iter().any(|stop| candidate.starts_with(stop)) {
+            if let Some(index) = self
+                .stops
+                .iter()
+                .position(|stop| candidate.starts_with(stop))
+            {
                 let text = std::str::from_utf8(&self.pending[..start])?.to_owned();
                 self.pending.clear();
-                self.matched = true;
+                self.matched = Some(index);
                 return Ok(StopOutput {
                     text,
                     matched: true,
@@ -83,20 +93,21 @@ impl StopMatcher {
     ///
     /// Returns an error when the final bytes are incomplete UTF-8.
     pub fn finish(&mut self) -> Result<StopOutput, Utf8Error> {
-        if self.matched {
+        if self.matched.is_some() {
             return Ok(StopOutput {
                 text: String::new(),
                 matched: true,
             });
         }
-        if let Some(start) = (0..self.pending.len()).find(|&start| {
+        if let Some((start, index)) = (0..self.pending.len()).find_map(|start| {
             self.stops
                 .iter()
-                .any(|stop| self.pending[start..].starts_with(stop))
+                .position(|stop| self.pending[start..].starts_with(stop))
+                .map(|index| (start, index))
         }) {
             let text = std::str::from_utf8(&self.pending[..start])?.to_owned();
             self.pending.clear();
-            self.matched = true;
+            self.matched = Some(index);
             return Ok(StopOutput {
                 text,
                 matched: true,
@@ -136,6 +147,7 @@ mod tests {
                 matched: true
             }
         );
+        assert_eq!(matcher.matched_index(), Some(0));
     }
 
     #[test]
