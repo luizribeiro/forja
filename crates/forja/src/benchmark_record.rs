@@ -136,7 +136,10 @@ pub(crate) fn combined_perf_hash(hashes: &[String]) -> Result<String, String> {
 }
 
 pub(crate) fn comparison_hash(key: &PerfKey) -> Result<String, String> {
-    hash(key)
+    let mut canonical = serde_json::to_value(key)
+        .map_err(|error| format!("cannot canonicalize performance key: {error}"))?;
+    canonical.sort_all_objects();
+    hash(&canonical)
 }
 
 pub(crate) fn recorded_perf_keys(record: &Recorded) -> Result<Vec<PerfKey>, String> {

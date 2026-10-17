@@ -31,6 +31,11 @@ clap = { version = "4.5", default-features = false, features = [
   "usage",
 ] }
 memmap2 = "0.9"
+llguidance = { version = "=1.9.1", default-features = false, features = [
+  "ahash",
+  "lark",
+  "rayon",
+] }
 minijinja = { version = "2.12", default-features = false, features = [
   "adjacent_loop_items",
   "builtins",

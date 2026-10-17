@@ -4,6 +4,8 @@
 
 mod chat_format;
 mod engine;
+#[doc(hidden)]
+pub mod guidance;
 mod http;
 mod request;
 mod response;

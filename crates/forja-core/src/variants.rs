@@ -485,13 +485,14 @@ pub fn render_catalog_json<I>(
             })
         })
         .collect::<Vec<_>>();
-    let mut output = serde_json::json!({
+    let mut catalog = serde_json::json!({
         "backend": backend,
         "device": device,
         "capabilities": capabilities.iter().map(ToString::to_string).collect::<Vec<_>>(),
         "variants": variants,
-    })
-    .to_string();
+    });
+    catalog.sort_all_objects();
+    let mut output = catalog.to_string();
     output.push('\n');
     output
 }
