@@ -36,6 +36,22 @@ fn disables_autoescape_and_renders_tools() {
     .unwrap();
     assert!(rendered.contains("<name>lookup</name>"));
     assert!(rendered.contains("Look up <items> & values"));
+
+    let required = render(
+        r#"[{"role":"user","content":"Find it"}]"#,
+        tools,
+        r#"{"add_generation_prompt":true,"tool_choice":"required"}"#,
+    )
+    .unwrap();
+    assert!(required.ends_with("<|im_start|>assistant\n<tool_call>\n"));
+}
+
+#[test]
+fn round_trips_openai_tool_calls_and_results() {
+    let messages = r#"[{"role":"assistant","content":null,"tool_calls":[{"id":"call_0","type":"function","function":{"name":"lookup","arguments":"{\"query\":\"rust\"}"}}]},{"role":"tool","tool_call_id":"call_0","content":"found"}]"#;
+    let rendered = render(messages, "null", r#"{"add_generation_prompt":true}"#).unwrap();
+    assert!(rendered.contains("<parameter=query>\nrust\n</parameter>"));
+    assert!(rendered.contains("<tool_response>\nfound\n</tool_response>"));
 }
 
 #[test]

@@ -3,6 +3,7 @@
 #![cfg_attr(not(target_family = "wasm"), forbid(unsafe_code))]
 
 use forja_chat_format::ChatTemplate;
+use serde_json::Value;
 
 /// Publisher-declared token ids that stop generation.
 pub const STOP_TOKEN_IDS: &[u32] = &[151_645, 151_643];
@@ -23,9 +24,46 @@ const TEMPLATE: &str = include_str!("chat_template.jinja");
 ///
 /// Returns template compilation, JSON, or rendering errors as guest-safe text.
 pub fn render(messages_json: &str, tools_json: &str, options_json: &str) -> Result<String, String> {
+    let mut messages: Value =
+        serde_json::from_str(messages_json).map_err(|error| error.to_string())?;
+    normalize_tool_calls(&mut messages)?;
+    let options: Value = serde_json::from_str(options_json).map_err(|error| error.to_string())?;
+    let messages_json = serde_json::to_string(&messages).map_err(|error| error.to_string())?;
     ChatTemplate::compile(TEMPLATE.to_owned())
         .map_err(|error| error.to_string())?
-        .render(messages_json, tools_json, options_json)
+        .render(&messages_json, tools_json, options_json)
+        .map(|mut rendered| {
+            let choice = options.get("tool_choice");
+            if choice.is_some_and(|choice| choice == "required" || choice.is_object()) {
+                rendered.push_str("<tool_call>\n");
+            }
+            rendered
+        })
+}
+
+fn normalize_tool_calls(messages: &mut Value) -> Result<(), String> {
+    let Some(messages) = messages.as_array_mut() else {
+        return Err("messages must be an array".to_owned());
+    };
+    for message in messages {
+        let Some(calls) = message.get_mut("tool_calls").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for call in calls {
+            let Some(arguments) = call.pointer_mut("/function/arguments") else {
+                continue;
+            };
+            if let Some(encoded) = arguments.as_str() {
+                let decoded: Value =
+                    serde_json::from_str(encoded).map_err(|error| error.to_string())?;
+                if !decoded.is_object() {
+                    return Err("tool arguments must encode an object".to_owned());
+                }
+                *arguments = decoded;
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(target_family = "wasm")]

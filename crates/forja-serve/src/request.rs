@@ -104,13 +104,13 @@ pub struct CompletionParams {
     pub echo: Option<bool>,
     /// Unsupported prompt suffix.
     pub suffix: Option<String>,
-    /// Unsupported tool definitions.
+    /// Optional tool definitions.
     pub tools: Option<Vec<Tool>>,
-    /// Unsupported tool selection.
+    /// Optional tool selection.
     pub tool_choice: Option<ToolChoice>,
     /// Accepted API compatibility flag; generation remains single-call.
     pub parallel_tool_calls: Option<bool>,
-    /// Unsupported structured response selection.
+    /// Structured response selection; only text is accepted.
     pub response_format: Option<ResponseFormat>,
 }
 

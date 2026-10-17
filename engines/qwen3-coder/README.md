@@ -20,6 +20,12 @@ tolerance: Python and Rust layer checks pass and all 32 teacher-forced and free-
 The trusted RMSNorm and RoPE operations remain available for OLMoE, whose near-tie routing is
 sensitive to those f32 rounding differences; the Coder does not depend on the trusted variants.
 
+## API notes
+
+The chat format accepts OpenAI function tools and `parallel_tool_calls` set to either value, but
+formats at most one tool call per assistant turn. Clients can append its tool result and continue
+the conversation for the next call.
+
 The profiled decode graph eagerly compiles two epilogue libraries and three pipeline
 specializations. The prefill graph compiles one library and one specialization. Replay requires
 zero compile fallbacks in both modes.

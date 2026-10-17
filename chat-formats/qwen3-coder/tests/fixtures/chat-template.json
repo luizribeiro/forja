@@ -18,8 +18,8 @@
     "name": "tool-result",
     "messages": [
       { "role": "user", "content": "Weather in Paris?" },
-      { "role": "assistant", "content": "", "tool_calls": [{ "function": { "name": "get_weather", "arguments": { "city": "Paris" } } }] },
-      { "role": "tool", "content": "18 C and sunny" }
+      { "role": "assistant", "content": null, "tool_calls": [{ "id": "call_0", "type": "function", "function": { "name": "get_weather", "arguments": "{\"city\":\"Paris\"}" } }] },
+      { "role": "tool", "tool_call_id": "call_0", "content": "18 C and sunny" }
     ],
     "rendered": "<|im_start|>user\nWeather in Paris?<|im_end|>\n<|im_start|>assistant\n<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n18 C and sunny\n</tool_response>\n<|im_end|>\n<|im_start|>assistant\n",
     "token_ids": [151644, 872, 198, 28981, 304, 12095, 30, 151645, 198, 151644, 77091, 198, 151657, 198, 27, 1688, 28280, 69364, 397, 27, 16181, 28, 8926, 397, 59604, 198, 522, 16181, 397, 522, 1688, 397, 151658, 151645, 198, 151644, 872, 198, 151665, 198, 16, 23, 356, 323, 39698, 198, 151666, 198, 151645, 198, 151644, 77091, 198]

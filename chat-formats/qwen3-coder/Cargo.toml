@@ -11,12 +11,10 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 forja-chat-format = { path = "../../crates/forja-chat-format" }
+serde_json.workspace = true
 
 [target.'cfg(target_family = "wasm")'.dependencies]
 wit-bindgen = "0.62"
-
-[dev-dependencies]
-serde_json.workspace = true
 
 [lints.rust]
 missing_docs = "warn"

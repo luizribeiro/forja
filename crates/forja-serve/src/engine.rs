@@ -138,7 +138,12 @@ pub struct PrefilledPrompt {
 }
 
 trait PromptRenderer: Send {
-    fn render_prompt(&mut self, messages: &str) -> Result<String, GenerationError>;
+    fn render_prompt(
+        &mut self,
+        messages: &str,
+        tools: &str,
+        options: &str,
+    ) -> Result<String, GenerationError>;
 }
 
 struct PromptArtifacts<R> {
@@ -147,8 +152,13 @@ struct PromptArtifacts<R> {
 }
 
 impl PromptRenderer for ChatFormat {
-    fn render_prompt(&mut self, messages: &str) -> Result<String, GenerationError> {
-        self.render(messages, "null", r#"{"add_generation_prompt":true}"#)
+    fn render_prompt(
+        &mut self,
+        messages: &str,
+        tools: &str,
+        options: &str,
+    ) -> Result<String, GenerationError> {
+        self.render(messages, tools, options)
             .map_err(|error| GenerationError::new(format!("chat format failed: {error}")))?
             .map_err(GenerationError::invalid)
     }
@@ -697,12 +707,21 @@ where
     }
     let messages = serde_json::to_string(&request.messages)
         .map_err(|error| GenerationError::new(format!("cannot encode messages: {error}")))?;
+    let tools = serde_json::to_string(&request.params.tools)
+        .map_err(|error| GenerationError::new(format!("cannot encode tools: {error}")))?;
+    let options = serde_json::to_string(&serde_json::json!({
+        "add_generation_prompt": true,
+        "tool_choice": request.params.tool_choice.as_ref(),
+        "parallel_tool_calls": request.params.parallel_tool_calls,
+        "response_format": request.params.response_format.as_ref(),
+    }))
+    .map_err(|error| GenerationError::new(format!("cannot encode render options: {error}")))?;
     let max_rendered_bytes = config.request.max_text_bytes.get();
     let tokens = tokio::task::spawn_blocking(move || {
         let mut prompt = prompt
             .lock()
             .map_err(|_| GenerationError::new("prompt processor lock is poisoned"))?;
-        let prompt_text = prompt.renderer.render_prompt(&messages)?;
+        let prompt_text = prompt.renderer.render_prompt(&messages, &tools, &options)?;
         let rendered_bytes = u64::try_from(prompt_text.len())
             .map_err(|_| GenerationError::invalid("rendered prompt size exceeds u64"))?;
         if rendered_bytes > max_rendered_bytes {
@@ -803,7 +822,7 @@ mod tests {
     struct CountingRenderer(Arc<AtomicUsize>);
 
     impl PromptRenderer for CountingRenderer {
-        fn render_prompt(&mut self, _: &str) -> Result<String, GenerationError> {
+        fn render_prompt(&mut self, _: &str, _: &str, _: &str) -> Result<String, GenerationError> {
             self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Ok("rendered".to_owned())
         }
