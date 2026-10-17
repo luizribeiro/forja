@@ -46,12 +46,6 @@ impl Profile {
         &self.0.build
     }
 
-    /// Returns optional serving artifacts declared by the profile.
-    #[must_use]
-    pub const fn serving(&self) -> &Serving {
-        &self.0.serving
-    }
-
     /// Returns the optional profile-built chat format.
     #[must_use]
     pub const fn chat(&self) -> Option<&Chat> {
@@ -134,7 +128,6 @@ struct ProfileData {
     model: Model,
     target: Target,
     build: Build,
-    serving: Serving,
     chat: Option<Chat>,
     numerics: Numerics,
     workload: Workload,
@@ -149,14 +142,6 @@ struct ProfileData {
 pub struct Build {
     /// Cargo features enabled for the engine component.
     pub features: Vec<String>,
-}
-
-/// Model-specific serving artifacts declared by a profile.
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
-pub struct Serving {
-    /// Zero-import chat-format component name.
-    pub chat_format: Option<String>,
 }
 
 /// Profile-built chat-format settings.
@@ -406,9 +391,6 @@ fn validate(profile: &ProfileData) -> Result<(), String> {
         profile.target.device_family.as_str(),
     )?;
     validate_build_features(&profile.build.features)?;
-    if let Some(format) = &profile.serving.chat_format {
-        validate_slug("serving.chat-format", format)?;
-    }
     if let Some(chat) = &profile.chat {
         validate_slug("chat.tool-format", &chat.tool_format)?;
         if profile.model.chat_template_sha256.is_none()

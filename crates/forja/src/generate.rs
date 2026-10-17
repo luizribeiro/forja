@@ -284,7 +284,7 @@ where
 
 fn load_stop_token_ids(engine: &Path) -> Result<Vec<u32>, Box<dyn Error>> {
     let profile = crate::resolution::read_embedded_profile(engine)?;
-    if profile.chat().is_none() && profile.serving().chat_format.is_none() {
+    if profile.chat().is_none() {
         return Ok(Vec::new());
     }
     let format = forja_serve::ChatFormat::load(

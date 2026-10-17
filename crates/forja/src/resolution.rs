@@ -94,29 +94,8 @@ pub(crate) fn build(
     fs::write(&output, component)?;
     if let Some(chat) = profile.chat() {
         build_chat_format(&profile, chat, models, &build_dir, &output)?;
-    } else if let Some(format) = &profile.serving().chat_format {
-        build_legacy_chat_format(format, &build_dir, &output)?;
     }
     Ok(output)
-}
-
-fn build_legacy_chat_format(
-    format: &str,
-    build_dir: &Path,
-    engine_output: &Path,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let manifest = fs::canonicalize(Path::new("chat-formats").join(format).join("Cargo.toml"))?;
-    let target_dir = build_dir.join("chat-format");
-    forja_build::build_core_module(&manifest, &target_dir, &[])?;
-    let module = fs::read(
-        target_dir
-            .join("wasm32-unknown-unknown/release")
-            .join(format!("{}_chat_format", format.replace('-', "_")))
-            .with_extension("wasm"),
-    )?;
-    let component = forja_build::encode_component(&module)?;
-    fs::write(engine_output.with_extension("chat-format.wasm"), component)?;
-    Ok(())
 }
 
 fn build_chat_format(
@@ -362,7 +341,7 @@ mod tests {
     }
 
     #[test]
-    fn serving_profiles_name_their_chat_format() {
+    fn chat_profiles_name_their_tool_format() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let path = resolve_profile_from(
             &root,
@@ -370,10 +349,7 @@ mod tests {
         )
         .unwrap();
         let profile: Profile = toml::from_str(&fs::read_to_string(path).unwrap()).unwrap();
-        assert_eq!(
-            profile.serving().chat_format.as_deref(),
-            Some("qwen3-coder")
-        );
+        assert_eq!(profile.chat().unwrap().tool_format, "qwen3-coder-xml");
     }
 
     #[test]
