@@ -5,6 +5,9 @@
 use forja_chat_format::ChatTemplate;
 use serde_json::Value;
 
+mod tools;
+pub use tools::grammar;
+
 /// Publisher-declared token ids that stop generation.
 pub const STOP_TOKEN_IDS: &[u32] = &[151_645, 151_643];
 /// Publisher-declared sampling temperature.
@@ -100,8 +103,9 @@ mod component {
             super::render(&messages_json, &tools_json, &options_json)
         }
 
-        fn grammar(_: String, _: String, _: String) -> Result<GrammarOut, String> {
-            Err("tool grammars are not implemented".to_owned())
+        fn grammar(tools: String, choice: String, response: String) -> Result<GrammarOut, String> {
+            super::grammar(&tools, &choice, &response)
+                .map(|(grammar, trigger)| GrammarOut { grammar, trigger })
         }
 
         fn parse(_: u64, _: String) -> Result<Vec<Event>, String> {
