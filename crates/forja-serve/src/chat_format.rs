@@ -32,6 +32,12 @@ pub struct ChatFormatLimits {
     pub input_bytes: usize,
     /// Maximum returned string size.
     pub output_bytes: usize,
+    /// Maximum grammar size.
+    pub grammar_bytes: usize,
+    /// Maximum trigger size.
+    pub trigger_bytes: usize,
+    /// Maximum events returned by one parse call.
+    pub events_per_parse: usize,
     /// Wall-clock deadline enforced by epoch interruption.
     pub timeout: Duration,
 }
@@ -43,6 +49,9 @@ impl Default for ChatFormatLimits {
             memory_bytes: 4 * 1024 * 1024,
             input_bytes: 1024 * 1024,
             output_bytes: 1024 * 1024,
+            grammar_bytes: 256 * 1024,
+            trigger_bytes: 256,
+            events_per_parse: 256,
             timeout: Duration::from_secs(1),
         }
     }
@@ -71,6 +80,11 @@ pub struct SamplingDefaults {
     /// Suggested output-token limit.
     pub max_new_tokens: Option<u32>,
 }
+
+/// One incremental parser event.
+pub use bindings::exports::l9o::gpu::chat_format::Event as ChatEvent;
+/// A grammar and the byte sequence that activates it.
+pub use bindings::exports::l9o::gpu::chat_format::GrammarOut as GrammarOutput;
 
 struct State {
     limits: StoreLimits,
@@ -221,6 +235,74 @@ impl ChatFormat {
             Ok(value) => self.lift_output(&value).map(Ok),
             Err(value) => self.lift_output(&value).map(Err),
         }
+    }
+
+    /// Builds a tool grammar from normalized request JSON.
+    #[allow(clippy::missing_errors_doc)]
+    pub fn grammar(
+        &mut self,
+        tools: &str,
+        choice: &str,
+        response_format: &str,
+    ) -> wasmtime::Result<Result<GrammarOutput, String>> {
+        self.check_input_size(tools, choice, response_format)?;
+        self.prepare_call()?;
+        let result = self.instance.l9o_gpu_chat_format().call_grammar(
+            &mut self.store,
+            tools,
+            choice,
+            response_format,
+        )?;
+        self.check_grammar(result)
+    }
+
+    /// Parses one ordered UTF-8 model-output chunk.
+    #[allow(clippy::missing_errors_doc)]
+    pub fn parse(
+        &mut self,
+        stream: u64,
+        chunk: &str,
+    ) -> wasmtime::Result<Result<Vec<ChatEvent>, String>> {
+        self.check_input_size(chunk, "", "")?;
+        self.prepare_call()?;
+        let result =
+            self.instance
+                .l9o_gpu_chat_format()
+                .call_parse(&mut self.store, stream, chunk)?;
+        if result
+            .as_ref()
+            .is_ok_and(|events| events.len() > self.limits.events_per_parse)
+        {
+            return Err(wasmtime::Error::msg(
+                "chat format event count exceeds its limit",
+            ));
+        }
+        Ok(result)
+    }
+
+    /// Releases parser state for a host-owned stream identifier.
+    #[allow(clippy::missing_errors_doc)]
+    pub fn reset(&mut self, stream: u64) -> wasmtime::Result<()> {
+        self.prepare_call()?;
+        self.instance
+            .l9o_gpu_chat_format()
+            .call_reset(&mut self.store, stream)
+    }
+
+    fn check_grammar(
+        &self,
+        result: Result<GrammarOutput, String>,
+    ) -> wasmtime::Result<Result<GrammarOutput, String>> {
+        if let Ok(output) = &result
+            && (output.grammar.len() > self.limits.grammar_bytes
+                || output.trigger.is_empty()
+                || output.trigger.len() > self.limits.trigger_bytes)
+        {
+            return Err(wasmtime::Error::msg(
+                "chat format grammar output exceeds its limit",
+            ));
+        }
+        Ok(result)
     }
 
     fn lift_output(&self, value: &WasmStr) -> wasmtime::Result<String> {

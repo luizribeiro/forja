@@ -1,6 +1,6 @@
 //! Sandboxing checks for chat-format components.
 
-use forja_serve::{ChatFormat, ChatFormatLimits};
+use forja_serve::{ChatEvent, ChatFormat, ChatFormatLimits};
 
 #[test]
 fn runs_a_bounded_zero_import_chat_format() {
@@ -47,7 +47,18 @@ fn runs_a_bounded_zero_import_chat_format() {
     assert_eq!(clock["now_unix_seconds"], 1_798_761_600);
     assert_eq!(clock["now_utc_offset_seconds"], 3600);
 
+    format.grammar("[]", "null", "null").unwrap().unwrap();
+    let events = format.parse(7, "hello").unwrap().unwrap();
+    assert!(matches!(&events[..], [ChatEvent::TextDelta(value)] if value == "hello"));
+    format.reset(7).unwrap();
     assert!(format.render("[]", "[]", r#"{"loop":true}"#).is_err());
+
+    let limits = ChatFormatLimits {
+        trigger_bytes: 1,
+        ..ChatFormatLimits::default()
+    };
+    let mut limited = ChatFormat::load(test_guests::chat_format_smoke(), limits).unwrap();
+    assert!(limited.grammar("[]", "null", "null").is_err());
 }
 
 #[test]

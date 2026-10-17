@@ -9,7 +9,9 @@ mod request;
 mod response;
 mod stop;
 
-pub use chat_format::{ChatFormat, ChatFormatLimits, ChatInfo, SamplingDefaults};
+pub use chat_format::{
+    ChatEvent, ChatFormat, ChatFormatLimits, ChatInfo, GrammarOutput, SamplingDefaults,
+};
 pub use engine::{
     Completion, FinishReason, GenerationControl, GenerationError, GenerationEvent, PrefilledPrompt,
     ServingEngine, Usage,
