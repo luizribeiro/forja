@@ -169,6 +169,71 @@ async fn metal_qwen3_coder_reuses_prefill_graph_across_offsets() -> Result<(), B
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[ignore = "requires FORJA_MODELS and runs in the pre-push hook"]
+async fn metal_qwen3_coder_bounds_exact_prefill_tail_graphs() -> Result<(), Box<dyn Error>> {
+    let component = test_guests::qwen3_coder();
+    let weights =
+        model_root()?.join("Qwen3-Coder-30B-A3B-Instruct-4bit/model.safetensors.index.json");
+    let load_config = common::load_config(component)?;
+    let mut lazy_config = load_config.clone();
+    lazy_config.replay = false;
+    let mut replay = EngineRunner::new(
+        component,
+        forja_metal::MetalBackend::with_graph_replay(forja_metal::MetalGraphReplay::Tier2)?,
+        LIMITS,
+        &weights,
+    )
+    .await?;
+    let mut lazy = EngineRunner::new(
+        component,
+        forja_metal::MetalBackend::new()?,
+        LIMITS,
+        &weights,
+    )
+    .await?;
+    replay.load_with_selections(Some(1), &load_config).await??;
+    lazy.load_with_selections(Some(1), &lazy_config).await??;
+
+    let lengths = (2_u32..=9)
+        .chain(2..=9)
+        .chain(10..=121)
+        .chain(2..=73)
+        .collect::<Vec<_>>();
+    assert_eq!(lengths.len(), 200);
+    assert_eq!(
+        lengths
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        120
+    );
+    let mut peak_graphs = 0;
+    for length in lengths {
+        let tokens = (0..length)
+            .map(|index| (index.wrapping_mul(7_919).wrapping_add(17)) % qwen3_coder::VOCAB)
+            .collect::<Vec<_>>();
+        let input = EngineDecode {
+            tokens: Some(tokens),
+            start_pos: 0,
+            sampling: SamplingParams::default(),
+        };
+        let replay_output = replay.decode(input.clone()).await??;
+        let lazy_output = lazy.decode(input).await??;
+        assert_eq!(
+            read_decode_output(&mut replay, &replay_output).await?,
+            read_decode_output(&mut lazy, &lazy_output).await?,
+            "prefill differed after {length} tokens"
+        );
+        peak_graphs = peak_graphs.max(replay.metrics().live_graphs);
+        assert!(peak_graphs <= 8);
+    }
+    assert_eq!(peak_graphs, 8);
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn compare_prefill<B>(
     replay_component: &Path,

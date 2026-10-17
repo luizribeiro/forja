@@ -5,7 +5,9 @@ mod variants;
 #[cfg(target_family = "wasm")]
 use forja_sdk::Param;
 #[cfg(target_family = "wasm")]
-use forja_sdk::nn::blocks::{ChunkedPrefill, DEFAULT_PREFILL_CHUNK, DecodeSelection, DecodeState};
+use forja_sdk::nn::blocks::{
+    ChunkedPrefill, DEFAULT_PREFILL_CHUNK, DecodeSelection, DecodeState, PrefillExecution,
+};
 use forja_sdk::{
     DType, Dim, Engine, EngineInfo, Load, Result, StepInput, StepOutput, Tensor, VariantSelection,
     Weights, bf16, export_engine,
@@ -574,18 +576,18 @@ impl Olmoe {
         let result = prefill.replay(
             tokens,
             start,
-            |tokens, sequence, last, start, end, parameter| {
-                self.forward_prefill_chunk(
-                    tokens,
-                    sequence,
-                    last,
-                    start,
-                    end,
-                    PrefillVariant {
+            |tokens, sequence, last, start, end, execution| {
+                let variant = match execution {
+                    PrefillExecution::Capture(parameter) => PrefillVariant {
                         start: 0,
                         parameter: Some(parameter),
                     },
-                )
+                    PrefillExecution::Lazy(start) => PrefillVariant {
+                        start,
+                        parameter: None,
+                    },
+                };
+                self.forward_prefill_chunk(tokens, sequence, last, start, end, variant)
             },
         );
         self.prefill = Some(prefill);

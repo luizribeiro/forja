@@ -13,6 +13,18 @@ use super::ops::{sdpa, sdpa_into, sdpa_into_with};
 pub const DEFAULT_PREFILL_CHUNK: u32 = 512;
 
 const MIN_PREFILL_BUCKET: u32 = 16;
+// Three decode paths, constrained selection, and the full prefill chunk need five leases;
+// three more remain free for overlap and future graph users, leaving eight exact tails.
+const DEFAULT_LIVE_GRAPH_BUDGET: usize = 16;
+const DECODE_GRAPH_RESERVE: usize = 3;
+const CONSTRAINED_GRAPH_RESERVE: usize = 1;
+const FULL_PREFILL_GRAPH_RESERVE: usize = 1;
+const GRAPH_LEASE_MARGIN: usize = 3;
+const PREFILL_TAIL_CAPACITY: usize = DEFAULT_LIVE_GRAPH_BUDGET
+    - DECODE_GRAPH_RESERVE
+    - CONSTRAINED_GRAPH_RESERVE
+    - FULL_PREFILL_GRAPH_RESERVE
+    - GRAPH_LEASE_MARGIN;
 
 /// Builds the Map program for elementwise addition.
 ///
@@ -455,9 +467,18 @@ struct CapturedPrefill<T: Element> {
     graph: Graph<Tensor<T>>,
 }
 
+/// Execution context for one replay-enabled prefill chunk.
+pub enum PrefillExecution<'a> {
+    /// Record a reusable graph parameterized by the chunk's starting position.
+    Capture(&'a Param),
+    /// Execute a one-off exact tail at this concrete starting position.
+    Lazy(u32),
+}
+
 struct PrefillTail<T: Element> {
     size: u32,
     captured: Option<CapturedPrefill<T>>,
+    last_used: u64,
 }
 
 /// Lazily captured prefill graphs and their retained token buffer.
@@ -467,10 +488,11 @@ pub struct ChunkedPrefill<T: Element> {
     tokens: Tensor<u32>,
     full: Option<CapturedPrefill<T>>,
     tails: Vec<PrefillTail<T>>,
+    tail_clock: u64,
 }
 
 impl<T: Element> ChunkedPrefill<T> {
-    /// Allocates a retained token buffer and one replay graph slot per chunk shape.
+    /// Allocates a retained token buffer for full chunks and exact-size tail graphs.
     ///
     /// # Errors
     ///
@@ -485,41 +507,29 @@ impl<T: Element> ChunkedPrefill<T> {
                 "prefill chunk must be a power of two from 16 through 512 within the context",
             ));
         }
-        let mut tails = Vec::new();
-        let mut size = MIN_PREFILL_BUCKET;
-        while size < chunk {
-            tails.push(PrefillTail {
-                size,
-                captured: None,
-            });
-            size = size
-                .checked_mul(2)
-                .ok_or_else(|| Error::loading("prefill bucket size overflowed"))?;
-        }
         Ok(Self {
             max_context,
             chunk,
             tokens: Tensor::zeros(&[max_context])?,
             full: None,
-            tails,
+            tails: Vec::with_capacity(PREFILL_TAIL_CAPACITY),
+            tail_clock: 0,
         })
     }
 
-    /// Reports whether the padded token range stays inside the cache.
+    /// Reports whether the token range stays inside the cache.
     #[must_use]
     pub fn supports(&self, start: u32, sequence: u32) -> bool {
         sequence != 0
-            && padded_prefill_len(sequence, self.chunk)
-                .and_then(|padded| start.checked_add(padded))
+            && start
+                .checked_add(sequence)
                 .is_some_and(|end| end <= self.max_context)
     }
 
     /// Writes the prompt once and replays one graph for every chunk of the same shape.
     ///
-    /// Capture is lazy: the first use records one graph for the entire bucket.
-    /// Padding follows real tokens, so causal attention and per-token `MoE` routing
-    /// cannot change real outputs. Padded cache entries are safe because the next
-    /// prefill or decode writes its position before attending to it. `forward`
+    /// Capture is lazy: the first full chunk records its graph. A first-seen exact tail runs
+    /// without capture; a repeated tail is captured and retained in the bounded LRU. `forward`
     /// must return the last real token's logits.
     ///
     /// # Errors
@@ -530,7 +540,14 @@ impl<T: Element> ChunkedPrefill<T> {
         &mut self,
         tokens: &Tensor<u32>,
         start: u32,
-        mut forward: impl FnMut(&Tensor<u32>, u32, &Dim, &Dim, &Dim, &Param) -> Result<Tensor<T>>,
+        mut forward: impl FnMut(
+            &Tensor<u32>,
+            u32,
+            &Dim,
+            &Dim,
+            &Dim,
+            PrefillExecution<'_>,
+        ) -> Result<Tensor<T>>,
     ) -> Result<Tensor<T>> {
         let [sequence] = tokens
             .shape()
@@ -550,47 +567,63 @@ impl<T: Element> ChunkedPrefill<T> {
         let mut position = start;
         let mut result = None;
         for (real, bucket_size) in plan {
-            let captured = if bucket_size == self.chunk {
-                &mut self.full
+            let tail = if bucket_size == self.chunk {
+                None
             } else {
-                &mut self
-                    .tails
-                    .iter_mut()
-                    .find(|tail| tail.size == bucket_size)
-                    .ok_or_else(|| Error::loading("prefill tail was not allocated"))?
-                    .captured
+                Some(self.touch_tail(bucket_size)?)
             };
-            if captured.is_none() {
-                let position_parameter = Param::new(0..=self.max_context - bucket_size)?;
-                let last_parameter = Param::new(0..=bucket_size - 1)?;
-                let trace_start = position_parameter.at(position);
-                let trace_end = (trace_start.clone() + bucket_size)?;
-                let start_dim: Dim = trace_start.into();
-                let last_dim = last_parameter.at(real - 1).into();
-                let graph = crate::capture(&[&position_parameter, &last_parameter], || {
-                    let input = self.tokens.narrow(0, &start_dim, bucket_size)?;
-                    forward(
-                        &input,
-                        bucket_size,
-                        &last_dim,
-                        &start_dim,
-                        &trace_end,
-                        &position_parameter,
-                    )
-                })?;
-                if graph.result().shape().len() != 1 {
-                    return Err(Error::loading(
-                        "prefill forward must return rank-one logits",
-                    ));
+            let chunk_result = if tail.is_some_and(|(_, hit)| !hit) {
+                let end = position
+                    .checked_add(bucket_size)
+                    .ok_or_else(|| Error::loading("prefill position overflowed"))?;
+                let start_dim: Dim = position.into();
+                let last_dim: Dim = (real - 1).into();
+                let end_dim: Dim = end.into();
+                let input = self.tokens.narrow(0, &start_dim, bucket_size)?;
+                let logits = forward(
+                    &input,
+                    bucket_size,
+                    &last_dim,
+                    &start_dim,
+                    &end_dim,
+                    PrefillExecution::Lazy(position),
+                )?;
+                validate_prefill_logits(&logits)?;
+                logits
+            } else {
+                let captured = match tail {
+                    None => &mut self.full,
+                    Some((index, _)) => &mut self.tails[index].captured,
+                };
+                if captured.is_none() {
+                    let position_parameter = Param::new(0..=self.max_context - bucket_size)?;
+                    let last_parameter = Param::new(0..=bucket_size - 1)?;
+                    let trace_start = position_parameter.at(position);
+                    let trace_end = (trace_start.clone() + bucket_size)?;
+                    let start_dim: Dim = trace_start.into();
+                    let last_dim = last_parameter.at(real - 1).into();
+                    let graph = crate::capture(&[&position_parameter, &last_parameter], || {
+                        let input = self.tokens.narrow(0, &start_dim, bucket_size)?;
+                        forward(
+                            &input,
+                            bucket_size,
+                            &last_dim,
+                            &start_dim,
+                            &trace_end,
+                            PrefillExecution::Capture(&position_parameter),
+                        )
+                    })?;
+                    validate_prefill_logits(graph.result())?;
+                    *captured = Some(CapturedPrefill { graph });
                 }
-                *captured = Some(CapturedPrefill { graph });
-            }
-            let graph = &captured
-                .as_ref()
-                .ok_or_else(|| Error::loading("prefill graph was not captured"))?
-                .graph;
-            graph.replay(&[position, real - 1])?;
-            result = Some(graph.result().alias()?);
+                let graph = &captured
+                    .as_ref()
+                    .ok_or_else(|| Error::loading("prefill graph was not captured"))?
+                    .graph;
+                graph.replay(&[position, real - 1])?;
+                graph.result().alias()?
+            };
+            result = Some(chunk_result);
             consumed = consumed
                 .checked_add(real)
                 .ok_or_else(|| Error::loading("prefill progress overflowed"))?;
@@ -599,6 +632,35 @@ impl<T: Element> ChunkedPrefill<T> {
                 .ok_or_else(|| Error::loading("prefill position overflowed"))?;
         }
         result.ok_or_else(|| Error::loading("prefill produced no logits"))
+    }
+
+    fn touch_tail(&mut self, size: u32) -> Result<(usize, bool)> {
+        self.tail_clock = self
+            .tail_clock
+            .checked_add(1)
+            .ok_or_else(|| Error::loading("prefill tail clock overflowed"))?;
+        if let Some(index) = self.tails.iter().position(|tail| tail.size == size) {
+            self.tails[index].last_used = self.tail_clock;
+            return Ok((index, true));
+        }
+        let tail = PrefillTail {
+            size,
+            captured: None,
+            last_used: self.tail_clock,
+        };
+        if self.tails.len() < PREFILL_TAIL_CAPACITY {
+            self.tails.push(tail);
+            return Ok((self.tails.len() - 1, false));
+        }
+        let least_recent = self
+            .tails
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, tail)| tail.last_used)
+            .map(|(index, _)| index)
+            .ok_or_else(|| Error::loading("prefill tail cache has no eviction candidate"))?;
+        self.tails[least_recent] = tail;
+        Ok((least_recent, false))
     }
 
     /// Runs the padded chunk plan without capturing or replaying graphs.
@@ -615,6 +677,15 @@ impl<T: Element> ChunkedPrefill<T> {
     ) -> Result<Tensor<T>> {
         run_lazy_chunked_prefill(tokens, start, self.chunk, &self.tokens, forward)
     }
+}
+
+fn validate_prefill_logits<T: Element>(logits: &Tensor<T>) -> Result<()> {
+    if logits.shape().len() != 1 {
+        return Err(Error::loading(
+            "prefill forward must return rank-one logits",
+        ));
+    }
+    Ok(())
 }
 
 /// Records the same fixed-size prefill chunks without capturing graphs.
@@ -637,10 +708,7 @@ pub fn lazy_chunked_prefill<T: Element>(
         .try_into()
         .map_err(|_| Error::loading("prefill tokens must have rank one"))?;
     let capacity = start
-        .checked_add(
-            padded_prefill_len(sequence, chunk)
-                .ok_or_else(|| Error::loading("prefill capacity overflowed"))?,
-        )
+        .checked_add(sequence)
         .ok_or_else(|| Error::loading("prefill capacity overflowed"))?;
     let retained = Tensor::zeros(&[capacity])?;
     run_lazy_chunked_prefill(tokens, start, chunk, &retained, forward)
@@ -696,16 +764,6 @@ fn run_lazy_chunked_prefill<T: Element>(
     result.ok_or_else(|| Error::loading("prefill produced no logits"))
 }
 
-fn padded_prefill_len(sequence: u32, chunk: u32) -> Option<u32> {
-    let full = sequence / chunk;
-    let remainder = sequence % chunk;
-    full.checked_mul(chunk)?.checked_add(if remainder == 0 {
-        0
-    } else {
-        prefill_bucket(remainder, chunk).ok()?
-    })
-}
-
 fn staged_tokens(values: &[u32], start: u32, capacity: u32) -> Result<Vec<u32>> {
     let begin =
         usize::try_from(start).map_err(|_| Error::loading("prefill offset does not fit usize"))?;
@@ -734,10 +792,7 @@ fn prefill_bucket(sequence: u32, chunk: u32) -> Result<u32> {
     if sequence == 0 || sequence > chunk {
         return Err(Error::loading("prefill chunk length is invalid"));
     }
-    if sequence == chunk {
-        return Ok(chunk);
-    }
-    Ok(sequence.max(MIN_PREFILL_BUCKET).next_power_of_two())
+    Ok(sequence)
 }
 
 fn prefill_plan(sequence: u32, chunk: u32) -> Result<Vec<(u32, u32)>> {
@@ -1253,16 +1308,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn prefill_plan_uses_fixed_chunks_and_power_of_two_remainders() {
+    fn prefill_plan_uses_fixed_chunks_and_exact_remainders() {
         let cases = [
-            (1, vec![(1, 16)]),
-            (7, vec![(7, 16)]),
+            (1, vec![(1, 1)]),
+            (7, vec![(7, 7)]),
             (16, vec![(16, 16)]),
-            (33, vec![(33, 64)]),
-            (511, vec![(511, 512)]),
+            (33, vec![(33, 33)]),
+            (511, vec![(511, 511)]),
             (512, vec![(512, 512)]),
-            (513, vec![(512, 512), (1, 16)]),
-            (1_500, vec![(512, 512), (512, 512), (476, 512)]),
+            (513, vec![(512, 512), (1, 1)]),
+            (1_500, vec![(512, 512), (512, 512), (476, 476)]),
             (
                 4_000,
                 vec![
@@ -1273,7 +1328,7 @@ mod tests {
                     (512, 512),
                     (512, 512),
                     (512, 512),
-                    (416, 512),
+                    (416, 416),
                 ],
             ),
         ];
@@ -1287,28 +1342,7 @@ mod tests {
     }
 
     #[test]
-    fn padded_length_accounts_for_only_the_remainder_bucket() {
-        for (sequence, padded) in [
-            (1, 16),
-            (7, 16),
-            (16, 16),
-            (33, 64),
-            (511, 512),
-            (512, 512),
-            (513, 528),
-            (1_500, 1_536),
-            (4_000, 4_096),
-        ] {
-            assert_eq!(
-                padded_prefill_len(sequence, DEFAULT_PREFILL_CHUNK),
-                Some(padded),
-                "sequence {sequence}"
-            );
-        }
-    }
-
-    #[test]
-    fn staged_tokens_preserve_the_prompt_offset_and_padding() {
+    fn staged_tokens_preserve_the_prompt_offset_and_capacity() {
         assert_eq!(
             staged_tokens(&[7, 11, 13], 2, 8).unwrap(),
             [0, 0, 7, 11, 13, 0, 0, 0]
