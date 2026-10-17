@@ -13,6 +13,20 @@ pub fn chat_response(
     model: &str,
     completion: &Completion,
 ) -> Result<Value, GenerationError> {
+    let message = completion.tool_call.as_ref().map_or_else(
+        || json!({"role": "assistant", "content": completion.text}),
+        |call| {
+            json!({
+                "role": "assistant",
+                "content": (!completion.text.is_empty()).then_some(&completion.text),
+                "tool_calls": [{
+                    "id": "call_0",
+                    "type": "function",
+                    "function": {"name": call.name, "arguments": call.arguments},
+                }],
+            })
+        },
+    );
     Ok(json!({
         "id": id,
         "object": "chat.completion",
@@ -20,7 +34,7 @@ pub fn chat_response(
         "model": model,
         "choices": [{
             "index": 0,
-            "message": {"role": "assistant", "content": completion.text},
+            "message": message,
             "finish_reason": finish_reason(completion.finish_reason),
         }],
         "usage": usage(completion)?,
@@ -81,6 +95,7 @@ mod tests {
     fn completion() -> Completion {
         Completion {
             text: "hello".to_owned(),
+            tool_call: None,
             finish_reason: FinishReason::Stop,
             usage: Usage {
                 prompt_tokens: 7,
@@ -99,5 +114,21 @@ mod tests {
         let text = text_response("cmpl-1", 2, "served", &completion()).unwrap();
         assert_eq!(text["object"], "text_completion");
         assert_eq!(text["choices"][0]["text"], "hello");
+    }
+
+    #[test]
+    fn serializes_one_validated_tool_call() {
+        let mut completion = completion();
+        completion.text.clear();
+        completion.finish_reason = FinishReason::ToolCalls;
+        completion.tool_call = Some(crate::GeneratedToolCall {
+            name: "read_file".to_owned(),
+            arguments: r#"{"path":"a.rs"}"#.to_owned(),
+        });
+        let response = chat_response("chatcmpl-1", 2, "served", &completion).unwrap();
+        let choice = &response["choices"][0];
+        assert!(choice["message"]["content"].is_null());
+        assert_eq!(choice["message"]["tool_calls"][0]["id"], "call_0");
+        assert_eq!(choice["finish_reason"], "tool_calls");
     }
 }

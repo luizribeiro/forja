@@ -17,8 +17,8 @@ pub use chat_format::{
     ChatEvent, ChatFormat, ChatFormatLimits, ChatInfo, GrammarOutput, SamplingDefaults,
 };
 pub use engine::{
-    Completion, FinishReason, GenerationControl, GenerationError, GenerationEvent, PrefilledPrompt,
-    ServingEngine, Usage,
+    Completion, FinishReason, GeneratedToolCall, GenerationControl, GenerationError,
+    GenerationEvent, PrefilledPrompt, ServingEngine, Usage,
 };
 pub use http::{ChatService, DrainHandle, chat_router, serving_router};
 pub use request::{

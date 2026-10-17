@@ -736,6 +736,7 @@ mod tests {
             Box::pin(async {
                 Ok(Completion {
                     text: "forged".to_owned(),
+                    tool_call: None,
                     finish_reason: FinishReason::Stop,
                     usage: Usage {
                         prompt_tokens: 4,
@@ -841,6 +842,7 @@ mod tests {
                 }
                 Ok(Completion {
                     text: "forged".to_owned(),
+                    tool_call: None,
                     finish_reason: FinishReason::Stop,
                     usage: Usage {
                         prompt_tokens: 4,
