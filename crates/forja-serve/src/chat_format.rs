@@ -6,7 +6,7 @@ use std::{
 };
 
 use serde_json::{Map, Value};
-use wasmtime::component::{Component, Func, Linker, WasmStr};
+use wasmtime::component::{Component, Func, Linker};
 use wasmtime::{Config, Engine, Store, StoreLimits, StoreLimitsBuilder};
 
 #[allow(missing_docs)]
@@ -229,11 +229,11 @@ impl ChatFormat {
         self.prepare_call()?;
         let render = self
             .render
-            .typed::<(&str, &str, &str), (Result<WasmStr, WasmStr>,)>(&self.store)?;
+            .typed::<(&str, &str, &str), (Result<String, String>,)>(&self.store)?;
         let (result,) = render.call(&mut self.store, (messages_json, tools_json, &options_json))?;
         match result {
-            Ok(value) => self.lift_output(&value).map(Ok),
-            Err(value) => self.lift_output(&value).map(Err),
+            Ok(value) => self.check_output(value).map(Ok),
+            Err(value) => self.check_output(value).map(Err),
         }
     }
 
@@ -305,8 +305,7 @@ impl ChatFormat {
         Ok(result)
     }
 
-    fn lift_output(&self, value: &WasmStr) -> wasmtime::Result<String> {
-        let value = value.to_str(&self.store)?.into_owned();
+    fn check_output(&self, value: String) -> wasmtime::Result<String> {
         if value.len() > self.limits.output_bytes {
             return Err(wasmtime::Error::msg(
                 "chat format output exceeds its byte limit",

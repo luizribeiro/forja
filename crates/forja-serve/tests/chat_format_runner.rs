@@ -135,3 +135,72 @@ fn runs_a_profile_chat_format() {
     let reset = format.parse(9, "plain").unwrap().unwrap();
     assert!(matches!(&reset[..], [ChatEvent::TextDelta(text)] if text == "plain"));
 }
+
+#[test]
+fn reuses_a_profile_component_for_multibyte_tool_conversations() {
+    let mut format = ChatFormat::load(
+        test_guests::qwen3_coder_chat_format(),
+        ChatFormatLimits::default(),
+    )
+    .unwrap();
+    let tools = r#"[{"type":"function","function":{"name":"lookup","description":"Busca café em 東京 🧰","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}]"#;
+    let calls = [
+        serde_json::json!([{"role": "user", "content": "café 東京 🧰"}]),
+        serde_json::json!([
+            {"role": "user", "content": "café 東京 🧰"},
+            {"role": "assistant", "content": "déjà vu"}
+        ]),
+        serde_json::json!([
+            {"role": "user", "content": "café 東京 🧰"},
+            {"role": "assistant", "content": null, "tool_calls": [{
+                "id": "call_0",
+                "type": "function",
+                "function": {"name": "lookup", "arguments": "{\"city\":\"Montréal\"}"}
+            }]},
+            {"role": "tool", "content": "résultat 東京 🧰", "tool_call_id": "call_0"}
+        ]),
+    ];
+    for iteration in 0..2_000_u64 {
+        let messages =
+            serde_json::to_string(&calls[usize::try_from(iteration % 3).unwrap()]).unwrap();
+        let rendered = format
+            .render(&messages, tools, r#"{"add_generation_prompt":true}"#)
+            .unwrap_or_else(|error| panic!("render {iteration} trapped: {error}"))
+            .unwrap_or_else(|error| panic!("render {iteration} failed: {error}"));
+        assert!(rendered.contains("café 東京 🧰"), "render {iteration}");
+
+        let stream = iteration % 4;
+        let mut events = format
+            .parse(stream, "préface 東京 🧰<tool_")
+            .unwrap()
+            .unwrap();
+        events.extend(
+            format
+                .parse(
+                    stream,
+                    "call>\n<function=lookup>\n<parameter=city>\nMontréal",
+                )
+                .unwrap()
+                .unwrap(),
+        );
+        events.extend(
+            format
+                .parse(stream, " 東京 🧰\n</parameter>\n</function>\n</tool_call>")
+                .unwrap()
+                .unwrap(),
+        );
+        assert!(matches!(
+            &events[..],
+            [
+                ChatEvent::TextDelta(text),
+                ChatEvent::CallStart(name),
+                ChatEvent::ArgumentDelta((parameter, value)),
+                ChatEvent::CallEnd
+            ] if text == "préface 東京 🧰"
+                && name == "lookup"
+                && parameter == "city"
+                && value == "Montréal 東京 🧰"
+        ));
+        format.reset(stream).unwrap();
+    }
+}
