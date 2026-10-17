@@ -12,6 +12,108 @@ use chrono::{DateTime, FixedOffset, Utc};
 use minijinja::{AutoEscape, Environment, Error, ErrorKind, State, UndefinedBehavior};
 use serde_json::Value as JsonValue;
 
+/// One incremental event emitted while parsing model output.
+#[allow(missing_docs)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Event {
+    TextDelta(String),
+    CallStart(String),
+    ArgumentDelta(String, String),
+    CallEnd,
+}
+
+/// Stateful parser for one ordered model-output stream.
+pub trait IncrementalParser {
+    /// Parses the next UTF-8 chunk.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the stream does not conform to the format.
+    fn parse(&mut self, chunk: &str) -> Result<Vec<Event>, String>;
+}
+
+/// A model-independent tool-call format.
+pub trait ToolFormat {
+    /// Typed, format-specific compatibility options.
+    type Options;
+    /// Incremental parser state for one output stream.
+    type Parser: Default + IncrementalParser;
+
+    /// Parses and validates the format options embedded by a profile build.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when an option is unknown or invalid.
+    fn options(options_json: &str) -> Result<Self::Options, String>;
+
+    /// Returns the byte sequence that activates this format.
+    fn trigger(options: &Self::Options) -> &str;
+
+    /// Constructs parser state, allowing variants to apply parser quirks.
+    fn parser(_options: &Self::Options) -> Self::Parser {
+        Self::Parser::default()
+    }
+
+    /// Normalizes messages before the Hugging Face template sees them.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when messages cannot be represented by this format.
+    fn normalize_messages(
+        _messages: &mut JsonValue,
+        _options: &Self::Options,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Applies format-specific output changes after template rendering.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when request options cannot be represented by this format.
+    fn finish_render(
+        rendered: String,
+        _request_options: &JsonValue,
+        _options: &Self::Options,
+    ) -> Result<String, String> {
+        Ok(rendered)
+    }
+
+    /// Renders a request through the shared Hugging Face template pipeline.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when JSON, normalization, or template rendering fails.
+    fn render(
+        template: &ChatTemplate,
+        messages_json: &str,
+        tools_json: &str,
+        request_options_json: &str,
+        options: &Self::Options,
+    ) -> Result<String, String> {
+        let mut messages =
+            serde_json::from_str(messages_json).map_err(|error| error.to_string())?;
+        Self::normalize_messages(&mut messages, options)?;
+        let request_options =
+            serde_json::from_str(request_options_json).map_err(|error| error.to_string())?;
+        let messages = serde_json::to_string(&messages).map_err(|error| error.to_string())?;
+        let rendered = template.render(&messages, tools_json, request_options_json)?;
+        Self::finish_render(rendered, &request_options, options)
+    }
+
+    /// Builds a grammar for a normalized tool request.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the request cannot be constrained by this format.
+    fn grammar(
+        tools_json: &str,
+        choice_json: &str,
+        response_json: &str,
+        options: &Self::Options,
+    ) -> Result<String, String>;
+}
+
 /// A compiled embedded chat template.
 pub struct ChatTemplate {
     environment: Environment<'static>,
@@ -100,6 +202,45 @@ fn clock_error(message: &'static str) -> Error {
 mod tests {
     use super::*;
 
+    struct PrefixFormat;
+
+    impl ToolFormat for PrefixFormat {
+        type Options = String;
+        type Parser = PrefixParser;
+
+        fn options(options_json: &str) -> Result<Self::Options, String> {
+            serde_json::from_str(options_json).map_err(|error| error.to_string())
+        }
+
+        fn trigger(options: &Self::Options) -> &str {
+            options
+        }
+
+        fn finish_render(
+            mut rendered: String,
+            request_options: &JsonValue,
+            options: &Self::Options,
+        ) -> Result<String, String> {
+            if request_options["activate"] == true {
+                rendered.push_str(options);
+            }
+            Ok(rendered)
+        }
+
+        fn grammar(_: &str, _: &str, _: &str, options: &Self::Options) -> Result<String, String> {
+            Ok(format!("start: {options}"))
+        }
+    }
+
+    #[derive(Default)]
+    struct PrefixParser;
+
+    impl IncrementalParser for PrefixParser {
+        fn parse(&mut self, chunk: &str) -> Result<Vec<Event>, String> {
+            Ok(vec![Event::TextDelta(chunk.to_owned())])
+        }
+    }
+
     #[test]
     fn renders_lenient_undefined_values_and_python_methods() {
         let template = ChatTemplate::compile(
@@ -143,6 +284,28 @@ mod tests {
                 .render("[]", "null", "{}")
                 .unwrap_err()
                 .contains("boom")
+        );
+    }
+
+    #[test]
+    fn format_contract_uses_typed_options_and_default_steps() {
+        let options = PrefixFormat::options(r#""<call>""#).unwrap();
+        let template = ChatTemplate::compile("{{ messages[0].content }}".to_owned()).unwrap();
+        assert_eq!(
+            PrefixFormat::render(
+                &template,
+                r#"[{"content":"hello"}]"#,
+                "null",
+                r#"{"activate":true}"#,
+                &options
+            )
+            .unwrap(),
+            "hello<call>"
+        );
+        assert_eq!(PrefixFormat::trigger(&options), "<call>");
+        assert_eq!(
+            PrefixFormat::parser(&options).parse("text").unwrap(),
+            [Event::TextDelta("text".to_owned())]
         );
     }
 }
