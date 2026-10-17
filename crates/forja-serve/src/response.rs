@@ -82,6 +82,7 @@ pub(crate) fn usage(completion: &Completion) -> Result<Value, GenerationError> {
         .ok_or_else(|| GenerationError::new("usage token count overflowed"))?;
     Ok(json!({
         "prompt_tokens": prompt,
+        "prompt_tokens_details": {"cached_tokens": completion.usage.cached_tokens},
         "completion_tokens": generated,
         "total_tokens": total,
     }))
@@ -99,6 +100,7 @@ mod tests {
             finish_reason: FinishReason::Stop,
             usage: Usage {
                 prompt_tokens: 7,
+                cached_tokens: 5,
                 completion_tokens: 3,
             },
         }
@@ -110,6 +112,7 @@ mod tests {
         assert_eq!(chat["choices"][0]["message"]["content"], "hello");
         assert_eq!(chat["choices"][0]["finish_reason"], "stop");
         assert_eq!(chat["usage"]["total_tokens"], 10);
+        assert_eq!(chat["usage"]["prompt_tokens_details"]["cached_tokens"], 5);
 
         let text = text_response("cmpl-1", 2, "served", &completion()).unwrap();
         assert_eq!(text["object"], "text_completion");

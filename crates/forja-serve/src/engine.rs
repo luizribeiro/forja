@@ -141,6 +141,7 @@ pub struct PrefilledPrompt {
     pub params: ResolvedParams,
     /// Rendered prompt token count.
     pub prompt_tokens: u32,
+    cached_tokens: u32,
     /// Engine sampling parameters used by every decode step.
     pub sampling: SamplingParams,
     ledger: PrefixLedger,
@@ -367,6 +368,8 @@ pub enum FinishReason {
 pub struct Usage {
     /// Tokens in the rendered prompt.
     pub prompt_tokens: u32,
+    /// Prompt tokens served from the immediately preceding live KV prefix.
+    pub cached_tokens: u32,
     /// Sampled tokens, including a token that caused a stop.
     pub completion_tokens: u32,
 }
@@ -629,6 +632,7 @@ where
             first,
             params,
             prompt_tokens,
+            cached_tokens: start_pos,
             sampling,
             ledger,
             constraint,
@@ -757,6 +761,7 @@ where
         let DecodeStart {
             params,
             prompt_tokens,
+            cached_tokens,
             sampling,
             constraint,
             mut guidance,
@@ -875,8 +880,11 @@ where
             &mut self.runner,
             tool_parser,
             text,
-            prompt_tokens,
-            consumed,
+            Usage {
+                prompt_tokens,
+                cached_tokens,
+                completion_tokens: consumed,
+            },
         )
         .await;
         let ledger = result.is_ok().then(|| std::mem::take(&mut pipeline.ledger));
@@ -896,22 +904,14 @@ async fn finish_decode_request<B>(
     runner: &mut EngineRunner<B>,
     parser: Option<ToolParser>,
     text: String,
-    prompt_tokens: u32,
-    completion_tokens: u32,
+    usage: Usage,
 ) -> Result<Completion, GenerationError>
 where
     B: Backend + Send + Sync + 'static,
 {
     let cleanup = pipeline.cleanup(runner).await;
     let tool_call = finish_tool_parser(&generation, parser).await;
-    finish_completion(
-        generation,
-        cleanup,
-        tool_call,
-        text,
-        prompt_tokens,
-        completion_tokens,
-    )
+    finish_completion(generation, cleanup, tool_call, text, usage)
 }
 
 fn finish_completion(
@@ -919,8 +919,7 @@ fn finish_completion(
     cleanup: Result<(), GenerationError>,
     tool_call: Result<Option<GeneratedToolCall>, GenerationError>,
     text: String,
-    prompt_tokens: u32,
-    completion_tokens: u32,
+    usage: Usage,
 ) -> Result<Completion, GenerationError> {
     let finish_reason = match (generation, cleanup) {
         (Ok(reason), Ok(())) => reason,
@@ -931,10 +930,7 @@ fn finish_completion(
         text,
         tool_call,
         finish_reason,
-        usage: Usage {
-            prompt_tokens,
-            completion_tokens,
-        },
+        usage,
     })
 }
 
@@ -943,6 +939,7 @@ type PendingDecode = (EngineDecodeOutput, u32);
 struct DecodeStart {
     params: ResolvedParams,
     prompt_tokens: u32,
+    cached_tokens: u32,
     sampling: SamplingParams,
     constraint: Option<ConstraintPlan>,
     guidance: Option<GuidanceSession>,
@@ -967,6 +964,7 @@ where
         mut first,
         params,
         prompt_tokens,
+        cached_tokens,
         sampling,
         ledger,
         constraint,
@@ -996,6 +994,7 @@ where
     Ok(DecodeStart {
         params,
         prompt_tokens,
+        cached_tokens,
         sampling,
         constraint,
         guidance,

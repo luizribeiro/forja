@@ -579,6 +579,7 @@ fn stream_data(event: GenerationEvent, id: &str, created: u64, model: &str, chat
 fn stream_usage(usage: Usage) -> Value {
     json!({
         "prompt_tokens": usage.prompt_tokens,
+        "prompt_tokens_details": {"cached_tokens": usage.cached_tokens},
         "completion_tokens": usage.completion_tokens,
         "total_tokens": u64::from(usage.prompt_tokens) + u64::from(usage.completion_tokens),
     })
@@ -758,6 +759,7 @@ mod tests {
                     finish_reason: FinishReason::Stop,
                     usage: Usage {
                         prompt_tokens: 4,
+                        cached_tokens: 0,
                         completion_tokens: 1,
                     },
                 })
@@ -796,6 +798,7 @@ mod tests {
                         FinishReason::Stop,
                         Usage {
                             prompt_tokens: 4,
+                            cached_tokens: 0,
                             completion_tokens: 1,
                         },
                     ))
@@ -864,6 +867,7 @@ mod tests {
                     finish_reason: FinishReason::Stop,
                     usage: Usage {
                         prompt_tokens: 4,
+                        cached_tokens: 0,
                         completion_tokens: 1,
                     },
                 })
@@ -978,6 +982,7 @@ mod tests {
     fn serializes_stream_chunks_and_clean_termination() {
         let usage = Usage {
             prompt_tokens: 7,
+            cached_tokens: 3,
             completion_tokens: 3,
         };
         let role = stream_data(GenerationEvent::Role, "id", 1, "model", true);
@@ -1017,6 +1022,7 @@ mod tests {
         assert!(call.contains("read_file"));
         assert!(arguments.contains("path"));
         assert!(usage.contains("total_tokens\":10"));
+        assert!(usage.contains("cached_tokens\":3"));
         assert_eq!(
             stream_data(GenerationEvent::Done, "id", 1, "model", true),
             "[DONE]"
