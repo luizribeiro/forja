@@ -4,7 +4,9 @@ use crate::common;
 
 use std::{env, error::Error, path::PathBuf, time::Duration};
 
-use forja_host::{EngineDecode, EngineRunner, EngineStep, Limits, SamplingParams};
+use forja_host::{
+    EngineBeginDecode, EngineDecode, EngineRunner, EngineStep, Limits, SamplingParams,
+};
 use golden_fixtures::{FixtureDirectory, decode_f32_le, normwise_relative_error};
 
 const LIMITS: Limits = Limits::new(
@@ -140,6 +142,71 @@ async fn metal_replay_matches_lazy_greedy_and_sampled_decode() -> Result<(), Box
 }
 
 #[cfg(target_os = "macos")]
+#[tokio::test]
+#[ignore = "requires FORJA_MODELS and runs in the pre-push hook"]
+async fn metal_rewind_matches_decode_without_speculation() -> Result<(), Box<dyn Error>> {
+    let mut runner = runner_with_graph_replay(forja_metal::MetalGraphReplay::Tier2).await?;
+    runner
+        .load_with_selections(Some(REPLAY_LAYERS), &load_config()?)
+        .await??;
+    let expected = constrained_continuation(&mut runner, false).await?;
+    let rewound = constrained_continuation(&mut runner, true).await?;
+    assert_eq!(rewound, expected);
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+async fn constrained_continuation(
+    runner: &mut EngineRunner<forja_metal::MetalBackend>,
+    speculate: bool,
+) -> Result<Vec<u32>, Box<dyn Error>> {
+    let sampling = SamplingParams {
+        temperature: 0.7,
+        top_k: 20,
+        top_p: 0.9,
+        seed: 17,
+    };
+    let prompt = vec![17, 33, 4097];
+    let first = runner
+        .enqueue_decode(EngineDecode {
+            tokens: Some(prompt.clone()),
+            start_pos: 0,
+            sampling,
+        })
+        .await??;
+    let mut tokens = vec![read_token(&runner.read_queued_token(first).await?)?];
+    let first_position = u32::try_from(prompt.len())?;
+    if speculate {
+        let output = runner
+            .enqueue_decode(EngineDecode {
+                tokens: None,
+                start_pos: first_position,
+                sampling,
+            })
+            .await??;
+        runner.discard_queued_decode(output).await?;
+        runner.rewind_decode(first_position).await??;
+    }
+    let allow = vec![u32::MAX; usize::try_from(qwen3_coder::VOCAB / 32)?];
+    let end = first_position
+        .checked_add(2)
+        .ok_or("decode position overflowed")?;
+    for position in first_position..end {
+        let logits = runner
+            .begin_decode(EngineBeginDecode {
+                tokens: None,
+                start_pos: position,
+            })
+            .await??;
+        let output = runner
+            .finish_decode(&logits, position, sampling, &allow)
+            .await??;
+        tokens.push(read_token(&runner.read_queued_token(output).await?)?);
+    }
+    Ok(tokens)
+}
+
+#[cfg(target_os = "macos")]
 async fn decode_outputs(replay: bool) -> Result<Vec<(Vec<u8>, Vec<u8>)>, Box<dyn Error>> {
     let mut runner = runner_with_graph_replay(forja_metal::MetalGraphReplay::Tier2).await?;
     let mut config = load_config()?;
@@ -243,6 +310,10 @@ fn top_k_set(values: &[f32], k: usize) -> Vec<usize> {
     indices.truncate(k);
     indices.sort_unstable();
     indices
+}
+
+fn read_token(bytes: &[u8]) -> Result<u32, Box<dyn Error>> {
+    Ok(u32::from_le_bytes(bytes.try_into()?))
 }
 
 fn model_root() -> Result<PathBuf, Box<dyn Error>> {
