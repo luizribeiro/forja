@@ -6,15 +6,45 @@ use serde_json::Value;
 
 use crate::{ChatInfo, SamplingDefaults};
 
-/// One chat message with string content.
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct Message {
-    /// OpenAI-compatible message role.
-    pub role: String,
-    /// Message text.
-    pub content: String,
+macro_rules! openai_record {
+    ($name:ident { $($field:ident: $kind:ty),+ $(,)? }) => {
+        #[allow(missing_docs)]
+        #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+        #[serde(deny_unknown_fields)]
+        pub struct $name { $(pub $field: $kind),+ }
+    };
 }
+
+openai_record!(Message { role: String, content: Option<String>, tool_calls: Option<Vec<ToolCall>>, tool_call_id: Option<String> });
+openai_record!(Tool {
+    r#type: String,
+    function: FunctionDefinition
+});
+openai_record!(FunctionDefinition { name: String, description: Option<String>, parameters: Value });
+openai_record!(ToolCall {
+    id: String,
+    r#type: String,
+    function: FunctionCall
+});
+openai_record!(FunctionCall {
+    name: String,
+    arguments: String
+});
+
+#[allow(missing_docs)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(untagged)]
+pub enum ToolChoice {
+    Mode(String),
+    Named(NamedToolChoice),
+}
+
+openai_record!(NamedToolChoice {
+    r#type: String,
+    function: NamedFunction
+});
+openai_record!(NamedFunction { name: String });
+openai_record!(ResponseFormat { r#type: String });
 
 /// One stop string or a list of stop strings.
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -69,11 +99,13 @@ pub struct CompletionParams {
     /// Unsupported prompt suffix.
     pub suffix: Option<String>,
     /// Unsupported tool definitions.
-    pub tools: Option<Vec<Value>>,
+    pub tools: Option<Vec<Tool>>,
     /// Unsupported tool selection.
-    pub tool_choice: Option<Value>,
+    pub tool_choice: Option<ToolChoice>,
+    /// Accepted API compatibility flag; generation remains single-call.
+    pub parallel_tool_calls: Option<bool>,
     /// Unsupported structured response selection.
-    pub response_format: Option<Value>,
+    pub response_format: Option<ResponseFormat>,
 }
 
 /// Optional controls for streaming usage emission.
@@ -172,7 +204,12 @@ pub(crate) fn validate_chat_input(
         return invalid("messages exceed the configured ceiling");
     }
     validate_text(
-        checked_text_bytes(request.messages.iter().map(|message| message.content.len()))?,
+        checked_text_bytes(
+            request
+                .messages
+                .iter()
+                .filter_map(|message| message.content.as_ref().map(String::len)),
+        )?,
         config,
     )?;
     resolve(&request.params, config, &defaults.sampling, vocab, true)
@@ -221,7 +258,7 @@ fn resolve(
     vocab: u32,
     chat: bool,
 ) -> Result<ResolvedParams, ValidationError> {
-    reject_unsupported(params)?;
+    reject_unsupported(params, chat)?;
     if params.max_tokens.is_some() && params.max_completion_tokens.is_some() {
         return invalid("max_tokens and max_completion_tokens conflict");
     }
@@ -325,7 +362,7 @@ fn ceiling_usize(value: u32) -> usize {
     usize::try_from(value).unwrap_or(usize::MAX)
 }
 
-fn reject_unsupported(params: &CompletionParams) -> Result<(), ValidationError> {
+fn reject_unsupported(params: &CompletionParams, _chat: bool) -> Result<(), ValidationError> {
     if params.stream_options.is_some() && !params.stream {
         return invalid("stream_options requires stream=true");
     }
@@ -346,6 +383,7 @@ fn reject_unsupported(params: &CompletionParams) -> Result<(), ValidationError> 
         || params.suffix.is_some()
         || params.tools.as_ref().is_some_and(|value| !value.is_empty())
         || params.tool_choice.is_some()
+        || params.parallel_tool_calls.is_some()
         || params.response_format.is_some();
     if unsupported {
         invalid("request contains an unsupported non-default field")
@@ -375,7 +413,9 @@ mod tests {
             model: "qwen".to_owned(),
             messages: vec![Message {
                 role: "user".to_owned(),
-                content: "hello".to_owned(),
+                content: Some("hello".to_owned()),
+                tool_calls: None,
+                tool_call_id: None,
             }],
             params,
         }
@@ -417,6 +457,16 @@ mod tests {
             serde_json::from_str::<ChatCompletionRequest>(
                 r#"{"model":"qwen","messages":[],"unknown":true}"#
             )
+            .is_err()
+        );
+        let tools = r#"{"model":"qwen","messages":[{"role":"assistant","content":null,"tool_calls":[{"id":"call_0","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"a.rs\"}"}}]},{"role":"tool","content":"ok","tool_call_id":"call_0"}],"tools":[{"type":"function","function":{"name":"read_file","description":"read","parameters":{"type":"object"}}}],"tool_choice":"auto","parallel_tool_calls":true,"response_format":{"type":"text"}}"#;
+        let request: ChatCompletionRequest = serde_json::from_str(tools).unwrap();
+        assert_eq!(request.params.tools.unwrap()[0].function.name, "read_file");
+        assert!(
+            serde_json::from_str::<ChatCompletionRequest>(&tools.replace(
+                "\"name\":\"read_file\"",
+                "\"name\":\"read_file\",\"unknown\":true"
+            ))
             .is_err()
         );
     }
@@ -546,11 +596,15 @@ mod tests {
             messages: vec![
                 Message {
                     role: "user".to_owned(),
-                    content: "a".repeat(limit),
+                    content: Some("a".repeat(limit)),
+                    tool_calls: None,
+                    tool_call_id: None,
                 },
                 Message {
                     role: "user".to_owned(),
-                    content: "b".to_owned(),
+                    content: Some("b".to_owned()),
+                    tool_calls: None,
+                    tool_call_id: None,
                 },
             ],
             params: CompletionParams::default(),

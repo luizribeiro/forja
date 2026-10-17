@@ -809,7 +809,9 @@ mod tests {
             model: "test".to_owned(),
             messages: vec![crate::Message {
                 role: "user".to_owned(),
-                content: "hello".to_owned(),
+                content: Some("hello".to_owned()),
+                tool_calls: None,
+                tool_call_id: None,
             }],
             params: crate::CompletionParams::default(),
         };

@@ -18,8 +18,10 @@ pub use engine::{
 };
 pub use http::{ChatService, DrainHandle, chat_router, serving_router};
 pub use request::{
-    ChatCompletionRequest, CompletionParams, CompletionRequest, Message, ResolvedParams, Stop,
-    StreamOptions, ValidationError, serving_context_ceiling, validate_chat, validate_completion,
+    ChatCompletionRequest, CompletionParams, CompletionRequest, FunctionCall, FunctionDefinition,
+    Message, NamedFunction, NamedToolChoice, ResolvedParams, ResponseFormat, Stop, StreamOptions,
+    Tool, ToolCall, ToolChoice, ValidationError, serving_context_ceiling, validate_chat,
+    validate_completion,
 };
 pub use response::{chat_response, text_response};
 pub use stop::{StopMatcher, StopOutput};
