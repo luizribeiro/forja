@@ -576,11 +576,37 @@ where
             return Err(GenerationError::cancelled());
         }
         let ledger = PrefixLedger::new(tokens.clone());
+        let (cached_len, live_len) = self.live_prefix.as_ref().map_or((0, 0), |prefix| {
+            (
+                prefix.match_len(self.prefix_namespace, &tokens),
+                prefix.len(),
+            )
+        });
+        let start_pos = u32::try_from(cached_len)
+            .map_err(|_| GenerationError::new("cached prefix length overflowed"))?;
+        if cached_len > 0 && cached_len < live_len {
+            let rewind = self
+                .runner
+                .rewind_decode(start_pos)
+                .await
+                .map_err(|error| {
+                    GenerationError::unavailable(format!("prefix rewind failed: {error}"))
+                })
+                .and_then(|result| {
+                    result.map_err(|error| {
+                        GenerationError::unavailable(format!("prefix rewind failed: {error:?}"))
+                    })
+                });
+            if let Err(error) = rewind {
+                self.live_prefix = None;
+                return Err(error);
+            }
+        }
         let first = self
             .runner
             .enqueue_decode(EngineDecode {
-                tokens: Some(tokens),
-                start_pos: 0,
+                tokens: Some(tokens[cached_len..].to_vec()),
+                start_pos,
                 sampling,
             })
             .await

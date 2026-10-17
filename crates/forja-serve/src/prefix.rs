@@ -100,6 +100,9 @@ impl LivePrefix {
             chain,
         }
     }
+    pub(crate) fn len(&self) -> usize {
+        self.tokens.len()
+    }
     pub(crate) fn match_len(&self, namespace: PrefixNamespace, prompt: &[u32]) -> usize {
         if namespace != self.namespace || prompt.is_empty() {
             return 0;
@@ -195,5 +198,18 @@ mod tests {
         replace_live(&mut entry, namespace, Some(PrefixLedger::new(vec![1])));
         replace_live(&mut entry, namespace, None);
         assert!(entry.is_none());
+    }
+    #[test]
+    fn reused_suffix_reconstructs_the_full_prompt() {
+        let namespace = PrefixNamespace([4; 32]);
+        let cached = (0..97).collect::<Vec<_>>();
+        let mut next = cached.clone();
+        next.extend(97..130);
+        let prefix = LivePrefix::new(namespace, cached);
+        let reused = prefix.match_len(namespace, &next);
+        let mut reconstructed = prefix.tokens[..reused].to_vec();
+        reconstructed.extend_from_slice(&next[reused..]);
+        assert_eq!(reused, 97);
+        assert_eq!(reconstructed, next);
     }
 }
