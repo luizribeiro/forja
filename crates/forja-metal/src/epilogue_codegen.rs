@@ -536,7 +536,7 @@ mod tests {
             broad_collective < broad_edge && broad_edge < broad_call && broad_call < broad_store
         );
 
-        let grouped_start = source.find("kernel void grouped_quantized_gemm(").unwrap();
+        let grouped_start = source.find("void grouped_quantized_gemm_impl(").unwrap();
         let grouped = &source[grouped_start
             ..source[grouped_start..]
                 .find("kernel void gathered_pair_from_projections(")

@@ -5,6 +5,7 @@ constant uint quant_bits [[function_constant(12)]];
 constant uint quant_group_size [[function_constant(13)]];
 constant uint gather_words_per_thread [[function_constant(14)]];
 constant uint quant_words_per_thread [[function_constant(15)]];
+constant uint grouped_tile_rows [[function_constant(16)]];
 
 struct QuantEmbedParams {
     uint vocab;
@@ -868,7 +869,7 @@ kernel void arrange_expert_routes(
     if (thread_index + 1 == params.experts) {
         atomic_store_explicit(counts + params.experts, scan[thread_index], memory_order_relaxed);
     }
-    scan[thread_index] = count == 0 ? 0 : (count + 15) / 16;
+    scan[thread_index] = count == 0 ? 0 : (count + grouped_tile_rows - 1) / grouped_tile_rows;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint shift = 1; shift < 256; shift <<= 1) {
         uint prefix = scan[thread_index];
@@ -896,35 +897,36 @@ kernel void arrange_expert_routes(
             }
         }
         uint block = thread_index == 0 ? 0 : scan[thread_index - 1];
-        for (uint start = 0; start < count; start += 16) {
-            blocks[block++] = uint3(thread_index, route_offset + start, min(16u, count - start));
+        for (uint start = 0; start < count; start += grouped_tile_rows) {
+            blocks[block++] = uint3(
+                thread_index, route_offset + start, min(grouped_tile_rows, count - start));
         }
     }
 }
 
-kernel void grouped_quantized_gemm(
-    device const uchar *input [[buffer(0)]],
-    device const uchar *packed [[buffer(1)]],
-    device const uchar *scales [[buffer(2)]],
-    device const uchar *biases [[buffer(3)]],
-    device const uint *sorted_routes [[buffer(4)]],
-    device const uint3 *blocks [[buffer(5)]],
-    device uchar *output [[buffer(6)]],
-    constant GatherQuantMatmulParams &params [[buffer(7)]],
-    FORJA_EPILOGUE_ARGUMENTS
-    uint thread_index [[thread_index_in_threadgroup]],
-    uint3 threadgroup_size [[threads_per_threadgroup]],
-    ushort simdgroup [[simdgroup_index_in_threadgroup]],
-    ushort lane [[thread_index_in_simdgroup]],
-    uint3 tile [[threadgroup_position_in_grid]]) {
-    constexpr uint block_rows = 16;
+template <uint block_rows>
+void grouped_quantized_gemm_impl(
+    device const uchar *input,
+    device const uchar *packed,
+    device const uchar *scales,
+    device const uchar *biases,
+    device const uint *sorted_routes,
+    device const uint3 *blocks,
+    device uchar *output,
+    constant GatherQuantMatmulParams &params,
+    FORJA_EPILOGUE_PARAMETERS
+    uint thread_index,
+    uint3 threadgroup_size,
+    ushort simdgroup,
+    ushort lane,
+    uint3 tile,
+    threadgroup float *input_tile,
+    threadgroup float *weight_tile) {
     constexpr uint block_columns = 32;
     constexpr uint block_inner = 32;
     constexpr uint simdgroups_rows = 1;
     constexpr uint simdgroups_columns = 2;
     constexpr uint tile_stride = block_inner + 4;
-    threadgroup float input_tile[block_rows * tile_stride];
-    threadgroup float weight_tile[block_columns * tile_stride];
     uint3 block = blocks[tile.y];
     if (block.x == 0xffffffffu) {
         return;
@@ -943,28 +945,39 @@ kernel void grouped_quantized_gemm(
             inner_origin + block_inner <= params.inner &&
             params.input_offset % 4 == 0 && params.input_row_stride % 4 == 0 &&
             params.input_inner_stride == 1) {
-            uint local_row = thread_index / 4;
-            uint local_inner = (thread_index % 4) * 8;
-            threadgroup float *destination =
-                input_tile + local_row * tile_stride + local_inner;
-            if (local_row < row_count) {
-                uint route = sorted_routes[sorted_origin + local_row];
-                uint input_row = route / params.routes;
-                device const float *source = reinterpret_cast<device const float *>(input) +
-                    params.input_offset + ulong(input_row) * params.input_row_stride +
-                    inner_origin + local_inner;
-                device const float4 *source_vectors =
-                    reinterpret_cast<device const float4 *>(source);
-                threadgroup float4 *destination_vectors =
-                    reinterpret_cast<threadgroup float4 *>(destination);
-#pragma clang loop unroll(full)
-                for (uint read = 0; read < 2; ++read) {
-                    destination_vectors[read] = source_vectors[read];
+            if constexpr (block_rows == 16) {
+                uint local_row = thread_index / 4;
+                uint local_inner = (thread_index % 4) * 8;
+                threadgroup float *destination =
+                    input_tile + local_row * tile_stride + local_inner;
+                if (local_row < row_count) {
+                    uint route = sorted_routes[sorted_origin + local_row];
+                    uint input_row = route / params.routes;
+                    device const float *source = reinterpret_cast<device const float *>(input) +
+                        params.input_offset + ulong(input_row) * params.input_row_stride +
+                        inner_origin + local_inner;
+                    *reinterpret_cast<threadgroup float4 *>(destination) =
+                        *reinterpret_cast<device const float4 *>(source);
+                    *reinterpret_cast<threadgroup float4 *>(destination + 4) =
+                        *reinterpret_cast<device const float4 *>(source + 4);
+                } else {
+                    *reinterpret_cast<threadgroup float4 *>(destination) = 0.0f;
+                    *reinterpret_cast<threadgroup float4 *>(destination + 4) = 0.0f;
                 }
             } else {
-#pragma clang loop unroll(full)
-                for (uint element = 0; element < 8; ++element) {
-                    destination[element] = 0.0f;
+                uint local_row = thread_index / 8;
+                uint local_inner = (thread_index % 8) * 4;
+                threadgroup float4 *destination = reinterpret_cast<threadgroup float4 *>(
+                    input_tile + local_row * tile_stride + local_inner);
+                if (local_row < row_count) {
+                    uint route = sorted_routes[sorted_origin + local_row];
+                    uint input_row = route / params.routes;
+                    device const float *source = reinterpret_cast<device const float *>(input) +
+                        params.input_offset + ulong(input_row) * params.input_row_stride +
+                        inner_origin + local_inner;
+                    *destination = *reinterpret_cast<device const float4 *>(source);
+                } else {
+                    *destination = 0.0f;
                 }
             }
         } else {
@@ -1039,6 +1052,34 @@ kernel void grouped_quantized_gemm(
             }
     }
 }
+
+#define grouped_quantized_gemm_kernel(name, block_rows)                            \
+kernel void name(                                                                  \
+    device const uchar *input [[buffer(0)]],                                        \
+    device const uchar *packed [[buffer(1)]],                                       \
+    device const uchar *scales [[buffer(2)]],                                       \
+    device const uchar *biases [[buffer(3)]],                                       \
+    device const uint *sorted_routes [[buffer(4)]],                                 \
+    device const uint3 *blocks [[buffer(5)]],                                       \
+    device uchar *output [[buffer(6)]],                                             \
+    constant GatherQuantMatmulParams &params [[buffer(7)]],                        \
+    FORJA_EPILOGUE_ARGUMENTS                                                        \
+    uint thread_index [[thread_index_in_threadgroup]],                              \
+    uint3 threadgroup_size [[threads_per_threadgroup]],                             \
+    ushort simdgroup [[simdgroup_index_in_threadgroup]],                            \
+    ushort lane [[thread_index_in_simdgroup]],                                      \
+    uint3 tile [[threadgroup_position_in_grid]]) {                                  \
+    constexpr uint tile_stride = 36;                                                \
+    threadgroup float input_tile[block_rows * tile_stride];                         \
+    threadgroup float weight_tile[32 * tile_stride];                                \
+    grouped_quantized_gemm_impl<block_rows>(                                        \
+        input, packed, scales, biases, sorted_routes, blocks, output, params,       \
+        FORJA_EPILOGUE_VALUES, thread_index, threadgroup_size, simdgroup, lane,     \
+        tile, input_tile, weight_tile);                                             \
+}
+
+grouped_quantized_gemm_kernel(grouped_quantized_gemm, 16)
+grouped_quantized_gemm_kernel(grouped_quantized_gemm_small_m, 8)
 
 kernel void gathered_pair_from_projections(
     device const float *gate [[buffer(0)]],

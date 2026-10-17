@@ -1,9 +1,228 @@
 //! Differential coverage for gathered affine-quantized matrix multiplication.
 
-use forja_core::{Backend, BackendError, CommandList, DType, Op, Slice, Submission};
+use forja_core::{
+    Backend, BackendDispatchData, BackendError, CommandList, DType, Op, Slice, Submission,
+    program::{
+        BinOp, EpilogueSignature, Inst, PreparedEpilogue, Program, ProgramKind, UnOp,
+        prepare_epilogue,
+    },
+};
 use forja_cpu::CpuBackend;
 use forja_metal::MetalBackend;
-use forja_testing::{TensorSpec, assert_backends_agree};
+use forja_testing::{
+    DeterministicValues, TensorSpec, assert_backends_agree, assert_outputs_agree,
+    generated_tensor_bytes,
+};
+
+#[derive(Clone, Copy)]
+struct GroupedCase {
+    rows: u32,
+    routes: u32,
+    experts: u32,
+    inner: u32,
+    columns: u32,
+}
+
+#[test]
+fn metal_grouped_small_m_variants_match_cpu_at_edges() {
+    let mut values = DeterministicValues::new(0x6a09_e667_f3bc_c909);
+    let cpu = CpuBackend::new();
+    let metal = MetalBackend::new().unwrap();
+    for case in [
+        GroupedCase {
+            rows: 1,
+            routes: 64,
+            experts: 9,
+            inner: 64,
+            columns: 1,
+        },
+        GroupedCase {
+            rows: 7,
+            routes: 10,
+            experts: 9,
+            inner: 128,
+            columns: 7,
+        },
+        GroupedCase {
+            rows: 33,
+            routes: 2,
+            experts: 9,
+            inner: 64,
+            columns: 33,
+        },
+        GroupedCase {
+            rows: 64,
+            routes: 1,
+            experts: 9,
+            inner: 192,
+            columns: 65,
+        },
+        GroupedCase {
+            rows: 7,
+            routes: 73,
+            experts: 9,
+            inner: 64,
+            columns: 33,
+        },
+    ] {
+        assert_grouped_case(&cpu, &metal, case, false, &mut values);
+        assert_grouped_case(&cpu, &metal, case, true, &mut values);
+    }
+}
+
+fn assert_grouped_case(
+    cpu: &CpuBackend,
+    metal: &MetalBackend,
+    case: GroupedCase,
+    paired: bool,
+    values: &mut DeterministicValues,
+) {
+    let specs = grouped_specs(case, paired);
+    let bytes = specs
+        .iter()
+        .map(|spec| generated_tensor_bytes(spec, values).unwrap())
+        .collect::<Vec<_>>();
+    let cpu_inputs = allocate_inputs(cpu, &specs, &bytes);
+    let metal_inputs = allocate_inputs(metal, &specs, &bytes);
+    let shape = [case.rows, case.routes, case.columns];
+    let cpu_output = cpu.alloc(DType::F32, &shape).unwrap();
+    let metal_output = metal.alloc(DType::F32, &shape).unwrap();
+    let op = Op::GatherQuantMatmul {
+        bits: 4,
+        group_size: 64,
+    };
+    let epilogue = paired.then(silu_mul_epilogue);
+    submit_grouped(cpu, op, &cpu_inputs, &cpu_output, epilogue.as_ref(), None);
+    let inputs = tensor_refs(&metal_inputs);
+    let variant = metal
+        .validate_variant_for_op(
+            op,
+            &inputs,
+            &[&metal_output],
+            if paired {
+                "gather-quant-matmul.grouped-pair-small-m"
+            } else {
+                "gather-quant-matmul.grouped-small-m"
+            },
+        )
+        .unwrap();
+    submit_grouped(
+        metal,
+        op,
+        &metal_inputs,
+        &metal_output,
+        epilogue.as_ref(),
+        Some(BackendDispatchData::new(variant)),
+    );
+    assert_outputs_agree(
+        DType::F32,
+        &cpu.read(&cpu_output).unwrap(),
+        &metal.read(&metal_output).unwrap(),
+    )
+    .unwrap();
+}
+
+fn grouped_specs(case: GroupedCase, paired: bool) -> Vec<TensorSpec> {
+    let GroupedCase {
+        rows,
+        routes,
+        experts,
+        inner,
+        columns,
+    } = case;
+    let mut specs = vec![
+        TensorSpec::contiguous(DType::F32, &[rows, inner]),
+        TensorSpec::contiguous(DType::U32, &[experts, columns, inner / 8]),
+        TensorSpec::contiguous(DType::F16, &[experts, columns, inner / 64]),
+        TensorSpec::contiguous(DType::F16, &[experts, columns, inner / 64]),
+    ];
+    if paired {
+        specs.extend([
+            TensorSpec::contiguous(DType::U32, &[experts, columns, inner / 8]),
+            TensorSpec::contiguous(DType::F16, &[experts, columns, inner / 64]),
+            TensorSpec::contiguous(DType::F16, &[experts, columns, inner / 64]),
+        ]);
+    }
+    let total = rows * routes;
+    let mut selected = (1..=7)
+        .flat_map(|count| std::iter::repeat_n(count - 1, usize::try_from(count).unwrap()))
+        .collect::<Vec<u32>>();
+    selected.resize(usize::try_from(total).unwrap(), experts - 1);
+    specs.push(TensorSpec::initialized(
+        DType::U32,
+        &[rows, routes],
+        selected.into_iter().flat_map(u32::to_le_bytes).collect(),
+    ));
+    specs
+}
+
+fn silu_mul_epilogue() -> std::sync::Arc<PreparedEpilogue> {
+    prepare_epilogue(
+        Program {
+            kind: ProgramKind::Map,
+            insts: vec![
+                Inst::Input(0),
+                Inst::Input(1),
+                Inst::Unary(UnOp::Neg, 0),
+                Inst::Unary(UnOp::Exp, 2),
+                Inst::Const(1.0),
+                Inst::Binary(BinOp::Add, 4, 3),
+                Inst::Binary(BinOp::Div, 0, 5),
+                Inst::Binary(BinOp::Mul, 6, 1),
+            ],
+            outputs: vec![(0, 7)],
+        }
+        .validate()
+        .unwrap(),
+        EpilogueSignature::new(2, 3, vec![], DType::F32),
+    )
+    .unwrap()
+}
+
+fn submit_grouped<B: Backend>(
+    backend: &B,
+    op: Op,
+    inputs: &[forja_core::Tensor],
+    output: &forja_core::Tensor,
+    epilogue: Option<&std::sync::Arc<PreparedEpilogue>>,
+    variant: Option<BackendDispatchData>,
+) {
+    let mut commands = CommandList::new();
+    let inputs = tensor_refs(inputs);
+    if let Some(epilogue) = epilogue {
+        commands
+            .dispatch_epilogue(op, &inputs, output, epilogue, &[])
+            .unwrap();
+    } else {
+        commands.dispatch(op, &inputs, output).unwrap();
+    }
+    if let Some(variant) = variant {
+        assert!(commands.set_last_backend_data(variant));
+    }
+    backend.submit(commands).unwrap().wait().unwrap();
+}
+
+fn allocate_inputs<B: Backend>(
+    backend: &B,
+    specs: &[TensorSpec],
+    bytes: &[Vec<u8>],
+) -> Vec<forja_core::Tensor> {
+    specs
+        .iter()
+        .zip(bytes)
+        .map(|(spec, bytes)| {
+            let tensor = backend
+                .alloc(spec.dtype(), spec.allocation_shape())
+                .unwrap();
+            backend.write(&tensor, bytes).unwrap();
+            tensor
+        })
+        .collect()
+}
+
+fn tensor_refs(tensors: &[forja_core::Tensor]) -> Vec<&forja_core::Tensor> {
+    tensors.iter().collect()
+}
 
 #[test]
 fn expert_128_projection_shapes_match_cpu() {

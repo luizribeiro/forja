@@ -28,6 +28,8 @@ pub(crate) enum MetalVariant {
     QuantMatmulTiled,
     GatherQuantMatmulPortable,
     GatherQuantMatmulRouteGemv,
+    GatherQuantMatmulGroupedSmallM,
+    GatherQuantMatmulGroupedPairSmallM,
     GatherQuantMatmulGrouped,
     SdpaPortable,
     SdpaDecomposed,
@@ -221,6 +223,7 @@ const EXPERTS: Dimension = dim("experts", PACKED, Axis::Index(0));
 const MATMUL_ROWS: Dimension = dim("rows", INDICES_MATMUL, Axis::Index(0));
 const MATMUL_ROUTES: Dimension = dim("routes", INDICES_MATMUL, Axis::Index(1));
 const PAIRED_MATMUL_ROUTES: Dimension = dim("routes", PAIRED_INDICES_MATMUL, Axis::Index(1));
+const PAIRED_MATMUL_ROWS: Dimension = dim("rows", PAIRED_INDICES_MATMUL, Axis::Index(0));
 const QUERY_HEADS: Dimension = dim("query heads", QUERY, Axis::Index(0));
 const QUERY_LENGTH: Dimension = dim("query length", QUERY, Axis::Index(1));
 const KEY_HEADS: Dimension = dim("key/value heads", KEY, Axis::Index(0));
@@ -347,7 +350,7 @@ const TILED: &[Constraint] = &[
     },
 ];
 
-const fn grouped(rows: Dimension, routes: Dimension) -> [Constraint; 2] {
+const fn grouped(rows: Dimension, routes: Dimension, relation: Relation) -> [Constraint; 2] {
     [
         Constraint::Value {
             value: ValueRef::Product {
@@ -355,16 +358,30 @@ const fn grouped(rows: Dimension, routes: Dimension) -> [Constraint; 2] {
                 left: rows,
                 right: routes,
             },
-            relation: Relation::Range {
-                min: 64,
-                max: u64::MAX,
-            },
+            relation,
         },
         value(EXPERTS, Relation::Range { min: 1, max: 256 }),
     ]
 }
 
-const GROUPED_MATMUL: &[Constraint] = &grouped(MATMUL_ROWS, MATMUL_ROUTES);
+const GROUPED_SMALL_M: &[Constraint] = &grouped(
+    MATMUL_ROWS,
+    MATMUL_ROUTES,
+    Relation::Range { min: 64, max: 511 },
+);
+const GROUPED_PAIR_SMALL_M: &[Constraint] = &grouped(
+    PAIRED_MATMUL_ROWS,
+    PAIRED_MATMUL_ROUTES,
+    Relation::Range { min: 64, max: 511 },
+);
+const GROUPED_MATMUL: &[Constraint] = &grouped(
+    MATMUL_ROWS,
+    MATMUL_ROUTES,
+    Relation::Range {
+        min: 64,
+        max: u64::MAX,
+    },
+);
 const ROUTE_GEMV: &[Constraint] = &[value(MATMUL_ROUTES, Relation::Range { min: 1, max: 8 })];
 const PAIRED_ROUTE_GEMV: &[Constraint] = &[value(
     PAIRED_MATMUL_ROUTES,
@@ -578,6 +595,24 @@ pub(crate) static REGISTRY: &[VariantDef<MetalVariant>] = &[
         &["fewer than 64 routed rows or more than 256 experts."],
         &["enough routes to amortize grouping."],
         &["Executes each routed row directly."]
+    ),
+    variant!(
+        "gather-quant-matmul.grouped-small-m",
+        GatherQuantMatmul,
+        GatherQuantMatmulGroupedSmallM,
+        GROUPED_SMALL_M,
+        &["64 through 511 routed rows with at most 256 experts."],
+        &["larger routed batches with enough rows to fill 16-row tiles."],
+        &["Groups routes into 8-row expert tiles."]
+    ),
+    variant!(
+        "gather-quant-matmul.grouped-pair-small-m",
+        GatherQuantMatmul,
+        GatherQuantMatmulGroupedPairSmallM,
+        GROUPED_PAIR_SMALL_M,
+        &["paired projections with 64 through 511 routed rows."],
+        &["single projections or larger routed batches."],
+        &["Groups paired projections into 8-row expert tiles."]
     ),
     variant!(
         "gather-quant-matmul.grouped",
@@ -1600,6 +1635,16 @@ mod tests {
                 "gather_quantized_gemv",
             ),
             (
+                "gather-quant-matmul.grouped-small-m",
+                gathered_dispatch(64, 1, 256, 1),
+                "grouped_quantized_gemm_small_m",
+            ),
+            (
+                "gather-quant-matmul.grouped-pair-small-m",
+                gathered_dispatch(8, 8, 128, 2),
+                "gathered_pair_from_projections_small_m",
+            ),
+            (
                 "gather-quant-matmul.grouped",
                 gathered_dispatch(64, 1, 256, 1),
                 "grouped_quantized_gemm",
@@ -1674,6 +1719,36 @@ mod tests {
             (
                 quant_dispatch(DType::BF16, 16, 64, true),
                 "quant-matmul.tiled",
+                false,
+            ),
+            (
+                gathered_dispatch(63, 1, 256, 1),
+                "gather-quant-matmul.grouped-small-m",
+                false,
+            ),
+            (
+                gathered_dispatch(64, 1, 256, 1),
+                "gather-quant-matmul.grouped-small-m",
+                true,
+            ),
+            (
+                gathered_dispatch(511, 1, 256, 1),
+                "gather-quant-matmul.grouped-small-m",
+                true,
+            ),
+            (
+                gathered_dispatch(512, 1, 256, 1),
+                "gather-quant-matmul.grouped-small-m",
+                false,
+            ),
+            (
+                gathered_dispatch(8, 8, 128, 2),
+                "gather-quant-matmul.grouped-pair-small-m",
+                true,
+            ),
+            (
+                gathered_dispatch(64, 8, 128, 2),
+                "gather-quant-matmul.grouped-pair-small-m",
                 false,
             ),
             (

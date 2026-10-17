@@ -220,6 +220,7 @@ struct EncoderTensor {
 fn gather_quant_params(
     tensors: [&EncoderTensor; 6],
     config: (u8, u32),
+    block_rows: u32,
 ) -> Result<(Vec<u8>, [u32; 3]), BackendError> {
     let [input, packed, scales, biases, indices, output] = tensors;
     let (bits, group_size) = config;
@@ -238,7 +239,7 @@ fn gather_quant_params(
         .shape()
         .try_into()
         .map_err(|_| BackendError::InvalidInput)?;
-    let grouped = GroupedRouteShape::new(rows, routes, experts)?;
+    let grouped = GroupedRouteShape::new(rows, routes, experts, block_rows)?;
     let mut params = Vec::with_capacity(212);
     for value in [
         input.layout.offset(),
@@ -354,12 +355,12 @@ fn weighted_gather_schedule(routes: u32) -> Result<WeightedGatherSchedule, Backe
 }
 
 impl GroupedRouteShape {
-    fn new(rows: u32, routes: u32, experts: u32) -> Result<Self, BackendError> {
+    fn new(rows: u32, routes: u32, experts: u32, block_rows: u32) -> Result<Self, BackendError> {
         let route_count = u64::from(rows)
             .checked_mul(u64::from(routes))
             .ok_or(BackendError::InvalidInput)?;
         let block_capacity = route_count
-            .div_ceil(16)
+            .div_ceil(u64::from(block_rows))
             .checked_add(u64::from(experts))
             .ok_or(BackendError::InvalidInput)?;
         let block_elements = block_capacity
@@ -376,7 +377,28 @@ impl GroupedRouteShape {
 }
 
 fn grouped_gather_dispatch(dispatch: &Dispatch) -> bool {
-    selected_variant(dispatch) == Some(MetalVariant::GatherQuantMatmulGrouped)
+    matches!(
+        selected_variant(dispatch),
+        Some(
+            MetalVariant::GatherQuantMatmulGrouped
+                | MetalVariant::GatherQuantMatmulGroupedSmallM
+                | MetalVariant::GatherQuantMatmulGroupedPairSmallM
+        )
+    )
+}
+
+fn grouped_block_rows(dispatch: &Dispatch) -> u32 {
+    if matches!(
+        selected_variant(dispatch),
+        Some(
+            MetalVariant::GatherQuantMatmulGroupedSmallM
+                | MetalVariant::GatherQuantMatmulGroupedPairSmallM
+        )
+    ) {
+        8
+    } else {
+        16
+    }
 }
 
 fn grouped_error_flag(arguments: &mut ArgumentWriter) -> Result<BufferBinding, BackendError> {
@@ -3148,8 +3170,9 @@ impl MetalBackend {
         let (params, [rows, routes, columns]) = gather_quant_params(
             [&input, &packed, &scales, &biases, &indices, &output],
             (bits, group_size),
+            grouped_block_rows(dispatch),
         )?;
-        if selected_variant(dispatch) == Some(MetalVariant::GatherQuantMatmulGrouped) {
+        if grouped_gather_dispatch(dispatch) {
             return self.encode_grouped_quant_matmul(
                 encoder,
                 table,
@@ -3353,6 +3376,7 @@ impl MetalBackend {
                 &output,
             ],
             config,
+            grouped_block_rows(dispatch),
         )?;
         let (second_params, _) = gather_quant_params(
             [
@@ -3364,8 +3388,9 @@ impl MetalBackend {
                 &output,
             ],
             config,
+            grouped_block_rows(dispatch),
         )?;
-        if selected_variant(dispatch) == Some(MetalVariant::GatherQuantMatmulGrouped) {
+        if grouped_gather_dispatch(dispatch) {
             return self.encode_grouped_quant_pair(
                 encoder,
                 table,
@@ -3481,7 +3506,8 @@ impl MetalBackend {
         let params = arguments.write(params)?;
         let error_flag = grouped_error_flag(arguments)?;
         let experts = packed.layout.shape()[0];
-        let grouped = GroupedRouteShape::new(shape[0], shape[1], experts)?;
+        let block_rows = grouped_block_rows(dispatch);
+        let grouped = GroupedRouteShape::new(shape[0], shape[1], experts, block_rows)?;
         let sorted = self.scratch_tensor(DType::U32, &[grouped.route_count])?;
         let offsets = self.scratch_tensor(
             DType::U32,
@@ -3498,6 +3524,7 @@ impl MetalBackend {
             output,
             &params,
             &error_flag,
+            block_rows,
             bindings,
         )?;
         encode_dispatch_barrier(encoder);
@@ -3509,6 +3536,7 @@ impl MetalBackend {
             &params,
             shape,
             grouped,
+            block_rows,
             config,
             dispatch.prepared_epilogue().map(AsRef::as_ref),
             bindings,
@@ -3549,7 +3577,8 @@ impl MetalBackend {
             output,
         ] = tensors;
         let experts = gate_packed.layout.shape()[0];
-        let grouped = GroupedRouteShape::new(shape[0], shape[1], experts)?;
+        let block_rows = grouped_block_rows(dispatch);
+        let grouped = GroupedRouteShape::new(shape[0], shape[1], experts, block_rows)?;
         let gate = self.scratch_tensor(DType::F32, &shape)?;
         let up = self.scratch_tensor(DType::F32, &shape)?;
         let sorted = self.scratch_tensor(DType::U32, &[grouped.route_count])?;
@@ -3561,10 +3590,12 @@ impl MetalBackend {
         let (gate_qmm_params, _) = gather_quant_params(
             [input, gate_packed, gate_scales, gate_biases, indices, &gate],
             config,
+            block_rows,
         )?;
         let (up_qmm_params, _) = gather_quant_params(
             [input, up_packed, up_scales, up_biases, indices, &up],
             config,
+            block_rows,
         )?;
         let final_params = arguments.write(&params[0])?;
         let gate_qmm_params = arguments.write(&gate_qmm_params)?;
@@ -3580,6 +3611,7 @@ impl MetalBackend {
             output,
             &final_params,
             &error_flag,
+            block_rows,
             bindings,
         )?;
         encode_dispatch_barrier(encoder);
@@ -3598,6 +3630,7 @@ impl MetalBackend {
             &gate_qmm_params,
             shape,
             grouped,
+            block_rows,
             config,
             None,
             bindings,
@@ -3611,6 +3644,7 @@ impl MetalBackend {
             &up_qmm_params,
             shape,
             grouped,
+            block_rows,
             config,
             None,
             bindings,
@@ -3681,6 +3715,7 @@ impl MetalBackend {
         output: &EncoderTensor,
         params: &BufferBinding,
         error_flag: &BufferBinding,
+        block_rows: u32,
         bindings: &mut ArgumentBindings,
     ) -> Result<(), BackendError> {
         let count_pipeline = self
@@ -3716,7 +3751,7 @@ impl MetalBackend {
             .pipelines
             .lock()
             .map_err(|_| BackendError::ExecutionFailed)?
-            .get("arrange_expert_routes", &[])?;
+            .get("arrange_expert_routes", &[(16, block_rows)])?;
         set_pipeline(encoder, &arrange_pipeline);
         bindings.bind(table, 0, &indices.buffer);
         bindings.bind(table, 1, &sorted.buffer);
@@ -3749,6 +3784,7 @@ impl MetalBackend {
         params: &BufferBinding,
         shape: [u32; 3],
         grouped: GroupedRouteShape,
+        block_rows: u32,
         config: (u8, u32),
         epilogue: Option<&PreparedEpilogue>,
         bindings: &mut ArgumentBindings,
@@ -3760,20 +3796,26 @@ impl MetalBackend {
             (2, dtype_code(output.layout.dtype())),
             (12, u32::from(config.0)),
             (13, config.1),
+            (16, block_rows),
         ];
         let mut pipelines = self
             .pipelines
             .lock()
             .map_err(|_| BackendError::ExecutionFailed)?;
+        let kernel = if block_rows == 8 {
+            "grouped_quantized_gemm_small_m"
+        } else {
+            "grouped_quantized_gemm"
+        };
         let pipeline = if let Some(epilogue) = epilogue {
             pipelines.lookup_epilogue(
                 epilogue_codegen::FamilySourceTag::GatherQuant,
                 epilogue,
-                "grouped_quantized_gemm",
+                kernel,
                 &constants,
             )?
         } else {
-            pipelines.get("grouped_quantized_gemm", &constants)?
+            pipelines.get(kernel, &constants)?
         };
         drop(pipelines);
         set_pipeline(encoder, &pipeline);
@@ -6436,6 +6478,8 @@ fn supported_dispatch(dispatch: &Dispatch) -> bool {
                     | MetalVariant::QuantMatmulTiled
                     | MetalVariant::GatherQuantMatmulPortable
                     | MetalVariant::GatherQuantMatmulRouteGemv
+                    | MetalVariant::GatherQuantMatmulGroupedSmallM
+                    | MetalVariant::GatherQuantMatmulGroupedPairSmallM
                     | MetalVariant::GatherQuantMatmulGrouped
             )
         )
@@ -6555,11 +6599,19 @@ pub(super) fn dispatch_kernel(dispatch: &Dispatch) -> Result<&'static str, Backe
                     .ok_or(BackendError::InvalidInput)?;
                 weighted_gather_schedule(*routes)?.implementation
             } else if dispatch.primitive_inputs().len() == 8 && grouped_gather_dispatch(dispatch) {
-                "gathered_pair_from_projections"
+                if grouped_block_rows(dispatch) == 8 {
+                    "gathered_pair_from_projections_small_m"
+                } else {
+                    "gathered_pair_from_projections"
+                }
             } else if dispatch.primitive_inputs().len() == 8 {
                 "gather_quantized_pair"
             } else if grouped_gather_dispatch(dispatch) {
-                "grouped_quantized_gemm"
+                if grouped_block_rows(dispatch) == 8 {
+                    "grouped_quantized_gemm_small_m"
+                } else {
+                    "grouped_quantized_gemm"
+                }
             } else {
                 "gather_quantized_gemv"
             }
@@ -6806,7 +6858,9 @@ pub(super) fn variant_supported(
         MetalVariant::QuantMatmulTiled => {
             quant_matmul_kernel(dispatch)?.starts_with("quantized_gemm_tiled_")
         }
-        MetalVariant::GatherQuantMatmulGrouped => grouped_gather_dispatch(dispatch),
+        MetalVariant::GatherQuantMatmulGrouped
+        | MetalVariant::GatherQuantMatmulGroupedSmallM
+        | MetalVariant::GatherQuantMatmulGroupedPairSmallM => grouped_gather_dispatch(dispatch),
         MetalVariant::SdpaVectorSinglePass => {
             vector_sdpa_supported(dispatch)?
                 && shape3(dispatch.inputs()[1].layout())?[1] < VECTOR_TWO_PASS_MIN_KEY_LENGTH
@@ -7348,11 +7402,17 @@ fn gather_epilogue_requests(
             parameter_dependent,
         );
     }
-    if selected_variant(dispatch) == Some(MetalVariant::GatherQuantMatmulGrouped) {
+    if grouped_gather_dispatch(dispatch) {
+        let block_rows = grouped_block_rows(dispatch);
+        constants.push((16, block_rows));
         return Ok(vec![EpiloguePipelineRequest {
             family: epilogue_codegen::FamilySourceTag::GatherQuant,
             epilogue,
-            implementation: "grouped_quantized_gemm",
+            implementation: if block_rows == 8 {
+                "grouped_quantized_gemm_small_m"
+            } else {
+                "grouped_quantized_gemm"
+            },
             constants,
         }]);
     }
@@ -7406,7 +7466,7 @@ fn paired_gather_epilogue_requests(
     constants: &[(u32, u32)],
     parameter_dependent: bool,
 ) -> Result<Vec<EpiloguePipelineRequest>, BackendError> {
-    if selected_variant(dispatch) == Some(MetalVariant::GatherQuantMatmulGrouped) {
+    if grouped_gather_dispatch(dispatch) {
         return Ok(vec![EpiloguePipelineRequest {
             family: epilogue_codegen::FamilySourceTag::GatherQuant,
             epilogue,
@@ -9015,6 +9075,26 @@ mod tests {
         assert!(pipelines.epilogue_pipelines.is_empty());
     }
 
+    fn push_grouped_epilogue_requests(
+        requests: &mut Vec<EpiloguePipelineRequest>,
+        epilogue: &Arc<PreparedEpilogue>,
+        constants: &[(u32, u32)],
+    ) {
+        for (implementation, block_rows) in [
+            ("grouped_quantized_gemm", 16),
+            ("grouped_quantized_gemm_small_m", 8),
+        ] {
+            let mut constants = constants.to_vec();
+            constants.push((16, block_rows));
+            requests.push(EpiloguePipelineRequest {
+                family: epilogue_codegen::FamilySourceTag::GatherQuant,
+                epilogue: Arc::clone(epilogue),
+                implementation,
+                constants,
+            });
+        }
+    }
+
     #[test]
     fn metal_eager_epilogue_specializations_cover_every_boundary_arm() {
         let backend = MetalBackend::new().unwrap();
@@ -9088,12 +9168,7 @@ mod tests {
                 constants,
             });
         }
-        requests.push(EpiloguePipelineRequest {
-            family: epilogue_codegen::FamilySourceTag::GatherQuant,
-            epilogue,
-            implementation: "grouped_quantized_gemm",
-            constants: gather_constants,
-        });
+        push_grouped_epilogue_requests(&mut requests, &epilogue, &gather_constants);
 
         let mut pipelines = backend.pipelines.lock().unwrap();
         pipelines.prepare_epilogue_pipelines(&requests).unwrap();
