@@ -690,7 +690,7 @@ impl Qwen3Coder {
             #[cfg(target_family = "wasm")]
             replay: config.replay,
             #[cfg(target_family = "wasm")]
-            decode: DecodeState::new(MAX_CONTEXT)?,
+            decode: DecodeState::new(MAX_CONTEXT, VOCAB)?,
             #[cfg(target_family = "wasm")]
             prefill: Some(ChunkedPrefill::new(MAX_CONTEXT, DEFAULT_PREFILL_CHUNK)?),
         })
@@ -935,6 +935,62 @@ impl Engine for Qwen3Coder {
             )),
         }
     }
+
+    #[cfg(target_family = "wasm")]
+    fn begin_decode(&mut self, input: forja_sdk::BeginDecodeInput) -> Result<Tensor<f32>> {
+        if !self.replay || input.start_pos >= MAX_CONTEXT {
+            return Err(forja_sdk::Error::loading(
+                "constrained decode requires replay within context",
+            ));
+        }
+        if let Some(tokens) = input.tokens.as_ref()
+            && tokens.shape() != [1]
+        {
+            return Err(forja_sdk::Error::loading(
+                "constrained decode accepts exactly one input token",
+            ));
+        }
+        self.replay_decode(
+            input.tokens.as_ref(),
+            input.start_pos,
+            DecodeSelection::None,
+        )
+    }
+
+    #[cfg(target_family = "wasm")]
+    fn finish_decode(
+        &mut self,
+        logits: &Tensor<f32>,
+        start_pos: u32,
+        sampling: forja_sdk::SamplingParams,
+        allow: &[u32],
+    ) -> Result<forja_sdk::DecodeOutput> {
+        self.decode.select(sampling)?;
+        self.decode.write_allow(allow)?;
+        if self.decode.masked_graph().is_none() {
+            let graph = self.capture_masked_selection(logits, start_pos)?;
+            self.decode.set_masked_graph(graph);
+        }
+        let graph = self
+            .decode
+            .masked_graph()
+            .ok_or_else(|| forja_sdk::Error::loading("masked selection graph was not captured"))?;
+        graph.replay(&[start_pos])?;
+        let next_pos = start_pos
+            .checked_add(1)
+            .ok_or_else(|| forja_sdk::Error::loading("decode position overflowed"))?;
+        let token = graph.result().alias()?;
+        self.decode.advance(next_pos);
+        Ok(forja_sdk::DecodeOutput {
+            logits: logits.alias()?,
+            token,
+        })
+    }
+
+    #[cfg(target_family = "wasm")]
+    fn rewind_decode(&mut self, next_pos: u32) -> Result<()> {
+        self.decode.rewind(next_pos)
+    }
 }
 
 #[cfg(target_family = "wasm")]
@@ -1053,6 +1109,29 @@ impl Qwen3Coder {
         })
     }
 
+    #[cfg(target_family = "wasm")]
+    fn capture_masked_selection(
+        &mut self,
+        logits: &Tensor<f32>,
+        start_pos: u32,
+    ) -> Result<forja_sdk::Graph<Tensor<u32>>> {
+        let position = forja_sdk::Param::new(0..=MAX_CONTEXT - 1)?;
+        let start = position.at(start_pos);
+        let sampling = self.decode.sampling()?;
+        let allow = self.decode.allow()?;
+        let mut feedback = self.decode.token()?;
+        let output_tokens = self.decode.output_tokens()?;
+        forja_sdk::capture(&[&position], || {
+            let selected =
+                logits
+                    .reshape(&[1, VOCAB])?
+                    .sample_masked(&sampling, &allow, start.clone())?;
+            selected.copy_into(&mut feedback)?;
+            selected.copy_into(&mut output_tokens.narrow(0, start, 1)?)?;
+            Ok(selected)
+        })
+    }
+
     fn decode_selected(
         &mut self,
         tokens: Option<&Tensor<u32>>,
@@ -1060,6 +1139,10 @@ impl Qwen3Coder {
         selection: DecodeSelection,
     ) -> Result<forja_sdk::DecodeOutput> {
         let logits = self.replay_decode(tokens, start_pos, selection)?;
+        let next_pos = start_pos
+            .checked_add(1)
+            .ok_or_else(|| forja_sdk::Error::loading("decode position overflowed"))?;
+        self.decode.advance(next_pos);
         Ok(forja_sdk::DecodeOutput {
             logits,
             token: self.decode.selected(start_pos)?,
@@ -1071,6 +1154,10 @@ impl Qwen3Coder {
             .reshape(&[1, VOCAB])?
             .sample(&self.decode.sampling()?, slot)?;
         let token = self.decode.store_selected(&selected, slot)?;
+        self.decode.advance(
+            slot.checked_add(1)
+                .ok_or_else(|| forja_sdk::Error::loading("decode position overflowed"))?,
+        );
         Ok(forja_sdk::DecodeOutput { logits, token })
     }
 }

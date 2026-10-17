@@ -814,6 +814,9 @@ pub struct DecodeState {
     sampling: Tensor<u32>,
     sampling_params: Option<SamplingParams>,
     graphs: [Option<Graph<Tensor<f32>>>; 3],
+    allow: Tensor<u32>,
+    masked_graph: Option<Graph<Tensor<u32>>>,
+    next_pos: u32,
 }
 
 #[cfg(target_family = "wasm")]
@@ -823,13 +826,20 @@ impl DecodeState {
     /// # Errors
     ///
     /// Returns an error when a buffer allocation is refused.
-    pub fn new(max_context: u32) -> Result<Self> {
+    pub fn new(max_context: u32, vocab: u32) -> Result<Self> {
+        let mask_words = vocab
+            .checked_add(31)
+            .ok_or_else(|| Error::loading("vocabulary mask size overflowed"))?
+            / 32;
         Ok(Self {
             token: Tensor::zeros(&[1])?,
             output_tokens: Tensor::zeros(&[max_context])?,
             sampling: Tensor::zeros(&[5])?,
             sampling_params: None,
             graphs: [None, None, None],
+            allow: Tensor::zeros(&[mask_words])?,
+            masked_graph: None,
+            next_pos: 0,
         })
     }
 
@@ -890,6 +900,57 @@ impl DecodeState {
     /// Stores the graph captured for a decode path.
     pub fn set_graph(&mut self, selection: DecodeSelection, graph: Graph<Tensor<f32>>) {
         self.graphs[selection as usize] = Some(graph);
+    }
+
+    /// Replaces the fixed constrained-sampling mask.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the mask has the wrong size or the write is refused.
+    pub fn write_allow(&self, allow: &[u32]) -> Result<()> {
+        self.allow.write(allow)
+    }
+
+    /// Returns an alias of the fixed constrained-sampling mask.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the host refuses the metadata-only view.
+    pub fn allow(&self) -> Result<Tensor<u32>> {
+        self.allow.alias()
+    }
+
+    /// Returns the constrained selection graph, when captured.
+    #[must_use]
+    pub const fn masked_graph(&self) -> Option<&Graph<Tensor<u32>>> {
+        self.masked_graph.as_ref()
+    }
+
+    /// Stores the constrained selection graph.
+    pub fn set_masked_graph(&mut self, graph: Graph<Tensor<u32>>) {
+        self.masked_graph = Some(graph);
+    }
+
+    /// Records the position following a selected token.
+    pub const fn advance(&mut self, next_pos: u32) {
+        self.next_pos = next_pos;
+    }
+
+    /// Restores feedback from the token preceding `next_pos`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the rewind does not move backward or feedback cannot be restored.
+    pub fn rewind(&mut self, next_pos: u32) -> Result<()> {
+        if next_pos == 0 || next_pos >= self.next_pos {
+            return Err(Error::loading(
+                "decode rewind must move backward from a nonzero position",
+            ));
+        }
+        let previous = self.output_tokens.narrow(0, next_pos - 1, 1)?;
+        previous.copy_into(&mut self.token.alias()?)?;
+        self.next_pos = next_pos;
+        Ok(())
     }
 
     /// Copies a selected token into feedback and output storage.

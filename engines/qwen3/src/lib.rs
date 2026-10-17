@@ -413,7 +413,7 @@ impl<T: Activation> Qwen3<T> {
             #[cfg(target_family = "wasm")]
             replay: config.replay,
             #[cfg(target_family = "wasm")]
-            decode: DecodeState::new(MAX_CONTEXT)?,
+            decode: DecodeState::new(MAX_CONTEXT, VOCAB)?,
             #[cfg(target_family = "wasm")]
             prefill: Some(ChunkedPrefill::new(MAX_CONTEXT, DEFAULT_PREFILL_CHUNK)?),
         })
