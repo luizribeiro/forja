@@ -4679,22 +4679,23 @@ impl MetalBackend {
     ) -> Result<Vec<BufferBinding>, BackendError> {
         use objc2_metal::MTLSize;
 
-        let kernel = if input.layout.is_contiguous() && output.layout.is_contiguous() {
+        let vectorized = vectorized_copy(&input.layout, &output.layout);
+        let kernel = if vectorized {
+            "copy_contiguous_f32x4"
+        } else if input.layout.is_contiguous() && output.layout.is_contiguous() {
             "copy_contiguous"
         } else {
             "copy_strided"
         };
+        let constants = [
+            (0, dtype_code(input.layout.dtype())),
+            (2, dtype_code(output.layout.dtype())),
+        ];
         let pipeline = self
             .pipelines
             .lock()
             .map_err(|_| BackendError::ExecutionFailed)?
-            .get(
-                kernel,
-                &[
-                    (0, dtype_code(input.layout.dtype())),
-                    (2, dtype_code(output.layout.dtype())),
-                ],
-            )?;
+            .get(kernel, if vectorized { &[] } else { &constants })?;
         set_pipeline(encoder, &pipeline);
         let layouts = vec![
             Self::layout_buffer(&input.layout, arguments)?,
@@ -4705,7 +4706,7 @@ impl MetalBackend {
         bindings.bind(table, 2, &layouts[0]);
         bindings.bind(table, 3, &layouts[1]);
         set_argument_table(encoder, table);
-        let count = usize::try_from(output.layout.element_count())
+        let count = usize::try_from(output.layout.element_count() / if vectorized { 4 } else { 1 })
             .map_err(|_| BackendError::ExecutionFailed)?;
         let width = pipeline.maxTotalThreadsPerThreadgroup().clamp(1, 256);
         dispatch_threadgroups(
@@ -5061,16 +5062,21 @@ impl MetalBackend {
         let rows = u32::try_from(output.layout().element_count())
             .map_err(|_| BackendError::ExecutionFailed)?;
         let scratch = self.scratch_tensor(DType::U32, &[rows, chunks, 2])?;
+        let vectorized = vectorized_argmax(input.layout(), width);
         let (partials_pipeline, finalize_pipeline) = {
             let mut pipelines = self
                 .pipelines
                 .lock()
                 .map_err(|_| BackendError::ExecutionFailed)?;
             (
-                pipelines.get(
-                    "argmax_partials",
-                    &[(0, dtype_code(input.layout().dtype()))],
-                )?,
+                if vectorized {
+                    pipelines.get("argmax_partials_f32x4", &[])?
+                } else {
+                    pipelines.get(
+                        "argmax_partials",
+                        &[(0, dtype_code(input.layout().dtype()))],
+                    )?
+                },
                 pipelines.get("argmax_finalize", &[])?,
             )
         };
@@ -6455,6 +6461,23 @@ fn supported_dispatch(dispatch: &Dispatch) -> bool {
     }
 }
 
+fn vectorized_copy(input: &Layout, output: &Layout) -> bool {
+    input.is_contiguous()
+        && output.is_contiguous()
+        && input.dtype() == DType::F32
+        && output.dtype() == DType::F32
+        && input.offset().is_multiple_of(4)
+        && output.offset().is_multiple_of(4)
+        && output.element_count().is_multiple_of(4)
+}
+
+fn vectorized_argmax(input: &Layout, width: u32) -> bool {
+    input.dtype() == DType::F32
+        && input.is_contiguous()
+        && input.offset().is_multiple_of(4)
+        && width.is_multiple_of(4)
+}
+
 fn dispatch_profile(dispatch: &Dispatch, barrier: bool) -> Result<DispatchProfile, BackendError> {
     Ok(DispatchProfile {
         op: dispatch.op(),
@@ -6485,14 +6508,30 @@ pub(super) fn dispatch_kernel(dispatch: &Dispatch) -> Result<&'static str, Backe
             let [input] = dispatch.inputs() else {
                 return Err(BackendError::InvalidInput);
             };
-            if input.layout().is_contiguous() && dispatch.output().layout().is_contiguous() {
+            if vectorized_copy(input.layout(), dispatch.output().layout()) {
+                "copy_contiguous_f32x4"
+            } else if input.layout().is_contiguous() && dispatch.output().layout().is_contiguous() {
                 "copy_contiguous"
             } else {
                 "copy_strided"
             }
         }
         Op::RmsNorm { .. } => row_kernel(dispatch, "rms_norm_single", "rms_norm_looped")?,
-        Op::Argmax => "argmax_partials+finalize",
+        Op::Argmax => {
+            let [input] = dispatch.inputs() else {
+                return Err(BackendError::InvalidInput);
+            };
+            let width = *input
+                .layout()
+                .shape()
+                .last()
+                .ok_or(BackendError::InvalidInput)?;
+            if vectorized_argmax(input.layout(), width) {
+                "argmax_partials_f32x4+finalize"
+            } else {
+                "argmax_partials+finalize"
+            }
+        }
         Op::TopK { .. } => match selected_variant(dispatch) {
             Some(MetalVariant::TopKSingleK8) => "topk_single",
             Some(MetalVariant::TopKPortable) => "topk_exact_fallback",
@@ -9511,7 +9550,7 @@ mod tests {
         let floats = [DType::F32, DType::F16, DType::BF16];
         for input_dtype in floats {
             for output_dtype in floats {
-                for width in [1, 7, 33, 4097] {
+                for width in [1, 7, 33, 4096, 4097] {
                     assert_backends_agree(
                         &reference,
                         &candidate,

@@ -33,6 +33,18 @@ kernel void copy_contiguous(
     }
 }
 
+kernel void copy_contiguous_f32x4(
+    device const float4 *input [[buffer(0)]],
+    device float4 *output [[buffer(1)]],
+    constant TensorLayout &input_layout [[buffer(2)]],
+    constant TensorLayout &output_layout [[buffer(3)]],
+    uint index [[thread_position_in_grid]]) {
+    uint count = output_layout.element_count / 4u;
+    if (index < count) {
+        output[output_layout.offset / 4u + index] = input[input_layout.offset / 4u + index];
+    }
+}
+
 struct RmsNormParams {
     float eps;
     uint width;
@@ -319,6 +331,38 @@ kernel void argmax_partials(
         float value = load_float(
             input, physical_index(input_layout, row * width + column), input0_dtype);
         best = max(best, argmax_candidate(value, column));
+    }
+    best = argmax_threadgroup_max(
+        best, simd_lane, simd_group, partial_keys, partial_indices);
+    if (lane == 0) {
+        output[row * chunks + chunk] = best;
+    }
+}
+
+kernel void argmax_partials_f32x4(
+    device const float4 *input [[buffer(0)]],
+    device ulong *output [[buffer(1)]],
+    constant TensorLayout &input_layout [[buffer(2)]],
+    constant uint &width [[buffer(3)]],
+    constant uint &chunks [[buffer(4)]],
+    uint group [[threadgroup_position_in_grid]],
+    uint lane [[thread_position_in_threadgroup]],
+    uint group_width [[threads_per_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+    threadgroup uint partial_keys[32];
+    threadgroup uint partial_indices[32];
+    uint row = group / chunks;
+    uint chunk = group % chunks;
+    uint first = chunk * 2048u;
+    uint end = first + min(2048u, width - first);
+    ulong best = 0;
+    for (uint column = first + lane * 4u; column < end; column += group_width * 4u) {
+        float4 values = input[(input_layout.offset + row * width + column) / 4u];
+        best = max(best, argmax_candidate(values.x, column));
+        best = max(best, argmax_candidate(values.y, column + 1u));
+        best = max(best, argmax_candidate(values.z, column + 2u));
+        best = max(best, argmax_candidate(values.w, column + 3u));
     }
     best = argmax_threadgroup_max(
         best, simd_lane, simd_group, partial_keys, partial_indices);
