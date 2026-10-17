@@ -7754,6 +7754,7 @@ mod tests {
     use forja_core::{
         Affine, Backend, BackendDispatchData, CommandList, DType, GraphLimits, Op, ParamSpace,
         RuleArm, Slice, Submission, SymbolicLayout, TemplateTensor, Tensor, VariantRule, ViewOp,
+        correction_sampling_seed,
         program::{
             BinOp, BoundProgram, EpilogueSignature, Inst, KernelSignature, Program, ProgramKind,
             RedOp, UnOp, ValidatedProgram, bind_program, prepare_epilogue, prepare_program,
@@ -7974,6 +7975,35 @@ mod tests {
             .try_into()
             .map(u32::from_le_bytes)
             .map_err(|_| BackendError::ExecutionFailed)
+    }
+
+    fn run_speculate_then_correct<B: Backend>(
+        backend: &B,
+        logits: &[u8],
+        allow: &[u32],
+        seed: u64,
+        position: u32,
+    ) -> Result<(u32, bool), BackendError> {
+        let provisional = run_sample(backend, logits, 8, 1.0, 0, 1.0, seed, position)?;
+        if allow[usize::try_from(provisional / 32).map_err(|_| BackendError::InvalidInput)?]
+            & (1 << (provisional % 32))
+            != 0
+        {
+            Ok((provisional, false))
+        } else {
+            run_masked_sample(
+                backend,
+                logits,
+                8,
+                allow,
+                1.0,
+                0,
+                1.0,
+                correction_sampling_seed(seed),
+                position,
+            )
+            .map(|token| (token, true))
+        }
     }
 
     #[test]
@@ -11491,6 +11521,30 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn metal_speculate_then_correct_matches_cpu() {
+        let reference = CpuBackend::new();
+        let candidate = MetalBackend::new().unwrap();
+        let logits = [0.3_f32, -0.2, 1.1, 0.7, -0.5, 0.2, 0.9, -0.8]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>();
+        let allow = [(1 << 1) | (1 << 4) | (1 << 6)];
+        let seed = 0xfeed_beef_dead_cafe;
+        let mut kept = false;
+        let mut corrected = false;
+        for position in 0..128 {
+            let expected =
+                run_speculate_then_correct(&reference, &logits, &allow, seed, position).unwrap();
+            let actual =
+                run_speculate_then_correct(&candidate, &logits, &allow, seed, position).unwrap();
+            assert_eq!(actual, expected);
+            kept |= !actual.1;
+            corrected |= actual.1;
+        }
+        assert!(kept && corrected);
     }
 
     #[test]

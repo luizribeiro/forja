@@ -13,7 +13,7 @@ use std::{
 };
 
 use forja_config::HostConfig;
-use forja_core::Backend;
+use forja_core::{Backend, correction_sampling_seed};
 use forja_host::{
     EngineBeginDecode, EngineDecode, EngineDecodeOutput, EngineInfo, EngineRunner, EngineTensor,
     SamplingParams,
@@ -733,7 +733,7 @@ where
                     return Err(GenerationError::cancelled());
                 }
                 let has_successor = needs_successor(consumed, params.max_tokens);
-                let speculative_constraint = constrained && greedy_sampling(sampling);
+                let speculative_constraint = constrained;
                 let token = take_pipeline_token(
                     &mut self.runner,
                     &mut pipeline,
@@ -1263,10 +1263,11 @@ where
     }
 }
 
-const fn greedy_sampling(sampling: SamplingParams) -> bool {
-    sampling.temperature == 0.0 || sampling.top_k == 1
-}
-
+/// Keeps an allowed ordinary draw and independently redraws rejected tokens under the mask.
+///
+/// This is rejection sampling: the accepted marginal is the ordinary distribution conditioned
+/// on the allowed set. Domain-separating the correction seed preserves deterministic replay while
+/// ensuring the rejected draw's uniform is never reused.
 async fn select_speculative_token<B>(
     runner: &mut EngineRunner<B>,
     pipeline: &mut DecodePipeline,
@@ -1295,7 +1296,11 @@ where
     }
 
     pipeline.discard_pending(runner).await?;
-    let corrected = finish_selection(runner, &output.logits, start_pos, sampling, allow).await?;
+    let correction = SamplingParams {
+        seed: correction_sampling_seed(sampling.seed),
+        ..sampling
+    };
+    let corrected = finish_selection(runner, &output.logits, start_pos, correction, allow).await?;
     let token = selected_token(runner, corrected).await?;
     let next_pos = start_pos
         .checked_add(1)

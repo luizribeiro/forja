@@ -1561,6 +1561,7 @@ fn encode(source: &[f32], output: DType) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use forja_core::correction_sampling_seed;
     use forja_core::{
         Affine, GraphLimits, GraphTemplate, Op, ParamSpace, Slice, SymbolicLayout, TemplateTensor,
         program::{
@@ -2158,6 +2159,42 @@ mod tests {
                 ));
             }
         }
+    }
+
+    #[test]
+    fn speculate_then_correct_matches_direct_masked_sampling() {
+        let row = [0.3, -0.2, 1.1, 0.7, -0.5, 0.2, 0.9, -0.8];
+        let allow = [(1 << 1) | (1 << 4) | (1 << 6)];
+        let parameters = sampling_parameters(1.0, 0, 1.0, 0xfeed_beef_dead_cafe);
+        let correction = SamplingParameters {
+            seed: correction_sampling_seed(parameters.seed),
+            ..parameters
+        };
+        let trials = 100_000_u32;
+        let mut direct = [0_u32; 8];
+        let mut speculative = [0_u32; 8];
+        for position in 0..trials {
+            let expected = sample_row_masked(&row, parameters, position, &allow).unwrap();
+            direct[usize::try_from(expected).unwrap()] += 1;
+            let provisional = sample_row(&row, parameters, position).unwrap();
+            let actual = if allow[0] & (1 << provisional) != 0 {
+                provisional
+            } else {
+                sample_row_masked(&row, correction, position, &allow).unwrap()
+            };
+            speculative[usize::try_from(actual).unwrap()] += 1;
+        }
+
+        let statistic = [1, 4, 6]
+            .into_iter()
+            .map(|token| {
+                let expected = f64::from(direct[token] + speculative[token]) / 2.0;
+                let difference = f64::from(direct[token]) - expected;
+                2.0 * difference * difference / expected
+            })
+            .sum::<f64>();
+        let p_value = (-statistic / 2.0).exp();
+        assert!(p_value >= 0.01, "chi-square p-value was {p_value}");
     }
 
     #[test]

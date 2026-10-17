@@ -38,6 +38,17 @@ pub use variants::{
     operation_value, render_catalog_json, render_catalog_markdown,
 };
 
+/// Derives the deterministic counter stream used to correct a rejected speculative sample.
+///
+/// Speculate-then-correct keeps an allowed draw from the ordinary stream. A rejected draw is
+/// replaced by an independently sampled draw from the masked distribution. Conditioning on the
+/// allowed set therefore preserves its exact marginal distribution without reusing the rejected
+/// draw's uniform value.
+#[must_use]
+pub const fn correction_sampling_seed(seed: u64) -> u64 {
+    seed ^ (1_u64 << 63)
+}
+
 /// A scalar type stored in an unquantized tensor.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum DType {
@@ -66,7 +77,7 @@ impl DType {
 
 #[cfg(test)]
 mod tests {
-    use super::DType;
+    use super::{DType, correction_sampling_seed};
 
     #[test]
     fn reports_scalar_byte_sizes() {
@@ -75,5 +86,11 @@ mod tests {
         assert_eq!(DType::BF16.byte_size(), 2);
         assert_eq!(DType::I32.byte_size(), 4);
         assert_eq!(DType::U32.byte_size(), 4);
+    }
+
+    #[test]
+    fn correction_sampling_uses_a_distinct_deterministic_stream() {
+        assert_eq!(correction_sampling_seed(17), correction_sampling_seed(17));
+        assert_ne!(correction_sampling_seed(17), 17);
     }
 }
