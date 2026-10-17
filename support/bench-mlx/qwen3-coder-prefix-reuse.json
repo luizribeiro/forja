@@ -1,0 +1,53 @@
+{
+  "schema_version": 1,
+  "implementation": "mlx_lm",
+  "measured_at": "2026-10-17T18:30:39Z",
+  "source_commit": "c9d5c3ecbe249bafbc0c831a05cd28cb24c7ab54",
+  "machine": {
+    "device": "Apple M3 Ultra",
+    "gpu_cores": 80,
+    "os": "macOS 26.6.2"
+  },
+  "software": {
+    "mlx": "0.32.2",
+    "mlx_lm": "0.31.3"
+  },
+  "model": {
+    "id": "mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit",
+    "revision": "6e302ea604ad9ab206367e2c501d1571023e7b6d"
+  },
+  "workload": {
+    "path": "mlx_lm.server /v1/chat/completions over HTTP",
+    "shared_prefix_tokens": 2048,
+    "fresh_tokens": 33,
+    "generated_tokens": 1,
+    "connection_reuse": true,
+    "prefill_step_size": 2048,
+    "sampling": {
+      "temperature": 0.0,
+      "top_k": 0,
+      "top_p": 1.0
+    },
+    "cached": {
+      "prompt_cache_size": 1,
+      "repetitions": 100,
+      "order": ["warm-prefix", "measured-suffix"]
+    },
+    "uncached": {
+      "prompt_cache_size": 0,
+      "repetitions": 30
+    }
+  },
+  "results": {
+    "cached_ttft_us": {
+      "p50": 173230,
+      "p90": 177267,
+      "p99": 178899
+    },
+    "uncached_ttft_us": {
+      "p50": 894973,
+      "p90": 900406,
+      "p99": 908904
+    }
+  }
+}
