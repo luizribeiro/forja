@@ -30,12 +30,22 @@ pub fn render(messages_json: &str, tools_json: &str, options_json: &str) -> Resu
 #[cfg(target_family = "wasm")]
 #[allow(clippy::same_length_and_capacity)]
 mod component {
+    use std::{
+        collections::BTreeMap,
+        sync::{Mutex, OnceLock},
+    };
+
     wit_bindgen::generate!({
         path: "../../wit",
         world: "chat-format-component",
     });
 
-    use exports::l9o::gpu::chat_format::{ChatInfo, Event, GrammarOut, Guest, SamplingDefaults};
+    use exports::l9o::gpu::chat_format::{
+        ChatInfo, Event as WitEvent, GrammarOut, Guest, SamplingDefaults,
+    };
+
+    static PARSERS: OnceLock<Mutex<BTreeMap<u64, super::qwen3_coder_xml::Parser>>> =
+        OnceLock::new();
 
     struct Component;
 
@@ -66,11 +76,41 @@ mod component {
                 .map(|(grammar, trigger)| GrammarOut { grammar, trigger })
         }
 
-        fn parse(_: u64, _: String) -> Result<Vec<Event>, String> {
-            Err("tool parsing is not implemented".to_owned())
+        fn parse(stream: u64, chunk: String) -> Result<Vec<WitEvent>, String> {
+            let parsers = PARSERS.get_or_init(|| Mutex::new(BTreeMap::new()));
+            let mut parsers = parsers
+                .lock()
+                .map_err(|_| "parser state is unavailable".to_owned())?;
+            parsers
+                .entry(stream)
+                .or_default()
+                .parse(&chunk)
+                .map(|events| {
+                    events
+                        .into_iter()
+                        .map(|event| match event {
+                            super::qwen3_coder_xml::Event::TextDelta(value) => {
+                                WitEvent::TextDelta(value)
+                            }
+                            super::qwen3_coder_xml::Event::CallStart(value) => {
+                                WitEvent::CallStart(value)
+                            }
+                            super::qwen3_coder_xml::Event::ArgumentDelta(name, value) => {
+                                WitEvent::ArgumentDelta((name, value))
+                            }
+                            super::qwen3_coder_xml::Event::CallEnd => WitEvent::CallEnd,
+                        })
+                        .collect()
+                })
         }
 
-        fn reset(_: u64) {}
+        fn reset(stream: u64) {
+            if let Some(parsers) = PARSERS.get()
+                && let Ok(mut parsers) = parsers.lock()
+            {
+                parsers.remove(&stream);
+            }
+        }
     }
 
     export!(Component);

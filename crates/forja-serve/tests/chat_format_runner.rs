@@ -91,4 +91,21 @@ fn runs_a_profile_chat_format() {
         .unwrap()
         .unwrap();
     assert!(rendered.contains("A & <B>"));
+    let tools =
+        r#"[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}]"#;
+    let grammar = format.grammar(tools, "\"auto\"", "null").unwrap().unwrap();
+    assert_eq!(grammar.trigger, "<tool_call>\n");
+    let started = format
+        .parse(9, "<tool_call>\n<function=lookup>\n")
+        .unwrap()
+        .unwrap();
+    assert!(matches!(&started[..], [ChatEvent::CallStart(name)] if name == "lookup"));
+    let events = format
+        .parse(9, "</function>\n</tool_call>")
+        .unwrap()
+        .unwrap();
+    assert!(matches!(&events[..], [ChatEvent::CallEnd]));
+    format.reset(9).unwrap();
+    let reset = format.parse(9, "plain").unwrap().unwrap();
+    assert!(matches!(&reset[..], [ChatEvent::TextDelta(text)] if text == "plain"));
 }
