@@ -700,6 +700,7 @@ where
         .await
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn decode(
         &mut self,
         prefill: PrefilledPrompt,
@@ -713,6 +714,7 @@ where
             constraint,
             mut guidance,
             mut constrained,
+            mut allow,
             mut pipeline,
             mut tool_parser,
         } = self.start_decode(prefill, sender, control).await?;
@@ -731,11 +733,17 @@ where
                     return Err(GenerationError::cancelled());
                 }
                 let has_successor = needs_successor(consumed, params.max_tokens);
-                pipeline
-                    .queue_successor(&mut self.runner, constrained, has_successor, sampling)
-                    .await?;
-                let output = pipeline.take_active()?;
-                let token = selected_token(&mut self.runner, output).await?;
+                let speculative_constraint = constrained && greedy_sampling(sampling);
+                let token = take_pipeline_token(
+                    &mut self.runner,
+                    &mut pipeline,
+                    constrained,
+                    speculative_constraint,
+                    has_successor,
+                    sampling,
+                    allow.as_deref(),
+                )
+                .await?;
                 consumed += 1;
                 if !constrained {
                     unconstrained_consumed += 1;
@@ -753,13 +761,18 @@ where
                     GenerationError::new(format!("cannot decode token: {error}"))
                 })?;
                 if constrained {
-                    parse_tool_piece(&mut tool_parser, piece, sender, control).await?;
-                    if process_constrained_token(
+                    if process_constraint_step(
                         &mut self.runner,
-                        guidance.as_ref(),
-                        token,
                         &mut pipeline,
+                        &mut tool_parser,
+                        guidance.as_ref(),
+                        &mut allow,
+                        token,
+                        piece,
+                        speculative_constraint,
                         sampling,
+                        sender,
+                        control,
                     )
                     .await?
                     {
@@ -774,17 +787,19 @@ where
                     return Ok(FinishReason::Stop);
                 }
                 if matches!(action, BoundaryAction::Activate) && consumed < params.max_tokens {
-                    seed_tool_parser(&mut tool_parser, sender, control).await?;
-                    guidance = Some(
-                        activate_at_boundary(
-                            &mut pipeline,
-                            &mut self.runner,
-                            &self.guidance,
-                            constraint.as_ref(),
-                            sampling,
-                        )
-                        .await?,
-                    );
+                    let (session, mask) = activate_tool_boundary(
+                        &mut pipeline,
+                        &mut self.runner,
+                        &self.guidance,
+                        constraint.as_ref(),
+                        sampling,
+                        &mut tool_parser,
+                        sender,
+                        control,
+                    )
+                    .await?;
+                    guidance = Some(session);
+                    allow = Some(mask);
                     constrained = true;
                 }
             }
@@ -868,6 +883,7 @@ struct DecodeStart {
     constraint: Option<ConstraintPlan>,
     guidance: Option<GuidanceSession>,
     constrained: bool,
+    allow: Option<Vec<u32>>,
     pipeline: DecodePipeline,
     tool_parser: Option<ToolParser>,
 }
@@ -895,8 +911,9 @@ where
         .ok_or_else(|| GenerationError::new("prefill position underflowed"))?;
     let constrained = constraint.as_ref().is_some_and(|plan| plan.forced);
     let mut guidance = None;
+    let mut allow = None;
     if constrained {
-        let (output, session) = initial_constraint(
+        let (output, session, mask) = initial_constraint(
             runner,
             worker,
             constraint.as_ref(),
@@ -907,6 +924,7 @@ where
         .await?;
         first = output;
         guidance = Some(session);
+        allow = Some(mask);
     }
     let tool_parser =
         start_tool_parser(constraint.as_ref(), prompt, constrained, sender, control).await?;
@@ -917,6 +935,7 @@ where
         constraint,
         guidance,
         constrained,
+        allow,
         pipeline: DecodePipeline::new(first, first_pos, prompt_tokens),
         tool_parser,
     })
@@ -943,10 +962,9 @@ impl DecodePipeline {
         self.active = self.pending.pop_front();
     }
 
-    fn take_active(&mut self) -> Result<EngineDecodeOutput, GenerationError> {
+    fn take_active(&mut self) -> Result<PendingDecode, GenerationError> {
         self.active
             .take()
-            .map(|(output, _)| output)
             .ok_or_else(|| GenerationError::new("active decode output is missing"))
     }
 
@@ -998,6 +1016,16 @@ impl DecodePipeline {
             (Ok(()), Ok(())) => Ok(()),
             (Err(error), _) | (Ok(()), Err(error)) => Err(error),
         }
+    }
+
+    async fn discard_pending<B>(
+        &mut self,
+        runner: &mut EngineRunner<B>,
+    ) -> Result<(), GenerationError>
+    where
+        B: Backend + Send + Sync + 'static,
+    {
+        finalize_sequence(runner, &mut self.pending, None).await
     }
 }
 
@@ -1087,14 +1115,14 @@ async fn initial_constraint<B>(
     first: &EngineDecodeOutput,
     start_pos: u32,
     sampling: SamplingParams,
-) -> Result<(EngineDecodeOutput, GuidanceSession), GenerationError>
+) -> Result<(EngineDecodeOutput, GuidanceSession, Vec<u32>), GenerationError>
 where
     B: Backend + Send + Sync + 'static,
 {
     let session = compile_constraint(worker, plan).await?;
     let allow = next_mask(&session).await?;
     let output = finish_selection(runner, &first.logits, start_pos, sampling, &allow).await?;
-    Ok((output, session))
+    Ok((output, session, allow))
 }
 
 async fn enqueue_unconstrained<B>(
@@ -1171,6 +1199,138 @@ where
     read_token(&bytes)
 }
 
+async fn take_pipeline_token<B>(
+    runner: &mut EngineRunner<B>,
+    pipeline: &mut DecodePipeline,
+    constrained: bool,
+    speculative_constraint: bool,
+    has_successor: bool,
+    sampling: SamplingParams,
+    allow: Option<&[u32]>,
+) -> Result<u32, GenerationError>
+where
+    B: Backend + Send + Sync + 'static,
+{
+    pipeline
+        .queue_successor(
+            runner,
+            constrained && !speculative_constraint,
+            has_successor,
+            sampling,
+        )
+        .await?;
+    let (output, start_pos) = pipeline.take_active()?;
+    if speculative_constraint {
+        select_speculative_token(
+            runner,
+            pipeline,
+            output,
+            start_pos,
+            sampling,
+            allow,
+            has_successor,
+        )
+        .await
+    } else {
+        selected_token(runner, output).await
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn process_constraint_step<B>(
+    runner: &mut EngineRunner<B>,
+    pipeline: &mut DecodePipeline,
+    parser: &mut Option<ToolParser>,
+    guidance: Option<&GuidanceSession>,
+    allow: &mut Option<Vec<u32>>,
+    token: u32,
+    piece: Option<String>,
+    speculative: bool,
+    sampling: SamplingParams,
+    sender: Option<&mpsc::Sender<GenerationEvent>>,
+    control: &GenerationControl,
+) -> Result<bool, GenerationError>
+where
+    B: Backend + Send + Sync + 'static,
+{
+    parse_tool_piece(parser, piece, sender, control).await?;
+    if speculative {
+        let (complete, next) = advance_speculative_constraint(guidance, token).await?;
+        *allow = next;
+        Ok(complete)
+    } else {
+        process_constrained_token(runner, guidance, token, pipeline, sampling).await
+    }
+}
+
+const fn greedy_sampling(sampling: SamplingParams) -> bool {
+    sampling.temperature == 0.0 || sampling.top_k == 1
+}
+
+async fn select_speculative_token<B>(
+    runner: &mut EngineRunner<B>,
+    pipeline: &mut DecodePipeline,
+    output: EngineDecodeOutput,
+    start_pos: u32,
+    sampling: SamplingParams,
+    allow: Option<&[u32]>,
+    has_successor: bool,
+) -> Result<u32, GenerationError>
+where
+    B: Backend + Send + Sync + 'static,
+{
+    let bytes = runner
+        .read_queued_token_retained(&output)
+        .await
+        .map_err(|error| {
+            GenerationError::unavailable(format!("selected-token read failed: {error:?}"))
+        })?;
+    let provisional = read_token(&bytes)?;
+    let allow = allow.ok_or_else(|| GenerationError::new("constraint mask is missing"))?;
+    if token_allowed(allow, provisional) {
+        runner.release_queued_decode(output).map_err(|error| {
+            GenerationError::unavailable(format!("decode output release failed: {error:?}"))
+        })?;
+        return Ok(provisional);
+    }
+
+    pipeline.discard_pending(runner).await?;
+    let corrected = finish_selection(runner, &output.logits, start_pos, sampling, allow).await?;
+    let token = selected_token(runner, corrected).await?;
+    let next_pos = start_pos
+        .checked_add(1)
+        .ok_or_else(|| GenerationError::new("decode position overflowed"))?;
+    pipeline.position = next_pos;
+    if has_successor {
+        let next = enqueue_unconstrained(runner, next_pos, sampling).await?;
+        pipeline.push_selected(next, next_pos)?;
+    }
+    Ok(token)
+}
+
+fn token_allowed(allow: &[u32], token: u32) -> bool {
+    usize::try_from(token / 32)
+        .ok()
+        .and_then(|word| allow.get(word))
+        .is_some_and(|bits| bits & (1_u32 << (token % 32)) != 0)
+}
+
+async fn advance_speculative_constraint(
+    session: Option<&GuidanceSession>,
+    token: u32,
+) -> Result<(bool, Option<Vec<u32>>), GenerationError> {
+    let session = session.ok_or_else(|| GenerationError::new("grammar session is missing"))?;
+    session
+        .commit(token)
+        .await
+        .map_err(|error| constraint_error(&error))?;
+    let next = session
+        .mask()
+        .await
+        .map_err(|error| constraint_error(&error))?;
+    Ok((next.is_none(), next))
+}
+
 async fn synchronize_unconstrained<B>(
     runner: &mut EngineRunner<B>,
     replay_base: u64,
@@ -1222,20 +1382,23 @@ async fn advance_constraint<B>(
 where
     B: Backend + Send + Sync + 'static,
 {
-    if session
+    session
         .commit(token)
         .await
-        .map_err(|error| constraint_error(&error))?
-    {
+        .map_err(|error| constraint_error(&error))?;
+    let allow = session
+        .mask()
+        .await
+        .map_err(|error| constraint_error(&error))?;
+    let Some(allow) = allow else {
         if let Some((logits, _)) = forward {
             discard_forward(runner, &logits)?;
         }
         return Ok((true, None));
-    }
+    };
     let Some((logits, start_pos)) = forward else {
         return Ok((false, None));
     };
-    let allow = next_mask(session).await?;
     let output = finish_selection(runner, &logits, start_pos, sampling, &allow).await?;
     Ok((false, Some((output, start_pos))))
 }
@@ -1246,7 +1409,7 @@ async fn activate_at_boundary<B>(
     worker: &GuidanceWorker,
     plan: Option<&ConstraintPlan>,
     sampling: SamplingParams,
-) -> Result<GuidanceSession, GenerationError>
+) -> Result<(GuidanceSession, Vec<u32>), GenerationError>
 where
     B: Backend + Send + Sync + 'static,
 {
@@ -1254,10 +1417,28 @@ where
         .pending
         .pop_front()
         .ok_or_else(|| GenerationError::new("trigger activation has no speculative token"))?;
-    let (session, output, rewind_pos) =
+    let (session, output, rewind_pos, allow) =
         activate_constraint(runner, worker, plan, speculative, sampling).await?;
     pipeline.push_selected(output, rewind_pos)?;
-    Ok(session)
+    Ok((session, allow))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn activate_tool_boundary<B>(
+    pipeline: &mut DecodePipeline,
+    runner: &mut EngineRunner<B>,
+    worker: &GuidanceWorker,
+    plan: Option<&ConstraintPlan>,
+    sampling: SamplingParams,
+    parser: &mut Option<ToolParser>,
+    sender: Option<&mpsc::Sender<GenerationEvent>>,
+    control: &GenerationControl,
+) -> Result<(GuidanceSession, Vec<u32>), GenerationError>
+where
+    B: Backend + Send + Sync + 'static,
+{
+    seed_tool_parser(parser, sender, control).await?;
+    activate_at_boundary(pipeline, runner, worker, plan, sampling).await
 }
 
 async fn activate_constraint<B>(
@@ -1266,7 +1447,7 @@ async fn activate_constraint<B>(
     plan: Option<&ConstraintPlan>,
     speculative: (EngineDecodeOutput, u32),
     sampling: SamplingParams,
-) -> Result<(GuidanceSession, EngineDecodeOutput, u32), GenerationError>
+) -> Result<(GuidanceSession, EngineDecodeOutput, u32, Vec<u32>), GenerationError>
 where
     B: Backend + Send + Sync + 'static,
 {
@@ -1288,7 +1469,7 @@ where
     let allow = next_mask(&session).await?;
     let logits = begin_forward(runner, rewind_pos).await?;
     let output = finish_selection(runner, &logits, rewind_pos, sampling, &allow).await?;
-    Ok((session, output, rewind_pos))
+    Ok((session, output, rewind_pos, allow))
 }
 
 fn discard_forward<B>(

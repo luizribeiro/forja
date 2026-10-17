@@ -36,7 +36,7 @@ enum Job {
     Commit {
         id: u64,
         token: u32,
-        reply: oneshot::Sender<Result<bool, String>>,
+        reply: oneshot::Sender<Result<(), String>>,
     },
     Remove(u64),
 }
@@ -89,10 +89,23 @@ impl GuidanceWorker {
             .checked_add(31)
             .ok_or_else(|| "vocabulary mask size overflowed".to_owned())?
             / 32;
+        let mut valid_tokens = vec![
+            0_u32;
+            usize::try_from(mask_words).map_err(|_| {
+                "vocabulary mask size does not fit usize".to_owned()
+            })?
+        ];
+        for &token in tokenizer.get_vocab(true).values() {
+            if token < vocab {
+                let word = usize::try_from(token / 32)
+                    .map_err(|_| "token id does not fit usize".to_owned())?;
+                valid_tokens[word] |= 1_u32 << (token % 32);
+            }
+        }
         let (jobs, receiver) = sync_channel(1);
         thread::Builder::new()
             .name("forja-llguidance".to_owned())
-            .spawn(move || run_worker(&receiver, &factory, mask_words))
+            .spawn(move || run_worker(&receiver, &factory, mask_words, &valid_tokens))
             .map_err(|error| format!("cannot start grammar worker: {error}"))?;
         Ok(Self {
             jobs,
@@ -151,8 +164,8 @@ impl GuidanceSession {
             .map_err(|_| "grammar worker stopped".to_owned())?
     }
 
-    /// Commits one sampled token and reports whether the grammar is complete.
-    pub async fn commit(&self, token: u32) -> Result<bool, String> {
+    /// Commits one sampled token.
+    pub async fn commit(&self, token: u32) -> Result<(), String> {
         let (reply, response) = oneshot::channel();
         self.jobs
             .try_send(Job::Commit {
@@ -192,7 +205,12 @@ fn parser_limits() -> ParserLimits {
     }
 }
 
-fn run_worker(jobs: &std::sync::mpsc::Receiver<Job>, factory: &ParserFactory, mask_words: u32) {
+fn run_worker(
+    jobs: &std::sync::mpsc::Receiver<Job>,
+    factory: &ParserFactory,
+    mask_words: u32,
+    valid_tokens: &[u32],
+) {
     let mut constraints = HashMap::<u64, Constraint>::new();
     while let Ok(job) = jobs.recv() {
         match job {
@@ -234,13 +252,22 @@ fn run_worker(jobs: &std::sync::mpsc::Receiver<Job>, factory: &ParserFactory, ma
                         let mask = step.sample_mask.as_ref().ok_or_else(|| {
                             "grammar requested unsupported forced tokens".to_owned()
                         })?;
-                        if mask.as_slice().len()
-                            != usize::try_from(mask_words).unwrap_or(usize::MAX)
-                            || mask.num_set() == 0
+                        let mask_words = usize::try_from(mask_words).unwrap_or(usize::MAX);
+                        let packed = mask.as_slice();
+                        if packed.len() < mask_words
+                            || packed[mask_words..].iter().any(|&word| word != 0)
                         {
                             return Err("grammar produced an invalid token mask".to_owned());
                         }
-                        Ok(Some(mask.as_slice().to_vec()))
+                        let packed: Vec<u32> = packed[..mask_words]
+                            .iter()
+                            .zip(valid_tokens)
+                            .map(|(&grammar, &valid)| grammar & valid)
+                            .collect();
+                        if packed.iter().all(|&word| word == 0) {
+                            return Err("grammar produced an empty token mask".to_owned());
+                        }
+                        Ok(Some(packed))
                     });
                 let _ = reply.send(result);
             }
@@ -258,7 +285,7 @@ fn run_worker(jobs: &std::sync::mpsc::Receiver<Job>, factory: &ParserFactory, ma
                                     .to_owned(),
                             );
                         }
-                        Ok(result.stop)
+                        Ok(())
                     });
                 let _ = reply.send(result);
             }
@@ -296,8 +323,15 @@ mod tests {
         let session = worker.compile("start: \"a\"".to_owned()).await.unwrap();
         let mask = session.mask().await.unwrap().unwrap();
         assert_eq!(mask, [1]);
-        assert!(!session.commit(0).await.unwrap());
+        session.commit(0).await.unwrap();
         assert!(session.mask().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn trims_zero_sentinel_storage_at_a_mask_word_boundary() {
+        let worker = GuidanceWorker::new(&tokenizer(), 32, &[2]).unwrap();
+        let session = worker.compile("start: \"a\"".to_owned()).await.unwrap();
+        assert_eq!(session.mask().await.unwrap().unwrap(), [1]);
     }
 
     #[tokio::test]

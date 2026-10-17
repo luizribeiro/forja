@@ -942,6 +942,7 @@ where
         if let Err(error) = self.release_outputs() {
             return Ok(Err(error));
         }
+        self.discarded_speculation = false;
         self.output_handles = vec![output.logits.rep(), output.token.rep()];
         Ok(Ok(EngineDecodeOutput {
             logits: EngineTensor {
@@ -969,7 +970,7 @@ where
         }
         self.set_guest_deadline();
         let engine = self.instance.l9o_gpu_engine();
-        match self
+        let result = match self
             .store
             .run_concurrent(async move |accessor| {
                 engine.call_rewind_decode(accessor, next_pos).await
@@ -979,7 +980,11 @@ where
             Ok(output) => output,
             Err(error) if is_epoch_timeout(&error) => Ok(Err(guest_timeout())),
             Err(error) => Err(error),
+        };
+        if matches!(result, Ok(Ok(()))) {
+            self.discarded_speculation = false;
         }
+        result
     }
 
     async fn decode_inner(
@@ -1063,19 +1068,30 @@ where
         &mut self,
         output: EngineDecodeOutput,
     ) -> Result<Vec<u8>, compute::Error> {
-        let result = if output.token.runner_id == self.id {
-            let resource = Resource::new_borrow(output.token.handle);
-            match self.store.data().prepare_replay_read(&resource) {
-                Ok(request) => request.run().await.map_err(guest_error),
-                Err(error) => Err(error),
-            }
-        } else {
-            Err(invalid_handle("engine tensor belongs to another runner"))
-        };
+        let result = self.read_queued_token_retained(&output).await;
         let release = self.release_decode_output(output);
         match (result, release) {
             (Err(error), _) | (Ok(_), Err(error)) => Err(error),
             (Ok(bytes), Ok(())) => Ok(bytes),
+        }
+    }
+
+    /// Reads a queued decode token while retaining that call's returned tensors.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-handle or backend read failure.
+    pub async fn read_queued_token_retained(
+        &mut self,
+        output: &EngineDecodeOutput,
+    ) -> Result<Vec<u8>, compute::Error> {
+        if output.token.runner_id != self.id {
+            return Err(invalid_handle("engine tensor belongs to another runner"));
+        }
+        let resource = Resource::new_borrow(output.token.handle);
+        match self.store.data().prepare_replay_read(&resource) {
+            Ok(request) => request.run().await.map_err(guest_error),
+            Err(error) => Err(error),
         }
     }
 
@@ -1090,6 +1106,18 @@ where
     ) -> Result<(), compute::Error> {
         self.discarded_speculation = true;
         self.read_queued_token(output).await.map(drop)
+    }
+
+    /// Releases an already-read queued decode output without invalidating speculation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-handle or guest resource-release failure.
+    pub fn release_queued_decode(
+        &mut self,
+        output: EngineDecodeOutput,
+    ) -> Result<(), compute::Error> {
+        self.release_decode_output(output)
     }
 
     fn release_decode_output(&mut self, output: EngineDecodeOutput) -> Result<(), compute::Error> {
