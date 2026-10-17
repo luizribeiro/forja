@@ -81,6 +81,10 @@ pub struct RequestCeiling {
     pub max_output_tokens: u32,
     /// Maximum stop strings.
     pub max_stops: u32,
+    /// Maximum declared tools.
+    pub max_tools: u32,
+    /// Maximum aggregate serialized tool bytes.
+    pub max_tool_bytes: ByteSize,
 }
 
 impl Default for RequestCeiling {
@@ -92,6 +96,8 @@ impl Default for RequestCeiling {
             max_prompt_tokens: None,
             max_output_tokens: 8_192,
             max_stops: 4,
+            max_tools: 128,
+            max_tool_bytes: ByteSize::new(256 * 1024),
         }
     }
 }
@@ -148,5 +154,7 @@ max_output_tokens = 4096
         assert_eq!(config.request.max_prompt_tokens, None);
         assert_eq!(config.request.max_output_tokens, 8_192);
         assert_eq!(config.request.max_stops, 4);
+        assert_eq!(config.request.max_tools, 128);
+        assert_eq!(config.request.max_tool_bytes, ByteSize::new(256 * 1024));
     }
 }

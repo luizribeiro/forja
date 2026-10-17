@@ -1,4 +1,8 @@
-use std::{collections::BTreeMap, error::Error, fmt};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    error::Error,
+    fmt,
+};
 
 use forja_config::HostConfig;
 use serde::{Deserialize, Serialize};
@@ -213,6 +217,7 @@ pub(crate) fn validate_chat_input(
         config,
     )?;
     validate_messages(&request.messages)?;
+    validate_tools(request, config)?;
     resolve(&request.params, config, &defaults.sampling, vocab, true)
 }
 
@@ -427,6 +432,55 @@ fn validate_messages(messages: &[Message]) -> Result<(), ValidationError> {
     }
 }
 
+fn validate_tools(
+    request: &ChatCompletionRequest,
+    config: &HostConfig,
+) -> Result<(), ValidationError> {
+    let tools = request.params.tools.as_deref().unwrap_or_default();
+    let bytes = serde_json::to_vec(tools)
+        .ok()
+        .and_then(|json| u64::try_from(json.len()).ok());
+    if tools.len() > ceiling_usize(config.request.max_tools)
+        || bytes.is_none_or(|bytes| bytes > config.request.max_tool_bytes.get())
+    {
+        return invalid("tools exceed the configured ceiling");
+    }
+    let mut names = BTreeSet::new();
+    if tools.iter().any(|tool| {
+        tool.r#type != "function"
+            || !valid_name(&tool.function.name)
+            || !names.insert(&tool.function.name)
+            || !tool.function.parameters.is_object()
+    }) {
+        return invalid("tool definition is invalid");
+    }
+    if request
+        .params
+        .response_format
+        .as_ref()
+        .is_some_and(|format| format.r#type != "text")
+    {
+        return invalid("response_format must be text");
+    }
+    let valid_choice = match request.params.tool_choice.as_ref() {
+        None => true,
+        Some(ToolChoice::Mode(mode)) => {
+            mode == "none" || (!tools.is_empty() && matches!(mode.as_str(), "auto" | "required"))
+        }
+        Some(ToolChoice::Named(choice)) => {
+            choice.r#type == "function"
+                && tools
+                    .iter()
+                    .any(|tool| tool.function.name == choice.function.name)
+        }
+    };
+    if valid_choice {
+        Ok(())
+    } else {
+        invalid("tool_choice is inconsistent with tools")
+    }
+}
+
 fn valid_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 64
@@ -509,6 +563,13 @@ mod tests {
             "read_file"
         );
         validate_chat_input(&request, &HostConfig::default(), &default_info(), 151_936).unwrap();
+        let duplicate = request.params.tools.as_ref().unwrap()[0].clone();
+        request.params.tools.as_mut().unwrap().push(duplicate);
+        assert!(
+            validate_chat_input(&request, &HostConfig::default(), &default_info(), 151_936)
+                .is_err()
+        );
+        request.params.tools.as_mut().unwrap().pop();
         request.messages[1].tool_call_id = None;
         assert!(
             validate_chat_input(&request, &HostConfig::default(), &default_info(), 151_936)
