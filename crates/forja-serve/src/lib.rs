@@ -7,6 +7,8 @@ mod engine;
 #[doc(hidden)]
 pub mod guidance;
 mod http;
+#[allow(dead_code)]
+mod prefix;
 mod request;
 mod response;
 mod stop;

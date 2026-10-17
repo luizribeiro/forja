@@ -941,6 +941,7 @@ dependencies = [
  "llguidance",
  "serde",
  "serde_json",
+ "sha2",
  "test-guests",
  "tokenizers",
  "tokio",
