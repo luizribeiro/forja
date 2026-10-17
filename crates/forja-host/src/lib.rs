@@ -840,6 +840,14 @@ where
         &mut self,
         input: EngineBeginDecode,
     ) -> wasmtime::Result<Result<EngineTensor, compute::Error>> {
+        self.with_profile(move |runner| Box::pin(runner.begin_decode_inner(input)))
+            .await
+    }
+
+    async fn begin_decode_inner(
+        &mut self,
+        input: EngineBeginDecode,
+    ) -> wasmtime::Result<Result<EngineTensor, compute::Error>> {
         self.set_guest_deadline();
         let engine = self.instance.l9o_gpu_engine();
         let logits = match self
@@ -895,6 +903,24 @@ where
         sampling: SamplingParams,
         allow: &[u32],
     ) -> wasmtime::Result<Result<EngineDecodeOutput, compute::Error>> {
+        let logits = EngineTensor {
+            handle: logits.handle,
+            runner_id: logits.runner_id,
+        };
+        let allow = allow.to_vec();
+        self.with_profile(move |runner| {
+            Box::pin(runner.finish_decode_inner(logits, start_pos, sampling, allow))
+        })
+        .await
+    }
+
+    async fn finish_decode_inner(
+        &mut self,
+        logits: EngineTensor,
+        start_pos: u32,
+        sampling: SamplingParams,
+        allow: Vec<u32>,
+    ) -> wasmtime::Result<Result<EngineDecodeOutput, compute::Error>> {
         if logits.runner_id != self.id {
             return Ok(Err(invalid_handle(
                 "engine tensor belongs to another runner",
@@ -903,7 +929,6 @@ where
         self.set_guest_deadline();
         let engine = self.instance.l9o_gpu_engine();
         let borrowed = Resource::new_borrow(logits.handle);
-        let allow = allow.to_vec();
         let output = match self
             .store
             .run_concurrent(async move |accessor| {
@@ -962,6 +987,14 @@ where
     ///
     /// Returns a component execution error or the engine's structured failure.
     pub async fn rewind_decode(
+        &mut self,
+        next_pos: u32,
+    ) -> wasmtime::Result<Result<(), compute::Error>> {
+        self.with_profile(move |runner| Box::pin(runner.rewind_decode_inner(next_pos)))
+            .await
+    }
+
+    async fn rewind_decode_inner(
         &mut self,
         next_pos: u32,
     ) -> wasmtime::Result<Result<(), compute::Error>> {
