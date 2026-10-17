@@ -9,7 +9,7 @@ use std::{
         Arc, Mutex as StdMutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use forja_config::HostConfig;
@@ -22,6 +22,7 @@ use tokenizers::Tokenizer;
 use tokio::sync::{Notify, mpsc};
 
 use crate::guidance::{GuidanceSession, GuidanceWorker};
+use crate::metrics::{ServingMetrics, observe};
 use crate::prefix::{LivePrefix, PrefixIdentity, PrefixLedger, PrefixNamespace, replace_live};
 use crate::request::{ToolChoice, validate_chat_input, validate_completion_input, validate_prompt};
 use crate::tool_output::{GeneratedToolCall, ToolDelta, ToolOutput};
@@ -142,6 +143,7 @@ pub struct PrefilledPrompt {
     /// Rendered prompt token count.
     pub prompt_tokens: u32,
     cached_tokens: u32,
+    started: Instant,
     /// Engine sampling parameters used by every decode step.
     pub sampling: SamplingParams,
     ledger: PrefixLedger,
@@ -420,6 +422,7 @@ pub struct ServingEngine<B: Backend + Send + Sync + 'static> {
     guidance: GuidanceWorker,
     prefix_namespace: PrefixNamespace,
     live_prefix: Option<LivePrefix>,
+    metrics: ServingMetrics,
 }
 
 impl<B> ServingEngine<B>
@@ -477,6 +480,7 @@ where
             guidance,
             prefix_namespace: prefix_identity.into_namespace(),
             live_prefix: None,
+            metrics: ServingMetrics::default(),
         })
     }
 
@@ -484,6 +488,18 @@ where
     #[must_use]
     pub fn model(&self) -> &str {
         &self.model
+    }
+
+    /// Returns bounded aggregate serving measurements.
+    #[must_use]
+    pub const fn metrics(&self) -> &ServingMetrics {
+        &self.metrics
+    }
+
+    fn invalidate_prefix(&mut self) {
+        if self.live_prefix.take().is_some() {
+            self.metrics.invalidations = self.metrics.invalidations.saturating_add(1);
+        }
     }
 
     pub(crate) fn max_body_bytes(&self) -> usize {
@@ -568,6 +584,7 @@ where
         constraint: Option<ConstraintPlan>,
         control: &GenerationControl,
     ) -> Result<PrefilledPrompt, GenerationError> {
+        let started = Instant::now();
         let sampling = SamplingParams {
             temperature: params.temperature,
             top_k: params.top_k,
@@ -575,19 +592,32 @@ where
             seed: sampling_seed(params.seed, params.temperature).await?,
         };
         if control.is_cancelled() {
-            self.live_prefix = None;
+            self.invalidate_prefix();
             return Err(GenerationError::cancelled());
         }
         let ledger = PrefixLedger::new(tokens.clone());
+        let match_started = Instant::now();
         let (cached_len, live_len) = self.live_prefix.as_ref().map_or((0, 0), |prefix| {
             (
                 prefix.match_len(self.prefix_namespace, &tokens),
                 prefix.len(),
             )
         });
+        self.metrics.requests = self.metrics.requests.saturating_add(1);
+        observe(&mut self.metrics.match_time, match_started.elapsed());
+        if cached_len == 0 {
+            self.metrics.misses = self.metrics.misses.saturating_add(1);
+        } else {
+            self.metrics.hits = self.metrics.hits.saturating_add(1);
+            self.metrics.reused_tokens = self
+                .metrics
+                .reused_tokens
+                .saturating_add(u64::try_from(cached_len).unwrap_or(u64::MAX));
+        }
         let start_pos = u32::try_from(cached_len)
             .map_err(|_| GenerationError::new("cached prefix length overflowed"))?;
         if cached_len > 0 && cached_len < live_len {
+            let rewind_started = Instant::now();
             let rewind = self
                 .runner
                 .rewind_decode(start_pos)
@@ -601,10 +631,13 @@ where
                     })
                 });
             if let Err(error) = rewind {
-                self.live_prefix = None;
+                self.invalidate_prefix();
                 return Err(error);
             }
+            self.metrics.rewinds = self.metrics.rewinds.saturating_add(1);
+            observe(&mut self.metrics.rewind_time, rewind_started.elapsed());
         }
+        let prefill_started = Instant::now();
         let first = self
             .runner
             .enqueue_decode(EngineDecode {
@@ -624,15 +657,20 @@ where
         let first = match first {
             Ok(first) => first,
             Err(error) => {
-                self.live_prefix = None;
+                self.invalidate_prefix();
                 return Err(error);
             }
         };
+        observe(
+            &mut self.metrics.suffix_prefill_time,
+            prefill_started.elapsed(),
+        );
         Ok(PrefilledPrompt {
             first,
             params,
             prompt_tokens,
             cached_tokens: start_pos,
+            started,
             sampling,
             ledger,
             constraint,
@@ -762,6 +800,7 @@ where
             params,
             prompt_tokens,
             cached_tokens,
+            started,
             sampling,
             constraint,
             mut guidance,
@@ -772,7 +811,7 @@ where
         } = match start {
             Ok(start) => start,
             Err(error) => {
-                self.live_prefix = None;
+                self.invalidate_prefix();
                 return Err(error);
             }
         };
@@ -782,7 +821,7 @@ where
         let tokenizer = match self.tokenizer() {
             Ok(tokenizer) => tokenizer,
             Err(error) => {
-                self.live_prefix = None;
+                self.invalidate_prefix();
                 return Err(error);
             }
         };
@@ -808,6 +847,13 @@ where
                     allow.as_deref(),
                 )
                 .await?;
+                if consumed == 0 {
+                    let ttft = started.elapsed();
+                    observe(&mut self.metrics.ttft, ttft);
+                    if cached_tokens == 0 {
+                        observe(&mut self.metrics.uncached_ttft, ttft);
+                    }
+                }
                 consumed += 1;
                 if !constrained {
                     unconstrained_consumed += 1;
@@ -940,6 +986,7 @@ struct DecodeStart {
     params: ResolvedParams,
     prompt_tokens: u32,
     cached_tokens: u32,
+    started: Instant,
     sampling: SamplingParams,
     constraint: Option<ConstraintPlan>,
     guidance: Option<GuidanceSession>,
@@ -965,6 +1012,7 @@ where
         params,
         prompt_tokens,
         cached_tokens,
+        started,
         sampling,
         ledger,
         constraint,
@@ -995,6 +1043,7 @@ where
         params,
         prompt_tokens,
         cached_tokens,
+        started,
         sampling,
         constraint,
         guidance,

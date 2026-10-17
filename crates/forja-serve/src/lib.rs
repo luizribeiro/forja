@@ -7,6 +7,7 @@ mod engine;
 #[doc(hidden)]
 pub mod guidance;
 mod http;
+mod metrics;
 mod prefix;
 mod request;
 mod response;
@@ -21,6 +22,7 @@ pub use engine::{
     ServingEngine, Usage,
 };
 pub use http::{ChatService, DrainHandle, chat_router, serving_router};
+pub use metrics::ServingMetrics;
 pub use prefix::PrefixIdentity;
 pub use request::{
     ChatCompletionRequest, CompletionParams, CompletionRequest, FunctionCall, FunctionDefinition,
