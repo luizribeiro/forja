@@ -10,6 +10,8 @@ use serde_json::Value;
 
 use crate::{ChatInfo, SamplingDefaults};
 
+const MAX_SCHEMA_VISITS: usize = 65_536;
+
 macro_rules! openai_record {
     ($name:ident { $($field:ident: $kind:ty),+ $(,)? }) => {
         #[allow(missing_docs)]
@@ -167,11 +169,14 @@ pub struct ResolvedParams {
 
 /// A client-visible invalid-request error.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ValidationError(String);
+pub struct ValidationError {
+    message: String,
+    too_large: bool,
+}
 
 impl fmt::Display for ValidationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.0)
+        formatter.write_str(&self.message)
     }
 }
 
@@ -310,8 +315,9 @@ pub(crate) fn validate_prompt(
     let remaining_context = max_context
         .checked_sub(prompt_tokens)
         .filter(|&remaining| remaining > 0)
-        .ok_or_else(|| {
-            ValidationError("prompt exceeds the configured context ceiling".to_owned())
+        .ok_or_else(|| ValidationError {
+            message: "prompt exceeds the configured context ceiling".to_owned(),
+            too_large: false,
         })?;
     params.max_tokens = params.max_tokens.min(remaining_context);
     Ok(params)
@@ -348,11 +354,14 @@ where
     T: TryInto<u64>,
 {
     lengths.into_iter().try_fold(0_u64, |sum, length| {
-        let length = length
-            .try_into()
-            .map_err(|_| ValidationError("request text size overflowed".to_owned()))?;
-        sum.checked_add(length)
-            .ok_or_else(|| ValidationError("request text size overflowed".to_owned()))
+        let length = length.try_into().map_err(|_| ValidationError {
+            message: "request text size overflowed".to_owned(),
+            too_large: false,
+        })?;
+        sum.checked_add(length).ok_or_else(|| ValidationError {
+            message: "request text size overflowed".to_owned(),
+            too_large: false,
+        })
     })
 }
 
@@ -440,17 +449,18 @@ fn validate_tools(
     let bytes = serde_json::to_vec(tools)
         .ok()
         .and_then(|json| u64::try_from(json.len()).ok());
-    if tools.len() > ceiling_usize(config.request.max_tools)
-        || bytes.is_none_or(|bytes| bytes > config.request.max_tool_bytes.get())
-    {
-        return invalid("tools exceed the configured ceiling");
+    if tools.len() > ceiling_usize(config.request.max_tools) {
+        return invalid("tool count exceeds the configured ceiling");
+    }
+    if bytes.is_none_or(|bytes| bytes > config.request.max_tool_bytes.get()) {
+        return too_large("tool bytes exceed the configured ceiling");
     }
     let mut names = BTreeSet::new();
     if tools.iter().any(|tool| {
         tool.r#type != "function"
             || !valid_name(&tool.function.name)
             || !names.insert(&tool.function.name)
-            || !tool.function.parameters.is_object()
+            || !valid_schema(&tool.function.parameters, config.request.max_schema_depth)
     }) {
         return invalid("tool definition is invalid");
     }
@@ -489,6 +499,149 @@ fn valid_name(name: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
 }
 
+fn valid_schema(root: &Value, max_depth: u32) -> bool {
+    SchemaValidator {
+        root,
+        max_depth,
+        active_refs: BTreeSet::new(),
+        validated_refs: BTreeSet::new(),
+        visits: 0,
+    }
+    .visit(root, 0)
+}
+
+struct SchemaValidator<'a> {
+    root: &'a Value,
+    max_depth: u32,
+    active_refs: BTreeSet<String>,
+    validated_refs: BTreeSet<String>,
+    visits: usize,
+}
+
+impl SchemaValidator<'_> {
+    fn visit(&mut self, value: &Value, depth: u32) -> bool {
+        self.visits += 1;
+        if self.visits > MAX_SCHEMA_VISITS {
+            return false;
+        }
+        let Some(schema) = value.as_object() else {
+            return false;
+        };
+        if depth > self.max_depth
+            || schema.keys().any(|key| {
+                !matches!(
+                    key.as_str(),
+                    "type"
+                        | "properties"
+                        | "required"
+                        | "description"
+                        | "enum"
+                        | "items"
+                        | "$defs"
+                        | "$ref"
+                        | "additionalProperties"
+                )
+            })
+        {
+            return false;
+        }
+        if schema
+            .get("type")
+            .and_then(Value::as_str)
+            .is_some_and(|kind| {
+                !matches!(
+                    kind,
+                    "object" | "array" | "string" | "number" | "integer" | "boolean"
+                )
+            })
+        {
+            return false;
+        }
+        if schema
+            .get("additionalProperties")
+            .is_some_and(|value| value != &Value::Bool(false))
+        {
+            return false;
+        }
+        if !valid_enum(schema) {
+            return false;
+        }
+        if !self.visit_reference(schema, depth) {
+            return false;
+        }
+        let maps_valid = ["properties", "$defs"].into_iter().all(|key| {
+            schema
+                .get(key)
+                .and_then(Value::as_object)
+                .is_none_or(|map| {
+                    map.iter().all(|(name, child)| {
+                        valid_name(name)
+                            && self
+                                .next_depth(depth)
+                                .is_some_and(|depth| self.visit(child, depth))
+                    })
+                })
+        });
+        let items_valid = schema.get("items").is_none_or(|child| {
+            self.next_depth(depth)
+                .is_some_and(|depth| self.visit(child, depth))
+        });
+        maps_valid && items_valid
+    }
+
+    fn visit_reference(&mut self, schema: &serde_json::Map<String, Value>, depth: u32) -> bool {
+        let Some(reference) = schema.get("$ref").and_then(Value::as_str) else {
+            return true;
+        };
+        let Some(pointer) = reference.strip_prefix('#') else {
+            return false;
+        };
+        if !reference.starts_with("#/$defs/") {
+            return false;
+        }
+        if self.validated_refs.contains(reference) {
+            return true;
+        }
+        if !self.active_refs.insert(reference.to_owned()) {
+            return false;
+        }
+        let valid = self.next_depth(depth).is_some_and(|depth| {
+            self.root
+                .pointer(pointer)
+                .is_some_and(|target| self.visit(target, depth))
+        });
+        self.active_refs.remove(reference);
+        if valid {
+            self.validated_refs.insert(reference.to_owned());
+        }
+        valid
+    }
+
+    fn next_depth(&self, depth: u32) -> Option<u32> {
+        depth
+            .checked_add(1)
+            .filter(|depth| *depth <= self.max_depth)
+    }
+}
+
+fn valid_enum(schema: &serde_json::Map<String, Value>) -> bool {
+    let Some(values) = schema.get("enum") else {
+        return true;
+    };
+    let Some(values) = values.as_array().filter(|values| !values.is_empty()) else {
+        return false;
+    };
+    match schema.get("type").and_then(Value::as_str) {
+        Some("string") => values.iter().all(Value::is_string),
+        Some("number") => values.iter().all(Value::is_number),
+        Some("integer") => values
+            .iter()
+            .all(|value| value.as_i64().is_some() || value.as_u64().is_some()),
+        Some("boolean") => values.iter().all(Value::is_boolean),
+        _ => false,
+    }
+}
+
 fn normalize_stops(stop: Option<&Stop>) -> Vec<String> {
     match stop {
         None => Vec::new(),
@@ -498,7 +651,23 @@ fn normalize_stops(stop: Option<&Stop>) -> Vec<String> {
 }
 
 fn invalid<T>(message: &str) -> Result<T, ValidationError> {
-    Err(ValidationError(message.to_owned()))
+    Err(ValidationError {
+        message: message.to_owned(),
+        too_large: false,
+    })
+}
+
+fn too_large<T>(message: &str) -> Result<T, ValidationError> {
+    Err(ValidationError {
+        message: message.to_owned(),
+        too_large: true,
+    })
+}
+
+impl ValidationError {
+    pub(crate) const fn is_too_large(&self) -> bool {
+        self.too_large
+    }
 }
 
 #[cfg(test)]
@@ -563,6 +732,13 @@ mod tests {
             "read_file"
         );
         validate_chat_input(&request, &HostConfig::default(), &default_info(), 151_936).unwrap();
+        let mut byte_limited = HostConfig::default();
+        byte_limited.request.max_tool_bytes = forja_config::ByteSize::new(1);
+        assert!(
+            validate_chat_input(&request, &byte_limited, &default_info(), 151_936)
+                .unwrap_err()
+                .is_too_large()
+        );
         let duplicate = request.params.tools.as_ref().unwrap()[0].clone();
         request.params.tools.as_mut().unwrap().push(duplicate);
         assert!(
@@ -582,6 +758,71 @@ mod tests {
             ))
             .is_err()
         );
+    }
+
+    #[test]
+    fn schema_validation_bounds_depth_and_references() {
+        let valid = serde_json::json!({"type":"object","properties":{"path":{"$ref":"#/$defs/path"}},"$defs":{"path":{"type":"string"}}});
+        assert!(valid_schema(&valid, 2));
+        for schema in [
+            serde_json::json!({"$ref":"https://example.com/schema"}),
+            serde_json::json!({"$defs":{"x":{"$ref":"#/$defs/x"}},"$ref":"#/$defs/x"}),
+            serde_json::json!({"type":"string","pattern":".*"}),
+        ] {
+            assert!(!valid_schema(&schema, 2));
+        }
+        assert!(!valid_schema(&valid, 0));
+    }
+
+    #[test]
+    fn schema_validation_memoizes_diamond_references() {
+        let mut definitions = serde_json::Map::new();
+        definitions.insert("leaf".to_owned(), serde_json::json!({"type":"string"}));
+        for level in (0..30).rev() {
+            let next = if level == 29 {
+                "leaf".to_owned()
+            } else {
+                format!("level_{}", level + 1)
+            };
+            definitions.insert(
+                format!("level_{level}"),
+                serde_json::json!({
+                    "type":"object",
+                    "properties": {
+                        "left":{"$ref":format!("#/$defs/{next}")},
+                        "right":{"$ref":format!("#/$defs/{next}")}
+                    }
+                }),
+            );
+        }
+        let schema = serde_json::json!({
+            "$defs": definitions,
+            "$ref":"#/$defs/level_0"
+        });
+        let started = std::time::Instant::now();
+        assert!(valid_schema(&schema, 64));
+        assert!(started.elapsed() < std::time::Duration::from_millis(100));
+    }
+
+    #[test]
+    fn schema_validation_refuses_unenforceable_enums() {
+        for schema in [
+            serde_json::json!({"type":"array","enum":[[]]}),
+            serde_json::json!({"type":"object","enum":[{}]}),
+            serde_json::json!({"enum":["missing type"]}),
+            serde_json::json!({"type":"integer","enum":[1.5]}),
+            serde_json::json!({"type":"boolean","enum":[]}),
+        ] {
+            assert!(!valid_schema(&schema, 64));
+        }
+        for schema in [
+            serde_json::json!({"type":"string","enum":["red","blue"]}),
+            serde_json::json!({"type":"number","enum":[1,2.5]}),
+            serde_json::json!({"type":"integer","enum":[-1,2]}),
+            serde_json::json!({"type":"boolean","enum":[true,false]}),
+        ] {
+            assert!(valid_schema(&schema, 64));
+        }
     }
 
     #[test]

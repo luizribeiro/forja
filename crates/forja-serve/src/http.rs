@@ -675,6 +675,7 @@ fn body_error(error: &BytesRejection) -> Response {
 fn generation_error(error: &GenerationError) -> Response {
     match error.kind() {
         ErrorKind::Invalid => api_error(StatusCode::BAD_REQUEST, &error.to_string()),
+        ErrorKind::PayloadTooLarge => api_error(StatusCode::PAYLOAD_TOO_LARGE, &error.to_string()),
         ErrorKind::Internal => api_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
         ErrorKind::Unavailable => api_error(StatusCode::SERVICE_UNAVAILABLE, &error.to_string()),
     }
@@ -982,6 +983,14 @@ mod tests {
         assert_eq!(
             stream_data(GenerationEvent::Done, "id", 1, "model", true),
             "[DONE]"
+        );
+    }
+
+    #[test]
+    fn declared_tool_byte_excess_is_payload_too_large() {
+        assert_eq!(
+            generation_error(&GenerationError::too_large("tool bytes")).status(),
+            StatusCode::PAYLOAD_TOO_LARGE
         );
     }
 

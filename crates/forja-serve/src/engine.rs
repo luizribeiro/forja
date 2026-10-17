@@ -46,6 +46,13 @@ impl GenerationError {
         }
     }
 
+    pub(crate) fn too_large(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            kind: ErrorKind::PayloadTooLarge,
+        }
+    }
+
     fn unavailable(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
@@ -68,6 +75,7 @@ impl GenerationError {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ErrorKind {
     Invalid,
+    PayloadTooLarge,
     Internal,
     Unavailable,
 }
@@ -677,8 +685,13 @@ async fn prepare_chat_prompt<R>(
 where
     R: PromptRenderer + 'static,
 {
-    let params = validate_chat_input(request, config, chat_info, vocab)
-        .map_err(|error| GenerationError::invalid(error.to_string()))?;
+    let params = validate_chat_input(request, config, chat_info, vocab).map_err(|error| {
+        if error.is_too_large() {
+            GenerationError::too_large(error.to_string())
+        } else {
+            GenerationError::invalid(error.to_string())
+        }
+    })?;
     if control.is_cancelled() {
         return Err(GenerationError::cancelled());
     }
