@@ -485,45 +485,23 @@ where
         sender: Option<&mpsc::Sender<GenerationEvent>>,
         control: &GenerationControl,
     ) -> Result<Completion, GenerationError> {
-        let mut pending = VecDeque::from([prefill.first]);
-        let mut issued = 1_u32;
+        let mut pipeline = DecodePipeline::new(
+            prefill.first,
+            prefill.prompt_tokens,
+            prefill.params.max_tokens,
+        );
         let mut consumed = 0_u32;
-        let mut position = prefill.prompt_tokens;
         let replay_base = self.runner.metrics().submissions;
         let tokenizer = self.tokenizer()?;
         let mut decoder = tokenizer.decode_stream(true);
         let mut matcher = StopMatcher::new(&prefill.params.stops);
         let mut text = String::new();
         let generation = async {
-            while let Some(output) = pending.pop_front() {
+            while let Some(output) = pipeline.take_next() {
                 if control.is_cancelled() {
                     return Err(GenerationError::cancelled());
                 }
-                while pending.len() < 2 && issued < prefill.params.max_tokens {
-                    pending.push_back(
-                        self.runner
-                            .enqueue_decode(EngineDecode {
-                                tokens: None,
-                                start_pos: position,
-                                sampling: prefill.sampling,
-                            })
-                            .await
-                            .map_err(|error| {
-                                GenerationError::unavailable(format!(
-                                    "engine decode failed: {error}"
-                                ))
-                            })?
-                            .map_err(|error| {
-                                GenerationError::unavailable(format!(
-                                    "engine decode failed: {error:?}"
-                                ))
-                            })?,
-                    );
-                    position = position
-                        .checked_add(1)
-                        .ok_or_else(|| GenerationError::new("decode position overflowed"))?;
-                    issued += 1;
-                }
+                pipeline.fill(&mut self.runner, prefill.sampling).await?;
                 let bytes = self
                     .runner
                     .read_queued_token(output)
@@ -569,7 +547,7 @@ where
             Ok(FinishReason::Length)
         }
         .await;
-        let discard = finalize_sequence(&mut self.runner, &mut pending).await;
+        let discard = pipeline.cleanup(&mut self.runner).await;
         let finish_reason = match (generation, discard) {
             (Ok(reason), Ok(())) => reason,
             (Err(error), _) | (Ok(_), Err(error)) => return Err(error),
@@ -583,6 +561,71 @@ where
             },
         })
     }
+}
+
+struct DecodePipeline {
+    pending: VecDeque<EngineDecodeOutput>,
+    issued: u32,
+    position: u32,
+    limit: u32,
+}
+
+impl DecodePipeline {
+    fn new(first: EngineDecodeOutput, position: u32, limit: u32) -> Self {
+        Self {
+            pending: VecDeque::from([first]),
+            issued: 1,
+            position,
+            limit,
+        }
+    }
+
+    fn take_next(&mut self) -> Option<EngineDecodeOutput> {
+        self.pending.pop_front()
+    }
+
+    async fn fill<B>(
+        &mut self,
+        runner: &mut EngineRunner<B>,
+        sampling: SamplingParams,
+    ) -> Result<(), GenerationError>
+    where
+        B: Backend + Send + Sync + 'static,
+    {
+        while needs_successor(self.pending.len(), self.issued, self.limit) {
+            let output = runner
+                .enqueue_decode(EngineDecode {
+                    tokens: None,
+                    start_pos: self.position,
+                    sampling,
+                })
+                .await
+                .map_err(|error| {
+                    GenerationError::unavailable(format!("engine decode failed: {error}"))
+                })?
+                .map_err(|error| {
+                    GenerationError::unavailable(format!("engine decode failed: {error:?}"))
+                })?;
+            self.pending.push_back(output);
+            self.position = self
+                .position
+                .checked_add(1)
+                .ok_or_else(|| GenerationError::new("decode position overflowed"))?;
+            self.issued += 1;
+        }
+        Ok(())
+    }
+
+    async fn cleanup<B>(&mut self, runner: &mut EngineRunner<B>) -> Result<(), GenerationError>
+    where
+        B: Backend + Send + Sync + 'static,
+    {
+        finalize_sequence(runner, &mut self.pending).await
+    }
+}
+
+fn needs_successor(pending: usize, issued: u32, limit: u32) -> bool {
+    pending < 2 && issued < limit
 }
 
 async fn emit_output(
@@ -826,6 +869,14 @@ mod tests {
             self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Ok("rendered".to_owned())
         }
+    }
+
+    #[test]
+    fn decode_pipeline_bounds_the_speculative_window() {
+        assert!(needs_successor(0, 1, 4));
+        assert!(needs_successor(1, 2, 4));
+        assert!(!needs_successor(2, 3, 4));
+        assert!(!needs_successor(0, 4, 4));
     }
 
     #[tokio::test]
