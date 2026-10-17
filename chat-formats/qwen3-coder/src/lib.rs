@@ -36,7 +36,7 @@ mod component {
         world: "chat-format-component",
     });
 
-    use exports::l9o::gpu::chat_format::{ChatInfo, Guest, SamplingDefaults};
+    use exports::l9o::gpu::chat_format::{ChatInfo, Event, GrammarOut, Guest, SamplingDefaults};
 
     struct Component;
 
@@ -61,6 +61,16 @@ mod component {
         ) -> Result<String, String> {
             super::render(&messages_json, &tools_json, &options_json)
         }
+
+        fn grammar(_: String, _: String, _: String) -> Result<GrammarOut, String> {
+            Err("tool grammars are not implemented".to_owned())
+        }
+
+        fn parse(_: u64, _: String) -> Result<Vec<Event>, String> {
+            Err("tool parsing is not implemented".to_owned())
+        }
+
+        fn reset(_: u64) {}
     }
 
     export!(Component);

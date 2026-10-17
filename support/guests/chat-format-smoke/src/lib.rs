@@ -5,7 +5,7 @@ wit_bindgen::generate!({
     world: "chat-format-component",
 });
 
-use exports::l9o::gpu::chat_format::{ChatInfo, Guest, SamplingDefaults};
+use exports::l9o::gpu::chat_format::{ChatInfo, Event, GrammarOut, Guest, SamplingDefaults};
 
 struct Component;
 
@@ -41,6 +41,23 @@ impl Guest for Component {
         }
         Ok(format!("rendered:{messages_json}"))
     }
+
+    fn grammar(
+        tools_json: String,
+        _tool_choice_json: String,
+        _response_format_json: String,
+    ) -> Result<GrammarOut, String> {
+        Ok(GrammarOut {
+            grammar: format!("grammar:{tools_json}"),
+            trigger: "<tool_call>\n".to_owned(),
+        })
+    }
+
+    fn parse(_stream: u64, chunk: String) -> Result<Vec<Event>, String> {
+        Ok(vec![Event::TextDelta(chunk)])
+    }
+
+    fn reset(_stream: u64) {}
 }
 
 export!(Component);
