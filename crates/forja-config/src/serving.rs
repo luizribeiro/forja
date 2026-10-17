@@ -12,12 +12,29 @@ pub struct HostConfig {
     pub server: Server,
     /// One loaded model.
     pub model: ServedModel,
+    /// Cross-request serving behavior.
+    pub serving: Serving,
     /// Backend execution strategy.
     pub backend: Backend,
     /// Host resource limits for the engine instance.
     pub limits: Limits,
     /// Per-request admission ceilings.
     pub request: RequestCeiling,
+}
+
+/// Cross-request serving behavior.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Serving {
+    /// Reuse the immediately preceding request's matching live KV prefix.
+    #[serde(rename = "prefix-reuse")]
+    pub prefix_reuse: bool,
+}
+
+impl Default for Serving {
+    fn default() -> Self {
+        Self { prefix_reuse: true }
+    }
 }
 
 /// Listener and connection lifecycle settings.
@@ -122,6 +139,9 @@ profile = "/srv/profile.toml"
 model = "/models/qwen"
 chat_format = "/srv/chat-format.wasm"
 
+[serving]
+prefix-reuse = false
+
 [backend.metal]
 graph_replay = "tier1"
 
@@ -135,6 +155,7 @@ max_output_tokens = 4096
             SocketAddr::from(([127, 0, 0, 1], 8080))
         );
         assert_eq!(config.request.max_output_tokens, 4_096);
+        assert!(!config.serving.prefix_reuse);
         assert!(toml::from_str::<HostConfig>("api_key = 'secret'").is_err());
         assert!(toml::from_str::<HostConfig>("[run]\nmax_tokens = 1").is_err());
     }
@@ -144,6 +165,7 @@ max_output_tokens = 4096
         let config = HostConfig::default();
 
         assert_eq!(config.server.queue_length, 16);
+        assert!(config.serving.prefix_reuse);
         assert_eq!(config.server.request_deadline, Duration::from_secs(300));
         assert_eq!(config.server.header_read_timeout, Duration::from_secs(10));
         assert_eq!(config.server.body_read_timeout, Duration::from_secs(30));
