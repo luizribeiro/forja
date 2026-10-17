@@ -1,6 +1,6 @@
 //! Qwen tool grammar and parser compatibility checks.
 
-use qwen3_coder_chat_format::grammar;
+use forja_chat_format::qwen3_coder_xml::grammar;
 
 #[test]
 fn grammar_selects_tools_and_preserves_parameter_order() {

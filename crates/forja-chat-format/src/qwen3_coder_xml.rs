@@ -1,6 +1,59 @@
 use serde_json::Value;
 
+use crate::ChatTemplate;
+
 const TERMINALS: &str = "STRING: /[^\\r\\n<][^\\r<]*/\nINTEGER: /-?(0|[1-9][0-9]*)/\nNUMBER: /-?(0|[1-9][0-9]*)(\\.[0-9]+)?([eE][+-]?[0-9]+)?/\nJSON: /[^\\r<]+/\n";
+const TRIGGER: &str = "<tool_call>\n";
+
+/// Renders a template after normalizing API calls for Qwen XML.
+///
+/// # Errors
+/// Returns an error when request JSON or template rendering is invalid.
+pub fn render(
+    template: &ChatTemplate,
+    messages: &str,
+    tools: &str,
+    options: &str,
+) -> Result<String, String> {
+    let mut messages: Value = serde_json::from_str(messages).map_err(|error| error.to_string())?;
+    normalize_tool_calls(&mut messages)?;
+    let options_value: Value = serde_json::from_str(options).map_err(|error| error.to_string())?;
+    let messages = serde_json::to_string(&messages).map_err(|error| error.to_string())?;
+    template
+        .render(&messages, tools, options)
+        .map(|mut rendered| {
+            let choice = options_value.get("tool_choice");
+            if choice.is_some_and(|choice| choice == "required" || choice.is_object()) {
+                rendered.push_str(TRIGGER);
+            }
+            rendered
+        })
+}
+
+fn normalize_tool_calls(messages: &mut Value) -> Result<(), String> {
+    let Some(messages) = messages.as_array_mut() else {
+        return Err("messages must be an array".to_owned());
+    };
+    for message in messages {
+        let Some(calls) = message.get_mut("tool_calls").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for call in calls {
+            let Some(arguments) = call.pointer_mut("/function/arguments") else {
+                continue;
+            };
+            if let Some(encoded) = arguments.as_str() {
+                let decoded: Value =
+                    serde_json::from_str(encoded).map_err(|error| error.to_string())?;
+                if !decoded.is_object() {
+                    return Err("tool arguments must encode an object".to_owned());
+                }
+                *arguments = decoded;
+            }
+        }
+    }
+    Ok(())
+}
 
 /// Builds the Qwen tool-call grammar for a normalized request.
 ///
@@ -83,7 +136,7 @@ pub fn grammar(
         starts.join(" | "),
         tool_rules.join("\n")
     );
-    Ok((grammar, "<tool_call>\n".to_owned()))
+    Ok((grammar, TRIGGER.to_owned()))
 }
 
 fn value_rule(schema: &Value) -> Result<String, String> {
