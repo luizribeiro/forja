@@ -12,6 +12,8 @@ mod profile;
 mod provenance;
 mod resolution;
 mod serve;
+#[cfg(test)]
+mod serve_benchmark;
 mod verify;
 
 use std::{error::Error, process::ExitCode};
