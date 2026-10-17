@@ -8,8 +8,10 @@ const SITES: &[&str] = &[
     "quant.prefill-small",
     "quant.prefill-tiled",
     "gather-quant-matmul.small",
+    "gather-quant-matmul.grouped-small-m",
     "gather-quant-matmul.grouped",
     "moe.gate-up.small",
+    "moe.gate-up.grouped-small-m",
     "moe.gate-up.grouped",
     "moe.down-combine",
     "moe.combine-small",
@@ -82,12 +84,18 @@ impl Variants {
     }
 
     fn gathered(&self, operation: &str, routed_rows: u32) -> Result<Variant> {
-        let size = if routed_rows >= 64 {
-            "grouped"
-        } else {
-            "small"
-        };
-        self.0.at(&format!("{operation}.{size}"), 0)
+        self.0
+            .at(&format!("{operation}.{}", gathered_size(routed_rows)), 0)
+    }
+}
+
+fn gathered_size(routed_rows: u32) -> &'static str {
+    if routed_rows >= 512 {
+        "grouped"
+    } else if routed_rows >= 64 {
+        "grouped-small-m"
+    } else {
+        "small"
     }
 }
 
@@ -113,5 +121,13 @@ mod tests {
         assert_eq!(quant_site(1, crate::Q8_BITS), "quant.decode-q8");
         assert_eq!(quant_site(15, crate::Q4_BITS), "quant.prefill-small");
         assert_eq!(quant_site(16, crate::Q4_BITS), "quant.prefill-tiled");
+    }
+
+    #[test]
+    fn classifies_grouped_dispatch_sites_at_boundaries() {
+        assert_eq!(gathered_size(63), "small");
+        assert_eq!(gathered_size(64), "grouped-small-m");
+        assert_eq!(gathered_size(511), "grouped-small-m");
+        assert_eq!(gathered_size(512), "grouped");
     }
 }
