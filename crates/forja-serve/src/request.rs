@@ -212,6 +212,7 @@ pub(crate) fn validate_chat_input(
         )?,
         config,
     )?;
+    validate_messages(&request.messages)?;
     resolve(&request.params, config, &defaults.sampling, vocab, true)
 }
 
@@ -362,7 +363,7 @@ fn ceiling_usize(value: u32) -> usize {
     usize::try_from(value).unwrap_or(usize::MAX)
 }
 
-fn reject_unsupported(params: &CompletionParams, _chat: bool) -> Result<(), ValidationError> {
+fn reject_unsupported(params: &CompletionParams, chat: bool) -> Result<(), ValidationError> {
     if params.stream_options.is_some() && !params.stream {
         return invalid("stream_options requires stream=true");
     }
@@ -381,15 +382,57 @@ fn reject_unsupported(params: &CompletionParams, _chat: bool) -> Result<(), Vali
         || params.best_of.is_some_and(|value| value != 1)
         || params.echo == Some(true)
         || params.suffix.is_some()
-        || params.tools.as_ref().is_some_and(|value| !value.is_empty())
-        || params.tool_choice.is_some()
-        || params.parallel_tool_calls.is_some()
-        || params.response_format.is_some();
+        || (!chat
+            && (params.tools.is_some()
+                || params.tool_choice.is_some()
+                || params.parallel_tool_calls.is_some()
+                || params.response_format.is_some()));
     if unsupported {
         invalid("request contains an unsupported non-default field")
     } else {
         Ok(())
     }
+}
+
+fn validate_messages(messages: &[Message]) -> Result<(), ValidationError> {
+    let invalid_message = messages.iter().any(|message| match message.role.as_str() {
+        "system" | "user" => {
+            message.content.is_none()
+                || message.tool_calls.is_some()
+                || message.tool_call_id.is_some()
+        }
+        "assistant" => {
+            message.tool_call_id.is_some()
+                || (message.content.is_none() && message.tool_calls.is_none())
+                || message.tool_calls.as_ref().is_some_and(|calls| {
+                    calls.len() != 1
+                        || calls.iter().any(|call| {
+                            call.r#type != "function"
+                                || !valid_name(&call.function.name)
+                                || serde_json::from_str::<Value>(&call.function.arguments).is_err()
+                        })
+                })
+        }
+        "tool" => {
+            message.content.is_none()
+                || message.tool_calls.is_some()
+                || message.tool_call_id.as_ref().is_none_or(String::is_empty)
+        }
+        _ => true,
+    });
+    if invalid_message {
+        invalid("message role or tool fields are inconsistent")
+    } else {
+        Ok(())
+    }
+}
+
+fn valid_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
 }
 
 fn normalize_stops(stop: Option<&Stop>) -> Vec<String> {
@@ -460,8 +503,17 @@ mod tests {
             .is_err()
         );
         let tools = r#"{"model":"qwen","messages":[{"role":"assistant","content":null,"tool_calls":[{"id":"call_0","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"a.rs\"}"}}]},{"role":"tool","content":"ok","tool_call_id":"call_0"}],"tools":[{"type":"function","function":{"name":"read_file","description":"read","parameters":{"type":"object"}}}],"tool_choice":"auto","parallel_tool_calls":true,"response_format":{"type":"text"}}"#;
-        let request: ChatCompletionRequest = serde_json::from_str(tools).unwrap();
-        assert_eq!(request.params.tools.unwrap()[0].function.name, "read_file");
+        let mut request: ChatCompletionRequest = serde_json::from_str(tools).unwrap();
+        assert_eq!(
+            request.params.tools.as_ref().unwrap()[0].function.name,
+            "read_file"
+        );
+        validate_chat_input(&request, &HostConfig::default(), &default_info(), 151_936).unwrap();
+        request.messages[1].tool_call_id = None;
+        assert!(
+            validate_chat_input(&request, &HostConfig::default(), &default_info(), 151_936)
+                .is_err()
+        );
         assert!(
             serde_json::from_str::<ChatCompletionRequest>(&tools.replace(
                 "\"name\":\"read_file\"",
