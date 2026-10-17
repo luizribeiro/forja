@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
-  "accepted_at": "2026-10-17T14:46:06Z",
-  "source_commit": "07bafe251955ef2251371009e8a1b5e8c6dfe02f",
+  "accepted_at": "2026-10-17T15:42:37Z",
+  "source_commit": "551cfcc9bf703d2d4f4476952f3d5f325769e497",
   "machine": {
     "device": "Apple M3 Ultra",
     "gpu_cores": 80,
@@ -14,23 +14,57 @@
   "workload": {
     "path": "forja serve /v1/chat/completions over HTTP",
     "prompt_tokens": 512,
-    "warmup_requests_per_case": 1,
-    "measured_requests_per_case": 5,
-    "order": ["no-tools", "auto-no-trigger", "constrained-tool-call"],
+    "server_processes_per_sampling_case": 5,
+    "order_per_process": [
+      "no-tools-warmup",
+      "no-tools-measured",
+      "constrained-tool-call-measured"
+    ],
+    "remeasured_cases": [
+      "greedy:no-tools",
+      "greedy:constrained-tool-call",
+      "qwen-default:no-tools",
+      "qwen-default:constrained-tool-call"
+    ],
+    "retained_cases": {
+      "source_commit": "07bafe251955ef2251371009e8a1b5e8c6dfe02f",
+      "cases": ["greedy:auto-no-trigger", "greedy:activation"]
+    },
     "generated_tokens": {
-      "no_tools": 128,
-      "auto_no_trigger": 128,
-      "constrained_tool_call": 42
+      "greedy": {
+        "no_tools": 86,
+        "auto_no_trigger": 128,
+        "constrained_tool_call": 42
+      },
+      "qwen_default": {
+        "no_tools": 82,
+        "constrained_tool_call": 42
+      }
     },
     "measured_intervals": {
-      "no_tools": 635,
-      "auto_no_trigger": 635,
-      "constrained_post_trigger": 195
+      "greedy": {
+        "no_tools": 425,
+        "auto_no_trigger": 635,
+        "constrained_post_trigger": 195
+      },
+      "qwen_default": {
+        "no_tools": 405,
+        "constrained_post_trigger": 195
+      }
     },
     "sampling": {
-      "temperature": 0.0,
-      "top_k": 0,
-      "top_p": 1.0
+      "greedy": {
+        "temperature": 0.0,
+        "top_k": 0,
+        "top_p": 1.0,
+        "seed": 0
+      },
+      "qwen_default": {
+        "temperature": 0.7,
+        "top_k": 20,
+        "top_p": 0.8,
+        "seed": 0
+      }
     }
   },
   "thresholds_us": {
@@ -40,41 +74,60 @@
     "constrained_minus_no_tools_p99": 2000
   },
   "results": {
-    "no_tools_itl_us": {
-      "p50": 9867,
-      "p90": 10035,
-      "p99": 10687
-    },
-    "auto_no_trigger_itl_us": {
-      "p50": 9859,
-      "p90": 10037,
-      "p99": 10611
-    },
-    "constrained_post_trigger_itl_us": {
-      "p50": 9779,
-      "p90": 9958,
-      "p99": 10709
-    },
-    "auto_no_trigger_minus_no_tools_us": {
-      "p50": -8,
-      "p90": 2,
-      "p99": -76
-    },
-    "constrained_minus_no_tools_us": {
-      "p50": -88,
-      "p90": -77,
-      "p99": 22
-    },
-    "activation_us": {
-      "rewind": {
-        "p50": 325,
-        "p90": 371,
-        "p99": 371
+    "greedy": {
+      "no_tools_itl_us": {
+        "p50": 9833,
+        "p90": 10006,
+        "p99": 10699
       },
-      "compile": {
-        "p50": 808,
-        "p90": 827,
-        "p99": 827
+      "auto_no_trigger_itl_us": {
+        "p50": 9859,
+        "p90": 10037,
+        "p99": 10611
+      },
+      "constrained_post_trigger_itl_us": {
+        "p50": 9748,
+        "p90": 9865,
+        "p99": 9954
+      },
+      "auto_no_trigger_minus_no_tools_us": {
+        "p50": 26,
+        "p90": 31,
+        "p99": -88
+      },
+      "constrained_minus_no_tools_us": {
+        "p50": -85,
+        "p90": -141,
+        "p99": -745
+      },
+      "activation_us": {
+        "rewind": {
+          "p50": 325,
+          "p90": 371,
+          "p99": 371
+        },
+        "compile": {
+          "p50": 808,
+          "p90": 827,
+          "p99": 827
+        }
+      }
+    },
+    "qwen_default": {
+      "no_tools_itl_us": {
+        "p50": 9906,
+        "p90": 10078,
+        "p99": 10457
+      },
+      "constrained_post_trigger_itl_us": {
+        "p50": 9843,
+        "p90": 9914,
+        "p99": 10293
+      },
+      "constrained_minus_no_tools_us": {
+        "p50": -63,
+        "p90": -164,
+        "p99": -164
       }
     },
     "peak_rss_mib": 23083
