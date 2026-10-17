@@ -15,6 +15,12 @@ pub fn qwen3_coder_chat_format() -> &'static Path {
     Path::new(env!("QWEN3_CODER_CHAT_FORMAT"))
 }
 
+/// Returns the path to the custom chat-format component.
+#[must_use]
+pub fn custom_chat_format() -> &'static Path {
+    Path::new(env!("CUSTOM_CHAT_FORMAT"))
+}
+
 /// Returns the path to the minimal engine component.
 #[must_use]
 pub fn engine_smoke() -> &'static Path {

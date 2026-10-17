@@ -1,0 +1,18 @@
+[package]
+name = "custom-chat-format-smoke"
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+forja-chat-format = { path = "../../../crates/forja-chat-format" }
+qwen3-coder-xml = { path = "../../../chat-formats/qwen3-coder-xml" }
+
+[target.'cfg(target_family = "wasm")'.dependencies]
+wit-bindgen = "0.62"
+
+[lints]
+workspace = true

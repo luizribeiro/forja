@@ -3,7 +3,7 @@
 use std::{
     env,
     ffi::{OsStr, OsString},
-    fs, io,
+    io,
     path::{Path, PathBuf},
     process::Command,
 };
@@ -57,12 +57,7 @@ fn build_target(
     environment: &[(&str, &OsStr)],
 ) -> io::Result<()> {
     let cargo = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-    let repository = manifest
-        .parent()
-        .and_then(Path::parent)
-        .and_then(Path::parent)
-        .ok_or_else(|| io::Error::other("component manifest has no repository root"))?;
-    let repository = fs::canonicalize(repository)?;
+    let repository = repository_root(manifest)?;
     let cargo_home = env::var_os("CARGO_HOME")
         .map(PathBuf::from)
         .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".cargo")))
@@ -102,6 +97,14 @@ fn build_target(
             "component build failed with {status}"
         )))
     }
+}
+
+fn repository_root(manifest: &Path) -> io::Result<PathBuf> {
+    manifest
+        .ancestors()
+        .find(|path| path.join("wit").is_dir() && path.join("crates/forja-build").is_dir())
+        .map(Path::to_owned)
+        .ok_or_else(|| io::Error::other("component manifest is outside the repository"))
 }
 
 /// Encodes a wit-bindgen core module as a zero-import component.
@@ -250,5 +253,15 @@ mod tests {
             ),
             "synthetic:0:/workspace/support/guests/synthetic/Cargo.toml\0synthetic/src/lib.rs\0"
         );
+    }
+
+    #[test]
+    fn finds_the_repository_above_nested_guest_workspaces() {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .unwrap();
+        let manifest = repository.join("support/guests/custom-chat-format-smoke/Cargo.toml");
+        assert_eq!(repository_root(&manifest).unwrap(), repository);
     }
 }

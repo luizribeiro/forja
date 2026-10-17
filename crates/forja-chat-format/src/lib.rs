@@ -115,6 +115,12 @@ pub trait ToolFormat {
 #[macro_export]
 macro_rules! export_component {
     ($format:ty, $data:ident) => {
+        $crate::export_component!(@with_wit $format, $data, "../../wit");
+    };
+    ($format:ty, $data:ident, $wit:literal) => {
+        $crate::export_component!(@with_wit $format, $data, $wit);
+    };
+    (@with_wit $format:ty, $data:ident, $wit:literal) => {
         #[allow(clippy::same_length_and_capacity)]
         mod component {
             use std::{
@@ -123,7 +129,7 @@ macro_rules! export_component {
             };
 
             wit_bindgen::generate!({
-                path: "../../wit",
+                path: $wit,
                 world: "chat-format-component",
             });
 

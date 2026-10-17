@@ -93,20 +93,32 @@ pub(crate) fn build(
     fs::create_dir_all(output.parent().ok_or("engine output has no parent")?)?;
     fs::write(&output, component)?;
     if let Some(chat) = profile.chat() {
-        build_chat_format(&profile, chat, models, &build_dir, &output)?;
+        if let Some(format) = &chat.tool_format {
+            build_chat_format(
+                &profile,
+                format,
+                &chat.tool_format_options,
+                models,
+                &build_dir,
+                &output,
+            )?;
+        } else if let Some(component) = &chat.component {
+            build_custom_chat_format(component, &build_dir, &output)?;
+        }
     }
     Ok(output)
 }
 
 fn build_chat_format(
     profile: &Profile,
-    chat: &forja_config::Chat,
+    format: &str,
+    format_options: &std::collections::BTreeMap<String, toml::Value>,
     models: Option<&Path>,
     build_dir: &Path,
     engine_output: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let options = serde_json::to_string(&chat.tool_format_options)?;
-    validate_tool_format(&chat.tool_format, &options)?;
+    let options = serde_json::to_string(format_options)?;
+    validate_tool_format(format, &options)?;
     let model_name = profile
         .model()
         .id
@@ -142,7 +154,7 @@ fn build_chat_format(
     build_chat_component(
         &manifest,
         &target_dir,
-        &["--no-default-features", "--features", &chat.tool_format],
+        &["--no-default-features", "--features", format],
         &[
             ("FORJA_CHAT_TEMPLATE", template.as_os_str()),
             ("FORJA_GENERATION_CONFIG", generation.as_os_str()),
@@ -173,6 +185,7 @@ fn verify_chat_input(
     }
     Ok(())
 }
+
 fn build_chat_component(
     manifest: &Path,
     target_dir: &Path,
@@ -191,6 +204,23 @@ fn build_chat_component(
     let component = forja_build::encode_component(&module)?;
     fs::write(engine_output.with_extension("chat-format.wasm"), component)?;
     Ok(())
+}
+
+fn build_custom_chat_format(
+    name: &str,
+    build_dir: &Path,
+    engine_output: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let manifest = fs::canonicalize(Path::new("chat-formats").join(name).join("Cargo.toml"))?;
+    let target_dir = build_dir.join("chat-format");
+    build_chat_component(
+        &manifest,
+        &target_dir,
+        &[],
+        &[],
+        &name.replace('-', "_"),
+        engine_output,
+    )
 }
 
 fn validate_tool_format(format: &str, options: &str) -> Result<(), String> {
@@ -349,7 +379,10 @@ mod tests {
         )
         .unwrap();
         let profile: Profile = toml::from_str(&fs::read_to_string(path).unwrap()).unwrap();
-        assert_eq!(profile.chat().unwrap().tool_format, "qwen3-coder-xml");
+        assert_eq!(
+            profile.chat().unwrap().tool_format.as_deref(),
+            Some("qwen3-coder-xml")
+        );
     }
 
     #[test]

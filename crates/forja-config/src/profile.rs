@@ -149,9 +149,11 @@ pub struct Build {
 #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 pub struct Chat {
     /// Tool-call protocol implemented by the component.
-    pub tool_format: String,
+    pub tool_format: Option<String>,
     /// Named compatibility quirks understood by the selected format.
     pub tool_format_options: BTreeMap<String, toml::Value>,
+    /// Custom chat-format component crate.
+    pub component: Option<String>,
 }
 
 /// Model identity pinned by a profile.
@@ -392,14 +394,28 @@ fn validate(profile: &ProfileData) -> Result<(), String> {
     )?;
     validate_build_features(&profile.build.features)?;
     if let Some(chat) = &profile.chat {
-        validate_slug("chat.tool-format", &chat.tool_format)?;
-        if profile.model.chat_template_sha256.is_none()
-            || profile.model.generation_config_sha256.is_none()
-        {
-            return Err(
-                "chat.tool-format requires model chat-template-sha256 and generation-config-sha256"
-                    .to_owned(),
-            );
+        match (&chat.tool_format, &chat.component) {
+            (Some(format), None) => {
+                validate_slug("chat.tool-format", format)?;
+                if profile.model.chat_template_sha256.is_none()
+                    || profile.model.generation_config_sha256.is_none()
+                {
+                    return Err(
+                        "chat.tool-format requires model chat-template-sha256 and generation-config-sha256"
+                            .to_owned(),
+                    );
+                }
+            }
+            (None, Some(component)) => {
+                validate_slug("chat.component", component)?;
+                if !chat.tool_format_options.is_empty() {
+                    return Err("chat.tool-format-options requires chat.tool-format".to_owned());
+                }
+            }
+            (Some(_), Some(_)) => {
+                return Err("chat must select either tool-format or component".to_owned());
+            }
+            (None, None) => return Err("chat must select tool-format or component".to_owned()),
         }
         require_count(
             "chat.tool-format-options",

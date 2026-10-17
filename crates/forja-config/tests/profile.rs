@@ -82,7 +82,7 @@ fn parses_typed_chat_settings() {
     );
     let profile: Profile = toml::from_str(&source).unwrap();
     let chat = profile.chat().unwrap();
-    assert_eq!(chat.tool_format, "qwen3-coder-xml");
+    assert_eq!(chat.tool_format.as_deref(), Some("qwen3-coder-xml"));
     assert!(chat.tool_format_options.is_empty());
     assert!(error(&source.replace("qwen3-coder-xml", "Qwen XML")).contains("lowercase ASCII"));
     assert!(
@@ -95,6 +95,27 @@ fn parses_typed_chat_settings() {
             ""
         ))
         .contains("requires model chat-template-sha256")
+    );
+}
+
+#[test]
+fn accepts_one_chat_component_source() {
+    let custom = format!("{PROFILE}\n[chat]\ncomponent = \"custom-smoke\"\n");
+    assert_eq!(
+        toml::from_str::<Profile>(&custom)
+            .unwrap()
+            .chat()
+            .unwrap()
+            .component
+            .as_deref(),
+        Some("custom-smoke")
+    );
+    assert!(error(&format!("{custom}tool-format = \"qwen3-coder-xml\"\n")).contains("either"));
+    assert!(
+        error(&format!(
+            "{custom}tool-format-options = {{ quirk = true }}\n"
+        ))
+        .contains("requires")
     );
 }
 

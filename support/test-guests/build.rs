@@ -32,6 +32,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "metal-variant-smoke",
             "--exclude",
             "chat-format-smoke",
+            "--exclude",
+            "custom-chat-format-smoke",
         ],
     )?;
     forja_build::build_component(
@@ -59,6 +61,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?)?;
     let qwen_chat_format_path = out_dir.join("qwen3-coder.chat-format.wasm");
     fs::write(&qwen_chat_format_path, qwen_chat_format)?;
+    let custom_manifest = repository.join("support/guests/custom-chat-format-smoke/Cargo.toml");
+    forja_build::build_core_module(&custom_manifest, &qwen_chat_target_dir, &[])?;
+    let custom_chat_format = forja_build::encode_component(&fs::read(
+        qwen_chat_target_dir.join("wasm32-unknown-unknown/release/custom_chat_format_smoke.wasm"),
+    )?)?;
+    let custom_chat_format_path = out_dir.join("custom-chat-format-smoke.wasm");
+    fs::write(&custom_chat_format_path, custom_chat_format)?;
     forja_build::build_component(&qwen3_manifest, &guest_target_dir, &[])?;
     forja_build::build_component(&qwen3_manifest, &bf16_target_dir, &["--features", "bf16"])?;
 
@@ -75,6 +84,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     emit_guest_path("HELLO_COMPONENT", &release_dir.join("hello.wasm"));
     emit_guest_path("CHAT_FORMAT_SMOKE_COMPONENT", &chat_format_path);
     emit_guest_path("QWEN3_CODER_CHAT_FORMAT", &qwen_chat_format_path);
+    emit_guest_path("CUSTOM_CHAT_FORMAT", &custom_chat_format_path);
     emit_guest_path(
         "METAL_VARIANT_SMOKE_COMPONENT",
         &release_dir.join("metal_variant_smoke.wasm"),

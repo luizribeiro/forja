@@ -67,6 +67,7 @@ fn component_declares_no_imports() {
     for path in [
         test_guests::chat_format_smoke(),
         test_guests::qwen3_coder_chat_format(),
+        test_guests::custom_chat_format(),
     ] {
         let component = wasmtime::component::Component::from_file(&engine, path).unwrap();
         assert_eq!(
@@ -76,6 +77,23 @@ fn component_declares_no_imports() {
             path.display()
         );
     }
+}
+
+#[test]
+fn runs_a_custom_chat_format_component() {
+    let mut format = ChatFormat::load(
+        test_guests::custom_chat_format(),
+        ChatFormatLimits::default(),
+    )
+    .unwrap();
+    assert_eq!(format.info().stop_token_ids, [7]);
+    assert_eq!(
+        format
+            .render(r#"[{"content":"custom"}]"#, "null", "{}")
+            .unwrap()
+            .unwrap(),
+        "custom"
+    );
 }
 
 #[test]
