@@ -538,6 +538,24 @@ fn stream_data(event: GenerationEvent, id: &str, created: u64, model: &str, chat
             "choices": [{"index": 0, "text": text, "finish_reason": Value::Null}],
         })
         .to_string(),
+        GenerationEvent::ToolCallStart(name) if chat => json!({
+            "id": id, "object": object, "created": created, "model": model,
+            "choices": [{"index": 0, "delta": {"tool_calls": [{
+                "index": 0, "id": "call_0", "type": "function",
+                "function": {"name": name, "arguments": ""}
+            }]}, "finish_reason": Value::Null}],
+        })
+        .to_string(),
+        GenerationEvent::ToolArguments(arguments) if chat => json!({
+            "id": id, "object": object, "created": created, "model": model,
+            "choices": [{"index": 0, "delta": {"tool_calls": [{
+                "index": 0, "function": {"arguments": arguments}
+            }]}, "finish_reason": Value::Null}],
+        })
+        .to_string(),
+        GenerationEvent::ToolCallStart(_) | GenerationEvent::ToolArguments(_) => {
+            error_value("text completions cannot emit tool calls", "server_error").to_string()
+        }
         GenerationEvent::Finished(reason, _) if chat => json!({
             "id": id, "object": object, "created": created, "model": model,
             "choices": [{"index": 0, "delta": {}, "finish_reason": crate::response::finish_reason(reason)}],
@@ -977,10 +995,27 @@ mod tests {
             "model",
             true,
         );
+        let call = stream_data(
+            GenerationEvent::ToolCallStart("read_file".to_owned()),
+            "id",
+            1,
+            "model",
+            true,
+        );
+        let arguments = stream_data(
+            GenerationEvent::ToolArguments("{\"path\":\"a.rs\"}".to_owned()),
+            "id",
+            1,
+            "model",
+            true,
+        );
         let usage = stream_data(GenerationEvent::Usage(usage), "id", 1, "model", true);
         assert!(role.contains("assistant"));
         assert!(content.contains("hi"));
         assert!(finish.contains("stop"));
+        assert!(call.contains("call_0"));
+        assert!(call.contains("read_file"));
+        assert!(arguments.contains("path"));
         assert!(usage.contains("total_tokens\":10"));
         assert_eq!(
             stream_data(GenerationEvent::Done, "id", 1, "model", true),

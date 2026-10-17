@@ -246,6 +246,10 @@ pub enum GenerationEvent {
     Role,
     /// Decoded content safe to expose to the client.
     Content(String),
+    /// Begins the only function call in a streamed turn.
+    ToolCallStart(String),
+    /// Appends canonical JSON to the streamed function arguments.
+    ToolArguments(String),
     /// The terminal choice chunk.
     Finished(FinishReason, Usage),
     /// Optional usage-only chunk.
