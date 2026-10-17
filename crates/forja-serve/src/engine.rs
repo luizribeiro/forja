@@ -1937,6 +1937,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn lazy_constraint_preserves_output_before_its_trigger() {
+        let plan = ConstraintPlan {
+            grammar: String::new(),
+            trigger: "<tool_call>\n".to_owned(),
+            trigger_tokens: vec![7, 8],
+            forced: false,
+            tools: Vec::new(),
+            selected: None,
+        };
+        let control = GenerationControl::new(Duration::from_secs(1));
+        let mut ordinary = BoundaryState::new(&[], None);
+        let mut lazy = BoundaryState::new(&[], Some(&plan));
+        let mut ordinary_text = String::new();
+        let mut lazy_text = String::new();
+        for (token, piece) in [(1, "ordinary "), (2, "answer")] {
+            let ordinary_action = ordinary
+                .process(
+                    token,
+                    Some(piece.to_owned()),
+                    &mut ordinary_text,
+                    None,
+                    &control,
+                )
+                .await
+                .unwrap();
+            let lazy_action = lazy
+                .process(
+                    token,
+                    Some(piece.to_owned()),
+                    &mut lazy_text,
+                    None,
+                    &control,
+                )
+                .await
+                .unwrap();
+            assert!(matches!(ordinary_action, BoundaryAction::Continue));
+            assert!(matches!(lazy_action, BoundaryAction::Continue));
+        }
+        ordinary
+            .finish(&mut ordinary_text, None, &control)
+            .await
+            .unwrap();
+        lazy.finish(&mut lazy_text, None, &control).await.unwrap();
+        assert_eq!(lazy_text, ordinary_text);
+    }
+
+    #[tokio::test]
     async fn component_events_build_one_validated_call() {
         let tool = serde_json::from_value(serde_json::json!({
             "type": "function",

@@ -38,6 +38,11 @@ enum Job {
         token: u32,
         reply: oneshot::Sender<Result<(), String>>,
     },
+    #[cfg(test)]
+    LexerStates {
+        id: u64,
+        reply: oneshot::Sender<Result<usize, String>>,
+    },
     Remove(u64),
 }
 
@@ -179,6 +184,17 @@ impl GuidanceSession {
             .map_err(|_| "grammar worker stopped".to_owned())?
     }
 
+    #[cfg(test)]
+    async fn lexer_states(&self) -> Result<usize, String> {
+        let (reply, response) = oneshot::channel();
+        self.jobs
+            .try_send(Job::LexerStates { id: self.id, reply })
+            .map_err(|_| "grammar worker is busy".to_owned())?;
+        response
+            .await
+            .map_err(|_| "grammar worker stopped".to_owned())?
+    }
+
     /// Requests cooperative cancellation without waiting for the worker.
     pub fn cancel(&self) {
         self.cancellation.cancel();
@@ -289,6 +305,14 @@ fn run_worker(
                     });
                 let _ = reply.send(result);
             }
+            #[cfg(test)]
+            Job::LexerStates { id, reply } => {
+                let result = constraints
+                    .get(&id)
+                    .ok_or_else(|| "grammar session is not active".to_owned())
+                    .map(|constraint| constraint.parser.parser.lexer_stats().num_states);
+                let _ = reply.send(result);
+            }
             Job::Remove(id) => {
                 constraints.remove(&id);
             }
@@ -298,6 +322,8 @@ fn run_worker(
 
 #[cfg(test)]
 mod tests {
+    use std::{env, path::PathBuf, time::Instant};
+
     use tokenizers::{Tokenizer, decoders::byte_level::ByteLevel, models::bpe::BPE};
 
     use super::{GuidanceWorker, MAX_GRAMMAR_BYTES};
@@ -342,5 +368,63 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.contains("byte ceiling"));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires FORJA_MODELS and records grammar benchmark data"]
+    async fn profiles_qwen_tool_grammar() {
+        let root = PathBuf::from(env::var_os("FORJA_MODELS").unwrap());
+        let tokenizer =
+            Tokenizer::from_file(root.join("Qwen3-Coder-30B-A3B-Instruct-4bit/tokenizer.json"))
+                .unwrap();
+        let mut format = crate::ChatFormat::load(
+            test_guests::qwen3_coder_chat_format(),
+            crate::ChatFormatLimits::default(),
+        )
+        .unwrap();
+        let tools = serde_json::json!([{"type":"function","function":{
+            "name":"read_file","description":"Read one source file","parameters":{
+                "type":"object","properties":{"path":{"type":"string","enum":["src/main.rs"]}},
+                "required":["path"],"additionalProperties":false
+            }
+        }}]);
+        let grammar = format
+            .grammar(
+                &tools.to_string(),
+                r#"{"type":"function","function":{"name":"read_file"}}"#,
+                "null",
+            )
+            .unwrap()
+            .unwrap();
+        let worker = GuidanceWorker::new(&tokenizer, 151_936, &[151_645, 151_643]).unwrap();
+        let compile_started = Instant::now();
+        let session = worker.compile(grammar.grammar).await.unwrap();
+        let compile = compile_started.elapsed();
+        let mut masks = Vec::new();
+        loop {
+            let mask_started = Instant::now();
+            let Some(mask) = session.mask().await.unwrap() else {
+                break;
+            };
+            masks.push(mask_started.elapsed());
+            let (word, bits) = mask
+                .iter()
+                .copied()
+                .enumerate()
+                .find(|(_, bits)| *bits != 0)
+                .unwrap();
+            let token = u32::try_from(word).unwrap() * 32 + bits.trailing_zeros();
+            session.commit(token).await.unwrap();
+        }
+        masks.sort_unstable();
+        let percentile = |percent: usize| masks[(masks.len() * percent).div_ceil(100) - 1];
+        eprintln!(
+            "Qwen grammar compile {compile:?}; lexer states {}; masks {}; mask p50/p90/p99 {:?}/{:?}/{:?}",
+            session.lexer_states().await.unwrap(),
+            masks.len(),
+            percentile(50),
+            percentile(90),
+            percentile(99)
+        );
     }
 }
