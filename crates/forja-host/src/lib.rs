@@ -242,6 +242,15 @@ pub struct EngineDecodeOutput {
     pub token: EngineTensor,
 }
 
+/// Input to the forward phase of constrained decode.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EngineBeginDecode {
+    /// Tokens to process, or `None` to reuse the retained feedback token.
+    pub tokens: Option<Vec<u32>>,
+    /// Position assigned to the first token.
+    pub start_pos: u32,
+}
+
 /// Cumulative execution counters for an engine runner.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct EngineMetrics {
@@ -821,6 +830,146 @@ where
     ) -> wasmtime::Result<Result<EngineDecodeOutput, compute::Error>> {
         self.with_profile(move |runner| Box::pin(runner.decode_inner(input, false)))
             .await
+    }
+
+    /// Runs the forward phase of constrained decode and retains its logits.
+    ///
+    /// # Errors
+    ///
+    /// Returns a component execution error or the engine's structured failure.
+    pub async fn begin_decode(
+        &mut self,
+        input: EngineBeginDecode,
+    ) -> wasmtime::Result<Result<EngineTensor, compute::Error>> {
+        if let Err(error) = self.release_outputs() {
+            return Ok(Err(error));
+        }
+        self.set_guest_deadline();
+        let engine = self.instance.l9o_gpu_engine();
+        let logits = match self
+            .store
+            .run_concurrent(async move |accessor| {
+                engine
+                    .call_begin_decode(accessor, input.tokens, input.start_pos)
+                    .await
+            })
+            .await
+        {
+            Ok(output) => output?,
+            Err(error) if is_epoch_timeout(&error) => return Ok(Err(guest_timeout())),
+            Err(error) => return Err(error),
+        }?;
+        let info = match &self.info {
+            Some(info) => info.clone(),
+            None => self.describe().await?,
+        };
+        if let Err(error) = self.validate_logits(&info, &logits) {
+            return Ok(Err(error));
+        }
+        self.output_handles.push(logits.rep());
+        Ok(Ok(EngineTensor {
+            handle: logits.rep(),
+            runner_id: self.id,
+        }))
+    }
+
+    /// Selects a constrained token from logits returned by [`Self::begin_decode`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a component execution error or the engine's structured failure.
+    pub async fn finish_decode(
+        &mut self,
+        logits: &EngineTensor,
+        start_pos: u32,
+        sampling: SamplingParams,
+        allow: &[u32],
+    ) -> wasmtime::Result<Result<EngineDecodeOutput, compute::Error>> {
+        if logits.runner_id != self.id {
+            return Ok(Err(invalid_handle(
+                "engine tensor belongs to another runner",
+            )));
+        }
+        self.set_guest_deadline();
+        let engine = self.instance.l9o_gpu_engine();
+        let borrowed = Resource::new_borrow(logits.handle);
+        let allow = allow.to_vec();
+        let output = match self
+            .store
+            .run_concurrent(async move |accessor| {
+                engine
+                    .call_finish_decode(
+                        accessor,
+                        borrowed,
+                        start_pos,
+                        engine_bindings::exports::l9o::gpu::engine::SamplingParams {
+                            temperature: sampling.temperature,
+                            top_k: sampling.top_k,
+                            top_p: sampling.top_p,
+                            seed: sampling.seed,
+                        },
+                        allow,
+                    )
+                    .await
+            })
+            .await
+        {
+            Ok(output) => output?,
+            Err(error) if is_epoch_timeout(&error) => return Ok(Err(guest_timeout())),
+            Err(error) => return Err(error),
+        };
+        let output = match output {
+            Ok(output) => output,
+            Err(error) => return Ok(Err(error)),
+        };
+        let info = match &self.info {
+            Some(info) => info.clone(),
+            None => self.describe().await?,
+        };
+        if let Err(error) = self.validate_decode_output(&info, &output.logits, &output.token) {
+            return Ok(Err(error));
+        }
+        if let Err(error) = self.release_outputs() {
+            return Ok(Err(error));
+        }
+        self.output_handles = vec![output.logits.rep(), output.token.rep()];
+        Ok(Ok(EngineDecodeOutput {
+            logits: EngineTensor {
+                handle: output.logits.rep(),
+                runner_id: self.id,
+            },
+            token: EngineTensor {
+                handle: output.token.rep(),
+                runner_id: self.id,
+            },
+        }))
+    }
+
+    /// Restores engine feedback for a constrained decode rewind.
+    ///
+    /// # Errors
+    ///
+    /// Returns a component execution error or the engine's structured failure.
+    pub async fn rewind_decode(
+        &mut self,
+        next_pos: u32,
+    ) -> wasmtime::Result<Result<(), compute::Error>> {
+        if let Err(error) = self.release_outputs() {
+            return Ok(Err(error));
+        }
+        self.set_guest_deadline();
+        let engine = self.instance.l9o_gpu_engine();
+        match self
+            .store
+            .run_concurrent(async move |accessor| {
+                engine.call_rewind_decode(accessor, next_pos).await
+            })
+            .await
+        {
+            Ok(output) => output,
+            Err(error) if is_epoch_timeout(&error) => Ok(Err(guest_timeout())),
+            Err(error) => Err(error),
+        }
     }
 
     async fn decode_inner(
