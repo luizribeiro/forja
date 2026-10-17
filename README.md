@@ -4,6 +4,9 @@ Forja is a trusted Rust host for running LLM-written inference engines as WebAss
 
 This project is under construction.
 
+See [engine profiles](engines/) and [chat formats](chat-formats/) for supported models and serving
+formats.
+
 Weight grants are capabilities for operator-owned model files. Granted files must not be modified
 or truncated while a guest or tensor can still reference them. Breaking that contract can change
 inference inputs or terminate the host with a bus error.
