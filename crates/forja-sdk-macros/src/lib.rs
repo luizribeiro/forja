@@ -115,6 +115,7 @@ fn expand_engine(item: &ItemImpl) -> syn::Result<proc_macro2::TokenStream> {
 
 fn engine_guest_impl() -> proc_macro2::TokenStream {
     let load_config = engine_load_config();
+    let decode_phases = engine_decode_phases();
     quote! {
         impl Guest for Component {
             fn describe() -> WitEngineInfo {
@@ -189,6 +190,8 @@ fn engine_guest_impl() -> proc_macro2::TokenStream {
                     token: output.token.into_guest(),
                 })
             }
+
+            #decode_phases
         }
 
         fn with_engine<T>(
@@ -211,6 +214,62 @@ fn engine_guest_impl() -> proc_macro2::TokenStream {
             let len = u32::try_from(tokens.len())
                 .map_err(|_| compute::Error::Layout("token count exceeds u32".into()))?;
             ::forja_sdk::Tensor::from_slice(tokens, &[len]).map_err(wit_error)
+        }
+    }
+}
+
+fn engine_decode_phases() -> proc_macro2::TokenStream {
+    quote! {
+        async fn begin_decode(
+            tokens: Option<Vec<u32>>,
+            start_pos: u32,
+        ) -> ::std::result::Result<compute::Tensor, compute::Error> {
+            let tokens = tokens.as_deref().map(token_tensor).transpose()?;
+            let logits = with_engine(|engine| {
+                <ExportedEngine as ::forja_sdk::Engine>::begin_decode(
+                    engine,
+                    ::forja_sdk::BeginDecodeInput { tokens, start_pos },
+                )
+            })?;
+            ::forja_sdk::eval().map_err(wit_error)?;
+            Ok(logits.into_guest())
+        }
+
+        async fn finish_decode(
+            logits: &compute::Tensor,
+            start_pos: u32,
+            sampling: bindings::exports::l9o::gpu::engine::SamplingParams,
+            allow: Vec<u32>,
+        ) -> ::std::result::Result<DecodeOut, compute::Error> {
+            let vocab = <ExportedEngine as ::forja_sdk::Engine>::describe().vocab;
+            let logits = logits.view(&compute::ViewOp::Reshape(vec![vocab]))?;
+            let logits = ::forja_sdk::Tensor::from_guest(logits, vec![vocab]);
+            let output = with_engine(|engine| {
+                <ExportedEngine as ::forja_sdk::Engine>::finish_decode(
+                    engine,
+                    &logits,
+                    start_pos,
+                    ::forja_sdk::SamplingParams {
+                        temperature: sampling.temperature,
+                        top_k: sampling.top_k,
+                        top_p: sampling.top_p,
+                        seed: sampling.seed,
+                    },
+                    &allow,
+                )
+            })?;
+            ::forja_sdk::eval().map_err(wit_error)?;
+            Ok(DecodeOut {
+                logits: output.logits.into_guest(),
+                token: output.token.into_guest(),
+            })
+        }
+
+        async fn rewind_decode(next_pos: u32) -> ::std::result::Result<(), compute::Error> {
+            with_engine(|engine| {
+                <ExportedEngine as ::forja_sdk::Engine>::rewind_decode(engine, next_pos)
+            })?;
+            ::forja_sdk::eval().map_err(wit_error)
         }
     }
 }

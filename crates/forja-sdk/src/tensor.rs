@@ -1638,6 +1638,12 @@ impl<T: Element> Tensor<T> {
     pub fn into_guest(self) -> sys::guest::compute::Tensor {
         self.handle
     }
+
+    #[cfg(all(target_family = "wasm", not(feature = "native")))]
+    #[doc(hidden)]
+    pub fn from_guest(handle: sys::guest::compute::Tensor, shape: Vec<u32>) -> Self {
+        Self::from_handle(handle, shape)
+    }
 }
 
 impl Tensor<u32> {

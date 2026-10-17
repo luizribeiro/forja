@@ -74,6 +74,29 @@ impl Guest for Component {
             "engine does not support retained-token decode".to_owned(),
         ))
     }
+
+    async fn begin_decode(_tokens: Option<Vec<u32>>, _start_pos: u32) -> Result<Tensor, Error> {
+        Err(Error::OpSignature(
+            "engine does not support constrained decode".to_owned(),
+        ))
+    }
+
+    async fn finish_decode(
+        _logits: &Tensor,
+        _start_pos: u32,
+        _sampling: exports::l9o::gpu::engine::SamplingParams,
+        _allow: Vec<u32>,
+    ) -> Result<DecodeOut, Error> {
+        Err(Error::OpSignature(
+            "engine does not support constrained decode".to_owned(),
+        ))
+    }
+
+    async fn rewind_decode(_next_pos: u32) -> Result<(), Error> {
+        Err(Error::OpSignature(
+            "engine does not support constrained decode".to_owned(),
+        ))
+    }
 }
 
 fn f32_tensor(shape: &[u32], values: &[f32]) -> Result<Tensor, Error> {

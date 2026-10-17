@@ -133,6 +133,14 @@ pub struct DecodeOutput {
     pub token: Tensor<u32>,
 }
 
+/// Input to the forward phase of constrained decode.
+pub struct BeginDecodeInput {
+    /// Tokens to process, or `None` to reuse the retained feedback token.
+    pub tokens: Option<Tensor<u32>>,
+    /// Position assigned to the first token.
+    pub start_pos: u32,
+}
+
 /// A model implementation exported through the component engine contract.
 pub trait Engine: Sized + 'static {
     /// Returns static model metadata without loading weights.
@@ -160,6 +168,45 @@ pub trait Engine: Sized + 'static {
     fn decode(&mut self, _input: DecodeInput) -> Result<DecodeOutput> {
         Err(crate::Error::loading(
             "engine does not support retained-token decode",
+        ))
+    }
+
+    /// Runs the forward phase of constrained decode and retains its logits.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when constrained decode is unavailable or forward execution fails.
+    fn begin_decode(&mut self, _input: BeginDecodeInput) -> Result<Tensor<f32>> {
+        Err(crate::Error::loading(
+            "engine does not support constrained decode",
+        ))
+    }
+
+    /// Selects a constrained token from retained decode logits.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the inputs are invalid or constrained selection fails.
+    fn finish_decode(
+        &mut self,
+        _logits: &Tensor<f32>,
+        _start_pos: u32,
+        _sampling: SamplingParams,
+        _allow: &[u32],
+    ) -> Result<DecodeOutput> {
+        Err(crate::Error::loading(
+            "engine does not support constrained decode",
+        ))
+    }
+
+    /// Restores feedback so decode can resume at `next_pos`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the position cannot be rewound.
+    fn rewind_decode(&mut self, _next_pos: u32) -> Result<()> {
+        Err(crate::Error::loading(
+            "engine does not support constrained decode",
         ))
     }
 }

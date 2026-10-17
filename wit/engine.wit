@@ -69,6 +69,12 @@ interface engine {
   load: async func(w: borrow<weights>, config: load-config) -> result<_, error>;
   step: async func(input: step-in) -> result<step-out, error>;
   decode: async func(input: decode-in) -> result<decode-out, error>;
+  begin-decode: async func(tokens: option<list<u32>>, start-pos: u32)
+    -> result<tensor, error>;
+  finish-decode: async func(logits: borrow<tensor>, start-pos: u32,
+                            sampling: sampling-params, allow: list<u32>)
+    -> result<decode-out, error>;
+  rewind-decode: async func(next-pos: u32) -> result<_, error>;
 }
 
 // This initial contract uses one sequence and engine-owned cache tensors.

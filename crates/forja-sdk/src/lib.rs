@@ -114,8 +114,8 @@ use std::{error, fmt};
 
 pub use element::{Element, FloatElement};
 pub use engine::{
-    DecodeInput, DecodeOutput, Engine, EngineInfo, EngineLoadConfig, FixedVariantPick,
-    SamplingParams, StepInput, StepOutput, VariantPickArm, VariantRulePick,
+    BeginDecodeInput, DecodeInput, DecodeOutput, Engine, EngineInfo, EngineLoadConfig,
+    FixedVariantPick, SamplingParams, StepInput, StepOutput, VariantPickArm, VariantRulePick,
 };
 pub use forja_sdk_macros::{Load, export_engine, kernel};
 pub use graph::{Dim, Graph, GraphResult, Param, Pos, capture, eval};
