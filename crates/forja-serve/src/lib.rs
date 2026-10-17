@@ -10,6 +10,8 @@ mod http;
 mod request;
 mod response;
 mod stop;
+#[cfg(test)]
+mod tool_output;
 
 pub use chat_format::{
     ChatEvent, ChatFormat, ChatFormatLimits, ChatInfo, GrammarOutput, SamplingDefaults,
