@@ -100,7 +100,7 @@
           cargo-nextest = cargoHook {
             name = "cargo-nextest-hook";
             runtimeInputs = [ pkgs.cargo-nextest ];
-            text = "cargo nextest run --profile ci --release --workspace --all-features --locked --no-tests pass";
+            text = "CARGO_INCREMENTAL=1 cargo nextest run --profile ci --release --workspace --all-features --locked --no-tests pass";
           };
           cargo-nextest-full = cargoHook {
             name = "cargo-nextest-full-hook";
