@@ -5,6 +5,8 @@ family = "qwen3-coder"
 id = "mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit"
 revision = "6e302ea604ad9ab206367e2c501d1571023e7b6d"
 weights-sha256 = "sha256:2f0797714404ba75a18599829d8ab96e316ef0088aa6f49e7cb7eb301043f5ec"
+chat-template-sha256 = "sha256:672e747c77e990320152343b0a4951222e40de5645297905d89afba05586d827"
+generation-config-sha256 = "sha256:c99723ab3ba28630d26ae23def77603b540a46924895af5cf234740d3b27b51d"
 
 [target]
 component = "wasm32-wasip2"

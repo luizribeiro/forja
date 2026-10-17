@@ -70,6 +70,35 @@ fn parses_and_canonicalizes_a_dense_profile() {
 }
 
 #[test]
+fn parses_typed_chat_settings() {
+    let source = format!(
+        "{PROFILE}\n[chat]\ntool-format = \"qwen3-coder-xml\"\ntool-format-options = {{}}\n"
+    )
+    .replace(
+        "[target]",
+        "chat-template-sha256 = \"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\"\n\
+         generation-config-sha256 = \"sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789\"\n\n\
+         [target]",
+    );
+    let profile: Profile = toml::from_str(&source).unwrap();
+    let chat = profile.chat().unwrap();
+    assert_eq!(chat.tool_format, "qwen3-coder-xml");
+    assert!(chat.tool_format_options.is_empty());
+    assert!(error(&source.replace("qwen3-coder-xml", "Qwen XML")).contains("lowercase ASCII"));
+    assert!(
+        error(&source.replace("sha256:0123", "sha256:Z123"))
+            .contains("64 lowercase hexadecimal digits")
+    );
+    assert!(
+        error(&source.replace(
+            "chat-template-sha256 = \"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\"\n",
+            ""
+        ))
+        .contains("requires model chat-template-sha256")
+    );
+}
+
+#[test]
 fn rejects_unknown_fields_and_invalid_identity() {
     assert!(error(&PROFILE.replace("family =", "families =")).contains("unknown field `families`"));
     assert!(

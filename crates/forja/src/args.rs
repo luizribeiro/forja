@@ -294,6 +294,7 @@ pub(crate) struct Serve {
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct Build {
     pub(crate) profile: PathBuf,
+    pub(crate) models: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -460,6 +461,7 @@ fn parse_with(
         )?),
         ParsedCommand::Build(options) => Command::Build(Build {
             profile: options.profile,
+            models: layered.config.paths.models.clone(),
         }),
         ParsedCommand::Catalog(options) => Command::Catalog(Catalog {
             backend: match layered.config.backend.kind {

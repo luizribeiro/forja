@@ -11,11 +11,13 @@ axum.workspace = true
 clap.workspace = true
 forja-core = { path = "../forja-core" }
 forja-build = { path = "../forja-build" }
+forja-chat-format = { path = "../forja-chat-format" }
 forja-config = { path = "../forja-config" }
 forja-cpu = { path = "../forja-cpu" }
 forja-host = { path = "../forja-host" }
 forja-serve = { path = "../forja-serve" }
 golden-fixtures = { path = "../../support/golden-fixtures" }
+qwen3-coder-xml = { path = "../../chat-formats/qwen3-coder-xml" }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

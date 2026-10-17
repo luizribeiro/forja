@@ -4,7 +4,10 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
+use forja_chat_format::ToolFormat;
 use forja_config::{Profile, embed_profile, read_profile};
+use qwen3_coder_xml::Qwen3CoderXml;
+use sha2::{Digest, Sha256};
 
 pub(crate) fn engine(path: &Path) -> PathBuf {
     if path.extension() == Some(OsStr::new("wasm")) || path.components().count() != 1 {
@@ -51,7 +54,10 @@ pub(crate) fn model(
         .ok_or_else(|| "profile model resolution requires paths.models or FORJA_MODELS".to_owned())
 }
 
-pub(crate) fn build(profile: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
+pub(crate) fn build(
+    profile: &Path,
+    models: Option<&Path>,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let profile_path = resolve_profile(profile)?;
     let source = fs::read_to_string(&profile_path)?;
     let profile: Profile = toml::from_str(&source)?;
@@ -86,13 +92,15 @@ pub(crate) fn build(profile: &Path) -> Result<PathBuf, Box<dyn std::error::Error
     let output = Path::new("target/engines").join(with_wasm_suffix(OsStr::new(name)));
     fs::create_dir_all(output.parent().ok_or("engine output has no parent")?)?;
     fs::write(&output, component)?;
-    if let Some(format) = &profile.serving().chat_format {
-        build_chat_format(format, &build_dir, &output)?;
+    if let Some(chat) = profile.chat() {
+        build_chat_format(&profile, chat, models, &build_dir, &output)?;
+    } else if let Some(format) = &profile.serving().chat_format {
+        build_legacy_chat_format(format, &build_dir, &output)?;
     }
     Ok(output)
 }
 
-fn build_chat_format(
+fn build_legacy_chat_format(
     format: &str,
     build_dir: &Path,
     engine_output: &Path,
@@ -109,6 +117,108 @@ fn build_chat_format(
     let component = forja_build::encode_component(&module)?;
     fs::write(engine_output.with_extension("chat-format.wasm"), component)?;
     Ok(())
+}
+
+fn build_chat_format(
+    profile: &Profile,
+    chat: &forja_config::Chat,
+    models: Option<&Path>,
+    build_dir: &Path,
+    engine_output: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let options = serde_json::to_string(&chat.tool_format_options)?;
+    validate_tool_format(&chat.tool_format, &options)?;
+    let model_name = profile
+        .model()
+        .id
+        .rsplit('/')
+        .next()
+        .filter(|name| is_safe_component(Path::new(name)))
+        .ok_or("profile model id has no safe final component")?;
+    let model = models
+        .ok_or("chat format build requires paths.models or FORJA_MODELS")?
+        .join(model_name);
+    let template = model.join("chat_template.jinja");
+    let generation = model.join("generation_config.json");
+    verify_chat_input(
+        &template,
+        profile
+            .model()
+            .chat_template_sha256
+            .as_deref()
+            .ok_or("profile has no chat template hash")?,
+        "chat template",
+    )?;
+    verify_chat_input(
+        &generation,
+        profile
+            .model()
+            .generation_config_sha256
+            .as_deref()
+            .ok_or("profile has no generation config hash")?,
+        "generation config",
+    )?;
+    let manifest = fs::canonicalize("crates/forja-chat-format-component/Cargo.toml")?;
+    let target_dir = build_dir.join("chat-format");
+    build_chat_component(
+        &manifest,
+        &target_dir,
+        &["--no-default-features", "--features", &chat.tool_format],
+        &[
+            ("FORJA_CHAT_TEMPLATE", template.as_os_str()),
+            ("FORJA_GENERATION_CONFIG", generation.as_os_str()),
+            ("FORJA_TOOL_FORMAT_OPTIONS", OsStr::new(&options)),
+        ],
+        "forja_chat_format_component",
+        engine_output,
+    )
+}
+
+fn verify_chat_input(
+    path: &Path,
+    expected: &str,
+    description: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let bytes = fs::read(path).map_err(|error| {
+        format!(
+            "{description} is missing or unreadable at {}: {error}",
+            path.display()
+        )
+    })?;
+    let actual = format!("sha256:{:x}", Sha256::digest(bytes));
+    if actual != expected {
+        return Err(format!(
+            "{description} hash mismatch: profile requires {expected}, found {actual}"
+        )
+        .into());
+    }
+    Ok(())
+}
+fn build_chat_component(
+    manifest: &Path,
+    target_dir: &Path,
+    args: &[&str],
+    environment: &[(&str, &OsStr)],
+    crate_name: &str,
+    engine_output: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    forja_build::build_configured_core_module(manifest, target_dir, args, environment)?;
+    let module = fs::read(
+        target_dir
+            .join("wasm32-unknown-unknown/release")
+            .join(crate_name)
+            .with_extension("wasm"),
+    )?;
+    let component = forja_build::encode_component(&module)?;
+    fs::write(engine_output.with_extension("chat-format.wasm"), component)?;
+    Ok(())
+}
+
+fn validate_tool_format(format: &str, options: &str) -> Result<(), String> {
+    match format {
+        "qwen3-coder-xml" => Qwen3CoderXml::options(options).map(|_| ()),
+        format => Err(format!("unsupported tool format {format}")),
+    }
 }
 
 pub(crate) fn read_embedded_profile(path: &Path) -> Result<Profile, String> {
@@ -264,5 +374,27 @@ mod tests {
             profile.serving().chat_format.as_deref(),
             Some("qwen3-coder")
         );
+    }
+
+    #[test]
+    fn validates_options_with_the_selected_tool_format() {
+        assert!(validate_tool_format("qwen3-coder-xml", "{}").is_ok());
+        assert!(validate_tool_format("qwen3-coder-xml", r#"{"unknown":true}"#).is_err());
+        assert!(validate_tool_format("missing", "{}").is_err());
+    }
+
+    #[test]
+    fn rejects_missing_and_mismatched_chat_inputs() {
+        let root = forja_testing::temporary_directory("chat-input-hashes").unwrap();
+        let path = root.join("chat_template.jinja");
+        let expected = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+
+        let missing = verify_chat_input(&path, expected, "chat template").unwrap_err();
+        assert!(missing.to_string().contains("chat template is missing"));
+
+        fs::write(&path, "changed").unwrap();
+        let mismatch = verify_chat_input(&path, expected, "chat template").unwrap_err();
+        assert!(mismatch.to_string().contains("chat template hash mismatch"));
+        fs::remove_dir_all(root).unwrap();
     }
 }

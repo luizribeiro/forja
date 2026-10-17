@@ -52,6 +52,12 @@ impl Profile {
         &self.0.serving
     }
 
+    /// Returns the optional profile-built chat format.
+    #[must_use]
+    pub const fn chat(&self) -> Option<&Chat> {
+        self.0.chat.as_ref()
+    }
+
     /// Returns the numeric formats.
     #[must_use]
     pub const fn numerics(&self) -> &Numerics {
@@ -129,6 +135,7 @@ struct ProfileData {
     target: Target,
     build: Build,
     serving: Serving,
+    chat: Option<Chat>,
     numerics: Numerics,
     workload: Workload,
     variants: Variants,
@@ -152,6 +159,16 @@ pub struct Serving {
     pub chat_format: Option<String>,
 }
 
+/// Profile-built chat-format settings.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
+pub struct Chat {
+    /// Tool-call protocol implemented by the component.
+    pub tool_format: String,
+    /// Named compatibility quirks understood by the selected format.
+    pub tool_format_options: BTreeMap<String, toml::Value>,
+}
+
 /// Model identity pinned by a profile.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
@@ -162,6 +179,10 @@ pub struct Model {
     pub revision: String,
     /// Strong hash of all model weight bytes.
     pub weights_sha256: String,
+    /// Strong hash of the model's chat template, when profile-built chat is enabled.
+    pub chat_template_sha256: Option<String>,
+    /// Strong hash of the model's generation configuration, when profile-built chat is enabled.
+    pub generation_config_sha256: Option<String>,
 }
 
 /// Component and backend target pinned by a profile.
@@ -374,6 +395,12 @@ fn validate(profile: &ProfileData) -> Result<(), String> {
         64,
         "sha256:",
     )?;
+    if let Some(hash) = &profile.model.chat_template_sha256 {
+        validate_hex("model.chat-template-sha256", hash, 64, "sha256:")?;
+    }
+    if let Some(hash) = &profile.model.generation_config_sha256 {
+        validate_hex("model.generation-config-sha256", hash, 64, "sha256:")?;
+    }
     validate_slug(
         "target.device-family",
         profile.target.device_family.as_str(),
@@ -381,6 +408,22 @@ fn validate(profile: &ProfileData) -> Result<(), String> {
     validate_build_features(&profile.build.features)?;
     if let Some(format) = &profile.serving.chat_format {
         validate_slug("serving.chat-format", format)?;
+    }
+    if let Some(chat) = &profile.chat {
+        validate_slug("chat.tool-format", &chat.tool_format)?;
+        if profile.model.chat_template_sha256.is_none()
+            || profile.model.generation_config_sha256.is_none()
+        {
+            return Err(
+                "chat.tool-format requires model chat-template-sha256 and generation-config-sha256"
+                    .to_owned(),
+            );
+        }
+        require_count(
+            "chat.tool-format-options",
+            chat.tool_format_options.len(),
+            MAX_DEFAULT_TUNINGS,
+        )?;
     }
     if profile.workload.prefill_chunk > profile.workload.max_context {
         return Err("workload.prefill-chunk must not exceed max-context".to_owned());

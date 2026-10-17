@@ -40,7 +40,10 @@ fn main() -> ExitCode {
 
 fn run(command: args::Command) -> Result<(), Box<dyn Error>> {
     if let args::Command::Build(options) = command {
-        println!("{}", resolution::build(&options.profile)?.display());
+        println!(
+            "{}",
+            resolution::build(&options.profile, options.models.as_deref())?.display()
+        );
         return Ok(());
     }
     if let args::Command::Catalog(options) = command {

@@ -15,7 +15,7 @@ use std::{
 /// Returns an error when required environment state is unavailable, Cargo cannot be launched, or
 /// the build fails.
 pub fn build_component(manifest: &Path, target_dir: &Path, args: &[&str]) -> io::Result<()> {
-    build_target(manifest, target_dir, "wasm32-wasip2", args)
+    build_target(manifest, target_dir, "wasm32-wasip2", args, &[])
 }
 
 /// Builds one zero-import core WebAssembly module with reproducible compiler inputs.
@@ -25,10 +25,37 @@ pub fn build_component(manifest: &Path, target_dir: &Path, args: &[&str]) -> io:
 /// Returns an error when required environment state is unavailable, Cargo cannot be launched, or
 /// the build fails.
 pub fn build_core_module(manifest: &Path, target_dir: &Path, args: &[&str]) -> io::Result<()> {
-    build_target(manifest, target_dir, "wasm32-unknown-unknown", args)
+    build_target(manifest, target_dir, "wasm32-unknown-unknown", args, &[])
 }
 
-fn build_target(manifest: &Path, target_dir: &Path, target: &str, args: &[&str]) -> io::Result<()> {
+/// Builds one configured zero-import core WebAssembly module reproducibly.
+///
+/// # Errors
+///
+/// Returns an error when required environment state is unavailable, Cargo cannot be launched, or
+/// the build fails.
+pub fn build_configured_core_module(
+    manifest: &Path,
+    target_dir: &Path,
+    args: &[&str],
+    environment: &[(&str, &OsStr)],
+) -> io::Result<()> {
+    build_target(
+        manifest,
+        target_dir,
+        "wasm32-unknown-unknown",
+        args,
+        environment,
+    )
+}
+
+fn build_target(
+    manifest: &Path,
+    target_dir: &Path,
+    target: &str,
+    args: &[&str],
+    environment: &[(&str, &OsStr)],
+) -> io::Result<()> {
     let cargo = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let repository = manifest
         .parent()
@@ -65,6 +92,7 @@ fn build_target(manifest: &Path, target_dir: &Path, target: &str, args: &[&str])
     command.env("FORJA_GUEST_REPOSITORY", repository);
     command.env("FORJA_GUEST_CARGO_HOME", cargo_home);
     command.env("FORJA_GUEST_TARGET_DIR", target_dir);
+    command.envs(environment.iter().copied());
 
     let status = command.status()?;
     if status.success() {
