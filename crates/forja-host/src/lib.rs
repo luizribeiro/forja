@@ -214,8 +214,7 @@ pub struct EngineDecode {
 
 /// A tensor returned by a component and owned by its runner.
 ///
-/// The handle remains valid until the runner starts its next step, which releases every output
-/// from the preceding step before invoking the guest.
+/// The handle remains valid until the runner consumes it or starts a step that replaces outputs.
 #[derive(Debug)]
 pub struct EngineTensor {
     handle: u32,
@@ -841,9 +840,6 @@ where
         &mut self,
         input: EngineBeginDecode,
     ) -> wasmtime::Result<Result<EngineTensor, compute::Error>> {
-        if let Err(error) = self.release_outputs() {
-            return Ok(Err(error));
-        }
         self.set_guest_deadline();
         let engine = self.instance.l9o_gpu_engine();
         let logits = match self
@@ -871,6 +867,20 @@ where
             handle: logits.rep(),
             runner_id: self.id,
         }))
+    }
+
+    /// Releases logits returned by [`Self::begin_decode`] without selecting a token.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-handle or guest resource-release failure.
+    pub fn discard_tensor(&mut self, tensor: &EngineTensor) -> Result<(), compute::Error> {
+        if tensor.runner_id != self.id {
+            return Err(invalid_handle("engine tensor belongs to another runner"));
+        }
+        self.output_handles
+            .retain(|handle| *handle != tensor.handle);
+        self.release_handles(vec![tensor.handle])
     }
 
     /// Selects a constrained token from logits returned by [`Self::begin_decode`].

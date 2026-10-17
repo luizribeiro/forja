@@ -56,6 +56,7 @@ pub(crate) const fn finish_reason(reason: FinishReason) -> &'static str {
     match reason {
         FinishReason::Stop => "stop",
         FinishReason::Length => "length",
+        FinishReason::ToolCalls => "tool_calls",
     }
 }
 

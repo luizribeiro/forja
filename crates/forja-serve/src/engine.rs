@@ -14,11 +14,15 @@ use std::{
 
 use forja_config::HostConfig;
 use forja_core::Backend;
-use forja_host::{EngineDecode, EngineDecodeOutput, EngineInfo, EngineRunner, SamplingParams};
+use forja_host::{
+    EngineBeginDecode, EngineDecode, EngineDecodeOutput, EngineInfo, EngineRunner, EngineTensor,
+    SamplingParams,
+};
 use tokenizers::Tokenizer;
 use tokio::sync::{Notify, mpsc};
 
-use crate::request::{validate_chat_input, validate_completion_input, validate_prompt};
+use crate::guidance::{GuidanceSession, GuidanceWorker};
+use crate::request::{ToolChoice, validate_chat_input, validate_completion_input, validate_prompt};
 use crate::{
     ChatCompletionRequest, ChatFormat, CompletionRequest, ResolvedParams, StopMatcher,
     serving_context_ceiling,
@@ -135,6 +139,14 @@ pub struct PrefilledPrompt {
     pub prompt_tokens: u32,
     /// Engine sampling parameters used by every decode step.
     pub sampling: SamplingParams,
+    constraint: Option<ConstraintPlan>,
+}
+
+struct ConstraintPlan {
+    grammar: String,
+    trigger: String,
+    trigger_tokens: Vec<u32>,
+    forced: bool,
 }
 
 trait PromptRenderer: Send {
@@ -144,6 +156,16 @@ trait PromptRenderer: Send {
         tools: &str,
         options: &str,
     ) -> Result<String, GenerationError>;
+
+    fn grammar(
+        &mut self,
+        tools: &str,
+        choice: &str,
+        response: &str,
+    ) -> Result<crate::GrammarOutput, GenerationError> {
+        let _ = (tools, choice, response);
+        Err(GenerationError::new("tool grammar is unavailable"))
+    }
 }
 
 struct PromptArtifacts<R> {
@@ -162,6 +184,17 @@ impl PromptRenderer for ChatFormat {
             .map_err(|error| GenerationError::new(format!("chat format failed: {error}")))?
             .map_err(GenerationError::invalid)
     }
+
+    fn grammar(
+        &mut self,
+        tools: &str,
+        choice: &str,
+        response: &str,
+    ) -> Result<crate::GrammarOutput, GenerationError> {
+        self.grammar(tools, choice, response)
+            .map_err(|error| GenerationError::new(format!("chat format failed: {error}")))?
+            .map_err(|error| GenerationError::new(format!("chat format grammar failed: {error}")))
+    }
 }
 
 /// Why token generation ended.
@@ -171,6 +204,8 @@ pub enum FinishReason {
     Stop,
     /// The validated output-token limit was reached.
     Length,
+    /// A complete function call was generated.
+    ToolCalls,
 }
 
 /// Token counts for one completed request.
@@ -219,6 +254,7 @@ pub struct ServingEngine<B: Backend + Send + Sync + 'static> {
     config: HostConfig,
     info: EngineInfo,
     max_context: u32,
+    guidance: GuidanceWorker,
 }
 
 impl<B> ServingEngine<B>
@@ -255,6 +291,11 @@ where
             ));
         }
         let chat_info = chat_format.info().clone();
+        let guidance =
+            GuidanceWorker::new(&tokenizer, info.vocab, chat_info.stop_token_ids.as_slice())
+                .map_err(|error| {
+                    GenerationError::new(format!("cannot initialize constraints: {error}"))
+                })?;
         Ok(Self {
             model,
             runner,
@@ -266,6 +307,7 @@ where
             config,
             info,
             max_context,
+            guidance,
         })
     }
 
@@ -316,7 +358,7 @@ where
         request: &ChatCompletionRequest,
         control: &GenerationControl,
     ) -> Result<PrefilledPrompt, GenerationError> {
-        let (tokens, prompt_tokens, params) = prepare_chat_prompt(
+        let (tokens, prompt_tokens, params, constraint) = prepare_chat_prompt(
             request,
             &self.config,
             &self.chat_info,
@@ -326,7 +368,8 @@ where
             control,
         )
         .await?;
-        self.prefill(tokens, prompt_tokens, params, control).await
+        self.prefill(tokens, prompt_tokens, params, constraint, control)
+            .await
     }
 
     async fn prefill_completion(
@@ -344,7 +387,8 @@ where
             control,
         )
         .await?;
-        self.prefill(tokens, prompt_tokens, params, control).await
+        self.prefill(tokens, prompt_tokens, params, None, control)
+            .await
     }
 
     async fn prefill(
@@ -352,6 +396,7 @@ where
         tokens: Vec<u32>,
         prompt_tokens: u32,
         params: ResolvedParams,
+        constraint: Option<ConstraintPlan>,
         control: &GenerationControl,
     ) -> Result<PrefilledPrompt, GenerationError> {
         let sampling = SamplingParams {
@@ -382,6 +427,7 @@ where
             params,
             prompt_tokens,
             sampling,
+            constraint,
         })
     }
 
@@ -485,46 +531,48 @@ where
         sender: Option<&mpsc::Sender<GenerationEvent>>,
         control: &GenerationControl,
     ) -> Result<Completion, GenerationError> {
-        let mut pipeline = DecodePipeline::new(
-            prefill.first,
-            prefill.prompt_tokens,
-            prefill.params.max_tokens,
-        );
+        let DecodeStart {
+            params,
+            prompt_tokens,
+            sampling,
+            constraint,
+            mut guidance,
+            mut constrained,
+            mut pipeline,
+        } = start_decode(&mut self.runner, &self.guidance, prefill).await?;
         let mut consumed = 0_u32;
+        let mut unconstrained_consumed = 0_u32;
         let replay_base = self.runner.metrics().submissions;
         let tokenizer = self.tokenizer()?;
-        let mut decoder = tokenizer.decode_stream(true);
-        let mut boundary = BoundaryState::new(&prefill.params.stops, None);
+        let skip_special_tokens = constraint.as_ref().is_none_or(|plan| plan.forced);
+        let mut decoder = tokenizer.decode_stream(skip_special_tokens);
+        let mut boundary = BoundaryState::new(&params.stops, constraint.as_ref());
         let mut text = String::new();
         let generation = async {
-            while let Some(output) = pipeline.take_next() {
+            while consumed < params.max_tokens && !pipeline.pending.is_empty() {
+                pipeline.activate_next();
                 if control.is_cancelled() {
                     return Err(GenerationError::cancelled());
                 }
-                pipeline.fill(&mut self.runner, prefill.sampling).await?;
-                let bytes = self
-                    .runner
-                    .read_queued_token(output)
-                    .await
-                    .map_err(|error| {
-                        GenerationError::unavailable(format!(
-                            "selected-token read failed: {error:?}"
-                        ))
-                    })?;
-                let token = read_token(&bytes)?;
+                let has_successor = consumed
+                    .checked_add(1)
+                    .is_some_and(|next| next < params.max_tokens);
+                pipeline
+                    .queue_successor(&mut self.runner, constrained, has_successor, sampling)
+                    .await?;
+                let output = pipeline.take_active()?;
+                let token = selected_token(&mut self.runner, output).await?;
                 consumed += 1;
-                if consumed > 1 {
-                    let expected = replay_base
-                        .checked_add(u64::from(consumed - 1))
-                        .ok_or_else(|| GenerationError::new("submission count overflowed"))?;
-                    self.runner
-                        .wait_for_submissions(expected)
-                        .await
-                        .map_err(|error| {
-                            GenerationError::unavailable(format!(
-                                "engine synchronization failed: {error}"
-                            ))
-                        })?;
+                if !constrained {
+                    unconstrained_consumed += 1;
+                }
+                if !constrained {
+                    synchronize_unconstrained(
+                        &mut self.runner,
+                        replay_base,
+                        unconstrained_consumed,
+                    )
+                    .await?;
                 }
                 if self.chat_info.stop_token_ids.contains(&token) {
                     return Ok(FinishReason::Stop);
@@ -532,84 +580,191 @@ where
                 let piece = decoder.step(token).map_err(|error| {
                     GenerationError::new(format!("cannot decode token: {error}"))
                 })?;
-                if matches!(
-                    boundary
-                        .process(token, piece, &mut text, sender, control)
-                        .await?,
-                    BoundaryAction::Stop
-                ) {
+                if constrained {
+                    drop(piece);
+                    if process_constrained_token(
+                        &mut self.runner,
+                        guidance.as_ref(),
+                        token,
+                        &mut pipeline,
+                        sampling,
+                    )
+                    .await?
+                    {
+                        return Ok(FinishReason::ToolCalls);
+                    }
+                    continue;
+                }
+                let action = boundary
+                    .process(token, piece, &mut text, sender, control)
+                    .await?;
+                if matches!(action, BoundaryAction::Stop) {
                     return Ok(FinishReason::Stop);
                 }
+                if matches!(action, BoundaryAction::Activate) && consumed < params.max_tokens {
+                    let speculative = pipeline.pending.pop_front().ok_or_else(|| {
+                        GenerationError::new("trigger activation has no speculative token")
+                    })?;
+                    let (session, output, rewind_pos) = activate_constraint(
+                        &mut self.runner,
+                        &self.guidance,
+                        constraint.as_ref(),
+                        speculative,
+                        sampling,
+                    )
+                    .await?;
+                    pipeline.push_selected(output, rewind_pos)?;
+                    guidance = Some(session);
+                    constrained = true;
+                }
             }
-            boundary.finish(&mut text, sender, control).await?;
+            if !constrained {
+                boundary.finish(&mut text, sender, control).await?;
+            }
             Ok(FinishReason::Length)
         }
         .await;
-        let discard = pipeline.cleanup(&mut self.runner).await;
-        let finish_reason = match (generation, discard) {
-            (Ok(reason), Ok(())) => reason,
-            (Err(error), _) | (Ok(_), Err(error)) => return Err(error),
-        };
-        Ok(Completion {
-            text,
-            finish_reason,
-            usage: Usage {
-                prompt_tokens: prefill.prompt_tokens,
-                completion_tokens: consumed,
-            },
-        })
+        let cleanup = pipeline.cleanup(&mut self.runner).await;
+        finish_completion(generation, cleanup, text, prompt_tokens, consumed)
     }
+}
+
+fn finish_completion(
+    generation: Result<FinishReason, GenerationError>,
+    cleanup: Result<(), GenerationError>,
+    text: String,
+    prompt_tokens: u32,
+    completion_tokens: u32,
+) -> Result<Completion, GenerationError> {
+    let finish_reason = match (generation, cleanup) {
+        (Ok(reason), Ok(())) => reason,
+        (Err(error), _) | (Ok(_), Err(error)) => return Err(error),
+    };
+    Ok(Completion {
+        text,
+        finish_reason,
+        usage: Usage {
+            prompt_tokens,
+            completion_tokens,
+        },
+    })
+}
+
+type PendingDecode = (EngineDecodeOutput, u32);
+
+struct DecodeStart {
+    params: ResolvedParams,
+    prompt_tokens: u32,
+    sampling: SamplingParams,
+    constraint: Option<ConstraintPlan>,
+    guidance: Option<GuidanceSession>,
+    constrained: bool,
+    pipeline: DecodePipeline,
+}
+
+async fn start_decode<B>(
+    runner: &mut EngineRunner<B>,
+    worker: &GuidanceWorker,
+    prefill: PrefilledPrompt,
+) -> Result<DecodeStart, GenerationError>
+where
+    B: Backend + Send + Sync + 'static,
+{
+    let PrefilledPrompt {
+        mut first,
+        params,
+        prompt_tokens,
+        sampling,
+        constraint,
+    } = prefill;
+    let first_pos = prompt_tokens
+        .checked_sub(1)
+        .ok_or_else(|| GenerationError::new("prefill position underflowed"))?;
+    let constrained = constraint.as_ref().is_some_and(|plan| plan.forced);
+    let mut guidance = None;
+    if constrained {
+        let (output, session) = initial_constraint(
+            runner,
+            worker,
+            constraint.as_ref(),
+            &first,
+            first_pos,
+            sampling,
+        )
+        .await?;
+        first = output;
+        guidance = Some(session);
+    }
+    Ok(DecodeStart {
+        params,
+        prompt_tokens,
+        sampling,
+        constraint,
+        guidance,
+        constrained,
+        pipeline: DecodePipeline::new(first, first_pos, prompt_tokens),
+    })
 }
 
 struct DecodePipeline {
-    pending: VecDeque<EngineDecodeOutput>,
-    issued: u32,
+    pending: VecDeque<PendingDecode>,
+    active: Option<PendingDecode>,
+    forward: Option<(EngineTensor, u32)>,
     position: u32,
-    limit: u32,
 }
 
 impl DecodePipeline {
-    fn new(first: EngineDecodeOutput, position: u32, limit: u32) -> Self {
+    fn new(first: EngineDecodeOutput, first_pos: u32, position: u32) -> Self {
         Self {
-            pending: VecDeque::from([first]),
-            issued: 1,
+            pending: VecDeque::from([(first, first_pos)]),
+            active: None,
+            forward: None,
             position,
-            limit,
         }
     }
 
-    fn take_next(&mut self) -> Option<EngineDecodeOutput> {
-        self.pending.pop_front()
+    fn activate_next(&mut self) {
+        self.active = self.pending.pop_front();
     }
 
-    async fn fill<B>(
+    fn take_active(&mut self) -> Result<EngineDecodeOutput, GenerationError> {
+        self.active
+            .take()
+            .map(|(output, _)| output)
+            .ok_or_else(|| GenerationError::new("active decode output is missing"))
+    }
+
+    fn push_selected(
+        &mut self,
+        output: EngineDecodeOutput,
+        start_pos: u32,
+    ) -> Result<(), GenerationError> {
+        self.pending.push_back((output, start_pos));
+        self.position = start_pos
+            .checked_add(1)
+            .ok_or_else(|| GenerationError::new("decode position overflowed"))?;
+        Ok(())
+    }
+
+    async fn queue_successor<B>(
         &mut self,
         runner: &mut EngineRunner<B>,
+        constrained: bool,
+        needed: bool,
         sampling: SamplingParams,
     ) -> Result<(), GenerationError>
     where
         B: Backend + Send + Sync + 'static,
     {
-        while needs_successor(self.pending.len(), self.issued, self.limit) {
-            let output = runner
-                .enqueue_decode(EngineDecode {
-                    tokens: None,
-                    start_pos: self.position,
-                    sampling,
-                })
-                .await
-                .map_err(|error| {
-                    GenerationError::unavailable(format!("engine decode failed: {error}"))
-                })?
-                .map_err(|error| {
-                    GenerationError::unavailable(format!("engine decode failed: {error:?}"))
-                })?;
-            self.pending.push_back(output);
-            self.position = self
-                .position
-                .checked_add(1)
-                .ok_or_else(|| GenerationError::new("decode position overflowed"))?;
-            self.issued += 1;
+        if !needed {
+            return Ok(());
+        }
+        if constrained {
+            let logits = begin_forward(runner, self.position).await?;
+            self.forward = Some((logits, self.position));
+        } else {
+            let output = enqueue_unconstrained(runner, self.position, sampling).await?;
+            self.push_selected(output, self.position)?;
         }
         Ok(())
     }
@@ -618,12 +773,16 @@ impl DecodePipeline {
     where
         B: Backend + Send + Sync + 'static,
     {
-        finalize_sequence(runner, &mut self.pending).await
+        let queued = finalize_sequence(runner, &mut self.pending, self.active.take()).await;
+        let forward = self
+            .forward
+            .take()
+            .map_or(Ok(()), |(logits, _)| discard_forward(runner, &logits));
+        match (queued, forward) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), _) | (Ok(()), Err(error)) => Err(error),
+        }
     }
-}
-
-fn needs_successor(pending: usize, issued: u32, limit: u32) -> bool {
-    pending < 2 && issued < limit
 }
 
 enum BoundaryAction {
@@ -639,15 +798,18 @@ struct BoundaryState {
 }
 
 impl BoundaryState {
-    fn new(stops: &[String], trigger: Option<(&str, &[u32])>) -> Self {
+    fn new(stops: &[String], constraint: Option<&ConstraintPlan>) -> Self {
         let mut stops = stops.to_vec();
-        let trigger_stop = trigger.map(|(text, _)| {
+        let trigger_stop = constraint.filter(|plan| !plan.forced).map(|plan| {
             let index = stops.len();
-            stops.push(text.to_owned());
+            stops.push(plan.trigger.clone());
             index
         });
+        let trigger = constraint
+            .filter(|plan| !plan.forced)
+            .map(|plan| TokenMatcher::new(&plan.trigger_tokens));
         Self {
-            trigger: trigger.map(|(_, tokens)| TokenMatcher::new(tokens)),
+            trigger,
             matcher: StopMatcher::new(&stops),
             trigger_stop,
         }
@@ -700,6 +862,235 @@ impl BoundaryState {
         emit_output(text, output, sender, control).await?;
         Ok(())
     }
+}
+
+async fn initial_constraint<B>(
+    runner: &mut EngineRunner<B>,
+    worker: &GuidanceWorker,
+    plan: Option<&ConstraintPlan>,
+    first: &EngineDecodeOutput,
+    start_pos: u32,
+    sampling: SamplingParams,
+) -> Result<(EngineDecodeOutput, GuidanceSession), GenerationError>
+where
+    B: Backend + Send + Sync + 'static,
+{
+    let session = compile_constraint(worker, plan).await?;
+    let allow = next_mask(&session).await?;
+    let output = finish_selection(runner, &first.logits, start_pos, sampling, &allow).await?;
+    Ok((output, session))
+}
+
+async fn enqueue_unconstrained<B>(
+    runner: &mut EngineRunner<B>,
+    start_pos: u32,
+    sampling: SamplingParams,
+) -> Result<EngineDecodeOutput, GenerationError>
+where
+    B: Backend + Send + Sync + 'static,
+{
+    runner
+        .enqueue_decode(EngineDecode {
+            tokens: None,
+            start_pos,
+            sampling,
+        })
+        .await
+        .map_err(|error| GenerationError::unavailable(format!("engine decode failed: {error}")))?
+        .map_err(|error| GenerationError::unavailable(format!("engine decode failed: {error:?}")))
+}
+
+async fn begin_forward<B>(
+    runner: &mut EngineRunner<B>,
+    start_pos: u32,
+) -> Result<EngineTensor, GenerationError>
+where
+    B: Backend + Send + Sync + 'static,
+{
+    runner
+        .begin_decode(EngineBeginDecode {
+            tokens: None,
+            start_pos,
+        })
+        .await
+        .map_err(|error| {
+            GenerationError::unavailable(format!("constrained forward failed: {error}"))
+        })?
+        .map_err(|error| {
+            GenerationError::unavailable(format!("constrained forward failed: {error:?}"))
+        })
+}
+
+async fn finish_selection<B>(
+    runner: &mut EngineRunner<B>,
+    logits: &EngineTensor,
+    start_pos: u32,
+    sampling: SamplingParams,
+    allow: &[u32],
+) -> Result<EngineDecodeOutput, GenerationError>
+where
+    B: Backend + Send + Sync + 'static,
+{
+    runner
+        .finish_decode(logits, start_pos, sampling, allow)
+        .await
+        .map_err(|error| {
+            GenerationError::unavailable(format!("constrained selection failed: {error}"))
+        })?
+        .map_err(|error| {
+            GenerationError::unavailable(format!("constrained selection failed: {error:?}"))
+        })
+}
+
+async fn selected_token<B>(
+    runner: &mut EngineRunner<B>,
+    output: EngineDecodeOutput,
+) -> Result<u32, GenerationError>
+where
+    B: Backend + Send + Sync + 'static,
+{
+    let bytes = runner.read_queued_token(output).await.map_err(|error| {
+        GenerationError::unavailable(format!("selected-token read failed: {error:?}"))
+    })?;
+    read_token(&bytes)
+}
+
+async fn synchronize_unconstrained<B>(
+    runner: &mut EngineRunner<B>,
+    replay_base: u64,
+    consumed: u32,
+) -> Result<(), GenerationError>
+where
+    B: Backend + Send + Sync + 'static,
+{
+    if consumed <= 1 {
+        return Ok(());
+    }
+    let expected = replay_base
+        .checked_add(u64::from(consumed - 1))
+        .ok_or_else(|| GenerationError::new("submission count overflowed"))?;
+    runner
+        .wait_for_submissions(expected)
+        .await
+        .map_err(|error| {
+            GenerationError::unavailable(format!("engine synchronization failed: {error}"))
+        })
+}
+
+async fn process_constrained_token<B>(
+    runner: &mut EngineRunner<B>,
+    session: Option<&GuidanceSession>,
+    token: u32,
+    pipeline: &mut DecodePipeline,
+    sampling: SamplingParams,
+) -> Result<bool, GenerationError>
+where
+    B: Backend + Send + Sync + 'static,
+{
+    let session = session.ok_or_else(|| GenerationError::new("grammar session is missing"))?;
+    let (complete, next) =
+        advance_constraint(runner, session, token, pipeline.forward.take(), sampling).await?;
+    if let Some((output, start_pos)) = next {
+        pipeline.push_selected(output, start_pos)?;
+    }
+    Ok(complete)
+}
+
+async fn advance_constraint<B>(
+    runner: &mut EngineRunner<B>,
+    session: &GuidanceSession,
+    token: u32,
+    forward: Option<(EngineTensor, u32)>,
+    sampling: SamplingParams,
+) -> Result<(bool, Option<(EngineDecodeOutput, u32)>), GenerationError>
+where
+    B: Backend + Send + Sync + 'static,
+{
+    if session
+        .commit(token)
+        .await
+        .map_err(|error| constraint_error(&error))?
+    {
+        if let Some((logits, _)) = forward {
+            discard_forward(runner, &logits)?;
+        }
+        return Ok((true, None));
+    }
+    let Some((logits, start_pos)) = forward else {
+        return Ok((false, None));
+    };
+    let allow = next_mask(session).await?;
+    let output = finish_selection(runner, &logits, start_pos, sampling, &allow).await?;
+    Ok((false, Some((output, start_pos))))
+}
+
+async fn activate_constraint<B>(
+    runner: &mut EngineRunner<B>,
+    worker: &GuidanceWorker,
+    plan: Option<&ConstraintPlan>,
+    speculative: (EngineDecodeOutput, u32),
+    sampling: SamplingParams,
+) -> Result<(GuidanceSession, EngineDecodeOutput, u32), GenerationError>
+where
+    B: Backend + Send + Sync + 'static,
+{
+    let (speculative, rewind_pos) = speculative;
+    runner
+        .discard_queued_decode(speculative)
+        .await
+        .map_err(|error| {
+            GenerationError::unavailable(format!("speculative decode discard failed: {error:?}"))
+        })?;
+    runner
+        .rewind_decode(rewind_pos)
+        .await
+        .map_err(|error| GenerationError::unavailable(format!("trigger rewind failed: {error}")))?
+        .map_err(|error| {
+            GenerationError::unavailable(format!("trigger rewind failed: {error:?}"))
+        })?;
+    let session = compile_constraint(worker, plan).await?;
+    let allow = next_mask(&session).await?;
+    let logits = begin_forward(runner, rewind_pos).await?;
+    let output = finish_selection(runner, &logits, rewind_pos, sampling, &allow).await?;
+    Ok((session, output, rewind_pos))
+}
+
+fn discard_forward<B>(
+    runner: &mut EngineRunner<B>,
+    logits: &EngineTensor,
+) -> Result<(), GenerationError>
+where
+    B: Backend + Send + Sync + 'static,
+{
+    runner.discard_tensor(logits).map_err(|error| {
+        GenerationError::unavailable(format!("constrained forward cleanup failed: {error:?}"))
+    })
+}
+
+async fn compile_constraint(
+    worker: &GuidanceWorker,
+    plan: Option<&ConstraintPlan>,
+) -> Result<GuidanceSession, GenerationError> {
+    let grammar = plan
+        .ok_or_else(|| GenerationError::new("constraint plan is missing"))?
+        .grammar
+        .clone();
+    worker
+        .compile(grammar)
+        .await
+        .map_err(|error| constraint_error(&error))
+}
+
+async fn next_mask(session: &GuidanceSession) -> Result<Vec<u32>, GenerationError> {
+    session
+        .mask()
+        .await
+        .map_err(|error| constraint_error(&error))?
+        .ok_or_else(|| GenerationError::new("grammar completed before token selection"))
+}
+
+fn constraint_error(error: &str) -> GenerationError {
+    GenerationError::invalid(format!("tool grammar is not usable: {error}"))
 }
 
 struct TokenMatcher {
@@ -822,13 +1213,14 @@ fn read_token(bytes: &[u8]) -> Result<u32, GenerationError> {
 
 async fn finalize_sequence<B>(
     runner: &mut EngineRunner<B>,
-    pending: &mut VecDeque<EngineDecodeOutput>,
+    pending: &mut VecDeque<(EngineDecodeOutput, u32)>,
+    active: Option<(EngineDecodeOutput, u32)>,
 ) -> Result<(), GenerationError>
 where
     B: Backend + Send + Sync + 'static,
 {
     let mut failure = None;
-    for output in pending.drain(..) {
+    for (output, _) in active.into_iter().chain(pending.drain(..)) {
         if let Err(error) = runner.discard_queued_decode(output).await
             && failure.is_none()
         {
@@ -850,7 +1242,7 @@ async fn prepare_chat_prompt<R>(
     vocab: u32,
     prompt: Arc<StdMutex<PromptArtifacts<R>>>,
     control: &GenerationControl,
-) -> Result<(Vec<u32>, u32, ResolvedParams), GenerationError>
+) -> Result<(Vec<u32>, u32, ResolvedParams, Option<ConstraintPlan>), GenerationError>
 where
     R: PromptRenderer + 'static,
 {
@@ -866,8 +1258,17 @@ where
     }
     let messages = serde_json::to_string(&request.messages)
         .map_err(|error| GenerationError::new(format!("cannot encode messages: {error}")))?;
-    let tools = serde_json::to_string(&request.params.tools)
-        .map_err(|error| GenerationError::new(format!("cannot encode tools: {error}")))?;
+    let constraint_mode = constraint_mode(request);
+    let tools = if constraint_mode.is_some() {
+        serde_json::to_string(&request.params.tools)
+            .map_err(|error| GenerationError::new(format!("cannot encode tools: {error}")))?
+    } else {
+        "null".to_owned()
+    };
+    let choice = serde_json::to_string(&request.params.tool_choice)
+        .map_err(|error| GenerationError::new(format!("cannot encode tool choice: {error}")))?;
+    let response = serde_json::to_string(&request.params.response_format)
+        .map_err(|error| GenerationError::new(format!("cannot encode response format: {error}")))?;
     let options = serde_json::to_string(&serde_json::json!({
         "add_generation_prompt": true,
         "tool_choice": request.params.tool_choice.as_ref(),
@@ -876,7 +1277,7 @@ where
     }))
     .map_err(|error| GenerationError::new(format!("cannot encode render options: {error}")))?;
     let max_rendered_bytes = config.request.max_text_bytes.get();
-    let tokens = tokio::task::spawn_blocking(move || {
+    let (tokens, constraint) = tokio::task::spawn_blocking(move || {
         let mut prompt = prompt
             .lock()
             .map_err(|_| GenerationError::new("prompt processor lock is poisoned"))?;
@@ -888,15 +1289,60 @@ where
                 "rendered prompt exceeds the configured byte ceiling",
             ));
         }
-        prompt
+        let constraint = constraint_mode
+            .map(|forced| {
+                let output = prompt.renderer.grammar(&tools, &choice, &response)?;
+                let encoding = prompt
+                    .tokenizer
+                    .encode(output.trigger.as_str(), false)
+                    .map_err(|error| {
+                        GenerationError::new(format!("cannot tokenize tool trigger: {error}"))
+                    })?;
+                let trigger_tokens = encoding.get_ids().to_vec();
+                if trigger_tokens.is_empty()
+                    || !prompt
+                        .tokenizer
+                        .decode(&trigger_tokens, false)
+                        .is_ok_and(|decoded| decoded == output.trigger)
+                {
+                    return Err(GenerationError::new(
+                        "chat format trigger is not a canonical token sequence",
+                    ));
+                }
+                Ok(ConstraintPlan {
+                    grammar: output.grammar,
+                    trigger: output.trigger,
+                    trigger_tokens,
+                    forced,
+                })
+            })
+            .transpose()?;
+        let tokens = prompt
             .tokenizer
             .encode(prompt_text, false)
             .map(|encoding| encoding.get_ids().to_vec())
-            .map_err(|error| GenerationError::new(format!("cannot tokenize prompt: {error}")))
+            .map_err(|error| GenerationError::new(format!("cannot tokenize prompt: {error}")))?;
+        Ok((tokens, constraint))
     })
     .await
     .map_err(|error| GenerationError::new(format!("prompt worker failed: {error}")))??;
-    finish_prompt(tokens, params, max_context, control, "rendered prompt")
+    let (tokens, prompt_tokens, params) =
+        finish_prompt(tokens, params, max_context, control, "rendered prompt")?;
+    Ok((tokens, prompt_tokens, params, constraint))
+}
+
+fn constraint_mode(request: &ChatCompletionRequest) -> Option<bool> {
+    request
+        .params
+        .tools
+        .as_ref()
+        .filter(|tools| !tools.is_empty())?;
+    match request.params.tool_choice.as_ref() {
+        Some(ToolChoice::Mode(mode)) if mode == "none" => None,
+        Some(ToolChoice::Mode(mode)) => Some(mode == "required"),
+        Some(ToolChoice::Named(_)) => Some(true),
+        None => Some(false),
+    }
 }
 
 async fn prepare_completion_prompt<R>(
@@ -987,21 +1433,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn decode_pipeline_bounds_the_speculative_window() {
-        assert!(needs_successor(0, 1, 4));
-        assert!(needs_successor(1, 2, 4));
-        assert!(!needs_successor(2, 3, 4));
-        assert!(!needs_successor(0, 4, 4));
-    }
-
-    #[test]
-    fn token_trigger_matcher_preserves_overlapping_prefixes() {
-        let mut matcher = TokenMatcher::new(&[1, 2, 1]);
-        let hits = [1, 2, 1, 2, 1].map(|token| matcher.push(token));
-        assert_eq!(hits, [false, false, true, false, true]);
-    }
-
     #[tokio::test]
     async fn invalid_message_count_never_calls_chat_format() {
         let calls = Arc::new(AtomicUsize::new(0));
@@ -1038,6 +1469,43 @@ mod tests {
     async fn greedy_sampling_needs_no_entropy() {
         assert_eq!(sampling_seed(None, 0.0).await.unwrap(), 0);
         assert_eq!(sampling_seed(Some(17), 0.7).await.unwrap(), 17);
+    }
+
+    #[test]
+    fn token_trigger_matcher_preserves_overlapping_prefixes() {
+        let mut matcher = TokenMatcher::new(&[1, 2, 1]);
+        let hits = [1, 2, 1, 2, 1].map(|token| matcher.push(token));
+        assert_eq!(hits, [false, false, true, false, true]);
+    }
+
+    #[test]
+    fn constraint_mode_distinguishes_lazy_and_forced_choices() {
+        let request = |choice| {
+            serde_json::from_value::<ChatCompletionRequest>(serde_json::json!({
+                "model": "test",
+                "messages": [{"role": "user", "content": "hello"}],
+                "tools": [{"type": "function", "function": {
+                    "name": "read", "parameters": {"type": "object"}
+                }}],
+                "tool_choice": choice,
+            }))
+            .unwrap()
+        };
+        assert_eq!(
+            constraint_mode(&request(serde_json::json!("auto"))),
+            Some(false)
+        );
+        assert_eq!(
+            constraint_mode(&request(serde_json::json!("required"))),
+            Some(true)
+        );
+        assert_eq!(constraint_mode(&request(serde_json::json!("none"))), None);
+        assert_eq!(
+            constraint_mode(&request(serde_json::json!({
+                "type": "function", "function": {"name": "read"}
+            }))),
+            Some(true)
+        );
     }
 
     #[tokio::test]

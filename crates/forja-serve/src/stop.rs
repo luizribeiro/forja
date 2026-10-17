@@ -147,7 +147,6 @@ mod tests {
                 matched: true
             }
         );
-        assert_eq!(matcher.matched_index(), Some(0));
     }
 
     #[test]
@@ -173,6 +172,7 @@ mod tests {
                 matched: true
             }
         );
+        assert_eq!(matcher.matched_index(), Some(1));
     }
 
     #[test]
