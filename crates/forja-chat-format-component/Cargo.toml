@@ -1,0 +1,28 @@
+[package]
+name = "forja-chat-format-component"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = ["qwen3-coder-xml"]
+qwen3-coder-xml = ["dep:qwen3-coder-xml"]
+test-fixtures = []
+
+[dependencies]
+forja-chat-format = { path = "../forja-chat-format" }
+qwen3-coder-xml = { path = "../../chat-formats/qwen3-coder-xml", optional = true }
+
+[target.'cfg(target_family = "wasm")'.dependencies]
+wit-bindgen = "0.62"
+
+[build-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true

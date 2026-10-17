@@ -63,7 +63,7 @@ fn embedded_model_files_match_the_pinned_copy() {
         .join("Qwen3-Coder-30B-A3B-Instruct-4bit");
     assert_eq!(
         fs::read_to_string(root.join("chat_template.jinja")).unwrap(),
-        include_str!("../src/chat_template.jinja")
+        include_str!("../../qwen3-coder-xml/tests/fixtures/chat_template.jinja")
     );
     let config: serde_json::Value =
         serde_json::from_slice(&fs::read(root.join("generation_config.json")).unwrap()).unwrap();

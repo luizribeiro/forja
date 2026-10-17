@@ -111,6 +111,101 @@ pub trait ToolFormat {
     ) -> Result<String, String>;
 }
 
+/// Exports the generic chat-format component for one format and embedded model data.
+#[macro_export]
+macro_rules! export_component {
+    ($format:ty, $data:ident) => {
+        #[allow(clippy::same_length_and_capacity)]
+        mod component {
+            use std::{
+                collections::BTreeMap,
+                sync::{Mutex, OnceLock},
+            };
+
+            wit_bindgen::generate!({
+                path: "../../wit",
+                world: "chat-format-component",
+            });
+
+            use exports::l9o::gpu::chat_format::{
+                ChatInfo, Event as WitEvent, GrammarOut, Guest, SamplingDefaults,
+            };
+            use $crate::{ChatTemplate, Event, IncrementalParser, ToolFormat};
+
+            static PARSERS: OnceLock<Mutex<BTreeMap<u64, <$format as ToolFormat>::Parser>>> =
+                OnceLock::new();
+
+            struct Component;
+
+            impl Guest for Component {
+                fn info() -> ChatInfo {
+                    ChatInfo {
+                        stop_token_ids: super::$data::STOP_TOKEN_IDS.to_vec(),
+                        sampling: SamplingDefaults {
+                            temperature: super::$data::TEMPERATURE,
+                            top_p: super::$data::TOP_P,
+                            top_k: super::$data::TOP_K,
+                            repetition_penalty: super::$data::REPETITION_PENALTY,
+                            max_new_tokens: super::$data::MAX_NEW_TOKENS,
+                        },
+                    }
+                }
+
+                fn render(messages: String, tools: String, request: String) -> Result<String, String> {
+                    let options = <$format as ToolFormat>::options(super::$data::TOOL_FORMAT_OPTIONS)?;
+                    let template = ChatTemplate::compile(super::$data::TEMPLATE.to_owned())
+                        .map_err(|error| error.to_string())?;
+                    <$format as ToolFormat>::render(&template, &messages, &tools, &request, &options)
+                }
+
+                fn grammar(tools: String, choice: String, response: String) -> Result<GrammarOut, String> {
+                    let options = <$format as ToolFormat>::options(super::$data::TOOL_FORMAT_OPTIONS)?;
+                    <$format as ToolFormat>::grammar(&tools, &choice, &response, &options).map(
+                        |grammar| GrammarOut {
+                            grammar,
+                            trigger: <$format as ToolFormat>::trigger(&options).to_owned(),
+                        },
+                    )
+                }
+
+                fn parse(stream: u64, chunk: String) -> Result<Vec<WitEvent>, String> {
+                    let options = <$format as ToolFormat>::options(super::$data::TOOL_FORMAT_OPTIONS)?;
+                    let parsers = PARSERS.get_or_init(|| Mutex::new(BTreeMap::new()));
+                    let mut parsers = parsers
+                        .lock()
+                        .map_err(|_| "parser state is unavailable".to_owned())?;
+                    let parser = parsers
+                        .entry(stream)
+                        .or_insert_with(|| <$format as ToolFormat>::parser(&options));
+                    parser.parse(&chunk).map(|events| {
+                        events
+                            .into_iter()
+                            .map(|event| match event {
+                                Event::TextDelta(value) => WitEvent::TextDelta(value),
+                                Event::CallStart(value) => WitEvent::CallStart(value),
+                                Event::ArgumentDelta(name, value) => {
+                                    WitEvent::ArgumentDelta((name, value))
+                                }
+                                Event::CallEnd => WitEvent::CallEnd,
+                            })
+                            .collect()
+                    })
+                }
+
+                fn reset(stream: u64) {
+                    if let Some(parsers) = PARSERS.get()
+                        && let Ok(mut parsers) = parsers.lock()
+                    {
+                        parsers.remove(&stream);
+                    }
+                }
+            }
+
+            export!(Component);
+        }
+    };
+}
+
 /// A compiled embedded chat template.
 pub struct ChatTemplate {
     environment: Environment<'static>,

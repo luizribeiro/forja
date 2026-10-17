@@ -64,10 +64,18 @@ fn runs_a_bounded_zero_import_chat_format() {
 #[test]
 fn component_declares_no_imports() {
     let engine = wasmtime::Engine::default();
-    let component =
-        wasmtime::component::Component::from_file(&engine, test_guests::chat_format_smoke())
-            .unwrap();
-    assert_eq!(component.component_type().imports(&engine).count(), 0);
+    for path in [
+        test_guests::chat_format_smoke(),
+        test_guests::qwen3_coder_chat_format(),
+    ] {
+        let component = wasmtime::component::Component::from_file(&engine, path).unwrap();
+        assert_eq!(
+            component.component_type().imports(&engine).count(),
+            0,
+            "{}",
+            path.display()
+        );
+    }
 }
 
 #[test]

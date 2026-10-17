@@ -46,11 +46,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?)?;
     let chat_format_path = out_dir.join("chat-format-smoke.wasm");
     fs::write(&chat_format_path, chat_format)?;
-    let qwen_chat_manifest = repository.join("chat-formats/qwen3-coder/Cargo.toml");
+    let qwen_chat_manifest = repository.join("crates/forja-chat-format-component/Cargo.toml");
     let qwen_chat_target_dir = main_target_dir.join("qwen-chat-format-build");
-    forja_build::build_core_module(&qwen_chat_manifest, &qwen_chat_target_dir, &[])?;
+    forja_build::build_core_module(
+        &qwen_chat_manifest,
+        &qwen_chat_target_dir,
+        &["--features", "test-fixtures"],
+    )?;
     let qwen_chat_format = forja_build::encode_component(&fs::read(
-        qwen_chat_target_dir.join("wasm32-unknown-unknown/release/qwen3_coder_chat_format.wasm"),
+        qwen_chat_target_dir
+            .join("wasm32-unknown-unknown/release/forja_chat_format_component.wasm"),
     )?)?;
     let qwen_chat_format_path = out_dir.join("qwen3-coder.chat-format.wasm");
     fs::write(&qwen_chat_format_path, qwen_chat_format)?;
@@ -111,7 +116,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     println!(
         "cargo::rerun-if-changed={}",
-        repository.join("chat-formats/qwen3-coder").display()
+        repository.join("chat-formats/qwen3-coder-xml").display()
+    );
+    println!(
+        "cargo::rerun-if-changed={}",
+        repository
+            .join("crates/forja-chat-format-component")
+            .display()
     );
     println!(
         "cargo::rerun-if-changed={}",

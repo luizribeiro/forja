@@ -16,7 +16,7 @@ pub const TOP_K: u32 = 20;
 /// Publisher-declared repetition penalty.
 pub const REPETITION_PENALTY: f32 = 1.05;
 
-const TEMPLATE: &str = include_str!("chat_template.jinja");
+const TEMPLATE: &str = include_str!("../../qwen3-coder-xml/tests/fixtures/chat_template.jinja");
 
 /// Renders a Qwen3-Coder prompt from the chat-format JSON boundary.
 ///
