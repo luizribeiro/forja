@@ -10,15 +10,14 @@ mod http;
 mod request;
 mod response;
 mod stop;
-#[cfg(test)]
 mod tool_output;
 
 pub use chat_format::{
     ChatEvent, ChatFormat, ChatFormatLimits, ChatInfo, GrammarOutput, SamplingDefaults,
 };
 pub use engine::{
-    Completion, FinishReason, GeneratedToolCall, GenerationControl, GenerationError,
-    GenerationEvent, PrefilledPrompt, ServingEngine, Usage,
+    Completion, FinishReason, GenerationControl, GenerationError, GenerationEvent, PrefilledPrompt,
+    ServingEngine, Usage,
 };
 pub use http::{ChatService, DrainHandle, chat_router, serving_router};
 pub use request::{
@@ -29,3 +28,4 @@ pub use request::{
 };
 pub use response::{chat_response, text_response};
 pub use stop::{StopMatcher, StopOutput};
+pub use tool_output::GeneratedToolCall;

@@ -12,11 +12,15 @@ fn accepts_only_declared_quirk_options() {
 
 #[test]
 fn grammar_selects_tools_and_preserves_parameter_order() {
-    let tools = r#"[{"type":"function","function":{"name":"read_file","parameters":{"type":"object","properties":{"path":{"type":"string"},"line":{"type":"integer"}},"required":["path"]}}},{"type":"function","function":{"name":"search","parameters":{"type":"object"}}}]"#;
+    let tools = r#"[{"type":"function","function":{"name":"read_file","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"},"mode":{"type":"string"}},"required":["path","content","mode"]}}},{"type":"function","function":{"name":"search","parameters":{"type":"object"}}}]"#;
     let all = Qwen3CoderXml::grammar(tools, "\"auto\"", "null", &Options).unwrap();
     assert_eq!(Qwen3CoderXml::trigger(&Options), "<tool_call>\n");
     assert!(all.contains("start: tool_0 | tool_1"));
-    assert!(all.contains("[param_0_0] param_0_1"));
+    assert!(all.contains("tool_0: \"<function=read_file>\\n\" param_0_0 param_0_1 param_0_2"));
+    let path = all.find("<parameter=path>").unwrap();
+    let content = all.find("<parameter=content>").unwrap();
+    let mode = all.find("<parameter=mode>").unwrap();
+    assert!(path < content && content < mode);
 
     let named = Qwen3CoderXml::grammar(
         tools,

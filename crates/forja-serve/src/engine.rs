@@ -7,7 +7,7 @@ use std::{
     io::Read,
     sync::{
         Arc, Mutex as StdMutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -23,10 +23,13 @@ use tokio::sync::{Notify, mpsc};
 
 use crate::guidance::{GuidanceSession, GuidanceWorker};
 use crate::request::{ToolChoice, validate_chat_input, validate_completion_input, validate_prompt};
+use crate::tool_output::{GeneratedToolCall, ToolDelta, ToolOutput};
 use crate::{
     ChatCompletionRequest, ChatFormat, CompletionRequest, ResolvedParams, StopMatcher,
     serving_context_ceiling,
 };
+
+static NEXT_CHAT_STREAM: AtomicU64 = AtomicU64::new(1);
 
 /// A failure while preparing or running a generation.
 #[derive(Debug)]
@@ -147,6 +150,155 @@ struct ConstraintPlan {
     trigger: String,
     trigger_tokens: Vec<u32>,
     forced: bool,
+    tools: Vec<crate::Tool>,
+    selected: Option<String>,
+}
+
+struct ToolParser {
+    stream: u64,
+    trigger: String,
+    prompt: Arc<StdMutex<PromptArtifacts<ChatFormat>>>,
+    output: ToolOutput,
+}
+
+impl ToolParser {
+    fn new(
+        plan: &ConstraintPlan,
+        prompt: Arc<StdMutex<PromptArtifacts<ChatFormat>>>,
+    ) -> Result<Self, GenerationError> {
+        let stream = NEXT_CHAT_STREAM
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |stream| {
+                stream.checked_add(1)
+            })
+            .map_err(|_| GenerationError::new("chat parser stream id space is exhausted"))?;
+        Ok(Self {
+            stream,
+            trigger: plan.trigger.clone(),
+            prompt,
+            output: ToolOutput::new(&plan.tools, plan.selected.clone()),
+        })
+    }
+
+    async fn seed(&mut self) -> Result<Vec<ToolDelta>, GenerationError> {
+        let trigger = self.trigger.clone();
+        self.parse(trigger).await
+    }
+
+    async fn parse(&mut self, chunk: String) -> Result<Vec<ToolDelta>, GenerationError> {
+        let prompt = Arc::clone(&self.prompt);
+        let stream = self.stream;
+        let events = tokio::task::spawn_blocking(move || {
+            prompt
+                .lock()
+                .map_err(|_| GenerationError::new("prompt processor lock is poisoned"))?
+                .renderer
+                .parse(stream, &chunk)
+                .map_err(|error| GenerationError::new(format!("chat format failed: {error}")))?
+                .map_err(|error| {
+                    GenerationError::new(format!("chat format parser failed: {error}"))
+                })
+        })
+        .await
+        .map_err(|error| GenerationError::new(format!("chat parser worker failed: {error}")))??;
+        self.output.apply(events).map_err(|error| {
+            GenerationError::new(format!("chat format event invariant failed: {error}"))
+        })
+    }
+
+    fn finish(&self) -> Result<GeneratedToolCall, GenerationError> {
+        self.output.finish().map_err(|error| {
+            GenerationError::new(format!("chat format event invariant failed: {error}"))
+        })
+    }
+
+    async fn reset(self) {
+        let prompt = self.prompt;
+        let stream = self.stream;
+        let _ =
+            tokio::task::spawn_blocking(move || prompt.lock().ok()?.renderer.reset(stream).ok())
+                .await;
+    }
+}
+
+async fn start_tool_parser(
+    plan: Option<&ConstraintPlan>,
+    prompt: Arc<StdMutex<PromptArtifacts<ChatFormat>>>,
+    forced: bool,
+    sender: Option<&mpsc::Sender<GenerationEvent>>,
+    control: &GenerationControl,
+) -> Result<Option<ToolParser>, GenerationError> {
+    let Some(plan) = plan else {
+        return Ok(None);
+    };
+    let mut parser = ToolParser::new(plan, prompt)?;
+    if forced {
+        let deltas = parser.seed().await?;
+        emit_tool_deltas(deltas, sender, control).await?;
+    }
+    Ok(Some(parser))
+}
+
+async fn emit_tool_deltas(
+    deltas: Vec<ToolDelta>,
+    sender: Option<&mpsc::Sender<GenerationEvent>>,
+    control: &GenerationControl,
+) -> Result<(), GenerationError> {
+    let Some(sender) = sender else {
+        return Ok(());
+    };
+    for delta in deltas {
+        let event = match delta {
+            ToolDelta::Start(name) => GenerationEvent::ToolCallStart(name),
+            ToolDelta::Arguments(arguments) => GenerationEvent::ToolArguments(arguments),
+        };
+        send_event(sender, event, control).await?;
+    }
+    Ok(())
+}
+
+async fn parse_tool_piece(
+    parser: &mut Option<ToolParser>,
+    piece: Option<String>,
+    sender: Option<&mpsc::Sender<GenerationEvent>>,
+    control: &GenerationControl,
+) -> Result<(), GenerationError> {
+    if let (Some(parser), Some(piece)) = (parser, piece) {
+        let deltas = parser.parse(piece).await?;
+        emit_tool_deltas(deltas, sender, control).await?;
+    }
+    Ok(())
+}
+
+async fn seed_tool_parser(
+    parser: &mut Option<ToolParser>,
+    sender: Option<&mpsc::Sender<GenerationEvent>>,
+    control: &GenerationControl,
+) -> Result<(), GenerationError> {
+    let deltas = parser
+        .as_mut()
+        .ok_or_else(|| GenerationError::new("tool parser is missing"))?
+        .seed()
+        .await?;
+    emit_tool_deltas(deltas, sender, control).await
+}
+
+async fn finish_tool_parser(
+    generation: &Result<FinishReason, GenerationError>,
+    parser: Option<ToolParser>,
+) -> Result<Option<GeneratedToolCall>, GenerationError> {
+    let call = if matches!(generation, Ok(FinishReason::ToolCalls)) {
+        parser
+            .as_ref()
+            .ok_or_else(|| GenerationError::new("tool parser is missing"))?
+            .finish()
+            .map(Some)
+    } else {
+        Ok(None)
+    };
+    if let Some(parser) = parser {
+        parser.reset().await;
+    }
+    call
 }
 
 trait PromptRenderer: Send {
@@ -215,15 +367,6 @@ pub struct Usage {
     pub prompt_tokens: u32,
     /// Sampled tokens, including a token that caused a stop.
     pub completion_tokens: u32,
-}
-
-/// One validated function call generated by the model.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct GeneratedToolCall {
-    /// Declared function name.
-    pub name: String,
-    /// Canonical JSON object arguments.
-    pub arguments: String,
 }
 
 /// Fully decoded output from one request.
@@ -540,6 +683,23 @@ where
         send_terminal(sender, &request.params, completion, control).await
     }
 
+    async fn start_decode(
+        &mut self,
+        prefill: PrefilledPrompt,
+        sender: Option<&mpsc::Sender<GenerationEvent>>,
+        control: &GenerationControl,
+    ) -> Result<DecodeStart, GenerationError> {
+        prepare_decode(
+            &mut self.runner,
+            &self.guidance,
+            prefill,
+            Arc::clone(&self.prompt),
+            sender,
+            control,
+        )
+        .await
+    }
+
     async fn decode(
         &mut self,
         prefill: PrefilledPrompt,
@@ -554,7 +714,8 @@ where
             mut guidance,
             mut constrained,
             mut pipeline,
-        } = start_decode(&mut self.runner, &self.guidance, prefill).await?;
+            mut tool_parser,
+        } = self.start_decode(prefill, sender, control).await?;
         let mut consumed = 0_u32;
         let mut unconstrained_consumed = 0_u32;
         let replay_base = self.runner.metrics().submissions;
@@ -569,9 +730,7 @@ where
                 if control.is_cancelled() {
                     return Err(GenerationError::cancelled());
                 }
-                let has_successor = consumed
-                    .checked_add(1)
-                    .is_some_and(|next| next < params.max_tokens);
+                let has_successor = needs_successor(consumed, params.max_tokens);
                 pipeline
                     .queue_successor(&mut self.runner, constrained, has_successor, sampling)
                     .await?;
@@ -580,8 +739,6 @@ where
                 consumed += 1;
                 if !constrained {
                     unconstrained_consumed += 1;
-                }
-                if !constrained {
                     synchronize_unconstrained(
                         &mut self.runner,
                         replay_base,
@@ -596,7 +753,7 @@ where
                     GenerationError::new(format!("cannot decode token: {error}"))
                 })?;
                 if constrained {
-                    drop(piece);
+                    parse_tool_piece(&mut tool_parser, piece, sender, control).await?;
                     if process_constrained_token(
                         &mut self.runner,
                         guidance.as_ref(),
@@ -617,19 +774,17 @@ where
                     return Ok(FinishReason::Stop);
                 }
                 if matches!(action, BoundaryAction::Activate) && consumed < params.max_tokens {
-                    let speculative = pipeline.pending.pop_front().ok_or_else(|| {
-                        GenerationError::new("trigger activation has no speculative token")
-                    })?;
-                    let (session, output, rewind_pos) = activate_constraint(
-                        &mut self.runner,
-                        &self.guidance,
-                        constraint.as_ref(),
-                        speculative,
-                        sampling,
-                    )
-                    .await?;
-                    pipeline.push_selected(output, rewind_pos)?;
-                    guidance = Some(session);
+                    seed_tool_parser(&mut tool_parser, sender, control).await?;
+                    guidance = Some(
+                        activate_at_boundary(
+                            &mut pipeline,
+                            &mut self.runner,
+                            &self.guidance,
+                            constraint.as_ref(),
+                            sampling,
+                        )
+                        .await?,
+                    );
                     constrained = true;
                 }
             }
@@ -639,14 +794,51 @@ where
             Ok(FinishReason::Length)
         }
         .await;
-        let cleanup = pipeline.cleanup(&mut self.runner).await;
-        finish_completion(generation, cleanup, text, prompt_tokens, consumed)
+        finish_decode_request(
+            generation,
+            &mut pipeline,
+            &mut self.runner,
+            tool_parser,
+            text,
+            prompt_tokens,
+            consumed,
+        )
+        .await
     }
+}
+
+fn needs_successor(consumed: u32, limit: u32) -> bool {
+    consumed.checked_add(1).is_some_and(|next| next < limit)
+}
+
+async fn finish_decode_request<B>(
+    generation: Result<FinishReason, GenerationError>,
+    pipeline: &mut DecodePipeline,
+    runner: &mut EngineRunner<B>,
+    parser: Option<ToolParser>,
+    text: String,
+    prompt_tokens: u32,
+    completion_tokens: u32,
+) -> Result<Completion, GenerationError>
+where
+    B: Backend + Send + Sync + 'static,
+{
+    let cleanup = pipeline.cleanup(runner).await;
+    let tool_call = finish_tool_parser(&generation, parser).await;
+    finish_completion(
+        generation,
+        cleanup,
+        tool_call,
+        text,
+        prompt_tokens,
+        completion_tokens,
+    )
 }
 
 fn finish_completion(
     generation: Result<FinishReason, GenerationError>,
     cleanup: Result<(), GenerationError>,
+    tool_call: Result<Option<GeneratedToolCall>, GenerationError>,
     text: String,
     prompt_tokens: u32,
     completion_tokens: u32,
@@ -655,9 +847,10 @@ fn finish_completion(
         (Ok(reason), Ok(())) => reason,
         (Err(error), _) | (Ok(_), Err(error)) => return Err(error),
     };
+    let tool_call = tool_call?;
     Ok(Completion {
         text,
-        tool_call: None,
+        tool_call,
         finish_reason,
         usage: Usage {
             prompt_tokens,
@@ -676,12 +869,16 @@ struct DecodeStart {
     guidance: Option<GuidanceSession>,
     constrained: bool,
     pipeline: DecodePipeline,
+    tool_parser: Option<ToolParser>,
 }
 
-async fn start_decode<B>(
+async fn prepare_decode<B>(
     runner: &mut EngineRunner<B>,
     worker: &GuidanceWorker,
     prefill: PrefilledPrompt,
+    prompt: Arc<StdMutex<PromptArtifacts<ChatFormat>>>,
+    sender: Option<&mpsc::Sender<GenerationEvent>>,
+    control: &GenerationControl,
 ) -> Result<DecodeStart, GenerationError>
 where
     B: Backend + Send + Sync + 'static,
@@ -711,6 +908,8 @@ where
         first = output;
         guidance = Some(session);
     }
+    let tool_parser =
+        start_tool_parser(constraint.as_ref(), prompt, constrained, sender, control).await?;
     Ok(DecodeStart {
         params,
         prompt_tokens,
@@ -719,6 +918,7 @@ where
         guidance,
         constrained,
         pipeline: DecodePipeline::new(first, first_pos, prompt_tokens),
+        tool_parser,
     })
 }
 
@@ -1040,6 +1240,26 @@ where
     Ok((false, Some((output, start_pos))))
 }
 
+async fn activate_at_boundary<B>(
+    pipeline: &mut DecodePipeline,
+    runner: &mut EngineRunner<B>,
+    worker: &GuidanceWorker,
+    plan: Option<&ConstraintPlan>,
+    sampling: SamplingParams,
+) -> Result<GuidanceSession, GenerationError>
+where
+    B: Backend + Send + Sync + 'static,
+{
+    let speculative = pipeline
+        .pending
+        .pop_front()
+        .ok_or_else(|| GenerationError::new("trigger activation has no speculative token"))?;
+    let (session, output, rewind_pos) =
+        activate_constraint(runner, worker, plan, speculative, sampling).await?;
+    pipeline.push_selected(output, rewind_pos)?;
+    Ok(session)
+}
+
 async fn activate_constraint<B>(
     runner: &mut EngineRunner<B>,
     worker: &GuidanceWorker,
@@ -1283,6 +1503,15 @@ where
     };
     let choice = serde_json::to_string(&request.params.tool_choice)
         .map_err(|error| GenerationError::new(format!("cannot encode tool choice: {error}")))?;
+    let constraint_tools = request.params.tools.clone().unwrap_or_default();
+    let selected = request
+        .params
+        .tool_choice
+        .as_ref()
+        .and_then(|choice| match choice {
+            ToolChoice::Named(choice) => Some(choice.function.name.clone()),
+            ToolChoice::Mode(_) => None,
+        });
     let response = serde_json::to_string(&request.params.response_format)
         .map_err(|error| GenerationError::new(format!("cannot encode response format: {error}")))?;
     let options = serde_json::to_string(&serde_json::json!({
@@ -1330,6 +1559,8 @@ where
                     trigger: output.trigger,
                     trigger_tokens,
                     forced,
+                    tools: constraint_tools.clone(),
+                    selected: selected.clone(),
                 })
             })
             .transpose()?;
@@ -1522,6 +1753,52 @@ mod tests {
             }))),
             Some(true)
         );
+    }
+
+    #[tokio::test]
+    async fn component_events_build_one_validated_call() {
+        let tool = serde_json::from_value(serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": null,
+                "parameters": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"],
+                    "additionalProperties": false
+                }
+            }
+        }))
+        .unwrap();
+        let plan = ConstraintPlan {
+            grammar: String::new(),
+            trigger: "<tool_call>\n".to_owned(),
+            trigger_tokens: vec![1],
+            forced: true,
+            tools: vec![tool],
+            selected: None,
+        };
+        let format = ChatFormat::load(
+            test_guests::qwen3_coder_chat_format(),
+            crate::ChatFormatLimits::default(),
+        )
+        .unwrap();
+        let prompt = Arc::new(StdMutex::new(PromptArtifacts {
+            tokenizer: Tokenizer::new(tokenizers::models::bpe::BPE::default()),
+            renderer: format,
+        }));
+        let mut parser = ToolParser::new(&plan, prompt).unwrap();
+        assert!(parser.seed().await.unwrap().is_empty());
+        parser
+            .parse(
+                "<function=read_file>\n<parameter=path>\na.rs\n</parameter>\n</function>\n</tool_call>"
+                    .to_owned(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(parser.finish().unwrap().arguments, r#"{"path":"a.rs"}"#);
+        parser.reset().await;
     }
 
     #[tokio::test]

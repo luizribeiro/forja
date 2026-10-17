@@ -263,9 +263,7 @@ fn grammar(tools_json: &str, choice_json: &str, response_json: &str) -> Result<S
             literal(&format!("<function={name}>\n"))?
         );
         if let Some(properties) = properties {
-            let mut properties = properties.iter().collect::<Vec<_>>();
-            properties.sort_unstable_by_key(|(parameter, _)| parameter.as_str());
-            for (parameter_index, (parameter, schema)) in properties.into_iter().enumerate() {
+            for (parameter_index, (parameter, schema)) in properties.iter().enumerate() {
                 let rule = format!("param_{index}_{parameter_index}");
                 body.push_str(if required.contains(&parameter.as_str()) {
                     " "

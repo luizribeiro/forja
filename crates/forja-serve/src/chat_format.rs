@@ -306,13 +306,13 @@ impl ChatFormat {
     }
 
     fn lift_output(&self, value: &WasmStr) -> wasmtime::Result<String> {
-        let value = value.to_str(&self.store)?;
+        let value = value.to_str(&self.store)?.into_owned();
         if value.len() > self.limits.output_bytes {
             return Err(wasmtime::Error::msg(
                 "chat format output exceeds its byte limit",
             ));
         }
-        Ok(value.into_owned())
+        Ok(value)
     }
 
     fn check_input_size(&self, messages: &str, tools: &str, options: &str) -> wasmtime::Result<()> {
