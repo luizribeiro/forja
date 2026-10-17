@@ -1756,8 +1756,17 @@ name = "qwen3-coder-chat-format"
 version = "0.0.0"
 dependencies = [
  "forja-chat-format",
+ "qwen3-coder-xml",
  "serde_json",
  "wit-bindgen 0.62.0",
+]
+
+[[package]]
+name = "qwen3-coder-xml"
+version = "0.0.0"
+dependencies = [
+ "forja-chat-format",
+ "serde_json",
 ]
 
 [[package]]

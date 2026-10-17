@@ -5,9 +5,6 @@
 
 #![forbid(unsafe_code)]
 
-/// Reusable Qwen3-Coder XML tool-call format.
-pub mod qwen3_coder_xml;
-
 use chrono::{DateTime, FixedOffset, Utc};
 use minijinja::{AutoEscape, Environment, Error, ErrorKind, State, UndefinedBehavior};
 use serde_json::Value as JsonValue;

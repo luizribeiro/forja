@@ -1,6 +1,64 @@
+//! Qwen XML tool calls used by Qwen3-Coder models.
+//!
+//! The format emits `<tool_call>`, `<function=...>`, and `<parameter=...>` tags. It currently has
+//! no compatibility options; an empty options object is required so future model quirks remain
+//! explicit and profile-controlled.
+
+#![forbid(unsafe_code)]
+
+use forja_chat_format::{Event, IncrementalParser, ToolFormat};
 use serde_json::Value;
 
-use crate::ChatTemplate;
+/// Qwen3-Coder's XML tool-call format.
+pub struct Qwen3CoderXml;
+
+/// Compatibility options for Qwen3-Coder XML.
+#[derive(Default)]
+pub struct Options;
+
+impl ToolFormat for Qwen3CoderXml {
+    type Options = Options;
+    type Parser = Parser;
+
+    fn options(options_json: &str) -> Result<Self::Options, String> {
+        let options: Value =
+            serde_json::from_str(options_json).map_err(|error| error.to_string())?;
+        match options.as_object() {
+            Some(options) if options.is_empty() => Ok(Options),
+            Some(_) => Err("qwen3-coder-xml has no options".to_owned()),
+            None => Err("tool format options must be an object".to_owned()),
+        }
+    }
+
+    fn trigger(_: &Self::Options) -> &str {
+        TRIGGER
+    }
+
+    fn normalize_messages(messages: &mut Value, _: &Self::Options) -> Result<(), String> {
+        normalize_tool_calls(messages)
+    }
+
+    fn finish_render(
+        mut rendered: String,
+        request_options: &Value,
+        _: &Self::Options,
+    ) -> Result<String, String> {
+        let choice = request_options.get("tool_choice");
+        if choice.is_some_and(|choice| choice == "required" || choice.is_object()) {
+            rendered.push_str(TRIGGER);
+        }
+        Ok(rendered)
+    }
+
+    fn grammar(
+        tools_json: &str,
+        choice_json: &str,
+        response_json: &str,
+        _: &Self::Options,
+    ) -> Result<String, String> {
+        grammar(tools_json, choice_json, response_json)
+    }
+}
 
 const TERMINALS: &str = "STRING: /[^\\r\\n<][^\\r<]*/\nINTEGER: /-?(0|[1-9][0-9]*)/\nNUMBER: /-?(0|[1-9][0-9]*)(\\.[0-9]+)?([eE][+-]?[0-9]+)?/\nJSON: /[^\\r<]+/\n";
 const TRIGGER: &str = "<tool_call>\n";
@@ -8,31 +66,6 @@ const FUNCTION_START: &str = "<function=";
 const PARAM_START: &str = "<parameter=";
 const CALL_END: &str = "</function>\n</tool_call>";
 const PARAM_END: &str = "\n</parameter>\n";
-
-/// Renders a template after normalizing API calls for Qwen XML.
-///
-/// # Errors
-/// Returns an error when request JSON or template rendering is invalid.
-pub fn render(
-    template: &ChatTemplate,
-    messages: &str,
-    tools: &str,
-    options: &str,
-) -> Result<String, String> {
-    let mut messages: Value = serde_json::from_str(messages).map_err(|error| error.to_string())?;
-    normalize_tool_calls(&mut messages)?;
-    let options_value: Value = serde_json::from_str(options).map_err(|error| error.to_string())?;
-    let messages = serde_json::to_string(&messages).map_err(|error| error.to_string())?;
-    template
-        .render(&messages, tools, options)
-        .map(|mut rendered| {
-            let choice = options_value.get("tool_choice");
-            if choice.is_some_and(|choice| choice == "required" || choice.is_object()) {
-                rendered.push_str(TRIGGER);
-            }
-            rendered
-        })
-}
 
 fn normalize_tool_calls(messages: &mut Value) -> Result<(), String> {
     let Some(messages) = messages.as_array_mut() else {
@@ -59,16 +92,6 @@ fn normalize_tool_calls(messages: &mut Value) -> Result<(), String> {
     Ok(())
 }
 
-/// One incremental Qwen tool-parser event.
-#[allow(missing_docs)]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum Event {
-    TextDelta(String),
-    CallStart(String),
-    ArgumentDelta(String, String),
-    CallEnd,
-}
-
 /// Incremental parser for one Qwen output stream.
 #[derive(Default)]
 pub struct Parser {
@@ -92,6 +115,12 @@ impl Parser {
     /// # Errors
     /// Returns an error for malformed XML or bytes following a completed call.
     pub fn parse(&mut self, chunk: &str) -> Result<Vec<Event>, String> {
+        IncrementalParser::parse(self, chunk)
+    }
+}
+
+impl IncrementalParser for Parser {
+    fn parse(&mut self, chunk: &str) -> Result<Vec<Event>, String> {
         if self.done && !chunk.is_empty() {
             return Err("data follows tool call".to_owned());
         }
@@ -196,11 +225,7 @@ fn consume_delimiter(buffer: &mut String, delimiter: &str) -> Option<bool> {
 ///
 /// # Errors
 /// Returns an error when the JSON or selected tool is invalid.
-pub fn grammar(
-    tools_json: &str,
-    choice_json: &str,
-    response_json: &str,
-) -> Result<(String, String), String> {
+fn grammar(tools_json: &str, choice_json: &str, response_json: &str) -> Result<String, String> {
     let tools: Value = serde_json::from_str(tools_json).map_err(|error| error.to_string())?;
     let choice: Value = serde_json::from_str(choice_json).map_err(|error| error.to_string())?;
     let response: Value = serde_json::from_str(response_json).map_err(|error| error.to_string())?;
@@ -273,7 +298,7 @@ pub fn grammar(
         starts.join(" | "),
         tool_rules.join("\n")
     );
-    Ok((grammar, TRIGGER.to_owned()))
+    Ok(grammar)
 }
 
 fn value_rule(schema: &Value) -> Result<String, String> {

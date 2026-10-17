@@ -8,8 +8,10 @@ use qwen3_coder_chat_format::{
 
 #[test]
 fn matches_embedded_render_goldens() {
-    let goldens: serde_json::Value =
-        serde_json::from_str(include_str!("fixtures/chat-template.json")).unwrap();
+    let goldens: serde_json::Value = serde_json::from_str(include_str!(
+        "../../qwen3-coder-xml/tests/fixtures/chat-template.json"
+    ))
+    .unwrap();
     for golden in goldens.as_array().unwrap() {
         let messages = serde_json::to_string(&golden["messages"]).unwrap();
         let actual = render(&messages, "null", r#"{"add_generation_prompt":true}"#).unwrap();

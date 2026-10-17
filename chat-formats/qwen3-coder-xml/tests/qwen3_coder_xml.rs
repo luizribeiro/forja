@@ -1,23 +1,32 @@
 //! Qwen tool grammar and parser compatibility checks.
 
-use forja_chat_format::qwen3_coder_xml::{Event, Parser, grammar};
+use forja_chat_format::{Event, ToolFormat};
+use qwen3_coder_xml::{Options, Parser, Qwen3CoderXml};
+
+#[test]
+fn accepts_only_declared_quirk_options() {
+    Qwen3CoderXml::options("{}").unwrap();
+    assert!(Qwen3CoderXml::options(r#"{"unknown":true}"#).is_err());
+    assert!(Qwen3CoderXml::options("null").is_err());
+}
 
 #[test]
 fn grammar_selects_tools_and_preserves_parameter_order() {
     let tools = r#"[{"type":"function","function":{"name":"read_file","parameters":{"type":"object","properties":{"path":{"type":"string"},"line":{"type":"integer"}},"required":["path"]}}},{"type":"function","function":{"name":"search","parameters":{"type":"object"}}}]"#;
-    let all = grammar(tools, "\"auto\"", "null").unwrap();
-    assert_eq!(all.1, "<tool_call>\n");
-    assert!(all.0.contains("start: tool_0 | tool_1"));
-    assert!(all.0.contains("[param_0_0] param_0_1"));
+    let all = Qwen3CoderXml::grammar(tools, "\"auto\"", "null", &Options).unwrap();
+    assert_eq!(Qwen3CoderXml::trigger(&Options), "<tool_call>\n");
+    assert!(all.contains("start: tool_0 | tool_1"));
+    assert!(all.contains("[param_0_0] param_0_1"));
 
-    let named = grammar(
+    let named = Qwen3CoderXml::grammar(
         tools,
         r#"{"type":"function","function":{"name":"search"}}"#,
         r#"{"type":"text"}"#,
+        &Options,
     )
     .unwrap();
-    assert!(named.0.contains("start: tool_0"));
-    assert!(!named.0.contains("read_file"));
+    assert!(named.contains("start: tool_0"));
+    assert!(!named.contains("read_file"));
 }
 
 #[test]
@@ -105,7 +114,7 @@ fn arguments(events: &[Event]) -> Vec<(&str, &str)> {
 #[test]
 fn enum_grammars_only_admit_declared_literals() {
     let tools = r#"[{"type":"function","function":{"name":"paint","parameters":{"type":"object","properties":{"color":{"type":"string","enum":["red","blue"]},"count":{"type":"integer","enum":[1,3]},"gloss":{"type":"number","enum":[0.5,1]},"dry":{"type":"boolean","enum":[true]}}}}}]"#;
-    let (grammar, _) = grammar(tools, "\"auto\"", "null").unwrap();
+    let grammar = Qwen3CoderXml::grammar(tools, "\"auto\"", "null", &Options).unwrap();
     for rule in [
         r#""red" | "blue""#,
         r#""1" | "3""#,
