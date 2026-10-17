@@ -22,6 +22,7 @@ use tokenizers::Tokenizer;
 use tokio::sync::{Notify, mpsc};
 
 use crate::guidance::{GuidanceSession, GuidanceWorker};
+use crate::prefix::{PrefixIdentity, PrefixNamespace};
 use crate::request::{ToolChoice, validate_chat_input, validate_completion_input, validate_prompt};
 use crate::tool_output::{GeneratedToolCall, ToolDelta, ToolOutput};
 use crate::{
@@ -413,6 +414,7 @@ pub struct ServingEngine<B: Backend + Send + Sync + 'static> {
     info: EngineInfo,
     max_context: u32,
     guidance: GuidanceWorker,
+    _prefix_namespace: PrefixNamespace,
 }
 
 impl<B> ServingEngine<B>
@@ -424,6 +426,7 @@ where
     /// # Errors
     ///
     /// Returns an error when the profile or tokenizer exceeds the engine contract.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         model: String,
         runner: EngineRunner<B>,
@@ -432,6 +435,7 @@ where
         config: HostConfig,
         info: EngineInfo,
         profile_max_context: u32,
+        prefix_identity: PrefixIdentity,
     ) -> Result<Self, GenerationError> {
         let max_context = serving_context_ceiling(
             info.max_context,
@@ -466,6 +470,7 @@ where
             info,
             max_context,
             guidance,
+            _prefix_namespace: prefix_identity.into_namespace(),
         })
     }
 

@@ -22,6 +22,7 @@ pub use engine::{
     ServingEngine, Usage,
 };
 pub use http::{ChatService, DrainHandle, chat_router, serving_router};
+pub use prefix::PrefixIdentity;
 pub use request::{
     ChatCompletionRequest, CompletionParams, CompletionRequest, FunctionCall, FunctionDefinition,
     Message, NamedFunction, NamedToolChoice, ResolvedParams, ResponseFormat, Stop, StreamOptions,

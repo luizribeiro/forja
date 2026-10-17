@@ -3,6 +3,7 @@ use std::{error::Error, fs};
 use forja_config::{BackendKind, Engine, Profile};
 use forja_core::Backend;
 use forja_host::EngineRunner;
+use golden_fixtures::sha256_file;
 use tokenizers::Tokenizer;
 
 use crate::{
@@ -70,6 +71,13 @@ where
         &config.model.chat_format,
         forja_serve::ChatFormatLimits::default(),
     )?;
+    let identity = forja_serve::PrefixIdentity::new([
+        &sha256_file(&config.model.engine)?,
+        &profile.sha256()?,
+        &profile.model().weights_sha256,
+        &sha256_file(config.model.model.join("tokenizer.json"))?,
+        &sha256_file(&config.model.chat_format)?,
+    ])?;
     let mut runner = EngineRunner::new(
         &config.model.engine,
         backend,
@@ -90,6 +98,7 @@ where
         config.clone(),
         info,
         profile.workload().max_context.get(),
+        identity,
     )?;
     let listener = tokio::net::TcpListener::bind(config.server.listen).await?;
     let (router, drain) = forja_serve::serving_router(engine);
@@ -273,6 +282,13 @@ mod tests {
         runner.load_with_selections(None, &load).await??;
         let mut config = forja_config::HostConfig::default();
         config.request.max_output_tokens = 256;
+        let identity = forja_serve::PrefixIdentity::new([
+            &sha256_file(component)?,
+            &profile.sha256()?,
+            &profile.model().weights_sha256,
+            &sha256_file(model.join("tokenizer.json"))?,
+            &sha256_file(test_guests::qwen3_coder_chat_format())?,
+        ])?;
         Ok(forja_serve::ServingEngine::new(
             profile.model().id.clone(),
             runner,
@@ -281,6 +297,7 @@ mod tests {
             config,
             info,
             profile.workload().max_context.get(),
+            identity,
         )?)
     }
 }

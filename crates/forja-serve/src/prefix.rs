@@ -1,6 +1,51 @@
 use sha2::{Digest, Sha256};
+use std::sync::atomic::{AtomicU64, Ordering};
 const BLOCK: usize = 64;
 const BLOCK_DOMAIN: &[u8] = b"forja-prefix-block-v1";
+const NAMESPACE_DOMAIN: &[u8] = b"forja-prefix-namespace-v1";
+static RUNNER_NONCE: AtomicU64 = AtomicU64::new(0);
+
+/// Artifact identity for one serving engine's live prefix.
+pub struct PrefixIdentity {
+    fields: [(u64, String); 5],
+}
+
+impl PrefixIdentity {
+    /// Builds an identity from the engine, profile, weights, tokenizer, and chat-format hashes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a hash length cannot be represented as `u64`.
+    pub fn new(hashes: [&str; 5]) -> Result<Self, &'static str> {
+        let mut fields = [const { (0, String::new()) }; 5];
+        for (output, hash) in fields.iter_mut().zip(hashes) {
+            output.0 = u64::try_from(hash.len()).map_err(|_| "artifact hash is too long")?;
+            hash.clone_into(&mut output.1);
+        }
+        Ok(Self { fields })
+    }
+
+    pub(crate) fn into_namespace(self) -> PrefixNamespace {
+        let nonce = RUNNER_NONCE.fetch_add(1, Ordering::Relaxed);
+        self.namespace_with_nonce(nonce)
+    }
+
+    fn namespace_with_nonce(&self, nonce: u64) -> PrefixNamespace {
+        let mut layout = Sha256::new();
+        layout.update(self.fields[0].1.as_bytes());
+        layout.update(nonce.to_le_bytes());
+        let layout: [u8; 32] = layout.finalize().into();
+        let mut hash = Sha256::new();
+        hash.update(NAMESPACE_DOMAIN);
+        for (length, value) in &self.fields {
+            hash.update(length.to_le_bytes());
+            hash.update(value.as_bytes());
+        }
+        hash.update(32_u64.to_le_bytes());
+        hash.update(layout);
+        PrefixNamespace(hash.finalize().into())
+    }
+}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct PrefixNamespace(pub(crate) [u8; 32]);
 #[derive(Debug)]
@@ -92,5 +137,25 @@ mod tests {
         prompt[33] = 999;
         cached.chain = LivePrefix::new(namespace, prompt.clone()).chain;
         assert_eq!(cached.match_len(namespace, &prompt), 33);
+    }
+
+    #[test]
+    fn every_namespace_input_isolated_independently() {
+        let base = ["engine", "profile", "weights", "tokenizer", "chat"];
+        let expected = PrefixIdentity::new(base).unwrap().namespace_with_nonce(7);
+        for index in 0..base.len() {
+            let mut changed = base;
+            changed[index] = "changed";
+            assert_ne!(
+                PrefixIdentity::new(changed)
+                    .unwrap()
+                    .namespace_with_nonce(7),
+                expected
+            );
+        }
+        assert_ne!(
+            PrefixIdentity::new(base).unwrap().namespace_with_nonce(8),
+            expected
+        );
     }
 }
