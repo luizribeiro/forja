@@ -2736,7 +2736,9 @@ impl MetalBackend {
                 ));
                 buffers
             }
-            Op::Program(_) => return Err(BackendError::InvalidInput),
+            Op::Program(_) | Op::SampleMasked { .. } => {
+                return Err(BackendError::InvalidInput);
+            }
             Op::Sdpa { .. } => {
                 self.encode_sdpa_dispatch(encoder, table, dispatch, bindings, arguments)?
             }
@@ -5804,6 +5806,7 @@ impl MetalBackend {
             Op::Sample { position } => {
                 Self::write_sample_arguments(dispatch, position, arguments)?;
             }
+            Op::SampleMasked { .. } => return Err(BackendError::InvalidInput),
             Op::Rope { .. } => {
                 for len in [112, 112, 112, 12] {
                     arguments.write(len)?;
@@ -6307,6 +6310,7 @@ fn supported_dispatch(dispatch: &Dispatch) -> bool {
         | Op::GatherQuantMatmul { .. }
         | Op::Sdpa { .. }
         | Op::Sample { .. } => true,
+        Op::SampleMasked { .. } => false,
     }
 }
 
@@ -6355,6 +6359,7 @@ pub(super) fn dispatch_kernel(dispatch: &Dispatch) -> Result<&'static str, Backe
             _ => return Err(BackendError::InvalidInput),
         },
         Op::Sample { .. } => "sample_rejection",
+        Op::SampleMasked { .. } => "sample-masked-unsupported",
         Op::Rope { .. } => "rope",
         Op::Embed => "embed",
         Op::QuantEmbed { .. } => "quant-embed",

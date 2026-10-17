@@ -362,6 +362,11 @@ pub enum TemplateOp {
         /// Absolute sequence position mixed into the random counter.
         position: Affine,
     },
+    /// Masked sampling with a parameterized absolute sequence position.
+    SampleMasked {
+        /// Absolute sequence position mixed into the random counter.
+        position: Affine,
+    },
 }
 
 impl TemplateOp {
@@ -379,6 +384,12 @@ impl TemplateOp {
     #[must_use]
     pub const fn sample(position: Affine) -> Self {
         Self::Sample { position }
+    }
+
+    /// Creates a masked sampling configuration whose position may depend on one parameter.
+    #[must_use]
+    pub const fn sample_masked(position: Affine) -> Self {
+        Self::SampleMasked { position }
     }
 
     /// Resolves the operation to a concrete configuration.
@@ -401,6 +412,9 @@ impl TemplateOp {
             Self::Sample { position } => Ok(Op::Sample {
                 position: position.evaluate(values)?,
             }),
+            Self::SampleMasked { position } => Ok(Op::SampleMasked {
+                position: position.evaluate(values)?,
+            }),
         }
     }
 
@@ -410,7 +424,7 @@ impl TemplateOp {
         match self {
             Self::Static(_) => false,
             Self::Sdpa { q_start, .. } => !q_start.is_constant(),
-            Self::Sample { position } => !position.is_constant(),
+            Self::Sample { position } | Self::SampleMasked { position } => !position.is_constant(),
         }
     }
 }
@@ -424,6 +438,7 @@ impl From<Op> for TemplateOp {
                 q_start,
             } => Self::sdpa(scale, causal, Affine::constant(q_start)),
             Op::Sample { position } => Self::sample(Affine::constant(position)),
+            Op::SampleMasked { position } => Self::sample_masked(Affine::constant(position)),
             _ => Self::Static(op),
         }
     }
@@ -1588,6 +1603,21 @@ mod tests {
             * DType::F32.byte_size();
         let layout = Layout::contiguous(DType::F32, 0, shape.to_vec(), bytes).unwrap();
         Tensor::from_allocation(BufferId::new(1, buffer, bytes), layout, true).unwrap()
+    }
+
+    #[test]
+    fn ordinary_sample_keeps_its_graph_identity() {
+        let operation = Op::Sample { position: 4097 };
+        let template = TemplateOp::from(operation);
+        let space = ParamSpace::new(std::iter::once(0..=0).collect()).unwrap();
+
+        assert_eq!(template, TemplateOp::sample(Affine::constant(4097)));
+        assert_eq!(
+            template
+                .instantiate(&space.values(vec![0]).unwrap())
+                .unwrap(),
+            operation
+        );
     }
 
     fn memory_graph(read_first_after_second_write: bool) -> (GraphTemplate, [Tensor; 7]) {

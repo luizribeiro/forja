@@ -167,6 +167,11 @@ pub enum Op {
         /// Absolute sequence position mixed into the random counter.
         position: u32,
     },
+    /// Samples one permitted index from each row using counter-based randomness.
+    SampleMasked {
+        /// Absolute sequence position mixed into the random counter.
+        position: u32,
+    },
     /// Applies half-split rotary position embeddings.
     Rope {
         /// The positive finite frequency base.
@@ -427,6 +432,7 @@ impl Dispatch {
             Op::Argmax => check_argmax(inputs, output)?,
             Op::TopK { k, .. } => check_top_k(inputs, outputs, k)?,
             Op::Sample { .. } => check_sample(inputs, output)?,
+            Op::SampleMasked { .. } => check_sample_masked(inputs, output)?,
             Op::Rope { theta } => check_rope(inputs, output, theta)?,
             Op::Embed => check_embed(inputs, output)?,
             Op::QuantEmbed { bits, group_size } => {
@@ -1131,6 +1137,32 @@ fn check_sample(inputs: &[&Tensor], output: &Tensor) -> Result<(), OpError> {
         });
     }
     check_argmax(&inputs[..1], output)
+}
+
+fn check_sample_masked(inputs: &[&Tensor], output: &Tensor) -> Result<(), OpError> {
+    if inputs.len() != 3 {
+        return Err(OpError::Arity {
+            expected: 3,
+            actual: inputs.len(),
+        });
+    }
+    check_sample(&inputs[..2], output)?;
+    let width = inputs[0]
+        .layout
+        .shape()
+        .last()
+        .copied()
+        .ok_or_else(|| shape_error(Operand::Input(0)))?;
+    if inputs[2].layout.dtype() != DType::U32 {
+        return Err(OpError::DType {
+            operand: Operand::Input(2),
+            dtype: inputs[2].layout.dtype(),
+        });
+    }
+    if inputs[2].layout.shape() != [width.div_ceil(32)] || !inputs[2].layout.is_contiguous() {
+        return Err(shape_error(Operand::Input(2)));
+    }
+    Ok(())
 }
 
 fn check_rope(inputs: &[&Tensor], output: &Tensor, theta: f32) -> Result<(), OpError> {
@@ -2219,6 +2251,43 @@ mod tests {
                 dtype: DType::F32
             })
         );
+    }
+
+    #[test]
+    fn masked_sample_requires_one_contiguous_mask_bit_per_logit() {
+        let logits = tensor(1, DType::F32, &[3, 33], &[33, 1]);
+        let params = tensor(2, DType::U32, &[5], &[1]);
+        let mask = tensor(3, DType::U32, &[2], &[1]);
+        let short_mask = tensor(4, DType::U32, &[1], &[1]);
+        let strided_mask = Tensor::from_allocation(
+            BufferId::new(1, 5, 12),
+            Layout::new(DType::U32, 0, vec![2], vec![2], 12).unwrap(),
+            true,
+        )
+        .unwrap();
+        let output = tensor(6, DType::U32, &[3], &[1]);
+
+        assert!(
+            CommandList::new()
+                .dispatch(
+                    Op::SampleMasked { position: 9 },
+                    &[&logits, &params, &mask],
+                    &output
+                )
+                .is_ok()
+        );
+        for invalid in [&short_mask, &strided_mask] {
+            assert_eq!(
+                CommandList::new().dispatch(
+                    Op::SampleMasked { position: 9 },
+                    &[&logits, &params, invalid],
+                    &output
+                ),
+                Err(OpError::Shape {
+                    operand: Operand::Input(2)
+                })
+            );
+        }
     }
 
     #[test]

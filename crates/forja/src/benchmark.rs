@@ -1977,6 +1977,7 @@ const fn op_name(operation: Op) -> &'static str {
         Op::Argmax => "argmax",
         Op::TopK { .. } => "top-k",
         Op::Sample { .. } => "sample",
+        Op::SampleMasked { .. } => "sample-masked",
         Op::Rope { .. } => "rope",
         Op::Embed => "embed",
         Op::QuantEmbed { .. } => "quant-embed",

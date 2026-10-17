@@ -429,6 +429,42 @@ impl CpuBackend {
         scatter(target, output.layout(), &bytes)
     }
 
+    fn execute_sample_masked(
+        &self,
+        inputs: &[Tensor],
+        output: &Tensor,
+        position: u32,
+    ) -> Result<(), BackendError> {
+        let values = decode(&self.read(&inputs[0])?, inputs[0].layout().dtype())
+            .ok_or(BackendError::ExecutionFailed)?;
+        let words = decode_u32(&self.read(&inputs[1])?).ok_or(BackendError::ExecutionFailed)?;
+        let allow = decode_u32(&self.read(&inputs[2])?).ok_or(BackendError::ExecutionFailed)?;
+        let parameters = SamplingParameters::from_words(&words)?;
+        let width = execution_usize(
+            inputs[0]
+                .layout()
+                .shape()
+                .last()
+                .copied()
+                .ok_or(BackendError::ExecutionFailed)?,
+        )?;
+        validate_allow_mask(&allow, width)?;
+        let indices = values
+            .chunks_exact(width)
+            .map(|row| sample_row_masked(row, parameters, position, &allow))
+            .collect::<Result<Vec<_>, _>>()?;
+        let bytes = indices
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect::<Vec<_>>();
+        let mut buffers = self
+            .buffers
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?;
+        let target = buffers.get_mut(output)?.bytes_mut()?;
+        scatter(target, output.layout(), &bytes)
+    }
+
     #[allow(clippy::cast_precision_loss)]
     fn execute_rope(
         &self,
@@ -1182,6 +1218,9 @@ impl Backend for CpuBackend {
                 Op::Sample { position } => {
                     self.execute_sample(dispatch.inputs(), dispatch.output(), position)
                 }
+                Op::SampleMasked { position } => {
+                    self.execute_sample_masked(dispatch.inputs(), dispatch.output(), position)
+                }
                 Op::Rope { theta } => {
                     self.execute_rope(dispatch.inputs(), dispatch.output(), theta)
                 }
@@ -1255,15 +1294,38 @@ fn sample_row(
     parameters: SamplingParameters,
     position: u32,
 ) -> Result<u32, BackendError> {
+    sample_allowed(row, parameters, position, (0..row.len()).collect())
+}
+
+fn sample_row_masked(
+    row: &[f32],
+    parameters: SamplingParameters,
+    position: u32,
+    allow: &[u32],
+) -> Result<u32, BackendError> {
+    let allowed = (0..row.len())
+        .filter(|&index| allow[index / 32] & (1 << (index % 32)) != 0)
+        .collect();
+    sample_allowed(row, parameters, position, allowed)
+}
+
+fn sample_allowed(
+    row: &[f32],
+    parameters: SamplingParameters,
+    position: u32,
+    mut allowed: Vec<usize>,
+) -> Result<u32, BackendError> {
     if parameters.temperature == 0.0 || parameters.top_k == 1 {
-        return row
-            .iter()
-            .enumerate()
-            .max_by(|(_, left), (_, right)| left.total_cmp(right))
-            .and_then(|(index, _)| u32::try_from(index).ok())
-            .ok_or(BackendError::ExecutionFailed);
+        return allowed
+            .into_iter()
+            .max_by(|&left, &right| {
+                row[left]
+                    .total_cmp(&row[right])
+                    .then_with(|| left.cmp(&right))
+            })
+            .and_then(|index| u32::try_from(index).ok())
+            .ok_or(BackendError::InvalidInput);
     }
-    let mut allowed = (0..row.len()).collect::<Vec<_>>();
     allowed.sort_unstable_by(|&left, &right| {
         row[right]
             .total_cmp(&row[left])
@@ -1288,6 +1350,21 @@ fn sample_row(
         })
         .and_then(|index| u32::try_from(index).ok())
         .ok_or(BackendError::ExecutionFailed)
+}
+
+fn validate_allow_mask(allow: &[u32], width: usize) -> Result<(), BackendError> {
+    let remainder = width % 32;
+    if remainder != 0
+        && allow
+            .last()
+            .is_none_or(|last| last & !((1_u32 << remainder) - 1) != 0)
+    {
+        return Err(BackendError::InvalidInput);
+    }
+    if allow.iter().all(|word| *word == 0) {
+        return Err(BackendError::InvalidInput);
+    }
+    Ok(())
 }
 
 fn truncate_top_p(
@@ -2062,6 +2139,53 @@ mod tests {
             assert!(sample_row(&row, top_p, position).unwrap() <= 1);
             assert!(sample_row(&row, combined, position).unwrap() <= 1);
         }
+    }
+
+    #[test]
+    fn masked_sampling_conditions_every_sampling_mode() {
+        let row = [10.0, 9.0, 8.0, 7.0, 6.0, 5.0, 4.0];
+        let allow = [0b0101_0010];
+        for parameters in [
+            sampling_parameters(0.0, 0, 1.0, 11),
+            sampling_parameters(1.0, 2, 1.0, 12),
+            sampling_parameters(1.0, 0, 0.8, 13),
+            sampling_parameters(0.7, 0, 1.0, 14),
+        ] {
+            for position in 0..256 {
+                assert!(matches!(
+                    sample_row_masked(&row, parameters, position, &allow).unwrap(),
+                    1 | 4 | 6
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn all_allowed_mask_preserves_unconstrained_sampling() {
+        let row = (0..33)
+            .map(|index| f32::from(u16::try_from(index).unwrap()) / 7.0)
+            .collect::<Vec<_>>();
+        let allow = [u32::MAX, 1];
+        let parameters = sampling_parameters(0.7, 7, 0.9, 0xfeed_beef);
+        for position in 0..512 {
+            assert_eq!(
+                sample_row_masked(&row, parameters, position, &allow).unwrap(),
+                sample_row(&row, parameters, position).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn masked_sampling_refuses_empty_and_padding_bits() {
+        assert_eq!(
+            validate_allow_mask(&[0], 7),
+            Err(BackendError::InvalidInput)
+        );
+        assert_eq!(
+            validate_allow_mask(&[1 << 7], 7),
+            Err(BackendError::InvalidInput)
+        );
+        assert!(validate_allow_mask(&[1 << 6], 7).is_ok());
     }
 
     #[test]

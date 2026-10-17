@@ -958,7 +958,7 @@ const fn template_operation(operation: TemplateOp) -> OperationKind {
     match operation {
         TemplateOp::Static(operation) => OperationKind::of(operation),
         TemplateOp::Sdpa { .. } => OperationKind::Sdpa,
-        TemplateOp::Sample { .. } => OperationKind::Other,
+        TemplateOp::Sample { .. } | TemplateOp::SampleMasked { .. } => OperationKind::Other,
     }
 }
 
