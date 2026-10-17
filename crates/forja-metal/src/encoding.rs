@@ -2692,6 +2692,13 @@ impl MetalBackend {
                 error_flags.push(EncodedErrorFlag::new(flag, dispatch_index, "sample"));
                 buffers
             }
+            Op::SampleMasked { position } => {
+                let (buffers, flag) = self.encode_sample_masked(
+                    encoder, table, dispatch, position, bindings, arguments,
+                )?;
+                error_flags.push(EncodedErrorFlag::new(flag, dispatch_index, "sample-masked"));
+                buffers
+            }
             Op::Rope { theta } => {
                 self.encode_rope(encoder, table, dispatch, theta, bindings, arguments)?
             }
@@ -2736,9 +2743,7 @@ impl MetalBackend {
                 ));
                 buffers
             }
-            Op::Program(_) | Op::SampleMasked { .. } => {
-                return Err(BackendError::InvalidInput);
-            }
+            Op::Program(_) => return Err(BackendError::InvalidInput),
             Op::Sdpa { .. } => {
                 self.encode_sdpa_dispatch(encoder, table, dispatch, bindings, arguments)?
             }
@@ -5615,6 +5620,138 @@ impl MetalBackend {
         Ok((temporaries, error_flag))
     }
 
+    #[allow(clippy::too_many_lines)]
+    fn encode_sample_masked(
+        &self,
+        encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
+        table: &ProtocolObject<dyn MTL4ArgumentTable>,
+        dispatch: &Dispatch,
+        position: u32,
+        bindings: &mut ArgumentBindings,
+        arguments: &mut ArgumentWriter,
+    ) -> Result<EncodedEmbed, BackendError> {
+        let [logits, sampling, allow] = dispatch.inputs() else {
+            return Err(BackendError::InvalidInput);
+        };
+        let output = dispatch.output();
+        let width = *logits
+            .layout()
+            .shape()
+            .last()
+            .ok_or(BackendError::InvalidInput)?;
+        let rows = u32::try_from(output.layout().element_count())
+            .map_err(|_| BackendError::ExecutionFailed)?;
+        let chunks = width.div_ceil(ARGMAX_CHUNK_WIDTH);
+        let partials = self.scratch_tensor(DType::U32, &[rows, chunks, 46])?;
+        let (partials_pipeline, finalize_pipeline) = {
+            let mut pipelines = self
+                .pipelines
+                .lock()
+                .map_err(|_| BackendError::ExecutionFailed)?;
+            let dtype = [(0, dtype_code(logits.layout().dtype()))];
+            (
+                pipelines.get("sample_masked_partials", &dtype)?,
+                pipelines.get("sample_masked_finalize", &dtype)?,
+            )
+        };
+        let mut temporaries = vec![arguments.write(&[0_u8; 8])?];
+        for layout in [
+            logits.layout(),
+            sampling.layout(),
+            allow.layout(),
+            output.layout(),
+        ] {
+            temporaries.push(Self::layout_buffer(layout, arguments)?);
+        }
+        temporaries.push(arguments.write(&width.to_ne_bytes())?);
+        temporaries.push(arguments.write(&position.to_ne_bytes())?);
+        temporaries.push(arguments.write(&chunks.to_ne_bytes())?);
+        let error_flag = temporaries[0].clone();
+        let (logits_buffer, sampling_buffer, allow_buffer, output_buffer) = {
+            let buffers = self
+                .buffers
+                .lock()
+                .map_err(|_| BackendError::ExecutionFailed)?;
+            (
+                BufferBinding::whole(buffers.get(logits)?.raw.clone()),
+                BufferBinding::whole(buffers.get(sampling)?.raw.clone()),
+                BufferBinding::whole(buffers.get(allow)?.raw.clone()),
+                BufferBinding::whole(buffers.get(output)?.raw.clone()),
+            )
+        };
+        let row_groups = MTLSize {
+            width: usize::try_from(rows).map_err(|_| BackendError::ExecutionFailed)?,
+            height: 1,
+            depth: 1,
+        };
+        let chunk_groups = MTLSize {
+            width: usize::try_from(rows)
+                .map_err(|_| BackendError::ExecutionFailed)?
+                .checked_mul(usize::try_from(chunks).map_err(|_| BackendError::ExecutionFailed)?)
+                .ok_or(BackendError::ExecutionFailed)?,
+            height: 1,
+            depth: 1,
+        };
+        let threads = MTLSize {
+            width: simd_thread_count(&partials_pipeline, 256)?,
+            height: 1,
+            depth: 1,
+        };
+        set_pipeline(encoder, &partials_pipeline);
+        for (index, buffer) in [
+            &logits_buffer,
+            &sampling_buffer,
+            &allow_buffer,
+            &partials.buffer,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            bindings.bind(table, index, buffer);
+        }
+        for index in 0..3 {
+            bindings.bind(table, index + 4, &temporaries[index + 1]);
+        }
+        bindings.bind(table, 7, &temporaries[5]);
+        bindings.bind(table, 8, &temporaries[6]);
+        bindings.bind(table, 9, &temporaries[7]);
+        set_argument_table(encoder, table);
+        dispatch_threadgroups(encoder, chunk_groups, threads);
+
+        encode_dispatch_barrier(encoder);
+        set_pipeline(encoder, &finalize_pipeline);
+        for (index, buffer) in [
+            &logits_buffer,
+            &sampling_buffer,
+            &allow_buffer,
+            &partials.buffer,
+            &output_buffer,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            bindings.bind(table, index, buffer);
+        }
+        for index in 0..4 {
+            bindings.bind(table, index + 5, &temporaries[index + 1]);
+        }
+        bindings.bind(table, 9, &temporaries[5]);
+        bindings.bind(table, 10, &temporaries[6]);
+        bindings.bind(table, 11, &temporaries[7]);
+        bindings.bind(table, 12, &error_flag);
+        set_argument_table(encoder, table);
+        dispatch_threadgroups(encoder, row_groups, threads);
+        temporaries.extend([
+            logits_buffer,
+            sampling_buffer,
+            allow_buffer,
+            output_buffer,
+            partials.buffer,
+            error_flag.clone(),
+        ]);
+        Ok((temporaries, error_flag))
+    }
+
     fn encode_rms_norm(
         &self,
         encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
@@ -5806,7 +5943,11 @@ impl MetalBackend {
             Op::Sample { position } => {
                 Self::write_sample_arguments(dispatch, position, arguments)?;
             }
-            Op::SampleMasked { .. } => return Err(BackendError::InvalidInput),
+            Op::SampleMasked { .. } => {
+                for len in [8, 112, 112, 112, 112, 4, 4, 4] {
+                    arguments.write(len)?;
+                }
+            }
             Op::Rope { .. } => {
                 for len in [112, 112, 112, 12] {
                     arguments.write(len)?;
@@ -6309,8 +6450,8 @@ fn supported_dispatch(dispatch: &Dispatch) -> bool {
         | Op::QuantMatmul { .. }
         | Op::GatherQuantMatmul { .. }
         | Op::Sdpa { .. }
-        | Op::Sample { .. } => true,
-        Op::SampleMasked { .. } => false,
+        | Op::Sample { .. }
+        | Op::SampleMasked { .. } => true,
     }
 }
 
@@ -6359,7 +6500,7 @@ pub(super) fn dispatch_kernel(dispatch: &Dispatch) -> Result<&'static str, Backe
             _ => return Err(BackendError::InvalidInput),
         },
         Op::Sample { .. } => "sample_rejection",
-        Op::SampleMasked { .. } => "sample-masked-unsupported",
+        Op::SampleMasked { .. } => "sample_masked",
         Op::Rope { .. } => "rope",
         Op::Embed => "embed",
         Op::QuantEmbed { .. } => "quant-embed",
@@ -6474,6 +6615,7 @@ fn reusable_dispatch(dispatch: &Dispatch) -> bool {
         Op::Argmax
         | Op::TopK { .. }
         | Op::Sample { .. }
+        | Op::SampleMasked { .. }
         | Op::Embed
         | Op::QuantEmbed { .. }
         | Op::GatherMatmul
@@ -7580,6 +7722,8 @@ fn nan_preserving_kernel(name: &str) -> bool {
             | "sample_partials"
             | "sample_reduce_finalize"
             | "sample_candidates_finalize"
+            | "sample_masked_partials"
+            | "sample_masked_finalize"
     )
 }
 
@@ -7609,7 +7753,7 @@ mod tests {
 
     use forja_core::{
         Affine, Backend, BackendDispatchData, CommandList, DType, GraphLimits, Op, ParamSpace,
-        RuleArm, Slice, Submission, SymbolicLayout, TemplateTensor, VariantRule, ViewOp,
+        RuleArm, Slice, Submission, SymbolicLayout, TemplateTensor, Tensor, VariantRule, ViewOp,
         program::{
             BinOp, BoundProgram, EpilogueSignature, Inst, KernelSignature, Program, ProgramKind,
             RedOp, UnOp, ValidatedProgram, bind_program, prepare_epilogue, prepare_program,
@@ -7780,6 +7924,48 @@ mod tests {
         let mut commands = CommandList::new();
         commands
             .dispatch(Op::Sample { position }, &[&input, &params], &output)
+            .map_err(|_| BackendError::InvalidInput)?;
+        backend.submit(commands)?.wait()?;
+        backend
+            .read(&output)?
+            .as_slice()
+            .try_into()
+            .map(u32::from_le_bytes)
+            .map_err(|_| BackendError::ExecutionFailed)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_masked_sample<B: Backend>(
+        backend: &B,
+        logits: &[u8],
+        width: u32,
+        allow: &[u32],
+        temperature: f32,
+        top_k: u32,
+        top_p: f32,
+        seed: u64,
+        position: u32,
+    ) -> Result<u32, BackendError> {
+        let input = backend.alloc(DType::F32, &[1, width])?;
+        backend.write(&input, logits)?;
+        let params = backend.alloc(DType::U32, &[5])?;
+        backend.write(&params, &sample_params(temperature, top_k, top_p, seed))?;
+        let mask = backend.alloc(DType::U32, &[width.div_ceil(32)])?;
+        backend.write(
+            &mask,
+            &allow
+                .iter()
+                .flat_map(|word| word.to_le_bytes())
+                .collect::<Vec<_>>(),
+        )?;
+        let output = backend.alloc(DType::U32, &[1])?;
+        let mut commands = CommandList::new();
+        commands
+            .dispatch(
+                Op::SampleMasked { position },
+                &[&input, &params, &mask],
+                &output,
+            )
             .map_err(|_| BackendError::InvalidInput)?;
         backend.submit(commands)?.wait()?;
         backend
@@ -11264,6 +11450,132 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn metal_masked_sample_matches_cpu_for_conditioned_sets() {
+        let reference = CpuBackend::new();
+        let candidate = MetalBackend::new().unwrap();
+        let values = (0_u16..33)
+            .map(|index| f32::from(index) / 7.0)
+            .collect::<Vec<_>>();
+        let logits = values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+        for allow in [[0x8000_0011, 1], [u32::MAX, 1]] {
+            let allow_bytes = allow
+                .into_iter()
+                .flat_map(u32::to_le_bytes)
+                .collect::<Vec<_>>();
+            for (temperature, top_k, top_p) in
+                [(0.0, 0, 1.0), (0.7, 3, 1.0), (0.7, 0, 0.8), (0.7, 3, 0.9)]
+            {
+                for position in [0, 1, 33, 4097] {
+                    assert_backends_agree(
+                        &reference,
+                        &candidate,
+                        Op::SampleMasked { position },
+                        &[
+                            TensorSpec::initialized(DType::F32, &[1, 33], logits.clone()),
+                            TensorSpec::initialized(
+                                DType::U32,
+                                &[5],
+                                sample_params(temperature, top_k, top_p, 0xfeed_beef),
+                            ),
+                            TensorSpec::initialized(DType::U32, &[2], allow_bytes.clone()),
+                        ],
+                        &TensorSpec::contiguous(DType::U32, &[1]),
+                    )
+                    .unwrap();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn metal_masked_sample_handles_qwen_vocabulary_and_refuses_bad_masks() {
+        let backend = MetalBackend::new().unwrap();
+        let logits = (0_u32..151_936)
+            .flat_map(|index| f32::from(u16::try_from(index % 97).unwrap()).to_le_bytes())
+            .collect::<Vec<_>>();
+        let mut allow = vec![0_u32; usize::try_from(151_936_u32.div_ceil(32)).unwrap()];
+        allow[0] |= 1 << 17;
+        allow[151_935 / 32] |= 1 << (151_935 % 32);
+        assert_eq!(
+            run_masked_sample(&backend, &logits, 151_936, &allow, 0.0, 0, 1.0, 7, 33,).unwrap(),
+            151_935
+        );
+
+        let short_logits = vec![0_u8; 33 * 4];
+        for bad in [[0_u32, 0], [1, 2]] {
+            assert!(matches!(
+                run_masked_sample(&backend, &short_logits, 33, &bad, 0.0, 0, 1.0, 7, 0,),
+                Err(BackendError::DeviceErrorFlag {
+                    operation: "sample-masked",
+                    flag: 2,
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn metal_masked_sample_tracks_ordinary_sample_gpu_time() {
+        let backend = MetalBackend::new().unwrap();
+        let width = 151_936_u32;
+        let logits = backend.alloc(DType::F32, &[1, width]).unwrap();
+        let values = (0..width)
+            .flat_map(|index| (f32::from(u16::try_from(index % 97).unwrap()) / 32.0).to_le_bytes())
+            .collect::<Vec<_>>();
+        backend.write(&logits, &values).unwrap();
+        let params = backend.alloc(DType::U32, &[5]).unwrap();
+        backend
+            .write(&params, &sample_params(0.6, 20, 0.95, 91))
+            .unwrap();
+        let output = backend.alloc(DType::U32, &[1]).unwrap();
+        let mask_words = usize::try_from(width.div_ceil(32)).unwrap();
+        let dense = backend.alloc(DType::U32, &[width.div_ceil(32)]).unwrap();
+        backend
+            .write(&dense, &vec![0xff_u8; mask_words * 4])
+            .unwrap();
+        let sparse = backend.alloc(DType::U32, &[width.div_ceil(32)]).unwrap();
+        let mut sparse_words = vec![0_u32; mask_words];
+        for token in (0..width).step_by(997) {
+            sparse_words[usize::try_from(token / 32).unwrap()] |= 1 << (token % 32);
+        }
+        backend
+            .write(
+                &sparse,
+                &sparse_words
+                    .into_iter()
+                    .flat_map(u32::to_le_bytes)
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        let measure = |op: Op, inputs: &[&Tensor]| {
+            let mut timings = Vec::with_capacity(20);
+            for iteration in 0..23 {
+                let mut commands = CommandList::new();
+                commands.dispatch(op, inputs, &output).unwrap();
+                let submission = backend.submit_profiled(commands).unwrap();
+                submission.wait().unwrap();
+                if iteration >= 3 {
+                    timings.push(submission.profile().unwrap().per_dispatch[0].gpu_time);
+                }
+            }
+            timings.sort_unstable();
+            timings[timings.len() / 2]
+        };
+        let ordinary = measure(Op::Sample { position: 511 }, &[&logits, &params]);
+        for (name, mask) in [("sparse", &sparse), ("dense", &dense)] {
+            let masked = measure(
+                Op::SampleMasked { position: 511 },
+                &[&logits, &params, mask],
+            );
+            eprintln!("sample width {width} masked {name}: {masked:?}, ordinary {ordinary:?}");
+            assert!(masked.as_secs_f64() <= ordinary.as_secs_f64() * 1.5);
+        }
     }
 
     #[test]

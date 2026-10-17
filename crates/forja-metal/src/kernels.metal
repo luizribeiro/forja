@@ -712,6 +712,434 @@ bool sample_uses_exact(device atomic_uint *state, uint row) {
         state + row * sample_state_words + sample_status, memory_order_relaxed) == sample_exact;
 }
 
+bool sample_mask_allows(
+    device const uint *allow,
+    constant TensorLayout &allow_layout,
+    uint column) {
+    uint word = allow[physical_index(allow_layout, column / 32u)];
+    return (word & (1u << (column % 32u))) != 0;
+}
+
+uint sample_masked_sum(
+    uint value,
+    uint lane,
+    uint simd_lane,
+    uint simd_group,
+    threadgroup uint *partials) {
+    value = simd_sum(value);
+    if (simd_group == 0) {
+        partials[simd_lane] = 0;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_lane == 0) {
+        partials[simd_group] = value;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_group == 0) {
+        value = simd_sum(partials[simd_lane]);
+    }
+    if (lane == 0) {
+        partials[0] = value;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    return partials[0];
+}
+
+float sample_masked_sum(
+    float value,
+    uint lane,
+    uint simd_lane,
+    uint simd_group,
+    threadgroup float *partials) {
+    value = simd_sum(value);
+    if (simd_group == 0) {
+        partials[simd_lane] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_lane == 0) {
+        partials[simd_group] = value;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_group == 0) {
+        value = simd_sum(partials[simd_lane]);
+    }
+    if (lane == 0) {
+        partials[0] = value;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    return partials[0];
+}
+
+constant uint sample_masked_stride = 23;
+
+kernel void sample_masked_partials(
+    device const uchar *logits [[buffer(0)]],
+    device const uint *sampling [[buffer(1)]],
+    device const uint *allow [[buffer(2)]],
+    device ulong *partials [[buffer(3)]],
+    constant TensorLayout &logits_layout [[buffer(4)]],
+    constant TensorLayout &sampling_layout [[buffer(5)]],
+    constant TensorLayout &allow_layout [[buffer(6)]],
+    constant uint &width [[buffer(7)]],
+    constant uint &position [[buffer(8)]],
+    constant uint &chunks [[buffer(9)]],
+    uint group [[threadgroup_position_in_grid]],
+    uint lane [[thread_position_in_threadgroup]],
+    uint group_width [[threads_per_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+    threadgroup ulong simd_top[160];
+    threadgroup uint partial_keys[32];
+    threadgroup uint partial_indices[32];
+    threadgroup uint partial_counts[32];
+    SamplingConfig config = sampling_config(sampling, sampling_layout);
+    uint row = group / chunks;
+    uint chunk = group % chunks;
+    uint first = chunk * 2048u;
+    uint end = first + min(2048u, width - first);
+    bool fast_ranked = !sampling_is_greedy(config) && config.top_k != 0u &&
+                       config.top_k <= sample_fast_topk;
+    ulong maximum = 0;
+    ulong sampled = 0;
+    uint allowed_count = 0;
+    ulong local_top[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    for (uint column = first + lane; column < end; column += group_width) {
+        if (sample_mask_allows(allow, allow_layout, column)) {
+            float value = load_float(
+                logits, physical_index(logits_layout, row * width + column), input0_dtype);
+            maximum = max(maximum, argmax_candidate(value, column));
+            if (!sampling_is_greedy(config) && !fast_ranked && config.top_p == 1.0f &&
+                config.top_k == 0u) {
+                float score = value / config.temperature +
+                              gumbel_noise(config.seed, position, 0u, column);
+                sampled = max(sampled, argmax_candidate(score, column));
+            }
+            if (fast_ranked) {
+                local_top[(column - first) / group_width] =
+                    argmax_candidate(value, column) + 1ul;
+            }
+            ++allowed_count;
+        }
+    }
+    maximum = argmax_threadgroup_max(
+        maximum, simd_lane, simd_group, partial_keys, partial_indices);
+    sampled = argmax_threadgroup_max(
+        sampled, simd_lane, simd_group, partial_keys, partial_indices);
+    allowed_count = sample_masked_sum(
+        allowed_count, lane, simd_lane, simd_group, partial_counts);
+    uint base = (row * chunks + chunk) * sample_masked_stride;
+    if (lane == 0) {
+        partials[base] = maximum;
+        partials[base + 1] = sampled;
+        partials[base + 2] = ulong(allowed_count);
+    }
+    if (!fast_ranked) {
+        return;
+    }
+    sort_eight_candidates_descending(local_top);
+    uint local_cursor = 0;
+    for (uint rank = 0; rank < sample_fast_topk; ++rank) {
+        ulong best = local_cursor < 8 ? local_top[local_cursor] : 0;
+        ulong chosen = simd_candidate_max(best);
+        if (simd_lane == 0) {
+            simd_top[simd_group * sample_fast_topk + rank] = chosen;
+        }
+        if (best == chosen && local_cursor < 8) {
+            ++local_cursor;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_group == 0) {
+        ulong merged[8];
+        for (uint slot = 0; slot < 8; ++slot) {
+            merged[slot] = simd_top[simd_lane + slot * 32];
+        }
+        sort_eight_candidates_descending(merged);
+        uint merged_cursor = 0;
+        for (uint rank = 0; rank < sample_fast_topk; ++rank) {
+            ulong best = merged_cursor < 8 ? merged[merged_cursor] : 0;
+            ulong chosen = simd_candidate_max(best);
+            if (simd_lane == 0) {
+                partials[base + 3 + rank] = chosen;
+            }
+            if (best == chosen && merged_cursor < 8) {
+                ++merged_cursor;
+            }
+        }
+    }
+}
+
+kernel void sample_masked_finalize(
+    device const uchar *logits [[buffer(0)]],
+    device const uint *sampling [[buffer(1)]],
+    device const uint *allow [[buffer(2)]],
+    device const ulong *partials [[buffer(3)]],
+    device uint *output [[buffer(4)]],
+    constant TensorLayout &logits_layout [[buffer(5)]],
+    constant TensorLayout &sampling_layout [[buffer(6)]],
+    constant TensorLayout &allow_layout [[buffer(7)]],
+    constant TensorLayout &output_layout [[buffer(8)]],
+    constant uint &width [[buffer(9)]],
+    constant uint &position [[buffer(10)]],
+    constant uint &chunks [[buffer(11)]],
+    device atomic_uint *error_flag [[buffer(12)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint lane [[thread_position_in_threadgroup]],
+    uint group_width [[threads_per_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+    threadgroup ulong simd_top[160];
+    threadgroup ulong ordered[20];
+    threadgroup float weights[20];
+    threadgroup uint keep;
+    threadgroup uint partial_keys[32];
+    threadgroup uint partial_indices[32];
+    threadgroup uint partial_counts[32];
+    threadgroup float partial_totals[32];
+    threadgroup ulong maximum_value;
+    threadgroup ulong topk_boundary;
+    threadgroup ulong probability_boundary;
+    threadgroup uint allowed_total;
+    threadgroup uint remaining;
+    threadgroup float cumulative;
+    SamplingConfig config = sampling_config(sampling, sampling_layout);
+    ulong maximum = 0;
+    ulong sampled = 0;
+    uint allowed_count = 0;
+    for (uint chunk = lane; chunk < chunks; chunk += group_width) {
+        uint base = (row * chunks + chunk) * sample_masked_stride;
+        maximum = max(maximum, partials[base]);
+        sampled = max(sampled, partials[base + 1]);
+        allowed_count += uint(partials[base + 2]);
+    }
+    maximum = argmax_threadgroup_max(
+        maximum, simd_lane, simd_group, partial_keys, partial_indices);
+    sampled = argmax_threadgroup_max(
+        sampled, simd_lane, simd_group, partial_keys, partial_indices);
+    allowed_count = sample_masked_sum(
+        allowed_count, lane, simd_lane, simd_group, partial_counts);
+    if (lane == 0) {
+        maximum_value = maximum;
+        allowed_total = allowed_count;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint final_bits = width % 32u;
+    uint final_word = allow[physical_index(allow_layout, (width - 1u) / 32u)];
+    bool bad_padding = final_bits != 0u && (final_word >> final_bits) != 0u;
+    if (invalid_sampling(config) || bad_padding || allowed_total == 0u) {
+        if (lane == 0) {
+            atomic_store_explicit(error_flag, 2u, memory_order_relaxed);
+        }
+        return;
+    }
+    if (sampling_is_greedy(config)) {
+        if (lane == 0) {
+            output[physical_index(output_layout, row)] = uint(maximum_value);
+        }
+        return;
+    }
+    if (config.top_k == 0u && config.top_p == 1.0f) {
+        if (lane == 0) {
+            output[physical_index(output_layout, row)] = uint(sampled);
+        }
+        return;
+    }
+    if (config.top_k != 0u && config.top_k <= sample_fast_topk) {
+        ulong local_top[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+        uint local_slot = 0;
+        uint partial_count = chunks * sample_fast_topk;
+        for (uint slot = lane; slot < partial_count; slot += group_width) {
+            uint chunk = slot / sample_fast_topk;
+            uint rank = slot % sample_fast_topk;
+            uint chunk_count = uint(
+                partials[(row * chunks + chunk) * sample_masked_stride + 2]);
+            local_top[local_slot++] = rank < min(chunk_count, sample_fast_topk)
+                ? partials[(row * chunks + chunk) * sample_masked_stride + 3 + rank]
+                : 0;
+        }
+        sort_eight_candidates_descending(local_top);
+        uint local_cursor = 0;
+        for (uint rank = 0; rank < sample_fast_topk; ++rank) {
+            ulong best = local_cursor < 8 ? local_top[local_cursor] : 0;
+            ulong chosen = simd_candidate_max(best);
+            if (simd_lane == 0) {
+                simd_top[simd_group * sample_fast_topk + rank] = chosen;
+            }
+            if (best == chosen && local_cursor < 8) {
+                ++local_cursor;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (simd_group == 0) {
+            ulong merged[8];
+            for (uint slot = 0; slot < 8; ++slot) {
+                merged[slot] = simd_top[simd_lane + slot * 32];
+            }
+            sort_eight_candidates_descending(merged);
+            uint merged_cursor = 0;
+            for (uint rank = 0; rank < sample_fast_topk; ++rank) {
+                ulong best = merged_cursor < 8 ? merged[merged_cursor] : 0;
+                ulong chosen = simd_candidate_max(best);
+                if (simd_lane == 0) {
+                    ordered[rank] = chosen - 1ul;
+                }
+                if (best == chosen && merged_cursor < 8) {
+                    ++merged_cursor;
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint count = min(config.top_k, allowed_total);
+        float maximum_logit = total_order_value(uint(ordered[0] >> 32));
+        for (uint slot = lane; slot < count; slot += group_width) {
+            float value = total_order_value(uint(ordered[slot] >> 32));
+            weights[slot] = exp((value - maximum_logit) / config.temperature);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (lane == 0) {
+            keep = count;
+            if (config.top_p < 1.0f) {
+                float total = 0.0f;
+                for (uint slot = 0; slot < count; ++slot) {
+                    total += weights[slot];
+                }
+                keep = 1;
+                if (isfinite(total) && total > 0.0f) {
+                    float prefix = 0.0f;
+                    for (uint slot = 0; slot < count; ++slot) {
+                        prefix += weights[slot] / total;
+                        keep = slot + 1;
+                        if (prefix >= config.top_p) {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        ulong best = 0;
+        for (uint slot = lane; slot < keep; slot += group_width) {
+            uint column = uint(ordered[slot]);
+            float value = total_order_value(uint(ordered[slot] >> 32));
+            float score = value / config.temperature +
+                          gumbel_noise(config.seed, position, 0u, column);
+            best = max(best, argmax_candidate(score, column));
+        }
+        best = argmax_threadgroup_max(
+            best, simd_lane, simd_group, partial_keys, partial_indices);
+        if (lane == 0) {
+            output[physical_index(output_layout, row)] = uint(best);
+        }
+        return;
+    }
+    uint count = config.top_k == 0u ? allowed_total : min(config.top_k, allowed_total);
+    if (lane == 0) {
+        topk_boundary = 0;
+        remaining = count;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int bit = 63; bit >= 0; --bit) {
+        ulong bit_value = 1ul << uint(bit);
+        uint selected = 0;
+        for (uint column = lane; column < width; column += group_width) {
+            if (sample_mask_allows(allow, allow_layout, column)) {
+                float value = load_float(
+                    logits, physical_index(logits_layout, row * width + column), input0_dtype);
+                ulong candidate = argmax_candidate(value, column);
+                ulong high_mask = ~(bit_value - 1ul);
+                selected += (candidate & high_mask) == (topk_boundary | bit_value);
+            }
+        }
+        selected = sample_masked_sum(
+            selected, lane, simd_lane, simd_group, partial_counts);
+        if (lane == 0) {
+            if (remaining <= selected) {
+                topk_boundary |= bit_value;
+            } else {
+                remaining -= selected;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (lane == 0) {
+        probability_boundary = topk_boundary;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (config.top_p < 1.0f) {
+        uint maximum_column = uint(maximum_value);
+        float maximum_logit = load_float(
+            logits,
+            physical_index(logits_layout, row * width + maximum_column),
+            input0_dtype);
+        float total = 0.0f;
+        for (uint column = lane; column < width; column += group_width) {
+            if (sample_mask_allows(allow, allow_layout, column)) {
+                float value = load_float(
+                    logits, physical_index(logits_layout, row * width + column), input0_dtype);
+                if (argmax_candidate(value, column) >= topk_boundary) {
+                    total += exp((value - maximum_logit) / config.temperature);
+                }
+            }
+        }
+        total = sample_masked_sum(total, lane, simd_lane, simd_group, partial_totals);
+        if (lane == 0) {
+            cumulative = 0.0f;
+            probability_boundary = isfinite(total) && total > 0.0f ? 0 : maximum_value;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (isfinite(total) && total > 0.0f) {
+            float target = config.top_p * total;
+            for (int bit = 63; bit >= 0; --bit) {
+                ulong bit_value = 1ul << uint(bit);
+                float selected = 0.0f;
+                for (uint column = lane; column < width; column += group_width) {
+                    if (sample_mask_allows(allow, allow_layout, column)) {
+                        float value = load_float(
+                            logits,
+                            physical_index(logits_layout, row * width + column),
+                            input0_dtype);
+                        ulong candidate = argmax_candidate(value, column);
+                        ulong high_mask = ~(bit_value - 1ul);
+                        if (candidate >= topk_boundary &&
+                            (candidate & high_mask) == (probability_boundary | bit_value)) {
+                            selected += exp((value - maximum_logit) / config.temperature);
+                        }
+                    }
+                }
+                selected = sample_masked_sum(
+                    selected, lane, simd_lane, simd_group, partial_totals);
+                if (lane == 0) {
+                    if (cumulative + selected >= target) {
+                        probability_boundary |= bit_value;
+                    } else {
+                        cumulative += selected;
+                    }
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+        }
+    }
+    ulong best = 0;
+    for (uint column = lane; column < width; column += group_width) {
+        if (!sample_mask_allows(allow, allow_layout, column)) {
+            continue;
+        }
+        float value = load_float(
+            logits, physical_index(logits_layout, row * width + column), input0_dtype);
+        ulong candidate = argmax_candidate(value, column);
+        if (candidate >= topk_boundary && candidate >= probability_boundary) {
+            float score = value / config.temperature +
+                          gumbel_noise(config.seed, position, 0u, column);
+            best = max(best, argmax_candidate(score, column));
+        }
+    }
+    best = argmax_threadgroup_max(
+        best, simd_lane, simd_group, partial_keys, partial_indices);
+    if (lane == 0) {
+        output[physical_index(output_layout, row)] = uint(best);
+    }
+}
+
 void sample_histogram_add(
     uint bucket,
     bool valid,
