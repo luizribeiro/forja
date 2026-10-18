@@ -185,7 +185,7 @@ pub struct Model {
 }
 
 /// Component and backend target pinned by a profile.
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 pub struct Target {
     /// WebAssembly component target.
@@ -194,6 +194,16 @@ pub struct Target {
     pub backend: ProfileBackend,
     /// Device family for which selections were made.
     pub device_family: DeviceFamily,
+}
+
+impl Default for Target {
+    fn default() -> Self {
+        Self {
+            component: ComponentTarget::default(),
+            backend: ProfileBackend::default(),
+            device_family: DeviceFamily(String::new()),
+        }
+    }
 }
 
 /// Supported component target.
@@ -220,12 +230,6 @@ pub enum ProfileBackend {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(transparent)]
 pub struct DeviceFamily(String);
-
-impl Default for DeviceFamily {
-    fn default() -> Self {
-        Self("apple-m3-ultra".to_owned())
-    }
-}
 
 impl DeviceFamily {
     /// Returns the device-family slug.

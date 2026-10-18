@@ -71,6 +71,12 @@ fn parses_and_canonicalizes_a_dense_profile() {
 }
 
 #[test]
+fn requires_an_explicit_device_family() {
+    let source = PROFILE.replace("device-family = \"apple-m3-ultra\"\n", "");
+    assert!(error(&source).contains("target.device-family must not be empty"));
+}
+
+#[test]
 fn validates_kv_cache_format_and_includes_it_in_identity() {
     let legacy: Profile = toml::from_str(PROFILE).unwrap();
     let f32: Profile = toml::from_str(&PROFILE.replace(

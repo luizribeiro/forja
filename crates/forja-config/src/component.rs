@@ -182,6 +182,9 @@ family = "test"
 id = "org/model"
 revision = "0000000000000000000000000000000000000000"
 weights-sha256 = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+
+[target]
+device-family = "apple-m3-ultra"
 "#;
 
     fn profile() -> Profile {
