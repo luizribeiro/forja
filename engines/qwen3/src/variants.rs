@@ -5,6 +5,7 @@ use forja_sdk::{
 
 const COMMON_SITES: &[&str] = &[
     "dense.decode",
+    "sample",
     "attention.decode",
     "attention.prefill-large",
     "attention.prefill-small",
@@ -37,6 +38,10 @@ impl Variants {
         columns: u32,
     ) -> Result<Variant> {
         self.0.at(matmul_site(dtype, rows, inner, columns), 0)
+    }
+
+    pub(crate) fn sample(&self) -> Result<Variant> {
+        self.0.at("sample", 0)
     }
 
     pub(crate) fn attention(

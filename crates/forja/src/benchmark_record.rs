@@ -353,7 +353,7 @@ mod tests {
         );
         assert_eq!(
             comparison_hash(&perf_key(&point, &inputs[0], &profile()).unwrap()).unwrap(),
-            "sha256:ebd60be6a02a2b643e964afa2a5eae822bb836976717f287d11cd43500a69bf3"
+            "sha256:cc4713cd98fad2a788c22e6dfac7e80a6a763412871023f130ffba6f8b17c080"
         );
     }
 

@@ -815,6 +815,7 @@ impl<T: Activation> Qwen3<T> {
         let mut feedback = self.decode.token()?;
         let output_tokens = self.decode.output_tokens()?;
         let sampling = self.decode.sampling()?;
+        let sample_variant = self.variants.sample()?;
         let attention = self.variants.attention(1, start_pos, Some(&position))?;
         forja_sdk::capture(&[&position], || {
             let logits = self
@@ -823,11 +824,11 @@ impl<T: Activation> Qwen3<T> {
             let selected = match selection {
                 DecodeSelection::None => None,
                 DecodeSelection::Greedy => Some(logits.reshape(&[1, VOCAB])?.argmax()?),
-                DecodeSelection::Sampled => Some(
-                    logits
-                        .reshape(&[1, VOCAB])?
-                        .sample(&sampling, start.clone())?,
-                ),
+                DecodeSelection::Sampled => Some(logits.reshape(&[1, VOCAB])?.sample_with(
+                    &sampling,
+                    start.clone(),
+                    &sample_variant,
+                )?),
             };
             if let Some(selected) = selected {
                 selected.copy_into(&mut feedback)?;
@@ -853,9 +854,12 @@ impl<T: Activation> Qwen3<T> {
 
     #[cfg(target_family = "wasm")]
     fn select_token(&mut self, logits: Tensor<f32>, slot: u32) -> Result<forja_sdk::DecodeOutput> {
-        let selected = logits
-            .reshape(&[1, VOCAB])?
-            .sample(&self.decode.sampling()?, slot)?;
+        let sample_variant = self.variants.sample()?;
+        let selected = logits.reshape(&[1, VOCAB])?.sample_with(
+            &self.decode.sampling()?,
+            slot,
+            &sample_variant,
+        )?;
         let output = self.decode.store_selected(&selected, slot)?;
         Ok(forja_sdk::DecodeOutput {
             logits,

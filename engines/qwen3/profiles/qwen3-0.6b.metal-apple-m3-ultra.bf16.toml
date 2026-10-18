@@ -29,6 +29,7 @@ prefill-chunk = 512
 "dense.decode" = "matmul.gemv-transposed"
 "dense.prefill.large-wide" = "matmul.steel-64x64x16-1x2"
 "dense.prefill.other" = "matmul.steel-64x32x32-2x2"
+"sample" = "sample.parallel"
 
 [variants.rules."attention.decode"]
 parameter = "position"
