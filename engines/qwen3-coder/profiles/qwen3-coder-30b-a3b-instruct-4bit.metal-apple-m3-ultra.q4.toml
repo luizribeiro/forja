@@ -57,7 +57,7 @@ arms = [
 
 [variants.rules."attention.prefill-large"]
 parameter = "position"
-arms = [{ lo = 0, hi = 32767, name = "sdpa.steel" }]
+arms = [{ lo = 0, hi = 32767, name = "sdpa.steel-half" }]
 
 [quantization]
 scheme = "mlx-affine"
