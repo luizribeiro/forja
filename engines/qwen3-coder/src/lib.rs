@@ -7,8 +7,8 @@ use forja_sdk::Param;
 #[cfg(target_family = "wasm")]
 use forja_sdk::nn::blocks::{ChunkedPrefill, DecodeSelection, DecodeState, PrefillExecution};
 use forja_sdk::{
-    DType, Dim, Engine, EngineInfo, EngineLoadConfig, Load, Result, StepInput, StepOutput, Tensor,
-    VariantSelection, Weights, bf16, export_engine,
+    DType, Dim, Engine, EngineInfo, EngineLoadConfig, KvCacheFormat, Load, Result, StepInput,
+    StepOutput, Tensor, VariantSelection, Weights, bf16, export_engine, f16,
     kernel::{Epilogue, Kernel, TensorRef},
     nn::{
         RmsNorm, RmsNormConfig,
@@ -538,10 +538,79 @@ struct DecoderLayer {
 }
 
 struct LayerResources<'a> {
-    cache: &'a mut KvCache<f32>,
+    cache: &'a mut Cache,
     following_norm: &'a RmsNorm<f32>,
     qk_norm_rope: &'a Kernel,
     moe_epilogues: &'a MoeEpilogues,
+}
+
+enum Cache {
+    F16(KvCache<f16>),
+    Bf16(KvCache<bf16>),
+    F32(KvCache<f32>),
+}
+
+impl Cache {
+    fn new(format: KvCacheFormat) -> Result<Self> {
+        match format {
+            KvCacheFormat::F16 => Ok(Self::F16(KvCache::new(
+                KEY_VALUE_HEADS,
+                MAX_CONTEXT,
+                HEAD_DIM,
+                f16::ZERO,
+            )?)),
+            KvCacheFormat::Bf16 => Ok(Self::Bf16(KvCache::new(
+                KEY_VALUE_HEADS,
+                MAX_CONTEXT,
+                HEAD_DIM,
+                bf16::ZERO,
+            )?)),
+            KvCacheFormat::F32 => Ok(Self::F32(KvCache::new(
+                KEY_VALUE_HEADS,
+                MAX_CONTEXT,
+                HEAD_DIM,
+                0.0,
+            )?)),
+        }
+    }
+
+    fn attention(
+        &mut self,
+        query: &Tensor<f32>,
+        key: &Tensor<f32>,
+        value: &Tensor<f32>,
+        start: &Dim,
+        end: &Dim,
+        selection: forja_sdk::target::metal::VariantChoice<'_>,
+    ) -> Result<Tensor<f32>> {
+        match self {
+            Self::F16(cache) => cache_attention(cache, query, key, value, start, end, selection),
+            Self::Bf16(cache) => cache_attention(cache, query, key, value, start, end, selection),
+            Self::F32(cache) => cache_attention(cache, query, key, value, start, end, selection),
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cache_attention<C: forja_sdk::Element>(
+    cache: &mut KvCache<C>,
+    query: &Tensor<f32>,
+    key: &Tensor<f32>,
+    value: &Tensor<f32>,
+    start: &Dim,
+    end: &Dim,
+    selection: forja_sdk::target::metal::VariantChoice<'_>,
+) -> Result<Tensor<f32>> {
+    cached_attention_with(
+        query,
+        key,
+        value,
+        cache,
+        ATTENTION_SCALE,
+        start,
+        end,
+        selection,
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -585,16 +654,8 @@ impl DecoderLayer {
             qk_kernel,
             activation_positions,
         )?;
-        let attended = cached_attention_with(
-            &query,
-            &key,
-            &value,
-            cache,
-            ATTENTION_SCALE,
-            start,
-            end,
-            attention_variant.choice(),
-        )?;
+        let attended =
+            cache.attention(&query, &key, &value, start, end, attention_variant.choice())?;
         let (hidden, normalized) = residual_norm(
             residual_kernel,
             input,
@@ -658,7 +719,7 @@ impl QwenWeights {
 pub struct Qwen3Coder {
     weights: QwenWeights,
     variants: variants::Variants,
-    caches: Vec<KvCache<f32>>,
+    caches: Vec<Cache>,
     residual_norm: Kernel,
     rms_norm: Kernel,
     qk_norm_rope: Kernel,
@@ -683,7 +744,7 @@ impl Qwen3Coder {
         let variants = variants::Variants::new(config)?;
         let weights = QwenWeights::load(weights, layers)?;
         let caches = (0..layers)
-            .map(|_| KvCache::new(KEY_VALUE_HEADS, MAX_CONTEXT, HEAD_DIM, 0.0))
+            .map(|_| Cache::new(config.kv_cache))
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             weights,
