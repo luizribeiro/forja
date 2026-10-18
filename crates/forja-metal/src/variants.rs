@@ -374,12 +374,20 @@ const fn grouped(rows: Dimension, routes: Dimension, relation: Relation) -> [Con
 const GROUPED_SMALL_M: &[Constraint] = &grouped(
     MATMUL_ROWS,
     MATMUL_ROUTES,
-    Relation::Range { min: 64, max: 511 },
+    // The former 64..=511 row range was a performance heuristic, not a legality limit.
+    Relation::Range {
+        min: 1,
+        max: u64::MAX,
+    },
 );
 const GROUPED_PAIR_SMALL_M: &[Constraint] = &grouped(
     PAIRED_MATMUL_ROWS,
     PAIRED_MATMUL_ROUTES,
-    Relation::Range { min: 64, max: 511 },
+    // The former 64..=511 row range was a performance heuristic, not a legality limit.
+    Relation::Range {
+        min: 1,
+        max: u64::MAX,
+    },
 );
 const GROUPED_MATMUL: &[Constraint] = &grouped(
     MATMUL_ROWS,
@@ -389,7 +397,14 @@ const GROUPED_MATMUL: &[Constraint] = &grouped(
         max: u64::MAX,
     },
 );
-const ROUTE_GEMV: &[Constraint] = &[value(MATMUL_ROUTES, Relation::Range { min: 1, max: 8 })];
+const ROUTE_GEMV: &[Constraint] = &[value(
+    MATMUL_ROUTES,
+    // The former 1..=8 route range was a performance heuristic, not a legality limit.
+    Relation::Range {
+        min: 1,
+        max: u64::MAX,
+    },
+)];
 const WEIGHTED_NARROW: &[Constraint] = &[
     value(MATMUL_ROUTES, Relation::Range { min: 1, max: 8 }),
     Constraint::DimensionsEqual {
@@ -403,7 +418,11 @@ const WEIGHTED_SIGNATURE: &[Constraint] = &[Constraint::DimensionsEqual {
 }];
 const PAIRED_ROUTE_GEMV: &[Constraint] = &[value(
     PAIRED_MATMUL_ROUTES,
-    Relation::Range { min: 1, max: 8 },
+    // The former 1..=8 route range was a performance heuristic, not a legality limit.
+    Relation::Range {
+        min: 1,
+        max: u64::MAX,
+    },
 )];
 const WIDTHS: &[u64] = &[64, 128];
 const VECTOR_COMMON: &[Constraint] = &[
@@ -616,7 +635,7 @@ pub(crate) static REGISTRY: &[VariantDef<MetalVariant>] = &[
         GatherQuantMatmul,
         GatherQuantMatmulRouteGemv,
         ROUTE_GEMV,
-        &["fewer than 64 routed rows or more than 256 experts."],
+        &["small routed batches or more than 256 experts."],
         &["enough routes to amortize grouping."],
         &["Executes each routed row directly."]
     ),
@@ -625,7 +644,7 @@ pub(crate) static REGISTRY: &[VariantDef<MetalVariant>] = &[
         GatherQuantMatmul,
         GatherQuantMatmulGroupedSmallM,
         GROUPED_SMALL_M,
-        &["64 through 511 routed rows with at most 256 experts."],
+        &["small routed batches with at most 256 experts."],
         &["larger routed batches with enough rows to fill 16-row tiles."],
         &["Groups routes into 8-row expert tiles."]
     ),
@@ -634,7 +653,7 @@ pub(crate) static REGISTRY: &[VariantDef<MetalVariant>] = &[
         GatherQuantMatmul,
         GatherQuantMatmulGroupedPairSmallM,
         GROUPED_PAIR_SMALL_M,
-        &["paired projections with 64 through 511 routed rows."],
+        &["paired projections with small routed batches."],
         &["single projections or larger routed batches."],
         &["Groups paired projections into 8-row expert tiles."]
     ),
@@ -1626,7 +1645,7 @@ mod tests {
     }
 
     #[test]
-    fn route_gemv_caps_routes_while_portable_accepts_broad_shapes() {
+    fn gather_variants_admit_their_full_legal_ranges() {
         assert!(
             resolve(
                 &gathered_dispatch(1, 8, 257, 1),
@@ -1637,8 +1656,7 @@ mod tests {
         );
         let broad = gathered_dispatch(1, 9, 257, 1);
         assert!(resolve(&broad, "gather-quant-matmul.portable", METAL4).is_ok());
-        let error = resolve(&broad, "gather-quant-matmul.route-gemv", METAL4).unwrap_err();
-        assert!(error.to_string().contains("routes is in 1..=8"));
+        assert!(resolve(&broad, "gather-quant-matmul.route-gemv", METAL4).is_ok());
         assert!(
             resolve(
                 &gathered_dispatch(1, 8, 257, 2),
@@ -1648,8 +1666,7 @@ mod tests {
             .is_ok()
         );
         let paired_broad = gathered_dispatch(1, 9, 257, 2);
-        let error = resolve(&paired_broad, "gather-quant-matmul.route-gemv", METAL4).unwrap_err();
-        assert!(error.to_string().contains("routes is in 1..=8"));
+        assert!(resolve(&paired_broad, "gather-quant-matmul.route-gemv", METAL4).is_ok());
     }
 
     #[test]
@@ -1866,7 +1883,7 @@ mod tests {
             (
                 gathered_dispatch(63, 1, 256, 1),
                 "gather-quant-matmul.grouped-small-m",
-                false,
+                true,
             ),
             (
                 gathered_dispatch(64, 1, 256, 1),
@@ -1881,7 +1898,7 @@ mod tests {
             (
                 gathered_dispatch(512, 1, 256, 1),
                 "gather-quant-matmul.grouped-small-m",
-                false,
+                true,
             ),
             (
                 gathered_dispatch(8, 8, 128, 2),
@@ -1891,7 +1908,7 @@ mod tests {
             (
                 gathered_dispatch(64, 8, 128, 2),
                 "gather-quant-matmul.grouped-pair-small-m",
-                false,
+                true,
             ),
             (
                 gathered_dispatch(63, 1, 256, 1),
