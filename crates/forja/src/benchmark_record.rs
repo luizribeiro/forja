@@ -6,7 +6,7 @@ use sha2::{Digest, Sha256};
 
 use crate::args::{Bench, BenchPoint};
 
-pub(crate) const SCHEMA_VERSION: u32 = 3;
+pub(crate) const SCHEMA_VERSION: u32 = 4;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub(crate) struct Input {
@@ -349,7 +349,7 @@ mod tests {
         }];
         assert_eq!(
             config_hash(&snapshot, &inputs).unwrap(),
-            "sha256:508a2846bb235d40db996a2fb87571b4b620025deafcaa6068c7eb195f01b38b"
+            "sha256:2b1b0b4f2104d06e078c046c116435d1db57f7844d6dae31e2dfa0ccf82b5171"
         );
         assert_eq!(
             comparison_hash(&perf_key(&point, &inputs[0], &profile()).unwrap()).unwrap(),

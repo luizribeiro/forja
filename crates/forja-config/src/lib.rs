@@ -307,7 +307,7 @@ pub struct Bench {
     pub warmups: u32,
     /// Prefill length used before timed decode.
     pub decode_prefill: NonZeroU32,
-    /// Decode context lengths to measure.
+    /// Decode context lengths at which to begin token-generation measurements.
     pub contexts: ContextList,
     /// Token-selection strategies to measure.
     pub selection: SelectionList,
@@ -415,6 +415,9 @@ impl<'de> Deserialize<'de> for ContextList {
         let contexts = Vec::<u32>::deserialize(deserializer)?;
         if contexts.is_empty() {
             return Err(de::Error::custom("bench contexts must not be empty"));
+        }
+        if contexts[0] == 0 {
+            return Err(de::Error::custom("bench contexts must be positive"));
         }
         if contexts.windows(2).any(|pair| pair[0] >= pair[1]) {
             return Err(de::Error::custom(
@@ -724,6 +727,7 @@ seed = 42
     fn rejects_invalid_bench_lists() {
         for source in [
             "[bench]\ncontexts = []\n",
+            "[bench]\ncontexts = [0, 9]\n",
             "[bench]\ncontexts = [9, 7]\n",
             "[bench]\ncontexts = [9, 9]\n",
             "[bench]\nselection = []\n",

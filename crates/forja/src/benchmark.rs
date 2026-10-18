@@ -11,8 +11,8 @@ use std::{
 use forja_config::{KeyPath, Origin, Selection};
 use forja_core::Op;
 use forja_host::{
-    EngineDecode, EngineMetrics, EngineOutput, EngineRunner, EngineStep, EngineStepProfile,
-    ImportProfile, SamplingParams,
+    EngineDecode, EngineInfo, EngineMetrics, EngineOutput, EngineRunner, EngineStep,
+    EngineStepProfile, ImportProfile, SamplingParams,
 };
 use golden_fixtures::{decode_f32_le, sha256_file};
 
@@ -60,6 +60,11 @@ struct ProfileMeasurement {
     steps: Vec<EngineStepProfile>,
 }
 
+struct ContextMeasurement {
+    context_start: usize,
+    summary: Summary,
+}
+
 struct ProfileReport {
     context_start: usize,
     baseline: Summary,
@@ -75,6 +80,7 @@ struct ProfileReport {
 struct BenchMeasurement {
     pp: Summary,
     tg: Summary,
+    contexts: Vec<ContextMeasurement>,
     device: String,
     profiles: Vec<ProfileMeasurement>,
     output_digest: String,
@@ -896,6 +902,7 @@ async fn measure_points(
                 let BenchMeasurement {
                     pp,
                     tg,
+                    contexts,
                     device,
                     profiles,
                     output_digest,
@@ -907,6 +914,14 @@ async fn measure_points(
                 record_device = Some(device.clone());
                 print_summary(&engine, selection, "pp", pp);
                 print_summary(&engine, selection, "tg", tg);
+                for context in &contexts {
+                    print_summary(
+                        &engine,
+                        selection,
+                        &format!("tg@{}", context.context_start),
+                        context.summary,
+                    );
+                }
                 let profile_reports = profiles
                     .iter()
                     .map(profile_report)
@@ -923,6 +938,13 @@ async fn measure_points(
                     "selection": selection,
                     "pp": summary_json(pp),
                     "tg": summary_json(tg),
+                    "context_token_generation": contexts
+                        .iter()
+                        .map(|context| serde_json::json!({
+                            "context_start": context.context_start,
+                            "tg": summary_json(context.summary),
+                        }))
+                        .collect::<Vec<_>>(),
                     "sampling_fallbacks": profile_reports
                         .iter()
                         .filter_map(sampling_fallbacks_json)
@@ -1020,17 +1042,7 @@ async fn bench_engine(
     overlap: bool,
 ) -> Result<BenchMeasurement, Box<dyn Error>> {
     let decode = decode_options(point, host_argmax, overlap);
-    let (backend, live_bytes) =
-        crate::engine::metal_backend(point.graph_replay, options.pool_capacity, &options.limits)?;
-    let device = backend.device_name();
-    let mut runner = EngineRunner::new(
-        component,
-        backend,
-        crate::engine::limits_for_live_bytes(&options.limits, live_bytes)?,
-        weights_path(&options.model_dir)?,
-    )
-    .await?;
-    let info = runner.describe().await?;
+    let (mut runner, info, device) = load_benchmark_runner(options, point, component).await?;
     let max_context = usize::try_from(info.max_context)?;
     let profile_context = *point
         .contexts
@@ -1045,19 +1057,14 @@ async fn bench_engine(
             .checked_add(point.tg)
             .ok_or("decode context length overflowed")?
             > max_context
-        || options.breakdown && profile_context >= max_context
+        || profile_context
+            .checked_add(point.tg)
+            .ok_or("decode context length overflowed")?
+            > max_context
     {
         return Err("benchmark shape exceeds the engine context".into());
     }
-    runner
-        .load_with_selections(None, &engine_load_config(component, &point.config.engine)?)
-        .await?
-        .map_err(|error| format!("engine load failed: {error:?}"))?;
-    let profile_tokens = if options.breakdown {
-        profile_context - 1
-    } else {
-        0
-    };
+    let profile_tokens = profile_context - 1;
     let tokens = synthetic_tokens(
         point.pp.max(options.decode_prefill).max(profile_tokens),
         info.vocab,
@@ -1086,6 +1093,7 @@ async fn bench_engine(
             .await?,
         );
     }
+    let contexts = measure_record_contexts(&tokens, point, options, component, decode, &tg).await?;
     let profiles = if options.breakdown {
         measure_profiles(
             &mut runner,
@@ -1109,11 +1117,91 @@ async fn bench_engine(
     Ok(BenchMeasurement {
         pp: summarize(&pp, point.pp)?,
         tg: summarize(&tg, point.tg)?,
+        contexts,
         device,
         profiles,
         output_digest,
         peak_footprint,
     })
+}
+
+#[cfg(target_os = "macos")]
+async fn load_benchmark_runner(
+    options: &Bench,
+    point: &BenchPoint,
+    component: &Path,
+) -> Result<(EngineRunner<forja_metal::MetalBackend>, EngineInfo, String), Box<dyn Error>> {
+    let (backend, live_bytes) =
+        crate::engine::metal_backend(point.graph_replay, options.pool_capacity, &options.limits)?;
+    let device = backend.device_name();
+    let mut runner = EngineRunner::new(
+        component,
+        backend,
+        crate::engine::limits_for_live_bytes(&options.limits, live_bytes)?,
+        weights_path(&options.model_dir)?,
+    )
+    .await?;
+    let info = runner.describe().await?;
+    runner
+        .load_with_selections(None, &engine_load_config(component, &point.config.engine)?)
+        .await?
+        .map_err(|error| format!("engine load failed: {error:?}"))?;
+    Ok((runner, info, device))
+}
+
+fn context_measurements_enabled(rerun_schema: Option<u32>) -> bool {
+    rerun_schema.is_none_or(|schema| schema >= benchmark_record::SCHEMA_VERSION)
+}
+
+#[cfg(target_os = "macos")]
+async fn measure_record_contexts(
+    tokens: &[u32],
+    point: &BenchPoint,
+    options: &Bench,
+    component: &Path,
+    decode: DecodeOptions,
+    primary: &[Sample],
+) -> Result<Vec<ContextMeasurement>, Box<dyn Error>> {
+    let rerun_schema = options.rerun.as_ref().map(|record| record.schema_version);
+    if context_measurements_enabled(rerun_schema) {
+        measure_contexts(tokens, point, options, component, decode, primary).await
+    } else {
+        Ok(Vec::new())
+    }
+}
+
+#[cfg(target_os = "macos")]
+async fn measure_contexts(
+    tokens: &[u32],
+    point: &BenchPoint,
+    options: &Bench,
+    component: &Path,
+    decode: DecodeOptions,
+    primary: &[Sample],
+) -> Result<Vec<ContextMeasurement>, Box<dyn Error>> {
+    let primary_start = options.decode_prefill + 1;
+    let mut measurements = Vec::with_capacity(point.contexts.len());
+    for &context_start in &point.contexts {
+        let mut samples = Vec::with_capacity(options.reps);
+        if context_start == primary_start {
+            samples.extend_from_slice(primary);
+        } else {
+            let (mut context_runner, _, _) =
+                load_benchmark_runner(options, point, component).await?;
+            let prompt = &tokens[..context_start - 1];
+            for _ in 0..options.warmups {
+                measure_decode(&mut context_runner, prompt, point.tg, decode).await?;
+            }
+            for _ in 0..options.reps {
+                samples.push(measure_decode(&mut context_runner, prompt, point.tg, decode).await?);
+            }
+        }
+        measurements.push(ContextMeasurement {
+            context_start,
+            summary: summarize(&samples, point.tg)?,
+        });
+    }
+    Ok(measurements)
 }
 
 #[cfg(target_os = "macos")]
@@ -2460,6 +2548,17 @@ mod tests {
             .unwrap(),
             Path::new("target/forja-bench/rejection-defaults.breakdown.json")
         );
+    }
+
+    #[test]
+    fn legacy_reruns_keep_their_original_context_workload() {
+        assert!(context_measurements_enabled(None));
+        assert!(context_measurements_enabled(Some(
+            benchmark_record::SCHEMA_VERSION
+        )));
+        assert!(!context_measurements_enabled(Some(
+            benchmark_record::SCHEMA_VERSION - 1
+        )));
     }
 
     #[cfg(target_os = "macos")]

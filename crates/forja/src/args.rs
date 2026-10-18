@@ -574,7 +574,7 @@ fn load_record(path: &PathBuf) -> Result<(PathBuf, Recorded), clap::Error> {
             format!("{}: invalid benchmark record: {error}", path.display()),
         )
     })?;
-    if record.schema_version == SCHEMA_VERSION
+    if record.schema_version >= 3
         && record.inputs.iter().any(|input| {
             input.profile_hash.is_none()
                 || input.profile_name.is_empty()
@@ -586,7 +586,7 @@ fn load_record(path: &PathBuf) -> Result<(PathBuf, Recorded), clap::Error> {
         return Err(Cli::command().error(
             clap::error::ErrorKind::ValueValidation,
             format!(
-                "{}: schema-v3 inputs require complete profile identity",
+                "{}: schema-v3+ inputs require complete profile identity",
                 path.display()
             ),
         ));
