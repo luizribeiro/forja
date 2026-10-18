@@ -3390,7 +3390,8 @@ impl<B: Backend + 'static> Host<B> {
         if entry.recorded.len() >= self.limits.dispatches_per_list {
             return Err(quota("command list dispatch count exceeds the guest limit"));
         }
-        merge_parameter_space(entry.space.as_ref(), dispatch_space.as_ref())?;
+        let command_space = entry.space.as_ref();
+        merge_parameter_space(command_space, dispatch_space.as_ref())?;
         if let Some(operation) = concrete_op {
             self.check_dispatch_work(operation, &input_tensors, &output_tensors)?;
         }
@@ -3404,7 +3405,7 @@ impl<B: Backend + 'static> Host<B> {
                     forja_metal::VariantValidationError::Variant(error) => variant_error(&error),
                 })?
         } else {
-            let space = dispatch_space.as_ref().ok_or_else(|| {
+            let space = dispatch_space.as_ref().or(command_space).ok_or_else(|| {
                 compute::Error::OpSignature(
                     "variant operation requires replay parameters".to_owned(),
                 )
@@ -5510,6 +5511,42 @@ mod tests {
             ),
             Err(compute::Error::OpSignature(_))
         ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_affine_variant_uses_the_command_parameter_space() {
+        let mut host = Host::new(forja_metal::MetalBackend::new().unwrap(), GENEROUS);
+        let (_params, inputs, output) = metal_symbolic_matmul(&mut host);
+        let commands = host.command_list().unwrap();
+        host.dispatch(
+            &commands,
+            compute::Op::Matmul,
+            &borrowed_tensors(&inputs),
+            &Resource::new_borrow(output.rep()),
+        )
+        .unwrap();
+
+        let query = host.alloc(compute::Dtype::F32, &[16, 1, 128]).unwrap();
+        let key = host.alloc(compute::Dtype::F32, &[8, 4, 128]).unwrap();
+        let value = host.alloc(compute::Dtype::F32, &[8, 4, 128]).unwrap();
+        let attended = host.alloc(compute::Dtype::F32, &[16, 1, 128]).unwrap();
+        host.record_metal_variant(
+            &commands,
+            compute::Op::Sdpa(compute::SdpaCfg {
+                scale: 0.088,
+                causal: true,
+                q_start: wit_affine(Some(0), 1, 0),
+            }),
+            &[
+                Resource::new_borrow(query.rep()),
+                Resource::new_borrow(key.rep()),
+                Resource::new_borrow(value.rep()),
+            ],
+            &[Resource::new_borrow(attended.rep())],
+            "sdpa.decomposed",
+        )
+        .unwrap();
     }
 
     #[cfg(target_os = "macos")]
