@@ -1,8 +1,16 @@
 # Qwen3-Coder
 
 Forja's Qwen3-Coder engine targets Qwen3-Coder-30B-A3B-Instruct with affine four-bit weights and
-q8 router gates on Metal for Apple M3 Ultra. The profile supports a 32768-token context and
-512-token prefill chunks.
+q8 router gates on Metal for Apple M3 Ultra. The profile supports a 32768-token context. Prompts
+below 2048 tokens use 512-token prefill chunks; longer prompts use 2048-token chunks with exact
+remainders capped at 16 tokens to stay within the default memory quota at full context. The two
+planners retain at most two full-chunk and seven exact-tail graphs between them.
+
+A 32760-token prefill settles at 29.8 GiB accounted and a 30.5 GiB physical footprint. Per-chunk
+sampling measured a 41.4 GiB transient allocation with a 42.2 GiB physical footprint during the
+full chunks; the process peak counter reached 42.4 GiB. The full-to-tail drain then releases the
+large arena before capturing the capped tail. These transients remain below the 48 GiB default
+quota.
 
 ```console
 forja build qwen3-coder-30b-a3b-instruct-4bit.metal-apple-m3-ultra.q4

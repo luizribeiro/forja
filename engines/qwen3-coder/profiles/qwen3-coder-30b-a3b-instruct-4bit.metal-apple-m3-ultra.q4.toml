@@ -25,7 +25,7 @@ weights = "q4"
 kind = "causal-lm"
 batch = 1
 max-context = 32768
-prefill-chunk = 512
+prefill-chunk = 2048
 
 [variants.fixed]
 "quant.decode-q4" = "quant-matmul.gemv"

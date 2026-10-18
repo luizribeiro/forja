@@ -247,6 +247,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "prefill-replay-smoke"
+version = "0.0.0"
+dependencies = [
+ "forja-sdk",
+]
+
+[[package]]
 name = "prettyplease"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

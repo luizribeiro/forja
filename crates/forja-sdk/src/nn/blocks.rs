@@ -486,9 +486,11 @@ struct PrefillTail<T: Element> {
 pub struct ChunkedPrefill<T: Element> {
     max_context: u32,
     chunk: u32,
+    tail_chunk: u32,
     tokens: Tensor<u32>,
     full: Option<CapturedPrefill<T>>,
     tails: Vec<PrefillTail<T>>,
+    tail_capacity: usize,
     tail_clock: u64,
 }
 
@@ -511,11 +513,46 @@ impl<T: Element> ChunkedPrefill<T> {
         Ok(Self {
             max_context,
             chunk,
+            tail_chunk: chunk,
             tokens: Tensor::zeros(&[max_context])?,
             full: None,
             tails: Vec::with_capacity(PREFILL_TAIL_CAPACITY),
+            tail_capacity: PREFILL_TAIL_CAPACITY,
             tail_clock: 0,
         })
+    }
+
+    /// Limits exact remainders after at least one full chunk.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error unless `tail_chunk` is a power of two from 16 through the full chunk.
+    pub fn with_tail_chunk(mut self, tail_chunk: u32) -> Result<Self> {
+        if !(MIN_PREFILL_BUCKET..=self.chunk).contains(&tail_chunk) || !tail_chunk.is_power_of_two()
+        {
+            return Err(Error::loading(
+                "prefill tail chunk must be a power of two from 16 through the full chunk",
+            ));
+        }
+        self.tail_chunk = tail_chunk;
+        Ok(self)
+    }
+
+    /// Limits the number of exact-tail graphs retained by this planner.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error unless `capacity` is from one through the default tail capacity and can
+    /// hold every tail already retained by this planner.
+    pub fn with_tail_capacity(mut self, capacity: usize) -> Result<Self> {
+        validate_prefill_tail_capacity(capacity)?;
+        if self.tails.len() > capacity {
+            return Err(Error::loading(
+                "prefill tail capacity cannot discard retained graphs",
+            ));
+        }
+        self.tail_capacity = capacity;
+        Ok(self)
     }
 
     /// Reports whether the token range stays inside the cache.
@@ -561,17 +598,25 @@ impl<T: Element> ChunkedPrefill<T> {
             return Err(Error::loading("prefill bucket exceeds the context"));
         }
         let values = tokens.to_vec()?;
-        let plan = prefill_plan(sequence, self.chunk)?;
+        let plan = prefill_plan(sequence, self.chunk, self.tail_chunk)?;
         self.tokens
             .write(&staged_tokens(&values, start, self.max_context)?)?;
         let mut consumed = 0_u32;
         let mut position = start;
-        let mut result = None;
-        for (real, bucket_size) in plan {
+        let mut result: Option<Tensor<T>> = None;
+        let mut full_graph_pending = false;
+        for &(real, bucket_size) in &plan {
+            drain_full_chunk_before_tail_allocation(
+                bucket_size,
+                self.chunk,
+                starts_capped_tail(bucket_size, self.chunk, self.tail_chunk, full_graph_pending),
+                result.as_ref(),
+            )?;
             let tail = if bucket_size == self.chunk {
                 None
             } else {
-                Some(self.touch_tail(bucket_size)?)
+                let (index, hit) = self.touch_tail(bucket_size)?;
+                Some((index, hit || tail_size_repeats(&plan, bucket_size)))
             };
             let chunk_result = if tail.is_some_and(|(_, hit)| !hit) {
                 let end = position
@@ -625,6 +670,7 @@ impl<T: Element> ChunkedPrefill<T> {
                 graph.result().alias()?
             };
             result = Some(chunk_result);
+            full_graph_pending = bucket_size == self.chunk;
             consumed = consumed
                 .checked_add(real)
                 .ok_or_else(|| Error::loading("prefill progress overflowed"))?;
@@ -649,7 +695,7 @@ impl<T: Element> ChunkedPrefill<T> {
             captured: None,
             last_used: self.tail_clock,
         };
-        if self.tails.len() < PREFILL_TAIL_CAPACITY {
+        if self.tails.len() < self.tail_capacity {
             self.tails.push(tail);
             return Ok((self.tails.len() - 1, false));
         }
@@ -676,8 +722,56 @@ impl<T: Element> ChunkedPrefill<T> {
         start: u32,
         forward: impl FnMut(&Tensor<u32>, u32, &Dim, &Dim, &Dim, u32) -> Result<Tensor<T>>,
     ) -> Result<Tensor<T>> {
-        run_lazy_chunked_prefill(tokens, start, self.chunk, &self.tokens, forward)
+        run_lazy_chunked_prefill(
+            tokens,
+            start,
+            self.chunk,
+            self.tail_chunk,
+            &self.tokens,
+            forward,
+        )
     }
+}
+
+fn drain_full_chunk_before_tail_allocation<T: Element>(
+    bucket_size: u32,
+    full_chunk: u32,
+    capped_tail_after_full_graph: bool,
+    logits: Option<&Tensor<T>>,
+) -> Result<()> {
+    if bucket_size != full_chunk
+        && capped_tail_after_full_graph
+        && let Some(logits) = logits
+    {
+        let _ = logits.to_vec()?;
+    }
+    Ok(())
+}
+
+fn starts_capped_tail(
+    bucket_size: u32,
+    full_chunk: u32,
+    tail_chunk: u32,
+    full_graph_pending: bool,
+) -> bool {
+    full_graph_pending && tail_chunk < full_chunk && bucket_size != full_chunk
+}
+
+fn tail_size_repeats(plan: &[(u32, u32)], bucket_size: u32) -> bool {
+    plan.iter()
+        .filter(|(_, size)| *size == bucket_size)
+        .take(2)
+        .count()
+        == 2
+}
+
+fn validate_prefill_tail_capacity(capacity: usize) -> Result<()> {
+    if !(1..=PREFILL_TAIL_CAPACITY).contains(&capacity) {
+        return Err(Error::loading(
+            "prefill tail capacity must be from 1 through 8",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_prefill_logits<T: Element>(logits: &Tensor<T>) -> Result<()> {
@@ -712,13 +806,14 @@ pub fn lazy_chunked_prefill<T: Element>(
         .checked_add(sequence)
         .ok_or_else(|| Error::loading("prefill capacity overflowed"))?;
     let retained = Tensor::zeros(&[capacity])?;
-    run_lazy_chunked_prefill(tokens, start, chunk, &retained, forward)
+    run_lazy_chunked_prefill(tokens, start, chunk, chunk, &retained, forward)
 }
 
 fn run_lazy_chunked_prefill<T: Element>(
     tokens: &Tensor<u32>,
     start: u32,
     chunk: u32,
+    tail_chunk: u32,
     retained: &Tensor<u32>,
     mut forward: impl FnMut(&Tensor<u32>, u32, &Dim, &Dim, &Dim, u32) -> Result<Tensor<T>>,
 ) -> Result<Tensor<T>> {
@@ -727,7 +822,7 @@ fn run_lazy_chunked_prefill<T: Element>(
         .try_into()
         .map_err(|_| Error::loading("prefill tokens must have rank one"))?;
     let values = tokens.to_vec()?;
-    let plan = prefill_plan(sequence, chunk)?;
+    let plan = prefill_plan(sequence, chunk, tail_chunk)?;
     retained.write(&staged_tokens(&values, start, retained.shape()[0])?)?;
     let mut consumed = 0_u32;
     let mut position = start;
@@ -796,14 +891,21 @@ fn prefill_bucket(sequence: u32, chunk: u32) -> Result<u32> {
     Ok(sequence)
 }
 
-fn prefill_plan(sequence: u32, chunk: u32) -> Result<Vec<(u32, u32)>> {
+fn prefill_plan(sequence: u32, chunk: u32, tail_chunk: u32) -> Result<Vec<(u32, u32)>> {
     if sequence == 0 {
         return Err(Error::loading("prefill tokens cannot be empty"));
     }
     let mut remaining = sequence;
     let mut plan = Vec::new();
+    if remaining < chunk {
+        return Ok(vec![(remaining, prefill_bucket(remaining, chunk)?)]);
+    }
     while remaining > 0 {
-        let real = remaining.min(chunk);
+        let real = if remaining >= chunk {
+            chunk
+        } else {
+            remaining.min(tail_chunk)
+        };
         plan.push((real, prefill_bucket(real, chunk)?));
         remaining -= real;
     }
@@ -1335,7 +1437,7 @@ mod tests {
         ];
         for (sequence, expected) in cases {
             assert_eq!(
-                prefill_plan(sequence, DEFAULT_PREFILL_CHUNK).unwrap(),
+                prefill_plan(sequence, DEFAULT_PREFILL_CHUNK, DEFAULT_PREFILL_CHUNK).unwrap(),
                 expected,
                 "sequence {sequence}"
             );
@@ -1345,9 +1447,37 @@ mod tests {
     #[test]
     fn prefill_plan_supports_large_replay_chunks() {
         assert_eq!(
-            prefill_plan(4_097, MAX_PREFILL_CHUNK).unwrap(),
+            prefill_plan(4_097, MAX_PREFILL_CHUNK, MAX_PREFILL_CHUNK).unwrap(),
             [(2_048, 2_048), (2_048, 2_048), (1, 1)]
         );
+    }
+
+    #[test]
+    fn prefill_plan_caps_remainders_after_full_chunks() {
+        let plan = prefill_plan(32_760, MAX_PREFILL_CHUNK, 16).unwrap();
+        assert_eq!(plan.len(), 143);
+        assert!(plan[..15].iter().all(|&chunk| chunk == (2_048, 2_048)));
+        assert!(plan[15..142].iter().all(|&chunk| chunk == (16, 16)));
+        assert_eq!(plan[142], (8, 8));
+        assert_eq!(
+            prefill_plan(512, MAX_PREFILL_CHUNK, 16).unwrap(),
+            [(512, 512)]
+        );
+    }
+
+    #[test]
+    fn prefill_tail_capacity_is_bounded() {
+        assert!(validate_prefill_tail_capacity(1).is_ok());
+        assert!(validate_prefill_tail_capacity(8).is_ok());
+        assert!(validate_prefill_tail_capacity(0).is_err());
+        assert!(validate_prefill_tail_capacity(9).is_err());
+    }
+
+    #[test]
+    fn only_capped_tails_require_the_full_graph_drain() {
+        assert!(starts_capped_tail(16, 2_048, 16, true));
+        assert!(!starts_capped_tail(33, 512, 512, true));
+        assert!(!starts_capped_tail(16, 2_048, 16, false));
     }
 
     #[test]

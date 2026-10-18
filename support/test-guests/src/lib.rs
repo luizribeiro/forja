@@ -57,6 +57,12 @@ pub fn program_smoke() -> &'static Path {
     Path::new(env!("PROGRAM_SMOKE_COMPONENT"))
 }
 
+/// Returns the path to the guest that exposes chunked-prefill replay state.
+#[must_use]
+pub fn prefill_replay_smoke() -> &'static Path {
+    Path::new(env!("PREFILL_REPLAY_SMOKE_COMPONENT"))
+}
+
 /// Returns the path to the guest that runs a Qwen-shaped SDK attention block.
 #[must_use]
 pub fn sdk_smoke() -> &'static Path {

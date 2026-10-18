@@ -105,6 +105,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "PROGRAM_SMOKE_COMPONENT",
         &release_dir.join("program_smoke.wasm"),
     );
+    emit_guest_path(
+        "PREFILL_REPLAY_SMOKE_COMPONENT",
+        &release_dir.join("prefill_replay_smoke.wasm"),
+    );
     emit_guest_path("SDK_SMOKE_COMPONENT", &release_dir.join("sdk_smoke.wasm"));
     emit_guest_path(
         "TENSOR_SMOKE_COMPONENT",

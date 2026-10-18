@@ -5,9 +5,7 @@ mod variants;
 #[cfg(target_family = "wasm")]
 use forja_sdk::Param;
 #[cfg(target_family = "wasm")]
-use forja_sdk::nn::blocks::{
-    ChunkedPrefill, DEFAULT_PREFILL_CHUNK, DecodeSelection, DecodeState, PrefillExecution,
-};
+use forja_sdk::nn::blocks::{ChunkedPrefill, DecodeSelection, DecodeState, PrefillExecution};
 use forja_sdk::{
     DType, Dim, Engine, EngineInfo, EngineLoadConfig, Load, Result, StepInput, StepOutput, Tensor,
     VariantSelection, Weights, bf16, export_engine,
@@ -46,6 +44,16 @@ pub const HIDDEN: u32 = 2_048;
 pub const LAYERS: usize = 48;
 /// Largest context accepted by this engine.
 pub const MAX_CONTEXT: u32 = 32_768;
+#[cfg(target_family = "wasm")]
+const PREFILL_CHUNK: u32 = 2_048;
+#[cfg(target_family = "wasm")]
+const PREFILL_TAIL_CHUNK: u32 = 16;
+#[cfg(target_family = "wasm")]
+const SHORT_PREFILL_CHUNK: u32 = 512;
+#[cfg(target_family = "wasm")]
+const SHORT_PREFILL_TAIL_CAPACITY: usize = 5;
+#[cfg(target_family = "wasm")]
+const LONG_PREFILL_TAIL_CAPACITY: usize = 2;
 
 const QUERY_HEADS: u32 = 32;
 const KEY_VALUE_HEADS: u32 = 4;
@@ -661,7 +669,9 @@ pub struct Qwen3Coder {
     #[cfg(target_family = "wasm")]
     decode: DecodeState,
     #[cfg(target_family = "wasm")]
-    prefill: Option<ChunkedPrefill<f32>>,
+    short_prefill: Option<ChunkedPrefill<f32>>,
+    #[cfg(target_family = "wasm")]
+    long_prefill: Option<ChunkedPrefill<f32>>,
 }
 
 impl Qwen3Coder {
@@ -694,7 +704,16 @@ impl Qwen3Coder {
             #[cfg(target_family = "wasm")]
             decode: DecodeState::new(MAX_CONTEXT, VOCAB)?,
             #[cfg(target_family = "wasm")]
-            prefill: Some(ChunkedPrefill::new(MAX_CONTEXT, DEFAULT_PREFILL_CHUNK)?),
+            short_prefill: Some(
+                ChunkedPrefill::new(MAX_CONTEXT, SHORT_PREFILL_CHUNK)?
+                    .with_tail_capacity(SHORT_PREFILL_TAIL_CAPACITY)?,
+            ),
+            #[cfg(target_family = "wasm")]
+            long_prefill: Some(
+                ChunkedPrefill::new(MAX_CONTEXT, PREFILL_CHUNK)?
+                    .with_tail_chunk(PREFILL_TAIL_CHUNK)?
+                    .with_tail_capacity(LONG_PREFILL_TAIL_CAPACITY)?,
+            ),
         })
     }
 
@@ -998,14 +1017,17 @@ impl Engine for Qwen3Coder {
 #[cfg(target_family = "wasm")]
 impl Qwen3Coder {
     fn prefill_supports(&self, start: u32, sequence: u32) -> bool {
-        self.prefill
-            .as_ref()
+        self.prefill_for(sequence)
             .is_some_and(|prefill| prefill.supports(start, sequence))
     }
 
     fn replay_prefill(&mut self, tokens: &Tensor<u32>, start: u32) -> Result<Tensor<f32>> {
+        let [sequence] = tokens
+            .shape()
+            .try_into()
+            .map_err(|_| forja_sdk::Error::loading("prefill tokens must have rank one"))?;
         let mut prefill = self
-            .prefill
+            .prefill_for_mut(sequence)
             .take()
             .ok_or_else(|| forja_sdk::Error::loading("prefill state is unavailable"))?;
         let result = prefill.replay(
@@ -1025,13 +1047,17 @@ impl Qwen3Coder {
                 self.forward_prefill_chunk(tokens, sequence, last, start, end, variant)
             },
         );
-        self.prefill = Some(prefill);
+        *self.prefill_for_mut(sequence) = Some(prefill);
         result
     }
 
     fn lazy_prefill(&mut self, tokens: &Tensor<u32>, start: u32) -> Result<Tensor<f32>> {
+        let [sequence] = tokens
+            .shape()
+            .try_into()
+            .map_err(|_| forja_sdk::Error::loading("prefill tokens must have rank one"))?;
         let prefill = self
-            .prefill
+            .prefill_for_mut(sequence)
             .take()
             .ok_or_else(|| forja_sdk::Error::loading("prefill state is unavailable"))?;
         let result = prefill.lazy(
@@ -1051,8 +1077,24 @@ impl Qwen3Coder {
                 )
             },
         );
-        self.prefill = Some(prefill);
+        *self.prefill_for_mut(sequence) = Some(prefill);
         result
+    }
+
+    fn prefill_for(&self, sequence: u32) -> Option<&ChunkedPrefill<f32>> {
+        if sequence < PREFILL_CHUNK {
+            self.short_prefill.as_ref()
+        } else {
+            self.long_prefill.as_ref()
+        }
+    }
+
+    fn prefill_for_mut(&mut self, sequence: u32) -> &mut Option<ChunkedPrefill<f32>> {
+        if sequence < PREFILL_CHUNK {
+            &mut self.short_prefill
+        } else {
+            &mut self.long_prefill
+        }
     }
 
     fn replay_decode(

@@ -2,10 +2,12 @@
 
 use crate::common;
 
-use std::{env, error::Error, path::Path, path::PathBuf, time::Duration};
+use std::{env, error::Error, fs, path::Path, path::PathBuf, time::Duration};
 
 use forja_core::Backend;
-use forja_host::{EngineDecode, EngineRunner, EngineStep, Limits, SamplingParams};
+use forja_host::{
+    EngineDecode, EngineLoadConfig, EngineRunner, EngineStep, Limits, SamplingParams,
+};
 use forja_testing::normwise_relative_error;
 use golden_fixtures::{BF16_HIDDEN_STATE_TOLERANCE, decode_f32_le};
 
@@ -20,6 +22,151 @@ const LIMITS: Limits = Limits::new(
 .with_command_limits(4_096, u64::MAX)
 .with_guest_call_timeout(Duration::from_secs(300))
 .with_gpu_limits(Duration::from_secs(60), Duration::from_secs(3_600));
+const REPLAY_ARENA_BUDGET: u64 = 4 * 1024 * 1024;
+const REPLAY_TEST_LIMITS: Limits =
+    Limits::new(REPLAY_ARENA_BUDGET, 2, 32_768, 128, REPLAY_ARENA_BUDGET)
+        .with_command_limits(16, 1_000_000)
+        .with_guest_call_timeout(Duration::from_secs(60))
+        .with_gpu_limits(Duration::from_secs(60), Duration::from_secs(600));
+
+#[tokio::test]
+async fn chunked_prefill_replay_bounds_memory_and_evicts_tails() -> Result<(), Box<dyn Error>> {
+    let weights = empty_weight_file("prefill-replay")?;
+    let mut replay = EngineRunner::new(
+        test_guests::prefill_replay_smoke(),
+        forja_cpu::CpuBackend::new(),
+        REPLAY_TEST_LIMITS,
+        &weights,
+    )
+    .await?;
+    let mut lazy = EngineRunner::new(
+        test_guests::prefill_replay_smoke(),
+        forja_cpu::CpuBackend::new(),
+        REPLAY_TEST_LIMITS,
+        &weights,
+    )
+    .await?;
+    replay.load().await??;
+    lazy.load_with_selections(
+        None,
+        &EngineLoadConfig {
+            replay: false,
+            ..EngineLoadConfig::default()
+        },
+    )
+    .await??;
+
+    let tokens = patterned_tokens(32_760);
+    let replay_output = replay
+        .step(EngineStep {
+            tokens: tokens.clone(),
+            start_pos: 0,
+            taps: true,
+        })
+        .await??;
+    let lazy_output = lazy
+        .step(EngineStep {
+            tokens: tokens.clone(),
+            start_pos: 0,
+            taps: true,
+        })
+        .await??;
+    assert_eq!(
+        forward_count(&mut replay, &replay_output).await?,
+        count_bits(3)
+    );
+    assert_eq!(
+        forward_count(&mut lazy, &lazy_output).await?,
+        count_bits(143)
+    );
+    let replay_cache = decode_f32_le(&replay.read(&replay_output.taps[0]).await?)?;
+    let lazy_cache = decode_f32_le(&lazy.read(&lazy_output.taps[0]).await?)?;
+    assert_eq!(replay_cache, lazy_cache);
+    assert!(
+        replay_cache
+            .iter()
+            .zip(tokens)
+            .all(|(&cached, token)| cached.to_bits()
+                == f32::from(u16::try_from(token).unwrap()).to_bits())
+    );
+    assert_eq!(replay.metrics().live_graphs, 2);
+    assert!(
+        replay
+            .memory_usage()
+            .accounted_bytes()
+            .is_some_and(|bytes| bytes <= REPLAY_ARENA_BUDGET)
+    );
+
+    assert_eq!(run_stub_prefill(&mut replay, 32_760).await?, count_bits(4));
+    assert_eq!(run_stub_prefill(&mut replay, 32_760).await?, count_bits(4));
+    assert_eq!(replay.metrics().live_graphs, 3);
+
+    let mut calls = 4_u16;
+    for length in 30..=37 {
+        calls += 1;
+        assert_eq!(
+            run_stub_prefill(&mut replay, length).await?,
+            count_bits(calls)
+        );
+        calls += 1;
+        assert_eq!(
+            run_stub_prefill(&mut replay, length).await?,
+            count_bits(calls)
+        );
+        assert!(replay.metrics().live_graphs <= 9);
+    }
+    assert_eq!(replay.metrics().live_graphs, 9);
+    calls += 1;
+    assert_eq!(run_stub_prefill(&mut replay, 8).await?, count_bits(calls));
+    calls += 1;
+    assert_eq!(run_stub_prefill(&mut replay, 8).await?, count_bits(calls));
+    assert_eq!(replay.metrics().live_graphs, 9);
+
+    drop((replay, lazy));
+    fs::remove_file(weights)?;
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn metal_chunked_prefill_replay_matches_a_small_lazy_shape() -> Result<(), Box<dyn Error>> {
+    let weights = empty_weight_file("prefill-replay-metal")?;
+    let mut runner = EngineRunner::new(
+        test_guests::prefill_replay_smoke(),
+        forja_metal::MetalBackend::with_graph_replay(forja_metal::MetalGraphReplay::Tier2)?,
+        REPLAY_TEST_LIMITS,
+        &weights,
+    )
+    .await?;
+    runner.load().await??;
+    let tokens = patterned_tokens(2_081);
+    let output = runner
+        .step(EngineStep {
+            tokens: tokens.clone(),
+            start_pos: 0,
+            taps: true,
+        })
+        .await??;
+    assert_eq!(forward_count(&mut runner, &output).await?, count_bits(3));
+    let cache = decode_f32_le(&runner.read(&output.taps[0]).await?)?;
+    assert!(
+        cache
+            .iter()
+            .zip(tokens)
+            .all(|(&cached, token)| cached.to_bits()
+                == f32::from(u16::try_from(token).unwrap()).to_bits())
+    );
+    assert_eq!(runner.metrics().live_graphs, 2);
+    assert!(
+        runner
+            .memory_usage()
+            .accounted_bytes()
+            .is_some_and(|bytes| bytes <= REPLAY_ARENA_BUDGET)
+    );
+    drop(runner);
+    fs::remove_file(weights)?;
+    Ok(())
+}
 
 #[tokio::test]
 #[ignore = "requires FORJA_MODELS and runs in the pre-push hook"]
@@ -357,6 +504,55 @@ where
         runner.read(&output.logits).await?,
         runner.read(&output.token).await?,
     ))
+}
+
+async fn run_stub_prefill<B>(
+    runner: &mut EngineRunner<B>,
+    length: u32,
+) -> Result<u32, Box<dyn Error>>
+where
+    B: Backend + Send + Sync + 'static,
+{
+    let output = runner
+        .step(EngineStep {
+            tokens: patterned_tokens(length),
+            start_pos: 0,
+            taps: false,
+        })
+        .await??;
+    forward_count(runner, &output).await
+}
+
+async fn forward_count<B>(
+    runner: &mut EngineRunner<B>,
+    output: &forja_host::EngineOutput,
+) -> Result<u32, Box<dyn Error>>
+where
+    B: Backend + Send + Sync + 'static,
+{
+    let logits = decode_f32_le(&runner.read(&output.logits).await?)?;
+    Ok(logits[0].to_bits())
+}
+
+fn count_bits(count: u16) -> u32 {
+    f32::from(count).to_bits()
+}
+
+fn patterned_tokens(length: u32) -> Vec<u32> {
+    (0..length).map(|position| position % 4).collect()
+}
+
+fn empty_weight_file(label: &str) -> Result<PathBuf, Box<dyn Error>> {
+    let mut header = br#"{"value":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#.to_vec();
+    while !(header.len() + 8).is_multiple_of(8) {
+        header.push(b' ');
+    }
+    let mut bytes = u64::try_from(header.len())?.to_le_bytes().to_vec();
+    bytes.extend(header);
+    bytes.extend_from_slice(&0_f32.to_le_bytes());
+    let path = env::temp_dir().join(format!("forja-{label}-{}", std::process::id()));
+    fs::write(&path, bytes)?;
+    Ok(path)
 }
 
 fn model_root() -> Result<PathBuf, Box<dyn Error>> {
