@@ -2,107 +2,162 @@
   "schema_version": 3,
   "implementation": "forja",
   "provenance": {
-    "commit": "0d3e932debb642342df770ff61a7de2b6522353a",
+    "commit": "64400d086588f91282008e051446bc7d9292b408",
     "dirty": false,
-    "binary_sha256": "01029af5b706f6deffa758a14c6d38851632753e808fae7f8d4d0a6948a9791e",
+    "binary_sha256": "e8b5c6c044ac3e7df299fbe979c10583c9ec03fc36295d77ec7999674768109b",
     "device": "Apple M3 Ultra",
     "gpu_cores": 80,
     "macos": "26.6.2",
-    "date": "2026-10-18T17:04Z",
-    "duration_s": 159,
+    "date": "2026-10-18T18:59Z",
+    "duration_s": 156,
     "machine_load": {
       "before": {
         "load_average": [
-          5.18,
-          5.97,
-          4.82
+          3.42,
+          3.64,
+          4.2
         ],
-        "gpu_device_percent": 85.0,
+        "gpu_device_percent": 0.0,
         "busiest_processes": [
           {
-            "pid": 19027,
-            "cpu_percent": 55.3,
-            "command": "XprotectService"
-          },
-          {
             "pid": 17309,
-            "cpu_percent": 31.3,
+            "cpu_percent": 25.1,
             "command": "syspolicyd"
           },
           {
-            "pid": 88371,
-            "cpu_percent": 20.4,
-            "command": "ds4-server"
-          },
-          {
-            "pid": 88373,
-            "cpu_percent": 10.2,
-            "command": "ds4-server"
+            "pid": 33218,
+            "cpu_percent": 8.8,
+            "command": "codex"
           },
           {
             "pid": 88665,
-            "cpu_percent": 4.3,
+            "cpu_percent": 4.6,
             "command": "python3.13"
           },
           {
             "pid": 88794,
-            "cpu_percent": 4.2,
+            "cpu_percent": 4.5,
             "command": "python3.13"
+          },
+          {
+            "pid": 54215,
+            "cpu_percent": 3.7,
+            "command": "Steam Helper"
+          },
+          {
+            "pid": 54219,
+            "cpu_percent": 3.1,
+            "command": "sleep"
+          },
+          {
+            "pid": 34002,
+            "cpu_percent": 1.7,
+            "command": "codex-code-mode-host"
+          },
+          {
+            "pid": 503,
+            "cpu_percent": 1.6,
+            "command": "opendirectoryd"
           },
           {
             "pid": 537,
-            "cpu_percent": 2.8,
+            "cpu_percent": 1.5,
             "command": "tccd"
           },
           {
-            "pid": 67706,
-            "cpu_percent": 2.1,
-            "command": "Steam Helper"
+            "pid": 54218,
+            "cpu_percent": 1.5,
+            "command": "bash"
           },
           {
-            "pid": 67650,
-            "cpu_percent": 1.1,
-            "command": "Steam Helper"
-          },
-          {
-            "pid": 40034,
-            "cpu_percent": 1.1,
-            "command": "codex"
-          }
-        ]
-      },
-      "after": {
-        "load_average": [
-          2.48,
-          4.41,
-          4.36
-        ],
-        "gpu_device_percent": 89.0,
-        "busiest_processes": [
-          {
-            "pid": 88373,
-            "cpu_percent": 46.8,
-            "command": "ds4-server"
-          },
-          {
-            "pid": 17309,
-            "cpu_percent": 24.4,
-            "command": "syspolicyd"
-          },
-          {
-            "pid": 88665,
-            "cpu_percent": 4.0,
-            "command": "python3.13"
-          },
-          {
-            "pid": 88794,
-            "cpu_percent": 3.9,
-            "command": "python3.13"
+            "pid": 42102,
+            "cpu_percent": 1.3,
+            "command": "claude"
           },
           {
             "pid": 528,
             "cpu_percent": 1.2,
             "command": "bluetoothd"
+          },
+          {
+            "pid": 461,
+            "cpu_percent": 1.1,
+            "command": "logd"
+          },
+          {
+            "pid": 529,
+            "cpu_percent": 1.0,
+            "command": "notifyd"
+          },
+          {
+            "pid": 67650,
+            "cpu_percent": 1.0,
+            "command": "Steam Helper"
+          },
+          {
+            "pid": 27683,
+            "cpu_percent": 1.0,
+            "command": "claude"
+          }
+        ]
+      },
+      "after": {
+        "load_average": [
+          2.55,
+          3.1,
+          3.88
+        ],
+        "gpu_device_percent": 89.0,
+        "busiest_processes": [
+          {
+            "pid": 88373,
+            "cpu_percent": 100.0,
+            "command": "ds4-server"
+          },
+          {
+            "pid": 17309,
+            "cpu_percent": 28.3,
+            "command": "syspolicyd"
+          },
+          {
+            "pid": 767,
+            "cpu_percent": 9.3,
+            "command": "sysmond"
+          },
+          {
+            "pid": 88665,
+            "cpu_percent": 4.2,
+            "command": "python3.13"
+          },
+          {
+            "pid": 88794,
+            "cpu_percent": 4.1,
+            "command": "python3.13"
+          },
+          {
+            "pid": 88371,
+            "cpu_percent": 2.8,
+            "command": "ds4-server"
+          },
+          {
+            "pid": 35324,
+            "cpu_percent": 2.1,
+            "command": "claude"
+          },
+          {
+            "pid": 58484,
+            "cpu_percent": 1.3,
+            "command": "sleep"
+          },
+          {
+            "pid": 58485,
+            "cpu_percent": 1.2,
+            "command": "sleep"
+          },
+          {
+            "pid": 70738,
+            "cpu_percent": 1.0,
+            "command": "claude"
           }
         ]
       }
@@ -110,7 +165,7 @@
   },
   "inputs": [
     {
-      "engine_sha256": "117b30b7df2fc9845c3b03c2fda6dbc0e5c0a2686c42471ea53c9a1be33260cd",
+      "engine_sha256": "7426cd41c09b037b2e0853729fc909b067e9b24b33b929a49b1e39c0d69ada0a",
       "profile_name": "qwen3-coder-30b-a3b-instruct-4bit.metal-apple-m3-ultra.q4",
       "profile_family": "qwen3-coder",
       "numerics": {
@@ -118,7 +173,7 @@
         "weights": "q4",
         "kv-cache": "f16"
       },
-      "profile_hash": "sha256:c985415b11008c9d52494b7ce505ab5d9fde8629e94fd6e89cebfd2b638da766",
+      "profile_hash": "sha256:3e768da8f1219ed7827661e561e03c7933145837049a76b803e6cdfd4a4d97fb",
       "weights_sha256": "sha256:2f0797714404ba75a18599829d8ab96e316ef0088aa6f49e7cb7eb301043f5ec",
       "model_revision": "6e302ea604ad9ab206367e2c501d1571023e7b6d"
     }
@@ -129,17 +184,17 @@
     "backend.metal.graph_replay": "auto",
     "backend.metal.pool_capacity": "default",
     "bench.breakdown": "default",
-    "bench.contexts": "default",
-    "bench.decode_prefill": "default",
-    "bench.pp": "default",
-    "bench.reps": "default",
+    "bench.contexts": "config file",
+    "bench.decode_prefill": "config file",
+    "bench.pp": "config file",
+    "bench.reps": "config file",
     "bench.sampling.seed": "default",
     "bench.sampling.temperature": "default",
     "bench.sampling.top_k": "default",
     "bench.sampling.top_p": "default",
-    "bench.selection": "default",
-    "bench.tg": "default",
-    "bench.warmups": "default",
+    "bench.selection": "config file",
+    "bench.tg": "config file",
+    "bench.warmups": "config file",
     "engine.replay": "default",
     "engine.tunings.add": "default",
     "engine.tunings.base": "default",
@@ -166,49 +221,49 @@
     "verify.prompts": "default"
   },
   "auto_notes": [
-    "backend.metal.graph_replay: auto -> tier2 (Apple M3 Ultra/macOS 26.6.2 @0d3e932debb642342df770ff61a7de2b6522353a)"
+    "backend.metal.graph_replay: auto -> tier2 (Apple M3 Ultra/macOS 26.6.2 @64400d086588f91282008e051446bc7d9292b408)"
   ],
-  "config_hash": "sha256:4a33190f120d172b76303ce3710f09d1727d1f27221e7381894d2e853e833df4",
-  "perf_hash": "sha256:87f65d3ab9085f8953a039631bcafabf70476d2f6799105362e09ffcd1a71506",
+  "config_hash": "sha256:68e21625170df9a85dd277e839a63edfc9d18113ea4850b2248410b432dd2bdf",
+  "perf_hash": "sha256:5fa6d0a1e4a784dfcbf9c99e0c4050368da58f7662a0c521c6bd21d4cb29eb1a",
   "axes": {},
   "allow_diff": [],
   "results": [
     {
       "input": 0,
       "point": {},
-      "perf_hash": "sha256:448f85baaf1f93d834ac9ec9e6a7601d67357d4ea6e7d9c1b64fbd065349e626",
+      "perf_hash": "sha256:4f04cce480b597500a1f86defde2b83b5f6189a6ac208b036a7c6eea61bf2976",
       "output_digest": "sha256:8ead771912e5462e687bce07318a12e85055399210fcbc5a146c785ffd241f8e",
-      "peak_physical_footprint_bytes": 23987650328,
+      "peak_physical_footprint_bytes": 23999053592,
       "selection": "gpu-sequential",
       "pp": {
         "tokens_per_second": {
           "wall": {
-            "median": 1267.4463385649585,
+            "median": 1273.8947273802944,
             "ci95": [
-              1266.7769608790054,
-              1268.07651430038
+              1273.1292144493364,
+              1274.3532864278236
             ]
           },
           "gpu": {
-            "median": 1366.723748802267,
+            "median": 1366.8998028652165,
             "ci95": [
-              1366.632395779112,
-              1366.8222583801287
+              1366.6071642704358,
+              1366.9852602918684
             ]
           }
         },
         "wall_time_seconds": {
-          "median": 0.40396187549999996,
+          "median": 0.4019170415,
           "ci95": [
-            0.403761125,
-            0.404175333
+            0.401772417,
+            0.402158708
           ]
         },
         "gpu_time_seconds": {
-          "median": 0.37461849950000004,
+          "median": 0.37457024949999995,
           "ci95": [
-            0.3745915,
-            0.374643541
+            0.374546833,
+            0.374650458
           ]
         },
         "submissions": {
@@ -222,32 +277,32 @@
       "tg": {
         "tokens_per_second": {
           "wall": {
-            "median": 71.19471741402495,
+            "median": 71.19986592247812,
             "ci95": [
-              70.95539519960221,
-              71.37234547372543
+              71.11473764666559,
+              71.4473552652061
             ]
           },
           "gpu": {
-            "median": 98.36837073804037,
+            "median": 98.50992821601986,
             "ci95": [
-              98.27149318629534,
-              98.44370175012206
+              98.43231140961457,
+              98.56005757878563
             ]
           }
         },
         "wall_time_seconds": {
-          "median": 1.7978863335000002,
+          "median": 1.7977562085,
           "ci95": [
-            1.793411708,
-            1.803950209
+            1.791528875,
+            1.799908208
           ]
         },
         "gpu_time_seconds": {
-          "median": 1.3012312705,
+          "median": 1.299361438,
           "ci95": [
-            1.3002355429999999,
-            1.302514044
+            1.29870054,
+            1.300386003
           ]
         },
         "submissions": {
@@ -260,44 +315,44 @@
       },
       "sampling_fallbacks": [],
       "engine.tunings": [],
-      "engine.picks_hash": "sha256:15b5adb9d1102536ba71c83231569479761fb244dc76ebc2d0f3727f5224232c"
+      "engine.picks_hash": "sha256:93d16297bc6c7bdc24fd9f66d96a3e0f1e218a3fcca4fc457765435325d5c5d3"
     },
     {
       "input": 0,
       "point": {},
-      "perf_hash": "sha256:448f85baaf1f93d834ac9ec9e6a7601d67357d4ea6e7d9c1b64fbd065349e626",
+      "perf_hash": "sha256:4f04cce480b597500a1f86defde2b83b5f6189a6ac208b036a7c6eea61bf2976",
       "output_digest": "sha256:8ead771912e5462e687bce07318a12e85055399210fcbc5a146c785ffd241f8e",
-      "peak_physical_footprint_bytes": 24058904512,
+      "peak_physical_footprint_bytes": 23999053592,
       "selection": "gpu-pipelined",
       "pp": {
         "tokens_per_second": {
           "wall": {
-            "median": 1267.2607419935164,
+            "median": 1273.3214298852893,
             "ci95": [
-              1266.4654421281566,
-              1267.7472230888463
+              1272.423642894762,
+              1274.412760991675
             ]
           },
           "gpu": {
-            "median": 1367.3936929799297,
+            "median": 1367.3667609324075,
             "ci95": [
-              1367.2324191635514,
-              1367.547392561891
+              1367.0541519359685,
+              1367.5467862128346
             ]
           }
         },
         "wall_time_seconds": {
-          "median": 0.40402104149999996,
+          "median": 0.40209799999999996,
           "ci95": [
-            0.403866,
-            0.40427475
+            0.401753667,
+            0.402381709
           ]
         },
         "gpu_time_seconds": {
-          "median": 0.37443495800000004,
+          "median": 0.37444233299999996,
           "ci95": [
-            0.374392875,
-            0.374479125
+            0.374393041,
+            0.374527958
           ]
         },
         "submissions": {
@@ -311,32 +366,32 @@
       "tg": {
         "tokens_per_second": {
           "wall": {
-            "median": 98.14350788453548,
+            "median": 98.06758850439499,
             "ci95": [
-              98.0454142651534,
-              98.27612105513775
+              97.91815858782891,
+              98.33814300325072
             ]
           },
           "gpu": {
-            "median": 99.12816096571655,
+            "median": 98.94976209557734,
             "ci95": [
-              98.86751608945433,
-              99.23500856047312
+              98.80767848055528,
+              99.21393673795554
             ]
           }
         },
         "wall_time_seconds": {
-          "median": 1.3042126045,
+          "median": 1.305222854,
           "ci95": [
-            1.3024527080000001,
-            1.305517458
+            1.30163125,
+            1.307214125
           ]
         },
         "gpu_time_seconds": {
-          "median": 1.291257691,
+          "median": 1.2935857285,
           "ci95": [
-            1.289867375,
-            1.294661837
+            1.290141327,
+            1.29544588
           ]
         },
         "submissions": {
@@ -349,7 +404,7 @@
       },
       "sampling_fallbacks": [],
       "engine.tunings": [],
-      "engine.picks_hash": "sha256:15b5adb9d1102536ba71c83231569479761fb244dc76ebc2d0f3727f5224232c"
+      "engine.picks_hash": "sha256:93d16297bc6c7bdc24fd9f66d96a3e0f1e218a3fcca4fc457765435325d5c5d3"
     }
   ]
 }
