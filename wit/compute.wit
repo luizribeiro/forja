@@ -173,6 +173,16 @@ interface compute {
     shape: list<u32>,
   }
 
+  record device-info {
+    family: string,
+    recommended-max-working-set-size: u64,
+    max-threadgroup-memory-length: u64,
+    gpu-core-count: option<u32>,
+    simd-width: u32,
+    streaming-read-gigabytes-per-second: f64,
+    streaming-copy-gigabytes-per-second: f64,
+  }
+
   resource tensor {
     alloc: static func(dt: dtype, shape: list<u32>) -> result<tensor, error>;
     view: func(operation: view-op) -> result<tensor, error>;
@@ -214,6 +224,7 @@ interface compute {
 
   submit: async func(cmds: command-list) -> result<option<u64>, error>;
   replay: async func(g: borrow<graph>, values: list<u32>) -> result<option<u64>, error>;
+  describe-device: func() -> result<device-info, error>;
   open-weights: func(grant: string) -> result<weights, error>;
 }
 

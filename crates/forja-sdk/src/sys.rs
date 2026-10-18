@@ -6,6 +6,7 @@
     )
 )]
 
+use crate::DeviceInfo;
 use crate::program::{BinaryOp, ProgramKind, ReduceOp, UnaryOp, ValueType};
 use crate::{Error, Result};
 
@@ -22,6 +23,26 @@ pub enum DType {
     U32,
     /// Signed 32-bit integer.
     I32,
+}
+
+#[cfg(target_family = "wasm")]
+pub(crate) fn device_info() -> Result<DeviceInfo> {
+    let info =
+        guest::compute::describe_device().map_err(|error| Error::new(format!("{error:?}")))?;
+    Ok(DeviceInfo {
+        family: info.family,
+        recommended_max_working_set_size: info.recommended_max_working_set_size,
+        max_threadgroup_memory_length: info.max_threadgroup_memory_length,
+        gpu_core_count: info.gpu_core_count,
+        simd_width: info.simd_width,
+        streaming_read_gigabytes_per_second: info.streaming_read_gigabytes_per_second,
+        streaming_copy_gigabytes_per_second: info.streaming_copy_gigabytes_per_second,
+    })
+}
+
+#[cfg(not(target_family = "wasm"))]
+pub(crate) fn device_info() -> Result<DeviceInfo> {
+    Err(Error::new("device capabilities require a WebAssembly host"))
 }
 
 pub(crate) struct Slice {

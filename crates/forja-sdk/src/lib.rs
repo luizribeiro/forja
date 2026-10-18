@@ -126,6 +126,34 @@ pub use selections::{EngineSelections, EngineTunings, Tuning, VariantSelection};
 pub use sys::DType;
 pub use tensor::{Slice, Tensor};
 
+/// Read-only capabilities reported by the host compute device.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DeviceInfo {
+    /// Highest GPU feature family reported by the device.
+    pub family: String,
+    /// Device-recommended maximum resident working set in bytes.
+    pub recommended_max_working_set_size: u64,
+    /// Maximum threadgroup-memory allocation in bytes.
+    pub max_threadgroup_memory_length: u64,
+    /// Number of GPU cores when the platform API reports it.
+    pub gpu_core_count: Option<u32>,
+    /// Threads executed together by the device's SIMD unit.
+    pub simd_width: u32,
+    /// Measured read-only streaming throughput in decimal gigabytes per second.
+    pub streaming_read_gigabytes_per_second: f64,
+    /// Measured combined read/write streaming throughput in decimal gigabytes per second.
+    pub streaming_copy_gigabytes_per_second: f64,
+}
+
+/// Returns read-only capabilities for the host compute device.
+///
+/// # Errors
+///
+/// Returns an error when the active host cannot describe its device or the capability probe fails.
+pub fn device_info() -> Result<DeviceInfo> {
+    sys::device_info()
+}
+
 /// An in-process backend selected for the current thread.
 #[cfg(feature = "native")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

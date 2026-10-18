@@ -22,11 +22,11 @@ use std::{
 };
 
 use forja_core::{
-    Affine, Backend, BackendDispatchData, BackendError, BufferId, CommandList, DType, GraphLimits,
-    GraphTemplate, Layout, LayoutError, MemoryUsage, Op, OpError, ParamSpace, PreparedGraph,
-    RuleArm, Slice, Submission, SubmissionProfile, SymbolicLayout, SymbolicLayoutError, TemplateOp,
-    TemplateTensor, Tensor, ViewOp, gather_matmul_flops, gather_quant_matmul_dispatch_flops,
-    matmul_flops,
+    Affine, Backend, BackendDispatchData, BackendError, BufferId, CommandList, DType, DeviceInfo,
+    GraphLimits, GraphTemplate, Layout, LayoutError, MemoryUsage, Op, OpError, ParamSpace,
+    PreparedGraph, RuleArm, Slice, Submission, SubmissionProfile, SymbolicLayout,
+    SymbolicLayoutError, TemplateOp, TemplateTensor, Tensor, ViewOp, gather_matmul_flops,
+    gather_quant_matmul_dispatch_flops, matmul_flops,
     program::{
         BinOp, EpilogueError, EpilogueSignature, Inst, KernelSignature, MAX_INSTRUCTIONS,
         MAX_OUTPUTS, PrepareError, PreparedEpilogue, PreparedProgram, Program, ProgramError,
@@ -4622,12 +4622,35 @@ impl<B> compute::Host for Host<B>
 where
     B: Backend + Send + Sync + 'static,
 {
+    fn describe_device(
+        &mut self,
+    ) -> impl Future<Output = wasmtime::Result<Result<compute::DeviceInfo, compute::Error>>> + Send
+    {
+        std::future::ready(Ok(self
+            .backend
+            .device_info()
+            .map(guest_device_info)
+            .map_err(guest_error)))
+    }
+
     fn open_weights(
         &mut self,
         grant: String,
     ) -> impl Future<Output = wasmtime::Result<Result<Resource<WeightsEntry>, compute::Error>>> + Send
     {
         std::future::ready(Ok(self.open_weights(&grant)))
+    }
+}
+
+fn guest_device_info(info: DeviceInfo) -> compute::DeviceInfo {
+    compute::DeviceInfo {
+        family: info.family,
+        recommended_max_working_set_size: info.recommended_max_working_set_size,
+        max_threadgroup_memory_length: info.max_threadgroup_memory_length,
+        gpu_core_count: info.gpu_core_count,
+        simd_width: info.simd_width,
+        streaming_read_gigabytes_per_second: info.streaming_read_gigabytes_per_second,
+        streaming_copy_gigabytes_per_second: info.streaming_copy_gigabytes_per_second,
     }
 }
 
