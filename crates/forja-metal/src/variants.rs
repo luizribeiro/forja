@@ -407,7 +407,13 @@ const VECTOR_COMMON: &[Constraint] = &[
         },
         relation: Relation::Range { min: 1, max: 32 },
     },
-    value(KEY_LENGTH, Relation::Range { min: 1, max: 1023 }),
+    value(
+        KEY_LENGTH,
+        Relation::Range {
+            min: 1,
+            max: 65_536,
+        },
+    ),
 ];
 const VECTOR_TWO_PASS: &[Constraint] = &[
     value(QUERY_LENGTH, Relation::Equal(1)),
@@ -427,7 +433,7 @@ const VECTOR_TWO_PASS: &[Constraint] = &[
     value(
         KEY_LENGTH,
         Relation::Range {
-            min: 1024,
+            min: 1,
             max: 65_536,
         },
     ),
@@ -1843,6 +1849,16 @@ mod tests {
             ),
             (
                 sdpa_dispatch(DType::F16, 8, 1, 1024, 64, 64),
+                "sdpa.vector-two-pass",
+                true,
+            ),
+            (
+                sdpa_dispatch(DType::F16, 8, 1, 1024, 64, 64),
+                "sdpa.vector-single-pass",
+                true,
+            ),
+            (
+                sdpa_dispatch(DType::F16, 8, 1, 33, 64, 64),
                 "sdpa.vector-two-pass",
                 true,
             ),
