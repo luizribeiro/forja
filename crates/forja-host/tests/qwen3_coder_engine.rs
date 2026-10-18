@@ -13,7 +13,9 @@ use forja_core::Op;
 use forja_host::{
     EngineBeginDecode, EngineDecode, EngineRunner, EngineStep, Limits, SamplingParams,
 };
-use golden_fixtures::{FixtureDirectory, decode_f32_le, normwise_relative_error};
+use golden_fixtures::{
+    BF16_HIDDEN_STATE_TOLERANCE, FixtureDirectory, decode_f32_le, normwise_relative_error,
+};
 
 const LIMITS: Limits = Limits::new(
     24 * 1024 * 1024 * 1024,
@@ -27,7 +29,6 @@ const LIMITS: Limits = Limits::new(
 .with_gpu_limits(Duration::from_secs(60), Duration::from_secs(3_600));
 const FULL_LAYERS: u32 = 48;
 const REPLAY_LAYERS: u32 = 4;
-const HIDDEN_TOLERANCE: f64 = 1.0e-5;
 const SERVING_TOKENS: u32 = 128;
 
 #[cfg(target_os = "macos")]
@@ -77,7 +78,7 @@ async fn metal_hidden_states_and_routing_match_same_byte_reference() -> Result<(
             index + 1
         );
         assert!(
-            error <= HIDDEN_TOLERANCE,
+            error <= BF16_HIDDEN_STATE_TOLERANCE,
             "layer {} relative error {error}",
             index + 1
         );
@@ -103,7 +104,7 @@ async fn metal_hidden_states_and_routing_match_same_byte_reference() -> Result<(
             layer + 1
         );
         assert!(
-            error <= HIDDEN_TOLERANCE,
+            error <= BF16_HIDDEN_STATE_TOLERANCE,
             "router layer {} relative error {error}",
             layer + 1
         );

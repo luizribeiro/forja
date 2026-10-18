@@ -20,6 +20,7 @@ tool-format-options = {}
 [numerics]
 activations = "bf16"
 weights = "q4"
+kv-cache = "f16"
 
 [workload]
 kind = "causal-lm"

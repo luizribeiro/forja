@@ -1,0 +1,68 @@
+schema-version = 1
+family = "qwen3-coder"
+
+[model]
+id = "mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit"
+revision = "6e302ea604ad9ab206367e2c501d1571023e7b6d"
+weights-sha256 = "sha256:2f0797714404ba75a18599829d8ab96e316ef0088aa6f49e7cb7eb301043f5ec"
+chat-template-sha256 = "sha256:672e747c77e990320152343b0a4951222e40de5645297905d89afba05586d827"
+generation-config-sha256 = "sha256:c99723ab3ba28630d26ae23def77603b540a46924895af5cf234740d3b27b51d"
+
+[target]
+component = "wasm32-wasip2"
+backend = "metal"
+device-family = "apple-m3-ultra"
+
+[chat]
+tool-format = "qwen3-coder-xml"
+tool-format-options = {}
+
+[numerics]
+activations = "bf16"
+weights = "q4"
+kv-cache = "f32"
+
+[workload]
+kind = "causal-lm"
+batch = 1
+max-context = 32768
+prefill-chunk = 2048
+
+[variants.fixed]
+"quant.decode-q4" = "quant-matmul.gemv"
+"quant.decode-q8" = "quant-matmul.q8-fast-gemv"
+"quant.prefill-small" = "quant-matmul.small-m"
+"quant.prefill-tiled" = "quant-matmul.tiled"
+"gather-quant-matmul.small" = "gather-quant-matmul.route-gemv"
+"gather-quant-matmul.grouped-small-m" = "gather-quant-matmul.grouped-small-m"
+"gather-quant-matmul.grouped" = "gather-quant-matmul.grouped"
+"moe.gate-up.small" = "gather-quant-matmul.route-gemv"
+"moe.gate-up.grouped-small-m" = "gather-quant-matmul.grouped-pair-small-m"
+"moe.gate-up.grouped" = "gather-quant-matmul.grouped"
+"moe.down-combine" = "gather-quant-matmul.route-gemv"
+"moe.combine-small" = "matmul.steel-64x32x32-2x2"
+"moe.combine-large" = "matmul.steel-64x64x16-2x2"
+"top-k" = "top-k.single-k8"
+"attention.prefill-small" = "sdpa.decomposed"
+
+[variants.rules."attention.decode"]
+parameter = "position"
+arms = [
+  { lo = 0, hi = 510, name = "sdpa.decomposed" },
+  { lo = 511, hi = 1022, name = "sdpa.vector-single-pass" },
+  { lo = 1023, hi = 1023, name = "sdpa.vector-two-pass" },
+  { lo = 1024, hi = 8191, name = "sdpa.vector-two-pass-128" },
+  { lo = 8192, hi = 32767, name = "sdpa.vector-two-pass-256" },
+]
+
+[variants.rules."attention.prefill-large"]
+parameter = "position"
+arms = [{ lo = 0, hi = 32767, name = "sdpa.steel" }]
+
+[quantization]
+scheme = "mlx-affine"
+default-bits = 4
+group-size = 64
+
+[quantization.overrides."model.layers.*.mlp.gate"]
+bits = 8
