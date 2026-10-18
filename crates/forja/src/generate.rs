@@ -16,9 +16,6 @@ use crate::{
     engine::{engine_load_config, limits, read_token, validate_engine, weights_path},
 };
 
-#[cfg(target_os = "macos")]
-use crate::engine::metal_graph_replay;
-
 pub(crate) async fn run(options: &Run) -> Result<(), Box<dyn Error>> {
     validate_engine(
         &options.engine,
@@ -31,8 +28,10 @@ pub(crate) async fn run(options: &Run) -> Result<(), Box<dyn Error>> {
     let mut output = stdout.lock();
     match options.backend {
         BackendArg::Cpu => {
+            let host_limits = limits(&options.limits)?;
             generate(
                 forja_cpu::CpuBackend::new(),
+                host_limits,
                 options,
                 &options.engine,
                 Some(&load_config),
@@ -42,17 +41,23 @@ pub(crate) async fn run(options: &Run) -> Result<(), Box<dyn Error>> {
         }
         BackendArg::Metal => {
             #[cfg(target_os = "macos")]
-            generate(
-                forja_metal::MetalBackend::with_graph_replay(metal_graph_replay(
+            {
+                let (backend, live_bytes) = crate::engine::metal_backend(
                     options.graph_replay,
-                ))
-                .map_err(|error| format!("cannot create Metal backend: {error}"))?,
-                options,
-                &options.engine,
-                Some(&load_config),
-                &mut output,
-            )
-            .await?;
+                    options.pool_capacity,
+                    &options.limits,
+                )
+                .map_err(|error| format!("cannot create Metal backend: {error}"))?;
+                generate(
+                    backend,
+                    crate::engine::limits_for_live_bytes(&options.limits, live_bytes)?,
+                    options,
+                    &options.engine,
+                    Some(&load_config),
+                    &mut output,
+                )
+                .await?;
+            }
             #[cfg(not(target_os = "macos"))]
             return Err("the Metal backend requires macOS".into());
         }
@@ -62,6 +67,7 @@ pub(crate) async fn run(options: &Run) -> Result<(), Box<dyn Error>> {
 
 async fn generate<B, W>(
     backend: B,
+    host_limits: forja_host::Limits,
     options: &Run,
     component: &Path,
     load_config: Option<&forja_host::EngineLoadConfig>,
@@ -71,7 +77,15 @@ where
     B: Backend + Send + Sync + 'static,
     W: Write,
 {
-    let report = generate_report(backend, options, component, load_config, output).await?;
+    let report = generate_report(
+        backend,
+        host_limits,
+        options,
+        component,
+        load_config,
+        output,
+    )
+    .await?;
     eprintln!(
         "engine memory: live={} bytes, RSS={} bytes",
         report.live_bytes, report.rss_bytes
@@ -87,6 +101,7 @@ struct GenerationReport {
 
 async fn generate_report<B, W>(
     backend: B,
+    host_limits: forja_host::Limits,
     options: &Run,
     component: &Path,
     load_config: Option<&forja_host::EngineLoadConfig>,
@@ -109,7 +124,7 @@ where
     let mut runner = EngineRunner::new(
         component,
         backend,
-        limits(&options.limits)?,
+        host_limits,
         weights_path(&options.model_dir)?,
     )
     .await?;
@@ -327,6 +342,7 @@ mod tests {
             seed: None,
             backend: BackendArg::Metal,
             graph_replay: forja_config::GraphReplay::Tier2,
+            pool_capacity: forja_config::Choice::Auto,
             limits: forja_config::Limits::default(),
             scratch: root.join("scratch"),
             engine_config: forja_config::Engine::default(),
@@ -346,6 +362,7 @@ mod tests {
                 let config = engine_load_config(component, &forja_config::Engine::default())?;
                 generate(
                     forja_metal::MetalBackend::new()?,
+                    limits(&options.limits)?,
                     &options,
                     component,
                     Some(&config),
@@ -373,8 +390,11 @@ mod tests {
             seed: None,
             backend: BackendArg::Metal,
             graph_replay: forja_config::GraphReplay::Tier2,
+            pool_capacity: forja_config::Choice::Auto,
             limits: forja_config::Limits {
-                live_bytes: forja_config::ByteSize::new(64 * 1024 * 1024 * 1024),
+                live_bytes: forja_config::Choice::Fixed(forja_config::ByteSize::new(
+                    64 * 1024 * 1024 * 1024,
+                )),
                 ..forja_config::Limits::default()
             },
             scratch: root.join("scratch"),
@@ -389,6 +409,7 @@ mod tests {
                 let config = engine_load_config(component, &forja_config::Engine::default())?;
                 generate_report(
                     forja_metal::MetalBackend::new()?,
+                    limits(&options.limits)?,
                     &options,
                     component,
                     Some(&config),

@@ -11,9 +11,6 @@ use crate::{
     engine::{engine_load_config, limits, validate_engine, weights_path},
 };
 
-#[cfg(target_os = "macos")]
-use crate::engine::metal_graph_replay;
-
 pub(crate) async fn run(options: &Serve) -> Result<(), Box<dyn Error>> {
     let config = &options.config;
     let backend_arg = match config.backend.kind {
@@ -35,6 +32,7 @@ pub(crate) async fn run(options: &Serve) -> Result<(), Box<dyn Error>> {
         BackendKind::Cpu => {
             serve_backend(
                 forja_cpu::CpuBackend::new(),
+                limits(&config.limits)?,
                 options,
                 &embedded,
                 &load_config,
@@ -45,9 +43,13 @@ pub(crate) async fn run(options: &Serve) -> Result<(), Box<dyn Error>> {
             #[cfg(target_os = "macos")]
             {
                 let replay = config.backend.metal.resolve().graph_replay;
-                let backend =
-                    forja_metal::MetalBackend::with_graph_replay(metal_graph_replay(replay))?;
-                serve_backend(backend, options, &embedded, &load_config).await
+                let (backend, live_bytes) = crate::engine::metal_backend(
+                    replay,
+                    config.backend.metal.pool_capacity,
+                    &config.limits,
+                )?;
+                let host_limits = crate::engine::limits_for_live_bytes(&config.limits, live_bytes)?;
+                serve_backend(backend, host_limits, options, &embedded, &load_config).await
             }
             #[cfg(not(target_os = "macos"))]
             Err("the Metal backend requires macOS".into())
@@ -57,6 +59,7 @@ pub(crate) async fn run(options: &Serve) -> Result<(), Box<dyn Error>> {
 
 async fn serve_backend<B>(
     backend: B,
+    host_limits: forja_host::Limits,
     options: &Serve,
     profile: &Profile,
     load_config: &forja_host::EngineLoadConfig,
@@ -81,7 +84,7 @@ where
     let mut runner = EngineRunner::new(
         &config.model.engine,
         backend,
-        limits(&config.limits)?,
+        host_limits,
         weights_path(&config.model.model)?,
     )
     .await?;
@@ -329,7 +332,9 @@ mod tests {
             forja_serve::ChatFormatLimits::default(),
         )?;
         let limits = forja_config::Limits {
-            live_bytes: forja_config::ByteSize::new(64 * 1024 * 1024 * 1024),
+            live_bytes: forja_config::Choice::Fixed(forja_config::ByteSize::new(
+                64 * 1024 * 1024 * 1024,
+            )),
             ..forja_config::Limits::default()
         };
         let mut runner = EngineRunner::new(

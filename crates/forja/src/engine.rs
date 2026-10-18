@@ -8,8 +8,8 @@ use std::{
 };
 
 use forja_config::{
-    ComponentTarget, Engine, GraphReplay, Limits as ConfigLimits, Profile, ProfileBackend, Target,
-    Unbounded, sharded_weights_sha256, single_weights_sha256,
+    ByteSize, Choice, ComponentTarget, Engine, GraphReplay, Limits as ConfigLimits, Profile,
+    ProfileBackend, Target, Unbounded, sharded_weights_sha256, single_weights_sha256,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -265,10 +265,13 @@ fn profile_load_config(
 
 struct HostLimits(forja_host::Limits);
 
-impl TryFrom<&ConfigLimits> for HostLimits {
+/// Preserves the pre-auto CPU quota where no device working-set recommendation exists.
+const DEFAULT_CPU_LIVE_BYTES: u64 = 48 * 1024 * 1024 * 1024;
+
+impl TryFrom<(&ConfigLimits, u64)> for HostLimits {
     type Error = TryFromIntError;
 
-    fn try_from(limits: &ConfigLimits) -> Result<Self, Self::Error> {
+    fn try_from((limits, live_bytes): (&ConfigLimits, u64)) -> Result<Self, Self::Error> {
         let dispatches_per_list = match limits.dispatches_per_list {
             Unbounded::Unlimited => usize::MAX,
             Unbounded::Limited(value) => usize::try_from(value)?,
@@ -283,7 +286,7 @@ impl TryFrom<&ConfigLimits> for HostLimits {
         };
         Ok(Self(
             forja_host::Limits::new(
-                limits.live_bytes.get(),
+                live_bytes,
                 usize::try_from(limits.tensor_rank)?,
                 limits.tensor_elements,
                 usize::try_from(limits.live_tensor_handles)?,
@@ -325,7 +328,42 @@ pub(crate) fn read_token(bytes: &[u8]) -> Result<u32, Box<dyn Error>> {
 }
 
 pub(crate) fn limits(config: &ConfigLimits) -> Result<forja_host::Limits, TryFromIntError> {
-    HostLimits::try_from(config).map(|limits| limits.0)
+    let live_bytes = match config.live_bytes {
+        Choice::Auto => DEFAULT_CPU_LIVE_BYTES,
+        Choice::Fixed(value) => value.get(),
+    };
+    HostLimits::try_from((config, live_bytes)).map(|limits| limits.0)
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn metal_backend(
+    graph_replay: GraphReplay,
+    pool_capacity: Choice<ByteSize>,
+    limits: &ConfigLimits,
+) -> Result<(forja_metal::MetalBackend, u64), Box<dyn Error>> {
+    let working_set = forja_metal::MetalBackend::recommended_max_working_set_size()?;
+    let physical_memory = forja_metal::MetalBackend::physical_memory_size()?;
+    let pool_capacity = forja_config::Metal {
+        graph_replay: Choice::Fixed(graph_replay),
+        pool_capacity,
+    }
+    .resolve_pool_capacity(working_set, physical_memory)?
+    .get();
+    let live_bytes = limits
+        .resolve_live_bytes(working_set, physical_memory)?
+        .get();
+    let backend = forja_metal::MetalBackend::with_graph_replay_and_pool_capacity(
+        metal_graph_replay(graph_replay),
+        pool_capacity,
+    )?;
+    Ok((backend, live_bytes))
+}
+
+pub(crate) fn limits_for_live_bytes(
+    config: &ConfigLimits,
+    live_bytes: u64,
+) -> Result<forja_host::Limits, TryFromIntError> {
+    HostLimits::try_from((config, live_bytes)).map(|limits| limits.0)
 }
 
 pub(crate) fn weights_path(model_dir: &Path) -> Result<PathBuf, String> {

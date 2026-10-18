@@ -20,12 +20,9 @@ use crate::{
     args::{Bench, BenchPoint, Profile, ProfileMode},
     benchmark_record::{self, Input, PerfKey, Recorded},
     benchmark_stats::{Stats, stats, synthetic_tokens},
-    engine::{argmax, engine_load_config, limits, read_token, validate_engine, weights_path},
+    engine::{argmax, engine_load_config, read_token, validate_engine, weights_path},
     machine_load,
 };
-
-#[cfg(target_os = "macos")]
-use crate::engine::metal_graph_replay;
 
 #[derive(Clone, Copy)]
 pub(crate) struct Summary {
@@ -116,13 +113,13 @@ pub(crate) async fn run(options: &Bench) -> Result<(), Box<dyn Error>> {
 pub(crate) async fn measure_token_profile(
     options: &Profile,
 ) -> Result<TokenProfile, Box<dyn Error>> {
-    let backend =
-        forja_metal::MetalBackend::with_graph_replay(metal_graph_replay(options.graph_replay))?;
+    let (backend, live_bytes) =
+        crate::engine::metal_backend(options.graph_replay, options.pool_capacity, &options.limits)?;
     let device = backend.device_name();
     let mut runner = EngineRunner::new(
         &options.engine,
         backend,
-        limits(&options.limits)?,
+        crate::engine::limits_for_live_bytes(&options.limits, live_bytes)?,
         weights_path(&options.model_dir)?,
     )
     .await?;
@@ -1023,13 +1020,13 @@ async fn bench_engine(
     overlap: bool,
 ) -> Result<BenchMeasurement, Box<dyn Error>> {
     let decode = decode_options(point, host_argmax, overlap);
-    let backend =
-        forja_metal::MetalBackend::with_graph_replay(metal_graph_replay(point.graph_replay))?;
+    let (backend, live_bytes) =
+        crate::engine::metal_backend(point.graph_replay, options.pool_capacity, &options.limits)?;
     let device = backend.device_name();
     let mut runner = EngineRunner::new(
         component,
         backend,
-        limits(&options.limits)?,
+        crate::engine::limits_for_live_bytes(&options.limits, live_bytes)?,
         weights_path(&options.model_dir)?,
     )
     .await?;

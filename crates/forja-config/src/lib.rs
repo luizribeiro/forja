@@ -85,12 +85,15 @@ pub enum BackendKind {
 pub struct Metal {
     /// Command graph replay strategy.
     pub graph_replay: Choice<GraphReplay>,
+    /// Maximum bytes retained in the reusable Metal buffer pool.
+    pub pool_capacity: Choice<ByteSize>,
 }
 
 impl Default for Metal {
     fn default() -> Self {
         Self {
             graph_replay: Choice::Auto,
+            pool_capacity: Choice::Auto,
         }
     }
 }
@@ -108,6 +111,27 @@ impl Metal {
                 graph_replay,
                 auto: None,
             },
+        }
+    }
+
+    /// Resolves the buffer-pool capacity from the device and host memory sizes.
+    ///
+    /// # Errors
+    ///
+    /// Returns a backend error when an automatic setting receives an implausible device
+    /// working-set recommendation.
+    pub fn resolve_pool_capacity(
+        &self,
+        recommended_max_working_set_size: u64,
+        physical_memory_size: u64,
+    ) -> Result<ByteSize, forja_core::BackendError> {
+        match self.pool_capacity {
+            Choice::Auto => forja_core::automatic_buffer_pool_capacity(
+                recommended_max_working_set_size,
+                physical_memory_size,
+            )
+            .map(ByteSize::new),
+            Choice::Fixed(value) => Ok(value),
         }
     }
 }
@@ -438,7 +462,7 @@ impl Default for Paths {
 #[serde(default, deny_unknown_fields)]
 pub struct Limits {
     /// Maximum live device allocation bytes.
-    pub live_bytes: ByteSize,
+    pub live_bytes: Choice<ByteSize>,
     /// Maximum tensor rank.
     pub tensor_rank: u32,
     /// Maximum elements in one tensor.
@@ -472,7 +496,7 @@ pub struct Limits {
 impl Default for Limits {
     fn default() -> Self {
         Self {
-            live_bytes: ByteSize::new(48 * 1024 * 1024 * 1024),
+            live_bytes: Choice::Auto,
             tensor_rank: 4,
             tensor_elements: 1_000_000_000,
             live_tensor_handles: 20_000,
@@ -491,6 +515,65 @@ impl Default for Limits {
     }
 }
 
+impl Limits {
+    /// Resolves the live allocation quota from the device and host memory sizes.
+    ///
+    /// # Errors
+    ///
+    /// Returns a backend error when an automatic setting receives an implausible device
+    /// working-set recommendation.
+    pub fn resolve_live_bytes(
+        &self,
+        recommended_max_working_set_size: u64,
+        physical_memory_size: u64,
+    ) -> Result<ByteSize, forja_core::BackendError> {
+        match self.live_bytes {
+            Choice::Auto => forja_core::automatic_live_bytes(
+                recommended_max_working_set_size,
+                physical_memory_size,
+            )
+            .map(ByteSize::new),
+            Choice::Fixed(value) => Ok(value),
+        }
+    }
+}
+
+/// Memory settings resolved for one device working-set recommendation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResolvedMemory {
+    /// Maximum live device allocation bytes.
+    pub live_bytes: ByteSize,
+    /// Maximum bytes retained in the reusable Metal buffer pool.
+    pub pool_capacity: ByteSize,
+}
+
+/// Resolves automatic memory settings from a device working-set recommendation.
+///
+/// The live allocation quota is one eighth of the recommendation. The reusable buffer pool is
+/// one forty-eighth of that quota, or one three-hundred-eighty-fourth of the recommendation.
+///
+/// # Errors
+///
+/// Returns a backend error when an automatic setting receives an implausible device working-set
+/// recommendation.
+pub fn resolve_memory(
+    limits: &Limits,
+    metal: &Metal,
+    device: &forja_core::DeviceInfo,
+    physical_memory_size: u64,
+) -> Result<ResolvedMemory, forja_core::BackendError> {
+    Ok(ResolvedMemory {
+        live_bytes: limits.resolve_live_bytes(
+            device.recommended_max_working_set_size,
+            physical_memory_size,
+        )?,
+        pool_capacity: metal.resolve_pool_capacity(
+            device.recommended_max_working_set_size,
+            physical_memory_size,
+        )?,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::{fs, path::Path, time};
@@ -500,7 +583,7 @@ mod tests {
     #[test]
     fn limit_defaults_match_the_cli_host_limits() {
         let limits = Limits::default();
-        assert_eq!(limits.live_bytes.get(), 48 * 1024 * 1024 * 1024);
+        assert_eq!(limits.live_bytes, Choice::Auto);
         assert_eq!(limits.tensor_rank, 4);
         assert_eq!(limits.tensor_elements, 1_000_000_000);
         assert_eq!(limits.live_tensor_handles, 20_000);
@@ -535,10 +618,68 @@ submission_timeout = "250ms"
 "#,
         )
         .unwrap();
-        assert_eq!(limits.live_bytes.get(), 48 * 1024 * 1024 * 1024);
+        assert_eq!(
+            limits.live_bytes,
+            Choice::Fixed(ByteSize::new(48 * 1024 * 1024 * 1024))
+        );
         assert_eq!(limits.tensor_rank, 4);
         assert_eq!(limits.dispatches_per_list, Unbounded::Unlimited);
         assert_eq!(limits.submission_timeout, Duration::from_millis(250));
+    }
+
+    #[test]
+    fn resolves_and_bounds_memory_defaults() {
+        let limits = Limits::default();
+        let metal = Metal::default();
+        let gib = 1024_u64.pow(3);
+
+        let device = |recommended_max_working_set_size| forja_core::DeviceInfo {
+            family: "test".to_owned(),
+            recommended_max_working_set_size,
+            max_threadgroup_memory_length: 32 * 1024,
+            gpu_core_count: None,
+            simd_width: 32,
+            streaming_read_gigabytes_per_second: 1.0,
+            streaming_copy_gigabytes_per_second: 1.0,
+        };
+
+        assert_eq!(
+            resolve_memory(&limits, &metal, &device(8 * gib), 16 * gib).unwrap(),
+            ResolvedMemory {
+                live_bytes: ByteSize::new(gib),
+                pool_capacity: ByteSize::new(8 * gib / 384),
+            }
+        );
+        assert_eq!(
+            resolve_memory(&limits, &metal, &device(384 * gib), 512 * gib).unwrap(),
+            ResolvedMemory {
+                live_bytes: ByteSize::new(48 * gib),
+                pool_capacity: ByteSize::new(gib),
+            }
+        );
+
+        for working_set in [0, gib / 2, 513 * gib] {
+            let error =
+                resolve_memory(&limits, &metal, &device(working_set), 512 * gib).unwrap_err();
+            assert!(error.to_string().contains("limits.live_bytes"));
+            assert!(error.to_string().contains("backend.metal.pool_capacity"));
+        }
+
+        let fixed_limits = Limits {
+            live_bytes: Choice::Fixed(ByteSize::new(33)),
+            ..limits
+        };
+        let fixed_metal = Metal {
+            pool_capacity: Choice::Fixed(ByteSize::new(7)),
+            ..metal
+        };
+        assert_eq!(
+            resolve_memory(&fixed_limits, &fixed_metal, &device(0), 512 * gib).unwrap(),
+            ResolvedMemory {
+                live_bytes: ByteSize::new(33),
+                pool_capacity: ByteSize::new(7),
+            }
+        );
     }
 
     #[test]
@@ -629,10 +770,14 @@ fixtures = "golden/qwen3-0.6b"
     #[test]
     fn choices_are_strings_and_auto_falls_back_to_tier2() {
         let config: DevConfig = toml::from_str(
-            "[backend]\nkind = \"cpu\"\n[backend.metal]\ngraph_replay = \"tier1\"\n",
+            "[backend]\nkind = \"cpu\"\n[backend.metal]\ngraph_replay = \"tier1\"\npool_capacity = \"2GiB\"\n",
         )
         .unwrap();
         assert_eq!(config.backend.kind, BackendKind::Cpu);
+        assert_eq!(
+            config.backend.metal.pool_capacity,
+            Choice::Fixed(ByteSize::new(2 * 1024 * 1024 * 1024))
+        );
         assert_eq!(
             config.backend.metal.resolve(),
             ResolvedMetal {
@@ -652,6 +797,10 @@ fixtures = "golden/qwen3-0.6b"
         let value = toml::Value::try_from(defaults).unwrap();
         assert_eq!(
             value["backend"]["metal"]["graph_replay"].as_str(),
+            Some("auto")
+        );
+        assert_eq!(
+            value["backend"]["metal"]["pool_capacity"].as_str(),
             Some("auto")
         );
     }

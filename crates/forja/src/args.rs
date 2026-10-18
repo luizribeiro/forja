@@ -2,8 +2,9 @@ use std::{collections::BTreeMap, fs, path::PathBuf};
 
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use forja_config::{
-    BackendKind, BenchSampling, ConfigError, DevConfig, Engine, GraphReplay, HostConfig, KeyPath,
-    Layer, Layered, Limits, Origin, Selection, dev_layers, file_layer, layer, set_layer,
+    BackendKind, BenchSampling, ByteSize, Choice, ConfigError, DevConfig, Engine, GraphReplay,
+    HostConfig, KeyPath, Layer, Layered, Limits, Origin, Selection, dev_layers, file_layer, layer,
+    set_layer,
 };
 
 use crate::benchmark_record::{Recorded, SCHEMA_VERSION};
@@ -36,6 +37,7 @@ pub(crate) struct Verify {
     pub(crate) prompts: Vec<String>,
     pub(crate) each_tuning: bool,
     pub(crate) graph_replay: GraphReplay,
+    pub(crate) pool_capacity: Choice<ByteSize>,
     pub(crate) limits: Limits,
     pub(crate) scratch: PathBuf,
     pub(crate) engine_config: Engine,
@@ -81,6 +83,7 @@ pub(crate) struct Run {
     pub(crate) seed: Option<u64>,
     pub(crate) backend: Backend,
     pub(crate) graph_replay: GraphReplay,
+    pub(crate) pool_capacity: Choice<ByteSize>,
     pub(crate) limits: Limits,
     pub(crate) scratch: PathBuf,
     pub(crate) engine_config: Engine,
@@ -134,6 +137,7 @@ pub(crate) struct Bench {
     pub(crate) json: Option<PathBuf>,
     pub(crate) breakdown: bool,
     pub(crate) graph_replay: GraphReplay,
+    pub(crate) pool_capacity: Choice<ByteSize>,
     pub(crate) limits: Limits,
     pub(crate) config: Box<DevConfig>,
     pub(crate) origins: BTreeMap<KeyPath, Origin>,
@@ -168,6 +172,7 @@ pub(crate) struct Profile {
     pub(crate) json: bool,
     pub(crate) scratch: PathBuf,
     pub(crate) graph_replay: GraphReplay,
+    pub(crate) pool_capacity: Choice<ByteSize>,
     pub(crate) limits: Limits,
     pub(crate) engine_config: Engine,
 }
@@ -995,6 +1000,7 @@ impl BenchArgs {
             json: self.json,
             breakdown: config.bench.breakdown,
             graph_replay: config.backend.metal.resolve().graph_replay,
+            pool_capacity: config.backend.metal.pool_capacity,
             limits,
             config: Box::new(config.clone()),
             origins: layered.origins.clone(),
@@ -1225,6 +1231,7 @@ impl ProfileArgs {
             scratch: config.paths.scratch.clone(),
             engine_config: config.engine.clone(),
             graph_replay: config.backend.metal.resolve().graph_replay,
+            pool_capacity: config.backend.metal.pool_capacity,
             limits,
         })
     }
@@ -1265,6 +1272,7 @@ impl RunArgs {
             seed: config.run.seed,
             backend: config.backend.kind.into(),
             graph_replay: config.backend.metal.resolve().graph_replay,
+            pool_capacity: config.backend.metal.pool_capacity,
             limits,
             scratch: config.paths.scratch.clone(),
             engine_config: config.engine.clone(),
@@ -1346,6 +1354,7 @@ impl VerifyArgs {
                 .collect(),
             each_tuning: self.each_tuning,
             graph_replay: config.backend.metal.resolve().graph_replay,
+            pool_capacity: config.backend.metal.pool_capacity,
             limits,
             scratch: config.paths.scratch.clone(),
             engine_config: config.engine.clone(),
@@ -2072,6 +2081,7 @@ selection = ["host-argmax"]
                 seed: Some(42),
                 backend: Backend::Cpu,
                 graph_replay: GraphReplay::Tier2,
+                pool_capacity: Choice::Auto,
                 limits: Limits::default(),
                 scratch: PathBuf::from("target/forja-bench"),
                 engine_config: Engine::default(),
@@ -2263,6 +2273,7 @@ selection = ["host-argmax"]
                 prompts: vec!["one".to_owned(), "two".to_owned()],
                 each_tuning: true,
                 graph_replay: GraphReplay::Tier2,
+                pool_capacity: Choice::Auto,
                 limits: Limits::default(),
                 scratch: PathBuf::from("target/forja-bench"),
                 engine_config: Engine::default(),
@@ -2300,6 +2311,7 @@ selection = ["host-argmax"]
                 prompts: vec!["one".to_owned(), "two".to_owned(), "three".to_owned()],
                 each_tuning: false,
                 graph_replay: GraphReplay::Tier2,
+                pool_capacity: Choice::Auto,
                 limits: Limits::default(),
                 scratch: PathBuf::from("target/forja-bench"),
                 engine_config: Engine::default(),

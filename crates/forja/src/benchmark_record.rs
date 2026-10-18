@@ -305,6 +305,7 @@ mod tests {
             json: None,
             breakdown: false,
             graph_replay: GraphReplay::Tier2,
+            pool_capacity: forja_config::Choice::Auto,
             limits: config.limits.clone(),
             config: Box::new(config),
             origins: BTreeMap::new(),
@@ -348,7 +349,7 @@ mod tests {
         }];
         assert_eq!(
             config_hash(&snapshot, &inputs).unwrap(),
-            "sha256:f65725041f3d0b6b5e8d34201039ab0d3662e56599e88c65e57c8838be69e9f4"
+            "sha256:508a2846bb235d40db996a2fb87571b4b620025deafcaa6068c7eb195f01b38b"
         );
         assert_eq!(
             comparison_hash(&perf_key(&point, &inputs[0], &profile()).unwrap()).unwrap(),

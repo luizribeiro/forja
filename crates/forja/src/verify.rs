@@ -10,9 +10,6 @@ use golden_fixtures::{
 use crate::args::{Backend as BackendArg, Precision, Verify};
 use crate::engine::{argmax, engine_load_config, limits, validate_engine};
 
-#[cfg(target_os = "macos")]
-use crate::engine::metal_graph_replay;
-
 const F32_HIDDEN_STATE_TOLERANCE: f64 = 2e-2;
 const BF16_TOP1_PERCENT: u64 = 95;
 const ROUTER_NEAR_TIE: f32 = 1.0e-3;
@@ -168,6 +165,7 @@ async fn run_with_component(
         BackendArg::Cpu => {
             verify(
                 forja_cpu::CpuBackend::new(),
+                limits(&options.limits)?,
                 options,
                 fixtures,
                 &source,
@@ -179,12 +177,15 @@ async fn run_with_component(
         BackendArg::Metal => {
             #[cfg(target_os = "macos")]
             {
-                let backend = forja_metal::MetalBackend::with_graph_replay(metal_graph_replay(
+                let (backend, live_bytes) = crate::engine::metal_backend(
                     options.graph_replay,
-                ))
+                    options.pool_capacity,
+                    &options.limits,
+                )
                 .map_err(|error| format!("cannot create Metal backend: {error}"))?;
                 verify(
                     backend,
+                    crate::engine::limits_for_live_bytes(&options.limits, live_bytes)?,
                     options,
                     fixtures,
                     &source,
@@ -201,6 +202,7 @@ async fn run_with_component(
 
 async fn verify<B>(
     backend: B,
+    host_limits: forja_host::Limits,
     options: &Verify,
     fixtures: &FixtureDirectory,
     source: &EngineSource<'_>,
@@ -212,13 +214,8 @@ where
 {
     let profile = crate::resolution::read_embedded_profile(source.component)?;
     let precision = verification_precision(profile.numerics().kv_cache, options.precision);
-    let mut runner = EngineRunner::new(
-        source.component,
-        backend,
-        limits(&options.limits)?,
-        source.weights,
-    )
-    .await?;
+    let mut runner =
+        EngineRunner::new(source.component, backend, host_limits, source.weights).await?;
     let info = runner.describe().await?;
     let first = fixtures
         .prompts()
@@ -809,7 +806,9 @@ mod tests {
     fn metal_bf16_olmoe_verification() -> Result<(), Box<dyn Error>> {
         let root = PathBuf::from(env::var_os("FORJA_MODELS").ok_or("FORJA_MODELS is not set")?);
         let limits = forja_config::Limits {
-            live_bytes: forja_config::ByteSize::new(48 * 1024 * 1024 * 1024),
+            live_bytes: forja_config::Choice::Fixed(forja_config::ByteSize::new(
+                48 * 1024 * 1024 * 1024,
+            )),
             ..forja_config::Limits::default()
         };
         let options = Verify {
@@ -821,6 +820,7 @@ mod tests {
             prompts: Vec::new(),
             each_tuning: false,
             graph_replay: forja_config::GraphReplay::Tier2,
+            pool_capacity: forja_config::Choice::Auto,
             limits,
             scratch: root.join("scratch"),
             engine_config: forja_config::Engine::default(),
@@ -836,7 +836,9 @@ mod tests {
     fn metal_quantized_qwen3_coder_verification() -> Result<(), Box<dyn Error>> {
         let root = PathBuf::from(env::var_os("FORJA_MODELS").ok_or("FORJA_MODELS is not set")?);
         let limits = forja_config::Limits {
-            live_bytes: forja_config::ByteSize::new(24 * 1024 * 1024 * 1024),
+            live_bytes: forja_config::Choice::Fixed(forja_config::ByteSize::new(
+                24 * 1024 * 1024 * 1024,
+            )),
             ..forja_config::Limits::default()
         };
         let options = Verify {
@@ -848,6 +850,7 @@ mod tests {
             prompts: Vec::new(),
             each_tuning: false,
             graph_replay: forja_config::GraphReplay::Tier2,
+            pool_capacity: forja_config::Choice::Auto,
             limits,
             scratch: root.join("scratch"),
             engine_config: forja_config::Engine::default(),
@@ -937,6 +940,7 @@ mod tests {
             prompts: Vec::new(),
             each_tuning: false,
             graph_replay: forja_config::GraphReplay::Tier2,
+            pool_capacity: forja_config::Choice::Auto,
             limits: forja_config::Limits::default(),
             scratch: root.join("scratch"),
             engine_config: forja_config::Engine::default(),
@@ -983,6 +987,7 @@ mod tests {
             prompts,
             each_tuning: false,
             graph_replay: forja_config::GraphReplay::Tier2,
+            pool_capacity: forja_config::Choice::Auto,
             limits: forja_config::Limits::default(),
             scratch: root.join("scratch"),
             engine_config: forja_config::Engine::default(),

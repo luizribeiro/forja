@@ -39,6 +39,69 @@ pub struct DeviceInfo {
     pub streaming_copy_gigabytes_per_second: f64,
 }
 
+const MIN_RECOMMENDED_WORKING_SET_SIZE: u64 = 1024 * 1024 * 1024;
+const LIVE_BYTES_WORKING_SET_DIVISOR: u64 = 8;
+const MIN_AUTOMATIC_LIVE_BYTES: u64 = 1024 * 1024 * 1024;
+const MAX_AUTOMATIC_LIVE_BYTES: u64 = 48 * 1024 * 1024 * 1024;
+const POOL_CAPACITY_WORKING_SET_DIVISOR: u64 = 384;
+const MIN_AUTOMATIC_POOL_CAPACITY: u64 = 16 * 1024 * 1024;
+const MAX_AUTOMATIC_POOL_CAPACITY: u64 = 1024 * 1024 * 1024;
+
+/// Derives a live-allocation quota from one eighth of a validated device working set.
+///
+/// The result is clamped between 1 GiB and 48 GiB so unusually small or large devices do not
+/// produce unusable or host-exhausting defaults.
+///
+/// # Errors
+///
+/// Returns [`BackendError::InvalidDeviceWorkingSet`] when the recommendation is below 1 GiB or
+/// exceeds physical memory.
+pub fn automatic_live_bytes(
+    recommended_max_working_set_size: u64,
+    physical_memory_size: u64,
+) -> Result<u64, BackendError> {
+    validate_working_set(recommended_max_working_set_size, physical_memory_size)?;
+    Ok(
+        (recommended_max_working_set_size / LIVE_BYTES_WORKING_SET_DIVISOR)
+            .clamp(MIN_AUTOMATIC_LIVE_BYTES, MAX_AUTOMATIC_LIVE_BYTES),
+    )
+}
+
+/// Derives a reusable-buffer pool from one three-hundred-eighty-fourth of a validated working set.
+///
+/// The result is clamped between 16 MiB and 1 GiB, retaining useful reuse without allowing idle
+/// buffers to consume an unbounded share of unified memory.
+///
+/// # Errors
+///
+/// Returns [`BackendError::InvalidDeviceWorkingSet`] when the recommendation is below 1 GiB or
+/// exceeds physical memory.
+pub fn automatic_buffer_pool_capacity(
+    recommended_max_working_set_size: u64,
+    physical_memory_size: u64,
+) -> Result<u64, BackendError> {
+    validate_working_set(recommended_max_working_set_size, physical_memory_size)?;
+    Ok(
+        (recommended_max_working_set_size / POOL_CAPACITY_WORKING_SET_DIVISOR)
+            .clamp(MIN_AUTOMATIC_POOL_CAPACITY, MAX_AUTOMATIC_POOL_CAPACITY),
+    )
+}
+
+fn validate_working_set(
+    recommended_max_working_set_size: u64,
+    physical_memory_size: u64,
+) -> Result<(), BackendError> {
+    if recommended_max_working_set_size < MIN_RECOMMENDED_WORKING_SET_SIZE
+        || recommended_max_working_set_size > physical_memory_size
+    {
+        return Err(BackendError::InvalidDeviceWorkingSet {
+            recommended: recommended_max_working_set_size,
+            physical: physical_memory_size,
+        });
+    }
+    Ok(())
+}
+
 use crate::{
     BufferId, CommandList, DType, GraphMemoryPlan, GraphTemplate, Layout, MappedRegion, Op,
     PreparedGraph, Slice, Tensor,
@@ -280,6 +343,13 @@ pub enum BackendError {
     QuotaExceeded,
     /// Host or device memory could not be allocated.
     AllocationFailed,
+    /// A device working-set recommendation cannot safely drive automatic memory settings.
+    InvalidDeviceWorkingSet {
+        /// Device-recommended maximum resident working set in bytes.
+        recommended: u64,
+        /// Physical memory reported by the host in bytes.
+        physical: u64,
+    },
     /// Validated work failed while executing.
     ExecutionFailed,
     /// The device rejected a submitted command buffer.
@@ -408,7 +478,18 @@ pub struct SubmissionProfile {
 
 impl fmt::Display for BackendError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "backend error: {self:?}")
+        match self {
+            Self::InvalidDeviceWorkingSet {
+                recommended,
+                physical,
+            } => write!(
+                f,
+                "device working-set recommendation {recommended} is below 1 GiB or exceeds \
+                 physical memory {physical}; set limits.live_bytes and \
+                 backend.metal.pool_capacity explicitly"
+            ),
+            _ => write!(f, "backend error: {self:?}"),
+        }
     }
 }
 

@@ -12,6 +12,7 @@ name = "config"
 path = "tests/config/main.rs"
 
 [dependencies]
+forja-core = { path = "../forja-core" }
 serde = { workspace = true, features = ["derive"] }
 sha2.workspace = true
 toml.workspace = true

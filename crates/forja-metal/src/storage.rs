@@ -1,10 +1,11 @@
 use std::{
     collections::HashMap,
     ffi::c_void,
+    process::Command,
     ptr::{self, NonNull},
     slice,
     sync::{
-        Arc, Mutex, MutexGuard, Weak,
+        Arc, Mutex, MutexGuard, OnceLock, Weak,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant},
@@ -284,8 +285,6 @@ impl BufferPool {
     }
 }
 
-const DEFAULT_POOL_CAPACITY: u64 = 1 << 30;
-
 #[cfg(test)]
 static LIVE_BACKENDS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(test)]
@@ -543,7 +542,7 @@ impl MetalBackend {
     pub fn new() -> Result<Self, BackendError> {
         Self::with_configuration(
             Duration::from_secs(10),
-            DEFAULT_POOL_CAPACITY,
+            Self::automatic_pool_capacity()?,
             ProgramCompileBudget::default(),
             MetalGraphReplay::Tier2,
         )
@@ -557,9 +556,70 @@ impl MetalBackend {
     pub fn with_graph_replay(graph_replay: MetalGraphReplay) -> Result<Self, BackendError> {
         Self::with_configuration(
             Duration::from_secs(10),
-            DEFAULT_POOL_CAPACITY,
+            Self::automatic_pool_capacity()?,
             ProgramCompileBudget::default(),
             graph_replay,
+        )
+    }
+
+    /// Creates a backend with explicit graph replay and free-buffer pool settings.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BackendError::AllocationFailed`] when `pool_capacity` does not fit the host, or
+    /// [`BackendError::ExecutionFailed`] when Metal 4 is unavailable.
+    pub fn with_graph_replay_and_pool_capacity(
+        graph_replay: MetalGraphReplay,
+        pool_capacity: u64,
+    ) -> Result<Self, BackendError> {
+        Self::with_configuration(
+            Duration::from_secs(10),
+            pool_capacity,
+            ProgramCompileBudget::default(),
+            graph_replay,
+        )
+    }
+
+    /// Returns the selected device's recommended maximum resident working set in bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BackendError::ExecutionFailed`] when Metal 4 is unavailable.
+    pub fn recommended_max_working_set_size() -> Result<u64, BackendError> {
+        let device = MTLCreateSystemDefaultDevice().ok_or(BackendError::ExecutionFailed)?;
+        if !device.supportsFamily(MTLGPUFamily::Metal4) {
+            return Err(BackendError::ExecutionFailed);
+        }
+        Ok(device.recommendedMaxWorkingSetSize())
+    }
+
+    /// Returns physical memory reported by `sysctl hw.memsize`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BackendError::ExecutionFailed`] when `sysctl` fails or reports an invalid value.
+    pub fn physical_memory_size() -> Result<u64, BackendError> {
+        static PHYSICAL_MEMORY_SIZE: OnceLock<Result<u64, BackendError>> = OnceLock::new();
+        *PHYSICAL_MEMORY_SIZE.get_or_init(|| {
+            let output = Command::new("/usr/sbin/sysctl")
+                .args(["-n", "hw.memsize"])
+                .output()
+                .map_err(|_| BackendError::ExecutionFailed)?;
+            if !output.status.success() {
+                return Err(BackendError::ExecutionFailed);
+            }
+            std::str::from_utf8(&output.stdout)
+                .map_err(|_| BackendError::ExecutionFailed)?
+                .trim()
+                .parse()
+                .map_err(|_| BackendError::ExecutionFailed)
+        })
+    }
+
+    fn automatic_pool_capacity() -> Result<u64, BackendError> {
+        forja_core::automatic_buffer_pool_capacity(
+            Self::recommended_max_working_set_size()?,
+            Self::physical_memory_size()?,
         )
     }
 
@@ -577,7 +637,7 @@ impl MetalBackend {
     pub fn with_program_compile_budget(budget: ProgramCompileBudget) -> Result<Self, BackendError> {
         Self::with_configuration(
             Duration::from_secs(10),
-            DEFAULT_POOL_CAPACITY,
+            Self::automatic_pool_capacity()?,
             budget,
             MetalGraphReplay::Tier2,
         )
@@ -606,7 +666,7 @@ impl MetalBackend {
     pub fn with_gpu_timeout(gpu_timeout: Duration) -> Result<Self, BackendError> {
         Self::with_configuration(
             gpu_timeout,
-            DEFAULT_POOL_CAPACITY,
+            Self::automatic_pool_capacity()?,
             ProgramCompileBudget::default(),
             MetalGraphReplay::Tier2,
         )
@@ -1180,6 +1240,7 @@ fn gpu_family(device: &ProtocolObject<dyn MTLDevice>) -> &'static str {
 }
 
 type BufferDeallocator = RcBlock<dyn Fn(NonNull<c_void>, usize)>;
+/// Protects Metal buffer-address alignment required by kernel vector loads.
 const GPU_ADDRESS_ALIGNMENT: usize = 16;
 
 fn readonly_buffer(
