@@ -116,6 +116,8 @@ pub struct EngineInfo {
 pub struct EngineLoadConfig {
     /// Whether the guest captures and replays reusable graphs.
     pub replay: bool,
+    /// Key/value cache storage format selected by the profile.
+    pub kv_cache: KvCacheFormat,
     /// Registered tuning names.
     pub tunings: Vec<String>,
     /// Fixed variant selections.
@@ -128,11 +130,24 @@ impl Default for EngineLoadConfig {
     fn default() -> Self {
         Self {
             replay: true,
+            kv_cache: KvCacheFormat::F32,
             tunings: Vec::new(),
             fixed_variant_picks: Vec::new(),
             variant_rule_picks: Vec::new(),
         }
     }
+}
+
+/// Key/value cache storage format selected by an engine profile.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum KvCacheFormat {
+    /// IEEE 754 binary16.
+    F16,
+    /// Brain floating point.
+    Bf16,
+    /// IEEE 754 binary32.
+    #[default]
+    F32,
 }
 
 /// One fixed engine dispatch-site selection.
@@ -665,6 +680,17 @@ where
                         engine_bindings::exports::l9o::gpu::engine::LoadConfig {
                             num_hidden_layers,
                             replay: config.replay,
+                            kv_cache: match config.kv_cache {
+                                KvCacheFormat::F16 => {
+                                    engine_bindings::exports::l9o::gpu::engine::KvCacheFormat::Float16
+                                }
+                                KvCacheFormat::Bf16 => {
+                                    engine_bindings::exports::l9o::gpu::engine::KvCacheFormat::Bfloat16
+                                }
+                                KvCacheFormat::F32 => {
+                                    engine_bindings::exports::l9o::gpu::engine::KvCacheFormat::Float32
+                                }
+                            },
                             tunings: config.tunings.clone(),
                             fixed_variant_picks: config
                                 .fixed_variant_picks

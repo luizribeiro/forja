@@ -20,6 +20,8 @@ pub struct EngineLoadConfig {
     pub num_hidden_layers: Option<u32>,
     /// Whether to capture and replay reusable graphs.
     pub replay: bool,
+    /// Key/value cache storage format selected by the profile.
+    pub kv_cache: KvCacheFormat,
     /// Effective registered tuning names.
     pub tunings: Vec<String>,
     /// Effective fixed variant picks.
@@ -33,11 +35,24 @@ impl Default for EngineLoadConfig {
         Self {
             num_hidden_layers: None,
             replay: true,
+            kv_cache: KvCacheFormat::F32,
             tunings: Vec::new(),
             fixed_variant_picks: Vec::new(),
             variant_rule_picks: Vec::new(),
         }
     }
+}
+
+/// Key/value cache storage format selected by an engine profile.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum KvCacheFormat {
+    /// IEEE 754 binary16.
+    F16,
+    /// Brain floating point.
+    Bf16,
+    /// IEEE 754 binary32.
+    #[default]
+    F32,
 }
 
 /// One fixed engine dispatch-site selection.

@@ -279,6 +279,17 @@ fn engine_load_config() -> proc_macro2::TokenStream {
         ::forja_sdk::EngineLoadConfig {
             num_hidden_layers: config.num_hidden_layers,
             replay: config.replay,
+            kv_cache: match config.kv_cache {
+                bindings::exports::l9o::gpu::engine::KvCacheFormat::Float16 => {
+                    ::forja_sdk::KvCacheFormat::F16
+                }
+                bindings::exports::l9o::gpu::engine::KvCacheFormat::Bfloat16 => {
+                    ::forja_sdk::KvCacheFormat::Bf16
+                }
+                bindings::exports::l9o::gpu::engine::KvCacheFormat::Float32 => {
+                    ::forja_sdk::KvCacheFormat::F32
+                }
+            },
             tunings: config.tunings,
             fixed_variant_picks: config.fixed_variant_picks.into_iter().map(|pick| {
                 ::forja_sdk::FixedVariantPick { site: pick.site, name: pick.name }

@@ -230,6 +230,11 @@ fn profile_load_config(
     let selection = overrides.resolve(profile)?;
     Ok(forja_host::EngineLoadConfig {
         replay: overrides.replay,
+        kv_cache: match profile.numerics().kv_cache {
+            forja_config::KvCacheFormat::F16 => forja_host::KvCacheFormat::F16,
+            forja_config::KvCacheFormat::Bf16 => forja_host::KvCacheFormat::Bf16,
+            forja_config::KvCacheFormat::F32 => forja_host::KvCacheFormat::F32,
+        },
         tunings: selection.tunings,
         fixed_variant_picks: selection
             .variants

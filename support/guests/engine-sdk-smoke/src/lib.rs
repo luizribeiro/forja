@@ -1,8 +1,8 @@
 //! Minimal engine component exported through the SDK macro.
 
 use forja_sdk::{
-    Engine, EngineInfo, EngineLoadConfig, Result, StepInput, StepOutput, Tensor, Weights,
-    export_engine, nn::blocks::ChunkedPrefill,
+    Engine, EngineInfo, EngineLoadConfig, KvCacheFormat, Result, StepInput, StepOutput, Tensor,
+    Weights, export_engine, nn::blocks::ChunkedPrefill,
 };
 
 const MAX_CONTEXT: u32 = 1_024;
@@ -27,6 +27,7 @@ impl Engine for ConstantEngine {
     fn load(_weights: &Weights<'_>, config: EngineLoadConfig) -> Result<Self> {
         if !config.tunings.is_empty()
             && (config.tunings != ["fused"]
+                || config.kv_cache != KvCacheFormat::F16
                 || config.fixed_variant_picks.len() != 1
                 || config.fixed_variant_picks[0].site != "dense.decode"
                 || config.fixed_variant_picks[0].name != "matmul.gemv-transposed"

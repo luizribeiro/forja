@@ -622,6 +622,11 @@ fn native_load_config() -> Result<forja_sdk::EngineLoadConfig, Box<dyn Error>> {
     Ok(forja_sdk::EngineLoadConfig {
         num_hidden_layers: None,
         replay: config.replay,
+        kv_cache: match config.kv_cache {
+            forja_host::KvCacheFormat::F16 => forja_sdk::KvCacheFormat::F16,
+            forja_host::KvCacheFormat::Bf16 => forja_sdk::KvCacheFormat::Bf16,
+            forja_host::KvCacheFormat::F32 => forja_sdk::KvCacheFormat::F32,
+        },
         tunings: config.tunings,
         fixed_variant_picks: config
             .fixed_variant_picks

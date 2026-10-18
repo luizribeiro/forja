@@ -39,6 +39,7 @@ async fn passes_engine_selections_through_load_config() -> wasmtime::Result<()> 
     .await?;
     let config = EngineLoadConfig {
         replay: true,
+        kv_cache: forja_host::KvCacheFormat::F16,
         tunings: vec!["fused".to_owned()],
         fixed_variant_picks: vec![FixedVariantPick {
             site: "dense.decode".to_owned(),

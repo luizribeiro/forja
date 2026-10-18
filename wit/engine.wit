@@ -13,9 +13,16 @@ interface engine {
   record load-config {
     num-hidden-layers: option<u32>,
     replay: bool,
+    kv-cache: kv-cache-format,
     tunings: list<string>,
     fixed-variant-picks: list<fixed-variant-pick>,
     variant-rule-picks: list<variant-rule-pick>,
+  }
+
+  enum kv-cache-format {
+    float16,
+    bfloat16,
+    float32,
   }
 
   record fixed-variant-pick {
