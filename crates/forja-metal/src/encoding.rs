@@ -4017,7 +4017,7 @@ impl MetalBackend {
                     depth: 1,
                 },
                 MTLSize {
-                    width: 1024,
+                    width: pipeline.maxTotalThreadsPerThreadgroup(),
                     height: 1,
                     depth: 1,
                 },
@@ -4107,7 +4107,7 @@ impl MetalBackend {
                 depth: 1,
             },
             MTLSize {
-                width: 1024,
+                width: second.maxTotalThreadsPerThreadgroup(),
                 height: 1,
                 depth: 1,
             },
@@ -5086,16 +5086,7 @@ impl MetalBackend {
             (0, dtype_code(input.layout.dtype())),
             (2, dtype_code(output.layout.dtype())),
         ];
-        let kernel = if width <= 1024 {
-            "softmax_single"
-        } else {
-            "softmax_looped"
-        };
-        let pipeline = self
-            .pipelines
-            .lock()
-            .map_err(|_| BackendError::ExecutionFailed)?
-            .get(kernel, &constants)?;
+        let pipeline = self.row_pipeline("softmax_single", "softmax_looped", width, &constants)?;
         set_pipeline(encoder, &pipeline);
         let temporaries = vec![
             Self::layout_buffer(&input.layout, arguments)?,
@@ -5887,16 +5878,8 @@ impl MetalBackend {
             (1, dtype_code(weight.layout().dtype())),
             (2, dtype_code(output.layout().dtype())),
         ];
-        let kernel = if width <= 1024 {
-            "rms_norm_single"
-        } else {
-            "rms_norm_looped"
-        };
-        let pipeline = self
-            .pipelines
-            .lock()
-            .map_err(|_| BackendError::ExecutionFailed)?
-            .get(kernel, &constants)?;
+        let pipeline =
+            self.row_pipeline("rms_norm_single", "rms_norm_looped", width, &constants)?;
         set_pipeline(encoder, &pipeline);
         let mut temporaries = vec![
             Self::layout_buffer(input.layout(), arguments)?,
@@ -5921,6 +5904,28 @@ impl MetalBackend {
         let (threadgroups, threads) = row_dispatch_geometry(&pipeline, output.layout(), width)?;
         dispatch_threadgroups(encoder, threadgroups, threads);
         Ok(temporaries)
+    }
+
+    fn row_pipeline(
+        &self,
+        single: &str,
+        looped: &str,
+        width: u32,
+        constants: &[(u32, u32)],
+    ) -> Result<Retained<ProtocolObject<dyn MTLComputePipelineState>>, BackendError> {
+        let mut pipelines = self
+            .pipelines
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?;
+        let pipeline = pipelines.get(single, constants)?;
+        let rounded_width = usize::try_from(width)
+            .map_err(|_| BackendError::ExecutionFailed)?
+            .next_multiple_of(32);
+        if rounded_width <= pipeline.maxTotalThreadsPerThreadgroup() {
+            Ok(pipeline)
+        } else {
+            pipelines.get(looped, constants)
+        }
     }
 
     fn encode_program(
@@ -6659,7 +6664,7 @@ pub(super) fn dispatch_kernel(dispatch: &Dispatch) -> Result<&'static str, Backe
                 "copy_strided"
             }
         }
-        Op::RmsNorm { .. } => row_kernel(dispatch, "rms_norm_single", "rms_norm_looped")?,
+        Op::RmsNorm { .. } => "rms_norm",
         Op::Argmax { chunk_width } => {
             let [input] = dispatch.inputs() else {
                 return Err(BackendError::InvalidInput);
@@ -6737,23 +6742,6 @@ fn quant_matmul_kernel(dispatch: &Dispatch) -> Result<&'static str, BackendError
         },
         _ => Err(BackendError::InvalidInput),
     }
-}
-
-fn row_kernel(
-    dispatch: &Dispatch,
-    single: &'static str,
-    looped: &'static str,
-) -> Result<&'static str, BackendError> {
-    let [input, ..] = dispatch.inputs() else {
-        return Err(BackendError::InvalidInput);
-    };
-    Ok(
-        if input.layout().shape().last().copied().unwrap_or_default() <= 1024 {
-            single
-        } else {
-            looped
-        },
-    )
 }
 
 fn matmul_kernel(dispatch: &Dispatch) -> Result<&'static str, BackendError> {
@@ -7159,20 +7147,24 @@ fn write_dispatch_timestamp(
     }
 }
 
+fn row_thread_count(max_threads: usize, width: u32) -> Result<usize, BackendError> {
+    let rounded_width = usize::try_from(width)
+        .map_err(|_| BackendError::ExecutionFailed)?
+        .next_multiple_of(32);
+    Ok(if rounded_width <= max_threads {
+        rounded_width
+    } else {
+        max_threads.min(256)
+    })
+}
+
 fn row_dispatch_geometry(
     pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
     output: &Layout,
     width: u32,
 ) -> Result<(MTLSize, MTLSize), BackendError> {
     let max_threads = pipeline.maxTotalThreadsPerThreadgroup();
-    let thread_count = if width <= 1024 {
-        usize::try_from(width)
-            .map_err(|_| BackendError::ExecutionFailed)?
-            .next_multiple_of(32)
-            .min(max_threads)
-    } else {
-        max_threads.min(256)
-    };
+    let thread_count = row_thread_count(max_threads, width)?;
     let rows = output
         .element_count()
         .checked_div(u64::from(width))
@@ -8309,6 +8301,13 @@ mod tests {
         assert!(resident_key.resident);
         assert!(!rereading_key.resident);
         assert_ne!(resident_key, rereading_key);
+    }
+
+    #[test]
+    fn row_thread_count_respects_pipeline_limits() {
+        assert_eq!(row_thread_count(512, 33).unwrap(), 64);
+        assert_eq!(row_thread_count(512, 4_097).unwrap(), 256);
+        assert_eq!(row_thread_count(768, 700).unwrap(), 704);
     }
 
     #[test]
