@@ -1,135 +1,37 @@
 {
   "schema_version": 1,
-  "accepted_at": "2026-10-17T15:42:37Z",
-  "source_commit": "551cfcc9bf703d2d4f4476952f3d5f325769e497",
+  "accepted_at": "2026-10-18T06:59:00Z",
+  "source_commit": "2fa313bd82077e29e1a67456e39c273ff1ac907c",
   "machine": {
     "device": "Apple M3 Ultra",
     "gpu_cores": 80,
-    "os": "macOS 26.6"
+    "os": "macOS 26.6.2"
   },
   "model": {
     "profile": "qwen3-coder-30b-a3b-instruct-4bit.metal-apple-m3-ultra.q4",
-    "revision": "6e302ea604ad9ab206367e2c501d1571023e7b6d"
+    "revision": "6e302ea604ad9ab206367e2c501d1571023e7b6d",
+    "kv_cache": "f16"
   },
   "workload": {
-    "path": "forja serve /v1/chat/completions over HTTP",
-    "prompt_tokens": 512,
-    "server_processes_per_sampling_case": 5,
-    "order_per_process": [
-      "no-tools-warmup",
-      "no-tools-measured",
-      "constrained-tool-call-measured"
-    ],
-    "remeasured_cases": [
-      "greedy:no-tools",
-      "greedy:constrained-tool-call",
-      "qwen-default:no-tools",
-      "qwen-default:constrained-tool-call"
-    ],
-    "retained_cases": {
-      "source_commit": "07bafe251955ef2251371009e8a1b5e8c6dfe02f",
-      "cases": ["greedy:auto-no-trigger", "greedy:activation"]
-    },
-    "generated_tokens": {
-      "greedy": {
-        "no_tools": 86,
-        "auto_no_trigger": 128,
-        "constrained_tool_call": 42
-      },
-      "qwen_default": {
-        "no_tools": 82,
-        "constrained_tool_call": 42
-      }
-    },
-    "measured_intervals": {
-      "greedy": {
-        "no_tools": 425,
-        "auto_no_trigger": 635,
-        "constrained_post_trigger": 195
-      },
-      "qwen_default": {
-        "no_tools": 405,
-        "constrained_post_trigger": 195
-      }
-    },
+    "path": "forja serve /v1/completions over HTTP",
+    "prompt_tokens": 2081,
+    "cached_tokens": 2048,
+    "generated_tokens": 16,
+    "repetitions": 100,
+    "measured_intervals": 1500,
     "sampling": {
-      "greedy": {
-        "temperature": 0.0,
-        "top_k": 0,
-        "top_p": 1.0,
-        "seed": 0
-      },
-      "qwen_default": {
-        "temperature": 0.7,
-        "top_k": 20,
-        "top_p": 0.8,
-        "seed": 0
-      }
+      "temperature": 0.0,
+      "top_k": 0,
+      "top_p": 1.0,
+      "seed": 0
     }
   },
-  "thresholds_us": {
-    "no_tools_p50_max": 11000,
-    "constrained_minus_no_tools_p50": 1000,
-    "constrained_minus_no_tools_p90": 1500,
-    "constrained_minus_no_tools_p99": 2000
-  },
   "results": {
-    "greedy": {
-      "no_tools_itl_us": {
-        "p50": 9833,
-        "p90": 10006,
-        "p99": 10699
-      },
-      "auto_no_trigger_itl_us": {
-        "p50": 9859,
-        "p90": 10037,
-        "p99": 10611
-      },
-      "constrained_post_trigger_itl_us": {
-        "p50": 9748,
-        "p90": 9865,
-        "p99": 9954
-      },
-      "auto_no_trigger_minus_no_tools_us": {
-        "p50": 26,
-        "p90": 31,
-        "p99": -88
-      },
-      "constrained_minus_no_tools_us": {
-        "p50": -85,
-        "p90": -141,
-        "p99": -745
-      },
-      "activation_us": {
-        "rewind": {
-          "p50": 325,
-          "p90": 371,
-          "p99": 371
-        },
-        "compile": {
-          "p50": 808,
-          "p90": 827,
-          "p99": 827
-        }
-      }
+    "itl_us": {
+      "p50": 11763,
+      "p90": 12341,
+      "p99": 14606
     },
-    "qwen_default": {
-      "no_tools_itl_us": {
-        "p50": 9906,
-        "p90": 10078,
-        "p99": 10457
-      },
-      "constrained_post_trigger_itl_us": {
-        "p50": 9843,
-        "p90": 9914,
-        "p99": 10293
-      },
-      "constrained_minus_no_tools_us": {
-        "p50": -63,
-        "p90": -164,
-        "p99": -164
-      }
-    },
-    "peak_rss_mib": 23083
+    "peak_rss_mib": 19908
   }
 }

@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
   "implementation": "forja",
-  "measured_at": "2026-10-18T01:15:56Z",
-  "source_commit": "74d1a96fc7a9a85d407c3f78999d95eea4a80003",
+  "measured_at": "2026-10-18T06:59:00Z",
+  "source_commit": "2fa313bd82077e29e1a67456e39c273ff1ac907c",
   "machine": {
     "device": "Apple M3 Ultra",
     "gpu_cores": 80,
@@ -11,10 +11,12 @@
   "model": {
     "id": "mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit",
     "revision": "6e302ea604ad9ab206367e2c501d1571023e7b6d",
-    "engine_sha256": "0a631d7c6ceefb9d48938f661f727ca3a1e4125318f93170b3ebf116c2515b31"
+    "profile": "qwen3-coder-30b-a3b-instruct-4bit.metal-apple-m3-ultra.q4",
+    "kv_cache": "f16",
+    "engine_sha256": "3822eeb076f15a34a811512b95ec41613e8da9c8af24d4b89347954063131bce"
   },
   "workload": {
-    "path": "forja serve /v1/chat/completions over HTTP",
+    "path": "forja serve /v1/completions over HTTP",
     "shared_prefix_tokens": 2048,
     "fresh_tokens": 33,
     "connection_reuse": true,
@@ -30,26 +32,26 @@
     },
     "uncached": {
       "generated_tokens": 1,
-      "prefix_reuse": false,
-      "repetitions": 30
+      "repetitions": 30,
+      "order": ["unrelated-prefix", "measured-prompt"]
     }
   },
   "results": {
     "cached_ttft_us": {
-      "p50": 143598,
-      "p90": 144816,
-      "p99": 146862
+      "p50": 135828,
+      "p90": 136820,
+      "p99": 137729
     },
     "cached_itl_us": {
-      "p50": 11015,
-      "p90": 11676,
-      "p99": 13660
+      "p50": 11763,
+      "p90": 12341,
+      "p99": 14606
     },
     "uncached_ttft_us": {
-      "p50": 1746732,
-      "p90": 1753568,
-      "p99": 2002107
+      "p50": 1850283,
+      "p90": 1864362,
+      "p99": 1881119
     },
-    "peak_rss_mib": 23123
+    "peak_rss_mib": 19908
   }
 }
