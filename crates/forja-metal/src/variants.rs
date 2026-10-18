@@ -31,6 +31,7 @@ pub(crate) enum MetalVariant {
     GatherQuantMatmulGroupedSmallM,
     GatherQuantMatmulGroupedPairSmallM,
     GatherQuantMatmulGrouped,
+    GatherQuantMatmulWeightedBroad,
     SdpaPortable,
     SdpaDecomposed,
     SdpaVectorSinglePass,
@@ -214,6 +215,7 @@ const PACKED: TensorRef = TensorRef::input("packed weights", 1);
 const SCALES: TensorRef = TensorRef::input("scales", 2);
 const BIASES: TensorRef = TensorRef::input("biases", 3);
 const INDICES_MATMUL: TensorRef = TensorRef::input("route indices", 4);
+const WEIGHTS_MATMUL: TensorRef = TensorRef::input("route weights", 5);
 const PAIRED_INDICES_MATMUL: TensorRef = TensorRef::input("route indices", 7);
 const OUTPUT: TensorRef = TensorRef::output("output", 0);
 const QUERY: TensorRef = TensorRef::input("query", 0);
@@ -226,6 +228,7 @@ const INNER: Dimension = dim("inner", INPUT, Axis::Index(1));
 const EXPERTS: Dimension = dim("experts", PACKED, Axis::Index(0));
 const MATMUL_ROWS: Dimension = dim("rows", INDICES_MATMUL, Axis::Index(0));
 const MATMUL_ROUTES: Dimension = dim("routes", INDICES_MATMUL, Axis::Index(1));
+const WEIGHT_ROUTES: Dimension = dim("weight routes", WEIGHTS_MATMUL, Axis::Index(1));
 const PAIRED_MATMUL_ROUTES: Dimension = dim("routes", PAIRED_INDICES_MATMUL, Axis::Index(1));
 const PAIRED_MATMUL_ROWS: Dimension = dim("rows", PAIRED_INDICES_MATMUL, Axis::Index(0));
 const QUERY_HEADS: Dimension = dim("query heads", QUERY, Axis::Index(0));
@@ -387,6 +390,17 @@ const GROUPED_MATMUL: &[Constraint] = &grouped(
     },
 );
 const ROUTE_GEMV: &[Constraint] = &[value(MATMUL_ROUTES, Relation::Range { min: 1, max: 8 })];
+const WEIGHTED_NARROW: &[Constraint] = &[
+    value(MATMUL_ROUTES, Relation::Range { min: 1, max: 8 }),
+    Constraint::DimensionsEqual {
+        left: MATMUL_ROUTES,
+        right: WEIGHT_ROUTES,
+    },
+];
+const WEIGHTED_SIGNATURE: &[Constraint] = &[Constraint::DimensionsEqual {
+    left: MATMUL_ROUTES,
+    right: WEIGHT_ROUTES,
+}];
 const PAIRED_ROUTE_GEMV: &[Constraint] = &[value(
     PAIRED_MATMUL_ROUTES,
     Relation::Range { min: 1, max: 8 },
@@ -634,6 +648,15 @@ pub(crate) static REGISTRY: &[VariantDef<MetalVariant>] = &[
         &["Sorts routes into bounded expert groups."]
     ),
     variant!(
+        "gather-quant-matmul.weighted-broad",
+        GatherQuantMatmul,
+        GatherQuantMatmulWeightedBroad,
+        WEIGHTED_SIGNATURE,
+        &["weighted combination with more than eight routes."],
+        &["eight or fewer routes can use one SIMD group per route."],
+        &["Uses one SIMD group to combine any legal route count."]
+    ),
+    variant!(
         "sdpa.portable",
         Sdpa,
         SdpaPortable,
@@ -819,10 +842,12 @@ fn variant_constraints(
     definition: &'static VariantDef<MetalVariant>,
     input_count: usize,
 ) -> &'static [Constraint] {
-    if definition.implementation == MetalVariant::GatherQuantMatmulRouteGemv && input_count == 8 {
-        PAIRED_ROUTE_GEMV
-    } else {
-        definition.constraints
+    match (definition.implementation, input_count) {
+        (MetalVariant::GatherQuantMatmulPortable | MetalVariant::GatherQuantMatmulRouteGemv, 6) => {
+            WEIGHTED_NARROW
+        }
+        (MetalVariant::GatherQuantMatmulRouteGemv, 8) => PAIRED_ROUTE_GEMV,
+        _ => definition.constraints,
     }
 }
 
@@ -1381,6 +1406,36 @@ mod tests {
         commands.into_dispatches().remove(0)
     }
 
+    fn weighted_gather_dispatch(rows: u32, routes: u32, experts: u32) -> Dispatch {
+        let backend = CpuBackend::new();
+        let (dtype, inner, columns, bits, group_size) = (DType::BF16, 64, 33, 4, 64);
+        let input = backend.alloc(dtype, &[rows, routes, inner]).unwrap();
+        let packed = backend
+            .alloc(
+                DType::U32,
+                &[experts, columns, inner * u32::from(bits) / 32],
+            )
+            .unwrap();
+        let scales = backend
+            .alloc(dtype, &[experts, columns, inner / group_size])
+            .unwrap();
+        let biases = backend
+            .alloc(dtype, &[experts, columns, inner / group_size])
+            .unwrap();
+        let indices = backend.alloc(DType::U32, &[rows, routes]).unwrap();
+        let weights = backend.alloc(dtype, &[rows, routes]).unwrap();
+        let output = backend.alloc(dtype, &[rows, columns]).unwrap();
+        let mut commands = CommandList::new();
+        commands
+            .dispatch(
+                Op::GatherQuantMatmul { bits, group_size },
+                &[&input, &packed, &scales, &biases, &indices, &weights],
+                &output,
+            )
+            .unwrap();
+        commands.into_dispatches().remove(0)
+    }
+
     fn sdpa_dispatch(
         dtype: DType,
         group: u32,
@@ -1608,6 +1663,21 @@ mod tests {
     }
 
     #[test]
+    fn weighted_gather_variants_partition_route_counts() {
+        let weighted_broad = weighted_gather_dispatch(1, 9, 257);
+        let error = resolve(&weighted_broad, "gather-quant-matmul.route-gemv", METAL4).unwrap_err();
+        assert!(error.to_string().contains("routes is in 1..=8"));
+        assert!(
+            resolve(
+                &weighted_broad,
+                "gather-quant-matmul.weighted-broad",
+                METAL4
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)]
     fn every_variant_has_an_encoder_accepted_fixture() {
         let fixtures = [
@@ -1695,6 +1765,11 @@ mod tests {
                 "gather-quant-matmul.grouped",
                 gathered_dispatch(64, 1, 256, 1),
                 "grouped_quantized_gemm",
+            ),
+            (
+                "gather-quant-matmul.weighted-broad",
+                weighted_gather_dispatch(1, 33, 8),
+                "gather_quantized_weighted_sum_broad",
             ),
             (
                 "sdpa.portable",

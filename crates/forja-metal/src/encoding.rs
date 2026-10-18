@@ -342,17 +342,22 @@ struct WeightedGatherSchedule {
     threadgroup_width: u32,
 }
 
-fn weighted_gather_schedule(routes: u32) -> Result<WeightedGatherSchedule, BackendError> {
-    if routes <= 8 {
-        Ok(WeightedGatherSchedule {
-            implementation: "gather_quantized_weighted_sum",
-            threadgroup_width: routes.checked_mul(32).ok_or(BackendError::InvalidInput)?,
-        })
-    } else {
-        Ok(WeightedGatherSchedule {
+fn weighted_gather_schedule(
+    selected: Option<MetalVariant>,
+    routes: u32,
+) -> Result<WeightedGatherSchedule, BackendError> {
+    match selected {
+        Some(MetalVariant::GatherQuantMatmulWeightedBroad) => Ok(WeightedGatherSchedule {
             implementation: "gather_quantized_weighted_sum_broad",
             threadgroup_width: 32,
-        })
+        }),
+        Some(
+            MetalVariant::GatherQuantMatmulPortable | MetalVariant::GatherQuantMatmulRouteGemv,
+        ) if routes <= 8 => Ok(WeightedGatherSchedule {
+            implementation: "gather_quantized_weighted_sum",
+            threadgroup_width: routes.checked_mul(32).ok_or(BackendError::InvalidInput)?,
+        }),
+        _ => Err(BackendError::InvalidInput),
     }
 }
 
@@ -3346,7 +3351,7 @@ impl MetalBackend {
             gather_quant_combine_params(tensors, (bits, group_size))?;
         let inner = input.layout.shape()[2];
         let words_per_thread = u32::from(columns % 4 == 0 && inner % 512 == 0) + 1;
-        let schedule = weighted_gather_schedule(routes)?;
+        let schedule = weighted_gather_schedule(selected_variant(dispatch), routes)?;
         let params = arguments.write(&params)?;
         let error_flag = grouped_error_flag(arguments)?;
         let constants = [
@@ -6530,6 +6535,11 @@ fn shape3(layout: &Layout) -> Result<[u32; 3], BackendError> {
 }
 
 fn supported_dispatch(dispatch: &Dispatch) -> bool {
+    if selected_variant(dispatch) == Some(MetalVariant::GatherQuantMatmulWeightedBroad)
+        && dispatch.primitive_inputs().len() != 6
+    {
+        return false;
+    }
     if dispatch.prepared_epilogue().is_some()
         && !matches!(
             selected_variant(dispatch),
@@ -6551,6 +6561,7 @@ fn supported_dispatch(dispatch: &Dispatch) -> bool {
                     | MetalVariant::GatherQuantMatmulGroupedSmallM
                     | MetalVariant::GatherQuantMatmulGroupedPairSmallM
                     | MetalVariant::GatherQuantMatmulGrouped
+                    | MetalVariant::GatherQuantMatmulWeightedBroad
             )
         )
     {
@@ -6668,7 +6679,7 @@ pub(super) fn dispatch_kernel(dispatch: &Dispatch) -> Result<&'static str, Backe
                     .first()
                     .and_then(|input| input.layout().shape().get(1))
                     .ok_or(BackendError::InvalidInput)?;
-                weighted_gather_schedule(*routes)?.implementation
+                weighted_gather_schedule(selected_variant(dispatch), *routes)?.implementation
             } else if dispatch.primitive_inputs().len() == 8 && grouped_gather_dispatch(dispatch) {
                 if grouped_block_rows(dispatch) == 8 {
                     "gathered_pair_from_projections_small_m"
@@ -6933,6 +6944,7 @@ pub(super) fn variant_supported(
         | MetalVariant::GatherQuantMatmulRouteGemv
         | MetalVariant::SdpaDecomposed
         | MetalVariant::TopKPartials => true,
+        MetalVariant::GatherQuantMatmulWeightedBroad => dispatch.primitive_inputs().len() == 6,
         MetalVariant::MatmulGemv => matmul_rows(dispatch)? == 1,
         MetalVariant::MatmulGemvTransposed => matmul_kernel(dispatch)? == "gemv_transposed",
         MetalVariant::MatmulSteel64x64x16_2x2
@@ -7477,7 +7489,8 @@ fn gather_epilogue_requests(
         return Ok(vec![EpiloguePipelineRequest {
             family: epilogue_codegen::FamilySourceTag::GatherQuant,
             epilogue,
-            implementation: weighted_gather_schedule(routes)?.implementation,
+            implementation: weighted_gather_schedule(selected_variant(dispatch), routes)?
+                .implementation,
             constants,
         }]);
     }
@@ -10154,23 +10167,29 @@ mod tests {
             )
             .unwrap();
             let mut commands = CommandList::new();
-            commands
-                .dispatch_epilogue(
-                    Op::GatherQuantMatmul {
-                        bits: 4,
-                        group_size: 64,
-                    },
-                    &[&input, &packed, &scales, &biases, &indices, &weights],
-                    &output,
-                    &epilogue,
-                    &[&residual],
-                )
+            let op = Op::GatherQuantMatmul {
+                bits: 4,
+                group_size: 64,
+            };
+            let inputs = [&input, &packed, &scales, &biases, &indices, &weights];
+            let variant = if routes <= 8 {
+                "gather-quant-matmul.route-gemv"
+            } else {
+                "gather-quant-matmul.weighted-broad"
+            };
+            let selection = backend
+                .validate_variant_for_op(op, &inputs, &[&output], variant)
                 .unwrap();
+            commands
+                .dispatch_epilogue(op, &inputs, &output, &epilogue, &[&residual])
+                .unwrap();
+            assert!(commands.set_last_backend_data(BackendDispatchData::new(selection)));
             backend.submit(commands).unwrap().wait().unwrap();
         }
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn metal_broad_weighted_gather_zeros_invalid_route_and_reports_error() {
         let backend = MetalBackend::new().unwrap();
         let rows = 1;
@@ -10241,18 +10260,23 @@ mod tests {
         )
         .unwrap();
         let mut commands = CommandList::new();
-        commands
-            .dispatch_epilogue(
-                Op::GatherQuantMatmul {
-                    bits: 4,
-                    group_size: 64,
-                },
-                &[&input, &packed, &scales, &biases, &indices, &weights],
-                &output,
-                &epilogue,
-                &[&residual],
+        let op = Op::GatherQuantMatmul {
+            bits: 4,
+            group_size: 64,
+        };
+        let inputs = [&input, &packed, &scales, &biases, &indices, &weights];
+        let selection = backend
+            .validate_variant_for_op(
+                op,
+                &inputs,
+                &[&output],
+                "gather-quant-matmul.weighted-broad",
             )
             .unwrap();
+        commands
+            .dispatch_epilogue(op, &inputs, &output, &epilogue, &[&residual])
+            .unwrap();
+        assert!(commands.set_last_backend_data(BackendDispatchData::new(selection)));
         let submission = backend.submit(commands).unwrap();
         assert!(matches!(
             submission.wait(),
