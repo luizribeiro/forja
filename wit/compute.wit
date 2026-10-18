@@ -51,6 +51,10 @@ interface compute {
 
   record sample-cfg {
     position: affine,
+    chunk-width: u32,
+    fast-top-k: u32,
+    fast-max-chunks: u32,
+    rejection-rounds: u32,
   }
 
   record reduction-cfg {

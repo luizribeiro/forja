@@ -171,11 +171,27 @@ pub enum Op {
     Sample {
         /// Absolute sequence position mixed into the random counter.
         position: u32,
+        /// Maximum number of row elements reduced by one partial workgroup.
+        chunk_width: u32,
+        /// Largest top-k count handled by the bounded fast path.
+        fast_top_k: u32,
+        /// Largest partial-workgroup count handled by the bounded fast path.
+        fast_max_chunks: u32,
+        /// Number of bounded rejection-sampling attempts.
+        rejection_rounds: u32,
     },
     /// Samples one permitted index from each row using counter-based randomness.
     SampleMasked {
         /// Absolute sequence position mixed into the random counter.
         position: u32,
+        /// Maximum number of row elements reduced by one partial workgroup.
+        chunk_width: u32,
+        /// Largest top-k count handled by the bounded fast path.
+        fast_top_k: u32,
+        /// Largest partial-workgroup count handled by the bounded fast path.
+        fast_max_chunks: u32,
+        /// Number of bounded rejection-sampling attempts.
+        rejection_rounds: u32,
     },
     /// Applies half-split rotary position embeddings.
     Rope {
@@ -311,8 +327,38 @@ impl fmt::Display for OpError {
 
 impl Error for OpError {}
 
+/// Eight candidates per lane bound the sampling kernels' thread-local selection arrays.
+const MAX_SAMPLING_CHUNK_WIDTH: u32 = 2_048;
+/// Twenty ranks bound the sampling kernels' threadgroup ranking arrays.
+const MAX_SAMPLING_FAST_TOP_K: u32 = 20;
+/// Eight candidates per thread bound a fast merge to 2,048 partial candidates.
+const MAX_SAMPLING_FAST_PARTIALS: u32 = 2_048;
+/// Eight attempts cap the command and argument resources recorded for one sampling dispatch.
+const MAX_SAMPLING_REJECTION_ROUNDS: u32 = 8;
+
 fn check_reduction_parameters(chunk_width: u32) -> Result<(), OpError> {
     if chunk_width == 0 {
+        return Err(OpError::InvalidKernelParameter);
+    }
+    Ok(())
+}
+
+fn check_sampling_parameters(
+    chunk_width: u32,
+    fast_top_k: u32,
+    fast_max_chunks: u32,
+    rejection_rounds: u32,
+) -> Result<(), OpError> {
+    let fast_partials = fast_top_k.checked_mul(fast_max_chunks);
+    if chunk_width == 0
+        || chunk_width > MAX_SAMPLING_CHUNK_WIDTH
+        || fast_top_k == 0
+        || fast_top_k > MAX_SAMPLING_FAST_TOP_K
+        || fast_max_chunks == 0
+        || fast_partials.is_none_or(|count| count > MAX_SAMPLING_FAST_PARTIALS)
+        || rejection_rounds == 0
+        || rejection_rounds > MAX_SAMPLING_REJECTION_ROUNDS
+    {
         return Err(OpError::InvalidKernelParameter);
     }
     Ok(())
@@ -451,8 +497,36 @@ impl Dispatch {
                 check_reduction_parameters(chunk_width)?;
                 check_top_k(inputs, outputs, k)?;
             }
-            Op::Sample { .. } => check_sample(inputs, output)?,
-            Op::SampleMasked { .. } => check_sample_masked(inputs, output)?,
+            Op::Sample {
+                chunk_width,
+                fast_top_k,
+                fast_max_chunks,
+                rejection_rounds,
+                ..
+            } => {
+                check_sampling_parameters(
+                    chunk_width,
+                    fast_top_k,
+                    fast_max_chunks,
+                    rejection_rounds,
+                )?;
+                check_sample(inputs, output)?;
+            }
+            Op::SampleMasked {
+                chunk_width,
+                fast_top_k,
+                fast_max_chunks,
+                rejection_rounds,
+                ..
+            } => {
+                check_sampling_parameters(
+                    chunk_width,
+                    fast_top_k,
+                    fast_max_chunks,
+                    rejection_rounds,
+                )?;
+                check_sample_masked(inputs, output)?;
+            }
             Op::Rope { theta } => check_rope(inputs, output, theta)?,
             Op::Embed => check_embed(inputs, output)?,
             Op::QuantEmbed { bits, group_size } => {
@@ -1855,6 +1929,26 @@ mod tests {
         Op::Argmax { chunk_width: 2_048 }
     }
 
+    fn sample(position: u32) -> Op {
+        Op::Sample {
+            position,
+            chunk_width: 2_048,
+            fast_top_k: 20,
+            fast_max_chunks: 102,
+            rejection_rounds: 2,
+        }
+    }
+
+    fn sample_masked(position: u32) -> Op {
+        Op::SampleMasked {
+            position,
+            chunk_width: 2_048,
+            fast_top_k: 20,
+            fast_max_chunks: 102,
+            rejection_rounds: 2,
+        }
+    }
+
     fn tensor(buffer: u64, dtype: DType, shape: &[u32], strides: &[u64]) -> Tensor {
         let bytes = u64::from(shape.iter().product::<u32>()) * dtype.byte_size();
         Tensor::from_allocation(
@@ -2242,7 +2336,7 @@ mod tests {
         let params = tensor(2, DType::U32, &[5], &[1]);
         let output = tensor(3, DType::U32, &[1], &[1]);
 
-        for op in [argmax(), Op::Sample { position: 9 }] {
+        for op in [argmax(), sample(9)] {
             let inputs = match op {
                 Op::Sample { .. } => vec![&logits, &params],
                 _ => vec![&logits],
@@ -2266,25 +2360,17 @@ mod tests {
 
         assert!(
             CommandList::new()
-                .dispatch(Op::Sample { position: 9 }, &[&logits, &params], &output)
+                .dispatch(sample(9), &[&logits, &params], &output)
                 .is_ok()
         );
         assert_eq!(
-            CommandList::new().dispatch(
-                Op::Sample { position: 9 },
-                &[&logits, &short_params],
-                &output
-            ),
+            CommandList::new().dispatch(sample(9), &[&logits, &short_params], &output),
             Err(OpError::Shape {
                 operand: Operand::Input(1)
             })
         );
         assert_eq!(
-            CommandList::new().dispatch(
-                Op::Sample { position: 9 },
-                &[&logits, &params],
-                &float_output
-            ),
+            CommandList::new().dispatch(sample(9), &[&logits, &params], &float_output),
             Err(OpError::DType {
                 operand: Operand::Output,
                 dtype: DType::F32
@@ -2308,17 +2394,13 @@ mod tests {
 
         assert!(
             CommandList::new()
-                .dispatch(
-                    Op::SampleMasked { position: 9 },
-                    &[&logits, &params, &mask],
-                    &output
-                )
+                .dispatch(sample_masked(9), &[&logits, &params, &mask], &output)
                 .is_ok()
         );
         for invalid in [&short_mask, &strided_mask] {
             assert_eq!(
                 CommandList::new().dispatch(
-                    Op::SampleMasked { position: 9 },
+                    sample_masked(9),
                     &[&logits, &params, invalid],
                     &output
                 ),
@@ -2327,6 +2409,69 @@ mod tests {
                 })
             );
         }
+    }
+
+    #[test]
+    fn sampling_parameters_enforce_kernel_capacities() {
+        let logits = tensor(1, DType::F32, &[1, 33], &[33, 1]);
+        let params = tensor(2, DType::U32, &[5], &[1]);
+        let output = tensor(3, DType::U32, &[1], &[1]);
+        for op in [
+            Op::Sample {
+                position: 0,
+                chunk_width: 2_049,
+                fast_top_k: 20,
+                fast_max_chunks: 102,
+                rejection_rounds: 2,
+            },
+            Op::Sample {
+                position: 0,
+                chunk_width: 2_048,
+                fast_top_k: 21,
+                fast_max_chunks: 1,
+                rejection_rounds: 2,
+            },
+            Op::Sample {
+                position: 0,
+                chunk_width: 2_048,
+                fast_top_k: 20,
+                fast_max_chunks: 103,
+                rejection_rounds: 2,
+            },
+            Op::Sample {
+                position: 0,
+                chunk_width: 2_048,
+                fast_top_k: 20,
+                fast_max_chunks: 102,
+                rejection_rounds: 0,
+            },
+            Op::Sample {
+                position: 0,
+                chunk_width: 2_048,
+                fast_top_k: 20,
+                fast_max_chunks: 102,
+                rejection_rounds: 9,
+            },
+        ] {
+            assert_eq!(
+                CommandList::new().dispatch(op, &[&logits, &params], &output),
+                Err(OpError::InvalidKernelParameter)
+            );
+        }
+        assert_eq!(
+            CommandList::new().dispatch(
+                Op::SampleMasked {
+                    position: 0,
+                    chunk_width: 2_048,
+                    fast_top_k: 20,
+                    fast_max_chunks: 102,
+                    rejection_rounds: 0,
+                },
+                &[&logits, &params, &tensor(4, DType::U32, &[2], &[1])],
+                &output,
+            ),
+            Err(OpError::InvalidKernelParameter)
+        );
     }
 
     #[test]

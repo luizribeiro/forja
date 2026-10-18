@@ -1215,10 +1215,10 @@ impl Backend for CpuBackend {
                 Op::TopK { k, normalize, .. } => {
                     self.execute_top_k(dispatch.inputs(), dispatch.outputs(), k, normalize)
                 }
-                Op::Sample { position } => {
+                Op::Sample { position, .. } => {
                     self.execute_sample(dispatch.inputs(), dispatch.output(), position)
                 }
-                Op::SampleMasked { position } => {
+                Op::SampleMasked { position, .. } => {
                     self.execute_sample_masked(dispatch.inputs(), dispatch.output(), position)
                 }
                 Op::Rope { theta } => {
@@ -1579,6 +1579,16 @@ mod tests {
 
     fn argmax() -> Op {
         Op::Argmax { chunk_width: 2_048 }
+    }
+
+    fn sample(position: u32) -> Op {
+        Op::Sample {
+            position,
+            chunk_width: 2_048,
+            fast_top_k: 20,
+            fast_max_chunks: 102,
+            rejection_rounds: 2,
+        }
     }
 
     #[test]
@@ -2277,7 +2287,7 @@ mod tests {
         let output = backend.alloc(DType::U32, &[]).unwrap();
         let mut commands = CommandList::new();
         commands
-            .dispatch(Op::Sample { position: 0 }, &[&logits, &params], &output)
+            .dispatch(sample(0), &[&logits, &params], &output)
             .unwrap();
         assert_eq!(
             backend.submit(commands).unwrap().wait(),

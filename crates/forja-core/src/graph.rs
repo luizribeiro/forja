@@ -361,11 +361,27 @@ pub enum TemplateOp {
     Sample {
         /// Absolute sequence position mixed into the random counter.
         position: Affine,
+        /// Maximum number of row elements reduced by one partial workgroup.
+        chunk_width: u32,
+        /// Largest top-k count handled by the bounded fast path.
+        fast_top_k: u32,
+        /// Largest partial-workgroup count handled by the bounded fast path.
+        fast_max_chunks: u32,
+        /// Number of bounded rejection-sampling attempts.
+        rejection_rounds: u32,
     },
     /// Masked sampling with a parameterized absolute sequence position.
     SampleMasked {
         /// Absolute sequence position mixed into the random counter.
         position: Affine,
+        /// Maximum number of row elements reduced by one partial workgroup.
+        chunk_width: u32,
+        /// Largest top-k count handled by the bounded fast path.
+        fast_top_k: u32,
+        /// Largest partial-workgroup count handled by the bounded fast path.
+        fast_max_chunks: u32,
+        /// Number of bounded rejection-sampling attempts.
+        rejection_rounds: u32,
     },
 }
 
@@ -382,14 +398,38 @@ impl TemplateOp {
 
     /// Creates a sampling configuration whose position may depend on one parameter.
     #[must_use]
-    pub const fn sample(position: Affine) -> Self {
-        Self::Sample { position }
+    pub const fn sample(
+        position: Affine,
+        chunk_width: u32,
+        fast_top_k: u32,
+        fast_max_chunks: u32,
+        rejection_rounds: u32,
+    ) -> Self {
+        Self::Sample {
+            position,
+            chunk_width,
+            fast_top_k,
+            fast_max_chunks,
+            rejection_rounds,
+        }
     }
 
     /// Creates a masked sampling configuration whose position may depend on one parameter.
     #[must_use]
-    pub const fn sample_masked(position: Affine) -> Self {
-        Self::SampleMasked { position }
+    pub const fn sample_masked(
+        position: Affine,
+        chunk_width: u32,
+        fast_top_k: u32,
+        fast_max_chunks: u32,
+        rejection_rounds: u32,
+    ) -> Self {
+        Self::SampleMasked {
+            position,
+            chunk_width,
+            fast_top_k,
+            fast_max_chunks,
+            rejection_rounds,
+        }
     }
 
     /// Resolves the operation to a concrete configuration.
@@ -409,11 +449,31 @@ impl TemplateOp {
                 causal,
                 q_start: q_start.evaluate(values)?,
             }),
-            Self::Sample { position } => Ok(Op::Sample {
+            Self::Sample {
+                position,
+                chunk_width,
+                fast_top_k,
+                fast_max_chunks,
+                rejection_rounds,
+            } => Ok(Op::Sample {
                 position: position.evaluate(values)?,
+                chunk_width,
+                fast_top_k,
+                fast_max_chunks,
+                rejection_rounds,
             }),
-            Self::SampleMasked { position } => Ok(Op::SampleMasked {
+            Self::SampleMasked {
+                position,
+                chunk_width,
+                fast_top_k,
+                fast_max_chunks,
+                rejection_rounds,
+            } => Ok(Op::SampleMasked {
                 position: position.evaluate(values)?,
+                chunk_width,
+                fast_top_k,
+                fast_max_chunks,
+                rejection_rounds,
             }),
         }
     }
@@ -424,7 +484,9 @@ impl TemplateOp {
         match self {
             Self::Static(_) => false,
             Self::Sdpa { q_start, .. } => !q_start.is_constant(),
-            Self::Sample { position } | Self::SampleMasked { position } => !position.is_constant(),
+            Self::Sample { position, .. } | Self::SampleMasked { position, .. } => {
+                !position.is_constant()
+            }
         }
     }
 }
@@ -437,8 +499,32 @@ impl From<Op> for TemplateOp {
                 causal,
                 q_start,
             } => Self::sdpa(scale, causal, Affine::constant(q_start)),
-            Op::Sample { position } => Self::sample(Affine::constant(position)),
-            Op::SampleMasked { position } => Self::sample_masked(Affine::constant(position)),
+            Op::Sample {
+                position,
+                chunk_width,
+                fast_top_k,
+                fast_max_chunks,
+                rejection_rounds,
+            } => Self::sample(
+                Affine::constant(position),
+                chunk_width,
+                fast_top_k,
+                fast_max_chunks,
+                rejection_rounds,
+            ),
+            Op::SampleMasked {
+                position,
+                chunk_width,
+                fast_top_k,
+                fast_max_chunks,
+                rejection_rounds,
+            } => Self::sample_masked(
+                Affine::constant(position),
+                chunk_width,
+                fast_top_k,
+                fast_max_chunks,
+                rejection_rounds,
+            ),
             _ => Self::Static(op),
         }
     }
@@ -1607,11 +1693,20 @@ mod tests {
 
     #[test]
     fn ordinary_sample_keeps_its_graph_identity() {
-        let operation = Op::Sample { position: 4097 };
+        let operation = Op::Sample {
+            position: 4097,
+            chunk_width: 2_048,
+            fast_top_k: 20,
+            fast_max_chunks: 102,
+            rejection_rounds: 2,
+        };
         let template = TemplateOp::from(operation);
         let space = ParamSpace::new(std::iter::once(0..=0).collect()).unwrap();
 
-        assert_eq!(template, TemplateOp::sample(Affine::constant(4097)));
+        assert_eq!(
+            template,
+            TemplateOp::sample(Affine::constant(4097), 2_048, 20, 102, 2)
+        );
         assert_eq!(
             template
                 .instantiate(&space.values(vec![0]).unwrap())

@@ -4878,15 +4878,41 @@ fn core_op(operation: compute::Op) -> (TemplateOp, Option<Op>) {
             let position = core_affine(config.position);
             let concrete = position.is_constant().then_some(Op::Sample {
                 position: config.position.offset,
+                chunk_width: config.chunk_width,
+                fast_top_k: config.fast_top_k,
+                fast_max_chunks: config.fast_max_chunks,
+                rejection_rounds: config.rejection_rounds,
             });
-            (TemplateOp::sample(position), concrete)
+            (
+                TemplateOp::sample(
+                    position,
+                    config.chunk_width,
+                    config.fast_top_k,
+                    config.fast_max_chunks,
+                    config.rejection_rounds,
+                ),
+                concrete,
+            )
         }
         compute::Op::SampleMasked(config) => {
             let position = core_affine(config.position);
             let concrete = position.is_constant().then_some(Op::SampleMasked {
                 position: config.position.offset,
+                chunk_width: config.chunk_width,
+                fast_top_k: config.fast_top_k,
+                fast_max_chunks: config.fast_max_chunks,
+                rejection_rounds: config.rejection_rounds,
             });
-            (TemplateOp::sample_masked(position), concrete)
+            (
+                TemplateOp::sample_masked(
+                    position,
+                    config.chunk_width,
+                    config.fast_top_k,
+                    config.fast_max_chunks,
+                    config.rejection_rounds,
+                ),
+                concrete,
+            )
         }
         compute::Op::Rope(config) => concrete_template(Op::Rope {
             theta: config.theta,

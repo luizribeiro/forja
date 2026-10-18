@@ -22,6 +22,37 @@ impl Default for ReductionConfig {
     }
 }
 
+/// Engine-selected sampling-kernel parameters.
+///
+/// Defaults use 2,048-element chunks, a top-k fast-path limit of 20, at most 102 chunks in that
+/// fast path, and two rejection attempts.
+///
+/// Chunk width is limited to 2,048, the fast top-k limit to 20, the product of the fast top-k and
+/// chunk limits to 2,048, and rejection attempts to eight. These bounds protect fixed kernel and
+/// command-resource capacities.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SamplingKernelConfig {
+    /// Maximum number of row elements handled by one partial workgroup.
+    pub chunk_width: u32,
+    /// Largest top-k count handled by the bounded ranking fast path.
+    pub fast_top_k: u32,
+    /// Largest partial-workgroup count handled by the bounded ranking fast path.
+    pub fast_max_chunks: u32,
+    /// Number of bounded rejection-sampling attempts.
+    pub rejection_rounds: u32,
+}
+
+impl Default for SamplingKernelConfig {
+    fn default() -> Self {
+        Self {
+            chunk_width: 2_048,
+            fast_top_k: 20,
+            fast_max_chunks: 102,
+            rejection_rounds: 2,
+        }
+    }
+}
+
 /// A strided selection along one tensor axis.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Slice {
@@ -482,6 +513,20 @@ impl<T: Element> Tensor<T> {
         params: &Tensor<u32>,
         position: impl Into<crate::Dim>,
     ) -> Result<Tensor<u32>> {
+        self.sample_with_config(params, position, SamplingKernelConfig::default())
+    }
+
+    /// Samples with explicit reduction and bounded-fast-path parameters.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid parameters, shapes, or a refused dispatch.
+    pub fn sample_with_config(
+        &self,
+        params: &Tensor<u32>,
+        position: impl Into<crate::Dim>,
+        config: SamplingKernelConfig,
+    ) -> Result<Tensor<u32>> {
         let mut shape = self.shape.clone();
         shape
             .pop()
@@ -489,7 +534,13 @@ impl<T: Element> Tensor<T> {
         let output = Tensor::<u32>::empty(shape)?;
         let position = graph::affine(&position.into())?;
         graph::record(
-            sys::Op::Sample { position },
+            sys::Op::Sample {
+                position,
+                chunk_width: config.chunk_width,
+                fast_top_k: config.fast_top_k,
+                fast_max_chunks: config.fast_max_chunks,
+                rejection_rounds: config.rejection_rounds,
+            },
             &[&self.handle, &params.handle],
             &output.handle,
         )?;
@@ -511,6 +562,21 @@ impl<T: Element> Tensor<T> {
         allow: &Tensor<u32>,
         position: impl Into<crate::Dim>,
     ) -> Result<Tensor<u32>> {
+        self.sample_masked_with_config(params, allow, position, SamplingKernelConfig::default())
+    }
+
+    /// Samples from an allow mask with explicit kernel parameters.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid parameters, shapes, or a refused dispatch.
+    pub fn sample_masked_with_config(
+        &self,
+        params: &Tensor<u32>,
+        allow: &Tensor<u32>,
+        position: impl Into<crate::Dim>,
+        config: SamplingKernelConfig,
+    ) -> Result<Tensor<u32>> {
         let mut shape = self.shape.clone();
         shape
             .pop()
@@ -518,7 +584,13 @@ impl<T: Element> Tensor<T> {
         let output = Tensor::<u32>::empty(shape)?;
         let position = graph::affine(&position.into())?;
         graph::record(
-            sys::Op::SampleMasked { position },
+            sys::Op::SampleMasked {
+                position,
+                chunk_width: config.chunk_width,
+                fast_top_k: config.fast_top_k,
+                fast_max_chunks: config.fast_max_chunks,
+                rejection_rounds: config.rejection_rounds,
+            },
             &[&self.handle, &params.handle, &allow.handle],
             &output.handle,
         )?;
@@ -1771,8 +1843,17 @@ mod tests {
     use forja_testing::assert_f32_values_agree;
 
     #[test]
-    fn reduction_parameter_default_preserves_existing_schedule() {
+    fn kernel_parameter_defaults_preserve_existing_schedules() {
         assert_eq!(ReductionConfig::default().chunk_width, 2_048);
+        assert_eq!(
+            SamplingKernelConfig::default(),
+            SamplingKernelConfig {
+                chunk_width: 2_048,
+                fast_top_k: 20,
+                fast_max_chunks: 102,
+                rejection_rounds: 2,
+            }
+        );
     }
 
     #[test]

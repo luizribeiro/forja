@@ -497,17 +497,47 @@ enum SdpaKernel {
 const VECTOR_MAX_KEY_LENGTH: u32 = 65_536;
 /// Specializes how many elements a partial reduction workgroup consumes.
 const REDUCTION_CHUNK_WIDTH_CONSTANT: u32 = 17;
-const ARGMAX_CHUNK_WIDTH: u32 = 2048;
-const SAMPLE_REJECTION_ROUNDS: u32 = 2;
+/// Specializes the bounded sampling rank arrays without exceeding their capacity of twenty.
+const SAMPLE_FAST_TOP_K_CONSTANT: u32 = 18;
+/// Specializes the bounded sampling merge without exceeding 2,048 partial candidates.
+const SAMPLE_FAST_MAX_CHUNKS_CONSTANT: u32 = 19;
+/// Index of the sampling error flag in the prepared argument vector.
 const SAMPLE_ERROR: usize = 0;
+/// Index of the logits layout in the prepared argument vector.
 const SAMPLE_LOGITS_LAYOUT: usize = 1;
+/// Index of the sampling-parameter layout in the prepared argument vector.
 const SAMPLE_PARAMS_LAYOUT: usize = 2;
+/// Index of the output layout in the prepared argument vector.
 const SAMPLE_OUTPUT_LAYOUT: usize = 3;
+/// Index of the row width in the prepared argument vector.
 const SAMPLE_WIDTH: usize = 4;
+/// Index of the sequence position in the prepared argument vector.
 const SAMPLE_POSITION: usize = 5;
+/// Index of the partial-workgroup count in the prepared argument vector.
 const SAMPLE_CHUNKS: usize = 6;
+/// Index of the rejection-attempt bound in the prepared argument vector.
 const SAMPLE_MAX_ROUNDS: usize = 7;
+/// First index reserved for per-round sampling arguments.
 const SAMPLE_ROUND_ARGUMENTS: usize = 8;
+#[derive(Clone, Copy)]
+struct SampleKernelParams {
+    position: u32,
+    chunk_width: u32,
+    fast_top_k: u32,
+    fast_max_chunks: u32,
+    rejection_rounds: u32,
+}
+
+impl SampleKernelParams {
+    const fn function_constants(self, dtype: u32) -> [(u32, u32); 4] {
+        [
+            (0, dtype),
+            (REDUCTION_CHUNK_WIDTH_CONSTANT, self.chunk_width),
+            (SAMPLE_FAST_TOP_K_CONSTANT, self.fast_top_k),
+            (SAMPLE_FAST_MAX_CHUNKS_CONSTANT, self.fast_max_chunks),
+        ]
+    }
+}
 
 struct EncodedDispatches {
     temporaries: Vec<BufferBinding>,
@@ -951,12 +981,12 @@ thread_local! {
     static FORCED_SAMPLE_REJECTION_ROUNDS: Cell<Option<u32>> = const { Cell::new(None) };
 }
 
-fn sample_rejection_rounds() -> u32 {
+fn sample_rejection_rounds(configured: u32) -> u32 {
     #[cfg(test)]
     if let Some(rounds) = FORCED_SAMPLE_REJECTION_ROUNDS.with(Cell::get) {
-        return rounds.min(SAMPLE_REJECTION_ROUNDS);
+        return rounds.min(configured);
     }
-    SAMPLE_REJECTION_ROUNDS
+    configured
 }
 
 struct MetalCallbackScope(bool);
@@ -2718,16 +2748,41 @@ impl MetalBackend {
                 bindings,
                 arguments,
             )?,
-            Op::Sample { position } => {
+            Op::Sample {
+                position,
+                chunk_width,
+                fast_top_k,
+                fast_max_chunks,
+                rejection_rounds,
+            } => {
+                let params = SampleKernelParams {
+                    position,
+                    chunk_width,
+                    fast_top_k,
+                    fast_max_chunks,
+                    rejection_rounds,
+                };
                 let (buffers, flag) =
-                    self.encode_sample(encoder, table, dispatch, position, bindings, arguments)?;
+                    self.encode_sample(encoder, table, dispatch, params, bindings, arguments)?;
                 error_flags.push(EncodedErrorFlag::new(flag, dispatch_index, "sample"));
                 buffers
             }
-            Op::SampleMasked { position } => {
-                let (buffers, flag) = self.encode_sample_masked(
-                    encoder, table, dispatch, position, bindings, arguments,
-                )?;
+            Op::SampleMasked {
+                position,
+                chunk_width,
+                fast_top_k,
+                fast_max_chunks,
+                rejection_rounds,
+            } => {
+                let params = SampleKernelParams {
+                    position,
+                    chunk_width,
+                    fast_top_k,
+                    fast_max_chunks,
+                    rejection_rounds,
+                };
+                let (buffers, flag) = self
+                    .encode_sample_masked(encoder, table, dispatch, params, bindings, arguments)?;
                 error_flags.push(EncodedErrorFlag::new(flag, dispatch_index, "sample-masked"));
                 buffers
             }
@@ -5381,7 +5436,7 @@ impl MetalBackend {
 
     fn write_sample_arguments<A: ArgumentSink>(
         dispatch: &Dispatch,
-        position: u32,
+        params: SampleKernelParams,
         arguments: &mut A,
     ) -> Result<Vec<A::Written>, BackendError> {
         let [logits, sampling] = dispatch.inputs() else {
@@ -5392,8 +5447,13 @@ impl MetalBackend {
             .shape()
             .last()
             .ok_or(BackendError::InvalidInput)?;
-        let chunks = width.div_ceil(ARGMAX_CHUNK_WIDTH);
-        let mut written = Vec::with_capacity(10);
+        let chunks = width.div_ceil(params.chunk_width);
+        let capacity = 8_usize
+            .checked_add(
+                usize::try_from(params.rejection_rounds).map_err(|_| BackendError::InvalidInput)?,
+            )
+            .ok_or(BackendError::InvalidInput)?;
+        let mut written = Vec::with_capacity(capacity);
         written.push(arguments.write_argument(&[0_u8; 8])?);
         for layout in [
             logits.layout(),
@@ -5402,11 +5462,14 @@ impl MetalBackend {
         ] {
             written.push(arguments.write_argument(&encode_layout(layout)?)?);
         }
-        for value in [width, position, chunks] {
+        for value in [width, params.position, chunks] {
             written.push(arguments.write_argument(&value.to_ne_bytes())?);
         }
-        written.push(arguments.write_argument(&sample_rejection_rounds().to_ne_bytes())?);
-        for round in 0..SAMPLE_REJECTION_ROUNDS {
+        written.push(
+            arguments
+                .write_argument(&sample_rejection_rounds(params.rejection_rounds).to_ne_bytes())?,
+        );
+        for round in 0..params.rejection_rounds {
             written.push(arguments.write_argument(&round.to_ne_bytes())?);
         }
         Ok(written)
@@ -5418,7 +5481,7 @@ impl MetalBackend {
         encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
         table: &ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>,
         dispatch: &Dispatch,
-        position: u32,
+        params: SampleKernelParams,
         bindings: &mut ArgumentBindings,
         arguments: &mut ArgumentWriter,
     ) -> Result<EncodedEmbed, BackendError> {
@@ -5433,13 +5496,17 @@ impl MetalBackend {
             .ok_or(BackendError::InvalidInput)?;
         let rows = u32::try_from(output.layout().element_count())
             .map_err(|_| BackendError::ExecutionFailed)?;
-        let chunks = width.div_ceil(ARGMAX_CHUNK_WIDTH);
+        let chunks = width.div_ceil(params.chunk_width);
         let state = self.scratch_tensor(DType::U32, &[rows, 7])?;
         let rejection_dispatch = self.scratch_tensor(DType::U32, &[3])?;
         let rejection_partials = self.scratch_tensor(DType::U32, &[rows, chunks, 4])?;
-        let topk_partials = self.scratch_tensor(DType::U32, &[rows, chunks, 40])?;
+        let topk_words = params
+            .fast_top_k
+            .checked_mul(2)
+            .ok_or(BackendError::InvalidInput)?;
+        let topk_partials = self.scratch_tensor(DType::U32, &[rows, chunks, topk_words])?;
         let partials = self.scratch_tensor(DType::U32, &[rows, chunks, 2])?;
-        let dtype = [(0, dtype_code(logits.layout().dtype()))];
+        let constants = params.function_constants(dtype_code(logits.layout().dtype()));
         let (
             prepare_pipeline,
             rejection_proposal_partials_pipeline,
@@ -5457,19 +5524,19 @@ impl MetalBackend {
                 .lock()
                 .map_err(|_| BackendError::ExecutionFailed)?;
             (
-                pipelines.get("sample_prepare", &[])?,
-                pipelines.get("sample_rejection_proposal_partials", &dtype)?,
-                pipelines.get("sample_rejection_proposal_finalize", &[])?,
-                pipelines.get("sample_rejection_threshold_partials", &dtype)?,
-                pipelines.get("sample_rejection_threshold_finalize", &dtype)?,
-                pipelines.get("sample_topk_partials", &dtype)?,
-                pipelines.get("sample_topk_finalize", &[])?,
-                pipelines.get("sample_exact_fallback", &dtype)?,
-                pipelines.get("sample_partials", &dtype)?,
-                pipelines.get("sample_reduce_finalize", &[])?,
+                pipelines.get("sample_prepare", &constants)?,
+                pipelines.get("sample_rejection_proposal_partials", &constants)?,
+                pipelines.get("sample_rejection_proposal_finalize", &constants)?,
+                pipelines.get("sample_rejection_threshold_partials", &constants)?,
+                pipelines.get("sample_rejection_threshold_finalize", &constants)?,
+                pipelines.get("sample_topk_partials", &constants)?,
+                pipelines.get("sample_topk_finalize", &constants)?,
+                pipelines.get("sample_exact_fallback", &constants)?,
+                pipelines.get("sample_partials", &constants)?,
+                pipelines.get("sample_reduce_finalize", &constants)?,
             )
         };
-        let mut temporaries = Self::write_sample_arguments(dispatch, position, arguments)?;
+        let mut temporaries = Self::write_sample_arguments(dispatch, params, arguments)?;
         let error_flag = temporaries[SAMPLE_ERROR].clone();
         let (logits_buffer, sampling_buffer, output_buffer) = {
             let buffers = self
@@ -5519,7 +5586,7 @@ impl MetalBackend {
             sampling_layout: &temporaries[SAMPLE_PARAMS_LAYOUT],
             width: &temporaries[SAMPLE_WIDTH],
         };
-        for round in 0..sample_rejection_rounds() {
+        for round in 0..sample_rejection_rounds(params.rejection_rounds) {
             let round_buffer = &temporaries[SAMPLE_ROUND_ARGUMENTS
                 + usize::try_from(round).map_err(|_| BackendError::ExecutionFailed)?];
             encode_dispatch_barrier(encoder);
@@ -5656,7 +5723,7 @@ impl MetalBackend {
         encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
         table: &ProtocolObject<dyn MTL4ArgumentTable>,
         dispatch: &Dispatch,
-        position: u32,
+        params: SampleKernelParams,
         bindings: &mut ArgumentBindings,
         arguments: &mut ArgumentWriter,
     ) -> Result<EncodedEmbed, BackendError> {
@@ -5671,17 +5738,22 @@ impl MetalBackend {
             .ok_or(BackendError::InvalidInput)?;
         let rows = u32::try_from(output.layout().element_count())
             .map_err(|_| BackendError::ExecutionFailed)?;
-        let chunks = width.div_ceil(ARGMAX_CHUNK_WIDTH);
-        let partials = self.scratch_tensor(DType::U32, &[rows, chunks, 46])?;
+        let chunks = width.div_ceil(params.chunk_width);
+        let partial_words = params
+            .fast_top_k
+            .checked_add(3)
+            .and_then(|values| values.checked_mul(2))
+            .ok_or(BackendError::InvalidInput)?;
+        let partials = self.scratch_tensor(DType::U32, &[rows, chunks, partial_words])?;
         let (partials_pipeline, finalize_pipeline) = {
             let mut pipelines = self
                 .pipelines
                 .lock()
                 .map_err(|_| BackendError::ExecutionFailed)?;
-            let dtype = [(0, dtype_code(logits.layout().dtype()))];
+            let constants = params.function_constants(dtype_code(logits.layout().dtype()));
             (
-                pipelines.get("sample_masked_partials", &dtype)?,
-                pipelines.get("sample_masked_finalize", &dtype)?,
+                pipelines.get("sample_masked_partials", &constants)?,
+                pipelines.get("sample_masked_finalize", &constants)?,
             )
         };
         let mut temporaries = vec![arguments.write(&[0_u8; 8])?];
@@ -5694,7 +5766,7 @@ impl MetalBackend {
             temporaries.push(Self::layout_buffer(layout, arguments)?);
         }
         temporaries.push(arguments.write(&width.to_ne_bytes())?);
-        temporaries.push(arguments.write(&position.to_ne_bytes())?);
+        temporaries.push(arguments.write(&params.position.to_ne_bytes())?);
         temporaries.push(arguments.write(&chunks.to_ne_bytes())?);
         let error_flag = temporaries[0].clone();
         let (logits_buffer, sampling_buffer, allow_buffer, output_buffer) = {
@@ -5970,8 +6042,24 @@ impl MetalBackend {
             Op::TopK { .. } => {
                 Self::size_top_k_arguments(dispatch, arguments)?;
             }
-            Op::Sample { position } => {
-                Self::write_sample_arguments(dispatch, position, arguments)?;
+            Op::Sample {
+                position,
+                chunk_width,
+                fast_top_k,
+                fast_max_chunks,
+                rejection_rounds,
+            } => {
+                Self::write_sample_arguments(
+                    dispatch,
+                    SampleKernelParams {
+                        position,
+                        chunk_width,
+                        fast_top_k,
+                        fast_max_chunks,
+                        rejection_rounds,
+                    },
+                    arguments,
+                )?;
             }
             Op::SampleMasked { .. } => {
                 for len in [8, 112, 112, 112, 112, 4, 4, 4] {
@@ -7870,6 +7958,26 @@ mod tests {
         Op::Argmax { chunk_width: 2_048 }
     }
 
+    fn sample_op(position: u32) -> Op {
+        Op::Sample {
+            position,
+            chunk_width: 2_048,
+            fast_top_k: 20,
+            fast_max_chunks: 102,
+            rejection_rounds: 2,
+        }
+    }
+
+    fn sample_masked_op(position: u32) -> Op {
+        Op::SampleMasked {
+            position,
+            chunk_width: 2_048,
+            fast_top_k: 20,
+            fast_max_chunks: 102,
+            rejection_rounds: 2,
+        }
+    }
+
     fn symbolic_prefix(base: &Tensor, space: ParamSpace, len: Affine) -> TemplateTensor {
         let layout = SymbolicLayout::new(base.layout().clone(), space)
             .slice(0, 0.into(), len, 1)
@@ -8026,7 +8134,7 @@ mod tests {
         let output = backend.alloc(DType::U32, &[1])?;
         let mut commands = CommandList::new();
         commands
-            .dispatch(Op::Sample { position }, &[&input, &params], &output)
+            .dispatch(sample_op(position), &[&input, &params], &output)
             .map_err(|_| BackendError::InvalidInput)?;
         backend.submit(commands)?.wait()?;
         backend
@@ -8065,7 +8173,7 @@ mod tests {
         let mut commands = CommandList::new();
         commands
             .dispatch(
-                Op::SampleMasked { position },
+                sample_masked_op(position),
                 &[&input, &params, &mask],
                 &output,
             )
@@ -11461,7 +11569,7 @@ mod tests {
                 assert_backends_agree(
                     &CpuBackend::new(),
                     &MetalBackend::new().unwrap(),
-                    Op::Sample { position: 33 },
+                    sample_op(33),
                     &[
                         TensorSpec::contiguous(dtype, &[1, width]),
                         TensorSpec::initialized(DType::U32, &[5], params.clone()),
@@ -11486,10 +11594,27 @@ mod tests {
         assert_backends_agree(
             &CpuBackend::new(),
             &MetalBackend::new().unwrap(),
-            Op::Sample { position: 33 },
+            sample_op(33),
             &[
                 TensorSpec::initialized(DType::F32, &[1, 7], edges),
                 TensorSpec::initialized(DType::U32, &[5], params),
+            ],
+            &TensorSpec::contiguous(DType::U32, &[1]),
+        )
+        .unwrap();
+        assert_backends_agree(
+            &CpuBackend::new(),
+            &MetalBackend::new().unwrap(),
+            Op::Sample {
+                position: 33,
+                chunk_width: 1_024,
+                fast_top_k: 10,
+                fast_max_chunks: 100,
+                rejection_rounds: 1,
+            },
+            &[
+                TensorSpec::contiguous(DType::F32, &[1, 4_097]),
+                TensorSpec::initialized(DType::U32, &[5], sample_params(0.0, 0, 1.0, 7)),
             ],
             &TensorSpec::contiguous(DType::U32, &[1]),
         )
@@ -11627,7 +11752,7 @@ mod tests {
             for iteration in 0..23 {
                 let mut commands = CommandList::new();
                 commands
-                    .dispatch(Op::Sample { position: 511 }, &[&input, &params], &output)
+                    .dispatch(sample_op(511), &[&input, &params], &output)
                     .unwrap();
                 let submission = backend.submit_profiled(commands).unwrap();
                 submission.wait().unwrap();
@@ -11681,7 +11806,7 @@ mod tests {
                     assert_backends_agree(
                         &reference,
                         &candidate,
-                        Op::SampleMasked { position },
+                        sample_masked_op(position),
                         &[
                             TensorSpec::initialized(DType::F32, &[1, 33], logits.clone()),
                             TensorSpec::initialized(
@@ -11697,6 +11822,31 @@ mod tests {
                 }
             }
         }
+
+        let mut allow = vec![u32::MAX; 129];
+        allow[128] = 1;
+        assert_backends_agree(
+            &reference,
+            &candidate,
+            Op::SampleMasked {
+                position: 33,
+                chunk_width: 1_024,
+                fast_top_k: 10,
+                fast_max_chunks: 100,
+                rejection_rounds: 1,
+            },
+            &[
+                TensorSpec::contiguous(DType::F32, &[1, 4_097]),
+                TensorSpec::initialized(DType::U32, &[5], sample_params(0.7, 10, 0.9, 0xfeed_beef)),
+                TensorSpec::initialized(
+                    DType::U32,
+                    &[129],
+                    allow.into_iter().flat_map(u32::to_le_bytes).collect(),
+                ),
+            ],
+            &TensorSpec::contiguous(DType::U32, &[1]),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -11797,12 +11947,9 @@ mod tests {
             timings.sort_unstable();
             timings[timings.len() / 2]
         };
-        let ordinary = measure(Op::Sample { position: 511 }, &[&logits, &params]);
+        let ordinary = measure(sample_op(511), &[&logits, &params]);
         for (name, mask) in [("sparse", &sparse), ("dense", &dense)] {
-            let masked = measure(
-                Op::SampleMasked { position: 511 },
-                &[&logits, &params, mask],
-            );
+            let masked = measure(sample_masked_op(511), &[&logits, &params, mask]);
             eprintln!("sample width {width} masked {name}: {masked:?}, ordinary {ordinary:?}");
             assert!(masked.as_secs_f64() <= ordinary.as_secs_f64() * 1.5);
         }

@@ -99,9 +99,17 @@ pub(crate) enum Op {
     },
     Sample {
         position: Affine,
+        chunk_width: u32,
+        fast_top_k: u32,
+        fast_max_chunks: u32,
+        rejection_rounds: u32,
     },
     SampleMasked {
         position: Affine,
+        chunk_width: u32,
+        fast_top_k: u32,
+        fast_max_chunks: u32,
+        rejection_rounds: u32,
     },
     Rope(f32),
     Embed,
@@ -626,11 +634,31 @@ pub(crate) mod guest {
                 normalize,
                 chunk_width,
             }),
-            Op::Sample { position } => compute::Op::Sample(compute::SampleCfg {
+            Op::Sample {
+                position,
+                chunk_width,
+                fast_top_k,
+                fast_max_chunks,
+                rejection_rounds,
+            } => compute::Op::Sample(compute::SampleCfg {
                 position: wit_affine(position),
+                chunk_width,
+                fast_top_k,
+                fast_max_chunks,
+                rejection_rounds,
             }),
-            Op::SampleMasked { position } => compute::Op::SampleMasked(compute::SampleCfg {
+            Op::SampleMasked {
+                position,
+                chunk_width,
+                fast_top_k,
+                fast_max_chunks,
+                rejection_rounds,
+            } => compute::Op::SampleMasked(compute::SampleCfg {
                 position: wit_affine(position),
+                chunk_width,
+                fast_top_k,
+                fast_max_chunks,
+                rejection_rounds,
             }),
             Op::Rope(theta) => compute::Op::Rope(compute::RopeCfg { theta }),
             Op::Embed => compute::Op::Embed,
@@ -1391,11 +1419,31 @@ pub(crate) mod native {
                 normalize,
                 chunk_width,
             },
-            Op::Sample { position } => CoreOp::Sample {
+            Op::Sample {
+                position,
+                chunk_width,
+                fast_top_k,
+                fast_max_chunks,
+                rejection_rounds,
+            } => CoreOp::Sample {
                 position: position.offset,
+                chunk_width,
+                fast_top_k,
+                fast_max_chunks,
+                rejection_rounds,
             },
-            Op::SampleMasked { position } => CoreOp::SampleMasked {
+            Op::SampleMasked {
+                position,
+                chunk_width,
+                fast_top_k,
+                fast_max_chunks,
+                rejection_rounds,
+            } => CoreOp::SampleMasked {
                 position: position.offset,
+                chunk_width,
+                fast_top_k,
+                fast_max_chunks,
+                rejection_rounds,
             },
             Op::Rope(theta) => CoreOp::Rope { theta },
             Op::Embed => CoreOp::Embed,

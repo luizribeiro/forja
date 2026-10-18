@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: MIT
 
 constant uint reduction_chunk_width [[function_constant(17)]];
+constant uint sample_fast_topk [[function_constant(18)]];
+constant uint sample_fast_max_chunks [[function_constant(19)]];
 
 kernel void hold(device uchar *buffer [[buffer(0)]], uint index [[thread_position_in_grid]]) {
     if (index == 0) {
@@ -747,7 +749,6 @@ constant uint sample_proposal = 5;
 constant uint sample_maximum = 6;
 constant uint sample_state_words = 7;
 // Partial and threadgroup workspaces bound fast refinement; larger top-k values use the exact fallback.
-constant uint sample_fast_topk = 20;
 constant uint sample_pending = 0;
 constant uint sample_accepted = 1;
 constant uint sample_exact = 2;
@@ -816,7 +817,9 @@ float sample_masked_sum(
     return partials[0];
 }
 
-constant uint sample_masked_stride = 23;
+uint sample_masked_stride() {
+    return 3u + sample_fast_topk;
+}
 
 kernel void sample_masked_partials(
     device const uchar *logits [[buffer(0)]],
@@ -841,10 +844,11 @@ kernel void sample_masked_partials(
     SamplingConfig config = sampling_config(sampling, sampling_layout);
     uint row = group / chunks;
     uint chunk = group % chunks;
-    uint first = chunk * 2048u;
-    uint end = first + min(2048u, width - first);
+    uint first = chunk * reduction_chunk_width;
+    uint end = first + min(reduction_chunk_width, width - first);
     bool fast_ranked = !sampling_is_greedy(config) && config.top_k != 0u &&
-                       config.top_k <= sample_fast_topk;
+                       config.top_k <= sample_fast_topk &&
+                       chunks <= sample_fast_max_chunks;
     ulong maximum = 0;
     ulong sampled = 0;
     uint allowed_count = 0;
@@ -873,7 +877,7 @@ kernel void sample_masked_partials(
         sampled, simd_lane, simd_group, partial_keys, partial_indices);
     allowed_count = sample_masked_sum(
         allowed_count, lane, simd_lane, simd_group, partial_counts);
-    uint base = (row * chunks + chunk) * sample_masked_stride;
+    uint base = (row * chunks + chunk) * sample_masked_stride();
     if (lane == 0) {
         partials[base] = maximum;
         partials[base + 1] = sampled;
@@ -953,7 +957,7 @@ kernel void sample_masked_finalize(
     ulong sampled = 0;
     uint allowed_count = 0;
     for (uint chunk = lane; chunk < chunks; chunk += group_width) {
-        uint base = (row * chunks + chunk) * sample_masked_stride;
+        uint base = (row * chunks + chunk) * sample_masked_stride();
         maximum = max(maximum, partials[base]);
         sampled = max(sampled, partials[base + 1]);
         allowed_count += uint(partials[base + 2]);
@@ -990,7 +994,8 @@ kernel void sample_masked_finalize(
         }
         return;
     }
-    if (config.top_k != 0u && config.top_k <= sample_fast_topk) {
+    if (config.top_k != 0u && config.top_k <= sample_fast_topk &&
+        chunks <= sample_fast_max_chunks) {
         ulong local_top[8] = {0, 0, 0, 0, 0, 0, 0, 0};
         uint local_slot = 0;
         uint partial_count = chunks * sample_fast_topk;
@@ -998,9 +1003,9 @@ kernel void sample_masked_finalize(
             uint chunk = slot / sample_fast_topk;
             uint rank = slot % sample_fast_topk;
             uint chunk_count = uint(
-                partials[(row * chunks + chunk) * sample_masked_stride + 2]);
+                partials[(row * chunks + chunk) * sample_masked_stride() + 2]);
             local_top[local_slot++] = rank < min(chunk_count, sample_fast_topk)
-                ? partials[(row * chunks + chunk) * sample_masked_stride + 3 + rank]
+                ? partials[(row * chunks + chunk) * sample_masked_stride() + 3 + rank]
                 : 0;
         }
         sort_eight_candidates_descending(local_top);
@@ -1276,8 +1281,8 @@ kernel void sample_rejection_proposal_partials(
     threadgroup uint partial_indices[32];
     SamplingConfig config = sampling_config(sampling, sampling_layout);
     uint chunk = group % chunks;
-    uint first = chunk * 2048u;
-    uint end = first + min(2048u, width - first);
+    uint first = chunk * reduction_chunk_width;
+    uint end = first + min(reduction_chunk_width, width - first);
     ulong proposal = 0;
     ulong maximum = 0;
     for (uint column = first + lane; column < end; column += group_width) {
@@ -1372,8 +1377,8 @@ kernel void sample_rejection_threshold_partials(
         logits, physical_index(logits_layout, row * width + maximum), input0_dtype);
     ulong candidate_order = argmax_candidate(candidate_value, candidate);
     uint chunk = group % chunks;
-    uint first = chunk * 2048u;
-    uint end = first + min(2048u, width - first);
+    uint first = chunk * reduction_chunk_width;
+    uint end = first + min(reduction_chunk_width, width - first);
     uint count = 0;
     float total = 0.0f;
     float prefix = 0.0f;
@@ -1488,7 +1493,8 @@ kernel void sample_rejection_threshold_finalize(
             state + row * sample_state_words + sample_status,
             sample_accepted, memory_order_relaxed);
     } else if (!decided || round + 1 >= max_rounds) {
-        uint status = config.top_k != 0 && config.top_k <= sample_fast_topk && chunks <= 102
+        uint status = config.top_k != 0 && config.top_k <= sample_fast_topk &&
+                              chunks <= sample_fast_max_chunks
             ? sample_refine
             : sample_exact;
         atomic_store_explicit(
@@ -1523,8 +1529,8 @@ kernel void sample_topk_partials(
     }
     threadgroup ulong simd_top[160];
     uint chunk = group % chunks;
-    uint first = chunk * 2048u;
-    uint end = first + min(2048u, width - first);
+    uint first = chunk * reduction_chunk_width;
+    uint end = first + min(reduction_chunk_width, width - first);
     ulong local_top[8] = {0, 0, 0, 0, 0, 0, 0, 0};
     for (uint column = first + lane; column < end; column += group_width) {
         float value = load_float(
@@ -1919,12 +1925,12 @@ kernel void sample_radix_histogram(
         return;
     }
     uint chunk = group % chunks;
-    uint first = chunk * 2048u;
-    uint end = first + min(2048u, width - first);
+    uint first = chunk * reduction_chunk_width;
+    uint end = first + min(reduction_chunk_width, width - first);
     uint prefix = atomic_load_explicit(
         state + row * sample_state_words + sample_prefix, memory_order_relaxed);
     uint high_mask = shift == 21 ? 0 : ~0u << (shift + (shift == 0 ? 10 : 11));
-    for (uint offset = 0; offset < 2048; offset += group_width) {
+    for (uint offset = 0; offset < reduction_chunk_width; offset += group_width) {
         uint column = first + lane + offset;
         bool valid = column < end;
         uint key = valid
@@ -2006,11 +2012,11 @@ kernel void sample_index_histogram(
         return;
     }
     uint chunk = group % chunks;
-    uint first = chunk * 2048u;
-    uint end = first + min(2048u, width - first);
+    uint first = chunk * reduction_chunk_width;
+    uint end = first + min(reduction_chunk_width, width - first);
     uint threshold = atomic_load_explicit(
         state + row * sample_state_words + sample_prefix, memory_order_relaxed);
-    for (uint offset = 0; offset < 2048; offset += group_width) {
+    for (uint offset = 0; offset < reduction_chunk_width; offset += group_width) {
         uint column = first + lane + offset;
         bool valid = column < end;
         uint key = valid
@@ -2088,8 +2094,8 @@ kernel void sample_compact(
         return;
     }
     uint chunk = group % chunks;
-    uint first = chunk * 2048u;
-    uint end = first + min(2048u, width - first);
+    uint first = chunk * reduction_chunk_width;
+    uint end = first + min(reduction_chunk_width, width - first);
     bool filter = sampling_needs_radix(config, width);
     uint threshold = atomic_load_explicit(
         state + row * sample_state_words + sample_prefix, memory_order_relaxed);
@@ -2133,8 +2139,8 @@ kernel void sample_partials(
     threadgroup uint partial_keys[32];
     threadgroup uint partial_indices[32];
     uint chunk = group % chunks;
-    uint first = chunk * 2048u;
-    uint end = first + min(2048u, width - first);
+    uint first = chunk * reduction_chunk_width;
+    uint end = first + min(reduction_chunk_width, width - first);
     bool greedy = sampling_is_greedy(config);
     bool filter = !greedy && sampling_needs_radix(config, width);
     uint threshold = atomic_load_explicit(
