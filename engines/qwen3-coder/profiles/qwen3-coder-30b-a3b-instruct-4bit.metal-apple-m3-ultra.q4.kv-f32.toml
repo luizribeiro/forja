@@ -43,6 +43,7 @@ prefill-chunk = 2048
 "moe.combine-small" = "matmul.steel-64x32x32-2x2"
 "moe.combine-large" = "matmul.steel-64x64x16-2x2"
 "top-k" = "top-k.single-k8"
+"sample" = "sample.parallel"
 "attention.prefill-small" = "sdpa.decomposed"
 
 [variants.rules."attention.decode"]
