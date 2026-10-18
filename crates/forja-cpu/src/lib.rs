@@ -1395,6 +1395,9 @@ fn truncate_top_p(
 }
 
 fn sampled_score(logit: f32, parameters: SamplingParameters, position: u32, index: usize) -> f32 {
+    if !logit.is_finite() {
+        return logit;
+    }
     let index = u64::try_from(index).unwrap_or(u64::MAX);
     let counter = parameters.seed ^ (u64::from(position) << 32) ^ index;
     let random = splitmix64(counter);

@@ -696,6 +696,17 @@ struct SamplingConfig {
     ulong seed;
 };
 
+float sample_score(
+    float value,
+    SamplingConfig config,
+    uint position,
+    uint round,
+    uint index) {
+    return isfinite(value)
+        ? value / config.temperature + gumbel_noise(config.seed, position, round, index)
+        : value;
+}
+
 SamplingConfig sampling_config(
     device const uint *sampling,
     constant TensorLayout &layout) {
@@ -868,8 +879,7 @@ kernel void sample_masked_partials(
             maximum = max(maximum, argmax_candidate(value, column));
             if (!sampling_is_greedy(config) && !fast_ranked && config.top_p == 1.0f &&
                 config.top_k == 0u) {
-                float score = value / config.temperature +
-                              gumbel_noise(config.seed, position, 0u, column);
+                float score = sample_score(value, config, position, 0u, column);
                 sampled = max(sampled, argmax_candidate(score, column));
             }
             if (fast_ranked) {
@@ -1083,8 +1093,7 @@ kernel void sample_masked_finalize(
         for (uint slot = lane; slot < keep; slot += group_width) {
             uint column = uint(ordered[slot]);
             float value = total_order_value(uint(ordered[slot] >> 32));
-            float score = value / config.temperature +
-                          gumbel_noise(config.seed, position, 0u, column);
+            float score = sample_score(value, config, position, 0u, column);
             best = max(best, argmax_candidate(score, column));
         }
         best = argmax_threadgroup_max(
@@ -1190,8 +1199,7 @@ kernel void sample_masked_finalize(
             logits, physical_index(logits_layout, row * width + column), input0_dtype);
         ulong candidate = argmax_candidate(value, column);
         if (candidate >= topk_boundary && candidate >= probability_boundary) {
-            float score = value / config.temperature +
-                          gumbel_noise(config.seed, position, 0u, column);
+            float score = sample_score(value, config, position, 0u, column);
             best = max(best, argmax_candidate(score, column));
         }
     }
@@ -1299,8 +1307,7 @@ kernel void sample_rejection_proposal_partials(
     for (uint column = first + lane; column < end; column += group_width) {
         float value = load_float(
             logits, physical_index(logits_layout, row * width + column), input0_dtype);
-        float score = value / config.temperature +
-                      gumbel_noise(config.seed, position, round, column);
+        float score = sample_score(value, config, position, round, column);
         proposal = max(proposal, argmax_candidate(score, column));
         maximum = max(maximum, argmax_candidate(value, column));
     }
@@ -1679,8 +1686,7 @@ kernel void sample_topk_finalize(
     for (uint slot = lane; slot < keep; slot += group_width) {
         uint column = uint(ordered[slot]);
         float value = total_order_value(uint(ordered[slot] >> 32));
-        float score = value / config.temperature +
-                      gumbel_noise(config.seed, position, max_rounds, column);
+        float score = sample_score(value, config, position, max_rounds, column);
         best = max(best, argmax_candidate(score, column));
     }
     if (lane < 32) {
@@ -1823,8 +1829,7 @@ kernel void sample_exact_fallback(
                 logits, physical_index(logits_layout, row * width + column), input0_dtype);
             uint key = total_order_key(value);
             if (count == width || key > prefix || (key == prefix && column >= cutoff)) {
-                float score = value / config.temperature +
-                              gumbel_noise(config.seed, position, max_rounds, column);
+                float score = sample_score(value, config, position, max_rounds, column);
                 best = max(best, argmax_candidate(score, column));
             }
         }
@@ -1903,8 +1908,7 @@ kernel void sample_exact_fallback(
         uint column = uint(ordered[slot]);
         float value = load_float(
             logits, physical_index(logits_layout, row * width + column), input0_dtype);
-        float score = value / config.temperature +
-                      gumbel_noise(config.seed, position, max_rounds, column);
+        float score = sample_score(value, config, position, max_rounds, column);
         best = max(best, argmax_candidate(score, column));
     }
     best = argmax_threadgroup_max(
@@ -2168,8 +2172,7 @@ kernel void sample_partials(
                 best = max(best, (ulong(key) << 32) | ulong(column));
             } else if (!filter || key > threshold || (key == threshold && column >= cutoff)) {
                 uint round = sampling_needs_rejection(config, width) ? max_rounds : 0;
-                float score = value / config.temperature +
-                              gumbel_noise(config.seed, position, round, column);
+                float score = sample_score(value, config, position, round, column);
                 best = max(best, argmax_candidate(score, column));
             }
         }
@@ -2300,8 +2303,7 @@ kernel void sample_candidates_finalize(
         uint column = uint(ordered[slot]);
         float value = load_float(
             logits, physical_index(logits_layout, row * width + column), input0_dtype);
-        float score = value / config.temperature +
-                      gumbel_noise(config.seed, position, max_rounds, column);
+        float score = sample_score(value, config, position, max_rounds, column);
         best = max(best, argmax_candidate(score, column));
     }
     best = argmax_threadgroup_max(

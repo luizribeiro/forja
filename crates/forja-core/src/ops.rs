@@ -166,6 +166,9 @@ pub enum Op {
     },
     /// Samples one index from each row using counter-based randomness.
     ///
+    /// Non-finite logits retain their IEEE total order and bypass temperature and random-noise
+    /// arithmetic.
+    ///
     /// A seed reproduces tokens for the same forja build, backend, and kernel variant. Tokens are
     /// not guaranteed to match across builds, backends, or variants.
     Sample {
@@ -181,6 +184,9 @@ pub enum Op {
         rejection_rounds: u32,
     },
     /// Samples one permitted index from each row using counter-based randomness.
+    ///
+    /// Non-finite logits retain their IEEE total order and bypass temperature and random-noise
+    /// arithmetic.
     SampleMasked {
         /// Absolute sequence position mixed into the random counter.
         position: u32,

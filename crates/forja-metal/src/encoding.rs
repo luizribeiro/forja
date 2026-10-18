@@ -12308,6 +12308,79 @@ mod tests {
     }
 
     #[test]
+    fn metal_sampling_variants_match_cpu_for_non_finite_logits() {
+        let reference = CpuBackend::new();
+        let candidate = MetalBackend::new().unwrap();
+        let mut values = (0_u16..33)
+            .map(|index| f32::from(index) / 8.0 - 2.0)
+            .collect::<Vec<_>>();
+        values[3] = f32::NEG_INFINITY;
+        values[7] = f32::INFINITY;
+        values[11] = f32::NAN;
+        values[17] = f32::from_bits(0xffc0_0001);
+        let logits = values
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>();
+        let allow = [0x000a_088a, 1];
+        for (temperature, top_k, top_p) in [(0.0, 0, 1.0), (0.6, 20, 0.95), (0.7, 0, 1.0)] {
+            let expected = run_sample(
+                &reference,
+                &logits,
+                33,
+                temperature,
+                top_k,
+                top_p,
+                0xfeed_beef_dead_cafe,
+                33,
+            )
+            .unwrap();
+            for variant in ["sample.portable", "sample.parallel"] {
+                let actual = run_metal_sample(
+                    &candidate,
+                    DType::F32,
+                    &logits,
+                    33,
+                    temperature,
+                    top_k,
+                    top_p,
+                    0xfeed_beef_dead_cafe,
+                    33,
+                    variant,
+                )
+                .unwrap();
+                assert_eq!(actual, expected, "variant={variant}");
+            }
+
+            let expected = run_masked_sample(
+                &reference,
+                &logits,
+                33,
+                &allow,
+                temperature,
+                top_k,
+                top_p,
+                0xfeed_beef_dead_cafe,
+                33,
+            )
+            .unwrap();
+            let actual = run_masked_sample(
+                &candidate,
+                &logits,
+                33,
+                &allow,
+                temperature,
+                top_k,
+                top_p,
+                0xfeed_beef_dead_cafe,
+                33,
+            )
+            .unwrap();
+            assert_eq!(actual, expected, "masked sample");
+        }
+    }
+
+    #[test]
     fn metal_parallel_and_masked_sample_track_ordinary_sample_gpu_time() {
         let backend = MetalBackend::new().unwrap();
         let width = 151_936_u32;
