@@ -246,14 +246,16 @@ def main() -> None:
                 model,
                 tokenizer,
                 prompt,
-                max_tokens=2,
+                max_tokens=tg + 2,
                 prefill_step_size=2048,
                 sampler=sampler,
             )
         )
         next(responses)
-        started = time.perf_counter()
         next(responses)
+        started = time.perf_counter()
+        for _ in range(tg):
+            next(responses)
         return time.perf_counter() - started
 
     for _ in range(bench["warmups"]):
@@ -266,14 +268,16 @@ def main() -> None:
         tg_times.append(tg_trial())
     context_times = []
     for context in bench["contexts"]:
-        for _ in range(bench["warmups"]):
-            context_trial(context)
+        if context == decode_prefill + 1:
+            times = tg_times
+        else:
+            for _ in range(bench["warmups"]):
+                context_trial(context)
+            times = [context_trial(context) for _ in range(bench["reps"])]
         context_times.append(
             {
                 "context_start": context,
-                "token_generation": summary(
-                    1, [context_trial(context) for _ in range(bench["reps"])]
-                ),
+                "token_generation": summary(tg, times),
             }
         )
     repository = Path(__file__).resolve().parents[2]
@@ -286,7 +290,7 @@ def main() -> None:
             **bench,
             "selection": ["gpu-pipelined"],
             "sampling": sampling,
-            "breakdown": True,
+            "breakdown": False,
             "vary": {},
         },
         "tg_context_start": decode_prefill + 1,

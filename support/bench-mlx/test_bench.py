@@ -109,6 +109,10 @@ class SuiteTests(unittest.TestCase):
                 [result["context_start"] for result in contexts],
                 [9, 512, 2048, 4000],
             )
+            self.assertEqual(
+                contexts[0]["token_generation"],
+                report["results"][0]["token_generation"],
+            )
 
     def test_reads_the_committed_default_suite(self) -> None:
         path = Path(__file__).resolve().parents[2] / "bench/suites/default.toml"

@@ -17,7 +17,7 @@ def arguments() -> argparse.Namespace:
 
 def rate(report: dict[str, object], result: dict[str, object], metric: str) -> str:
     """Format a wall throughput median and confidence interval."""
-    field = metric if report.get("schema_version") == 2 else {
+    field = metric if report.get("schema_version", 1) >= 2 else {
         "pp": "prompt_processing",
         "tg": "token_generation",
     }[metric]
@@ -27,7 +27,7 @@ def rate(report: dict[str, object], result: dict[str, object], metric: str) -> s
 
 def settings(report: dict[str, object]) -> dict[str, object]:
     """Return benchmark settings from either record schema."""
-    if report.get("schema_version") == 2:
+    if report.get("schema_version", 1) >= 2:
         values = tomllib.loads(report["config"])["bench"]
     else:
         values = report["settings"].copy()
@@ -47,7 +47,7 @@ def settings(report: dict[str, object]) -> dict[str, object]:
 
 def engine(report: dict[str, object], result: dict[str, object]) -> str:
     """Return a path-free engine label from either record schema."""
-    if report.get("schema_version") == 2:
+    if report.get("schema_version", 1) >= 2:
         digest = report["inputs"][result["input"]]["engine_sha256"]
         return digest[:12]
     provenance = result["provenance"]
@@ -79,7 +79,15 @@ def main() -> None:
     print("\nimplementation\tengine\tcontext\ttg wall tok/s (95% CI)")
     for report in reports:
         for result in report["results"]:
-            if report.get("schema_version") == 2:
+            if report.get("schema_version", 1) >= 4:
+                contexts = [
+                    {
+                        "context_start": value["context_start"],
+                        "token_generation": value["tg"],
+                    }
+                    for value in result.get("context_token_generation", [])
+                ]
+            elif report.get("schema_version", 1) >= 2:
                 contexts = [
                     {
                         "context_start": value["context_start"],
