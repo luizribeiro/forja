@@ -3,11 +3,23 @@ use std::{collections::BTreeMap, num::NonZeroU32};
 use serde::{Deserialize, Deserializer, Serialize, de};
 use sha2::{Digest, Sha256};
 
+/// Prevents duplicate-checking work from growing with untrusted input; 64 exceeds the intended
+/// number of independently named tuning sets.
 const MAX_DEFAULT_TUNINGS: usize = 64;
+/// Prevents unbounded build-feature allocation; 64 is well above the feature count of supported
+/// engine builds.
 const MAX_BUILD_FEATURES: usize = 64;
+/// Bounds lookup and hashing work for fixed selections; 1,024 covers every operation site in the
+/// current engine families with substantial headroom.
 const MAX_FIXED_PICKS: usize = 1_024;
+/// Bounds proof work for parameterized selections; 1,024 matches the fixed-selection budget and
+/// prevents a profile from multiplying validation cost.
 const MAX_VARIANT_RULES: usize = 1_024;
+/// Bounds alternatives examined for one tuning; 64 permits broad experiments without allowing a
+/// single tuning to dominate validation.
 const MAX_TUNING_VARIANTS: usize = 64;
+/// Prevents identifier-driven allocation and diagnostic growth; 64 bytes accommodates readable
+/// model, tuning, and operation names.
 const MAX_NAME_BYTES: usize = 64;
 
 /// A validated engine build profile.

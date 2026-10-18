@@ -4,9 +4,13 @@ use forja_core::{Backend, BackendError, CommandList, DType, Op, Submission};
 
 use crate::MetalBackend;
 
+/// Caps the temporary device allocation while keeping the probe larger than cache.
 const STREAM_BYTES: u64 = 512 * 1024 * 1024;
+/// Splits the probe into enough rows to expose parallel streaming throughput.
 const ROWS: u32 = 256;
+/// Discards cold pipeline and allocation effects before measurement.
 const WARMUPS: usize = 3;
+/// Bounds probe time while permitting a stable median.
 const SAMPLES: usize = 9;
 
 /// Sustained device-memory rates from large streaming kernels.

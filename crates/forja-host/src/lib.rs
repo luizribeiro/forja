@@ -39,7 +39,9 @@ use wasmtime::component::{Accessor, Component, HasData, Linker, Resource, Resour
 use wasmtime::{Config, Engine, Store, StoreLimits, StoreLimitsBuilder, Trap};
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
+/// Caps guest-controlled allocation for a backend variant name.
 const MAX_VARIANT_NAME_BYTES: usize = 64;
+/// Caps validation and replay work for one guest-provided variant rule.
 const MAX_VARIANT_RULE_ARMS: usize = 64;
 
 pub use native::{NativeCommandList, NativeEpilogue, NativeHost, NativeKernel, NativeTensor};
@@ -502,6 +504,7 @@ pub struct EngineRunner<B: Backend + Send + Sync + 'static> {
 type EngineCallFuture<'a, T> =
     Pin<Box<dyn Future<Output = wasmtime::Result<Result<T, compute::Error>>> + Send + 'a>>;
 
+/// Bounds timeout-check latency without dedicating a thread to each store.
 const EPOCH_TICK: Duration = Duration::from_millis(10);
 static EPOCH_ENGINES: Mutex<Vec<EpochEngine>> = Mutex::new(Vec::new());
 static EPOCH_TICKER: OnceLock<()> = OnceLock::new();

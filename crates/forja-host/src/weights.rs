@@ -14,8 +14,14 @@ use serde::{
 };
 use serde_json::Value;
 
+/// Prevents the safetensors length prefix from forcing an arbitrary allocation; 100 MiB admits
+/// very large tensor maps while remaining small relative to supported model weights.
 const MAX_HEADER_BYTES: u64 = 100 * 1024 * 1024;
+/// Prevents a sharded-model index from consuming arbitrary host memory; 100 MiB matches the header
+/// budget because both describe the same tensor population.
 const MAX_INDEX_BYTES: u64 = 100 * 1024 * 1024;
+/// Prevents a model from retaining unbounded files and mappings; 1,024 shards is far beyond the
+/// supported profiles while fitting ordinary descriptor limits.
 const MAX_SHARDS: usize = 1_024;
 
 /// Metadata for one tensor in a weight source.

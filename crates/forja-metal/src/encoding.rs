@@ -1695,6 +1695,7 @@ pub(super) struct InFlightTracker {
 }
 
 // The host permits two overlapping replays per graph; two extra slots keep unrelated work moving.
+/// Caps retained command resources while permitting CPU/GPU overlap.
 const MAX_IN_FLIGHT_SUBMISSIONS: usize = 4;
 
 impl InFlightTracker {

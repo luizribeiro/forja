@@ -6,6 +6,8 @@ use crate::Profile;
 
 const PROFILE_SECTION: &str = "forja.profile.v1";
 const PROFILE_SECTION_PREFIX: &str = "forja.profile.";
+/// Prevents an embedded custom section from forcing a large allocation; 1 MiB leaves ample room
+/// for profiles with extensive variant tables.
 const MAX_PROFILE_BYTES: usize = 1024 * 1024;
 
 /// A failure to encode or read an embedded engine profile.

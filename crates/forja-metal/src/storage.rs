@@ -183,6 +183,8 @@ struct BufferPool {
     residency: PoolResidency,
 }
 
+/// Prevents captured graphs from retaining unbounded transient storage; two arenas permit one
+/// replay to overlap its immediate successor.
 pub(super) const GRAPH_ARENA_DEPTH: usize = 2;
 
 struct GraphArenaSlot {

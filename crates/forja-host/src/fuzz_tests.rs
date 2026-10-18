@@ -24,9 +24,13 @@ use compute::{Binop as WitBinOp, Redop as WitRedOp, Unop as WitUnOp, ValueType a
 
 static NEXT_PROGRAM_WEIGHT: AtomicU64 = AtomicU64::new(0);
 
+/// Keeps a generated operation within the 60-second fuzz-test deadline; 8 MiB covers one million
+/// low-precision elements plus command scratch.
 const FUZZ_LIMITS: Limits = Limits::new(8 * 1024 * 1024, 8, 1_000_000, 128, 8 * 1024 * 1024)
     .with_command_limits(16, 1_000_000_000)
     .with_gpu_limits(Duration::from_secs(60), Duration::MAX);
+/// Keeps replay fuzzing within the same deadline; 64 MiB allows the eight-operation graph corpus
+/// to retain intermediate tensors without admitting unbounded plans.
 const GRAPH_FUZZ_LIMITS: Limits = Limits::new(64 * 1024 * 1024, 8, 1_000_000, 128, 8 * 1024 * 1024)
     .with_command_limits(16, 1_000_000_000)
     .with_gpu_limits(Duration::from_secs(60), Duration::MAX);

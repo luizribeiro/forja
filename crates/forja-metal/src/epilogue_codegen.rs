@@ -7,6 +7,8 @@ use forja_core::{
 
 use crate::scalar_codegen;
 
+/// Prevents generated argument tables from exceeding the encoder's reserved slots; seven matches
+/// the largest supported fused epilogue signature.
 pub(super) const EXTRA_CAPACITY: usize = 7;
 const IDENTITY_HELPER: &str = r"inline float forja_epilogue(
     float accumulator0,

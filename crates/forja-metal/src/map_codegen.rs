@@ -9,6 +9,8 @@ use crate::scalar_codegen;
 
 pub(super) const KERNEL_NAME: &str = "forja_map";
 pub(super) const ROW_KERNEL_NAME: &str = "forja_row";
+/// Prevents wide rows from exhausting per-thread registers across a reduction; 1,024 is the
+/// largest resident width before code generation switches to rereading inputs.
 pub(super) const REGISTER_RESIDENT_WIDTH: u32 = 1024;
 pub(super) const SHARED_HEADER: &str = include_str!("elementwise.metal");
 
