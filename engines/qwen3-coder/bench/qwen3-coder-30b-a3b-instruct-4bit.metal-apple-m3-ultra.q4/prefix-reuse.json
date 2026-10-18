@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
   "implementation": "forja",
-  "measured_at": "2026-10-17T20:12:27Z",
-  "source_commit": "afad24ae961f9e60d16bd3b05c3f75d8ac3f5701",
+  "measured_at": "2026-10-18T01:15:56Z",
+  "source_commit": "74d1a96fc7a9a85d407c3f78999d95eea4a80003",
   "machine": {
     "device": "Apple M3 Ultra",
     "gpu_cores": 80,
@@ -11,7 +11,7 @@
   "model": {
     "id": "mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit",
     "revision": "6e302ea604ad9ab206367e2c501d1571023e7b6d",
-    "engine_sha256": "7cf6ac2eaf0df8dbf2812cdcaebbff1d6c07361b2ea6d8091c02e7664eac1394"
+    "engine_sha256": "0a631d7c6ceefb9d48938f661f727ca3a1e4125318f93170b3ebf116c2515b31"
   },
   "workload": {
     "path": "forja serve /v1/chat/completions over HTTP",
@@ -36,20 +36,20 @@
   },
   "results": {
     "cached_ttft_us": {
-      "p50": 142945,
-      "p90": 144191,
-      "p99": 147214
+      "p50": 143598,
+      "p90": 144816,
+      "p99": 146862
     },
     "cached_itl_us": {
-      "p50": 10955,
-      "p90": 11594,
-      "p99": 13675
+      "p50": 11015,
+      "p90": 11676,
+      "p99": 13660
     },
     "uncached_ttft_us": {
-      "p50": 1979091,
-      "p90": 1987551,
-      "p99": 2001419
+      "p50": 1746732,
+      "p90": 1753568,
+      "p99": 2002107
     },
-    "peak_rss_mib": 23054
+    "peak_rss_mib": 23123
   }
 }
