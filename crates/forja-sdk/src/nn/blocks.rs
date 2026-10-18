@@ -13,6 +13,7 @@ use super::ops::{sdpa, sdpa_into, sdpa_into_with};
 pub const DEFAULT_PREFILL_CHUNK: u32 = 512;
 
 const MIN_PREFILL_BUCKET: u32 = 16;
+const MAX_PREFILL_CHUNK: u32 = 2048;
 // Three decode paths, constrained selection, and the full prefill chunk need five leases;
 // three more remain free for overlap and future graph users, leaving eight exact tails.
 const DEFAULT_LIVE_GRAPH_BUDGET: usize = 16;
@@ -496,15 +497,15 @@ impl<T: Element> ChunkedPrefill<T> {
     ///
     /// # Errors
     ///
-    /// Returns an error unless `chunk` is a power of two from 16 through 512, or
+    /// Returns an error unless `chunk` is a power of two from 16 through 2048, or
     /// when a retained token buffer cannot be allocated.
     pub fn new(max_context: u32, chunk: u32) -> Result<Self> {
-        if !(MIN_PREFILL_BUCKET..=DEFAULT_PREFILL_CHUNK).contains(&chunk)
+        if !(MIN_PREFILL_BUCKET..=MAX_PREFILL_CHUNK).contains(&chunk)
             || !chunk.is_power_of_two()
             || chunk > max_context
         {
             return Err(Error::loading(
-                "prefill chunk must be a power of two from 16 through 512 within the context",
+                "prefill chunk must be a power of two from 16 through 2048 within the context",
             ));
         }
         Ok(Self {
@@ -1339,6 +1340,14 @@ mod tests {
                 "sequence {sequence}"
             );
         }
+    }
+
+    #[test]
+    fn prefill_plan_supports_large_replay_chunks() {
+        assert_eq!(
+            prefill_plan(4_097, MAX_PREFILL_CHUNK).unwrap(),
+            [(2_048, 2_048), (2_048, 2_048), (1, 1)]
+        );
     }
 
     #[test]
