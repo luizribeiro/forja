@@ -1273,6 +1273,7 @@ mod tests {
                 Op::TopK {
                     k,
                     normalize: false,
+                    chunk_width: 2_048,
                 },
                 &[&input],
                 &[&values, &indices],

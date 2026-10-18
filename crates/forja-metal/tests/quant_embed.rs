@@ -91,7 +91,9 @@ fn quantized_embedding_reports_a_gpu_produced_bad_id() {
         )
         .unwrap();
     let mut commands = CommandList::new();
-    commands.dispatch(Op::Argmax, &[&logits], &ids).unwrap();
+    commands
+        .dispatch(Op::Argmax { chunk_width: 2_048 }, &[&logits], &ids)
+        .unwrap();
     commands
         .dispatch(
             Op::QuantEmbed {

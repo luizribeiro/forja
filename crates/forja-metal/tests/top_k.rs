@@ -97,7 +97,15 @@ fn run<B: Backend>(
     let indices = backend.alloc(DType::U32, &[1, k]).unwrap();
     let mut commands = CommandList::new();
     commands
-        .dispatch_many(Op::TopK { k, normalize }, &[&input], &[&values, &indices])
+        .dispatch_many(
+            Op::TopK {
+                k,
+                normalize,
+                chunk_width: 2_048,
+            },
+            &[&input],
+            &[&values, &indices],
+        )
         .unwrap();
     let submission = backend.submit(commands).unwrap();
     submission.wait().unwrap();

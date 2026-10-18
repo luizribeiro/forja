@@ -4866,10 +4866,13 @@ fn core_op(operation: compute::Op) -> (TemplateOp, Option<Op>) {
     match operation {
         compute::Op::Copy => concrete_template(Op::Copy),
         compute::Op::RmsNorm(eps) => concrete_template(Op::RmsNorm { eps }),
-        compute::Op::Argmax => concrete_template(Op::Argmax),
+        compute::Op::Argmax(config) => concrete_template(Op::Argmax {
+            chunk_width: config.chunk_width,
+        }),
         compute::Op::TopK(config) => concrete_template(Op::TopK {
             k: config.k,
             normalize: config.normalize,
+            chunk_width: config.chunk_width,
         }),
         compute::Op::Sample(config) => {
             let position = core_affine(config.position);
@@ -7154,7 +7157,7 @@ mod tests {
                 (compute::Dtype::F32, vec![7, 1024]),
             ),
             (
-                compute::Op::Argmax,
+                compute::Op::Argmax(compute::ReductionCfg { chunk_width: 2_048 }),
                 vec![(compute::Dtype::F32, vec![7, 33])],
                 (compute::Dtype::U32, vec![7]),
             ),

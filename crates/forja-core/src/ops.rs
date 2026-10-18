@@ -149,7 +149,10 @@ pub enum Op {
     /// Selects the greatest element of each row under IEEE total order.
     ///
     /// Equal greatest values select the highest index.
-    Argmax,
+    Argmax {
+        /// Maximum number of row elements reduced by one partial workgroup.
+        chunk_width: u32,
+    },
     /// Selects the greatest elements of each row under IEEE total order.
     ///
     /// Results are sorted descending, with lower indices first for equal values.
@@ -158,6 +161,8 @@ pub enum Op {
         k: u32,
         /// Whether selected logits are softmax-normalized over the selected set.
         normalize: bool,
+        /// Maximum number of row elements selected by one partial workgroup.
+        chunk_width: u32,
     },
     /// Samples one index from each row using counter-based randomness.
     ///
@@ -294,6 +299,8 @@ pub enum OpError {
     InvalidQuantization,
     /// A top-k count is zero, exceeds the row width, or exceeds the supported limit.
     InvalidTopK,
+    /// An engine-selected kernel parameter is outside its documented safety bounds.
+    InvalidKernelParameter,
 }
 
 impl fmt::Display for OpError {
@@ -303,6 +310,13 @@ impl fmt::Display for OpError {
 }
 
 impl Error for OpError {}
+
+fn check_reduction_parameters(chunk_width: u32) -> Result<(), OpError> {
+    if chunk_width == 0 {
+        return Err(OpError::InvalidKernelParameter);
+    }
+    Ok(())
+}
 
 /// A dispatch whose signature and aliasing have been validated.
 #[derive(Clone)]
@@ -429,8 +443,14 @@ impl Dispatch {
             Op::Program(_) => return Err(OpError::ProgramRequiresBinding),
             Op::Copy => check_copy(inputs, output)?,
             Op::RmsNorm { eps } => check_rms_norm(inputs, output, eps)?,
-            Op::Argmax => check_argmax(inputs, output)?,
-            Op::TopK { k, .. } => check_top_k(inputs, outputs, k)?,
+            Op::Argmax { chunk_width } => {
+                check_reduction_parameters(chunk_width)?;
+                check_argmax(inputs, output)?;
+            }
+            Op::TopK { k, chunk_width, .. } => {
+                check_reduction_parameters(chunk_width)?;
+                check_top_k(inputs, outputs, k)?;
+            }
             Op::Sample { .. } => check_sample(inputs, output)?,
             Op::SampleMasked { .. } => check_sample_masked(inputs, output)?,
             Op::Rope { theta } => check_rope(inputs, output, theta)?,
@@ -1831,6 +1851,10 @@ mod tests {
     use super::*;
     use crate::program::{BinOp, EpilogueSignature, Inst, Program, ProgramKind, prepare_epilogue};
 
+    fn argmax() -> Op {
+        Op::Argmax { chunk_width: 2_048 }
+    }
+
     fn tensor(buffer: u64, dtype: DType, shape: &[u32], strides: &[u64]) -> Tensor {
         let bytes = u64::from(shape.iter().product::<u32>()) * dtype.byte_size();
         Tensor::from_allocation(
@@ -2084,37 +2108,41 @@ mod tests {
         let wrong_output = tensor(5, DType::U32, &[1], &[1]);
         let scalar = tensor(6, DType::F32, &[], &[]);
         assert_eq!(
-            CommandList::new().dispatch(Op::Argmax, &[], &output),
+            CommandList::new().dispatch(argmax(), &[], &output),
             Err(OpError::Arity {
                 expected: 1,
                 actual: 0
             })
         );
         assert_eq!(
-            CommandList::new().dispatch(Op::Argmax, &[&integer], &output),
+            CommandList::new().dispatch(argmax(), &[&integer], &output),
             Err(OpError::DType {
                 operand: Operand::Input(0),
                 dtype: DType::U32
             })
         );
         assert_eq!(
-            CommandList::new().dispatch(Op::Argmax, &[&input], &float_output),
+            CommandList::new().dispatch(argmax(), &[&input], &float_output),
             Err(OpError::DType {
                 operand: Operand::Output,
                 dtype: DType::F32
             })
         );
         assert_eq!(
-            CommandList::new().dispatch(Op::Argmax, &[&input], &wrong_output),
+            CommandList::new().dispatch(argmax(), &[&input], &wrong_output),
             Err(OpError::Shape {
                 operand: Operand::Output
             })
         );
         assert_eq!(
-            CommandList::new().dispatch(Op::Argmax, &[&scalar], &wrong_output),
+            CommandList::new().dispatch(argmax(), &[&scalar], &wrong_output),
             Err(OpError::Shape {
                 operand: Operand::Input(0)
             })
+        );
+        assert_eq!(
+            CommandList::new().dispatch(Op::Argmax { chunk_width: 0 }, &[&input], &output),
+            Err(OpError::InvalidKernelParameter)
         );
     }
 
@@ -2129,6 +2157,7 @@ mod tests {
                     Op::TopK {
                         k: 7,
                         normalize: false,
+                        chunk_width: 2_048,
                     },
                     &[&input],
                     &[&values, &indices],
@@ -2144,6 +2173,7 @@ mod tests {
                     Op::TopK {
                         k: 65,
                         normalize: false,
+                        chunk_width: 2_048,
                     },
                     &[&wide_input],
                     &[&wide_values, &wide_indices],
@@ -2155,6 +2185,7 @@ mod tests {
                 Op::TopK {
                     k: 0,
                     normalize: false,
+                    chunk_width: 2_048,
                 },
                 &[&input],
                 &[&values, &indices],
@@ -2166,6 +2197,7 @@ mod tests {
                 Op::TopK {
                     k: 8,
                     normalize: false,
+                    chunk_width: 2_048,
                 },
                 &[&input],
                 &[&values, &indices],
@@ -2177,6 +2209,7 @@ mod tests {
                 Op::TopK {
                     k: 7,
                     normalize: false,
+                    chunk_width: 2_048,
                 },
                 &[&input],
                 &[&values],
@@ -2192,6 +2225,7 @@ mod tests {
                 Op::TopK {
                     k: 7,
                     normalize: false,
+                    chunk_width: 2_048,
                 },
                 &[&input],
                 &[&values, &wrong_indices]
@@ -2208,7 +2242,7 @@ mod tests {
         let params = tensor(2, DType::U32, &[5], &[1]);
         let output = tensor(3, DType::U32, &[1], &[1]);
 
-        for op in [Op::Argmax, Op::Sample { position: 9 }] {
+        for op in [argmax(), Op::Sample { position: 9 }] {
             let inputs = match op {
                 Op::Sample { .. } => vec![&logits, &params],
                 _ => vec![&logits],

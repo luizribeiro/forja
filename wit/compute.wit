@@ -53,6 +53,10 @@ interface compute {
     position: affine,
   }
 
+  record reduction-cfg {
+    chunk-width: u32,
+  }
+
   record quant-matmul-cfg {
     bits: u8,
     group-size: u32,
@@ -61,6 +65,7 @@ interface compute {
   record top-k-cfg {
     k: u32,
     normalize: bool,
+    chunk-width: u32,
   }
 
   enum program-kind {
@@ -146,7 +151,7 @@ interface compute {
   variant op {
     copy,
     rms-norm(f32),
-    argmax,
+    argmax(reduction-cfg),
     top-k(top-k-cfg),
     sample(sample-cfg),
     sample-masked(sample-cfg),

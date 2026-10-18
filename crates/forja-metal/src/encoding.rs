@@ -47,6 +47,8 @@ use crate::{
     variants::MetalVariant,
 };
 
+type ComputePipeline = Retained<ProtocolObject<dyn MTLComputePipelineState>>;
+
 type MetalBufferRef = Retained<ProtocolObject<dyn MTLBuffer>>;
 type EncodedEmbed = (Vec<BufferBinding>, BufferBinding);
 
@@ -493,6 +495,8 @@ enum SdpaKernel {
 
 #[cfg(test)]
 const VECTOR_MAX_KEY_LENGTH: u32 = 65_536;
+/// Specializes how many elements a partial reduction workgroup consumes.
+const REDUCTION_CHUNK_WIDTH_CONSTANT: u32 = 17;
 const ARGMAX_CHUNK_WIDTH: u32 = 2048;
 const SAMPLE_REJECTION_ROUNDS: u32 = 2;
 const SAMPLE_ERROR: usize = 0;
@@ -2699,12 +2703,18 @@ impl MetalBackend {
             Op::RmsNorm { eps } => {
                 self.encode_rms_norm(encoder, table, dispatch, eps, bindings, arguments)?
             }
-            Op::Argmax => self.encode_argmax(encoder, table, dispatch, bindings, arguments)?,
-            Op::TopK { k, normalize } => self.encode_top_k(
+            Op::Argmax { chunk_width } => {
+                self.encode_argmax(encoder, table, dispatch, chunk_width, bindings, arguments)?
+            }
+            Op::TopK {
+                k,
+                normalize,
+                chunk_width,
+            } => self.encode_top_k(
                 encoder,
                 table,
                 dispatch,
-                (k, normalize),
+                (k, normalize, chunk_width),
                 bindings,
                 arguments,
             )?,
@@ -5043,6 +5053,7 @@ impl MetalBackend {
         encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
         table: &ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>,
         dispatch: &Dispatch,
+        chunk_width: u32,
         bindings: &mut ArgumentBindings,
         arguments: &mut ArgumentWriter,
     ) -> Result<Vec<BufferBinding>, BackendError> {
@@ -5055,28 +5066,12 @@ impl MetalBackend {
             .shape()
             .last()
             .ok_or(BackendError::InvalidInput)?;
-        let chunks = width.div_ceil(ARGMAX_CHUNK_WIDTH);
+        let chunks = width.div_ceil(chunk_width);
         let rows = u32::try_from(output.layout().element_count())
             .map_err(|_| BackendError::ExecutionFailed)?;
         let scratch = self.scratch_tensor(DType::U32, &[rows, chunks, 2])?;
-        let vectorized = vectorized_argmax(input.layout(), width);
-        let (partials_pipeline, finalize_pipeline) = {
-            let mut pipelines = self
-                .pipelines
-                .lock()
-                .map_err(|_| BackendError::ExecutionFailed)?;
-            (
-                if vectorized {
-                    pipelines.get("argmax_partials_f32x4", &[])?
-                } else {
-                    pipelines.get(
-                        "argmax_partials",
-                        &[(0, dtype_code(input.layout().dtype()))],
-                    )?
-                },
-                pipelines.get("argmax_finalize", &[])?,
-            )
-        };
+        let (partials_pipeline, finalize_pipeline) =
+            self.argmax_pipelines(input.layout(), width, chunk_width)?;
         let mut temporaries = vec![
             Self::layout_buffer(input.layout(), arguments)?,
             Self::layout_buffer(output.layout(), arguments)?,
@@ -5148,6 +5143,33 @@ impl MetalBackend {
         Ok(temporaries)
     }
 
+    fn argmax_pipelines(
+        &self,
+        input: &Layout,
+        width: u32,
+        chunk_width: u32,
+    ) -> Result<(ComputePipeline, ComputePipeline), BackendError> {
+        let mut pipelines = self
+            .pipelines
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?;
+        let partials = if vectorized_argmax(input, width, chunk_width) {
+            pipelines.get(
+                "argmax_partials_f32x4",
+                &[(REDUCTION_CHUNK_WIDTH_CONSTANT, chunk_width)],
+            )?
+        } else {
+            pipelines.get(
+                "argmax_partials",
+                &[
+                    (0, dtype_code(input.dtype())),
+                    (REDUCTION_CHUNK_WIDTH_CONSTANT, chunk_width),
+                ],
+            )?
+        };
+        Ok((partials, pipelines.get("argmax_finalize", &[])?))
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn encode_top_k_direct(
         &self,
@@ -5210,11 +5232,11 @@ impl MetalBackend {
         encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
         table: &ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>,
         dispatch: &Dispatch,
-        config: (u32, bool),
+        config: (u32, bool, u32),
         bindings: &mut ArgumentBindings,
         arguments: &mut ArgumentWriter,
     ) -> Result<Vec<BufferBinding>, BackendError> {
-        let (k, normalize) = config;
+        let (k, normalize, chunk_width) = config;
         let [input] = dispatch.inputs() else {
             return Err(BackendError::InvalidInput);
         };
@@ -5229,7 +5251,7 @@ impl MetalBackend {
             .shape()
             .last()
             .ok_or(BackendError::InvalidInput)?;
-        let chunks = width.div_ceil(ARGMAX_CHUNK_WIDTH);
+        let chunks = width.div_ceil(chunk_width);
         let rows = u32::try_from(values.layout.element_count() / u64::from(k))
             .map_err(|_| BackendError::ExecutionFailed)?;
         let constants = [
@@ -5281,13 +5303,18 @@ impl MetalBackend {
             );
         }
         let scratch = self.scratch_tensor(DType::U32, &[rows, chunks, k, 2])?;
+        let partial_constants = [
+            (0, dtype_code(input.layout.dtype())),
+            (2, dtype_code(values.layout.dtype())),
+            (REDUCTION_CHUNK_WIDTH_CONSTANT, chunk_width),
+        ];
         let (partials_pipeline, finalize_pipeline) = {
             let mut pipelines = self
                 .pipelines
                 .lock()
                 .map_err(|_| BackendError::ExecutionFailed)?;
             (
-                pipelines.get("topk_partials", &constants)?,
+                pipelines.get("topk_partials", &partial_constants)?,
                 pipelines.get("topk_finalize", &constants)?,
             )
         };
@@ -5936,7 +5963,7 @@ impl MetalBackend {
                     arguments.write(len)?;
                 }
             }
-            Op::Argmax => {
+            Op::Argmax { .. } => {
                 Self::size_softmax_arguments(arguments)?;
                 arguments.write(size_of::<u32>())?;
             }
@@ -6445,7 +6472,7 @@ fn supported_dispatch(dispatch: &Dispatch) -> bool {
         Op::Program(_) => dispatch.bound_program().is_some(),
         Op::Copy
         | Op::RmsNorm { .. }
-        | Op::Argmax
+        | Op::Argmax { .. }
         | Op::TopK { .. }
         | Op::Rope { .. }
         | Op::Embed
@@ -6470,11 +6497,12 @@ fn vectorized_copy(input: &Layout, output: &Layout) -> bool {
         && output.element_count().is_multiple_of(4)
 }
 
-fn vectorized_argmax(input: &Layout, width: u32) -> bool {
+fn vectorized_argmax(input: &Layout, width: u32, chunk_width: u32) -> bool {
     input.dtype() == DType::F32
         && input.is_contiguous()
         && input.offset().is_multiple_of(4)
         && width.is_multiple_of(4)
+        && chunk_width.is_multiple_of(4)
 }
 
 fn dispatch_profile(dispatch: &Dispatch, barrier: bool) -> Result<DispatchProfile, BackendError> {
@@ -6516,7 +6544,7 @@ pub(super) fn dispatch_kernel(dispatch: &Dispatch) -> Result<&'static str, Backe
             }
         }
         Op::RmsNorm { .. } => row_kernel(dispatch, "rms_norm_single", "rms_norm_looped")?,
-        Op::Argmax => {
+        Op::Argmax { chunk_width } => {
             let [input] = dispatch.inputs() else {
                 return Err(BackendError::InvalidInput);
             };
@@ -6525,7 +6553,7 @@ pub(super) fn dispatch_kernel(dispatch: &Dispatch) -> Result<&'static str, Backe
                 .shape()
                 .last()
                 .ok_or(BackendError::InvalidInput)?;
-            if vectorized_argmax(input.layout(), width) {
+            if vectorized_argmax(input.layout(), width, chunk_width) {
                 "argmax_partials_f32x4+finalize"
             } else {
                 "argmax_partials+finalize"
@@ -6656,7 +6684,7 @@ fn sdpa_kernel(dispatch: &Dispatch) -> Result<&'static str, BackendError> {
 
 fn reusable_dispatch(dispatch: &Dispatch) -> bool {
     match dispatch.op() {
-        Op::Argmax
+        Op::Argmax { .. }
         | Op::TopK { .. }
         | Op::Sample { .. }
         | Op::SampleMasked { .. }
@@ -7837,6 +7865,10 @@ mod tests {
     };
 
     use super::*;
+
+    fn argmax_op() -> Op {
+        Op::Argmax { chunk_width: 2_048 }
+    }
 
     fn symbolic_prefix(base: &Tensor, space: ParamSpace, len: Affine) -> TemplateTensor {
         let layout = SymbolicLayout::new(base.layout().clone(), space)
@@ -9254,7 +9286,11 @@ mod tests {
         let mut template =
             GraphTemplate::new(ParamSpace::new(Vec::new()).unwrap(), GraphLimits::default());
         template
-            .dispatch(Op::Argmax, &[&input.clone().into()], &output.clone().into())
+            .dispatch(
+                argmax_op(),
+                &[&input.clone().into()],
+                &output.clone().into(),
+            )
             .unwrap();
 
         let graph = backend.prepare_graph(template).unwrap();
@@ -11326,7 +11362,7 @@ mod tests {
                 assert_backends_agree(
                     &reference,
                     &candidate,
-                    Op::Argmax,
+                    argmax_op(),
                     &[TensorSpec::contiguous(dtype, &[2, width])],
                     &TensorSpec::contiguous(DType::U32, &[2]),
                 )
@@ -11335,12 +11371,20 @@ mod tests {
             assert_backends_agree(
                 &reference,
                 &candidate,
-                Op::Argmax,
+                argmax_op(),
                 &[TensorSpec::permuted(dtype, &[33, 7], &[1, 0])],
                 &TensorSpec::contiguous(DType::U32, &[7]),
             )
             .unwrap();
         }
+        assert_backends_agree(
+            &reference,
+            &candidate,
+            Op::Argmax { chunk_width: 33 },
+            &[TensorSpec::contiguous(DType::F32, &[2, 4_097])],
+            &TensorSpec::contiguous(DType::U32, &[2]),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -11351,7 +11395,7 @@ mod tests {
         let mut timings = Vec::with_capacity(20);
         for iteration in 0..23 {
             let mut commands = CommandList::new();
-            commands.dispatch(Op::Argmax, &[&input], &output).unwrap();
+            commands.dispatch(argmax_op(), &[&input], &output).unwrap();
             let submission = backend.submit_profiled(commands).unwrap();
             submission.wait().unwrap();
             if iteration >= 3 {
@@ -11401,7 +11445,7 @@ mod tests {
             assert_backends_agree(
                 &CpuBackend::new(),
                 &MetalBackend::new().unwrap(),
-                Op::Argmax,
+                argmax_op(),
                 &[TensorSpec::initialized(dtype, &[1, 7], bytes)],
                 &TensorSpec::contiguous(DType::U32, &[1]),
             )

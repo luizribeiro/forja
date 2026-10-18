@@ -148,7 +148,7 @@ fn op_name(operation: Op) -> &'static str {
         Op::Program(_) => "program",
         Op::Copy => "copy",
         Op::RmsNorm { .. } => "rms_norm",
-        Op::Argmax => "argmax",
+        Op::Argmax { .. } => "argmax",
         Op::TopK { .. } => "top-k",
         Op::Sample { .. } => "sample",
         Op::SampleMasked { .. } => "sample-masked",

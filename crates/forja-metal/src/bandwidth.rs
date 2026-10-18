@@ -53,7 +53,7 @@ impl MetalBackend {
             let read = measure(|| {
                 let mut commands = CommandList::new();
                 commands
-                    .dispatch(Op::Argmax, &[&input], &reduced)
+                    .dispatch(Op::Argmax { chunk_width: 2_048 }, &[&input], &reduced)
                     .map_err(|_| BackendError::InvalidInput)?;
                 gpu_time(&self.submit(commands)?)
             })?;

@@ -1,6 +1,8 @@
 // Copyright © 2024 Apple Inc.
 // SPDX-License-Identifier: MIT
 
+constant uint reduction_chunk_width [[function_constant(17)]];
+
 kernel void hold(device uchar *buffer [[buffer(0)]], uint index [[thread_position_in_grid]]) {
     if (index == 0) {
         buffer[0] = buffer[0];
@@ -324,8 +326,8 @@ kernel void argmax_partials(
     threadgroup uint partial_indices[32];
     uint row = group / chunks;
     uint chunk = group % chunks;
-    uint first = chunk * 2048u;
-    uint end = first + min(2048u, width - first);
+    uint first = chunk * reduction_chunk_width;
+    uint end = first + min(reduction_chunk_width, width - first);
     ulong best = 0;
     for (uint column = first + lane; column < end; column += group_width) {
         float value = load_float(
@@ -354,8 +356,8 @@ kernel void argmax_partials_f32x4(
     threadgroup uint partial_indices[32];
     uint row = group / chunks;
     uint chunk = group % chunks;
-    uint first = chunk * 2048u;
-    uint end = first + min(2048u, width - first);
+    uint first = chunk * reduction_chunk_width;
+    uint end = first + min(reduction_chunk_width, width - first);
     ulong best = 0;
     for (uint column = first + lane * 4u; column < end; column += group_width * 4u) {
         float4 values = input[(input_layout.offset + row * width + column) / 4u];
@@ -604,8 +606,8 @@ kernel void topk_partials(
     }
     uint row = group / chunks;
     uint chunk = group % chunks;
-    uint first = chunk * 2048u;
-    uint end = first + min(2048u, width - first);
+    uint first = chunk * reduction_chunk_width;
+    uint end = first + min(reduction_chunk_width, width - first);
     ulong selected[64] = {0};
     for (uint column = first; column < end; ++column) {
         float value = load_float(

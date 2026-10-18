@@ -33,7 +33,12 @@ pub fn moe_router_with<'a, T: FloatElement>(
     selection: impl Into<crate::target::metal::VariantChoice<'a>>,
 ) -> Result<(Tensor<T>, Tensor<u32>)> {
     if normalize {
-        logits.top_k_selected(k, true, Some(selection.into()))
+        logits.top_k_selected(
+            k,
+            true,
+            crate::ReductionConfig::default(),
+            Some(selection.into()),
+        )
     } else {
         logits.softmax_last_dim()?.top_k_with(k, selection.into())
     }

@@ -7,6 +7,21 @@ use crate::{
     sys,
 };
 
+/// Engine-selected partial-reduction parameters.
+///
+/// The chunk width must be nonzero. Its default is 2,048 elements.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReductionConfig {
+    /// Maximum number of row elements handled by one partial workgroup.
+    pub chunk_width: u32,
+}
+
+impl Default for ReductionConfig {
+    fn default() -> Self {
+        Self { chunk_width: 2_048 }
+    }
+}
+
 /// A strided selection along one tensor axis.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Slice {
@@ -344,11 +359,25 @@ impl<T: Element> Tensor<T> {
     ///
     /// Returns an error for an empty or scalar shape, unsupported type, or refused dispatch.
     pub fn argmax(&self) -> Result<Tensor<u32>> {
+        self.argmax_with_config(ReductionConfig::default())
+    }
+
+    /// Selects greatest indices with explicit partial-reduction parameters.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid chunk width or refused dispatch.
+    pub fn argmax_with_config(&self, config: ReductionConfig) -> Result<Tensor<u32>> {
         let mut shape = self.shape.clone();
         shape
             .pop()
             .ok_or_else(|| Error::new("argmax requires at least one dimension"))?;
-        self.unary(sys::Op::Argmax, shape)
+        self.unary(
+            sys::Op::Argmax {
+                chunk_width: config.chunk_width,
+            },
+            shape,
+        )
     }
 
     /// Selects the greatest values and their indices along the last dimension.
@@ -360,7 +389,20 @@ impl<T: Element> Tensor<T> {
     /// Returns an error when `k` is zero, greater than 64, greater than the row width, or the
     /// dispatch is refused.
     pub fn top_k(&self, k: u32) -> Result<(Self, Tensor<u32>)> {
-        self.top_k_selected(k, false, None)
+        self.top_k_selected(k, false, ReductionConfig::default(), None)
+    }
+
+    /// Selects greatest values with explicit partial-reduction parameters.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid count, chunk width, or refused dispatch.
+    pub fn top_k_with_config(
+        &self,
+        k: u32,
+        config: ReductionConfig,
+    ) -> Result<(Self, Tensor<u32>)> {
+        self.top_k_selected(k, false, config, None)
     }
 
     /// Selects greatest values with an explicit Metal algorithm selection.
@@ -373,7 +415,7 @@ impl<T: Element> Tensor<T> {
         k: u32,
         selection: impl Into<crate::target::metal::VariantChoice<'a>>,
     ) -> Result<(Self, Tensor<u32>)> {
-        self.top_k_selected(k, false, Some(selection.into()))
+        self.top_k_selected(k, false, ReductionConfig::default(), Some(selection.into()))
     }
 
     pub(crate) fn top_k_with_normalization(
@@ -381,13 +423,14 @@ impl<T: Element> Tensor<T> {
         k: u32,
         normalize: bool,
     ) -> Result<(Self, Tensor<u32>)> {
-        self.top_k_selected(k, normalize, None)
+        self.top_k_selected(k, normalize, ReductionConfig::default(), None)
     }
 
     pub(crate) fn top_k_selected(
         &self,
         k: u32,
         normalize: bool,
+        config: ReductionConfig,
         selection: Option<crate::target::metal::VariantChoice<'_>>,
     ) -> Result<(Self, Tensor<u32>)> {
         let mut shape = self.shape.clone();
@@ -402,7 +445,11 @@ impl<T: Element> Tensor<T> {
         *width = k;
         let values = Self::empty(shape.clone())?;
         let indices = Tensor::<u32>::empty(shape)?;
-        let operation = sys::Op::TopK { k, normalize };
+        let operation = sys::Op::TopK {
+            k,
+            normalize,
+            chunk_width: config.chunk_width,
+        };
         if let Some(selection) = selection {
             graph::record_variant_many(
                 operation,
@@ -1722,6 +1769,11 @@ mod tests {
     use super::*;
     use crate::{DType, program::Kernel};
     use forja_testing::assert_f32_values_agree;
+
+    #[test]
+    fn reduction_parameter_default_preserves_existing_schedule() {
+        assert_eq!(ReductionConfig::default().chunk_width, 2_048);
+    }
 
     #[test]
     fn native_views_round_trip_non_contiguous_values() {

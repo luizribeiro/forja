@@ -89,10 +89,13 @@ pub(crate) enum View {
 pub(crate) enum Op {
     Copy,
     RmsNorm(f32),
-    Argmax,
+    Argmax {
+        chunk_width: u32,
+    },
     TopK {
         k: u32,
         normalize: bool,
+        chunk_width: u32,
     },
     Sample {
         position: Affine,
@@ -611,8 +614,18 @@ pub(crate) mod guest {
         match operation {
             Op::Copy => compute::Op::Copy,
             Op::RmsNorm(eps) => compute::Op::RmsNorm(eps),
-            Op::Argmax => compute::Op::Argmax,
-            Op::TopK { k, normalize } => compute::Op::TopK(compute::TopKCfg { k, normalize }),
+            Op::Argmax { chunk_width } => {
+                compute::Op::Argmax(compute::ReductionCfg { chunk_width })
+            }
+            Op::TopK {
+                k,
+                normalize,
+                chunk_width,
+            } => compute::Op::TopK(compute::TopKCfg {
+                k,
+                normalize,
+                chunk_width,
+            }),
             Op::Sample { position } => compute::Op::Sample(compute::SampleCfg {
                 position: wit_affine(position),
             }),
@@ -1368,8 +1381,16 @@ pub(crate) mod native {
         match operation {
             Op::Copy => CoreOp::Copy,
             Op::RmsNorm(eps) => CoreOp::RmsNorm { eps },
-            Op::Argmax => CoreOp::Argmax,
-            Op::TopK { k, normalize } => CoreOp::TopK { k, normalize },
+            Op::Argmax { chunk_width } => CoreOp::Argmax { chunk_width },
+            Op::TopK {
+                k,
+                normalize,
+                chunk_width,
+            } => CoreOp::TopK {
+                k,
+                normalize,
+                chunk_width,
+            },
             Op::Sample { position } => CoreOp::Sample {
                 position: position.offset,
             },

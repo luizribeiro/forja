@@ -1211,8 +1211,8 @@ impl Backend for CpuBackend {
                 Op::RmsNorm { eps } => {
                     self.execute_rms_norm(dispatch.inputs(), dispatch.output(), eps)
                 }
-                Op::Argmax => self.execute_argmax(dispatch.inputs(), dispatch.output()),
-                Op::TopK { k, normalize } => {
+                Op::Argmax { .. } => self.execute_argmax(dispatch.inputs(), dispatch.output()),
+                Op::TopK { k, normalize, .. } => {
                     self.execute_top_k(dispatch.inputs(), dispatch.outputs(), k, normalize)
                 }
                 Op::Sample { position } => {
@@ -1576,6 +1576,10 @@ mod tests {
     };
 
     static NEXT_FILE: AtomicU64 = AtomicU64::new(0);
+
+    fn argmax() -> Op {
+        Op::Argmax { chunk_width: 2_048 }
+    }
 
     #[test]
     fn fused_matmul_epilogue_matches_decomposed_broadcast_add() {
@@ -1985,7 +1989,7 @@ mod tests {
         let input = f32_tensor(&backend, &[1, 5], &[1.0, 9.0, 2.0, 9.0, 3.0]);
         let output = backend.alloc(DType::U32, &[1]).unwrap();
         let mut commands = CommandList::new();
-        commands.dispatch(Op::Argmax, &[&input], &output).unwrap();
+        commands.dispatch(argmax(), &[&input], &output).unwrap();
         backend.submit(commands).unwrap().wait().unwrap();
         assert_eq!(backend.read(&output).unwrap(), u32_bytes(&[3]));
     }
@@ -2815,7 +2819,11 @@ mod tests {
         let mut commands = CommandList::new();
         commands
             .dispatch_many(
-                Op::TopK { k, normalize },
+                Op::TopK {
+                    k,
+                    normalize,
+                    chunk_width: 2_048,
+                },
                 &[&input],
                 &[&output_values, &output_indices],
             )

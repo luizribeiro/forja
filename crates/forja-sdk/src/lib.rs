@@ -124,7 +124,7 @@ pub use half::{bf16, f16};
 pub use load::{Load, Weights};
 pub use selections::{EngineSelections, EngineTunings, Tuning, VariantSelection};
 pub use sys::DType;
-pub use tensor::{Slice, Tensor};
+pub use tensor::{ReductionConfig, Slice, Tensor};
 
 /// Read-only capabilities reported by the host compute device.
 #[derive(Clone, Debug, PartialEq)]
