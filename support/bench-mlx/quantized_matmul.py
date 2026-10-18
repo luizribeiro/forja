@@ -14,6 +14,7 @@ SHAPES = [
     ("expert gate/up", 2048, 768, 4),
     ("expert down", 768, 2048, 4),
     ("router", 2048, 128, 8),
+    ("lm_head", 2048, 151936, 4),
 ]
 
 
@@ -70,6 +71,7 @@ def profile_shapes() -> list[dict[str, object]]:
                 "name": name,
                 "shape": [inner, columns],
                 "bits": bits,
+                "bytes_moved": byte_count,
                 "synchronized_seconds": elapsed,
                 "gigabytes_per_second": byte_count / elapsed / 1e9,
             }
@@ -79,10 +81,11 @@ def profile_shapes() -> list[dict[str, object]]:
 
 def main() -> None:
     """Print the synchronized shape comparison."""
-    print("shape\tMLX synchronized ms\tlogical GB/s")
+    print("shape\tMLX us\tbytes\tlogical GB/s")
     for result in profile_shapes():
         print(
-            f"{result['name']}\t{result['synchronized_seconds'] * 1e3:.3f}\t"
+            f"{result['name']}\t{result['synchronized_seconds'] * 1e6:.3f}\t"
+            f"{result['bytes_moved']}\t"
             f"{result['gigabytes_per_second']:.1f}"
         )
 

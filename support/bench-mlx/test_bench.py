@@ -28,6 +28,7 @@ class SuiteTests(unittest.TestCase):
                 ("expert gate/up", 2048, 768, 4),
                 ("expert down", 768, 2048, 4),
                 ("router", 2048, 128, 8),
+                ("lm_head", 2048, 151936, 4),
             ],
         )
 
