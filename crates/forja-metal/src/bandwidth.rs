@@ -26,6 +26,20 @@ impl MetalBackend {
     /// Returns a backend error when allocation, submission, timing, or release fails.
     #[allow(clippy::cast_precision_loss)]
     pub fn measure_memory_bandwidth(&self) -> Result<MemoryBandwidth, BackendError> {
+        let mut cached = self
+            .bandwidth
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?;
+        if let Some(bandwidth) = *cached {
+            return Ok(bandwidth);
+        }
+        let bandwidth = self.measure_memory_bandwidth_uncached()?;
+        *cached = Some(bandwidth);
+        Ok(bandwidth)
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    fn measure_memory_bandwidth_uncached(&self) -> Result<MemoryBandwidth, BackendError> {
         let elements = u32::try_from(STREAM_BYTES / DType::F32.byte_size())
             .map_err(|_| BackendError::AllocationFailed)?;
         let columns = elements
@@ -84,11 +98,26 @@ fn measure(
 
 #[cfg(test)]
 mod tests {
+    use forja_core::Backend;
+
     #[test]
     fn metal_streaming_probe_reports_rates() {
         let backend = super::MetalBackend::new().unwrap();
         let bandwidth = backend.measure_memory_bandwidth().unwrap();
         assert!((0.0..10_000.0).contains(&bandwidth.read_gigabytes_per_second));
         assert!((0.0..10_000.0).contains(&bandwidth.copy_gigabytes_per_second));
+    }
+
+    #[test]
+    fn metal_device_info_reports_capabilities_and_reuses_bandwidth() {
+        let backend = super::MetalBackend::new().unwrap();
+        let first = backend.device_info().unwrap();
+        let second = backend.device_info().unwrap();
+
+        assert!(first.family.starts_with("apple"));
+        assert!(first.recommended_max_working_set_size > 0);
+        assert!(first.max_threadgroup_memory_length > 0);
+        assert!(first.simd_width > 0);
+        assert_eq!(first, second);
     }
 }

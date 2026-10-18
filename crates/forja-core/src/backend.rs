@@ -20,6 +20,25 @@ pub struct MemoryUsage {
     pub peak_physical_footprint: Option<u64>,
 }
 
+/// Read-only capabilities reported by a compute device.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DeviceInfo {
+    /// Highest GPU feature family reported by the device.
+    pub family: String,
+    /// Device-recommended maximum resident working set in bytes.
+    pub recommended_max_working_set_size: u64,
+    /// Maximum threadgroup-memory allocation in bytes.
+    pub max_threadgroup_memory_length: u64,
+    /// Number of GPU cores when the platform API reports it.
+    pub gpu_core_count: Option<u32>,
+    /// Threads executed together by the device's SIMD unit.
+    pub simd_width: u32,
+    /// Measured read-only streaming throughput in decimal gigabytes per second.
+    pub streaming_read_gigabytes_per_second: f64,
+    /// Measured combined read/write streaming throughput in decimal gigabytes per second.
+    pub streaming_copy_gigabytes_per_second: f64,
+}
+
 use crate::{
     BufferId, CommandList, DType, GraphMemoryPlan, GraphTemplate, Layout, MappedRegion, Op,
     PreparedGraph, Slice, Tensor,
@@ -439,6 +458,16 @@ pub trait Backend {
     /// Returns the backend and process memory visible to this backend.
     fn memory_usage(&self) -> MemoryUsage {
         MemoryUsage::default()
+    }
+
+    /// Returns read-only capabilities for the selected compute device.
+    ///
+    /// # Errors
+    ///
+    /// Returns unsupported operation when the backend has no device capability record, or a
+    /// backend error when a required measurement fails.
+    fn device_info(&self) -> Result<DeviceInfo, BackendError> {
+        Err(BackendError::UnsupportedOperation)
     }
 
     /// Sets the byte quota covering allocations made for one guest.

@@ -20,17 +20,17 @@ use crate::encoding::{
 };
 use block2::RcBlock;
 use forja_core::{
-    AllocationRegistry, Backend, BackendError, BufferId, CommandList, DType, GraphMemoryPlan,
-    GraphTemplate, Layout, MappedRegion, MemoryUsage, PreparedGraph, ReadonlyImport, Tensor,
-    ViewOp,
+    AllocationRegistry, Backend, BackendError, BufferId, CommandList, DType, DeviceInfo,
+    GraphMemoryPlan, GraphTemplate, Layout, MappedRegion, MemoryUsage, PreparedGraph,
+    ReadonlyImport, Tensor, ViewOp,
     program::{KernelSignature, ProgramHash, ValidatedProgram},
 };
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_foundation::NSPageSize;
 use objc2_metal::{
-    MTL4CommandQueue, MTLAllocation, MTLBuffer, MTLCreateSystemDefaultDevice, MTLDevice,
-    MTLGPUFamily, MTLResidencySet, MTLResidencySetDescriptor, MTLResourceOptions, MTLSharedEvent,
-    MTLSharedEventListener,
+    MTL4CommandQueue, MTLAllocation, MTLBuffer, MTLComputePipelineState,
+    MTLCreateSystemDefaultDevice, MTLDevice, MTLGPUFamily, MTLResidencySet,
+    MTLResidencySetDescriptor, MTLResourceOptions, MTLSharedEvent, MTLSharedEventListener,
 };
 
 pub(super) struct MetalBuffer {
@@ -407,6 +407,7 @@ pub struct MetalBackend {
     allocation_limit: AtomicU64,
     allocation_lock: Mutex<()>,
     baseline_device_bytes: u64,
+    pub(super) bandwidth: Mutex<Option<crate::MemoryBandwidth>>,
     #[cfg(test)]
     allocation_requests: AtomicUsize,
 }
@@ -696,6 +697,7 @@ impl MetalBackend {
             allocation_limit: AtomicU64::new(u64::MAX),
             allocation_lock: Mutex::new(()),
             baseline_device_bytes,
+            bandwidth: Mutex::new(None),
             #[cfg(test)]
             allocation_requests: AtomicUsize::new(0),
         };
@@ -924,6 +926,26 @@ impl Backend for MetalBackend {
         }
     }
 
+    fn device_info(&self) -> Result<DeviceInfo, BackendError> {
+        let bandwidth = self.measure_memory_bandwidth()?;
+        let simd_width = self
+            .pipelines
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?
+            .get("copy_contiguous", &[])?
+            .threadExecutionWidth();
+        Ok(DeviceInfo {
+            family: gpu_family(&self.device).to_owned(),
+            recommended_max_working_set_size: self.device.recommendedMaxWorkingSetSize(),
+            max_threadgroup_memory_length: u64::try_from(self.device.maxThreadgroupMemoryLength())
+                .map_err(|_| BackendError::ExecutionFailed)?,
+            gpu_core_count: None,
+            simd_width: u32::try_from(simd_width).map_err(|_| BackendError::ExecutionFailed)?,
+            streaming_read_gigabytes_per_second: bandwidth.read_gigabytes_per_second,
+            streaming_copy_gigabytes_per_second: bandwidth.copy_gigabytes_per_second,
+        })
+    }
+
     fn set_memory_limit(&self, bytes: u64) {
         self.allocation_limit.store(bytes, Ordering::Release);
     }
@@ -1133,6 +1155,28 @@ impl Backend for MetalBackend {
     fn supports_replay_overlap(&self) -> bool {
         true
     }
+}
+
+fn gpu_family(device: &ProtocolObject<dyn MTLDevice>) -> &'static str {
+    for (family, name) in [
+        (MTLGPUFamily::Apple9, "apple9"),
+        (MTLGPUFamily::Apple8, "apple8"),
+        (MTLGPUFamily::Apple7, "apple7"),
+        (MTLGPUFamily::Apple6, "apple6"),
+        (MTLGPUFamily::Apple5, "apple5"),
+        (MTLGPUFamily::Apple4, "apple4"),
+        (MTLGPUFamily::Apple3, "apple3"),
+        (MTLGPUFamily::Apple2, "apple2"),
+        (MTLGPUFamily::Apple1, "apple1"),
+        (MTLGPUFamily::Common3, "common3"),
+        (MTLGPUFamily::Common2, "common2"),
+        (MTLGPUFamily::Common1, "common1"),
+    ] {
+        if device.supportsFamily(family) {
+            return name;
+        }
+    }
+    "unknown"
 }
 
 type BufferDeallocator = RcBlock<dyn Fn(NonNull<c_void>, usize)>;
