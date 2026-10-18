@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, error::Error, fs, time::Duration};
 
-use forja_core::{DType, DispatchProfile, Op, ProfileTensor};
+use forja_core::{Backend, DType, DeviceInfo, DispatchProfile, Op, ProfileTensor};
 use forja_host::EngineMemory;
 
 use crate::{
@@ -64,10 +64,10 @@ pub(crate) async fn run(options: &Profile) -> Result<(), Box<dyn Error>> {
             &options.scratch,
         )?;
         let load_before = machine_load::capture("BEFORE PROFILE")?;
-        let bandwidth = forja_metal::MetalBackend::new()?.measure_memory_bandwidth()?;
+        let device = forja_metal::MetalBackend::new()?.device_info()?;
         let measurement = measure_token_profile(options).await?;
         let load_after = machine_load::capture("AFTER PROFILE")?;
-        let report = report(options, &measurement, bandwidth, &load_before, &load_after)?;
+        let report = report(options, &measurement, &device, &load_before, &load_after)?;
         if options.json {
             fs::create_dir_all(&options.scratch)?;
             let path = options.scratch.join("profile.json");
@@ -76,7 +76,7 @@ pub(crate) async fn run(options: &Profile) -> Result<(), Box<dyn Error>> {
             fs::write(&path, bytes)?;
             println!("profile JSON: {}", path.display());
         } else {
-            print_markdown(options, &measurement, bandwidth)?;
+            print_markdown(options, &measurement, &device)?;
         }
         Ok(())
     }
@@ -209,9 +209,9 @@ fn throughput(bytes: u64, elapsed: Duration) -> f64 {
 fn print_markdown(
     options: &Profile,
     measurement: &TokenProfile,
-    bandwidth: forja_metal::MemoryBandwidth,
+    device: &DeviceInfo,
 ) -> Result<(), Box<dyn Error>> {
-    let peak = bandwidth.read_gigabytes_per_second;
+    let peak = device.streaming_read_gigabytes_per_second;
     let memory = memory_report(measurement.step.memory)?;
     let submission = measurement
         .step
@@ -228,12 +228,13 @@ fn print_markdown(
         .fold(Duration::ZERO, |sum, dispatch| sum + dispatch.gap_before);
     println!("# forja profile\n");
     println!("- Device: {}", measurement.device);
+    print_device_info(device);
     println!("- Mode: {}", mode_name(options.mode));
     println!("- Tokens: {}", options.context);
     println!("- Streaming read roofline: {peak:.1} GB/s");
     println!(
         "- Streaming copy traffic: {:.1} GB/s",
-        bandwidth.copy_gigabytes_per_second
+        device.streaming_copy_gigabytes_per_second
     );
     println!(
         "- Step memory: {} bytes accounted ({} live tensors + {} backend), {} bytes device, {} bytes footprint",
@@ -309,6 +310,24 @@ fn print_markdown(
     Ok(())
 }
 
+fn print_device_info(device: &DeviceInfo) {
+    println!("- GPU family: {}", device.family);
+    println!(
+        "- Recommended maximum working set: {} bytes",
+        device.recommended_max_working_set_size
+    );
+    println!(
+        "- Maximum threadgroup memory: {} bytes",
+        device.max_threadgroup_memory_length
+    );
+    if let Some(cores) = device.gpu_core_count {
+        println!("- GPU cores: {cores}");
+    } else {
+        println!("- GPU cores: unavailable");
+    }
+    println!("- SIMD width: {}", device.simd_width);
+}
+
 fn print_totals(title: &str, totals: BTreeMap<&str, Total>, gpu_time: Duration) {
     println!("\n## {title}\n");
     println!("| name | time ms | share | dispatches | barriers | idle gaps ms |");
@@ -328,11 +347,11 @@ fn print_totals(title: &str, totals: BTreeMap<&str, Total>, gpu_time: Duration) 
 fn report(
     options: &Profile,
     measurement: &TokenProfile,
-    bandwidth: forja_metal::MemoryBandwidth,
+    device: &DeviceInfo,
     load_before: &machine_load::Snapshot,
     load_after: &machine_load::Snapshot,
 ) -> Result<serde_json::Value, Box<dyn Error>> {
-    let peak = bandwidth.read_gigabytes_per_second;
+    let peak = device.streaming_read_gigabytes_per_second;
     let memory = memory_report(measurement.step.memory)?;
     let submission = measurement
         .step
@@ -372,10 +391,17 @@ fn report(
             },
         },
         "device": measurement.device,
+        "device_capabilities": {
+            "family": device.family,
+            "recommended_max_working_set_size": device.recommended_max_working_set_size,
+            "max_threadgroup_memory_length": device.max_threadgroup_memory_length,
+            "gpu_core_count": device.gpu_core_count,
+            "simd_width": device.simd_width,
+        },
         "mode": mode_name(options.mode),
         "tokens": options.context,
         "streaming_read_gigabytes_per_second": peak,
-        "streaming_copy_gigabytes_per_second": bandwidth.copy_gigabytes_per_second,
+        "streaming_copy_gigabytes_per_second": device.streaming_copy_gigabytes_per_second,
         "unprofiled": {
             "wall_time_seconds": measurement.baseline_wall.as_secs_f64(),
             "gpu_time_seconds": measurement.baseline_gpu.as_secs_f64(),
