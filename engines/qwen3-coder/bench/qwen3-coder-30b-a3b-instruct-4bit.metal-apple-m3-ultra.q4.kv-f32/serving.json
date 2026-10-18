@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "accepted_at": "2026-10-18T06:59:00Z",
+  "source_commit": "2fa313bd82077e29e1a67456e39c273ff1ac907c",
+  "machine": {
+    "device": "Apple M3 Ultra",
+    "gpu_cores": 80,
+    "os": "macOS 26.6.2"
+  },
+  "model": {
+    "profile": "qwen3-coder-30b-a3b-instruct-4bit.metal-apple-m3-ultra.q4.kv-f32",
+    "revision": "6e302ea604ad9ab206367e2c501d1571023e7b6d",
+    "kv_cache": "f32"
+  },
+  "workload": {
+    "path": "forja serve /v1/completions over HTTP",
+    "prompt_tokens": 2081,
+    "cached_tokens": 2048,
+    "generated_tokens": 16,
+    "repetitions": 100,
+    "measured_intervals": 1500,
+    "sampling": {
+      "temperature": 0.0,
+      "top_k": 0,
+      "top_p": 1.0,
+      "seed": 0
+    }
+  },
+  "results": {
+    "itl_us": {
+      "p50": 11022,
+      "p90": 11644,
+      "p99": 13726
+    },
+    "peak_rss_mib": 23215
+  }
+}
