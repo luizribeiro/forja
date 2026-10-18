@@ -47,10 +47,10 @@ Accepted pp512/tg128 results use 30 measured repetitions on an 80-core Apple M3 
 
 | KV cache | Selection | PP tok/s | TG tok/s |
 | --- | --- | ---: | ---: |
-| f16 | GPU sequential | 1267.45 | 71.19 |
-| f16 | GPU pipelined | 1267.26 | 98.14 |
-| f32 | GPU sequential | 1218.97 | 71.62 |
-| f32 | GPU pipelined | 1220.69 | 98.21 |
+| f16 | GPU sequential | 1273.89 | 71.20 |
+| f16 | GPU pipelined | 1273.32 | 98.07 |
+| f32 | GPU sequential | 1226.42 | 71.10 |
+| f32 | GPU pipelined | 1224.55 | 98.09 |
 
 The f16 profile uses half-precision Q, K, V, and probability MMA inputs with f32 score, softmax,
 and output accumulation. Median wall throughput from matched five-repetition runs was:
