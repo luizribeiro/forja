@@ -491,7 +491,6 @@ enum SdpaKernel {
     Decomposed,
 }
 
-const VECTOR_TWO_PASS_MIN_KEY_LENGTH: u32 = 1024;
 #[cfg(test)]
 const VECTOR_MAX_KEY_LENGTH: u32 = 65_536;
 const ARGMAX_CHUNK_WIDTH: u32 = 2048;
@@ -944,6 +943,7 @@ impl Drop for TemporaryProfileScope {
 #[cfg(test)]
 thread_local! {
     static FORCED_SDPA_KERNEL: Cell<Option<SdpaKernel>> = const { Cell::new(None) };
+    static FORCED_VECTOR_BLOCKS: Cell<Option<u32>> = const { Cell::new(None) };
     static FORCED_SAMPLE_REJECTION_ROUNDS: Cell<Option<u32>> = const { Cell::new(None) };
 }
 
@@ -3896,16 +3896,12 @@ impl MetalBackend {
         let value = self.encoder_tensor(value_tensor)?;
         let output = self.encoder_tensor(dispatch.output())?;
         let [query_heads, query_length, width] = shape3(&query.layout)?;
-        let [kv_heads, key_length, _] = shape3(&key.layout)?;
+        let [kv_heads, _, _] = shape3(&key.layout)?;
         let [_, _, value_width] = shape3(&value.layout)?;
         let fast_f32 = vector_f32_supported(dispatch);
-        let two_pass = key_length >= VECTOR_TWO_PASS_MIN_KEY_LENGTH;
         let heads_per_group = query_heads / kv_heads;
-        let blocks = if two_pass {
-            self.vector_block_count(key_length, heads_per_group, query_length)?
-        } else {
-            1
-        };
+        let two_pass_blocks = vector_two_pass_blocks(dispatch);
+        let blocks = two_pass_blocks.unwrap_or(1);
         let params = Self::sdpa_params(
             &query, &key, &value, &output, scale, causal, q_start, blocks, arguments,
         )?;
@@ -3916,7 +3912,7 @@ impl MetalBackend {
             (3, dtype_code(value.layout.dtype())),
         ];
         let mut temporaries = vec![params.clone()];
-        if !two_pass {
+        if two_pass_blocks.is_none() {
             let pipeline = self
                 .pipelines
                 .lock()
@@ -4044,47 +4040,6 @@ impl MetalBackend {
         );
         temporaries.extend([intermediate.buffer, sums.buffer, maxs.buffer]);
         Ok(temporaries)
-    }
-
-    fn vector_block_count(
-        &self,
-        key_length: u32,
-        heads_per_group: u32,
-        query_length: u32,
-    ) -> Result<u32, BackendError> {
-        let simdgroups = heads_per_group
-            .checked_mul(query_length)
-            .ok_or(BackendError::InvalidInput)?;
-        let architecture = self.device.architecture().name().to_string();
-        let class = architecture.chars().next_back();
-        let blocks = match class {
-            Some('s') => {
-                if key_length > 1024 && simdgroups > 4 {
-                    match key_length {
-                        ..=8192 => 128,
-                        8193..=32_768 => 256,
-                        32_769..=65_536 => 512,
-                        _ => 1024,
-                    }
-                } else {
-                    64
-                }
-            }
-            Some('d') => {
-                if simdgroups <= 2 && key_length > 8192 {
-                    256
-                } else if simdgroups >= 6 && key_length >= 65_536 {
-                    1024
-                } else if simdgroups >= 6 && key_length >= 16_384 {
-                    512
-                } else {
-                    128
-                }
-            }
-            _ if simdgroups >= 4 => 64,
-            _ => 32,
-        };
-        Ok(blocks)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -6672,22 +6627,20 @@ fn matmul_kernel(dispatch: &Dispatch) -> Result<&'static str, BackendError> {
 }
 
 fn sdpa_kernel(dispatch: &Dispatch) -> Result<&'static str, BackendError> {
-    let [query, key, _] = dispatch.inputs() else {
+    let [query, _, _] = dispatch.inputs() else {
         return Err(BackendError::InvalidInput);
     };
     let width = shape3(query.layout())?[2];
     let fast_f32 = vector_f32_supported(dispatch);
     Ok(match select_sdpa(dispatch)? {
-        SdpaKernel::Vector if shape3(key.layout())?[1] >= VECTOR_TWO_PASS_MIN_KEY_LENGTH => {
-            vector_kernel(
-                if fast_f32 {
-                    "mlx_sdpa_vector_2pass_f32"
-                } else {
-                    "mlx_sdpa_vector_2pass"
-                },
-                width,
-            )?
-        }
+        SdpaKernel::Vector if vector_two_pass_blocks(dispatch).is_some() => vector_kernel(
+            if fast_f32 {
+                "mlx_sdpa_vector_2pass_f32"
+            } else {
+                "mlx_sdpa_vector_2pass"
+            },
+            width,
+        )?,
         SdpaKernel::Vector => vector_kernel(
             if fast_f32 {
                 "mlx_sdpa_vector_f32"
@@ -6792,9 +6745,14 @@ fn select_sdpa(dispatch: &Dispatch) -> Result<SdpaKernel, BackendError> {
         Some(MetalVariant::SdpaPortable | MetalVariant::SdpaDecomposed) => {
             Ok(SdpaKernel::Decomposed)
         }
-        Some(MetalVariant::SdpaVectorSinglePass | MetalVariant::SdpaVectorTwoPass) => {
-            Ok(SdpaKernel::Vector)
-        }
+        Some(
+            MetalVariant::SdpaVectorSinglePass
+            | MetalVariant::SdpaVectorTwoPass64
+            | MetalVariant::SdpaVectorTwoPass128
+            | MetalVariant::SdpaVectorTwoPass256
+            | MetalVariant::SdpaVectorTwoPass512
+            | MetalVariant::SdpaVectorTwoPass1024,
+        ) => Ok(SdpaKernel::Vector),
         Some(MetalVariant::SdpaSteel) => Ok(SdpaKernel::Steel),
         _ => Err(BackendError::InvalidInput),
     }
@@ -6811,6 +6769,21 @@ fn selected_variant(dispatch: &Dispatch) -> Option<MetalVariant> {
     pinned_variant(dispatch).or_else(|| {
         crate::variants::portable_implementation(forja_core::OperationKind::of(dispatch.op()))
     })
+}
+
+fn vector_two_pass_blocks(dispatch: &Dispatch) -> Option<u32> {
+    #[cfg(test)]
+    if let Some(blocks) = FORCED_VECTOR_BLOCKS.with(Cell::get) {
+        return Some(blocks);
+    }
+    match selected_variant(dispatch)? {
+        MetalVariant::SdpaVectorTwoPass64 => Some(64),
+        MetalVariant::SdpaVectorTwoPass128 => Some(128),
+        MetalVariant::SdpaVectorTwoPass256 => Some(256),
+        MetalVariant::SdpaVectorTwoPass512 => Some(512),
+        MetalVariant::SdpaVectorTwoPass1024 => Some(1024),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -6861,14 +6834,12 @@ pub(super) fn variant_supported(
         MetalVariant::GatherQuantMatmulGrouped
         | MetalVariant::GatherQuantMatmulGroupedSmallM
         | MetalVariant::GatherQuantMatmulGroupedPairSmallM => grouped_gather_dispatch(dispatch),
-        MetalVariant::SdpaVectorSinglePass => {
-            vector_sdpa_supported(dispatch)?
-                && shape3(dispatch.inputs()[1].layout())?[1] < VECTOR_TWO_PASS_MIN_KEY_LENGTH
-        }
-        MetalVariant::SdpaVectorTwoPass => {
-            vector_sdpa_supported(dispatch)?
-                && shape3(dispatch.inputs()[1].layout())?[1] >= VECTOR_TWO_PASS_MIN_KEY_LENGTH
-        }
+        MetalVariant::SdpaVectorSinglePass
+        | MetalVariant::SdpaVectorTwoPass64
+        | MetalVariant::SdpaVectorTwoPass128
+        | MetalVariant::SdpaVectorTwoPass256
+        | MetalVariant::SdpaVectorTwoPass512
+        | MetalVariant::SdpaVectorTwoPass1024 => vector_sdpa_supported(dispatch)?,
         MetalVariant::SdpaSteel => steel_sdpa_supported(dispatch)?,
         MetalVariant::TopKSingleK8 => dispatch_kernel(dispatch)? == "topk_single",
     })
@@ -10617,18 +10588,27 @@ mod tests {
         .unwrap();
     }
 
-    struct SdpaOverride(Option<SdpaKernel>);
+    struct SdpaOverride(Option<SdpaKernel>, Option<u32>);
 
     impl SdpaOverride {
         fn set(kernel: SdpaKernel) -> Self {
             let previous = FORCED_SDPA_KERNEL.with(|forced| forced.replace(Some(kernel)));
-            Self(previous)
+            let blocks = FORCED_VECTOR_BLOCKS.with(|forced| forced.replace(None));
+            Self(previous, blocks)
+        }
+
+        fn vector_two_pass(blocks: u32) -> Self {
+            let previous =
+                FORCED_SDPA_KERNEL.with(|forced| forced.replace(Some(SdpaKernel::Vector)));
+            let blocks = FORCED_VECTOR_BLOCKS.with(|forced| forced.replace(Some(blocks)));
+            Self(previous, blocks)
         }
     }
 
     impl Drop for SdpaOverride {
         fn drop(&mut self) {
             FORCED_SDPA_KERNEL.with(|forced| forced.set(self.0));
+            FORCED_VECTOR_BLOCKS.with(|forced| forced.set(self.1));
         }
     }
 
@@ -10850,7 +10830,7 @@ mod tests {
 
     #[test]
     fn metal_vector_attention_matches_two_pass_decode() {
-        let _override = SdpaOverride::set(SdpaKernel::Vector);
+        let _override = SdpaOverride::vector_two_pass(64);
         let reference = CpuBackend::new();
         let candidate = MetalBackend::new().unwrap();
         for dtype in [DType::F32, DType::F16, DType::BF16] {

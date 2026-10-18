@@ -34,7 +34,11 @@ pub(crate) enum MetalVariant {
     SdpaPortable,
     SdpaDecomposed,
     SdpaVectorSinglePass,
-    SdpaVectorTwoPass,
+    SdpaVectorTwoPass64,
+    SdpaVectorTwoPass128,
+    SdpaVectorTwoPass256,
+    SdpaVectorTwoPass512,
+    SdpaVectorTwoPass1024,
     SdpaSteel,
     TopKPortable,
     TopKSingleK8,
@@ -653,11 +657,47 @@ pub(crate) static REGISTRY: &[VariantDef<MetalVariant>] = &[
     variant!(
         "sdpa.vector-two-pass",
         Sdpa,
-        SdpaVectorTwoPass,
+        SdpaVectorTwoPass64,
         VECTOR_TWO_PASS,
-        &["decode with key length from 1024 through 65536."],
-        &["prefill or short cache lengths."],
-        &["Uses bounded temporary reductions."]
+        &["decode where 64 reduction blocks fit the target well."],
+        &["prefill or a profile-tuned block count."],
+        &["Uses 64 reduction blocks as the platform-neutral default."]
+    ),
+    variant!(
+        "sdpa.vector-two-pass-128",
+        Sdpa,
+        SdpaVectorTwoPass128,
+        VECTOR_TWO_PASS,
+        &["decode where 128 reduction blocks fit the target well."],
+        &["prefill or shorter cache lengths."],
+        &["Uses 128 reduction blocks chosen by the engine profile."]
+    ),
+    variant!(
+        "sdpa.vector-two-pass-256",
+        Sdpa,
+        SdpaVectorTwoPass256,
+        VECTOR_TWO_PASS,
+        &["decode where 256 reduction blocks fit the target well."],
+        &["prefill or shorter cache lengths."],
+        &["Uses 256 reduction blocks chosen by the engine profile."]
+    ),
+    variant!(
+        "sdpa.vector-two-pass-512",
+        Sdpa,
+        SdpaVectorTwoPass512,
+        VECTOR_TWO_PASS,
+        &["decode where 512 reduction blocks fit the target well."],
+        &["prefill or shorter cache lengths."],
+        &["Uses 512 reduction blocks chosen by the engine profile."]
+    ),
+    variant!(
+        "sdpa.vector-two-pass-1024",
+        Sdpa,
+        SdpaVectorTwoPass1024,
+        VECTOR_TWO_PASS,
+        &["decode where 1024 reduction blocks fit the target well."],
+        &["prefill or shorter cache lengths."],
+        &["Uses 1024 reduction blocks chosen by the engine profile."]
     ),
     variant!(
         "sdpa.steel",
@@ -1666,6 +1706,26 @@ mod tests {
             ),
             (
                 "sdpa.vector-two-pass",
+                sdpa_dispatch(DType::BF16, 2, 1, 1024, 128, 128),
+                "mlx_sdpa_vector_2pass_128",
+            ),
+            (
+                "sdpa.vector-two-pass-128",
+                sdpa_dispatch(DType::BF16, 2, 1, 1024, 128, 128),
+                "mlx_sdpa_vector_2pass_128",
+            ),
+            (
+                "sdpa.vector-two-pass-256",
+                sdpa_dispatch(DType::BF16, 2, 1, 1024, 128, 128),
+                "mlx_sdpa_vector_2pass_128",
+            ),
+            (
+                "sdpa.vector-two-pass-512",
+                sdpa_dispatch(DType::BF16, 2, 1, 1024, 128, 128),
+                "mlx_sdpa_vector_2pass_128",
+            ),
+            (
+                "sdpa.vector-two-pass-1024",
                 sdpa_dispatch(DType::BF16, 2, 1, 1024, 128, 128),
                 "mlx_sdpa_vector_2pass_128",
             ),
