@@ -499,6 +499,7 @@ enum SdpaKernel {
 }
 
 #[cfg(test)]
+/// Bounds the vector-SDPA test fixture to the registered legality limit.
 const VECTOR_MAX_KEY_LENGTH: u32 = 65_536;
 /// Specializes how many elements a partial reduction workgroup consumes.
 const REDUCTION_CHUNK_WIDTH_CONSTANT: u32 = 17;
@@ -524,6 +525,9 @@ const SAMPLE_CHUNKS: usize = 6;
 const SAMPLE_MAX_ROUNDS: usize = 7;
 /// First index reserved for per-round sampling arguments.
 const SAMPLE_ROUND_ARGUMENTS: usize = 8;
+/// Unpinned single-row matrix products use the ordinary GEMV storage traversal.
+const DEFAULT_GEMV_TRANSPOSED: bool = false;
+
 #[derive(Clone, Copy)]
 struct SampleKernelParams {
     position: u32,
@@ -4306,6 +4310,7 @@ impl MetalBackend {
                 .checked_mul(heads_per_group)
                 .ok_or(BackendError::InvalidInput)?;
             let query_group = head_group(query, first_head, heads_per_group)?;
+            let matmul_variant = sdpa_matmul_variant(query_group.layout.shape()[1], true);
             let key_head = head_matrix(key, kv_head, true)?;
             let score_group = head_group(scores, first_head, heads_per_group)?;
             let left = self.prepare_matmul_encoder_input(
@@ -4333,7 +4338,7 @@ impl MetalBackend {
             temporaries.push(self.encode_matmul_kernel(
                 encoder,
                 table,
-                None,
+                Some(matmul_variant),
                 None,
                 &left,
                 &right,
@@ -4424,7 +4429,7 @@ impl MetalBackend {
             temporaries.push(self.encode_matmul_kernel(
                 encoder,
                 table,
-                None,
+                Some(sdpa_matmul_variant(query_length, false)),
                 None,
                 &left,
                 &right,
@@ -4655,7 +4660,7 @@ impl MetalBackend {
                     Some(MetalVariant::MatmulGemv) => false,
                     Some(MetalVariant::MatmulGemvTransposed) => true,
                     Some(_) => return Err(BackendError::InvalidInput),
-                    None => shape.right_column_major && !shape.left_column_major,
+                    None => DEFAULT_GEMV_TRANSPOSED,
                 };
                 let (kernel, block_columns, thread_count) = if transposed {
                     ("gemv_transposed", 32, 256)
@@ -6532,6 +6537,18 @@ fn shape3(layout: &Layout) -> Result<[u32; 3], BackendError> {
         .shape()
         .try_into()
         .map_err(|_| BackendError::InvalidInput)
+}
+
+fn sdpa_matmul_variant(rows: u32, right_transposed: bool) -> MetalVariant {
+    if rows == 1 {
+        if right_transposed {
+            MetalVariant::MatmulGemvTransposed
+        } else {
+            MetalVariant::MatmulGemv
+        }
+    } else {
+        MetalVariant::MatmulPortable
+    }
 }
 
 fn supported_dispatch(dispatch: &Dispatch) -> bool {
@@ -10846,6 +10863,16 @@ mod tests {
         };
         submission.wait().unwrap();
         backend.read(output).unwrap()
+    }
+
+    #[test]
+    fn sdpa_matmul_variants_are_explicit() {
+        assert_eq!(
+            sdpa_matmul_variant(1, true),
+            MetalVariant::MatmulGemvTransposed
+        );
+        assert_eq!(sdpa_matmul_variant(1, false), MetalVariant::MatmulGemv);
+        assert_eq!(sdpa_matmul_variant(2, true), MetalVariant::MatmulPortable);
     }
 
     #[test]
