@@ -6,8 +6,8 @@ below 2048 tokens use 512-token prefill chunks; longer prompts use 2048-token ch
 remainders capped at 16 tokens. The two planners retain at most two full-chunk and seven exact-tail
 graphs between them.
 
-The default profile stores K/V in f16. It passed reduced-precision verification with a 2.01e-4
-teacher-forced mean KL, 64/64 top-1 agreement, and a 4.83e-4 maximum layer-relative error; its
+The default profile stores K/V in f16. It passed reduced-precision verification with a 2.012e-4
+teacher-forced mean KL, 64/64 top-1 agreement, and a 4.826e-4 maximum layer-relative error; its
 64/64 free-running agreement is informational. The `.kv-f32` profile keeps exact f32 cache storage
 and passed strict verification with exact teacher-forced and free-running top-1 agreement and a
 4.18e-6 maximum layer-relative error. Choose `.kv-f32` when exact-cache reproducibility matters;
@@ -47,24 +47,32 @@ Accepted pp512/tg128 results use 30 measured repetitions on an 80-core Apple M3 
 
 | KV cache | Selection | PP tok/s | TG tok/s |
 | --- | --- | ---: | ---: |
-| f16 | GPU sequential | 1221.81 | 71.53 |
-| f16 | GPU pipelined | 1220.90 | 98.02 |
+| f16 | GPU sequential | 1267.45 | 71.19 |
+| f16 | GPU pipelined | 1267.26 | 98.14 |
 | f32 | GPU sequential | 1218.97 | 71.62 |
 | f32 | GPU pipelined | 1220.69 | 98.21 |
 
-Long-context prompt processing benefits more from the smaller cache, but remains outside the
-1.25x MLX-LM target. Median wall throughput from matched five-repetition runs was:
+The f16 profile uses half-precision Q, K, V, and probability MMA inputs with f32 score, softmax,
+and output accumulation. Median wall throughput from matched five-repetition runs was:
 
-| Prompt | f16 | bf16 | f32 | MLX-LM | f16 gap |
-| ---: | ---: | ---: | ---: | ---: | ---: |
-| 2048 | 1255.90 | 1254.56 | 1252.53 | 2961.97 | 2.36x |
-| 8192 | 831.47 | 838.09 | 786.85 | 2286.70 | 2.75x |
-| 16384 | 525.29 | 526.74 | 485.83 | 1720.25 | 3.28x |
+| Prompt | f16 before | f16 after | Improvement | f32 | MLX-LM | f16 gap |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 2048 | 1254.54 | 1362.10 | 8.6% | 1251.42 | 2961.97 | 2.17x |
+| 8192 | 833.26 | 1144.98 | 37.4% | 786.49 | 2286.70 | 2.00x |
+| 16384 | 524.50 | 902.93 | 72.2% | 485.89 | 1720.25 | 1.91x |
+
+At 16K, the attention profile fell from 5.237 to 1.835 seconds, a 2.85x kernel-level speedup,
+and its GPU share fell from 77.8% to 58.9%. The end-to-end result remains outside the 1.25x
+MLX-LM target; quantized gather matmul is now the largest secondary cost. The f32 results remain
+within 0.1% of the preceding measurements because that profile retains the original Steel path.
+The f16 verification rerun changed teacher-forced mean KL only from 2.01e-4 to 2.012e-4 and kept
+64/64 top-1 agreement.
 
 At 32760 prompt tokens, f16 reached 194.70 tok/s with a 36.3 GiB physical-footprint peak and
-19.4 GiB guarded RSS, versus 186.61 tok/s, 39.5 GiB, and 22.4 GiB for f32. HTTP measurements for a
-2048-token cached prefix plus 33 fresh tokens put f16/f32 uncached TTFT at 1.850/1.853 seconds,
-cached TTFT at 135.8/136.5 ms, and cached ITL at 11.76/11.02 ms. The precision ABBA tg128 runs
-differed by less than 0.5% after bracketing run-order drift.
+19.4 GiB guarded RSS, versus 186.61 tok/s, 39.5 GiB, and 22.4 GiB for f32. A warmed 100-request
+HTTP run with a 2048-token cached prefix plus 33 fresh tokens measured f16 cached TTFT at
+141.3/143.1/144.2 ms and ITL at 11.79/12.40/14.53 ms at p50/p90/p99. Exact cache reuse was 2048
+tokens. Old/new tg128 ABBA runs on Qwen3, OLMoE, and Qwen3-Coder differed by less than 0.1% after
+bracketing run-order drift.
 
 The complete confidence intervals and provenance are in the profile's `bench` directory.
