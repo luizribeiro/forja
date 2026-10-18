@@ -32,6 +32,7 @@ prefill-chunk = 512
 "dense.prefill-f32-small" = "matmul.steel-64x32x32-2x2"
 "dense.prefill-f32-transposed" = "matmul.steel-32x64x16-1x2"
 "top-k" = "top-k.single-k8"
+"sample" = "sample.portable"
 "attention.prefill-small" = "sdpa.decomposed"
 
 [variants.rules."attention.decode"]

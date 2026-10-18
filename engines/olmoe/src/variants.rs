@@ -14,6 +14,7 @@ const SITES: &[&str] = &[
     "dense.prefill-f32-small",
     "dense.prefill-f32-transposed",
     "top-k",
+    "sample",
     "attention.decode",
     "attention.prefill-large",
     "attention.prefill-small",
@@ -48,6 +49,10 @@ impl Variants {
 
     pub(crate) fn top_k(&self) -> Result<Variant> {
         self.0.at("top-k", 0)
+    }
+
+    pub(crate) fn sample(&self) -> Result<Variant> {
+        self.0.at("sample", 0)
     }
 
     pub(crate) fn attention(
