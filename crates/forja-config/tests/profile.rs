@@ -1,6 +1,6 @@
 //! Engine profile schema and validation checks.
 
-use forja_config::{ActivationFormat, Profile, WeightFormat};
+use forja_config::{ActivationFormat, KvCacheFormat, Profile, WeightFormat};
 
 const PROFILE: &str = r#"
 schema-version = 1
@@ -57,6 +57,7 @@ fn parses_and_canonicalizes_a_dense_profile() {
     assert_eq!(profile.family(), "qwen3");
     assert_eq!(profile.numerics().activations, ActivationFormat::Bf16);
     assert_eq!(profile.numerics().weights, WeightFormat::Bf16);
+    assert_eq!(profile.numerics().kv_cache, KvCacheFormat::F32);
     assert_eq!(profile.default_tunings(), ["residual-norm", "qk-norm-rope"]);
     assert_eq!(profile.build().features, ["bf16"]);
     assert!(profile.quantization().is_none());
@@ -67,6 +68,33 @@ fn parses_and_canonicalizes_a_dense_profile() {
     assert_eq!(canonical, profile.canonical_toml().unwrap());
     assert_eq!(profile.sha256().unwrap().len(), 71);
     assert_eq!(profile.sha256().unwrap(), reparsed.sha256().unwrap());
+}
+
+#[test]
+fn validates_kv_cache_format_and_includes_it_in_identity() {
+    let legacy: Profile = toml::from_str(PROFILE).unwrap();
+    let f32: Profile = toml::from_str(&PROFILE.replace(
+        "weights = \"bf16\"",
+        "weights = \"bf16\"\nkv-cache = \"f32\"",
+    ))
+    .unwrap();
+    assert_eq!(legacy, f32);
+    assert_eq!(legacy.sha256().unwrap(), f32.sha256().unwrap());
+
+    let f16: Profile = toml::from_str(&PROFILE.replace(
+        "weights = \"bf16\"",
+        "weights = \"bf16\"\nkv-cache = \"f16\"",
+    ))
+    .unwrap();
+    assert_eq!(f16.numerics().kv_cache, KvCacheFormat::F16);
+    assert_ne!(f16.sha256().unwrap(), f32.sha256().unwrap());
+    assert!(
+        error(&PROFILE.replace(
+            "weights = \"bf16\"",
+            "weights = \"bf16\"\nkv-cache = \"fp16\""
+        ))
+        .contains("unknown variant")
+    );
 }
 
 #[test]

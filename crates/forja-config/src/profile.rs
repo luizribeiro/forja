@@ -225,12 +225,27 @@ impl DeviceFamily {
 
 /// Activation and weight formats.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 pub struct Numerics {
     /// Scalar activation format.
     pub activations: ActivationFormat,
     /// Scalar or quantized weight format.
     pub weights: WeightFormat,
+    /// Key/value cache storage format.
+    pub kv_cache: KvCacheFormat,
+}
+
+/// Supported key/value cache formats.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum KvCacheFormat {
+    /// IEEE 754 binary16.
+    F16,
+    /// Brain floating point.
+    Bf16,
+    /// IEEE 754 binary32.
+    #[default]
+    F32,
 }
 
 /// Supported activation format.
