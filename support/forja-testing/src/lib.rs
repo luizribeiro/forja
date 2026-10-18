@@ -601,6 +601,45 @@ where
     R: Backend,
     C: Backend,
 {
+    let (expected, actual) = backend_output_bytes(reference, candidate, op, inputs, output)?;
+    assert_outputs_agree(output.dtype, &expected, &actual)
+}
+
+/// Runs identical initialized work and checks output with another dtype's numeric tolerance.
+///
+/// This is used when a floating-point input controls the operation's accepted error while the
+/// output remains f32.
+///
+/// # Errors
+///
+/// Returns a backend, encoding, size, dtype, or tolerance error.
+pub fn assert_backends_agree_at_tolerance<R, C>(
+    reference: &R,
+    candidate: &C,
+    op: Op,
+    inputs: &[TensorSpec],
+    output: &TensorSpec,
+    tolerance_dtype: DType,
+) -> Result<(), AgreementError>
+where
+    R: Backend,
+    C: Backend,
+{
+    let (expected, actual) = backend_output_bytes(reference, candidate, op, inputs, output)?;
+    assert_outputs_agree_at_tolerance(output.dtype, tolerance_dtype, &expected, &actual)
+}
+
+fn backend_output_bytes<R, C>(
+    reference: &R,
+    candidate: &C,
+    op: Op,
+    inputs: &[TensorSpec],
+    output: &TensorSpec,
+) -> Result<(Vec<u8>, Vec<u8>), AgreementError>
+where
+    R: Backend,
+    C: Backend,
+{
     let mut values = DeterministicValues::new(0x6a09_e667_f3bc_c909);
     let mut reference_inputs = Vec::with_capacity(inputs.len());
     let mut candidate_inputs = Vec::with_capacity(inputs.len());
@@ -613,9 +652,10 @@ where
     let candidate_output = allocate(candidate, output)?;
     run(reference, op, &reference_inputs, &reference_output)?;
     run(candidate, op, &candidate_inputs, &candidate_output)?;
-    let expected_bytes = reference.read(&reference_output)?;
-    let actual_bytes = candidate.read(&candidate_output)?;
-    assert_outputs_agree(output.dtype, &expected_bytes, &actual_bytes)
+    Ok((
+        reference.read(&reference_output)?,
+        candidate.read(&candidate_output)?,
+    ))
 }
 
 /// Runs identical initialized multi-output work on two backends and checks every output.
@@ -856,6 +896,20 @@ pub fn assert_outputs_agree(
     }
     let tolerance = dtype_tolerance(dtype)?;
     assert_float_values_agree(&expected, &actual, tolerance)
+}
+
+fn assert_outputs_agree_at_tolerance(
+    output_dtype: DType,
+    tolerance_dtype: DType,
+    expected_bytes: &[u8],
+    actual_bytes: &[u8],
+) -> Result<(), AgreementError> {
+    let expected = decode(expected_bytes, output_dtype)?;
+    let actual = decode(actual_bytes, output_dtype)?;
+    if expected.len() != actual.len() {
+        return Err(AgreementError::OutputMismatch);
+    }
+    assert_float_values_agree(&expected, &actual, dtype_tolerance(tolerance_dtype)?)
 }
 
 fn run<B: Backend>(

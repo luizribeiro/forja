@@ -180,7 +180,7 @@ fn stack_projection<T: forja_sdk::Element>(
     let output = Tensor::zeros(&[rows, width])?;
     let mut offset = 0_u32;
     for (prefix, rows) in projections {
-        let source = weights.scoped(prefix).tensor(name, &[*rows, width])?;
+        let source = weights.scoped(prefix).tensor::<T>(name, &[*rows, width])?;
         let mut destination = output.narrow(0, offset, *rows)?;
         source.copy_into(&mut destination)?;
         offset = offset

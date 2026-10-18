@@ -68,6 +68,12 @@ impl Guest for Component {
         }
     }
 
+    async fn sdpa_dtype_refusals() -> Result<(), String> {
+        expect_sdpa_refusal(Dtype::F16, Dtype::Bf16)?;
+        expect_sdpa_refusal(Dtype::F32, Dtype::F16)?;
+        expect_sdpa_refusal(Dtype::U32, Dtype::U32)
+    }
+
     async fn churn_kernels() -> Result<u32, String> {
         let mut kernels = Vec::new();
         for value in 0_u16..100 {
@@ -236,6 +242,31 @@ fn expect_quota<T>(result: Result<T, Error>) -> Result<(), String> {
         Err(Error::Quota(_)) => Ok(()),
         Err(error) => Err(format!("over-limit tensor returned {error:?}")),
         Ok(_) => Err("over-limit tensor was accepted".to_owned()),
+    }
+}
+
+fn expect_sdpa_refusal(key_dtype: Dtype, value_dtype: Dtype) -> Result<(), String> {
+    let query = Tensor::alloc(Dtype::F32, &[4, 2, 3]).map_err(error)?;
+    let key = Tensor::alloc(key_dtype, &[2, 3, 3]).map_err(error)?;
+    let value = Tensor::alloc(value_dtype, &[2, 3, 2]).map_err(error)?;
+    let output = Tensor::alloc(Dtype::F32, &[4, 2, 2]).map_err(error)?;
+    let commands = CommandList::new();
+    match commands.dispatch(
+        Op::Sdpa(l9o::gpu::compute::SdpaCfg {
+            scale: 1.0,
+            causal: false,
+            q_start: Affine {
+                param: None,
+                scale: 0,
+                offset: 0,
+            },
+        }),
+        &[&query, &key, &value],
+        &output,
+    ) {
+        Err(Error::OpSignature(_)) => Ok(()),
+        Err(error) => Err(format!("invalid attention dtypes returned {error:?}")),
+        Ok(()) => Err("invalid attention dtypes were accepted".to_owned()),
     }
 }
 

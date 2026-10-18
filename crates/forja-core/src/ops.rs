@@ -1777,8 +1777,13 @@ fn check_sdpa(
             actual: inputs.len(),
         });
     }
-    for (index, input) in inputs.iter().enumerate() {
-        check_float(input, Operand::Input(index))?;
+    check_float(inputs[0], Operand::Input(0))?;
+    check_float(inputs[1], Operand::Input(1))?;
+    if inputs[2].layout.dtype() != inputs[1].layout.dtype() {
+        return Err(OpError::DType {
+            operand: Operand::Input(2),
+            dtype: inputs[2].layout.dtype(),
+        });
     }
     check_float(output, Operand::Output)?;
     if !scale.is_finite() {
@@ -2828,5 +2833,49 @@ mod tests {
                 operand: Operand::Input(0)
             })
         );
+    }
+
+    #[test]
+    fn sdpa_rejects_mismatched_or_unsupported_cache_dtypes() {
+        let q = tensor(1, DType::F32, &[4, 2, 3], &[6, 3, 1]);
+        let output = tensor(2, DType::F32, &[4, 2, 2], &[4, 2, 1]);
+        let op = Op::Sdpa {
+            scale: 1.0,
+            causal: false,
+            q_start: 0,
+        };
+        for (key_dtype, value_dtype, expected) in [
+            (
+                DType::F16,
+                DType::BF16,
+                OpError::DType {
+                    operand: Operand::Input(2),
+                    dtype: DType::BF16,
+                },
+            ),
+            (
+                DType::F32,
+                DType::F16,
+                OpError::DType {
+                    operand: Operand::Input(2),
+                    dtype: DType::F16,
+                },
+            ),
+            (
+                DType::U32,
+                DType::U32,
+                OpError::DType {
+                    operand: Operand::Input(1),
+                    dtype: DType::U32,
+                },
+            ),
+        ] {
+            let key = tensor(3, key_dtype, &[2, 3, 3], &[9, 3, 1]);
+            let value = tensor(4, value_dtype, &[2, 3, 2], &[6, 2, 1]);
+            assert_eq!(
+                CommandList::new().dispatch(op, &[&q, &key, &value], &output),
+                Err(expected)
+            );
+        }
     }
 }

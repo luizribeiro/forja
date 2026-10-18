@@ -7,10 +7,10 @@ use crate::{Dim, Element, Error, Result, Tensor, graph, sys};
 /// # Errors
 ///
 /// Returns an error for incompatible shapes, types, scale, or a refused dispatch.
-pub fn sdpa<T: Element>(
+pub fn sdpa<T: Element, K: Element>(
     query: &Tensor<T>,
-    key: &Tensor<T>,
-    value: &Tensor<T>,
+    key: &Tensor<K>,
+    value: &Tensor<K>,
     scale: f32,
     causal: bool,
     q_start: impl Into<Dim>,
@@ -24,10 +24,10 @@ pub fn sdpa<T: Element>(
 /// # Errors
 ///
 /// Returns an error for incompatible inputs, rule context, or a host-refused selection.
-pub fn sdpa_with<'a, T: Element>(
+pub fn sdpa_with<'a, T: Element, K: Element>(
     query: &Tensor<T>,
-    key: &Tensor<T>,
-    value: &Tensor<T>,
+    key: &Tensor<K>,
+    value: &Tensor<K>,
     scale: f32,
     causal: bool,
     q_start: impl Into<Dim>,
@@ -45,10 +45,10 @@ pub fn sdpa_with<'a, T: Element>(
     )
 }
 
-fn sdpa_selected<T: Element>(
+fn sdpa_selected<T: Element, K: Element>(
     query: &Tensor<T>,
-    key: &Tensor<T>,
-    value: &Tensor<T>,
+    key: &Tensor<K>,
+    value: &Tensor<K>,
     scale: f32,
     causal: bool,
     q_start: &Dim,
@@ -68,10 +68,10 @@ fn sdpa_selected<T: Element>(
 /// # Errors
 ///
 /// Returns an error for incompatible shapes, types, scale, or a refused dispatch.
-pub fn sdpa_into<T: Element>(
+pub fn sdpa_into<T: Element, K: Element>(
     query: &Tensor<T>,
-    key: &Tensor<T>,
-    value: &Tensor<T>,
+    key: &Tensor<K>,
+    value: &Tensor<K>,
     output: &Tensor<T>,
     scale: f32,
     causal: bool,
@@ -87,10 +87,10 @@ pub fn sdpa_into<T: Element>(
 ///
 /// Returns an error for incompatible inputs, rule context, or a host-refused selection.
 #[allow(clippy::too_many_arguments)]
-pub fn sdpa_into_with<'a, T: Element>(
+pub fn sdpa_into_with<'a, T: Element, K: Element>(
     query: &Tensor<T>,
-    key: &Tensor<T>,
-    value: &Tensor<T>,
+    key: &Tensor<K>,
+    value: &Tensor<K>,
     output: &Tensor<T>,
     scale: f32,
     causal: bool,
@@ -111,10 +111,10 @@ pub fn sdpa_into_with<'a, T: Element>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn sdpa_into_selected<T: Element>(
+fn sdpa_into_selected<T: Element, K: Element>(
     query: &Tensor<T>,
-    key: &Tensor<T>,
-    value: &Tensor<T>,
+    key: &Tensor<K>,
+    value: &Tensor<K>,
     output: &Tensor<T>,
     scale: f32,
     causal: bool,

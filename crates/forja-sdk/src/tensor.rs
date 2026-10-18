@@ -1390,7 +1390,7 @@ impl<T: Element> Tensor<T> {
     /// # Errors
     ///
     /// Returns an error for incompatible shapes, types, aliasing, or dispatches.
-    pub fn copy_into(&self, destination: &mut Self) -> Result<()> {
+    pub fn copy_into<U: Element>(&self, destination: &mut Tensor<U>) -> Result<()> {
         graph::record(sys::Op::Copy, &[&self.handle], &destination.handle)
     }
 

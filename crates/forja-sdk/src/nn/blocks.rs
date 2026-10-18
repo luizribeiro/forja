@@ -1158,10 +1158,10 @@ impl<T: Element> KvCache<T> {
     /// # Errors
     ///
     /// Returns an error for invalid ranges, shapes, aliasing, or refused copies.
-    pub fn append(
+    pub fn append<U: Element>(
         &mut self,
-        key: &Tensor<T>,
-        value: &Tensor<T>,
+        key: &Tensor<U>,
+        value: &Tensor<U>,
         start: &Dim,
         sequence: u32,
         end: &Dim,
@@ -1234,10 +1234,10 @@ impl<T: FloatElement> KvCache<T> {
     }
 }
 
-fn attend_cached<T: Element>(
+fn attend_cached<T: Element, K: Element>(
     query: &Tensor<T>,
-    key: &Tensor<T>,
-    value: &Tensor<T>,
+    key: &Tensor<K>,
+    value: &Tensor<K>,
     scale: f32,
     start: &Dim,
 ) -> Result<Tensor<T>> {
@@ -1291,11 +1291,11 @@ pub fn projected_cached_attention<T: FloatElement>(
 /// # Errors
 ///
 /// Returns an error for incompatible shapes, an invalid cache range, overflow, or refused work.
-pub fn cached_attention<T: Element>(
+pub fn cached_attention<T: Element, C: Element>(
     query: &Tensor<T>,
     key: &Tensor<T>,
     value: &Tensor<T>,
-    cache: &mut KvCache<T>,
+    cache: &mut KvCache<C>,
     scale: f32,
     start: &Dim,
     end: &Dim,
@@ -1309,11 +1309,11 @@ pub fn cached_attention<T: Element>(
 ///
 /// Returns an error for incompatible shapes, cache ranges, rule context, or a refused selection.
 #[allow(clippy::too_many_arguments)]
-pub fn cached_attention_with<'a, T: Element>(
+pub fn cached_attention_with<'a, T: Element, C: Element>(
     query: &Tensor<T>,
     key: &Tensor<T>,
     value: &Tensor<T>,
-    cache: &mut KvCache<T>,
+    cache: &mut KvCache<C>,
     scale: f32,
     start: &Dim,
     end: &Dim,
@@ -1332,11 +1332,11 @@ pub fn cached_attention_with<'a, T: Element>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn cached_attention_selected<T: Element>(
+fn cached_attention_selected<T: Element, C: Element>(
     query: &Tensor<T>,
     key: &Tensor<T>,
     value: &Tensor<T>,
-    cache: &mut KvCache<T>,
+    cache: &mut KvCache<C>,
     scale: f32,
     start: &Dim,
     end: &Dim,

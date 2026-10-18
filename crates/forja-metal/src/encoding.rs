@@ -7832,8 +7832,8 @@ mod tests {
     };
     use forja_cpu::CpuBackend;
     use forja_testing::{
-        DifferentialComparison, TensorSpec, assert_backends_agree, assert_fused_decomposed,
-        assert_outputs_agree,
+        DifferentialComparison, TensorSpec, assert_backends_agree,
+        assert_backends_agree_at_tolerance, assert_fused_decomposed, assert_outputs_agree,
     };
 
     use super::*;
@@ -10624,6 +10624,34 @@ mod tests {
         assert_sdpa(op, query, key, value, output);
     }
 
+    fn assert_mixed_sdpa(
+        kernel: SdpaKernel,
+        blocks: Option<u32>,
+        query_length: u32,
+        key_length: u32,
+        cache_dtype: DType,
+    ) {
+        let _override =
+            blocks.map_or_else(|| SdpaOverride::set(kernel), SdpaOverride::vector_two_pass);
+        assert_backends_agree_at_tolerance(
+            &CpuBackend::new(),
+            &MetalBackend::new().unwrap(),
+            Op::Sdpa {
+                scale: 128.0_f32.sqrt().recip(),
+                causal: true,
+                q_start: key_length - query_length,
+            },
+            &[
+                TensorSpec::contiguous(DType::F32, &[16, query_length, 128]),
+                TensorSpec::contiguous(cache_dtype, &[8, key_length, 128]),
+                TensorSpec::contiguous(cache_dtype, &[8, key_length, 128]),
+            ],
+            &TensorSpec::contiguous(DType::F32, &[16, query_length, 128]),
+            cache_dtype,
+        )
+        .unwrap();
+    }
+
     fn patterned_bf16(count: usize, modulus: u16) -> Vec<u8> {
         (0..count)
             .flat_map(|index| {
@@ -10857,6 +10885,16 @@ mod tests {
                 )
                 .unwrap();
             }
+        }
+    }
+
+    #[test]
+    fn metal_attention_paths_accept_reduced_precision_cache() {
+        for dtype in [DType::F16, DType::BF16] {
+            assert_mixed_sdpa(SdpaKernel::Decomposed, None, 7, 33, dtype);
+            assert_mixed_sdpa(SdpaKernel::Steel, None, 7, 33, dtype);
+            assert_mixed_sdpa(SdpaKernel::Vector, None, 1, 33, dtype);
+            assert_mixed_sdpa(SdpaKernel::Vector, Some(64), 1, 1024, dtype);
         }
     }
 

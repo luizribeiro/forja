@@ -305,6 +305,23 @@ async fn large_broadcast_is_only_usable_without_reading() -> wasmtime::Result<()
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn raw_guest_sdpa_refuses_invalid_cache_dtypes() -> wasmtime::Result<()> {
+    let (mut store, instance) = instantiate(
+        forja_cpu::CpuBackend::new(),
+        test_guests::tensor_abuse(),
+        LIMITS,
+    )
+    .await?;
+    let refusals =
+        instance.get_typed_func::<(), (Result<(), String>,)>(&mut store, "sdpa-dtype-refusals")?;
+    Host::reset_guest_deadline(&mut store);
+    let (result,) = store
+        .run_concurrent(async move |accessor| refusals.call_concurrent(accessor, ()).await)
+        .await??;
+    result.map_err(wasmtime::Error::msg)
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn kernel_churn_returns_a_quota_error() -> wasmtime::Result<()> {
     let limits = LIMITS.with_kernel_limit(4);
     let (mut store, instance) = instantiate(
