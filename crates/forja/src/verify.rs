@@ -210,6 +210,8 @@ async fn verify<B>(
 where
     B: Backend + Send + Sync + 'static,
 {
+    let profile = crate::resolution::read_embedded_profile(source.component)?;
+    let precision = verification_precision(profile.numerics().kv_cache, options.precision);
     let mut runner = EngineRunner::new(
         source.component,
         backend,
@@ -249,7 +251,7 @@ where
         let prompt = verify_prompt(
             &mut runner,
             fixture,
-            options.precision,
+            precision,
             usize::try_from(info.vocab)?,
             decode_steps,
         )
@@ -257,7 +259,7 @@ where
         summary.maximum_layer_error = summary.maximum_layer_error.max(prompt.maximum_layer_error);
         summary.teacher_forced.include(prompt.teacher_forced);
         summary.free_running.include(prompt.free_running);
-        let fixture_passed = match options.precision {
+        let fixture_passed = match precision {
             Precision::F32 => prompt.passed,
             Precision::Bf16 => prompt.layers_passed,
         };
@@ -266,7 +268,7 @@ where
         }
         passed &= fixture_passed;
     }
-    if options.precision == Precision::Bf16 {
+    if precision == Precision::Bf16 {
         let teacher_passed = summary.teacher_forced.mean_kl() <= BF16_LOGIT_KL_TOLERANCE
             && top1_passes(summary.teacher_forced);
         passed &= teacher_passed;
@@ -286,6 +288,16 @@ where
             .or(first_fixture)
             .unwrap_or_else(|| "unknown".to_owned());
         Err(format!("verification failed for fixture {fixture:?}").into())
+    }
+}
+
+fn verification_precision(
+    kv_cache: forja_config::KvCacheFormat,
+    requested: Precision,
+) -> Precision {
+    match kv_cache {
+        forja_config::KvCacheFormat::F32 => requested,
+        forja_config::KvCacheFormat::F16 | forja_config::KvCacheFormat::Bf16 => Precision::Bf16,
     }
 }
 
@@ -739,6 +751,23 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn reduced_kv_cache_selects_teacher_forced_criteria() {
+        assert_eq!(
+            verification_precision(forja_config::KvCacheFormat::F32, Precision::F32),
+            Precision::F32
+        );
+        for format in [
+            forja_config::KvCacheFormat::F16,
+            forja_config::KvCacheFormat::Bf16,
+        ] {
+            assert_eq!(
+                verification_precision(format, Precision::F32),
+                Precision::Bf16
+            );
+        }
+    }
 
     #[cfg(target_os = "macos")]
     #[test]
