@@ -115,12 +115,14 @@ struct SteelMMATile {
     }
 };
 
-template <typename T, int rows, int columns, int inner>
+template <
+    typename T, typename A, typename B, typename C,
+    int rows, int columns, int inner>
 void steel_tile_multiply(
     thread SteelMMATile<T, rows, columns> &result,
-    thread SteelMMATile<T, rows, inner> &left,
-    thread SteelMMATile<T, inner, columns> &right,
-    thread SteelMMATile<T, rows, columns> &accumulator) {
+    thread SteelMMATile<A, rows, inner> &left,
+    thread SteelMMATile<B, inner, columns> &right,
+    thread SteelMMATile<C, rows, columns> &accumulator) {
     for (short row = 0; row < rows; ++row) {
         for (short column = 0; column < columns; ++column) {
             for (short reduction = 0; reduction < inner; ++reduction) {

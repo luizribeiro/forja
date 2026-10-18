@@ -3,6 +3,7 @@
 
 template <int rows, int columns>
 struct BlockLoader {
+    template <typename T>
     static void load_to(
         device const uchar *source,
         ulong base,
@@ -15,7 +16,7 @@ struct BlockLoader {
         uint column_extent,
         bool rows_aligned,
         bool columns_aligned,
-        threadgroup float *destination,
+        threadgroup T *destination,
         uint destination_row_stride,
         uint destination_column_stride,
         uint thread_index,
@@ -29,10 +30,11 @@ struct BlockLoader {
                           ulong(column_origin + column) * column_stride;
             uint destination_index = row * destination_row_stride
                 + column * destination_column_stride;
-            destination[destination_index] = valid ? load_float(source, index, dtype) : 0.0f;
+            destination[destination_index] = valid ? T(load_float(source, index, dtype)) : T(0);
         }
     }
 
+    template <typename T>
     static void load(
         device const uchar *source,
         ulong base,
@@ -45,7 +47,7 @@ struct BlockLoader {
         uint column_extent,
         bool rows_aligned,
         bool columns_aligned,
-        threadgroup float *destination,
+        threadgroup T *destination,
         uint thread_index,
         uint thread_count) {
         load_to(
