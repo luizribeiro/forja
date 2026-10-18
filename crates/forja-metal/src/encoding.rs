@@ -495,6 +495,7 @@ fn log_matmul_route(
 enum SdpaKernel {
     Vector,
     Steel,
+    SteelHalf,
     Decomposed,
 }
 
@@ -3936,16 +3937,38 @@ impl MetalBackend {
         else {
             return Err(BackendError::InvalidInput);
         };
-        match select_sdpa(dispatch)? {
+        match self.prepare_sdpa_kernel(dispatch)? {
             SdpaKernel::Vector => self.encode_vector_sdpa(
                 encoder, table, dispatch, scale, causal, q_start, bindings, arguments,
             ),
-            SdpaKernel::Steel => self.encode_steel_sdpa(
-                encoder, table, dispatch, scale, causal, q_start, bindings, arguments,
+            kernel @ (SdpaKernel::Steel | SdpaKernel::SteelHalf) => self.encode_steel_sdpa(
+                encoder, table, dispatch, scale, causal, q_start, kernel, bindings, arguments,
             ),
             SdpaKernel::Decomposed => self.encode_decomposed_sdpa(
                 encoder, table, dispatch, scale, causal, q_start, bindings, arguments,
             ),
+        }
+    }
+
+    fn prepare_sdpa_kernel(&self, dispatch: &Dispatch) -> Result<SdpaKernel, BackendError> {
+        let kernel = select_sdpa(dispatch)?;
+        if !matches!(kernel, SdpaKernel::Steel | SdpaKernel::SteelHalf) {
+            return Ok(kernel);
+        }
+        let [query, _, _] = dispatch.inputs() else {
+            return Err(BackendError::InvalidInput);
+        };
+        let [_, _, width] = shape3(query.layout())?;
+        let constants = steel_attention_constants(dispatch, kernel)?;
+        match self
+            .pipelines
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?
+            .get(steel_attention_kernel(kernel, width)?, &constants)
+        {
+            Ok(_) => Ok(kernel),
+            Err(BackendError::UnsupportedOperation) => Ok(SdpaKernel::Decomposed),
+            Err(error) => Err(error),
         }
     }
 
@@ -4126,6 +4149,7 @@ impl MetalBackend {
         scale: f32,
         causal: bool,
         q_start: u32,
+        kernel: SdpaKernel,
         bindings: &mut ArgumentBindings,
         arguments: &mut ArgumentWriter,
     ) -> Result<Vec<BufferBinding>, BackendError> {
@@ -4139,26 +4163,16 @@ impl MetalBackend {
         let value = self.encoder_tensor(value_tensor)?;
         let output = self.encoder_tensor(dispatch.output())?;
         let [query_heads, query_length, width] = shape3(&query.layout)?;
-        let [_, key_length, _] = shape3(&key.layout)?;
-        let block_query = 32;
-        let block_key = if width == 64 { 32 } else { 16 };
-        let params = Self::sdpa_params(
-            &query, &key, &value, &output, scale, causal, q_start, 1, arguments,
-        )?;
-        let constants = [
-            (0, dtype_code(query.layout.dtype())),
-            (1, dtype_code(key.layout.dtype())),
-            (2, dtype_code(output.layout.dtype())),
-            (3, dtype_code(value.layout.dtype())),
-            (210, u32::from(query_length % block_query == 0)),
-            (211, u32::from(key_length % block_key == 0)),
-            (212, u32::from(causal)),
-        ];
+        let (block_query, _) = steel_attention_tile(kernel, width)?;
+        let constants = steel_attention_constants(dispatch, kernel)?;
         let pipeline = self
             .pipelines
             .lock()
             .map_err(|_| BackendError::ExecutionFailed)?
-            .get(steel_attention_kernel(width)?, &constants)?;
+            .get(steel_attention_kernel(kernel, width)?, &constants)?;
+        let params = Self::sdpa_params(
+            &query, &key, &value, &output, scale, causal, q_start, 1, arguments,
+        )?;
         set_pipeline(encoder, &pipeline);
         for (index, tensor) in [&query, &key, &value, &output].into_iter().enumerate() {
             bindings.bind(table, index, &tensor.buffer);
@@ -4175,7 +4189,7 @@ impl MetalBackend {
             },
             MTLSize {
                 width: 32,
-                height: 4,
+                height: usize::try_from(block_query / 8).map_err(|_| BackendError::InvalidInput)?,
                 depth: 1,
             },
         );
@@ -6224,7 +6238,7 @@ impl MetalBackend {
         dispatch: &Dispatch,
         arguments: &mut ArgumentSizer,
     ) -> Result<(), BackendError> {
-        if select_sdpa(dispatch)? != SdpaKernel::Decomposed {
+        if self.prepare_sdpa_kernel(dispatch)? != SdpaKernel::Decomposed {
             return arguments.write(172);
         }
         let [query, key, value] = dispatch.inputs() else {
@@ -6782,7 +6796,9 @@ fn sdpa_kernel(dispatch: &Dispatch) -> Result<&'static str, BackendError> {
             },
             width,
         )?,
-        SdpaKernel::Steel => steel_attention_kernel(width)?,
+        kernel @ (SdpaKernel::Steel | SdpaKernel::SteelHalf) => {
+            steel_attention_kernel(kernel, width)?
+        }
         SdpaKernel::Decomposed => "sdpa_decomposed",
     })
 }
@@ -6861,12 +6877,47 @@ fn vector_kernel(prefix: &str, width: u32) -> Result<&'static str, BackendError>
     }
 }
 
-fn steel_attention_kernel(width: u32) -> Result<&'static str, BackendError> {
-    match width {
-        64 => Ok("steel_attention_64"),
-        128 => Ok("steel_attention_128"),
+fn steel_attention_kernel(kernel: SdpaKernel, width: u32) -> Result<&'static str, BackendError> {
+    match (kernel, width) {
+        (SdpaKernel::Steel, 64) => Ok("steel_attention_64"),
+        (SdpaKernel::Steel, 128) => Ok("steel_attention_128"),
+        (SdpaKernel::SteelHalf, 64) => Ok("steel_attention_half_64_64x32"),
+        (SdpaKernel::SteelHalf, 128) => Ok("steel_attention_half_128_96x16"),
         _ => Err(BackendError::InvalidInput),
     }
+}
+
+fn steel_attention_tile(kernel: SdpaKernel, width: u32) -> Result<(u32, u32), BackendError> {
+    match kernel {
+        SdpaKernel::Steel => Ok((32, if width == 64 { 32 } else { 16 })),
+        SdpaKernel::SteelHalf if width == 128 => Ok((96, 16)),
+        SdpaKernel::SteelHalf => Ok((64, 32)),
+        SdpaKernel::Vector | SdpaKernel::Decomposed => Err(BackendError::InvalidInput),
+    }
+}
+
+fn steel_attention_constants(
+    dispatch: &Dispatch,
+    kernel: SdpaKernel,
+) -> Result<[(u32, u32); 7], BackendError> {
+    let [query, key, value] = dispatch.inputs() else {
+        return Err(BackendError::InvalidInput);
+    };
+    let [_, query_length, width] = shape3(query.layout())?;
+    let [_, key_length, _] = shape3(key.layout())?;
+    let (block_query, block_key) = steel_attention_tile(kernel, width)?;
+    let Op::Sdpa { causal, .. } = dispatch.op() else {
+        return Err(BackendError::InvalidInput);
+    };
+    Ok([
+        (0, dtype_code(query.layout().dtype())),
+        (1, dtype_code(key.layout().dtype())),
+        (2, dtype_code(dispatch.output().layout().dtype())),
+        (3, dtype_code(value.layout().dtype())),
+        (210, u32::from(query_length % block_query == 0)),
+        (211, u32::from(key_length % block_key == 0)),
+        (212, u32::from(causal)),
+    ])
 }
 
 fn select_sdpa(dispatch: &Dispatch) -> Result<SdpaKernel, BackendError> {
@@ -6887,6 +6938,7 @@ fn select_sdpa(dispatch: &Dispatch) -> Result<SdpaKernel, BackendError> {
             | MetalVariant::SdpaVectorTwoPass1024,
         ) => Ok(SdpaKernel::Vector),
         Some(MetalVariant::SdpaSteel) => Ok(SdpaKernel::Steel),
+        Some(MetalVariant::SdpaSteelHalf) => Ok(SdpaKernel::SteelHalf),
         _ => Err(BackendError::InvalidInput),
     }
 }
@@ -6927,6 +6979,16 @@ fn steel_sdpa_supported(dispatch: &Dispatch) -> Result<bool, BackendError> {
     let [_, query_length, width] = shape3(query.layout())?;
     let [_, _, value_width] = shape3(value.layout())?;
     Ok(query_length > 1 && width == value_width && matches!(width, 64 | 128))
+}
+
+#[cfg(test)]
+fn half_steel_sdpa_supported(dispatch: &Dispatch) -> Result<bool, BackendError> {
+    let [_, key, value] = dispatch.inputs() else {
+        return Err(BackendError::InvalidInput);
+    };
+    Ok(steel_sdpa_supported(dispatch)?
+        && matches!(key.layout().dtype(), DType::F16 | DType::BF16)
+        && value.layout().dtype() == key.layout().dtype())
 }
 
 #[cfg(test)]
@@ -6975,6 +7037,7 @@ pub(super) fn variant_supported(
         | MetalVariant::SdpaVectorTwoPass512
         | MetalVariant::SdpaVectorTwoPass1024 => vector_sdpa_supported(dispatch)?,
         MetalVariant::SdpaSteel => steel_sdpa_supported(dispatch)?,
+        MetalVariant::SdpaSteelHalf => half_steel_sdpa_supported(dispatch)?,
         MetalVariant::TopKSingleK8 => dispatch_kernel(dispatch)? == "topk_single",
     })
 }
@@ -7653,9 +7716,11 @@ fn encode_layout(layout: &Layout) -> Result<[u8; 112], BackendError> {
 
 pub(super) struct PipelineCache {
     device: Retained<ProtocolObject<dyn MTLDevice>>,
+    max_threadgroup_memory_length: usize,
     fast_library: Retained<ProtocolObject<dyn MTLLibrary>>,
     nan_preserving_library: Retained<ProtocolObject<dyn MTLLibrary>>,
     pipelines: HashMap<PipelineKey, Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
+    unavailable_pipelines: HashSet<PipelineKey>,
     epilogue_libraries:
         HashMap<epilogue_codegen::SourceKey, Retained<ProtocolObject<dyn MTLLibrary>>>,
     epilogue_pipelines: HashMap<
@@ -7674,6 +7739,11 @@ struct EpilogueCompileCounts {
 }
 
 impl PipelineCache {
+    #[cfg(test)]
+    pub(super) fn set_threadgroup_memory_limit(&mut self, bytes: usize) {
+        self.max_threadgroup_memory_length = bytes;
+    }
+
     pub(super) fn new(
         device: &Retained<ProtocolObject<dyn MTLDevice>>,
         source: &str,
@@ -7689,9 +7759,11 @@ impl PipelineCache {
             .map_err(|_| BackendError::ExecutionFailed)?;
         Ok(Self {
             device: device.clone(),
+            max_threadgroup_memory_length: device.maxThreadgroupMemoryLength(),
             fast_library,
             nan_preserving_library,
             pipelines: HashMap::new(),
+            unavailable_pipelines: HashSet::new(),
             epilogue_libraries: HashMap::new(),
             epilogue_pipelines: HashMap::new(),
             epilogue_counts: EpilogueCompileCounts::default(),
@@ -7710,20 +7782,29 @@ impl PipelineCache {
         if let Some(pipeline) = self.pipelines.get(&key) {
             return Ok(pipeline.clone());
         }
+        if self.unavailable_pipelines.contains(&key) {
+            return Err(BackendError::UnsupportedOperation);
+        }
         let values = function_constants(constants)?;
         let library = if nan_preserving_kernel(name) {
             &self.nan_preserving_library
         } else {
             &self.fast_library
         };
-        let name = NSString::from_str(name);
+        let function_name = NSString::from_str(name);
         let function = library
-            .newFunctionWithName_constantValues_error(&name, &values)
+            .newFunctionWithName_constantValues_error(&function_name, &values)
             .map_err(|_| BackendError::ExecutionFailed)?;
         let pipeline = self
             .device
             .newComputePipelineStateWithFunction_error(&function)
             .map_err(|_| BackendError::ExecutionFailed)?;
+        if name.starts_with("steel_attention_")
+            && pipeline.staticThreadgroupMemoryLength() > self.max_threadgroup_memory_length
+        {
+            self.unavailable_pipelines.insert(key);
+            return Err(BackendError::UnsupportedOperation);
+        }
         self.pipelines.insert(key, pipeline.clone());
         Ok(pipeline)
     }
@@ -10837,6 +10918,48 @@ mod tests {
         .unwrap();
     }
 
+    fn assert_half_steel_profile_case(
+        backend: &MetalBackend,
+        cache_dtype: DType,
+        query_length: u32,
+        key_length: u32,
+        query_heads: u32,
+        kv_heads: u32,
+        width: u32,
+    ) {
+        let cache_slice = [
+            Slice::new(0, kv_heads, 1).unwrap(),
+            Slice::new(3, key_length, 1).unwrap(),
+            Slice::new(0, width, 1).unwrap(),
+        ];
+        let _override = SdpaOverride::set(SdpaKernel::SteelHalf);
+        assert_backends_agree_at_tolerance(
+            &CpuBackend::new(),
+            backend,
+            Op::Sdpa {
+                scale: f32::from(u16::try_from(width).unwrap()).sqrt().recip(),
+                causal: true,
+                q_start: key_length - query_length,
+            },
+            &[
+                TensorSpec::contiguous(DType::F32, &[query_heads, query_length, width]),
+                TensorSpec::sliced(
+                    cache_dtype,
+                    &[kv_heads, key_length + 3, width],
+                    &cache_slice,
+                ),
+                TensorSpec::sliced(
+                    cache_dtype,
+                    &[kv_heads, key_length + 3, width],
+                    &cache_slice,
+                ),
+            ],
+            &TensorSpec::contiguous(DType::F32, &[query_heads, query_length, width]),
+            cache_dtype,
+        )
+        .unwrap();
+    }
+
     fn patterned_bf16(count: usize, modulus: u16) -> Vec<u8> {
         (0..count)
             .flat_map(|index| {
@@ -11086,11 +11209,64 @@ mod tests {
     #[test]
     fn metal_attention_paths_accept_reduced_precision_cache() {
         for dtype in [DType::F16, DType::BF16] {
+            assert_mixed_sdpa(SdpaKernel::Decomposed, None, 1, 1, dtype);
             assert_mixed_sdpa(SdpaKernel::Decomposed, None, 7, 33, dtype);
             assert_mixed_sdpa(SdpaKernel::Steel, None, 7, 33, dtype);
             assert_mixed_sdpa(SdpaKernel::Vector, None, 1, 33, dtype);
             assert_mixed_sdpa(SdpaKernel::Vector, Some(64), 1, 1024, dtype);
         }
+    }
+
+    #[test]
+    fn metal_half_steel_attention_matches_cpu_at_profile_tolerance() {
+        let backend = MetalBackend::new().unwrap();
+        for dtype in [DType::F16, DType::BF16] {
+            for (query_length, key_length) in [(7, 7), (33, 33), (7, 4_097), (2, 16_384)] {
+                assert_half_steel_profile_case(
+                    &backend,
+                    dtype,
+                    query_length,
+                    key_length,
+                    32,
+                    4,
+                    128,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn metal_half_steel_width_64_matches_cpu_at_profile_tolerance() {
+        let backend = MetalBackend::new().unwrap();
+        for dtype in [DType::F16, DType::BF16] {
+            for key_length in [1, 7, 33, 4_097] {
+                let query_length = key_length.min(2);
+                assert_half_steel_profile_case(
+                    &backend,
+                    dtype,
+                    query_length,
+                    key_length,
+                    16,
+                    8,
+                    64,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn metal_half_steel_masks_unaligned_long_key_boundary() {
+        let backend = MetalBackend::new().unwrap();
+        for dtype in [DType::F16, DType::BF16] {
+            assert_half_steel_profile_case(&backend, dtype, 1, 32_759, 32, 4, 128);
+        }
+    }
+
+    #[test]
+    fn metal_steel_attention_falls_back_over_mocked_threadgroup_limit() {
+        let backend = MetalBackend::new().unwrap();
+        backend.set_pipeline_threadgroup_memory_limit_for_test(1);
+        assert_half_steel_profile_case(&backend, DType::F16, 2, 7, 32, 4, 128);
     }
 
     #[test]

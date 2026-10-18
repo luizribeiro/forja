@@ -41,6 +41,7 @@ pub(crate) enum MetalVariant {
     SdpaVectorTwoPass512,
     SdpaVectorTwoPass1024,
     SdpaSteel,
+    SdpaSteelHalf,
     TopKPortable,
     TopKSingleK8,
     TopKPartials,
@@ -425,6 +426,7 @@ const PAIRED_ROUTE_GEMV: &[Constraint] = &[value(
     },
 )];
 const WIDTHS: &[u64] = &[64, 128];
+const REDUCED_DTYPES: &[forja_core::DType] = &[forja_core::DType::F16, forja_core::DType::BF16];
 const VECTOR_COMMON: &[Constraint] = &[
     value(QUERY_LENGTH, Relation::Equal(1)),
     value(KEY_WIDTH, Relation::OneOf(WIDTHS)),
@@ -483,6 +485,28 @@ const SDPA_STEEL: &[Constraint] = &[
     Constraint::DimensionsEqual {
         left: KEY_WIDTH,
         right: VALUE_WIDTH,
+    },
+];
+const SDPA_STEEL_HALF: &[Constraint] = &[
+    value(
+        QUERY_LENGTH,
+        Relation::Range {
+            min: 2,
+            max: u64::MAX,
+        },
+    ),
+    value(KEY_WIDTH, Relation::OneOf(WIDTHS)),
+    Constraint::DimensionsEqual {
+        left: KEY_WIDTH,
+        right: VALUE_WIDTH,
+    },
+    Constraint::DType {
+        tensor: KEY,
+        allowed: REDUCED_DTYPES,
+    },
+    Constraint::DType {
+        tensor: VALUE,
+        allowed: REDUCED_DTYPES,
     },
 ];
 const TOP_K_SINGLE: &[Constraint] = &[
@@ -755,6 +779,18 @@ pub(crate) static REGISTRY: &[VariantDef<MetalVariant>] = &[
         &["multi-token queries with supported head widths."],
         &["single-token decode."],
         &["Uses tiled matrix operations for prefill-shaped work."]
+    ),
+    variant!(
+        "sdpa.steel-half",
+        Sdpa,
+        SdpaSteelHalf,
+        SDPA_STEEL_HALF,
+        &["reduced-precision cache prefill."],
+        &["f32 caches or single-token decode."],
+        &[
+            "Uses 64x32 tiles at width 64 and 96x16 tiles at width 128.",
+            "Converts MMA inputs to half and accumulates in f32."
+        ]
     ),
     variant!(
         "top-k.portable",
@@ -1463,20 +1499,40 @@ mod tests {
         width: u32,
         value_width: u32,
     ) -> Dispatch {
+        sdpa_dispatch_with_cache(
+            dtype,
+            dtype,
+            group,
+            query_length,
+            key_length,
+            width,
+            value_width,
+        )
+    }
+
+    fn sdpa_dispatch_with_cache(
+        query_dtype: DType,
+        cache_dtype: DType,
+        group: u32,
+        query_length: u32,
+        key_length: u32,
+        width: u32,
+        value_width: u32,
+    ) -> Dispatch {
         let backend = CpuBackend::new();
         let kv_heads = 8;
         let query_heads = kv_heads * group;
         let query = backend
-            .alloc(dtype, &[query_heads, query_length, width])
+            .alloc(query_dtype, &[query_heads, query_length, width])
             .unwrap();
         let key = backend
-            .alloc(dtype, &[kv_heads, key_length, width])
+            .alloc(cache_dtype, &[kv_heads, key_length, width])
             .unwrap();
         let value = backend
-            .alloc(dtype, &[kv_heads, key_length, value_width])
+            .alloc(cache_dtype, &[kv_heads, key_length, value_width])
             .unwrap();
         let output = backend
-            .alloc(dtype, &[query_heads, query_length, value_width])
+            .alloc(query_dtype, &[query_heads, query_length, value_width])
             .unwrap();
         let mut commands = CommandList::new();
         commands
@@ -1580,6 +1636,24 @@ mod tests {
             error.to_string(),
             "metal matmul variant 'matmul.gemv': constraint 'm = 1' failed (m was 2)"
         );
+    }
+
+    #[test]
+    fn half_steel_attention_is_bounded_to_reduced_cache_prefill() {
+        let reduced = sdpa_dispatch_with_cache(DType::F32, DType::F16, 8, 7, 33, 128, 128);
+        assert!(resolve(&reduced, "sdpa.steel-half", METAL4).is_ok());
+
+        let decode = sdpa_dispatch_with_cache(DType::F32, DType::F16, 8, 1, 33, 128, 128);
+        let f32 = sdpa_dispatch(DType::F32, 8, 7, 33, 128, 128);
+        assert!(matches!(
+            resolve(&decode, "sdpa.steel-half", METAL4),
+            Err(VariantError::Constraint { .. })
+        ));
+        assert!(matches!(
+            resolve(&f32, "sdpa.steel-half", METAL4),
+            Err(VariantError::Constraint { .. })
+        ));
+        assert!(resolve(&f32, "sdpa.steel", METAL4).is_ok());
     }
 
     #[test]
@@ -1832,6 +1906,11 @@ mod tests {
                 "sdpa.steel",
                 sdpa_dispatch(DType::F32, 8, 2, 2, 64, 64),
                 "steel_attention_64",
+            ),
+            (
+                "sdpa.steel-half",
+                sdpa_dispatch_with_cache(DType::F32, DType::F16, 8, 64, 64, 128, 128),
+                "steel_attention_half_128_96x16",
             ),
             (
                 "top-k.portable",

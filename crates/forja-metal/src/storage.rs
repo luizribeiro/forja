@@ -434,6 +434,14 @@ impl Drop for MetalBackend {
 }
 
 impl MetalBackend {
+    #[cfg(test)]
+    pub(crate) fn set_pipeline_threadgroup_memory_limit_for_test(&self, bytes: usize) {
+        self.pipelines
+            .lock()
+            .unwrap()
+            .set_threadgroup_memory_limit(bytes);
+    }
+
     /// Returns the fixed compatibility variant for a portable core operation.
     #[must_use]
     pub const fn portable_variant_name(

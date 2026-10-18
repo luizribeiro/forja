@@ -82,23 +82,23 @@ struct SteelDivide {
     }
 };
 
-template <int BQ, int BK, int BD, int WM, int WN>
+template <typename TileT, int BQ, int BK, int BD, int WM, int WN>
 void steel_attention_body(
     device const uchar *query [[buffer(0)]],
     device const uchar *key [[buffer(1)]],
     device const uchar *value [[buffer(2)]],
     device uchar *output [[buffer(3)]],
     constant SdpaParams &params [[buffer(4)]],
-    threadgroup float *query_tile,
-    threadgroup float *kv_tile,
+    threadgroup TileT *query_tile,
+    threadgroup TileT *kv_tile,
     uint3 position [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]],
     uint3 threads [[threads_per_threadgroup]],
     ushort simdgroup [[simdgroup_index_in_threadgroup]],
     ushort lane [[thread_index_in_simdgroup]]) {
-    constexpr short Q_PADDING = 4;
-    constexpr short K_PADDING = 4;
-    constexpr short V_PADDING = 4;
+    constexpr short Q_PADDING = 16 / sizeof(TileT);
+    constexpr short K_PADDING = 16 / sizeof(TileT);
+    constexpr short V_PADDING = 16 / sizeof(TileT);
     constexpr short LDQ = BD + Q_PADDING;
     constexpr short LDK = BK + K_PADDING;
     constexpr short LDV = BD + V_PADDING;
@@ -124,10 +124,12 @@ void steel_attention_body(
         align_Q != 0, true, query_tile, LDQ, 1, thread_index, thread_count);
 
     using Fragment = SteelMMAFragment<float>;
-    SteelMMATile<float, 1, 1> query_mma;
-    SteelMMATile<float, 1, TK> key_mma;
+    using TileFragment = SteelMMAFragment<TileT>;
+    SteelMMATile<TileT, 1, 1> query_mma;
+    SteelMMATile<TileT, 1, TK> key_mma;
     SteelMMATile<float, 1, TK> scores;
-    SteelMMATile<float, 1, 1> value_mma;
+    SteelMMATile<TileT, 1, TK> probabilities;
+    SteelMMATile<TileT, 1, 1> value_mma;
     SteelMMATile<float, 1, TD> result;
     result.clear();
 
@@ -160,12 +162,12 @@ void steel_attention_body(
         scores.clear();
         for (short dimension = 0; dimension < TD; ++dimension) {
             simdgroup_barrier(mem_flags::mem_none);
-            Fragment::load(
+            TileFragment::load(
                 query_mma.at(0, 0),
                 &query_tile[query_row * LDQ + dimension * FRAGMENT + column],
                 LDQ, 1);
             for (short key_fragment = 0; key_fragment < TK; ++key_fragment) {
-                Fragment::load(
+                TileFragment::load(
                     key_mma.at(0, key_fragment),
                     &kv_tile[dimension * FRAGMENT * LDK
                         + row * LDK + key_fragment * FRAGMENT + column],
@@ -209,6 +211,11 @@ void steel_attention_body(
         scores.template row_reduce<SteelSum>(block_sum);
         denominator[0] = denominator[0] * adjustment[0] + block_sum[0];
         result.template row_apply<SteelMultiply>(adjustment);
+        if constexpr (!is_same_v<TileT, float>) {
+            for (short element = 0; element < scores.element_count; ++element) {
+                probabilities.elements()[element] = TileT(scores.elements()[element]);
+            }
+        }
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
         BlockLoader<BK, BD>::load_to(
@@ -219,13 +226,19 @@ void steel_attention_body(
         for (short dimension = 0; dimension < TD; ++dimension) {
             for (short key_fragment = 0; key_fragment < TK; ++key_fragment) {
                 short key_row = key_fragment * FRAGMENT + row;
-                Fragment::load(
+                TileFragment::load(
                     value_mma.at(0, 0),
                     &kv_tile[key_row * LDV + dimension * FRAGMENT + column],
                     LDV, 1);
-                Fragment::multiply(
-                    result.at(0, dimension), scores.at(0, key_fragment),
-                    value_mma.at(0, 0), result.at(0, dimension));
+                if constexpr (is_same_v<TileT, float>) {
+                    Fragment::multiply(
+                        result.at(0, dimension), scores.at(0, key_fragment),
+                        value_mma.at(0, 0), result.at(0, dimension));
+                } else {
+                    Fragment::multiply(
+                        result.at(0, dimension), probabilities.at(0, key_fragment),
+                        value_mma.at(0, 0), result.at(0, dimension));
+                }
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -249,7 +262,7 @@ void steel_attention_body(
     }
 }
 
-#define DEFINE_STEEL_ATTENTION(name, bq, bk, bd, wm, wn)                  \
+#define DEFINE_STEEL_ATTENTION(name, tile_type, bq, bk, bd, wm, wn)       \
 kernel void name(                                                         \
     device const uchar *query [[buffer(0)]],                              \
     device const uchar *key [[buffer(1)]],                                \
@@ -261,13 +274,16 @@ kernel void name(                                                         \
     uint3 threads [[threads_per_threadgroup]],                            \
     ushort simdgroup [[simdgroup_index_in_threadgroup]],                  \
     ushort lane [[thread_index_in_simdgroup]]) {                          \
-    threadgroup float query_tile[bq * (bd + 4)];                         \
-    threadgroup float kv_tile[(bk + 4) * bd];                            \
-    steel_attention_body<bq, bk, bd, wm, wn>(                            \
+    threadgroup tile_type query_tile[bq * (bd + 16 / sizeof(tile_type))]; \
+    threadgroup tile_type kv_tile[(bk + 16 / sizeof(tile_type)) * bd];    \
+    steel_attention_body<tile_type, bq, bk, bd, wm, wn>(                  \
         query, key, value, output, params, query_tile, kv_tile, position, \
         thread_index,                                                     \
         threads, simdgroup, lane);                                        \
 }
 
-DEFINE_STEEL_ATTENTION(steel_attention_64, 32, 32, 64, 4, 1)
-DEFINE_STEEL_ATTENTION(steel_attention_128, 32, 16, 128, 4, 1)
+DEFINE_STEEL_ATTENTION(steel_attention_64, float, 32, 32, 64, 4, 1)
+DEFINE_STEEL_ATTENTION(steel_attention_128, float, 32, 16, 128, 4, 1)
+DEFINE_STEEL_ATTENTION(steel_attention_half_64_64x32, half, 64, 32, 64, 8, 1)
+// 96 * (128 + 8) * 2 + (16 + 8) * 128 * 2 = 32,256 bytes, 512 below 32 KiB.
+DEFINE_STEEL_ATTENTION(steel_attention_half_128_96x16, half, 96, 16, 128, 12, 1)
