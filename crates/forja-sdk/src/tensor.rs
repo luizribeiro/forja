@@ -513,7 +513,28 @@ impl<T: Element> Tensor<T> {
         params: &Tensor<u32>,
         position: impl Into<crate::Dim>,
     ) -> Result<Tensor<u32>> {
-        self.sample_with_config(params, position, SamplingKernelConfig::default())
+        let position = position.into();
+        self.sample_selected(params, &position, SamplingKernelConfig::default(), None)
+    }
+
+    /// Samples with an explicit Metal algorithm selection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid shapes, rule context, or a host-refused selection.
+    pub fn sample_with<'a>(
+        &self,
+        params: &Tensor<u32>,
+        position: impl Into<crate::Dim>,
+        selection: impl Into<crate::target::metal::VariantChoice<'a>>,
+    ) -> Result<Tensor<u32>> {
+        let position = position.into();
+        self.sample_selected(
+            params,
+            &position,
+            SamplingKernelConfig::default(),
+            Some(selection.into()),
+        )
     }
 
     /// Samples with explicit reduction and bounded-fast-path parameters.
@@ -527,23 +548,39 @@ impl<T: Element> Tensor<T> {
         position: impl Into<crate::Dim>,
         config: SamplingKernelConfig,
     ) -> Result<Tensor<u32>> {
+        let position = position.into();
+        self.sample_selected(params, &position, config, None)
+    }
+
+    fn sample_selected(
+        &self,
+        params: &Tensor<u32>,
+        position: &crate::Dim,
+        config: SamplingKernelConfig,
+        selection: Option<crate::target::metal::VariantChoice<'_>>,
+    ) -> Result<Tensor<u32>> {
         let mut shape = self.shape.clone();
         shape
             .pop()
             .ok_or_else(|| Error::new("sampling requires at least one dimension"))?;
         let output = Tensor::<u32>::empty(shape)?;
-        let position = graph::affine(&position.into())?;
-        graph::record(
-            sys::Op::Sample {
-                position,
-                chunk_width: config.chunk_width,
-                fast_top_k: config.fast_top_k,
-                fast_max_chunks: config.fast_max_chunks,
-                rejection_rounds: config.rejection_rounds,
-            },
-            &[&self.handle, &params.handle],
-            &output.handle,
-        )?;
+        let operation = sys::Op::Sample {
+            position: graph::affine(position)?,
+            chunk_width: config.chunk_width,
+            fast_top_k: config.fast_top_k,
+            fast_max_chunks: config.fast_max_chunks,
+            rejection_rounds: config.rejection_rounds,
+        };
+        if let Some(selection) = selection {
+            graph::record_variant(
+                operation,
+                &[&self.handle, &params.handle],
+                &output.handle,
+                selection,
+            )?;
+        } else {
+            graph::record(operation, &[&self.handle, &params.handle], &output.handle)?;
+        }
         Ok(output)
     }
 

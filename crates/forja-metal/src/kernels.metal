@@ -4,6 +4,7 @@
 constant uint reduction_chunk_width [[function_constant(17)]];
 constant uint sample_fast_topk [[function_constant(18)]];
 constant uint sample_fast_max_chunks [[function_constant(19)]];
+constant uint sample_has_mask [[function_constant(20)]];
 
 kernel void hold(device uchar *buffer [[buffer(0)]], uint index [[thread_position_in_grid]]) {
     if (index == 0) {
@@ -767,6 +768,13 @@ bool sample_mask_allows(
     return (word & (1u << (column % 32u))) != 0;
 }
 
+bool sample_allows(
+    device const uint *allow,
+    constant TensorLayout &allow_layout,
+    uint column) {
+    return sample_has_mask == 0u || sample_mask_allows(allow, allow_layout, column);
+}
+
 uint sample_masked_sum(
     uint value,
     uint lane,
@@ -854,7 +862,7 @@ kernel void sample_masked_partials(
     uint allowed_count = 0;
     ulong local_top[8] = {0, 0, 0, 0, 0, 0, 0, 0};
     for (uint column = first + lane; column < end; column += group_width) {
-        if (sample_mask_allows(allow, allow_layout, column)) {
+        if (sample_allows(allow, allow_layout, column)) {
             float value = load_float(
                 logits, physical_index(logits_layout, row * width + column), input0_dtype);
             maximum = max(maximum, argmax_candidate(value, column));
@@ -973,9 +981,12 @@ kernel void sample_masked_finalize(
         allowed_total = allowed_count;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
+    bool bad_padding = false;
     uint final_bits = width % 32u;
-    uint final_word = allow[physical_index(allow_layout, (width - 1u) / 32u)];
-    bool bad_padding = final_bits != 0u && (final_word >> final_bits) != 0u;
+    if (sample_has_mask != 0u && final_bits != 0u) {
+        uint final_word = allow[physical_index(allow_layout, (width - 1u) / 32u)];
+        bad_padding = (final_word >> final_bits) != 0u;
+    }
     if (invalid_sampling(config) || bad_padding || allowed_total == 0u) {
         if (lane == 0) {
             atomic_store_explicit(error_flag, 2u, memory_order_relaxed);
@@ -1093,7 +1104,7 @@ kernel void sample_masked_finalize(
         ulong bit_value = 1ul << uint(bit);
         uint selected = 0;
         for (uint column = lane; column < width; column += group_width) {
-            if (sample_mask_allows(allow, allow_layout, column)) {
+            if (sample_allows(allow, allow_layout, column)) {
                 float value = load_float(
                     logits, physical_index(logits_layout, row * width + column), input0_dtype);
                 ulong candidate = argmax_candidate(value, column);
@@ -1124,7 +1135,7 @@ kernel void sample_masked_finalize(
             input0_dtype);
         float total = 0.0f;
         for (uint column = lane; column < width; column += group_width) {
-            if (sample_mask_allows(allow, allow_layout, column)) {
+            if (sample_allows(allow, allow_layout, column)) {
                 float value = load_float(
                     logits, physical_index(logits_layout, row * width + column), input0_dtype);
                 if (argmax_candidate(value, column) >= topk_boundary) {
@@ -1144,7 +1155,7 @@ kernel void sample_masked_finalize(
                 ulong bit_value = 1ul << uint(bit);
                 float selected = 0.0f;
                 for (uint column = lane; column < width; column += group_width) {
-                    if (sample_mask_allows(allow, allow_layout, column)) {
+                    if (sample_allows(allow, allow_layout, column)) {
                         float value = load_float(
                             logits,
                             physical_index(logits_layout, row * width + column),
@@ -1172,7 +1183,7 @@ kernel void sample_masked_finalize(
     }
     ulong best = 0;
     for (uint column = lane; column < width; column += group_width) {
-        if (!sample_mask_allows(allow, allow_layout, column)) {
+        if (!sample_allows(allow, allow_layout, column)) {
             continue;
         }
         float value = load_float(

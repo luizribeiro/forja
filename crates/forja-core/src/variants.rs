@@ -15,6 +15,8 @@ pub enum OperationKind {
     Sdpa,
     /// Greatest-element selection.
     TopK,
+    /// Categorical token sampling.
+    Sample,
     /// An operation without selectable variants.
     Other,
 }
@@ -29,6 +31,7 @@ impl OperationKind {
             Op::GatherQuantMatmul { .. } => Self::GatherQuantMatmul,
             Op::Sdpa { .. } => Self::Sdpa,
             Op::TopK { .. } => Self::TopK,
+            Op::Sample { .. } => Self::Sample,
             _ => Self::Other,
         }
     }
@@ -42,6 +45,7 @@ impl fmt::Display for OperationKind {
             Self::GatherQuantMatmul => "gather-quant-matmul",
             Self::Sdpa => "sdpa",
             Self::TopK => "top-k",
+            Self::Sample => "sample",
             Self::Other => "other",
         })
     }

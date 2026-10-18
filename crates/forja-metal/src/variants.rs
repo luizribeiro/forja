@@ -45,6 +45,8 @@ pub(crate) enum MetalVariant {
     TopKPortable,
     TopKSingleK8,
     TopKPartials,
+    SamplePortable,
+    SampleParallel,
 }
 
 /// A registry variant resolved and checked for one concrete dispatch.
@@ -819,6 +821,24 @@ pub(crate) static REGISTRY: &[VariantDef<MetalVariant>] = &[
         &["larger selection counts or k = 8 with width at most 2048."],
         &["Reduces fixed-capacity chunk partials in a finalize pass."]
     ),
+    variant!(
+        "sample.portable",
+        Sample,
+        SamplePortable,
+        &[],
+        &["broad sampling configurations or an unprofiled workload."],
+        &["the parallel algorithm wins for the target vocabulary."],
+        &["Uses bounded rejection followed by an exact fallback."]
+    ),
+    variant!(
+        "sample.parallel",
+        Sample,
+        SampleParallel,
+        &[],
+        &["large vocabularies where chunk partials amortize finalization."],
+        &["small vocabularies where fixed parallel setup dominates."],
+        &["Uses chunk partials and exact parallel selection."]
+    ),
 ];
 
 pub(crate) const fn portable_name(operation: OperationKind) -> Option<&'static str> {
@@ -828,6 +848,7 @@ pub(crate) const fn portable_name(operation: OperationKind) -> Option<&'static s
         OperationKind::GatherQuantMatmul => Some("gather-quant-matmul.portable"),
         OperationKind::Sdpa => Some("sdpa.portable"),
         OperationKind::TopK => Some("top-k.portable"),
+        OperationKind::Sample => Some("sample.portable"),
         OperationKind::Other => None,
     }
 }
@@ -839,6 +860,7 @@ pub(crate) const fn portable_implementation(operation: OperationKind) -> Option<
         OperationKind::GatherQuantMatmul => Some(MetalVariant::GatherQuantMatmulPortable),
         OperationKind::Sdpa => Some(MetalVariant::SdpaPortable),
         OperationKind::TopK => Some(MetalVariant::TopKPortable),
+        OperationKind::Sample => Some(MetalVariant::SamplePortable),
         OperationKind::Other => None,
     }
 }
@@ -1119,7 +1141,8 @@ const fn template_operation(operation: TemplateOp) -> OperationKind {
     match operation {
         TemplateOp::Static(operation) => OperationKind::of(operation),
         TemplateOp::Sdpa { .. } => OperationKind::Sdpa,
-        TemplateOp::Sample { .. } | TemplateOp::SampleMasked { .. } => OperationKind::Other,
+        TemplateOp::Sample { .. } => OperationKind::Sample,
+        TemplateOp::SampleMasked { .. } => OperationKind::Other,
     }
 }
 
@@ -1357,6 +1380,28 @@ mod tests {
                 },
                 &[&input],
                 &[&values, &indices],
+            )
+            .unwrap();
+        commands.into_dispatches().remove(0)
+    }
+
+    fn sample_dispatch(width: u32) -> Dispatch {
+        let backend = CpuBackend::new();
+        let logits = backend.alloc(DType::F32, &[1, width]).unwrap();
+        let params = backend.alloc(DType::U32, &[5]).unwrap();
+        let output = backend.alloc(DType::U32, &[1]).unwrap();
+        let mut commands = CommandList::new();
+        commands
+            .dispatch(
+                Op::Sample {
+                    position: 7,
+                    chunk_width: 2_048,
+                    fast_top_k: 20,
+                    fast_max_chunks: 102,
+                    rejection_rounds: 4,
+                },
+                &[&logits, &params],
+                &output,
             )
             .unwrap();
         commands.into_dispatches().remove(0)
@@ -1923,6 +1968,8 @@ mod tests {
                 top_k_dispatch(2049),
                 "topk_partials+finalize",
             ),
+            ("sample.portable", sample_dispatch(33), "sample_rejection"),
+            ("sample.parallel", sample_dispatch(4097), "sample_parallel"),
         ];
         assert_eq!(fixtures.len(), REGISTRY.len());
         for (name, dispatch, kernel) in fixtures {

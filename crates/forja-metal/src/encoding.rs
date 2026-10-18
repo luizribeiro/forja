@@ -506,6 +506,8 @@ const VECTOR_MAX_KEY_LENGTH: u32 = 65_536;
 const REDUCTION_CHUNK_WIDTH_CONSTANT: u32 = 17;
 /// Specializes the bounded sampling rank arrays without exceeding their capacity of twenty.
 const SAMPLE_FAST_TOP_K_CONSTANT: u32 = 18;
+/// Function constant selecting mask reads in the parallel sampling kernels.
+const SAMPLE_HAS_MASK_CONSTANT: u32 = 20;
 /// Specializes the bounded sampling merge without exceeding 2,048 partial candidates.
 const SAMPLE_FAST_MAX_CHUNKS_CONSTANT: u32 = 19;
 /// Index of the sampling error flag in the prepared argument vector.
@@ -2773,8 +2775,15 @@ impl MetalBackend {
                     fast_max_chunks,
                     rejection_rounds,
                 };
-                let (buffers, flag) =
-                    self.encode_sample(encoder, table, dispatch, params, bindings, arguments)?;
+                let (buffers, flag) = match selected_variant(dispatch) {
+                    Some(MetalVariant::SamplePortable) => {
+                        self.encode_sample(encoder, table, dispatch, params, bindings, arguments)?
+                    }
+                    Some(MetalVariant::SampleParallel) => self.encode_sample_parallel(
+                        encoder, table, dispatch, params, None, bindings, arguments,
+                    )?,
+                    _ => return Err(BackendError::InvalidInput),
+                };
                 error_flags.push(EncodedErrorFlag::new(flag, dispatch_index, "sample"));
                 buffers
             }
@@ -2792,8 +2801,16 @@ impl MetalBackend {
                     fast_max_chunks,
                     rejection_rounds,
                 };
-                let (buffers, flag) = self
-                    .encode_sample_masked(encoder, table, dispatch, params, bindings, arguments)?;
+                let allow = dispatch.inputs().get(2).ok_or(BackendError::InvalidInput)?;
+                let (buffers, flag) = self.encode_sample_parallel(
+                    encoder,
+                    table,
+                    dispatch,
+                    params,
+                    Some(allow),
+                    bindings,
+                    arguments,
+                )?;
                 error_flags.push(EncodedErrorFlag::new(flag, dispatch_index, "sample-masked"));
                 buffers
             }
@@ -5733,17 +5750,18 @@ impl MetalBackend {
         Ok((temporaries, error_flag))
     }
 
-    #[allow(clippy::too_many_lines)]
-    fn encode_sample_masked(
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    fn encode_sample_parallel(
         &self,
         encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
         table: &ProtocolObject<dyn MTL4ArgumentTable>,
         dispatch: &Dispatch,
         params: SampleKernelParams,
+        allow: Option<&Tensor>,
         bindings: &mut ArgumentBindings,
         arguments: &mut ArgumentWriter,
     ) -> Result<EncodedEmbed, BackendError> {
-        let [logits, sampling, allow] = dispatch.inputs() else {
+        let [logits, sampling, ..] = dispatch.inputs() else {
             return Err(BackendError::InvalidInput);
         };
         let output = dispatch.output();
@@ -5766,7 +5784,10 @@ impl MetalBackend {
                 .pipelines
                 .lock()
                 .map_err(|_| BackendError::ExecutionFailed)?;
-            let constants = params.function_constants(dtype_code(logits.layout().dtype()));
+            let mut constants = params
+                .function_constants(dtype_code(logits.layout().dtype()))
+                .to_vec();
+            constants.push((SAMPLE_HAS_MASK_CONSTANT, u32::from(allow.is_some())));
             (
                 pipelines.get("sample_masked_partials", &constants)?,
                 pipelines.get("sample_masked_finalize", &constants)?,
@@ -5776,7 +5797,7 @@ impl MetalBackend {
         for layout in [
             logits.layout(),
             sampling.layout(),
-            allow.layout(),
+            allow.map_or(&partials.layout, Tensor::layout),
             output.layout(),
         ] {
             temporaries.push(Self::layout_buffer(layout, arguments)?);
@@ -5790,10 +5811,18 @@ impl MetalBackend {
                 .buffers
                 .lock()
                 .map_err(|_| BackendError::ExecutionFailed)?;
+            let allow_buffer = allow.map_or_else(
+                || Ok(partials.buffer.clone()),
+                |mask| {
+                    buffers
+                        .get(mask)
+                        .map(|buffer| BufferBinding::whole(buffer.raw.clone()))
+                },
+            )?;
             (
                 BufferBinding::whole(buffers.get(logits)?.raw.clone()),
                 BufferBinding::whole(buffers.get(sampling)?.raw.clone()),
-                BufferBinding::whole(buffers.get(allow)?.raw.clone()),
+                allow_buffer,
                 BufferBinding::whole(buffers.get(output)?.raw.clone()),
             )
         };
@@ -6079,22 +6108,24 @@ impl MetalBackend {
                 fast_max_chunks,
                 rejection_rounds,
             } => {
-                Self::write_sample_arguments(
-                    dispatch,
-                    SampleKernelParams {
-                        position,
-                        chunk_width,
-                        fast_top_k,
-                        fast_max_chunks,
-                        rejection_rounds,
-                    },
-                    arguments,
-                )?;
+                if selected_variant(dispatch) == Some(MetalVariant::SampleParallel) {
+                    Self::size_parallel_sample_arguments(arguments)?;
+                } else {
+                    Self::write_sample_arguments(
+                        dispatch,
+                        SampleKernelParams {
+                            position,
+                            chunk_width,
+                            fast_top_k,
+                            fast_max_chunks,
+                            rejection_rounds,
+                        },
+                        arguments,
+                    )?;
+                }
             }
             Op::SampleMasked { .. } => {
-                for len in [8, 112, 112, 112, 112, 4, 4, 4] {
-                    arguments.write(len)?;
-                }
+                Self::size_parallel_sample_arguments(arguments)?;
             }
             Op::Rope { .. } => {
                 for len in [112, 112, 112, 12] {
@@ -6154,6 +6185,13 @@ impl MetalBackend {
             &[112, 112, 112, 4, 4, 4, 4]
         };
         for &len in lengths {
+            arguments.write(len)?;
+        }
+        Ok(())
+    }
+
+    fn size_parallel_sample_arguments(arguments: &mut ArgumentSizer) -> Result<(), BackendError> {
+        for len in [8, 112, 112, 112, 112, 4, 4, 4] {
             arguments.write(len)?;
         }
         Ok(())
@@ -6701,7 +6739,11 @@ pub(super) fn dispatch_kernel(dispatch: &Dispatch) -> Result<&'static str, Backe
             Some(MetalVariant::TopKPartials) => "topk_partials+finalize",
             _ => return Err(BackendError::InvalidInput),
         },
-        Op::Sample { .. } => "sample_rejection",
+        Op::Sample { .. } => match selected_variant(dispatch) {
+            Some(MetalVariant::SamplePortable) => "sample_rejection",
+            Some(MetalVariant::SampleParallel) => "sample_parallel",
+            _ => return Err(BackendError::InvalidInput),
+        },
         Op::SampleMasked { .. } => "sample_masked",
         Op::Rope { .. } => "rope",
         Op::Embed => "embed",
@@ -7039,6 +7081,8 @@ pub(super) fn variant_supported(
         MetalVariant::SdpaSteel => steel_sdpa_supported(dispatch)?,
         MetalVariant::SdpaSteelHalf => half_steel_sdpa_supported(dispatch)?,
         MetalVariant::TopKSingleK8 => dispatch_kernel(dispatch)? == "topk_single",
+        MetalVariant::SamplePortable => dispatch_kernel(dispatch)? == "sample_rejection",
+        MetalVariant::SampleParallel => dispatch_kernel(dispatch)? == "sample_parallel",
     })
 }
 
@@ -8231,7 +8275,71 @@ mod tests {
         seed: u64,
         position: u32,
     ) -> Result<u32, BackendError> {
-        let input = backend.alloc(DType::F32, &[1, width])?;
+        run_typed_sample(
+            backend,
+            DType::F32,
+            logits,
+            width,
+            temperature,
+            top_k,
+            top_p,
+            seed,
+            position,
+            |_| Ok(()),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_metal_sample(
+        backend: &MetalBackend,
+        dtype: DType,
+        logits: &[u8],
+        width: u32,
+        temperature: f32,
+        top_k: u32,
+        top_p: f32,
+        seed: u64,
+        position: u32,
+        variant: &str,
+    ) -> Result<u32, BackendError> {
+        run_typed_sample(
+            backend,
+            dtype,
+            logits,
+            width,
+            temperature,
+            top_k,
+            top_p,
+            seed,
+            position,
+            |commands| {
+                let dispatch = commands.last_dispatch().ok_or(BackendError::InvalidInput)?;
+                let selected = backend
+                    .validate_variant(dispatch, variant)
+                    .map_err(|_| BackendError::InvalidInput)?;
+                if commands.set_last_backend_data(BackendDispatchData::new(selected)) {
+                    Ok(())
+                } else {
+                    Err(BackendError::InvalidInput)
+                }
+            },
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_typed_sample<B: Backend>(
+        backend: &B,
+        dtype: DType,
+        logits: &[u8],
+        width: u32,
+        temperature: f32,
+        top_k: u32,
+        top_p: f32,
+        seed: u64,
+        position: u32,
+        select: impl FnOnce(&mut CommandList) -> Result<(), BackendError>,
+    ) -> Result<u32, BackendError> {
+        let input = backend.alloc(dtype, &[1, width])?;
         backend.write(&input, logits)?;
         let params = backend.alloc(DType::U32, &[5])?;
         backend.write(&params, &sample_params(temperature, top_k, top_p, seed))?;
@@ -8240,13 +8348,18 @@ mod tests {
         commands
             .dispatch(sample_op(position), &[&input, &params], &output)
             .map_err(|_| BackendError::InvalidInput)?;
+        select(&mut commands)?;
         backend.submit(commands)?.wait()?;
-        backend
+        let sampled = backend
             .read(&output)?
             .as_slice()
             .try_into()
             .map(u32::from_le_bytes)
-            .map_err(|_| BackendError::ExecutionFailed)
+            .map_err(|_| BackendError::ExecutionFailed)?;
+        for tensor in [&input, &params, &output] {
+            backend.release(tensor)?;
+        }
+        Ok(sampled)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -8283,12 +8396,16 @@ mod tests {
             )
             .map_err(|_| BackendError::InvalidInput)?;
         backend.submit(commands)?.wait()?;
-        backend
+        let sampled = backend
             .read(&output)?
             .as_slice()
             .try_into()
             .map(u32::from_le_bytes)
-            .map_err(|_| BackendError::ExecutionFailed)
+            .map_err(|_| BackendError::ExecutionFailed)?;
+        for tensor in [&input, &params, &mask, &output] {
+            backend.release(tensor)?;
+        }
+        Ok(sampled)
     }
 
     fn run_speculate_then_correct<B: Backend>(
@@ -12128,7 +12245,70 @@ mod tests {
     }
 
     #[test]
-    fn metal_masked_sample_tracks_ordinary_sample_gpu_time() {
+    fn metal_parallel_sample_matches_cpu_at_model_and_edge_widths() {
+        let reference = CpuBackend::new();
+        let candidate = MetalBackend::new().unwrap();
+        for width in [1_u32, 7, 33, 4097, 151_936] {
+            let (dtype, logits) = if width == 1 {
+                (DType::F16, vec![0_u8; 2])
+            } else {
+                (
+                    DType::F32,
+                    (0..width)
+                        .flat_map(|index| {
+                            (f32::from(u16::try_from(index % 31).unwrap()) / 8.0
+                                - f32::from(u16::try_from(index % 7).unwrap()))
+                            .to_le_bytes()
+                        })
+                        .collect(),
+                )
+            };
+            for (temperature, top_k, top_p) in [
+                (0.0, 0, 1.0),
+                (0.7, 0, 1.0),
+                (0.7, width.min(7), 1.0),
+                (0.7, 0, 0.9),
+            ] {
+                let expected = run_typed_sample(
+                    &reference,
+                    dtype,
+                    &logits,
+                    width,
+                    temperature,
+                    top_k,
+                    top_p,
+                    0xfeed_beef_dead_cafe,
+                    33,
+                    |_| Ok(()),
+                )
+                .unwrap();
+                let actual = run_metal_sample(
+                    &candidate,
+                    dtype,
+                    &logits,
+                    width,
+                    temperature,
+                    top_k,
+                    top_p,
+                    0xfeed_beef_dead_cafe,
+                    33,
+                    "sample.parallel",
+                )
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "parallel sample failed for width={width}, top_k={top_k}, top_p={top_p}: {error:?}"
+                    )
+                });
+                assert_eq!(
+                    actual, expected,
+                    "width={width}, top_k={top_k}, top_p={top_p}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn metal_parallel_and_masked_sample_track_ordinary_sample_gpu_time() {
         let backend = MetalBackend::new().unwrap();
         let width = 151_936_u32;
         let logits = backend.alloc(DType::F32, &[1, width]).unwrap();
@@ -12160,11 +12340,16 @@ mod tests {
                     .collect::<Vec<_>>(),
             )
             .unwrap();
-        let measure = |op: Op, inputs: &[&Tensor]| {
+        let measure = |op: Op, inputs: &[&Tensor], variant: Option<&str>| {
             let mut timings = Vec::with_capacity(20);
             for iteration in 0..23 {
                 let mut commands = CommandList::new();
                 commands.dispatch(op, inputs, &output).unwrap();
+                if let Some(name) = variant {
+                    let dispatch = commands.last_dispatch().unwrap();
+                    let selected = backend.validate_variant(dispatch, name).unwrap();
+                    assert!(commands.set_last_backend_data(BackendDispatchData::new(selected)));
+                }
                 let submission = backend.submit_profiled(commands).unwrap();
                 submission.wait().unwrap();
                 if iteration >= 3 {
@@ -12174,9 +12359,12 @@ mod tests {
             timings.sort_unstable();
             timings[timings.len() / 2]
         };
-        let ordinary = measure(sample_op(511), &[&logits, &params]);
+        let ordinary = measure(sample_op(511), &[&logits, &params], None);
+        let parallel = measure(sample_op(511), &[&logits, &params], Some("sample.parallel"));
+        eprintln!("sample width {width} parallel: {parallel:?}, ordinary {ordinary:?}");
+        assert!(parallel.as_secs_f64() <= ordinary.as_secs_f64() * 1.5);
         for (name, mask) in [("sparse", &sparse), ("dense", &dense)] {
-            let masked = measure(sample_masked_op(511), &[&logits, &params, mask]);
+            let masked = measure(sample_masked_op(511), &[&logits, &params, mask], None);
             eprintln!("sample width {width} masked {name}: {masked:?}, ordinary {ordinary:?}");
             assert!(masked.as_secs_f64() <= ordinary.as_secs_f64() * 1.5);
         }
