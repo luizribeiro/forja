@@ -63,6 +63,9 @@ pub mod bindings {
             "l9o:gpu/compute.weights": crate::WeightsEntry,
             "l9o:gpu/compute.params": crate::ParamsEntry,
             "l9o:gpu/compute.graph": crate::GraphEntry,
+            "l9o:gpu/paged-storage.page-pool": crate::PagePoolEntry,
+            "l9o:gpu/paged-storage.sequence": crate::PagedSequenceEntry,
+            "l9o:gpu/paged-storage.batch-slot": crate::BatchSlotEntry,
         },
     });
 }
@@ -93,11 +96,13 @@ pub mod engine_bindings {
         require_store_data_send: true,
         with: {
             "l9o:gpu/compute": crate::bindings::l9o::gpu::compute,
+            "l9o:gpu/paged-storage": crate::bindings::l9o::gpu::paged_storage,
         },
     });
 }
 
 use bindings::l9o::gpu::compute;
+use bindings::l9o::gpu::paged_storage;
 use compute::{Binop as WitBinOp, Redop as WitRedOp, Unop as WitUnOp, ValueType as WitValueType};
 
 /// Static metadata declared by an engine component.
@@ -1633,6 +1638,18 @@ pub struct TensorEntry {
     symbolic: Option<SymbolicLayout>,
     buffer: Arc<BufferHandle>,
 }
+
+/// Host-owned state behind an opaque guest page-pool resource.
+#[derive(Debug)]
+pub struct PagePoolEntry;
+
+/// Host-owned state behind an opaque guest paged-sequence resource.
+#[derive(Debug)]
+pub struct PagedSequenceEntry;
+
+/// Host-owned state behind an opaque guest batch-slot resource.
+#[derive(Debug)]
+pub struct BatchSlotEntry;
 
 impl TensorEntry {
     fn template(&self) -> Result<TemplateTensor, compute::Error> {
@@ -4646,6 +4663,111 @@ where
     }
 }
 
+impl<B> paged_storage::HostPagePool for Host<B>
+where
+    B: Backend + Send + Sync + 'static,
+{
+    fn drop(
+        &mut self,
+        resource: Resource<PagePoolEntry>,
+    ) -> impl Future<Output = wasmtime::Result<()>> + Send {
+        std::future::ready(
+            self.table
+                .delete(resource)
+                .map(|_| ())
+                .map_err(wasmtime::Error::msg),
+        )
+    }
+}
+
+impl<B> paged_storage::HostSequence for Host<B>
+where
+    B: Backend + Send + Sync + 'static,
+{
+    fn drop(
+        &mut self,
+        resource: Resource<PagedSequenceEntry>,
+    ) -> impl Future<Output = wasmtime::Result<()>> + Send {
+        std::future::ready(
+            self.table
+                .delete(resource)
+                .map(|_| ())
+                .map_err(wasmtime::Error::msg),
+        )
+    }
+}
+
+impl<B> paged_storage::HostBatchSlot for Host<B>
+where
+    B: Backend + Send + Sync + 'static,
+{
+    fn drop(
+        &mut self,
+        resource: Resource<BatchSlotEntry>,
+    ) -> impl Future<Output = wasmtime::Result<()>> + Send {
+        std::future::ready(
+            self.table
+                .delete(resource)
+                .map(|_| ())
+                .map_err(wasmtime::Error::msg),
+        )
+    }
+}
+
+impl<B> paged_storage::Host for Host<B>
+where
+    B: Backend + Send + Sync + 'static,
+{
+    fn record_paged_copy(
+        &mut self,
+        commands: Resource<CommandListEntry>,
+        pool: Resource<PagePoolEntry>,
+        slot: Resource<BatchSlotEntry>,
+        lane: u32,
+        span: paged_storage::PagedSpan,
+        ordinary: Resource<TensorEntry>,
+        direction: paged_storage::CopyDirection,
+    ) -> impl Future<Output = wasmtime::Result<Result<(), compute::Error>>> + Send {
+        let _ = (lane, span, direction);
+        let result = self
+            .table
+            .get(&commands)
+            .map_err(invalid_handle)
+            .and_then(|_| self.table.get(&pool).map_err(invalid_handle))
+            .and_then(|_| self.table.get(&slot).map_err(invalid_handle))
+            .and_then(|_| self.table.get(&ordinary).map_err(invalid_handle))
+            .and(Err(compute::Error::BackendExecution(
+                "paged resources are not bound to this runner".to_owned(),
+            )));
+        std::future::ready(Ok(result))
+    }
+
+    fn record_paged_sdpa(
+        &mut self,
+        commands: Resource<CommandListEntry>,
+        pool: Resource<PagePoolEntry>,
+        slot: Resource<BatchSlotEntry>,
+        lane: u32,
+        query: Resource<TensorEntry>,
+        output: Resource<TensorEntry>,
+        config: paged_storage::SdpaCfg,
+    ) -> impl Future<Output = wasmtime::Result<Result<(), compute::Error>>> + Send {
+        let _ = (lane, config);
+        let result = self
+            .table
+            .get(&commands)
+            .map_err(invalid_handle)
+            .and_then(|_| self.table.get(&pool).map_err(invalid_handle))
+            .and_then(|_| self.table.get(&slot).map_err(invalid_handle))
+            .and_then(|_| self.table.get(&query).map_err(invalid_handle))
+            .and_then(|_| self.table.get(&output).map_err(invalid_handle))
+            .and(Err(compute::Error::BackendExecution(
+                "paged resources are not bound to this runner".to_owned(),
+            )));
+        std::future::ready(Ok(result))
+    }
+}
+
 fn guest_device_info(info: DeviceInfo) -> compute::DeviceInfo {
     compute::DeviceInfo {
         family: info.family,
@@ -5296,10 +5418,12 @@ mod tests {
     use wasmtime::component::Resource;
 
     use super::{
-        BackendEvent, BackendTimer, EngineMemory, EngineMetrics, EngineRunner, EngineStep,
-        EngineStepProfile, Grants, Host, ImportKind, ImportTimer, Limits, MAX_INSTRUCTIONS,
-        MAX_OUTPUTS, ParamsEntry, ReplayFlight, ReplayState, TensorEntry,
-        bindings::l9o::gpu::compute, core_op, core_program, expected_layer_outputs,
+        BackendEvent, BackendTimer, BatchSlotEntry, EngineMemory, EngineMetrics, EngineRunner,
+        EngineStep, EngineStepProfile, Grants, Host, ImportKind, ImportTimer, Limits,
+        MAX_INSTRUCTIONS, MAX_OUTPUTS, PagePoolEntry, PagedSequenceEntry, ParamsEntry,
+        ReplayFlight, ReplayState, TensorEntry,
+        bindings::l9o::gpu::{compute, paged_storage},
+        core_op, core_program, expected_layer_outputs,
     };
 
     const GENEROUS: Limits = Limits::new(u64::MAX, 8, u64::MAX, 32, u64::MAX);
@@ -5311,6 +5435,80 @@ mod tests {
         assert_eq!(expected_layer_outputs(&layers, Some(4), true), 3);
         assert_eq!(expected_layer_outputs(&layers, None, true), 4);
         assert_eq!(expected_layer_outputs(&layers, Some(4), false), 0);
+    }
+
+    #[tokio::test]
+    async fn paged_wasmtime_stubs_refuse_and_drop_resources() {
+        let mut host = Host::new(CpuBackend::new(), GENEROUS);
+        let commands = host.command_list().unwrap();
+        let pool = host.table.push(PagePoolEntry).unwrap();
+        let sequence = host.table.push(PagedSequenceEntry).unwrap();
+        let slot = host.table.push(BatchSlotEntry).unwrap();
+        let ordinary = host.alloc(compute::Dtype::F32, &[1]).unwrap();
+        let output = host.alloc(compute::Dtype::F32, &[1]).unwrap();
+        let copy = <Host<CpuBackend> as paged_storage::Host>::record_paged_copy(
+            &mut host,
+            Resource::new_borrow(commands.rep()),
+            Resource::new_borrow(pool.rep()),
+            Resource::new_borrow(slot.rep()),
+            0,
+            paged_storage::PagedSpan {
+                plane: 0,
+                start: 0,
+                len: 1,
+            },
+            Resource::new_borrow(ordinary.rep()),
+            paged_storage::CopyDirection::IntoPages,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(copy, Err(compute::Error::BackendExecution(_))));
+        let sdpa = <Host<CpuBackend> as paged_storage::Host>::record_paged_sdpa(
+            &mut host,
+            Resource::new_borrow(commands.rep()),
+            Resource::new_borrow(pool.rep()),
+            Resource::new_borrow(slot.rep()),
+            0,
+            Resource::new_borrow(ordinary.rep()),
+            Resource::new_borrow(output.rep()),
+            paged_storage::SdpaCfg {
+                key_plane: 0,
+                value_plane: 1,
+                scale: 1.0,
+                causal: false,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(sdpa, Err(compute::Error::BackendExecution(_))));
+
+        let pool_rep = pool.rep();
+        let sequence_rep = sequence.rep();
+        let slot_rep = slot.rep();
+        <Host<CpuBackend> as paged_storage::HostPagePool>::drop(&mut host, pool)
+            .await
+            .unwrap();
+        <Host<CpuBackend> as paged_storage::HostSequence>::drop(&mut host, sequence)
+            .await
+            .unwrap();
+        <Host<CpuBackend> as paged_storage::HostBatchSlot>::drop(&mut host, slot)
+            .await
+            .unwrap();
+        assert!(
+            host.table
+                .get(&Resource::<PagePoolEntry>::new_borrow(pool_rep))
+                .is_err()
+        );
+        assert!(
+            host.table
+                .get(&Resource::<PagedSequenceEntry>::new_borrow(sequence_rep))
+                .is_err()
+        );
+        assert!(
+            host.table
+                .get(&Resource::<BatchSlotEntry>::new_borrow(slot_rep))
+                .is_err()
+        );
     }
 
     fn doubling_program(value: f32) -> compute::ProgramSource {

@@ -1,0 +1,47 @@
+package l9o:gpu@0.1.0;
+
+interface paged-storage {
+  use compute.{command-list, error, tensor};
+
+  resource page-pool;
+  resource sequence;
+  resource batch-slot;
+
+  enum copy-direction {
+    into-pages,
+    out-of-pages,
+  }
+
+  record paged-span {
+    plane: u32,
+    start: u64,
+    len: u64,
+  }
+
+  record sdpa-cfg {
+    key-plane: u32,
+    value-plane: u32,
+    scale: f32,
+    causal: bool,
+  }
+
+  record-paged-copy: func(
+    cmds: borrow<command-list>,
+    pool: borrow<page-pool>,
+    slot: borrow<batch-slot>,
+    lane: u32,
+    span: paged-span,
+    ordinary: borrow<tensor>,
+    direction: copy-direction,
+  ) -> result<_, error>;
+
+  record-paged-sdpa: func(
+    cmds: borrow<command-list>,
+    pool: borrow<page-pool>,
+    slot: borrow<batch-slot>,
+    lane: u32,
+    query: borrow<tensor>,
+    output: borrow<tensor>,
+    config: sdpa-cfg,
+  ) -> result<_, error>;
+}

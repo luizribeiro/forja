@@ -88,5 +88,6 @@ interface engine {
 // Paged caches, batches, and drafting replace it in the serving interface.
 world engine-component {
   import compute;
+  import paged-storage;
   export engine;
 }

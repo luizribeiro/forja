@@ -12,6 +12,7 @@ use syn::{
 mod kernel;
 
 const COMPUTE_WIT: &str = include_str!("../../../wit/compute.wit");
+const PAGED_STORAGE_WIT: &str = include_str!("../../../wit/paged-storage.wit");
 const ENGINE_WIT: &str = include_str!("../../../wit/engine.wit");
 
 /// Defines a restricted Rust-syntax scalar kernel.
@@ -63,7 +64,12 @@ fn expand_engine(item: &ItemImpl) -> syn::Result<proc_macro2::TokenStream> {
     let engine_wit = ENGINE_WIT
         .strip_prefix("package l9o:gpu@0.1.0;\n")
         .ok_or_else(|| syn::Error::new_spanned(&item.self_ty, "engine WIT package changed"))?;
-    let wit = format!("{COMPUTE_WIT}\n{engine_wit}");
+    let paged_storage_wit = PAGED_STORAGE_WIT
+        .strip_prefix("package l9o:gpu@0.1.0;\n")
+        .ok_or_else(|| {
+            syn::Error::new_spanned(&item.self_ty, "paged storage WIT package changed")
+        })?;
+    let wit = format!("{COMPUTE_WIT}\n{paged_storage_wit}\n{engine_wit}");
     let guest_impl = engine_guest_impl();
     Ok(quote! {
         #item

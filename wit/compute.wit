@@ -239,6 +239,7 @@ interface compute {
 
 world host {
   import compute;
+  import paged-storage;
 }
 
 world tensor-smoke {
