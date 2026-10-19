@@ -12,16 +12,31 @@ const BLOCK_DOMAIN: &[u8] = b"forja-prefix-block-v1";
 const NAMESPACE_DOMAIN: &[u8] = b"forja-prefix-namespace-v1";
 static RUNNER_NONCE: AtomicU64 = AtomicU64::new(0);
 
+/// Fixed metadata bounds for one shared-prefix index.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(not(test), allow(dead_code, reason = "used by paged serving"))]
+pub(crate) struct PrefixLimits {
+    pub(crate) entries: usize,
+    pub(crate) tokens: usize,
+    pub(crate) referenced_pages: usize,
+}
+
 /// A shared-prefix index operation failure.
 #[derive(Debug)]
 #[cfg_attr(not(test), allow(dead_code, reason = "used by paged serving"))]
 pub(crate) enum PrefixIndexError {
+    InvalidLimits,
+    EntryTooLarge,
+    Bookkeeping,
     Pool(PagePoolError),
 }
 
 impl fmt::Display for PrefixIndexError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidLimits => formatter.write_str("prefix index limits must be nonzero"),
+            Self::EntryTooLarge => formatter.write_str("prefix index entry exceeds its limits"),
+            Self::Bookkeeping => formatter.write_str("prefix index bookkeeping is inconsistent"),
             Self::Pool(error) => write!(formatter, "prefix index pool error: {error}"),
         }
     }
@@ -89,6 +104,8 @@ pub(crate) struct LivePrefix {
 struct PrefixEntry {
     fingerprint: LivePrefix,
     sequence: PagedSequence,
+    pages: usize,
+    used: u64,
 }
 
 /// A sequence fork attached to the longest exact indexed prefix.
@@ -101,19 +118,30 @@ pub(crate) struct PrefixHit {
 /// Multi-entry prefix index retaining immutable page references.
 #[cfg_attr(not(test), allow(dead_code, reason = "used by paged serving"))]
 pub(crate) struct PrefixIndex {
+    limits: PrefixLimits,
     entries: HashMap<u64, PrefixEntry>,
     blocks: HashMap<[u8; 32], Vec<u64>>,
     next_id: u64,
+    clock: u64,
+    tokens: usize,
+    pages: usize,
 }
 
 #[cfg_attr(not(test), allow(dead_code, reason = "used by paged serving"))]
 impl PrefixIndex {
-    pub(crate) fn new() -> Self {
-        Self {
+    pub(crate) fn new(limits: PrefixLimits) -> Result<Self, PrefixIndexError> {
+        if limits.entries == 0 || limits.tokens == 0 || limits.referenced_pages == 0 {
+            return Err(PrefixIndexError::InvalidLimits);
+        }
+        Ok(Self {
+            limits,
             entries: HashMap::new(),
             blocks: HashMap::new(),
             next_id: 0,
-        }
+            clock: 0,
+            tokens: 0,
+            pages: 0,
+        })
     }
 
     pub(crate) fn publish(
@@ -126,20 +154,39 @@ impl PrefixIndex {
             u64::try_from(tokens.len())
                 .map_err(|_| PrefixIndexError::Pool(PagePoolError::ArithmeticOverflow))?,
         )?;
+        let page_count = pages.table()?.entries().len();
+        if tokens.len() > self.limits.tokens || page_count > self.limits.referenced_pages {
+            return Err(PrefixIndexError::EntryTooLarge);
+        }
+        self.evict_for(tokens.len(), page_count)?;
         let id = self.next_id;
-        self.next_id = self
+        let next_id = self
             .next_id
             .checked_add(1)
             .ok_or(PrefixIndexError::Pool(PagePoolError::ArithmeticOverflow))?;
         let fingerprint = LivePrefix::new(namespace, tokens);
+        let token_total = self
+            .tokens
+            .checked_add(fingerprint.tokens.len())
+            .ok_or(PrefixIndexError::Bookkeeping)?;
+        let page_total = self
+            .pages
+            .checked_add(page_count)
+            .ok_or(PrefixIndexError::Bookkeeping)?;
+        let used = self.tick()?;
         for hash in &fingerprint.chain {
             self.blocks.entry(*hash).or_default().push(id);
         }
+        self.next_id = next_id;
+        self.tokens = token_total;
+        self.pages = page_total;
         self.entries.insert(
             id,
             PrefixEntry {
                 fingerprint,
                 sequence: pages,
+                pages: page_count,
+                used,
             },
         );
         Ok(())
@@ -187,10 +234,12 @@ impl PrefixIndex {
         let Some((id, cached_tokens @ 1..)) = best else {
             return Ok(None);
         };
+        let used = self.tick()?;
         let entry = self
             .entries
             .get_mut(&id)
             .ok_or(PrefixIndexError::Pool(PagePoolError::CorruptState))?;
+        entry.used = used;
         let sequence = entry.sequence.fork_reserved(
             u64::try_from(cached_tokens)
                 .map_err(|_| PrefixIndexError::Pool(PagePoolError::ArithmeticOverflow))?,
@@ -200,6 +249,63 @@ impl PrefixIndex {
             sequence,
             cached_tokens,
         }))
+    }
+
+    fn tick(&mut self) -> Result<u64, PrefixIndexError> {
+        self.clock = self
+            .clock
+            .checked_add(1)
+            .ok_or(PrefixIndexError::Bookkeeping)?;
+        Ok(self.clock)
+    }
+
+    fn evict_for(&mut self, tokens: usize, pages: usize) -> Result<(), PrefixIndexError> {
+        loop {
+            let over_budget = self.entries.len() >= self.limits.entries
+                || self
+                    .tokens
+                    .checked_add(tokens)
+                    .is_none_or(|total| total > self.limits.tokens)
+                || self
+                    .pages
+                    .checked_add(pages)
+                    .is_none_or(|total| total > self.limits.referenced_pages);
+            if !over_budget {
+                return Ok(());
+            }
+            let Some((&id, _)) = self.entries.iter().min_by_key(|(_, entry)| entry.used) else {
+                return Err(PrefixIndexError::Bookkeeping);
+            };
+            self.remove(id)?;
+        }
+    }
+
+    fn remove(&mut self, id: u64) -> Result<(), PrefixIndexError> {
+        let entry = self.entries.get(&id).ok_or(PrefixIndexError::Bookkeeping)?;
+        let tokens = self
+            .tokens
+            .checked_sub(entry.fingerprint.tokens.len())
+            .ok_or(PrefixIndexError::Bookkeeping)?;
+        let pages = self
+            .pages
+            .checked_sub(entry.pages)
+            .ok_or(PrefixIndexError::Bookkeeping)?;
+        let entry = self
+            .entries
+            .remove(&id)
+            .ok_or(PrefixIndexError::Bookkeeping)?;
+        self.tokens = tokens;
+        self.pages = pages;
+        for hash in &entry.fingerprint.chain {
+            let empty = self.blocks.get_mut(hash).is_some_and(|ids| {
+                ids.retain(|candidate| *candidate != id);
+                ids.is_empty()
+            });
+            if empty {
+                self.blocks.remove(hash);
+            }
+        }
+        Ok(())
     }
 }
 #[derive(Default)]
@@ -391,7 +497,12 @@ mod tests {
     fn unrelated_entry_does_not_evict_an_agent_prefix() {
         let namespace = PrefixNamespace([9; 32]);
         let pool = pool();
-        let mut index = PrefixIndex::new();
+        let mut index = PrefixIndex::new(PrefixLimits {
+            entries: 3,
+            tokens: 768,
+            referenced_pages: 12,
+        })
+        .unwrap();
         let agent = (0..130).collect::<Vec<_>>();
         let unrelated = (1_000..1_100).collect::<Vec<_>>();
         index
@@ -412,5 +523,69 @@ mod tests {
         assert_eq!(hit.cached_tokens, 130);
         assert_eq!(hit.sequence.logical_len(), 130);
         assert_eq!(hit.sequence.reserved_tokens(), 192);
+    }
+
+    #[test]
+    fn least_recent_entry_is_evicted_after_a_hit() {
+        let namespace = PrefixNamespace([3; 32]);
+        let pool = pool();
+        let mut index = PrefixIndex::new(PrefixLimits {
+            entries: 2,
+            tokens: 512,
+            referenced_pages: 12,
+        })
+        .unwrap();
+        for start in [0, 1_000] {
+            let tokens = (start..start + 100).collect::<Vec<_>>();
+            index
+                .publish(namespace, tokens, &mut sequence(&pool, 100))
+                .unwrap();
+        }
+        let first = (0..110).collect::<Vec<_>>();
+        assert!(index.lookup(namespace, &first, 128).unwrap().is_some());
+        let third = (2_000..2_100).collect::<Vec<_>>();
+        index
+            .publish(namespace, third.clone(), &mut sequence(&pool, 100))
+            .unwrap();
+
+        assert!(index.lookup(namespace, &first, 128).unwrap().is_some());
+        assert!(
+            index
+                .lookup(namespace, &(1_000..1_110).collect::<Vec<_>>(), 128)
+                .unwrap()
+                .is_none()
+        );
+        assert!(index.lookup(namespace, &third, 128).unwrap().is_some());
+    }
+
+    #[test]
+    fn bookkeeping_drift_is_reported_without_removing_entries() {
+        let namespace = PrefixNamespace([5; 32]);
+        let pool = pool();
+        let mut index = PrefixIndex::new(PrefixLimits {
+            entries: 2,
+            tokens: 256,
+            referenced_pages: 8,
+        })
+        .unwrap();
+        let tokens = (0..100).collect::<Vec<_>>();
+        let mut sequence = sequence(&pool, tokens.len());
+        index
+            .publish(namespace, tokens.clone(), &mut sequence)
+            .unwrap();
+        index.tokens = 0;
+
+        assert!(matches!(
+            index.remove(0),
+            Err(PrefixIndexError::Bookkeeping)
+        ));
+        assert!(index.entries.contains_key(&0));
+
+        index.entries.clear();
+        index.tokens = usize::MAX;
+        assert!(matches!(
+            index.evict_for(1, 1),
+            Err(PrefixIndexError::Bookkeeping)
+        ));
     }
 }
