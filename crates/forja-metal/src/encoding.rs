@@ -7592,6 +7592,7 @@ pub(super) fn variant_supported(
         | MetalVariant::SdpaVectorGqaTwoPass256 => vector_sdpa_supported(dispatch)?,
         MetalVariant::SdpaSteel => steel_sdpa_supported(dispatch)?,
         MetalVariant::SdpaSteelHalf => half_steel_sdpa_supported(dispatch)?,
+        MetalVariant::PagedSdpaVector => matches!(dispatch.op(), Op::PagedSdpa { .. }),
         MetalVariant::TopKSingleK8 => dispatch_kernel(dispatch)? == "topk_single",
         MetalVariant::SamplePortable => dispatch_kernel(dispatch)? == "sample_rejection",
         MetalVariant::SampleParallel => dispatch_kernel(dispatch)? == "sample_parallel",

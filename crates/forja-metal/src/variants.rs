@@ -46,6 +46,7 @@ pub(crate) enum MetalVariant {
     SdpaVectorGqaTwoPass256,
     SdpaSteel,
     SdpaSteelHalf,
+    PagedSdpaVector,
     TopKPortable,
     TopKSingleK8,
     TopKPartials,
@@ -71,6 +72,12 @@ impl ValidatedVariant {
     #[must_use]
     pub fn operation(self) -> OperationKind {
         REGISTRY[self.index].operation
+    }
+
+    /// Reports whether batch size and lane position preserve each row's reduction order.
+    #[must_use]
+    pub fn is_batch_invariant(self) -> bool {
+        REGISTRY[self.index].batch_invariant
     }
 
     pub(crate) const fn implementation(self) -> MetalVariant {
@@ -244,6 +251,7 @@ const KEY_HEADS: Dimension = dim("key/value heads", KEY, Axis::Index(0));
 const KEY_LENGTH: Dimension = dim("key length", KEY, Axis::Index(1));
 const KEY_WIDTH: Dimension = dim("key width", KEY, Axis::Index(2));
 const VALUE_WIDTH: Dimension = dim("value width", VALUE, Axis::Index(2));
+const PAGED_KEY_WIDTH: Dimension = dim("key width", KEY, Axis::Index(3));
 const TOP_K_WIDTH: Dimension = dim("width", INPUT, Axis::FromEnd(1));
 
 const fn dim(name: &'static str, tensor: TensorRef, axis: Axis) -> Dimension {
@@ -546,9 +554,11 @@ const TOP_K_PARTIALS: &[Constraint] = &[operation(
     OperationValue::TopK,
     Relation::Range { min: 1, max: 64 },
 )];
+const PAGED_SDPA: &[Constraint] = &[value(PAGED_KEY_WIDTH, Relation::OneOf(WIDTHS))];
 
 macro_rules! variant {
-    ($name:literal, $operation:ident, $implementation:ident, $constraints:expr,
+    (@batch_invariant $batch_invariant:expr;
+     $name:literal, $operation:ident, $implementation:ident, $constraints:expr,
      $use_when:expr, $avoid_when:expr, $notes:expr) => {
         VariantDef {
             name: $name,
@@ -557,16 +567,30 @@ macro_rules! variant {
             availability: METAL4,
             constraints: $constraints,
             guarantees: DETERMINISTIC,
+            batch_invariant: $batch_invariant,
             use_when: $use_when,
             avoid_when: $avoid_when,
             notes: $notes,
             lifecycle: ACTIVE,
         }
     };
+    ($name:literal, $operation:ident, $implementation:ident, $constraints:expr,
+     $use_when:expr, $avoid_when:expr, $notes:expr) => {
+        variant!(@batch_invariant false; $name, $operation, $implementation, $constraints,
+                 $use_when, $avoid_when, $notes)
+    };
+}
+
+macro_rules! batch_invariant_variant {
+    ($name:literal, $operation:ident, $implementation:ident, $constraints:expr,
+     $use_when:expr, $avoid_when:expr, $notes:expr) => {
+        variant!(@batch_invariant true; $name, $operation, $implementation, $constraints,
+                 $use_when, $avoid_when, $notes)
+    };
 }
 
 pub(crate) static REGISTRY: &[VariantDef<MetalVariant>] = &[
-    variant!(
+    batch_invariant_variant!(
         "matmul.portable",
         Matmul,
         MatmulPortable,
@@ -575,7 +599,7 @@ pub(crate) static REGISTRY: &[VariantDef<MetalVariant>] = &[
         &["an engine can pin a shape-specific algorithm."],
         &["Uses one fixed broad Steel tile for every valid shape."]
     ),
-    variant!(
+    batch_invariant_variant!(
         "matmul.gemv",
         Matmul,
         MatmulGemv,
@@ -584,7 +608,7 @@ pub(crate) static REGISTRY: &[VariantDef<MetalVariant>] = &[
         &["the right matrix is column-major."],
         &["Bandwidth-oriented matrix-vector multiplication."]
     ),
-    variant!(
+    batch_invariant_variant!(
         "matmul.gemv-transposed",
         Matmul,
         MatmulGemvTransposed,
@@ -593,7 +617,7 @@ pub(crate) static REGISTRY: &[VariantDef<MetalVariant>] = &[
         &["either matrix needs layout staging."],
         &["Reads the right operand in its transposed storage order."]
     ),
-    variant!(
+    batch_invariant_variant!(
         "matmul.steel-64x64x16-2x2",
         Matmul,
         MatmulSteel64x64x16_2x2,
@@ -602,7 +626,7 @@ pub(crate) static REGISTRY: &[VariantDef<MetalVariant>] = &[
         &["m = 1 or small half-precision products."],
         &["A 64 by 64 Steel tile with 16-wide reduction blocks."]
     ),
-    variant!(
+    batch_invariant_variant!(
         "matmul.steel-64x64x16-1x2",
         Matmul,
         MatmulSteel64x64x16_1x2,
@@ -611,7 +635,7 @@ pub(crate) static REGISTRY: &[VariantDef<MetalVariant>] = &[
         &["small products where launch overhead dominates."],
         &["A 64 by 64 Steel tile with lower thread count."]
     ),
-    variant!(
+    batch_invariant_variant!(
         "matmul.steel-64x32x32-2x2",
         Matmul,
         MatmulSteel64x32x32_2x2,
@@ -620,7 +644,7 @@ pub(crate) static REGISTRY: &[VariantDef<MetalVariant>] = &[
         &["wide output tiles dominate the shape."],
         &["A 64 by 32 Steel tile with 32-wide reduction blocks."]
     ),
-    variant!(
+    batch_invariant_variant!(
         "matmul.steel-32x64x16-1x2",
         Matmul,
         MatmulSteel32x64x16_1x2,
@@ -629,7 +653,7 @@ pub(crate) static REGISTRY: &[VariantDef<MetalVariant>] = &[
         &["tall output tiles dominate the shape."],
         &["A 32 by 64 Steel tile with 16-wide reduction blocks."]
     ),
-    variant!(
+    batch_invariant_variant!(
         "quant-matmul.portable",
         QuantMatmul,
         QuantMatmulPortable,
@@ -638,7 +662,7 @@ pub(crate) static REGISTRY: &[VariantDef<MetalVariant>] = &[
         &["decode and large contiguous batches have faster specialized algorithms."],
         &["Uses the general small-m algorithm for every valid shape."]
     ),
-    variant!(
+    batch_invariant_variant!(
         "quant-matmul.gemv",
         QuantMatmul,
         QuantMatmulGemv,
@@ -647,7 +671,7 @@ pub(crate) static REGISTRY: &[VariantDef<MetalVariant>] = &[
         &["large batches that can amortize tiled work."],
         &["General quantized matrix-vector multiplication."]
     ),
-    variant!(
+    batch_invariant_variant!(
         "quant-matmul.q8-fast-gemv",
         QuantMatmul,
         QuantMatmulQ8FastGemv,
@@ -656,7 +680,7 @@ pub(crate) static REGISTRY: &[VariantDef<MetalVariant>] = &[
         &["strided tensors or q4 weights."],
         &["Uses vectorized q8 loads."]
     ),
-    variant!(
+    batch_invariant_variant!(
         "quant-matmul.small-m",
         QuantMatmul,
         QuantMatmulSmallM,
@@ -665,7 +689,7 @@ pub(crate) static REGISTRY: &[VariantDef<MetalVariant>] = &[
         &["contiguous batches of at least 16 rows."],
         &["The general quantized matrix-matrix fallback."]
     ),
-    variant!(
+    batch_invariant_variant!(
         "quant-matmul.tiled",
         QuantMatmul,
         QuantMatmulTiled,
@@ -674,7 +698,7 @@ pub(crate) static REGISTRY: &[VariantDef<MetalVariant>] = &[
         &["small or strided batches."],
         &["One algorithm supports f32, f16, and bf16 activations."]
     ),
-    variant!(
+    batch_invariant_variant!(
         "gather-quant-matmul.portable",
         GatherQuantMatmul,
         GatherQuantMatmulPortable,
@@ -683,7 +707,7 @@ pub(crate) static REGISTRY: &[VariantDef<MetalVariant>] = &[
         &["large routed batches can amortize grouping."],
         &["Uses route GEMV for every valid shape."]
     ),
-    variant!(
+    batch_invariant_variant!(
         "gather-quant-matmul.route-gemv",
         GatherQuantMatmul,
         GatherQuantMatmulRouteGemv,
@@ -692,7 +716,7 @@ pub(crate) static REGISTRY: &[VariantDef<MetalVariant>] = &[
         &["enough routes to amortize grouping."],
         &["Executes each routed row directly."]
     ),
-    variant!(
+    batch_invariant_variant!(
         "gather-quant-matmul.grouped-small-m",
         GatherQuantMatmul,
         GatherQuantMatmulGroupedSmallM,
@@ -701,7 +725,7 @@ pub(crate) static REGISTRY: &[VariantDef<MetalVariant>] = &[
         &["larger routed batches with enough rows to fill 16-row tiles."],
         &["Groups routes into 8-row expert tiles."]
     ),
-    variant!(
+    batch_invariant_variant!(
         "gather-quant-matmul.grouped-pair-small-m",
         GatherQuantMatmul,
         GatherQuantMatmulGroupedPairSmallM,
@@ -710,7 +734,7 @@ pub(crate) static REGISTRY: &[VariantDef<MetalVariant>] = &[
         &["single projections or larger routed batches."],
         &["Groups paired projections into 8-row expert tiles."]
     ),
-    variant!(
+    batch_invariant_variant!(
         "gather-quant-matmul.grouped",
         GatherQuantMatmul,
         GatherQuantMatmulGrouped,
@@ -719,7 +743,7 @@ pub(crate) static REGISTRY: &[VariantDef<MetalVariant>] = &[
         &["small route counts."],
         &["Sorts routes into bounded expert groups."]
     ),
-    variant!(
+    batch_invariant_variant!(
         "gather-quant-matmul.weighted-broad",
         GatherQuantMatmul,
         GatherQuantMatmulWeightedBroad,
@@ -728,7 +752,18 @@ pub(crate) static REGISTRY: &[VariantDef<MetalVariant>] = &[
         &["eight or fewer routes can use one SIMD group per route."],
         &["Uses one SIMD group to combine any legal route count."]
     ),
-    variant!(
+    batch_invariant_variant!(
+        "paged-sdpa.vector",
+        PagedSdpa,
+        PagedSdpaVector,
+        PAGED_SDPA,
+        &["paged attention with head width 64 or 128."],
+        &["ordinary contiguous attention does not need a page table."],
+        &[
+            "Uses one authenticated table entry per logical page and a direct-address path for consecutive entries."
+        ]
+    ),
+    batch_invariant_variant!(
         "sdpa.portable",
         Sdpa,
         SdpaPortable,
@@ -737,7 +772,7 @@ pub(crate) static REGISTRY: &[VariantDef<MetalVariant>] = &[
         &["supported decode and prefill shapes have faster specialized algorithms."],
         &["Uses decomposed attention for every valid shape."]
     ),
-    variant!(
+    batch_invariant_variant!(
         "sdpa.decomposed",
         Sdpa,
         SdpaDecomposed,
@@ -746,7 +781,7 @@ pub(crate) static REGISTRY: &[VariantDef<MetalVariant>] = &[
         &["a specialized vector or Steel kernel is known to fit."],
         &["Broad baseline assembled from trusted operations."]
     ),
-    variant!(
+    batch_invariant_variant!(
         "sdpa.vector-single-pass",
         Sdpa,
         SdpaVectorSinglePass,
@@ -755,7 +790,7 @@ pub(crate) static REGISTRY: &[VariantDef<MetalVariant>] = &[
         &["prefill or long cache lengths."],
         &["Keeps the reduction in one pass."]
     ),
-    variant!(
+    batch_invariant_variant!(
         "sdpa.vector-two-pass",
         Sdpa,
         SdpaVectorTwoPass64,
@@ -764,7 +799,7 @@ pub(crate) static REGISTRY: &[VariantDef<MetalVariant>] = &[
         &["prefill or a profile-tuned block count."],
         &["Uses 64 reduction blocks as the platform-neutral default."]
     ),
-    variant!(
+    batch_invariant_variant!(
         "sdpa.vector-two-pass-128",
         Sdpa,
         SdpaVectorTwoPass128,
@@ -773,7 +808,7 @@ pub(crate) static REGISTRY: &[VariantDef<MetalVariant>] = &[
         &["prefill or shorter cache lengths."],
         &["Uses 128 reduction blocks chosen by the engine profile."]
     ),
-    variant!(
+    batch_invariant_variant!(
         "sdpa.vector-two-pass-256",
         Sdpa,
         SdpaVectorTwoPass256,
@@ -782,7 +817,7 @@ pub(crate) static REGISTRY: &[VariantDef<MetalVariant>] = &[
         &["prefill or shorter cache lengths."],
         &["Uses 256 reduction blocks chosen by the engine profile."]
     ),
-    variant!(
+    batch_invariant_variant!(
         "sdpa.vector-two-pass-512",
         Sdpa,
         SdpaVectorTwoPass512,
@@ -791,7 +826,7 @@ pub(crate) static REGISTRY: &[VariantDef<MetalVariant>] = &[
         &["prefill or shorter cache lengths."],
         &["Uses 512 reduction blocks chosen by the engine profile."]
     ),
-    variant!(
+    batch_invariant_variant!(
         "sdpa.vector-two-pass-1024",
         Sdpa,
         SdpaVectorTwoPass1024,
@@ -800,7 +835,7 @@ pub(crate) static REGISTRY: &[VariantDef<MetalVariant>] = &[
         &["prefill or shorter cache lengths."],
         &["Uses 1024 reduction blocks chosen by the engine profile."]
     ),
-    variant!(
+    batch_invariant_variant!(
         "sdpa.vector-gqa-two-pass-32",
         Sdpa,
         SdpaVectorGqaTwoPass32,
@@ -809,7 +844,7 @@ pub(crate) static REGISTRY: &[VariantDef<MetalVariant>] = &[
         &["other grouped-query factors or longer cache lengths."],
         &["Reuses each K/V load across two query heads with 32 reduction blocks."]
     ),
-    variant!(
+    batch_invariant_variant!(
         "sdpa.vector-gqa-two-pass",
         Sdpa,
         SdpaVectorGqaTwoPass64,
@@ -818,7 +853,7 @@ pub(crate) static REGISTRY: &[VariantDef<MetalVariant>] = &[
         &["other grouped-query factors or a profile-tuned block count."],
         &["Reuses each K/V load across two query heads with 64 reduction blocks."]
     ),
-    variant!(
+    batch_invariant_variant!(
         "sdpa.vector-gqa-two-pass-128",
         Sdpa,
         SdpaVectorGqaTwoPass128,
@@ -827,7 +862,7 @@ pub(crate) static REGISTRY: &[VariantDef<MetalVariant>] = &[
         &["other grouped-query factors or shorter cache lengths."],
         &["Reuses each K/V load across two query heads with 128 reduction blocks."]
     ),
-    variant!(
+    batch_invariant_variant!(
         "sdpa.vector-gqa-two-pass-256",
         Sdpa,
         SdpaVectorGqaTwoPass256,
@@ -836,7 +871,7 @@ pub(crate) static REGISTRY: &[VariantDef<MetalVariant>] = &[
         &["other grouped-query factors or shorter cache lengths."],
         &["Reuses each K/V load across two query heads with 256 reduction blocks."]
     ),
-    variant!(
+    batch_invariant_variant!(
         "sdpa.steel",
         Sdpa,
         SdpaSteel,
@@ -845,7 +880,7 @@ pub(crate) static REGISTRY: &[VariantDef<MetalVariant>] = &[
         &["single-token decode."],
         &["Uses tiled matrix operations for prefill-shaped work."]
     ),
-    variant!(
+    batch_invariant_variant!(
         "sdpa.steel-half",
         Sdpa,
         SdpaSteelHalf,
@@ -857,7 +892,7 @@ pub(crate) static REGISTRY: &[VariantDef<MetalVariant>] = &[
             "Converts MMA inputs to half and accumulates in f32."
         ]
     ),
-    variant!(
+    batch_invariant_variant!(
         "top-k.portable",
         TopK,
         TopKPortable,
@@ -866,7 +901,7 @@ pub(crate) static REGISTRY: &[VariantDef<MetalVariant>] = &[
         &["selection counts at most 64 have faster bounded algorithms."],
         &["Uses an exact parallel fallback for every valid shape."]
     ),
-    variant!(
+    batch_invariant_variant!(
         "top-k.single-k8",
         TopK,
         TopKSingleK8,
@@ -875,7 +910,7 @@ pub(crate) static REGISTRY: &[VariantDef<MetalVariant>] = &[
         &["other k values or wider rows."],
         &["Selects and finalizes in one kernel."]
     ),
-    variant!(
+    batch_invariant_variant!(
         "top-k.partials",
         TopK,
         TopKPartials,
@@ -884,7 +919,7 @@ pub(crate) static REGISTRY: &[VariantDef<MetalVariant>] = &[
         &["larger selection counts or k = 8 with width at most 2048."],
         &["Reduces fixed-capacity chunk partials in a finalize pass."]
     ),
-    variant!(
+    batch_invariant_variant!(
         "sample.portable",
         Sample,
         SamplePortable,
@@ -893,7 +928,7 @@ pub(crate) static REGISTRY: &[VariantDef<MetalVariant>] = &[
         &["the parallel algorithm wins for the target vocabulary."],
         &["Uses bounded rejection followed by an exact fallback."]
     ),
-    variant!(
+    batch_invariant_variant!(
         "sample.parallel",
         Sample,
         SampleParallel,
@@ -910,6 +945,7 @@ pub(crate) const fn portable_name(operation: OperationKind) -> Option<&'static s
         OperationKind::QuantMatmul => Some("quant-matmul.portable"),
         OperationKind::GatherQuantMatmul => Some("gather-quant-matmul.portable"),
         OperationKind::Sdpa => Some("sdpa.portable"),
+        OperationKind::PagedSdpa => Some("paged-sdpa.vector"),
         OperationKind::TopK => Some("top-k.portable"),
         OperationKind::Sample => Some("sample.portable"),
         OperationKind::Other => None,
@@ -922,6 +958,7 @@ pub(crate) const fn portable_implementation(operation: OperationKind) -> Option<
         OperationKind::QuantMatmul => Some(MetalVariant::QuantMatmulPortable),
         OperationKind::GatherQuantMatmul => Some(MetalVariant::GatherQuantMatmulPortable),
         OperationKind::Sdpa => Some(MetalVariant::SdpaPortable),
+        OperationKind::PagedSdpa => Some(MetalVariant::PagedSdpaVector),
         OperationKind::TopK => Some(MetalVariant::TopKPortable),
         OperationKind::Sample => Some(MetalVariant::SamplePortable),
         OperationKind::Other => None,
@@ -1395,6 +1432,58 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn batch_invariant_variants_are_explicitly_audited() {
+        let audited = REGISTRY
+            .iter()
+            .filter(|variant| variant.batch_invariant)
+            .map(|variant| variant.name)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            audited,
+            [
+                "matmul.portable",
+                "matmul.gemv",
+                "matmul.gemv-transposed",
+                "matmul.steel-64x64x16-2x2",
+                "matmul.steel-64x64x16-1x2",
+                "matmul.steel-64x32x32-2x2",
+                "matmul.steel-32x64x16-1x2",
+                "quant-matmul.portable",
+                "quant-matmul.gemv",
+                "quant-matmul.q8-fast-gemv",
+                "quant-matmul.small-m",
+                "quant-matmul.tiled",
+                "gather-quant-matmul.portable",
+                "gather-quant-matmul.route-gemv",
+                "gather-quant-matmul.grouped-small-m",
+                "gather-quant-matmul.grouped-pair-small-m",
+                "gather-quant-matmul.grouped",
+                "gather-quant-matmul.weighted-broad",
+                "paged-sdpa.vector",
+                "sdpa.portable",
+                "sdpa.decomposed",
+                "sdpa.vector-single-pass",
+                "sdpa.vector-two-pass",
+                "sdpa.vector-two-pass-128",
+                "sdpa.vector-two-pass-256",
+                "sdpa.vector-two-pass-512",
+                "sdpa.vector-two-pass-1024",
+                "sdpa.vector-gqa-two-pass-32",
+                "sdpa.vector-gqa-two-pass",
+                "sdpa.vector-gqa-two-pass-128",
+                "sdpa.vector-gqa-two-pass-256",
+                "sdpa.steel",
+                "sdpa.steel-half",
+                "top-k.portable",
+                "top-k.single-k8",
+                "top-k.partials",
+                "sample.portable",
+                "sample.parallel",
+            ]
+        );
+    }
+
     fn matmul_dispatch(rows: u32) -> Dispatch {
         let backend = CpuBackend::new();
         let left = backend.alloc(DType::F32, &[rows, 7]).unwrap();
@@ -1651,6 +1740,32 @@ mod tests {
                     q_start: 0,
                 },
                 &[&query, &key, &value],
+                &output,
+            )
+            .unwrap();
+        commands.into_dispatches().remove(0)
+    }
+
+    fn paged_sdpa_dispatch(width: u32) -> Dispatch {
+        let backend = CpuBackend::new();
+        let query = backend.alloc(DType::F32, &[16, 1, width]).unwrap();
+        let key = backend.alloc(DType::F16, &[2, 4, 8, width]).unwrap();
+        let value = backend.alloc(DType::F16, &[2, 4, 8, width]).unwrap();
+        let table = backend.alloc(DType::U32, &[2, 2]).unwrap();
+        let generations = backend.alloc(DType::U32, &[2]).unwrap();
+        let output = backend.alloc(DType::F32, &[16, 1, width]).unwrap();
+        let mut commands = CommandList::new();
+        commands
+            .dispatch(
+                Op::PagedSdpa {
+                    scale: 1.0,
+                    causal: false,
+                    q_start: 0,
+                    key_length: 7,
+                    page_tokens: 4,
+                    contiguous_entries: false,
+                },
+                &[&query, &key, &value, &table, &generations],
                 &output,
             )
             .unwrap();
@@ -2052,6 +2167,11 @@ mod tests {
                 "sdpa.steel-half",
                 sdpa_dispatch_with_cache(DType::F32, DType::F16, 8, 64, 64, 128, 128),
                 "steel_attention_half_128_96x16",
+            ),
+            (
+                "paged-sdpa.vector",
+                paged_sdpa_dispatch(128),
+                "paged_sdpa_128",
             ),
             (
                 "top-k.portable",
