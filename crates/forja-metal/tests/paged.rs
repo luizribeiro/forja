@@ -4,8 +4,8 @@
 #![allow(clippy::cast_precision_loss)]
 
 use forja_core::{
-    Backend, BackendDispatchData, BackendError, CommandList, DType, Op, PagedCopyDirection,
-    Submission,
+    Backend, BackendDispatchData, BackendError, CommandList, DType, Op, PagePool,
+    PagedCopyDirection, PagedLayout, PagedPlane, Submission,
 };
 use half::{bf16, f16};
 
@@ -133,6 +133,67 @@ fn metal_paged_copy_reports_corrupt_entries_without_writing_pool() {
         }
     ));
     assert_eq!(backend.read(&pool).unwrap(), canary);
+}
+
+#[test]
+fn metal_in_flight_paged_read_defers_page_reuse() {
+    let backend = forja_metal::MetalBackend::new().unwrap();
+    let allocator = PagePool::new(
+        PagedLayout::new(
+            4,
+            vec![PagedPlane {
+                dtype: DType::F32,
+                elements_per_token: 2,
+                alignment: 4,
+                label: "cache".to_owned(),
+            }],
+        )
+        .unwrap(),
+        2,
+        1_024,
+    )
+    .unwrap();
+    let sequence = allocator.reserve(4).unwrap();
+    let snapshot = sequence.table().unwrap();
+    let old = snapshot.resolve(0).unwrap();
+    let generation = snapshot.entries()[0].generation();
+    let pages = backend.alloc(DType::F32, &[2, 4, 2]).unwrap();
+    let table = backend.alloc(DType::U32, &[1, 2]).unwrap();
+    let generations = backend.alloc(DType::U32, &[2]).unwrap();
+    let output = backend.alloc(DType::F32, &[4, 2]).unwrap();
+    let canary = encode(&[13.0; 16], DType::F32);
+    backend.write(&pages, &canary).unwrap();
+    backend
+        .write(&table, &table_bytes(&[(old, generation)]))
+        .unwrap();
+    backend
+        .write(&generations, &generation_bytes(snapshot.generations()))
+        .unwrap();
+    let mut commands = CommandList::new();
+    commands
+        .dispatch(
+            Op::PagedCopy {
+                direction: PagedCopyDirection::OutOfPages,
+                start: 0,
+                page_tokens: 4,
+            },
+            &[&pages, &table, &generations],
+            &output,
+        )
+        .unwrap();
+    let submission = backend.submit(commands).unwrap();
+    let serial = submission.completion_serial().unwrap();
+    sequence.mark_submitted(serial).unwrap();
+    drop(sequence);
+
+    let replacement = allocator.reserve(4).unwrap();
+    assert_ne!(replacement.table().unwrap().resolve(0).unwrap(), old);
+    submission.wait().unwrap();
+    assert_eq!(
+        backend.read(&output).unwrap(),
+        encode(&[13.0; 8], DType::F32)
+    );
+    allocator.observe_completion(serial).unwrap();
 }
 
 fn run_sdpa<B: Backend>(
