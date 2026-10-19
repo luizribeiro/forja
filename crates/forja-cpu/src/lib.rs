@@ -7,7 +7,8 @@ use std::{ops::Range, sync::Mutex, time::Duration};
 
 use forja_core::{
     AllocationRegistry, Backend, BackendError, BufferId, CommandList, DType, Layout, MappedRegion,
-    Op, ReadonlyImport, Submission, Tensor, ViewOp,
+    Op, PageTable, PageTableEntry, PagedCopyDirection, PagedLayout, PagedPlane, ReadonlyImport,
+    Submission, Tensor, ViewOp,
     program::{BoundProgram, KernelSignature, ValidatedProgram},
 };
 use half::{bf16, f16};
@@ -178,6 +179,130 @@ impl CpuBackend {
         }
         let values = decode(&self.read(&inputs[0])?, inputs[0].layout().dtype())
             .ok_or(BackendError::ExecutionFailed)?;
+        self.write_output(output, &values)
+    }
+
+    fn execute_paged_copy(
+        &self,
+        inputs: &[Tensor],
+        output: &Tensor,
+        direction: PagedCopyDirection,
+        start: u32,
+        page_tokens: u32,
+    ) -> Result<(), BackendError> {
+        let (ordinary, pool) = match direction {
+            PagedCopyDirection::IntoPages => (&inputs[0], output),
+            PagedCopyDirection::OutOfPages => (output, &inputs[0]),
+        };
+        let table = cpu_page_table(self, &inputs[1], &inputs[2])?;
+        let shape = pool.layout().shape();
+        let layout = PagedLayout::new(
+            page_tokens,
+            vec![PagedPlane {
+                dtype: pool.layout().dtype(),
+                elements_per_token: u64::from(shape[2]),
+                alignment: pool.layout().dtype().byte_size(),
+                label: "plane".to_owned(),
+            }],
+        )
+        .map_err(|_| BackendError::InvalidInput)?;
+        let physical_pages = shape[0];
+        let mut pages =
+            paged::CpuPagePool::from_plane_bytes(layout, physical_pages, vec![self.read(pool)?])?;
+        match direction {
+            PagedCopyDirection::IntoPages => {
+                pages.copy_in(
+                    0,
+                    &table,
+                    u64::from(start),
+                    u64::from(ordinary.layout().shape()[0]),
+                    &self.read(ordinary)?,
+                )?;
+                self.write(
+                    output,
+                    &pages.copy_out(
+                        0,
+                        &identity_table(physical_pages)?,
+                        0,
+                        u64::from(physical_pages)
+                            .checked_mul(u64::from(page_tokens))
+                            .ok_or(BackendError::InvalidInput)?,
+                    )?,
+                )
+            }
+            PagedCopyDirection::OutOfPages => self.write(
+                output,
+                &pages.copy_out(
+                    0,
+                    &table,
+                    u64::from(start),
+                    u64::from(ordinary.layout().shape()[0]),
+                )?,
+            ),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_paged_sdpa(
+        &self,
+        inputs: &[Tensor],
+        output: &Tensor,
+        scale: f32,
+        causal: bool,
+        q_start: u32,
+        key_length: u32,
+        page_tokens: u32,
+    ) -> Result<(), BackendError> {
+        let key_shape = inputs[1].layout().shape();
+        let value_shape = inputs[2].layout().shape();
+        let key_elements = u64::from(key_shape[2])
+            .checked_mul(u64::from(key_shape[3]))
+            .ok_or(BackendError::InvalidInput)?;
+        let value_elements = u64::from(value_shape[2])
+            .checked_mul(u64::from(value_shape[3]))
+            .ok_or(BackendError::InvalidInput)?;
+        let layout = PagedLayout::new(
+            page_tokens,
+            vec![
+                PagedPlane {
+                    dtype: inputs[1].layout().dtype(),
+                    elements_per_token: key_elements,
+                    alignment: inputs[1].layout().dtype().byte_size(),
+                    label: "key".to_owned(),
+                },
+                PagedPlane {
+                    dtype: inputs[2].layout().dtype(),
+                    elements_per_token: value_elements,
+                    alignment: inputs[2].layout().dtype().byte_size(),
+                    label: "value".to_owned(),
+                },
+            ],
+        )
+        .map_err(|_| BackendError::InvalidInput)?;
+        let pages = paged::CpuPagePool::from_plane_bytes(
+            layout,
+            key_shape[0],
+            vec![self.read(&inputs[1])?, self.read(&inputs[2])?],
+        )?;
+        let table = cpu_page_table(self, &inputs[3], &inputs[4])?;
+        let query = decode(&self.read(&inputs[0])?, inputs[0].layout().dtype())
+            .ok_or(BackendError::ExecutionFailed)?;
+        let q_shape = inputs[0].layout().shape();
+        let values = pages.sdpa(
+            &table,
+            0,
+            1,
+            &query,
+            q_shape[0],
+            q_shape[1],
+            key_shape[2],
+            key_shape[3],
+            value_shape[3],
+            key_length,
+            q_start,
+            scale,
+            causal,
+        )?;
         self.write_output(output, &values)
     }
 
@@ -1209,9 +1334,17 @@ impl Backend for CpuBackend {
                     .ok_or(BackendError::ExecutionFailed)
                     .and_then(|program| self.execute_program(program)),
                 Op::Copy => self.execute_copy(dispatch.inputs(), dispatch.output()),
-                Op::PagedCopy { .. } | Op::PagedSdpa { .. } => {
-                    Err(BackendError::UnsupportedOperation)
-                }
+                Op::PagedCopy {
+                    direction,
+                    start,
+                    page_tokens,
+                } => self.execute_paged_copy(
+                    dispatch.inputs(),
+                    dispatch.output(),
+                    direction,
+                    start,
+                    page_tokens,
+                ),
                 Op::RmsNorm { eps } => {
                     self.execute_rms_norm(dispatch.inputs(), dispatch.output(), eps)
                 }
@@ -1253,12 +1386,54 @@ impl Backend for CpuBackend {
                 } => {
                     self.execute_sdpa(dispatch.inputs(), dispatch.output(), scale, causal, q_start)
                 }
+                Op::PagedSdpa {
+                    scale,
+                    causal,
+                    q_start,
+                    key_length,
+                    page_tokens,
+                    ..
+                } => self.execute_paged_sdpa(
+                    dispatch.inputs(),
+                    dispatch.output(),
+                    scale,
+                    causal,
+                    q_start,
+                    key_length,
+                    page_tokens,
+                ),
             });
         Ok(CpuSubmission {
             result,
             wall_time: started.elapsed(),
         })
     }
+}
+
+fn cpu_page_table(
+    backend: &CpuBackend,
+    table: &Tensor,
+    generations: &Tensor,
+) -> Result<PageTable, BackendError> {
+    let words = decode_u32(&backend.read(table)?).ok_or(BackendError::InvalidInput)?;
+    let generations = decode_u32(&backend.read(generations)?).ok_or(BackendError::InvalidInput)?;
+    let (entry_words, remainder) = words.as_chunks::<2>();
+    if !remainder.is_empty() {
+        return Err(BackendError::InvalidInput);
+    }
+    let entries = entry_words
+        .iter()
+        .map(|entry| PageTableEntry::new(entry[0], entry[1]))
+        .collect::<Vec<_>>();
+    PageTable::new(entries, generations).map_err(|_| BackendError::ExecutionFailed)
+}
+
+fn identity_table(pages: u32) -> Result<PageTable, BackendError> {
+    let entries = (0..pages)
+        .map(|page| PageTableEntry::new(page, 1))
+        .collect();
+    PageTable::new(entries, vec![1; execution_usize(pages)?])
+        .map_err(|_| BackendError::ExecutionFailed)
 }
 
 #[derive(Clone, Copy)]

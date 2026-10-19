@@ -42,6 +42,33 @@ impl CpuPagePool {
         })
     }
 
+    /// Creates CPU backing from trusted, exactly sized plane bytes.
+    #[doc(hidden)]
+    pub fn from_plane_bytes(
+        layout: PagedLayout,
+        physical_pages: u32,
+        planes: Vec<Vec<u8>>,
+    ) -> Result<Self, BackendError> {
+        if physical_pages == 0 || planes.len() != layout.planes().len() {
+            return Err(BackendError::InvalidInput);
+        }
+        for (plane, bytes) in planes.iter().enumerate() {
+            let expected = layout
+                .plane_page_bytes(plane)
+                .and_then(|page| page.checked_mul(u64::from(physical_pages)))
+                .and_then(|bytes| usize::try_from(bytes).ok())
+                .ok_or(BackendError::InvalidInput)?;
+            if bytes.len() != expected {
+                return Err(BackendError::InvalidInput);
+            }
+        }
+        Ok(Self {
+            layout,
+            physical_pages,
+            planes,
+        })
+    }
+
     /// Copies contiguous token rows into a logical paged span.
     ///
     /// # Errors
