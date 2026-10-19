@@ -5997,8 +5997,11 @@ fn template_operation_kind(operation: TemplateOp) -> forja_core::OperationKind {
     match operation {
         TemplateOp::Static(operation) => forja_core::OperationKind::of(operation),
         TemplateOp::Sdpa { .. } => forja_core::OperationKind::Sdpa,
+        TemplateOp::PagedSdpa { .. } => forja_core::OperationKind::PagedSdpa,
         TemplateOp::Sample { .. } => forja_core::OperationKind::Sample,
-        TemplateOp::SampleMasked { .. } => forja_core::OperationKind::Other,
+        TemplateOp::PagedCopy { .. } | TemplateOp::SampleMasked { .. } => {
+            forja_core::OperationKind::Other
+        }
     }
 }
 

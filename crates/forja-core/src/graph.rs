@@ -357,6 +357,30 @@ pub enum TemplateOp {
         /// The absolute position of the first query.
         q_start: Affine,
     },
+    /// Paged row copy with a parameterized logical start.
+    PagedCopy {
+        /// Whether rows move into or out of paged storage.
+        direction: crate::PagedCopyDirection,
+        /// Logical position of the first row.
+        start: Affine,
+        /// Number of tokens in one page.
+        page_tokens: u32,
+    },
+    /// Paged attention with parameterized query and key extents.
+    PagedSdpa {
+        /// The score multiplier.
+        scale: f32,
+        /// Whether keys after each query position are masked.
+        causal: bool,
+        /// Absolute position of the first query.
+        q_start: Affine,
+        /// Logical key length.
+        key_length: Affine,
+        /// Number of tokens in one page.
+        page_tokens: u32,
+        /// Whether the page table entries are consecutive.
+        contiguous_entries: bool,
+    },
     /// Sampling with a parameterized absolute sequence position.
     Sample {
         /// Absolute sequence position mixed into the random counter.
@@ -393,6 +417,40 @@ impl TemplateOp {
             scale,
             causal,
             q_start,
+        }
+    }
+
+    /// Creates a paged copy configuration whose logical start may be parameterized.
+    #[must_use]
+    pub const fn paged_copy(
+        direction: crate::PagedCopyDirection,
+        start: Affine,
+        page_tokens: u32,
+    ) -> Self {
+        Self::PagedCopy {
+            direction,
+            start,
+            page_tokens,
+        }
+    }
+
+    /// Creates paged attention whose query and key positions may be parameterized.
+    #[must_use]
+    pub const fn paged_sdpa(
+        scale: f32,
+        causal: bool,
+        q_start: Affine,
+        key_length: Affine,
+        page_tokens: u32,
+        contiguous_entries: bool,
+    ) -> Self {
+        Self::PagedSdpa {
+            scale,
+            causal,
+            q_start,
+            key_length,
+            page_tokens,
+            contiguous_entries,
         }
     }
 
@@ -449,6 +507,30 @@ impl TemplateOp {
                 causal,
                 q_start: q_start.evaluate(values)?,
             }),
+            Self::PagedCopy {
+                direction,
+                start,
+                page_tokens,
+            } => Ok(Op::PagedCopy {
+                direction,
+                start: start.evaluate(values)?,
+                page_tokens,
+            }),
+            Self::PagedSdpa {
+                scale,
+                causal,
+                q_start,
+                key_length,
+                page_tokens,
+                contiguous_entries,
+            } => Ok(Op::PagedSdpa {
+                scale,
+                causal,
+                q_start: q_start.evaluate(values)?,
+                key_length: key_length.evaluate(values)?,
+                page_tokens,
+                contiguous_entries,
+            }),
             Self::Sample {
                 position,
                 chunk_width,
@@ -484,6 +566,12 @@ impl TemplateOp {
         match self {
             Self::Static(_) => false,
             Self::Sdpa { q_start, .. } => !q_start.is_constant(),
+            Self::PagedCopy { start, .. } => !start.is_constant(),
+            Self::PagedSdpa {
+                q_start,
+                key_length,
+                ..
+            } => !q_start.is_constant() || !key_length.is_constant(),
             Self::Sample { position, .. } | Self::SampleMasked { position, .. } => {
                 !position.is_constant()
             }
@@ -499,6 +587,26 @@ impl From<Op> for TemplateOp {
                 causal,
                 q_start,
             } => Self::sdpa(scale, causal, Affine::constant(q_start)),
+            Op::PagedCopy {
+                direction,
+                start,
+                page_tokens,
+            } => Self::paged_copy(direction, Affine::constant(start), page_tokens),
+            Op::PagedSdpa {
+                scale,
+                causal,
+                q_start,
+                key_length,
+                page_tokens,
+                contiguous_entries,
+            } => Self::paged_sdpa(
+                scale,
+                causal,
+                Affine::constant(q_start),
+                Affine::constant(key_length),
+                page_tokens,
+                contiguous_entries,
+            ),
             Op::Sample {
                 position,
                 chunk_width,
