@@ -3128,6 +3128,8 @@ impl MetalBackend {
         bindings: &mut ArgumentBindings,
         arguments: &mut ArgumentWriter,
     ) -> Result<(Vec<BufferBinding>, BufferBinding), BackendError> {
+        const GQA_BLOCKS: u32 = 64;
+
         let Op::PagedSdpa {
             scale,
             causal,
@@ -3175,7 +3177,7 @@ impl MetalBackend {
             .shape()
             .try_into()
             .map_err(|_| BackendError::InvalidInput)?;
-        let mut params = Vec::with_capacity(14 * size_of::<u32>());
+        let mut params = Vec::with_capacity(15 * size_of::<u32>());
         params.extend_from_slice(&scale.to_ne_bytes());
         for value in [
             q[0],
@@ -3191,6 +3193,7 @@ impl MetalBackend {
             t[0],
             k[0],
             u32::from(contiguous_entries),
+            GQA_BLOCKS,
         ] {
             params.extend_from_slice(&value.to_ne_bytes());
         }
@@ -3207,6 +3210,83 @@ impl MetalBackend {
             (2, dtype_code(output.layout.dtype())),
             (3, dtype_code(value.layout.dtype())),
         ];
+        if q[0] / k[2] == 8 && q[1] == 1 && q[2] == 128 && v[3] == 128 && key_length >= GQA_BLOCKS {
+            let partials = self.scratch_tensor(query.layout.dtype(), &[q[0], GQA_BLOCKS, v[3]])?;
+            let sums = self.scratch_tensor(DType::F32, &[q[0], GQA_BLOCKS])?;
+            let maxs = self.scratch_tensor(DType::F32, &[q[0], GQA_BLOCKS])?;
+            let first = self
+                .pipelines
+                .lock()
+                .map_err(|_| BackendError::ExecutionFailed)?
+                .get("paged_sdpa_2pass_1_gqa_128", &constants)?;
+            set_pipeline(encoder, &first);
+            for (index, tensor) in [
+                &query,
+                &key,
+                &value,
+                &page_table,
+                &generations,
+                &partials,
+                &sums,
+                &maxs,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                bindings.bind(table, index, &tensor.buffer);
+            }
+            bindings.bind(table, 8, &params);
+            bindings.bind(table, 9, &error_flag);
+            set_argument_table(encoder, table);
+            dispatch_threadgroups(
+                encoder,
+                MTLSize {
+                    width: usize::try_from(k[2]).map_err(|_| BackendError::InvalidInput)?,
+                    height: 1,
+                    depth: usize::try_from(GQA_BLOCKS).map_err(|_| BackendError::InvalidInput)?,
+                },
+                MTLSize {
+                    width: 256,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            encode_dispatch_barrier(encoder);
+            let second = self
+                .pipelines
+                .lock()
+                .map_err(|_| BackendError::ExecutionFailed)?
+                .get("paged_sdpa_2pass_2_128", &constants)?;
+            set_pipeline(encoder, &second);
+            for (index, tensor) in [&partials, &sums, &maxs, &output].into_iter().enumerate() {
+                bindings.bind(table, index, &tensor.buffer);
+            }
+            bindings.bind(table, 4, &params);
+            set_argument_table(encoder, table);
+            dispatch_threadgroups(
+                encoder,
+                MTLSize {
+                    width: usize::try_from(q[0]).map_err(|_| BackendError::InvalidInput)?,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: second.maxTotalThreadsPerThreadgroup(),
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            return Ok((
+                vec![
+                    params,
+                    error_flag.clone(),
+                    partials.buffer,
+                    sums.buffer,
+                    maxs.buffer,
+                ],
+                error_flag,
+            ));
+        }
         let pipeline = self
             .pipelines
             .lock()

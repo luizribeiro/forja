@@ -96,10 +96,10 @@ fn run_sdpa<B: Backend>(
     dtype: DType,
     key_length: u32,
     contiguous: bool,
+    query_heads: u32,
+    kv_heads: u32,
 ) -> Result<Vec<f32>, BackendError> {
     const PAGE_TOKENS: u32 = 64;
-    const QUERY_HEADS: u32 = 16;
-    const KV_HEADS: u32 = 8;
     const WIDTH: u32 = 128;
 
     let logical_pages = key_length.div_ceil(PAGE_TOKENS);
@@ -117,7 +117,7 @@ fn run_sdpa<B: Backend>(
     let generations = (0..physical_pages)
         .map(|page| 11 + page)
         .collect::<Vec<_>>();
-    let plane_elements = usize::try_from(KV_HEADS * WIDTH).unwrap();
+    let plane_elements = usize::try_from(kv_heads * WIDTH).unwrap();
     let pool_tokens = usize::try_from(physical_pages * PAGE_TOKENS).unwrap();
     let mut keys = vec![0.0_f32; pool_tokens * plane_elements];
     let mut values = vec![0.0_f32; pool_tokens * plane_elements];
@@ -134,15 +134,15 @@ fn run_sdpa<B: Backend>(
                 ((token.wrapping_mul(5) + seed.wrapping_mul(11)) % 97) as f32 / 96.0 - 0.5;
         }
     }
-    let query_values = (0..QUERY_HEADS * WIDTH)
+    let query_values = (0..query_heads * WIDTH)
         .map(|index| ((index * 17) % 89) as f32 / 88.0 - 0.5)
         .collect::<Vec<_>>();
-    let query = backend.alloc(DType::F32, &[QUERY_HEADS, 1, WIDTH])?;
-    let key = backend.alloc(dtype, &[physical_pages, PAGE_TOKENS, KV_HEADS, WIDTH])?;
-    let value = backend.alloc(dtype, &[physical_pages, PAGE_TOKENS, KV_HEADS, WIDTH])?;
+    let query = backend.alloc(DType::F32, &[query_heads, 1, WIDTH])?;
+    let key = backend.alloc(dtype, &[physical_pages, PAGE_TOKENS, kv_heads, WIDTH])?;
+    let value = backend.alloc(dtype, &[physical_pages, PAGE_TOKENS, kv_heads, WIDTH])?;
     let table = backend.alloc(DType::U32, &[logical_pages, 2])?;
     let generation_tensor = backend.alloc(DType::U32, &[physical_pages])?;
-    let output = backend.alloc(DType::F32, &[QUERY_HEADS, 1, WIDTH])?;
+    let output = backend.alloc(DType::F32, &[query_heads, 1, WIDTH])?;
     backend.write(&query, &encode(&query_values, DType::F32))?;
     backend.write(&key, &encode(&keys, dtype))?;
     backend.write(&value, &encode(&values, dtype))?;
@@ -173,8 +173,8 @@ fn metal_paged_sdpa_matches_cpu_at_real_shapes() {
     let metal = forja_metal::MetalBackend::new().unwrap();
     for dtype in [DType::F32, DType::F16, DType::BF16] {
         for length in [1, 7, 33, 4_097] {
-            let reference = run_sdpa(&cpu, dtype, length, false).unwrap();
-            let candidate = run_sdpa(&metal, dtype, length, false).unwrap();
+            let reference = run_sdpa(&cpu, dtype, length, false, 16, 8).unwrap();
+            let candidate = run_sdpa(&metal, dtype, length, false, 16, 8).unwrap();
             let error = forja_testing::normwise_relative_error(&reference, &candidate);
             assert!(
                 error <= forja_testing::dtype_tolerance(dtype).unwrap(),
@@ -185,11 +185,28 @@ fn metal_paged_sdpa_matches_cpu_at_real_shapes() {
 }
 
 #[test]
+fn metal_paged_gqa_two_pass_matches_cpu() {
+    let cpu = forja_cpu::CpuBackend::new();
+    let metal = forja_metal::MetalBackend::new().unwrap();
+    for length in [512, 4_000] {
+        for contiguous in [false, true] {
+            let reference = run_sdpa(&cpu, DType::F16, length, contiguous, 32, 4).unwrap();
+            let candidate = run_sdpa(&metal, DType::F16, length, contiguous, 32, 4).unwrap();
+            let error = forja_testing::normwise_relative_error(&reference, &candidate);
+            assert!(
+                error <= forja_testing::F16_TOLERANCE,
+                "length={length} contiguous={contiguous} error={error}"
+            );
+        }
+    }
+}
+
+#[test]
 fn metal_paged_sdpa_uses_contiguous_entry_path() {
     let cpu = forja_cpu::CpuBackend::new();
     let metal = forja_metal::MetalBackend::new().unwrap();
-    let reference = run_sdpa(&cpu, DType::F16, 129, true).unwrap();
-    let candidate = run_sdpa(&metal, DType::F16, 129, true).unwrap();
+    let reference = run_sdpa(&cpu, DType::F16, 129, true, 16, 8).unwrap();
+    let candidate = run_sdpa(&metal, DType::F16, 129, true, 16, 8).unwrap();
     assert!(
         forja_testing::normwise_relative_error(&reference, &candidate)
             <= forja_testing::F16_TOLERANCE
