@@ -98,6 +98,24 @@ impl PageTable {
         }
     }
 
+    /// Pads a valid table with entries carrying the impossible generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PageTableError::LogicalPageOutOfBounds`] when `logical_pages` is too small.
+    pub fn pad_with_poison(&self, logical_pages: usize) -> Result<Self, PageTableError> {
+        if logical_pages < self.entries.len() {
+            return Err(PageTableError::LogicalPageOutOfBounds);
+        }
+        let mut entries = self.entries.clone();
+        entries.resize(logical_pages, PageTableEntry::new(0, POISON_GENERATION));
+        Ok(Self {
+            entries,
+            generations: self.generations.clone(),
+            contiguous: self.contiguous,
+        })
+    }
+
     /// Resolves one logical page after rechecking its generation.
     ///
     /// # Errors
