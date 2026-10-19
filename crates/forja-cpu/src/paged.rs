@@ -1,6 +1,7 @@
 //! Reference execution for host-owned paged storage.
 
 use forja_core::{BackendError, DType, PageTable, PagedLayout};
+use half::{bf16, f16};
 
 /// CPU backing storage for a validated paged layout.
 #[derive(Debug)]
@@ -121,6 +122,115 @@ impl CpuPagePool {
         Ok(output)
     }
 
+    /// Computes grouped-query SDPA directly over logical K/V page spans.
+    ///
+    /// Query storage is f32 in `[head, query, width]` order. The output uses the same order with
+    /// `value_width` as its innermost extent.
+    ///
+    /// # Errors
+    ///
+    /// Returns invalid input for inconsistent dimensions, ranges, or page entries.
+    #[allow(clippy::too_many_arguments)]
+    pub fn sdpa(
+        &self,
+        table: &PageTable,
+        key_plane: usize,
+        value_plane: usize,
+        query: &[f32],
+        query_heads: u32,
+        query_length: u32,
+        kv_heads: u32,
+        width: u32,
+        value_width: u32,
+        key_length: u32,
+        query_start: u32,
+        scale: f32,
+        causal: bool,
+    ) -> Result<Vec<f32>, BackendError> {
+        let expected_query = checked_product(&[query_heads, query_length, width])?;
+        let key_elements = u64::from(kv_heads)
+            .checked_mul(u64::from(width))
+            .ok_or(BackendError::InvalidInput)?;
+        let value_elements = u64::from(kv_heads)
+            .checked_mul(u64::from(value_width))
+            .ok_or(BackendError::InvalidInput)?;
+        if query.len() != expected_query
+            || query_heads == 0
+            || kv_heads == 0
+            || !query_heads.is_multiple_of(kv_heads)
+            || self.plane_elements(key_plane)? != key_elements
+            || self.plane_elements(value_plane)? != value_elements
+            || !scale.is_finite()
+        {
+            return Err(BackendError::InvalidInput);
+        }
+        let output_len = checked_product(&[query_heads, query_length, value_width])?;
+        let mut output = Vec::new();
+        output
+            .try_reserve_exact(output_len)
+            .map_err(|_| BackendError::AllocationFailed)?;
+        let heads_per_group = query_heads / kv_heads;
+        for head in 0..query_heads {
+            let kv_head = head / heads_per_group;
+            for query_row in 0..query_length {
+                let query_offset = usize::try_from(head)
+                    .ok()
+                    .and_then(|head| {
+                        head.checked_mul(checked_product(&[query_length, width]).ok()?)
+                    })
+                    .and_then(|offset| {
+                        offset.checked_add(checked_product(&[query_row, width]).ok()?)
+                    })
+                    .ok_or(BackendError::InvalidInput)?;
+                let query_end = query_offset
+                    .checked_add(usize::try_from(width).map_err(|_| BackendError::InvalidInput)?)
+                    .ok_or(BackendError::InvalidInput)?;
+                let query_row_values = query
+                    .get(query_offset..query_end)
+                    .ok_or(BackendError::InvalidInput)?;
+                let attended = if causal {
+                    key_length.min(
+                        query_start
+                            .checked_add(query_row)
+                            .and_then(|position| position.checked_add(1))
+                            .ok_or(BackendError::InvalidInput)?,
+                    )
+                } else {
+                    key_length
+                };
+                let mut scores = Vec::with_capacity(
+                    usize::try_from(attended).map_err(|_| BackendError::InvalidInput)?,
+                );
+                for key_row in 0..attended {
+                    let mut score = 0.0_f32;
+                    for column in 0..width {
+                        let element = row_element(kv_head, width, column)?;
+                        score += query_row_values
+                            [usize::try_from(column).map_err(|_| BackendError::InvalidInput)?]
+                            * self.load(key_plane, table, key_row, element)?;
+                    }
+                    scores.push(score * scale);
+                }
+                softmax(&mut scores);
+                for column in 0..value_width {
+                    let mut sum = 0.0_f32;
+                    for (key_row, weight) in scores.iter().enumerate() {
+                        let element = row_element(kv_head, value_width, column)?;
+                        sum += weight
+                            * self.load(
+                                value_plane,
+                                table,
+                                u32::try_from(key_row).map_err(|_| BackendError::InvalidInput)?,
+                                element,
+                            )?;
+                    }
+                    output.push(sum);
+                }
+            }
+        }
+        Ok(output)
+    }
+
     fn row_bytes(&self, plane: usize) -> Result<u64, BackendError> {
         self.plane_elements(plane)?
             .checked_mul(self.plane_dtype(plane)?.byte_size())
@@ -176,6 +286,78 @@ impl CpuPagePool {
                 ..usize::try_from(end).map_err(|_| BackendError::InvalidInput)?,
         )
     }
+
+    fn load(
+        &self,
+        plane: usize,
+        table: &PageTable,
+        token: u32,
+        element: u64,
+    ) -> Result<f32, BackendError> {
+        if element >= self.plane_elements(plane)? {
+            return Err(BackendError::InvalidInput);
+        }
+        let token_range = self.token_range(plane, table, u64::from(token))?;
+        let dtype = self.plane_dtype(plane)?;
+        let offset = token_range
+            .start
+            .checked_add(
+                usize::try_from(
+                    element
+                        .checked_mul(dtype.byte_size())
+                        .ok_or(BackendError::InvalidInput)?,
+                )
+                .map_err(|_| BackendError::InvalidInput)?,
+            )
+            .ok_or(BackendError::InvalidInput)?;
+        let bytes = self.planes.get(plane).ok_or(BackendError::InvalidInput)?;
+        match dtype {
+            DType::F32 => read_array::<4>(bytes, offset).map(f32::from_le_bytes),
+            DType::F16 => read_array::<2>(bytes, offset)
+                .map(u16::from_le_bytes)
+                .map(f16::from_bits)
+                .map(f32::from),
+            DType::BF16 => read_array::<2>(bytes, offset)
+                .map(u16::from_le_bytes)
+                .map(bf16::from_bits)
+                .map(f32::from),
+            DType::I32 | DType::U32 => Err(BackendError::InvalidInput),
+        }
+    }
+}
+
+fn row_element(head: u32, width: u32, column: u32) -> Result<u64, BackendError> {
+    u64::from(head)
+        .checked_mul(u64::from(width))
+        .and_then(|offset| offset.checked_add(u64::from(column)))
+        .ok_or(BackendError::InvalidInput)
+}
+
+fn checked_product(extents: &[u32]) -> Result<usize, BackendError> {
+    extents.iter().try_fold(1_usize, |product, &extent| {
+        product
+            .checked_mul(usize::try_from(extent).map_err(|_| BackendError::InvalidInput)?)
+            .ok_or(BackendError::InvalidInput)
+    })
+}
+
+fn read_array<const N: usize>(bytes: &[u8], offset: usize) -> Result<[u8; N], BackendError> {
+    bytes
+        .get(offset..offset.checked_add(N).ok_or(BackendError::InvalidInput)?)
+        .and_then(|value| value.try_into().ok())
+        .ok_or(BackendError::InvalidInput)
+}
+
+fn softmax(values: &mut [f32]) {
+    let maximum = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let mut sum = 0.0_f32;
+    for value in values.iter_mut() {
+        *value = (*value - maximum).exp();
+        sum += *value;
+    }
+    for value in values {
+        *value /= sum;
+    }
 }
 
 #[cfg(test)]
@@ -207,5 +389,26 @@ mod tests {
         let values = (0_u32..12).flat_map(u32::to_le_bytes).collect::<Vec<_>>();
         pool.copy_in(0, &table, 2, 6, &values).unwrap();
         assert_eq!(pool.copy_out(0, &table, 2, 6).unwrap(), values);
+    }
+
+    #[test]
+    fn paged_attention_matches_a_hand_checked_case() {
+        let mut pool = CpuPagePool::new(layout(), 2).unwrap();
+        let table = PageTable::new(
+            vec![PageTableEntry::new(1, 4), PageTableEntry::new(0, 3)],
+            vec![3, 4],
+        )
+        .unwrap();
+        let values = [1.0_f32, 0.0, 0.0, 1.0]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>();
+        pool.copy_in(0, &table, 0, 2, &values).unwrap();
+        let output = pool
+            .sdpa(&table, 0, 0, &[1.0, 0.0], 1, 1, 1, 2, 2, 2, 0, 1.0, false)
+            .unwrap();
+        let expected = std::f32::consts::E / (std::f32::consts::E + 1.0);
+        assert!((output[0] - expected).abs() < 1.0e-6);
+        assert!((output[1] - (1.0 - expected)).abs() < 1.0e-6);
     }
 }
