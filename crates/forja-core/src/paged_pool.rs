@@ -78,6 +78,7 @@ struct PoolInner {
 struct PoolState {
     pages: Vec<PageState>,
     free: Vec<u32>,
+    completed_serial: u64,
     memory: PagedMemoryUsage,
 }
 
@@ -85,6 +86,7 @@ struct PoolState {
 struct PageState {
     generation: u32,
     references: u32,
+    last_use: u64,
     lifecycle: PageLifecycle,
 }
 
@@ -92,6 +94,7 @@ struct PageState {
 enum PageLifecycle {
     Free,
     Allocated,
+    Retiring,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -121,6 +124,7 @@ impl PagePool {
         let mut state = PoolState {
             pages: Vec::new(),
             free: Vec::new(),
+            completed_serial: 0,
             memory: PagedMemoryUsage {
                 slab_bytes,
                 ..PagedMemoryUsage::default()
@@ -135,6 +139,28 @@ impl PagePool {
                 state: Mutex::new(state),
             }),
         })
+    }
+
+    /// Makes pages retired by completed submissions available for reuse.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if pool state is poisoned or inconsistent.
+    pub fn observe_completion(&self, serial: u64) -> Result<(), PagePoolError> {
+        let mut state = self.lock()?;
+        state.completed_serial = state.completed_serial.max(serial);
+        let completed = state.completed_serial;
+        let mut reclaimed = Vec::new();
+        for (index, page) in state.pages.iter_mut().enumerate() {
+            if page.lifecycle == PageLifecycle::Retiring && page.last_use <= completed {
+                page.lifecycle = PageLifecycle::Free;
+                reclaimed
+                    .push(u32::try_from(index).map_err(|_| PagePoolError::ArithmeticOverflow)?);
+            }
+        }
+        reclaimed.sort_unstable_by(|left, right| right.cmp(left));
+        state.free.extend(reclaimed);
+        Ok(())
     }
 
     /// Returns the pool's validated plane geometry.
@@ -196,14 +222,19 @@ impl PagePool {
     fn release(&self, pages: &[PageLease]) -> Result<(), PagePoolError> {
         let mut state = self.lock()?;
         for lease in pages {
+            let completed = state.completed_serial;
             let page = live_page_mut(&mut state, *lease)?;
             page.references = page
                 .references
                 .checked_sub(1)
                 .ok_or(PagePoolError::CorruptState)?;
             if page.references == 0 {
-                page.lifecycle = PageLifecycle::Free;
-                state.free.push(lease.index);
+                if page.last_use <= completed {
+                    page.lifecycle = PageLifecycle::Free;
+                    state.free.push(lease.index);
+                } else {
+                    page.lifecycle = PageLifecycle::Retiring;
+                }
             }
         }
         Ok(())
@@ -285,6 +316,20 @@ impl PagedSequence {
         Ok(())
     }
 
+    /// Marks every table page as read by a submitted command serial.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for stale internal allocator state.
+    pub fn mark_submitted(&self, serial: u64) -> Result<(), PagePoolError> {
+        let mut state = self.pool.lock()?;
+        for lease in &self.pages {
+            let page = live_page_mut(&mut state, *lease)?;
+            page.last_use = page.last_use.max(serial);
+        }
+        Ok(())
+    }
+
     /// Builds an authenticated table snapshot for trusted backend upload.
     ///
     /// # Errors
@@ -338,6 +383,7 @@ fn add_slab(state: &mut PoolState, pages_per_slab: u32) -> Result<(), PagePoolEr
     state.pages.extend((start..end).map(|_| PageState {
         generation: 0,
         references: 0,
+        last_use: 0,
         lifecycle: PageLifecycle::Free,
     }));
     state.free.extend((start..end).rev());
@@ -461,5 +507,20 @@ mod tests {
         let replacement = pool.reserve(4).unwrap();
 
         assert_eq!(replacement.table().unwrap().resolve(0).unwrap(), old);
+    }
+
+    #[test]
+    fn in_flight_pages_are_not_reused() {
+        let pool = pool(1_024);
+        let sequence = pool.reserve(4).unwrap();
+        let old = sequence.table().unwrap().resolve(0).unwrap();
+        sequence.mark_submitted(7).unwrap();
+        drop(sequence);
+        let replacement = pool.reserve(4).unwrap();
+        assert_ne!(replacement.table().unwrap().resolve(0).unwrap(), old);
+        drop(replacement);
+        pool.observe_completion(7).unwrap();
+        let reused = pool.reserve(4).unwrap();
+        assert_eq!(reused.table().unwrap().resolve(0).unwrap(), old);
     }
 }
