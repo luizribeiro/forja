@@ -953,6 +953,67 @@ thread_local! {
     static IN_METAL_CALLBACK: Cell<bool> = const { Cell::new(false) };
     static TEMPORARY_PROFILE: Cell<Option<ProfileCount>> = const { Cell::new(None) };
     static PLAN_RECORDER: RefCell<Option<PlanRecording>> = const { RefCell::new(None) };
+    static SUBMISSION_SCRATCH: RefCell<Option<Arc<Mutex<ReusableScratch>>>> = const { RefCell::new(None) };
+}
+
+/// The primary submission slot keeps its high-water scratch set to avoid allocation and residency
+/// churn, while overlap slots retain only decode-sized buffers so quadratic prefill temporaries do
+/// not multiply across every in-flight slot.
+#[derive(Default)]
+struct ReusableScratch {
+    buffers: Vec<InFlightBuffer>,
+    next: usize,
+}
+
+impl ReusableScratch {
+    fn acquire(
+        &mut self,
+        backend: &MetalBackend,
+        len: usize,
+    ) -> Result<MetalBufferRef, BackendError> {
+        let index = self.next;
+        self.next = self
+            .next
+            .checked_add(1)
+            .ok_or(BackendError::AllocationFailed)?;
+        if index == self.buffers.len() {
+            self.buffers.push(InFlightBuffer {
+                raw: backend.new_buffer(len)?,
+                pool_resident: false,
+            });
+        } else if self.buffers[index].raw.length() < len {
+            self.buffers[index].raw = backend.new_buffer(len)?;
+        }
+        Ok(self.buffers[index].raw.clone())
+    }
+
+    fn trim_above(&mut self, limit: usize) -> bool {
+        let old_len = self.buffers.len();
+        self.buffers.retain(|buffer| buffer.raw.length() <= limit);
+        self.next = 0;
+        self.buffers.len() != old_len
+    }
+}
+
+struct ScratchScope(Option<Arc<Mutex<ReusableScratch>>>);
+
+impl ScratchScope {
+    fn enter(scratch: Arc<Mutex<ReusableScratch>>) -> Result<Self, BackendError> {
+        scratch
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?
+            .next = 0;
+        let previous = SUBMISSION_SCRATCH.with(|current| current.replace(Some(scratch)));
+        Ok(Self(previous))
+    }
+}
+
+impl Drop for ScratchScope {
+    fn drop(&mut self) {
+        SUBMISSION_SCRATCH.with(|current| {
+            current.replace(self.0.take());
+        });
+    }
 }
 
 struct TemporaryProfileScope {
@@ -1095,6 +1156,9 @@ struct ReusableSubmissionObjects {
     argument_table: Retained<ProtocolObject<dyn MTL4ArgumentTable>>,
     argument_buffer: ArgumentBuffer,
     residency: Retained<ProtocolObject<dyn MTLResidencySet>>,
+    resident_buffers: Vec<MetalBufferRef>,
+    scratch: Arc<Mutex<ReusableScratch>>,
+    retain_oversized_scratch: bool,
     timestamps: GpuTimestamps,
 }
 
@@ -1130,10 +1194,44 @@ impl SubmissionObjects {
             .ok_or(BackendError::ExecutionFailed)
     }
 
-    fn residency(&self) -> Result<Retained<ProtocolObject<dyn MTLResidencySet>>, BackendError> {
+    fn make_resident(
+        &mut self,
+        command_buffer: &ProtocolObject<dyn MTL4CommandBuffer>,
+        resources: &CommandResources,
+    ) -> Result<Retained<ProtocolObject<dyn MTLResidencySet>>, BackendError> {
+        let objects = self
+            .reusable
+            .as_mut()
+            .ok_or(BackendError::ExecutionFailed)?;
+        let current = resources
+            .buffers
+            .iter()
+            .filter(|buffer| !buffer.pool_resident)
+            .map(|buffer| buffer.raw.clone())
+            .collect::<Vec<_>>();
+        let unchanged = current.len() == objects.resident_buffers.len()
+            && current
+                .iter()
+                .zip(objects.resident_buffers.iter())
+                .all(|(next, old)| std::ptr::eq(&raw const **next, &raw const **old));
+        if !unchanged {
+            objects.residency.removeAllAllocations();
+            for buffer in &current {
+                let buffer: &ProtocolObject<dyn MTLBuffer> = buffer;
+                let allocation: &ProtocolObject<dyn MTLAllocation> = buffer.as_ref();
+                objects.residency.addAllocation(allocation);
+            }
+            objects.residency.commit();
+            objects.resident_buffers = current;
+        }
+        command_buffer.useResidencySet(&objects.residency);
+        Ok(objects.residency.clone())
+    }
+
+    fn scratch(&self) -> Result<Arc<Mutex<ReusableScratch>>, BackendError> {
         self.reusable
             .as_ref()
-            .map(|objects| objects.residency.clone())
+            .map(|objects| Arc::clone(&objects.scratch))
             .ok_or(BackendError::ExecutionFailed)
     }
 
@@ -1701,6 +1799,27 @@ pub(super) struct InFlightTracker {
 // The host permits two overlapping replays per graph; two extra slots keep unrelated work moving.
 /// Caps retained command resources while permitting CPU/GPU overlap.
 const MAX_IN_FLIGHT_SUBMISSIONS: usize = 4;
+const MAX_RETAINED_SCRATCH_BUFFER_BYTES: usize = 8 * 1024 * 1024;
+
+impl ReusableSubmissionObjects {
+    fn trim_scratch(&mut self) {
+        let limit = if self.retain_oversized_scratch {
+            usize::MAX
+        } else {
+            MAX_RETAINED_SCRATCH_BUFFER_BYTES
+        };
+        let trimmed = self
+            .scratch
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .trim_above(limit);
+        if trimmed {
+            self.residency.removeAllAllocations();
+            self.residency.commit();
+            self.resident_buffers.clear();
+        }
+    }
+}
 
 impl InFlightTracker {
     pub(super) const fn new() -> Self {
@@ -1732,14 +1851,13 @@ impl InFlightTracker {
             {
                 break objects;
             }
-            if self
-                .slots
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |slots| {
-                    (slots < MAX_IN_FLIGHT_SUBMISSIONS).then_some(slots + 1)
-                })
-                .is_ok()
+            if let Ok(slot) =
+                self.slots
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |slots| {
+                        (slots < MAX_IN_FLIGHT_SUBMISSIONS).then_some(slots + 1)
+                    })
             {
-                match Self::new_slot(backend, argument_capacity) {
+                match Self::new_slot(backend, argument_capacity, slot == 0) {
                     Ok(objects) => break objects,
                     Err(error) => {
                         self.slots.fetch_sub(1, Ordering::AcqRel);
@@ -1810,6 +1928,7 @@ impl InFlightTracker {
     fn new_slot(
         backend: &MetalBackend,
         argument_capacity: usize,
+        retain_oversized_scratch: bool,
     ) -> Result<ReusableSubmissionObjects, BackendError> {
         use objc2_metal::MTL4ArgumentTableDescriptor;
 
@@ -1843,6 +1962,9 @@ impl InFlightTracker {
                 capacity: argument_capacity,
             },
             residency,
+            resident_buffers: Vec::new(),
+            scratch: Arc::new(Mutex::new(ReusableScratch::default())),
+            retain_oversized_scratch,
             timestamps,
         })
     }
@@ -1925,14 +2047,16 @@ impl InFlightTracker {
             .pool
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        for completed in done {
+        for mut completed in done {
+            completed.objects.trim_scratch();
             pool.push(completed.objects);
         }
         drop(pool);
         self.notify_progress();
     }
 
-    fn return_dirty(&self, objects: ReusableSubmissionObjects) {
+    fn return_dirty(&self, mut objects: ReusableSubmissionObjects) {
+        objects.trim_scratch();
         self.pool
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -2243,6 +2367,7 @@ impl MetalBackend {
             .collect::<Vec<_>>();
         let capacity = self.argument_capacity(&dispatches)?;
         let objects = self.in_flight.checkout(self, capacity)?;
+        let _scratch = ScratchScope::enter(objects.scratch()?)?;
         let command_buffer = self.begin_command_buffer(objects.allocator()?)?;
         let mut arguments = ArgumentWriter::new(objects.argument_buffer()?);
         let graph_arena_base = graph
@@ -2441,6 +2566,7 @@ impl MetalBackend {
             graph.and_then(|prepared| prepared.encoding.as_ref()),
         )?;
         let mut objects = self.in_flight.checkout(self, argument_capacity)?;
+        let _scratch = ScratchScope::enter(objects.scratch()?)?;
         let command_buffer = self.begin_command_buffer(objects.allocator()?)?;
         let timestamps = if PROFILE {
             let count = dispatches
@@ -2510,8 +2636,7 @@ impl MetalBackend {
             self.command_resources(&tensors, encoded, graph.map(|prepared| &prepared.buffers))?;
         objects.programs = prepared_programs;
         let residency_started = PROFILE.then(Instant::now);
-        let residency = objects.residency()?;
-        Self::make_resident(&command_buffer, &residency, &resources);
+        let residency = objects.make_resident(&command_buffer, &resources)?;
         if let Some(graph) = graph {
             command_buffer.useResidencySet(&graph.residency);
         }
@@ -4899,7 +5024,18 @@ impl MetalBackend {
             .and_then(|count| count.checked_mul(dtype.byte_size()))
             .ok_or(BackendError::AllocationFailed)?;
         let len = usize::try_from(byte_len).map_err(|_| BackendError::AllocationFailed)?;
-        let buffer = self.new_buffer(len)?;
+        let buffer = SUBMISSION_SCRATCH.with(|current| {
+            let scratch = current.borrow().clone();
+            scratch.map_or_else(
+                || self.new_buffer(len),
+                |scratch| {
+                    scratch
+                        .lock()
+                        .map_err(|_| BackendError::ExecutionFailed)?
+                        .acquire(self, len)
+                },
+            )
+        })?;
         let layout = Layout::contiguous(dtype, 0, shape.to_vec(), byte_len)
             .map_err(|_| BackendError::InvalidInput)?;
         Ok(EncoderTensor {
@@ -6488,24 +6624,6 @@ impl MetalBackend {
             buffers: owned,
             error_flags,
         })
-    }
-
-    fn make_resident(
-        command_buffer: &ProtocolObject<dyn MTL4CommandBuffer>,
-        residency: &ProtocolObject<dyn MTLResidencySet>,
-        resources: &CommandResources,
-    ) {
-        residency.removeAllAllocations();
-        for buffer in &resources.buffers {
-            if buffer.pool_resident {
-                continue;
-            }
-            let buffer: &ProtocolObject<dyn MTLBuffer> = &buffer.raw;
-            let allocation: &ProtocolObject<dyn MTLAllocation> = buffer.as_ref();
-            residency.addAllocation(allocation);
-        }
-        residency.commit();
-        command_buffer.useResidencySet(residency);
     }
 
     fn retain_tensors(
@@ -9692,6 +9810,9 @@ mod tests {
         let second = backend.replay(&graph, Vec::new()).unwrap();
         second.wait().unwrap();
         first.wait().unwrap();
+        let allocations = backend.debug_state().allocation_requests;
+        backend.replay(&graph, Vec::new()).unwrap().wait().unwrap();
+        assert_eq!(backend.debug_state().allocation_requests, allocations);
         assert_eq!(backend.read(&output).unwrap(), 4096_u32.to_le_bytes());
     }
 
@@ -10130,8 +10251,7 @@ mod tests {
                 None,
             )
             .unwrap();
-        let residency = objects.residency().unwrap();
-        MetalBackend::make_resident(&command_buffer, &residency, &resources);
+        let residency = objects.make_resident(&command_buffer, &resources).unwrap();
         let timestamps = backend.make_timestamps(2).unwrap();
         // SAFETY: The heap has two entries and remains live through completion.
         unsafe {
@@ -10155,6 +10275,34 @@ mod tests {
             .wait()
             .unwrap();
         assert_eq!(backend.read(&output).unwrap(), bytes);
+    }
+
+    #[test]
+    fn reusable_scratch_grows_after_release() {
+        let backend = MetalBackend::new().unwrap();
+        let mut scratch = ReusableScratch::default();
+        let small = scratch.acquire(&backend, 33).unwrap();
+        let small_len = small.length();
+        drop(small);
+        scratch.next = 0;
+        let large = scratch.acquire(&backend, 4097).unwrap();
+        assert!(small_len >= 33);
+        assert!(large.length() >= 4097);
+        assert_eq!(scratch.buffers.len(), 1);
+    }
+
+    #[test]
+    fn reusable_scratch_trims_oversized_buffers() {
+        let backend = MetalBackend::new().unwrap();
+        let mut scratch = ReusableScratch::default();
+        let small = scratch.acquire(&backend, 33).unwrap();
+        let limit = small.length();
+        drop(small);
+        scratch.acquire(&backend, 4097).unwrap();
+        assert!(scratch.trim_above(limit));
+        assert_eq!(scratch.buffers.len(), 1);
+        assert!(scratch.buffers[0].raw.length() >= 33);
+        assert_eq!(scratch.next, 0);
     }
 
     fn assert_matmul(a: TensorSpec, b: TensorSpec, output: &TensorSpec) {
@@ -11510,6 +11658,13 @@ mod tests {
         for dtype in [DType::F16, DType::BF16] {
             assert_half_steel_profile_case(&backend, dtype, 1, 32_759, 32, 4, 128);
         }
+    }
+
+    #[test]
+    fn metal_gqa_vector_attention_reuses_grown_scratch() {
+        let backend = MetalBackend::new().unwrap();
+        assert_gqa_profile_case(&backend, DType::F16, 600, 32);
+        assert_gqa_profile_case(&backend, DType::F16, 9_000, 256);
     }
 
     #[test]
