@@ -847,19 +847,13 @@ where
             .collect();
         let layout = PagedLayout::new(serving.page_tokens, planes)
             .map_err(|error| compute::Error::Layout(error.to_string()))?;
-        let pool = PagePool::new(layout, 1, self.store.data().limits.live_bytes)
-            .map_err(|error| compute::Error::Quota(error.to_string()))?;
-        let charged_bytes = pool
-            .memory_usage()
-            .map_err(|error| compute::Error::Quota(error.to_string()))?
-            .0
-            .total()
-            .ok_or_else(|| compute::Error::Quota("paged pool byte size overflowed".to_owned()))?;
-        self.store.data().check_byte_allocation(charged_bytes)?;
-        self.store
-            .data()
-            .live_bytes
-            .fetch_add(charged_bytes, Ordering::AcqRel);
+        let pages_per_sequence = serving.max_context.div_ceil(serving.page_tokens);
+        let pool = PagePool::new(
+            layout,
+            pages_per_sequence,
+            self.store.data().limits.live_bytes,
+        )
+        .map_err(|error| compute::Error::Quota(error.to_string()))?;
         let entry = PagePoolEntry {
             pool,
             active_lanes: serving.active_lanes,
@@ -867,7 +861,7 @@ where
             plane_count: u32::try_from(serving.planes.len())
                 .map_err(|_| compute::Error::Layout("paged plane count exceeds u32".to_owned()))?,
             slot_banks: None,
-            charged_bytes: AtomicU64::new(charged_bytes),
+            charged_bytes: AtomicU64::new(0),
             live_bytes: Arc::clone(&self.store.data().live_bytes),
         };
         let resource = self
@@ -1801,7 +1795,15 @@ pub struct PagedSequenceEntry;
 /// Host-owned state behind an opaque guest batch-slot resource.
 pub struct BatchSlotEntry {
     _banks: Arc<PagedSlotBanks>,
-    _planes: u32,
+    planes: Vec<u32>,
+    tables: [Vec<u32>; 2],
+    generations: u32,
+}
+
+struct PagedBackingHandles {
+    planes: Vec<u32>,
+    tables: [Vec<u32>; 2],
+    generations: u32,
 }
 
 impl TensorEntry {
@@ -2139,7 +2141,7 @@ impl<B: Backend + 'static> Host<B> {
         resource: &Resource<PagePoolEntry>,
         planes: u32,
     ) -> Result<Resource<BatchSlotEntry>, compute::Error> {
-        let (pool, active_lanes, table_pages, before) = {
+        let (pool, active_lanes, table_pages, page_tokens, plane_specs, before) = {
             let entry = self.table.get(resource).map_err(invalid_handle)?;
             if planes == 0 || planes > entry.plane_count || entry.slot_banks.is_some() {
                 return Err(compute::Error::Layout(
@@ -2156,6 +2158,23 @@ impl<B: Backend + 'static> Host<B> {
                 usize::try_from(table_pages).map_err(|_| {
                     compute::Error::Layout("page table length exceeds usize".to_owned())
                 })?,
+                entry.pool.layout().page_tokens(),
+                entry
+                    .pool
+                    .layout()
+                    .planes()
+                    .iter()
+                    .take(usize::try_from(planes).map_err(|_| {
+                        compute::Error::Layout("paged plane count exceeds usize".to_owned())
+                    })?)
+                    .map(|plane| {
+                        u32::try_from(plane.elements_per_token)
+                            .map(|elements| (guest_dtype(plane.dtype), elements))
+                            .map_err(|_| {
+                                compute::Error::Layout("paged plane width exceeds u32".to_owned())
+                            })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
                 entry
                     .pool
                     .memory_usage()
@@ -2171,6 +2190,8 @@ impl<B: Backend + 'static> Host<B> {
             PagedSlotBanks::new(pool.clone(), active_lanes, table_pages)
                 .map_err(|error| compute::Error::Quota(error.to_string()))?,
         );
+        let backing =
+            self.allocate_paged_backing(plane_specs, page_tokens, table_pages, active_lanes)?;
         let after = pool
             .memory_usage()
             .map_err(|error| compute::Error::Quota(error.to_string()))?
@@ -2181,18 +2202,145 @@ impl<B: Backend + 'static> Host<B> {
             compute::Error::BackendExecution("paged pool charge regressed".to_owned())
         })?;
         self.check_byte_allocation(charge)?;
-        let slot = self
-            .table
-            .push(BatchSlotEntry {
-                _banks: Arc::clone(&banks),
-                _planes: planes,
-            })
-            .map_err(invalid_handle)?;
+        let mut cleanup = backing.planes.clone();
+        cleanup.extend(backing.tables.iter().flatten().copied());
+        cleanup.push(backing.generations);
+        let slot = match self.table.push(BatchSlotEntry {
+            _banks: Arc::clone(&banks),
+            planes: backing.planes,
+            tables: backing.tables,
+            generations: backing.generations,
+        }) {
+            Ok(slot) => slot,
+            Err(error) => {
+                self.drop_paged_handles(cleanup);
+                return Err(invalid_handle(error));
+            }
+        };
         let entry = self.table.get_mut(resource).map_err(invalid_handle)?;
         entry.slot_banks = Some(banks);
         entry.charged_bytes.fetch_add(charge, Ordering::AcqRel);
         entry.live_bytes.fetch_add(charge, Ordering::AcqRel);
         Ok(slot)
+    }
+
+    fn allocate_paged_backing(
+        &mut self,
+        plane_specs: Vec<(compute::Dtype, u32)>,
+        page_tokens: u32,
+        table_pages: usize,
+        active_lanes: usize,
+    ) -> Result<PagedBackingHandles, compute::Error> {
+        let physical_pages = u32::try_from(table_pages)
+            .map_err(|_| compute::Error::Layout("physical page count exceeds u32".to_owned()))?;
+        let mut backing = Vec::new();
+        let mut plane_handles = Vec::new();
+        for (dtype, elements) in plane_specs {
+            match self.alloc_paged_tensor(dtype, &[physical_pages, page_tokens, elements]) {
+                Ok(tensor) => {
+                    plane_handles.push(tensor);
+                    backing.push(tensor);
+                }
+                Err(error) => {
+                    self.drop_paged_handles(backing);
+                    return Err(error);
+                }
+            }
+        }
+        let generations = match self.alloc_paged_tensor(compute::Dtype::U32, &[physical_pages]) {
+            Ok(tensor) => {
+                backing.push(tensor);
+                tensor
+            }
+            Err(error) => {
+                self.drop_paged_handles(backing);
+                return Err(error);
+            }
+        };
+        let mut table_handles = [Vec::new(), Vec::new()];
+        for bank in &mut table_handles {
+            for _ in 0..active_lanes {
+                match self.alloc_paged_tensor(compute::Dtype::U32, &[physical_pages, 2]) {
+                    Ok(tensor) => {
+                        bank.push(tensor);
+                        backing.push(tensor);
+                    }
+                    Err(error) => {
+                        self.drop_paged_handles(backing);
+                        return Err(error);
+                    }
+                }
+            }
+        }
+        let generation_bytes = usize::try_from(physical_pages)
+            .ok()
+            .and_then(|pages| pages.checked_mul(4))
+            .ok_or_else(|| {
+                compute::Error::Layout("paged generation bytes overflowed".to_owned())
+            })?;
+        let zeros = vec![0; generation_bytes];
+        if let Err(error) = self.write(&Resource::new_borrow(generations), &zeros) {
+            self.drop_paged_handles(backing);
+            return Err(error);
+        }
+        let poison = [0_u32.to_ne_bytes(), u32::MAX.to_ne_bytes()].concat();
+        let poison = poison.repeat(table_pages);
+        for &table in table_handles.iter().flatten() {
+            if let Err(error) = self.write(&Resource::new_borrow(table), &poison) {
+                self.drop_paged_handles(backing);
+                return Err(error);
+            }
+        }
+        Ok(PagedBackingHandles {
+            planes: plane_handles,
+            tables: table_handles,
+            generations,
+        })
+    }
+
+    fn alloc_paged_tensor(
+        &mut self,
+        dtype: compute::Dtype,
+        shape: &[u32],
+    ) -> Result<u32, compute::Error> {
+        let dtype = core_dtype(dtype);
+        let byte_len = self.check_allocation(dtype, shape)?;
+        let tensor = self.backend.alloc(dtype, shape).map_err(guest_error)?;
+        let buffer = Arc::new(BufferHandle {
+            owner: tensor.clone(),
+            taints: Arc::clone(&self.taints),
+            guest_handles: AtomicUsize::new(0),
+            kind: BufferKind::Allocated {
+                byte_len,
+                live_bytes: Arc::clone(&self.live_bytes),
+            },
+        });
+        let entry = TensorEntry {
+            tensor: tensor.clone(),
+            symbolic: None,
+            buffer: Arc::clone(&buffer),
+        };
+        self.live_bytes.fetch_add(byte_len, Ordering::AcqRel);
+        let resource = self.table.push(entry).map_err(|error| {
+            let _ = release_buffer(self.backend.as_ref(), buffer, self.active_profile.as_ref());
+            invalid_handle(error)
+        })?;
+        Ok(resource.rep())
+    }
+
+    fn drop_paged_handles(&mut self, resources: Vec<u32>) {
+        for resource in resources {
+            if let Ok(entry) = self
+                .table
+                .delete(Resource::<TensorEntry>::new_own(resource))
+            {
+                let _ = release_buffer(
+                    self.backend.as_ref(),
+                    entry.buffer,
+                    self.active_profile.as_ref(),
+                );
+            }
+        }
     }
 
     /// Creates a Wasmtime store with the configured resource limiter installed.
@@ -4928,12 +5076,17 @@ where
         &mut self,
         resource: Resource<BatchSlotEntry>,
     ) -> impl Future<Output = wasmtime::Result<()>> + Send {
-        std::future::ready(
-            self.table
-                .delete(resource)
-                .map(|_| ())
-                .map_err(wasmtime::Error::msg),
-        )
+        let result = self
+            .table
+            .delete(resource)
+            .map_err(invalid_handle)
+            .map(|entry| {
+                let mut resources = entry.planes;
+                resources.extend(entry.tables.into_iter().flatten());
+                resources.push(entry.generations);
+                self.drop_paged_handles(resources);
+            });
+        std::future::ready(result.map_err(wasmtime::Error::msg))
     }
 }
 
@@ -5803,6 +5956,26 @@ mod tests {
                 .get(&Resource::<BatchSlotEntry>::new_borrow(slot_rep))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn paged_backing_allocation_failure_releases_every_partial_resource() {
+        let limits = Limits::new(130, 8, u64::MAX, 32, u64::MAX);
+        let mut host = Host::new(CpuBackend::new(), limits);
+        let pool = insert_test_pool(&mut host, 1, 8);
+        let pool_state = host.table.get(&pool).unwrap().pool.clone();
+        let before_memory = pool_state.memory_usage().unwrap();
+        let before_live = host.live_bytes.load(Ordering::Acquire);
+
+        assert!(matches!(
+            host.open_paged_slot(&pool, 1),
+            Err(compute::Error::Quota(_))
+        ));
+
+        let entry = host.table.get(&pool).unwrap();
+        assert!(entry.slot_banks.is_none());
+        assert_eq!(pool_state.memory_usage().unwrap(), before_memory);
+        assert_eq!(host.live_bytes.load(Ordering::Acquire), before_live);
     }
 
     fn doubling_program(value: f32) -> compute::ProgramSource {
