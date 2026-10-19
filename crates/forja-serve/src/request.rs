@@ -323,6 +323,27 @@ pub(crate) fn validate_prompt(
     Ok(params)
 }
 
+/// Computes the pages-worth of tokens admission must reserve before streaming starts.
+#[cfg_attr(not(test), allow(dead_code, reason = "used by paged admission"))]
+pub(crate) fn reservation_tokens(
+    prompt_tokens: u32,
+    cached_tokens: u32,
+    params: &ResolvedParams,
+) -> Result<u64, ValidationError> {
+    let suffix = prompt_tokens
+        .checked_sub(cached_tokens)
+        .ok_or_else(|| ValidationError {
+            message: "cached tokens exceed the prompt length".to_owned(),
+            too_large: false,
+        })?;
+    u64::from(suffix)
+        .checked_add(u64::from(params.max_tokens))
+        .ok_or_else(|| ValidationError {
+            message: "reservation token count overflowed".to_owned(),
+            too_large: true,
+        })
+}
+
 fn configured_context(config: &HostConfig, engine_profile_context: u32) -> u32 {
     config
         .request
@@ -862,13 +883,25 @@ mod tests {
     }
 
     #[test]
-    fn component_output_limit_is_used_as_the_request_default() {
+    fn component_output_limit_remains_the_request_default() {
         let defaults = info(SamplingDefaults {
             max_new_tokens: Some(7),
             ..SamplingDefaults::default()
         });
         let resolved = resolve_chat(&CompletionParams::default(), &defaults, 1, 32_768).unwrap();
         assert_eq!(resolved.max_tokens, 7);
+    }
+
+    #[test]
+    fn admission_reserves_uncached_suffix_and_resolved_default() {
+        let defaults = info(SamplingDefaults {
+            max_new_tokens: Some(33),
+            ..SamplingDefaults::default()
+        });
+        let resolved = resolve_chat(&CompletionParams::default(), &defaults, 2_048, 4_096).unwrap();
+        assert_eq!(resolved.max_tokens, 33);
+        assert_eq!(reservation_tokens(2_048, 1_024, &resolved).unwrap(), 1_057);
+        assert!(reservation_tokens(2_048, 2_049, &resolved).is_err());
     }
 
     #[test]
