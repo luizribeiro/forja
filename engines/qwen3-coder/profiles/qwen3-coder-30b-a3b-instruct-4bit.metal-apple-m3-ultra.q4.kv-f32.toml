@@ -28,6 +28,9 @@ batch = 1
 max-context = 32768
 prefill-chunk = 2048
 
+[serving]
+prompt-token-budget = 2048
+
 [variants.fixed]
 "quant.decode-q4" = "quant-matmul.gemv"
 "quant.decode-q8" = "quant-matmul.q8-fast-gemv"

@@ -30,6 +30,9 @@ batch = 1
 max-context = 4096
 prefill-chunk = 512
 
+[serving]
+prompt-token-budget = 512
+
 [variants.fixed]
 "dense.decode" = "matmul.gemv-transposed"
 "top-k" = "top-k.single-k8"
@@ -60,6 +63,7 @@ fn parses_and_canonicalizes_a_dense_profile() {
     assert_eq!(profile.numerics().kv_cache, KvCacheFormat::F32);
     assert_eq!(profile.default_tunings(), ["residual-norm", "qk-norm-rope"]);
     assert_eq!(profile.build().features, ["bf16"]);
+    assert_eq!(profile.serving().unwrap().prompt_token_budget.get(), 512);
     assert!(profile.quantization().is_none());
 
     let canonical = profile.canonical_toml().unwrap();
@@ -190,11 +194,16 @@ fn rejects_invalid_workload_bounds_and_tuning_names() {
         PROFILE.replace("batch = 1", "batch = 0"),
         PROFILE.replace("max-context = 4096", "max-context = 0"),
         PROFILE.replace("prefill-chunk = 512", "prefill-chunk = 0"),
+        PROFILE.replace("prompt-token-budget = 512", "prompt-token-budget = 0"),
     ] {
         assert!(toml::from_str::<Profile>(&source).is_err(), "{source}");
     }
     assert!(
         error(&PROFILE.replace("prefill-chunk = 512", "prefill-chunk = 4097"))
+            .contains("must not exceed")
+    );
+    assert!(
+        error(&PROFILE.replace("prompt-token-budget = 512", "prompt-token-budget = 4097"))
             .contains("must not exceed")
     );
     assert!(

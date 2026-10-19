@@ -76,6 +76,12 @@ impl Profile {
         &self.0.workload
     }
 
+    /// Returns serving scheduler settings when the profile supports paged serving.
+    #[must_use]
+    pub const fn serving(&self) -> Option<&Serving> {
+        self.0.serving.as_ref()
+    }
+
     /// Returns the default tuning names.
     #[must_use]
     pub fn default_tunings(&self) -> &[String] {
@@ -143,6 +149,7 @@ struct ProfileData {
     chat: Option<Chat>,
     numerics: Numerics,
     workload: Workload,
+    serving: Option<Serving>,
     variants: Variants,
     tuning_variants: BTreeMap<String, Variants>,
     quantization: Option<Quantization>,
@@ -302,6 +309,22 @@ pub struct Workload {
     pub prefill_chunk: NonZeroU32,
 }
 
+/// Scheduler settings for paged serving.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
+pub struct Serving {
+    /// Maximum prompt tokens scheduled in one iteration.
+    pub prompt_token_budget: NonZeroU32,
+}
+
+impl Default for Serving {
+    fn default() -> Self {
+        Self {
+            prompt_token_budget: NonZeroU32::MIN,
+        }
+    }
+}
+
 impl Default for Workload {
     fn default() -> Self {
         Self {
@@ -456,6 +479,12 @@ fn validate(profile: &ProfileData) -> Result<(), String> {
     }
     if profile.workload.prefill_chunk > profile.workload.max_context {
         return Err("workload.prefill-chunk must not exceed max-context".to_owned());
+    }
+    if profile
+        .serving
+        .is_some_and(|serving| serving.prompt_token_budget > profile.workload.max_context)
+    {
+        return Err("serving.prompt-token-budget must not exceed max-context".to_owned());
     }
     validate_tunings(&profile.default_tunings)?;
     validate_variants(&profile.variants, profile.workload.max_context)?;
