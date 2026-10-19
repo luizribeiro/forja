@@ -2127,6 +2127,10 @@ pub struct MetalSubmission {
 }
 
 impl Submission for MetalSubmission {
+    fn completion_serial(&self) -> Option<u64> {
+        self.completion.event_value()
+    }
+
     fn wait(&self) -> Result<(), BackendError> {
         self.wait_profiled(self.timeout)
     }
@@ -9739,6 +9743,22 @@ mod tests {
     fn metal_empty_command_list_completes() {
         let backend = MetalBackend::new().unwrap();
         backend.submit(CommandList::new()).unwrap().wait().unwrap();
+    }
+
+    #[test]
+    fn metal_submissions_expose_shared_event_serials() {
+        let backend = MetalBackend::new().unwrap();
+        let first = backend.submit(CommandList::new()).unwrap();
+        let second = backend.submit(CommandList::new()).unwrap();
+
+        assert_eq!(
+            second.completion_serial(),
+            first
+                .completion_serial()
+                .and_then(|value| value.checked_add(1))
+        );
+        first.wait().unwrap();
+        second.wait().unwrap();
     }
 
     #[test]

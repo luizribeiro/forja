@@ -497,6 +497,13 @@ impl Error for BackendError {}
 
 /// Completion state returned by a backend submission.
 pub trait Submission {
+    /// Returns the backend completion serial assigned when this work was submitted.
+    ///
+    /// Backends without an asynchronous completion timeline return `None`.
+    fn completion_serial(&self) -> Option<u64> {
+        None
+    }
+
     /// Waits for execution and returns the command list result.
     ///
     /// # Errors
