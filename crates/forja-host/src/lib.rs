@@ -24,7 +24,7 @@ use std::{
 use forja_core::{
     Affine, Backend, BackendDispatchData, BackendError, BufferId, CommandList, DType, DeviceInfo,
     GraphLimits, GraphTemplate, Layout, LayoutError, MemoryUsage, Op, OpError, PagePool,
-    PagedLayout, PagedPlane, ParamSpace, PreparedGraph, RuleArm, Slice, Submission,
+    PagedLayout, PagedPlane, PagedSlotBanks, ParamSpace, PreparedGraph, RuleArm, Slice, Submission,
     SubmissionProfile, SymbolicLayout, SymbolicLayoutError, TemplateOp, TemplateTensor, Tensor,
     ViewOp, gather_matmul_flops, gather_quant_matmul_dispatch_flops, matmul_flops,
     program::{
@@ -862,7 +862,12 @@ where
             .fetch_add(charged_bytes, Ordering::AcqRel);
         let entry = PagePoolEntry {
             pool,
-            charged_bytes,
+            active_lanes: serving.active_lanes,
+            max_context: serving.max_context,
+            plane_count: u32::try_from(serving.planes.len())
+                .map_err(|_| compute::Error::Layout("paged plane count exceeds u32".to_owned()))?,
+            slot_banks: None,
+            charged_bytes: AtomicU64::new(charged_bytes),
             live_bytes: Arc::clone(&self.store.data().live_bytes),
         };
         let resource = self
@@ -1774,14 +1779,18 @@ pub struct TensorEntry {
 /// Host-owned state behind an opaque guest page-pool resource.
 pub struct PagePoolEntry {
     pool: PagePool,
-    charged_bytes: u64,
+    active_lanes: u32,
+    max_context: u32,
+    plane_count: u32,
+    slot_banks: Option<Arc<PagedSlotBanks>>,
+    charged_bytes: AtomicU64,
     live_bytes: Arc<AtomicU64>,
 }
 
 impl Drop for PagePoolEntry {
     fn drop(&mut self) {
         self.live_bytes
-            .fetch_sub(self.charged_bytes, Ordering::AcqRel);
+            .fetch_sub(self.charged_bytes.load(Ordering::Acquire), Ordering::AcqRel);
     }
 }
 
@@ -1790,8 +1799,10 @@ impl Drop for PagePoolEntry {
 pub struct PagedSequenceEntry;
 
 /// Host-owned state behind an opaque guest batch-slot resource.
-#[derive(Debug)]
-pub struct BatchSlotEntry;
+pub struct BatchSlotEntry {
+    _banks: Arc<PagedSlotBanks>,
+    _planes: u32,
+}
 
 impl TensorEntry {
     fn template(&self) -> Result<TemplateTensor, compute::Error> {
@@ -2121,6 +2132,67 @@ impl<B: Backend + 'static> Host<B> {
             epoch_registration: None,
             explicit_metal_variants: false,
         }
+    }
+
+    fn open_paged_slot(
+        &mut self,
+        resource: &Resource<PagePoolEntry>,
+        planes: u32,
+    ) -> Result<Resource<BatchSlotEntry>, compute::Error> {
+        let (pool, active_lanes, table_pages, before) = {
+            let entry = self.table.get(resource).map_err(invalid_handle)?;
+            if planes == 0 || planes > entry.plane_count || entry.slot_banks.is_some() {
+                return Err(compute::Error::Layout(
+                    "paged slot planes are invalid or already open".to_owned(),
+                ));
+            }
+            let table_pages = entry
+                .max_context
+                .div_ceil(entry.pool.layout().page_tokens());
+            (
+                entry.pool.clone(),
+                usize::try_from(entry.active_lanes)
+                    .map_err(|_| compute::Error::Layout("lane count exceeds usize".to_owned()))?,
+                usize::try_from(table_pages).map_err(|_| {
+                    compute::Error::Layout("page table length exceeds usize".to_owned())
+                })?,
+                entry
+                    .pool
+                    .memory_usage()
+                    .map_err(|error| compute::Error::Quota(error.to_string()))?
+                    .0
+                    .total()
+                    .ok_or_else(|| {
+                        compute::Error::Quota("paged pool byte size overflowed".to_owned())
+                    })?,
+            )
+        };
+        let banks = Arc::new(
+            PagedSlotBanks::new(pool.clone(), active_lanes, table_pages)
+                .map_err(|error| compute::Error::Quota(error.to_string()))?,
+        );
+        let after = pool
+            .memory_usage()
+            .map_err(|error| compute::Error::Quota(error.to_string()))?
+            .0
+            .total()
+            .ok_or_else(|| compute::Error::Quota("paged pool byte size overflowed".to_owned()))?;
+        let charge = after.checked_sub(before).ok_or_else(|| {
+            compute::Error::BackendExecution("paged pool charge regressed".to_owned())
+        })?;
+        self.check_byte_allocation(charge)?;
+        let slot = self
+            .table
+            .push(BatchSlotEntry {
+                _banks: Arc::clone(&banks),
+                _planes: planes,
+            })
+            .map_err(invalid_handle)?;
+        let entry = self.table.get_mut(resource).map_err(invalid_handle)?;
+        entry.slot_banks = Some(banks);
+        entry.charged_bytes.fetch_add(charge, Ordering::AcqRel);
+        entry.live_bytes.fetch_add(charge, Ordering::AcqRel);
+        Ok(slot)
     }
 
     /// Creates a Wasmtime store with the configured resource limiter installed.
@@ -4809,6 +4881,15 @@ impl<B> paged_storage::HostPagePool for Host<B>
 where
     B: Backend + Send + Sync + 'static,
 {
+    fn open_slot(
+        &mut self,
+        resource: Resource<PagePoolEntry>,
+        planes: u32,
+    ) -> impl Future<Output = wasmtime::Result<Result<Resource<BatchSlotEntry>, compute::Error>>> + Send
+    {
+        std::future::ready(Ok(self.open_paged_slot(&resource, planes)))
+    }
+
     fn drop(
         &mut self,
         resource: Resource<PagePoolEntry>,
@@ -5596,7 +5677,7 @@ mod tests {
             )
             .unwrap(),
             1,
-            64,
+            4_096,
         )
         .unwrap();
         let charged_bytes = paged.memory_usage().unwrap().0.total().unwrap();
@@ -5605,12 +5686,16 @@ mod tests {
             .table
             .push(PagePoolEntry {
                 pool: paged,
-                charged_bytes,
+                active_lanes: 1,
+                max_context: 4,
+                plane_count: 1,
+                slot_banks: None,
+                charged_bytes: AtomicU64::new(charged_bytes),
                 live_bytes: Arc::clone(&host.live_bytes),
             })
             .unwrap();
         let sequence = host.table.push(PagedSequenceEntry).unwrap();
-        let slot = host.table.push(BatchSlotEntry).unwrap();
+        let slot = host.open_paged_slot(&pool, 1).unwrap();
         let ordinary = host.alloc(compute::Dtype::F32, &[1]).unwrap();
         let output = host.alloc(compute::Dtype::F32, &[1]).unwrap();
         let copy = <Host<CpuBackend> as paged_storage::Host>::record_paged_copy(

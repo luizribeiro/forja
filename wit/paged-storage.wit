@@ -3,9 +3,11 @@ package l9o:gpu@0.1.0;
 interface paged-storage {
   use compute.{command-list, error, tensor};
 
-  resource page-pool;
   resource sequence;
   resource batch-slot;
+  resource page-pool {
+    open-slot: func(planes: u32) -> result<batch-slot, error>;
+  }
 
   enum copy-direction {
     into-pages,
