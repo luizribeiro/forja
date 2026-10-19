@@ -34,7 +34,11 @@ impl Guest for Component {
         }
     }
 
-    async fn load(_weights: &Weights, _config: LoadConfig) -> Result<(), Error> {
+    async fn load(
+        _weights: &Weights,
+        _pool: Option<&l9o::gpu::paged_storage::PagePool>,
+        _config: LoadConfig,
+    ) -> Result<(), Error> {
         Ok(())
     }
 

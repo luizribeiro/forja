@@ -138,6 +138,7 @@ fn engine_guest_impl() -> proc_macro2::TokenStream {
 
             async fn load(
                 weights: &compute::Weights,
+                _pool: Option<&bindings::l9o::gpu::paged_storage::PagePool>,
                 config: LoadConfig,
             ) -> ::std::result::Result<(), compute::Error> {
                 let weights = ::forja_sdk::Weights::from_guest(weights);

@@ -2,6 +2,7 @@ package l9o:gpu@0.1.0;
 
 interface engine {
   use compute.{error, tensor, weights};
+  use paged-storage.{page-pool};
 
   record cache-plane {
     elements-per-token: u64,
@@ -87,7 +88,7 @@ interface engine {
   }
 
   describe: func() -> engine-info;
-  load: async func(w: borrow<weights>, config: load-config) -> result<_, error>;
+  load: async func(w: borrow<weights>, pool: option<borrow<page-pool>>, config: load-config) -> result<_, error>;
   step: async func(input: step-in) -> result<step-out, error>;
   decode: async func(input: decode-in) -> result<decode-out, error>;
   begin-decode: async func(tokens: option<list<u32>>, start-pos: u32)

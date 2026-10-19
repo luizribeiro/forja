@@ -23,10 +23,10 @@ use std::{
 
 use forja_core::{
     Affine, Backend, BackendDispatchData, BackendError, BufferId, CommandList, DType, DeviceInfo,
-    GraphLimits, GraphTemplate, Layout, LayoutError, MemoryUsage, Op, OpError, ParamSpace,
-    PreparedGraph, RuleArm, Slice, Submission, SubmissionProfile, SymbolicLayout,
-    SymbolicLayoutError, TemplateOp, TemplateTensor, Tensor, ViewOp, gather_matmul_flops,
-    gather_quant_matmul_dispatch_flops, matmul_flops,
+    GraphLimits, GraphTemplate, Layout, LayoutError, MemoryUsage, Op, OpError, PagePool,
+    PagedLayout, PagedPlane, ParamSpace, PreparedGraph, RuleArm, Slice, Submission,
+    SubmissionProfile, SymbolicLayout, SymbolicLayoutError, TemplateOp, TemplateTensor, Tensor,
+    ViewOp, gather_matmul_flops, gather_quant_matmul_dispatch_flops, matmul_flops,
     program::{
         BinOp, EpilogueError, EpilogueSignature, Inst, KernelSignature, MAX_INSTRUCTIONS,
         MAX_OUTPUTS, PrepareError, PreparedEpilogue, PreparedProgram, Program, ProgramError,
@@ -530,6 +530,7 @@ pub struct EngineRunner<B: Backend + Send + Sync + 'static> {
     discarded_speculation: bool,
     profiling: bool,
     last_profile: Option<EngineStepProfile>,
+    page_pool: Option<u32>,
 }
 
 type EngineCallFuture<'a, T> =
@@ -640,6 +641,7 @@ where
             discarded_speculation: false,
             profiling: false,
             last_profile: None,
+            page_pool: None,
         })
     }
 
@@ -711,6 +713,14 @@ where
         num_hidden_layers: Option<u32>,
         config: &EngineLoadConfig,
     ) -> wasmtime::Result<Result<(), compute::Error>> {
+        let info = match &self.info {
+            Some(info) => info.clone(),
+            None => self.describe().await?,
+        };
+        let pool = match self.bind_page_pool(&info, config.kv_cache) {
+            Ok(pool) => pool,
+            Err(error) => return Ok(Err(error)),
+        };
         self.set_guest_deadline();
         let weights = self
             .store
@@ -725,6 +735,7 @@ where
                     .call_load(
                         accessor,
                         weights,
+                        pool.map(Resource::new_borrow),
                         engine_bindings::exports::l9o::gpu::engine::LoadConfig {
                             num_hidden_layers,
                             replay: config.replay,
@@ -781,6 +792,87 @@ where
             self.loaded_num_hidden_layers = num_hidden_layers;
         }
         result
+    }
+
+    fn bind_page_pool(
+        &mut self,
+        info: &EngineInfo,
+        kv_cache: KvCacheFormat,
+    ) -> Result<Option<u32>, compute::Error> {
+        let Some(serving) = &info.serving else {
+            return Ok(None);
+        };
+        if serving.active_lanes == 0
+            || serving.max_context == 0
+            || serving.max_context > info.max_context
+        {
+            return Err(compute::Error::Layout(
+                "paged serving ceilings are invalid".to_owned(),
+            ));
+        }
+        let dtype = match kv_cache {
+            KvCacheFormat::F16 => DType::F16,
+            KvCacheFormat::Bf16 => DType::BF16,
+            KvCacheFormat::F32 => DType::F32,
+        };
+        if let Some(resource) = self.page_pool {
+            let entry = self
+                .store
+                .data()
+                .table
+                .get(&Resource::<PagePoolEntry>::new_borrow(resource))
+                .map_err(invalid_handle)?;
+            if entry
+                .pool
+                .layout()
+                .planes()
+                .iter()
+                .any(|plane| plane.dtype != dtype)
+            {
+                return Err(compute::Error::Layout(
+                    "paged pool dtype cannot change after load".to_owned(),
+                ));
+            }
+            return Ok(Some(resource));
+        }
+        let planes = serving
+            .planes
+            .iter()
+            .map(|plane| PagedPlane {
+                dtype,
+                elements_per_token: plane.elements_per_token,
+                alignment: plane.alignment,
+                label: plane.label.clone(),
+            })
+            .collect();
+        let layout = PagedLayout::new(serving.page_tokens, planes)
+            .map_err(|error| compute::Error::Layout(error.to_string()))?;
+        let pool = PagePool::new(layout, 1, self.store.data().limits.live_bytes)
+            .map_err(|error| compute::Error::Quota(error.to_string()))?;
+        let charged_bytes = pool
+            .memory_usage()
+            .map_err(|error| compute::Error::Quota(error.to_string()))?
+            .0
+            .total()
+            .ok_or_else(|| compute::Error::Quota("paged pool byte size overflowed".to_owned()))?;
+        self.store.data().check_byte_allocation(charged_bytes)?;
+        self.store
+            .data()
+            .live_bytes
+            .fetch_add(charged_bytes, Ordering::AcqRel);
+        let entry = PagePoolEntry {
+            pool,
+            charged_bytes,
+            live_bytes: Arc::clone(&self.store.data().live_bytes),
+        };
+        let resource = self
+            .store
+            .data_mut()
+            .table
+            .push(entry)
+            .map_err(invalid_handle)?;
+        self.page_pool = Some(resource.rep());
+        Ok(self.page_pool)
     }
 
     /// Runs one engine invocation and retains its device tensors.
@@ -1680,8 +1772,18 @@ pub struct TensorEntry {
 }
 
 /// Host-owned state behind an opaque guest page-pool resource.
-#[derive(Debug)]
-pub struct PagePoolEntry;
+pub struct PagePoolEntry {
+    pool: PagePool,
+    charged_bytes: u64,
+    live_bytes: Arc<AtomicU64>,
+}
+
+impl Drop for PagePoolEntry {
+    fn drop(&mut self) {
+        self.live_bytes
+            .fetch_sub(self.charged_bytes, Ordering::AcqRel);
+    }
+}
 
 /// Host-owned state behind an opaque guest paged-sequence resource.
 #[derive(Debug)]
@@ -5451,7 +5553,8 @@ mod tests {
 
     use forja_core::{
         Backend, BackendError, BufferId, CommandList, DType, Layout, LayoutError, MappedRegion,
-        MemoryUsage, Op, OpError, Submission, Tensor, ViewOp as CoreViewOp,
+        MemoryUsage, Op, OpError, PagePool, PagedLayout, PagedPlane, Submission, Tensor,
+        ViewOp as CoreViewOp,
         program::{KernelSignature, ValidatedProgram},
     };
     use forja_cpu::CpuBackend;
@@ -5481,7 +5584,31 @@ mod tests {
     async fn paged_wasmtime_stubs_refuse_and_drop_resources() {
         let mut host = Host::new(CpuBackend::new(), GENEROUS);
         let commands = host.command_list().unwrap();
-        let pool = host.table.push(PagePoolEntry).unwrap();
+        let paged = PagePool::new(
+            PagedLayout::new(
+                4,
+                vec![PagedPlane {
+                    dtype: DType::F32,
+                    elements_per_token: 1,
+                    alignment: 4,
+                    label: "test".to_owned(),
+                }],
+            )
+            .unwrap(),
+            1,
+            64,
+        )
+        .unwrap();
+        let charged_bytes = paged.memory_usage().unwrap().0.total().unwrap();
+        host.live_bytes.fetch_add(charged_bytes, Ordering::AcqRel);
+        let pool = host
+            .table
+            .push(PagePoolEntry {
+                pool: paged,
+                charged_bytes,
+                live_bytes: Arc::clone(&host.live_bytes),
+            })
+            .unwrap();
         let sequence = host.table.push(PagedSequenceEntry).unwrap();
         let slot = host.table.push(BatchSlotEntry).unwrap();
         let ordinary = host.alloc(compute::Dtype::F32, &[1]).unwrap();
