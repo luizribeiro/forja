@@ -7,8 +7,9 @@ use forja_sdk::Param;
 #[cfg(target_family = "wasm")]
 use forja_sdk::nn::blocks::{ChunkedPrefill, DecodeSelection, DecodeState, PrefillExecution};
 use forja_sdk::{
-    DType, Dim, Engine, EngineInfo, EngineLoadConfig, KvCacheFormat, Load, Result, StepInput,
-    StepOutput, Tensor, VariantSelection, Weights, bf16, export_engine, f16,
+    CachePlane, DType, Dim, Engine, EngineInfo, EngineLoadConfig, KvCacheFormat, Load, Result,
+    ServingInfo, StepInput, StepOutput, Tensor, VariantSelection, Weights, bf16, export_engine,
+    f16,
     kernel::{Epilogue, Kernel, TensorRef},
     nn::{
         RmsNorm, RmsNormConfig,
@@ -69,6 +70,24 @@ const ATTENTION_SCALE: f32 = 0.088_388_35;
 const Q4_BITS: u8 = 4;
 const Q8_BITS: u8 = 8;
 const QUANT_GROUP: u32 = 64;
+
+fn serving_info() -> ServingInfo {
+    let planes = (0..LAYERS)
+        .flat_map(|layer| {
+            ["key", "value"].map(move |kind| CachePlane {
+                elements_per_token: u64::from(KEY_VALUE_HEADS * HEAD_DIM),
+                alignment: 256,
+                label: format!("layer-{layer}-{kind}"),
+            })
+        })
+        .collect();
+    ServingInfo {
+        page_tokens: 64,
+        planes,
+        active_lanes: 8,
+        max_context: MAX_CONTEXT,
+    }
+}
 
 fn exact_position(position: u32) -> Result<f32> {
     if position > 1 << f32::MANTISSA_DIGITS {
@@ -895,7 +914,7 @@ impl Engine for Qwen3Coder {
             max_context: MAX_CONTEXT,
             tap_layers: (1..=48).collect(),
             router_layers: (1..=48).collect(),
-            serving: None,
+            serving: Some(serving_info()),
         }
     }
 
@@ -1283,6 +1302,12 @@ mod tests {
         assert_eq!(info.max_context, MAX_CONTEXT);
         assert_eq!(info.tap_layers, (1..=48).collect::<Vec<_>>());
         assert_eq!(info.router_layers, (1..=48).collect::<Vec<_>>());
+        let serving = info.serving.unwrap();
+        assert_eq!(serving.page_tokens, 64);
+        assert_eq!(serving.planes.len(), 96);
+        assert_eq!(serving.planes[0].elements_per_token, 512);
+        assert_eq!(serving.active_lanes, 8);
+        assert_eq!(serving.max_context, MAX_CONTEXT);
     }
 
     #[test]
