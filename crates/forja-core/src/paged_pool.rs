@@ -173,6 +173,7 @@ impl PagePool {
             ],
             logical_len: 0,
             reserved_tokens: tokens,
+            table_bytes,
         })
     }
 
@@ -192,6 +193,22 @@ impl PagePool {
             .map_err(|_| PagePoolError::CorruptState)
     }
 
+    fn release(&self, pages: &[PageLease]) -> Result<(), PagePoolError> {
+        let mut state = self.lock()?;
+        for lease in pages {
+            let page = live_page_mut(&mut state, *lease)?;
+            page.references = page
+                .references
+                .checked_sub(1)
+                .ok_or(PagePoolError::CorruptState)?;
+            if page.references == 0 {
+                page.lifecycle = PageLifecycle::Free;
+                state.free.push(lease.index);
+            }
+        }
+        Ok(())
+    }
+
     fn refcount(&self, lease: PageLease) -> Result<u32, PagePoolError> {
         let mut state = self.lock()?;
         Ok(live_page_mut(&mut state, lease)?.references)
@@ -205,6 +222,7 @@ pub struct PagedSequence {
     immutable: Vec<bool>,
     logical_len: u64,
     reserved_tokens: u64,
+    table_bytes: u64,
 }
 
 impl PagedSequence {
@@ -281,6 +299,15 @@ impl PagedSequence {
             .map(|page| PageTableEntry::new(page.index, page.generation))
             .collect();
         PageTable::new(entries, generations).map_err(|_| PagePoolError::CorruptState)
+    }
+}
+
+impl Drop for PagedSequence {
+    fn drop(&mut self) {
+        let _ = self.pool.release(&self.pages);
+        if let Ok(mut state) = self.pool.lock() {
+            state.memory.table_bytes = state.memory.table_bytes.saturating_sub(self.table_bytes);
+        }
     }
 }
 
@@ -422,5 +449,17 @@ mod tests {
             Err(PagePoolError::QuotaExceeded)
         ));
         assert_eq!(pool.memory_usage().unwrap(), before);
+    }
+
+    #[test]
+    fn dropped_pages_are_reused() {
+        let pool = pool(1_024);
+        let sequence = pool.reserve(4).unwrap();
+        let old = sequence.table().unwrap().resolve(0).unwrap();
+        drop(sequence);
+
+        let replacement = pool.reserve(4).unwrap();
+
+        assert_eq!(replacement.table().unwrap().resolve(0).unwrap(), old);
     }
 }
