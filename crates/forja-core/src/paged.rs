@@ -1,0 +1,195 @@
+use std::{error::Error, fmt};
+
+use crate::DType;
+
+/// Largest accepted token count in one page.
+pub const MAX_PAGE_TOKENS: u32 = 4_096;
+/// Largest accepted plane count in one pool.
+pub const MAX_PAGED_PLANES: usize = 4_096;
+const MAX_LABEL_BYTES: usize = 64;
+
+/// One independently typed plane in a paged storage pool.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PagedPlane {
+    /// Stored scalar type.
+    pub dtype: DType,
+    /// Number of stored values for each logical token.
+    pub elements_per_token: u64,
+    /// Required byte alignment for each page of this plane.
+    pub alignment: u64,
+    /// Engine-local diagnostic name.
+    pub label: String,
+}
+
+/// A reason paged storage geometry was refused.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PagedLayoutError {
+    /// The page token count is zero or exceeds [`MAX_PAGE_TOKENS`].
+    InvalidPageTokens,
+    /// A pool must contain between one and [`MAX_PAGED_PLANES`] planes.
+    InvalidPlaneCount,
+    /// A plane contains no values per token.
+    EmptyPlane {
+        /// Zero-based plane index.
+        plane: usize,
+    },
+    /// A plane alignment is not a power of two compatible with its dtype.
+    InvalidAlignment {
+        /// Zero-based plane index.
+        plane: usize,
+    },
+    /// A diagnostic label is empty or too long.
+    InvalidLabel {
+        /// Zero-based plane index.
+        plane: usize,
+    },
+    /// A byte calculation exceeded 64 bits.
+    ArithmeticOverflow,
+}
+
+impl fmt::Display for PagedLayoutError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "invalid paged layout: {self:?}")
+    }
+}
+
+impl Error for PagedLayoutError {}
+
+/// Validated, model-neutral geometry shared by every page in a pool.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PagedLayout {
+    page_tokens: u32,
+    planes: Vec<PagedPlane>,
+    page_bytes: Vec<u64>,
+    total_page_bytes: u64,
+}
+
+impl PagedLayout {
+    /// Validates plane geometry and all derived byte counts.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PagedLayoutError`] for invalid fields or checked-arithmetic overflow.
+    pub fn new(page_tokens: u32, planes: Vec<PagedPlane>) -> Result<Self, PagedLayoutError> {
+        if page_tokens == 0 || page_tokens > MAX_PAGE_TOKENS {
+            return Err(PagedLayoutError::InvalidPageTokens);
+        }
+        if planes.is_empty() || planes.len() > MAX_PAGED_PLANES {
+            return Err(PagedLayoutError::InvalidPlaneCount);
+        }
+        let mut page_bytes = Vec::with_capacity(planes.len());
+        let mut total_page_bytes = 0_u64;
+        for (plane, descriptor) in planes.iter().enumerate() {
+            if descriptor.elements_per_token == 0 {
+                return Err(PagedLayoutError::EmptyPlane { plane });
+            }
+            if !descriptor.alignment.is_power_of_two()
+                || descriptor.alignment < descriptor.dtype.byte_size()
+                || !descriptor
+                    .alignment
+                    .is_multiple_of(descriptor.dtype.byte_size())
+            {
+                return Err(PagedLayoutError::InvalidAlignment { plane });
+            }
+            if descriptor.label.is_empty() || descriptor.label.len() > MAX_LABEL_BYTES {
+                return Err(PagedLayoutError::InvalidLabel { plane });
+            }
+            let bytes = u64::from(page_tokens)
+                .checked_mul(descriptor.elements_per_token)
+                .and_then(|elements| elements.checked_mul(descriptor.dtype.byte_size()))
+                .ok_or(PagedLayoutError::ArithmeticOverflow)?;
+            let padded = align_up(bytes, descriptor.alignment)?;
+            total_page_bytes = total_page_bytes
+                .checked_add(padded)
+                .ok_or(PagedLayoutError::ArithmeticOverflow)?;
+            page_bytes.push(padded);
+        }
+        Ok(Self {
+            page_tokens,
+            planes,
+            page_bytes,
+            total_page_bytes,
+        })
+    }
+
+    /// Returns the logical token capacity of each page.
+    #[must_use]
+    pub const fn page_tokens(&self) -> u32 {
+        self.page_tokens
+    }
+
+    /// Returns the validated plane descriptors.
+    #[must_use]
+    pub fn planes(&self) -> &[PagedPlane] {
+        &self.planes
+    }
+
+    /// Returns the aligned bytes occupied by one page of a plane.
+    #[must_use]
+    pub fn plane_page_bytes(&self, plane: usize) -> Option<u64> {
+        self.page_bytes.get(plane).copied()
+    }
+
+    /// Returns the sum of one corresponding page from every plane.
+    #[must_use]
+    pub const fn total_page_bytes(&self) -> u64 {
+        self.total_page_bytes
+    }
+}
+
+/// `alignment` is a nonzero power of two validated at the layout boundary.
+fn align_up(value: u64, alignment: u64) -> Result<u64, PagedLayoutError> {
+    value
+        .checked_add(alignment - 1)
+        .map(|end| end & !(alignment - 1))
+        .ok_or(PagedLayoutError::ArithmeticOverflow)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn plane() -> PagedPlane {
+        PagedPlane {
+            dtype: DType::F16,
+            elements_per_token: 1_024,
+            alignment: 256,
+            label: "key".to_owned(),
+        }
+    }
+
+    #[test]
+    fn validates_and_aligns_planes() {
+        let layout = PagedLayout::new(33, vec![plane()]).unwrap();
+        assert_eq!(layout.plane_page_bytes(0), Some(67_584));
+        assert_eq!(layout.total_page_bytes(), 67_584);
+    }
+
+    #[test]
+    fn refuses_zero_and_oversized_pages() {
+        assert_eq!(
+            PagedLayout::new(0, vec![plane()]),
+            Err(PagedLayoutError::InvalidPageTokens)
+        );
+        assert_eq!(
+            PagedLayout::new(MAX_PAGE_TOKENS + 1, vec![plane()]),
+            Err(PagedLayoutError::InvalidPageTokens)
+        );
+    }
+
+    #[test]
+    fn refuses_bad_plane_layouts_and_overflow() {
+        let mut bad = plane();
+        bad.alignment = 3;
+        assert_eq!(
+            PagedLayout::new(64, vec![bad]),
+            Err(PagedLayoutError::InvalidAlignment { plane: 0 })
+        );
+        let mut overflowing = plane();
+        overflowing.elements_per_token = u64::MAX;
+        assert_eq!(
+            PagedLayout::new(64, vec![overflowing]),
+            Err(PagedLayoutError::ArithmeticOverflow)
+        );
+    }
+}
