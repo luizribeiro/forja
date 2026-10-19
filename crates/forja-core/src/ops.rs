@@ -93,6 +93,15 @@ pub struct Tensor {
     writable: bool,
 }
 
+/// Direction of a generic paged-storage copy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PagedCopyDirection {
+    /// Copies contiguous token rows into paged storage.
+    IntoPages,
+    /// Copies paged token rows into contiguous storage.
+    OutOfPages,
+}
+
 impl Tensor {
     pub(crate) fn from_allocation(
         buffer: BufferId,
@@ -141,6 +150,15 @@ pub enum Op {
     Program(ProgramHash),
     /// Copies and optionally casts one tensor.
     Copy,
+    /// Copies token rows between an ordinary tensor and one paged plane.
+    PagedCopy {
+        /// Direction of the transfer.
+        direction: PagedCopyDirection,
+        /// First logical token in the page table.
+        start: u32,
+        /// Logical tokens stored by one physical page.
+        page_tokens: u32,
+    },
     /// Normalizes rows by their root mean square and applies a weight.
     RmsNorm {
         /// The nonnegative stabilizer added before the square root.
@@ -239,6 +257,21 @@ pub enum Op {
         causal: bool,
         /// The absolute position of the first query.
         q_start: u32,
+    },
+    /// Computes grouped-query attention directly over paged K/V planes.
+    PagedSdpa {
+        /// The score multiplier.
+        scale: f32,
+        /// Whether keys after each query position are masked.
+        causal: bool,
+        /// The absolute position of the first query.
+        q_start: u32,
+        /// Logical key length for this lane.
+        key_length: u32,
+        /// Logical tokens stored by one physical page.
+        page_tokens: u32,
+        /// Whether the trusted table validator proved consecutive physical entries.
+        contiguous_entries: bool,
     },
 }
 
@@ -474,6 +507,7 @@ impl Dispatch {
         Self::new_many(op, inputs, &[output])
     }
 
+    #[allow(clippy::too_many_lines)]
     pub(crate) fn new_many(
         op: Op,
         inputs: &[&Tensor],
@@ -494,6 +528,11 @@ impl Dispatch {
         match op {
             Op::Program(_) => return Err(OpError::ProgramRequiresBinding),
             Op::Copy => check_copy(inputs, output)?,
+            Op::PagedCopy {
+                direction,
+                start,
+                page_tokens,
+            } => check_paged_copy(inputs, output, direction, start, page_tokens)?,
             Op::RmsNorm { eps } => check_rms_norm(inputs, output, eps)?,
             Op::Argmax { chunk_width } => {
                 check_reduction_parameters(chunk_width)?;
@@ -551,6 +590,22 @@ impl Dispatch {
                 causal,
                 q_start,
             } => check_sdpa(inputs, output, scale, causal, q_start)?,
+            Op::PagedSdpa {
+                scale,
+                causal,
+                q_start,
+                key_length,
+                page_tokens,
+                ..
+            } => check_paged_sdpa(
+                inputs,
+                output,
+                scale,
+                causal,
+                q_start,
+                key_length,
+                page_tokens,
+            )?,
         }
         Ok(Self {
             op,
@@ -1118,6 +1173,67 @@ fn check_copy(inputs: &[&Tensor], output: &Tensor) -> Result<(), OpError> {
         });
     }
     check_shape(output, inputs[0], Operand::Output)?;
+    Ok(())
+}
+
+fn check_paged_copy(
+    inputs: &[&Tensor],
+    output: &Tensor,
+    direction: PagedCopyDirection,
+    start: u32,
+    page_tokens: u32,
+) -> Result<(), OpError> {
+    if inputs.len() != 3 {
+        return Err(OpError::Arity {
+            expected: 3,
+            actual: inputs.len(),
+        });
+    }
+    check_paged_layouts(inputs, output)?;
+    let (ordinary, pool) = match direction {
+        PagedCopyDirection::IntoPages => (inputs[0], output),
+        PagedCopyDirection::OutOfPages => (output, inputs[0]),
+    };
+    check_float(ordinary, Operand::Input(0))?;
+    if pool.layout.dtype() != ordinary.layout.dtype() {
+        return Err(OpError::DType {
+            operand: Operand::Input(0),
+            dtype: pool.layout.dtype(),
+        });
+    }
+    let [tokens, elements]: [u32; 2] = ordinary
+        .layout
+        .shape()
+        .try_into()
+        .map_err(|_| shape_error(Operand::Input(0)))?;
+    let [physical_pages, pool_page_tokens, pool_elements]: [u32; 3] = pool
+        .layout
+        .shape()
+        .try_into()
+        .map_err(|_| shape_error(Operand::Output))?;
+    let [logical_pages, table_width]: [u32; 2] = inputs[1]
+        .layout
+        .shape()
+        .try_into()
+        .map_err(|_| shape_error(Operand::Input(1)))?;
+    if inputs[1].layout.dtype() != DType::U32 || table_width != 2 {
+        return Err(shape_error(Operand::Input(1)));
+    }
+    if inputs[2].layout.dtype() != DType::U32 || inputs[2].layout.shape() != [physical_pages] {
+        return Err(shape_error(Operand::Input(2)));
+    }
+    let logical_capacity = u64::from(logical_pages)
+        .checked_mul(u64::from(page_tokens))
+        .ok_or(OpError::InvalidKernelParameter)?;
+    if page_tokens == 0
+        || pool_page_tokens != page_tokens
+        || pool_elements != elements
+        || u64::from(start)
+            .checked_add(u64::from(tokens))
+            .is_none_or(|end| end > logical_capacity)
+    {
+        return Err(OpError::InvalidKernelParameter);
+    }
     Ok(())
 }
 
@@ -1907,6 +2023,90 @@ fn check_sdpa(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn check_paged_sdpa(
+    inputs: &[&Tensor],
+    output: &Tensor,
+    scale: f32,
+    causal: bool,
+    q_start: u32,
+    key_length: u32,
+    page_tokens: u32,
+) -> Result<(), OpError> {
+    if inputs.len() != 5 {
+        return Err(OpError::Arity {
+            expected: 5,
+            actual: inputs.len(),
+        });
+    }
+    check_paged_layouts(inputs, output)?;
+    check_float(inputs[0], Operand::Input(0))?;
+    check_float(inputs[1], Operand::Input(1))?;
+    if inputs[2].layout.dtype() != inputs[1].layout.dtype() {
+        return Err(OpError::DType {
+            operand: Operand::Input(2),
+            dtype: inputs[2].layout.dtype(),
+        });
+    }
+    check_float(output, Operand::Output)?;
+    if !scale.is_finite() || page_tokens == 0 || key_length == 0 {
+        return Err(OpError::InvalidKernelParameter);
+    }
+    let [query_heads, query_length, width] = shape3(inputs[0], Operand::Input(0))?;
+    let [physical_pages, pool_page_tokens, kv_heads, key_width]: [u32; 4] = inputs[1]
+        .layout
+        .shape()
+        .try_into()
+        .map_err(|_| shape_error(Operand::Input(1)))?;
+    let [value_pages, value_page_tokens, value_heads, value_width]: [u32; 4] = inputs[2]
+        .layout
+        .shape()
+        .try_into()
+        .map_err(|_| shape_error(Operand::Input(2)))?;
+    let [logical_pages, table_width]: [u32; 2] = inputs[3]
+        .layout
+        .shape()
+        .try_into()
+        .map_err(|_| shape_error(Operand::Input(3)))?;
+    if inputs[3].layout.dtype() != DType::U32 || table_width != 2 {
+        return Err(shape_error(Operand::Input(3)));
+    }
+    if inputs[4].layout.dtype() != DType::U32 || inputs[4].layout.shape() != [physical_pages] {
+        return Err(shape_error(Operand::Input(4)));
+    }
+    let capacity = u64::from(logical_pages)
+        .checked_mul(u64::from(page_tokens))
+        .ok_or(OpError::InvalidKernelParameter)?;
+    if pool_page_tokens != page_tokens
+        || value_page_tokens != page_tokens
+        || value_pages != physical_pages
+        || value_heads != kv_heads
+        || key_width != width
+        || !query_heads.is_multiple_of(kv_heads)
+        || u64::from(key_length) > capacity
+        || causal
+            && q_start
+                .checked_add(query_length)
+                .is_none_or(|end| end > key_length)
+        || output.layout.shape() != [query_heads, query_length, value_width]
+    {
+        return Err(OpError::InvalidKernelParameter);
+    }
+    Ok(())
+}
+
+fn check_paged_layouts(inputs: &[&Tensor], output: &Tensor) -> Result<(), OpError> {
+    for (input, tensor) in inputs.iter().enumerate() {
+        if !tensor.layout().is_contiguous() {
+            return Err(shape_error(Operand::Input(input)));
+        }
+    }
+    if !output.layout().is_contiguous() {
+        return Err(shape_error(Operand::Output));
+    }
+    Ok(())
+}
+
 const fn shape_error(operand: Operand) -> OpError {
     OpError::Shape { operand }
 }
@@ -2139,6 +2339,41 @@ mod tests {
             Err(OpError::Shape {
                 operand: Operand::Output
             })
+        );
+    }
+
+    #[test]
+    fn paged_operations_reject_strided_storage() {
+        let ordinary = tensor(1, DType::F32, &[2, 2], &[1, 2]);
+        let pool = tensor(2, DType::F32, &[2, 4, 2], &[8, 2, 1]);
+        let table = tensor(3, DType::U32, &[2, 2], &[2, 1]);
+        let generations = tensor(4, DType::U32, &[2], &[1]);
+        assert_eq!(
+            check_paged_copy(
+                &[&ordinary, &table, &generations],
+                &pool,
+                PagedCopyDirection::IntoPages,
+                0,
+                4,
+            ),
+            Err(shape_error(Operand::Input(0)))
+        );
+
+        let query = tensor(5, DType::F32, &[16, 2, 128], &[128, 2_048, 1]);
+        let keys = tensor(6, DType::F16, &[2, 4, 8, 128], &[4_096, 1_024, 128, 1]);
+        let values = tensor(7, DType::F16, &[2, 4, 8, 128], &[4_096, 1_024, 128, 1]);
+        let output = tensor(8, DType::F32, &[16, 2, 128], &[256, 128, 1]);
+        assert_eq!(
+            check_paged_sdpa(
+                &[&query, &keys, &values, &table, &generations],
+                &output,
+                1.0,
+                false,
+                0,
+                7,
+                4,
+            ),
+            Err(shape_error(Operand::Input(0)))
         );
     }
 

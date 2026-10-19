@@ -2957,6 +2957,9 @@ impl MetalBackend {
                 buffers
             }
             Op::Copy => self.encode_copy(encoder, table, dispatch, bindings, arguments)?,
+            Op::PagedCopy { .. } | Op::PagedSdpa { .. } => {
+                return Err(BackendError::UnsupportedOperation);
+            }
             Op::Matmul => self.encode_matmul(encoder, table, dispatch, bindings, arguments)?,
             Op::GatherMatmul => {
                 let (buffers, flag) =
@@ -6263,6 +6266,9 @@ impl MetalBackend {
                 }
             }
             Op::Copy => Self::size_copy_arguments(arguments)?,
+            Op::PagedCopy { .. } | Op::PagedSdpa { .. } => {
+                return Err(BackendError::UnsupportedOperation);
+            }
             Op::RmsNorm { .. } => {
                 for len in [112, 112, 112, 8] {
                     arguments.write(len)?;
@@ -6800,6 +6806,7 @@ fn supported_dispatch(dispatch: &Dispatch) -> bool {
     }
     match dispatch.op() {
         Op::Program(_) => dispatch.bound_program().is_some(),
+        Op::PagedCopy { .. } | Op::PagedSdpa { .. } => false,
         Op::Copy
         | Op::RmsNorm { .. }
         | Op::Argmax { .. }
@@ -6872,6 +6879,9 @@ pub(super) fn dispatch_kernel(dispatch: &Dispatch) -> Result<&'static str, Backe
             } else {
                 "copy_strided"
             }
+        }
+        Op::PagedCopy { .. } | Op::PagedSdpa { .. } => {
+            return Err(BackendError::UnsupportedOperation);
         }
         Op::RmsNorm { .. } => "rms_norm",
         Op::Argmax { chunk_width } => {

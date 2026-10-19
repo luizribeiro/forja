@@ -1209,6 +1209,9 @@ impl Backend for CpuBackend {
                     .ok_or(BackendError::ExecutionFailed)
                     .and_then(|program| self.execute_program(program)),
                 Op::Copy => self.execute_copy(dispatch.inputs(), dispatch.output()),
+                Op::PagedCopy { .. } | Op::PagedSdpa { .. } => {
+                    Err(BackendError::UnsupportedOperation)
+                }
                 Op::RmsNorm { eps } => {
                     self.execute_rms_norm(dispatch.inputs(), dispatch.output(), eps)
                 }
