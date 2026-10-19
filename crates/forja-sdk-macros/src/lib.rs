@@ -122,6 +122,7 @@ fn expand_engine(item: &ItemImpl) -> syn::Result<proc_macro2::TokenStream> {
 fn engine_guest_impl() -> proc_macro2::TokenStream {
     let load_config = engine_load_config();
     let decode_phases = engine_decode_phases();
+    let serving_info = serving_info();
     quote! {
         impl Guest for Component {
             fn describe() -> WitEngineInfo {
@@ -131,6 +132,7 @@ fn engine_guest_impl() -> proc_macro2::TokenStream {
                     max_context: info.max_context,
                     tap_layers: info.tap_layers,
                     router_layers: info.router_layers,
+                    serving: #serving_info,
                 }
             }
 
@@ -221,6 +223,21 @@ fn engine_guest_impl() -> proc_macro2::TokenStream {
                 .map_err(|_| compute::Error::Layout("token count exceeds u32".into()))?;
             ::forja_sdk::Tensor::from_slice(tokens, &[len]).map_err(wit_error)
         }
+    }
+}
+
+fn serving_info() -> proc_macro2::TokenStream {
+    quote! {
+        info.serving.map(|serving| bindings::exports::l9o::gpu::engine::ServingInfo {
+            page_tokens: serving.page_tokens,
+            planes: serving.planes.into_iter().map(|plane| bindings::exports::l9o::gpu::engine::CachePlane {
+                elements_per_token: plane.elements_per_token,
+                alignment: plane.alignment,
+                label: plane.label,
+            }).collect(),
+            active_lanes: serving.active_lanes,
+            max_context: serving.max_context,
+        })
     }
 }
 

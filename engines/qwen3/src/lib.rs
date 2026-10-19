@@ -483,6 +483,7 @@ impl Engine for ExportedQwen3 {
             max_context: MAX_CONTEXT,
             tap_layers: (1..=28).collect(),
             router_layers: Vec::new(),
+            serving: None,
         }
     }
 

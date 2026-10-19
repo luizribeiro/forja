@@ -11,6 +11,32 @@ pub struct EngineInfo {
     pub tap_layers: Vec<u32>,
     /// Layer indices available as router-logit taps.
     pub router_layers: Vec<u32>,
+    /// Optional geometry for host-owned paged serving storage.
+    pub serving: Option<ServingInfo>,
+}
+
+/// Model-independent geometry for host-owned paged serving storage.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ServingInfo {
+    /// Tokens stored in one logical page.
+    pub page_tokens: u32,
+    /// Cache planes stored for each logical page.
+    pub planes: Vec<CachePlane>,
+    /// Largest number of simultaneously active lanes.
+    pub active_lanes: u32,
+    /// Largest context accepted through paged serving.
+    pub max_context: u32,
+}
+
+/// One cache plane whose dtype is selected by the engine load profile.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CachePlane {
+    /// Scalar elements stored for each token.
+    pub elements_per_token: u64,
+    /// Required byte alignment.
+    pub alignment: u64,
+    /// Engine-owned diagnostic label.
+    pub label: String,
 }
 
 /// Optional model dimensions selected when an engine loads.

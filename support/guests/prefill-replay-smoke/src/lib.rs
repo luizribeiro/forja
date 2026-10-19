@@ -26,6 +26,7 @@ impl Engine for PrefillReplayEngine {
             max_context: MAX_CONTEXT,
             tap_layers: vec![0],
             router_layers: vec![],
+            serving: None,
         }
     }
 

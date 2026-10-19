@@ -8,7 +8,7 @@ wit_bindgen::generate!({
 });
 
 use exports::l9o::gpu::engine::{
-    DecodeIn, DecodeOut, EngineInfo, Guest, LoadConfig, StepIn, StepOut,
+    CachePlane, DecodeIn, DecodeOut, EngineInfo, Guest, LoadConfig, ServingInfo, StepIn, StepOut,
 };
 use l9o::gpu::compute::{Dtype, Error, Tensor, Weights};
 
@@ -21,6 +21,16 @@ impl Guest for Component {
             max_context: 33,
             tap_layers: vec![0],
             router_layers: vec![],
+            serving: Some(ServingInfo {
+                page_tokens: 4,
+                planes: vec![CachePlane {
+                    elements_per_token: 2,
+                    alignment: 4,
+                    label: "cache".to_owned(),
+                }],
+                active_lanes: 2,
+                max_context: 32,
+            }),
         }
     }
 

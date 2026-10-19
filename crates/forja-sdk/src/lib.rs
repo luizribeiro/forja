@@ -45,7 +45,13 @@
 //! #[export_engine]
 //! impl Engine for Llama {
 //!     fn describe() -> EngineInfo {
-//!         EngineInfo { vocab: VOCAB, max_context: 4096, tap_layers: vec![], router_layers: vec![] }
+//!         EngineInfo {
+//!             vocab: VOCAB,
+//!             max_context: 4096,
+//!             tap_layers: vec![],
+//!             router_layers: vec![],
+//!             serving: None,
+//!         }
 //!     }
 //!
 //!     fn load(weights: &Weights<'_>, _config: forja_sdk::EngineLoadConfig) -> Result<Self> {
@@ -114,9 +120,9 @@ use std::{error, fmt};
 
 pub use element::{Element, FloatElement};
 pub use engine::{
-    BeginDecodeInput, DecodeInput, DecodeOutput, Engine, EngineInfo, EngineLoadConfig,
-    FixedVariantPick, KvCacheFormat, SamplingParams, StepInput, StepOutput, VariantPickArm,
-    VariantRulePick,
+    BeginDecodeInput, CachePlane, DecodeInput, DecodeOutput, Engine, EngineInfo, EngineLoadConfig,
+    FixedVariantPick, KvCacheFormat, SamplingParams, ServingInfo, StepInput, StepOutput,
+    VariantPickArm, VariantRulePick,
 };
 pub use forja_sdk_macros::{Load, export_engine, kernel};
 pub use graph::{Dim, Graph, GraphResult, Param, Pos, capture, eval};

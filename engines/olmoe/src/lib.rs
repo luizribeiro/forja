@@ -445,6 +445,7 @@ impl Engine for Olmoe {
             max_context: MAX_CONTEXT,
             tap_layers: (1..=16).collect(),
             router_layers: (1..=16).collect(),
+            serving: None,
         }
     }
 

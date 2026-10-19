@@ -116,6 +116,32 @@ pub struct EngineInfo {
     pub tap_layers: Vec<u32>,
     /// Layers whose router logits can be returned by a step.
     pub router_layers: Vec<u32>,
+    /// Optional geometry for host-owned paged serving storage.
+    pub serving: Option<ServingInfo>,
+}
+
+/// Model-independent geometry for host-owned paged serving storage.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ServingInfo {
+    /// Tokens stored in one logical page.
+    pub page_tokens: u32,
+    /// Cache planes stored for each logical page.
+    pub planes: Vec<CachePlane>,
+    /// Largest number of simultaneously active lanes.
+    pub active_lanes: u32,
+    /// Largest context accepted through paged serving.
+    pub max_context: u32,
+}
+
+/// One cache plane whose dtype is selected by the engine load profile.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CachePlane {
+    /// Scalar elements stored for each token.
+    pub elements_per_token: u64,
+    /// Required byte alignment.
+    pub alignment: u64,
+    /// Engine-owned diagnostic label.
+    pub label: String,
 }
 
 /// Effective engine-side selections supplied during load.
@@ -634,6 +660,20 @@ where
             max_context: info.max_context,
             tap_layers: info.tap_layers,
             router_layers: info.router_layers,
+            serving: info.serving.map(|serving| ServingInfo {
+                page_tokens: serving.page_tokens,
+                planes: serving
+                    .planes
+                    .into_iter()
+                    .map(|plane| CachePlane {
+                        elements_per_token: plane.elements_per_token,
+                        alignment: plane.alignment,
+                        label: plane.label,
+                    })
+                    .collect(),
+                active_lanes: serving.active_lanes,
+                max_context: serving.max_context,
+            }),
         };
         self.info = Some(info.clone());
         Ok(info)

@@ -170,7 +170,13 @@ async fn run_engine(component: &Path, taps: bool, fixture: &str) -> wasmtime::Re
     let mut runner =
         EngineRunner::new(component, CpuBackend::new(), LIMITS, weights.path()).await?;
 
-    assert_eq!(runner.describe().await?.vocab, 4);
+    let info = runner.describe().await?;
+    assert_eq!(info.vocab, 4);
+    let serving = info.serving.expect("engine smoke declares paged serving");
+    assert_eq!(serving.page_tokens, 4);
+    assert_eq!(serving.planes[0].label, "cache");
+    assert_eq!(serving.active_lanes, 2);
+    assert_eq!(serving.max_context, 32);
     runner.load().await??;
     let output = runner
         .step(EngineStep {

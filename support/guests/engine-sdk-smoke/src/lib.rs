@@ -1,8 +1,8 @@
 //! Minimal engine component exported through the SDK macro.
 
 use forja_sdk::{
-    Engine, EngineInfo, EngineLoadConfig, KvCacheFormat, Result, StepInput, StepOutput, Tensor,
-    Weights, export_engine, nn::blocks::ChunkedPrefill,
+    CachePlane, Engine, EngineInfo, EngineLoadConfig, KvCacheFormat, Result, ServingInfo,
+    StepInput, StepOutput, Tensor, Weights, export_engine, nn::blocks::ChunkedPrefill,
 };
 
 const MAX_CONTEXT: u32 = 1_024;
@@ -21,6 +21,16 @@ impl Engine for ConstantEngine {
             max_context: MAX_CONTEXT,
             tap_layers: vec![0],
             router_layers: vec![],
+            serving: Some(ServingInfo {
+                page_tokens: 4,
+                planes: vec![CachePlane {
+                    elements_per_token: 2,
+                    alignment: 4,
+                    label: "cache".to_owned(),
+                }],
+                active_lanes: 2,
+                max_context: 32,
+            }),
         }
     }
 

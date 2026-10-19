@@ -62,6 +62,7 @@ impl Engine for ToyEngine {
             max_context: MAX_CONTEXT,
             tap_layers: vec![0, 1],
             router_layers: Vec::new(),
+            serving: None,
         }
     }
 

@@ -895,6 +895,7 @@ impl Engine for Qwen3Coder {
             max_context: MAX_CONTEXT,
             tap_layers: (1..=48).collect(),
             router_layers: (1..=48).collect(),
+            serving: None,
         }
     }
 
