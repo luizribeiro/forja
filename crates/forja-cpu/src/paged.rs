@@ -390,7 +390,7 @@ fn softmax(values: &mut [f32]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use forja_core::{PageTableEntry, PagedPlane};
+    use forja_core::{PagePool, PageTableEntry, PagedPlane};
 
     fn layout() -> PagedLayout {
         PagedLayout::new(
@@ -416,6 +416,42 @@ mod tests {
         let values = (0_u32..12).flat_map(u32::to_le_bytes).collect::<Vec<_>>();
         pool.copy_in(0, &table, 2, 6, &values).unwrap();
         assert_eq!(pool.copy_out(0, &table, 2, 6).unwrap(), values);
+    }
+
+    #[test]
+    fn cow_copy_preserves_shared_prefix_bytes() {
+        let layout = layout();
+        let pool = PagePool::new(layout.clone(), 4, 4_096).unwrap();
+        let mut original = pool.reserve(8).unwrap();
+        original.commit_write(7).unwrap();
+        let mut storage = CpuPagePool::new(layout, 4).unwrap();
+        let prefix = (0_u32..14).flat_map(u32::to_le_bytes).collect::<Vec<_>>();
+        storage
+            .copy_in(0, &original.table().unwrap(), 0, 7, &prefix)
+            .unwrap();
+        let sibling = original.fork(7).unwrap();
+
+        let copy = original.cow_tail().unwrap().unwrap();
+        assert_eq!(copy.token_count(), 3);
+        let tail = storage
+            .copy_out(0, &sibling.table().unwrap(), 4, 3)
+            .unwrap();
+        storage
+            .copy_in(0, &original.table().unwrap(), 4, 3, &tail)
+            .unwrap();
+
+        assert_eq!(
+            storage
+                .copy_out(0, &original.table().unwrap(), 0, 7)
+                .unwrap(),
+            prefix
+        );
+        assert_eq!(
+            storage
+                .copy_out(0, &sibling.table().unwrap(), 0, 7)
+                .unwrap(),
+            prefix
+        );
     }
 
     #[test]
