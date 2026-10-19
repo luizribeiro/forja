@@ -1601,7 +1601,7 @@ pub(crate) fn paged_copy(
     commands: &mut Commands,
     slot: &guest::paged_storage::BatchSlot,
     plane: u32,
-    start: u64,
+    start: Affine,
     len: u64,
     ordinary: &Handle,
 ) -> Result<()> {
@@ -1609,7 +1609,15 @@ pub(crate) fn paged_copy(
         commands,
         slot,
         0,
-        guest::paged_storage::PagedSpan { plane, start, len },
+        guest::paged_storage::PagedSpan {
+            plane,
+            start: guest::compute::Affine {
+                param: start.param,
+                scale: start.scale,
+                offset: start.offset,
+            },
+            len,
+        },
         ordinary,
         guest::paged_storage::CopyDirection::IntoPages,
     )
@@ -1626,6 +1634,8 @@ pub(crate) fn paged_sdpa(
     value_plane: u32,
     scale: f32,
     causal: bool,
+    q_start: Affine,
+    key_length: Affine,
 ) -> Result<()> {
     guest::paged_storage::record_paged_sdpa(
         commands,
@@ -1638,6 +1648,16 @@ pub(crate) fn paged_sdpa(
             value_plane,
             scale,
             causal,
+            q_start: guest::compute::Affine {
+                param: q_start.param,
+                scale: q_start.scale,
+                offset: q_start.offset,
+            },
+            key_length: guest::compute::Affine {
+                param: key_length.param,
+                scale: key_length.scale,
+                offset: key_length.offset,
+            },
         },
     )
     .map_err(|error| Error::new(format!("{error:?}")))

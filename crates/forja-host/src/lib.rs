@@ -3253,32 +3253,56 @@ impl<B: Backend + 'static> Host<B> {
     fn record_paged_dispatch(
         &mut self,
         commands: &Resource<CommandListEntry>,
-        operation: Op,
+        operation: (TemplateOp, Option<Op>),
         inputs: Vec<TensorEntry>,
         output: TensorEntry,
+        protected: Vec<BufferId>,
         usage: PagedUse,
     ) -> Result<(), compute::Error> {
+        let (template_op, concrete_op) = operation;
         let input_tensors = inputs.iter().map(|entry| &entry.tensor).collect::<Vec<_>>();
         let output_tensors = [&output.tensor];
+        let dispatch_space = tensor_space(inputs.iter().chain([&output]))?;
         let entry = self.table.get(commands).map_err(invalid_handle)?;
         if entry.recorded.len() >= self.limits.dispatches_per_list {
             return Err(quota("command list dispatch count exceeds the guest limit"));
         }
-        self.check_dispatch_work(operation, &input_tensors, &output_tensors)?;
+        merge_parameter_space(entry.space.as_ref(), dispatch_space.as_ref())?;
+        if let Some(operation) = concrete_op {
+            self.check_dispatch_work(operation, &input_tensors, &output_tensors)?;
+        }
+        let template_inputs = inputs
+            .iter()
+            .map(TensorEntry::template)
+            .collect::<Result<Vec<_>, _>>()?;
+        let template_output = output.template()?;
         let entry = self.table.get_mut(commands).map_err(invalid_handle)?;
-        entry
-            .commands
-            .dispatch(operation, &input_tensors, &output.tensor)
-            .map_err(guest_error)?;
-        let dispatch = entry
-            .commands
-            .last_dispatch()
-            .cloned()
-            .ok_or_else(|| guest_error(BackendError::ExecutionFailed))?;
-        entry
-            .recorded
-            .push(RecordedDispatch::Static(Box::new(dispatch)));
+        if let Some(operation) = concrete_op
+            && dispatch_space.is_none()
+        {
+            entry
+                .commands
+                .dispatch(operation, &input_tensors, &output.tensor)
+                .map_err(guest_error)?;
+            let dispatch = entry
+                .commands
+                .last_dispatch()
+                .cloned()
+                .ok_or_else(|| guest_error(BackendError::ExecutionFailed))?;
+            entry
+                .recorded
+                .push(RecordedDispatch::Static(Box::new(dispatch)));
+        } else {
+            entry.parameterized = true;
+            entry.recorded.push(RecordedDispatch::Operation {
+                op: template_op,
+                inputs: template_inputs,
+                outputs: vec![template_output],
+            });
+        }
+        entry.space = entry.space.take().or(dispatch_space);
         entry.access.record(&inputs, std::slice::from_ref(&output));
+        entry.protected.extend(protected);
         entry.retained.extend(inputs);
         entry.retained.push(output);
         usage.binding.used.store(true, Ordering::Release);
@@ -5673,8 +5697,7 @@ where
             let (pages, table, generations, _, usage) =
                 self.paged_slot_entries(&slot, lane, span.plane)?;
             let ordinary = self.entry(&ordinary)?.clone();
-            let start = u32::try_from(span.start)
-                .map_err(|_| compute::Error::Layout("paged copy start exceeds u32".to_owned()))?;
+            let start = core_affine(span.start);
             let tokens = ordinary
                 .tensor
                 .layout()
@@ -5687,29 +5710,48 @@ where
                     "paged copy span length does not match the tensor".to_owned(),
                 ));
             }
-            let operation = Op::PagedCopy {
-                direction: match direction {
-                    paged_storage::CopyDirection::IntoPages => PagedCopyDirection::IntoPages,
-                    paged_storage::CopyDirection::OutOfPages => PagedCopyDirection::OutOfPages,
-                },
-                start,
-                page_tokens: pages.tensor.layout().shape()[1],
+            let direction = match direction {
+                paged_storage::CopyDirection::IntoPages => PagedCopyDirection::IntoPages,
+                paged_storage::CopyDirection::OutOfPages => PagedCopyDirection::OutOfPages,
             };
+            let page_tokens = pages.tensor.layout().shape()[1];
+            let template = TemplateOp::paged_copy(direction, start, page_tokens);
+            let concrete = start.is_constant().then_some(Op::PagedCopy {
+                direction,
+                start: span.start.offset,
+                page_tokens,
+            });
             match direction {
-                paged_storage::CopyDirection::IntoPages => self.record_paged_dispatch(
-                    &commands,
-                    operation,
-                    vec![ordinary, table, generations],
-                    pages,
-                    usage,
-                ),
-                paged_storage::CopyDirection::OutOfPages => self.record_paged_dispatch(
-                    &commands,
-                    operation,
-                    vec![pages, table, generations],
-                    ordinary,
-                    usage,
-                ),
+                PagedCopyDirection::IntoPages => {
+                    let protected = vec![
+                        pages.tensor.buffer(),
+                        table.tensor.buffer(),
+                        generations.tensor.buffer(),
+                    ];
+                    self.record_paged_dispatch(
+                        &commands,
+                        (template, concrete),
+                        vec![ordinary, table, generations],
+                        pages,
+                        protected,
+                        usage,
+                    )
+                }
+                PagedCopyDirection::OutOfPages => {
+                    let protected = vec![
+                        pages.tensor.buffer(),
+                        table.tensor.buffer(),
+                        generations.tensor.buffer(),
+                    ];
+                    self.record_paged_dispatch(
+                        &commands,
+                        (template, concrete),
+                        vec![pages, table, generations],
+                        ordinary,
+                        protected,
+                        usage,
+                    )
+                }
             }
         })();
         std::future::ready(Ok(result))
@@ -5758,16 +5800,45 @@ where
             let q_start = key_length.checked_sub(query_tokens).ok_or_else(|| {
                 compute::Error::Layout("paged query exceeds the key length".to_owned())
             })?;
+            let affine_q_start = core_affine(config.q_start);
+            let affine_key_length = core_affine(config.key_length);
+            if config.q_start.param != config.key_length.param
+                || config.q_start.scale != config.key_length.scale
+                || config.q_start.offset.checked_add(query_tokens) != Some(config.key_length.offset)
+                || (affine_q_start.is_constant()
+                    && (config.q_start.offset != q_start || config.key_length.offset != key_length))
+            {
+                return Err(compute::Error::Layout(
+                    "paged attention positions do not match the bound sequence".to_owned(),
+                ));
+            }
+            let page_tokens = page_shape[1];
+            let contiguous_entries = snapshot.table().is_contiguous();
+            let template = TemplateOp::paged_sdpa(
+                config.scale,
+                config.causal,
+                affine_q_start,
+                affine_key_length,
+                page_tokens,
+                contiguous_entries,
+            );
+            let concrete = affine_q_start.is_constant().then_some(Op::PagedSdpa {
+                scale: config.scale,
+                causal: config.causal,
+                q_start,
+                key_length,
+                page_tokens,
+                contiguous_entries,
+            });
+            let protected = vec![
+                key.tensor.buffer(),
+                value.tensor.buffer(),
+                table.tensor.buffer(),
+                generations.tensor.buffer(),
+            ];
             self.record_paged_dispatch(
                 &commands,
-                Op::PagedSdpa {
-                    scale: config.scale,
-                    causal: config.causal,
-                    q_start,
-                    key_length,
-                    page_tokens: page_shape[1],
-                    contiguous_entries: snapshot.table().is_contiguous(),
-                },
+                (template, concrete),
                 vec![
                     query,
                     reshape_plane(key)?,
@@ -5776,6 +5847,7 @@ where
                     generations,
                 ],
                 output,
+                protected,
                 usage,
             )
         })();
@@ -6550,7 +6622,7 @@ mod tests {
             0,
             paged_storage::PagedSpan {
                 plane: 0,
-                start: 0,
+                start: wit_affine(None, 0, 0),
                 len: 1,
             },
             Resource::new_borrow(ordinary.rep()),
@@ -6571,6 +6643,8 @@ mod tests {
                 value_plane: 1,
                 scale: 1.0,
                 causal: false,
+                q_start: wit_affine(None, 0, 0),
+                key_length: wit_affine(None, 0, 1),
             },
         )
         .await
@@ -6624,7 +6698,7 @@ mod tests {
             0,
             paged_storage::PagedSpan {
                 plane: 0,
-                start: 0,
+                start: wit_affine(None, 0, 0),
                 len: 1,
             },
             Resource::new_borrow(ordinary.rep()),
@@ -6645,6 +6719,8 @@ mod tests {
                 value_plane: 1,
                 scale: 1.0,
                 causal: true,
+                q_start: wit_affine(None, 0, 0),
+                key_length: wit_affine(None, 0, 1),
             },
         )
         .await

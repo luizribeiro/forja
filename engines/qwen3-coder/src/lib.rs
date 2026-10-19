@@ -581,13 +581,13 @@ impl LayerCache<'_> {
         match self {
             Self::Contiguous(cache) => cache.attention(query, key, value, start, end, selection),
             Self::Paged(cache, KvCacheFormat::F16) => {
-                paged_cache_attention::<f16>(cache, query, key, value, start.value())
+                paged_cache_attention::<f16>(cache, query, key, value, start, end)
             }
             Self::Paged(cache, KvCacheFormat::Bf16) => {
-                paged_cache_attention::<bf16>(cache, query, key, value, start.value())
+                paged_cache_attention::<bf16>(cache, query, key, value, start, end)
             }
             Self::Paged(cache, KvCacheFormat::F32) => {
-                paged_cache_attention::<f32>(cache, query, key, value, start.value())
+                paged_cache_attention::<f32>(cache, query, key, value, start, end)
             }
         }
     }
@@ -598,12 +598,13 @@ fn paged_cache_attention<C: forja_sdk::Element>(
     query: &Tensor<f32>,
     key: &Tensor<f32>,
     value: &Tensor<f32>,
-    start: u32,
+    start: &Dim,
+    end: &Dim,
 ) -> Result<Tensor<f32>> {
     let cached_key = key.to_dtype::<C>()?;
     let cached_value = value.to_dtype::<C>()?;
     cache.append(&cached_key, &cached_value, start)?;
-    cache.attention(query, ATTENTION_SCALE)
+    cache.attention(query, ATTENTION_SCALE, start, end)
 }
 
 enum CacheStorage {

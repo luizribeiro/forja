@@ -1,6 +1,6 @@
 use std::marker::PhantomData;
 
-use crate::{Element, Error, Result, Tensor};
+use crate::{Dim, Element, Error, Result, Tensor};
 
 /// A borrowed capability for the host-owned paged-storage pool.
 pub struct PagedPool<'a> {
@@ -110,7 +110,12 @@ impl PagedCache<'_> {
     /// # Errors
     ///
     /// Returns an error for incompatible shapes, overflow, or refused host work.
-    pub fn append<T: Element>(&self, key: &Tensor<T>, value: &Tensor<T>, start: u32) -> Result<()> {
+    pub fn append<T: Element>(
+        &self,
+        key: &Tensor<T>,
+        value: &Tensor<T>,
+        start: &Dim,
+    ) -> Result<()> {
         let [tokens, heads, width]: [u32; 3] = key
             .shape()
             .try_into()
@@ -124,12 +129,14 @@ impl PagedCache<'_> {
         let key = key.contiguous()?.reshape(&[tokens, elements])?;
         let value = value.contiguous()?.reshape(&[tokens, elements])?;
         #[cfg(target_family = "wasm")]
+        let start = crate::graph::affine(start)?;
+        #[cfg(target_family = "wasm")]
         crate::graph::record_import(|commands| {
             crate::sys::paged_copy(
                 commands,
                 &self._set._slot,
                 self.key_plane,
-                u64::from(start),
+                start,
                 u64::from(tokens),
                 key.handle(),
             )?;
@@ -137,7 +144,7 @@ impl PagedCache<'_> {
                 commands,
                 &self._set._slot,
                 self.value_plane,
-                u64::from(start),
+                start,
                 u64::from(tokens),
                 value.handle(),
             )
@@ -155,7 +162,13 @@ impl PagedCache<'_> {
     /// # Errors
     ///
     /// Returns an error for incompatible shapes, overflow, or refused host work.
-    pub fn attention<T: Element>(&self, query: &Tensor<T>, scale: f32) -> Result<Tensor<T>> {
+    pub fn attention<T: Element>(
+        &self,
+        query: &Tensor<T>,
+        scale: f32,
+        start: &Dim,
+        end: &Dim,
+    ) -> Result<Tensor<T>> {
         let [sequence, heads, width]: [u32; 3] = query
             .shape()
             .try_into()
@@ -165,6 +178,8 @@ impl PagedCache<'_> {
             .ok_or_else(|| Error::loading("paged attention width overflowed"))?;
         let query = query.permute(&[1, 0, 2])?.contiguous()?;
         let output = Tensor::zeros(&[heads, sequence, width])?;
+        #[cfg(target_family = "wasm")]
+        let (start, end) = (crate::graph::affine(start)?, crate::graph::affine(end)?);
         #[cfg(target_family = "wasm")]
         crate::graph::record_import(|commands| {
             crate::sys::paged_sdpa(
@@ -176,10 +191,12 @@ impl PagedCache<'_> {
                 self.value_plane,
                 scale,
                 true,
+                start,
+                end,
             )
         })?;
         #[cfg(not(target_family = "wasm"))]
-        let _ = (&query, scale);
+        let _ = (&query, scale, start, end);
         output
             .permute(&[1, 0, 2])?
             .contiguous()?
