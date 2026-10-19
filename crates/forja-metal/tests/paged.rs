@@ -5,7 +5,7 @@
 
 use forja_core::{
     Backend, BackendDispatchData, BackendError, CommandList, DType, Op, PagePool,
-    PagedCopyDirection, PagedLayout, PagedPlane, Submission,
+    PagedCopyDirection, PagedLayout, PagedPlane, Submission, ViewOp,
 };
 use half::{bf16, f16};
 
@@ -196,10 +196,13 @@ fn metal_in_flight_paged_read_defers_page_reuse() {
     allocator.observe_completion(serial).unwrap();
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_sdpa<B: Backend>(
     backend: &B,
     dtype: DType,
     key_length: u32,
+    query_length: u32,
+    causal: bool,
     contiguous: bool,
     query_heads: u32,
     kv_heads: u32,
@@ -239,15 +242,15 @@ fn run_sdpa<B: Backend>(
                 ((token.wrapping_mul(5) + seed.wrapping_mul(11)) % 97) as f32 / 96.0 - 0.5;
         }
     }
-    let query_values = (0..query_heads * WIDTH)
+    let query_values = (0..query_heads * query_length * WIDTH)
         .map(|index| ((index * 17) % 89) as f32 / 88.0 - 0.5)
         .collect::<Vec<_>>();
-    let query = backend.alloc(DType::F32, &[query_heads, 1, WIDTH])?;
+    let query = backend.alloc(DType::F32, &[query_heads, query_length, WIDTH])?;
     let key = backend.alloc(dtype, &[physical_pages, PAGE_TOKENS, kv_heads, WIDTH])?;
     let value = backend.alloc(dtype, &[physical_pages, PAGE_TOKENS, kv_heads, WIDTH])?;
     let table = backend.alloc(DType::U32, &[logical_pages, 2])?;
     let generation_tensor = backend.alloc(DType::U32, &[physical_pages])?;
-    let output = backend.alloc(DType::F32, &[query_heads, 1, WIDTH])?;
+    let output = backend.alloc(DType::F32, &[query_heads, query_length, WIDTH])?;
     backend.write(&query, &encode(&query_values, DType::F32))?;
     backend.write(&key, &encode(&keys, dtype))?;
     backend.write(&value, &encode(&values, dtype))?;
@@ -258,7 +261,7 @@ fn run_sdpa<B: Backend>(
         .dispatch(
             Op::PagedSdpa {
                 scale: 1.0 / (WIDTH as f32).sqrt(),
-                causal: false,
+                causal,
                 q_start: 0,
                 key_length,
                 page_tokens: PAGE_TOKENS,
@@ -278,8 +281,8 @@ fn metal_paged_sdpa_matches_cpu_at_real_shapes() {
     let metal = forja_metal::MetalBackend::new().unwrap();
     for dtype in [DType::F32, DType::F16, DType::BF16] {
         for length in [1, 7, 33, 4_097] {
-            let reference = run_sdpa(&cpu, dtype, length, false, 16, 8).unwrap();
-            let candidate = run_sdpa(&metal, dtype, length, false, 16, 8).unwrap();
+            let reference = run_sdpa(&cpu, dtype, length, 1, false, false, 16, 8).unwrap();
+            let candidate = run_sdpa(&metal, dtype, length, 1, false, false, 16, 8).unwrap();
             let error = forja_testing::normwise_relative_error(&reference, &candidate);
             assert!(
                 error <= forja_testing::dtype_tolerance(dtype).unwrap(),
@@ -295,8 +298,10 @@ fn metal_paged_gqa_two_pass_matches_cpu() {
     let metal = forja_metal::MetalBackend::new().unwrap();
     for length in [512, 4_000] {
         for contiguous in [false, true] {
-            let reference = run_sdpa(&cpu, DType::F16, length, contiguous, 32, 4).unwrap();
-            let candidate = run_sdpa(&metal, DType::F16, length, contiguous, 32, 4).unwrap();
+            let reference =
+                run_sdpa(&cpu, DType::F16, length, 1, false, contiguous, 32, 4).unwrap();
+            let candidate =
+                run_sdpa(&metal, DType::F16, length, 1, false, contiguous, 32, 4).unwrap();
             let error = forja_testing::normwise_relative_error(&reference, &candidate);
             assert!(
                 error <= forja_testing::F16_TOLERANCE,
@@ -310,8 +315,94 @@ fn metal_paged_gqa_two_pass_matches_cpu() {
 fn metal_paged_sdpa_uses_contiguous_entry_path() {
     let cpu = forja_cpu::CpuBackend::new();
     let metal = forja_metal::MetalBackend::new().unwrap();
-    let reference = run_sdpa(&cpu, DType::F16, 129, true, 16, 8).unwrap();
-    let candidate = run_sdpa(&metal, DType::F16, 129, true, 16, 8).unwrap();
+    let reference = run_sdpa(&cpu, DType::F16, 129, 1, false, true, 16, 8).unwrap();
+    let candidate = run_sdpa(&metal, DType::F16, 129, 1, false, true, 16, 8).unwrap();
+    assert!(
+        forja_testing::normwise_relative_error(&reference, &candidate)
+            <= forja_testing::F16_TOLERANCE
+    );
+}
+
+#[test]
+fn metal_paged_sdpa_matches_causal_prefill() {
+    let cpu = forja_cpu::CpuBackend::new();
+    let metal = forja_metal::MetalBackend::new().unwrap();
+    let reference = run_sdpa(&cpu, DType::F16, 11, 11, true, true, 32, 4).unwrap();
+    let candidate = run_sdpa(&metal, DType::F16, 11, 11, true, true, 32, 4).unwrap();
+    assert!(
+        forja_testing::normwise_relative_error(&reference, &candidate)
+            <= forja_testing::F16_TOLERANCE
+    );
+}
+
+#[test]
+fn metal_paged_copy_then_sdpa_matches_cpu() {
+    fn run<B: Backend>(backend: &B) -> Result<Vec<f32>, BackendError> {
+        const TOKENS: u32 = 11;
+        const PAGE_TOKENS: u32 = 64;
+        const QUERY_HEADS: u32 = 32;
+        const KV_HEADS: u32 = 4;
+        const WIDTH: u32 = 128;
+        let elements = KV_HEADS * WIDTH;
+        let ordinary_values = (0..TOKENS * elements)
+            .map(|index| ((index * 7) % 101) as f32 / 100.0 - 0.5)
+            .collect::<Vec<_>>();
+        let query_values = (0..QUERY_HEADS * TOKENS * WIDTH)
+            .map(|index| ((index * 17) % 89) as f32 / 88.0 - 0.5)
+            .collect::<Vec<_>>();
+        let ordinary = backend.alloc(DType::F16, &[TOKENS, elements])?;
+        let key_rows = backend.alloc(DType::F16, &[1, PAGE_TOKENS, elements])?;
+        let value_rows = backend.alloc(DType::F16, &[1, PAGE_TOKENS, elements])?;
+        let key = backend.view(
+            &key_rows,
+            ViewOp::Reshape(vec![1, PAGE_TOKENS, KV_HEADS, WIDTH]),
+        )?;
+        let value = backend.view(
+            &value_rows,
+            ViewOp::Reshape(vec![1, PAGE_TOKENS, KV_HEADS, WIDTH]),
+        )?;
+        let table = backend.alloc(DType::U32, &[1, 2])?;
+        let generations = backend.alloc(DType::U32, &[1])?;
+        let query = backend.alloc(DType::F32, &[QUERY_HEADS, TOKENS, WIDTH])?;
+        let output = backend.alloc(DType::F32, &[QUERY_HEADS, TOKENS, WIDTH])?;
+        backend.write(&ordinary, &encode(&ordinary_values, DType::F16))?;
+        backend.write(&table, &table_bytes(&[(0, 1)]))?;
+        backend.write(&generations, &generation_bytes(&[1]))?;
+        backend.write(&query, &encode(&query_values, DType::F32))?;
+        let mut commands = CommandList::new();
+        for pool in [&key_rows, &value_rows] {
+            commands
+                .dispatch(
+                    Op::PagedCopy {
+                        direction: PagedCopyDirection::IntoPages,
+                        start: 0,
+                        page_tokens: PAGE_TOKENS,
+                    },
+                    &[&ordinary, &table, &generations],
+                    pool,
+                )
+                .map_err(|_| BackendError::InvalidInput)?;
+        }
+        commands
+            .dispatch(
+                Op::PagedSdpa {
+                    scale: 1.0 / (WIDTH as f32).sqrt(),
+                    causal: true,
+                    q_start: 0,
+                    key_length: TOKENS,
+                    page_tokens: PAGE_TOKENS,
+                    contiguous_entries: true,
+                },
+                &[&query, &key, &value, &table, &generations],
+                &output,
+            )
+            .map_err(|_| BackendError::InvalidInput)?;
+        backend.submit(commands)?.wait()?;
+        backend.read(&output).map(|bytes| decode_f32(&bytes))
+    }
+
+    let reference = run(&forja_cpu::CpuBackend::new()).unwrap();
+    let candidate = run(&forja_metal::MetalBackend::new().unwrap()).unwrap();
     assert!(
         forja_testing::normwise_relative_error(&reference, &candidate)
             <= forja_testing::F16_TOLERANCE
