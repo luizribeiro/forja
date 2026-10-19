@@ -85,7 +85,9 @@ pub struct Dim {
 }
 
 impl Dim {
-    pub(crate) const fn value(&self) -> u32 {
+    /// Returns the concrete value used for the current trace or lazy operation.
+    #[must_use]
+    pub const fn value(&self) -> u32 {
         self.value
     }
 
