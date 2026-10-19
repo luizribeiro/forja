@@ -1883,7 +1883,7 @@ pub struct BatchSlotEntry {
 }
 
 struct PagedBinding {
-    _pool: PagePool,
+    pool: PagePool,
     banks: Arc<PagedSlotBanks>,
     sequence: Mutex<Option<Arc<Mutex<PagedSequence>>>>,
     used: AtomicBool,
@@ -2145,6 +2145,7 @@ pub struct CommandListEntry {
     retained: Vec<TensorEntry>,
     retained_kernels: Vec<KernelEntry>,
     retained_epilogues: Vec<EpilogueEntry>,
+    paged: Vec<PagedUse>,
 }
 
 /// Host-owned state behind a guest graph resource.
@@ -2155,6 +2156,7 @@ pub struct GraphEntry {
     retained: Vec<TensorEntry>,
     retained_kernels: Vec<KernelEntry>,
     retained_epilogues: Vec<EpilogueEntry>,
+    paged: Vec<PagedUse>,
     _lease: GraphLease,
 }
 
@@ -2292,7 +2294,7 @@ impl<B: Backend + 'static> Host<B> {
         })?;
         self.check_byte_allocation(charge)?;
         let binding = Arc::new(PagedBinding {
-            _pool: pool,
+            pool,
             banks: Arc::clone(&banks),
             sequence: Mutex::new(None),
             used: AtomicBool::new(false),
@@ -3156,6 +3158,7 @@ impl<B: Backend + 'static> Host<B> {
                 retained: Vec::new(),
                 retained_kernels: Vec::new(),
                 retained_epilogues: Vec::new(),
+                paged: Vec::new(),
             })
             .map_err(invalid_handle)
     }
@@ -3639,6 +3642,7 @@ impl<B: Backend + 'static> Host<B> {
             retained: Vec::new(),
             retained_kernels: Vec::new(),
             retained_epilogues: Vec::new(),
+            paged: entry.paged.clone(),
             _lease: lease,
         };
         let resource = match self.table.push(graph_entry) {
@@ -3652,6 +3656,7 @@ impl<B: Backend + 'static> Host<B> {
         graph.retained = entry.retained;
         graph.retained_kernels = entry.retained_kernels;
         graph.retained_epilogues = entry.retained_epilogues;
+        graph.paged = entry.paged;
         Ok(resource)
     }
 
@@ -3681,6 +3686,7 @@ impl<B: Backend + 'static> Host<B> {
             work: SubmissionWork::Commands(entry.commands),
             access: entry.access,
             retained: entry.retained,
+            paged: entry.paged,
             flight: None,
             timeout: self.limits.submission_timeout,
             gpu_time_budget_ns: duration_ns(self.limits.gpu_time_budget),
@@ -3733,6 +3739,7 @@ impl<B: Backend + 'static> Host<B> {
             },
             access: entry.access.clone(),
             retained: Vec::new(),
+            paged: entry.paged.clone(),
             flight: Some(flight),
             timeout: self.limits.submission_timeout,
             gpu_time_budget_ns: duration_ns(self.limits.gpu_time_budget),
@@ -4374,6 +4381,7 @@ struct SubmitRequest<B: Backend> {
     work: SubmissionWork,
     access: SubmissionAccess,
     retained: Vec<TensorEntry>,
+    paged: Vec<PagedUse>,
     flight: Option<ReplayFlight>,
     timeout: Duration,
     gpu_time_budget_ns: u64,
@@ -4393,6 +4401,73 @@ enum SubmissionWork {
         graph: Arc<PreparedGraph>,
         values: Vec<u32>,
     },
+}
+
+#[derive(Clone)]
+struct PagedUse {
+    binding: Arc<PagedBinding>,
+    bank: usize,
+}
+
+impl std::fmt::Debug for PagedUse {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PagedUse")
+            .field("bank", &self.bank)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PagedUse {
+    fn mark_all(usages: &[Self], serial: Option<u64>) -> Result<(), BackendError> {
+        serial.map_or(Ok(()), |serial| {
+            usages
+                .iter()
+                .try_for_each(|usage| usage.mark_submitted(serial))
+        })
+    }
+
+    fn observe_all(
+        usages: &[Self],
+        serial: Option<u64>,
+        completed: bool,
+    ) -> Result<(), BackendError> {
+        if !completed {
+            return Ok(());
+        }
+        serial.map_or(Ok(()), |serial| {
+            usages
+                .iter()
+                .try_for_each(|usage| usage.observe_completion(serial))
+        })
+    }
+
+    fn mark_submitted(&self, serial: u64) -> Result<(), BackendError> {
+        let sequence = self
+            .binding
+            .sequence
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?
+            .as_ref()
+            .cloned()
+            .ok_or(BackendError::ExecutionFailed)?;
+        sequence
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?
+            .mark_submitted(serial)
+            .map_err(|_| BackendError::ExecutionFailed)?;
+        self.binding
+            .banks
+            .mark_submitted(self.bank, serial)
+            .map_err(|_| BackendError::ExecutionFailed)
+    }
+
+    fn observe_completion(&self, serial: u64) -> Result<(), BackendError> {
+        self.binding
+            .pool
+            .observe_completion(serial)
+            .map_err(|_| BackendError::ExecutionFailed)
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -4762,6 +4837,7 @@ where
                 work,
                 access,
                 retained,
+                paged,
                 flight,
                 timeout,
                 gpu_time_budget_ns: _,
@@ -4786,11 +4862,15 @@ where
                                 .unwrap_or(BackendError::ExecutionFailed);
                             Err(error)
                         }
-                        Ok(submission) => Ok((submission, reservation, taint)),
+                        Ok(submission) => {
+                            let serial = submission.completion_serial();
+                            let marked = PagedUse::mark_all(&paged, serial);
+                            Ok((submission, reservation, taint, serial, marked))
+                        }
                     },
                 },
             };
-            let (submission, reservation, taint) = match submitted {
+            let (submission, reservation, taint, serial, marked) = match submitted {
                 Ok(submitted) => {
                     publish_queued_submission(&queued_submissions, started);
                     submitted
@@ -4811,26 +4891,21 @@ where
             };
             let wait_started = Instant::now();
             let wait = submission.wait_timeout(timeout);
+            let observed =
+                PagedUse::observe_all(&paged, serial, wait != Err(BackendError::Timeout));
             let wall_time = duration_ns(wait_started.elapsed()).max(1);
             let gpu_time = submission.gpu_time().map(duration_ns);
             let submission_profile = submission.profile();
-            let charged = if wait == Err(BackendError::Timeout) {
-                reservation.amount()
-            } else {
-                gpu_time.unwrap_or(wall_time).max(1)
-            };
+            let charged = submission_charge(&wait, reservation.amount(), gpu_time, wall_time);
             let accounting = reservation.settle(charged);
-            let result = match (wait, accounting) {
-                (Err(error), _) | (Ok(()), Err(error)) => Err(error),
-                (Ok(()), Ok(())) => {
-                    if let (Some(target), Some(submission_profile)) = (&profile, submission_profile)
-                        && let Ok(mut target) = target.lock()
-                    {
-                        target.submission = Some(submission_profile);
-                    }
-                    Ok(gpu_time)
+            let result = combine_submission_results(wait, accounting, marked, observed).map(|()| {
+                if let (Some(target), Some(submission_profile)) = (&profile, submission_profile)
+                    && let Ok(mut target) = target.lock()
+                {
+                    target.submission = Some(submission_profile);
                 }
-            };
+                gpu_time
+            });
             let release = release_retained(backend.as_ref(), retained, profile.as_ref());
             let result = combine_submission_release(result, release);
             let result = match &flight {
@@ -4864,6 +4939,34 @@ fn submit_work<B: Backend>(
             backend.replay_profiled(&graph, values)
         }
         SubmissionWork::Replay { graph, values } => backend.replay(&graph, values),
+    }
+}
+
+fn combine_submission_results(
+    wait: Result<(), BackendError>,
+    accounting: Result<(), BackendError>,
+    marked: Result<(), BackendError>,
+    observed: Result<(), BackendError>,
+) -> Result<(), BackendError> {
+    match (wait, accounting, marked, observed) {
+        (Err(error), _, _, _)
+        | (Ok(()), Err(error), _, _)
+        | (Ok(()), Ok(()), Err(error), _)
+        | (Ok(()), Ok(()), Ok(()), Err(error)) => Err(error),
+        (Ok(()), Ok(()), Ok(()), Ok(())) => Ok(()),
+    }
+}
+
+fn submission_charge(
+    wait: &Result<(), BackendError>,
+    reserved: u64,
+    gpu_time: Option<u64>,
+    wall_time: u64,
+) -> u64 {
+    if *wait == Err(BackendError::Timeout) {
+        reserved
+    } else {
+        gpu_time.unwrap_or(wall_time).max(1)
     }
 }
 
@@ -6264,6 +6367,50 @@ mod tests {
             host.table.get(&pool).unwrap().pool.memory_usage().unwrap(),
             before_memory
         );
+    }
+
+    #[test]
+    fn paged_submission_completion_releases_retired_pages_but_timeout_does_not() {
+        let pool = PagePool::new(
+            PagedLayout::new(
+                4,
+                vec![PagedPlane {
+                    dtype: DType::F32,
+                    elements_per_token: 1,
+                    alignment: 4,
+                    label: "test".to_owned(),
+                }],
+            )
+            .unwrap(),
+            1,
+            1_024,
+        )
+        .unwrap();
+        let mut sequence = pool.reserve(4).unwrap();
+        sequence.commit_write(4).unwrap();
+        let old_page = sequence.table().unwrap().resolve(0).unwrap();
+        let sequence = Arc::new(Mutex::new(sequence));
+        let banks = Arc::new(forja_core::PagedSlotBanks::new(pool.clone(), 1, 1).unwrap());
+        banks.bind(0, 0, &sequence.lock().unwrap()).unwrap();
+        let binding = Arc::new(super::PagedBinding {
+            pool: pool.clone(),
+            banks,
+            sequence: Mutex::new(Some(Arc::clone(&sequence))),
+            used: std::sync::atomic::AtomicBool::new(false),
+        });
+        let usage = super::PagedUse { binding, bank: 0 };
+        super::PagedUse::mark_all(std::slice::from_ref(&usage), Some(7)).unwrap();
+        *usage.binding.sequence.lock().unwrap() = None;
+        drop(sequence);
+
+        super::PagedUse::observe_all(std::slice::from_ref(&usage), Some(7), false).unwrap();
+        let replacement = pool.reserve(4).unwrap();
+        assert_ne!(replacement.table().unwrap().resolve(0).unwrap(), old_page);
+        drop(replacement);
+
+        super::PagedUse::observe_all(std::slice::from_ref(&usage), Some(7), true).unwrap();
+        let reused = pool.reserve(4).unwrap();
+        assert_eq!(reused.table().unwrap().resolve(0).unwrap(), old_page);
     }
 
     fn doubling_program(value: f32) -> compute::ProgramSource {
