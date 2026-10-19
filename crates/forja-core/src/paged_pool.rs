@@ -255,11 +255,17 @@ impl PagePool {
     fn retain(&self, pages: &[PageLease]) -> Result<(), PagePoolError> {
         let mut state = self.lock()?;
         for lease in pages {
+            live_page_mut(&mut state, *lease)?
+                .references
+                .checked_add(1)
+                .ok_or(PagePoolError::ArithmeticOverflow)?;
+        }
+        for lease in pages {
             let page = live_page_mut(&mut state, *lease)?;
             page.references = page
                 .references
                 .checked_add(1)
-                .ok_or(PagePoolError::ArithmeticOverflow)?;
+                .ok_or(PagePoolError::CorruptState)?;
         }
         Ok(())
     }
@@ -639,57 +645,99 @@ impl PagedSequence {
         PageTable::new(entries, generations).map_err(|_| PagePoolError::CorruptState)
     }
 
+    /// Returns the allocator reference count for each page in sequence order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for stale internal allocator state.
+    pub fn page_reference_counts(&self) -> Result<Vec<u32>, PagePoolError> {
+        let mut state = self.pool.lock()?;
+        self.pages
+            .iter()
+            .map(|&page| Ok(live_page_mut(&mut state, page)?.references))
+            .collect()
+    }
+
     /// Shares the committed prefix with a sibling sequence.
     ///
     /// # Errors
     ///
     /// Returns an error when the prefix exceeds the committed length or refcounts overflow.
     pub fn fork(&mut self, prefix_tokens: u64) -> Result<Self, PagePoolError> {
+        self.fork_reserved(prefix_tokens, prefix_tokens)
+    }
+
+    /// Shares a committed prefix while atomically reserving private suffix capacity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when lengths are invalid, quota is insufficient, or refcounts overflow.
+    pub fn fork_reserved(
+        &mut self,
+        prefix_tokens: u64,
+        reserved_tokens: u64,
+    ) -> Result<Self, PagePoolError> {
         if prefix_tokens > self.logical_len {
             return Err(PagePoolError::UnreservedWrite);
         }
-        let page_count = pages_for(prefix_tokens, self.pool.layout().page_tokens())?;
-        let count = usize::try_from(page_count).map_err(|_| PagePoolError::ArithmeticOverflow)?;
-        let pages = self
+        if reserved_tokens < prefix_tokens {
+            return Err(PagePoolError::UnreservedWrite);
+        }
+        let shared_pages = pages_for(prefix_tokens, self.pool.layout().page_tokens())?;
+        let reserved_pages = pages_for(reserved_tokens, self.pool.layout().page_tokens())?;
+        let private_pages = reserved_pages
+            .checked_sub(shared_pages)
+            .ok_or(PagePoolError::ArithmeticOverflow)?;
+        let shared_count =
+            usize::try_from(shared_pages).map_err(|_| PagePoolError::ArithmeticOverflow)?;
+        let mut pages = self
             .pages
-            .get(..count)
+            .get(..shared_count)
             .ok_or(PagePoolError::CorruptState)?
             .to_vec();
-        let table_bytes = page_count
+        let table_bytes = reserved_pages
             .checked_mul(8)
             .ok_or(PagePoolError::ArithmeticOverflow)?;
-        let mut state = self.pool.lock()?;
-        let projected = state
-            .memory
-            .total()
-            .and_then(|bytes| bytes.checked_add(table_bytes))
-            .ok_or(PagePoolError::ArithmeticOverflow)?;
-        if projected > self.pool.inner.byte_limit {
-            return Err(PagePoolError::QuotaExceeded);
+        {
+            let state = self.pool.lock()?;
+            preflight_pages(&self.pool, &state, private_pages, table_bytes)?;
         }
-        for lease in &pages {
-            let page = live_page_mut(&mut state, *lease)?;
-            page.references = page
-                .references
-                .checked_add(1)
+        self.pool.retain(&pages)?;
+        let allocated = (|| {
+            let mut state = self.pool.lock()?;
+            preflight_pages(&self.pool, &state, private_pages, table_bytes)?;
+            let table_bytes = state
+                .memory
+                .table_bytes
+                .checked_add(table_bytes)
                 .ok_or(PagePoolError::ArithmeticOverflow)?;
-        }
-        state.memory.table_bytes = state
-            .memory
-            .table_bytes
-            .checked_add(table_bytes)
-            .ok_or(PagePoolError::ArithmeticOverflow)?;
-        drop(state);
+            grow_for(&self.pool, &mut state, private_pages)?;
+            let private = allocate_pages(&mut state, private_pages)?;
+            state.memory.table_bytes = table_bytes;
+            Ok(private)
+        })();
+        let private = match allocated {
+            Ok(private) => private,
+            Err(error) => {
+                self.pool.release(&pages)?;
+                return Err(error);
+            }
+        };
+        pages.extend(private);
         self.immutable
-            .get_mut(..count)
+            .get_mut(..shared_count)
             .ok_or(PagePoolError::CorruptState)?
             .fill(true);
+        let reserved_count =
+            usize::try_from(reserved_pages).map_err(|_| PagePoolError::ArithmeticOverflow)?;
+        let mut immutable = vec![false; reserved_count];
+        immutable[..shared_count].fill(true);
         Ok(Self {
             pool: self.pool.clone(),
             pages,
-            immutable: vec![true; count],
+            immutable,
             logical_len: prefix_tokens,
-            reserved_tokens: prefix_tokens,
+            reserved_tokens,
             table_bytes,
             identity: Arc::new(()),
         })
@@ -1047,6 +1095,40 @@ mod tests {
         assert_eq!(copy.token_count(), 3);
         original.commit_write(1).unwrap();
         assert_ne!(original.table().unwrap(), sibling.table().unwrap());
+    }
+
+    #[test]
+    fn reserved_fork_shares_prefix_and_owns_suffix_pages() {
+        let pool = pool(2_048);
+        let mut original = pool.reserve(8).unwrap();
+        original.commit_write(7).unwrap();
+
+        let mut sibling = original.fork_reserved(7, 12).unwrap();
+
+        assert_eq!(sibling.logical_len(), 7);
+        assert_eq!(sibling.reserved_tokens(), 12);
+        assert_eq!(sibling.validate_write(7, 1), Err(PagePoolError::SharedTail));
+        sibling.cow_tail().unwrap().unwrap();
+        sibling.commit_write(5).unwrap();
+        assert_eq!(sibling.logical_len(), 12);
+        assert_eq!(original.logical_len(), 7);
+    }
+
+    #[test]
+    fn refused_reserved_fork_preserves_memory_and_references() {
+        let pool = pool(100);
+        let mut original = pool.reserve(8).unwrap();
+        original.commit_write(7).unwrap();
+        let before_memory = pool.memory_usage().unwrap();
+        let before_references = original.page_reference_counts().unwrap();
+
+        assert!(matches!(
+            original.fork_reserved(7, 12),
+            Err(PagePoolError::QuotaExceeded)
+        ));
+
+        assert_eq!(pool.memory_usage().unwrap(), before_memory);
+        assert_eq!(original.page_reference_counts().unwrap(), before_references);
     }
 
     #[test]
