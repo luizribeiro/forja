@@ -33,7 +33,9 @@ pub use paged::{
     MAX_PAGE_TOKENS, MAX_PAGED_PLANES, PageTable, PageTableEntry, PageTableError, PagedLayout,
     PagedLayoutError, PagedPlane,
 };
-pub use paged_pool::{CowPageCopy, PagePool, PagePoolError, PagedMemoryUsage, PagedSequence};
+pub use paged_pool::{
+    CowPageCopy, PagePool, PagePoolError, PagedMemoryUsage, PagedSequence, SequenceCheckpoint,
+};
 pub use quantized::{QuantizedMatrix, QuantizedMatrixError, QuantizedMatrixPart};
 pub use symbolic::{
     Affine, ByteHull, MAX_PARAMS, ParamError, ParamSpace, ParamValues, SymbolicLayout,

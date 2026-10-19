@@ -200,6 +200,7 @@ impl PagePool {
             logical_len: 0,
             reserved_tokens: tokens,
             table_bytes,
+            identity: Arc::new(()),
         })
     }
 
@@ -217,6 +218,22 @@ impl PagePool {
             .state
             .lock()
             .map_err(|_| PagePoolError::CorruptState)
+    }
+
+    fn same_pool(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
+    fn retain(&self, pages: &[PageLease]) -> Result<(), PagePoolError> {
+        let mut state = self.lock()?;
+        for lease in pages {
+            let page = live_page_mut(&mut state, *lease)?;
+            page.references = page
+                .references
+                .checked_add(1)
+                .ok_or(PagePoolError::ArithmeticOverflow)?;
+        }
+        Ok(())
     }
 
     fn release(&self, pages: &[PageLease]) -> Result<(), PagePoolError> {
@@ -263,6 +280,7 @@ pub struct PagedSequence {
     logical_len: u64,
     reserved_tokens: u64,
     table_bytes: u64,
+    identity: Arc<()>,
 }
 
 impl PagedSequence {
@@ -407,6 +425,7 @@ impl PagedSequence {
             logical_len: prefix_tokens,
             reserved_tokens: prefix_tokens,
             table_bytes,
+            identity: Arc::new(()),
         })
     }
 
@@ -442,6 +461,81 @@ impl PagedSequence {
                 .map_err(|_| PagePoolError::ArithmeticOverflow)?,
         }))
     }
+
+    /// Captures page, length, tail, and reservation state for rollback.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if retaining checkpoint references fails.
+    pub fn checkpoint(&self) -> Result<SequenceCheckpoint, PagePoolError> {
+        let retained_page = if self.logical_len == 0 {
+            None
+        } else {
+            let tail = usize::try_from(
+                (self.logical_len - 1) / u64::from(self.pool.layout().page_tokens()),
+            )
+            .map_err(|_| PagePoolError::ArithmeticOverflow)?;
+            let page = *self.pages.get(tail).ok_or(PagePoolError::CorruptState)?;
+            if self.immutable.get(tail).copied().unwrap_or(true) || self.pool.refcount(page)? > 1 {
+                self.pool.retain(&[page])?;
+                Some(page)
+            } else {
+                None
+            }
+        };
+        Ok(SequenceCheckpoint {
+            pool: self.pool.clone(),
+            sequence: Arc::clone(&self.identity),
+            pages: self.pages.clone(),
+            immutable: self.immutable.clone(),
+            logical_len: self.logical_len,
+            reserved_tokens: self.reserved_tokens,
+            retained_page,
+            active: true,
+        })
+    }
+
+    /// Restores a consumed checkpoint without affecting sibling sequences.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a foreign or stale checkpoint.
+    pub fn rollback(&mut self, mut checkpoint: SequenceCheckpoint) -> Result<(), PagePoolError> {
+        if !self.pool.same_pool(&checkpoint.pool)
+            || !Arc::ptr_eq(&self.identity, &checkpoint.sequence)
+            || !checkpoint.active
+        {
+            return Err(PagePoolError::InvalidCheckpoint);
+        }
+        let replaced = self
+            .pages
+            .iter()
+            .zip(&checkpoint.pages)
+            .filter_map(|(current, saved)| (current != saved).then_some(*current))
+            .collect::<Vec<_>>();
+        if self.pages.len() != checkpoint.pages.len() {
+            return Err(PagePoolError::CorruptState);
+        }
+        self.pool.release(&replaced)?;
+        // If COW replaced the saved tail, its retained reference becomes the restored
+        // sequence's reference; otherwise the checkpoint's extra retain must be released.
+        if checkpoint
+            .retained_page
+            .is_some_and(|page| self.pages.contains(&page))
+        {
+            self.pool.release(&[checkpoint
+                .retained_page
+                .take()
+                .ok_or(PagePoolError::CorruptState)?])?;
+        }
+        self.pages = std::mem::take(&mut checkpoint.pages);
+        self.immutable = std::mem::take(&mut checkpoint.immutable);
+        self.logical_len = checkpoint.logical_len;
+        self.reserved_tokens = checkpoint.reserved_tokens;
+        checkpoint.retained_page = None;
+        checkpoint.active = false;
+        Ok(())
+    }
 }
 
 impl Drop for PagedSequence {
@@ -449,6 +543,26 @@ impl Drop for PagedSequence {
         let _ = self.pool.release(&self.pages);
         if let Ok(mut state) = self.pool.lock() {
             state.memory.table_bytes = state.memory.table_bytes.saturating_sub(self.table_bytes);
+        }
+    }
+}
+
+/// A retained sequence boundary consumed by rollback.
+pub struct SequenceCheckpoint {
+    pool: PagePool,
+    sequence: Arc<()>,
+    pages: Vec<PageLease>,
+    immutable: Vec<bool>,
+    logical_len: u64,
+    reserved_tokens: u64,
+    retained_page: Option<PageLease>,
+    active: bool,
+}
+
+impl Drop for SequenceCheckpoint {
+    fn drop(&mut self) {
+        if let Some(page) = self.retained_page {
+            let _ = self.pool.release(&[page]);
         }
     }
 }
@@ -667,5 +781,78 @@ mod tests {
         assert_eq!(copy.token_count(), 3);
         original.commit_write(1).unwrap();
         assert_ne!(original.table().unwrap(), sibling.table().unwrap());
+    }
+
+    #[test]
+    fn copy_on_write_and_rollback_restore_the_shared_tail() {
+        let pool = pool(1_024);
+        let mut original = pool.reserve(8).unwrap();
+        original.commit_write(7).unwrap();
+        let sibling = original.fork(7).unwrap();
+        let checkpoint = original.checkpoint().unwrap();
+        original.cow_tail().unwrap().unwrap();
+        original.commit_write(1).unwrap();
+
+        original.rollback(checkpoint).unwrap();
+
+        assert_eq!(original.logical_len(), 7);
+        assert_eq!(original.table().unwrap(), sibling.table().unwrap());
+    }
+
+    #[test]
+    fn rollback_crosses_a_cow_tail_and_private_page_boundary() {
+        let pool = pool(2_048);
+        let mut original = pool.reserve(12).unwrap();
+        original.commit_write(7).unwrap();
+        let sibling = original.fork(7).unwrap();
+        let checkpoint = original.checkpoint().unwrap();
+        let shared = sibling.table().unwrap();
+
+        original.cow_tail().unwrap().unwrap();
+        original.commit_write(5).unwrap();
+        assert_eq!(original.logical_len(), 12);
+        original.rollback(checkpoint).unwrap();
+
+        assert_eq!(original.logical_len(), 7);
+        let restored = original.table().unwrap();
+        assert_eq!(restored.resolve(0), shared.resolve(0));
+        assert_eq!(restored.resolve(1), shared.resolve(1));
+    }
+    #[test]
+    fn rollback_restores_refcounts_after_interleaved_cow() {
+        let layout = PagedLayout::new(
+            4,
+            vec![PagedPlane {
+                dtype: DType::F32,
+                elements_per_token: 2,
+                alignment: 4,
+                label: "plane".to_owned(),
+            }],
+        )
+        .unwrap();
+        let pool = PagePool::new(layout, 8, 4_096).unwrap();
+        let mut original = pool.reserve(8).unwrap();
+        original.commit_write(7).unwrap();
+        let before_counts = original
+            .pages
+            .iter()
+            .map(|&page| pool.refcount(page).unwrap())
+            .collect::<Vec<_>>();
+        let before_memory = pool.memory_usage().unwrap();
+
+        let mut sibling = original.fork(7).unwrap();
+        let checkpoint = original.checkpoint().unwrap();
+        original.cow_tail().unwrap().unwrap();
+        sibling.cow_tail().unwrap().unwrap();
+        original.rollback(checkpoint).unwrap();
+        drop(sibling);
+
+        let after_counts = original
+            .pages
+            .iter()
+            .map(|&page| pool.refcount(page).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(after_counts, before_counts);
+        assert_eq!(pool.memory_usage().unwrap(), before_memory);
     }
 }
