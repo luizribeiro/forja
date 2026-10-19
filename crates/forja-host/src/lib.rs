@@ -4944,7 +4944,6 @@ where
     fn record_paged_copy(
         &mut self,
         commands: Resource<CommandListEntry>,
-        pool: Resource<PagePoolEntry>,
         slot: Resource<BatchSlotEntry>,
         lane: u32,
         span: paged_storage::PagedSpan,
@@ -4956,7 +4955,6 @@ where
             .table
             .get(&commands)
             .map_err(invalid_handle)
-            .and_then(|_| self.table.get(&pool).map_err(invalid_handle))
             .and_then(|_| self.table.get(&slot).map_err(invalid_handle))
             .and_then(|_| self.table.get(&ordinary).map_err(invalid_handle))
             .and(Err(compute::Error::BackendExecution(
@@ -4968,7 +4966,6 @@ where
     fn record_paged_sdpa(
         &mut self,
         commands: Resource<CommandListEntry>,
-        pool: Resource<PagePoolEntry>,
         slot: Resource<BatchSlotEntry>,
         lane: u32,
         query: Resource<TensorEntry>,
@@ -4980,7 +4977,6 @@ where
             .table
             .get(&commands)
             .map_err(invalid_handle)
-            .and_then(|_| self.table.get(&pool).map_err(invalid_handle))
             .and_then(|_| self.table.get(&slot).map_err(invalid_handle))
             .and_then(|_| self.table.get(&query).map_err(invalid_handle))
             .and_then(|_| self.table.get(&output).map_err(invalid_handle))
@@ -5701,7 +5697,6 @@ mod tests {
         let copy = <Host<CpuBackend> as paged_storage::Host>::record_paged_copy(
             &mut host,
             Resource::new_borrow(commands.rep()),
-            Resource::new_borrow(pool.rep()),
             Resource::new_borrow(slot.rep()),
             0,
             paged_storage::PagedSpan {
@@ -5718,7 +5713,6 @@ mod tests {
         let sdpa = <Host<CpuBackend> as paged_storage::Host>::record_paged_sdpa(
             &mut host,
             Resource::new_borrow(commands.rep()),
-            Resource::new_borrow(pool.rep()),
             Resource::new_borrow(slot.rep()),
             0,
             Resource::new_borrow(ordinary.rep()),

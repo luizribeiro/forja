@@ -29,7 +29,6 @@ interface paged-storage {
 
   record-paged-copy: func(
     cmds: borrow<command-list>,
-    pool: borrow<page-pool>,
     slot: borrow<batch-slot>,
     lane: u32,
     span: paged-span,
@@ -39,7 +38,6 @@ interface paged-storage {
 
   record-paged-sdpa: func(
     cmds: borrow<command-list>,
-    pool: borrow<page-pool>,
     slot: borrow<batch-slot>,
     lane: u32,
     query: borrow<tensor>,
