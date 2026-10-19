@@ -876,6 +876,45 @@ where
         Ok(self.page_pool)
     }
 
+    fn prepare_paged_append(
+        &mut self,
+        start: u32,
+        tokens: u32,
+    ) -> Result<Option<SequenceCheckpoint>, compute::Error> {
+        match self.page_pool {
+            Some(pool) => self
+                .store
+                .data_mut()
+                .begin_paged_append(pool, start, tokens),
+            None => Ok(None),
+        }
+    }
+
+    fn rollback_paged_append(
+        &mut self,
+        checkpoint: Option<SequenceCheckpoint>,
+    ) -> Result<(), compute::Error> {
+        match (self.page_pool, checkpoint) {
+            (Some(pool), Some(checkpoint)) => self
+                .store
+                .data_mut()
+                .rollback_paged_append(pool, checkpoint),
+            _ => Ok(()),
+        }
+    }
+
+    fn finish_paged_append(
+        &mut self,
+        checkpoint: Option<SequenceCheckpoint>,
+    ) -> Result<(), compute::Error> {
+        match (self.page_pool, checkpoint) {
+            (Some(pool), Some(checkpoint)) => {
+                self.store.data_mut().finish_paged_append(pool, checkpoint)
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// Runs one engine invocation and retains its device tensors.
     ///
     /// # Errors
@@ -904,6 +943,10 @@ where
         let Ok(sequence) = u32::try_from(input.tokens.len()) else {
             return Ok(Err(quota("token count exceeds u32")));
         };
+        let checkpoint = match self.prepare_paged_append(input.start_pos, sequence) {
+            Ok(checkpoint) => checkpoint,
+            Err(error) => return Ok(Err(error)),
+        };
         let taps_requested = input.taps;
         self.set_guest_deadline();
         let engine = self.instance.l9o_gpu_engine();
@@ -923,10 +966,22 @@ where
             })
             .await
         {
-            Ok(output) => output?,
-            Err(error) if is_epoch_timeout(&error) => return Ok(Err(guest_timeout())),
-            Err(error) => return Err(error),
-        }?;
+            Ok(output) => match output? {
+                Ok(output) => output,
+                Err(error) => {
+                    self.rollback_paged_append(checkpoint)?;
+                    return Ok(Err(error));
+                }
+            },
+            Err(error) if is_epoch_timeout(&error) => {
+                self.rollback_paged_append(checkpoint)?;
+                return Ok(Err(guest_timeout()));
+            }
+            Err(error) => {
+                self.rollback_paged_append(checkpoint)?;
+                return Err(error);
+            }
+        };
         let StepOut {
             logits,
             taps,
@@ -944,11 +999,13 @@ where
             &taps,
             &router_logits,
         ) {
+            self.rollback_paged_append(checkpoint)?;
             return Ok(Err(match self.release_handles(handles) {
                 Ok(()) => error,
                 Err(release_error) => release_error,
             }));
         }
+        self.finish_paged_append(checkpoint)?;
         self.output_handles = handles;
         Ok(Ok(EngineOutput {
             logits: EngineTensor {
@@ -1207,6 +1264,14 @@ where
             Some(info) => info.clone(),
             None => self.describe().await?,
         };
+        let appended = input
+            .tokens
+            .as_ref()
+            .map_or(1, |tokens| u32::try_from(tokens.len()).unwrap_or(u32::MAX));
+        let checkpoint = match self.prepare_paged_append(input.start_pos, appended) {
+            Ok(checkpoint) => checkpoint,
+            Err(error) => return Ok(Err(error)),
+        };
         self.set_guest_deadline();
         let engine = self.instance.l9o_gpu_engine();
         let output = match self
@@ -1230,18 +1295,32 @@ where
             })
             .await
         {
-            Ok(output) => output?,
-            Err(error) if is_epoch_timeout(&error) => return Ok(Err(guest_timeout())),
-            Err(error) => return Err(error),
-        }?;
+            Ok(output) => match output? {
+                Ok(output) => output,
+                Err(error) => {
+                    self.rollback_paged_append(checkpoint)?;
+                    return Ok(Err(error));
+                }
+            },
+            Err(error) if is_epoch_timeout(&error) => {
+                self.rollback_paged_append(checkpoint)?;
+                return Ok(Err(guest_timeout()));
+            }
+            Err(error) => {
+                self.rollback_paged_append(checkpoint)?;
+                return Err(error);
+            }
+        };
         let DecodeOut { logits, token } = output;
         let handles = vec![logits.rep(), token.rep()];
         if let Err(error) = self.validate_decode_output(&info, &logits, &token) {
+            self.rollback_paged_append(checkpoint)?;
             return Ok(Err(match self.release_handles(handles) {
                 Ok(()) => error,
                 Err(release_error) => release_error,
             }));
         }
+        self.finish_paged_append(checkpoint)?;
         if release_previous {
             self.output_handles = handles;
         } else {
@@ -1797,14 +1876,12 @@ pub struct PagedSequenceEntry;
 
 /// Host-owned state behind an opaque guest batch-slot resource.
 pub struct BatchSlotEntry {
-    #[allow(dead_code)]
     binding: Arc<PagedBinding>,
     planes: Vec<u32>,
     tables: [Vec<u32>; 2],
     generations: u32,
 }
 
-#[allow(dead_code)]
 struct PagedBinding {
     _pool: PagePool,
     banks: Arc<PagedSlotBanks>,
@@ -2362,7 +2439,6 @@ impl<B: Backend + 'static> Host<B> {
         }
     }
 
-    #[allow(dead_code)]
     fn begin_paged_append(
         &mut self,
         pool_rep: u32,
@@ -2467,7 +2543,6 @@ impl<B: Backend + 'static> Host<B> {
         Ok(Some(checkpoint))
     }
 
-    #[allow(dead_code)]
     fn finish_paged_append(
         &mut self,
         pool_rep: u32,
