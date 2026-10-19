@@ -50,10 +50,10 @@ prefill-chunk = 2048
 parameter = "position"
 arms = [
   { lo = 0, hi = 510, name = "sdpa.decomposed" },
-  { lo = 511, hi = 1022, name = "sdpa.vector-single-pass" },
-  { lo = 1023, hi = 1023, name = "sdpa.vector-two-pass" },
-  { lo = 1024, hi = 8191, name = "sdpa.vector-two-pass-128" },
-  { lo = 8192, hi = 32767, name = "sdpa.vector-two-pass-256" },
+  { lo = 511, hi = 1022, name = "sdpa.vector-gqa-two-pass-32" },
+  { lo = 1023, hi = 3071, name = "sdpa.vector-gqa-two-pass" },
+  { lo = 3072, hi = 8191, name = "sdpa.vector-gqa-two-pass-128" },
+  { lo = 8192, hi = 32767, name = "sdpa.vector-gqa-two-pass-256" },
 ]
 
 [variants.rules."attention.prefill-large"]

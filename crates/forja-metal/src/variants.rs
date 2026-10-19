@@ -40,6 +40,10 @@ pub(crate) enum MetalVariant {
     SdpaVectorTwoPass256,
     SdpaVectorTwoPass512,
     SdpaVectorTwoPass1024,
+    SdpaVectorGqaTwoPass32,
+    SdpaVectorGqaTwoPass64,
+    SdpaVectorGqaTwoPass128,
+    SdpaVectorGqaTwoPass256,
     SdpaSteel,
     SdpaSteelHalf,
     TopKPortable,
@@ -475,6 +479,29 @@ const VECTOR_TWO_PASS: &[Constraint] = &[
         },
     ),
 ];
+const VECTOR_GQA_TWO_PASS: &[Constraint] = &[
+    value(QUERY_LENGTH, Relation::Equal(1)),
+    value(KEY_WIDTH, Relation::OneOf(WIDTHS)),
+    Constraint::DimensionsEqual {
+        left: KEY_WIDTH,
+        right: VALUE_WIDTH,
+    },
+    Constraint::Value {
+        value: ValueRef::Quotient {
+            name: "grouped-head SIMD count",
+            numerator: QUERY_HEADS,
+            denominator: KEY_HEADS,
+        },
+        relation: Relation::Equal(8),
+    },
+    value(
+        KEY_LENGTH,
+        Relation::Range {
+            min: 1,
+            max: 65_536,
+        },
+    ),
+];
 const SDPA_STEEL: &[Constraint] = &[
     value(
         QUERY_LENGTH,
@@ -772,6 +799,42 @@ pub(crate) static REGISTRY: &[VariantDef<MetalVariant>] = &[
         &["decode where 1024 reduction blocks fit the target well."],
         &["prefill or shorter cache lengths."],
         &["Uses 1024 reduction blocks chosen by the engine profile."]
+    ),
+    variant!(
+        "sdpa.vector-gqa-two-pass-32",
+        Sdpa,
+        SdpaVectorGqaTwoPass32,
+        VECTOR_GQA_TWO_PASS,
+        &["short single-token decode with eight query heads per K/V head."],
+        &["other grouped-query factors or longer cache lengths."],
+        &["Reuses each K/V load across two query heads with 32 reduction blocks."]
+    ),
+    variant!(
+        "sdpa.vector-gqa-two-pass",
+        Sdpa,
+        SdpaVectorGqaTwoPass64,
+        VECTOR_GQA_TWO_PASS,
+        &["single-token decode with eight query heads per K/V head."],
+        &["other grouped-query factors or a profile-tuned block count."],
+        &["Reuses each K/V load across two query heads with 64 reduction blocks."]
+    ),
+    variant!(
+        "sdpa.vector-gqa-two-pass-128",
+        Sdpa,
+        SdpaVectorGqaTwoPass128,
+        VECTOR_GQA_TWO_PASS,
+        &["single-token decode with eight query heads per K/V head."],
+        &["other grouped-query factors or shorter cache lengths."],
+        &["Reuses each K/V load across two query heads with 128 reduction blocks."]
+    ),
+    variant!(
+        "sdpa.vector-gqa-two-pass-256",
+        Sdpa,
+        SdpaVectorGqaTwoPass256,
+        VECTOR_GQA_TWO_PASS,
+        &["long single-token decode with eight query heads per K/V head."],
+        &["other grouped-query factors or shorter cache lengths."],
+        &["Reuses each K/V load across two query heads with 256 reduction blocks."]
     ),
     variant!(
         "sdpa.steel",
@@ -1702,6 +1765,19 @@ mod tests {
     }
 
     #[test]
+    fn gqa_vector_attention_requires_eight_query_heads_per_cache_head() {
+        for ratio in [1, 2, 4, 16] {
+            let dispatch = sdpa_dispatch(DType::F32, ratio, 1, 1024, 128, 128);
+            assert!(matches!(
+                resolve(&dispatch, "sdpa.vector-gqa-two-pass", METAL4),
+                Err(VariantError::Constraint { .. })
+            ));
+        }
+        let dispatch = sdpa_dispatch(DType::F32, 8, 1, 1024, 128, 128);
+        assert!(resolve(&dispatch, "sdpa.vector-gqa-two-pass", METAL4).is_ok());
+    }
+
+    #[test]
     fn symbolic_pins_report_the_failing_replay_range() {
         let backend = CpuBackend::new();
         let space = ParamSpace::new(std::iter::once(1..=2).collect()).unwrap();
@@ -1946,6 +2022,26 @@ mod tests {
                 "sdpa.vector-two-pass-1024",
                 sdpa_dispatch(DType::BF16, 2, 1, 1024, 128, 128),
                 "mlx_sdpa_vector_2pass_128",
+            ),
+            (
+                "sdpa.vector-gqa-two-pass-32",
+                sdpa_dispatch(DType::F32, 8, 1, 513, 128, 128),
+                "mlx_sdpa_vector_2pass_gqa_128",
+            ),
+            (
+                "sdpa.vector-gqa-two-pass",
+                sdpa_dispatch(DType::F32, 8, 1, 1024, 128, 128),
+                "mlx_sdpa_vector_2pass_gqa_128",
+            ),
+            (
+                "sdpa.vector-gqa-two-pass-128",
+                sdpa_dispatch(DType::F32, 8, 1, 4097, 128, 128),
+                "mlx_sdpa_vector_2pass_gqa_128",
+            ),
+            (
+                "sdpa.vector-gqa-two-pass-256",
+                sdpa_dispatch(DType::F32, 8, 1, 16_384, 128, 128),
+                "mlx_sdpa_vector_2pass_gqa_128",
             ),
             (
                 "sdpa.steel",

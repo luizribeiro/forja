@@ -494,6 +494,7 @@ fn log_matmul_route(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SdpaKernel {
     Vector,
+    VectorGqa,
     Steel,
     SteelHalf,
     Decomposed,
@@ -3955,8 +3956,8 @@ impl MetalBackend {
             return Err(BackendError::InvalidInput);
         };
         match self.prepare_sdpa_kernel(dispatch)? {
-            SdpaKernel::Vector => self.encode_vector_sdpa(
-                encoder, table, dispatch, scale, causal, q_start, bindings, arguments,
+            kernel @ (SdpaKernel::Vector | SdpaKernel::VectorGqa) => self.encode_vector_sdpa(
+                encoder, table, dispatch, scale, causal, q_start, kernel, bindings, arguments,
             ),
             kernel @ (SdpaKernel::Steel | SdpaKernel::SteelHalf) => self.encode_steel_sdpa(
                 encoder, table, dispatch, scale, causal, q_start, kernel, bindings, arguments,
@@ -3969,22 +3970,56 @@ impl MetalBackend {
 
     fn prepare_sdpa_kernel(&self, dispatch: &Dispatch) -> Result<SdpaKernel, BackendError> {
         let kernel = select_sdpa(dispatch)?;
-        if !matches!(kernel, SdpaKernel::Steel | SdpaKernel::SteelHalf) {
-            return Ok(kernel);
-        }
-        let [query, _, _] = dispatch.inputs() else {
+        let [query, key, value] = dispatch.inputs() else {
             return Err(BackendError::InvalidInput);
         };
         let [_, _, width] = shape3(query.layout())?;
-        let constants = steel_attention_constants(dispatch, kernel)?;
+        let (name, constants, fallback) = match kernel {
+            kernel @ (SdpaKernel::Vector | SdpaKernel::VectorGqa) => {
+                let fast_f32 = vector_f32_supported(dispatch);
+                let prefix = if vector_two_pass_blocks(dispatch).is_some() {
+                    if kernel == SdpaKernel::VectorGqa {
+                        "mlx_sdpa_vector_2pass_1_gqa"
+                    } else if fast_f32 {
+                        "mlx_sdpa_vector_2pass_1_f32"
+                    } else {
+                        "mlx_sdpa_vector_2pass_1"
+                    }
+                } else if fast_f32 {
+                    "mlx_sdpa_vector_f32"
+                } else {
+                    "mlx_sdpa_vector"
+                };
+                (
+                    vector_kernel(prefix, width)?,
+                    vec![
+                        (0, dtype_code(query.layout().dtype())),
+                        (1, dtype_code(key.layout().dtype())),
+                        (2, dtype_code(dispatch.output().layout().dtype())),
+                        (3, dtype_code(value.layout().dtype())),
+                    ],
+                    if kernel == SdpaKernel::VectorGqa {
+                        SdpaKernel::Vector
+                    } else {
+                        SdpaKernel::Decomposed
+                    },
+                )
+            }
+            SdpaKernel::Steel | SdpaKernel::SteelHalf => (
+                steel_attention_kernel(kernel, width)?,
+                steel_attention_constants(dispatch, kernel)?.to_vec(),
+                SdpaKernel::Decomposed,
+            ),
+            SdpaKernel::Decomposed => return Ok(kernel),
+        };
         match self
             .pipelines
             .lock()
             .map_err(|_| BackendError::ExecutionFailed)?
-            .get(steel_attention_kernel(kernel, width)?, &constants)
+            .get(name, &constants)
         {
             Ok(_) => Ok(kernel),
-            Err(BackendError::UnsupportedOperation) => Ok(SdpaKernel::Decomposed),
+            Err(BackendError::UnsupportedOperation) => Ok(fallback),
             Err(error) => Err(error),
         }
     }
@@ -3998,6 +4033,7 @@ impl MetalBackend {
         scale: f32,
         causal: bool,
         q_start: u32,
+        kernel: SdpaKernel,
         bindings: &mut ArgumentBindings,
         arguments: &mut ArgumentWriter,
     ) -> Result<Vec<BufferBinding>, BackendError> {
@@ -4078,7 +4114,9 @@ impl MetalBackend {
             .map_err(|_| BackendError::ExecutionFailed)?
             .get(
                 vector_kernel(
-                    if fast_f32 {
+                    if kernel == SdpaKernel::VectorGqa {
+                        "mlx_sdpa_vector_2pass_1_gqa"
+                    } else if fast_f32 {
                         "mlx_sdpa_vector_2pass_1_f32"
                     } else {
                         "mlx_sdpa_vector_2pass_1"
@@ -6822,6 +6860,7 @@ fn sdpa_kernel(dispatch: &Dispatch) -> Result<&'static str, BackendError> {
     let width = shape3(query.layout())?[2];
     let fast_f32 = vector_f32_supported(dispatch);
     Ok(match select_sdpa(dispatch)? {
+        SdpaKernel::VectorGqa => vector_kernel("mlx_sdpa_vector_2pass_gqa", width)?,
         SdpaKernel::Vector if vector_two_pass_blocks(dispatch).is_some() => vector_kernel(
             if fast_f32 {
                 "mlx_sdpa_vector_2pass_f32"
@@ -6903,10 +6942,14 @@ fn vector_kernel(prefix: &str, width: u32) -> Result<&'static str, BackendError>
         ("mlx_sdpa_vector", 128) => Ok("mlx_sdpa_vector_128"),
         ("mlx_sdpa_vector_2pass_1", 64) => Ok("mlx_sdpa_vector_2pass_1_64"),
         ("mlx_sdpa_vector_2pass_1", 128) => Ok("mlx_sdpa_vector_2pass_1_128"),
+        ("mlx_sdpa_vector_2pass_1_gqa", 64) => Ok("mlx_sdpa_vector_2pass_1_gqa_64"),
+        ("mlx_sdpa_vector_2pass_1_gqa", 128) => Ok("mlx_sdpa_vector_2pass_1_gqa_128"),
         ("mlx_sdpa_vector_2pass_2", 64) => Ok("mlx_sdpa_vector_2pass_2_64"),
         ("mlx_sdpa_vector_2pass_2", 128) => Ok("mlx_sdpa_vector_2pass_2_128"),
         ("mlx_sdpa_vector_2pass", 64) => Ok("mlx_sdpa_vector_2pass_64"),
         ("mlx_sdpa_vector_2pass", 128) => Ok("mlx_sdpa_vector_2pass_128"),
+        ("mlx_sdpa_vector_2pass_gqa", 64) => Ok("mlx_sdpa_vector_2pass_gqa_64"),
+        ("mlx_sdpa_vector_2pass_gqa", 128) => Ok("mlx_sdpa_vector_2pass_gqa_128"),
         ("mlx_sdpa_vector_f32", 64) => Ok("mlx_sdpa_vector_f32_64"),
         ("mlx_sdpa_vector_f32", 128) => Ok("mlx_sdpa_vector_f32_128"),
         ("mlx_sdpa_vector_2pass_f32", 64) => Ok("mlx_sdpa_vector_2pass_f32_64"),
@@ -6934,7 +6977,9 @@ fn steel_attention_tile(kernel: SdpaKernel, width: u32) -> Result<(u32, u32), Ba
         SdpaKernel::Steel => Ok((32, if width == 64 { 32 } else { 16 })),
         SdpaKernel::SteelHalf if width == 128 => Ok((96, 16)),
         SdpaKernel::SteelHalf => Ok((64, 32)),
-        SdpaKernel::Vector | SdpaKernel::Decomposed => Err(BackendError::InvalidInput),
+        SdpaKernel::Vector | SdpaKernel::VectorGqa | SdpaKernel::Decomposed => {
+            Err(BackendError::InvalidInput)
+        }
     }
 }
 
@@ -6979,6 +7024,12 @@ fn select_sdpa(dispatch: &Dispatch) -> Result<SdpaKernel, BackendError> {
             | MetalVariant::SdpaVectorTwoPass512
             | MetalVariant::SdpaVectorTwoPass1024,
         ) => Ok(SdpaKernel::Vector),
+        Some(
+            MetalVariant::SdpaVectorGqaTwoPass32
+            | MetalVariant::SdpaVectorGqaTwoPass64
+            | MetalVariant::SdpaVectorGqaTwoPass128
+            | MetalVariant::SdpaVectorGqaTwoPass256,
+        ) => Ok(SdpaKernel::VectorGqa),
         Some(MetalVariant::SdpaSteel) => Ok(SdpaKernel::Steel),
         Some(MetalVariant::SdpaSteelHalf) => Ok(SdpaKernel::SteelHalf),
         _ => Err(BackendError::InvalidInput),
@@ -7004,11 +7055,12 @@ fn vector_two_pass_blocks(dispatch: &Dispatch) -> Option<u32> {
         return Some(blocks);
     }
     match selected_variant(dispatch)? {
-        MetalVariant::SdpaVectorTwoPass64 => Some(64),
-        MetalVariant::SdpaVectorTwoPass128 => Some(128),
-        MetalVariant::SdpaVectorTwoPass256 => Some(256),
+        MetalVariant::SdpaVectorTwoPass64 | MetalVariant::SdpaVectorGqaTwoPass64 => Some(64),
+        MetalVariant::SdpaVectorTwoPass128 | MetalVariant::SdpaVectorGqaTwoPass128 => Some(128),
+        MetalVariant::SdpaVectorTwoPass256 | MetalVariant::SdpaVectorGqaTwoPass256 => Some(256),
         MetalVariant::SdpaVectorTwoPass512 => Some(512),
         MetalVariant::SdpaVectorTwoPass1024 => Some(1024),
+        MetalVariant::SdpaVectorGqaTwoPass32 => Some(32),
         _ => None,
     }
 }
@@ -7077,7 +7129,11 @@ pub(super) fn variant_supported(
         | MetalVariant::SdpaVectorTwoPass128
         | MetalVariant::SdpaVectorTwoPass256
         | MetalVariant::SdpaVectorTwoPass512
-        | MetalVariant::SdpaVectorTwoPass1024 => vector_sdpa_supported(dispatch)?,
+        | MetalVariant::SdpaVectorTwoPass1024
+        | MetalVariant::SdpaVectorGqaTwoPass32
+        | MetalVariant::SdpaVectorGqaTwoPass64
+        | MetalVariant::SdpaVectorGqaTwoPass128
+        | MetalVariant::SdpaVectorGqaTwoPass256 => vector_sdpa_supported(dispatch)?,
         MetalVariant::SdpaSteel => steel_sdpa_supported(dispatch)?,
         MetalVariant::SdpaSteelHalf => half_steel_sdpa_supported(dispatch)?,
         MetalVariant::TopKSingleK8 => dispatch_kernel(dispatch)? == "topk_single",
@@ -10986,6 +11042,13 @@ mod tests {
             let blocks = FORCED_VECTOR_BLOCKS.with(|forced| forced.replace(Some(blocks)));
             Self(previous, blocks)
         }
+
+        fn vector_gqa_two_pass(blocks: u32) -> Self {
+            let previous =
+                FORCED_SDPA_KERNEL.with(|forced| forced.replace(Some(SdpaKernel::VectorGqa)));
+            let blocks = FORCED_VECTOR_BLOCKS.with(|forced| forced.replace(Some(blocks)));
+            Self(previous, blocks)
+        }
     }
 
     impl Drop for SdpaOverride {
@@ -11072,6 +11135,37 @@ mod tests {
                 ),
             ],
             &TensorSpec::contiguous(DType::F32, &[query_heads, query_length, width]),
+            cache_dtype,
+        )
+        .unwrap();
+    }
+
+    fn assert_gqa_profile_case(
+        backend: &MetalBackend,
+        cache_dtype: DType,
+        key_length: u32,
+        blocks: u32,
+    ) {
+        let cache_slice = [
+            Slice::new(0, 4, 1).unwrap(),
+            Slice::new(3, key_length, 1).unwrap(),
+            Slice::new(0, 128, 1).unwrap(),
+        ];
+        let _override = SdpaOverride::vector_gqa_two_pass(blocks);
+        assert_backends_agree_at_tolerance(
+            &CpuBackend::new(),
+            backend,
+            Op::Sdpa {
+                scale: 128.0_f32.sqrt().recip(),
+                causal: true,
+                q_start: key_length - 1,
+            },
+            &[
+                TensorSpec::contiguous(DType::F32, &[32, 1, 128]),
+                TensorSpec::sliced(cache_dtype, &[4, key_length + 3, 128], &cache_slice),
+                TensorSpec::sliced(cache_dtype, &[4, key_length + 3, 128], &cache_slice),
+            ],
+            &TensorSpec::contiguous(DType::F32, &[32, 1, 128]),
             cache_dtype,
         )
         .unwrap();
@@ -11324,6 +11418,45 @@ mod tests {
     }
 
     #[test]
+    fn metal_gqa_vector_attention_matches_profile_lengths() {
+        let _override = SdpaOverride::vector_gqa_two_pass(128);
+        let reference = CpuBackend::new();
+        let candidate = MetalBackend::new().unwrap();
+        for key_length in [1, 7, 33, 4_097, 16_384] {
+            let cache_slice = [
+                Slice::new(0, 4, 1).unwrap(),
+                Slice::new(3, key_length, 1).unwrap(),
+                Slice::new(0, 128, 1).unwrap(),
+            ];
+            assert_backends_agree_at_tolerance(
+                &reference,
+                &candidate,
+                Op::Sdpa {
+                    scale: 128.0_f32.sqrt().recip(),
+                    causal: true,
+                    q_start: key_length - 1,
+                },
+                &[
+                    TensorSpec::contiguous(DType::F32, &[32, 1, 128]),
+                    TensorSpec::sliced(DType::F16, &[4, key_length + 3, 128], &cache_slice),
+                    TensorSpec::sliced(DType::F16, &[4, key_length + 3, 128], &cache_slice),
+                ],
+                &TensorSpec::contiguous(DType::F32, &[32, 1, 128]),
+                DType::F16,
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn metal_gqa_vector_attention_accepts_each_cache_dtype() {
+        let backend = MetalBackend::new().unwrap();
+        for dtype in [DType::F16, DType::BF16, DType::F32] {
+            assert_gqa_profile_case(&backend, dtype, 1024, 128);
+        }
+    }
+
+    #[test]
     fn metal_attention_paths_accept_reduced_precision_cache() {
         for dtype in [DType::F16, DType::BF16] {
             assert_mixed_sdpa(SdpaKernel::Decomposed, None, 1, 1, dtype);
@@ -11384,6 +11517,13 @@ mod tests {
         let backend = MetalBackend::new().unwrap();
         backend.set_pipeline_threadgroup_memory_limit_for_test(1);
         assert_half_steel_profile_case(&backend, DType::F16, 2, 7, 32, 4, 128);
+    }
+
+    #[test]
+    fn metal_gqa_vector_attention_falls_back_over_mocked_threadgroup_limit() {
+        let backend = MetalBackend::new().unwrap();
+        backend.set_pipeline_threadgroup_memory_limit_for_test(1);
+        assert_gqa_profile_case(&backend, DType::F16, 33, 128);
     }
 
     #[test]
