@@ -94,6 +94,47 @@ fn metal_paged_copy_matches_cpu_across_page_edges() {
     assert_eq!(run_copy(&metal).unwrap(), run_copy(&cpu).unwrap());
 }
 
+#[test]
+fn metal_paged_copy_reports_corrupt_entries_without_writing_pool() {
+    let backend = forja_metal::MetalBackend::new().unwrap();
+    let source = backend.alloc(DType::F32, &[1, 2]).unwrap();
+    let pool = backend.alloc(DType::F32, &[2, 4, 2]).unwrap();
+    let table = backend.alloc(DType::U32, &[1, 2]).unwrap();
+    let generations = backend.alloc(DType::U32, &[2]).unwrap();
+    backend
+        .write(&source, &encode(&[3.0, 5.0], DType::F32))
+        .unwrap();
+    let canary = encode(&[7.0; 16], DType::F32);
+    backend.write(&pool, &canary).unwrap();
+    backend.write(&table, &table_bytes(&[(1, 99)])).unwrap();
+    backend
+        .write(&generations, &generation_bytes(&[1, 2]))
+        .unwrap();
+    let mut commands = CommandList::new();
+    commands
+        .dispatch(
+            Op::PagedCopy {
+                direction: PagedCopyDirection::IntoPages,
+                start: 0,
+                page_tokens: 4,
+            },
+            &[&source, &table, &generations],
+            &pool,
+        )
+        .unwrap();
+    let error = backend.submit(commands).unwrap().wait().unwrap_err();
+    assert!(matches!(
+        error,
+        BackendError::DeviceErrorFlag {
+            operation: "paged-copy",
+            flag: 1,
+            value: 0,
+            ..
+        }
+    ));
+    assert_eq!(backend.read(&pool).unwrap(), canary);
+}
+
 fn run_sdpa<B: Backend>(
     backend: &B,
     dtype: DType,
