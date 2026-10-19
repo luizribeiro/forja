@@ -275,7 +275,7 @@ pub(crate) mod guest {
     use compute::{
         Binop as WitBinOp, Redop as WitRedOp, Unop as WitUnOp, ValueType as WitValueType,
     };
-    pub use l9o::gpu::compute;
+    pub use l9o::gpu::{compute, paged_storage};
     #[cfg(feature = "metal-variants")]
     use variants::l9o::gpu::metal_variants;
 

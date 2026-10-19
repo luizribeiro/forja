@@ -194,6 +194,22 @@ pub trait Engine: Sized + 'static {
     /// Returns an error when required weights are missing or incompatible.
     fn load(weights: &Weights<'_>, config: EngineLoadConfig) -> Result<Self>;
 
+    /// Constructs the model with an optional host-owned paged-storage capability.
+    ///
+    /// Engines that use paged caches override this method. The default preserves
+    /// compatibility for engines whose descriptor does not request a page pool.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when required weights or the supplied pool are incompatible.
+    fn load_paged(
+        weights: &Weights<'_>,
+        _pool: Option<crate::PagedPool<'_>>,
+        config: EngineLoadConfig,
+    ) -> Result<Self> {
+        Self::load(weights, config)
+    }
+
     /// Runs one unbatched model invocation.
     ///
     /// # Errors

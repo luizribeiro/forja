@@ -92,6 +92,7 @@ fn expand_engine(item: &ItemImpl) -> syn::Result<proc_macro2::TokenStream> {
                     runtime_path: "::forja_sdk::__private::wit_bindgen::rt",
                     with: {
                         "l9o:gpu/compute@0.1.0": ::forja_sdk::__private::compute,
+                        "l9o:gpu/paged-storage@0.1.0": ::forja_sdk::__private::paged_storage,
                     },
                 });
             }
@@ -138,12 +139,13 @@ fn engine_guest_impl() -> proc_macro2::TokenStream {
 
             async fn load(
                 weights: &compute::Weights,
-                _pool: Option<&bindings::l9o::gpu::paged_storage::PagePool>,
+                pool: Option<&::forja_sdk::__private::paged_storage::PagePool>,
                 config: LoadConfig,
             ) -> ::std::result::Result<(), compute::Error> {
                 let weights = ::forja_sdk::Weights::from_guest(weights);
-                let engine = <ExportedEngine as ::forja_sdk::Engine>::load(
+                let engine = <ExportedEngine as ::forja_sdk::Engine>::load_paged(
                     &weights,
+                    pool.map(::forja_sdk::PagedPool::from_guest),
                     #load_config,
                 )
                     .map_err(wit_error)?;
