@@ -2072,7 +2072,7 @@ const fn op_name(operation: Op) -> &'static str {
     match operation {
         Op::Program(_) => "program",
         Op::Copy => "copy",
-        Op::PagedCopy { .. } | Op::PagedSdpa { .. } => "unsupported",
+        Op::PagedCopy { .. } => "paged-copy",
         Op::RmsNorm { .. } => "rms_norm",
         Op::Argmax { .. } => "argmax",
         Op::TopK { .. } => "top-k",
@@ -2086,6 +2086,7 @@ const fn op_name(operation: Op) -> &'static str {
         Op::QuantMatmul { .. } => "quant-matmul",
         Op::GatherQuantMatmul { .. } => "gather-quant-matmul",
         Op::Sdpa { .. } => "sdpa",
+        Op::PagedSdpa { .. } => "paged-sdpa",
     }
 }
 
