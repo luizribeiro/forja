@@ -213,6 +213,34 @@ impl PagePool {
         Ok((self.lock()?.memory, self.inner.byte_limit))
     }
 
+    /// Atomically charges two reusable graph arenas at the largest retained arena size.
+    ///
+    /// # Errors
+    ///
+    /// Returns quota or overflow while preserving the prior charge.
+    pub fn set_graph_arena_bytes(&self, maximum_arena_bytes: u64) -> Result<(), PagePoolError> {
+        let bytes = maximum_arena_bytes
+            .checked_mul(2)
+            .ok_or(PagePoolError::ArithmeticOverflow)?;
+        self.replace_aux_charge(AuxCharge::Graph, bytes)
+    }
+
+    /// Atomically charges primary high-water scratch plus the trimmed overlap slot.
+    ///
+    /// # Errors
+    ///
+    /// Returns quota or overflow while preserving the prior charge.
+    pub fn set_scratch_bytes(
+        &self,
+        primary_bytes: u64,
+        overlap_bytes: u64,
+    ) -> Result<(), PagePoolError> {
+        let bytes = primary_bytes
+            .checked_add(overlap_bytes)
+            .ok_or(PagePoolError::ArithmeticOverflow)?;
+        self.replace_aux_charge(AuxCharge::Scratch, bytes)
+    }
+
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, PoolState>, PagePoolError> {
         self.inner
             .state
@@ -294,6 +322,34 @@ impl PagePool {
             state.memory.slot_bytes = state.memory.slot_bytes.saturating_sub(bytes);
         }
     }
+
+    fn replace_aux_charge(&self, kind: AuxCharge, bytes: u64) -> Result<(), PagePoolError> {
+        let mut state = self.lock()?;
+        let old = match kind {
+            AuxCharge::Graph => state.memory.graph_bytes,
+            AuxCharge::Scratch => state.memory.scratch_bytes,
+        };
+        let projected = state
+            .memory
+            .total()
+            .and_then(|total| total.checked_sub(old))
+            .and_then(|total| total.checked_add(bytes))
+            .ok_or(PagePoolError::ArithmeticOverflow)?;
+        if projected > self.inner.byte_limit {
+            return Err(PagePoolError::QuotaExceeded);
+        }
+        match kind {
+            AuxCharge::Graph => state.memory.graph_bytes = bytes,
+            AuxCharge::Scratch => state.memory.scratch_bytes = bytes,
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy)]
+enum AuxCharge {
+    Graph,
+    Scratch,
 }
 
 /// One immutable lane snapshot read from a rebindable slot bank.
@@ -1095,5 +1151,21 @@ mod tests {
             banks.bind(0, 0, &foreign),
             Err(PagePoolError::ForeignResource)
         );
+    }
+
+    #[test]
+    fn graph_and_scratch_charges_never_raise_the_quota() {
+        let pool = pool(512);
+        pool.set_graph_arena_bytes(32).unwrap();
+        pool.set_scratch_bytes(40, 8).unwrap();
+        let accepted = pool.memory_usage().unwrap().0;
+        assert_eq!(accepted.graph_bytes, 64);
+        assert_eq!(accepted.scratch_bytes, 48);
+        assert_eq!(
+            pool.set_graph_arena_bytes(512),
+            Err(PagePoolError::QuotaExceeded)
+        );
+        assert_eq!(pool.memory_usage().unwrap().0, accepted);
+        assert_eq!(pool.memory_usage().unwrap().1, 512);
     }
 }
