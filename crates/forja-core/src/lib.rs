@@ -6,6 +6,7 @@ mod graph;
 mod layout;
 mod ops;
 mod paged;
+mod paged_pool;
 pub mod program;
 mod quantized;
 mod symbolic;
@@ -32,6 +33,7 @@ pub use paged::{
     MAX_PAGE_TOKENS, MAX_PAGED_PLANES, PageTable, PageTableEntry, PageTableError, PagedLayout,
     PagedLayoutError, PagedPlane,
 };
+pub use paged_pool::{PagePool, PagePoolError, PagedMemoryUsage, PagedSequence};
 pub use quantized::{QuantizedMatrix, QuantizedMatrixError, QuantizedMatrixPart};
 pub use symbolic::{
     Affine, ByteHull, MAX_PARAMS, ParamError, ParamSpace, ParamValues, SymbolicLayout,
