@@ -16,7 +16,7 @@ use std::{
     pin::Pin,
     sync::{
         Arc, Condvar, Mutex, OnceLock, Weak,
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     thread,
 };
@@ -24,9 +24,10 @@ use std::{
 use forja_core::{
     Affine, Backend, BackendDispatchData, BackendError, BufferId, CommandList, DType, DeviceInfo,
     GraphLimits, GraphTemplate, Layout, LayoutError, MemoryUsage, Op, OpError, PagePool,
-    PagedLayout, PagedPlane, PagedSlotBanks, ParamSpace, PreparedGraph, RuleArm, Slice, Submission,
-    SubmissionProfile, SymbolicLayout, SymbolicLayoutError, TemplateOp, TemplateTensor, Tensor,
-    ViewOp, gather_matmul_flops, gather_quant_matmul_dispatch_flops, matmul_flops,
+    PagedLayout, PagedPlane, PagedSequence, PagedSlotBanks, ParamSpace, PreparedGraph, RuleArm,
+    SequenceCheckpoint, Slice, Submission, SubmissionProfile, SymbolicLayout, SymbolicLayoutError,
+    TemplateOp, TemplateTensor, Tensor, ViewOp, gather_matmul_flops,
+    gather_quant_matmul_dispatch_flops, matmul_flops,
     program::{
         BinOp, EpilogueError, EpilogueSignature, Inst, KernelSignature, MAX_INSTRUCTIONS,
         MAX_OUTPUTS, PrepareError, PreparedEpilogue, PreparedProgram, Program, ProgramError,
@@ -861,6 +862,7 @@ where
             plane_count: u32::try_from(serving.planes.len())
                 .map_err(|_| compute::Error::Layout("paged plane count exceeds u32".to_owned()))?,
             slot_banks: None,
+            slot: None,
             charged_bytes: AtomicU64::new(0),
             live_bytes: Arc::clone(&self.store.data().live_bytes),
         };
@@ -1777,6 +1779,7 @@ pub struct PagePoolEntry {
     max_context: u32,
     plane_count: u32,
     slot_banks: Option<Arc<PagedSlotBanks>>,
+    slot: Option<u32>,
     charged_bytes: AtomicU64,
     live_bytes: Arc<AtomicU64>,
 }
@@ -1794,10 +1797,19 @@ pub struct PagedSequenceEntry;
 
 /// Host-owned state behind an opaque guest batch-slot resource.
 pub struct BatchSlotEntry {
-    _banks: Arc<PagedSlotBanks>,
+    #[allow(dead_code)]
+    binding: Arc<PagedBinding>,
     planes: Vec<u32>,
     tables: [Vec<u32>; 2],
     generations: u32,
+}
+
+#[allow(dead_code)]
+struct PagedBinding {
+    _pool: PagePool,
+    banks: Arc<PagedSlotBanks>,
+    sequence: Mutex<Option<Arc<Mutex<PagedSequence>>>>,
+    used: AtomicBool,
 }
 
 struct PagedBackingHandles {
@@ -2202,11 +2214,17 @@ impl<B: Backend + 'static> Host<B> {
             compute::Error::BackendExecution("paged pool charge regressed".to_owned())
         })?;
         self.check_byte_allocation(charge)?;
+        let binding = Arc::new(PagedBinding {
+            _pool: pool,
+            banks: Arc::clone(&banks),
+            sequence: Mutex::new(None),
+            used: AtomicBool::new(false),
+        });
         let mut cleanup = backing.planes.clone();
         cleanup.extend(backing.tables.iter().flatten().copied());
         cleanup.push(backing.generations);
         let slot = match self.table.push(BatchSlotEntry {
-            _banks: Arc::clone(&banks),
+            binding,
             planes: backing.planes,
             tables: backing.tables,
             generations: backing.generations,
@@ -2219,6 +2237,7 @@ impl<B: Backend + 'static> Host<B> {
         };
         let entry = self.table.get_mut(resource).map_err(invalid_handle)?;
         entry.slot_banks = Some(banks);
+        entry.slot = Some(slot.rep());
         entry.charged_bytes.fetch_add(charge, Ordering::AcqRel);
         entry.live_bytes.fetch_add(charge, Ordering::AcqRel);
         Ok(slot)
@@ -2341,6 +2360,169 @@ impl<B: Backend + 'static> Host<B> {
                 );
             }
         }
+    }
+
+    #[allow(dead_code)]
+    fn begin_paged_append(
+        &mut self,
+        pool_rep: u32,
+        start: u32,
+        tokens: u32,
+    ) -> Result<Option<SequenceCheckpoint>, compute::Error> {
+        let (pool, max_context, slot_rep) = {
+            let entry = self
+                .table
+                .get(&Resource::<PagePoolEntry>::new_borrow(pool_rep))
+                .map_err(invalid_handle)?;
+            let Some(slot) = entry.slot else {
+                return Ok(None);
+            };
+            (entry.pool.clone(), entry.max_context, slot)
+        };
+        let (binding, table_rep, generation_rep) = {
+            let slot = self
+                .table
+                .get(&Resource::<BatchSlotEntry>::new_borrow(slot_rep))
+                .map_err(invalid_handle)?;
+            (
+                Arc::clone(&slot.binding),
+                *slot
+                    .tables
+                    .first()
+                    .and_then(|bank| bank.first())
+                    .ok_or_else(|| invalid_handle("paged lane zero is missing"))?,
+                slot.generations,
+            )
+        };
+        binding.used.store(false, Ordering::Release);
+        let sequence = {
+            let mut active = binding
+                .sequence
+                .lock()
+                .map_err(|_| guest_error(BackendError::ExecutionFailed))?;
+            if active.is_none() {
+                *active = Some(Arc::new(Mutex::new(
+                    pool.reserve(u64::from(max_context))
+                        .map_err(|error| compute::Error::Quota(error.to_string()))?,
+                )));
+            }
+            Arc::clone(
+                active
+                    .as_ref()
+                    .ok_or_else(|| guest_error(BackendError::ExecutionFailed))?,
+            )
+        };
+        let (checkpoint, table) = {
+            let mut sequence = sequence
+                .lock()
+                .map_err(|_| guest_error(BackendError::ExecutionFailed))?;
+            let checkpoint = sequence
+                .checkpoint()
+                .map_err(|error| compute::Error::Quota(error.to_string()))?;
+            if sequence.logical_len() == 0 && start != 0 {
+                sequence
+                    .commit_write(u64::from(start))
+                    .map_err(|error| compute::Error::Quota(error.to_string()))?;
+            }
+            if sequence.logical_len() != u64::from(start) {
+                return Err(compute::Error::Layout(
+                    "paged append start does not match the sequence".to_owned(),
+                ));
+            }
+            if sequence
+                .cow_tail()
+                .map_err(|error| compute::Error::Quota(error.to_string()))?
+                .is_some()
+            {
+                return Err(compute::Error::BackendExecution(
+                    "paged tail copy is not recorded".to_owned(),
+                ));
+            }
+            sequence
+                .commit_write(u64::from(tokens))
+                .map_err(|error| compute::Error::Quota(error.to_string()))?;
+            binding
+                .banks
+                .bind(0, 0, &sequence)
+                .map_err(|error| compute::Error::Quota(error.to_string()))?;
+            let table = binding
+                .banks
+                .slot(0, 0)
+                .map_err(|error| compute::Error::Quota(error.to_string()))?
+                .table()
+                .clone();
+            (checkpoint, table)
+        };
+        let mut table_bytes = Vec::with_capacity(table.entries().len() * 8);
+        for entry in table.entries() {
+            table_bytes.extend_from_slice(&entry.page().to_ne_bytes());
+            table_bytes.extend_from_slice(&entry.generation().to_ne_bytes());
+        }
+        let mut generation_bytes = Vec::with_capacity(table.generations().len() * 4);
+        for generation in table.generations() {
+            generation_bytes.extend_from_slice(&generation.to_ne_bytes());
+        }
+        self.write(&Resource::new_borrow(table_rep), &table_bytes)?;
+        self.write(&Resource::new_borrow(generation_rep), &generation_bytes)?;
+        Ok(Some(checkpoint))
+    }
+
+    #[allow(dead_code)]
+    fn finish_paged_append(
+        &mut self,
+        pool_rep: u32,
+        checkpoint: SequenceCheckpoint,
+    ) -> Result<(), compute::Error> {
+        let slot_rep = self
+            .table
+            .get(&Resource::<PagePoolEntry>::new_borrow(pool_rep))
+            .map_err(invalid_handle)?
+            .slot
+            .ok_or_else(|| invalid_handle("paged slot is not open"))?;
+        let used = self
+            .table
+            .get(&Resource::<BatchSlotEntry>::new_borrow(slot_rep))
+            .map_err(invalid_handle)?
+            .binding
+            .used
+            .load(Ordering::Acquire);
+        if used {
+            Ok(())
+        } else {
+            self.rollback_paged_append(pool_rep, checkpoint)
+        }
+    }
+
+    fn rollback_paged_append(
+        &mut self,
+        pool_rep: u32,
+        checkpoint: SequenceCheckpoint,
+    ) -> Result<(), compute::Error> {
+        let slot_rep = self
+            .table
+            .get(&Resource::<PagePoolEntry>::new_borrow(pool_rep))
+            .map_err(invalid_handle)?
+            .slot
+            .ok_or_else(|| invalid_handle("paged slot is not open"))?;
+        let binding = Arc::clone(
+            &self
+                .table
+                .get(&Resource::<BatchSlotEntry>::new_borrow(slot_rep))
+                .map_err(invalid_handle)?
+                .binding,
+        );
+        let sequence = binding
+            .sequence
+            .lock()
+            .map_err(|_| guest_error(BackendError::ExecutionFailed))?
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| invalid_handle("paged sequence is not active"))?;
+        sequence
+            .lock()
+            .map_err(|_| guest_error(BackendError::ExecutionFailed))?
+            .rollback(checkpoint)
+            .map_err(|error| compute::Error::Quota(error.to_string()))
     }
 
     /// Creates a Wasmtime store with the configured resource limiter installed.
@@ -5830,6 +6012,7 @@ mod tests {
                 max_context,
                 plane_count,
                 slot_banks: None,
+                slot: None,
                 charged_bytes: AtomicU64::new(charged_bytes),
                 live_bytes: Arc::clone(&host.live_bytes),
             })
@@ -5887,6 +6070,7 @@ mod tests {
                 max_context: 4,
                 plane_count: 1,
                 slot_banks: None,
+                slot: None,
                 charged_bytes: AtomicU64::new(charged_bytes),
                 live_bytes: Arc::clone(&host.live_bytes),
             })
@@ -5976,6 +6160,35 @@ mod tests {
         assert!(entry.slot_banks.is_none());
         assert_eq!(pool_state.memory_usage().unwrap(), before_memory);
         assert_eq!(host.live_bytes.load(Ordering::Acquire), before_live);
+    }
+
+    #[test]
+    fn paged_append_rollback_restores_the_retained_sequence() {
+        let mut host = Host::new(CpuBackend::new(), GENEROUS);
+        let pool = insert_test_pool(&mut host, 1, 8);
+        host.open_paged_slot(&pool, 1).unwrap();
+        let initial = host.begin_paged_append(pool.rep(), 0, 0).unwrap().unwrap();
+        host.rollback_paged_append(pool.rep(), initial).unwrap();
+        let before_memory = host.table.get(&pool).unwrap().pool.memory_usage().unwrap();
+        let checkpoint = host.begin_paged_append(pool.rep(), 0, 3).unwrap().unwrap();
+
+        host.rollback_paged_append(pool.rep(), checkpoint).unwrap();
+
+        let slot = host.table.get(&pool).unwrap().slot.unwrap();
+        let binding = &host
+            .table
+            .get(&Resource::<BatchSlotEntry>::new_borrow(slot))
+            .unwrap()
+            .binding;
+        let active = binding.sequence.lock().unwrap();
+        let sequence = active.as_ref().unwrap().lock().unwrap();
+        assert_eq!(sequence.logical_len(), 0);
+        assert_eq!(sequence.reserved_tokens(), 8);
+        assert_eq!(sequence.page_reference_counts().unwrap(), [1, 1]);
+        assert_eq!(
+            host.table.get(&pool).unwrap().pool.memory_usage().unwrap(),
+            before_memory
+        );
     }
 
     fn doubling_program(value: f32) -> compute::ProgramSource {
