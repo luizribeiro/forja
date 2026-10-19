@@ -1,6 +1,7 @@
 //! Reference CPU execution for Forja operations.
 
 pub mod interpreter;
+pub mod paged;
 
 use std::{ops::Range, sync::Mutex, time::Duration};
 
