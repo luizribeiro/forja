@@ -14,6 +14,8 @@ mod indirect_commands;
 mod map_programs;
 #[path = "../nan_comparisons.rs"]
 mod nan_comparisons;
+#[path = "../paged.rs"]
+mod paged;
 #[path = "../quant_embed.rs"]
 mod quant_embed;
 #[path = "../quant_matmul.rs"]

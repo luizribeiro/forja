@@ -17,7 +17,8 @@ use std::sync::atomic::AtomicU64;
 use block2::RcBlock;
 use forja_core::{
     BackendError, BufferId, CommandList, DType, Dispatch, DispatchProfile, GraphTemplate, Layout,
-    Op, PreparedGraph, ProfileCount, ProfileTensor, Slice, Submission, SubmissionProfile, Tensor,
+    Op, PagedCopyDirection, PreparedGraph, ProfileCount, ProfileTensor, Slice, Submission,
+    SubmissionProfile, Tensor,
     program::{
         KernelSignature, PreparedEpilogue, PreparedProgram, ProgramHash, ProgramKind,
         ValidatedProgram,
@@ -409,9 +410,13 @@ fn grouped_block_rows(dispatch: &Dispatch) -> u32 {
 }
 
 fn grouped_error_flag(arguments: &mut ArgumentWriter) -> Result<BufferBinding, BackendError> {
+    arguments.write(&error_state())
+}
+
+fn error_state() -> [u8; 8] {
     let mut state = [0_u8; 8];
     state[4..].copy_from_slice(&u32::MAX.to_ne_bytes());
-    arguments.write(&state)
+    state
 }
 
 #[derive(Clone, Copy)]
@@ -2957,8 +2962,11 @@ impl MetalBackend {
                 buffers
             }
             Op::Copy => self.encode_copy(encoder, table, dispatch, bindings, arguments)?,
-            Op::PagedCopy { .. } | Op::PagedSdpa { .. } => {
-                return Err(BackendError::UnsupportedOperation);
+            Op::PagedCopy { .. } => {
+                let (buffers, flag) =
+                    self.encode_paged_copy(encoder, table, dispatch, bindings, arguments)?;
+                error_flags.push(EncodedErrorFlag::new(flag, dispatch_index, "paged-copy"));
+                buffers
             }
             Op::Matmul => self.encode_matmul(encoder, table, dispatch, bindings, arguments)?,
             Op::GatherMatmul => {
@@ -2991,6 +2999,7 @@ impl MetalBackend {
             Op::Sdpa { .. } => {
                 self.encode_sdpa_dispatch(encoder, table, dispatch, bindings, arguments)?
             }
+            Op::PagedSdpa { .. } => return Err(BackendError::UnsupportedOperation),
         };
         temporaries.extend(buffers);
         Ok(())
@@ -3010,6 +3019,99 @@ impl MetalBackend {
         let input = self.encoder_tensor(input)?;
         let output = self.encoder_tensor(dispatch.output())?;
         self.encode_copy_tensors(encoder, table, &input, &output, bindings, arguments)
+    }
+
+    fn encode_paged_copy(
+        &self,
+        encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
+        table: &ProtocolObject<dyn MTL4ArgumentTable>,
+        dispatch: &Dispatch,
+        bindings: &mut ArgumentBindings,
+        arguments: &mut ArgumentWriter,
+    ) -> Result<(Vec<BufferBinding>, BufferBinding), BackendError> {
+        let Op::PagedCopy {
+            direction,
+            start,
+            page_tokens,
+        } = dispatch.op()
+        else {
+            return Err(BackendError::InvalidInput);
+        };
+        let [first, table_tensor, generations] = dispatch.inputs() else {
+            return Err(BackendError::InvalidInput);
+        };
+        let (ordinary_tensor, pool_tensor) = match direction {
+            PagedCopyDirection::IntoPages => (first, dispatch.output()),
+            PagedCopyDirection::OutOfPages => (dispatch.output(), first),
+        };
+        let ordinary = self.encoder_tensor(ordinary_tensor)?;
+        let pool = self.encoder_tensor(pool_tensor)?;
+        let page_table = self.encoder_tensor(table_tensor)?;
+        let generations = self.encoder_tensor(generations)?;
+        let ordinary_shape: [u32; 2] = ordinary
+            .layout
+            .shape()
+            .try_into()
+            .map_err(|_| BackendError::InvalidInput)?;
+        let pool_shape: [u32; 3] = pool
+            .layout
+            .shape()
+            .try_into()
+            .map_err(|_| BackendError::InvalidInput)?;
+        let table_shape: [u32; 2] = page_table
+            .layout
+            .shape()
+            .try_into()
+            .map_err(|_| BackendError::InvalidInput)?;
+        let mut params = Vec::with_capacity(7 * size_of::<u32>());
+        for value in [
+            start,
+            ordinary_shape[0],
+            ordinary_shape[1],
+            page_tokens,
+            table_shape[0],
+            pool_shape[0],
+            u32::from(direction == PagedCopyDirection::OutOfPages),
+        ] {
+            params.extend_from_slice(&value.to_ne_bytes());
+        }
+        let params = arguments.write(&params)?;
+        let error_flag = arguments.write(&error_state())?;
+        let pipeline = self
+            .pipelines
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?
+            .get("paged_copy", &[(0, dtype_code(ordinary.layout.dtype()))])?;
+        set_pipeline(encoder, &pipeline);
+        for (index, tensor) in [&ordinary, &pool, &page_table, &generations]
+            .into_iter()
+            .enumerate()
+        {
+            bindings.bind(table, index, &tensor.buffer);
+        }
+        bindings.bind(table, 4, &params);
+        bindings.bind(table, 5, &error_flag);
+        set_argument_table(encoder, table);
+        let count = ordinary_shape[0]
+            .checked_mul(ordinary_shape[1])
+            .ok_or(BackendError::InvalidInput)?;
+        let threads = 256_usize.min(pipeline.maxTotalThreadsPerThreadgroup());
+        dispatch_threadgroups(
+            encoder,
+            MTLSize {
+                width: usize::try_from(count)
+                    .map_err(|_| BackendError::InvalidInput)?
+                    .div_ceil(threads),
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: threads,
+                height: 1,
+                depth: 1,
+            },
+        );
+        Ok((vec![params, error_flag.clone()], error_flag))
     }
 
     fn encode_matmul(
@@ -6266,8 +6368,9 @@ impl MetalBackend {
                 }
             }
             Op::Copy => Self::size_copy_arguments(arguments)?,
-            Op::PagedCopy { .. } | Op::PagedSdpa { .. } => {
-                return Err(BackendError::UnsupportedOperation);
+            Op::PagedCopy { .. } => {
+                arguments.write(7 * size_of::<u32>())?;
+                arguments.write(2 * size_of::<u32>())?;
             }
             Op::RmsNorm { .. } => {
                 for len in [112, 112, 112, 8] {
@@ -6347,6 +6450,7 @@ impl MetalBackend {
                 Self::size_gather_quant_arguments(dispatch, arguments)?;
             }
             Op::Sdpa { .. } => self.size_sdpa_arguments(dispatch, arguments)?,
+            Op::PagedSdpa { .. } => return Err(BackendError::UnsupportedOperation),
         }
         Ok(())
     }
@@ -6806,8 +6910,8 @@ fn supported_dispatch(dispatch: &Dispatch) -> bool {
     }
     match dispatch.op() {
         Op::Program(_) => dispatch.bound_program().is_some(),
-        Op::PagedCopy { .. } | Op::PagedSdpa { .. } => false,
         Op::Copy
+        | Op::PagedCopy { .. }
         | Op::RmsNorm { .. }
         | Op::Argmax { .. }
         | Op::TopK { .. }
@@ -6821,6 +6925,7 @@ fn supported_dispatch(dispatch: &Dispatch) -> bool {
         | Op::Sdpa { .. }
         | Op::Sample { .. }
         | Op::SampleMasked { .. } => true,
+        Op::PagedSdpa { .. } => false,
     }
 }
 
@@ -6880,9 +6985,7 @@ pub(super) fn dispatch_kernel(dispatch: &Dispatch) -> Result<&'static str, Backe
                 "copy_strided"
             }
         }
-        Op::PagedCopy { .. } | Op::PagedSdpa { .. } => {
-            return Err(BackendError::UnsupportedOperation);
-        }
+        Op::PagedCopy { .. } => "paged_copy",
         Op::RmsNorm { .. } => "rms_norm",
         Op::Argmax { chunk_width } => {
             let [input] = dispatch.inputs() else {
@@ -6944,6 +7047,7 @@ pub(super) fn dispatch_kernel(dispatch: &Dispatch) -> Result<&'static str, Backe
             }
         }
         Op::Sdpa { .. } => sdpa_kernel(dispatch)?,
+        Op::PagedSdpa { .. } => return Err(BackendError::UnsupportedOperation),
     })
 }
 
@@ -7022,7 +7126,9 @@ fn reusable_dispatch(dispatch: &Dispatch) -> bool {
         | Op::QuantEmbed { .. }
         | Op::GatherMatmul
         | Op::GatherQuantMatmul { .. }
-        | Op::Sdpa { .. } => false,
+        | Op::Sdpa { .. }
+        | Op::PagedCopy { .. }
+        | Op::PagedSdpa { .. } => false,
         Op::Matmul => {
             dispatch
                 .primitive_inputs()
