@@ -240,6 +240,15 @@ impl PagePool {
         Ok(())
     }
 
+    fn allocate_one(&self) -> Result<PageLease, PagePoolError> {
+        let mut state = self.lock()?;
+        preflight_pages(self, &state, 1, 0)?;
+        grow_for(self, &mut state, 1)?;
+        allocate_pages(&mut state, 1)?
+            .pop()
+            .ok_or(PagePoolError::CorruptState)
+    }
+
     fn refcount(&self, lease: PageLease) -> Result<u32, PagePoolError> {
         let mut state = self.lock()?;
         Ok(live_page_mut(&mut state, lease)?.references)
@@ -345,6 +354,94 @@ impl PagedSequence {
             .collect();
         PageTable::new(entries, generations).map_err(|_| PagePoolError::CorruptState)
     }
+
+    /// Shares the committed prefix with a sibling sequence.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the prefix exceeds the committed length or refcounts overflow.
+    pub fn fork(&mut self, prefix_tokens: u64) -> Result<Self, PagePoolError> {
+        if prefix_tokens > self.logical_len {
+            return Err(PagePoolError::UnreservedWrite);
+        }
+        let page_count = pages_for(prefix_tokens, self.pool.layout().page_tokens())?;
+        let count = usize::try_from(page_count).map_err(|_| PagePoolError::ArithmeticOverflow)?;
+        let pages = self
+            .pages
+            .get(..count)
+            .ok_or(PagePoolError::CorruptState)?
+            .to_vec();
+        let table_bytes = page_count
+            .checked_mul(8)
+            .ok_or(PagePoolError::ArithmeticOverflow)?;
+        let mut state = self.pool.lock()?;
+        let projected = state
+            .memory
+            .total()
+            .and_then(|bytes| bytes.checked_add(table_bytes))
+            .ok_or(PagePoolError::ArithmeticOverflow)?;
+        if projected > self.pool.inner.byte_limit {
+            return Err(PagePoolError::QuotaExceeded);
+        }
+        for lease in &pages {
+            let page = live_page_mut(&mut state, *lease)?;
+            page.references = page
+                .references
+                .checked_add(1)
+                .ok_or(PagePoolError::ArithmeticOverflow)?;
+        }
+        state.memory.table_bytes = state
+            .memory
+            .table_bytes
+            .checked_add(table_bytes)
+            .ok_or(PagePoolError::ArithmeticOverflow)?;
+        drop(state);
+        self.immutable
+            .get_mut(..count)
+            .ok_or(PagePoolError::CorruptState)?
+            .fill(true);
+        Ok(Self {
+            pool: self.pool.clone(),
+            pages,
+            immutable: vec![true; count],
+            logical_len: prefix_tokens,
+            reserved_tokens: prefix_tokens,
+            table_bytes,
+        })
+    }
+
+    /// Replaces a shared tail with a fresh private page before backend copying.
+    ///
+    /// # Errors
+    ///
+    /// Returns quota or state errors atomically before changing the table.
+    pub fn cow_tail(&mut self) -> Result<Option<CowPageCopy>, PagePoolError> {
+        if self.logical_len == 0 {
+            return Ok(None);
+        }
+        let page_tokens = u64::from(self.pool.layout().page_tokens());
+        let tail = usize::try_from((self.logical_len - 1) / page_tokens)
+            .map_err(|_| PagePoolError::ArithmeticOverflow)?;
+        let old = *self.pages.get(tail).ok_or(PagePoolError::CorruptState)?;
+        if !self.immutable.get(tail).copied().unwrap_or(true) && self.pool.refcount(old)? == 1 {
+            return Ok(None);
+        }
+        let new = self.pool.allocate_one()?;
+        self.pages[tail] = new;
+        self.immutable[tail] = false;
+        if let Err(error) = self.pool.release(&[old]) {
+            self.pages[tail] = old;
+            self.immutable[tail] = true;
+            self.pool.release(&[new])?;
+            return Err(error);
+        }
+        Ok(Some(CowPageCopy {
+            source: old.index,
+            destination: new.index,
+            token_count: u32::try_from(self.logical_len % page_tokens)
+                .map_err(|_| PagePoolError::ArithmeticOverflow)?,
+        }))
+    }
 }
 
 impl Drop for PagedSequence {
@@ -353,6 +450,34 @@ impl Drop for PagedSequence {
         if let Ok(mut state) = self.pool.lock() {
             state.memory.table_bytes = state.memory.table_bytes.saturating_sub(self.table_bytes);
         }
+    }
+}
+
+/// Physical page copy required to complete a tail copy-on-write transition.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CowPageCopy {
+    source: u32,
+    destination: u32,
+    token_count: u32,
+}
+
+impl CowPageCopy {
+    /// Returns the source physical page.
+    #[must_use]
+    pub const fn source(self) -> u32 {
+        self.source
+    }
+
+    /// Returns the new private physical page.
+    #[must_use]
+    pub const fn destination(self) -> u32 {
+        self.destination
+    }
+
+    /// Returns valid prefix tokens that must be copied.
+    #[must_use]
+    pub const fn token_count(self) -> u32 {
+        self.token_count
     }
 }
 
@@ -522,5 +647,25 @@ mod tests {
         pool.observe_completion(7).unwrap();
         let reused = pool.reserve(4).unwrap();
         assert_eq!(reused.table().unwrap().resolve(0).unwrap(), old);
+    }
+
+    #[test]
+    fn fork_shares_prefix_until_tail_copy_on_write() {
+        let pool = pool(1_024);
+        let mut original = pool.reserve(8).unwrap();
+        original.commit_write(7).unwrap();
+        let sibling = original.fork(7).unwrap();
+        assert_eq!(original.table().unwrap(), sibling.table().unwrap());
+        assert_eq!(
+            original.validate_write(7, 1),
+            Err(PagePoolError::SharedTail)
+        );
+
+        let copy = original.cow_tail().unwrap().unwrap();
+
+        assert_ne!(copy.source(), copy.destination());
+        assert_eq!(copy.token_count(), 3);
+        original.commit_write(1).unwrap();
+        assert_ne!(original.table().unwrap(), sibling.table().unwrap());
     }
 }
