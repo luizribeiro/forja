@@ -7,6 +7,145 @@ pub const MAX_PAGE_TOKENS: u32 = 4_096;
 /// Largest accepted plane count in one pool.
 pub const MAX_PAGED_PLANES: usize = 4_096;
 const MAX_LABEL_BYTES: usize = 64;
+const POISON_GENERATION: u32 = u32::MAX;
+
+/// One authenticated logical-to-physical page mapping.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(C)]
+pub struct PageTableEntry {
+    page: u32,
+    generation: u32,
+}
+
+impl PageTableEntry {
+    /// Creates an entry from trusted allocator state.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn new(page: u32, generation: u32) -> Self {
+        Self { page, generation }
+    }
+
+    /// Returns the physical page index.
+    #[must_use]
+    pub const fn page(self) -> u32 {
+        self.page
+    }
+
+    /// Returns the allocation generation carried by the entry.
+    #[must_use]
+    pub const fn generation(self) -> u32 {
+        self.generation
+    }
+}
+
+/// A reason a page-table lookup was refused.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PageTableError {
+    /// The logical page index is outside the table.
+    LogicalPageOutOfBounds,
+    /// The entry names a physical page outside the pool.
+    PhysicalPageOutOfBounds,
+    /// The entry generation does not authenticate the current allocation.
+    StaleGeneration,
+}
+
+impl fmt::Display for PageTableError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "invalid page table: {self:?}")
+    }
+}
+
+impl Error for PageTableError {}
+
+/// A host-owned, generation-authenticated logical page table.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PageTable {
+    entries: Vec<PageTableEntry>,
+    generations: Vec<u32>,
+    contiguous: bool,
+}
+
+impl PageTable {
+    /// Validates every entry against the current physical-page generations.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PageTableError`] when an entry is out of bounds or stale.
+    pub fn new(
+        entries: Vec<PageTableEntry>,
+        generations: Vec<u32>,
+    ) -> Result<Self, PageTableError> {
+        for entry in &entries {
+            validate_entry(*entry, &generations)?;
+        }
+        let contiguous = entries
+            .windows(2)
+            .all(|pair| pair[0].page.checked_add(1) == Some(pair[1].page));
+        Ok(Self {
+            entries,
+            generations,
+            contiguous,
+        })
+    }
+
+    /// Constructs an inactive-lane table whose entries must never be dereferenced.
+    #[must_use]
+    pub fn poisoned(logical_pages: usize) -> Self {
+        Self {
+            entries: vec![PageTableEntry::new(0, POISON_GENERATION); logical_pages],
+            generations: vec![0],
+            contiguous: false,
+        }
+    }
+
+    /// Resolves one logical page after rechecking its generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PageTableError`] when the logical index, physical index, or generation is bad.
+    pub fn resolve(&self, logical_page: u32) -> Result<u32, PageTableError> {
+        let entry = self
+            .entries
+            .get(
+                usize::try_from(logical_page)
+                    .map_err(|_| PageTableError::LogicalPageOutOfBounds)?,
+            )
+            .copied()
+            .ok_or(PageTableError::LogicalPageOutOfBounds)?;
+        validate_entry(entry, &self.generations)?;
+        Ok(entry.page)
+    }
+
+    /// Returns whether the validator proved that every physical page is consecutive.
+    #[must_use]
+    pub const fn is_contiguous(&self) -> bool {
+        self.contiguous
+    }
+
+    /// Returns the authenticated entries for trusted backend upload.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn entries(&self) -> &[PageTableEntry] {
+        &self.entries
+    }
+
+    /// Returns current generations for trusted backend upload.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn generations(&self) -> &[u32] {
+        &self.generations
+    }
+}
+
+fn validate_entry(entry: PageTableEntry, generations: &[u32]) -> Result<(), PageTableError> {
+    let generation = generations
+        .get(usize::try_from(entry.page).map_err(|_| PageTableError::PhysicalPageOutOfBounds)?)
+        .ok_or(PageTableError::PhysicalPageOutOfBounds)?;
+    if *generation != entry.generation {
+        return Err(PageTableError::StaleGeneration);
+    }
+    Ok(())
+}
 
 /// One independently typed plane in a paged storage pool.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -190,6 +329,29 @@ mod tests {
         assert_eq!(
             PagedLayout::new(64, vec![overflowing]),
             Err(PagedLayoutError::ArithmeticOverflow)
+        );
+    }
+
+    #[test]
+    fn authenticates_and_classifies_page_tables() {
+        let table = PageTable::new(
+            vec![PageTableEntry::new(2, 7), PageTableEntry::new(3, 11)],
+            vec![0, 0, 7, 11],
+        )
+        .unwrap();
+        assert_eq!(table.resolve(1), Ok(3));
+        assert!(table.is_contiguous());
+        assert_eq!(
+            PageTable::new(vec![PageTableEntry::new(2, 6)], vec![0, 0, 7]),
+            Err(PageTableError::StaleGeneration)
+        );
+    }
+
+    #[test]
+    fn poisoned_tables_fail_if_dereferenced() {
+        assert_eq!(
+            PageTable::poisoned(1).resolve(0),
+            Err(PageTableError::StaleGeneration)
         );
     }
 }

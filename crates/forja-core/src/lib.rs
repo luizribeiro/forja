@@ -28,7 +28,10 @@ pub use ops::{
     TensorError, gather_matmul_flops, gather_quant_matmul_dispatch_flops,
     gather_quant_matmul_flops, matmul_flops, quant_matmul_flops, required_barriers, sdpa_flops,
 };
-pub use paged::{MAX_PAGE_TOKENS, MAX_PAGED_PLANES, PagedLayout, PagedLayoutError, PagedPlane};
+pub use paged::{
+    MAX_PAGE_TOKENS, MAX_PAGED_PLANES, PageTable, PageTableEntry, PageTableError, PagedLayout,
+    PagedLayoutError, PagedPlane,
+};
 pub use quantized::{QuantizedMatrix, QuantizedMatrixError, QuantizedMatrixPart};
 pub use symbolic::{
     Affine, ByteHull, MAX_PARAMS, ParamError, ParamSpace, ParamValues, SymbolicLayout,
