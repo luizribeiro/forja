@@ -34,6 +34,51 @@ const SERVING_TOKENS: u32 = 128;
 #[cfg(target_os = "macos")]
 #[tokio::test]
 #[ignore = "requires FORJA_MODELS and runs in the pre-push hook"]
+async fn metal_first_paged_layer_matches_same_byte_reference() -> Result<(), Box<dyn Error>> {
+    let root = model_root()?;
+    let fixtures = FixtureDirectory::open(root.join("golden/Qwen3-Coder-30B-A3B-Instruct-4bit"))?;
+    let fixture = fixtures
+        .prompt("python")
+        .ok_or("python fixture is missing")?;
+    let tokens = fixture
+        .prompt_ids()
+        .iter()
+        .map(|&token| u32::try_from(token))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut runner = runner(test_guests::qwen3_coder()).await?;
+    let mut config = load_config()?;
+    config.paged_cache = true;
+    runner.load_with_selections(Some(1), &config).await??;
+    let output = runner
+        .step(EngineStep {
+            tokens,
+            start_pos: 0,
+            taps: true,
+        })
+        .await??;
+    let actual = decode_f32_le(&runner.read(&output.router_logits[0]).await?)?;
+    let expected = fixture.router_logits().ok_or("router fixture is missing")?;
+    let reference = expected
+        .values()
+        .get(..actual.len())
+        .ok_or("router fixture is incomplete")?;
+    let error = normwise_relative_error(reference, &actual)?;
+    assert!(
+        error <= BF16_HIDDEN_STATE_TOLERANCE,
+        "relative error {error}"
+    );
+    assert_selected_sets(
+        reference,
+        &actual,
+        usize::try_from(qwen3_coder::EXPERTS)?,
+        usize::try_from(qwen3_coder::TOP_K)?,
+    )?;
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[ignore = "requires FORJA_MODELS and runs in the pre-push hook"]
 async fn metal_hidden_states_and_routing_match_same_byte_reference() -> Result<(), Box<dyn Error>> {
     let root = model_root()?;
     let fixtures = FixtureDirectory::open(root.join("golden/Qwen3-Coder-30B-A3B-Instruct-4bit"))?;

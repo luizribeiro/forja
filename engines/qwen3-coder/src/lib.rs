@@ -7,9 +7,9 @@ use forja_sdk::Param;
 #[cfg(target_family = "wasm")]
 use forja_sdk::nn::blocks::{ChunkedPrefill, DecodeSelection, DecodeState, PrefillExecution};
 use forja_sdk::{
-    CachePlane, DType, Dim, Engine, EngineInfo, EngineLoadConfig, KvCacheFormat, Load, Result,
-    ServingInfo, StepInput, StepOutput, Tensor, VariantSelection, Weights, bf16, export_engine,
-    f16,
+    CachePlane, DType, Dim, Engine, EngineInfo, EngineLoadConfig, KvCacheFormat, Load, PagedCache,
+    PagedCacheSet, PagedPool, Result, ServingInfo, StepInput, StepOutput, Tensor, VariantSelection,
+    Weights, bf16, export_engine, f16,
     kernel::{Epilogue, Kernel, TensorRef},
     nn::{
         RmsNorm, RmsNormConfig,
@@ -557,10 +557,75 @@ struct DecoderLayer {
 }
 
 struct LayerResources<'a> {
-    cache: &'a mut Cache,
+    cache: LayerCache<'a>,
     following_norm: &'a RmsNorm<f32>,
     qk_norm_rope: &'a Kernel,
     moe_epilogues: &'a MoeEpilogues,
+}
+
+enum LayerCache<'a> {
+    Contiguous(&'a mut Cache),
+    Paged(PagedCache<'a>, KvCacheFormat),
+}
+
+impl LayerCache<'_> {
+    fn attention(
+        &mut self,
+        query: &Tensor<f32>,
+        key: &Tensor<f32>,
+        value: &Tensor<f32>,
+        start: &Dim,
+        end: &Dim,
+        selection: forja_sdk::target::metal::VariantChoice<'_>,
+    ) -> Result<Tensor<f32>> {
+        match self {
+            Self::Contiguous(cache) => cache.attention(query, key, value, start, end, selection),
+            Self::Paged(cache, KvCacheFormat::F16) => {
+                paged_cache_attention::<f16>(cache, query, key, value, start.value())
+            }
+            Self::Paged(cache, KvCacheFormat::Bf16) => {
+                paged_cache_attention::<bf16>(cache, query, key, value, start.value())
+            }
+            Self::Paged(cache, KvCacheFormat::F32) => {
+                paged_cache_attention::<f32>(cache, query, key, value, start.value())
+            }
+        }
+    }
+}
+
+fn paged_cache_attention<C: forja_sdk::Element>(
+    cache: &PagedCache<'_>,
+    query: &Tensor<f32>,
+    key: &Tensor<f32>,
+    value: &Tensor<f32>,
+    start: u32,
+) -> Result<Tensor<f32>> {
+    let cached_key = key.to_dtype::<C>()?;
+    let cached_value = value.to_dtype::<C>()?;
+    cache.append(&cached_key, &cached_value, start)?;
+    cache.attention(query, ATTENTION_SCALE)
+}
+
+enum CacheStorage {
+    Contiguous(Vec<Cache>),
+    Paged(PagedCacheSet, KvCacheFormat),
+}
+
+impl CacheStorage {
+    fn layer(&mut self, index: usize) -> Result<LayerCache<'_>> {
+        match self {
+            Self::Contiguous(caches) => caches
+                .get_mut(index)
+                .map(LayerCache::Contiguous)
+                .ok_or_else(|| forja_sdk::Error::loading("cache layer is out of range")),
+            Self::Paged(caches, format) => caches
+                .layer(
+                    u32::try_from(index)
+                        .map_err(|_| forja_sdk::Error::loading("cache layer exceeds u32"))?,
+                )
+                .map(|cache| LayerCache::Paged(cache, *format)),
+        }
+    }
 }
 
 enum Cache {
@@ -653,7 +718,7 @@ impl DecoderLayer {
         resources: LayerResources<'_>,
     ) -> Result<(Tensor<f32>, Tensor<f32>, Tensor<f32>)> {
         let LayerResources {
-            cache,
+            mut cache,
             following_norm,
             qk_norm_rope: qk_kernel,
             moe_epilogues,
@@ -738,7 +803,7 @@ impl QwenWeights {
 pub struct Qwen3Coder {
     weights: QwenWeights,
     variants: variants::Variants,
-    caches: Vec<Cache>,
+    caches: CacheStorage,
     residual_norm: Kernel,
     rms_norm: Kernel,
     qk_norm_rope: Kernel,
@@ -758,13 +823,28 @@ impl Qwen3Coder {
     fn load_from_weights(
         weights: &Weights<'_>,
         layers: usize,
+        pool: Option<PagedPool<'_>>,
         config: &EngineLoadConfig,
     ) -> Result<Self> {
         let variants = variants::Variants::new(config)?;
         let weights = QwenWeights::load(weights, layers)?;
-        let caches = (0..layers)
-            .map(|_| Cache::new(config.kv_cache))
-            .collect::<Result<Vec<_>>>()?;
+        #[cfg(target_family = "wasm")]
+        let paged = pool.is_some();
+        let caches = if let Some(pool) = pool {
+            CacheStorage::Paged(
+                pool.cache_set(
+                    u32::try_from(layers)
+                        .map_err(|_| forja_sdk::Error::loading("layer count exceeds u32"))?,
+                )?,
+                config.kv_cache,
+            )
+        } else {
+            CacheStorage::Contiguous(
+                (0..layers)
+                    .map(|_| Cache::new(config.kv_cache))
+                    .collect::<Result<Vec<_>>>()?,
+            )
+        };
         Ok(Self {
             weights,
             variants,
@@ -780,20 +860,24 @@ impl Qwen3Coder {
                 &[MAX_CONTEXT],
             )?,
             #[cfg(target_family = "wasm")]
-            replay: config.replay,
+            replay: config.replay && !paged,
             #[cfg(target_family = "wasm")]
             decode: DecodeState::new(MAX_CONTEXT, VOCAB)?,
             #[cfg(target_family = "wasm")]
-            short_prefill: Some(
-                ChunkedPrefill::new(MAX_CONTEXT, SHORT_PREFILL_CHUNK)?
-                    .with_tail_capacity(SHORT_PREFILL_TAIL_CAPACITY)?,
-            ),
+            short_prefill: (!paged)
+                .then(|| {
+                    ChunkedPrefill::new(MAX_CONTEXT, SHORT_PREFILL_CHUNK)?
+                        .with_tail_capacity(SHORT_PREFILL_TAIL_CAPACITY)
+                })
+                .transpose()?,
             #[cfg(target_family = "wasm")]
-            long_prefill: Some(
-                ChunkedPrefill::new(MAX_CONTEXT, PREFILL_CHUNK)?
-                    .with_tail_chunk(PREFILL_TAIL_CHUNK)?
-                    .with_tail_capacity(LONG_PREFILL_TAIL_CAPACITY)?,
-            ),
+            long_prefill: (!paged)
+                .then(|| {
+                    ChunkedPrefill::new(MAX_CONTEXT, PREFILL_CHUNK)?
+                        .with_tail_chunk(PREFILL_TAIL_CHUNK)?
+                        .with_tail_capacity(LONG_PREFILL_TAIL_CAPACITY)
+                })
+                .transpose()?,
         })
     }
 
@@ -861,7 +945,7 @@ impl Qwen3Coder {
                     attention_variant,
                 },
                 LayerResources {
-                    cache: &mut self.caches[index],
+                    cache: self.caches.layer(index)?,
                     following_norm,
                     qk_norm_rope: &self.qk_norm_rope,
                     moe_epilogues: &self.moe_epilogues,
@@ -928,7 +1012,24 @@ impl Engine for Qwen3Coder {
                 "layer count must be between 1 and 48",
             ));
         }
-        Self::load_from_weights(weights, layers, &config)
+        Self::load_from_weights(weights, layers, None, &config)
+    }
+
+    fn load_paged(
+        weights: &Weights<'_>,
+        pool: Option<PagedPool<'_>>,
+        config: EngineLoadConfig,
+    ) -> Result<Self> {
+        let layers = config
+            .num_hidden_layers
+            .map_or(Ok(LAYERS), usize::try_from)
+            .map_err(|_| forja_sdk::Error::loading("layer count does not fit usize"))?;
+        if !(1..=LAYERS).contains(&layers) {
+            return Err(forja_sdk::Error::loading(
+                "layer count must be between 1 and 48",
+            ));
+        }
+        Self::load_from_weights(weights, layers, pool, &config)
     }
 
     fn step(&mut self, input: StepInput) -> Result<StepOutput> {
@@ -1040,9 +1141,9 @@ impl Engine for Qwen3Coder {
 
     #[cfg(target_family = "wasm")]
     fn begin_decode(&mut self, input: forja_sdk::BeginDecodeInput) -> Result<Tensor<f32>> {
-        if !self.replay || input.start_pos >= MAX_CONTEXT {
+        if input.start_pos >= MAX_CONTEXT {
             return Err(forja_sdk::Error::loading(
-                "constrained decode requires replay within context",
+                "constrained decode requires a position within context",
             ));
         }
         if let Some(tokens) = input.tokens.as_ref()
@@ -1052,11 +1153,23 @@ impl Engine for Qwen3Coder {
                 "constrained decode accepts exactly one input token",
             ));
         }
-        self.replay_decode(
-            input.tokens.as_ref(),
-            input.start_pos,
-            DecodeSelection::None,
-        )
+        if self.replay {
+            return self.replay_decode(
+                input.tokens.as_ref(),
+                input.start_pos,
+                DecodeSelection::None,
+            );
+        }
+        let token = match input.tokens {
+            Some(tokens) => tokens,
+            None => self.decode.token()?,
+        };
+        let start = input.start_pos.into();
+        let end = (input.start_pos + 1).into();
+        let attention = self.variants.attention(1, input.start_pos, None)?;
+        Ok(self
+            .forward(&token, 1, &start, &end, false, &attention)?
+            .logits)
     }
 
     #[cfg(target_family = "wasm")]
