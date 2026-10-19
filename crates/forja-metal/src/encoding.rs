@@ -2999,7 +2999,12 @@ impl MetalBackend {
             Op::Sdpa { .. } => {
                 self.encode_sdpa_dispatch(encoder, table, dispatch, bindings, arguments)?
             }
-            Op::PagedSdpa { .. } => return Err(BackendError::UnsupportedOperation),
+            Op::PagedSdpa { .. } => {
+                let (buffers, flag) =
+                    self.encode_paged_sdpa(encoder, table, dispatch, bindings, arguments)?;
+                error_flags.push(EncodedErrorFlag::new(flag, dispatch_index, "paged-sdpa"));
+                buffers
+            }
         };
         temporaries.extend(buffers);
         Ok(())
@@ -3107,6 +3112,128 @@ impl MetalBackend {
             },
             MTLSize {
                 width: threads,
+                height: 1,
+                depth: 1,
+            },
+        );
+        Ok((vec![params, error_flag.clone()], error_flag))
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn encode_paged_sdpa(
+        &self,
+        encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
+        table: &ProtocolObject<dyn MTL4ArgumentTable>,
+        dispatch: &Dispatch,
+        bindings: &mut ArgumentBindings,
+        arguments: &mut ArgumentWriter,
+    ) -> Result<(Vec<BufferBinding>, BufferBinding), BackendError> {
+        let Op::PagedSdpa {
+            scale,
+            causal,
+            q_start,
+            key_length,
+            page_tokens,
+            contiguous_entries,
+        } = dispatch.op()
+        else {
+            return Err(BackendError::InvalidInput);
+        };
+        let [
+            query_tensor,
+            key_tensor,
+            value_tensor,
+            table_tensor,
+            generation_tensor,
+        ] = dispatch.inputs()
+        else {
+            return Err(BackendError::InvalidInput);
+        };
+        let query = self.encoder_tensor(query_tensor)?;
+        let key = self.encoder_tensor(key_tensor)?;
+        let value = self.encoder_tensor(value_tensor)?;
+        let page_table = self.encoder_tensor(table_tensor)?;
+        let generations = self.encoder_tensor(generation_tensor)?;
+        let output = self.encoder_tensor(dispatch.output())?;
+        let q: [u32; 3] = query
+            .layout
+            .shape()
+            .try_into()
+            .map_err(|_| BackendError::InvalidInput)?;
+        let k: [u32; 4] = key
+            .layout
+            .shape()
+            .try_into()
+            .map_err(|_| BackendError::InvalidInput)?;
+        let v: [u32; 4] = value
+            .layout
+            .shape()
+            .try_into()
+            .map_err(|_| BackendError::InvalidInput)?;
+        let t: [u32; 2] = page_table
+            .layout
+            .shape()
+            .try_into()
+            .map_err(|_| BackendError::InvalidInput)?;
+        let mut params = Vec::with_capacity(14 * size_of::<u32>());
+        params.extend_from_slice(&scale.to_ne_bytes());
+        for value in [
+            q[0],
+            q[1],
+            q[2],
+            k[2],
+            key_length,
+            v[3],
+            q[0] / k[2],
+            q_start,
+            u32::from(causal),
+            page_tokens,
+            t[0],
+            k[0],
+            u32::from(contiguous_entries),
+        ] {
+            params.extend_from_slice(&value.to_ne_bytes());
+        }
+        let params = arguments.write(&params)?;
+        let error_flag = arguments.write(&error_state())?;
+        let kernel = match q[2] {
+            64 => "paged_sdpa_64",
+            128 => "paged_sdpa_128",
+            _ => return Err(BackendError::UnsupportedOperation),
+        };
+        let constants = [
+            (0, dtype_code(query.layout.dtype())),
+            (1, dtype_code(key.layout.dtype())),
+            (2, dtype_code(output.layout.dtype())),
+            (3, dtype_code(value.layout.dtype())),
+        ];
+        let pipeline = self
+            .pipelines
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?
+            .get(kernel, &constants)?;
+        if pipeline.maxTotalThreadsPerThreadgroup() < 1_024 {
+            return Err(BackendError::UnsupportedOperation);
+        }
+        set_pipeline(encoder, &pipeline);
+        for (index, tensor) in [&query, &key, &value, &page_table, &generations, &output]
+            .into_iter()
+            .enumerate()
+        {
+            bindings.bind(table, index, &tensor.buffer);
+        }
+        bindings.bind(table, 6, &params);
+        bindings.bind(table, 7, &error_flag);
+        set_argument_table(encoder, table);
+        dispatch_threadgroups(
+            encoder,
+            MTLSize {
+                width: usize::try_from(q[0]).map_err(|_| BackendError::InvalidInput)?,
+                height: usize::try_from(q[1]).map_err(|_| BackendError::InvalidInput)?,
+                depth: 1,
+            },
+            MTLSize {
+                width: 1_024,
                 height: 1,
                 depth: 1,
             },
@@ -6450,7 +6577,10 @@ impl MetalBackend {
                 Self::size_gather_quant_arguments(dispatch, arguments)?;
             }
             Op::Sdpa { .. } => self.size_sdpa_arguments(dispatch, arguments)?,
-            Op::PagedSdpa { .. } => return Err(BackendError::UnsupportedOperation),
+            Op::PagedSdpa { .. } => {
+                arguments.write(14 * size_of::<u32>())?;
+                arguments.write(2 * size_of::<u32>())?;
+            }
         }
         Ok(())
     }
@@ -6923,9 +7053,9 @@ fn supported_dispatch(dispatch: &Dispatch) -> bool {
         | Op::QuantMatmul { .. }
         | Op::GatherQuantMatmul { .. }
         | Op::Sdpa { .. }
+        | Op::PagedSdpa { .. }
         | Op::Sample { .. }
         | Op::SampleMasked { .. } => true,
-        Op::PagedSdpa { .. } => false,
     }
 }
 
@@ -7047,7 +7177,19 @@ pub(super) fn dispatch_kernel(dispatch: &Dispatch) -> Result<&'static str, Backe
             }
         }
         Op::Sdpa { .. } => sdpa_kernel(dispatch)?,
-        Op::PagedSdpa { .. } => return Err(BackendError::UnsupportedOperation),
+        Op::PagedSdpa { .. } => {
+            let width = dispatch
+                .inputs()
+                .first()
+                .and_then(|query| query.layout().shape().get(2))
+                .copied()
+                .ok_or(BackendError::InvalidInput)?;
+            match width {
+                64 => "paged_sdpa_64",
+                128 => "paged_sdpa_128",
+                _ => return Err(BackendError::UnsupportedOperation),
+            }
+        }
     })
 }
 

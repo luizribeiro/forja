@@ -883,6 +883,7 @@ dependencies = [
  "forja-core",
  "forja-cpu",
  "forja-testing",
+ "half",
  "mach2",
  "objc2",
  "objc2-foundation",
