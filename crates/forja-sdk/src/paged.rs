@@ -1,6 +1,6 @@
 use std::marker::PhantomData;
 
-use crate::{Error, Result};
+use crate::{Element, Error, Result, Tensor};
 
 /// A borrowed capability for the host-owned paged-storage pool.
 pub struct PagedPool<'a> {
@@ -103,6 +103,87 @@ impl PagedCache<'_> {
     #[must_use]
     pub const fn value_plane(&self) -> u32 {
         self.value_plane
+    }
+
+    /// Appends sequence-major key and value rows to this layer's planes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for incompatible shapes, overflow, or refused host work.
+    pub fn append<T: Element>(&self, key: &Tensor<T>, value: &Tensor<T>, start: u32) -> Result<()> {
+        let [tokens, heads, width]: [u32; 3] = key
+            .shape()
+            .try_into()
+            .map_err(|_| Error::loading("paged key must have rank three"))?;
+        if value.shape() != key.shape() {
+            return Err(Error::loading("paged key and value shapes differ"));
+        }
+        let elements = heads
+            .checked_mul(width)
+            .ok_or_else(|| Error::loading("paged cache row width overflowed"))?;
+        let key = key.contiguous()?.reshape(&[tokens, elements])?;
+        let value = value.contiguous()?.reshape(&[tokens, elements])?;
+        #[cfg(target_family = "wasm")]
+        crate::graph::record_import(|commands| {
+            crate::sys::paged_copy(
+                commands,
+                &self._set._slot,
+                self.key_plane,
+                u64::from(start),
+                u64::from(tokens),
+                key.handle(),
+            )?;
+            crate::sys::paged_copy(
+                commands,
+                &self._set._slot,
+                self.value_plane,
+                u64::from(start),
+                u64::from(tokens),
+                value.handle(),
+            )
+        })?;
+        #[cfg(not(target_family = "wasm"))]
+        let _ = (&key, &value, start);
+        Ok(())
+    }
+
+    /// Applies causal attention to this layer's host-bound page table.
+    ///
+    /// The query has shape `[sequence, query_heads, width]`; the result has
+    /// shape `[sequence, query_heads * width]`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for incompatible shapes, overflow, or refused host work.
+    pub fn attention<T: Element>(&self, query: &Tensor<T>, scale: f32) -> Result<Tensor<T>> {
+        let [sequence, heads, width]: [u32; 3] = query
+            .shape()
+            .try_into()
+            .map_err(|_| Error::loading("paged attention query must have rank three"))?;
+        let hidden = heads
+            .checked_mul(width)
+            .ok_or_else(|| Error::loading("paged attention width overflowed"))?;
+        let query = query.permute(&[1, 0, 2])?.contiguous()?;
+        let output = Tensor::zeros(&[heads, sequence, width])?;
+        #[cfg(target_family = "wasm")]
+        crate::graph::record_import(|commands| {
+            crate::sys::paged_sdpa(
+                commands,
+                &self._set._slot,
+                query.handle(),
+                output.handle(),
+                self.key_plane,
+                self.value_plane,
+                scale,
+                true,
+            )
+        })?;
+        #[cfg(not(target_family = "wasm"))]
+        let _ = (&query, scale);
+        output
+            .permute(&[1, 0, 2])?
+            .contiguous()?
+            .reshape(&[sequence, hidden])
     }
 }
 

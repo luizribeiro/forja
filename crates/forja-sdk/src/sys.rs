@@ -1596,6 +1596,53 @@ pub(crate) fn dispatch_many(
     Active::dispatch_many(commands, operation, inputs, outputs)
 }
 
+#[cfg(target_family = "wasm")]
+pub(crate) fn paged_copy(
+    commands: &mut Commands,
+    slot: &guest::paged_storage::BatchSlot,
+    plane: u32,
+    start: u64,
+    len: u64,
+    ordinary: &Handle,
+) -> Result<()> {
+    guest::paged_storage::record_paged_copy(
+        commands,
+        slot,
+        0,
+        guest::paged_storage::PagedSpan { plane, start, len },
+        ordinary,
+        guest::paged_storage::CopyDirection::IntoPages,
+    )
+    .map_err(|error| Error::new(format!("{error:?}")))
+}
+
+#[cfg(target_family = "wasm")]
+pub(crate) fn paged_sdpa(
+    commands: &mut Commands,
+    slot: &guest::paged_storage::BatchSlot,
+    query: &Handle,
+    output: &Handle,
+    key_plane: u32,
+    value_plane: u32,
+    scale: f32,
+    causal: bool,
+) -> Result<()> {
+    guest::paged_storage::record_paged_sdpa(
+        commands,
+        slot,
+        0,
+        query,
+        output,
+        guest::paged_storage::SdpaCfg {
+            key_plane,
+            value_plane,
+            scale,
+            causal,
+        },
+    )
+    .map_err(|error| Error::new(format!("{error:?}")))
+}
+
 pub(crate) fn dispatch_variant(
     commands: &mut Commands,
     operation: Op,
