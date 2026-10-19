@@ -24,10 +24,10 @@ use std::{
 use forja_core::{
     Affine, Backend, BackendDispatchData, BackendError, BufferId, CommandList, DType, DeviceInfo,
     GraphLimits, GraphTemplate, Layout, LayoutError, MemoryUsage, Op, OpError, PagePool,
-    PagedLayout, PagedPlane, PagedSequence, PagedSlotBanks, ParamSpace, PreparedGraph, RuleArm,
-    SequenceCheckpoint, Slice, Submission, SubmissionProfile, SymbolicLayout, SymbolicLayoutError,
-    TemplateOp, TemplateTensor, Tensor, ViewOp, gather_matmul_flops,
-    gather_quant_matmul_dispatch_flops, matmul_flops,
+    PagedCopyDirection, PagedLayout, PagedPlane, PagedSequence, PagedSlotBanks, ParamSpace,
+    PreparedGraph, RuleArm, SequenceCheckpoint, Slice, Submission, SubmissionProfile,
+    SymbolicLayout, SymbolicLayoutError, TemplateOp, TemplateTensor, Tensor, ViewOp,
+    gather_matmul_flops, gather_quant_matmul_dispatch_flops, matmul_flops,
     program::{
         BinOp, EpilogueError, EpilogueSignature, Inst, KernelSignature, MAX_INSTRUCTIONS,
         MAX_OUTPUTS, PrepareError, PreparedEpilogue, PreparedProgram, Program, ProgramError,
@@ -3141,6 +3141,103 @@ impl<B: Backend + 'static> Host<B> {
         self.backend.write(tensor, bytes).map_err(guest_error)
     }
 
+    fn record_paged_dispatch(
+        &mut self,
+        commands: &Resource<CommandListEntry>,
+        operation: Op,
+        inputs: Vec<TensorEntry>,
+        output: TensorEntry,
+        usage: PagedUse,
+    ) -> Result<(), compute::Error> {
+        let input_tensors = inputs.iter().map(|entry| &entry.tensor).collect::<Vec<_>>();
+        let output_tensors = [&output.tensor];
+        let entry = self.table.get(commands).map_err(invalid_handle)?;
+        if entry.recorded.len() >= self.limits.dispatches_per_list {
+            return Err(quota("command list dispatch count exceeds the guest limit"));
+        }
+        self.check_dispatch_work(operation, &input_tensors, &output_tensors)?;
+        let entry = self.table.get_mut(commands).map_err(invalid_handle)?;
+        entry
+            .commands
+            .dispatch(operation, &input_tensors, &output.tensor)
+            .map_err(guest_error)?;
+        let dispatch = entry
+            .commands
+            .last_dispatch()
+            .cloned()
+            .ok_or_else(|| guest_error(BackendError::ExecutionFailed))?;
+        entry
+            .recorded
+            .push(RecordedDispatch::Static(Box::new(dispatch)));
+        entry.access.record(&inputs, std::slice::from_ref(&output));
+        entry.retained.extend(inputs);
+        entry.retained.push(output);
+        usage.binding.used.store(true, Ordering::Release);
+        if !entry
+            .paged
+            .iter()
+            .any(|existing| Arc::ptr_eq(&existing.binding, &usage.binding))
+        {
+            entry.paged.push(usage);
+        }
+        Ok(())
+    }
+
+    fn paged_slot_entries(
+        &self,
+        slot: &Resource<BatchSlotEntry>,
+        lane: u32,
+        plane: u32,
+    ) -> Result<
+        (
+            TensorEntry,
+            TensorEntry,
+            TensorEntry,
+            forja_core::PagedSlot,
+            PagedUse,
+        ),
+        compute::Error,
+    > {
+        let slot = self.table.get(slot).map_err(invalid_handle)?;
+        let lane = usize::try_from(lane)
+            .map_err(|_| compute::Error::Layout("paged lane exceeds usize".to_owned()))?;
+        let plane = usize::try_from(plane)
+            .map_err(|_| compute::Error::Layout("paged plane exceeds usize".to_owned()))?;
+        let page_tensor = self
+            .entry(&Resource::new_borrow(*slot.planes.get(plane).ok_or_else(
+                || invalid_handle("paged plane is out of range"),
+            )?))?
+            .clone();
+        let table_tensor = self
+            .entry(&Resource::new_borrow(
+                *slot
+                    .tables
+                    .first()
+                    .and_then(|bank| bank.get(lane))
+                    .ok_or_else(|| invalid_handle("paged lane is out of range"))?,
+            ))?
+            .clone();
+        let generations = self.entry(&Resource::new_borrow(slot.generations))?.clone();
+        let snapshot = slot
+            .binding
+            .banks
+            .slot(0, lane)
+            .map_err(|error| compute::Error::Layout(error.to_string()))?;
+        if !snapshot.is_active() {
+            return Err(compute::Error::Layout("paged lane is inactive".to_owned()));
+        }
+        Ok((
+            page_tensor,
+            table_tensor,
+            generations,
+            snapshot,
+            PagedUse {
+                binding: Arc::clone(&slot.binding),
+                bank: 0,
+            },
+        ))
+    }
+
     /// Creates an empty command list.
     ///
     /// # Errors
@@ -5463,16 +5560,49 @@ where
         ordinary: Resource<TensorEntry>,
         direction: paged_storage::CopyDirection,
     ) -> impl Future<Output = wasmtime::Result<Result<(), compute::Error>>> + Send {
-        let _ = (lane, span, direction);
-        let result = self
-            .table
-            .get(&commands)
-            .map_err(invalid_handle)
-            .and_then(|_| self.table.get(&slot).map_err(invalid_handle))
-            .and_then(|_| self.table.get(&ordinary).map_err(invalid_handle))
-            .and(Err(compute::Error::BackendExecution(
-                "paged resources are not bound to this runner".to_owned(),
-            )));
+        let result = (|| {
+            let (pages, table, generations, _, usage) =
+                self.paged_slot_entries(&slot, lane, span.plane)?;
+            let ordinary = self.entry(&ordinary)?.clone();
+            let start = u32::try_from(span.start)
+                .map_err(|_| compute::Error::Layout("paged copy start exceeds u32".to_owned()))?;
+            let tokens = ordinary
+                .tensor
+                .layout()
+                .shape()
+                .first()
+                .copied()
+                .ok_or_else(|| compute::Error::Layout("paged copy input is scalar".to_owned()))?;
+            if u64::from(tokens) != span.len {
+                return Err(compute::Error::Layout(
+                    "paged copy span length does not match the tensor".to_owned(),
+                ));
+            }
+            let operation = Op::PagedCopy {
+                direction: match direction {
+                    paged_storage::CopyDirection::IntoPages => PagedCopyDirection::IntoPages,
+                    paged_storage::CopyDirection::OutOfPages => PagedCopyDirection::OutOfPages,
+                },
+                start,
+                page_tokens: pages.tensor.layout().shape()[1],
+            };
+            match direction {
+                paged_storage::CopyDirection::IntoPages => self.record_paged_dispatch(
+                    &commands,
+                    operation,
+                    vec![ordinary, table, generations],
+                    pages,
+                    usage,
+                ),
+                paged_storage::CopyDirection::OutOfPages => self.record_paged_dispatch(
+                    &commands,
+                    operation,
+                    vec![pages, table, generations],
+                    ordinary,
+                    usage,
+                ),
+            }
+        })();
         std::future::ready(Ok(result))
     }
 
@@ -5485,17 +5615,61 @@ where
         output: Resource<TensorEntry>,
         config: paged_storage::SdpaCfg,
     ) -> impl Future<Output = wasmtime::Result<Result<(), compute::Error>>> + Send {
-        let _ = (lane, config);
-        let result = self
-            .table
-            .get(&commands)
-            .map_err(invalid_handle)
-            .and_then(|_| self.table.get(&slot).map_err(invalid_handle))
-            .and_then(|_| self.table.get(&query).map_err(invalid_handle))
-            .and_then(|_| self.table.get(&output).map_err(invalid_handle))
-            .and(Err(compute::Error::BackendExecution(
-                "paged resources are not bound to this runner".to_owned(),
-            )));
+        let result = (|| {
+            let (key, table, generations, snapshot, usage) =
+                self.paged_slot_entries(&slot, lane, config.key_plane)?;
+            let (value, _, _, _, _) = self.paged_slot_entries(&slot, lane, config.value_plane)?;
+            let query = self.entry(&query)?.clone();
+            let output = self.entry(&output)?.clone();
+            let [_query_heads, query_tokens, width]: [u32; 3] =
+                query.tensor.layout().shape().try_into().map_err(|_| {
+                    compute::Error::Layout("paged query must have rank three".to_owned())
+                })?;
+            let page_shape: [u32; 3] = key.tensor.layout().shape().try_into().map_err(|_| {
+                compute::Error::Layout("paged plane must have rank three".to_owned())
+            })?;
+            let key_heads = page_shape[2]
+                .checked_div(width)
+                .filter(|&heads| heads != 0)
+                .ok_or_else(|| compute::Error::Layout("paged plane width is invalid".to_owned()))?;
+            let reshape_plane = |entry: TensorEntry| -> Result<TensorEntry, compute::Error> {
+                let layout = entry
+                    .tensor
+                    .layout()
+                    .reshape(&[page_shape[0], page_shape[1], key_heads, width])
+                    .map_err(|error| compute::Error::Layout(error.to_string()))?;
+                let tensor = self
+                    .backend
+                    .tensor(entry.tensor.buffer(), layout)
+                    .map_err(guest_error)?;
+                Ok(TensorEntry { tensor, ..entry })
+            };
+            let key_length = u32::try_from(snapshot.logical_len())
+                .map_err(|_| compute::Error::Layout("paged key length exceeds u32".to_owned()))?;
+            let q_start = key_length.checked_sub(query_tokens).ok_or_else(|| {
+                compute::Error::Layout("paged query exceeds the key length".to_owned())
+            })?;
+            self.record_paged_dispatch(
+                &commands,
+                Op::PagedSdpa {
+                    scale: config.scale,
+                    causal: config.causal,
+                    q_start,
+                    key_length,
+                    page_tokens: page_shape[1],
+                    contiguous_entries: snapshot.table().is_contiguous(),
+                },
+                vec![
+                    query,
+                    reshape_plane(key)?,
+                    reshape_plane(value)?,
+                    table,
+                    generations,
+                ],
+                output,
+                usage,
+            )
+        })();
         std::future::ready(Ok(result))
     }
 }
@@ -6220,7 +6394,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn paged_wasmtime_stubs_refuse_and_drop_resources() {
+    async fn paged_wasmtime_calls_require_an_active_lane() {
         let mut host = Host::new(CpuBackend::new(), GENEROUS);
         let commands = host.command_list().unwrap();
         let paged = PagePool::new(
@@ -6272,7 +6446,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(matches!(copy, Err(compute::Error::BackendExecution(_))));
+        assert!(matches!(copy, Err(compute::Error::Layout(_))));
         let sdpa = <Host<CpuBackend> as paged_storage::Host>::record_paged_sdpa(
             &mut host,
             Resource::new_borrow(commands.rep()),
@@ -6289,7 +6463,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(matches!(sdpa, Err(compute::Error::BackendExecution(_))));
+        assert!(matches!(sdpa, Err(compute::Error::Layout(_))));
 
         let pool_rep = pool.rep();
         let sequence_rep = sequence.rep();
