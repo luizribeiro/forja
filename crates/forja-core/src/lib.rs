@@ -34,7 +34,8 @@ pub use paged::{
     PagedLayoutError, PagedPlane,
 };
 pub use paged_pool::{
-    CowPageCopy, PagePool, PagePoolError, PagedMemoryUsage, PagedSequence, SequenceCheckpoint,
+    CowPageCopy, PagePool, PagePoolError, PagedMemoryUsage, PagedSequence, PagedSlot,
+    PagedSlotBanks, SequenceCheckpoint,
 };
 pub use quantized::{QuantizedMatrix, QuantizedMatrixError, QuantizedMatrixPart};
 pub use symbolic::{

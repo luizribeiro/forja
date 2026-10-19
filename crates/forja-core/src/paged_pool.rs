@@ -270,6 +270,216 @@ impl PagePool {
         let mut state = self.lock()?;
         Ok(live_page_mut(&mut state, lease)?.references)
     }
+
+    fn charge_slots(&self, bytes: u64) -> Result<(), PagePoolError> {
+        let mut state = self.lock()?;
+        let projected = state
+            .memory
+            .total()
+            .and_then(|total| total.checked_add(bytes))
+            .ok_or(PagePoolError::ArithmeticOverflow)?;
+        if projected > self.inner.byte_limit {
+            return Err(PagePoolError::QuotaExceeded);
+        }
+        state.memory.slot_bytes = state
+            .memory
+            .slot_bytes
+            .checked_add(bytes)
+            .ok_or(PagePoolError::ArithmeticOverflow)?;
+        Ok(())
+    }
+
+    fn uncharge_slots(&self, bytes: u64) {
+        if let Ok(mut state) = self.lock() {
+            state.memory.slot_bytes = state.memory.slot_bytes.saturating_sub(bytes);
+        }
+    }
+}
+
+/// One immutable lane snapshot read from a rebindable slot bank.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PagedSlot {
+    table: PageTable,
+    logical_len: u64,
+    active: bool,
+}
+
+impl PagedSlot {
+    /// Returns the fixed-size table, including poisoned padding entries.
+    #[must_use]
+    pub const fn table(&self) -> &PageTable {
+        &self.table
+    }
+
+    /// Returns the lane's logical key length.
+    #[must_use]
+    pub const fn logical_len(&self) -> u64 {
+        self.logical_len
+    }
+
+    /// Reports whether this lane has a bound sequence capability.
+    #[must_use]
+    pub const fn is_active(&self) -> bool {
+        self.active
+    }
+}
+
+/// Exactly two globally rebindable banks of fixed-size opaque lane slots.
+pub struct PagedSlotBanks {
+    pool: PagePool,
+    table_pages: usize,
+    banks: [Mutex<Vec<PagedSlot>>; 2],
+    submitted: Mutex<[Option<u64>; 2]>,
+    charged_bytes: u64,
+}
+
+impl PagedSlotBanks {
+    /// Allocates and charges two banks initialized with poisoned inactive lanes.
+    ///
+    /// # Errors
+    ///
+    /// Returns quota or overflow before changing pool accounting.
+    pub fn new(pool: PagePool, lanes: usize, table_pages: usize) -> Result<Self, PagePoolError> {
+        if lanes == 0 || table_pages == 0 {
+            return Err(PagePoolError::UnreservedWrite);
+        }
+        let lane_count = u64::try_from(lanes).map_err(|_| PagePoolError::ArithmeticOverflow)?;
+        let table_page_count =
+            u64::try_from(table_pages).map_err(|_| PagePoolError::ArithmeticOverflow)?;
+        let lane_metadata_bytes = lane_count
+            .checked_mul(16)
+            .ok_or(PagePoolError::ArithmeticOverflow)?;
+        let charged_bytes = lane_count
+            .checked_mul(table_page_count)
+            .and_then(|entries| entries.checked_mul(8))
+            .and_then(|one_bank| one_bank.checked_add(lane_metadata_bytes))
+            .and_then(|one_bank| one_bank.checked_mul(2))
+            .ok_or(PagePoolError::ArithmeticOverflow)?;
+        pool.charge_slots(charged_bytes)?;
+        let lane = PagedSlot {
+            table: PageTable::poisoned(table_pages),
+            logical_len: 0,
+            active: false,
+        };
+        let first = vec![lane.clone(); lanes];
+        let second = vec![lane; lanes];
+        Ok(Self {
+            pool,
+            table_pages,
+            banks: [Mutex::new(first), Mutex::new(second)],
+            submitted: Mutex::new([None, None]),
+            charged_bytes,
+        })
+    }
+
+    /// Rebinds an active sequence capability into one lane.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a foreign sequence, invalid bank/lane, oversized table, or bank whose
+    /// prior submission has not completed.
+    pub fn bind(
+        &self,
+        bank: usize,
+        lane: usize,
+        sequence: &PagedSequence,
+    ) -> Result<(), PagePoolError> {
+        if !self.pool.same_pool(&sequence.pool) {
+            return Err(PagePoolError::ForeignResource);
+        }
+        self.ensure_rebindable(bank)?;
+        let table = sequence
+            .table()?
+            .pad_with_poison(self.table_pages)
+            .map_err(|_| PagePoolError::UnreservedWrite)?;
+        let mut lanes = self
+            .banks
+            .get(bank)
+            .ok_or(PagePoolError::ForeignResource)?
+            .lock()
+            .map_err(|_| PagePoolError::CorruptState)?;
+        *lanes.get_mut(lane).ok_or(PagePoolError::ForeignResource)? = PagedSlot {
+            table,
+            logical_len: sequence.logical_len,
+            active: true,
+        };
+        Ok(())
+    }
+
+    /// Replaces one lane with a poisoned inactive slot.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid or still-in-flight bank/lane.
+    pub fn poison(&self, bank: usize, lane: usize) -> Result<(), PagePoolError> {
+        self.ensure_rebindable(bank)?;
+        let mut lanes = self
+            .banks
+            .get(bank)
+            .ok_or(PagePoolError::ForeignResource)?
+            .lock()
+            .map_err(|_| PagePoolError::CorruptState)?;
+        *lanes.get_mut(lane).ok_or(PagePoolError::ForeignResource)? = PagedSlot {
+            table: PageTable::poisoned(self.table_pages),
+            logical_len: 0,
+            active: false,
+        };
+        Ok(())
+    }
+
+    /// Returns a lane snapshot for trusted backend upload.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid bank/lane or poisoned lock.
+    pub fn slot(&self, bank: usize, lane: usize) -> Result<PagedSlot, PagePoolError> {
+        self.banks
+            .get(bank)
+            .ok_or(PagePoolError::ForeignResource)?
+            .lock()
+            .map_err(|_| PagePoolError::CorruptState)?
+            .get(lane)
+            .cloned()
+            .ok_or(PagePoolError::ForeignResource)
+    }
+
+    /// Marks one bank unavailable until its submission completion is observed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid bank or poisoned lock.
+    pub fn mark_submitted(&self, bank: usize, serial: u64) -> Result<(), PagePoolError> {
+        let mut submitted = self
+            .submitted
+            .lock()
+            .map_err(|_| PagePoolError::CorruptState)?;
+        *submitted
+            .get_mut(bank)
+            .ok_or(PagePoolError::ForeignResource)? = Some(serial);
+        Ok(())
+    }
+
+    fn ensure_rebindable(&self, bank: usize) -> Result<(), PagePoolError> {
+        let completed = self.pool.lock()?.completed_serial;
+        let mut submitted = self
+            .submitted
+            .lock()
+            .map_err(|_| PagePoolError::CorruptState)?;
+        let pending = submitted
+            .get_mut(bank)
+            .ok_or(PagePoolError::ForeignResource)?;
+        if pending.is_some_and(|serial| serial > completed) {
+            return Err(PagePoolError::SharedTail);
+        }
+        *pending = None;
+        Ok(())
+    }
+}
+
+impl Drop for PagedSlotBanks {
+    fn drop(&mut self) {
+        self.pool.uncharge_slots(self.charged_bytes);
+    }
 }
 
 /// An opaque sequence reservation and its hidden page table.
@@ -854,5 +1064,36 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(after_counts, before_counts);
         assert_eq!(pool.memory_usage().unwrap(), before_memory);
+    }
+
+    #[test]
+    fn inactive_slots_stay_poisoned_across_bank_rebinding() {
+        let pool = pool(4_096);
+        let mut sequence = pool.reserve(8).unwrap();
+        sequence.commit_write(4).unwrap();
+        let banks = PagedSlotBanks::new(pool.clone(), 2, 2).unwrap();
+        banks.bind(0, 0, &sequence).unwrap();
+        assert!(banks.slot(0, 0).unwrap().is_active());
+        let inactive = banks.slot(0, 1).unwrap();
+        assert!(!inactive.is_active());
+        assert!(inactive.table().resolve(0).is_err());
+        banks.mark_submitted(0, 9).unwrap();
+        assert_eq!(banks.poison(0, 0), Err(PagePoolError::SharedTail));
+        banks.bind(1, 1, &sequence).unwrap();
+        pool.observe_completion(9).unwrap();
+        banks.poison(0, 0).unwrap();
+        assert!(banks.slot(0, 0).unwrap().table().resolve(0).is_err());
+        assert!(banks.slot(1, 1).unwrap().is_active());
+    }
+    #[test]
+    fn slots_refuse_sequences_from_another_pool() {
+        let primary = pool(4_096);
+        let foreign = pool(4_096).reserve(4).unwrap();
+        let banks = PagedSlotBanks::new(primary, 1, 1).unwrap();
+
+        assert_eq!(
+            banks.bind(0, 0, &foreign),
+            Err(PagePoolError::ForeignResource)
+        );
     }
 }
