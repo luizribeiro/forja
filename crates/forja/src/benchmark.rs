@@ -3,6 +3,7 @@ use std::{
     error::Error,
     ffi::OsString,
     fs,
+    future::Future,
     path::{Path, PathBuf},
     process::Command,
     time::{Duration, Instant},
@@ -1034,6 +1035,16 @@ fn decode_options(point: &BenchPoint, host_argmax: bool, overlap: bool) -> Decod
 }
 
 #[cfg(target_os = "macos")]
+async fn after_runner_drop<R, F, Fut>(runner: R, measure: F) -> Fut::Output
+where
+    F: FnOnce() -> Fut,
+    Fut: Future,
+{
+    drop(runner);
+    measure().await
+}
+
+#[cfg(target_os = "macos")]
 async fn bench_engine(
     options: &Bench,
     point: &BenchPoint,
@@ -1093,7 +1104,6 @@ async fn bench_engine(
             .await?,
         );
     }
-    let contexts = measure_record_contexts(&tokens, point, options, component, decode, &tg).await?;
     let profiles = if options.breakdown {
         measure_profiles(
             &mut runner,
@@ -1113,6 +1123,10 @@ async fn bench_engine(
         point.tg,
         decode.sampling,
     )
+    .await?;
+    let contexts = after_runner_drop(runner, || {
+        measure_record_contexts(&tokens, point, options, component, decode, &tg)
+    })
     .await?;
     Ok(BenchMeasurement {
         pp: summarize(&pp, point.pp)?,
@@ -2110,7 +2124,7 @@ fn gpu_core_count() -> Result<u64, Box<dyn Error>> {
 
 #[cfg(test)]
 mod tests {
-    use std::{env, fs};
+    use std::{cell::Cell, env, fs, rc::Rc};
 
     use forja_testing::temporary_directory;
 
@@ -2118,6 +2132,28 @@ mod tests {
 
     fn test_profile() -> forja_config::Profile {
         crate::resolution::read_embedded_profile(test_guests::qwen3()).unwrap()
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn context_measurement_starts_after_primary_runner_drops() {
+        struct DropFlag(Rc<Cell<bool>>);
+
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.set(true);
+            }
+        }
+
+        let dropped = Rc::new(Cell::new(false));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let observed = runtime
+            .block_on(after_runner_drop(DropFlag(Rc::clone(&dropped)), || async {
+                dropped.get()
+            }));
+        assert!(observed);
     }
 
     #[test]
