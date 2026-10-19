@@ -3,7 +3,10 @@
 #![cfg(target_os = "macos")]
 #![allow(clippy::cast_precision_loss)]
 
-use forja_core::{Backend, BackendError, CommandList, DType, Op, PagedCopyDirection, Submission};
+use forja_core::{
+    Backend, BackendDispatchData, BackendError, CommandList, DType, Op, PagedCopyDirection,
+    Submission,
+};
 use half::{bf16, f16};
 
 fn encode(values: &[f32], dtype: DType) -> Vec<u8> {
@@ -211,4 +214,146 @@ fn metal_paged_sdpa_uses_contiguous_entry_path() {
         forja_testing::normwise_relative_error(&reference, &candidate)
             <= forja_testing::F16_TOLERANCE
     );
+}
+
+#[allow(clippy::too_many_lines)]
+fn benchmark_commands(
+    backend: &forja_metal::MetalBackend,
+    key_length: u32,
+) -> (
+    impl FnMut() -> CommandList + use<>,
+    impl FnMut() -> CommandList + use<>,
+) {
+    const PAGE_TOKENS: u32 = 64;
+    const QUERY_HEADS: u32 = 32;
+    const KV_HEADS: u32 = 4;
+    const WIDTH: u32 = 128;
+
+    let pages = key_length.div_ceil(PAGE_TOKENS);
+    let query = backend.alloc(DType::F32, &[QUERY_HEADS, 1, WIDTH]).unwrap();
+    let contiguous_key = backend
+        .alloc(DType::F16, &[KV_HEADS, key_length, WIDTH])
+        .unwrap();
+    let contiguous_value = backend
+        .alloc(DType::F16, &[KV_HEADS, key_length, WIDTH])
+        .unwrap();
+    let paged_key = backend
+        .alloc(DType::F16, &[pages, PAGE_TOKENS, KV_HEADS, WIDTH])
+        .unwrap();
+    let paged_value = backend
+        .alloc(DType::F16, &[pages, PAGE_TOKENS, KV_HEADS, WIDTH])
+        .unwrap();
+    let table = backend.alloc(DType::U32, &[pages, 2]).unwrap();
+    let generations = backend.alloc(DType::U32, &[pages]).unwrap();
+    let contiguous_output = backend.alloc(DType::F32, &[QUERY_HEADS, 1, WIDTH]).unwrap();
+    let paged_output = backend.alloc(DType::F32, &[QUERY_HEADS, 1, WIDTH]).unwrap();
+    let query_values = (0..QUERY_HEADS * WIDTH)
+        .map(|index| ((index * 17) % 89) as f32 / 88.0 - 0.5)
+        .collect::<Vec<_>>();
+    let contiguous_values = (0..KV_HEADS * key_length * WIDTH)
+        .map(|index| ((index * 7) % 101) as f32 / 100.0 - 0.5)
+        .collect::<Vec<_>>();
+    let padded_tokens = pages * PAGE_TOKENS;
+    let mut paged_values =
+        vec![0.0_f32; usize::try_from(padded_tokens * KV_HEADS * WIDTH).unwrap()];
+    for head in 0..KV_HEADS {
+        for token in 0..key_length {
+            for column in 0..WIDTH {
+                let contiguous_index =
+                    usize::try_from((head * key_length + token) * WIDTH + column).unwrap();
+                let paged_index =
+                    usize::try_from((token * KV_HEADS + head) * WIDTH + column).unwrap();
+                paged_values[paged_index] = contiguous_values[contiguous_index];
+            }
+        }
+    }
+    backend
+        .write(&query, &encode(&query_values, DType::F32))
+        .unwrap();
+    backend
+        .write(&contiguous_key, &encode(&contiguous_values, DType::F16))
+        .unwrap();
+    backend
+        .write(&contiguous_value, &encode(&contiguous_values, DType::F16))
+        .unwrap();
+    backend
+        .write(&paged_key, &encode(&paged_values, DType::F16))
+        .unwrap();
+    backend
+        .write(&paged_value, &encode(&paged_values, DType::F16))
+        .unwrap();
+    let entries = (0..pages).map(|page| (page, 1)).collect::<Vec<_>>();
+    backend.write(&table, &table_bytes(&entries)).unwrap();
+    backend
+        .write(
+            &generations,
+            &generation_bytes(&vec![1; usize::try_from(pages).unwrap()]),
+        )
+        .unwrap();
+    let scale = 1.0 / (WIDTH as f32).sqrt();
+    let contiguous_op = Op::Sdpa {
+        scale,
+        causal: false,
+        q_start: 0,
+    };
+    let contiguous_variant = backend
+        .validate_variant_for_op(
+            contiguous_op,
+            &[&query, &contiguous_key, &contiguous_value],
+            &[&contiguous_output],
+            "sdpa.vector-gqa-two-pass",
+        )
+        .unwrap();
+    let paged_query = query.clone();
+    let contiguous = move || {
+        let mut commands = CommandList::new();
+        commands
+            .dispatch(
+                contiguous_op,
+                &[&query, &contiguous_key, &contiguous_value],
+                &contiguous_output,
+            )
+            .unwrap();
+        assert!(commands.set_last_backend_data(BackendDispatchData::new(contiguous_variant)));
+        commands
+    };
+    let paged_commands = move || {
+        let mut commands = CommandList::new();
+        commands
+            .dispatch(
+                Op::PagedSdpa {
+                    scale,
+                    causal: false,
+                    q_start: 0,
+                    key_length,
+                    page_tokens: PAGE_TOKENS,
+                    contiguous_entries: true,
+                },
+                &[&paged_query, &paged_key, &paged_value, &table, &generations],
+                &paged_output,
+            )
+            .unwrap();
+        commands
+    };
+    (contiguous, paged_commands)
+}
+
+#[test]
+#[ignore = "manual paged-attention kernel checkpoint"]
+fn metal_paged_sdpa_microbenchmark() {
+    let backend = forja_metal::MetalBackend::new().unwrap();
+    for length in [512, 4_000] {
+        let (contiguous, paged) = benchmark_commands(&backend, length);
+        let (contiguous_time, paged_time) =
+            super::common::comparative_gpu_times(&backend, contiguous, paged);
+        eprintln!(
+            "paged-sdpa keys={length} gqa_two_pass_us={} paged_us={} ratio={:.4}",
+            contiguous_time.as_secs_f64() * 1.0e6,
+            paged_time.as_secs_f64() * 1.0e6,
+            paged_time.as_secs_f64() / contiguous_time.as_secs_f64(),
+        );
+        assert!(
+            paged_time.as_secs_f64() / contiguous_time.as_secs_f64() <= super::common::D5_RATIO
+        );
+    }
 }
