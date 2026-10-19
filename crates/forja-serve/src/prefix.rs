@@ -1,9 +1,39 @@
 use sha2::{Digest, Sha256};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::{
+    collections::{HashMap, HashSet},
+    error::Error,
+    fmt,
+    sync::atomic::{AtomicU64, Ordering},
+};
+
+use forja_core::{PagePoolError, PagedSequence};
 const BLOCK: usize = 64;
 const BLOCK_DOMAIN: &[u8] = b"forja-prefix-block-v1";
 const NAMESPACE_DOMAIN: &[u8] = b"forja-prefix-namespace-v1";
 static RUNNER_NONCE: AtomicU64 = AtomicU64::new(0);
+
+/// A shared-prefix index operation failure.
+#[derive(Debug)]
+#[cfg_attr(not(test), allow(dead_code, reason = "used by paged serving"))]
+pub(crate) enum PrefixIndexError {
+    Pool(PagePoolError),
+}
+
+impl fmt::Display for PrefixIndexError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Pool(error) => write!(formatter, "prefix index pool error: {error}"),
+        }
+    }
+}
+
+impl Error for PrefixIndexError {}
+
+impl From<PagePoolError> for PrefixIndexError {
+    fn from(error: PagePoolError) -> Self {
+        Self::Pool(error)
+    }
+}
 
 /// Artifact identity for one serving engine's live prefix.
 pub struct PrefixIdentity {
@@ -53,6 +83,124 @@ pub(crate) struct LivePrefix {
     namespace: PrefixNamespace,
     tokens: Vec<u32>,
     chain: Vec<[u8; 32]>,
+}
+
+#[cfg_attr(not(test), allow(dead_code, reason = "used by paged serving"))]
+struct PrefixEntry {
+    fingerprint: LivePrefix,
+    sequence: PagedSequence,
+}
+
+/// A sequence fork attached to the longest exact indexed prefix.
+#[cfg_attr(not(test), allow(dead_code, reason = "used by paged serving"))]
+pub(crate) struct PrefixHit {
+    pub(crate) sequence: PagedSequence,
+    pub(crate) cached_tokens: usize,
+}
+
+/// Multi-entry prefix index retaining immutable page references.
+#[cfg_attr(not(test), allow(dead_code, reason = "used by paged serving"))]
+pub(crate) struct PrefixIndex {
+    entries: HashMap<u64, PrefixEntry>,
+    blocks: HashMap<[u8; 32], Vec<u64>>,
+    next_id: u64,
+}
+
+#[cfg_attr(not(test), allow(dead_code, reason = "used by paged serving"))]
+impl PrefixIndex {
+    pub(crate) fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+            blocks: HashMap::new(),
+            next_id: 0,
+        }
+    }
+
+    pub(crate) fn publish(
+        &mut self,
+        namespace: PrefixNamespace,
+        tokens: Vec<u32>,
+        sequence: &mut PagedSequence,
+    ) -> Result<(), PrefixIndexError> {
+        let pages = sequence.fork(
+            u64::try_from(tokens.len())
+                .map_err(|_| PrefixIndexError::Pool(PagePoolError::ArithmeticOverflow))?,
+        )?;
+        let id = self.next_id;
+        self.next_id = self
+            .next_id
+            .checked_add(1)
+            .ok_or(PrefixIndexError::Pool(PagePoolError::ArithmeticOverflow))?;
+        let fingerprint = LivePrefix::new(namespace, tokens);
+        for hash in &fingerprint.chain {
+            self.blocks.entry(*hash).or_default().push(id);
+        }
+        self.entries.insert(
+            id,
+            PrefixEntry {
+                fingerprint,
+                sequence: pages,
+            },
+        );
+        Ok(())
+    }
+
+    pub(crate) fn lookup(
+        &mut self,
+        namespace: PrefixNamespace,
+        prompt: &[u32],
+        reserved_tokens: u64,
+    ) -> Result<Option<PrefixHit>, PrefixIndexError> {
+        if prompt.is_empty() {
+            return Ok(None);
+        }
+        let cap = prompt.len().saturating_sub(1);
+        let prompt_fingerprint = LivePrefix::new(namespace, prompt[..cap].to_vec());
+        let mut visited = HashSet::new();
+        let mut best = None;
+        for block in (0..=prompt_fingerprint.chain.len()).rev() {
+            let candidates = block.checked_sub(1).map_or_else(
+                || self.entries.keys().copied().collect::<Vec<_>>(),
+                |index| {
+                    self.blocks
+                        .get(&prompt_fingerprint.chain[index])
+                        .cloned()
+                        .unwrap_or_default()
+                },
+            );
+            for id in candidates {
+                if !visited.insert(id) {
+                    continue;
+                }
+                let Some(entry) = self.entries.get(&id) else {
+                    continue;
+                };
+                let matched = entry.fingerprint.match_len(namespace, prompt);
+                if best.is_none_or(|(_, length)| matched > length) {
+                    best = Some((id, matched));
+                }
+            }
+            if best.is_some_and(|(_, length)| length >= block * BLOCK) {
+                break;
+            }
+        }
+        let Some((id, cached_tokens @ 1..)) = best else {
+            return Ok(None);
+        };
+        let entry = self
+            .entries
+            .get_mut(&id)
+            .ok_or(PrefixIndexError::Pool(PagePoolError::CorruptState))?;
+        let sequence = entry.sequence.fork_reserved(
+            u64::try_from(cached_tokens)
+                .map_err(|_| PrefixIndexError::Pool(PagePoolError::ArithmeticOverflow))?,
+            reserved_tokens,
+        )?;
+        Ok(Some(PrefixHit {
+            sequence,
+            cached_tokens,
+        }))
+    }
 }
 #[derive(Default)]
 pub(crate) struct PrefixLedger(Vec<u32>);
@@ -136,8 +284,34 @@ impl LivePrefix {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use forja_core::{DType, PagePool, PagedLayout, PagedPlane};
+
     fn prefix() -> LivePrefix {
         LivePrefix::new(PrefixNamespace([7; 32]), (0..130).collect())
+    }
+
+    fn pool() -> PagePool {
+        PagePool::new(
+            PagedLayout::new(
+                64,
+                vec![PagedPlane {
+                    dtype: DType::F16,
+                    elements_per_token: 8,
+                    alignment: 16,
+                    label: "cache".to_owned(),
+                }],
+            )
+            .unwrap(),
+            8,
+            1 << 20,
+        )
+        .unwrap()
+    }
+
+    fn sequence(pool: &PagePool, tokens: usize) -> PagedSequence {
+        let mut sequence = pool.reserve(256).unwrap();
+        sequence.commit_write(tokens as u64).unwrap();
+        sequence
     }
     #[test]
     fn finds_boundaries_partial_blocks_and_prompt_cap() {
@@ -211,5 +385,32 @@ mod tests {
         reconstructed.extend_from_slice(&next[reused..]);
         assert_eq!(reused, 97);
         assert_eq!(reconstructed, next);
+    }
+
+    #[test]
+    fn unrelated_entry_does_not_evict_an_agent_prefix() {
+        let namespace = PrefixNamespace([9; 32]);
+        let pool = pool();
+        let mut index = PrefixIndex::new();
+        let agent = (0..130).collect::<Vec<_>>();
+        let unrelated = (1_000..1_100).collect::<Vec<_>>();
+        index
+            .publish(namespace, agent.clone(), &mut sequence(&pool, agent.len()))
+            .unwrap();
+        index
+            .publish(
+                namespace,
+                unrelated.clone(),
+                &mut sequence(&pool, unrelated.len()),
+            )
+            .unwrap();
+        let mut next_turn = agent;
+        next_turn.extend(130..140);
+
+        let hit = index.lookup(namespace, &next_turn, 192).unwrap().unwrap();
+
+        assert_eq!(hit.cached_tokens, 130);
+        assert_eq!(hit.sequence.logical_len(), 130);
+        assert_eq!(hit.sequence.reserved_tokens(), 192);
     }
 }
