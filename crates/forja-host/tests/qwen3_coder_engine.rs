@@ -188,9 +188,34 @@ async fn metal_hidden_states_and_routing_match_same_byte_reference() -> Result<(
 #[tokio::test]
 #[ignore = "requires FORJA_MODELS and runs in the pre-push hook"]
 async fn metal_replay_matches_lazy_greedy_and_sampled_decode() -> Result<(), Box<dyn Error>> {
-    let replay = decode_outputs(true).await?;
-    let lazy = decode_outputs(false).await?;
+    let replay = decode_outputs(false, true, REPLAY_LAYERS).await?;
+    let lazy = decode_outputs(false, false, REPLAY_LAYERS).await?;
     assert_eq!(replay, lazy);
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[ignore = "requires FORJA_MODELS and runs in the pre-push hook"]
+async fn metal_paged_replay_matches_lazy_decode_at_one_layer() -> Result<(), Box<dyn Error>> {
+    assert_paged_replay_matches_lazy(1).await
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[ignore = "requires FORJA_MODELS and runs in the pre-push hook"]
+async fn metal_paged_replay_matches_lazy_decode_at_all_layers() -> Result<(), Box<dyn Error>> {
+    assert_paged_replay_matches_lazy(FULL_LAYERS).await
+}
+
+#[cfg(target_os = "macos")]
+async fn assert_paged_replay_matches_lazy(layers: u32) -> Result<(), Box<dyn Error>> {
+    let replay = decode_outputs(true, true, layers).await?;
+    let lazy = decode_outputs(true, false, layers).await?;
+    for (step, (replay, lazy)) in replay.iter().zip(&lazy).enumerate() {
+        assert_eq!(replay.0, lazy.0, "token differs at step {step}");
+        assert_eq!(replay.1, lazy.1, "logits differ at step {step}");
+    }
     Ok(())
 }
 
@@ -516,13 +541,16 @@ async fn constrained_continuation(
 }
 
 #[cfg(target_os = "macos")]
-async fn decode_outputs(replay: bool) -> Result<Vec<(Vec<u8>, Vec<u8>)>, Box<dyn Error>> {
+async fn decode_outputs(
+    paged_cache: bool,
+    replay: bool,
+    layers: u32,
+) -> Result<Vec<(Vec<u8>, Vec<u8>)>, Box<dyn Error>> {
     let mut runner = runner_with_graph_replay(forja_metal::MetalGraphReplay::Tier2).await?;
     let mut config = load_config()?;
+    config.paged_cache = paged_cache;
     config.replay = replay;
-    runner
-        .load_with_selections(Some(REPLAY_LAYERS), &config)
-        .await??;
+    runner.load_with_selections(Some(layers), &config).await??;
     let greedy = SamplingParams::default();
     let sampled = SamplingParams {
         temperature: 0.7,

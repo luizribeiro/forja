@@ -829,8 +829,6 @@ impl Qwen3Coder {
     ) -> Result<Self> {
         let variants = variants::Variants::new(config)?;
         let weights = QwenWeights::load(weights, layers)?;
-        #[cfg(target_family = "wasm")]
-        let paged = pool.is_some();
         let caches = if let Some(pool) = pool {
             CacheStorage::Paged(
                 pool.cache_set(
@@ -861,24 +859,20 @@ impl Qwen3Coder {
                 &[MAX_CONTEXT],
             )?,
             #[cfg(target_family = "wasm")]
-            replay: config.replay && !paged,
+            replay: config.replay,
             #[cfg(target_family = "wasm")]
             decode: DecodeState::new(MAX_CONTEXT, VOCAB)?,
             #[cfg(target_family = "wasm")]
-            short_prefill: (!paged)
-                .then(|| {
-                    ChunkedPrefill::new(MAX_CONTEXT, SHORT_PREFILL_CHUNK)?
-                        .with_tail_capacity(SHORT_PREFILL_TAIL_CAPACITY)
-                })
-                .transpose()?,
+            short_prefill: Some(
+                ChunkedPrefill::new(MAX_CONTEXT, SHORT_PREFILL_CHUNK)?
+                    .with_tail_capacity(SHORT_PREFILL_TAIL_CAPACITY)?,
+            ),
             #[cfg(target_family = "wasm")]
-            long_prefill: (!paged)
-                .then(|| {
-                    ChunkedPrefill::new(MAX_CONTEXT, PREFILL_CHUNK)?
-                        .with_tail_chunk(PREFILL_TAIL_CHUNK)?
-                        .with_tail_capacity(LONG_PREFILL_TAIL_CAPACITY)
-                })
-                .transpose()?,
+            long_prefill: Some(
+                ChunkedPrefill::new(MAX_CONTEXT, PREFILL_CHUNK)?
+                    .with_tail_chunk(PREFILL_TAIL_CHUNK)?
+                    .with_tail_capacity(LONG_PREFILL_TAIL_CAPACITY)?,
+            ),
         })
     }
 
