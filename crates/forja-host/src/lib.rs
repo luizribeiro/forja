@@ -7246,13 +7246,17 @@ mod tests {
                 sequence.page_reference_counts().unwrap(),
             )
         };
-        let before_memory = {
+        let (before_memory, before_charged, before_live) = {
             let host = runner.store.data();
             let entry = host
                 .table
                 .get(&Resource::<PagePoolEntry>::new_borrow(pool_rep))
                 .unwrap();
-            entry.pool.memory_usage().unwrap()
+            (
+                entry.pool.memory_usage().unwrap(),
+                entry.charged_bytes.load(Ordering::Acquire),
+                host.live_bytes.load(Ordering::Acquire),
+            )
         };
 
         assert!(matches!(
@@ -7273,6 +7277,8 @@ mod tests {
             .get(&Resource::<PagePoolEntry>::new_borrow(pool_rep))
             .unwrap();
         assert_eq!(entry.pool.memory_usage().unwrap(), before_memory);
+        assert_eq!(entry.charged_bytes.load(Ordering::Acquire), before_charged);
+        assert_eq!(host.live_bytes.load(Ordering::Acquire), before_live);
         fs::remove_file(weights).unwrap();
     }
 
