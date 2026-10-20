@@ -285,6 +285,8 @@ pub(crate) enum Command {
     Build(Build),
     Catalog(Catalog),
     Config(ConfigShow),
+    ConfigCheck,
+    ConfigSchema,
     Profile(Profile),
     Run(Run),
     Serve(Serve),
@@ -329,8 +331,29 @@ struct ConfigArgs {
 
 #[derive(Subcommand)]
 enum ConfigCommand {
+    /// Validate a serving host configuration.
+    Check(HostConfigArgs),
+    /// Emit a machine-readable configuration schema.
+    Schema(HostSchemaArgs),
     /// Print the effective development configuration.
     Show(ConfigShowArgs),
+}
+
+#[derive(Args)]
+struct HostConfigArgs {
+    /// Select the serving host configuration.
+    #[arg(long = "host", required = true)]
+    _host: bool,
+}
+
+#[derive(Args)]
+struct HostSchemaArgs {
+    /// Select the serving host configuration.
+    #[arg(long = "host", required = true)]
+    _host: bool,
+    /// Emit JSON Schema.
+    #[arg(long = "json", required = true)]
+    _json: bool,
 }
 
 #[derive(Args)]
@@ -411,6 +434,9 @@ fn parse_with(
     let mut matches = Cli::command().try_get_matches_from(arguments)?;
     let overrides = ordered_overrides(&matches);
     let cli = Cli::from_arg_matches_mut(&mut matches)?;
+    if let Some(command) = host_config_command(&cli.command, &overrides)? {
+        return Ok(command);
+    }
     if matches!(&cli.command, ParsedCommand::Serve(_)) {
         return serve_config(overrides).map(Command::Serve);
     }
@@ -476,6 +502,9 @@ fn parse_with(
             json: options.json,
         }),
         ParsedCommand::Config(options) => match options.command {
+            ConfigCommand::Check(_) | ConfigCommand::Schema(_) => {
+                unreachable!("host configuration commands return before development config")
+            }
             ConfigCommand::Show(options) => Command::Config(ConfigShow {
                 layered,
                 origin: options.origin,
@@ -594,9 +623,27 @@ fn load_record(path: &PathBuf) -> Result<(PathBuf, Recorded), clap::Error> {
     Ok((path.clone(), record))
 }
 
+#[derive(Clone)]
 enum Override {
     File(PathBuf),
     Set(String),
+}
+
+fn host_config_command(
+    command: &ParsedCommand,
+    overrides: &[Override],
+) -> Result<Option<Command>, clap::Error> {
+    let ParsedCommand::Config(options) = command else {
+        return Ok(None);
+    };
+    match options.command {
+        ConfigCommand::Check(_) => {
+            serve_config(overrides.to_vec())?;
+            Ok(Some(Command::ConfigCheck))
+        }
+        ConfigCommand::Schema(_) => Ok(Some(Command::ConfigSchema)),
+        ConfigCommand::Show(_) => Ok(None),
+    }
 }
 
 fn serve_config(overrides: Vec<Override>) -> Result<Serve, clap::Error> {
@@ -1408,6 +1455,28 @@ mod tests {
         };
         assert_eq!(serve.config.server.queue_length, 3);
         assert_eq!(serve.config.model.engine, PathBuf::from("engine.wasm"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn parses_host_schema_and_checks_host_files() {
+        assert_eq!(
+            parse(["config", "schema", "--host", "--json"].map(str::to_owned)).unwrap(),
+            Command::ConfigSchema
+        );
+        let root = temporary_directory("host-check").unwrap();
+        let path = root.join("host.toml");
+        fs::write(&path, "[server]\nqueue_length=7\n").unwrap();
+        assert_eq!(
+            parse(["-c", path.to_str().unwrap(), "config", "check", "--host"].map(str::to_owned))
+                .unwrap(),
+            Command::ConfigCheck
+        );
+        fs::write(&path, "[server]\nunknown=true\n").unwrap();
+        assert!(
+            parse(["-c", path.to_str().unwrap(), "config", "check", "--host"].map(str::to_owned))
+                .is_err()
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

@@ -7,6 +7,7 @@ mod benchmark_stats;
 mod config_show;
 mod engine;
 mod generate;
+mod host_schema;
 mod machine_load;
 mod profile;
 mod provenance;
@@ -70,6 +71,13 @@ fn run(command: args::Command) -> Result<(), Box<dyn Error>> {
         print!("{}", config_show::render(&options)?);
         return Ok(());
     }
+    if let args::Command::ConfigSchema = command {
+        print!("{}", host_schema::render()?);
+        return Ok(());
+    }
+    if let args::Command::ConfigCheck = command {
+        return Ok(());
+    }
     if let args::Command::Serve(options) = command {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -84,6 +92,9 @@ fn run(command: args::Command) -> Result<(), Box<dyn Error>> {
         args::Command::Build(_) => unreachable!("build commands return before runtime"),
         args::Command::Catalog(_) => unreachable!("catalog commands return before runtime"),
         args::Command::Config(_) => unreachable!("configuration commands return before runtime"),
+        args::Command::ConfigCheck | args::Command::ConfigSchema => {
+            unreachable!("configuration commands return before runtime")
+        }
         args::Command::Profile(options) => runtime.block_on(profile::run(&options)),
         args::Command::Run(options) => runtime.block_on(generate::run(&options)),
         args::Command::Serve(_) => unreachable!("serve commands use the network runtime"),
