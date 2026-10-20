@@ -1636,6 +1636,7 @@ pub(crate) fn paged_sdpa(
     causal: bool,
     q_start: Affine,
     key_length: Affine,
+    variant: &str,
 ) -> Result<()> {
     guest::paged_storage::record_paged_sdpa(
         commands,
@@ -1643,7 +1644,7 @@ pub(crate) fn paged_sdpa(
         0,
         query,
         output,
-        guest::paged_storage::SdpaCfg {
+        &guest::paged_storage::SdpaCfg {
             key_plane,
             value_plane,
             scale,
@@ -1658,6 +1659,7 @@ pub(crate) fn paged_sdpa(
                 scale: key_length.scale,
                 offset: key_length.offset,
             },
+            algorithm: variant.to_owned(),
         },
     )
     .map_err(|error| Error::new(format!("{error:?}")))

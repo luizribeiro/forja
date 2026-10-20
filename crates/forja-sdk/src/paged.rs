@@ -168,6 +168,7 @@ impl PagedCache<'_> {
         scale: f32,
         start: &Dim,
         end: &Dim,
+        variant: &crate::target::metal::Variant,
     ) -> Result<Tensor<T>> {
         let [sequence, heads, width]: [u32; 3] = query
             .shape()
@@ -193,10 +194,11 @@ impl PagedCache<'_> {
                 true,
                 start,
                 end,
+                variant.name(),
             )
         })?;
         #[cfg(not(target_family = "wasm"))]
-        let _ = (&query, scale, start, end);
+        let _ = (&query, scale, start, end, variant);
         output
             .permute(&[1, 0, 2])?
             .contiguous()?

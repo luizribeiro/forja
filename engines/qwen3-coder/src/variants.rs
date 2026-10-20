@@ -21,6 +21,9 @@ const SITES: &[&str] = &[
     "attention.decode",
     "attention.prefill-large",
     "attention.prefill-small",
+    "paged-attention.decode",
+    "paged-attention.prefill-large",
+    "paged-attention.prefill-small",
 ];
 
 pub(crate) struct Variants(EngineSelections);
@@ -73,18 +76,24 @@ impl Variants {
         sequence: u32,
         start: u32,
         parameter: Option<&Param>,
+        paged: bool,
     ) -> Result<VariantSelection> {
-        let site = if sequence == 1 {
-            "attention.decode"
+        let phase = if sequence == 1 {
+            "decode"
         } else if sequence >= 512 {
-            "attention.prefill-large"
+            "prefill-large"
         } else {
-            "attention.prefill-small"
+            "prefill-small"
+        };
+        let site = if paged {
+            format!("paged-attention.{phase}")
+        } else {
+            format!("attention.{phase}")
         };
         if let Some(parameter) = parameter {
-            self.0.for_param(site, parameter)
+            self.0.for_param(&site, parameter)
         } else {
-            Ok(VariantSelection::Fixed(self.0.at(site, start)?))
+            Ok(VariantSelection::Fixed(self.0.at(&site, start)?))
         }
     }
 

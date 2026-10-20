@@ -27,6 +27,7 @@ interface paged-storage {
     causal: bool,
     q-start: affine,
     key-length: affine,
+    algorithm: string,
   }
 
   record-paged-copy: func(

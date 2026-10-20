@@ -48,6 +48,9 @@ prompt-token-budget = 2048
 "top-k" = "top-k.single-k8"
 "sample" = "sample.parallel"
 "attention.prefill-small" = "sdpa.decomposed"
+"paged-attention.decode" = "paged-sdpa.vector"
+"paged-attention.prefill-large" = "paged-sdpa.steel"
+"paged-attention.prefill-small" = "paged-sdpa.steel"
 
 [variants.rules."attention.decode"]
 parameter = "position"

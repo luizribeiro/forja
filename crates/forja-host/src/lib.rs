@@ -3549,9 +3549,13 @@ impl<B: Backend + 'static> Host<B> {
         operation: (TemplateOp, Option<Op>),
         inputs: Vec<TensorEntry>,
         output: TensorEntry,
-        protected: Vec<BufferId>,
-        usage: PagedUse,
+        context: PagedDispatchContext<'_>,
     ) -> Result<(), compute::Error> {
+        let PagedDispatchContext {
+            protected,
+            usage,
+            variant_name,
+        } = context;
         let (template_op, concrete_op) = operation;
         let input_tensors = inputs.iter().map(|entry| &entry.tensor).collect::<Vec<_>>();
         let output_tensors = [&output.tensor];
@@ -3569,6 +3573,24 @@ impl<B: Backend + 'static> Host<B> {
             .map(TensorEntry::template)
             .collect::<Result<Vec<_>, _>>()?;
         let template_output = output.template()?;
+        #[cfg(target_os = "macos")]
+        let variant = self.validate_paged_variant(
+            &PagedVariantInputs {
+                operation,
+                inputs: &input_tensors,
+                outputs: &output_tensors,
+                template_inputs: &template_inputs,
+                template_output: &template_output,
+                space: dispatch_space.as_ref().or(entry.space.as_ref()),
+                is_static: concrete_op.is_some() && dispatch_space.is_none(),
+            },
+            variant_name,
+        )?;
+        #[cfg(not(target_os = "macos"))]
+        let variant: Option<BackendDispatchData> = {
+            let _ = variant_name;
+            None
+        };
         let entry = self.table.get_mut(commands).map_err(invalid_handle)?;
         if let Some(operation) = concrete_op
             && dispatch_space.is_none()
@@ -3577,20 +3599,34 @@ impl<B: Backend + 'static> Host<B> {
                 .commands
                 .dispatch(operation, &input_tensors, &output.tensor)
                 .map_err(guest_error)?;
-            let dispatch = entry
+            let mut dispatch = entry
                 .commands
                 .last_dispatch()
                 .cloned()
                 .ok_or_else(|| guest_error(BackendError::ExecutionFailed))?;
+            if let Some(data) = variant.clone() {
+                dispatch.set_backend_data(data.clone());
+                if !entry.commands.set_last_backend_data(data) {
+                    return Err(guest_error(BackendError::ExecutionFailed));
+                }
+            }
             entry
                 .recorded
                 .push(RecordedDispatch::Static(Box::new(dispatch)));
         } else {
             entry.parameterized = true;
-            entry.recorded.push(RecordedDispatch::Operation {
-                op: template_op,
-                inputs: template_inputs,
-                outputs: vec![template_output],
+            entry.recorded.push(match variant {
+                None => RecordedDispatch::Operation {
+                    op: template_op,
+                    inputs: template_inputs,
+                    outputs: vec![template_output],
+                },
+                Some(data) => RecordedDispatch::Variant {
+                    op: template_op,
+                    inputs: template_inputs,
+                    outputs: vec![template_output],
+                    data,
+                },
             });
         }
         entry.space = entry.space.take().or(dispatch_space);
@@ -4517,6 +4553,48 @@ impl<B: Backend + 'static> Host<B> {
             .ok_or_else(|| compute::Error::OpSignature("Metal variants are unavailable".to_owned()))
     }
 
+    fn validate_paged_variant(
+        &self,
+        request: &PagedVariantInputs<'_>,
+        name: Option<&str>,
+    ) -> Result<Option<BackendDispatchData>, compute::Error> {
+        let Some(name) = name else {
+            return Ok(None);
+        };
+        if !(self.backend.as_ref() as &dyn Any).is::<forja_metal::MetalBackend>() {
+            return Ok(None);
+        }
+        validate_variant_name_length(name)?;
+        let validated = if request.is_static {
+            let operation = request.operation.1.ok_or_else(|| {
+                compute::Error::OpSignature("paged concrete operation is unavailable".to_owned())
+            })?;
+            self.metal_backend()?
+                .validate_variant_for_op(operation, request.inputs, request.outputs, name)
+                .map_err(|error| match error {
+                    forja_metal::VariantValidationError::Operation(error) => guest_error(error),
+                    forja_metal::VariantValidationError::Variant(error) => variant_error(&error),
+                })?
+        } else {
+            let space = request.space.ok_or_else(|| {
+                compute::Error::OpSignature(
+                    "paged variant operation requires replay parameters".to_owned(),
+                )
+            })?;
+            let inputs = request.template_inputs.iter().collect::<Vec<_>>();
+            self.metal_backend()?
+                .validate_template_variant(
+                    space,
+                    request.operation.0,
+                    &inputs,
+                    &[request.template_output],
+                    name,
+                )
+                .map_err(|error| variant_error(&error))?
+        };
+        Ok(Some(BackendDispatchData::new(validated)))
+    }
+
     fn record_metal_variant(
         &mut self,
         commands: &Resource<CommandListEntry>,
@@ -4930,6 +5008,23 @@ enum SubmissionWork {
 struct PagedUse {
     binding: Arc<PagedBinding>,
     bank: usize,
+}
+
+struct PagedDispatchContext<'a> {
+    protected: Vec<BufferId>,
+    usage: PagedUse,
+    variant_name: Option<&'a str>,
+}
+
+#[cfg(target_os = "macos")]
+struct PagedVariantInputs<'a> {
+    operation: (TemplateOp, Option<Op>),
+    inputs: &'a [&'a Tensor],
+    outputs: &'a [&'a Tensor],
+    template_inputs: &'a [TemplateTensor],
+    template_output: &'a TemplateTensor,
+    space: Option<&'a ParamSpace>,
+    is_static: bool,
 }
 
 impl std::fmt::Debug for PagedUse {
@@ -6027,8 +6122,11 @@ where
                         (template, concrete),
                         vec![ordinary, table, generations],
                         pages,
-                        protected,
-                        usage,
+                        PagedDispatchContext {
+                            protected,
+                            usage,
+                            variant_name: None,
+                        },
                     )
                 }
                 PagedCopyDirection::OutOfPages => {
@@ -6042,8 +6140,11 @@ where
                         (template, concrete),
                         vec![pages, table, generations],
                         ordinary,
-                        protected,
-                        usage,
+                        PagedDispatchContext {
+                            protected,
+                            usage,
+                            variant_name: None,
+                        },
                     )
                 }
             }
@@ -6141,8 +6242,11 @@ where
                     generations,
                 ],
                 output,
-                protected,
-                usage,
+                PagedDispatchContext {
+                    protected,
+                    usage,
+                    variant_name: Some(&config.algorithm),
+                },
             )
         })();
         std::future::ready(Ok(result))
@@ -6964,6 +7068,7 @@ mod tests {
                 causal: false,
                 q_start: wit_affine(None, 0, 0),
                 key_length: wit_affine(None, 0, 1),
+                algorithm: "paged-sdpa.vector".to_owned(),
             },
         )
         .await
@@ -7040,6 +7145,7 @@ mod tests {
                 causal: true,
                 q_start: wit_affine(None, 0, 0),
                 key_length: wit_affine(None, 0, 1),
+                algorithm: "paged-sdpa.vector".to_owned(),
             },
         )
         .await
