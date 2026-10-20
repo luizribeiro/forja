@@ -8,6 +8,7 @@ mod config_show;
 mod engine;
 mod generate;
 mod host_schema;
+mod logging;
 mod machine_load;
 mod profile;
 mod provenance;
@@ -79,6 +80,7 @@ fn run(command: args::Command) -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
     if let args::Command::Serve(options) = command {
+        logging::init(&options.config.logging)?;
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?;

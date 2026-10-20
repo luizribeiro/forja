@@ -65,6 +65,13 @@ tokio-stream = "0.1"
 tokenizers = { version = "0.22", default-features = false, features = [
   "fancy-regex",
 ] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = [
+  "ansi",
+  "env-filter",
+  "fmt",
+  "json",
+] }
 toml = "1.0"
 wasmparser = { version = "0.258", default-features = false, features = [
   "component-model",
