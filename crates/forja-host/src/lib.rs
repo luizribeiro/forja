@@ -587,6 +587,32 @@ impl PagedPrefix {
             .entries()
             .len())
     }
+
+    /// Returns the committed logical token length.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the sequence state is corrupt.
+    pub fn logical_len(&self) -> Result<u64, PagePoolError> {
+        Ok(self
+            .sequence
+            .lock()
+            .map_err(|_| PagePoolError::CorruptState)?
+            .logical_len())
+    }
+
+    /// Returns the reserved token capacity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the sequence state is corrupt.
+    pub fn reserved_tokens(&self) -> Result<u64, PagePoolError> {
+        Ok(self
+            .sequence
+            .lock()
+            .map_err(|_| PagePoolError::CorruptState)?
+            .reserved_tokens())
+    }
 }
 
 type EngineCallFuture<'a, T> =
@@ -6728,6 +6754,31 @@ mod tests {
             .load(Ordering::Acquire);
 
         assert_eq!(host.live_bytes.load(Ordering::Acquire), charged);
+    }
+
+    #[test]
+    fn paged_prefix_reports_committed_and_reserved_lengths() {
+        let pool = PagePool::new(
+            PagedLayout::new(
+                4,
+                vec![PagedPlane {
+                    dtype: DType::F32,
+                    elements_per_token: 1,
+                    alignment: 4,
+                    label: "test".to_owned(),
+                }],
+            )
+            .unwrap(),
+            2,
+            1_024,
+        )
+        .unwrap();
+        let mut sequence = pool.reserve(8).unwrap();
+        sequence.commit_write(3).unwrap();
+        let prefix = super::PagedPrefix::new(sequence);
+
+        assert_eq!(prefix.logical_len().unwrap(), 3);
+        assert_eq!(prefix.reserved_tokens().unwrap(), 8);
     }
 
     #[test]
