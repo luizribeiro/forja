@@ -1,8 +1,8 @@
-use std::{net::SocketAddr, path::PathBuf};
+use std::{net::SocketAddr, num::NonZeroU32, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{Backend, ByteSize, Duration, Limits};
+use crate::{Backend, ByteSize, Choice, Duration, Limits};
 
 /// Configuration used by the serving host.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -20,6 +20,12 @@ pub struct HostConfig {
     pub limits: Limits,
     /// Per-request admission ceilings.
     pub request: RequestCeiling,
+    /// CPU worker pools used by serving.
+    pub pools: Pools,
+    /// Structured logging policy.
+    pub logging: Logging,
+    /// Metrics and health listener.
+    pub metrics: Metrics,
 }
 
 /// Cross-request serving behavior.
@@ -53,6 +59,8 @@ pub struct Server {
     pub body_read_timeout: Duration,
     /// Maximum time an SSE write may remain stalled.
     pub sse_write_stall_timeout: Duration,
+    /// Maximum time to drain the current model before cancelling work.
+    pub model_drain_deadline: Duration,
 }
 
 impl Default for Server {
@@ -64,6 +72,7 @@ impl Default for Server {
             header_read_timeout: Duration::from_secs(10),
             body_read_timeout: Duration::from_secs(30),
             sse_write_stall_timeout: Duration::from_secs(30),
+            model_drain_deadline: Duration::from_secs(30),
         }
     }
 }
@@ -122,6 +131,77 @@ impl Default for RequestCeiling {
     }
 }
 
+/// CPU worker-pool configuration.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Pools {
+    /// Number of grammar compilation workers.
+    pub grammar_workers: Choice<NonZeroU32>,
+    /// Maximum queued grammar jobs.
+    pub grammar_queue_length: u32,
+}
+
+impl Default for Pools {
+    fn default() -> Self {
+        Self {
+            grammar_workers: Choice::Auto,
+            grammar_queue_length: 1,
+        }
+    }
+}
+
+/// Structured log output configuration.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Logging {
+    /// Log filter level.
+    pub level: String,
+    /// Output encoding.
+    pub format: LogFormat,
+    /// Include tracing span lifecycle events.
+    #[serde(rename = "include-spans")]
+    pub include_spans: bool,
+}
+
+impl Default for Logging {
+    fn default() -> Self {
+        Self {
+            level: "info".to_owned(),
+            format: LogFormat::Json,
+            include_spans: false,
+        }
+    }
+}
+
+/// Structured log output encoding.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LogFormat {
+    /// One JSON object per event.
+    Json,
+    /// Human-readable output for interactive use.
+    Pretty,
+}
+
+/// Metrics and health endpoint configuration.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Metrics {
+    /// Listener address, or absent to disable operational endpoints.
+    pub listen: Option<SocketAddr>,
+    /// Prometheus metrics path.
+    pub path: String,
+}
+
+impl Default for Metrics {
+    fn default() -> Self {
+        Self {
+            listen: Some(SocketAddr::from(([127, 0, 0, 1], 9091))),
+            path: "/metrics".to_owned(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -173,6 +253,36 @@ max_output_tokens = 4096
             config.server.sse_write_stall_timeout,
             Duration::from_secs(30)
         );
+        assert_eq!(config.request.max_body_bytes, ByteSize::new(1024 * 1024));
+        assert_eq!(config.request.max_messages, 256);
+        assert_eq!(config.request.max_text_bytes, ByteSize::new(1024 * 1024));
+        assert_eq!(config.request.max_prompt_tokens, None);
+        assert_eq!(config.request.max_output_tokens, 8_192);
+        assert_eq!(config.request.max_stops, 4);
+        assert_eq!(config.request.max_tools, 128);
+        assert_eq!(config.request.max_tool_bytes, ByteSize::new(256 * 1024));
+        assert_eq!(config.request.max_schema_depth, 64);
+        assert_eq!(config.metrics.listen, Some(([127, 0, 0, 1], 9091).into()));
+        assert_eq!(config.metrics.path, "/metrics");
+        assert_eq!(config.logging.format, LogFormat::Json);
+    }
+
+    #[test]
+    fn preserves_every_preexisting_default_value() {
+        let config = HostConfig::default();
+        assert_eq!(config.server.listen, ([127, 0, 0, 1], 8080).into());
+        assert_eq!(config.server.queue_length, 16);
+        assert_eq!(config.server.request_deadline, Duration::from_secs(300));
+        assert_eq!(config.server.header_read_timeout, Duration::from_secs(10));
+        assert_eq!(config.server.body_read_timeout, Duration::from_secs(30));
+        assert_eq!(
+            config.server.sse_write_stall_timeout,
+            Duration::from_secs(30)
+        );
+        assert_eq!(config.model, ServedModel::default());
+        assert!(config.serving.prefix_reuse);
+        assert_eq!(config.backend, Backend::default());
+        assert_eq!(config.limits, Limits::default());
         assert_eq!(config.request.max_body_bytes, ByteSize::new(1024 * 1024));
         assert_eq!(config.request.max_messages, 256);
         assert_eq!(config.request.max_text_bytes, ByteSize::new(1024 * 1024));

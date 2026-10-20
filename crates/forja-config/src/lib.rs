@@ -22,7 +22,9 @@ pub use profile::{
     Serving as ProfileServing, Target, VariantArm, VariantRule, Variants, WeightFormat, Workload,
     WorkloadKind,
 };
-pub use serving::{HostConfig, RequestCeiling, ServedModel, Server};
+pub use serving::{
+    HostConfig, LogFormat, Logging, Metrics, Pools, RequestCeiling, ServedModel, Server, Serving,
+};
 pub use set::set_layer;
 pub use units::{ByteSize, Duration, Unbounded};
 pub use weights::{sharded_weights_sha256, single_weights_sha256};
