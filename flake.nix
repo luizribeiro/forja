@@ -1,6 +1,10 @@
 {
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    nix-darwin = {
+      url = "github:nix-darwin/nix-darwin";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
     flake-utils.url = "github:numtide/flake-utils";
     rust-overlay = {
       url = "github:oxalica/rust-overlay";
@@ -15,6 +19,7 @@
   outputs =
     {
       self,
+      nix-darwin,
       nixpkgs,
       flake-utils,
       git-hooks,
@@ -37,6 +42,35 @@
             "wasm32-unknown-unknown"
             "wasm32-wasip2"
           ];
+        };
+        rustPlatform = pkgs.makeRustPlatform {
+          cargo = toolchain;
+          rustc = toolchain;
+        };
+        forjaPackage = rustPlatform.buildRustPackage {
+          pname = "forja";
+          version = "0.0.0";
+          src = pkgs.lib.fileset.toSource {
+            root = ./.;
+            fileset = pkgs.lib.fileset.unions [
+              ./Cargo.lock
+              ./Cargo.toml
+              ./chat-formats
+              ./crates
+              ./engines
+              ./support
+              ./wit
+            ];
+          };
+          cargoLock.lockFile = ./Cargo.lock;
+          cargoBuildFlags = [
+            "-p"
+            "forja"
+            "--bin"
+            "forja"
+          ];
+          doCheck = false;
+          FORJA_BUILD_REV = self.rev or self.dirtyRev or "unknown";
         };
         cargoFiles = "(^|/)(Cargo\\.(toml|lock)|.*\\.rs)$";
         runEverythingFiles = "(Cargo\\.lock|flake\\.lock|rust-toolchain(\\.toml)?)$";
@@ -289,9 +323,57 @@
         };
       in
       {
-        checks.pre-commit = git-hooks.lib.${system}.run {
-          src = ./.;
-          hooks = offlineHooks;
+        packages = {
+          default = forjaPackage;
+          forja = forjaPackage;
+        };
+        checks = {
+          pre-commit = git-hooks.lib.${system}.run {
+            src = ./.;
+            hooks = offlineHooks;
+          };
+        }
+        // pkgs.lib.optionalAttrs (system == "aarch64-darwin") {
+          forja-darwin-build = self.darwinConfigurations.forja-test.system;
+          forja-module-eval =
+            let
+              configuration = self.darwinConfigurations.forja-test;
+              configFile = configuration.config.services.forja.configFile;
+              service = configuration.config.launchd.daemons.forja.serviceConfig;
+              arguments = service.ProgramArguments;
+            in
+            assert service.UserName == "_forja";
+            assert configuration.config.users.users._forja.isHidden;
+            assert configuration.options.services.forja.uid.default == 492;
+            assert configuration.options.services.forja.gid.default == 492;
+            assert
+              arguments == [
+                "${configuration.config.services.forja.package}/bin/forja"
+                "-c"
+                "${configFile}"
+                "serve"
+              ];
+            assert builtins.all (pkgs.lib.hasPrefix "/") [
+              (builtins.elemAt arguments 0)
+              (builtins.elemAt arguments 2)
+            ];
+            assert service.WorkingDirectory == "/var/lib/forja";
+            assert service.Umask == 27;
+            assert service.RunAtLoad;
+            assert !service.KeepAlive.SuccessfulExit;
+            assert service.SoftResourceLimits.Core == 0;
+            assert service.SoftResourceLimits.NumberOfFiles == 65536;
+            assert service.SoftResourceLimits.NumberOfProcesses == 1024;
+            assert service.HardResourceLimits.Core == 0;
+            assert service.HardResourceLimits.NumberOfFiles == 65536;
+            assert service.HardResourceLimits.NumberOfProcesses == 1024;
+            pkgs.runCommand "forja-module-eval" { } ''
+              grep -q 'live_bytes = "auto"' ${configFile}
+              grep -q 'kind = "cpu"' ${configFile}
+              grep -q '^engine = "/nix/store/' ${configFile}
+              grep -q '^chat_format = "/nix/store/' ${configFile}
+              touch "$out"
+            '';
         };
 
         devShells.default = pkgs.mkShell {
@@ -312,5 +394,16 @@
           '';
         };
       }
-    );
+    )
+    // {
+      darwinModules.forja = import ./nix/module.nix { };
+      darwinConfigurations.forja-test = nix-darwin.lib.darwinSystem {
+        modules = [
+          self.darwinModules.forja
+          (import ./nix/test-configuration.nix {
+            forjaPackage = self.packages.aarch64-darwin.forja;
+          })
+        ];
+      };
+    };
 }
