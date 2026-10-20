@@ -13,7 +13,7 @@ use axum::{
     Json, Router,
     body::Bytes,
     extract::{DefaultBodyLimit, FromRequest, Path, Request, State, rejection::BytesRejection},
-    http::StatusCode,
+    http::{StatusCode, header},
     response::{
         IntoResponse, Response,
         sse::{Event, Sse},
@@ -28,7 +28,7 @@ use tokio_stream::{StreamExt, wrappers::ReceiverStream};
 use crate::engine::ErrorKind;
 use crate::{
     ChatCompletionRequest, Completion, CompletionRequest, GenerationControl, GenerationError,
-    GenerationEvent, ServingEngine, Usage, chat_response, text_response,
+    GenerationEvent, ServingEngine, ServingMetrics, Usage, chat_response, text_response,
 };
 
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
@@ -49,6 +49,11 @@ pub trait ChatService: Send + 'static {
 
     /// Maximum time a streaming event may remain backpressured.
     fn write_stall_timeout(&self) -> Duration;
+
+    /// Snapshot of currently accumulated bounded metrics.
+    fn metrics(&self) -> ServingMetrics {
+        ServingMetrics::default()
+    }
 
     /// Completes one chat request.
     fn complete(
@@ -103,6 +108,10 @@ where
 
     fn write_stall_timeout(&self) -> Duration {
         self.write_stall_timeout()
+    }
+
+    fn metrics(&self) -> ServingMetrics {
+        self.metrics().clone()
     }
 
     fn complete(
@@ -177,6 +186,25 @@ pub fn serving_router<S: ChatService>(service: S) -> (Router, DrainHandle<S>) {
     (router, DrainHandle { state })
 }
 
+/// Builds the read-only health and Prometheus router for a serving handle.
+///
+/// # Errors
+///
+/// Returns an error when the configured metrics path conflicts with a health path.
+pub fn operational_router<S: ChatService>(
+    handle: &DrainHandle<S>,
+    metrics_path: &str,
+) -> Result<Router, String> {
+    if !metrics_path.starts_with('/') || matches!(metrics_path, "/health/live" | "/health/ready") {
+        return Err("metrics path must be an absolute, non-health path".to_owned());
+    }
+    Ok(Router::new()
+        .route("/health/live", get(live))
+        .route("/health/ready", get(ready::<S>))
+        .route(metrics_path, get(prometheus::<S>))
+        .with_state(Arc::clone(&handle.state)))
+}
+
 struct HttpState<S> {
     model: String,
     service: Mutex<S>,
@@ -188,6 +216,31 @@ struct HttpState<S> {
     queue_limit: u32,
     deadline: Duration,
     write_stall_timeout: Duration,
+}
+
+async fn live() -> Response {
+    (StatusCode::OK, "live\n").into_response()
+}
+
+async fn ready<S>(State(state): State<Arc<HttpState<S>>>) -> Response {
+    if state.draining.load(Ordering::Acquire) {
+        (StatusCode::SERVICE_UNAVAILABLE, "not ready\n").into_response()
+    } else {
+        (StatusCode::OK, "ready\n").into_response()
+    }
+}
+
+async fn prometheus<S: ChatService>(State(state): State<Arc<HttpState<S>>>) -> Response {
+    let ready = !state.draining.load(Ordering::Acquire);
+    let text = state.service.lock().await.metrics().prometheus(true, ready);
+    (
+        [(
+            header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        text,
+    )
+        .into_response()
 }
 
 /// Stops admission, cancels active generation, and waits for its finalizer.
@@ -968,6 +1021,27 @@ mod tests {
                 .await
                 .status(),
             StatusCode::NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
+    async fn health_and_metrics_reflect_readiness() {
+        let state = state();
+        assert_eq!(live().await.status(), StatusCode::OK);
+        assert_eq!(
+            ready::<Smoke>(State(Arc::clone(&state))).await.status(),
+            StatusCode::OK
+        );
+        let metrics = prometheus::<Smoke>(State(Arc::clone(&state))).await;
+        assert_eq!(metrics.status(), StatusCode::OK);
+        assert_eq!(
+            metrics.headers()[header::CONTENT_TYPE],
+            "text/plain; version=0.0.4; charset=utf-8"
+        );
+        state.draining.store(true, Ordering::Release);
+        assert_eq!(
+            ready::<Smoke>(State(state)).await.status(),
+            StatusCode::SERVICE_UNAVAILABLE
         );
     }
 

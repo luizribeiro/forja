@@ -105,14 +105,33 @@ where
     )?;
     let listener = tokio::net::TcpListener::bind(config.server.listen).await?;
     let (router, drain) = forja_serve::serving_router(engine);
-    axum::serve(listener, router)
+    let (metrics_shutdown, mut metrics_shutdown_rx) = tokio::sync::watch::channel(false);
+    let metrics_task = if let Some(address) = config.metrics.listen {
+        let listener = tokio::net::TcpListener::bind(address).await?;
+        let router = forja_serve::operational_router(&drain, &config.metrics.path)?;
+        Some(tokio::spawn(async move {
+            axum::serve(listener, router)
+                .with_graceful_shutdown(async move {
+                    let _ = metrics_shutdown_rx.changed().await;
+                })
+                .await
+        }))
+    } else {
+        None
+    };
+    let result = axum::serve(listener, router)
         .with_graceful_shutdown(async move {
             if let Err(error) = shutdown_signal().await {
-                eprintln!("cannot listen for shutdown: {error}");
+                tracing::error!(event = "shutdown.listen_failed", %error);
             }
             drain.drain().await;
         })
-        .await?;
+        .await;
+    let _ = metrics_shutdown.send(true);
+    if let Some(task) = metrics_task {
+        task.await??;
+    }
+    result?;
     Ok(())
 }
 
