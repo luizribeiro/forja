@@ -144,7 +144,7 @@ fn parses_typed_chat_settings() {
     let profile: Profile = toml::from_str(&source).unwrap();
     let chat = profile.chat().unwrap();
     assert_eq!(chat.tool_format.as_deref(), Some("qwen3-coder-xml"));
-    assert!(chat.tool_format_options.is_empty());
+    assert_eq!(chat.tool_format_options.len(), 0);
     assert!(error(&source.replace("qwen3-coder-xml", "Qwen XML")).contains("lowercase ASCII"));
     assert!(
         error(&source.replace("sha256:0123", "sha256:Z123"))

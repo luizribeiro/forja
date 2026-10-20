@@ -1953,7 +1953,7 @@ mod tests {
         .unwrap() else {
             panic!("expected bench command");
         };
-        assert!(options.points[0].config.engine.tunings.add.is_empty());
+        assert_eq!(options.points[0].config.engine.tunings.add.len(), 0);
         assert!(
             options
                 .points
@@ -2408,7 +2408,7 @@ selection = ["host-argmax"]
         };
         assert_eq!(options.backend, Backend::Metal);
         assert_eq!(options.precision, Precision::F32);
-        assert!(options.prompts.is_empty());
+        assert_eq!(options.prompts.len(), 0);
     }
 
     #[test]

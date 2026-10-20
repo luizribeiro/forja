@@ -92,7 +92,7 @@ where
             .filter(|dispatch| matches!(dispatch.op, forja_core::Op::Matmul))
             .map(|dispatch| dispatch.kernel)
             .collect::<Vec<_>>();
-        assert!(!kernels.is_empty());
+        assert_ne!(kernels.len(), 0);
         assert!(kernels.iter().all(|kernel| *kernel == expected_kernel));
     }
     Ok(())

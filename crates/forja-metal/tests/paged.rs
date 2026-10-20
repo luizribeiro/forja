@@ -31,7 +31,7 @@ fn encode(values: &[f32], dtype: DType) -> Vec<u8> {
 
 fn decode_f32(bytes: &[u8]) -> Vec<f32> {
     let (words, remainder) = bytes.as_chunks::<4>();
-    assert!(remainder.is_empty());
+    assert_eq!(remainder.len(), 0);
     words.iter().copied().map(f32::from_le_bytes).collect()
 }
 

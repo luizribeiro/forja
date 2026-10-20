@@ -322,7 +322,7 @@ mod tests {
             load_stop_token_ids(test_guests::qwen3_coder())?,
             [151_645, 151_643]
         );
-        assert!(load_stop_token_ids(test_guests::qwen3())?.is_empty());
+        assert_eq!(load_stop_token_ids(test_guests::qwen3())?.len(), 0);
         Ok(())
     }
 
@@ -422,7 +422,7 @@ mod tests {
             "Qwen3-Coder full model: live={} bytes, RSS={} bytes, output={text:?}",
             report.live_bytes, report.rss_bytes,
         );
-        assert!(!report.tokens.is_empty());
+        assert_ne!(report.tokens.len(), 0);
         assert!(text.trim().len() >= 8);
         assert!(
             text.chars()

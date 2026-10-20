@@ -68,7 +68,7 @@ fn parser_emits_completed_parts_before_the_call_ends() {
             Err(error) => panic!("invalid fixture UTF-8: {error}"),
         }
     }
-    assert!(pending.is_empty());
+    assert_eq!(pending.len(), 0);
     assert_eq!(events, expected);
     assert!(arrivals[0] < CALL.len() - CALL_END_LEN);
     assert!(arrivals[1] < CALL.len() - CALL_END_LEN);

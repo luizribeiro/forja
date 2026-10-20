@@ -11,7 +11,7 @@ fn catalog(arguments: &[&str]) -> String {
         .output()
         .unwrap();
     assert!(output.status.success());
-    assert!(output.stderr.is_empty());
+    assert_eq!(output.stderr.len(), 0);
     String::from_utf8(output.stdout).unwrap()
 }
 

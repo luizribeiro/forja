@@ -2242,7 +2242,7 @@ mod tests {
             renderer: format,
         }));
         let mut parser = ToolParser::new(&plan, prompt).unwrap();
-        assert!(parser.seed().await.unwrap().is_empty());
+        assert_eq!(parser.seed().await.unwrap().len(), 0);
         parser
             .parse(
                 "<function=read_file>\n<parameter=path>\na.rs\n</parameter>\n</function>\n</tool_call>"

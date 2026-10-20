@@ -9174,7 +9174,7 @@ mod tests {
             && threads_per_threadgroup.width == 33
             && threads_per_threadgroup.height == 1
             && threads_per_threadgroup.depth == 1));
-        assert!(PlanRecorderScope::enter(0, None).finish().is_empty());
+        assert_eq!(PlanRecorderScope::enter(0, None).finish().len(), 0);
     }
 
     #[test]
@@ -9439,8 +9439,8 @@ mod tests {
             let actual = run_row_program(&metal, &program, width);
             let (expected, expected_remainder) = expected.as_chunks::<4>();
             let (actual, actual_remainder) = actual.as_chunks::<4>();
-            assert!(expected_remainder.is_empty());
-            assert!(actual_remainder.is_empty());
+            assert_eq!(expected_remainder.len(), 0);
+            assert_eq!(actual_remainder.len(), 0);
             for (expected, actual) in expected.iter().zip(actual) {
                 assert_outputs_agree(DType::F32, expected, actual).unwrap();
             }
@@ -10083,8 +10083,8 @@ mod tests {
             Err(BackendError::QuotaExceeded)
         ));
         let pipelines = backend.pipelines.lock().unwrap();
-        assert!(pipelines.epilogue_libraries.is_empty());
-        assert!(pipelines.epilogue_pipelines.is_empty());
+        assert_eq!(pipelines.epilogue_libraries.len(), 0);
+        assert_eq!(pipelines.epilogue_pipelines.len(), 0);
     }
 
     #[test]
@@ -10112,8 +10112,8 @@ mod tests {
             Err(BackendError::ExecutionFailed)
         ));
         assert_eq!(pipelines.epilogue_counts.fallbacks, 1);
-        assert!(pipelines.epilogue_libraries.is_empty());
-        assert!(pipelines.epilogue_pipelines.is_empty());
+        assert_eq!(pipelines.epilogue_libraries.len(), 0);
+        assert_eq!(pipelines.epilogue_pipelines.len(), 0);
 
         let assertion = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             pipelines.lookup_epilogue(
@@ -10129,8 +10129,8 @@ mod tests {
             _ => false,
         });
         assert_eq!(pipelines.epilogue_counts.fallbacks, 2);
-        assert!(pipelines.epilogue_libraries.is_empty());
-        assert!(pipelines.epilogue_pipelines.is_empty());
+        assert_eq!(pipelines.epilogue_libraries.len(), 0);
+        assert_eq!(pipelines.epilogue_pipelines.len(), 0);
     }
 
     fn push_grouped_epilogue_requests(
@@ -10276,7 +10276,7 @@ mod tests {
         let graph = backend.prepare_graph(graph).unwrap();
         let state = graph.backend_state::<PreparedMetalGraph>().unwrap();
         assert!(state.encoding.as_ref().unwrap().dispatches[0].is_some());
-        assert!(state.variant_rechecks.is_empty());
+        assert_eq!(state.variant_rechecks.len(), 0);
         crate::variants::reset_replay_validation_count();
         backend.replay(&graph, Vec::new()).unwrap().wait().unwrap();
         backend.replay(&graph, Vec::new()).unwrap().wait().unwrap();

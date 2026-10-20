@@ -14,7 +14,7 @@ mod tests {
 
     #[test]
     fn embedded_revision_has_a_commit_and_dirty_state() {
-        assert!(!commit().is_empty());
+        assert_ne!(commit(), "");
         assert_eq!(dirty(), REVISION.ends_with("-dirty"));
     }
 }

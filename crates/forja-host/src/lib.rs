@@ -7822,7 +7822,7 @@ mod tests {
             panic!("expected an epilogue variant rule");
         };
         assert!(Arc::ptr_eq(epilogue, &prepared));
-        assert!(extras.is_empty());
+        assert_eq!(extras.len(), 0);
         assert_eq!(*parameter, 0);
         assert_eq!(arms.len(), 1);
         assert_eq!(
@@ -8843,7 +8843,7 @@ mod tests {
             host.dispatch_kernel(&commands, &kernel, &[input], &[output]),
             Err(compute::Error::OpSignature(_))
         ));
-        assert!(host.table.get(&commands).unwrap().commands.is_empty());
+        assert_eq!(host.table.get(&commands).unwrap().commands.len(), 0);
     }
 
     #[test]
@@ -9592,7 +9592,7 @@ mod tests {
             ),
             Err(compute::Error::Quota(_))
         ));
-        assert!(host.table.get(&commands).unwrap().commands.is_empty());
+        assert_eq!(host.table.get(&commands).unwrap().commands.len(), 0);
 
         host.limits.work_per_dispatch = 14;
         host.dispatch(
@@ -9643,7 +9643,7 @@ mod tests {
             },
             Err(compute::Error::Quota(_))
         ));
-        assert!(host.table.get(&commands).unwrap().commands.is_empty());
+        assert_eq!(host.table.get(&commands).unwrap().commands.len(), 0);
     }
 
     #[test]
