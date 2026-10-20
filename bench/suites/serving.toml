@@ -1,0 +1,71 @@
+[suite]
+schema_version = 1
+model = "mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit"
+revision = "6e302ea604ad9ab206367e2c501d1571023e7b6d"
+repetitions = 30
+warmups = 3
+connection_policy = "reuse"
+seed = 0
+
+[[case]]
+name = "cold-pp512-tg128"
+route = "completions"
+prompt_tokens = [512]
+output_tokens = 128
+concurrency = [1]
+sampling = "greedy"
+cold = true
+
+[[case]]
+name = "warm-repeated-agent-prefix"
+route = "chat"
+prompt_tokens = [33]
+warm_prefix_tokens = 2048
+output_tokens = 128
+concurrency = [1, 2, 4, 8]
+sampling = "greedy"
+cache_hit = true
+
+[[case]]
+name = "mixed-prompts"
+route = "completions"
+prompt_tokens = [1, 7, 33, 512, 4097]
+output_tokens = 128
+concurrency = [1, 2, 4, 8]
+sampling = "greedy"
+
+[[case]]
+name = "qwen-generation-defaults"
+route = "chat"
+prompt_tokens = [33]
+output_tokens = 128
+concurrency = [1]
+sampling = "qwen-defaults"
+
+[[case]]
+name = "streaming"
+route = "chat"
+prompt_tokens = [33]
+output_tokens = 128
+concurrency = [1, 4]
+sampling = "greedy"
+stream = true
+
+[[case]]
+name = "tools"
+route = "chat"
+prompt_tokens = [33]
+output_tokens = 128
+concurrency = [1]
+sampling = "greedy"
+tools = true
+
+[[case]]
+name = "cancellation"
+route = "completions"
+prompt_tokens = [33]
+output_tokens = 128
+concurrency = [1, 4]
+sampling = "greedy"
+stream = true
+cancel_after_tokens = 7
