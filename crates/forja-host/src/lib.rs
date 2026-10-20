@@ -711,7 +711,7 @@ where
             engine_bindings::EngineComponent::instantiate_async(&mut store, &component, &linker)
                 .await?;
         let id = NEXT_RUNNER_ID
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |id| id.checked_add(1))
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |id| id.checked_add(1))
             .map_err(|_| wasmtime::Error::msg("engine runner id space is exhausted"))?;
         Ok(Self {
             store,
@@ -1982,7 +1982,7 @@ impl BufferHandle {
 
     fn release_guest_handle(&self) -> Result<(), compute::Error> {
         self.guest_handles
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
                 count.checked_sub(1)
             })
             .map(|_| ())
@@ -2010,7 +2010,7 @@ impl BufferHandle {
                 byte_len,
                 live_bytes,
             } => live_bytes
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |bytes| {
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |bytes| {
                     bytes.checked_sub(*byte_len)
                 })
                 .map(|_| ())
@@ -2021,7 +2021,7 @@ impl BufferHandle {
                 ..
             } => copied_byte_len.map_or(Ok(()), |byte_len| {
                 live_bytes
-                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |bytes| {
+                    .try_update(Ordering::AcqRel, Ordering::Acquire, |bytes| {
                         bytes.checked_sub(byte_len)
                     })
                     .map(|_| ())
@@ -2149,7 +2149,7 @@ impl Drop for KernelLease {
 
 impl KernelLease {
     fn acquire(live: Arc<AtomicUsize>, limit: usize) -> Result<Self, compute::Error> {
-        live.fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+        live.try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
             count.checked_add(1).filter(|&next| next <= limit)
         })
         .map_err(|_| quota("live kernels exceed the guest limit"))?;
@@ -2170,7 +2170,7 @@ impl Drop for GraphLease {
 
 impl GraphLease {
     fn acquire(live: Arc<AtomicUsize>, limit: usize) -> Result<Self, compute::Error> {
-        live.fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+        live.try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
             count.checked_add(1).filter(|&next| next <= limit)
         })
         .map_err(|_| quota("live graphs exceed the guest limit"))?;
@@ -5475,7 +5475,7 @@ struct GpuReservation {
 impl GpuReservation {
     fn new(total: Arc<AtomicU64>, budget: u64, reserved: u64) -> Result<Self, BackendError> {
         total
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 current.checked_add(reserved).filter(|&next| next <= budget)
             })
             .map_err(|_| BackendError::QuotaExceeded)?;
@@ -5489,7 +5489,7 @@ impl GpuReservation {
     fn settle(mut self, charged: u64) -> Result<(), BackendError> {
         let charged = charged.min(self.reserved);
         self.total
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 current
                     .checked_sub(self.reserved)
                     .and_then(|remaining| remaining.checked_add(charged))
@@ -5505,7 +5505,7 @@ impl Drop for GpuReservation {
         if self.reserved != 0 {
             let _ = self
                 .total
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                     current.checked_sub(self.reserved)
                 });
         }
@@ -5692,7 +5692,7 @@ fn combine_submission_release<T>(
 }
 
 fn saturating_increment(counter: &AtomicU64) {
-    let _ = counter.fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+    let _ = counter.try_update(Ordering::AcqRel, Ordering::Acquire, |value| {
         Some(value.saturating_add(1))
     });
 }
@@ -5708,7 +5708,7 @@ fn publish_queued_submission(
 }
 
 fn saturating_add(counter: &AtomicU64, value: u64) {
-    let _ = counter.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+    let _ = counter.try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
         Some(current.saturating_add(value))
     });
 }

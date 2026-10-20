@@ -671,7 +671,7 @@ fn unix_time() -> u64 {
 
 fn next_request_id() -> u64 {
     NEXT_REQUEST_ID
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |id| id.checked_add(1))
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |id| id.checked_add(1))
         .unwrap_or(u64::MAX)
 }
 
@@ -703,7 +703,7 @@ async fn admit<S>(state: &Arc<HttpState<S>>) -> Result<OwnedSemaphorePermit, Box
     }
     if state
         .queued
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |queued| {
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |queued| {
             (queued < state.queue_limit).then_some(queued + 1)
         })
         .is_err()

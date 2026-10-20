@@ -176,7 +176,7 @@ impl ToolParser {
         prompt: Arc<StdMutex<PromptArtifacts<ChatFormat>>>,
     ) -> Result<Self, GenerationError> {
         let stream = NEXT_CHAT_STREAM
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |stream| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |stream| {
                 stream.checked_add(1)
             })
             .map_err(|_| GenerationError::new("chat parser stream id space is exhausted"))?;

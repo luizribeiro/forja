@@ -1856,11 +1856,11 @@ impl InFlightTracker {
             {
                 break objects;
             }
-            if let Ok(slot) =
-                self.slots
-                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |slots| {
-                        (slots < MAX_IN_FLIGHT_SUBMISSIONS).then_some(slots + 1)
-                    })
+            if let Ok(slot) = self
+                .slots
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |slots| {
+                    (slots < MAX_IN_FLIGHT_SUBMISSIONS).then_some(slots + 1)
+                })
             {
                 match Self::new_slot(backend, argument_capacity, slot == 0) {
                     Ok(objects) => break objects,

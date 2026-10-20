@@ -42,7 +42,7 @@ impl Param {
             return Err(crate::Error::new("parameter range cannot be empty"));
         }
         let id = NEXT_PARAM_ID
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
             .map_err(|_| crate::Error::new("parameter identities exhausted"))?;
         Ok(Self { id, range })
     }

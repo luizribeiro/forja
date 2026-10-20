@@ -98,7 +98,7 @@ impl ParamSpace {
             return Err(ParamError::InvalidRange { index });
         }
         let id = NEXT_PARAM_SPACE_ID
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
             .map_err(|_| ParamError::IdentityExhausted)?;
         Ok(Self { id, ranges })
     }
