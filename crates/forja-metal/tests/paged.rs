@@ -3,7 +3,7 @@
 #![cfg(target_os = "macos")]
 #![allow(clippy::cast_precision_loss)]
 
-use std::collections::HashSet;
+use std::{any::Any, collections::HashSet};
 
 use forja_core::{
     Backend, BackendDispatchData, BackendError, CommandList, DType, GraphLimits, GraphTemplate, Op,
@@ -284,7 +284,7 @@ fn metal_in_flight_paged_read_defers_page_reuse() {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run_sdpa<B: Backend>(
+fn run_sdpa<B: Backend + 'static>(
     backend: &B,
     dtype: DType,
     key_length: u32,
@@ -293,6 +293,7 @@ fn run_sdpa<B: Backend>(
     contiguous: bool,
     query_heads: u32,
     kv_heads: u32,
+    variant: Option<&str>,
 ) -> Result<Vec<f32>, BackendError> {
     const PAGE_TOKENS: u32 = 64;
     const WIDTH: u32 = 128;
@@ -358,6 +359,15 @@ fn run_sdpa<B: Backend>(
             &output,
         )
         .map_err(|_| BackendError::InvalidInput)?;
+    if let Some(name) = variant {
+        let metal = (backend as &dyn Any)
+            .downcast_ref::<forja_metal::MetalBackend>()
+            .unwrap();
+        let selection = metal
+            .validate_variant(commands.last_dispatch().unwrap(), name)
+            .unwrap();
+        assert!(commands.set_last_backend_data(BackendDispatchData::new(selection)));
+    }
     backend.submit(commands)?.wait()?;
     backend.read(&output).map(|bytes| decode_f32(&bytes))
 }
@@ -368,8 +378,8 @@ fn metal_paged_sdpa_matches_cpu_at_real_shapes() {
     let metal = forja_metal::MetalBackend::new().unwrap();
     for dtype in [DType::F32, DType::F16, DType::BF16] {
         for length in [1, 7, 33, 4_097] {
-            let reference = run_sdpa(&cpu, dtype, length, 1, false, false, 16, 8).unwrap();
-            let candidate = run_sdpa(&metal, dtype, length, 1, false, false, 16, 8).unwrap();
+            let reference = run_sdpa(&cpu, dtype, length, 1, false, false, 16, 8, None).unwrap();
+            let candidate = run_sdpa(&metal, dtype, length, 1, false, false, 16, 8, None).unwrap();
             let error = forja_testing::normwise_relative_error(&reference, &candidate);
             assert!(
                 error <= forja_testing::dtype_tolerance(dtype).unwrap(),
@@ -386,9 +396,19 @@ fn metal_paged_gqa_two_pass_matches_cpu() {
     for length in [512, 4_000] {
         for contiguous in [false, true] {
             let reference =
-                run_sdpa(&cpu, DType::F16, length, 1, false, contiguous, 32, 4).unwrap();
-            let candidate =
-                run_sdpa(&metal, DType::F16, length, 1, false, contiguous, 32, 4).unwrap();
+                run_sdpa(&cpu, DType::F16, length, 1, false, contiguous, 32, 4, None).unwrap();
+            let candidate = run_sdpa(
+                &metal,
+                DType::F16,
+                length,
+                1,
+                false,
+                contiguous,
+                32,
+                4,
+                None,
+            )
+            .unwrap();
             let error = forja_testing::normwise_relative_error(&reference, &candidate);
             assert!(
                 error <= forja_testing::F16_TOLERANCE,
@@ -402,8 +422,8 @@ fn metal_paged_gqa_two_pass_matches_cpu() {
 fn metal_paged_sdpa_uses_contiguous_entry_path() {
     let cpu = forja_cpu::CpuBackend::new();
     let metal = forja_metal::MetalBackend::new().unwrap();
-    let reference = run_sdpa(&cpu, DType::F16, 129, 1, false, true, 16, 8).unwrap();
-    let candidate = run_sdpa(&metal, DType::F16, 129, 1, false, true, 16, 8).unwrap();
+    let reference = run_sdpa(&cpu, DType::F16, 129, 1, false, true, 16, 8, None).unwrap();
+    let candidate = run_sdpa(&metal, DType::F16, 129, 1, false, true, 16, 8, None).unwrap();
     assert!(
         forja_testing::normwise_relative_error(&reference, &candidate)
             <= forja_testing::F16_TOLERANCE
@@ -414,8 +434,19 @@ fn metal_paged_sdpa_uses_contiguous_entry_path() {
 fn metal_paged_sdpa_matches_causal_prefill() {
     let cpu = forja_cpu::CpuBackend::new();
     let metal = forja_metal::MetalBackend::new().unwrap();
-    let reference = run_sdpa(&cpu, DType::F16, 11, 11, true, true, 32, 4).unwrap();
-    let candidate = run_sdpa(&metal, DType::F16, 11, 11, true, true, 32, 4).unwrap();
+    let reference = run_sdpa(&cpu, DType::F16, 11, 11, true, true, 32, 4, None).unwrap();
+    let candidate = run_sdpa(
+        &metal,
+        DType::F16,
+        11,
+        11,
+        true,
+        true,
+        32,
+        4,
+        Some("paged-sdpa.steel-half"),
+    )
+    .unwrap();
     assert!(
         forja_testing::normwise_relative_error(&reference, &candidate)
             <= forja_testing::F16_TOLERANCE

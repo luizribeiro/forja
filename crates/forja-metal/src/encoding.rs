@@ -3214,6 +3214,52 @@ impl MetalBackend {
             (2, dtype_code(output.layout.dtype())),
             (3, dtype_code(value.layout.dtype())),
         ];
+        if let Some(kernel) = match selected_variant(dispatch) {
+            Some(MetalVariant::PagedSdpaSteel) => Some(SdpaKernel::Steel),
+            Some(MetalVariant::PagedSdpaSteelHalf) => Some(SdpaKernel::SteelHalf),
+            _ => None,
+        } {
+            let (block_query, _) = steel_attention_tile(kernel, q[2])?;
+            let pipeline = self
+                .pipelines
+                .lock()
+                .map_err(|_| BackendError::ExecutionFailed)?
+                .get(paged_sdpa_kernel(dispatch, q[2])?, &constants);
+            match pipeline {
+                Ok(pipeline) => {
+                    set_pipeline(encoder, &pipeline);
+                    for (index, tensor) in
+                        [&query, &key, &value, &page_table, &generations, &output]
+                            .into_iter()
+                            .enumerate()
+                    {
+                        bindings.bind(table, index, &tensor.buffer);
+                    }
+                    bindings.bind(table, 6, &params);
+                    bindings.bind(table, 7, &error_flag);
+                    set_argument_table(encoder, table);
+                    dispatch_threadgroups(
+                        encoder,
+                        MTLSize {
+                            width: usize::try_from(q[1].div_ceil(block_query))
+                                .map_err(|_| BackendError::InvalidInput)?,
+                            height: usize::try_from(q[0])
+                                .map_err(|_| BackendError::InvalidInput)?,
+                            depth: 1,
+                        },
+                        MTLSize {
+                            width: 32,
+                            height: usize::try_from(block_query / 8)
+                                .map_err(|_| BackendError::InvalidInput)?,
+                            depth: 1,
+                        },
+                    );
+                    return Ok((vec![params, error_flag.clone()], error_flag));
+                }
+                Err(BackendError::UnsupportedOperation) => {}
+                Err(error) => return Err(error),
+            }
+        }
         if q[0] / k[2] == 8 && q[1] == 1 && q[2] == 128 && v[3] == 128 && key_length >= GQA_BLOCKS {
             let partials = self.scratch_tensor(query.layout.dtype(), &[q[0], GQA_BLOCKS, v[3]])?;
             let sums = self.scratch_tensor(DType::F32, &[q[0], GQA_BLOCKS])?;
@@ -8439,7 +8485,7 @@ impl PipelineCache {
             .device
             .newComputePipelineStateWithFunction_error(&function)
             .map_err(|_| BackendError::ExecutionFailed)?;
-        if name.starts_with("steel_attention_")
+        if (name.starts_with("steel_attention_") || name.starts_with("paged_steel_attention_"))
             && pipeline.staticThreadgroupMemoryLength() > self.max_threadgroup_memory_length
         {
             self.unavailable_pipelines.insert(key);
