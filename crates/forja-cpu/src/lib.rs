@@ -211,12 +211,16 @@ impl CpuBackend {
             paged::CpuPagePool::from_plane_bytes(layout, physical_pages, vec![self.read(pool)?])?;
         match direction {
             PagedCopyDirection::IntoPages => {
+                let ordinary_values = decode(&self.read(ordinary)?, ordinary.layout().dtype())
+                    .ok_or(BackendError::ExecutionFailed)?;
+                let page_values = encode(&ordinary_values, pool.layout().dtype())
+                    .ok_or(BackendError::ExecutionFailed)?;
                 pages.copy_in(
                     0,
                     &table,
                     u64::from(start),
                     u64::from(ordinary.layout().shape()[0]),
-                    &self.read(ordinary)?,
+                    &page_values,
                 )?;
                 self.write(
                     output,
@@ -230,15 +234,21 @@ impl CpuBackend {
                     )?,
                 )
             }
-            PagedCopyDirection::OutOfPages => self.write(
-                output,
-                &pages.copy_out(
+            PagedCopyDirection::OutOfPages => {
+                let page_values = pages.copy_out(
                     0,
                     &table,
                     u64::from(start),
                     u64::from(ordinary.layout().shape()[0]),
-                )?,
-            ),
+                )?;
+                let values = decode(&page_values, pool.layout().dtype())
+                    .ok_or(BackendError::ExecutionFailed)?;
+                self.write(
+                    output,
+                    &encode(&values, ordinary.layout().dtype())
+                        .ok_or(BackendError::ExecutionFailed)?,
+                )
+            }
         }
     }
 
@@ -1771,6 +1781,50 @@ mod tests {
             fast_max_chunks: 102,
             rejection_rounds: 2,
         }
+    }
+
+    #[test]
+    fn paged_copy_converts_directly_into_reduced_storage() {
+        let backend = CpuBackend::new();
+        let source = backend.alloc(DType::F32, &[7, 3]).unwrap();
+        let pool = backend.alloc(DType::F16, &[3, 4, 3]).unwrap();
+        let table = backend.alloc(DType::U32, &[2, 2]).unwrap();
+        let generations = backend.alloc(DType::U32, &[3]).unwrap();
+        let output = backend.alloc(DType::F32, &[7, 3]).unwrap();
+        let values = (0_u16..21)
+            .map(|value| f32::from(value) / 8.0)
+            .collect::<Vec<_>>();
+        backend.write(&source, &f32_bytes(&values)).unwrap();
+        backend.write(&table, &u32_bytes(&[2, 5, 0, 7])).unwrap();
+        backend.write(&generations, &u32_bytes(&[7, 0, 5])).unwrap();
+        let mut commands = CommandList::new();
+        for direction in [
+            PagedCopyDirection::IntoPages,
+            PagedCopyDirection::OutOfPages,
+        ] {
+            let (input, target) = match direction {
+                PagedCopyDirection::IntoPages => (&source, &pool),
+                PagedCopyDirection::OutOfPages => (&pool, &output),
+            };
+            commands
+                .dispatch(
+                    Op::PagedCopy {
+                        direction,
+                        start: 1,
+                        page_tokens: 4,
+                    },
+                    &[input, &table, &generations],
+                    target,
+                )
+                .unwrap();
+        }
+        backend.submit(commands).unwrap().wait().unwrap();
+        let actual = decode(&backend.read(&output).unwrap(), DType::F32).unwrap();
+        let expected = values
+            .into_iter()
+            .map(|value| f16::from_f32(value).to_f32())
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
     }
 
     #[test]

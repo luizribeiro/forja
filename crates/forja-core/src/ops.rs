@@ -1195,17 +1195,13 @@ fn check_paged_copy(
         PagedCopyDirection::OutOfPages => (output, inputs[0]),
     };
     check_float(ordinary, Operand::Input(0))?;
-    if pool.layout.dtype() != ordinary.layout.dtype() {
-        return Err(OpError::DType {
-            operand: Operand::Input(0),
-            dtype: pool.layout.dtype(),
-        });
-    }
+    check_float(pool, Operand::Input(0))?;
     let [tokens, elements]: [u32; 2] = ordinary
         .layout
         .shape()
         .try_into()
         .map_err(|_| shape_error(Operand::Input(0)))?;
+    paged_copy_element_count(tokens, elements)?;
     let [physical_pages, pool_page_tokens, pool_elements]: [u32; 3] = pool
         .layout
         .shape()
@@ -1235,6 +1231,13 @@ fn check_paged_copy(
         return Err(OpError::InvalidKernelParameter);
     }
     Ok(())
+}
+
+fn paged_copy_element_count(tokens: u32, elements: u32) -> Result<u32, OpError> {
+    tokens
+        .checked_mul(elements)
+        .filter(|&count| count != 0)
+        .ok_or(OpError::InvalidKernelParameter)
 }
 
 fn check_shape(tensor: &Tensor, expected: &Tensor, operand: Operand) -> Result<(), OpError> {
@@ -2374,6 +2377,19 @@ mod tests {
                 4,
             ),
             Err(shape_error(Operand::Input(0)))
+        );
+    }
+
+    #[test]
+    fn paged_copy_element_count_fits_the_kernel_index() {
+        assert_eq!(paged_copy_element_count(7, 33), Ok(231));
+        assert_eq!(
+            paged_copy_element_count(u32::MAX, 2),
+            Err(OpError::InvalidKernelParameter)
+        );
+        assert_eq!(
+            paged_copy_element_count(0, 33),
+            Err(OpError::InvalidKernelParameter)
         );
     }
 
