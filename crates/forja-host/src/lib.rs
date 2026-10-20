@@ -535,6 +535,8 @@ pub struct EngineRunner<B: Backend + Send + Sync + 'static> {
     profiling: bool,
     last_profile: Option<EngineStepProfile>,
     page_pool: Option<u32>,
+    paged_origin: Option<SequenceCheckpoint>,
+    paged_checkpoint: Option<(u32, SequenceCheckpoint)>,
 }
 
 type EngineCallFuture<'a, T> =
@@ -646,6 +648,8 @@ where
             profiling: false,
             last_profile: None,
             page_pool: None,
+            paged_origin: None,
+            paged_checkpoint: None,
         })
     }
 
@@ -890,6 +894,25 @@ where
         start: u32,
         tokens: u32,
     ) -> Result<Option<SequenceCheckpoint>, compute::Error> {
+        if start == 0
+            && let (Some(pool), Some(checkpoint)) = (self.page_pool, self.paged_origin.take())
+        {
+            self.store
+                .data_mut()
+                .rollback_paged_append(pool, checkpoint)?;
+            self.paged_checkpoint = None;
+        }
+        if let (Some(pool), Some((checkpoint_start, checkpoint))) =
+            (self.page_pool, self.paged_checkpoint.take())
+        {
+            if checkpoint_start == start {
+                self.store
+                    .data_mut()
+                    .rollback_paged_append(pool, checkpoint)?;
+            } else {
+                self.paged_checkpoint = Some((checkpoint_start, checkpoint));
+            }
+        }
         match self.page_pool {
             Some(pool) => self
                 .store
@@ -914,11 +937,22 @@ where
 
     fn finish_paged_append(
         &mut self,
+        start: u32,
         checkpoint: Option<SequenceCheckpoint>,
     ) -> Result<(), compute::Error> {
         match (self.page_pool, checkpoint) {
             (Some(pool), Some(checkpoint)) => {
-                self.store.data_mut().finish_paged_append(pool, checkpoint)
+                let checkpoint = self
+                    .store
+                    .data_mut()
+                    .finish_paged_append(pool, checkpoint)?;
+                if start == 0 {
+                    self.paged_origin = checkpoint;
+                    self.paged_checkpoint = None;
+                } else {
+                    self.paged_checkpoint = checkpoint.map(|checkpoint| (start, checkpoint));
+                }
+                Ok(())
             }
             _ => Ok(()),
         }
@@ -1014,7 +1048,7 @@ where
                 Err(release_error) => release_error,
             }));
         }
-        self.finish_paged_append(checkpoint)?;
+        self.finish_paged_append(input.start_pos, checkpoint)?;
         self.output_handles = handles;
         Ok(Ok(EngineOutput {
             logits: EngineTensor {
@@ -1081,6 +1115,15 @@ where
         &mut self,
         input: EngineBeginDecode,
     ) -> wasmtime::Result<Result<EngineTensor, compute::Error>> {
+        let appended = input
+            .tokens
+            .as_ref()
+            .map_or(1, |tokens| u32::try_from(tokens.len()).unwrap_or(u32::MAX));
+        let checkpoint = match self.prepare_paged_append(input.start_pos, appended) {
+            Ok(checkpoint) => checkpoint,
+            Err(error) => return Ok(Err(error)),
+        };
+        let start_pos = input.start_pos;
         self.set_guest_deadline();
         let engine = self.instance.l9o_gpu_engine();
         let logits = match self
@@ -1093,16 +1136,31 @@ where
             .await
         {
             Ok(output) => output?,
-            Err(error) if is_epoch_timeout(&error) => return Ok(Err(guest_timeout())),
-            Err(error) => return Err(error),
-        }?;
+            Err(error) if is_epoch_timeout(&error) => {
+                self.rollback_paged_append(checkpoint)?;
+                return Ok(Err(guest_timeout()));
+            }
+            Err(error) => {
+                self.rollback_paged_append(checkpoint)?;
+                return Err(error);
+            }
+        };
+        let logits = match logits {
+            Ok(logits) => logits,
+            Err(error) => {
+                self.rollback_paged_append(checkpoint)?;
+                return Ok(Err(error));
+            }
+        };
         let info = match &self.info {
             Some(info) => info.clone(),
             None => self.describe().await?,
         };
         if let Err(error) = self.validate_logits(&info, &logits) {
+            self.rollback_paged_append(checkpoint)?;
             return Ok(Err(error));
         }
+        self.finish_paged_append(start_pos, checkpoint)?;
         self.output_handles.push(logits.rep());
         Ok(Ok(EngineTensor {
             handle: logits.rep(),
@@ -1248,6 +1306,15 @@ where
             Err(error) => Err(error),
         };
         if matches!(result, Ok(Ok(()))) {
+            if let Some((start, checkpoint)) = self.paged_checkpoint.take() {
+                if start == next_pos {
+                    self.rollback_paged_append(Some(checkpoint))?;
+                } else if let Some(pool) = self.page_pool {
+                    self.store
+                        .data_mut()
+                        .rewind_private_paged_sequence(pool, next_pos)?;
+                }
+            }
             self.discarded_speculation = false;
         }
         result
@@ -1329,7 +1396,7 @@ where
                 Err(release_error) => release_error,
             }));
         }
-        self.finish_paged_append(checkpoint)?;
+        self.finish_paged_append(input.start_pos, checkpoint)?;
         if release_previous {
             self.output_handles = handles;
         } else {
@@ -2558,7 +2625,7 @@ impl<B: Backend + 'static> Host<B> {
         &mut self,
         pool_rep: u32,
         checkpoint: SequenceCheckpoint,
-    ) -> Result<(), compute::Error> {
+    ) -> Result<Option<SequenceCheckpoint>, compute::Error> {
         let slot_rep = self
             .table
             .get(&Resource::<PagePoolEntry>::new_borrow(pool_rep))
@@ -2573,9 +2640,10 @@ impl<B: Backend + 'static> Host<B> {
             .used
             .load(Ordering::Acquire);
         if used {
-            Ok(())
+            Ok(Some(checkpoint))
         } else {
-            self.rollback_paged_append(pool_rep, checkpoint)
+            self.rollback_paged_append(pool_rep, checkpoint)?;
+            Ok(None)
         }
     }
 
@@ -2608,6 +2676,38 @@ impl<B: Backend + 'static> Host<B> {
             .lock()
             .map_err(|_| guest_error(BackendError::ExecutionFailed))?
             .rollback(checkpoint)
+            .map_err(|error| compute::Error::Quota(error.to_string()))
+    }
+
+    fn rewind_private_paged_sequence(
+        &mut self,
+        pool_rep: u32,
+        logical_len: u32,
+    ) -> Result<(), compute::Error> {
+        let slot_rep = self
+            .table
+            .get(&Resource::<PagePoolEntry>::new_borrow(pool_rep))
+            .map_err(invalid_handle)?
+            .slot
+            .ok_or_else(|| invalid_handle("paged slot is not open"))?;
+        let binding = Arc::clone(
+            &self
+                .table
+                .get(&Resource::<BatchSlotEntry>::new_borrow(slot_rep))
+                .map_err(invalid_handle)?
+                .binding,
+        );
+        let sequence = binding
+            .sequence
+            .lock()
+            .map_err(|_| guest_error(BackendError::ExecutionFailed))?
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| invalid_handle("paged sequence is not active"))?;
+        sequence
+            .lock()
+            .map_err(|_| guest_error(BackendError::ExecutionFailed))?
+            .rewind_private(u64::from(logical_len))
             .map_err(|error| compute::Error::Quota(error.to_string()))
     }
 

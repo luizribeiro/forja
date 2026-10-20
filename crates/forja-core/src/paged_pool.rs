@@ -615,6 +615,24 @@ impl PagedSequence {
         Ok(())
     }
 
+    /// Moves an exclusively owned sequence to an earlier logical boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-checkpoint or shared-tail error without changing sequence state.
+    pub fn rewind_private(&mut self, logical_len: u64) -> Result<(), PagePoolError> {
+        if logical_len >= self.logical_len {
+            return Err(PagePoolError::InvalidCheckpoint);
+        }
+        for (&page, &immutable) in self.pages.iter().zip(&self.immutable) {
+            if immutable || self.pool.refcount(page)? != 1 {
+                return Err(PagePoolError::SharedTail);
+            }
+        }
+        self.logical_len = logical_len;
+        Ok(())
+    }
+
     /// Marks every table page as read by a submitted command serial.
     ///
     /// # Errors
@@ -1202,6 +1220,19 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(after_counts, before_counts);
         assert_eq!(pool.memory_usage().unwrap(), before_memory);
+    }
+
+    #[test]
+    fn private_rewind_preserves_reserved_capacity() {
+        let pool = pool(1_024);
+        let mut sequence = pool.reserve(12).unwrap();
+        sequence.commit_write(9).unwrap();
+
+        sequence.rewind_private(3).unwrap();
+        sequence.commit_write(9).unwrap();
+
+        assert_eq!(sequence.logical_len(), 12);
+        assert_eq!(sequence.reserved_tokens(), 12);
     }
 
     #[test]
