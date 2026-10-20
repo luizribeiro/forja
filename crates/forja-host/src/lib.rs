@@ -965,7 +965,7 @@ where
         Ok(self.page_pool)
     }
 
-    fn prepare_paged_append(
+    async fn prepare_paged_append(
         &mut self,
         start: u32,
         tokens: u32,
@@ -990,10 +990,19 @@ where
             }
         }
         match self.page_pool {
-            Some(pool) => self
-                .store
-                .data_mut()
-                .begin_paged_append(pool, start, tokens),
+            Some(pool) => {
+                let (checkpoint, copy) = self
+                    .store
+                    .data_mut()
+                    .begin_paged_append(pool, start, tokens)?;
+                if let Some(copy) = copy
+                    && let Err(error) = copy.run().await
+                {
+                    self.rollback_paged_append(checkpoint)?;
+                    return Err(error);
+                }
+                Ok(checkpoint)
+            }
             None => Ok(None),
         }
     }
@@ -1062,7 +1071,7 @@ where
         let Ok(sequence) = u32::try_from(input.tokens.len()) else {
             return Ok(Err(quota("token count exceeds u32")));
         };
-        let checkpoint = match self.prepare_paged_append(input.start_pos, sequence) {
+        let checkpoint = match self.prepare_paged_append(input.start_pos, sequence).await {
             Ok(checkpoint) => checkpoint,
             Err(error) => return Ok(Err(error)),
         };
@@ -1195,7 +1204,7 @@ where
             .tokens
             .as_ref()
             .map_or(1, |tokens| u32::try_from(tokens.len()).unwrap_or(u32::MAX));
-        let checkpoint = match self.prepare_paged_append(input.start_pos, appended) {
+        let checkpoint = match self.prepare_paged_append(input.start_pos, appended).await {
             Ok(checkpoint) => checkpoint,
             Err(error) => return Ok(Err(error)),
         };
@@ -1454,7 +1463,7 @@ where
             .tokens
             .as_ref()
             .map_or(1, |tokens| u32::try_from(tokens.len()).unwrap_or(u32::MAX));
-        let checkpoint = match self.prepare_paged_append(input.start_pos, appended) {
+        let checkpoint = match self.prepare_paged_append(input.start_pos, appended).await {
             Ok(checkpoint) => checkpoint,
             Err(error) => return Ok(Err(error)),
         };
@@ -2073,6 +2082,7 @@ struct PagedBinding {
     banks: Arc<PagedSlotBanks>,
     sequence: Mutex<Option<Arc<Mutex<PagedSequence>>>>,
     used: AtomicBool,
+    table_dirty: AtomicBool,
 }
 
 struct PagedBackingHandles {
@@ -2484,6 +2494,7 @@ impl<B: Backend + 'static> Host<B> {
             banks: Arc::clone(&banks),
             sequence: Mutex::new(None),
             used: AtomicBool::new(false),
+            table_dirty: AtomicBool::new(false),
         });
         let mut cleanup = backing.planes.clone();
         cleanup.extend(backing.tables.iter().flatten().copied());
@@ -2627,19 +2638,23 @@ impl<B: Backend + 'static> Host<B> {
         }
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "checkpoint rollback must cover table rebinding and COW preparation"
+    )]
     fn begin_paged_append(
         &mut self,
         pool_rep: u32,
         start: u32,
         tokens: u32,
-    ) -> Result<Option<SequenceCheckpoint>, compute::Error> {
+    ) -> Result<(Option<SequenceCheckpoint>, Option<SubmitRequest<B>>), compute::Error> {
         let (pool, max_context, slot_rep) = {
             let entry = self
                 .table
                 .get(&Resource::<PagePoolEntry>::new_borrow(pool_rep))
                 .map_err(invalid_handle)?;
             let Some(slot) = entry.slot else {
-                return Ok(None);
+                return Ok((None, None));
             };
             (entry.pool.clone(), entry.max_context, slot)
         };
@@ -2669,6 +2684,7 @@ impl<B: Backend + 'static> Host<B> {
                     pool.reserve(u64::from(max_context))
                         .map_err(|error| compute::Error::Quota(error.to_string()))?,
                 )));
+                binding.table_dirty.store(true, Ordering::Release);
             }
             Arc::clone(
                 active
@@ -2676,7 +2692,7 @@ impl<B: Backend + 'static> Host<B> {
                     .ok_or_else(|| guest_error(BackendError::ExecutionFailed))?,
             )
         };
-        let (checkpoint, table) = {
+        let (checkpoint, table, copy, upload) = {
             let mut sequence = sequence
                 .lock()
                 .map_err(|_| guest_error(BackendError::ExecutionFailed))?;
@@ -2693,30 +2709,56 @@ impl<B: Backend + 'static> Host<B> {
                     "paged append start does not match the sequence".to_owned(),
                 ));
             }
-            if sequence
+            let copy = sequence
                 .cow_tail()
-                .map_err(|error| compute::Error::Quota(error.to_string()))?
-                .is_some()
-            {
-                return Err(compute::Error::BackendExecution(
-                    "paged tail copy is not recorded".to_owned(),
-                ));
-            }
+                .map_err(|error| compute::Error::Quota(error.to_string()))?;
             sequence
                 .commit_write(u64::from(tokens))
                 .map_err(|error| compute::Error::Quota(error.to_string()))?;
-            binding
-                .banks
-                .bind(0, 0, &sequence)
-                .map_err(|error| compute::Error::Quota(error.to_string()))?;
+            if copy.is_some() {
+                binding.table_dirty.store(true, Ordering::Release);
+            }
+            if binding.table_dirty.load(Ordering::Acquire) {
+                binding
+                    .banks
+                    .bind(0, 0, &sequence)
+                    .map_err(|error| compute::Error::Quota(error.to_string()))?;
+            }
             let table = binding
                 .banks
                 .slot(0, 0)
                 .map_err(|error| compute::Error::Quota(error.to_string()))?
                 .table()
                 .clone();
-            (checkpoint, table)
+            let upload = binding.table_dirty.swap(false, Ordering::AcqRel);
+            (checkpoint, table, copy, upload)
         };
+        let prepared = (|| {
+            if upload {
+                self.upload_paged_table(table_rep, generation_rep, &table)?;
+            }
+            copy.map(|copy| self.prepare_cow_copy(slot_rep, Arc::clone(&binding), copy))
+                .transpose()
+        })();
+        match prepared {
+            Ok(copy) => Ok((Some(checkpoint), copy)),
+            Err(error) => {
+                sequence
+                    .lock()
+                    .map_err(|_| guest_error(BackendError::ExecutionFailed))?
+                    .rollback(checkpoint)
+                    .map_err(|rollback| compute::Error::Quota(rollback.to_string()))?;
+                Err(error)
+            }
+        }
+    }
+
+    fn upload_paged_table(
+        &self,
+        table_rep: u32,
+        generation_rep: u32,
+        table: &forja_core::PageTable,
+    ) -> Result<(), compute::Error> {
         let mut table_bytes = Vec::with_capacity(table.entries().len() * 8);
         for entry in table.entries() {
             table_bytes.extend_from_slice(&entry.page().to_ne_bytes());
@@ -2727,8 +2769,67 @@ impl<B: Backend + 'static> Host<B> {
             generation_bytes.extend_from_slice(&generation.to_ne_bytes());
         }
         self.write(&Resource::new_borrow(table_rep), &table_bytes)?;
-        self.write(&Resource::new_borrow(generation_rep), &generation_bytes)?;
-        Ok(Some(checkpoint))
+        self.write(&Resource::new_borrow(generation_rep), &generation_bytes)
+    }
+
+    fn prepare_cow_copy(
+        &self,
+        slot_rep: u32,
+        binding: Arc<PagedBinding>,
+        copy: forja_core::CowPageCopy,
+    ) -> Result<SubmitRequest<B>, compute::Error> {
+        let slot = self
+            .table
+            .get(&Resource::<BatchSlotEntry>::new_borrow(slot_rep))
+            .map_err(invalid_handle)?;
+        let mut commands = CommandList::new();
+        let mut access = SubmissionAccess::default();
+        for plane in &slot.planes {
+            let tensor = &self
+                .table
+                .get(&Resource::<TensorEntry>::new_borrow(*plane))
+                .map_err(invalid_handle)?
+                .tensor;
+            let shape = tensor.layout().shape();
+            let slices = |page| {
+                Ok::<_, compute::Error>(ViewOp::Slice(vec![
+                    Slice::new(page, 1, 1).map_err(guest_error)?,
+                    Slice::new(0, copy.token_count(), 1).map_err(guest_error)?,
+                    Slice::new(0, shape[2], 1).map_err(guest_error)?,
+                ]))
+            };
+            let source = self
+                .backend
+                .view(tensor, slices(copy.source())?)
+                .map_err(guest_error)?;
+            let destination = self
+                .backend
+                .view(tensor, slices(copy.destination())?)
+                .map_err(guest_error)?;
+            commands
+                .dispatch(Op::Copy, &[&source], &destination)
+                .map_err(guest_error)?;
+            access.reads.insert(tensor.buffer());
+            access.writes.insert(tensor.buffer());
+        }
+        Ok(SubmitRequest {
+            backend: Arc::clone(&self.backend),
+            work: SubmissionWork::Commands(commands),
+            access,
+            retained: Vec::new(),
+            paged: vec![PagedUse { binding, bank: 0 }],
+            flight: None,
+            timeout: self.limits.submission_timeout,
+            gpu_time_budget_ns: duration_ns(self.limits.gpu_time_budget),
+            gpu_time_ns: Arc::clone(&self.gpu_time_ns),
+            queued_submissions: Arc::clone(&self.queued_submissions),
+            completed_submissions: Arc::clone(&self.completed_submissions),
+            timed_submissions: Arc::clone(&self.timed_submissions),
+            completed_gpu_time_ns: Arc::clone(&self.completed_gpu_time_ns),
+            submission_notify: Arc::clone(&self.submission_notify),
+            taints: Arc::clone(&self.taints),
+            profile: self.active_profile.clone(),
+        })
     }
 
     fn finish_paged_append(
@@ -2895,6 +2996,7 @@ impl<B: Backend + 'static> Host<B> {
             .lock()
             .map_err(|_| guest_error(BackendError::ExecutionFailed))? = Some(sequence);
         binding.used.store(false, Ordering::Release);
+        binding.table_dirty.store(true, Ordering::Release);
         Ok(())
     }
 
@@ -4860,6 +4962,7 @@ impl PagedUse {
     }
 
     fn mark_submitted(&self, serial: u64) -> Result<(), BackendError> {
+        self.binding.used.store(true, Ordering::Release);
         let sequence = self
             .binding
             .sequence
@@ -6969,10 +7072,18 @@ mod tests {
         let mut host = Host::new(CpuBackend::new(), GENEROUS);
         let pool = insert_test_pool(&mut host, 1, 8);
         host.open_paged_slot(&pool, 1).unwrap();
-        let initial = host.begin_paged_append(pool.rep(), 0, 0).unwrap().unwrap();
+        let initial = host
+            .begin_paged_append(pool.rep(), 0, 0)
+            .unwrap()
+            .0
+            .unwrap();
         host.rollback_paged_append(pool.rep(), initial).unwrap();
         let before_memory = host.table.get(&pool).unwrap().pool.memory_usage().unwrap();
-        let checkpoint = host.begin_paged_append(pool.rep(), 0, 3).unwrap().unwrap();
+        let checkpoint = host
+            .begin_paged_append(pool.rep(), 0, 3)
+            .unwrap()
+            .0
+            .unwrap();
 
         host.rollback_paged_append(pool.rep(), checkpoint).unwrap();
 
@@ -7021,6 +7132,7 @@ mod tests {
             banks,
             sequence: Mutex::new(Some(Arc::clone(&sequence))),
             used: std::sync::atomic::AtomicBool::new(false),
+            table_dirty: std::sync::atomic::AtomicBool::new(false),
         });
         let usage = super::PagedUse { binding, bank: 0 };
         super::PagedUse::mark_all(std::slice::from_ref(&usage), Some(7)).unwrap();
@@ -7080,6 +7192,88 @@ mod tests {
         let sequence = after.sequence.lock().unwrap();
         assert_eq!(sequence.logical_len(), before_logical);
         assert_eq!(sequence.reserved_tokens(), 8);
+    }
+
+    #[tokio::test]
+    async fn failed_cow_submission_restores_host_paged_state() {
+        let mut backend = AccountingBackend::new(None, None, Duration::ZERO);
+        backend.fail_submission = Some(1);
+        let weights = test_weight_file();
+        let mut runner =
+            EngineRunner::new(test_guests::engine_smoke(), backend, GENEROUS, &weights)
+                .await
+                .unwrap();
+        runner
+            .load_with_selections(
+                None,
+                &super::EngineLoadConfig {
+                    paged_cache: true,
+                    ..super::EngineLoadConfig::default()
+                },
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        runner.prepare_paged_request(None, 8).unwrap();
+        let checkpoint = runner.prepare_paged_append(0, 3).await.unwrap();
+        let pool_rep = runner.page_pool.unwrap();
+        let binding = {
+            let host = runner.store.data();
+            let slot_rep = host
+                .table
+                .get(&Resource::<PagePoolEntry>::new_borrow(pool_rep))
+                .unwrap()
+                .slot
+                .unwrap();
+            Arc::clone(
+                &host
+                    .table
+                    .get(&Resource::<BatchSlotEntry>::new_borrow(slot_rep))
+                    .unwrap()
+                    .binding,
+            )
+        };
+        binding.used.store(true, Ordering::Release);
+        runner.finish_paged_append(0, checkpoint).unwrap();
+        let retained = runner.paged_prefix().unwrap().unwrap();
+        let fork = retained.fork_reserved(3, 8).unwrap();
+        runner.prepare_paged_request(Some(fork), 8).unwrap();
+        let before = runner.paged_prefix().unwrap().unwrap();
+        let (before_table, before_refs) = {
+            let sequence = before.sequence.lock().unwrap();
+            (
+                sequence.table().unwrap(),
+                sequence.page_reference_counts().unwrap(),
+            )
+        };
+        let before_memory = {
+            let host = runner.store.data();
+            let entry = host
+                .table
+                .get(&Resource::<PagePoolEntry>::new_borrow(pool_rep))
+                .unwrap();
+            entry.pool.memory_usage().unwrap()
+        };
+
+        assert!(matches!(
+            runner.prepare_paged_append(3, 1).await,
+            Err(compute::Error::BackendExecution(_))
+        ));
+
+        let after = runner.paged_prefix().unwrap().unwrap();
+        let sequence = after.sequence.lock().unwrap();
+        assert_eq!(sequence.logical_len(), 3);
+        assert_eq!(sequence.reserved_tokens(), 8);
+        assert_eq!(sequence.table().unwrap().entries(), before_table.entries());
+        assert_eq!(sequence.page_reference_counts().unwrap(), before_refs);
+        drop(sequence);
+        let host = runner.store.data();
+        let entry = host
+            .table
+            .get(&Resource::<PagePoolEntry>::new_borrow(pool_rep))
+            .unwrap();
+        assert_eq!(entry.pool.memory_usage().unwrap(), before_memory);
+        fs::remove_file(weights).unwrap();
     }
 
     fn doubling_program(value: f32) -> compute::ProgramSource {
