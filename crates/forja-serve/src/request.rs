@@ -212,6 +212,14 @@ pub(crate) fn validate_chat_input(
     if request.messages.len() > ceiling_usize(config.request.max_messages) {
         return invalid("messages exceed the configured ceiling");
     }
+    if request.messages.iter().any(|message| {
+        serde_json::to_vec(message)
+            .ok()
+            .and_then(|bytes| u64::try_from(bytes.len()).ok())
+            .is_none_or(|bytes| bytes > config.request.max_message_bytes.get())
+    }) {
+        return too_large("message bytes exceed the configured ceiling");
+    }
     validate_text(
         checked_text_bytes(
             request
@@ -280,7 +288,7 @@ fn resolve(
         .max_completion_tokens
         .or(params.max_tokens)
         .or(defaults.max_new_tokens)
-        .unwrap_or(config.request.max_output_tokens);
+        .unwrap_or(config.request.default_output_tokens);
     if requested == 0 {
         return invalid("output token limit must be positive");
     }
@@ -293,7 +301,13 @@ fn resolve(
         return invalid("top_p must be finite and in (0, 1]");
     }
     let stops = normalize_stops(params.stop.as_ref());
-    if stops.len() > ceiling_usize(config.request.max_stops) || stops.iter().any(String::is_empty) {
+    if stops.len() > ceiling_usize(config.request.max_stops)
+        || stops.iter().any(|stop| {
+            stop.is_empty()
+                || u64::try_from(stop.len())
+                    .map_or(true, |bytes| bytes > config.request.max_stop_bytes.get())
+        })
+    {
         return invalid("stop strings exceed the configured ceiling or are empty");
     }
     Ok(ResolvedParams {
@@ -883,25 +897,32 @@ mod tests {
     }
 
     #[test]
-    fn component_output_limit_remains_the_request_default() {
-        let defaults = info(SamplingDefaults {
-            max_new_tokens: Some(7),
-            ..SamplingDefaults::default()
-        });
-        let resolved = resolve_chat(&CompletionParams::default(), &defaults, 1, 32_768).unwrap();
-        assert_eq!(resolved.max_tokens, 7);
-    }
-
-    #[test]
-    fn admission_reserves_uncached_suffix_and_resolved_default() {
+    fn output_limit_precedence_also_controls_paged_reservation() {
+        let mut config = HostConfig::default();
+        config.request.default_output_tokens = 17;
         let defaults = info(SamplingDefaults {
             max_new_tokens: Some(33),
             ..SamplingDefaults::default()
         });
-        let resolved = resolve_chat(&CompletionParams::default(), &defaults, 2_048, 4_096).unwrap();
-        assert_eq!(resolved.max_tokens, 33);
-        assert_eq!(reservation_tokens(2_048, 1_024, &resolved).unwrap(), 1_057);
-        assert!(reservation_tokens(2_048, 2_049, &resolved).is_err());
+        let requested = CompletionParams {
+            max_tokens: Some(7),
+            ..CompletionParams::default()
+        };
+        let omitted = CompletionParams::default();
+        let no_model_default = default_info();
+        for (params, model, expected) in [
+            (&requested, &defaults, 7),
+            (&omitted, &defaults, 33),
+            (&omitted, &no_model_default, 17),
+        ] {
+            let resolved = resolve(params, &config, &model.sampling, 151_936, true).unwrap();
+            assert_eq!(resolved.max_tokens, expected);
+            assert_eq!(
+                reservation_tokens(2_048, 1_024, &resolved).unwrap(),
+                1_024 + u64::from(expected)
+            );
+            assert!(reservation_tokens(2_048, 2_049, &resolved).is_err());
+        }
     }
 
     #[test]
@@ -976,7 +997,8 @@ mod tests {
 
     #[test]
     fn aggregate_text_size_ceiling_is_rejected() {
-        let config = HostConfig::default();
+        let mut config = HostConfig::default();
+        config.request.max_message_bytes = forja_config::ByteSize::new(2 * 1024 * 1024);
         let limit = usize::try_from(config.request.max_text_bytes.get()).unwrap();
         let request = ChatCompletionRequest {
             model: "qwen".to_owned(),
@@ -1001,6 +1023,32 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "request text exceeds the configured ceiling"
+        );
+    }
+
+    #[test]
+    fn individual_message_and_stop_byte_ceilings_are_rejected() {
+        let mut config = HostConfig::default();
+        config.request.max_message_bytes = forja_config::ByteSize::new(32);
+        let message = validate_chat(
+            &chat(CompletionParams::default()),
+            &config,
+            &default_info(),
+            1,
+            32_768,
+            151_936,
+        )
+        .unwrap_err();
+        assert!(message.is_too_large());
+
+        config.request.max_message_bytes = forja_config::ByteSize::new(1024);
+        config.request.max_stop_bytes = forja_config::ByteSize::new(3);
+        let params = CompletionParams {
+            stop: Some(Stop::One("stop".to_owned())),
+            ..CompletionParams::default()
+        };
+        assert!(
+            validate_chat(&chat(params), &config, &default_info(), 1, 32_768, 151_936).is_err()
         );
     }
 

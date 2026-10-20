@@ -105,14 +105,30 @@ pub struct RequestCeiling {
     pub max_prompt_tokens: Option<u32>,
     /// Maximum generated tokens.
     pub max_output_tokens: u32,
+    /// Output-token limit used when a request omits one.
+    pub default_output_tokens: u32,
+    /// Maximum text bytes in one message.
+    pub max_message_bytes: ByteSize,
+    /// Maximum bytes emitted by chat rendering.
+    pub max_rendered_bytes: ByteSize,
     /// Maximum stop strings.
     pub max_stops: u32,
+    /// Maximum bytes in one stop string.
+    pub max_stop_bytes: ByteSize,
     /// Maximum declared tools.
     pub max_tools: u32,
     /// Maximum aggregate serialized tool bytes.
     pub max_tool_bytes: ByteSize,
     /// Maximum JSON Schema nesting depth.
     pub max_schema_depth: u32,
+    /// Maximum incremental chat-parser events.
+    pub max_parser_events: u32,
+    /// Maximum bytes in a generated grammar.
+    pub max_grammar_bytes: ByteSize,
+    /// Maximum lexer states in a compiled grammar.
+    pub max_grammar_states: u32,
+    /// Maximum time spent compiling one grammar.
+    pub max_grammar_compile_time: Duration,
 }
 
 impl Default for RequestCeiling {
@@ -123,10 +139,18 @@ impl Default for RequestCeiling {
             max_text_bytes: ByteSize::new(1024 * 1024),
             max_prompt_tokens: None,
             max_output_tokens: 8_192,
+            default_output_tokens: 128,
+            max_message_bytes: ByteSize::new(1024 * 1024),
+            max_rendered_bytes: ByteSize::new(2 * 1024 * 1024),
             max_stops: 4,
+            max_stop_bytes: ByteSize::new(64 * 1024),
             max_tools: 128,
             max_tool_bytes: ByteSize::new(256 * 1024),
             max_schema_depth: 64,
+            max_parser_events: 8_192,
+            max_grammar_bytes: ByteSize::new(256 * 1024),
+            max_grammar_states: 100_000,
+            max_grammar_compile_time: Duration::from_millis(500),
         }
     }
 }
@@ -258,10 +282,24 @@ max_output_tokens = 4096
         assert_eq!(config.request.max_text_bytes, ByteSize::new(1024 * 1024));
         assert_eq!(config.request.max_prompt_tokens, None);
         assert_eq!(config.request.max_output_tokens, 8_192);
+        assert_eq!(config.request.default_output_tokens, 128);
+        assert_eq!(config.request.max_message_bytes, ByteSize::new(1024 * 1024));
+        assert_eq!(
+            config.request.max_rendered_bytes,
+            ByteSize::new(2 * 1024 * 1024)
+        );
         assert_eq!(config.request.max_stops, 4);
+        assert_eq!(config.request.max_stop_bytes, ByteSize::new(64 * 1024));
         assert_eq!(config.request.max_tools, 128);
         assert_eq!(config.request.max_tool_bytes, ByteSize::new(256 * 1024));
         assert_eq!(config.request.max_schema_depth, 64);
+        assert_eq!(config.request.max_parser_events, 8_192);
+        assert_eq!(config.request.max_grammar_bytes, ByteSize::new(256 * 1024));
+        assert_eq!(config.request.max_grammar_states, 100_000);
+        assert_eq!(
+            config.request.max_grammar_compile_time,
+            Duration::from_millis(500)
+        );
         assert_eq!(config.metrics.listen, Some(([127, 0, 0, 1], 9091).into()));
         assert_eq!(config.metrics.path, "/metrics");
         assert_eq!(config.logging.format, LogFormat::Json);
