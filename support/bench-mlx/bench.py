@@ -10,6 +10,10 @@ import subprocess
 import time
 import tomllib
 from pathlib import Path
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from bench_stats import stats  # noqa: E402
 
 MASK64 = (1 << 64) - 1
 
@@ -73,27 +77,6 @@ def synthetic_tokens(count: int, vocab: int) -> list[int]:
         state = (state * 6_364_136_223_846_793_005 + 1) & MASK64
         tokens.append(state % vocab)
     return tokens
-
-
-def stats(values: list[float]) -> dict[str, object]:
-    """Return a median and distribution-free 95% order-statistic interval."""
-    values = sorted(values)
-    count = len(values)
-    median = (
-        values[count // 2]
-        if count % 2
-        else (values[count // 2 - 1] + values[count // 2]) / 2
-    )
-    probability = 0.5**count
-    cumulative = probability
-    rank = 0
-    for index in range(count // 2):
-        probability *= (count - index) / (index + 1)
-        if cumulative + probability > 0.025:
-            break
-        cumulative += probability
-        rank = index + 1
-    return {"median": median, "ci95": [values[rank], values[-rank - 1]]}
 
 
 def summary(tokens: int, times: list[float]) -> dict[str, object]:
