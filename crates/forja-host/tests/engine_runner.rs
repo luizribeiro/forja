@@ -28,6 +28,33 @@ async fn runs_an_sdk_exported_engine() -> wasmtime::Result<()> {
 }
 
 #[tokio::test]
+async fn paged_load_requires_a_serving_descriptor() -> wasmtime::Result<()> {
+    let weights = weight_file("paged-without-descriptor")?;
+    let mut runner = EngineRunner::new(
+        test_guests::prefill_replay_smoke(),
+        CpuBackend::new(),
+        LIMITS,
+        weights.path(),
+    )
+    .await?;
+    let error = runner
+        .load_with_selections(
+            None,
+            &EngineLoadConfig {
+                paged_cache: true,
+                ..EngineLoadConfig::default()
+            },
+        )
+        .await?
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        forja_host::bindings::l9o::gpu::compute::Error::Layout(_)
+    ));
+    Ok(())
+}
+
+#[tokio::test]
 async fn passes_engine_selections_through_load_config() -> wasmtime::Result<()> {
     let weights = weight_file("load-config")?;
     let mut runner = EngineRunner::new(

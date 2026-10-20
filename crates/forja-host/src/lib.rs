@@ -808,7 +808,9 @@ where
         kv_cache: KvCacheFormat,
     ) -> Result<Option<u32>, compute::Error> {
         let Some(serving) = &info.serving else {
-            return Ok(None);
+            return Err(compute::Error::Layout(
+                "paged cache requires an engine serving descriptor".to_owned(),
+            ));
         };
         if serving.active_lanes == 0
             || serving.max_context == 0
