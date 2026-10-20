@@ -3053,10 +3053,10 @@ impl MetalBackend {
             PagedCopyDirection::IntoPages => (first, dispatch.output()),
             PagedCopyDirection::OutOfPages => (dispatch.output(), first),
         };
-        let ordinary = self.encoder_tensor(ordinary_tensor)?;
-        let pool = self.encoder_tensor(pool_tensor)?;
-        let page_table = self.encoder_tensor(table_tensor)?;
-        let generations = self.encoder_tensor(generations)?;
+        let ordinary = self.encoder_dense_tensor(ordinary_tensor)?;
+        let pool = self.encoder_dense_tensor(pool_tensor)?;
+        let page_table = self.encoder_dense_tensor(table_tensor)?;
+        let generations = self.encoder_dense_tensor(generations)?;
         let ordinary_shape: [u32; 2] = ordinary
             .layout
             .shape()
@@ -3155,12 +3155,12 @@ impl MetalBackend {
         else {
             return Err(BackendError::InvalidInput);
         };
-        let query = self.encoder_tensor(query_tensor)?;
-        let key = self.encoder_tensor(key_tensor)?;
-        let value = self.encoder_tensor(value_tensor)?;
-        let page_table = self.encoder_tensor(table_tensor)?;
-        let generations = self.encoder_tensor(generation_tensor)?;
-        let output = self.encoder_tensor(dispatch.output())?;
+        let query = self.encoder_dense_tensor(query_tensor)?;
+        let key = self.encoder_dense_tensor(key_tensor)?;
+        let value = self.encoder_dense_tensor(value_tensor)?;
+        let page_table = self.encoder_dense_tensor(table_tensor)?;
+        let generations = self.encoder_dense_tensor(generation_tensor)?;
+        let output = self.encoder_dense_tensor(dispatch.output())?;
         let q: [u32; 3] = query
             .layout
             .shape()
@@ -5349,6 +5349,28 @@ impl MetalBackend {
             },
             layout: normalized,
         })
+    }
+
+    fn encoder_dense_tensor(&self, tensor: &Tensor) -> Result<EncoderTensor, BackendError> {
+        if !tensor.layout().is_contiguous() {
+            return Err(BackendError::InvalidInput);
+        }
+        let mut tensor = self.encoder_tensor(tensor)?;
+        let span = tensor.layout.byte_span();
+        let offset = usize::try_from(span.start).map_err(|_| BackendError::InvalidInput)?;
+        let len = usize::try_from(span.end - span.start).map_err(|_| BackendError::InvalidInput)?;
+        tensor.buffer.offset = tensor
+            .buffer
+            .offset
+            .checked_add(offset)
+            .ok_or(BackendError::InvalidInput)?;
+        tensor.buffer.address = tensor
+            .buffer
+            .address
+            .checked_add(u64::try_from(offset).map_err(|_| BackendError::InvalidInput)?)
+            .ok_or(BackendError::InvalidInput)?;
+        tensor.buffer.len = len;
+        Ok(tensor)
     }
 
     fn scratch_tensor(&self, dtype: DType, shape: &[u32]) -> Result<EncoderTensor, BackendError> {

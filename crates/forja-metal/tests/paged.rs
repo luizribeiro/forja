@@ -3,9 +3,11 @@
 #![cfg(target_os = "macos")]
 #![allow(clippy::cast_precision_loss)]
 
+use std::collections::HashSet;
+
 use forja_core::{
-    Backend, BackendDispatchData, BackendError, CommandList, DType, Op, PagePool,
-    PagedCopyDirection, PagedLayout, PagedPlane, Submission, ViewOp,
+    Backend, BackendDispatchData, BackendError, CommandList, DType, GraphLimits, GraphTemplate, Op,
+    PagePool, PagedCopyDirection, PagedLayout, PagedPlane, ParamSpace, Submission, ViewOp,
 };
 use half::{bf16, f16};
 
@@ -92,6 +94,91 @@ fn metal_paged_copy_matches_cpu_across_page_edges() {
     let cpu = forja_cpu::CpuBackend::new();
     let metal = forja_metal::MetalBackend::new().unwrap();
     assert_eq!(run_copy(&metal).unwrap(), run_copy(&cpu).unwrap());
+}
+
+#[test]
+fn metal_graph_arena_offsets_paged_operands() {
+    let backend = forja_metal::MetalBackend::new().unwrap();
+    let source_a = backend.alloc(DType::F32, &[2, 2]).unwrap();
+    let source_b = backend.alloc(DType::F32, &[2, 2]).unwrap();
+    let transient_a = backend.alloc(DType::F32, &[2, 2]).unwrap();
+    let transient_b = backend.alloc(DType::F32, &[2, 2]).unwrap();
+    let pool = backend.alloc(DType::F32, &[1, 4, 2]).unwrap();
+    let table = backend.alloc(DType::U32, &[1, 2]).unwrap();
+    let generations = backend.alloc(DType::U32, &[1]).unwrap();
+    let result = backend.alloc(DType::F32, &[2, 2]).unwrap();
+    let sink = backend.alloc(DType::F32, &[2, 2]).unwrap();
+    let expected = [3.0, 5.0, 7.0, 11.0];
+    backend
+        .write(&source_a, &encode(&[13.0, 17.0, 19.0, 23.0], DType::F32))
+        .unwrap();
+    backend
+        .write(&source_b, &encode(&expected, DType::F32))
+        .unwrap();
+    backend.write(&table, &table_bytes(&[(0, 1)])).unwrap();
+    backend
+        .write(&generations, &generation_bytes(&[1]))
+        .unwrap();
+
+    let mut commands = CommandList::new();
+    commands
+        .dispatch(Op::Copy, &[&source_a], &transient_a)
+        .unwrap();
+    commands
+        .dispatch(Op::Copy, &[&source_b], &transient_b)
+        .unwrap();
+    commands
+        .dispatch(
+            Op::PagedCopy {
+                direction: PagedCopyDirection::IntoPages,
+                start: 0,
+                page_tokens: 4,
+            },
+            &[&transient_b, &table, &generations],
+            &pool,
+        )
+        .unwrap();
+    commands
+        .dispatch(
+            Op::PagedCopy {
+                direction: PagedCopyDirection::OutOfPages,
+                start: 0,
+                page_tokens: 4,
+            },
+            &[&pool, &table, &generations],
+            &result,
+        )
+        .unwrap();
+    commands.dispatch(Op::Copy, &[&transient_a], &sink).unwrap();
+    let mut graph =
+        GraphTemplate::new(ParamSpace::new(Vec::new()).unwrap(), GraphLimits::default());
+    for dispatch in commands.into_dispatches() {
+        graph.record_validated(dispatch).unwrap();
+    }
+    let reachable = [
+        source_a.buffer(),
+        source_b.buffer(),
+        pool.buffer(),
+        table.buffer(),
+        generations.buffer(),
+        result.buffer(),
+        sink.buffer(),
+    ]
+    .into_iter()
+    .collect::<HashSet<_>>();
+    let plan = graph.plan_memory(&reachable).unwrap();
+    assert_ne!(plan.offset(transient_b.buffer()), Some(0));
+
+    let prepared = backend.prepare_graph_memory(graph, plan).unwrap();
+    backend
+        .replay(&prepared, Vec::new())
+        .unwrap()
+        .wait()
+        .unwrap();
+    assert_eq!(
+        backend.read(&result).unwrap(),
+        encode(&expected, DType::F32)
+    );
 }
 
 #[test]
