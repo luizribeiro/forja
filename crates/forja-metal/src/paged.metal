@@ -67,6 +67,30 @@ struct PagedSdpaParams {
     uint blocks;
 };
 
+kernel void paged_sdpa_validate(
+    device const uint2 *table [[buffer(0)]],
+    device const uint *generations [[buffer(1)]],
+    constant PagedSdpaParams &params [[buffer(2)]],
+    device atomic_uint *error_flag [[buffer(3)]],
+    uint logical_page [[thread_position_in_grid]]) {
+    uint pages = (params.key_length + params.page_tokens - 1) / params.page_tokens;
+    if (logical_page >= pages) {
+        return;
+    }
+    bool valid = logical_page < params.logical_pages;
+    if (valid) {
+        uint2 entry = table[logical_page];
+        uint expected = table[0].x + logical_page;
+        valid = entry.x < params.physical_pages
+            && generations[entry.x] == entry.y
+            && (params.contiguous_entries == 0 || entry.x == expected);
+    }
+    if (!valid) {
+        atomic_store_explicit(error_flag, 1, memory_order_relaxed);
+        atomic_fetch_min_explicit(error_flag + 1, logical_page, memory_order_relaxed);
+    }
+}
+
 template <typename TileT, int BQ, int BK, int BD>
 void paged_steel_attention_body(
     device const uchar *query,
@@ -133,37 +157,31 @@ void paged_steel_attention_body(
     }
     if (thread_index == 0) {
         first_page = table[0].x;
+        physical_page = first_page;
+        valid = atomic_load_explicit(error_flag, memory_order_relaxed) == 0;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    uint previous_page = UINT_MAX;
+    uint previous_page = 0;
     for (uint key_block = 0; key_block < key_limit; ++key_block) {
         uint first_key = key_block * BK;
         uint logical_page = first_key / params.page_tokens;
-        if (logical_page != previous_page) {
+        if (params.contiguous_entries == 0 && logical_page != previous_page) {
             if (thread_index == 0) {
-                uint2 entry = table[logical_page];
-                uint expected = first_page + logical_page;
-                valid = logical_page < params.logical_pages
-                    && entry.x < params.physical_pages
-                    && generations[entry.x] == entry.y
-                    && (params.contiguous_entries == 0 || entry.x == expected);
-                physical_page = params.contiguous_entries == 0 ? entry.x : expected;
-                if (valid == 0) {
-                    atomic_store_explicit(error_flag, 1, memory_order_relaxed);
-                    atomic_fetch_min_explicit(
-                        error_flag + 1, logical_page, memory_order_relaxed);
-                }
+                physical_page = table[logical_page].x;
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
             previous_page = logical_page;
         }
         uint page_row = first_key % params.page_tokens;
-        ulong page_base = (ulong(physical_page) * params.page_tokens + page_row)
+        uint page_valid = valid;
+        uint page = params.contiguous_entries == 0
+            ? physical_page : first_page + logical_page;
+        ulong page_base = (ulong(page) * params.page_tokens + page_row)
             * params.kv_heads * BD + ulong(kv_head) * BD;
         for (uint linear = thread_index; linear < BK * BD; linear += thread_count) {
             uint tile_row = linear / BD;
             uint tile_column = linear % BD;
-            bool in_range = valid != 0 && first_key + tile_row < params.key_length;
+            bool in_range = page_valid != 0 && first_key + tile_row < params.key_length;
             ulong index = page_base + ulong(tile_row) * params.kv_heads * BD + tile_column;
             kv_tile[tile_column * LDK + tile_row] = in_range
                 ? TileT(load_float(key, index, input1_dtype)) : TileT(0);
@@ -228,7 +246,7 @@ void paged_steel_attention_body(
         for (uint linear = thread_index; linear < BK * BD; linear += thread_count) {
             uint tile_row = linear / BD;
             uint tile_column = linear % BD;
-            bool in_range = valid != 0 && first_key + tile_row < params.key_length;
+            bool in_range = page_valid != 0 && first_key + tile_row < params.key_length;
             ulong index = page_base + ulong(tile_row) * params.kv_heads * BD + tile_column;
             kv_tile[tile_row * LDV + tile_column] = in_range
                 ? TileT(load_float(value, index, input2_dtype)) : TileT(0);
@@ -355,26 +373,19 @@ void paged_sdpa_2pass_1_gqa_body(
     uint valid = 0;
     uint first_page = 0;
     if (simd_lane == 0) {
-        // Validation rejects empty attention, so entry zero is always inside the table.
         first_page = table[0].x;
+        valid = atomic_load_explicit(error_flag, memory_order_relaxed) == 0;
     }
     first_page = simd_broadcast(first_page, 0);
+    valid = simd_broadcast(valid, 0);
     for (uint key_row = chunk_start; key_row < chunk_end; ++key_row) {
         uint logical_page = key_row / params.page_tokens;
         if (logical_page != previous_logical_page) {
-            uint2 entry = table[logical_page];
-            uint expected = first_page + logical_page;
-            uint lane_physical_page = params.contiguous_entries == 0 ? entry.x : expected;
-            uint lane_valid = logical_page < params.logical_pages
-                && entry.x < params.physical_pages
-                && generations[entry.x] == entry.y
-                && (params.contiguous_entries == 0 || entry.x == expected);
-            physical_page = simd_broadcast(lane_physical_page, 0);
-            valid = simd_broadcast(lane_valid, 0);
-            if (simd_lane == 0 && valid == 0) {
-                atomic_store_explicit(error_flag, 1, memory_order_relaxed);
-                atomic_fetch_min_explicit(error_flag + 1, logical_page, memory_order_relaxed);
+            uint lane_physical_page = first_page + logical_page;
+            if (params.contiguous_entries == 0 && simd_lane == 0) {
+                lane_physical_page = table[logical_page].x;
             }
+            physical_page = simd_broadcast(lane_physical_page, 0);
             previous_logical_page = logical_page;
         }
         if (valid == 0 || (params.causal != 0 && key_row > params.query_start)) {
@@ -590,26 +601,21 @@ void paged_sdpa_body(
     float maximum = negative_finite_sentinel();
     float denominator = 0.0f;
     if (simd_group == 0 && simd_lane == 0) {
-        // Validation rejects empty attention, so entry zero is always inside the table.
         first_page = table[0].x;
+        physical_page = first_page;
+        valid = atomic_load_explicit(error_flag, memory_order_relaxed) == 0;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     uint pages = (params.key_length + params.page_tokens - 1) / params.page_tokens;
     for (uint logical_page = 0; logical_page < pages; ++logical_page) {
-        if (simd_group == 0 && simd_lane == 0) {
-            uint2 entry = table[logical_page];
-            uint expected = first_page + logical_page;
-            valid = logical_page < params.logical_pages
-                && entry.x < params.physical_pages
-                && generations[entry.x] == entry.y
-                && (params.contiguous_entries == 0 || entry.x == expected);
-            physical_page = params.contiguous_entries == 0 ? entry.x : expected;
-            if (valid == 0) {
-                atomic_store_explicit(error_flag, 1, memory_order_relaxed);
-                atomic_fetch_min_explicit(error_flag + 1, logical_page, memory_order_relaxed);
+        uint page = first_page + logical_page;
+        if (params.contiguous_entries == 0) {
+            if (simd_group == 0 && simd_lane == 0) {
+                physical_page = table[logical_page].x;
             }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            page = physical_page;
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
         uint page_begin = logical_page * params.page_tokens;
         uint page_end = min(params.key_length, page_begin + params.page_tokens);
         if (valid != 0) {
@@ -618,7 +624,7 @@ void paged_sdpa_body(
                     continue;
                 }
                 uint page_row = key_row - page_begin;
-                ulong k_base = ((ulong(physical_page) * params.page_tokens + page_row)
+                ulong k_base = ((ulong(page) * params.page_tokens + page_row)
                     * params.kv_heads + kv_head) * D;
                 float score = 0.0f;
                 for (uint element = 0; element < elements_per_thread; ++element) {
@@ -632,7 +638,7 @@ void paged_sdpa_body(
                 float score_factor = fast::exp(score - next_maximum);
                 maximum = next_maximum;
                 denominator = denominator * previous_factor + score_factor;
-                ulong v_base = ((ulong(physical_page) * params.page_tokens + page_row)
+                ulong v_base = ((ulong(page) * params.page_tokens + page_row)
                     * params.kv_heads + kv_head) * params.value_width;
                 for (uint element = 0; element < elements_per_thread; ++element) {
                     uint column = simd_lane * elements_per_thread + element;
@@ -641,7 +647,9 @@ void paged_sdpa_body(
                 }
             }
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (params.contiguous_entries == 0) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
     }
     if (simd_lane == 0) {
         max_scores[simd_group] = maximum;

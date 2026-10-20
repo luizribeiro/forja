@@ -3214,6 +3214,33 @@ impl MetalBackend {
             (2, dtype_code(output.layout.dtype())),
             (3, dtype_code(value.layout.dtype())),
         ];
+        let validation = self
+            .pipelines
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?
+            .get("paged_sdpa_validate", &[])?;
+        set_pipeline(encoder, &validation);
+        for (index, tensor) in [&page_table, &generations].into_iter().enumerate() {
+            bindings.bind(table, index, &tensor.buffer);
+        }
+        bindings.bind(table, 2, &params);
+        bindings.bind(table, 3, &error_flag);
+        set_argument_table(encoder, table);
+        dispatch_threadgroups(
+            encoder,
+            MTLSize {
+                width: usize::try_from(key_length.div_ceil(page_tokens).div_ceil(64))
+                    .map_err(|_| BackendError::InvalidInput)?,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: 64,
+                height: 1,
+                depth: 1,
+            },
+        );
+        encode_dispatch_barrier(encoder);
         if let Some(kernel) = match selected_variant(dispatch) {
             Some(MetalVariant::PagedSdpaSteel) => Some(SdpaKernel::Steel),
             Some(MetalVariant::PagedSdpaSteelHalf) => Some(SdpaKernel::SteelHalf),
