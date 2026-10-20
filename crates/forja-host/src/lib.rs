@@ -3538,7 +3538,7 @@ impl<B: Backend + 'static> Host<B> {
         entry
             .buffer
             .taints
-            .wait_for_writes(tensor.buffer())
+            .wait_for_writes(tensor.buffer(), self.limits.submission_timeout)
             .map_err(guest_error)?;
         self.backend.write(tensor, bytes).map_err(guest_error)
     }
@@ -4530,6 +4530,7 @@ impl<B: Backend + 'static> Host<B> {
             backend: Arc::clone(&self.backend),
             tensor: entry.tensor.clone(),
             buffer: Arc::clone(&entry.buffer),
+            timeout: self.limits.submission_timeout,
             profile: self.active_profile.clone(),
             replay_output: false,
         })
@@ -5053,6 +5054,7 @@ struct ReadRequest<B: Backend> {
     backend: Arc<B>,
     tensor: Tensor,
     buffer: Arc<BufferHandle>,
+    timeout: Duration,
     profile: Option<Arc<Mutex<EngineStepProfile>>>,
     replay_output: bool,
 }
@@ -5202,16 +5204,25 @@ struct SubmissionOutcome {
 }
 
 impl SubmissionOutcome {
-    fn wait(&self) -> Result<(), BackendError> {
+    fn wait(&self, timeout: Duration) -> Result<(), BackendError> {
+        let started = Instant::now();
         let mut result = self
             .result
             .lock()
             .map_err(|_| BackendError::ExecutionFailed)?;
         while result.is_none() {
-            result = self
+            let remaining = timeout.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                return Err(BackendError::Timeout);
+            }
+            let (next, wait) = self
                 .ready
-                .wait(result)
+                .wait_timeout(result, remaining)
                 .map_err(|_| BackendError::ExecutionFailed)?;
+            result = next;
+            if wait.timed_out() && result.is_none() {
+                return Err(BackendError::Timeout);
+            }
         }
         result.unwrap_or(Err(BackendError::ExecutionFailed))
     }
@@ -5267,7 +5278,7 @@ impl BufferTaints {
         })
     }
 
-    fn wait_for_writes(&self, buffer: BufferId) -> Result<(), BackendError> {
+    fn wait_for_writes(&self, buffer: BufferId, timeout: Duration) -> Result<(), BackendError> {
         let pending = {
             let mut state = self
                 .state
@@ -5283,7 +5294,7 @@ impl BufferTaints {
             pending.iter().filter_map(Weak::upgrade).collect::<Vec<_>>()
         };
         for outcome in pending {
-            outcome.wait()?;
+            outcome.wait(timeout)?;
         }
         self.state
             .lock()
@@ -5325,10 +5336,11 @@ impl TaintFlight {
         mut self,
         mut result: Result<T, BackendError>,
         committed: bool,
+        timeout: Duration,
     ) -> Result<T, BackendError> {
         if result.is_ok() {
             for dependency in &self.dependencies {
-                if let Err(error) = dependency.wait() {
+                if let Err(error) = dependency.wait(timeout) {
                     result = Err(error);
                     break;
                 }
@@ -5556,7 +5568,7 @@ where
                     Ok(taint) => match submit_work(backend.as_ref(), work, profile.is_some()) {
                         Err(error) => {
                             let error = taint
-                                .finish::<()>(Err(error), false)
+                                .finish::<()>(Err(error), false, self.timeout)
                                 .err()
                                 .unwrap_or(BackendError::ExecutionFailed);
                             Err(error)
@@ -5611,7 +5623,7 @@ where
                 Some(flight) => flight.finish(result),
                 None => result,
             };
-            let result = taint.finish(result, true);
+            let result = taint.finish(result, true, timeout);
             drop(flight);
             if let Ok(gpu_time) = result {
                 if let Some(gpu_time) = gpu_time {
@@ -5711,13 +5723,14 @@ where
                 backend,
                 tensor,
                 buffer,
+                timeout,
                 profile,
                 replay_output,
             } = self;
             let taint = if replay_output {
                 buffer.taints.check(tensor.buffer())
             } else {
-                buffer.taints.wait_for_writes(tensor.buffer())
+                buffer.taints.wait_for_writes(tensor.buffer(), timeout)
             };
             if let Err(error) = taint {
                 let release = release_buffer(backend.as_ref(), buffer, profile.as_ref());
@@ -7010,7 +7023,7 @@ mod tests {
         BackendEvent, BackendTimer, BatchSlotEntry, EngineMemory, EngineMetrics, EngineRunner,
         EngineStep, EngineStepProfile, Grants, Host, ImportKind, ImportTimer, Limits,
         MAX_INSTRUCTIONS, MAX_OUTPUTS, PagePoolEntry, PagedSequenceEntry, ParamsEntry,
-        ReplayFlight, ReplayState, TensorEntry,
+        ReplayFlight, ReplayState, SubmissionOutcome, TensorEntry,
         bindings::l9o::gpu::{compute, paged_storage},
         core_op, core_program, expected_layer_outputs,
     };
@@ -7065,6 +7078,15 @@ mod tests {
             .load(Ordering::Acquire);
 
         assert_eq!(host.live_bytes.load(Ordering::Acquire), charged);
+    }
+
+    #[test]
+    fn pending_submission_waits_return_at_the_deadline() {
+        let pending = SubmissionOutcome::default();
+        assert_eq!(
+            pending.wait(Duration::from_millis(1)),
+            Err(BackendError::Timeout)
+        );
     }
 
     #[test]
