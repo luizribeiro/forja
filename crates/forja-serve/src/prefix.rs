@@ -6,7 +6,8 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use forja_core::{PagePoolError, PagedSequence};
+use forja_core::PagePoolError;
+use forja_host::PagedPrefix;
 const BLOCK: usize = 64;
 const BLOCK_DOMAIN: &[u8] = b"forja-prefix-block-v1";
 const NAMESPACE_DOMAIN: &[u8] = b"forja-prefix-namespace-v1";
@@ -103,7 +104,7 @@ pub(crate) struct LivePrefix {
 #[cfg_attr(not(test), allow(dead_code, reason = "used by paged serving"))]
 struct PrefixEntry {
     fingerprint: LivePrefix,
-    sequence: PagedSequence,
+    sequence: PagedPrefix,
     pages: usize,
     used: u64,
 }
@@ -111,7 +112,7 @@ struct PrefixEntry {
 /// A sequence fork attached to the longest exact indexed prefix.
 #[cfg_attr(not(test), allow(dead_code, reason = "used by paged serving"))]
 pub(crate) struct PrefixHit {
-    pub(crate) sequence: PagedSequence,
+    pub(crate) sequence: PagedPrefix,
     pub(crate) cached_tokens: usize,
 }
 
@@ -148,13 +149,12 @@ impl PrefixIndex {
         &mut self,
         namespace: PrefixNamespace,
         tokens: Vec<u32>,
-        sequence: &mut PagedSequence,
+        sequence: &PagedPrefix,
     ) -> Result<(), PrefixIndexError> {
-        let pages = sequence.fork(
-            u64::try_from(tokens.len())
-                .map_err(|_| PrefixIndexError::Pool(PagePoolError::ArithmeticOverflow))?,
-        )?;
-        let page_count = pages.table()?.entries().len();
+        let token_count = u64::try_from(tokens.len())
+            .map_err(|_| PrefixIndexError::Pool(PagePoolError::ArithmeticOverflow))?;
+        let pages = sequence.fork_reserved(token_count, token_count)?;
+        let page_count = pages.page_count()?;
         if tokens.len() > self.limits.tokens || page_count > self.limits.referenced_pages {
             return Err(PrefixIndexError::EntryTooLarge);
         }
@@ -322,6 +322,10 @@ impl PrefixLedger {
     pub(crate) fn finish(self, namespace: PrefixNamespace) -> LivePrefix {
         LivePrefix::new(namespace, self.0)
     }
+
+    pub(crate) fn into_tokens(self) -> Vec<u32> {
+        self.0
+    }
 }
 pub(crate) fn replace_live(
     entry: &mut Option<LivePrefix>,
@@ -414,10 +418,10 @@ mod tests {
         .unwrap()
     }
 
-    fn sequence(pool: &PagePool, tokens: usize) -> PagedSequence {
+    fn sequence(pool: &PagePool, tokens: usize) -> PagedPrefix {
         let mut sequence = pool.reserve(256).unwrap();
         sequence.commit_write(tokens as u64).unwrap();
-        sequence
+        PagedPrefix::new(sequence)
     }
     #[test]
     fn finds_boundaries_partial_blocks_and_prompt_cap() {
@@ -506,13 +510,13 @@ mod tests {
         let agent = (0..130).collect::<Vec<_>>();
         let unrelated = (1_000..1_100).collect::<Vec<_>>();
         index
-            .publish(namespace, agent.clone(), &mut sequence(&pool, agent.len()))
+            .publish(namespace, agent.clone(), &sequence(&pool, agent.len()))
             .unwrap();
         index
             .publish(
                 namespace,
                 unrelated.clone(),
-                &mut sequence(&pool, unrelated.len()),
+                &sequence(&pool, unrelated.len()),
             )
             .unwrap();
         let mut next_turn = agent;
@@ -521,8 +525,8 @@ mod tests {
         let hit = index.lookup(namespace, &next_turn, 192).unwrap().unwrap();
 
         assert_eq!(hit.cached_tokens, 130);
-        assert_eq!(hit.sequence.logical_len(), 130);
-        assert_eq!(hit.sequence.reserved_tokens(), 192);
+        assert_eq!(hit.sequence.logical_len().unwrap(), 130);
+        assert_eq!(hit.sequence.reserved_tokens().unwrap(), 192);
     }
 
     #[test]
@@ -538,14 +542,14 @@ mod tests {
         for start in [0, 1_000] {
             let tokens = (start..start + 100).collect::<Vec<_>>();
             index
-                .publish(namespace, tokens, &mut sequence(&pool, 100))
+                .publish(namespace, tokens, &sequence(&pool, 100))
                 .unwrap();
         }
         let first = (0..110).collect::<Vec<_>>();
         assert!(index.lookup(namespace, &first, 128).unwrap().is_some());
         let third = (2_000..2_100).collect::<Vec<_>>();
         index
-            .publish(namespace, third.clone(), &mut sequence(&pool, 100))
+            .publish(namespace, third.clone(), &sequence(&pool, 100))
             .unwrap();
 
         assert!(index.lookup(namespace, &first, 128).unwrap().is_some());
@@ -569,10 +573,8 @@ mod tests {
         })
         .unwrap();
         let tokens = (0..100).collect::<Vec<_>>();
-        let mut sequence = sequence(&pool, tokens.len());
-        index
-            .publish(namespace, tokens.clone(), &mut sequence)
-            .unwrap();
+        let sequence = sequence(&pool, tokens.len());
+        index.publish(namespace, tokens.clone(), &sequence).unwrap();
         index.tokens = 0;
 
         assert!(matches!(

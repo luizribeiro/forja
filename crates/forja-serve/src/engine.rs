@@ -23,7 +23,10 @@ use tokio::sync::{Notify, mpsc};
 
 use crate::guidance::{GuidanceSession, GuidanceWorker};
 use crate::metrics::{ServingMetrics, observe};
-use crate::prefix::{LivePrefix, PrefixIdentity, PrefixLedger, PrefixNamespace, replace_live};
+use crate::prefix::{
+    LivePrefix, PrefixIdentity, PrefixIndex, PrefixLedger, PrefixLimits, PrefixNamespace,
+    replace_live,
+};
 use crate::request::{ToolChoice, validate_chat_input, validate_completion_input, validate_prompt};
 use crate::tool_output::{GeneratedToolCall, ToolDelta, ToolOutput};
 use crate::{
@@ -147,6 +150,7 @@ pub struct PrefilledPrompt {
     /// Engine sampling parameters used by every decode step.
     pub sampling: SamplingParams,
     ledger: PrefixLedger,
+    paged: bool,
     constraint: Option<ConstraintPlan>,
 }
 
@@ -430,6 +434,7 @@ pub struct ServingEngine<B: Backend + Send + Sync + 'static> {
     max_context: u32,
     guidance: GuidanceWorker,
     prefix_namespace: PrefixNamespace,
+    prefix_index: Option<PrefixIndex>,
     live_prefix: Option<LivePrefix>,
     metrics: ServingMetrics,
 }
@@ -475,6 +480,28 @@ where
                 .map_err(|error| {
                     GenerationError::new(format!("cannot initialize constraints: {error}"))
                 })?;
+        let prefix_index = info
+            .serving
+            .as_ref()
+            .map(|serving| {
+                let entries = usize::try_from(config.server.queue_length.max(serving.active_lanes))
+                    .map_err(|_| GenerationError::new("prefix entry limit overflowed"))?;
+                let context = usize::try_from(serving.max_context)
+                    .map_err(|_| GenerationError::new("prefix token limit overflowed"))?;
+                let pages = usize::try_from(serving.max_context.div_ceil(serving.page_tokens))
+                    .map_err(|_| GenerationError::new("prefix page limit overflowed"))?;
+                PrefixIndex::new(PrefixLimits {
+                    entries,
+                    tokens: entries
+                        .checked_mul(context)
+                        .ok_or_else(|| GenerationError::new("prefix token limit overflowed"))?,
+                    referenced_pages: entries
+                        .checked_mul(pages)
+                        .ok_or_else(|| GenerationError::new("prefix page limit overflowed"))?,
+                })
+                .map_err(|error| GenerationError::new(error.to_string()))
+            })
+            .transpose()?;
         Ok(Self {
             model,
             runner,
@@ -488,6 +515,7 @@ where
             max_context,
             guidance,
             prefix_namespace: prefix_identity.into_namespace(),
+            prefix_index,
             live_prefix: None,
             metrics: ServingMetrics::default(),
         })
@@ -585,6 +613,45 @@ where
             .await
     }
 
+    fn prepare_prefix(
+        &mut self,
+        tokens: &[u32],
+        prompt_tokens: u32,
+        max_tokens: u32,
+    ) -> Result<(usize, usize, bool), GenerationError> {
+        let reserved_tokens = u64::from(prompt_tokens)
+            .checked_add(u64::from(max_tokens))
+            .ok_or_else(|| GenerationError::new("paged reservation overflowed"))?;
+        let hit = if self.config.serving.prefix_reuse {
+            self.prefix_index
+                .as_mut()
+                .map(|index| index.lookup(self.prefix_namespace, tokens, reserved_tokens))
+                .transpose()
+                .map_err(|error| GenerationError::unavailable(error.to_string()))?
+                .flatten()
+        } else {
+            None
+        };
+        let indexed_len = hit.as_ref().map_or(0, |hit| hit.cached_tokens);
+        let paged = self
+            .runner
+            .prepare_paged_request(hit.map(|hit| hit.sequence), reserved_tokens)
+            .map_err(|error| {
+                GenerationError::unavailable(format!("paged admission failed: {error:?}"))
+            })?;
+        if paged {
+            Ok((indexed_len, indexed_len, true))
+        } else {
+            Ok(self.live_prefix.as_ref().map_or((0, 0, false), |prefix| {
+                (
+                    prefix.match_len(self.prefix_namespace, tokens),
+                    prefix.len(),
+                    false,
+                )
+            }))
+        }
+    }
+
     async fn prefill(
         &mut self,
         tokens: Vec<u32>,
@@ -606,12 +673,8 @@ where
         }
         let ledger = PrefixLedger::new(tokens.clone());
         let match_started = Instant::now();
-        let (cached_len, live_len) = self.live_prefix.as_ref().map_or((0, 0), |prefix| {
-            (
-                prefix.match_len(self.prefix_namespace, &tokens),
-                prefix.len(),
-            )
-        });
+        let (cached_len, live_len, paged) =
+            self.prepare_prefix(&tokens, prompt_tokens, params.max_tokens)?;
         self.metrics.requests = self.metrics.requests.saturating_add(1);
         observe(&mut self.metrics.match_time, match_started.elapsed());
         if cached_len == 0 {
@@ -625,7 +688,7 @@ where
         }
         let start_pos = u32::try_from(cached_len)
             .map_err(|_| GenerationError::new("cached prefix length overflowed"))?;
-        if cached_len > 0 && cached_len < live_len {
+        if !paged && cached_len > 0 && cached_len < live_len {
             let rewind_started = Instant::now();
             let rewind = self
                 .runner
@@ -682,6 +745,7 @@ where
             started,
             sampling,
             ledger,
+            paged,
             constraint,
         })
     }
@@ -811,6 +875,7 @@ where
             cached_tokens,
             started,
             sampling,
+            paged,
             constraint,
             mut guidance,
             mut constrained,
@@ -947,7 +1012,29 @@ where
         .await;
         let ledger = result.is_ok().then(|| std::mem::take(&mut pipeline.ledger));
         let ledger = self.config.serving.prefix_reuse.then_some(ledger).flatten();
-        replace_live(&mut self.live_prefix, self.prefix_namespace, ledger);
+        if paged {
+            if let Some(ledger) = ledger {
+                let publish = self
+                    .runner
+                    .paged_prefix()
+                    .map_err(|error| {
+                        GenerationError::unavailable(format!(
+                            "paged prefix publication failed: {error:?}"
+                        ))
+                    })?
+                    .ok_or_else(|| GenerationError::new("paged prefix is unavailable"))
+                    .and_then(|sequence| {
+                        self.prefix_index
+                            .as_mut()
+                            .ok_or_else(|| GenerationError::new("prefix index is unavailable"))?
+                            .publish(self.prefix_namespace, ledger.into_tokens(), &sequence)
+                            .map_err(|error| GenerationError::unavailable(error.to_string()))
+                    });
+                publish?;
+            }
+        } else {
+            replace_live(&mut self.live_prefix, self.prefix_namespace, ledger);
+        }
         result
     }
 }
@@ -1003,6 +1090,7 @@ struct DecodeStart {
     cached_tokens: u32,
     started: Instant,
     sampling: SamplingParams,
+    paged: bool,
     constraint: Option<ConstraintPlan>,
     guidance: Option<GuidanceSession>,
     constrained: bool,
@@ -1029,6 +1117,7 @@ where
         cached_tokens,
         started,
         sampling,
+        paged,
         ledger,
         constraint,
     } = prefill;
@@ -1060,6 +1149,7 @@ where
         cached_tokens,
         started,
         sampling,
+        paged,
         constraint,
         guidance,
         constrained,

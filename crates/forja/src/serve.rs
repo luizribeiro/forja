@@ -162,7 +162,7 @@ mod tests {
             .enable_time()
             .build()?;
         runtime.block_on(async {
-            let mut engine = agent_engine().await?;
+            let mut engine = agent_engine(false, true).await?;
             let first: forja_serve::ChatCompletionRequest = serde_json::from_value(
                 serde_json::json!({
                     "model": engine.model(),
@@ -268,20 +268,40 @@ mod tests {
             let model = root.join("Qwen3-Coder-30B-A3B-Instruct-4bit");
             let tokenizer = Tokenizer::from_file(model.join("tokenizer.json"))
                 .map_err(|error| format!("cannot load tokenizer: {error}"))?;
-            let prefix = " x".repeat(2_048);
-            let prompt = format!("{prefix}{}", " token".repeat(33));
+            let prefix = format!("{} token", " x".repeat(2_048));
+            let prompt = format!("{prefix}{}", " token".repeat(32));
             let token_count = |text: String| {
                 tokenizer
                     .encode(text, false)
                     .map(|encoding| encoding.len())
                     .map_err(|error| error.to_string())
             };
-            if token_count(prefix.clone())? != 2_048 || token_count(prompt.clone())? != 2_081 {
-                return Err("repeated-agent fixture does not have 2,048 + 33 tokens".into());
+            if token_count(prefix.clone())? != 2_049 || token_count(prompt.clone())? != 2_081 {
+                return Err("repeated-agent fixture does not have 2,049 + 32 tokens".into());
             }
-            let mut engine = agent_engine().await?;
+            let mut engine = agent_engine(true, true).await?;
+            let mut cached = Vec::new();
             for (temperature, seed) in [(0.0, 0), (0.7, 17)] {
-                compare_prefix_reuse(&mut engine, &prefix, &prompt, temperature, seed).await?;
+                cached.push(
+                    compare_prefix_reuse(&mut engine, &prefix, &prompt, temperature, seed).await?,
+                );
+            }
+            drop(engine);
+            let mut uncached = agent_engine(true, false).await?;
+            for ((temperature, seed), cached) in [(0.0, 0), (0.7, 17)].into_iter().zip(cached) {
+                let request: forja_serve::CompletionRequest =
+                    serde_json::from_value(serde_json::json!({
+                        "model": uncached.model(), "prompt": prompt, "max_tokens": 8,
+                        "temperature": temperature, "top_k": 20, "top_p": 0.8, "seed": seed
+                    }))?;
+                let fresh = uncached.complete_text(&request).await?;
+                if fresh.usage.cached_tokens != 0
+                    || fresh.token_ids() != cached.token_ids()
+                    || fresh.finish_reason != cached.finish_reason
+                    || fresh.usage.completion_tokens != cached.usage.completion_tokens
+                {
+                    return Err("cached and uncached continuations differ".into());
+                }
             }
             Ok(())
         })
@@ -294,7 +314,7 @@ mod tests {
         prompt: &str,
         temperature: f32,
         seed: u64,
-    ) -> Result<(), Box<dyn Error>> {
+    ) -> Result<forja_serve::Completion, Box<dyn Error>> {
         let model = engine.model().to_owned();
         let request = |prompt: &str, max_tokens| {
             serde_json::from_value::<forja_serve::CompletionRequest>(serde_json::json!({
@@ -305,22 +325,30 @@ mod tests {
         engine.complete_text(&request(prefix, 1)?).await?;
         let cached = engine.complete_text(&request(prompt, 8)?).await?;
         engine.complete_text(&request(" unrelated", 1)?).await?;
-        let uncached = engine.complete_text(&request(prompt, 8)?).await?;
-        if cached.usage.cached_tokens != 2_048 || uncached.usage.cached_tokens != 0 {
-            return Err("prefix reuse did not report the expected cached tokens".into());
-        }
-        if cached.token_ids() != uncached.token_ids()
-            || cached.finish_reason != uncached.finish_reason
-            || cached.usage.completion_tokens != uncached.usage.completion_tokens
+        let interleaved = engine.complete_text(&request(prompt, 8)?).await?;
+        if !(2_049..=2_080).contains(&cached.usage.cached_tokens)
+            || interleaved.usage.cached_tokens != 2_080
         {
-            return Err("cached and uncached continuations differ".into());
+            return Err(format!(
+                "prefix reuse reported cached tokens {}/{} outside 2049..=2080/2080",
+                cached.usage.cached_tokens, interleaved.usage.cached_tokens
+            )
+            .into());
         }
-        Ok(())
+        if cached.token_ids() != interleaved.token_ids()
+            || cached.finish_reason != interleaved.finish_reason
+            || cached.usage.completion_tokens != interleaved.usage.completion_tokens
+        {
+            return Err("interleaved cached continuations differ".into());
+        }
+        Ok(cached)
     }
 
     #[cfg(target_os = "macos")]
-    async fn agent_engine()
-    -> Result<forja_serve::ServingEngine<forja_metal::MetalBackend>, Box<dyn Error>> {
+    async fn agent_engine(
+        paged_cache: bool,
+        prefix_reuse: bool,
+    ) -> Result<forja_serve::ServingEngine<forja_metal::MetalBackend>, Box<dyn Error>> {
         let root = PathBuf::from(env::var_os("FORJA_MODELS").ok_or("FORJA_MODELS is not set")?);
         let model = root.join("Qwen3-Coder-30B-A3B-Instruct-4bit");
         let component = test_guests::qwen3_coder();
@@ -345,10 +373,12 @@ mod tests {
         )
         .await?;
         let info = runner.describe().await?;
-        let load = engine_load_config(component, &Engine::default())?;
+        let mut load = engine_load_config(component, &Engine::default())?;
+        load.paged_cache = paged_cache;
         runner.load_with_selections(None, &load).await??;
         let mut config = forja_config::HostConfig::default();
         config.request.max_output_tokens = 256;
+        config.serving.prefix_reuse = prefix_reuse;
         let identity = forja_serve::PrefixIdentity::new([
             &sha256_file(component)?,
             &profile.sha256()?,
