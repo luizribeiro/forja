@@ -48,7 +48,6 @@ prompt-token-budget = 2048
 "top-k" = "top-k.single-k8"
 "sample" = "sample.parallel"
 "attention.prefill-small" = "sdpa.decomposed"
-"paged-attention.decode" = "paged-sdpa.vector"
 "paged-attention.prefill-large" = "paged-sdpa.steel-half"
 "paged-attention.prefill-small" = "paged-sdpa.steel-half"
 
@@ -60,6 +59,16 @@ arms = [
   { lo = 1023, hi = 3071, name = "sdpa.vector-gqa-two-pass" },
   { lo = 3072, hi = 8191, name = "sdpa.vector-gqa-two-pass-128" },
   { lo = 8192, hi = 32767, name = "sdpa.vector-gqa-two-pass-256" },
+]
+
+[variants.rules."paged-attention.decode"]
+parameter = "position"
+arms = [
+  { lo = 0, hi = 510, name = "paged-sdpa.vector" },
+  { lo = 511, hi = 1022, name = "paged-sdpa.vector-gqa-two-pass-32" },
+  { lo = 1023, hi = 3071, name = "paged-sdpa.vector-gqa-two-pass" },
+  { lo = 3072, hi = 8191, name = "paged-sdpa.vector-gqa-two-pass-128" },
+  { lo = 8192, hi = 32767, name = "paged-sdpa.vector-gqa-two-pass-256" },
 ]
 
 [variants.rules."attention.prefill-large"]

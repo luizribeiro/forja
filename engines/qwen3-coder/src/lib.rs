@@ -604,15 +604,10 @@ fn paged_cache_attention<C: forja_sdk::Element>(
     end: &Dim,
     selection: &VariantSelection,
 ) -> Result<Tensor<f32>> {
-    let VariantSelection::Fixed(variant) = selection else {
-        return Err(forja_sdk::Error::loading(
-            "paged attention requires a fixed variant",
-        ));
-    };
     let cached_key = key.to_dtype::<C>()?;
     let cached_value = value.to_dtype::<C>()?;
     cache.append(&cached_key, &cached_value, start)?;
-    cache.attention(query, ATTENTION_SCALE, start, end, variant)
+    cache.attention(query, ATTENTION_SCALE, start, end, selection.choice())
 }
 
 enum CacheStorage {
