@@ -162,13 +162,13 @@ impl PagedCache<'_> {
     /// # Errors
     ///
     /// Returns an error for incompatible shapes, overflow, or refused host work.
-    pub fn attention<T: Element>(
+    pub fn attention<'a, T: Element>(
         &self,
         query: &Tensor<T>,
         scale: f32,
         start: &Dim,
         end: &Dim,
-        variant: &crate::target::metal::Variant,
+        selection: impl Into<crate::target::metal::VariantChoice<'a>>,
     ) -> Result<Tensor<T>> {
         let [sequence, heads, width]: [u32; 3] = query
             .shape()
@@ -182,23 +182,42 @@ impl PagedCache<'_> {
         #[cfg(target_family = "wasm")]
         let (start, end) = (crate::graph::affine(start)?, crate::graph::affine(end)?);
         #[cfg(target_family = "wasm")]
-        crate::graph::record_import(|commands| {
-            crate::sys::paged_sdpa(
-                commands,
-                &self._set._slot,
-                query.handle(),
-                output.handle(),
-                self.key_plane,
-                self.value_plane,
-                scale,
-                true,
-                start,
-                end,
-                variant.name(),
-            )
-        })?;
+        crate::graph::record_import_variant(
+            selection.into(),
+            |commands, name| {
+                crate::sys::paged_sdpa(
+                    commands,
+                    &self._set._slot,
+                    query.handle(),
+                    output.handle(),
+                    self.key_plane,
+                    self.value_plane,
+                    scale,
+                    true,
+                    start,
+                    end,
+                    name,
+                )
+            },
+            |commands, params, parameter, arms| {
+                crate::sys::paged_sdpa(
+                    commands,
+                    &self._set._slot,
+                    query.handle(),
+                    output.handle(),
+                    self.key_plane,
+                    self.value_plane,
+                    scale,
+                    true,
+                    start,
+                    end,
+                    "",
+                )?;
+                crate::sys::select_paged_sdpa_variant_rule(commands, params, parameter, arms)
+            },
+        )?;
         #[cfg(not(target_family = "wasm"))]
-        let _ = (&query, scale, start, end, variant);
+        let _ = (&query, scale, start, end, selection);
         output
             .permute(&[1, 0, 2])?
             .contiguous()?

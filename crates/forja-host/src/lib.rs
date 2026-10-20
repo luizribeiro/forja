@@ -4595,6 +4595,86 @@ impl<B: Backend + 'static> Host<B> {
         Ok(Some(BackendDispatchData::new(validated)))
     }
 
+    fn select_paged_variant_rule(
+        &mut self,
+        commands: &Resource<CommandListEntry>,
+        params: &Resource<ParamsEntry>,
+        parameter: u8,
+        arms: &[paged_storage::VariantArm],
+    ) -> Result<(), compute::Error> {
+        if arms.len() > MAX_VARIANT_RULE_ARMS {
+            return Err(quota("Metal variant rule has too many arms"));
+        }
+        for arm in arms {
+            validate_variant_name_length(&arm.name)?;
+        }
+        let space = self
+            .table
+            .get(params)
+            .map_err(invalid_handle)?
+            .space
+            .clone();
+        let rule = forja_core::VariantRule::new(
+            &space,
+            parameter,
+            arms.iter()
+                .map(|arm| RuleArm::new(arm.lo, arm.hi, &arm.name))
+                .collect(),
+        )
+        .map_err(|error| variant_error(&error))?;
+        let variants = {
+            let entry = self.table.get(commands).map_err(invalid_handle)?;
+            validate_variant_rule_space(entry.space.clone(), &space)?;
+            let Some(RecordedDispatch::Operation {
+                op,
+                inputs,
+                outputs,
+            }) = entry.recorded.last()
+            else {
+                return Err(guest_error(BackendError::InvalidInput));
+            };
+            if template_operation_kind(*op) != forja_core::OperationKind::PagedSdpa {
+                return Err(guest_error(BackendError::InvalidInput));
+            }
+            self.metal_backend()?
+                .validate_variant_rule(
+                    &space,
+                    &rule,
+                    *op,
+                    &inputs.iter().collect::<Vec<_>>(),
+                    &outputs.iter().collect::<Vec<_>>(),
+                )
+                .map_err(|error| variant_error(&error))?
+        };
+        let entry = self.table.get_mut(commands).map_err(invalid_handle)?;
+        let recorded = entry
+            .recorded
+            .pop()
+            .ok_or_else(|| guest_error(BackendError::ExecutionFailed))?;
+        let RecordedDispatch::Operation {
+            op,
+            inputs,
+            outputs,
+        } = recorded
+        else {
+            return Err(guest_error(BackendError::ExecutionFailed));
+        };
+        entry.recorded.push(RecordedDispatch::VariantRule {
+            op,
+            inputs,
+            outputs,
+            parameter,
+            arms: rule
+                .arms()
+                .iter()
+                .zip(variants)
+                .map(|(arm, variant)| (arm.hi(), BackendDispatchData::new(variant)))
+                .collect(),
+        });
+        entry.parameterized = true;
+        Ok(())
+    }
+
     fn record_metal_variant(
         &mut self,
         commands: &Resource<CommandListEntry>,
@@ -6245,10 +6325,30 @@ where
                 PagedDispatchContext {
                     protected,
                     usage,
-                    variant_name: Some(&config.algorithm),
+                    variant_name: (!config.algorithm.is_empty())
+                        .then_some(config.algorithm.as_str()),
                 },
             )
         })();
+        std::future::ready(Ok(result))
+    }
+
+    fn select_paged_sdpa_variant_rule(
+        &mut self,
+        commands: Resource<CommandListEntry>,
+        params: Resource<ParamsEntry>,
+        parameter: u8,
+        arms: Vec<paged_storage::VariantArm>,
+    ) -> impl Future<Output = wasmtime::Result<Result<(), compute::Error>>> + Send {
+        #[cfg(target_os = "macos")]
+        let result = self.select_paged_variant_rule(&commands, &params, parameter, &arms);
+        #[cfg(not(target_os = "macos"))]
+        let result = {
+            let _ = (commands, params, parameter, arms);
+            Err(compute::Error::OpSignature(
+                "Metal variants are unavailable".to_owned(),
+            ))
+        };
         std::future::ready(Ok(result))
     }
 }

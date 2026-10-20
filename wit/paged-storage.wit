@@ -1,7 +1,13 @@
 package l9o:gpu@0.1.0;
 
 interface paged-storage {
-  use compute.{affine, command-list, error, tensor};
+  use compute.{affine, command-list, error, params, tensor};
+
+  record variant-arm {
+    lo: u32,
+    hi: u32,
+    name: string,
+  }
 
   resource sequence;
   resource batch-slot;
@@ -46,5 +52,12 @@ interface paged-storage {
     query: borrow<tensor>,
     output: borrow<tensor>,
     config: sdpa-cfg,
+  ) -> result<_, error>;
+
+  select-paged-sdpa-variant-rule: func(
+    cmds: borrow<command-list>,
+    space: borrow<params>,
+    parameter: u8,
+    arms: list<variant-arm>,
   ) -> result<_, error>;
 }

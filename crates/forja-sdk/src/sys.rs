@@ -1665,6 +1665,25 @@ pub(crate) fn paged_sdpa(
     .map_err(|error| Error::new(format!("{error:?}")))
 }
 
+#[cfg(target_family = "wasm")]
+pub(crate) fn select_paged_sdpa_variant_rule(
+    commands: &mut Commands,
+    params: &Params,
+    parameter: u8,
+    arms: &[VariantArm],
+) -> Result<()> {
+    let arms = arms
+        .iter()
+        .map(|arm| guest::paged_storage::VariantArm {
+            lo: arm.lo,
+            hi: arm.hi,
+            name: arm.name.clone(),
+        })
+        .collect::<Vec<_>>();
+    guest::paged_storage::select_paged_sdpa_variant_rule(commands, params, parameter, &arms)
+        .map_err(|error| Error::new(format!("{error:?}")))
+}
+
 pub(crate) fn dispatch_variant(
     commands: &mut Commands,
     operation: Op,

@@ -436,6 +436,52 @@ pub(crate) fn record_import(
     })
 }
 
+#[cfg(target_family = "wasm")]
+pub(crate) fn record_import_variant(
+    selection: crate::target::metal::VariantChoice<'_>,
+    fixed: impl FnOnce(&mut sys::Commands, &str) -> Result<()>,
+    rule: impl FnOnce(&mut sys::Commands, &sys::Params, u8, &[sys::VariantArm]) -> Result<()>,
+) -> Result<()> {
+    CURRENT.with(|current| {
+        let mut current = current.borrow_mut();
+        if current.is_none() {
+            if matches!(selection, crate::target::metal::VariantChoice::Rule(_)) {
+                return Err(crate::Error::new(
+                    "Metal variant rules can only be used during capture",
+                ));
+            }
+            *current = Some(Recording::Lazy(sys::command_list()?));
+        }
+        match (current.as_mut(), selection) {
+            (
+                Some(Recording::Lazy(commands) | Recording::Capture { commands, .. }),
+                crate::target::metal::VariantChoice::Variant(variant),
+            ) => fixed(commands, variant.name()),
+            (
+                Some(Recording::Capture {
+                    commands,
+                    params,
+                    ids,
+                }),
+                crate::target::metal::VariantChoice::Rule(selection),
+            ) => {
+                let parameter = ids
+                    .iter()
+                    .position(|candidate| *candidate == selection.parameter_id)
+                    .and_then(|slot| u8::try_from(slot).ok())
+                    .ok_or_else(|| {
+                        crate::Error::new("variant rule parameter is not part of this capture")
+                    })?;
+                rule(commands, params, parameter, &selection.arms)
+            }
+            (Some(Recording::Lazy(_)), crate::target::metal::VariantChoice::Rule(_)) => Err(
+                crate::Error::new("Metal variant rules can only be used during capture"),
+            ),
+            (None, _) => Err(crate::Error::new("current graph was not initialized")),
+        }
+    })
+}
+
 pub(crate) fn record_variant(
     operation: sys::Op,
     inputs: &[&sys::Handle],
