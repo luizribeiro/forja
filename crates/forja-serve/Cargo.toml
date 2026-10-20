@@ -23,6 +23,7 @@ wasmtime.workspace = true
 
 [dev-dependencies]
 test-guests = { path = "../../support/test-guests" }
+tracing-subscriber.workspace = true
 
 [lints]
 workspace = true

@@ -4,7 +4,7 @@ use std::{
     pin::Pin,
     sync::{
         Arc, Mutex as StdMutex,
-        atomic::{AtomicU32, Ordering},
+        atomic::{AtomicU32, AtomicU64, Ordering},
     },
     time::{Duration, UNIX_EPOCH},
 };
@@ -30,6 +30,8 @@ use crate::{
     ChatCompletionRequest, Completion, CompletionRequest, GenerationControl, GenerationError,
     GenerationEvent, ServingEngine, Usage, chat_response, text_response,
 };
+
+static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Asynchronous chat generation used by the HTTP transport.
 pub trait ChatService: Send + 'static {
@@ -241,6 +243,7 @@ async fn chat<S: ChatService>(
     State(state): State<Arc<HttpState<S>>>,
     request: Request,
 ) -> Response {
+    let request_id = next_request_id();
     let deadline = tokio::time::Instant::now() + state.deadline;
     let body = match body(request).await {
         Ok(body) => body,
@@ -296,6 +299,7 @@ async fn chat<S: ChatService>(
             return api_error(StatusCode::GATEWAY_TIMEOUT, "request deadline exceeded");
         }
     };
+    log_completion(request_id, "/v1/chat/completions", &model, &completion);
     let created = unix_time();
     match chat_response(&format!("chatcmpl-{created}"), created, &model, &completion) {
         Ok(body) => Json(body).into_response(),
@@ -307,6 +311,7 @@ async fn text<S: ChatService>(
     State(state): State<Arc<HttpState<S>>>,
     request: Request,
 ) -> Response {
+    let request_id = next_request_id();
     let deadline = tokio::time::Instant::now() + state.deadline;
     let body = match body(request).await {
         Ok(body) => body,
@@ -362,6 +367,7 @@ async fn text<S: ChatService>(
             return api_error(StatusCode::GATEWAY_TIMEOUT, "request deadline exceeded");
         }
     };
+    log_completion(request_id, "/v1/completions", &model, &completion);
     let created = unix_time();
     match text_response(&format!("cmpl-{created}"), created, &model, &completion) {
         Ok(body) => Json(body).into_response(),
@@ -610,6 +616,28 @@ fn unix_time() -> u64 {
         .map_or(0, |duration| duration.as_secs())
 }
 
+fn next_request_id() -> u64 {
+    NEXT_REQUEST_ID
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |id| id.checked_add(1))
+        .unwrap_or(u64::MAX)
+}
+
+fn log_completion(request_id: u64, route: &str, model: &str, completion: &Completion) {
+    tracing::info!(
+        event = "request.completed",
+        request_id,
+        config_generation = 0,
+        model,
+        route,
+        outcome = "ok",
+        status = 200,
+        finish_reason = crate::response::finish_reason(completion.finish_reason),
+        prompt_tokens = completion.usage.prompt_tokens,
+        output_tokens = completion.usage.completion_tokens,
+        cached_tokens = completion.usage.cached_tokens,
+    );
+}
+
 async fn admit<S>(state: &Arc<HttpState<S>>) -> Result<OwnedSemaphorePermit, Box<Response>> {
     if state.draining.load(Ordering::Acquire) {
         return Err(Box::new(api_error(
@@ -720,6 +748,10 @@ fn error_value(message: &str, error_type: &str) -> Value {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
+
+    use tracing_subscriber::fmt::MakeWriter;
+
     use super::*;
     use crate::{FinishReason, Usage};
 
@@ -1029,6 +1061,54 @@ mod tests {
             stream_data(GenerationEvent::Done, "id", 1, "model", true),
             "[DONE]"
         );
+    }
+
+    #[test]
+    fn structured_completion_event_omits_generated_content() {
+        #[derive(Clone)]
+        struct Capture(Arc<StdMutex<Vec<u8>>>);
+
+        impl Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().write(bytes)
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl<'a> MakeWriter<'a> for Capture {
+            type Writer = Self;
+
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let output = Arc::new(StdMutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_writer(Capture(Arc::clone(&output)))
+            .finish();
+        let completion = Completion {
+            text: "secret prompt completion and tool body".to_owned(),
+            tool_call: None,
+            finish_reason: FinishReason::Stop,
+            usage: Usage {
+                prompt_tokens: 7,
+                cached_tokens: 3,
+                completion_tokens: 2,
+            },
+            token_ids: vec![1, 2],
+        };
+        tracing::subscriber::with_default(subscriber, || {
+            log_completion(7, "/v1/completions", "model", &completion);
+        });
+        let output = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        assert!(output.contains("request.completed"));
+        assert!(output.contains("prompt_tokens"));
+        assert!(!output.contains("secret prompt completion and tool body"));
     }
 
     #[test]
