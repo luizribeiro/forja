@@ -505,6 +505,31 @@ impl PagedSlotBanks {
             .ok_or(PagePoolError::ForeignResource)
     }
 
+    /// Updates host-side logical length without changing the bound page table.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid bank, lane, or inactive slot.
+    pub fn set_logical_len(
+        &self,
+        bank: usize,
+        lane: usize,
+        logical_len: u64,
+    ) -> Result<(), PagePoolError> {
+        let mut lanes = self
+            .banks
+            .get(bank)
+            .ok_or(PagePoolError::ForeignResource)?
+            .lock()
+            .map_err(|_| PagePoolError::CorruptState)?;
+        let slot = lanes.get_mut(lane).ok_or(PagePoolError::ForeignResource)?;
+        if !slot.active {
+            return Err(PagePoolError::ForeignResource);
+        }
+        slot.logical_len = logical_len;
+        Ok(())
+    }
+
     /// Marks one bank unavailable until its submission completion is observed.
     ///
     /// # Errors
@@ -1280,6 +1305,8 @@ mod tests {
         let banks = PagedSlotBanks::new(pool.clone(), 2, 2).unwrap();
         banks.bind(0, 0, &sequence).unwrap();
         assert!(banks.slot(0, 0).unwrap().is_active());
+        banks.set_logical_len(0, 0, 3).unwrap();
+        assert_eq!(banks.slot(0, 0).unwrap().logical_len(), 3);
         let inactive = banks.slot(0, 1).unwrap();
         assert!(!inactive.is_active());
         assert!(inactive.table().resolve(0).is_err());

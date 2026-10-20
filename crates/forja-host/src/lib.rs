@@ -2724,6 +2724,10 @@ impl<B: Backend + 'static> Host<B> {
                     .bind(0, 0, &sequence)
                     .map_err(|error| compute::Error::Quota(error.to_string()))?;
             }
+            binding
+                .banks
+                .set_logical_len(0, 0, sequence.logical_len())
+                .map_err(|error| compute::Error::Quota(error.to_string()))?;
             let table = binding
                 .banks
                 .slot(0, 0)
