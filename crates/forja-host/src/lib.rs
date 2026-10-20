@@ -150,6 +150,8 @@ pub struct CachePlane {
 pub struct EngineLoadConfig {
     /// Whether the guest captures and replays reusable graphs.
     pub replay: bool,
+    /// Whether the host supplies paged cache storage to the guest.
+    pub paged_cache: bool,
     /// Key/value cache storage format selected by the profile.
     pub kv_cache: KvCacheFormat,
     /// Registered tuning names.
@@ -164,6 +166,7 @@ impl Default for EngineLoadConfig {
     fn default() -> Self {
         Self {
             replay: true,
+            paged_cache: false,
             kv_cache: KvCacheFormat::F32,
             tunings: Vec::new(),
             fixed_variant_picks: Vec::new(),
@@ -718,9 +721,13 @@ where
             Some(info) => info.clone(),
             None => self.describe().await?,
         };
-        let pool = match self.bind_page_pool(&info, config.kv_cache) {
-            Ok(pool) => pool,
-            Err(error) => return Ok(Err(error)),
+        let pool = if config.paged_cache {
+            match self.bind_page_pool(&info, config.kv_cache) {
+                Ok(pool) => pool,
+                Err(error) => return Ok(Err(error)),
+            }
+        } else {
+            None
         };
         self.set_guest_deadline();
         let weights = self

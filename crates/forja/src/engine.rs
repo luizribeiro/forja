@@ -230,6 +230,7 @@ fn profile_load_config(
     let selection = overrides.resolve(profile)?;
     Ok(forja_host::EngineLoadConfig {
         replay: overrides.replay,
+        paged_cache: profile.serving().is_some_and(|serving| serving.paged_cache),
         kv_cache: match profile.numerics().kv_cache {
             forja_config::KvCacheFormat::F16 => forja_host::KvCacheFormat::F16,
             forja_config::KvCacheFormat::Bf16 => forja_host::KvCacheFormat::Bf16,
@@ -579,6 +580,7 @@ mod tests {
     #[test]
     fn converts_profiles_to_deterministic_guest_load_config() {
         let config = profile_load_config(&profile(), &Engine::default()).unwrap();
+        assert!(!config.paged_cache);
         assert!(config.tunings.is_empty());
         assert_eq!(
             config.fixed_variant_picks[0].site,

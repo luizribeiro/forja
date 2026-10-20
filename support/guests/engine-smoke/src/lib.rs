@@ -44,10 +44,8 @@ impl Guest for Component {
         pool: Option<&l9o::gpu::paged_storage::PagePool>,
         _config: LoadConfig,
     ) -> Result<(), Error> {
-        let slot = pool
-            .ok_or_else(|| Error::Layout("paged pool is missing".to_owned()))?
-            .open_slot(1)?;
-        PAGED_SLOT.with(|state| *state.borrow_mut() = Some(slot));
+        let slot = pool.map(|pool| pool.open_slot(1)).transpose()?;
+        PAGED_SLOT.with(|state| *state.borrow_mut() = slot);
         Ok(())
     }
 

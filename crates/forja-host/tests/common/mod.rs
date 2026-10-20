@@ -7,6 +7,7 @@ pub fn load_config(component: &Path) -> Result<EngineLoadConfig, Box<dyn Error>>
     let profile = read_profile(&fs::read(component)?)?;
     Ok(EngineLoadConfig {
         replay: true,
+        paged_cache: profile.serving().is_some_and(|serving| serving.paged_cache),
         kv_cache: match profile.numerics().kv_cache {
             forja_config::KvCacheFormat::F16 => forja_host::KvCacheFormat::F16,
             forja_config::KvCacheFormat::Bf16 => forja_host::KvCacheFormat::Bf16,

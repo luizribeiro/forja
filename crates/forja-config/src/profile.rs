@@ -315,12 +315,16 @@ pub struct Workload {
 pub struct Serving {
     /// Maximum prompt tokens scheduled in one iteration.
     pub prompt_token_budget: NonZeroU32,
+    /// Whether this profile selects host-owned paged cache storage.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub paged_cache: bool,
 }
 
 impl Default for Serving {
     fn default() -> Self {
         Self {
             prompt_token_budget: NonZeroU32::MIN,
+            paged_cache: false,
         }
     }
 }

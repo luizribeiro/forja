@@ -64,6 +64,7 @@ fn parses_and_canonicalizes_a_dense_profile() {
     assert_eq!(profile.default_tunings(), ["residual-norm", "qk-norm-rope"]);
     assert_eq!(profile.build().features, ["bf16"]);
     assert_eq!(profile.serving().unwrap().prompt_token_budget.get(), 512);
+    assert!(!profile.serving().unwrap().paged_cache);
     assert!(profile.quantization().is_none());
 
     let canonical = profile.canonical_toml().unwrap();
@@ -105,6 +106,28 @@ fn validates_kv_cache_format_and_includes_it_in_identity() {
         ))
         .contains("unknown variant")
     );
+}
+
+#[test]
+fn paged_cache_is_explicit_without_changing_default_identity() {
+    let default: Profile = toml::from_str(PROFILE).unwrap();
+    let explicit_default: Profile = toml::from_str(&PROFILE.replace(
+        "prompt-token-budget = 512",
+        "prompt-token-budget = 512\npaged-cache = false",
+    ))
+    .unwrap();
+    assert_eq!(
+        default.sha256().unwrap(),
+        explicit_default.sha256().unwrap()
+    );
+
+    let paged: Profile = toml::from_str(&PROFILE.replace(
+        "prompt-token-budget = 512",
+        "prompt-token-budget = 512\npaged-cache = true",
+    ))
+    .unwrap();
+    assert!(paged.serving().unwrap().paged_cache);
+    assert_ne!(default.sha256().unwrap(), paged.sha256().unwrap());
 }
 
 #[test]
