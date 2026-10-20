@@ -49,6 +49,7 @@ minijinja-contrib = { version = "2.12", default-features = false, features = [
   "pycompat",
 ] }
 safetensors = "0.6"
+schemars = "1.2"
 serde = "1.0"
 serde_json = "1.0"
 sha2 = "0.10"

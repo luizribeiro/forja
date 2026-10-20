@@ -6,6 +6,7 @@ mod component;
 mod engine;
 mod files;
 mod host_metadata;
+mod host_schema;
 mod layer;
 mod profile;
 mod serving;
@@ -17,6 +18,7 @@ pub use component::{ProfileSectionError, embed_profile, read_profile};
 pub use engine::{Engine, EngineSelection, TuningBase, TuningOverrides};
 pub use files::{dev_layers, file_layer, user_config_path};
 pub use host_metadata::{HOST_LEAVES, ReloadClass, host_reload_class};
+pub use host_schema::host_schema;
 pub use layer::{ConfigError, KeyPath, Layer, Layered, Origin, Schema, layer};
 pub use profile::{
     ActivationFormat, Build, Chat, ComponentTarget, DeviceFamily, KvCacheFormat, Model, Numerics,
@@ -34,6 +36,7 @@ pub use weights::{sharded_weights_sha256, single_weights_sha256};
 
 use std::{collections::BTreeMap, num::NonZeroU32, path::PathBuf};
 
+use schemars::{JsonSchema, Schema as JsonSchemaValue, SchemaGenerator};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
 /// Configuration used by development commands.
@@ -57,7 +60,7 @@ pub struct DevConfig {
 }
 
 /// Compute backend settings.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Backend {
     /// Backend implementation used by run and verify.
@@ -76,7 +79,7 @@ impl Default for Backend {
 }
 
 /// Compute backend implementation.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum BackendKind {
     /// Metal GPU backend.
@@ -86,7 +89,7 @@ pub enum BackendKind {
 }
 
 /// Metal backend settings.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Metal {
     /// Command graph replay strategy.
@@ -186,8 +189,19 @@ where
     }
 }
 
+impl<T: JsonSchema> JsonSchema for Choice<T> {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        format!("Choice_of_{}", T::schema_name()).into()
+    }
+
+    fn json_schema(generator: &mut SchemaGenerator) -> JsonSchemaValue {
+        let fixed = generator.subschema_for::<T>();
+        schemars::json_schema!({"oneOf": [{"const": "auto"}, fixed]})
+    }
+}
+
 /// Metal command graph replay strategy.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub enum GraphReplay {
     /// Replay command structure while re-encoding resource bindings.
@@ -447,7 +461,7 @@ pub enum Selection {
 }
 
 /// Developer filesystem locations.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Paths {
     /// Root used to resolve model names.
@@ -467,7 +481,7 @@ impl Default for Paths {
 }
 
 /// Resource limits applied by the host to one guest instance.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Limits {
     /// Maximum live device allocation bytes.

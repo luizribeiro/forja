@@ -4,12 +4,13 @@ use std::{
     path::PathBuf,
 };
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{Backend, ByteSize, Choice, Duration, Limits};
 
 /// Configuration used by the serving host.
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct HostConfig {
     /// Listener and connection lifecycle settings.
@@ -86,7 +87,7 @@ impl<'de> Deserialize<'de> for HostConfig {
 }
 
 /// Cross-request serving behavior.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Serving {
     /// Reuse the immediately preceding request's matching live KV prefix.
@@ -127,7 +128,7 @@ impl Default for Serving {
 }
 
 /// Listener and connection lifecycle settings.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Server {
     /// Listener address.
@@ -161,7 +162,7 @@ impl Default for Server {
 }
 
 /// A nonzero byte quantity used for explicitly sized pools.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(transparent)]
 pub struct PositiveByteSize(ByteSize);
 
@@ -187,7 +188,7 @@ impl<'de> Deserialize<'de> for PositiveByteSize {
 }
 
 /// Files that define the loaded model.
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ServedModel {
     /// Engine component path.
@@ -201,7 +202,7 @@ pub struct ServedModel {
 }
 
 /// Per-request admission ceilings.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RequestCeiling {
     /// Maximum request body size.
@@ -265,7 +266,7 @@ impl Default for RequestCeiling {
 }
 
 /// CPU worker-pool configuration.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Pools {
     /// Number of grammar compilation workers.
@@ -284,7 +285,7 @@ impl Default for Pools {
 }
 
 /// Structured log output configuration.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Logging {
     /// Log filter level.
@@ -307,7 +308,7 @@ impl Default for Logging {
 }
 
 /// Structured log output encoding.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum LogFormat {
     /// One JSON object per event.
@@ -317,7 +318,7 @@ pub enum LogFormat {
 }
 
 /// Metrics and health endpoint configuration.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Metrics {
     /// Listener address, or absent to disable operational endpoints.

@@ -1,5 +1,6 @@
 use std::{fmt, marker::PhantomData, num::IntErrorKind, time};
 
+use schemars::{JsonSchema, Schema, SchemaGenerator};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de, de::IntoDeserializer};
 
 /// A byte count serialized as an integer or an IEC quantity such as `8GiB`.
@@ -35,6 +36,21 @@ impl<'de> Deserialize<'de> for ByteSize {
         D: Deserializer<'de>,
     {
         deserializer.deserialize_any(ByteSizeVisitor)
+    }
+}
+
+impl JsonSchema for ByteSize {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "ByteSize".into()
+    }
+
+    fn json_schema(_: &mut SchemaGenerator) -> Schema {
+        schemars::json_schema!({
+            "oneOf": [
+                {"type": "integer", "minimum": 0},
+                {"type": "string", "pattern": "^[0-9]+(B|KiB|MiB|GiB|TiB)$"}
+            ]
+        })
     }
 }
 
@@ -124,6 +140,16 @@ impl<'de> Deserialize<'de> for Duration {
     }
 }
 
+impl JsonSchema for Duration {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "Duration".into()
+    }
+
+    fn json_schema(_: &mut SchemaGenerator) -> Schema {
+        schemars::json_schema!({"type": "string", "pattern": "^[0-9]+(ms|s|m|h)$"})
+    }
+}
+
 const DURATION_UNITS: &[(&str, u64)] = &[("ms", 1), ("s", 1_000), ("m", 60_000), ("h", 3_600_000)];
 
 fn parse_quantity(value: &str, units: &[(&str, u64)]) -> Result<u64, String> {
@@ -183,6 +209,17 @@ where
         D: Deserializer<'de>,
     {
         deserializer.deserialize_any(UnboundedVisitor(PhantomData))
+    }
+}
+
+impl<T: JsonSchema> JsonSchema for Unbounded<T> {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        format!("Unbounded_of_{}", T::schema_name()).into()
+    }
+
+    fn json_schema(generator: &mut SchemaGenerator) -> Schema {
+        let limited = generator.subschema_for::<T>();
+        schemars::json_schema!({"oneOf": [{"const": "unlimited"}, limited]})
     }
 }
 
