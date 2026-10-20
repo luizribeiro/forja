@@ -1,5 +1,6 @@
 """Tests for the serving benchmark client."""
 
+import argparse
 import tempfile
 import json
 import threading
@@ -8,6 +9,7 @@ from pathlib import Path
 
 import http_client
 import provenance
+import serving_bench
 import suite
 
 
@@ -111,3 +113,13 @@ def test_provenance_extracts_gpu_name_and_core_count() -> None:
         "device": "Apple Test GPU",
         "gpu_core_count": 80,
     }
+
+
+def test_runner_refuses_incomplete_implementation_identity() -> None:
+    args = argparse.Namespace(implementation="forja", resolved_config=None, weights=[])
+    try:
+        serving_bench.validate_identity(args, {"tokenizer": Path("tokenizer.json")})
+    except ValueError as error:
+        assert "resolved-config" in str(error)
+    else:
+        raise AssertionError("incomplete Forja identity was accepted")
