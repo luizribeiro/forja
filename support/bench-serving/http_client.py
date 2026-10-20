@@ -1,0 +1,183 @@
+"""Dependency-free OpenAI serving benchmark transport."""
+
+import http.client
+import json
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from urllib.parse import urlsplit
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from bench_stats import stats  # noqa: E402
+
+
+def prompt(tokens: int, prefix_tokens: int = 0) -> str:
+    """Build deterministic text shared byte-for-byte by both servers."""
+    return "".join([" prefix"] * prefix_tokens + [" token"] * tokens).lstrip()
+
+
+class OpenAIClient:
+    """One thread-local persistent HTTP/1.1 connection pool."""
+
+    def __init__(self, base_url: str, model: str, timeout: float = 300.0):
+        parsed = urlsplit(base_url)
+        if parsed.scheme != "http" or not parsed.hostname:
+            raise ValueError("server URL must use http")
+        self.host = parsed.hostname
+        self.port = parsed.port or 80
+        self.base_path = parsed.path.rstrip("/")
+        self.model = model
+        self.timeout = timeout
+        self.local = threading.local()
+
+    def connection(self) -> http.client.HTTPConnection:
+        """Return this worker thread's reusable connection."""
+        connection = getattr(self.local, "connection", None)
+        if connection is None:
+            connection = http.client.HTTPConnection(self.host, self.port, timeout=self.timeout)
+            self.local.connection = connection
+        return connection
+
+    def request(self, case: dict[str, object]) -> dict[str, object]:
+        """Execute one concrete completion and retain only timings and counts."""
+        body = request_body(case, self.model)
+        route = "/v1/chat/completions" if case["route"] == "chat" else "/v1/completions"
+        started = time.perf_counter()
+        try:
+            connection = self.connection()
+            connection.request(
+                "POST",
+                self.base_path + route,
+                json.dumps(body, separators=(",", ":")),
+                {"Content-Type": "application/json"},
+            )
+            response = connection.getresponse()
+            if response.status != 200:
+                message = response.read(4096).decode(errors="replace")
+                return failed(started, f"HTTP {response.status}: {message}")
+            if case.get("stream"):
+                return self.read_stream(response, case, started)
+            payload = json.loads(response.read())
+            ended = time.perf_counter()
+            usage = payload.get("usage", {})
+            return sample(
+                started,
+                ended,
+                ended,
+                [],
+                usage.get("prompt_tokens", 0),
+                usage.get("completion_tokens", 0),
+                usage.get("prompt_tokens_details", {}).get("cached_tokens", 0),
+                False,
+            )
+        except (OSError, ValueError, json.JSONDecodeError, http.client.HTTPException) as error:
+            self.local.connection = None
+            return failed(started, str(error))
+
+    def read_stream(
+        self,
+        response: http.client.HTTPResponse,
+        case: dict[str, object],
+        started: float,
+    ) -> dict[str, object]:
+        """Read SSE while measuring first-byte and inter-event latency."""
+        arrivals = []
+        usage = {}
+        cancelled = False
+        limit = case.get("cancel_after_tokens", 0)
+        while line := response.readline():
+            if not line.startswith(b"data: "):
+                continue
+            data = line[6:].strip()
+            if data == b"[DONE]":
+                break
+            payload = json.loads(data)
+            if payload.get("usage"):
+                usage = payload["usage"]
+            choices = payload.get("choices", [])
+            if choices and has_content(choices[0]):
+                arrivals.append(time.perf_counter())
+                if limit and len(arrivals) >= limit:
+                    response.close()
+                    self.local.connection = None
+                    cancelled = True
+                    break
+        ended = time.perf_counter()
+        if not cancelled:
+            response.read()
+            response.close()
+        first = arrivals[0] if arrivals else ended
+        itl = [right - left for left, right in zip(arrivals, arrivals[1:])]
+        return sample(
+            started,
+            first,
+            ended,
+            itl,
+            usage.get("prompt_tokens", 0),
+            usage.get("completion_tokens", len(arrivals)),
+            usage.get("prompt_tokens_details", {}).get("cached_tokens", 0),
+            cancelled,
+        )
+
+
+def request_body(case: dict[str, object], model: str) -> dict[str, object]:
+    """Build one identical OpenAI request for either implementation."""
+    text = prompt(case["prompt_tokens"], case.get("warm_prefix_tokens", 0))
+    body = {"model": model, "max_tokens": case["output_tokens"], "stream": case.get("stream", False)}
+    if case["route"] == "chat":
+        body["messages"] = [{"role": "user", "content": text}]
+    else:
+        body["prompt"] = text
+    if case["sampling"] == "greedy":
+        body.update({"temperature": 0.0, "top_k": 0, "top_p": 1.0, "seed": 0})
+    if case.get("stream"):
+        body["stream_options"] = {"include_usage": True}
+    if case.get("tools"):
+        body["tools"] = [{"type": "function", "function": {"name": "lookup", "description": "Lookup a value", "parameters": {"type": "object", "properties": {"key": {"type": "string"}}, "required": ["key"]}}}]
+        body["tool_choice"] = "auto"
+    return body
+
+
+def run_case(client: OpenAIClient, case: dict[str, object], warmups: int, repetitions: int) -> dict[str, object]:
+    """Run one expanded case with its requested concurrency."""
+    for _ in range(warmups):
+        client.request(case)
+    count = repetitions * case["concurrency"]
+    started = time.perf_counter()
+    with ThreadPoolExecutor(max_workers=case["concurrency"]) as executor:
+        samples = list(executor.map(lambda _: client.request(case), range(count)))
+    elapsed = time.perf_counter() - started
+    good = [value for value in samples if value["error"] is None]
+    itl = [value for item in good for value in item["itl_seconds"]]
+    return {
+        "case": case,
+        "requests": count,
+        "requests_per_second": count / elapsed,
+        "ttft_seconds": stats([value["ttft_seconds"] for value in good]) if good else None,
+        "itl_seconds": stats(itl) if itl else None,
+        "e2e_seconds": stats([value["e2e_seconds"] for value in good]) if good else None,
+        "prompt_tokens_per_second": sum(value["prompt_tokens"] for value in good) / elapsed,
+        "output_tokens_per_second": sum(value["output_tokens"] for value in good) / elapsed,
+        "cached_tokens": sum(value["cached_tokens"] for value in good),
+        "errors": [value["error"] for value in samples if value["error"] is not None],
+        "cancellations": sum(value["cancelled"] for value in samples),
+    }
+
+
+def has_content(choice: dict[str, object]) -> bool:
+    """Return whether one stream chunk carries generated content."""
+    return bool(choice.get("text") or choice.get("delta", {}).get("content") or choice.get("delta", {}).get("tool_calls"))
+
+
+def sample(started, first, ended, itl, prompt_tokens, output_tokens, cached_tokens, cancelled):
+    """Construct one bounded timing sample."""
+    return {"ttft_seconds": first - started, "itl_seconds": itl, "e2e_seconds": ended - started, "prompt_tokens": prompt_tokens, "output_tokens": output_tokens, "cached_tokens": cached_tokens, "cancelled": cancelled, "error": None}
+
+
+def failed(started: float, error: str) -> dict[str, object]:
+    """Construct a failed sample without response content."""
+    ended = time.perf_counter()
+    return {"ttft_seconds": ended - started, "itl_seconds": [], "e2e_seconds": ended - started, "prompt_tokens": 0, "output_tokens": 0, "cached_tokens": 0, "cancelled": False, "error": error}
