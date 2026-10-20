@@ -293,11 +293,15 @@ fn run_sdpa<B: Backend + 'static>(
     contiguous: bool,
     query_heads: u32,
     kv_heads: u32,
+    corrupt_generation: bool,
     variant: Option<&str>,
 ) -> Result<Vec<f32>, BackendError> {
     const PAGE_TOKENS: u32 = 64;
     const WIDTH: u32 = 128;
 
+    let q_start = key_length
+        .checked_sub(query_length)
+        .ok_or(BackendError::InvalidInput)?;
     let logical_pages = key_length.div_ceil(PAGE_TOKENS);
     let physical_pages = logical_pages + 1;
     let entries = (0..logical_pages)
@@ -310,9 +314,12 @@ fn run_sdpa<B: Backend + 'static>(
             (page, 11 + page)
         })
         .collect::<Vec<_>>();
-    let generations = (0..physical_pages)
+    let mut generations = (0..physical_pages)
         .map(|page| 11 + page)
         .collect::<Vec<_>>();
+    if corrupt_generation {
+        generations[usize::try_from(entries[0].0).unwrap()] = 0;
+    }
     let plane_elements = usize::try_from(kv_heads * WIDTH).unwrap();
     let pool_tokens = usize::try_from(physical_pages * PAGE_TOKENS).unwrap();
     let mut keys = vec![0.0_f32; pool_tokens * plane_elements];
@@ -350,7 +357,7 @@ fn run_sdpa<B: Backend + 'static>(
             Op::PagedSdpa {
                 scale: 1.0 / (WIDTH as f32).sqrt(),
                 causal,
-                q_start: 0,
+                q_start,
                 key_length,
                 page_tokens: PAGE_TOKENS,
                 contiguous_entries: contiguous,
@@ -377,9 +384,41 @@ fn metal_paged_sdpa_matches_cpu_at_real_shapes() {
     let cpu = forja_cpu::CpuBackend::new();
     let metal = forja_metal::MetalBackend::new().unwrap();
     for dtype in [DType::F32, DType::F16, DType::BF16] {
-        for length in [1, 7, 33, 4_097] {
-            let reference = run_sdpa(&cpu, dtype, length, 1, false, false, 16, 8, None).unwrap();
-            let candidate = run_sdpa(&metal, dtype, length, 1, false, false, 16, 8, None).unwrap();
+        for (length, query_length) in [(1, 1), (7, 2), (33, 7), (4_097, 7), (16_384, 2)] {
+            if dtype == DType::F32 && length == 16_384 {
+                continue;
+            }
+            let reference = run_sdpa(
+                &cpu,
+                dtype,
+                length,
+                query_length,
+                true,
+                false,
+                16,
+                8,
+                false,
+                None,
+            )
+            .unwrap();
+            let variant = match (dtype, query_length) {
+                (_, 1) => "paged-sdpa.vector",
+                (DType::F32, _) => "paged-sdpa.steel",
+                _ => "paged-sdpa.steel-half",
+            };
+            let candidate = run_sdpa(
+                &metal,
+                dtype,
+                length,
+                query_length,
+                true,
+                false,
+                16,
+                8,
+                false,
+                Some(variant),
+            )
+            .unwrap();
             let error = forja_testing::normwise_relative_error(&reference, &candidate);
             assert!(
                 error <= forja_testing::dtype_tolerance(dtype).unwrap(),
@@ -395,8 +434,19 @@ fn metal_paged_gqa_two_pass_matches_cpu() {
     let metal = forja_metal::MetalBackend::new().unwrap();
     for length in [512, 4_000] {
         for contiguous in [false, true] {
-            let reference =
-                run_sdpa(&cpu, DType::F16, length, 1, false, contiguous, 32, 4, None).unwrap();
+            let reference = run_sdpa(
+                &cpu,
+                DType::F16,
+                length,
+                1,
+                false,
+                contiguous,
+                32,
+                4,
+                false,
+                None,
+            )
+            .unwrap();
             let candidate = run_sdpa(
                 &metal,
                 DType::F16,
@@ -406,6 +456,7 @@ fn metal_paged_gqa_two_pass_matches_cpu() {
                 contiguous,
                 32,
                 4,
+                false,
                 None,
             )
             .unwrap();
@@ -422,8 +473,8 @@ fn metal_paged_gqa_two_pass_matches_cpu() {
 fn metal_paged_sdpa_uses_contiguous_entry_path() {
     let cpu = forja_cpu::CpuBackend::new();
     let metal = forja_metal::MetalBackend::new().unwrap();
-    let reference = run_sdpa(&cpu, DType::F16, 129, 1, false, true, 16, 8, None).unwrap();
-    let candidate = run_sdpa(&metal, DType::F16, 129, 1, false, true, 16, 8, None).unwrap();
+    let reference = run_sdpa(&cpu, DType::F16, 129, 1, false, true, 16, 8, false, None).unwrap();
+    let candidate = run_sdpa(&metal, DType::F16, 129, 1, false, true, 16, 8, false, None).unwrap();
     assert!(
         forja_testing::normwise_relative_error(&reference, &candidate)
             <= forja_testing::F16_TOLERANCE
@@ -434,7 +485,7 @@ fn metal_paged_sdpa_uses_contiguous_entry_path() {
 fn metal_paged_sdpa_matches_causal_prefill() {
     let cpu = forja_cpu::CpuBackend::new();
     let metal = forja_metal::MetalBackend::new().unwrap();
-    let reference = run_sdpa(&cpu, DType::F16, 11, 11, true, true, 32, 4, None).unwrap();
+    let reference = run_sdpa(&cpu, DType::F16, 11, 11, true, true, 32, 4, false, None).unwrap();
     let candidate = run_sdpa(
         &metal,
         DType::F16,
@@ -444,6 +495,7 @@ fn metal_paged_sdpa_matches_causal_prefill() {
         true,
         32,
         4,
+        false,
         Some("paged-sdpa.steel-half"),
     )
     .unwrap();
@@ -451,6 +503,24 @@ fn metal_paged_sdpa_matches_causal_prefill() {
         forja_testing::normwise_relative_error(&reference, &candidate)
             <= forja_testing::F16_TOLERANCE
     );
+}
+
+#[test]
+fn metal_paged_steel_refuses_corrupt_entries() {
+    let error = run_sdpa(
+        &forja_metal::MetalBackend::new().unwrap(),
+        DType::F16,
+        129,
+        7,
+        true,
+        true,
+        16,
+        8,
+        true,
+        Some("paged-sdpa.steel-half"),
+    )
+    .unwrap_err();
+    assert!(matches!(error, BackendError::DeviceErrorFlag { .. }));
 }
 
 #[test]
@@ -541,7 +611,9 @@ fn benchmark_commands(
     const WIDTH: u32 = 128;
 
     let pages = key_length.div_ceil(PAGE_TOKENS);
-    let query = backend.alloc(DType::F32, &[QUERY_HEADS, 1, WIDTH]).unwrap();
+    let query = backend
+        .alloc(DType::F32, &[QUERY_HEADS, key_length, WIDTH])
+        .unwrap();
     let contiguous_key = backend
         .alloc(DType::F16, &[KV_HEADS, key_length, WIDTH])
         .unwrap();
@@ -556,9 +628,13 @@ fn benchmark_commands(
         .unwrap();
     let table = backend.alloc(DType::U32, &[pages, 2]).unwrap();
     let generations = backend.alloc(DType::U32, &[pages]).unwrap();
-    let contiguous_output = backend.alloc(DType::F32, &[QUERY_HEADS, 1, WIDTH]).unwrap();
-    let paged_output = backend.alloc(DType::F32, &[QUERY_HEADS, 1, WIDTH]).unwrap();
-    let query_values = (0..QUERY_HEADS * WIDTH)
+    let contiguous_output = backend
+        .alloc(DType::F32, &[QUERY_HEADS, key_length, WIDTH])
+        .unwrap();
+    let paged_output = backend
+        .alloc(DType::F32, &[QUERY_HEADS, key_length, WIDTH])
+        .unwrap();
+    let query_values = (0..QUERY_HEADS * key_length * WIDTH)
         .map(|index| ((index * 17) % 89) as f32 / 88.0 - 0.5)
         .collect::<Vec<_>>();
     let contiguous_values = (0..KV_HEADS * key_length * WIDTH)
@@ -604,7 +680,7 @@ fn benchmark_commands(
     let scale = 1.0 / (WIDTH as f32).sqrt();
     let contiguous_op = Op::Sdpa {
         scale,
-        causal: false,
+        causal: true,
         q_start: 0,
     };
     let contiguous_variant = backend
@@ -612,7 +688,23 @@ fn benchmark_commands(
             contiguous_op,
             &[&query, &contiguous_key, &contiguous_value],
             &[&contiguous_output],
-            "sdpa.vector-gqa-two-pass",
+            "sdpa.steel-half",
+        )
+        .unwrap();
+    let paged_op = Op::PagedSdpa {
+        scale,
+        causal: true,
+        q_start: 0,
+        key_length,
+        page_tokens: PAGE_TOKENS,
+        contiguous_entries: true,
+    };
+    let paged_variant = backend
+        .validate_variant_for_op(
+            paged_op,
+            &[&query, &paged_key, &paged_value, &table, &generations],
+            &[&paged_output],
+            "paged-sdpa.steel-half",
         )
         .unwrap();
     let paged_query = query.clone();
@@ -632,18 +724,12 @@ fn benchmark_commands(
         let mut commands = CommandList::new();
         commands
             .dispatch(
-                Op::PagedSdpa {
-                    scale,
-                    causal: false,
-                    q_start: 0,
-                    key_length,
-                    page_tokens: PAGE_TOKENS,
-                    contiguous_entries: true,
-                },
+                paged_op,
                 &[&paged_query, &paged_key, &paged_value, &table, &generations],
                 &paged_output,
             )
             .unwrap();
+        assert!(commands.set_last_backend_data(BackendDispatchData::new(paged_variant)));
         commands
     };
     (contiguous, paged_commands)
@@ -653,18 +739,16 @@ fn benchmark_commands(
 #[ignore = "manual paged-attention kernel checkpoint"]
 fn metal_paged_sdpa_microbenchmark() {
     let backend = forja_metal::MetalBackend::new().unwrap();
-    for length in [512, 4_000] {
+    for length in [512, 4_096] {
         let (contiguous, paged) = benchmark_commands(&backend, length);
         let (contiguous_time, paged_time) =
             super::common::comparative_gpu_times(&backend, contiguous, paged);
         eprintln!(
-            "paged-sdpa keys={length} gqa_two_pass_us={} paged_us={} ratio={:.4}",
+            "paged-sdpa queries={length} steel_half_us={} paged_steel_half_us={} ratio={:.4}",
             contiguous_time.as_secs_f64() * 1.0e6,
             paged_time.as_secs_f64() * 1.0e6,
             paged_time.as_secs_f64() / contiguous_time.as_secs_f64(),
         );
-        assert!(
-            paged_time.as_secs_f64() / contiguous_time.as_secs_f64() <= super::common::D5_RATIO
-        );
+        assert!(paged_time.as_secs_f64() / contiguous_time.as_secs_f64() <= 1.04);
     }
 }
