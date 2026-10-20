@@ -31,7 +31,7 @@
       let
         overlays = [ (import rust-overlay) ];
         pkgs = import nixpkgs { inherit system overlays; };
-        toolchain = pkgs.rust-bin.stable.latest.minimal.override {
+        toolchain = pkgs.rust-bin.stable."1.99.1".minimal.override {
           extensions = [
             "clippy"
             "rust-analyzer"
