@@ -21,7 +21,19 @@ def stats(values: list[float]) -> dict[str, object]:
             break
         cumulative += probability
         rank = index + 1
-    return {"median": median, "ci95": [values[rank], values[-rank - 1]]}
+    return {
+        "median": median,
+        "p50": median,
+        "p90": percentile(values, 90),
+        "p99": percentile(values, 99),
+        "ci95": [values[rank], values[-rank - 1]],
+    }
+
+
+def percentile(values: list[float], percent: int) -> float:
+    """Return one nearest-rank percentile from sorted nonempty values."""
+    rank = max(1, (len(values) * percent + 99) // 100)
+    return values[rank - 1]
 
 
 def summary(tokens: int, times: list[float]) -> dict[str, object]:

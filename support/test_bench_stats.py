@@ -4,7 +4,10 @@ from bench_stats import stats, summary
 
 
 def test_order_statistics_and_throughput_summary() -> None:
-    assert stats([4.0, 1.0, 3.0, 2.0])["median"] == 2.5
+    distribution = stats([4.0, 1.0, 3.0, 2.0])
+    assert distribution["median"] == 2.5
+    assert distribution["p90"] == 4.0
+    assert distribution["p99"] == 4.0
     result = summary(8, [2.0, 1.0])
     assert result["tokens_per_second"]["median"] == 6.0
     assert result["latency_seconds"]["median"] == 1.5
