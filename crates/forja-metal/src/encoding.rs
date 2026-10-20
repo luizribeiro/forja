@@ -7309,11 +7309,7 @@ pub(super) fn dispatch_kernel(dispatch: &Dispatch) -> Result<&'static str, Backe
                 .and_then(|query| query.layout().shape().get(2))
                 .copied()
                 .ok_or(BackendError::InvalidInput)?;
-            match width {
-                64 => "paged_sdpa_64",
-                128 => "paged_sdpa_128",
-                _ => return Err(BackendError::UnsupportedOperation),
-            }
+            paged_sdpa_kernel(dispatch, width)?
         }
     })
 }
@@ -7381,6 +7377,18 @@ fn sdpa_kernel(dispatch: &Dispatch) -> Result<&'static str, BackendError> {
         }
         SdpaKernel::Decomposed => "sdpa_decomposed",
     })
+}
+
+fn paged_sdpa_kernel(dispatch: &Dispatch, width: u32) -> Result<&'static str, BackendError> {
+    match (selected_variant(dispatch), width) {
+        (Some(MetalVariant::PagedSdpaSteel), 64) => Ok("paged_steel_attention_64"),
+        (Some(MetalVariant::PagedSdpaSteel), 128) => Ok("paged_steel_attention_128"),
+        (Some(MetalVariant::PagedSdpaSteelHalf), 64) => Ok("paged_steel_attention_half_64_64x32"),
+        (Some(MetalVariant::PagedSdpaSteelHalf), 128) => Ok("paged_steel_attention_half_128_96x16"),
+        (_, 64) => Ok("paged_sdpa_64"),
+        (_, 128) => Ok("paged_sdpa_128"),
+        _ => Err(BackendError::UnsupportedOperation),
+    }
 }
 
 fn reusable_dispatch(dispatch: &Dispatch) -> bool {
@@ -7587,6 +7595,34 @@ fn half_steel_sdpa_supported(dispatch: &Dispatch) -> Result<bool, BackendError> 
 }
 
 #[cfg(test)]
+fn paged_steel_sdpa_supported(dispatch: &Dispatch) -> Result<bool, BackendError> {
+    let [query, key, value, _, _] = dispatch.inputs() else {
+        return Err(BackendError::InvalidInput);
+    };
+    let [_, query_length, width] = shape3(query.layout())?;
+    let value_width = value
+        .layout()
+        .shape()
+        .get(3)
+        .copied()
+        .ok_or(BackendError::InvalidInput)?;
+    Ok(query_length > 1
+        && width == value_width
+        && matches!(width, 64 | 128)
+        && key.layout().shape().get(3) == Some(&width))
+}
+
+#[cfg(test)]
+fn paged_half_steel_sdpa_supported(dispatch: &Dispatch) -> Result<bool, BackendError> {
+    let [_, key, value, _, _] = dispatch.inputs() else {
+        return Err(BackendError::InvalidInput);
+    };
+    Ok(paged_steel_sdpa_supported(dispatch)?
+        && matches!(key.layout().dtype(), DType::F16 | DType::BF16)
+        && value.layout().dtype() == key.layout().dtype())
+}
+
+#[cfg(test)]
 pub(super) fn variant_supported(
     dispatch: &Dispatch,
     variant: MetalVariant,
@@ -7638,6 +7674,8 @@ pub(super) fn variant_supported(
         MetalVariant::SdpaSteel => steel_sdpa_supported(dispatch)?,
         MetalVariant::SdpaSteelHalf => half_steel_sdpa_supported(dispatch)?,
         MetalVariant::PagedSdpaVector => matches!(dispatch.op(), Op::PagedSdpa { .. }),
+        MetalVariant::PagedSdpaSteel => paged_steel_sdpa_supported(dispatch)?,
+        MetalVariant::PagedSdpaSteelHalf => paged_half_steel_sdpa_supported(dispatch)?,
         MetalVariant::TopKSingleK8 => dispatch_kernel(dispatch)? == "topk_single",
         MetalVariant::SamplePortable => dispatch_kernel(dispatch)? == "sample_rejection",
         MetalVariant::SampleParallel => dispatch_kernel(dispatch)? == "sample_parallel",

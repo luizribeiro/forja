@@ -47,6 +47,8 @@ pub(crate) enum MetalVariant {
     SdpaSteel,
     SdpaSteelHalf,
     PagedSdpaVector,
+    PagedSdpaSteel,
+    PagedSdpaSteelHalf,
     TopKPortable,
     TopKSingleK8,
     TopKPartials,
@@ -252,6 +254,7 @@ const KEY_LENGTH: Dimension = dim("key length", KEY, Axis::Index(1));
 const KEY_WIDTH: Dimension = dim("key width", KEY, Axis::Index(2));
 const VALUE_WIDTH: Dimension = dim("value width", VALUE, Axis::Index(2));
 const PAGED_KEY_WIDTH: Dimension = dim("key width", KEY, Axis::Index(3));
+const PAGED_VALUE_WIDTH: Dimension = dim("value width", VALUE, Axis::Index(3));
 const TOP_K_WIDTH: Dimension = dim("width", INPUT, Axis::FromEnd(1));
 
 const fn dim(name: &'static str, tensor: TensorRef, axis: Axis) -> Dimension {
@@ -555,6 +558,33 @@ const TOP_K_PARTIALS: &[Constraint] = &[operation(
     Relation::Range { min: 1, max: 64 },
 )];
 const PAGED_SDPA: &[Constraint] = &[value(PAGED_KEY_WIDTH, Relation::OneOf(WIDTHS))];
+const PAGED_SDPA_STEEL: &[Constraint] = &[
+    value(
+        QUERY_LENGTH,
+        Relation::Range {
+            min: 2,
+            max: u64::MAX,
+        },
+    ),
+    value(PAGED_KEY_WIDTH, Relation::OneOf(WIDTHS)),
+    Constraint::DimensionsEqual {
+        left: PAGED_KEY_WIDTH,
+        right: PAGED_VALUE_WIDTH,
+    },
+];
+const PAGED_SDPA_STEEL_HALF: &[Constraint] = &[
+    PAGED_SDPA_STEEL[0],
+    PAGED_SDPA_STEEL[1],
+    PAGED_SDPA_STEEL[2],
+    Constraint::DType {
+        tensor: KEY,
+        allowed: REDUCED_DTYPES,
+    },
+    Constraint::DType {
+        tensor: VALUE,
+        allowed: REDUCED_DTYPES,
+    },
+];
 
 macro_rules! variant {
     (@batch_invariant $batch_invariant:expr;
@@ -762,6 +792,24 @@ pub(crate) static REGISTRY: &[VariantDef<MetalVariant>] = &[
         &[
             "Uses one authenticated table entry per logical page and a direct-address path for consecutive entries."
         ]
+    ),
+    batch_invariant_variant!(
+        "paged-sdpa.steel",
+        PagedSdpa,
+        PagedSdpaSteel,
+        PAGED_SDPA_STEEL,
+        &["multi-token paged queries with supported head widths."],
+        &["single-token decode."],
+        &["Uses tiled matrix operations with authenticated page loads."]
+    ),
+    batch_invariant_variant!(
+        "paged-sdpa.steel-half",
+        PagedSdpa,
+        PagedSdpaSteelHalf,
+        PAGED_SDPA_STEEL_HALF,
+        &["reduced-precision paged-cache prefill."],
+        &["f32 caches or single-token decode."],
+        &["Converts paged MMA inputs to half and accumulates in f32."]
     ),
     batch_invariant_variant!(
         "sdpa.portable",
@@ -1462,6 +1510,8 @@ mod tests {
                 "gather-quant-matmul.grouped",
                 "gather-quant-matmul.weighted-broad",
                 "paged-sdpa.vector",
+                "paged-sdpa.steel",
+                "paged-sdpa.steel-half",
                 "sdpa.portable",
                 "sdpa.decomposed",
                 "sdpa.vector-single-pass",
@@ -1747,14 +1797,18 @@ mod tests {
         commands.into_dispatches().remove(0)
     }
 
-    fn paged_sdpa_dispatch(width: u32) -> Dispatch {
+    fn paged_sdpa_dispatch(dtype: DType, query_length: u32, width: u32) -> Dispatch {
         let backend = CpuBackend::new();
-        let query = backend.alloc(DType::F32, &[16, 1, width]).unwrap();
-        let key = backend.alloc(DType::F16, &[2, 4, 8, width]).unwrap();
-        let value = backend.alloc(DType::F16, &[2, 4, 8, width]).unwrap();
+        let query = backend
+            .alloc(DType::F32, &[16, query_length, width])
+            .unwrap();
+        let key = backend.alloc(dtype, &[2, 4, 8, width]).unwrap();
+        let value = backend.alloc(dtype, &[2, 4, 8, width]).unwrap();
         let table = backend.alloc(DType::U32, &[2, 2]).unwrap();
         let generations = backend.alloc(DType::U32, &[2]).unwrap();
-        let output = backend.alloc(DType::F32, &[16, 1, width]).unwrap();
+        let output = backend
+            .alloc(DType::F32, &[16, query_length, width])
+            .unwrap();
         let mut commands = CommandList::new();
         commands
             .dispatch(
@@ -1878,6 +1932,23 @@ mod tests {
             Err(VariantError::Constraint { .. })
         ));
         assert!(resolve(&f32, "sdpa.steel", METAL4).is_ok());
+    }
+
+    #[test]
+    fn paged_steel_attention_matches_contiguous_constraints() {
+        let reduced = paged_sdpa_dispatch(DType::F16, 7, 128);
+        let decode = paged_sdpa_dispatch(DType::F16, 1, 128);
+        let f32 = paged_sdpa_dispatch(DType::F32, 7, 128);
+        assert!(resolve(&reduced, "paged-sdpa.steel-half", METAL4).is_ok());
+        assert!(matches!(
+            resolve(&decode, "paged-sdpa.steel-half", METAL4),
+            Err(VariantError::Constraint { .. })
+        ));
+        assert!(matches!(
+            resolve(&f32, "paged-sdpa.steel-half", METAL4),
+            Err(VariantError::Constraint { .. })
+        ));
+        assert!(resolve(&f32, "paged-sdpa.steel", METAL4).is_ok());
     }
 
     #[test]
@@ -2171,8 +2242,18 @@ mod tests {
             ),
             (
                 "paged-sdpa.vector",
-                paged_sdpa_dispatch(128),
+                paged_sdpa_dispatch(DType::F16, 1, 128),
                 "paged_sdpa_128",
+            ),
+            (
+                "paged-sdpa.steel",
+                paged_sdpa_dispatch(DType::F32, 2, 64),
+                "paged_steel_attention_64",
+            ),
+            (
+                "paged-sdpa.steel-half",
+                paged_sdpa_dispatch(DType::F16, 2, 128),
+                "paged_steel_attention_half_128_96x16",
             ),
             (
                 "top-k.portable",
