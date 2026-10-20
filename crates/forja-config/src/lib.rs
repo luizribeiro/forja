@@ -23,7 +23,8 @@ pub use profile::{
     WorkloadKind,
 };
 pub use serving::{
-    HostConfig, LogFormat, Logging, Metrics, Pools, RequestCeiling, ServedModel, Server, Serving,
+    HostConfig, LogFormat, Logging, Metrics, Pools, PositiveByteSize, RequestCeiling, ServedModel,
+    Server, Serving,
 };
 pub use set::set_layer;
 pub use units::{ByteSize, Duration, Unbounded};

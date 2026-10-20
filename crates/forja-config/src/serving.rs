@@ -1,11 +1,15 @@
-use std::{net::SocketAddr, num::NonZeroU32, path::PathBuf};
+use std::{
+    net::SocketAddr,
+    num::{NonZeroU32, NonZeroU64},
+    path::PathBuf,
+};
 
 use serde::{Deserialize, Serialize};
 
 use crate::{Backend, ByteSize, Choice, Duration, Limits};
 
 /// Configuration used by the serving host.
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct HostConfig {
     /// Listener and connection lifecycle settings.
@@ -28,6 +32,59 @@ pub struct HostConfig {
     pub metrics: Metrics,
 }
 
+#[derive(Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct HostConfigInput {
+    server: Server,
+    model: ServedModel,
+    serving: Serving,
+    backend: Backend,
+    limits: Limits,
+    request: RequestCeiling,
+    pools: Pools,
+    logging: Logging,
+    metrics: Metrics,
+}
+
+impl Default for HostConfigInput {
+    fn default() -> Self {
+        let value = HostConfig::default();
+        Self {
+            server: value.server,
+            model: value.model,
+            serving: value.serving,
+            backend: value.backend,
+            limits: value.limits,
+            request: value.request,
+            pools: value.pools,
+            logging: value.logging,
+            metrics: value.metrics,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for HostConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = HostConfigInput::deserialize(deserializer)?;
+        let config = Self {
+            server: value.server,
+            model: value.model,
+            serving: value.serving,
+            backend: value.backend,
+            limits: value.limits,
+            request: value.request,
+            pools: value.pools,
+            logging: value.logging,
+            metrics: value.metrics,
+        };
+        config.validate().map_err(serde::de::Error::custom)?;
+        Ok(config)
+    }
+}
+
 /// Cross-request serving behavior.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
@@ -35,11 +92,37 @@ pub struct Serving {
     /// Reuse the immediately preceding request's matching live KV prefix.
     #[serde(rename = "prefix-reuse")]
     pub prefix_reuse: bool,
+    /// Maximum simultaneously active sequences.
+    pub max_active_sequences: Choice<NonZeroU32>,
+    /// Maximum sequences in one batch.
+    pub max_batch_size: Choice<NonZeroU32>,
+    /// Maximum prompt chunks admitted together.
+    pub max_prefill_chunks: Choice<NonZeroU32>,
+    /// Maximum aggregate prompt tokens admitted together.
+    pub prompt_token_budget: Choice<NonZeroU64>,
+    /// Maximum reusable prefix records.
+    pub prefix_cache_entries: Choice<NonZeroU32>,
+    /// Maximum tokens retained by reusable prefixes.
+    pub prefix_cache_tokens: Choice<NonZeroU64>,
+    /// Maximum pages retained by reusable prefixes.
+    pub prefix_cache_pages: Choice<NonZeroU32>,
+    /// Bytes reserved for the page pool.
+    pub page_pool_bytes: Choice<PositiveByteSize>,
 }
 
 impl Default for Serving {
     fn default() -> Self {
-        Self { prefix_reuse: true }
+        Self {
+            prefix_reuse: true,
+            max_active_sequences: Choice::Auto,
+            max_batch_size: Choice::Auto,
+            max_prefill_chunks: Choice::Auto,
+            prompt_token_budget: Choice::Auto,
+            prefix_cache_entries: Choice::Auto,
+            prefix_cache_tokens: Choice::Auto,
+            prefix_cache_pages: Choice::Auto,
+            page_pool_bytes: Choice::Auto,
+        }
     }
 }
 
@@ -74,6 +157,32 @@ impl Default for Server {
             sse_write_stall_timeout: Duration::from_secs(30),
             model_drain_deadline: Duration::from_secs(30),
         }
+    }
+}
+
+/// A nonzero byte quantity used for explicitly sized pools.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct PositiveByteSize(ByteSize);
+
+impl PositiveByteSize {
+    /// Returns the validated byte count.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+
+impl<'de> Deserialize<'de> for PositiveByteSize {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = ByteSize::deserialize(deserializer)?;
+        if value.get() == 0 {
+            return Err(serde::de::Error::custom("byte quantity must be positive"));
+        }
+        Ok(Self(value))
     }
 }
 
@@ -226,6 +335,82 @@ impl Default for Metrics {
     }
 }
 
+impl HostConfig {
+    fn validate(&self) -> Result<(), String> {
+        if self.request.default_output_tokens == 0
+            || self.request.default_output_tokens > self.request.max_output_tokens
+        {
+            return Err(
+                "request.default_output_tokens must be within max_output_tokens".to_owned(),
+            );
+        }
+        if let (Choice::Fixed(batch), Choice::Fixed(active)) = (
+            self.serving.max_batch_size,
+            self.serving.max_active_sequences,
+        ) && batch > active
+        {
+            return Err("serving.max_batch_size must not exceed max_active_sequences".to_owned());
+        }
+        checked_product(
+            u64::from(self.request.max_messages),
+            self.request.max_message_bytes.get(),
+            "request message byte ceiling",
+        )?;
+        checked_product(
+            u64::from(self.request.max_stops),
+            self.request.max_stop_bytes.get(),
+            "request stop byte ceiling",
+        )?;
+        if let (Choice::Fixed(active), Choice::Fixed(tokens)) = (
+            self.serving.max_active_sequences,
+            self.serving.prompt_token_budget,
+        ) {
+            checked_product(
+                u64::from(active.get()),
+                tokens.get(),
+                "prompt reservation ceiling",
+            )?;
+        }
+        if let (Choice::Fixed(entries), Choice::Fixed(tokens)) = (
+            self.serving.prefix_cache_entries,
+            self.serving.prefix_cache_tokens,
+        ) {
+            checked_product(
+                u64::from(entries.get()),
+                tokens.get(),
+                "prefix cache ceiling",
+            )?;
+        }
+        if let (Choice::Fixed(live), Choice::Fixed(pool), Choice::Fixed(pages)) = (
+            self.limits.live_bytes,
+            self.backend.metal.pool_capacity,
+            self.serving.page_pool_bytes,
+        ) {
+            let reserved = pool
+                .get()
+                .checked_add(pages.get())
+                .ok_or_else(|| "configured memory pool sum overflows u64".to_owned())?;
+            if reserved > live.get() {
+                return Err("configured memory pools exceed limits.live_bytes".to_owned());
+            }
+        }
+        if !self.metrics.path.starts_with('/')
+            || matches!(self.metrics.path.as_str(), "/health/live" | "/health/ready")
+        {
+            return Err("metrics.path must be an absolute, non-health path".to_owned());
+        }
+        if self.logging.level.trim().is_empty() {
+            return Err("logging.level must not be empty".to_owned());
+        }
+        Ok(())
+    }
+}
+
+fn checked_product(left: u64, right: u64, name: &str) -> Result<u64, String> {
+    left.checked_mul(right)
+        .ok_or_else(|| format!("{name} overflows u64"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -303,6 +488,23 @@ max_output_tokens = 4096
         assert_eq!(config.metrics.listen, Some(([127, 0, 0, 1], 9091).into()));
         assert_eq!(config.metrics.path, "/metrics");
         assert_eq!(config.logging.format, LogFormat::Json);
+        assert_eq!(config.serving.max_active_sequences, Choice::Auto);
+        assert_eq!(config.serving.page_pool_bytes, Choice::Auto);
+    }
+
+    #[test]
+    fn rejects_inconsistent_or_overflowing_host_ceilings() {
+        for source in [
+            "[request]\ndefault_output_tokens = 129\nmax_output_tokens = 128",
+            "[serving]\nmax_batch_size = 8\nmax_active_sequences = 4",
+            "[request]\nmax_messages = 4294967295\nmax_message_bytes = 18446744073709551615",
+            "[limits]\nlive_bytes = 100\n[backend.metal]\npool_capacity = 60\n[serving]\npage_pool_bytes = 41",
+            "[metrics]\npath = 'health'",
+        ] {
+            assert!(toml::from_str::<HostConfig>(source).is_err(), "{source}");
+        }
+        assert!(toml::from_str::<HostConfig>("[serving]\nmax_batch_size = 0").is_err());
+        assert!(toml::from_str::<HostConfig>("[serving]\npage_pool_bytes = 0").is_err());
     }
 
     #[test]
