@@ -24,8 +24,8 @@ use std::{
 use forja_core::{
     Affine, Backend, BackendDispatchData, BackendError, BufferId, CommandList, DType, DeviceInfo,
     GraphLimits, GraphTemplate, Layout, LayoutError, MemoryUsage, Op, OpError, PagePool,
-    PagedCopyDirection, PagedLayout, PagedPlane, PagedSequence, PagedSlotBanks, ParamSpace,
-    PreparedGraph, RuleArm, SequenceCheckpoint, Slice, Submission, SubmissionProfile,
+    PagePoolError, PagedCopyDirection, PagedLayout, PagedPlane, PagedSequence, PagedSlotBanks,
+    ParamSpace, PreparedGraph, RuleArm, SequenceCheckpoint, Slice, Submission, SubmissionProfile,
     SymbolicLayout, SymbolicLayoutError, TemplateOp, TemplateTensor, Tensor, ViewOp,
     gather_matmul_flops, gather_quant_matmul_dispatch_flops, matmul_flops,
     program::{
@@ -537,6 +537,56 @@ pub struct EngineRunner<B: Backend + Send + Sync + 'static> {
     page_pool: Option<u32>,
     paged_origin: Option<SequenceCheckpoint>,
     paged_checkpoint: Option<(u32, SequenceCheckpoint)>,
+}
+
+/// A shareable host-owned paged sequence used for prefix reuse.
+#[derive(Clone)]
+pub struct PagedPrefix {
+    sequence: Arc<Mutex<PagedSequence>>,
+}
+
+impl PagedPrefix {
+    /// Wraps an owned sequence for indexed prefix retention.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn new(sequence: PagedSequence) -> Self {
+        Self {
+            sequence: Arc::new(Mutex::new(sequence)),
+        }
+    }
+
+    /// Forks a committed prefix and reserves its complete request capacity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid lengths, exhausted quota, or corrupt state.
+    pub fn fork_reserved(
+        &self,
+        prefix_tokens: u64,
+        reserved_tokens: u64,
+    ) -> Result<Self, PagePoolError> {
+        let sequence = self
+            .sequence
+            .lock()
+            .map_err(|_| PagePoolError::CorruptState)?
+            .fork_reserved(prefix_tokens, reserved_tokens)?;
+        Ok(Self::new(sequence))
+    }
+
+    /// Returns the number of physical pages referenced by this sequence.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the sequence state is corrupt.
+    pub fn page_count(&self) -> Result<usize, PagePoolError> {
+        Ok(self
+            .sequence
+            .lock()
+            .map_err(|_| PagePoolError::CorruptState)?
+            .table()?
+            .entries()
+            .len())
+    }
 }
 
 type EngineCallFuture<'a, T> =
@@ -1283,6 +1333,40 @@ where
     ) -> wasmtime::Result<Result<(), compute::Error>> {
         self.with_profile(move |runner| Box::pin(runner.rewind_decode_inner(next_pos)))
             .await
+    }
+
+    /// Replaces the active paged request with a retained prefix or a fresh private sequence.
+    ///
+    /// Returns `false` when this runner was loaded without paged storage.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when reservation or binding fails.
+    pub fn prepare_paged_request(
+        &mut self,
+        prefix: Option<PagedPrefix>,
+        reserved_tokens: u64,
+    ) -> Result<bool, compute::Error> {
+        let Some(pool) = self.page_pool else {
+            return Ok(false);
+        };
+        self.store
+            .data_mut()
+            .bind_paged_request(pool, prefix, reserved_tokens)?;
+        self.paged_origin = None;
+        self.paged_checkpoint = None;
+        Ok(true)
+    }
+
+    /// Returns the active paged sequence as a shareable prefix capability.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when paged host state is unavailable or corrupt.
+    pub fn paged_prefix(&self) -> Result<Option<PagedPrefix>, compute::Error> {
+        self.page_pool
+            .map(|pool| self.store.data().paged_prefix(pool))
+            .transpose()
     }
 
     async fn rewind_decode_inner(
@@ -2709,6 +2793,83 @@ impl<B: Backend + 'static> Host<B> {
             .map_err(|_| guest_error(BackendError::ExecutionFailed))?
             .rewind_private(u64::from(logical_len))
             .map_err(|error| compute::Error::Quota(error.to_string()))
+    }
+
+    fn paged_prefix(&self, pool_rep: u32) -> Result<PagedPrefix, compute::Error> {
+        let slot_rep = self
+            .table
+            .get(&Resource::<PagePoolEntry>::new_borrow(pool_rep))
+            .map_err(invalid_handle)?
+            .slot
+            .ok_or_else(|| invalid_handle("paged slot is not open"))?;
+        let binding = &self
+            .table
+            .get(&Resource::<BatchSlotEntry>::new_borrow(slot_rep))
+            .map_err(invalid_handle)?
+            .binding;
+        let sequence = binding
+            .sequence
+            .lock()
+            .map_err(|_| guest_error(BackendError::ExecutionFailed))?
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| invalid_handle("paged sequence is not active"))?;
+        Ok(PagedPrefix { sequence })
+    }
+
+    fn bind_paged_request(
+        &mut self,
+        pool_rep: u32,
+        prefix: Option<PagedPrefix>,
+        reserved_tokens: u64,
+    ) -> Result<(), compute::Error> {
+        let (pool, max_context, slot_rep) = {
+            let entry = self
+                .table
+                .get(&Resource::<PagePoolEntry>::new_borrow(pool_rep))
+                .map_err(invalid_handle)?;
+            (
+                entry.pool.clone(),
+                entry.max_context,
+                entry
+                    .slot
+                    .ok_or_else(|| invalid_handle("paged slot is not open"))?,
+            )
+        };
+        if reserved_tokens > u64::from(max_context) {
+            return Err(compute::Error::Quota(
+                "paged request exceeds the context ceiling".to_owned(),
+            ));
+        }
+        let binding = Arc::clone(
+            &self
+                .table
+                .get(&Resource::<BatchSlotEntry>::new_borrow(slot_rep))
+                .map_err(invalid_handle)?
+                .binding,
+        );
+        let sequence = match prefix {
+            Some(prefix) => prefix.sequence,
+            None => Arc::new(Mutex::new(
+                pool.reserve(reserved_tokens)
+                    .map_err(|error| compute::Error::Quota(error.to_string()))?,
+            )),
+        };
+        {
+            let sequence_guard = sequence
+                .lock()
+                .map_err(|_| guest_error(BackendError::ExecutionFailed))?;
+            binding
+                .banks
+                .bind(0, 0, &sequence_guard)
+                .map_err(|error| compute::Error::Quota(error.to_string()))?;
+        }
+        *binding
+            .sequence
+            .lock()
+            .map_err(|_| guest_error(BackendError::ExecutionFailed))? = Some(sequence);
+        binding.used.store(false, Ordering::Release);
+        Ok(())
     }
 
     /// Creates a Wasmtime store with the configured resource limiter installed.
@@ -6823,6 +6984,51 @@ mod tests {
         super::PagedUse::observe_all(std::slice::from_ref(&usage), Some(7), true).unwrap();
         let reused = pool.reserve(4).unwrap();
         assert_eq!(reused.table().unwrap().resolve(0).unwrap(), old_page);
+    }
+
+    #[test]
+    fn paged_request_binding_accepts_a_reserved_prefix_fork() {
+        let mut host = Host::new(CpuBackend::new(), GENEROUS);
+        let pool = insert_test_pool(&mut host, 1, 16);
+        host.open_paged_slot(&pool, 1).unwrap();
+        host.bind_paged_request(pool.rep(), None, 8).unwrap();
+        let active = host.paged_prefix(pool.rep()).unwrap();
+        active.sequence.lock().unwrap().commit_write(7).unwrap();
+        let fork = active.fork_reserved(7, 12).unwrap();
+
+        host.bind_paged_request(pool.rep(), Some(fork), 12).unwrap();
+
+        let rebound = host.paged_prefix(pool.rep()).unwrap();
+        let sequence = rebound.sequence.lock().unwrap();
+        assert_eq!(sequence.logical_len(), 7);
+        assert_eq!(sequence.reserved_tokens(), 12);
+    }
+
+    #[test]
+    fn paged_request_binding_refuses_a_foreign_prefix_without_rebinding() {
+        let mut host = Host::new(CpuBackend::new(), GENEROUS);
+        let local = insert_test_pool(&mut host, 1, 8);
+        let foreign = insert_test_pool(&mut host, 1, 8);
+        host.open_paged_slot(&local, 1).unwrap();
+        host.bind_paged_request(local.rep(), None, 8).unwrap();
+        let before = host.paged_prefix(local.rep()).unwrap();
+        let before_logical = before.sequence.lock().unwrap().logical_len();
+        let mut foreign_sequence = host.table.get(&foreign).unwrap().pool.reserve(8).unwrap();
+        foreign_sequence.commit_write(3).unwrap();
+
+        assert!(matches!(
+            host.bind_paged_request(
+                local.rep(),
+                Some(super::PagedPrefix::new(foreign_sequence)),
+                8,
+            ),
+            Err(compute::Error::Quota(_))
+        ));
+
+        let after = host.paged_prefix(local.rep()).unwrap();
+        let sequence = after.sequence.lock().unwrap();
+        assert_eq!(sequence.logical_len(), before_logical);
+        assert_eq!(sequence.reserved_tokens(), 8);
     }
 
     fn doubling_program(value: f32) -> compute::ProgramSource {
