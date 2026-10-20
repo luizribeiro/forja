@@ -100,6 +100,77 @@ def test_http_client_reuses_openai_transport_and_measures_sse() -> None:
         thread.join()
 
 
+def test_cold_case_runs_setup_before_every_request() -> None:
+    server = ThreadingHTTPServer(("127.0.0.1", 0), FakeServer)
+    thread = threading.Thread(target=server.serve_forever)
+    thread.start()
+    setups = []
+    try:
+        client = http_client.OpenAIClient(f"http://127.0.0.1:{server.server_port}", "model")
+        case = {"name": "cold", "route": "completions", "prompt_tokens": 7, "output_tokens": 2, "concurrency": 1, "sampling": "greedy"}
+        result = http_client.run_case(client, case, 2, 3, lambda: setups.append(None))
+        assert result["requests"] == 3
+        assert len(setups) == 5
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+def test_runner_initializes_client_when_first_case_is_cold(monkeypatch, tmp_path) -> None:
+    case = {"name": "cold", "route": "completions", "prompt_tokens": 7, "output_tokens": 2, "concurrency": 1, "sampling": "greedy", "cold": True}
+    settings = {"model": "model", "revision": "revision", "seed": 0, "connection_policy": "reuse", "warmups": 0, "repetitions": 1}
+
+    class ManagedServer:
+        last = None
+
+        def __init__(self, _command, _url):
+            self.process = None
+            self.starts = 0
+            ManagedServer.last = self
+
+        def start(self):
+            self.process = object()
+            self.starts += 1
+
+        def stop(self):
+            self.process = None
+
+        def rss_bytes(self):
+            return 1
+
+    class Client:
+        def __init__(self, _url, _model):
+            self.resets = 0
+
+        def reset_connection(self):
+            self.resets += 1
+
+    client = Client("", "")
+    monkeypatch.setattr(serving_bench, "Server", ManagedServer)
+    monkeypatch.setattr(serving_bench.suite, "load", lambda _path: (settings, [case], "suite"))
+    monkeypatch.setattr(serving_bench.suite, "expand", lambda cases: cases)
+    monkeypatch.setattr(serving_bench.http_client, "OpenAIClient", lambda _url, _model: client)
+    monkeypatch.setattr(serving_bench.http_client, "run_case", lambda _client, _case, _warmups, _repetitions, setup: (setup(), {"case": case})[1])
+    monkeypatch.setattr(serving_bench.provenance, "collect", lambda *_args: {})
+    args = argparse.Namespace(
+        implementation="mlx_lm",
+        url="http://127.0.0.1:1",
+        suite=tmp_path / "suite.toml",
+        artifact=[("tokenizer", tmp_path / "tokenizer.json")],
+        weights=[tmp_path / "weights.safetensors"],
+        server_command="mlx_lm.server",
+        repository=tmp_path,
+        forja_repository=tmp_path,
+        resolved_config=None,
+    )
+
+    serving_bench.run(args)
+
+    assert ManagedServer.last.starts == 1
+    assert client.resets == 1
+
+
 def test_provenance_hashes_content_without_paths() -> None:
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)

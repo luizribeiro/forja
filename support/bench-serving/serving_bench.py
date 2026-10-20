@@ -122,19 +122,32 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     validate_identity(args, artifacts)
     command = shlex.split(args.server_command)
     server = Server(command, args.url)
-    client = http_client.OpenAIClient(args.url, settings["model"])
+    client: http_client.OpenAIClient | None = http_client.OpenAIClient(args.url, settings["model"])
     started_at = datetime.now(timezone.utc).isoformat()
     started = time.perf_counter()
     results = []
     try:
         for case in concrete:
-            if server.process is None or case.get("cold"):
+            if server.process is None and not case.get("cold"):
                 server.start()
                 client = http_client.OpenAIClient(args.url, settings["model"])
+            assert client is not None
             if case.get("warm_prefix_tokens"):
                 client.request({**case, "prompt_tokens": 0, "output_tokens": 1})
             before = server.rss_bytes()
-            result = http_client.run_case(client, case, settings["warmups"], settings["repetitions"])
+            restart = None
+            if case.get("cold"):
+                def restart() -> None:
+                    server.start()
+                    client.reset_connection()
+
+            result = http_client.run_case(
+                client,
+                case,
+                settings["warmups"],
+                settings["repetitions"],
+                restart,
+            )
             rss = [value for value in [before, server.rss_bytes()] if value is not None]
             result["rss_bytes"] = max(rss) if rss else None
             results.append(result)

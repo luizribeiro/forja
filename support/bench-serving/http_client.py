@@ -5,6 +5,7 @@ import json
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Callable
 from urllib.parse import urlsplit
 
 import sys
@@ -40,6 +41,13 @@ class OpenAIClient:
             connection = http.client.HTTPConnection(self.host, self.port, timeout=self.timeout)
             self.local.connection = connection
         return connection
+
+    def reset_connection(self) -> None:
+        """Discard this thread's connection after a managed server restart."""
+        connection = getattr(self.local, "connection", None)
+        if connection is not None:
+            connection.close()
+        self.local.connection = None
 
     def request(self, case: dict[str, object]) -> dict[str, object]:
         """Execute one concrete completion and retain only timings and counts."""
@@ -141,14 +149,28 @@ def request_body(case: dict[str, object], model: str) -> dict[str, object]:
     return body
 
 
-def run_case(client: OpenAIClient, case: dict[str, object], warmups: int, repetitions: int) -> dict[str, object]:
+def run_case(
+    client: OpenAIClient,
+    case: dict[str, object],
+    warmups: int,
+    repetitions: int,
+    before_request: Callable[[], None] | None = None,
+) -> dict[str, object]:
     """Run one expanded case with its requested concurrency."""
+    if before_request is not None and case["concurrency"] != 1:
+        raise ValueError("per-request setup requires concurrency 1")
+
+    def request(_: int) -> dict[str, object]:
+        if before_request is not None:
+            before_request()
+        return client.request(case)
+
     for _ in range(warmups):
-        client.request(case)
+        request(0)
     count = repetitions * case["concurrency"]
     started = time.perf_counter()
     with ThreadPoolExecutor(max_workers=case["concurrency"]) as executor:
-        samples = list(executor.map(lambda _: client.request(case), range(count)))
+        samples = list(executor.map(request, range(count)))
     elapsed = time.perf_counter() - started
     good = [value for value in samples if value["error"] is None]
     itl = [value for item in good for value in item["itl_seconds"]]
