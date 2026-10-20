@@ -624,7 +624,15 @@ impl PagedSequence {
         if logical_len >= self.logical_len {
             return Err(PagePoolError::InvalidCheckpoint);
         }
-        for (&page, &immutable) in self.pages.iter().zip(&self.immutable) {
+        let page_tokens = u64::from(self.pool.layout().page_tokens());
+        let first = usize::try_from(logical_len.div_ceil(page_tokens))
+            .map_err(|_| PagePoolError::ArithmeticOverflow)?;
+        let last = usize::try_from(self.logical_len.div_ceil(page_tokens))
+            .map_err(|_| PagePoolError::ArithmeticOverflow)?;
+        for (&page, &immutable) in self.pages[first..last]
+            .iter()
+            .zip(&self.immutable[first..last])
+        {
             if immutable || self.pool.refcount(page)? != 1 {
                 return Err(PagePoolError::SharedTail);
             }
@@ -771,6 +779,9 @@ impl PagedSequence {
             return Ok(None);
         }
         let page_tokens = u64::from(self.pool.layout().page_tokens());
+        if self.logical_len.is_multiple_of(page_tokens) {
+            return Ok(None);
+        }
         let tail = usize::try_from((self.logical_len - 1) / page_tokens)
             .map_err(|_| PagePoolError::ArithmeticOverflow)?;
         let old = *self.pages.get(tail).ok_or(PagePoolError::CorruptState)?;
@@ -1150,6 +1161,18 @@ mod tests {
     }
 
     #[test]
+    fn page_aligned_fork_appends_without_copying_the_full_tail() {
+        let pool = pool(1_024);
+        let mut original = pool.reserve(12).unwrap();
+        original.commit_write(8).unwrap();
+        let mut sibling = original.fork_reserved(8, 12).unwrap();
+
+        assert!(sibling.cow_tail().unwrap().is_none());
+        sibling.commit_write(1).unwrap();
+        assert_eq!(sibling.logical_len(), 9);
+    }
+
+    #[test]
     fn copy_on_write_and_rollback_restore_the_shared_tail() {
         let pool = pool(1_024);
         let mut original = pool.reserve(8).unwrap();
@@ -1233,6 +1256,20 @@ mod tests {
 
         assert_eq!(sequence.logical_len(), 12);
         assert_eq!(sequence.reserved_tokens(), 12);
+    }
+
+    #[test]
+    fn private_rewind_allows_an_untouched_shared_prefix() {
+        let pool = pool(2_048);
+        let mut original = pool.reserve(8).unwrap();
+        original.commit_write(4).unwrap();
+        let mut sibling = original.fork_reserved(4, 12).unwrap();
+        sibling.commit_write(5).unwrap();
+
+        sibling.rewind_private(7).unwrap();
+
+        assert_eq!(sibling.logical_len(), 7);
+        assert_eq!(original.logical_len(), 4);
     }
 
     #[test]
