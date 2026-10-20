@@ -5314,21 +5314,40 @@ impl MetalBackend {
             .lock()
             .map_err(|_| BackendError::ExecutionFailed)?;
         let buffer = buffers.get(tensor)?;
-        let offset =
-            u64::try_from(buffer.data_offset).map_err(|_| BackendError::ExecutionFailed)?;
+        let layout = tensor.layout();
+        let span = layout.byte_span();
+        let view_offset = usize::try_from(span.start).map_err(|_| BackendError::InvalidInput)?;
+        let view_len =
+            usize::try_from(span.end - span.start).map_err(|_| BackendError::InvalidInput)?;
+        if span.end > u64::try_from(buffer.len).map_err(|_| BackendError::InvalidInput)? {
+            return Err(BackendError::InvalidInput);
+        }
+        let binding_offset = buffer
+            .data_offset
+            .checked_add(view_offset)
+            .ok_or(BackendError::InvalidInput)?;
+        let offset = u64::try_from(binding_offset).map_err(|_| BackendError::ExecutionFailed)?;
         let address = buffer
             .raw
             .gpuAddress()
             .checked_add(offset)
             .ok_or(BackendError::ExecutionFailed)?;
+        let normalized = Layout::new(
+            layout.dtype(),
+            0,
+            layout.shape().to_vec(),
+            layout.strides().to_vec(),
+            u64::try_from(view_len).map_err(|_| BackendError::InvalidInput)?,
+        )
+        .map_err(|_| BackendError::InvalidInput)?;
         Ok(EncoderTensor {
             buffer: BufferBinding {
                 raw: buffer.raw.clone(),
-                offset: buffer.data_offset,
-                len: buffer.len,
+                offset: binding_offset,
+                len: view_len,
                 address,
             },
-            layout: tensor.layout().clone(),
+            layout: normalized,
         })
     }
 
@@ -11824,6 +11843,37 @@ mod tests {
     }
 
     #[test]
+    fn metal_sdpa_offsets_narrowed_operands() {
+        let query_slice = [
+            Slice::new(0, 16, 1).unwrap(),
+            Slice::new(2, 7, 1).unwrap(),
+            Slice::new(0, 128, 1).unwrap(),
+        ];
+        let cache_slice = [
+            Slice::new(0, 8, 1).unwrap(),
+            Slice::new(3, 7, 1).unwrap(),
+            Slice::new(0, 128, 1).unwrap(),
+        ];
+        let output_slice = [
+            Slice::new(0, 16, 1).unwrap(),
+            Slice::new(1, 7, 1).unwrap(),
+            Slice::new(0, 128, 1).unwrap(),
+        ];
+        assert_sdpa_with(
+            SdpaKernel::Decomposed,
+            Op::Sdpa {
+                scale: 128.0_f32.sqrt().recip(),
+                causal: true,
+                q_start: 0,
+            },
+            TensorSpec::sliced(DType::F32, &[16, 11, 128], &query_slice),
+            TensorSpec::sliced(DType::F32, &[8, 13, 128], &cache_slice),
+            TensorSpec::sliced(DType::F32, &[8, 13, 128], &cache_slice),
+            &TensorSpec::sliced(DType::F32, &[16, 9, 128], &output_slice),
+        );
+    }
+
+    #[test]
     fn metal_vector_attention_matches_short_decode() {
         let _override = SdpaOverride::set(SdpaKernel::Vector);
         let reference = CpuBackend::new();
@@ -12370,6 +12420,28 @@ mod tests {
             ),
             TensorSpec::permuted(DType::BF16, &[2048, 1024], &[1, 0]),
             &TensorSpec::contiguous(DType::BF16, &[1, 2048]),
+        );
+    }
+
+    #[test]
+    fn metal_matmul_offsets_narrowed_operands() {
+        assert_matmul(
+            TensorSpec::sliced(
+                DType::F32,
+                &[9, 33],
+                &[Slice::new(1, 7, 1).unwrap(), Slice::new(0, 33, 1).unwrap()],
+            ),
+            TensorSpec::sliced_permuted(
+                DType::F32,
+                &[19, 33],
+                &[Slice::new(2, 17, 1).unwrap(), Slice::new(0, 33, 1).unwrap()],
+                &[1, 0],
+            ),
+            &TensorSpec::sliced(
+                DType::F32,
+                &[9, 17],
+                &[Slice::new(1, 7, 1).unwrap(), Slice::new(0, 17, 1).unwrap()],
+            ),
         );
     }
 
