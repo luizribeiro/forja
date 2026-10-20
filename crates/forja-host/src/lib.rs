@@ -6494,6 +6494,56 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn paged_wasmtime_calls_record_copy_and_attention_with_one_usage() {
+        let mut host = Host::new(CpuBackend::new(), GENEROUS);
+        let pool = insert_test_pool(&mut host, 2, 8);
+        let slot = host.open_paged_slot(&pool, 2).unwrap();
+        let _checkpoint = host.begin_paged_append(pool.rep(), 0, 1).unwrap();
+        let commands = host.command_list().unwrap();
+        let ordinary = host.alloc(compute::Dtype::F32, &[1, 2]).unwrap();
+        let query = host.alloc(compute::Dtype::F32, &[1, 1, 2]).unwrap();
+        let output = host.alloc(compute::Dtype::F32, &[1, 1, 2]).unwrap();
+
+        <Host<CpuBackend> as paged_storage::Host>::record_paged_copy(
+            &mut host,
+            Resource::new_borrow(commands.rep()),
+            Resource::new_borrow(slot.rep()),
+            0,
+            paged_storage::PagedSpan {
+                plane: 0,
+                start: 0,
+                len: 1,
+            },
+            Resource::new_borrow(ordinary.rep()),
+            paged_storage::CopyDirection::IntoPages,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        <Host<CpuBackend> as paged_storage::Host>::record_paged_sdpa(
+            &mut host,
+            Resource::new_borrow(commands.rep()),
+            Resource::new_borrow(slot.rep()),
+            0,
+            Resource::new_borrow(query.rep()),
+            Resource::new_borrow(output.rep()),
+            paged_storage::SdpaCfg {
+                key_plane: 0,
+                value_plane: 1,
+                scale: 1.0,
+                causal: true,
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        let recorded = host.table.get(&commands).unwrap();
+        assert_eq!(recorded.recorded.len(), 2);
+        assert_eq!(recorded.paged.len(), 1);
+    }
+
     #[test]
     fn paged_backing_allocation_failure_releases_every_partial_resource() {
         let limits = Limits::new(130, 8, u64::MAX, 32, u64::MAX);
