@@ -1,8 +1,9 @@
 """Tests for the serving benchmark client."""
 
 import argparse
-import tempfile
+import importlib.util
 import json
+import tempfile
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -11,6 +12,15 @@ import http_client
 import provenance
 import serving_bench
 import suite
+
+
+def comparison_module():
+    """Load the local compare.py without colliding with the MLX helper."""
+    path = Path(__file__).with_name("compare.py")
+    spec = importlib.util.spec_from_file_location("serving_compare", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 class FakeServer(BaseHTTPRequestHandler):
@@ -123,3 +133,64 @@ def test_runner_refuses_incomplete_implementation_identity() -> None:
         assert "resolved-config" in str(error)
     else:
         raise AssertionError("incomplete Forja identity was accepted")
+
+
+def test_compare_refuses_every_workload_identity_mismatch() -> None:
+    compare = comparison_module()
+    case = {"name": "case", "prompt_tokens": 7, "concurrency": 1, "sampling": "greedy"}
+    record = {
+        "schema_version": 1,
+        "suite_sha256": "suite",
+        "prompt_sha256": "prompt",
+        "model": {"id": "model", "revision": "revision"},
+        "sampling_seed": 0,
+        "warmups": 3,
+        "connection_policy": "reuse",
+        "results": [{"case": case}],
+    }
+    for field, value in [
+        ("schema_version", 2),
+        ("suite_sha256", "other"),
+        ("prompt_sha256", "other"),
+        ("sampling_seed", 1),
+        ("warmups", 4),
+        ("connection_policy", "new"),
+    ]:
+        changed = {**record, field: value}
+        try:
+            compare.comparable(record, changed)
+        except ValueError as error:
+            assert "differs" in str(error)
+        else:
+            raise AssertionError(f"{field} mismatch was accepted")
+    for field, value in [("id", "other"), ("revision", "other")]:
+        changed = json.loads(json.dumps(record))
+        changed["model"][field] = value
+        try:
+            compare.comparable(record, changed)
+        except ValueError as error:
+            assert "differs" in str(error)
+        else:
+            raise AssertionError(f"model {field} mismatch was accepted")
+    for field, value in [("concurrency", 2), ("sampling", "temperature"), ("prompt_tokens", 8)]:
+        changed = json.loads(json.dumps(record))
+        changed["results"][0]["case"][field] = value
+        try:
+            compare.comparable(record, changed)
+        except ValueError as error:
+            expected = f"{field} differs" if field in {"concurrency", "sampling"} else "requests differ"
+            assert str(error) == expected
+        else:
+            raise AssertionError(f"{field} mismatch was accepted")
+
+
+def test_compare_reports_improvement_above_one_for_both_metric_directions() -> None:
+    compare = comparison_module()
+    case = {"name": "case", "prompt_tokens": 7, "concurrency": 1}
+    latency = {"p50": 2.0, "p90": 2.0, "p99": 2.0}
+    baseline = {"results": [{"case": case, "requests_per_second": 10.0, "prompt_tokens_per_second": 10.0, "output_tokens_per_second": 10.0, "ttft_seconds": latency, "itl_seconds": latency, "e2e_seconds": latency}]}
+    faster = {"results": [{"case": case, "requests_per_second": 20.0, "prompt_tokens_per_second": 20.0, "output_tokens_per_second": 20.0, "ttft_seconds": {key: 1.0 for key in latency}, "itl_seconds": {key: 1.0 for key in latency}, "e2e_seconds": {key: 1.0 for key in latency}}]}
+    reported = {metric: value for _case, metric, value in compare.rows(baseline, faster)}
+
+    assert reported["requests_per_second"] == 2.0
+    assert reported["ttft_seconds.p50"] == 2.0
