@@ -8660,6 +8660,20 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn metal_compiles_paged_half_steel_attention() {
+        let backend = MetalBackend::new().unwrap();
+        backend
+            .pipelines
+            .lock()
+            .unwrap()
+            .get(
+                "paged_steel_attention_half_128_96x16",
+                &[(0, 0), (1, 1), (2, 0), (3, 1)],
+            )
+            .unwrap();
+    }
+
     fn argmax_op() -> Op {
         Op::Argmax { chunk_width: 2_048 }
     }

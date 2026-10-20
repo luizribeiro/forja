@@ -1,3 +1,5 @@
+// Copyright © 2024 Apple Inc.
+// SPDX-License-Identifier: MIT
 struct PagedCopyParams {
     uint start;
     uint tokens;
@@ -64,6 +66,240 @@ struct PagedSdpaParams {
     uint contiguous_entries;
     uint blocks;
 };
+
+template <typename TileT, int BQ, int BK, int BD>
+void paged_steel_attention_body(
+    device const uchar *query,
+    device const uchar *key,
+    device const uchar *value,
+    device const uint2 *table,
+    device const uint *generations,
+    device uchar *output,
+    constant PagedSdpaParams &params,
+    device atomic_uint *error_flag,
+    threadgroup TileT *query_tile,
+    threadgroup TileT *kv_tile,
+    threadgroup uint &physical_page,
+    threadgroup uint &first_page,
+    threadgroup uint &valid,
+    uint3 position,
+    uint thread_index,
+    uint3 threads,
+    ushort simdgroup,
+    ushort lane) {
+    constexpr short PADDING = 16 / sizeof(TileT);
+    constexpr short LDQ = BD + PADDING;
+    constexpr short LDK = BK + PADDING;
+    constexpr short LDV = BD + PADDING;
+    constexpr short FRAGMENT = 8;
+    constexpr short TK = BK / FRAGMENT;
+    constexpr short TD = BD / FRAGMENT;
+    uint query_block = position.x;
+    uint head = position.y;
+    uint first_query = query_block * BQ;
+    uint kv_head = head / params.heads_per_group;
+    uint thread_count = threads.x * threads.y * threads.z;
+    ulong query_base = ulong(head) * params.query_length * BD;
+    ulong output_base = ulong(head) * params.query_length * params.value_width
+        + ulong(first_query) * params.value_width;
+    BlockLoader<BQ, BD>::load_to(
+        query, query_base, BD, 1, input0_dtype, first_query, 0,
+        params.query_length, BD, false, true, query_tile, LDQ, 1,
+        thread_index, thread_count);
+    using Fragment = SteelMMAFragment<float>;
+    using TileFragment = SteelMMAFragment<TileT>;
+    SteelMMATile<TileT, 1, 1> query_mma;
+    SteelMMATile<TileT, 1, TK> key_mma;
+    SteelMMATile<float, 1, TK> scores;
+    SteelMMATile<TileT, 1, TK> probabilities;
+    SteelMMATile<TileT, 1, 1> value_mma;
+    SteelMMATile<float, 1, TD> result;
+    result.clear();
+
+    short2 coordinate = Fragment::coordinate(lane);
+    short row = coordinate.y;
+    short column = coordinate.x;
+    short query_row = FRAGMENT * simdgroup + row;
+    float maximum[1] = {negative_finite_sentinel()};
+    float denominator[1] = {0.0f};
+    uint key_blocks = (params.key_length + BK - 1) / BK;
+    uint key_limit = key_blocks;
+    uint first_causal_block = key_blocks;
+    if (params.causal != 0) {
+        uint query_limit = min(first_query + BQ, params.query_length);
+        uint absolute_limit = params.query_start + query_limit;
+        key_limit = min(key_blocks, (absolute_limit + BK - 1) / BK);
+        first_causal_block = (params.query_start + first_query) / BK;
+    }
+    if (thread_index == 0) {
+        first_page = table[0].x;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint previous_page = UINT_MAX;
+    for (uint key_block = 0; key_block < key_limit; ++key_block) {
+        uint first_key = key_block * BK;
+        uint logical_page = first_key / params.page_tokens;
+        if (logical_page != previous_page) {
+            if (thread_index == 0) {
+                uint2 entry = table[logical_page];
+                uint expected = first_page + logical_page;
+                valid = logical_page < params.logical_pages
+                    && entry.x < params.physical_pages
+                    && generations[entry.x] == entry.y
+                    && (params.contiguous_entries == 0 || entry.x == expected);
+                physical_page = params.contiguous_entries == 0 ? entry.x : expected;
+                if (valid == 0) {
+                    atomic_store_explicit(error_flag, 1, memory_order_relaxed);
+                    atomic_fetch_min_explicit(
+                        error_flag + 1, logical_page, memory_order_relaxed);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            previous_page = logical_page;
+        }
+        uint page_row = first_key % params.page_tokens;
+        ulong page_base = (ulong(physical_page) * params.page_tokens + page_row)
+            * params.kv_heads * BD + ulong(kv_head) * BD;
+        for (uint linear = thread_index; linear < BK * BD; linear += thread_count) {
+            uint tile_row = linear / BD;
+            uint tile_column = linear % BD;
+            bool in_range = valid != 0 && first_key + tile_row < params.key_length;
+            ulong index = page_base + ulong(tile_row) * params.kv_heads * BD + tile_column;
+            kv_tile[tile_column * LDK + tile_row] = in_range
+                ? TileT(load_float(key, index, input1_dtype)) : TileT(0);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        scores.clear();
+        for (short dimension = 0; dimension < TD; ++dimension) {
+            simdgroup_barrier(mem_flags::mem_none);
+            TileFragment::load(
+                query_mma.at(0, 0),
+                &query_tile[query_row * LDQ + dimension * FRAGMENT + column], LDQ, 1);
+            for (short key_fragment = 0; key_fragment < TK; ++key_fragment) {
+                TileFragment::load(
+                    key_mma.at(0, key_fragment),
+                    &kv_tile[dimension * FRAGMENT * LDK + row * LDK
+                        + key_fragment * FRAGMENT + column], LDK, 1);
+            }
+            simdgroup_barrier(mem_flags::mem_none);
+            steel_tile_multiply(scores, query_mma, key_mma, scores);
+        }
+        for (short element = 0; element < scores.element_count; ++element) {
+            scores.elements()[element] *= params.scale;
+        }
+        if (first_key + BK > params.key_length) {
+            for (short key_fragment = 0; key_fragment < TK; ++key_fragment) {
+                short key_column = key_fragment * FRAGMENT + column;
+                for (short element = 0; element < Fragment::elements; ++element) {
+                    if (first_key + key_column + element >= params.key_length) {
+                        scores.at(0, key_fragment)[element] = negative_finite_sentinel();
+                    }
+                }
+            }
+        }
+        if (params.causal != 0 && key_block >= first_causal_block) {
+            uint absolute_query = params.query_start + first_query + query_row;
+            for (short key_fragment = 0; key_fragment < TK; ++key_fragment) {
+                short key_column = key_fragment * FRAGMENT + column;
+                for (short element = 0; element < Fragment::elements; ++element) {
+                    if (first_key + key_column + element > absolute_query) {
+                        scores.at(0, key_fragment)[element] = negative_finite_sentinel();
+                    }
+                }
+            }
+        }
+
+        float next_maximum[1] = {maximum[0]};
+        scores.template row_reduce<SteelMax>(next_maximum);
+        scores.template row_apply<SteelExpSubtract>(next_maximum);
+        float adjustment[1] = {fast::exp(maximum[0] - next_maximum[0])};
+        maximum[0] = next_maximum[0];
+        float block_sum[1] = {0.0f};
+        scores.template row_reduce<SteelSum>(block_sum);
+        denominator[0] = denominator[0] * adjustment[0] + block_sum[0];
+        result.template row_apply<SteelMultiply>(adjustment);
+        if constexpr (!is_same_v<TileT, float>) {
+            for (short element = 0; element < scores.element_count; ++element) {
+                probabilities.elements()[element] = TileT(scores.elements()[element]);
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint linear = thread_index; linear < BK * BD; linear += thread_count) {
+            uint tile_row = linear / BD;
+            uint tile_column = linear % BD;
+            bool in_range = valid != 0 && first_key + tile_row < params.key_length;
+            ulong index = page_base + ulong(tile_row) * params.kv_heads * BD + tile_column;
+            kv_tile[tile_row * LDV + tile_column] = in_range
+                ? TileT(load_float(value, index, input2_dtype)) : TileT(0);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (short dimension = 0; dimension < TD; ++dimension) {
+            for (short key_fragment = 0; key_fragment < TK; ++key_fragment) {
+                short key_row = key_fragment * FRAGMENT + row;
+                TileFragment::load(
+                    value_mma.at(0, 0),
+                    &kv_tile[key_row * LDV + dimension * FRAGMENT + column], LDV, 1);
+                if constexpr (is_same_v<TileT, float>) {
+                    Fragment::multiply(result.at(0, dimension),
+                        scores.at(0, key_fragment), value_mma.at(0, 0),
+                        result.at(0, dimension));
+                } else {
+                    Fragment::multiply(result.at(0, dimension),
+                        probabilities.at(0, key_fragment), value_mma.at(0, 0),
+                        result.at(0, dimension));
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    result.template row_apply<SteelDivide>(denominator);
+    uint output_row = first_query + query_row;
+    if (output_row >= params.query_length) {
+        return;
+    }
+    for (short dimension = 0; dimension < TD; ++dimension) {
+        uint output_column = dimension * FRAGMENT + column;
+        for (short element = 0; element < Fragment::elements; ++element) {
+            ulong output_index = output_base + ulong(query_row) * params.value_width
+                + output_column + element;
+            store_float(output, output_index, output_dtype,
+                result.at(0, dimension)[element]);
+        }
+    }
+}
+
+#define DEFINE_PAGED_STEEL_ATTENTION(name, tile_type, bq, bk, bd)          \
+kernel void name(                                                           \
+    device const uchar *query [[buffer(0)]],                                \
+    device const uchar *key [[buffer(1)]],                                  \
+    device const uchar *value [[buffer(2)]],                                \
+    device const uint2 *table [[buffer(3)]],                                \
+    device const uint *generations [[buffer(4)]],                           \
+    device uchar *output [[buffer(5)]],                                     \
+    constant PagedSdpaParams &params [[buffer(6)]],                         \
+    device atomic_uint *error_flag [[buffer(7)]],                           \
+    uint3 position [[threadgroup_position_in_grid]],                        \
+    uint thread_index [[thread_index_in_threadgroup]],                      \
+    uint3 threads [[threads_per_threadgroup]],                              \
+    ushort simdgroup [[simdgroup_index_in_threadgroup]],                    \
+    ushort lane [[thread_index_in_simdgroup]]) {                            \
+    threadgroup tile_type query_tile[bq * (bd + 16 / sizeof(tile_type))];   \
+    threadgroup tile_type kv_tile[(bk + 16 / sizeof(tile_type)) * bd];      \
+    threadgroup uint physical_page;                                         \
+    threadgroup uint first_page;                                            \
+    threadgroup uint valid;                                                 \
+    paged_steel_attention_body<tile_type, bq, bk, bd>(                      \
+        query, key, value, table, generations, output, params, error_flag,  \
+        query_tile, kv_tile, physical_page, first_page, valid, position,    \
+        thread_index, threads, simdgroup, lane);                            \
+}
+
+DEFINE_PAGED_STEEL_ATTENTION(paged_steel_attention_64, float, 32, 32, 64)
+DEFINE_PAGED_STEEL_ATTENTION(paged_steel_attention_128, float, 32, 16, 128)
+DEFINE_PAGED_STEEL_ATTENTION(paged_steel_attention_half_64_64x32, half, 64, 32, 64)
+DEFINE_PAGED_STEEL_ATTENTION(paged_steel_attention_half_128_96x16, half, 96, 16, 128)
 
 template <uint D, uint G, uint HPT>
 void paged_sdpa_2pass_1_gqa_body(
