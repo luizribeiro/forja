@@ -47,6 +47,10 @@ pub(crate) enum MetalVariant {
     SdpaSteel,
     SdpaSteelHalf,
     PagedSdpaVector,
+    PagedSdpaVectorGqaTwoPass32,
+    PagedSdpaVectorGqaTwoPass64,
+    PagedSdpaVectorGqaTwoPass128,
+    PagedSdpaVectorGqaTwoPass256,
     PagedSdpaSteel,
     PagedSdpaSteelHalf,
     TopKPortable,
@@ -255,6 +259,7 @@ const KEY_WIDTH: Dimension = dim("key width", KEY, Axis::Index(2));
 const VALUE_WIDTH: Dimension = dim("value width", VALUE, Axis::Index(2));
 const PAGED_KEY_WIDTH: Dimension = dim("key width", KEY, Axis::Index(3));
 const PAGED_VALUE_WIDTH: Dimension = dim("value width", VALUE, Axis::Index(3));
+const PAGED_KEY_HEADS: Dimension = dim("key/value heads", KEY, Axis::Index(2));
 const TOP_K_WIDTH: Dimension = dim("width", INPUT, Axis::FromEnd(1));
 
 const fn dim(name: &'static str, tensor: TensorRef, axis: Axis) -> Dimension {
@@ -558,6 +563,22 @@ const TOP_K_PARTIALS: &[Constraint] = &[operation(
     Relation::Range { min: 1, max: 64 },
 )];
 const PAGED_SDPA: &[Constraint] = &[value(PAGED_KEY_WIDTH, Relation::OneOf(WIDTHS))];
+const PAGED_GQA_TWO_PASS: &[Constraint] = &[
+    value(QUERY_LENGTH, Relation::Equal(1)),
+    value(PAGED_KEY_WIDTH, Relation::Equal(128)),
+    Constraint::DimensionsEqual {
+        left: PAGED_KEY_WIDTH,
+        right: PAGED_VALUE_WIDTH,
+    },
+    Constraint::Value {
+        value: ValueRef::Quotient {
+            name: "grouped-head SIMD count",
+            numerator: QUERY_HEADS,
+            denominator: PAGED_KEY_HEADS,
+        },
+        relation: Relation::Equal(8),
+    },
+];
 const PAGED_SDPA_STEEL: &[Constraint] = &[
     value(
         QUERY_LENGTH,
@@ -792,6 +813,42 @@ pub(crate) static REGISTRY: &[VariantDef<MetalVariant>] = &[
         &[
             "Uses one authenticated table entry per logical page and a direct-address path for consecutive entries."
         ]
+    ),
+    batch_invariant_variant!(
+        "paged-sdpa.vector-gqa-two-pass-32",
+        PagedSdpa,
+        PagedSdpaVectorGqaTwoPass32,
+        PAGED_GQA_TWO_PASS,
+        &["short single-token paged decode with eight query heads per K/V head."],
+        &["other grouped-query factors or longer cache lengths."],
+        &["Reuses each paged K/V load across two query heads with 32 reduction blocks."]
+    ),
+    batch_invariant_variant!(
+        "paged-sdpa.vector-gqa-two-pass",
+        PagedSdpa,
+        PagedSdpaVectorGqaTwoPass64,
+        PAGED_GQA_TWO_PASS,
+        &["single-token paged decode with eight query heads per K/V head."],
+        &["other grouped-query factors or a profile-tuned block count."],
+        &["Reuses each paged K/V load across two query heads with 64 reduction blocks."]
+    ),
+    batch_invariant_variant!(
+        "paged-sdpa.vector-gqa-two-pass-128",
+        PagedSdpa,
+        PagedSdpaVectorGqaTwoPass128,
+        PAGED_GQA_TWO_PASS,
+        &["single-token paged decode with eight query heads per K/V head."],
+        &["other grouped-query factors or shorter cache lengths."],
+        &["Reuses each paged K/V load across two query heads with 128 reduction blocks."]
+    ),
+    batch_invariant_variant!(
+        "paged-sdpa.vector-gqa-two-pass-256",
+        PagedSdpa,
+        PagedSdpaVectorGqaTwoPass256,
+        PAGED_GQA_TWO_PASS,
+        &["long single-token paged decode with eight query heads per K/V head."],
+        &["other grouped-query factors or shorter cache lengths."],
+        &["Reuses each paged K/V load across two query heads with 256 reduction blocks."]
     ),
     batch_invariant_variant!(
         "paged-sdpa.steel",
@@ -1510,6 +1567,10 @@ mod tests {
                 "gather-quant-matmul.grouped",
                 "gather-quant-matmul.weighted-broad",
                 "paged-sdpa.vector",
+                "paged-sdpa.vector-gqa-two-pass-32",
+                "paged-sdpa.vector-gqa-two-pass",
+                "paged-sdpa.vector-gqa-two-pass-128",
+                "paged-sdpa.vector-gqa-two-pass-256",
                 "paged-sdpa.steel",
                 "paged-sdpa.steel-half",
                 "sdpa.portable",
@@ -1798,16 +1859,27 @@ mod tests {
     }
 
     fn paged_sdpa_dispatch(dtype: DType, query_length: u32, width: u32) -> Dispatch {
+        paged_sdpa_dispatch_with_heads(dtype, 2, query_length, width)
+    }
+
+    fn paged_sdpa_dispatch_with_heads(
+        dtype: DType,
+        group: u32,
+        query_length: u32,
+        width: u32,
+    ) -> Dispatch {
         let backend = CpuBackend::new();
+        let kv_heads = 8;
+        let query_heads = kv_heads * group;
         let query = backend
-            .alloc(DType::F32, &[16, query_length, width])
+            .alloc(DType::F32, &[query_heads, query_length, width])
             .unwrap();
-        let key = backend.alloc(dtype, &[2, 4, 8, width]).unwrap();
-        let value = backend.alloc(dtype, &[2, 4, 8, width]).unwrap();
+        let key = backend.alloc(dtype, &[2, 4, kv_heads, width]).unwrap();
+        let value = backend.alloc(dtype, &[2, 4, kv_heads, width]).unwrap();
         let table = backend.alloc(DType::U32, &[2, 2]).unwrap();
         let generations = backend.alloc(DType::U32, &[2]).unwrap();
         let output = backend
-            .alloc(DType::F32, &[16, query_length, width])
+            .alloc(DType::F32, &[query_heads, query_length, width])
             .unwrap();
         let mut commands = CommandList::new();
         commands
@@ -1949,6 +2021,19 @@ mod tests {
             Err(VariantError::Constraint { .. })
         ));
         assert!(resolve(&f32, "paged-sdpa.steel", METAL4).is_ok());
+    }
+
+    #[test]
+    fn paged_gqa_vector_attention_requires_eight_query_heads_per_cache_head() {
+        for ratio in [1, 2, 4, 16] {
+            let dispatch = paged_sdpa_dispatch_with_heads(DType::F32, ratio, 1, 128);
+            assert!(matches!(
+                resolve(&dispatch, "paged-sdpa.vector-gqa-two-pass", METAL4),
+                Err(VariantError::Constraint { .. })
+            ));
+        }
+        let dispatch = paged_sdpa_dispatch_with_heads(DType::F32, 8, 1, 128);
+        assert!(resolve(&dispatch, "paged-sdpa.vector-gqa-two-pass", METAL4).is_ok());
     }
 
     #[test]
@@ -2244,6 +2329,26 @@ mod tests {
                 "paged-sdpa.vector",
                 paged_sdpa_dispatch(DType::F16, 1, 128),
                 "paged_sdpa_128",
+            ),
+            (
+                "paged-sdpa.vector-gqa-two-pass-32",
+                paged_sdpa_dispatch_with_heads(DType::F16, 8, 1, 128),
+                "paged_sdpa_2pass_1_gqa_128",
+            ),
+            (
+                "paged-sdpa.vector-gqa-two-pass",
+                paged_sdpa_dispatch_with_heads(DType::F16, 8, 1, 128),
+                "paged_sdpa_2pass_1_gqa_128",
+            ),
+            (
+                "paged-sdpa.vector-gqa-two-pass-128",
+                paged_sdpa_dispatch_with_heads(DType::F16, 8, 1, 128),
+                "paged_sdpa_2pass_1_gqa_128",
+            ),
+            (
+                "paged-sdpa.vector-gqa-two-pass-256",
+                paged_sdpa_dispatch_with_heads(DType::F16, 8, 1, 128),
+                "paged_sdpa_2pass_1_gqa_128",
             ),
             (
                 "paged-sdpa.steel",

@@ -3132,8 +3132,6 @@ impl MetalBackend {
         bindings: &mut ArgumentBindings,
         arguments: &mut ArgumentWriter,
     ) -> Result<(Vec<BufferBinding>, BufferBinding), BackendError> {
-        const GQA_BLOCKS: u32 = 64;
-
         let Op::PagedSdpa {
             scale,
             causal,
@@ -3181,6 +3179,13 @@ impl MetalBackend {
             .shape()
             .try_into()
             .map_err(|_| BackendError::InvalidInput)?;
+        let gqa_blocks = match selected_variant(dispatch) {
+            Some(MetalVariant::PagedSdpaVectorGqaTwoPass32) => Some(32),
+            Some(MetalVariant::PagedSdpaVectorGqaTwoPass64) => Some(64),
+            Some(MetalVariant::PagedSdpaVectorGqaTwoPass128) => Some(128),
+            Some(MetalVariant::PagedSdpaVectorGqaTwoPass256) => Some(256),
+            _ => None,
+        };
         let mut params = Vec::with_capacity(15 * size_of::<u32>());
         params.extend_from_slice(&scale.to_ne_bytes());
         for value in [
@@ -3197,7 +3202,7 @@ impl MetalBackend {
             t[0],
             k[0],
             u32::from(contiguous_entries),
-            GQA_BLOCKS,
+            gqa_blocks.unwrap_or(0),
         ] {
             params.extend_from_slice(&value.to_ne_bytes());
         }
@@ -3287,10 +3292,10 @@ impl MetalBackend {
                 Err(error) => return Err(error),
             }
         }
-        if q[0] / k[2] == 8 && q[1] == 1 && q[2] == 128 && v[3] == 128 && key_length >= GQA_BLOCKS {
-            let partials = self.scratch_tensor(query.layout.dtype(), &[q[0], GQA_BLOCKS, v[3]])?;
-            let sums = self.scratch_tensor(DType::F32, &[q[0], GQA_BLOCKS])?;
-            let maxs = self.scratch_tensor(DType::F32, &[q[0], GQA_BLOCKS])?;
+        if let Some(gqa_blocks) = gqa_blocks {
+            let partials = self.scratch_tensor(query.layout.dtype(), &[q[0], gqa_blocks, v[3]])?;
+            let sums = self.scratch_tensor(DType::F32, &[q[0], gqa_blocks])?;
+            let maxs = self.scratch_tensor(DType::F32, &[q[0], gqa_blocks])?;
             let first = self
                 .pipelines
                 .lock()
@@ -3320,7 +3325,7 @@ impl MetalBackend {
                 MTLSize {
                     width: usize::try_from(k[2]).map_err(|_| BackendError::InvalidInput)?,
                     height: 1,
-                    depth: usize::try_from(GQA_BLOCKS).map_err(|_| BackendError::InvalidInput)?,
+                    depth: usize::try_from(gqa_blocks).map_err(|_| BackendError::InvalidInput)?,
                 },
                 MTLSize {
                     width: 256,
@@ -7454,6 +7459,15 @@ fn sdpa_kernel(dispatch: &Dispatch) -> Result<&'static str, BackendError> {
 
 fn paged_sdpa_kernel(dispatch: &Dispatch, width: u32) -> Result<&'static str, BackendError> {
     match (selected_variant(dispatch), width) {
+        (
+            Some(
+                MetalVariant::PagedSdpaVectorGqaTwoPass32
+                | MetalVariant::PagedSdpaVectorGqaTwoPass64
+                | MetalVariant::PagedSdpaVectorGqaTwoPass128
+                | MetalVariant::PagedSdpaVectorGqaTwoPass256,
+            ),
+            128,
+        ) => Ok("paged_sdpa_2pass_1_gqa_128"),
         (Some(MetalVariant::PagedSdpaSteel), 64) => Ok("paged_steel_attention_64"),
         (Some(MetalVariant::PagedSdpaSteel), 128) => Ok("paged_steel_attention_128"),
         (Some(MetalVariant::PagedSdpaSteelHalf), 64) => Ok("paged_steel_attention_half_64_64x32"),
@@ -7747,6 +7761,12 @@ pub(super) fn variant_supported(
         MetalVariant::SdpaSteel => steel_sdpa_supported(dispatch)?,
         MetalVariant::SdpaSteelHalf => half_steel_sdpa_supported(dispatch)?,
         MetalVariant::PagedSdpaVector => matches!(dispatch.op(), Op::PagedSdpa { .. }),
+        MetalVariant::PagedSdpaVectorGqaTwoPass32
+        | MetalVariant::PagedSdpaVectorGqaTwoPass64
+        | MetalVariant::PagedSdpaVectorGqaTwoPass128
+        | MetalVariant::PagedSdpaVectorGqaTwoPass256 => {
+            matches!(dispatch.op(), Op::PagedSdpa { .. })
+        }
         MetalVariant::PagedSdpaSteel => paged_steel_sdpa_supported(dispatch)?,
         MetalVariant::PagedSdpaSteelHalf => paged_half_steel_sdpa_supported(dispatch)?,
         MetalVariant::TopKSingleK8 => dispatch_kernel(dispatch)? == "topk_single",
