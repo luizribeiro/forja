@@ -25,6 +25,9 @@ pub fn host_schema() -> Result<Value, String> {
             "x-forja-reload".to_owned(),
             Value::String(class.as_str().to_owned()),
         );
+        if path.starts_with("model.") {
+            object.insert("x-forja-absolute-path".to_owned(), Value::Bool(true));
+        }
     }
     Ok(schema)
 }
@@ -49,6 +52,11 @@ mod tests {
             assert!(leaf.get("description").is_some(), "{path}");
             assert!(leaf.get("default").is_some(), "{path}");
             assert_eq!(leaf["x-forja-reload"], class.as_str(), "{path}");
+            assert_eq!(
+                leaf.get("x-forja-absolute-path").and_then(Value::as_bool),
+                path.starts_with("model.").then_some(true),
+                "{path}"
+            );
         }
         assert_eq!(schema["additionalProperties"], false);
     }
