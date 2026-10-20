@@ -5649,6 +5649,54 @@ mod tests {
     const GENEROUS: Limits = Limits::new(u64::MAX, 8, u64::MAX, 32, u64::MAX);
     static NEXT_WEIGHT_FILE: AtomicU64 = AtomicU64::new(0);
 
+    fn insert_test_pool<B: Backend>(
+        host: &mut Host<B>,
+        plane_count: u32,
+        max_context: u32,
+    ) -> Resource<PagePoolEntry> {
+        let planes = (0..plane_count)
+            .map(|plane| PagedPlane {
+                dtype: DType::F32,
+                elements_per_token: 2,
+                alignment: 4,
+                label: format!("plane-{plane}"),
+            })
+            .collect();
+        let pool = PagePool::new(
+            PagedLayout::new(4, planes).unwrap(),
+            max_context.div_ceil(4),
+            4_096,
+        )
+        .unwrap();
+        let charged_bytes = pool.memory_usage().unwrap().0.total().unwrap();
+        host.live_bytes.fetch_add(charged_bytes, Ordering::AcqRel);
+        host.table
+            .push(PagePoolEntry {
+                pool,
+                active_lanes: 1,
+                max_context,
+                plane_count,
+                slot_banks: None,
+                charged_bytes: AtomicU64::new(charged_bytes),
+                live_bytes: Arc::clone(&host.live_bytes),
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn paged_pool_fixture_tracks_its_initial_charge() {
+        let mut host = Host::new(CpuBackend::new(), GENEROUS);
+        let pool = insert_test_pool(&mut host, 1, 8);
+        let charged = host
+            .table
+            .get(&pool)
+            .unwrap()
+            .charged_bytes
+            .load(Ordering::Acquire);
+
+        assert_eq!(host.live_bytes.load(Ordering::Acquire), charged);
+    }
+
     #[test]
     fn loaded_layer_count_limits_expected_taps() {
         let layers = [1, 2, 4, 8];
