@@ -76,3 +76,27 @@ tokens. Old/new tg128 ABBA runs on Qwen3, OLMoE, and Qwen3-Coder differed by les
 bracketing run-order drift.
 
 The complete confidence intervals and provenance are in the profile's `bench` directory.
+
+## Paged serving memory ceiling
+
+The f16 paged profile stores 6 MiB per 64-token page across its 96 cache planes. The table below
+charges eight admitted lanes, two slot banks, per-sequence tables, generation metadata, and a
+3 MiB conservative prefix-index allowance. The fixed working set is 20,164,345,856 bytes: the
+17,181,071,994-byte weights plus ordinary tensors, two replay arenas, and measured scratch
+high-water storage. Page references are not charged a second time.
+
+For `P = context / 64` pages, the metadata column is the 3 MiB prefix-index allowance plus
+`2 × (8 × P × 8 + 8 × 16)` bytes for the two charged slot banks, `2 × 8 × P × 8` for their GPU
+table buffers, `8 × P × 8` for active sequence tables, and `P × 4` for generations. This totals
+3,166,720, 3,228,928, and 3,311,872 bytes for the three rows respectively.
+
+| Context ceiling | Cache slabs | Slot/table metadata | Fixed working set | Charged ceiling | 48 GiB headroom |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 4,096 | 3.00 GiB | < 3.1 MiB | 18.78 GiB | 21.78 GiB | 26.22 GiB |
+| 16,384 | 12.00 GiB | < 3.1 MiB | 18.78 GiB | 30.78 GiB | 17.22 GiB |
+| 32,768 | 24.00 GiB | < 3.2 MiB | 18.78 GiB | 42.78 GiB | 5.22 GiB |
+
+The slab allocator grows in 3 GiB units because one slab spans a 32K f16 sequence. Eight 4K lanes
+therefore share one slab, eight 16K lanes require four, and eight 32K lanes require eight. The
+32K row is an accounting ceiling, not a concurrency target; admission may use the remaining
+headroom only when the complete reservation fits the unchanged quota.
