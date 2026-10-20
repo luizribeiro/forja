@@ -7,6 +7,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import http_client
+import provenance
 import suite
 
 
@@ -85,3 +86,28 @@ def test_http_client_reuses_openai_transport_and_measures_sse() -> None:
         server.shutdown()
         server.server_close()
         thread.join()
+
+
+def test_provenance_hashes_content_without_paths() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        first = root / "first"
+        second = root / "second"
+        first.write_bytes(b"one")
+        second.write_bytes(b"two")
+        combined = provenance.sha256_files([first, second])
+        assert combined == provenance.sha256_files([second, first])
+        assert str(first) not in combined
+        assert len(provenance.sha256_file(first)) == 64
+
+
+def test_provenance_extracts_gpu_name_and_core_count() -> None:
+    displays = {
+        "SPDisplaysDataType": [
+            {"sppci_model": "Apple Test GPU", "sppci_cores": "80"},
+        ],
+    }
+    assert provenance.graphics_device(displays) == {
+        "device": "Apple Test GPU",
+        "gpu_core_count": 80,
+    }
