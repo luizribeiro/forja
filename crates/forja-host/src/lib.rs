@@ -1576,6 +1576,97 @@ where
             .await
     }
 
+    /// Runs one homogeneous forward-only batch and retains its logits.
+    ///
+    /// # Errors
+    ///
+    /// Returns a component execution error or a construction-boundary refusal.
+    pub async fn batch_forward(
+        &mut self,
+        input: EngineBatch,
+    ) -> wasmtime::Result<Result<EngineTensor, compute::Error>> {
+        self.with_profile(move |runner| Box::pin(runner.batch_forward_inner(input)))
+            .await
+    }
+
+    async fn batch_forward_inner(
+        &mut self,
+        input: EngineBatch,
+    ) -> wasmtime::Result<Result<EngineTensor, compute::Error>> {
+        if let Err(error) = self.release_outputs() {
+            return Ok(Err(error));
+        }
+        let info = match &self.info {
+            Some(info) => info.clone(),
+            None => self.describe().await?,
+        };
+        let Some(serving) = info.serving.as_ref() else {
+            return Ok(Err(compute::Error::Layout(
+                "engine does not declare batch serving".to_owned(),
+            )));
+        };
+        let appended =
+            match validate_batch_lanes(serving, input.shape, &input.lanes, BatchSelection::Forward)
+            {
+                Ok(appended) => appended,
+                Err(error) => return Ok(Err(error)),
+            };
+        let Some(pool) = self.page_pool else {
+            return Ok(Err(invalid_handle("batch serving requires a paged pool")));
+        };
+        let slot = match self.paged_batch_slot(pool) {
+            Ok(slot) => slot,
+            Err(error) => return Ok(Err(error)),
+        };
+        let mut checkpoints = match self.prepare_batch_appends(pool, &input, &appended).await {
+            Ok(checkpoints) => checkpoints,
+            Err(error) => return Ok(Err(error)),
+        };
+        let bucket = input.shape.bucket;
+        let wit_input = input.into();
+        self.set_guest_deadline();
+        let engine = self.instance.l9o_gpu_engine();
+        let output = self
+            .store
+            .run_concurrent(async move |accessor| {
+                engine
+                    .call_batch_forward(accessor, Resource::new_borrow(slot), wit_input)
+                    .await
+            })
+            .await;
+        let logits = match output {
+            Ok(output) => match output? {
+                Ok(output) => output,
+                Err(error) => {
+                    self.rollback_batch_appends(pool, &mut checkpoints)?;
+                    return Ok(Err(error));
+                }
+            },
+            Err(error) if is_epoch_timeout(&error) => {
+                self.rollback_batch_appends(pool, &mut checkpoints)?;
+                return Ok(Err(guest_timeout()));
+            }
+            Err(error) => {
+                self.rollback_batch_appends(pool, &mut checkpoints)?;
+                return Err(error);
+            }
+        };
+        if let Err(error) = self.validate_batch_logits(&info, bucket, &logits) {
+            self.rollback_batch_appends(pool, &mut checkpoints)?;
+            let error = self
+                .release_handles(vec![logits.rep()])
+                .err()
+                .unwrap_or(error);
+            return Ok(Err(error));
+        }
+        self.finish_batch_appends(pool, checkpoints)?;
+        self.output_handles = vec![logits.rep()];
+        Ok(Ok(EngineTensor {
+            handle: logits.rep(),
+            runner_id: self.id,
+        }))
+    }
+
     async fn batch_step_inner(
         &mut self,
         input: EngineBatch,
@@ -2418,6 +2509,24 @@ where
             tokens.tensor.layout().shape(),
         );
         validate_batch_output_layouts(logits, tokens, bucket, info.vocab)
+    }
+
+    fn validate_batch_logits(
+        &self,
+        info: &EngineInfo,
+        bucket: u32,
+        logits: &Resource<TensorEntry>,
+    ) -> Result<(), compute::Error> {
+        let logits = self.store.data().entry(logits)?;
+        if logits.tensor.layout().dtype() != DType::F32
+            || logits.tensor.layout().shape() != [bucket, info.vocab]
+        {
+            return Err(compute::Error::Layout(format!(
+                "batch logits must be f32 [{bucket}, {}]",
+                info.vocab
+            )));
+        }
+        Ok(())
     }
 
     fn validate_logits(

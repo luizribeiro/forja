@@ -55,6 +55,32 @@ async fn runs_a_combined_batch_with_inert_padding() -> wasmtime::Result<()> {
 }
 
 #[tokio::test]
+async fn runs_a_forward_only_batch() -> wasmtime::Result<()> {
+    let (_weights, mut runner) = paged_smoke_runner("forward-batch").await?;
+    assert!(runner.prepare_paged_lane(0, None, 8)?);
+    let logits = runner
+        .batch_forward(EngineBatch {
+            shape: BatchShape {
+                phase: BatchPhase::Decode,
+                bucket: 2,
+                tokens: 1,
+                selection: BatchSelection::Forward,
+            },
+            lanes: vec![
+                Some(EngineBatchLane {
+                    tokens: Some(vec![1]),
+                    start_pos: 0,
+                    sampling: SamplingParams::default(),
+                }),
+                None,
+            ],
+        })
+        .await??;
+    assert_eq!(runner.read(&logits).await?.len(), 8 * size_of::<f32>());
+    Ok(())
+}
+
+#[tokio::test]
 async fn paged_load_requires_a_serving_descriptor() -> wasmtime::Result<()> {
     let weights = weight_file("paged-without-descriptor")?;
     let mut runner = EngineRunner::new(

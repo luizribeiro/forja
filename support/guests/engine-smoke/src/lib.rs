@@ -36,12 +36,14 @@ impl Guest for Component {
                 }],
                 active_lanes: 2,
                 max_context: 32,
-                batch_shapes: vec![BatchShape {
-                    phase: BatchPhase::Decode,
-                    bucket: 2,
-                    tokens: 1,
-                    selection: BatchSelection::Combined,
-                }],
+                batch_shapes: [BatchSelection::Combined, BatchSelection::Forward]
+                    .map(|selection| BatchShape {
+                        phase: BatchPhase::Decode,
+                        bucket: 2,
+                        tokens: 1,
+                        selection,
+                    })
+                    .to_vec(),
             }),
         }
     }
@@ -130,40 +132,14 @@ impl Guest for Component {
         _slot: &l9o::gpu::paged_storage::BatchSlot,
         input: BatchIn,
     ) -> Result<BatchOut, Error> {
-        let mut logits = Vec::with_capacity(8);
-        let mut tokens = Vec::with_capacity(2);
-        for lane in input.lanes {
-            let Some(lane) = lane else {
-                logits.extend([0.0; 4]);
-                tokens.push(0);
-                continue;
-            };
-            let token = lane
-                .tokens
-                .as_ref()
-                .and_then(|tokens| tokens.first())
-                .copied()
-                .unwrap_or_default();
-            let selected = (token + 1) % 4;
-            let mut row = [1.0; 4];
-            row[usize::try_from(selected)
-                .map_err(|_| Error::Layout("token does not fit usize".to_owned()))?] = 4.0;
-            logits.extend(row);
-            tokens.push(selected);
-        }
-        Ok(BatchOut {
-            logits: f32_tensor(&[2, 4], &logits)?,
-            tokens: u32_tensor(&[2], &tokens)?,
-        })
+        batch_output(input)
     }
 
     async fn batch_forward(
         _slot: &l9o::gpu::paged_storage::BatchSlot,
-        _input: exports::l9o::gpu::engine::BatchIn,
+        input: exports::l9o::gpu::engine::BatchIn,
     ) -> Result<Tensor, Error> {
-        Err(Error::OpSignature(
-            "engine does not support batch decode".to_owned(),
-        ))
+        Ok(batch_output(input)?.logits)
     }
 
     async fn batch_select(
@@ -175,6 +151,34 @@ impl Guest for Component {
             "engine does not support batch decode".to_owned(),
         ))
     }
+}
+
+fn batch_output(input: BatchIn) -> Result<BatchOut, Error> {
+    let mut logits = Vec::with_capacity(8);
+    let mut tokens = Vec::with_capacity(2);
+    for lane in input.lanes {
+        let Some(lane) = lane else {
+            logits.extend([0.0; 4]);
+            tokens.push(0);
+            continue;
+        };
+        let token = lane
+            .tokens
+            .as_ref()
+            .and_then(|tokens| tokens.first())
+            .copied()
+            .unwrap_or_default();
+        let selected = (token + 1) % 4;
+        let mut row = [1.0; 4];
+        row[usize::try_from(selected)
+            .map_err(|_| Error::Layout("token does not fit usize".to_owned()))?] = 4.0;
+        logits.extend(row);
+        tokens.push(selected);
+    }
+    Ok(BatchOut {
+        logits: f32_tensor(&[2, 4], &logits)?,
+        tokens: u32_tensor(&[2], &tokens)?,
+    })
 }
 
 fn f32_tensor(shape: &[u32], values: &[f32]) -> Result<Tensor, Error> {
