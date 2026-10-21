@@ -3,7 +3,7 @@
 #![cfg(target_os = "macos")]
 #![allow(clippy::cast_precision_loss)]
 
-use std::{any::Any, collections::HashSet};
+use std::{any::Any, collections::HashSet, ops::Range};
 
 use forja_core::{
     Backend, BackendDispatchData, BackendError, CommandList, DType, GraphLimits, GraphTemplate, Op,
@@ -336,6 +336,24 @@ fn metal_in_flight_paged_read_defers_page_reuse() {
     allocator.observe_completion(serial).unwrap();
 }
 
+fn seeded_query_values(
+    query_heads: u32,
+    query_length: u32,
+    width: u32,
+    head_offset: u32,
+) -> Vec<f32> {
+    let element_offset = head_offset
+        .checked_mul(query_length)
+        .and_then(|offset| offset.checked_mul(width))
+        .unwrap();
+    (0..query_heads * query_length * width)
+        .map(|index| {
+            let source = element_offset.checked_add(index).unwrap();
+            ((source * 17) % 89) as f32 / 88.0 - 0.5
+        })
+        .collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_sdpa<B: Backend + 'static>(
     backend: &B,
@@ -346,6 +364,7 @@ fn run_sdpa<B: Backend + 'static>(
     contiguous: bool,
     query_heads: u32,
     kv_heads: u32,
+    head_offsets: (u32, u32),
     corrupt_generation: bool,
     variant: Option<&str>,
 ) -> Result<Vec<f32>, BackendError> {
@@ -373,6 +392,8 @@ fn run_sdpa<B: Backend + 'static>(
     if corrupt_generation {
         generations[usize::try_from(entries[0].0).unwrap()] = 0;
     }
+    let (query_head_offset, kv_head_offset) = head_offsets;
+    let kv_element_offset = kv_head_offset.checked_mul(WIDTH).unwrap();
     let plane_elements = usize::try_from(kv_heads * WIDTH).unwrap();
     let pool_tokens = usize::try_from(physical_pages * PAGE_TOKENS).unwrap();
     let mut keys = vec![0.0_f32; pool_tokens * plane_elements];
@@ -383,16 +404,16 @@ fn run_sdpa<B: Backend + 'static>(
         let physical_token = physical * PAGE_TOKENS + token % PAGE_TOKENS;
         let base = usize::try_from(physical_token).unwrap() * plane_elements;
         for element in 0..plane_elements {
-            let seed = u32::try_from(element).unwrap();
+            let seed = kv_element_offset
+                .checked_add(u32::try_from(element).unwrap())
+                .unwrap();
             keys[base + element] =
                 ((token.wrapping_mul(13) + seed.wrapping_mul(7)) % 101) as f32 / 100.0 - 0.5;
             values[base + element] =
                 ((token.wrapping_mul(5) + seed.wrapping_mul(11)) % 97) as f32 / 96.0 - 0.5;
         }
     }
-    let query_values = (0..query_heads * query_length * WIDTH)
-        .map(|index| ((index * 17) % 89) as f32 / 88.0 - 0.5)
-        .collect::<Vec<_>>();
+    let query_values = seeded_query_values(query_heads, query_length, WIDTH, query_head_offset);
     let query_storage = backend.alloc(DType::F32, &[query_length, query_heads, WIDTH])?;
     let query = backend.view(&query_storage, ViewOp::Permute(vec![1, 0, 2]))?;
     let key = backend.alloc(dtype, &[physical_pages, PAGE_TOKENS, kv_heads, WIDTH])?;
@@ -444,54 +465,109 @@ fn run_sdpa<B: Backend + 'static>(
     backend.read(&output).map(|bytes| decode_f32(&bytes))
 }
 
-#[test]
-fn metal_paged_sdpa_matches_cpu_at_real_shapes() {
+fn check_paged_sdpa_real_shapes(dtype: DType, shapes: &[(u32, u32)], query_head_range: Range<u32>) {
+    const QUERY_HEADS: u32 = 16;
+    const KV_HEADS: u32 = 8;
+    const WIDTH: u32 = 128;
+
+    assert!(query_head_range.start < query_head_range.end);
+    assert_eq!(query_head_range.start % 2, 0);
+    assert_eq!(query_head_range.end % 2, 0);
+    assert!(query_head_range.end <= QUERY_HEADS);
+    let reference_query_heads = query_head_range.end - query_head_range.start;
+    let reference_kv_heads = reference_query_heads / 2;
+    let reference_kv_offset = query_head_range.start / 2;
     let cpu = forja_cpu::CpuBackend::new();
     let metal = forja_metal::MetalBackend::new().unwrap();
-    for dtype in [DType::F32, DType::F16, DType::BF16] {
-        for (length, query_length) in [(1, 1), (7, 2), (33, 7), (4_097, 7), (16_384, 2)] {
-            if dtype == DType::F32 && length == 16_384 {
-                continue;
-            }
-            let reference = run_sdpa(
-                &cpu,
-                dtype,
-                length,
-                query_length,
-                true,
-                false,
-                16,
-                8,
-                false,
-                None,
-            )
-            .unwrap();
-            let variant = match (dtype, query_length) {
-                (_, 1) => "paged-sdpa.vector",
-                (DType::F32, _) => "paged-sdpa.steel",
-                _ => "paged-sdpa.steel-half",
-            };
-            let candidate = run_sdpa(
-                &metal,
-                dtype,
-                length,
-                query_length,
-                true,
-                false,
-                16,
-                8,
-                false,
-                Some(variant),
-            )
-            .unwrap();
-            let error = forja_testing::normwise_relative_error(&reference, &candidate);
-            assert!(
-                error <= forja_testing::dtype_tolerance(dtype).unwrap(),
-                "dtype={dtype:?} length={length} error={error}"
-            );
-        }
+    for &(length, query_length) in shapes {
+        let reference = run_sdpa(
+            &cpu,
+            dtype,
+            length,
+            query_length,
+            true,
+            false,
+            reference_query_heads,
+            reference_kv_heads,
+            (query_head_range.start, reference_kv_offset),
+            false,
+            None,
+        )
+        .unwrap();
+        let variant = match (dtype, query_length) {
+            (_, 1) => "paged-sdpa.vector",
+            (DType::F32, _) => "paged-sdpa.steel",
+            _ => "paged-sdpa.steel-half",
+        };
+        let candidate = run_sdpa(
+            &metal,
+            dtype,
+            length,
+            query_length,
+            true,
+            false,
+            QUERY_HEADS,
+            KV_HEADS,
+            (0, 0),
+            false,
+            Some(variant),
+        )
+        .unwrap();
+        let row_elements = usize::try_from(query_length * WIDTH).unwrap();
+        let candidate_start = usize::try_from(query_head_range.start).unwrap() * row_elements;
+        let candidate_end = usize::try_from(query_head_range.end).unwrap() * row_elements;
+        let error = forja_testing::normwise_relative_error(
+            &reference,
+            &candidate[candidate_start..candidate_end],
+        );
+        assert!(
+            error <= forja_testing::dtype_tolerance(dtype).unwrap(),
+            "dtype={dtype:?} length={length} error={error}"
+        );
     }
 }
+
+#[test]
+fn metal_paged_sdpa_matches_cpu_at_short_real_shapes() {
+    for dtype in [DType::F32, DType::F16, DType::BF16] {
+        check_paged_sdpa_real_shapes(dtype, &[(1, 1), (7, 2), (33, 7)], 0..16);
+    }
+}
+
+macro_rules! real_shape_tests {
+    ($(($name:ident, $dtype:expr, $length:expr, $query_length:expr, $heads:expr)),+ $(,)?) => {
+        $(
+            #[test]
+            fn $name() {
+                check_paged_sdpa_real_shapes($dtype, &[($length, $query_length)], $heads);
+            }
+        )+
+    };
+}
+
+#[rustfmt::skip]
+real_shape_tests!(
+    (metal_paged_sdpa_matches_cpu_at_4097_f32_heads_0_3, DType::F32, 4_097, 7, 0..4),
+    (metal_paged_sdpa_matches_cpu_at_4097_f32_heads_4_7, DType::F32, 4_097, 7, 4..8),
+    (metal_paged_sdpa_matches_cpu_at_4097_f32_heads_8_11, DType::F32, 4_097, 7, 8..12),
+    (metal_paged_sdpa_matches_cpu_at_4097_f32_heads_12_15, DType::F32, 4_097, 7, 12..16),
+    (metal_paged_sdpa_matches_cpu_at_4097_f16_heads_0_3, DType::F16, 4_097, 7, 0..4),
+    (metal_paged_sdpa_matches_cpu_at_4097_f16_heads_4_7, DType::F16, 4_097, 7, 4..8),
+    (metal_paged_sdpa_matches_cpu_at_4097_f16_heads_8_11, DType::F16, 4_097, 7, 8..12),
+    (metal_paged_sdpa_matches_cpu_at_4097_f16_heads_12_15, DType::F16, 4_097, 7, 12..16),
+    (metal_paged_sdpa_matches_cpu_at_4097_bf16_heads_0_3, DType::BF16, 4_097, 7, 0..4),
+    (metal_paged_sdpa_matches_cpu_at_4097_bf16_heads_4_7, DType::BF16, 4_097, 7, 4..8),
+    (metal_paged_sdpa_matches_cpu_at_4097_bf16_heads_8_11, DType::BF16, 4_097, 7, 8..12),
+    (metal_paged_sdpa_matches_cpu_at_4097_bf16_heads_12_15, DType::BF16, 4_097, 7, 12..16),
+    (metal_paged_sdpa_matches_cpu_at_16384_f16_heads_0_3, DType::F16, 16_384, 2, 0..4),
+    (metal_paged_sdpa_matches_cpu_at_16384_f16_heads_4_7, DType::F16, 16_384, 2, 4..8),
+    (metal_paged_sdpa_matches_cpu_at_16384_f16_heads_8_11, DType::F16, 16_384, 2, 8..12),
+    (metal_paged_sdpa_matches_cpu_at_16384_f16_heads_12_15, DType::F16, 16_384, 2, 12..16),
+    (metal_paged_sdpa_matches_cpu_at_16384_bf16_heads_0_3, DType::BF16, 16_384, 2, 0..4),
+    (metal_paged_sdpa_matches_cpu_at_16384_bf16_heads_4_7, DType::BF16, 16_384, 2, 4..8),
+    (metal_paged_sdpa_matches_cpu_at_16384_bf16_heads_8_11, DType::BF16, 16_384, 2, 8..12),
+    (metal_paged_sdpa_matches_cpu_at_16384_bf16_heads_12_15, DType::BF16, 16_384, 2, 12..16),
+);
 
 #[test]
 fn metal_paged_gqa_two_pass_matches_cpu() {
@@ -508,6 +584,7 @@ fn metal_paged_gqa_two_pass_matches_cpu() {
                 contiguous,
                 32,
                 4,
+                (0, 0),
                 false,
                 None,
             )
@@ -521,6 +598,7 @@ fn metal_paged_gqa_two_pass_matches_cpu() {
                 contiguous,
                 32,
                 4,
+                (0, 0),
                 false,
                 None,
             )
@@ -538,8 +616,34 @@ fn metal_paged_gqa_two_pass_matches_cpu() {
 fn metal_paged_sdpa_uses_contiguous_entry_path() {
     let cpu = forja_cpu::CpuBackend::new();
     let metal = forja_metal::MetalBackend::new().unwrap();
-    let reference = run_sdpa(&cpu, DType::F16, 129, 1, false, true, 16, 8, false, None).unwrap();
-    let candidate = run_sdpa(&metal, DType::F16, 129, 1, false, true, 16, 8, false, None).unwrap();
+    let reference = run_sdpa(
+        &cpu,
+        DType::F16,
+        129,
+        1,
+        false,
+        true,
+        16,
+        8,
+        (0, 0),
+        false,
+        None,
+    )
+    .unwrap();
+    let candidate = run_sdpa(
+        &metal,
+        DType::F16,
+        129,
+        1,
+        false,
+        true,
+        16,
+        8,
+        (0, 0),
+        false,
+        None,
+    )
+    .unwrap();
     assert!(
         forja_testing::normwise_relative_error(&reference, &candidate)
             <= forja_testing::F16_TOLERANCE
@@ -550,7 +654,20 @@ fn metal_paged_sdpa_uses_contiguous_entry_path() {
 fn metal_paged_sdpa_matches_causal_prefill() {
     let cpu = forja_cpu::CpuBackend::new();
     let metal = forja_metal::MetalBackend::new().unwrap();
-    let reference = run_sdpa(&cpu, DType::F16, 11, 11, true, true, 32, 4, false, None).unwrap();
+    let reference = run_sdpa(
+        &cpu,
+        DType::F16,
+        11,
+        11,
+        true,
+        true,
+        32,
+        4,
+        (0, 0),
+        false,
+        None,
+    )
+    .unwrap();
     let candidate = run_sdpa(
         &metal,
         DType::F16,
@@ -560,6 +677,7 @@ fn metal_paged_sdpa_matches_causal_prefill() {
         true,
         32,
         4,
+        (0, 0),
         false,
         Some("paged-sdpa.steel-half"),
     )
@@ -581,6 +699,7 @@ fn metal_paged_steel_refuses_corrupt_entries() {
         true,
         16,
         8,
+        (0, 0),
         true,
         Some("paged-sdpa.steel-half"),
     )
