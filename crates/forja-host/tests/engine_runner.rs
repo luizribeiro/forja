@@ -55,6 +55,15 @@ async fn paged_load_requires_a_serving_descriptor() -> wasmtime::Result<()> {
 }
 
 #[tokio::test]
+async fn prepares_independent_paged_lanes() -> wasmtime::Result<()> {
+    let (_weights, mut runner) = paged_smoke_runner("paged-lanes").await?;
+    assert!(runner.prepare_paged_lane(0, None, 8)?);
+    assert!(runner.prepare_paged_lane(1, None, 8)?);
+    assert!(runner.prepare_paged_lane(2, None, 8).is_err());
+    Ok(())
+}
+
+#[tokio::test]
 async fn passes_engine_selections_through_load_config() -> wasmtime::Result<()> {
     let weights = weight_file("load-config")?;
     let mut runner = EngineRunner::new(
@@ -218,6 +227,29 @@ async fn run_engine(component: &Path, taps: bool, fixture: &str) -> wasmtime::Re
     assert_eq!(logits, [1.0, 2.0, 3.0, 4.0]);
     assert_eq!(output.taps.len(), usize::from(taps));
     Ok(())
+}
+
+async fn paged_smoke_runner(
+    fixture: &str,
+) -> wasmtime::Result<(WeightFile, EngineRunner<CpuBackend>)> {
+    let weights = weight_file(fixture)?;
+    let mut runner = EngineRunner::new(
+        test_guests::engine_smoke(),
+        CpuBackend::new(),
+        LIMITS,
+        weights.path(),
+    )
+    .await?;
+    runner
+        .load_with_selections(
+            None,
+            &EngineLoadConfig {
+                paged_cache: true,
+                ..EngineLoadConfig::default()
+            },
+        )
+        .await??;
+    Ok((weights, runner))
 }
 
 struct WeightFile {

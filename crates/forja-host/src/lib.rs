@@ -1696,6 +1696,28 @@ where
         Ok(true)
     }
 
+    /// Replaces one paged serving lane with a retained prefix or a fresh sequence.
+    ///
+    /// Returns `false` when this runner was loaded without paged storage.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an out-of-range lane or a failed reservation or binding.
+    pub fn prepare_paged_lane(
+        &mut self,
+        lane: u32,
+        prefix: Option<PagedPrefix>,
+        reserved_tokens: u64,
+    ) -> Result<bool, compute::Error> {
+        let Some(pool) = self.page_pool else {
+            return Ok(false);
+        };
+        self.store
+            .data_mut()
+            .bind_paged_lane(pool, lane, prefix, reserved_tokens)?;
+        Ok(true)
+    }
+
     /// Returns the active paged sequence as a shareable prefix capability.
     ///
     /// # Errors
