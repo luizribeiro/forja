@@ -2181,6 +2181,9 @@ pub struct BatchSlotEntry {
     planes: Vec<u32>,
     tables: [Vec<u32>; 2],
     generations: u32,
+    logical_lengths: u32,
+    query_starts: u32,
+    absolute_positions: u32,
 }
 
 struct PagedBinding {
@@ -2207,6 +2210,7 @@ struct PagedBackingHandles {
     planes: Vec<u32>,
     tables: [Vec<u32>; 2],
     generations: u32,
+    metadata: [u32; 3],
 }
 
 impl TensorEntry {
@@ -2621,11 +2625,15 @@ impl<B: Backend + 'static> Host<B> {
         let mut cleanup = backing.planes.clone();
         cleanup.extend(backing.tables.iter().flatten().copied());
         cleanup.push(backing.generations);
+        cleanup.extend(backing.metadata);
         let slot = match self.table.push(BatchSlotEntry {
             binding,
             planes: backing.planes,
             tables: backing.tables,
             generations: backing.generations,
+            logical_lengths: backing.metadata[0],
+            query_starts: backing.metadata[1],
+            absolute_positions: backing.metadata[2],
         }) {
             Ok(slot) => slot,
             Err(error) => {
@@ -2650,6 +2658,8 @@ impl<B: Backend + 'static> Host<B> {
     ) -> Result<PagedBackingHandles, compute::Error> {
         let physical_pages = u32::try_from(table_pages)
             .map_err(|_| compute::Error::Layout("physical page count exceeds u32".to_owned()))?;
+        let lane_count = u32::try_from(active_lanes)
+            .map_err(|_| compute::Error::Layout("lane count exceeds u32".to_owned()))?;
         let mut backing = Vec::new();
         let mut plane_handles = Vec::new();
         for (dtype, elements) in plane_specs {
@@ -2689,6 +2699,19 @@ impl<B: Backend + 'static> Host<B> {
                 }
             }
         }
+        let mut metadata = Vec::with_capacity(3);
+        for _ in 0..3 {
+            match self.alloc_paged_tensor(compute::Dtype::U32, &[lane_count]) {
+                Ok(tensor) => {
+                    metadata.push(tensor);
+                    backing.push(tensor);
+                }
+                Err(error) => {
+                    self.drop_paged_handles(backing);
+                    return Err(error);
+                }
+            }
+        }
         let generation_bytes = usize::try_from(physical_pages)
             .ok()
             .and_then(|pages| pages.checked_mul(4))
@@ -2708,10 +2731,21 @@ impl<B: Backend + 'static> Host<B> {
                 return Err(error);
             }
         }
+        let metadata_len = active_lanes.checked_mul(4).ok_or_else(|| {
+            compute::Error::Layout("paged metadata byte size overflowed".to_owned())
+        })?;
+        let metadata_bytes = vec![0; metadata_len];
+        for &tensor in &metadata {
+            if let Err(error) = self.write(&Resource::new_borrow(tensor), &metadata_bytes) {
+                self.drop_paged_handles(backing);
+                return Err(error);
+            }
+        }
         Ok(PagedBackingHandles {
             planes: plane_handles,
             tables: table_handles,
             generations,
+            metadata: [metadata[0], metadata[1], metadata[2]],
         })
     }
 
@@ -6295,6 +6329,11 @@ where
                 let mut resources = entry.planes;
                 resources.extend(entry.tables.into_iter().flatten());
                 resources.push(entry.generations);
+                resources.extend([
+                    entry.logical_lengths,
+                    entry.query_starts,
+                    entry.absolute_positions,
+                ]);
                 self.drop_paged_handles(resources);
             });
         std::future::ready(result.map_err(wasmtime::Error::msg))
@@ -7224,6 +7263,27 @@ mod tests {
             .load(Ordering::Acquire);
 
         assert_eq!(host.live_bytes.load(Ordering::Acquire), charged);
+    }
+
+    #[test]
+    fn paged_slot_allocates_host_owned_lane_metadata() {
+        let mut host = Host::new(CpuBackend::new(), GENEROUS);
+        let pool = insert_test_pool(&mut host, 1, 8);
+        let slot = host.open_paged_slot(&pool, 1).unwrap();
+        let slot = host.table.get(&slot).unwrap();
+
+        for handle in [
+            slot.logical_lengths,
+            slot.query_starts,
+            slot.absolute_positions,
+        ] {
+            let tensor = host
+                .table
+                .get(&Resource::<TensorEntry>::new_borrow(handle))
+                .unwrap();
+            assert_eq!(tensor.tensor.layout().dtype(), DType::U32);
+            assert_eq!(tensor.tensor.layout().shape(), [1]);
+        }
     }
 
     #[test]
