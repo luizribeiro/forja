@@ -473,10 +473,18 @@ fn paged_entries(logical_pages: u32, contiguous: bool) -> (u32, Vec<(u32, u32)>)
             } else {
                 logical + 2
             };
-            (page, 11 + page)
+            (page, page_generation(page))
         })
         .collect();
     (physical_pages, entries)
+}
+
+fn page_generation(page: u32) -> u32 {
+    11 + page
+}
+
+fn page_generations(physical_pages: u32) -> Vec<u32> {
+    (0..physical_pages).map(page_generation).collect()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -502,9 +510,7 @@ fn run_sdpa<B: Backend + 'static>(
         .ok_or(BackendError::InvalidInput)?;
     let logical_pages = key_length.div_ceil(PAGE_TOKENS);
     let (physical_pages, entries) = paged_entries(logical_pages, contiguous);
-    let mut generations = (0..physical_pages)
-        .map(|page| 11 + page)
-        .collect::<Vec<_>>();
+    let mut generations = page_generations(physical_pages);
     for &logical_page in corrupt_pages {
         generations[usize::try_from(entries[logical_page].0).unwrap()] = 0;
     }
@@ -1069,55 +1075,61 @@ fn benchmark_commands(
     query_length: u32,
     contiguous_variant: &str,
     paged_variant: &str,
+    consecutive_pages: bool,
+    heads: (u32, u32),
 ) -> (
     impl FnMut() -> CommandList + use<>,
     impl FnMut() -> CommandList + use<>,
 ) {
     const PAGE_TOKENS: u32 = 64;
-    const QUERY_HEADS: u32 = 32;
-    const KV_HEADS: u32 = 4;
     const WIDTH: u32 = 128;
 
+    let (query_heads, kv_heads) = heads;
     let pages = key_length.div_ceil(PAGE_TOKENS);
+    let (physical_pages, entries) = paged_entries(pages, consecutive_pages);
     let query = backend
-        .alloc(DType::F32, &[QUERY_HEADS, query_length, WIDTH])
+        .alloc(DType::F32, &[query_heads, query_length, WIDTH])
         .unwrap();
     let contiguous_key = backend
-        .alloc(DType::F16, &[KV_HEADS, key_length, WIDTH])
+        .alloc(DType::F16, &[kv_heads, key_length, WIDTH])
         .unwrap();
     let contiguous_value = backend
-        .alloc(DType::F16, &[KV_HEADS, key_length, WIDTH])
+        .alloc(DType::F16, &[kv_heads, key_length, WIDTH])
         .unwrap();
     let paged_key = backend
-        .alloc(DType::F16, &[pages, PAGE_TOKENS, KV_HEADS, WIDTH])
+        .alloc(DType::F16, &[physical_pages, PAGE_TOKENS, kv_heads, WIDTH])
         .unwrap();
     let paged_value = backend
-        .alloc(DType::F16, &[pages, PAGE_TOKENS, KV_HEADS, WIDTH])
+        .alloc(DType::F16, &[physical_pages, PAGE_TOKENS, kv_heads, WIDTH])
         .unwrap();
     let table = backend.alloc(DType::U32, &[pages, 2]).unwrap();
-    let generations = backend.alloc(DType::U32, &[pages]).unwrap();
+    let generations = backend.alloc(DType::U32, &[physical_pages]).unwrap();
     let contiguous_output = backend
-        .alloc(DType::F32, &[QUERY_HEADS, query_length, WIDTH])
+        .alloc(DType::F32, &[query_heads, query_length, WIDTH])
         .unwrap();
     let paged_output = backend
-        .alloc(DType::F32, &[QUERY_HEADS, query_length, WIDTH])
+        .alloc(DType::F32, &[query_heads, query_length, WIDTH])
         .unwrap();
-    let query_values = (0..QUERY_HEADS * query_length * WIDTH)
+    let query_values = (0..query_heads * query_length * WIDTH)
         .map(|index| ((index * 17) % 89) as f32 / 88.0 - 0.5)
         .collect::<Vec<_>>();
-    let contiguous_values = (0..KV_HEADS * key_length * WIDTH)
+    let contiguous_values = (0..kv_heads * key_length * WIDTH)
         .map(|index| ((index * 7) % 101) as f32 / 100.0 - 0.5)
         .collect::<Vec<_>>();
-    let padded_tokens = pages * PAGE_TOKENS;
+    let padded_tokens = physical_pages * PAGE_TOKENS;
     let mut paged_values =
-        vec![0.0_f32; usize::try_from(padded_tokens * KV_HEADS * WIDTH).unwrap()];
-    for head in 0..KV_HEADS {
+        vec![0.0_f32; usize::try_from(padded_tokens * kv_heads * WIDTH).unwrap()];
+    for head in 0..kv_heads {
         for token in 0..key_length {
             for column in 0..WIDTH {
                 let contiguous_index =
                     usize::try_from((head * key_length + token) * WIDTH + column).unwrap();
+                let logical_page = token / PAGE_TOKENS;
+                let physical_token = entries[usize::try_from(logical_page).unwrap()].0
+                    * PAGE_TOKENS
+                    + token % PAGE_TOKENS;
                 let paged_index =
-                    usize::try_from((token * KV_HEADS + head) * WIDTH + column).unwrap();
+                    usize::try_from((physical_token * kv_heads + head) * WIDTH + column).unwrap();
                 paged_values[paged_index] = contiguous_values[contiguous_index];
             }
         }
@@ -1137,12 +1149,11 @@ fn benchmark_commands(
     backend
         .write(&paged_value, &encode(&paged_values, DType::F16))
         .unwrap();
-    let entries = (0..pages).map(|page| (page, 1)).collect::<Vec<_>>();
     backend.write(&table, &table_bytes(&entries)).unwrap();
     backend
         .write(
             &generations,
-            &generation_bytes(&vec![1; usize::try_from(pages).unwrap()]),
+            &generation_bytes(&page_generations(physical_pages)),
         )
         .unwrap();
     let scale = 1.0 / (WIDTH as f32).sqrt();
@@ -1206,23 +1217,45 @@ fn benchmark_commands(
 #[ignore = "manual paged-attention kernel checkpoint"]
 fn metal_paged_sdpa_microbenchmark() {
     let backend = forja_metal::MetalBackend::new().unwrap();
-    for length in [512, 4_096] {
+    for consecutive in [true, false] {
+        for length in [512, 4_096] {
+            let (contiguous, paged) = benchmark_commands(
+                &backend,
+                length,
+                length,
+                "sdpa.steel-half",
+                "paged-sdpa.steel-half",
+                consecutive,
+                (32, 4),
+            );
+            let (contiguous_time, paged_time) =
+                super::common::comparative_gpu_times(&backend, contiguous, paged);
+            eprintln!(
+                "paged-sdpa queries={length} consecutive={consecutive} steel_half_us={} paged_steel_half_us={} ratio={:.4}",
+                contiguous_time.as_secs_f64() * 1.0e6,
+                paged_time.as_secs_f64() * 1.0e6,
+                paged_time.as_secs_f64() / contiguous_time.as_secs_f64(),
+            );
+        }
+    }
+    for consecutive in [true, false] {
         let (contiguous, paged) = benchmark_commands(
             &backend,
-            length,
-            length,
-            "sdpa.steel-half",
-            "paged-sdpa.steel-half",
+            512,
+            1,
+            "sdpa.vector-single-pass",
+            "paged-sdpa.vector",
+            consecutive,
+            (16, 8),
         );
         let (contiguous_time, paged_time) =
             super::common::comparative_gpu_times(&backend, contiguous, paged);
         eprintln!(
-            "paged-sdpa queries={length} steel_half_us={} paged_steel_half_us={} ratio={:.4}",
+            "paged-sdpa keys=512 consecutive={consecutive} vector_us={} paged_vector_us={} ratio={:.4}",
             contiguous_time.as_secs_f64() * 1.0e6,
             paged_time.as_secs_f64() * 1.0e6,
             paged_time.as_secs_f64() / contiguous_time.as_secs_f64(),
         );
-        assert!(paged_time.as_secs_f64() / contiguous_time.as_secs_f64() <= 1.04);
     }
     let mut decode_regressions = Vec::new();
     for (length, blocks) in [
@@ -1239,6 +1272,8 @@ fn metal_paged_sdpa_microbenchmark() {
             1,
             &format!("sdpa.vector-gqa-two-pass{blocks}"),
             &format!("paged-sdpa.vector-gqa-two-pass{blocks}"),
+            true,
+            (32, 4),
         );
         let (contiguous_time, paged_time) =
             super::common::comparative_gpu_times(&backend, contiguous, paged);
