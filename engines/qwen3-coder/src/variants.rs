@@ -24,6 +24,7 @@ const SITES: &[&str] = &[
     "paged-attention.decode",
     "paged-attention.prefill-large",
     "paged-attention.prefill-small",
+    "paged-attention.prefill-tiny",
 ];
 
 pub(crate) struct Variants(EngineSelections);
@@ -78,13 +79,7 @@ impl Variants {
         parameter: Option<&Param>,
         paged: bool,
     ) -> Result<VariantSelection> {
-        let phase = if sequence == 1 {
-            "decode"
-        } else if sequence >= 512 {
-            "prefill-large"
-        } else {
-            "prefill-small"
-        };
+        let phase = attention_phase(sequence, paged);
         let site = if paged {
             format!("paged-attention.{phase}")
         } else {
@@ -110,6 +105,18 @@ fn gathered_size(routed_rows: u32) -> &'static str {
         "grouped-small-m"
     } else {
         "small"
+    }
+}
+
+fn attention_phase(sequence: u32, paged: bool) -> &'static str {
+    if sequence == 1 {
+        "decode"
+    } else if sequence >= 512 {
+        "prefill-large"
+    } else if paged && sequence <= 33 {
+        "prefill-tiny"
+    } else {
+        "prefill-small"
     }
 }
 
@@ -143,5 +150,16 @@ mod tests {
         assert_eq!(gathered_size(64), "grouped-small-m");
         assert_eq!(gathered_size(511), "grouped-small-m");
         assert_eq!(gathered_size(512), "grouped");
+    }
+
+    #[test]
+    fn classifies_paged_attention_sites_at_boundaries() {
+        assert_eq!(attention_phase(1, true), "decode");
+        assert_eq!(attention_phase(2, true), "prefill-tiny");
+        assert_eq!(attention_phase(33, true), "prefill-tiny");
+        assert_eq!(attention_phase(34, true), "prefill-small");
+        assert_eq!(attention_phase(511, true), "prefill-small");
+        assert_eq!(attention_phase(512, true), "prefill-large");
+        assert_eq!(attention_phase(33, false), "prefill-small");
     }
 }

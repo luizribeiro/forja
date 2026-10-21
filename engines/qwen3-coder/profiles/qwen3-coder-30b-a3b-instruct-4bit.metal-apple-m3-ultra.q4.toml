@@ -50,6 +50,7 @@ prompt-token-budget = 2048
 "attention.prefill-small" = "sdpa.decomposed"
 "paged-attention.prefill-large" = "paged-sdpa.steel-half"
 "paged-attention.prefill-small" = "paged-sdpa.steel-half"
+"paged-attention.prefill-tiny" = "paged-sdpa.vector"
 
 [variants.rules."attention.decode"]
 parameter = "position"
