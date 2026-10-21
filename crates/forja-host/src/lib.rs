@@ -6301,16 +6301,12 @@ where
                 ));
             }
             let page_tokens = page_shape[1];
-            // Recorded commands replay after the lane is rebound to other tables, so they
-            // cannot assume that this snapshot's pages stay consecutive.
-            let contiguous_entries = false;
             let template = TemplateOp::paged_sdpa(
                 config.scale,
                 config.causal,
                 affine_q_start,
                 affine_key_length,
                 page_tokens,
-                contiguous_entries,
             );
             let concrete = affine_q_start.is_constant().then_some(Op::PagedSdpa {
                 scale: config.scale,
@@ -6318,7 +6314,6 @@ where
                 q_start,
                 key_length,
                 page_tokens,
-                contiguous_entries,
             });
             let protected = vec![
                 key.tensor.buffer(),

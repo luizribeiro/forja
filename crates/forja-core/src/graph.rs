@@ -378,8 +378,6 @@ pub enum TemplateOp {
         key_length: Affine,
         /// Number of tokens in one page.
         page_tokens: u32,
-        /// Whether the page table entries are consecutive.
-        contiguous_entries: bool,
     },
     /// Sampling with a parameterized absolute sequence position.
     Sample {
@@ -442,7 +440,6 @@ impl TemplateOp {
         q_start: Affine,
         key_length: Affine,
         page_tokens: u32,
-        contiguous_entries: bool,
     ) -> Self {
         Self::PagedSdpa {
             scale,
@@ -450,7 +447,6 @@ impl TemplateOp {
             q_start,
             key_length,
             page_tokens,
-            contiguous_entries,
         }
     }
 
@@ -522,14 +518,12 @@ impl TemplateOp {
                 q_start,
                 key_length,
                 page_tokens,
-                contiguous_entries,
             } => Ok(Op::PagedSdpa {
                 scale,
                 causal,
                 q_start: q_start.evaluate(values)?,
                 key_length: key_length.evaluate(values)?,
                 page_tokens,
-                contiguous_entries,
             }),
             Self::Sample {
                 position,
@@ -598,14 +592,12 @@ impl From<Op> for TemplateOp {
                 q_start,
                 key_length,
                 page_tokens,
-                contiguous_entries,
             } => Self::paged_sdpa(
                 scale,
                 causal,
                 Affine::constant(q_start),
                 Affine::constant(key_length),
                 page_tokens,
-                contiguous_entries,
             ),
             Op::Sample {
                 position,

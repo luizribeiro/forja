@@ -562,7 +562,6 @@ fn run_sdpa<B: Backend + 'static>(
                 q_start,
                 key_length,
                 page_tokens: PAGE_TOKENS,
-                contiguous_entries: contiguous,
             },
             &[&query, &key, &value, &table, &generation_tensor],
             &output,
@@ -1046,7 +1045,6 @@ fn metal_paged_copy_then_sdpa_matches_cpu() {
                     q_start: 0,
                     key_length: TOKENS,
                     page_tokens: PAGE_TOKENS,
-                    contiguous_entries: true,
                 },
                 &[&query, &key, &value, &table, &generations],
                 &output,
@@ -1167,7 +1165,6 @@ fn benchmark_commands(
         q_start: key_length - query_length,
         key_length,
         page_tokens: PAGE_TOKENS,
-        contiguous_entries: true,
     };
     let paged_variant = backend
         .validate_variant_for_op(

@@ -270,8 +270,6 @@ pub enum Op {
         key_length: u32,
         /// Logical tokens stored by one physical page.
         page_tokens: u32,
-        /// Whether the trusted table validator proved consecutive physical entries.
-        contiguous_entries: bool,
     },
 }
 

@@ -1890,7 +1890,6 @@ mod tests {
                     q_start: 0,
                     key_length: 7,
                     page_tokens: 4,
-                    contiguous_entries: false,
                 },
                 &[&query, &key, &value, &table, &generations],
                 &output,

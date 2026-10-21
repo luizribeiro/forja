@@ -3159,7 +3159,6 @@ impl MetalBackend {
             q_start,
             key_length,
             page_tokens,
-            contiguous_entries: _,
         } = dispatch.op()
         else {
             return Err(BackendError::InvalidInput);
