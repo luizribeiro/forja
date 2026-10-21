@@ -868,6 +868,46 @@ pub fn validate_batch_output_layouts(
     Ok(())
 }
 
+impl From<EngineBatch> for engine_bindings::exports::l9o::gpu::engine::BatchIn {
+    fn from(input: EngineBatch) -> Self {
+        use engine_bindings::exports::l9o::gpu::engine::{
+            BatchIn, BatchLane, BatchPhase as WitPhase, BatchSelection as WitSelection,
+            BatchShape as WitShape, SamplingParams as WitSampling,
+        };
+        BatchIn {
+            shape: WitShape {
+                phase: match input.shape.phase {
+                    BatchPhase::Prompt => WitPhase::Prompt,
+                    BatchPhase::Decode => WitPhase::Decode,
+                },
+                bucket: input.shape.bucket,
+                tokens: input.shape.tokens,
+                selection: match input.shape.selection {
+                    BatchSelection::Combined => WitSelection::Combined,
+                    BatchSelection::Forward => WitSelection::Forward,
+                    BatchSelection::Masked => WitSelection::Masked,
+                },
+            },
+            lanes: input
+                .lanes
+                .into_iter()
+                .map(|lane| {
+                    lane.map(|lane| BatchLane {
+                        tokens: lane.tokens,
+                        start_pos: lane.start_pos,
+                        sampling: WitSampling {
+                            temperature: lane.sampling.temperature,
+                            top_k: lane.sampling.top_k,
+                            top_p: lane.sampling.top_p,
+                            seed: lane.sampling.seed,
+                        },
+                    })
+                })
+                .collect(),
+        }
+    }
+}
+
 struct EpochEngine {
     engine: Engine,
     live: Weak<()>,
@@ -7558,10 +7598,10 @@ mod tests {
 
     use super::{
         BackendEvent, BackendTimer, BatchPhase, BatchSelection, BatchShape, BatchSlotEntry,
-        EngineBatchLane, EngineMemory, EngineMetrics, EngineRunner, EngineStep, EngineStepProfile,
-        Grants, Host, ImportKind, ImportTimer, Limits, MAX_INSTRUCTIONS, MAX_OUTPUTS,
-        PagePoolEntry, PagedSequenceEntry, ParamsEntry, ReplayFlight, ReplayState, SamplingParams,
-        ServingInfo, SubmissionOutcome, TensorEntry,
+        EngineBatch, EngineBatchLane, EngineMemory, EngineMetrics, EngineRunner, EngineStep,
+        EngineStepProfile, Grants, Host, ImportKind, ImportTimer, Limits, MAX_INSTRUCTIONS,
+        MAX_OUTPUTS, PagePoolEntry, PagedSequenceEntry, ParamsEntry, ReplayFlight, ReplayState,
+        SamplingParams, ServingInfo, SubmissionOutcome, TensorEntry,
         bindings::l9o::gpu::{compute, paged_storage},
         core_op, core_program, expected_layer_outputs, validate_batch_lanes,
         validate_batch_output_layouts, validate_batch_shapes,
@@ -7793,6 +7833,23 @@ mod tests {
             validate_batch_output_layouts((DType::F32, &[1, 4]), (DType::U32, &[2]), 2, 4,)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn batch_input_preserves_shape_and_padding() {
+        let input = EngineBatch {
+            shape: BatchShape {
+                phase: BatchPhase::Decode,
+                bucket: 2,
+                tokens: 1,
+                selection: BatchSelection::Forward,
+            },
+            lanes: vec![None, None],
+        };
+        let input: super::engine_bindings::exports::l9o::gpu::engine::BatchIn = input.into();
+        assert_eq!(input.shape.bucket, 2);
+        assert_eq!(input.lanes.len(), 2);
+        assert!(input.lanes.iter().all(Option::is_none));
     }
 
     #[tokio::test]
