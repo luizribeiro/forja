@@ -7,7 +7,7 @@ use std::{any::Any, collections::HashSet};
 
 use forja_core::{
     Backend, BackendDispatchData, BackendError, CommandList, DType, GraphLimits, GraphTemplate, Op,
-    PagePool, PagedCopyDirection, PagedLayout, PagedPlane, ParamSpace, Submission, ViewOp,
+    PagePool, PagedCopyDirection, PagedLayout, PagedPlane, ParamSpace, Slice, Submission, ViewOp,
 };
 use half::{bf16, f16};
 
@@ -50,16 +50,46 @@ fn generation_bytes(generations: &[u32]) -> Vec<u8> {
         .collect()
 }
 
-fn run_copy<B: Backend>(backend: &B, cache_dtype: DType) -> Result<Vec<u8>, BackendError> {
-    let source = backend.alloc(DType::F32, &[7, 3])?;
-    let pool = backend.alloc(cache_dtype, &[3, 4, 3])?;
-    let table = backend.alloc(DType::U32, &[2, 2])?;
-    let generations = backend.alloc(DType::U32, &[3])?;
-    let output = backend.alloc(DType::F32, &[7, 3])?;
+fn run_copy<B: Backend>(
+    backend: &B,
+    cache_dtype: DType,
+    strided: bool,
+) -> Result<Vec<u8>, BackendError> {
+    let ordinary_shape: &[u32] = if strided { &[7, 3, 3] } else { &[7, 3] };
+    let source_storage = backend.alloc(DType::F32, ordinary_shape)?;
     let values = (0_u32..21)
         .map(|value| value as f32 / 8.0)
         .collect::<Vec<_>>();
-    backend.write(&source, &encode(&values, DType::F32))?;
+    if strided {
+        let mut backing = vec![0.0_f32; 7 * 3 * 3];
+        for token in 0..7 {
+            for column in 0..3 {
+                backing[token * 9 + 3 + column] = values[token * 3 + column];
+            }
+        }
+        backend.write(&source_storage, &encode(&backing, DType::F32))?;
+    } else {
+        backend.write(&source_storage, &encode(&values, DType::F32))?;
+    }
+    let strided_view = |tensor| {
+        backend.view(
+            tensor,
+            ViewOp::Slice(vec![
+                Slice::new(0, 7, 1).unwrap(),
+                Slice::new(1, 1, 1).unwrap(),
+                Slice::new(0, 3, 1).unwrap(),
+            ]),
+        )
+    };
+    let source = if strided {
+        strided_view(&source_storage)?
+    } else {
+        source_storage
+    };
+    let output = backend.alloc(DType::F32, &[7, 3])?;
+    let pool = backend.alloc(cache_dtype, &[3, 4, 3])?;
+    let table = backend.alloc(DType::U32, &[2, 2])?;
+    let generations = backend.alloc(DType::U32, &[3])?;
     backend.write(&table, &table_bytes(&[(2, 5), (0, 7)]))?;
     backend.write(&generations, &generation_bytes(&[7, 0, 5]))?;
     let mut commands = CommandList::new();
@@ -94,8 +124,8 @@ fn metal_paged_copy_matches_cpu_across_page_edges() {
     let cpu = forja_cpu::CpuBackend::new();
     let metal = forja_metal::MetalBackend::new().unwrap();
     assert_eq!(
-        run_copy(&metal, DType::F32).unwrap(),
-        run_copy(&cpu, DType::F32).unwrap()
+        run_copy(&metal, DType::F32, false).unwrap(),
+        run_copy(&cpu, DType::F32, false).unwrap()
     );
 }
 
@@ -104,8 +134,18 @@ fn metal_paged_copy_converts_directly_into_reduced_pages() {
     let cpu = forja_cpu::CpuBackend::new();
     let metal = forja_metal::MetalBackend::new().unwrap();
     assert_eq!(
-        run_copy(&metal, DType::F16).unwrap(),
-        run_copy(&cpu, DType::F16).unwrap()
+        run_copy(&metal, DType::F16, false).unwrap(),
+        run_copy(&cpu, DType::F16, false).unwrap()
+    );
+}
+
+#[test]
+fn metal_paged_copy_reads_producer_views_directly() {
+    let cpu = forja_cpu::CpuBackend::new();
+    let metal = forja_metal::MetalBackend::new().unwrap();
+    assert_eq!(
+        run_copy(&metal, DType::F16, true).unwrap(),
+        run_copy(&cpu, DType::F16, true).unwrap()
     );
 }
 

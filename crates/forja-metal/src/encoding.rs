@@ -3053,14 +3053,18 @@ impl MetalBackend {
             PagedCopyDirection::IntoPages => (first, dispatch.output()),
             PagedCopyDirection::OutOfPages => (dispatch.output(), first),
         };
-        let ordinary = self.encoder_dense_tensor(ordinary_tensor)?;
+        let ordinary = self.encoder_tensor(ordinary_tensor)?;
         let pool = self.encoder_dense_tensor(pool_tensor)?;
         let page_table = self.encoder_dense_tensor(table_tensor)?;
         let generations = self.encoder_dense_tensor(generations)?;
-        let ordinary_shape: [u32; 2] = ordinary
+        let tokens = ordinary
             .layout
             .shape()
-            .try_into()
+            .first()
+            .copied()
+            .filter(|&tokens| tokens != 0)
+            .ok_or(BackendError::InvalidInput)?;
+        let elements = u32::try_from(ordinary.layout.element_count() / u64::from(tokens))
             .map_err(|_| BackendError::InvalidInput)?;
         let pool_shape: [u32; 3] = pool
             .layout
@@ -3075,8 +3079,8 @@ impl MetalBackend {
         let mut params = Vec::with_capacity(7 * size_of::<u32>());
         for value in [
             start,
-            ordinary_shape[0],
-            ordinary_shape[1],
+            tokens,
+            elements,
             page_tokens,
             table_shape[0],
             pool_shape[0],
@@ -3085,6 +3089,7 @@ impl MetalBackend {
             params.extend_from_slice(&value.to_ne_bytes());
         }
         let params = arguments.write(&params)?;
+        let ordinary_layout = Self::layout_buffer(&ordinary.layout, arguments)?;
         let error_flag = arguments.write(&error_state())?;
         let pipeline = self
             .pipelines
@@ -3104,11 +3109,12 @@ impl MetalBackend {
         {
             bindings.bind(table, index, &tensor.buffer);
         }
-        bindings.bind(table, 4, &params);
-        bindings.bind(table, 5, &error_flag);
+        bindings.bind(table, 4, &ordinary_layout);
+        bindings.bind(table, 5, &params);
+        bindings.bind(table, 6, &error_flag);
         set_argument_table(encoder, table);
-        let count = ordinary_shape[0]
-            .checked_mul(ordinary_shape[1])
+        let count = tokens
+            .checked_mul(elements)
             .ok_or(BackendError::InvalidInput)?;
         let threads = 256_usize.min(pipeline.maxTotalThreadsPerThreadgroup());
         dispatch_threadgroups(
@@ -3126,7 +3132,10 @@ impl MetalBackend {
                 depth: 1,
             },
         );
-        Ok((vec![params, error_flag.clone()], error_flag))
+        Ok((
+            vec![ordinary_layout, params, error_flag.clone()],
+            error_flag,
+        ))
     }
 
     #[allow(clippy::too_many_lines)]
@@ -6706,6 +6715,7 @@ impl MetalBackend {
             Op::Copy => Self::size_copy_arguments(arguments)?,
             Op::PagedCopy { .. } => {
                 arguments.write(7 * size_of::<u32>())?;
+                arguments.write(112)?;
                 arguments.write(2 * size_of::<u32>())?;
             }
             Op::RmsNorm { .. } => {

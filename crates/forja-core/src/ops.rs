@@ -1189,18 +1189,30 @@ fn check_paged_copy(
             actual: inputs.len(),
         });
     }
-    check_paged_layouts(inputs, output)?;
-    let (ordinary, pool) = match direction {
-        PagedCopyDirection::IntoPages => (inputs[0], output),
-        PagedCopyDirection::OutOfPages => (output, inputs[0]),
+    let (ordinary, pool, pool_operand) = match direction {
+        PagedCopyDirection::IntoPages => (inputs[0], output, Operand::Output),
+        PagedCopyDirection::OutOfPages => (output, inputs[0], Operand::Input(0)),
     };
+    for (input, tensor) in inputs[1..].iter().enumerate() {
+        if !tensor.layout().is_contiguous() {
+            return Err(shape_error(Operand::Input(input + 1)));
+        }
+    }
+    if !pool.layout().is_contiguous() {
+        return Err(shape_error(pool_operand));
+    }
     check_float(ordinary, Operand::Input(0))?;
     check_float(pool, Operand::Input(0))?;
-    let [tokens, elements]: [u32; 2] = ordinary
+    let (&tokens, row_shape) = ordinary
         .layout
         .shape()
-        .try_into()
-        .map_err(|_| shape_error(Operand::Input(0)))?;
+        .split_first()
+        .filter(|(_, row_shape)| !row_shape.is_empty())
+        .ok_or_else(|| shape_error(Operand::Input(0)))?;
+    let elements = row_shape
+        .iter()
+        .try_fold(1_u32, |count, &extent| count.checked_mul(extent))
+        .ok_or(OpError::InvalidKernelParameter)?;
     paged_copy_element_count(tokens, elements)?;
     let [physical_pages, pool_page_tokens, pool_elements]: [u32; 3] = pool
         .layout
@@ -2346,7 +2358,7 @@ mod tests {
     }
 
     #[test]
-    fn paged_operations_reject_strided_storage() {
+    fn paged_copy_accepts_strided_ordinary_storage() {
         let ordinary = tensor(1, DType::F32, &[2, 2], &[1, 2]);
         let pool = tensor(2, DType::F32, &[2, 4, 2], &[8, 2, 1]);
         let table = tensor(3, DType::U32, &[2, 2], &[2, 1]);
@@ -2359,9 +2371,14 @@ mod tests {
                 0,
                 4,
             ),
-            Err(shape_error(Operand::Input(0)))
+            Ok(())
         );
+    }
 
+    #[test]
+    fn paged_sdpa_rejects_strided_storage() {
+        let table = tensor(3, DType::U32, &[2, 2], &[2, 1]);
+        let generations = tensor(4, DType::U32, &[2], &[1]);
         let query = tensor(5, DType::F32, &[16, 2, 128], &[128, 2_048, 1]);
         let keys = tensor(6, DType::F16, &[2, 4, 8, 128], &[4_096, 1_024, 128, 1]);
         let values = tensor(7, DType::F16, &[2, 4, 8, 128], &[4_096, 1_024, 128, 1]);

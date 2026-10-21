@@ -15,8 +15,9 @@ kernel void paged_copy(
     device uchar *pool [[buffer(1)]],
     device const uint2 *table [[buffer(2)]],
     device const uint *generations [[buffer(3)]],
-    constant PagedCopyParams &params [[buffer(4)]],
-    device atomic_uint *error_flag [[buffer(5)]],
+    constant TensorLayout &ordinary_layout [[buffer(4)]],
+    constant PagedCopyParams &params [[buffer(5)]],
+    device atomic_uint *error_flag [[buffer(6)]],
     uint index [[thread_position_in_grid]]) {
     uint count = params.tokens * params.elements;
     if (index >= count) {
@@ -39,13 +40,14 @@ kernel void paged_copy(
     }
     ulong paged_index = (ulong(entry.x) * params.page_tokens
         + logical_token % params.page_tokens) * params.elements + element;
+    ulong ordinary_index = physical_index(ordinary_layout, index);
     float value = params.direction == 0
-        ? load_float(ordinary, index, input0_dtype)
+        ? load_float(ordinary, ordinary_index, input0_dtype)
         : load_float(pool, paged_index, input1_dtype);
     if (params.direction == 0) {
         store_float(pool, paged_index, input1_dtype, value);
     } else {
-        store_float(ordinary, index, input0_dtype, value);
+        store_float(ordinary, ordinary_index, input0_dtype, value);
     }
 }
 
