@@ -240,6 +240,7 @@ fn serving_info() -> proc_macro2::TokenStream {
             }).collect(),
             active_lanes: serving.active_lanes,
             max_context: serving.max_context,
+            batch_shapes: Vec::new(),
         })
     }
 }

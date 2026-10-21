@@ -10,11 +10,30 @@ interface engine {
     label: string,
   }
 
+  enum batch-phase {
+    prompt,
+    decode,
+  }
+
+  enum batch-selection {
+    combined,
+    forward,
+    masked,
+  }
+
+  record batch-shape {
+    phase: batch-phase,
+    bucket: u32,
+    tokens: u32,
+    selection: batch-selection,
+  }
+
   record serving-info {
     page-tokens: u32,
     planes: list<cache-plane>,
     active-lanes: u32,
     max-context: u32,
+    batch-shapes: list<batch-shape>,
   }
 
   record engine-info {
