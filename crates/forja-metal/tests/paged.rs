@@ -1075,7 +1075,15 @@ fn metal_paged_sdpa_microbenchmark() {
         );
         assert!(paged_time.as_secs_f64() / contiguous_time.as_secs_f64() <= 1.04);
     }
-    for (length, blocks) in [(512, "-32"), (2_048, ""), (4_000, "-128")] {
+    let mut decode_regressions = Vec::new();
+    for (length, blocks) in [
+        (512, "-32"),
+        (513, "-32"),
+        (2_048, ""),
+        (2_049, ""),
+        (4_000, "-128"),
+        (4_001, "-128"),
+    ] {
         let (contiguous, paged) = benchmark_commands(
             &backend,
             length,
@@ -1085,12 +1093,16 @@ fn metal_paged_sdpa_microbenchmark() {
         );
         let (contiguous_time, paged_time) =
             super::common::comparative_gpu_times(&backend, contiguous, paged);
+        let ratio = paged_time.as_secs_f64() / contiguous_time.as_secs_f64();
         eprintln!(
             "paged-sdpa keys={length} two_pass_us={} paged_two_pass_us={} ratio={:.4}",
             contiguous_time.as_secs_f64() * 1.0e6,
             paged_time.as_secs_f64() * 1.0e6,
-            paged_time.as_secs_f64() / contiguous_time.as_secs_f64(),
+            ratio,
         );
-        assert!(paged_time.as_secs_f64() / contiguous_time.as_secs_f64() <= 1.02);
+        if ratio > 1.02 {
+            decode_regressions.push((length, ratio));
+        }
     }
+    assert!(decode_regressions.is_empty(), "{decode_regressions:?}");
 }
