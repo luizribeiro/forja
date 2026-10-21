@@ -410,6 +410,16 @@ void paged_sdpa_2pass_1_gqa_body(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (valid == 0) {
+        uint head = kv_head * G + simd_group;
+        ulong partial_row = ulong(head) * params.blocks + block;
+        for (uint element = 0; element < elements_per_thread; ++element) {
+            uint column = simd_lane * elements_per_thread + element;
+            store_float(partials, partial_row * D + column, input0_dtype, 0.0f);
+        }
+        if (simd_lane == 0) {
+            sums[partial_row] = 1.0f;
+            maxs[partial_row] = 0.0f;
+        }
         return;
     }
     uint first_logical_page = block_start / params.page_tokens;

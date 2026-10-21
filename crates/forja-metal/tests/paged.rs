@@ -717,6 +717,28 @@ fn metal_paged_gqa_two_pass_keeps_barriers_uniform_across_rejected_pages() {
 }
 
 #[test]
+fn metal_paged_gqa_two_pass_replaces_stale_scratch_on_early_refusal() {
+    let mut rejected_output = Vec::new();
+    let error = run_sdpa(
+        &forja_metal::MetalBackend::new().unwrap(),
+        DType::F16,
+        512,
+        1,
+        false,
+        false,
+        32,
+        4,
+        (0, 0),
+        &[0],
+        Some("paged-sdpa.vector-gqa-two-pass-32"),
+        Some(&mut rejected_output),
+    )
+    .unwrap_err();
+    assert!(matches!(error, BackendError::DeviceErrorFlag { .. }));
+    assert_eq!(rejected_output, vec![0.0; 32 * 128]);
+}
+
+#[test]
 fn metal_paged_sdpa_uses_contiguous_entry_path() {
     let cpu = forja_cpu::CpuBackend::new();
     let metal = forja_metal::MetalBackend::new().unwrap();
