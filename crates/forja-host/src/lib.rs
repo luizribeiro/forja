@@ -6301,7 +6301,9 @@ where
                 ));
             }
             let page_tokens = page_shape[1];
-            let contiguous_entries = snapshot.table().is_contiguous();
+            // Recorded commands replay after the lane is rebound to other tables, so they
+            // cannot assume that this snapshot's pages stay consecutive.
+            let contiguous_entries = false;
             let template = TemplateOp::paged_sdpa(
                 config.scale,
                 config.causal,
@@ -7036,10 +7038,19 @@ mod tests {
         plane_count: u32,
         max_context: u32,
     ) -> Resource<PagePoolEntry> {
+        insert_test_pool_with_width(host, plane_count, max_context, 2)
+    }
+
+    fn insert_test_pool_with_width<B: Backend>(
+        host: &mut Host<B>,
+        plane_count: u32,
+        max_context: u32,
+        elements_per_token: u64,
+    ) -> Resource<PagePoolEntry> {
         let planes = (0..plane_count)
             .map(|plane| PagedPlane {
                 dtype: DType::F32,
-                elements_per_token: 2,
+                elements_per_token,
                 alignment: 4,
                 label: format!("plane-{plane}"),
             })
@@ -7047,7 +7058,7 @@ mod tests {
         let pool = PagePool::new(
             PagedLayout::new(4, planes).unwrap(),
             max_context.div_ceil(4),
-            4_096,
+            2_048 * elements_per_token,
         )
         .unwrap();
         let charged_bytes = pool.memory_usage().unwrap().0.total().unwrap();
@@ -7397,6 +7408,63 @@ mod tests {
         let sequence = rebound.sequence.lock().unwrap();
         assert_eq!(sequence.logical_len(), 7);
         assert_eq!(sequence.reserved_tokens(), 12);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn metal_paged_graph_replays_after_rebinding_a_scattered_table() {
+        type Metal = forja_metal::MetalBackend;
+        let mut host = Host::new(Metal::new().unwrap(), GENEROUS);
+        let pool = insert_test_pool_with_width(&mut host, 2, 16, 64);
+        let slot = host.open_paged_slot(&pool, 2).unwrap();
+        host.bind_paged_request(pool.rep(), None, 8).unwrap();
+        host.begin_paged_append(pool.rep(), 0, 8).unwrap();
+        let commands = host.command_list().unwrap();
+        let query = host.alloc(compute::Dtype::F32, &[1, 1, 64]).unwrap();
+        let output = host.alloc(compute::Dtype::F32, &[1, 1, 64]).unwrap();
+        <Host<Metal> as paged_storage::Host>::record_paged_sdpa(
+            &mut host,
+            Resource::new_borrow(commands.rep()),
+            Resource::new_borrow(slot.rep()),
+            0,
+            Resource::new_borrow(query.rep()),
+            Resource::new_borrow(output.rep()),
+            paged_storage::SdpaCfg {
+                key_plane: 0,
+                value_plane: 1,
+                scale: 1.0,
+                causal: true,
+                q_start: wit_affine(None, 0, 7),
+                key_length: wit_affine(None, 0, 8),
+                algorithm: "paged-sdpa.vector".to_owned(),
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let graph = host.create_graph(commands).unwrap();
+        host.prepare_replay(&graph, Vec::new())
+            .unwrap()
+            .run()
+            .await
+            .unwrap();
+
+        let recorded = host.paged_prefix(pool.rep()).unwrap();
+        let recorded_table = recorded.sequence.lock().unwrap().table().unwrap();
+        assert!(recorded_table.is_contiguous());
+        let forked_prefix = recorded.fork_reserved(4, 8).unwrap();
+        host.bind_paged_request(pool.rep(), Some(forked_prefix), 8)
+            .unwrap();
+        host.begin_paged_append(pool.rep(), 4, 4).unwrap();
+        let rebound = host.paged_prefix(pool.rep()).unwrap();
+        let rebound_table = rebound.sequence.lock().unwrap().table().unwrap();
+        assert!(!rebound_table.is_contiguous());
+
+        host.prepare_replay(&graph, Vec::new())
+            .unwrap()
+            .run()
+            .await
+            .unwrap();
     }
 
     #[test]
