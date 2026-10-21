@@ -1600,6 +1600,7 @@ pub(crate) fn dispatch_many(
 pub(crate) fn paged_copy(
     commands: &mut Commands,
     slot: &guest::paged_storage::BatchSlot,
+    lane: u32,
     plane: u32,
     start: Affine,
     len: u64,
@@ -1608,7 +1609,7 @@ pub(crate) fn paged_copy(
     guest::paged_storage::record_paged_copy(
         commands,
         slot,
-        0,
+        lane,
         guest::paged_storage::PagedSpan {
             plane,
             start: guest::compute::Affine {
@@ -1628,6 +1629,7 @@ pub(crate) fn paged_copy(
 pub(crate) fn paged_sdpa(
     commands: &mut Commands,
     slot: &guest::paged_storage::BatchSlot,
+    lane: u32,
     query: &Handle,
     output: &Handle,
     key_plane: u32,
@@ -1641,7 +1643,7 @@ pub(crate) fn paged_sdpa(
     guest::paged_storage::record_paged_sdpa(
         commands,
         slot,
-        0,
+        lane,
         query,
         output,
         &guest::paged_storage::SdpaCfg {

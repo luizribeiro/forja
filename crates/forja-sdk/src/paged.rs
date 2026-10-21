@@ -90,6 +90,15 @@ impl PagedCacheSet {
     ///
     /// Returns an error when `layer` is outside this set.
     pub fn layer(&self, layer: u32) -> Result<PagedCache<'_>> {
+        self.layer_at(0, layer)
+    }
+
+    /// Borrows one layer's key/value planes for a serving lane.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `layer` is outside this set.
+    pub fn layer_at(&self, lane: u32, layer: u32) -> Result<PagedCache<'_>> {
         if layer >= self.layers {
             return Err(Error::loading("paged cache layer is out of range"));
         }
@@ -98,6 +107,7 @@ impl PagedCacheSet {
             .ok_or_else(|| Error::loading("paged cache plane index overflowed"))?;
         Ok(PagedCache {
             _set: self,
+            lane,
             key_plane,
             value_plane: key_plane + 1,
         })
@@ -107,6 +117,7 @@ impl PagedCacheSet {
 /// A borrowed key/value plane pair for one transformer layer.
 pub struct PagedCache<'a> {
     _set: &'a PagedCacheSet,
+    lane: u32,
     key_plane: u32,
     value_plane: u32,
 }
@@ -122,6 +133,12 @@ impl PagedCache<'_> {
     #[must_use]
     pub const fn value_plane(&self) -> u32 {
         self.value_plane
+    }
+
+    /// Returns the host slot lane used by this cache pair.
+    #[must_use]
+    pub const fn lane(&self) -> u32 {
+        self.lane
     }
 
     /// Appends sequence-major key and value rows to this layer's planes.
@@ -149,6 +166,7 @@ impl PagedCache<'_> {
             crate::sys::paged_copy(
                 commands,
                 &self._set._slot,
+                self.lane,
                 self.key_plane,
                 start,
                 u64::from(tokens),
@@ -157,6 +175,7 @@ impl PagedCache<'_> {
             crate::sys::paged_copy(
                 commands,
                 &self._set._slot,
+                self.lane,
                 self.value_plane,
                 start,
                 u64::from(tokens),
@@ -203,6 +222,7 @@ impl PagedCache<'_> {
                 crate::sys::paged_sdpa(
                     commands,
                     &self._set._slot,
+                    self.lane,
                     query.handle(),
                     paged_output.handle(),
                     self.key_plane,
@@ -218,6 +238,7 @@ impl PagedCache<'_> {
                 crate::sys::paged_sdpa(
                     commands,
                     &self._set._slot,
+                    self.lane,
                     query.handle(),
                     paged_output.handle(),
                     self.key_plane,
@@ -245,9 +266,13 @@ mod tests {
     fn assigns_one_key_value_pair_per_layer() {
         let caches = PagedCacheSet { layers: 3 };
         let middle = caches.layer(1).unwrap();
+        let batched = caches.layer_at(7, 2).unwrap();
         assert_eq!(caches.len(), 3);
+        assert_eq!(middle.lane(), 0);
         assert_eq!(middle.key_plane(), 2);
         assert_eq!(middle.value_plane(), 3);
+        assert_eq!(batched.lane(), 7);
+        assert_eq!(batched.key_plane(), 4);
         assert!(caches.layer(3).is_err());
     }
 }
