@@ -30,6 +30,7 @@ prefill-chunk = 2048
 
 [serving]
 prompt-token-budget = 2048
+paged-cache = true
 
 [variants.fixed]
 "quant.decode-q4" = "quant-matmul.gemv"
