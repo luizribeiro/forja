@@ -620,8 +620,13 @@ struct LayerResources<'a> {
 #[derive(Clone, Copy)]
 struct BatchLayerPosition<'a> {
     activation_positions: &'a Tensor<f32>,
-    starts: &'a [Option<u32>],
+    lanes: &'a [Option<BatchLanePosition>],
     variants: &'a variants::Variants,
+}
+
+struct BatchLanePosition {
+    start: Dim,
+    attention: VariantSelection,
 }
 
 struct BatchLayerResources<'a> {
@@ -858,7 +863,7 @@ impl DecoderLayer {
     ) -> Result<(Tensor<f32>, Tensor<f32>)> {
         let BatchLayerPosition {
             activation_positions,
-            starts,
+            lanes,
             variants,
         } = position;
         let BatchLayerResources {
@@ -868,7 +873,7 @@ impl DecoderLayer {
             qk_norm_rope,
             moe_epilogues,
         } = resources;
-        let rows = u32::try_from(starts.len())
+        let rows = u32::try_from(lanes.len())
             .map_err(|_| forja_sdk::Error::loading("batch rows exceed u32"))?;
         let (query, key, value) = self.self_attn.project_decode_rows(
             variants,
@@ -878,17 +883,21 @@ impl DecoderLayer {
             activation_positions,
         )?;
         let attended = Tensor::zeros(&[rows, QUERY_HEADS * HEAD_DIM])?;
-        for (lane, start, end) in batch_lane_spans(starts)? {
-            let start_dim = start.into();
-            let selection = variants.attention(1, start, None, true)?;
+        for (lane, position) in lanes.iter().enumerate() {
+            let Some(position) = position else {
+                continue;
+            };
+            let lane = u32::try_from(lane)
+                .map_err(|_| forja_sdk::Error::loading("batch lane exceeds u32"))?;
+            let end = position.start.clone().checked_add(1)?;
             let lane_output = paged_cache_attention(
                 &caches.paged_layer_at(lane, layer)?,
                 &query.narrow(0, lane, 1)?,
                 &key.narrow(0, lane, 1)?,
                 &value.narrow(0, lane, 1)?,
-                &start_dim,
-                &end.into(),
-                &selection,
+                &position.start,
+                &end,
+                &position.attention,
             )?
             .reshape(&[1, QUERY_HEADS * HEAD_DIM])?;
             lane_output.copy_into(&mut attended.narrow(0, lane, 1)?)?;
@@ -1427,6 +1436,7 @@ fn batch_starts(lanes: &[Option<forja_sdk::BatchLane>]) -> Vec<Option<u32>> {
         .collect()
 }
 
+#[cfg(test)]
 fn batch_lane_spans(starts: &[Option<u32>]) -> Result<Vec<(u32, u32, u32)>> {
     starts
         .iter()
@@ -1548,6 +1558,29 @@ impl Qwen3Coder {
         positions: &Tensor<f32>,
         starts: &[Option<u32>],
     ) -> Result<Tensor<f32>> {
+        let lanes = starts
+            .iter()
+            .copied()
+            .map(|start| {
+                start
+                    .map(|start| {
+                        Ok(BatchLanePosition {
+                            start: start.into(),
+                            attention: self.variants.attention(1, start, None, true)?,
+                        })
+                    })
+                    .transpose()
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.forward_batch_positioned(tokens, positions, &lanes)
+    }
+
+    fn forward_batch_positioned(
+        &mut self,
+        tokens: &Tensor<u32>,
+        positions: &Tensor<f32>,
+        lanes: &[Option<BatchLanePosition>],
+    ) -> Result<Tensor<f32>> {
         let mut hidden = self.weights.embed_tokens.forward(tokens)?;
         let layers = self.weights.layers.len();
         let mut normalized = self.weights.layers[0].input_layernorm.forward(&hidden)?;
@@ -1564,7 +1597,7 @@ impl Qwen3Coder {
                 &normalized,
                 BatchLayerPosition {
                     activation_positions: positions,
-                    starts,
+                    lanes,
                     variants: &self.variants,
                 },
                 BatchLayerResources {
