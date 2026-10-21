@@ -36,14 +36,18 @@ impl Guest for Component {
                 }],
                 active_lanes: 2,
                 max_context: 32,
-                batch_shapes: [BatchSelection::Combined, BatchSelection::Forward]
-                    .map(|selection| BatchShape {
-                        phase: BatchPhase::Decode,
-                        bucket: 2,
-                        tokens: 1,
-                        selection,
-                    })
-                    .to_vec(),
+                batch_shapes: [
+                    BatchSelection::Combined,
+                    BatchSelection::Forward,
+                    BatchSelection::Masked,
+                ]
+                .map(|selection| BatchShape {
+                    phase: BatchPhase::Decode,
+                    bucket: 2,
+                    tokens: 1,
+                    selection,
+                })
+                .to_vec(),
             }),
         }
     }
@@ -145,11 +149,20 @@ impl Guest for Component {
     async fn batch_select(
         _slot: &l9o::gpu::paged_storage::BatchSlot,
         _logits: &Tensor,
-        _input: exports::l9o::gpu::engine::BatchSelectIn,
+        input: exports::l9o::gpu::engine::BatchSelectIn,
     ) -> Result<exports::l9o::gpu::engine::BatchOut, Error> {
-        Err(Error::OpSignature(
-            "engine does not support batch decode".to_owned(),
-        ))
+        let tokens = input
+            .lanes
+            .into_iter()
+            .map(|lane| {
+                lane.and_then(|lane| lane.allow.first().copied())
+                    .unwrap_or(0)
+            })
+            .collect::<Vec<_>>();
+        Ok(BatchOut {
+            logits: f32_tensor(&[2, 4], &[0.0; 8])?,
+            tokens: u32_tensor(&[2], &tokens)?,
+        })
     }
 }
 

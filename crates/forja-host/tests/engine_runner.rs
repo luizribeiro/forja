@@ -9,9 +9,9 @@ use std::{
 
 use forja_cpu::CpuBackend;
 use forja_host::{
-    BatchPhase, BatchSelection, BatchShape, EngineBatch, EngineBatchLane, EngineLoadConfig,
-    EngineRunner, EngineStep, FixedVariantPick, Limits, SamplingParams, VariantPickArm,
-    VariantRulePick, bindings::l9o::gpu::compute::Error,
+    BatchPhase, BatchSelection, BatchShape, EngineBatch, EngineBatchLane, EngineBatchSelect,
+    EngineBatchSelectLane, EngineLoadConfig, EngineRunner, EngineStep, FixedVariantPick, Limits,
+    SamplingParams, VariantPickArm, VariantRulePick, bindings::l9o::gpu::compute::Error,
 };
 use golden_fixtures::decode_f32_le;
 
@@ -77,6 +77,31 @@ async fn runs_a_forward_only_batch() -> wasmtime::Result<()> {
         })
         .await??;
     assert_eq!(runner.read(&logits).await?.len(), 8 * size_of::<f32>());
+    let selected = runner
+        .batch_select(
+            &logits,
+            EngineBatchSelect {
+                shape: BatchShape {
+                    phase: BatchPhase::Decode,
+                    bucket: 2,
+                    tokens: 1,
+                    selection: BatchSelection::Masked,
+                },
+                lanes: vec![
+                    Some(EngineBatchSelectLane {
+                        start_pos: 0,
+                        sampling: SamplingParams::default(),
+                        allow: vec![2],
+                    }),
+                    None,
+                ],
+            },
+        )
+        .await??;
+    assert_eq!(
+        runner.read(&selected.tokens).await?,
+        [2, 0, 0, 0, 0, 0, 0, 0]
+    );
     Ok(())
 }
 

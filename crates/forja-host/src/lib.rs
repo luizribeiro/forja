@@ -1667,6 +1667,106 @@ where
         }))
     }
 
+    /// Runs one homogeneous masked-selection batch against retained logits.
+    ///
+    /// # Errors
+    ///
+    /// Returns a component execution error or a construction-boundary refusal.
+    pub async fn batch_select(
+        &mut self,
+        logits: &EngineTensor,
+        input: EngineBatchSelect,
+    ) -> wasmtime::Result<Result<EngineBatchOutput, compute::Error>> {
+        let logits = EngineTensor {
+            handle: logits.handle,
+            runner_id: logits.runner_id,
+        };
+        self.with_profile(move |runner| Box::pin(runner.batch_select_inner(logits, input)))
+            .await
+    }
+
+    async fn batch_select_inner(
+        &mut self,
+        logits: EngineTensor,
+        input: EngineBatchSelect,
+    ) -> wasmtime::Result<Result<EngineBatchOutput, compute::Error>> {
+        if logits.runner_id != self.id {
+            return Ok(Err(invalid_handle(
+                "engine tensor belongs to another runner",
+            )));
+        }
+        let info = match &self.info {
+            Some(info) => info.clone(),
+            None => self.describe().await?,
+        };
+        let Some(serving) = info.serving.as_ref() else {
+            return Ok(Err(compute::Error::Layout(
+                "engine does not declare batch serving".to_owned(),
+            )));
+        };
+        if let Err(error) = validate_batch_select_lanes(serving, &input) {
+            return Ok(Err(error));
+        }
+        let bucket = input.shape.bucket;
+        let logits_resource = Resource::new_borrow(logits.handle);
+        if let Err(error) = self.validate_batch_logits(&info, bucket, &logits_resource) {
+            return Ok(Err(error));
+        }
+        let Some(pool) = self.page_pool else {
+            return Ok(Err(invalid_handle("batch serving requires a paged pool")));
+        };
+        let slot = match self.paged_batch_slot(pool) {
+            Ok(slot) => slot,
+            Err(error) => return Ok(Err(error)),
+        };
+        let wit_input = input.into();
+        self.set_guest_deadline();
+        let engine = self.instance.l9o_gpu_engine();
+        let output = self
+            .store
+            .run_concurrent(async move |accessor| {
+                engine
+                    .call_batch_select(
+                        accessor,
+                        Resource::new_borrow(slot),
+                        logits_resource,
+                        wit_input,
+                    )
+                    .await
+            })
+            .await;
+        let output = match output {
+            Ok(output) => output?,
+            Err(error) if is_epoch_timeout(&error) => return Ok(Err(guest_timeout())),
+            Err(error) => return Err(error),
+        };
+        let output = match output {
+            Ok(output) => output,
+            Err(error) => return Ok(Err(error)),
+        };
+        let handles = vec![output.logits.rep(), output.tokens.rep()];
+        if let Err(error) =
+            self.validate_batch_output(&info, bucket, &output.logits, &output.tokens)
+        {
+            let error = self.release_handles(handles).err().unwrap_or(error);
+            return Ok(Err(error));
+        }
+        if let Err(error) = self.release_outputs() {
+            return Ok(Err(error));
+        }
+        self.output_handles = handles;
+        Ok(Ok(EngineBatchOutput {
+            logits: EngineTensor {
+                handle: output.logits.rep(),
+                runner_id: self.id,
+            },
+            tokens: EngineTensor {
+                handle: output.tokens.rep(),
+                runner_id: self.id,
+            },
+        }))
+    }
+
     async fn batch_step_inner(
         &mut self,
         input: EngineBatch,
@@ -8309,6 +8409,87 @@ mod tests {
         assert!(validate_batch_select_lanes(&serving, &input(vec![1, 3])).is_ok());
         assert!(validate_batch_select_lanes(&serving, &input(vec![3, 1])).is_err());
         assert!(validate_batch_select_lanes(&serving, &input(Vec::new())).is_err());
+    }
+
+    #[tokio::test]
+    async fn masked_selection_preserves_unselected_lane_tables() -> wasmtime::Result<()> {
+        let weights = test_weight_file();
+        let mut runner = EngineRunner::new(
+            test_guests::engine_smoke(),
+            CpuBackend::new(),
+            GENEROUS,
+            &weights,
+        )
+        .await?;
+        let config = super::EngineLoadConfig {
+            paged_cache: true,
+            ..super::EngineLoadConfig::default()
+        };
+        runner.load_with_selections(None, &config).await??;
+        runner.prepare_paged_lane(0, None, 8)?;
+        runner.prepare_paged_lane(1, None, 8)?;
+        let handle = runner
+            .store
+            .data_mut()
+            .alloc(compute::Dtype::F32, &[2, 4])
+            .unwrap()
+            .rep();
+        let logits = super::EngineTensor {
+            handle,
+            runner_id: runner.id,
+        };
+        let shape = BatchShape {
+            phase: BatchPhase::Decode,
+            bucket: 2,
+            tokens: 1,
+            selection: BatchSelection::Masked,
+        };
+        let before_table = batch_lane_table(&runner, 1);
+
+        runner
+            .batch_select(
+                &logits,
+                EngineBatchSelect {
+                    shape,
+                    lanes: vec![
+                        Some(EngineBatchSelectLane {
+                            start_pos: 0,
+                            sampling: SamplingParams::default(),
+                            allow: vec![1],
+                        }),
+                        None,
+                    ],
+                },
+            )
+            .await??;
+
+        assert_eq!(before_table, batch_lane_table(&runner, 1));
+        fs::remove_file(weights)?;
+        Ok(())
+    }
+
+    fn batch_lane_table(runner: &EngineRunner<CpuBackend>, lane: usize) -> forja_core::PageTable {
+        let host = runner.store.data();
+        let pool = host
+            .table
+            .get(&Resource::<PagePoolEntry>::new_borrow(
+                runner.page_pool.unwrap(),
+            ))
+            .unwrap();
+        let slot = host
+            .table
+            .get(&Resource::<BatchSlotEntry>::new_borrow(pool.slot.unwrap()))
+            .unwrap();
+        assert!(
+            slot.binding
+                .lane(lane)
+                .unwrap()
+                .sequence
+                .lock()
+                .unwrap()
+                .is_some()
+        );
+        slot.binding.banks.slot(0, lane).unwrap().table().clone()
     }
 
     #[tokio::test]
