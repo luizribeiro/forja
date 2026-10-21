@@ -3113,17 +3113,16 @@ impl MetalBackend {
         bindings.bind(table, 5, &params);
         bindings.bind(table, 6, &error_flag);
         set_argument_table(encoder, table);
-        let count = tokens
-            .checked_mul(elements)
-            .ok_or(BackendError::InvalidInput)?;
-        let threads = 256_usize.min(pipeline.maxTotalThreadsPerThreadgroup());
+        let elements = usize::try_from(elements).map_err(|_| BackendError::InvalidInput)?;
+        let threads = elements.min(pipeline.maxTotalThreadsPerThreadgroup());
+        if threads == 0 {
+            return Err(BackendError::InvalidInput);
+        }
         dispatch_threadgroups(
             encoder,
             MTLSize {
-                width: usize::try_from(count)
-                    .map_err(|_| BackendError::InvalidInput)?
-                    .div_ceil(threads),
-                height: 1,
+                width: elements.div_ceil(threads),
+                height: usize::try_from(tokens).map_err(|_| BackendError::InvalidInput)?,
                 depth: 1,
             },
             MTLSize {

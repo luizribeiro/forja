@@ -18,28 +18,35 @@ kernel void paged_copy(
     constant TensorLayout &ordinary_layout [[buffer(4)]],
     constant PagedCopyParams &params [[buffer(5)]],
     device atomic_uint *error_flag [[buffer(6)]],
-    uint index [[thread_position_in_grid]]) {
-    uint count = params.tokens * params.elements;
-    if (index >= count) {
-        return;
-    }
-    uint token = index / params.elements;
-    uint element = index % params.elements;
+    uint2 position [[thread_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]]) {
+    threadgroup uint physical_page;
+    threadgroup uint valid;
+    uint element = position.x;
+    uint token = position.y;
     uint logical_token = params.start + token;
-    uint logical_page = logical_token / params.page_tokens;
-    if (logical_page >= params.logical_pages) {
-        atomic_store_explicit(error_flag, 1, memory_order_relaxed);
-        atomic_fetch_min_explicit(error_flag + 1, logical_page, memory_order_relaxed);
+    if (thread_index == 0) {
+        uint logical_page = logical_token / params.page_tokens;
+        valid = logical_page < params.logical_pages;
+        uint2 entry = uint2(0);
+        if (valid != 0) {
+            entry = table[logical_page];
+            valid = entry.x < params.physical_pages
+                && generations[entry.x] == entry.y;
+        }
+        physical_page = valid != 0 ? entry.x : 0;
+        if (valid == 0) {
+            atomic_store_explicit(error_flag, 1, memory_order_relaxed);
+            atomic_fetch_min_explicit(error_flag + 1, logical_page, memory_order_relaxed);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (valid == 0 || element >= params.elements) {
         return;
     }
-    uint2 entry = table[logical_page];
-    if (entry.x >= params.physical_pages || generations[entry.x] != entry.y) {
-        atomic_store_explicit(error_flag, 1, memory_order_relaxed);
-        atomic_fetch_min_explicit(error_flag + 1, logical_page, memory_order_relaxed);
-        return;
-    }
-    ulong paged_index = (ulong(entry.x) * params.page_tokens
+    ulong paged_index = (ulong(physical_page) * params.page_tokens
         + logical_token % params.page_tokens) * params.elements + element;
+    uint index = token * params.elements + element;
     ulong ordinary_index = physical_index(ordinary_layout, index);
     float value = params.direction == 0
         ? load_float(ordinary, ordinary_index, input0_dtype)

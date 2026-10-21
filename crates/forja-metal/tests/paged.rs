@@ -277,6 +277,99 @@ fn metal_paged_copy_reports_corrupt_entries_without_writing_pool() {
 }
 
 #[test]
+fn metal_paged_copy_isolates_rejected_row_from_other_rows_in_same_dispatch() {
+    let backend = forja_metal::MetalBackend::new().unwrap();
+    let source = backend.alloc(DType::F32, &[3, 2]).unwrap();
+    let pool = backend.alloc(DType::F32, &[3, 1, 2]).unwrap();
+    let table = backend.alloc(DType::U32, &[3, 2]).unwrap();
+    let generations = backend.alloc(DType::U32, &[3]).unwrap();
+    backend
+        .write(
+            &source,
+            &encode(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], DType::F32),
+        )
+        .unwrap();
+    let canary = encode(&[9.0; 6], DType::F32);
+    backend.write(&pool, &canary).unwrap();
+    // No valid entry targets physical page 0, so a write there can only come from the rejected row.
+    backend
+        .write(&table, &table_bytes(&[(1, 10), (99, 11), (2, 12)]))
+        .unwrap();
+    backend
+        .write(&generations, &generation_bytes(&[0, 10, 12]))
+        .unwrap();
+    let mut commands = CommandList::new();
+    commands
+        .dispatch(
+            Op::PagedCopy {
+                direction: PagedCopyDirection::IntoPages,
+                start: 0,
+                page_tokens: 1,
+            },
+            &[&source, &table, &generations],
+            &pool,
+        )
+        .unwrap();
+    let error = backend.submit(commands).unwrap().wait().unwrap_err();
+    assert!(matches!(
+        error,
+        BackendError::DeviceErrorFlag {
+            operation: "paged-copy",
+            flag: 1,
+            value: 1,
+            ..
+        }
+    ));
+    assert_eq!(
+        decode_f32(&backend.read(&pool).unwrap()),
+        vec![9.0, 9.0, 1.0, 2.0, 5.0, 6.0]
+    );
+}
+
+#[test]
+fn metal_paged_copy_rejects_wide_row_spanning_multiple_threadgroups() {
+    const ELEMENTS: usize = 1536;
+    let backend = forja_metal::MetalBackend::new().unwrap();
+    let width = u32::try_from(ELEMENTS).unwrap();
+    let source = backend.alloc(DType::F32, &[1, width]).unwrap();
+    let pool = backend.alloc(DType::F32, &[1, 1, width]).unwrap();
+    let table = backend.alloc(DType::U32, &[1, 2]).unwrap();
+    let generations = backend.alloc(DType::U32, &[1]).unwrap();
+    backend
+        .write(&source, &encode(&vec![1.0_f32; ELEMENTS], DType::F32))
+        .unwrap();
+    let canary = encode(&vec![9.0_f32; ELEMENTS], DType::F32);
+    backend.write(&pool, &canary).unwrap();
+    backend.write(&table, &table_bytes(&[(0, 99)])).unwrap();
+    backend
+        .write(&generations, &generation_bytes(&[1]))
+        .unwrap();
+    let mut commands = CommandList::new();
+    commands
+        .dispatch(
+            Op::PagedCopy {
+                direction: PagedCopyDirection::IntoPages,
+                start: 0,
+                page_tokens: 1,
+            },
+            &[&source, &table, &generations],
+            &pool,
+        )
+        .unwrap();
+    let error = backend.submit(commands).unwrap().wait().unwrap_err();
+    assert!(matches!(
+        error,
+        BackendError::DeviceErrorFlag {
+            operation: "paged-copy",
+            flag: 1,
+            value: 0,
+            ..
+        }
+    ));
+    assert_eq!(backend.read(&pool).unwrap(), canary);
+}
+
+#[test]
 fn metal_in_flight_paged_read_defers_page_reuse() {
     let backend = forja_metal::MetalBackend::new().unwrap();
     let allocator = PagePool::new(
