@@ -44,6 +44,8 @@ use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 const MAX_VARIANT_NAME_BYTES: usize = 64;
 /// Caps validation and replay work for one guest-provided variant rule.
 const MAX_VARIANT_RULE_ARMS: usize = 64;
+/// Preserves one live-graph slot for an exact prompt tail.
+const MAX_RETAINED_BATCH_SHAPES: usize = 15;
 
 pub use native::{NativeCommandList, NativeEpilogue, NativeHost, NativeKernel, NativeTensor};
 pub use weights::{Safetensors, WeightError, WeightSource, WeightTensor};
@@ -668,6 +670,47 @@ fn expected_layer_outputs(layers: &[u32], loaded: Option<u32>, requested: bool) 
     })
 }
 
+fn validate_batch_shapes(serving: &ServingInfo) -> Result<(), compute::Error> {
+    if serving.batch_shapes.len() > MAX_RETAINED_BATCH_SHAPES {
+        return Err(quota(
+            "serving batch shape catalog exceeds the graph budget",
+        ));
+    }
+    for (index, shape) in serving.batch_shapes.iter().enumerate() {
+        if shape.bucket == 0
+            || !shape.bucket.is_power_of_two()
+            || shape.bucket > serving.active_lanes
+            || shape.tokens == 0
+            || shape.tokens > serving.max_context
+        {
+            return Err(compute::Error::Layout(
+                "serving batch shape has invalid dimensions".to_owned(),
+            ));
+        }
+        match shape.phase {
+            BatchPhase::Prompt
+                if shape.bucket != 1 || shape.selection != BatchSelection::Combined =>
+            {
+                return Err(compute::Error::Layout(
+                    "prompt batch shapes must be single-lane combined graphs".to_owned(),
+                ));
+            }
+            BatchPhase::Decode if shape.tokens != 1 => {
+                return Err(compute::Error::Layout(
+                    "decode batch shapes must contain one token per lane".to_owned(),
+                ));
+            }
+            BatchPhase::Prompt | BatchPhase::Decode => {}
+        }
+        if serving.batch_shapes[..index].contains(shape) {
+            return Err(compute::Error::Layout(
+                "serving batch shape catalog contains a duplicate".to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 struct EpochEngine {
     engine: Engine,
     live: Weak<()>,
@@ -962,6 +1005,7 @@ where
                 "paged serving ceilings are invalid".to_owned(),
             ));
         }
+        validate_batch_shapes(serving)?;
         let dtype = match kv_cache {
             KvCacheFormat::F16 => DType::F16,
             KvCacheFormat::Bf16 => DType::BF16,
@@ -7079,12 +7123,13 @@ mod tests {
     use wasmtime::component::Resource;
 
     use super::{
-        BackendEvent, BackendTimer, BatchSlotEntry, EngineMemory, EngineMetrics, EngineRunner,
-        EngineStep, EngineStepProfile, Grants, Host, ImportKind, ImportTimer, Limits,
-        MAX_INSTRUCTIONS, MAX_OUTPUTS, PagePoolEntry, PagedSequenceEntry, ParamsEntry,
-        ReplayFlight, ReplayState, SubmissionOutcome, TensorEntry,
+        BackendEvent, BackendTimer, BatchPhase, BatchSelection, BatchShape, BatchSlotEntry,
+        EngineMemory, EngineMetrics, EngineRunner, EngineStep, EngineStepProfile, Grants, Host,
+        ImportKind, ImportTimer, Limits, MAX_INSTRUCTIONS, MAX_OUTPUTS, PagePoolEntry,
+        PagedSequenceEntry, ParamsEntry, ReplayFlight, ReplayState, ServingInfo, SubmissionOutcome,
+        TensorEntry,
         bindings::l9o::gpu::{compute, paged_storage},
-        core_op, core_program, expected_layer_outputs,
+        core_op, core_program, expected_layer_outputs, validate_batch_shapes,
     };
 
     const GENEROUS: Limits = Limits::new(u64::MAX, 8, u64::MAX, 32, u64::MAX);
@@ -7188,6 +7233,39 @@ mod tests {
         assert_eq!(expected_layer_outputs(&layers, Some(4), true), 3);
         assert_eq!(expected_layer_outputs(&layers, None, true), 4);
         assert_eq!(expected_layer_outputs(&layers, Some(4), false), 0);
+    }
+
+    #[test]
+    fn serving_batch_catalog_refuses_invalid_or_duplicate_shapes() {
+        let shape = BatchShape {
+            phase: BatchPhase::Decode,
+            bucket: 2,
+            tokens: 1,
+            selection: BatchSelection::Combined,
+        };
+        let serving = |batch_shapes| ServingInfo {
+            page_tokens: 4,
+            planes: Vec::new(),
+            active_lanes: 8,
+            max_context: 32,
+            batch_shapes,
+        };
+        assert!(validate_batch_shapes(&serving(vec![shape])).is_ok());
+        assert!(matches!(
+            validate_batch_shapes(&serving(vec![shape, shape])),
+            Err(compute::Error::Layout(_))
+        ));
+        assert!(matches!(
+            validate_batch_shapes(&serving(vec![BatchShape { bucket: 3, ..shape }])),
+            Err(compute::Error::Layout(_))
+        ));
+        assert!(matches!(
+            validate_batch_shapes(&serving(vec![BatchShape {
+                phase: BatchPhase::Prompt,
+                ..shape
+            }])),
+            Err(compute::Error::Layout(_))
+        ));
     }
 
     #[tokio::test]
