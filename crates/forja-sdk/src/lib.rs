@@ -121,15 +121,16 @@ use std::{error, fmt};
 
 pub use element::{Element, FloatElement};
 pub use engine::{
-    BatchPhase, BatchSelection, BatchShape, BeginDecodeInput, CachePlane, DecodeInput,
-    DecodeOutput, Engine, EngineInfo, EngineLoadConfig, FixedVariantPick, KvCacheFormat,
-    SamplingParams, ServingInfo, StepInput, StepOutput, VariantPickArm, VariantRulePick,
+    BatchInput, BatchLane, BatchOutput, BatchPhase, BatchSelectInput, BatchSelectLane,
+    BatchSelection, BatchShape, BeginDecodeInput, CachePlane, DecodeInput, DecodeOutput, Engine,
+    EngineInfo, EngineLoadConfig, FixedVariantPick, KvCacheFormat, SamplingParams, ServingInfo,
+    StepInput, StepOutput, VariantPickArm, VariantRulePick,
 };
 pub use forja_sdk_macros::{Load, export_engine, kernel};
 pub use graph::{Dim, Graph, GraphResult, Param, Pos, capture, eval};
 pub use half::{bf16, f16};
 pub use load::{Load, Weights};
-pub use paged::{PagedCache, PagedCacheSet, PagedPool};
+pub use paged::{PagedCache, PagedCacheSet, PagedPool, PagedSlot};
 pub use selections::{EngineSelections, EngineTunings, Tuning, VariantSelection};
 pub use sys::DType;
 pub use tensor::{ReductionConfig, SamplingKernelConfig, Slice, Tensor};

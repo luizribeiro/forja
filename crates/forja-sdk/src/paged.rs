@@ -9,6 +9,25 @@ pub struct PagedPool<'a> {
     lifetime: PhantomData<&'a ()>,
 }
 
+/// A borrowed capability for one host-filled serving slot.
+pub struct PagedSlot<'a> {
+    #[cfg(target_family = "wasm")]
+    pub(crate) raw: &'a crate::sys::guest::paged_storage::BatchSlot,
+    lifetime: PhantomData<&'a ()>,
+}
+
+impl PagedSlot<'_> {
+    #[cfg(target_family = "wasm")]
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn from_guest(raw: &crate::sys::guest::paged_storage::BatchSlot) -> PagedSlot<'_> {
+        PagedSlot {
+            raw,
+            lifetime: PhantomData,
+        }
+    }
+}
+
 impl PagedPool<'_> {
     #[cfg(target_family = "wasm")]
     #[doc(hidden)]

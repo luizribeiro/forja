@@ -1,4 +1,4 @@
-use crate::{Result, Tensor, Weights};
+use crate::{PagedSlot, Result, Tensor, Weights};
 
 /// Static metadata declared by an inference engine.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -209,6 +209,56 @@ pub struct DecodeOutput {
     pub token: Tensor<u32>,
 }
 
+/// One active lane in a homogeneous decode batch.
+pub struct BatchLane {
+    /// Tokens to process, or `None` to reuse the lane's retained feedback token.
+    pub tokens: Option<Tensor<u32>>,
+    /// Absolute position assigned to the first token.
+    pub start_pos: u32,
+    /// Token sampling parameters.
+    pub sampling: SamplingParams,
+}
+
+/// Inputs shared by the combined and forward-only batch exports.
+pub struct BatchInput<'a> {
+    /// Host-filled paged-storage slot for this batch.
+    pub slot: PagedSlot<'a>,
+    /// Exact declared graph shape selected by the host.
+    pub shape: BatchShape,
+    /// Bucket-sized lane list; `None` denotes inert padding.
+    pub lanes: Vec<Option<BatchLane>>,
+}
+
+/// One active lane in a masked-selection batch.
+pub struct BatchSelectLane {
+    /// Absolute position represented by this selection.
+    pub start_pos: u32,
+    /// Token sampling parameters.
+    pub sampling: SamplingParams,
+    /// Sorted token ids permitted by the lane's grammar.
+    pub allow: Vec<u32>,
+}
+
+/// Inputs to the masked-selection batch export.
+pub struct BatchSelectInput<'a> {
+    /// Host-filled paged-storage slot for this batch.
+    pub slot: PagedSlot<'a>,
+    /// Exact declared graph shape selected by the host.
+    pub shape: BatchShape,
+    /// Bucket-shaped logits produced by forward-only execution.
+    pub logits: &'a Tensor<f32>,
+    /// Bucket-sized lane list; `None` denotes inert padding.
+    pub lanes: Vec<Option<BatchSelectLane>>,
+}
+
+/// Device-resident outputs from one homogeneous serving batch.
+pub struct BatchOutput {
+    /// Logits with shape `[bucket, vocab]`.
+    pub logits: Tensor<f32>,
+    /// Selected token ids with shape `[bucket]`.
+    pub tokens: Tensor<u32>,
+}
+
 /// Input to the forward phase of constrained decode.
 pub struct BeginDecodeInput {
     /// Tokens to process, or `None` to reuse the retained feedback token.
@@ -299,6 +349,39 @@ pub trait Engine: Sized + 'static {
     fn rewind_decode(&mut self, _next_pos: u32) -> Result<()> {
         Err(crate::Error::loading(
             "engine does not support constrained decode",
+        ))
+    }
+
+    /// Runs forward execution followed by per-lane token selection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when homogeneous batch execution is unavailable.
+    fn batch_step(&mut self, _input: BatchInput<'_>) -> Result<BatchOutput> {
+        Err(crate::Error::loading(
+            "engine does not support batch decode",
+        ))
+    }
+
+    /// Runs forward execution without token selection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when homogeneous batch execution is unavailable.
+    fn batch_forward(&mut self, _input: BatchInput<'_>) -> Result<Tensor<f32>> {
+        Err(crate::Error::loading(
+            "engine does not support batch decode",
+        ))
+    }
+
+    /// Selects masked tokens from bucket-shaped retained logits.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when homogeneous batch execution is unavailable.
+    fn batch_select(&mut self, _input: BatchSelectInput<'_>) -> Result<BatchOutput> {
+        Err(crate::Error::loading(
+            "engine does not support batch decode",
         ))
     }
 }
