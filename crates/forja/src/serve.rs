@@ -327,6 +327,54 @@ mod tests {
     }
 
     #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires FORJA_MODELS and runs in the pre-push hook"]
+    fn metal_paged_prefix_reuse_after_lru_eviction() -> Result<(), Box<dyn Error>> {
+        // A one-request queue leaves the index sized by the engine's eight active lanes.
+        const PREFIX_ENTRIES: u32 = 8;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()?;
+        runtime.block_on(async {
+            let mut engine = agent_engine_with_queue(true, true, 1).await?;
+            let model = engine.model().to_owned();
+            let system = " x".repeat(2_040);
+            let chat = |user: String| {
+                serde_json::from_value::<forja_serve::ChatCompletionRequest>(serde_json::json!({
+                    "model": &model, "max_completion_tokens": 1, "temperature": 0.0,
+                    "messages": [
+                        {"role": "system", "content": &system},
+                        {"role": "user", "content": user}
+                    ]
+                }))
+            };
+            let warm = || chat(" warm".to_owned());
+            let extension = || chat(" y".repeat(28));
+
+            engine.complete_chat(&warm()?).await?;
+            engine.complete_chat(&extension()?).await?;
+            for index in 0..=PREFIX_ENTRIES {
+                let unrelated = serde_json::from_value(serde_json::json!({
+                    "model": &model, "max_completion_tokens": 1, "temperature": 0.0,
+                    "messages": [{"role": "user", "content": format!(" eviction {index}")}]
+                }))?;
+                engine.complete_chat(&unrelated).await?;
+            }
+            let rewarmed = engine.complete_chat(&warm()?).await?;
+            let reused = engine.complete_chat(&extension()?).await?;
+
+            if rewarmed.usage.cached_tokens >= 2_048 || reused.usage.cached_tokens != 2_048 {
+                return Err(format!(
+                    "cached tokens after eviction were {}/{} instead of below 2048/2048",
+                    rewarmed.usage.cached_tokens, reused.usage.cached_tokens
+                )
+                .into());
+            }
+            Ok(())
+        })
+    }
+
+    #[cfg(target_os = "macos")]
     async fn compare_prefix_reuse(
         engine: &mut forja_serve::ServingEngine<forja_metal::MetalBackend>,
         prefix: &str,
@@ -368,6 +416,16 @@ mod tests {
         paged_cache: bool,
         prefix_reuse: bool,
     ) -> Result<forja_serve::ServingEngine<forja_metal::MetalBackend>, Box<dyn Error>> {
+        let queue_length = forja_config::HostConfig::default().server.queue_length;
+        agent_engine_with_queue(paged_cache, prefix_reuse, queue_length).await
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn agent_engine_with_queue(
+        paged_cache: bool,
+        prefix_reuse: bool,
+        queue_length: u32,
+    ) -> Result<forja_serve::ServingEngine<forja_metal::MetalBackend>, Box<dyn Error>> {
         let root = PathBuf::from(env::var_os("FORJA_MODELS").ok_or("FORJA_MODELS is not set")?);
         let model = root.join("Qwen3-Coder-30B-A3B-Instruct-4bit");
         let component = test_guests::qwen3_coder();
@@ -396,6 +454,7 @@ mod tests {
         load.paged_cache = paged_cache;
         runner.load_with_selections(None, &load).await??;
         let mut config = forja_config::HostConfig::default();
+        config.server.queue_length = queue_length;
         config.request.max_output_tokens = 256;
         config.serving.prefix_reuse = prefix_reuse;
         let identity = forja_serve::PrefixIdentity::new([
