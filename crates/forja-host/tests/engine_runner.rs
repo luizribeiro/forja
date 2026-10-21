@@ -9,7 +9,8 @@ use std::{
 
 use forja_cpu::CpuBackend;
 use forja_host::{
-    EngineLoadConfig, EngineRunner, EngineStep, FixedVariantPick, Limits, VariantPickArm,
+    BatchPhase, BatchSelection, BatchShape, EngineBatch, EngineBatchLane, EngineLoadConfig,
+    EngineRunner, EngineStep, FixedVariantPick, Limits, SamplingParams, VariantPickArm,
     VariantRulePick, bindings::l9o::gpu::compute::Error,
 };
 use golden_fixtures::decode_f32_le;
@@ -25,6 +26,32 @@ async fn runs_an_engine_and_reads_its_logits() -> wasmtime::Result<()> {
 #[tokio::test]
 async fn runs_an_sdk_exported_engine() -> wasmtime::Result<()> {
     run_engine(test_guests::engine_sdk_smoke(), true, "sdk-engine").await
+}
+
+#[tokio::test]
+async fn runs_a_combined_batch_with_inert_padding() -> wasmtime::Result<()> {
+    let (_weights, mut runner) = paged_smoke_runner("combined-batch").await?;
+    assert!(runner.prepare_paged_lane(0, None, 8)?);
+    let output = runner
+        .batch_step(EngineBatch {
+            shape: BatchShape {
+                phase: BatchPhase::Decode,
+                bucket: 2,
+                tokens: 1,
+                selection: BatchSelection::Combined,
+            },
+            lanes: vec![
+                Some(EngineBatchLane {
+                    tokens: Some(vec![2]),
+                    start_pos: 0,
+                    sampling: SamplingParams::default(),
+                }),
+                None,
+            ],
+        })
+        .await??;
+    assert_eq!(runner.read(&output.tokens).await?, [3, 0, 0, 0, 0, 0, 0, 0]);
+    Ok(())
 }
 
 #[tokio::test]

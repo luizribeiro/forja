@@ -1486,6 +1486,207 @@ where
             .await
     }
 
+    /// Runs one homogeneous combined batch and retains its device tensors.
+    /// # Errors
+    ///
+    /// Returns a component execution error or a construction-boundary refusal.
+    pub async fn batch_step(
+        &mut self,
+        input: EngineBatch,
+    ) -> wasmtime::Result<Result<EngineBatchOutput, compute::Error>> {
+        self.with_profile(move |runner| Box::pin(runner.batch_step_inner(input)))
+            .await
+    }
+
+    async fn batch_step_inner(
+        &mut self,
+        input: EngineBatch,
+    ) -> wasmtime::Result<Result<EngineBatchOutput, compute::Error>> {
+        use engine_bindings::exports::l9o::gpu::engine::BatchOut;
+        if let Err(error) = self.release_outputs() {
+            return Ok(Err(error));
+        }
+        let info = match &self.info {
+            Some(info) => info.clone(),
+            None => self.describe().await?,
+        };
+        let Some(serving) = info.serving.as_ref() else {
+            return Ok(Err(compute::Error::Layout(
+                "engine does not declare batch serving".to_owned(),
+            )));
+        };
+        let appended = match validate_batch_lanes(
+            serving,
+            input.shape,
+            &input.lanes,
+            BatchSelection::Combined,
+        ) {
+            Ok(appended) => appended,
+            Err(error) => return Ok(Err(error)),
+        };
+        let Some(pool) = self.page_pool else {
+            return Ok(Err(invalid_handle("batch serving requires a paged pool")));
+        };
+        let slot = match self.paged_batch_slot(pool) {
+            Ok(slot) => slot,
+            Err(error) => return Ok(Err(error)),
+        };
+        let mut checkpoints = match self.prepare_batch_appends(pool, &input, &appended).await {
+            Ok(checkpoints) => checkpoints,
+            Err(error) => return Ok(Err(error)),
+        };
+        let bucket = input.shape.bucket;
+        let wit_input = input.into();
+        self.set_guest_deadline();
+        let engine = self.instance.l9o_gpu_engine();
+        let output = self
+            .store
+            .run_concurrent(async move |accessor| {
+                engine
+                    .call_batch_step(accessor, Resource::new_borrow(slot), wit_input)
+                    .await
+            })
+            .await;
+        let BatchOut { logits, tokens } = match output {
+            Ok(output) => match output? {
+                Ok(output) => output,
+                Err(error) => {
+                    self.rollback_batch_appends(pool, &mut checkpoints)?;
+                    return Ok(Err(error));
+                }
+            },
+            Err(error) if is_epoch_timeout(&error) => {
+                self.rollback_batch_appends(pool, &mut checkpoints)?;
+                return Ok(Err(guest_timeout()));
+            }
+            Err(error) => {
+                self.rollback_batch_appends(pool, &mut checkpoints)?;
+                return Err(error);
+            }
+        };
+        let handles = vec![logits.rep(), tokens.rep()];
+        if let Err(error) = self.validate_batch_output(&info, bucket, &logits, &tokens) {
+            self.rollback_batch_appends(pool, &mut checkpoints)?;
+            let error = self.release_handles(handles).err().unwrap_or(error);
+            return Ok(Err(error));
+        }
+        self.finish_batch_appends(pool, checkpoints)?;
+        self.output_handles = handles;
+        Ok(Ok(EngineBatchOutput {
+            logits: EngineTensor {
+                handle: logits.rep(),
+                runner_id: self.id,
+            },
+            tokens: EngineTensor {
+                handle: tokens.rep(),
+                runner_id: self.id,
+            },
+        }))
+    }
+
+    fn paged_batch_slot(&self, pool: u32) -> Result<u32, compute::Error> {
+        self.store
+            .data()
+            .table
+            .get(&Resource::<PagePoolEntry>::new_borrow(pool))
+            .map_err(invalid_handle)?
+            .slot
+            .ok_or_else(|| invalid_handle("paged slot is not open"))
+    }
+
+    async fn prepare_batch_appends(
+        &mut self,
+        pool: u32,
+        input: &EngineBatch,
+        appended: &[u32],
+    ) -> Result<Vec<Option<SequenceCheckpoint>>, compute::Error> {
+        let mut checkpoints = Vec::with_capacity(input.lanes.len());
+        for (lane_index, (input_lane, &tokens)) in input.lanes.iter().zip(appended).enumerate() {
+            let lane = u32::try_from(lane_index)
+                .map_err(|_| compute::Error::Layout("batch lane exceeds u32".to_owned()))?;
+            let Some(input_lane) = input_lane else {
+                checkpoints.push(None);
+                continue;
+            };
+            let prepared = self.store.data_mut().begin_paged_lane_append(
+                pool,
+                lane,
+                input_lane.start_pos,
+                tokens,
+            );
+            let (checkpoint, copy) = match prepared {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    self.rollback_batch_appends(pool, &mut checkpoints)?;
+                    return Err(error);
+                }
+            };
+            if let Some(copy) = copy
+                && let Err(error) = copy.run().await
+            {
+                if let Some(checkpoint) = checkpoint {
+                    self.store
+                        .data_mut()
+                        .rollback_paged_lane_append(pool, lane, checkpoint)?;
+                }
+                self.rollback_batch_appends(pool, &mut checkpoints)?;
+                return Err(error);
+            }
+            checkpoints.push(checkpoint);
+        }
+        let metadata = input
+            .lanes
+            .iter()
+            .zip(appended)
+            .map(|(lane, &tokens)| lane.as_ref().map(|lane| (lane.start_pos, tokens)))
+            .collect::<Vec<_>>();
+        if let Err(error) = self
+            .store
+            .data_mut()
+            .write_paged_lane_metadata(pool, &metadata)
+        {
+            self.rollback_batch_appends(pool, &mut checkpoints)?;
+            return Err(error);
+        }
+        Ok(checkpoints)
+    }
+
+    fn finish_batch_appends(
+        &mut self,
+        pool: u32,
+        checkpoints: Vec<Option<SequenceCheckpoint>>,
+    ) -> Result<(), compute::Error> {
+        for (lane_index, checkpoint) in checkpoints.into_iter().enumerate() {
+            let Some(checkpoint) = checkpoint else {
+                continue;
+            };
+            let lane = u32::try_from(lane_index)
+                .map_err(|_| compute::Error::Layout("batch lane exceeds u32".to_owned()))?;
+            let _ = self
+                .store
+                .data_mut()
+                .finish_paged_lane_append(pool, lane, checkpoint)?;
+        }
+        Ok(())
+    }
+
+    fn rollback_batch_appends(
+        &mut self,
+        pool: u32,
+        checkpoints: &mut [Option<SequenceCheckpoint>],
+    ) -> Result<(), compute::Error> {
+        for (lane, checkpoint) in checkpoints.iter_mut().enumerate() {
+            if let Some(checkpoint) = checkpoint.take() {
+                let lane = u32::try_from(lane)
+                    .map_err(|_| compute::Error::Layout("batch lane exceeds u32".to_owned()))?;
+                self.store
+                    .data_mut()
+                    .rollback_paged_lane_append(pool, lane, checkpoint)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Runs the forward phase of constrained decode and retains its logits.
     ///
     /// # Errors
@@ -2119,6 +2320,26 @@ where
             ));
         }
         Ok(())
+    }
+
+    fn validate_batch_output(
+        &self,
+        info: &EngineInfo,
+        bucket: u32,
+        logits: &Resource<TensorEntry>,
+        tokens: &Resource<TensorEntry>,
+    ) -> Result<(), compute::Error> {
+        let logits = self.store.data().entry(logits)?;
+        let logits = (
+            logits.tensor.layout().dtype(),
+            logits.tensor.layout().shape(),
+        );
+        let tokens = self.store.data().entry(tokens)?;
+        let tokens = (
+            tokens.tensor.layout().dtype(),
+            tokens.tensor.layout().shape(),
+        );
+        validate_batch_output_layouts(logits, tokens, bucket, info.vocab)
     }
 
     fn validate_logits(
