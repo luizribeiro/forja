@@ -301,6 +301,80 @@ pub struct EngineDecode {
     pub sampling: SamplingParams,
 }
 
+/// One active lane in a homogeneous engine batch.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EngineBatchLane {
+    /// Tokens to process, or `None` to reuse retained feedback during decode.
+    pub tokens: Option<Vec<u32>>,
+    /// Absolute position assigned to the first token.
+    pub start_pos: u32,
+    /// Token sampling parameters.
+    pub sampling: SamplingParams,
+}
+
+/// One homogeneous combined or forward-only engine batch.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EngineBatch {
+    /// Exact shape declared by the engine descriptor.
+    pub shape: BatchShape,
+    /// Bucket-sized lanes; `None` denotes inert padding.
+    pub lanes: Vec<Option<EngineBatchLane>>,
+}
+
+/// One active lane in a masked-selection batch.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EngineBatchSelectLane {
+    /// Absolute position represented by the retained logits.
+    pub start_pos: u32,
+    /// Token sampling parameters.
+    pub sampling: SamplingParams,
+    /// Token ids permitted by the lane's grammar.
+    pub allow: Vec<u32>,
+}
+
+/// Device-resident outputs from one homogeneous engine batch.
+#[derive(Debug)]
+pub struct EngineBatchOutput {
+    /// Logits with shape `[bucket, vocab]`.
+    pub logits: EngineTensor,
+    /// Selected tokens with shape `[bucket]`.
+    pub tokens: EngineTensor,
+}
+
+/// Reserved for scheduler-owned lane retirement; the runner does not consume it yet.
+pub struct EngineLaneCheckpoint<State> {
+    /// Absolute sampler position before submission.
+    pub sampler_position: u32,
+    /// Feedback token before submission.
+    pub feedback_token: u32,
+    /// Grammar, parser, and usage state owned by the caller.
+    pub state: State,
+    /// Tokens reserved for the request.
+    pub reserved_tokens: u64,
+    /// Paged sequence boundary, including logical length and tail-page state.
+    pub paged: SequenceCheckpoint,
+}
+
+impl<State> EngineLaneCheckpoint<State> {
+    /// Constructs a checkpoint from host and caller-owned lane state.
+    #[must_use]
+    pub const fn new(
+        sampler_position: u32,
+        feedback_token: u32,
+        state: State,
+        reserved_tokens: u64,
+        paged: SequenceCheckpoint,
+    ) -> Self {
+        Self {
+            sampler_position,
+            feedback_token,
+            state,
+            reserved_tokens,
+            paged,
+        }
+    }
+}
+
 /// A tensor returned by a component and owned by its runner.
 ///
 /// The handle remains valid until the runner consumes it or starts a step that replaces outputs.
@@ -709,6 +783,68 @@ fn validate_batch_shapes(serving: &ServingInfo) -> Result<(), compute::Error> {
         }
     }
     Ok(())
+}
+
+/// Validates one batch against an engine's serving descriptor.
+#[doc(hidden)]
+pub fn validate_batch_lanes(
+    serving: &ServingInfo,
+    shape: BatchShape,
+    lanes: &[Option<EngineBatchLane>],
+    selection: BatchSelection,
+) -> Result<Vec<u32>, compute::Error> {
+    if shape.selection != selection || !serving.batch_shapes.contains(&shape) {
+        return Err(compute::Error::Layout(
+            "batch shape is not declared for this export".to_owned(),
+        ));
+    }
+    if usize::try_from(shape.bucket) != Ok(lanes.len()) {
+        return Err(compute::Error::Layout(
+            "batch lane count does not match its bucket".to_owned(),
+        ));
+    }
+    let mut active = 0_u32;
+    let mut appended = Vec::with_capacity(lanes.len());
+    for lane in lanes {
+        let Some(lane) = lane else {
+            appended.push(0);
+            continue;
+        };
+        active = active
+            .checked_add(1)
+            .ok_or_else(|| compute::Error::Layout("active lane count overflowed".to_owned()))?;
+        let tokens = match lane.tokens.as_ref() {
+            Some(tokens) => u32::try_from(tokens.len())
+                .map_err(|_| compute::Error::Layout("lane token count exceeds u32".to_owned()))?,
+            None if shape.phase == BatchPhase::Decode => 1,
+            None => {
+                return Err(compute::Error::Layout(
+                    "prompt lanes require input tokens".to_owned(),
+                ));
+            }
+        };
+        let valid_tokens = match shape.phase {
+            BatchPhase::Decode => tokens == 1,
+            BatchPhase::Prompt => (1..=shape.tokens).contains(&tokens),
+        };
+        if !valid_tokens
+            || lane
+                .start_pos
+                .checked_add(tokens)
+                .is_none_or(|end| end > serving.max_context)
+        {
+            return Err(compute::Error::Layout(
+                "batch lane tokens exceed the declared shape or context".to_owned(),
+            ));
+        }
+        appended.push(tokens);
+    }
+    if active == 0 || active > serving.active_lanes {
+        return Err(compute::Error::Layout(
+            "batch active lane count is invalid".to_owned(),
+        ));
+    }
+    Ok(appended)
 }
 
 struct EpochEngine {
@@ -7300,12 +7436,12 @@ mod tests {
 
     use super::{
         BackendEvent, BackendTimer, BatchPhase, BatchSelection, BatchShape, BatchSlotEntry,
-        EngineMemory, EngineMetrics, EngineRunner, EngineStep, EngineStepProfile, Grants, Host,
-        ImportKind, ImportTimer, Limits, MAX_INSTRUCTIONS, MAX_OUTPUTS, PagePoolEntry,
-        PagedSequenceEntry, ParamsEntry, ReplayFlight, ReplayState, ServingInfo, SubmissionOutcome,
-        TensorEntry,
+        EngineBatchLane, EngineMemory, EngineMetrics, EngineRunner, EngineStep, EngineStepProfile,
+        Grants, Host, ImportKind, ImportTimer, Limits, MAX_INSTRUCTIONS, MAX_OUTPUTS,
+        PagePoolEntry, PagedSequenceEntry, ParamsEntry, ReplayFlight, ReplayState, SamplingParams,
+        ServingInfo, SubmissionOutcome, TensorEntry,
         bindings::l9o::gpu::{compute, paged_storage},
-        core_op, core_program, expected_layer_outputs, validate_batch_shapes,
+        core_op, core_program, expected_layer_outputs, validate_batch_lanes, validate_batch_shapes,
     };
 
     const GENEROUS: Limits = Limits::new(u64::MAX, 8, u64::MAX, 32, u64::MAX);
@@ -7490,6 +7626,43 @@ mod tests {
             }])),
             Err(compute::Error::Layout(_))
         ));
+    }
+
+    #[test]
+    fn batch_lane_validation_refuses_wrong_buckets_and_contexts() {
+        let shape = BatchShape {
+            phase: BatchPhase::Decode,
+            bucket: 2,
+            tokens: 1,
+            selection: BatchSelection::Combined,
+        };
+        let serving = ServingInfo {
+            page_tokens: 4,
+            planes: Vec::new(),
+            active_lanes: 2,
+            max_context: 32,
+            batch_shapes: vec![shape],
+        };
+        let lane = |start_pos| {
+            Some(EngineBatchLane {
+                tokens: Some(vec![1]),
+                start_pos,
+                sampling: SamplingParams::default(),
+            })
+        };
+
+        assert_eq!(
+            validate_batch_lanes(&serving, shape, &[lane(7), None], BatchSelection::Combined,)
+                .unwrap(),
+            [1, 0]
+        );
+        assert!(
+            validate_batch_lanes(&serving, shape, &[lane(7)], BatchSelection::Combined,).is_err()
+        );
+        assert!(
+            validate_batch_lanes(&serving, shape, &[lane(32), None], BatchSelection::Combined,)
+                .is_err()
+        );
     }
 
     #[tokio::test]
