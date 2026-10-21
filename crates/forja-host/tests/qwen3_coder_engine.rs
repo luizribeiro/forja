@@ -11,7 +11,8 @@ use std::{
 
 use forja_core::Op;
 use forja_host::{
-    EngineBeginDecode, EngineDecode, EngineRunner, EngineStep, Limits, SamplingParams,
+    BatchPhase, BatchSelection, BatchShape, EngineBatch, EngineBatchLane, EngineBeginDecode,
+    EngineDecode, EngineRunner, EngineStep, Limits, PagedPrefix, SamplingParams,
 };
 use golden_fixtures::{
     BF16_HIDDEN_STATE_TOLERANCE, FixtureDirectory, decode_f32_le, normwise_relative_error,
@@ -30,6 +31,87 @@ const LIMITS: Limits = Limits::new(
 const FULL_LAYERS: u32 = 48;
 const REPLAY_LAYERS: u32 = 4;
 const SERVING_TOKENS: u32 = 128;
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[ignore = "requires FORJA_MODELS and runs in the pre-push hook"]
+async fn metal_batch_tokens_match_single_lanes_exactly() -> Result<(), Box<dyn Error>> {
+    let mut runner = runner(test_guests::qwen3_coder()).await?;
+    let mut config = load_config()?;
+    config.paged_cache = true;
+    runner.load_with_selections(Some(1), &config).await??;
+    let sampling_modes = [
+        SamplingParams::default(),
+        SamplingParams {
+            temperature: 0.7,
+            top_k: 20,
+            top_p: 0.9,
+            seed: 17,
+        },
+    ];
+    for sampling in sampling_modes {
+        for bucket in [2, 4, 8] {
+            let prefixes = (0..bucket)
+                .map(|lane| 1 + (lane * 3) % 15)
+                .collect::<Vec<_>>();
+            let inputs = (0..bucket).map(|lane| 17 + lane).collect::<Vec<_>>();
+            let mut singles = Vec::new();
+            for (&prefix, &token) in prefixes.iter().zip(&inputs) {
+                let retained = batch_prefix(&mut runner, prefix).await?;
+                runner.prepare_paged_lane(0, Some(retained), 64)?;
+                singles.push(
+                    batch_decode(&mut runner, 1, &[Some((prefix, token))], sampling).await?[0],
+                );
+            }
+            let mut retained = Vec::new();
+            for &prefix in &prefixes {
+                retained.push(batch_prefix(&mut runner, prefix).await?);
+            }
+            for (lane, prefix) in retained.into_iter().enumerate() {
+                runner.prepare_paged_lane(u32::try_from(lane)?, Some(prefix), 64)?;
+            }
+            let lanes = prefixes
+                .iter()
+                .copied()
+                .zip(inputs.iter().copied())
+                .map(Some)
+                .collect::<Vec<_>>();
+            let batched = batch_decode(&mut runner, bucket, &lanes, sampling).await?;
+            assert_eq!(batched, singles);
+        }
+    }
+    let active = [(0_usize, 7_u32, 31_u32), (3, 10, 37), (7, 13, 41)];
+    let mut singles = Vec::new();
+    let mut prefixes = Vec::new();
+    for &(_, position, token) in &active {
+        let prefix = batch_prefix(&mut runner, position).await?;
+        runner.prepare_paged_lane(0, Some(prefix), 64)?;
+        singles.push(
+            batch_decode(
+                &mut runner,
+                1,
+                &[Some((position, token))],
+                SamplingParams::default(),
+            )
+            .await?[0],
+        );
+        prefixes.push(batch_prefix(&mut runner, position).await?);
+    }
+    let mut lanes = vec![None; 8];
+    for ((lane, position, token), prefix) in active.into_iter().zip(prefixes) {
+        runner.prepare_paged_lane(u32::try_from(lane)?, Some(prefix), 64)?;
+        lanes[lane] = Some((position, token));
+    }
+    let padded = batch_decode(&mut runner, 8, &lanes, SamplingParams::default()).await?;
+    assert_eq!(&[padded[0], padded[3], padded[7]], singles.as_slice());
+    assert!(
+        padded
+            .iter()
+            .enumerate()
+            .all(|(lane, &token)| lanes[lane].is_some() || token == 0)
+    );
+    Ok(())
+}
 
 #[cfg(target_os = "macos")]
 #[tokio::test]
@@ -597,6 +679,69 @@ async fn runner(
         model_root()?.join("Qwen3-Coder-30B-A3B-Instruct-4bit/model.safetensors.index.json"),
     )
     .await?)
+}
+
+#[cfg(target_os = "macos")]
+async fn batch_prefix(
+    runner: &mut EngineRunner<forja_metal::MetalBackend>,
+    length: u32,
+) -> Result<PagedPrefix, Box<dyn Error>> {
+    runner.prepare_paged_lane(0, None, 64)?;
+    let tokens = (0..length).map(|position| 100 + position).collect();
+    let output = runner
+        .batch_step(EngineBatch {
+            shape: BatchShape {
+                phase: BatchPhase::Prompt,
+                bucket: 1,
+                tokens: 16,
+                selection: BatchSelection::Combined,
+            },
+            lanes: vec![Some(EngineBatchLane {
+                tokens: Some(tokens),
+                start_pos: 0,
+                sampling: SamplingParams::default(),
+            })],
+        })
+        .await??;
+    runner.read(&output.tokens).await?;
+    runner
+        .paged_prefix()?
+        .ok_or_else(|| "paged prefix is unavailable".into())
+}
+
+#[cfg(target_os = "macos")]
+async fn batch_decode(
+    runner: &mut EngineRunner<forja_metal::MetalBackend>,
+    bucket: u32,
+    lanes: &[Option<(u32, u32)>],
+    sampling: SamplingParams,
+) -> Result<Vec<u32>, Box<dyn Error>> {
+    let output = runner
+        .batch_step(EngineBatch {
+            shape: BatchShape {
+                phase: BatchPhase::Decode,
+                bucket,
+                tokens: 1,
+                selection: BatchSelection::Combined,
+            },
+            lanes: lanes
+                .iter()
+                .map(|lane| {
+                    lane.map(|(start_pos, token)| EngineBatchLane {
+                        tokens: Some(vec![token]),
+                        start_pos,
+                        sampling,
+                    })
+                })
+                .collect(),
+        })
+        .await??;
+    let bytes = runner.read(&output.tokens).await?;
+    let (words, remainder) = bytes.as_chunks::<4>();
+    if !remainder.is_empty() {
+        return Err("batch token output is not u32-aligned".into());
+    }
+    Ok(words.iter().copied().map(u32::from_le_bytes).collect())
 }
 
 #[cfg(target_os = "macos")]
