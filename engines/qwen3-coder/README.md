@@ -47,8 +47,8 @@ Accepted pp512/tg128 results use 30 measured repetitions on an 80-core Apple M3 
 
 | KV cache | Selection | PP tok/s | TG tok/s |
 | --- | --- | ---: | ---: |
-| f16 | GPU sequential | 1323.24 | 72.08 |
-| f16 | GPU pipelined | 1323.57 | 97.66 |
+| f16 | GPU sequential | 1308.62 | 82.26 |
+| f16 | GPU pipelined | 1299.95 | 105.31 |
 | f32 | GPU sequential | 1226.42 | 71.10 |
 | f32 | GPU pipelined | 1224.55 | 98.09 |
 
