@@ -136,6 +136,17 @@ impl Guest for Component {
         _slot: &l9o::gpu::paged_storage::BatchSlot,
         input: BatchIn,
     ) -> Result<BatchOut, Error> {
+        if input.lanes.iter().flatten().any(|lane| {
+            lane.tokens
+                .as_ref()
+                .and_then(|tokens| tokens.first())
+                .copied()
+                == Some(u32::MAX)
+        }) {
+            loop {
+                std::hint::spin_loop();
+            }
+        }
         batch_output(input)
     }
 
@@ -167,6 +178,13 @@ impl Guest for Component {
 }
 
 fn batch_output(input: BatchIn) -> Result<BatchOut, Error> {
+    let corrupt = input.lanes.iter().flatten().any(|lane| {
+        lane.tokens
+            .as_ref()
+            .and_then(|tokens| tokens.first())
+            .copied()
+            == Some(100)
+    });
     let mut logits = Vec::with_capacity(8);
     let mut tokens = Vec::with_capacity(2);
     for lane in input.lanes {
@@ -188,8 +206,11 @@ fn batch_output(input: BatchIn) -> Result<BatchOut, Error> {
         logits.extend(row);
         tokens.push(selected);
     }
+    let output_rows = if corrupt { 1_usize } else { 2 };
+    let output_shape = if corrupt { [1, 4] } else { [2, 4] };
+    logits.truncate(output_rows * 4);
     Ok(BatchOut {
-        logits: f32_tensor(&[2, 4], &logits)?,
+        logits: f32_tensor(&output_shape, &logits)?,
         tokens: u32_tensor(&[2], &tokens)?,
     })
 }

@@ -32,26 +32,71 @@ async fn runs_an_sdk_exported_engine() -> wasmtime::Result<()> {
 async fn runs_a_combined_batch_with_inert_padding() -> wasmtime::Result<()> {
     let (_weights, mut runner) = paged_smoke_runner("combined-batch").await?;
     assert!(runner.prepare_paged_lane(0, None, 8)?);
-    let output = runner
-        .batch_step(EngineBatch {
-            shape: BatchShape {
-                phase: BatchPhase::Decode,
-                bucket: 2,
-                tokens: 1,
-                selection: BatchSelection::Combined,
-            },
-            lanes: vec![
-                Some(EngineBatchLane {
-                    tokens: Some(vec![2]),
-                    start_pos: 0,
-                    sampling: SamplingParams::default(),
-                }),
-                None,
-            ],
-        })
-        .await??;
+    let output = runner.batch_step(combined_batch(2)).await??;
     assert_eq!(runner.read(&output.tokens).await?, [3, 0, 0, 0, 0, 0, 0, 0]);
     Ok(())
+}
+
+#[tokio::test]
+async fn combined_batch_refuses_corrupt_outputs() -> wasmtime::Result<()> {
+    let (_weights, mut runner) = paged_smoke_runner("corrupt-batch").await?;
+    assert!(runner.prepare_paged_lane(0, None, 8)?);
+    let error = runner
+        .batch_step(combined_batch(100))
+        .await?
+        .expect_err("malformed batch output must be rejected");
+    assert!(matches!(error, Error::Layout(_)));
+    assert_eq!(runner.paged_prefix()?.unwrap().logical_len()?, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn combined_batch_obeys_guest_call_quota() -> wasmtime::Result<()> {
+    let weights = weight_file("batch-deadline")?;
+    let mut runner = EngineRunner::new(
+        test_guests::engine_smoke(),
+        CpuBackend::new(),
+        LIMITS.with_guest_call_timeout(Duration::from_millis(50)),
+        weights.path(),
+    )
+    .await?;
+    runner
+        .load_with_selections(
+            None,
+            &EngineLoadConfig {
+                paged_cache: true,
+                ..EngineLoadConfig::default()
+            },
+        )
+        .await??;
+    assert!(runner.prepare_paged_lane(0, None, 8)?);
+    let started = Instant::now();
+    let error = runner
+        .batch_step(combined_batch(u32::MAX))
+        .await?
+        .expect_err("batch call must time out");
+    assert!(matches!(error, Error::Quota(_)));
+    assert!(started.elapsed() < Duration::from_secs(1));
+    Ok(())
+}
+
+fn combined_batch(token: u32) -> EngineBatch {
+    EngineBatch {
+        shape: BatchShape {
+            phase: BatchPhase::Decode,
+            bucket: 2,
+            tokens: 1,
+            selection: BatchSelection::Combined,
+        },
+        lanes: vec![
+            Some(EngineBatchLane {
+                tokens: Some(vec![token]),
+                start_pos: 0,
+                sampling: SamplingParams::default(),
+            }),
+            None,
+        ],
+    }
 }
 
 #[tokio::test]
