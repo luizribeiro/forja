@@ -5,14 +5,26 @@ use forja_sdk::{
 const SITES: &[&str] = &[
     "quant.decode-q4",
     "quant.decode-q8",
+    "quant.decode-b2-q4",
+    "quant.decode-b2-q8",
+    "quant.decode-b4-q4",
+    "quant.decode-b4-q8",
+    "quant.decode-b8-q4",
+    "quant.decode-b8-q8",
     "quant.prefill-small",
     "quant.prefill-tiled",
     "gather-quant-matmul.small",
     "gather-quant-matmul.grouped-small-m",
     "gather-quant-matmul.grouped",
+    "gather-quant-matmul.batch-2",
+    "gather-quant-matmul.batch-4",
+    "gather-quant-matmul.batch-8",
     "moe.gate-up.small",
     "moe.gate-up.grouped-small-m",
     "moe.gate-up.grouped",
+    "moe.gate-up.batch-2",
+    "moe.gate-up.batch-4",
+    "moe.gate-up.batch-8",
     "moe.down-combine",
     "moe.combine-small",
     "moe.combine-large",
@@ -93,8 +105,16 @@ impl Variants {
     }
 
     fn gathered(&self, operation: &str, routed_rows: u32) -> Result<Variant> {
-        self.0
-            .at(&format!("{operation}.{}", gathered_size(routed_rows)), 0)
+        self.0.at(&gathered_site(operation, routed_rows), 0)
+    }
+}
+
+fn gathered_site(operation: &str, routed_rows: u32) -> String {
+    match routed_rows {
+        16 => format!("{operation}.batch-2"),
+        32 => format!("{operation}.batch-4"),
+        64 => format!("{operation}.batch-8"),
+        _ => format!("{operation}.{}", gathered_size(routed_rows)),
     }
 }
 
@@ -121,14 +141,17 @@ fn attention_phase(sequence: u32, paged: bool) -> &'static str {
 }
 
 fn quant_site(rows: u32, bits: u8) -> &'static str {
-    if rows == 1 && bits == crate::Q8_BITS {
-        "quant.decode-q8"
-    } else if rows == 1 {
-        "quant.decode-q4"
-    } else if rows >= 16 {
-        "quant.prefill-tiled"
-    } else {
-        "quant.prefill-small"
+    match (rows, bits) {
+        (1, crate::Q8_BITS) => "quant.decode-q8",
+        (1, _) => "quant.decode-q4",
+        (2, crate::Q8_BITS) => "quant.decode-b2-q8",
+        (2, _) => "quant.decode-b2-q4",
+        (4, crate::Q8_BITS) => "quant.decode-b4-q8",
+        (4, _) => "quant.decode-b4-q4",
+        (8, crate::Q8_BITS) => "quant.decode-b8-q8",
+        (8, _) => "quant.decode-b8-q4",
+        (16.., _) => "quant.prefill-tiled",
+        _ => "quant.prefill-small",
     }
 }
 
@@ -140,6 +163,9 @@ mod tests {
     fn classifies_quantized_dispatch_sites_at_boundaries() {
         assert_eq!(quant_site(1, crate::Q4_BITS), "quant.decode-q4");
         assert_eq!(quant_site(1, crate::Q8_BITS), "quant.decode-q8");
+        assert_eq!(quant_site(2, crate::Q4_BITS), "quant.decode-b2-q4");
+        assert_eq!(quant_site(4, crate::Q8_BITS), "quant.decode-b4-q8");
+        assert_eq!(quant_site(8, crate::Q4_BITS), "quant.decode-b8-q4");
         assert_eq!(quant_site(15, crate::Q4_BITS), "quant.prefill-small");
         assert_eq!(quant_site(16, crate::Q4_BITS), "quant.prefill-tiled");
     }
@@ -150,6 +176,13 @@ mod tests {
         assert_eq!(gathered_size(64), "grouped-small-m");
         assert_eq!(gathered_size(511), "grouped-small-m");
         assert_eq!(gathered_size(512), "grouped");
+    }
+
+    #[test]
+    fn assigns_routed_decode_rows_to_batch_sites() {
+        assert_eq!(gathered_site("moe.gate-up", 16), "moe.gate-up.batch-2");
+        assert_eq!(gathered_site("moe.gate-up", 32), "moe.gate-up.batch-4");
+        assert_eq!(gathered_site("moe.gate-up", 64), "moe.gate-up.batch-8");
     }
 
     #[test]
