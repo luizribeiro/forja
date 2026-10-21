@@ -73,7 +73,7 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
   "json",
 ] }
 toml = "1.0"
-wasmparser = { version = "0.258", default-features = false, features = [
+wasmparser = { version = "0.262", default-features = false, features = [
   "component-model",
   "std",
 ] }
