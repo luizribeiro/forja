@@ -7,11 +7,12 @@ This project is under construction.
 See [engine profiles](engines/) and [chat formats](chat-formats/) for supported models and serving
 formats.
 
-`forja serve` provides no authentication. By default it reuses an exact live token prefix from the
-immediately preceding request; `cached_tokens` and response timing therefore reveal cache
-membership. Multi-tenant deployments behind one server should set `serving.prefix-reuse = false`
-unless their trusted upstream provides the required isolation. Intervening requests replace the
-sole live prefix.
+`forja serve` provides no authentication. By default it reuses exact token prefixes from earlier
+requests; `cached_tokens` and response timing therefore reveal cache membership. Engines with a
+paged KV cache keep a bounded LRU index of many prefixes, so any recently served prompt can be
+probed; other engines keep only the immediately preceding request's prefix. Multi-tenant
+deployments behind one server should set `serving.prefix-reuse = false` unless their trusted
+upstream provides the required isolation.
 
 Weight grants are capabilities for operator-owned model files. Granted files must not be modified
 or truncated while a guest or tensor can still reference them. Breaking that contract can change
