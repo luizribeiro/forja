@@ -7,10 +7,10 @@ use forja_sdk::Param;
 #[cfg(target_family = "wasm")]
 use forja_sdk::nn::blocks::{ChunkedPrefill, DecodeSelection, DecodeState, PrefillExecution};
 use forja_sdk::{
-    BatchInput, BatchPhase, BatchSelection, BatchShape, CachePlane, DType, Dim, Engine, EngineInfo,
-    EngineLoadConfig, KvCacheFormat, Load, PagedCache, PagedCacheSet, PagedPool, Result,
-    ServingInfo, StepInput, StepOutput, Tensor, VariantSelection, Weights, bf16, export_engine,
-    f16,
+    BatchInput, BatchOutput, BatchPhase, BatchSelectInput, BatchSelection, BatchShape, CachePlane,
+    DType, Dim, Engine, EngineInfo, EngineLoadConfig, KvCacheFormat, Load, PagedCache,
+    PagedCacheSet, PagedPool, Result, ServingInfo, StepInput, StepOutput, Tensor, VariantSelection,
+    Weights, bf16, export_engine, f16,
     kernel::{Epilogue, Kernel, TensorRef},
     nn::{
         RmsNorm, RmsNormConfig,
@@ -956,6 +956,8 @@ pub struct Qwen3Coder {
     short_prefill: Option<ChunkedPrefill<f32>>,
     #[cfg(target_family = "wasm")]
     long_prefill: Option<ChunkedPrefill<f32>>,
+    #[cfg(target_family = "wasm")]
+    batch_feedback: Tensor<u32>,
 }
 
 impl Qwen3Coder {
@@ -1010,6 +1012,8 @@ impl Qwen3Coder {
                     .with_tail_chunk(PREFILL_TAIL_CHUNK)?
                     .with_tail_capacity(LONG_PREFILL_TAIL_CAPACITY)?,
             ),
+            #[cfg(target_family = "wasm")]
+            batch_feedback: Tensor::zeros(&[8])?,
         })
     }
 
@@ -1354,11 +1358,30 @@ impl Engine for Qwen3Coder {
     }
 
     #[cfg(target_family = "wasm")]
+    fn batch_step(&mut self, input: BatchInput<'_>) -> Result<BatchOutput> {
+        let starts = batch_starts(&input.lanes);
+        let tokens = self.batch_tokens(&input.lanes)?;
+        let positions = batch_positions(&starts)?;
+        let logits = self.forward_batch_rows(&tokens, &positions, &starts)?;
+        let tokens = self.select_batch_rows(&logits, &input.lanes)?;
+        Ok(BatchOutput { logits, tokens })
+    }
+
+    #[cfg(target_family = "wasm")]
     fn batch_forward(&mut self, input: BatchInput<'_>) -> Result<Tensor<f32>> {
         let starts = batch_starts(&input.lanes);
-        let tokens = Self::batch_tokens(&input.lanes)?;
+        let tokens = self.batch_tokens(&input.lanes)?;
         let positions = batch_positions(&starts)?;
         self.forward_batch_rows(&tokens, &positions, &starts)
+    }
+
+    #[cfg(target_family = "wasm")]
+    fn batch_select(&mut self, input: BatchSelectInput<'_>) -> Result<BatchOutput> {
+        let tokens = self.select_masked_batch_rows(input.logits, &input.lanes)?;
+        Ok(BatchOutput {
+            logits: input.logits.alias()?,
+            tokens,
+        })
     }
 }
 
@@ -1389,19 +1412,73 @@ fn batch_lane_spans(starts: &[Option<u32>]) -> Result<Vec<(u32, u32, u32)>> {
 
 #[cfg(target_family = "wasm")]
 fn batch_positions(starts: &[Option<u32>]) -> Result<Tensor<f32>> {
-    let positions = starts
-        .iter()
-        .copied()
-        .map(|start| exact_position(start.unwrap_or_default()))
-        .collect::<Result<Vec<_>>>()?;
+    let positions = batch_position_values(starts)?;
     let rows = u32::try_from(positions.len())
         .map_err(|_| forja_sdk::Error::loading("batch rows exceed u32"))?;
     Tensor::constant(&positions, &[rows])
 }
 
+fn batch_position_values(starts: &[Option<u32>]) -> Result<Vec<f32>> {
+    starts
+        .iter()
+        .copied()
+        .map(|start| exact_position(start.unwrap_or_default()))
+        .collect()
+}
+
+#[cfg(target_family = "wasm")]
+fn sampling_tensor(sampling: forja_sdk::SamplingParams) -> Result<Tensor<u32>> {
+    let seed_low = u32::try_from(sampling.seed & u64::from(u32::MAX))
+        .map_err(|_| forja_sdk::Error::loading("sampling seed low word overflowed"))?;
+    let seed_high = u32::try_from(sampling.seed >> 32)
+        .map_err(|_| forja_sdk::Error::loading("sampling seed high word overflowed"))?;
+    Tensor::constant(
+        &[
+            sampling.temperature.to_bits(),
+            sampling.top_k,
+            sampling.top_p.to_bits(),
+            seed_low,
+            seed_high,
+        ],
+        &[5],
+    )
+}
+
+fn allow_mask(allow: &[u32]) -> Result<Vec<u32>> {
+    let words = VOCAB
+        .checked_add(31)
+        .ok_or_else(|| forja_sdk::Error::loading("vocabulary mask size overflowed"))?
+        / 32;
+    let mut mask = vec![
+        0_u32;
+        usize::try_from(words).map_err(|_| {
+            forja_sdk::Error::loading("vocabulary mask size exceeds address space")
+        })?
+    ];
+    for &token in allow {
+        if token >= VOCAB {
+            return Err(forja_sdk::Error::loading(
+                "masked batch token exceeds vocabulary",
+            ));
+        }
+        let word = usize::try_from(token / 32)
+            .map_err(|_| forja_sdk::Error::loading("mask index exceeds address space"))?;
+        mask[word] |= 1 << (token % 32);
+    }
+    Ok(mask)
+}
+
+#[cfg(target_family = "wasm")]
+fn allow_tensor(allow: &[u32]) -> Result<Tensor<u32>> {
+    let mask = allow_mask(allow)?;
+    let words = u32::try_from(mask.len())
+        .map_err(|_| forja_sdk::Error::loading("vocabulary mask size exceeds u32"))?;
+    Tensor::constant(&mask, &[words])
+}
+
 #[cfg(target_family = "wasm")]
 impl Qwen3Coder {
-    fn batch_tokens(lanes: &[Option<forja_sdk::BatchLane>]) -> Result<Tensor<u32>> {
+    fn batch_tokens(&self, lanes: &[Option<forja_sdk::BatchLane>]) -> Result<Tensor<u32>> {
         let rows = u32::try_from(lanes.len())
             .map_err(|_| forja_sdk::Error::loading("batch rows exceed u32"))?;
         let tokens = Tensor::zeros(&[rows])?;
@@ -1411,9 +1488,10 @@ impl Qwen3Coder {
             };
             let lane = u32::try_from(lane)
                 .map_err(|_| forja_sdk::Error::loading("batch lane exceeds u32"))?;
-            let token = input.tokens.as_ref().ok_or_else(|| {
-                forja_sdk::Error::loading("forward-only batch lanes require input tokens")
-            })?;
+            let token = input
+                .tokens
+                .as_ref()
+                .map_or_else(|| self.batch_feedback.narrow(0, lane, 1), Tensor::alias)?;
             if token.shape() != [1] {
                 return Err(forja_sdk::Error::loading(
                     "batch decode lanes require one token",
@@ -1461,6 +1539,61 @@ impl Qwen3Coder {
             normalized = next_normalized;
         }
         self.weights.lm_head.forward(&self.variants, &normalized)
+    }
+
+    fn select_batch_rows(
+        &self,
+        logits: &Tensor<f32>,
+        lanes: &[Option<forja_sdk::BatchLane>],
+    ) -> Result<Tensor<u32>> {
+        let rows = u32::try_from(lanes.len())
+            .map_err(|_| forja_sdk::Error::loading("batch rows exceed u32"))?;
+        let output = Tensor::zeros(&[rows])?;
+        for (lane, input) in lanes.iter().enumerate() {
+            let Some(input) = input else {
+                continue;
+            };
+            let lane = u32::try_from(lane)
+                .map_err(|_| forja_sdk::Error::loading("batch lane exceeds u32"))?;
+            let row = logits.narrow(0, lane, 1)?;
+            let selected = if input.sampling.temperature == 0.0 || input.sampling.top_k == 1 {
+                row.argmax()?
+            } else {
+                row.sample_with(
+                    &sampling_tensor(input.sampling)?,
+                    input.start_pos,
+                    &self.variants.sample()?,
+                )?
+            };
+            selected.copy_into(&mut output.narrow(0, lane, 1)?)?;
+            selected.copy_into(&mut self.batch_feedback.narrow(0, lane, 1)?)?;
+        }
+        Ok(output)
+    }
+
+    fn select_masked_batch_rows(
+        &self,
+        logits: &Tensor<f32>,
+        lanes: &[Option<forja_sdk::BatchSelectLane>],
+    ) -> Result<Tensor<u32>> {
+        let rows = u32::try_from(lanes.len())
+            .map_err(|_| forja_sdk::Error::loading("batch rows exceed u32"))?;
+        let output = Tensor::zeros(&[rows])?;
+        for (lane, input) in lanes.iter().enumerate() {
+            let Some(input) = input else {
+                continue;
+            };
+            let lane = u32::try_from(lane)
+                .map_err(|_| forja_sdk::Error::loading("batch lane exceeds u32"))?;
+            let selected = logits.narrow(0, lane, 1)?.sample_masked(
+                &sampling_tensor(input.sampling)?,
+                &allow_tensor(&input.allow)?,
+                input.start_pos,
+            )?;
+            selected.copy_into(&mut output.narrow(0, lane, 1)?)?;
+            selected.copy_into(&mut self.batch_feedback.narrow(0, lane, 1)?)?;
+        }
+        Ok(output)
     }
 
     fn prefill_supports(&self, start: u32, sequence: u32) -> bool {
@@ -1716,5 +1849,22 @@ mod tests {
             [(0, 7, 8), (2, 33, 34)]
         );
         assert!(batch_lane_spans(&[Some(u32::MAX)]).is_err());
+    }
+
+    #[test]
+    fn builds_per_lane_allow_masks() {
+        let mask = allow_mask(&[0, 31, 32, VOCAB - 1]).unwrap();
+        assert_eq!(mask[0], (1 << 31) | 1);
+        assert_eq!(mask[1], 1);
+        assert_ne!(mask.last().copied().unwrap() & (1 << ((VOCAB - 1) % 32)), 0);
+        assert!(allow_mask(&[VOCAB]).is_err());
+    }
+
+    #[test]
+    fn builds_independent_batch_positions() {
+        assert_eq!(
+            batch_position_values(&[Some(7), None, Some(33)]).unwrap(),
+            [7.0, 0.0, 33.0]
+        );
     }
 }
