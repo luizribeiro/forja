@@ -1,5 +1,6 @@
 //! Qwen3-Coder-30B-A3B-Instruct MLX 4-bit inference engine.
 
+mod reduction_classes;
 mod variants;
 
 #[cfg(target_family = "wasm")]

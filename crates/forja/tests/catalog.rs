@@ -4,6 +4,9 @@ use std::{fmt::Write as _, process::Command};
 
 use sha2::{Digest, Sha256};
 
+#[path = "../../../engines/qwen3-coder/src/reduction_classes.rs"]
+mod qwen3_coder_reduction_classes;
+
 fn catalog(arguments: &[&str]) -> String {
     let output = Command::new(env!("CARGO_BIN_EXE_forja"))
         .args(["--isolated", "catalog"])
@@ -49,5 +52,27 @@ fn metal_catalog_cli_snapshots() {
     assert_eq!(
         digest(&json),
         "3abe592fa4775baad35fa6caca42f4b9a241f14ccfc6b4f763d665e1b3c36202"
+    );
+}
+
+#[test]
+fn qwen3_coder_reduction_classes_match_the_metal_registry() {
+    let catalog: serde_json::Value = serde_json::from_str(&catalog(&["--json"])).unwrap();
+    let variants = catalog["variants"].as_array().unwrap();
+    let mut matched = 0;
+    for variant in variants {
+        let name = variant["name"].as_str().unwrap();
+        if let Some(expected) = qwen3_coder_reduction_classes::serving_reduction_class(name) {
+            assert_eq!(
+                variant["reduction_class"].as_str(),
+                Some(expected),
+                "{name}"
+            );
+            matched += 1;
+        }
+    }
+    assert_eq!(
+        matched,
+        qwen3_coder_reduction_classes::SERVING_REDUCTION_CLASSES.len()
     );
 }

@@ -1,6 +1,9 @@
 use forja_sdk::{
     EngineLoadConfig, EngineSelections, Param, Result, VariantSelection, target::metal::Variant,
 };
+use std::collections::BTreeMap;
+
+use crate::reduction_classes::serving_reduction_class;
 
 const SITES: &[&str] = &[
     "quant.decode-q4",
@@ -43,6 +46,7 @@ pub(crate) struct Variants(EngineSelections);
 
 impl Variants {
     pub(crate) fn new(config: &EngineLoadConfig) -> Result<Self> {
+        validate_batch_reductions(config)?;
         Ok(Self(EngineSelections::new(
             config,
             &[],
@@ -107,6 +111,58 @@ impl Variants {
     fn gathered(&self, operation: &str, routed_rows: u32) -> Result<Variant> {
         self.0.at(&gathered_site(operation, routed_rows), 0)
     }
+}
+
+fn validate_batch_reductions(config: &EngineLoadConfig) -> Result<()> {
+    let picks = config
+        .fixed_variant_picks
+        .iter()
+        .map(|pick| (pick.site.as_str(), pick.name.as_str()))
+        .collect::<BTreeMap<_, _>>();
+    for sites in [
+        &[
+            "quant.decode-q4",
+            "quant.decode-b2-q4",
+            "quant.decode-b4-q4",
+            "quant.decode-b8-q4",
+        ][..],
+        &[
+            "quant.decode-q8",
+            "quant.decode-b2-q8",
+            "quant.decode-b4-q8",
+            "quant.decode-b8-q8",
+        ],
+        &[
+            "gather-quant-matmul.small",
+            "gather-quant-matmul.batch-2",
+            "gather-quant-matmul.batch-4",
+            "gather-quant-matmul.batch-8",
+        ],
+        &[
+            "moe.gate-up.small",
+            "moe.gate-up.batch-2",
+            "moe.gate-up.batch-4",
+            "moe.gate-up.batch-8",
+        ],
+    ] {
+        let mut class = None;
+        for site in sites {
+            let Some(name) = picks.get(site) else {
+                continue;
+            };
+            let next = serving_reduction_class(name).ok_or_else(|| {
+                forja_sdk::Error::loading(format!(
+                    "serving site {site:?} selected a non-invariant variant"
+                ))
+            })?;
+            if class.replace(next).is_some_and(|class| class != next) {
+                return Err(forja_sdk::Error::loading(
+                    "serving decode buckets require one reduction class",
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn gathered_site(operation: &str, routed_rows: u32) -> String {
@@ -183,6 +239,19 @@ mod tests {
         assert_eq!(gathered_site("moe.gate-up", 16), "moe.gate-up.batch-2");
         assert_eq!(gathered_site("moe.gate-up", 32), "moe.gate-up.batch-4");
         assert_eq!(gathered_site("moe.gate-up", 64), "moe.gate-up.batch-8");
+    }
+
+    #[test]
+    fn distinguishes_cross_bucket_reduction_classes() {
+        assert_eq!(
+            serving_reduction_class("quant-matmul.gemv"),
+            serving_reduction_class("quant-matmul.row-gemv")
+        );
+        assert_ne!(
+            serving_reduction_class("gather-quant-matmul.route-gemv"),
+            serving_reduction_class("gather-quant-matmul.grouped-small-m")
+        );
+        assert_eq!(serving_reduction_class("matmul.portable"), None);
     }
 
     #[test]
