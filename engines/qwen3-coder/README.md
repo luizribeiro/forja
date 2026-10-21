@@ -49,8 +49,8 @@ Accepted pp512/tg128 results use 30 measured repetitions on an 80-core Apple M3 
 | --- | --- | ---: | ---: |
 | f16 | GPU sequential | 1308.62 | 82.26 |
 | f16 | GPU pipelined | 1299.95 | 105.31 |
-| f32 | GPU sequential | 1226.42 | 71.10 |
-| f32 | GPU pipelined | 1224.55 | 98.09 |
+| f32 | GPU sequential | 1266.44 | 82.78 |
+| f32 | GPU pipelined | 1246.92 | 104.88 |
 
 The f16 profile uses half-precision Q, K, V, and probability MMA inputs with f32 score, softmax,
 and output accumulation. Median wall throughput from matched five-repetition runs was:
@@ -69,11 +69,13 @@ The f16 verification rerun changed teacher-forced mean KL only from 2.01e-4 to 2
 64/64 top-1 agreement.
 
 At 32760 prompt tokens, f16 reached 194.70 tok/s with a 36.3 GiB physical-footprint peak and
-19.4 GiB guarded RSS, versus 186.61 tok/s, 39.5 GiB, and 22.4 GiB for f32. A warmed 100-request
-HTTP run with a 2048-token cached prefix plus 33 fresh tokens measured f16 cached TTFT at
-141.3/143.1/144.2 ms and ITL at 11.79/12.40/14.53 ms at p50/p90/p99. Exact cache reuse was 2048
-tokens. Old/new tg128 ABBA runs on Qwen3, OLMoE, and Qwen3-Coder differed by less than 0.1% after
-bracketing run-order drift.
+19.4 GiB guarded RSS, versus 186.61 tok/s, 39.5 GiB, and 22.4 GiB for f32. Eviction-faithful
+100-request HTTP A/B/B/A runs with a 2048-token cached prefix plus 33 fresh tokens measured
+contiguous f16 cached TTFT medians of 139.71 and 140.67 ms and paged medians of 153.81 and
+155.60 ms. Both paged 95% confidence intervals overlapped both contiguous intervals. Paged ITL
+medians were 10.64 and 10.57 ms, versus 10.80 ms for both contiguous legs, and exact cache reuse
+was 2048 tokens. Old/new tg128 ABBA runs on Qwen3, OLMoE, and Qwen3-Coder differed by less than
+0.1% after bracketing run-order drift.
 
 The complete confidence intervals and provenance are in the profile's `bench` directory.
 
