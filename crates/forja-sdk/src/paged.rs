@@ -116,18 +116,13 @@ impl PagedCache<'_> {
         value: &Tensor<T>,
         start: &Dim,
     ) -> Result<()> {
-        let [tokens, heads, width]: [u32; 3] = key
+        let [tokens, _, _]: [u32; 3] = key
             .shape()
             .try_into()
             .map_err(|_| Error::loading("paged key must have rank three"))?;
         if value.shape() != key.shape() {
             return Err(Error::loading("paged key and value shapes differ"));
         }
-        let elements = heads
-            .checked_mul(width)
-            .ok_or_else(|| Error::loading("paged cache row width overflowed"))?;
-        let key = key.contiguous()?.reshape(&[tokens, elements])?;
-        let value = value.contiguous()?.reshape(&[tokens, elements])?;
         #[cfg(target_family = "wasm")]
         let start = crate::graph::affine(start)?;
         #[cfg(target_family = "wasm")]
@@ -150,7 +145,7 @@ impl PagedCache<'_> {
             )
         })?;
         #[cfg(not(target_family = "wasm"))]
-        let _ = (&key, &value, start);
+        let _ = (&key, &value, start, tokens);
         Ok(())
     }
 

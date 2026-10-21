@@ -565,7 +565,7 @@ struct LayerResources<'a> {
 
 enum LayerCache<'a> {
     Contiguous(&'a mut Cache),
-    Paged(PagedCache<'a>, KvCacheFormat),
+    Paged(PagedCache<'a>),
 }
 
 impl LayerCache<'_> {
@@ -582,20 +582,14 @@ impl LayerCache<'_> {
             Self::Contiguous(cache) => {
                 cache.attention(query, key, value, start, end, selection.choice())
             }
-            Self::Paged(cache, KvCacheFormat::F16) => {
-                paged_cache_attention::<f16>(cache, query, key, value, start, end, selection)
-            }
-            Self::Paged(cache, KvCacheFormat::Bf16) => {
-                paged_cache_attention::<bf16>(cache, query, key, value, start, end, selection)
-            }
-            Self::Paged(cache, KvCacheFormat::F32) => {
-                paged_cache_attention::<f32>(cache, query, key, value, start, end, selection)
+            Self::Paged(cache) => {
+                paged_cache_attention(cache, query, key, value, start, end, selection)
             }
         }
     }
 }
 
-fn paged_cache_attention<C: forja_sdk::Element>(
+fn paged_cache_attention(
     cache: &PagedCache<'_>,
     query: &Tensor<f32>,
     key: &Tensor<f32>,
@@ -604,15 +598,13 @@ fn paged_cache_attention<C: forja_sdk::Element>(
     end: &Dim,
     selection: &VariantSelection,
 ) -> Result<Tensor<f32>> {
-    let cached_key = key.to_dtype::<C>()?;
-    let cached_value = value.to_dtype::<C>()?;
-    cache.append(&cached_key, &cached_value, start)?;
+    cache.append(key, value, start)?;
     cache.attention(query, ATTENTION_SCALE, start, end, selection.choice())
 }
 
 enum CacheStorage {
     Contiguous(Vec<Cache>),
-    Paged(PagedCacheSet, KvCacheFormat),
+    Paged(PagedCacheSet),
 }
 
 impl CacheStorage {
@@ -626,12 +618,12 @@ impl CacheStorage {
                 .get_mut(index)
                 .map(LayerCache::Contiguous)
                 .ok_or_else(|| forja_sdk::Error::loading("cache layer is out of range")),
-            Self::Paged(caches, format) => caches
+            Self::Paged(caches) => caches
                 .layer(
                     u32::try_from(index)
                         .map_err(|_| forja_sdk::Error::loading("cache layer exceeds u32"))?,
                 )
-                .map(|cache| LayerCache::Paged(cache, *format)),
+                .map(LayerCache::Paged),
         }
     }
 }
@@ -841,7 +833,6 @@ impl Qwen3Coder {
                     u32::try_from(layers)
                         .map_err(|_| forja_sdk::Error::loading("layer count exceeds u32"))?,
                 )?,
-                config.kv_cache,
             )
         } else {
             CacheStorage::Contiguous(
