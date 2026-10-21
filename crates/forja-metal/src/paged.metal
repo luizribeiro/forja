@@ -162,11 +162,16 @@ void paged_steel_attention_body(
         first_causal_block = (params.query_start + first_query) / BK;
     }
     if (thread_index == 0) {
-        first_page = table[0].x;
-        physical_page = first_page;
         valid = atomic_load_explicit(error_flag, memory_order_relaxed) == 0;
+        if (valid != 0) {
+            first_page = table[0].x;
+            physical_page = first_page;
+        }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (valid == 0) {
+        return;
+    }
     uint previous_page = 0;
     uint row_stride = params.kv_heads * BD;
     ulong first_physical_token = ulong(first_page) * params.page_tokens;
@@ -189,12 +194,11 @@ void paged_steel_attention_body(
             page_base = (ulong(physical_page) * params.page_tokens + page_row)
                 * row_stride + ulong(kv_head) * BD;
         }
-        uint page_valid = valid;
         for (uint linear = thread_index; linear < BK * BD; linear += thread_count) {
             uint tile_row = linear / BD;
             uint tile_column = linear % BD;
-            bool in_range = page_valid != 0 && (paged_align_key != 0
-                || first_key + tile_row < params.key_length);
+            bool in_range = paged_align_key != 0
+                || first_key + tile_row < params.key_length;
             ulong index = page_base + ulong(tile_row) * row_stride + tile_column;
             kv_tile[tile_column * LDK + tile_row] = in_range
                 ? TileT(load_float(key, index, input1_dtype)) : TileT(0);
@@ -259,8 +263,8 @@ void paged_steel_attention_body(
         for (uint linear = thread_index; linear < BK * BD; linear += thread_count) {
             uint tile_row = linear / BD;
             uint tile_column = linear % BD;
-            bool in_range = page_valid != 0 && (paged_align_key != 0
-                || first_key + tile_row < params.key_length);
+            bool in_range = paged_align_key != 0
+                || first_key + tile_row < params.key_length;
             ulong index = page_base + ulong(tile_row) * row_stride + tile_column;
             kv_tile[tile_row * LDV + tile_column] = in_range
                 ? TileT(load_float(value, index, input2_dtype)) : TileT(0);
@@ -387,11 +391,16 @@ void paged_sdpa_2pass_1_gqa_body(
     uint valid = 0;
     uint first_page = 0;
     if (simd_lane == 0) {
-        first_page = table[0].x;
         valid = atomic_load_explicit(error_flag, memory_order_relaxed) == 0;
+        if (valid != 0) {
+            first_page = table[0].x;
+        }
     }
     first_page = simd_broadcast(first_page, 0);
     valid = simd_broadcast(valid, 0);
+    if (valid == 0) {
+        return;
+    }
     for (uint key_row = chunk_start; key_row < chunk_end; ++key_row) {
         uint logical_page = key_row / params.page_tokens;
         if (logical_page != previous_logical_page) {
@@ -615,11 +624,16 @@ void paged_sdpa_body(
     float maximum = negative_finite_sentinel();
     float denominator = 0.0f;
     if (simd_group == 0 && simd_lane == 0) {
-        first_page = table[0].x;
-        physical_page = first_page;
         valid = atomic_load_explicit(error_flag, memory_order_relaxed) == 0;
+        if (valid != 0) {
+            first_page = table[0].x;
+            physical_page = first_page;
+        }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (valid == 0) {
+        return;
+    }
     uint pages = (params.key_length + params.page_tokens - 1) / params.page_tokens;
     for (uint logical_page = 0; logical_page < pages; ++logical_page) {
         uint page = first_page + logical_page;
@@ -632,33 +646,31 @@ void paged_sdpa_body(
         }
         uint page_begin = logical_page * params.page_tokens;
         uint page_end = min(params.key_length, page_begin + params.page_tokens);
-        if (valid != 0) {
-            for (uint key_row = page_begin + simd_group; key_row < page_end; key_row += groups) {
-                if (params.causal != 0 && key_row > params.query_start + query_row) {
-                    continue;
-                }
-                uint page_row = key_row - page_begin;
-                ulong k_base = ((ulong(page) * params.page_tokens + page_row)
-                    * params.kv_heads + kv_head) * D;
-                float score = 0.0f;
-                for (uint element = 0; element < elements_per_thread; ++element) {
-                    uint column = simd_lane * elements_per_thread + element;
-                    score += q[element] * load_float(
-                        key, k_base + column, input1_dtype);
-                }
-                score = simd_sum(score);
-                float next_maximum = max(maximum, score);
-                float previous_factor = fast::exp(maximum - next_maximum);
-                float score_factor = fast::exp(score - next_maximum);
-                maximum = next_maximum;
-                denominator = denominator * previous_factor + score_factor;
-                ulong v_base = ((ulong(page) * params.page_tokens + page_row)
-                    * params.kv_heads + kv_head) * params.value_width;
-                for (uint element = 0; element < elements_per_thread; ++element) {
-                    uint column = simd_lane * elements_per_thread + element;
-                    float v = load_float(value, v_base + column, input2_dtype);
-                    result[element] = result[element] * previous_factor + score_factor * v;
-                }
+        for (uint key_row = page_begin + simd_group; key_row < page_end; key_row += groups) {
+            if (params.causal != 0 && key_row > params.query_start + query_row) {
+                continue;
+            }
+            uint page_row = key_row - page_begin;
+            ulong k_base = ((ulong(page) * params.page_tokens + page_row)
+                * params.kv_heads + kv_head) * D;
+            float score = 0.0f;
+            for (uint element = 0; element < elements_per_thread; ++element) {
+                uint column = simd_lane * elements_per_thread + element;
+                score += q[element] * load_float(
+                    key, k_base + column, input1_dtype);
+            }
+            score = simd_sum(score);
+            float next_maximum = max(maximum, score);
+            float previous_factor = fast::exp(maximum - next_maximum);
+            float score_factor = fast::exp(score - next_maximum);
+            maximum = next_maximum;
+            denominator = denominator * previous_factor + score_factor;
+            ulong v_base = ((ulong(page) * params.page_tokens + page_row)
+                * params.kv_heads + kv_head) * params.value_width;
+            for (uint element = 0; element < elements_per_thread; ++element) {
+                uint column = simd_lane * elements_per_thread + element;
+                float v = load_float(value, v_base + column, input2_dtype);
+                result[element] = result[element] * previous_factor + score_factor * v;
             }
         }
         if (params.contiguous_entries == 0) {
