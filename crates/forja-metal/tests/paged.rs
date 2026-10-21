@@ -7,7 +7,8 @@ use std::{any::Any, collections::HashSet, ops::Range};
 
 use forja_core::{
     Backend, BackendDispatchData, BackendError, CommandList, DType, GraphLimits, GraphTemplate, Op,
-    PagePool, PagedCopyDirection, PagedLayout, PagedPlane, ParamSpace, Slice, Submission, ViewOp,
+    PagePool, PagedCopyDirection, PagedLayout, PagedPlane, ParamSpace, Slice, Submission, Tensor,
+    ViewOp,
 };
 use half::{bf16, f16};
 
@@ -354,6 +355,22 @@ fn seeded_query_values(
         .collect()
 }
 
+fn finish_sdpa<B: Backend>(
+    backend: &B,
+    output: &Tensor,
+    submission: B::Submission,
+    rejected_output: Option<&mut Vec<f32>>,
+) -> Result<Vec<f32>, BackendError> {
+    if let Err(error) = submission.wait() {
+        drop(submission);
+        if let Some(capture) = rejected_output {
+            *capture = decode_f32(&backend.read(output)?);
+        }
+        return Err(error);
+    }
+    backend.read(output).map(|bytes| decode_f32(&bytes))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_sdpa<B: Backend + 'static>(
     backend: &B,
@@ -367,6 +384,7 @@ fn run_sdpa<B: Backend + 'static>(
     head_offsets: (u32, u32),
     corrupt_pages: &[usize],
     variant: Option<&str>,
+    rejected_output: Option<&mut Vec<f32>>,
 ) -> Result<Vec<f32>, BackendError> {
     const PAGE_TOKENS: u32 = 64;
     const WIDTH: u32 = 128;
@@ -396,8 +414,8 @@ fn run_sdpa<B: Backend + 'static>(
     let kv_element_offset = kv_head_offset.checked_mul(WIDTH).unwrap();
     let plane_elements = usize::try_from(kv_heads * WIDTH).unwrap();
     let pool_tokens = usize::try_from(physical_pages * PAGE_TOKENS).unwrap();
-    let mut keys = vec![0.0_f32; pool_tokens * plane_elements];
-    let mut values = vec![0.0_f32; pool_tokens * plane_elements];
+    let mut keys = vec![f32::NAN; pool_tokens * plane_elements];
+    let mut values = vec![f32::NAN; pool_tokens * plane_elements];
     for token in 0..key_length {
         let logical_page = token / PAGE_TOKENS;
         let physical = entries[usize::try_from(logical_page).unwrap()].0;
@@ -461,8 +479,7 @@ fn run_sdpa<B: Backend + 'static>(
             .unwrap();
         assert!(commands.set_last_backend_data(BackendDispatchData::new(selection)));
     }
-    backend.submit(commands)?.wait()?;
-    backend.read(&output).map(|bytes| decode_f32(&bytes))
+    finish_sdpa(backend, &output, backend.submit(commands)?, rejected_output)
 }
 
 fn check_paged_sdpa_real_shapes(dtype: DType, shapes: &[(u32, u32)], query_head_range: Range<u32>) {
@@ -492,6 +509,7 @@ fn check_paged_sdpa_real_shapes(dtype: DType, shapes: &[(u32, u32)], query_head_
             (query_head_range.start, reference_kv_offset),
             &[],
             None,
+            None,
         )
         .unwrap();
         let variant = match (dtype, query_length) {
@@ -511,6 +529,7 @@ fn check_paged_sdpa_real_shapes(dtype: DType, shapes: &[(u32, u32)], query_head_
             (0, 0),
             &[],
             Some(variant),
+            None,
         )
         .unwrap();
         let row_elements = usize::try_from(query_length * WIDTH).unwrap();
@@ -585,6 +604,7 @@ fn check_paged_gqa_two_pass(length: u32, variant: &str) {
             (0, 0),
             &[],
             None,
+            None,
         )
         .unwrap();
         let candidate = run_sdpa(
@@ -599,6 +619,7 @@ fn check_paged_gqa_two_pass(length: u32, variant: &str) {
             (0, 0),
             &[],
             Some(variant),
+            None,
         )
         .unwrap();
         let error = forja_testing::normwise_relative_error(&reference, &candidate);
@@ -639,7 +660,8 @@ paged_gqa_two_pass_tests!(
 );
 
 #[test]
-fn metal_paged_gqa_two_pass_refuses_corrupt_entries() {
+fn metal_paged_gqa_two_pass_refuses_corrupt_page_without_reading_it() {
+    let mut rejected_output = Vec::new();
     let error = run_sdpa(
         &forja_metal::MetalBackend::new().unwrap(),
         DType::F16,
@@ -652,9 +674,46 @@ fn metal_paged_gqa_two_pass_refuses_corrupt_entries() {
         (0, 0),
         &[7],
         Some("paged-sdpa.vector-gqa-two-pass-32"),
+        Some(&mut rejected_output),
     )
     .unwrap_err();
     assert!(matches!(error, BackendError::DeviceErrorFlag { .. }));
+    assert_eq!(rejected_output.len(), 32 * 128);
+    assert!(rejected_output.iter().all(|value| value.is_finite()));
+}
+
+#[test]
+fn metal_paged_gqa_two_pass_keeps_barriers_uniform_across_rejected_pages() {
+    let backend = forja_metal::MetalBackend::new().unwrap();
+    for (length, variant) in [
+        (512_u32, "paged-sdpa.vector-gqa-two-pass-32"),
+        (2_048, "paged-sdpa.vector-gqa-two-pass"),
+        (4_000, "paged-sdpa.vector-gqa-two-pass-128"),
+    ] {
+        let pages = usize::try_from(length.div_ceil(64)).unwrap();
+        let corrupt_pages = (1..pages).step_by(2).collect::<Vec<_>>();
+        for _ in 0..50 {
+            let mut rejected_output = Vec::new();
+            let error = run_sdpa(
+                &backend,
+                DType::F16,
+                length,
+                1,
+                false,
+                false,
+                32,
+                4,
+                (0, 0),
+                &corrupt_pages,
+                Some(variant),
+                Some(&mut rejected_output),
+            )
+            .unwrap_err();
+            assert!(matches!(error, BackendError::DeviceErrorFlag { .. }));
+            assert_eq!(rejected_output.len(), 32 * 128);
+            assert!(rejected_output.iter().all(|value| value.is_finite()));
+        }
+    }
 }
 
 #[test]
@@ -673,6 +732,7 @@ fn metal_paged_sdpa_uses_contiguous_entry_path() {
         (0, 0),
         &[],
         None,
+        None,
     )
     .unwrap();
     let candidate = run_sdpa(
@@ -686,6 +746,7 @@ fn metal_paged_sdpa_uses_contiguous_entry_path() {
         8,
         (0, 0),
         &[],
+        None,
         None,
     )
     .unwrap();
@@ -711,6 +772,7 @@ fn metal_paged_sdpa_matches_causal_prefill() {
         (0, 0),
         &[],
         None,
+        None,
     )
     .unwrap();
     let candidate = run_sdpa(
@@ -725,6 +787,7 @@ fn metal_paged_sdpa_matches_causal_prefill() {
         (0, 0),
         &[],
         Some("paged-sdpa.steel-half"),
+        None,
     )
     .unwrap();
     assert!(
@@ -747,6 +810,7 @@ fn metal_paged_steel_refuses_corrupt_entries() {
         (0, 0),
         &[0],
         Some("paged-sdpa.steel-half"),
+        None,
     )
     .unwrap_err();
     assert!(matches!(error, BackendError::DeviceErrorFlag { .. }));

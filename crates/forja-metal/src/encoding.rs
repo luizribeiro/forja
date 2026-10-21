@@ -3259,21 +3259,23 @@ impl MetalBackend {
         bindings.bind(table, 2, &params);
         bindings.bind(table, 3, &error_flag);
         set_argument_table(encoder, table);
-        dispatch_threadgroups(
-            encoder,
-            MTLSize {
-                width: usize::try_from(key_length.div_ceil(page_tokens).div_ceil(64))
-                    .map_err(|_| BackendError::InvalidInput)?,
-                height: 1,
-                depth: 1,
-            },
-            MTLSize {
-                width: 64,
-                height: 1,
-                depth: 1,
-            },
-        );
-        encode_dispatch_barrier(encoder);
+        if gqa_blocks.is_none() {
+            dispatch_threadgroups(
+                encoder,
+                MTLSize {
+                    width: usize::try_from(key_length.div_ceil(page_tokens).div_ceil(64))
+                        .map_err(|_| BackendError::InvalidInput)?,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: 64,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            encode_dispatch_barrier(encoder);
+        }
         if let Some(kernel) = match selected_variant(dispatch) {
             Some(MetalVariant::PagedSdpaSteel) => Some(SdpaKernel::Steel),
             Some(MetalVariant::PagedSdpaSteelHalf) => Some(SdpaKernel::SteelHalf),
@@ -3330,11 +3332,13 @@ impl MetalBackend {
             let partials = self.scratch_tensor(query.layout.dtype(), &[q[0], gqa_blocks, v[3]])?;
             let sums = self.scratch_tensor(DType::F32, &[q[0], gqa_blocks])?;
             let maxs = self.scratch_tensor(DType::F32, &[q[0], gqa_blocks])?;
+            let mut first_constants = constants.to_vec();
+            first_constants.push((213, u32::from(contiguous_entries)));
             let first = self
                 .pipelines
                 .lock()
                 .map_err(|_| BackendError::ExecutionFailed)?
-                .get("paged_sdpa_2pass_1_gqa_128", &constants)?;
+                .get("paged_sdpa_2pass_1_gqa_128", &first_constants)?;
             set_pipeline(encoder, &first);
             for (index, tensor) in [
                 &query,
