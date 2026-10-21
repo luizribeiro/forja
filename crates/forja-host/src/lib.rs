@@ -332,6 +332,15 @@ pub struct EngineBatchSelectLane {
     pub allow: Vec<u32>,
 }
 
+/// One homogeneous masked-selection batch.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EngineBatchSelect {
+    /// Exact masked shape declared by the engine descriptor.
+    pub shape: BatchShape,
+    /// Bucket-sized lanes; `None` denotes inert padding.
+    pub lanes: Vec<Option<EngineBatchSelectLane>>,
+}
+
 /// Device-resident outputs from one homogeneous engine batch.
 #[derive(Debug)]
 pub struct EngineBatchOutput {
@@ -868,6 +877,39 @@ pub fn validate_batch_output_layouts(
     Ok(())
 }
 
+/// Validates the construction boundary for masked-selection lanes.
+#[doc(hidden)]
+pub fn validate_batch_select_lanes(
+    serving: &ServingInfo,
+    input: &EngineBatchSelect,
+) -> Result<(), compute::Error> {
+    if input.shape.selection != BatchSelection::Masked
+        || !serving.batch_shapes.contains(&input.shape)
+    {
+        return Err(compute::Error::Layout(
+            "batch shape is not declared for masked selection".to_owned(),
+        ));
+    }
+    if usize::try_from(input.shape.bucket) != Ok(input.lanes.len())
+        || input.lanes.iter().all(Option::is_none)
+    {
+        return Err(compute::Error::Layout(
+            "masked lane count does not match its bucket".to_owned(),
+        ));
+    }
+    for lane in input.lanes.iter().flatten() {
+        if lane.start_pos >= serving.max_context
+            || lane.allow.is_empty()
+            || lane.allow.windows(2).any(|pair| pair[0] >= pair[1])
+        {
+            return Err(compute::Error::Layout(
+                "masked lane position or allow list is invalid".to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 impl From<EngineBatch> for engine_bindings::exports::l9o::gpu::engine::BatchIn {
     fn from(input: EngineBatch) -> Self {
         use engine_bindings::exports::l9o::gpu::engine::{
@@ -901,6 +943,42 @@ impl From<EngineBatch> for engine_bindings::exports::l9o::gpu::engine::BatchIn {
                             top_p: lane.sampling.top_p,
                             seed: lane.sampling.seed,
                         },
+                    })
+                })
+                .collect(),
+        }
+    }
+}
+
+impl From<EngineBatchSelect> for engine_bindings::exports::l9o::gpu::engine::BatchSelectIn {
+    fn from(input: EngineBatchSelect) -> Self {
+        use engine_bindings::exports::l9o::gpu::engine::{
+            BatchPhase as WitPhase, BatchSelectIn, BatchSelectLane, BatchSelection as WitSelection,
+            BatchShape as WitShape, SamplingParams as WitSampling,
+        };
+        BatchSelectIn {
+            shape: WitShape {
+                phase: match input.shape.phase {
+                    BatchPhase::Prompt => WitPhase::Prompt,
+                    BatchPhase::Decode => WitPhase::Decode,
+                },
+                bucket: input.shape.bucket,
+                tokens: input.shape.tokens,
+                selection: WitSelection::Masked,
+            },
+            lanes: input
+                .lanes
+                .into_iter()
+                .map(|lane| {
+                    lane.map(|lane| BatchSelectLane {
+                        start_pos: lane.start_pos,
+                        sampling: WitSampling {
+                            temperature: lane.sampling.temperature,
+                            top_k: lane.sampling.top_k,
+                            top_p: lane.sampling.top_p,
+                            seed: lane.sampling.seed,
+                        },
+                        allow: lane.allow,
                     })
                 })
                 .collect(),
@@ -7841,13 +7919,14 @@ mod tests {
 
     use super::{
         BackendEvent, BackendTimer, BatchPhase, BatchSelection, BatchShape, BatchSlotEntry,
-        EngineBatch, EngineBatchLane, EngineMemory, EngineMetrics, EngineRunner, EngineStep,
-        EngineStepProfile, Grants, Host, ImportKind, ImportTimer, Limits, MAX_INSTRUCTIONS,
-        MAX_OUTPUTS, PagePoolEntry, PagedSequenceEntry, ParamsEntry, ReplayFlight, ReplayState,
-        SamplingParams, ServingInfo, SubmissionOutcome, TensorEntry,
+        EngineBatch, EngineBatchLane, EngineBatchSelect, EngineBatchSelectLane, EngineMemory,
+        EngineMetrics, EngineRunner, EngineStep, EngineStepProfile, Grants, Host, ImportKind,
+        ImportTimer, Limits, MAX_INSTRUCTIONS, MAX_OUTPUTS, PagePoolEntry, PagedSequenceEntry,
+        ParamsEntry, ReplayFlight, ReplayState, SamplingParams, ServingInfo, SubmissionOutcome,
+        TensorEntry,
         bindings::l9o::gpu::{compute, paged_storage},
         core_op, core_program, expected_layer_outputs, validate_batch_lanes,
-        validate_batch_output_layouts, validate_batch_shapes,
+        validate_batch_output_layouts, validate_batch_select_lanes, validate_batch_shapes,
     };
 
     const GENEROUS: Limits = Limits::new(u64::MAX, 8, u64::MAX, 32, u64::MAX);
@@ -8093,6 +8172,34 @@ mod tests {
         assert_eq!(input.shape.bucket, 2);
         assert_eq!(input.lanes.len(), 2);
         assert!(input.lanes.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn masked_batch_validation_requires_sorted_nonempty_masks() {
+        let shape = BatchShape {
+            phase: BatchPhase::Decode,
+            bucket: 1,
+            tokens: 1,
+            selection: BatchSelection::Masked,
+        };
+        let serving = ServingInfo {
+            page_tokens: 4,
+            planes: Vec::new(),
+            active_lanes: 1,
+            max_context: 32,
+            batch_shapes: vec![shape],
+        };
+        let input = |allow| EngineBatchSelect {
+            shape,
+            lanes: vec![Some(EngineBatchSelectLane {
+                start_pos: 7,
+                sampling: SamplingParams::default(),
+                allow,
+            })],
+        };
+        assert!(validate_batch_select_lanes(&serving, &input(vec![1, 3])).is_ok());
+        assert!(validate_batch_select_lanes(&serving, &input(vec![3, 1])).is_err());
+        assert!(validate_batch_select_lanes(&serving, &input(Vec::new())).is_err());
     }
 
     #[tokio::test]
