@@ -3090,7 +3090,13 @@ impl MetalBackend {
             .pipelines
             .lock()
             .map_err(|_| BackendError::ExecutionFailed)?
-            .get("paged_copy", &[(0, dtype_code(ordinary.layout.dtype()))])?;
+            .get(
+                "paged_copy",
+                &[
+                    (0, dtype_code(ordinary.layout.dtype())),
+                    (1, dtype_code(pool.layout.dtype())),
+                ],
+            )?;
         set_pipeline(encoder, &pipeline);
         for (index, tensor) in [&ordinary, &pool, &page_table, &generations]
             .into_iter()

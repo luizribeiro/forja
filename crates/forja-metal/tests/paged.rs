@@ -50,9 +50,9 @@ fn generation_bytes(generations: &[u32]) -> Vec<u8> {
         .collect()
 }
 
-fn run_copy<B: Backend>(backend: &B) -> Result<Vec<u8>, BackendError> {
+fn run_copy<B: Backend>(backend: &B, cache_dtype: DType) -> Result<Vec<u8>, BackendError> {
     let source = backend.alloc(DType::F32, &[7, 3])?;
-    let pool = backend.alloc(DType::F32, &[3, 4, 3])?;
+    let pool = backend.alloc(cache_dtype, &[3, 4, 3])?;
     let table = backend.alloc(DType::U32, &[2, 2])?;
     let generations = backend.alloc(DType::U32, &[3])?;
     let output = backend.alloc(DType::F32, &[7, 3])?;
@@ -93,7 +93,20 @@ fn run_copy<B: Backend>(backend: &B) -> Result<Vec<u8>, BackendError> {
 fn metal_paged_copy_matches_cpu_across_page_edges() {
     let cpu = forja_cpu::CpuBackend::new();
     let metal = forja_metal::MetalBackend::new().unwrap();
-    assert_eq!(run_copy(&metal).unwrap(), run_copy(&cpu).unwrap());
+    assert_eq!(
+        run_copy(&metal, DType::F32).unwrap(),
+        run_copy(&cpu, DType::F32).unwrap()
+    );
+}
+
+#[test]
+fn metal_paged_copy_converts_directly_into_reduced_pages() {
+    let cpu = forja_cpu::CpuBackend::new();
+    let metal = forja_metal::MetalBackend::new().unwrap();
+    assert_eq!(
+        run_copy(&metal, DType::F16).unwrap(),
+        run_copy(&cpu, DType::F16).unwrap()
+    );
 }
 
 #[test]

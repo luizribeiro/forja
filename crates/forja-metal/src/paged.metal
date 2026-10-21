@@ -41,9 +41,9 @@ kernel void paged_copy(
         + logical_token % params.page_tokens) * params.elements + element;
     float value = params.direction == 0
         ? load_float(ordinary, index, input0_dtype)
-        : load_float(pool, paged_index, input0_dtype);
+        : load_float(pool, paged_index, input1_dtype);
     if (params.direction == 0) {
-        store_float(pool, paged_index, input0_dtype, value);
+        store_float(pool, paged_index, input1_dtype, value);
     } else {
         store_float(ordinary, index, input0_dtype, value);
     }
