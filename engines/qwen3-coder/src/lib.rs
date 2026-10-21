@@ -1360,6 +1360,39 @@ impl Engine for Qwen3Coder {
 
     #[cfg(target_family = "wasm")]
     fn batch_step(&mut self, input: BatchInput<'_>) -> Result<BatchOutput> {
+        if input.shape.phase == BatchPhase::Prompt {
+            let lane = input
+                .lanes
+                .first()
+                .and_then(Option::as_ref)
+                .ok_or_else(|| forja_sdk::Error::loading("prompt batch lane is inactive"))?;
+            let tokens = lane
+                .tokens
+                .as_ref()
+                .ok_or_else(|| forja_sdk::Error::loading("prompt batch tokens are missing"))?;
+            let sequence = tokens
+                .shape()
+                .first()
+                .copied()
+                .ok_or_else(|| forja_sdk::Error::loading("prompt tokens must have rank one"))?;
+            let end = prompt_end(lane.start_pos, sequence)?;
+            let attention = self
+                .variants
+                .attention(sequence, lane.start_pos, None, true)?;
+            let logits = self
+                .forward(
+                    tokens,
+                    sequence,
+                    &lane.start_pos.into(),
+                    &end.into(),
+                    false,
+                    &attention,
+                )?
+                .logits
+                .reshape(&[1, VOCAB])?;
+            let tokens = self.select_batch_rows(&logits, &input.lanes)?;
+            return Ok(BatchOutput { logits, tokens });
+        }
         let starts = batch_starts(&input.lanes);
         let tokens = self.batch_tokens(&input.lanes)?;
         let positions = batch_positions(&starts)?;
@@ -1425,6 +1458,12 @@ fn batch_position_values(starts: &[Option<u32>]) -> Result<Vec<f32>> {
         .copied()
         .map(|start| exact_position(start.unwrap_or_default()))
         .collect()
+}
+
+fn prompt_end(start: u32, sequence: u32) -> Result<u32> {
+    start
+        .checked_add(sequence)
+        .ok_or_else(|| forja_sdk::Error::loading("prompt position overflowed"))
 }
 
 #[cfg(target_family = "wasm")]
@@ -1557,12 +1596,18 @@ impl Qwen3Coder {
             let lane = u32::try_from(lane)
                 .map_err(|_| forja_sdk::Error::loading("batch lane exceeds u32"))?;
             let row = logits.narrow(0, lane, 1)?;
+            let position = input
+                .tokens
+                .as_ref()
+                .and_then(|tokens| tokens.shape().first().copied())
+                .and_then(|length| input.start_pos.checked_add(length)?.checked_sub(1))
+                .unwrap_or(input.start_pos);
             let selected = if input.sampling.temperature == 0.0 || input.sampling.top_k == 1 {
                 row.argmax()?
             } else {
                 row.sample_with(
                     &sampling_tensor(input.sampling)?,
-                    input.start_pos,
+                    position,
                     &self.variants.sample()?,
                 )?
             };
@@ -1828,6 +1873,15 @@ mod tests {
                 .collect::<Vec<_>>(),
             [1, 2, 4, 8]
         );
+        assert_eq!(
+            serving
+                .batch_shapes
+                .iter()
+                .filter(|shape| shape.phase == BatchPhase::Prompt)
+                .map(|shape| shape.tokens)
+                .collect::<Vec<_>>(),
+            [16, 512, 2_048]
+        );
     }
 
     #[test]
@@ -1867,5 +1921,11 @@ mod tests {
             batch_position_values(&[Some(7), None, Some(33)]).unwrap(),
             [7.0, 0.0, 33.0]
         );
+    }
+
+    #[test]
+    fn bounds_prompt_batches_at_the_lane_start() {
+        assert_eq!(prompt_end(7, 2_048).unwrap(), 2_055);
+        assert!(prompt_end(u32::MAX, 1).is_err());
     }
 }
