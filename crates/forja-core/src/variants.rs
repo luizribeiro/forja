@@ -409,6 +409,8 @@ pub struct VariantDef<I> {
     pub guarantees: Guarantee,
     /// Whether row reduction order is independent of batch size and lane position.
     pub batch_invariant: bool,
+    /// Identity of the per-row reduction order used for cross-bucket matching.
+    pub reduction_class: Option<&'static str>,
     /// Shapes and workloads where this algorithm is useful.
     pub use_when: &'static [&'static str],
     /// Shapes and workloads where another algorithm is preferable.
@@ -449,8 +451,11 @@ pub fn render_catalog_markdown<I>(
         append_markdown_sentences(&mut output, "Notes", variant.notes);
         let _ = write!(
             output,
-            "\n- Guarantee: {}.\n\n- Batch invariant: {}.\n\n- Lifecycle: {}.\n",
-            variant.guarantees, variant.batch_invariant, variant.lifecycle
+            "\n- Guarantee: {}.\n\n- Batch invariant: {}.\n\n- Reduction class: {}.\n\n- Lifecycle: {}.\n",
+            variant.guarantees,
+            variant.batch_invariant,
+            variant.reduction_class.unwrap_or("none"),
+            variant.lifecycle
         );
     }
     output
@@ -492,6 +497,7 @@ pub fn render_catalog_json<I>(
                 "notes": variant.notes,
                 "guarantees": variant.guarantees.to_string(),
                 "batch_invariant": variant.batch_invariant,
+                "reduction_class": variant.reduction_class,
                 "lifecycle": variant.lifecycle.to_string(),
             })
         })
@@ -676,6 +682,7 @@ mod tests {
         constraints: CONSTRAINTS,
         guarantees: Guarantee::Deterministic,
         batch_invariant: true,
+        reduction_class: Some("unit-test"),
         use_when: &["testing stable output"],
         avoid_when: &["production"],
         notes: &["quotes are escaped: \"yes\""],
@@ -706,6 +713,7 @@ mod tests {
             VARIANTS[0].guarantees.to_string()
         );
         assert_eq!(value["variants"][0]["batch_invariant"], true);
+        assert_eq!(value["variants"][0]["reduction_class"], "unit-test");
         assert_eq!(
             value["variants"][0]["lifecycle"],
             VARIANTS[0].lifecycle.to_string()

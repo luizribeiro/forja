@@ -86,6 +86,12 @@ impl ValidatedVariant {
         REGISTRY[self.index].batch_invariant
     }
 
+    /// Returns the stable per-row reduction identity used across serving buckets.
+    #[must_use]
+    pub fn reduction_class(self) -> Option<&'static str> {
+        REGISTRY[self.index].reduction_class
+    }
+
     pub(crate) const fn implementation(self) -> MetalVariant {
         REGISTRY[self.index].implementation
     }
@@ -619,6 +625,7 @@ macro_rules! variant {
             constraints: $constraints,
             guarantees: DETERMINISTIC,
             batch_invariant: $batch_invariant,
+            reduction_class: None,
             use_when: $use_when,
             avoid_when: $avoid_when,
             notes: $notes,
@@ -635,8 +642,11 @@ macro_rules! variant {
 macro_rules! batch_invariant_variant {
     ($name:literal, $operation:ident, $implementation:ident, $constraints:expr,
      $use_when:expr, $avoid_when:expr, $notes:expr) => {
-        variant!(@batch_invariant true; $name, $operation, $implementation, $constraints,
-                 $use_when, $avoid_when, $notes)
+        VariantDef {
+            reduction_class: Some($name),
+            ..variant!(@batch_invariant true; $name, $operation, $implementation, $constraints,
+                       $use_when, $avoid_when, $notes)
+        }
     };
 }
 
@@ -1593,6 +1603,15 @@ mod tests {
                 "sample.portable",
                 "sample.parallel",
             ]
+        );
+    }
+
+    #[test]
+    fn batch_invariant_variants_declare_reduction_classes() {
+        assert!(
+            REGISTRY
+                .iter()
+                .all(|variant| { !variant.batch_invariant || variant.reduction_class.is_some() })
         );
     }
 
