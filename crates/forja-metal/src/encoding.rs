@@ -3266,12 +3266,18 @@ impl MetalBackend {
             Some(MetalVariant::PagedSdpaSteelHalf) => Some(SdpaKernel::SteelHalf),
             _ => None,
         } {
-            let (block_query, _) = steel_attention_tile(kernel, q[2])?;
+            let (block_query, block_key) = steel_attention_tile(kernel, q[2])?;
+            let mut steel_constants = constants.to_vec();
+            steel_constants.extend([
+                (213, u32::from(contiguous_entries)),
+                (214, u32::from(key_length % block_key == 0)),
+                (215, u32::from(causal)),
+            ]);
             let pipeline = self
                 .pipelines
                 .lock()
                 .map_err(|_| BackendError::ExecutionFailed)?
-                .get(paged_sdpa_kernel(dispatch, q[2])?, &constants);
+                .get(paged_sdpa_kernel(dispatch, q[2])?, &steel_constants);
             match pipeline {
                 Ok(pipeline) => {
                     set_pipeline(encoder, &pipeline);

@@ -69,6 +69,10 @@ struct PagedSdpaParams {
     uint blocks;
 };
 
+constant uint paged_contiguous_entries [[function_constant(213)]];
+constant uint paged_align_key [[function_constant(214)]];
+constant uint paged_do_causal [[function_constant(215)]];
+
 kernel void paged_sdpa_validate(
     device const uint2 *table [[buffer(0)]],
     device const uint *generations [[buffer(1)]],
@@ -151,7 +155,7 @@ void paged_steel_attention_body(
     uint key_blocks = (params.key_length + BK - 1) / BK;
     uint key_limit = key_blocks;
     uint first_causal_block = key_blocks;
-    if (params.causal != 0) {
+    if (paged_do_causal != 0) {
         uint query_limit = min(first_query + BQ, params.query_length);
         uint absolute_limit = params.query_start + query_limit;
         key_limit = min(key_blocks, (absolute_limit + BK - 1) / BK);
@@ -164,27 +168,34 @@ void paged_steel_attention_body(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     uint previous_page = 0;
+    uint row_stride = params.kv_heads * BD;
+    ulong first_physical_token = ulong(first_page) * params.page_tokens;
     for (uint key_block = 0; key_block < key_limit; ++key_block) {
         uint first_key = key_block * BK;
-        uint logical_page = first_key / params.page_tokens;
-        if (params.contiguous_entries == 0 && logical_page != previous_page) {
-            if (thread_index == 0) {
-                physical_page = table[logical_page].x;
+        ulong page_base;
+        if (paged_contiguous_entries != 0) {
+            page_base = (first_physical_token + first_key) * row_stride
+                + ulong(kv_head) * BD;
+        } else {
+            uint logical_page = first_key / params.page_tokens;
+            if (logical_page != previous_page) {
+                if (thread_index == 0) {
+                    physical_page = table[logical_page].x;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                previous_page = logical_page;
             }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            previous_page = logical_page;
+            uint page_row = first_key % params.page_tokens;
+            page_base = (ulong(physical_page) * params.page_tokens + page_row)
+                * row_stride + ulong(kv_head) * BD;
         }
-        uint page_row = first_key % params.page_tokens;
         uint page_valid = valid;
-        uint page = params.contiguous_entries == 0
-            ? physical_page : first_page + logical_page;
-        ulong page_base = (ulong(page) * params.page_tokens + page_row)
-            * params.kv_heads * BD + ulong(kv_head) * BD;
         for (uint linear = thread_index; linear < BK * BD; linear += thread_count) {
             uint tile_row = linear / BD;
             uint tile_column = linear % BD;
-            bool in_range = page_valid != 0 && first_key + tile_row < params.key_length;
-            ulong index = page_base + ulong(tile_row) * params.kv_heads * BD + tile_column;
+            bool in_range = page_valid != 0 && (paged_align_key != 0
+                || first_key + tile_row < params.key_length);
+            ulong index = page_base + ulong(tile_row) * row_stride + tile_column;
             kv_tile[tile_column * LDK + tile_row] = in_range
                 ? TileT(load_float(key, index, input1_dtype)) : TileT(0);
         }
@@ -217,7 +228,7 @@ void paged_steel_attention_body(
                 }
             }
         }
-        if (params.causal != 0 && key_block >= first_causal_block) {
+        if (paged_do_causal != 0 && key_block >= first_causal_block) {
             uint absolute_query = params.query_start + first_query + query_row;
             for (short key_fragment = 0; key_fragment < TK; ++key_fragment) {
                 short key_column = key_fragment * FRAGMENT + column;
@@ -248,8 +259,9 @@ void paged_steel_attention_body(
         for (uint linear = thread_index; linear < BK * BD; linear += thread_count) {
             uint tile_row = linear / BD;
             uint tile_column = linear % BD;
-            bool in_range = page_valid != 0 && first_key + tile_row < params.key_length;
-            ulong index = page_base + ulong(tile_row) * params.kv_heads * BD + tile_column;
+            bool in_range = page_valid != 0 && (paged_align_key != 0
+                || first_key + tile_row < params.key_length);
+            ulong index = page_base + ulong(tile_row) * row_stride + tile_column;
             kv_tile[tile_row * LDV + tile_column] = in_range
                 ? TileT(load_float(value, index, input2_dtype)) : TileT(0);
         }
