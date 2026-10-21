@@ -360,7 +360,8 @@ void paged_sdpa_2pass_1_gqa_body(
     threadgroup float *partial_outputs,
     threadgroup float *partial_sums,
     threadgroup float *partial_maxs,
-    threadgroup uint &physical_page,
+    threadgroup uint *physical_pages,
+    threadgroup uint *page_valid,
     threadgroup uint &first_page,
     threadgroup uint &valid) {
     constexpr uint elements_per_thread = D / 32;
@@ -396,7 +397,6 @@ void paged_sdpa_2pass_1_gqa_body(
 
     if (simd_group == 0 && simd_lane == 0) {
         valid = atomic_load_explicit(error_flag, memory_order_relaxed) == 0;
-        physical_page = 0;
         if (valid != 0) {
             uint2 entry = table[0];
             valid = entry.x < params.physical_pages
@@ -426,67 +426,75 @@ void paged_sdpa_2pass_1_gqa_body(
     uint end_logical_page = (block_end + params.page_tokens - 1) / params.page_tokens;
     ulong key_row_stride = ulong(params.kv_heads) * D;
     ulong value_row_stride = ulong(params.kv_heads) * params.value_width;
-    for (uint logical_page = first_logical_page;
-         logical_page < end_logical_page; ++logical_page) {
+    constexpr uint pages_per_batch = 4;
+    for (uint batch_start = first_logical_page;
+         batch_start < end_logical_page; batch_start += pages_per_batch) {
+        uint batch_pages = min(pages_per_batch, end_logical_page - batch_start);
         if (simd_group == 0 && simd_lane == 0) {
-            bool page_valid = logical_page < params.logical_pages;
-            uint2 entry = uint2(0);
-            if (page_valid) {
-                entry = table[logical_page];
-                page_valid = entry.x < params.physical_pages
-                    && generations[entry.x] == entry.y
-                    && (paged_contiguous_entries == 0
-                        || entry.x == first_page + logical_page);
-            }
-            valid = page_valid;
-            if (page_valid) {
-                physical_page = entry.x;
-            }
-            if (!page_valid) {
-                atomic_store_explicit(error_flag, 1, memory_order_relaxed);
-                atomic_fetch_min_explicit(
-                    error_flag + 1, logical_page, memory_order_relaxed);
+            for (uint index = 0; index < batch_pages; ++index) {
+                uint logical_page = batch_start + index;
+                bool accepted = logical_page < params.logical_pages;
+                uint2 entry = uint2(0);
+                if (accepted) {
+                    entry = table[logical_page];
+                    accepted = entry.x < params.physical_pages
+                        && generations[entry.x] == entry.y
+                        && (paged_contiguous_entries == 0
+                            || entry.x == first_page + logical_page);
+                }
+                page_valid[index] = accepted;
+                physical_pages[index] = accepted ? entry.x : 0;
+                if (!accepted) {
+                    atomic_store_explicit(error_flag, 1, memory_order_relaxed);
+                    atomic_fetch_min_explicit(
+                        error_flag + 1, logical_page, memory_order_relaxed);
+                }
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (valid != 0) {
-            uint page_start = logical_page * params.page_tokens;
-            uint key_start = max(chunk_start, page_start);
-            uint key_end = min(chunk_end, page_start + params.page_tokens);
-            if (params.causal != 0) {
-                key_end = min(key_end, params.query_start + 1);
-            }
-            uint page_row = key_start - page_start;
-            ulong physical_token = ulong(physical_page) * params.page_tokens + page_row;
-            ulong k_base = physical_token * key_row_stride + ulong(kv_head) * D;
-            ulong v_base = physical_token * value_row_stride
-                + ulong(kv_head) * params.value_width;
-            for (uint key_row = key_start; key_row < key_end; ++key_row) {
-                float key_values[elements_per_thread];
-                float value_values[elements_per_thread];
-                for (uint element = 0; element < elements_per_thread; ++element) {
-                    uint column = simd_lane * elements_per_thread + element;
-                    key_values[element] = load_float(key, k_base + column, input1_dtype);
-                    value_values[element] = load_float(value, v_base + column, input2_dtype);
+        for (uint index = 0; index < batch_pages; ++index) {
+            if (page_valid[index] != 0) {
+                uint logical_page = batch_start + index;
+                uint page_start = logical_page * params.page_tokens;
+                uint key_start = max(chunk_start, page_start);
+                uint key_end = min(chunk_end, page_start + params.page_tokens);
+                if (params.causal != 0) {
+                    key_end = min(key_end, params.query_start + 1);
                 }
-                for (uint local_head = 0; local_head < HPT; ++local_head) {
-                    float score = 0.0f;
+                uint page_row = key_start - page_start;
+                ulong physical_token = ulong(physical_pages[index])
+                    * params.page_tokens + page_row;
+                ulong k_base = physical_token * key_row_stride + ulong(kv_head) * D;
+                ulong v_base = physical_token * value_row_stride
+                    + ulong(kv_head) * params.value_width;
+                for (uint key_row = key_start; key_row < key_end; ++key_row) {
+                    float key_values[elements_per_thread];
+                    float value_values[elements_per_thread];
                     for (uint element = 0; element < elements_per_thread; ++element) {
-                        score += q[local_head][element] * key_values[element];
+                        uint column = simd_lane * elements_per_thread + element;
+                        key_values[element] = load_float(key, k_base + column, input1_dtype);
+                        value_values[element] = load_float(value, v_base + column, input2_dtype);
                     }
-                    score = simd_sum(score);
-                    float next_maximum = max(maximum[local_head], score);
-                    float previous_factor = fast::exp(maximum[local_head] - next_maximum);
-                    float score_factor = fast::exp(score - next_maximum);
-                    maximum[local_head] = next_maximum;
-                    denominator[local_head] = denominator[local_head] * previous_factor + score_factor;
-                    for (uint element = 0; element < elements_per_thread; ++element) {
-                        result[local_head][element] = result[local_head][element] * previous_factor
-                            + score_factor * value_values[element];
+                    for (uint local_head = 0; local_head < HPT; ++local_head) {
+                        float score = 0.0f;
+                        for (uint element = 0; element < elements_per_thread; ++element) {
+                            score += q[local_head][element] * key_values[element];
+                        }
+                        score = simd_sum(score);
+                        float next_maximum = max(maximum[local_head], score);
+                        float previous_factor = fast::exp(maximum[local_head] - next_maximum);
+                        float score_factor = fast::exp(score - next_maximum);
+                        maximum[local_head] = next_maximum;
+                        denominator[local_head] = denominator[local_head] * previous_factor
+                            + score_factor;
+                        for (uint element = 0; element < elements_per_thread; ++element) {
+                            result[local_head][element] = result[local_head][element]
+                                * previous_factor + score_factor * value_values[element];
+                        }
                     }
+                    k_base += key_row_stride;
+                    v_base += value_row_stride;
                 }
-                k_base += key_row_stride;
-                v_base += value_row_stride;
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -558,13 +566,15 @@ kernel void NAME(                                                            \
     threadgroup float partial_outputs[8 * 2 * D];                            \
     threadgroup float partial_sums[8 * 2];                                   \
     threadgroup float partial_maxs[8 * 2];                                   \
-    threadgroup uint physical_page;                                          \
+    threadgroup uint physical_pages[4];                                     \
+    threadgroup uint page_valid[4];                                         \
     threadgroup uint first_page;                                             \
     threadgroup uint valid;                                                  \
     paged_sdpa_2pass_1_gqa_body<D, 8, 2>(                                   \
         query, key, value, table, generations, partials, sums, maxs, params, \
         error_flag, position, simd_group, simd_lane, partial_outputs,        \
-        partial_sums, partial_maxs, physical_page, first_page, valid);       \
+        partial_sums, partial_maxs, physical_pages, page_valid, first_page,  \
+        valid);                                                              \
 }
 
 DEFINE_PAGED_SDPA_PASS1_GQA(paged_sdpa_2pass_1_gqa_128, 128)

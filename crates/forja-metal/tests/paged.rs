@@ -648,6 +648,11 @@ paged_gqa_two_pass_tests!(
         "paged-sdpa.vector-gqa-two-pass-32"
     ),
     (
+        metal_paged_gqa_two_pass_matches_cpu_at_513,
+        513,
+        "paged-sdpa.vector-gqa-two-pass-32"
+    ),
+    (
         metal_paged_gqa_two_pass_matches_cpu_at_2048,
         2_048,
         "paged-sdpa.vector-gqa-two-pass"
@@ -655,6 +660,11 @@ paged_gqa_two_pass_tests!(
     (
         metal_paged_gqa_two_pass_matches_cpu_at_4000,
         4_000,
+        "paged-sdpa.vector-gqa-two-pass-128"
+    ),
+    (
+        metal_paged_gqa_two_pass_matches_cpu_at_4001,
+        4_001,
         "paged-sdpa.vector-gqa-two-pass-128"
     ),
 );
@@ -687,6 +697,7 @@ fn metal_paged_gqa_two_pass_keeps_barriers_uniform_across_rejected_pages() {
     let backend = forja_metal::MetalBackend::new().unwrap();
     for (length, variant) in [
         (512_u32, "paged-sdpa.vector-gqa-two-pass-32"),
+        (513, "paged-sdpa.vector-gqa-two-pass-32"),
         (2_048, "paged-sdpa.vector-gqa-two-pass"),
         (4_000, "paged-sdpa.vector-gqa-two-pass-128"),
     ] {
