@@ -847,6 +847,27 @@ pub fn validate_batch_lanes(
     Ok(appended)
 }
 
+/// Validates the two bucket-shaped tensors returned by a batch export.
+#[doc(hidden)]
+pub fn validate_batch_output_layouts(
+    logits: (DType, &[u32]),
+    tokens: (DType, &[u32]),
+    bucket: u32,
+    vocab: u32,
+) -> Result<(), compute::Error> {
+    if logits.0 != DType::F32 || logits.1 != [bucket, vocab] {
+        return Err(compute::Error::Layout(format!(
+            "batch logits must be f32 [{bucket}, {vocab}]"
+        )));
+    }
+    if tokens.0 != DType::U32 || tokens.1 != [bucket] {
+        return Err(compute::Error::Layout(format!(
+            "batch tokens must be u32 [{bucket}]"
+        )));
+    }
+    Ok(())
+}
+
 struct EpochEngine {
     engine: Engine,
     live: Weak<()>,
@@ -7542,7 +7563,8 @@ mod tests {
         PagePoolEntry, PagedSequenceEntry, ParamsEntry, ReplayFlight, ReplayState, SamplingParams,
         ServingInfo, SubmissionOutcome, TensorEntry,
         bindings::l9o::gpu::{compute, paged_storage},
-        core_op, core_program, expected_layer_outputs, validate_batch_lanes, validate_batch_shapes,
+        core_op, core_program, expected_layer_outputs, validate_batch_lanes,
+        validate_batch_output_layouts, validate_batch_shapes,
     };
 
     const GENEROUS: Limits = Limits::new(u64::MAX, 8, u64::MAX, 32, u64::MAX);
@@ -7762,6 +7784,13 @@ mod tests {
         );
         assert!(
             validate_batch_lanes(&serving, shape, &[lane(32), None], BatchSelection::Combined,)
+                .is_err()
+        );
+        assert!(
+            validate_batch_output_layouts((DType::F32, &[2, 4]), (DType::U32, &[2]), 2, 4,).is_ok()
+        );
+        assert!(
+            validate_batch_output_layouts((DType::F32, &[1, 4]), (DType::U32, &[2]), 2, 4,)
                 .is_err()
         );
     }
