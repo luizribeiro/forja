@@ -3117,6 +3117,16 @@ impl<B: Backend + 'static> Host<B> {
         prefix: Option<PagedPrefix>,
         reserved_tokens: u64,
     ) -> Result<(), compute::Error> {
+        self.bind_paged_lane(pool_rep, 0, prefix, reserved_tokens)
+    }
+
+    fn bind_paged_lane(
+        &mut self,
+        pool_rep: u32,
+        lane: u32,
+        prefix: Option<PagedPrefix>,
+        reserved_tokens: u64,
+    ) -> Result<(), compute::Error> {
         let (pool, max_context, slot_rep) = {
             let entry = self
                 .table
@@ -3142,6 +3152,9 @@ impl<B: Backend + 'static> Host<B> {
                 .map_err(invalid_handle)?
                 .binding,
         );
+        let lane = usize::try_from(lane)
+            .map_err(|_| compute::Error::Layout("paged lane exceeds usize".to_owned()))?;
+        let lane_binding = binding.lane(lane)?;
         let sequence = match prefix {
             Some(prefix) => prefix.sequence,
             None => Arc::new(Mutex::new(
@@ -3155,16 +3168,15 @@ impl<B: Backend + 'static> Host<B> {
                 .map_err(|_| guest_error(BackendError::ExecutionFailed))?;
             binding
                 .banks
-                .bind(0, 0, &sequence_guard)
+                .bind(0, lane, &sequence_guard)
                 .map_err(|error| compute::Error::Quota(error.to_string()))?;
         }
-        let lane = binding.lane(0)?;
-        *lane
+        *lane_binding
             .sequence
             .lock()
             .map_err(|_| guest_error(BackendError::ExecutionFailed))? = Some(sequence);
-        lane.used.store(false, Ordering::Release);
-        lane.table_dirty.store(true, Ordering::Release);
+        lane_binding.used.store(false, Ordering::Release);
+        lane_binding.table_dirty.store(true, Ordering::Release);
         Ok(())
     }
 
@@ -7731,6 +7743,32 @@ mod tests {
         let sequence = rebound.sequence.lock().unwrap();
         assert_eq!(sequence.logical_len(), 7);
         assert_eq!(sequence.reserved_tokens(), 12);
+    }
+
+    #[test]
+    fn paged_request_binding_is_lane_local() {
+        let mut host = Host::new(CpuBackend::new(), GENEROUS);
+        let pool = insert_test_pool(&mut host, 1, 16);
+        host.table.get_mut(&pool).unwrap().active_lanes = 2;
+        host.open_paged_slot(&pool, 1).unwrap();
+
+        host.bind_paged_lane(pool.rep(), 0, None, 8).unwrap();
+        host.bind_paged_lane(pool.rep(), 1, None, 8).unwrap();
+
+        let slot = host.table.get(&pool).unwrap().slot.unwrap();
+        let binding = &host
+            .table
+            .get(&Resource::<BatchSlotEntry>::new_borrow(slot))
+            .unwrap()
+            .binding;
+        assert!(binding.banks.slot(0, 0).unwrap().is_active());
+        assert!(binding.banks.slot(0, 1).unwrap().is_active());
+        let first = binding.lane(0).unwrap().sequence.lock().unwrap();
+        let second = binding.lane(1).unwrap().sequence.lock().unwrap();
+        assert!(!Arc::ptr_eq(
+            first.as_ref().unwrap(),
+            second.as_ref().unwrap()
+        ));
     }
 
     #[cfg(target_os = "macos")]
