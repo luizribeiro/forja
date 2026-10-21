@@ -72,7 +72,6 @@ struct PagedSdpaParams {
     uint page_tokens;
     uint logical_pages;
     uint physical_pages;
-    uint contiguous_entries;
     uint blocks;
     uint padding;
     ulong q_offset;
@@ -81,7 +80,6 @@ struct PagedSdpaParams {
     ulong o_strides[3];
 };
 
-constant uint paged_contiguous_entries [[function_constant(213)]];
 constant uint paged_align_key [[function_constant(214)]];
 constant uint paged_do_causal [[function_constant(215)]];
 
@@ -100,8 +98,10 @@ kernel void paged_sdpa_validate(
         uint2 entry = table[logical_page];
         uint expected = table[0].x + logical_page;
         valid = entry.x < params.physical_pages
-            && generations[entry.x] == entry.y
-            && (params.contiguous_entries == 0 || entry.x == expected);
+            && generations[entry.x] == entry.y;
+        if (valid && entry.x != expected) {
+            atomic_store_explicit(error_flag + 2, 0, memory_order_relaxed);
+        }
     }
     if (!valid) {
         atomic_store_explicit(error_flag, 1, memory_order_relaxed);
@@ -123,6 +123,7 @@ void paged_steel_attention_body(
     threadgroup TileT *kv_tile,
     threadgroup uint &physical_page,
     threadgroup uint &first_page,
+    threadgroup uint &contiguous,
     threadgroup uint &valid,
     uint3 position,
     uint thread_index,
@@ -178,6 +179,7 @@ void paged_steel_attention_body(
         if (valid != 0) {
             first_page = table[0].x;
             physical_page = first_page;
+            contiguous = atomic_load_explicit(error_flag + 2, memory_order_relaxed);
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -190,7 +192,7 @@ void paged_steel_attention_body(
     for (uint key_block = 0; key_block < key_limit; ++key_block) {
         uint first_key = key_block * BK;
         ulong page_base;
-        if (paged_contiguous_entries != 0) {
+        if (contiguous != 0) {
             page_base = (first_physical_token + first_key) * row_stride
                 + ulong(kv_head) * BD;
         } else {
@@ -337,10 +339,12 @@ kernel void name(                                                           \
     threadgroup tile_type kv_tile[(bk + 16 / sizeof(tile_type)) * bd];      \
     threadgroup uint physical_page;                                         \
     threadgroup uint first_page;                                            \
+    threadgroup uint contiguous;                                            \
     threadgroup uint valid;                                                 \
     paged_steel_attention_body<tile_type, bq, bk, bd>(                      \
         query, key, value, table, generations, output, params, error_flag,  \
-        query_tile, kv_tile, physical_page, first_page, valid, position,    \
+        query_tile, kv_tile, physical_page, first_page, contiguous, valid,  \
+        position,                                                           \
         thread_index, threads, simdgroup, lane);                            \
 }
 
@@ -445,9 +449,7 @@ void paged_sdpa_2pass_1_gqa_body(
                 if (accepted) {
                     entry = table[logical_page];
                     accepted = entry.x < params.physical_pages
-                        && generations[entry.x] == entry.y
-                        && (paged_contiguous_entries == 0
-                            || entry.x == first_page + logical_page);
+                        && generations[entry.x] == entry.y;
                 }
                 page_valid[index] = accepted;
                 physical_pages[index] = accepted ? entry.x : 0;
@@ -676,6 +678,7 @@ void paged_sdpa_body(
     threadgroup float *sum_exp_scores,
     threadgroup uint &physical_page,
     threadgroup uint &first_page,
+    threadgroup uint &contiguous,
     threadgroup uint &valid) {
     constexpr uint groups = 32;
     constexpr uint elements_per_thread = D / 32;
@@ -698,6 +701,7 @@ void paged_sdpa_body(
         if (valid != 0) {
             first_page = table[0].x;
             physical_page = first_page;
+            contiguous = atomic_load_explicit(error_flag + 2, memory_order_relaxed);
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -707,7 +711,7 @@ void paged_sdpa_body(
     uint pages = (params.key_length + params.page_tokens - 1) / params.page_tokens;
     for (uint logical_page = 0; logical_page < pages; ++logical_page) {
         uint page = first_page + logical_page;
-        if (params.contiguous_entries == 0) {
+        if (contiguous == 0) {
             if (simd_group == 0 && simd_lane == 0) {
                 physical_page = table[logical_page].x;
             }
@@ -743,7 +747,7 @@ void paged_sdpa_body(
                 result[element] = result[element] * previous_factor + score_factor * v;
             }
         }
-        if (params.contiguous_entries == 0) {
+        if (contiguous == 0) {
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
     }
@@ -789,10 +793,12 @@ kernel void NAME(                                                            \
     threadgroup float sum_exp_scores[32];                                    \
     threadgroup uint physical_page;                                          \
     threadgroup uint first_page;                                             \
+    threadgroup uint contiguous;                                             \
     threadgroup uint valid;                                                  \
     paged_sdpa_body<D>(query, key, value, table, generations, output, params,\
         error_flag, position, simd_group, simd_lane, outputs, max_scores,     \
-        sum_exp_scores, physical_page, first_page, valid);                   \
+        sum_exp_scores, physical_page, first_page,                            \
+        contiguous, valid);                                                  \
 }
 
 DEFINE_PAGED_SDPA(paged_sdpa_64, 64)

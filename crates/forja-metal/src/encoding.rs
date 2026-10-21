@@ -419,6 +419,13 @@ fn error_state() -> [u8; 8] {
     state
 }
 
+fn paged_attention_state() -> [u8; 12] {
+    let mut state = [0_u8; 12];
+    state[4..8].copy_from_slice(&u32::MAX.to_ne_bytes());
+    state[8..].copy_from_slice(&1_u32.to_ne_bytes());
+    state
+}
+
 #[derive(Clone, Copy)]
 struct MatmulShape {
     left_dtype: DType,
@@ -3152,7 +3159,7 @@ impl MetalBackend {
             q_start,
             key_length,
             page_tokens,
-            contiguous_entries,
+            contiguous_entries: _,
         } = dispatch.op()
         else {
             return Err(BackendError::InvalidInput);
@@ -3215,8 +3222,8 @@ impl MetalBackend {
             page_tokens,
             t[0],
             k[0],
-            u32::from(contiguous_entries),
             gqa_blocks.unwrap_or(0),
+            0,
         ] {
             params.extend_from_slice(&value.to_ne_bytes());
         }
@@ -3234,7 +3241,7 @@ impl MetalBackend {
             params.extend_from_slice(&value.to_ne_bytes());
         }
         let params = arguments.write(&params)?;
-        let error_flag = arguments.write(&error_state())?;
+        let error_flag = arguments.write(&paged_attention_state())?;
         let kernel = match q[2] {
             64 => "paged_sdpa_64",
             128 => "paged_sdpa_128",
@@ -3283,7 +3290,6 @@ impl MetalBackend {
             let (block_query, block_key) = steel_attention_tile(kernel, q[2])?;
             let mut steel_constants = constants.to_vec();
             steel_constants.extend([
-                (213, u32::from(contiguous_entries)),
                 (214, u32::from(key_length % block_key == 0)),
                 (215, u32::from(causal)),
             ]);
@@ -3331,13 +3337,11 @@ impl MetalBackend {
             let partials = self.scratch_tensor(query.layout.dtype(), &[q[0], gqa_blocks, v[3]])?;
             let sums = self.scratch_tensor(DType::F32, &[q[0], gqa_blocks])?;
             let maxs = self.scratch_tensor(DType::F32, &[q[0], gqa_blocks])?;
-            let mut first_constants = constants.to_vec();
-            first_constants.push((213, u32::from(contiguous_entries)));
             let first = self
                 .pipelines
                 .lock()
                 .map_err(|_| BackendError::ExecutionFailed)?
-                .get("paged_sdpa_2pass_1_gqa_128", &first_constants)?;
+                .get("paged_sdpa_2pass_1_gqa_128", &constants)?;
             set_pipeline(encoder, &first);
             for (index, tensor) in [
                 &query,
@@ -6820,7 +6824,7 @@ impl MetalBackend {
             Op::Sdpa { .. } => self.size_sdpa_arguments(dispatch, arguments)?,
             Op::PagedSdpa { .. } => {
                 arguments.write(128)?;
-                arguments.write(2 * size_of::<u32>())?;
+                arguments.write(3 * size_of::<u32>())?;
             }
         }
         Ok(())

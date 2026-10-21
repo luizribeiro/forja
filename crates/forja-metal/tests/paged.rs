@@ -464,6 +464,21 @@ fn finish_sdpa<B: Backend>(
     backend.read(output).map(|bytes| decode_f32(&bytes))
 }
 
+fn paged_entries(logical_pages: u32, contiguous: bool) -> (u32, Vec<(u32, u32)>) {
+    let physical_pages = logical_pages + u32::from(!contiguous) + 1;
+    let entries = (0..logical_pages)
+        .map(|logical| {
+            let page = if contiguous || logical + 2 < logical_pages {
+                logical + 1
+            } else {
+                logical + 2
+            };
+            (page, 11 + page)
+        })
+        .collect();
+    (physical_pages, entries)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_sdpa<B: Backend + 'static>(
     backend: &B,
@@ -486,17 +501,7 @@ fn run_sdpa<B: Backend + 'static>(
         .checked_sub(query_length)
         .ok_or(BackendError::InvalidInput)?;
     let logical_pages = key_length.div_ceil(PAGE_TOKENS);
-    let physical_pages = logical_pages + 1;
-    let entries = (0..logical_pages)
-        .map(|logical| {
-            let page = if contiguous {
-                logical + 1
-            } else {
-                logical_pages - logical
-            };
-            (page, 11 + page)
-        })
-        .collect::<Vec<_>>();
+    let (physical_pages, entries) = paged_entries(logical_pages, contiguous);
     let mut generations = (0..physical_pages)
         .map(|page| 11 + page)
         .collect::<Vec<_>>();
@@ -880,6 +885,49 @@ fn metal_paged_sdpa_uses_contiguous_entry_path() {
         forja_testing::normwise_relative_error(&reference, &candidate)
             <= forja_testing::F16_TOLERANCE
     );
+}
+
+#[test]
+fn metal_paged_sdpa_falls_back_after_a_consecutive_prefix() {
+    let cpu = forja_cpu::CpuBackend::new();
+    let metal = forja_metal::MetalBackend::new().unwrap();
+    for (query_length, variant) in [(1, "paged-sdpa.vector"), (7, "paged-sdpa.steel-half")] {
+        let reference = run_sdpa(
+            &cpu,
+            DType::F16,
+            257,
+            query_length,
+            true,
+            false,
+            16,
+            8,
+            (0, 0),
+            &[],
+            None,
+            None,
+        )
+        .unwrap();
+        let candidate = run_sdpa(
+            &metal,
+            DType::F16,
+            257,
+            query_length,
+            true,
+            false,
+            16,
+            8,
+            (0, 0),
+            &[],
+            Some(variant),
+            None,
+        )
+        .unwrap();
+        assert!(
+            forja_testing::normwise_relative_error(&reference, &candidate)
+                <= forja_testing::F16_TOLERANCE,
+            "variant={variant}"
+        );
+    }
 }
 
 #[test]
