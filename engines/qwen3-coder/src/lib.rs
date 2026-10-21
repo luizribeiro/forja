@@ -7,7 +7,7 @@ use forja_sdk::Param;
 #[cfg(target_family = "wasm")]
 use forja_sdk::nn::blocks::{ChunkedPrefill, DecodeSelection, DecodeState, PrefillExecution};
 use forja_sdk::{
-    BatchPhase, BatchSelection, BatchShape, CachePlane, DType, Dim, Engine, EngineInfo,
+    BatchInput, BatchPhase, BatchSelection, BatchShape, CachePlane, DType, Dim, Engine, EngineInfo,
     EngineLoadConfig, KvCacheFormat, Load, PagedCache, PagedCacheSet, PagedPool, Result,
     ServingInfo, StepInput, StepOutput, Tensor, VariantSelection, Weights, bf16, export_engine,
     f16,
@@ -616,6 +616,21 @@ struct LayerResources<'a> {
     moe_epilogues: &'a MoeEpilogues,
 }
 
+#[derive(Clone, Copy)]
+struct BatchLayerPosition<'a> {
+    activation_positions: &'a Tensor<f32>,
+    starts: &'a [Option<u32>],
+    variants: &'a variants::Variants,
+}
+
+struct BatchLayerResources<'a> {
+    caches: &'a mut CacheStorage,
+    layer: usize,
+    following_norm: &'a RmsNorm<f32>,
+    qk_norm_rope: &'a Kernel,
+    moe_epilogues: &'a MoeEpilogues,
+}
+
 enum LayerCache<'a> {
     Contiguous(&'a mut Cache),
     Paged(PagedCache<'a>),
@@ -678,6 +693,19 @@ impl CacheStorage {
                 )
                 .map(LayerCache::Paged),
         }
+    }
+
+    fn paged_layer_at(&self, lane: u32, index: usize) -> Result<PagedCache<'_>> {
+        let Self::Paged(caches) = self else {
+            return Err(forja_sdk::Error::loading(
+                "batch serving requires paged caches",
+            ));
+        };
+        caches.layer_at(
+            lane,
+            u32::try_from(index)
+                .map_err(|_| forja_sdk::Error::loading("cache layer exceeds u32"))?,
+        )
     }
 }
 
@@ -816,6 +844,65 @@ impl DecoderLayer {
             (hidden, normalized, router_logits)
         };
         Ok((hidden, normalized, router_logits))
+    }
+
+    fn forward_batch(
+        &self,
+        residual_kernel: &Kernel,
+        norm_kernel: &Kernel,
+        input: &Tensor<f32>,
+        normalized_input: &Tensor<f32>,
+        position: BatchLayerPosition<'_>,
+        resources: BatchLayerResources<'_>,
+    ) -> Result<(Tensor<f32>, Tensor<f32>)> {
+        let BatchLayerPosition {
+            activation_positions,
+            starts,
+            variants,
+        } = position;
+        let BatchLayerResources {
+            caches,
+            layer,
+            following_norm,
+            qk_norm_rope,
+            moe_epilogues,
+        } = resources;
+        let rows = u32::try_from(starts.len())
+            .map_err(|_| forja_sdk::Error::loading("batch rows exceed u32"))?;
+        let (query, key, value) = self.self_attn.project_decode_rows(
+            variants,
+            normalized_input,
+            rows,
+            qk_norm_rope,
+            activation_positions,
+        )?;
+        let attended = Tensor::zeros(&[rows, QUERY_HEADS * HEAD_DIM])?;
+        for (lane, start, end) in batch_lane_spans(starts)? {
+            let start_dim = start.into();
+            let selection = variants.attention(1, start, None, true)?;
+            let lane_output = paged_cache_attention(
+                &caches.paged_layer_at(lane, layer)?,
+                &query.narrow(0, lane, 1)?,
+                &key.narrow(0, lane, 1)?,
+                &value.narrow(0, lane, 1)?,
+                &start_dim,
+                &end.into(),
+                &selection,
+            )?
+            .reshape(&[1, QUERY_HEADS * HEAD_DIM])?;
+            lane_output.copy_into(&mut attended.narrow(0, lane, 1)?)?;
+        }
+        let (hidden, normalized) = residual_norm(
+            residual_kernel,
+            input,
+            &self.self_attn.o_proj.forward(variants, &attended)?,
+            self.post_attention_layernorm.weight(),
+        )?;
+        let (hidden, _) = self
+            .mlp
+            .forward_decode(variants, moe_epilogues, &normalized, &hidden)?;
+        let normalized = rms_norm(norm_kernel, &hidden, following_norm.weight())?;
+        Ok((hidden, normalized))
     }
 }
 
@@ -1265,10 +1352,117 @@ impl Engine for Qwen3Coder {
     fn rewind_decode(&mut self, next_pos: u32) -> Result<()> {
         self.decode.rewind(next_pos)
     }
+
+    #[cfg(target_family = "wasm")]
+    fn batch_forward(&mut self, input: BatchInput<'_>) -> Result<Tensor<f32>> {
+        let starts = batch_starts(&input.lanes);
+        let tokens = Self::batch_tokens(&input.lanes)?;
+        let positions = batch_positions(&starts)?;
+        self.forward_batch_rows(&tokens, &positions, &starts)
+    }
+}
+
+#[cfg(target_family = "wasm")]
+fn batch_starts(lanes: &[Option<forja_sdk::BatchLane>]) -> Vec<Option<u32>> {
+    lanes
+        .iter()
+        .map(|lane| lane.as_ref().map(|lane| lane.start_pos))
+        .collect()
+}
+
+fn batch_lane_spans(starts: &[Option<u32>]) -> Result<Vec<(u32, u32, u32)>> {
+    starts
+        .iter()
+        .copied()
+        .enumerate()
+        .filter_map(|(lane, start)| start.map(|start| (lane, start)))
+        .map(|(lane, start)| {
+            let lane = u32::try_from(lane)
+                .map_err(|_| forja_sdk::Error::loading("batch lane exceeds u32"))?;
+            let end = start
+                .checked_add(1)
+                .ok_or_else(|| forja_sdk::Error::loading("batch position overflowed"))?;
+            Ok((lane, start, end))
+        })
+        .collect()
+}
+
+#[cfg(target_family = "wasm")]
+fn batch_positions(starts: &[Option<u32>]) -> Result<Tensor<f32>> {
+    let positions = starts
+        .iter()
+        .copied()
+        .map(|start| exact_position(start.unwrap_or_default()))
+        .collect::<Result<Vec<_>>>()?;
+    let rows = u32::try_from(positions.len())
+        .map_err(|_| forja_sdk::Error::loading("batch rows exceed u32"))?;
+    Tensor::constant(&positions, &[rows])
 }
 
 #[cfg(target_family = "wasm")]
 impl Qwen3Coder {
+    fn batch_tokens(lanes: &[Option<forja_sdk::BatchLane>]) -> Result<Tensor<u32>> {
+        let rows = u32::try_from(lanes.len())
+            .map_err(|_| forja_sdk::Error::loading("batch rows exceed u32"))?;
+        let tokens = Tensor::zeros(&[rows])?;
+        for (lane, input) in lanes.iter().enumerate() {
+            let Some(input) = input else {
+                continue;
+            };
+            let lane = u32::try_from(lane)
+                .map_err(|_| forja_sdk::Error::loading("batch lane exceeds u32"))?;
+            let token = input.tokens.as_ref().ok_or_else(|| {
+                forja_sdk::Error::loading("forward-only batch lanes require input tokens")
+            })?;
+            if token.shape() != [1] {
+                return Err(forja_sdk::Error::loading(
+                    "batch decode lanes require one token",
+                ));
+            }
+            token.copy_into(&mut tokens.narrow(0, lane, 1)?)?;
+        }
+        Ok(tokens)
+    }
+
+    fn forward_batch_rows(
+        &mut self,
+        tokens: &Tensor<u32>,
+        positions: &Tensor<f32>,
+        starts: &[Option<u32>],
+    ) -> Result<Tensor<f32>> {
+        let mut hidden = self.weights.embed_tokens.forward(tokens)?;
+        let layers = self.weights.layers.len();
+        let mut normalized = self.weights.layers[0].input_layernorm.forward(&hidden)?;
+        for index in 0..layers {
+            let following_norm = self
+                .weights
+                .layers
+                .get(index + 1)
+                .map_or(&self.weights.norm, |layer| &layer.input_layernorm);
+            let (next, next_normalized) = self.weights.layers[index].forward_batch(
+                &self.residual_norm,
+                &self.rms_norm,
+                &hidden,
+                &normalized,
+                BatchLayerPosition {
+                    activation_positions: positions,
+                    starts,
+                    variants: &self.variants,
+                },
+                BatchLayerResources {
+                    caches: &mut self.caches,
+                    layer: index,
+                    following_norm,
+                    qk_norm_rope: &self.qk_norm_rope,
+                    moe_epilogues: &self.moe_epilogues,
+                },
+            )?;
+            hidden = next;
+            normalized = next_normalized;
+        }
+        self.weights.lm_head.forward(&self.variants, &normalized)
+    }
+
     fn prefill_supports(&self, start: u32, sequence: u32) -> bool {
         self.prefill_for(sequence)
             .is_some_and(|prefill| prefill.supports(start, sequence))
@@ -1491,6 +1685,15 @@ mod tests {
                 .count(),
             12
         );
+        assert_eq!(
+            serving
+                .batch_shapes
+                .iter()
+                .filter(|shape| shape.selection == BatchSelection::Forward)
+                .map(|shape| shape.bucket)
+                .collect::<Vec<_>>(),
+            [1, 2, 4, 8]
+        );
     }
 
     #[test]
@@ -1504,5 +1707,14 @@ mod tests {
             16_777_216.0_f32.to_bits()
         );
         assert!(exact_position((1 << f32::MANTISSA_DIGITS) + 1).is_err());
+    }
+
+    #[test]
+    fn maps_ragged_batch_lanes_to_independent_spans() {
+        assert_eq!(
+            batch_lane_spans(&[Some(7), None, Some(33)]).unwrap(),
+            [(0, 7, 8), (2, 33, 34)]
+        );
+        assert!(batch_lane_spans(&[Some(u32::MAX)]).is_err());
     }
 }
