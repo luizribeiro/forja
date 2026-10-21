@@ -2186,9 +2186,21 @@ pub struct BatchSlotEntry {
 struct PagedBinding {
     pool: PagePool,
     banks: Arc<PagedSlotBanks>,
+    lanes: Vec<PagedLaneBinding>,
+}
+
+struct PagedLaneBinding {
     sequence: Mutex<Option<Arc<Mutex<PagedSequence>>>>,
     used: AtomicBool,
     table_dirty: AtomicBool,
+}
+
+impl PagedBinding {
+    fn lane(&self, lane: usize) -> Result<&PagedLaneBinding, compute::Error> {
+        self.lanes
+            .get(lane)
+            .ok_or_else(|| invalid_handle("paged lane is out of range"))
+    }
 }
 
 struct PagedBackingHandles {
@@ -2598,9 +2610,13 @@ impl<B: Backend + 'static> Host<B> {
         let binding = Arc::new(PagedBinding {
             pool,
             banks: Arc::clone(&banks),
-            sequence: Mutex::new(None),
-            used: AtomicBool::new(false),
-            table_dirty: AtomicBool::new(false),
+            lanes: (0..active_lanes)
+                .map(|_| PagedLaneBinding {
+                    sequence: Mutex::new(None),
+                    used: AtomicBool::new(false),
+                    table_dirty: AtomicBool::new(false),
+                })
+                .collect(),
         });
         let mut cleanup = backing.planes.clone();
         cleanup.extend(backing.tables.iter().flatten().copied());
@@ -2779,9 +2795,10 @@ impl<B: Backend + 'static> Host<B> {
                 slot.generations,
             )
         };
-        binding.used.store(false, Ordering::Release);
+        let lane = binding.lane(0)?;
+        lane.used.store(false, Ordering::Release);
         let sequence = {
-            let mut active = binding
+            let mut active = lane
                 .sequence
                 .lock()
                 .map_err(|_| guest_error(BackendError::ExecutionFailed))?;
@@ -2790,7 +2807,7 @@ impl<B: Backend + 'static> Host<B> {
                     pool.reserve(u64::from(max_context))
                         .map_err(|error| compute::Error::Quota(error.to_string()))?,
                 )));
-                binding.table_dirty.store(true, Ordering::Release);
+                lane.table_dirty.store(true, Ordering::Release);
             }
             Arc::clone(
                 active
@@ -2822,9 +2839,9 @@ impl<B: Backend + 'static> Host<B> {
                 .commit_write(u64::from(tokens))
                 .map_err(|error| compute::Error::Quota(error.to_string()))?;
             if copy.is_some() {
-                binding.table_dirty.store(true, Ordering::Release);
+                lane.table_dirty.store(true, Ordering::Release);
             }
-            if binding.table_dirty.load(Ordering::Acquire) {
+            if lane.table_dirty.load(Ordering::Acquire) {
                 binding
                     .banks
                     .bind(0, 0, &sequence)
@@ -2840,7 +2857,7 @@ impl<B: Backend + 'static> Host<B> {
                 .map_err(|error| compute::Error::Quota(error.to_string()))?
                 .table()
                 .clone();
-            let upload = binding.table_dirty.swap(false, Ordering::AcqRel);
+            let upload = lane.table_dirty.swap(false, Ordering::AcqRel);
             (checkpoint, table, copy, upload)
         };
         let prepared = (|| {
@@ -2927,7 +2944,11 @@ impl<B: Backend + 'static> Host<B> {
             work: SubmissionWork::Commands(commands),
             access,
             retained: Vec::new(),
-            paged: vec![PagedUse { binding, bank: 0 }],
+            paged: vec![PagedUse {
+                binding,
+                bank: 0,
+                lane: 0,
+            }],
             flight: None,
             timeout: self.limits.submission_timeout,
             gpu_time_budget_ns: duration_ns(self.limits.gpu_time_budget),
@@ -2953,13 +2974,12 @@ impl<B: Backend + 'static> Host<B> {
             .map_err(invalid_handle)?
             .slot
             .ok_or_else(|| invalid_handle("paged slot is not open"))?;
-        let used = self
+        let binding = &self
             .table
             .get(&Resource::<BatchSlotEntry>::new_borrow(slot_rep))
             .map_err(invalid_handle)?
-            .binding
-            .used
-            .load(Ordering::Acquire);
+            .binding;
+        let used = binding.lane(0)?.used.load(Ordering::Acquire);
         if used {
             Ok(Some(checkpoint))
         } else {
@@ -2987,6 +3007,7 @@ impl<B: Backend + 'static> Host<B> {
                 .binding,
         );
         let sequence = binding
+            .lane(0)?
             .sequence
             .lock()
             .map_err(|_| guest_error(BackendError::ExecutionFailed))?
@@ -3019,6 +3040,7 @@ impl<B: Backend + 'static> Host<B> {
                 .binding,
         );
         let sequence = binding
+            .lane(0)?
             .sequence
             .lock()
             .map_err(|_| guest_error(BackendError::ExecutionFailed))?
@@ -3045,6 +3067,7 @@ impl<B: Backend + 'static> Host<B> {
             .map_err(invalid_handle)?
             .binding;
         let sequence = binding
+            .lane(0)?
             .sequence
             .lock()
             .map_err(|_| guest_error(BackendError::ExecutionFailed))?
@@ -3101,12 +3124,13 @@ impl<B: Backend + 'static> Host<B> {
                 .bind(0, 0, &sequence_guard)
                 .map_err(|error| compute::Error::Quota(error.to_string()))?;
         }
-        *binding
+        let lane = binding.lane(0)?;
+        *lane
             .sequence
             .lock()
             .map_err(|_| guest_error(BackendError::ExecutionFailed))? = Some(sequence);
-        binding.used.store(false, Ordering::Release);
-        binding.table_dirty.store(true, Ordering::Release);
+        lane.used.store(false, Ordering::Release);
+        lane.table_dirty.store(true, Ordering::Release);
         Ok(())
     }
 
@@ -3740,12 +3764,14 @@ impl<B: Backend + 'static> Host<B> {
         entry.protected.extend(protected);
         entry.retained.extend(inputs);
         entry.retained.push(output);
-        usage.binding.used.store(true, Ordering::Release);
-        if !entry
-            .paged
-            .iter()
-            .any(|existing| Arc::ptr_eq(&existing.binding, &usage.binding))
-        {
+        usage
+            .binding
+            .lane(usage.lane)?
+            .used
+            .store(true, Ordering::Release);
+        if !entry.paged.iter().any(|existing| {
+            existing.lane == usage.lane && Arc::ptr_eq(&existing.binding, &usage.binding)
+        }) {
             entry.paged.push(usage);
         }
         Ok(())
@@ -3802,6 +3828,7 @@ impl<B: Backend + 'static> Host<B> {
             PagedUse {
                 binding: Arc::clone(&slot.binding),
                 bank: 0,
+                lane,
             },
         ))
     }
@@ -5196,6 +5223,7 @@ enum SubmissionWork {
 struct PagedUse {
     binding: Arc<PagedBinding>,
     bank: usize,
+    lane: usize,
 }
 
 struct PagedDispatchContext<'a> {
@@ -5220,6 +5248,7 @@ impl std::fmt::Debug for PagedUse {
         formatter
             .debug_struct("PagedUse")
             .field("bank", &self.bank)
+            .field("lane", &self.lane)
             .finish_non_exhaustive()
     }
 }
@@ -5249,9 +5278,13 @@ impl PagedUse {
     }
 
     fn mark_submitted(&self, serial: u64) -> Result<(), BackendError> {
-        self.binding.used.store(true, Ordering::Release);
-        let sequence = self
+        let lane = self
             .binding
+            .lanes
+            .get(self.lane)
+            .ok_or(BackendError::ExecutionFailed)?;
+        lane.used.store(true, Ordering::Release);
+        let sequence = lane
             .sequence
             .lock()
             .map_err(|_| BackendError::ExecutionFailed)?
@@ -7471,7 +7504,7 @@ mod tests {
             .get(&Resource::<BatchSlotEntry>::new_borrow(slot))
             .unwrap()
             .binding;
-        let active = binding.sequence.lock().unwrap();
+        let active = binding.lane(0).unwrap().sequence.lock().unwrap();
         let sequence = active.as_ref().unwrap().lock().unwrap();
         assert_eq!(sequence.logical_len(), 0);
         assert_eq!(sequence.reserved_tokens(), 8);
@@ -7508,13 +7541,28 @@ mod tests {
         let binding = Arc::new(super::PagedBinding {
             pool: pool.clone(),
             banks,
-            sequence: Mutex::new(Some(Arc::clone(&sequence))),
-            used: std::sync::atomic::AtomicBool::new(false),
-            table_dirty: std::sync::atomic::AtomicBool::new(false),
+            lanes: vec![
+                super::PagedLaneBinding {
+                    sequence: Mutex::new(Some(Arc::clone(&sequence))),
+                    used: std::sync::atomic::AtomicBool::new(false),
+                    table_dirty: std::sync::atomic::AtomicBool::new(false),
+                },
+                super::PagedLaneBinding {
+                    sequence: Mutex::new(None),
+                    used: std::sync::atomic::AtomicBool::new(false),
+                    table_dirty: std::sync::atomic::AtomicBool::new(false),
+                },
+            ],
         });
-        let usage = super::PagedUse { binding, bank: 0 };
+        let usage = super::PagedUse {
+            binding,
+            bank: 0,
+            lane: 0,
+        };
         super::PagedUse::mark_all(std::slice::from_ref(&usage), Some(7)).unwrap();
-        *usage.binding.sequence.lock().unwrap() = None;
+        assert!(usage.binding.lane(0).unwrap().used.load(Ordering::Acquire));
+        assert!(!usage.binding.lane(1).unwrap().used.load(Ordering::Acquire));
+        *usage.binding.lane(0).unwrap().sequence.lock().unwrap() = None;
         drop(sequence);
 
         super::PagedUse::observe_all(std::slice::from_ref(&usage), Some(7), false).unwrap();
@@ -7668,7 +7716,7 @@ mod tests {
                     .binding,
             )
         };
-        binding.used.store(true, Ordering::Release);
+        binding.lane(0).unwrap().used.store(true, Ordering::Release);
         runner.finish_paged_append(0, checkpoint).unwrap();
         let retained = runner.paged_prefix().unwrap().unwrap();
         let fork = retained.fork_reserved(3, 8).unwrap();
