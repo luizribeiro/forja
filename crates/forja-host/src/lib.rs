@@ -2804,6 +2804,22 @@ impl<B: Backend + 'static> Host<B> {
         start: u32,
         tokens: u32,
     ) -> Result<(Option<SequenceCheckpoint>, Option<SubmitRequest<B>>), compute::Error> {
+        self.begin_paged_lane_append(pool_rep, 0, start, tokens)
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "checkpoint rollback must cover table rebinding and COW preparation"
+    )]
+    fn begin_paged_lane_append(
+        &mut self,
+        pool_rep: u32,
+        lane: u32,
+        start: u32,
+        tokens: u32,
+    ) -> Result<(Option<SequenceCheckpoint>, Option<SubmitRequest<B>>), compute::Error> {
+        let lane = usize::try_from(lane)
+            .map_err(|_| compute::Error::Layout("paged lane exceeds usize".to_owned()))?;
         let (pool, max_context, slot_rep) = {
             let entry = self
                 .table
@@ -2824,15 +2840,15 @@ impl<B: Backend + 'static> Host<B> {
                 *slot
                     .tables
                     .first()
-                    .and_then(|bank| bank.first())
-                    .ok_or_else(|| invalid_handle("paged lane zero is missing"))?,
+                    .and_then(|bank| bank.get(lane))
+                    .ok_or_else(|| invalid_handle("paged lane is missing"))?,
                 slot.generations,
             )
         };
-        let lane = binding.lane(0)?;
-        lane.used.store(false, Ordering::Release);
+        let lane_binding = binding.lane(lane)?;
+        lane_binding.used.store(false, Ordering::Release);
         let sequence = {
-            let mut active = lane
+            let mut active = lane_binding
                 .sequence
                 .lock()
                 .map_err(|_| guest_error(BackendError::ExecutionFailed))?;
@@ -2841,7 +2857,7 @@ impl<B: Backend + 'static> Host<B> {
                     pool.reserve(u64::from(max_context))
                         .map_err(|error| compute::Error::Quota(error.to_string()))?,
                 )));
-                lane.table_dirty.store(true, Ordering::Release);
+                lane_binding.table_dirty.store(true, Ordering::Release);
             }
             Arc::clone(
                 active
@@ -2873,32 +2889,32 @@ impl<B: Backend + 'static> Host<B> {
                 .commit_write(u64::from(tokens))
                 .map_err(|error| compute::Error::Quota(error.to_string()))?;
             if copy.is_some() {
-                lane.table_dirty.store(true, Ordering::Release);
+                lane_binding.table_dirty.store(true, Ordering::Release);
             }
-            if lane.table_dirty.load(Ordering::Acquire) {
+            if lane_binding.table_dirty.load(Ordering::Acquire) {
                 binding
                     .banks
-                    .bind(0, 0, &sequence)
+                    .bind(0, lane, &sequence)
                     .map_err(|error| compute::Error::Quota(error.to_string()))?;
             }
             binding
                 .banks
-                .set_logical_len(0, 0, sequence.logical_len())
+                .set_logical_len(0, lane, sequence.logical_len())
                 .map_err(|error| compute::Error::Quota(error.to_string()))?;
             let table = binding
                 .banks
-                .slot(0, 0)
+                .slot(0, lane)
                 .map_err(|error| compute::Error::Quota(error.to_string()))?
                 .table()
                 .clone();
-            let upload = lane.table_dirty.swap(false, Ordering::AcqRel);
+            let upload = lane_binding.table_dirty.swap(false, Ordering::AcqRel);
             (checkpoint, table, copy, upload)
         };
         let prepared = (|| {
             if upload {
                 self.upload_paged_table(table_rep, generation_rep, &table)?;
             }
-            copy.map(|copy| self.prepare_cow_copy(slot_rep, Arc::clone(&binding), copy))
+            copy.map(|copy| self.prepare_cow_copy(slot_rep, Arc::clone(&binding), lane, copy))
                 .transpose()
         })();
         match prepared {
@@ -2937,6 +2953,7 @@ impl<B: Backend + 'static> Host<B> {
         &self,
         slot_rep: u32,
         binding: Arc<PagedBinding>,
+        lane: usize,
         copy: forja_core::CowPageCopy,
     ) -> Result<SubmitRequest<B>, compute::Error> {
         let slot = self
@@ -2981,7 +2998,7 @@ impl<B: Backend + 'static> Host<B> {
             paged: vec![PagedUse {
                 binding,
                 bank: 0,
-                lane: 0,
+                lane,
             }],
             flight: None,
             timeout: self.limits.submission_timeout,
@@ -3002,6 +3019,15 @@ impl<B: Backend + 'static> Host<B> {
         pool_rep: u32,
         checkpoint: SequenceCheckpoint,
     ) -> Result<Option<SequenceCheckpoint>, compute::Error> {
+        self.finish_paged_lane_append(pool_rep, 0, checkpoint)
+    }
+
+    fn finish_paged_lane_append(
+        &mut self,
+        pool_rep: u32,
+        lane: u32,
+        checkpoint: SequenceCheckpoint,
+    ) -> Result<Option<SequenceCheckpoint>, compute::Error> {
         let slot_rep = self
             .table
             .get(&Resource::<PagePoolEntry>::new_borrow(pool_rep))
@@ -3013,11 +3039,13 @@ impl<B: Backend + 'static> Host<B> {
             .get(&Resource::<BatchSlotEntry>::new_borrow(slot_rep))
             .map_err(invalid_handle)?
             .binding;
-        let used = binding.lane(0)?.used.load(Ordering::Acquire);
+        let lane_index = usize::try_from(lane)
+            .map_err(|_| compute::Error::Layout("paged lane exceeds usize".to_owned()))?;
+        let used = binding.lane(lane_index)?.used.load(Ordering::Acquire);
         if used {
             Ok(Some(checkpoint))
         } else {
-            self.rollback_paged_append(pool_rep, checkpoint)?;
+            self.rollback_paged_lane_append(pool_rep, lane, checkpoint)?;
             Ok(None)
         }
     }
@@ -3025,6 +3053,15 @@ impl<B: Backend + 'static> Host<B> {
     fn rollback_paged_append(
         &mut self,
         pool_rep: u32,
+        checkpoint: SequenceCheckpoint,
+    ) -> Result<(), compute::Error> {
+        self.rollback_paged_lane_append(pool_rep, 0, checkpoint)
+    }
+
+    fn rollback_paged_lane_append(
+        &mut self,
+        pool_rep: u32,
+        lane: u32,
         checkpoint: SequenceCheckpoint,
     ) -> Result<(), compute::Error> {
         let slot_rep = self
@@ -3040,8 +3077,10 @@ impl<B: Backend + 'static> Host<B> {
                 .map_err(invalid_handle)?
                 .binding,
         );
+        let lane = usize::try_from(lane)
+            .map_err(|_| compute::Error::Layout("paged lane exceeds usize".to_owned()))?;
         let sequence = binding
-            .lane(0)?
+            .lane(lane)?
             .sequence
             .lock()
             .map_err(|_| guest_error(BackendError::ExecutionFailed))?
@@ -7754,6 +7793,14 @@ mod tests {
 
         host.bind_paged_lane(pool.rep(), 0, None, 8).unwrap();
         host.bind_paged_lane(pool.rep(), 1, None, 8).unwrap();
+        let first_checkpoint = host
+            .begin_paged_lane_append(pool.rep(), 0, 0, 3)
+            .unwrap()
+            .0
+            .unwrap();
+        host.begin_paged_lane_append(pool.rep(), 1, 0, 2).unwrap();
+        host.rollback_paged_lane_append(pool.rep(), 0, first_checkpoint)
+            .unwrap();
 
         let slot = host.table.get(&pool).unwrap().slot.unwrap();
         let binding = &host
@@ -7769,6 +7816,8 @@ mod tests {
             first.as_ref().unwrap(),
             second.as_ref().unwrap()
         ));
+        assert_eq!(first.as_ref().unwrap().lock().unwrap().logical_len(), 0);
+        assert_eq!(second.as_ref().unwrap().lock().unwrap().logical_len(), 2);
     }
 
     #[cfg(target_os = "macos")]
