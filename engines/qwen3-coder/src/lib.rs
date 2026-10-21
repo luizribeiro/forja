@@ -322,6 +322,44 @@ impl Load<Config> for Attention {
 }
 
 impl Attention {
+    fn project_decode_rows(
+        &self,
+        variants: &variants::Variants,
+        input: &Tensor<f32>,
+        rows: u32,
+        kernel: &Kernel,
+        positions: &Tensor<f32>,
+    ) -> Result<(Tensor<f32>, Tensor<f32>, Tensor<f32>)> {
+        let qkv = self.qkv_proj.forward(variants, input)?;
+        let qk_rows = qkv.narrow(1, 0, (QUERY_HEADS + KEY_VALUE_HEADS) * HEAD_DIM)?;
+        let qk_rows = if rows == 1 {
+            qk_rows
+        } else {
+            qk_rows.contiguous()?
+        };
+        let qk = qk_norm_rope(
+            kernel,
+            &qk_rows.reshape(&[rows, QUERY_HEADS + KEY_VALUE_HEADS, HEAD_DIM])?,
+            &self.decode_norm,
+            positions,
+        )?;
+        let value = qkv.narrow(
+            1,
+            (QUERY_HEADS + KEY_VALUE_HEADS) * HEAD_DIM,
+            KEY_VALUE_HEADS * HEAD_DIM,
+        )?;
+        let value = if rows == 1 {
+            value
+        } else {
+            value.contiguous()?
+        };
+        Ok((
+            qk.narrow(1, 0, QUERY_HEADS)?,
+            qk.narrow(1, QUERY_HEADS, KEY_VALUE_HEADS)?,
+            value.reshape(&[rows, KEY_VALUE_HEADS, HEAD_DIM])?,
+        ))
+    }
+
     fn project_normalized(
         &self,
         variants: &variants::Variants,
@@ -331,24 +369,7 @@ impl Attention {
         positions: &Tensor<f32>,
     ) -> Result<(Tensor<f32>, Tensor<f32>, Tensor<f32>)> {
         if sequence == 1 {
-            let qkv = self.qkv_proj.forward(variants, input)?;
-            let qk = qk_norm_rope(
-                kernel,
-                &qkv.narrow(1, 0, (QUERY_HEADS + KEY_VALUE_HEADS) * HEAD_DIM)?
-                    .reshape(&[sequence, QUERY_HEADS + KEY_VALUE_HEADS, HEAD_DIM])?,
-                &self.decode_norm,
-                positions,
-            )?;
-            return Ok((
-                qk.narrow(1, 0, QUERY_HEADS)?,
-                qk.narrow(1, QUERY_HEADS, KEY_VALUE_HEADS)?,
-                qkv.narrow(
-                    1,
-                    (QUERY_HEADS + KEY_VALUE_HEADS) * HEAD_DIM,
-                    KEY_VALUE_HEADS * HEAD_DIM,
-                )?
-                .reshape(&[sequence, KEY_VALUE_HEADS, HEAD_DIM])?,
-            ));
+            return self.project_decode_rows(variants, input, sequence, kernel, positions);
         }
         let query = self.q_proj.forward(variants, input)?;
         let key = self.k_proj.forward(variants, input)?;
