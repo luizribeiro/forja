@@ -16,6 +16,16 @@ pub struct PagedSlot<'a> {
     lifetime: PhantomData<&'a ()>,
 }
 
+/// Host-filled lane metadata used by serving graphs.
+pub struct PagedSlotTensors {
+    /// Per-lane logical sequence lengths.
+    pub logical_lengths: Tensor<u32>,
+    /// Per-lane query starts.
+    pub query_starts: Tensor<u32>,
+    /// Per-lane absolute sampling positions.
+    pub absolute_positions: Tensor<u32>,
+}
+
 impl PagedSlot<'_> {
     #[cfg(target_family = "wasm")]
     #[doc(hidden)]
@@ -25,6 +35,25 @@ impl PagedSlot<'_> {
             raw,
             lifetime: PhantomData,
         }
+    }
+
+    /// Returns device-visible aliases of host-owned lane metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the host refuses the slot or its lane count.
+    #[cfg(target_family = "wasm")]
+    pub fn tensors(&self) -> Result<PagedSlotTensors> {
+        let tensors = self
+            .raw
+            .tensors()
+            .map_err(|error| Error::loading(format!("{error:?}")))?;
+        let shape = vec![tensors.lanes];
+        Ok(PagedSlotTensors {
+            logical_lengths: Tensor::from_guest(tensors.logical_lengths, shape.clone()),
+            query_starts: Tensor::from_guest(tensors.query_starts, shape.clone()),
+            absolute_positions: Tensor::from_guest(tensors.absolute_positions, shape),
+        })
     }
 }
 

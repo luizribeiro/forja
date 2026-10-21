@@ -10,7 +10,15 @@ interface paged-storage {
   }
 
   resource sequence;
-  resource batch-slot;
+  record slot-tensors {
+    lanes: u32,
+    logical-lengths: tensor,
+    query-starts: tensor,
+    absolute-positions: tensor,
+  }
+  resource batch-slot {
+    tensors: func() -> result<slot-tensors, error>;
+  }
   resource page-pool {
     open-slot: func(planes: u32) -> result<batch-slot, error>;
   }

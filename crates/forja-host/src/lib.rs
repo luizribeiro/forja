@@ -6317,6 +6317,59 @@ impl<B> paged_storage::HostBatchSlot for Host<B>
 where
     B: Backend + Send + Sync + 'static,
 {
+    fn tensors(
+        &mut self,
+        resource: Resource<BatchSlotEntry>,
+    ) -> impl Future<Output = wasmtime::Result<Result<paged_storage::SlotTensors, compute::Error>>> + Send
+    {
+        let result = (|| {
+            let (lanes, handles) = {
+                let slot = self.table.get(&resource).map_err(invalid_handle)?;
+                (
+                    u32::try_from(slot.binding.lanes.len()).map_err(|_| {
+                        compute::Error::Layout("paged lane count exceeds u32".to_owned())
+                    })?,
+                    [
+                        slot.logical_lengths,
+                        slot.query_starts,
+                        slot.absolute_positions,
+                    ],
+                )
+            };
+            let mut aliases = Vec::with_capacity(handles.len());
+            for handle in handles {
+                let resource = Resource::new_borrow(handle);
+                let shape = self.entry(&resource)?.tensor.layout().shape().to_vec();
+                match self.view(&resource, compute::ViewOp::Reshape(shape)) {
+                    Ok(alias) => aliases.push(alias),
+                    Err(error) => {
+                        for alias in aliases {
+                            let _ = self.drop_tensor(alias);
+                        }
+                        return Err(error);
+                    }
+                }
+            }
+            let mut aliases = aliases.into_iter();
+            let logical_lengths = aliases
+                .next()
+                .ok_or_else(|| invalid_handle("paged logical lengths are missing"))?;
+            let query_starts = aliases
+                .next()
+                .ok_or_else(|| invalid_handle("paged query starts are missing"))?;
+            let absolute_positions = aliases
+                .next()
+                .ok_or_else(|| invalid_handle("paged absolute positions are missing"))?;
+            Ok(paged_storage::SlotTensors {
+                lanes,
+                logical_lengths,
+                query_starts,
+                absolute_positions,
+            })
+        })();
+        std::future::ready(Ok(result))
+    }
+
     fn drop(
         &mut self,
         resource: Resource<BatchSlotEntry>,
@@ -7283,6 +7336,33 @@ mod tests {
                 .unwrap();
             assert_eq!(tensor.tensor.layout().dtype(), DType::U32);
             assert_eq!(tensor.tensor.layout().shape(), [1]);
+        }
+    }
+
+    #[tokio::test]
+    async fn paged_slot_exports_lane_metadata_aliases() {
+        let mut host = Host::new(CpuBackend::new(), GENEROUS);
+        let pool = insert_test_pool(&mut host, 1, 8);
+        let slot = host.open_paged_slot(&pool, 1).unwrap();
+
+        let tensors = <Host<CpuBackend> as paged_storage::HostBatchSlot>::tensors(
+            &mut host,
+            Resource::new_borrow(slot.rep()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(tensors.lanes, 1);
+        for tensor in [
+            tensors.logical_lengths,
+            tensors.query_starts,
+            tensors.absolute_positions,
+        ] {
+            assert_eq!(
+                host.table.get(&tensor).unwrap().tensor.layout().shape(),
+                [1]
+            );
         }
     }
 

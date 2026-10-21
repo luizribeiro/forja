@@ -130,7 +130,7 @@ pub use forja_sdk_macros::{Load, export_engine, kernel};
 pub use graph::{Dim, Graph, GraphResult, Param, Pos, capture, eval};
 pub use half::{bf16, f16};
 pub use load::{Load, Weights};
-pub use paged::{PagedCache, PagedCacheSet, PagedPool, PagedSlot};
+pub use paged::{PagedCache, PagedCacheSet, PagedPool, PagedSlot, PagedSlotTensors};
 pub use selections::{EngineSelections, EngineTunings, Tuning, VariantSelection};
 pub use sys::DType;
 pub use tensor::{ReductionConfig, SamplingKernelConfig, Slice, Tensor};
