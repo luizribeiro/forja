@@ -365,7 +365,7 @@ fn run_sdpa<B: Backend + 'static>(
     query_heads: u32,
     kv_heads: u32,
     head_offsets: (u32, u32),
-    corrupt_generation: bool,
+    corrupt_pages: &[usize],
     variant: Option<&str>,
 ) -> Result<Vec<f32>, BackendError> {
     const PAGE_TOKENS: u32 = 64;
@@ -389,8 +389,8 @@ fn run_sdpa<B: Backend + 'static>(
     let mut generations = (0..physical_pages)
         .map(|page| 11 + page)
         .collect::<Vec<_>>();
-    if corrupt_generation {
-        generations[usize::try_from(entries[0].0).unwrap()] = 0;
+    for &logical_page in corrupt_pages {
+        generations[usize::try_from(entries[logical_page].0).unwrap()] = 0;
     }
     let (query_head_offset, kv_head_offset) = head_offsets;
     let kv_element_offset = kv_head_offset.checked_mul(WIDTH).unwrap();
@@ -490,7 +490,7 @@ fn check_paged_sdpa_real_shapes(dtype: DType, shapes: &[(u32, u32)], query_head_
             reference_query_heads,
             reference_kv_heads,
             (query_head_range.start, reference_kv_offset),
-            false,
+            &[],
             None,
         )
         .unwrap();
@@ -509,7 +509,7 @@ fn check_paged_sdpa_real_shapes(dtype: DType, shapes: &[(u32, u32)], query_head_
             QUERY_HEADS,
             KV_HEADS,
             (0, 0),
-            false,
+            &[],
             Some(variant),
         )
         .unwrap();
@@ -569,47 +569,92 @@ real_shape_tests!(
     (metal_paged_sdpa_matches_cpu_at_16384_bf16_heads_12_15, DType::BF16, 16_384, 2, 12..16),
 );
 
-#[test]
-fn metal_paged_gqa_two_pass_matches_cpu() {
+fn check_paged_gqa_two_pass(length: u32, variant: &str) {
     let cpu = forja_cpu::CpuBackend::new();
     let metal = forja_metal::MetalBackend::new().unwrap();
-    for length in [512, 4_000] {
-        for contiguous in [false, true] {
-            let reference = run_sdpa(
-                &cpu,
-                DType::F16,
-                length,
-                1,
-                false,
-                contiguous,
-                32,
-                4,
-                (0, 0),
-                false,
-                None,
-            )
-            .unwrap();
-            let candidate = run_sdpa(
-                &metal,
-                DType::F16,
-                length,
-                1,
-                false,
-                contiguous,
-                32,
-                4,
-                (0, 0),
-                false,
-                None,
-            )
-            .unwrap();
-            let error = forja_testing::normwise_relative_error(&reference, &candidate);
-            assert!(
-                error <= forja_testing::F16_TOLERANCE,
-                "length={length} contiguous={contiguous} error={error}"
-            );
-        }
+    for contiguous in [false, true] {
+        let reference = run_sdpa(
+            &cpu,
+            DType::F16,
+            length,
+            1,
+            false,
+            contiguous,
+            32,
+            4,
+            (0, 0),
+            &[],
+            None,
+        )
+        .unwrap();
+        let candidate = run_sdpa(
+            &metal,
+            DType::F16,
+            length,
+            1,
+            false,
+            contiguous,
+            32,
+            4,
+            (0, 0),
+            &[],
+            Some(variant),
+        )
+        .unwrap();
+        let error = forja_testing::normwise_relative_error(&reference, &candidate);
+        assert!(
+            error <= forja_testing::F16_TOLERANCE,
+            "length={length} contiguous={contiguous} error={error}"
+        );
     }
+}
+
+macro_rules! paged_gqa_two_pass_tests {
+    ($(($name:ident, $length:expr, $variant:expr)),+ $(,)?) => {
+        $(
+            #[test]
+            fn $name() {
+                check_paged_gqa_two_pass($length, $variant);
+            }
+        )+
+    };
+}
+
+paged_gqa_two_pass_tests!(
+    (
+        metal_paged_gqa_two_pass_matches_cpu_at_512,
+        512,
+        "paged-sdpa.vector-gqa-two-pass-32"
+    ),
+    (
+        metal_paged_gqa_two_pass_matches_cpu_at_2048,
+        2_048,
+        "paged-sdpa.vector-gqa-two-pass"
+    ),
+    (
+        metal_paged_gqa_two_pass_matches_cpu_at_4000,
+        4_000,
+        "paged-sdpa.vector-gqa-two-pass-128"
+    ),
+);
+
+#[test]
+fn metal_paged_gqa_two_pass_refuses_corrupt_entries() {
+    let error = run_sdpa(
+        &forja_metal::MetalBackend::new().unwrap(),
+        DType::F16,
+        512,
+        1,
+        false,
+        false,
+        32,
+        4,
+        (0, 0),
+        &[7],
+        Some("paged-sdpa.vector-gqa-two-pass-32"),
+    )
+    .unwrap_err();
+    assert!(matches!(error, BackendError::DeviceErrorFlag { .. }));
 }
 
 #[test]
@@ -626,7 +671,7 @@ fn metal_paged_sdpa_uses_contiguous_entry_path() {
         16,
         8,
         (0, 0),
-        false,
+        &[],
         None,
     )
     .unwrap();
@@ -640,7 +685,7 @@ fn metal_paged_sdpa_uses_contiguous_entry_path() {
         16,
         8,
         (0, 0),
-        false,
+        &[],
         None,
     )
     .unwrap();
@@ -664,7 +709,7 @@ fn metal_paged_sdpa_matches_causal_prefill() {
         32,
         4,
         (0, 0),
-        false,
+        &[],
         None,
     )
     .unwrap();
@@ -678,7 +723,7 @@ fn metal_paged_sdpa_matches_causal_prefill() {
         32,
         4,
         (0, 0),
-        false,
+        &[],
         Some("paged-sdpa.steel-half"),
     )
     .unwrap();
@@ -700,7 +745,7 @@ fn metal_paged_steel_refuses_corrupt_entries() {
         16,
         8,
         (0, 0),
-        true,
+        &[0],
         Some("paged-sdpa.steel-half"),
     )
     .unwrap_err();
