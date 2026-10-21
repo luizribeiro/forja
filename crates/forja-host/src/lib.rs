@@ -3072,17 +3072,118 @@ impl<B: Backend + 'static> Host<B> {
         generation_rep: u32,
         table: &forja_core::PageTable,
     ) -> Result<(), compute::Error> {
+        self.upload_paged_table_entries(table_rep, table)?;
+        let mut generation_bytes = Vec::with_capacity(table.generations().len() * 4);
+        for generation in table.generations() {
+            generation_bytes.extend_from_slice(&generation.to_ne_bytes());
+        }
+        self.write(&Resource::new_borrow(generation_rep), &generation_bytes)
+    }
+
+    fn upload_paged_table_entries(
+        &self,
+        table_rep: u32,
+        table: &forja_core::PageTable,
+    ) -> Result<(), compute::Error> {
         let mut table_bytes = Vec::with_capacity(table.entries().len() * 8);
         for entry in table.entries() {
             table_bytes.extend_from_slice(&entry.page().to_ne_bytes());
             table_bytes.extend_from_slice(&entry.generation().to_ne_bytes());
         }
-        let mut generation_bytes = Vec::with_capacity(table.generations().len() * 4);
-        for generation in table.generations() {
-            generation_bytes.extend_from_slice(&generation.to_ne_bytes());
+        self.write(&Resource::new_borrow(table_rep), &table_bytes)
+    }
+
+    /// Writes trusted per-lane positions and poisons every padding lane.
+    #[doc(hidden)]
+    pub fn write_paged_lane_metadata(
+        &mut self,
+        pool_rep: u32,
+        lanes: &[Option<(u32, u32)>],
+    ) -> Result<(), compute::Error> {
+        let slot_rep = self
+            .table
+            .get(&Resource::<PagePoolEntry>::new_borrow(pool_rep))
+            .map_err(invalid_handle)?
+            .slot
+            .ok_or_else(|| invalid_handle("paged slot is not open"))?;
+        let (binding, tables, metadata) = {
+            let slot = self
+                .table
+                .get(&Resource::<BatchSlotEntry>::new_borrow(slot_rep))
+                .map_err(invalid_handle)?;
+            (
+                Arc::clone(&slot.binding),
+                slot.tables[0].clone(),
+                [
+                    slot.logical_lengths,
+                    slot.query_starts,
+                    slot.absolute_positions,
+                ],
+            )
+        };
+        if lanes.len() > binding.lanes.len() {
+            return Err(compute::Error::Layout(
+                "batch lane count exceeds the paged slot".to_owned(),
+            ));
         }
-        self.write(&Resource::new_borrow(table_rep), &table_bytes)?;
-        self.write(&Resource::new_borrow(generation_rep), &generation_bytes)
+        let mut logical_lengths = vec![0_u32; binding.lanes.len()];
+        let mut query_starts = vec![0_u32; binding.lanes.len()];
+        let mut absolute_positions = vec![0_u32; binding.lanes.len()];
+        for lane in 0..binding.lanes.len() {
+            if let Some((start, tokens)) = lanes.get(lane).copied().flatten() {
+                let sequence = binding
+                    .lane(lane)?
+                    .sequence
+                    .lock()
+                    .map_err(|_| guest_error(BackendError::ExecutionFailed))?
+                    .as_ref()
+                    .cloned()
+                    .ok_or_else(|| invalid_handle("paged sequence is not active"))?;
+                logical_lengths[lane] = u32::try_from(
+                    sequence
+                        .lock()
+                        .map_err(|_| guest_error(BackendError::ExecutionFailed))?
+                        .logical_len(),
+                )
+                .map_err(|_| compute::Error::Layout("paged length exceeds u32".to_owned()))?;
+                query_starts[lane] = start;
+                absolute_positions[lane] = start
+                    .checked_add(tokens)
+                    .and_then(|end| end.checked_sub(1))
+                    .ok_or_else(|| {
+                        compute::Error::Layout("batch absolute position overflowed".to_owned())
+                    })?;
+            } else {
+                binding
+                    .banks
+                    .poison(0, lane)
+                    .map_err(|error| compute::Error::Layout(error.to_string()))?;
+                let table = binding
+                    .banks
+                    .slot(0, lane)
+                    .map_err(|error| compute::Error::Layout(error.to_string()))?
+                    .table()
+                    .clone();
+                self.upload_paged_table_entries(tables[lane], &table)?;
+                *binding
+                    .lane(lane)?
+                    .sequence
+                    .lock()
+                    .map_err(|_| guest_error(BackendError::ExecutionFailed))? = None;
+            }
+        }
+        for (handle, values) in
+            metadata
+                .into_iter()
+                .zip([logical_lengths, query_starts, absolute_positions])
+        {
+            let bytes = values
+                .into_iter()
+                .flat_map(u32::to_ne_bytes)
+                .collect::<Vec<_>>();
+            self.write(&Resource::new_borrow(handle), &bytes)?;
+        }
+        Ok(())
     }
 
     fn prepare_cow_copy(
@@ -7991,6 +8092,62 @@ mod tests {
         ));
         assert_eq!(first.as_ref().unwrap().lock().unwrap().logical_len(), 0);
         assert_eq!(second.as_ref().unwrap().lock().unwrap().logical_len(), 2);
+    }
+
+    #[test]
+    fn paged_lane_metadata_poisons_padding_after_reuse() {
+        let mut host = Host::new(CpuBackend::new(), GENEROUS);
+        let pool = insert_test_pool(&mut host, 1, 16);
+        host.table.get_mut(&pool).unwrap().active_lanes = 2;
+        host.open_paged_slot(&pool, 1).unwrap();
+        host.bind_paged_lane(pool.rep(), 0, None, 8).unwrap();
+        host.bind_paged_lane(pool.rep(), 1, None, 8).unwrap();
+        host.begin_paged_lane_append(pool.rep(), 0, 3, 1).unwrap();
+        host.begin_paged_lane_append(pool.rep(), 1, 0, 2).unwrap();
+
+        host.write_paged_lane_metadata(pool.rep(), &[Some((3, 1)), None])
+            .unwrap();
+
+        let slot_rep = host.table.get(&pool).unwrap().slot.unwrap();
+        let slot = host
+            .table
+            .get(&Resource::<BatchSlotEntry>::new_borrow(slot_rep))
+            .unwrap();
+        assert!(!slot.binding.banks.slot(0, 1).unwrap().is_active());
+        assert!(
+            slot.binding
+                .lane(1)
+                .unwrap()
+                .sequence
+                .lock()
+                .unwrap()
+                .is_none()
+        );
+        let handles = [
+            slot.logical_lengths,
+            slot.query_starts,
+            slot.absolute_positions,
+        ];
+        let values = handles.map(|handle| {
+            let tensor = &host
+                .table
+                .get(&Resource::<TensorEntry>::new_borrow(handle))
+                .unwrap()
+                .tensor;
+            host.backend.read(tensor).unwrap()
+        });
+        assert_eq!(
+            values[0],
+            [4_u32.to_ne_bytes(), 0_u32.to_ne_bytes()].concat()
+        );
+        assert_eq!(
+            values[1],
+            [3_u32.to_ne_bytes(), 0_u32.to_ne_bytes()].concat()
+        );
+        assert_eq!(
+            values[2],
+            [3_u32.to_ne_bytes(), 0_u32.to_ne_bytes()].concat()
+        );
     }
 
     #[cfg(target_os = "macos")]
