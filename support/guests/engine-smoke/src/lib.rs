@@ -119,6 +119,34 @@ impl Guest for Component {
             "engine does not support constrained decode".to_owned(),
         ))
     }
+
+    async fn batch_step(
+        _slot: &l9o::gpu::paged_storage::BatchSlot,
+        _input: exports::l9o::gpu::engine::BatchIn,
+    ) -> Result<exports::l9o::gpu::engine::BatchOut, Error> {
+        Err(Error::OpSignature(
+            "engine does not support batch decode".to_owned(),
+        ))
+    }
+
+    async fn batch_forward(
+        _slot: &l9o::gpu::paged_storage::BatchSlot,
+        _input: exports::l9o::gpu::engine::BatchIn,
+    ) -> Result<Tensor, Error> {
+        Err(Error::OpSignature(
+            "engine does not support batch decode".to_owned(),
+        ))
+    }
+
+    async fn batch_select(
+        _slot: &l9o::gpu::paged_storage::BatchSlot,
+        _logits: &Tensor,
+        _input: exports::l9o::gpu::engine::BatchSelectIn,
+    ) -> Result<exports::l9o::gpu::engine::BatchOut, Error> {
+        Err(Error::OpSignature(
+            "engine does not support batch decode".to_owned(),
+        ))
+    }
 }
 
 fn f32_tensor(shape: &[u32], values: &[f32]) -> Result<Tensor, Error> {

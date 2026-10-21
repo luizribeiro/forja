@@ -2,7 +2,7 @@ package l9o:gpu@0.1.0;
 
 interface engine {
   use compute.{error, tensor, weights};
-  use paged-storage.{page-pool};
+  use paged-storage.{batch-slot, page-pool};
 
   record cache-plane {
     elements-per-token: u64,
@@ -101,6 +101,33 @@ interface engine {
     seed: u64,
   }
 
+  record batch-lane {
+    tokens: option<list<u32>>,
+    start-pos: u32,
+    sampling: sampling-params,
+  }
+
+  record batch-in {
+    shape: batch-shape,
+    lanes: list<option<batch-lane>>,
+  }
+
+  record batch-select-lane {
+    start-pos: u32,
+    sampling: sampling-params,
+    allow: list<u32>,
+  }
+
+  record batch-select-in {
+    shape: batch-shape,
+    lanes: list<option<batch-select-lane>>,
+  }
+
+  record batch-out {
+    logits: tensor,
+    tokens: tensor,
+  }
+
   record decode-out {
     logits: tensor,
     token: tensor,
@@ -116,6 +143,12 @@ interface engine {
                             sampling: sampling-params, allow: list<u32>)
     -> result<decode-out, error>;
   rewind-decode: async func(next-pos: u32) -> result<_, error>;
+  batch-step: async func(slot: borrow<batch-slot>, input: batch-in)
+    -> result<batch-out, error>;
+  batch-forward: async func(slot: borrow<batch-slot>, input: batch-in)
+    -> result<tensor, error>;
+  batch-select: async func(slot: borrow<batch-slot>, logits: borrow<tensor>,
+                           input: batch-select-in) -> result<batch-out, error>;
 }
 
 // This initial contract uses one sequence and engine-owned cache tensors.
