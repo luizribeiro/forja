@@ -306,6 +306,7 @@ const STEEL: &[Constraint] = &[value(
     },
 )];
 const QUANT_GEMV: &[Constraint] = &[value(QUANT_M, Relation::Equal(1))];
+const QUANT_ROW_GEMV: &[Constraint] = &[value(QUANT_M, Relation::Range { min: 2, max: 8 })];
 const Q8_FAST: &[Constraint] = &[
     value(QUANT_M, Relation::Equal(1)),
     operation(OperationValue::Bits, Relation::Equal(8)),
@@ -640,13 +641,18 @@ macro_rules! variant {
 }
 
 macro_rules! batch_invariant_variant {
-    ($name:literal, $operation:ident, $implementation:ident, $constraints:expr,
-     $use_when:expr, $avoid_when:expr, $notes:expr) => {
+    (@class $class:literal; $name:literal, $operation:ident, $implementation:ident,
+     $constraints:expr, $use_when:expr, $avoid_when:expr, $notes:expr) => {
         VariantDef {
-            reduction_class: Some($name),
+            reduction_class: Some($class),
             ..variant!(@batch_invariant true; $name, $operation, $implementation, $constraints,
                        $use_when, $avoid_when, $notes)
         }
+    };
+    ($name:literal, $operation:ident, $implementation:ident, $constraints:expr,
+     $use_when:expr, $avoid_when:expr, $notes:expr) => {
+        batch_invariant_variant!(@class $name; $name, $operation, $implementation, $constraints,
+                                 $use_when, $avoid_when, $notes)
     };
 }
 
@@ -723,7 +729,7 @@ pub(crate) static REGISTRY: &[VariantDef<MetalVariant>] = &[
         &["decode and large contiguous batches have faster specialized algorithms."],
         &["Uses the general small-m algorithm for every valid shape."]
     ),
-    batch_invariant_variant!(
+    batch_invariant_variant!(@class "quant-matmul.row-gemv";
         "quant-matmul.gemv",
         QuantMatmul,
         QuantMatmulGemv,
@@ -731,6 +737,15 @@ pub(crate) static REGISTRY: &[VariantDef<MetalVariant>] = &[
         &["single-row decode with general supported quantization."],
         &["large batches that can amortize tiled work."],
         &["General quantized matrix-vector multiplication."]
+    ),
+    batch_invariant_variant!(@class "quant-matmul.row-gemv";
+        "quant-matmul.row-gemv",
+        QuantMatmul,
+        QuantMatmulGemv,
+        QUANT_ROW_GEMV,
+        &["decode batches with two through eight independent rows."],
+        &["larger batches that can amortize tiled work."],
+        &["Runs the single-row reduction independently for each grid row."]
     ),
     batch_invariant_variant!(
         "quant-matmul.q8-fast-gemv",
@@ -1567,6 +1582,7 @@ mod tests {
                 "matmul.steel-32x64x16-1x2",
                 "quant-matmul.portable",
                 "quant-matmul.gemv",
+                "quant-matmul.row-gemv",
                 "quant-matmul.q8-fast-gemv",
                 "quant-matmul.small-m",
                 "quant-matmul.tiled",
@@ -2226,6 +2242,11 @@ mod tests {
             (
                 "quant-matmul.gemv",
                 quant_dispatch(DType::F32, 1, 64, false),
+                "quantized_gemv",
+            ),
+            (
+                "quant-matmul.row-gemv",
+                quant_dispatch(DType::F32, 2, 64, false),
                 "quantized_gemv",
             ),
             (

@@ -1,6 +1,6 @@
 //! Differential coverage for affine-quantized matrix multiplication.
 
-use forja_core::{DType, Op, Slice};
+use forja_core::{Backend, BackendDispatchData, CommandList, DType, Op, Slice, ViewOp};
 use forja_cpu::CpuBackend;
 use forja_metal::MetalBackend;
 use forja_testing::{TensorSpec, assert_backends_agree};
@@ -106,6 +106,101 @@ fn quantized_matmul_matches_cpu_for_strided_views() {
         &output,
     )
     .unwrap();
+}
+
+#[test]
+#[ignore = "manual decode batch kernel comparison"]
+fn metal_decode_batch_quantized_matmul_microbenchmark() {
+    let backend = MetalBackend::new().unwrap();
+    for (site, inner, columns) in [
+        ("qkv", 2_048, 5_120),
+        ("o", 4_096, 2_048),
+        ("lm-head", 2_048, 151_936),
+    ] {
+        for rows in [2, 4, 8] {
+            let tensors = quant_benchmark_tensors(&backend, rows, inner, columns);
+            let gemv = || quant_benchmark_commands(&backend, &tensors, rows, true);
+            let small_m = || quant_benchmark_commands(&backend, &tensors, rows, false);
+            let (gemv_time, small_m_time) =
+                crate::common::comparative_gpu_times(&backend, gemv, small_m);
+            eprintln!(
+                "quant-batch site={site} rows={rows} row_gemv_us={} small_m_us={} ratio={:.4}",
+                gemv_time.as_secs_f64() * 1.0e6,
+                small_m_time.as_secs_f64() * 1.0e6,
+                small_m_time.as_secs_f64() / gemv_time.as_secs_f64(),
+            );
+        }
+    }
+}
+
+fn quant_benchmark_tensors(
+    backend: &MetalBackend,
+    rows: u32,
+    inner: u32,
+    columns: u32,
+) -> [forja_core::Tensor; 5] {
+    [
+        backend.alloc(DType::F32, &[rows, inner]).unwrap(),
+        backend.alloc(DType::U32, &[columns, inner / 8]).unwrap(),
+        backend.alloc(DType::BF16, &[columns, inner / 64]).unwrap(),
+        backend.alloc(DType::BF16, &[columns, inner / 64]).unwrap(),
+        backend.alloc(DType::F32, &[rows, columns]).unwrap(),
+    ]
+}
+
+fn quant_benchmark_commands(
+    backend: &MetalBackend,
+    tensors: &[forja_core::Tensor; 5],
+    rows: u32,
+    per_row: bool,
+) -> CommandList {
+    let op = Op::QuantMatmul {
+        bits: 4,
+        group_size: 64,
+    };
+    let mut commands = CommandList::new();
+    let row_count = if per_row { rows } else { 1 };
+    for row in 0..row_count {
+        let (input, output) = if per_row {
+            let input = backend
+                .view(
+                    &tensors[0],
+                    ViewOp::Slice(vec![
+                        Slice::new(row, 1, 1).unwrap(),
+                        Slice::new(0, tensors[0].layout().shape()[1], 1).unwrap(),
+                    ]),
+                )
+                .unwrap();
+            let output = backend
+                .view(
+                    &tensors[4],
+                    ViewOp::Slice(vec![
+                        Slice::new(row, 1, 1).unwrap(),
+                        Slice::new(0, tensors[4].layout().shape()[1], 1).unwrap(),
+                    ]),
+                )
+                .unwrap();
+            (input, output)
+        } else {
+            (tensors[0].clone(), tensors[4].clone())
+        };
+        let inputs = [&input, &tensors[1], &tensors[2], &tensors[3]];
+        commands.dispatch(op, &inputs, &output).unwrap();
+        let variant = backend
+            .validate_variant_for_op(
+                op,
+                &inputs,
+                &[&output],
+                if per_row {
+                    "quant-matmul.gemv"
+                } else {
+                    "quant-matmul.small-m"
+                },
+            )
+            .unwrap();
+        assert!(commands.set_last_backend_data(BackendDispatchData::new(variant)));
+    }
+    commands
 }
 
 fn assert_case(

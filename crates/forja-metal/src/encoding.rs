@@ -7778,7 +7778,7 @@ pub(super) fn variant_supported(
         | MetalVariant::MatmulSteel64x64x16_1x2
         | MetalVariant::MatmulSteel64x32x32_2x2
         | MetalVariant::MatmulSteel32x64x16_1x2 => matmul_rows(dispatch)? > 1,
-        MetalVariant::QuantMatmulGemv => rows()? == 1,
+        MetalVariant::QuantMatmulGemv => (1..=8).contains(&rows()?),
         MetalVariant::QuantMatmulQ8FastGemv => {
             quant_matmul_kernel(dispatch)? == "quantized_gemv_q8_fast"
         }
