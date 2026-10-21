@@ -393,13 +393,25 @@ fn run_sdpa<B: Backend + 'static>(
     let query_values = (0..query_heads * query_length * WIDTH)
         .map(|index| ((index * 17) % 89) as f32 / 88.0 - 0.5)
         .collect::<Vec<_>>();
-    let query = backend.alloc(DType::F32, &[query_heads, query_length, WIDTH])?;
+    let query_storage = backend.alloc(DType::F32, &[query_length, query_heads, WIDTH])?;
+    let query = backend.view(&query_storage, ViewOp::Permute(vec![1, 0, 2]))?;
     let key = backend.alloc(dtype, &[physical_pages, PAGE_TOKENS, kv_heads, WIDTH])?;
     let value = backend.alloc(dtype, &[physical_pages, PAGE_TOKENS, kv_heads, WIDTH])?;
     let table = backend.alloc(DType::U32, &[logical_pages, 2])?;
     let generation_tensor = backend.alloc(DType::U32, &[physical_pages])?;
-    let output = backend.alloc(DType::F32, &[query_heads, query_length, WIDTH])?;
-    backend.write(&query, &encode(&query_values, DType::F32))?;
+    let output_storage = backend.alloc(DType::F32, &[query_length, query_heads, WIDTH])?;
+    let output = backend.view(&output_storage, ViewOp::Permute(vec![1, 0, 2]))?;
+    let mut query_storage_values = vec![0.0_f32; query_values.len()];
+    for head in 0..query_heads {
+        for row in 0..query_length {
+            for column in 0..WIDTH {
+                let source = usize::try_from((head * query_length + row) * WIDTH + column).unwrap();
+                let target = usize::try_from((row * query_heads + head) * WIDTH + column).unwrap();
+                query_storage_values[target] = query_values[source];
+            }
+        }
+    }
+    backend.write(&query_storage, &encode(&query_storage_values, DType::F32))?;
     backend.write(&key, &encode(&keys, dtype))?;
     backend.write(&value, &encode(&values, dtype))?;
     backend.write(&table, &table_bytes(&entries))?;

@@ -67,6 +67,11 @@ struct PagedSdpaParams {
     uint physical_pages;
     uint contiguous_entries;
     uint blocks;
+    uint padding;
+    ulong q_offset;
+    ulong q_strides[3];
+    ulong o_offset;
+    ulong o_strides[3];
 };
 
 constant uint paged_contiguous_entries [[function_constant(213)]];
@@ -129,11 +134,11 @@ void paged_steel_attention_body(
     uint first_query = query_block * BQ;
     uint kv_head = head / params.heads_per_group;
     uint thread_count = threads.x * threads.y * threads.z;
-    ulong query_base = ulong(head) * params.query_length * BD;
-    ulong output_base = ulong(head) * params.query_length * params.value_width
-        + ulong(first_query) * params.value_width;
+    ulong query_base = params.q_offset + ulong(head) * params.q_strides[0];
+    ulong output_base = params.o_offset + ulong(head) * params.o_strides[0]
+        + ulong(first_query) * params.o_strides[1];
     BlockLoader<BQ, BD>::load_to(
-        query, query_base, BD, 1, input0_dtype, first_query, 0,
+        query, query_base, params.q_strides[1], params.q_strides[2], input0_dtype, first_query, 0,
         params.query_length, BD, false, true, query_tile, LDQ, 1,
         thread_index, thread_count);
     using Fragment = SteelMMAFragment<float>;
@@ -298,8 +303,8 @@ void paged_steel_attention_body(
     for (short dimension = 0; dimension < TD; ++dimension) {
         uint output_column = dimension * FRAGMENT + column;
         for (short element = 0; element < Fragment::elements; ++element) {
-            ulong output_index = output_base + ulong(query_row) * params.value_width
-                + output_column + element;
+            ulong output_index = output_base + ulong(query_row) * params.o_strides[1]
+                + ulong(output_column + element) * params.o_strides[2];
             store_float(output, output_index, output_dtype,
                 result.at(0, dimension)[element]);
         }
@@ -375,7 +380,7 @@ void paged_sdpa_2pass_1_gqa_body(
     float denominator[HPT];
     for (uint local_head = 0; local_head < HPT; ++local_head) {
         uint head = kv_head * G + first_head + local_head;
-        ulong q_base = ulong(head) * D;
+        ulong q_base = params.q_offset + ulong(head) * params.q_strides[0];
         for (uint element = 0; element < elements_per_thread; ++element) {
             uint column = simd_lane * elements_per_thread + element;
             q[local_head][element] = params.scale
@@ -566,7 +571,8 @@ void paged_sdpa_2pass_2_body(
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (simd_lane == 0) {
             uint column = simd_group * elements_per_thread + element;
-            ulong output_index = ulong(head) * params.value_width + column;
+            ulong output_index = params.o_offset + ulong(head) * params.o_strides[0]
+                + ulong(column) * params.o_strides[2];
             store_float(output, output_index, output_dtype, total / denominator);
         }
     }
@@ -615,7 +621,8 @@ void paged_sdpa_body(
     uint kv_head = head / params.heads_per_group;
     float q[elements_per_thread];
     float result[elements_per_thread];
-    ulong q_base = (ulong(head) * params.query_length + query_row) * D;
+    ulong q_base = params.q_offset + ulong(head) * params.q_strides[0]
+        + ulong(query_row) * params.q_strides[1];
     for (uint element = 0; element < elements_per_thread; ++element) {
         uint column = simd_lane * elements_per_thread + element;
         q[element] = params.scale * load_float(query, q_base + column, input0_dtype);
@@ -693,8 +700,9 @@ void paged_sdpa_body(
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (simd_lane == 0) {
             uint column = simd_group * elements_per_thread + element;
-            ulong out_index = (ulong(head) * params.query_length + query_row)
-                * params.value_width + column;
+            ulong out_index = params.o_offset + ulong(head) * params.o_strides[0]
+                + ulong(query_row) * params.o_strides[1]
+                + ulong(column) * params.o_strides[2];
             store_float(output, out_index, output_dtype, total / denominator);
         }
     }

@@ -2054,7 +2054,11 @@ fn check_paged_sdpa(
             actual: inputs.len(),
         });
     }
-    check_paged_layouts(inputs, output)?;
+    for (input, tensor) in inputs[1..].iter().enumerate() {
+        if !tensor.layout().is_contiguous() {
+            return Err(shape_error(Operand::Input(input + 1)));
+        }
+    }
     check_float(inputs[0], Operand::Input(0))?;
     check_float(inputs[1], Operand::Input(1))?;
     if inputs[2].layout.dtype() != inputs[1].layout.dtype() {
@@ -2106,18 +2110,6 @@ fn check_paged_sdpa(
         || output.layout.shape() != [query_heads, query_length, value_width]
     {
         return Err(OpError::InvalidKernelParameter);
-    }
-    Ok(())
-}
-
-fn check_paged_layouts(inputs: &[&Tensor], output: &Tensor) -> Result<(), OpError> {
-    for (input, tensor) in inputs.iter().enumerate() {
-        if !tensor.layout().is_contiguous() {
-            return Err(shape_error(Operand::Input(input)));
-        }
-    }
-    if !output.layout().is_contiguous() {
-        return Err(shape_error(Operand::Output));
     }
     Ok(())
 }
@@ -2376,13 +2368,13 @@ mod tests {
     }
 
     #[test]
-    fn paged_sdpa_rejects_strided_storage() {
+    fn paged_sdpa_accepts_strided_query_and_output() {
         let table = tensor(3, DType::U32, &[2, 2], &[2, 1]);
         let generations = tensor(4, DType::U32, &[2], &[1]);
         let query = tensor(5, DType::F32, &[16, 2, 128], &[128, 2_048, 1]);
         let keys = tensor(6, DType::F16, &[2, 4, 8, 128], &[4_096, 1_024, 128, 1]);
         let values = tensor(7, DType::F16, &[2, 4, 8, 128], &[4_096, 1_024, 128, 1]);
-        let output = tensor(8, DType::F32, &[16, 2, 128], &[256, 128, 1]);
+        let output = tensor(8, DType::F32, &[16, 2, 128], &[128, 2_048, 1]);
         assert_eq!(
             check_paged_sdpa(
                 &[&query, &keys, &values, &table, &generations],
@@ -2393,7 +2385,7 @@ mod tests {
                 7,
                 4,
             ),
-            Err(shape_error(Operand::Input(0)))
+            Ok(())
         );
     }
 

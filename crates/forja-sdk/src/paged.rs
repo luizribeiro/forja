@@ -172,8 +172,9 @@ impl PagedCache<'_> {
         let hidden = heads
             .checked_mul(width)
             .ok_or_else(|| Error::loading("paged attention width overflowed"))?;
-        let query = query.permute(&[1, 0, 2])?.contiguous()?;
-        let output = Tensor::zeros(&[heads, sequence, width])?;
+        let query = query.permute(&[1, 0, 2])?;
+        let output = Tensor::zeros(&[sequence, heads, width])?;
+        let paged_output = output.permute(&[1, 0, 2])?;
         #[cfg(target_family = "wasm")]
         let (start, end) = (crate::graph::affine(start)?, crate::graph::affine(end)?);
         #[cfg(target_family = "wasm")]
@@ -184,7 +185,7 @@ impl PagedCache<'_> {
                     commands,
                     &self._set._slot,
                     query.handle(),
-                    output.handle(),
+                    paged_output.handle(),
                     self.key_plane,
                     self.value_plane,
                     scale,
@@ -199,7 +200,7 @@ impl PagedCache<'_> {
                     commands,
                     &self._set._slot,
                     query.handle(),
-                    output.handle(),
+                    paged_output.handle(),
                     self.key_plane,
                     self.value_plane,
                     scale,
@@ -212,11 +213,8 @@ impl PagedCache<'_> {
             },
         )?;
         #[cfg(not(target_family = "wasm"))]
-        let _ = (&query, scale, start, end, selection);
-        output
-            .permute(&[1, 0, 2])?
-            .contiguous()?
-            .reshape(&[sequence, hidden])
+        let _ = (&query, &paged_output, scale, start, end, selection);
+        output.reshape(&[sequence, hidden])
     }
 }
 

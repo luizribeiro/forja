@@ -3168,12 +3168,12 @@ impl MetalBackend {
         else {
             return Err(BackendError::InvalidInput);
         };
-        let query = self.encoder_dense_tensor(query_tensor)?;
+        let query = self.encoder_tensor(query_tensor)?;
         let key = self.encoder_dense_tensor(key_tensor)?;
         let value = self.encoder_dense_tensor(value_tensor)?;
         let page_table = self.encoder_dense_tensor(table_tensor)?;
         let generations = self.encoder_dense_tensor(generation_tensor)?;
-        let output = self.encoder_dense_tensor(dispatch.output())?;
+        let output = self.encoder_tensor(dispatch.output())?;
         let q: [u32; 3] = query
             .layout
             .shape()
@@ -3201,7 +3201,7 @@ impl MetalBackend {
             Some(MetalVariant::PagedSdpaVectorGqaTwoPass256) => Some(256),
             _ => None,
         };
-        let mut params = Vec::with_capacity(15 * size_of::<u32>());
+        let mut params = Vec::with_capacity(128);
         params.extend_from_slice(&scale.to_ne_bytes());
         for value in [
             q[0],
@@ -3218,6 +3218,19 @@ impl MetalBackend {
             k[0],
             u32::from(contiguous_entries),
             gqa_blocks.unwrap_or(0),
+        ] {
+            params.extend_from_slice(&value.to_ne_bytes());
+        }
+        params.extend_from_slice(&0_u32.to_ne_bytes());
+        for value in [
+            query.layout.offset(),
+            query.layout.strides()[0],
+            query.layout.strides()[1],
+            query.layout.strides()[2],
+            output.layout.offset(),
+            output.layout.strides()[0],
+            output.layout.strides()[1],
+            output.layout.strides()[2],
         ] {
             params.extend_from_slice(&value.to_ne_bytes());
         }
@@ -6803,7 +6816,7 @@ impl MetalBackend {
             }
             Op::Sdpa { .. } => self.size_sdpa_arguments(dispatch, arguments)?,
             Op::PagedSdpa { .. } => {
-                arguments.write(14 * size_of::<u32>())?;
+                arguments.write(128)?;
                 arguments.write(2 * size_of::<u32>())?;
             }
         }
