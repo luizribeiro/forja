@@ -24,6 +24,83 @@ struct GroupedCase {
 }
 
 #[test]
+#[ignore = "manual decode routing kernel comparison"]
+fn metal_decode_batch_routing_microbenchmark() {
+    let backend = MetalBackend::new().unwrap();
+    for (site, inner, columns, paired) in
+        [("gate-up", 2_048, 768, true), ("down", 768, 2_048, false)]
+    {
+        for rows in [2, 4, 8] {
+            let case = GroupedCase {
+                rows,
+                routes: 8,
+                experts: 128,
+                inner,
+                columns,
+            };
+            let specs = grouped_specs(case, paired);
+            let tensors = specs
+                .iter()
+                .map(|spec| {
+                    backend
+                        .alloc(spec.dtype(), spec.allocation_shape())
+                        .unwrap()
+                })
+                .collect::<Vec<_>>();
+            let indices = tensors.last().unwrap();
+            backend
+                .write(indices, &vec![0; usize::try_from(rows * 8 * 4).unwrap()])
+                .unwrap();
+            let output = backend.alloc(DType::F32, &[rows, 8, columns]).unwrap();
+            let route = || routing_benchmark_commands(&backend, &tensors, &output, paired, true);
+            let grouped = || routing_benchmark_commands(&backend, &tensors, &output, paired, false);
+            let (route_time, grouped_time) =
+                crate::common::comparative_gpu_times(&backend, route, grouped);
+            eprintln!(
+                "routing-batch site={site} rows={rows} route_us={} grouped_us={} ratio={:.4}",
+                route_time.as_secs_f64() * 1.0e6,
+                grouped_time.as_secs_f64() * 1.0e6,
+                grouped_time.as_secs_f64() / route_time.as_secs_f64(),
+            );
+        }
+    }
+}
+
+fn routing_benchmark_commands(
+    backend: &MetalBackend,
+    tensors: &[forja_core::Tensor],
+    output: &forja_core::Tensor,
+    paired: bool,
+    route: bool,
+) -> CommandList {
+    let op = Op::GatherQuantMatmul {
+        bits: 4,
+        group_size: 64,
+    };
+    let inputs = tensor_refs(tensors);
+    let mut commands = CommandList::new();
+    if paired {
+        commands
+            .dispatch_epilogue(op, &inputs, output, &silu_mul_epilogue(), &[])
+            .unwrap();
+    } else {
+        commands.dispatch(op, &inputs, output).unwrap();
+    }
+    let name = if route {
+        "gather-quant-matmul.route-gemv"
+    } else if paired {
+        "gather-quant-matmul.grouped-pair-small-m"
+    } else {
+        "gather-quant-matmul.grouped-small-m"
+    };
+    let variant = backend
+        .validate_variant_for_op(op, &inputs, &[output], name)
+        .unwrap();
+    assert!(commands.set_last_backend_data(BackendDispatchData::new(variant)));
+    commands
+}
+
+#[test]
 fn metal_grouped_small_m_variants_match_cpu_at_edges() {
     let mut values = DeterministicValues::new(0x6a09_e667_f3bc_c909);
     let cpu = CpuBackend::new();
