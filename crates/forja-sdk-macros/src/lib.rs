@@ -240,7 +240,19 @@ fn serving_info() -> proc_macro2::TokenStream {
             }).collect(),
             active_lanes: serving.active_lanes,
             max_context: serving.max_context,
-            batch_shapes: Vec::new(),
+            batch_shapes: serving.batch_shapes.into_iter().map(|shape| bindings::exports::l9o::gpu::engine::BatchShape {
+                phase: match shape.phase {
+                    ::forja_sdk::BatchPhase::Prompt => bindings::exports::l9o::gpu::engine::BatchPhase::Prompt,
+                    ::forja_sdk::BatchPhase::Decode => bindings::exports::l9o::gpu::engine::BatchPhase::Decode,
+                },
+                bucket: shape.bucket,
+                tokens: shape.tokens,
+                selection: match shape.selection {
+                    ::forja_sdk::BatchSelection::Combined => bindings::exports::l9o::gpu::engine::BatchSelection::Combined,
+                    ::forja_sdk::BatchSelection::Forward => bindings::exports::l9o::gpu::engine::BatchSelection::Forward,
+                    ::forja_sdk::BatchSelection::Masked => bindings::exports::l9o::gpu::engine::BatchSelection::Masked,
+                },
+            }).collect(),
         })
     }
 }

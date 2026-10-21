@@ -7,9 +7,10 @@ use forja_sdk::Param;
 #[cfg(target_family = "wasm")]
 use forja_sdk::nn::blocks::{ChunkedPrefill, DecodeSelection, DecodeState, PrefillExecution};
 use forja_sdk::{
-    CachePlane, DType, Dim, Engine, EngineInfo, EngineLoadConfig, KvCacheFormat, Load, PagedCache,
-    PagedCacheSet, PagedPool, Result, ServingInfo, StepInput, StepOutput, Tensor, VariantSelection,
-    Weights, bf16, export_engine, f16,
+    BatchPhase, BatchSelection, BatchShape, CachePlane, DType, Dim, Engine, EngineInfo,
+    EngineLoadConfig, KvCacheFormat, Load, PagedCache, PagedCacheSet, PagedPool, Result,
+    ServingInfo, StepInput, StepOutput, Tensor, VariantSelection, Weights, bf16, export_engine,
+    f16,
     kernel::{Epilogue, Kernel, TensorRef},
     nn::{
         RmsNorm, RmsNormConfig,
@@ -86,6 +87,37 @@ fn serving_info() -> ServingInfo {
         planes,
         active_lanes: 8,
         max_context: MAX_CONTEXT,
+        batch_shapes: [1, 2, 4, 8]
+            .into_iter()
+            .flat_map(|bucket| {
+                [
+                    BatchShape {
+                        phase: BatchPhase::Decode,
+                        bucket,
+                        tokens: 1,
+                        selection: BatchSelection::Combined,
+                    },
+                    BatchShape {
+                        phase: BatchPhase::Decode,
+                        bucket,
+                        tokens: 1,
+                        selection: BatchSelection::Forward,
+                    },
+                    BatchShape {
+                        phase: BatchPhase::Decode,
+                        bucket,
+                        tokens: 1,
+                        selection: BatchSelection::Masked,
+                    },
+                ]
+            })
+            .chain([16, 512, 2_048].map(|tokens| BatchShape {
+                phase: BatchPhase::Prompt,
+                bucket: 1,
+                tokens,
+                selection: BatchSelection::Combined,
+            }))
+            .collect(),
     }
 }
 
@@ -1429,6 +1461,15 @@ mod tests {
         assert_eq!(serving.planes[0].elements_per_token, 512);
         assert_eq!(serving.active_lanes, 8);
         assert_eq!(serving.max_context, MAX_CONTEXT);
+        assert_eq!(serving.batch_shapes.len(), 15);
+        assert_eq!(
+            serving
+                .batch_shapes
+                .iter()
+                .filter(|shape| shape.phase == BatchPhase::Decode)
+                .count(),
+            12
+        );
     }
 
     #[test]

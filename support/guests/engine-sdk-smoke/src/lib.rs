@@ -30,6 +30,7 @@ impl Engine for ConstantEngine {
                 }],
                 active_lanes: 2,
                 max_context: 32,
+                batch_shapes: vec![],
             }),
         }
     }

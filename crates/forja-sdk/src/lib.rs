@@ -121,9 +121,9 @@ use std::{error, fmt};
 
 pub use element::{Element, FloatElement};
 pub use engine::{
-    BeginDecodeInput, CachePlane, DecodeInput, DecodeOutput, Engine, EngineInfo, EngineLoadConfig,
-    FixedVariantPick, KvCacheFormat, SamplingParams, ServingInfo, StepInput, StepOutput,
-    VariantPickArm, VariantRulePick,
+    BatchPhase, BatchSelection, BatchShape, BeginDecodeInput, CachePlane, DecodeInput,
+    DecodeOutput, Engine, EngineInfo, EngineLoadConfig, FixedVariantPick, KvCacheFormat,
+    SamplingParams, ServingInfo, StepInput, StepOutput, VariantPickArm, VariantRulePick,
 };
 pub use forja_sdk_macros::{Load, export_engine, kernel};
 pub use graph::{Dim, Graph, GraphResult, Param, Pos, capture, eval};

@@ -26,6 +26,41 @@ pub struct ServingInfo {
     pub active_lanes: u32,
     /// Largest context accepted through paged serving.
     pub max_context: u32,
+    /// Exact graph shapes retained for serving.
+    pub batch_shapes: Vec<BatchShape>,
+}
+
+/// One phase in the finite serving graph catalog.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BatchPhase {
+    /// Prompt ingestion.
+    Prompt,
+    /// Single-token generation.
+    Decode,
+}
+
+/// Work performed by one serving graph.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BatchSelection {
+    /// Forward execution followed by token selection.
+    Combined,
+    /// Forward execution only.
+    Forward,
+    /// Masked token selection only.
+    Masked,
+}
+
+/// One exact serving graph shape.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BatchShape {
+    /// Execution phase.
+    pub phase: BatchPhase,
+    /// Fixed number of lanes represented by the graph.
+    pub bucket: u32,
+    /// Fixed token capacity per lane.
+    pub tokens: u32,
+    /// Selection work represented by the graph.
+    pub selection: BatchSelection,
 }
 
 /// One cache plane whose dtype is selected by the engine load profile.
