@@ -3793,7 +3793,9 @@ impl<B: Backend + 'static> Host<B> {
                 .commit_write(u64::from(tokens))
                 .map_err(|error| compute::Error::Quota(error.to_string()))?;
             if copy.is_some() {
-                lane_binding.table_dirty[bank].store(true, Ordering::Release);
+                for dirty in &lane_binding.table_dirty {
+                    dirty.store(true, Ordering::Release);
+                }
             }
             if lane_binding.table_dirty[bank].load(Ordering::Acquire) {
                 binding
@@ -4210,13 +4212,17 @@ impl<B: Backend + 'static> Host<B> {
                 "paged request exceeds the context ceiling".to_owned(),
             ));
         }
-        let binding = Arc::clone(
-            &self
+        let (binding, tables, generations) = {
+            let slot = self
                 .table
                 .get(&Resource::<BatchSlotEntry>::new_borrow(slot_rep))
-                .map_err(invalid_handle)?
-                .binding,
-        );
+                .map_err(invalid_handle)?;
+            (
+                Arc::clone(&slot.binding),
+                slot.tables.clone(),
+                slot.generations,
+            )
+        };
         let lane = usize::try_from(lane)
             .map_err(|_| compute::Error::Layout("paged lane exceeds usize".to_owned()))?;
         let lane_binding = binding.lane(lane)?;
@@ -4241,10 +4247,32 @@ impl<B: Backend + 'static> Host<B> {
         *lane_binding
             .sequence
             .lock()
-            .map_err(|_| guest_error(BackendError::ExecutionFailed))? = Some(sequence);
+            .map_err(|_| guest_error(BackendError::ExecutionFailed))? = Some(Arc::clone(&sequence));
         lane_binding.used.store(false, Ordering::Release);
         for dirty in &lane_binding.table_dirty {
             dirty.store(true, Ordering::Release);
+        }
+        let sequence = sequence
+            .lock()
+            .map_err(|_| guest_error(BackendError::ExecutionFailed))?;
+        for (bank, bank_tables) in tables.iter().enumerate() {
+            match binding.banks.bind(bank, lane, &sequence) {
+                Ok(()) => {
+                    let table = binding
+                        .banks
+                        .slot(bank, lane)
+                        .map_err(|error| compute::Error::Quota(error.to_string()))?
+                        .table()
+                        .clone();
+                    let table_handle = *bank_tables
+                        .get(lane)
+                        .ok_or_else(|| invalid_handle("paged lane is missing"))?;
+                    self.upload_paged_table(table_handle, generations, &table)?;
+                    lane_binding.table_dirty[bank].store(false, Ordering::Release);
+                }
+                Err(forja_core::PagePoolError::SharedTail) => {}
+                Err(error) => return Err(compute::Error::Quota(error.to_string())),
+            }
         }
         Ok(())
     }
@@ -9644,18 +9672,53 @@ mod tests {
     }
 
     #[test]
-    fn paged_request_binding_defers_slot_updates_until_use() {
+    fn paged_request_binding_defers_busy_slot_updates_until_use() {
         let mut host = Host::new(CpuBackend::new(), GENEROUS);
         let pool = insert_test_pool(&mut host, 1, 16);
         let slot = host.open_paged_slot(&pool, 1).unwrap();
 
         host.bind_paged_request(pool.rep(), None, 8).unwrap();
+        host.table
+            .get(&slot)
+            .unwrap()
+            .binding
+            .banks
+            .mark_submitted(0, 1)
+            .unwrap();
+        host.bind_paged_request(pool.rep(), None, 8).unwrap();
 
         let binding = &host.table.get(&slot).unwrap().binding;
-        assert!(!binding.banks.slot(0, 0).unwrap().is_active());
-        assert!(!binding.banks.slot(1, 0).unwrap().is_active());
+        assert!(binding.banks.slot(0, 0).unwrap().is_active());
+        assert!(binding.banks.slot(1, 0).unwrap().is_active());
         assert!(binding.lane(0).unwrap().table_dirty[0].load(Ordering::Acquire));
-        assert!(binding.lane(0).unwrap().table_dirty[1].load(Ordering::Acquire));
+        assert!(!binding.lane(0).unwrap().table_dirty[1].load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn copy_on_write_invalidates_the_other_primed_bank() {
+        let mut host = Host::new(CpuBackend::new(), GENEROUS);
+        let pool = insert_test_pool(&mut host, 1, 16);
+        let slot = host.open_paged_slot(&pool, 1).unwrap();
+        let pool_state = host.table.get(&pool).unwrap().pool.clone();
+        let mut sequence = pool_state.reserve(4).unwrap();
+        sequence.commit_write(3).unwrap();
+        let retained = super::PagedPrefix::new(sequence);
+        let fork = retained.fork_reserved(3, 8).unwrap();
+        host.bind_paged_lane(pool.rep(), 0, Some(fork), 8).unwrap();
+
+        let (_, copy) = host.begin_paged_lane_append(pool.rep(), 0, 3, 1).unwrap();
+
+        assert!(copy.is_some());
+        let dirty = &host
+            .table
+            .get(&slot)
+            .unwrap()
+            .binding
+            .lane(0)
+            .unwrap()
+            .table_dirty;
+        assert!(!dirty[0].load(Ordering::Acquire));
+        assert!(dirty[1].load(Ordering::Acquire));
     }
 
     #[test]
