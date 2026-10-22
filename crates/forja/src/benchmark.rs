@@ -1306,7 +1306,7 @@ async fn measure_decode(
     if options.overlap && !options.host_argmax {
         return measure_pipelined_decode(runner, prompt, steps, options.sampling).await;
     }
-    let mut token = select_from_tokens(runner, prompt.to_vec(), 0, options).await?;
+    let mut token = prepare_decode(runner, prompt, options).await?;
     let mut schedule = Vec::with_capacity(steps.saturating_add(1));
     visit_decode_steps(u32::try_from(prompt.len())?, steps, |position, timed| {
         schedule.push((position, timed));
@@ -1356,7 +1356,7 @@ async fn measure_pipelined_decode(
         overlap: true,
         sampling,
     };
-    let token = select_from_tokens(runner, prompt.to_vec(), 0, options).await?;
+    let token = prepare_decode(runner, prompt, options).await?;
     let context_start = u32::try_from(prompt.len())?;
     let warmup_before = runner.metrics().submissions;
     select_next(runner, token, context_start, options).await?;
@@ -1419,10 +1419,19 @@ async fn measure_pipelined_decode(
 async fn settle_submission_metrics(
     runner: &EngineRunner<forja_metal::MetalBackend>,
 ) -> Result<(), Box<dyn Error>> {
-    runner
-        .wait_for_submissions(runner.metrics().submissions)
-        .await?;
+    runner.wait_for_queued_submissions().await?;
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+async fn prepare_decode(
+    runner: &mut EngineRunner<forja_metal::MetalBackend>,
+    prompt: &[u32],
+    options: DecodeOptions,
+) -> Result<u32, Box<dyn Error>> {
+    let token = select_from_tokens(runner, prompt.to_vec(), 0, options).await?;
+    settle_submission_metrics(runner).await?;
+    Ok(token)
 }
 
 #[cfg(target_os = "macos")]
