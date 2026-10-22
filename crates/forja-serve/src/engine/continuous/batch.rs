@@ -85,7 +85,17 @@ where
                 continue;
             };
             self.mark_submitted_cancellations(&mut batch, &mut active);
-            let mut successor = match self.submit_successor(&active, &batch).await {
+            drain_pending(receiver, pending);
+            let admission_waiting = deferred.is_some()
+                || pending
+                    .front()
+                    .is_some_and(|request| !request.requires_serial_path());
+            let next = if admission_waiting {
+                Ok(None)
+            } else {
+                self.submit_successor(&active, &batch).await
+            };
+            let mut successor = match next {
                 Ok(successor) => successor,
                 Err(error) => {
                     let _ = self.runner.read_queued_batch_tokens(batch.output).await;
@@ -117,8 +127,10 @@ where
             };
             self.apply_batch_tokens(batch.lanes, &mut active, &mut successor, &tokens)
                 .await;
-            self.admit_pending(receiver, pending, &mut active, &mut deferred)
-                .await;
+            if successor.is_none() {
+                self.admit_pending(receiver, pending, &mut active, &mut deferred)
+                    .await;
+            }
             current = successor;
         }
     }
@@ -386,9 +398,7 @@ where
         active: &mut Vec<BatchLane>,
         deferred: &mut Option<PreparedRequest>,
     ) {
-        while let Ok(command) = receiver.try_recv() {
-            pending.push_back(RequestEnvelope::from_command(command));
-        }
+        drain_pending(receiver, pending);
         while active.len() < usize::try_from(self.scheduler.active_lanes).unwrap_or(usize::MAX) {
             if deferred.is_none()
                 && pending
@@ -513,6 +523,15 @@ where
     fn fail_batch_lane(&mut self, lane: BatchLane, error: GenerationError) {
         let _ = self.runner.prepare_paged_lane(lane.slot, None, 0);
         lane.fail(error);
+    }
+}
+
+fn drain_pending(
+    receiver: &mut mpsc::Receiver<ServiceCommand>,
+    pending: &mut VecDeque<RequestEnvelope>,
+) {
+    while let Ok(command) = receiver.try_recv() {
+        pending.push_back(RequestEnvelope::from_command(command));
     }
 }
 

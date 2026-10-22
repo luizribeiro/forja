@@ -980,7 +980,6 @@ pub struct Qwen3Coder {
 struct BatchDecodeGraphs {
     bucket: u32,
     bank: usize,
-    tokens: Tensor<u32>,
     positions: Tensor<f32>,
     sampling: Tensor<u32>,
     logits: Tensor<f32>,
@@ -1001,7 +1000,6 @@ impl BatchDecodeGraphs {
         Ok(Self {
             bucket,
             bank,
-            tokens: Tensor::zeros(&[bucket])?,
             positions: Tensor::zeros(&[bucket])?,
             sampling: Tensor::zeros(&[bucket, 5])?,
             logits: Tensor::zeros(&[bucket, VOCAB])?,
@@ -1018,38 +1016,46 @@ impl BatchDecodeGraphs {
         lanes: &[Option<forja_sdk::BatchLane>],
         feedback: &Tensor<u32>,
     ) -> Result<Vec<u32>> {
-        let feedback = feedback.to_vec()?;
-        let mut tokens = Vec::with_capacity(lanes.len());
+        let mut host_tokens = Vec::with_capacity(lanes.len());
         let mut positions = Vec::with_capacity(lanes.len());
         let mut sampling = Vec::with_capacity(lanes.len() * 5);
         let mut starts = Vec::with_capacity(lanes.len());
-        for (index, lane) in lanes.iter().enumerate() {
+        for lane in lanes {
             let lane = lane
                 .as_ref()
                 .ok_or_else(|| forja_sdk::Error::loading("captured batch lane is inactive"))?;
-            let token = lane.tokens.as_ref().map_or_else(
-                || {
-                    feedback
-                        .get(index)
-                        .copied()
-                        .ok_or_else(|| forja_sdk::Error::loading("batch feedback is missing"))
-                },
-                |token| {
-                    let values = token.to_vec()?;
-                    if values.len() != 1 {
-                        return Err(forja_sdk::Error::loading(
-                            "batch decode lanes require one token",
-                        ));
-                    }
-                    Ok(values[0])
-                },
-            )?;
-            tokens.push(token);
+            host_tokens.push(
+                lane.tokens
+                    .as_ref()
+                    .map(|token| {
+                        let values = token.to_vec()?;
+                        if values.len() != 1 {
+                            return Err(forja_sdk::Error::loading(
+                                "batch decode lanes require one token",
+                            ));
+                        }
+                        Ok(values[0])
+                    })
+                    .transpose()?,
+            );
             positions.push(exact_position(lane.start_pos)?);
             sampling.extend(sampling_words(lane.sampling)?);
             starts.push(lane.start_pos);
         }
-        self.tokens.write(&tokens)?;
+        if host_tokens.iter().any(Option::is_some) {
+            let mut tokens = feedback.to_vec()?;
+            for (lane, token) in host_tokens.into_iter().enumerate() {
+                if let Some(token) = token {
+                    *tokens.get_mut(lane).ok_or_else(|| {
+                        forja_sdk::Error::loading("batch feedback lane is missing")
+                    })? = token;
+                }
+            }
+            let tokens = tokens
+                .get(..lanes.len())
+                .ok_or_else(|| forja_sdk::Error::loading("batch feedback is missing"))?;
+            feedback.narrow(0, 0, self.bucket)?.write(tokens)?;
+        }
         self.positions.write(&positions)?;
         self.sampling.write(&sampling)?;
         Ok(starts)
@@ -1721,8 +1727,9 @@ impl Qwen3Coder {
                 let (params, lanes) = self.batch_graph_positions(&starts)?;
                 let param_refs = params.iter().collect::<Vec<_>>();
                 let graph = forja_sdk::capture(&param_refs, || {
+                    let tokens = self.batch_feedback.narrow(0, 0, state.bucket)?;
                     let logits =
-                        self.forward_batch_positioned(&state.tokens, &state.positions, &lanes)?;
+                        self.forward_batch_positioned(&tokens, &state.positions, &lanes)?;
                     let tokens = self.select_graph_rows(&logits, &state.sampling, &lanes)?;
                     Ok((logits, tokens))
                 })?;
@@ -1750,7 +1757,8 @@ impl Qwen3Coder {
                 let (params, lanes) = self.batch_graph_positions(&starts)?;
                 let param_refs = params.iter().collect::<Vec<_>>();
                 let graph = forja_sdk::capture(&param_refs, || {
-                    self.forward_batch_positioned(&state.tokens, &state.positions, &lanes)
+                    let tokens = self.batch_feedback.narrow(0, 0, state.bucket)?;
+                    self.forward_batch_positioned(&tokens, &state.positions, &lanes)
                 })?;
                 state.forward = Some(graph);
             }

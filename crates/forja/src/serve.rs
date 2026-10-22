@@ -170,11 +170,158 @@ async fn shutdown_signal() -> Result<(), Box<dyn Error>> {
 
 #[cfg(test)]
 mod tests {
-    use std::{env, path::Path, path::PathBuf};
+    use std::{
+        env,
+        io::{Read, Write},
+        net::{SocketAddr, TcpStream},
+        path::Path,
+        path::PathBuf,
+        thread,
+        time::Duration,
+    };
 
     use forja_serve::{FinishReason, GenerationEvent};
 
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires FORJA_MODELS and runs in the pre-push hook"]
+    async fn metal_concurrent_mixed_requests_match_serial() -> Result<(), Box<dyn Error>> {
+        let engine = agent_engine(true, true).await?;
+        let model = engine.model().to_owned();
+        let mut groups = Vec::new();
+        for (temperature, seed) in [(0.0, 0), (0.7, 17)] {
+            for specs in [
+                vec![(" x".to_owned(), 8, 0), (" y".repeat(7), 2, 30)],
+                vec![
+                    (" a".to_owned(), 8, 0),
+                    (" b".repeat(7), 2, 20),
+                    (" c".repeat(33), 3, 35),
+                    (" d".repeat(7), 2, 50),
+                ],
+            ] {
+                groups.push(
+                    specs
+                        .into_iter()
+                        .map(|(prompt, max_tokens, delay_ms)| {
+                            completion_request(&model, &prompt, max_tokens, temperature, seed)
+                                .map(|request| (request, Duration::from_millis(delay_ms)))
+                        })
+                        .collect::<Result<Vec<_>, _>>()?,
+                );
+            }
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let router = forja_serve::serving_router(engine).0;
+        let server = tokio::spawn(async move { axum::serve(listener, router).await });
+        for (temperature, seed) in [(0.0, 0), (0.7, 17)] {
+            let request =
+                completion_request(&model, &" repeated".repeat(33), 16, temperature, seed)?;
+            let reference = {
+                let request = request.clone();
+                tokio::task::spawn_blocking(move || http_completion(address, &request))
+                    .await?
+                    .map_err(|error| error.to_string())?
+            };
+            let clients = (0..4)
+                .map(|_| {
+                    let request = request.clone();
+                    tokio::task::spawn_blocking(move || http_completion(address, &request))
+                })
+                .collect::<Vec<_>>();
+            for client in clients {
+                assert_eq!(client.await?.map_err(|error| error.to_string())?, reference);
+            }
+        }
+        let mut expected = Vec::with_capacity(groups.len());
+        for group in &groups {
+            let mut outputs = Vec::with_capacity(group.len());
+            for (request, _) in group {
+                let request = request.clone();
+                outputs.push(
+                    tokio::task::spawn_blocking(move || http_completion(address, &request))
+                        .await?
+                        .map_err(|error| error.to_string())?,
+                );
+            }
+            expected.push(outputs);
+        }
+        let mut actual = Vec::with_capacity(groups.len());
+        for group in groups {
+            let clients = group
+                .into_iter()
+                .map(|(request, delay)| {
+                    tokio::task::spawn_blocking(move || {
+                        thread::sleep(delay);
+                        http_completion(address, &request)
+                    })
+                })
+                .collect::<Vec<_>>();
+            let mut outputs = Vec::with_capacity(clients.len());
+            for client in clients {
+                outputs.push(client.await?.map_err(|error| error.to_string())?);
+            }
+            actual.push(outputs);
+        }
+        server.abort();
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    fn completion_request(
+        model: &str,
+        prompt: &str,
+        max_tokens: u32,
+        temperature: f32,
+        seed: u64,
+    ) -> Result<forja_serve::CompletionRequest, serde_json::Error> {
+        serde_json::from_value(serde_json::json!({
+            "model": model,
+            "prompt": prompt,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "top_k": 20,
+            "top_p": 0.9,
+            "seed": seed
+        }))
+    }
+
+    #[cfg(target_os = "macos")]
+    fn http_completion(
+        address: SocketAddr,
+        request: &forja_serve::CompletionRequest,
+    ) -> Result<String, Box<dyn Error + Send + Sync>> {
+        let body = serde_json::to_vec(&serde_json::json!({
+            "model": request.model,
+            "prompt": request.prompt,
+            "max_tokens": request.params.max_tokens,
+            "temperature": request.params.temperature,
+            "top_k": request.params.top_k,
+            "top_p": request.params.top_p,
+            "seed": request.params.seed
+        }))?;
+        let mut stream = TcpStream::connect(address)?;
+        write!(
+            stream,
+            "POST /v1/completions HTTP/1.1\r\nHost: {address}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )?;
+        stream.write_all(&body)?;
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response)?;
+        let split = response
+            .windows(4)
+            .position(|bytes| bytes == b"\r\n\r\n")
+            .ok_or("HTTP response has no body")?;
+        let value: serde_json::Value = serde_json::from_slice(&response[split + 4..])?;
+        value["choices"][0]["text"]
+            .as_str()
+            .map(str::to_owned)
+            .ok_or_else(|| format!("completion response has no text: {value}").into())
+    }
 
     #[cfg(target_os = "macos")]
     #[test]
