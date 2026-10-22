@@ -43,6 +43,14 @@ concurrency = [1]
 sampling = "qwen-defaults"
 
 [[case]]
+name = "seeded-exactness"
+route = "chat"
+prompt_tokens = [33]
+output_tokens = 128
+concurrency = [1, 4]
+sampling = "seeded"
+
+[[case]]
 name = "streaming"
 route = "chat"
 prompt_tokens = [33]

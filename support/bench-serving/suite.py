@@ -58,7 +58,7 @@ def load(path: Path) -> tuple[dict[str, object], list[dict[str, object]], str]:
         names.add(case["name"])
         if case["route"] not in {"chat", "completions"}:
             raise ValueError("case route is unsupported")
-        if case["sampling"] not in {"greedy", "qwen-defaults"}:
+        if case["sampling"] not in {"greedy", "qwen-defaults", "seeded"}:
             raise ValueError("case sampling is unsupported")
         positive(case, "output_tokens")
         for key in ("prompt_tokens", "concurrency"):

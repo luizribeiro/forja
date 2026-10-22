@@ -1,6 +1,7 @@
 """Dependency-free OpenAI serving benchmark transport."""
 
 import http.client
+import hashlib
 import json
 import threading
 import time
@@ -71,6 +72,7 @@ class OpenAIClient:
             payload = json.loads(response.read())
             ended = time.perf_counter()
             usage = payload.get("usage", {})
+            output = response_output(payload)
             return sample(
                 started,
                 ended,
@@ -80,6 +82,7 @@ class OpenAIClient:
                 usage.get("completion_tokens", 0),
                 usage.get("prompt_tokens_details", {}).get("cached_tokens", 0),
                 False,
+                output,
             )
         except (OSError, ValueError, json.JSONDecodeError, http.client.HTTPException) as error:
             self.local.connection = None
@@ -93,6 +96,7 @@ class OpenAIClient:
     ) -> dict[str, object]:
         """Read SSE while measuring first-byte and inter-event latency."""
         arrivals = []
+        output = []
         usage = {}
         cancelled = False
         limit = case.get("cancel_after_tokens", 0)
@@ -108,6 +112,7 @@ class OpenAIClient:
             choices = payload.get("choices", [])
             if choices and has_content(choices[0]):
                 arrivals.append(time.perf_counter())
+                output.append(response_output(payload))
                 if limit and len(arrivals) >= limit:
                     response.close()
                     self.local.connection = None
@@ -128,6 +133,7 @@ class OpenAIClient:
             usage.get("completion_tokens", len(arrivals)),
             usage.get("prompt_tokens_details", {}).get("cached_tokens", 0),
             cancelled,
+            "".join(output),
         )
 
 
@@ -141,6 +147,8 @@ def request_body(case: dict[str, object], model: str) -> dict[str, object]:
         body["prompt"] = text
     if case["sampling"] == "greedy":
         body.update({"temperature": 0.0, "top_k": 0, "top_p": 1.0, "seed": 0})
+    elif case["sampling"] == "seeded":
+        body.update({"temperature": 0.7, "top_k": 20, "top_p": 0.8, "seed": 17})
     if case.get("stream"):
         body["stream_options"] = {"include_usage": True}
     if case.get("tools"):
@@ -189,6 +197,13 @@ def run_case(
         "cached_tokens": sum(value["cached_tokens"] for value in good),
         "errors": [value["error"] for value in samples if value["error"] is not None],
         "cancellations": sum(value["cancelled"] for value in samples),
+        "output_sha256": sorted(
+            {
+                hashlib.sha256(value["output"].encode()).hexdigest()
+                for value in good
+                if not value["cancelled"]
+            }
+        ),
     }
 
 
@@ -197,12 +212,27 @@ def has_content(choice: dict[str, object]) -> bool:
     return bool(choice.get("text") or choice.get("delta", {}).get("content") or choice.get("delta", {}).get("tool_calls"))
 
 
-def sample(started, first, ended, itl, prompt_tokens, output_tokens, cached_tokens, cancelled):
+def response_output(payload: dict[str, object]) -> str:
+    """Return a stable representation of generated response content."""
+    choices = payload.get("choices", [])
+    if not choices:
+        return ""
+    choice = choices[0]
+    message = choice.get("message", {})
+    delta = choice.get("delta", {})
+    value = choice.get("text") or message.get("content") or delta.get("content")
+    if value is not None:
+        return value
+    tools = message.get("tool_calls") or delta.get("tool_calls") or []
+    return json.dumps(tools, sort_keys=True, separators=(",", ":"))
+
+
+def sample(started, first, ended, itl, prompt_tokens, output_tokens, cached_tokens, cancelled, output):
     """Construct one bounded timing sample."""
-    return {"ttft_seconds": first - started, "itl_seconds": itl, "e2e_seconds": ended - started, "prompt_tokens": prompt_tokens, "output_tokens": output_tokens, "cached_tokens": cached_tokens, "cancelled": cancelled, "error": None}
+    return {"ttft_seconds": first - started, "itl_seconds": itl, "e2e_seconds": ended - started, "prompt_tokens": prompt_tokens, "output_tokens": output_tokens, "cached_tokens": cached_tokens, "cancelled": cancelled, "output": output, "error": None}
 
 
 def failed(started: float, error: str) -> dict[str, object]:
     """Construct a failed sample without response content."""
     ended = time.perf_counter()
-    return {"ttft_seconds": ended - started, "itl_seconds": [], "e2e_seconds": ended - started, "prompt_tokens": 0, "output_tokens": 0, "cached_tokens": 0, "cancelled": False, "error": error}
+    return {"ttft_seconds": ended - started, "itl_seconds": [], "e2e_seconds": ended - started, "prompt_tokens": 0, "output_tokens": 0, "cached_tokens": 0, "cancelled": False, "output": "", "error": error}

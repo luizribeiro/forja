@@ -96,6 +96,7 @@ def test_http_client_reuses_openai_transport_and_measures_sse() -> None:
         assert result["requests"] == 4
         assert not result["errors"]
         assert result["cached_tokens"] == 12
+        assert len(result["output_sha256"]) == 1
         streamed = client.request({**case, "stream": True})
         assert streamed["output_tokens"] == 2
         assert len(streamed["itl_seconds"]) == 1
