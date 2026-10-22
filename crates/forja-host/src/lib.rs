@@ -3973,26 +3973,40 @@ impl<B: Backend + 'static> Host<B> {
             .as_ref()
             .cloned()
             .ok_or_else(|| invalid_handle("paged sequence is not active"))?;
-        let table = {
+        let (table, upload) = {
             let mut sequence = sequence
                 .lock()
                 .map_err(|_| guest_error(BackendError::ExecutionFailed))?;
+            let current = binding
+                .banks
+                .slot(0, lane)
+                .map_err(|error| compute::Error::Quota(error.to_string()))?;
             sequence
                 .rollback(checkpoint)
                 .map_err(|error| compute::Error::Quota(error.to_string()))?;
-            binding
-                .banks
-                .bind(0, lane, &sequence)
-                .map_err(|error| compute::Error::Quota(error.to_string()))?;
-            binding
-                .banks
-                .slot(0, lane)
-                .map_err(|error| compute::Error::Quota(error.to_string()))?
+            let table = sequence
                 .table()
-                .clone()
+                .map_err(|error| compute::Error::Quota(error.to_string()))?
+                .pad_with_poison(current.table().entries().len())
+                .map_err(|error| compute::Error::Layout(error.to_string()))?;
+            let upload = current.table() != &table;
+            if upload {
+                binding
+                    .banks
+                    .bind(0, lane, &sequence)
+                    .map_err(|error| compute::Error::Quota(error.to_string()))?;
+            } else {
+                binding
+                    .banks
+                    .open_append(0, lane, sequence.logical_len(), sequence.logical_len())
+                    .map_err(|error| compute::Error::Quota(error.to_string()))?;
+            }
+            (table, upload)
         };
-        lane_binding.table_dirty.store(true, Ordering::Release);
-        self.upload_paged_table(table_rep, generation_rep, &table)?;
+        lane_binding.table_dirty.store(upload, Ordering::Release);
+        if upload {
+            self.upload_paged_table(table_rep, generation_rep, &table)?;
+        }
         lane_binding.table_dirty.store(false, Ordering::Release);
         Ok(())
     }
@@ -9297,20 +9311,24 @@ mod tests {
             .unwrap()
             .0
             .unwrap();
+        let slot = host.table.get(&pool).unwrap().slot.unwrap();
+        let binding = Arc::clone(
+            &host
+                .table
+                .get(&Resource::<BatchSlotEntry>::new_borrow(slot))
+                .unwrap()
+                .binding,
+        );
+        binding.banks.mark_submitted(0, 1).unwrap();
 
         host.rollback_paged_append(pool.rep(), checkpoint).unwrap();
 
-        let slot = host.table.get(&pool).unwrap().slot.unwrap();
-        let binding = &host
-            .table
-            .get(&Resource::<BatchSlotEntry>::new_borrow(slot))
-            .unwrap()
-            .binding;
         let active = binding.lane(0).unwrap().sequence.lock().unwrap();
         let sequence = active.as_ref().unwrap().lock().unwrap();
         assert_eq!(sequence.logical_len(), 0);
         assert_eq!(sequence.reserved_tokens(), 8);
         assert_eq!(sequence.page_reference_counts().unwrap(), [1, 1]);
+        assert_eq!(binding.banks.append_window(0, 0), Ok(0..0));
         assert_eq!(
             host.table.get(&pool).unwrap().pool.memory_usage().unwrap(),
             before_memory
