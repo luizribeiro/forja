@@ -934,7 +934,12 @@ where
         sender: Option<&mpsc::Sender<GenerationEvent>>,
         control: &GenerationControl,
     ) -> Result<Completion, GenerationError> {
+        let constrained_request = prefill.constraint.is_some();
+        let parser_started = Instant::now();
         let start = self.start_decode(prefill, sender, control).await;
+        if constrained_request {
+            observe(&mut self.metrics.parser_mask_time, parser_started.elapsed());
+        }
         let DecodeStart {
             params,
             prompt_tokens,
@@ -1014,6 +1019,7 @@ where
                     GenerationError::new(format!("cannot decode token: {error}"))
                 })?;
                 if constrained {
+                    let parser_started = Instant::now();
                     if process_constraint_step(
                         &mut self.runner,
                         &mut pipeline,
@@ -1029,17 +1035,24 @@ where
                     )
                     .await?
                     {
+                        observe(&mut self.metrics.parser_mask_time, parser_started.elapsed());
                         return Ok(FinishReason::ToolCalls);
                     }
+                    observe(&mut self.metrics.parser_mask_time, parser_started.elapsed());
                     continue;
                 }
+                let sse_started = sender.map(|_| Instant::now());
                 let action = boundary
                     .process(token, piece, &mut text, sender, control)
                     .await?;
+                if let Some(started) = sse_started {
+                    observe(&mut self.metrics.sse_time, started.elapsed());
+                }
                 if matches!(action, BoundaryAction::Stop) {
                     return Ok(FinishReason::Stop);
                 }
                 if matches!(action, BoundaryAction::Activate) && consumed < params.max_tokens {
+                    let parser_started = Instant::now();
                     let (session, mask) = activate_tool_boundary(
                         &mut pipeline,
                         &mut self.runner,
@@ -1051,6 +1064,7 @@ where
                         control,
                     )
                     .await?;
+                    observe(&mut self.metrics.parser_mask_time, parser_started.elapsed());
                     guidance = Some(session);
                     allow = Some(mask);
                     constrained = true;

@@ -114,6 +114,7 @@ impl BatchLane {
             return Ok(Some(FinishReason::Stop));
         }
         let piece = self.decoder.step(token).await?;
+        let sse_started = self.sink.events().map(|_| std::time::Instant::now());
         let action = self
             .boundary
             .process(
@@ -124,6 +125,9 @@ impl BatchLane {
                 &self.control,
             )
             .await?;
+        if let Some(started) = sse_started {
+            observe(&mut metrics.sse_time, started.elapsed());
+        }
         if matches!(action, BoundaryAction::Stop) {
             return Ok(Some(FinishReason::Stop));
         }
