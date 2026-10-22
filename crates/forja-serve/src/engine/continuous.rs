@@ -6,11 +6,90 @@ use std::{
 use forja_core::Backend;
 use tokio::sync::{mpsc, oneshot};
 
-use super::ServingEngine;
-use crate::{
-    ChatCompletionRequest, Completion, CompletionRequest, GenerationControl, GenerationError,
-    GenerationEvent, ServingMetrics, http::ServiceCommand, metrics::observe,
+use super::{
+    ConstraintPlan, ServingEngine, prepare_chat_prompt, prepare_completion_prompt, send_terminal,
 };
+use crate::{
+    ChatCompletionRequest, Completion, CompletionParams, CompletionRequest, GenerationControl,
+    GenerationError, GenerationEvent, ResolvedParams, ServingMetrics, http::ServiceCommand,
+    metrics::observe,
+};
+
+enum CompletionSink {
+    Complete(oneshot::Sender<Result<Completion, GenerationError>>),
+    Stream {
+        events: mpsc::Sender<GenerationEvent>,
+        reply: oneshot::Sender<Result<(), GenerationError>>,
+    },
+}
+
+impl CompletionSink {
+    async fn finish(
+        self,
+        params: &CompletionParams,
+        completion: Completion,
+        control: &GenerationControl,
+    ) {
+        match self {
+            Self::Complete(reply) => drop(reply.send(Ok(completion))),
+            Self::Stream { events, reply } => {
+                drop(reply.send(send_terminal(&events, params, completion, control).await));
+            }
+        }
+    }
+
+    fn fail(self, error: GenerationError) {
+        match self {
+            Self::Complete(reply) => drop(reply.send(Err(error))),
+            Self::Stream { reply, .. } => drop(reply.send(Err(error))),
+        }
+    }
+
+    fn events(&self) -> Option<&mpsc::Sender<GenerationEvent>> {
+        match self {
+            Self::Complete(_) => None,
+            Self::Stream { events, .. } => Some(events),
+        }
+    }
+}
+
+struct PreparedRequest {
+    tokens: Vec<u32>,
+    prompt_tokens: u32,
+    params: ResolvedParams,
+    request_params: CompletionParams,
+    constraint: Option<ConstraintPlan>,
+    control: GenerationControl,
+    sink: CompletionSink,
+}
+
+impl PreparedRequest {
+    async fn run_single<B>(self, engine: &mut ServingEngine<B>)
+    where
+        B: Backend + Send + Sync + 'static,
+    {
+        let Self {
+            tokens,
+            prompt_tokens,
+            params,
+            request_params,
+            constraint,
+            control,
+            sink,
+        } = self;
+        let result = match engine
+            .prefill(tokens, prompt_tokens, params, constraint, &control)
+            .await
+        {
+            Ok(prefill) => engine.decode(prefill, sink.events(), &control).await,
+            Err(error) => Err(error),
+        };
+        match result {
+            Ok(completion) => sink.finish(&request_params, completion, &control).await,
+            Err(error) => sink.fail(error),
+        }
+    }
+}
 
 enum RequestEnvelope {
     Chat {
@@ -104,53 +183,121 @@ impl RequestEnvelope {
         }
     }
 
-    async fn run_serial<B>(self, engine: &mut ServingEngine<B>)
+    async fn prepare<B>(self, engine: &mut ServingEngine<B>) -> Option<PreparedRequest>
     where
         B: Backend + Send + Sync + 'static,
     {
-        match self {
+        let (prepared, request_params, control, sink) = match self {
             Self::Chat {
                 request,
                 control,
                 reply,
-                ..
+                queued: _,
             } => {
-                drop(reply.send(engine.complete_chat_controlled(&request, &control).await));
+                let params = request.params.clone();
+                let prepared = prepare_chat(engine, &request, &control).await;
+                (prepared, params, control, CompletionSink::Complete(reply))
             }
             Self::Text {
                 request,
                 control,
                 reply,
-                ..
+                queued: _,
             } => {
-                drop(reply.send(engine.complete_text_controlled(&request, &control).await));
+                let params = request.params.clone();
+                let prepared = prepare_text(engine, &request, &control).await;
+                (prepared, params, control, CompletionSink::Complete(reply))
             }
             Self::StreamChat {
                 request,
                 events,
                 control,
                 reply,
-                ..
+                queued: _,
             } => {
-                let result = engine
-                    .stream_chat_controlled(&request, &events, &control)
-                    .await;
-                drop(reply.send(result));
+                let params = request.params.clone();
+                let prepared = prepare_chat(engine, &request, &control).await;
+                (
+                    prepared,
+                    params,
+                    control,
+                    CompletionSink::Stream { events, reply },
+                )
             }
             Self::StreamText {
                 request,
                 events,
                 control,
                 reply,
-                ..
+                queued: _,
             } => {
-                let result = engine
-                    .stream_text_controlled(&request, &events, &control)
-                    .await;
-                drop(reply.send(result));
+                let params = request.params.clone();
+                let prepared = prepare_text(engine, &request, &control).await;
+                (
+                    prepared,
+                    params,
+                    control,
+                    CompletionSink::Stream { events, reply },
+                )
+            }
+        };
+        match prepared {
+            Ok((tokens, prompt_tokens, params, constraint)) => Some(PreparedRequest {
+                tokens,
+                prompt_tokens,
+                params,
+                request_params,
+                constraint,
+                control,
+                sink,
+            }),
+            Err(error) => {
+                sink.fail(error);
+                None
             }
         }
     }
+}
+
+async fn prepare_chat<B>(
+    engine: &mut ServingEngine<B>,
+    request: &ChatCompletionRequest,
+    control: &GenerationControl,
+) -> Result<(Vec<u32>, u32, ResolvedParams, Option<ConstraintPlan>), GenerationError>
+where
+    B: Backend + Send + Sync + 'static,
+{
+    prepare_chat_prompt(
+        request,
+        &engine.config,
+        &engine.chat_info,
+        engine.max_context,
+        engine.info.vocab,
+        Arc::clone(&engine.prompt),
+        control,
+    )
+    .await
+}
+
+async fn prepare_text<B>(
+    engine: &mut ServingEngine<B>,
+    request: &CompletionRequest,
+    control: &GenerationControl,
+) -> Result<(Vec<u32>, u32, ResolvedParams, Option<ConstraintPlan>), GenerationError>
+where
+    B: Backend + Send + Sync + 'static,
+{
+    prepare_completion_prompt(
+        request,
+        &engine.config,
+        &engine.chat_info,
+        engine.max_context,
+        engine.info.vocab,
+        Arc::clone(&engine.prompt),
+        control,
+    )
+    .await
+    .map(|(tokens, count, resolved)| (tokens, count, resolved, None))
 }
 
 impl<B> ServingEngine<B>
@@ -166,7 +313,9 @@ where
             let envelope = RequestEnvelope::from_command(command);
             let queued = envelope.queued().elapsed();
             let scheduled = Instant::now();
-            envelope.run_serial(&mut self).await;
+            if let Some(prepared) = envelope.prepare(&mut self).await {
+                prepared.run_single(&mut self).await;
+            }
             if let Ok(mut metrics) = shared_metrics.lock() {
                 self.metrics.queue_time = metrics.queue_time;
                 self.metrics.scheduler_time = metrics.scheduler_time;
