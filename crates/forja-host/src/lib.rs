@@ -2199,6 +2199,49 @@ where
             .transpose()
     }
 
+    /// Returns one active serving lane as a shareable prefix capability.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the lane is out of range or has no active sequence.
+    pub fn paged_lane_prefix(&self, lane: u32) -> Result<Option<PagedPrefix>, compute::Error> {
+        self.page_pool
+            .map(|pool| self.store.data().paged_lane_prefix(pool, lane))
+            .transpose()
+    }
+
+    /// Captures one serving lane's paged sequence boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the lane is out of range or has no active sequence.
+    pub fn checkpoint_paged_lane(
+        &self,
+        lane: u32,
+    ) -> Result<Option<SequenceCheckpoint>, compute::Error> {
+        self.page_pool
+            .map(|pool| self.store.data().checkpoint_paged_lane(pool, lane))
+            .transpose()
+    }
+
+    /// Restores one serving lane without changing any sibling lane.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a foreign or stale checkpoint.
+    pub fn rollback_paged_lane(
+        &mut self,
+        lane: u32,
+        checkpoint: SequenceCheckpoint,
+    ) -> Result<(), compute::Error> {
+        let pool = self
+            .page_pool
+            .ok_or_else(|| invalid_handle("paged storage is unavailable"))?;
+        self.store
+            .data_mut()
+            .rollback_paged_lane_append(pool, lane, checkpoint)
+    }
+
     async fn rewind_decode_inner(
         &mut self,
         next_pos: u32,
@@ -4045,6 +4088,10 @@ impl<B: Backend + 'static> Host<B> {
     }
 
     fn paged_prefix(&self, pool_rep: u32) -> Result<PagedPrefix, compute::Error> {
+        self.paged_lane_prefix(pool_rep, 0)
+    }
+
+    fn paged_lane_prefix(&self, pool_rep: u32, lane: u32) -> Result<PagedPrefix, compute::Error> {
         let slot_rep = self
             .table
             .get(&Resource::<PagePoolEntry>::new_borrow(pool_rep))
@@ -4057,7 +4104,10 @@ impl<B: Backend + 'static> Host<B> {
             .map_err(invalid_handle)?
             .binding;
         let sequence = binding
-            .lane(0)?
+            .lane(
+                usize::try_from(lane)
+                    .map_err(|_| compute::Error::Layout("paged lane exceeds usize".to_owned()))?,
+            )?
             .sequence
             .lock()
             .map_err(|_| guest_error(BackendError::ExecutionFailed))?
@@ -4065,6 +4115,21 @@ impl<B: Backend + 'static> Host<B> {
             .cloned()
             .ok_or_else(|| invalid_handle("paged sequence is not active"))?;
         Ok(PagedPrefix { sequence })
+    }
+
+    fn checkpoint_paged_lane(
+        &self,
+        pool_rep: u32,
+        lane: u32,
+    ) -> Result<SequenceCheckpoint, compute::Error> {
+        let prefix = self.paged_lane_prefix(pool_rep, lane)?;
+        let checkpoint = prefix
+            .sequence
+            .lock()
+            .map_err(|_| guest_error(BackendError::ExecutionFailed))?
+            .checkpoint()
+            .map_err(|error| compute::Error::Quota(error.to_string()))?;
+        Ok(checkpoint)
     }
 
     fn bind_paged_request(

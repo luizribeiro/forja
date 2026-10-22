@@ -187,6 +187,20 @@ async fn prepares_independent_paged_lanes() -> wasmtime::Result<()> {
 }
 
 #[tokio::test]
+async fn rolls_back_only_the_selected_paged_lane() -> wasmtime::Result<()> {
+    let (_weights, mut runner) = paged_smoke_runner("lane-rollback").await?;
+    assert!(runner.prepare_paged_lane(0, None, 8)?);
+    let checkpoint = runner.checkpoint_paged_lane(0)?.unwrap();
+    assert!(runner.prepare_paged_lane(1, None, 4)?);
+
+    runner.rollback_paged_lane(0, checkpoint)?;
+
+    assert_eq!(runner.paged_lane_prefix(0)?.unwrap().reserved_tokens()?, 8);
+    assert_eq!(runner.paged_lane_prefix(1)?.unwrap().reserved_tokens()?, 4);
+    Ok(())
+}
+
+#[tokio::test]
 async fn passes_engine_selections_through_load_config() -> wasmtime::Result<()> {
     let weights = weight_file("load-config")?;
     let mut runner = EngineRunner::new(
