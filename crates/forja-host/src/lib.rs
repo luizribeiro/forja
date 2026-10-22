@@ -3030,7 +3030,7 @@ struct PagedBinding {
 struct PagedLaneBinding {
     sequence: Mutex<Option<Arc<Mutex<PagedSequence>>>>,
     used: AtomicBool,
-    table_dirty: AtomicBool,
+    table_dirty: [AtomicBool; 2],
 }
 
 impl PagedBinding {
@@ -3503,7 +3503,7 @@ impl<B: Backend + 'static> Host<B> {
                 .map(|_| PagedLaneBinding {
                     sequence: Mutex::new(None),
                     used: AtomicBool::new(false),
-                    table_dirty: AtomicBool::new(false),
+                    table_dirty: [AtomicBool::new(false), AtomicBool::new(false)],
                 })
                 .collect(),
         });
@@ -3714,19 +3714,21 @@ impl<B: Backend + 'static> Host<B> {
             };
             (entry.pool.clone(), entry.max_context, slot)
         };
-        let (binding, table_rep, generation_rep) = {
+        let (binding, table_rep, generation_rep, bank) = {
             let slot = self
                 .table
                 .get(&Resource::<BatchSlotEntry>::new_borrow(slot_rep))
                 .map_err(invalid_handle)?;
+            let bank = slot.active_bank;
             (
                 Arc::clone(&slot.binding),
                 *slot
                     .tables
-                    .first()
+                    .get(bank)
                     .and_then(|bank| bank.get(lane))
                     .ok_or_else(|| invalid_handle("paged lane is missing"))?,
                 slot.generations,
+                bank,
             )
         };
         let lane_binding = binding.lane(lane)?;
@@ -3741,7 +3743,9 @@ impl<B: Backend + 'static> Host<B> {
                     pool.reserve(u64::from(max_context))
                         .map_err(|error| compute::Error::Quota(error.to_string()))?,
                 )));
-                lane_binding.table_dirty.store(true, Ordering::Release);
+                for dirty in &lane_binding.table_dirty {
+                    dirty.store(true, Ordering::Release);
+                }
             }
             Arc::clone(
                 active
@@ -3773,32 +3777,32 @@ impl<B: Backend + 'static> Host<B> {
                 .commit_write(u64::from(tokens))
                 .map_err(|error| compute::Error::Quota(error.to_string()))?;
             if copy.is_some() {
-                lane_binding.table_dirty.store(true, Ordering::Release);
+                lane_binding.table_dirty[bank].store(true, Ordering::Release);
             }
-            if lane_binding.table_dirty.load(Ordering::Acquire) {
+            if lane_binding.table_dirty[bank].load(Ordering::Acquire) {
                 binding
                     .banks
-                    .bind(0, lane, &sequence)
+                    .bind(bank, lane, &sequence)
                     .map_err(|error| compute::Error::Quota(error.to_string()))?;
             }
             binding
                 .banks
-                .open_append(0, lane, u64::from(start), sequence.logical_len())
+                .open_append(bank, lane, u64::from(start), sequence.logical_len())
                 .map_err(|error| compute::Error::Quota(error.to_string()))?;
             let table = binding
                 .banks
-                .slot(0, lane)
+                .slot(bank, lane)
                 .map_err(|error| compute::Error::Quota(error.to_string()))?
                 .table()
                 .clone();
-            let upload = lane_binding.table_dirty.swap(false, Ordering::AcqRel);
+            let upload = lane_binding.table_dirty[bank].swap(false, Ordering::AcqRel);
             (checkpoint, table, copy, upload)
         };
         let prepared = (|| {
             if upload {
                 self.upload_paged_table(table_rep, generation_rep, &table)?;
             }
-            copy.map(|copy| self.prepare_cow_copy(slot_rep, Arc::clone(&binding), lane, copy))
+            copy.map(|copy| self.prepare_cow_copy(slot_rep, Arc::clone(&binding), bank, lane, copy))
                 .transpose()
         })();
         match prepared {
@@ -3854,7 +3858,7 @@ impl<B: Backend + 'static> Host<B> {
             .map_err(invalid_handle)?
             .slot
             .ok_or_else(|| invalid_handle("paged slot is not open"))?;
-        let (binding, tables, metadata) = {
+        let (binding, tables, metadata, bank) = {
             let slot = self
                 .table
                 .get(&Resource::<BatchSlotEntry>::new_borrow(slot_rep))
@@ -3864,6 +3868,7 @@ impl<B: Backend + 'static> Host<B> {
                 Arc::clone(&slot.binding),
                 slot.tables[bank].clone(),
                 slot.metadata[bank],
+                bank,
             )
         };
         if lanes.len() > binding.lanes.len() {
@@ -3901,19 +3906,16 @@ impl<B: Backend + 'static> Host<B> {
             } else {
                 binding
                     .banks
-                    .poison(0, lane)
+                    .poison(bank, lane)
                     .map_err(|error| compute::Error::Layout(error.to_string()))?;
                 let table = binding
                     .banks
-                    .slot(0, lane)
+                    .slot(bank, lane)
                     .map_err(|error| compute::Error::Layout(error.to_string()))?
                     .table()
                     .clone();
                 self.upload_paged_table_entries(tables[lane], &table)?;
-                binding
-                    .lane(lane)?
-                    .table_dirty
-                    .store(true, Ordering::Release);
+                binding.lane(lane)?.table_dirty[bank].store(true, Ordering::Release);
             }
         }
         for (handle, values) in
@@ -3934,6 +3936,7 @@ impl<B: Backend + 'static> Host<B> {
         &self,
         slot_rep: u32,
         binding: Arc<PagedBinding>,
+        bank: usize,
         lane: usize,
         copy: forja_core::CowPageCopy,
     ) -> Result<SubmitRequest<B>, compute::Error> {
@@ -3978,7 +3981,7 @@ impl<B: Backend + 'static> Host<B> {
             retained: Vec::new(),
             paged: vec![PagedUse {
                 binding,
-                bank: 0,
+                bank,
                 lane,
             }],
             flight: None,
@@ -4053,21 +4056,13 @@ impl<B: Backend + 'static> Host<B> {
             .ok_or_else(|| invalid_handle("paged slot is not open"))?;
         let lane = usize::try_from(lane)
             .map_err(|_| compute::Error::Layout("paged lane exceeds usize".to_owned()))?;
-        let (binding, table_rep, generation_rep) = {
-            let slot = self
+        let binding = Arc::clone(
+            &self
                 .table
                 .get(&Resource::<BatchSlotEntry>::new_borrow(slot_rep))
-                .map_err(invalid_handle)?;
-            (
-                Arc::clone(&slot.binding),
-                *slot
-                    .tables
-                    .first()
-                    .and_then(|bank| bank.get(lane))
-                    .ok_or_else(|| invalid_handle("paged lane is missing"))?,
-                slot.generations,
-            )
-        };
+                .map_err(invalid_handle)?
+                .binding,
+        );
         let lane_binding = binding.lane(lane)?;
         let sequence = lane_binding
             .sequence
@@ -4076,41 +4071,14 @@ impl<B: Backend + 'static> Host<B> {
             .as_ref()
             .cloned()
             .ok_or_else(|| invalid_handle("paged sequence is not active"))?;
-        let (table, upload) = {
-            let mut sequence = sequence
-                .lock()
-                .map_err(|_| guest_error(BackendError::ExecutionFailed))?;
-            let current = binding
-                .banks
-                .slot(0, lane)
-                .map_err(|error| compute::Error::Quota(error.to_string()))?;
-            sequence
-                .rollback(checkpoint)
-                .map_err(|error| compute::Error::Quota(error.to_string()))?;
-            let table = sequence
-                .table()
-                .map_err(|error| compute::Error::Quota(error.to_string()))?
-                .pad_with_poison(current.table().entries().len())
-                .map_err(|error| compute::Error::Layout(error.to_string()))?;
-            let upload = current.table() != &table;
-            if upload {
-                binding
-                    .banks
-                    .bind(0, lane, &sequence)
-                    .map_err(|error| compute::Error::Quota(error.to_string()))?;
-            } else {
-                binding
-                    .banks
-                    .open_append(0, lane, sequence.logical_len(), sequence.logical_len())
-                    .map_err(|error| compute::Error::Quota(error.to_string()))?;
-            }
-            (table, upload)
-        };
-        lane_binding.table_dirty.store(upload, Ordering::Release);
-        if upload {
-            self.upload_paged_table(table_rep, generation_rep, &table)?;
+        sequence
+            .lock()
+            .map_err(|_| guest_error(BackendError::ExecutionFailed))?
+            .rollback(checkpoint)
+            .map_err(|error| compute::Error::Quota(error.to_string()))?;
+        for dirty in &lane_binding.table_dirty {
+            dirty.store(true, Ordering::Release);
         }
-        lane_binding.table_dirty.store(false, Ordering::Release);
         Ok(())
     }
 
@@ -4226,13 +4194,13 @@ impl<B: Backend + 'static> Host<B> {
                 "paged request exceeds the context ceiling".to_owned(),
             ));
         }
-        let binding = Arc::clone(
-            &self
+        let (binding, bank) = {
+            let slot = self
                 .table
                 .get(&Resource::<BatchSlotEntry>::new_borrow(slot_rep))
-                .map_err(invalid_handle)?
-                .binding,
-        );
+                .map_err(invalid_handle)?;
+            (Arc::clone(&slot.binding), slot.active_bank)
+        };
         let lane = usize::try_from(lane)
             .map_err(|_| compute::Error::Layout("paged lane exceeds usize".to_owned()))?;
         let lane_binding = binding.lane(lane)?;
@@ -4249,7 +4217,7 @@ impl<B: Backend + 'static> Host<B> {
                 .map_err(|_| guest_error(BackendError::ExecutionFailed))?;
             binding
                 .banks
-                .bind(0, lane, &sequence_guard)
+                .bind(bank, lane, &sequence_guard)
                 .map_err(|error| compute::Error::Quota(error.to_string()))?;
         }
         *lane_binding
@@ -4257,7 +4225,9 @@ impl<B: Backend + 'static> Host<B> {
             .lock()
             .map_err(|_| guest_error(BackendError::ExecutionFailed))? = Some(sequence);
         lane_binding.used.store(false, Ordering::Release);
-        lane_binding.table_dirty.store(true, Ordering::Release);
+        for dirty in &lane_binding.table_dirty {
+            dirty.store(true, Ordering::Release);
+        }
         Ok(())
     }
 
@@ -4906,6 +4876,7 @@ impl<B: Backend + 'static> Host<B> {
         plane: u32,
     ) -> Result<(TensorEntry, TensorEntry, TensorEntry, PagedUse), compute::Error> {
         let slot = self.table.get(slot).map_err(invalid_handle)?;
+        let bank = slot.active_bank;
         let lane = usize::try_from(lane)
             .map_err(|_| compute::Error::Layout("paged lane exceeds usize".to_owned()))?;
         let plane = usize::try_from(plane)
@@ -4919,7 +4890,7 @@ impl<B: Backend + 'static> Host<B> {
             .entry(&Resource::new_borrow(
                 *slot
                     .tables
-                    .first()
+                    .get(bank)
                     .and_then(|bank| bank.get(lane))
                     .ok_or_else(|| invalid_handle("paged lane is out of range"))?,
             ))?
@@ -4927,7 +4898,7 @@ impl<B: Backend + 'static> Host<B> {
         let generations = self.entry(&Resource::new_borrow(slot.generations))?.clone();
         slot.binding
             .banks
-            .append_window(0, lane)
+            .append_window(bank, lane)
             .map_err(|_| compute::Error::Layout("paged lane is inactive".to_owned()))?;
         Ok((
             page_tensor,
@@ -4935,7 +4906,7 @@ impl<B: Backend + 'static> Host<B> {
             generations,
             PagedUse {
                 binding: Arc::clone(&slot.binding),
-                bank: 0,
+                bank,
                 lane,
             },
         ))
@@ -9442,7 +9413,7 @@ mod tests {
         assert_eq!(sequence.logical_len(), 0);
         assert_eq!(sequence.reserved_tokens(), 8);
         assert_eq!(sequence.page_reference_counts().unwrap(), [1, 1]);
-        assert_eq!(binding.banks.append_window(0, 0), Ok(0..0));
+        assert_eq!(binding.banks.append_window(0, 0), Ok(0..3));
         assert_eq!(
             host.table.get(&pool).unwrap().pool.memory_usage().unwrap(),
             before_memory
@@ -9450,7 +9421,7 @@ mod tests {
     }
 
     #[test]
-    fn cow_batch_rollback_restores_the_uploaded_lane_table() {
+    fn cow_batch_rollback_marks_both_lane_tables_dirty() {
         let mut host = Host::new(CpuBackend::new(), GENEROUS);
         let pool = insert_test_pool(&mut host, 1, 16);
         host.table.get_mut(&pool).unwrap().active_lanes = 2;
@@ -9466,12 +9437,12 @@ mod tests {
         host.bind_paged_lane(pool.rep(), 1, Some(super::PagedPrefix::new(second)), 4)
             .unwrap();
         let slot_rep = host.table.get(&pool).unwrap().slot.unwrap();
-        let (binding, table_rep) = {
+        let binding = {
             let slot = host
                 .table
                 .get(&Resource::<BatchSlotEntry>::new_borrow(slot_rep))
                 .unwrap();
-            (Arc::clone(&slot.binding), slot.tables[0][0])
+            Arc::clone(&slot.binding)
         };
         let restored = binding
             .lane(0)
@@ -9485,7 +9456,7 @@ mod tests {
             .unwrap()
             .table()
             .unwrap();
-        let restored_entries = restored.pad_with_poison(4).unwrap().entries().to_vec();
+        let restored_entries = restored.entries().to_vec();
         let (checkpoint, copy) = host.begin_paged_lane_append(pool.rep(), 0, 3, 1).unwrap();
         assert!(copy.is_some());
         assert!(host.begin_paged_lane_append(pool.rep(), 1, 1, 1).is_err());
@@ -9493,8 +9464,27 @@ mod tests {
         host.rollback_paged_lane_append(pool.rep(), 0, checkpoint.unwrap())
             .unwrap();
 
-        let restored_table = binding.banks.slot(0, 0).unwrap().table().clone();
+        let restored_table = binding
+            .lane(0)
+            .unwrap()
+            .sequence
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .table()
+            .unwrap();
         assert_eq!(restored_table.entries(), restored_entries);
+        assert!(
+            binding
+                .lane(0)
+                .unwrap()
+                .table_dirty
+                .iter()
+                .all(|dirty| dirty.load(Ordering::Acquire))
+        );
         assert_eq!(
             binding
                 .lane(1)
@@ -9509,17 +9499,6 @@ mod tests {
                 .logical_len(),
             2
         );
-        let uploaded = &host
-            .table
-            .get(&Resource::<TensorEntry>::new_borrow(table_rep))
-            .unwrap()
-            .tensor;
-        let mut expected = Vec::new();
-        for entry in restored_table.entries() {
-            expected.extend_from_slice(&entry.page().to_ne_bytes());
-            expected.extend_from_slice(&entry.generation().to_ne_bytes());
-        }
-        assert_eq!(host.backend.read(uploaded).unwrap(), expected);
     }
 
     #[test]
@@ -9552,12 +9531,18 @@ mod tests {
                 super::PagedLaneBinding {
                     sequence: Mutex::new(Some(Arc::clone(&sequence))),
                     used: std::sync::atomic::AtomicBool::new(false),
-                    table_dirty: std::sync::atomic::AtomicBool::new(false),
+                    table_dirty: [
+                        std::sync::atomic::AtomicBool::new(false),
+                        std::sync::atomic::AtomicBool::new(false),
+                    ],
                 },
                 super::PagedLaneBinding {
                     sequence: Mutex::new(None),
                     used: std::sync::atomic::AtomicBool::new(false),
-                    table_dirty: std::sync::atomic::AtomicBool::new(false),
+                    table_dirty: [
+                        std::sync::atomic::AtomicBool::new(false),
+                        std::sync::atomic::AtomicBool::new(false),
+                    ],
                 },
             ],
         });
@@ -9687,13 +9672,7 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
-        assert!(
-            slot.binding
-                .lane(1)
-                .unwrap()
-                .table_dirty
-                .load(Ordering::Acquire)
-        );
+        assert!(slot.binding.lane(1).unwrap().table_dirty[0].load(Ordering::Acquire));
         let handles = slot.metadata[0];
         let values = handles.map(|handle| {
             let tensor = &host
