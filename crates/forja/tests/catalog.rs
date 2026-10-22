@@ -56,7 +56,7 @@ fn metal_catalog_cli_snapshots() {
 }
 
 #[test]
-fn qwen3_coder_reduction_classes_match_the_metal_registry() {
+fn metal_qwen3_coder_reduction_classes_match_the_registry() {
     let catalog: serde_json::Value = serde_json::from_str(&catalog(&["--json"])).unwrap();
     let variants = catalog["variants"].as_array().unwrap();
     let mut matched = 0;
