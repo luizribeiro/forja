@@ -173,6 +173,37 @@ def metric_report(
     return report
 
 
+def exactness_report(results: list[dict[str, object]]) -> list[dict[str, object]]:
+    """Compare deterministic outputs at concurrency against their serial case."""
+    serial = {}
+    report = []
+    for result in results:
+        case = result["case"]
+        if case["sampling"] not in {"greedy", "seeded"} or case.get("cancel_after_tokens"):
+            continue
+        identity = (
+            case["name"],
+            case["route"],
+            case["prompt_tokens"],
+            case["output_tokens"],
+            case["sampling"],
+            case.get("stream", False),
+        )
+        if case["concurrency"] == 1:
+            serial[identity] = result["output_sha256"]
+        elif identity in serial:
+            report.append(
+                {
+                    "case": case["name"],
+                    "prompt_tokens": case["prompt_tokens"],
+                    "sampling": case["sampling"],
+                    "concurrency": case["concurrency"],
+                    "exact": result["output_sha256"] == serial[identity],
+                }
+            )
+    return report
+
+
 def run(args: argparse.Namespace) -> dict[str, object]:
     """Run every expanded case and assemble one comparable record."""
     settings, cases, suite_hash = suite.load(args.suite)
@@ -236,6 +267,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         "duration_seconds": time.perf_counter() - started,
         "provenance": provenance.collect(args.repository, args.forja_repository, artifacts, args.weights, args.resolved_config, command),
         "results": results,
+        "exactness": exactness_report(results),
     }
 
 

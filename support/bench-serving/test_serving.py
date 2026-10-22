@@ -144,6 +144,24 @@ def test_runner_scrapes_resource_gauges_and_counter_deltas() -> None:
         thread.join()
 
 
+def test_exactness_report_compares_concurrent_output_fingerprints() -> None:
+    base = {
+        "name": "exact",
+        "route": "chat",
+        "prompt_tokens": 33,
+        "output_tokens": 8,
+        "sampling": "seeded",
+    }
+    report = serving_bench.exactness_report(
+        [
+            {"case": {**base, "concurrency": 1}, "output_sha256": ["same"]},
+            {"case": {**base, "concurrency": 4}, "output_sha256": ["same"]},
+            {"case": {**base, "concurrency": 8}, "output_sha256": ["different"]},
+        ]
+    )
+    assert [item["exact"] for item in report] == [True, False]
+
+
 def test_runner_initializes_client_when_first_case_is_cold(monkeypatch, tmp_path) -> None:
     case = {"name": "cold", "route": "completions", "prompt_tokens": 7, "output_tokens": 2, "concurrency": 1, "sampling": "greedy", "cold": True}
     settings = {"model": "model", "revision": "revision", "seed": 0, "connection_policy": "reuse", "warmups": 0, "repetitions": 1}
@@ -184,7 +202,7 @@ def test_runner_initializes_client_when_first_case_is_cold(monkeypatch, tmp_path
         lambda _client, _case, _warmups, _repetitions, setup, begin: (
             setup(),
             begin(),
-            {"case": case},
+            {"case": case, "output_sha256": ["output"]},
         )[2],
     )
     monkeypatch.setattr(serving_bench.provenance, "collect", lambda *_args: {})
