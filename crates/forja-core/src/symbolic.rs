@@ -222,6 +222,16 @@ impl Affine {
         matches!(self.term, None | Some((_, 0)))
     }
 
+    /// Returns the value of an expression that is independent of all parameters.
+    #[must_use]
+    pub const fn constant_value(self) -> Option<u32> {
+        if self.is_constant() {
+            Some(self.offset)
+        } else {
+            None
+        }
+    }
+
     /// Evaluates the expression using checked `u64` arithmetic and narrows to `u32`.
     ///
     /// # Errors
@@ -773,6 +783,13 @@ mod tests {
             Affine::parameter(0, 1, 1).evaluate(&largest),
             Err(ParamError::ArithmeticOverflow)
         );
+    }
+
+    #[test]
+    fn reports_values_only_for_parameter_independent_expressions() {
+        assert_eq!(Affine::constant(4097).constant_value(), Some(4097));
+        assert_eq!(Affine::parameter(0, 33, 0).constant_value(), Some(33));
+        assert_eq!(Affine::parameter(0, 33, 1).constant_value(), None);
     }
 
     #[test]
