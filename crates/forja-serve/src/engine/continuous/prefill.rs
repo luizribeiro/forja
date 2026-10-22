@@ -102,9 +102,25 @@ where
             .tokens
             .get(cached..)
             .ok_or_else(|| GenerationError::new("cached prefix exceeds the prepared prompt"))?;
-        self.runner
-            .prepare_paged_lane(0, hit.map(|hit| hit.sequence), reserved)
-            .map_err(|error| batch_admission_error(&error))?;
+        let prefix = hit.map(|hit| hit.sequence);
+        loop {
+            match self.runner.prepare_paged_lane(0, prefix.clone(), reserved) {
+                Ok(_) => break,
+                Err(error) if prefix.is_none() => {
+                    let evicted = self
+                        .prefix_index
+                        .as_mut()
+                        .map(|index| index.evict_lru(None))
+                        .transpose()
+                        .map_err(|failure| GenerationError::unavailable(failure.to_string()))?
+                        .unwrap_or(false);
+                    if !evicted {
+                        return Err(batch_admission_error(&error));
+                    }
+                }
+                Err(error) => return Err(batch_admission_error(&error)),
+            }
+        }
         let cached = u32::try_from(cached)
             .map_err(|_| GenerationError::new("cached prefix length overflowed"))?;
         let prefill_started = std::time::Instant::now();

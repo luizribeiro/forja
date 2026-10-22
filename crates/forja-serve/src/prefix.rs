@@ -153,7 +153,14 @@ impl PrefixIndex {
     ) -> Result<(), PrefixIndexError> {
         let token_count = u64::try_from(tokens.len())
             .map_err(|_| PrefixIndexError::Pool(PagePoolError::ArithmeticOverflow))?;
-        let pages = sequence.fork_reserved(token_count, token_count)?;
+        let pages = loop {
+            match sequence.fork_reserved(token_count, token_count) {
+                Ok(pages) => break pages,
+                Err(PagePoolError::QuotaExceeded) if self.evict_lru(None)? => {}
+                Err(PagePoolError::QuotaExceeded) => return Ok(()),
+                Err(error) => return Err(error.into()),
+            }
+        };
         let page_count = pages.page_count()?;
         if tokens.len() > self.limits.tokens || page_count > self.limits.referenced_pages {
             return Err(PrefixIndexError::EntryTooLarge);
@@ -240,11 +247,21 @@ impl PrefixIndex {
             .get_mut(&id)
             .ok_or(PrefixIndexError::Pool(PagePoolError::CorruptState))?;
         entry.used = used;
-        let sequence = entry.sequence.fork_reserved(
-            u64::try_from(cached_tokens)
-                .map_err(|_| PrefixIndexError::Pool(PagePoolError::ArithmeticOverflow))?,
-            reserved_tokens,
-        )?;
+        let cached_tokens_u64 = u64::try_from(cached_tokens)
+            .map_err(|_| PrefixIndexError::Pool(PagePoolError::ArithmeticOverflow))?;
+        let sequence = loop {
+            let result = self
+                .entries
+                .get(&id)
+                .ok_or(PrefixIndexError::Pool(PagePoolError::CorruptState))?
+                .sequence
+                .fork_reserved(cached_tokens_u64, reserved_tokens);
+            match result {
+                Ok(sequence) => break sequence,
+                Err(PagePoolError::QuotaExceeded) if self.evict_lru(Some(id))? => {}
+                Err(error) => return Err(error.into()),
+            }
+        };
         Ok(Some(PrefixHit {
             sequence,
             cached_tokens,
@@ -278,6 +295,19 @@ impl PrefixIndex {
             };
             self.remove(id)?;
         }
+    }
+
+    pub(crate) fn evict_lru(&mut self, excluded: Option<u64>) -> Result<bool, PrefixIndexError> {
+        let Some((&id, _)) = self
+            .entries
+            .iter()
+            .filter(|(id, _)| Some(**id) != excluded)
+            .min_by_key(|(_, entry)| entry.used)
+        else {
+            return Ok(false);
+        };
+        self.remove(id)?;
+        Ok(true)
     }
 
     fn remove(&mut self, id: u64) -> Result<(), PrefixIndexError> {
