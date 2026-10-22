@@ -3017,9 +3017,8 @@ pub struct BatchSlotEntry {
     planes: Vec<u32>,
     tables: [Vec<u32>; 2],
     generations: u32,
-    logical_lengths: u32,
-    query_starts: u32,
-    absolute_positions: u32,
+    metadata: [[u32; 3]; 2],
+    active_bank: usize,
 }
 
 struct PagedBinding {
@@ -3072,7 +3071,7 @@ struct PagedBackingHandles {
     planes: Vec<u32>,
     tables: [Vec<u32>; 2],
     generations: u32,
-    metadata: [u32; 3],
+    metadata: [[u32; 3]; 2],
 }
 
 impl TensorEntry {
@@ -3511,15 +3510,14 @@ impl<B: Backend + 'static> Host<B> {
         let mut cleanup = backing.planes.clone();
         cleanup.extend(backing.tables.iter().flatten().copied());
         cleanup.push(backing.generations);
-        cleanup.extend(backing.metadata);
+        cleanup.extend(backing.metadata.into_iter().flatten());
         let slot = match self.table.push(BatchSlotEntry {
             binding,
             planes: backing.planes,
             tables: backing.tables,
             generations: backing.generations,
-            logical_lengths: backing.metadata[0],
-            query_starts: backing.metadata[1],
-            absolute_positions: backing.metadata[2],
+            metadata: backing.metadata,
+            active_bank: 0,
         }) {
             Ok(slot) => slot,
             Err(error) => {
@@ -3585,17 +3583,17 @@ impl<B: Backend + 'static> Host<B> {
                 }
             }
         }
-        let mut metadata = Vec::with_capacity(3);
-        for _ in 0..3 {
-            match self.alloc_paged_tensor(compute::Dtype::U32, &[lane_count]) {
-                Ok(tensor) => {
-                    metadata.push(tensor);
-                    backing.push(tensor);
-                }
-                Err(error) => {
-                    self.drop_paged_handles(backing);
-                    return Err(error);
-                }
+        let mut metadata = [[0; 3]; 2];
+        for bank in &mut metadata {
+            for tensor in bank {
+                *tensor = match self.alloc_paged_tensor(compute::Dtype::U32, &[lane_count]) {
+                    Ok(tensor) => tensor,
+                    Err(error) => {
+                        self.drop_paged_handles(backing);
+                        return Err(error);
+                    }
+                };
+                backing.push(*tensor);
             }
         }
         let generation_bytes = usize::try_from(physical_pages)
@@ -3621,7 +3619,7 @@ impl<B: Backend + 'static> Host<B> {
             compute::Error::Layout("paged metadata byte size overflowed".to_owned())
         })?;
         let metadata_bytes = vec![0; metadata_len];
-        for &tensor in &metadata {
+        for &tensor in metadata.iter().flatten() {
             if let Err(error) = self.write(&Resource::new_borrow(tensor), &metadata_bytes) {
                 self.drop_paged_handles(backing);
                 return Err(error);
@@ -3631,7 +3629,7 @@ impl<B: Backend + 'static> Host<B> {
             planes: plane_handles,
             tables: table_handles,
             generations,
-            metadata: [metadata[0], metadata[1], metadata[2]],
+            metadata,
         })
     }
 
@@ -3861,14 +3859,11 @@ impl<B: Backend + 'static> Host<B> {
                 .table
                 .get(&Resource::<BatchSlotEntry>::new_borrow(slot_rep))
                 .map_err(invalid_handle)?;
+            let bank = slot.active_bank;
             (
                 Arc::clone(&slot.binding),
-                slot.tables[0].clone(),
-                [
-                    slot.logical_lengths,
-                    slot.query_starts,
-                    slot.absolute_positions,
-                ],
+                slot.tables[bank].clone(),
+                slot.metadata[bank],
             )
         };
         if lanes.len() > binding.lanes.len() {
@@ -7508,15 +7503,12 @@ where
         let result = (|| {
             let (lanes, handles) = {
                 let slot = self.table.get(&resource).map_err(invalid_handle)?;
+                let bank = slot.active_bank;
                 (
                     u32::try_from(slot.binding.lanes.len()).map_err(|_| {
                         compute::Error::Layout("paged lane count exceeds u32".to_owned())
                     })?,
-                    [
-                        slot.logical_lengths,
-                        slot.query_starts,
-                        slot.absolute_positions,
-                    ],
+                    slot.metadata[bank],
                 )
             };
             let mut aliases = Vec::with_capacity(handles.len());
@@ -7565,11 +7557,7 @@ where
                 let mut resources = entry.planes;
                 resources.extend(entry.tables.into_iter().flatten());
                 resources.push(entry.generations);
-                resources.extend([
-                    entry.logical_lengths,
-                    entry.query_starts,
-                    entry.absolute_positions,
-                ]);
+                resources.extend(entry.metadata.into_iter().flatten());
                 self.drop_paged_handles(resources);
             });
         std::future::ready(result.map_err(wasmtime::Error::msg))
@@ -8522,11 +8510,7 @@ mod tests {
         let slot = host.open_paged_slot(&pool, 1).unwrap();
         let slot = host.table.get(&slot).unwrap();
 
-        for handle in [
-            slot.logical_lengths,
-            slot.query_starts,
-            slot.absolute_positions,
-        ] {
+        for handle in slot.metadata.into_iter().flatten() {
             let tensor = host
                 .table
                 .get(&Resource::<TensorEntry>::new_borrow(handle))
@@ -9710,11 +9694,7 @@ mod tests {
                 .table_dirty
                 .load(Ordering::Acquire)
         );
-        let handles = [
-            slot.logical_lengths,
-            slot.query_starts,
-            slot.absolute_positions,
-        ];
+        let handles = slot.metadata[0];
         let values = handles.map(|handle| {
             let tensor = &host
                 .table
