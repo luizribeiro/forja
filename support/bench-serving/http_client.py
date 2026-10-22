@@ -175,7 +175,8 @@ def run_case(
         return client.request(case)
 
     for _ in range(warmups):
-        request(0)
+        with ThreadPoolExecutor(max_workers=case["concurrency"]) as executor:
+            list(executor.map(request, range(case["concurrency"])))
     if after_warmups is not None:
         after_warmups()
     count = repetitions * case["concurrency"]
