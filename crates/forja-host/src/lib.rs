@@ -10326,13 +10326,14 @@ mod tests {
         assert_eq!(host.engine_metrics().submissions, 0);
         gate.release();
         tokio::time::timeout(Duration::from_secs(1), async {
-            while replay.status.lock().unwrap().in_flight != 0 {
+            while replay.status.lock().unwrap().in_flight != 0
+                || host.engine_metrics().submissions != 1
+            {
                 tokio::task::yield_now().await;
             }
         })
         .await
         .unwrap();
-        assert_eq!(host.engine_metrics().submissions, 1);
     }
 
     #[tokio::test(flavor = "multi_thread")]
