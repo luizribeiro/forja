@@ -308,7 +308,7 @@ const STEEL: &[Constraint] = &[value(
 const QUANT_GEMV: &[Constraint] = &[value(QUANT_M, Relation::Equal(1))];
 const QUANT_ROW_GEMV: &[Constraint] = &[value(QUANT_M, Relation::Range { min: 2, max: 8 })];
 const Q8_FAST: &[Constraint] = &[
-    value(QUANT_M, Relation::Equal(1)),
+    value(QUANT_M, Relation::Range { min: 1, max: 8 }),
     operation(OperationValue::Bits, Relation::Equal(8)),
     operation(OperationValue::GroupSize, Relation::MultipleOf(8)),
     value(INNER, Relation::MultipleOf(256)),

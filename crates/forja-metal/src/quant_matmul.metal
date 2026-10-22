@@ -372,9 +372,15 @@ kernel void quantized_gemv_q8_fast(
     for (uint block = 0; block < params.inner; block += 256) {
         uint first_inner = block + uint(lane) * 8;
         float4 activations0 = load_float4_contiguous(
-            input, params.input_offset + ulong(first_inner), input0_dtype);
+            input,
+            params.input_offset + ulong(tile.y) * params.input_row_stride +
+                ulong(first_inner),
+            input0_dtype);
         float4 activations1 = load_float4_contiguous(
-            input, params.input_offset + ulong(first_inner + 4), input0_dtype);
+            input,
+            params.input_offset + ulong(tile.y) * params.input_row_stride +
+                ulong(first_inner + 4),
+            input0_dtype);
         float input_sum = dot(activations0, float4(1.0f)) +
             dot(activations1, float4(1.0f));
         uint group = first_inner / quant_group_size;
@@ -411,7 +417,10 @@ kernel void quantized_gemv_q8_fast(
                     sums[item], 0.0f, 0u, tile.y, column,
                     1u, params.rows, params.columns, FORJA_EPILOGUE_VALUES);
                 store_float(
-                    output, params.output_offset + ulong(column), output_dtype,
+                    output,
+                    params.output_offset + ulong(tile.y) * params.output_row_stride +
+                        ulong(column) * params.output_column_stride,
+                    output_dtype,
                     value);
             }
         }

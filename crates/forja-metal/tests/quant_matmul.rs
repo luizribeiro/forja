@@ -1,9 +1,12 @@
 //! Differential coverage for affine-quantized matrix multiplication.
 
-use forja_core::{Backend, BackendDispatchData, CommandList, DType, Op, Slice, ViewOp};
+use forja_core::{Backend, BackendDispatchData, CommandList, DType, Op, Slice, Submission, ViewOp};
 use forja_cpu::CpuBackend;
 use forja_metal::MetalBackend;
-use forja_testing::{TensorSpec, assert_backends_agree};
+use forja_testing::{
+    DeterministicValues, TensorSpec, assert_backends_agree, assert_outputs_agree,
+    generated_tensor_bytes,
+};
 
 #[test]
 fn decode_quantized_matmul_matches_cpu_for_formats_and_groups() {
@@ -29,6 +32,114 @@ fn small_row_quantized_matmul_matches_cpu_at_odd_sizes() {
             }
         }
     }
+}
+
+#[test]
+fn pinned_decode_batch_variants_match_cpu_for_distinct_rows() {
+    let reference = CpuBackend::new();
+    let candidate = MetalBackend::new().unwrap();
+    let mut values = DeterministicValues::new(0x510e_527f_ade6_82d1);
+    for rows in [2, 4, 8] {
+        assert_pinned_decode_batch(
+            &reference,
+            &candidate,
+            rows,
+            4,
+            "quant-matmul.row-gemv",
+            &mut values,
+        );
+        assert_pinned_decode_batch(
+            &reference,
+            &candidate,
+            rows,
+            8,
+            "quant-matmul.q8-fast-gemv",
+            &mut values,
+        );
+    }
+}
+
+fn assert_pinned_decode_batch(
+    reference: &CpuBackend,
+    candidate: &MetalBackend,
+    rows: u32,
+    bits: u8,
+    name: &str,
+    values: &mut DeterministicValues,
+) {
+    let inner = 256;
+    let columns = 33;
+    let group_size = 64;
+    let activations = (0..rows * inner)
+        .flat_map(|index| (f32::from(u16::try_from(index).unwrap()) / 257.0 - 4.0).to_le_bytes())
+        .collect();
+    let specs = [
+        TensorSpec::initialized(DType::F32, &[rows, inner], activations),
+        TensorSpec::contiguous(DType::U32, &[columns, inner * u32::from(bits) / 32]),
+        TensorSpec::contiguous(DType::F16, &[columns, inner / group_size]),
+        TensorSpec::contiguous(DType::F16, &[columns, inner / group_size]),
+    ];
+    let bytes = specs
+        .iter()
+        .map(|spec| generated_tensor_bytes(spec, values).unwrap())
+        .collect::<Vec<_>>();
+    let reference_inputs = allocate_inputs(reference, &specs, &bytes);
+    let candidate_inputs = allocate_inputs(candidate, &specs, &bytes);
+    let reference_output = reference.alloc(DType::F32, &[rows, columns]).unwrap();
+    let candidate_output = candidate.alloc(DType::F32, &[rows, columns]).unwrap();
+    let op = Op::QuantMatmul { bits, group_size };
+    submit_quant(reference, op, &reference_inputs, &reference_output, None);
+    let inputs = candidate_inputs.iter().collect::<Vec<_>>();
+    let variant = candidate
+        .validate_variant_for_op(op, &inputs, &[&candidate_output], name)
+        .unwrap();
+    submit_quant(
+        candidate,
+        op,
+        &candidate_inputs,
+        &candidate_output,
+        Some(BackendDispatchData::new(variant)),
+    );
+    assert_outputs_agree(
+        DType::F32,
+        &reference.read(&reference_output).unwrap(),
+        &candidate.read(&candidate_output).unwrap(),
+    )
+    .unwrap();
+}
+
+fn allocate_inputs<B: Backend>(
+    backend: &B,
+    specs: &[TensorSpec],
+    bytes: &[Vec<u8>],
+) -> Vec<forja_core::Tensor> {
+    specs
+        .iter()
+        .zip(bytes)
+        .map(|(spec, bytes)| {
+            let tensor = backend
+                .alloc(spec.dtype(), spec.allocation_shape())
+                .unwrap();
+            backend.write(&tensor, bytes).unwrap();
+            tensor
+        })
+        .collect()
+}
+
+fn submit_quant<B: Backend>(
+    backend: &B,
+    op: Op,
+    inputs: &[forja_core::Tensor],
+    output: &forja_core::Tensor,
+    variant: Option<BackendDispatchData>,
+) {
+    let mut commands = CommandList::new();
+    let inputs = inputs.iter().collect::<Vec<_>>();
+    commands.dispatch(op, &inputs, output).unwrap();
+    if let Some(variant) = variant {
+        assert!(commands.set_last_backend_data(variant));
+    }
+    backend.submit(commands).unwrap().wait().unwrap();
 }
 
 #[test]

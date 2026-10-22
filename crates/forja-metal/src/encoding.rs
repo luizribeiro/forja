@@ -10985,16 +10985,18 @@ mod tests {
     fn metal_quant_q8_fast_epilogues_cover_every_dtype() {
         let backend = MetalBackend::new().unwrap();
         for dtype in [DType::F32, DType::F16, DType::BF16] {
-            assert_quant_epilogue(
-                &backend,
-                "quant-matmul.q8-fast-gemv",
-                dtype,
-                8,
-                1,
-                256,
-                33,
-                true,
-            );
+            for rows in [1, 2, 4, 8] {
+                assert_quant_epilogue(
+                    &backend,
+                    "quant-matmul.q8-fast-gemv",
+                    dtype,
+                    8,
+                    rows,
+                    256,
+                    33,
+                    true,
+                );
+            }
         }
     }
 
