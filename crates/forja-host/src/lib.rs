@@ -24,10 +24,11 @@ use std::{
 use forja_core::{
     Affine, Backend, BackendDispatchData, BackendError, BufferId, CommandList, DType, DeviceInfo,
     GraphLimits, GraphTemplate, Layout, LayoutError, MemoryUsage, Op, OpError, PagePool,
-    PagePoolError, PagedCopyDirection, PagedLayout, PagedPlane, PagedSequence, PagedSlotBanks,
-    ParamError, ParamSpace, ParamValues, PreparedGraph, RuleArm, SequenceCheckpoint, Slice,
-    Submission, SubmissionProfile, SymbolicLayout, SymbolicLayoutError, TemplateOp, TemplateTensor,
-    Tensor, ViewOp, gather_matmul_flops, gather_quant_matmul_dispatch_flops, matmul_flops,
+    PagePoolError, PagedCopyDirection, PagedLayout, PagedMemoryUsage, PagedPlane, PagedSequence,
+    PagedSlotBanks, ParamError, ParamSpace, ParamValues, PreparedGraph, RuleArm,
+    SequenceCheckpoint, Slice, Submission, SubmissionProfile, SymbolicLayout, SymbolicLayoutError,
+    TemplateOp, TemplateTensor, Tensor, ViewOp, gather_matmul_flops,
+    gather_quant_matmul_dispatch_flops, matmul_flops,
     program::{
         BinOp, EpilogueError, EpilogueSignature, Inst, KernelSignature, MAX_INSTRUCTIONS,
         MAX_OUTPUTS, PrepareError, PreparedEpilogue, PreparedProgram, Program, ProgramError,
@@ -2474,6 +2475,28 @@ where
     #[must_use]
     pub fn memory_usage(&self) -> EngineMemory {
         self.store.data().engine_memory()
+    }
+
+    /// Returns paged pool, table, slot, graph, and scratch charges.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when paged pool state is unavailable or poisoned.
+    pub fn paged_memory_usage(&self) -> Result<Option<PagedMemoryUsage>, compute::Error> {
+        let Some(pool) = self.page_pool else {
+            return Ok(None);
+        };
+        let entry = self
+            .store
+            .data()
+            .table
+            .get(&Resource::<PagePoolEntry>::new_borrow(pool))
+            .map_err(invalid_handle)?;
+        entry
+            .pool
+            .memory_usage()
+            .map(|(usage, _)| Some(usage))
+            .map_err(|error| compute::Error::Quota(error.to_string()))
     }
 
     /// Waits until the requested number of backend submissions has completed successfully.

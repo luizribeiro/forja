@@ -183,6 +183,9 @@ async fn prepares_independent_paged_lanes() -> wasmtime::Result<()> {
     assert!(runner.prepare_paged_lane(0, None, 8)?);
     assert!(runner.prepare_paged_lane(1, None, 8)?);
     assert!(runner.prepare_paged_lane(2, None, 8).is_err());
+    let memory = runner.paged_memory_usage()?.unwrap();
+    assert!(memory.slab_bytes > 0);
+    assert!(memory.slot_bytes > 0);
     Ok(())
 }
 
