@@ -1573,7 +1573,20 @@ where
         &mut self,
         input: EngineBatch,
     ) -> wasmtime::Result<Result<EngineBatchOutput, compute::Error>> {
-        self.with_profile(move |runner| Box::pin(runner.batch_step_inner(input)))
+        self.with_profile(move |runner| Box::pin(runner.batch_step_inner(input, true)))
+            .await
+    }
+
+    /// Enqueues a homogeneous combined batch while retaining earlier batch outputs.
+    ///
+    /// # Errors
+    ///
+    /// Returns a component execution error or a construction-boundary refusal.
+    pub async fn enqueue_batch_step(
+        &mut self,
+        input: EngineBatch,
+    ) -> wasmtime::Result<Result<EngineBatchOutput, compute::Error>> {
+        self.with_profile(move |runner| Box::pin(runner.batch_step_inner(input, false)))
             .await
     }
 
@@ -1771,9 +1784,10 @@ where
     async fn batch_step_inner(
         &mut self,
         input: EngineBatch,
+        release_previous: bool,
     ) -> wasmtime::Result<Result<EngineBatchOutput, compute::Error>> {
         use engine_bindings::exports::l9o::gpu::engine::BatchOut;
-        if let Err(error) = self.release_outputs() {
+        if release_previous && let Err(error) = self.release_outputs() {
             return Ok(Err(error));
         }
         let info = match &self.info {
@@ -1841,7 +1855,11 @@ where
             return Ok(Err(error));
         }
         self.finish_batch_appends(pool, checkpoints)?;
-        self.output_handles = handles;
+        if release_previous {
+            self.output_handles = handles;
+        } else {
+            self.output_handles.extend(handles);
+        }
         Ok(Ok(EngineBatchOutput {
             logits: EngineTensor {
                 handle: logits.rep(),
@@ -2389,6 +2407,23 @@ where
         }
     }
 
+    /// Reads queued batch tokens and releases that call's returned tensor handles.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-handle or backend read failure.
+    pub async fn read_queued_batch_tokens(
+        &mut self,
+        output: EngineBatchOutput,
+    ) -> Result<Vec<u8>, compute::Error> {
+        let result = self.read(&output.tokens).await;
+        let release = self.release_batch_output(output);
+        match (result, release) {
+            (Err(error), _) | (Ok(_), Err(error)) => Err(error),
+            (Ok(bytes), Ok(())) => Ok(bytes),
+        }
+    }
+
     /// Reads a queued decode token while retaining that call's returned tensors.
     ///
     /// # Errors
@@ -2436,6 +2471,14 @@ where
     fn release_decode_output(&mut self, output: EngineDecodeOutput) -> Result<(), compute::Error> {
         let EngineDecodeOutput { logits, token } = output;
         let handles = [logits.handle, token.handle];
+        self.output_handles
+            .retain(|handle| !handles.contains(handle));
+        self.release_handles(handles.into())
+    }
+
+    fn release_batch_output(&mut self, output: EngineBatchOutput) -> Result<(), compute::Error> {
+        let EngineBatchOutput { logits, tokens } = output;
+        let handles = [logits.handle, tokens.handle];
         self.output_handles
             .retain(|handle| !handles.contains(handle));
         self.release_handles(handles.into())

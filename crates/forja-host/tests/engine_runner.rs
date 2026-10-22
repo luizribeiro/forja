@@ -38,6 +38,23 @@ async fn runs_a_combined_batch_with_inert_padding() -> wasmtime::Result<()> {
 }
 
 #[tokio::test]
+async fn queued_batches_retain_earlier_outputs() -> wasmtime::Result<()> {
+    let (_weights, mut runner) = paged_smoke_runner("queued-combined-batch").await?;
+    assert!(runner.prepare_paged_lane(0, None, 8)?);
+    let first = runner.enqueue_batch_step(combined_batch(2)).await??;
+    let second = runner.enqueue_batch_step(combined_batch(3)).await??;
+    assert_eq!(
+        runner.read_queued_batch_tokens(first).await?,
+        [3, 0, 0, 0, 0, 0, 0, 0]
+    );
+    assert_eq!(
+        runner.read_queued_batch_tokens(second).await?,
+        [0, 0, 0, 0, 0, 0, 0, 0]
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn combined_batch_refuses_corrupt_outputs() -> wasmtime::Result<()> {
     let (_weights, mut runner) = paged_smoke_runner("corrupt-batch").await?;
     assert!(runner.prepare_paged_lane(0, None, 8)?);
