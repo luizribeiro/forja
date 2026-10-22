@@ -167,7 +167,7 @@ async fn shutdown_signal() -> Result<(), Box<dyn Error>> {
 
 #[cfg(test)]
 mod tests {
-    use std::{env, path::PathBuf};
+    use std::{env, path::Path, path::PathBuf};
 
     use forja_serve::{FinishReason, GenerationEvent};
 
@@ -372,6 +372,120 @@ mod tests {
             }
             Ok(())
         })
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires FORJA_MODELS and runs in the pre-push hook"]
+    fn metal_qwen3_paged_prefix_reuse_after_lru_eviction() -> Result<(), Box<dyn Error>> {
+        paged_completion_prefix_reuse(test_guests::qwen3(), "Qwen3-0.6B")
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires FORJA_MODELS and runs in the pre-push hook"]
+    fn metal_olmoe_paged_prefix_reuse_after_lru_eviction() -> Result<(), Box<dyn Error>> {
+        paged_completion_prefix_reuse(test_guests::olmoe(), "OLMoE-1B-7B-0924")
+    }
+
+    #[cfg(target_os = "macos")]
+    fn paged_completion_prefix_reuse(
+        component: &Path,
+        model_directory: &str,
+    ) -> Result<(), Box<dyn Error>> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()?;
+        runtime.block_on(async {
+            let prefix = format!("{} token", " x".repeat(128));
+            let extension = format!("{prefix}{}", " token".repeat(32));
+            let root = PathBuf::from(
+                env::var_os("FORJA_MODELS").ok_or("FORJA_MODELS is not set")?,
+            );
+            let tokenizer = Tokenizer::from_file(root.join(model_directory).join("tokenizer.json"))
+                .map_err(|error| format!("cannot load tokenizer: {error}"))?;
+            let cached_tokens = u32::try_from(
+                tokenizer
+                    .encode(prefix.as_str(), false)
+                    .map_err(|error| error.to_string())?
+                    .len(),
+            )?;
+            let mut engine = completion_engine(component, model_directory).await?;
+            let model = engine.model().to_owned();
+            let request = |prompt: &str| {
+                serde_json::from_value::<forja_serve::CompletionRequest>(serde_json::json!({
+                    "model": &model, "prompt": prompt, "max_tokens": 1, "temperature": 0.0
+                }))
+            };
+
+            engine.complete_text(&request(&prefix)?).await?;
+            engine.complete_text(&request(&extension)?).await?;
+            for index in 0..=1 {
+                engine
+                    .complete_text(&request(&format!(" eviction {index}"))?)
+                    .await?;
+            }
+            let rewarmed = engine.complete_text(&request(&prefix)?).await?;
+            let reused = engine.complete_text(&request(&extension)?).await?;
+            if rewarmed.usage.cached_tokens >= cached_tokens
+                || reused.usage.cached_tokens != cached_tokens
+            {
+                return Err(format!(
+                    "cached tokens after eviction were {}/{} instead of below {cached_tokens}/{cached_tokens}",
+                    rewarmed.usage.cached_tokens, reused.usage.cached_tokens
+                )
+                .into());
+            }
+            Ok(())
+        })
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn completion_engine(
+        component: &Path,
+        model_directory: &str,
+    ) -> Result<forja_serve::ServingEngine<forja_metal::MetalBackend>, Box<dyn Error>> {
+        let root = PathBuf::from(env::var_os("FORJA_MODELS").ok_or("FORJA_MODELS is not set")?);
+        let model = root.join(model_directory);
+        let profile = crate::resolution::read_embedded_profile(component)?;
+        let tokenizer = Tokenizer::from_file(model.join("tokenizer.json"))
+            .map_err(|error| format!("cannot load tokenizer: {error}"))?;
+        let chat_component = test_guests::chat_format_smoke();
+        let chat_format = forja_serve::ChatFormat::load(
+            chat_component,
+            forja_serve::ChatFormatLimits::default(),
+        )?;
+        let mut runner = EngineRunner::new(
+            component,
+            forja_metal::MetalBackend::new()?,
+            crate::engine::limits(&forja_config::Limits::default())?,
+            crate::engine::weights_path(&model)?,
+        )
+        .await?;
+        let info = runner.describe().await?;
+        let mut load = engine_load_config(component, &Engine::default())?;
+        load.paged_cache = true;
+        runner.load_with_selections(None, &load).await??;
+        let mut config = forja_config::HostConfig::default();
+        config.server.queue_length = 1;
+        config.serving.prefix_reuse = true;
+        let identity = forja_serve::PrefixIdentity::new([
+            &sha256_file(component)?,
+            &profile.sha256()?,
+            &profile.model().weights_sha256,
+            &sha256_file(model.join("tokenizer.json"))?,
+            &sha256_file(chat_component)?,
+        ])?;
+        Ok(forja_serve::ServingEngine::new(
+            profile.model().id.clone(),
+            runner,
+            tokenizer,
+            chat_format,
+            config,
+            info,
+            profile.workload().max_context.get(),
+            identity,
+        )?)
     }
 
     #[cfg(target_os = "macos")]
