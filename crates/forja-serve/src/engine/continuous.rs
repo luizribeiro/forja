@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     sync::{Arc, Mutex as StdMutex},
     time::Instant,
 };
@@ -189,6 +190,14 @@ impl RequestEnvelope {
         }
     }
 
+    fn requires_serial_path(&self) -> bool {
+        matches!(
+            self,
+            Self::Chat { request, .. } | Self::StreamChat { request, .. }
+                if request.params.tools.is_some()
+        )
+    }
+
     async fn prepare<B>(self, engine: &mut ServingEngine<B>) -> Option<PreparedRequest>
     where
         B: Backend + Send + Sync + 'static,
@@ -317,23 +326,31 @@ where
         mut receiver: mpsc::Receiver<ServiceCommand>,
         shared_metrics: Arc<StdMutex<ServingMetrics>>,
     ) {
-        while let Some(command) = receiver.recv().await {
-            let envelope = RequestEnvelope::from_command(command);
-            let queued = envelope.queued().elapsed();
+        let mut pending = VecDeque::new();
+        loop {
+            if pending.is_empty() {
+                let Some(command) = receiver.recv().await else {
+                    return;
+                };
+                pending.push_back(RequestEnvelope::from_command(command));
+            }
+            while let Ok(command) = receiver.try_recv() {
+                pending.push_back(RequestEnvelope::from_command(command));
+            }
             let scheduled = Instant::now();
-            if let Some(prepared) = envelope.prepare(&mut self).await {
-                if prepared.constraint.is_none() && self.info.serving.is_some() {
-                    if let Some(lane) = self.start_batch_lane(prepared, 0).await {
-                        self.run_batch_lanes(vec![lane]).await;
-                    }
-                } else {
+            if self.info.serving.is_some()
+                && pending
+                    .front()
+                    .is_some_and(|request| !request.requires_serial_path())
+            {
+                self.run_batch_lanes(&mut receiver, &mut pending).await;
+            } else if let Some(envelope) = pending.pop_front() {
+                observe(&mut self.metrics.queue_time, envelope.queued().elapsed());
+                if let Some(prepared) = envelope.prepare(&mut self).await {
                     prepared.run_single(&mut self).await;
                 }
             }
             if let Ok(mut metrics) = shared_metrics.lock() {
-                self.metrics.queue_time = metrics.queue_time;
-                self.metrics.scheduler_time = metrics.scheduler_time;
-                observe(&mut self.metrics.queue_time, queued);
                 observe(&mut self.metrics.scheduler_time, scheduled.elapsed());
                 *metrics = self.metrics.clone();
             }

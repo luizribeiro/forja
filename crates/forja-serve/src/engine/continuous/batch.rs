@@ -1,30 +1,25 @@
+use std::collections::VecDeque;
+
 use forja_core::Backend;
 use forja_host::{BatchPhase, BatchSelection, BatchShape, EngineBatch, EngineBatchLane};
+use tokio::sync::mpsc;
 
 use super::lane::BatchLane;
-use super::{batch_admission_error, read_batch_tokens, repeated_error};
+use super::{RequestEnvelope, batch_admission_error, read_batch_tokens, repeated_error};
 use crate::engine::{GenerationError, ServingEngine};
+use crate::{http::ServiceCommand, metrics::observe};
 
 impl<B> ServingEngine<B>
 where
     B: Backend + Send + Sync + 'static,
 {
-    pub(super) async fn run_batch_lanes(&mut self, lanes: Vec<BatchLane>) {
+    pub(super) async fn run_batch_lanes(
+        &mut self,
+        receiver: &mut mpsc::Receiver<ServiceCommand>,
+        pending: &mut VecDeque<RequestEnvelope>,
+    ) {
         let mut active = Vec::new();
-        for mut lane in lanes {
-            match lane
-                .accept(
-                    lane.pending_token,
-                    &self.chat_info.stop_token_ids,
-                    &mut self.metrics,
-                )
-                .await
-            {
-                Ok(Some(reason)) => self.finish_batch_lane(lane, reason).await,
-                Ok(None) => active.push(lane),
-                Err(error) => self.fail_batch_lane(lane, error),
-            }
-        }
+        self.admit_pending(receiver, pending, &mut active).await;
         while !active.is_empty() {
             let shape = match self.decode_shape(&active) {
                 Ok(shape) => shape,
@@ -87,6 +82,53 @@ where
                 }
             }
             active = next;
+            self.admit_pending(receiver, pending, &mut active).await;
+        }
+    }
+
+    async fn admit_pending(
+        &mut self,
+        receiver: &mut mpsc::Receiver<ServiceCommand>,
+        pending: &mut VecDeque<RequestEnvelope>,
+        active: &mut Vec<BatchLane>,
+    ) {
+        while let Ok(command) = receiver.try_recv() {
+            pending.push_back(RequestEnvelope::from_command(command));
+        }
+        while active.len() < usize::try_from(self.scheduler.active_lanes).unwrap_or(usize::MAX) {
+            if pending
+                .front()
+                .is_none_or(RequestEnvelope::requires_serial_path)
+            {
+                return;
+            }
+            let Some(slot) = (0..self.scheduler.active_lanes)
+                .find(|slot| active.iter().all(|lane| lane.slot != *slot))
+            else {
+                return;
+            };
+            let Some(envelope) = pending.pop_front() else {
+                return;
+            };
+            observe(&mut self.metrics.queue_time, envelope.queued().elapsed());
+            let Some(prepared) = envelope.prepare(self).await else {
+                continue;
+            };
+            let Some(mut lane) = self.start_batch_lane(prepared, slot).await else {
+                continue;
+            };
+            match lane
+                .accept(
+                    lane.pending_token,
+                    &self.chat_info.stop_token_ids,
+                    &mut self.metrics,
+                )
+                .await
+            {
+                Ok(Some(reason)) => self.finish_batch_lane(lane, reason).await,
+                Ok(None) => active.push(lane),
+                Err(error) => self.fail_batch_lane(lane, error),
+            }
         }
     }
 
