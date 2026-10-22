@@ -52,6 +52,22 @@ Accepted pp512/tg128 results use 30 measured repetitions on an 80-core Apple M3 
 | f32 | GPU sequential | 1266.44 | 82.78 |
 | f32 | GPU pipelined | 1246.92 | 104.88 |
 
+Full-model batched decode uses alternating 512- and 2048-token cached contexts, 128 timed decode
+steps, three warmups and 30 measured repetitions. The aggregate throughput and each lane's ITL are:
+
+| Bucket | Execution | Wall tok/s (95% CI) | GPU tok/s (95% CI) | Wall ITL ms (95% CI) | GPU ITL ms (95% CI) |
+| ---: | --- | ---: | ---: | ---: | ---: |
+| 1 | graph | 75.29 (73.97–76.30) | 96.07 (95.38–97.06) | 13.28 (13.11–13.52) | 10.41 (10.30–10.48) |
+| 2 | graph | 108.85 (107.65–109.68) | 138.69 (136.92–139.52) | 18.37 (18.23–18.58) | 14.42 (14.34–14.61) |
+| 4 | graph | 145.32 (144.84–145.91) | 182.57 (181.88–183.06) | 27.53 (27.41–27.62) | 21.91 (21.85–21.99) |
+| 8 | eager | 149.38 (149.26–149.46) | 215.79 (215.41–216.14) | 53.56 (53.53–53.60) | 37.07 (37.01–37.14) |
+
+The eager bucket 8 gains only 2.8% aggregate wall throughput over bucket 4 while its per-lane wall
+ITL is 94.6% higher. Against bucket 2, its wall ITL is 191.5% higher. The record was captured by
+`forja bench` at commit `abe0761`, with engine SHA-256 `7a96b390d54b200ea050feb9c5b31244701e275063f85902d303f618b4fc01cd`,
+model revision `6e302ea604ad9ab206367e2c501d1571023e7b6d`, and an 80-core Apple M3 Ultra on macOS 27.0.1.
+Full confidence intervals and provenance are in `bench/qwen3-coder-30b-a3b-instruct-4bit.metal-apple-m3-ultra.q4/batched-decode.json`.
+
 The f16 profile uses half-precision Q, K, V, and probability MMA inputs with f32 score, softmax,
 and output accumulation. Median wall throughput from matched five-repetition runs was:
 
