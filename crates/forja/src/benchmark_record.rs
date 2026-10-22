@@ -6,7 +6,7 @@ use sha2::{Digest, Sha256};
 
 use crate::args::{Bench, BenchPoint};
 
-pub(crate) const SCHEMA_VERSION: u32 = 4;
+pub(crate) const SCHEMA_VERSION: u32 = 5;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub(crate) struct Input {
@@ -187,6 +187,10 @@ fn recorded_perf_key(
             key.insert(field.to_owned(), value);
         }
     }
+    if record.schema_version < 5 {
+        key.remove("bench.batch-decode.buckets");
+        key.remove("bench.batch-decode.contexts");
+    }
     Ok(key)
 }
 
@@ -232,6 +236,14 @@ fn perf_key_from(
     key.insert(
         "bench.breakdown".to_owned(),
         serde_json::json!(config.bench.breakdown),
+    );
+    key.insert(
+        "bench.batch-decode.buckets".to_owned(),
+        serde_json::json!([1, 2, 4, 8]),
+    );
+    key.insert(
+        "bench.batch-decode.contexts".to_owned(),
+        serde_json::json!([512, 2048]),
     );
     key.insert(
         "engine.sha256".to_owned(),
@@ -349,11 +361,11 @@ mod tests {
         }];
         assert_eq!(
             config_hash(&snapshot, &inputs).unwrap(),
-            "sha256:2b1b0b4f2104d06e078c046c116435d1db57f7844d6dae31e2dfa0ccf82b5171"
+            "sha256:5018d97656a9ac2c58f6c181d775deeeceeb1cd71f074b99c528c66f551f1d44"
         );
         assert_eq!(
             comparison_hash(&perf_key(&point, &inputs[0], &profile()).unwrap()).unwrap(),
-            "sha256:11160d9fb14caf9a5550d4d0c0cc76e68e82e0cdf237aa8e2b8275b8d4d7d784"
+            "sha256:8ef1ab198a395a78e3e0c9609e09ac5c74b8a9d49508d7f1aee6ee94c6497d85"
         );
     }
 

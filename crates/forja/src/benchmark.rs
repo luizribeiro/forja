@@ -607,6 +607,12 @@ fn validate_comparability(
             key.remove("engine.picks_hash");
         }
     }
+    if record.schema_version < 5 {
+        for key in &mut current {
+            key.remove("bench.batch-decode.buckets");
+            key.remove("bench.batch-decode.contexts");
+        }
+    }
     if recorded.len() != current.len() {
         return Err(format!(
             "benchmark records are not comparable:\n  results.count: {} -> {}",
@@ -1185,7 +1191,7 @@ async fn load_benchmark_runner(
 }
 
 fn context_measurements_enabled(rerun_schema: Option<u32>) -> bool {
-    rerun_schema.is_none_or(|schema| schema >= benchmark_record::SCHEMA_VERSION)
+    rerun_schema.is_none_or(|schema| schema >= 4)
 }
 
 #[cfg(target_os = "macos")]
@@ -2641,9 +2647,8 @@ mod tests {
         assert!(context_measurements_enabled(Some(
             benchmark_record::SCHEMA_VERSION
         )));
-        assert!(!context_measurements_enabled(Some(
-            benchmark_record::SCHEMA_VERSION - 1
-        )));
+        assert!(context_measurements_enabled(Some(4)));
+        assert!(!context_measurements_enabled(Some(3)));
     }
 
     #[cfg(target_os = "macos")]
