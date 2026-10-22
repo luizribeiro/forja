@@ -166,6 +166,12 @@ impl BatchLane {
         }
     }
 
+    pub(super) fn needs_successor(&self) -> bool {
+        self.consumed
+            .checked_add(1)
+            .is_some_and(|consumed| consumed < self.params.max_tokens)
+    }
+
     pub(super) async fn reply(self, completion: Completion) {
         self.sink
             .finish(&self.request_params, completion, &self.control)

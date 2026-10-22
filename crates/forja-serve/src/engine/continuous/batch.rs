@@ -12,7 +12,7 @@ use super::{
     PreparedRequest, RequestEnvelope, batch_admission_error, read_batch_tokens, repeated_error,
 };
 use crate::engine::{GenerationError, ServingEngine};
-use crate::{http::ServiceCommand, metrics::observe_phase};
+use crate::{FinishReason, http::ServiceCommand, metrics::observe_phase};
 
 struct PendingBatch {
     output: EngineBatchOutput,
@@ -22,6 +22,28 @@ struct PendingBatch {
 struct PendingLane {
     slot: u32,
     checkpoint: EngineLaneCheckpoint<()>,
+    retirement: Option<Retirement>,
+}
+
+enum Retirement {
+    Finish(BatchLane, FinishReason),
+    Fail(BatchLane, GenerationError),
+}
+
+impl Retirement {
+    fn slot(&self) -> u32 {
+        match self {
+            Self::Finish(lane, _) | Self::Fail(lane, _) => lane.slot,
+        }
+    }
+}
+
+impl PendingBatch {
+    fn contains_active(&self, slot: u32) -> bool {
+        self.lanes
+            .iter()
+            .any(|lane| lane.slot == slot && lane.retirement.is_none())
+    }
 }
 
 impl<B> ServingEngine<B>
@@ -59,55 +81,70 @@ where
                     }
                 };
             }
-            let Some(batch) = current.take() else {
+            let Some(mut batch) = current.take() else {
                 continue;
             };
-            let tokens = match self.runner.read_queued_batch_tokens(batch.output).await {
-                Ok(bytes) => read_batch_tokens(&bytes),
-                Err(error) => Err(GenerationError::unavailable(format!(
-                    "decode batch read failed: {error}"
-                ))),
-            };
-            let tokens = match tokens {
-                Ok(tokens) => tokens,
+            self.mark_submitted_cancellations(&mut batch, &mut active);
+            let mut successor = match self.submit_successor(&active, &batch).await {
+                Ok(successor) => successor,
                 Err(error) => {
-                    for lane in active.drain(..) {
-                        self.fail_batch_lane(lane, repeated_error(&error));
-                    }
+                    let _ = self.runner.read_queued_batch_tokens(batch.output).await;
+                    self.fail_pipeline(batch.lanes, None, &mut active, error)
+                        .await;
                     return;
                 }
             };
-            self.apply_batch_tokens(&mut active, batch.lanes, &tokens)
+            let tokens = self.runner.read_queued_batch_tokens(batch.output).await;
+            let tokens = match tokens {
+                Ok(bytes) => match read_batch_tokens(&bytes) {
+                    Ok(tokens) => tokens,
+                    Err(error) => {
+                        self.fail_pipeline(batch.lanes, successor, &mut active, error)
+                            .await;
+                        return;
+                    }
+                },
+                Err(error) => {
+                    self.fail_pipeline(
+                        batch.lanes,
+                        successor,
+                        &mut active,
+                        GenerationError::unavailable(format!("decode batch read failed: {error}")),
+                    )
+                    .await;
+                    return;
+                }
+            };
+            self.apply_batch_tokens(batch.lanes, &mut active, &mut successor, &tokens)
                 .await;
             self.admit_pending(receiver, pending, &mut active, &mut deferred)
                 .await;
+            current = successor;
         }
     }
 
     async fn apply_batch_tokens(
         &mut self,
-        active: &mut Vec<BatchLane>,
         submitted: Vec<PendingLane>,
+        active: &mut Vec<BatchLane>,
+        successor: &mut Option<PendingBatch>,
         tokens: &[u32],
     ) {
-        for submitted in submitted {
-            let Some(index) = active.iter().position(|lane| lane.slot == submitted.slot) else {
+        for pending in submitted {
+            if let Some(retirement) = pending.retirement {
+                self.finish_retirement(retirement, pending.checkpoint).await;
+                continue;
+            }
+            let Some(index) = active.iter().position(|lane| lane.slot == pending.slot) else {
                 continue;
             };
             let mut lane = active.remove(index);
-            if lane.control.is_cancelled() {
-                let rollback = self
-                    .runner
-                    .rollback_paged_lane(submitted.slot, submitted.checkpoint.paged)
-                    .map_err(|error| batch_admission_error(&error));
-                self.fail_batch_lane(
-                    lane,
-                    rollback.err().unwrap_or_else(GenerationError::cancelled),
-                );
-                continue;
-            }
             let Some(position) = lane.position.checked_add(1) else {
-                self.fail_batch_lane(lane, GenerationError::new("decode position overflowed"));
+                self.retire_or_finish(
+                    Retirement::Fail(lane, GenerationError::new("decode position overflowed")),
+                    successor,
+                )
+                .await;
                 continue;
             };
             lane.position = position;
@@ -115,18 +152,45 @@ where
                 .ok()
                 .and_then(|slot| tokens.get(slot))
             else {
-                self.fail_batch_lane(lane, GenerationError::new("batch token is missing"));
+                self.retire_or_finish(
+                    Retirement::Fail(lane, GenerationError::new("batch token is missing")),
+                    successor,
+                )
+                .await;
                 continue;
             };
             match lane
                 .accept(token, &self.chat_info.stop_token_ids, &mut self.metrics)
                 .await
             {
-                Ok(Some(reason)) => self.finish_batch_lane(lane, reason).await,
+                Ok(Some(reason)) => {
+                    self.retire_or_finish(Retirement::Finish(lane, reason), successor)
+                        .await;
+                }
                 Ok(None) => active.push(lane),
-                Err(error) => self.fail_batch_lane(lane, error),
+                Err(error) => {
+                    self.retire_or_finish(Retirement::Fail(lane, error), successor)
+                        .await;
+                }
             }
         }
+    }
+
+    async fn submit_successor(
+        &mut self,
+        active: &[BatchLane],
+        current: &PendingBatch,
+    ) -> Result<Option<PendingBatch>, GenerationError> {
+        let lanes = active
+            .iter()
+            .filter(|lane| !current.contains_active(lane.slot) || lane.needs_successor())
+            .collect::<Vec<_>>();
+        let feedback = lanes
+            .iter()
+            .filter(|lane| current.contains_active(lane.slot))
+            .map(|lane| lane.slot)
+            .collect::<Vec<_>>();
+        self.submit_batch(&lanes, &feedback).await
     }
 
     async fn submit_batch(
@@ -159,6 +223,7 @@ where
                 .map(|(lane, checkpoint)| PendingLane {
                     slot: lane.slot,
                     checkpoint,
+                    retirement: None,
                 })
                 .collect(),
         }))
@@ -209,6 +274,108 @@ where
             } else {
                 index += 1;
             }
+        }
+    }
+
+    fn mark_submitted_cancellations(
+        &mut self,
+        batch: &mut PendingBatch,
+        active: &mut Vec<BatchLane>,
+    ) {
+        let mut index = 0;
+        while index < active.len() {
+            if !active[index].control.is_cancelled() {
+                index += 1;
+                continue;
+            }
+            let lane = active.remove(index);
+            if let Some(pending) = batch
+                .lanes
+                .iter_mut()
+                .find(|pending| pending.slot == lane.slot && pending.retirement.is_none())
+            {
+                pending.retirement = Some(Retirement::Fail(lane, GenerationError::cancelled()));
+            } else {
+                self.fail_batch_lane(lane, GenerationError::cancelled());
+            }
+        }
+    }
+
+    async fn retire_or_finish(
+        &mut self,
+        retirement: Retirement,
+        successor: &mut Option<PendingBatch>,
+    ) {
+        if let Some(pending) = successor.as_mut().and_then(|batch| {
+            batch
+                .lanes
+                .iter_mut()
+                .find(|pending| pending.slot == retirement.slot())
+        }) {
+            pending.retirement = Some(retirement);
+            return;
+        }
+        match retirement {
+            Retirement::Finish(lane, reason) => self.finish_batch_lane(lane, reason).await,
+            Retirement::Fail(lane, error) => self.fail_batch_lane(lane, error),
+        }
+    }
+
+    async fn finish_retirement(
+        &mut self,
+        retirement: Retirement,
+        checkpoint: EngineLaneCheckpoint<()>,
+    ) {
+        let rollback = self
+            .runner
+            .rollback_paged_lane(retirement.slot(), checkpoint.paged)
+            .map_err(|error| batch_admission_error(&error));
+        match (retirement, rollback) {
+            (Retirement::Finish(lane, reason), Ok(())) => {
+                self.finish_batch_lane(lane, reason).await;
+            }
+            (Retirement::Fail(lane, error), Ok(())) => self.fail_batch_lane(lane, error),
+            (Retirement::Finish(lane, _) | Retirement::Fail(lane, _), Err(error)) => {
+                self.fail_batch_lane(lane, error);
+            }
+        }
+    }
+
+    async fn fail_pipeline(
+        &mut self,
+        current: Vec<PendingLane>,
+        successor: Option<PendingBatch>,
+        active: &mut Vec<BatchLane>,
+        error: GenerationError,
+    ) {
+        let current_slots = current.iter().map(|lane| lane.slot).collect::<Vec<_>>();
+        let successor = if let Some(successor) = successor {
+            let PendingBatch { output, lanes } = successor;
+            let _ = self.runner.read_queued_batch_tokens(output).await;
+            lanes
+        } else {
+            Vec::new()
+        };
+        let mut lanes = Vec::new();
+        for (is_current, pending) in current
+            .into_iter()
+            .map(|pending| (true, pending))
+            .chain(successor.into_iter().map(|pending| (false, pending)))
+        {
+            if is_current || !current_slots.contains(&pending.slot) {
+                let _ = self
+                    .runner
+                    .rollback_paged_lane(pending.slot, pending.checkpoint.paged);
+            }
+            if let Some(retirement) = pending.retirement {
+                lanes.push(match retirement {
+                    Retirement::Finish(lane, _) | Retirement::Fail(lane, _) => lane,
+                });
+            }
+        }
+        lanes.append(active);
+        for lane in lanes {
+            self.fail_batch_lane(lane, repeated_error(&error));
         }
     }
 
