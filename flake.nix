@@ -304,6 +304,29 @@
             files = "^bench/.*\\.json$";
             pass_filenames = true;
           };
+          target-deps-entries = {
+            enable = true;
+            entry = "${
+              pkgs.writeShellApplication {
+                name = "target-deps-entries-hook";
+                text = ''
+                  readonly maximum_entries=20000
+                  failed=0
+                  shopt -s nullglob
+                  for deps in target/*/deps target/*/*/deps target/tests/trybuild/*/*/deps; do
+                    entries=$(find "$deps" -mindepth 1 -maxdepth 1 | wc -l)
+                    if (( entries > maximum_entries )); then
+                      echo "$deps holds $entries entries (limit $maximum_entries). Metal device creation scans the test executable's directory, so every Metal test slows down. Run: find target -path '*/deps/*.rcgu.o' -delete (or cargo clean --profile dev)" >&2
+                      failed=1
+                    fi
+                  done
+                  exit "$failed"
+                '';
+              }
+            }/bin/target-deps-entries-hook";
+            always_run = true;
+            pass_filenames = false;
+          };
           nixfmt.enable = true;
           deadnix.enable = true;
           statix.enable = true;
