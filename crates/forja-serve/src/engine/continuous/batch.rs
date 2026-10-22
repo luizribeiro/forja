@@ -2,7 +2,8 @@ use std::collections::VecDeque;
 
 use forja_core::Backend;
 use forja_host::{
-    BatchPhase, BatchSelection, BatchShape, EngineBatch, EngineBatchLane, EngineLaneCheckpoint,
+    BatchPhase, BatchSelection, BatchShape, EngineBatch, EngineBatchLane, EngineBatchOutput,
+    EngineLaneCheckpoint,
 };
 use tokio::sync::mpsc;
 
@@ -12,6 +13,16 @@ use super::{
 };
 use crate::engine::{GenerationError, ServingEngine};
 use crate::{http::ServiceCommand, metrics::observe_phase};
+
+struct PendingBatch {
+    output: EngineBatchOutput,
+    lanes: Vec<PendingLane>,
+}
+
+struct PendingLane {
+    slot: u32,
+    checkpoint: EngineLaneCheckpoint<()>,
+}
 
 impl<B> ServingEngine<B>
 where
@@ -45,8 +56,8 @@ where
                     return;
                 }
             }
-            let shape = match self.decode_shape(&active) {
-                Ok(shape) => shape,
+            let batch = match self.submit_batch(&active, &[]).await {
+                Ok(batch) => batch,
                 Err(error) => {
                     for lane in active {
                         self.fail_batch_lane(lane, repeated_error(&error));
@@ -54,43 +65,10 @@ where
                     return;
                 }
             };
-            let checkpoints = match self.checkpoint_lanes(&active) {
-                Ok(checkpoints) => checkpoints,
-                Err(error) => {
-                    for lane in active {
-                        self.fail_batch_lane(lane, repeated_error(&error));
-                    }
-                    return;
-                }
-            };
-            let inputs = match batch_inputs(shape, &active) {
-                Ok(inputs) => inputs,
-                Err(error) => {
-                    for lane in active {
-                        self.fail_batch_lane(lane, repeated_error(&error));
-                    }
-                    return;
-                }
-            };
-            let output = self
-                .runner
-                .batch_step(EngineBatch {
-                    shape,
-                    lanes: inputs,
-                })
-                .await;
-            let tokens = match output {
-                Ok(Ok(output)) => match self.runner.read(&output.tokens).await {
-                    Ok(bytes) => read_batch_tokens(&bytes),
-                    Err(error) => Err(GenerationError::unavailable(format!(
-                        "decode batch read failed: {error}"
-                    ))),
-                },
-                Ok(Err(error)) => Err(GenerationError::unavailable(format!(
-                    "decode batch failed: {error:?}"
-                ))),
+            let tokens = match self.runner.read_queued_batch_tokens(batch.output).await {
+                Ok(bytes) => read_batch_tokens(&bytes),
                 Err(error) => Err(GenerationError::unavailable(format!(
-                    "decode batch failed: {error}"
+                    "decode batch read failed: {error}"
                 ))),
             };
             let tokens = match tokens {
@@ -102,7 +80,7 @@ where
                     return;
                 }
             };
-            active = self.apply_batch_tokens(active, checkpoints, &tokens).await;
+            active = self.apply_batch_tokens(active, batch.lanes, &tokens).await;
             self.admit_pending(receiver, pending, &mut active, &mut deferred)
                 .await;
         }
@@ -111,15 +89,15 @@ where
     async fn apply_batch_tokens(
         &mut self,
         active: Vec<BatchLane>,
-        checkpoints: Vec<EngineLaneCheckpoint<()>>,
+        submitted: Vec<PendingLane>,
         tokens: &[u32],
     ) -> Vec<BatchLane> {
         let mut next = Vec::new();
-        for (mut lane, checkpoint) in active.into_iter().zip(checkpoints) {
+        for (mut lane, submitted) in active.into_iter().zip(submitted) {
             if lane.control.is_cancelled() {
                 let rollback = self
                     .runner
-                    .rollback_paged_lane(lane.slot, checkpoint.paged)
+                    .rollback_paged_lane(submitted.slot, submitted.checkpoint.paged)
                     .map_err(|error| batch_admission_error(&error));
                 self.fail_batch_lane(
                     lane,
@@ -149,6 +127,38 @@ where
             }
         }
         next
+    }
+
+    async fn submit_batch(
+        &mut self,
+        lanes: &[BatchLane],
+        feedback: &[u32],
+    ) -> Result<PendingBatch, GenerationError> {
+        let shape = self.decode_shape(lanes)?;
+        let checkpoints = self.checkpoint_lanes(lanes)?;
+        let inputs = batch_inputs(shape, lanes, feedback)?;
+        let output = self
+            .runner
+            .enqueue_batch_step(EngineBatch {
+                shape,
+                lanes: inputs,
+            })
+            .await
+            .map_err(|error| GenerationError::unavailable(format!("decode batch failed: {error}")))?
+            .map_err(|error| {
+                GenerationError::unavailable(format!("decode batch failed: {error:?}"))
+            })?;
+        Ok(PendingBatch {
+            output,
+            lanes: lanes
+                .iter()
+                .zip(checkpoints)
+                .map(|(lane, checkpoint)| PendingLane {
+                    slot: lane.slot,
+                    checkpoint,
+                })
+                .collect(),
+        })
     }
 
     fn checkpoint_lanes(
@@ -342,6 +352,7 @@ fn reservations_fit(
 fn batch_inputs(
     shape: BatchShape,
     lanes: &[BatchLane],
+    feedback: &[u32],
 ) -> Result<Vec<Option<EngineBatchLane>>, GenerationError> {
     let count = usize::try_from(shape.bucket)
         .map_err(|_| GenerationError::new("decode bucket exceeds usize"))?;
@@ -353,8 +364,14 @@ fn batch_inputs(
             .get_mut(slot)
             .ok_or_else(|| GenerationError::new("decode lane exceeds its bucket"))?;
         *input = Some(EngineBatchLane {
-            tokens: Some(vec![lane.pending_token]),
-            start_pos: lane.position,
+            tokens: (!feedback.contains(&lane.slot)).then(|| vec![lane.pending_token]),
+            start_pos: if feedback.contains(&lane.slot) {
+                lane.position
+                    .checked_add(1)
+                    .ok_or_else(|| GenerationError::new("decode position overflowed"))?
+            } else {
+                lane.position
+            },
             sampling: lane.sampling,
         });
     }
