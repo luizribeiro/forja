@@ -3898,28 +3898,57 @@ impl<B: Backend + 'static> Host<B> {
             .map_err(invalid_handle)?
             .slot
             .ok_or_else(|| invalid_handle("paged slot is not open"))?;
-        let binding = Arc::clone(
-            &self
-                .table
-                .get(&Resource::<BatchSlotEntry>::new_borrow(slot_rep))
-                .map_err(invalid_handle)?
-                .binding,
-        );
         let lane = usize::try_from(lane)
             .map_err(|_| compute::Error::Layout("paged lane exceeds usize".to_owned()))?;
-        let sequence = binding
-            .lane(lane)?
+        let (binding, table_rep, generation_rep) = {
+            let slot = self
+                .table
+                .get(&Resource::<BatchSlotEntry>::new_borrow(slot_rep))
+                .map_err(invalid_handle)?;
+            (
+                Arc::clone(&slot.binding),
+                *slot
+                    .tables
+                    .first()
+                    .and_then(|bank| bank.get(lane))
+                    .ok_or_else(|| invalid_handle("paged lane is missing"))?,
+                slot.generations,
+            )
+        };
+        let lane_binding = binding.lane(lane)?;
+        let sequence = lane_binding
             .sequence
             .lock()
             .map_err(|_| guest_error(BackendError::ExecutionFailed))?
             .as_ref()
             .cloned()
             .ok_or_else(|| invalid_handle("paged sequence is not active"))?;
-        sequence
-            .lock()
-            .map_err(|_| guest_error(BackendError::ExecutionFailed))?
-            .rollback(checkpoint)
-            .map_err(|error| compute::Error::Quota(error.to_string()))
+        let table = {
+            let mut sequence = sequence
+                .lock()
+                .map_err(|_| guest_error(BackendError::ExecutionFailed))?;
+            sequence
+                .rollback(checkpoint)
+                .map_err(|error| compute::Error::Quota(error.to_string()))?;
+            binding
+                .banks
+                .bind(0, lane, &sequence)
+                .map_err(|error| compute::Error::Quota(error.to_string()))?;
+            binding
+                .banks
+                .set_logical_len(0, lane, sequence.logical_len())
+                .map_err(|error| compute::Error::Quota(error.to_string()))?;
+            binding
+                .banks
+                .slot(0, lane)
+                .map_err(|error| compute::Error::Quota(error.to_string()))?
+                .table()
+                .clone()
+        };
+        lane_binding.table_dirty.store(true, Ordering::Release);
+        self.upload_paged_table(table_rep, generation_rep, &table)?;
+        lane_binding.table_dirty.store(false, Ordering::Release);
+        Ok(())
     }
 
     fn rewind_private_paged_sequence(
@@ -8706,6 +8735,79 @@ mod tests {
             host.table.get(&pool).unwrap().pool.memory_usage().unwrap(),
             before_memory
         );
+    }
+
+    #[test]
+    fn cow_batch_rollback_restores_the_uploaded_lane_table() {
+        let mut host = Host::new(CpuBackend::new(), GENEROUS);
+        let pool = insert_test_pool(&mut host, 1, 16);
+        host.table.get_mut(&pool).unwrap().active_lanes = 2;
+        host.open_paged_slot(&pool, 1).unwrap();
+        let pool_state = host.table.get(&pool).unwrap().pool.clone();
+        let mut first = pool_state.reserve(4).unwrap();
+        first.commit_write(3).unwrap();
+        let retained = super::PagedPrefix::new(first);
+        let fork = retained.fork_reserved(3, 8).unwrap();
+        host.bind_paged_lane(pool.rep(), 0, Some(fork), 8).unwrap();
+        let mut second = pool_state.reserve(4).unwrap();
+        second.commit_write(2).unwrap();
+        host.bind_paged_lane(pool.rep(), 1, Some(super::PagedPrefix::new(second)), 4)
+            .unwrap();
+        let slot_rep = host.table.get(&pool).unwrap().slot.unwrap();
+        let (binding, table_rep) = {
+            let slot = host
+                .table
+                .get(&Resource::<BatchSlotEntry>::new_borrow(slot_rep))
+                .unwrap();
+            (Arc::clone(&slot.binding), slot.tables[0][0])
+        };
+        let restored = binding
+            .lane(0)
+            .unwrap()
+            .sequence
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .table()
+            .unwrap();
+        let restored_entries = restored.pad_with_poison(4).unwrap().entries().to_vec();
+        let (checkpoint, copy) = host.begin_paged_lane_append(pool.rep(), 0, 3, 1).unwrap();
+        assert!(copy.is_some());
+        assert!(host.begin_paged_lane_append(pool.rep(), 1, 1, 1).is_err());
+
+        host.rollback_paged_lane_append(pool.rep(), 0, checkpoint.unwrap())
+            .unwrap();
+
+        let restored_table = binding.banks.slot(0, 0).unwrap().table().clone();
+        assert_eq!(restored_table.entries(), restored_entries);
+        assert_eq!(
+            binding
+                .lane(1)
+                .unwrap()
+                .sequence
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .logical_len(),
+            2
+        );
+        let uploaded = &host
+            .table
+            .get(&Resource::<TensorEntry>::new_borrow(table_rep))
+            .unwrap()
+            .tensor;
+        let mut expected = Vec::new();
+        for entry in restored_table.entries() {
+            expected.extend_from_slice(&entry.page().to_ne_bytes());
+            expected.extend_from_slice(&entry.generation().to_ne_bytes());
+        }
+        assert_eq!(host.backend.read(uploaded).unwrap(), expected);
     }
 
     #[test]
