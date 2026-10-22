@@ -11,8 +11,9 @@ use std::{
 
 use forja_core::Op;
 use forja_host::{
-    BatchPhase, BatchSelection, BatchShape, EngineBatch, EngineBatchLane, EngineBeginDecode,
-    EngineDecode, EngineRunner, EngineStep, Limits, PagedPrefix, SamplingParams,
+    BatchPhase, BatchSelection, BatchShape, EngineBatch, EngineBatchLane, EngineBatchSelect,
+    EngineBatchSelectLane, EngineBeginDecode, EngineDecode, EngineRunner, EngineStep, Limits,
+    PagedPrefix, SamplingParams,
 };
 use golden_fixtures::{
     BF16_HIDDEN_STATE_TOLERANCE, FixtureDirectory, decode_f32_le, normwise_relative_error,
@@ -109,6 +110,72 @@ async fn metal_batch_tokens_match_single_lanes_exactly() -> Result<(), Box<dyn E
             .iter()
             .enumerate()
             .all(|(lane, &token)| lanes[lane].is_some() || token == 0)
+    );
+    assert_batch_graph_modes().await?;
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+async fn assert_batch_graph_modes() -> Result<(), Box<dyn Error>> {
+    let mut runner = runner(test_guests::qwen3_coder()).await?;
+    let mut config = load_config()?;
+    config.paged_cache = true;
+    runner.load_with_selections(Some(1), &config).await??;
+    let prefixes = [
+        batch_prefix(&mut runner, 1).await?,
+        batch_prefix(&mut runner, 4).await?,
+    ];
+    for (lane, prefix) in prefixes.into_iter().enumerate() {
+        runner.prepare_paged_lane(u32::try_from(lane)?, Some(prefix), 64)?;
+    }
+    let shape = BatchShape {
+        phase: BatchPhase::Decode,
+        bucket: 2,
+        tokens: 1,
+        selection: BatchSelection::Forward,
+    };
+    let lanes = [(1, 31), (4, 37)].map(|(start_pos, token)| {
+        Some(EngineBatchLane {
+            tokens: Some(vec![token]),
+            start_pos,
+            sampling: SamplingParams::default(),
+        })
+    });
+    let logits = runner
+        .batch_forward(EngineBatch {
+            shape,
+            lanes: lanes.into(),
+        })
+        .await??;
+    let sampling = SamplingParams {
+        temperature: 0.7,
+        top_k: 20,
+        top_p: 0.9,
+        seed: 17,
+    };
+    let selected = runner
+        .batch_select(
+            &logits,
+            EngineBatchSelect {
+                shape: BatchShape {
+                    selection: BatchSelection::Masked,
+                    ..shape
+                },
+                lanes: [(1, 101), (4, 102)]
+                    .map(|(start_pos, token)| {
+                        Some(EngineBatchSelectLane {
+                            start_pos,
+                            sampling,
+                            allow: vec![token],
+                        })
+                    })
+                    .into(),
+            },
+        )
+        .await??;
+    assert_eq!(
+        batch_tokens(&runner.read(&selected.tokens).await?)?,
+        [101, 102]
     );
     Ok(())
 }
@@ -736,7 +803,11 @@ async fn batch_decode(
                 .collect(),
         })
         .await??;
-    let bytes = runner.read(&output.tokens).await?;
+    batch_tokens(&runner.read(&output.tokens).await?)
+}
+
+#[cfg(target_os = "macos")]
+fn batch_tokens(bytes: &[u8]) -> Result<Vec<u32>, Box<dyn Error>> {
     let (words, remainder) = bytes.as_chunks::<4>();
     if !remainder.is_empty() {
         return Err("batch token output is not u32-aligned".into());
