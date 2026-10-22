@@ -50,6 +50,7 @@ pub(super) struct BatchLane {
     pub(super) slot: u32,
     pub(super) pending_token: u32,
     pub(super) position: u32,
+    pub(super) reserved_tokens: u64,
     pub(super) sampling: SamplingParams,
     pub(super) control: GenerationControl,
     params: crate::ResolvedParams,
@@ -79,6 +80,8 @@ impl BatchLane {
             slot,
             pending_token,
             position: request.prompt_tokens,
+            reserved_tokens: u64::from(request.prompt_tokens)
+                + u64::from(request.params.max_tokens),
             sampling,
             control: request.control,
             boundary: BoundaryState::new(&request.params.stops, None),

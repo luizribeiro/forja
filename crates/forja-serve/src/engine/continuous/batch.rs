@@ -7,7 +7,9 @@ use forja_host::{
 use tokio::sync::mpsc;
 
 use super::lane::BatchLane;
-use super::{RequestEnvelope, batch_admission_error, read_batch_tokens, repeated_error};
+use super::{
+    PreparedRequest, RequestEnvelope, batch_admission_error, read_batch_tokens, repeated_error,
+};
 use crate::engine::{GenerationError, ServingEngine};
 use crate::{http::ServiceCommand, metrics::observe_phase};
 
@@ -21,7 +23,9 @@ where
         pending: &mut VecDeque<RequestEnvelope>,
     ) {
         let mut active = Vec::new();
-        self.admit_pending(receiver, pending, &mut active).await;
+        let mut deferred = None;
+        self.admit_pending(receiver, pending, &mut active, &mut deferred)
+            .await;
         while !active.is_empty() {
             active = active
                 .into_iter()
@@ -35,7 +39,11 @@ where
                 })
                 .collect();
             if active.is_empty() {
-                return;
+                self.admit_pending(receiver, pending, &mut active, &mut deferred)
+                    .await;
+                if active.is_empty() {
+                    return;
+                }
             }
             let shape = match self.decode_shape(&active) {
                 Ok(shape) => shape,
@@ -95,7 +103,8 @@ where
                 }
             };
             active = self.apply_batch_tokens(active, checkpoints, &tokens).await;
-            self.admit_pending(receiver, pending, &mut active).await;
+            self.admit_pending(receiver, pending, &mut active, &mut deferred)
+                .await;
         }
     }
 
@@ -183,14 +192,16 @@ where
         receiver: &mut mpsc::Receiver<ServiceCommand>,
         pending: &mut VecDeque<RequestEnvelope>,
         active: &mut Vec<BatchLane>,
+        deferred: &mut Option<PreparedRequest>,
     ) {
         while let Ok(command) = receiver.try_recv() {
             pending.push_back(RequestEnvelope::from_command(command));
         }
         while active.len() < usize::try_from(self.scheduler.active_lanes).unwrap_or(usize::MAX) {
-            if pending
-                .front()
-                .is_none_or(RequestEnvelope::requires_serial_path)
+            if deferred.is_none()
+                && pending
+                    .front()
+                    .is_none_or(RequestEnvelope::requires_serial_path)
             {
                 return;
             }
@@ -199,17 +210,26 @@ where
             else {
                 return;
             };
-            let Some(envelope) = pending.pop_front() else {
+            let prepared = if let Some(prepared) = deferred.take() {
+                prepared
+            } else {
+                let Some(envelope) = pending.pop_front() else {
+                    return;
+                };
+                observe_phase(
+                    &mut self.metrics.queue_time,
+                    &mut self.metrics.queue_time_ns,
+                    envelope.queued().elapsed(),
+                );
+                let Some(prepared) = envelope.prepare(self).await else {
+                    continue;
+                };
+                prepared
+            };
+            if !self.reservation_fits(active, &prepared) {
+                *deferred = Some(prepared);
                 return;
-            };
-            observe_phase(
-                &mut self.metrics.queue_time,
-                &mut self.metrics.queue_time_ns,
-                envelope.queued().elapsed(),
-            );
-            let Some(prepared) = envelope.prepare(self).await else {
-                continue;
-            };
+            }
             let Some(mut lane) = self.start_batch_lane(prepared, slot).await else {
                 continue;
             };
@@ -226,6 +246,24 @@ where
                 Err(error) => self.fail_batch_lane(lane, error),
             }
         }
+    }
+
+    fn reservation_fits(&self, active: &[BatchLane], request: &PreparedRequest) -> bool {
+        let Some(serving) = self.info.serving.as_ref() else {
+            return false;
+        };
+        let candidate =
+            u64::from(request.prompt_tokens).checked_add(u64::from(request.params.max_tokens));
+        candidate.is_some_and(|candidate| {
+            reservations_fit(
+                serving.page_tokens,
+                serving.max_context,
+                active
+                    .iter()
+                    .map(|lane| lane.reserved_tokens)
+                    .chain(std::iter::once(candidate)),
+            )
+        })
     }
 
     fn decode_shape(&self, lanes: &[BatchLane]) -> Result<BatchShape, GenerationError> {
@@ -286,6 +324,21 @@ where
     }
 }
 
+fn reservations_fit(
+    page_tokens: u32,
+    max_context: u32,
+    reservations: impl IntoIterator<Item = u64>,
+) -> bool {
+    let page_tokens = u64::from(page_tokens);
+    let capacity = u64::from(max_context).div_ceil(page_tokens);
+    reservations
+        .into_iter()
+        .try_fold(0_u64, |total, tokens| {
+            total.checked_add(tokens.div_ceil(page_tokens))
+        })
+        .is_some_and(|pages| pages <= capacity)
+}
+
 fn batch_inputs(
     shape: BatchShape,
     lanes: &[BatchLane],
@@ -306,4 +359,15 @@ fn batch_inputs(
         });
     }
     Ok(inputs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::reservations_fit;
+
+    #[test]
+    fn page_reservations_defer_the_first_request_that_does_not_fit() {
+        assert!(reservations_fit(64, 32_768, [4_225; 7]));
+        assert!(!reservations_fit(64, 32_768, [4_225; 8]));
+    }
 }
