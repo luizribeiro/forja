@@ -6213,12 +6213,13 @@ struct PagedDispatchContext<'a> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PagedBound {
     Write { start: Affine, tokens: u64 },
+    Read { start: Affine, tokens: u64 },
 }
 
 impl PagedBound {
     const fn is_constant(self) -> bool {
         match self {
-            Self::Write { start, .. } => start.is_constant(),
+            Self::Write { start, .. } | Self::Read { start, .. } => start.is_constant(),
         }
     }
 }
@@ -6251,9 +6252,27 @@ impl PagedCheck {
             bank,
             lane,
         } = &self.usage;
+        let logical_len = || {
+            binding
+                .banks
+                .append_window(*bank, *lane)
+                .map(|window| window.end)
+                .map_err(paged_refusal)
+        };
         match self.bound {
             PagedBound::Write { start, tokens } => {
                 binding.validate_append(*bank, *lane, resolve(start)?, tokens)
+            }
+            PagedBound::Read { start, tokens } => {
+                let end = resolve(start)?
+                    .checked_add(tokens)
+                    .ok_or_else(|| paged_refusal(PagePoolError::ArithmeticOverflow))?;
+                if end > logical_len()? {
+                    return Err(compute::Error::Layout(
+                        "paged read ends beyond the bound sequence".to_owned(),
+                    ));
+                }
+                Ok(())
             }
         }
     }
@@ -7430,7 +7449,13 @@ where
                         tokens: span.len,
                     }),
                 ),
-                paged_storage::CopyDirection::OutOfPages => (PagedCopyDirection::OutOfPages, None),
+                paged_storage::CopyDirection::OutOfPages => (
+                    PagedCopyDirection::OutOfPages,
+                    Some(PagedBound::Read {
+                        start,
+                        tokens: span.len,
+                    }),
+                ),
             };
             let page_tokens = pages.tensor.layout().shape()[1];
             let template = TemplateOp::paged_copy(direction, start, page_tokens);
@@ -8822,6 +8847,17 @@ mod tests {
         start: compute::Affine,
         tokens: u32,
     ) -> Result<(), compute::Error> {
+        let direction = paged_storage::CopyDirection::IntoPages;
+        record_paged_rows(host, commands, (slot, lane), (start, tokens), direction).await
+    }
+
+    async fn record_paged_rows(
+        host: &mut Host<CpuBackend>,
+        commands: &Resource<super::CommandListEntry>,
+        (slot, lane): (&Resource<BatchSlotEntry>, u32),
+        (start, tokens): (compute::Affine, u32),
+        direction: paged_storage::CopyDirection,
+    ) -> Result<(), compute::Error> {
         let rows = host.alloc(compute::Dtype::F32, &[tokens, 2]).unwrap();
         <Host<CpuBackend> as paged_storage::Host>::record_paged_copy(
             host,
@@ -8834,7 +8870,7 @@ mod tests {
                 len: u64::from(tokens),
             },
             Resource::new_borrow(rows.rep()),
-            paged_storage::CopyDirection::IntoPages,
+            direction,
         )
         .await
         .unwrap()
@@ -8888,6 +8924,25 @@ mod tests {
         let ahead = record_into_pages(&mut host, &commands, &slot, 0, wit_affine(None, 0, 4), 2);
         assert!(matches!(ahead.await, Err(compute::Error::Layout(_))));
         record_into_pages(&mut host, &commands, &slot, 0, wit_affine(None, 0, 4), 1)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn guest_read_beyond_the_logical_length_is_refused() {
+        let mut host = Host::new(CpuBackend::new(), GENEROUS);
+        let pool = insert_test_pool(&mut host, 2, 8);
+        let slot = host.open_paged_slot(&pool, 2).unwrap();
+        host.bind_paged_request(pool.rep(), None, 8).unwrap();
+        host.begin_paged_append(pool.rep(), 0, 4).unwrap();
+        let commands = host.command_list().unwrap();
+        let direction = paged_storage::CopyDirection::OutOfPages;
+
+        let overread = (wit_affine(None, 0, 2), 3);
+        let refused = record_paged_rows(&mut host, &commands, (&slot, 0), overread, direction);
+        assert!(matches!(refused.await, Err(compute::Error::Layout(_))));
+        let committed = (wit_affine(None, 0, 0), 4);
+        record_paged_rows(&mut host, &commands, (&slot, 0), committed, direction)
             .await
             .unwrap();
     }
