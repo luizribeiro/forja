@@ -5345,6 +5345,10 @@ impl<B: Backend + 'static> Host<B> {
                 "submit does not accept parameterized command lists".to_owned(),
             ));
         }
+        if let Err(error) = PagedCheck::validate_all(&entry.paged_bounds, None) {
+            self.release_retained(entry.retained)?;
+            return Err(error);
+        }
         Ok(SubmitRequest {
             backend: Arc::clone(&self.backend),
             work: SubmissionWork::Commands(entry.commands),
@@ -5395,9 +5399,7 @@ impl<B: Backend + 'static> Host<B> {
             .graph
             .values(values.clone())
             .map_err(|error| graph_error(&error))?;
-        for check in &entry.paged_bounds {
-            check.validate(Some(&checked))?;
-        }
+        PagedCheck::validate_all(&entry.paged_bounds, Some(&checked))?;
         Ok(SubmitRequest {
             backend: Arc::clone(&self.backend),
             work: SubmissionWork::Replay {
@@ -6238,6 +6240,10 @@ impl PartialEq for PagedCheck {
 }
 
 impl PagedCheck {
+    fn validate_all(checks: &[Self], values: Option<&ParamValues>) -> Result<(), compute::Error> {
+        checks.iter().try_for_each(|check| check.validate(values))
+    }
+
     /// Validates this bound against its lane, resolving parameters from `values`; without
     /// values only constant bounds resolve.
     fn validate(&self, values: Option<&ParamValues>) -> Result<(), compute::Error> {
@@ -9016,6 +9022,26 @@ mod tests {
                 .await
                 .unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn command_list_held_past_its_step_is_refused_at_submit() {
+        let mut host = Host::new(CpuBackend::new(), GENEROUS);
+        let pool = insert_test_pool(&mut host, 2, 8);
+        let slot = host.open_paged_slot(&pool, 2).unwrap();
+        host.bind_paged_request(pool.rep(), None, 8).unwrap();
+        host.begin_paged_append(pool.rep(), 0, 1).unwrap();
+        let held = host.command_list().unwrap();
+        record_into_pages(&mut host, &held, &slot, 0, wit_affine(None, 0, 0), 1)
+            .await
+            .unwrap();
+
+        host.begin_paged_append(pool.rep(), 1, 1).unwrap();
+
+        assert!(matches!(
+            host.prepare_submit(held),
+            Err(compute::Error::Layout(_))
+        ));
     }
 
     #[tokio::test]
