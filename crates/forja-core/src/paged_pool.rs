@@ -1,6 +1,7 @@
 use std::{
     error::Error,
     fmt,
+    ops::Range,
     sync::{Arc, Mutex},
 };
 
@@ -363,6 +364,7 @@ enum AuxCharge {
 pub struct PagedSlot {
     table: PageTable,
     logical_len: u64,
+    append_start: u64,
     active: bool,
 }
 
@@ -377,6 +379,12 @@ impl PagedSlot {
     #[must_use]
     pub const fn logical_len(&self) -> u64 {
         self.logical_len
+    }
+
+    /// Returns the tokens appended since the lane's last committed boundary.
+    #[must_use]
+    pub const fn append_window(&self) -> Range<u64> {
+        self.append_start..self.logical_len
     }
 
     /// Reports whether this lane has a bound sequence capability.
@@ -421,6 +429,7 @@ impl PagedSlotBanks {
         let lane = PagedSlot {
             table: PageTable::poisoned(table_pages),
             logical_len: 0,
+            append_start: 0,
             active: false,
         };
         let first = vec![lane.clone(); lanes];
@@ -463,6 +472,7 @@ impl PagedSlotBanks {
         *lanes.get_mut(lane).ok_or(PagePoolError::ForeignResource)? = PagedSlot {
             table,
             logical_len: sequence.logical_len,
+            append_start: sequence.logical_len,
             active: true,
         };
         Ok(())
@@ -484,6 +494,7 @@ impl PagedSlotBanks {
         *lanes.get_mut(lane).ok_or(PagePoolError::ForeignResource)? = PagedSlot {
             table: PageTable::poisoned(self.table_pages),
             logical_len: 0,
+            append_start: 0,
             active: false,
         };
         Ok(())
@@ -505,17 +516,22 @@ impl PagedSlotBanks {
             .ok_or(PagePoolError::ForeignResource)
     }
 
-    /// Updates host-side logical length without changing the bound page table.
+    /// Opens the append window `start..logical_len` without changing the bound page table.
     ///
     /// # Errors
     ///
-    /// Returns an error for an invalid bank, lane, or inactive slot.
-    pub fn set_logical_len(
+    /// Returns an error for an invalid bank, lane, inactive slot, or a window that ends before
+    /// it starts.
+    pub fn open_append(
         &self,
         bank: usize,
         lane: usize,
+        start: u64,
         logical_len: u64,
     ) -> Result<(), PagePoolError> {
+        if start > logical_len {
+            return Err(PagePoolError::UnreservedWrite);
+        }
         let mut lanes = self
             .banks
             .get(bank)
@@ -527,7 +543,27 @@ impl PagedSlotBanks {
             return Err(PagePoolError::ForeignResource);
         }
         slot.logical_len = logical_len;
+        slot.append_start = start;
         Ok(())
+    }
+
+    /// Returns an active lane's append window without copying its page table.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid bank, lane, or inactive slot.
+    pub fn append_window(&self, bank: usize, lane: usize) -> Result<Range<u64>, PagePoolError> {
+        let lanes = self
+            .banks
+            .get(bank)
+            .ok_or(PagePoolError::ForeignResource)?
+            .lock()
+            .map_err(|_| PagePoolError::CorruptState)?;
+        let slot = lanes.get(lane).ok_or(PagePoolError::ForeignResource)?;
+        if !slot.active {
+            return Err(PagePoolError::ForeignResource);
+        }
+        Ok(slot.append_window())
     }
 
     /// Marks one bank unavailable until its submission completion is observed.
@@ -602,10 +638,37 @@ impl PagedSequence {
         let end = start
             .checked_add(tokens)
             .ok_or(PagePoolError::ArithmeticOverflow)?;
-        if start != self.logical_len || end > self.reserved_tokens {
+        if start != self.logical_len {
             return Err(PagePoolError::UnreservedWrite);
         }
-        if tokens == 0 {
+        self.validate_exclusive(start, end)
+    }
+
+    /// Validates a pending write that must stay inside a lane's open append window.
+    ///
+    /// # Errors
+    ///
+    /// Returns unreserved-write or shared-tail errors without changing sequence state.
+    pub fn validate_append(
+        &self,
+        window: &Range<u64>,
+        start: u64,
+        tokens: u64,
+    ) -> Result<(), PagePoolError> {
+        let end = start
+            .checked_add(tokens)
+            .ok_or(PagePoolError::ArithmeticOverflow)?;
+        if start < window.start || end > window.end {
+            return Err(PagePoolError::UnreservedWrite);
+        }
+        self.validate_exclusive(start, end)
+    }
+
+    fn validate_exclusive(&self, start: u64, end: u64) -> Result<(), PagePoolError> {
+        if end > self.reserved_tokens {
+            return Err(PagePoolError::UnreservedWrite);
+        }
+        if end == start {
             return Ok(());
         }
         let page_tokens = u64::from(self.pool.layout().page_tokens());
@@ -1305,8 +1368,8 @@ mod tests {
         let banks = PagedSlotBanks::new(pool.clone(), 2, 2).unwrap();
         banks.bind(0, 0, &sequence).unwrap();
         assert!(banks.slot(0, 0).unwrap().is_active());
-        banks.set_logical_len(0, 0, 3).unwrap();
-        assert_eq!(banks.slot(0, 0).unwrap().logical_len(), 3);
+        banks.open_append(0, 0, 3, 4).unwrap();
+        assert_eq!(banks.slot(0, 0).unwrap().logical_len(), 4);
         let inactive = banks.slot(0, 1).unwrap();
         assert!(!inactive.is_active());
         assert!(inactive.table().resolve(0).is_err());
@@ -1318,6 +1381,66 @@ mod tests {
         assert!(banks.slot(0, 0).unwrap().table().resolve(0).is_err());
         assert!(banks.slot(1, 1).unwrap().is_active());
     }
+
+    #[test]
+    fn slot_append_window_opens_and_closes_on_rebind() {
+        let pool = pool(4_096);
+        let mut sequence = pool.reserve(8).unwrap();
+        sequence.commit_write(4).unwrap();
+        let banks = PagedSlotBanks::new(pool.clone(), 2, 2).unwrap();
+        banks.bind(0, 0, &sequence).unwrap();
+        assert_eq!(banks.append_window(0, 0), Ok(4..4));
+
+        sequence.commit_write(3).unwrap();
+        banks.open_append(0, 0, 4, 7).unwrap();
+        assert_eq!(banks.append_window(0, 0), Ok(4..7));
+        assert_eq!(banks.slot(0, 0).unwrap().append_window(), 4..7);
+        assert_eq!(
+            banks.open_append(0, 0, 8, 7),
+            Err(PagePoolError::UnreservedWrite)
+        );
+        assert_eq!(
+            banks.append_window(0, 1),
+            Err(PagePoolError::ForeignResource)
+        );
+
+        banks.bind(0, 0, &sequence).unwrap();
+        assert_eq!(banks.append_window(0, 0), Ok(7..7));
+    }
+
+    #[test]
+    fn append_validation_admits_only_the_private_open_window() {
+        let pool = pool(4_096);
+        let mut sequence = pool.reserve(8).unwrap();
+        sequence.commit_write(7).unwrap();
+        let window = 5..7;
+
+        assert_eq!(sequence.validate_append(&window, 5, 2), Ok(()));
+        assert_eq!(sequence.validate_append(&window, 6, 1), Ok(()));
+        assert_eq!(
+            sequence.validate_append(&window, 4, 1),
+            Err(PagePoolError::UnreservedWrite)
+        );
+        assert_eq!(
+            sequence.validate_append(&window, 6, 2),
+            Err(PagePoolError::UnreservedWrite)
+        );
+        assert_eq!(
+            sequence.validate_append(&(5..9), 7, 2),
+            Err(PagePoolError::UnreservedWrite)
+        );
+        assert_eq!(
+            sequence.validate_append(&window, u64::MAX, 2),
+            Err(PagePoolError::ArithmeticOverflow)
+        );
+
+        let _published = sequence.fork(7).unwrap();
+        assert_eq!(
+            sequence.validate_append(&window, 5, 2),
+            Err(PagePoolError::SharedTail)
+        );
+    }
+
     #[test]
     fn slots_refuse_sequences_from_another_pool() {
         let primary = pool(4_096);

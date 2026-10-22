@@ -3626,7 +3626,7 @@ impl<B: Backend + 'static> Host<B> {
             }
             binding
                 .banks
-                .set_logical_len(0, lane, sequence.logical_len())
+                .open_append(0, lane, u64::from(start), sequence.logical_len())
                 .map_err(|error| compute::Error::Quota(error.to_string()))?;
             let table = binding
                 .banks
@@ -3933,10 +3933,6 @@ impl<B: Backend + 'static> Host<B> {
             binding
                 .banks
                 .bind(0, lane, &sequence)
-                .map_err(|error| compute::Error::Quota(error.to_string()))?;
-            binding
-                .banks
-                .set_logical_len(0, lane, sequence.logical_len())
                 .map_err(|error| compute::Error::Quota(error.to_string()))?;
             binding
                 .banks
