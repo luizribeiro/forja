@@ -353,7 +353,7 @@ DEFINE_PAGED_STEEL_ATTENTION(paged_steel_attention_128, float, 32, 16, 128)
 DEFINE_PAGED_STEEL_ATTENTION(paged_steel_attention_half_64_64x32, half, 64, 32, 64)
 DEFINE_PAGED_STEEL_ATTENTION(paged_steel_attention_half_128_96x16, half, 96, 16, 128)
 
-template <uint D, uint G, uint HPT>
+template <uint D, uint G, uint HPT, uint KVPTG>
 void paged_sdpa_2pass_1_gqa_body(
     device const uchar *query,
     device const uchar *key,
@@ -378,10 +378,11 @@ void paged_sdpa_2pass_1_gqa_body(
     constexpr uint elements_per_thread = D / 32;
     constexpr uint chunks_per_head = HPT;
     constexpr uint head_groups = G / HPT;
-    uint kv_head = position.x;
+    uint kv_head = position.x * KVPTG + (KVPTG == 1 ? 0 : simd_group);
+    uint head_group = KVPTG == 1 ? simd_group : 0;
     uint block = position.z;
-    uint chunk = simd_group / head_groups;
-    uint first_head = (simd_group % head_groups) * HPT;
+    uint chunk = head_group / head_groups;
+    uint first_head = (head_group % head_groups) * HPT;
     uint keys_per_block = (params.key_length + params.blocks - 1) / params.blocks;
     uint block_start = block * keys_per_block;
     uint block_end = min(params.key_length, block_start + keys_per_block);
@@ -421,7 +422,7 @@ void paged_sdpa_2pass_1_gqa_body(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (valid == 0) {
-        uint head = kv_head * G + simd_group;
+        uint head = kv_head * G + head_group;
         ulong partial_row = ulong(head) * params.blocks + block;
         for (uint element = 0; element < elements_per_thread; ++element) {
             uint column = simd_lane * elements_per_thread + element;
@@ -509,6 +510,20 @@ void paged_sdpa_2pass_1_gqa_body(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
+    if constexpr (KVPTG > 1) {
+        ulong partial_row = ulong(kv_head) * params.blocks + block;
+        for (uint element = 0; element < elements_per_thread; ++element) {
+            uint column = simd_lane * elements_per_thread + element;
+            store_float(partials, partial_row * D + column, input0_dtype,
+                        result[0][element]);
+        }
+        if (simd_lane == 0) {
+            sums[partial_row] = denominator[0];
+            maxs[partial_row] = maximum[0];
+        }
+        return;
+    }
+
     for (uint local_head = 0; local_head < HPT; ++local_head) {
         uint slot = (first_head + local_head) * HPT + chunk;
         float inverse = denominator[local_head] > 0.0f
@@ -526,7 +541,7 @@ void paged_sdpa_2pass_1_gqa_body(
 
     float group_maximum = negative_finite_sentinel();
     for (uint chunk_index = 0; chunk_index < HPT; ++chunk_index) {
-        group_maximum = max(group_maximum, partial_maxs[simd_group * HPT + chunk_index]);
+        group_maximum = max(group_maximum, partial_maxs[head_group * HPT + chunk_index]);
     }
     float group_denominator = 0.0f;
     float group_result[elements_per_thread];
@@ -534,7 +549,7 @@ void paged_sdpa_2pass_1_gqa_body(
         group_result[element] = 0.0f;
     }
     for (uint chunk_index = 0; chunk_index < HPT; ++chunk_index) {
-        uint slot = simd_group * HPT + chunk_index;
+        uint slot = head_group * HPT + chunk_index;
         float weight = partial_sums[slot]
             * fast::exp(partial_maxs[slot] - group_maximum);
         group_denominator += weight;
@@ -544,7 +559,7 @@ void paged_sdpa_2pass_1_gqa_body(
         }
     }
 
-    uint head = kv_head * G + simd_group;
+    uint head = kv_head * G + head_group;
     ulong partial_row = ulong(head) * params.blocks + block;
     for (uint element = 0; element < elements_per_thread; ++element) {
         uint column = simd_lane * elements_per_thread + element;
@@ -557,7 +572,7 @@ void paged_sdpa_2pass_1_gqa_body(
     }
 }
 
-#define DEFINE_PAGED_SDPA_PASS1_GQA(NAME, D, G, HPT)                        \
+#define DEFINE_PAGED_SDPA_PASS1_GQA(NAME, D, G, HPT, KVPTG)                 \
 kernel void NAME(                                                            \
     device const uchar *query [[buffer(0)]],                                 \
     device const uchar *key [[buffer(1)]],                                   \
@@ -579,16 +594,17 @@ kernel void NAME(                                                            \
     threadgroup uint page_valid[4];                                         \
     threadgroup uint first_page;                                             \
     threadgroup uint valid;                                                  \
-    paged_sdpa_2pass_1_gqa_body<D, G, HPT>(                                 \
+    paged_sdpa_2pass_1_gqa_body<D, G, HPT, KVPTG>(                          \
         query, key, value, table, generations, partials, sums, maxs, params, \
         error_flag, position, simd_group, simd_lane, partial_outputs,        \
         partial_sums, partial_maxs, physical_pages, page_valid, first_page,  \
         valid);                                                              \
 }
 
-DEFINE_PAGED_SDPA_PASS1_GQA(paged_sdpa_2pass_1_gqa1_128, 128, 1, 1)
-DEFINE_PAGED_SDPA_PASS1_GQA(paged_sdpa_2pass_1_gqa2_128, 128, 2, 1)
-DEFINE_PAGED_SDPA_PASS1_GQA(paged_sdpa_2pass_1_gqa8_128, 128, 8, 2)
+DEFINE_PAGED_SDPA_PASS1_GQA(paged_sdpa_2pass_1_gqa1_128, 128, 1, 1, 1)
+DEFINE_PAGED_SDPA_PASS1_GQA(paged_sdpa_2pass_1_gqa1x8_128, 128, 1, 1, 8)
+DEFINE_PAGED_SDPA_PASS1_GQA(paged_sdpa_2pass_1_gqa2_128, 128, 2, 1, 1)
+DEFINE_PAGED_SDPA_PASS1_GQA(paged_sdpa_2pass_1_gqa8_128, 128, 8, 2, 1)
 
 template <uint D>
 void paged_sdpa_2pass_2_body(

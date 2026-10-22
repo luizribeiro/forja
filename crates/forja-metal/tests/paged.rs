@@ -771,7 +771,7 @@ fn check_paged_gqa_two_pass(length: u32, variant: &str, heads: (u32, u32)) {
         let error = forja_testing::normwise_relative_error(&reference, &candidate);
         assert!(
             error <= forja_testing::F16_TOLERANCE,
-            "length={length} contiguous={contiguous} error={error}"
+            "length={length} heads={heads:?} contiguous={contiguous} error={error}"
         );
     }
 }
@@ -817,84 +817,98 @@ paged_gqa_two_pass_tests!(
     ),
 );
 
+fn for_each_paged_gqa_safety_heads(mut check: impl FnMut(u32, u32)) {
+    for (query_heads, kv_heads) in [(32, 4), (16, 16)] {
+        check(query_heads, kv_heads);
+    }
+}
+
 #[test]
 fn metal_paged_gqa_two_pass_refuses_corrupt_page_without_reading_it() {
-    let mut rejected_output = Vec::new();
-    let error = run_sdpa(
-        &forja_metal::MetalBackend::new().unwrap(),
-        DType::F16,
-        512,
-        1,
-        false,
-        false,
-        32,
-        4,
-        (0, 0),
-        &[7],
-        Some("paged-sdpa.vector-gqa-two-pass-32"),
-        Some(&mut rejected_output),
-    )
-    .unwrap_err();
-    assert!(matches!(error, BackendError::DeviceErrorFlag { .. }));
-    assert_eq!(rejected_output.len(), 32 * 128);
-    assert!(rejected_output.iter().all(|value| value.is_finite()));
+    let backend = forja_metal::MetalBackend::new().unwrap();
+    for_each_paged_gqa_safety_heads(|query_heads, kv_heads| {
+        let mut rejected_output = Vec::new();
+        let error = run_sdpa(
+            &backend,
+            DType::F16,
+            512,
+            1,
+            false,
+            false,
+            query_heads,
+            kv_heads,
+            (0, 0),
+            &[7],
+            Some("paged-sdpa.vector-gqa-two-pass-32"),
+            Some(&mut rejected_output),
+        )
+        .unwrap_err();
+        assert!(matches!(error, BackendError::DeviceErrorFlag { .. }));
+        assert_eq!(rejected_output.len(), query_heads as usize * 128);
+        assert!(rejected_output.iter().all(|value| value.is_finite()));
+    });
 }
 
 #[test]
 fn metal_paged_gqa_two_pass_keeps_barriers_uniform_across_rejected_pages() {
     let backend = forja_metal::MetalBackend::new().unwrap();
-    for (length, variant) in [
-        (512_u32, "paged-sdpa.vector-gqa-two-pass-32"),
-        (513, "paged-sdpa.vector-gqa-two-pass-32"),
-        (2_048, "paged-sdpa.vector-gqa-two-pass"),
-        (4_000, "paged-sdpa.vector-gqa-two-pass-128"),
-    ] {
-        let pages = usize::try_from(length.div_ceil(64)).unwrap();
-        let corrupt_pages = (1..pages).step_by(2).collect::<Vec<_>>();
-        for _ in 0..50 {
-            let mut rejected_output = Vec::new();
-            let error = run_sdpa(
-                &backend,
-                DType::F16,
-                length,
-                1,
-                false,
-                false,
-                32,
-                4,
-                (0, 0),
-                &corrupt_pages,
-                Some(variant),
-                Some(&mut rejected_output),
-            )
-            .unwrap_err();
-            assert!(matches!(error, BackendError::DeviceErrorFlag { .. }));
-            assert_eq!(rejected_output.len(), 32 * 128);
-            assert!(rejected_output.iter().all(|value| value.is_finite()));
+    for_each_paged_gqa_safety_heads(|query_heads, kv_heads| {
+        for (length, variant) in [
+            (512_u32, "paged-sdpa.vector-gqa-two-pass-32"),
+            (513, "paged-sdpa.vector-gqa-two-pass-32"),
+            (2_048, "paged-sdpa.vector-gqa-two-pass"),
+            (4_000, "paged-sdpa.vector-gqa-two-pass-128"),
+        ] {
+            let pages = usize::try_from(length.div_ceil(64)).unwrap();
+            let corrupt_pages = (1..pages).step_by(2).collect::<Vec<_>>();
+            for _ in 0..8 {
+                let mut rejected_output = Vec::new();
+                let error = run_sdpa(
+                    &backend,
+                    DType::F16,
+                    length,
+                    1,
+                    false,
+                    false,
+                    query_heads,
+                    kv_heads,
+                    (0, 0),
+                    &corrupt_pages,
+                    Some(variant),
+                    Some(&mut rejected_output),
+                )
+                .unwrap_err();
+                assert!(matches!(error, BackendError::DeviceErrorFlag { .. }));
+                assert_eq!(rejected_output.len(), query_heads as usize * 128);
+                assert!(rejected_output.iter().all(|value| value.is_finite()));
+            }
         }
-    }
+    });
 }
 
 #[test]
 fn metal_paged_gqa_two_pass_replaces_stale_scratch_on_early_refusal() {
-    let mut rejected_output = Vec::new();
-    let error = run_sdpa(
-        &forja_metal::MetalBackend::new().unwrap(),
-        DType::F16,
-        512,
-        1,
-        false,
-        false,
-        32,
-        4,
-        (0, 0),
-        &[0],
-        Some("paged-sdpa.vector-gqa-two-pass-32"),
-        Some(&mut rejected_output),
-    )
-    .unwrap_err();
-    assert!(matches!(error, BackendError::DeviceErrorFlag { .. }));
-    assert_eq!(rejected_output, vec![0.0; 32 * 128]);
+    let backend = forja_metal::MetalBackend::new().unwrap();
+    for_each_paged_gqa_safety_heads(|query_heads, kv_heads| {
+        let mut rejected_output = Vec::new();
+        let error = run_sdpa(
+            &backend,
+            DType::F16,
+            512,
+            1,
+            false,
+            false,
+            query_heads,
+            kv_heads,
+            (0, 0),
+            &[0],
+            Some("paged-sdpa.vector-gqa-two-pass-32"),
+            Some(&mut rejected_output),
+        )
+        .unwrap_err();
+        assert!(matches!(error, BackendError::DeviceErrorFlag { .. }));
+        assert_eq!(rejected_output, vec![0.0; query_heads as usize * 128]);
+    });
 }
 
 #[test]
