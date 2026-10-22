@@ -8878,6 +8878,61 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[tokio::test(flavor = "multi_thread")]
+    async fn metal_paged_sdk_graph_rebinds_start_after_query_permutation() {
+        let weights = test_weight_file();
+        let mut runner = EngineRunner::new(
+            test_guests::engine_sdk_smoke(),
+            forja_metal::MetalBackend::new().unwrap(),
+            GENEROUS,
+            &weights,
+        )
+        .await
+        .unwrap();
+        runner
+            .load_with_selections(
+                None,
+                &super::EngineLoadConfig {
+                    paged_cache: true,
+                    ..super::EngineLoadConfig::default()
+                },
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        runner.prepare_paged_request(None, 8).unwrap();
+        let first = runner
+            .step(EngineStep {
+                tokens: vec![1],
+                start_pos: 0,
+                taps: false,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        let first = runner.read(&first.logits).await.unwrap();
+        assert!((first_f32(&first) - 1.0).abs() < 1.0e-5);
+
+        let second = runner
+            .step(EngineStep {
+                tokens: vec![3],
+                start_pos: 1,
+                taps: false,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        let second = runner.read(&second.logits).await.unwrap();
+        assert!((first_f32(&second) - 2.0).abs() < 1.0e-5);
+        fs::remove_file(weights).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    fn first_f32(bytes: &[u8]) -> f32 {
+        f32::from_le_bytes(bytes[..size_of::<f32>()].try_into().unwrap())
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test(flavor = "multi_thread")]
     async fn metal_paged_graph_replays_after_rebinding_a_scattered_table() {
         type Metal = forja_metal::MetalBackend;
         let mut host = Host::new(Metal::new().unwrap(), GENEROUS);

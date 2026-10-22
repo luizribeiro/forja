@@ -239,7 +239,8 @@ impl PagedCache<'_> {
         let hidden = heads
             .checked_mul(width)
             .ok_or_else(|| Error::loading("paged attention width overflowed"))?;
-        let query = query.permute(&[1, 0, 2])?;
+        let query =
+            bind_replay_start_to_permuted_query(query.permute(&[1, 0, 2])?, start, sequence)?;
         let output = Tensor::zeros(&[sequence, heads, width])?;
         let paged_output = output.permute(&[1, 0, 2])?;
         #[cfg(target_family = "wasm")]
@@ -284,6 +285,18 @@ impl PagedCache<'_> {
         #[cfg(not(target_family = "wasm"))]
         let _ = (&query, &paged_output, scale, start, end, selection);
         output.reshape(&[sequence, hidden])
+    }
+}
+
+fn bind_replay_start_to_permuted_query<T: Element>(
+    query: Tensor<T>,
+    start: &Dim,
+    sequence: u32,
+) -> Result<Tensor<T>> {
+    if start.is_symbolic() {
+        query.narrow(1, start.clone().checked_mul(0)?, sequence)
+    } else {
+        Ok(query)
     }
 }
 

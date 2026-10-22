@@ -111,6 +111,27 @@ impl Dim {
             .ok_or_else(|| crate::Error::new("traced dimension overflowed"))?;
         Ok(self)
     }
+
+    /// Multiplies this affine dimension by a constant.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the affine scale, offset, or trace value overflows.
+    pub fn checked_mul(mut self, factor: u32) -> Result<Self> {
+        self.scale = self
+            .scale
+            .checked_mul(factor)
+            .ok_or_else(|| crate::Error::new("affine scale overflowed"))?;
+        self.offset = self
+            .offset
+            .checked_mul(factor)
+            .ok_or_else(|| crate::Error::new("affine offset overflowed"))?;
+        self.value = self
+            .value
+            .checked_mul(factor)
+            .ok_or_else(|| crate::Error::new("traced dimension overflowed"))?;
+        Ok(self)
+    }
 }
 
 impl From<u32> for Dim {
