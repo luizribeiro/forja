@@ -656,6 +656,49 @@ fn metal_paged_sdpa_matches_cpu_at_short_real_shapes() {
     }
 }
 
+#[test]
+fn metal_paged_decomposed_attention_matches_route_sensitive_shapes() {
+    let cpu = forja_cpu::CpuBackend::new();
+    let metal = forja_metal::MetalBackend::new().unwrap();
+    for length in [2, 7, 33] {
+        let reference = run_sdpa(
+            &cpu,
+            DType::F32,
+            length,
+            length,
+            true,
+            false,
+            16,
+            16,
+            (0, 0),
+            &[],
+            None,
+            None,
+        )
+        .unwrap();
+        let candidate = run_sdpa(
+            &metal,
+            DType::F32,
+            length,
+            length,
+            true,
+            false,
+            16,
+            16,
+            (0, 0),
+            &[],
+            Some("paged-sdpa.decomposed"),
+            None,
+        )
+        .unwrap();
+        let error = forja_testing::normwise_relative_error(&reference, &candidate);
+        assert!(
+            error <= forja_testing::F32_TOLERANCE,
+            "length={length} error={error}"
+        );
+    }
+}
+
 macro_rules! real_shape_tests {
     ($(($name:ident, $dtype:expr, $length:expr, $query_length:expr, $heads:expr)),+ $(,)?) => {
         $(

@@ -51,6 +51,7 @@ pub(crate) enum MetalVariant {
     PagedSdpaVectorGqaTwoPass64,
     PagedSdpaVectorGqaTwoPass128,
     PagedSdpaVectorGqaTwoPass256,
+    PagedSdpaDecomposed,
     PagedSdpaSteel,
     PagedSdpaSteelHalf,
     TopKPortable,
@@ -570,6 +571,20 @@ const TOP_K_PARTIALS: &[Constraint] = &[operation(
     Relation::Range { min: 1, max: 64 },
 )];
 const PAGED_SDPA: &[Constraint] = &[value(PAGED_KEY_WIDTH, Relation::OneOf(WIDTHS))];
+const PAGED_SDPA_DECOMPOSED: &[Constraint] = &[
+    value(
+        QUERY_LENGTH,
+        Relation::Range {
+            min: 2,
+            max: u64::MAX,
+        },
+    ),
+    value(PAGED_KEY_WIDTH, Relation::OneOf(WIDTHS)),
+    Constraint::DimensionsEqual {
+        left: PAGED_KEY_WIDTH,
+        right: PAGED_VALUE_WIDTH,
+    },
+];
 const PAGED_GQA_RATIOS: &[u64] = &[1, 2, 8];
 const PAGED_GQA_TWO_PASS: &[Constraint] = &[
     value(QUERY_LENGTH, Relation::Equal(1)),
@@ -875,6 +890,15 @@ pub(crate) static REGISTRY: &[VariantDef<MetalVariant>] = &[
         &["long single-token paged decode with a supported query-to-K/V head ratio."],
         &["unsupported grouped-query factors or shorter cache lengths."],
         &["Reuses each paged K/V load across grouped query heads with 256 reduction blocks."]
+    ),
+    batch_invariant_variant!(
+        "paged-sdpa.decomposed",
+        PagedSdpa,
+        PagedSdpaDecomposed,
+        PAGED_SDPA_DECOMPOSED,
+        &["route-sensitive multi-token paged attention."],
+        &["single-token decode or memory-constrained prefill."],
+        &["Copies authenticated pages into scratch before the ordinary decomposed reduction."]
     ),
     batch_invariant_variant!(
         "paged-sdpa.steel",
@@ -1598,6 +1622,7 @@ mod tests {
                 "paged-sdpa.vector-gqa-two-pass",
                 "paged-sdpa.vector-gqa-two-pass-128",
                 "paged-sdpa.vector-gqa-two-pass-256",
+                "paged-sdpa.decomposed",
                 "paged-sdpa.steel",
                 "paged-sdpa.steel-half",
                 "sdpa.portable",
@@ -2391,6 +2416,11 @@ mod tests {
                 "paged-sdpa.vector-gqa-two-pass-256",
                 paged_sdpa_dispatch_with_heads(DType::F16, 8, 1, 128),
                 "paged_sdpa_2pass_1_gqa8_128",
+            ),
+            (
+                "paged-sdpa.decomposed",
+                paged_sdpa_dispatch(DType::F32, 2, 128),
+                "sdpa_decomposed",
             ),
             (
                 "paged-sdpa.steel",

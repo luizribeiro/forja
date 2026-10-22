@@ -3144,6 +3144,79 @@ impl MetalBackend {
         ))
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn encode_paged_copy_out(
+        &self,
+        encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
+        table: &ProtocolObject<dyn MTL4ArgumentTable>,
+        pool: &EncoderTensor,
+        page_table: &EncoderTensor,
+        generations: &EncoderTensor,
+        ordinary: &EncoderTensor,
+        tokens: u32,
+        page_tokens: u32,
+        logical_pages: u32,
+        physical_pages: u32,
+        error_flag: &BufferBinding,
+        bindings: &mut ArgumentBindings,
+        arguments: &mut ArgumentWriter,
+    ) -> Result<Vec<BufferBinding>, BackendError> {
+        let elements = u32::try_from(ordinary.layout.element_count() / u64::from(tokens))
+            .map_err(|_| BackendError::InvalidInput)?;
+        let mut raw_params = Vec::with_capacity(7 * size_of::<u32>());
+        for value in [
+            0,
+            tokens,
+            elements,
+            page_tokens,
+            logical_pages,
+            physical_pages,
+            1,
+        ] {
+            raw_params.extend_from_slice(&value.to_ne_bytes());
+        }
+        let params = arguments.write(&raw_params)?;
+        let ordinary_layout = Self::layout_buffer(&ordinary.layout, arguments)?;
+        let pipeline = self
+            .pipelines
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?
+            .get(
+                "paged_copy",
+                &[
+                    (0, dtype_code(ordinary.layout.dtype())),
+                    (1, dtype_code(pool.layout.dtype())),
+                ],
+            )?;
+        set_pipeline(encoder, &pipeline);
+        for (index, tensor) in [ordinary, pool, page_table, generations]
+            .into_iter()
+            .enumerate()
+        {
+            bindings.bind(table, index, &tensor.buffer);
+        }
+        bindings.bind(table, 4, &ordinary_layout);
+        bindings.bind(table, 5, &params);
+        bindings.bind(table, 6, error_flag);
+        set_argument_table(encoder, table);
+        let elements = usize::try_from(elements).map_err(|_| BackendError::InvalidInput)?;
+        let threads = elements.min(pipeline.maxTotalThreadsPerThreadgroup());
+        dispatch_threadgroups(
+            encoder,
+            MTLSize {
+                width: elements.div_ceil(threads),
+                height: usize::try_from(tokens).map_err(|_| BackendError::InvalidInput)?,
+                depth: 1,
+            },
+            MTLSize {
+                width: threads,
+                height: 1,
+                depth: 1,
+            },
+        );
+        Ok(vec![ordinary_layout, params])
+    }
+
     #[allow(clippy::too_many_lines)]
     fn encode_paged_sdpa(
         &self,
@@ -3280,6 +3353,80 @@ impl MetalBackend {
                 },
             );
             encode_dispatch_barrier(encoder);
+        }
+        if selected_variant(dispatch) == Some(MetalVariant::PagedSdpaDecomposed) {
+            let key_scratch = self.scratch_tensor(key.layout.dtype(), &[key_length, k[2], k[3]])?;
+            let value_scratch =
+                self.scratch_tensor(value.layout.dtype(), &[key_length, v[2], v[3]])?;
+            let mut temporaries = vec![params.clone(), error_flag.clone()];
+            for (pool, ordinary, shape) in [(&key, &key_scratch, k), (&value, &value_scratch, v)] {
+                temporaries.extend(self.encode_paged_copy_out(
+                    encoder,
+                    table,
+                    pool,
+                    &page_table,
+                    &generations,
+                    ordinary,
+                    key_length,
+                    page_tokens,
+                    t[0],
+                    shape[0],
+                    &error_flag,
+                    bindings,
+                    arguments,
+                )?);
+            }
+            encode_dispatch_barrier(encoder);
+            let key_heads = EncoderTensor {
+                buffer: key_scratch.buffer.clone(),
+                layout: key_scratch
+                    .layout
+                    .permute(&[1, 0, 2])
+                    .map_err(|_| BackendError::InvalidInput)?,
+            };
+            let value_heads = EncoderTensor {
+                buffer: value_scratch.buffer.clone(),
+                layout: value_scratch
+                    .layout
+                    .permute(&[1, 0, 2])
+                    .map_err(|_| BackendError::InvalidInput)?,
+            };
+            let scores = self.scratch_tensor(DType::F32, &[q[0], q[1], key_length])?;
+            temporaries.extend(self.encode_sdpa_query_key(
+                encoder,
+                table,
+                &query,
+                &key_heads,
+                &scores,
+                k[2],
+                q[0] / k[2],
+                bindings,
+                arguments,
+            )?);
+            encode_dispatch_barrier(encoder);
+            temporaries.push(self.encode_sdpa_scale_mask(
+                encoder, table, &scores, scale, causal, q_start, bindings, arguments,
+            )?);
+            encode_dispatch_barrier(encoder);
+            temporaries.extend(
+                self.encode_softmax_tensors(encoder, table, &scores, &scores, bindings, arguments)?,
+            );
+            encode_dispatch_barrier(encoder);
+            temporaries.extend(self.encode_sdpa_probability_value(
+                encoder,
+                table,
+                &scores,
+                &value_heads,
+                &output,
+                k[2],
+                q[0] / k[2],
+                q[1],
+                v[3],
+                bindings,
+                arguments,
+            )?);
+            temporaries.extend([key_scratch.buffer, value_scratch.buffer, scores.buffer]);
+            return Ok((temporaries, error_flag));
         }
         if let Some(kernel) = match selected_variant(dispatch) {
             Some(MetalVariant::PagedSdpaSteel) => Some(SdpaKernel::Steel),
@@ -6726,6 +6873,7 @@ impl MetalBackend {
         Ok(arguments.offset.max(1))
     }
 
+    #[allow(clippy::too_many_lines)]
     fn size_dispatch_arguments(
         &self,
         dispatch: &Dispatch,
@@ -6825,6 +6973,26 @@ impl MetalBackend {
             Op::PagedSdpa { .. } => {
                 arguments.write(128)?;
                 arguments.write(3 * size_of::<u32>())?;
+                if selected_variant(dispatch) == Some(MetalVariant::PagedSdpaDecomposed) {
+                    for _ in 0..2 {
+                        arguments.write(7 * size_of::<u32>())?;
+                        arguments.write(112)?;
+                    }
+                    let kv_heads = dispatch
+                        .inputs()
+                        .get(1)
+                        .and_then(|key| key.layout().shape().get(2))
+                        .copied()
+                        .ok_or(BackendError::InvalidInput)?;
+                    for _ in 0..kv_heads {
+                        arguments.write(96)?;
+                    }
+                    arguments.write(24)?;
+                    Self::size_softmax_arguments(arguments)?;
+                    for _ in 0..kv_heads {
+                        arguments.write(96)?;
+                    }
+                }
             }
         }
         Ok(())
@@ -7501,6 +7669,7 @@ fn sdpa_kernel(dispatch: &Dispatch) -> Result<&'static str, BackendError> {
 
 fn paged_sdpa_kernel(dispatch: &Dispatch, width: u32) -> Result<&'static str, BackendError> {
     match (selected_variant(dispatch), width) {
+        (Some(MetalVariant::PagedSdpaDecomposed), 64 | 128) => Ok("sdpa_decomposed"),
         (
             Some(
                 MetalVariant::PagedSdpaVectorGqaTwoPass32
@@ -7830,7 +7999,9 @@ pub(super) fn variant_supported(
         | MetalVariant::SdpaVectorGqaTwoPass256 => vector_sdpa_supported(dispatch)?,
         MetalVariant::SdpaSteel => steel_sdpa_supported(dispatch)?,
         MetalVariant::SdpaSteelHalf => half_steel_sdpa_supported(dispatch)?,
-        MetalVariant::PagedSdpaVector => matches!(dispatch.op(), Op::PagedSdpa { .. }),
+        MetalVariant::PagedSdpaVector | MetalVariant::PagedSdpaDecomposed => {
+            matches!(dispatch.op(), Op::PagedSdpa { .. })
+        }
         MetalVariant::PagedSdpaVectorGqaTwoPass32
         | MetalVariant::PagedSdpaVectorGqaTwoPass64
         | MetalVariant::PagedSdpaVectorGqaTwoPass128
