@@ -25,9 +25,9 @@ use forja_core::{
     Affine, Backend, BackendDispatchData, BackendError, BufferId, CommandList, DType, DeviceInfo,
     GraphLimits, GraphTemplate, Layout, LayoutError, MemoryUsage, Op, OpError, PagePool,
     PagePoolError, PagedCopyDirection, PagedLayout, PagedPlane, PagedSequence, PagedSlotBanks,
-    ParamSpace, PreparedGraph, RuleArm, SequenceCheckpoint, Slice, Submission, SubmissionProfile,
-    SymbolicLayout, SymbolicLayoutError, TemplateOp, TemplateTensor, Tensor, ViewOp,
-    gather_matmul_flops, gather_quant_matmul_dispatch_flops, matmul_flops,
+    ParamError, ParamSpace, ParamValues, PreparedGraph, RuleArm, SequenceCheckpoint, Slice,
+    Submission, SubmissionProfile, SymbolicLayout, SymbolicLayoutError, TemplateOp, TemplateTensor,
+    Tensor, ViewOp, gather_matmul_flops, gather_quant_matmul_dispatch_flops, matmul_flops,
     program::{
         BinOp, EpilogueError, EpilogueSignature, Inst, KernelSignature, MAX_INSTRUCTIONS,
         MAX_OUTPUTS, PrepareError, PreparedEpilogue, PreparedProgram, Program, ProgramError,
@@ -2932,8 +2932,17 @@ impl PagedBinding {
             .ok_or_else(|| invalid_handle("paged lane is out of range"))
     }
 
-    fn validate_append(&self, lane: usize, start: u64, tokens: u64) -> Result<(), compute::Error> {
-        let window = self.banks.append_window(0, lane).map_err(paged_refusal)?;
+    fn validate_append(
+        &self,
+        bank: usize,
+        lane: usize,
+        start: u64,
+        tokens: u64,
+    ) -> Result<(), compute::Error> {
+        let window = self
+            .banks
+            .append_window(bank, lane)
+            .map_err(paged_refusal)?;
         let sequence = self
             .lane(lane)?
             .sequence
@@ -3208,6 +3217,20 @@ pub struct CommandListEntry {
     retained_kernels: Vec<KernelEntry>,
     retained_epilogues: Vec<EpilogueEntry>,
     paged: Vec<PagedUse>,
+}
+
+impl CommandListEntry {
+    fn note_paged(&mut self, usage: PagedUse) -> Result<(), compute::Error> {
+        usage
+            .binding
+            .lane(usage.lane)?
+            .used
+            .store(true, Ordering::Release);
+        if !self.paged.iter().any(|existing| existing.same_lane(&usage)) {
+            self.paged.push(usage);
+        }
+        Ok(())
+    }
 }
 
 /// Host-owned state behind a guest graph resource.
@@ -4639,8 +4662,16 @@ impl<B: Backend + 'static> Host<B> {
         let PagedDispatchContext {
             protected,
             usage,
+            bound,
             variant_name,
         } = context;
+        if let Some(bound) = bound.filter(|bound| bound.is_constant()) {
+            PagedCheck {
+                usage: usage.clone(),
+                bound,
+            }
+            .validate(None)?;
+        }
         let (template_op, concrete_op) = operation;
         let input_tensors = inputs.iter().map(|entry| &entry.tensor).collect::<Vec<_>>();
         let output_tensors = [&output.tensor];
@@ -4719,17 +4750,7 @@ impl<B: Backend + 'static> Host<B> {
         entry.protected.extend(protected);
         entry.retained.extend(inputs);
         entry.retained.push(output);
-        usage
-            .binding
-            .lane(usage.lane)?
-            .used
-            .store(true, Ordering::Release);
-        if !entry.paged.iter().any(|existing| {
-            existing.lane == usage.lane && Arc::ptr_eq(&existing.binding, &usage.binding)
-        }) {
-            entry.paged.push(usage);
-        }
-        Ok(())
+        entry.note_paged(usage)
     }
 
     fn paged_slot_entries(
@@ -6184,7 +6205,58 @@ struct PagedUse {
 struct PagedDispatchContext<'a> {
     protected: Vec<BufferId>,
     usage: PagedUse,
+    bound: Option<PagedBound>,
     variant_name: Option<&'a str>,
+}
+
+/// A guest-chosen paged span that must stay inside its lane's bounds whenever it executes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PagedBound {
+    Write { start: Affine, tokens: u64 },
+}
+
+impl PagedBound {
+    const fn is_constant(self) -> bool {
+        match self {
+            Self::Write { start, .. } => start.is_constant(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PagedCheck {
+    usage: PagedUse,
+    bound: PagedBound,
+}
+
+impl PagedCheck {
+    /// Validates this bound against its lane, resolving parameters from `values`; without
+    /// values only constant bounds resolve.
+    fn validate(&self, values: Option<&ParamValues>) -> Result<(), compute::Error> {
+        let resolve = |affine: Affine| {
+            values
+                .map_or_else(
+                    || {
+                        affine
+                            .constant_value()
+                            .ok_or(ParamError::UnknownParameter { index: 0 })
+                    },
+                    |values| affine.evaluate(values),
+                )
+                .map(u64::from)
+                .map_err(|error| graph_error(&error))
+        };
+        let PagedUse {
+            binding,
+            bank,
+            lane,
+        } = &self.usage;
+        match self.bound {
+            PagedBound::Write { start, tokens } => {
+                binding.validate_append(*bank, *lane, resolve(start)?, tokens)
+            }
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -6209,6 +6281,12 @@ impl std::fmt::Debug for PagedUse {
 }
 
 impl PagedUse {
+    fn same_lane(&self, other: &Self) -> bool {
+        self.bank == other.bank
+            && self.lane == other.lane
+            && Arc::ptr_eq(&self.binding, &other.binding)
+    }
+
     fn mark_all(usages: &[Self], serial: Option<u64>) -> Result<(), BackendError> {
         serial.map_or(Ok(()), |serial| {
             usages
@@ -7344,9 +7422,15 @@ where
                     "paged copy span length does not match the tensor".to_owned(),
                 ));
             }
-            let direction = match direction {
-                paged_storage::CopyDirection::IntoPages => PagedCopyDirection::IntoPages,
-                paged_storage::CopyDirection::OutOfPages => PagedCopyDirection::OutOfPages,
+            let (direction, bound) = match direction {
+                paged_storage::CopyDirection::IntoPages => (
+                    PagedCopyDirection::IntoPages,
+                    Some(PagedBound::Write {
+                        start,
+                        tokens: span.len,
+                    }),
+                ),
+                paged_storage::CopyDirection::OutOfPages => (PagedCopyDirection::OutOfPages, None),
             };
             let page_tokens = pages.tensor.layout().shape()[1];
             let template = TemplateOp::paged_copy(direction, start, page_tokens);
@@ -7357,13 +7441,6 @@ where
             });
             match direction {
                 PagedCopyDirection::IntoPages => {
-                    if start.is_constant() {
-                        usage.binding.validate_append(
-                            usage.lane,
-                            u64::from(span.start.offset),
-                            span.len,
-                        )?;
-                    }
                     let protected = vec![
                         pages.tensor.buffer(),
                         table.tensor.buffer(),
@@ -7377,6 +7454,7 @@ where
                         PagedDispatchContext {
                             protected,
                             usage,
+                            bound,
                             variant_name: None,
                         },
                     )
@@ -7395,6 +7473,7 @@ where
                         PagedDispatchContext {
                             protected,
                             usage,
+                            bound,
                             variant_name: None,
                         },
                     )
@@ -7496,6 +7575,7 @@ where
                 PagedDispatchContext {
                     protected,
                     usage,
+                    bound: None,
                     variant_name: (!config.algorithm.is_empty())
                         .then_some(config.algorithm.as_str()),
                 },
