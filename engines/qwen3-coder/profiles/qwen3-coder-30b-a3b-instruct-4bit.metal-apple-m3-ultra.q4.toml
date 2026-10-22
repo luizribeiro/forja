@@ -29,7 +29,7 @@ max-context = 32768
 prefill-chunk = 2048
 
 [serving]
-prompt-token-budget = 2048
+prompt-token-budget = 512
 paged-cache = true
 
 [variants.fixed]
