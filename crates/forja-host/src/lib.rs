@@ -7396,7 +7396,9 @@ where
             let key_length = u32::try_from(snapshot.logical_len())
                 .map_err(|_| compute::Error::Layout("paged key length exceeds u32".to_owned()))?;
             let q_start = key_length.checked_sub(query_tokens).ok_or_else(|| {
-                compute::Error::Layout("paged query exceeds the key length".to_owned())
+                compute::Error::Layout(format!(
+                    "paged query length {query_tokens} exceeds key length {key_length}"
+                ))
             })?;
             let affine_q_start = core_affine(config.q_start);
             let affine_key_length = core_affine(config.key_length);
