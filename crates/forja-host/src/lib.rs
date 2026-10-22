@@ -2931,6 +2931,23 @@ impl PagedBinding {
             .get(lane)
             .ok_or_else(|| invalid_handle("paged lane is out of range"))
     }
+
+    fn validate_append(&self, lane: usize, start: u64, tokens: u64) -> Result<(), compute::Error> {
+        let window = self.banks.append_window(0, lane).map_err(paged_refusal)?;
+        let sequence = self
+            .lane(lane)?
+            .sequence
+            .lock()
+            .map_err(|_| guest_error(BackendError::ExecutionFailed))?
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| invalid_handle("paged sequence is not active"))?;
+        sequence
+            .lock()
+            .map_err(|_| guest_error(BackendError::ExecutionFailed))?
+            .validate_append(&window, start, tokens)
+            .map_err(paged_refusal)
+    }
 }
 
 struct PagedBackingHandles {
@@ -7340,6 +7357,13 @@ where
             });
             match direction {
                 PagedCopyDirection::IntoPages => {
+                    if start.is_constant() {
+                        usage.binding.validate_append(
+                            usage.lane,
+                            u64::from(span.start.offset),
+                            span.len,
+                        )?;
+                    }
                     let protected = vec![
                         pages.tensor.buffer(),
                         table.tensor.buffer(),
@@ -8060,6 +8084,10 @@ fn dispatch_work_quota() -> compute::Error {
     quota("dispatch work exceeds the guest limit")
 }
 
+fn paged_refusal(error: forja_core::PagePoolError) -> compute::Error {
+    compute::Error::Layout(error.to_string())
+}
+
 fn invalid_handle(error: impl ToString) -> compute::Error {
     let message = error.to_string();
     drop(error);
@@ -8674,6 +8702,132 @@ mod tests {
         let recorded = host.table.get(&commands).unwrap();
         assert_eq!(recorded.recorded.len(), 2);
         assert_eq!(recorded.paged.len(), 1);
+    }
+
+    const SHARED_PREFIX_TOKENS: u32 = 5;
+
+    fn bind_lanes_on_a_shared_prefix(
+        host: &mut Host<CpuBackend>,
+        lanes: u32,
+    ) -> (
+        Resource<PagePoolEntry>,
+        Resource<BatchSlotEntry>,
+        super::PagedPrefix,
+    ) {
+        let pool = insert_test_pool(host, 2, 16);
+        host.table.get_mut(&pool).unwrap().active_lanes = lanes;
+        let slot = host.open_paged_slot(&pool, 2).unwrap();
+        let mut prefix = host.table.get(&pool).unwrap().pool.reserve(8).unwrap();
+        prefix
+            .commit_write(u64::from(SHARED_PREFIX_TOKENS))
+            .unwrap();
+        let retained = super::PagedPrefix::new(prefix);
+        for lane in 0..lanes {
+            let fork = retained
+                .fork_reserved(u64::from(SHARED_PREFIX_TOKENS), 8)
+                .unwrap();
+            host.bind_paged_lane(pool.rep(), lane, Some(fork), 8)
+                .unwrap();
+            host.begin_paged_lane_append(pool.rep(), lane, SHARED_PREFIX_TOKENS, 1)
+                .unwrap();
+        }
+        (pool, slot, retained)
+    }
+
+    async fn record_into_pages(
+        host: &mut Host<CpuBackend>,
+        commands: &Resource<super::CommandListEntry>,
+        slot: &Resource<BatchSlotEntry>,
+        lane: u32,
+        start: compute::Affine,
+        tokens: u32,
+    ) -> Result<(), compute::Error> {
+        let rows = host.alloc(compute::Dtype::F32, &[tokens, 2]).unwrap();
+        <Host<CpuBackend> as paged_storage::Host>::record_paged_copy(
+            host,
+            Resource::new_borrow(commands.rep()),
+            Resource::new_borrow(slot.rep()),
+            lane,
+            paged_storage::PagedSpan {
+                plane: 0,
+                start,
+                len: u64::from(tokens),
+            },
+            Resource::new_borrow(rows.rep()),
+            paged_storage::CopyDirection::IntoPages,
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn guest_copy_onto_a_shared_prefix_page_is_refused() {
+        let mut host = Host::new(CpuBackend::new(), GENEROUS);
+        let (_pool, slot, _prefix) = bind_lanes_on_a_shared_prefix(&mut host, 1);
+        let commands = host.command_list().unwrap();
+
+        let overwrite =
+            record_into_pages(&mut host, &commands, &slot, 0, wit_affine(None, 0, 0), 1);
+        assert!(matches!(overwrite.await, Err(compute::Error::Layout(_))));
+        let append = wit_affine(None, 0, SHARED_PREFIX_TOKENS);
+        record_into_pages(&mut host, &commands, &slot, 0, append, 1)
+            .await
+            .unwrap();
+
+        assert_eq!(host.table.get(&commands).unwrap().recorded.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn guest_copy_past_the_reservation_is_refused() {
+        let mut host = Host::new(CpuBackend::new(), GENEROUS);
+        let pool = insert_test_pool(&mut host, 2, 8);
+        let slot = host.open_paged_slot(&pool, 2).unwrap();
+        host.bind_paged_request(pool.rep(), None, 8).unwrap();
+        host.begin_paged_append(pool.rep(), 0, 8).unwrap();
+        let commands = host.command_list().unwrap();
+
+        let overrun = record_into_pages(&mut host, &commands, &slot, 0, wit_affine(None, 0, 7), 2);
+        assert!(matches!(overrun.await, Err(compute::Error::Layout(_))));
+        record_into_pages(&mut host, &commands, &slot, 0, wit_affine(None, 0, 0), 8)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn guest_copy_outside_the_open_window_is_refused() {
+        let mut host = Host::new(CpuBackend::new(), GENEROUS);
+        let pool = insert_test_pool(&mut host, 2, 8);
+        let slot = host.open_paged_slot(&pool, 2).unwrap();
+        host.bind_paged_request(pool.rep(), None, 8).unwrap();
+        host.begin_paged_append(pool.rep(), 0, 4).unwrap();
+        host.begin_paged_append(pool.rep(), 4, 1).unwrap();
+        let commands = host.command_list().unwrap();
+
+        let stale = record_into_pages(&mut host, &commands, &slot, 0, wit_affine(None, 0, 3), 1);
+        assert!(matches!(stale.await, Err(compute::Error::Layout(_))));
+        let ahead = record_into_pages(&mut host, &commands, &slot, 0, wit_affine(None, 0, 4), 2);
+        assert!(matches!(ahead.await, Err(compute::Error::Layout(_))));
+        record_into_pages(&mut host, &commands, &slot, 0, wit_affine(None, 0, 4), 1)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn guest_copy_onto_a_tail_published_mid_step_is_refused() {
+        let mut host = Host::new(CpuBackend::new(), GENEROUS);
+        let pool = insert_test_pool(&mut host, 2, 8);
+        let slot = host.open_paged_slot(&pool, 2).unwrap();
+        host.bind_paged_request(pool.rep(), None, 8).unwrap();
+        host.begin_paged_append(pool.rep(), 0, 4).unwrap();
+        let _published = host
+            .paged_prefix(pool.rep())
+            .unwrap()
+            .fork_reserved(4, 8)
+            .unwrap();
+        let commands = host.command_list().unwrap();
+
+        let write = record_into_pages(&mut host, &commands, &slot, 0, wit_affine(None, 0, 0), 4);
+        assert!(matches!(write.await, Err(compute::Error::Layout(_))));
     }
 
     #[test]
