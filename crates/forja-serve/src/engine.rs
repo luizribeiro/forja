@@ -22,7 +22,7 @@ use tokenizers::Tokenizer;
 use tokio::sync::{Notify, mpsc};
 
 use crate::guidance::{GuidanceSession, GuidanceWorker};
-use crate::metrics::{ServingMetrics, observe};
+use crate::metrics::{ServingMetrics, observe, observe_phase};
 use crate::prefix::{
     LivePrefix, PrefixIdentity, PrefixIndex, PrefixLedger, PrefixLimits, PrefixNamespace,
     replace_live,
@@ -938,7 +938,11 @@ where
         let parser_started = Instant::now();
         let start = self.start_decode(prefill, sender, control).await;
         if constrained_request {
-            observe(&mut self.metrics.parser_mask_time, parser_started.elapsed());
+            observe_phase(
+                &mut self.metrics.parser_mask_time,
+                &mut self.metrics.parser_mask_time_ns,
+                parser_started.elapsed(),
+            );
         }
         let DecodeStart {
             params,
@@ -1035,10 +1039,18 @@ where
                     )
                     .await?
                     {
-                        observe(&mut self.metrics.parser_mask_time, parser_started.elapsed());
+                        observe_phase(
+                            &mut self.metrics.parser_mask_time,
+                            &mut self.metrics.parser_mask_time_ns,
+                            parser_started.elapsed(),
+                        );
                         return Ok(FinishReason::ToolCalls);
                     }
-                    observe(&mut self.metrics.parser_mask_time, parser_started.elapsed());
+                    observe_phase(
+                        &mut self.metrics.parser_mask_time,
+                        &mut self.metrics.parser_mask_time_ns,
+                        parser_started.elapsed(),
+                    );
                     continue;
                 }
                 let sse_started = sender.map(|_| Instant::now());
@@ -1046,7 +1058,11 @@ where
                     .process(token, piece, &mut text, sender, control)
                     .await?;
                 if let Some(started) = sse_started {
-                    observe(&mut self.metrics.sse_time, started.elapsed());
+                    observe_phase(
+                        &mut self.metrics.sse_time,
+                        &mut self.metrics.sse_time_ns,
+                        started.elapsed(),
+                    );
                 }
                 if matches!(action, BoundaryAction::Stop) {
                     return Ok(FinishReason::Stop);
@@ -1064,7 +1080,11 @@ where
                         control,
                     )
                     .await?;
-                    observe(&mut self.metrics.parser_mask_time, parser_started.elapsed());
+                    observe_phase(
+                        &mut self.metrics.parser_mask_time,
+                        &mut self.metrics.parser_mask_time_ns,
+                        parser_started.elapsed(),
+                    );
                     guidance = Some(session);
                     allow = Some(mask);
                     constrained = true;

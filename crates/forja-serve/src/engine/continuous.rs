@@ -13,7 +13,7 @@ use super::{
 use crate::{
     ChatCompletionRequest, Completion, CompletionParams, CompletionRequest, GenerationControl,
     GenerationError, GenerationEvent, ResolvedParams, ServingMetrics, http::ServiceCommand,
-    metrics::observe,
+    metrics::observe_phase,
 };
 
 mod batch;
@@ -345,14 +345,22 @@ where
             {
                 self.run_batch_lanes(&mut receiver, &mut pending).await;
             } else if let Some(envelope) = pending.pop_front() {
-                observe(&mut self.metrics.queue_time, envelope.queued().elapsed());
+                observe_phase(
+                    &mut self.metrics.queue_time,
+                    &mut self.metrics.queue_time_ns,
+                    envelope.queued().elapsed(),
+                );
                 if let Some(prepared) = envelope.prepare(&mut self).await {
                     prepared.run_single(&mut self).await;
                 }
             }
             if let Ok(mut metrics) = shared_metrics.lock() {
                 self.refresh_runtime_metrics();
-                observe(&mut self.metrics.scheduler_time, scheduled.elapsed());
+                observe_phase(
+                    &mut self.metrics.scheduler_time,
+                    &mut self.metrics.scheduler_time_ns,
+                    scheduled.elapsed(),
+                );
                 *metrics = self.metrics.clone();
             }
         }

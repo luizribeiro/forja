@@ -371,8 +371,17 @@ async fn run_serial<S: ChatService>(
         }
         if let Ok(mut snapshot) = metrics.lock() {
             *snapshot = service.metrics();
-            crate::metrics::observe(&mut snapshot.queue_time, queued);
-            crate::metrics::observe(&mut snapshot.scheduler_time, scheduled.elapsed());
+            let snapshot = &mut *snapshot;
+            crate::metrics::observe_phase(
+                &mut snapshot.queue_time,
+                &mut snapshot.queue_time_ns,
+                queued,
+            );
+            crate::metrics::observe_phase(
+                &mut snapshot.scheduler_time,
+                &mut snapshot.scheduler_time_ns,
+                scheduled.elapsed(),
+            );
         }
     }
 }

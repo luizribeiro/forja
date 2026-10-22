@@ -18,6 +18,10 @@ pub struct ServingMetrics {
     pub(crate) queue_time: [u64; 32],
     pub(crate) parser_mask_time: [u64; 32],
     pub(crate) sse_time: [u64; 32],
+    pub(crate) scheduler_time_ns: u64,
+    pub(crate) queue_time_ns: u64,
+    pub(crate) parser_mask_time_ns: u64,
+    pub(crate) sse_time_ns: u64,
     pub(crate) gpu_time_ns: u64,
     pub(crate) live_bytes: u64,
     pub(crate) pool_bytes: u64,
@@ -73,6 +77,22 @@ impl ServingMetrics {
             &self.parser_mask_time,
         );
         histogram(&mut output, "forja_sse_seconds", &self.sse_time);
+        counter(
+            &mut output,
+            "forja_scheduler_nanoseconds_total",
+            self.scheduler_time_ns,
+        );
+        counter(
+            &mut output,
+            "forja_queue_nanoseconds_total",
+            self.queue_time_ns,
+        );
+        counter(
+            &mut output,
+            "forja_parser_mask_nanoseconds_total",
+            self.parser_mask_time_ns,
+        );
+        counter(&mut output, "forja_sse_nanoseconds_total", self.sse_time_ns);
         gauge_u64(
             &mut output,
             "forja_engine_gpu_time_nanoseconds",
@@ -150,6 +170,16 @@ pub(crate) fn observe(histogram: &mut [u64; 32], duration: Duration) {
     histogram[bucket] = histogram[bucket].saturating_add(1);
 }
 
+pub(crate) fn observe_phase(
+    histogram: &mut [u64; 32],
+    total_nanoseconds: &mut u64,
+    duration: Duration,
+) {
+    observe(histogram, duration);
+    *total_nanoseconds =
+        total_nanoseconds.saturating_add(u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -171,13 +201,18 @@ mod tests {
             ..ServingMetrics::default()
         };
         observe(&mut metrics.ttft, Duration::from_micros(33));
-        observe(&mut metrics.scheduler_time, Duration::from_micros(7));
+        observe_phase(
+            &mut metrics.scheduler_time,
+            &mut metrics.scheduler_time_ns,
+            Duration::from_micros(7),
+        );
         let text = metrics.prometheus(true, false);
         assert!(text.contains("forja_live 1\n"));
         assert!(text.contains("forja_ready 0\n"));
         assert!(text.contains("forja_prefix_requests_total 7\n"));
         assert!(text.contains("forja_ttft_seconds_count 1\n"));
         assert!(text.contains("forja_scheduler_seconds_count 1\n"));
+        assert!(text.contains("forja_scheduler_nanoseconds_total 7000\n"));
         assert!(text.contains("forja_queue_seconds_count 0\n"));
         assert!(text.contains("forja_engine_gpu_time_nanoseconds 11\n"));
         assert!(!text.contains("request_id"));

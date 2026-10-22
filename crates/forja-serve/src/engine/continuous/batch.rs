@@ -9,7 +9,7 @@ use tokio::sync::mpsc;
 use super::lane::BatchLane;
 use super::{RequestEnvelope, batch_admission_error, read_batch_tokens, repeated_error};
 use crate::engine::{GenerationError, ServingEngine};
-use crate::{http::ServiceCommand, metrics::observe};
+use crate::{http::ServiceCommand, metrics::observe_phase};
 
 impl<B> ServingEngine<B>
 where
@@ -197,7 +197,11 @@ where
             let Some(envelope) = pending.pop_front() else {
                 return;
             };
-            observe(&mut self.metrics.queue_time, envelope.queued().elapsed());
+            observe_phase(
+                &mut self.metrics.queue_time,
+                &mut self.metrics.queue_time_ns,
+                envelope.queued().elapsed(),
+            );
             let Some(prepared) = envelope.prepare(self).await else {
                 continue;
             };

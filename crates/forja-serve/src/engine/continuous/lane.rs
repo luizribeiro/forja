@@ -4,7 +4,7 @@ use forja_host::SamplingParams;
 
 use super::{CompletionSink, PreparedRequest};
 use crate::engine::{BoundaryAction, BoundaryState, GenerationError};
-use crate::metrics::{ServingMetrics, observe};
+use crate::metrics::{ServingMetrics, observe, observe_phase};
 use crate::prefix::PrefixLedger;
 use crate::{Completion, FinishReason, GenerationControl, Usage};
 
@@ -126,7 +126,11 @@ impl BatchLane {
             )
             .await?;
         if let Some(started) = sse_started {
-            observe(&mut metrics.sse_time, started.elapsed());
+            observe_phase(
+                &mut metrics.sse_time,
+                &mut metrics.sse_time_ns,
+                started.elapsed(),
+            );
         }
         if matches!(action, BoundaryAction::Stop) {
             return Ok(Some(FinishReason::Stop));
