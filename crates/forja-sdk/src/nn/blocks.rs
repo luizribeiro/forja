@@ -609,7 +609,7 @@ impl<T: Element> ChunkedPrefill<T> {
             drain_full_chunk_before_tail_allocation(
                 bucket_size,
                 self.chunk,
-                starts_capped_tail(bucket_size, self.chunk, self.tail_chunk, full_graph_pending),
+                tail_follows_full_graph(bucket_size, self.chunk, full_graph_pending),
                 result.as_ref(),
             )?;
             let tail = if bucket_size == self.chunk {
@@ -736,11 +736,11 @@ impl<T: Element> ChunkedPrefill<T> {
 fn drain_full_chunk_before_tail_allocation<T: Element>(
     bucket_size: u32,
     full_chunk: u32,
-    capped_tail_after_full_graph: bool,
+    tail_after_full_graph: bool,
     logits: Option<&Tensor<T>>,
 ) -> Result<()> {
     if bucket_size != full_chunk
-        && capped_tail_after_full_graph
+        && tail_after_full_graph
         && let Some(logits) = logits
     {
         let _ = logits.to_vec()?;
@@ -748,13 +748,12 @@ fn drain_full_chunk_before_tail_allocation<T: Element>(
     Ok(())
 }
 
-fn starts_capped_tail(
+const fn tail_follows_full_graph(
     bucket_size: u32,
     full_chunk: u32,
-    tail_chunk: u32,
     full_graph_pending: bool,
 ) -> bool {
-    full_graph_pending && tail_chunk < full_chunk && bucket_size != full_chunk
+    full_graph_pending && bucket_size != full_chunk
 }
 
 fn tail_size_repeats(plan: &[(u32, u32)], bucket_size: u32) -> bool {
@@ -1474,10 +1473,10 @@ mod tests {
     }
 
     #[test]
-    fn only_capped_tails_require_the_full_graph_drain() {
-        assert!(starts_capped_tail(16, 2_048, 16, true));
-        assert!(!starts_capped_tail(33, 512, 512, true));
-        assert!(!starts_capped_tail(16, 2_048, 16, false));
+    fn every_tail_after_a_full_graph_requires_a_drain() {
+        assert!(tail_follows_full_graph(16, 2_048, true));
+        assert!(tail_follows_full_graph(33, 512, true));
+        assert!(!tail_follows_full_graph(16, 2_048, false));
     }
 
     #[test]
