@@ -107,6 +107,10 @@ class OpenAIClient:
             if data == b"[DONE]":
                 break
             payload = json.loads(data)
+            if payload.get("error"):
+                response.close()
+                self.local.connection = None
+                return failed(started, f"SSE error: {payload['error']}")
             if payload.get("usage"):
                 usage = payload["usage"]
             choices = payload.get("choices", [])
