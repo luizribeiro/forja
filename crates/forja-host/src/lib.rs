@@ -3217,17 +3217,26 @@ pub struct CommandListEntry {
     retained_kernels: Vec<KernelEntry>,
     retained_epilogues: Vec<EpilogueEntry>,
     paged: Vec<PagedUse>,
+    paged_bounds: Vec<PagedCheck>,
 }
 
 impl CommandListEntry {
-    fn note_paged(&mut self, usage: PagedUse) -> Result<(), compute::Error> {
-        usage
+    fn note_paged(&mut self, check: PagedCheck) -> Result<(), compute::Error> {
+        check
+            .usage
             .binding
-            .lane(usage.lane)?
+            .lane(check.usage.lane)?
             .used
             .store(true, Ordering::Release);
-        if !self.paged.iter().any(|existing| existing.same_lane(&usage)) {
-            self.paged.push(usage);
+        if !self
+            .paged
+            .iter()
+            .any(|existing| existing.same_lane(&check.usage))
+        {
+            self.paged.push(check.usage.clone());
+        }
+        if !self.paged_bounds.contains(&check) {
+            self.paged_bounds.push(check);
         }
         Ok(())
     }
@@ -3242,6 +3251,7 @@ pub struct GraphEntry {
     retained_kernels: Vec<KernelEntry>,
     retained_epilogues: Vec<EpilogueEntry>,
     paged: Vec<PagedUse>,
+    paged_bounds: Vec<PagedCheck>,
     _lease: GraphLease,
 }
 
@@ -4747,7 +4757,7 @@ impl<B: Backend + 'static> Host<B> {
         entry.protected.extend(protected);
         entry.retained.extend(inputs);
         entry.retained.push(output);
-        entry.note_paged(check.usage)
+        entry.note_paged(check)
     }
 
     fn paged_slot_entries(
@@ -4810,6 +4820,7 @@ impl<B: Backend + 'static> Host<B> {
                 retained_kernels: Vec::new(),
                 retained_epilogues: Vec::new(),
                 paged: Vec::new(),
+                paged_bounds: Vec::new(),
             })
             .map_err(invalid_handle)
     }
@@ -5294,6 +5305,7 @@ impl<B: Backend + 'static> Host<B> {
             retained_kernels: Vec::new(),
             retained_epilogues: Vec::new(),
             paged: entry.paged.clone(),
+            paged_bounds: entry.paged_bounds.clone(),
             _lease: lease,
         };
         let resource = match self.table.push(graph_entry) {
@@ -5308,6 +5320,7 @@ impl<B: Backend + 'static> Host<B> {
         graph.retained_kernels = entry.retained_kernels;
         graph.retained_epilogues = entry.retained_epilogues;
         graph.paged = entry.paged;
+        graph.paged_bounds = entry.paged_bounds;
         Ok(resource)
     }
 
@@ -5378,10 +5391,13 @@ impl<B: Backend + 'static> Host<B> {
         flight: ReplayFlight,
     ) -> Result<SubmitRequest<B>, compute::Error> {
         let entry = self.table.get(resource).map_err(invalid_handle)?;
-        entry
+        let checked = entry
             .graph
             .values(values.clone())
             .map_err(|error| graph_error(&error))?;
+        for check in &entry.paged_bounds {
+            check.validate(Some(&checked))?;
+        }
         Ok(SubmitRequest {
             backend: Arc::clone(&self.backend),
             work: SubmissionWork::Replay {
@@ -6213,6 +6229,12 @@ impl PagedBound {
 struct PagedCheck {
     usage: PagedUse,
     bound: PagedBound,
+}
+
+impl PartialEq for PagedCheck {
+    fn eq(&self, other: &Self) -> bool {
+        self.usage.same_lane(&other.usage) && self.bound == other.bound
+    }
 }
 
 impl PagedCheck {
@@ -8832,7 +8854,15 @@ mod tests {
         tokens: u32,
     ) -> Result<(), compute::Error> {
         let direction = paged_storage::CopyDirection::IntoPages;
-        record_paged_rows(host, commands, (slot, lane), (start, tokens), direction).await
+        record_paged_rows(
+            host,
+            commands,
+            (slot, lane),
+            (start, tokens),
+            direction,
+            None,
+        )
+        .await
     }
 
     async fn record_paged_rows(
@@ -8841,8 +8871,12 @@ mod tests {
         (slot, lane): (&Resource<BatchSlotEntry>, u32),
         (start, tokens): (compute::Affine, u32),
         direction: paged_storage::CopyDirection,
+        replay: Option<&Resource<ParamsEntry>>,
     ) -> Result<(), compute::Error> {
-        let rows = host.alloc(compute::Dtype::F32, &[tokens, 2]).unwrap();
+        let rows = match replay {
+            Some(params) => bind_replay_space(host, params, &[tokens, 2]),
+            None => host.alloc(compute::Dtype::F32, &[tokens, 2]).unwrap(),
+        };
         <Host<CpuBackend> as paged_storage::Host>::record_paged_copy(
             host,
             Resource::new_borrow(commands.rep()),
@@ -8923,10 +8957,11 @@ mod tests {
         let direction = paged_storage::CopyDirection::OutOfPages;
 
         let overread = (wit_affine(None, 0, 2), 3);
-        let refused = record_paged_rows(&mut host, &commands, (&slot, 0), overread, direction);
+        let refused =
+            record_paged_rows(&mut host, &commands, (&slot, 0), overread, direction, None);
         assert!(matches!(refused.await, Err(compute::Error::Layout(_))));
         let committed = (wit_affine(None, 0, 0), 4);
-        record_paged_rows(&mut host, &commands, (&slot, 0), committed, direction)
+        record_paged_rows(&mut host, &commands, (&slot, 0), committed, direction, None)
             .await
             .unwrap();
     }
@@ -8999,6 +9034,114 @@ mod tests {
 
         let write = record_into_pages(&mut host, &commands, &slot, 0, wit_affine(None, 0, 0), 4);
         assert!(matches!(write.await, Err(compute::Error::Layout(_))));
+    }
+
+    fn bind_replay_space(
+        host: &mut Host<CpuBackend>,
+        params: &Resource<ParamsEntry>,
+        shape: &[u32],
+    ) -> Resource<TensorEntry> {
+        let tensor = host.alloc(compute::Dtype::F32, shape).unwrap();
+        let slices = shape
+            .iter()
+            .enumerate()
+            .map(|(axis, &len)| compute::ParamSlice {
+                start: wit_affine((axis == 0).then_some(0), 0, 0),
+                len: wit_affine(None, 0, len),
+                step: 1,
+            })
+            .collect();
+        host.view_param(&tensor, &Resource::new_borrow(params.rep()), slices)
+            .unwrap()
+    }
+
+    async fn paged_copy_graph(
+        host: &mut Host<CpuBackend>,
+        slot: &Resource<BatchSlotEntry>,
+        direction: paged_storage::CopyDirection,
+    ) -> Resource<super::GraphEntry> {
+        let params = host
+            .params(vec![compute::ParamRange { lo: 0, hi: 7 }])
+            .unwrap();
+        let commands = host.command_list().unwrap();
+        let start = (wit_affine(Some(0), 1, 0), 1);
+        record_paged_rows(host, &commands, (slot, 0), start, direction, Some(&params))
+            .await
+            .unwrap();
+        host.create_graph(commands).unwrap()
+    }
+
+    fn fresh_paged_lane(
+        host: &mut Host<CpuBackend>,
+    ) -> (Resource<PagePoolEntry>, Resource<BatchSlotEntry>) {
+        let pool = insert_test_pool(host, 2, 8);
+        let slot = host.open_paged_slot(&pool, 2).unwrap();
+        host.bind_paged_request(pool.rep(), None, 8).unwrap();
+        host.begin_paged_append(pool.rep(), 0, 1).unwrap();
+        (pool, slot)
+    }
+
+    #[tokio::test]
+    async fn replayed_paged_write_outside_the_open_window_is_refused() {
+        let mut host = Host::new(CpuBackend::new(), GENEROUS);
+        let (pool, slot) = fresh_paged_lane(&mut host);
+        let graph =
+            paged_copy_graph(&mut host, &slot, paged_storage::CopyDirection::IntoPages).await;
+        host.prepare_replay(&graph, vec![0]).unwrap();
+
+        host.begin_paged_append(pool.rep(), 1, 1).unwrap();
+
+        assert!(matches!(
+            host.prepare_replay(&graph, vec![0]),
+            Err(compute::Error::Layout(_))
+        ));
+        assert!(matches!(
+            host.prepare_replay(&graph, vec![2]),
+            Err(compute::Error::Layout(_))
+        ));
+        host.prepare_replay(&graph, vec![1]).unwrap();
+    }
+
+    #[tokio::test]
+    async fn replayed_paged_read_beyond_the_logical_length_is_refused() {
+        let mut host = Host::new(CpuBackend::new(), GENEROUS);
+        let (_pool, slot) = fresh_paged_lane(&mut host);
+        let graph =
+            paged_copy_graph(&mut host, &slot, paged_storage::CopyDirection::OutOfPages).await;
+
+        host.prepare_replay(&graph, vec![0]).unwrap();
+        assert!(matches!(
+            host.prepare_replay(&graph, vec![1]),
+            Err(compute::Error::Layout(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn replayed_paged_attention_beyond_the_logical_length_is_refused() {
+        let mut host = Host::new(CpuBackend::new(), GENEROUS);
+        let (pool, slot) = fresh_paged_lane(&mut host);
+        let params = host
+            .params(vec![compute::ParamRange { lo: 0, hi: 7 }])
+            .unwrap();
+        let query = bind_replay_space(&mut host, &params, &[1, 1, 2]);
+        let commands = host.command_list().unwrap();
+        let window = (wit_affine(Some(0), 1, 0), wit_affine(Some(0), 1, 1));
+        record_attention(&mut host, &commands, (&slot, &query), window)
+            .await
+            .unwrap();
+        let graph = host.create_graph(commands).unwrap();
+
+        host.prepare_replay(&graph, vec![0]).unwrap();
+        assert!(matches!(
+            host.prepare_replay(&graph, vec![1]),
+            Err(compute::Error::Layout(_))
+        ));
+        host.begin_paged_append(pool.rep(), 1, 2).unwrap();
+        host.prepare_replay(&graph, vec![0]).unwrap();
+        assert!(matches!(
+            host.prepare_replay(&graph, vec![3]),
+            Err(compute::Error::Layout(_))
+        ));
     }
 
     #[test]
