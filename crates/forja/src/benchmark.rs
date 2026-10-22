@@ -12,8 +12,9 @@ use std::{
 use forja_config::{KeyPath, Origin, Selection};
 use forja_core::Op;
 use forja_host::{
-    EngineDecode, EngineInfo, EngineMetrics, EngineOutput, EngineRunner, EngineStep,
-    EngineStepProfile, ImportProfile, SamplingParams,
+    BatchPhase, BatchSelection, BatchShape, EngineBatch, EngineBatchLane, EngineDecode, EngineInfo,
+    EngineMetrics, EngineOutput, EngineRunner, EngineStep, EngineStepProfile, ImportProfile,
+    PagedPrefix, SamplingParams,
 };
 use golden_fixtures::{decode_f32_le, sha256_file};
 
@@ -66,6 +67,12 @@ struct ContextMeasurement {
     summary: Summary,
 }
 
+#[allow(dead_code)]
+struct BatchDecodeMeasurement {
+    bucket: usize,
+    summary: Summary,
+}
+const BATCH_CONTEXTS: [u32; 2] = [512, 2_048];
 struct ProfileReport {
     context_start: usize,
     baseline: Summary,
@@ -1192,6 +1199,240 @@ async fn load_benchmark_runner(
 
 fn context_measurements_enabled(rerun_schema: Option<u32>) -> bool {
     rerun_schema.is_none_or(|schema| schema >= 4)
+}
+
+#[cfg(target_os = "macos")]
+#[allow(dead_code)]
+async fn measure_record_batches(
+    options: &Bench,
+    point: &BenchPoint,
+    component: &Path,
+) -> Result<Vec<BatchDecodeMeasurement>, Box<dyn Error>> {
+    let (mut runner, info, _) = load_benchmark_runner(options, point, component).await?;
+    let Some(serving) = info.serving.as_ref() else {
+        return Ok(Vec::new());
+    };
+    let buckets = [1_u32, 2, 4, 8]
+        .into_iter()
+        .filter(|&bucket| {
+            serving.batch_shapes.contains(&BatchShape {
+                phase: BatchPhase::Decode,
+                bucket,
+                tokens: 1,
+                selection: BatchSelection::Combined,
+            })
+        })
+        .collect::<Vec<_>>();
+    let Some(&largest) = buckets.last() else {
+        return Ok(Vec::new());
+    };
+    let contexts = batch_contexts(usize::try_from(largest)?);
+    let token_count = BATCH_CONTEXTS
+        .len()
+        .checked_mul(2_048)
+        .ok_or("batch benchmark token count overflowed")?;
+    let tokens = synthetic_tokens(token_count, info.vocab);
+    let mut prefixes = Vec::with_capacity(BATCH_CONTEXTS.len());
+    for (index, &context) in BATCH_CONTEXTS.iter().enumerate() {
+        let start = index
+            .checked_mul(2_048)
+            .ok_or("batch benchmark token offset overflowed")?;
+        let prompt_len = usize::try_from(
+            context
+                .checked_sub(1)
+                .ok_or("batch benchmark context is empty")?,
+        )?;
+        let end = start
+            .checked_add(prompt_len)
+            .ok_or("batch benchmark token range overflowed")?;
+        let reserved_tokens = u64::from(context)
+            .checked_add(u64::try_from(point.tg)?)
+            .ok_or("batch benchmark reservation overflowed")?;
+        prefixes.push(
+            prepare_batch_prefix(
+                &mut runner,
+                serving,
+                tokens[start..end].to_vec(),
+                reserved_tokens,
+            )
+            .await?,
+        );
+    }
+    let feedback = synthetic_tokens(contexts.len(), info.vocab);
+    let mut measurements = Vec::with_capacity(buckets.len());
+    for bucket in buckets {
+        let mut samples = Vec::with_capacity(options.reps);
+        for repetition in 0..options.warmups.saturating_add(options.reps) {
+            let sample = measure_batch_repetition(
+                &mut runner,
+                &prefixes,
+                &contexts,
+                &feedback,
+                bucket,
+                point.tg,
+                sampling_params(point),
+            )
+            .await?;
+            if repetition >= options.warmups {
+                samples.push(sample);
+            }
+        }
+        let aggregate_tokens = usize::try_from(bucket)?
+            .checked_mul(point.tg)
+            .ok_or("batch benchmark aggregate token count overflowed")?;
+        let summary = summarize(&samples, aggregate_tokens)?;
+        measurements.push(BatchDecodeMeasurement {
+            bucket: usize::try_from(bucket)?,
+            summary,
+        });
+    }
+    Ok(measurements)
+}
+
+#[cfg(target_os = "macos")]
+async fn prepare_batch_prefix(
+    runner: &mut EngineRunner<forja_metal::MetalBackend>,
+    serving: &forja_host::ServingInfo,
+    tokens: Vec<u32>,
+    reserved_tokens: u64,
+) -> Result<PagedPrefix, Box<dyn Error>> {
+    let shape = serving
+        .batch_shapes
+        .iter()
+        .filter(|shape| {
+            shape.phase == BatchPhase::Prompt
+                && shape.bucket == 1
+                && shape.selection == BatchSelection::Combined
+                && shape.tokens <= 512
+        })
+        .max_by_key(|shape| shape.tokens)
+        .copied()
+        .ok_or("batch benchmark has no bounded prompt shape")?;
+    runner.prepare_paged_lane(0, None, reserved_tokens)?;
+    for (chunk, start) in tokens
+        .chunks(usize::try_from(shape.tokens)?)
+        .zip((0..).step_by(usize::try_from(shape.tokens)?))
+    {
+        let output = runner
+            .batch_step(EngineBatch {
+                shape,
+                lanes: vec![Some(EngineBatchLane {
+                    tokens: Some(chunk.to_vec()),
+                    start_pos: u32::try_from(start)?,
+                    sampling: SamplingParams::default(),
+                })],
+            })
+            .await?
+            .map_err(|error| format!("batch benchmark prefix failed: {error:?}"))?;
+        runner.read(&output.tokens).await?;
+    }
+    runner
+        .paged_prefix()?
+        .ok_or_else(|| "batch benchmark did not produce a paged prefix".into())
+}
+
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+async fn measure_batch_repetition(
+    runner: &mut EngineRunner<forja_metal::MetalBackend>,
+    prefixes: &[PagedPrefix],
+    contexts: &[u32],
+    feedback: &[u32],
+    bucket: u32,
+    steps: usize,
+    sampling: SamplingParams,
+) -> Result<Sample, Box<dyn Error>> {
+    let active = usize::try_from(bucket)?;
+    for lane in 0..active {
+        let reserved = u64::from(contexts[lane])
+            .checked_add(u64::try_from(steps)?)
+            .ok_or("batch benchmark reservation overflowed")?;
+        let prefix_tokens = contexts[lane]
+            .checked_sub(1)
+            .ok_or("batch benchmark context is empty")?;
+        let prefix =
+            prefixes[lane % prefixes.len()].fork_reserved(u64::from(prefix_tokens), reserved)?;
+        runner.prepare_paged_lane(u32::try_from(lane)?, Some(prefix), reserved)?;
+    }
+    let mut lane_tokens = run_batch_decode_step(
+        runner,
+        contexts,
+        &feedback[..active],
+        bucket,
+        0,
+        true,
+        sampling,
+    )
+    .await?;
+    settle_submission_metrics(runner).await?;
+    let before = runner.metrics();
+    let started = Instant::now();
+    for step in 0..u32::try_from(steps)? {
+        lane_tokens = run_batch_decode_step(
+            runner,
+            contexts,
+            &lane_tokens,
+            bucket,
+            step,
+            false,
+            sampling,
+        )
+        .await?;
+    }
+    settle_submission_metrics(runner).await?;
+    sample(before, runner.metrics(), started.elapsed())
+}
+
+#[cfg(target_os = "macos")]
+async fn run_batch_decode_step(
+    runner: &mut EngineRunner<forja_metal::MetalBackend>,
+    contexts: &[u32],
+    tokens: &[u32],
+    bucket: u32,
+    offset: u32,
+    seed: bool,
+    sampling: SamplingParams,
+) -> Result<Vec<u32>, Box<dyn Error>> {
+    let active = usize::try_from(bucket)?;
+    let lanes = (0..active)
+        .map(|lane| -> Result<_, Box<dyn Error>> {
+            let start = contexts[lane]
+                .checked_add(offset)
+                .and_then(|position| position.checked_sub(u32::from(seed)))
+                .ok_or("batch benchmark position overflowed")?;
+            Ok(Some(EngineBatchLane {
+                tokens: Some(vec![tokens[lane]]),
+                start_pos: start,
+                sampling,
+            }))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let output = runner
+        .batch_step(EngineBatch {
+            shape: BatchShape {
+                phase: BatchPhase::Decode,
+                bucket,
+                tokens: 1,
+                selection: BatchSelection::Combined,
+            },
+            lanes,
+        })
+        .await?
+        .map_err(|error| format!("batch benchmark decode failed: {error:?}"))?;
+    decode_batch_tokens(&runner.read(&output.tokens).await?)
+}
+
+#[cfg(target_os = "macos")]
+fn decode_batch_tokens(bytes: &[u8]) -> Result<Vec<u32>, Box<dyn Error>> {
+    let (tokens, remainder) = bytes.as_chunks::<4>();
+    if !remainder.is_empty() {
+        return Err("batch token output is not u32-aligned".into());
+    }
+    Ok(tokens.iter().copied().map(u32::from_le_bytes).collect())
+}
+
+fn batch_contexts(bucket: usize) -> Vec<u32> {
+    BATCH_CONTEXTS.into_iter().cycle().take(bucket).collect()
 }
 
 #[cfg(target_os = "macos")]
@@ -2649,6 +2890,11 @@ mod tests {
         )));
         assert!(context_measurements_enabled(Some(4)));
         assert!(!context_measurements_enabled(Some(3)));
+    }
+
+    #[test]
+    fn batched_decode_alternates_short_and_long_contexts() {
+        assert_eq!(batch_contexts(4), [512, 2_048, 512, 2_048]);
     }
 
     #[cfg(target_os = "macos")]
