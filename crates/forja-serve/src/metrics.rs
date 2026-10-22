@@ -14,6 +14,10 @@ pub struct ServingMetrics {
     pub(crate) suffix_prefill_time: [u64; 32],
     pub(crate) ttft: [u64; 32],
     pub(crate) uncached_ttft: [u64; 32],
+    pub(crate) scheduler_time: [u64; 32],
+    pub(crate) queue_time: [u64; 32],
+    pub(crate) parser_mask_time: [u64; 32],
+    pub(crate) sse_time: [u64; 32],
 }
 
 impl ServingMetrics {
@@ -54,6 +58,14 @@ impl ServingMetrics {
             "forja_uncached_ttft_seconds",
             &self.uncached_ttft,
         );
+        histogram(&mut output, "forja_scheduler_seconds", &self.scheduler_time);
+        histogram(&mut output, "forja_queue_seconds", &self.queue_time);
+        histogram(
+            &mut output,
+            "forja_parser_mask_seconds",
+            &self.parser_mask_time,
+        );
+        histogram(&mut output, "forja_sse_seconds", &self.sse_time);
         output
     }
 }
@@ -130,11 +142,14 @@ mod tests {
             ..ServingMetrics::default()
         };
         observe(&mut metrics.ttft, Duration::from_micros(33));
+        observe(&mut metrics.scheduler_time, Duration::from_micros(7));
         let text = metrics.prometheus(true, false);
         assert!(text.contains("forja_live 1\n"));
         assert!(text.contains("forja_ready 0\n"));
         assert!(text.contains("forja_prefix_requests_total 7\n"));
         assert!(text.contains("forja_ttft_seconds_count 1\n"));
+        assert!(text.contains("forja_scheduler_seconds_count 1\n"));
+        assert!(text.contains("forja_queue_seconds_count 0\n"));
         assert!(!text.contains("request_id"));
         assert!(!text.contains("path="));
     }
