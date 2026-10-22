@@ -17,6 +17,7 @@ features = ["bf16"]
 [numerics]
 activations = "bf16"
 weights = "bf16"
+kv-cache = "bf16"
 
 [workload]
 kind = "causal-lm"
@@ -26,6 +27,10 @@ prefill-chunk = 512
 
 [variants.fixed]
 "attention.prefill-small" = "sdpa.decomposed"
+"paged-attention.decode" = "paged-sdpa.vector"
+"paged-attention.prefill-large" = "paged-sdpa.steel-half"
+"paged-attention.prefill-small" = "paged-sdpa.steel-half"
+"paged-attention.prefill-tiny" = "paged-sdpa.vector"
 "dense.decode" = "matmul.gemv-transposed"
 "dense.prefill.large-wide" = "matmul.steel-64x64x16-1x2"
 "dense.prefill.other" = "matmul.steel-64x32x32-2x2"

@@ -9,8 +9,9 @@ use forja_sdk::nn::blocks::{
     ChunkedPrefill, DEFAULT_PREFILL_CHUNK, DecodeSelection, DecodeState, PrefillExecution,
 };
 use forja_sdk::{
-    DType, Dim, Engine, EngineInfo, FloatElement, Load, Result, StepInput, StepOutput, Tensor,
-    VariantSelection, Weights, bf16, export_engine,
+    CachePlane, DType, Dim, Engine, EngineInfo, EngineLoadConfig, FloatElement, Load, PagedCache,
+    PagedCacheSet, PagedPool, Result, ServingInfo, StepInput, StepOutput, Tensor, VariantSelection,
+    Weights, bf16, export_engine,
     kernel::Kernel,
     nn::{
         Embedding, EmbeddingConfig, Linear, LinearConfig, RmsNorm, RmsNormConfig, WeightElement,
@@ -40,6 +41,25 @@ const ROPE_THETA: f32 = 1.0e6;
 const ATTENTION_SCALE: f32 = 0.088_388_35;
 #[derive(Clone, Copy)]
 struct Config;
+
+fn serving_info() -> ServingInfo {
+    let planes = (0..LAYERS)
+        .flat_map(|layer| {
+            ["key", "value"].map(move |kind| CachePlane {
+                elements_per_token: u64::from(KEY_VALUE_HEADS * HEAD_DIM),
+                alignment: 256,
+                label: format!("layer-{layer}-{kind}"),
+            })
+        })
+        .collect();
+    ServingInfo {
+        page_tokens: 64,
+        planes,
+        active_lanes: 1,
+        max_context: MAX_CONTEXT,
+        batch_shapes: Vec::new(),
+    }
+}
 
 /// Activation precision supported by the Qwen3 engine.
 pub trait Activation: WeightElement + FloatElement {
@@ -286,8 +306,68 @@ impl GuestKernels {
 }
 
 struct LayerResources<'a, T: Activation> {
-    cache: &'a mut KvCache<T>,
+    cache: LayerCache<'a, T>,
     following_norm: Option<&'a RmsNorm<T>>,
+}
+
+enum LayerCache<'a, T: Activation> {
+    Contiguous(&'a mut KvCache<T>),
+    Paged(PagedCache<'a>),
+}
+
+impl<T: Activation> LayerCache<'_, T> {
+    fn attention(
+        &mut self,
+        query: &Tensor<T>,
+        key: &Tensor<T>,
+        value: &Tensor<T>,
+        start: &Dim,
+        end: &Dim,
+        selection: &VariantSelection,
+    ) -> Result<Tensor<T>> {
+        match self {
+            Self::Contiguous(cache) => cached_attention_with(
+                query,
+                key,
+                value,
+                cache,
+                ATTENTION_SCALE,
+                start,
+                end,
+                selection.choice(),
+            ),
+            Self::Paged(cache) => {
+                cache.append(key, value, start)?;
+                cache.attention(query, ATTENTION_SCALE, start, end, selection.choice())
+            }
+        }
+    }
+}
+
+enum CacheStorage<T: Activation> {
+    Contiguous(Vec<KvCache<T>>),
+    Paged(PagedCacheSet),
+}
+
+impl<T: Activation> CacheStorage<T> {
+    const fn is_paged(&self) -> bool {
+        matches!(self, Self::Paged(..))
+    }
+
+    fn layer(&mut self, index: usize) -> Result<LayerCache<'_, T>> {
+        match self {
+            Self::Contiguous(caches) => caches
+                .get_mut(index)
+                .map(LayerCache::Contiguous)
+                .ok_or_else(|| forja_sdk::Error::loading("cache layer is out of range")),
+            Self::Paged(caches) => caches
+                .layer(
+                    u32::try_from(index)
+                        .map_err(|_| forja_sdk::Error::loading("cache layer exceeds u32"))?,
+                )
+                .map(LayerCache::Paged),
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -317,7 +397,7 @@ impl<T: Activation> DecoderLayer<T> {
         resources: LayerResources<'_, T>,
     ) -> Result<(Tensor<T>, Option<Tensor<T>>)> {
         let LayerResources {
-            cache,
+            mut cache,
             following_norm,
         } = resources;
         let LayerPosition {
@@ -344,16 +424,7 @@ impl<T: Activation> DecoderLayer<T> {
             positions,
         )?;
         let value = value_projection.reshape(&[sequence, KEY_VALUE_HEADS, HEAD_DIM])?;
-        let attended = cached_attention_with(
-            &query,
-            &key,
-            &value,
-            cache,
-            ATTENTION_SCALE,
-            start,
-            end,
-            attention.choice(),
-        )?;
+        let attended = cache.attention(&query, &key, &value, start, end, attention)?;
         let attention = linear(
             variants,
             &self.self_attn.o_proj,
@@ -383,7 +454,7 @@ impl<T: Activation> DecoderLayer<T> {
 pub struct Qwen3<T: Activation = f32> {
     weights: QwenWeights<T>,
     variants: variants::Variants,
-    caches: Vec<KvCache<T>>,
+    caches: CacheStorage<T>,
     kernels: GuestKernels,
     positions: Tensor<T>,
     #[cfg(target_family = "wasm")]
@@ -397,13 +468,25 @@ pub struct Qwen3<T: Activation = f32> {
 impl<T: Activation> Qwen3<T> {
     fn load_from_weights(
         weights: &Weights<'_>,
-        config: &forja_sdk::EngineLoadConfig,
+        pool: Option<PagedPool<'_>>,
+        config: &EngineLoadConfig,
     ) -> Result<Self> {
         let variants = variants::Variants::new(config, T::KERNEL_DTYPE)?;
         let weights = QwenWeights::<_>::load(weights, &Config)?;
-        let caches = (0..LAYERS)
-            .map(|_| KvCache::new(KEY_VALUE_HEADS, MAX_CONTEXT, HEAD_DIM, T::ZERO))
-            .collect::<Result<Vec<_>>>()?;
+        let caches = if let Some(pool) = pool {
+            CacheStorage::Paged(
+                pool.cache_set(
+                    u32::try_from(LAYERS)
+                        .map_err(|_| forja_sdk::Error::loading("layer count exceeds u32"))?,
+                )?,
+            )
+        } else {
+            CacheStorage::Contiguous(
+                (0..LAYERS)
+                    .map(|_| KvCache::new(KEY_VALUE_HEADS, MAX_CONTEXT, HEAD_DIM, T::ZERO))
+                    .collect::<Result<Vec<_>>>()?,
+            )
+        };
         let kernels = GuestKernels::load::<T>()?;
         let positions = activation_position_table::<T>()?;
         Ok(Self {
@@ -445,7 +528,9 @@ impl<T: Activation> Qwen3<T> {
         )?;
         let start = 0.into();
         let end = sequence.into();
-        let attention = self.variants.attention(sequence, 0, None)?;
+        let attention = self
+            .variants
+            .attention(sequence, 0, None, self.caches.is_paged())?;
         self.weights.model.layers[0]
             .forward(
                 &self.kernels,
@@ -460,7 +545,7 @@ impl<T: Activation> Qwen3<T> {
                     attention: &attention,
                 },
                 LayerResources {
-                    cache: &mut self.caches[0],
+                    cache: self.caches.layer(0)?,
                     following_norm: None,
                 },
             )?
@@ -483,12 +568,20 @@ impl Engine for ExportedQwen3 {
             max_context: MAX_CONTEXT,
             tap_layers: (1..=28).collect(),
             router_layers: Vec::new(),
-            serving: None,
+            serving: Some(serving_info()),
         }
     }
 
     fn load(weights: &Weights<'_>, config: forja_sdk::EngineLoadConfig) -> Result<Self> {
-        Self::load_from_weights(weights, &config)
+        Self::load_from_weights(weights, None, &config)
+    }
+
+    fn load_paged(
+        weights: &Weights<'_>,
+        pool: Option<PagedPool<'_>>,
+        config: EngineLoadConfig,
+    ) -> Result<Self> {
+        Self::load_from_weights(weights, pool, &config)
     }
 
     fn step(&mut self, input: StepInput) -> Result<StepOutput> {
@@ -530,7 +623,9 @@ impl Engine for ExportedQwen3 {
         }
         let start = input.start_pos.into();
         let end = end_pos.into();
-        let attention = self.variants.attention(sequence, input.start_pos, None)?;
+        let attention =
+            self.variants
+                .attention(sequence, input.start_pos, None, self.caches.is_paged())?;
         self.forward(
             &input.tokens,
             sequence,
@@ -572,7 +667,12 @@ impl Engine for ExportedQwen3 {
                 } else {
                     let start = input.start_pos.into();
                     let end_dim = end.into();
-                    let attention = self.variants.attention(sequence, input.start_pos, None)?;
+                    let attention = self.variants.attention(
+                        sequence,
+                        input.start_pos,
+                        None,
+                        self.caches.is_paged(),
+                    )?;
                     let logits = self
                         .forward(&tokens, sequence, &start, &end_dim, &attention, false)?
                         .logits;
@@ -587,7 +687,9 @@ impl Engine for ExportedQwen3 {
                 let end = input.start_pos + 1;
                 let start_dim = input.start_pos.into();
                 let end_dim = end.into();
-                let attention = self.variants.attention(1, input.start_pos, None)?;
+                let attention =
+                    self.variants
+                        .attention(1, input.start_pos, None, self.caches.is_paged())?;
                 let logits = self
                     .forward(&token, 1, &start_dim, &end_dim, &attention, false)?
                     .logits;
@@ -662,7 +764,7 @@ impl<T: Activation> Qwen3<T> {
                     attention,
                 },
                 LayerResources {
-                    cache: &mut self.caches[index],
+                    cache: self.caches.layer(index)?,
                     following_norm,
                 },
             )?;
@@ -707,9 +809,12 @@ impl<T: Activation> Qwen3<T> {
         end: &Dim,
         variant: PrefillVariant<'_>,
     ) -> Result<Tensor<f32>> {
-        let attention = self
-            .variants
-            .attention(sequence, variant.start, variant.parameter)?;
+        let attention = self.variants.attention(
+            sequence,
+            variant.start,
+            variant.parameter,
+            self.caches.is_paged(),
+        )?;
         let (logits, _) = self.forward_sequence(tokens, sequence, start, end, &attention, false)?;
         Self::last_logits(&logits, last)
     }
@@ -817,7 +922,9 @@ impl<T: Activation> Qwen3<T> {
         let output_tokens = self.decode.output_tokens()?;
         let sampling = self.decode.sampling()?;
         let sample_variant = self.variants.sample()?;
-        let attention = self.variants.attention(1, start_pos, Some(&position))?;
+        let attention =
+            self.variants
+                .attention(1, start_pos, Some(&position), self.caches.is_paged())?;
         forja_sdk::capture(&[&position], || {
             let logits = self
                 .forward(&token, 1, &start_dim, &end, &attention, false)?
