@@ -27,7 +27,6 @@ prefill-chunk = 512
 "dense.prefill.small" = "matmul.steel-32x64x16-1x2"
 "sample" = "sample.parallel"
 "attention.prefill-small" = "sdpa.decomposed"
-"paged-attention.decode" = "paged-sdpa.vector"
 "paged-attention.prefill-large" = "paged-sdpa.steel"
 "paged-attention.prefill-small" = "paged-sdpa.steel"
 "paged-attention.prefill-tiny" = "paged-sdpa.vector"
@@ -38,6 +37,15 @@ arms = [
   { lo = 0, hi = 510, name = "sdpa.decomposed" },
   { lo = 511, hi = 1022, name = "sdpa.vector-single-pass" },
   { lo = 1023, hi = 4095, name = "sdpa.vector-two-pass" },
+]
+
+[variants.rules."paged-attention.decode"]
+parameter = "position"
+arms = [
+  { lo = 0, hi = 510, name = "paged-sdpa.vector" },
+  { lo = 511, hi = 1022, name = "paged-sdpa.vector-gqa-two-pass-32" },
+  { lo = 1023, hi = 3071, name = "paged-sdpa.vector-gqa-two-pass" },
+  { lo = 3072, hi = 4095, name = "paged-sdpa.vector-gqa-two-pass-128" },
 ]
 
 [variants.rules."attention.prefill-large"]

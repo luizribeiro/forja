@@ -27,7 +27,6 @@ prefill-chunk = 512
 
 [variants.fixed]
 "attention.prefill-small" = "sdpa.decomposed"
-"paged-attention.decode" = "paged-sdpa.vector"
 "paged-attention.prefill-large" = "paged-sdpa.steel-half"
 "paged-attention.prefill-small" = "paged-sdpa.steel-half"
 "paged-attention.prefill-tiny" = "paged-sdpa.vector"
@@ -53,6 +52,29 @@ name = "sdpa.vector-single-pass"
 lo = 1023
 hi = 4095
 name = "sdpa.vector-two-pass"
+
+[variants.rules."paged-attention.decode"]
+parameter = "position"
+
+[[variants.rules."paged-attention.decode".arms]]
+lo = 0
+hi = 510
+name = "paged-sdpa.vector"
+
+[[variants.rules."paged-attention.decode".arms]]
+lo = 511
+hi = 1022
+name = "paged-sdpa.vector-gqa-two-pass-32"
+
+[[variants.rules."paged-attention.decode".arms]]
+lo = 1023
+hi = 3071
+name = "paged-sdpa.vector-gqa-two-pass"
+
+[[variants.rules."paged-attention.decode".arms]]
+lo = 3072
+hi = 4095
+name = "paged-sdpa.vector-gqa-two-pass-128"
 
 [variants.rules."attention.prefill-large"]
 parameter = "position"
