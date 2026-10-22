@@ -8823,8 +8823,8 @@ mod tests {
 
     const SHARED_PREFIX_TOKENS: u32 = 5;
 
-    fn bind_lanes_on_a_shared_prefix(
-        host: &mut Host<CpuBackend>,
+    fn bind_lanes_on_a_shared_prefix<B: Backend + Send + Sync + 'static>(
+        host: &mut Host<B>,
         lanes: u32,
     ) -> (
         Resource<PagePoolEntry>,
@@ -8851,8 +8851,8 @@ mod tests {
         (pool, slot, retained)
     }
 
-    async fn record_into_pages(
-        host: &mut Host<CpuBackend>,
+    async fn record_into_pages<B: Backend + Send + Sync + 'static>(
+        host: &mut Host<B>,
         commands: &Resource<super::CommandListEntry>,
         slot: &Resource<BatchSlotEntry>,
         lane: u32,
@@ -8871,8 +8871,8 @@ mod tests {
         .await
     }
 
-    async fn record_paged_rows(
-        host: &mut Host<CpuBackend>,
+    async fn record_paged_rows<B: Backend + Send + Sync + 'static>(
+        host: &mut Host<B>,
         commands: &Resource<super::CommandListEntry>,
         (slot, lane): (&Resource<BatchSlotEntry>, u32),
         (start, tokens): (compute::Affine, u32),
@@ -8883,7 +8883,7 @@ mod tests {
             Some(params) => bind_replay_space(host, params, &[tokens, 2]),
             None => host.alloc(compute::Dtype::F32, &[tokens, 2]).unwrap(),
         };
-        <Host<CpuBackend> as paged_storage::Host>::record_paged_copy(
+        <Host<B> as paged_storage::Host>::record_paged_copy(
             host,
             Resource::new_borrow(commands.rep()),
             Resource::new_borrow(slot.rep()),
@@ -9044,6 +9044,96 @@ mod tests {
         ));
     }
 
+    #[cfg(target_os = "macos")]
+    fn shared_page_bytes(plane: &[u8], shape: &[u32], page: u32) -> Vec<u8> {
+        let page_bytes = usize::try_from(shape[1] * shape[2]).unwrap() * size_of::<f32>();
+        let start = usize::try_from(page).unwrap() * page_bytes;
+        plane[start..start + page_bytes].to_vec()
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn metal_batch_refusals_leave_a_neighbour_on_the_shared_prefix_unchanged() {
+        let mut host = Host::new(forja_metal::MetalBackend::new().unwrap(), GENEROUS);
+        let (_pool, slot, prefix) = bind_lanes_on_a_shared_prefix(&mut host, 2);
+        let (plane, binding) = {
+            let entry = host.table.get(&slot).unwrap();
+            let plane = host
+                .table
+                .get(&Resource::<TensorEntry>::new_borrow(entry.planes[0]))
+                .unwrap();
+            (plane.tensor.clone(), Arc::clone(&entry.binding))
+        };
+        let shape = plane.layout().shape().to_vec();
+        let elements = usize::try_from(shape.iter().product::<u32>()).unwrap();
+        host.backend
+            .write(&plane, &f32_bytes(&vec![1.0; elements]))
+            .unwrap();
+        let before = host.backend.read(&plane).unwrap();
+        let shared = prefix
+            .sequence
+            .lock()
+            .unwrap()
+            .table()
+            .unwrap()
+            .resolve(0)
+            .unwrap();
+
+        let commands = host.command_list().unwrap();
+        let overwrite =
+            record_into_pages(&mut host, &commands, &slot, 0, wit_affine(None, 0, 0), 1);
+        assert!(matches!(overwrite.await, Err(compute::Error::Layout(_))));
+        let append = wit_affine(None, 0, SHARED_PREFIX_TOKENS);
+        record_into_pages(&mut host, &commands, &slot, 1, append, 1)
+            .await
+            .unwrap();
+        host.prepare_submit(commands).unwrap().run().await.unwrap();
+        let submitted = host.backend.read(&plane).unwrap();
+        assert_ne!(submitted, before);
+        assert_eq!(
+            shared_page_bytes(&submitted, &shape, shared),
+            shared_page_bytes(&before, &shape, shared)
+        );
+
+        let params = host
+            .params(vec![compute::ParamRange { lo: 0, hi: 7 }; 2])
+            .unwrap();
+        let commands = host.command_list().unwrap();
+        for lane in 0..2 {
+            let start = (wit_affine(Some(u8::try_from(lane).unwrap()), 1, 0), 1);
+            let direction = paged_storage::CopyDirection::IntoPages;
+            record_paged_rows(
+                &mut host,
+                &commands,
+                (&slot, lane),
+                start,
+                direction,
+                Some(&params),
+            )
+            .await
+            .unwrap();
+        }
+        let graph = host.create_graph(commands).unwrap();
+        let resumed = SHARED_PREFIX_TOKENS;
+
+        assert!(matches!(
+            host.prepare_replay(&graph, vec![0, resumed]),
+            Err(compute::Error::Layout(_))
+        ));
+        assert_eq!(host.backend.read(&plane).unwrap(), submitted);
+        assert_eq!(binding.banks.append_window(0, 1), Ok(5..6));
+        assert_eq!(
+            prefix
+                .sequence
+                .lock()
+                .unwrap()
+                .page_reference_counts()
+                .unwrap()[0],
+            3
+        );
+        host.prepare_replay(&graph, vec![resumed, resumed]).unwrap();
+    }
+
     #[tokio::test]
     async fn guest_copy_onto_a_tail_published_mid_step_is_refused() {
         let mut host = Host::new(CpuBackend::new(), GENEROUS);
@@ -9062,8 +9152,8 @@ mod tests {
         assert!(matches!(write.await, Err(compute::Error::Layout(_))));
     }
 
-    fn bind_replay_space(
-        host: &mut Host<CpuBackend>,
+    fn bind_replay_space<B: Backend + Send + Sync + 'static>(
+        host: &mut Host<B>,
         params: &Resource<ParamsEntry>,
         shape: &[u32],
     ) -> Resource<TensorEntry> {
