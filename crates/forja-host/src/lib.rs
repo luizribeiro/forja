@@ -4665,12 +4665,9 @@ impl<B: Backend + 'static> Host<B> {
             bound,
             variant_name,
         } = context;
-        if let Some(bound) = bound.filter(|bound| bound.is_constant()) {
-            PagedCheck {
-                usage: usage.clone(),
-                bound,
-            }
-            .validate(None)?;
+        let check = PagedCheck { usage, bound };
+        if bound.is_constant() {
+            check.validate(None)?;
         }
         let (template_op, concrete_op) = operation;
         let input_tensors = inputs.iter().map(|entry| &entry.tensor).collect::<Vec<_>>();
@@ -4750,7 +4747,7 @@ impl<B: Backend + 'static> Host<B> {
         entry.protected.extend(protected);
         entry.retained.extend(inputs);
         entry.retained.push(output);
-        entry.note_paged(usage)
+        entry.note_paged(check.usage)
     }
 
     fn paged_slot_entries(
@@ -4758,16 +4755,7 @@ impl<B: Backend + 'static> Host<B> {
         slot: &Resource<BatchSlotEntry>,
         lane: u32,
         plane: u32,
-    ) -> Result<
-        (
-            TensorEntry,
-            TensorEntry,
-            TensorEntry,
-            forja_core::PagedSlot,
-            PagedUse,
-        ),
-        compute::Error,
-    > {
+    ) -> Result<(TensorEntry, TensorEntry, TensorEntry, PagedUse), compute::Error> {
         let slot = self.table.get(slot).map_err(invalid_handle)?;
         let lane = usize::try_from(lane)
             .map_err(|_| compute::Error::Layout("paged lane exceeds usize".to_owned()))?;
@@ -4788,19 +4776,14 @@ impl<B: Backend + 'static> Host<B> {
             ))?
             .clone();
         let generations = self.entry(&Resource::new_borrow(slot.generations))?.clone();
-        let snapshot = slot
-            .binding
+        slot.binding
             .banks
-            .slot(0, lane)
-            .map_err(|error| compute::Error::Layout(error.to_string()))?;
-        if !snapshot.is_active() {
-            return Err(compute::Error::Layout("paged lane is inactive".to_owned()));
-        }
+            .append_window(0, lane)
+            .map_err(|_| compute::Error::Layout("paged lane is inactive".to_owned()))?;
         Ok((
             page_tensor,
             table_tensor,
             generations,
-            snapshot,
             PagedUse {
                 binding: Arc::clone(&slot.binding),
                 bank: 0,
@@ -6205,7 +6188,7 @@ struct PagedUse {
 struct PagedDispatchContext<'a> {
     protected: Vec<BufferId>,
     usage: PagedUse,
-    bound: Option<PagedBound>,
+    bound: PagedBound,
     variant_name: Option<&'a str>,
 }
 
@@ -6214,12 +6197,14 @@ struct PagedDispatchContext<'a> {
 enum PagedBound {
     Write { start: Affine, tokens: u64 },
     Read { start: Affine, tokens: u64 },
+    KeyLength(Affine),
 }
 
 impl PagedBound {
     const fn is_constant(self) -> bool {
         match self {
             Self::Write { start, .. } | Self::Read { start, .. } => start.is_constant(),
+            Self::KeyLength(key_length) => key_length.is_constant(),
         }
     }
 }
@@ -6270,6 +6255,14 @@ impl PagedCheck {
                 if end > logical_len()? {
                     return Err(compute::Error::Layout(
                         "paged read ends beyond the bound sequence".to_owned(),
+                    ));
+                }
+                Ok(())
+            }
+            PagedBound::KeyLength(key_length) => {
+                if resolve(key_length)? > logical_len()? {
+                    return Err(compute::Error::Layout(
+                        "paged attention reads beyond the bound sequence".to_owned(),
                     ));
                 }
                 Ok(())
@@ -7425,7 +7418,7 @@ where
         direction: paged_storage::CopyDirection,
     ) -> impl Future<Output = wasmtime::Result<Result<(), compute::Error>>> + Send {
         let result = (|| {
-            let (pages, table, generations, _, usage) =
+            let (pages, table, generations, usage) =
                 self.paged_slot_entries(&slot, lane, span.plane)?;
             let ordinary = self.entry(&ordinary)?.clone();
             let start = core_affine(span.start);
@@ -7444,17 +7437,17 @@ where
             let (direction, bound) = match direction {
                 paged_storage::CopyDirection::IntoPages => (
                     PagedCopyDirection::IntoPages,
-                    Some(PagedBound::Write {
+                    PagedBound::Write {
                         start,
                         tokens: span.len,
-                    }),
+                    },
                 ),
                 paged_storage::CopyDirection::OutOfPages => (
                     PagedCopyDirection::OutOfPages,
-                    Some(PagedBound::Read {
+                    PagedBound::Read {
                         start,
                         tokens: span.len,
-                    }),
+                    },
                 ),
             };
             let page_tokens = pages.tensor.layout().shape()[1];
@@ -7518,9 +7511,9 @@ where
         config: paged_storage::SdpaCfg,
     ) -> impl Future<Output = wasmtime::Result<Result<(), compute::Error>>> + Send {
         let result = (|| {
-            let (key, table, generations, snapshot, usage) =
+            let (key, table, generations, usage) =
                 self.paged_slot_entries(&slot, lane, config.key_plane)?;
-            let (value, _, _, _, _) = self.paged_slot_entries(&slot, lane, config.value_plane)?;
+            let (value, _, _, _) = self.paged_slot_entries(&slot, lane, config.value_plane)?;
             let query = self.entry(&query)?.clone();
             let output = self.entry(&output)?.clone();
             let [_query_heads, query_tokens, width]: [u32; 3] =
@@ -7546,20 +7539,11 @@ where
                     .map_err(guest_error)?;
                 Ok(TensorEntry { tensor, ..entry })
             };
-            let key_length = u32::try_from(snapshot.logical_len())
-                .map_err(|_| compute::Error::Layout("paged key length exceeds u32".to_owned()))?;
-            let q_start = key_length.checked_sub(query_tokens).ok_or_else(|| {
-                compute::Error::Layout(format!(
-                    "paged query length {query_tokens} exceeds key length {key_length}"
-                ))
-            })?;
             let affine_q_start = core_affine(config.q_start);
             let affine_key_length = core_affine(config.key_length);
             if config.q_start.param != config.key_length.param
                 || config.q_start.scale != config.key_length.scale
                 || config.q_start.offset.checked_add(query_tokens) != Some(config.key_length.offset)
-                || (affine_q_start.is_constant()
-                    && (config.q_start.offset != q_start || config.key_length.offset != key_length))
             {
                 return Err(compute::Error::Layout(
                     "paged attention positions do not match the bound sequence".to_owned(),
@@ -7576,8 +7560,8 @@ where
             let concrete = affine_q_start.is_constant().then_some(Op::PagedSdpa {
                 scale: config.scale,
                 causal: config.causal,
-                q_start,
-                key_length,
+                q_start: config.q_start.offset,
+                key_length: config.key_length.offset,
                 page_tokens,
             });
             let protected = vec![
@@ -7600,7 +7584,7 @@ where
                 PagedDispatchContext {
                     protected,
                     usage,
-                    bound: None,
+                    bound: PagedBound::KeyLength(affine_key_length),
                     variant_name: (!config.algorithm.is_empty())
                         .then_some(config.algorithm.as_str()),
                 },
@@ -8945,6 +8929,58 @@ mod tests {
         record_paged_rows(&mut host, &commands, (&slot, 0), committed, direction)
             .await
             .unwrap();
+    }
+
+    async fn record_attention(
+        host: &mut Host<CpuBackend>,
+        commands: &Resource<super::CommandListEntry>,
+        (slot, query): (&Resource<BatchSlotEntry>, &Resource<TensorEntry>),
+        (q_start, key_length): (compute::Affine, compute::Affine),
+    ) -> Result<(), compute::Error> {
+        let output = host.alloc(compute::Dtype::F32, &[1, 1, 2]).unwrap();
+        <Host<CpuBackend> as paged_storage::Host>::record_paged_sdpa(
+            host,
+            Resource::new_borrow(commands.rep()),
+            Resource::new_borrow(slot.rep()),
+            0,
+            Resource::new_borrow(query.rep()),
+            Resource::new_borrow(output.rep()),
+            paged_storage::SdpaCfg {
+                key_plane: 0,
+                value_plane: 1,
+                scale: 1.0,
+                causal: true,
+                q_start,
+                key_length,
+                algorithm: String::new(),
+            },
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn guest_attention_beyond_the_logical_length_is_refused() {
+        let mut host = Host::new(CpuBackend::new(), GENEROUS);
+        let pool = insert_test_pool(&mut host, 2, 8);
+        let slot = host.open_paged_slot(&pool, 2).unwrap();
+        host.bind_paged_request(pool.rep(), None, 8).unwrap();
+        host.begin_paged_append(pool.rep(), 0, 2).unwrap();
+        let commands = host.command_list().unwrap();
+        let query = host.alloc(compute::Dtype::F32, &[1, 1, 2]).unwrap();
+
+        let beyond = (wit_affine(None, 0, 2), wit_affine(None, 0, 3));
+        let refused = record_attention(&mut host, &commands, (&slot, &query), beyond);
+        assert!(matches!(refused.await, Err(compute::Error::Layout(_))));
+        for chunk_end in [1, 2] {
+            let chunk = (
+                wit_affine(None, 0, chunk_end - 1),
+                wit_affine(None, 0, chunk_end),
+            );
+            record_attention(&mut host, &commands, (&slot, &query), chunk)
+                .await
+                .unwrap();
+        }
     }
 
     #[tokio::test]
