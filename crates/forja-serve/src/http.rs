@@ -155,6 +155,209 @@ where
     }
 }
 
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ActorError {
+    Full,
+    Closed,
+}
+
+#[allow(dead_code)]
+enum ServiceCommand {
+    Chat {
+        request: ChatCompletionRequest,
+        control: GenerationControl,
+        reply: oneshot::Sender<Result<Completion, GenerationError>>,
+        queued: std::time::Instant,
+    },
+    Text {
+        request: CompletionRequest,
+        control: GenerationControl,
+        reply: oneshot::Sender<Result<Completion, GenerationError>>,
+        queued: std::time::Instant,
+    },
+    StreamChat {
+        request: ChatCompletionRequest,
+        events: mpsc::Sender<GenerationEvent>,
+        control: GenerationControl,
+        reply: oneshot::Sender<Result<(), GenerationError>>,
+        queued: std::time::Instant,
+    },
+    StreamText {
+        request: CompletionRequest,
+        events: mpsc::Sender<GenerationEvent>,
+        control: GenerationControl,
+        reply: oneshot::Sender<Result<(), GenerationError>>,
+        queued: std::time::Instant,
+    },
+}
+
+impl ServiceCommand {
+    fn queued(&self) -> std::time::Instant {
+        match self {
+            Self::Chat { queued, .. }
+            | Self::Text { queued, .. }
+            | Self::StreamChat { queued, .. }
+            | Self::StreamText { queued, .. } => *queued,
+        }
+    }
+}
+
+#[allow(dead_code)]
+struct ServiceActor<S> {
+    sender: mpsc::Sender<ServiceCommand>,
+    metrics: Arc<StdMutex<ServingMetrics>>,
+    marker: std::marker::PhantomData<fn() -> S>,
+}
+
+impl<S> Clone for ServiceActor<S> {
+    fn clone(&self) -> Self {
+        Self {
+            sender: self.sender.clone(),
+            metrics: Arc::clone(&self.metrics),
+            marker: std::marker::PhantomData,
+        }
+    }
+}
+
+#[allow(dead_code)]
+impl<S: ChatService> ServiceActor<S> {
+    fn spawn(mut service: S, capacity: usize) -> Self {
+        let (sender, mut receiver) = mpsc::channel::<ServiceCommand>(capacity.max(1));
+        let metrics = Arc::new(StdMutex::new(service.metrics()));
+        let actor_metrics = Arc::clone(&metrics);
+        tokio::spawn(async move {
+            while let Some(command) = receiver.recv().await {
+                let queued = command.queued().elapsed();
+                let scheduled = std::time::Instant::now();
+                match command {
+                    ServiceCommand::Chat {
+                        request,
+                        control,
+                        reply,
+                        ..
+                    } => {
+                        let _ = reply.send(service.complete(request, control).await);
+                    }
+                    ServiceCommand::Text {
+                        request,
+                        control,
+                        reply,
+                        ..
+                    } => {
+                        let _ = reply.send(service.complete_text(request, control).await);
+                    }
+                    ServiceCommand::StreamChat {
+                        request,
+                        events,
+                        control,
+                        reply,
+                        ..
+                    } => {
+                        let _ = reply.send(service.stream_chat(request, events, control).await);
+                    }
+                    ServiceCommand::StreamText {
+                        request,
+                        events,
+                        control,
+                        reply,
+                        ..
+                    } => {
+                        let _ = reply.send(service.stream_text(request, events, control).await);
+                    }
+                }
+                if let Ok(mut snapshot) = actor_metrics.lock() {
+                    *snapshot = service.metrics();
+                    crate::metrics::observe(&mut snapshot.queue_time, queued);
+                    crate::metrics::observe(&mut snapshot.scheduler_time, scheduled.elapsed());
+                }
+            }
+        });
+        Self {
+            sender,
+            metrics,
+            marker: std::marker::PhantomData,
+        }
+    }
+
+    fn complete(
+        &self,
+        request: ChatCompletionRequest,
+        control: GenerationControl,
+    ) -> Result<oneshot::Receiver<Result<Completion, GenerationError>>, ActorError> {
+        let (reply, receiver) = oneshot::channel();
+        self.send(ServiceCommand::Chat {
+            request,
+            control,
+            reply,
+            queued: std::time::Instant::now(),
+        })?;
+        Ok(receiver)
+    }
+
+    fn complete_text(
+        &self,
+        request: CompletionRequest,
+        control: GenerationControl,
+    ) -> Result<oneshot::Receiver<Result<Completion, GenerationError>>, ActorError> {
+        let (reply, receiver) = oneshot::channel();
+        self.send(ServiceCommand::Text {
+            request,
+            control,
+            reply,
+            queued: std::time::Instant::now(),
+        })?;
+        Ok(receiver)
+    }
+
+    fn stream_chat(
+        &self,
+        request: ChatCompletionRequest,
+        events: mpsc::Sender<GenerationEvent>,
+        control: GenerationControl,
+    ) -> Result<oneshot::Receiver<Result<(), GenerationError>>, ActorError> {
+        let (reply, receiver) = oneshot::channel();
+        self.send(ServiceCommand::StreamChat {
+            request,
+            events,
+            control,
+            reply,
+            queued: std::time::Instant::now(),
+        })?;
+        Ok(receiver)
+    }
+
+    fn stream_text(
+        &self,
+        request: CompletionRequest,
+        events: mpsc::Sender<GenerationEvent>,
+        control: GenerationControl,
+    ) -> Result<oneshot::Receiver<Result<(), GenerationError>>, ActorError> {
+        let (reply, receiver) = oneshot::channel();
+        self.send(ServiceCommand::StreamText {
+            request,
+            events,
+            control,
+            reply,
+            queued: std::time::Instant::now(),
+        })?;
+        Ok(receiver)
+    }
+
+    fn send(&self, command: ServiceCommand) -> Result<(), ActorError> {
+        self.sender.try_send(command).map_err(|error| match error {
+            mpsc::error::TrySendError::Full(_) => ActorError::Full,
+            mpsc::error::TrySendError::Closed(_) => ActorError::Closed,
+        })
+    }
+
+    fn metrics(&self) -> ServingMetrics {
+        self.metrics
+            .lock()
+            .map_or_else(|_| ServingMetrics::default(), |metrics| metrics.clone())
+    }
+}
+
 /// Builds the OpenAI-compatible chat-completions router.
 pub fn chat_router<S: ChatService>(service: S) -> Router {
     serving_router(service).0
@@ -906,6 +1109,25 @@ mod tests {
                 Ok(())
             })
         }
+    }
+
+    #[tokio::test]
+    async fn service_actor_owns_requests_and_reports_queue_time() {
+        let actor = ServiceActor::spawn(Smoke, 1);
+        let request = ChatCompletionRequest {
+            model: "smoke".to_owned(),
+            messages: Vec::new(),
+            params: crate::CompletionParams::default(),
+        };
+        let receiver = actor
+            .complete(request, GenerationControl::new(Duration::from_secs(1)))
+            .unwrap();
+        let completion = receiver.await.unwrap().unwrap();
+        assert_eq!(completion.text, "forged");
+        tokio::task::yield_now().await;
+        let metrics = actor.metrics().prometheus(true, true);
+        assert!(metrics.contains("forja_queue_seconds_count 1\n"));
+        assert!(metrics.contains("forja_scheduler_seconds_count 1\n"));
     }
 
     struct DeadlineSmoke {
