@@ -18,6 +18,10 @@ const SITES: &[&str] = &[
     "attention.decode",
     "attention.prefill-large",
     "attention.prefill-small",
+    "paged-attention.decode",
+    "paged-attention.prefill-large",
+    "paged-attention.prefill-small",
+    "paged-attention.prefill-tiny",
 ];
 
 pub(crate) struct Variants(EngineSelections);
@@ -60,19 +64,31 @@ impl Variants {
         sequence: u32,
         start: u32,
         parameter: Option<&Param>,
+        paged: bool,
     ) -> Result<VariantSelection> {
-        let site = if sequence == 1 {
-            "attention.decode"
-        } else if sequence >= 512 {
-            "attention.prefill-large"
+        let phase = attention_phase(sequence, paged);
+        let site = if paged {
+            format!("paged-attention.{phase}")
         } else {
-            "attention.prefill-small"
+            format!("attention.{phase}")
         };
         if let Some(parameter) = parameter {
-            self.0.for_param(site, parameter)
+            self.0.for_param(&site, parameter)
         } else {
-            Ok(VariantSelection::Fixed(self.0.at(site, start)?))
+            Ok(VariantSelection::Fixed(self.0.at(&site, start)?))
         }
+    }
+}
+
+fn attention_phase(sequence: u32, paged: bool) -> &'static str {
+    if sequence == 1 {
+        "decode"
+    } else if sequence >= 512 {
+        "prefill-large"
+    } else if paged && sequence <= 33 {
+        "prefill-tiny"
+    } else {
+        "prefill-small"
     }
 }
 
@@ -138,5 +154,16 @@ mod tests {
             matmul_site(DType::BF16, 1, 512, crate::VOCAB, crate::HIDDEN, true).unwrap(),
             "dense.prefill-bf16-large-wide"
         );
+    }
+
+    #[test]
+    fn classifies_paged_attention_sites_at_boundaries() {
+        assert_eq!(attention_phase(1, true), "decode");
+        assert_eq!(attention_phase(2, true), "prefill-tiny");
+        assert_eq!(attention_phase(33, true), "prefill-tiny");
+        assert_eq!(attention_phase(34, true), "prefill-small");
+        assert_eq!(attention_phase(511, true), "prefill-small");
+        assert_eq!(attention_phase(512, true), "prefill-large");
+        assert_eq!(attention_phase(33, false), "prefill-small");
     }
 }

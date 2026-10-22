@@ -9,8 +9,9 @@ use forja_sdk::nn::blocks::{
     ChunkedPrefill, DEFAULT_PREFILL_CHUNK, DecodeSelection, DecodeState, PrefillExecution,
 };
 use forja_sdk::{
-    DType, Dim, Engine, EngineInfo, Load, Result, StepInput, StepOutput, Tensor, VariantSelection,
-    Weights, bf16, export_engine,
+    CachePlane, DType, Dim, Engine, EngineInfo, EngineLoadConfig, Load, PagedCache, PagedCacheSet,
+    PagedPool, Result, ServingInfo, StepInput, StepOutput, Tensor, VariantSelection, Weights, bf16,
+    export_engine,
     kernel::Kernel,
     nn::{
         Embedding, EmbeddingConfig, Linear, LinearConfig, RmsNorm, RmsNormConfig,
@@ -43,6 +44,25 @@ const ROPE_THETA: f32 = 10_000.0;
 const ATTENTION_SCALE: f32 = 0.088_388_35;
 #[derive(Clone, Copy)]
 struct Config;
+
+fn serving_info() -> ServingInfo {
+    let planes = (0..LAYERS)
+        .flat_map(|layer| {
+            ["key", "value"].map(move |kind| CachePlane {
+                elements_per_token: u64::from(HEADS * HEAD_DIM),
+                alignment: 256,
+                label: format!("layer-{layer}-{kind}"),
+            })
+        })
+        .collect();
+    ServingInfo {
+        page_tokens: 64,
+        planes,
+        active_lanes: 1,
+        max_context: MAX_CONTEXT,
+        batch_shapes: Vec::new(),
+    }
+}
 
 type SequenceOutput = (Tensor<bf16>, Vec<Tensor<f32>>, Vec<Tensor<f32>>);
 
@@ -187,12 +207,72 @@ struct DecoderLayer {
     mlp: SparseMoe,
 }
 
+enum LayerCache<'a> {
+    Contiguous(&'a mut KvCache<f32>),
+    Paged(PagedCache<'a>),
+}
+
+impl LayerCache<'_> {
+    fn attention(
+        &mut self,
+        query: &Tensor<f32>,
+        key: &Tensor<f32>,
+        value: &Tensor<f32>,
+        start: &Dim,
+        end: &Dim,
+        selection: &VariantSelection,
+    ) -> Result<Tensor<f32>> {
+        match self {
+            Self::Contiguous(cache) => cached_attention_with(
+                query,
+                key,
+                value,
+                cache,
+                ATTENTION_SCALE,
+                start,
+                end,
+                selection.choice(),
+            ),
+            Self::Paged(cache) => {
+                cache.append(key, value, start)?;
+                cache.attention(query, ATTENTION_SCALE, start, end, selection.choice())
+            }
+        }
+    }
+}
+
+enum CacheStorage {
+    Contiguous(Vec<KvCache<f32>>),
+    Paged(PagedCacheSet),
+}
+
+impl CacheStorage {
+    const fn is_paged(&self) -> bool {
+        matches!(self, Self::Paged(..))
+    }
+
+    fn layer(&mut self, index: usize) -> Result<LayerCache<'_>> {
+        match self {
+            Self::Contiguous(caches) => caches
+                .get_mut(index)
+                .map(LayerCache::Contiguous)
+                .ok_or_else(|| forja_sdk::Error::loading("cache layer is out of range")),
+            Self::Paged(caches) => caches
+                .layer(
+                    u32::try_from(index)
+                        .map_err(|_| forja_sdk::Error::loading("cache layer exceeds u32"))?,
+                )
+                .map(LayerCache::Paged),
+        }
+    }
+}
+
 impl DecoderLayer {
     fn forward(
         &self,
         input: &Tensor<f32>,
         positions: &Tensor<u32>,
-        cache: &mut KvCache<f32>,
+        mut cache: LayerCache<'_>,
         start: &Dim,
         end: &Dim,
         dispatch: Dispatch<'_>,
@@ -239,16 +319,7 @@ impl DecoderLayer {
             HIDDEN,
         )?
         .reshape(&[sequence, HEADS, HEAD_DIM])?;
-        let attended = cached_attention_with(
-            &query,
-            &key,
-            &value,
-            cache,
-            ATTENTION_SCALE,
-            start,
-            end,
-            dispatch.attention.choice(),
-        )?;
+        let attended = cache.attention(&query, &key, &value, start, end, dispatch.attention)?;
         let attention = linear(
             dispatch.variants,
             &self.self_attn.o_proj,
@@ -295,7 +366,7 @@ pub struct Olmoe {
     weights: OlmoeWeights,
     variants: variants::Variants,
     kernels: GuestKernels,
-    caches: Vec<KvCache<f32>>,
+    caches: CacheStorage,
     positions: Tensor<u32>,
     #[cfg(target_family = "wasm")]
     replay: bool,
@@ -308,13 +379,25 @@ pub struct Olmoe {
 impl Olmoe {
     fn load_from_weights(
         weights: &Weights<'_>,
-        config: &forja_sdk::EngineLoadConfig,
+        pool: Option<PagedPool<'_>>,
+        config: &EngineLoadConfig,
     ) -> Result<Self> {
         let variants = variants::Variants::new(config)?;
         let weights = OlmoeWeights::load(weights, &Config)?;
-        let caches = (0..LAYERS)
-            .map(|_| KvCache::new(HEADS, MAX_CONTEXT, HEAD_DIM, 0.0))
-            .collect::<Result<Vec<_>>>()?;
+        let caches = if let Some(pool) = pool {
+            CacheStorage::Paged(
+                pool.cache_set(
+                    u32::try_from(LAYERS)
+                        .map_err(|_| forja_sdk::Error::loading("layer count exceeds u32"))?,
+                )?,
+            )
+        } else {
+            CacheStorage::Contiguous(
+                (0..LAYERS)
+                    .map(|_| KvCache::new(HEADS, MAX_CONTEXT, HEAD_DIM, 0.0))
+                    .collect::<Result<Vec<_>>>()?,
+            )
+        };
         Ok(Self {
             weights,
             variants,
@@ -381,7 +464,7 @@ impl Olmoe {
             let (next, router) = self.weights.model.layers[index].forward(
                 &hidden,
                 &positions,
-                &mut self.caches[index],
+                self.caches.layer(index)?,
                 start,
                 end,
                 dispatch,
@@ -428,9 +511,12 @@ impl Olmoe {
         end: &Dim,
         selection: PrefillVariant<'_>,
     ) -> Result<Tensor<f32>> {
-        let attention = self
-            .variants
-            .attention(sequence, selection.start, selection.parameter)?;
+        let attention = self.variants.attention(
+            sequence,
+            selection.start,
+            selection.parameter,
+            self.caches.is_paged(),
+        )?;
         let (logits, _, _) =
             self.forward_sequence(tokens, sequence, start, end, false, &attention)?;
         Self::last_logits(&logits, last)
@@ -445,12 +531,20 @@ impl Engine for Olmoe {
             max_context: MAX_CONTEXT,
             tap_layers: (1..=16).collect(),
             router_layers: (1..=16).collect(),
-            serving: None,
+            serving: Some(serving_info()),
         }
     }
 
     fn load(weights: &Weights<'_>, config: forja_sdk::EngineLoadConfig) -> Result<Self> {
-        Self::load_from_weights(weights, &config)
+        Self::load_from_weights(weights, None, &config)
+    }
+
+    fn load_paged(
+        weights: &Weights<'_>,
+        pool: Option<PagedPool<'_>>,
+        config: EngineLoadConfig,
+    ) -> Result<Self> {
+        Self::load_from_weights(weights, pool, &config)
     }
 
     fn step(&mut self, input: StepInput) -> Result<StepOutput> {
@@ -492,7 +586,9 @@ impl Engine for Olmoe {
         }
         let start = input.start_pos.into();
         let end = end.into();
-        let attention = self.variants.attention(sequence, input.start_pos, None)?;
+        let attention =
+            self.variants
+                .attention(sequence, input.start_pos, None, self.caches.is_paged())?;
         self.forward(
             &input.tokens,
             sequence,
@@ -534,7 +630,12 @@ impl Engine for Olmoe {
                 } else {
                     let start = input.start_pos.into();
                     let end_dim = end.into();
-                    let attention = self.variants.attention(sequence, input.start_pos, None)?;
+                    let attention = self.variants.attention(
+                        sequence,
+                        input.start_pos,
+                        None,
+                        self.caches.is_paged(),
+                    )?;
                     let logits = self
                         .forward(&tokens, sequence, &start, &end_dim, false, &attention)?
                         .logits;
@@ -548,7 +649,9 @@ impl Engine for Olmoe {
                 let token = self.decode.token()?;
                 let start = input.start_pos.into();
                 let end = (input.start_pos + 1).into();
-                let attention = self.variants.attention(1, input.start_pos, None)?;
+                let attention =
+                    self.variants
+                        .attention(1, input.start_pos, None, self.caches.is_paged())?;
                 let logits = self
                     .forward(&token, 1, &start, &end, false, &attention)?
                     .logits;
@@ -657,7 +760,9 @@ impl Olmoe {
         let sampling = self.decode.sampling()?;
         let sample_variant = self.variants.sample()?;
         forja_sdk::capture(&[&position], || {
-            let attention = self.variants.attention(1, start_pos, Some(&position))?;
+            let attention =
+                self.variants
+                    .attention(1, start_pos, Some(&position), self.caches.is_paged())?;
             let logits = self
                 .forward(&token, 1, &start_dim, &end, false, &attention)?
                 .logits;
