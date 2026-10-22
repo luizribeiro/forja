@@ -56,6 +56,19 @@ pub trait ChatService: Send + 'static {
         ServingMetrics::default()
     }
 
+    /// Runs the bounded command mailbox owned by the HTTP transport.
+    #[doc(hidden)]
+    fn run(
+        self,
+        receiver: mpsc::Receiver<ServiceCommand>,
+        metrics: Arc<StdMutex<ServingMetrics>>,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send>>
+    where
+        Self: Sized,
+    {
+        Box::pin(run_serial(self, receiver, metrics))
+    }
+
     /// Completes one chat request.
     fn complete(
         &mut self,
@@ -163,8 +176,9 @@ enum ActorError {
     Closed,
 }
 
-#[allow(dead_code)]
-enum ServiceCommand {
+#[doc(hidden)]
+#[allow(missing_docs)]
+pub enum ServiceCommand {
     Chat {
         request: ChatCompletionRequest,
         control: GenerationControl,
@@ -204,7 +218,6 @@ impl ServiceCommand {
     }
 }
 
-#[allow(dead_code)]
 struct ServiceActor<S> {
     sender: mpsc::Sender<ServiceCommand>,
     metrics: Arc<StdMutex<ServingMetrics>>,
@@ -221,59 +234,12 @@ impl<S> Clone for ServiceActor<S> {
     }
 }
 
-#[allow(dead_code)]
 impl<S: ChatService> ServiceActor<S> {
-    fn spawn(mut service: S, capacity: usize) -> Self {
-        let (sender, mut receiver) = mpsc::channel::<ServiceCommand>(capacity.max(1));
+    fn spawn(service: S, capacity: usize) -> Self {
+        let (sender, receiver) = mpsc::channel::<ServiceCommand>(capacity.max(1));
         let metrics = Arc::new(StdMutex::new(service.metrics()));
         let actor_metrics = Arc::clone(&metrics);
-        tokio::spawn(async move {
-            while let Some(command) = receiver.recv().await {
-                let queued = command.queued().elapsed();
-                let scheduled = std::time::Instant::now();
-                match command {
-                    ServiceCommand::Chat {
-                        request,
-                        control,
-                        reply,
-                        ..
-                    } => {
-                        let _ = reply.send(service.complete(request, control).await);
-                    }
-                    ServiceCommand::Text {
-                        request,
-                        control,
-                        reply,
-                        ..
-                    } => {
-                        let _ = reply.send(service.complete_text(request, control).await);
-                    }
-                    ServiceCommand::StreamChat {
-                        request,
-                        events,
-                        control,
-                        reply,
-                        ..
-                    } => {
-                        let _ = reply.send(service.stream_chat(request, events, control).await);
-                    }
-                    ServiceCommand::StreamText {
-                        request,
-                        events,
-                        control,
-                        reply,
-                        ..
-                    } => {
-                        let _ = reply.send(service.stream_text(request, events, control).await);
-                    }
-                }
-                if let Ok(mut snapshot) = actor_metrics.lock() {
-                    *snapshot = service.metrics();
-                    crate::metrics::observe(&mut snapshot.queue_time, queued);
-                    crate::metrics::observe(&mut snapshot.scheduler_time, scheduled.elapsed());
-                }
-            }
-        });
+        tokio::spawn(service.run(receiver, actor_metrics));
         Self {
             sender,
             metrics,
@@ -356,6 +322,50 @@ impl<S: ChatService> ServiceActor<S> {
         self.metrics
             .lock()
             .map_or_else(|_| ServingMetrics::default(), |metrics| metrics.clone())
+    }
+}
+
+async fn run_serial<S: ChatService>(
+    mut service: S,
+    mut receiver: mpsc::Receiver<ServiceCommand>,
+    metrics: Arc<StdMutex<ServingMetrics>>,
+) {
+    while let Some(command) = receiver.recv().await {
+        let queued = command.queued().elapsed();
+        let scheduled = std::time::Instant::now();
+        match command {
+            ServiceCommand::Chat {
+                request,
+                control,
+                reply,
+                ..
+            } => drop(reply.send(service.complete(request, control).await)),
+            ServiceCommand::Text {
+                request,
+                control,
+                reply,
+                ..
+            } => drop(reply.send(service.complete_text(request, control).await)),
+            ServiceCommand::StreamChat {
+                request,
+                events,
+                control,
+                reply,
+                ..
+            } => drop(reply.send(service.stream_chat(request, events, control).await)),
+            ServiceCommand::StreamText {
+                request,
+                events,
+                control,
+                reply,
+                ..
+            } => drop(reply.send(service.stream_text(request, events, control).await)),
+        }
+        if let Ok(mut snapshot) = metrics.lock() {
+            *snapshot = service.metrics();
+            crate::metrics::observe(&mut snapshot.queue_time, queued);
+            crate::metrics::observe(&mut snapshot.scheduler_time, scheduled.elapsed());
+        }
     }
 }
 
