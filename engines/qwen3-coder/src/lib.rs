@@ -4,8 +4,6 @@ mod reduction_classes;
 mod variants;
 
 #[cfg(target_family = "wasm")]
-use forja_sdk::Param;
-#[cfg(target_family = "wasm")]
 use forja_sdk::nn::blocks::{ChunkedPrefill, DecodeSelection, DecodeState, PrefillExecution};
 use forja_sdk::{
     BatchInput, BatchOutput, BatchPhase, BatchSelectInput, BatchSelection, BatchShape, CachePlane,
@@ -22,6 +20,8 @@ use forja_sdk::{
         moe_combine_with, moe_router_with,
     },
 };
+#[cfg(target_family = "wasm")]
+use forja_sdk::{Graph, Param};
 
 #[forja_sdk::kernel(map)]
 fn moe_gate_up(
@@ -968,6 +968,74 @@ pub struct Qwen3Coder {
     long_prefill: Option<ChunkedPrefill<f32>>,
     #[cfg(target_family = "wasm")]
     batch_feedback: Tensor<u32>,
+    #[cfg(target_family = "wasm")]
+    batch_graphs: Vec<BatchDecodeGraphs>,
+}
+
+#[cfg(target_family = "wasm")]
+struct BatchDecodeGraphs {
+    bucket: u32,
+    tokens: Tensor<u32>,
+    positions: Tensor<f32>,
+    sampling: Tensor<u32>,
+    combined: Option<Graph<(Tensor<f32>, Tensor<u32>)>>,
+    forward: Option<Graph<Tensor<f32>>>,
+}
+
+#[cfg(target_family = "wasm")]
+impl BatchDecodeGraphs {
+    fn new(bucket: u32) -> Result<Self> {
+        Ok(Self {
+            bucket,
+            tokens: Tensor::zeros(&[bucket])?,
+            positions: Tensor::zeros(&[bucket])?,
+            sampling: Tensor::zeros(&[bucket, 5])?,
+            combined: None,
+            forward: None,
+        })
+    }
+
+    fn write_input(
+        &self,
+        lanes: &[Option<forja_sdk::BatchLane>],
+        feedback: &Tensor<u32>,
+    ) -> Result<Vec<u32>> {
+        let feedback = feedback.to_vec()?;
+        let mut tokens = Vec::with_capacity(lanes.len());
+        let mut positions = Vec::with_capacity(lanes.len());
+        let mut sampling = Vec::with_capacity(lanes.len() * 5);
+        let mut starts = Vec::with_capacity(lanes.len());
+        for (index, lane) in lanes.iter().enumerate() {
+            let lane = lane
+                .as_ref()
+                .ok_or_else(|| forja_sdk::Error::loading("captured batch lane is inactive"))?;
+            let token = lane.tokens.as_ref().map_or_else(
+                || {
+                    feedback
+                        .get(index)
+                        .copied()
+                        .ok_or_else(|| forja_sdk::Error::loading("batch feedback is missing"))
+                },
+                |token| {
+                    let values = token.to_vec()?;
+                    if values.len() != 1 {
+                        return Err(forja_sdk::Error::loading(
+                            "batch decode lanes require one token",
+                        ));
+                    }
+                    Ok(values[0])
+                },
+            )?;
+            tokens.push(token);
+            positions.push(exact_position(lane.start_pos)?);
+            sampling.extend(sampling_words(lane.sampling)?);
+            starts.push(lane.start_pos);
+        }
+        self.tokens.write(&tokens)?;
+        self.positions.write(&positions)?;
+        self.sampling.write(&sampling)?;
+        Ok(starts)
+    }
 }
 
 impl Qwen3Coder {
@@ -1024,6 +1092,15 @@ impl Qwen3Coder {
             ),
             #[cfg(target_family = "wasm")]
             batch_feedback: Tensor::zeros(&[8])?,
+            #[cfg(target_family = "wasm")]
+            batch_graphs: if config.replay {
+                [1, 2, 4]
+                    .into_iter()
+                    .map(BatchDecodeGraphs::new)
+                    .collect::<Result<Vec<_>>>()?
+            } else {
+                Vec::new()
+            },
         })
     }
 
@@ -1403,6 +1480,13 @@ impl Engine for Qwen3Coder {
             return Ok(BatchOutput { logits, tokens });
         }
         let starts = batch_starts(&input.lanes);
+        if use_batch_decode_graph(
+            self.replay,
+            input.shape.bucket,
+            input.lanes.iter().all(Option::is_some),
+        ) {
+            return self.replay_batch_step(&input);
+        }
         let tokens = self.batch_tokens(&input.lanes)?;
         let positions = batch_positions(&starts)?;
         let logits = self.forward_batch_rows(&tokens, &positions, &starts)?;
@@ -1413,6 +1497,13 @@ impl Engine for Qwen3Coder {
     #[cfg(target_family = "wasm")]
     fn batch_forward(&mut self, input: BatchInput<'_>) -> Result<Tensor<f32>> {
         let starts = batch_starts(&input.lanes);
+        if use_batch_decode_graph(
+            self.replay,
+            input.shape.bucket,
+            input.lanes.iter().all(Option::is_some),
+        ) {
+            return self.replay_batch_forward(&input);
+        }
         let tokens = self.batch_tokens(&input.lanes)?;
         let positions = batch_positions(&starts)?;
         self.forward_batch_rows(&tokens, &positions, &starts)
@@ -1476,22 +1567,28 @@ fn prompt_end(start: u32, sequence: u32) -> Result<u32> {
         .ok_or_else(|| forja_sdk::Error::loading("prompt position overflowed"))
 }
 
+const fn use_batch_decode_graph(replay: bool, bucket: u32, dense: bool) -> bool {
+    replay && bucket <= 4 && dense
+}
+
 #[cfg(target_family = "wasm")]
 fn sampling_tensor(sampling: forja_sdk::SamplingParams) -> Result<Tensor<u32>> {
+    Tensor::constant(&sampling_words(sampling)?, &[5])
+}
+
+#[cfg(target_family = "wasm")]
+fn sampling_words(sampling: forja_sdk::SamplingParams) -> Result<[u32; 5]> {
     let seed_low = u32::try_from(sampling.seed & u64::from(u32::MAX))
         .map_err(|_| forja_sdk::Error::loading("sampling seed low word overflowed"))?;
     let seed_high = u32::try_from(sampling.seed >> 32)
         .map_err(|_| forja_sdk::Error::loading("sampling seed high word overflowed"))?;
-    Tensor::constant(
-        &[
-            sampling.temperature.to_bits(),
-            sampling.top_k,
-            sampling.top_p.to_bits(),
-            seed_low,
-            seed_high,
-        ],
-        &[5],
-    )
+    Ok([
+        sampling.temperature.to_bits(),
+        sampling.top_k,
+        sampling.top_p.to_bits(),
+        seed_low,
+        seed_high,
+    ])
 }
 
 fn allow_mask(allow: &[u32]) -> Result<Vec<u32>> {
@@ -1528,6 +1625,114 @@ fn allow_tensor(allow: &[u32]) -> Result<Tensor<u32>> {
 
 #[cfg(target_family = "wasm")]
 impl Qwen3Coder {
+    fn replay_batch_step(&mut self, input: &BatchInput<'_>) -> Result<BatchOutput> {
+        let index = self.batch_graph_index(input.shape.bucket)?;
+        let mut state = self.batch_graphs.remove(index);
+        let starts = state.write_input(&input.lanes, &self.batch_feedback)?;
+        let result = (|| {
+            if state.combined.is_none() {
+                let (params, lanes) = self.batch_graph_positions(&starts)?;
+                let param_refs = params.iter().collect::<Vec<_>>();
+                let graph = forja_sdk::capture(&param_refs, || {
+                    let logits =
+                        self.forward_batch_positioned(&state.tokens, &state.positions, &lanes)?;
+                    let tokens = self.select_graph_rows(&logits, &state.sampling, &lanes)?;
+                    Ok((logits, tokens))
+                })?;
+                state.combined = Some(graph);
+            }
+            let graph = state.combined.as_ref().ok_or_else(|| {
+                forja_sdk::Error::loading("combined batch graph was not captured")
+            })?;
+            graph.replay(&starts)?;
+            Ok(BatchOutput {
+                logits: graph.result().0.alias()?,
+                tokens: graph.result().1.alias()?,
+            })
+        })();
+        self.batch_graphs.insert(index, state);
+        result
+    }
+
+    fn replay_batch_forward(&mut self, input: &BatchInput<'_>) -> Result<Tensor<f32>> {
+        let index = self.batch_graph_index(input.shape.bucket)?;
+        let mut state = self.batch_graphs.remove(index);
+        let starts = state.write_input(&input.lanes, &self.batch_feedback)?;
+        let result = (|| {
+            if state.forward.is_none() {
+                let (params, lanes) = self.batch_graph_positions(&starts)?;
+                let param_refs = params.iter().collect::<Vec<_>>();
+                let graph = forja_sdk::capture(&param_refs, || {
+                    self.forward_batch_positioned(&state.tokens, &state.positions, &lanes)
+                })?;
+                state.forward = Some(graph);
+            }
+            let graph = state
+                .forward
+                .as_ref()
+                .ok_or_else(|| forja_sdk::Error::loading("forward batch graph was not captured"))?;
+            graph.replay(&starts)?;
+            graph.result().alias()
+        })();
+        self.batch_graphs.insert(index, state);
+        result
+    }
+
+    fn batch_graph_index(&self, bucket: u32) -> Result<usize> {
+        self.batch_graphs
+            .iter()
+            .position(|state| state.bucket == bucket)
+            .ok_or_else(|| forja_sdk::Error::loading("batch graph bucket is unavailable"))
+    }
+
+    fn batch_graph_positions(
+        &self,
+        starts: &[u32],
+    ) -> Result<(Vec<Param>, Vec<Option<BatchLanePosition>>)> {
+        let params = starts
+            .iter()
+            .map(|_| Param::new(0..=MAX_CONTEXT - 1))
+            .collect::<Result<Vec<_>>>()?;
+        let lanes = params
+            .iter()
+            .zip(starts)
+            .map(|(param, &start)| {
+                Ok(Some(BatchLanePosition {
+                    start: param.at(start).into(),
+                    attention: self.variants.attention(1, start, Some(param), true)?,
+                }))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok((params, lanes))
+    }
+
+    fn select_graph_rows(
+        &self,
+        logits: &Tensor<f32>,
+        sampling: &Tensor<u32>,
+        lanes: &[Option<BatchLanePosition>],
+    ) -> Result<Tensor<u32>> {
+        let rows = u32::try_from(lanes.len())
+            .map_err(|_| forja_sdk::Error::loading("batch rows exceed u32"))?;
+        let output = Tensor::zeros(&[rows])?;
+        let variant = self.variants.sample()?;
+        for (lane, position) in lanes.iter().enumerate() {
+            let position = position
+                .as_ref()
+                .ok_or_else(|| forja_sdk::Error::loading("captured batch lane is inactive"))?;
+            let lane = u32::try_from(lane)
+                .map_err(|_| forja_sdk::Error::loading("batch lane exceeds u32"))?;
+            let selected = logits.narrow(0, lane, 1)?.sample_with(
+                &sampling.narrow(0, lane, 1)?.reshape(&[5])?,
+                position.start.clone(),
+                &variant,
+            )?;
+            selected.copy_into(&mut output.narrow(0, lane, 1)?)?;
+            selected.copy_into(&mut self.batch_feedback.narrow(0, lane, 1)?)?;
+        }
+        Ok(output)
+    }
+
     fn batch_tokens(&self, lanes: &[Option<forja_sdk::BatchLane>]) -> Result<Tensor<u32>> {
         let rows = u32::try_from(lanes.len())
             .map_err(|_| forja_sdk::Error::loading("batch rows exceed u32"))?;
@@ -1960,5 +2165,14 @@ mod tests {
     fn bounds_prompt_batches_at_the_lane_start() {
         assert_eq!(prompt_end(7, 2_048).unwrap(), 2_055);
         assert!(prompt_end(u32::MAX, 1).is_err());
+    }
+
+    #[test]
+    fn captures_only_supported_dense_decode_buckets() {
+        assert!(use_batch_decode_graph(true, 1, true));
+        assert!(use_batch_decode_graph(true, 4, true));
+        assert!(!use_batch_decode_graph(true, 8, true));
+        assert!(!use_batch_decode_graph(true, 4, false));
+        assert!(!use_batch_decode_graph(false, 4, true));
     }
 }
