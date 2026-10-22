@@ -1075,6 +1075,8 @@ async fn bench_engine(
     {
         return Err("benchmark shape exceeds the engine context".into());
     }
+    let reserved_tokens = benchmark_reservation(point, options, tg_context_start, profile_context)?;
+    prepare_benchmark_runner(&mut runner, reserved_tokens)?;
     let profile_tokens = profile_context - 1;
     let tokens = synthetic_tokens(
         point.pp.max(options.decode_prefill).max(profile_tokens),
@@ -1137,6 +1139,25 @@ async fn bench_engine(
         output_digest,
         peak_footprint,
     })
+}
+
+fn benchmark_reservation(
+    point: &BenchPoint,
+    options: &Bench,
+    tg_context_start: usize,
+    profile_context: usize,
+) -> Result<usize, Box<dyn Error>> {
+    let decode = tg_context_start
+        .checked_add(point.tg)
+        .ok_or("decode context length overflowed")?;
+    let mut reserved_tokens = point.pp.max(decode);
+    if options.breakdown {
+        let profile = profile_context
+            .checked_add(2)
+            .ok_or("profile context length overflowed")?;
+        reserved_tokens = reserved_tokens.max(profile);
+    }
+    Ok(reserved_tokens)
 }
 
 #[cfg(target_os = "macos")]
@@ -1202,6 +1223,12 @@ async fn measure_contexts(
         } else {
             let (mut context_runner, _, _) =
                 load_benchmark_runner(options, point, component).await?;
+            prepare_benchmark_runner(
+                &mut context_runner,
+                context_start
+                    .checked_add(point.tg)
+                    .ok_or("decode context length overflowed")?,
+            )?;
             let prompt = &tokens[..context_start - 1];
             for _ in 0..options.warmups {
                 measure_decode(&mut context_runner, prompt, point.tg, decode).await?;
@@ -1531,6 +1558,17 @@ async fn prepare_profile_context(
         .ok_or("profile context must follow a prefill token")?;
     let token = select_from_tokens(runner, tokens[..prefill].to_vec(), 0, options).await?;
     select_next(runner, token, u32::try_from(prefill)?, options).await
+}
+
+#[cfg(target_os = "macos")]
+fn prepare_benchmark_runner(
+    runner: &mut EngineRunner<forja_metal::MetalBackend>,
+    reserved_tokens: usize,
+) -> Result<(), Box<dyn Error>> {
+    runner
+        .prepare_paged_request(None, u64::try_from(reserved_tokens)?)
+        .map_err(|error| format!("paged benchmark admission failed: {error:?}"))?;
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
