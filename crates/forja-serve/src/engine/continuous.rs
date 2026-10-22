@@ -351,6 +351,7 @@ where
                 }
             }
             if let Ok(mut metrics) = shared_metrics.lock() {
+                self.refresh_runtime_metrics();
                 observe(&mut self.metrics.scheduler_time, scheduled.elapsed());
                 *metrics = self.metrics.clone();
             }

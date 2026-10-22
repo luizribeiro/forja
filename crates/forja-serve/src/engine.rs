@@ -586,6 +586,19 @@ where
         &self.metrics
     }
 
+    fn refresh_runtime_metrics(&mut self) {
+        let execution = self.runner.metrics();
+        self.metrics.gpu_time_ns = u64::try_from(execution.gpu_time.as_nanos()).unwrap_or(u64::MAX);
+        self.metrics.live_bytes = execution.live_bytes;
+        if let Ok(Some(memory)) = self.runner.paged_memory_usage() {
+            self.metrics.pool_bytes = memory.slab_bytes;
+            self.metrics.table_bytes = memory.table_bytes;
+            self.metrics.slot_bytes = memory.slot_bytes;
+            self.metrics.graph_bytes = memory.graph_bytes;
+            self.metrics.scratch_bytes = memory.scratch_bytes;
+        }
+    }
+
     fn invalidate_prefix(&mut self) {
         if self.live_prefix.take().is_some() {
             self.metrics.invalidations = self.metrics.invalidations.saturating_add(1);

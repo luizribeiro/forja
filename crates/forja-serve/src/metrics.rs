@@ -18,6 +18,13 @@ pub struct ServingMetrics {
     pub(crate) queue_time: [u64; 32],
     pub(crate) parser_mask_time: [u64; 32],
     pub(crate) sse_time: [u64; 32],
+    pub(crate) gpu_time_ns: u64,
+    pub(crate) live_bytes: u64,
+    pub(crate) pool_bytes: u64,
+    pub(crate) table_bytes: u64,
+    pub(crate) slot_bytes: u64,
+    pub(crate) graph_bytes: u64,
+    pub(crate) scratch_bytes: u64,
 }
 
 impl ServingMetrics {
@@ -66,6 +73,17 @@ impl ServingMetrics {
             &self.parser_mask_time,
         );
         histogram(&mut output, "forja_sse_seconds", &self.sse_time);
+        gauge_u64(
+            &mut output,
+            "forja_engine_gpu_time_nanoseconds",
+            self.gpu_time_ns,
+        );
+        gauge_u64(&mut output, "forja_engine_live_bytes", self.live_bytes);
+        gauge_u64(&mut output, "forja_pool_bytes", self.pool_bytes);
+        gauge_u64(&mut output, "forja_table_bytes", self.table_bytes);
+        gauge_u64(&mut output, "forja_slot_bytes", self.slot_bytes);
+        gauge_u64(&mut output, "forja_graph_bytes", self.graph_bytes);
+        gauge_u64(&mut output, "forja_scratch_bytes", self.scratch_bytes);
         output
     }
 }
@@ -84,6 +102,16 @@ fn counter(output: &mut String, name: &str, value: u64) {
     output.push_str("# TYPE ");
     output.push_str(name);
     output.push_str(" counter\n");
+    output.push_str(name);
+    output.push(' ');
+    output.push_str(&value.to_string());
+    output.push('\n');
+}
+
+fn gauge_u64(output: &mut String, name: &str, value: u64) {
+    output.push_str("# TYPE ");
+    output.push_str(name);
+    output.push_str(" gauge\n");
     output.push_str(name);
     output.push(' ');
     output.push_str(&value.to_string());
@@ -139,6 +167,7 @@ mod tests {
         let mut metrics = ServingMetrics {
             requests: 7,
             hits: 3,
+            gpu_time_ns: 11,
             ..ServingMetrics::default()
         };
         observe(&mut metrics.ttft, Duration::from_micros(33));
@@ -150,6 +179,7 @@ mod tests {
         assert!(text.contains("forja_ttft_seconds_count 1\n"));
         assert!(text.contains("forja_scheduler_seconds_count 1\n"));
         assert!(text.contains("forja_queue_seconds_count 0\n"));
+        assert!(text.contains("forja_engine_gpu_time_nanoseconds 11\n"));
         assert!(!text.contains("request_id"));
         assert!(!text.contains("path="));
     }
