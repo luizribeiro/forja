@@ -7714,6 +7714,7 @@ fn paged_gqa_first_pass(
     {
         Some(1) if kv_heads.is_multiple_of(8) => Ok(("paged_sdpa_2pass_1_gqa1x8_128", 256, 8)),
         Some(1) => Ok(("paged_sdpa_2pass_1_gqa1_128", 32, 1)),
+        Some(2) if kv_heads.is_multiple_of(8) => Ok(("paged_sdpa_2pass_1_gqa2x8_128", 512, 8)),
         Some(2) => Ok(("paged_sdpa_2pass_1_gqa2_128", 64, 1)),
         Some(8) => Ok(("paged_sdpa_2pass_1_gqa8_128", 256, 1)),
         _ => Err(BackendError::UnsupportedOperation),

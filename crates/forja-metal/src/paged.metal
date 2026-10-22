@@ -378,8 +378,9 @@ void paged_sdpa_2pass_1_gqa_body(
     constexpr uint elements_per_thread = D / 32;
     constexpr uint chunks_per_head = HPT;
     constexpr uint head_groups = G / HPT;
-    uint kv_head = position.x * KVPTG + (KVPTG == 1 ? 0 : simd_group);
-    uint head_group = KVPTG == 1 ? simd_group : 0;
+    uint packed_kv_head = simd_group / head_groups;
+    uint kv_head = position.x * KVPTG + (KVPTG == 1 ? 0 : packed_kv_head);
+    uint head_group = KVPTG == 1 ? simd_group : simd_group % head_groups;
     uint block = position.z;
     uint chunk = head_group / head_groups;
     uint first_head = (head_group % head_groups) * HPT;
@@ -511,7 +512,8 @@ void paged_sdpa_2pass_1_gqa_body(
     }
 
     if constexpr (KVPTG > 1) {
-        ulong partial_row = ulong(kv_head) * params.blocks + block;
+        uint head = kv_head * G + head_group;
+        ulong partial_row = ulong(head) * params.blocks + block;
         for (uint element = 0; element < elements_per_thread; ++element) {
             uint column = simd_lane * elements_per_thread + element;
             store_float(partials, partial_row * D + column, input0_dtype,
@@ -604,6 +606,7 @@ kernel void NAME(                                                            \
 DEFINE_PAGED_SDPA_PASS1_GQA(paged_sdpa_2pass_1_gqa1_128, 128, 1, 1, 1)
 DEFINE_PAGED_SDPA_PASS1_GQA(paged_sdpa_2pass_1_gqa1x8_128, 128, 1, 1, 8)
 DEFINE_PAGED_SDPA_PASS1_GQA(paged_sdpa_2pass_1_gqa2_128, 128, 2, 1, 1)
+DEFINE_PAGED_SDPA_PASS1_GQA(paged_sdpa_2pass_1_gqa2x8_128, 128, 2, 1, 8)
 DEFINE_PAGED_SDPA_PASS1_GQA(paged_sdpa_2pass_1_gqa8_128, 128, 8, 2, 1)
 
 template <uint D>

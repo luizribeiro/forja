@@ -818,7 +818,7 @@ paged_gqa_two_pass_tests!(
 );
 
 fn for_each_paged_gqa_safety_heads(mut check: impl FnMut(u32, u32)) {
-    for (query_heads, kv_heads) in [(32, 4), (16, 16)] {
+    for (query_heads, kv_heads) in [(32, 4), (16, 16), (16, 8)] {
         check(query_heads, kv_heads);
     }
 }
@@ -890,6 +890,21 @@ fn metal_paged_gqa_two_pass_keeps_barriers_uniform_across_rejected_pages() {
 fn metal_paged_gqa_two_pass_replaces_stale_scratch_on_early_refusal() {
     let backend = forja_metal::MetalBackend::new().unwrap();
     for_each_paged_gqa_safety_heads(|query_heads, kv_heads| {
+        run_sdpa(
+            &backend,
+            DType::F16,
+            512,
+            1,
+            false,
+            false,
+            query_heads,
+            kv_heads,
+            (0, 0),
+            &[],
+            Some("paged-sdpa.vector-gqa-two-pass-32"),
+            None,
+        )
+        .unwrap();
         let mut rejected_output = Vec::new();
         let error = run_sdpa(
             &backend,
