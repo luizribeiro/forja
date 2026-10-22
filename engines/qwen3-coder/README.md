@@ -68,6 +68,32 @@ ITL is 94.6% higher. Against bucket 2, its wall ITL is 191.5% higher. The record
 model revision `6e302ea604ad9ab206367e2c501d1571023e7b6d`, and an 80-core Apple M3 Ultra on macOS 27.0.1.
 Full confidence intervals and provenance are in `bench/qwen3-coder-30b-a3b-instruct-4bit.metal-apple-m3-ultra.q4/batched-decode.json`.
 
+Continuous HTTP serving uses at most eight active lanes and caps each prompt chunk at the profile's
+512-token serving budget. With 30 measured repetitions after three warmups, the 33-token greedy
+workload produced:
+
+| Server | c1 output tok/s | c2 | c4 | c8 | c4/c1 | c1/c4 streaming p99 ITL |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Forja | 75.34 | 114.52 | 160.80 | 155.07 | 2.13x | 17.82 / 31.41 ms |
+| mlx_lm 0.31.3 | 104.11 | 104.20 | 104.13 | 104.04 | 1.00x | 9.80 / 9.81 ms |
+
+Forja therefore passes the concurrency gate: concurrency-four aggregate decode is 2.13x its
+concurrency-one result, while p99 ITL is 1.76x. Both servers completed the 33-case, 3,240-request
+suite with no errors, 150 requested stream cancellations, and identical serial-versus-concurrent
+outputs for every comparable greedy and seeded case. At concurrency four, Forja served 1.256
+requests/s and 41.46 prompt tok/s; streaming measured 1.797 requests/s, 73.66 prompt tok/s, 158.10
+output tok/s, 323.94 ms p99 TTFT, and 2.498 s p99 end-to-end latency. The corresponding MLX
+streaming result was 0.811 requests/s, 33.23 prompt tok/s, 103.75 output tok/s, 3.796 s p99 TTFT,
+and 4.952 s p99 end-to-end latency.
+
+The representative Forja concurrency-four case reported a 3,221,227,520-byte pool, a 384-byte
+table, zero pool-attributed graph and scratch bytes, 17.42 GiB RSS, 72.89 GPU seconds, 95.52
+scheduler seconds, and 6.31 queue seconds. MLX reported 16.39 GiB RSS; its server does not expose
+the corresponding device-memory, GPU-time, or host-phase counters. Per-case request, token,
+TTFT/ITL/end-to-end percentile, cache, memory, GPU, host-phase, error, cancellation, configuration,
+and provenance data are in `serving-concurrency.json` and `serving-concurrency-mlx.json` beside the
+other accepted records.
+
 The f16 profile uses half-precision Q, K, V, and probability MMA inputs with f32 score, softmax,
 and output accumulation. Median wall throughput from matched five-repetition runs was:
 
