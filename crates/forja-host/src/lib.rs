@@ -1639,6 +1639,10 @@ where
             Ok(checkpoints) => checkpoints,
             Err(error) => return Ok(Err(error)),
         };
+        if let Err(error) = self.store.data_mut().advance_paged_batch_bank(slot) {
+            self.rollback_batch_appends(pool, &mut checkpoints)?;
+            return Ok(Err(error));
+        }
         let bucket = input.shape.bucket;
         let wit_input = input.into();
         self.set_guest_deadline();
@@ -1825,6 +1829,10 @@ where
             Ok(checkpoints) => checkpoints,
             Err(error) => return Ok(Err(error)),
         };
+        if let Err(error) = self.store.data_mut().advance_paged_batch_bank(slot) {
+            self.rollback_batch_appends(pool, &mut checkpoints)?;
+            return Ok(Err(error));
+        }
         let bucket = input.shape.bucket;
         let wit_input = input.into();
         self.set_guest_deadline();
@@ -4247,6 +4255,14 @@ impl<B: Backend + 'static> Host<B> {
             .get_mut(&Resource::<BatchSlotEntry>::new_borrow(slot_rep))
             .map_err(invalid_handle)?;
         slot.active_bank = slot.next_bank;
+        Ok(())
+    }
+
+    fn advance_paged_batch_bank(&mut self, slot_rep: u32) -> Result<(), compute::Error> {
+        let slot = self
+            .table
+            .get_mut(&Resource::<BatchSlotEntry>::new_borrow(slot_rep))
+            .map_err(invalid_handle)?;
         slot.next_bank ^= 1;
         Ok(())
     }
@@ -9614,12 +9630,17 @@ mod tests {
         host.select_paged_batch_bank(slot.rep()).unwrap();
         let entry = host.table.get(&slot).unwrap();
         assert_eq!(entry.active_bank, 0);
-        assert_eq!(entry.next_bank, 1);
+        assert_eq!(entry.next_bank, 0);
+
+        host.advance_paged_batch_bank(slot.rep()).unwrap();
 
         host.select_paged_batch_bank(slot.rep()).unwrap();
         let entry = host.table.get(&slot).unwrap();
         assert_eq!(entry.active_bank, 1);
-        assert_eq!(entry.next_bank, 0);
+        assert_eq!(entry.next_bank, 1);
+
+        host.advance_paged_batch_bank(slot.rep()).unwrap();
+        assert_eq!(host.table.get(&slot).unwrap().next_bank, 0);
     }
 
     #[test]

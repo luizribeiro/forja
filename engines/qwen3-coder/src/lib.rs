@@ -970,11 +970,16 @@ pub struct Qwen3Coder {
     batch_feedback: Tensor<u32>,
     #[cfg(target_family = "wasm")]
     batch_graphs: Vec<BatchDecodeGraphs>,
+    #[cfg(target_family = "wasm")]
+    batch_bank: usize,
+    #[cfg(target_family = "wasm")]
+    selection_bank: usize,
 }
 
 #[cfg(target_family = "wasm")]
 struct BatchDecodeGraphs {
     bucket: u32,
+    bank: usize,
     tokens: Tensor<u32>,
     positions: Tensor<f32>,
     sampling: Tensor<u32>,
@@ -988,13 +993,14 @@ struct BatchDecodeGraphs {
 
 #[cfg(target_family = "wasm")]
 impl BatchDecodeGraphs {
-    fn new(bucket: u32) -> Result<Self> {
+    fn new(bucket: u32, bank: usize) -> Result<Self> {
         let mask_words = VOCAB
             .checked_add(31)
             .ok_or_else(|| forja_sdk::Error::loading("vocabulary mask size overflowed"))?
             / 32;
         Ok(Self {
             bucket,
+            bank,
             tokens: Tensor::zeros(&[bucket])?,
             positions: Tensor::zeros(&[bucket])?,
             sampling: Tensor::zeros(&[bucket, 5])?,
@@ -1136,13 +1142,20 @@ impl Qwen3Coder {
             batch_feedback: Tensor::zeros(&[8])?,
             #[cfg(target_family = "wasm")]
             batch_graphs: if config.replay {
-                [1, 2, 4]
-                    .into_iter()
-                    .map(BatchDecodeGraphs::new)
+                (0..2)
+                    .flat_map(|bank| {
+                        [1, 2, 4]
+                            .into_iter()
+                            .map(move |bucket| BatchDecodeGraphs::new(bucket, bank))
+                    })
                     .collect::<Result<Vec<_>>>()?
             } else {
                 Vec::new()
             },
+            #[cfg(target_family = "wasm")]
+            batch_bank: 0,
+            #[cfg(target_family = "wasm")]
+            selection_bank: 0,
         })
     }
 
@@ -1488,6 +1501,7 @@ impl Engine for Qwen3Coder {
 
     #[cfg(target_family = "wasm")]
     fn batch_step(&mut self, input: BatchInput<'_>) -> Result<BatchOutput> {
+        let bank = self.next_batch_bank();
         if input.shape.phase == BatchPhase::Prompt {
             let lane = input
                 .lanes
@@ -1527,7 +1541,7 @@ impl Engine for Qwen3Coder {
             input.shape.bucket,
             input.lanes.iter().all(Option::is_some),
         ) {
-            return self.replay_batch_step(&input);
+            return self.replay_batch_step(&input, bank);
         }
         let tokens = self.batch_tokens(&input.lanes)?;
         let positions = batch_positions(&starts)?;
@@ -1538,13 +1552,15 @@ impl Engine for Qwen3Coder {
 
     #[cfg(target_family = "wasm")]
     fn batch_forward(&mut self, input: BatchInput<'_>) -> Result<Tensor<f32>> {
+        let bank = self.next_batch_bank();
+        self.selection_bank = bank;
         let starts = batch_starts(&input.lanes);
         if use_batch_decode_graph(
             self.replay,
             input.shape.bucket,
             input.lanes.iter().all(Option::is_some),
         ) {
-            return self.replay_batch_forward(&input);
+            return self.replay_batch_forward(&input, bank);
         }
         let tokens = self.batch_tokens(&input.lanes)?;
         let positions = batch_positions(&starts)?;
@@ -1556,9 +1572,13 @@ impl Engine for Qwen3Coder {
         if self.replay
             && input.shape.bucket <= 4
             && input.lanes.iter().all(Option::is_some)
-            && self.batch_masked_graph_supports(input.shape.bucket, &input.lanes)?
+            && self.batch_masked_graph_supports(
+                input.shape.bucket,
+                self.selection_bank,
+                &input.lanes,
+            )?
         {
-            return self.replay_batch_select(&input);
+            return self.replay_batch_select(&input, self.selection_bank);
         }
         let tokens = self.select_masked_batch_rows(input.logits, &input.lanes)?;
         Ok(BatchOutput {
@@ -1686,8 +1706,14 @@ fn allow_tensor(allow: &[u32]) -> Result<Tensor<u32>> {
 
 #[cfg(target_family = "wasm")]
 impl Qwen3Coder {
-    fn replay_batch_step(&mut self, input: &BatchInput<'_>) -> Result<BatchOutput> {
-        let index = self.batch_graph_index(input.shape.bucket)?;
+    fn next_batch_bank(&mut self) -> usize {
+        let bank = self.batch_bank;
+        self.batch_bank ^= 1;
+        bank
+    }
+
+    fn replay_batch_step(&mut self, input: &BatchInput<'_>, bank: usize) -> Result<BatchOutput> {
+        let index = self.batch_graph_index(input.shape.bucket, bank)?;
         let mut state = self.batch_graphs.remove(index);
         let starts = state.write_input(&input.lanes, &self.batch_feedback)?;
         let result = (|| {
@@ -1715,8 +1741,8 @@ impl Qwen3Coder {
         result
     }
 
-    fn replay_batch_forward(&mut self, input: &BatchInput<'_>) -> Result<Tensor<f32>> {
-        let index = self.batch_graph_index(input.shape.bucket)?;
+    fn replay_batch_forward(&mut self, input: &BatchInput<'_>, bank: usize) -> Result<Tensor<f32>> {
+        let index = self.batch_graph_index(input.shape.bucket, bank)?;
         let mut state = self.batch_graphs.remove(index);
         let starts = state.write_input(&input.lanes, &self.batch_feedback)?;
         let result = (|| {
@@ -1739,8 +1765,12 @@ impl Qwen3Coder {
         result
     }
 
-    fn replay_batch_select(&mut self, input: &BatchSelectInput<'_>) -> Result<BatchOutput> {
-        let index = self.batch_graph_index(input.shape.bucket)?;
+    fn replay_batch_select(
+        &mut self,
+        input: &BatchSelectInput<'_>,
+        bank: usize,
+    ) -> Result<BatchOutput> {
+        let index = self.batch_graph_index(input.shape.bucket, bank)?;
         let mut state = self.batch_graphs.remove(index);
         let starts = state.write_selection(input.logits, &input.lanes)?;
         let result = (|| {
@@ -1790,22 +1820,23 @@ impl Qwen3Coder {
         result
     }
 
-    fn batch_graph_index(&self, bucket: u32) -> Result<usize> {
+    fn batch_graph_index(&self, bucket: u32, bank: usize) -> Result<usize> {
         self.batch_graphs
             .iter()
-            .position(|state| state.bucket == bucket)
+            .position(|state| state.bucket == bucket && state.bank == bank)
             .ok_or_else(|| forja_sdk::Error::loading("batch graph bucket is unavailable"))
     }
 
     fn batch_masked_graph_supports(
         &self,
         bucket: u32,
+        bank: usize,
         lanes: &[Option<forja_sdk::BatchSelectLane>],
     ) -> Result<bool> {
         let Some(expected) = self
             .batch_graphs
             .iter()
-            .find(|state| state.bucket == bucket)
+            .find(|state| state.bucket == bucket && state.bank == bank)
             .and_then(|state| state.masked_offsets.as_ref())
         else {
             return Ok(true);
