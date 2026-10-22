@@ -37,33 +37,30 @@ where
         let mut deferred = None;
         self.admit_pending(receiver, pending, &mut active, &mut deferred)
             .await;
-        while !active.is_empty() {
-            active = active
-                .into_iter()
-                .filter_map(|lane| {
-                    if lane.control.is_cancelled() {
-                        self.fail_batch_lane(lane, GenerationError::cancelled());
-                        None
-                    } else {
-                        Some(lane)
-                    }
-                })
-                .collect();
-            if active.is_empty() {
+        let mut current = None;
+        loop {
+            if current.is_none() {
+                self.remove_unsubmitted_cancellations(&mut active);
                 self.admit_pending(receiver, pending, &mut active, &mut deferred)
                     .await;
                 if active.is_empty() {
                     return;
                 }
-            }
-            let batch = match self.submit_batch(&active, &[]).await {
-                Ok(batch) => batch,
-                Err(error) => {
-                    for lane in active {
-                        self.fail_batch_lane(lane, repeated_error(&error));
+                current = match self
+                    .submit_batch(&active.iter().collect::<Vec<_>>(), &[])
+                    .await
+                {
+                    Ok(batch) => batch,
+                    Err(error) => {
+                        for lane in active.drain(..) {
+                            self.fail_batch_lane(lane, repeated_error(&error));
+                        }
+                        return;
                     }
-                    return;
-                }
+                };
+            }
+            let Some(batch) = current.take() else {
+                continue;
             };
             let tokens = match self.runner.read_queued_batch_tokens(batch.output).await {
                 Ok(bytes) => read_batch_tokens(&bytes),
@@ -74,13 +71,14 @@ where
             let tokens = match tokens {
                 Ok(tokens) => tokens,
                 Err(error) => {
-                    for lane in active {
+                    for lane in active.drain(..) {
                         self.fail_batch_lane(lane, repeated_error(&error));
                     }
                     return;
                 }
             };
-            active = self.apply_batch_tokens(active, batch.lanes, &tokens).await;
+            self.apply_batch_tokens(&mut active, batch.lanes, &tokens)
+                .await;
             self.admit_pending(receiver, pending, &mut active, &mut deferred)
                 .await;
         }
@@ -88,12 +86,15 @@ where
 
     async fn apply_batch_tokens(
         &mut self,
-        active: Vec<BatchLane>,
+        active: &mut Vec<BatchLane>,
         submitted: Vec<PendingLane>,
         tokens: &[u32],
-    ) -> Vec<BatchLane> {
-        let mut next = Vec::new();
-        for (mut lane, submitted) in active.into_iter().zip(submitted) {
+    ) {
+        for submitted in submitted {
+            let Some(index) = active.iter().position(|lane| lane.slot == submitted.slot) else {
+                continue;
+            };
+            let mut lane = active.remove(index);
             if lane.control.is_cancelled() {
                 let rollback = self
                     .runner
@@ -122,18 +123,20 @@ where
                 .await
             {
                 Ok(Some(reason)) => self.finish_batch_lane(lane, reason).await,
-                Ok(None) => next.push(lane),
+                Ok(None) => active.push(lane),
                 Err(error) => self.fail_batch_lane(lane, error),
             }
         }
-        next
     }
 
     async fn submit_batch(
         &mut self,
-        lanes: &[BatchLane],
+        lanes: &[&BatchLane],
         feedback: &[u32],
-    ) -> Result<PendingBatch, GenerationError> {
+    ) -> Result<Option<PendingBatch>, GenerationError> {
+        if lanes.is_empty() {
+            return Ok(None);
+        }
         let shape = self.decode_shape(lanes)?;
         let checkpoints = self.checkpoint_lanes(lanes)?;
         let inputs = batch_inputs(shape, lanes, feedback)?;
@@ -148,7 +151,7 @@ where
             .map_err(|error| {
                 GenerationError::unavailable(format!("decode batch failed: {error:?}"))
             })?;
-        Ok(PendingBatch {
+        Ok(Some(PendingBatch {
             output,
             lanes: lanes
                 .iter()
@@ -158,12 +161,12 @@ where
                     checkpoint,
                 })
                 .collect(),
-        })
+        }))
     }
 
     fn checkpoint_lanes(
         &self,
-        lanes: &[BatchLane],
+        lanes: &[&BatchLane],
     ) -> Result<Vec<EngineLaneCheckpoint<()>>, GenerationError> {
         lanes
             .iter()
@@ -195,6 +198,18 @@ where
                 ))
             })
             .collect()
+    }
+
+    fn remove_unsubmitted_cancellations(&mut self, active: &mut Vec<BatchLane>) {
+        let mut index = 0;
+        while index < active.len() {
+            if active[index].control.is_cancelled() {
+                let lane = active.remove(index);
+                self.fail_batch_lane(lane, GenerationError::cancelled());
+            } else {
+                index += 1;
+            }
+        }
     }
 
     async fn admit_pending(
@@ -276,7 +291,7 @@ where
         })
     }
 
-    fn decode_shape(&self, lanes: &[BatchLane]) -> Result<BatchShape, GenerationError> {
+    fn decode_shape(&self, lanes: &[&BatchLane]) -> Result<BatchShape, GenerationError> {
         let needed = lanes
             .iter()
             .map(|lane| lane.slot.saturating_add(1))
@@ -351,7 +366,7 @@ fn reservations_fit(
 
 fn batch_inputs(
     shape: BatchShape,
-    lanes: &[BatchLane],
+    lanes: &[&BatchLane],
     feedback: &[u32],
 ) -> Result<Vec<Option<EngineBatchLane>>, GenerationError> {
     let count = usize::try_from(shape.bucket)
