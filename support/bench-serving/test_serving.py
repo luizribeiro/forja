@@ -46,6 +46,13 @@ class FakeServer(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def do_GET(self) -> None:
+        body = b"forja_engine_gpu_time_nanoseconds 3000000000\nforja_pool_bytes 17\n"
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def log_message(self, _format: str, *_args: object) -> None:
         pass
 
@@ -117,6 +124,25 @@ def test_cold_case_runs_setup_before_every_request() -> None:
         thread.join()
 
 
+def test_runner_scrapes_resource_gauges_and_counter_deltas() -> None:
+    server = ThreadingHTTPServer(("127.0.0.1", 0), FakeServer)
+    thread = threading.Thread(target=server.serve_forever)
+    thread.start()
+    try:
+        url = f"http://127.0.0.1:{server.server_port}/metrics"
+        samples = serving_bench.scrape_metrics(url)
+        report = serving_bench.metric_report(
+            {**samples, "forja_engine_gpu_time_nanoseconds": 1_000_000_000}, samples
+        )
+        assert report["gpu_seconds"] == 2.0
+        assert report["memory"]["pool_bytes"] == 17
+        assert report["memory"]["table_bytes"] is None
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
 def test_runner_initializes_client_when_first_case_is_cold(monkeypatch, tmp_path) -> None:
     case = {"name": "cold", "route": "completions", "prompt_tokens": 7, "output_tokens": 2, "concurrency": 1, "sampling": "greedy", "cold": True}
     settings = {"model": "model", "revision": "revision", "seed": 0, "connection_policy": "reuse", "warmups": 0, "repetitions": 1}
@@ -151,7 +177,15 @@ def test_runner_initializes_client_when_first_case_is_cold(monkeypatch, tmp_path
     monkeypatch.setattr(serving_bench.suite, "load", lambda _path: (settings, [case], "suite"))
     monkeypatch.setattr(serving_bench.suite, "expand", lambda cases: cases)
     monkeypatch.setattr(serving_bench.http_client, "OpenAIClient", lambda _url, _model: client)
-    monkeypatch.setattr(serving_bench.http_client, "run_case", lambda _client, _case, _warmups, _repetitions, setup: (setup(), {"case": case})[1])
+    monkeypatch.setattr(
+        serving_bench.http_client,
+        "run_case",
+        lambda _client, _case, _warmups, _repetitions, setup, begin: (
+            setup(),
+            begin(),
+            {"case": case},
+        )[2],
+    )
     monkeypatch.setattr(serving_bench.provenance, "collect", lambda *_args: {})
     args = argparse.Namespace(
         implementation="mlx_lm",
@@ -163,6 +197,7 @@ def test_runner_initializes_client_when_first_case_is_cold(monkeypatch, tmp_path
         repository=tmp_path,
         forja_repository=tmp_path,
         resolved_config=None,
+        metrics_url=None,
     )
 
     serving_bench.run(args)
@@ -210,7 +245,7 @@ def test_compare_refuses_every_workload_identity_mismatch() -> None:
     compare = comparison_module()
     case = {"name": "case", "prompt_tokens": 7, "concurrency": 1, "sampling": "greedy"}
     record = {
-        "schema_version": 1,
+        "schema_version": 2,
         "suite_sha256": "suite",
         "prompt_sha256": "prompt",
         "model": {"id": "model", "revision": "revision"},
@@ -220,7 +255,7 @@ def test_compare_refuses_every_workload_identity_mismatch() -> None:
         "results": [{"case": case}],
     }
     for field, value in [
-        ("schema_version", 2),
+        ("schema_version", 1),
         ("suite_sha256", "other"),
         ("prompt_sha256", "other"),
         ("sampling_seed", 1),

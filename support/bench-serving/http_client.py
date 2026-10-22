@@ -155,6 +155,7 @@ def run_case(
     warmups: int,
     repetitions: int,
     before_request: Callable[[], None] | None = None,
+    after_warmups: Callable[[], None] | None = None,
 ) -> dict[str, object]:
     """Run one expanded case with its requested concurrency."""
     if before_request is not None and case["concurrency"] != 1:
@@ -167,6 +168,8 @@ def run_case(
 
     for _ in range(warmups):
         request(0)
+    if after_warmups is not None:
+        after_warmups()
     count = repetitions * case["concurrency"]
     started = time.perf_counter()
     with ThreadPoolExecutor(max_workers=case["concurrency"]) as executor:

@@ -22,6 +22,7 @@ def arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--implementation", choices=("forja", "mlx_lm"), required=True)
     parser.add_argument("--url", required=True)
+    parser.add_argument("--metrics-url")
     parser.add_argument("--suite", required=True, type=Path)
     parser.add_argument("--json", required=True, type=Path)
     parser.add_argument("--server-command", required=True)
@@ -114,6 +115,64 @@ def ready(base_url: str) -> bool:
         connection.close()
 
 
+def scrape_metrics(url: str | None) -> dict[str, float] | None:
+    """Read unlabeled Prometheus samples from an optional endpoint."""
+    if url is None:
+        return None
+    parsed = urlsplit(url)
+    connection = http.client.HTTPConnection(parsed.hostname, parsed.port or 80, timeout=5)
+    try:
+        connection.request("GET", parsed.path or "/metrics")
+        response = connection.getresponse()
+        body = response.read().decode()
+        if response.status != 200:
+            raise RuntimeError(f"metrics endpoint returned HTTP {response.status}")
+    finally:
+        connection.close()
+    samples = {}
+    for line in body.splitlines():
+        if not line or line.startswith("#") or "{" in line:
+            continue
+        name, separator, value = line.partition(" ")
+        if separator:
+            samples[name] = float(value)
+    return samples
+
+
+def metric_report(
+    before: dict[str, float] | None,
+    after: dict[str, float] | None,
+) -> dict[str, object]:
+    """Report resource gauges and counter deltas with explicit unavailable values."""
+    memory = {
+        name: None
+        for name in ("pool_bytes", "table_bytes", "graph_bytes", "scratch_bytes")
+    }
+    phases = {
+        name: None for name in ("scheduler_seconds", "queue_seconds", "parser_mask_seconds", "sse_seconds")
+    }
+    report = {"gpu_seconds": None, "memory": memory, "host_phases": phases}
+    if before is None or after is None:
+        return report
+    for name in memory:
+        metric = f"forja_{name}"
+        if metric in after:
+            memory[name] = int(after[metric])
+    counters = {
+        "scheduler_seconds": "forja_scheduler_nanoseconds_total",
+        "queue_seconds": "forja_queue_nanoseconds_total",
+        "parser_mask_seconds": "forja_parser_mask_nanoseconds_total",
+        "sse_seconds": "forja_sse_nanoseconds_total",
+    }
+    for name, metric in counters.items():
+        if metric in before and metric in after:
+            phases[name] = max(0.0, after[metric] - before[metric]) / 1_000_000_000
+    gpu = "forja_engine_gpu_time_nanoseconds"
+    if gpu in before and gpu in after:
+        report["gpu_seconds"] = max(0.0, after[gpu] - before[gpu]) / 1_000_000_000
+    return report
+
+
 def run(args: argparse.Namespace) -> dict[str, object]:
     """Run every expanded case and assemble one comparable record."""
     settings, cases, suite_hash = suite.load(args.suite)
@@ -136,10 +195,15 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                 client.request({**case, "prompt_tokens": 0, "output_tokens": 1})
             before = server.rss_bytes()
             restart = None
+            metrics_before = None
             if case.get("cold"):
                 def restart() -> None:
                     server.start()
                     client.reset_connection()
+
+            def begin_measurement() -> None:
+                nonlocal metrics_before
+                metrics_before = scrape_metrics(args.metrics_url)
 
             result = http_client.run_case(
                 client,
@@ -147,6 +211,10 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                 settings["warmups"],
                 settings["repetitions"],
                 restart,
+                begin_measurement,
+            )
+            result["server_metrics"] = metric_report(
+                metrics_before, scrape_metrics(args.metrics_url)
             )
             rss = [value for value in [before, server.rss_bytes()] if value is not None]
             result["rss_bytes"] = max(rss) if rss else None
@@ -156,7 +224,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     prompts = [http_client.request_body(case, settings["model"]) for case in concrete]
     prompt_hash = hashlib.sha256(json.dumps(prompts, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "implementation": args.implementation,
         "model": {"id": settings["model"], "revision": settings["revision"]},
         "suite_sha256": suite_hash,
