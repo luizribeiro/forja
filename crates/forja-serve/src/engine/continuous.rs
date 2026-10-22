@@ -15,6 +15,10 @@ use crate::{
     metrics::observe,
 };
 
+mod batch;
+mod lane;
+mod prefill;
+
 enum CompletionSink {
     Complete(oneshot::Sender<Result<Completion, GenerationError>>),
     Stream {
@@ -61,6 +65,7 @@ struct PreparedRequest {
     constraint: Option<ConstraintPlan>,
     control: GenerationControl,
     sink: CompletionSink,
+    started: Instant,
 }
 
 impl PreparedRequest {
@@ -76,6 +81,7 @@ impl PreparedRequest {
             constraint,
             control,
             sink,
+            started: _,
         } = self;
         let result = match engine
             .prefill(tokens, prompt_tokens, params, constraint, &control)
@@ -187,6 +193,7 @@ impl RequestEnvelope {
     where
         B: Backend + Send + Sync + 'static,
     {
+        let started = Instant::now();
         let (prepared, request_params, control, sink) = match self {
             Self::Chat {
                 request,
@@ -250,6 +257,7 @@ impl RequestEnvelope {
                 constraint,
                 control,
                 sink,
+                started,
             }),
             Err(error) => {
                 sink.fail(error);
@@ -314,7 +322,13 @@ where
             let queued = envelope.queued().elapsed();
             let scheduled = Instant::now();
             if let Some(prepared) = envelope.prepare(&mut self).await {
-                prepared.run_single(&mut self).await;
+                if prepared.constraint.is_none() && self.info.serving.is_some() {
+                    if let Some(lane) = self.start_batch_lane(prepared, 0).await {
+                        self.run_batch_lanes(vec![lane]).await;
+                    }
+                } else {
+                    prepared.run_single(&mut self).await;
+                }
             }
             if let Ok(mut metrics) = shared_metrics.lock() {
                 self.metrics.queue_time = metrics.queue_time;
@@ -325,4 +339,24 @@ where
             }
         }
     }
+}
+
+fn batch_admission_error(
+    error: &forja_host::bindings::l9o::gpu::compute::Error,
+) -> GenerationError {
+    GenerationError::unavailable(format!("paged admission failed: {error:?}"))
+}
+
+fn read_batch_tokens(bytes: &[u8]) -> Result<Vec<u32>, GenerationError> {
+    let (tokens, remainder) = bytes.as_chunks::<4>();
+    if !remainder.is_empty() {
+        return Err(GenerationError::new(
+            "batch token output is not u32-aligned",
+        ));
+    }
+    Ok(tokens.iter().copied().map(u32::from_le_bytes).collect())
+}
+
+fn repeated_error(error: &GenerationError) -> GenerationError {
+    GenerationError::unavailable(error.to_string())
 }

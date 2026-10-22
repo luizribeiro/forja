@@ -122,7 +122,11 @@ where
                     self.prefix_index
                         .as_mut()
                         .ok_or_else(|| GenerationError::new("prefix index is unavailable"))?
-                        .publish(self.prefix_namespace, lane.take_ledger().into_tokens(), &prefix)
+                        .publish(
+                            self.prefix_namespace,
+                            lane.take_ledger().into_tokens(),
+                            &prefix,
+                        )
                         .map_err(|error| GenerationError::unavailable(error.to_string()))
                 })
         } else {

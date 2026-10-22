@@ -151,8 +151,12 @@ where
                     })],
                 })
                 .await
-                .map_err(|error| GenerationError::unavailable(format!("prompt batch failed: {error}")))?
-                .map_err(|error| GenerationError::unavailable(format!("prompt batch failed: {error:?}")))?;
+                .map_err(|error| {
+                    GenerationError::unavailable(format!("prompt batch failed: {error}"))
+                })?
+                .map_err(|error| {
+                    GenerationError::unavailable(format!("prompt batch failed: {error:?}"))
+                })?;
             let bytes = self.runner.read(&output.tokens).await.map_err(|error| {
                 GenerationError::unavailable(format!("prompt batch read failed: {error}"))
             })?;
