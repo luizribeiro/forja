@@ -1,10 +1,11 @@
 use std::{
+    collections::BTreeMap,
     convert::Infallible,
     future::Future,
     pin::Pin,
     sync::{
         Arc, Mutex as StdMutex,
-        atomic::{AtomicU32, AtomicU64, Ordering},
+        atomic::{AtomicU64, Ordering},
     },
     time::{Duration, UNIX_EPOCH},
 };
@@ -22,7 +23,7 @@ use axum::{
 };
 use forja_core::Backend;
 use serde_json::{Value, json};
-use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot};
 use tokio_stream::{StreamExt, wrappers::ReceiverStream};
 
 use crate::engine::ErrorKind;
@@ -367,16 +368,14 @@ pub fn chat_router<S: ChatService>(service: S) -> Router {
 pub fn serving_router<S: ChatService>(service: S) -> (Router, DrainHandle<S>) {
     let max_body_bytes = service.max_body_bytes();
     let served_model = service.model().to_owned();
+    let queue_capacity = usize::try_from(service.queue_length()).unwrap_or(usize::MAX);
     let state = Arc::new(HttpState {
         model: served_model,
-        queue_limit: service.queue_length(),
         deadline: service.request_deadline(),
         write_stall_timeout: service.write_stall_timeout(),
-        service: Mutex::new(service),
-        sequence: Arc::new(Semaphore::new(1)),
-        queued: AtomicU32::new(0),
+        service: ServiceActor::spawn(service, queue_capacity),
         draining: std::sync::atomic::AtomicBool::new(false),
-        active: StdMutex::new(None),
+        active: StdMutex::new(BTreeMap::new()),
         drained: tokio::sync::Notify::new(),
     });
     let router = Router::new()
@@ -410,13 +409,10 @@ pub fn operational_router<S: ChatService>(
 
 struct HttpState<S> {
     model: String,
-    service: Mutex<S>,
-    sequence: Arc<Semaphore>,
-    queued: AtomicU32,
+    service: ServiceActor<S>,
     draining: std::sync::atomic::AtomicBool,
-    active: StdMutex<Option<GenerationControl>>,
+    active: StdMutex<BTreeMap<u64, GenerationControl>>,
     drained: tokio::sync::Notify,
-    queue_limit: u32,
     deadline: Duration,
     write_stall_timeout: Duration,
 }
@@ -435,7 +431,7 @@ async fn ready<S>(State(state): State<Arc<HttpState<S>>>) -> Response {
 
 async fn prometheus<S: ChatService>(State(state): State<Arc<HttpState<S>>>) -> Response {
     let ready = !state.draining.load(Ordering::Acquire);
-    let text = state.service.lock().await.metrics().prometheus(true, ready);
+    let text = state.service.metrics().prometheus(true, ready);
     (
         [(
             header::CONTENT_TYPE,
@@ -455,11 +451,10 @@ impl<S> DrainHandle<S> {
     /// Drains all admitted serving work.
     pub async fn drain(&self) {
         self.state.draining.store(true, Ordering::Release);
-        self.state.sequence.close();
-        if let Ok(active) = self.state.active.lock()
-            && let Some(control) = active.as_ref()
-        {
-            control.cancel();
+        if let Ok(active) = self.state.active.lock() {
+            for control in active.values() {
+                control.cancel();
+            }
         }
         loop {
             let notified = self.state.drained.notified();
@@ -467,7 +462,7 @@ impl<S> DrainHandle<S> {
                 .state
                 .active
                 .lock()
-                .map_or(true, |active| active.is_none());
+                .map_or(true, |active| active.is_empty());
             if done {
                 return;
             }
@@ -478,12 +473,13 @@ impl<S> DrainHandle<S> {
 
 struct ActiveGuard<S> {
     state: Arc<HttpState<S>>,
+    request_id: u64,
 }
 
 impl<S> Drop for ActiveGuard<S> {
     fn drop(&mut self) {
         if let Ok(mut active) = self.state.active.lock() {
-            *active = None;
+            active.remove(&self.request_id);
         }
         self.state.drained.notify_waiters();
     }
@@ -513,26 +509,23 @@ async fn chat<S: ChatService>(
         return api_error(StatusCode::NOT_FOUND, "model is not loaded");
     }
     if request.params.stream {
-        return stream_chat_response(state, request, deadline).await;
+        return stream_chat_response(state, request, request_id, deadline).await;
     }
-    let permit = match tokio::time::timeout_at(deadline, admit(&state)).await {
-        Ok(Ok(permit)) => permit,
-        Ok(Err(response)) => return *response,
-        Err(_) => return api_error(StatusCode::GATEWAY_TIMEOUT, "request deadline exceeded"),
-    };
     let model = request.model.clone();
     let control = GenerationControl::new(state.write_stall_timeout);
-    let active = match activate(&state, &control) {
+    let active = match activate(&state, request_id, &control) {
         Ok(active) => active,
         Err(response) => return *response,
+    };
+    let actor = match state.service.complete(request, control.clone()) {
+        Ok(receiver) => receiver,
+        Err(error) => return actor_error(error),
     };
     let (sender, receiver) = oneshot::channel();
     let task_control = control.clone();
     tokio::spawn(async move {
         let _active = active;
-        let _permit = permit;
-        let mut service = state.service.lock().await;
-        let generation = service.complete(request, task_control.clone());
+        let generation = actor_result(actor);
         controlled_deadline(
             deadline,
             &task_control,
@@ -581,26 +574,23 @@ async fn text<S: ChatService>(
         return api_error(StatusCode::NOT_FOUND, "model is not loaded");
     }
     if request.params.stream {
-        return stream_text_response(state, request, deadline).await;
+        return stream_text_response(&state, request, request_id, deadline);
     }
-    let permit = match tokio::time::timeout_at(deadline, admit(&state)).await {
-        Ok(Ok(permit)) => permit,
-        Ok(Err(response)) => return *response,
-        Err(_) => return api_error(StatusCode::GATEWAY_TIMEOUT, "request deadline exceeded"),
-    };
     let model = request.model.clone();
     let control = GenerationControl::new(state.write_stall_timeout);
-    let active = match activate(&state, &control) {
+    let active = match activate(&state, request_id, &control) {
         Ok(active) => active,
         Err(response) => return *response,
+    };
+    let actor = match state.service.complete_text(request, control.clone()) {
+        Ok(receiver) => receiver,
+        Err(error) => return actor_error(error),
     };
     let (sender, receiver) = oneshot::channel();
     let task_control = control.clone();
     tokio::spawn(async move {
         let _active = active;
-        let _permit = permit;
-        let mut service = state.service.lock().await;
-        let generation = service.complete_text(request, task_control.clone());
+        let generation = actor_result(actor);
         controlled_deadline(
             deadline,
             &task_control,
@@ -634,16 +624,12 @@ async fn text<S: ChatService>(
 async fn stream_chat_response<S: ChatService>(
     state: Arc<HttpState<S>>,
     request: ChatCompletionRequest,
+    request_id: u64,
     deadline: tokio::time::Instant,
 ) -> Response {
     if request.model != state.model {
         return api_error(StatusCode::NOT_FOUND, "model is not loaded");
     }
-    let permit = match tokio::time::timeout_at(deadline, admit(&state)).await {
-        Ok(Ok(permit)) => permit,
-        Ok(Err(response)) => return *response,
-        Err(_) => return api_error(StatusCode::GATEWAY_TIMEOUT, "request deadline exceeded"),
-    };
     let model = request.model.clone();
     let created = unix_time();
     let id = format!("chatcmpl-{created}");
@@ -655,15 +641,20 @@ async fn stream_chat_response<S: ChatService>(
         );
     }
     let control = GenerationControl::new(state.write_stall_timeout);
-    let active = match activate(&state, &control) {
+    let active = match activate(&state, request_id, &control) {
         Ok(active) => active,
         Err(response) => return *response,
     };
+    let actor = match state
+        .service
+        .stream_chat(request, sender.clone(), control.clone())
+    {
+        Ok(receiver) => receiver,
+        Err(error) => return actor_error(error),
+    };
     tokio::spawn(async move {
         let _active = active;
-        let _permit = permit;
-        let mut service = state.service.lock().await;
-        let generation = service.stream_chat(request, sender.clone(), control.clone());
+        let generation = actor_result(actor);
         controlled_deadline(deadline, &control, generation, move |result| async move {
             send_stream_error(result, &sender).await;
         })
@@ -672,33 +663,34 @@ async fn stream_chat_response<S: ChatService>(
     sse_response(receiver, id, created, model, true)
 }
 
-async fn stream_text_response<S: ChatService>(
-    state: Arc<HttpState<S>>,
+fn stream_text_response<S: ChatService>(
+    state: &Arc<HttpState<S>>,
     request: CompletionRequest,
+    request_id: u64,
     deadline: tokio::time::Instant,
 ) -> Response {
     if request.model != state.model {
         return api_error(StatusCode::NOT_FOUND, "model is not loaded");
     }
-    let permit = match tokio::time::timeout_at(deadline, admit(&state)).await {
-        Ok(Ok(permit)) => permit,
-        Ok(Err(response)) => return *response,
-        Err(_) => return api_error(StatusCode::GATEWAY_TIMEOUT, "request deadline exceeded"),
-    };
     let model = request.model.clone();
     let created = unix_time();
     let id = format!("cmpl-{created}");
     let (sender, receiver) = mpsc::channel(16);
     let control = GenerationControl::new(state.write_stall_timeout);
-    let active = match activate(&state, &control) {
+    let active = match activate(state, request_id, &control) {
         Ok(active) => active,
         Err(response) => return *response,
     };
+    let actor = match state
+        .service
+        .stream_text(request, sender.clone(), control.clone())
+    {
+        Ok(receiver) => receiver,
+        Err(error) => return actor_error(error),
+    };
     tokio::spawn(async move {
         let _active = active;
-        let _permit = permit;
-        let mut service = state.service.lock().await;
-        let generation = service.stream_text(request, sender.clone(), control.clone());
+        let generation = actor_result(actor);
         controlled_deadline(deadline, &control, generation, move |result| async move {
             send_stream_error(result, &sender).await;
         })
@@ -710,6 +702,14 @@ async fn stream_text_response<S: ChatService>(
 enum DeadlineResult<T> {
     Completed(Result<T, GenerationError>),
     TimedOut,
+}
+
+async fn actor_result<T>(
+    receiver: oneshot::Receiver<Result<T, GenerationError>>,
+) -> Result<T, GenerationError> {
+    receiver
+        .await
+        .map_err(|_| GenerationError::new("serving scheduler stopped"))?
 }
 
 struct CancelOnDrop(Option<GenerationControl>);
@@ -894,47 +894,9 @@ fn log_completion(request_id: u64, route: &str, model: &str, completion: &Comple
     );
 }
 
-async fn admit<S>(state: &Arc<HttpState<S>>) -> Result<OwnedSemaphorePermit, Box<Response>> {
-    if state.draining.load(Ordering::Acquire) {
-        return Err(Box::new(api_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "server is draining",
-        )));
-    }
-    if let Ok(permit) = Arc::clone(&state.sequence).try_acquire_owned() {
-        return Ok(permit);
-    }
-    if state
-        .queued
-        .try_update(Ordering::AcqRel, Ordering::Acquire, |queued| {
-            (queued < state.queue_limit).then_some(queued + 1)
-        })
-        .is_err()
-    {
-        return Err(Box::new(api_error(
-            StatusCode::TOO_MANY_REQUESTS,
-            "request queue is full",
-        )));
-    }
-    let reservation = QueueReservation(&state.queued);
-    let permit = Arc::clone(&state.sequence).acquire_owned().await;
-    drop(reservation);
-    if state.draining.load(Ordering::Acquire) {
-        return Err(Box::new(api_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "server is draining",
-        )));
-    }
-    permit.map_err(|_| {
-        Box::new(api_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "server is draining",
-        ))
-    })
-}
-
 fn activate<S>(
     state: &Arc<HttpState<S>>,
+    request_id: u64,
     control: &GenerationControl,
 ) -> Result<ActiveGuard<S>, Box<Response>> {
     let mut active = state.active.lock().map_err(|_| {
@@ -949,18 +911,18 @@ fn activate<S>(
             "server is draining",
         )));
     }
-    *active = Some(control.clone());
+    active.insert(request_id, control.clone());
     drop(active);
     Ok(ActiveGuard {
         state: Arc::clone(state),
+        request_id,
     })
 }
 
-struct QueueReservation<'a>(&'a AtomicU32);
-
-impl Drop for QueueReservation<'_> {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::AcqRel);
+fn actor_error(error: ActorError) -> Response {
+    match error {
+        ActorError::Full => api_error(StatusCode::TOO_MANY_REQUESTS, "request queue is full"),
+        ActorError::Closed => api_error(StatusCode::SERVICE_UNAVAILABLE, "server is draining"),
     }
 }
 
@@ -1269,26 +1231,29 @@ mod tests {
 
     #[tokio::test]
     async fn bounds_the_fifo_waiting_queue() {
-        let state = state();
-        let active = admit(&state).await.unwrap();
-        let waiting = admit(&state);
-        tokio::pin!(waiting);
-        assert!(matches!(
-            futures_poll_once(waiting.as_mut()),
-            std::task::Poll::Pending
-        ));
-        assert_eq!(
-            admit(&state).await.unwrap_err().status(),
-            StatusCode::TOO_MANY_REQUESTS
+        let release = Arc::new(tokio::sync::Notify::new());
+        let actor = ServiceActor::spawn(
+            DeadlineSmoke {
+                release: Arc::clone(&release),
+                block_next: true,
+            },
+            1,
         );
-        drop(active);
-        assert!(waiting.await.is_ok());
+        let first = actor.complete(chat_request(), control()).unwrap();
+        tokio::task::yield_now().await;
+        let second = actor.complete(chat_request(), control()).unwrap();
+        assert_eq!(
+            actor.complete(chat_request(), control()).unwrap_err(),
+            ActorError::Full
+        );
+        release.notify_one();
+        assert!(first.await.unwrap().is_ok());
+        assert!(second.await.unwrap().is_ok());
     }
 
     #[tokio::test]
     async fn wrong_model_never_enters_admission() {
         let state = state();
-        let _active = Arc::clone(&state.sequence).try_acquire_owned().unwrap();
         let chat_request = br#"{"model":"missing","messages":[]}"#;
         let text_request = br#"{"model":"missing","prompt":"hi"}"#;
 
@@ -1298,14 +1263,14 @@ mod tests {
         let stream_text = serde_json::from_slice(text_request).unwrap();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
         let stream_chat_response =
-            stream_chat_response(Arc::clone(&state), stream_chat, deadline).await;
-        let stream_text_response = stream_text_response(state.clone(), stream_text, deadline).await;
+            stream_chat_response(Arc::clone(&state), stream_chat, 1, deadline).await;
+        let stream_text_response = stream_text_response(&state, stream_text, 2, deadline);
 
         assert_eq!(chat_response.status(), StatusCode::NOT_FOUND);
         assert_eq!(text_response.status(), StatusCode::NOT_FOUND);
         assert_eq!(stream_chat_response.status(), StatusCode::NOT_FOUND);
         assert_eq!(stream_text_response.status(), StatusCode::NOT_FOUND);
-        assert_eq!(state.queued.load(Ordering::Acquire), 0);
+        assert!(state.active.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -1447,17 +1412,17 @@ mod tests {
         let release = Arc::new(tokio::sync::Notify::new());
         let state = Arc::new(HttpState {
             model: "smoke".to_owned(),
-            service: Mutex::new(DeadlineSmoke {
-                release: Arc::clone(&release),
-                block_next: true,
-            }),
-            sequence: Arc::new(Semaphore::new(1)),
-            queued: AtomicU32::new(0),
-            queue_limit: 1,
+            service: ServiceActor::spawn(
+                DeadlineSmoke {
+                    release: Arc::clone(&release),
+                    block_next: true,
+                },
+                1,
+            ),
             deadline: Duration::from_millis(30),
             write_stall_timeout: Duration::from_secs(1),
             draining: std::sync::atomic::AtomicBool::new(false),
-            active: StdMutex::new(None),
+            active: StdMutex::new(BTreeMap::new()),
             drained: tokio::sync::Notify::new(),
         });
         let body = br#"{"model":"smoke","messages":[]}"#;
@@ -1467,7 +1432,7 @@ mod tests {
 
         assert_eq!(first.status(), StatusCode::GATEWAY_TIMEOUT);
         assert!(started.elapsed() < Duration::from_millis(250));
-        assert_eq!(state.sequence.available_permits(), 0);
+        assert_eq!(state.active.lock().unwrap().len(), 1);
         let next = tokio::spawn(chat::<DeadlineSmoke>(
             State(Arc::clone(&state)),
             request(body),
@@ -1485,9 +1450,8 @@ mod tests {
     #[tokio::test]
     async fn drain_stops_admission_and_waits_for_finalization() {
         let state = state();
-        let permit = admit(&state).await.unwrap();
         let control = GenerationControl::new(Duration::from_secs(1));
-        let active = activate(&state, &control).unwrap();
+        let active = activate(&state, 1, &control).unwrap();
         let handle = DrainHandle {
             state: Arc::clone(&state),
         };
@@ -1499,10 +1463,9 @@ mod tests {
         ));
         assert!(control.is_cancelled());
         drop(active);
-        drop(permit);
         drain.await;
         assert_eq!(
-            admit(&state).await.unwrap_err().status(),
+            activate(&state, 2, &control).err().unwrap().status(),
             StatusCode::SERVICE_UNAVAILABLE
         );
     }
@@ -1510,16 +1473,25 @@ mod tests {
     fn state() -> Arc<HttpState<Smoke>> {
         Arc::new(HttpState {
             model: "smoke".to_owned(),
-            service: Mutex::new(Smoke),
-            sequence: Arc::new(Semaphore::new(1)),
-            queued: AtomicU32::new(0),
-            queue_limit: 1,
+            service: ServiceActor::spawn(Smoke, 1),
             deadline: Duration::from_secs(1),
             write_stall_timeout: Duration::from_secs(1),
             draining: std::sync::atomic::AtomicBool::new(false),
-            active: StdMutex::new(None),
+            active: StdMutex::new(BTreeMap::new()),
             drained: tokio::sync::Notify::new(),
         })
+    }
+
+    fn chat_request() -> ChatCompletionRequest {
+        ChatCompletionRequest {
+            model: "smoke".to_owned(),
+            messages: Vec::new(),
+            params: crate::CompletionParams::default(),
+        }
+    }
+
+    fn control() -> GenerationControl {
+        GenerationControl::new(Duration::from_secs(1))
     }
 
     fn request(bytes: &'static [u8]) -> Request {
