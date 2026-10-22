@@ -101,6 +101,9 @@ where
         config.clone(),
         info,
         profile.workload().max_context.get(),
+        profile
+            .serving()
+            .map_or(1, |serving| serving.prompt_token_budget.get()),
         identity,
     )?;
     let listener = tokio::net::TcpListener::bind(config.server.listen).await?;
@@ -484,6 +487,9 @@ mod tests {
             config,
             info,
             profile.workload().max_context.get(),
+            profile
+                .serving()
+                .map_or(1, |serving| serving.prompt_token_budget.get()),
             identity,
         )?)
     }
@@ -586,6 +592,9 @@ mod tests {
             config,
             info,
             profile.workload().max_context.get(),
+            profile
+                .serving()
+                .map_or(1, |serving| serving.prompt_token_budget.get()),
             identity,
         )?)
     }

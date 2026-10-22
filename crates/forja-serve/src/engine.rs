@@ -12,7 +12,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use forja_config::HostConfig;
+use forja_config::{Choice, HostConfig};
 use forja_core::{Backend, correction_sampling_seed};
 use forja_host::{
     EngineBeginDecode, EngineDecode, EngineDecodeOutput, EngineInfo, EngineRunner, EngineTensor,
@@ -437,6 +437,54 @@ pub struct ServingEngine<B: Backend + Send + Sync + 'static> {
     prefix_index: Option<PrefixIndex>,
     live_prefix: Option<LivePrefix>,
     metrics: ServingMetrics,
+    #[allow(dead_code)]
+    scheduler: SchedulerConfig,
+}
+
+#[allow(dead_code)]
+struct SchedulerConfig {
+    active_lanes: u32,
+    prompt_token_budget: u32,
+}
+
+impl SchedulerConfig {
+    fn resolve(
+        info: &EngineInfo,
+        config: &HostConfig,
+        profile_budget: u32,
+    ) -> Result<Self, GenerationError> {
+        let Some(serving) = info.serving.as_ref() else {
+            return Ok(Self {
+                active_lanes: 1,
+                prompt_token_budget: 1,
+            });
+        };
+        if profile_budget == 0 {
+            return Err(GenerationError::new(
+                "profile prompt budget must be positive",
+            ));
+        }
+        let configured_active = match config.serving.max_active_sequences {
+            Choice::Auto => serving.active_lanes,
+            Choice::Fixed(value) => value.get(),
+        };
+        let configured_batch = match config.serving.max_batch_size {
+            Choice::Auto => serving.active_lanes,
+            Choice::Fixed(value) => value.get(),
+        };
+        let configured_prompt = match config.serving.prompt_token_budget {
+            Choice::Auto => u64::from(profile_budget),
+            Choice::Fixed(value) => value.get(),
+        };
+        Ok(Self {
+            active_lanes: serving
+                .active_lanes
+                .min(configured_active)
+                .min(configured_batch),
+            prompt_token_budget: profile_budget
+                .min(u32::try_from(configured_prompt).unwrap_or(u32::MAX)),
+        })
+    }
 }
 
 impl<B> ServingEngine<B>
@@ -457,6 +505,7 @@ where
         config: HostConfig,
         info: EngineInfo,
         profile_max_context: u32,
+        profile_prompt_budget: u32,
         prefix_identity: PrefixIdentity,
     ) -> Result<Self, GenerationError> {
         let max_context = serving_context_ceiling(
@@ -502,6 +551,7 @@ where
                 .map_err(|error| GenerationError::new(error.to_string()))
             })
             .transpose()?;
+        let scheduler = SchedulerConfig::resolve(&info, &config, profile_prompt_budget)?;
         Ok(Self {
             model,
             runner,
@@ -518,6 +568,7 @@ where
             prefix_index,
             live_prefix: None,
             metrics: ServingMetrics::default(),
+            scheduler,
         })
     }
 
