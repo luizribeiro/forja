@@ -3333,6 +3333,7 @@ impl MetalBackend {
             }
         }
         if let Some(gqa_blocks) = gqa_blocks {
+            let (first_kernel, first_threads) = paged_gqa_first_pass(q[0], k[2])?;
             let partials = self.scratch_tensor(query.layout.dtype(), &[q[0], gqa_blocks, v[3]])?;
             let sums = self.scratch_tensor(DType::F32, &[q[0], gqa_blocks])?;
             let maxs = self.scratch_tensor(DType::F32, &[q[0], gqa_blocks])?;
@@ -3340,7 +3341,7 @@ impl MetalBackend {
                 .pipelines
                 .lock()
                 .map_err(|_| BackendError::ExecutionFailed)?
-                .get("paged_sdpa_2pass_1_gqa_128", &constants)?;
+                .get(first_kernel, &constants)?;
             set_pipeline(encoder, &first);
             for (index, tensor) in [
                 &query,
@@ -3368,7 +3369,7 @@ impl MetalBackend {
                     depth: usize::try_from(gqa_blocks).map_err(|_| BackendError::InvalidInput)?,
                 },
                 MTLSize {
-                    width: 256,
+                    width: first_threads,
                     height: 1,
                     depth: 1,
                 },
@@ -7508,13 +7509,41 @@ fn paged_sdpa_kernel(dispatch: &Dispatch, width: u32) -> Result<&'static str, Ba
                 | MetalVariant::PagedSdpaVectorGqaTwoPass256,
             ),
             128,
-        ) => Ok("paged_sdpa_2pass_1_gqa_128"),
+        ) => {
+            let inputs = dispatch.inputs();
+            let query_heads = inputs
+                .first()
+                .and_then(|query| query.layout().shape().first())
+                .copied()
+                .ok_or(BackendError::InvalidInput)?;
+            let kv_heads = inputs
+                .get(1)
+                .and_then(|key| key.layout().shape().get(2))
+                .copied()
+                .ok_or(BackendError::InvalidInput)?;
+            paged_gqa_first_pass(query_heads, kv_heads).map(|(kernel, _)| kernel)
+        }
         (Some(MetalVariant::PagedSdpaSteel), 64) => Ok("paged_steel_attention_64"),
         (Some(MetalVariant::PagedSdpaSteel), 128) => Ok("paged_steel_attention_128"),
         (Some(MetalVariant::PagedSdpaSteelHalf), 64) => Ok("paged_steel_attention_half_64_64x32"),
         (Some(MetalVariant::PagedSdpaSteelHalf), 128) => Ok("paged_steel_attention_half_128_96x16"),
         (_, 64) => Ok("paged_sdpa_64"),
         (_, 128) => Ok("paged_sdpa_128"),
+        _ => Err(BackendError::UnsupportedOperation),
+    }
+}
+
+fn paged_gqa_first_pass(
+    query_heads: u32,
+    kv_heads: u32,
+) -> Result<(&'static str, usize), BackendError> {
+    match query_heads
+        .checked_div(kv_heads)
+        .filter(|_| query_heads.is_multiple_of(kv_heads))
+    {
+        Some(1) => Ok(("paged_sdpa_2pass_1_gqa1_128", 32)),
+        Some(2) => Ok(("paged_sdpa_2pass_1_gqa2_128", 64)),
+        Some(8) => Ok(("paged_sdpa_2pass_1_gqa8_128", 256)),
         _ => Err(BackendError::UnsupportedOperation),
     }
 }

@@ -691,7 +691,7 @@ real_shape_tests!(
     (metal_paged_sdpa_matches_cpu_at_16384_bf16_heads_12_15, DType::BF16, 16_384, 2, 12..16),
 );
 
-fn check_paged_gqa_two_pass(length: u32, variant: &str) {
+fn check_paged_gqa_two_pass(length: u32, variant: &str, heads: (u32, u32)) {
     let cpu = forja_cpu::CpuBackend::new();
     let metal = forja_metal::MetalBackend::new().unwrap();
     for contiguous in [false, true] {
@@ -702,8 +702,8 @@ fn check_paged_gqa_two_pass(length: u32, variant: &str) {
             1,
             false,
             contiguous,
-            32,
-            4,
+            heads.0,
+            heads.1,
             (0, 0),
             &[],
             None,
@@ -717,8 +717,8 @@ fn check_paged_gqa_two_pass(length: u32, variant: &str) {
             1,
             false,
             contiguous,
-            32,
-            4,
+            heads.0,
+            heads.1,
             (0, 0),
             &[],
             Some(variant),
@@ -738,7 +738,9 @@ macro_rules! paged_gqa_two_pass_tests {
         $(
             #[test]
             fn $name() {
-                check_paged_gqa_two_pass($length, $variant);
+                for heads in [(16, 16), (16, 8), (32, 4)] {
+                    check_paged_gqa_two_pass($length, $variant, heads);
+                }
             }
         )+
     };

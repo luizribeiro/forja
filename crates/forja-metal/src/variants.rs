@@ -570,6 +570,7 @@ const TOP_K_PARTIALS: &[Constraint] = &[operation(
     Relation::Range { min: 1, max: 64 },
 )];
 const PAGED_SDPA: &[Constraint] = &[value(PAGED_KEY_WIDTH, Relation::OneOf(WIDTHS))];
+const PAGED_GQA_RATIOS: &[u64] = &[1, 2, 8];
 const PAGED_GQA_TWO_PASS: &[Constraint] = &[
     value(QUERY_LENGTH, Relation::Equal(1)),
     value(PAGED_KEY_WIDTH, Relation::Equal(128)),
@@ -583,7 +584,7 @@ const PAGED_GQA_TWO_PASS: &[Constraint] = &[
             numerator: QUERY_HEADS,
             denominator: PAGED_KEY_HEADS,
         },
-        relation: Relation::Equal(8),
+        relation: Relation::OneOf(PAGED_GQA_RATIOS),
     },
 ];
 const PAGED_SDPA_STEEL: &[Constraint] = &[
@@ -844,36 +845,36 @@ pub(crate) static REGISTRY: &[VariantDef<MetalVariant>] = &[
         PagedSdpa,
         PagedSdpaVectorGqaTwoPass32,
         PAGED_GQA_TWO_PASS,
-        &["short single-token paged decode with eight query heads per K/V head."],
-        &["other grouped-query factors or longer cache lengths."],
-        &["Reuses each paged K/V load across two query heads with 32 reduction blocks."]
+        &["short single-token paged decode with a supported query-to-K/V head ratio."],
+        &["unsupported grouped-query factors or longer cache lengths."],
+        &["Reuses each paged K/V load across grouped query heads with 32 reduction blocks."]
     ),
     batch_invariant_variant!(
         "paged-sdpa.vector-gqa-two-pass",
         PagedSdpa,
         PagedSdpaVectorGqaTwoPass64,
         PAGED_GQA_TWO_PASS,
-        &["single-token paged decode with eight query heads per K/V head."],
-        &["other grouped-query factors or a profile-tuned block count."],
-        &["Reuses each paged K/V load across two query heads with 64 reduction blocks."]
+        &["single-token paged decode with a supported query-to-K/V head ratio."],
+        &["unsupported grouped-query factors or a profile-tuned block count."],
+        &["Reuses each paged K/V load across grouped query heads with 64 reduction blocks."]
     ),
     batch_invariant_variant!(
         "paged-sdpa.vector-gqa-two-pass-128",
         PagedSdpa,
         PagedSdpaVectorGqaTwoPass128,
         PAGED_GQA_TWO_PASS,
-        &["single-token paged decode with eight query heads per K/V head."],
-        &["other grouped-query factors or shorter cache lengths."],
-        &["Reuses each paged K/V load across two query heads with 128 reduction blocks."]
+        &["single-token paged decode with a supported query-to-K/V head ratio."],
+        &["unsupported grouped-query factors or shorter cache lengths."],
+        &["Reuses each paged K/V load across grouped query heads with 128 reduction blocks."]
     ),
     batch_invariant_variant!(
         "paged-sdpa.vector-gqa-two-pass-256",
         PagedSdpa,
         PagedSdpaVectorGqaTwoPass256,
         PAGED_GQA_TWO_PASS,
-        &["long single-token paged decode with eight query heads per K/V head."],
-        &["other grouped-query factors or shorter cache lengths."],
-        &["Reuses each paged K/V load across two query heads with 256 reduction blocks."]
+        &["long single-token paged decode with a supported query-to-K/V head ratio."],
+        &["unsupported grouped-query factors or shorter cache lengths."],
+        &["Reuses each paged K/V load across grouped query heads with 256 reduction blocks."]
     ),
     batch_invariant_variant!(
         "paged-sdpa.steel",
@@ -2058,16 +2059,18 @@ mod tests {
     }
 
     #[test]
-    fn paged_gqa_vector_attention_requires_eight_query_heads_per_cache_head() {
-        for ratio in [1, 2, 4, 16] {
+    fn paged_gqa_vector_attention_supports_profile_head_ratios() {
+        for ratio in [4, 16] {
             let dispatch = paged_sdpa_dispatch_with_heads(DType::F32, ratio, 1, 128);
             assert!(matches!(
                 resolve(&dispatch, "paged-sdpa.vector-gqa-two-pass", METAL4),
                 Err(VariantError::Constraint { .. })
             ));
         }
-        let dispatch = paged_sdpa_dispatch_with_heads(DType::F32, 8, 1, 128);
-        assert!(resolve(&dispatch, "paged-sdpa.vector-gqa-two-pass", METAL4).is_ok());
+        for ratio in [1, 2, 8] {
+            let dispatch = paged_sdpa_dispatch_with_heads(DType::F32, ratio, 1, 128);
+            assert!(resolve(&dispatch, "paged-sdpa.vector-gqa-two-pass", METAL4).is_ok());
+        }
     }
 
     #[test]
@@ -2372,22 +2375,22 @@ mod tests {
             (
                 "paged-sdpa.vector-gqa-two-pass-32",
                 paged_sdpa_dispatch_with_heads(DType::F16, 8, 1, 128),
-                "paged_sdpa_2pass_1_gqa_128",
+                "paged_sdpa_2pass_1_gqa8_128",
             ),
             (
                 "paged-sdpa.vector-gqa-two-pass",
                 paged_sdpa_dispatch_with_heads(DType::F16, 8, 1, 128),
-                "paged_sdpa_2pass_1_gqa_128",
+                "paged_sdpa_2pass_1_gqa8_128",
             ),
             (
                 "paged-sdpa.vector-gqa-two-pass-128",
                 paged_sdpa_dispatch_with_heads(DType::F16, 8, 1, 128),
-                "paged_sdpa_2pass_1_gqa_128",
+                "paged_sdpa_2pass_1_gqa8_128",
             ),
             (
                 "paged-sdpa.vector-gqa-two-pass-256",
                 paged_sdpa_dispatch_with_heads(DType::F16, 8, 1, 128),
-                "paged_sdpa_2pass_1_gqa_128",
+                "paged_sdpa_2pass_1_gqa8_128",
             ),
             (
                 "paged-sdpa.steel",

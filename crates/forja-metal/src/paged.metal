@@ -557,7 +557,7 @@ void paged_sdpa_2pass_1_gqa_body(
     }
 }
 
-#define DEFINE_PAGED_SDPA_PASS1_GQA(NAME, D)                                \
+#define DEFINE_PAGED_SDPA_PASS1_GQA(NAME, D, G, HPT)                        \
 kernel void NAME(                                                            \
     device const uchar *query [[buffer(0)]],                                 \
     device const uchar *key [[buffer(1)]],                                   \
@@ -572,21 +572,23 @@ kernel void NAME(                                                            \
     uint3 position [[threadgroup_position_in_grid]],                         \
     uint simd_group [[simdgroup_index_in_threadgroup]],                      \
     uint simd_lane [[thread_index_in_simdgroup]]) {                          \
-    threadgroup float partial_outputs[8 * 2 * D];                            \
-    threadgroup float partial_sums[8 * 2];                                   \
-    threadgroup float partial_maxs[8 * 2];                                   \
+    threadgroup float partial_outputs[G * HPT * D];                          \
+    threadgroup float partial_sums[G * HPT];                                 \
+    threadgroup float partial_maxs[G * HPT];                                 \
     threadgroup uint physical_pages[4];                                     \
     threadgroup uint page_valid[4];                                         \
     threadgroup uint first_page;                                             \
     threadgroup uint valid;                                                  \
-    paged_sdpa_2pass_1_gqa_body<D, 8, 2>(                                   \
+    paged_sdpa_2pass_1_gqa_body<D, G, HPT>(                                 \
         query, key, value, table, generations, partials, sums, maxs, params, \
         error_flag, position, simd_group, simd_lane, partial_outputs,        \
         partial_sums, partial_maxs, physical_pages, page_valid, first_page,  \
         valid);                                                              \
 }
 
-DEFINE_PAGED_SDPA_PASS1_GQA(paged_sdpa_2pass_1_gqa_128, 128)
+DEFINE_PAGED_SDPA_PASS1_GQA(paged_sdpa_2pass_1_gqa1_128, 128, 1, 1)
+DEFINE_PAGED_SDPA_PASS1_GQA(paged_sdpa_2pass_1_gqa2_128, 128, 2, 1)
+DEFINE_PAGED_SDPA_PASS1_GQA(paged_sdpa_2pass_1_gqa8_128, 128, 8, 2)
 
 template <uint D>
 void paged_sdpa_2pass_2_body(
