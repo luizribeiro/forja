@@ -67,10 +67,13 @@ struct ContextMeasurement {
     summary: Summary,
 }
 
-#[allow(dead_code)]
+#[derive(Clone)]
 struct BatchDecodeMeasurement {
     bucket: usize,
+    contexts: Vec<u32>,
     summary: Summary,
+    wall_itl: Stats,
+    gpu_itl: Stats,
 }
 const BATCH_CONTEXTS: [u32; 2] = [512, 2_048];
 struct ProfileReport {
@@ -910,6 +913,21 @@ async fn measure_points(
     for (point_index, point) in options.points.iter().enumerate() {
         for (input, component) in options.engines.iter().enumerate() {
             let engine = component.display().to_string();
+            let batches = if batch_measurements_enabled(
+                options.rerun.as_ref().map(|record| record.schema_version),
+            ) {
+                measure_record_batches(options, point, component).await?
+            } else {
+                Vec::new()
+            };
+            for batch in &batches {
+                print_summary(
+                    &engine,
+                    "batch-combined",
+                    &format!("batch-{}", batch.bucket),
+                    batch.summary,
+                );
+            }
             for &strategy in &point.selection {
                 let (host_argmax, overlap) = selection_mode(strategy);
                 let selection = selection_name(strategy);
@@ -959,6 +977,7 @@ async fn measure_points(
                             "tg": summary_json(context.summary),
                         }))
                         .collect::<Vec<_>>(),
+                    "batch_decode": batches.iter().map(batch_json).collect::<Vec<_>>(),
                     "sampling_fallbacks": profile_reports
                         .iter()
                         .filter_map(sampling_fallbacks_json)
@@ -1201,8 +1220,11 @@ fn context_measurements_enabled(rerun_schema: Option<u32>) -> bool {
     rerun_schema.is_none_or(|schema| schema >= 4)
 }
 
+fn batch_measurements_enabled(rerun_schema: Option<u32>) -> bool {
+    rerun_schema.is_none_or(|schema| schema >= 5)
+}
+
 #[cfg(target_os = "macos")]
-#[allow(dead_code)]
 async fn measure_record_batches(
     options: &Bench,
     point: &BenchPoint,
@@ -1281,9 +1303,13 @@ async fn measure_record_batches(
             .checked_mul(point.tg)
             .ok_or("batch benchmark aggregate token count overflowed")?;
         let summary = summarize(&samples, aggregate_tokens)?;
+        let steps = f64::from(u32::try_from(point.tg)?);
         measurements.push(BatchDecodeMeasurement {
             bucket: usize::try_from(bucket)?,
+            contexts: contexts[..usize::try_from(bucket)?].to_vec(),
             summary,
+            wall_itl: stats(samples.iter().map(|sample| sample.wall_seconds / steps)),
+            gpu_itl: stats(samples.iter().map(|sample| sample.gpu_seconds / steps)),
         });
     }
     Ok(measurements)
@@ -1433,6 +1459,22 @@ fn decode_batch_tokens(bytes: &[u8]) -> Result<Vec<u32>, Box<dyn Error>> {
 
 fn batch_contexts(bucket: usize) -> Vec<u32> {
     BATCH_CONTEXTS.into_iter().cycle().take(bucket).collect()
+}
+
+fn batch_json(batch: &BatchDecodeMeasurement) -> serde_json::Value {
+    serde_json::json!({
+        "bucket": batch.bucket,
+        "contexts": batch.contexts,
+        "aggregate": summary_json(batch.summary),
+        "lanes": batch.contexts.iter().enumerate().map(|(lane, context_start)| serde_json::json!({
+            "lane": lane,
+            "context_start": context_start,
+            "itl_seconds": {
+                "wall": stats_json(batch.wall_itl),
+                "gpu": stats_json(batch.gpu_itl),
+            },
+        })).collect::<Vec<_>>(),
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -2895,6 +2937,9 @@ mod tests {
     #[test]
     fn batched_decode_alternates_short_and_long_contexts() {
         assert_eq!(batch_contexts(4), [512, 2_048, 512, 2_048]);
+        assert!(batch_measurements_enabled(None));
+        assert!(batch_measurements_enabled(Some(5)));
+        assert!(!batch_measurements_enabled(Some(4)));
     }
 
     #[cfg(target_os = "macos")]
