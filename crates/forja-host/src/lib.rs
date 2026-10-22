@@ -3872,11 +3872,10 @@ impl<B: Backend + 'static> Host<B> {
                     .table()
                     .clone();
                 self.upload_paged_table_entries(tables[lane], &table)?;
-                *binding
+                binding
                     .lane(lane)?
-                    .sequence
-                    .lock()
-                    .map_err(|_| guest_error(BackendError::ExecutionFailed))? = None;
+                    .table_dirty
+                    .store(true, Ordering::Release);
             }
         }
         for (handle, values) in
@@ -9633,7 +9632,7 @@ mod tests {
     }
 
     #[test]
-    fn paged_lane_metadata_poisons_padding_after_reuse() {
+    fn paged_lane_metadata_preserves_padding_sequence() {
         let mut host = Host::new(CpuBackend::new(), GENEROUS);
         let pool = insert_test_pool(&mut host, 1, 16);
         host.table.get_mut(&pool).unwrap().active_lanes = 2;
@@ -9659,7 +9658,14 @@ mod tests {
                 .sequence
                 .lock()
                 .unwrap()
-                .is_none()
+                .is_some()
+        );
+        assert!(
+            slot.binding
+                .lane(1)
+                .unwrap()
+                .table_dirty
+                .load(Ordering::Acquire)
         );
         let handles = [
             slot.logical_lengths,
@@ -9685,6 +9691,18 @@ mod tests {
         assert_eq!(
             values[2],
             [3_u32.to_ne_bytes(), 0_u32.to_ne_bytes()].concat()
+        );
+        host.begin_paged_lane_append(pool.rep(), 1, 2, 1).unwrap();
+        let slot = host.table.get(&pool).unwrap().slot.unwrap();
+        assert!(
+            host.table
+                .get(&Resource::<BatchSlotEntry>::new_borrow(slot))
+                .unwrap()
+                .binding
+                .banks
+                .slot(0, 1)
+                .unwrap()
+                .is_active()
         );
     }
 

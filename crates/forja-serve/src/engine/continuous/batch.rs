@@ -152,7 +152,12 @@ where
                 let prefix = self
                     .runner
                     .paged_lane_prefix(lane.slot)
-                    .map_err(|error| batch_admission_error(&error))?
+                    .map_err(|error| {
+                        GenerationError::unavailable(format!(
+                            "paged lane {} checkpoint failed: {error}",
+                            lane.slot
+                        ))
+                    })?
                     .ok_or_else(|| GenerationError::new("paged lane is unavailable"))?;
                 let reserved_tokens = prefix.reserved_tokens().map_err(|error| {
                     GenerationError::unavailable(format!("paged checkpoint failed: {error}"))
