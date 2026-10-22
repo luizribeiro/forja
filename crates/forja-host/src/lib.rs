@@ -3650,9 +3650,9 @@ impl<B: Backend + 'static> Host<B> {
                 .checkpoint()
                 .map_err(|error| compute::Error::Quota(error.to_string()))?;
             if sequence.logical_len() == 0 && start != 0 {
-                sequence
-                    .commit_write(u64::from(start))
-                    .map_err(|error| compute::Error::Quota(error.to_string()))?;
+                return Err(compute::Error::Layout(
+                    "fresh paged sequences must start at zero".to_owned(),
+                ));
             }
             if sequence.logical_len() != u64::from(start) {
                 return Err(compute::Error::Layout(
@@ -9505,6 +9505,28 @@ mod tests {
     }
 
     #[test]
+    fn fresh_paged_lane_refuses_a_nonzero_start() {
+        let mut host = Host::new(CpuBackend::new(), GENEROUS);
+        let pool = insert_test_pool(&mut host, 1, 16);
+        host.open_paged_slot(&pool, 1).unwrap();
+        host.bind_paged_lane(pool.rep(), 0, None, 8).unwrap();
+
+        assert!(matches!(
+            host.begin_paged_lane_append(pool.rep(), 0, 3, 1),
+            Err(compute::Error::Layout(_))
+        ));
+        assert_eq!(
+            host.paged_prefix(pool.rep())
+                .unwrap()
+                .sequence
+                .lock()
+                .unwrap()
+                .logical_len(),
+            0
+        );
+    }
+
+    #[test]
     fn paged_lane_metadata_poisons_padding_after_reuse() {
         let mut host = Host::new(CpuBackend::new(), GENEROUS);
         let pool = insert_test_pool(&mut host, 1, 16);
@@ -9512,7 +9534,7 @@ mod tests {
         host.open_paged_slot(&pool, 1).unwrap();
         host.bind_paged_lane(pool.rep(), 0, None, 8).unwrap();
         host.bind_paged_lane(pool.rep(), 1, None, 8).unwrap();
-        host.begin_paged_lane_append(pool.rep(), 0, 3, 1).unwrap();
+        host.begin_paged_lane_append(pool.rep(), 0, 0, 4).unwrap();
         host.begin_paged_lane_append(pool.rep(), 1, 0, 2).unwrap();
 
         host.write_paged_lane_metadata(pool.rep(), &[Some((3, 1)), None])
