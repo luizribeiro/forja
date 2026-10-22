@@ -104,6 +104,14 @@ impl<B> ChatService for ServingEngine<B>
 where
     B: Backend + Send + Sync + 'static,
 {
+    fn run(
+        self,
+        receiver: mpsc::Receiver<ServiceCommand>,
+        metrics: Arc<StdMutex<ServingMetrics>>,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+        Box::pin(self.run_continuous(receiver, metrics))
+    }
+
     fn model(&self) -> &str {
         self.model()
     }
@@ -208,7 +216,7 @@ pub enum ServiceCommand {
 }
 
 impl ServiceCommand {
-    fn queued(&self) -> std::time::Instant {
+    pub(crate) fn queued(&self) -> std::time::Instant {
         match self {
             Self::Chat { queued, .. }
             | Self::Text { queued, .. }

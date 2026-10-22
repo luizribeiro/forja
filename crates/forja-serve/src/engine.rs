@@ -34,6 +34,8 @@ use crate::{
     serving_context_ceiling,
 };
 
+mod continuous;
+
 static NEXT_CHAT_STREAM: AtomicU64 = AtomicU64::new(1);
 
 /// A failure while preparing or running a generation.
