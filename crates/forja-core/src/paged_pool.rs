@@ -443,6 +443,12 @@ impl PagedSlotBanks {
         })
     }
 
+    /// Reports whether a sequence belongs to this slot bank's pool.
+    #[must_use]
+    pub fn owns_sequence(&self, sequence: &PagedSequence) -> bool {
+        self.pool.same_pool(&sequence.pool)
+    }
+
     /// Rebinds an active sequence capability into one lane.
     ///
     /// # Errors
@@ -455,7 +461,7 @@ impl PagedSlotBanks {
         lane: usize,
         sequence: &PagedSequence,
     ) -> Result<(), PagePoolError> {
-        if !self.pool.same_pool(&sequence.pool) {
+        if !self.owns_sequence(sequence) {
             return Err(PagePoolError::ForeignResource);
         }
         self.ensure_rebindable(bank)?;

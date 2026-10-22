@@ -1632,6 +1632,9 @@ where
             Ok(slot) => slot,
             Err(error) => return Ok(Err(error)),
         };
+        if let Err(error) = self.store.data_mut().select_paged_batch_bank(slot) {
+            return Ok(Err(error));
+        }
         let mut checkpoints = match self.prepare_batch_appends(pool, &input, &appended).await {
             Ok(checkpoints) => checkpoints,
             Err(error) => return Ok(Err(error)),
@@ -1815,6 +1818,9 @@ where
             Ok(slot) => slot,
             Err(error) => return Ok(Err(error)),
         };
+        if let Err(error) = self.store.data_mut().select_paged_batch_bank(slot) {
+            return Ok(Err(error));
+        }
         let mut checkpoints = match self.prepare_batch_appends(pool, &input, &appended).await {
             Ok(checkpoints) => checkpoints,
             Err(error) => return Ok(Err(error)),
@@ -3019,6 +3025,7 @@ pub struct BatchSlotEntry {
     generations: u32,
     metadata: [[u32; 3]; 2],
     active_bank: usize,
+    next_bank: usize,
 }
 
 struct PagedBinding {
@@ -3518,6 +3525,7 @@ impl<B: Backend + 'static> Host<B> {
             generations: backing.generations,
             metadata: backing.metadata,
             active_bank: 0,
+            next_bank: 0,
         }) {
             Ok(slot) => slot,
             Err(error) => {
@@ -4194,13 +4202,13 @@ impl<B: Backend + 'static> Host<B> {
                 "paged request exceeds the context ceiling".to_owned(),
             ));
         }
-        let (binding, bank) = {
-            let slot = self
+        let binding = Arc::clone(
+            &self
                 .table
                 .get(&Resource::<BatchSlotEntry>::new_borrow(slot_rep))
-                .map_err(invalid_handle)?;
-            (Arc::clone(&slot.binding), slot.active_bank)
-        };
+                .map_err(invalid_handle)?
+                .binding,
+        );
         let lane = usize::try_from(lane)
             .map_err(|_| compute::Error::Layout("paged lane exceeds usize".to_owned()))?;
         let lane_binding = binding.lane(lane)?;
@@ -4211,14 +4219,16 @@ impl<B: Backend + 'static> Host<B> {
                     .map_err(|error| compute::Error::Quota(error.to_string()))?,
             )),
         };
-        {
-            let sequence_guard = sequence
+        let owned = {
+            let sequence = sequence
                 .lock()
                 .map_err(|_| guest_error(BackendError::ExecutionFailed))?;
-            binding
-                .banks
-                .bind(bank, lane, &sequence_guard)
-                .map_err(|error| compute::Error::Quota(error.to_string()))?;
+            binding.banks.owns_sequence(&sequence)
+        };
+        if !owned {
+            return Err(compute::Error::Quota(
+                forja_core::PagePoolError::ForeignResource.to_string(),
+            ));
         }
         *lane_binding
             .sequence
@@ -4228,6 +4238,16 @@ impl<B: Backend + 'static> Host<B> {
         for dirty in &lane_binding.table_dirty {
             dirty.store(true, Ordering::Release);
         }
+        Ok(())
+    }
+
+    fn select_paged_batch_bank(&mut self, slot_rep: u32) -> Result<(), compute::Error> {
+        let slot = self
+            .table
+            .get_mut(&Resource::<BatchSlotEntry>::new_borrow(slot_rep))
+            .map_err(invalid_handle)?;
+        slot.active_bank = slot.next_bank;
+        slot.next_bank ^= 1;
         Ok(())
     }
 
@@ -9583,6 +9603,38 @@ mod tests {
         let sequence = rebound.sequence.lock().unwrap();
         assert_eq!(sequence.logical_len(), 7);
         assert_eq!(sequence.reserved_tokens(), 12);
+    }
+
+    #[test]
+    fn paged_batch_calls_alternate_slot_banks() {
+        let mut host = Host::new(CpuBackend::new(), GENEROUS);
+        let pool = insert_test_pool(&mut host, 1, 16);
+        let slot = host.open_paged_slot(&pool, 1).unwrap();
+
+        host.select_paged_batch_bank(slot.rep()).unwrap();
+        let entry = host.table.get(&slot).unwrap();
+        assert_eq!(entry.active_bank, 0);
+        assert_eq!(entry.next_bank, 1);
+
+        host.select_paged_batch_bank(slot.rep()).unwrap();
+        let entry = host.table.get(&slot).unwrap();
+        assert_eq!(entry.active_bank, 1);
+        assert_eq!(entry.next_bank, 0);
+    }
+
+    #[test]
+    fn paged_request_binding_defers_slot_updates_until_use() {
+        let mut host = Host::new(CpuBackend::new(), GENEROUS);
+        let pool = insert_test_pool(&mut host, 1, 16);
+        let slot = host.open_paged_slot(&pool, 1).unwrap();
+
+        host.bind_paged_request(pool.rep(), None, 8).unwrap();
+
+        let binding = &host.table.get(&slot).unwrap().binding;
+        assert!(!binding.banks.slot(0, 0).unwrap().is_active());
+        assert!(!binding.banks.slot(1, 0).unwrap().is_active());
+        assert!(binding.lane(0).unwrap().table_dirty[0].load(Ordering::Acquire));
+        assert!(binding.lane(0).unwrap().table_dirty[1].load(Ordering::Acquire));
     }
 
     #[test]
