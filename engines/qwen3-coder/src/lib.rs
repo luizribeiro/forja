@@ -978,20 +978,32 @@ struct BatchDecodeGraphs {
     tokens: Tensor<u32>,
     positions: Tensor<f32>,
     sampling: Tensor<u32>,
+    logits: Tensor<f32>,
+    allow: Tensor<u32>,
     combined: Option<Graph<(Tensor<f32>, Tensor<u32>)>>,
     forward: Option<Graph<Tensor<f32>>>,
+    masked: Option<Graph<Tensor<u32>>>,
+    masked_offsets: Option<Vec<u32>>,
 }
 
 #[cfg(target_family = "wasm")]
 impl BatchDecodeGraphs {
     fn new(bucket: u32) -> Result<Self> {
+        let mask_words = VOCAB
+            .checked_add(31)
+            .ok_or_else(|| forja_sdk::Error::loading("vocabulary mask size overflowed"))?
+            / 32;
         Ok(Self {
             bucket,
             tokens: Tensor::zeros(&[bucket])?,
             positions: Tensor::zeros(&[bucket])?,
             sampling: Tensor::zeros(&[bucket, 5])?,
+            logits: Tensor::zeros(&[bucket, VOCAB])?,
+            allow: Tensor::zeros(&[bucket, mask_words])?,
             combined: None,
             forward: None,
+            masked: None,
+            masked_offsets: None,
         })
     }
 
@@ -1034,6 +1046,36 @@ impl BatchDecodeGraphs {
         self.tokens.write(&tokens)?;
         self.positions.write(&positions)?;
         self.sampling.write(&sampling)?;
+        Ok(starts)
+    }
+
+    fn write_selection(
+        &self,
+        logits: &Tensor<f32>,
+        lanes: &[Option<forja_sdk::BatchSelectLane>],
+    ) -> Result<Vec<u32>> {
+        let values = logits.to_vec()?;
+        let expected = usize::try_from(u64::from(self.bucket) * u64::from(VOCAB))
+            .map_err(|_| forja_sdk::Error::loading("batch logits exceed address space"))?;
+        if values.len() != expected {
+            return Err(forja_sdk::Error::loading(
+                "batch logits have the wrong size",
+            ));
+        }
+        let mut sampling = Vec::with_capacity(lanes.len() * 5);
+        let mut masks = Vec::new();
+        let mut starts = Vec::with_capacity(lanes.len());
+        for lane in lanes {
+            let lane = lane
+                .as_ref()
+                .ok_or_else(|| forja_sdk::Error::loading("captured batch lane is inactive"))?;
+            sampling.extend(sampling_words(lane.sampling)?);
+            masks.extend(allow_mask(&lane.allow)?);
+            starts.push(lane.start_pos);
+        }
+        self.logits.write(&values)?;
+        self.sampling.write(&sampling)?;
+        self.allow.write(&masks)?;
         Ok(starts)
     }
 }
@@ -1511,6 +1553,13 @@ impl Engine for Qwen3Coder {
 
     #[cfg(target_family = "wasm")]
     fn batch_select(&mut self, input: BatchSelectInput<'_>) -> Result<BatchOutput> {
+        if self.replay
+            && input.shape.bucket <= 4
+            && input.lanes.iter().all(Option::is_some)
+            && self.batch_masked_graph_supports(input.shape.bucket, &input.lanes)?
+        {
+            return self.replay_batch_select(&input);
+        }
         let tokens = self.select_masked_batch_rows(input.logits, &input.lanes)?;
         Ok(BatchOutput {
             logits: input.logits.alias()?,
@@ -1589,6 +1638,18 @@ fn sampling_words(sampling: forja_sdk::SamplingParams) -> Result<[u32; 5]> {
         seed_low,
         seed_high,
     ])
+}
+
+#[cfg(target_family = "wasm")]
+fn batch_position_offsets(starts: &[u32], base: u32) -> Result<Vec<u32>> {
+    starts
+        .iter()
+        .map(|start| {
+            start
+                .checked_sub(base)
+                .ok_or_else(|| forja_sdk::Error::loading("batch position underflowed"))
+        })
+        .collect()
 }
 
 fn allow_mask(allow: &[u32]) -> Result<Vec<u32>> {
@@ -1678,11 +1739,91 @@ impl Qwen3Coder {
         result
     }
 
+    fn replay_batch_select(&mut self, input: &BatchSelectInput<'_>) -> Result<BatchOutput> {
+        let index = self.batch_graph_index(input.shape.bucket)?;
+        let mut state = self.batch_graphs.remove(index);
+        let starts = state.write_selection(input.logits, &input.lanes)?;
+        let result = (|| {
+            let base = starts
+                .iter()
+                .copied()
+                .min()
+                .ok_or_else(|| forja_sdk::Error::loading("masked batch has no lane"))?;
+            let offsets = batch_position_offsets(&starts, base)?;
+            if state.masked.is_none() {
+                let max_offset = offsets.iter().copied().max().unwrap_or_default();
+                let end = (MAX_CONTEXT - 1).checked_sub(max_offset).ok_or_else(|| {
+                    forja_sdk::Error::loading("masked batch position exceeds context")
+                })?;
+                let param = Param::new(0..=end)?;
+                let positions = offsets
+                    .iter()
+                    .map(|&offset| param.at(base) + offset)
+                    .collect::<Result<Vec<Dim>>>()?;
+                let graph = forja_sdk::capture(&[&param], || {
+                    let logits = state.logits.narrow(
+                        0,
+                        Dim::from(param.at(base)).checked_mul(0)?,
+                        state.bucket,
+                    )?;
+                    self.select_masked_graph_rows(
+                        &logits,
+                        &state.sampling,
+                        &state.allow,
+                        &positions,
+                    )
+                })?;
+                state.masked_offsets = Some(offsets);
+                state.masked = Some(graph);
+            }
+            let graph = state
+                .masked
+                .as_ref()
+                .ok_or_else(|| forja_sdk::Error::loading("masked batch graph is unavailable"))?;
+            graph.replay(&[base])?;
+            Ok(BatchOutput {
+                logits: state.logits.alias()?,
+                tokens: graph.result().alias()?,
+            })
+        })();
+        self.batch_graphs.insert(index, state);
+        result
+    }
+
     fn batch_graph_index(&self, bucket: u32) -> Result<usize> {
         self.batch_graphs
             .iter()
             .position(|state| state.bucket == bucket)
             .ok_or_else(|| forja_sdk::Error::loading("batch graph bucket is unavailable"))
+    }
+
+    fn batch_masked_graph_supports(
+        &self,
+        bucket: u32,
+        lanes: &[Option<forja_sdk::BatchSelectLane>],
+    ) -> Result<bool> {
+        let Some(expected) = self
+            .batch_graphs
+            .iter()
+            .find(|state| state.bucket == bucket)
+            .and_then(|state| state.masked_offsets.as_ref())
+        else {
+            return Ok(true);
+        };
+        let starts = lanes
+            .iter()
+            .map(|lane| {
+                lane.as_ref()
+                    .map(|lane| lane.start_pos)
+                    .ok_or_else(|| forja_sdk::Error::loading("captured batch lane is inactive"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let base = starts
+            .iter()
+            .copied()
+            .min()
+            .ok_or_else(|| forja_sdk::Error::loading("masked batch has no lane"))?;
+        Ok(&batch_position_offsets(&starts, base)? == expected)
     }
 
     fn batch_graph_positions(
@@ -1726,6 +1867,35 @@ impl Qwen3Coder {
                 &sampling.narrow(0, lane, 1)?.reshape(&[5])?,
                 position.start.clone(),
                 &variant,
+            )?;
+            selected.copy_into(&mut output.narrow(0, lane, 1)?)?;
+            selected.copy_into(&mut self.batch_feedback.narrow(0, lane, 1)?)?;
+        }
+        Ok(output)
+    }
+
+    fn select_masked_graph_rows(
+        &self,
+        logits: &Tensor<f32>,
+        sampling: &Tensor<u32>,
+        allow: &Tensor<u32>,
+        positions: &[Dim],
+    ) -> Result<Tensor<u32>> {
+        let rows = u32::try_from(positions.len())
+            .map_err(|_| forja_sdk::Error::loading("batch rows exceed u32"))?;
+        let mask_words = allow
+            .shape()
+            .get(1)
+            .copied()
+            .ok_or_else(|| forja_sdk::Error::loading("batch mask must have rank two"))?;
+        let output = Tensor::zeros(&[rows])?;
+        for (lane, position) in positions.iter().enumerate() {
+            let lane = u32::try_from(lane)
+                .map_err(|_| forja_sdk::Error::loading("batch lane exceeds u32"))?;
+            let selected = logits.narrow(0, lane, 1)?.sample_masked(
+                &sampling.narrow(0, lane, 1)?.reshape(&[5])?,
+                &allow.narrow(0, lane, 1)?.reshape(&[mask_words])?,
+                position.clone(),
             )?;
             selected.copy_into(&mut output.narrow(0, lane, 1)?)?;
             selected.copy_into(&mut self.batch_feedback.narrow(0, lane, 1)?)?;
@@ -2174,5 +2344,11 @@ mod tests {
         assert!(!use_batch_decode_graph(true, 8, true));
         assert!(!use_batch_decode_graph(true, 4, false));
         assert!(!use_batch_decode_graph(false, 4, true));
+    }
+
+    #[test]
+    fn preserves_masked_graph_lane_offsets() {
+        assert_eq!(batch_position_offsets(&[7, 10, 33], 7).unwrap(), [0, 3, 26]);
+        assert!(batch_position_offsets(&[7], 8).is_err());
     }
 }
