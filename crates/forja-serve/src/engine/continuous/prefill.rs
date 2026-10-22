@@ -176,7 +176,7 @@ where
                 .ok_or_else(|| GenerationError::new("no prompt shape can accept the suffix"))?;
             let output = self
                 .runner
-                .batch_step(EngineBatch {
+                .enqueue_batch_step(EngineBatch {
                     shape,
                     lanes: vec![Some(EngineBatchLane {
                         tokens: Some(tokens[..count].to_vec()),
@@ -191,9 +191,13 @@ where
                 .map_err(|error| {
                     GenerationError::unavailable(format!("prompt batch failed: {error:?}"))
                 })?;
-            let bytes = self.runner.read(&output.tokens).await.map_err(|error| {
-                GenerationError::unavailable(format!("prompt batch read failed: {error}"))
-            })?;
+            let bytes = self
+                .runner
+                .read_queued_batch_tokens(output)
+                .await
+                .map_err(|error| {
+                    GenerationError::unavailable(format!("prompt batch read failed: {error}"))
+                })?;
             selected = read_batch_tokens(&bytes)?.first().copied();
             let consumed = count;
             let count = u32::try_from(consumed)
