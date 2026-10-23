@@ -1777,8 +1777,7 @@ impl Qwen3Coder {
                 let param_refs = params.iter().collect::<Vec<_>>();
                 let graph = forja_sdk::capture(&param_refs, || {
                     let tokens = self.batch_feedback.narrow(0, 0, state.bucket)?;
-                    let logits =
-                        self.forward_batch_positioned(&tokens, &state.positions, &lanes)?;
+                    let logits = self.forward_graph_rows(&tokens, &state.positions, &lanes)?;
                     let tokens = self.select_graph_rows(&logits, &state.sampling, &lanes)?;
                     Ok((logits, tokens))
                 })?;
@@ -1807,7 +1806,7 @@ impl Qwen3Coder {
                 let param_refs = params.iter().collect::<Vec<_>>();
                 let graph = forja_sdk::capture(&param_refs, || {
                     let tokens = self.batch_feedback.narrow(0, 0, state.bucket)?;
-                    self.forward_batch_positioned(&tokens, &state.positions, &lanes)
+                    self.forward_graph_rows(&tokens, &state.positions, &lanes)
                 })?;
                 state.forward = Some(graph);
             }
@@ -2075,6 +2074,21 @@ impl Qwen3Coder {
             normalized = next_normalized;
         }
         self.weights.lm_head.forward(&self.variants, &normalized)
+    }
+
+    fn forward_graph_rows(
+        &mut self,
+        tokens: &Tensor<u32>,
+        positions: &Tensor<f32>,
+        lanes: &[Option<BatchLanePosition>],
+    ) -> Result<Tensor<f32>> {
+        if let [Some(position)] = lanes {
+            let end = position.start.clone().checked_add(1)?;
+            return Ok(self
+                .forward_paged_sequence(tokens, 1, &position.start, &end, &position.attention, 0)?
+                .0);
+        }
+        self.forward_batch_positioned(tokens, positions, lanes)
     }
 
     fn select_batch_rows(
