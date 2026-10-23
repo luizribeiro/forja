@@ -452,6 +452,7 @@ pub struct ServingEngine<B: Backend + Send + Sync + 'static> {
 pub(crate) struct BatchTestBarrier {
     armed: AtomicBool,
     admission_overlapped: AtomicBool,
+    retirement_drained: AtomicBool,
     prefill_overlap_width: AtomicU64,
     reached: Notify,
     resume: Notify,
@@ -464,9 +465,18 @@ pub(crate) struct BatchTestBarrier {
 #[allow(dead_code)]
 impl BatchTestBarrier {
     pub(crate) const fn new() -> Self {
+        Self::with_armed(true)
+    }
+
+    pub(crate) const fn passive() -> Self {
+        Self::with_armed(false)
+    }
+
+    const fn with_armed(armed: bool) -> Self {
         Self {
-            armed: AtomicBool::new(true),
+            armed: AtomicBool::new(armed),
             admission_overlapped: AtomicBool::new(false),
+            retirement_drained: AtomicBool::new(false),
             prefill_overlap_width: AtomicU64::new(0),
             reached: Notify::const_new(),
             resume: Notify::const_new(),
@@ -486,6 +496,10 @@ impl BatchTestBarrier {
 
     pub(crate) fn admission_overlapped(&self) -> bool {
         self.admission_overlapped.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn retirement_drained(&self) -> bool {
+        self.retirement_drained.load(Ordering::Acquire)
     }
 
     pub(crate) fn prefill_overlap_width(&self) -> u64 {
@@ -510,6 +524,10 @@ impl BatchTestBarrier {
 
     fn note_admission_overlap(&self) {
         self.admission_overlapped.store(true, Ordering::Release);
+    }
+
+    fn note_retirement_drain(&self) {
+        self.retirement_drained.store(true, Ordering::Release);
     }
 
     fn note_prefill_overlap(&self, width: usize) {

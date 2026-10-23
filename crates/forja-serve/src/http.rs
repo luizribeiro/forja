@@ -1677,6 +1677,32 @@ mod tests {
         assert_serial(&survivor.await.unwrap().unwrap(), &expected);
     }
 
+    #[tokio::test]
+    async fn lane_retirement_does_not_change_an_inflight_successor() {
+        let short_expected = serial_output("b", 2).await;
+        let long_expected = serial_output("b", 6).await;
+        let barrier = Arc::new(crate::engine::BatchTestBarrier::passive());
+        let (actor, _weights) = continuous_actor_with_barrier(Some(Arc::clone(&barrier)))
+            .await
+            .unwrap();
+        let short = actor
+            .complete_text(
+                text_request("b", 2),
+                GenerationControl::new(Duration::from_secs(2)),
+            )
+            .unwrap();
+        let long = actor
+            .complete_text(
+                text_request("b", 6),
+                GenerationControl::new(Duration::from_secs(2)),
+            )
+            .unwrap();
+        assert_serial(&short.await.unwrap().unwrap(), &short_expected);
+        assert_serial(&long.await.unwrap().unwrap(), &long_expected);
+        assert!(barrier.retirement_drained());
+        assert!(barrier.prefill_overlap_width() >= 2);
+    }
+
     fn test_weights() -> Result<TestWeights, Box<dyn Error + Send + Sync>> {
         let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
         let nonce = NEXT_WEIGHTS.fetch_add(1, AtomicOrdering::Relaxed);

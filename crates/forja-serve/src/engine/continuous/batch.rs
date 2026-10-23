@@ -46,6 +46,10 @@ impl PendingBatch {
             .iter()
             .any(|lane| lane.slot == slot && lane.retirement.is_none())
     }
+
+    fn has_retirement(&self) -> bool {
+        self.lanes.iter().any(|lane| lane.retirement.is_some())
+    }
 }
 
 impl<B> ServingEngine<B>
@@ -279,6 +283,17 @@ where
         active: &[BatchLane],
         current: &PendingBatch,
     ) -> Result<Option<PendingBatch>, GenerationError> {
+        let reaches_retirement = current.has_retirement()
+            || active
+                .iter()
+                .any(|lane| current.contains_active(lane.slot) && !lane.needs_successor());
+        if reaches_retirement {
+            #[cfg(test)]
+            if let Some(barrier) = &self.batch_test_barrier {
+                barrier.note_retirement_drain();
+            }
+            return Ok(None);
+        }
         let lanes = active
             .iter()
             .filter(|lane| {
