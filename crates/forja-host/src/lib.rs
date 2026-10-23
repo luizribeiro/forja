@@ -432,6 +432,12 @@ pub struct EngineMetrics {
     pub live_bytes: u64,
     /// Command graphs currently retained by the guest.
     pub live_graphs: usize,
+    /// Command graphs successfully prepared since the runner was created.
+    pub prepared_graphs: u64,
+    /// Wall time spent successfully preparing command graphs.
+    pub graph_preparation_time: Duration,
+    /// Wall time spent validating dispatches for successfully prepared graphs.
+    pub graph_validation_time: Duration,
     /// Successfully completed backend submissions.
     pub submissions: u64,
     /// Completed submissions that supplied device timestamps.
@@ -3409,6 +3415,9 @@ pub struct Host<B: Backend> {
     live_handles: usize,
     live_kernels: Arc<AtomicUsize>,
     live_graphs: Arc<AtomicUsize>,
+    prepared_graphs: AtomicU64,
+    graph_preparation_time_ns: AtomicU64,
+    graph_validation_time_ns: AtomicU64,
     graph_arena_bytes: u64,
     gpu_time_ns: Arc<AtomicU64>,
     queued_submissions: Arc<AtomicU64>,
@@ -3448,6 +3457,9 @@ impl<B: Backend + 'static> Host<B> {
             live_handles: 0,
             live_kernels: Arc::new(AtomicUsize::new(0)),
             live_graphs: Arc::new(AtomicUsize::new(0)),
+            prepared_graphs: AtomicU64::new(0),
+            graph_preparation_time_ns: AtomicU64::new(0),
+            graph_validation_time_ns: AtomicU64::new(0),
             graph_arena_bytes: 0,
             gpu_time_ns: Arc::new(AtomicU64::new(0)),
             queued_submissions: Arc::new(AtomicU64::new(0)),
@@ -4387,6 +4399,13 @@ impl<B: Backend + 'static> Host<B> {
         EngineMetrics {
             live_bytes: self.live_bytes.load(Ordering::Acquire),
             live_graphs: self.live_graphs.load(Ordering::Acquire),
+            prepared_graphs: self.prepared_graphs.load(Ordering::Acquire),
+            graph_preparation_time: Duration::from_nanos(
+                self.graph_preparation_time_ns.load(Ordering::Acquire),
+            ),
+            graph_validation_time: Duration::from_nanos(
+                self.graph_validation_time_ns.load(Ordering::Acquire),
+            ),
             submissions: self.completed_submissions.load(Ordering::Acquire),
             timed_submissions: self.timed_submissions.load(Ordering::Acquire),
             gpu_time: Duration::from_nanos(self.completed_gpu_time_ns.load(Ordering::Acquire)),
@@ -5475,6 +5494,7 @@ impl<B: Backend + 'static> Host<B> {
         &mut self,
         resource: Resource<CommandListEntry>,
     ) -> Result<Resource<GraphEntry>, compute::Error> {
+        let started = Instant::now();
         let mut entry = self.table.delete(resource).map_err(invalid_handle)?;
         let space = match entry.space.clone() {
             Some(space) => space,
@@ -5488,10 +5508,12 @@ impl<B: Backend + 'static> Host<B> {
                 self.limits.work_per_dispatch,
             ),
         );
+        let validation_started = Instant::now();
         let built = entry
             .recorded
             .iter()
             .try_for_each(|dispatch| record_graph_dispatch(&mut graph, dispatch));
+        let validation_time = validation_started.elapsed();
         let graph = match built {
             Ok(()) => self.prepare_captured_graph(graph, &mut entry),
             Err(error) => Err(graph_error(&error)),
@@ -5528,6 +5550,11 @@ impl<B: Backend + 'static> Host<B> {
                 return Err(invalid_handle(error));
             }
         };
+        self.prepared_graphs.fetch_add(1, Ordering::AcqRel);
+        self.graph_preparation_time_ns
+            .fetch_add(duration_ns(started.elapsed()), Ordering::AcqRel);
+        self.graph_validation_time_ns
+            .fetch_add(duration_ns(validation_time), Ordering::AcqRel);
         let graph = self.table.get_mut(&resource).map_err(invalid_handle)?;
         graph.retained = entry.retained;
         graph.retained_kernels = entry.retained_kernels;
@@ -12637,6 +12664,9 @@ mod tests {
             EngineMetrics {
                 live_bytes: 0,
                 live_graphs: 0,
+                prepared_graphs: 0,
+                graph_preparation_time: Duration::ZERO,
+                graph_validation_time: Duration::ZERO,
                 submissions: 2,
                 timed_submissions: 2,
                 gpu_time: Duration::from_nanos(66),
