@@ -76,7 +76,7 @@ where
         loop {
             if current.is_none() {
                 self.remove_unsubmitted_cancellations(&mut active);
-                self.admit_scheduled(
+                self.admit_pending(
                     receiver,
                     pending,
                     &active,
@@ -87,25 +87,15 @@ where
                 )
                 .await;
                 if active.iter().all(BatchLane::is_constrained) && !prefilling.is_empty() {
-                    self.advance_prefills_scheduled(
-                        &mut prefilling,
-                        &mut active,
-                        &mut current,
-                        &mut policy,
-                    )
-                    .await;
+                    self.advance_prefills(&mut prefilling, &mut active, &mut current, &mut policy)
+                        .await;
                 }
                 if current.is_some() {
                     continue;
                 }
                 if active.is_empty() {
-                    self.advance_prefills_scheduled(
-                        &mut prefilling,
-                        &mut active,
-                        &mut current,
-                        &mut policy,
-                    )
-                    .await;
+                    self.advance_prefills(&mut prefilling, &mut active, &mut current, &mut policy)
+                        .await;
                     if current.is_some() {
                         continue;
                     }
@@ -121,8 +111,7 @@ where
                     .filter(|lane| !lane.is_constrained())
                     .collect::<Vec<_>>();
                 if ordinary.is_empty() {
-                    self.advance_constrained_lane_scheduled(&mut active, &policy)
-                        .await;
+                    self.advance_constrained_lane(&mut active, &policy).await;
                     continue;
                 }
                 let submitted_slots = ordinary.iter().map(|lane| lane.slot).collect::<Vec<_>>();
@@ -170,6 +159,13 @@ where
                     continue;
                 }
             };
+            #[cfg(test)]
+            if batch.lanes.len() >= 2
+                && successor.is_some()
+                && let Some(barrier) = &self.batch_test_barrier
+            {
+                barrier.pause_once().await;
+            }
             let tokens = self.runner.read_queued_batch_tokens(batch.output).await;
             let tokens = match tokens {
                 Ok(bytes) => match read_batch_tokens(&bytes) {
@@ -200,9 +196,14 @@ where
             self.apply_batch_tokens(batch.lanes, &mut active, &mut successor, &tokens)
                 .await;
             if successor.is_none() {
-                self.advance_constrained_lane_scheduled(&mut active, &policy)
-                    .await;
-                self.admit_scheduled(
+                #[cfg(test)]
+                if successor.is_some()
+                    && let Some(barrier) = &self.batch_test_barrier
+                {
+                    barrier.note_admission_overlap();
+                }
+                self.advance_constrained_lane(&mut active, &policy).await;
+                self.admit_pending(
                     receiver,
                     pending,
                     &active,
@@ -212,13 +213,8 @@ where
                     &mut next_id,
                 )
                 .await;
-                self.advance_prefills_scheduled(
-                    &mut prefilling,
-                    &mut active,
-                    &mut successor,
-                    &mut policy,
-                )
-                .await;
+                self.advance_prefills(&mut prefilling, &mut active, &mut successor, &mut policy)
+                    .await;
             }
             current = successor;
         }
@@ -462,6 +458,11 @@ where
         } else {
             Vec::new()
         };
+        let affected = current_slots
+            .iter()
+            .copied()
+            .chain(successor.iter().map(|lane| lane.slot))
+            .collect::<Vec<_>>();
         let mut lanes = Vec::new();
         for (is_current, pending) in current
             .into_iter()
@@ -479,14 +480,21 @@ where
                 });
             }
         }
-        lanes.append(active);
+        let mut index = 0;
+        while index < active.len() {
+            if affected.contains(&active[index].slot) {
+                lanes.push(active.remove(index));
+            } else {
+                index += 1;
+            }
+        }
         for lane in lanes {
             self.fail_batch_lane(lane, repeated_error(&error));
         }
     }
 
     #[allow(dead_code)]
-    async fn advance_constrained_lane_scheduled(
+    async fn advance_constrained_lane(
         &mut self,
         active: &mut Vec<BatchLane>,
         policy: &SchedulerPolicy,
@@ -625,7 +633,6 @@ where
             .ok_or_else(|| GenerationError::new("constrained token is missing"))
     }
 
-    #[allow(dead_code)]
     fn decode_selection_shape(
         &self,
         policy: &SchedulerPolicy,
@@ -649,11 +656,10 @@ where
     }
 
     #[allow(
-        dead_code,
         clippy::too_many_arguments,
         reason = "admission reconciles the mailbox, scheduler, and both lane states atomically"
     )]
-    async fn admit_scheduled(
+    async fn admit_pending(
         &mut self,
         receiver: &mut mpsc::Receiver<ServiceCommand>,
         pending: &mut VecDeque<RequestEnvelope>,
@@ -754,7 +760,8 @@ where
             }
         }
     }
-    async fn advance_prefills_scheduled(
+
+    async fn advance_prefills(
         &mut self,
         prefilling: &mut BTreeMap<RequestId, PendingPrefill>,
         active: &mut Vec<BatchLane>,
@@ -856,83 +863,6 @@ where
         reservations_fit(serving.page_tokens, serving.max_context, reservations)
     }
 
-    #[allow(dead_code)]
-    async fn admit_pending(
-        &mut self,
-        receiver: &mut mpsc::Receiver<ServiceCommand>,
-        pending: &mut VecDeque<RequestEnvelope>,
-        active: &mut Vec<BatchLane>,
-        deferred: &mut Option<PreparedRequest>,
-    ) {
-        drain_pending(receiver, pending);
-        while active.len() < usize::try_from(self.scheduler.active_lanes).unwrap_or(usize::MAX) {
-            if deferred.is_none()
-                && pending
-                    .front()
-                    .is_none_or(RequestEnvelope::requires_serial_path)
-            {
-                return;
-            }
-            let Some(slot) = (0..self.scheduler.active_lanes)
-                .find(|slot| active.iter().all(|lane| lane.slot != *slot))
-            else {
-                return;
-            };
-            let prepared = if let Some(prepared) = deferred.take() {
-                prepared
-            } else {
-                let Some(envelope) = pending.pop_front() else {
-                    return;
-                };
-                observe_phase(
-                    &mut self.metrics.queue_time,
-                    &mut self.metrics.queue_time_ns,
-                    envelope.queued().elapsed(),
-                );
-                let Some(prepared) = envelope.prepare(self).await else {
-                    continue;
-                };
-                prepared
-            };
-            if !self.reservation_fits(active, &prepared) {
-                *deferred = Some(prepared);
-                return;
-            }
-            let Some(mut lane) = self.start_batch_lane(prepared, slot).await else {
-                continue;
-            };
-            match lane
-                .accept(
-                    lane.pending_token,
-                    &self.chat_info.stop_token_ids,
-                    &mut self.metrics,
-                )
-                .await
-            {
-                Ok(Some(reason)) => self.finish_batch_lane(lane, reason).await,
-                Ok(None) => active.push(lane),
-                Err(error) => self.fail_batch_lane(lane, error),
-            }
-        }
-    }
-
-    fn reservation_fits(&self, active: &[BatchLane], request: &PreparedRequest) -> bool {
-        let Some(serving) = self.info.serving.as_ref() else {
-            return false;
-        };
-        let candidate =
-            u64::from(request.prompt_tokens).checked_add(u64::from(request.params.max_tokens));
-        candidate.is_some_and(|candidate| {
-            reservations_fit(
-                serving.page_tokens,
-                serving.max_context,
-                active
-                    .iter()
-                    .map(|lane| lane.reserved_tokens)
-                    .chain(std::iter::once(candidate)),
-            )
-        })
-    }
     fn decode_shape(
         &self,
         policy: &SchedulerPolicy,
@@ -956,6 +886,10 @@ where
     }
 
     async fn finish_batch_lane(&mut self, mut lane: BatchLane, reason: crate::FinishReason) {
+        #[cfg(test)]
+        if let Some(barrier) = &self.batch_test_barrier {
+            barrier.note_finish(lane.is_constrained());
+        }
         let completion = lane.completion(reason).await;
         let publish = if completion.is_ok() && self.config.serving.prefix_reuse {
             self.runner
@@ -989,7 +923,7 @@ where
     }
 
     fn fail_batch_lane(&mut self, lane: BatchLane, error: GenerationError) {
-        let _ = self.runner.prepare_paged_lane(lane.slot, None, 0);
+        let error = self.release_failed_lane(lane.slot).unwrap_or(error);
         lane.fail(error);
     }
 }
