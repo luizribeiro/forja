@@ -489,8 +489,8 @@ where
     }
 
     async fn finish_batch_lane(&mut self, mut lane: BatchLane, reason: crate::FinishReason) {
-        let completion = lane.completion(reason);
-        let publish = if self.config.serving.prefix_reuse {
+        let completion = lane.completion(reason).await;
+        let publish = if completion.is_ok() && self.config.serving.prefix_reuse {
             self.runner
                 .paged_lane_prefix(lane.slot)
                 .map_err(|error| batch_admission_error(&error))
@@ -514,9 +514,10 @@ where
             .runner
             .prepare_paged_lane(lane.slot, None, 0)
             .map_err(|error| batch_admission_error(&error));
-        match publish.and(release.map(|_| ())) {
-            Ok(()) => lane.reply(completion).await,
-            Err(error) => lane.fail(error),
+        let cleanup = publish.and(release.map(|_| ()));
+        match (completion, cleanup) {
+            (Ok(completion), Ok(())) => lane.reply(completion).await,
+            (Err(error), _) | (Ok(_), Err(error)) => lane.fail(error),
         }
     }
 

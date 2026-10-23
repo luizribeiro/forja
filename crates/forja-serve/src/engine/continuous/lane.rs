@@ -3,7 +3,11 @@ use tokio::sync::{mpsc, oneshot};
 use forja_host::SamplingParams;
 
 use super::{CompletionSink, PreparedRequest};
-use crate::engine::{BoundaryAction, BoundaryState, GenerationError};
+use crate::engine::{
+    BoundaryAction, BoundaryState, GenerationError, ToolParser, advance_speculative_constraint,
+    finish_tool_parser, parse_tool_piece,
+};
+use crate::guidance::GuidanceSession;
 use crate::metrics::{ServingMetrics, observe, observe_phase};
 use crate::prefix::PrefixLedger;
 use crate::{Completion, FinishReason, GenerationControl, Usage};
@@ -65,6 +69,13 @@ pub(super) struct BatchLane {
     text: String,
     token_ids: Vec<u32>,
     ledger: PrefixLedger,
+    constraint: Option<BatchConstraint>,
+}
+
+pub(super) struct BatchConstraint {
+    pub(super) guidance: GuidanceSession,
+    pub(super) allow: Vec<u32>,
+    pub(super) parser: Option<ToolParser>,
 }
 
 impl BatchLane {
@@ -75,6 +86,7 @@ impl BatchLane {
         pending_token: u32,
         sampling: SamplingParams,
         tokenizer: tokenizers::Tokenizer,
+        constraint: Option<BatchConstraint>,
     ) -> Self {
         Self {
             slot,
@@ -96,6 +108,7 @@ impl BatchLane {
             consumed: 0,
             text: String::new(),
             token_ids: Vec::new(),
+            constraint,
         }
     }
 
@@ -117,6 +130,35 @@ impl BatchLane {
             return Ok(Some(FinishReason::Stop));
         }
         let piece = self.decoder.step(token).await?;
+        if let Some(constraint) = &mut self.constraint {
+            let parser_started = std::time::Instant::now();
+            parse_tool_piece(
+                &mut constraint.parser,
+                piece,
+                self.sink.events(),
+                &self.control,
+            )
+            .await?;
+            let (complete, allow) =
+                advance_speculative_constraint(Some(&constraint.guidance), token).await?;
+            if let Some(allow) = allow {
+                constraint.allow = allow;
+            }
+            observe_phase(
+                &mut metrics.parser_mask_time,
+                &mut metrics.parser_mask_time_ns,
+                parser_started.elapsed(),
+            );
+            if complete {
+                return Ok(Some(FinishReason::ToolCalls));
+            }
+            if self.consumed >= self.params.max_tokens {
+                return Ok(Some(FinishReason::Length));
+            }
+            self.ledger.record(token, true);
+            self.pending_token = token;
+            return Ok(None);
+        }
         let sse_started = self.sink.events().map(|_| std::time::Instant::now());
         let action = self
             .boundary
@@ -152,10 +194,18 @@ impl BatchLane {
         Ok(None)
     }
 
-    pub(super) fn completion(&self, reason: FinishReason) -> Completion {
-        Completion {
+    pub(super) async fn completion(
+        &mut self,
+        reason: FinishReason,
+    ) -> Result<Completion, GenerationError> {
+        let parser = self
+            .constraint
+            .take()
+            .and_then(|constraint| constraint.parser);
+        let tool_call = finish_tool_parser(&Ok(reason), parser).await?;
+        Ok(Completion {
             text: self.text.clone(),
-            tool_call: None,
+            tool_call,
             finish_reason: reason,
             usage: Usage {
                 prompt_tokens: self.prompt_tokens,
@@ -163,13 +213,25 @@ impl BatchLane {
                 completion_tokens: self.consumed,
             },
             token_ids: self.token_ids.clone(),
-        }
+        })
     }
 
     pub(super) fn needs_successor(&self) -> bool {
         self.consumed
             .checked_add(1)
             .is_some_and(|consumed| consumed < self.params.max_tokens)
+    }
+
+    #[allow(dead_code)]
+    pub(super) const fn is_constrained(&self) -> bool {
+        self.constraint.is_some()
+    }
+
+    #[allow(dead_code)]
+    pub(super) fn constraint_allow(&self) -> Option<&[u32]> {
+        self.constraint
+            .as_ref()
+            .map(|constraint| constraint.allow.as_slice())
     }
 
     pub(super) async fn reply(self, completion: Completion) {

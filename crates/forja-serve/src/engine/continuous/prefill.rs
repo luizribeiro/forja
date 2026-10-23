@@ -44,6 +44,7 @@ where
                 first,
                 sampling,
                 tokenizer,
+                None,
             )),
             Err(error) => {
                 let _ = self.runner.prepare_paged_lane(slot, None, 0);
