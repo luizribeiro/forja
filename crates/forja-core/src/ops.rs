@@ -1028,6 +1028,7 @@ pub(crate) fn barriers_for_accesses(
         .collect()
 }
 
+#[cfg(test)]
 pub(crate) fn barriers_bounded_by(dispatches: &[Vec<BufferAccess>], upper: &[bool]) -> Vec<bool> {
     let mut barriers = vec![false; dispatches.len()];
     for (current_index, current) in dispatches.iter().enumerate() {

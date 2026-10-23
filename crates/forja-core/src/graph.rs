@@ -10,7 +10,7 @@ use crate::{
     Affine, BackendDispatchData, ByteHull, CommandList, Dispatch, Op, OpError, ParamError,
     ParamSpace, ParamValues, SymbolicLayout, SymbolicLayoutError, Tensor, TensorError,
     byte_ranges_overlap, gather_matmul_flops, gather_quant_matmul_dispatch_flops, matmul_flops,
-    ops::{BufferAccess, barriers_bounded_by, barriers_for_accesses, dispatch_accesses},
+    ops::{BufferAccess, dispatch_accesses},
     program::{BindError, Inst, PreparedEpilogue, PreparedProgram, ProgramKind},
     quant_matmul_flops, sdpa_flops,
 };
@@ -1037,6 +1037,7 @@ pub struct GraphTemplate {
     dispatches: Vec<TemplateDispatch>,
     barrier_accesses: Vec<Vec<BufferAccess>>,
     hull_barrier_accesses: Vec<Vec<BufferAccess>>,
+    upper_barriers: Vec<bool>,
     required_barriers: Vec<bool>,
     memory_arena: Option<crate::BufferId>,
 }
@@ -1122,6 +1123,7 @@ impl GraphTemplate {
             dispatches: Vec::new(),
             barrier_accesses: Vec::new(),
             hull_barrier_accesses: Vec::new(),
+            upper_barriers: Vec::new(),
             required_barriers: Vec::new(),
             memory_arena: None,
         }
@@ -1216,6 +1218,7 @@ impl GraphTemplate {
             rebound.barrier_accesses.push(accesses);
             rebound.hull_barrier_accesses.push(hull_accesses);
         }
+        rebound.upper_barriers.clone_from(&self.upper_barriers);
         rebound
             .required_barriers
             .clone_from(&self.required_barriers);
@@ -1625,10 +1628,34 @@ impl GraphTemplate {
     }
 
     fn record_accesses(&mut self, accesses: Vec<BufferAccess>, hull_accesses: Vec<BufferAccess>) {
+        let current_index = self.barrier_accesses.len();
+        let upper_start = self
+            .upper_barriers
+            .iter()
+            .rposition(|&barrier| barrier)
+            .unwrap_or(0);
+        let upper = hull_accesses.iter().any(|access| {
+            self.hull_barrier_accesses[upper_start..]
+                .iter()
+                .flatten()
+                .any(|candidate| access.conflicts(candidate))
+        });
+        self.upper_barriers.push(upper);
+        self.required_barriers.push(false);
+        for (prior_index, prior) in self.barrier_accesses.iter().enumerate() {
+            if accesses
+                .iter()
+                .any(|access| prior.iter().any(|candidate| access.conflicts(candidate)))
+            {
+                let target = self.upper_barriers[prior_index + 1..=current_index]
+                    .iter()
+                    .position(|&barrier| barrier)
+                    .map_or(current_index, |offset| prior_index + 1 + offset);
+                self.required_barriers[target] = true;
+            }
+        }
         self.barrier_accesses.push(accesses);
         self.hull_barrier_accesses.push(hull_accesses);
-        let upper = barriers_for_accesses(self.hull_barrier_accesses.iter().cloned());
-        self.required_barriers = barriers_bounded_by(&self.barrier_accesses, &upper);
     }
 }
 
@@ -1838,7 +1865,7 @@ mod tests {
     use crate::{
         Affine, BackendDispatchData, BufferId, CommandList, DType, Dispatch, Layout, Op, OpError,
         Operand, ParamError, ParamSpace, ParamValues, SymbolicLayout, Tensor,
-        ops::{BufferAccess, barriers_for_accesses},
+        ops::{BufferAccess, barriers_bounded_by, barriers_for_accesses},
         program::{
             BinOp, EpilogueSignature, Inst, KernelSignature, PreparedProgram, Program, ProgramKind,
             prepare_epilogue, prepared_for_test,
@@ -2780,6 +2807,10 @@ mod tests {
                     BufferAccess::hull(sink.buffer(), sink.byte_hull().unwrap().byte_span(), true),
                 ],
             ]);
+            prop_assert_eq!(
+                &exact,
+                &barriers_bounded_by(&graph.barrier_accesses, &hull)
+            );
 
             for (exact_has_barrier, hull_has_barrier) in exact.iter().zip(&hull) {
                 prop_assert!(!exact_has_barrier || *hull_has_barrier);
