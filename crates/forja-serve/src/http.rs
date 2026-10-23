@@ -1703,6 +1703,42 @@ mod tests {
         assert!(barrier.prefill_overlap_width() >= 2);
     }
 
+    #[tokio::test]
+    async fn admission_during_a_successor_preserves_both_outputs() {
+        let short_expected = serial_output("b", 6).await;
+        let survivor_expected = serial_output("b", 8).await;
+        let newcomer_expected = serial_output("a", 2).await;
+        let barrier = Arc::new(crate::engine::BatchTestBarrier::new());
+        let (actor, _weights) = continuous_actor_with_barrier(Some(Arc::clone(&barrier)))
+            .await
+            .unwrap();
+        let short = actor
+            .complete_text(
+                text_request("b", 6),
+                GenerationControl::new(Duration::from_secs(2)),
+            )
+            .unwrap();
+        let survivor = actor
+            .complete_text(
+                text_request("b", 8),
+                GenerationControl::new(Duration::from_secs(2)),
+            )
+            .unwrap();
+        barrier.reached().await;
+        let newcomer = actor
+            .complete_text(
+                text_request("a", 2),
+                GenerationControl::new(Duration::from_secs(2)),
+            )
+            .unwrap();
+        barrier.release();
+        assert_serial(&short.await.unwrap().unwrap(), &short_expected);
+        assert_serial(&survivor.await.unwrap().unwrap(), &survivor_expected);
+        assert_serial(&newcomer.await.unwrap().unwrap(), &newcomer_expected);
+        assert_eq!(survivor_expected.1.len(), 8);
+        assert!(!barrier.admission_overlapped());
+    }
+
     fn test_weights() -> Result<TestWeights, Box<dyn Error + Send + Sync>> {
         let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
         let nonce = NEXT_WEIGHTS.fetch_add(1, AtomicOrdering::Relaxed);
