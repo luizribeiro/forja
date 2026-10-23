@@ -419,10 +419,10 @@ fn error_state() -> [u8; 8] {
     state
 }
 
-fn paged_attention_state() -> [u8; 12] {
-    let mut state = [0_u8; 12];
+fn paged_attention_state() -> [u8; 16] {
+    let mut state = [0_u8; 16];
     state[4..8].copy_from_slice(&u32::MAX.to_ne_bytes());
-    state[8..].copy_from_slice(&1_u32.to_ne_bytes());
+    state[8..12].copy_from_slice(&1_u32.to_ne_bytes());
     state
 }
 
@@ -3037,6 +3037,10 @@ impl MetalBackend {
         self.encode_copy_tensors(encoder, table, &input, &output, bindings, arguments)
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "paged-copy encoding keeps one argument-table layout together"
+    )]
     fn encode_paged_copy(
         &self,
         encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
@@ -3053,8 +3057,12 @@ impl MetalBackend {
         else {
             return Err(BackendError::InvalidInput);
         };
-        let [first, table_tensor, generations] = dispatch.inputs() else {
-            return Err(BackendError::InvalidInput);
+        let (first, table_tensor, generations, activity_tensor) = match dispatch.inputs() {
+            [first, table_tensor, generations] => (first, table_tensor, generations, None),
+            [first, table_tensor, generations, activity] => {
+                (first, table_tensor, generations, Some(activity))
+            }
+            _ => return Err(BackendError::InvalidInput),
         };
         let (ordinary_tensor, pool_tensor) = match direction {
             PagedCopyDirection::IntoPages => (first, dispatch.output()),
@@ -3064,6 +3072,9 @@ impl MetalBackend {
         let pool = self.encoder_dense_tensor(pool_tensor)?;
         let page_table = self.encoder_dense_tensor(table_tensor)?;
         let generations = self.encoder_dense_tensor(generations)?;
+        let activity = activity_tensor
+            .map(|tensor| self.encoder_dense_tensor(tensor))
+            .transpose()?;
         let tokens = ordinary
             .layout
             .shape()
@@ -3098,6 +3109,14 @@ impl MetalBackend {
         let params = arguments.write(&params)?;
         let ordinary_layout = Self::layout_buffer(&ordinary.layout, arguments)?;
         let error_flag = arguments.write(&error_state())?;
+        let default_activity = activity
+            .is_none()
+            .then(|| arguments.write(&1_u32.to_ne_bytes()))
+            .transpose()?;
+        let activity = activity
+            .as_ref()
+            .map_or_else(|| default_activity.as_ref(), |tensor| Some(&tensor.buffer))
+            .ok_or(BackendError::ExecutionFailed)?;
         let pipeline = self
             .pipelines
             .lock()
@@ -3119,6 +3138,7 @@ impl MetalBackend {
         bindings.bind(table, 4, &ordinary_layout);
         bindings.bind(table, 5, &params);
         bindings.bind(table, 6, &error_flag);
+        bindings.bind(table, 7, activity);
         set_argument_table(encoder, table);
         let elements = usize::try_from(elements).map_err(|_| BackendError::InvalidInput)?;
         let threads = elements.min(pipeline.maxTotalThreadsPerThreadgroup());
@@ -3139,7 +3159,10 @@ impl MetalBackend {
             },
         );
         Ok((
-            vec![ordinary_layout, params, error_flag.clone()],
+            [ordinary_layout, params, error_flag.clone()]
+                .into_iter()
+                .chain(default_activity)
+                .collect(),
             error_flag,
         ))
     }
@@ -3158,6 +3181,7 @@ impl MetalBackend {
         logical_pages: u32,
         physical_pages: u32,
         error_flag: &BufferBinding,
+        activity: &BufferBinding,
         bindings: &mut ArgumentBindings,
         arguments: &mut ArgumentWriter,
     ) -> Result<Vec<BufferBinding>, BackendError> {
@@ -3198,6 +3222,7 @@ impl MetalBackend {
         bindings.bind(table, 4, &ordinary_layout);
         bindings.bind(table, 5, &params);
         bindings.bind(table, 6, error_flag);
+        bindings.bind(table, 7, activity);
         set_argument_table(encoder, table);
         let elements = usize::try_from(elements).map_err(|_| BackendError::InvalidInput)?;
         let threads = elements.min(pipeline.maxTotalThreadsPerThreadgroup());
@@ -3236,21 +3261,24 @@ impl MetalBackend {
         else {
             return Err(BackendError::InvalidInput);
         };
-        let [
-            query_tensor,
-            key_tensor,
-            value_tensor,
-            table_tensor,
-            generation_tensor,
-        ] = dispatch.inputs()
-        else {
-            return Err(BackendError::InvalidInput);
-        };
+        let (query_tensor, key_tensor, value_tensor, table_tensor, generation_tensor, activity) =
+            match dispatch.inputs() {
+                [query, key, value, table, generations] => {
+                    (query, key, value, table, generations, None)
+                }
+                [query, key, value, table, generations, activity] => {
+                    (query, key, value, table, generations, Some(activity))
+                }
+                _ => return Err(BackendError::InvalidInput),
+            };
         let query = self.encoder_tensor(query_tensor)?;
         let key = self.encoder_dense_tensor(key_tensor)?;
         let value = self.encoder_dense_tensor(value_tensor)?;
         let page_table = self.encoder_dense_tensor(table_tensor)?;
         let generations = self.encoder_dense_tensor(generation_tensor)?;
+        let activity = activity
+            .map(|tensor| self.encoder_dense_tensor(tensor))
+            .transpose()?;
         let output = self.encoder_tensor(dispatch.output())?;
         let q: [u32; 3] = query
             .layout
@@ -3314,6 +3342,14 @@ impl MetalBackend {
         }
         let params = arguments.write(&params)?;
         let error_flag = arguments.write(&paged_attention_state())?;
+        let default_activity = activity
+            .is_none()
+            .then(|| arguments.write(&1_u32.to_ne_bytes()))
+            .transpose()?;
+        let activity = activity
+            .as_ref()
+            .map_or_else(|| default_activity.as_ref(), |tensor| Some(&tensor.buffer))
+            .ok_or(BackendError::ExecutionFailed)?;
         let kernel = match q[2] {
             64 => "paged_sdpa_64",
             128 => "paged_sdpa_128",
@@ -3336,6 +3372,7 @@ impl MetalBackend {
         }
         bindings.bind(table, 2, &params);
         bindings.bind(table, 3, &error_flag);
+        bindings.bind(table, 4, activity);
         set_argument_table(encoder, table);
         if gqa_blocks.is_none() {
             dispatch_threadgroups(
@@ -3359,6 +3396,7 @@ impl MetalBackend {
             let value_scratch =
                 self.scratch_tensor(value.layout.dtype(), &[key_length, v[2], v[3]])?;
             let mut temporaries = vec![params.clone(), error_flag.clone()];
+            temporaries.extend(default_activity.clone());
             for (pool, ordinary, shape) in [(&key, &key_scratch, k), (&value, &value_scratch, v)] {
                 temporaries.extend(self.encode_paged_copy_out(
                     encoder,
@@ -3372,6 +3410,7 @@ impl MetalBackend {
                     t[0],
                     shape[0],
                     &error_flag,
+                    activity,
                     bindings,
                     arguments,
                 )?);
@@ -3456,6 +3495,7 @@ impl MetalBackend {
                     }
                     bindings.bind(table, 6, &params);
                     bindings.bind(table, 7, &error_flag);
+                    bindings.bind(table, 8, activity);
                     set_argument_table(encoder, table);
                     dispatch_threadgroups(
                         encoder,
@@ -3473,7 +3513,9 @@ impl MetalBackend {
                             depth: 1,
                         },
                     );
-                    return Ok((vec![params, error_flag.clone()], error_flag));
+                    let mut temporaries = vec![params, error_flag.clone()];
+                    temporaries.extend(default_activity.clone());
+                    return Ok((temporaries, error_flag));
                 }
                 Err(BackendError::UnsupportedOperation) => {}
                 Err(error) => return Err(error),
@@ -3508,6 +3550,7 @@ impl MetalBackend {
             }
             bindings.bind(table, 8, &params);
             bindings.bind(table, 9, &error_flag);
+            bindings.bind(table, 10, activity);
             set_argument_table(encoder, table);
             dispatch_threadgroups(
                 encoder,
@@ -3534,6 +3577,7 @@ impl MetalBackend {
                 bindings.bind(table, index, &tensor.buffer);
             }
             bindings.bind(table, 4, &params);
+            bindings.bind(table, 5, activity);
             set_argument_table(encoder, table);
             dispatch_threadgroups(
                 encoder,
@@ -3548,16 +3592,15 @@ impl MetalBackend {
                     depth: 1,
                 },
             );
-            return Ok((
-                vec![
-                    params,
-                    error_flag.clone(),
-                    partials.buffer,
-                    sums.buffer,
-                    maxs.buffer,
-                ],
-                error_flag,
-            ));
+            let mut temporaries = vec![
+                params,
+                error_flag.clone(),
+                partials.buffer,
+                sums.buffer,
+                maxs.buffer,
+            ];
+            temporaries.extend(default_activity.clone());
+            return Ok((temporaries, error_flag));
         }
         let pipeline = self
             .pipelines
@@ -3576,6 +3619,7 @@ impl MetalBackend {
         }
         bindings.bind(table, 6, &params);
         bindings.bind(table, 7, &error_flag);
+        bindings.bind(table, 8, activity);
         set_argument_table(encoder, table);
         dispatch_threadgroups(
             encoder,
@@ -3590,7 +3634,9 @@ impl MetalBackend {
                 depth: 1,
             },
         );
-        Ok((vec![params, error_flag.clone()], error_flag))
+        let mut temporaries = vec![params, error_flag.clone()];
+        temporaries.extend(default_activity);
+        Ok((temporaries, error_flag))
     }
 
     fn encode_matmul(
@@ -6893,6 +6939,9 @@ impl MetalBackend {
                 arguments.write(7 * size_of::<u32>())?;
                 arguments.write(112)?;
                 arguments.write(2 * size_of::<u32>())?;
+                if dispatch.inputs().len() == 3 {
+                    arguments.write(size_of::<u32>())?;
+                }
             }
             Op::RmsNorm { .. } => {
                 for len in [112, 112, 112, 8] {
@@ -6974,7 +7023,10 @@ impl MetalBackend {
             Op::Sdpa { .. } => self.size_sdpa_arguments(dispatch, arguments)?,
             Op::PagedSdpa { .. } => {
                 arguments.write(128)?;
-                arguments.write(3 * size_of::<u32>())?;
+                arguments.write(4 * size_of::<u32>())?;
+                if dispatch.inputs().len() == 5 {
+                    arguments.write(size_of::<u32>())?;
+                }
                 if selected_variant(dispatch) == Some(MetalVariant::PagedSdpaDecomposed) {
                     for _ in 0..2 {
                         arguments.write(7 * size_of::<u32>())?;
@@ -10075,6 +10127,115 @@ mod tests {
             capacity
         );
         drop(tensors);
+    }
+
+    fn submit_with_planned_arguments(backend: &MetalBackend, commands: CommandList) {
+        let capacity = backend
+            .argument_capacity(&commands.clone().into_dispatches())
+            .unwrap();
+        backend.submit(commands).unwrap().wait().unwrap();
+        backend.in_flight.drain_done();
+        assert!(
+            backend
+                .in_flight
+                .pool
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|objects| objects.argument_buffer.capacity == capacity)
+        );
+    }
+
+    #[test]
+    fn paged_variants_encode_with_exact_planned_arguments() {
+        let backend = MetalBackend::new().unwrap();
+        let table = backend.alloc(DType::U32, &[1, 2]).unwrap();
+        let generations = backend.alloc(DType::U32, &[1]).unwrap();
+        let activity = backend.alloc(DType::U32, &[1]).unwrap();
+        backend
+            .write(
+                &table,
+                &[0_u32, 1]
+                    .into_iter()
+                    .flat_map(u32::to_ne_bytes)
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        backend.write(&generations, &1_u32.to_ne_bytes()).unwrap();
+        backend.write(&activity, &1_u32.to_ne_bytes()).unwrap();
+
+        let ordinary = backend.alloc(DType::F32, &[1, 2]).unwrap();
+        let pool = backend.alloc(DType::F32, &[1, 4, 2]).unwrap();
+        let copy_output = backend.alloc(DType::F32, &[1, 2]).unwrap();
+        for direction in [
+            PagedCopyDirection::IntoPages,
+            PagedCopyDirection::OutOfPages,
+        ] {
+            for explicit_activity in [false, true] {
+                let (first, output) = match direction {
+                    PagedCopyDirection::IntoPages => (&ordinary, &pool),
+                    PagedCopyDirection::OutOfPages => (&pool, &copy_output),
+                };
+                let mut inputs = vec![first, &table, &generations];
+                if explicit_activity {
+                    inputs.push(&activity);
+                }
+                let mut commands = CommandList::new();
+                commands
+                    .dispatch(
+                        Op::PagedCopy {
+                            direction,
+                            start: 0,
+                            page_tokens: 4,
+                        },
+                        &inputs,
+                        output,
+                    )
+                    .unwrap();
+                submit_with_planned_arguments(&backend, commands);
+            }
+        }
+
+        for (variant, dtype, query_length) in [
+            ("paged-sdpa.vector", DType::F32, 1),
+            ("paged-sdpa.vector-gqa-two-pass-32", DType::F16, 1),
+            ("paged-sdpa.vector-gqa-two-pass", DType::F16, 1),
+            ("paged-sdpa.vector-gqa-two-pass-128", DType::F16, 1),
+            ("paged-sdpa.vector-gqa-two-pass-256", DType::F16, 1),
+            ("paged-sdpa.decomposed", DType::F32, 7),
+            ("paged-sdpa.steel", DType::F32, 7),
+            ("paged-sdpa.steel-half", DType::F16, 7),
+        ] {
+            let query = backend.alloc(DType::F32, &[16, query_length, 128]).unwrap();
+            let key = backend.alloc(dtype, &[1, 64, 8, 128]).unwrap();
+            let value = backend.alloc(dtype, &[1, 64, 8, 128]).unwrap();
+            let output = backend.alloc(DType::F32, &[16, query_length, 128]).unwrap();
+            for explicit_activity in [false, true] {
+                let mut inputs = vec![&query, &key, &value, &table, &generations];
+                if explicit_activity {
+                    inputs.push(&activity);
+                }
+                let mut commands = CommandList::new();
+                commands
+                    .dispatch(
+                        Op::PagedSdpa {
+                            scale: 128.0_f32.sqrt().recip(),
+                            causal: true,
+                            q_start: 33 - query_length,
+                            key_length: 33,
+                            page_tokens: 64,
+                        },
+                        &inputs,
+                        &output,
+                    )
+                    .unwrap();
+                let selection = backend
+                    .validate_variant(commands.last_dispatch().unwrap(), variant)
+                    .unwrap();
+                assert!(commands.set_last_backend_data(BackendDispatchData::new(selection)));
+                submit_with_planned_arguments(&backend, commands);
+            }
+        }
     }
 
     #[test]
