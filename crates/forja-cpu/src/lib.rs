@@ -190,6 +190,9 @@ impl CpuBackend {
         start: u32,
         page_tokens: u32,
     ) -> Result<(), BackendError> {
+        if !self.paged_lane_active(inputs.get(3))? {
+            return Ok(());
+        }
         let (ordinary, pool) = match direction {
             PagedCopyDirection::IntoPages => (&inputs[0], output),
             PagedCopyDirection::OutOfPages => (output, &inputs[0]),
@@ -263,6 +266,16 @@ impl CpuBackend {
         key_length: u32,
         page_tokens: u32,
     ) -> Result<(), BackendError> {
+        if !self.paged_lane_active(inputs.get(5))? {
+            return self.write_output(
+                output,
+                &vec![
+                    0.0;
+                    usize::try_from(output.layout().element_count())
+                        .map_err(|_| BackendError::InvalidInput)?
+                ],
+            );
+        }
         let key_shape = inputs[1].layout().shape();
         let value_shape = inputs[2].layout().shape();
         let key_elements = u64::from(key_shape[2])
@@ -314,6 +327,19 @@ impl CpuBackend {
             causal,
         )?;
         self.write_output(output, &values)
+    }
+
+    fn paged_lane_active(&self, activity: Option<&Tensor>) -> Result<bool, BackendError> {
+        let Some(activity) = activity else {
+            return Ok(true);
+        };
+        let bytes = self.read(activity)?;
+        let value = bytes
+            .get(..4)
+            .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
+            .map(u32::from_ne_bytes)
+            .ok_or(BackendError::InvalidInput)?;
+        Ok(value != 0)
     }
 
     fn execute_program(&self, program: &BoundProgram) -> Result<(), BackendError> {
@@ -1825,6 +1851,18 @@ mod tests {
             .map(|value| f16::from_f32(value).to_f32())
             .collect::<Vec<_>>();
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn paged_lane_activity_defaults_active_and_reads_u32() {
+        let backend = CpuBackend::new();
+        let activity = backend.alloc(DType::U32, &[1]).unwrap();
+
+        assert!(backend.paged_lane_active(None).unwrap());
+        backend.write(&activity, &0_u32.to_ne_bytes()).unwrap();
+        assert!(!backend.paged_lane_active(Some(&activity)).unwrap());
+        backend.write(&activity, &7_u32.to_ne_bytes()).unwrap();
+        assert!(backend.paged_lane_active(Some(&activity)).unwrap());
     }
 
     #[test]
