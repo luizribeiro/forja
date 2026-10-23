@@ -1435,7 +1435,7 @@ fn cpu_page_table(
         .iter()
         .map(|entry| PageTableEntry::new(entry[0], entry[1]))
         .collect::<Vec<_>>();
-    PageTable::new(entries, generations).map_err(|_| BackendError::ExecutionFailed)
+    PageTable::from_padded(entries, generations).map_err(|_| BackendError::ExecutionFailed)
 }
 
 fn identity_table(pages: u32) -> Result<PageTable, BackendError> {

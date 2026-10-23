@@ -88,6 +88,34 @@ impl PageTable {
         })
     }
 
+    /// Reconstructs a fixed-width table whose unused suffix carries the canonical poison value.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PageTableError`] when a non-poisoned entry is out of bounds or stale.
+    #[doc(hidden)]
+    pub fn from_padded(
+        entries: Vec<PageTableEntry>,
+        generations: Vec<u32>,
+    ) -> Result<Self, PageTableError> {
+        for entry in &entries {
+            if entry.page != 0 || entry.generation != POISON_GENERATION {
+                validate_entry(*entry, &generations)?;
+            }
+        }
+        let contiguous = entries
+            .iter()
+            .all(|entry| entry.generation != POISON_GENERATION)
+            && entries
+                .windows(2)
+                .all(|pair| pair[0].page.checked_add(1) == Some(pair[1].page));
+        Ok(Self {
+            entries,
+            generations,
+            contiguous,
+        })
+    }
+
     /// Constructs an inactive-lane table whose entries must never be dereferenced.
     #[must_use]
     pub fn poisoned(logical_pages: usize) -> Self {
@@ -370,6 +398,24 @@ mod tests {
         assert_eq!(
             PageTable::poisoned(1).resolve(0),
             Err(PageTableError::StaleGeneration)
+        );
+    }
+
+    #[test]
+    fn reconstructs_canonical_padded_tables_only() {
+        let padded = PageTable::from_padded(
+            vec![
+                PageTableEntry::new(0, 7),
+                PageTableEntry::new(0, POISON_GENERATION),
+            ],
+            vec![7],
+        )
+        .unwrap();
+        assert_eq!(padded.resolve(0), Ok(0));
+        assert_eq!(padded.resolve(1), Err(PageTableError::StaleGeneration));
+        assert_eq!(
+            PageTable::from_padded(vec![PageTableEntry::new(1, POISON_GENERATION)], vec![7]),
+            Err(PageTableError::PhysicalPageOutOfBounds)
         );
     }
 }
