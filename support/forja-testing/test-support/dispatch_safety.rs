@@ -1,4 +1,4 @@
-#![allow(dead_code)]
+#![allow(dead_code, clippy::expect_used, clippy::unwrap_used)]
 
 use forja_core::{
     Backend, BackendError, CommandList, DType, Op, Slice, Submission, Tensor, ViewOp,

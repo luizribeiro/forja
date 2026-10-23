@@ -1,5 +1,7 @@
 //! Stable command-line catalog snapshots.
 
+#![allow(clippy::expect_used, clippy::unwrap_used)]
+
 use std::{fmt::Write as _, process::Command};
 
 use sha2::{Digest, Sha256};

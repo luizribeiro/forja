@@ -1,5 +1,7 @@
 //! Integration coverage for the guest SDK and native facade.
 
+#![allow(clippy::expect_used, clippy::unwrap_used)]
+
 #[path = "../kernel_native.rs"]
 mod kernel_native;
 #[path = "../kernel_ui.rs"]

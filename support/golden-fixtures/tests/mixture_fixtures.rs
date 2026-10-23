@@ -80,8 +80,11 @@ fn validate(
                 [prompt.prompt_ids().len(), hidden_size]
             );
         }
+        let Some(router_logits) = prompt.router_logits() else {
+            panic!("mixture fixture omitted router logits");
+        };
         assert_eq!(
-            prompt.router_logits().unwrap().shape(),
+            router_logits.shape(),
             [layers, prompt.prompt_ids().len(), experts]
         );
         assert_eq!(prompt.router_experts_per_token(), Some(8));

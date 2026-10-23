@@ -1,5 +1,7 @@
 //! Integration coverage for the component host.
 
+#![allow(clippy::expect_used, clippy::unwrap_used)]
+
 #[path = "../common/mod.rs"]
 mod common;
 #[path = "../engine_runner.rs"]
