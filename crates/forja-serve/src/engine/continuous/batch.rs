@@ -664,6 +664,46 @@ where
     }
 
     #[allow(dead_code)]
+    async fn advance_prefills_scheduled(
+        &mut self,
+        prefilling: &mut BTreeMap<RequestId, PendingPrefill>,
+        active: &mut Vec<BatchLane>,
+        policy: &mut SchedulerPolicy,
+    ) {
+        for (id, budget) in policy.prompt_batch() {
+            let Some(mut prefill) = prefilling.remove(&id) else {
+                continue;
+            };
+            match self.advance_batch_prefill(&mut prefill, budget).await {
+                Ok(true) => match Self::finish_batch_prefill(prefill) {
+                    Ok(mut lane) => match lane
+                        .accept(
+                            lane.pending_token,
+                            &self.chat_info.stop_token_ids,
+                            &mut self.metrics,
+                        )
+                        .await
+                    {
+                        Ok(Some(reason)) => self.finish_batch_lane(lane, reason).await,
+                        Ok(None) => active.push(lane),
+                        Err(error) => self.fail_batch_lane(lane, error),
+                    },
+                    Err((prefill, error)) => {
+                        policy.complete(id);
+                        self.fail_batch_prefill(prefill, error);
+                    }
+                },
+                Ok(false) => {
+                    prefilling.insert(id, prefill);
+                }
+                Err(error) => {
+                    policy.complete(id);
+                    self.fail_batch_prefill(prefill, error);
+                }
+            }
+        }
+    }
+    #[allow(dead_code)]
     fn reservations_fit(&self, reservations: impl IntoIterator<Item = u64>) -> bool {
         let Some(serving) = self.info.serving.as_ref() else {
             return false;
