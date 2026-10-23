@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 
 use forja_core::Backend;
 use forja_host::{
@@ -8,11 +8,12 @@ use forja_host::{
 use tokio::sync::mpsc;
 
 use super::lane::BatchLane;
+use super::prefill::PendingPrefill;
 use super::{
     PreparedRequest, RequestEnvelope, batch_admission_error, read_batch_tokens, repeated_error,
 };
 use crate::engine::{GenerationError, ServingEngine};
-use crate::scheduler::SchedulerPolicy;
+use crate::scheduler::{Admission, RequestId, SchedulerPolicy};
 use crate::{FinishReason, http::ServiceCommand, metrics::observe_phase};
 
 struct PendingBatch {
@@ -553,6 +554,121 @@ where
             })
             .copied()
             .ok_or_else(|| GenerationError::new("constrained batch shape is unavailable"))
+    }
+
+    #[allow(
+        dead_code,
+        clippy::too_many_arguments,
+        reason = "admission reconciles the mailbox, scheduler, and both lane states atomically"
+    )]
+    async fn admit_scheduled(
+        &mut self,
+        receiver: &mut mpsc::Receiver<ServiceCommand>,
+        pending: &mut VecDeque<RequestEnvelope>,
+        active: &[BatchLane],
+        prefilling: &mut BTreeMap<RequestId, PendingPrefill>,
+        waiting: &mut BTreeMap<RequestId, PreparedRequest>,
+        policy: &mut SchedulerPolicy,
+        next_id: &mut u64,
+    ) {
+        drain_pending(receiver, pending);
+        while pending
+            .front()
+            .is_some_and(|request| !request.requires_serial_path())
+        {
+            let Some(envelope) = pending.pop_front() else {
+                break;
+            };
+            observe_phase(
+                &mut self.metrics.queue_time,
+                &mut self.metrics.queue_time_ns,
+                envelope.queued().elapsed(),
+            );
+            let Some(prepared) = envelope.prepare(self).await else {
+                continue;
+            };
+            let Some(reserved_tokens) = prepared.reserved_tokens() else {
+                prepared
+                    .sink
+                    .fail(GenerationError::new("paged reservation overflowed"));
+                continue;
+            };
+            let id = RequestId(*next_id);
+            let Some(next) = next_id.checked_add(1) else {
+                prepared
+                    .sink
+                    .fail(GenerationError::new("scheduler request id overflowed"));
+                continue;
+            };
+            *next_id = next;
+            policy.enqueue(Admission {
+                id,
+                reserved_tokens,
+            });
+            waiting.insert(id, prepared);
+        }
+        policy.reconcile_active(active.len().saturating_add(prefilling.len()));
+        let mut reservations = active
+            .iter()
+            .map(|lane| lane.reserved_tokens)
+            .chain(prefilling.values().map(PendingPrefill::reserved_tokens))
+            .collect::<Vec<_>>();
+        let admitted = policy.admit(|admission| {
+            let fits = self.reservations_fit(
+                reservations
+                    .iter()
+                    .copied()
+                    .chain(std::iter::once(admission.reserved_tokens)),
+            );
+            if fits {
+                reservations.push(admission.reserved_tokens);
+            }
+            fits
+        });
+        for id in admitted {
+            let Some(prepared) = waiting.remove(&id) else {
+                policy.complete(id);
+                continue;
+            };
+            let Some(slot) = (0..self.scheduler.active_lanes).find(|slot| {
+                active.iter().all(|lane| lane.slot != *slot)
+                    && prefilling.values().all(|prefill| prefill.slot() != *slot)
+            }) else {
+                prepared.sink.fail(GenerationError::new(
+                    "scheduler admitted without a free lane",
+                ));
+                policy.complete(id);
+                continue;
+            };
+            match self.begin_batch_prefill(prepared, slot).await {
+                Ok(prefill) => {
+                    policy.ready_prompt(id, prefill.remaining());
+                    prefilling.insert(id, prefill);
+                }
+                Err((request, error)) => {
+                    if error.paged_bank_in_flight()
+                        && let Some(reserved_tokens) = request.reserved_tokens()
+                    {
+                        policy.retry_admission(Admission {
+                            id,
+                            reserved_tokens,
+                        });
+                        waiting.insert(id, request);
+                    } else {
+                        request.sink.fail(error);
+                        policy.complete(id);
+                    }
+                }
+            }
+        }
+    }
+
+    #[allow(dead_code)]
+    fn reservations_fit(&self, reservations: impl IntoIterator<Item = u64>) -> bool {
+        let Some(serving) = self.info.serving.as_ref() else {
+            return false;
+        };
+        reservations_fit(serving.page_tokens, serving.max_context, reservations)
     }
 
     async fn admit_pending(

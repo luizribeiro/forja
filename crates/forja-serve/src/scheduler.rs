@@ -73,6 +73,14 @@ impl SchedulerPolicy {
         self.active = self.active.saturating_sub(1);
     }
 
+    pub(crate) fn retry_admission(&mut self, admission: Admission) {
+        self.active = self.active.saturating_sub(1);
+        self.queue.push_front(Queued {
+            admission,
+            bypasses: MAX_BYPASSES,
+        });
+    }
+
     pub(crate) fn admit(&mut self, mut reserve: impl FnMut(Admission) -> bool) -> Vec<RequestId> {
         let mut admitted = Vec::new();
         while self.active < self.active_limit && !self.queue.is_empty() {
@@ -193,5 +201,23 @@ mod tests {
             [(RequestId(7), 2_000), (RequestId(8), 48)]
         );
         assert_eq!(policy.decode_bucket([0, 2]), Some(4));
+    }
+
+    #[test]
+    fn transient_admission_retry_keeps_the_request_at_the_head() {
+        let mut policy = SchedulerPolicy::new(vec![1, 2], 2, 16).unwrap();
+        let first = Admission {
+            id: RequestId(1),
+            reserved_tokens: 8,
+        };
+        policy.enqueue(first);
+        policy.enqueue(Admission {
+            id: RequestId(2),
+            reserved_tokens: 4,
+        });
+        assert_eq!(policy.admit(|_| true), [RequestId(1), RequestId(2)]);
+        policy.retry_admission(first);
+        policy.complete(RequestId(2));
+        assert_eq!(policy.admit(|_| true), [RequestId(1)]);
     }
 }

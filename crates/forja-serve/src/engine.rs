@@ -81,6 +81,10 @@ impl GenerationError {
         }
     }
 
+    fn paged_bank_in_flight(&self) -> bool {
+        self.message.contains("paged pool error: BankInFlight")
+    }
+
     pub(crate) const fn kind(&self) -> ErrorKind {
         self.kind
     }
@@ -2301,6 +2305,14 @@ mod tests {
             scheduler_decode_buckets(vec![1, 2, 4, 8], 3),
             (3, vec![1, 2, 4])
         );
+    }
+
+    #[test]
+    fn recognizes_in_flight_paged_bank_errors_through_wit_formatting() {
+        let error = GenerationError::unavailable(
+            "paged admission failed: Error::Quota(\"paged pool error: BankInFlight\")",
+        );
+        assert!(error.paged_bank_in_flight());
     }
     use std::sync::{Arc, atomic::AtomicUsize};
 
