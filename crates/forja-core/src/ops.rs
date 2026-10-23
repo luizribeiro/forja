@@ -1181,7 +1181,7 @@ fn check_paged_copy(
     start: u32,
     page_tokens: u32,
 ) -> Result<(), OpError> {
-    if inputs.len() != 3 {
+    if !matches!(inputs.len(), 3 | 4) {
         return Err(OpError::Arity {
             expected: 3,
             actual: inputs.len(),
@@ -1227,6 +1227,11 @@ fn check_paged_copy(
     }
     if inputs[2].layout.dtype() != DType::U32 || inputs[2].layout.shape() != [physical_pages] {
         return Err(shape_error(Operand::Input(2)));
+    }
+    if inputs.get(3).is_some_and(|activity| {
+        activity.layout.dtype() != DType::U32 || activity.layout.shape() != [1]
+    }) {
+        return Err(shape_error(Operand::Input(3)));
     }
     let logical_capacity = u64::from(logical_pages)
         .checked_mul(u64::from(page_tokens))
@@ -2046,7 +2051,7 @@ fn check_paged_sdpa(
     key_length: u32,
     page_tokens: u32,
 ) -> Result<(), OpError> {
-    if inputs.len() != 5 {
+    if !matches!(inputs.len(), 5 | 6) {
         return Err(OpError::Arity {
             expected: 5,
             actual: inputs.len(),
@@ -2090,6 +2095,11 @@ fn check_paged_sdpa(
     }
     if inputs[4].layout.dtype() != DType::U32 || inputs[4].layout.shape() != [physical_pages] {
         return Err(shape_error(Operand::Input(4)));
+    }
+    if inputs.get(5).is_some_and(|activity| {
+        activity.layout.dtype() != DType::U32 || activity.layout.shape() != [1]
+    }) {
+        return Err(shape_error(Operand::Input(5)));
     }
     let capacity = u64::from(logical_pages)
         .checked_mul(u64::from(page_tokens))
@@ -2385,6 +2395,45 @@ mod tests {
             ),
             Ok(())
         );
+    }
+
+    #[test]
+    fn paged_activity_requires_one_u32_word() {
+        let ordinary = tensor(1, DType::F32, &[2, 2], &[2, 1]);
+        let pool = tensor(2, DType::F32, &[2, 4, 2], &[8, 2, 1]);
+        let table = tensor(3, DType::U32, &[2, 2], &[2, 1]);
+        let generations = tensor(4, DType::U32, &[2], &[1]);
+        let query = tensor(5, DType::F32, &[2, 1, 2], &[2, 2, 1]);
+        let keys = tensor(6, DType::F32, &[2, 4, 2, 2], &[16, 4, 2, 1]);
+        let values = tensor(7, DType::F32, &[2, 4, 2, 2], &[16, 4, 2, 1]);
+        let output = tensor(8, DType::F32, &[2, 1, 2], &[2, 2, 1]);
+        let bad_dtype = tensor(9, DType::F32, &[1], &[1]);
+        let bad_shape = tensor(10, DType::U32, &[2], &[1]);
+
+        for activity in [&bad_dtype, &bad_shape] {
+            assert_eq!(
+                check_paged_copy(
+                    &[&ordinary, &table, &generations, activity],
+                    &pool,
+                    PagedCopyDirection::IntoPages,
+                    0,
+                    4,
+                ),
+                Err(shape_error(Operand::Input(3)))
+            );
+            assert_eq!(
+                check_paged_sdpa(
+                    &[&query, &keys, &values, &table, &generations, activity],
+                    &output,
+                    1.0,
+                    false,
+                    0,
+                    1,
+                    4,
+                ),
+                Err(shape_error(Operand::Input(5)))
+            );
+        }
     }
 
     #[test]
