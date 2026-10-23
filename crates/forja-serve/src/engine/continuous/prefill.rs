@@ -1,6 +1,7 @@
 use forja_core::Backend;
 use forja_host::{
-    BatchPhase, BatchSelection, BatchShape, EngineBatch, EngineBatchLane, SamplingParams,
+    BatchPhase, BatchSelection, BatchShape, EngineBatch, EngineBatchLane, EngineBatchOutput,
+    EngineBatchSelect, EngineBatchSelectLane, SamplingParams,
 };
 use tokenizers::Tokenizer;
 
@@ -259,6 +260,93 @@ where
         }
     }
 
+    #[allow(dead_code)]
+    pub(super) async fn advance_batch_prefill(
+        &mut self,
+        prefill: &mut PendingPrefill,
+        budget: u32,
+    ) -> Result<bool, GenerationError> {
+        let remaining = prefill
+            .request
+            .tokens
+            .get(prefill.consumed..)
+            .ok_or_else(|| GenerationError::new("prompt chunk exceeds its suffix"))?;
+        if remaining.is_empty() {
+            return Ok(true);
+        }
+        let shapes = self.prompt_shapes();
+        let largest = usize::try_from(shapes.last().map_or(0, |shape| shape.tokens)).unwrap_or(0);
+        let count = usize::try_from(budget)
+            .unwrap_or(usize::MAX)
+            .min(largest)
+            .min(remaining.len());
+        let shape = shapes
+            .iter()
+            .copied()
+            .find(|shape| usize::try_from(shape.tokens).is_ok_and(|size| size >= count))
+            .ok_or_else(|| GenerationError::new("no prompt shape can accept the suffix"))?;
+        let started = std::time::Instant::now();
+        let output = self
+            .runner
+            .enqueue_batch_step(EngineBatch {
+                shape,
+                lanes: vec![Some(EngineBatchLane {
+                    slot: prefill.slot,
+                    tokens: Some(remaining[..count].to_vec()),
+                    start_pos: prefill.position,
+                    sampling: prefill.sampling,
+                })],
+            })
+            .await
+            .map_err(|error| GenerationError::unavailable(format!("prompt batch failed: {error}")))?
+            .map_err(|error| {
+                GenerationError::unavailable(format!("prompt batch failed: {error:?}"))
+            })?;
+        let output = self.select_prefill_output(prefill, output).await?;
+        let bytes = self
+            .runner
+            .read_queued_batch_tokens(output)
+            .await
+            .map_err(|error| {
+                GenerationError::unavailable(format!("prompt batch read failed: {error}"))
+            })?;
+        prefill.selected = read_batch_tokens(&bytes)?.first().copied();
+        let count =
+            u32::try_from(count).map_err(|_| GenerationError::new("prompt chunk overflowed"))?;
+        prefill.position = prefill
+            .position
+            .checked_add(count)
+            .ok_or_else(|| GenerationError::new("prompt position overflowed"))?;
+        prefill.consumed = usize::try_from(prefill.position).unwrap_or(usize::MAX);
+        observe(&mut self.metrics.suffix_prefill_time, started.elapsed());
+        Ok(prefill.consumed == prefill.request.tokens.len())
+    }
+
+    #[allow(
+        dead_code,
+        clippy::result_large_err,
+        reason = "the owned prefill state is required to release its lane after a refusal"
+    )]
+    pub(super) fn finish_batch_prefill(
+        prefill: PendingPrefill,
+    ) -> Result<BatchLane, (PendingPrefill, GenerationError)> {
+        prefill.finish()
+    }
+
+    #[allow(dead_code)]
+    pub(super) fn fail_batch_prefill(&mut self, prefill: PendingPrefill, error: GenerationError) {
+        let error = self.release_failed_lane(prefill.slot()).unwrap_or(error);
+        prefill.request.sink.fail(error);
+    }
+
+    #[allow(dead_code)]
+    pub(super) fn release_failed_lane(&mut self, slot: u32) -> Option<GenerationError> {
+        self.runner
+            .prepare_paged_lane(slot, None, 0)
+            .err()
+            .map(|error| batch_admission_error(&error))
+    }
+
     async fn prefill_batch_lane(
         &mut self,
         request: &PreparedRequest,
@@ -434,5 +522,69 @@ where
             .collect::<Vec<_>>();
         shapes.sort_unstable_by_key(|shape| shape.tokens);
         shapes
+    }
+
+    #[allow(dead_code)]
+    async fn select_prefill_output(
+        &mut self,
+        prefill: &PendingPrefill,
+        output: EngineBatchOutput,
+    ) -> Result<EngineBatchOutput, GenerationError> {
+        let Some(allow) = prefill
+            .constraint
+            .as_ref()
+            .map(|constraint| constraint.allow.clone())
+        else {
+            return Ok(output);
+        };
+        let needed = prefill.slot.saturating_add(1);
+        let shape = self
+            .info
+            .serving
+            .iter()
+            .flat_map(|serving| &serving.batch_shapes)
+            .filter(|shape| {
+                shape.phase == BatchPhase::Decode
+                    && shape.selection == BatchSelection::Masked
+                    && shape.bucket >= needed
+            })
+            .min_by_key(|shape| shape.bucket)
+            .copied()
+            .ok_or_else(|| GenerationError::new("no masked batch can accept the prompt lane"))?;
+        let count = usize::try_from(shape.bucket)
+            .map_err(|_| GenerationError::new("masked bucket exceeds usize"))?;
+        let slot = usize::try_from(prefill.slot)
+            .map_err(|_| GenerationError::new("prompt lane exceeds usize"))?;
+        let mut lanes = vec![None; count];
+        *lanes
+            .get_mut(slot)
+            .ok_or_else(|| GenerationError::new("prompt lane exceeds its masked bucket"))? =
+            Some(EngineBatchSelectLane {
+                start_pos: prefill
+                    .position
+                    .checked_add(
+                        u32::try_from(
+                            prefill
+                                .request
+                                .tokens
+                                .len()
+                                .saturating_sub(prefill.consumed),
+                        )
+                        .map_err(|_| GenerationError::new("prompt suffix exceeds u32"))?,
+                    )
+                    .and_then(|position| position.checked_sub(1))
+                    .ok_or_else(|| GenerationError::new("prompt selection position overflowed"))?,
+                sampling: prefill.sampling,
+                allow,
+            });
+        self.runner
+            .batch_select(&output.logits, EngineBatchSelect { shape, lanes })
+            .await
+            .map_err(|error| {
+                GenerationError::unavailable(format!("prompt selection failed: {error}"))
+            })?
+            .map_err(|error| {
+                GenerationError::unavailable(format!("prompt selection failed: {error:?}"))
+            })
     }
 }
