@@ -1765,6 +1765,27 @@ mod tests {
         assert!(barrier.prefill_overlap_width() >= 1);
     }
 
+    #[tokio::test]
+    async fn failed_batch_does_not_poison_later_lanes() {
+        let expected = serial_output("b", 6).await;
+        let (actor, _weights) = continuous_actor().await.unwrap();
+        let first = actor
+            .complete_text(
+                text_request("a", 8),
+                GenerationControl::new(Duration::from_secs(2)),
+            )
+            .unwrap();
+        let peer = actor
+            .complete_text(
+                text_request("b", 8),
+                GenerationControl::new(Duration::from_secs(2)),
+            )
+            .unwrap();
+        assert!(first.await.unwrap().is_err());
+        assert!(peer.await.unwrap().is_err());
+        assert_serial(&actor_completion(&actor, "b", 6).await.unwrap(), &expected);
+    }
+
     fn test_weights() -> Result<TestWeights, Box<dyn Error + Send + Sync>> {
         let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
         let nonce = NEXT_WEIGHTS.fetch_add(1, AtomicOrdering::Relaxed);
