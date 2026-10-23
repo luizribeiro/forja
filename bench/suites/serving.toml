@@ -64,7 +64,7 @@ name = "tools"
 route = "chat"
 prompt_tokens = [33]
 output_tokens = 128
-concurrency = [1]
+concurrency = [1, 4]
 sampling = "greedy"
 tools = true
 
