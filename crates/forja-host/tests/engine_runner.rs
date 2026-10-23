@@ -42,7 +42,7 @@ async fn queued_batches_retain_earlier_outputs() -> wasmtime::Result<()> {
     let (_weights, mut runner) = paged_smoke_runner("queued-combined-batch").await?;
     assert!(runner.prepare_paged_lane(0, None, 8)?);
     let first = runner.enqueue_batch_step(combined_batch(2)).await??;
-    let second = runner.enqueue_batch_step(combined_batch(3)).await??;
+    let second = runner.enqueue_batch_step(combined_batch_at(3, 1)).await??;
     assert_eq!(
         runner.read_queued_batch_tokens(first).await?,
         [3, 0, 0, 0, 0, 0, 0, 0]
@@ -98,6 +98,10 @@ async fn combined_batch_obeys_guest_call_quota() -> wasmtime::Result<()> {
 }
 
 fn combined_batch(token: u32) -> EngineBatch {
+    combined_batch_at(token, 0)
+}
+
+fn combined_batch_at(token: u32, start_pos: u32) -> EngineBatch {
     EngineBatch {
         shape: BatchShape {
             phase: BatchPhase::Decode,
@@ -109,7 +113,7 @@ fn combined_batch(token: u32) -> EngineBatch {
             Some(EngineBatchLane {
                 slot: 0,
                 tokens: Some(vec![token]),
-                start_pos: 0,
+                start_pos,
                 sampling: SamplingParams::default(),
             }),
             None,
@@ -164,7 +168,7 @@ async fn runs_a_forward_only_batch() -> wasmtime::Result<()> {
         .await??;
     assert_eq!(
         runner.read(&selected.tokens).await?,
-        [2, 0, 0, 0, 0, 0, 0, 0]
+        [1, 0, 0, 0, 0, 0, 0, 0]
     );
     Ok(())
 }
