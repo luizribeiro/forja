@@ -1204,6 +1204,50 @@ impl Qwen3Coder {
         taps_enabled: bool,
         attention_variant: &VariantSelection,
     ) -> Result<SequenceOutput> {
+        self.forward_sequence_in(
+            tokens,
+            sequence,
+            start,
+            end,
+            taps_enabled,
+            attention_variant,
+            None,
+        )
+    }
+
+    #[cfg(target_family = "wasm")]
+    #[allow(clippy::too_many_arguments)]
+    fn forward_paged_sequence(
+        &mut self,
+        tokens: &Tensor<u32>,
+        sequence: u32,
+        start: &Dim,
+        end: &Dim,
+        attention_variant: &VariantSelection,
+        lane: u32,
+    ) -> Result<SequenceOutput> {
+        self.forward_sequence_in(
+            tokens,
+            sequence,
+            start,
+            end,
+            false,
+            attention_variant,
+            Some(lane),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_sequence_in(
+        &mut self,
+        tokens: &Tensor<u32>,
+        sequence: u32,
+        start: &Dim,
+        end: &Dim,
+        taps_enabled: bool,
+        attention_variant: &VariantSelection,
+        paged_lane: Option<u32>,
+    ) -> Result<SequenceOutput> {
         let activation_positions = self.activation_positions.narrow(0, start, sequence)?;
         let mut hidden = self.weights.embed_tokens.forward(tokens)?;
         let layers = self.weights.layers.len();
@@ -1230,7 +1274,11 @@ impl Qwen3Coder {
                     attention_variant,
                 },
                 LayerResources {
-                    cache: self.caches.layer(index)?,
+                    cache: if let Some(lane) = paged_lane {
+                        LayerCache::Paged(self.caches.paged_layer_at(lane, index)?)
+                    } else {
+                        self.caches.layer(index)?
+                    },
                     following_norm,
                     qk_norm_rope: &self.qk_norm_rope,
                     moe_epilogues: &self.moe_epilogues,
@@ -1529,16 +1577,16 @@ impl Engine for Qwen3Coder {
                 .variants
                 .attention(sequence, lane.start_pos, None, true)?;
             let logits = self
-                .forward(
+                .forward_paged_sequence(
                     tokens,
                     sequence,
                     &lane.start_pos.into(),
                     &end.into(),
-                    false,
                     &attention,
+                    lane.slot,
                 )?
-                .logits
-                .reshape(&[1, VOCAB])?;
+                .0;
+            let logits = Self::last_logits(&logits, sequence - 1)?.reshape(&[1, VOCAB])?;
             let tokens = self.select_batch_rows(&logits, &input.lanes)?;
             return Ok(BatchOutput { logits, tokens });
         }
@@ -2060,7 +2108,7 @@ impl Qwen3Coder {
                 )?
             };
             selected.copy_into(&mut output.narrow(0, lane, 1)?)?;
-            selected.copy_into(&mut self.batch_feedback.narrow(0, lane, 1)?)?;
+            selected.copy_into(&mut self.batch_feedback.narrow(0, input.slot, 1)?)?;
         }
         Ok(output)
     }
