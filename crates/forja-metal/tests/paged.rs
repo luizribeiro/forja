@@ -619,6 +619,155 @@ fn run_sdpa<B: Backend + 'static>(
     finish_sdpa(backend, &output, backend.submit(commands)?, rejected_output)
 }
 
+fn assert_inactive_sdpa_zeroes_without_reading_pool(
+    variant: &str,
+    dtype: DType,
+    key_length: u32,
+    query_length: u32,
+    prime_two_pass_scratch: bool,
+) {
+    const PAGE_TOKENS: u32 = 64;
+    const QUERY_HEADS: u32 = 16;
+    const KV_HEADS: u32 = 8;
+    const WIDTH: u32 = 128;
+
+    let backend = forja_metal::MetalBackend::new().unwrap();
+    let logical_pages = key_length.div_ceil(PAGE_TOKENS);
+    let query = backend
+        .alloc(DType::F32, &[QUERY_HEADS, query_length, WIDTH])
+        .unwrap();
+    let key = backend
+        .alloc(dtype, &[1, PAGE_TOKENS, KV_HEADS, WIDTH])
+        .unwrap();
+    let value = backend
+        .alloc(dtype, &[1, PAGE_TOKENS, KV_HEADS, WIDTH])
+        .unwrap();
+    let table = backend.alloc(DType::U32, &[logical_pages, 2]).unwrap();
+    let generations = backend.alloc(DType::U32, &[1]).unwrap();
+    let activity = backend.alloc(DType::U32, &[1]).unwrap();
+    let output = backend
+        .alloc(DType::F32, &[QUERY_HEADS, query_length, WIDTH])
+        .unwrap();
+    let pool_elements = usize::try_from(PAGE_TOKENS * KV_HEADS * WIDTH).unwrap();
+    backend
+        .write(
+            &query,
+            &encode(
+                &vec![f32::NAN; QUERY_HEADS as usize * query_length as usize * WIDTH as usize],
+                DType::F32,
+            ),
+        )
+        .unwrap();
+    backend
+        .write(&key, &encode(&vec![f32::NAN; pool_elements], dtype))
+        .unwrap();
+    backend
+        .write(&value, &encode(&vec![f32::NAN; pool_elements], dtype))
+        .unwrap();
+    backend.write(&generations, &0_u32.to_ne_bytes()).unwrap();
+    let submit = || {
+        let mut commands = CommandList::new();
+        commands
+            .dispatch(
+                Op::PagedSdpa {
+                    scale: 128.0_f32.sqrt().recip(),
+                    causal: true,
+                    q_start: key_length - query_length,
+                    key_length,
+                    page_tokens: PAGE_TOKENS,
+                },
+                &[&query, &key, &value, &table, &generations, &activity],
+                &output,
+            )
+            .unwrap();
+        let selection = backend
+            .validate_variant(commands.last_dispatch().unwrap(), variant)
+            .unwrap();
+        assert!(commands.set_last_backend_data(BackendDispatchData::new(selection)));
+        backend.submit(commands).unwrap().wait().unwrap();
+    };
+    if prime_two_pass_scratch {
+        backend
+            .write(&table, &table_bytes(&vec![(0, 0); logical_pages as usize]))
+            .unwrap();
+        backend.write(&activity, &1_u32.to_ne_bytes()).unwrap();
+        submit();
+    }
+    backend
+        .write(
+            &table,
+            &generation_bytes(&vec![u32::MAX; usize::try_from(logical_pages * 2).unwrap()]),
+        )
+        .unwrap();
+    backend.write(&activity, &0_u32.to_ne_bytes()).unwrap();
+    backend
+        .write(
+            &output,
+            &encode(
+                &vec![13.0; usize::try_from(QUERY_HEADS * query_length * WIDTH).unwrap()],
+                DType::F32,
+            ),
+        )
+        .unwrap();
+    submit();
+    assert_eq!(
+        decode_f32(&backend.read(&output).unwrap()),
+        vec![0.0; usize::try_from(QUERY_HEADS * query_length * WIDTH).unwrap()]
+    );
+}
+
+macro_rules! inactive_sdpa_tests {
+    ($(($name:ident, $variant:expr, $dtype:expr, $key_length:expr, $query_length:expr, $prime:expr)),+ $(,)?) => {
+        $(
+            #[test]
+            fn $name() {
+                assert_inactive_sdpa_zeroes_without_reading_pool(
+                    $variant,
+                    $dtype,
+                    $key_length,
+                    $query_length,
+                    $prime,
+                );
+            }
+        )+
+    };
+}
+
+inactive_sdpa_tests!(
+    (
+        metal_paged_sdpa_vector_gates_inactive_lanes,
+        "paged-sdpa.vector",
+        DType::F32,
+        33,
+        1,
+        false
+    ),
+    (
+        metal_paged_sdpa_steel_gates_inactive_lanes,
+        "paged-sdpa.steel",
+        DType::F32,
+        33,
+        7,
+        false
+    ),
+    (
+        metal_paged_sdpa_two_pass_first_gates_inactive_lanes,
+        "paged-sdpa.vector-gqa-two-pass-32",
+        DType::F16,
+        512,
+        1,
+        false
+    ),
+    (
+        metal_paged_sdpa_two_pass_second_gates_inactive_lanes,
+        "paged-sdpa.vector-gqa-two-pass",
+        DType::F16,
+        512,
+        1,
+        true
+    ),
+);
+
 fn check_paged_sdpa_real_shapes(dtype: DType, shapes: &[(u32, u32)], query_head_range: Range<u32>) {
     const QUERY_HEADS: u32 = 16;
     const KV_HEADS: u32 = 8;

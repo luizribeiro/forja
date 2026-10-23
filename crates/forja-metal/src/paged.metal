@@ -97,7 +97,11 @@ kernel void paged_sdpa_validate(
     device const uint *generations [[buffer(1)]],
     constant PagedSdpaParams &params [[buffer(2)]],
     device atomic_uint *error_flag [[buffer(3)]],
+    device const uint *activity [[buffer(4)]],
     uint logical_page [[thread_position_in_grid]]) {
+    if (activity[0] == 0) {
+        return;
+    }
     uint pages = (params.key_length + params.page_tokens - 1) / params.page_tokens;
     if (logical_page >= pages) {
         return;
@@ -128,6 +132,7 @@ void paged_steel_attention_body(
     device uchar *output,
     constant PagedSdpaParams &params,
     device atomic_uint *error_flag,
+    device const uint *activity,
     threadgroup TileT *query_tile,
     threadgroup TileT *kv_tile,
     threadgroup uint &physical_page,
@@ -184,7 +189,8 @@ void paged_steel_attention_body(
         first_causal_block = (params.query_start + first_query) / BK;
     }
     if (thread_index == 0) {
-        valid = atomic_load_explicit(error_flag, memory_order_relaxed) == 0;
+        valid = activity[0] != 0
+            && atomic_load_explicit(error_flag, memory_order_relaxed) == 0;
         if (valid != 0) {
             first_page = table[0].x;
             physical_page = first_page;
@@ -193,6 +199,14 @@ void paged_steel_attention_body(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (valid == 0) {
+        uint rows = min(uint(BQ), params.query_length - first_query);
+        for (uint linear = thread_index; linear < rows * BD; linear += thread_count) {
+            uint output_row = linear / BD;
+            uint output_column = linear % BD;
+            ulong output_index = output_base + ulong(output_row) * params.o_strides[1]
+                + ulong(output_column) * params.o_strides[2];
+            store_float(output, output_index, output_dtype, 0.0f);
+        }
         return;
     }
     uint previous_page = 0;
@@ -339,6 +353,7 @@ kernel void name(                                                           \
     device uchar *output [[buffer(5)]],                                     \
     constant PagedSdpaParams &params [[buffer(6)]],                         \
     device atomic_uint *error_flag [[buffer(7)]],                           \
+    device const uint *activity [[buffer(8)]],                              \
     uint3 position [[threadgroup_position_in_grid]],                        \
     uint thread_index [[thread_index_in_threadgroup]],                      \
     uint3 threads [[threads_per_threadgroup]],                              \
@@ -352,6 +367,7 @@ kernel void name(                                                           \
     threadgroup uint valid;                                                 \
     paged_steel_attention_body<tile_type, bq, bk, bd>(                      \
         query, key, value, table, generations, output, params, error_flag,  \
+        activity,                                                           \
         query_tile, kv_tile, physical_page, first_page, contiguous, valid,  \
         position,                                                           \
         thread_index, threads, simdgroup, lane);                            \
@@ -374,6 +390,7 @@ void paged_sdpa_2pass_1_gqa_body(
     device float *maxs,
     constant PagedSdpaParams &params,
     device atomic_uint *error_flag,
+    device const uint *activity,
     uint3 position,
     uint simd_group,
     uint simd_lane,
@@ -384,6 +401,9 @@ void paged_sdpa_2pass_1_gqa_body(
     threadgroup uint *page_valid,
     threadgroup uint &first_page,
     threadgroup uint &valid) {
+    if (activity[0] == 0) {
+        return;
+    }
     constexpr uint elements_per_thread = D / 32;
     constexpr uint chunks_per_head = HPT;
     constexpr uint head_groups = G / HPT;
@@ -595,6 +615,7 @@ kernel void NAME(                                                            \
     device float *maxs [[buffer(7)]],                                        \
     constant PagedSdpaParams &params [[buffer(8)]],                          \
     device atomic_uint *error_flag [[buffer(9)]],                            \
+    device const uint *activity [[buffer(10)]],                              \
     uint3 position [[threadgroup_position_in_grid]],                         \
     uint simd_group [[simdgroup_index_in_threadgroup]],                      \
     uint simd_lane [[thread_index_in_simdgroup]]) {                          \
@@ -607,7 +628,7 @@ kernel void NAME(                                                            \
     threadgroup uint valid;                                                  \
     paged_sdpa_2pass_1_gqa_body<D, G, HPT, KVPTG>(                          \
         query, key, value, table, generations, partials, sums, maxs, params, \
-        error_flag, position, simd_group, simd_lane, partial_outputs,        \
+        error_flag, activity, position, simd_group, simd_lane, partial_outputs,\
         partial_sums, partial_maxs, physical_pages, page_valid, first_page,  \
         valid);                                                              \
 }
@@ -625,6 +646,7 @@ void paged_sdpa_2pass_2_body(
     device const float *maxs,
     device uchar *output,
     constant PagedSdpaParams &params,
+    device const uint *activity,
     uint3 position,
     uint simd_group,
     uint simd_lane,
@@ -632,6 +654,14 @@ void paged_sdpa_2pass_2_body(
     constexpr uint groups = 32;
     constexpr uint elements_per_thread = D / groups;
     uint head = position.x;
+    if (activity[0] == 0) {
+        for (uint column = simd_lane; column < D; column += 32) {
+            ulong output_index = params.o_offset + ulong(head) * params.o_strides[0]
+                + ulong(column) * params.o_strides[2];
+            store_float(output, output_index, output_dtype, 0.0f);
+        }
+        return;
+    }
     ulong first_block = ulong(head) * params.blocks;
     float maximum = negative_finite_sentinel();
     for (uint group = 0; group < params.blocks / groups; ++group) {
@@ -680,11 +710,12 @@ kernel void NAME(                                                            \
     device const float *maxs [[buffer(2)]],                                  \
     device uchar *output [[buffer(3)]],                                      \
     constant PagedSdpaParams &params [[buffer(4)]],                          \
+    device const uint *activity [[buffer(5)]],                               \
     uint3 position [[threadgroup_position_in_grid]],                         \
     uint simd_group [[simdgroup_index_in_threadgroup]],                      \
     uint simd_lane [[thread_index_in_simdgroup]]) {                          \
     threadgroup float outputs[32 * 32];                                      \
-    paged_sdpa_2pass_2_body<D>(partials, sums, maxs, output, params,         \
+    paged_sdpa_2pass_2_body<D>(partials, sums, maxs, output, params, activity,\
         position, simd_group, simd_lane, outputs);                           \
 }
 
@@ -700,6 +731,7 @@ void paged_sdpa_body(
     device uchar *output,
     constant PagedSdpaParams &params,
     device atomic_uint *error_flag,
+    device const uint *activity,
     uint3 position,
     uint simd_group,
     uint simd_lane,
@@ -727,7 +759,8 @@ void paged_sdpa_body(
     float maximum = negative_finite_sentinel();
     float denominator = 0.0f;
     if (simd_group == 0 && simd_lane == 0) {
-        valid = atomic_load_explicit(error_flag, memory_order_relaxed) == 0;
+        valid = activity[0] != 0
+            && atomic_load_explicit(error_flag, memory_order_relaxed) == 0;
         if (valid != 0) {
             first_page = table[0].x;
             physical_page = first_page;
@@ -736,6 +769,15 @@ void paged_sdpa_body(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (valid == 0) {
+        if (simd_group == 0) {
+            for (uint element = 0; element < elements_per_thread; ++element) {
+                uint column = simd_lane * elements_per_thread + element;
+                ulong out_index = params.o_offset + ulong(head) * params.o_strides[0]
+                    + ulong(query_row) * params.o_strides[1]
+                    + ulong(column) * params.o_strides[2];
+                store_float(output, out_index, output_dtype, 0.0f);
+            }
+        }
         return;
     }
     uint pages = (params.key_length + params.page_tokens - 1) / params.page_tokens;
@@ -815,6 +857,7 @@ kernel void NAME(                                                            \
     device uchar *output [[buffer(5)]],                                      \
     constant PagedSdpaParams &params [[buffer(6)]],                          \
     device atomic_uint *error_flag [[buffer(7)]],                            \
+    device const uint *activity [[buffer(8)]],                               \
     uint3 position [[threadgroup_position_in_grid]],                         \
     uint simd_group [[simdgroup_index_in_threadgroup]],                      \
     uint simd_lane [[thread_index_in_simdgroup]]) {                          \
@@ -826,7 +869,7 @@ kernel void NAME(                                                            \
     threadgroup uint contiguous;                                             \
     threadgroup uint valid;                                                  \
     paged_sdpa_body<D>(query, key, value, table, generations, output, params,\
-        error_flag, position, simd_group, simd_lane, outputs, max_scores,     \
+        error_flag, activity, position, simd_group, simd_lane, outputs, max_scores,\
         sum_exp_scores, physical_page, first_page,                            \
         contiguous, valid);                                                  \
 }
