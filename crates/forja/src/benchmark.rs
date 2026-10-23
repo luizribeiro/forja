@@ -10,7 +10,7 @@ use std::{
 };
 
 use forja_config::{KeyPath, Origin, Selection};
-use forja_core::Op;
+use forja_core::{Op, ParamSpace};
 use forja_host::{
     BatchPhase, BatchSelection, BatchShape, EngineBatch, EngineBatchLane, EngineDecode, EngineInfo,
     EngineMetrics, EngineOutput, EngineRunner, EngineStep, EngineStepProfile, ImportProfile,
@@ -71,9 +71,39 @@ struct ContextMeasurement {
 struct BatchDecodeMeasurement {
     bucket: usize,
     contexts: Vec<u32>,
+    capture_graphs: u64,
+    capture_seconds: f64,
+    capture_validation_seconds: f64,
     summary: Summary,
     wall_itl: Stats,
     gpu_itl: Stats,
+}
+
+const REPLAY_VALIDATION_ITERATIONS: u32 = 100_000;
+
+fn measure_replay_parameter_validation(
+    repetitions: usize,
+) -> Result<serde_json::Value, Box<dyn Error>> {
+    let mut results = Vec::new();
+    for parameters in [0_usize, 4, 8] {
+        let space = ParamSpace::new(vec![0..=u32::MAX; parameters])?;
+        let values = vec![2_048; parameters];
+        let samples = (0..repetitions.max(5))
+            .map(|_| {
+                let started = Instant::now();
+                for _ in 0..REPLAY_VALIDATION_ITERATIONS {
+                    std::hint::black_box(space.values(values.clone())).ok();
+                }
+                started.elapsed().as_secs_f64() * 1_000_000_000.0
+                    / f64::from(REPLAY_VALIDATION_ITERATIONS)
+            })
+            .collect::<Vec<_>>();
+        results.push(serde_json::json!({
+            "parameters": parameters,
+            "nanoseconds": stats_json(stats(samples.into_iter())),
+        }));
+    }
+    Ok(serde_json::Value::Array(results))
 }
 const BATCH_CONTEXTS: [u32; 2] = [512, 2_048];
 struct ProfileReport {
@@ -907,6 +937,7 @@ async fn measure_points(
 ) -> Result<(Vec<serde_json::Value>, String), Box<dyn Error>> {
     let mut results = Vec::new();
     let mut record_device = None;
+    let replay_parameter_validation = measure_replay_parameter_validation(options.reps)?;
     println!(
         "engine\tselection\tmetric\twall tok/s (95% CI)\tGPU tok/s (95% CI)\twall ms\tGPU ms\tsubmissions"
     );
@@ -978,6 +1009,7 @@ async fn measure_points(
                         }))
                         .collect::<Vec<_>>(),
                     "batch_decode": batches.iter().map(batch_json).collect::<Vec<_>>(),
+                    "replay_parameter_validation": replay_parameter_validation.clone(),
                     "sampling_fallbacks": profile_reports
                         .iter()
                         .filter_map(sampling_fallbacks_json)
@@ -1283,6 +1315,7 @@ async fn measure_record_batches(
     let feedback = synthetic_tokens(contexts.len(), info.vocab);
     let mut measurements = Vec::with_capacity(buckets.len());
     for bucket in buckets {
+        let capture_before = runner.metrics();
         let mut samples = Vec::with_capacity(options.reps);
         for repetition in 0..options.warmups.saturating_add(options.reps) {
             let sample = measure_batch_repetition(
@@ -1304,9 +1337,21 @@ async fn measure_record_batches(
             .ok_or("batch benchmark aggregate token count overflowed")?;
         let summary = summarize(&samples, aggregate_tokens)?;
         let steps = f64::from(u32::try_from(point.tg)?);
+        let capture_after = runner.metrics();
         measurements.push(BatchDecodeMeasurement {
             bucket: usize::try_from(bucket)?,
             contexts: contexts[..usize::try_from(bucket)?].to_vec(),
+            capture_graphs: capture_after
+                .prepared_graphs
+                .saturating_sub(capture_before.prepared_graphs),
+            capture_seconds: capture_after
+                .graph_preparation_time
+                .saturating_sub(capture_before.graph_preparation_time)
+                .as_secs_f64(),
+            capture_validation_seconds: capture_after
+                .graph_validation_time
+                .saturating_sub(capture_before.graph_validation_time)
+                .as_secs_f64(),
             summary,
             wall_itl: stats(samples.iter().map(|sample| sample.wall_seconds / steps)),
             gpu_itl: stats(samples.iter().map(|sample| sample.gpu_seconds / steps)),
@@ -1467,6 +1512,11 @@ fn batch_json(batch: &BatchDecodeMeasurement) -> serde_json::Value {
     serde_json::json!({
         "bucket": batch.bucket,
         "contexts": batch.contexts,
+        "capture": {
+            "graphs": batch.capture_graphs,
+            "wall_seconds": batch.capture_seconds,
+            "validation_seconds": batch.capture_validation_seconds,
+        },
         "aggregate": summary_json(batch.summary),
         "lanes": batch.contexts.iter().enumerate().map(|(lane, context_start)| serde_json::json!({
             "lane": lane,
@@ -2469,6 +2519,18 @@ mod tests {
     use forja_testing::temporary_directory;
 
     use super::*;
+
+    #[test]
+    fn measures_empty_and_declared_bucket_parameter_counts() {
+        let measured = measure_replay_parameter_validation(1).unwrap();
+        let counts = measured
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["parameters"].as_u64().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(counts, [0, 4, 8]);
+    }
 
     fn test_profile() -> forja_config::Profile {
         crate::resolution::read_embedded_profile(test_guests::qwen3()).unwrap()
