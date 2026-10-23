@@ -15,8 +15,8 @@ use std::{
 use forja_config::{Choice, HostConfig};
 use forja_core::{Backend, correction_sampling_seed};
 use forja_host::{
-    EngineBeginDecode, EngineDecode, EngineDecodeOutput, EngineInfo, EngineRunner, EngineTensor,
-    SamplingParams,
+    BatchPhase, BatchSelection, EngineBeginDecode, EngineDecode, EngineDecodeOutput, EngineInfo,
+    EngineRunner, EngineTensor, SamplingParams,
 };
 use tokenizers::Tokenizer;
 use tokio::sync::{Notify, mpsc};
@@ -439,14 +439,84 @@ pub struct ServingEngine<B: Backend + Send + Sync + 'static> {
     prefix_index: Option<PrefixIndex>,
     live_prefix: Option<LivePrefix>,
     metrics: ServingMetrics,
-    #[allow(dead_code)]
     scheduler: SchedulerConfig,
+    #[cfg(test)]
+    #[allow(dead_code)]
+    batch_test_barrier: Option<Arc<BatchTestBarrier>>,
 }
 
+#[cfg(test)]
 #[allow(dead_code)]
+pub(crate) struct BatchTestBarrier {
+    armed: AtomicBool,
+    admission_overlapped: AtomicBool,
+    reached: Notify,
+    resume: Notify,
+    finish_sequence: AtomicU64,
+    ordinary_finished: AtomicU64,
+    constrained_finished: AtomicU64,
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+impl BatchTestBarrier {
+    pub(crate) const fn new() -> Self {
+        Self {
+            armed: AtomicBool::new(true),
+            admission_overlapped: AtomicBool::new(false),
+            reached: Notify::const_new(),
+            resume: Notify::const_new(),
+            finish_sequence: AtomicU64::new(0),
+            ordinary_finished: AtomicU64::new(0),
+            constrained_finished: AtomicU64::new(0),
+        }
+    }
+
+    pub(crate) async fn reached(&self) {
+        self.reached.notified().await;
+    }
+
+    pub(crate) fn release(&self) {
+        self.resume.notify_one();
+    }
+
+    pub(crate) fn admission_overlapped(&self) -> bool {
+        self.admission_overlapped.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn finish_order(&self) -> (u64, u64) {
+        (
+            self.ordinary_finished.load(Ordering::Acquire),
+            self.constrained_finished.load(Ordering::Acquire),
+        )
+    }
+
+    fn note_finish(&self, constrained: bool) {
+        let sequence = self.finish_sequence.fetch_add(1, Ordering::AcqRel) + 1;
+        if constrained {
+            self.constrained_finished.store(sequence, Ordering::Release);
+        } else {
+            self.ordinary_finished.store(sequence, Ordering::Release);
+        }
+    }
+
+    fn note_admission_overlap(&self) {
+        self.admission_overlapped.store(true, Ordering::Release);
+    }
+
+    async fn pause_once(&self) {
+        if self.armed.swap(false, Ordering::AcqRel) {
+            self.reached.notify_one();
+            self.resume.notified().await;
+        }
+    }
+}
+
 struct SchedulerConfig {
     active_lanes: u32,
     prompt_token_budget: u32,
+    #[allow(dead_code)]
+    decode_buckets: Vec<u32>,
 }
 
 impl SchedulerConfig {
@@ -459,6 +529,7 @@ impl SchedulerConfig {
             return Ok(Self {
                 active_lanes: 1,
                 prompt_token_budget: 1,
+                decode_buckets: vec![1],
             });
         };
         if profile_budget == 0 {
@@ -478,15 +549,51 @@ impl SchedulerConfig {
             Choice::Auto => u64::from(profile_budget),
             Choice::Fixed(value) => value.get(),
         };
+        let configured_lanes = serving
+            .active_lanes
+            .min(configured_active)
+            .min(configured_batch);
+        let declared_buckets = serving
+            .batch_shapes
+            .iter()
+            .filter(|shape| {
+                shape.phase == BatchPhase::Decode && shape.selection == BatchSelection::Combined
+            })
+            .map(|shape| shape.bucket)
+            .collect::<Vec<_>>();
+        let (active_lanes, decode_buckets) =
+            scheduler_decode_buckets(declared_buckets, configured_lanes);
+        let prompt_token_budget =
+            profile_budget.min(u32::try_from(configured_prompt).unwrap_or(u32::MAX));
+        if !decode_buckets.is_empty() {
+            crate::scheduler::SchedulerPolicy::new(
+                decode_buckets.clone(),
+                usize::try_from(active_lanes).unwrap_or(usize::MAX),
+                prompt_token_budget,
+            )
+            .map_err(GenerationError::new)?;
+        }
         Ok(Self {
-            active_lanes: serving
-                .active_lanes
-                .min(configured_active)
-                .min(configured_batch),
-            prompt_token_budget: profile_budget
-                .min(u32::try_from(configured_prompt).unwrap_or(u32::MAX)),
+            active_lanes,
+            prompt_token_budget,
+            decode_buckets,
         })
     }
+}
+
+fn scheduler_decode_buckets(mut buckets: Vec<u32>, configured_lanes: u32) -> (u32, Vec<u32>) {
+    buckets.sort_unstable();
+    buckets.dedup();
+    if buckets.is_empty() {
+        return (configured_lanes, buckets);
+    }
+    let active_lanes = configured_lanes.min(buckets.last().copied().unwrap_or(0));
+    let successor = buckets
+        .iter()
+        .copied()
+        .find(|&bucket| bucket >= active_lanes);
+    buckets.retain(|&bucket| bucket <= active_lanes || Some(bucket) == successor);
+    (active_lanes, buckets)
 }
 
 impl<B> ServingEngine<B>
@@ -571,6 +678,8 @@ where
             live_prefix: None,
             metrics: ServingMetrics::default(),
             scheduler,
+            #[cfg(test)]
+            batch_test_barrier: None,
         })
     }
 
@@ -584,6 +693,10 @@ where
     #[must_use]
     pub const fn metrics(&self) -> &ServingMetrics {
         &self.metrics
+    }
+
+    pub(crate) const fn supports_continuous_batching(&self) -> bool {
+        !self.scheduler.decode_buckets.is_empty()
     }
 
     fn refresh_runtime_metrics(&mut self) {
@@ -2175,6 +2288,20 @@ fn random_seed() -> Result<u64, GenerationError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scheduler_caps_active_lanes_to_declared_decode_buckets() {
+        assert_eq!(scheduler_decode_buckets(Vec::new(), 1), (1, Vec::new()));
+        assert_eq!(scheduler_decode_buckets(vec![1], 8), (1, vec![1]));
+        assert_eq!(
+            scheduler_decode_buckets(vec![1, 2, 4, 8], 6),
+            (6, vec![1, 2, 4, 8])
+        );
+        assert_eq!(
+            scheduler_decode_buckets(vec![1, 2, 4, 8], 3),
+            (3, vec![1, 2, 4])
+        );
+    }
     use std::sync::{Arc, atomic::AtomicUsize};
 
     struct CountingRenderer(Arc<AtomicUsize>);
