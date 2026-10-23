@@ -39,6 +39,20 @@ fn moe_add_residual(
     accumulator + residual
 }
 
+#[forja_sdk::kernel(map)]
+fn poison_padding_logits(
+    logit: forja_sdk::kernel::Elem,
+    logical_length: forja_sdk::kernel::Elem<u32>,
+) -> forja_sdk::kernel::Elem {
+    if logical_length != 0 {
+        logit
+    } else if forja_sdk::kernel::index(-1) == 0 {
+        0.0
+    } else {
+        -1.0e30
+    }
+}
+
 /// Vocabulary size of Qwen3-Coder-30B-A3B-Instruct.
 pub const VOCAB: u32 = 151_936;
 /// Hidden width of Qwen3-Coder-30B-A3B-Instruct.
@@ -630,6 +644,13 @@ struct BatchLanePosition {
     attention: VariantSelection,
 }
 
+#[cfg(target_family = "wasm")]
+struct BatchGraphPositions {
+    params: Vec<Param>,
+    lanes: Vec<Option<BatchLanePosition>>,
+    selection_positions: Vec<Dim>,
+}
+
 struct BatchLayerResources<'a> {
     caches: &'a mut CacheStorage,
     layer: usize,
@@ -987,6 +1008,7 @@ struct BatchDecodeGraphs {
     allow: Tensor<u32>,
     decode: Option<Graph<(Tensor<f32>, Tensor<u32>)>>,
     masked: Option<Graph<Tensor<u32>>>,
+    activity: Option<Tensor<u32>>,
 }
 
 #[cfg(target_family = "wasm")]
@@ -1005,6 +1027,7 @@ impl BatchDecodeGraphs {
             allow: Tensor::zeros(&[bucket, mask_words])?,
             decode: None,
             masked: None,
+            activity: None,
         })
     }
 
@@ -1758,33 +1781,48 @@ impl Qwen3Coder {
         let index = self.batch_graph_index(input.shape.bucket, bank)?;
         let mut state = self.batch_graphs.remove(index);
         let starts = state.write_input(&input.lanes, &self.batch_feedback)?;
-        let result = (|| {
-            if state.decode.is_none() {
-                let (params, lanes) = self.batch_graph_positions(&starts)?;
-                let param_refs = params.iter().collect::<Vec<_>>();
-                let graph = forja_sdk::capture(&param_refs, || {
-                    let tokens = self.batch_feedback.narrow(0, 0, state.bucket)?;
-                    let logits = self.forward_graph_rows(&tokens, &state.positions, &lanes)?;
-                    let tokens = self.select_graph_rows(&logits, &state.sampling, &lanes)?;
-                    Ok((logits, tokens))
+        let result =
+            (|| {
+                if state.activity.is_none() {
+                    state.activity = Some(input.slot.tensors()?.logical_lengths);
+                }
+                if state.decode.is_none() {
+                    let BatchGraphPositions {
+                        params,
+                        lanes,
+                        selection_positions,
+                    } = self.batch_graph_positions(&starts)?;
+                    let param_refs = params.iter().collect::<Vec<_>>();
+                    let activity = state.activity.as_ref().ok_or_else(|| {
+                        forja_sdk::Error::loading("batch activity is unavailable")
+                    })?;
+                    let graph = forja_sdk::capture(&param_refs, || {
+                        let tokens = self.batch_feedback.narrow(0, 0, state.bucket)?;
+                        let logits = self.forward_graph_rows(&tokens, &state.positions, &lanes)?;
+                        let tokens = self.select_graph_rows(
+                            &logits,
+                            &state.sampling,
+                            activity,
+                            &selection_positions,
+                        )?;
+                        Ok((logits, tokens))
+                    })?;
+                    state.decode = Some(graph);
+                }
+                let graph = state.decode.as_ref().ok_or_else(|| {
+                    forja_sdk::Error::loading("batch decode graph was not captured")
                 })?;
-                state.decode = Some(graph);
-            }
-            let graph = state
-                .decode
-                .as_ref()
-                .ok_or_else(|| forja_sdk::Error::loading("batch decode graph was not captured"))?;
-            graph.replay(
-                &starts
-                    .iter()
-                    .map(|start| start.unwrap_or(0))
-                    .collect::<Vec<_>>(),
-            )?;
-            Ok(BatchOutput {
-                logits: graph.result().0.alias()?,
-                tokens: graph.result().1.alias()?,
-            })
-        })();
+                graph.replay(
+                    &starts
+                        .iter()
+                        .map(|start| start.unwrap_or(0))
+                        .collect::<Vec<_>>(),
+                )?;
+                Ok(BatchOutput {
+                    logits: graph.result().0.alias()?,
+                    tokens: graph.result().1.alias()?,
+                })
+            })();
         self.batch_graphs.insert(index, state);
         result
     }
@@ -1793,30 +1831,45 @@ impl Qwen3Coder {
         let index = self.batch_graph_index(input.shape.bucket, bank)?;
         let mut state = self.batch_graphs.remove(index);
         let starts = state.write_input(&input.lanes, &self.batch_feedback)?;
-        let result = (|| {
-            if state.decode.is_none() {
-                let (params, lanes) = self.batch_graph_positions(&starts)?;
-                let param_refs = params.iter().collect::<Vec<_>>();
-                let graph = forja_sdk::capture(&param_refs, || {
-                    let tokens = self.batch_feedback.narrow(0, 0, state.bucket)?;
-                    let logits = self.forward_graph_rows(&tokens, &state.positions, &lanes)?;
-                    let tokens = self.select_graph_rows(&logits, &state.sampling, &lanes)?;
-                    Ok((logits, tokens))
+        let result =
+            (|| {
+                if state.activity.is_none() {
+                    state.activity = Some(input.slot.tensors()?.logical_lengths);
+                }
+                if state.decode.is_none() {
+                    let BatchGraphPositions {
+                        params,
+                        lanes,
+                        selection_positions,
+                    } = self.batch_graph_positions(&starts)?;
+                    let param_refs = params.iter().collect::<Vec<_>>();
+                    let activity = state.activity.as_ref().ok_or_else(|| {
+                        forja_sdk::Error::loading("batch activity is unavailable")
+                    })?;
+                    let graph = forja_sdk::capture(&param_refs, || {
+                        let tokens = self.batch_feedback.narrow(0, 0, state.bucket)?;
+                        let logits = self.forward_graph_rows(&tokens, &state.positions, &lanes)?;
+                        let tokens = self.select_graph_rows(
+                            &logits,
+                            &state.sampling,
+                            activity,
+                            &selection_positions,
+                        )?;
+                        Ok((logits, tokens))
+                    })?;
+                    state.decode = Some(graph);
+                }
+                let graph = state.decode.as_ref().ok_or_else(|| {
+                    forja_sdk::Error::loading("batch decode graph was not captured")
                 })?;
-                state.decode = Some(graph);
-            }
-            let graph = state
-                .decode
-                .as_ref()
-                .ok_or_else(|| forja_sdk::Error::loading("batch decode graph was not captured"))?;
-            graph.replay(
-                &starts
-                    .iter()
-                    .map(|start| start.unwrap_or(0))
-                    .collect::<Vec<_>>(),
-            )?;
-            graph.result().0.alias()
-        })();
+                graph.replay(
+                    &starts
+                        .iter()
+                        .map(|start| start.unwrap_or(0))
+                        .collect::<Vec<_>>(),
+                )?;
+                graph.result().0.alias()
+            })();
         self.batch_graphs.insert(index, state);
         result
     }
@@ -1882,43 +1935,47 @@ impl Qwen3Coder {
             .ok_or_else(|| forja_sdk::Error::loading("batch graph bucket is unavailable"))
     }
 
-    fn batch_graph_positions(
-        &self,
-        starts: &[Option<u32>],
-    ) -> Result<(Vec<Param>, Vec<Option<BatchLanePosition>>)> {
+    fn batch_graph_positions(&self, starts: &[Option<u32>]) -> Result<BatchGraphPositions> {
         let mut params = Vec::new();
         let mut lanes = Vec::with_capacity(starts.len());
+        let mut selection_positions = Vec::with_capacity(starts.len());
         for start in starts {
             let start = start.unwrap_or(0);
             let param = Param::new(0..=MAX_CONTEXT - 1)?;
+            let position = Dim::from(param.at(start));
             lanes.push(Some(BatchLanePosition {
-                start: param.at(start).into(),
+                start: position.clone(),
                 attention: self.variants.attention(1, start, Some(&param), true)?,
             }));
+            selection_positions.push(position);
             params.push(param);
         }
-        Ok((params, lanes))
+        Ok(BatchGraphPositions {
+            params,
+            lanes,
+            selection_positions,
+        })
     }
 
     fn select_graph_rows(
         &self,
         logits: &Tensor<f32>,
         sampling: &Tensor<u32>,
-        lanes: &[Option<BatchLanePosition>],
+        activity: &Tensor<u32>,
+        positions: &[Dim],
     ) -> Result<Tensor<u32>> {
-        let rows = u32::try_from(lanes.len())
+        let rows = u32::try_from(positions.len())
             .map_err(|_| forja_sdk::Error::loading("batch rows exceed u32"))?;
         let output = Tensor::zeros(&[rows])?;
         let variant = self.variants.sample()?;
-        for (lane, position) in lanes.iter().enumerate() {
-            let Some(position) = position else {
-                continue;
-            };
+        for (lane, position) in positions.iter().enumerate() {
             let lane = u32::try_from(lane)
                 .map_err(|_| forja_sdk::Error::loading("batch lane exceeds u32"))?;
-            let selected = logits.narrow(0, lane, 1)?.sample_with(
+            let row =
+                poison_padding_logits(&logits.narrow(0, lane, 1)?, &activity.narrow(0, lane, 1)?)?;
+            let selected = row.sample_with(
                 &sampling.narrow(0, lane, 1)?.reshape(&[5])?,
-                position.start.clone(),
+                position.clone(),
                 &variant,
             )?;
             selected.copy_into(&mut output.narrow(0, lane, 1)?)?;
