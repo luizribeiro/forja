@@ -1739,6 +1739,32 @@ mod tests {
         assert!(!barrier.admission_overlapped());
     }
 
+    #[tokio::test]
+    async fn lane_zero_survives_nonzero_lane_prefill() {
+        let expected = serial_output("b", 6).await;
+        let newcomer_expected = serial_output("a", 2).await;
+        let barrier = Arc::new(crate::engine::BatchTestBarrier::passive());
+        let (actor, _weights) = continuous_actor_with_barrier(Some(Arc::clone(&barrier)))
+            .await
+            .unwrap();
+        let survivor = actor
+            .complete_text(
+                text_request("b", 6),
+                GenerationControl::new(Duration::from_secs(2)),
+            )
+            .unwrap();
+        tokio::task::yield_now().await;
+        let newcomer = actor
+            .complete_text(
+                text_request("a", 2),
+                GenerationControl::new(Duration::from_secs(2)),
+            )
+            .unwrap();
+        assert_serial(&survivor.await.unwrap().unwrap(), &expected);
+        assert_serial(&newcomer.await.unwrap().unwrap(), &newcomer_expected);
+        assert!(barrier.prefill_overlap_width() >= 1);
+    }
+
     fn test_weights() -> Result<TestWeights, Box<dyn Error + Send + Sync>> {
         let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
         let nonce = NEXT_WEIGHTS.fetch_add(1, AtomicOrdering::Relaxed);
