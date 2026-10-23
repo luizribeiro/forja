@@ -994,7 +994,7 @@ impl PagedSequence {
     ///
     /// Returns an error if retaining checkpoint references fails.
     pub fn checkpoint(&self) -> Result<SequenceCheckpoint, PagePoolError> {
-        let retained_page = if self.logical_len == 0 {
+        let tail = if self.logical_len == 0 {
             None
         } else {
             let tail = usize::try_from(
@@ -1002,21 +1002,23 @@ impl PagedSequence {
             )
             .map_err(|_| PagePoolError::ArithmeticOverflow)?;
             let page = *self.pages.get(tail).ok_or(PagePoolError::CorruptState)?;
-            if self.immutable.get(tail).copied().unwrap_or(true) || self.pool.refcount(page)? > 1 {
+            let immutable = self.immutable.get(tail).copied().unwrap_or(true);
+            let retained = immutable || self.pool.refcount(page)? > 1;
+            if retained {
                 self.pool.retain(&[page])?;
-                Some(page)
-            } else {
-                None
             }
+            Some(CheckpointTail {
+                index: tail,
+                page,
+                immutable,
+                retained,
+            })
         };
         Ok(SequenceCheckpoint {
             pool: self.pool.clone(),
             sequence: Arc::clone(&self.identity),
-            pages: self.pages.clone(),
-            immutable: self.immutable.clone(),
             logical_len: self.logical_len,
-            reserved_tokens: self.reserved_tokens,
-            retained_page,
+            tail,
             active: true,
         })
     }
@@ -1033,32 +1035,27 @@ impl PagedSequence {
         {
             return Err(PagePoolError::InvalidCheckpoint);
         }
-        let replaced = self
-            .pages
-            .iter()
-            .zip(&checkpoint.pages)
-            .filter_map(|(current, saved)| (current != saved).then_some(*current))
-            .collect::<Vec<_>>();
-        if self.pages.len() != checkpoint.pages.len() {
-            return Err(PagePoolError::CorruptState);
+        if let Some(tail) = checkpoint.tail.as_mut() {
+            let current = self
+                .pages
+                .get_mut(tail.index)
+                .ok_or(PagePoolError::CorruptState)?;
+            let immutable = self
+                .immutable
+                .get_mut(tail.index)
+                .ok_or(PagePoolError::CorruptState)?;
+            if *current == tail.page {
+                if tail.retained {
+                    self.pool.release(&[tail.page])?;
+                }
+            } else {
+                self.pool.release(&[*current])?;
+                *current = tail.page;
+                tail.retained = false;
+            }
+            *immutable = tail.immutable;
         }
-        self.pool.release(&replaced)?;
-        // If COW replaced the saved tail, its retained reference becomes the restored
-        // sequence's reference; otherwise the checkpoint's extra retain must be released.
-        if checkpoint
-            .retained_page
-            .is_some_and(|page| self.pages.contains(&page))
-        {
-            self.pool.release(&[checkpoint
-                .retained_page
-                .take()
-                .ok_or(PagePoolError::CorruptState)?])?;
-        }
-        self.pages = std::mem::take(&mut checkpoint.pages);
-        self.immutable = std::mem::take(&mut checkpoint.immutable);
         self.logical_len = checkpoint.logical_len;
-        self.reserved_tokens = checkpoint.reserved_tokens;
-        checkpoint.retained_page = None;
         checkpoint.active = false;
         Ok(())
     }
@@ -1077,18 +1074,24 @@ impl Drop for PagedSequence {
 pub struct SequenceCheckpoint {
     pool: PagePool,
     sequence: Arc<()>,
-    pages: Vec<PageLease>,
-    immutable: Vec<bool>,
     logical_len: u64,
-    reserved_tokens: u64,
-    retained_page: Option<PageLease>,
+    tail: Option<CheckpointTail>,
     active: bool,
+}
+
+struct CheckpointTail {
+    index: usize,
+    page: PageLease,
+    immutable: bool,
+    retained: bool,
 }
 
 impl Drop for SequenceCheckpoint {
     fn drop(&mut self) {
-        if let Some(page) = self.retained_page {
-            let _ = self.pool.release(&[page]);
+        if let Some(tail) = &self.tail
+            && tail.retained
+        {
+            let _ = self.pool.release(&[tail.page]);
         }
     }
 }
