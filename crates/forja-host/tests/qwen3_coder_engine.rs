@@ -111,7 +111,73 @@ async fn metal_batch_tokens_match_single_lanes_exactly() -> Result<(), Box<dyn E
             .enumerate()
             .all(|(lane, &token)| lanes[lane].is_some() || token == 0)
     );
+    assert_lane_mask_changes_replay().await?;
     assert_batch_graph_modes().await?;
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+async fn assert_lane_mask_changes_replay() -> Result<(), Box<dyn Error>> {
+    let patterns = [
+        [(0_usize, 1_u32, 31_u32), (3, 4, 37), (7, 7, 41)],
+        [(1, 2, 43), (4, 5, 47), (6, 8, 53)],
+        [(0, 3, 59), (2, 6, 61), (7, 9, 67)],
+        [(1, 4, 71), (3, 7, 73), (5, 10, 79)],
+        [(0, 5, 83), (4, 8, 89), (7, 11, 97)],
+    ];
+    let mut singles = runner(test_guests::qwen3_coder()).await?;
+    let mut config = load_config()?;
+    config.paged_cache = true;
+    singles.load_with_selections(Some(1), &config).await??;
+    let mut expected = Vec::new();
+    for pattern in patterns {
+        let mut tokens = Vec::new();
+        for &(_, position, token) in &pattern {
+            let prefix = batch_prefix(&mut singles, position).await?;
+            singles.prepare_paged_lane(0, Some(prefix), 64)?;
+            tokens.push(
+                batch_decode(
+                    &mut singles,
+                    1,
+                    &[Some((position, token))],
+                    SamplingParams::default(),
+                )
+                .await?[0],
+            );
+        }
+        expected.push(tokens);
+    }
+
+    let mut batched = runner(test_guests::qwen3_coder()).await?;
+    batched.load_with_selections(Some(1), &config).await??;
+    let mut prefixes = Vec::new();
+    for pattern in patterns {
+        let mut retained = Vec::new();
+        for &(_, position, _) in &pattern {
+            retained.push(batch_prefix(&mut batched, position).await?);
+        }
+        prefixes.push(retained);
+    }
+    let prepared_before = batched.metrics().prepared_graphs;
+    for ((pattern, retained), expected) in patterns.into_iter().zip(prefixes).zip(expected) {
+        let mut lanes = vec![None; 8];
+        for ((lane, position, token), prefix) in pattern.into_iter().zip(retained) {
+            batched.prepare_paged_lane(u32::try_from(lane)?, Some(prefix), 64)?;
+            lanes[lane] = Some((position, token));
+        }
+        let actual = batch_decode(&mut batched, 8, &lanes, SamplingParams::default()).await?;
+        assert_eq!(
+            pattern.map(|(lane, _, _)| actual[lane]),
+            expected.as_slice()
+        );
+        assert!(
+            actual
+                .iter()
+                .enumerate()
+                .all(|(lane, &token)| lanes[lane].is_some() || token == 0)
+        );
+    }
+    assert_eq!(batched.metrics().prepared_graphs, prepared_before + 2);
     Ok(())
 }
 

@@ -1617,11 +1617,7 @@ impl Engine for Qwen3Coder {
             return Ok(BatchOutput { logits, tokens });
         }
         let starts = batch_starts(&input.lanes);
-        if use_batch_decode_graph(
-            self.replay,
-            input.shape.bucket,
-            input.lanes.iter().all(Option::is_some),
-        ) {
+        if use_batch_decode_graph(self.replay, input.shape.bucket) {
             return self.replay_batch_step(&input, bank);
         }
         let tokens = self.batch_tokens(&input.lanes)?;
@@ -1636,11 +1632,7 @@ impl Engine for Qwen3Coder {
         let bank = self.next_batch_bank();
         self.selection_bank = bank;
         let starts = batch_starts(&input.lanes);
-        if use_batch_decode_graph(
-            self.replay,
-            input.shape.bucket,
-            input.lanes.iter().all(Option::is_some),
-        ) {
+        if use_batch_decode_graph(self.replay, input.shape.bucket) {
             return self.replay_batch_forward(&input, bank);
         }
         let tokens = self.batch_tokens(&input.lanes)?;
@@ -1650,11 +1642,7 @@ impl Engine for Qwen3Coder {
 
     #[cfg(target_family = "wasm")]
     fn batch_select(&mut self, input: BatchSelectInput<'_>) -> Result<BatchOutput> {
-        if use_batch_decode_graph(
-            self.replay,
-            input.shape.bucket,
-            input.lanes.iter().all(Option::is_some),
-        ) {
+        if use_batch_decode_graph(self.replay, input.shape.bucket) {
             return self.replay_batch_select(&input, self.selection_bank);
         }
         let tokens = self.select_masked_batch_rows(input.logits, &input.lanes)?;
@@ -1713,8 +1701,8 @@ fn prompt_end(start: u32, sequence: u32) -> Result<u32> {
         .ok_or_else(|| forja_sdk::Error::loading("prompt position overflowed"))
 }
 
-const fn use_batch_decode_graph(replay: bool, bucket: u32, dense: bool) -> bool {
-    replay && bucket <= ACTIVE_LANES && dense
+const fn use_batch_decode_graph(replay: bool, bucket: u32) -> bool {
+    replay && bucket <= ACTIVE_LANES
 }
 
 #[cfg(target_family = "wasm")]
@@ -2463,12 +2451,11 @@ mod tests {
     }
 
     #[test]
-    fn captures_every_declared_dense_decode_bucket() {
-        assert!(use_batch_decode_graph(true, 1, true));
-        assert!(use_batch_decode_graph(true, 4, true));
-        assert!(use_batch_decode_graph(true, 8, true));
-        assert!(!use_batch_decode_graph(true, 9, true));
-        assert!(!use_batch_decode_graph(true, 4, false));
-        assert!(!use_batch_decode_graph(false, 4, true));
+    fn captures_every_declared_decode_bucket() {
+        assert!(use_batch_decode_graph(true, 1));
+        assert!(use_batch_decode_graph(true, 4));
+        assert!(use_batch_decode_graph(true, 8));
+        assert!(!use_batch_decode_graph(true, 9));
+        assert!(!use_batch_decode_graph(false, 4));
     }
 }
