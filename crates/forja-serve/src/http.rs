@@ -1627,6 +1627,28 @@ mod tests {
         .unwrap()
     }
 
+    fn forced_tool_request(max_tokens: u32) -> ChatCompletionRequest {
+        serde_json::from_value(serde_json::json!({
+            "model": "smoke",
+            "messages": [{"role": "user", "content": "a"}],
+            "max_tokens": max_tokens,
+            "temperature": 0.0,
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "tool",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {},
+                        "additionalProperties": false
+                    }
+                }
+            }],
+            "tool_choice": "required"
+        }))
+        .unwrap()
+    }
+
     async fn actor_completion(
         actor: &ContinuousActor,
         prompt: &str,
@@ -1784,6 +1806,40 @@ mod tests {
         assert!(first.await.unwrap().is_err());
         assert!(peer.await.unwrap().is_err());
         assert_serial(&actor_completion(&actor, "b", 6).await.unwrap(), &expected);
+    }
+
+    #[tokio::test]
+    async fn constrained_generation_yields_to_ordinary_batches() {
+        let expected = serial_output("b", 2).await;
+        let barrier = Arc::new(crate::engine::BatchTestBarrier::new());
+        let (actor, _weights) = continuous_actor_with_barrier(Some(Arc::clone(&barrier)))
+            .await
+            .unwrap();
+        let constrained = actor
+            .complete(
+                forced_tool_request(16),
+                GenerationControl::new(Duration::from_secs(2)),
+            )
+            .unwrap();
+        barrier.reached().await;
+        let ordinary = actor
+            .complete_text(
+                text_request("b", 2),
+                GenerationControl::new(Duration::from_secs(2)),
+            )
+            .unwrap();
+        barrier.release();
+
+        assert_serial(&ordinary.await.unwrap().unwrap(), &expected);
+        assert_eq!(
+            constrained.await.unwrap().unwrap().finish_reason,
+            FinishReason::Length
+        );
+        let (ordinary, constrained) = barrier.finish_order();
+        assert!(
+            ordinary > 0 && ordinary < constrained,
+            "finish order was ordinary={ordinary}, constrained={constrained}"
+        );
     }
 
     fn test_weights() -> Result<TestWeights, Box<dyn Error + Send + Sync>> {

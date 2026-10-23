@@ -462,7 +462,6 @@ pub(crate) struct BatchTestBarrier {
 }
 
 #[cfg(test)]
-#[allow(dead_code)]
 impl BatchTestBarrier {
     pub(crate) const fn new() -> Self {
         Self::with_armed(true)
