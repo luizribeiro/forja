@@ -43,6 +43,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "continuous-chat-format-smoke"
+version = "0.0.0"
+dependencies = [
+ "wit-bindgen",
+]
+
+[[package]]
 name = "crunchy"
 version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"

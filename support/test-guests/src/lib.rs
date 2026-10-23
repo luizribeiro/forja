@@ -21,6 +21,12 @@ pub fn custom_chat_format() -> &'static Path {
     Path::new(env!("CUSTOM_CHAT_FORMAT"))
 }
 
+/// Returns the path to the chat format used by continuous-serving tests.
+#[must_use]
+pub fn continuous_chat_format() -> &'static Path {
+    Path::new(env!("CONTINUOUS_CHAT_FORMAT"))
+}
+
 /// Returns the path to the minimal engine component.
 #[must_use]
 pub fn engine_smoke() -> &'static Path {
