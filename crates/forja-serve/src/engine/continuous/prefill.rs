@@ -6,6 +6,7 @@ use forja_host::{
 use super::lane::BatchLane;
 use super::{PreparedRequest, batch_admission_error, read_batch_tokens};
 use crate::engine::{GenerationError, ServingEngine, sampling_seed};
+use crate::metrics::observe;
 
 impl<B> ServingEngine<B>
 where
@@ -61,6 +62,7 @@ where
         let reserved = u64::from(request.prompt_tokens)
             .checked_add(u64::from(request.params.max_tokens))
             .ok_or_else(|| GenerationError::new("paged reservation overflowed"))?;
+        let match_started = std::time::Instant::now();
         let hit = self
             .prefix_index
             .as_mut()
@@ -70,6 +72,17 @@ where
             .map_err(|error| GenerationError::unavailable(error.to_string()))?
             .flatten();
         let cached = hit.as_ref().map_or(0, |hit| hit.cached_tokens);
+        self.metrics.requests = self.metrics.requests.saturating_add(1);
+        observe(&mut self.metrics.match_time, match_started.elapsed());
+        if cached == 0 {
+            self.metrics.misses = self.metrics.misses.saturating_add(1);
+        } else {
+            self.metrics.hits = self.metrics.hits.saturating_add(1);
+            self.metrics.reused_tokens = self
+                .metrics
+                .reused_tokens
+                .saturating_add(u64::try_from(cached).unwrap_or(u64::MAX));
+        }
         let saved = if slot == 0 {
             None
         } else {
@@ -94,7 +107,12 @@ where
             .map_err(|error| batch_admission_error(&error))?;
         let cached = u32::try_from(cached)
             .map_err(|_| GenerationError::new("cached prefix length overflowed"))?;
+        let prefill_started = std::time::Instant::now();
         let output = self.run_prompt_chunks(suffix, cached, sampling).await;
+        observe(
+            &mut self.metrics.suffix_prefill_time,
+            prefill_started.elapsed(),
+        );
         if slot == 0 {
             return output.map(|token| (cached, token));
         }
