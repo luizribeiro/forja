@@ -303,6 +303,7 @@ fn engine_batch_helpers() -> proc_macro2::TokenStream {
         ) -> ::std::result::Result<::forja_sdk::BatchInput<'a>, compute::Error> {
             let lanes = input.lanes.into_iter().map(|lane| lane.map(|lane| {
                 Ok(::forja_sdk::BatchLane {
+                    slot: lane.slot,
                     tokens: lane.tokens.as_deref().map(token_tensor).transpose()?,
                     start_pos: lane.start_pos,
                     sampling: sampling(lane.sampling),

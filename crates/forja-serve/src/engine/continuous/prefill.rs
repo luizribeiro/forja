@@ -179,6 +179,7 @@ where
                 .enqueue_batch_step(EngineBatch {
                     shape,
                     lanes: vec![Some(EngineBatchLane {
+                        slot: 0,
                         tokens: Some(tokens[..count].to_vec()),
                         start_pos,
                         sampling,

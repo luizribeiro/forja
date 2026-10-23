@@ -565,6 +565,7 @@ fn batch_inputs(
             .get_mut(slot)
             .ok_or_else(|| GenerationError::new("decode lane exceeds its bucket"))?;
         *input = Some(EngineBatchLane {
+            slot: lane.slot,
             tokens: (!feedback.contains(&lane.slot)).then(|| vec![lane.pending_token]),
             start_pos: if feedback.contains(&lane.slot) {
                 lane.position

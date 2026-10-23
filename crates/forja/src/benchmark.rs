@@ -1343,6 +1343,7 @@ async fn prepare_batch_prefix(
             .batch_step(EngineBatch {
                 shape,
                 lanes: vec![Some(EngineBatchLane {
+                    slot: 0,
                     tokens: Some(chunk.to_vec()),
                     start_pos: u32::try_from(start)?,
                     sampling: SamplingParams::default(),
@@ -1427,6 +1428,7 @@ async fn run_batch_decode_step(
                 .and_then(|position| position.checked_sub(u32::from(seed)))
                 .ok_or("batch benchmark position overflowed")?;
             Ok(Some(EngineBatchLane {
+                slot: u32::try_from(lane)?,
                 tokens: Some(vec![tokens[lane]]),
                 start_pos: start,
                 sampling,

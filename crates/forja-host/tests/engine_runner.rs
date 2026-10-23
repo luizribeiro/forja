@@ -107,6 +107,7 @@ fn combined_batch(token: u32) -> EngineBatch {
         },
         lanes: vec![
             Some(EngineBatchLane {
+                slot: 0,
                 tokens: Some(vec![token]),
                 start_pos: 0,
                 sampling: SamplingParams::default(),
@@ -130,6 +131,7 @@ async fn runs_a_forward_only_batch() -> wasmtime::Result<()> {
             },
             lanes: vec![
                 Some(EngineBatchLane {
+                    slot: 0,
                     tokens: Some(vec![1]),
                     start_pos: 0,
                     sampling: SamplingParams::default(),

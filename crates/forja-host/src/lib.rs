@@ -305,6 +305,8 @@ pub struct EngineDecode {
 /// One active lane in a homogeneous engine batch.
 #[derive(Clone, Debug, PartialEq)]
 pub struct EngineBatchLane {
+    /// Physical paged-cache slot owned by this lane.
+    pub slot: u32,
     /// Tokens to process, or `None` to reuse retained feedback during decode.
     pub tokens: Option<Vec<u32>>,
     /// Absolute position assigned to the first token.
@@ -776,7 +778,7 @@ fn validate_batch_shapes(serving: &ServingInfo) -> Result<(), compute::Error> {
                 if shape.bucket != 1 || shape.selection != BatchSelection::Combined =>
             {
                 return Err(compute::Error::Layout(
-                    "prompt batch shapes must be single-lane combined graphs".to_owned(),
+                    "prompt batch shapes must be single-row combined graphs".to_owned(),
                 ));
             }
             BatchPhase::Decode if shape.tokens != 1 => {
@@ -815,11 +817,21 @@ pub fn validate_batch_lanes(
     }
     let mut active = 0_u32;
     let mut appended = Vec::with_capacity(lanes.len());
-    for lane in lanes {
+    let mut slots = Vec::new();
+    for (row, lane) in lanes.iter().enumerate() {
         let Some(lane) = lane else {
             appended.push(0);
             continue;
         };
+        if lane.slot >= serving.active_lanes
+            || slots.contains(&lane.slot)
+            || (shape.phase == BatchPhase::Decode && usize::try_from(lane.slot).ok() != Some(row))
+        {
+            return Err(compute::Error::Layout(
+                "batch lane slot is invalid or duplicated".to_owned(),
+            ));
+        }
+        slots.push(lane.slot);
         active = active
             .checked_add(1)
             .ok_or_else(|| compute::Error::Layout("active lane count overflowed".to_owned()))?;
@@ -936,6 +948,7 @@ impl From<EngineBatch> for engine_bindings::exports::l9o::gpu::engine::BatchIn {
                 .into_iter()
                 .map(|lane| {
                     lane.map(|lane| BatchLane {
+                        slot: lane.slot,
                         tokens: lane.tokens,
                         start_pos: lane.start_pos,
                         sampling: WitSampling {
@@ -1632,7 +1645,10 @@ where
         if let Err(error) = self.store.data_mut().select_paged_batch_bank(slot) {
             return Ok(Err(error));
         }
-        let mut checkpoints = match self.prepare_batch_appends(pool, &input, &appended).await {
+        let mut checkpoints = match self
+            .prepare_batch_appends(pool, serving.active_lanes, &input, &appended)
+            .await
+        {
             Ok(checkpoints) => checkpoints,
             Err(error) => return Ok(Err(error)),
         };
@@ -1822,7 +1838,10 @@ where
         if let Err(error) = self.store.data_mut().select_paged_batch_bank(slot) {
             return Ok(Err(error));
         }
-        let mut checkpoints = match self.prepare_batch_appends(pool, &input, &appended).await {
+        let mut checkpoints = match self
+            .prepare_batch_appends(pool, serving.active_lanes, &input, &appended)
+            .await
+        {
             Ok(checkpoints) => checkpoints,
             Err(error) => return Ok(Err(error)),
         };
@@ -1896,17 +1915,17 @@ where
     async fn prepare_batch_appends(
         &mut self,
         pool: u32,
+        active_lanes: u32,
         input: &EngineBatch,
         appended: &[u32],
-    ) -> Result<Vec<Option<SequenceCheckpoint>>, compute::Error> {
+    ) -> Result<Vec<Option<(u32, SequenceCheckpoint)>>, compute::Error> {
         let mut checkpoints = Vec::with_capacity(input.lanes.len());
-        for (lane_index, (input_lane, &tokens)) in input.lanes.iter().zip(appended).enumerate() {
-            let lane = u32::try_from(lane_index)
-                .map_err(|_| compute::Error::Layout("batch lane exceeds u32".to_owned()))?;
+        for (input_lane, &tokens) in input.lanes.iter().zip(appended) {
             let Some(input_lane) = input_lane else {
                 checkpoints.push(None);
                 continue;
             };
+            let lane = input_lane.slot;
             let prepared = self.store.data_mut().begin_paged_lane_append(
                 pool,
                 lane,
@@ -1931,14 +1950,19 @@ where
                 self.rollback_batch_appends(pool, &mut checkpoints)?;
                 return Err(error);
             }
-            checkpoints.push(checkpoint);
+            checkpoints.push(checkpoint.map(|checkpoint| (lane, checkpoint)));
         }
-        let metadata = input
-            .lanes
-            .iter()
-            .zip(appended)
-            .map(|(lane, &tokens)| lane.as_ref().map(|lane| (lane.start_pos, tokens)))
-            .collect::<Vec<_>>();
+        let mut metadata = vec![None; usize::try_from(active_lanes).unwrap_or(usize::MAX)];
+        for (lane, &tokens) in input.lanes.iter().zip(appended) {
+            let Some(lane) = lane else {
+                continue;
+            };
+            let slot = usize::try_from(lane.slot)
+                .map_err(|_| compute::Error::Layout("batch lane exceeds usize".to_owned()))?;
+            *metadata.get_mut(slot).ok_or_else(|| {
+                compute::Error::Layout("batch lane exceeds metadata".to_owned())
+            })? = Some((lane.start_pos, tokens));
+        }
         if let Err(error) = self
             .store
             .data_mut()
@@ -1953,14 +1977,12 @@ where
     fn finish_batch_appends(
         &mut self,
         pool: u32,
-        checkpoints: Vec<Option<SequenceCheckpoint>>,
+        checkpoints: Vec<Option<(u32, SequenceCheckpoint)>>,
     ) -> Result<(), compute::Error> {
-        for (lane_index, checkpoint) in checkpoints.into_iter().enumerate() {
-            let Some(checkpoint) = checkpoint else {
+        for checkpoint in checkpoints {
+            let Some((lane, checkpoint)) = checkpoint else {
                 continue;
             };
-            let lane = u32::try_from(lane_index)
-                .map_err(|_| compute::Error::Layout("batch lane exceeds u32".to_owned()))?;
             let _ = self
                 .store
                 .data_mut()
@@ -1972,12 +1994,10 @@ where
     fn rollback_batch_appends(
         &mut self,
         pool: u32,
-        checkpoints: &mut [Option<SequenceCheckpoint>],
+        checkpoints: &mut [Option<(u32, SequenceCheckpoint)>],
     ) -> Result<(), compute::Error> {
-        for (lane, checkpoint) in checkpoints.iter_mut().enumerate() {
-            if let Some(checkpoint) = checkpoint.take() {
-                let lane = u32::try_from(lane)
-                    .map_err(|_| compute::Error::Layout("batch lane exceeds u32".to_owned()))?;
+        for checkpoint in checkpoints {
+            if let Some((lane, checkpoint)) = checkpoint.take() {
                 self.store
                     .data_mut()
                     .rollback_paged_lane_append(pool, lane, checkpoint)?;
@@ -8703,8 +8723,9 @@ mod tests {
             max_context: 32,
             batch_shapes: vec![shape],
         };
-        let lane = |start_pos| {
+        let lane = |slot, start_pos| {
             Some(EngineBatchLane {
+                slot,
                 tokens: Some(vec![1]),
                 start_pos,
                 sampling: SamplingParams::default(),
@@ -8712,16 +8733,27 @@ mod tests {
         };
 
         assert_eq!(
-            validate_batch_lanes(&serving, shape, &[lane(7), None], BatchSelection::Combined,)
-                .unwrap(),
+            validate_batch_lanes(
+                &serving,
+                shape,
+                &[lane(0, 7), None],
+                BatchSelection::Combined,
+            )
+            .unwrap(),
             [1, 0]
         );
         assert!(
-            validate_batch_lanes(&serving, shape, &[lane(7)], BatchSelection::Combined,).is_err()
+            validate_batch_lanes(&serving, shape, &[lane(0, 7)], BatchSelection::Combined,)
+                .is_err()
         );
         assert!(
-            validate_batch_lanes(&serving, shape, &[lane(32), None], BatchSelection::Combined,)
-                .is_err()
+            validate_batch_lanes(
+                &serving,
+                shape,
+                &[lane(0, 32), None],
+                BatchSelection::Combined,
+            )
+            .is_err()
         );
         assert!(
             validate_batch_output_layouts((DType::F32, &[2, 4]), (DType::U32, &[2]), 2, 4,).is_ok()

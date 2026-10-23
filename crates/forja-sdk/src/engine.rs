@@ -211,6 +211,8 @@ pub struct DecodeOutput {
 
 /// One active lane in a homogeneous decode batch.
 pub struct BatchLane {
+    /// Physical paged-cache slot owned by this lane.
+    pub slot: u32,
     /// Tokens to process, or `None` to reuse the lane's retained feedback token.
     pub tokens: Option<Tensor<u32>>,
     /// Absolute position assigned to the first token.

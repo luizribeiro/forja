@@ -136,6 +136,7 @@ async fn assert_batch_graph_modes() -> Result<(), Box<dyn Error>> {
     };
     let lanes = [(1, 31), (4, 37)].map(|(start_pos, token)| {
         Some(EngineBatchLane {
+            slot: start_pos / 4,
             tokens: Some(vec![token]),
             start_pos,
             sampling: SamplingParams::default(),
@@ -764,6 +765,7 @@ async fn batch_prefix(
                 selection: BatchSelection::Combined,
             },
             lanes: vec![Some(EngineBatchLane {
+                slot: 0,
                 tokens: Some(tokens),
                 start_pos: 0,
                 sampling: SamplingParams::default(),
@@ -793,8 +795,10 @@ async fn batch_decode(
             },
             lanes: lanes
                 .iter()
-                .map(|lane| {
+                .enumerate()
+                .map(|(slot, lane)| {
                     lane.map(|(start_pos, token)| EngineBatchLane {
+                        slot: u32::try_from(slot).unwrap(),
                         tokens: Some(vec![token]),
                         start_pos,
                         sampling,

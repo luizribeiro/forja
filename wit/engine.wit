@@ -102,6 +102,7 @@ interface engine {
   }
 
   record batch-lane {
+    slot: u32,
     tokens: option<list<u32>>,
     start-pos: u32,
     sampling: sampling-params,
