@@ -74,21 +74,21 @@ workload produced:
 
 | Server | c1 output tok/s | c2 | c4 | c8 | c4/c1 | c1/c4 streaming p99 ITL |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Forja | 75.34 | 114.52 | 160.80 | 155.07 | 2.13x | 17.82 / 31.41 ms |
+| Forja | 102.79 | 155.51 | 209.38 | 147.40 | 2.04x | 13.02 / 30.12 ms |
 | mlx_lm 0.31.3 | 104.11 | 104.20 | 104.13 | 104.04 | 1.00x | 9.80 / 9.81 ms |
 
-Forja therefore passes the concurrency gate: concurrency-four aggregate decode is 2.13x its
-concurrency-one result, while p99 ITL is 1.76x. Both servers completed the 33-case, 3,240-request
-suite with no errors, 150 requested stream cancellations, and identical serial-versus-concurrent
-outputs for every comparable greedy and seeded case. At concurrency four, Forja served 1.256
-requests/s and 41.46 prompt tok/s; streaming measured 1.797 requests/s, 73.66 prompt tok/s, 158.10
-output tok/s, 323.94 ms p99 TTFT, and 2.498 s p99 end-to-end latency. The corresponding MLX
+Forja passes the concurrency gate: concurrency-four aggregate decode is 2.04x its concurrency-one
+result, while streaming p99 ITL is 2.31x. It completed the 33-case, 3,240-request suite with no
+errors and 150 requested stream cancellations, and all 20 comparable serial-versus-concurrent
+greedy and seeded outputs matched. At concurrency four, Forja served 1.636 requests/s and 53.98
+prompt tok/s; streaming measured 2.315 requests/s, 94.93 prompt tok/s, 203.74 output tok/s,
+109.86 ms p99 TTFT, and 1.734 s p99 end-to-end latency. The corresponding MLX
 streaming result was 0.811 requests/s, 33.23 prompt tok/s, 103.75 output tok/s, 3.796 s p99 TTFT,
 and 4.952 s p99 end-to-end latency.
 
 The representative Forja concurrency-four case reported a 3,221,227,520-byte pool, a 384-byte
-table, zero pool-attributed graph and scratch bytes, 17.42 GiB RSS, 72.89 GPU seconds, 95.52
-scheduler seconds, and 6.31 queue seconds. MLX reported 16.39 GiB RSS; its server does not expose
+table, zero pool-attributed graph and scratch bytes, 17.47 GiB RSS, 70.89 GPU seconds, 73.34
+scheduler seconds, and 4.64 queue seconds. MLX reported 16.39 GiB RSS; its server does not expose
 the corresponding device-memory, GPU-time, or host-phase counters. Per-case request, token,
 TTFT/ITL/end-to-end percentile, cache, memory, GPU, host-phase, error, cancellation, configuration,
 and provenance data are in `serving-concurrency.json` and `serving-concurrency-mlx.json` beside the
