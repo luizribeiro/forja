@@ -997,8 +997,17 @@ fn error_value(message: &str, error_type: &str) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write;
+    use std::{
+        error::Error,
+        fs,
+        io::Write,
+        path::PathBuf,
+        sync::atomic::{AtomicU64, Ordering as AtomicOrdering},
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
+    use forja_host::{EngineLoadConfig, EngineRunner, Limits};
+    use tokenizers::{Tokenizer, decoders::byte_level::ByteLevel, models::bpe::BPE};
     use tracing_subscriber::fmt::MakeWriter;
 
     use super::*;
@@ -1534,5 +1543,161 @@ mod tests {
     fn futures_poll_once<F: Future>(future: Pin<&mut F>) -> std::task::Poll<F::Output> {
         let mut context = std::task::Context::from_waker(std::task::Waker::noop());
         future.poll(&mut context)
+    }
+
+    type ContinuousActor = ServiceActor<crate::ServingEngine<forja_cpu::CpuBackend>>;
+    static NEXT_WEIGHTS: AtomicU64 = AtomicU64::new(0);
+
+    struct TestWeights {
+        directory: PathBuf,
+        path: PathBuf,
+    }
+
+    impl Drop for TestWeights {
+        fn drop(&mut self) {
+            drop(fs::remove_dir_all(&self.directory));
+        }
+    }
+
+    async fn continuous_actor()
+    -> Result<(ContinuousActor, TestWeights), Box<dyn Error + Send + Sync>> {
+        continuous_actor_with_barrier(None).await
+    }
+
+    async fn continuous_actor_with_barrier(
+        barrier: Option<Arc<crate::engine::BatchTestBarrier>>,
+    ) -> Result<(ContinuousActor, TestWeights), Box<dyn Error + Send + Sync>> {
+        let weights = test_weights()?;
+        let mut runner = EngineRunner::new(
+            test_guests::engine_smoke(),
+            forja_cpu::CpuBackend::new(),
+            Limits::new(1024 * 1024, 4, 1024, 128, 1024 * 1024),
+            &weights.path,
+        )
+        .await?;
+        let info = runner.describe().await?;
+        runner
+            .load_with_selections(
+                None,
+                &EngineLoadConfig {
+                    paged_cache: true,
+                    ..EngineLoadConfig::default()
+                },
+            )
+            .await??;
+        let vocab = [
+            ("a".to_owned(), 0),
+            ("b".to_owned(), 1),
+            ("c".to_owned(), 2),
+            ("d".to_owned(), 3),
+        ];
+        let model = BPE::builder().vocab_and_merges(vocab, Vec::new()).build()?;
+        let mut tokenizer = Tokenizer::new(model);
+        tokenizer.with_decoder(Some(ByteLevel::default()));
+        let chat_format = crate::ChatFormat::load(
+            test_guests::continuous_chat_format(),
+            crate::ChatFormatLimits::default(),
+        )?;
+        let mut config = forja_config::HostConfig::default();
+        config.server.queue_length = 16;
+        let mut engine = crate::ServingEngine::new(
+            "smoke".to_owned(),
+            runner,
+            tokenizer,
+            chat_format,
+            config,
+            info,
+            32,
+            16,
+            crate::PrefixIdentity::new(["engine", "profile", "weights", "tokenizer", "chat"])?,
+        )?;
+        if let Some(barrier) = barrier {
+            engine.set_batch_test_barrier(barrier);
+        }
+        Ok((ServiceActor::spawn(engine, 16), weights))
+    }
+
+    fn text_request(prompt: &str, max_tokens: u32) -> CompletionRequest {
+        serde_json::from_value(serde_json::json!({
+            "model": "smoke",
+            "prompt": prompt,
+            "max_tokens": max_tokens,
+            "temperature": 0.0
+        }))
+        .unwrap()
+    }
+
+    async fn actor_completion(
+        actor: &ContinuousActor,
+        prompt: &str,
+        max_tokens: u32,
+    ) -> Result<Completion, GenerationError> {
+        actor
+            .complete_text(
+                text_request(prompt, max_tokens),
+                GenerationControl::new(Duration::from_secs(2)),
+            )
+            .unwrap()
+            .await
+            .unwrap()
+    }
+
+    async fn serial_output(prompt: &str, max_tokens: u32) -> (Vec<u8>, Vec<u32>) {
+        let (actor, _weights) = continuous_actor().await.unwrap();
+        let completion = actor_completion(&actor, prompt, max_tokens).await.unwrap();
+        (
+            completion.text.as_bytes().to_vec(),
+            completion.token_ids().to_vec(),
+        )
+    }
+
+    fn assert_serial(completion: &Completion, expected: &(Vec<u8>, Vec<u32>)) {
+        assert_eq!(completion.text.as_bytes(), expected.0);
+        assert_eq!(completion.token_ids(), expected.1);
+    }
+
+    #[tokio::test]
+    async fn cancelling_one_submitted_lane_preserves_its_peer() {
+        let expected = serial_output("b", 6).await;
+        let (actor, _weights) = continuous_actor().await.unwrap();
+        let control = GenerationControl::new(Duration::from_secs(2));
+        let (events, mut received) = mpsc::channel(1);
+        let cancelled = actor
+            .stream_text(text_request("a", 8), events, control.clone())
+            .unwrap();
+        let survivor = actor
+            .complete_text(
+                text_request("b", 6),
+                GenerationControl::new(Duration::from_secs(2)),
+            )
+            .unwrap();
+        received.recv().await.unwrap();
+        control.cancel();
+        assert!(cancelled.await.unwrap().is_err());
+        assert_serial(&survivor.await.unwrap().unwrap(), &expected);
+    }
+
+    fn test_weights() -> Result<TestWeights, Box<dyn Error + Send + Sync>> {
+        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let nonce = NEXT_WEIGHTS.fetch_add(1, AtomicOrdering::Relaxed);
+        let directory = std::env::temp_dir().join(format!(
+            "forja-continuous-serving-{}-{timestamp}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir(&directory)?;
+        let path = directory.join("weights.safetensors");
+        fs::write(&path, empty_safetensors())?;
+        Ok(TestWeights { directory, path })
+    }
+
+    fn empty_safetensors() -> Vec<u8> {
+        let mut header = br#"{"value":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#.to_vec();
+        while !(header.len() + 8).is_multiple_of(8) {
+            header.push(b' ');
+        }
+        let mut bytes = u64::try_from(header.len()).unwrap().to_le_bytes().to_vec();
+        bytes.extend(header);
+        bytes.extend_from_slice(&0_f32.to_le_bytes());
+        bytes
     }
 }

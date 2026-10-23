@@ -949,6 +949,7 @@ dependencies = [
  "axum",
  "forja-config",
  "forja-core",
+ "forja-cpu",
  "forja-host",
  "llguidance",
  "serde",

@@ -445,12 +445,10 @@ pub struct ServingEngine<B: Backend + Send + Sync + 'static> {
     metrics: ServingMetrics,
     scheduler: SchedulerConfig,
     #[cfg(test)]
-    #[allow(dead_code)]
     batch_test_barrier: Option<Arc<BatchTestBarrier>>,
 }
 
 #[cfg(test)]
-#[allow(dead_code)]
 pub(crate) struct BatchTestBarrier {
     armed: AtomicBool,
     admission_overlapped: AtomicBool,
@@ -695,6 +693,11 @@ where
             #[cfg(test)]
             batch_test_barrier: None,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_batch_test_barrier(&mut self, barrier: Arc<BatchTestBarrier>) {
+        self.batch_test_barrier = Some(barrier);
     }
 
     /// Returns the only model identifier accepted by this engine.
