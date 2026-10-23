@@ -96,6 +96,13 @@ def test_suite_accepts_required_tool_choice() -> None:
     assert http_client.request_body(tools | {"prompt_tokens": 33}, "model")["tool_choice"] == "required"
 
 
+def test_http_client_omits_seed_only_for_batchable_greedy_requests() -> None:
+    greedy = {"route": "chat", "prompt_tokens": 7, "output_tokens": 2, "sampling": "greedy"}
+    seeded = greedy | {"sampling": "seeded"}
+    assert "seed" not in http_client.request_body(greedy, "model")
+    assert http_client.request_body(seeded, "model")["seed"] == 17
+
+
 def test_http_client_reuses_openai_transport_and_measures_sse() -> None:
     server = ThreadingHTTPServer(("127.0.0.1", 0), FakeServer)
     thread = threading.Thread(target=server.serve_forever)

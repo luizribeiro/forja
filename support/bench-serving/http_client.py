@@ -150,7 +150,7 @@ def request_body(case: dict[str, object], model: str) -> dict[str, object]:
     else:
         body["prompt"] = text
     if case["sampling"] == "greedy":
-        body.update({"temperature": 0.0, "top_k": 0, "top_p": 1.0, "seed": 0})
+        body.update({"temperature": 0.0, "top_k": 0, "top_p": 1.0})
     elif case["sampling"] == "seeded":
         body.update({"temperature": 0.7, "top_k": 20, "top_p": 0.8, "seed": 17})
     if case.get("stream"):
