@@ -74,21 +74,27 @@ workload produced:
 
 | Server | c1 output tok/s | c2 | c4 | c8 | c4/c1 | c1/c4 streaming p99 ITL |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Forja | 102.79 | 155.51 | 209.38 | 147.40 | 2.04x | 13.02 / 30.12 ms |
-| mlx_lm 0.31.3 | 104.11 | 104.20 | 104.13 | 104.04 | 1.00x | 9.80 / 9.81 ms |
+| Forja | 104.20 | 151.33 | 205.23 | 163.51 | 1.97x | 9.99 / 19.06 ms |
+| mlx_lm 0.31.3 | 91.51 | 152.36 | 235.05 | 337.69 | 2.57x | 10.94 / 15.19 ms |
 
-Forja passes the concurrency gate: concurrency-four aggregate decode is 2.04x its concurrency-one
-result, while streaming p99 ITL is 2.31x. It completed the 33-case, 3,240-request suite with no
-errors and 150 requested stream cancellations, and all 20 comparable serial-versus-concurrent
-greedy and seeded outputs matched. At concurrency four, Forja served 1.636 requests/s and 53.98
-prompt tok/s; streaming measured 2.315 requests/s, 94.93 prompt tok/s, 203.74 output tok/s,
-109.86 ms p99 TTFT, and 1.734 s p99 end-to-end latency. The corresponding MLX
-streaming result was 0.811 requests/s, 33.23 prompt tok/s, 103.75 output tok/s, 3.796 s p99 TTFT,
-and 4.952 s p99 end-to-end latency.
+Forja passes the concurrency gate: streaming concurrency-four aggregate decode is 1.99x its
+concurrency-one result, while p99 ITL is 1.91x. It completed the 34-case, 3,360-request suite with
+no errors and 150 requested stream cancellations, and all 21 comparable serial-versus-concurrent
+outputs matched. At concurrency four, Forja served 1.603 requests/s and 52.91 prompt tok/s;
+streaming measured 2.315 requests/s, 94.93 prompt tok/s, 203.76 output tok/s, 137.56 ms p99 TTFT,
+and 1.734 s p99 end-to-end latency. The corresponding mlx_lm streaming result was 2.551
+requests/s, 104.58 prompt tok/s, 218.08 output tok/s, 716.09 ms p99 TTFT, and 2.263 s p99
+end-to-end latency.
 
-The representative Forja concurrency-four case reported a 3,221,227,520-byte pool, a 384-byte
-table, zero pool-attributed graph and scratch bytes, 17.47 GiB RSS, 70.89 GPU seconds, 73.34
-scheduler seconds, and 4.64 queue seconds. MLX reported 16.39 GiB RSS; its server does not expose
+mlx_lm ran with `--decode-concurrency 32 --prompt-concurrency 8`. Its greedy throughput scales
+with client concurrency, confirming that its batched path ran, but only 13 of 21 concurrent outputs
+matched their serial references. Seeded sampling is not batchable on mlx_lm: its c1/c4 throughput
+was 98.17/98.21 output tok/s. Forja's seeded c1/c4 throughput was 103.55/203.89 output tok/s and
+the concurrent output matched serial.
+
+The representative Forja concurrency-four case reported a 3,271,559,200-byte pool, a 384-byte
+table, zero pool-attributed graph and scratch bytes, 17.60 GiB RSS, 71.93 GPU seconds, 74.84
+scheduler seconds, and 4.18 queue seconds. mlx_lm reported 16.49 GiB RSS; its server does not expose
 the corresponding device-memory, GPU-time, or host-phase counters. Per-case request, token,
 TTFT/ITL/end-to-end percentile, cache, memory, GPU, host-phase, error, cancellation, configuration,
 and provenance data are in `serving-concurrency.json` and `serving-concurrency-mlx.json` beside the
