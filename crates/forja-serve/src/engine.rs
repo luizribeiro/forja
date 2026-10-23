@@ -454,6 +454,7 @@ pub struct ServingEngine<B: Backend + Send + Sync + 'static> {
 pub(crate) struct BatchTestBarrier {
     armed: AtomicBool,
     admission_overlapped: AtomicBool,
+    prefill_overlap_width: AtomicU64,
     reached: Notify,
     resume: Notify,
     finish_sequence: AtomicU64,
@@ -468,6 +469,7 @@ impl BatchTestBarrier {
         Self {
             armed: AtomicBool::new(true),
             admission_overlapped: AtomicBool::new(false),
+            prefill_overlap_width: AtomicU64::new(0),
             reached: Notify::const_new(),
             resume: Notify::const_new(),
             finish_sequence: AtomicU64::new(0),
@@ -488,6 +490,10 @@ impl BatchTestBarrier {
         self.admission_overlapped.load(Ordering::Acquire)
     }
 
+    pub(crate) fn prefill_overlap_width(&self) -> u64 {
+        self.prefill_overlap_width.load(Ordering::Acquire)
+    }
+
     pub(crate) fn finish_order(&self) -> (u64, u64) {
         (
             self.ordinary_finished.load(Ordering::Acquire),
@@ -506,6 +512,11 @@ impl BatchTestBarrier {
 
     fn note_admission_overlap(&self) {
         self.admission_overlapped.store(true, Ordering::Release);
+    }
+
+    fn note_prefill_overlap(&self, width: usize) {
+        self.prefill_overlap_width
+            .fetch_max(u64::try_from(width).unwrap_or(u64::MAX), Ordering::AcqRel);
     }
 
     async fn pause_once(&self) {

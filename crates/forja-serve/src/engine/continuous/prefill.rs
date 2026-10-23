@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use forja_core::Backend;
 use forja_host::{
     BatchPhase, BatchSelection, BatchShape, EngineBatch, EngineBatchLane, EngineBatchOutput,

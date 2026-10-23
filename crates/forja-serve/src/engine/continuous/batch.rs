@@ -52,34 +52,93 @@ impl<B> ServingEngine<B>
 where
     B: Backend + Send + Sync + 'static,
 {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the loop keeps successor ownership and admission ordering visible in one place"
+    )]
     pub(super) async fn run_batch_lanes(
         &mut self,
         receiver: &mut mpsc::Receiver<ServiceCommand>,
         pending: &mut VecDeque<RequestEnvelope>,
     ) {
+        let Ok(mut policy) = SchedulerPolicy::new(
+            self.scheduler.decode_buckets.clone(),
+            usize::try_from(self.scheduler.active_lanes).unwrap_or(usize::MAX),
+            self.scheduler.prompt_token_budget,
+        ) else {
+            return;
+        };
         let mut active = Vec::new();
-        let mut deferred = None;
-        self.admit_pending(receiver, pending, &mut active, &mut deferred)
-            .await;
+        let mut waiting = BTreeMap::new();
+        let mut prefilling = BTreeMap::new();
+        let mut next_id = 0_u64;
         let mut current = None;
         loop {
             if current.is_none() {
                 self.remove_unsubmitted_cancellations(&mut active);
-                self.admit_pending(receiver, pending, &mut active, &mut deferred)
+                self.admit_scheduled(
+                    receiver,
+                    pending,
+                    &active,
+                    &mut prefilling,
+                    &mut waiting,
+                    &mut policy,
+                    &mut next_id,
+                )
+                .await;
+                if active.iter().all(BatchLane::is_constrained) && !prefilling.is_empty() {
+                    self.advance_prefills_scheduled(
+                        &mut prefilling,
+                        &mut active,
+                        &mut current,
+                        &mut policy,
+                    )
                     .await;
-                if active.is_empty() {
-                    return;
                 }
-                current = match self
-                    .submit_batch(&active.iter().collect::<Vec<_>>(), &[])
-                    .await
-                {
+                if current.is_some() {
+                    continue;
+                }
+                if active.is_empty() {
+                    self.advance_prefills_scheduled(
+                        &mut prefilling,
+                        &mut active,
+                        &mut current,
+                        &mut policy,
+                    )
+                    .await;
+                    if current.is_some() {
+                        continue;
+                    }
+                    if active.is_empty() {
+                        if prefilling.is_empty() && waiting.is_empty() {
+                            return;
+                        }
+                        continue;
+                    }
+                }
+                let ordinary = active
+                    .iter()
+                    .filter(|lane| !lane.is_constrained())
+                    .collect::<Vec<_>>();
+                if ordinary.is_empty() {
+                    self.advance_constrained_lane_scheduled(&mut active, &policy)
+                        .await;
+                    continue;
+                }
+                let submitted_slots = ordinary.iter().map(|lane| lane.slot).collect::<Vec<_>>();
+                current = match self.submit_batch(&policy, &ordinary, &[]).await {
                     Ok(batch) => batch,
                     Err(error) => {
-                        for lane in active.drain(..) {
-                            self.fail_batch_lane(lane, repeated_error(&error));
+                        let mut index = 0;
+                        while index < active.len() {
+                            if submitted_slots.contains(&active[index].slot) {
+                                let lane = active.remove(index);
+                                self.fail_batch_lane(lane, repeated_error(&error));
+                            } else {
+                                index += 1;
+                            }
                         }
-                        return;
+                        continue;
                     }
                 };
             }
@@ -88,14 +147,16 @@ where
             };
             self.mark_submitted_cancellations(&mut batch, &mut active);
             drain_pending(receiver, pending);
-            let admission_waiting = deferred.is_some()
+            let admission_waiting = active.iter().any(BatchLane::is_constrained)
+                || !waiting.is_empty()
+                || !prefilling.is_empty()
                 || pending
                     .front()
                     .is_some_and(|request| !request.requires_serial_path());
             let next = if admission_waiting {
                 Ok(None)
             } else {
-                self.submit_successor(&active, &batch).await
+                self.submit_successor(&policy, &active, &batch).await
             };
             let mut successor = match next {
                 Ok(successor) => successor,
@@ -103,7 +164,10 @@ where
                     let _ = self.runner.read_queued_batch_tokens(batch.output).await;
                     self.fail_pipeline(batch.lanes, None, &mut active, error)
                         .await;
-                    return;
+                    if active.is_empty() {
+                        return;
+                    }
+                    continue;
                 }
             };
             let tokens = self.runner.read_queued_batch_tokens(batch.output).await;
@@ -113,7 +177,10 @@ where
                     Err(error) => {
                         self.fail_pipeline(batch.lanes, successor, &mut active, error)
                             .await;
-                        return;
+                        if active.is_empty() {
+                            return;
+                        }
+                        continue;
                     }
                 },
                 Err(error) => {
@@ -124,14 +191,34 @@ where
                         GenerationError::unavailable(format!("decode batch read failed: {error}")),
                     )
                     .await;
-                    return;
+                    if active.is_empty() {
+                        return;
+                    }
+                    continue;
                 }
             };
             self.apply_batch_tokens(batch.lanes, &mut active, &mut successor, &tokens)
                 .await;
             if successor.is_none() {
-                self.admit_pending(receiver, pending, &mut active, &mut deferred)
+                self.advance_constrained_lane_scheduled(&mut active, &policy)
                     .await;
+                self.admit_scheduled(
+                    receiver,
+                    pending,
+                    &active,
+                    &mut prefilling,
+                    &mut waiting,
+                    &mut policy,
+                    &mut next_id,
+                )
+                .await;
+                self.advance_prefills_scheduled(
+                    &mut prefilling,
+                    &mut active,
+                    &mut successor,
+                    &mut policy,
+                )
+                .await;
             }
             current = successor;
         }
@@ -192,30 +279,35 @@ where
 
     async fn submit_successor(
         &mut self,
+        policy: &SchedulerPolicy,
         active: &[BatchLane],
         current: &PendingBatch,
     ) -> Result<Option<PendingBatch>, GenerationError> {
         let lanes = active
             .iter()
-            .filter(|lane| !current.contains_active(lane.slot) || lane.needs_successor())
+            .filter(|lane| {
+                !lane.is_constrained()
+                    && (!current.contains_active(lane.slot) || lane.needs_successor())
+            })
             .collect::<Vec<_>>();
         let feedback = lanes
             .iter()
             .filter(|lane| current.contains_active(lane.slot))
             .map(|lane| lane.slot)
             .collect::<Vec<_>>();
-        self.submit_batch(&lanes, &feedback).await
+        self.submit_batch(policy, &lanes, &feedback).await
     }
 
     async fn submit_batch(
         &mut self,
+        policy: &SchedulerPolicy,
         lanes: &[&BatchLane],
         feedback: &[u32],
     ) -> Result<Option<PendingBatch>, GenerationError> {
         if lanes.is_empty() {
             return Ok(None);
         }
-        let shape = self.decode_shape(lanes)?;
+        let shape = self.decode_shape(policy, lanes)?;
         let checkpoints = self.checkpoint_lanes(lanes)?;
         let inputs = batch_inputs(shape, lanes, feedback)?;
         let output = self
@@ -662,32 +754,21 @@ where
             }
         }
     }
-
-    #[allow(dead_code)]
     async fn advance_prefills_scheduled(
         &mut self,
         prefilling: &mut BTreeMap<RequestId, PendingPrefill>,
         active: &mut Vec<BatchLane>,
+        queued: &mut Option<PendingBatch>,
         policy: &mut SchedulerPolicy,
     ) {
+        let mut completed = Vec::new();
         for (id, budget) in policy.prompt_batch() {
             let Some(mut prefill) = prefilling.remove(&id) else {
                 continue;
             };
             match self.advance_batch_prefill(&mut prefill, budget).await {
                 Ok(true) => match Self::finish_batch_prefill(prefill) {
-                    Ok(mut lane) => match lane
-                        .accept(
-                            lane.pending_token,
-                            &self.chat_info.stop_token_ids,
-                            &mut self.metrics,
-                        )
-                        .await
-                    {
-                        Ok(Some(reason)) => self.finish_batch_lane(lane, reason).await,
-                        Ok(None) => active.push(lane),
-                        Err(error) => self.fail_batch_lane(lane, error),
-                    },
+                    Ok(lane) => completed.push((id, lane)),
                     Err((prefill, error)) => {
                         policy.complete(id);
                         self.fail_batch_prefill(prefill, error);
@@ -702,8 +783,72 @@ where
                 }
             }
         }
+        let (submitted_slots, submission) = {
+            let ordinary = active
+                .iter()
+                .chain(completed.iter().map(|(_, lane)| lane))
+                .filter(|lane| !lane.is_constrained())
+                .collect::<Vec<_>>();
+            let slots = ordinary.iter().map(|lane| lane.slot).collect::<Vec<_>>();
+            let submission = if queued.is_none() {
+                self.submit_batch(policy, &ordinary, &[]).await
+            } else {
+                Ok(None)
+            };
+            (slots, submission)
+        };
+        match submission {
+            Ok(batch) => {
+                if batch.is_some() {
+                    *queued = batch;
+                }
+                #[cfg(test)]
+                if queued.is_some()
+                    && !completed.is_empty()
+                    && let Some(barrier) = &self.batch_test_barrier
+                {
+                    barrier.note_prefill_overlap(submitted_slots.len());
+                }
+            }
+            Err(error) => {
+                let mut index = 0;
+                while index < active.len() {
+                    if submitted_slots.contains(&active[index].slot) {
+                        let lane = active.remove(index);
+                        self.fail_batch_lane(lane, repeated_error(&error));
+                    } else {
+                        index += 1;
+                    }
+                }
+                for (id, lane) in completed {
+                    policy.complete(id);
+                    self.fail_batch_lane(lane, repeated_error(&error));
+                }
+                return;
+            }
+        }
+        for (_, mut lane) in completed {
+            match lane
+                .accept(
+                    lane.pending_token,
+                    &self.chat_info.stop_token_ids,
+                    &mut self.metrics,
+                )
+                .await
+            {
+                Ok(Some(reason)) => {
+                    self.retire_or_finish(Retirement::Finish(lane, reason), queued)
+                        .await;
+                }
+                Ok(None) => active.push(lane),
+                Err(error) => {
+                    self.retire_or_finish(Retirement::Fail(lane, error), queued)
+                        .await;
+                }
+            }
+        }
     }
-    #[allow(dead_code)]
+
     fn reservations_fit(&self, reservations: impl IntoIterator<Item = u64>) -> bool {
         let Some(serving) = self.info.serving.as_ref() else {
             return false;
@@ -711,6 +856,7 @@ where
         reservations_fit(serving.page_tokens, serving.max_context, reservations)
     }
 
+    #[allow(dead_code)]
     async fn admit_pending(
         &mut self,
         receiver: &mut mpsc::Receiver<ServiceCommand>,
@@ -787,13 +933,14 @@ where
             )
         })
     }
-
-    fn decode_shape(&self, lanes: &[&BatchLane]) -> Result<BatchShape, GenerationError> {
-        let needed = lanes
-            .iter()
-            .map(|lane| lane.slot.saturating_add(1))
-            .max()
-            .unwrap_or(1);
+    fn decode_shape(
+        &self,
+        policy: &SchedulerPolicy,
+        lanes: &[&BatchLane],
+    ) -> Result<BatchShape, GenerationError> {
+        let bucket = policy
+            .decode_bucket(lanes.iter().map(|lane| lane.slot))
+            .ok_or_else(|| GenerationError::new("no decode bucket can accept active lanes"))?;
         self.info
             .serving
             .iter()
@@ -801,7 +948,7 @@ where
             .filter(|shape| {
                 shape.phase == BatchPhase::Decode
                     && shape.selection == BatchSelection::Combined
-                    && shape.bucket >= needed
+                    && shape.bucket == bucket
             })
             .min_by_key(|shape| shape.bucket)
             .copied()
