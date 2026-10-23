@@ -72,6 +72,7 @@ const ATTENTION_SCALE: f32 = 0.088_388_35;
 const Q4_BITS: u8 = 4;
 const Q8_BITS: u8 = 8;
 const QUANT_GROUP: u32 = 64;
+const ACTIVE_LANES: u32 = 8;
 
 fn serving_info() -> ServingInfo {
     let planes = (0..LAYERS)
@@ -86,7 +87,7 @@ fn serving_info() -> ServingInfo {
     ServingInfo {
         page_tokens: 64,
         planes,
-        active_lanes: 8,
+        active_lanes: ACTIVE_LANES,
         max_context: MAX_CONTEXT,
         batch_shapes: [1, 2, 4, 8]
             .into_iter()
@@ -1145,7 +1146,7 @@ impl Qwen3Coder {
                     .with_tail_capacity(LONG_PREFILL_TAIL_CAPACITY)?,
             ),
             #[cfg(target_family = "wasm")]
-            batch_feedback: Tensor::zeros(&[8])?,
+            batch_feedback: Tensor::zeros(&[ACTIVE_LANES])?,
             #[cfg(target_family = "wasm")]
             batch_graphs: if config.replay {
                 (0..2)
