@@ -70,7 +70,6 @@ struct PreparedRequest {
 }
 
 impl PreparedRequest {
-    #[allow(dead_code)]
     fn reserved_tokens(&self) -> Option<u64> {
         u64::from(self.prompt_tokens).checked_add(u64::from(self.params.max_tokens))
     }

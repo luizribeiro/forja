@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use forja_core::Backend;
 use forja_host::{
     BatchPhase, BatchSelection, BatchShape, EngineBatch, EngineBatchLane, EngineBatchOutput,
@@ -14,7 +12,6 @@ use crate::engine::{
 };
 use crate::metrics::{observe, observe_phase};
 
-#[allow(dead_code)]
 pub(super) struct PendingPrefill {
     request: PreparedRequest,
     slot: u32,
@@ -28,7 +25,6 @@ pub(super) struct PendingPrefill {
     constraint: Option<BatchConstraint>,
 }
 
-#[allow(dead_code)]
 impl PendingPrefill {
     pub(super) fn remaining(&self) -> u32 {
         u32::try_from(self.request.tokens.len().saturating_sub(self.consumed)).unwrap_or(u32::MAX)
@@ -67,7 +63,6 @@ where
     B: Backend + Send + Sync + 'static,
 {
     #[allow(
-        dead_code,
         clippy::result_large_err,
         clippy::too_many_lines,
         reason = "ownership returns the prepared request so every construction failure can reply"
@@ -220,49 +215,6 @@ where
         })
     }
 
-    pub(super) async fn start_batch_lane(
-        &mut self,
-        request: PreparedRequest,
-        slot: u32,
-    ) -> Option<BatchLane> {
-        let sampling = match sampling_seed(request.params.seed, request.params.temperature).await {
-            Ok(seed) => SamplingParams {
-                temperature: request.params.temperature,
-                top_k: request.params.top_k,
-                top_p: request.params.top_p,
-                seed,
-            },
-            Err(error) => {
-                request.sink.fail(error);
-                return None;
-            }
-        };
-        let tokenizer = match self.tokenizer() {
-            Ok(tokenizer) => tokenizer,
-            Err(error) => {
-                request.sink.fail(error);
-                return None;
-            }
-        };
-        match self.prefill_batch_lane(&request, slot, sampling).await {
-            Ok((cached_tokens, first)) => Some(BatchLane::new(
-                request,
-                slot,
-                cached_tokens,
-                first,
-                sampling,
-                tokenizer,
-                None,
-            )),
-            Err(error) => {
-                let _ = self.runner.prepare_paged_lane(slot, None, 0);
-                request.sink.fail(error);
-                None
-            }
-        }
-    }
-
-    #[allow(dead_code)]
     pub(super) async fn advance_batch_prefill(
         &mut self,
         prefill: &mut PendingPrefill,
@@ -325,7 +277,6 @@ where
     }
 
     #[allow(
-        dead_code,
         clippy::result_large_err,
         reason = "the owned prefill state is required to release its lane after a refusal"
     )]
@@ -335,178 +286,16 @@ where
         prefill.finish()
     }
 
-    #[allow(dead_code)]
     pub(super) fn fail_batch_prefill(&mut self, prefill: PendingPrefill, error: GenerationError) {
         let error = self.release_failed_lane(prefill.slot()).unwrap_or(error);
         prefill.request.sink.fail(error);
     }
 
-    #[allow(dead_code)]
     pub(super) fn release_failed_lane(&mut self, slot: u32) -> Option<GenerationError> {
         self.runner
             .prepare_paged_lane(slot, None, 0)
             .err()
             .map(|error| batch_admission_error(&error))
-    }
-
-    async fn prefill_batch_lane(
-        &mut self,
-        request: &PreparedRequest,
-        slot: u32,
-        sampling: SamplingParams,
-    ) -> Result<(u32, u32), GenerationError> {
-        let reserved = u64::from(request.prompt_tokens)
-            .checked_add(u64::from(request.params.max_tokens))
-            .ok_or_else(|| GenerationError::new("paged reservation overflowed"))?;
-        let match_started = std::time::Instant::now();
-        let hit = self
-            .prefix_index
-            .as_mut()
-            .filter(|_| self.config.serving.prefix_reuse)
-            .map(|index| index.lookup(self.prefix_namespace, &request.tokens, reserved))
-            .transpose()
-            .map_err(|error| GenerationError::unavailable(error.to_string()))?
-            .flatten();
-        let cached = hit.as_ref().map_or(0, |hit| hit.cached_tokens);
-        self.metrics.requests = self.metrics.requests.saturating_add(1);
-        observe(&mut self.metrics.match_time, match_started.elapsed());
-        if cached == 0 {
-            self.metrics.misses = self.metrics.misses.saturating_add(1);
-        } else {
-            self.metrics.hits = self.metrics.hits.saturating_add(1);
-            self.metrics.reused_tokens = self
-                .metrics
-                .reused_tokens
-                .saturating_add(u64::try_from(cached).unwrap_or(u64::MAX));
-        }
-        let saved = if slot == 0 {
-            None
-        } else {
-            self.runner
-                .paged_lane_prefix(0)
-                .ok()
-                .flatten()
-                .map(|prefix| {
-                    let reserved = prefix.reserved_tokens().map_err(|error| {
-                        GenerationError::unavailable(format!("paged save failed: {error}"))
-                    })?;
-                    Ok((prefix, reserved))
-                })
-                .transpose()?
-        };
-        let suffix = request
-            .tokens
-            .get(cached..)
-            .ok_or_else(|| GenerationError::new("cached prefix exceeds the prepared prompt"))?;
-        let prefix = hit.map(|hit| hit.sequence);
-        loop {
-            match self.runner.prepare_paged_lane(0, prefix.clone(), reserved) {
-                Ok(_) => break,
-                Err(error) if prefix.is_none() => {
-                    let evicted = self
-                        .prefix_index
-                        .as_mut()
-                        .map(|index| index.evict_lru(None))
-                        .transpose()
-                        .map_err(|failure| GenerationError::unavailable(failure.to_string()))?
-                        .unwrap_or(false);
-                    if !evicted {
-                        return Err(batch_admission_error(&error));
-                    }
-                }
-                Err(error) => return Err(batch_admission_error(&error)),
-            }
-        }
-        let cached = u32::try_from(cached)
-            .map_err(|_| GenerationError::new("cached prefix length overflowed"))?;
-        let prefill_started = std::time::Instant::now();
-        let output = self.run_prompt_chunks(suffix, cached, sampling).await;
-        observe(
-            &mut self.metrics.suffix_prefill_time,
-            prefill_started.elapsed(),
-        );
-        if slot == 0 {
-            return output.map(|token| (cached, token));
-        }
-        let transfer = output.and_then(|token| {
-            self.runner
-                .paged_lane_prefix(0)
-                .map_err(|error| batch_admission_error(&error))
-                .and_then(|prefix| {
-                    prefix.ok_or_else(|| GenerationError::new("prefilled lane is unavailable"))
-                })
-                .and_then(|prefix| {
-                    self.runner
-                        .prepare_paged_lane(slot, Some(prefix), reserved)
-                        .map_err(|error| batch_admission_error(&error))
-                })
-                .map(|_| (cached, token))
-        });
-        let restore = match saved {
-            Some((prefix, reserved)) => self.runner.prepare_paged_lane(0, Some(prefix), reserved),
-            None => self.runner.prepare_paged_lane(0, None, 0),
-        }
-        .map_err(|error| batch_admission_error(&error));
-        match (transfer, restore) {
-            (Ok(result), Ok(_)) => Ok(result),
-            (Err(error), _) | (Ok(_), Err(error)) => Err(error),
-        }
-    }
-
-    async fn run_prompt_chunks(
-        &mut self,
-        mut tokens: &[u32],
-        mut start_pos: u32,
-        sampling: SamplingParams,
-    ) -> Result<u32, GenerationError> {
-        let shapes = self.prompt_shapes();
-        let largest = usize::try_from(shapes.last().map_or(0, |shape| shape.tokens)).unwrap_or(0);
-        let budget = usize::try_from(self.scheduler.prompt_token_budget).unwrap_or(usize::MAX);
-        let mut selected = None;
-        while !tokens.is_empty() {
-            let count = budget.min(largest).min(tokens.len());
-            let shape = shapes
-                .iter()
-                .copied()
-                .find(|shape| usize::try_from(shape.tokens).is_ok_and(|size| size >= count))
-                .ok_or_else(|| GenerationError::new("no prompt shape can accept the suffix"))?;
-            let output = self
-                .runner
-                .enqueue_batch_step(EngineBatch {
-                    shape,
-                    lanes: vec![Some(EngineBatchLane {
-                        slot: 0,
-                        tokens: Some(tokens[..count].to_vec()),
-                        start_pos,
-                        sampling,
-                    })],
-                })
-                .await
-                .map_err(|error| {
-                    GenerationError::unavailable(format!("prompt batch failed: {error}"))
-                })?
-                .map_err(|error| {
-                    GenerationError::unavailable(format!("prompt batch failed: {error:?}"))
-                })?;
-            let bytes = self
-                .runner
-                .read_queued_batch_tokens(output)
-                .await
-                .map_err(|error| {
-                    GenerationError::unavailable(format!("prompt batch read failed: {error}"))
-                })?;
-            selected = read_batch_tokens(&bytes)?.first().copied();
-            let consumed = count;
-            let count = u32::try_from(consumed)
-                .map_err(|_| GenerationError::new("prompt chunk overflowed"))?;
-            start_pos = start_pos
-                .checked_add(count)
-                .ok_or_else(|| GenerationError::new("prompt position overflowed"))?;
-            tokens = tokens
-                .get(consumed..)
-                .ok_or_else(|| GenerationError::new("prompt chunk exceeds its suffix"))?;
-        }
-        selected.ok_or_else(|| GenerationError::new("prompt suffix is empty"))
     }
 
     fn prompt_shapes(&self) -> Vec<BatchShape> {
@@ -526,7 +315,6 @@ where
         shapes
     }
 
-    #[allow(dead_code)]
     async fn select_prefill_output(
         &mut self,
         prefill: &PendingPrefill,

@@ -11,7 +11,6 @@ mod metrics;
 mod prefix;
 mod request;
 mod response;
-#[allow(dead_code)]
 mod scheduler;
 mod stop;
 mod tool_output;

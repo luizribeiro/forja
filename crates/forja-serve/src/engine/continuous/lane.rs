@@ -222,12 +222,10 @@ impl BatchLane {
             .is_some_and(|consumed| consumed < self.params.max_tokens)
     }
 
-    #[allow(dead_code)]
     pub(super) const fn is_constrained(&self) -> bool {
         self.constraint.is_some()
     }
 
-    #[allow(dead_code)]
     pub(super) fn constraint_allow(&self) -> Option<&[u32]> {
         self.constraint
             .as_ref()

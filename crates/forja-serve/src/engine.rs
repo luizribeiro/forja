@@ -530,7 +530,6 @@ impl BatchTestBarrier {
 struct SchedulerConfig {
     active_lanes: u32,
     prompt_token_budget: u32,
-    #[allow(dead_code)]
     decode_buckets: Vec<u32>,
 }
 

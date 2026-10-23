@@ -493,7 +493,6 @@ where
         }
     }
 
-    #[allow(dead_code)]
     async fn advance_constrained_lane(
         &mut self,
         active: &mut Vec<BatchLane>,
@@ -555,7 +554,6 @@ where
         }
     }
 
-    #[allow(dead_code)]
     async fn constrained_token(
         &mut self,
         lane: &BatchLane,
