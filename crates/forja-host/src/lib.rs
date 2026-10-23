@@ -1320,12 +1320,9 @@ where
         let layout = PagedLayout::new(serving.page_tokens, planes)
             .map_err(|error| compute::Error::Layout(error.to_string()))?;
         let pages_per_sequence = serving.max_context.div_ceil(serving.page_tokens);
-        let pool = PagePool::new(
-            layout,
-            pages_per_sequence,
-            self.store.data().limits.live_bytes,
-        )
-        .map_err(|error| compute::Error::Quota(error.to_string()))?;
+        let physical_pages = paged_backing_pages(pages_per_sequence, serving.active_lanes)?;
+        let pool = PagePool::new_fixed(layout, physical_pages, self.store.data().limits.live_bytes)
+            .map_err(|error| compute::Error::Quota(error.to_string()))?;
         let entry = PagePoolEntry {
             pool,
             active_lanes: serving.active_lanes,
@@ -3031,6 +3028,7 @@ pub struct BatchSlotEntry {
     planes: Vec<u32>,
     tables: [Vec<u32>; 2],
     generations: u32,
+    generation_pages: usize,
     metadata: [[u32; 3]; 2],
     active_bank: usize,
     next_bank: usize,
@@ -3531,6 +3529,9 @@ impl<B: Backend + 'static> Host<B> {
             planes: backing.planes,
             tables: backing.tables,
             generations: backing.generations,
+            generation_pages: table_pages.checked_add(active_lanes).ok_or_else(|| {
+                compute::Error::Layout("physical page count overflowed".to_owned())
+            })?,
             metadata: backing.metadata,
             active_bank: 0,
             next_bank: 0,
@@ -3556,10 +3557,11 @@ impl<B: Backend + 'static> Host<B> {
         table_pages: usize,
         active_lanes: usize,
     ) -> Result<PagedBackingHandles, compute::Error> {
-        let physical_pages = u32::try_from(table_pages)
-            .map_err(|_| compute::Error::Layout("physical page count exceeds u32".to_owned()))?;
+        let table_page_count = u32::try_from(table_pages)
+            .map_err(|_| compute::Error::Layout("page table length exceeds u32".to_owned()))?;
         let lane_count = u32::try_from(active_lanes)
             .map_err(|_| compute::Error::Layout("lane count exceeds u32".to_owned()))?;
+        let physical_pages = paged_backing_pages(table_page_count, lane_count)?;
         let mut backing = Vec::new();
         let mut plane_handles = Vec::new();
         for (dtype, elements) in plane_specs {
@@ -3587,7 +3589,7 @@ impl<B: Backend + 'static> Host<B> {
         let mut table_handles = [Vec::new(), Vec::new()];
         for bank in &mut table_handles {
             for _ in 0..active_lanes {
-                match self.alloc_paged_tensor(compute::Dtype::U32, &[physical_pages, 2]) {
+                match self.alloc_paged_tensor(compute::Dtype::U32, &[table_page_count, 2]) {
                     Ok(tensor) => {
                         bank.push(tensor);
                         backing.push(tensor);
@@ -3730,7 +3732,7 @@ impl<B: Backend + 'static> Host<B> {
             };
             (entry.pool.clone(), entry.max_context, slot)
         };
-        let (binding, table_rep, generation_rep, bank) = {
+        let (binding, table_rep, generation_rep, generation_pages, bank) = {
             let slot = self
                 .table
                 .get(&Resource::<BatchSlotEntry>::new_borrow(slot_rep))
@@ -3744,6 +3746,7 @@ impl<B: Backend + 'static> Host<B> {
                     .and_then(|bank| bank.get(lane))
                     .ok_or_else(|| invalid_handle("paged lane is missing"))?,
                 slot.generations,
+                slot.generation_pages,
                 bank,
             )
         };
@@ -3818,7 +3821,7 @@ impl<B: Backend + 'static> Host<B> {
         };
         let prepared = (|| {
             if upload {
-                self.upload_paged_table(table_rep, generation_rep, &table)?;
+                self.upload_paged_table(table_rep, generation_rep, generation_pages, &table)?;
             }
             copy.map(|copy| self.prepare_cow_copy(slot_rep, Arc::clone(&binding), bank, lane, copy))
                 .transpose()
@@ -3840,6 +3843,7 @@ impl<B: Backend + 'static> Host<B> {
         &self,
         table_rep: u32,
         generation_rep: u32,
+        generation_pages: usize,
         table: &forja_core::PageTable,
     ) -> Result<(), compute::Error> {
         self.upload_paged_table_entries(table_rep, table)?;
@@ -3847,6 +3851,12 @@ impl<B: Backend + 'static> Host<B> {
         for generation in table.generations() {
             generation_bytes.extend_from_slice(&generation.to_ne_bytes());
         }
+        generation_bytes.resize(
+            generation_pages
+                .checked_mul(4)
+                .ok_or_else(|| compute::Error::Layout("generation bytes overflowed".to_owned()))?,
+            0,
+        );
         self.write(&Resource::new_borrow(generation_rep), &generation_bytes)
     }
 
@@ -4212,7 +4222,7 @@ impl<B: Backend + 'static> Host<B> {
                 "paged request exceeds the context ceiling".to_owned(),
             ));
         }
-        let (binding, tables, generations) = {
+        let (binding, tables, generations, generation_pages) = {
             let slot = self
                 .table
                 .get(&Resource::<BatchSlotEntry>::new_borrow(slot_rep))
@@ -4221,6 +4231,7 @@ impl<B: Backend + 'static> Host<B> {
                 Arc::clone(&slot.binding),
                 slot.tables.clone(),
                 slot.generations,
+                slot.generation_pages,
             )
         };
         let lane = usize::try_from(lane)
@@ -4261,7 +4272,9 @@ impl<B: Backend + 'static> Host<B> {
             .map_err(|error| compute::Error::Quota(error.to_string()))?;
         let table = replacement.table();
         for &table_handle in &handles {
-            if let Err(error) = self.upload_paged_table(table_handle, generations, table) {
+            if let Err(error) =
+                self.upload_paged_table(table_handle, generations, generation_pages, table)
+            {
                 for dirty in &lane_binding.table_dirty {
                     dirty.store(true, Ordering::Release);
                 }
@@ -8451,6 +8464,12 @@ impl From<BackendError> for GuestFailure {
     }
 }
 
+fn paged_backing_pages(table_pages: u32, active_lanes: u32) -> Result<u32, compute::Error> {
+    table_pages
+        .checked_add(active_lanes)
+        .ok_or_else(|| compute::Error::Layout("physical page count overflowed".to_owned()))
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::{Duration, Instant};
@@ -8479,12 +8498,18 @@ mod tests {
         ParamsEntry, ReplayFlight, ReplayState, SamplingParams, ServingInfo, SubmissionOutcome,
         TensorEntry,
         bindings::l9o::gpu::{compute, paged_storage},
-        core_op, core_program, expected_layer_outputs, validate_batch_lanes,
+        core_op, core_program, expected_layer_outputs, paged_backing_pages, validate_batch_lanes,
         validate_batch_output_layouts, validate_batch_select_lanes, validate_batch_shapes,
     };
 
     const GENEROUS: Limits = Limits::new(u64::MAX, 8, u64::MAX, 32, u64::MAX);
     static NEXT_WEIGHT_FILE: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn paged_backing_reserves_one_copy_on_write_page_per_lane() {
+        assert_eq!(paged_backing_pages(512, 8).unwrap(), 520);
+        assert!(paged_backing_pages(u32::MAX, 1).is_err());
+    }
 
     fn insert_test_pool<B: Backend>(
         host: &mut Host<B>,

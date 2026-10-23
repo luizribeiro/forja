@@ -20,6 +20,8 @@ pub enum PagePoolError {
     UnreservedWrite,
     /// A write targets a shared or immutable tail without copy-on-write.
     SharedTail,
+    /// A slot bank is still referenced by an in-flight submission.
+    BankInFlight,
     /// A resource belongs to another pool.
     ForeignResource,
     /// A checkpoint is stale or does not belong to this sequence.
@@ -73,6 +75,7 @@ struct PoolInner {
     layout: PagedLayout,
     pages_per_slab: u32,
     byte_limit: u64,
+    fixed_capacity: bool,
     state: Mutex<PoolState>,
 }
 
@@ -105,6 +108,19 @@ struct PageLease {
 }
 
 impl PagePool {
+    /// Creates a pool whose physical capacity is exactly one slab.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an empty slab, arithmetic overflow, or insufficient quota.
+    pub fn new_fixed(
+        layout: PagedLayout,
+        pages: u32,
+        byte_limit: u64,
+    ) -> Result<Self, PagePoolError> {
+        Self::new_with_capacity(layout, pages, byte_limit, true)
+    }
+
     /// Creates a bounded pool with one checked initial slab.
     ///
     /// # Errors
@@ -114,6 +130,15 @@ impl PagePool {
         layout: PagedLayout,
         pages_per_slab: u32,
         byte_limit: u64,
+    ) -> Result<Self, PagePoolError> {
+        Self::new_with_capacity(layout, pages_per_slab, byte_limit, false)
+    }
+
+    fn new_with_capacity(
+        layout: PagedLayout,
+        pages_per_slab: u32,
+        byte_limit: u64,
+        fixed_capacity: bool,
     ) -> Result<Self, PagePoolError> {
         if pages_per_slab == 0 {
             return Err(PagePoolError::EmptySlab);
@@ -137,6 +162,7 @@ impl PagePool {
                 layout,
                 pages_per_slab,
                 byte_limit,
+                fixed_capacity,
                 state: Mutex::new(state),
             }),
         })
@@ -664,7 +690,7 @@ impl PagedSlotBanks {
             .get_mut(bank)
             .ok_or(PagePoolError::ForeignResource)?;
         if pending.is_some_and(|serial| serial > completed) {
-            return Err(PagePoolError::SharedTail);
+            return Err(PagePoolError::BankInFlight);
         }
         *pending = None;
         Ok(())
@@ -688,7 +714,7 @@ impl PagedSlotBanks {
             .ok_or(PagePoolError::ForeignResource)?
             .is_some_and(|serial| serial > completed)
         {
-            return Err(PagePoolError::SharedTail);
+            return Err(PagePoolError::BankInFlight);
         }
         Ok(())
     }
@@ -1166,6 +1192,9 @@ fn preflight_pages(
 ) -> Result<(), PagePoolError> {
     let free = u64::try_from(state.free.len()).map_err(|_| PagePoolError::ArithmeticOverflow)?;
     let missing = pages.saturating_sub(free);
+    if missing > 0 && pool.inner.fixed_capacity {
+        return Err(PagePoolError::QuotaExceeded);
+    }
     let slabs = missing.div_ceil(u64::from(pool.inner.pages_per_slab));
     let growth = slab_bytes(&pool.inner.layout, pool.inner.pages_per_slab)?
         .checked_mul(slabs)
@@ -1262,6 +1291,26 @@ mod tests {
             pool.reserve(12),
             Err(PagePoolError::QuotaExceeded)
         ));
+        assert_eq!(pool.memory_usage().unwrap(), before);
+    }
+
+    #[test]
+    fn fixed_pool_refuses_to_grow_past_its_backing() {
+        let layout = PagedLayout::new(
+            4,
+            vec![PagedPlane {
+                dtype: DType::F32,
+                elements_per_token: 2,
+                alignment: 4,
+                label: "plane".to_owned(),
+            }],
+        )
+        .unwrap();
+        let pool = PagePool::new_fixed(layout, 2, 1_024).unwrap();
+        let _resident = pool.reserve(8).unwrap();
+        let before = pool.memory_usage().unwrap();
+
+        assert!(matches!(pool.reserve(4), Err(PagePoolError::QuotaExceeded)));
         assert_eq!(pool.memory_usage().unwrap(), before);
     }
 
@@ -1472,7 +1521,7 @@ mod tests {
         assert!(!inactive.is_active());
         assert!(inactive.table().resolve(0).is_err());
         banks.mark_submitted(0, 9).unwrap();
-        assert_eq!(banks.poison(0, 0), Err(PagePoolError::SharedTail));
+        assert_eq!(banks.poison(0, 0), Err(PagePoolError::BankInFlight));
         banks.bind(1, 1, &sequence).unwrap();
         pool.observe_completion(9).unwrap();
         banks.poison(0, 0).unwrap();
