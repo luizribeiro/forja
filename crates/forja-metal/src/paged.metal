@@ -18,6 +18,7 @@ kernel void paged_copy(
     constant TensorLayout &ordinary_layout [[buffer(4)]],
     constant PagedCopyParams &params [[buffer(5)]],
     device atomic_uint *error_flag [[buffer(6)]],
+    device const uint *activity [[buffer(7)]],
     uint2 position [[thread_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]]) {
     threadgroup uint physical_page;
@@ -25,6 +26,14 @@ kernel void paged_copy(
     uint element = position.x;
     uint token = position.y;
     uint logical_token = params.start + token;
+    if (activity[0] == 0) {
+        if (params.direction != 0 && element < params.elements) {
+            uint index = token * params.elements + element;
+            ulong ordinary_index = physical_index(ordinary_layout, index);
+            store_float(ordinary, ordinary_index, input0_dtype, 0.0f);
+        }
+        return;
+    }
     if (thread_index == 0) {
         uint logical_page = logical_token / params.page_tokens;
         valid = logical_page < params.logical_pages;

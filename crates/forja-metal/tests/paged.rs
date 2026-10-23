@@ -277,6 +277,40 @@ fn metal_paged_copy_reports_corrupt_entries_without_writing_pool() {
 }
 
 #[test]
+fn metal_paged_copy_does_not_dereference_inactive_lane() {
+    let backend = forja_metal::MetalBackend::new().unwrap();
+    let source = backend.alloc(DType::F32, &[1, 2]).unwrap();
+    let pool = backend.alloc(DType::F32, &[2, 4, 2]).unwrap();
+    let table = backend.alloc(DType::U32, &[1, 2]).unwrap();
+    let generations = backend.alloc(DType::U32, &[2]).unwrap();
+    let activity = backend.alloc(DType::U32, &[1]).unwrap();
+    backend
+        .write(&source, &encode(&[3.0, 5.0], DType::F32))
+        .unwrap();
+    let canary = encode(&[7.0; 16], DType::F32);
+    backend.write(&pool, &canary).unwrap();
+    backend.write(&table, &table_bytes(&[(1, 99)])).unwrap();
+    backend
+        .write(&generations, &generation_bytes(&[1, 2]))
+        .unwrap();
+    backend.write(&activity, &0_u32.to_ne_bytes()).unwrap();
+    let mut commands = CommandList::new();
+    commands
+        .dispatch(
+            Op::PagedCopy {
+                direction: PagedCopyDirection::IntoPages,
+                start: 0,
+                page_tokens: 4,
+            },
+            &[&source, &table, &generations, &activity],
+            &pool,
+        )
+        .unwrap();
+    backend.submit(commands).unwrap().wait().unwrap();
+    assert_eq!(backend.read(&pool).unwrap(), canary);
+}
+
+#[test]
 fn metal_paged_copy_isolates_rejected_row_from_other_rows_in_same_dispatch() {
     let backend = forja_metal::MetalBackend::new().unwrap();
     let source = backend.alloc(DType::F32, &[3, 2]).unwrap();
