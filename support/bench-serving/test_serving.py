@@ -85,6 +85,17 @@ def test_suite_rejects_unknown_case_keys() -> None:
             raise AssertionError("unknown suite key was accepted")
 
 
+def test_suite_accepts_required_tool_choice() -> None:
+    source = (Path(__file__).resolve().parents[2] / "bench/suites/serving.toml").read_text()
+    source = source.replace("tools = true", 'tools = true\ntool_choice = "required"')
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "suite.toml"
+        path.write_text(source)
+        _, cases, _ = suite.load(path)
+    tools = next(case for case in cases if case.get("tools"))
+    assert http_client.request_body(tools | {"prompt_tokens": 33}, "model")["tool_choice"] == "required"
+
+
 def test_http_client_reuses_openai_transport_and_measures_sse() -> None:
     server = ThreadingHTTPServer(("127.0.0.1", 0), FakeServer)
     thread = threading.Thread(target=server.serve_forever)

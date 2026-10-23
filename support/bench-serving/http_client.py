@@ -157,7 +157,7 @@ def request_body(case: dict[str, object], model: str) -> dict[str, object]:
         body["stream_options"] = {"include_usage": True}
     if case.get("tools"):
         body["tools"] = [{"type": "function", "function": {"name": "lookup", "description": "Lookup a value", "parameters": {"type": "object", "properties": {"key": {"type": "string"}}, "required": ["key"]}}}]
-        body["tool_choice"] = "auto"
+        body["tool_choice"] = case.get("tool_choice", "auto")
     return body
 
 

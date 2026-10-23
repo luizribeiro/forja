@@ -26,6 +26,7 @@ CASE_KEYS = {
     "cache_hit",
     "stream",
     "tools",
+    "tool_choice",
     "cancel_after_tokens",
 }
 
@@ -60,6 +61,10 @@ def load(path: Path) -> tuple[dict[str, object], list[dict[str, object]], str]:
             raise ValueError("case route is unsupported")
         if case["sampling"] not in {"greedy", "qwen-defaults", "seeded"}:
             raise ValueError("case sampling is unsupported")
+        if "tool_choice" in case and (
+            not case.get("tools") or case["tool_choice"] not in {"auto", "required"}
+        ):
+            raise ValueError("case.tool_choice requires tools and must be auto or required")
         positive(case, "output_tokens")
         for key in ("prompt_tokens", "concurrency"):
             values = case[key]
