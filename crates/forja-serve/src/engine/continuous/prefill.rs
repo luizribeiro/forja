@@ -2,16 +2,221 @@ use forja_core::Backend;
 use forja_host::{
     BatchPhase, BatchSelection, BatchShape, EngineBatch, EngineBatchLane, SamplingParams,
 };
+use tokenizers::Tokenizer;
 
-use super::lane::BatchLane;
+use super::lane::{BatchConstraint, BatchLane};
 use super::{PreparedRequest, batch_admission_error, read_batch_tokens};
-use crate::engine::{GenerationError, ServingEngine, sampling_seed};
-use crate::metrics::observe;
+use crate::engine::{
+    GenerationError, ServingEngine, compile_constraint, next_mask, sampling_seed, start_tool_parser,
+};
+use crate::metrics::{observe, observe_phase};
+
+#[allow(dead_code)]
+pub(super) struct PendingPrefill {
+    request: PreparedRequest,
+    slot: u32,
+    sampling: SamplingParams,
+    tokenizer: Tokenizer,
+    cached: u32,
+    reserved: u64,
+    consumed: usize,
+    position: u32,
+    selected: Option<u32>,
+    constraint: Option<BatchConstraint>,
+}
+
+#[allow(dead_code)]
+impl PendingPrefill {
+    pub(super) fn remaining(&self) -> u32 {
+        u32::try_from(self.request.tokens.len().saturating_sub(self.consumed)).unwrap_or(u32::MAX)
+    }
+
+    pub(super) const fn slot(&self) -> u32 {
+        self.slot
+    }
+
+    pub(super) fn reserved_tokens(&self) -> u64 {
+        self.reserved
+    }
+
+    #[allow(
+        clippy::result_large_err,
+        reason = "the owned prefill state is required to release its lane after a refusal"
+    )]
+    fn finish(self) -> Result<BatchLane, (Self, GenerationError)> {
+        let Some(first) = self.selected else {
+            return Err((self, GenerationError::new("prompt suffix is empty")));
+        };
+        Ok(BatchLane::new(
+            self.request,
+            self.slot,
+            self.cached,
+            first,
+            self.sampling,
+            self.tokenizer,
+            self.constraint,
+        ))
+    }
+}
 
 impl<B> ServingEngine<B>
 where
     B: Backend + Send + Sync + 'static,
 {
+    #[allow(
+        dead_code,
+        clippy::result_large_err,
+        clippy::too_many_lines,
+        reason = "ownership returns the prepared request so every construction failure can reply"
+    )]
+    pub(super) async fn begin_batch_prefill(
+        &mut self,
+        request: PreparedRequest,
+        slot: u32,
+    ) -> Result<PendingPrefill, (PreparedRequest, GenerationError)> {
+        let sampling = match sampling_seed(request.params.seed, request.params.temperature).await {
+            Ok(seed) => SamplingParams {
+                temperature: request.params.temperature,
+                top_k: request.params.top_k,
+                top_p: request.params.top_p,
+                seed,
+            },
+            Err(error) => return Err((request, error)),
+        };
+        let tokenizer = match self.tokenizer() {
+            Ok(tokenizer) => tokenizer,
+            Err(error) => return Err((request, error)),
+        };
+        let parser_started = std::time::Instant::now();
+        let constraint = if request
+            .constraint
+            .as_ref()
+            .is_some_and(|constraint| constraint.forced)
+        {
+            let guidance =
+                match compile_constraint(&self.guidance, request.constraint.as_ref()).await {
+                    Ok(guidance) => guidance,
+                    Err(error) => return Err((request, error)),
+                };
+            let allow = match next_mask(&guidance).await {
+                Ok(allow) => allow,
+                Err(error) => return Err((request, error)),
+            };
+            let parser = match start_tool_parser(
+                request.constraint.as_ref(),
+                std::sync::Arc::clone(&self.prompt),
+                true,
+                request.sink.events(),
+                &request.control,
+            )
+            .await
+            {
+                Ok(parser) => parser,
+                Err(error) => return Err((request, error)),
+            };
+            Some(BatchConstraint {
+                guidance,
+                allow,
+                parser,
+            })
+        } else {
+            None
+        };
+        if constraint.is_some() {
+            observe_phase(
+                &mut self.metrics.parser_mask_time,
+                &mut self.metrics.parser_mask_time_ns,
+                parser_started.elapsed(),
+            );
+        }
+        let Some(reserved) =
+            u64::from(request.prompt_tokens).checked_add(u64::from(request.params.max_tokens))
+        else {
+            return Err((
+                request,
+                GenerationError::new("paged reservation overflowed"),
+            ));
+        };
+        let match_started = std::time::Instant::now();
+        let hit = match self
+            .prefix_index
+            .as_mut()
+            .filter(|_| self.config.serving.prefix_reuse)
+            .map(|index| index.lookup(self.prefix_namespace, &request.tokens, reserved))
+            .transpose()
+        {
+            Ok(hit) => hit.flatten(),
+            Err(error) => {
+                return Err((request, GenerationError::unavailable(error.to_string())));
+            }
+        };
+        let cached = hit.as_ref().map_or(0, |hit| hit.cached_tokens);
+        self.metrics.requests = self.metrics.requests.saturating_add(1);
+        observe(&mut self.metrics.match_time, match_started.elapsed());
+        if cached == 0 {
+            self.metrics.misses = self.metrics.misses.saturating_add(1);
+        } else {
+            self.metrics.hits = self.metrics.hits.saturating_add(1);
+            self.metrics.reused_tokens = self
+                .metrics
+                .reused_tokens
+                .saturating_add(u64::try_from(cached).unwrap_or(u64::MAX));
+        }
+        if request.tokens.get(cached..).is_none() || cached == request.tokens.len() {
+            return Err((
+                request,
+                GenerationError::new("cached prefix leaves no prompt suffix"),
+            ));
+        }
+        let prefix = hit.map(|hit| hit.sequence);
+        loop {
+            match self
+                .runner
+                .prepare_paged_lane(slot, prefix.clone(), reserved)
+            {
+                Ok(_) => break,
+                Err(error) if prefix.is_none() => {
+                    let evicted = match self
+                        .prefix_index
+                        .as_mut()
+                        .map(|index| index.evict_lru(None))
+                        .transpose()
+                    {
+                        Ok(evicted) => evicted.unwrap_or(false),
+                        Err(failure) => {
+                            return Err((
+                                request,
+                                GenerationError::unavailable(failure.to_string()),
+                            ));
+                        }
+                    };
+                    if !evicted {
+                        return Err((request, batch_admission_error(&error)));
+                    }
+                }
+                Err(error) => return Err((request, batch_admission_error(&error))),
+            }
+        }
+        let Ok(cached) = u32::try_from(cached) else {
+            return Err((
+                request,
+                GenerationError::new("cached prefix length overflowed"),
+            ));
+        };
+        Ok(PendingPrefill {
+            request,
+            slot,
+            sampling,
+            tokenizer,
+            cached,
+            reserved,
+            consumed: usize::try_from(cached).unwrap_or(usize::MAX),
+            position: cached,
+            selected: None,
+            constraint,
+        })
+    }
+
     pub(super) async fn start_batch_lane(
         &mut self,
         request: PreparedRequest,
