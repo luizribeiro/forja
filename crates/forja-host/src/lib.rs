@@ -4244,35 +4244,41 @@ impl<B: Backend + 'static> Host<B> {
                 forja_core::PagePoolError::ForeignResource.to_string(),
             ));
         }
+        let locked = sequence
+            .lock()
+            .map_err(|_| guest_error(BackendError::ExecutionFailed))?;
+        let handles = tables
+            .iter()
+            .map(|bank| {
+                bank.get(lane)
+                    .copied()
+                    .ok_or_else(|| invalid_handle("paged lane is missing"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let (previous, replacement) = binding
+            .banks
+            .bind_all(lane, &locked)
+            .map_err(|error| compute::Error::Quota(error.to_string()))?;
+        let table = replacement.table();
+        for &table_handle in &handles {
+            if let Err(error) = self.upload_paged_table(table_handle, generations, table) {
+                for dirty in &lane_binding.table_dirty {
+                    dirty.store(true, Ordering::Release);
+                }
+                return match binding.banks.restore_all(lane, previous) {
+                    Ok(()) => Err(error),
+                    Err(restore) => Err(compute::Error::Quota(restore.to_string())),
+                };
+            }
+        }
+        drop(locked);
         *lane_binding
             .sequence
             .lock()
-            .map_err(|_| guest_error(BackendError::ExecutionFailed))? = Some(Arc::clone(&sequence));
+            .map_err(|_| guest_error(BackendError::ExecutionFailed))? = Some(sequence);
         lane_binding.used.store(false, Ordering::Release);
         for dirty in &lane_binding.table_dirty {
-            dirty.store(true, Ordering::Release);
-        }
-        let sequence = sequence
-            .lock()
-            .map_err(|_| guest_error(BackendError::ExecutionFailed))?;
-        for (bank, bank_tables) in tables.iter().enumerate() {
-            match binding.banks.bind(bank, lane, &sequence) {
-                Ok(()) => {
-                    let table = binding
-                        .banks
-                        .slot(bank, lane)
-                        .map_err(|error| compute::Error::Quota(error.to_string()))?
-                        .table()
-                        .clone();
-                    let table_handle = *bank_tables
-                        .get(lane)
-                        .ok_or_else(|| invalid_handle("paged lane is missing"))?;
-                    self.upload_paged_table(table_handle, generations, &table)?;
-                    lane_binding.table_dirty[bank].store(false, Ordering::Release);
-                }
-                Err(forja_core::PagePoolError::SharedTail) => {}
-                Err(error) => return Err(compute::Error::Quota(error.to_string())),
-            }
+            dirty.store(false, Ordering::Release);
         }
         Ok(())
     }
@@ -9672,26 +9678,50 @@ mod tests {
     }
 
     #[test]
-    fn paged_request_binding_defers_busy_slot_updates_until_use() {
+    fn paged_lane_binding_is_atomic_when_a_bank_is_busy() {
         let mut host = Host::new(CpuBackend::new(), GENEROUS);
         let pool = insert_test_pool(&mut host, 1, 16);
         let slot = host.open_paged_slot(&pool, 1).unwrap();
-
-        host.bind_paged_request(pool.rep(), None, 8).unwrap();
+        host.bind_paged_lane(pool.rep(), 0, None, 8).unwrap();
+        let original = host.paged_lane_prefix(pool.rep(), 0).unwrap();
+        let before = [0, 1].map(|bank| {
+            host.table
+                .get(&slot)
+                .unwrap()
+                .binding
+                .banks
+                .slot(bank, 0)
+                .unwrap()
+        });
         host.table
             .get(&slot)
             .unwrap()
             .binding
             .banks
-            .mark_submitted(0, 1)
+            .mark_submitted(1, 1)
             .unwrap();
-        host.bind_paged_request(pool.rep(), None, 8).unwrap();
+        let replacement =
+            super::PagedPrefix::new(host.table.get(&pool).unwrap().pool.reserve(4).unwrap());
 
-        let binding = &host.table.get(&slot).unwrap().binding;
-        assert!(binding.banks.slot(0, 0).unwrap().is_active());
-        assert!(binding.banks.slot(1, 0).unwrap().is_active());
-        assert!(binding.lane(0).unwrap().table_dirty[0].load(Ordering::Acquire));
-        assert!(!binding.lane(0).unwrap().table_dirty[1].load(Ordering::Acquire));
+        assert!(
+            host.bind_paged_lane(pool.rep(), 0, Some(replacement), 4)
+                .is_err()
+        );
+
+        let after = host.paged_lane_prefix(pool.rep(), 0).unwrap();
+        assert!(Arc::ptr_eq(&original.sequence, &after.sequence));
+        for (bank, expected) in before.iter().enumerate() {
+            assert_eq!(
+                host.table
+                    .get(&slot)
+                    .unwrap()
+                    .binding
+                    .banks
+                    .slot(bank, 0)
+                    .unwrap(),
+                *expected
+            );
+        }
     }
 
     #[test]

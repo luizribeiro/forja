@@ -484,6 +484,72 @@ impl PagedSlotBanks {
         Ok(())
     }
 
+    /// Atomically rebinds `sequence` into `lane` in both banks.
+    ///
+    /// # Errors
+    ///
+    /// Returns the prior slots for rollback, or the same refusal as [`Self::bind`] before either
+    /// bank is mutated.
+    pub fn bind_all(
+        &self,
+        lane: usize,
+        sequence: &PagedSequence,
+    ) -> Result<([PagedSlot; 2], PagedSlot), PagePoolError> {
+        if !self.owns_sequence(sequence) {
+            return Err(PagePoolError::ForeignResource);
+        }
+        let table = sequence
+            .table()?
+            .pad_with_poison(self.table_pages)
+            .map_err(|_| PagePoolError::UnreservedWrite)?;
+        for bank in 0..self.banks.len() {
+            self.validate_rebindable(bank, lane)?;
+        }
+        let mut first = self.banks[0]
+            .lock()
+            .map_err(|_| PagePoolError::CorruptState)?;
+        let mut second = self.banks[1]
+            .lock()
+            .map_err(|_| PagePoolError::CorruptState)?;
+        let old = [
+            first
+                .get(lane)
+                .cloned()
+                .ok_or(PagePoolError::ForeignResource)?,
+            second
+                .get(lane)
+                .cloned()
+                .ok_or(PagePoolError::ForeignResource)?,
+        ];
+        let replacement = PagedSlot {
+            table,
+            logical_len: sequence.logical_len,
+            append_start: sequence.logical_len,
+            active: true,
+        };
+        *first.get_mut(lane).ok_or(PagePoolError::ForeignResource)? = replacement.clone();
+        *second.get_mut(lane).ok_or(PagePoolError::ForeignResource)? = replacement.clone();
+        Ok((old, replacement))
+    }
+
+    /// Restores slots returned by [`Self::bind_all`] before the rebound lane can be submitted.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if either bank or lane is unavailable.
+    pub fn restore_all(&self, lane: usize, slots: [PagedSlot; 2]) -> Result<(), PagePoolError> {
+        let [first_slot, second_slot] = slots;
+        let mut first = self.banks[0]
+            .lock()
+            .map_err(|_| PagePoolError::CorruptState)?;
+        let mut second = self.banks[1]
+            .lock()
+            .map_err(|_| PagePoolError::CorruptState)?;
+        *first.get_mut(lane).ok_or(PagePoolError::ForeignResource)? = first_slot;
+        *second.get_mut(lane).ok_or(PagePoolError::ForeignResource)? = second_slot;
+        Ok(())
+    }
+
     /// Replaces one lane with a poisoned inactive slot.
     ///
     /// # Errors
@@ -601,6 +667,29 @@ impl PagedSlotBanks {
             return Err(PagePoolError::SharedTail);
         }
         *pending = None;
+        Ok(())
+    }
+
+    fn validate_rebindable(&self, bank: usize, lane: usize) -> Result<(), PagePoolError> {
+        self.banks
+            .get(bank)
+            .ok_or(PagePoolError::ForeignResource)?
+            .lock()
+            .map_err(|_| PagePoolError::CorruptState)?
+            .get(lane)
+            .ok_or(PagePoolError::ForeignResource)?;
+        let completed = self.pool.lock()?.completed_serial;
+        let submitted = self
+            .submitted
+            .lock()
+            .map_err(|_| PagePoolError::CorruptState)?;
+        if submitted
+            .get(bank)
+            .ok_or(PagePoolError::ForeignResource)?
+            .is_some_and(|serial| serial > completed)
+        {
+            return Err(PagePoolError::SharedTail);
+        }
         Ok(())
     }
 }
