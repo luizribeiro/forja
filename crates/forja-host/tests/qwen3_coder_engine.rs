@@ -250,6 +250,68 @@ async fn assert_batch_graph_modes() -> Result<(), Box<dyn Error>> {
 #[cfg(target_os = "macos")]
 #[tokio::test]
 #[ignore = "requires FORJA_MODELS and runs in the pre-push hook"]
+async fn metal_batch_graph_catalog_stays_within_limit() -> Result<(), Box<dyn Error>> {
+    let mut runner = runner(test_guests::qwen3_coder()).await?;
+    let mut config = load_config()?;
+    config.paged_cache = true;
+    runner.load_with_selections(Some(1), &config).await??;
+
+    for bucket in [1, 2, 4, 8] {
+        let prefix = batch_prefix(&mut runner, 1).await?;
+        runner.prepare_paged_lane(0, Some(prefix), 64)?;
+        let mut lanes = vec![None; usize::try_from(bucket)?];
+        lanes[0] = Some((1, 31));
+        batch_decode(&mut runner, bucket, &lanes, SamplingParams::default()).await?;
+        lanes[0] = Some((2, 37));
+        batch_decode(&mut runner, bucket, &lanes, SamplingParams::default()).await?;
+
+        let prefix = batch_prefix(&mut runner, 1).await?;
+        runner.prepare_paged_lane(0, Some(prefix), 64)?;
+        for (position, token) in [(1, 41), (2, 43)] {
+            let shape = BatchShape {
+                phase: BatchPhase::Decode,
+                bucket,
+                tokens: 1,
+                selection: BatchSelection::Forward,
+            };
+            let mut lanes = vec![None; usize::try_from(bucket)?];
+            lanes[0] = Some(EngineBatchLane {
+                slot: 0,
+                tokens: Some(vec![token]),
+                start_pos: position,
+                sampling: SamplingParams::default(),
+            });
+            let logits = runner.batch_forward(EngineBatch { shape, lanes }).await??;
+            let mut lanes = vec![None; usize::try_from(bucket)?];
+            lanes[0] = Some(EngineBatchSelectLane {
+                start_pos: position,
+                sampling: SamplingParams::default(),
+                allow: vec![47],
+            });
+            let selected = runner
+                .batch_select(
+                    &logits,
+                    EngineBatchSelect {
+                        shape: BatchShape {
+                            selection: BatchSelection::Masked,
+                            ..shape
+                        },
+                        lanes,
+                    },
+                )
+                .await??;
+            assert_eq!(batch_tokens(&runner.read(&selected.tokens).await?)?[0], 47);
+        }
+    }
+
+    assert_eq!(runner.metrics().live_graphs, 2 * 4 * 2);
+    assert_eq!(runner.metrics().prepared_graphs, 2 * 4 * 2);
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[ignore = "requires FORJA_MODELS and runs in the pre-push hook"]
 async fn metal_first_paged_layer_matches_same_byte_reference() -> Result<(), Box<dyn Error>> {
     let root = model_root()?;
     let fixtures = FixtureDirectory::open(root.join("golden/Qwen3-Coder-30B-A3B-Instruct-4bit"))?;
