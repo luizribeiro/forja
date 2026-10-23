@@ -15,13 +15,11 @@ struct Queued {
 }
 pub(crate) struct SchedulerPolicy {
     queue: VecDeque<Queued>,
-    decode: VecDeque<RequestId>,
     prompt: BTreeMap<RequestId, u32>,
     buckets: Vec<u32>,
     active_limit: usize,
     prompt_budget: u32,
     active: usize,
-    submissions: u8,
 }
 impl SchedulerPolicy {
     pub(crate) fn new(
@@ -36,7 +34,7 @@ impl SchedulerPolicy {
                 .last()
                 .copied()
                 .and_then(|value| usize::try_from(value).ok())
-                != Some(active_limit)
+                .is_none_or(|largest| largest < active_limit)
         {
             return Err("decode buckets must span the active-lane ceiling");
         }
@@ -45,13 +43,11 @@ impl SchedulerPolicy {
         }
         Ok(Self {
             queue: VecDeque::new(),
-            decode: VecDeque::new(),
             prompt: BTreeMap::new(),
             buckets,
             active_limit,
             prompt_budget,
             active: 0,
-            submissions: 0,
         })
     }
     pub(crate) fn enqueue(&mut self, admission: Admission) {
@@ -60,19 +56,19 @@ impl SchedulerPolicy {
             bypasses: 0,
         });
     }
-    pub(crate) fn cancel(&mut self, id: RequestId) -> bool {
-        if let Some(index) = self
-            .queue
+
+    pub(crate) fn reconcile_active(&mut self, active: usize) {
+        self.active = active.min(self.active_limit);
+    }
+
+    pub(crate) fn decode_bucket(&self, slots: impl IntoIterator<Item = u32>) -> Option<u32> {
+        let needed = slots.into_iter().map(|slot| slot.saturating_add(1)).max()?;
+        self.buckets
             .iter()
-            .position(|queued| queued.admission.id == id)
-        {
-            self.queue.remove(index);
-            return true;
-        }
-        false
+            .copied()
+            .find(|&bucket| bucket >= needed)
     }
     pub(crate) fn complete(&mut self, id: RequestId) {
-        self.decode.retain(|candidate| *candidate != id);
         self.prompt.remove(&id);
         self.active = self.active.saturating_sub(1);
     }
@@ -122,31 +118,8 @@ impl SchedulerPolicy {
         candidate
     }
 
-    pub(crate) fn ready_decode(&mut self, id: RequestId) {
-        if !self.decode.contains(&id) {
-            self.decode.push_back(id);
-        }
-    }
-
     pub(crate) fn ready_prompt(&mut self, id: RequestId, tokens: u32) {
         self.prompt.insert(id, tokens);
-    }
-
-    pub(crate) fn decode_batches(&mut self) -> Vec<(u32, Vec<RequestId>)> {
-        let mut batches = Vec::new();
-        while !self.decode.is_empty() {
-            let active = self.decode.len().min(self.active_limit);
-            let bucket = self
-                .buckets
-                .iter()
-                .copied()
-                .find(|&bucket| usize::try_from(bucket).is_ok_and(|bucket| bucket >= active))
-                .unwrap_or_else(|| self.buckets[self.buckets.len() - 1]);
-            let count = active.min(usize::try_from(bucket).unwrap_or(usize::MAX));
-            let lanes = self.decode.drain(..count).collect();
-            batches.push((bucket, lanes));
-        }
-        batches
     }
 
     pub(crate) fn prompt_batch(&mut self) -> Vec<(RequestId, u32)> {
@@ -170,22 +143,6 @@ impl SchedulerPolicy {
             }
         }
         batch
-    }
-
-    pub(crate) fn can_submit(&self) -> bool {
-        self.submissions < 2
-    }
-
-    pub(crate) fn submitted(&mut self) -> Result<(), &'static str> {
-        if !self.can_submit() {
-            return Err("scheduler pipeline is full");
-        }
-        self.submissions += 1;
-        Ok(())
-    }
-
-    pub(crate) fn completed_submission(&mut self) {
-        self.submissions = self.submissions.saturating_sub(1);
     }
 }
 
@@ -227,22 +184,14 @@ mod tests {
     }
 
     #[test]
-    fn prioritizes_decode_and_caps_prompt_work_and_pipeline_depth() {
+    fn caps_prompt_work_and_selects_decode_buckets() {
         let mut policy = SchedulerPolicy::new(vec![1, 2, 4, 8], 8, 2_048).unwrap();
-        for id in 1..=5 {
-            policy.ready_decode(RequestId(id));
-        }
-        assert_eq!(policy.decode_batches()[0].0, 8);
         policy.ready_prompt(RequestId(7), 2_000);
         policy.ready_prompt(RequestId(8), 1_000);
         assert_eq!(
             policy.prompt_batch(),
             [(RequestId(7), 2_000), (RequestId(8), 48)]
         );
-        policy.submitted().unwrap();
-        policy.submitted().unwrap();
-        assert!(policy.submitted().is_err());
-        policy.completed_submission();
-        assert!(policy.can_submit());
+        assert_eq!(policy.decode_bucket([0, 2]), Some(4));
     }
 }

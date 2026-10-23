@@ -200,6 +200,14 @@ impl RequestEnvelope {
             self,
             Self::Chat { request, .. } | Self::StreamChat { request, .. }
                 if request.params.tools.is_some()
+                    && !matches!(
+                        request.params.tool_choice.as_ref(),
+                        Some(crate::ToolChoice::Mode(mode)) if mode == "required"
+                    )
+                    && !matches!(
+                        request.params.tool_choice.as_ref(),
+                        Some(crate::ToolChoice::Named(_))
+                    )
         )
     }
 
