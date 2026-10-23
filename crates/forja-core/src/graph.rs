@@ -276,6 +276,20 @@ impl TemplateTensor {
         matches!(self, Self::Symbolic { .. })
     }
 
+    fn parameter_mask(&self) -> u16 {
+        match self {
+            Self::Concrete(_) => 0,
+            Self::Symbolic { layout, .. } => layout.parameter_mask(),
+        }
+    }
+
+    fn endpoint_validation_safe(&self) -> Result<bool, GraphError> {
+        match self {
+            Self::Concrete(_) => Ok(true),
+            Self::Symbolic { layout, .. } => Ok(layout.endpoint_validation_safe()?),
+        }
+    }
+
     fn instantiate(&self, values: &ParamValues) -> Result<Tensor, GraphError> {
         match self {
             Self::Concrete(tensor) => Ok(tensor.clone()),
@@ -408,6 +422,23 @@ pub enum TemplateOp {
 }
 
 impl TemplateOp {
+    const fn parameter_mask(self) -> u16 {
+        match self {
+            Self::Static(_) => 0,
+            Self::Sdpa { q_start, .. } | Self::PagedCopy { start: q_start, .. } => {
+                q_start.parameter_mask()
+            }
+            Self::PagedSdpa {
+                q_start,
+                key_length,
+                ..
+            } => q_start.parameter_mask() | key_length.parameter_mask(),
+            Self::Sample { position, .. } | Self::SampleMasked { position, .. } => {
+                position.parameter_mask()
+            }
+        }
+    }
+
     /// Creates an attention configuration whose query position may depend on one parameter.
     #[must_use]
     pub const fn sdpa(scale: f32, causal: bool, q_start: Affine) -> Self {
@@ -652,6 +683,30 @@ enum DynamicDispatch {
 }
 
 impl DynamicDispatch {
+    fn parameter_mask(&self) -> u16 {
+        let operation = match self {
+            Self::Operation { op, .. } | Self::Epilogue { op, .. } => op.parameter_mask(),
+            Self::Program { .. } => 0,
+        };
+        self.tensors()
+            .fold(operation, |mask, tensor| mask | tensor.parameter_mask())
+    }
+
+    fn endpoint_validation_safe(&self) -> Result<bool, GraphError> {
+        // Fixed extents make resource limits and bindings invariant, while byte hulls already
+        // cover every offset. A single operation parameter is monotone over its two endpoints.
+        let operation_parameters = match self {
+            Self::Operation { op, .. } | Self::Epilogue { op, .. } => op.parameter_mask(),
+            Self::Program { .. } => 0,
+        };
+        if operation_parameters.count_ones() > 1 {
+            return Ok(false);
+        }
+        self.tensors().try_fold(true, |safe, tensor| {
+            Ok(safe && tensor.endpoint_validation_safe()?)
+        })
+    }
+
     fn is_parameter_dependent(&self) -> bool {
         match self {
             Self::Operation {
@@ -1268,7 +1323,7 @@ impl GraphTemplate {
         self.space.values(values)
     }
 
-    /// Validates and records one trusted operation at every parameter-space corner.
+    /// Validates and records one trusted operation over its parameter-space bounds.
     ///
     /// # Errors
     ///
@@ -1283,7 +1338,7 @@ impl GraphTemplate {
         self.dispatch_many(op, inputs, &[output])
     }
 
-    /// Validates and records one trusted multi-output operation at every parameter-space corner.
+    /// Validates and records one trusted multi-output operation over its parameter-space bounds.
     ///
     /// # Errors
     ///
@@ -1345,7 +1400,7 @@ impl GraphTemplate {
         )
     }
 
-    /// Validates and records one prepared scalar-program dispatch at every corner.
+    /// Validates and records one prepared scalar-program dispatch over its parameter-space bounds.
     ///
     /// # Errors
     ///
@@ -1367,7 +1422,7 @@ impl GraphTemplate {
         )
     }
 
-    /// Validates and records an epilogue-bearing primitive at every parameter-space corner.
+    /// Validates and records an epilogue-bearing primitive over its parameter-space bounds.
     ///
     /// # Errors
     ///
@@ -1507,7 +1562,12 @@ impl GraphTemplate {
         dispatch.check_hull_aliasing()?;
         let accesses = dispatch.accesses()?;
         let hull_accesses = dispatch.hull_accesses()?;
-        let mut corners = self.space.corners().into_iter();
+        let mut corners = if dispatch.endpoint_validation_safe()? {
+            self.space.endpoints()
+        } else {
+            self.space.corners_for(dispatch.parameter_mask())
+        }
+        .into_iter();
         let first = corners
             .next()
             .ok_or(GraphError::ParameterSpaceMismatch)
@@ -1547,7 +1607,12 @@ impl GraphTemplate {
         dispatch.check_hull_aliasing()?;
         let accesses = dispatch.accesses()?;
         let hull_accesses = dispatch.hull_accesses()?;
-        for values in self.space.corners() {
+        let corners = if dispatch.endpoint_validation_safe()? {
+            self.space.endpoints()
+        } else {
+            self.space.corners_for(dispatch.parameter_mask())
+        };
+        for values in corners {
             dispatch.instantiate(&values, self.limits)?;
         }
         self.dispatches.push(TemplateDispatch::Rule {

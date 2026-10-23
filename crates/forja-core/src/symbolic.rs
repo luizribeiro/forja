@@ -10,7 +10,7 @@ static NEXT_PARAM_SPACE_ID: AtomicU64 = AtomicU64::new(0);
 use crate::{Layout, LayoutError, Slice};
 
 /// The largest number of parameters accepted by a symbolic layout.
-pub const MAX_PARAMS: usize = 4;
+pub const MAX_PARAMS: usize = 8;
 
 /// A reason that symbolic parameter construction or evaluation failed.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -50,7 +50,7 @@ pub enum ParamError {
 impl fmt::Display for ParamError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::TooManyParameters => formatter.write_str("parameter count exceeds four"),
+            Self::TooManyParameters => formatter.write_str("parameter count exceeds eight"),
             Self::InvalidRange { index } => {
                 write!(formatter, "parameter {index} has an empty range")
             }
@@ -85,7 +85,7 @@ pub struct ParamSpace {
 }
 
 impl ParamSpace {
-    /// Creates a parameter space containing at most four nonempty ranges.
+    /// Creates a parameter space containing at most eight nonempty ranges.
     ///
     /// # Errors
     ///
@@ -139,7 +139,11 @@ impl ParamSpace {
     }
 
     pub(crate) fn corners(&self) -> Vec<ParamValues> {
-        let count = 1_usize << self.ranges.len();
+        self.corners_for((1_u16 << self.ranges.len()) - 1)
+    }
+
+    pub(crate) fn corners_for(&self, parameters: u16) -> Vec<ParamValues> {
+        let count = 1_usize << parameters.count_ones();
         (0..count)
             .map(|corner| ParamValues {
                 space_id: self.id,
@@ -148,10 +152,12 @@ impl ParamSpace {
                     .iter()
                     .enumerate()
                     .map(|(index, range)| {
-                        if corner & (1 << index) == 0 {
-                            *range.start()
-                        } else {
+                        let bit = 1_u16 << index;
+                        let preceding = (parameters & (bit - 1)).count_ones();
+                        if parameters & bit != 0 && corner & (1 << preceding) != 0 {
                             *range.end()
+                        } else {
+                            *range.start()
                         }
                     })
                     .collect(),
@@ -167,6 +173,14 @@ impl ParamSpace {
                 .iter()
                 .map(|range| if upper { *range.end() } else { *range.start() })
                 .collect(),
+        }
+    }
+
+    pub(crate) fn endpoints(&self) -> Vec<ParamValues> {
+        if self.ranges.is_empty() {
+            vec![self.endpoint_values(false)]
+        } else {
+            vec![self.endpoint_values(false), self.endpoint_values(true)]
         }
     }
 
@@ -254,6 +268,13 @@ impl Affine {
 
     pub(crate) const fn parts(self) -> (u32, Option<(u8, u32)>) {
         (self.offset, self.term)
+    }
+
+    pub(crate) const fn parameter_mask(self) -> u16 {
+        match self.term {
+            Some((parameter, scale)) if scale != 0 => 1_u16 << parameter,
+            _ => 0,
+        }
     }
 }
 
@@ -350,6 +371,25 @@ pub struct SymbolicLayout {
 }
 
 impl SymbolicLayout {
+    pub(crate) fn parameter_mask(&self) -> u16 {
+        self.recipe
+            .iter()
+            .fold(0, |mask, operation| match operation {
+                RecipeOp::Slice { start, len, .. } => {
+                    mask | start.parameter_mask() | len.parameter_mask()
+                }
+                RecipeOp::Permute(_) | RecipeOp::Broadcast(_) | RecipeOp::Reshape(_) => mask,
+            })
+    }
+
+    pub(crate) fn endpoint_validation_safe(&self) -> Result<bool, SymbolicLayoutError> {
+        Ok(self
+            .constraint_facts()?
+            .dimensions
+            .into_iter()
+            .all(Affine::is_constant))
+    }
+
     pub(crate) fn rebase(
         &self,
         byte_offset: u64,
@@ -523,7 +563,10 @@ impl SymbolicLayout {
     }
 
     fn validate_corners(&self) -> Result<(), SymbolicLayoutError> {
-        self.corner_layouts().map(|_| ())
+        self.space
+            .corners_for(self.parameter_mask())
+            .iter()
+            .try_for_each(|values| self.instantiate(values).map(|_| ()))
     }
 
     fn apply_op(
@@ -726,7 +769,8 @@ mod tests {
     use proptest::prelude::*;
 
     use super::{
-        Affine, ByteHull, MAX_PARAMS, ParamError, ParamSpace, SymbolicLayout, SymbolicLayoutError,
+        Affine, ByteHull, LinearAffine, MAX_PARAMS, ParamError, ParamSpace, SymbolicLayout,
+        SymbolicLayoutError,
     };
     use crate::{DType, Layout, LayoutError};
 
@@ -760,6 +804,7 @@ mod tests {
             ParamSpace::new(vec![0..=0; MAX_PARAMS + 1]),
             Err(ParamError::TooManyParameters)
         );
+        assert!(ParamSpace::new(vec![0..=u32::MAX; MAX_PARAMS]).is_ok());
     }
 
     #[test]
@@ -783,6 +828,25 @@ mod tests {
             Affine::parameter(0, 1, 1).evaluate(&largest),
             Err(ParamError::ArithmeticOverflow)
         );
+    }
+
+    #[test]
+    fn scaled_linear_coefficients_refuse_wide_overflow() {
+        for count in 5..=MAX_PARAMS {
+            let mut coefficients = [0; MAX_PARAMS];
+            coefficients[..count].fill(u64::MAX / 4);
+            let affine = LinearAffine {
+                offset: 0,
+                coefficients,
+            };
+            assert_eq!(
+                affine.checked_add_scaled(
+                    Affine::parameter(u8::try_from(count - 1).unwrap(), 0, 4),
+                    u64::MAX / 4 + 1,
+                ),
+                Err(ParamError::ArithmeticOverflow)
+            );
+        }
     }
 
     #[test]
@@ -900,7 +964,7 @@ mod tests {
     }
 
     #[test]
-    fn enumerates_at_most_sixteen_corners() {
+    fn enumerates_parameter_space_corners() {
         let space = ParamSpace::new(vec![0..=1, 2..=3, 4..=5, 6..=7]).unwrap();
         let base = Layout::contiguous(DType::F32, 0, vec![1], 4).unwrap();
         assert_eq!(
@@ -910,6 +974,38 @@ mod tests {
                 .len(),
             16
         );
+    }
+
+    #[test]
+    fn projects_corners_onto_referenced_parameters() {
+        let space = ParamSpace::new(
+            (0..MAX_PARAMS)
+                .map(|index| u32::try_from(index).unwrap()..=9)
+                .collect(),
+        )
+        .unwrap();
+        let corners = space.corners_for((1 << 1) | (1 << 7));
+        assert_eq!(corners.len(), 4);
+        assert_eq!(corners[0].as_slice(), [0, 1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(corners[1].as_slice(), [0, 9, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(corners[2].as_slice(), [0, 1, 2, 3, 4, 5, 6, 9]);
+        assert_eq!(corners[3].as_slice(), [0, 9, 2, 3, 4, 5, 6, 9]);
+    }
+
+    #[test]
+    fn endpoint_validation_requires_parameter_independent_extents() {
+        let range = 0..=7;
+        let space = ParamSpace::new(vec![range]).unwrap();
+        let base = Layout::contiguous(DType::F32, 0, vec![8], 32).unwrap();
+        let offset = SymbolicLayout::new(base.clone(), space.clone())
+            .slice(0, Affine::parameter(0, 0, 1), 1.into(), 1)
+            .unwrap();
+        let extent = SymbolicLayout::new(base, space)
+            .slice(0, 0.into(), Affine::parameter(0, 1, 1), 1)
+            .unwrap();
+
+        assert!(offset.endpoint_validation_safe().unwrap());
+        assert!(!extent.endpoint_validation_safe().unwrap());
     }
 
     #[test]

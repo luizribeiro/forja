@@ -787,6 +787,8 @@ fn linear_bounds(
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
+
     use super::*;
     use crate::{BufferId, Op, Tensor};
 
@@ -952,9 +954,11 @@ mod tests {
 
     #[test]
     fn checked_range_arithmetic_reports_overflow() {
+        let mut coefficients = [0; MAX_PARAMS];
+        coefficients[0] = 1;
         let expression = Expression {
             offset: u64::MAX,
-            coefficients: [1, 0, 0, 0],
+            coefficients,
             product: None,
         };
         let ranges = std::iter::once(1..=1).collect::<Vec<_>>();
@@ -962,6 +966,50 @@ mod tests {
             expression.bounds(&ranges, "overflow fixture"),
             Err(ConstraintProofError::ArithmeticOverflow { .. })
         ));
+    }
+
+    #[test]
+    fn linear_bounds_refuse_many_wide_coefficients() {
+        for count in 5..=MAX_PARAMS {
+            let mut coefficients = [0; MAX_PARAMS];
+            coefficients[..count].fill(u64::MAX / 4);
+            let ranges = vec![1..=1; count];
+            assert!(matches!(
+                linear_bounds(0, coefficients, &ranges, "wide coefficients"),
+                Err(ConstraintProofError::ArithmeticOverflow { .. })
+            ));
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn linear_bounds_match_checked_endpoint_sums(
+            count in 1_usize..=MAX_PARAMS,
+            raw_coefficients in prop::collection::vec(0_u64..=1_000_000, MAX_PARAMS),
+            starts in prop::collection::vec(0_u32..=1_000, MAX_PARAMS),
+            widths in prop::collection::vec(0_u32..=1_000, MAX_PARAMS),
+        ) {
+            let mut coefficients = [0; MAX_PARAMS];
+            coefficients[..count].copy_from_slice(&raw_coefficients[..count]);
+            let ranges = starts[..count]
+                .iter()
+                .zip(&widths[..count])
+                .map(|(&start, &width)| start..=start + width)
+                .collect::<Vec<_>>();
+            let expected = coefficients[..count]
+                .iter()
+                .zip(&ranges)
+                .fold((0_u64, 0_u64), |(minimum, maximum), (&coefficient, range)| {
+                    (
+                        minimum + coefficient * u64::from(*range.start()),
+                        maximum + coefficient * u64::from(*range.end()),
+                    )
+                });
+            prop_assert_eq!(
+                linear_bounds(0, coefficients, &ranges, "generated bounds").unwrap(),
+                expected
+            );
+        }
     }
 
     #[test]
