@@ -439,8 +439,13 @@ struct HttpState<S> {
     generation: RwLock<PublishedGeneration<S>>,
     ready: std::sync::atomic::AtomicBool,
     closed: std::sync::atomic::AtomicBool,
-    active: StdMutex<BTreeMap<u64, GenerationControl>>,
+    active: StdMutex<BTreeMap<u64, ActiveRequest>>,
     drained: tokio::sync::Notify,
+}
+
+struct ActiveRequest {
+    generation: u64,
+    control: GenerationControl,
 }
 
 struct PublishedGeneration<S> {
@@ -528,14 +533,22 @@ pub struct DrainHandle<S> {
     state: Arc<HttpState<S>>,
 }
 
+impl<S> Clone for DrainHandle<S> {
+    fn clone(&self) -> Self {
+        Self {
+            state: Arc::clone(&self.state),
+        }
+    }
+}
+
 impl<S> DrainHandle<S> {
     /// Drains all admitted serving work.
     pub async fn drain(&self) {
         self.state.closed.store(true, Ordering::Release);
         self.state.ready.store(false, Ordering::Release);
         if let Ok(active) = self.state.active.lock() {
-            for control in active.values() {
-                control.cancel();
+            for request in active.values() {
+                request.control.cancel();
             }
         }
         loop {
@@ -554,6 +567,13 @@ impl<S> DrainHandle<S> {
 }
 
 impl<S: ChatService> DrainHandle<S> {
+    /// Makes admission return service-unavailable responses.
+    pub fn set_ready(&self, ready: bool) {
+        if !self.state.closed.load(Ordering::Acquire) {
+            self.state.ready.store(ready, Ordering::Release);
+        }
+    }
+
     /// Publishes a fully built serving generation atomically.
     ///
     /// # Errors
@@ -568,6 +588,49 @@ impl<S: ChatService> DrainHandle<S> {
             .map_err(|_| "runtime state failed")?;
         *active = next;
         Ok(())
+    }
+
+    /// Waits for one generation, cancelling its remaining controls at the deadline.
+    pub async fn drain_generation(&self, generation: u64, deadline: Duration) {
+        self.set_ready(false);
+        let expired = tokio::time::sleep(deadline);
+        tokio::pin!(expired);
+        loop {
+            let notified = self.state.drained.notified();
+            let remaining = self.state.active.lock().map_or(0, |active| {
+                active
+                    .values()
+                    .filter(|request| request.generation == generation)
+                    .count()
+            });
+            if remaining == 0 {
+                return;
+            }
+            tokio::select! {
+                () = &mut expired => break,
+                () = notified => {}
+            }
+        }
+        if let Ok(active) = self.state.active.lock() {
+            for request in active
+                .values()
+                .filter(|request| request.generation == generation)
+            {
+                request.control.cancel();
+            }
+        }
+        loop {
+            let notified = self.state.drained.notified();
+            let done = self.state.active.lock().map_or(true, |active| {
+                active
+                    .values()
+                    .all(|request| request.generation != generation)
+            });
+            if done {
+                return;
+            }
+            notified.await;
+        }
     }
 }
 
@@ -617,7 +680,7 @@ async fn chat<S: ChatService>(
     }
     let model = request.model.clone();
     let control = GenerationControl::new(runtime.write_stall_timeout);
-    let active = match activate(&state, request_id, &control) {
+    let active = match activate(&state, runtime.id, request_id, &control) {
         Ok(active) => active,
         Err(response) => return *response,
     };
@@ -692,7 +755,7 @@ async fn text<S: ChatService>(
     }
     let model = request.model.clone();
     let control = GenerationControl::new(runtime.write_stall_timeout);
-    let active = match activate(&state, request_id, &control) {
+    let active = match activate(&state, runtime.id, request_id, &control) {
         Ok(active) => active,
         Err(response) => return *response,
     };
@@ -762,7 +825,7 @@ async fn stream_chat_response<S: ChatService>(
         );
     }
     let control = GenerationControl::new(runtime.write_stall_timeout);
-    let active = match activate(&state, request_id, &control) {
+    let active = match activate(&state, runtime.id, request_id, &control) {
         Ok(active) => active,
         Err(response) => return *response,
     };
@@ -799,7 +862,7 @@ fn stream_text_response<S: ChatService>(
     let id = format!("cmpl-{created}");
     let (sender, receiver) = mpsc::channel(16);
     let control = GenerationControl::new(runtime.write_stall_timeout);
-    let active = match activate(state, request_id, &control) {
+    let active = match activate(state, runtime.id, request_id, &control) {
         Ok(active) => active,
         Err(response) => return *response,
     };
@@ -1033,6 +1096,7 @@ fn log_completion(
 
 fn activate<S>(
     state: &Arc<HttpState<S>>,
+    generation: u64,
     request_id: u64,
     control: &GenerationControl,
 ) -> Result<ActiveGuard<S>, Box<Response>> {
@@ -1048,7 +1112,13 @@ fn activate<S>(
             "model is unavailable",
         )));
     }
-    active.insert(request_id, control.clone());
+    active.insert(
+        request_id,
+        ActiveRequest {
+            generation,
+            control: control.clone(),
+        },
+    );
     drop(active);
     Ok(ActiveGuard {
         state: Arc::clone(state),
@@ -1593,7 +1663,8 @@ mod tests {
     async fn drain_stops_admission_and_waits_for_finalization() {
         let state = state();
         let control = GenerationControl::new(Duration::from_secs(1));
-        let active = activate(&state, 1, &control).unwrap();
+        let active = activate(&state, 0, 1, &control).unwrap();
+        assert_eq!(state.active.lock().unwrap()[&1].generation, 0);
         let handle = DrainHandle {
             state: Arc::clone(&state),
         };
@@ -1607,7 +1678,7 @@ mod tests {
         drop(active);
         drain.await;
         assert_eq!(
-            activate(&state, 2, &control).err().unwrap().status(),
+            activate(&state, 0, 2, &control).err().unwrap().status(),
             StatusCode::SERVICE_UNAVAILABLE
         );
     }
@@ -1620,6 +1691,32 @@ mod tests {
         };
         handle.publish(7, Smoke).unwrap();
         assert_eq!(state.generation.read().unwrap().id, 7);
+    }
+
+    #[tokio::test]
+    async fn generation_deadline_cancels_only_the_drained_runtime() {
+        let state = state();
+        let handle = DrainHandle {
+            state: Arc::clone(&state),
+        };
+        let old = GenerationControl::new(Duration::from_secs(1));
+        let next = GenerationControl::new(Duration::from_secs(1));
+        let old_guard = activate(&state, 0, 1, &old).unwrap();
+        let next_guard = activate(&state, 1, 2, &next).unwrap();
+        let drain = tokio::spawn(async move {
+            handle.drain_generation(0, Duration::ZERO).await;
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !old.is_cancelled() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!next.is_cancelled());
+        drop(old_guard);
+        drain.await.unwrap();
+        drop(next_guard);
     }
 
     fn state() -> Arc<HttpState<Smoke>> {
