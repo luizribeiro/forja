@@ -3065,6 +3065,9 @@ struct PagedBinding {
     banks: Arc<PagedSlotBanks>,
     lanes: Vec<PagedLaneBinding>,
     activity: [Vec<AtomicBool>; 2],
+    uploaded_activity: [Vec<AtomicBool>; 2],
+    #[cfg(test)]
+    activity_uploads: AtomicU64,
 }
 
 struct PagedLaneBinding {
@@ -3552,6 +3555,11 @@ impl<B: Backend + 'static> Host<B> {
             activity: std::array::from_fn(|_| {
                 (0..active_lanes).map(|_| AtomicBool::new(false)).collect()
             }),
+            uploaded_activity: std::array::from_fn(|_| {
+                (0..active_lanes).map(|_| AtomicBool::new(false)).collect()
+            }),
+            #[cfg(test)]
+            activity_uploads: AtomicU64::new(0),
             lanes: (0..active_lanes)
                 .map(|_| PagedLaneBinding {
                     sequence: Mutex::new(None),
@@ -3769,12 +3777,8 @@ impl<B: Backend + 'static> Host<B> {
             let active = binding.activity[bank]
                 .first()
                 .ok_or_else(|| invalid_handle("paged activity lane is missing"))?;
-            if !active.swap(true, Ordering::AcqRel)
-                && let Err(error) = self.upload_paged_activity(&binding, bank, tensor)
-            {
-                active.store(false, Ordering::Release);
-                return Err(error);
-            }
+            active.store(true, Ordering::Release);
+            self.upload_paged_activity(&binding, bank, tensor, false)?;
         }
         Ok(())
     }
@@ -3948,16 +3952,40 @@ impl<B: Backend + 'static> Host<B> {
         binding: &PagedBinding,
         bank: usize,
         activity_rep: u32,
+        force: bool,
     ) -> Result<(), compute::Error> {
-        let values = binding
+        let activity = binding
             .activity
             .get(bank)
-            .ok_or_else(|| invalid_handle("paged activity bank is missing"))?
+            .ok_or_else(|| invalid_handle("paged activity bank is missing"))?;
+        let uploaded = binding
+            .uploaded_activity
+            .get(bank)
+            .ok_or_else(|| invalid_handle("uploaded paged activity bank is missing"))?;
+        let values = activity
             .iter()
             .map(|active| u32::from(active.load(Ordering::Acquire)))
+            .collect::<Vec<_>>();
+        if !force
+            && values
+                .iter()
+                .zip(uploaded)
+                .all(|(&active, uploaded)| (active != 0) == uploaded.load(Ordering::Acquire))
+        {
+            return Ok(());
+        }
+        let bytes = values
+            .iter()
+            .copied()
             .flat_map(u32::to_ne_bytes)
             .collect::<Vec<_>>();
-        self.write(&Resource::new_borrow(activity_rep), &values)
+        self.write(&Resource::new_borrow(activity_rep), &bytes)?;
+        for (&active, uploaded) in values.iter().zip(uploaded) {
+            uploaded.store(active != 0, Ordering::Release);
+        }
+        #[cfg(test)]
+        binding.activity_uploads.fetch_add(1, Ordering::AcqRel);
+        Ok(())
     }
 
     /// Writes trusted per-lane positions and activity, and poisons every padding lane.
@@ -4035,21 +4063,19 @@ impl<B: Backend + 'static> Host<B> {
                 binding.lane(lane)?.table_dirty[bank].store(true, Ordering::Release);
             }
         }
-        for (handle, values) in metadata.into_iter().zip([
-            logical_lengths,
-            query_starts,
-            absolute_positions,
-            binding.activity[bank]
+        for (handle, values) in
+            metadata[..3]
                 .iter()
-                .map(|active| u32::from(active.load(Ordering::Acquire)))
-                .collect(),
-        ]) {
+                .copied()
+                .zip([logical_lengths, query_starts, absolute_positions])
+        {
             let bytes = values
                 .into_iter()
                 .flat_map(u32::to_ne_bytes)
                 .collect::<Vec<_>>();
             self.write(&Resource::new_borrow(handle), &bytes)?;
         }
+        self.upload_paged_activity(&binding, bank, metadata[3], false)?;
         Ok(())
     }
 
@@ -4385,7 +4411,7 @@ impl<B: Backend + 'static> Host<B> {
             .map_err(|_| guest_error(BackendError::ExecutionFailed))? = Some(sequence);
         for (bank, activity) in binding.activity.iter().enumerate() {
             activity[lane].store(true, Ordering::Release);
-            self.upload_paged_activity(&binding, bank, metadata[bank][3])?;
+            self.upload_paged_activity(&binding, bank, metadata[bank][3], true)?;
         }
         lane_binding.used.store(false, Ordering::Release);
         for dirty in &lane_binding.table_dirty {
@@ -9774,6 +9800,13 @@ mod tests {
                     std::sync::atomic::AtomicBool::new(false),
                 ]
             }),
+            uploaded_activity: std::array::from_fn(|_| {
+                vec![
+                    std::sync::atomic::AtomicBool::new(false),
+                    std::sync::atomic::AtomicBool::new(false),
+                ]
+            }),
+            activity_uploads: AtomicU64::new(0),
             lanes: vec![
                 super::PagedLaneBinding {
                     sequence: Mutex::new(Some(Arc::clone(&sequence))),
@@ -10053,6 +10086,51 @@ mod tests {
                 .unwrap()
                 .is_active()
         );
+    }
+
+    #[test]
+    fn paged_activity_uploads_only_on_transitions_and_rebind() {
+        let mut host = Host::new(CpuBackend::new(), GENEROUS);
+        let pool = insert_test_pool(&mut host, 1, 16);
+        host.table.get_mut(&pool).unwrap().active_lanes = 2;
+        let slot = host.open_paged_slot(&pool, 1).unwrap();
+        host.bind_paged_lane(pool.rep(), 0, None, 8).unwrap();
+        host.bind_paged_lane(pool.rep(), 1, None, 8).unwrap();
+        let uploads = |host: &Host<CpuBackend>| {
+            host.table
+                .get(&slot)
+                .unwrap()
+                .binding
+                .activity_uploads
+                .load(Ordering::Acquire)
+        };
+        assert_eq!(uploads(&host), 4);
+
+        host.write_paged_lane_metadata(pool.rep(), &[Some((0, 1)), None])
+            .unwrap();
+        assert_eq!(uploads(&host), 5);
+        host.write_paged_lane_metadata(pool.rep(), &[Some((1, 1)), None])
+            .unwrap();
+        assert_eq!(uploads(&host), 5);
+
+        host.write_paged_lane_metadata(pool.rep(), &[Some((2, 1)), Some((0, 1))])
+            .unwrap();
+        assert_eq!(uploads(&host), 6);
+        host.write_paged_lane_metadata(pool.rep(), &[Some((3, 1)), Some((1, 1))])
+            .unwrap();
+        assert_eq!(uploads(&host), 6);
+
+        host.advance_paged_batch_bank(slot.rep()).unwrap();
+        host.select_paged_batch_bank(slot.rep()).unwrap();
+        host.write_paged_lane_metadata(pool.rep(), &[Some((4, 1)), Some((2, 1))])
+            .unwrap();
+        assert_eq!(uploads(&host), 6);
+        host.write_paged_lane_metadata(pool.rep(), &[Some((5, 1)), None])
+            .unwrap();
+        assert_eq!(uploads(&host), 7);
+
+        host.bind_paged_lane(pool.rep(), 1, None, 8).unwrap();
+        assert_eq!(uploads(&host), 9);
     }
 
     async fn assert_single_paged_request_defaults_active<B>(backend: B)
