@@ -4,6 +4,7 @@
 
 mod chat_format;
 mod engine;
+mod generation;
 #[doc(hidden)]
 pub mod guidance;
 mod http;
@@ -22,6 +23,7 @@ pub use engine::{
     Completion, FinishReason, GenerationControl, GenerationError, GenerationEvent, PrefilledPrompt,
     ServingEngine, Usage,
 };
+pub use generation::{LoadPlan, ProcessLedger};
 pub use http::{ChatService, DrainHandle, chat_router, operational_router, serving_router};
 pub use metrics::ServingMetrics;
 pub use prefix::PrefixIdentity;
