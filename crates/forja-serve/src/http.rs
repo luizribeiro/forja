@@ -4,7 +4,7 @@ use std::{
     future::Future,
     pin::Pin,
     sync::{
-        Arc, Mutex as StdMutex,
+        Arc, Mutex as StdMutex, RwLock,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, UNIX_EPOCH},
@@ -398,14 +398,11 @@ pub fn chat_router<S: ChatService>(service: S) -> Router {
 /// Builds a serving router and a handle that drains its admitted work.
 pub fn serving_router<S: ChatService>(service: S) -> (Router, DrainHandle<S>) {
     let max_body_bytes = service.max_body_bytes();
-    let served_model = service.model().to_owned();
-    let queue_capacity = usize::try_from(service.queue_length()).unwrap_or(usize::MAX);
+    let generation = PublishedGeneration::new(0, service);
     let state = Arc::new(HttpState {
-        model: served_model,
-        deadline: service.request_deadline(),
-        write_stall_timeout: service.write_stall_timeout(),
-        service: ServiceActor::spawn(service, queue_capacity),
-        draining: std::sync::atomic::AtomicBool::new(false),
+        generation: RwLock::new(generation),
+        ready: std::sync::atomic::AtomicBool::new(true),
+        closed: std::sync::atomic::AtomicBool::new(false),
         active: StdMutex::new(BTreeMap::new()),
         drained: tokio::sync::Notify::new(),
     });
@@ -439,13 +436,62 @@ pub fn operational_router<S: ChatService>(
 }
 
 struct HttpState<S> {
-    model: String,
-    service: ServiceActor<S>,
-    draining: std::sync::atomic::AtomicBool,
+    generation: RwLock<PublishedGeneration<S>>,
+    ready: std::sync::atomic::AtomicBool,
+    closed: std::sync::atomic::AtomicBool,
     active: StdMutex<BTreeMap<u64, GenerationControl>>,
     drained: tokio::sync::Notify,
+}
+
+struct PublishedGeneration<S> {
+    id: u64,
+    model: String,
     deadline: Duration,
     write_stall_timeout: Duration,
+    service: ServiceActor<S>,
+}
+
+impl<S: ChatService> PublishedGeneration<S> {
+    fn new(id: u64, service: S) -> Self {
+        let model = service.model().to_owned();
+        let deadline = service.request_deadline();
+        let write_stall_timeout = service.write_stall_timeout();
+        let queue_capacity = usize::try_from(service.queue_length()).unwrap_or(usize::MAX);
+        Self {
+            id,
+            model,
+            deadline,
+            write_stall_timeout,
+            service: ServiceActor::spawn(service, queue_capacity),
+        }
+    }
+
+    fn snapshot(&self) -> GenerationSnapshot<S> {
+        GenerationSnapshot {
+            id: self.id,
+            model: self.model.clone(),
+            deadline: self.deadline,
+            write_stall_timeout: self.write_stall_timeout,
+            service: self.service.clone(),
+        }
+    }
+}
+
+struct GenerationSnapshot<S> {
+    id: u64,
+    model: String,
+    deadline: Duration,
+    write_stall_timeout: Duration,
+    service: ServiceActor<S>,
+}
+
+impl<S: ChatService> HttpState<S> {
+    fn snapshot(&self) -> Result<GenerationSnapshot<S>, &'static str> {
+        self.generation
+            .read()
+            .map(|generation| generation.snapshot())
+            .map_err(|_| "runtime state failed")
+    }
 }
 
 async fn live() -> Response {
@@ -453,16 +499,20 @@ async fn live() -> Response {
 }
 
 async fn ready<S>(State(state): State<Arc<HttpState<S>>>) -> Response {
-    if state.draining.load(Ordering::Acquire) {
-        (StatusCode::SERVICE_UNAVAILABLE, "not ready\n").into_response()
-    } else {
+    if state.ready.load(Ordering::Acquire) {
         (StatusCode::OK, "ready\n").into_response()
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, "not ready\n").into_response()
     }
 }
 
 async fn prometheus<S: ChatService>(State(state): State<Arc<HttpState<S>>>) -> Response {
-    let ready = !state.draining.load(Ordering::Acquire);
-    let text = state.service.metrics().prometheus(true, ready);
+    let ready = state.ready.load(Ordering::Acquire);
+    let metrics = state.snapshot().map_or_else(
+        |_| ServingMetrics::default(),
+        |runtime| runtime.service.metrics(),
+    );
+    let text = metrics.prometheus(true, ready);
     (
         [(
             header::CONTENT_TYPE,
@@ -481,7 +531,8 @@ pub struct DrainHandle<S> {
 impl<S> DrainHandle<S> {
     /// Drains all admitted serving work.
     pub async fn drain(&self) {
-        self.state.draining.store(true, Ordering::Release);
+        self.state.closed.store(true, Ordering::Release);
+        self.state.ready.store(false, Ordering::Release);
         if let Ok(active) = self.state.active.lock() {
             for control in active.values() {
                 control.cancel();
@@ -499,6 +550,24 @@ impl<S> DrainHandle<S> {
             }
             notified.await;
         }
+    }
+}
+
+impl<S: ChatService> DrainHandle<S> {
+    /// Publishes a fully built serving generation atomically.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the runtime lock is poisoned.
+    pub fn publish(&self, generation: u64, service: S) -> Result<(), &'static str> {
+        let next = PublishedGeneration::new(generation, service);
+        let mut active = self
+            .state
+            .generation
+            .write()
+            .map_err(|_| "runtime state failed")?;
+        *active = next;
+        Ok(())
     }
 }
 
@@ -527,7 +596,11 @@ async fn chat<S: ChatService>(
     request: Request,
 ) -> Response {
     let request_id = next_request_id();
-    let deadline = tokio::time::Instant::now() + state.deadline;
+    let runtime = match state.snapshot() {
+        Ok(runtime) => runtime,
+        Err(error) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, error),
+    };
+    let deadline = tokio::time::Instant::now() + runtime.deadline;
     let body = match body(request).await {
         Ok(body) => body,
         Err(error) => return body_error(&error),
@@ -536,19 +609,19 @@ async fn chat<S: ChatService>(
         Ok(request) => request,
         Err(error) => return api_error(StatusCode::BAD_REQUEST, &error.to_string()),
     };
-    if request.model != state.model {
+    if request.model != runtime.model {
         return api_error(StatusCode::NOT_FOUND, "model is not loaded");
     }
     if request.params.stream {
-        return stream_chat_response(state, request, request_id, deadline).await;
+        return stream_chat_response(state, runtime, request, request_id, deadline).await;
     }
     let model = request.model.clone();
-    let control = GenerationControl::new(state.write_stall_timeout);
+    let control = GenerationControl::new(runtime.write_stall_timeout);
     let active = match activate(&state, request_id, &control) {
         Ok(active) => active,
         Err(response) => return *response,
     };
-    let actor = match state.service.complete(request, control.clone()) {
+    let actor = match runtime.service.complete(request, control.clone()) {
         Ok(receiver) => receiver,
         Err(error) => return actor_error(error),
     };
@@ -579,7 +652,13 @@ async fn chat<S: ChatService>(
             return api_error(StatusCode::GATEWAY_TIMEOUT, "request deadline exceeded");
         }
     };
-    log_completion(request_id, "/v1/chat/completions", &model, &completion);
+    log_completion(
+        runtime.id,
+        request_id,
+        "/v1/chat/completions",
+        &model,
+        &completion,
+    );
     let created = unix_time();
     match chat_response(&format!("chatcmpl-{created}"), created, &model, &completion) {
         Ok(body) => Json(body).into_response(),
@@ -592,7 +671,11 @@ async fn text<S: ChatService>(
     request: Request,
 ) -> Response {
     let request_id = next_request_id();
-    let deadline = tokio::time::Instant::now() + state.deadline;
+    let runtime = match state.snapshot() {
+        Ok(runtime) => runtime,
+        Err(error) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, error),
+    };
+    let deadline = tokio::time::Instant::now() + runtime.deadline;
     let body = match body(request).await {
         Ok(body) => body,
         Err(error) => return body_error(&error),
@@ -601,19 +684,19 @@ async fn text<S: ChatService>(
         Ok(request) => request,
         Err(error) => return api_error(StatusCode::BAD_REQUEST, &error.to_string()),
     };
-    if request.model != state.model {
+    if request.model != runtime.model {
         return api_error(StatusCode::NOT_FOUND, "model is not loaded");
     }
     if request.params.stream {
-        return stream_text_response(&state, request, request_id, deadline);
+        return stream_text_response(&state, &runtime, request, request_id, deadline);
     }
     let model = request.model.clone();
-    let control = GenerationControl::new(state.write_stall_timeout);
+    let control = GenerationControl::new(runtime.write_stall_timeout);
     let active = match activate(&state, request_id, &control) {
         Ok(active) => active,
         Err(response) => return *response,
     };
-    let actor = match state.service.complete_text(request, control.clone()) {
+    let actor = match runtime.service.complete_text(request, control.clone()) {
         Ok(receiver) => receiver,
         Err(error) => return actor_error(error),
     };
@@ -644,7 +727,13 @@ async fn text<S: ChatService>(
             return api_error(StatusCode::GATEWAY_TIMEOUT, "request deadline exceeded");
         }
     };
-    log_completion(request_id, "/v1/completions", &model, &completion);
+    log_completion(
+        runtime.id,
+        request_id,
+        "/v1/completions",
+        &model,
+        &completion,
+    );
     let created = unix_time();
     match text_response(&format!("cmpl-{created}"), created, &model, &completion) {
         Ok(body) => Json(body).into_response(),
@@ -654,11 +743,12 @@ async fn text<S: ChatService>(
 
 async fn stream_chat_response<S: ChatService>(
     state: Arc<HttpState<S>>,
+    runtime: GenerationSnapshot<S>,
     request: ChatCompletionRequest,
     request_id: u64,
     deadline: tokio::time::Instant,
 ) -> Response {
-    if request.model != state.model {
+    if request.model != runtime.model {
         return api_error(StatusCode::NOT_FOUND, "model is not loaded");
     }
     let model = request.model.clone();
@@ -671,12 +761,12 @@ async fn stream_chat_response<S: ChatService>(
             "cannot start response stream",
         );
     }
-    let control = GenerationControl::new(state.write_stall_timeout);
+    let control = GenerationControl::new(runtime.write_stall_timeout);
     let active = match activate(&state, request_id, &control) {
         Ok(active) => active,
         Err(response) => return *response,
     };
-    let actor = match state
+    let actor = match runtime
         .service
         .stream_chat(request, sender.clone(), control.clone())
     {
@@ -696,23 +786,24 @@ async fn stream_chat_response<S: ChatService>(
 
 fn stream_text_response<S: ChatService>(
     state: &Arc<HttpState<S>>,
+    runtime: &GenerationSnapshot<S>,
     request: CompletionRequest,
     request_id: u64,
     deadline: tokio::time::Instant,
 ) -> Response {
-    if request.model != state.model {
+    if request.model != runtime.model {
         return api_error(StatusCode::NOT_FOUND, "model is not loaded");
     }
     let model = request.model.clone();
     let created = unix_time();
     let id = format!("cmpl-{created}");
     let (sender, receiver) = mpsc::channel(16);
-    let control = GenerationControl::new(state.write_stall_timeout);
+    let control = GenerationControl::new(runtime.write_stall_timeout);
     let active = match activate(state, request_id, &control) {
         Ok(active) => active,
         Err(response) => return *response,
     };
-    let actor = match state
+    let actor = match runtime
         .service
         .stream_text(request, sender.clone(), control.clone())
     {
@@ -879,15 +970,24 @@ fn stream_usage(usage: Usage) -> Value {
 }
 
 async fn models<S: ChatService>(State(state): State<Arc<HttpState<S>>>) -> Response {
-    Json(json!({"object": "list", "data": [model_object(&state.model)]})).into_response()
+    match state.snapshot() {
+        Ok(runtime) => {
+            Json(json!({"object": "list", "data": [model_object(&runtime.model)]})).into_response()
+        }
+        Err(error) => api_error(StatusCode::INTERNAL_SERVER_ERROR, error),
+    }
 }
 
 async fn model<S: ChatService>(
     State(state): State<Arc<HttpState<S>>>,
     Path(requested): Path<String>,
 ) -> Response {
-    if requested == state.model {
-        Json(model_object(&state.model)).into_response()
+    let runtime = match state.snapshot() {
+        Ok(runtime) => runtime,
+        Err(error) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, error),
+    };
+    if requested == runtime.model {
+        Json(model_object(&runtime.model)).into_response()
     } else {
         api_error(StatusCode::NOT_FOUND, "model is not loaded")
     }
@@ -909,11 +1009,17 @@ fn next_request_id() -> u64 {
         .unwrap_or(u64::MAX)
 }
 
-fn log_completion(request_id: u64, route: &str, model: &str, completion: &Completion) {
+fn log_completion(
+    config_generation: u64,
+    request_id: u64,
+    route: &str,
+    model: &str,
+    completion: &Completion,
+) {
     tracing::info!(
         event = "request.completed",
         request_id,
-        config_generation = 0,
+        config_generation,
         model,
         route,
         outcome = "ok",
@@ -936,10 +1042,10 @@ fn activate<S>(
             "admission state failed",
         ))
     })?;
-    if state.draining.load(Ordering::Acquire) {
+    if state.closed.load(Ordering::Acquire) || !state.ready.load(Ordering::Acquire) {
         return Err(Box::new(api_error(
             StatusCode::SERVICE_UNAVAILABLE,
-            "server is draining",
+            "model is unavailable",
         )));
     }
     active.insert(request_id, control.clone());
@@ -1262,7 +1368,7 @@ mod tests {
             metrics.headers()[header::CONTENT_TYPE],
             "text/plain; version=0.0.4; charset=utf-8"
         );
-        state.draining.store(true, Ordering::Release);
+        state.ready.store(false, Ordering::Release);
         assert_eq!(
             ready::<Smoke>(State(state)).await.status(),
             StatusCode::SERVICE_UNAVAILABLE
@@ -1299,12 +1405,19 @@ mod tests {
 
         let chat_response = chat::<Smoke>(State(Arc::clone(&state)), request(chat_request)).await;
         let text_response = text::<Smoke>(State(Arc::clone(&state)), request(text_request)).await;
-        let stream_chat = serde_json::from_slice(chat_request).unwrap();
-        let stream_text = serde_json::from_slice(text_request).unwrap();
+        let stream_chat: ChatCompletionRequest = serde_json::from_slice(chat_request).unwrap();
+        let stream_text: CompletionRequest = serde_json::from_slice(text_request).unwrap();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
-        let stream_chat_response =
-            stream_chat_response(Arc::clone(&state), stream_chat, 1, deadline).await;
-        let stream_text_response = stream_text_response(&state, stream_text, 2, deadline);
+        let stream_chat_response = stream_chat_response(
+            Arc::clone(&state),
+            state.snapshot().unwrap(),
+            stream_chat,
+            1,
+            deadline,
+        )
+        .await;
+        let runtime = state.snapshot().unwrap();
+        let stream_text_response = stream_text_response(&state, &runtime, stream_text, 2, deadline);
 
         assert_eq!(chat_response.status(), StatusCode::NOT_FOUND);
         assert_eq!(text_response.status(), StatusCode::NOT_FOUND);
@@ -1404,7 +1517,7 @@ mod tests {
             token_ids: vec![1, 2],
         };
         tracing::subscriber::with_default(subscriber, || {
-            log_completion(7, "/v1/completions", "model", &completion);
+            log_completion(3, 7, "/v1/completions", "model", &completion);
         });
         let output = String::from_utf8(output.lock().unwrap().clone()).unwrap();
         assert!(output.contains("request.completed"));
@@ -1450,20 +1563,9 @@ mod tests {
     #[tokio::test]
     async fn deadline_replies_before_finalization_and_retains_admission() {
         let release = Arc::new(tokio::sync::Notify::new());
-        let state = Arc::new(HttpState {
-            model: "smoke".to_owned(),
-            service: ServiceActor::spawn(
-                DeadlineSmoke {
-                    release: Arc::clone(&release),
-                    block_next: true,
-                },
-                1,
-            ),
-            deadline: Duration::from_millis(30),
-            write_stall_timeout: Duration::from_secs(1),
-            draining: std::sync::atomic::AtomicBool::new(false),
-            active: StdMutex::new(BTreeMap::new()),
-            drained: tokio::sync::Notify::new(),
+        let state = test_state(DeadlineSmoke {
+            release: Arc::clone(&release),
+            block_next: true,
         });
         let body = br#"{"model":"smoke","messages":[]}"#;
         let started = tokio::time::Instant::now();
@@ -1510,13 +1612,25 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn publishes_a_complete_runtime_generation() {
+        let state = state();
+        let handle = DrainHandle {
+            state: Arc::clone(&state),
+        };
+        handle.publish(7, Smoke).unwrap();
+        assert_eq!(state.generation.read().unwrap().id, 7);
+    }
+
     fn state() -> Arc<HttpState<Smoke>> {
+        test_state(Smoke)
+    }
+
+    fn test_state<S: ChatService>(service: S) -> Arc<HttpState<S>> {
         Arc::new(HttpState {
-            model: "smoke".to_owned(),
-            service: ServiceActor::spawn(Smoke, 1),
-            deadline: Duration::from_secs(1),
-            write_stall_timeout: Duration::from_secs(1),
-            draining: std::sync::atomic::AtomicBool::new(false),
+            generation: RwLock::new(PublishedGeneration::new(0, service)),
+            ready: std::sync::atomic::AtomicBool::new(true),
+            closed: std::sync::atomic::AtomicBool::new(false),
             active: StdMutex::new(BTreeMap::new()),
             drained: tokio::sync::Notify::new(),
         })
