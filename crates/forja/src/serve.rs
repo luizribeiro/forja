@@ -223,7 +223,7 @@ mod tests {
                 let request = request.clone();
                 tokio::task::spawn_blocking(move || http_completion(address, &request))
                     .await?
-                    .map_err(|error| error.to_string())?
+                    .map_err(|error| format!("repeated reference {temperature}/{seed}: {error}"))?
             };
             let clients = (0..4)
                 .map(|_| {
@@ -231,25 +231,32 @@ mod tests {
                     tokio::task::spawn_blocking(move || http_completion(address, &request))
                 })
                 .collect::<Vec<_>>();
-            for client in clients {
-                assert_eq!(client.await?.map_err(|error| error.to_string())?, reference);
+            for (index, client) in clients.into_iter().enumerate() {
+                assert_eq!(
+                    client.await?.map_err(|error| format!(
+                        "repeated client {temperature}/{seed}/{index}: {error}"
+                    ))?,
+                    reference
+                );
             }
         }
         let mut expected = Vec::with_capacity(groups.len());
-        for group in &groups {
+        for (group_index, group) in groups.iter().enumerate() {
             let mut outputs = Vec::with_capacity(group.len());
-            for (request, _) in group {
+            for (request_index, (request, _)) in group.iter().enumerate() {
                 let request = request.clone();
                 outputs.push(
                     tokio::task::spawn_blocking(move || http_completion(address, &request))
                         .await?
-                        .map_err(|error| error.to_string())?,
+                        .map_err(|error| {
+                            format!("serial group {group_index}/{request_index}: {error}")
+                        })?,
                 );
             }
             expected.push(outputs);
         }
         let mut actual = Vec::with_capacity(groups.len());
-        for group in groups {
+        for (group_index, group) in groups.into_iter().enumerate() {
             let clients = group
                 .into_iter()
                 .map(|(request, delay)| {
@@ -260,8 +267,10 @@ mod tests {
                 })
                 .collect::<Vec<_>>();
             let mut outputs = Vec::with_capacity(clients.len());
-            for client in clients {
-                outputs.push(client.await?.map_err(|error| error.to_string())?);
+            for (request_index, client) in clients.into_iter().enumerate() {
+                outputs.push(client.await?.map_err(|error| {
+                    format!("concurrent group {group_index}/{request_index}: {error}")
+                })?);
             }
             actual.push(outputs);
         }
