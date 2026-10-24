@@ -139,7 +139,7 @@ where
         let hit = match self
             .prefix_index
             .as_mut()
-            .filter(|_| self.config.serving.prefix_reuse)
+            .filter(|_| request.prefix_reuse)
             .map(|index| index.lookup(self.prefix_namespace, &request.tokens, reserved))
             .transpose()
         {

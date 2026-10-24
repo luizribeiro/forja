@@ -59,6 +59,8 @@ impl CompletionSink {
 }
 
 struct PreparedRequest {
+    generation: u64,
+    prefix_reuse: bool,
     tokens: Vec<u32>,
     prompt_tokens: u32,
     params: ResolvedParams,
@@ -79,6 +81,8 @@ impl PreparedRequest {
         B: Backend + Send + Sync + 'static,
     {
         let Self {
+            generation: _,
+            prefix_reuse: _,
             tokens,
             prompt_tokens,
             params,
@@ -109,18 +113,21 @@ enum RequestEnvelope {
         reply: oneshot::Sender<Result<(), GenerationError>>,
     },
     Chat {
+        policy: crate::http::AdmissionPolicy,
         request: ChatCompletionRequest,
         control: GenerationControl,
         reply: oneshot::Sender<Result<Completion, GenerationError>>,
         queued: Instant,
     },
     Text {
+        policy: crate::http::AdmissionPolicy,
         request: CompletionRequest,
         control: GenerationControl,
         reply: oneshot::Sender<Result<Completion, GenerationError>>,
         queued: Instant,
     },
     StreamChat {
+        policy: crate::http::AdmissionPolicy,
         request: ChatCompletionRequest,
         events: mpsc::Sender<GenerationEvent>,
         control: GenerationControl,
@@ -128,6 +135,7 @@ enum RequestEnvelope {
         queued: Instant,
     },
     StreamText {
+        policy: crate::http::AdmissionPolicy,
         request: CompletionRequest,
         events: mpsc::Sender<GenerationEvent>,
         control: GenerationControl,
@@ -149,34 +157,40 @@ impl RequestEnvelope {
                 reply,
             },
             ServiceCommand::Chat {
+                policy,
                 request,
                 control,
                 reply,
                 queued,
             } => Self::Chat {
+                policy,
                 request,
                 control,
                 reply,
                 queued,
             },
             ServiceCommand::Text {
+                policy,
                 request,
                 control,
                 reply,
                 queued,
             } => Self::Text {
+                policy,
                 request,
                 control,
                 reply,
                 queued,
             },
             ServiceCommand::StreamChat {
+                policy,
                 request,
                 events,
                 control,
                 reply,
                 queued,
             } => Self::StreamChat {
+                policy,
                 request,
                 events,
                 control,
@@ -184,12 +198,14 @@ impl RequestEnvelope {
                 queued,
             },
             ServiceCommand::StreamText {
+                policy,
                 request,
                 events,
                 control,
                 reply,
                 queued,
             } => Self::StreamText {
+                policy,
                 request,
                 events,
                 control,
@@ -231,7 +247,7 @@ impl RequestEnvelope {
         B: Backend + Send + Sync + 'static,
     {
         let started = Instant::now();
-        let (prepared, request_params, control, sink) = match self {
+        let (prepared, request_params, control, sink, policy) = match self {
             Self::UpdatePolicy { reply, .. } => {
                 drop(reply.send(Err(GenerationError::new(
                     "policy update reached request preparation",
@@ -239,26 +255,41 @@ impl RequestEnvelope {
                 return None;
             }
             Self::Chat {
+                policy,
                 request,
                 control,
                 reply,
                 queued: _,
             } => {
                 let params = request.params.clone();
-                let prepared = prepare_chat(engine, &request, &control).await;
-                (prepared, params, control, CompletionSink::Complete(reply))
+                let prepared = prepare_chat(engine, &request, &policy.config, &control).await;
+                (
+                    prepared,
+                    params,
+                    control,
+                    CompletionSink::Complete(reply),
+                    policy,
+                )
             }
             Self::Text {
+                policy,
                 request,
                 control,
                 reply,
                 queued: _,
             } => {
                 let params = request.params.clone();
-                let prepared = prepare_text(engine, &request, &control).await;
-                (prepared, params, control, CompletionSink::Complete(reply))
+                let prepared = prepare_text(engine, &request, &policy.config, &control).await;
+                (
+                    prepared,
+                    params,
+                    control,
+                    CompletionSink::Complete(reply),
+                    policy,
+                )
             }
             Self::StreamChat {
+                policy,
                 request,
                 events,
                 control,
@@ -266,15 +297,17 @@ impl RequestEnvelope {
                 queued: _,
             } => {
                 let params = request.params.clone();
-                let prepared = prepare_chat(engine, &request, &control).await;
+                let prepared = prepare_chat(engine, &request, &policy.config, &control).await;
                 (
                     prepared,
                     params,
                     control,
                     CompletionSink::Stream { events, reply },
+                    policy,
                 )
             }
             Self::StreamText {
+                policy,
                 request,
                 events,
                 control,
@@ -282,17 +315,20 @@ impl RequestEnvelope {
                 queued: _,
             } => {
                 let params = request.params.clone();
-                let prepared = prepare_text(engine, &request, &control).await;
+                let prepared = prepare_text(engine, &request, &policy.config, &control).await;
                 (
                     prepared,
                     params,
                     control,
                     CompletionSink::Stream { events, reply },
+                    policy,
                 )
             }
         };
         match prepared {
             Ok((tokens, prompt_tokens, params, constraint)) => Some(PreparedRequest {
+                generation: policy.generation,
+                prefix_reuse: policy.config.serving.prefix_reuse,
                 tokens,
                 prompt_tokens,
                 params,
@@ -313,6 +349,7 @@ impl RequestEnvelope {
 async fn prepare_chat<B>(
     engine: &mut ServingEngine<B>,
     request: &ChatCompletionRequest,
+    config: &forja_config::HostConfig,
     control: &GenerationControl,
 ) -> Result<(Vec<u32>, u32, ResolvedParams, Option<ConstraintPlan>), GenerationError>
 where
@@ -320,7 +357,7 @@ where
 {
     prepare_chat_prompt(
         request,
-        &engine.config,
+        config,
         &engine.chat_info,
         engine.max_context,
         engine.info.vocab,
@@ -333,6 +370,7 @@ where
 async fn prepare_text<B>(
     engine: &mut ServingEngine<B>,
     request: &CompletionRequest,
+    config: &forja_config::HostConfig,
     control: &GenerationControl,
 ) -> Result<(Vec<u32>, u32, ResolvedParams, Option<ConstraintPlan>), GenerationError>
 where
@@ -340,7 +378,7 @@ where
 {
     prepare_completion_prompt(
         request,
-        &engine.config,
+        config,
         &engine.chat_info,
         engine.max_context,
         engine.info.vocab,

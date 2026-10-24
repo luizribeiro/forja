@@ -853,6 +853,10 @@ where
         &self.metrics
     }
 
+    pub(crate) fn host_config(&self) -> HostConfig {
+        self.config.clone()
+    }
+
     pub(crate) fn update_policy(
         &mut self,
         generation: u64,

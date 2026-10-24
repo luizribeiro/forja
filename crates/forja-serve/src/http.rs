@@ -52,6 +52,11 @@ pub trait ChatService: Send + 'static {
     /// Maximum time a streaming event may remain backpressured.
     fn write_stall_timeout(&self) -> Duration;
 
+    /// Current immutable admission policy.
+    fn host_config(&self) -> HostConfig {
+        HostConfig::default()
+    }
+
     /// Snapshot of currently accumulated bounded metrics.
     fn metrics(&self) -> ServingMetrics {
         ServingMetrics::default()
@@ -150,6 +155,10 @@ where
         self.write_stall_timeout()
     }
 
+    fn host_config(&self) -> HostConfig {
+        self.host_config()
+    }
+
     fn metrics(&self) -> ServingMetrics {
         self.metrics().clone()
     }
@@ -219,18 +228,21 @@ pub enum ServiceCommand {
         reply: oneshot::Sender<Result<(), GenerationError>>,
     },
     Chat {
+        policy: AdmissionPolicy,
         request: ChatCompletionRequest,
         control: GenerationControl,
         reply: oneshot::Sender<Result<Completion, GenerationError>>,
         queued: std::time::Instant,
     },
     Text {
+        policy: AdmissionPolicy,
         request: CompletionRequest,
         control: GenerationControl,
         reply: oneshot::Sender<Result<Completion, GenerationError>>,
         queued: std::time::Instant,
     },
     StreamChat {
+        policy: AdmissionPolicy,
         request: ChatCompletionRequest,
         events: mpsc::Sender<GenerationEvent>,
         control: GenerationControl,
@@ -238,12 +250,20 @@ pub enum ServiceCommand {
         queued: std::time::Instant,
     },
     StreamText {
+        policy: AdmissionPolicy,
         request: CompletionRequest,
         events: mpsc::Sender<GenerationEvent>,
         control: GenerationControl,
         reply: oneshot::Sender<Result<(), GenerationError>>,
         queued: std::time::Instant,
     },
+}
+
+#[derive(Clone)]
+#[doc(hidden)]
+pub struct AdmissionPolicy {
+    pub(crate) generation: u64,
+    pub(crate) config: Arc<HostConfig>,
 }
 
 impl ServiceCommand {
@@ -287,13 +307,15 @@ impl<S: ChatService> ServiceActor<S> {
         }
     }
 
-    fn complete(
+    fn complete_with_policy(
         &self,
+        policy: AdmissionPolicy,
         request: ChatCompletionRequest,
         control: GenerationControl,
     ) -> Result<oneshot::Receiver<Result<Completion, GenerationError>>, ActorError> {
         let (reply, receiver) = oneshot::channel();
         self.send(ServiceCommand::Chat {
+            policy,
             request,
             control,
             reply,
@@ -302,13 +324,24 @@ impl<S: ChatService> ServiceActor<S> {
         Ok(receiver)
     }
 
-    fn complete_text(
+    #[cfg(test)]
+    fn complete(
         &self,
+        request: ChatCompletionRequest,
+        control: GenerationControl,
+    ) -> Result<oneshot::Receiver<Result<Completion, GenerationError>>, ActorError> {
+        self.complete_with_policy(test_policy(), request, control)
+    }
+
+    fn complete_text_with_policy(
+        &self,
+        policy: AdmissionPolicy,
         request: CompletionRequest,
         control: GenerationControl,
     ) -> Result<oneshot::Receiver<Result<Completion, GenerationError>>, ActorError> {
         let (reply, receiver) = oneshot::channel();
         self.send(ServiceCommand::Text {
+            policy,
             request,
             control,
             reply,
@@ -317,14 +350,25 @@ impl<S: ChatService> ServiceActor<S> {
         Ok(receiver)
     }
 
-    fn stream_chat(
+    #[cfg(test)]
+    fn complete_text(
         &self,
+        request: CompletionRequest,
+        control: GenerationControl,
+    ) -> Result<oneshot::Receiver<Result<Completion, GenerationError>>, ActorError> {
+        self.complete_text_with_policy(test_policy(), request, control)
+    }
+
+    fn stream_chat_with_policy(
+        &self,
+        policy: AdmissionPolicy,
         request: ChatCompletionRequest,
         events: mpsc::Sender<GenerationEvent>,
         control: GenerationControl,
     ) -> Result<oneshot::Receiver<Result<(), GenerationError>>, ActorError> {
         let (reply, receiver) = oneshot::channel();
         self.send(ServiceCommand::StreamChat {
+            policy,
             request,
             events,
             control,
@@ -334,14 +378,16 @@ impl<S: ChatService> ServiceActor<S> {
         Ok(receiver)
     }
 
-    fn stream_text(
+    fn stream_text_with_policy(
         &self,
+        policy: AdmissionPolicy,
         request: CompletionRequest,
         events: mpsc::Sender<GenerationEvent>,
         control: GenerationControl,
     ) -> Result<oneshot::Receiver<Result<(), GenerationError>>, ActorError> {
         let (reply, receiver) = oneshot::channel();
         self.send(ServiceCommand::StreamText {
+            policy,
             request,
             events,
             control,
@@ -349,6 +395,16 @@ impl<S: ChatService> ServiceActor<S> {
             queued: std::time::Instant::now(),
         })?;
         Ok(receiver)
+    }
+
+    #[cfg(test)]
+    fn stream_text(
+        &self,
+        request: CompletionRequest,
+        events: mpsc::Sender<GenerationEvent>,
+        control: GenerationControl,
+    ) -> Result<oneshot::Receiver<Result<(), GenerationError>>, ActorError> {
+        self.stream_text_with_policy(test_policy(), request, events, control)
     }
 
     fn send(&self, command: ServiceCommand) -> Result<(), ActorError> {
@@ -382,6 +438,14 @@ impl<S: ChatService> ServiceActor<S> {
     }
 }
 
+#[cfg(test)]
+fn test_policy() -> AdmissionPolicy {
+    AdmissionPolicy {
+        generation: 0,
+        config: Arc::new(HostConfig::default()),
+    }
+}
+
 async fn run_serial<S: ChatService>(
     mut service: S,
     mut receiver: mpsc::Receiver<ServiceCommand>,
@@ -401,18 +465,21 @@ async fn run_serial<S: ChatService>(
         let scheduled = std::time::Instant::now();
         match command {
             ServiceCommand::Chat {
+                policy: _,
                 request,
                 control,
                 reply,
                 ..
             } => drop(reply.send(service.complete(request, control).await)),
             ServiceCommand::Text {
+                policy: _,
                 request,
                 control,
                 reply,
                 ..
             } => drop(reply.send(service.complete_text(request, control).await)),
             ServiceCommand::StreamChat {
+                policy: _,
                 request,
                 events,
                 control,
@@ -420,6 +487,7 @@ async fn run_serial<S: ChatService>(
                 ..
             } => drop(reply.send(service.stream_chat(request, events, control).await)),
             ServiceCommand::StreamText {
+                policy: _,
                 request,
                 events,
                 control,
@@ -511,6 +579,7 @@ struct PublishedGeneration<S> {
     deadline: Duration,
     write_stall_timeout: Duration,
     service: ServiceActor<S>,
+    config: Arc<HostConfig>,
 }
 
 impl<S: ChatService> PublishedGeneration<S> {
@@ -518,6 +587,7 @@ impl<S: ChatService> PublishedGeneration<S> {
         let model = service.model().to_owned();
         let deadline = service.request_deadline();
         let write_stall_timeout = service.write_stall_timeout();
+        let config = Arc::new(service.host_config());
         let queue_capacity = usize::try_from(service.queue_length()).unwrap_or(usize::MAX);
         Self {
             id,
@@ -525,6 +595,7 @@ impl<S: ChatService> PublishedGeneration<S> {
             deadline,
             write_stall_timeout,
             service: ServiceActor::spawn(service, queue_capacity),
+            config,
         }
     }
 
@@ -535,6 +606,10 @@ impl<S: ChatService> PublishedGeneration<S> {
             deadline: self.deadline,
             write_stall_timeout: self.write_stall_timeout,
             service: self.service.clone(),
+            policy: AdmissionPolicy {
+                generation: self.id,
+                config: Arc::clone(&self.config),
+            },
         }
     }
 }
@@ -545,6 +620,7 @@ struct GenerationSnapshot<S> {
     deadline: Duration,
     write_stall_timeout: Duration,
     service: ServiceActor<S>,
+    policy: AdmissionPolicy,
 }
 
 impl<S: ChatService> HttpState<S> {
@@ -678,6 +754,7 @@ impl<S: ChatService> DrainHandle<S> {
         published.id = generation;
         published.deadline = config.server.request_deadline.get();
         published.write_stall_timeout = config.server.sse_write_stall_timeout.get();
+        published.config = Arc::new(config);
         Ok(())
     }
 
@@ -775,10 +852,14 @@ async fn chat<S: ChatService>(
         Ok(active) => active,
         Err(response) => return *response,
     };
-    let actor = match runtime.service.complete(request, control.clone()) {
-        Ok(receiver) => receiver,
-        Err(error) => return actor_error(error),
-    };
+    let actor =
+        match runtime
+            .service
+            .complete_with_policy(runtime.policy.clone(), request, control.clone())
+        {
+            Ok(receiver) => receiver,
+            Err(error) => return actor_error(error),
+        };
     let (sender, receiver) = oneshot::channel();
     let task_control = control.clone();
     tokio::spawn(async move {
@@ -850,7 +931,11 @@ async fn text<S: ChatService>(
         Ok(active) => active,
         Err(response) => return *response,
     };
-    let actor = match runtime.service.complete_text(request, control.clone()) {
+    let actor = match runtime.service.complete_text_with_policy(
+        runtime.policy.clone(),
+        request,
+        control.clone(),
+    ) {
         Ok(receiver) => receiver,
         Err(error) => return actor_error(error),
     };
@@ -920,10 +1005,12 @@ async fn stream_chat_response<S: ChatService>(
         Ok(active) => active,
         Err(response) => return *response,
     };
-    let actor = match runtime
-        .service
-        .stream_chat(request, sender.clone(), control.clone())
-    {
+    let actor = match runtime.service.stream_chat_with_policy(
+        runtime.policy.clone(),
+        request,
+        sender.clone(),
+        control.clone(),
+    ) {
         Ok(receiver) => receiver,
         Err(error) => return actor_error(error),
     };
@@ -957,10 +1044,12 @@ fn stream_text_response<S: ChatService>(
         Ok(active) => active,
         Err(response) => return *response,
     };
-    let actor = match runtime
-        .service
-        .stream_text(request, sender.clone(), control.clone())
-    {
+    let actor = match runtime.service.stream_text_with_policy(
+        runtime.policy.clone(),
+        request,
+        sender.clone(),
+        control.clone(),
+    ) {
         Ok(receiver) => receiver,
         Err(error) => return actor_error(error),
     };

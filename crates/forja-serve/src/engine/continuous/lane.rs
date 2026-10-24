@@ -70,6 +70,7 @@ pub(super) struct BatchLane {
     token_ids: Vec<u32>,
     ledger: PrefixLedger,
     constraint: Option<BatchConstraint>,
+    prefix_reuse: bool,
 }
 
 pub(super) struct BatchConstraint {
@@ -88,6 +89,7 @@ impl BatchLane {
         tokenizer: tokenizers::Tokenizer,
         constraint: Option<BatchConstraint>,
     ) -> Self {
+        let _generation = request.generation;
         Self {
             slot,
             pending_token,
@@ -109,7 +111,12 @@ impl BatchLane {
             text: String::new(),
             token_ids: Vec::new(),
             constraint,
+            prefix_reuse: request.prefix_reuse,
         }
+    }
+
+    pub(super) const fn prefix_reuse(&self) -> bool {
+        self.prefix_reuse
     }
 
     pub(super) async fn accept(
