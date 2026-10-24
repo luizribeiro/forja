@@ -106,6 +106,22 @@ impl ServingMetrics {
     }
 }
 
+pub(crate) fn operational_prometheus(
+    generation: u64,
+    reload_failures: u64,
+    draining: bool,
+) -> String {
+    let mut output = String::new();
+    gauge_u64(&mut output, "forja_config_generation", generation);
+    counter(
+        &mut output,
+        "forja_config_reload_failures_total",
+        reload_failures,
+    );
+    gauge(&mut output, "forja_model_draining", draining);
+    output
+}
+
 fn gauge(output: &mut String, name: &str, value: bool) {
     output.push_str("# TYPE ");
     output.push_str(name);
@@ -219,5 +235,13 @@ mod tests {
         assert!(text.contains("forja_engine_graph_preparation_nanoseconds_total 17\n"));
         assert!(!text.contains("request_id"));
         assert!(!text.contains("path="));
+    }
+
+    #[test]
+    fn operational_metrics_expose_reload_and_drain_state() {
+        let text = operational_prometheus(7, 3, true);
+        assert!(text.contains("forja_config_generation 7\n"));
+        assert!(text.contains("forja_config_reload_failures_total 3\n"));
+        assert!(text.contains("forja_model_draining 1\n"));
     }
 }

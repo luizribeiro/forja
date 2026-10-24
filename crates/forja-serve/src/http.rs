@@ -526,6 +526,9 @@ pub fn serving_router<S: ChatService>(service: S) -> (Router, DrainHandle<S>) {
     let generation = PublishedGeneration::new(0, service);
     let state = Arc::new(HttpState {
         generation: RwLock::new(Some(generation)),
+        config_generation: AtomicU64::new(0),
+        reload_failures: AtomicU64::new(0),
+        draining: std::sync::atomic::AtomicBool::new(false),
         ready: std::sync::atomic::AtomicBool::new(true),
         closed: std::sync::atomic::AtomicBool::new(false),
         active: StdMutex::new(BTreeMap::new()),
@@ -562,6 +565,9 @@ pub fn operational_router<S: ChatService>(
 
 struct HttpState<S> {
     generation: RwLock<Option<PublishedGeneration<S>>>,
+    config_generation: AtomicU64,
+    reload_failures: AtomicU64,
+    draining: std::sync::atomic::AtomicBool,
     ready: std::sync::atomic::AtomicBool,
     closed: std::sync::atomic::AtomicBool,
     active: StdMutex<BTreeMap<u64, ActiveRequest>>,
@@ -652,7 +658,12 @@ async fn prometheus<S: ChatService>(State(state): State<Arc<HttpState<S>>>) -> R
         |_| ServingMetrics::default(),
         |runtime| runtime.service.metrics(),
     );
-    let text = metrics.prometheus(true, ready);
+    let mut text = metrics.prometheus(true, ready);
+    text.push_str(&crate::metrics::operational_prometheus(
+        state.config_generation.load(Ordering::Acquire),
+        state.reload_failures.load(Ordering::Acquire),
+        state.draining.load(Ordering::Acquire),
+    ));
     (
         [(
             header::CONTENT_TYPE,
@@ -681,6 +692,7 @@ impl<S> DrainHandle<S> {
     pub fn close_admission(&self) {
         self.state.closed.store(true, Ordering::Release);
         self.state.ready.store(false, Ordering::Release);
+        self.state.draining.store(true, Ordering::Release);
     }
 
     /// Drains all admitted serving work.
@@ -711,7 +723,15 @@ impl<S: ChatService> DrainHandle<S> {
     pub fn set_ready(&self, ready: bool) {
         if !self.state.closed.load(Ordering::Acquire) {
             self.state.ready.store(ready, Ordering::Release);
+            if ready {
+                self.state.draining.store(false, Ordering::Release);
+            }
         }
+    }
+
+    /// Records one rejected or failed configuration reload.
+    pub fn note_reload_failure(&self) {
+        self.state.reload_failures.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Publishes a fully built serving generation atomically.
@@ -727,6 +747,9 @@ impl<S: ChatService> DrainHandle<S> {
             .write()
             .map_err(|_| "runtime state failed")?;
         *active = Some(next);
+        self.state
+            .config_generation
+            .store(generation, Ordering::Release);
         Ok(())
     }
 
@@ -780,12 +803,16 @@ impl<S: ChatService> DrainHandle<S> {
         published.deadline = config.server.request_deadline.get();
         published.write_stall_timeout = config.server.sse_write_stall_timeout.get();
         published.config = Arc::new(config);
+        self.state
+            .config_generation
+            .store(generation, Ordering::Release);
         Ok(())
     }
 
     /// Waits for one generation, cancelling its remaining controls at the deadline.
     pub async fn drain_generation(&self, generation: u64, deadline: Duration) {
         self.set_ready(false);
+        self.state.draining.store(true, Ordering::Release);
         let expired = tokio::time::sleep(deadline);
         tokio::pin!(expired);
         loop {
@@ -797,6 +824,7 @@ impl<S: ChatService> DrainHandle<S> {
                     .count()
             });
             if remaining == 0 {
+                self.state.draining.store(false, Ordering::Release);
                 return;
             }
             tokio::select! {
@@ -820,6 +848,7 @@ impl<S: ChatService> DrainHandle<S> {
                     .all(|request| request.generation != generation)
             });
             if done {
+                self.state.draining.store(false, Ordering::Release);
                 return;
             }
             notified.await;
@@ -1965,6 +1994,9 @@ mod tests {
     fn test_state<S: ChatService>(service: S) -> Arc<HttpState<S>> {
         Arc::new(HttpState {
             generation: RwLock::new(Some(PublishedGeneration::new(0, service))),
+            config_generation: AtomicU64::new(0),
+            reload_failures: AtomicU64::new(0),
+            draining: std::sync::atomic::AtomicBool::new(false),
             ready: std::sync::atomic::AtomicBool::new(true),
             closed: std::sync::atomic::AtomicBool::new(false),
             active: StdMutex::new(BTreeMap::new()),
