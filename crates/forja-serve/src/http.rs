@@ -591,6 +591,7 @@ struct PublishedGeneration<S> {
     model: String,
     max_body_bytes: usize,
     declared_active_sequences: u32,
+    body_read_timeout: Duration,
     deadline: Duration,
     write_stall_timeout: Duration,
     service: ServiceActor<S>,
@@ -602,15 +603,17 @@ impl<S: ChatService> PublishedGeneration<S> {
         let model = service.model().to_owned();
         let max_body_bytes = service.max_body_bytes();
         let declared_active_sequences = service.declared_active_sequences();
+        let config = Arc::new(service.host_config());
+        let body_read_timeout = config.server.body_read_timeout.get();
         let deadline = service.request_deadline();
         let write_stall_timeout = service.write_stall_timeout();
-        let config = Arc::new(service.host_config());
         let queue_capacity = tokio::sync::Semaphore::MAX_PERMITS;
         Self {
             id,
             model,
             max_body_bytes,
             declared_active_sequences,
+            body_read_timeout,
             deadline,
             write_stall_timeout,
             service: ServiceActor::spawn(service, queue_capacity),
@@ -624,6 +627,7 @@ impl<S: ChatService> PublishedGeneration<S> {
             model: self.model.clone(),
             max_body_bytes: self.max_body_bytes,
             admission_capacity: admission_capacity(self.declared_active_sequences, &self.config),
+            body_read_timeout: self.body_read_timeout,
             deadline: self.deadline,
             write_stall_timeout: self.write_stall_timeout,
             service: self.service.clone(),
@@ -640,6 +644,7 @@ struct GenerationSnapshot<S> {
     model: String,
     max_body_bytes: usize,
     admission_capacity: usize,
+    body_read_timeout: Duration,
     deadline: Duration,
     write_stall_timeout: Duration,
     service: ServiceActor<S>,
@@ -862,6 +867,7 @@ impl<S: ChatService> DrainHandle<S> {
         published.id = generation;
         published.max_body_bytes =
             usize::try_from(config.request.max_body_bytes.get()).unwrap_or(usize::MAX);
+        published.body_read_timeout = config.server.body_read_timeout.get();
         published.deadline = config.server.request_deadline.get();
         published.write_stall_timeout = config.server.sse_write_stall_timeout.get();
         published.config = Arc::new(config);
@@ -932,8 +938,17 @@ impl<S> Drop for ActiveGuard<S> {
     }
 }
 
-async fn body(request: Request, limit: usize) -> Result<Bytes, axum::Error> {
-    to_bytes(request.into_body(), limit).await
+#[derive(Clone, Copy)]
+enum BodyError {
+    Invalid,
+    Timeout,
+}
+
+async fn body(request: Request, limit: usize, timeout: Duration) -> Result<Bytes, BodyError> {
+    tokio::time::timeout(timeout, to_bytes(request.into_body(), limit))
+        .await
+        .map_err(|_| BodyError::Timeout)?
+        .map_err(|_| BodyError::Invalid)
 }
 
 async fn chat<S: ChatService>(
@@ -949,8 +964,9 @@ async fn chat<S: ChatService>(
         Err(error) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, error),
     };
     let deadline = tokio::time::Instant::now() + runtime.deadline;
-    let Ok(body) = body(request, runtime.max_body_bytes).await else {
-        return body_error();
+    let body = match body(request, runtime.max_body_bytes, runtime.body_read_timeout).await {
+        Ok(body) => body,
+        Err(error) => return body_error(error),
     };
     let request = match serde_json::from_slice::<ChatCompletionRequest>(&body) {
         Ok(request) => request,
@@ -1036,8 +1052,9 @@ async fn text<S: ChatService>(
         Err(error) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, error),
     };
     let deadline = tokio::time::Instant::now() + runtime.deadline;
-    let Ok(body) = body(request, runtime.max_body_bytes).await else {
-        return body_error();
+    let body = match body(request, runtime.max_body_bytes, runtime.body_read_timeout).await {
+        Ok(body) => body,
+        Err(error) => return body_error(error),
     };
     let request = match serde_json::from_slice::<CompletionRequest>(&body) {
         Ok(request) => request,
@@ -1462,11 +1479,14 @@ fn actor_error(error: ActorError) -> Response {
     }
 }
 
-fn body_error() -> Response {
-    api_error(
-        StatusCode::PAYLOAD_TOO_LARGE,
-        "request body exceeds the configured ceiling",
-    )
+fn body_error(error: BodyError) -> Response {
+    match error {
+        BodyError::Invalid => api_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "request body exceeds the configured ceiling",
+        ),
+        BodyError::Timeout => api_error(StatusCode::REQUEST_TIMEOUT, "request body timed out"),
+    }
 }
 
 fn generation_error(error: &GenerationError) -> Response {
@@ -1748,6 +1768,20 @@ mod tests {
         let response =
             chat::<Smoke>(State(state), request(br#"{"model":"smoke","messages":[]}"#)).await;
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn body_read_timeout_bounds_a_stalled_upload() {
+        let (_sender, receiver) = mpsc::channel::<Result<Bytes, std::io::Error>>(1);
+        let request = Request::builder()
+            .body(axum::body::Body::from_stream(
+                tokio_stream::wrappers::ReceiverStream::new(receiver),
+            ))
+            .unwrap();
+        assert!(matches!(
+            body(request, 1024, Duration::from_millis(1)).await,
+            Err(BodyError::Timeout)
+        ));
     }
 
     #[tokio::test]
@@ -2061,6 +2095,7 @@ mod tests {
         };
         let mut config = HostConfig::default();
         config.server.request_deadline = forja_config::Duration::from_secs(9);
+        config.server.body_read_timeout = forja_config::Duration::from_secs(5);
         config.server.queue_length = 0;
         handle.update_policy(8, config.clone()).await.unwrap();
         assert_eq!(state.generation.read().unwrap().as_ref().unwrap().id, 8);
@@ -2069,6 +2104,10 @@ mod tests {
             Duration::from_secs(9)
         );
         assert_eq!(state.snapshot().unwrap().admission_capacity, 1);
+        assert_eq!(
+            state.snapshot().unwrap().body_read_timeout,
+            Duration::from_secs(5)
+        );
 
         config.server.queue_length = 99;
         assert!(handle.update_policy(9, config).await.is_err());
