@@ -1,4 +1,4 @@
-use std::{error::Error, fs};
+use std::{error::Error, fs, future::Future, path::Path, pin::Pin};
 
 use forja_config::{BackendKind, Choice, Engine, Profile};
 use forja_core::Backend;
@@ -11,54 +11,126 @@ use crate::{
     engine::{engine_load_config, limits, validate_engine, weights_path},
 };
 
+pub(crate) struct Loaded<S> {
+    pub(crate) service: S,
+}
+
+pub(crate) type LoadFuture<'a, S> = Pin<Box<dyn Future<Output = Result<Loaded<S>, String>> + 'a>>;
+
+pub(crate) trait RuntimeFactory {
+    type Service: forja_serve::ChatService;
+
+    fn plan(&self, config: &forja_config::HostConfig) -> Result<forja_serve::LoadPlan, String>;
+
+    fn load<'a>(
+        &'a mut self,
+        config: &'a forja_config::HostConfig,
+    ) -> LoadFuture<'a, Self::Service>;
+}
+
 pub(crate) async fn run(options: &Serve) -> Result<(), Box<dyn Error>> {
-    let config = &options.config;
-    let backend_arg = match config.backend.kind {
-        BackendKind::Metal => BackendArg::Metal,
-        BackendKind::Cpu => BackendArg::Cpu,
-    };
-    let (embedded, _) = validate_engine(
-        &config.model.engine,
-        &config.model.model,
-        backend_arg,
-        std::path::Path::new("target/forja-serve"),
-    )?;
-    let source: Profile = toml::from_str(&fs::read_to_string(&config.model.profile)?)?;
-    if source != embedded {
-        return Err("configured profile does not match the engine profile".into());
-    }
-    let load_config = engine_load_config(&config.model.engine, &Engine::default())?;
-    match config.backend.kind {
-        BackendKind::Cpu => {
-            let host_limits = page_pool_limit(limits(&config.limits)?, config);
-            serve_backend(
-                forja_cpu::CpuBackend::new(),
-                host_limits,
-                options,
-                &embedded,
-                &load_config,
-            )
-            .await
-        }
+    match options.config.backend.kind {
+        BackendKind::Cpu => run_factory(CpuFactory, options).await,
         BackendKind::Metal => {
             #[cfg(target_os = "macos")]
             {
-                let replay = config.backend.metal.resolve().graph_replay;
-                let (backend, live_bytes) = crate::engine::metal_backend(
-                    replay,
-                    config.backend.metal.pool_capacity,
-                    &config.limits,
-                )?;
-                let host_limits = page_pool_limit(
-                    crate::engine::limits_for_live_bytes(&config.limits, live_bytes)?,
-                    config,
-                );
-                serve_backend(backend, host_limits, options, &embedded, &load_config).await
+                run_factory(MetalFactory, options).await
             }
             #[cfg(not(target_os = "macos"))]
             Err("the Metal backend requires macOS".into())
         }
     }
+}
+
+struct CpuFactory;
+
+impl RuntimeFactory for CpuFactory {
+    type Service = forja_serve::ServingEngine<forja_cpu::CpuBackend>;
+
+    fn plan(&self, config: &forja_config::HostConfig) -> Result<forja_serve::LoadPlan, String> {
+        validate_config(config, BackendArg::Cpu)?;
+        let retained_bytes = match config.limits.live_bytes {
+            Choice::Auto => 48 * 1024 * 1024 * 1024,
+            Choice::Fixed(bytes) => bytes.get(),
+        };
+        Ok(forja_serve::LoadPlan { retained_bytes })
+    }
+
+    fn load<'a>(
+        &'a mut self,
+        config: &'a forja_config::HostConfig,
+    ) -> LoadFuture<'a, Self::Service> {
+        Box::pin(async move {
+            let host_limits = page_pool_limit(
+                limits(&config.limits).map_err(|error| error.to_string())?,
+                config,
+            );
+            load_engine(forja_cpu::CpuBackend::new(), host_limits, config).await
+        })
+    }
+}
+
+#[cfg(target_os = "macos")]
+struct MetalFactory;
+
+#[cfg(target_os = "macos")]
+impl RuntimeFactory for MetalFactory {
+    type Service = forja_serve::ServingEngine<forja_metal::MetalBackend>;
+
+    fn plan(&self, config: &forja_config::HostConfig) -> Result<forja_serve::LoadPlan, String> {
+        validate_config(config, BackendArg::Metal)?;
+        let working_set = forja_metal::MetalBackend::recommended_max_working_set_size()
+            .map_err(|error| error.to_string())?;
+        let physical =
+            forja_metal::MetalBackend::physical_memory_size().map_err(|error| error.to_string())?;
+        let retained_bytes = config
+            .limits
+            .resolve_live_bytes(working_set, physical)
+            .map_err(|error| error.to_string())?
+            .get();
+        Ok(forja_serve::LoadPlan { retained_bytes })
+    }
+
+    fn load<'a>(
+        &'a mut self,
+        config: &'a forja_config::HostConfig,
+    ) -> LoadFuture<'a, Self::Service> {
+        Box::pin(async move {
+            let replay = config.backend.metal.resolve().graph_replay;
+            let (backend, live_bytes) = crate::engine::metal_backend(
+                replay,
+                config.backend.metal.pool_capacity,
+                &config.limits,
+            )
+            .map_err(|error| error.to_string())?;
+            let host_limits = page_pool_limit(
+                crate::engine::limits_for_live_bytes(&config.limits, live_bytes)
+                    .map_err(|error| error.to_string())?,
+                config,
+            );
+            load_engine(backend, host_limits, config).await
+        })
+    }
+}
+
+fn validate_config(
+    config: &forja_config::HostConfig,
+    backend: BackendArg,
+) -> Result<Profile, String> {
+    let (embedded, _) = validate_engine(
+        &config.model.engine,
+        &config.model.model,
+        backend,
+        Path::new("target/forja-serve"),
+    )
+    .map_err(|error| error.to_string())?;
+    let source = fs::read_to_string(&config.model.profile)
+        .map_err(|error| format!("cannot read configured profile: {error}"))?;
+    let source: Profile = toml::from_str(&source).map_err(|error| error.to_string())?;
+    if source != embedded {
+        return Err("configured profile does not match the engine profile".to_owned());
+    }
+    Ok(embedded)
 }
 
 fn page_pool_limit(
@@ -71,41 +143,51 @@ fn page_pool_limit(
     }
 }
 
-async fn serve_backend<B>(
+async fn load_engine<B>(
     backend: B,
     host_limits: forja_host::Limits,
-    options: &Serve,
-    profile: &Profile,
-    load_config: &forja_host::EngineLoadConfig,
-) -> Result<(), Box<dyn Error>>
+    config: &forja_config::HostConfig,
+) -> Result<Loaded<forja_serve::ServingEngine<B>>, String>
 where
     B: Backend + Send + Sync + 'static,
 {
-    let config = options.config.clone();
+    let profile = validate_config(
+        config,
+        match config.backend.kind {
+            BackendKind::Metal => BackendArg::Metal,
+            BackendKind::Cpu => BackendArg::Cpu,
+        },
+    )?;
+    let load_config = engine_load_config(&config.model.engine, &Engine::default())?;
     let tokenizer = Tokenizer::from_file(config.model.model.join("tokenizer.json"))
         .map_err(|error| format!("cannot load tokenizer: {error}"))?;
     let chat_format = forja_serve::ChatFormat::load(
         &config.model.chat_format,
         forja_serve::ChatFormatLimits::default(),
-    )?;
+    )
+    .map_err(|error| error.to_string())?;
     let identity = forja_serve::PrefixIdentity::new([
-        &sha256_file(&config.model.engine)?,
-        &profile.sha256()?,
+        &sha256_file(&config.model.engine).map_err(|error| error.to_string())?,
+        &profile.sha256().map_err(|error| error.to_string())?,
         &profile.model().weights_sha256,
-        &sha256_file(config.model.model.join("tokenizer.json"))?,
-        &sha256_file(&config.model.chat_format)?,
-    ])?;
+        &sha256_file(config.model.model.join("tokenizer.json"))
+            .map_err(|error| error.to_string())?,
+        &sha256_file(&config.model.chat_format).map_err(|error| error.to_string())?,
+    ])
+    .map_err(str::to_owned)?;
     let mut runner = EngineRunner::new(
         &config.model.engine,
         backend,
         host_limits,
         weights_path(&config.model.model)?,
     )
-    .await?;
-    let info = runner.describe().await?;
+    .await
+    .map_err(|error| error.to_string())?;
+    let info = runner.describe().await.map_err(|error| error.to_string())?;
     runner
-        .load_with_selections(None, load_config)
-        .await?
+        .load_with_selections(None, &load_config)
+        .await
+        .map_err(|error| error.to_string())?
         .map_err(|error| format!("engine load failed: {error:?}"))?;
     let engine = forja_serve::ServingEngine::new(
         profile.model().id.clone(),
@@ -119,9 +201,20 @@ where
             .serving()
             .map_or(1, |serving| serving.prompt_token_budget.get()),
         identity,
-    )?;
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(Loaded { service: engine })
+}
+
+async fn run_factory<F>(mut factory: F, options: &Serve) -> Result<(), Box<dyn Error>>
+where
+    F: RuntimeFactory + 'static,
+{
+    let config = options.config.clone();
+    factory.plan(&config)?;
+    let loaded = factory.load(&config).await?;
     let listener = tokio::net::TcpListener::bind(config.server.listen).await?;
-    let (router, drain) = forja_serve::serving_router(engine);
+    let (router, drain) = forja_serve::serving_router(loaded.service);
     let (metrics_shutdown, mut metrics_shutdown_rx) = tokio::sync::watch::channel(false);
     let metrics_task = if let Some(address) = config.metrics.listen {
         let listener = tokio::net::TcpListener::bind(address).await?;
