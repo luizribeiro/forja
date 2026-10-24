@@ -300,7 +300,7 @@ where
         {
             return Some(batch_admission_error(
                 &forja_host::bindings::l9o::gpu::compute::Error::Quota(
-                    "paged pool error: BankInFlight".to_owned(),
+                    forja_core::PagePoolError::BankInFlight.to_string(),
                 ),
             ));
         }

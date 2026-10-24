@@ -40,6 +40,7 @@ static NEXT_CHAT_STREAM: AtomicU64 = AtomicU64::new(1);
 pub struct GenerationError {
     message: String,
     kind: ErrorKind,
+    paged_bank_in_flight: bool,
 }
 
 impl GenerationError {
@@ -47,6 +48,7 @@ impl GenerationError {
         Self {
             message: message.into(),
             kind: ErrorKind::Internal,
+            paged_bank_in_flight: false,
         }
     }
 
@@ -54,6 +56,7 @@ impl GenerationError {
         Self {
             message: message.into(),
             kind: ErrorKind::Invalid,
+            paged_bank_in_flight: false,
         }
     }
 
@@ -61,6 +64,7 @@ impl GenerationError {
         Self {
             message: message.into(),
             kind: ErrorKind::PayloadTooLarge,
+            paged_bank_in_flight: false,
         }
     }
 
@@ -68,6 +72,15 @@ impl GenerationError {
         Self {
             message: message.into(),
             kind: ErrorKind::Unavailable,
+            paged_bank_in_flight: false,
+        }
+    }
+
+    fn paged_admission(error: &forja_host::bindings::l9o::gpu::compute::Error) -> Self {
+        Self {
+            message: format!("paged admission failed: {error:?}"),
+            kind: ErrorKind::Unavailable,
+            paged_bank_in_flight: forja_host::is_paged_bank_in_flight(error),
         }
     }
 
@@ -75,11 +88,12 @@ impl GenerationError {
         Self {
             message: "generation cancelled".to_owned(),
             kind: ErrorKind::Unavailable,
+            paged_bank_in_flight: false,
         }
     }
 
     fn paged_bank_in_flight(&self) -> bool {
-        self.message.contains("paged pool error: BankInFlight")
+        self.paged_bank_in_flight
     }
 
     pub(crate) const fn kind(&self) -> ErrorKind {
@@ -2325,10 +2339,11 @@ mod tests {
     }
 
     #[test]
-    fn recognizes_in_flight_paged_bank_errors_through_wit_formatting() {
-        let error = GenerationError::unavailable(
-            "paged admission failed: Error::Quota(\"paged pool error: BankInFlight\")",
+    fn preserves_in_flight_paged_bank_classification() {
+        let source = forja_host::bindings::l9o::gpu::compute::Error::Quota(
+            forja_core::PagePoolError::BankInFlight.to_string(),
         );
+        let error = GenerationError::paged_admission(&source);
         assert!(error.paged_bank_in_flight());
     }
     use std::sync::{Arc, atomic::AtomicUsize};

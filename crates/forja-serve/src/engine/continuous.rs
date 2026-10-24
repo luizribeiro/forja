@@ -382,7 +382,7 @@ where
 fn batch_admission_error(
     error: &forja_host::bindings::l9o::gpu::compute::Error,
 ) -> GenerationError {
-    GenerationError::unavailable(format!("paged admission failed: {error:?}"))
+    GenerationError::paged_admission(error)
 }
 
 fn read_batch_tokens(bytes: &[u8]) -> Result<Vec<u32>, GenerationError> {

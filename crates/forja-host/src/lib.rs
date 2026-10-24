@@ -109,6 +109,24 @@ use bindings::l9o::gpu::compute;
 use bindings::l9o::gpu::paged_storage;
 use compute::{Binop as WitBinOp, Redop as WitRedOp, Unop as WitUnOp, ValueType as WitValueType};
 
+/// Quota refusal returned when a paged lane must be released before reuse.
+pub const PAGED_LANE_RELEASE_REQUIRED: &str = "paged lane must be released before rebinding";
+
+/// Returns whether a guest error requires releasing a paged lane before retrying admission.
+#[must_use]
+pub fn is_paged_lane_release_required(error: &compute::Error) -> bool {
+    matches!(error, compute::Error::Quota(message) if message == PAGED_LANE_RELEASE_REQUIRED)
+}
+
+/// Returns whether a guest error reports a paged bank that still has submitted work.
+#[must_use]
+pub fn is_paged_bank_in_flight(error: &compute::Error) -> bool {
+    matches!(
+        error,
+        compute::Error::Quota(message) if message == &PagePoolError::BankInFlight.to_string()
+    )
+}
+
 /// Static metadata declared by an engine component.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EngineInfo {
@@ -4403,7 +4421,7 @@ impl<B: Backend + 'static> Host<B> {
         let release = prefix.is_none() && reserved_tokens == 0;
         if !release && lane_binding.used.load(Ordering::Acquire) {
             return Err(compute::Error::Quota(
-                "paged lane must be released before rebinding".to_owned(),
+                PAGED_LANE_RELEASE_REQUIRED.to_owned(),
             ));
         }
         let sequence = match prefix {
@@ -8797,16 +8815,27 @@ mod tests {
         BackendEvent, BackendTimer, BatchPhase, BatchSelection, BatchShape, BatchSlotEntry,
         EngineBatch, EngineBatchLane, EngineBatchSelect, EngineBatchSelectLane, EngineMemory,
         EngineMetrics, EngineRunner, EngineStep, EngineStepProfile, Grants, Host, ImportKind,
-        ImportTimer, Limits, MAX_INSTRUCTIONS, MAX_OUTPUTS, PagePoolEntry, PagedSequenceEntry,
-        ParamsEntry, ReplayFlight, ReplayState, SamplingParams, ServingInfo, SubmissionOutcome,
-        TensorEntry,
+        ImportTimer, Limits, MAX_INSTRUCTIONS, MAX_OUTPUTS, PAGED_LANE_RELEASE_REQUIRED,
+        PagePoolEntry, PagePoolError, PagedSequenceEntry, ParamsEntry, ReplayFlight, ReplayState,
+        SamplingParams, ServingInfo, SubmissionOutcome, TensorEntry,
         bindings::l9o::gpu::{compute, paged_storage},
-        core_op, core_program, expected_layer_outputs, paged_backing_pages, validate_batch_lanes,
+        core_op, core_program, expected_layer_outputs, is_paged_bank_in_flight,
+        is_paged_lane_release_required, paged_backing_pages, validate_batch_lanes,
         validate_batch_output_layouts, validate_batch_select_lanes, validate_batch_shapes,
     };
 
     const GENEROUS: Limits = Limits::new(u64::MAX, 8, u64::MAX, 32, u64::MAX);
     static NEXT_WEIGHT_FILE: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn classifies_paged_lane_lifecycle_refusals() {
+        let release = compute::Error::Quota(PAGED_LANE_RELEASE_REQUIRED.to_owned());
+        let in_flight = compute::Error::Quota(PagePoolError::BankInFlight.to_string());
+        assert!(is_paged_lane_release_required(&release));
+        assert!(!is_paged_bank_in_flight(&release));
+        assert!(is_paged_bank_in_flight(&in_flight));
+        assert!(!is_paged_lane_release_required(&in_flight));
+    }
 
     #[test]
     fn paged_backing_reserves_one_copy_on_write_page_per_lane() {
