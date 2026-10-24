@@ -296,6 +296,13 @@ pub(crate) enum Command {
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct Serve {
     pub(crate) config: HostConfig,
+    pub(crate) sources: HostConfigSources,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct HostConfigSources {
+    pub(crate) files: Vec<PathBuf>,
+    pub(crate) sets: Vec<String>,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -651,23 +658,25 @@ fn serve_config(overrides: Vec<Override>) -> Result<Serve, clap::Error> {
     let mut sets = Vec::new();
     for override_ in overrides {
         match override_ {
-            Override::File(path) => {
-                files.push(file_layer::<HostConfig>(&path).map_err(|error| config_error(&error))?);
-            }
+            Override::File(path) => files.push(path),
             Override::Set(expression) => sets.push(expression),
         }
     }
-    for (index, expression) in sets.into_iter().enumerate() {
-        files.push(
-            set_layer::<HostConfig>(index + 1, &expression)
-                .map_err(|error| config_error(&error))?
-                .0,
-        );
+    let sources = HostConfigSources { files, sets };
+    let config = load_host_config(&sources).map_err(|error| config_error(&error))?;
+    Ok(Serve { config, sources })
+}
+
+pub(crate) fn load_host_config(sources: &HostConfigSources) -> Result<HostConfig, ConfigError> {
+    let mut layers = sources
+        .files
+        .iter()
+        .map(|path| file_layer::<HostConfig>(path))
+        .collect::<Result<Vec<_>, _>>()?;
+    for (index, expression) in sources.sets.iter().enumerate() {
+        layers.push(set_layer::<HostConfig>(index + 1, expression)?.0);
     }
-    let config = layer::<HostConfig>(files)
-        .map_err(|error| config_error(&error))?
-        .config;
-    Ok(Serve { config })
+    layer::<HostConfig>(layers).map(|layered| layered.config)
 }
 
 fn ordered_overrides(matches: &clap::ArgMatches) -> Vec<Override> {
@@ -1455,6 +1464,20 @@ mod tests {
         };
         assert_eq!(serve.config.server.queue_length, 3);
         assert_eq!(serve.config.model.engine, PathBuf::from("engine.wasm"));
+        assert_eq!(serve.sources.files, std::slice::from_ref(&path));
+        assert_eq!(serve.sources.sets, ["server.queue_length=3"]);
+        fs::write(
+            &path,
+            "[server]\nqueue_length=9\n[model]\nengine='engine.wasm'\nprofile='profile.toml'\nmodel='model'\nchat_format='chat.wasm'\n",
+        )
+        .unwrap();
+        assert_eq!(
+            load_host_config(&serve.sources)
+                .unwrap()
+                .server
+                .queue_length,
+            3
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

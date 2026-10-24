@@ -17,7 +17,7 @@ mod weights;
 pub use component::{ProfileSectionError, embed_profile, read_profile};
 pub use engine::{Engine, EngineSelection, TuningBase, TuningOverrides};
 pub use files::{dev_layers, file_layer, user_config_path};
-pub use host_metadata::{HOST_LEAVES, ReloadClass, host_reload_class};
+pub use host_metadata::{HOST_LEAVES, HostConfigDiff, ReloadClass, host_reload_class};
 pub use host_schema::host_schema;
 pub use layer::{ConfigError, KeyPath, Layer, Layered, Origin, Schema, layer};
 pub use profile::{

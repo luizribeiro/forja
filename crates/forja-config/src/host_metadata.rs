@@ -9,6 +9,57 @@ pub enum ReloadClass {
     Restart,
 }
 
+/// Changed serving leaves grouped by their application boundary.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct HostConfigDiff {
+    /// Leaves applied to future work in the current runtime.
+    pub live: Vec<&'static str>,
+    /// Leaves requiring replacement of the loaded model.
+    pub model: Vec<&'static str>,
+    /// Leaves requiring process restart.
+    pub restart: Vec<&'static str>,
+}
+
+impl HostConfigDiff {
+    /// Compares two complete host configurations using the registered reload metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if either complete configuration cannot be inspected.
+    pub fn between(
+        previous: &crate::HostConfig,
+        candidate: &crate::HostConfig,
+    ) -> Result<Self, String> {
+        let previous = toml::Value::try_from(previous)
+            .map_err(|error| format!("cannot inspect active host configuration: {error}"))?;
+        let candidate = toml::Value::try_from(candidate)
+            .map_err(|error| format!("cannot inspect candidate host configuration: {error}"))?;
+        let mut diff = Self::default();
+        for &(path, class) in HOST_LEAVES {
+            if leaf(&previous, path) == leaf(&candidate, path) {
+                continue;
+            }
+            match class {
+                ReloadClass::Live => diff.live.push(path),
+                ReloadClass::Model => diff.model.push(path),
+                ReloadClass::Restart => diff.restart.push(path),
+            }
+        }
+        Ok(diff)
+    }
+
+    /// Returns whether every host configuration leaf is unchanged.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.live.is_empty() && self.model.is_empty() && self.restart.is_empty()
+    }
+}
+
+fn leaf<'a>(root: &'a toml::Value, path: &str) -> Option<&'a toml::Value> {
+    path.split('.')
+        .try_fold(root, |value, part| value.get(part))
+}
+
 impl ReloadClass {
     /// Returns the stable JSON Schema spelling.
     #[must_use]
@@ -118,5 +169,19 @@ mod tests {
             Some(ReloadClass::Live)
         );
         assert_eq!(host_reload_class("request.unknown"), None);
+    }
+
+    #[test]
+    fn typed_diff_groups_each_changed_leaf() {
+        let previous = crate::HostConfig::default();
+        let mut candidate = previous.clone();
+        candidate.server.queue_length = 7;
+        candidate.model.engine = "next.wasm".into();
+        candidate.metrics.path = "/new-metrics".to_owned();
+        let diff = HostConfigDiff::between(&previous, &candidate).unwrap();
+        assert_eq!(diff.live, ["server.queue_length"]);
+        assert_eq!(diff.model, ["model.engine"]);
+        assert_eq!(diff.restart, ["metrics.path"]);
+        assert!(!diff.is_empty());
     }
 }
