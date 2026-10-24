@@ -90,7 +90,7 @@ impl<'de> Deserialize<'de> for HostConfig {
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Serving {
-    /// Reuse the immediately preceding request's matching live KV prefix.
+    /// Reuse matching prefixes retained by a paged KV cache.
     #[serde(rename = "prefix-reuse")]
     pub prefix_reuse: bool,
     /// Maximum simultaneously active sequences.
