@@ -12,8 +12,8 @@ use std::{
 
 use axum::{
     Json, Router,
-    body::Bytes,
-    extract::{DefaultBodyLimit, FromRequest, Path, Request, State, rejection::BytesRejection},
+    body::{Bytes, to_bytes},
+    extract::{Path, Request, State},
     http::{StatusCode, header},
     response::{
         IntoResponse, Response,
@@ -522,7 +522,6 @@ pub fn chat_router<S: ChatService>(service: S) -> Router {
 
 /// Builds a serving router and a handle that drains its admitted work.
 pub fn serving_router<S: ChatService>(service: S) -> (Router, DrainHandle<S>) {
-    let max_body_bytes = service.max_body_bytes();
     let generation = PublishedGeneration::new(0, service);
     let state = Arc::new(HttpState {
         generation: RwLock::new(Some(generation)),
@@ -539,7 +538,6 @@ pub fn serving_router<S: ChatService>(service: S) -> (Router, DrainHandle<S>) {
         .route("/v1/completions", post(text::<S>))
         .route("/v1/models", get(models::<S>))
         .route("/v1/models/{model}", get(model::<S>))
-        .layer(DefaultBodyLimit::max(max_body_bytes))
         .with_state(Arc::clone(&state));
     (router, DrainHandle { state })
 }
@@ -582,6 +580,7 @@ struct ActiveRequest {
 struct PublishedGeneration<S> {
     id: u64,
     model: String,
+    max_body_bytes: usize,
     deadline: Duration,
     write_stall_timeout: Duration,
     service: ServiceActor<S>,
@@ -591,6 +590,7 @@ struct PublishedGeneration<S> {
 impl<S: ChatService> PublishedGeneration<S> {
     fn new(id: u64, service: S) -> Self {
         let model = service.model().to_owned();
+        let max_body_bytes = service.max_body_bytes();
         let deadline = service.request_deadline();
         let write_stall_timeout = service.write_stall_timeout();
         let config = Arc::new(service.host_config());
@@ -598,6 +598,7 @@ impl<S: ChatService> PublishedGeneration<S> {
         Self {
             id,
             model,
+            max_body_bytes,
             deadline,
             write_stall_timeout,
             service: ServiceActor::spawn(service, queue_capacity),
@@ -609,6 +610,7 @@ impl<S: ChatService> PublishedGeneration<S> {
         GenerationSnapshot {
             id: self.id,
             model: self.model.clone(),
+            max_body_bytes: self.max_body_bytes,
             deadline: self.deadline,
             write_stall_timeout: self.write_stall_timeout,
             service: self.service.clone(),
@@ -623,6 +625,7 @@ impl<S: ChatService> PublishedGeneration<S> {
 struct GenerationSnapshot<S> {
     id: u64,
     model: String,
+    max_body_bytes: usize,
     deadline: Duration,
     write_stall_timeout: Duration,
     service: ServiceActor<S>,
@@ -831,6 +834,8 @@ impl<S: ChatService> DrainHandle<S> {
             ));
         }
         published.id = generation;
+        published.max_body_bytes =
+            usize::try_from(config.request.max_body_bytes.get()).unwrap_or(usize::MAX);
         published.deadline = config.server.request_deadline.get();
         published.write_stall_timeout = config.server.sse_write_stall_timeout.get();
         published.config = Arc::new(config);
@@ -901,10 +906,8 @@ impl<S> Drop for ActiveGuard<S> {
     }
 }
 
-type Body = Result<Bytes, BytesRejection>;
-
-async fn body(request: Request) -> Body {
-    Bytes::from_request(request, &()).await
+async fn body(request: Request, limit: usize) -> Result<Bytes, axum::Error> {
+    to_bytes(request.into_body(), limit).await
 }
 
 async fn chat<S: ChatService>(
@@ -920,9 +923,8 @@ async fn chat<S: ChatService>(
         Err(error) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, error),
     };
     let deadline = tokio::time::Instant::now() + runtime.deadline;
-    let body = match body(request).await {
-        Ok(body) => body,
-        Err(error) => return body_error(&error),
+    let Ok(body) = body(request, runtime.max_body_bytes).await else {
+        return body_error();
     };
     let request = match serde_json::from_slice::<ChatCompletionRequest>(&body) {
         Ok(request) => request,
@@ -1002,9 +1004,8 @@ async fn text<S: ChatService>(
         Err(error) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, error),
     };
     let deadline = tokio::time::Instant::now() + runtime.deadline;
-    let body = match body(request).await {
-        Ok(body) => body,
-        Err(error) => return body_error(&error),
+    let Ok(body) = body(request, runtime.max_body_bytes).await else {
+        return body_error();
     };
     let request = match serde_json::from_slice::<CompletionRequest>(&body) {
         Ok(request) => request,
@@ -1404,15 +1405,11 @@ fn actor_error(error: ActorError) -> Response {
     }
 }
 
-fn body_error(error: &BytesRejection) -> Response {
-    if error.status() == StatusCode::PAYLOAD_TOO_LARGE {
-        api_error(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "request body exceeds the configured ceiling",
-        )
-    } else {
-        api_error(StatusCode::BAD_REQUEST, &error.to_string())
-    }
+fn body_error() -> Response {
+    api_error(
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "request body exceeds the configured ceiling",
+    )
 }
 
 fn generation_error(error: &GenerationError) -> Response {
@@ -1680,6 +1677,20 @@ mod tests {
         let body = br#"{"model":"smoke","messages":[{"role":"user","content":"hi"}]}"#;
         let response = chat::<Smoke>(State(state()), request(body)).await;
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn live_policy_lowers_the_request_body_ceiling() {
+        let state = state();
+        let handle = DrainHandle {
+            state: Arc::clone(&state),
+        };
+        let mut config = HostConfig::default();
+        config.request.max_body_bytes = forja_config::ByteSize::new(8);
+        handle.update_policy(1, config).await.unwrap();
+        let response =
+            chat::<Smoke>(State(state), request(br#"{"model":"smoke","messages":[]}"#)).await;
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     #[tokio::test]
