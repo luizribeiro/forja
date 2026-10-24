@@ -450,11 +450,14 @@ pub(crate) struct BatchTestBarrier {
     admission_overlapped: AtomicBool,
     retirement_drained: AtomicBool,
     prefill_overlap_width: AtomicU64,
+    deferred_fallthroughs: AtomicU64,
     reached: Notify,
     resume: Notify,
     finish_sequence: AtomicU64,
     ordinary_finished: AtomicU64,
     constrained_finished: AtomicU64,
+    cancel_on_batch: StdMutex<Option<GenerationControl>>,
+    refuse_release: AtomicBool,
 }
 
 #[cfg(test)]
@@ -473,12 +476,22 @@ impl BatchTestBarrier {
             admission_overlapped: AtomicBool::new(false),
             retirement_drained: AtomicBool::new(false),
             prefill_overlap_width: AtomicU64::new(0),
+            deferred_fallthroughs: AtomicU64::new(0),
             reached: Notify::const_new(),
             resume: Notify::const_new(),
             finish_sequence: AtomicU64::new(0),
             ordinary_finished: AtomicU64::new(0),
             constrained_finished: AtomicU64::new(0),
+            cancel_on_batch: StdMutex::new(None),
+            refuse_release: AtomicBool::new(false),
         }
+    }
+
+    pub(crate) fn cancel_on_next_batch(&self, control: GenerationControl) {
+        if let Ok(mut cancel) = self.cancel_on_batch.lock() {
+            *cancel = Some(control);
+        }
+        self.refuse_release.store(true, Ordering::Release);
     }
 
     pub(crate) async fn reached(&self) {
@@ -499,6 +512,10 @@ impl BatchTestBarrier {
 
     pub(crate) fn prefill_overlap_width(&self) -> u64 {
         self.prefill_overlap_width.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn deferred_fallthroughs(&self) -> u64 {
+        self.deferred_fallthroughs.load(Ordering::Acquire)
     }
 
     pub(crate) fn finish_order(&self) -> (u64, u64) {
@@ -528,6 +545,26 @@ impl BatchTestBarrier {
     fn note_prefill_overlap(&self, width: usize) {
         self.prefill_overlap_width
             .fetch_max(u64::try_from(width).unwrap_or(u64::MAX), Ordering::AcqRel);
+    }
+
+    fn note_deferred_fallthrough(&self) {
+        self.deferred_fallthroughs.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn cancel_lane(&self) {
+        if let Ok(mut cancel) = self.cancel_on_batch.lock()
+            && let Some(control) = cancel.take()
+        {
+            control.cancel();
+        }
+    }
+
+    fn release_is_blocked(&self) -> bool {
+        self.refuse_release.load(Ordering::Acquire)
+    }
+
+    fn observe_batch_completion(&self) {
+        self.refuse_release.store(false, Ordering::Release);
     }
 
     async fn pause_once(&self) {

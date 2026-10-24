@@ -19,6 +19,7 @@ use crate::{FinishReason, http::ServiceCommand, metrics::observe_phase};
 struct PendingBatch {
     output: EngineBatchOutput,
     lanes: Vec<PendingLane>,
+    deferred_retirements: Vec<Retirement>,
 }
 
 struct PendingLane {
@@ -48,7 +49,8 @@ impl PendingBatch {
     }
 
     fn has_retirement(&self) -> bool {
-        self.lanes.iter().any(|lane| lane.retirement.is_some())
+        !self.deferred_retirements.is_empty()
+            || self.lanes.iter().any(|lane| lane.retirement.is_some())
     }
 }
 
@@ -138,7 +140,14 @@ where
             let Some(mut batch) = current.take() else {
                 continue;
             };
-            self.mark_submitted_cancellations(&mut batch, &mut active);
+            #[cfg(test)]
+            if active.iter().any(BatchLane::is_constrained)
+                && let Some(barrier) = &self.batch_test_barrier
+            {
+                barrier.cancel_lane();
+                barrier.pause_once().await;
+            }
+            Self::mark_submitted_cancellations(&mut batch, &mut active);
             drain_pending(receiver, pending);
             let admission_waiting = active.iter().any(BatchLane::is_constrained)
                 || !waiting.is_empty()
@@ -154,9 +163,15 @@ where
             let mut successor = match next {
                 Ok(successor) => successor,
                 Err(error) => {
-                    let _ = self.runner.read_queued_batch_tokens(batch.output).await;
-                    self.fail_pipeline(batch.lanes, None, &mut active, error)
-                        .await;
+                    let _ = self.read_completed_batch(batch.output).await;
+                    self.fail_pipeline(
+                        batch.lanes,
+                        batch.deferred_retirements,
+                        None,
+                        &mut active,
+                        error,
+                    )
+                    .await;
                     if active.is_empty() {
                         return;
                     }
@@ -170,13 +185,19 @@ where
             {
                 barrier.pause_once().await;
             }
-            let tokens = self.runner.read_queued_batch_tokens(batch.output).await;
+            let tokens = self.read_completed_batch(batch.output).await;
             let tokens = match tokens {
                 Ok(bytes) => match read_batch_tokens(&bytes) {
                     Ok(tokens) => tokens,
                     Err(error) => {
-                        self.fail_pipeline(batch.lanes, successor, &mut active, error)
-                            .await;
+                        self.fail_pipeline(
+                            batch.lanes,
+                            batch.deferred_retirements,
+                            successor,
+                            &mut active,
+                            error,
+                        )
+                        .await;
                         if active.is_empty() {
                             return;
                         }
@@ -186,6 +207,7 @@ where
                 Err(error) => {
                     self.fail_pipeline(
                         batch.lanes,
+                        batch.deferred_retirements,
                         successor,
                         &mut active,
                         GenerationError::unavailable(format!("decode batch read failed: {error}")),
@@ -197,8 +219,14 @@ where
                     continue;
                 }
             };
-            self.apply_batch_tokens(batch.lanes, &mut active, &mut successor, &tokens)
-                .await;
+            self.apply_batch_tokens(
+                batch.lanes,
+                batch.deferred_retirements,
+                &mut active,
+                &mut successor,
+                &tokens,
+            )
+            .await;
             if successor.is_none() {
                 #[cfg(test)]
                 if successor.is_some()
@@ -227,6 +255,7 @@ where
     async fn apply_batch_tokens(
         &mut self,
         submitted: Vec<PendingLane>,
+        deferred_retirements: Vec<Retirement>,
         active: &mut Vec<BatchLane>,
         successor: &mut Option<PendingBatch>,
         tokens: &[u32],
@@ -274,6 +303,9 @@ where
                         .await;
                 }
             }
+        }
+        for retirement in deferred_retirements {
+            self.retire_or_finish(retirement, successor).await;
         }
     }
 
@@ -343,6 +375,7 @@ where
                     retirement: None,
                 })
                 .collect(),
+            deferred_retirements: Vec::new(),
         }))
     }
 
@@ -394,11 +427,7 @@ where
         }
     }
 
-    fn mark_submitted_cancellations(
-        &mut self,
-        batch: &mut PendingBatch,
-        active: &mut Vec<BatchLane>,
-    ) {
+    fn mark_submitted_cancellations(batch: &mut PendingBatch, active: &mut Vec<BatchLane>) {
         let mut index = 0;
         while index < active.len() {
             if !active[index].control.is_cancelled() {
@@ -413,7 +442,9 @@ where
             {
                 pending.retirement = Some(Retirement::Fail(lane, GenerationError::cancelled()));
             } else {
-                self.fail_batch_lane(lane, GenerationError::cancelled());
+                batch
+                    .deferred_retirements
+                    .push(Retirement::Fail(lane, GenerationError::cancelled()));
             }
         }
     }
@@ -423,13 +454,20 @@ where
         retirement: Retirement,
         successor: &mut Option<PendingBatch>,
     ) {
-        if let Some(pending) = successor.as_mut().and_then(|batch| {
-            batch
+        if let Some(batch) = successor.as_mut() {
+            if let Some(pending) = batch
                 .lanes
                 .iter_mut()
                 .find(|pending| pending.slot == retirement.slot())
-        }) {
-            pending.retirement = Some(retirement);
+            {
+                pending.retirement = Some(retirement);
+            } else {
+                #[cfg(test)]
+                if let Some(barrier) = &self.batch_test_barrier {
+                    barrier.note_deferred_fallthrough();
+                }
+                batch.deferred_retirements.push(retirement);
+            }
             return;
         }
         match retirement {
@@ -461,24 +499,35 @@ where
     async fn fail_pipeline(
         &mut self,
         current: Vec<PendingLane>,
+        current_retirements: Vec<Retirement>,
         successor: Option<PendingBatch>,
         active: &mut Vec<BatchLane>,
         error: GenerationError,
     ) {
         let current_slots = current.iter().map(|lane| lane.slot).collect::<Vec<_>>();
-        let successor = if let Some(successor) = successor {
-            let PendingBatch { output, lanes } = successor;
-            let _ = self.runner.read_queued_batch_tokens(output).await;
-            lanes
+        let (successor, successor_retirements) = if let Some(successor) = successor {
+            let PendingBatch {
+                output,
+                lanes,
+                deferred_retirements,
+            } = successor;
+            let _ = self.read_completed_batch(output).await;
+            (lanes, deferred_retirements)
         } else {
-            Vec::new()
+            (Vec::new(), Vec::new())
         };
         let affected = current_slots
             .iter()
             .copied()
             .chain(successor.iter().map(|lane| lane.slot))
             .collect::<Vec<_>>();
-        let mut lanes = Vec::new();
+        let mut lanes = current_retirements
+            .into_iter()
+            .chain(successor_retirements)
+            .map(|retirement| match retirement {
+                Retirement::Finish(lane, _) | Retirement::Fail(lane, _) => lane,
+            })
+            .collect::<Vec<_>>();
         for (is_current, pending) in current
             .into_iter()
             .map(|pending| (true, pending))
@@ -506,6 +555,18 @@ where
         for lane in lanes {
             self.fail_batch_lane(lane, repeated_error(&error));
         }
+    }
+
+    async fn read_completed_batch(
+        &mut self,
+        output: EngineBatchOutput,
+    ) -> Result<Vec<u8>, forja_host::bindings::l9o::gpu::compute::Error> {
+        let result = self.runner.read_queued_batch_tokens(output).await;
+        #[cfg(test)]
+        if let Some(barrier) = &self.batch_test_barrier {
+            barrier.observe_batch_completion();
+        }
+        result
     }
 
     async fn advance_constrained_lane(

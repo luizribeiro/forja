@@ -1700,6 +1700,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancelled_lane_is_released_before_its_slot_is_reused() {
+        let expected = serial_output("b", 6).await;
+        let barrier = Arc::new(crate::engine::BatchTestBarrier::passive());
+        let (actor, _weights) = continuous_actor_with_barrier(Some(Arc::clone(&barrier)))
+            .await
+            .unwrap();
+        let retiring = actor
+            .complete(
+                forced_tool_request(1),
+                GenerationControl::new(Duration::from_secs(2)),
+            )
+            .unwrap();
+        let peer = actor
+            .complete_text(
+                text_request("a", 2),
+                GenerationControl::new(Duration::from_secs(2)),
+            )
+            .unwrap();
+        assert!(retiring.await.unwrap().is_ok());
+        assert!(peer.await.unwrap().is_ok());
+        assert!(barrier.deferred_fallthroughs() > 0);
+
+        let control = GenerationControl::new(Duration::from_secs(2));
+        barrier.cancel_on_next_batch(control.clone());
+        let cancelled = actor
+            .complete(forced_tool_request(16), control.clone())
+            .unwrap();
+        let survivor = actor
+            .complete_text(
+                text_request("b", 6),
+                GenerationControl::new(Duration::from_secs(2)),
+            )
+            .unwrap();
+        let replacement = actor
+            .complete_text(
+                text_request("a", 2),
+                GenerationControl::new(Duration::from_secs(2)),
+            )
+            .unwrap();
+
+        assert!(cancelled.await.unwrap().is_err());
+        assert_serial(&survivor.await.unwrap().unwrap(), &expected);
+        assert!(replacement.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
     async fn lane_retirement_does_not_change_an_inflight_successor() {
         let short_expected = serial_output("b", 2).await;
         let long_expected = serial_output("b", 6).await;

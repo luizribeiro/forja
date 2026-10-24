@@ -292,6 +292,18 @@ where
     }
 
     pub(super) fn release_failed_lane(&mut self, slot: u32) -> Option<GenerationError> {
+        #[cfg(test)]
+        if self
+            .batch_test_barrier
+            .as_ref()
+            .is_some_and(|barrier| barrier.release_is_blocked())
+        {
+            return Some(batch_admission_error(
+                &forja_host::bindings::l9o::gpu::compute::Error::Quota(
+                    "paged pool error: BankInFlight".to_owned(),
+                ),
+            ));
+        }
         self.runner
             .prepare_paged_lane(slot, None, 0)
             .err()
