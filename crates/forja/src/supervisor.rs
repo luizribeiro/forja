@@ -45,6 +45,8 @@ pub(crate) struct Supervisor<F: RuntimeFactory> {
     sources: HostConfigSources,
     active: Arc<HostConfig>,
     generation: u64,
+    runtime_id: u64,
+    next_runtime_id: u64,
     retained_bytes: Option<u64>,
     ledger: ProcessLedger,
     factory: F,
@@ -68,6 +70,8 @@ impl<F: RuntimeFactory> Supervisor<F> {
             sources,
             active: Arc::new(config),
             generation: 0,
+            runtime_id: 0,
+            next_runtime_id: 1,
             retained_bytes: Some(retained_bytes),
             ledger,
             factory,
@@ -152,11 +156,12 @@ impl<F: RuntimeFactory> Supervisor<F> {
             shutdown = true
         );
         self.runtime
-            .drain_generation(
-                self.generation,
+            .try_drain_generation(
+                self.runtime_id,
                 self.active.server.model_drain_deadline.get(),
             )
-            .await;
+            .await
+            .map_err(|error| error.to_string())?;
         tracing::info!(
             event = "model.drain_finished",
             config_generation = self.generation,
@@ -181,11 +186,12 @@ impl<F: RuntimeFactory> Supervisor<F> {
             replacement_generation = candidate.generation
         );
         self.runtime
-            .drain_generation(
-                self.generation,
+            .try_drain_generation(
+                self.runtime_id,
                 self.active.server.model_drain_deadline.get(),
             )
-            .await;
+            .await
+            .map_err(|error| error.to_string())?;
         tracing::info!(
             event = "model.drain_finished",
             config_generation = self.generation,
@@ -205,8 +211,11 @@ impl<F: RuntimeFactory> Supervisor<F> {
                 Err(load_error) => return self.rollback(load_error).await,
             },
         };
-        self.runtime.publish(candidate.generation, loaded.service)?;
+        let runtime_id = self.allocate_runtime_id()?;
+        self.runtime
+            .publish_runtime(runtime_id, candidate.generation, loaded.service)?;
         self.runtime.set_ready(true);
+        self.runtime_id = runtime_id;
         self.retained_bytes = Some(loaded.retained_bytes);
         self.active = candidate.config;
         self.generation = candidate.generation;
@@ -230,8 +239,11 @@ impl<F: RuntimeFactory> Supervisor<F> {
         match self.factory.load(&self.active).await {
             Ok(loaded) => {
                 self.ledger.reserve(loaded.retained_bytes)?;
-                self.runtime.publish(self.generation, loaded.service)?;
+                let runtime_id = self.allocate_runtime_id()?;
+                self.runtime
+                    .publish_runtime(runtime_id, self.generation, loaded.service)?;
                 self.runtime.set_ready(true);
+                self.runtime_id = runtime_id;
                 self.retained_bytes = Some(loaded.retained_bytes);
                 Err(format!(
                     "candidate load failed and the active generation was restored: {load_error}"
@@ -241,6 +253,14 @@ impl<F: RuntimeFactory> Supervisor<F> {
                 "candidate load failed: {load_error}; rollback failed: {rollback_error}"
             )),
         }
+    }
+
+    fn allocate_runtime_id(&mut self) -> Result<u64, String> {
+        let runtime_id = self.next_runtime_id;
+        self.next_runtime_id = runtime_id
+            .checked_add(1)
+            .ok_or_else(|| "runtime identity overflowed".to_owned())?;
+        Ok(runtime_id)
     }
 }
 
@@ -323,6 +343,16 @@ mod tests {
         readiness: Arc<Mutex<Vec<bool>>>,
     }
 
+    struct IdentityFactory {
+        next_id: u64,
+        quiesced: Arc<Mutex<Vec<u64>>>,
+    }
+
+    struct IdentityService {
+        id: u64,
+        quiesced: Arc<Mutex<Vec<u64>>>,
+    }
+
     struct FakeLogging(bool);
 
     impl crate::logging::Reload for FakeLogging {
@@ -377,6 +407,100 @@ mod tests {
             Box::pin(async {
                 Ok(Loaded {
                     service: FakeService,
+                    retained_bytes: 4,
+                })
+            })
+        }
+    }
+
+    impl ChatService for IdentityService {
+        fn model(&self) -> &'static str {
+            "fake"
+        }
+
+        fn max_body_bytes(&self) -> usize {
+            1
+        }
+
+        fn queue_length(&self) -> u32 {
+            1
+        }
+
+        fn request_deadline(&self) -> Duration {
+            Duration::from_secs(1)
+        }
+
+        fn write_stall_timeout(&self) -> Duration {
+            Duration::from_secs(1)
+        }
+
+        fn complete(
+            &mut self,
+            _: ChatCompletionRequest,
+            _: GenerationControl,
+        ) -> Pin<Box<dyn Future<Output = Result<Completion, GenerationError>> + Send + '_>>
+        {
+            Box::pin(std::future::pending())
+        }
+
+        fn complete_text(
+            &mut self,
+            _: CompletionRequest,
+            _: GenerationControl,
+        ) -> Pin<Box<dyn Future<Output = Result<Completion, GenerationError>> + Send + '_>>
+        {
+            Box::pin(std::future::pending())
+        }
+
+        fn stream_chat(
+            &mut self,
+            _: ChatCompletionRequest,
+            _: tokio::sync::mpsc::Sender<GenerationEvent>,
+            _: GenerationControl,
+        ) -> Pin<Box<dyn Future<Output = Result<(), GenerationError>> + Send + '_>> {
+            Box::pin(std::future::pending())
+        }
+
+        fn stream_text(
+            &mut self,
+            _: CompletionRequest,
+            _: tokio::sync::mpsc::Sender<GenerationEvent>,
+            _: GenerationControl,
+        ) -> Pin<Box<dyn Future<Output = Result<(), GenerationError>> + Send + '_>> {
+            Box::pin(std::future::pending())
+        }
+
+        fn quiesce(
+            &mut self,
+        ) -> Pin<Box<dyn Future<Output = Result<(), GenerationError>> + Send + '_>> {
+            self.quiesced.lock().unwrap().push(self.id);
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    impl RuntimeFactory for IdentityFactory {
+        type Service = IdentityService;
+
+        fn quota(&self, _: &HostConfig) -> Result<u64, String> {
+            Ok(8)
+        }
+
+        fn plan(&mut self, _: &HostConfig) -> Result<LoadPlan, String> {
+            Ok(LoadPlan {
+                retained_bytes: Some(8),
+            })
+        }
+
+        fn load<'a>(
+            &'a mut self,
+            _: &'a HostConfig,
+        ) -> crate::serve::LoadFuture<'a, IdentityService> {
+            let id = self.next_id;
+            self.next_id += 1;
+            let quiesced = Arc::clone(&self.quiesced);
+            Box::pin(async move {
+                Ok(Loaded {
+                    service: IdentityService { id, quiesced },
                     retained_bytes: 4,
                 })
             })
@@ -504,6 +628,51 @@ mod tests {
             supervisor.shutdown().await.unwrap();
         }
         assert_eq!(*readiness.lock().unwrap(), [true, false, false]);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn policy_generation_does_not_change_the_runtime_drain_identity() {
+        let root = temporary_directory("supervisor-runtime-identity").unwrap();
+        let path = root.join("host.toml");
+        fs::write(&path, "[server]\nqueue_length=7\n").unwrap();
+        let sources = HostConfigSources {
+            files: vec![path.clone()],
+            sets: Vec::new(),
+        };
+        let quiesced = Arc::new(Mutex::new(Vec::new()));
+        let initial = IdentityService {
+            id: 0,
+            quiesced: Arc::clone(&quiesced),
+        };
+        let (_, runtime) = forja_serve::serving_router(initial);
+        let factory = IdentityFactory {
+            next_id: 1,
+            quiesced: Arc::clone(&quiesced),
+        };
+        let mut supervisor = Supervisor::new(
+            sources,
+            HostConfig::default(),
+            4,
+            8,
+            factory,
+            Box::new(FakeLogging(false)),
+            runtime,
+        )
+        .unwrap();
+
+        supervisor.reload().await.unwrap();
+        assert_eq!(supervisor.generation, 1);
+        assert_eq!(supervisor.runtime_id, 0);
+
+        fs::write(&path, "[model]\nengine='candidate'\n").unwrap();
+        supervisor.reload().await.unwrap();
+        assert_eq!(supervisor.generation, 2);
+        assert_eq!(supervisor.runtime_id, 1);
+        assert_eq!(*quiesced.lock().unwrap(), [0]);
+
+        supervisor.shutdown().await.unwrap();
+        assert_eq!(*quiesced.lock().unwrap(), [0, 1]);
         fs::remove_dir_all(root).unwrap();
     }
 
