@@ -112,15 +112,16 @@ fn validate_identity(
 }
 
 fn target_identity(target: &Target) -> TargetIdentity<'_> {
+    let backend = match target.backend {
+        ProfileBackend::Metal => "metal",
+        ProfileBackend::Cpu => "cpu",
+    };
     TargetIdentity {
         component: match target.component {
             ComponentTarget::Wasm32Wasip2 => "wasm32-wasip2",
         },
-        backend: match target.backend {
-            ProfileBackend::Metal => "metal",
-            ProfileBackend::Cpu => "cpu",
-        },
-        device_family: Some(target.device_family.as_str()),
+        backend,
+        device_family: (backend == "metal").then(|| target.device_family.as_str()),
     }
 }
 
