@@ -145,6 +145,27 @@ impl PrefixIndex {
         })
     }
 
+    pub(crate) fn reconfigure(
+        &mut self,
+        limits: PrefixLimits,
+        enabled: bool,
+    ) -> Result<(), PrefixIndexError> {
+        if limits.entries == 0 || limits.tokens == 0 || limits.referenced_pages == 0 {
+            return Err(PrefixIndexError::InvalidLimits);
+        }
+        self.limits = limits;
+        while !enabled
+            || self.entries.len() > limits.entries
+            || self.tokens > limits.tokens
+            || self.pages > limits.referenced_pages
+        {
+            if !self.evict_lru(None)? {
+                break;
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn publish(
         &mut self,
         namespace: PrefixNamespace,
@@ -584,5 +605,42 @@ mod tests {
             index.evict_for(1, 1),
             Err(PrefixIndexError::Bookkeeping)
         ));
+    }
+
+    #[test]
+    fn lower_limits_evict_retained_entries_without_revoking_forks() {
+        let namespace = PrefixNamespace([6; 32]);
+        let pool = pool();
+        let mut index = PrefixIndex::new(PrefixLimits {
+            entries: 2,
+            tokens: 256,
+            referenced_pages: 8,
+        })
+        .unwrap();
+        for start in [0, 1_000] {
+            let tokens = (start..start + 100).collect::<Vec<_>>();
+            index
+                .publish(namespace, tokens, &sequence(&pool, 100))
+                .unwrap();
+        }
+        let fork = index
+            .lookup(namespace, &(0..110).collect::<Vec<_>>(), 128)
+            .unwrap()
+            .unwrap()
+            .sequence;
+
+        index
+            .reconfigure(
+                PrefixLimits {
+                    entries: 1,
+                    tokens: 128,
+                    referenced_pages: 2,
+                },
+                false,
+            )
+            .unwrap();
+
+        assert!(index.entries.is_empty());
+        assert_eq!(fork.logical_len().unwrap(), 100);
     }
 }
