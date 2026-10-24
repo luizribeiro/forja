@@ -225,10 +225,12 @@ where
     let retained_bytes = loaded.retained_bytes;
     let listener = tokio::net::TcpListener::bind(config.server.listen).await?;
     let (router, drain) = forja_serve::serving_router(loaded.service);
-    let mut supervisor = Supervisor::<F>::new(
+    let mut supervisor = Supervisor::new(
+        options.sources.clone(),
+        config.clone(),
         retained_bytes,
         plan.retained_bytes,
-        config.server.model_drain_deadline.get(),
+        factory,
         drain.clone(),
     )?;
     let (metrics_shutdown, mut metrics_shutdown_rx) = tokio::sync::watch::channel(false);

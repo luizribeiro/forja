@@ -5,11 +5,10 @@ use forja_serve::{LoadPlan, ProcessLedger};
 
 use crate::{
     args::{HostConfigSources, load_host_config},
-    serve::RuntimeFactory,
+    serve::{Loaded, RuntimeFactory},
 };
 
 #[derive(Debug)]
-#[allow(dead_code, reason = "constructed during configuration reload")]
 pub(crate) struct Candidate {
     pub(crate) generation: u64,
     pub(crate) config: Arc<HostConfig>,
@@ -18,7 +17,6 @@ pub(crate) struct Candidate {
 }
 
 impl Candidate {
-    #[allow(dead_code, reason = "called during configuration reload")]
     pub(crate) fn from_sources(
         generation: u64,
         active: &HostConfig,
@@ -44,44 +42,214 @@ impl Candidate {
 }
 
 pub(crate) struct Supervisor<F: RuntimeFactory> {
+    sources: HostConfigSources,
+    active: Arc<HostConfig>,
+    generation: u64,
     retained_bytes: u64,
-    drain_deadline: std::time::Duration,
     ledger: ProcessLedger,
+    factory: F,
     runtime: forja_serve::DrainHandle<F::Service>,
 }
 
 impl<F: RuntimeFactory> Supervisor<F> {
     pub(crate) fn new(
+        sources: HostConfigSources,
+        config: HostConfig,
         retained_bytes: u64,
         quota: u64,
-        drain_deadline: std::time::Duration,
+        factory: F,
         runtime: forja_serve::DrainHandle<F::Service>,
     ) -> Result<Self, String> {
         let mut ledger = ProcessLedger::new(quota);
         ledger.reserve(retained_bytes)?;
         Ok(Self {
+            sources,
+            active: Arc::new(config),
+            generation: 0,
             retained_bytes,
-            drain_deadline,
             ledger,
+            factory,
             runtime,
         })
     }
 
+    #[allow(dead_code, reason = "invoked by reload signal handling")]
+    pub(crate) async fn reload(&mut self) -> Result<(), String> {
+        let generation = self
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| "configuration generation overflowed".to_owned())?;
+        let candidate =
+            Candidate::from_sources(generation, &self.active, &self.sources, |config| {
+                self.factory.plan(config)
+            })?;
+        if candidate.diff.is_empty() {
+            return Ok(());
+        }
+        if candidate.diff.model.is_empty() {
+            self.runtime
+                .update_policy(generation, (*candidate.config).clone())
+                .await
+                .map_err(|error| error.to_string())?;
+            self.active = candidate.config;
+            self.generation = generation;
+            return Ok(());
+        }
+        self.replace(candidate).await
+    }
+
     pub(crate) async fn shutdown(&mut self) -> Result<(), String> {
         self.runtime.close_admission();
-        self.runtime.drain_generation(0, self.drain_deadline).await;
+        self.runtime
+            .drain_generation(
+                self.generation,
+                self.active.server.model_drain_deadline.get(),
+            )
+            .await;
         self.runtime.unload()?;
         self.ledger.release(self.retained_bytes)
+    }
+
+    async fn replace(&mut self, candidate: Candidate) -> Result<(), String> {
+        let preloaded = if self.ledger.fits(candidate.plan.retained_bytes) {
+            self.preload(&candidate).await
+        } else {
+            None
+        };
+        self.runtime.set_ready(false);
+        self.runtime
+            .drain_generation(
+                self.generation,
+                self.active.server.model_drain_deadline.get(),
+            )
+            .await;
+        self.runtime.unload()?;
+        self.ledger.release(self.retained_bytes)?;
+        let loaded = match preloaded {
+            Some(loaded) => loaded,
+            None => match self.factory.load(&candidate.config).await {
+                Ok(loaded) => {
+                    self.ledger.reserve(loaded.retained_bytes)?;
+                    loaded
+                }
+                Err(load_error) => return self.rollback(load_error).await,
+            },
+        };
+        self.runtime.publish(candidate.generation, loaded.service)?;
+        self.runtime.set_ready(true);
+        self.retained_bytes = loaded.retained_bytes;
+        self.active = candidate.config;
+        self.generation = candidate.generation;
+        Ok(())
+    }
+
+    async fn preload(&mut self, candidate: &Candidate) -> Option<Loaded<F::Service>> {
+        let loaded = self.factory.load(&candidate.config).await.ok()?;
+        self.ledger.reserve(loaded.retained_bytes).ok()?;
+        Some(loaded)
+    }
+
+    async fn rollback(&mut self, load_error: String) -> Result<(), String> {
+        match self.factory.load(&self.active).await {
+            Ok(loaded) => {
+                self.ledger.reserve(loaded.retained_bytes)?;
+                self.runtime.publish(self.generation, loaded.service)?;
+                self.runtime.set_ready(true);
+                self.retained_bytes = loaded.retained_bytes;
+                Err(format!(
+                    "candidate load failed and the active generation was restored: {load_error}"
+                ))
+            }
+            Err(rollback_error) => Err(format!(
+                "candidate load failed: {load_error}; rollback failed: {rollback_error}"
+            )),
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{collections::VecDeque, fs, future::Future, pin::Pin, time::Duration};
 
+    use forja_serve::{
+        ChatCompletionRequest, ChatService, Completion, CompletionRequest, GenerationControl,
+        GenerationError, GenerationEvent,
+    };
     use forja_testing::temporary_directory;
 
     use super::*;
+
+    struct FakeService;
+
+    impl ChatService for FakeService {
+        fn model(&self) -> &'static str {
+            "fake"
+        }
+        fn max_body_bytes(&self) -> usize {
+            1
+        }
+        fn queue_length(&self) -> u32 {
+            1
+        }
+        fn request_deadline(&self) -> Duration {
+            Duration::from_secs(1)
+        }
+        fn write_stall_timeout(&self) -> Duration {
+            Duration::from_secs(1)
+        }
+        fn complete(
+            &mut self,
+            _: ChatCompletionRequest,
+            _: GenerationControl,
+        ) -> Pin<Box<dyn Future<Output = Result<Completion, GenerationError>> + Send + '_>>
+        {
+            Box::pin(std::future::pending())
+        }
+        fn complete_text(
+            &mut self,
+            _: CompletionRequest,
+            _: GenerationControl,
+        ) -> Pin<Box<dyn Future<Output = Result<Completion, GenerationError>> + Send + '_>>
+        {
+            Box::pin(std::future::pending())
+        }
+        fn stream_chat(
+            &mut self,
+            _: ChatCompletionRequest,
+            _: tokio::sync::mpsc::Sender<GenerationEvent>,
+            _: GenerationControl,
+        ) -> Pin<Box<dyn Future<Output = Result<(), GenerationError>> + Send + '_>> {
+            Box::pin(std::future::pending())
+        }
+        fn stream_text(
+            &mut self,
+            _: CompletionRequest,
+            _: tokio::sync::mpsc::Sender<GenerationEvent>,
+            _: GenerationControl,
+        ) -> Pin<Box<dyn Future<Output = Result<(), GenerationError>> + Send + '_>> {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    struct FakeFactory(VecDeque<Result<u64, String>>);
+
+    impl RuntimeFactory for FakeFactory {
+        type Service = FakeService;
+
+        fn plan(&self, _: &HostConfig) -> Result<LoadPlan, String> {
+            Ok(LoadPlan { retained_bytes: 8 })
+        }
+
+        fn load<'a>(&'a mut self, _: &'a HostConfig) -> crate::serve::LoadFuture<'a, FakeService> {
+            let outcome = self.0.pop_front().unwrap();
+            Box::pin(async move {
+                outcome.map(|retained_bytes| Loaded {
+                    service: FakeService,
+                    retained_bytes,
+                })
+            })
+        }
+    }
 
     #[test]
     fn candidate_rereads_sources_and_refuses_restart_changes() {
@@ -103,6 +271,26 @@ mod tests {
                 .unwrap_err()
                 .contains("server.listen")
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_candidate_load_restores_the_active_generation() {
+        let root = temporary_directory("supervisor-rollback").unwrap();
+        let path = root.join("host.toml");
+        fs::write(&path, "[model]\nengine='candidate'\n").unwrap();
+        let sources = HostConfigSources {
+            files: vec![path],
+            sets: Vec::new(),
+        };
+        let (_, runtime) = forja_serve::serving_router(FakeService);
+        let factory = FakeFactory(VecDeque::from([Err("candidate failed".to_owned()), Ok(4)]));
+        let mut supervisor =
+            Supervisor::new(sources, HostConfig::default(), 4, 8, factory, runtime).unwrap();
+        let error = supervisor.reload().await.unwrap_err();
+        assert!(error.contains("active generation was restored"));
+        assert_eq!(supervisor.generation, 0);
+        supervisor.shutdown().await.unwrap();
         fs::remove_dir_all(root).unwrap();
     }
 }
