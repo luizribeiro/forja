@@ -51,7 +51,7 @@ impl From<PagePoolError> for PrefixIndexError {
     }
 }
 
-/// Artifact identity for one serving engine's live prefix.
+/// Artifact identity for one serving engine's reusable prefixes.
 pub struct PrefixIdentity {
     fields: [(u64, String); 5],
 }
@@ -95,7 +95,7 @@ impl PrefixIdentity {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct PrefixNamespace(pub(crate) [u8; 32]);
 #[derive(Debug)]
-pub(crate) struct LivePrefix {
+struct PrefixFingerprint {
     namespace: PrefixNamespace,
     tokens: Vec<u32>,
     chain: Vec<[u8; 32]>,
@@ -103,7 +103,7 @@ pub(crate) struct LivePrefix {
 
 #[cfg_attr(not(test), allow(dead_code, reason = "used by paged serving"))]
 struct PrefixEntry {
-    fingerprint: LivePrefix,
+    fingerprint: PrefixFingerprint,
     sequence: PagedPrefix,
     pages: usize,
     used: u64,
@@ -171,7 +171,7 @@ impl PrefixIndex {
             .next_id
             .checked_add(1)
             .ok_or(PrefixIndexError::Pool(PagePoolError::ArithmeticOverflow))?;
-        let fingerprint = LivePrefix::new(namespace, tokens);
+        let fingerprint = PrefixFingerprint::new(namespace, tokens);
         let token_total = self
             .tokens
             .checked_add(fingerprint.tokens.len())
@@ -209,7 +209,7 @@ impl PrefixIndex {
             return Ok(None);
         }
         let cap = prompt.len().saturating_sub(1);
-        let prompt_fingerprint = LivePrefix::new(namespace, prompt[..cap].to_vec());
+        let prompt_fingerprint = PrefixFingerprint::new(namespace, prompt[..cap].to_vec());
         let mut visited = HashSet::new();
         let mut best = None;
         for block in (0..=prompt_fingerprint.chain.len()).rev() {
@@ -349,22 +349,11 @@ impl PrefixLedger {
             self.0.push(token);
         }
     }
-    pub(crate) fn finish(self, namespace: PrefixNamespace) -> LivePrefix {
-        LivePrefix::new(namespace, self.0)
-    }
-
     pub(crate) fn into_tokens(self) -> Vec<u32> {
         self.0
     }
 }
-pub(crate) fn replace_live(
-    entry: &mut Option<LivePrefix>,
-    namespace: PrefixNamespace,
-    ledger: Option<PrefixLedger>,
-) {
-    *entry = ledger.map(|ledger| ledger.finish(namespace));
-}
-impl LivePrefix {
+impl PrefixFingerprint {
     pub(crate) fn new(namespace: PrefixNamespace, tokens: Vec<u32>) -> Self {
         let mut previous = namespace.0;
         let chain = tokens
@@ -387,9 +376,6 @@ impl LivePrefix {
             tokens,
             chain,
         }
-    }
-    pub(crate) fn len(&self) -> usize {
-        self.tokens.len()
     }
     pub(crate) fn match_len(&self, namespace: PrefixNamespace, prompt: &[u32]) -> usize {
         if namespace != self.namespace || prompt.is_empty() {
@@ -426,8 +412,8 @@ mod tests {
     use super::*;
     use forja_core::{DType, PagePool, PagedLayout, PagedPlane};
 
-    fn prefix() -> LivePrefix {
-        LivePrefix::new(PrefixNamespace([7; 32]), (0..130).collect())
+    fn prefix() -> PrefixFingerprint {
+        PrefixFingerprint::new(PrefixNamespace([7; 32]), (0..130).collect())
     }
 
     fn pool() -> PagePool {
@@ -474,7 +460,7 @@ mod tests {
         let mut cached = prefix();
         let mut prompt = (0..130).collect::<Vec<_>>();
         prompt[33] = 999;
-        cached.chain = LivePrefix::new(namespace, prompt.clone()).chain;
+        cached.chain = PrefixFingerprint::new(namespace, prompt.clone()).chain;
         assert_eq!(cached.match_len(namespace, &prompt), 33);
     }
 
@@ -503,28 +489,7 @@ mod tests {
         ledger.record(3, true);
         ledger.record(4, false);
         ledger.record(99, false);
-        assert_eq!(ledger.finish(PrefixNamespace([0; 32])).tokens, [1, 2, 3]);
-    }
-    #[test]
-    fn failed_or_cancelled_requests_invalidate_the_live_entry() {
-        let namespace = PrefixNamespace([0; 32]);
-        let mut entry = None;
-        replace_live(&mut entry, namespace, Some(PrefixLedger::new(vec![1])));
-        replace_live(&mut entry, namespace, None);
-        assert!(entry.is_none());
-    }
-    #[test]
-    fn reused_suffix_reconstructs_the_full_prompt() {
-        let namespace = PrefixNamespace([4; 32]);
-        let cached = (0..97).collect::<Vec<_>>();
-        let mut next = cached.clone();
-        next.extend(97..130);
-        let prefix = LivePrefix::new(namespace, cached);
-        let reused = prefix.match_len(namespace, &next);
-        let mut reconstructed = prefix.tokens[..reused].to_vec();
-        reconstructed.extend_from_slice(&next[reused..]);
-        assert_eq!(reused, 97);
-        assert_eq!(reconstructed, next);
+        assert_eq!(ledger.into_tokens(), [1, 2, 3]);
     }
 
     #[test]

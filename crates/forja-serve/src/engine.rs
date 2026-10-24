@@ -23,10 +23,7 @@ use tokio::sync::{Notify, mpsc};
 
 use crate::guidance::{GuidanceSession, GuidanceWorker};
 use crate::metrics::{ServingMetrics, observe, observe_phase};
-use crate::prefix::{
-    LivePrefix, PrefixIdentity, PrefixIndex, PrefixLedger, PrefixLimits, PrefixNamespace,
-    replace_live,
-};
+use crate::prefix::{PrefixIdentity, PrefixIndex, PrefixLedger, PrefixLimits, PrefixNamespace};
 use crate::request::{ToolChoice, validate_chat_input, validate_completion_input, validate_prompt};
 use crate::tool_output::{GeneratedToolCall, ToolDelta, ToolOutput};
 use crate::{
@@ -380,7 +377,7 @@ pub enum FinishReason {
 pub struct Usage {
     /// Tokens in the rendered prompt.
     pub prompt_tokens: u32,
-    /// Prompt tokens served from the immediately preceding live KV prefix.
+    /// Prompt tokens served from a retained paged KV prefix.
     pub cached_tokens: u32,
     /// Sampled tokens, including a token that caused a stop.
     pub completion_tokens: u32,
@@ -441,7 +438,6 @@ pub struct ServingEngine<B: Backend + Send + Sync + 'static> {
     guidance: GuidanceWorker,
     prefix_namespace: PrefixNamespace,
     prefix_index: Option<PrefixIndex>,
-    live_prefix: Option<LivePrefix>,
     metrics: ServingMetrics,
     scheduler: SchedulerConfig,
     #[cfg(test)]
@@ -704,7 +700,6 @@ where
             guidance,
             prefix_namespace: prefix_identity.into_namespace(),
             prefix_index,
-            live_prefix: None,
             metrics: ServingMetrics::default(),
             scheduler,
             #[cfg(test)]
@@ -746,12 +741,6 @@ where
             self.metrics.slot_bytes = memory.slot_bytes;
             self.metrics.graph_bytes = memory.graph_bytes;
             self.metrics.scratch_bytes = memory.scratch_bytes;
-        }
-    }
-
-    fn invalidate_prefix(&mut self) {
-        if self.live_prefix.take().is_some() {
-            self.metrics.invalidations = self.metrics.invalidations.saturating_add(1);
         }
     }
 
@@ -834,7 +823,7 @@ where
         tokens: &[u32],
         prompt_tokens: u32,
         max_tokens: u32,
-    ) -> Result<(usize, usize, bool), GenerationError> {
+    ) -> Result<(usize, bool), GenerationError> {
         let reserved_tokens = u64::from(prompt_tokens)
             .checked_add(u64::from(max_tokens))
             .ok_or_else(|| GenerationError::new("paged reservation overflowed"))?;
@@ -856,15 +845,9 @@ where
                 GenerationError::unavailable(format!("paged admission failed: {error:?}"))
             })?;
         if paged {
-            Ok((indexed_len, indexed_len, true))
+            Ok((indexed_len, true))
         } else {
-            Ok(self.live_prefix.as_ref().map_or((0, 0, false), |prefix| {
-                (
-                    prefix.match_len(self.prefix_namespace, tokens),
-                    prefix.len(),
-                    false,
-                )
-            }))
+            Ok((0, false))
         }
     }
 
@@ -884,13 +867,11 @@ where
             seed: sampling_seed(params.seed, params.temperature).await?,
         };
         if control.is_cancelled() {
-            self.invalidate_prefix();
             return Err(GenerationError::cancelled());
         }
         let ledger = PrefixLedger::new(tokens.clone());
         let match_started = Instant::now();
-        let (cached_len, live_len, paged) =
-            self.prepare_prefix(&tokens, prompt_tokens, params.max_tokens)?;
+        let (cached_len, paged) = self.prepare_prefix(&tokens, prompt_tokens, params.max_tokens)?;
         self.metrics.requests = self.metrics.requests.saturating_add(1);
         observe(&mut self.metrics.match_time, match_started.elapsed());
         if cached_len == 0 {
@@ -904,27 +885,6 @@ where
         }
         let start_pos = u32::try_from(cached_len)
             .map_err(|_| GenerationError::new("cached prefix length overflowed"))?;
-        if !paged && cached_len > 0 && cached_len < live_len {
-            let rewind_started = Instant::now();
-            let rewind = self
-                .runner
-                .rewind_decode(start_pos)
-                .await
-                .map_err(|error| {
-                    GenerationError::unavailable(format!("prefix rewind failed: {error}"))
-                })
-                .and_then(|result| {
-                    result.map_err(|error| {
-                        GenerationError::unavailable(format!("prefix rewind failed: {error:?}"))
-                    })
-                });
-            if let Err(error) = rewind {
-                self.invalidate_prefix();
-                return Err(error);
-            }
-            self.metrics.rewinds = self.metrics.rewinds.saturating_add(1);
-            observe(&mut self.metrics.rewind_time, rewind_started.elapsed());
-        }
         let prefill_started = Instant::now();
         let first = self
             .runner
@@ -944,10 +904,7 @@ where
             });
         let first = match first {
             Ok(first) => first,
-            Err(error) => {
-                self.invalidate_prefix();
-                return Err(error);
-            }
+            Err(error) => return Err(error),
         };
         observe(
             &mut self.metrics.suffix_prefill_time,
@@ -1109,20 +1066,14 @@ where
             mut tool_parser,
         } = match start {
             Ok(start) => start,
-            Err(error) => {
-                self.invalidate_prefix();
-                return Err(error);
-            }
+            Err(error) => return Err(error),
         };
         let mut consumed = 0_u32;
         let mut unconstrained_consumed = 0_u32;
         let replay_base = self.runner.metrics().submissions;
         let tokenizer = match self.tokenizer() {
             Ok(tokenizer) => tokenizer,
-            Err(error) => {
-                self.invalidate_prefix();
-                return Err(error);
-            }
+            Err(error) => return Err(error),
         };
         let skip_special_tokens = constraint.as_ref().is_none_or(|plan| plan.forced);
         let mut decoder = tokenizer.decode_stream(skip_special_tokens);
@@ -1262,28 +1213,24 @@ where
         .await;
         let ledger = result.is_ok().then(|| std::mem::take(&mut pipeline.ledger));
         let ledger = self.config.serving.prefix_reuse.then_some(ledger).flatten();
-        if paged {
-            if let Some(ledger) = ledger {
-                let publish = self
-                    .runner
-                    .paged_prefix()
-                    .map_err(|error| {
-                        GenerationError::unavailable(format!(
-                            "paged prefix publication failed: {error:?}"
-                        ))
-                    })?
-                    .ok_or_else(|| GenerationError::new("paged prefix is unavailable"))
-                    .and_then(|sequence| {
-                        self.prefix_index
-                            .as_mut()
-                            .ok_or_else(|| GenerationError::new("prefix index is unavailable"))?
-                            .publish(self.prefix_namespace, ledger.into_tokens(), &sequence)
-                            .map_err(|error| GenerationError::unavailable(error.to_string()))
-                    });
-                publish?;
-            }
-        } else {
-            replace_live(&mut self.live_prefix, self.prefix_namespace, ledger);
+        if paged && let Some(ledger) = ledger {
+            let publish = self
+                .runner
+                .paged_prefix()
+                .map_err(|error| {
+                    GenerationError::unavailable(format!(
+                        "paged prefix publication failed: {error:?}"
+                    ))
+                })?
+                .ok_or_else(|| GenerationError::new("paged prefix is unavailable"))
+                .and_then(|sequence| {
+                    self.prefix_index
+                        .as_mut()
+                        .ok_or_else(|| GenerationError::new("prefix index is unavailable"))?
+                        .publish(self.prefix_namespace, ledger.into_tokens(), &sequence)
+                        .map_err(|error| GenerationError::unavailable(error.to_string()))
+                });
+            publish?;
         }
         result
     }
