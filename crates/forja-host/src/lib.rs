@@ -2584,6 +2584,20 @@ where
         self.store.data().engine_memory()
     }
 
+    /// Replaces the live guest-call and GPU time budgets sampled by future work.
+    pub fn update_time_limits(
+        &mut self,
+        guest_call_timeout: Duration,
+        submission_timeout: Duration,
+        gpu_time_budget: Duration,
+    ) {
+        self.store.data_mut().limits.set_time_limits(
+            guest_call_timeout,
+            submission_timeout,
+            gpu_time_budget,
+        );
+    }
+
     /// Returns paged pool, table, slot, graph, and scratch charges.
     ///
     /// # Errors
@@ -2867,6 +2881,17 @@ impl Grants {
 }
 
 impl Limits {
+    fn set_time_limits(
+        &mut self,
+        guest_call_timeout: Duration,
+        submission_timeout: Duration,
+        gpu_time_budget: Duration,
+    ) {
+        self.guest_call_timeout = guest_call_timeout;
+        self.submission_timeout = submission_timeout;
+        self.gpu_time_budget = gpu_time_budget;
+    }
+
     /// Creates tensor limits with a 4 GiB guest-memory default.
     #[must_use]
     pub const fn new(
@@ -2962,6 +2987,24 @@ impl Limits {
         self.table_elements = table_elements;
         self.instances = instances;
         self
+    }
+}
+
+#[cfg(test)]
+mod live_limit_tests {
+    use super::*;
+
+    #[test]
+    fn time_limits_replace_as_one_policy() {
+        let mut limits = Limits::new(1, 1, 1, 1, 1);
+        limits.set_time_limits(
+            Duration::from_secs(2),
+            Duration::from_secs(3),
+            Duration::from_secs(4),
+        );
+        assert_eq!(limits.guest_call_timeout, Duration::from_secs(2));
+        assert_eq!(limits.submission_timeout, Duration::from_secs(3));
+        assert_eq!(limits.gpu_time_budget, Duration::from_secs(4));
     }
 }
 

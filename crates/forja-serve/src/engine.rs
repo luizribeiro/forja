@@ -12,7 +12,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use forja_config::{Choice, HostConfig};
+use forja_config::{Choice, HostConfig, Unbounded};
 use forja_core::{Backend, correction_sampling_seed};
 use forja_host::{
     BatchPhase, BatchSelection, EngineBeginDecode, EngineDecode, EngineDecodeOutput, EngineInfo,
@@ -870,6 +870,14 @@ where
                 .reconfigure(limits, config.serving.prefix_reuse)
                 .map_err(|error| GenerationError::new(error.to_string()))?;
         }
+        self.runner.update_time_limits(
+            config.limits.guest_call_timeout.get(),
+            config.limits.submission_timeout.get(),
+            match config.limits.gpu_time_budget {
+                Unbounded::Unlimited => Duration::MAX,
+                Unbounded::Limited(duration) => duration.get(),
+            },
+        );
         self.scheduler = scheduler;
         self.config = config;
         self.config_generation = generation;
