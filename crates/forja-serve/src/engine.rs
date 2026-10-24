@@ -472,6 +472,7 @@ pub(crate) struct BatchTestBarrier {
     constrained_finished: AtomicU64,
     cancel_on_batch: StdMutex<Option<GenerationControl>>,
     refuse_release: AtomicBool,
+    refuse_bind: AtomicBool,
 }
 
 #[cfg(test)]
@@ -498,6 +499,7 @@ impl BatchTestBarrier {
             constrained_finished: AtomicU64::new(0),
             cancel_on_batch: StdMutex::new(None),
             refuse_release: AtomicBool::new(false),
+            refuse_bind: AtomicBool::new(false),
         }
     }
 
@@ -506,6 +508,12 @@ impl BatchTestBarrier {
             *cancel = Some(control);
         }
         self.refuse_release.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn stale_lane() -> Self {
+        let barrier = Self::passive();
+        barrier.refuse_bind.store(true, Ordering::Release);
+        barrier
     }
 
     pub(crate) async fn reached(&self) {
@@ -579,6 +587,10 @@ impl BatchTestBarrier {
 
     fn observe_batch_completion(&self) {
         self.refuse_release.store(false, Ordering::Release);
+    }
+
+    fn refuse_bind_once(&self) -> bool {
+        self.refuse_bind.swap(false, Ordering::AcqRel)
     }
 
     async fn pause_once(&self) {

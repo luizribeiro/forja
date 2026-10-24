@@ -168,11 +168,29 @@ where
         }
         let prefix = hit.map(|hit| hit.sequence);
         loop {
-            match self
-                .runner
-                .prepare_paged_lane(slot, prefix.clone(), reserved)
-            {
+            #[cfg(test)]
+            let refuse_bind = self
+                .batch_test_barrier
+                .as_ref()
+                .is_some_and(|barrier| barrier.refuse_bind_once());
+            #[cfg(not(test))]
+            let refuse_bind = false;
+            let binding = if refuse_bind {
+                Err(forja_host::bindings::l9o::gpu::compute::Error::Quota(
+                    forja_host::PAGED_LANE_RELEASE_REQUIRED.to_owned(),
+                ))
+            } else {
+                self.runner
+                    .prepare_paged_lane(slot, prefix.clone(), reserved)
+            };
+            match binding {
                 Ok(_) => break,
+                Err(error) if forja_host::is_paged_lane_release_required(&error) => {
+                    // WHY: Fixed-bucket graph capture records padded lanes as paged users, so first admission must release their capture occupant.
+                    if let Err(error) = self.runner.prepare_paged_lane(slot, None, 0) {
+                        return Err((request, batch_admission_error(&error)));
+                    }
+                }
                 Err(error) if prefix.is_none() => {
                     let evicted = match self
                         .prefix_index

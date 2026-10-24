@@ -1746,6 +1746,14 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stale_lane_is_released_before_admission() {
+        let barrier = Arc::new(crate::engine::BatchTestBarrier::stale_lane());
+        let (actor, _weights) = continuous_actor_with_barrier(Some(barrier)).await.unwrap();
+
+        assert!(actor_completion(&actor, "a", 2).await.is_ok());
+    }
+
+    #[tokio::test]
     async fn lane_retirement_does_not_change_an_inflight_successor() {
         let short_expected = serial_output("b", 2).await;
         let long_expected = serial_output("b", 6).await;
