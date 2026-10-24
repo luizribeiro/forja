@@ -21,11 +21,17 @@ frequencies. This is not an expressiveness limit of guest programs: a future bui
 same reduction schedule and precomputed frequency inputs, but the current builders do not promise
 bitwise parity with those host kernels.
 
-Accepted pp512/tg128 results use 30 measured repetitions on an 80-core Apple M3 Ultra:
+Accepted pp512/tg128 results use 30 measured repetitions on an 80-core Apple M3 Ultra. The TG
+column is the context-9 result; the accepted record also covers contexts 512 and 2048.
 
 | Selection | PP tok/s | TG tok/s |
 | --- | ---: | ---: |
-| GPU sequential | 918.88 | 79.64 |
-| GPU pipelined | 916.35 | 95.46 |
+| GPU sequential | 916.24 | 84.89 |
+| GPU pipelined | 916.84 | 98.49 |
+
+The paged-cache profile was screened with a five-repetition A/B/B/A against the otherwise
+identical contiguous profile. Pipelined wall/GPU deltas at pp512 and tg128 contexts 9/512/2048
+were +0.13/+0.06%, +2.47/+2.38%, -0.17/-0.30%, and -0.65/-0.64%. The context-2048 result matches
+the accepted long-context cost in exchange for batching and multi-entry prefix reuse.
 
 The complete confidence intervals and provenance are in the profile's `bench` directory.
