@@ -47,7 +47,12 @@ class FakeServer(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self) -> None:
-        body = b"forja_engine_gpu_time_nanoseconds 3000000000\nforja_pool_bytes 17\n"
+        body = (
+            b"forja_engine_gpu_time_nanoseconds 3000000000\n"
+            b"forja_engine_prepared_graphs_total 13\n"
+            b"forja_engine_graph_preparation_nanoseconds_total 17000000\n"
+            b"forja_pool_bytes 17\n"
+        )
         self.send_response(200)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
@@ -154,6 +159,7 @@ def test_runner_scrapes_resource_gauges_and_counter_deltas() -> None:
             {**samples, "forja_engine_gpu_time_nanoseconds": 1_000_000_000}, samples
         )
         assert report["gpu_seconds"] == 2.0
+        assert report["graphs"] == {"prepared": 0, "preparation_seconds": 0.0}
         assert report["memory"]["pool_bytes"] == 17
         assert report["memory"]["table_bytes"] is None
     finally:

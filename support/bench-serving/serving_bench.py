@@ -151,7 +151,8 @@ def metric_report(
     phases = {
         name: None for name in ("scheduler_seconds", "queue_seconds", "parser_mask_seconds", "sse_seconds")
     }
-    report = {"gpu_seconds": None, "memory": memory, "host_phases": phases}
+    graphs = {"prepared": None, "preparation_seconds": None}
+    report = {"gpu_seconds": None, "graphs": graphs, "memory": memory, "host_phases": phases}
     if before is None or after is None:
         return report
     for name in memory:
@@ -170,6 +171,12 @@ def metric_report(
     gpu = "forja_engine_gpu_time_nanoseconds"
     if gpu in before and gpu in after:
         report["gpu_seconds"] = max(0.0, after[gpu] - before[gpu]) / 1_000_000_000
+    prepared = "forja_engine_prepared_graphs_total"
+    if prepared in before and prepared in after:
+        graphs["prepared"] = int(max(0.0, after[prepared] - before[prepared]))
+    preparation = "forja_engine_graph_preparation_nanoseconds_total"
+    if preparation in before and preparation in after:
+        graphs["preparation_seconds"] = max(0.0, after[preparation] - before[preparation]) / 1_000_000_000
     return report
 
 

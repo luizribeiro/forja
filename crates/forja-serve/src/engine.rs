@@ -736,6 +736,9 @@ where
     fn refresh_runtime_metrics(&mut self) {
         let execution = self.runner.metrics();
         self.metrics.gpu_time_ns = u64::try_from(execution.gpu_time.as_nanos()).unwrap_or(u64::MAX);
+        self.metrics.prepared_graphs = execution.prepared_graphs;
+        self.metrics.graph_preparation_time_ns =
+            u64::try_from(execution.graph_preparation_time.as_nanos()).unwrap_or(u64::MAX);
         self.metrics.live_bytes = execution.live_bytes;
         if let Ok(Some(memory)) = self.runner.paged_memory_usage() {
             self.metrics.pool_bytes = memory.slab_bytes;

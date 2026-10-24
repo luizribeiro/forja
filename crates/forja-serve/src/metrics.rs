@@ -23,6 +23,8 @@ pub struct ServingMetrics {
     pub(crate) parser_mask_time_ns: u64,
     pub(crate) sse_time_ns: u64,
     pub(crate) gpu_time_ns: u64,
+    pub(crate) prepared_graphs: u64,
+    pub(crate) graph_preparation_time_ns: u64,
     pub(crate) live_bytes: u64,
     pub(crate) pool_bytes: u64,
     pub(crate) table_bytes: u64,
@@ -97,6 +99,16 @@ impl ServingMetrics {
             &mut output,
             "forja_engine_gpu_time_nanoseconds",
             self.gpu_time_ns,
+        );
+        counter(
+            &mut output,
+            "forja_engine_prepared_graphs_total",
+            self.prepared_graphs,
+        );
+        counter(
+            &mut output,
+            "forja_engine_graph_preparation_nanoseconds_total",
+            self.graph_preparation_time_ns,
         );
         gauge_u64(&mut output, "forja_engine_live_bytes", self.live_bytes);
         gauge_u64(&mut output, "forja_pool_bytes", self.pool_bytes);
@@ -198,6 +210,8 @@ mod tests {
             requests: 7,
             hits: 3,
             gpu_time_ns: 11,
+            prepared_graphs: 13,
+            graph_preparation_time_ns: 17,
             ..ServingMetrics::default()
         };
         observe(&mut metrics.ttft, Duration::from_micros(33));
@@ -215,6 +229,8 @@ mod tests {
         assert!(text.contains("forja_scheduler_nanoseconds_total 7000\n"));
         assert!(text.contains("forja_queue_seconds_count 0\n"));
         assert!(text.contains("forja_engine_gpu_time_nanoseconds 11\n"));
+        assert!(text.contains("forja_engine_prepared_graphs_total 13\n"));
+        assert!(text.contains("forja_engine_graph_preparation_nanoseconds_total 17\n"));
         assert!(!text.contains("request_id"));
         assert!(!text.contains("path="));
     }
