@@ -231,7 +231,7 @@ where
     };
     let result = axum::serve(listener, router)
         .with_graceful_shutdown(async move {
-            if let Err(error) = shutdown_signal().await {
+            if let Err(error) = crate::signals::shutdown().await {
                 tracing::error!(event = "shutdown.listen_failed", %error);
             }
             drain.drain().await;
@@ -242,36 +242,6 @@ where
         task.await??;
     }
     result?;
-    Ok(())
-}
-
-#[cfg(unix)]
-async fn shutdown_signal() -> Result<(), Box<dyn Error>> {
-    use tokio::signal::unix::{SignalKind, signal};
-
-    let mut interrupt = signal(SignalKind::interrupt())?;
-    let mut terminate = signal(SignalKind::terminate())?;
-    let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
-    let interrupt_sender = sender.clone();
-    tokio::spawn(async move {
-        if interrupt.recv().await.is_some() {
-            let _ = interrupt_sender.send(()).await;
-        }
-    });
-    tokio::spawn(async move {
-        if terminate.recv().await.is_some() {
-            let _ = sender.send(()).await;
-        }
-    });
-    receiver
-        .recv()
-        .await
-        .ok_or_else(|| "shutdown signal listeners closed".into())
-}
-
-#[cfg(not(unix))]
-async fn shutdown_signal() -> Result<(), Box<dyn Error>> {
-    tokio::signal::ctrl_c().await?;
     Ok(())
 }
 
