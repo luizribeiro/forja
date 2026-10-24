@@ -576,6 +576,7 @@ fn run_sdpa<B: Backend + 'static>(
     let value = backend.alloc(dtype, &[physical_pages, PAGE_TOKENS, kv_heads, WIDTH])?;
     let table = backend.alloc(DType::U32, &[logical_pages, 2])?;
     let generation_tensor = backend.alloc(DType::U32, &[physical_pages])?;
+    let activity = backend.alloc(DType::U32, &[1])?;
     let output_storage = backend.alloc(DType::F32, &[query_length, query_heads, WIDTH])?;
     let output = backend.view(&output_storage, ViewOp::Permute(vec![1, 0, 2]))?;
     let mut query_storage_values = vec![0.0_f32; query_values.len()];
@@ -593,6 +594,7 @@ fn run_sdpa<B: Backend + 'static>(
     backend.write(&value, &encode(&values, dtype))?;
     backend.write(&table, &table_bytes(&entries))?;
     backend.write(&generation_tensor, &generation_bytes(&generations))?;
+    backend.write(&activity, &1_u32.to_ne_bytes())?;
     let mut commands = CommandList::new();
     commands
         .dispatch(
@@ -603,7 +605,7 @@ fn run_sdpa<B: Backend + 'static>(
                 key_length,
                 page_tokens: PAGE_TOKENS,
             },
-            &[&query, &key, &value, &table, &generation_tensor],
+            &[&query, &key, &value, &table, &generation_tensor, &activity],
             &output,
         )
         .map_err(|_| BackendError::InvalidInput)?;

@@ -3065,6 +3065,7 @@ struct PagedBinding {
     banks: Arc<PagedSlotBanks>,
     lanes: Vec<PagedLaneBinding>,
     activity: [Vec<AtomicBool>; 2],
+    activity_gated: [AtomicBool; 2],
     uploaded_activity: [Vec<AtomicBool>; 2],
     #[cfg(test)]
     activity_uploads: AtomicU64,
@@ -3555,6 +3556,7 @@ impl<B: Backend + 'static> Host<B> {
             activity: std::array::from_fn(|_| {
                 (0..active_lanes).map(|_| AtomicBool::new(false)).collect()
             }),
+            activity_gated: std::array::from_fn(|_| AtomicBool::new(true)),
             uploaded_activity: std::array::from_fn(|_| {
                 (0..active_lanes).map(|_| AtomicBool::new(false)).collect()
             }),
@@ -3778,7 +3780,9 @@ impl<B: Backend + 'static> Host<B> {
                 .first()
                 .ok_or_else(|| invalid_handle("paged activity lane is missing"))?;
             active.store(true, Ordering::Release);
-            self.upload_paged_activity(&binding, bank, tensor, false)?;
+            self.upload_paged_activity(&binding, bank, tensor, false)
+                .inspect_err(|_| active.store(false, Ordering::Release))?;
+            binding.activity_gated[bank].store(false, Ordering::Release);
         }
         Ok(())
     }
@@ -4019,6 +4023,7 @@ impl<B: Backend + 'static> Host<B> {
                 "batch lane count exceeds the paged slot".to_owned(),
             ));
         }
+        binding.activity_gated[bank].store(true, Ordering::Release);
         let mut logical_lengths = vec![0_u32; binding.lanes.len()];
         let mut query_starts = vec![0_u32; binding.lanes.len()];
         let mut absolute_positions = vec![0_u32; binding.lanes.len()];
@@ -4130,6 +4135,7 @@ impl<B: Backend + 'static> Host<B> {
                 binding,
                 bank,
                 lane,
+                ungated: false,
             }],
             flight: None,
             timeout: self.limits.submission_timeout,
@@ -4466,9 +4472,10 @@ impl<B: Backend + 'static> Host<B> {
             .map_err(|_| guest_error(BackendError::ExecutionFailed))?;
         *active_sequence = (!release).then_some(sequence);
         drop(active_sequence);
-        for (bank, activity) in binding.activity.iter().enumerate() {
-            activity[lane].store(!release, Ordering::Release);
-            self.upload_paged_activity(binding, bank, metadata[bank][3], true)?;
+        for (bank, bank_metadata) in metadata.iter().enumerate() {
+            binding.activity[bank][lane].store(!release, Ordering::Release);
+            binding.activity_gated[bank].store(true, Ordering::Release);
+            self.upload_paged_activity(binding, bank, bank_metadata[3], true)?;
             if release {
                 binding
                     .banks
@@ -5151,8 +5158,16 @@ impl<B: Backend + 'static> Host<B> {
         slot: &Resource<BatchSlotEntry>,
         lane: u32,
         plane: u32,
-    ) -> Result<(TensorEntry, TensorEntry, TensorEntry, TensorEntry, PagedUse), compute::Error>
-    {
+    ) -> Result<
+        (
+            TensorEntry,
+            TensorEntry,
+            TensorEntry,
+            Option<TensorEntry>,
+            PagedUse,
+        ),
+        compute::Error,
+    > {
         let slot = self.table.get(slot).map_err(invalid_handle)?;
         let bank = slot.active_bank;
         let lane = usize::try_from(lane)
@@ -5174,27 +5189,46 @@ impl<B: Backend + 'static> Host<B> {
             ))?
             .clone();
         let generations = self.entry(&Resource::new_borrow(slot.generations))?.clone();
-        let activity = self.entry(&Resource::new_borrow(slot.metadata[bank][3]))?;
-        let activity = TensorEntry {
-            tensor: self
-                .backend
-                .view(
-                    &activity.tensor,
-                    ViewOp::Slice(vec![
-                        Slice::new(
-                            u32::try_from(lane).map_err(|_| {
-                                compute::Error::Layout("paged lane exceeds u32".to_owned())
-                            })?,
-                            1,
-                            1,
+        let lane_activity = slot
+            .binding
+            .activity
+            .get(bank)
+            .and_then(|bank| bank.get(lane))
+            .ok_or_else(|| invalid_handle("paged lane activity is missing"))?;
+        let ungated = lane == 0
+            && !slot.binding.activity_gated[bank].load(Ordering::Acquire)
+            && lane_activity.load(Ordering::Acquire)
+            && slot
+                .binding
+                .banks
+                .slot(bank, lane)
+                .map_err(paged_refusal)?
+                .is_active();
+        let activity = (!ungated)
+            .then(|| {
+                let activity = self.entry(&Resource::new_borrow(slot.metadata[bank][3]))?;
+                Ok::<_, compute::Error>(TensorEntry {
+                    tensor: self
+                        .backend
+                        .view(
+                            &activity.tensor,
+                            ViewOp::Slice(vec![
+                                Slice::new(
+                                    u32::try_from(lane).map_err(|_| {
+                                        compute::Error::Layout("paged lane exceeds u32".to_owned())
+                                    })?,
+                                    1,
+                                    1,
+                                )
+                                .map_err(guest_error)?,
+                            ]),
                         )
                         .map_err(guest_error)?,
-                    ]),
-                )
-                .map_err(guest_error)?,
-            symbolic: None,
-            buffer: Arc::clone(&activity.buffer),
-        };
+                    symbolic: None,
+                    buffer: Arc::clone(&activity.buffer),
+                })
+            })
+            .transpose()?;
         Ok((
             page_tensor,
             table_tensor,
@@ -5204,6 +5238,7 @@ impl<B: Backend + 'static> Host<B> {
                 binding: Arc::clone(&slot.binding),
                 bank,
                 lane,
+                ungated,
             },
         ))
     }
@@ -6615,6 +6650,7 @@ struct PagedUse {
     binding: Arc<PagedBinding>,
     bank: usize,
     lane: usize,
+    ungated: bool,
 }
 
 struct PagedDispatchContext<'a> {
@@ -6649,7 +6685,9 @@ struct PagedCheck {
 
 impl PartialEq for PagedCheck {
     fn eq(&self, other: &Self) -> bool {
-        self.usage.same_lane(&other.usage) && self.bound == other.bound
+        self.usage.same_lane(&other.usage)
+            && self.usage.ungated == other.usage.ungated
+            && self.bound == other.bound
     }
 }
 
@@ -6661,7 +6699,22 @@ impl PagedCheck {
     /// Validates this bound against its lane, resolving parameters from `values`; without
     /// values only constant bounds resolve.
     fn validate(&self, values: Option<&ParamValues>) -> Result<(), compute::Error> {
-        if !self.usage.is_active()? {
+        let active = self.usage.is_active()?;
+        if self.usage.ungated {
+            if !active
+                || !self
+                    .usage
+                    .binding
+                    .banks
+                    .slot(self.usage.bank, self.usage.lane)
+                    .map_err(paged_refusal)?
+                    .is_active()
+            {
+                return Err(compute::Error::Layout(
+                    "ungated paged lane is no longer active".to_owned(),
+                ));
+            }
+        } else if !active {
             return Ok(());
         }
         let resolve = |affine: Affine| {
@@ -6681,6 +6734,7 @@ impl PagedCheck {
             binding,
             bank,
             lane,
+            ..
         } = &self.usage;
         let logical_len = || {
             binding
@@ -6733,6 +6787,7 @@ impl std::fmt::Debug for PagedUse {
             .debug_struct("PagedUse")
             .field("bank", &self.bank)
             .field("lane", &self.lane)
+            .field("ungated", &self.ungated)
             .finish_non_exhaustive()
     }
 }
@@ -7920,10 +7975,12 @@ where
                         table.tensor.buffer(),
                         generations.tensor.buffer(),
                     ];
+                    let mut inputs = vec![ordinary, table, generations];
+                    inputs.extend(activity);
                     self.record_paged_dispatch(
                         &commands,
                         (template, concrete),
-                        vec![ordinary, table, generations, activity],
+                        inputs,
                         pages,
                         PagedDispatchContext {
                             protected,
@@ -7939,10 +7996,12 @@ where
                         table.tensor.buffer(),
                         generations.tensor.buffer(),
                     ];
+                    let mut inputs = vec![pages, table, generations];
+                    inputs.extend(activity);
                     self.record_paged_dispatch(
                         &commands,
                         (template, concrete),
-                        vec![pages, table, generations, activity],
+                        inputs,
                         ordinary,
                         PagedDispatchContext {
                             protected,
@@ -8026,17 +8085,18 @@ where
                 table.tensor.buffer(),
                 generations.tensor.buffer(),
             ];
+            let mut inputs = vec![
+                query,
+                reshape_plane(key)?,
+                reshape_plane(value)?,
+                table,
+                generations,
+            ];
+            inputs.extend(activity);
             self.record_paged_dispatch(
                 &commands,
                 (template, concrete),
-                vec![
-                    query,
-                    reshape_plane(key)?,
-                    reshape_plane(value)?,
-                    table,
-                    generations,
-                    activity,
-                ],
+                inputs,
                 output,
                 PagedDispatchContext {
                     protected,
@@ -9138,7 +9198,7 @@ mod tests {
             .table
             .push(PagePoolEntry {
                 pool: paged,
-                active_lanes: 1,
+                active_lanes: 2,
                 max_context: 4,
                 plane_count: 1,
                 slot_banks: None,
@@ -9149,12 +9209,25 @@ mod tests {
             .unwrap();
         let sequence = host.table.push(PagedSequenceEntry).unwrap();
         let slot = host.open_paged_slot(&pool, 1).unwrap();
+        host.bind_paged_request(pool.rep(), None, 4).unwrap();
+        host.begin_paged_append(pool.rep(), 0, 1).unwrap();
+        let plane = host
+            .table
+            .get(&Resource::<TensorEntry>::new_borrow(
+                host.table.get(&slot).unwrap().planes[0],
+            ))
+            .unwrap()
+            .tensor
+            .clone();
+        let elements = plane.layout().shape().iter().product::<u32>() as usize;
+        let sentinel = f32_bytes(&vec![f32::NAN; elements]);
+        host.backend.write(&plane, &sentinel).unwrap();
         let ordinary = host.alloc(compute::Dtype::F32, &[1, 1]).unwrap();
         let copy = <Host<CpuBackend> as paged_storage::Host>::record_paged_copy(
             &mut host,
             Resource::new_borrow(commands.rep()),
             Resource::new_borrow(slot.rep()),
-            0,
+            1,
             paged_storage::PagedSpan {
                 plane: 0,
                 start: wit_affine(None, 0, 0),
@@ -9167,6 +9240,7 @@ mod tests {
         .unwrap();
         assert!(copy.is_ok(), "{copy:?}");
         host.prepare_submit(commands).unwrap().run().await.unwrap();
+        assert_eq!(host.backend.read(&plane).unwrap(), sentinel);
 
         let pool_rep = pool.rep();
         let sequence_rep = sequence.rep();
@@ -9197,33 +9271,42 @@ mod tests {
         );
     }
 
+    #[test]
+    fn failed_default_activity_upload_clears_host_activity() {
+        let mut host = Host::new(CpuBackend::new(), GENEROUS);
+        let pool = insert_test_pool(&mut host, 1, 8);
+        let slot = host.open_paged_slot(&pool, 1).unwrap();
+        host.bind_paged_request(pool.rep(), None, 8).unwrap();
+        let (binding, activity) = {
+            let slot = host.table.get(&slot).unwrap();
+            (Arc::clone(&slot.binding), slot.metadata[0][3])
+        };
+        binding.uploaded_activity[0][0].store(false, Ordering::Release);
+        host.table
+            .delete(Resource::<TensorEntry>::new_own(activity))
+            .unwrap();
+
+        assert!(host.activate_default_paged_lane(pool.rep()).is_err());
+        assert!(!binding.activity[0][0].load(Ordering::Acquire));
+    }
+
     #[tokio::test]
-    async fn paged_wasmtime_calls_record_copy_and_attention_with_one_usage() {
+    async fn paged_checks_keep_mixed_gating_for_the_same_lane_and_bound() {
         let mut host = Host::new(CpuBackend::new(), GENEROUS);
         let pool = insert_test_pool(&mut host, 2, 8);
         let slot = host.open_paged_slot(&pool, 2).unwrap();
         let _checkpoint = host.begin_paged_append(pool.rep(), 0, 1).unwrap();
         let commands = host.command_list().unwrap();
-        let ordinary = host.alloc(compute::Dtype::F32, &[1, 2]).unwrap();
         let query = host.alloc(compute::Dtype::F32, &[1, 1, 2]).unwrap();
         let output = host.alloc(compute::Dtype::F32, &[1, 1, 2]).unwrap();
 
-        <Host<CpuBackend> as paged_storage::Host>::record_paged_copy(
-            &mut host,
-            Resource::new_borrow(commands.rep()),
-            Resource::new_borrow(slot.rep()),
-            0,
-            paged_storage::PagedSpan {
-                plane: 0,
-                start: wit_affine(None, 0, 0),
-                len: 1,
-            },
-            Resource::new_borrow(ordinary.rep()),
-            paged_storage::CopyDirection::IntoPages,
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        record_into_pages(&mut host, &commands, &slot, 0, wit_affine(None, 0, 0), 1)
+            .await
+            .unwrap();
+        host.table.get(&slot).unwrap().binding.activity_gated[0].store(true, Ordering::Release);
+        record_into_pages(&mut host, &commands, &slot, 0, wit_affine(None, 0, 0), 1)
+            .await
+            .unwrap();
         <Host<CpuBackend> as paged_storage::Host>::record_paged_sdpa(
             &mut host,
             Resource::new_borrow(commands.rep()),
@@ -9246,8 +9329,18 @@ mod tests {
         .unwrap();
 
         let recorded = host.table.get(&commands).unwrap();
-        assert_eq!(recorded.recorded.len(), 2);
+        assert_eq!(recorded.recorded.len(), 3);
         assert_eq!(recorded.paged.len(), 1);
+        assert_eq!(recorded.paged_bounds.len(), 3);
+        assert!(recorded.paged_bounds[0].usage.ungated);
+        assert!(!recorded.paged_bounds[1].usage.ungated);
+        assert!(matches!(
+            recorded.recorded.as_slice(),
+            [super::RecordedDispatch::Static(first), super::RecordedDispatch::Static(second),
+                super::RecordedDispatch::Static(sdpa)]
+                if first.inputs().len() == 3 && second.inputs().len() == 4
+                    && sdpa.inputs().len() == 6
+        ));
     }
 
     const SHARED_PREFIX_TOKENS: u32 = 5;
@@ -9645,6 +9738,11 @@ mod tests {
             Err(compute::Error::Layout(_))
         ));
         host.prepare_replay(&graph, vec![1]).unwrap();
+        host.bind_paged_lane(pool.rep(), 0, None, 0).unwrap();
+        assert!(matches!(
+            host.prepare_replay(&graph, vec![0]),
+            Err(compute::Error::Layout(_))
+        ));
     }
 
     #[tokio::test]
@@ -9863,6 +9961,7 @@ mod tests {
                     std::sync::atomic::AtomicBool::new(false),
                 ]
             }),
+            activity_gated: std::array::from_fn(|_| std::sync::atomic::AtomicBool::new(true)),
             uploaded_activity: std::array::from_fn(|_| {
                 vec![
                     std::sync::atomic::AtomicBool::new(false),
@@ -9893,6 +9992,7 @@ mod tests {
             binding,
             bank: 0,
             lane: 0,
+            ungated: false,
         };
         super::PagedUse::mark_all(std::slice::from_ref(&usage), Some(7)).unwrap();
         assert!(usage.binding.lane(0).unwrap().used.load(Ordering::Acquire));

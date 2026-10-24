@@ -10,6 +10,12 @@ struct PagedCopyParams {
     uint direction;
 };
 
+constant uint paged_has_activity [[function_constant(216)]];
+
+inline bool paged_lane_active(device const uint *activity) {
+    return paged_has_activity == 0 || activity[0] != 0;
+}
+
 kernel void paged_copy(
     device uchar *ordinary [[buffer(0)]],
     device uchar *pool [[buffer(1)]],
@@ -26,7 +32,7 @@ kernel void paged_copy(
     uint element = position.x;
     uint token = position.y;
     uint logical_token = params.start + token;
-    if (activity[0] == 0) {
+    if (!paged_lane_active(activity)) {
         if (params.direction != 0 && element < params.elements) {
             uint index = token * params.elements + element;
             ulong ordinary_index = physical_index(ordinary_layout, index);
@@ -99,7 +105,7 @@ kernel void paged_sdpa_validate(
     device atomic_uint *error_flag [[buffer(3)]],
     device const uint *activity [[buffer(4)]],
     uint logical_page [[thread_position_in_grid]]) {
-    if (activity[0] == 0) {
+    if (!paged_lane_active(activity)) {
         return;
     }
     uint pages = (params.key_length + params.page_tokens - 1) / params.page_tokens;
@@ -189,7 +195,7 @@ void paged_steel_attention_body(
         first_causal_block = (params.query_start + first_query) / BK;
     }
     if (thread_index == 0) {
-        valid = activity[0] != 0
+        valid = paged_lane_active(activity)
             && atomic_load_explicit(error_flag, memory_order_relaxed) == 0;
         if (valid != 0) {
             first_page = table[0].x;
@@ -401,7 +407,7 @@ void paged_sdpa_2pass_1_gqa_body(
     threadgroup uint *page_valid,
     threadgroup uint &first_page,
     threadgroup uint &valid) {
-    if (activity[0] == 0) {
+    if (!paged_lane_active(activity)) {
         return;
     }
     constexpr uint elements_per_thread = D / 32;
@@ -654,7 +660,7 @@ void paged_sdpa_2pass_2_body(
     constexpr uint groups = 32;
     constexpr uint elements_per_thread = D / groups;
     uint head = position.x;
-    if (activity[0] == 0) {
+    if (!paged_lane_active(activity)) {
         for (uint column = simd_lane; column < D; column += 32) {
             ulong output_index = params.o_offset + ulong(head) * params.o_strides[0]
                 + ulong(column) * params.o_strides[2];
@@ -759,7 +765,7 @@ void paged_sdpa_body(
     float maximum = negative_finite_sentinel();
     float denominator = 0.0f;
     if (simd_group == 0 && simd_lane == 0) {
-        valid = activity[0] != 0
+        valid = paged_lane_active(activity)
             && atomic_load_explicit(error_flag, memory_order_relaxed) == 0;
         if (valid != 0) {
             first_page = table[0].x;

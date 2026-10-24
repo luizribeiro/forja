@@ -3072,6 +3072,7 @@ impl MetalBackend {
         let pool = self.encoder_dense_tensor(pool_tensor)?;
         let page_table = self.encoder_dense_tensor(table_tensor)?;
         let generations = self.encoder_dense_tensor(generations)?;
+        let has_activity = activity_tensor.is_some();
         let activity = activity_tensor
             .map(|tensor| self.encoder_dense_tensor(tensor))
             .transpose()?;
@@ -3126,6 +3127,7 @@ impl MetalBackend {
                 &[
                     (0, dtype_code(ordinary.layout.dtype())),
                     (1, dtype_code(pool.layout.dtype())),
+                    (216, u32::from(has_activity)),
                 ],
             )?;
         set_pipeline(encoder, &pipeline);
@@ -3210,6 +3212,7 @@ impl MetalBackend {
                 &[
                     (0, dtype_code(ordinary.layout.dtype())),
                     (1, dtype_code(pool.layout.dtype())),
+                    (216, 1),
                 ],
             )?;
         set_pipeline(encoder, &pipeline);
@@ -3276,6 +3279,7 @@ impl MetalBackend {
         let value = self.encoder_dense_tensor(value_tensor)?;
         let page_table = self.encoder_dense_tensor(table_tensor)?;
         let generations = self.encoder_dense_tensor(generation_tensor)?;
+        let has_activity = activity.is_some();
         let activity = activity
             .map(|tensor| self.encoder_dense_tensor(tensor))
             .transpose()?;
@@ -3355,17 +3359,18 @@ impl MetalBackend {
             128 => "paged_sdpa_128",
             _ => return Err(BackendError::UnsupportedOperation),
         };
-        let constants = [
+        let constants = vec![
             (0, dtype_code(query.layout.dtype())),
             (1, dtype_code(key.layout.dtype())),
             (2, dtype_code(output.layout.dtype())),
             (3, dtype_code(value.layout.dtype())),
+            (216, u32::from(has_activity)),
         ];
         let validation = self
             .pipelines
             .lock()
             .map_err(|_| BackendError::ExecutionFailed)?
-            .get("paged_sdpa_validate", &[])?;
+            .get("paged_sdpa_validate", &[(216, u32::from(has_activity))])?;
         set_pipeline(encoder, &validation);
         for (index, tensor) in [&page_table, &generations].into_iter().enumerate() {
             bindings.bind(table, index, &tensor.buffer);
@@ -3473,7 +3478,7 @@ impl MetalBackend {
             _ => None,
         } {
             let (block_query, block_key) = steel_attention_tile(kernel, q[2])?;
-            let mut steel_constants = constants.to_vec();
+            let mut steel_constants = constants.clone();
             steel_constants.extend([
                 (214, u32::from(key_length % block_key == 0)),
                 (215, u32::from(causal)),
