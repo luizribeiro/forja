@@ -2,9 +2,8 @@
 
 Forja's Qwen3-Coder engine targets Qwen3-Coder-30B-A3B-Instruct with affine four-bit weights and
 q8 router gates on Metal for Apple M3 Ultra. Both profiles support a 32768-token context. Prompts
-below 2048 tokens use 512-token prefill chunks; longer prompts use 2048-token chunks with exact
-remainders capped at 16 tokens. The two planners retain at most two full-chunk and seven exact-tail
-graphs between them.
+use 2048-token chunks with exact remainders capped at 16 tokens. The planner retains at
+most one full-chunk and one exact-tail graph.
 
 The default profile stores K/V in f16. It passed reduced-precision verification with a 2.012e-4
 teacher-forced mean KL, 64/64 top-1 agreement, and a 4.826e-4 maximum layer-relative error; its

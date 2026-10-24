@@ -256,6 +256,8 @@ async fn metal_batch_graph_catalog_stays_within_limit() -> Result<(), Box<dyn Er
     config.paged_cache = true;
     runner.load_with_selections(Some(1), &config).await??;
 
+    populate_single_replay_catalog(&mut runner).await?;
+
     for bucket in [1, 2, 4, 8] {
         let prefix = batch_prefix(&mut runner, 1).await?;
         runner.prepare_paged_lane(0, Some(prefix), 64)?;
@@ -267,7 +269,7 @@ async fn metal_batch_graph_catalog_stays_within_limit() -> Result<(), Box<dyn Er
 
         let prefix = batch_prefix(&mut runner, 1).await?;
         runner.prepare_paged_lane(0, Some(prefix), 64)?;
-        for (position, token) in [(1, 41), (2, 43)] {
+        for (position, token, allowed) in [(1, 41, 47), (2, 43, 53)] {
             let shape = BatchShape {
                 phase: BatchPhase::Decode,
                 bucket,
@@ -286,7 +288,7 @@ async fn metal_batch_graph_catalog_stays_within_limit() -> Result<(), Box<dyn Er
             lanes[0] = Some(EngineBatchSelectLane {
                 start_pos: position,
                 sampling: SamplingParams::default(),
-                allow: vec![47],
+                allow: vec![allowed],
             });
             let selected = runner
                 .batch_select(
@@ -300,12 +302,77 @@ async fn metal_batch_graph_catalog_stays_within_limit() -> Result<(), Box<dyn Er
                     },
                 )
                 .await??;
-            assert_eq!(batch_tokens(&runner.read(&selected.tokens).await?)?[0], 47);
+            assert_eq!(
+                batch_tokens(&runner.read(&selected.tokens).await?)?[0],
+                allowed
+            );
         }
     }
 
-    assert_eq!(runner.metrics().live_graphs, 2 * 4 * 2);
-    assert_eq!(runner.metrics().prepared_graphs, 2 * 4 * 2);
+    assert_eq!(runner.metrics().live_graphs, 2 + 2 + 4 * 3);
+    assert_eq!(runner.metrics().prepared_graphs, 2 + 2 + 4 * 3);
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+async fn populate_single_replay_catalog(
+    runner: &mut EngineRunner<forja_metal::MetalBackend>,
+) -> Result<(), Box<dyn Error>> {
+    let mut position = 0;
+    for sequence in [9, 512, 2_048, 4_000] {
+        let output = runner
+            .step(EngineStep {
+                tokens: vec![17; sequence],
+                start_pos: position,
+                taps: false,
+            })
+            .await??;
+        runner.read(&output.logits).await?;
+        position += u32::try_from(sequence)?;
+    }
+    assert_eq!(runner.metrics().live_graphs, 2);
+    let output = runner
+        .step(EngineStep {
+            tokens: vec![17],
+            start_pos: position,
+            taps: false,
+        })
+        .await??;
+    runner.read(&output.logits).await?;
+    position += 1;
+    assert_eq!(runner.metrics().live_graphs, 3);
+    for sampling in [
+        SamplingParams::default(),
+        SamplingParams {
+            temperature: 0.7,
+            top_k: 20,
+            top_p: 0.9,
+            seed: 17,
+        },
+    ] {
+        let output = runner
+            .decode(EngineDecode {
+                tokens: None,
+                start_pos: position,
+                sampling,
+            })
+            .await??;
+        runner.read(&output.token).await?;
+        position += 1;
+    }
+    assert_eq!(runner.metrics().live_graphs, 3);
+    let logits = runner
+        .begin_decode(EngineBeginDecode {
+            tokens: Some(vec![17]),
+            start_pos: position,
+        })
+        .await??;
+    let allow = vec![u32::MAX; usize::try_from(qwen3_coder::VOCAB / 32)?];
+    let output = runner
+        .finish_decode(&logits, position, SamplingParams::default(), &allow)
+        .await??;
+    runner.read_queued_token(output).await?;
+    assert_eq!(runner.metrics().live_graphs, 2 + 2);
     Ok(())
 }
 

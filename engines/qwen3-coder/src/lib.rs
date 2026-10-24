@@ -66,11 +66,7 @@ const PREFILL_CHUNK: u32 = 2_048;
 #[cfg(target_family = "wasm")]
 const PREFILL_TAIL_CHUNK: u32 = 16;
 #[cfg(target_family = "wasm")]
-const SHORT_PREFILL_CHUNK: u32 = 512;
-#[cfg(target_family = "wasm")]
-const SHORT_PREFILL_TAIL_CAPACITY: usize = 5;
-#[cfg(target_family = "wasm")]
-const LONG_PREFILL_TAIL_CAPACITY: usize = 2;
+const PREFILL_TAIL_CAPACITY: usize = 1;
 
 const QUERY_HEADS: u32 = 32;
 const KEY_VALUE_HEADS: u32 = 4;
@@ -985,17 +981,13 @@ pub struct Qwen3Coder {
     #[cfg(target_family = "wasm")]
     decode: DecodeState,
     #[cfg(target_family = "wasm")]
-    short_prefill: Option<ChunkedPrefill<f32>>,
-    #[cfg(target_family = "wasm")]
-    long_prefill: Option<ChunkedPrefill<f32>>,
+    prefill: Option<ChunkedPrefill<f32>>,
     #[cfg(target_family = "wasm")]
     batch_feedback: Tensor<u32>,
     #[cfg(target_family = "wasm")]
     batch_graphs: Vec<BatchDecodeGraphs>,
     #[cfg(target_family = "wasm")]
     batch_bank: usize,
-    #[cfg(target_family = "wasm")]
-    selection_bank: usize,
 }
 
 #[cfg(target_family = "wasm")]
@@ -1086,36 +1078,30 @@ impl BatchDecodeGraphs {
     }
 
     fn write_selection(
-        &self,
+        &mut self,
         logits: &Tensor<f32>,
         lanes: &[Option<forja_sdk::BatchSelectLane>],
-    ) -> Result<Vec<Option<u32>>> {
-        let values = logits.to_vec()?;
-        let expected = usize::try_from(u64::from(self.bucket) * u64::from(VOCAB))
-            .map_err(|_| forja_sdk::Error::loading("batch logits exceed address space"))?;
-        if values.len() != expected {
+    ) -> Result<()> {
+        if logits.shape() != [self.bucket, VOCAB] {
             return Err(forja_sdk::Error::loading(
-                "batch logits have the wrong size",
+                "batch logits have the wrong shape",
             ));
         }
         let mut sampling = Vec::with_capacity(lanes.len() * 5);
         let mut masks = Vec::new();
-        let mut starts = Vec::with_capacity(lanes.len());
         for lane in lanes {
             let Some(lane) = lane.as_ref() else {
                 sampling.extend(sampling_words(forja_sdk::SamplingParams::default())?);
                 masks.extend(allow_mask(&[0])?);
-                starts.push(None);
                 continue;
             };
             sampling.extend(sampling_words(lane.sampling)?);
             masks.extend(allow_mask(&lane.allow)?);
-            starts.push(Some(lane.start_pos));
         }
-        self.logits.write(&values)?;
+        logits.copy_into(&mut self.logits)?;
         self.sampling.write(&sampling)?;
         self.allow.write(&masks)?;
-        Ok(starts)
+        Ok(())
     }
 }
 
@@ -1142,6 +1128,12 @@ impl Qwen3Coder {
                     .collect::<Result<Vec<_>>>()?,
             )
         };
+        #[cfg(target_family = "wasm")]
+        let decode = {
+            let mut decode = DecodeState::new(MAX_CONTEXT, VOCAB)?;
+            decode.select(forja_sdk::SamplingParams::default())?;
+            decode
+        };
         Ok(Self {
             weights,
             variants,
@@ -1159,17 +1151,12 @@ impl Qwen3Coder {
             #[cfg(target_family = "wasm")]
             replay: config.replay,
             #[cfg(target_family = "wasm")]
-            decode: DecodeState::new(MAX_CONTEXT, VOCAB)?,
+            decode,
             #[cfg(target_family = "wasm")]
-            short_prefill: Some(
-                ChunkedPrefill::new(MAX_CONTEXT, SHORT_PREFILL_CHUNK)?
-                    .with_tail_capacity(SHORT_PREFILL_TAIL_CAPACITY)?,
-            ),
-            #[cfg(target_family = "wasm")]
-            long_prefill: Some(
+            prefill: Some(
                 ChunkedPrefill::new(MAX_CONTEXT, PREFILL_CHUNK)?
                     .with_tail_chunk(PREFILL_TAIL_CHUNK)?
-                    .with_tail_capacity(LONG_PREFILL_TAIL_CAPACITY)?,
+                    .with_tail_capacity(PREFILL_TAIL_CAPACITY)?,
             ),
             #[cfg(target_family = "wasm")]
             batch_feedback: Tensor::zeros(&[ACTIVE_LANES])?,
@@ -1187,8 +1174,6 @@ impl Qwen3Coder {
             },
             #[cfg(target_family = "wasm")]
             batch_bank: 0,
-            #[cfg(target_family = "wasm")]
-            selection_bank: 0,
         })
     }
 
@@ -1410,8 +1395,7 @@ impl Engine for Qwen3Coder {
             .ok_or_else(|| forja_sdk::Error::loading("tokens exceed the 32768-token context"))?;
         #[cfg(target_family = "wasm")]
         if self.replay && sequence == 1 && !input.taps {
-            let logits =
-                self.replay_decode(Some(&input.tokens), input.start_pos, DecodeSelection::None)?;
+            let logits = self.replay_decode(Some(&input.tokens), input.start_pos)?;
             return Ok(StepOutput {
                 logits,
                 taps: Vec::new(),
@@ -1448,7 +1432,7 @@ impl Engine for Qwen3Coder {
 
     #[cfg(target_family = "wasm")]
     fn decode(&mut self, input: forja_sdk::DecodeInput) -> Result<forja_sdk::DecodeOutput> {
-        let selection = self.decode.select(input.sampling)?;
+        self.decode.select(input.sampling)?;
         match input.tokens {
             Some(tokens) => {
                 let [sequence] = tokens
@@ -1473,7 +1457,7 @@ impl Engine for Qwen3Coder {
                     };
                     self.select_token(logits, end - 1)
                 } else if self.replay && sequence == 1 {
-                    self.decode_selected(Some(&tokens), input.start_pos, selection)
+                    self.decode_selected(Some(&tokens), input.start_pos)
                 } else {
                     let start = input.start_pos.into();
                     let end_dim = end.into();
@@ -1490,7 +1474,7 @@ impl Engine for Qwen3Coder {
                 }
             }
             None if input.start_pos < MAX_CONTEXT && self.replay => {
-                self.decode_selected(None, input.start_pos, selection)
+                self.decode_selected(None, input.start_pos)
             }
             None if input.start_pos < MAX_CONTEXT => {
                 let token = self.decode.token()?;
@@ -1525,11 +1509,7 @@ impl Engine for Qwen3Coder {
             ));
         }
         if self.replay {
-            return self.replay_decode(
-                input.tokens.as_ref(),
-                input.start_pos,
-                DecodeSelection::None,
-            );
+            return self.replay_decode(input.tokens.as_ref(), input.start_pos);
         }
         let token = match input.tokens {
             Some(tokens) => tokens,
@@ -1630,7 +1610,6 @@ impl Engine for Qwen3Coder {
     #[cfg(target_family = "wasm")]
     fn batch_forward(&mut self, input: BatchInput<'_>) -> Result<Tensor<f32>> {
         let bank = self.next_batch_bank();
-        self.selection_bank = bank;
         let starts = batch_starts(&input.lanes);
         if use_batch_decode_graph(self.replay, input.shape.bucket) {
             return self.replay_batch_forward(&input, bank);
@@ -1643,7 +1622,7 @@ impl Engine for Qwen3Coder {
     #[cfg(target_family = "wasm")]
     fn batch_select(&mut self, input: BatchSelectInput<'_>) -> Result<BatchOutput> {
         if use_batch_decode_graph(self.replay, input.shape.bucket) {
-            return self.replay_batch_select(&input, self.selection_bank);
+            return self.replay_batch_select(&input, 0);
         }
         let tokens = self.select_masked_batch_rows(input.logits, &input.lanes)?;
         Ok(BatchOutput {
@@ -1869,7 +1848,11 @@ impl Qwen3Coder {
     ) -> Result<BatchOutput> {
         let index = self.batch_graph_index(input.shape.bucket, bank)?;
         let mut state = self.batch_graphs.remove(index);
-        let starts = state.write_selection(input.logits, &input.lanes)?;
+        let starts = input
+            .lanes
+            .iter()
+            .map(|lane| lane.as_ref().map(|lane| lane.start_pos))
+            .collect::<Vec<_>>();
         let result = (|| {
             if state.masked.is_none() {
                 let params = starts
@@ -1897,6 +1880,7 @@ impl Qwen3Coder {
                 })?;
                 state.masked = Some(graph);
             }
+            state.write_selection(input.logits, &input.lanes)?;
             let graph = state
                 .masked
                 .as_ref()
@@ -2228,48 +2212,35 @@ impl Qwen3Coder {
         result
     }
 
-    fn prefill_for(&self, sequence: u32) -> Option<&ChunkedPrefill<f32>> {
-        if sequence < PREFILL_CHUNK {
-            self.short_prefill.as_ref()
-        } else {
-            self.long_prefill.as_ref()
-        }
+    fn prefill_for(&self, _sequence: u32) -> Option<&ChunkedPrefill<f32>> {
+        self.prefill.as_ref()
     }
 
-    fn prefill_for_mut(&mut self, sequence: u32) -> &mut Option<ChunkedPrefill<f32>> {
-        if sequence < PREFILL_CHUNK {
-            &mut self.short_prefill
-        } else {
-            &mut self.long_prefill
-        }
+    fn prefill_for_mut(&mut self, _sequence: u32) -> &mut Option<ChunkedPrefill<f32>> {
+        &mut self.prefill
     }
 
     fn replay_decode(
         &mut self,
         tokens: Option<&Tensor<u32>>,
         start_pos: u32,
-        selection: DecodeSelection,
     ) -> Result<Tensor<f32>> {
         if let Some(tokens) = tokens {
             self.decode.write_token(tokens)?;
         }
-        if self.decode.graph(selection).is_none() {
-            let graph = self.capture_decode(start_pos, selection)?;
-            self.decode.set_graph(selection, graph);
+        if self.decode.graph(DecodeSelection::None).is_none() {
+            let graph = self.capture_decode(start_pos)?;
+            self.decode.set_graph(DecodeSelection::None, graph);
         }
         let graph = self
             .decode
-            .graph(selection)
+            .graph(DecodeSelection::None)
             .ok_or_else(|| forja_sdk::Error::loading("decode graph was not captured"))?;
         graph.replay(&[start_pos])?;
         graph.result().alias()
     }
 
-    fn capture_decode(
-        &mut self,
-        start_pos: u32,
-        selection: DecodeSelection,
-    ) -> Result<forja_sdk::Graph<Tensor<f32>>> {
+    fn capture_decode(&mut self, start_pos: u32) -> Result<forja_sdk::Graph<Tensor<f32>>> {
         let position = forja_sdk::Param::new(0..=MAX_CONTEXT - 1)?;
         let start = position.at(start_pos);
         let end = (start.clone() + 1)?;
@@ -2286,19 +2257,13 @@ impl Qwen3Coder {
             let logits = self
                 .forward(&token, 1, &start_dim, &end, false, &attention)?
                 .logits;
-            let selected = match selection {
-                DecodeSelection::None => None,
-                DecodeSelection::Greedy => Some(logits.reshape(&[1, VOCAB])?.argmax()?),
-                DecodeSelection::Sampled => Some(logits.reshape(&[1, VOCAB])?.sample_with(
-                    &sampling,
-                    start.clone(),
-                    &sample_variant,
-                )?),
-            };
-            if let Some(selected) = selected {
-                selected.copy_into(&mut feedback)?;
-                selected.copy_into(&mut output_tokens.narrow(0, start, 1)?)?;
-            }
+            let selected = logits.reshape(&[1, VOCAB])?.sample_with(
+                &sampling,
+                start.clone(),
+                &sample_variant,
+            )?;
+            selected.copy_into(&mut feedback)?;
+            selected.copy_into(&mut output_tokens.narrow(0, start, 1)?)?;
             Ok(logits)
         })
     }
@@ -2330,9 +2295,8 @@ impl Qwen3Coder {
         &mut self,
         tokens: Option<&Tensor<u32>>,
         start_pos: u32,
-        selection: DecodeSelection,
     ) -> Result<forja_sdk::DecodeOutput> {
-        let logits = self.replay_decode(tokens, start_pos, selection)?;
+        let logits = self.replay_decode(tokens, start_pos)?;
         let next_pos = start_pos
             .checked_add(1)
             .ok_or_else(|| forja_sdk::Error::loading("decode position overflowed"))?;
