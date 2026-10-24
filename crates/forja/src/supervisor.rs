@@ -325,13 +325,39 @@ mod tests {
             sets: Vec::new(),
         };
         let (_, runtime) = forja_serve::serving_router(FakeService);
+        let readiness = runtime.clone();
         let factory = FakeFactory(VecDeque::from([Err("candidate failed".to_owned()), Ok(4)]));
         let mut supervisor =
             Supervisor::new(sources, HostConfig::default(), 4, 8, factory, runtime).unwrap();
         let error = supervisor.reload().await.unwrap_err();
         assert!(error.contains("active generation was restored"));
         assert_eq!(supervisor.generation, 0);
+        assert!(readiness.is_ready());
         supervisor.shutdown().await.unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_rollback_leaves_the_listener_unready() {
+        let root = temporary_directory("supervisor-double-failure").unwrap();
+        let path = root.join("host.toml");
+        fs::write(&path, "[model]\nengine='candidate'\n").unwrap();
+        let sources = HostConfigSources {
+            files: vec![path],
+            sets: Vec::new(),
+        };
+        let (_, runtime) = forja_serve::serving_router(FakeService);
+        let readiness = runtime.clone();
+        let factory = FakeFactory(VecDeque::from([
+            Err("candidate failed".to_owned()),
+            Err("rollback failed".to_owned()),
+        ]));
+        let mut supervisor =
+            Supervisor::new(sources, HostConfig::default(), 4, 8, factory, runtime).unwrap();
+        let error = supervisor.reload().await.unwrap_err();
+        assert!(error.contains("candidate load failed: candidate failed"));
+        assert!(error.contains("rollback failed: rollback failed"));
+        assert!(!readiness.is_ready());
         fs::remove_dir_all(root).unwrap();
     }
 }

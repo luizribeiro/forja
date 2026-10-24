@@ -688,6 +688,12 @@ impl<S> Clone for DrainHandle<S> {
 }
 
 impl<S> DrainHandle<S> {
+    /// Reports whether a runtime generation currently accepts requests.
+    #[must_use]
+    pub fn is_ready(&self) -> bool {
+        self.state.ready.load(Ordering::Acquire)
+    }
+
     /// Permanently closes admission without cancelling active requests.
     pub fn close_admission(&self) {
         self.state.closed.store(true, Ordering::Release);
