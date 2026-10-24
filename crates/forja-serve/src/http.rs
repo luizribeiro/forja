@@ -21,7 +21,7 @@ use axum::{
     },
     routing::{get, post},
 };
-use forja_config::HostConfig;
+use forja_config::{Choice, HostConfig};
 use forja_core::Backend;
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
@@ -45,6 +45,11 @@ pub trait ChatService: Send + 'static {
 
     /// Maximum number of requests waiting behind the active sequence.
     fn queue_length(&self) -> u32;
+
+    /// Engine-declared upper bound on simultaneously active sequences.
+    fn declared_active_sequences(&self) -> u32 {
+        1
+    }
 
     /// End-to-end request deadline.
     fn request_deadline(&self) -> Duration;
@@ -145,6 +150,10 @@ where
 
     fn queue_length(&self) -> u32 {
         self.queue_length()
+    }
+
+    fn declared_active_sequences(&self) -> u32 {
+        self.declared_active_sequences()
     }
 
     fn request_deadline(&self) -> Duration {
@@ -581,6 +590,7 @@ struct PublishedGeneration<S> {
     id: u64,
     model: String,
     max_body_bytes: usize,
+    declared_active_sequences: u32,
     deadline: Duration,
     write_stall_timeout: Duration,
     service: ServiceActor<S>,
@@ -591,14 +601,16 @@ impl<S: ChatService> PublishedGeneration<S> {
     fn new(id: u64, service: S) -> Self {
         let model = service.model().to_owned();
         let max_body_bytes = service.max_body_bytes();
+        let declared_active_sequences = service.declared_active_sequences();
         let deadline = service.request_deadline();
         let write_stall_timeout = service.write_stall_timeout();
         let config = Arc::new(service.host_config());
-        let queue_capacity = usize::try_from(service.queue_length()).unwrap_or(usize::MAX);
+        let queue_capacity = tokio::sync::Semaphore::MAX_PERMITS;
         Self {
             id,
             model,
             max_body_bytes,
+            declared_active_sequences,
             deadline,
             write_stall_timeout,
             service: ServiceActor::spawn(service, queue_capacity),
@@ -611,6 +623,7 @@ impl<S: ChatService> PublishedGeneration<S> {
             id: self.id,
             model: self.model.clone(),
             max_body_bytes: self.max_body_bytes,
+            admission_capacity: admission_capacity(self.declared_active_sequences, &self.config),
             deadline: self.deadline,
             write_stall_timeout: self.write_stall_timeout,
             service: self.service.clone(),
@@ -626,10 +639,23 @@ struct GenerationSnapshot<S> {
     id: u64,
     model: String,
     max_body_bytes: usize,
+    admission_capacity: usize,
     deadline: Duration,
     write_stall_timeout: Duration,
     service: ServiceActor<S>,
     policy: AdmissionPolicy,
+}
+
+fn admission_capacity(declared_active: u32, config: &HostConfig) -> usize {
+    let active = match config.serving.max_active_sequences {
+        Choice::Auto => declared_active,
+        Choice::Fixed(value) => value.get().min(declared_active),
+    };
+    let batch = match config.serving.max_batch_size {
+        Choice::Auto => active,
+        Choice::Fixed(value) => value.get().min(active),
+    };
+    usize::try_from(u64::from(batch) + u64::from(config.server.queue_length)).unwrap_or(usize::MAX)
 }
 
 impl<S: ChatService> HttpState<S> {
@@ -938,7 +964,13 @@ async fn chat<S: ChatService>(
     }
     let model = request.model.clone();
     let control = GenerationControl::new(runtime.write_stall_timeout);
-    let active = match activate(&state, runtime.id, request_id, &control) {
+    let active = match activate(
+        &state,
+        runtime.admission_capacity,
+        runtime.id,
+        request_id,
+        &control,
+    ) {
         Ok(active) => active,
         Err(response) => return *response,
     };
@@ -1019,7 +1051,13 @@ async fn text<S: ChatService>(
     }
     let model = request.model.clone();
     let control = GenerationControl::new(runtime.write_stall_timeout);
-    let active = match activate(&state, runtime.id, request_id, &control) {
+    let active = match activate(
+        &state,
+        runtime.admission_capacity,
+        runtime.id,
+        request_id,
+        &control,
+    ) {
         Ok(active) => active,
         Err(response) => return *response,
     };
@@ -1093,7 +1131,13 @@ async fn stream_chat_response<S: ChatService>(
         );
     }
     let control = GenerationControl::new(runtime.write_stall_timeout);
-    let active = match activate(&state, runtime.id, request_id, &control) {
+    let active = match activate(
+        &state,
+        runtime.admission_capacity,
+        runtime.id,
+        request_id,
+        &control,
+    ) {
         Ok(active) => active,
         Err(response) => return *response,
     };
@@ -1132,7 +1176,13 @@ fn stream_text_response<S: ChatService>(
     let id = format!("cmpl-{created}");
     let (sender, receiver) = mpsc::channel(16);
     let control = GenerationControl::new(runtime.write_stall_timeout);
-    let active = match activate(state, runtime.id, request_id, &control) {
+    let active = match activate(
+        state,
+        runtime.admission_capacity,
+        runtime.id,
+        request_id,
+        &control,
+    ) {
         Ok(active) => active,
         Err(response) => return *response,
     };
@@ -1368,6 +1418,7 @@ fn log_completion(
 
 fn activate<S>(
     state: &Arc<HttpState<S>>,
+    admission_capacity: usize,
     generation: u64,
     request_id: u64,
     control: &GenerationControl,
@@ -1382,6 +1433,12 @@ fn activate<S>(
         return Err(Box::new(api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "model is unavailable",
+        )));
+    }
+    if active.len() >= admission_capacity {
+        return Err(Box::new(api_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "request queue is full",
         )));
     }
     active.insert(
@@ -1953,7 +2010,7 @@ mod tests {
     async fn drain_stops_admission_and_waits_for_finalization() {
         let state = state();
         let control = GenerationControl::new(Duration::from_secs(1));
-        let active = activate(&state, 0, 1, &control).unwrap();
+        let active = activate(&state, usize::MAX, 0, 1, &control).unwrap();
         assert_eq!(state.active.lock().unwrap()[&1].generation, 0);
         let handle = DrainHandle {
             state: Arc::clone(&state),
@@ -1968,7 +2025,10 @@ mod tests {
         drop(active);
         drain.await;
         assert_eq!(
-            activate(&state, 0, 2, &control).err().unwrap().status(),
+            activate(&state, usize::MAX, 0, 2, &control)
+                .err()
+                .unwrap()
+                .status(),
             StatusCode::SERVICE_UNAVAILABLE
         );
     }
@@ -2001,12 +2061,14 @@ mod tests {
         };
         let mut config = HostConfig::default();
         config.server.request_deadline = forja_config::Duration::from_secs(9);
+        config.server.queue_length = 0;
         handle.update_policy(8, config.clone()).await.unwrap();
         assert_eq!(state.generation.read().unwrap().as_ref().unwrap().id, 8);
         assert_eq!(
             state.generation.read().unwrap().as_ref().unwrap().deadline,
             Duration::from_secs(9)
         );
+        assert_eq!(state.snapshot().unwrap().admission_capacity, 1);
 
         config.server.queue_length = 99;
         assert!(handle.update_policy(9, config).await.is_err());
@@ -2021,8 +2083,8 @@ mod tests {
         };
         let old = GenerationControl::new(Duration::from_secs(1));
         let next = GenerationControl::new(Duration::from_secs(1));
-        let old_guard = activate(&state, 0, 1, &old).unwrap();
-        let next_guard = activate(&state, 1, 2, &next).unwrap();
+        let old_guard = activate(&state, usize::MAX, 0, 1, &old).unwrap();
+        let next_guard = activate(&state, usize::MAX, 1, 2, &next).unwrap();
         let drain = tokio::spawn(async move {
             handle.drain_generation(0, Duration::ZERO).await;
         });

@@ -904,6 +904,13 @@ where
         self.config.server.queue_length
     }
 
+    pub(crate) fn declared_active_sequences(&self) -> u32 {
+        self.info
+            .serving
+            .as_ref()
+            .map_or(1, |serving| serving.active_lanes)
+    }
+
     pub(crate) const fn request_deadline(&self) -> Duration {
         self.config.server.request_deadline.get()
     }
