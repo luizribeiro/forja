@@ -1,4 +1,6 @@
 [workspace]
+# A bare `cargo run` should start the CLI; guest-side crates need build inputs only `forja build` provides.
+default-members = ["crates/forja"]
 exclude = ["engines/olmoe", "engines/qwen3", "engines/qwen3-coder"]
 members = [
   "chat-formats/*",
