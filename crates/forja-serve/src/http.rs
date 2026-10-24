@@ -677,10 +677,15 @@ impl<S> Clone for DrainHandle<S> {
 }
 
 impl<S> DrainHandle<S> {
-    /// Drains all admitted serving work.
-    pub async fn drain(&self) {
+    /// Permanently closes admission without cancelling active requests.
+    pub fn close_admission(&self) {
         self.state.closed.store(true, Ordering::Release);
         self.state.ready.store(false, Ordering::Release);
+    }
+
+    /// Drains all admitted serving work.
+    pub async fn drain(&self) {
+        self.close_admission();
         if let Ok(active) = self.state.active.lock() {
             for request in active.values() {
                 request.control.cancel();

@@ -9,10 +9,12 @@ use tokenizers::Tokenizer;
 use crate::{
     args::{Backend as BackendArg, Serve},
     engine::{engine_load_config, limits, validate_engine, weights_path},
+    supervisor::Supervisor,
 };
 
 pub(crate) struct Loaded<S> {
     pub(crate) service: S,
+    pub(crate) retained_bytes: u64,
 }
 
 pub(crate) type LoadFuture<'a, S> = Pin<Box<dyn Future<Output = Result<Loaded<S>, String>> + 'a>>;
@@ -189,6 +191,10 @@ where
         .await
         .map_err(|error| error.to_string())?
         .map_err(|error| format!("engine load failed: {error:?}"))?;
+    let retained_bytes = runner
+        .memory_usage()
+        .accounted_bytes()
+        .ok_or_else(|| "retained runtime charge overflowed".to_owned())?;
     let engine = forja_serve::ServingEngine::new(
         profile.model().id.clone(),
         runner,
@@ -203,7 +209,10 @@ where
         identity,
     )
     .map_err(|error| error.to_string())?;
-    Ok(Loaded { service: engine })
+    Ok(Loaded {
+        service: engine,
+        retained_bytes,
+    })
 }
 
 async fn run_factory<F>(mut factory: F, options: &Serve) -> Result<(), Box<dyn Error>>
@@ -211,10 +220,17 @@ where
     F: RuntimeFactory + 'static,
 {
     let config = options.config.clone();
-    factory.plan(&config)?;
+    let plan = factory.plan(&config)?;
     let loaded = factory.load(&config).await?;
+    let retained_bytes = loaded.retained_bytes;
     let listener = tokio::net::TcpListener::bind(config.server.listen).await?;
     let (router, drain) = forja_serve::serving_router(loaded.service);
+    let mut supervisor = Supervisor::<F>::new(
+        retained_bytes,
+        plan.retained_bytes,
+        config.server.model_drain_deadline.get(),
+        drain.clone(),
+    )?;
     let (metrics_shutdown, mut metrics_shutdown_rx) = tokio::sync::watch::channel(false);
     let metrics_task = if let Some(address) = config.metrics.listen {
         let listener = tokio::net::TcpListener::bind(address).await?;
@@ -229,14 +245,21 @@ where
     } else {
         None
     };
-    let result = axum::serve(listener, router)
-        .with_graceful_shutdown(async move {
-            if let Err(error) = crate::signals::shutdown().await {
-                tracing::error!(event = "shutdown.listen_failed", %error);
-            }
-            drain.drain().await;
-        })
-        .await;
+    let (shutdown, mut shutdown_rx) = tokio::sync::watch::channel(false);
+    let server = tokio::spawn(async move {
+        axum::serve(listener, router)
+            .with_graceful_shutdown(async move {
+                let _ = shutdown_rx.changed().await;
+            })
+            .await
+    });
+    if let Err(error) = crate::signals::shutdown().await {
+        tracing::error!(event = "shutdown.listen_failed", %error);
+    }
+    let shutdown_result = supervisor.shutdown().await;
+    let _ = shutdown.send(true);
+    let result = server.await?;
+    shutdown_result?;
     let _ = metrics_shutdown.send(true);
     if let Some(task) = metrics_task {
         task.await??;
