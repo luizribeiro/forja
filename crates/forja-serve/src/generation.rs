@@ -1,10 +1,10 @@
 //! Runtime-generation resource accounting.
 
-/// A no-allocation estimate of a generation's fully retained memory.
+/// A no-allocation plan for a generation's fully retained memory.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LoadPlan {
-    /// Bytes retained after startup completes.
-    pub retained_bytes: u64,
+    /// Exact bytes retained after startup, when proven from an equivalent load.
+    pub retained_bytes: Option<u64>,
 }
 
 /// Shared memory reservations for all resident runtime generations.

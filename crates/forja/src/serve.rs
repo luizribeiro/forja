@@ -1,4 +1,4 @@
-use std::{error::Error, fs, future::Future, path::Path, pin::Pin};
+use std::{collections::HashMap, error::Error, fs, future::Future, path::Path, pin::Pin};
 
 use forja_config::{BackendKind, Choice, Engine, Profile};
 use forja_core::Backend;
@@ -22,7 +22,9 @@ pub(crate) type LoadFuture<'a, S> = Pin<Box<dyn Future<Output = Result<Loaded<S>
 pub(crate) trait RuntimeFactory {
     type Service: forja_serve::ChatService;
 
-    fn plan(&self, config: &forja_config::HostConfig) -> Result<forja_serve::LoadPlan, String>;
+    fn quota(&self, config: &forja_config::HostConfig) -> Result<u64, String>;
+
+    fn plan(&mut self, config: &forja_config::HostConfig) -> Result<forja_serve::LoadPlan, String>;
 
     fn load<'a>(
         &'a mut self,
@@ -35,11 +37,11 @@ pub(crate) async fn run(
     logging: crate::logging::Controller,
 ) -> Result<(), Box<dyn Error>> {
     match options.config.backend.kind {
-        BackendKind::Cpu => run_factory(CpuFactory, options, logging).await,
+        BackendKind::Cpu => run_factory(CpuFactory::default(), options, logging).await,
         BackendKind::Metal => {
             #[cfg(target_os = "macos")]
             {
-                run_factory(MetalFactory, options, logging).await
+                run_factory(MetalFactory::default(), options, logging).await
             }
             #[cfg(not(target_os = "macos"))]
             Err("the Metal backend requires macOS".into())
@@ -47,60 +49,115 @@ pub(crate) async fn run(
     }
 }
 
-struct CpuFactory;
+#[derive(Default)]
+struct FactoryPlans {
+    prepared: Option<PreparedLoad>,
+    retained: HashMap<String, u64>,
+}
+
+struct PreparedLoad {
+    config: forja_config::HostConfig,
+    profile: Profile,
+    load_config: forja_host::EngineLoadConfig,
+    hashes: [String; 5],
+    key: String,
+}
+
+impl FactoryPlans {
+    fn plan(
+        &mut self,
+        config: &forja_config::HostConfig,
+        backend: BackendArg,
+    ) -> Result<forja_serve::LoadPlan, String> {
+        let prepared = prepare_load(config, backend)?;
+        let retained_bytes = self.retained.get(&prepared.key).copied();
+        self.prepared = Some(prepared);
+        Ok(forja_serve::LoadPlan { retained_bytes })
+    }
+
+    fn take(
+        &mut self,
+        config: &forja_config::HostConfig,
+        backend: BackendArg,
+    ) -> Result<PreparedLoad, String> {
+        match self.prepared.take() {
+            Some(prepared) if prepared.config == *config => Ok(prepared),
+            _ => prepare_load(config, backend),
+        }
+    }
+}
+
+#[derive(Default)]
+struct CpuFactory(FactoryPlans);
 
 impl RuntimeFactory for CpuFactory {
     type Service = forja_serve::ServingEngine<forja_cpu::CpuBackend>;
 
-    fn plan(&self, config: &forja_config::HostConfig) -> Result<forja_serve::LoadPlan, String> {
-        validate_config(config, BackendArg::Cpu)?;
-        let retained_bytes = match config.limits.live_bytes {
-            Choice::Auto => 48 * 1024 * 1024 * 1024,
+    fn quota(&self, config: &forja_config::HostConfig) -> Result<u64, String> {
+        Ok(match config.limits.live_bytes {
+            Choice::Auto => crate::engine::DEFAULT_CPU_LIVE_BYTES,
             Choice::Fixed(bytes) => bytes.get(),
-        };
-        Ok(forja_serve::LoadPlan { retained_bytes })
+        })
+    }
+
+    fn plan(&mut self, config: &forja_config::HostConfig) -> Result<forja_serve::LoadPlan, String> {
+        self.0.plan(config, BackendArg::Cpu)
     }
 
     fn load<'a>(
         &'a mut self,
         config: &'a forja_config::HostConfig,
     ) -> LoadFuture<'a, Self::Service> {
+        let prepared = self.0.take(config, BackendArg::Cpu);
+        let retained = &mut self.0.retained;
         Box::pin(async move {
+            let prepared = prepared?;
+            let key = prepared.key.clone();
             let host_limits = page_pool_limit(
                 limits(&config.limits).map_err(|error| error.to_string())?,
                 config,
             );
-            load_engine(forja_cpu::CpuBackend::new(), host_limits, config).await
+            let loaded =
+                load_engine(forja_cpu::CpuBackend::new(), host_limits, config, prepared).await?;
+            retained.insert(key, loaded.retained_bytes);
+            Ok(loaded)
         })
     }
 }
 
 #[cfg(target_os = "macos")]
-struct MetalFactory;
+#[derive(Default)]
+struct MetalFactory(FactoryPlans);
 
 #[cfg(target_os = "macos")]
 impl RuntimeFactory for MetalFactory {
     type Service = forja_serve::ServingEngine<forja_metal::MetalBackend>;
 
-    fn plan(&self, config: &forja_config::HostConfig) -> Result<forja_serve::LoadPlan, String> {
-        validate_config(config, BackendArg::Metal)?;
+    fn quota(&self, config: &forja_config::HostConfig) -> Result<u64, String> {
         let working_set = forja_metal::MetalBackend::recommended_max_working_set_size()
             .map_err(|error| error.to_string())?;
         let physical =
             forja_metal::MetalBackend::physical_memory_size().map_err(|error| error.to_string())?;
-        let retained_bytes = config
+        Ok(config
             .limits
             .resolve_live_bytes(working_set, physical)
             .map_err(|error| error.to_string())?
-            .get();
-        Ok(forja_serve::LoadPlan { retained_bytes })
+            .get())
+    }
+
+    fn plan(&mut self, config: &forja_config::HostConfig) -> Result<forja_serve::LoadPlan, String> {
+        self.0.plan(config, BackendArg::Metal)
     }
 
     fn load<'a>(
         &'a mut self,
         config: &'a forja_config::HostConfig,
     ) -> LoadFuture<'a, Self::Service> {
+        let prepared = self.0.take(config, BackendArg::Metal);
+        let retained = &mut self.0.retained;
         Box::pin(async move {
+            let prepared = prepared?;
+            let key = prepared.key.clone();
             let replay = config.backend.metal.resolve().graph_replay;
             let (backend, live_bytes) = crate::engine::metal_backend(
                 replay,
@@ -113,7 +170,9 @@ impl RuntimeFactory for MetalFactory {
                     .map_err(|error| error.to_string())?,
                 config,
             );
-            load_engine(backend, host_limits, config).await
+            let loaded = load_engine(backend, host_limits, config, prepared).await?;
+            retained.insert(key, loaded.retained_bytes);
+            Ok(loaded)
         })
     }
 }
@@ -139,6 +198,30 @@ fn validate_config(
     Ok(embedded)
 }
 
+fn prepare_load(
+    config: &forja_config::HostConfig,
+    backend: BackendArg,
+) -> Result<PreparedLoad, String> {
+    let profile = validate_config(config, backend)?;
+    let load_config = engine_load_config(&config.model.engine, &Engine::default())?;
+    let hashes = [
+        sha256_file(&config.model.engine).map_err(|error| error.to_string())?,
+        profile.sha256().map_err(|error| error.to_string())?,
+        profile.model().weights_sha256.clone(),
+        sha256_file(config.model.model.join("tokenizer.json"))
+            .map_err(|error| error.to_string())?,
+        sha256_file(&config.model.chat_format).map_err(|error| error.to_string())?,
+    ];
+    let key = hashes.join(":");
+    Ok(PreparedLoad {
+        config: config.clone(),
+        profile,
+        load_config,
+        hashes,
+        key,
+    })
+}
+
 fn page_pool_limit(
     limits: forja_host::Limits,
     config: &forja_config::HostConfig,
@@ -153,18 +236,17 @@ async fn load_engine<B>(
     backend: B,
     host_limits: forja_host::Limits,
     config: &forja_config::HostConfig,
+    prepared: PreparedLoad,
 ) -> Result<Loaded<forja_serve::ServingEngine<B>>, String>
 where
     B: Backend + Send + Sync + 'static,
 {
-    let profile = validate_config(
-        config,
-        match config.backend.kind {
-            BackendKind::Metal => BackendArg::Metal,
-            BackendKind::Cpu => BackendArg::Cpu,
-        },
-    )?;
-    let load_config = engine_load_config(&config.model.engine, &Engine::default())?;
+    let PreparedLoad {
+        profile,
+        load_config,
+        hashes,
+        ..
+    } = prepared;
     let tokenizer = Tokenizer::from_file(config.model.model.join("tokenizer.json"))
         .map_err(|error| format!("cannot load tokenizer: {error}"))?;
     let chat_format = forja_serve::ChatFormat::load(
@@ -172,15 +254,8 @@ where
         forja_serve::ChatFormatLimits::default(),
     )
     .map_err(|error| error.to_string())?;
-    let identity = forja_serve::PrefixIdentity::new([
-        &sha256_file(&config.model.engine).map_err(|error| error.to_string())?,
-        &profile.sha256().map_err(|error| error.to_string())?,
-        &profile.model().weights_sha256,
-        &sha256_file(config.model.model.join("tokenizer.json"))
-            .map_err(|error| error.to_string())?,
-        &sha256_file(&config.model.chat_format).map_err(|error| error.to_string())?,
-    ])
-    .map_err(str::to_owned)?;
+    let identity = forja_serve::PrefixIdentity::new(hashes.each_ref().map(String::as_str))
+        .map_err(str::to_owned)?;
     let mut runner = EngineRunner::new(
         &config.model.engine,
         backend,
@@ -228,7 +303,8 @@ where
     F: RuntimeFactory + 'static,
 {
     let config = options.config.clone();
-    let plan = factory.plan(&config)?;
+    let quota = factory.quota(&config)?;
+    let _plan = factory.plan(&config)?;
     let loaded = factory.load(&config).await?;
     let retained_bytes = loaded.retained_bytes;
     let listener = tokio::net::TcpListener::bind(config.server.listen).await?;
@@ -237,7 +313,7 @@ where
         options.sources.clone(),
         config.clone(),
         retained_bytes,
-        plan.retained_bytes,
+        quota,
         factory,
         Box::new(logging),
         drain.clone(),

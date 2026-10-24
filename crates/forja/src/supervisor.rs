@@ -45,7 +45,7 @@ pub(crate) struct Supervisor<F: RuntimeFactory> {
     sources: HostConfigSources,
     active: Arc<HostConfig>,
     generation: u64,
-    retained_bytes: u64,
+    retained_bytes: Option<u64>,
     ledger: ProcessLedger,
     factory: F,
     logging: Box<dyn crate::logging::Reload>,
@@ -68,7 +68,7 @@ impl<F: RuntimeFactory> Supervisor<F> {
             sources,
             active: Arc::new(config),
             generation: 0,
-            retained_bytes,
+            retained_bytes: Some(retained_bytes),
             ledger,
             factory,
             logging,
@@ -163,14 +163,16 @@ impl<F: RuntimeFactory> Supervisor<F> {
             shutdown = true
         );
         self.runtime.unload().await?;
-        self.ledger.release(self.retained_bytes)
+        if let Some(retained_bytes) = self.retained_bytes.take() {
+            self.ledger.release(retained_bytes)?;
+        }
+        Ok(())
     }
 
     async fn replace(&mut self, candidate: Candidate) -> Result<(), String> {
-        let preloaded = if self.ledger.fits(candidate.plan.retained_bytes) {
-            self.preload(&candidate).await
-        } else {
-            None
+        let preloaded = match candidate.plan.retained_bytes {
+            Some(bytes) if self.ledger.fits(bytes) => self.preload(&candidate).await,
+            _ => None,
         };
         self.runtime.set_ready(false);
         tracing::info!(
@@ -190,7 +192,9 @@ impl<F: RuntimeFactory> Supervisor<F> {
             replacement_generation = candidate.generation
         );
         self.runtime.unload().await?;
-        self.ledger.release(self.retained_bytes)?;
+        if let Some(retained_bytes) = self.retained_bytes.take() {
+            self.ledger.release(retained_bytes)?;
+        }
         let loaded = match preloaded {
             Some(loaded) => loaded,
             None => match self.factory.load(&candidate.config).await {
@@ -203,7 +207,7 @@ impl<F: RuntimeFactory> Supervisor<F> {
         };
         self.runtime.publish(candidate.generation, loaded.service)?;
         self.runtime.set_ready(true);
-        self.retained_bytes = loaded.retained_bytes;
+        self.retained_bytes = Some(loaded.retained_bytes);
         self.active = candidate.config;
         self.generation = candidate.generation;
         tracing::info!(
@@ -215,6 +219,9 @@ impl<F: RuntimeFactory> Supervisor<F> {
 
     async fn preload(&mut self, candidate: &Candidate) -> Option<Loaded<F::Service>> {
         let loaded = self.factory.load(&candidate.config).await.ok()?;
+        if candidate.plan.retained_bytes != Some(loaded.retained_bytes) {
+            return None;
+        }
         self.ledger.reserve(loaded.retained_bytes).ok()?;
         Some(loaded)
     }
@@ -225,7 +232,7 @@ impl<F: RuntimeFactory> Supervisor<F> {
                 self.ledger.reserve(loaded.retained_bytes)?;
                 self.runtime.publish(self.generation, loaded.service)?;
                 self.runtime.set_ready(true);
-                self.retained_bytes = loaded.retained_bytes;
+                self.retained_bytes = Some(loaded.retained_bytes);
                 Err(format!(
                     "candidate load failed and the active generation was restored: {load_error}"
                 ))
@@ -239,7 +246,14 @@ impl<F: RuntimeFactory> Supervisor<F> {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::VecDeque, fs, future::Future, pin::Pin, time::Duration};
+    use std::{
+        collections::VecDeque,
+        fs,
+        future::Future,
+        pin::Pin,
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
 
     use forja_serve::{
         ChatCompletionRequest, ChatService, Completion, CompletionRequest, GenerationControl,
@@ -303,6 +317,12 @@ mod tests {
 
     struct FakeFactory(VecDeque<Result<u64, String>>);
 
+    struct ObservedFactory {
+        planned_bytes: Option<u64>,
+        runtime: forja_serve::DrainHandle<FakeService>,
+        readiness: Arc<Mutex<Vec<bool>>>,
+    }
+
     struct FakeLogging(bool);
 
     impl crate::logging::Reload for FakeLogging {
@@ -318,8 +338,14 @@ mod tests {
     impl RuntimeFactory for FakeFactory {
         type Service = FakeService;
 
-        fn plan(&self, _: &HostConfig) -> Result<LoadPlan, String> {
-            Ok(LoadPlan { retained_bytes: 8 })
+        fn quota(&self, _: &HostConfig) -> Result<u64, String> {
+            Ok(8)
+        }
+
+        fn plan(&mut self, _: &HostConfig) -> Result<LoadPlan, String> {
+            Ok(LoadPlan {
+                retained_bytes: Some(8),
+            })
         }
 
         fn load<'a>(&'a mut self, _: &'a HostConfig) -> crate::serve::LoadFuture<'a, FakeService> {
@@ -328,6 +354,30 @@ mod tests {
                 outcome.map(|retained_bytes| Loaded {
                     service: FakeService,
                     retained_bytes,
+                })
+            })
+        }
+    }
+
+    impl RuntimeFactory for ObservedFactory {
+        type Service = FakeService;
+
+        fn quota(&self, _: &HostConfig) -> Result<u64, String> {
+            Ok(8)
+        }
+
+        fn plan(&mut self, _: &HostConfig) -> Result<LoadPlan, String> {
+            Ok(LoadPlan {
+                retained_bytes: self.planned_bytes,
+            })
+        }
+
+        fn load<'a>(&'a mut self, _: &'a HostConfig) -> crate::serve::LoadFuture<'a, FakeService> {
+            self.readiness.lock().unwrap().push(self.runtime.is_ready());
+            Box::pin(async {
+                Ok(Loaded {
+                    service: FakeService,
+                    retained_bytes: 4,
                 })
             })
         }
@@ -343,10 +393,14 @@ mod tests {
             sets: Vec::new(),
         };
         let active = HostConfig::default();
-        let plan = |_: &HostConfig| Ok(LoadPlan { retained_bytes: 7 });
+        let plan = |_: &HostConfig| {
+            Ok(LoadPlan {
+                retained_bytes: Some(7),
+            })
+        };
         let candidate = Candidate::from_sources(1, &active, &sources, plan).unwrap();
         assert_eq!(candidate.diff.live, ["server.queue_length"]);
-        assert_eq!(candidate.plan.retained_bytes, 7);
+        assert_eq!(candidate.plan.retained_bytes, Some(7));
         fs::write(path, "[server]\nlisten='127.0.0.1:9000'\n").unwrap();
         assert!(
             Candidate::from_sources(2, &active, &sources, plan)
@@ -387,7 +441,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_rollback_leaves_the_listener_unready() {
+    async fn double_load_failure_still_allows_shutdown_drain() {
         let root = temporary_directory("supervisor-double-failure").unwrap();
         let path = root.join("host.toml");
         fs::write(&path, "[model]\nengine='candidate'\n").unwrap();
@@ -415,6 +469,41 @@ mod tests {
         assert!(error.contains("candidate load failed: candidate failed"));
         assert!(error.contains("rollback failed: rollback failed"));
         assert!(!readiness.is_ready());
+        supervisor.shutdown().await.unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn exact_preload_charge_preserves_readiness_and_fallback_drains_first() {
+        let root = temporary_directory("supervisor-load-paths").unwrap();
+        let path = root.join("host.toml");
+        fs::write(&path, "[model]\nengine='candidate'\n").unwrap();
+        let readiness = Arc::new(Mutex::new(Vec::new()));
+        for planned_bytes in [Some(4), None, Some(8)] {
+            let sources = HostConfigSources {
+                files: vec![path.clone()],
+                sets: Vec::new(),
+            };
+            let (_, runtime) = forja_serve::serving_router(FakeService);
+            let factory = ObservedFactory {
+                planned_bytes,
+                runtime: runtime.clone(),
+                readiness: Arc::clone(&readiness),
+            };
+            let mut supervisor = Supervisor::new(
+                sources,
+                HostConfig::default(),
+                4,
+                8,
+                factory,
+                Box::new(FakeLogging(false)),
+                runtime,
+            )
+            .unwrap();
+            supervisor.reload().await.unwrap();
+            supervisor.shutdown().await.unwrap();
+        }
+        assert_eq!(*readiness.lock().unwrap(), [true, false, false]);
         fs::remove_dir_all(root).unwrap();
     }
 

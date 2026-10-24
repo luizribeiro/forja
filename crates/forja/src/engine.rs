@@ -267,7 +267,7 @@ fn profile_load_config(
 struct HostLimits(forja_host::Limits);
 
 /// Preserves the pre-auto CPU quota where no device working-set recommendation exists.
-const DEFAULT_CPU_LIVE_BYTES: u64 = 48 * 1024 * 1024 * 1024;
+pub(crate) const DEFAULT_CPU_LIVE_BYTES: u64 = 48 * 1024 * 1024 * 1024;
 
 impl TryFrom<(&ConfigLimits, u64)> for HostLimits {
     type Error = TryFromIntError;
