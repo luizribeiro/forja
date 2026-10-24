@@ -52,6 +52,9 @@ async fn metal_batch_tokens_match_single_lanes_exactly() -> Result<(), Box<dyn E
     ];
     for sampling in sampling_modes {
         for bucket in [2, 4, 8] {
+            for lane in 0..8 {
+                runner.prepare_paged_lane(lane, None, 0)?;
+            }
             let prefixes = (0..bucket)
                 .map(|lane| 1 + (lane * 3) % 15)
                 .collect::<Vec<_>>();
@@ -80,6 +83,9 @@ async fn metal_batch_tokens_match_single_lanes_exactly() -> Result<(), Box<dyn E
             let batched = batch_decode(&mut runner, bucket, &lanes, sampling).await?;
             assert_eq!(batched, singles);
         }
+    }
+    for lane in 0..8 {
+        runner.prepare_paged_lane(lane, None, 0)?;
     }
     let active = [(0_usize, 7_u32, 31_u32), (3, 10, 37), (7, 13, 41)];
     let mut singles = Vec::new();
@@ -160,6 +166,9 @@ async fn assert_lane_mask_changes_replay() -> Result<(), Box<dyn Error>> {
     }
     let prepared_before = batched.metrics().prepared_graphs;
     for ((pattern, retained), expected) in patterns.into_iter().zip(prefixes).zip(expected) {
+        for lane in 0..8 {
+            batched.prepare_paged_lane(lane, None, 0)?;
+        }
         let mut lanes = vec![None; 8];
         for ((lane, position, token), prefix) in pattern.into_iter().zip(retained) {
             batched.prepare_paged_lane(u32::try_from(lane)?, Some(prefix), 64)?;
@@ -949,6 +958,7 @@ async fn batch_prefix(
     runner: &mut EngineRunner<forja_metal::MetalBackend>,
     length: u32,
 ) -> Result<PagedPrefix, Box<dyn Error>> {
+    runner.prepare_paged_lane(0, None, 0)?;
     runner.prepare_paged_lane(0, None, 64)?;
     let tokens = (0..length).map(|position| 100 + position).collect();
     let output = runner
@@ -968,9 +978,11 @@ async fn batch_prefix(
         })
         .await??;
     runner.read(&output.tokens).await?;
-    runner
+    let prefix = runner
         .paged_prefix()?
-        .ok_or_else(|| "paged prefix is unavailable".into())
+        .ok_or_else(|| Box::<dyn Error>::from("paged prefix is unavailable"))?;
+    runner.prepare_paged_lane(0, None, 0)?;
+    Ok(prefix)
 }
 
 #[cfg(target_os = "macos")]

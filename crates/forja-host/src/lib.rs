@@ -4313,10 +4313,47 @@ impl<B: Backend + 'static> Host<B> {
         prefix: Option<PagedPrefix>,
         reserved_tokens: u64,
     ) -> Result<(), compute::Error> {
-        self.bind_paged_lane(pool_rep, 0, prefix, reserved_tokens)
+        if let Some(prefix) = &prefix {
+            let slot_rep = self
+                .table
+                .get(&Resource::<PagePoolEntry>::new_borrow(pool_rep))
+                .map_err(invalid_handle)?
+                .slot
+                .ok_or_else(|| invalid_handle("paged slot is not open"))?;
+            let sequence = prefix
+                .sequence
+                .lock()
+                .map_err(|_| guest_error(BackendError::ExecutionFailed))?;
+            let owned = self
+                .table
+                .get(&Resource::<BatchSlotEntry>::new_borrow(slot_rep))
+                .map_err(invalid_handle)?
+                .binding
+                .banks
+                .owns_sequence(&sequence);
+            if !owned {
+                return Err(compute::Error::Quota(
+                    forja_core::PagePoolError::ForeignResource.to_string(),
+                ));
+            }
+        }
+        if self.paged_lane_prefix(pool_rep, 0).is_ok() {
+            self.bind_paged_lane_inner(pool_rep, 0, None, 0)?;
+        }
+        self.bind_paged_lane_inner(pool_rep, 0, prefix, reserved_tokens)
     }
 
     fn bind_paged_lane(
+        &mut self,
+        pool_rep: u32,
+        lane: u32,
+        prefix: Option<PagedPrefix>,
+        reserved_tokens: u64,
+    ) -> Result<(), compute::Error> {
+        self.bind_paged_lane_inner(pool_rep, lane, prefix, reserved_tokens)
+    }
+
+    fn bind_paged_lane_inner(
         &mut self,
         pool_rep: u32,
         lane: u32,
@@ -4357,6 +4394,12 @@ impl<B: Backend + 'static> Host<B> {
         let lane = usize::try_from(lane)
             .map_err(|_| compute::Error::Layout("paged lane exceeds usize".to_owned()))?;
         let lane_binding = binding.lane(lane)?;
+        let release = prefix.is_none() && reserved_tokens == 0;
+        if !release && lane_binding.used.load(Ordering::Acquire) {
+            return Err(compute::Error::Quota(
+                "paged lane must be released before rebinding".to_owned(),
+            ));
+        }
         let sequence = match prefix {
             Some(prefix) => prefix.sequence,
             None => Arc::new(Mutex::new(
@@ -4405,13 +4448,33 @@ impl<B: Backend + 'static> Host<B> {
             }
         }
         drop(locked);
-        *lane_binding
+        self.publish_paged_lane_binding(&binding, lane_binding, lane, sequence, metadata, release)
+    }
+
+    fn publish_paged_lane_binding(
+        &self,
+        binding: &PagedBinding,
+        lane_binding: &PagedLaneBinding,
+        lane: usize,
+        sequence: Arc<Mutex<PagedSequence>>,
+        metadata: [[u32; 4]; 2],
+        release: bool,
+    ) -> Result<(), compute::Error> {
+        let mut active_sequence = lane_binding
             .sequence
             .lock()
-            .map_err(|_| guest_error(BackendError::ExecutionFailed))? = Some(sequence);
+            .map_err(|_| guest_error(BackendError::ExecutionFailed))?;
+        *active_sequence = (!release).then_some(sequence);
+        drop(active_sequence);
         for (bank, activity) in binding.activity.iter().enumerate() {
-            activity[lane].store(true, Ordering::Release);
-            self.upload_paged_activity(&binding, bank, metadata[bank][3], true)?;
+            activity[lane].store(!release, Ordering::Release);
+            self.upload_paged_activity(binding, bank, metadata[bank][3], true)?;
+            if release {
+                binding
+                    .banks
+                    .poison(bank, lane)
+                    .map_err(|error| compute::Error::Quota(error.to_string()))?;
+            }
         }
         lane_binding.used.store(false, Ordering::Release);
         for dirty in &lane_binding.table_dirty {
@@ -9888,11 +9951,11 @@ mod tests {
     }
 
     #[test]
-    fn paged_lane_binding_is_atomic_when_a_bank_is_busy() {
+    fn paged_request_binding_is_atomic_when_a_bank_is_busy() {
         let mut host = Host::new(CpuBackend::new(), GENEROUS);
         let pool = insert_test_pool(&mut host, 1, 16);
         let slot = host.open_paged_slot(&pool, 1).unwrap();
-        host.bind_paged_lane(pool.rep(), 0, None, 8).unwrap();
+        host.bind_paged_request(pool.rep(), None, 8).unwrap();
         let original = host.paged_lane_prefix(pool.rep(), 0).unwrap();
         let before = [0, 1].map(|bank| {
             host.table
@@ -9914,7 +9977,7 @@ mod tests {
             super::PagedPrefix::new(host.table.get(&pool).unwrap().pool.reserve(4).unwrap());
 
         assert!(
-            host.bind_paged_lane(pool.rep(), 0, Some(replacement), 4)
+            host.bind_paged_request(pool.rep(), Some(replacement), 4)
                 .is_err()
         );
 
@@ -9932,6 +9995,66 @@ mod tests {
                 *expected
             );
         }
+    }
+
+    #[test]
+    fn paged_lane_rebind_requires_release_after_rollback() {
+        let mut host = Host::new(CpuBackend::new(), GENEROUS);
+        let pool = insert_test_pool(&mut host, 1, 16);
+        let slot = host.open_paged_slot(&pool, 1).unwrap();
+        host.bind_paged_lane(pool.rep(), 0, None, 8).unwrap();
+        let checkpoint = host
+            .begin_paged_lane_append(pool.rep(), 0, 0, 2)
+            .unwrap()
+            .0
+            .unwrap();
+        let binding = Arc::clone(&host.table.get(&slot).unwrap().binding);
+        binding.lane(0).unwrap().used.store(true, Ordering::Release);
+        let checkpoint = host
+            .finish_paged_lane_append(pool.rep(), 0, checkpoint)
+            .unwrap()
+            .unwrap();
+        let old_table = host
+            .paged_lane_prefix(pool.rep(), 0)
+            .unwrap()
+            .sequence
+            .lock()
+            .unwrap()
+            .table()
+            .unwrap();
+        host.rollback_paged_lane_append(pool.rep(), 0, checkpoint)
+            .unwrap();
+        let replacement =
+            super::PagedPrefix::new(host.table.get(&pool).unwrap().pool.reserve(4).unwrap());
+
+        assert!(matches!(
+            host.bind_paged_lane(pool.rep(), 0, Some(replacement.clone()), 4),
+            Err(compute::Error::Quota(_))
+        ));
+
+        host.bind_paged_lane(pool.rep(), 0, None, 0).unwrap();
+        assert!(binding.lane(0).unwrap().sequence.lock().unwrap().is_none());
+        for bank in 0..2 {
+            assert!(!binding.banks.slot(bank, 0).unwrap().is_active());
+            assert!(!binding.activity[bank][0].load(Ordering::Acquire));
+            let activity = host
+                .table
+                .get(&Resource::<TensorEntry>::new_borrow(
+                    host.table.get(&slot).unwrap().metadata[bank][3],
+                ))
+                .unwrap();
+            assert_eq!(
+                host.backend.read(&activity.tensor).unwrap(),
+                0_u32.to_ne_bytes()
+            );
+        }
+
+        host.bind_paged_lane(pool.rep(), 0, Some(replacement), 4)
+            .unwrap();
+        let rebound = host.paged_lane_prefix(pool.rep(), 0).unwrap();
+        let rebound = rebound.sequence.lock().unwrap();
+        assert_eq!(rebound.logical_len(), 0);
+        assert_ne!(rebound.table().unwrap(), old_table);
     }
 
     #[test]
@@ -10393,14 +10516,29 @@ mod tests {
         assert_eq!(sequence.table().unwrap().entries(), before_table.entries());
         assert_eq!(sequence.page_reference_counts().unwrap(), before_refs);
         drop(sequence);
-        let host = runner.store.data();
-        let entry = host
-            .table
-            .get(&Resource::<PagePoolEntry>::new_borrow(pool_rep))
-            .unwrap();
-        assert_eq!(entry.pool.memory_usage().unwrap(), before_memory);
-        assert_eq!(entry.charged_bytes.load(Ordering::Acquire), before_charged);
-        assert_eq!(host.live_bytes.load(Ordering::Acquire), before_live);
+        {
+            let host = runner.store.data();
+            let entry = host
+                .table
+                .get(&Resource::<PagePoolEntry>::new_borrow(pool_rep))
+                .unwrap();
+            assert_eq!(entry.pool.memory_usage().unwrap(), before_memory);
+            assert_eq!(entry.charged_bytes.load(Ordering::Acquire), before_charged);
+            assert_eq!(host.live_bytes.load(Ordering::Acquire), before_live);
+        }
+        drop(after);
+        runner.prepare_paged_request(None, 8).unwrap();
+        assert_eq!(
+            runner
+                .paged_prefix()
+                .unwrap()
+                .unwrap()
+                .sequence
+                .lock()
+                .unwrap()
+                .logical_len(),
+            0
+        );
         fs::remove_file(weights).unwrap();
     }
 

@@ -1379,6 +1379,7 @@ async fn prepare_batch_prefix(
         .max_by_key(|shape| shape.tokens)
         .copied()
         .ok_or("batch benchmark has no bounded prompt shape")?;
+    runner.prepare_paged_lane(0, None, 0)?;
     runner.prepare_paged_lane(0, None, reserved_tokens)?;
     for (chunk, start) in tokens
         .chunks(usize::try_from(shape.tokens)?)
@@ -1424,6 +1425,7 @@ async fn measure_batch_repetition(
             .ok_or("batch benchmark context is empty")?;
         let prefix =
             prefixes[lane % prefixes.len()].fork_reserved(u64::from(prefix_tokens), reserved)?;
+        runner.prepare_paged_lane(u32::try_from(lane)?, None, 0)?;
         runner.prepare_paged_lane(u32::try_from(lane)?, Some(prefix), reserved)?;
     }
     let mut lane_tokens = run_batch_decode_step(
