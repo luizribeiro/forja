@@ -74,6 +74,24 @@ impl<F: RuntimeFactory> Supervisor<F> {
     }
 
     pub(crate) async fn reload(&mut self) -> Result<(), String> {
+        let result = self.reload_candidate().await;
+        if let Err(error) = &result {
+            self.runtime.note_reload_failure();
+            tracing::error!(
+                event = "config.reload_failed",
+                config_generation = self.generation,
+                %error
+            );
+        } else {
+            tracing::info!(
+                event = "config.reloaded",
+                config_generation = self.generation
+            );
+        }
+        result
+    }
+
+    async fn reload_candidate(&mut self) -> Result<(), String> {
         let generation = self
             .generation
             .checked_add(1)
@@ -99,12 +117,22 @@ impl<F: RuntimeFactory> Supervisor<F> {
 
     pub(crate) async fn shutdown(&mut self) -> Result<(), String> {
         self.runtime.close_admission();
+        tracing::info!(
+            event = "model.drain_started",
+            config_generation = self.generation,
+            shutdown = true
+        );
         self.runtime
             .drain_generation(
                 self.generation,
                 self.active.server.model_drain_deadline.get(),
             )
             .await;
+        tracing::info!(
+            event = "model.drain_finished",
+            config_generation = self.generation,
+            shutdown = true
+        );
         self.runtime.unload()?;
         self.ledger.release(self.retained_bytes)
     }
@@ -116,12 +144,22 @@ impl<F: RuntimeFactory> Supervisor<F> {
             None
         };
         self.runtime.set_ready(false);
+        tracing::info!(
+            event = "model.drain_started",
+            config_generation = self.generation,
+            replacement_generation = candidate.generation
+        );
         self.runtime
             .drain_generation(
                 self.generation,
                 self.active.server.model_drain_deadline.get(),
             )
             .await;
+        tracing::info!(
+            event = "model.drain_finished",
+            config_generation = self.generation,
+            replacement_generation = candidate.generation
+        );
         self.runtime.unload()?;
         self.ledger.release(self.retained_bytes)?;
         let loaded = match preloaded {
@@ -139,6 +177,10 @@ impl<F: RuntimeFactory> Supervisor<F> {
         self.retained_bytes = loaded.retained_bytes;
         self.active = candidate.config;
         self.generation = candidate.generation;
+        tracing::info!(
+            event = "model.published",
+            config_generation = self.generation
+        );
         Ok(())
     }
 

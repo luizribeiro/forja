@@ -269,11 +269,7 @@ where
             }
             command = signals.reload.recv() => {
                 command.ok_or("reload signal listener closed")?;
-                if let Err(error) = supervisor.reload().await {
-                    tracing::error!(event = "config.reload_failed", %error);
-                } else {
-                    tracing::info!(event = "config.reloaded");
-                }
+                let _reload = supervisor.reload().await;
             }
             completed = &mut server => break completed?,
         }

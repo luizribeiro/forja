@@ -1942,6 +1942,16 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reload_failures_advance_the_operational_counter() {
+        let state = state();
+        let handle = DrainHandle {
+            state: Arc::clone(&state),
+        };
+        handle.note_reload_failure();
+        assert_eq!(state.reload_failures.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
     async fn publishes_policy_only_after_actor_acknowledgement() {
         let state = state();
         let handle = DrainHandle {
