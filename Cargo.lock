@@ -788,6 +788,8 @@ dependencies = [
  "forja-serve",
  "forja-testing",
  "golden-fixtures",
+ "hyper",
+ "hyper-util",
  "qwen3-coder-xml",
  "serde",
  "serde_json",

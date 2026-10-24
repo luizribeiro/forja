@@ -1,4 +1,6 @@
-use std::{collections::HashMap, error::Error, fs, future::Future, path::Path, pin::Pin};
+use std::{
+    collections::HashMap, error::Error, fs, future::Future, path::Path, pin::Pin, time::Duration,
+};
 
 use forja_config::{BackendKind, Choice, Engine, Profile};
 use forja_core::Backend;
@@ -332,14 +334,15 @@ where
     } else {
         None
     };
-    let (shutdown, mut shutdown_rx) = tokio::sync::watch::channel(false);
-    let mut server = tokio::spawn(async move {
-        axum::serve(listener, router)
-            .with_graceful_shutdown(async move {
-                let _ = shutdown_rx.changed().await;
-            })
-            .await
-    });
+    let (shutdown, shutdown_rx) = tokio::sync::watch::channel(false);
+    let (header_timeout, header_timeout_rx) =
+        tokio::sync::watch::channel(config.server.header_read_timeout.get());
+    let mut server = tokio::spawn(serve_http1(
+        listener,
+        router,
+        header_timeout_rx,
+        shutdown_rx,
+    ));
     let mut signals = crate::signals::commands()?;
     let result = loop {
         tokio::select! {
@@ -354,7 +357,9 @@ where
             }
             command = signals.reload.recv() => {
                 command.ok_or("reload signal listener closed")?;
-                let _reload = supervisor.reload().await;
+                if supervisor.reload().await.is_ok() {
+                    header_timeout.send_replace(supervisor.header_read_timeout());
+                }
             }
             completed = &mut server => break completed?,
         }
@@ -364,6 +369,41 @@ where
         task.await??;
     }
     result?;
+    Ok(())
+}
+
+async fn serve_http1(
+    listener: tokio::net::TcpListener,
+    router: axum::Router,
+    header_read_timeout: tokio::sync::watch::Receiver<Duration>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) -> std::io::Result<()> {
+    let graceful = hyper_util::server::graceful::GracefulShutdown::new();
+    loop {
+        let accepted = tokio::select! {
+            biased;
+            changed = shutdown.changed() => {
+                let _ = changed;
+                break;
+            }
+            accepted = listener.accept() => accepted,
+        };
+        let (stream, peer) = accepted?;
+        let mut http = hyper::server::conn::http1::Builder::new();
+        http.timer(hyper_util::rt::TokioTimer::new())
+            .header_read_timeout(*header_read_timeout.borrow());
+        let connection = http.serve_connection(
+            hyper_util::rt::TokioIo::new(stream),
+            hyper_util::service::TowerToHyperService::new(router.clone()),
+        );
+        let connection = graceful.watcher().watch(connection);
+        tokio::spawn(async move {
+            if let Err(error) = connection.await {
+                tracing::debug!(%peer, %error, "HTTP connection closed");
+            }
+        });
+    }
+    graceful.shutdown().await;
     Ok(())
 }
 
@@ -382,6 +422,42 @@ mod tests {
     use forja_serve::{FinishReason, GenerationEvent};
 
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn live_header_timeout_closes_an_incomplete_request() -> Result<(), Box<dyn Error>> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let router = axum::Router::new().route("/", axum::routing::get(|| async { "ok" }));
+        let (header_timeout, header_timeout_rx) =
+            tokio::sync::watch::channel(Duration::from_secs(10));
+        let (shutdown, shutdown_rx) = tokio::sync::watch::channel(false);
+        let server = tokio::spawn(serve_http1(
+            listener,
+            router,
+            header_timeout_rx,
+            shutdown_rx,
+        ));
+        header_timeout.send_replace(Duration::from_millis(20));
+        let elapsed = tokio::task::spawn_blocking(move || -> std::io::Result<Duration> {
+            let mut stream = TcpStream::connect(address)?;
+            stream.set_read_timeout(Some(Duration::from_secs(1)))?;
+            stream.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nX-Slow:")?;
+            let started = std::time::Instant::now();
+            let mut response = Vec::new();
+            match stream.read_to_end(&mut response) {
+                Ok(_) => Ok(started.elapsed()),
+                Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {
+                    Ok(started.elapsed())
+                }
+                Err(error) => Err(error),
+            }
+        })
+        .await??;
+        assert!(elapsed < Duration::from_secs(1));
+        let _ = shutdown.send(true);
+        server.await??;
+        Ok(())
+    }
 
     #[cfg(target_os = "macos")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

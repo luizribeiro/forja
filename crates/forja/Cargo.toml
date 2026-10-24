@@ -17,6 +17,8 @@ forja-cpu = { path = "../forja-cpu" }
 forja-host = { path = "../forja-host" }
 forja-serve = { path = "../forja-serve" }
 golden-fixtures = { path = "../../support/golden-fixtures" }
+hyper.workspace = true
+hyper-util.workspace = true
 qwen3-coder-xml = { path = "../../chat-formats/qwen3-coder-xml" }
 serde.workspace = true
 serde_json.workspace = true

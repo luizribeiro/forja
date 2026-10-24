@@ -98,6 +98,10 @@ impl<F: RuntimeFactory> Supervisor<F> {
         result
     }
 
+    pub(crate) fn header_read_timeout(&self) -> std::time::Duration {
+        self.active.server.header_read_timeout.get()
+    }
+
     async fn reload_candidate(&mut self) -> Result<(), String> {
         let generation = self
             .generation
