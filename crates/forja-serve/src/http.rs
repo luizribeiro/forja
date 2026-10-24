@@ -1602,25 +1602,6 @@ fn admit<S, T>(
     ))
 }
 
-#[cfg(test)]
-fn activate<S>(
-    state: &Arc<HttpState<S>>,
-    admission_capacity: usize,
-    runtime_id: u64,
-    request_id: u64,
-    control: &GenerationControl,
-) -> Result<ActiveGuard<S>, Box<Response>> {
-    admit(
-        state,
-        admission_capacity,
-        runtime_id,
-        request_id,
-        control,
-        || Ok(()),
-    )
-    .map(|(active, ())| active)
-}
-
 fn actor_error(error: ActorError) -> Response {
     match error {
         ActorError::Full => api_error(StatusCode::TOO_MANY_REQUESTS, "request queue is full"),
@@ -2292,7 +2273,7 @@ mod tests {
     async fn drain_stops_admission_and_waits_for_finalization() {
         let state = state();
         let control = GenerationControl::new(Duration::from_secs(1));
-        let active = activate(&state, usize::MAX, 0, 1, &control).unwrap();
+        let (active, ()) = admit(&state, usize::MAX, 0, 1, &control, || Ok(())).unwrap();
         assert_eq!(state.active.lock().unwrap()[&1].generation, 0);
         let handle = DrainHandle {
             state: Arc::clone(&state),
@@ -2307,7 +2288,7 @@ mod tests {
         drop(active);
         drain.await;
         assert_eq!(
-            activate(&state, usize::MAX, 0, 2, &control)
+            admit(&state, usize::MAX, 0, 2, &control, || Ok(()))
                 .err()
                 .unwrap()
                 .status(),
@@ -2321,7 +2302,7 @@ mod tests {
         let handle = DrainHandle {
             state: Arc::clone(&state),
         };
-        handle.publish(7, Smoke).unwrap();
+        handle.publish_runtime(7, 11, Smoke).unwrap();
         assert_eq!(state.generation.read().unwrap().as_ref().unwrap().id, 7);
         handle.unload().await.unwrap();
         assert!(state.generation.read().unwrap().is_none());
@@ -2446,6 +2427,32 @@ mod tests {
         );
         assert!(cancelled.load(AtomicOrdering::Acquire));
         assert!(quiesced.load(AtomicOrdering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn policy_update_waits_for_a_racing_request_cancellation() {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let actor = ServiceActor::spawn(
+            CancelSmoke {
+                started: Arc::clone(&started),
+                cancelled: Arc::clone(&cancelled),
+                quiesced: Arc::new(AtomicBool::new(false)),
+            },
+            2,
+        );
+        let control = control();
+        let request = actor.complete(chat_request(), control.clone()).unwrap();
+        started.notified().await;
+        let update_actor = actor.clone();
+        let update =
+            tokio::spawn(async move { update_actor.update_policy(1, HostConfig::default()).await });
+        tokio::task::yield_now().await;
+        assert!(!update.is_finished());
+        control.cancel();
+        assert!(request.await.unwrap().is_err());
+        update.await.unwrap().unwrap();
+        assert!(cancelled.load(AtomicOrdering::Acquire));
     }
 
     #[tokio::test]
