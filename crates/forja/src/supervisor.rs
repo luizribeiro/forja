@@ -73,7 +73,6 @@ impl<F: RuntimeFactory> Supervisor<F> {
         })
     }
 
-    #[allow(dead_code, reason = "invoked by reload signal handling")]
     pub(crate) async fn reload(&mut self) -> Result<(), String> {
         let generation = self
             .generation

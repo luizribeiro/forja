@@ -248,20 +248,36 @@ where
         None
     };
     let (shutdown, mut shutdown_rx) = tokio::sync::watch::channel(false);
-    let server = tokio::spawn(async move {
+    let mut server = tokio::spawn(async move {
         axum::serve(listener, router)
             .with_graceful_shutdown(async move {
                 let _ = shutdown_rx.changed().await;
             })
             .await
     });
-    if let Err(error) = crate::signals::shutdown().await {
-        tracing::error!(event = "shutdown.listen_failed", %error);
-    }
-    let shutdown_result = supervisor.shutdown().await;
-    let _ = shutdown.send(true);
-    let result = server.await?;
-    shutdown_result?;
+    let mut signals = crate::signals::commands()?;
+    let result = loop {
+        tokio::select! {
+            biased;
+            command = signals.terminate.recv() => {
+                command.ok_or("shutdown signal listeners closed")?;
+                let shutdown_result = supervisor.shutdown().await;
+                let _ = shutdown.send(true);
+                let server_result = server.await?;
+                shutdown_result?;
+                break server_result;
+            }
+            command = signals.reload.recv() => {
+                command.ok_or("reload signal listener closed")?;
+                if let Err(error) = supervisor.reload().await {
+                    tracing::error!(event = "config.reload_failed", %error);
+                } else {
+                    tracing::info!(event = "config.reloaded");
+                }
+            }
+            completed = &mut server => break completed?,
+        }
+    };
     let _ = metrics_shutdown.send(true);
     if let Some(task) = metrics_task {
         task.await??;
