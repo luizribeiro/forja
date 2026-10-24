@@ -525,7 +525,7 @@ pub fn serving_router<S: ChatService>(service: S) -> (Router, DrainHandle<S>) {
     let max_body_bytes = service.max_body_bytes();
     let generation = PublishedGeneration::new(0, service);
     let state = Arc::new(HttpState {
-        generation: RwLock::new(generation),
+        generation: RwLock::new(Some(generation)),
         ready: std::sync::atomic::AtomicBool::new(true),
         closed: std::sync::atomic::AtomicBool::new(false),
         active: StdMutex::new(BTreeMap::new()),
@@ -561,7 +561,7 @@ pub fn operational_router<S: ChatService>(
 }
 
 struct HttpState<S> {
-    generation: RwLock<PublishedGeneration<S>>,
+    generation: RwLock<Option<PublishedGeneration<S>>>,
     ready: std::sync::atomic::AtomicBool,
     closed: std::sync::atomic::AtomicBool,
     active: StdMutex<BTreeMap<u64, ActiveRequest>>,
@@ -627,8 +627,10 @@ impl<S: ChatService> HttpState<S> {
     fn snapshot(&self) -> Result<GenerationSnapshot<S>, &'static str> {
         self.generation
             .read()
-            .map(|generation| generation.snapshot())
-            .map_err(|_| "runtime state failed")
+            .map_err(|_| "runtime state failed")?
+            .as_ref()
+            .map(PublishedGeneration::snapshot)
+            .ok_or("model is not loaded")
     }
 }
 
@@ -719,7 +721,22 @@ impl<S: ChatService> DrainHandle<S> {
             .generation
             .write()
             .map_err(|_| "runtime state failed")?;
-        *active = next;
+        *active = Some(next);
+        Ok(())
+    }
+
+    /// Drops the drained runtime while the listener remains unready.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the runtime lock is poisoned.
+    pub fn unload(&self) -> Result<(), &'static str> {
+        let mut active = self
+            .state
+            .generation
+            .write()
+            .map_err(|_| "runtime state failed")?;
+        *active = None;
         Ok(())
     }
 
@@ -746,6 +763,9 @@ impl<S: ChatService> DrainHandle<S> {
             .generation
             .write()
             .map_err(|_| GenerationError::unavailable("runtime state failed"))?;
+        let published = published
+            .as_mut()
+            .ok_or_else(|| GenerationError::unavailable("model is not loaded"))?;
         if published.id != current.id {
             return Err(GenerationError::unavailable(
                 "runtime changed during policy update",
@@ -827,6 +847,9 @@ async fn chat<S: ChatService>(
     request: Request,
 ) -> Response {
     let request_id = next_request_id();
+    if !state.ready.load(Ordering::Acquire) {
+        return api_error(StatusCode::SERVICE_UNAVAILABLE, "model is unavailable");
+    }
     let runtime = match state.snapshot() {
         Ok(runtime) => runtime,
         Err(error) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, error),
@@ -906,6 +929,9 @@ async fn text<S: ChatService>(
     request: Request,
 ) -> Response {
     let request_id = next_request_id();
+    if !state.ready.load(Ordering::Acquire) {
+        return api_error(StatusCode::SERVICE_UNAVAILABLE, "model is unavailable");
+    }
     let runtime = match state.snapshot() {
         Ok(runtime) => runtime,
         Err(error) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, error),
@@ -1878,7 +1904,7 @@ mod tests {
             state: Arc::clone(&state),
         };
         handle.publish(7, Smoke).unwrap();
-        assert_eq!(state.generation.read().unwrap().id, 7);
+        assert_eq!(state.generation.read().unwrap().as_ref().unwrap().id, 7);
     }
 
     #[tokio::test]
@@ -1890,15 +1916,15 @@ mod tests {
         let mut config = HostConfig::default();
         config.server.request_deadline = forja_config::Duration::from_secs(9);
         handle.update_policy(8, config.clone()).await.unwrap();
-        assert_eq!(state.generation.read().unwrap().id, 8);
+        assert_eq!(state.generation.read().unwrap().as_ref().unwrap().id, 8);
         assert_eq!(
-            state.generation.read().unwrap().deadline,
+            state.generation.read().unwrap().as_ref().unwrap().deadline,
             Duration::from_secs(9)
         );
 
         config.server.queue_length = 99;
         assert!(handle.update_policy(9, config).await.is_err());
-        assert_eq!(state.generation.read().unwrap().id, 8);
+        assert_eq!(state.generation.read().unwrap().as_ref().unwrap().id, 8);
     }
 
     #[tokio::test]
@@ -1933,7 +1959,7 @@ mod tests {
 
     fn test_state<S: ChatService>(service: S) -> Arc<HttpState<S>> {
         Arc::new(HttpState {
-            generation: RwLock::new(PublishedGeneration::new(0, service)),
+            generation: RwLock::new(Some(PublishedGeneration::new(0, service))),
             ready: std::sync::atomic::AtomicBool::new(true),
             closed: std::sync::atomic::AtomicBool::new(false),
             active: StdMutex::new(BTreeMap::new()),
