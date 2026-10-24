@@ -1094,24 +1094,21 @@ async fn chat<S: ChatService>(
     }
     let model = request.model.clone();
     let control = GenerationControl::new(runtime.write_stall_timeout);
-    let active = match activate(
+    let (active, actor) = match admit(
         &state,
         runtime.admission_capacity,
         runtime.id,
         request_id,
         &control,
+        || {
+            runtime
+                .service
+                .complete_with_policy(runtime.policy.clone(), request, control.clone())
+        },
     ) {
-        Ok(active) => active,
+        Ok(admitted) => admitted,
         Err(response) => return *response,
     };
-    let actor =
-        match runtime
-            .service
-            .complete_with_policy(runtime.policy.clone(), request, control.clone())
-        {
-            Ok(receiver) => receiver,
-            Err(error) => return actor_error(error),
-        };
     let (sender, receiver) = oneshot::channel();
     let task_control = control.clone();
     tokio::spawn(async move {
@@ -1182,23 +1179,22 @@ async fn text<S: ChatService>(
     }
     let model = request.model.clone();
     let control = GenerationControl::new(runtime.write_stall_timeout);
-    let active = match activate(
+    let (active, actor) = match admit(
         &state,
         runtime.admission_capacity,
         runtime.id,
         request_id,
         &control,
+        || {
+            runtime.service.complete_text_with_policy(
+                runtime.policy.clone(),
+                request,
+                control.clone(),
+            )
+        },
     ) {
-        Ok(active) => active,
+        Ok(admitted) => admitted,
         Err(response) => return *response,
-    };
-    let actor = match runtime.service.complete_text_with_policy(
-        runtime.policy.clone(),
-        request,
-        control.clone(),
-    ) {
-        Ok(receiver) => receiver,
-        Err(error) => return actor_error(error),
     };
     let (sender, receiver) = oneshot::channel();
     let task_control = control.clone();
@@ -1262,24 +1258,23 @@ async fn stream_chat_response<S: ChatService>(
         );
     }
     let control = GenerationControl::new(runtime.write_stall_timeout);
-    let active = match activate(
+    let (active, actor) = match admit(
         &state,
         runtime.admission_capacity,
         runtime.id,
         request_id,
         &control,
+        || {
+            runtime.service.stream_chat_with_policy(
+                runtime.policy.clone(),
+                request,
+                sender.clone(),
+                control.clone(),
+            )
+        },
     ) {
-        Ok(active) => active,
+        Ok(admitted) => admitted,
         Err(response) => return *response,
-    };
-    let actor = match runtime.service.stream_chat_with_policy(
-        runtime.policy.clone(),
-        request,
-        sender.clone(),
-        control.clone(),
-    ) {
-        Ok(receiver) => receiver,
-        Err(error) => return actor_error(error),
     };
     tokio::spawn(async move {
         let _active = active;
@@ -1307,24 +1302,23 @@ fn stream_text_response<S: ChatService>(
     let id = format!("cmpl-{created}");
     let (sender, receiver) = mpsc::channel(16);
     let control = GenerationControl::new(runtime.write_stall_timeout);
-    let active = match activate(
+    let (active, actor) = match admit(
         state,
         runtime.admission_capacity,
         runtime.id,
         request_id,
         &control,
+        || {
+            runtime.service.stream_text_with_policy(
+                runtime.policy.clone(),
+                request,
+                sender.clone(),
+                control.clone(),
+            )
+        },
     ) {
-        Ok(active) => active,
+        Ok(admitted) => admitted,
         Err(response) => return *response,
-    };
-    let actor = match runtime.service.stream_text_with_policy(
-        runtime.policy.clone(),
-        request,
-        sender.clone(),
-        control.clone(),
-    ) {
-        Ok(receiver) => receiver,
-        Err(error) => return actor_error(error),
     };
     tokio::spawn(async move {
         let _active = active;
@@ -1547,20 +1541,38 @@ fn log_completion(
     );
 }
 
-fn activate<S>(
+fn admit<S, T>(
     state: &Arc<HttpState<S>>,
     admission_capacity: usize,
-    generation: u64,
+    runtime_id: u64,
     request_id: u64,
     control: &GenerationControl,
-) -> Result<ActiveGuard<S>, Box<Response>> {
+    send: impl FnOnce() -> Result<T, ActorError>,
+) -> Result<(ActiveGuard<S>, T), Box<Response>> {
+    let _admission = state.admission.lock().map_err(|_| {
+        Box::new(api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "admission state failed",
+        ))
+    })?;
+    let published = state.generation.read().map_err(|_| {
+        Box::new(api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "runtime state failed",
+        ))
+    })?;
     let mut active = state.active.lock().map_err(|_| {
         Box::new(api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "admission state failed",
         ))
     })?;
-    if state.closed.load(Ordering::Acquire) || !state.ready.load(Ordering::Acquire) {
+    if state.closed.load(Ordering::Acquire)
+        || !state.ready.load(Ordering::Acquire)
+        || published
+            .as_ref()
+            .is_none_or(|published| published.id != runtime_id)
+    {
         return Err(Box::new(api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "model is unavailable",
@@ -1572,18 +1584,41 @@ fn activate<S>(
             "request queue is full",
         )));
     }
+    let receiver = send().map_err(|error| Box::new(actor_error(error)))?;
     active.insert(
         request_id,
         ActiveRequest {
-            generation,
+            generation: runtime_id,
             control: control.clone(),
         },
     );
     drop(active);
-    Ok(ActiveGuard {
-        state: Arc::clone(state),
+    Ok((
+        ActiveGuard {
+            state: Arc::clone(state),
+            request_id,
+        },
+        receiver,
+    ))
+}
+
+#[cfg(test)]
+fn activate<S>(
+    state: &Arc<HttpState<S>>,
+    admission_capacity: usize,
+    runtime_id: u64,
+    request_id: u64,
+    control: &GenerationControl,
+) -> Result<ActiveGuard<S>, Box<Response>> {
+    admit(
+        state,
+        admission_capacity,
+        runtime_id,
         request_id,
-    })
+        control,
+        || Ok(()),
+    )
+    .map(|(active, ())| active)
 }
 
 fn actor_error(error: ActorError) -> Response {
@@ -1633,11 +1668,13 @@ fn error_value(message: &str, error_type: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use std::{
+        convert::Infallible,
         error::Error,
         fs,
         io::Write,
         path::PathBuf,
         sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering},
+        task::{Context, Poll},
         time::{SystemTime, UNIX_EPOCH},
     };
 
@@ -1649,6 +1686,23 @@ mod tests {
     use crate::{FinishReason, Usage};
 
     struct Smoke;
+
+    struct PolledBody {
+        receiver: mpsc::Receiver<Result<Bytes, Infallible>>,
+        polled: Arc<AtomicBool>,
+    }
+
+    impl tokio_stream::Stream for PolledBody {
+        type Item = Result<Bytes, Infallible>;
+
+        fn poll_next(
+            mut self: Pin<&mut Self>,
+            context: &mut Context<'_>,
+        ) -> Poll<Option<Self::Item>> {
+            self.polled.store(true, AtomicOrdering::Release);
+            self.receiver.poll_recv(context)
+        }
+    }
 
     struct CancelSmoke {
         started: Arc<tokio::sync::Notify>,
@@ -2274,6 +2328,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn body_straggler_cannot_dispatch_to_a_replaced_runtime() {
+        let state = state();
+        let handle = DrainHandle {
+            state: Arc::clone(&state),
+        };
+        let polled = Arc::new(AtomicBool::new(false));
+        let (sender, receiver) = mpsc::channel(1);
+        let body = axum::body::Body::from_stream(PolledBody {
+            receiver,
+            polled: Arc::clone(&polled),
+        });
+        let request = Request::builder().body(body).unwrap();
+        let response = tokio::spawn(chat::<Smoke>(State(Arc::clone(&state)), request));
+        while !polled.load(AtomicOrdering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+        handle.publish_runtime(1, 0, Smoke).unwrap();
+        sender
+            .send(Ok(Bytes::from_static(
+                br#"{"model":"smoke","messages":[]}"#,
+            )))
+            .await
+            .unwrap();
+        drop(sender);
+        assert_eq!(
+            response.await.unwrap().status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    #[tokio::test]
     async fn reload_failures_advance_the_operational_counter() {
         let state = state();
         let handle = DrainHandle {
@@ -2371,10 +2456,14 @@ mod tests {
         };
         let old = GenerationControl::new(Duration::from_secs(1));
         let next = GenerationControl::new(Duration::from_secs(1));
-        let old_guard = activate(&state, usize::MAX, 0, 1, &old).unwrap();
-        let next_guard = activate(&state, usize::MAX, 1, 2, &next).unwrap();
+        let (old_guard, ()) = admit(&state, usize::MAX, 0, 1, &old, || Ok(())).unwrap();
+        handle.publish_runtime(1, 0, Smoke).unwrap();
+        let (next_guard, ()) = admit(&state, usize::MAX, 1, 2, &next, || Ok(())).unwrap();
         let drain = tokio::spawn(async move {
-            handle.drain_generation(0, Duration::ZERO).await;
+            handle
+                .try_drain_generation(0, Duration::ZERO)
+                .await
+                .unwrap();
         });
         tokio::time::timeout(Duration::from_secs(1), async {
             while !old.is_cancelled() {
