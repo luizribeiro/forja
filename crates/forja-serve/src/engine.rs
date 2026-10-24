@@ -68,7 +68,7 @@ impl GenerationError {
         }
     }
 
-    fn unavailable(message: impl Into<String>) -> Self {
+    pub(crate) fn unavailable(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
             kind: ErrorKind::Unavailable,
@@ -453,6 +453,7 @@ pub struct ServingEngine<B: Backend + Send + Sync + 'static> {
     prefix_namespace: PrefixNamespace,
     prefix_index: Option<PrefixIndex>,
     metrics: ServingMetrics,
+    config_generation: u64,
     scheduler: SchedulerConfig,
     #[cfg(test)]
     batch_test_barrier: Option<Arc<BatchTestBarrier>>,
@@ -606,6 +607,7 @@ struct SchedulerConfig {
     active_lanes: u32,
     max_prefill_chunks: u32,
     prompt_token_budget: u32,
+    profile_prompt_budget: u32,
     decode_buckets: Vec<u32>,
 }
 
@@ -620,6 +622,7 @@ impl SchedulerConfig {
                 active_lanes: 1,
                 max_prefill_chunks: 1,
                 prompt_token_budget: 1,
+                profile_prompt_budget: profile_budget,
                 decode_buckets: vec![1],
             });
         };
@@ -674,6 +677,7 @@ impl SchedulerConfig {
             active_lanes,
             max_prefill_chunks,
             prompt_token_budget,
+            profile_prompt_budget: profile_budget,
             decode_buckets,
         })
     }
@@ -825,6 +829,7 @@ where
             prefix_namespace: prefix_identity.into_namespace(),
             prefix_index,
             metrics: ServingMetrics::default(),
+            config_generation: 0,
             scheduler,
             #[cfg(test)]
             batch_test_barrier: None,
@@ -846,6 +851,25 @@ where
     #[must_use]
     pub const fn metrics(&self) -> &ServingMetrics {
         &self.metrics
+    }
+
+    pub(crate) fn update_policy(
+        &mut self,
+        generation: u64,
+        config: HostConfig,
+    ) -> Result<(), GenerationError> {
+        let scheduler =
+            SchedulerConfig::resolve(&self.info, &config, self.scheduler.profile_prompt_budget)?;
+        if let (Some(serving), Some(index)) = (&self.info.serving, &mut self.prefix_index) {
+            let limits = prefix_limits(serving, &config)?;
+            index
+                .reconfigure(limits, config.serving.prefix_reuse)
+                .map_err(|error| GenerationError::new(error.to_string()))?;
+        }
+        self.scheduler = scheduler;
+        self.config = config;
+        self.config_generation = generation;
+        Ok(())
     }
 
     pub(crate) const fn supports_continuous_batching(&self) -> bool {

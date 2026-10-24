@@ -103,6 +103,11 @@ impl PreparedRequest {
 }
 
 enum RequestEnvelope {
+    UpdatePolicy {
+        generation: u64,
+        config: Box<forja_config::HostConfig>,
+        reply: oneshot::Sender<Result<(), GenerationError>>,
+    },
     Chat {
         request: ChatCompletionRequest,
         control: GenerationControl,
@@ -134,6 +139,15 @@ enum RequestEnvelope {
 impl RequestEnvelope {
     fn from_command(command: ServiceCommand) -> Self {
         match command {
+            ServiceCommand::UpdatePolicy {
+                generation,
+                config,
+                reply,
+            } => Self::UpdatePolicy {
+                generation,
+                config,
+                reply,
+            },
             ServiceCommand::Chat {
                 request,
                 control,
@@ -187,6 +201,7 @@ impl RequestEnvelope {
 
     fn queued(&self) -> Instant {
         match self {
+            Self::UpdatePolicy { .. } => Instant::now(),
             Self::Chat { queued, .. }
             | Self::Text { queued, .. }
             | Self::StreamChat { queued, .. }
@@ -195,19 +210,20 @@ impl RequestEnvelope {
     }
 
     fn requires_serial_path(&self) -> bool {
-        matches!(
-            self,
-            Self::Chat { request, .. } | Self::StreamChat { request, .. }
-                if request.params.tools.is_some()
-                    && !matches!(
-                        request.params.tool_choice.as_ref(),
-                        Some(crate::ToolChoice::Mode(mode)) if mode == "required"
-                    )
-                    && !matches!(
-                        request.params.tool_choice.as_ref(),
-                        Some(crate::ToolChoice::Named(_))
-                    )
-        )
+        matches!(self, Self::UpdatePolicy { .. })
+            || matches!(
+                self,
+                Self::Chat { request, .. } | Self::StreamChat { request, .. }
+                    if request.params.tools.is_some()
+                        && !matches!(
+                            request.params.tool_choice.as_ref(),
+                            Some(crate::ToolChoice::Mode(mode)) if mode == "required"
+                        )
+                        && !matches!(
+                            request.params.tool_choice.as_ref(),
+                            Some(crate::ToolChoice::Named(_))
+                        )
+            )
     }
 
     async fn prepare<B>(self, engine: &mut ServingEngine<B>) -> Option<PreparedRequest>
@@ -216,6 +232,12 @@ impl RequestEnvelope {
     {
         let started = Instant::now();
         let (prepared, request_params, control, sink) = match self {
+            Self::UpdatePolicy { reply, .. } => {
+                drop(reply.send(Err(GenerationError::new(
+                    "policy update reached request preparation",
+                ))));
+                return None;
+            }
             Self::Chat {
                 request,
                 control,
@@ -348,6 +370,18 @@ where
             }
             while let Ok(command) = receiver.try_recv() {
                 pending.push_back(RequestEnvelope::from_command(command));
+            }
+            if matches!(pending.front(), Some(RequestEnvelope::UpdatePolicy { .. })) {
+                let Some(RequestEnvelope::UpdatePolicy {
+                    generation,
+                    config,
+                    reply,
+                }) = pending.pop_front()
+                else {
+                    continue;
+                };
+                drop(reply.send(self.update_policy(generation, *config)));
+                continue;
             }
             let scheduled = Instant::now();
             if self.info.serving.is_some()

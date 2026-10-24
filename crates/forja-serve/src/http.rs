@@ -21,6 +21,7 @@ use axum::{
     },
     routing::{get, post},
 };
+use forja_config::HostConfig;
 use forja_core::Backend;
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
@@ -54,6 +55,19 @@ pub trait ChatService: Send + 'static {
     /// Snapshot of currently accumulated bounded metrics.
     fn metrics(&self) -> ServingMetrics {
         ServingMetrics::default()
+    }
+
+    /// Applies a validated live policy at an actor boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the service cannot apply the complete policy.
+    fn update_policy(
+        &mut self,
+        _generation: u64,
+        _config: HostConfig,
+    ) -> Result<(), GenerationError> {
+        Ok(())
     }
 
     /// Runs the bounded command mailbox owned by the HTTP transport.
@@ -140,6 +154,14 @@ where
         self.metrics().clone()
     }
 
+    fn update_policy(
+        &mut self,
+        generation: u64,
+        config: HostConfig,
+    ) -> Result<(), GenerationError> {
+        self.update_policy(generation, config)
+    }
+
     fn complete(
         &mut self,
         request: ChatCompletionRequest,
@@ -191,6 +213,11 @@ enum ActorError {
 #[doc(hidden)]
 #[allow(missing_docs)]
 pub enum ServiceCommand {
+    UpdatePolicy {
+        generation: u64,
+        config: Box<HostConfig>,
+        reply: oneshot::Sender<Result<(), GenerationError>>,
+    },
     Chat {
         request: ChatCompletionRequest,
         control: GenerationControl,
@@ -222,6 +249,7 @@ pub enum ServiceCommand {
 impl ServiceCommand {
     pub(crate) fn queued(&self) -> std::time::Instant {
         match self {
+            Self::UpdatePolicy { .. } => std::time::Instant::now(),
             Self::Chat { queued, .. }
             | Self::Text { queued, .. }
             | Self::StreamChat { queued, .. }
@@ -330,6 +358,23 @@ impl<S: ChatService> ServiceActor<S> {
         })
     }
 
+    async fn update_policy(
+        &self,
+        generation: u64,
+        config: HostConfig,
+    ) -> Result<(), GenerationError> {
+        let (reply, receiver) = oneshot::channel();
+        self.send(ServiceCommand::UpdatePolicy {
+            generation,
+            config: Box::new(config),
+            reply,
+        })
+        .map_err(|_| GenerationError::unavailable("serving scheduler stopped"))?;
+        receiver
+            .await
+            .map_err(|_| GenerationError::unavailable("serving scheduler stopped"))?
+    }
+
     fn metrics(&self) -> ServingMetrics {
         self.metrics
             .lock()
@@ -343,6 +388,15 @@ async fn run_serial<S: ChatService>(
     metrics: Arc<StdMutex<ServingMetrics>>,
 ) {
     while let Some(command) = receiver.recv().await {
+        if let ServiceCommand::UpdatePolicy {
+            generation,
+            config,
+            reply,
+        } = command
+        {
+            drop(reply.send(service.update_policy(generation, *config)));
+            continue;
+        }
         let queued = command.queued().elapsed();
         let scheduled = std::time::Instant::now();
         match command {
@@ -372,6 +426,9 @@ async fn run_serial<S: ChatService>(
                 reply,
                 ..
             } => drop(reply.send(service.stream_text(request, events, control).await)),
+            ServiceCommand::UpdatePolicy { .. } => {
+                unreachable!("policy updates return before request dispatch")
+            }
         }
         if let Ok(mut snapshot) = metrics.lock() {
             *snapshot = service.metrics();
@@ -587,6 +644,40 @@ impl<S: ChatService> DrainHandle<S> {
             .write()
             .map_err(|_| "runtime state failed")?;
         *active = next;
+        Ok(())
+    }
+
+    /// Applies live policy in the scheduler before publishing it to admission.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the scheduler rejects the policy or runtime state changes concurrently.
+    pub async fn update_policy(
+        &self,
+        generation: u64,
+        config: HostConfig,
+    ) -> Result<(), GenerationError> {
+        let current = self
+            .state
+            .snapshot()
+            .map_err(GenerationError::unavailable)?;
+        current
+            .service
+            .update_policy(generation, config.clone())
+            .await?;
+        let mut published = self
+            .state
+            .generation
+            .write()
+            .map_err(|_| GenerationError::unavailable("runtime state failed"))?;
+        if published.id != current.id {
+            return Err(GenerationError::unavailable(
+                "runtime changed during policy update",
+            ));
+        }
+        published.id = generation;
+        published.deadline = config.server.request_deadline.get();
+        published.write_stall_timeout = config.server.sse_write_stall_timeout.get();
         Ok(())
     }
 
@@ -1212,6 +1303,14 @@ mod tests {
             Duration::from_secs(1)
         }
 
+        fn update_policy(&mut self, _: u64, config: HostConfig) -> Result<(), GenerationError> {
+            if config.server.queue_length == 99 {
+                Err(GenerationError::new("rejected policy"))
+            } else {
+                Ok(())
+            }
+        }
+
         fn complete(
             &mut self,
             _: ChatCompletionRequest,
@@ -1691,6 +1790,26 @@ mod tests {
         };
         handle.publish(7, Smoke).unwrap();
         assert_eq!(state.generation.read().unwrap().id, 7);
+    }
+
+    #[tokio::test]
+    async fn publishes_policy_only_after_actor_acknowledgement() {
+        let state = state();
+        let handle = DrainHandle {
+            state: Arc::clone(&state),
+        };
+        let mut config = HostConfig::default();
+        config.server.request_deadline = forja_config::Duration::from_secs(9);
+        handle.update_policy(8, config.clone()).await.unwrap();
+        assert_eq!(state.generation.read().unwrap().id, 8);
+        assert_eq!(
+            state.generation.read().unwrap().deadline,
+            Duration::from_secs(9)
+        );
+
+        config.server.queue_length = 99;
+        assert!(handle.update_policy(9, config).await.is_err());
+        assert_eq!(state.generation.read().unwrap().id, 8);
     }
 
     #[tokio::test]
