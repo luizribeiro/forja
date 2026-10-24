@@ -48,6 +48,7 @@ pub(crate) struct Supervisor<F: RuntimeFactory> {
     retained_bytes: u64,
     ledger: ProcessLedger,
     factory: F,
+    logging: Box<dyn crate::logging::Reload>,
     runtime: forja_serve::DrainHandle<F::Service>,
 }
 
@@ -58,6 +59,7 @@ impl<F: RuntimeFactory> Supervisor<F> {
         retained_bytes: u64,
         quota: u64,
         factory: F,
+        logging: Box<dyn crate::logging::Reload>,
         runtime: forja_serve::DrainHandle<F::Service>,
     ) -> Result<Self, String> {
         let mut ledger = ProcessLedger::new(quota);
@@ -69,6 +71,7 @@ impl<F: RuntimeFactory> Supervisor<F> {
             retained_bytes,
             ledger,
             factory,
+            logging,
             runtime,
         })
     }
@@ -104,15 +107,41 @@ impl<F: RuntimeFactory> Supervisor<F> {
             return Ok(());
         }
         if candidate.diff.model.is_empty() {
-            self.runtime
-                .update_policy(generation, (*candidate.config).clone())
-                .await
-                .map_err(|error| error.to_string())?;
+            self.apply_live_policy(&candidate).await?;
             self.active = candidate.config;
             self.generation = generation;
             return Ok(());
         }
         self.replace(candidate).await
+    }
+
+    async fn apply_live_policy(&mut self, candidate: &Candidate) -> Result<(), String> {
+        let previous = self
+            .runtime
+            .acknowledge_policy(candidate.generation, (*candidate.config).clone())
+            .await
+            .map_err(|error| error.to_string())?;
+        if let Err(error) = self.logging.reconfigure(&candidate.config.logging) {
+            self.runtime
+                .acknowledge_policy(self.generation, (*self.active).clone())
+                .await
+                .map_err(|rollback| format!("{error}; scheduler rollback failed: {rollback}"))?;
+            return Err(error);
+        }
+        if let Err(error) =
+            self.runtime
+                .publish_policy(previous, candidate.generation, (*candidate.config).clone())
+        {
+            let logging = self.logging.reconfigure(&self.active.logging);
+            let scheduler = self
+                .runtime
+                .acknowledge_policy(self.generation, (*self.active).clone())
+                .await;
+            return Err(format!(
+                "policy publication failed: {error}; logging rollback: {logging:?}; scheduler rollback: {scheduler:?}"
+            ));
+        }
+        Ok(())
     }
 
     pub(crate) async fn shutdown(&mut self) -> Result<(), String> {
@@ -274,6 +303,18 @@ mod tests {
 
     struct FakeFactory(VecDeque<Result<u64, String>>);
 
+    struct FakeLogging(bool);
+
+    impl crate::logging::Reload for FakeLogging {
+        fn reconfigure(&self, _: &forja_config::Logging) -> Result<(), String> {
+            if self.0 {
+                Err("logger rejected policy".to_owned())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
     impl RuntimeFactory for FakeFactory {
         type Service = FakeService;
 
@@ -327,8 +368,16 @@ mod tests {
         let (_, runtime) = forja_serve::serving_router(FakeService);
         let readiness = runtime.clone();
         let factory = FakeFactory(VecDeque::from([Err("candidate failed".to_owned()), Ok(4)]));
-        let mut supervisor =
-            Supervisor::new(sources, HostConfig::default(), 4, 8, factory, runtime).unwrap();
+        let mut supervisor = Supervisor::new(
+            sources,
+            HostConfig::default(),
+            4,
+            8,
+            factory,
+            Box::new(FakeLogging(false)),
+            runtime,
+        )
+        .unwrap();
         let error = supervisor.reload().await.unwrap_err();
         assert!(error.contains("active generation was restored"));
         assert_eq!(supervisor.generation, 0);
@@ -352,12 +401,49 @@ mod tests {
             Err("candidate failed".to_owned()),
             Err("rollback failed".to_owned()),
         ]));
-        let mut supervisor =
-            Supervisor::new(sources, HostConfig::default(), 4, 8, factory, runtime).unwrap();
+        let mut supervisor = Supervisor::new(
+            sources,
+            HostConfig::default(),
+            4,
+            8,
+            factory,
+            Box::new(FakeLogging(false)),
+            runtime,
+        )
+        .unwrap();
         let error = supervisor.reload().await.unwrap_err();
         assert!(error.contains("candidate load failed: candidate failed"));
         assert!(error.contains("rollback failed: rollback failed"));
         assert!(!readiness.is_ready());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn logging_failure_rolls_back_scheduler_policy() {
+        let root = temporary_directory("supervisor-logging-rollback").unwrap();
+        let path = root.join("host.toml");
+        fs::write(&path, "[logging]\nlevel='debug'\n").unwrap();
+        let sources = HostConfigSources {
+            files: vec![path],
+            sets: Vec::new(),
+        };
+        let (_, runtime) = forja_serve::serving_router(FakeService);
+        let readiness = runtime.clone();
+        let mut supervisor = Supervisor::new(
+            sources,
+            HostConfig::default(),
+            4,
+            8,
+            FakeFactory(VecDeque::new()),
+            Box::new(FakeLogging(true)),
+            runtime,
+        )
+        .unwrap();
+        let error = supervisor.reload().await.unwrap_err();
+        assert!(error.contains("logger rejected policy"));
+        assert_eq!(supervisor.generation, 0);
+        assert!(readiness.is_ready());
+        supervisor.shutdown().await.unwrap();
         fs::remove_dir_all(root).unwrap();
     }
 }

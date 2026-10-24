@@ -784,14 +784,39 @@ impl<S: ChatService> DrainHandle<S> {
         generation: u64,
         config: HostConfig,
     ) -> Result<(), GenerationError> {
+        let previous = self.acknowledge_policy(generation, config.clone()).await?;
+        self.publish_policy(previous, generation, config)
+    }
+
+    /// Applies policy in the scheduler and returns the generation it acknowledged from.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the scheduler rejects the policy or no runtime is loaded.
+    pub async fn acknowledge_policy(
+        &self,
+        generation: u64,
+        config: HostConfig,
+    ) -> Result<u64, GenerationError> {
         let current = self
             .state
             .snapshot()
             .map_err(GenerationError::unavailable)?;
-        current
-            .service
-            .update_policy(generation, config.clone())
-            .await?;
+        current.service.update_policy(generation, config).await?;
+        Ok(current.id)
+    }
+
+    /// Publishes an acknowledged policy to HTTP admission.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the runtime changed after scheduler acknowledgement.
+    pub fn publish_policy(
+        &self,
+        previous: u64,
+        generation: u64,
+        config: HostConfig,
+    ) -> Result<(), GenerationError> {
         let mut published = self
             .state
             .generation
@@ -800,7 +825,7 @@ impl<S: ChatService> DrainHandle<S> {
         let published = published
             .as_mut()
             .ok_or_else(|| GenerationError::unavailable("model is not loaded"))?;
-        if published.id != current.id {
+        if published.id != previous {
             return Err(GenerationError::unavailable(
                 "runtime changed during policy update",
             ));

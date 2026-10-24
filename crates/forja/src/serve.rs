@@ -30,13 +30,16 @@ pub(crate) trait RuntimeFactory {
     ) -> LoadFuture<'a, Self::Service>;
 }
 
-pub(crate) async fn run(options: &Serve) -> Result<(), Box<dyn Error>> {
+pub(crate) async fn run(
+    options: &Serve,
+    logging: crate::logging::Controller,
+) -> Result<(), Box<dyn Error>> {
     match options.config.backend.kind {
-        BackendKind::Cpu => run_factory(CpuFactory, options).await,
+        BackendKind::Cpu => run_factory(CpuFactory, options, logging).await,
         BackendKind::Metal => {
             #[cfg(target_os = "macos")]
             {
-                run_factory(MetalFactory, options).await
+                run_factory(MetalFactory, options, logging).await
             }
             #[cfg(not(target_os = "macos"))]
             Err("the Metal backend requires macOS".into())
@@ -119,6 +122,7 @@ fn validate_config(
     config: &forja_config::HostConfig,
     backend: BackendArg,
 ) -> Result<Profile, String> {
+    crate::logging::validate(&config.logging)?;
     let (embedded, _) = validate_engine(
         &config.model.engine,
         &config.model.model,
@@ -215,7 +219,11 @@ where
     })
 }
 
-async fn run_factory<F>(mut factory: F, options: &Serve) -> Result<(), Box<dyn Error>>
+async fn run_factory<F>(
+    mut factory: F,
+    options: &Serve,
+    logging: crate::logging::Controller,
+) -> Result<(), Box<dyn Error>>
 where
     F: RuntimeFactory + 'static,
 {
@@ -231,6 +239,7 @@ where
         retained_bytes,
         plan.retained_bytes,
         factory,
+        Box::new(logging),
         drain.clone(),
     )?;
     let (metrics_shutdown, mut metrics_shutdown_rx) = tokio::sync::watch::channel(false);

@@ -82,11 +82,11 @@ fn run(command: args::Command) -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
     if let args::Command::Serve(options) = command {
-        logging::init(&options.config.logging)?;
+        let logging = logging::init(&options.config.logging)?;
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?;
-        return runtime.block_on(serve::run(&options));
+        return runtime.block_on(serve::run(&options, logging));
     }
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_time()
