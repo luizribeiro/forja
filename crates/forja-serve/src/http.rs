@@ -304,16 +304,24 @@ impl<S> Clone for ServiceActor<S> {
 }
 
 impl<S: ChatService> ServiceActor<S> {
+    #[cfg(test)]
     fn spawn(service: S, capacity: usize) -> Self {
+        Self::spawn_tracked(service, capacity).0
+    }
+
+    fn spawn_tracked(service: S, capacity: usize) -> (Self, tokio::task::JoinHandle<()>) {
         let (sender, receiver) = mpsc::channel::<ServiceCommand>(capacity.max(1));
         let metrics = Arc::new(StdMutex::new(service.metrics()));
         let actor_metrics = Arc::clone(&metrics);
-        tokio::spawn(service.run(receiver, actor_metrics));
-        Self {
-            sender,
-            metrics,
-            marker: std::marker::PhantomData,
-        }
+        let finalizer = tokio::spawn(service.run(receiver, actor_metrics));
+        (
+            Self {
+                sender,
+                metrics,
+                marker: std::marker::PhantomData,
+            },
+            finalizer,
+        )
     }
 
     fn complete_with_policy(
@@ -595,6 +603,7 @@ struct PublishedGeneration<S> {
     deadline: Duration,
     write_stall_timeout: Duration,
     service: ServiceActor<S>,
+    finalizer: tokio::task::JoinHandle<()>,
     config: Arc<HostConfig>,
 }
 
@@ -608,6 +617,7 @@ impl<S: ChatService> PublishedGeneration<S> {
         let deadline = service.request_deadline();
         let write_stall_timeout = service.write_stall_timeout();
         let queue_capacity = tokio::sync::Semaphore::MAX_PERMITS;
+        let (service, finalizer) = ServiceActor::spawn_tracked(service, queue_capacity);
         Self {
             id,
             model,
@@ -616,7 +626,8 @@ impl<S: ChatService> PublishedGeneration<S> {
             body_read_timeout,
             deadline,
             write_stall_timeout,
-            service: ServiceActor::spawn(service, queue_capacity),
+            service,
+            finalizer,
             config,
         }
     }
@@ -798,14 +809,23 @@ impl<S: ChatService> DrainHandle<S> {
     /// # Errors
     ///
     /// Returns an error when the runtime lock is poisoned.
-    pub fn unload(&self) -> Result<(), &'static str> {
-        let mut active = self
+    pub async fn unload(&self) -> Result<(), &'static str> {
+        let generation = self
             .state
             .generation
             .write()
-            .map_err(|_| "runtime state failed")?;
-        *active = None;
-        Ok(())
+            .map_err(|_| "runtime state failed")?
+            .take();
+        let Some(generation) = generation else {
+            return Ok(());
+        };
+        let PublishedGeneration {
+            service, finalizer, ..
+        } = generation;
+        drop(service);
+        finalizer
+            .await
+            .map_err(|_| "runtime finalizer failed before unload")
     }
 
     /// Applies live policy in the scheduler before publishing it to admission.
@@ -2075,6 +2095,8 @@ mod tests {
         };
         handle.publish(7, Smoke).unwrap();
         assert_eq!(state.generation.read().unwrap().as_ref().unwrap().id, 7);
+        handle.unload().await.unwrap();
+        assert!(state.generation.read().unwrap().is_none());
     }
 
     #[tokio::test]

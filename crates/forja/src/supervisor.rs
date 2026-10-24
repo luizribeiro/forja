@@ -162,7 +162,7 @@ impl<F: RuntimeFactory> Supervisor<F> {
             config_generation = self.generation,
             shutdown = true
         );
-        self.runtime.unload()?;
+        self.runtime.unload().await?;
         self.ledger.release(self.retained_bytes)
     }
 
@@ -189,7 +189,7 @@ impl<F: RuntimeFactory> Supervisor<F> {
             config_generation = self.generation,
             replacement_generation = candidate.generation
         );
-        self.runtime.unload()?;
+        self.runtime.unload().await?;
         self.ledger.release(self.retained_bytes)?;
         let loaded = match preloaded {
             Some(loaded) => loaded,
