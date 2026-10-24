@@ -580,7 +580,7 @@ mod tests {
     #[test]
     fn converts_profiles_to_deterministic_guest_load_config() {
         let config = profile_load_config(&profile(), &Engine::default()).unwrap();
-        assert!(!config.paged_cache);
+        assert!(config.paged_cache);
         assert_eq!(config.tunings.len(), 0);
         assert_eq!(
             config.fixed_variant_picks[0].site,

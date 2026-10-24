@@ -25,6 +25,9 @@ batch = 1
 max-context = 4096
 prefill-chunk = 512
 
+[serving]
+paged-cache = true
+
 [variants.fixed]
 "attention.prefill-small" = "sdpa.decomposed"
 "paged-attention.prefill-large" = "paged-sdpa.steel-half"

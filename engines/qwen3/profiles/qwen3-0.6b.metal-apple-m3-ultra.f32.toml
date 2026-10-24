@@ -21,6 +21,9 @@ batch = 1
 max-context = 4096
 prefill-chunk = 512
 
+[serving]
+paged-cache = true
+
 [variants.fixed]
 "dense.decode" = "matmul.gemv-transposed"
 "dense.prefill.large" = "matmul.steel-64x64x16-2x2"
