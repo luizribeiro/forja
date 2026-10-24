@@ -1689,6 +1689,21 @@ mod tests {
         started: Arc<tokio::sync::Notify>,
         cancelled: Arc<AtomicBool>,
         quiesced: Arc<AtomicBool>,
+        finish: Option<Arc<tokio::sync::Notify>>,
+    }
+
+    fn smoke_completion() -> Completion {
+        Completion {
+            text: "forged".to_owned(),
+            tool_call: None,
+            finish_reason: FinishReason::Stop,
+            usage: Usage {
+                prompt_tokens: 4,
+                cached_tokens: 0,
+                completion_tokens: 1,
+            },
+            token_ids: vec![1],
+        }
     }
 
     impl ChatService for Smoke {
@@ -1726,19 +1741,7 @@ mod tests {
             _: GenerationControl,
         ) -> Pin<Box<dyn Future<Output = Result<Completion, GenerationError>> + Send + '_>>
         {
-            Box::pin(async {
-                Ok(Completion {
-                    text: "forged".to_owned(),
-                    tool_call: None,
-                    finish_reason: FinishReason::Stop,
-                    usage: Usage {
-                        prompt_tokens: 4,
-                        cached_tokens: 0,
-                        completion_tokens: 1,
-                    },
-                    token_ids: vec![1],
-                })
-            })
+            Box::pin(async { Ok(smoke_completion()) })
         }
 
         fn complete_text(
@@ -1826,8 +1829,13 @@ mod tests {
         {
             let started = Arc::clone(&self.started);
             let cancelled = Arc::clone(&self.cancelled);
+            let finish = self.finish.clone();
             Box::pin(async move {
                 started.notify_one();
+                if let Some(finish) = finish {
+                    finish.notified().await;
+                    return Ok(smoke_completion());
+                }
                 while !control.is_cancelled() {
                     tokio::task::yield_now().await;
                 }
@@ -2404,6 +2412,7 @@ mod tests {
             started: Arc::clone(&started),
             cancelled: Arc::clone(&cancelled),
             quiesced: Arc::clone(&quiesced),
+            finish: None,
         });
         let handle = DrainHandle {
             state: Arc::clone(&state),
@@ -2438,6 +2447,7 @@ mod tests {
                 started: Arc::clone(&started),
                 cancelled: Arc::clone(&cancelled),
                 quiesced: Arc::new(AtomicBool::new(false)),
+                finish: None,
             },
             2,
         );
@@ -2453,6 +2463,46 @@ mod tests {
         assert!(request.await.unwrap().is_err());
         update.await.unwrap().unwrap();
         assert!(cancelled.load(AtomicOrdering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn policy_update_waits_for_a_racing_request_completion() {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let finish = Arc::new(tokio::sync::Notify::new());
+        let actor = ServiceActor::spawn(
+            CancelSmoke {
+                started: Arc::clone(&started),
+                cancelled: Arc::new(AtomicBool::new(false)),
+                quiesced: Arc::new(AtomicBool::new(false)),
+                finish: Some(Arc::clone(&finish)),
+            },
+            2,
+        );
+        let request = actor.complete(chat_request(), control()).unwrap();
+        started.notified().await;
+        let update_actor = actor.clone();
+        let update =
+            tokio::spawn(async move { update_actor.update_policy(1, HostConfig::default()).await });
+        tokio::task::yield_now().await;
+        assert!(!update.is_finished());
+        finish.notify_one();
+        assert!(request.await.unwrap().is_ok());
+        update.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_request_snapshotted_during_policy_reload_remains_admissible() {
+        let state = state();
+        let snapshot = state.snapshot().unwrap();
+        let handle = DrainHandle {
+            state: Arc::clone(&state),
+        };
+        handle
+            .update_policy(1, HostConfig::default())
+            .await
+            .unwrap();
+        let control = control();
+        let (_active, ()) = admit(&state, usize::MAX, snapshot.id, 1, &control, || Ok(())).unwrap();
     }
 
     #[tokio::test]
