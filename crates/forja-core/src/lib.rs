@@ -35,7 +35,7 @@ pub use paged::{
 };
 pub use paged_pool::{
     CowPageCopy, PagePool, PagePoolError, PagedMemoryUsage, PagedSequence, PagedSlot,
-    PagedSlotBanks, SequenceCheckpoint,
+    PagedSlotBanks, SequenceCheckpoint, paged_slab_bytes,
 };
 pub use quantized::{QuantizedMatrix, QuantizedMatrixError, QuantizedMatrixPart};
 pub use symbolic::{

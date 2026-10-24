@@ -1,6 +1,6 @@
 use std::{error::Error, fs};
 
-use forja_config::{BackendKind, Engine, Profile};
+use forja_config::{BackendKind, Choice, Engine, Profile};
 use forja_core::Backend;
 use forja_host::EngineRunner;
 use golden_fixtures::sha256_file;
@@ -30,9 +30,10 @@ pub(crate) async fn run(options: &Serve) -> Result<(), Box<dyn Error>> {
     let load_config = engine_load_config(&config.model.engine, &Engine::default())?;
     match config.backend.kind {
         BackendKind::Cpu => {
+            let host_limits = page_pool_limit(limits(&config.limits)?, config);
             serve_backend(
                 forja_cpu::CpuBackend::new(),
-                limits(&config.limits)?,
+                host_limits,
                 options,
                 &embedded,
                 &load_config,
@@ -48,12 +49,25 @@ pub(crate) async fn run(options: &Serve) -> Result<(), Box<dyn Error>> {
                     config.backend.metal.pool_capacity,
                     &config.limits,
                 )?;
-                let host_limits = crate::engine::limits_for_live_bytes(&config.limits, live_bytes)?;
+                let host_limits = page_pool_limit(
+                    crate::engine::limits_for_live_bytes(&config.limits, live_bytes)?,
+                    config,
+                );
                 serve_backend(backend, host_limits, options, &embedded, &load_config).await
             }
             #[cfg(not(target_os = "macos"))]
             Err("the Metal backend requires macOS".into())
         }
+    }
+}
+
+fn page_pool_limit(
+    limits: forja_host::Limits,
+    config: &forja_config::HostConfig,
+) -> forja_host::Limits {
+    match config.serving.page_pool_bytes {
+        Choice::Auto => limits,
+        Choice::Fixed(bytes) => limits.with_page_pool_limit(bytes.get()),
     }
 }
 

@@ -1357,8 +1357,17 @@ where
         let layout = PagedLayout::new(serving.page_tokens, planes)
             .map_err(|error| compute::Error::Layout(error.to_string()))?;
         let pages_per_sequence = serving.max_context.div_ceil(serving.page_tokens);
-        let physical_pages = paged_backing_pages(pages_per_sequence, serving.active_lanes)?;
-        let pool = PagePool::new_fixed(layout, physical_pages, self.store.data().limits.live_bytes)
+        let declared_pages = paged_backing_pages(pages_per_sequence, serving.active_lanes)?;
+        let byte_limit = self
+            .store
+            .data()
+            .limits
+            .page_pool_bytes
+            .unwrap_or(self.store.data().limits.live_bytes)
+            .min(self.store.data().limits.live_bytes);
+        let physical_pages =
+            page_pool_pages(&layout, declared_pages, serving.active_lanes, byte_limit)?;
+        let pool = PagePool::new_fixed(layout, physical_pages, byte_limit)
             .map_err(|error| compute::Error::Quota(error.to_string()))?;
         let entry = PagePoolEntry {
             pool,
@@ -2815,6 +2824,7 @@ where
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Limits {
     live_bytes: u64,
+    page_pool_bytes: Option<u64>,
     tensor_rank: usize,
     tensor_elements: u64,
     live_tensor_handles: usize,
@@ -2868,6 +2878,7 @@ impl Limits {
     ) -> Self {
         Self {
             live_bytes: max_live_bytes,
+            page_pool_bytes: None,
             tensor_rank: max_tensor_rank,
             tensor_elements: max_tensor_elements,
             live_tensor_handles: max_live_tensor_handles,
@@ -2883,6 +2894,13 @@ impl Limits {
             submission_timeout: Duration::from_secs(10),
             gpu_time_budget: Duration::MAX,
         }
+    }
+
+    /// Restricts the bytes reserved by host-owned paged storage.
+    #[must_use]
+    pub const fn with_page_pool_limit(mut self, bytes: u64) -> Self {
+        self.page_pool_bytes = Some(bytes);
+        self
     }
 
     /// Overrides command recording limits.
@@ -8791,6 +8809,24 @@ fn paged_backing_pages(table_pages: u32, active_lanes: u32) -> Result<u32, compu
         .ok_or_else(|| compute::Error::Layout("physical page count overflowed".to_owned()))
 }
 
+fn page_pool_pages(
+    layout: &PagedLayout,
+    declared_pages: u32,
+    active_lanes: u32,
+    byte_limit: u64,
+) -> Result<u32, compute::Error> {
+    let page_bytes = forja_core::paged_slab_bytes(layout, 1)
+        .map_err(|error| compute::Error::Layout(error.to_string()))?;
+    let limited = u32::try_from(byte_limit / page_bytes).unwrap_or(u32::MAX);
+    let pages = declared_pages.min(limited);
+    if pages <= active_lanes {
+        return Err(compute::Error::Quota(
+            "serving.page_pool_bytes cannot retain one page per active sequence".to_owned(),
+        ));
+    }
+    Ok(pages)
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::{Duration, Instant};
@@ -8820,7 +8856,7 @@ mod tests {
         SamplingParams, ServingInfo, SubmissionOutcome, TensorEntry,
         bindings::l9o::gpu::{compute, paged_storage},
         core_op, core_program, expected_layer_outputs, is_paged_bank_in_flight,
-        is_paged_lane_release_required, paged_backing_pages, validate_batch_lanes,
+        is_paged_lane_release_required, page_pool_pages, paged_backing_pages, validate_batch_lanes,
         validate_batch_output_layouts, validate_batch_select_lanes, validate_batch_shapes,
     };
 
@@ -8841,6 +8877,28 @@ mod tests {
     fn paged_backing_reserves_one_copy_on_write_page_per_lane() {
         assert_eq!(paged_backing_pages(512, 8).unwrap(), 520);
         assert!(paged_backing_pages(u32::MAX, 1).is_err());
+    }
+
+    #[test]
+    fn page_pool_byte_limit_lowers_physical_capacity() {
+        let layout = PagedLayout::new(
+            64,
+            vec![PagedPlane {
+                dtype: DType::F32,
+                elements_per_token: 4,
+                alignment: 16,
+                label: "cache".to_owned(),
+            }],
+        )
+        .unwrap();
+        let page_bytes = forja_core::paged_slab_bytes(&layout, 1).unwrap();
+        assert_eq!(
+            page_pool_pages(&layout, 520, 8, page_bytes * 20).unwrap(),
+            20
+        );
+        assert!(PagePool::new_fixed(layout.clone(), 20, page_bytes * 20).is_ok());
+        assert!(PagePool::new_fixed(layout.clone(), 20, page_bytes * 20 - 1).is_err());
+        assert!(page_pool_pages(&layout, 520, 8, page_bytes * 8).is_err());
     }
 
     fn insert_test_pool<B: Backend>(

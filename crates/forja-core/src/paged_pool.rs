@@ -143,7 +143,7 @@ impl PagePool {
         if pages_per_slab == 0 {
             return Err(PagePoolError::EmptySlab);
         }
-        let slab_bytes = slab_bytes(&layout, pages_per_slab)?;
+        let slab_bytes = paged_slab_bytes(&layout, pages_per_slab)?;
         if slab_bytes > byte_limit {
             return Err(PagePoolError::QuotaExceeded);
         }
@@ -1150,7 +1150,12 @@ impl CowPageCopy {
     }
 }
 
-fn slab_bytes(layout: &PagedLayout, pages_per_slab: u32) -> Result<u64, PagePoolError> {
+/// Returns the charged bytes for a slab with the requested number of pages.
+///
+/// # Errors
+///
+/// Returns an error when the byte calculation overflows.
+pub fn paged_slab_bytes(layout: &PagedLayout, pages_per_slab: u32) -> Result<u64, PagePoolError> {
     layout
         .total_page_bytes()
         .checked_add(4)
@@ -1196,7 +1201,7 @@ fn preflight_pages(
         return Err(PagePoolError::QuotaExceeded);
     }
     let slabs = missing.div_ceil(u64::from(pool.inner.pages_per_slab));
-    let growth = slab_bytes(&pool.inner.layout, pool.inner.pages_per_slab)?
+    let growth = paged_slab_bytes(&pool.inner.layout, pool.inner.pages_per_slab)?
         .checked_mul(slabs)
         .ok_or(PagePoolError::ArithmeticOverflow)?;
     let projected = state
@@ -1217,7 +1222,10 @@ fn grow_for(pool: &PagePool, state: &mut PoolState, pages: u64) -> Result<(), Pa
         state.memory.slab_bytes = state
             .memory
             .slab_bytes
-            .checked_add(slab_bytes(&pool.inner.layout, pool.inner.pages_per_slab)?)
+            .checked_add(paged_slab_bytes(
+                &pool.inner.layout,
+                pool.inner.pages_per_slab,
+            )?)
             .ok_or(PagePoolError::ArithmeticOverflow)?;
     }
     Ok(())
