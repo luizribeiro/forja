@@ -89,7 +89,6 @@ impl BatchLane {
         tokenizer: tokenizers::Tokenizer,
         constraint: Option<BatchConstraint>,
     ) -> Self {
-        let _generation = request.generation;
         Self {
             slot,
             pending_token,

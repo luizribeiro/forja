@@ -459,6 +459,14 @@ pub struct ServingEngine<B: Backend + Send + Sync + 'static> {
     batch_test_barrier: Option<Arc<BatchTestBarrier>>,
 }
 
+impl<B: Backend + Send + Sync + 'static> ServingEngine<B> {
+    pub(crate) fn wait_for_quiescence(
+        &self,
+    ) -> impl Future<Output = Result<(), forja_core::BackendError>> + Send + 'static {
+        self.runner.wait_for_queued_submissions()
+    }
+}
+
 #[cfg(test)]
 pub(crate) struct BatchTestBarrier {
     armed: AtomicBool,

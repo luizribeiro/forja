@@ -2652,9 +2652,11 @@ where
     /// # Errors
     ///
     /// Returns a timeout if completion accounting does not advance within the backend deadline.
-    pub async fn wait_for_queued_submissions(&self) -> Result<(), BackendError> {
+    pub fn wait_for_queued_submissions(
+        &self,
+    ) -> impl Future<Output = Result<(), BackendError>> + Send + 'static {
         let expected = self.store.data().queued_submissions.load(Ordering::Acquire);
-        self.wait_for_submissions(expected).await
+        self.wait_for_submissions(expected)
     }
 
     /// Enables or disables detailed profiling for subsequent steps.

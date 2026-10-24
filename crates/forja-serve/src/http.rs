@@ -80,6 +80,13 @@ pub trait ChatService: Send + 'static {
         Ok(())
     }
 
+    /// Waits until the service has no submitted backend work.
+    fn quiesce(
+        &mut self,
+    ) -> Pin<Box<dyn Future<Output = Result<(), GenerationError>> + Send + '_>> {
+        Box::pin(async { Ok(()) })
+    }
+
     /// Runs the bounded command mailbox owned by the HTTP transport.
     #[doc(hidden)]
     fn run(
@@ -180,6 +187,17 @@ where
         self.update_policy(generation, config)
     }
 
+    fn quiesce(
+        &mut self,
+    ) -> Pin<Box<dyn Future<Output = Result<(), GenerationError>> + Send + '_>> {
+        let quiescence = self.wait_for_quiescence();
+        Box::pin(async move {
+            quiescence
+                .await
+                .map_err(|error| GenerationError::unavailable(error.to_string()))
+        })
+    }
+
     fn complete(
         &mut self,
         request: ChatCompletionRequest,
@@ -236,6 +254,9 @@ pub enum ServiceCommand {
         config: Box<HostConfig>,
         reply: oneshot::Sender<Result<(), GenerationError>>,
     },
+    Quiesce {
+        reply: oneshot::Sender<Result<(), GenerationError>>,
+    },
     Chat {
         policy: AdmissionPolicy,
         request: ChatCompletionRequest,
@@ -271,14 +292,13 @@ pub enum ServiceCommand {
 #[derive(Clone)]
 #[doc(hidden)]
 pub struct AdmissionPolicy {
-    pub(crate) generation: u64,
     pub(crate) config: Arc<HostConfig>,
 }
 
 impl ServiceCommand {
     pub(crate) fn queued(&self) -> std::time::Instant {
         match self {
-            Self::UpdatePolicy { .. } => std::time::Instant::now(),
+            Self::UpdatePolicy { .. } | Self::Quiesce { .. } => std::time::Instant::now(),
             Self::Chat { queued, .. }
             | Self::Text { queued, .. }
             | Self::StreamChat { queued, .. }
@@ -448,6 +468,15 @@ impl<S: ChatService> ServiceActor<S> {
             .map_err(|_| GenerationError::unavailable("serving scheduler stopped"))?
     }
 
+    async fn quiesce(&self) -> Result<(), GenerationError> {
+        let (reply, receiver) = oneshot::channel();
+        self.send(ServiceCommand::Quiesce { reply })
+            .map_err(|_| GenerationError::unavailable("serving scheduler stopped"))?;
+        receiver
+            .await
+            .map_err(|_| GenerationError::unavailable("serving scheduler stopped"))?
+    }
+
     fn metrics(&self) -> ServingMetrics {
         self.metrics
             .lock()
@@ -458,7 +487,6 @@ impl<S: ChatService> ServiceActor<S> {
 #[cfg(test)]
 fn test_policy() -> AdmissionPolicy {
     AdmissionPolicy {
-        generation: 0,
         config: Arc::new(HostConfig::default()),
     }
 }
@@ -476,6 +504,10 @@ async fn run_serial<S: ChatService>(
         } = command
         {
             drop(reply.send(service.update_policy(generation, *config)));
+            continue;
+        }
+        if let ServiceCommand::Quiesce { reply } = command {
+            drop(reply.send(service.quiesce().await));
             continue;
         }
         let queued = command.queued().elapsed();
@@ -514,6 +546,9 @@ async fn run_serial<S: ChatService>(
             ServiceCommand::UpdatePolicy { .. } => {
                 unreachable!("policy updates return before request dispatch")
             }
+            ServiceCommand::Quiesce { .. } => {
+                unreachable!("quiescence barriers return before request dispatch")
+            }
         }
         if let Ok(mut snapshot) = metrics.lock() {
             *snapshot = service.metrics();
@@ -547,6 +582,7 @@ pub fn serving_router<S: ChatService>(service: S) -> (Router, DrainHandle<S>) {
         draining: std::sync::atomic::AtomicBool::new(false),
         ready: std::sync::atomic::AtomicBool::new(true),
         closed: std::sync::atomic::AtomicBool::new(false),
+        admission: StdMutex::new(()),
         active: StdMutex::new(BTreeMap::new()),
         drained: tokio::sync::Notify::new(),
     });
@@ -585,6 +621,7 @@ struct HttpState<S> {
     draining: std::sync::atomic::AtomicBool,
     ready: std::sync::atomic::AtomicBool,
     closed: std::sync::atomic::AtomicBool,
+    admission: StdMutex<()>,
     active: StdMutex<BTreeMap<u64, ActiveRequest>>,
     drained: tokio::sync::Notify,
 }
@@ -596,6 +633,7 @@ struct ActiveRequest {
 
 struct PublishedGeneration<S> {
     id: u64,
+    config_generation: u64,
     model: String,
     max_body_bytes: usize,
     declared_active_sequences: u32,
@@ -609,6 +647,10 @@ struct PublishedGeneration<S> {
 
 impl<S: ChatService> PublishedGeneration<S> {
     fn new(id: u64, service: S) -> Self {
+        Self::with_config_generation(id, id, service)
+    }
+
+    fn with_config_generation(runtime_id: u64, config_generation: u64, service: S) -> Self {
         let model = service.model().to_owned();
         let max_body_bytes = service.max_body_bytes();
         let declared_active_sequences = service.declared_active_sequences();
@@ -619,7 +661,8 @@ impl<S: ChatService> PublishedGeneration<S> {
         let queue_capacity = tokio::sync::Semaphore::MAX_PERMITS;
         let (service, finalizer) = ServiceActor::spawn_tracked(service, queue_capacity);
         Self {
-            id,
+            id: runtime_id,
+            config_generation,
             model,
             max_body_bytes,
             declared_active_sequences,
@@ -635,6 +678,7 @@ impl<S: ChatService> PublishedGeneration<S> {
     fn snapshot(&self) -> GenerationSnapshot<S> {
         GenerationSnapshot {
             id: self.id,
+            config_generation: self.config_generation,
             model: self.model.clone(),
             max_body_bytes: self.max_body_bytes,
             admission_capacity: admission_capacity(self.declared_active_sequences, &self.config),
@@ -643,7 +687,6 @@ impl<S: ChatService> PublishedGeneration<S> {
             write_stall_timeout: self.write_stall_timeout,
             service: self.service.clone(),
             policy: AdmissionPolicy {
-                generation: self.id,
                 config: Arc::clone(&self.config),
             },
         }
@@ -652,6 +695,7 @@ impl<S: ChatService> PublishedGeneration<S> {
 
 struct GenerationSnapshot<S> {
     id: u64,
+    config_generation: u64,
     model: String,
     max_body_bytes: usize,
     admission_capacity: usize,
@@ -741,6 +785,7 @@ impl<S> DrainHandle<S> {
 
     /// Permanently closes admission without cancelling active requests.
     pub fn close_admission(&self) {
+        let _admission = self.state.admission.lock();
         self.state.closed.store(true, Ordering::Release);
         self.state.ready.store(false, Ordering::Release);
         self.state.draining.store(true, Ordering::Release);
@@ -772,6 +817,7 @@ impl<S> DrainHandle<S> {
 impl<S: ChatService> DrainHandle<S> {
     /// Makes admission return service-unavailable responses.
     pub fn set_ready(&self, ready: bool) {
+        let _admission = self.state.admission.lock();
         if !self.state.closed.load(Ordering::Acquire) {
             self.state.ready.store(ready, Ordering::Release);
             if ready {
@@ -791,7 +837,27 @@ impl<S: ChatService> DrainHandle<S> {
     ///
     /// Returns an error when the runtime lock is poisoned.
     pub fn publish(&self, generation: u64, service: S) -> Result<(), &'static str> {
-        let next = PublishedGeneration::new(generation, service);
+        self.publish_runtime(generation, generation, service)
+    }
+
+    /// Publishes a runtime identity and its current configuration generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the runtime lock is poisoned.
+    pub fn publish_runtime(
+        &self,
+        runtime_id: u64,
+        config_generation: u64,
+        service: S,
+    ) -> Result<(), &'static str> {
+        let next =
+            PublishedGeneration::with_config_generation(runtime_id, config_generation, service);
+        let _admission = self
+            .state
+            .admission
+            .lock()
+            .map_err(|_| "admission failed")?;
         let mut active = self
             .state
             .generation
@@ -800,7 +866,7 @@ impl<S: ChatService> DrainHandle<S> {
         *active = Some(next);
         self.state
             .config_generation
-            .store(generation, Ordering::Release);
+            .store(config_generation, Ordering::Release);
         Ok(())
     }
 
@@ -884,7 +950,7 @@ impl<S: ChatService> DrainHandle<S> {
                 "runtime changed during policy update",
             ));
         }
-        published.id = generation;
+        published.config_generation = generation;
         published.max_body_bytes =
             usize::try_from(config.request.max_body_bytes.get()).unwrap_or(usize::MAX);
         published.body_read_timeout = config.server.body_read_timeout.get();
@@ -897,10 +963,33 @@ impl<S: ChatService> DrainHandle<S> {
         Ok(())
     }
 
-    /// Waits for one generation, cancelling its remaining controls at the deadline.
-    pub async fn drain_generation(&self, generation: u64, deadline: Duration) {
-        self.set_ready(false);
-        self.state.draining.store(true, Ordering::Release);
+    /// Waits for one runtime, cancelling its remaining controls at the deadline.
+    pub async fn drain_generation(&self, runtime_id: u64, deadline: Duration) {
+        let _ = self.try_drain_generation(runtime_id, deadline).await;
+    }
+
+    /// Waits for one runtime and reports a failed quiescence barrier.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the runtime cannot acknowledge backend quiescence.
+    pub async fn try_drain_generation(
+        &self,
+        runtime_id: u64,
+        deadline: Duration,
+    ) -> Result<(), GenerationError> {
+        let service = {
+            let _admission = self.state.admission.lock();
+            self.state.ready.store(false, Ordering::Release);
+            self.state.draining.store(true, Ordering::Release);
+            self.state
+                .snapshot()
+                .ok()
+                .filter(|runtime| runtime.id == runtime_id)
+                .map(|runtime| runtime.service)
+        };
+        let quiescence =
+            service.map(|service| tokio::spawn(async move { service.quiesce().await }));
         let expired = tokio::time::sleep(deadline);
         tokio::pin!(expired);
         loop {
@@ -908,12 +997,11 @@ impl<S: ChatService> DrainHandle<S> {
             let remaining = self.state.active.lock().map_or(0, |active| {
                 active
                     .values()
-                    .filter(|request| request.generation == generation)
+                    .filter(|request| request.generation == runtime_id)
                     .count()
             });
             if remaining == 0 {
-                self.state.draining.store(false, Ordering::Release);
-                return;
+                break;
             }
             tokio::select! {
                 () = &mut expired => break,
@@ -923,7 +1011,7 @@ impl<S: ChatService> DrainHandle<S> {
         if let Ok(active) = self.state.active.lock() {
             for request in active
                 .values()
-                .filter(|request| request.generation == generation)
+                .filter(|request| request.generation == runtime_id)
             {
                 request.control.cancel();
             }
@@ -933,14 +1021,20 @@ impl<S: ChatService> DrainHandle<S> {
             let done = self.state.active.lock().map_or(true, |active| {
                 active
                     .values()
-                    .all(|request| request.generation != generation)
+                    .all(|request| request.generation != runtime_id)
             });
             if done {
-                self.state.draining.store(false, Ordering::Release);
-                return;
+                break;
             }
             notified.await;
         }
+        if let Some(quiescence) = quiescence {
+            quiescence
+                .await
+                .map_err(|_| GenerationError::unavailable("quiescence task stopped"))??;
+        }
+        self.state.draining.store(false, Ordering::Release);
+        Ok(())
     }
 }
 
@@ -1046,7 +1140,7 @@ async fn chat<S: ChatService>(
         }
     };
     log_completion(
-        runtime.id,
+        runtime.config_generation,
         request_id,
         "/v1/chat/completions",
         &model,
@@ -1134,7 +1228,7 @@ async fn text<S: ChatService>(
         }
     };
     log_completion(
-        runtime.id,
+        runtime.config_generation,
         request_id,
         "/v1/completions",
         &model,
@@ -1543,7 +1637,7 @@ mod tests {
         fs,
         io::Write,
         path::PathBuf,
-        sync::atomic::{AtomicU64, Ordering as AtomicOrdering},
+        sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering},
         time::{SystemTime, UNIX_EPOCH},
     };
 
@@ -1555,6 +1649,12 @@ mod tests {
     use crate::{FinishReason, Usage};
 
     struct Smoke;
+
+    struct CancelSmoke {
+        started: Arc<tokio::sync::Notify>,
+        cancelled: Arc<AtomicBool>,
+        quiesced: Arc<AtomicBool>,
+    }
 
     impl ChatService for Smoke {
         fn model(&self) -> &'static str {
@@ -1659,6 +1759,80 @@ mod tests {
                 sender.send(GenerationEvent::Done).await.unwrap();
                 Ok(())
             })
+        }
+    }
+
+    impl ChatService for CancelSmoke {
+        fn model(&self) -> &'static str {
+            "smoke"
+        }
+
+        fn max_body_bytes(&self) -> usize {
+            1024
+        }
+
+        fn queue_length(&self) -> u32 {
+            1
+        }
+
+        fn request_deadline(&self) -> Duration {
+            Duration::from_secs(1)
+        }
+
+        fn write_stall_timeout(&self) -> Duration {
+            Duration::from_secs(1)
+        }
+
+        fn complete(
+            &mut self,
+            _: ChatCompletionRequest,
+            control: GenerationControl,
+        ) -> Pin<Box<dyn Future<Output = Result<Completion, GenerationError>> + Send + '_>>
+        {
+            let started = Arc::clone(&self.started);
+            let cancelled = Arc::clone(&self.cancelled);
+            Box::pin(async move {
+                started.notify_one();
+                while !control.is_cancelled() {
+                    tokio::task::yield_now().await;
+                }
+                cancelled.store(true, AtomicOrdering::Release);
+                Err(GenerationError::unavailable("cancelled"))
+            })
+        }
+
+        fn complete_text(
+            &mut self,
+            _: CompletionRequest,
+            control: GenerationControl,
+        ) -> Pin<Box<dyn Future<Output = Result<Completion, GenerationError>> + Send + '_>>
+        {
+            self.complete(chat_request(), control)
+        }
+
+        fn stream_chat(
+            &mut self,
+            _: ChatCompletionRequest,
+            _: mpsc::Sender<GenerationEvent>,
+            _: GenerationControl,
+        ) -> Pin<Box<dyn Future<Output = Result<(), GenerationError>> + Send + '_>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn stream_text(
+            &mut self,
+            _: CompletionRequest,
+            _: mpsc::Sender<GenerationEvent>,
+            _: GenerationControl,
+        ) -> Pin<Box<dyn Future<Output = Result<(), GenerationError>> + Send + '_>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn quiesce(
+            &mut self,
+        ) -> Pin<Box<dyn Future<Output = Result<(), GenerationError>> + Send + '_>> {
+            self.quiesced.store(true, AtomicOrdering::Release);
+            Box::pin(async { Ok(()) })
         }
     }
 
@@ -2120,7 +2294,17 @@ mod tests {
         config.server.body_read_timeout = forja_config::Duration::from_secs(5);
         config.server.queue_length = 0;
         handle.update_policy(8, config.clone()).await.unwrap();
-        assert_eq!(state.generation.read().unwrap().as_ref().unwrap().id, 8);
+        assert_eq!(state.snapshot().unwrap().id, 0);
+        assert_eq!(
+            state
+                .generation
+                .read()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .config_generation,
+            8
+        );
         assert_eq!(
             state.generation.read().unwrap().as_ref().unwrap().deadline,
             Duration::from_secs(9)
@@ -2133,7 +2317,50 @@ mod tests {
 
         config.server.queue_length = 99;
         assert!(handle.update_policy(9, config).await.is_err());
-        assert_eq!(state.generation.read().unwrap().as_ref().unwrap().id, 8);
+        assert_eq!(
+            state
+                .generation
+                .read()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .config_generation,
+            8
+        );
+    }
+
+    #[tokio::test]
+    async fn live_policy_then_model_drain_cancels_and_quiesces_the_runtime() {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let quiesced = Arc::new(AtomicBool::new(false));
+        let state = test_state(CancelSmoke {
+            started: Arc::clone(&started),
+            cancelled: Arc::clone(&cancelled),
+            quiesced: Arc::clone(&quiesced),
+        });
+        let handle = DrainHandle {
+            state: Arc::clone(&state),
+        };
+        handle
+            .update_policy(1, HostConfig::default())
+            .await
+            .unwrap();
+        let response = tokio::spawn(chat::<CancelSmoke>(
+            State(Arc::clone(&state)),
+            request(br#"{"model":"smoke","messages":[]}"#),
+        ));
+        started.notified().await;
+        handle
+            .try_drain_generation(0, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(
+            response.await.unwrap().status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert!(cancelled.load(AtomicOrdering::Acquire));
+        assert!(quiesced.load(AtomicOrdering::Acquire));
     }
 
     #[tokio::test]
@@ -2174,6 +2401,7 @@ mod tests {
             draining: std::sync::atomic::AtomicBool::new(false),
             ready: std::sync::atomic::AtomicBool::new(true),
             closed: std::sync::atomic::AtomicBool::new(false),
+            admission: StdMutex::new(()),
             active: StdMutex::new(BTreeMap::new()),
             drained: tokio::sync::Notify::new(),
         })

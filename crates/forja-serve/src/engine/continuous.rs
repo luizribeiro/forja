@@ -58,8 +58,15 @@ impl CompletionSink {
     }
 }
 
+fn reject_control_command(
+    reply: oneshot::Sender<Result<(), GenerationError>>,
+    message: &'static str,
+) -> Option<PreparedRequest> {
+    drop(reply.send(Err(GenerationError::new(message))));
+    None
+}
+
 struct PreparedRequest {
-    generation: u64,
     prefix_reuse: bool,
     tokens: Vec<u32>,
     prompt_tokens: u32,
@@ -81,7 +88,6 @@ impl PreparedRequest {
         B: Backend + Send + Sync + 'static,
     {
         let Self {
-            generation: _,
             prefix_reuse: _,
             tokens,
             prompt_tokens,
@@ -110,6 +116,9 @@ enum RequestEnvelope {
     UpdatePolicy {
         generation: u64,
         config: Box<forja_config::HostConfig>,
+        reply: oneshot::Sender<Result<(), GenerationError>>,
+    },
+    Quiesce {
         reply: oneshot::Sender<Result<(), GenerationError>>,
     },
     Chat {
@@ -156,6 +165,7 @@ impl RequestEnvelope {
                 config,
                 reply,
             },
+            ServiceCommand::Quiesce { reply } => Self::Quiesce { reply },
             ServiceCommand::Chat {
                 policy,
                 request,
@@ -217,7 +227,7 @@ impl RequestEnvelope {
 
     fn queued(&self) -> Instant {
         match self {
-            Self::UpdatePolicy { .. } => Instant::now(),
+            Self::UpdatePolicy { .. } | Self::Quiesce { .. } => Instant::now(),
             Self::Chat { queued, .. }
             | Self::Text { queued, .. }
             | Self::StreamChat { queued, .. }
@@ -226,7 +236,7 @@ impl RequestEnvelope {
     }
 
     fn requires_serial_path(&self) -> bool {
-        matches!(self, Self::UpdatePolicy { .. })
+        matches!(self, Self::UpdatePolicy { .. } | Self::Quiesce { .. })
             || matches!(
                 self,
                 Self::Chat { request, .. } | Self::StreamChat { request, .. }
@@ -242,6 +252,10 @@ impl RequestEnvelope {
             )
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one match preserves ownership across every request and control envelope"
+    )]
     async fn prepare<B>(self, engine: &mut ServingEngine<B>) -> Option<PreparedRequest>
     where
         B: Backend + Send + Sync + 'static,
@@ -249,10 +263,13 @@ impl RequestEnvelope {
         let started = Instant::now();
         let (prepared, request_params, control, sink, policy) = match self {
             Self::UpdatePolicy { reply, .. } => {
-                drop(reply.send(Err(GenerationError::new(
-                    "policy update reached request preparation",
-                ))));
-                return None;
+                return reject_control_command(reply, "policy update reached request preparation");
+            }
+            Self::Quiesce { reply } => {
+                return reject_control_command(
+                    reply,
+                    "quiescence barrier reached request preparation",
+                );
             }
             Self::Chat {
                 policy,
@@ -327,7 +344,6 @@ impl RequestEnvelope {
         };
         match prepared {
             Ok((tokens, prompt_tokens, params, constraint)) => Some(PreparedRequest {
-                generation: policy.generation,
                 prefix_reuse: policy.config.serving.prefix_reuse,
                 tokens,
                 prompt_tokens,
@@ -419,6 +435,20 @@ where
                     continue;
                 };
                 drop(reply.send(self.update_policy(generation, *config)));
+                continue;
+            }
+            if matches!(pending.front(), Some(RequestEnvelope::Quiesce { .. })) {
+                let Some(RequestEnvelope::Quiesce { reply }) = pending.pop_front() else {
+                    continue;
+                };
+                let quiescence = self.wait_for_quiescence();
+                drop(
+                    reply.send(
+                        quiescence
+                            .await
+                            .map_err(|error| GenerationError::unavailable(error.to_string())),
+                    ),
+                );
                 continue;
             }
             let scheduled = Instant::now();
