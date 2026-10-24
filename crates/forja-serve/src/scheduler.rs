@@ -18,6 +18,7 @@ pub(crate) struct SchedulerPolicy {
     prompt: BTreeMap<RequestId, u32>,
     buckets: Vec<u32>,
     active_limit: usize,
+    prefill_limit: usize,
     prompt_budget: u32,
     active: usize,
 }
@@ -25,6 +26,7 @@ impl SchedulerPolicy {
     pub(crate) fn new(
         mut buckets: Vec<u32>,
         active_limit: usize,
+        prefill_limit: usize,
         prompt_budget: u32,
     ) -> Result<Self, &'static str> {
         buckets.sort_unstable();
@@ -38,14 +40,15 @@ impl SchedulerPolicy {
         {
             return Err("decode buckets must span the active-lane ceiling");
         }
-        if prompt_budget == 0 {
-            return Err("prompt budget must be positive");
+        if prefill_limit == 0 || prompt_budget == 0 {
+            return Err("prefill limits must be positive");
         }
         Ok(Self {
             queue: VecDeque::new(),
             prompt: BTreeMap::new(),
             buckets,
             active_limit,
+            prefill_limit,
             prompt_budget,
             active: 0,
         })
@@ -135,6 +138,9 @@ impl SchedulerPolicy {
         let ids = self.prompt.keys().copied().collect::<Vec<_>>();
         let mut batch = Vec::new();
         for id in ids {
+            if batch.len() == self.prefill_limit {
+                break;
+            }
             let Some(tokens) = self.prompt.get(&id).copied() else {
                 continue;
             };
@@ -160,7 +166,7 @@ mod tests {
 
     #[test]
     fn admits_fifo_with_bounded_smaller_request_bypass() {
-        let mut policy = SchedulerPolicy::new(vec![1, 2, 4, 8], 8, 2_048).unwrap();
+        let mut policy = SchedulerPolicy::new(vec![1, 2, 4, 8], 8, 8, 2_048).unwrap();
         policy.enqueue(Admission {
             id: RequestId(1),
             reserved_tokens: 4_096,
@@ -193,19 +199,16 @@ mod tests {
 
     #[test]
     fn caps_prompt_work_and_selects_decode_buckets() {
-        let mut policy = SchedulerPolicy::new(vec![1, 2, 4, 8], 8, 2_048).unwrap();
+        let mut policy = SchedulerPolicy::new(vec![1, 2, 4, 8], 8, 1, 2_048).unwrap();
         policy.ready_prompt(RequestId(7), 2_000);
         policy.ready_prompt(RequestId(8), 1_000);
-        assert_eq!(
-            policy.prompt_batch(),
-            [(RequestId(7), 2_000), (RequestId(8), 48)]
-        );
+        assert_eq!(policy.prompt_batch(), [(RequestId(7), 2_000)]);
         assert_eq!(policy.decode_bucket([0, 2]), Some(4));
     }
 
     #[test]
     fn transient_admission_retry_keeps_the_request_at_the_head() {
-        let mut policy = SchedulerPolicy::new(vec![1, 2], 2, 16).unwrap();
+        let mut policy = SchedulerPolicy::new(vec![1, 2], 2, 2, 16).unwrap();
         let first = Admission {
             id: RequestId(1),
             reserved_tokens: 8,

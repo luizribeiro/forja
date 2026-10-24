@@ -70,6 +70,7 @@ where
         let Ok(mut policy) = SchedulerPolicy::new(
             self.scheduler.decode_buckets.clone(),
             usize::try_from(self.scheduler.active_lanes).unwrap_or(usize::MAX),
+            usize::try_from(self.scheduler.max_prefill_chunks).unwrap_or(usize::MAX),
             self.scheduler.prompt_token_budget,
         ) else {
             return;

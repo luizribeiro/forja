@@ -601,8 +601,10 @@ impl BatchTestBarrier {
     }
 }
 
+#[derive(Debug)]
 struct SchedulerConfig {
     active_lanes: u32,
+    max_prefill_chunks: u32,
     prompt_token_budget: u32,
     decode_buckets: Vec<u32>,
 }
@@ -616,6 +618,7 @@ impl SchedulerConfig {
         let Some(serving) = info.serving.as_ref() else {
             return Ok(Self {
                 active_lanes: 1,
+                max_prefill_chunks: 1,
                 prompt_token_budget: 1,
                 decode_buckets: vec![1],
             });
@@ -625,22 +628,27 @@ impl SchedulerConfig {
                 "profile prompt budget must be positive",
             ));
         }
-        let configured_active = match config.serving.max_active_sequences {
-            Choice::Auto => serving.active_lanes,
-            Choice::Fixed(value) => value.get(),
-        };
-        let configured_batch = match config.serving.max_batch_size {
-            Choice::Auto => serving.active_lanes,
-            Choice::Fixed(value) => value.get(),
-        };
-        let configured_prompt = match config.serving.prompt_token_budget {
-            Choice::Auto => u64::from(profile_budget),
-            Choice::Fixed(value) => value.get(),
-        };
-        let configured_lanes = serving
-            .active_lanes
-            .min(configured_active)
-            .min(configured_batch);
+        let configured_active = resolve_u32_ceiling(
+            config.serving.max_active_sequences,
+            serving.active_lanes,
+            "serving.max_active_sequences",
+        )?;
+        let configured_batch = resolve_u32_ceiling(
+            config.serving.max_batch_size,
+            configured_active,
+            "serving.max_batch_size",
+        )?;
+        let max_prefill_chunks = resolve_u32_ceiling(
+            config.serving.max_prefill_chunks,
+            configured_active,
+            "serving.max_prefill_chunks",
+        )?;
+        let configured_prompt = resolve_u64_ceiling(
+            config.serving.prompt_token_budget,
+            u64::from(profile_budget),
+            "serving.prompt_token_budget",
+        )?;
+        let configured_lanes = configured_active.min(configured_batch);
         let declared_buckets = serving
             .batch_shapes
             .iter()
@@ -657,16 +665,83 @@ impl SchedulerConfig {
             crate::scheduler::SchedulerPolicy::new(
                 decode_buckets.clone(),
                 usize::try_from(active_lanes).unwrap_or(usize::MAX),
+                usize::try_from(max_prefill_chunks).unwrap_or(usize::MAX),
                 prompt_token_budget,
             )
             .map_err(GenerationError::new)?;
         }
         Ok(Self {
             active_lanes,
+            max_prefill_chunks,
             prompt_token_budget,
             decode_buckets,
         })
     }
+}
+
+fn resolve_u32_ceiling(
+    configured: Choice<std::num::NonZeroU32>,
+    declared: u32,
+    field: &str,
+) -> Result<u32, GenerationError> {
+    match configured {
+        Choice::Auto => Ok(declared),
+        Choice::Fixed(value) if value.get() <= declared => Ok(value.get()),
+        Choice::Fixed(_) => Err(GenerationError::new(format!(
+            "{field} exceeds the engine-declared ceiling of {declared}"
+        ))),
+    }
+}
+
+fn resolve_u64_ceiling(
+    configured: Choice<std::num::NonZeroU64>,
+    declared: u64,
+    field: &str,
+) -> Result<u64, GenerationError> {
+    match configured {
+        Choice::Auto => Ok(declared),
+        Choice::Fixed(value) if value.get() <= declared => Ok(value.get()),
+        Choice::Fixed(_) => Err(GenerationError::new(format!(
+            "{field} exceeds the engine-declared ceiling of {declared}"
+        ))),
+    }
+}
+
+fn prefix_limits(
+    serving: &forja_host::ServingInfo,
+    config: &HostConfig,
+) -> Result<PrefixLimits, GenerationError> {
+    let declared_entries = config.server.queue_length.max(serving.active_lanes);
+    let declared_tokens = u64::from(declared_entries)
+        .checked_mul(u64::from(serving.max_context))
+        .ok_or_else(|| GenerationError::new("prefix token limit overflowed"))?;
+    let pages_per_entry = serving.max_context.div_ceil(serving.page_tokens);
+    let declared_pages = declared_entries
+        .checked_mul(pages_per_entry)
+        .ok_or_else(|| GenerationError::new("prefix page limit overflowed"))?;
+    let entries = resolve_u32_ceiling(
+        config.serving.prefix_cache_entries,
+        declared_entries,
+        "serving.prefix_cache_entries",
+    )?;
+    let tokens = resolve_u64_ceiling(
+        config.serving.prefix_cache_tokens,
+        declared_tokens,
+        "serving.prefix_cache_tokens",
+    )?;
+    let pages = resolve_u32_ceiling(
+        config.serving.prefix_cache_pages,
+        declared_pages,
+        "serving.prefix_cache_pages",
+    )?;
+    Ok(PrefixLimits {
+        entries: usize::try_from(entries)
+            .map_err(|_| GenerationError::new("prefix entry limit overflowed"))?,
+        tokens: usize::try_from(tokens)
+            .map_err(|_| GenerationError::new("prefix token limit overflowed"))?,
+        referenced_pages: usize::try_from(pages)
+            .map_err(|_| GenerationError::new("prefix page limit overflowed"))?,
+    })
 }
 
 fn scheduler_decode_buckets(mut buckets: Vec<u32>, configured_lanes: u32) -> (u32, Vec<u32>) {
@@ -730,22 +805,8 @@ where
             .serving
             .as_ref()
             .map(|serving| {
-                let entries = usize::try_from(config.server.queue_length.max(serving.active_lanes))
-                    .map_err(|_| GenerationError::new("prefix entry limit overflowed"))?;
-                let context = usize::try_from(serving.max_context)
-                    .map_err(|_| GenerationError::new("prefix token limit overflowed"))?;
-                let pages = usize::try_from(serving.max_context.div_ceil(serving.page_tokens))
-                    .map_err(|_| GenerationError::new("prefix page limit overflowed"))?;
-                PrefixIndex::new(PrefixLimits {
-                    entries,
-                    tokens: entries
-                        .checked_mul(context)
-                        .ok_or_else(|| GenerationError::new("prefix token limit overflowed"))?,
-                    referenced_pages: entries
-                        .checked_mul(pages)
-                        .ok_or_else(|| GenerationError::new("prefix page limit overflowed"))?,
-                })
-                .map_err(|error| GenerationError::new(error.to_string()))
+                let limits = prefix_limits(serving, &config)?;
+                PrefixIndex::new(limits).map_err(|error| GenerationError::new(error.to_string()))
             })
             .transpose()?;
         let scheduler = SchedulerConfig::resolve(&info, &config, profile_prompt_budget)?;
@@ -2336,6 +2397,24 @@ fn random_seed() -> Result<u64, GenerationError> {
 mod tests {
     use super::*;
 
+    fn serving_info() -> forja_host::ServingInfo {
+        forja_host::ServingInfo {
+            page_tokens: 64,
+            planes: Vec::new(),
+            active_lanes: 8,
+            max_context: 4_096,
+            batch_shapes: [1, 2, 4, 8]
+                .into_iter()
+                .map(|bucket| forja_host::BatchShape {
+                    phase: forja_host::BatchPhase::Decode,
+                    bucket,
+                    tokens: 1,
+                    selection: forja_host::BatchSelection::Combined,
+                })
+                .collect(),
+        }
+    }
+
     #[test]
     fn scheduler_caps_active_lanes_to_declared_decode_buckets() {
         assert_eq!(scheduler_decode_buckets(Vec::new(), 1), (1, Vec::new()));
@@ -2347,6 +2426,60 @@ mod tests {
         assert_eq!(
             scheduler_decode_buckets(vec![1, 2, 4, 8], 3),
             (3, vec![1, 2, 4])
+        );
+    }
+
+    #[test]
+    fn explicit_scheduler_limits_must_lower_engine_limits() {
+        let info = EngineInfo {
+            vocab: 1,
+            max_context: 4_096,
+            tap_layers: Vec::new(),
+            router_layers: Vec::new(),
+            serving: Some(serving_info()),
+        };
+        let mut config = HostConfig::default();
+        config.serving.max_active_sequences = Choice::Fixed(std::num::NonZeroU32::new(4).unwrap());
+        config.serving.max_batch_size = Choice::Fixed(std::num::NonZeroU32::new(2).unwrap());
+        config.serving.max_prefill_chunks = Choice::Fixed(std::num::NonZeroU32::new(1).unwrap());
+        config.serving.prompt_token_budget = Choice::Fixed(std::num::NonZeroU64::new(64).unwrap());
+        let resolved = SchedulerConfig::resolve(&info, &config, 128).unwrap();
+        assert_eq!(resolved.active_lanes, 2);
+        assert_eq!(resolved.max_prefill_chunks, 1);
+        assert_eq!(resolved.prompt_token_budget, 64);
+
+        config.serving.max_active_sequences = Choice::Fixed(std::num::NonZeroU32::new(9).unwrap());
+        assert!(
+            SchedulerConfig::resolve(&info, &config, 128)
+                .unwrap_err()
+                .to_string()
+                .contains("serving.max_active_sequences")
+        );
+    }
+
+    #[test]
+    fn explicit_prefix_limits_bound_the_derived_index() {
+        let mut config = HostConfig::default();
+        config.server.queue_length = 16;
+        config.serving.prefix_cache_entries = Choice::Fixed(std::num::NonZeroU32::new(3).unwrap());
+        config.serving.prefix_cache_tokens =
+            Choice::Fixed(std::num::NonZeroU64::new(1_000).unwrap());
+        config.serving.prefix_cache_pages = Choice::Fixed(std::num::NonZeroU32::new(20).unwrap());
+        assert_eq!(
+            prefix_limits(&serving_info(), &config).unwrap(),
+            PrefixLimits {
+                entries: 3,
+                tokens: 1_000,
+                referenced_pages: 20,
+            }
+        );
+
+        config.serving.prefix_cache_entries = Choice::Fixed(std::num::NonZeroU32::new(17).unwrap());
+        assert!(
+            prefix_limits(&serving_info(), &config)
+                .unwrap_err()
+                .to_string()
+                .contains("serving.prefix_cache_entries")
         );
     }
 
