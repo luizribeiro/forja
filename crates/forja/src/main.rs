@@ -16,6 +16,7 @@ mod resolution;
 mod serve;
 #[cfg(test)]
 mod serve_benchmark;
+mod supervisor;
 mod verify;
 
 use std::{error::Error, process::ExitCode};
