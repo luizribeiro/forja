@@ -54,6 +54,26 @@ class OpenAIClient:
         """Execute one concrete completion and retain only timings and counts."""
         body = request_body(case, self.model)
         route = "/v1/chat/completions" if case["route"] == "chat" else "/v1/completions"
+        return self._request(route, body, case.get("cancel_after_tokens", 0))
+
+    def chat(self, messages: list[dict[str, object]], output_tokens: int) -> dict[str, object]:
+        """Execute one streaming greedy chat request with an explicit history."""
+        body = {
+            "model": self.model,
+            "messages": messages,
+            "max_tokens": output_tokens,
+            "stream": True,
+            "stream_options": {"include_usage": True},
+            "temperature": 0.0,
+            "top_k": 0,
+            "top_p": 1.0,
+        }
+        return self._request("/v1/chat/completions", body, 0)
+
+    def _request(
+        self, route: str, body: dict[str, object], cancel_after_tokens: int
+    ) -> dict[str, object]:
+        """Send one prepared OpenAI request and collect its timing sample."""
         started = time.perf_counter()
         try:
             connection = self.connection()
@@ -67,8 +87,8 @@ class OpenAIClient:
             if response.status != 200:
                 message = response.read(4096).decode(errors="replace")
                 return failed(started, f"HTTP {response.status}: {message}")
-            if case.get("stream"):
-                return self.read_stream(response, case, started)
+            if body.get("stream"):
+                return self.read_stream(response, cancel_after_tokens, started)
             payload = json.loads(response.read())
             ended = time.perf_counter()
             usage = payload.get("usage", {})
@@ -91,7 +111,7 @@ class OpenAIClient:
     def read_stream(
         self,
         response: http.client.HTTPResponse,
-        case: dict[str, object],
+        cancel_after_tokens: int,
         started: float,
     ) -> dict[str, object]:
         """Read SSE while measuring first-byte and inter-event latency."""
@@ -99,7 +119,7 @@ class OpenAIClient:
         output = []
         usage = {}
         cancelled = False
-        limit = case.get("cancel_after_tokens", 0)
+        limit = cancel_after_tokens
         while line := response.readline():
             if not line.startswith(b"data: "):
                 continue

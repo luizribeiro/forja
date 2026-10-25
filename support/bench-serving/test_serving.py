@@ -123,6 +123,8 @@ def test_http_client_reuses_openai_transport_and_measures_sse() -> None:
         streamed = client.request({**case, "stream": True})
         assert streamed["output_tokens"] == 2
         assert len(streamed["itl_seconds"]) == 1
+        chat = client.chat([{"role": "user", "content": "hello"}], 2)
+        assert chat["output"] == "ab"
         cancelled = client.request({**case, "stream": True, "cancel_after_tokens": 1})
         assert cancelled["cancelled"]
     finally:
