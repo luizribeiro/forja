@@ -167,6 +167,7 @@ pub(crate) struct Profile {
     pub(crate) model_dir: PathBuf,
     pub(crate) context: usize,
     pub(crate) prefix_context: usize,
+    pub(crate) step_tokens: Option<usize>,
     pub(crate) mode: ProfileMode,
     pub(crate) warmups: usize,
     pub(crate) sampling: BenchSampling,
@@ -192,6 +193,9 @@ struct ProfileArgs {
     /// Tokens to populate before measuring a suffix prefill.
     #[arg(long, default_value_t = 0)]
     prefix_context: u32,
+    /// Prompt tokens per serving batch step.
+    #[arg(long, value_parser = parse_positive)]
+    step_tokens: Option<u32>,
     /// Inference phase to profile.
     #[arg(long, value_enum, default_value_t = ProfileMode::Decode)]
     mode: ProfileMode,
@@ -1284,6 +1288,14 @@ impl ProfileArgs {
                 "--prefix-context requires prefill mode and must be less than --context",
             ));
         }
+        if self.step_tokens.is_some()
+            && (self.mode != ProfileMode::Prefill || self.prefix_context == 0)
+        {
+            return Err(Cli::command().error(
+                clap::error::ErrorKind::ValueValidation,
+                "--step-tokens requires a cached-prefix prefill",
+            ));
+        }
         Ok(Profile {
             engine,
             model_dir,
@@ -1293,6 +1305,13 @@ impl ProfileArgs {
             prefix_context: usize::try_from(self.prefix_context).map_err(|error| {
                 Cli::command().error(clap::error::ErrorKind::ValueValidation, error.to_string())
             })?,
+            step_tokens: self
+                .step_tokens
+                .map(usize::try_from)
+                .transpose()
+                .map_err(|error| {
+                    Cli::command().error(clap::error::ErrorKind::ValueValidation, error.to_string())
+                })?,
             mode: self.mode,
             warmups: usize::try_from(config.bench.warmups).map_err(|error| {
                 Cli::command().error(clap::error::ErrorKind::ValueValidation, error.to_string())
@@ -1592,6 +1611,7 @@ mod tests {
         assert_eq!(options.engine, PathBuf::from("/engine.wasm"));
         assert_eq!(options.context, 512);
         assert_eq!(options.prefix_context, 0);
+        assert_eq!(options.step_tokens, None);
         assert_eq!(options.mode, ProfileMode::Decode);
         assert_eq!(options.warmups, 7);
         assert!(options.json);
@@ -1613,6 +1633,8 @@ mod tests {
                 "prefill",
                 "--prefix-context",
                 "256",
+                "--step-tokens",
+                "128",
             ]
             .map(str::to_owned),
         )
@@ -1622,6 +1644,7 @@ mod tests {
         };
         assert_eq!(options.mode, ProfileMode::Prefill);
         assert_eq!(options.prefix_context, 256);
+        assert_eq!(options.step_tokens, Some(128));
     }
 
     #[test]

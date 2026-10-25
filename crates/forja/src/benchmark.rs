@@ -48,6 +48,7 @@ pub(crate) struct TokenProfile {
     pub(crate) baseline_gpu: Duration,
     pub(crate) profiled_wall: Duration,
     pub(crate) profiled_gpu: Duration,
+    pub(crate) cache_setup_wall: Duration,
     pub(crate) step: EngineStepProfile,
 }
 
@@ -203,6 +204,17 @@ pub(crate) async fn measure_token_profile(
             seed: options.sampling.seed,
         },
     };
+    if let Some(step_tokens) = options.step_tokens {
+        return measure_serving_prefill_profile(
+            &mut runner,
+            &info,
+            &tokens,
+            options,
+            step_tokens,
+            device,
+        )
+        .await;
+    }
     for _ in 0..options.warmups {
         measure_profile_phase(&mut runner, &tokens, options, decode).await?;
     }
@@ -214,10 +226,178 @@ pub(crate) async fn measure_token_profile(
         baseline_gpu: Duration::from_secs_f64(baseline.gpu_seconds),
         profiled_wall: Duration::from_secs_f64(profiled.wall_seconds),
         profiled_gpu: Duration::from_secs_f64(profiled.gpu_seconds),
+        cache_setup_wall: Duration::ZERO,
         step: runner
             .take_profile()
             .ok_or("profiled phase produced no timing detail")?,
     })
+}
+
+#[cfg(target_os = "macos")]
+async fn measure_serving_prefill_profile(
+    runner: &mut EngineRunner<forja_metal::MetalBackend>,
+    info: &EngineInfo,
+    tokens: &[u32],
+    options: &Profile,
+    step_tokens: usize,
+    device: String,
+) -> Result<TokenProfile, Box<dyn Error>> {
+    let serving = info
+        .serving
+        .as_ref()
+        .ok_or("serving prefill requires a paged engine")?;
+    let shape = serving
+        .batch_shapes
+        .iter()
+        .find(|shape| {
+            shape.phase == BatchPhase::Prompt
+                && shape.bucket == 1
+                && shape.selection == BatchSelection::Combined
+                && usize::try_from(shape.tokens) == Ok(step_tokens)
+        })
+        .copied()
+        .ok_or("serving prefill step has no exact batch shape")?;
+    let reserved = u64::try_from(options.context)?;
+    let prefix =
+        prepare_serving_profile_prefix(runner, &tokens[..options.prefix_context], shape, reserved)
+            .await?;
+    for _ in 0..options.warmups {
+        measure_serving_profile_phase(runner, &prefix, tokens, options, shape, reserved, false)
+            .await?;
+    }
+    let (baseline, cache_setup, _) =
+        measure_serving_profile_phase(runner, &prefix, tokens, options, shape, reserved, false)
+            .await?;
+    let (profiled, _, step_profiles) =
+        measure_serving_profile_phase(runner, &prefix, tokens, options, shape, reserved, true)
+            .await?;
+    Ok(TokenProfile {
+        device,
+        baseline_wall: Duration::from_secs_f64(baseline.wall_seconds),
+        baseline_gpu: Duration::from_secs_f64(baseline.gpu_seconds),
+        profiled_wall: Duration::from_secs_f64(profiled.wall_seconds),
+        profiled_gpu: Duration::from_secs_f64(profiled.gpu_seconds),
+        cache_setup_wall: cache_setup,
+        step: merge_step_profiles(step_profiles)?,
+    })
+}
+
+#[cfg(target_os = "macos")]
+async fn prepare_serving_profile_prefix(
+    runner: &mut EngineRunner<forja_metal::MetalBackend>,
+    tokens: &[u32],
+    shape: BatchShape,
+    reserved: u64,
+) -> Result<PagedPrefix, Box<dyn Error>> {
+    runner.prepare_paged_lane(0, None, 0)?;
+    runner.prepare_paged_lane(0, None, reserved)?;
+    let step_tokens = usize::try_from(shape.tokens)?;
+    for (index, chunk) in tokens.chunks(step_tokens).enumerate() {
+        run_serving_profile_step(
+            runner,
+            shape,
+            chunk,
+            index
+                .checked_mul(step_tokens)
+                .ok_or("prefix offset overflowed")?,
+        )
+        .await?;
+    }
+    let prefix = runner
+        .paged_prefix()?
+        .ok_or("serving prefill did not produce a paged prefix")?;
+    runner.prepare_paged_lane(0, None, 0)?;
+    Ok(prefix)
+}
+
+#[cfg(target_os = "macos")]
+async fn measure_serving_profile_phase(
+    runner: &mut EngineRunner<forja_metal::MetalBackend>,
+    prefix: &PagedPrefix,
+    tokens: &[u32],
+    options: &Profile,
+    shape: BatchShape,
+    reserved: u64,
+    profiling: bool,
+) -> Result<(Sample, Duration, Vec<EngineStepProfile>), Box<dyn Error>> {
+    runner.prepare_paged_lane(0, None, 0)?;
+    let setup_started = Instant::now();
+    let fork = prefix.fork_reserved(u64::try_from(options.prefix_context)?, reserved)?;
+    runner.prepare_paged_lane(0, Some(fork), reserved)?;
+    let cache_setup = setup_started.elapsed();
+    let before = runner.metrics();
+    let started = Instant::now();
+    let mut profiles = Vec::new();
+    runner.set_profiling(profiling);
+    let step_tokens = usize::try_from(shape.tokens)?;
+    for (index, chunk) in tokens[options.prefix_context..]
+        .chunks(step_tokens)
+        .enumerate()
+    {
+        let start = options
+            .prefix_context
+            .checked_add(
+                index
+                    .checked_mul(step_tokens)
+                    .ok_or("suffix offset overflowed")?,
+            )
+            .ok_or("suffix position overflowed")?;
+        run_serving_profile_step(runner, shape, chunk, start).await?;
+        if profiling {
+            profiles.push(
+                runner
+                    .take_profile()
+                    .ok_or("serving prefill step produced no timing detail")?,
+            );
+        }
+    }
+    runner.set_profiling(false);
+    runner.wait_for_queued_submissions().await?;
+    let sample = sample(before, runner.metrics(), started.elapsed())?;
+    Ok((sample, cache_setup, profiles))
+}
+
+#[cfg(target_os = "macos")]
+async fn run_serving_profile_step(
+    runner: &mut EngineRunner<forja_metal::MetalBackend>,
+    shape: BatchShape,
+    tokens: &[u32],
+    start: usize,
+) -> Result<(), Box<dyn Error>> {
+    let output = runner
+        .batch_step(EngineBatch {
+            shape,
+            lanes: vec![Some(EngineBatchLane {
+                slot: 0,
+                tokens: Some(tokens.to_vec()),
+                start_pos: u32::try_from(start)?,
+                sampling: SamplingParams::default(),
+            })],
+        })
+        .await?
+        .map_err(|error| format!("serving prefill failed: {error:?}"))?;
+    runner.read(&output.tokens).await?;
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn merge_step_profiles(
+    mut profiles: Vec<EngineStepProfile>,
+) -> Result<EngineStepProfile, &'static str> {
+    let Some(last) = profiles.last().cloned() else {
+        return Err("serving prefill produced no profiles");
+    };
+    let mut merged = EngineStepProfile {
+        submission: last.submission,
+        memory: last.memory,
+        ..EngineStepProfile::default()
+    };
+    for profile in profiles.drain(..) {
+        merged.wall_time = merged.wall_time.saturating_add(profile.wall_time);
+        merged.guest_time = merged.guest_time.saturating_add(profile.guest_time);
+        merged.submissions.extend(profile.submissions);
+    }
+    Ok(merged)
 }
 
 #[cfg(target_os = "macos")]
@@ -2576,6 +2756,19 @@ mod tests {
 
     fn test_profile() -> forja_config::Profile {
         crate::resolution::read_embedded_profile(test_guests::qwen3()).unwrap()
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn merges_serving_prefill_step_profiles() {
+        let profiles = [2_u64, 3].map(|milliseconds| EngineStepProfile {
+            wall_time: Duration::from_millis(milliseconds),
+            guest_time: Duration::from_millis(milliseconds - 1),
+            ..EngineStepProfile::default()
+        });
+        let merged = merge_step_profiles(profiles.into()).unwrap();
+        assert_eq!(merged.wall_time, Duration::from_millis(5));
+        assert_eq!(merged.guest_time, Duration::from_millis(3));
     }
 
     #[cfg(target_os = "macos")]

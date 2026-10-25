@@ -320,6 +320,9 @@ fn print_profile_shape(options: &Profile) {
             "- Measured suffix: {}",
             options.context - options.prefix_context
         );
+        if let Some(step_tokens) = options.step_tokens {
+            println!("- Serving step: {step_tokens} tokens");
+        }
     }
 }
 
@@ -468,11 +471,13 @@ fn report(
         "tokens": options.context,
         "cached_prefix_tokens": options.prefix_context,
         "measured_tokens": options.context - options.prefix_context,
+        "serving_step_tokens": options.step_tokens,
         "streaming_read_gigabytes_per_second": peak,
         "streaming_copy_gigabytes_per_second": device.streaming_copy_gigabytes_per_second,
         "unprofiled": {
             "wall_time_seconds": measurement.baseline_wall.as_secs_f64(),
             "gpu_time_seconds": measurement.baseline_gpu.as_secs_f64(),
+            "cache_setup_wall_time_seconds": measurement.cache_setup_wall.as_secs_f64(),
         },
         "whole_run": whole_run,
         "profiled": {
