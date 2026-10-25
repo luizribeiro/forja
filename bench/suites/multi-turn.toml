@@ -1,0 +1,25 @@
+[suite]
+schema_version = 1
+model = "mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit"
+revision = "6e302ea604ad9ab206367e2c501d1571023e7b6d"
+repetitions = 5
+warmups = 1
+connection_policy = "reuse"
+seed = 0
+max_context = 32768
+output_tokens = 128
+scripted_assistant_tokens = 128
+tool_output_tokens = [
+  1536,
+  2048,
+  2560,
+  1536,
+  2048,
+  2560,
+  1536,
+  2048,
+  2560,
+  1536,
+  2048,
+  2560,
+]
