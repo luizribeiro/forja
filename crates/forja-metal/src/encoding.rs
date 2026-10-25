@@ -16,9 +16,9 @@ use std::sync::atomic::AtomicU64;
 
 use block2::RcBlock;
 use forja_core::{
-    BackendError, BufferId, CommandList, DType, Dispatch, DispatchProfile, GraphTemplate, Layout,
-    Op, PagedCopyDirection, PreparedGraph, ProfileCount, ProfileTensor, Slice, Submission,
-    SubmissionProfile, Tensor,
+    BackendError, BufferId, CommandList, DType, Dispatch, DispatchProfile, GraphTemplate,
+    KernelProfile, Layout, Op, PagedCopyDirection, PreparedGraph, ProfileCount, ProfileTensor,
+    Slice, Submission, SubmissionProfile, Tensor,
     program::{
         KernelSignature, PreparedEpilogue, PreparedProgram, ProgramHash, ProgramKind,
         ValidatedProgram,
@@ -571,6 +571,15 @@ struct EncodedDispatches {
     arguments: Option<ArgumentUsage>,
     program_encoding: ProfileCount,
     program_compile_fallbacks: u64,
+    internal_profiles: Vec<InternalDispatchProfile>,
+}
+
+#[derive(Clone)]
+struct InternalDispatchProfile {
+    dispatch: usize,
+    kernel: &'static str,
+    start: usize,
+    end: usize,
 }
 
 struct EncodedErrorFlag {
@@ -631,6 +640,7 @@ enum PlanCall {
         threads_per_threadgroup: MTLSize,
     },
     Barrier,
+    InternalBoundary,
 }
 
 struct PlanRecording {
@@ -1383,7 +1393,8 @@ fn dedupe_plan_calls(plans: &mut [Option<StaticEncodingPlan>]) {
             PlanCall::Bind { .. }
             | PlanCall::Dispatch { .. }
             | PlanCall::IndirectDispatch { .. }
-            | PlanCall::Barrier => true,
+            | PlanCall::Barrier
+            | PlanCall::InternalBoundary => true,
         });
     }
 }
@@ -1753,6 +1764,35 @@ impl Completion {
                     gpu_time,
                     ..metadata.clone()
                 })
+            })
+            .collect()
+    }
+
+    fn internal_dispatch_times(
+        &self,
+        metadata: &[InternalDispatchProfile],
+    ) -> Option<Vec<(usize, KernelProfile)>> {
+        let timestamps = self.resolved_timestamps.get()?.as_ref()?;
+        metadata
+            .iter()
+            .map(|metadata| {
+                let [gpu_start, gpu_end, gpu_time] = timestamps
+                    .elapsed_pairs(&[
+                        (2, metadata.start),
+                        (2, metadata.end),
+                        (metadata.start, metadata.end),
+                    ])?
+                    .try_into()
+                    .ok()?;
+                Some((
+                    metadata.dispatch,
+                    KernelProfile {
+                        kernel: metadata.kernel,
+                        gpu_start,
+                        gpu_end,
+                        gpu_time,
+                    },
+                ))
             })
             .collect()
     }
@@ -2131,6 +2171,7 @@ pub struct MetalSubmission {
     timeout: Duration,
     profile: Option<Mutex<SubmissionProfile>>,
     dispatch_profiles: Vec<DispatchProfile>,
+    internal_profiles: Vec<InternalDispatchProfile>,
 }
 
 impl Submission for MetalSubmission {
@@ -2153,7 +2194,14 @@ impl Submission for MetalSubmission {
     fn profile(&self) -> Option<SubmissionProfile> {
         let mut profile = self.profile.as_ref()?.lock().ok()?.clone();
         profile.sample_fallbacks = self.completion.sample_fallbacks();
-        profile.per_dispatch = self.completion.dispatch_times(&self.dispatch_profiles)?;
+        let mut dispatches = self.completion.dispatch_times(&self.dispatch_profiles)?;
+        for (dispatch, internal) in self
+            .completion
+            .internal_dispatch_times(&self.internal_profiles)?
+        {
+            dispatches.get_mut(dispatch)?.internal.push(internal);
+        }
+        profile.per_dispatch = dispatches;
         Some(profile)
     }
 }
@@ -2585,10 +2633,18 @@ impl MetalBackend {
         let _scratch = ScratchScope::enter(objects.scratch()?)?;
         let command_buffer = self.begin_command_buffer(objects.allocator()?)?;
         let timestamps = if PROFILE {
+            let internal = dispatches
+                .iter()
+                .map(internal_dispatch_names)
+                .try_fold(0_usize, |count, names| {
+                    count.checked_add(names.len().saturating_sub(1))
+                })
+                .ok_or(BackendError::ExecutionFailed)?;
             let count = dispatches
                 .len()
                 .checked_mul(2)
                 .and_then(|count| count.checked_add(2))
+                .and_then(|count| count.checked_add(internal))
                 .ok_or(BackendError::ExecutionFailed)?;
             self.make_timestamps(count)?
         } else {
@@ -2614,7 +2670,7 @@ impl MetalBackend {
         if let Some(encoding) = graph.and_then(|graph| graph.encoding.as_ref()) {
             argument_writer.copy_image(&encoding.arena)?;
         }
-        let encoded = self.encode_dispatches(
+        let mut encoded = self.encode_dispatches(
             &command_buffer,
             objects.argument_table()?,
             &DispatchEncoding {
@@ -2632,7 +2688,7 @@ impl MetalBackend {
             graph_arena_binding.as_ref(),
         )?;
         argument_writer.validate_capacity(argument_capacity, dispatches.is_empty())?;
-        if let Some(profile) = &mut profile {
+        let internal_profiles = if let Some(profile) = &mut profile {
             let epilogue = self
                 .pipelines
                 .lock()
@@ -2647,7 +2703,10 @@ impl MetalBackend {
             profile.epilogue_compile_fallbacks = epilogue.fallbacks;
             let encoding = encoding_started.map_or(Duration::ZERO, |started| started.elapsed());
             profile.encoding = encoding.saturating_sub(profile.metadata_buffers.time);
-        }
+            std::mem::take(&mut encoded.internal_profiles)
+        } else {
+            Vec::new()
+        };
         let resources =
             self.command_resources(&tensors, encoded, graph.map(|prepared| &prepared.buffers))?;
         objects.programs = prepared_programs;
@@ -2690,6 +2749,7 @@ impl MetalBackend {
             profile.commit = commit_started.map_or(Duration::ZERO, |started| started.elapsed());
             submission.profile = Some(Mutex::new(profile));
             submission.dispatch_profiles = dispatch_profiles;
+            submission.internal_profiles = internal_profiles;
         }
         #[cfg(test)]
         store_duration(&LAST_SUBMIT_NANOS, submit_started.elapsed());
@@ -2717,6 +2777,13 @@ impl MetalBackend {
         let mut bindings = ArgumentBindings::default();
         let mut program_encoding = ProfileCount::default();
         let mut program_compile_fallbacks = 0_u64;
+        let mut internal_timestamp = plan
+            .dispatches
+            .len()
+            .checked_mul(2)
+            .and_then(|count| count.checked_add(2))
+            .ok_or(BackendError::ExecutionFailed)?;
+        let mut internal_profiles = Vec::new();
         for (index, (dispatch, &barrier)) in plan.dispatches.iter().zip(plan.barriers).enumerate() {
             if index > 0 {
                 write_dispatch_timestamp(&encoder, timestamps, 1 + index * 2);
@@ -2725,11 +2792,27 @@ impl MetalBackend {
                 encode_dispatch_barrier(&encoder);
             }
             write_dispatch_timestamp(&encoder, timestamps, 2 + index * 2);
+            if timestamps.is_some() {
+                internal_profiles.extend(internal_dispatch_profiles(
+                    dispatch,
+                    index,
+                    internal_timestamp,
+                ));
+            }
             if let Some(plan) = prepared
                 .and_then(|plans| plans.get(index))
                 .and_then(Option::as_ref)
             {
-                Self::encode_plan(&encoder, table, plan, &mut bindings, arguments, graph_arena)?;
+                Self::encode_plan(
+                    &encoder,
+                    table,
+                    plan,
+                    timestamps,
+                    &mut internal_timestamp,
+                    &mut bindings,
+                    arguments,
+                    graph_arena,
+                )?;
                 continue;
             }
             self.encode_dispatch(
@@ -2738,6 +2821,8 @@ impl MetalBackend {
                 dispatch,
                 index,
                 timestamps.is_some(),
+                timestamps,
+                &mut internal_timestamp,
                 &mut temporaries,
                 &mut error_flags,
                 &mut bindings,
@@ -2764,13 +2849,17 @@ impl MetalBackend {
             arguments: argument_usage,
             program_encoding,
             program_compile_fallbacks,
+            internal_profiles,
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn encode_plan(
         encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
         table: &ProtocolObject<dyn MTL4ArgumentTable>,
         plan: &StaticEncodingPlan,
+        timestamps: Option<&GpuTimestamps>,
+        internal_timestamp: &mut usize,
         bindings: &mut ArgumentBindings,
         arguments: &mut ArgumentWriter,
         graph_arena: Option<&BufferBinding>,
@@ -2850,6 +2939,9 @@ impl MetalBackend {
                     }
                 }
                 PlanCall::Barrier => encode_dispatch_barrier(encoder),
+                PlanCall::InternalBoundary => {
+                    write_internal_timestamp(encoder, timestamps, internal_timestamp)?;
+                }
             }
         }
         Ok(())
@@ -2863,6 +2955,8 @@ impl MetalBackend {
         dispatch: &Dispatch,
         dispatch_index: usize,
         profile: bool,
+        timestamps: Option<&GpuTimestamps>,
+        internal_timestamp: &mut usize,
         temporaries: &mut Vec<BufferBinding>,
         error_flags: &mut Vec<EncodedErrorFlag>,
         bindings: &mut ArgumentBindings,
@@ -2996,7 +3090,15 @@ impl MetalBackend {
                     )?
                 } else {
                     self.encode_gather_quant_matmul(
-                        encoder, table, dispatch, bits, group_size, bindings, arguments,
+                        encoder,
+                        table,
+                        dispatch,
+                        bits,
+                        group_size,
+                        timestamps,
+                        internal_timestamp,
+                        bindings,
+                        arguments,
                     )?
                 };
                 error_flags.push(EncodedErrorFlag::new(
@@ -4004,12 +4106,22 @@ impl MetalBackend {
         dispatch: &Dispatch,
         bits: u8,
         group_size: u32,
+        timestamps: Option<&GpuTimestamps>,
+        internal_timestamp: &mut usize,
         bindings: &mut ArgumentBindings,
         arguments: &mut ArgumentWriter,
     ) -> Result<EncodedEmbed, BackendError> {
         if dispatch.primitive_inputs().len() == 8 {
             return self.encode_gather_quant_matmul_pair(
-                encoder, table, dispatch, bits, group_size, bindings, arguments,
+                encoder,
+                table,
+                dispatch,
+                bits,
+                group_size,
+                timestamps,
+                internal_timestamp,
+                bindings,
+                arguments,
             );
         }
         let [input, packed, scales, biases, indices] = dispatch.primitive_inputs() else {
@@ -4035,6 +4147,8 @@ impl MetalBackend {
                 &params,
                 [rows, routes, columns],
                 (bits, group_size),
+                timestamps,
+                internal_timestamp,
                 bindings,
                 arguments,
             );
@@ -4194,6 +4308,8 @@ impl MetalBackend {
         dispatch: &Dispatch,
         bits: u8,
         group_size: u32,
+        timestamps: Option<&GpuTimestamps>,
+        internal_timestamp: &mut usize,
         bindings: &mut ArgumentBindings,
         arguments: &mut ArgumentWriter,
     ) -> Result<EncodedEmbed, BackendError> {
@@ -4263,6 +4379,8 @@ impl MetalBackend {
                 &[first_params, second_params],
                 [rows, routes, columns],
                 config,
+                timestamps,
+                internal_timestamp,
                 bindings,
                 arguments,
             );
@@ -4353,6 +4471,8 @@ impl MetalBackend {
         params: &[u8],
         shape: [u32; 3],
         config: (u8, u32),
+        timestamps: Option<&GpuTimestamps>,
+        internal_timestamp: &mut usize,
         bindings: &mut ArgumentBindings,
         arguments: &mut ArgumentWriter,
     ) -> Result<EncodedEmbed, BackendError> {
@@ -4379,6 +4499,8 @@ impl MetalBackend {
             &params,
             &error_flag,
             block_rows,
+            timestamps,
+            internal_timestamp,
             bindings,
         )?;
         encode_dispatch_barrier(encoder);
@@ -4416,6 +4538,8 @@ impl MetalBackend {
         params: &[Vec<u8>; 2],
         shape: [u32; 3],
         config: (u8, u32),
+        timestamps: Option<&GpuTimestamps>,
+        internal_timestamp: &mut usize,
         bindings: &mut ArgumentBindings,
         arguments: &mut ArgumentWriter,
     ) -> Result<EncodedEmbed, BackendError> {
@@ -4466,6 +4590,8 @@ impl MetalBackend {
             &final_params,
             &error_flag,
             block_rows,
+            timestamps,
+            internal_timestamp,
             bindings,
         )?;
         encode_dispatch_barrier(encoder);
@@ -4489,6 +4615,7 @@ impl MetalBackend {
             None,
             bindings,
         )?;
+        write_internal_timestamp(encoder, timestamps, internal_timestamp)?;
         self.encode_grouped_quantized_gemm(
             encoder,
             table,
@@ -4503,6 +4630,7 @@ impl MetalBackend {
             None,
             bindings,
         )?;
+        write_internal_timestamp(encoder, timestamps, internal_timestamp)?;
         encode_dispatch_barrier(encoder);
         let constants = [(2, dtype_code(output.layout.dtype()))];
         let pipeline = self
@@ -4570,6 +4698,8 @@ impl MetalBackend {
         params: &BufferBinding,
         error_flag: &BufferBinding,
         block_rows: u32,
+        timestamps: Option<&GpuTimestamps>,
+        internal_timestamp: &mut usize,
         bindings: &mut ArgumentBindings,
     ) -> Result<(), BackendError> {
         let count_pipeline = self
@@ -4600,6 +4730,7 @@ impl MetalBackend {
                 depth: 1,
             },
         );
+        write_internal_timestamp(encoder, timestamps, internal_timestamp)?;
         encode_dispatch_barrier(encoder);
         let arrange_pipeline = self
             .pipelines
@@ -4626,6 +4757,7 @@ impl MetalBackend {
                 depth: 1,
             },
         );
+        write_internal_timestamp(encoder, timestamps, internal_timestamp)?;
         Ok(())
     }
 
@@ -7276,6 +7408,7 @@ impl MetalBackend {
             arguments,
             program_encoding: _,
             program_compile_fallbacks: _,
+            internal_profiles: _,
         } = encoded;
         let mut indices = HashMap::<u64, usize>::new();
         let mut owned = Vec::<InFlightBuffer>::new();
@@ -7454,6 +7587,7 @@ impl MetalBackend {
             timeout: self.gpu_timeout,
             profile: None,
             dispatch_profiles: Vec::new(),
+            internal_profiles: Vec::new(),
         })
     }
 }
@@ -7562,6 +7696,56 @@ fn dispatch_profile(dispatch: &Dispatch, barrier: bool) -> Result<DispatchProfil
         gpu_time: Duration::ZERO,
         internal: Vec::new(),
     })
+}
+
+fn internal_dispatch_names(dispatch: &Dispatch) -> &'static [&'static str] {
+    if !matches!(dispatch.op(), Op::GatherQuantMatmul { .. }) || !grouped_gather_dispatch(dispatch)
+    {
+        return &[];
+    }
+    match dispatch.primitive_inputs().len() {
+        8 => &[
+            "count_expert_routes",
+            "arrange_expert_routes",
+            "grouped_quantized_gemm_gate",
+            "grouped_quantized_gemm_up",
+            "gathered_pair_from_projections",
+        ],
+        6 => &[],
+        _ => &[
+            "count_expert_routes",
+            "arrange_expert_routes",
+            "grouped_quantized_gemm",
+        ],
+    }
+}
+
+fn internal_dispatch_profiles(
+    dispatch: &Dispatch,
+    dispatch_index: usize,
+    first_internal: usize,
+) -> Vec<InternalDispatchProfile> {
+    let names = internal_dispatch_names(dispatch);
+    let outer_start = 2 + dispatch_index * 2;
+    let outer_end = outer_start + 1;
+    names
+        .iter()
+        .enumerate()
+        .map(|(index, &kernel)| InternalDispatchProfile {
+            dispatch: dispatch_index,
+            kernel,
+            start: if index == 0 {
+                outer_start
+            } else {
+                first_internal + index - 1
+            },
+            end: if index + 1 == names.len() {
+                outer_end
+            } else {
+                first_internal + index
+            },
+        })
+        .collect()
 }
 
 pub(super) fn dispatch_kernel(dispatch: &Dispatch) -> Result<&'static str, BackendError> {
@@ -8236,8 +8420,8 @@ fn write_dispatch_timestamp(
     let Some(timestamps) = timestamps else {
         return;
     };
-    // SAFETY: Profiled heaps reserve `2 + 2 * dispatches` entries, and callers keep every
-    // per-dispatch index below that bound.
+    // SAFETY: Profiled heaps reserve `2 + 2 * dispatches + internal` entries. Outer indices stay
+    // below `2 + 2 * dispatches`; the checked internal writer uses that value as its lower bound.
     unsafe {
         encoder.writeTimestampWithGranularity_intoHeap_atIndex(
             MTL4TimestampGranularity::Precise,
@@ -8245,6 +8429,24 @@ fn write_dispatch_timestamp(
             index,
         );
     }
+}
+
+fn write_internal_timestamp(
+    encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
+    timestamps: Option<&GpuTimestamps>,
+    next_timestamp: &mut usize,
+) -> Result<(), BackendError> {
+    record_plan_call(PlanCall::InternalBoundary);
+    if let Some(timestamps) = timestamps {
+        if *next_timestamp >= timestamps.count {
+            return Err(BackendError::ExecutionFailed);
+        }
+        write_dispatch_timestamp(encoder, Some(timestamps), *next_timestamp);
+        *next_timestamp = next_timestamp
+            .checked_add(1)
+            .ok_or(BackendError::ExecutionFailed)?;
+    }
+    Ok(())
 }
 
 fn row_thread_count(max_threads: usize, width: u32) -> Result<usize, BackendError> {
@@ -10057,6 +10259,7 @@ mod tests {
             arguments: None,
             program_encoding: ProfileCount::default(),
             program_compile_fallbacks: 0,
+            internal_profiles: Vec::new(),
         };
         assert!(matches!(
             backend.command_resources(&[], unowned, None),
@@ -10080,6 +10283,7 @@ mod tests {
             }),
             program_encoding: ProfileCount::default(),
             program_compile_fallbacks: 0,
+            internal_profiles: Vec::new(),
         };
         assert!(matches!(
             backend.command_resources(&[], unwritten, None),
@@ -11204,6 +11408,7 @@ mod tests {
                     }),
                     program_encoding: ProfileCount::default(),
                     program_compile_fallbacks: 0,
+                    internal_profiles: Vec::new(),
                 },
                 None,
             )
@@ -11505,7 +11710,43 @@ mod tests {
                 .dispatch_epilogue(op, &inputs, &output, &epilogue, &[])
                 .unwrap();
             assert!(commands.set_last_backend_data(BackendDispatchData::new(selection)));
-            backend.submit(commands).unwrap().wait().unwrap();
+            let submission = if variant == "gather-quant-matmul.grouped" {
+                backend.submit_profiled(commands.clone()).unwrap()
+            } else {
+                backend.submit(commands.clone()).unwrap()
+            };
+            submission.wait().unwrap();
+            if variant == "gather-quant-matmul.grouped" {
+                let profile = submission.profile().unwrap();
+                let internal = &profile.per_dispatch[0].internal;
+                assert_eq!(internal.len(), 5);
+                assert_eq!(internal[0].kernel, "count_expert_routes");
+                assert_eq!(internal[4].kernel, "gathered_pair_from_projections");
+                assert!(
+                    internal
+                        .iter()
+                        .all(|kernel| kernel.gpu_time > Duration::ZERO)
+                );
+
+                let mut template = GraphTemplate::new(
+                    ParamSpace::new(Vec::new()).unwrap(),
+                    GraphLimits::default(),
+                );
+                template
+                    .record_validated(commands.into_dispatches().remove(0))
+                    .unwrap();
+                let graph = backend.prepare_graph(template).unwrap();
+                let replay = backend.replay_graph(&graph, Vec::new(), true).unwrap();
+                replay.wait().unwrap();
+                let replay_profile = replay.profile().unwrap();
+                assert_eq!(replay_profile.per_dispatch[0].internal.len(), 5);
+                assert!(
+                    replay_profile.per_dispatch[0]
+                        .internal
+                        .iter()
+                        .all(|kernel| kernel.gpu_time > Duration::ZERO)
+                );
+            }
         }
     }
 
