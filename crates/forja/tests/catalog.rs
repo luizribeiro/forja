@@ -45,7 +45,7 @@ fn metal_catalog_cli_snapshots() {
         + "\n";
     assert_eq!(
         digest(&markdown),
-        "a3aead72c9edeef92bc55b8e86bd11b4f35391d036d4605536f4739d43c9e479"
+        "3783123dc76fab02f7f40ff4a8a3cb8c889f1b93caf409abeb7a0bb4413e34a7"
     );
 
     let mut json: serde_json::Value = serde_json::from_str(&catalog(&["--json"])).unwrap();
@@ -53,7 +53,7 @@ fn metal_catalog_cli_snapshots() {
     let json = json.to_string() + "\n";
     assert_eq!(
         digest(&json),
-        "a3a50af0bb7efa7129c84fabb187bf87aee6ca97e143a69b1198380eb13e8231"
+        "5ed5e19f49181e694be72e5b0ec6e9c5c394759b369ed43aade4e86c741c7786"
     );
 }
 

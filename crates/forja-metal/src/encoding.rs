@@ -391,6 +391,7 @@ fn grouped_gather_dispatch(dispatch: &Dispatch) -> bool {
             MetalVariant::GatherQuantMatmulGrouped
                 | MetalVariant::GatherQuantMatmulGrouped32x32
                 | MetalVariant::GatherQuantMatmulGrouped32x32Blocked
+                | MetalVariant::GatherQuantMatmulGroupedPair32x32Blocked
                 | MetalVariant::GatherQuantMatmulGroupedSmallM
                 | MetalVariant::GatherQuantMatmulGroupedPairSmallM
         )
@@ -403,6 +404,7 @@ fn grouped_block_rows(dispatch: &Dispatch) -> u32 {
         Some(
             MetalVariant::GatherQuantMatmulGrouped32x32
                 | MetalVariant::GatherQuantMatmulGrouped32x32Blocked
+                | MetalVariant::GatherQuantMatmulGroupedPair32x32Blocked
         )
     ) {
         return 32;
@@ -4452,6 +4454,33 @@ impl MetalBackend {
             grouped_block_rows(dispatch),
         )?;
         if grouped_gather_dispatch(dispatch) {
+            if selected_variant(dispatch)
+                == Some(MetalVariant::GatherQuantMatmulGroupedPair32x32Blocked)
+            {
+                return self.encode_fused_grouped_quant_pair(
+                    encoder,
+                    table,
+                    dispatch,
+                    [
+                        &input,
+                        &first_packed,
+                        &first_scales,
+                        &first_biases,
+                        &second_packed,
+                        &second_scales,
+                        &second_biases,
+                        &indices,
+                        &output,
+                    ],
+                    &[first_params, second_params],
+                    [rows, routes, columns],
+                    config,
+                    timestamps,
+                    internal_timestamp,
+                    bindings,
+                    arguments,
+                );
+            }
             return self.encode_grouped_quant_pair(
                 encoder,
                 table,
@@ -4628,6 +4657,131 @@ impl MetalBackend {
         )?;
         let mut temporaries = vec![
             params,
+            error_flag.clone(),
+            sorted.buffer,
+            offsets.buffer,
+            blocks.buffer,
+        ];
+        temporaries.extend(layouts);
+        Ok((temporaries, error_flag))
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    fn encode_fused_grouped_quant_pair(
+        &self,
+        encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
+        table: &ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>,
+        dispatch: &Dispatch,
+        tensors: [&EncoderTensor; 9],
+        params: &[Vec<u8>; 2],
+        shape: [u32; 3],
+        config: (u8, u32),
+        timestamps: Option<&GpuTimestamps>,
+        internal_timestamp: &mut usize,
+        bindings: &mut ArgumentBindings,
+        arguments: &mut ArgumentWriter,
+    ) -> Result<EncodedEmbed, BackendError> {
+        let [
+            input,
+            gate_packed,
+            gate_scales,
+            gate_biases,
+            up_packed,
+            up_scales,
+            up_biases,
+            indices,
+            output,
+        ] = tensors;
+        let experts = gate_packed.layout.shape()[0];
+        let block_rows = grouped_block_rows(dispatch);
+        let grouped = GroupedRouteShape::new(shape[0], shape[1], experts, block_rows)?;
+        let sorted = self.scratch_tensor(DType::U32, &[grouped.route_count])?;
+        let offsets = self.scratch_tensor(
+            DType::U32,
+            &[experts.checked_add(1).ok_or(BackendError::InvalidInput)?],
+        )?;
+        let blocks = self.scratch_tensor(DType::U32, &[grouped.block_elements])?;
+        let gate_params = arguments.write(&params[0])?;
+        let up_params = arguments.write(&params[1])?;
+        let final_params = arguments.write(&params[0])?;
+        let error_flag = grouped_error_flag(arguments)?;
+        self.encode_expert_buckets(
+            encoder,
+            table,
+            indices,
+            &sorted,
+            &offsets,
+            &blocks,
+            output,
+            &final_params,
+            &error_flag,
+            block_rows,
+            timestamps,
+            internal_timestamp,
+            bindings,
+        )?;
+        encode_dispatch_barrier(encoder);
+        let constants = [
+            (0, dtype_code(input.layout.dtype())),
+            (1, dtype_code(gate_scales.layout.dtype())),
+            (2, dtype_code(output.layout.dtype())),
+            (12, u32::from(config.0)),
+            (13, config.1),
+        ];
+        let pipeline = self
+            .pipelines
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?
+            .lookup_epilogue(
+                epilogue_codegen::FamilySourceTag::GatherQuant,
+                dispatch
+                    .prepared_epilogue()
+                    .ok_or(BackendError::InvalidInput)?,
+                "grouped_quantized_pair_32x32_2x2_blocked",
+                &constants,
+            )?;
+        set_pipeline(encoder, &pipeline);
+        for (index, tensor) in [
+            input,
+            gate_packed,
+            gate_scales,
+            gate_biases,
+            up_packed,
+            up_scales,
+            up_biases,
+            &sorted,
+            &blocks,
+            output,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            bindings.bind(table, index, &tensor.buffer);
+        }
+        bindings.bind(table, 10, &gate_params);
+        bindings.bind(table, 11, &up_params);
+        bindings.bind(table, 12, &final_params);
+        let layouts = self.bind_epilogue_arguments(dispatch, table, bindings, arguments)?;
+        set_argument_table(encoder, table);
+        dispatch_threadgroups(
+            encoder,
+            MTLSize {
+                width: usize::try_from(shape[2].div_ceil(32))
+                    .map_err(|_| BackendError::InvalidInput)?,
+                height: usize::try_from(grouped.block_capacity)
+                    .map_err(|_| BackendError::InvalidInput)?,
+                depth: 1,
+            },
+            MTLSize {
+                width: 128,
+                height: 1,
+                depth: 1,
+            },
+        );
+        let mut temporaries = vec![
+            gate_params,
+            up_params,
+            final_params,
             error_flag.clone(),
             sorted.buffer,
             offsets.buffer,
@@ -7793,6 +7947,7 @@ fn supported_dispatch(dispatch: &Dispatch) -> bool {
                     | MetalVariant::GatherQuantMatmulGrouped
                     | MetalVariant::GatherQuantMatmulGrouped32x32
                     | MetalVariant::GatherQuantMatmulGrouped32x32Blocked
+                    | MetalVariant::GatherQuantMatmulGroupedPair32x32Blocked
                     | MetalVariant::GatherQuantMatmulWeightedBroad
             )
         )
@@ -7857,6 +8012,13 @@ fn internal_dispatch_names(dispatch: &Dispatch) -> &'static [&'static str] {
     if !matches!(dispatch.op(), Op::GatherQuantMatmul { .. }) || !grouped_gather_dispatch(dispatch)
     {
         return &[];
+    }
+    if selected_variant(dispatch) == Some(MetalVariant::GatherQuantMatmulGroupedPair32x32Blocked) {
+        return &[
+            "count_expert_routes",
+            "arrange_expert_routes",
+            "grouped_quantized_pair_32x32_2x2_blocked",
+        ];
     }
     match dispatch.primitive_inputs().len() {
         8 => &[
@@ -7971,8 +8133,13 @@ pub(super) fn dispatch_kernel(dispatch: &Dispatch) -> Result<&'static str, Backe
                     .ok_or(BackendError::InvalidInput)?;
                 weighted_gather_schedule(selected_variant(dispatch), *routes)?.implementation
             } else if dispatch.primitive_inputs().len() == 8 && grouped_gather_dispatch(dispatch) {
-                match grouped_block_rows(dispatch) {
-                    8 => "gathered_pair_from_projections_small_m",
+                match selected_variant(dispatch) {
+                    Some(MetalVariant::GatherQuantMatmulGroupedPair32x32Blocked) => {
+                        "grouped_quantized_pair_32x32_2x2_blocked"
+                    }
+                    _ if grouped_block_rows(dispatch) == 8 => {
+                        "gathered_pair_from_projections_small_m"
+                    }
                     _ => "gathered_pair_from_projections",
                 }
             } else if dispatch.primitive_inputs().len() == 8 {
@@ -8417,6 +8584,7 @@ pub(super) fn variant_supported(
         MetalVariant::GatherQuantMatmulGrouped
         | MetalVariant::GatherQuantMatmulGrouped32x32
         | MetalVariant::GatherQuantMatmulGrouped32x32Blocked
+        | MetalVariant::GatherQuantMatmulGroupedPair32x32Blocked
         | MetalVariant::GatherQuantMatmulGroupedSmallM
         | MetalVariant::GatherQuantMatmulGroupedPairSmallM => grouped_gather_dispatch(dispatch),
         MetalVariant::SdpaVectorSinglePass
@@ -9079,6 +9247,16 @@ fn paired_gather_epilogue_requests(
     parameter_dependent: bool,
 ) -> Result<Vec<EpiloguePipelineRequest>, BackendError> {
     if grouped_gather_dispatch(dispatch) {
+        if selected_variant(dispatch)
+            == Some(MetalVariant::GatherQuantMatmulGroupedPair32x32Blocked)
+        {
+            return Ok(vec![EpiloguePipelineRequest {
+                family: epilogue_codegen::FamilySourceTag::GatherQuant,
+                epilogue,
+                implementation: "grouped_quantized_pair_32x32_2x2_blocked",
+                constants: constants.to_vec(),
+            }]);
+        }
         return Ok(vec![EpiloguePipelineRequest {
             family: epilogue_codegen::FamilySourceTag::GatherQuant,
             epilogue,

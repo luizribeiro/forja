@@ -34,6 +34,7 @@ pub(crate) enum MetalVariant {
     GatherQuantMatmulGrouped,
     GatherQuantMatmulGrouped32x32,
     GatherQuantMatmulGrouped32x32Blocked,
+    GatherQuantMatmulGroupedPair32x32Blocked,
     GatherQuantMatmulWeightedBroad,
     SdpaPortable,
     SdpaDecomposed,
@@ -430,6 +431,14 @@ const GROUPED_PAIR_SMALL_M: &[Constraint] = &grouped(
 const GROUPED_MATMUL: &[Constraint] = &grouped(
     MATMUL_ROWS,
     MATMUL_ROUTES,
+    Relation::Range {
+        min: 64,
+        max: u64::MAX,
+    },
+);
+const GROUPED_PAIR_MATMUL: &[Constraint] = &grouped(
+    PAIRED_MATMUL_ROWS,
+    PAIRED_MATMUL_ROUTES,
     Relation::Range {
         min: 64,
         max: u64::MAX,
@@ -884,6 +893,15 @@ pub(crate) static REGISTRY: &[VariantDef<MetalVariant>] = &[
         &["large routed batches with partially filled final expert blocks."],
         &["small routed batches."],
         &["Skips the upper SIMD-group row when its 16 route rows are padding."]
+    ),
+    batch_invariant_variant!(
+        "gather-quant-matmul.grouped-pair-32x32-2x2-blocked",
+        GatherQuantMatmul,
+        GatherQuantMatmulGroupedPair32x32Blocked,
+        GROUPED_PAIR_MATMUL,
+        &["large paired routed projections with partially filled final expert blocks."],
+        &["single projections or small routed batches."],
+        &["Shares input loads and writes the pair epilogue without projection scratch."]
     ),
     batch_invariant_variant!(
         "gather-quant-matmul.weighted-broad",
@@ -1687,6 +1705,7 @@ mod tests {
                 "gather-quant-matmul.grouped",
                 "gather-quant-matmul.grouped-32x32-2x2",
                 "gather-quant-matmul.grouped-32x32-2x2-blocked",
+                "gather-quant-matmul.grouped-pair-32x32-2x2-blocked",
                 "gather-quant-matmul.weighted-broad",
                 "paged-sdpa.vector",
                 "paged-sdpa.vector-gqa-two-pass-32",
@@ -2411,6 +2430,11 @@ mod tests {
                 "gather-quant-matmul.grouped-32x32-2x2-blocked",
                 gathered_dispatch(64, 1, 256, 1),
                 "grouped_quantized_gemm_32x32_2x2_blocked",
+            ),
+            (
+                "gather-quant-matmul.grouped-pair-32x32-2x2-blocked",
+                gathered_dispatch(64, 8, 256, 2),
+                "grouped_quantized_pair_32x32_2x2_blocked",
             ),
             (
                 "gather-quant-matmul.weighted-broad",

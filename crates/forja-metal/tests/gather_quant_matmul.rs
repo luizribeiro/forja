@@ -189,11 +189,15 @@ fn metal_grouped_tile_heights_match_bits() {
             };
             let epilogue = paired.then(silu_mul_epilogue);
             let mut outputs = Vec::new();
-            for name in [
+            let mut variants = vec![
                 "gather-quant-matmul.grouped",
                 "gather-quant-matmul.grouped-32x32-2x2",
                 "gather-quant-matmul.grouped-32x32-2x2-blocked",
-            ] {
+            ];
+            if paired {
+                variants.push("gather-quant-matmul.grouped-pair-32x32-2x2-blocked");
+            }
+            for name in variants {
                 let output = metal
                     .alloc(DType::F32, &[case.rows, case.routes, case.columns])
                     .unwrap();
@@ -213,6 +217,9 @@ fn metal_grouped_tile_heights_match_bits() {
             }
             assert_eq!(outputs[0], outputs[1]);
             assert_eq!(outputs[0], outputs[2]);
+            if paired {
+                assert_eq!(outputs[0], outputs[3]);
+            }
         }
     }
 }
