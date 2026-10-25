@@ -169,7 +169,7 @@ struct PagedSteelAddressing {
         device const uchar *source = key + base * steel_attention_dtype_size(input1_dtype);
         steel_attention_load_tile<T, BK, WIDTH, 1, LD, THREADS>(source,
             params.kv_heads * BD, 1, input1_dtype, key_length - first_key,
-            paged_align_key != 0, tile, index);
+            paged_align_key != 0, base % 4 == 0, tile, index);
     }
 
     template <typename T, int BK, int WIDTH, int LD, int THREADS>
@@ -178,7 +178,7 @@ struct PagedSteelAddressing {
         device const uchar *source = value + base * steel_attention_dtype_size(input2_dtype);
         steel_attention_load_tile<T, BK, WIDTH, LD, 1, THREADS>(source,
             params.kv_heads * BD, 1, input2_dtype, key_length - first_key,
-            paged_align_key != 0, tile, index);
+            paged_align_key != 0, base % 4 == 0, tile, index);
     }
 };
 

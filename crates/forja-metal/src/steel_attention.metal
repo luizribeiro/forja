@@ -20,6 +20,7 @@ struct SteelExpSubtract {
 struct SteelDivide {
     static float apply(float left, float right) { return left / right; }
 };
+constant uint steel_vectorized_loaders [[function_constant(217)]];
 
 inline uint steel_attention_dtype_size(uint dtype) {
     return dtype == 0 ? 4 : 2;
@@ -27,21 +28,50 @@ inline uint steel_attention_dtype_size(uint dtype) {
 template <typename T, int ROWS, int COLUMNS, int DST_ROW, int DST_COLUMN, int THREADS>
 void steel_attention_load_tile(
     device const uchar *source,
-    ulong row_stride,
-    ulong column_stride,
+    uint row_stride,
+    uint column_stride,
     uint dtype,
     uint row_extent,
     bool rows_aligned,
+    bool vector_aligned,
     threadgroup T *destination,
     uint thread_index) {
-    for (uint linear = thread_index; linear < ROWS * COLUMNS; linear += THREADS) {
-        uint row = linear / COLUMNS;
-        uint column = linear % COLUMNS;
-        bool valid = rows_aligned || row < row_extent;
-        ulong source_offset = ulong(row) * row_stride + ulong(column) * column_stride;
+    if (steel_vectorized_loaders == 0) {
+        for (uint linear = thread_index; linear < ROWS * COLUMNS; linear += THREADS) {
+            uint row = linear / COLUMNS;
+            uint column = linear % COLUMNS;
+            bool valid = rows_aligned || row < row_extent;
+            uint source_offset = row * row_stride + column * column_stride;
+            uint destination_offset = row * DST_ROW + column * DST_COLUMN;
+            destination[destination_offset] = valid
+                ? T(load_float(source, source_offset, dtype)) : T(0);
+        }
+        return;
+    }
+    constexpr uint VECTOR_WIDTH = 4;
+    constexpr uint VECTORS_PER_ROW = COLUMNS / VECTOR_WIDTH;
+    constexpr uint VECTOR_COUNT = ROWS * VECTORS_PER_ROW;
+    constexpr uint READS_PER_THREAD = (VECTOR_COUNT + THREADS - 1) / THREADS;
+    for (uint read = 0; read < READS_PER_THREAD; ++read) {
+        uint linear = thread_index + read * THREADS;
+        bool assigned = linear < VECTOR_COUNT;
+        uint row = assigned ? linear / VECTORS_PER_ROW : 0;
+        uint column = assigned ? (linear % VECTORS_PER_ROW) * VECTOR_WIDTH : 0;
+        bool valid = assigned && (rows_aligned || row < row_extent);
+        uint source_offset = row * row_stride + column * column_stride;
         uint destination_offset = row * DST_ROW + column * DST_COLUMN;
-        destination[destination_offset] = valid
-            ? T(load_float(source, source_offset, dtype)) : T(0);
+        if (valid && column_stride == 1 && vector_aligned) {
+            float4 values = load_float4_contiguous(source, source_offset, dtype);
+            for (uint element = 0; element < VECTOR_WIDTH; ++element) {
+                destination[destination_offset + element * DST_COLUMN] = T(values[element]);
+            }
+        } else if (assigned) {
+            for (uint element = 0; element < VECTOR_WIDTH; ++element) {
+                destination[destination_offset + element * DST_COLUMN] = valid
+                    ? T(load_float(source, source_offset + element * column_stride, dtype))
+                    : T(0);
+            }
+        }
     }
 }
 
@@ -73,8 +103,8 @@ void steel_attention_body(
     device const uchar *query_pointer = query
         + query_base * steel_attention_dtype_size(input0_dtype);
     steel_attention_load_tile<TileT, BQ, BD, LDQ, 1, THREADS>(
-        query_pointer, params.q_strides[1], params.q_strides[2], input0_dtype,
-        params.query_length - first_query, false,
+        query_pointer, uint(params.q_strides[1]), uint(params.q_strides[2]), input0_dtype,
+        params.query_length - first_query, false, query_base % 4 == 0,
         query_tile, thread_index);
 
     using Fragment = SteelMMAFragment<float>;

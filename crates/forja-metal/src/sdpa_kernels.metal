@@ -65,8 +65,8 @@ struct ContiguousSteelAddressing {
             + ulong(first_key) * params.k_strides[1];
         device const uchar *source = key + base * steel_attention_dtype_size(input1_dtype);
         steel_attention_load_tile<T, BK, BD, 1, LD, THREADS>(source,
-            params.k_strides[1], params.k_strides[2], input1_dtype,
-            key_length - first_key, align_K != 0, tile, thread_index);
+            uint(params.k_strides[1]), uint(params.k_strides[2]), input1_dtype,
+            key_length - first_key, align_K != 0, base % 4 == 0, tile, thread_index);
     }
 
     template <typename T, int BK, int BD, int LD, int THREADS>
@@ -75,8 +75,8 @@ struct ContiguousSteelAddressing {
             + ulong(first_key) * params.v_strides[1];
         device const uchar *source = value + base * steel_attention_dtype_size(input2_dtype);
         steel_attention_load_tile<T, BK, BD, LD, 1, THREADS>(source,
-            params.v_strides[1], params.v_strides[2], input2_dtype,
-            key_length - first_key, align_K != 0, tile, thread_index);
+            uint(params.v_strides[1]), uint(params.v_strides[2]), input2_dtype,
+            key_length - first_key, align_K != 0, base % 4 == 0, tile, thread_index);
     }
 };
 

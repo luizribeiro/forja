@@ -1081,7 +1081,16 @@ impl Drop for TemporaryProfileScope {
 thread_local! {
     static FORCED_SDPA_KERNEL: Cell<Option<SdpaKernel>> = const { Cell::new(None) };
     static FORCED_VECTOR_BLOCKS: Cell<Option<u32>> = const { Cell::new(None) };
+    static FORCED_STEEL_VECTORIZED_LOADERS: Cell<Option<bool>> = const { Cell::new(None) };
     static FORCED_SAMPLE_REJECTION_ROUNDS: Cell<Option<u32>> = const { Cell::new(None) };
+}
+
+fn steel_vectorized_loaders() -> u32 {
+    #[cfg(test)]
+    if let Some(enabled) = FORCED_STEEL_VECTORIZED_LOADERS.with(Cell::get) {
+        return u32::from(enabled);
+    }
+    1
 }
 
 fn sample_rejection_rounds(configured: u32) -> u32 {
@@ -3632,10 +3641,17 @@ impl MetalBackend {
             _ => None,
         } {
             let (block_query, block_key) = steel_attention_tile(kernel, q[2])?;
+            if !steel_loader_offsets_fit(&query.layout, block_query)
+                || !steel_loader_offsets_fit(&key.layout, block_key)
+                || !steel_loader_offsets_fit(&value.layout, block_key)
+            {
+                return Err(BackendError::UnsupportedOperation);
+            }
             let mut steel_constants = constants.clone();
             steel_constants.extend([
                 (214, u32::from(key_length % block_key == 0)),
                 (215, u32::from(causal)),
+                (217, steel_vectorized_loaders()),
             ]);
             let pipeline = self
                 .pipelines
@@ -4956,11 +4972,18 @@ impl MetalBackend {
     }
 
     fn prepare_sdpa_kernel(&self, dispatch: &Dispatch) -> Result<SdpaKernel, BackendError> {
-        let kernel = select_sdpa(dispatch)?;
+        let mut kernel = select_sdpa(dispatch)?;
         let [query, key, value] = dispatch.inputs() else {
             return Err(BackendError::InvalidInput);
         };
         let [_, _, width] = shape3(query.layout())?;
+        if matches!(kernel, SdpaKernel::Steel | SdpaKernel::SteelHalf) {
+            kernel = steel_kernel_for_loaders(
+                kernel,
+                width,
+                [query.layout(), key.layout(), value.layout()],
+            )?;
+        }
         let (name, constants, fallback) = match kernel {
             kernel @ (SdpaKernel::Vector | SdpaKernel::VectorGqa) => {
                 let fast_f32 = vector_f32_supported(dispatch);
@@ -8176,7 +8199,7 @@ fn steel_attention_tile(kernel: SdpaKernel, width: u32) -> Result<(u32, u32), Ba
 fn steel_attention_constants(
     dispatch: &Dispatch,
     kernel: SdpaKernel,
-) -> Result<[(u32, u32); 6], BackendError> {
+) -> Result<[(u32, u32); 7], BackendError> {
     let [query, key, value] = dispatch.inputs() else {
         return Err(BackendError::InvalidInput);
     };
@@ -8193,7 +8216,34 @@ fn steel_attention_constants(
         (3, dtype_code(value.layout().dtype())),
         (211, u32::from(key_length % block_key == 0)),
         (212, u32::from(causal)),
+        (217, steel_vectorized_loaders()),
     ])
+}
+
+fn steel_loader_offsets_fit(layout: &Layout, block_rows: u32) -> bool {
+    layout
+        .strides()
+        .get(1)
+        .filter(|stride| stride.is_multiple_of(4))
+        .and_then(|stride| u64::from(block_rows).checked_mul(*stride))
+        .is_some_and(|offset| u32::try_from(offset).is_ok())
+}
+
+fn steel_kernel_for_loaders(
+    kernel: SdpaKernel,
+    width: u32,
+    layouts: [&Layout; 3],
+) -> Result<SdpaKernel, BackendError> {
+    let (block_query, block_key) = steel_attention_tile(kernel, width)?;
+    let supported = steel_loader_offsets_fit(layouts[0], block_query)
+        && layouts[1..]
+            .iter()
+            .all(|layout| steel_loader_offsets_fit(layout, block_key));
+    Ok(if supported {
+        kernel
+    } else {
+        SdpaKernel::Decomposed
+    })
 }
 
 fn select_sdpa(dispatch: &Dispatch) -> Result<SdpaKernel, BackendError> {
@@ -12829,6 +12879,20 @@ mod tests {
         }
     }
 
+    struct SteelLoaderOverride(Option<bool>);
+
+    impl SteelLoaderOverride {
+        fn set(enabled: bool) -> Self {
+            Self(FORCED_STEEL_VECTORIZED_LOADERS.with(|forced| forced.replace(Some(enabled))))
+        }
+    }
+
+    impl Drop for SteelLoaderOverride {
+        fn drop(&mut self) {
+            FORCED_STEEL_VECTORIZED_LOADERS.with(|forced| forced.set(self.0));
+        }
+    }
+
     fn assert_sdpa_with(
         kernel: SdpaKernel,
         op: Op,
@@ -13285,6 +13349,126 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn steel_loaders_reject_unaligned_or_wide_row_offsets() {
+        let wide_stride = u64::from(u32::MAX).div_ceil(16).next_multiple_of(4);
+        for stride in [129, wide_stride] {
+            let layout =
+                Layout::new(DType::F32, 0, vec![1, 2, 1], vec![0, stride, 1], u64::MAX).unwrap();
+            assert!(!steel_loader_offsets_fit(&layout, 16));
+            let selected = steel_kernel_for_loaders(SdpaKernel::SteelHalf, 128, [&layout; 3]);
+            assert_eq!(selected.unwrap(), SdpaKernel::Decomposed);
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn metal_vectorized_steel_loaders_match_scalar_bits() {
+        const QUERY_HEADS: u32 = 32;
+        const KV_HEADS: u32 = 4;
+        const LENGTH: u32 = 33;
+        const WIDTH: u32 = 128;
+        let backend = MetalBackend::new().unwrap();
+        let query = backend
+            .alloc(DType::F32, &[QUERY_HEADS, LENGTH, WIDTH])
+            .unwrap();
+        let key = backend
+            .alloc(DType::BF16, &[KV_HEADS, LENGTH, WIDTH])
+            .unwrap();
+        let value = backend
+            .alloc(DType::BF16, &[KV_HEADS, LENGTH, WIDTH])
+            .unwrap();
+        let output = backend
+            .alloc(DType::F32, &[QUERY_HEADS, LENGTH, WIDTH])
+            .unwrap();
+        let query_values = (0..query.layout().element_count())
+            .flat_map(|index| {
+                let value = f32::from(u8::try_from(index % 127).unwrap()) / 127.0 - 0.5;
+                value.to_le_bytes()
+            })
+            .collect::<Vec<_>>();
+        backend.write(&query, &query_values).unwrap();
+        let cache_values =
+            patterned_bf16(usize::try_from(key.layout().element_count()).unwrap(), 113);
+        backend.write(&key, &cache_values).unwrap();
+        backend.write(&value, &cache_values).unwrap();
+        let op = Op::Sdpa {
+            scale: 128.0_f32.sqrt().recip(),
+            causal: true,
+            q_start: 0,
+        };
+        let run = |vectorized| {
+            let _loaders = SteelLoaderOverride::set(vectorized);
+            run_sdpa_kernel(
+                &backend,
+                SdpaKernel::SteelHalf,
+                op,
+                &[&query, &key, &value],
+                &output,
+            )
+        };
+        let scalar = run(false);
+        let vectorized = run(true);
+        assert_eq!(scalar, vectorized);
+
+        let paged_key = backend
+            .alloc(DType::BF16, &[2, 64, KV_HEADS, WIDTH])
+            .unwrap();
+        let paged_value = backend
+            .alloc(DType::BF16, &[2, 64, KV_HEADS, WIDTH])
+            .unwrap();
+        let table = backend.alloc(DType::U32, &[1, 2]).unwrap();
+        let generations = backend.alloc(DType::U32, &[2]).unwrap();
+        let paged_output = backend
+            .alloc(DType::F32, &[QUERY_HEADS, LENGTH, WIDTH])
+            .unwrap();
+        let paged_values = patterned_bf16(
+            usize::try_from(paged_key.layout().element_count()).unwrap(),
+            109,
+        );
+        backend.write(&paged_key, &paged_values).unwrap();
+        backend.write(&paged_value, &paged_values).unwrap();
+        backend
+            .write(&table, &[1_u32.to_le_bytes(), 7_u32.to_le_bytes()].concat())
+            .unwrap();
+        backend
+            .write(
+                &generations,
+                &[0_u32.to_le_bytes(), 7_u32.to_le_bytes()].concat(),
+            )
+            .unwrap();
+        let paged_op = Op::PagedSdpa {
+            scale: 128.0_f32.sqrt().recip(),
+            causal: true,
+            q_start: 0,
+            key_length: LENGTH,
+            page_tokens: 64,
+        };
+        let run_paged = |vectorized| {
+            let mut commands = CommandList::new();
+            commands
+                .dispatch(
+                    paged_op,
+                    &[&query, &paged_key, &paged_value, &table, &generations],
+                    &paged_output,
+                )
+                .unwrap();
+            let selection = backend
+                .validate_variant(commands.last_dispatch().unwrap(), "paged-sdpa.steel-half")
+                .unwrap();
+            assert!(commands.set_last_backend_data(BackendDispatchData::new(selection)));
+            let submission = {
+                let _loaders = SteelLoaderOverride::set(vectorized);
+                backend.submit(commands).unwrap()
+            };
+            submission.wait().unwrap();
+            backend.read(&paged_output).unwrap()
+        };
+        let paged_scalar = run_paged(false);
+        let paged_vectorized = run_paged(true);
+        assert_eq!(paged_scalar, paged_vectorized);
     }
 
     #[test]
