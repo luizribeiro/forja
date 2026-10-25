@@ -57,6 +57,7 @@ pub(crate) enum MetalVariant {
     PagedSdpaSteel,
     PagedSdpaSteelHalf,
     PagedSdpaSteelHalf32x16,
+    PagedSdpaSteelHalf64x16,
     TopKPortable,
     TopKSingleK8,
     TopKPartials,
@@ -967,6 +968,15 @@ pub(crate) static REGISTRY: &[VariantDef<MetalVariant>] = &[
         &["Uses 32x16 tiles with half MMA inputs and f32 accumulation."]
     ),
     batch_invariant_variant!(
+        "paged-sdpa.steel-half-64x16",
+        PagedSdpa,
+        PagedSdpaSteelHalf64x16,
+        PAGED_SDPA_STEEL_HALF_128,
+        &["reduced-precision paged-cache prefill with long query blocks."],
+        &["f32 caches, single-token decode, or shorter query blocks."],
+        &["Uses 64x16 tiles with half MMA inputs and f32 accumulation."]
+    ),
+    batch_invariant_variant!(
         "sdpa.portable",
         Sdpa,
         SdpaPortable,
@@ -1676,6 +1686,7 @@ mod tests {
                 "paged-sdpa.steel",
                 "paged-sdpa.steel-half",
                 "paged-sdpa.steel-half-32x16",
+                "paged-sdpa.steel-half-64x16",
                 "sdpa.portable",
                 "sdpa.decomposed",
                 "sdpa.vector-single-pass",
@@ -2124,6 +2135,7 @@ mod tests {
         let f32 = paged_sdpa_dispatch(DType::F32, 7, 128);
         assert!(resolve(&reduced, "paged-sdpa.steel-half", METAL4).is_ok());
         assert!(resolve(&reduced, "paged-sdpa.steel-half-32x16", METAL4).is_ok());
+        assert!(resolve(&reduced, "paged-sdpa.steel-half-64x16", METAL4).is_ok());
         assert!(matches!(
             resolve(&decode, "paged-sdpa.steel-half", METAL4),
             Err(VariantError::Constraint { .. })
@@ -2503,6 +2515,11 @@ mod tests {
                 "paged-sdpa.steel-half-32x16",
                 paged_sdpa_dispatch(DType::F16, 2, 128),
                 "paged_steel_attention_half_128_32x16",
+            ),
+            (
+                "paged-sdpa.steel-half-64x16",
+                paged_sdpa_dispatch(DType::F16, 2, 128),
+                "paged_steel_attention_half_128_64x16",
             ),
             (
                 "top-k.portable",

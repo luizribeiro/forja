@@ -835,7 +835,11 @@ fn check_paged_sdpa_real_shapes(dtype: DType, shapes: &[(u32, u32)], query_head_
         let variants: &[&str] = match (dtype, query_length) {
             (_, 1) => &["paged-sdpa.vector"],
             (DType::F32, _) => &["paged-sdpa.steel"],
-            _ => &["paged-sdpa.steel-half", "paged-sdpa.steel-half-32x16"],
+            _ => &[
+                "paged-sdpa.steel-half",
+                "paged-sdpa.steel-half-32x16",
+                "paged-sdpa.steel-half-64x16",
+            ],
         };
         for &variant in variants {
             let candidate = run_sdpa(
@@ -1321,12 +1325,38 @@ fn metal_paged_sdpa_matches_causal_prefill() {
             .map(|value| value.to_bits())
             .collect::<Vec<_>>()
     );
+    let wide = run_sdpa(
+        &metal,
+        DType::F16,
+        11,
+        11,
+        true,
+        true,
+        32,
+        4,
+        (0, 0),
+        &[],
+        Some("paged-sdpa.steel-half-64x16"),
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        candidate
+            .iter()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>(),
+        wide.iter().map(|value| value.to_bits()).collect::<Vec<_>>()
+    );
 }
 
 #[test]
 fn metal_paged_steel_refuses_corrupt_entries() {
     let metal = forja_metal::MetalBackend::new().unwrap();
-    for variant in ["paged-sdpa.steel-half", "paged-sdpa.steel-half-32x16"] {
+    for variant in [
+        "paged-sdpa.steel-half",
+        "paged-sdpa.steel-half-32x16",
+        "paged-sdpa.steel-half-64x16",
+    ] {
         let error = run_sdpa(
             &metal,
             DType::F16,
