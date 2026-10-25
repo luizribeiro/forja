@@ -536,13 +536,45 @@ fn run_sdpa<B: Backend + 'static>(
     variant: Option<&str>,
     rejected_output: Option<&mut Vec<f32>>,
 ) -> Result<Vec<f32>, BackendError> {
-    const PAGE_TOKENS: u32 = 64;
+    run_sdpa_with_page_tokens(
+        backend,
+        dtype,
+        key_length,
+        query_length,
+        causal,
+        contiguous,
+        query_heads,
+        kv_heads,
+        head_offsets,
+        corrupt_pages,
+        variant,
+        rejected_output,
+        64,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_sdpa_with_page_tokens<B: Backend + 'static>(
+    backend: &B,
+    dtype: DType,
+    key_length: u32,
+    query_length: u32,
+    causal: bool,
+    contiguous: bool,
+    query_heads: u32,
+    kv_heads: u32,
+    head_offsets: (u32, u32),
+    corrupt_pages: &[usize],
+    variant: Option<&str>,
+    rejected_output: Option<&mut Vec<f32>>,
+    page_tokens: u32,
+) -> Result<Vec<f32>, BackendError> {
     const WIDTH: u32 = 128;
 
     let q_start = key_length
         .checked_sub(query_length)
         .ok_or(BackendError::InvalidInput)?;
-    let logical_pages = key_length.div_ceil(PAGE_TOKENS);
+    let logical_pages = key_length.div_ceil(page_tokens);
     let (physical_pages, entries) = paged_entries(logical_pages, contiguous);
     let mut generations = page_generations(physical_pages);
     for &logical_page in corrupt_pages {
@@ -551,13 +583,13 @@ fn run_sdpa<B: Backend + 'static>(
     let (query_head_offset, kv_head_offset) = head_offsets;
     let kv_element_offset = kv_head_offset.checked_mul(WIDTH).unwrap();
     let plane_elements = usize::try_from(kv_heads * WIDTH).unwrap();
-    let pool_tokens = usize::try_from(physical_pages * PAGE_TOKENS).unwrap();
+    let pool_tokens = usize::try_from(physical_pages * page_tokens).unwrap();
     let mut keys = vec![f32::NAN; pool_tokens * plane_elements];
     let mut values = vec![f32::NAN; pool_tokens * plane_elements];
     for token in 0..key_length {
-        let logical_page = token / PAGE_TOKENS;
+        let logical_page = token / page_tokens;
         let physical = entries[usize::try_from(logical_page).unwrap()].0;
-        let physical_token = physical * PAGE_TOKENS + token % PAGE_TOKENS;
+        let physical_token = physical * page_tokens + token % page_tokens;
         let base = usize::try_from(physical_token).unwrap() * plane_elements;
         for element in 0..plane_elements {
             let seed = kv_element_offset
@@ -572,8 +604,8 @@ fn run_sdpa<B: Backend + 'static>(
     let query_values = seeded_query_values(query_heads, query_length, WIDTH, query_head_offset);
     let query_storage = backend.alloc(DType::F32, &[query_length, query_heads, WIDTH])?;
     let query = backend.view(&query_storage, ViewOp::Permute(vec![1, 0, 2]))?;
-    let key = backend.alloc(dtype, &[physical_pages, PAGE_TOKENS, kv_heads, WIDTH])?;
-    let value = backend.alloc(dtype, &[physical_pages, PAGE_TOKENS, kv_heads, WIDTH])?;
+    let key = backend.alloc(dtype, &[physical_pages, page_tokens, kv_heads, WIDTH])?;
+    let value = backend.alloc(dtype, &[physical_pages, page_tokens, kv_heads, WIDTH])?;
     let table = backend.alloc(DType::U32, &[logical_pages, 2])?;
     let generation_tensor = backend.alloc(DType::U32, &[physical_pages])?;
     let activity = backend.alloc(DType::U32, &[1])?;
@@ -603,7 +635,7 @@ fn run_sdpa<B: Backend + 'static>(
                 causal,
                 q_start,
                 key_length,
-                page_tokens: PAGE_TOKENS,
+                page_tokens,
             },
             &[&query, &key, &value, &table, &generation_tensor, &activity],
             &output,
@@ -615,7 +647,7 @@ fn run_sdpa<B: Backend + 'static>(
             .unwrap();
         let selection = metal
             .validate_variant(commands.last_dispatch().unwrap(), name)
-            .unwrap();
+            .map_err(|_| BackendError::UnsupportedOperation)?;
         assert!(commands.set_last_backend_data(BackendDispatchData::new(selection)));
     }
     finish_sdpa(backend, &output, backend.submit(commands)?, rejected_output)
@@ -1191,6 +1223,29 @@ fn metal_paged_sdpa_falls_back_after_a_consecutive_prefix() {
                 <= forja_testing::F16_TOLERANCE,
             "variant={variant}"
         );
+    }
+}
+
+#[test]
+fn metal_paged_steel_refuses_tiles_crossing_page_boundaries() {
+    let metal = forja_metal::MetalBackend::new().unwrap();
+    for page_tokens in [24, 40] {
+        let result = run_sdpa_with_page_tokens(
+            &metal,
+            DType::F16,
+            page_tokens + 9,
+            7,
+            true,
+            false,
+            16,
+            8,
+            (0, 0),
+            &[],
+            Some("paged-sdpa.steel-half"),
+            None,
+            page_tokens,
+        );
+        assert_eq!(result.unwrap_err(), BackendError::UnsupportedOperation);
     }
 }
 

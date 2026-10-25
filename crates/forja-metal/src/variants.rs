@@ -619,11 +619,13 @@ const PAGED_SDPA_STEEL: &[Constraint] = &[
         left: PAGED_KEY_WIDTH,
         right: PAGED_VALUE_WIDTH,
     },
+    operation(OperationValue::PageTokens, Relation::MultipleOf(32)),
 ];
 const PAGED_SDPA_STEEL_HALF: &[Constraint] = &[
     PAGED_SDPA_STEEL[0],
     PAGED_SDPA_STEEL[1],
     PAGED_SDPA_STEEL[2],
+    PAGED_SDPA_STEEL[3],
     Constraint::DType {
         tensor: KEY,
         allowed: REDUCED_DTYPES,
@@ -1959,8 +1961,8 @@ mod tests {
         let query = backend
             .alloc(DType::F32, &[query_heads, query_length, width])
             .unwrap();
-        let key = backend.alloc(dtype, &[2, 4, kv_heads, width]).unwrap();
-        let value = backend.alloc(dtype, &[2, 4, kv_heads, width]).unwrap();
+        let key = backend.alloc(dtype, &[2, 32, kv_heads, width]).unwrap();
+        let value = backend.alloc(dtype, &[2, 32, kv_heads, width]).unwrap();
         let table = backend.alloc(DType::U32, &[2, 2]).unwrap();
         let generations = backend.alloc(DType::U32, &[2]).unwrap();
         let output = backend
@@ -1974,7 +1976,7 @@ mod tests {
                     causal: false,
                     q_start: 0,
                     key_length: 7,
-                    page_tokens: 4,
+                    page_tokens: 32,
                 },
                 &[&query, &key, &value, &table, &generations],
                 &output,

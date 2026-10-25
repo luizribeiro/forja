@@ -428,12 +428,15 @@ fn operation_expression(
     value: OperationValue,
     canonical: &str,
 ) -> Result<Expression, ConstraintProofError> {
-    let TemplateOp::Static(operation) = operation else {
-        return Err(ConstraintProofError::Unsupported {
-            constraint: canonical.to_owned(),
-        });
+    let value = match (operation, value) {
+        (
+            TemplateOp::PagedCopy { page_tokens, .. } | TemplateOp::PagedSdpa { page_tokens, .. },
+            OperationValue::PageTokens,
+        ) => Some(u64::from(page_tokens)),
+        (TemplateOp::Static(operation), value) => operation_value(operation, value),
+        _ => None,
     };
-    let Some(value) = operation_value(operation, value) else {
+    let Some(value) = value else {
         return Err(ConstraintProofError::Unsupported {
             constraint: canonical.to_owned(),
         });
@@ -1036,6 +1039,30 @@ mod tests {
             ),
             Err(ConstraintProofError::Unsupported { .. })
         ));
+    }
+
+    #[test]
+    fn parameterized_paged_operations_expose_page_tokens() {
+        let operations = [
+            TemplateOp::paged_copy(
+                crate::PagedCopyDirection::IntoPages,
+                Affine::parameter(0, 0, 1),
+                64,
+            ),
+            TemplateOp::paged_sdpa(
+                1.0,
+                true,
+                Affine::parameter(0, 0, 1),
+                Affine::parameter(0, 1, 1),
+                64,
+            ),
+        ];
+        for operation in operations {
+            assert_eq!(
+                operation_expression(operation, OperationValue::PageTokens, "page tokens").unwrap(),
+                Expression::constant(64)
+            );
+        }
     }
 
     #[test]

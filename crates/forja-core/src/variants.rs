@@ -122,6 +122,8 @@ pub enum OperationValue {
     GroupSize,
     /// Top-k selection count.
     TopK,
+    /// Number of tokens stored in each cache page.
+    PageTokens,
 }
 
 impl fmt::Display for OperationValue {
@@ -130,6 +132,7 @@ impl fmt::Display for OperationValue {
             Self::Bits => "bits",
             Self::GroupSize => "group size",
             Self::TopK => "k",
+            Self::PageTokens => "page tokens",
         })
     }
 }
@@ -147,6 +150,10 @@ pub fn operation_value(op: Op, value: OperationValue) -> Option<u64> {
             OperationValue::GroupSize,
         ) => Some(u64::from(group_size)),
         (Op::TopK { k, .. }, OperationValue::TopK) => Some(u64::from(k)),
+        (
+            Op::PagedCopy { page_tokens, .. } | Op::PagedSdpa { page_tokens, .. },
+            OperationValue::PageTokens,
+        ) => Some(u64::from(page_tokens)),
         _ => None,
     }
 }
@@ -188,6 +195,7 @@ impl ValueRef {
             Self::Operation(OperationValue::Bits) => "bits",
             Self::Operation(OperationValue::GroupSize) => "group size",
             Self::Operation(OperationValue::TopK) => "k",
+            Self::Operation(OperationValue::PageTokens) => "page tokens",
         }
     }
 }
