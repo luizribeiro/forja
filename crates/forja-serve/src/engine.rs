@@ -33,7 +33,7 @@ mod continuous;
 static NEXT_CHAT_STREAM: AtomicU64 = AtomicU64::new(1);
 
 /// A failure while preparing or running a generation.
-#[derive(Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GenerationError {
     message: String,
     kind: ErrorKind,
@@ -61,6 +61,14 @@ impl GenerationError {
         Self {
             message: message.into(),
             kind: ErrorKind::PayloadTooLarge,
+            paged_bank_in_flight: false,
+        }
+    }
+
+    pub(crate) fn context_length(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            kind: ErrorKind::ContextLength,
             paged_bank_in_flight: false,
         }
     }
@@ -101,6 +109,7 @@ impl GenerationError {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ErrorKind {
     Invalid,
+    ContextLength,
     PayloadTooLarge,
     Internal,
     Unavailable,
@@ -434,7 +443,7 @@ pub enum GenerationEvent {
     /// Clean stream terminator.
     Done,
     /// One terminal error emitted after response headers.
-    Error(String),
+    Error(GenerationError),
 }
 
 /// One loaded engine, tokenizer, and model-declared chat format.
@@ -2343,8 +2352,9 @@ where
     })
     .await
     .map_err(|error| GenerationError::new(format!("prompt worker failed: {error}")))??;
-    let (tokens, prompt_tokens, params) =
-        finish_prompt(tokens, params, max_context, control, "rendered prompt")?;
+    let limits = (max_context, config.request.max_prompt_tokens);
+    let finished = finish_prompt(tokens, params, limits, control, "rendered prompt")?;
+    let (tokens, prompt_tokens, params) = finished;
     Ok((tokens, prompt_tokens, params, constraint))
 }
 
@@ -2391,13 +2401,14 @@ where
     })
     .await
     .map_err(|error| GenerationError::new(format!("prompt worker failed: {error}")))??;
-    finish_prompt(tokens, params, max_context, control, "prompt")
+    let limits = (max_context, config.request.max_prompt_tokens);
+    finish_prompt(tokens, params, limits, control, "prompt")
 }
 
 fn finish_prompt(
     tokens: Vec<u32>,
     params: ResolvedParams,
-    max_context: u32,
+    limits: (u32, Option<u32>),
     control: &GenerationControl,
     description: &str,
 ) -> Result<(Vec<u32>, u32, ResolvedParams), GenerationError> {
@@ -2411,8 +2422,13 @@ fn finish_prompt(
             "{description} tokenized to an empty sequence"
         )));
     }
-    let params = validate_prompt(params, prompt_tokens, max_context)
-        .map_err(|error| GenerationError::invalid(error.to_string()))?;
+    let params = validate_prompt(params, prompt_tokens, limits.0, limits.1).map_err(|error| {
+        if error.is_context_length() {
+            GenerationError::context_length(error.to_string())
+        } else {
+            GenerationError::invalid(error.to_string())
+        }
+    })?;
     Ok((tokens, prompt_tokens, params))
 }
 

@@ -1175,7 +1175,7 @@ async fn text<S: ChatService>(
         return api_error(StatusCode::NOT_FOUND, "model is not loaded");
     }
     if request.params.stream {
-        return stream_text_response(&state, &runtime, request, request_id, deadline);
+        return stream_text_response(&state, &runtime, request, request_id, deadline).await;
     }
     let model = request.model.clone();
     let control = GenerationControl::new(runtime.write_stall_timeout);
@@ -1251,12 +1251,6 @@ async fn stream_chat_response<S: ChatService>(
     let created = unix_time();
     let id = format!("chatcmpl-{created}");
     let (sender, receiver) = mpsc::channel(16);
-    if sender.send(GenerationEvent::Role).await.is_err() {
-        return api_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "cannot start response stream",
-        );
-    }
     let control = GenerationControl::new(runtime.write_stall_timeout);
     let (active, actor) = match admit(
         &state,
@@ -1276,6 +1270,7 @@ async fn stream_chat_response<S: ChatService>(
         Ok(admitted) => admitted,
         Err(response) => return *response,
     };
+    let response_control = control.clone();
     tokio::spawn(async move {
         let _active = active;
         let generation = actor_result(actor);
@@ -1284,10 +1279,10 @@ async fn stream_chat_response<S: ChatService>(
         })
         .await;
     });
-    sse_response(receiver, id, created, model, true)
+    first_stream_response(receiver, id, created, model, true, response_control).await
 }
 
-fn stream_text_response<S: ChatService>(
+async fn stream_text_response<S: ChatService>(
     state: &Arc<HttpState<S>>,
     runtime: &GenerationSnapshot<S>,
     request: CompletionRequest,
@@ -1320,6 +1315,7 @@ fn stream_text_response<S: ChatService>(
         Ok(admitted) => admitted,
         Err(response) => return *response,
     };
+    let response_control = control.clone();
     tokio::spawn(async move {
         let _active = active;
         let generation = actor_result(actor);
@@ -1328,7 +1324,7 @@ fn stream_text_response<S: ChatService>(
         })
         .await;
     });
-    sse_response(receiver, id, created, model, false)
+    first_stream_response(receiver, id, created, model, false, response_control).await
 }
 
 enum DeadlineResult<T> {
@@ -1387,26 +1383,56 @@ async fn controlled_deadline<T, F, N, NF>(
 }
 
 async fn send_stream_error(result: DeadlineResult<()>, sender: &mpsc::Sender<GenerationEvent>) {
-    let message = match result {
+    let error = match result {
         DeadlineResult::Completed(Ok(())) => return,
-        DeadlineResult::Completed(Err(error)) => error.to_string(),
-        DeadlineResult::TimedOut => "request deadline exceeded".to_owned(),
+        DeadlineResult::Completed(Err(error)) => error,
+        DeadlineResult::TimedOut => GenerationError::unavailable("request deadline exceeded"),
     };
-    let _ = sender.send(GenerationEvent::Error(message)).await;
+    let _ = sender.send(GenerationEvent::Error(error)).await;
+}
+
+async fn first_stream_response(
+    mut receiver: mpsc::Receiver<GenerationEvent>,
+    id: String,
+    created: u64,
+    model: String,
+    chat: bool,
+    control: GenerationControl,
+) -> Response {
+    let mut disconnect = CancelOnDrop(Some(control));
+    let Some(first) = receiver.recv().await else {
+        return api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "generation stream ended early",
+        );
+    };
+    if let GenerationEvent::Error(error) = first {
+        return generation_error(&error);
+    }
+    disconnect.0 = None;
+    let initial = if chat {
+        vec![GenerationEvent::Role, first]
+    } else {
+        vec![first]
+    };
+    sse_response(receiver, initial, id, created, model, chat)
 }
 
 fn sse_response(
     receiver: mpsc::Receiver<GenerationEvent>,
+    initial: Vec<GenerationEvent>,
     id: String,
     created: u64,
     model: String,
     chat: bool,
 ) -> Response {
-    let stream = ReceiverStream::new(receiver).map(move |event| {
-        Ok::<Event, Infallible>(
-            Event::default().data(stream_data(event, &id, created, &model, chat)),
-        )
-    });
+    let stream = tokio_stream::iter(initial)
+        .chain(ReceiverStream::new(receiver))
+        .map(move |event| {
+            Ok::<Event, Infallible>(
+                Event::default().data(stream_data(event, &id, created, &model, chat)),
+            )
+        });
     Sse::new(stream).into_response()
 }
 
@@ -1466,7 +1492,9 @@ fn stream_data(event: GenerationEvent, id: &str, created: u64, model: &str, chat
         })
         .to_string(),
         GenerationEvent::Done => "[DONE]".to_owned(),
-        GenerationEvent::Error(message) => error_value(&message, "server_error").to_string(),
+        GenerationEvent::Error(error) => {
+            error_value(&error.to_string(), "server_error").to_string()
+        }
     }
 }
 
@@ -1622,6 +1650,11 @@ fn body_error(error: BodyError) -> Response {
 fn generation_error(error: &GenerationError) -> Response {
     match error.kind() {
         ErrorKind::Invalid => api_error(StatusCode::BAD_REQUEST, &error.to_string()),
+        ErrorKind::ContextLength => api_error_code(
+            StatusCode::BAD_REQUEST,
+            &error.to_string(),
+            "context_length_exceeded",
+        ),
         ErrorKind::PayloadTooLarge => api_error(StatusCode::PAYLOAD_TOO_LARGE, &error.to_string()),
         ErrorKind::Internal => api_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
         ErrorKind::Unavailable => api_error(StatusCode::SERVICE_UNAVAILABLE, &error.to_string()),
@@ -1635,6 +1668,12 @@ fn api_error(status: StatusCode, message: &str) -> Response {
         "server_error"
     };
     (status, Json(error_value(message, error_type))).into_response()
+}
+
+fn api_error_code(status: StatusCode, message: &str, code: &str) -> Response {
+    let mut value = error_value(message, "invalid_request_error");
+    value["error"]["code"] = Value::String(code.to_owned());
+    (status, Json(value)).into_response()
 }
 
 fn error_value(message: &str, error_type: &str) -> Value {
@@ -1737,11 +1776,17 @@ mod tests {
 
         fn complete(
             &mut self,
-            _: ChatCompletionRequest,
+            request: ChatCompletionRequest,
             _: GenerationControl,
         ) -> Pin<Box<dyn Future<Output = Result<Completion, GenerationError>> + Send + '_>>
         {
-            Box::pin(async { Ok(smoke_completion()) })
+            Box::pin(async move {
+                if request.params.max_tokens == Some(999) {
+                    Err(GenerationError::context_length("context is full"))
+                } else {
+                    Ok(smoke_completion())
+                }
+            })
         }
 
         fn complete_text(
@@ -1762,11 +1807,14 @@ mod tests {
 
         fn stream_chat(
             &mut self,
-            _: ChatCompletionRequest,
+            request: ChatCompletionRequest,
             sender: mpsc::Sender<GenerationEvent>,
             _: GenerationControl,
         ) -> Pin<Box<dyn Future<Output = Result<(), GenerationError>> + Send + '_>> {
             Box::pin(async move {
+                if request.params.max_tokens == Some(999) {
+                    return Err(GenerationError::context_length("context is full"));
+                }
                 sender
                     .send(GenerationEvent::Content("forged".to_owned()))
                     .await
@@ -1994,6 +2042,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn context_length_errors_are_400_before_streaming() {
+        for stream in [false, true] {
+            let body =
+                format!(r#"{{"model":"smoke","messages":[],"max_tokens":999,"stream":{stream}}}"#);
+            let response = chat::<Smoke>(
+                State(state()),
+                Request::builder()
+                    .body(axum::body::Body::from(body))
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let body = to_bytes(response.into_body(), 1_024).await.unwrap();
+            let value: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(value["error"]["type"], "invalid_request_error");
+            assert_eq!(value["error"]["code"], "context_length_exceeded");
+        }
+    }
+
+    #[tokio::test]
+    async fn real_engine_rejects_templated_context_overflow_before_streaming() {
+        let (engine, _weights) = continuous_engine_with_context(None, 2).await.unwrap();
+        let state = test_state(engine);
+        for stream in [false, true] {
+            let body = format!(
+                r#"{{"model":"smoke","messages":[{{"role":"user","content":"ignored"}}],"max_tokens":2,"stream":{stream}}}"#
+            );
+            let response = chat::<crate::ServingEngine<forja_cpu::CpuBackend>>(
+                State(Arc::clone(&state)),
+                Request::builder()
+                    .body(axum::body::Body::from(body))
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_ne!(
+                response.headers().get(header::CONTENT_TYPE).unwrap(),
+                "text/event-stream"
+            );
+            let body = to_bytes(response.into_body(), 1_024).await.unwrap();
+            assert!(!body.starts_with(b"data:"));
+            let value: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(value["error"]["code"], "context_length_exceeded");
+        }
+
+        let response = chat::<crate::ServingEngine<forja_cpu::CpuBackend>>(
+            State(state),
+            Request::builder()
+                .body(axum::body::Body::from(
+                    r#"{"model":"smoke","messages":[{"role":"user","content":"ignored"}],"max_tokens":1}"#,
+                ))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
     async fn live_policy_lowers_the_request_body_ceiling() {
         let state = state();
         let handle = DrainHandle {
@@ -2110,7 +2216,7 @@ mod tests {
         assert_eq!(chat_response.status(), StatusCode::NOT_FOUND);
         assert_eq!(text_response.status(), StatusCode::NOT_FOUND);
         assert_eq!(stream_chat_response.status(), StatusCode::NOT_FOUND);
-        assert_eq!(stream_text_response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(stream_text_response.await.status(), StatusCode::NOT_FOUND);
         assert!(state.active.lock().unwrap().is_empty());
     }
 
@@ -2598,6 +2704,26 @@ mod tests {
     async fn continuous_actor_with_barrier(
         barrier: Option<Arc<crate::engine::BatchTestBarrier>>,
     ) -> Result<(ContinuousActor, TestWeights), Box<dyn Error + Send + Sync>> {
+        let (engine, weights) = continuous_engine_with_barrier(barrier).await?;
+        Ok((ServiceActor::spawn(engine, 16), weights))
+    }
+
+    async fn continuous_engine_with_barrier(
+        barrier: Option<Arc<crate::engine::BatchTestBarrier>>,
+    ) -> Result<
+        (crate::ServingEngine<forja_cpu::CpuBackend>, TestWeights),
+        Box<dyn Error + Send + Sync>,
+    > {
+        continuous_engine_with_context(barrier, 32).await
+    }
+
+    async fn continuous_engine_with_context(
+        barrier: Option<Arc<crate::engine::BatchTestBarrier>>,
+        max_context: u32,
+    ) -> Result<
+        (crate::ServingEngine<forja_cpu::CpuBackend>, TestWeights),
+        Box<dyn Error + Send + Sync>,
+    > {
         let weights = test_weights()?;
         let mut runner = EngineRunner::new(
             test_guests::engine_smoke(),
@@ -2638,14 +2764,14 @@ mod tests {
             chat_format,
             config,
             info,
-            32,
+            max_context,
             16,
             crate::PrefixIdentity::new(["engine", "profile", "weights", "tokenizer", "chat"])?,
         )?;
         if let Some(barrier) = barrier {
             engine.set_batch_test_barrier(barrier);
         }
-        Ok((ServiceActor::spawn(engine, 16), weights))
+        Ok((engine, weights))
     }
 
     fn text_request(prompt: &str, max_tokens: u32) -> CompletionRequest {

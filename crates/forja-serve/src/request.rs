@@ -172,6 +172,7 @@ pub struct ResolvedParams {
 pub struct ValidationError {
     message: String,
     too_large: bool,
+    context_length: bool,
 }
 
 impl fmt::Display for ValidationError {
@@ -199,7 +200,8 @@ pub fn validate_chat(
     validate_prompt(
         params,
         prompt_tokens,
-        configured_context(config, max_context),
+        max_context,
+        config.request.max_prompt_tokens,
     )
 }
 
@@ -251,7 +253,8 @@ pub fn validate_completion(
     validate_prompt(
         params,
         prompt_tokens,
-        configured_context(config, max_context),
+        max_context,
+        config.request.max_prompt_tokens,
     )
 }
 
@@ -322,18 +325,24 @@ fn resolve(
 }
 
 pub(crate) fn validate_prompt(
-    mut params: ResolvedParams,
+    params: ResolvedParams,
     prompt_tokens: u32,
     max_context: u32,
+    max_prompt_tokens: Option<u32>,
 ) -> Result<ResolvedParams, ValidationError> {
-    let remaining_context = max_context
-        .checked_sub(prompt_tokens)
-        .filter(|&remaining| remaining > 0)
-        .ok_or_else(|| ValidationError {
-            message: "prompt exceeds the configured context ceiling".to_owned(),
-            too_large: false,
-        })?;
-    params.max_tokens = params.max_tokens.min(remaining_context);
+    if max_prompt_tokens.is_some_and(|ceiling| prompt_tokens > ceiling) {
+        return invalid("prompt exceeds the configured prompt-token ceiling");
+    }
+    let total = u64::from(prompt_tokens)
+        .checked_add(u64::from(params.max_tokens))
+        .ok_or_else(|| context_length_error(prompt_tokens, params.max_tokens, max_context))?;
+    if total > u64::from(max_context) {
+        return Err(context_length_error(
+            prompt_tokens,
+            params.max_tokens,
+            max_context,
+        ));
+    }
     Ok(params)
 }
 
@@ -349,21 +358,15 @@ pub(crate) fn reservation_tokens(
         .ok_or_else(|| ValidationError {
             message: "cached tokens exceed the prompt length".to_owned(),
             too_large: false,
+            context_length: false,
         })?;
     u64::from(suffix)
         .checked_add(u64::from(params.max_tokens))
         .ok_or_else(|| ValidationError {
             message: "reservation token count overflowed".to_owned(),
             too_large: true,
+            context_length: false,
         })
-}
-
-fn configured_context(config: &HostConfig, engine_profile_context: u32) -> u32 {
-    config
-        .request
-        .max_prompt_tokens
-        .unwrap_or(engine_profile_context)
-        .min(engine_profile_context)
 }
 
 /// Resolves the context supported jointly by an engine, profile, and host configuration.
@@ -389,6 +392,7 @@ pub fn serving_context_ceiling(
                 configured.get()
             ),
             too_large: false,
+            context_length: false,
         });
     }
     if configured.get() > profile_max_context {
@@ -398,6 +402,7 @@ pub fn serving_context_ceiling(
                 configured.get()
             ),
             too_large: false,
+            context_length: false,
         });
     }
     Ok(configured.get())
@@ -411,10 +416,12 @@ where
         let length = length.try_into().map_err(|_| ValidationError {
             message: "request text size overflowed".to_owned(),
             too_large: false,
+            context_length: false,
         })?;
         sum.checked_add(length).ok_or_else(|| ValidationError {
             message: "request text size overflowed".to_owned(),
             too_large: false,
+            context_length: false,
         })
     })
 }
@@ -708,6 +715,7 @@ fn invalid<T>(message: &str) -> Result<T, ValidationError> {
     Err(ValidationError {
         message: message.to_owned(),
         too_large: false,
+        context_length: false,
     })
 }
 
@@ -715,12 +723,27 @@ fn too_large<T>(message: &str) -> Result<T, ValidationError> {
     Err(ValidationError {
         message: message.to_owned(),
         too_large: true,
+        context_length: false,
     })
+}
+
+fn context_length_error(prompt: u32, output: u32, maximum: u32) -> ValidationError {
+    ValidationError {
+        message: format!(
+            "maximum context length is {maximum} tokens, but the request has {prompt} prompt tokens and requests {output} completion tokens"
+        ),
+        too_large: false,
+        context_length: true,
+    }
 }
 
 impl ValidationError {
     pub(crate) const fn is_too_large(&self) -> bool {
         self.too_large
+    }
+
+    pub(crate) const fn is_context_length(&self) -> bool {
+        self.context_length
     }
 }
 
@@ -754,7 +777,7 @@ mod tests {
             151_936,
             true,
         )?;
-        validate_prompt(resolved, prompt_tokens, max_context)
+        validate_prompt(resolved, prompt_tokens, max_context, None)
     }
 
     fn info(sampling: SamplingDefaults) -> ChatInfo {
@@ -880,7 +903,7 @@ mod tests {
     }
 
     #[test]
-    fn request_values_override_defaults_and_context_clamps_output() {
+    fn request_values_override_defaults() {
         let defaults = info(SamplingDefaults {
             temperature: Some(0.7),
             top_p: Some(0.8),
@@ -894,8 +917,8 @@ mod tests {
             top_k: Some(7),
             ..CompletionParams::default()
         };
-        let resolved = resolve_chat(&params, &defaults, 32_700, 32_768).unwrap();
-        assert_eq!(resolved.max_tokens, 68);
+        let resolved = resolve_chat(&params, &defaults, 32_000, 32_768).unwrap();
+        assert_eq!(resolved.max_tokens, 100);
         assert_eq!(resolved.temperature.to_bits(), 0.2_f32.to_bits());
         assert_eq!(resolved.top_p.to_bits(), 0.8_f32.to_bits());
         assert_eq!(resolved.top_k, 7);
@@ -1082,10 +1105,19 @@ mod tests {
             151_936,
         )
         .unwrap_err();
-        assert_eq!(
-            error.to_string(),
-            "prompt exceeds the configured context ceiling"
-        );
+        assert!(error.is_context_length());
+        assert!(error.to_string().contains("32768 prompt tokens"));
+
+        let lowered = validate_chat(
+            &chat(CompletionParams::default()),
+            &HostConfig::default(),
+            &default_info(),
+            4_000,
+            4_096,
+            151_936,
+        )
+        .unwrap_err();
+        assert!(lowered.is_context_length());
     }
 
     #[test]
