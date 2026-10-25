@@ -346,6 +346,45 @@ fn print_totals(title: &str, totals: BTreeMap<&str, Total>, gpu_time: Duration) 
     }
 }
 
+fn whole_run_json(measurement: &TokenProfile) -> Result<serde_json::Value, &'static str> {
+    if measurement.step.submissions.is_empty() {
+        return Err("profiled step has no submission detail");
+    }
+    let dispatches = measurement
+        .step
+        .submissions
+        .iter()
+        .flat_map(|submission| submission.per_dispatch.iter().cloned())
+        .collect::<Vec<_>>();
+    let gpu_time = measurement
+        .step
+        .submissions
+        .iter()
+        .fold(Duration::ZERO, |sum, submission| sum + submission.gpu_time);
+    let dispatch_count = measurement
+        .step
+        .submissions
+        .iter()
+        .map(|submission| submission.dispatches)
+        .sum::<u64>();
+    let barriers = measurement
+        .step
+        .submissions
+        .iter()
+        .map(|submission| submission.barriers)
+        .sum::<u64>();
+    Ok(serde_json::json!({
+        "submissions": measurement.step.submissions.len(),
+        "wall_time_seconds": measurement.profiled_wall.as_secs_f64(),
+        "gpu_time_seconds": measurement.profiled_gpu.as_secs_f64(),
+        "submission_gpu_time_seconds": gpu_time.as_secs_f64(),
+        "dispatches": dispatch_count,
+        "barriers": barriers,
+        "by_op": totals_json(aggregate(&dispatches, |item| op_name(item.op)), gpu_time),
+        "by_kernel": totals_json(aggregate(&dispatches, |item| item.kernel), gpu_time),
+    }))
+}
+
 fn report(
     options: &Profile,
     measurement: &TokenProfile,
@@ -360,6 +399,7 @@ fn report(
         .submission
         .as_ref()
         .ok_or("profiled step has no submission detail")?;
+    let whole_run = whole_run_json(measurement)?;
     let timeline = submission
         .per_dispatch
         .iter()
@@ -408,6 +448,7 @@ fn report(
             "wall_time_seconds": measurement.baseline_wall.as_secs_f64(),
             "gpu_time_seconds": measurement.baseline_gpu.as_secs_f64(),
         },
+        "whole_run": whole_run,
         "profiled": {
             "wall_time_seconds": measurement.step.wall_time.as_secs_f64(),
             "gpu_time_seconds": submission.gpu_time.as_secs_f64(),

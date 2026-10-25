@@ -566,8 +566,10 @@ pub struct EngineStepProfile {
     pub releases: ImportProfile,
     /// Host reads of returned tensors after the guest call.
     pub output_read: ImportProfile,
-    /// Detailed timing for the step's submission.
+    /// Detailed timing for the step's last submission.
     pub submission: Option<SubmissionProfile>,
+    /// Detailed timings for every submission made by the step.
+    pub submissions: Vec<SubmissionProfile>,
     /// Memory observed after the step completed.
     pub memory: EngineMemory,
 }
@@ -7391,11 +7393,7 @@ where
             let charged = submission_charge(&wait, reservation.amount(), gpu_time, wall_time);
             let accounting = reservation.settle(charged);
             let result = combine_submission_results(wait, accounting, marked, observed).map(|()| {
-                if let (Some(target), Some(submission_profile)) = (&profile, submission_profile)
-                    && let Ok(mut target) = target.lock()
-                {
-                    target.submission = Some(submission_profile);
-                }
+                record_submission_profile(profile.as_ref(), submission_profile);
                 gpu_time
             });
             let release = release_retained(backend.as_ref(), retained, profile.as_ref());
@@ -7416,6 +7414,18 @@ where
             }
             result
         })
+    }
+}
+
+fn record_submission_profile(
+    profile: Option<&Arc<Mutex<EngineStepProfile>>>,
+    submission: Option<SubmissionProfile>,
+) {
+    if let (Some(target), Some(submission)) = (profile, submission)
+        && let Ok(mut target) = target.lock()
+    {
+        target.submission = Some(submission.clone());
+        target.submissions.push(submission);
     }
 }
 
@@ -8885,8 +8895,8 @@ mod tests {
 
     use forja_core::{
         Backend, BackendError, BufferId, CommandList, DType, Layout, LayoutError, MappedRegion,
-        MemoryUsage, Op, OpError, PagePool, PagedLayout, PagedPlane, Submission, Tensor,
-        ViewOp as CoreViewOp,
+        MemoryUsage, Op, OpError, PagePool, PagedLayout, PagedPlane, Submission, SubmissionProfile,
+        Tensor, ViewOp as CoreViewOp,
         program::{KernelSignature, ValidatedProgram},
     };
     use forja_cpu::CpuBackend;
@@ -8901,12 +8911,37 @@ mod tests {
         SamplingParams, ServingInfo, SubmissionOutcome, TensorEntry,
         bindings::l9o::gpu::{compute, paged_storage},
         core_op, core_program, expected_layer_outputs, is_paged_bank_in_flight,
-        is_paged_lane_release_required, page_pool_pages, paged_backing_pages, validate_batch_lanes,
-        validate_batch_output_layouts, validate_batch_select_lanes, validate_batch_shapes,
+        is_paged_lane_release_required, page_pool_pages, paged_backing_pages,
+        record_submission_profile, validate_batch_lanes, validate_batch_output_layouts,
+        validate_batch_select_lanes, validate_batch_shapes,
     };
 
     const GENEROUS: Limits = Limits::new(u64::MAX, 8, u64::MAX, 32, u64::MAX);
     static NEXT_WEIGHT_FILE: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn profile_retains_every_submission() {
+        let profile = Arc::new(Mutex::new(EngineStepProfile::default()));
+        let active = Some(Arc::clone(&profile));
+        record_submission_profile(
+            active.as_ref(),
+            Some(SubmissionProfile {
+                dispatches: 1,
+                ..SubmissionProfile::default()
+            }),
+        );
+        record_submission_profile(
+            active.as_ref(),
+            Some(SubmissionProfile {
+                dispatches: 2,
+                ..SubmissionProfile::default()
+            }),
+        );
+
+        let profile = profile.lock().unwrap();
+        assert_eq!(profile.submissions.len(), 2);
+        assert_eq!(profile.submission.as_ref().unwrap().dispatches, 2);
+    }
 
     #[test]
     fn classifies_paged_lane_lifecycle_refusals() {

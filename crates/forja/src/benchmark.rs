@@ -46,6 +46,8 @@ pub(crate) struct TokenProfile {
     pub(crate) device: String,
     pub(crate) baseline_wall: Duration,
     pub(crate) baseline_gpu: Duration,
+    pub(crate) profiled_wall: Duration,
+    pub(crate) profiled_gpu: Duration,
     pub(crate) step: EngineStepProfile,
 }
 
@@ -205,14 +207,16 @@ pub(crate) async fn measure_token_profile(
         measure_profile_phase(&mut runner, &tokens, options, decode).await?;
     }
     let baseline = measure_profile_phase(&mut runner, &tokens, options, decode).await?;
-    measure_profiled_phase(&mut runner, &tokens, options, decode).await?;
+    let profiled = measure_profiled_phase(&mut runner, &tokens, options, decode).await?;
     Ok(TokenProfile {
         device,
         baseline_wall: Duration::from_secs_f64(baseline.wall_seconds),
         baseline_gpu: Duration::from_secs_f64(baseline.gpu_seconds),
+        profiled_wall: Duration::from_secs_f64(profiled.wall_seconds),
+        profiled_gpu: Duration::from_secs_f64(profiled.gpu_seconds),
         step: runner
             .take_profile()
-            .ok_or("profiled step produced no timing detail")?,
+            .ok_or("profiled phase produced no timing detail")?,
     })
 }
 
