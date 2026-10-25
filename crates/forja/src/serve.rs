@@ -245,7 +245,7 @@ where
 {
     let PreparedLoad {
         profile,
-        load_config,
+        mut load_config,
         hashes,
         ..
     } = prepared;
@@ -267,6 +267,13 @@ where
     .await
     .map_err(|error| error.to_string())?;
     let info = runner.describe().await.map_err(|error| error.to_string())?;
+    let max_context = forja_serve::serving_context_ceiling(
+        info.max_context,
+        profile.workload().max_context.get(),
+        config.serving.max_context,
+    )
+    .map_err(|error| error.to_string())?;
+    load_config.max_context = Some(max_context);
     runner
         .load_with_selections(None, &load_config)
         .await
@@ -283,7 +290,7 @@ where
         chat_format,
         config.clone(),
         info,
-        profile.workload().max_context.get(),
+        max_context,
         profile
             .serving()
             .map_or(1, |serving| serving.prompt_token_budget.get()),

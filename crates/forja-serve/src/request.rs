@@ -4,7 +4,7 @@ use std::{
     fmt,
 };
 
-use forja_config::HostConfig;
+use forja_config::{Choice, HostConfig};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -374,14 +374,33 @@ fn configured_context(config: &HostConfig, engine_profile_context: u32) -> u32 {
 pub fn serving_context_ceiling(
     engine_max_context: u32,
     profile_max_context: u32,
-    configured: Option<u32>,
+    configured: Choice<std::num::NonZeroU32>,
 ) -> Result<u32, ValidationError> {
     if profile_max_context > engine_max_context {
         return invalid("profile max-context exceeds the engine maximum");
     }
-    Ok(configured
-        .unwrap_or(engine_max_context)
-        .min(profile_max_context))
+    let Choice::Fixed(configured) = configured else {
+        return Ok(profile_max_context);
+    };
+    if configured.get() > engine_max_context {
+        return Err(ValidationError {
+            message: format!(
+                "serving.max_context {} exceeds the engine maximum {engine_max_context}",
+                configured.get()
+            ),
+            too_large: false,
+        });
+    }
+    if configured.get() > profile_max_context {
+        return Err(ValidationError {
+            message: format!(
+                "serving.max_context {} exceeds the profile maximum {profile_max_context}",
+                configured.get()
+            ),
+            too_large: false,
+        });
+    }
+    Ok(configured.get())
 }
 
 fn checked_text_bytes<T>(lengths: impl IntoIterator<Item = T>) -> Result<u64, ValidationError>
@@ -1114,14 +1133,26 @@ mod tests {
     #[test]
     fn context_ceiling_uses_every_loaded_boundary() {
         assert_eq!(
-            serving_context_ceiling(32_768, 16_384, None).unwrap(),
+            serving_context_ceiling(32_768, 16_384, Choice::Auto).unwrap(),
             16_384
         );
         assert_eq!(
-            serving_context_ceiling(32_768, 16_384, Some(8_192)).unwrap(),
+            serving_context_ceiling(
+                32_768,
+                16_384,
+                Choice::Fixed(std::num::NonZeroU32::new(8_192).unwrap()),
+            )
+            .unwrap(),
             8_192
         );
-        assert!(serving_context_ceiling(4_096, 8_192, None).is_err());
+        assert!(serving_context_ceiling(4_096, 8_192, Choice::Auto).is_err());
+        let error = serving_context_ceiling(
+            32_768,
+            16_384,
+            Choice::Fixed(std::num::NonZeroU32::new(20_000).unwrap()),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("profile maximum 16384"));
     }
 
     #[test]

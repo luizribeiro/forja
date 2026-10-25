@@ -26,10 +26,7 @@ use crate::metrics::{ServingMetrics, observe, observe_phase};
 use crate::prefix::{PrefixIdentity, PrefixIndex, PrefixLedger, PrefixLimits, PrefixNamespace};
 use crate::request::{ToolChoice, validate_chat_input, validate_completion_input, validate_prompt};
 use crate::tool_output::{GeneratedToolCall, ToolDelta, ToolOutput};
-use crate::{
-    ChatCompletionRequest, ChatFormat, CompletionRequest, ResolvedParams, StopMatcher,
-    serving_context_ceiling,
-};
+use crate::{ChatCompletionRequest, ChatFormat, CompletionRequest, ResolvedParams, StopMatcher};
 
 mod continuous;
 
@@ -722,12 +719,13 @@ fn resolve_u64_ceiling(
 fn prefix_limits(
     serving: &forja_host::ServingInfo,
     config: &HostConfig,
+    max_context: u32,
 ) -> Result<PrefixLimits, GenerationError> {
     let declared_entries = config.server.queue_length.max(serving.active_lanes);
     let declared_tokens = u64::from(declared_entries)
-        .checked_mul(u64::from(serving.max_context))
+        .checked_mul(u64::from(max_context))
         .ok_or_else(|| GenerationError::new("prefix token limit overflowed"))?;
-    let pages_per_entry = serving.max_context.div_ceil(serving.page_tokens);
+    let pages_per_entry = max_context.div_ceil(serving.page_tokens);
     let declared_pages = declared_entries
         .checked_mul(pages_per_entry)
         .ok_or_else(|| GenerationError::new("prefix page limit overflowed"))?;
@@ -788,16 +786,10 @@ where
         chat_format: ChatFormat,
         config: HostConfig,
         info: EngineInfo,
-        profile_max_context: u32,
+        max_context: u32,
         profile_prompt_budget: u32,
         prefix_identity: PrefixIdentity,
     ) -> Result<Self, GenerationError> {
-        let max_context = serving_context_ceiling(
-            info.max_context,
-            profile_max_context,
-            config.request.max_prompt_tokens,
-        )
-        .map_err(|error| GenerationError::new(error.to_string()))?;
         if tokenizer
             .get_vocab(true)
             .values()
@@ -817,7 +809,7 @@ where
             .serving
             .as_ref()
             .map(|serving| {
-                let limits = prefix_limits(serving, &config)?;
+                let limits = prefix_limits(serving, &config, max_context)?;
                 PrefixIndex::new(limits).map_err(|error| GenerationError::new(error.to_string()))
             })
             .transpose()?;
@@ -873,7 +865,7 @@ where
         let scheduler =
             SchedulerConfig::resolve(&self.info, &config, self.scheduler.profile_prompt_budget)?;
         if let (Some(serving), Some(index)) = (&self.info.serving, &mut self.prefix_index) {
-            let limits = prefix_limits(serving, &config)?;
+            let limits = prefix_limits(serving, &config, self.max_context)?;
             index
                 .reconfigure(limits, config.serving.prefix_reuse)
                 .map_err(|error| GenerationError::new(error.to_string()))?;
@@ -2512,12 +2504,20 @@ mod tests {
     fn explicit_prefix_limits_bound_the_derived_index() {
         let mut config = HostConfig::default();
         config.server.queue_length = 16;
+        assert_eq!(
+            prefix_limits(&serving_info(), &config, 2_048).unwrap(),
+            PrefixLimits {
+                entries: 16,
+                tokens: 32_768,
+                referenced_pages: 512,
+            }
+        );
         config.serving.prefix_cache_entries = Choice::Fixed(std::num::NonZeroU32::new(3).unwrap());
         config.serving.prefix_cache_tokens =
             Choice::Fixed(std::num::NonZeroU64::new(1_000).unwrap());
         config.serving.prefix_cache_pages = Choice::Fixed(std::num::NonZeroU32::new(20).unwrap());
         assert_eq!(
-            prefix_limits(&serving_info(), &config).unwrap(),
+            prefix_limits(&serving_info(), &config, 2_048).unwrap(),
             PrefixLimits {
                 entries: 3,
                 tokens: 1_000,
@@ -2527,7 +2527,7 @@ mod tests {
 
         config.serving.prefix_cache_entries = Choice::Fixed(std::num::NonZeroU32::new(17).unwrap());
         assert!(
-            prefix_limits(&serving_info(), &config)
+            prefix_limits(&serving_info(), &config, 2_048)
                 .unwrap_err()
                 .to_string()
                 .contains("serving.prefix_cache_entries")
