@@ -141,6 +141,20 @@ fn metal_grouped_small_m_variants_match_cpu_at_edges() {
             inner: 64,
             columns: 33,
         },
+        GroupedCase {
+            rows: 4_097,
+            routes: 1,
+            experts: 9,
+            inner: 64,
+            columns: 1,
+        },
+        GroupedCase {
+            rows: 1,
+            routes: 2_049,
+            experts: 9,
+            inner: 64,
+            columns: 1,
+        },
     ] {
         assert_grouped_case(&cpu, &metal, case, false, &mut values);
         assert_grouped_case(&cpu, &metal, case, true, &mut values);

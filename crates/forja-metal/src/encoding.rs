@@ -4533,6 +4533,23 @@ impl MetalBackend {
             &[experts.checked_add(1).ok_or(BackendError::InvalidInput)?],
         )?;
         let blocks = self.scratch_tensor(DType::U32, &[grouped.block_elements])?;
+        #[cfg(test)]
+        {
+            *self
+                .expert_route_capture
+                .lock()
+                .map_err(|_| BackendError::ExecutionFailed)? =
+                Some(crate::storage::ExpertRouteCapture {
+                    sorted: sorted.buffer.raw.clone(),
+                    offsets: offsets.buffer.raw.clone(),
+                    route_count: usize::try_from(grouped.route_count)
+                        .map_err(|_| BackendError::InvalidInput)?,
+                    offset_count: usize::try_from(experts)
+                        .map_err(|_| BackendError::InvalidInput)?
+                        .checked_add(1)
+                        .ok_or(BackendError::InvalidInput)?,
+                });
+        }
         self.encode_expert_buckets(
             encoder,
             table,
@@ -9349,6 +9366,97 @@ mod tests {
     };
 
     use super::*;
+
+    fn captured_u32s(buffer: &ProtocolObject<dyn MTLBuffer>, count: usize) -> Vec<u32> {
+        // SAFETY: The retained shared-storage buffer contains at least `count` u32 values, and
+        // the test reads it only after the submission has completed.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(buffer.contents().cast::<u8>().as_ptr(), count * 4)
+        };
+        bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|bytes| u32::from_ne_bytes(*bytes))
+            .collect()
+    }
+
+    fn expected_expert_routes(selected: &[u32], experts: u32) -> (Vec<u32>, Vec<u32>) {
+        let mut sorted = Vec::new();
+        let mut offsets = Vec::with_capacity(usize::try_from(experts).unwrap() + 1);
+        for expert in 0..experts {
+            offsets.push(u32::try_from(sorted.len()).unwrap());
+            sorted.extend(
+                selected
+                    .iter()
+                    .enumerate()
+                    .filter(|&(_, &selected)| selected == expert)
+                    .map(|(route, _)| u32::try_from(route).unwrap()),
+            );
+        }
+        offsets.push(u32::try_from(sorted.len()).unwrap());
+        (sorted, offsets)
+    }
+
+    fn capture_expert_routes(
+        rows: u32,
+        routes: u32,
+        experts: u32,
+        selected: &[u32],
+    ) -> (Result<(), BackendError>, Vec<u32>, Vec<u32>) {
+        assert_eq!(selected.len(), usize::try_from(rows * routes).unwrap());
+        let backend = MetalBackend::new().unwrap();
+        let input = backend.alloc(DType::F32, &[rows, 64]).unwrap();
+        let packed = backend.alloc(DType::U32, &[experts, 1, 8]).unwrap();
+        let scales = backend.alloc(DType::F16, &[experts, 1, 1]).unwrap();
+        let biases = backend.alloc(DType::F16, &[experts, 1, 1]).unwrap();
+        let indices = backend.alloc(DType::U32, &[rows, routes]).unwrap();
+        let output = backend.alloc(DType::F32, &[rows, routes, 1]).unwrap();
+        backend
+            .write(
+                &indices,
+                &selected
+                    .iter()
+                    .copied()
+                    .flat_map(u32::to_ne_bytes)
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        let op = Op::GatherQuantMatmul {
+            bits: 4,
+            group_size: 64,
+        };
+        let inputs = [&input, &packed, &scales, &biases, &indices];
+        let variant = backend
+            .validate_variant_for_op(op, &inputs, &[&output], "gather-quant-matmul.grouped")
+            .unwrap();
+        let mut commands = CommandList::new();
+        commands.dispatch(op, &inputs, &output).unwrap();
+        assert!(commands.set_last_backend_data(BackendDispatchData::new(variant)));
+        let submission = backend.submit(commands).unwrap();
+        let result = submission.wait();
+        let capture = backend.expert_route_capture.lock().unwrap().take().unwrap();
+        let sorted = captured_u32s(&capture.sorted, capture.route_count);
+        let offsets = captured_u32s(&capture.offsets, capture.offset_count);
+        (result, sorted, offsets)
+    }
+
+    #[test]
+    fn metal_expert_routes_keep_stable_cpu_order() {
+        for (rows, routes, experts, selected) in [
+            (1, 64, 5, (0..64).map(|route| 1 + route % 3).collect()),
+            (7, 10, 5, vec![2; 70]),
+            (33, 2, 5, (0..33 * 2).map(|route| 1 + route % 3).collect()),
+            (4_097, 1, 9, (0..4_097).map(|route| 1 + route % 7).collect()),
+        ] {
+            let (result, actual_routes, actual_offsets) =
+                capture_expert_routes(rows, routes, experts, &selected);
+            result.unwrap();
+            let (expected_routes, expected_offsets) = expected_expert_routes(&selected, experts);
+            assert_eq!(&actual_routes[..expected_routes.len()], expected_routes);
+            assert_eq!(actual_offsets, expected_offsets);
+        }
+    }
 
     #[test]
     fn metal_compiles_paged_half_steel_attention() {

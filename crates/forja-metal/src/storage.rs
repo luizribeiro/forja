@@ -411,7 +411,27 @@ pub struct MetalBackend {
     pub(super) bandwidth: Mutex<Option<crate::MemoryBandwidth>>,
     #[cfg(test)]
     allocation_requests: AtomicUsize,
+    #[cfg(test)]
+    pub(super) expert_route_capture: Mutex<Option<ExpertRouteCapture>>,
 }
+
+#[cfg(test)]
+pub(super) struct ExpertRouteCapture {
+    pub(super) sorted: Retained<ProtocolObject<dyn MTLBuffer>>,
+    pub(super) offsets: Retained<ProtocolObject<dyn MTLBuffer>>,
+    pub(super) route_count: usize,
+    pub(super) offset_count: usize,
+}
+
+// SAFETY: The test-only capture only retains shared Metal buffers; mutation is GPU-ordered and
+// host reads happen after submission completion.
+#[cfg(test)]
+unsafe impl Send for ExpertRouteCapture {}
+
+// SAFETY: Access to the capture is serialized by its mutex, and retained Metal buffers support
+// cross-thread lifetime management.
+#[cfg(test)]
+unsafe impl Sync for ExpertRouteCapture {}
 
 /// Reusable graph execution strategy selected by the host operator.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -772,6 +792,8 @@ impl MetalBackend {
             bandwidth: Mutex::new(None),
             #[cfg(test)]
             allocation_requests: AtomicUsize::new(0),
+            #[cfg(test)]
+            expert_route_capture: Mutex::new(None),
         };
         #[cfg(test)]
         {

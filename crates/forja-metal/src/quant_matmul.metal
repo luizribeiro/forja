@@ -818,31 +818,29 @@ kernel void count_expert_routes(
     device atomic_uint *error_flag [[buffer(4)]],
     uint thread_index [[thread_position_in_threadgroup]],
     uint thread_count [[threads_per_threadgroup]]) {
-    uint route_count = params.rows * params.routes;
     for (uint expert = thread_index; expert <= params.experts; expert += thread_count) {
         atomic_store_explicit(counts + expert, 0, memory_order_relaxed);
     }
     threadgroup_barrier(mem_flags::mem_device);
-    for (uint route = thread_index; route < route_count; route += thread_count) {
-        uint row = route / params.routes;
-        uint slot = route % params.routes;
-        uint selected = indices[
-            params.indices_offset + ulong(row) * params.indices_row_stride +
-            ulong(slot) * params.indices_slot_stride];
-        if (selected < params.experts) {
-            atomic_fetch_add_explicit(counts + selected, 1, memory_order_relaxed);
-        } else {
-            for (uint column = 0; column < params.columns; ++column) {
-                store_float(
-                    output,
-                    params.output_offset + ulong(row) * params.output_row_stride +
-                        ulong(slot) * params.output_slot_stride +
-                        ulong(column) * params.output_column_stride,
-                    output_dtype,
-                    0.0f);
+    for (uint row = thread_index; row < params.rows; row += thread_count) {
+        ulong index_base = params.indices_offset + ulong(row) * params.indices_row_stride;
+        ulong output_base = params.output_offset + ulong(row) * params.output_row_stride;
+        for (uint slot = 0; slot < params.routes; ++slot) {
+            uint selected = indices[index_base + ulong(slot) * params.indices_slot_stride];
+            if (selected < params.experts) {
+                atomic_fetch_add_explicit(counts + selected, 1, memory_order_relaxed);
+            } else {
+                for (uint column = 0; column < params.columns; ++column) {
+                    store_float(
+                        output,
+                        output_base + ulong(slot) * params.output_slot_stride +
+                            ulong(column) * params.output_column_stride,
+                        output_dtype,
+                        0.0f);
+                }
+                atomic_store_explicit(error_flag, 1, memory_order_relaxed);
+                atomic_fetch_min_explicit(error_flag + 1, selected, memory_order_relaxed);
             }
-            atomic_store_explicit(error_flag, 1, memory_order_relaxed);
-            atomic_fetch_min_explicit(error_flag + 1, selected, memory_order_relaxed);
         }
     }
 }
@@ -855,8 +853,9 @@ kernel void arrange_expert_routes(
     constant GatherQuantMatmulParams &params [[buffer(4)]],
     uint thread_index [[thread_position_in_threadgroup]],
     uint thread_count [[threads_per_threadgroup]]) {
+    constexpr uint staged_route_capacity = 2048;
     threadgroup uint scan[256];
-    uint route_count = params.rows * params.routes;
+    threadgroup uint staged_routes[staged_route_capacity];
     uint count = thread_index < params.experts
         ? atomic_load_explicit(counts + thread_index, memory_order_relaxed)
         : 0;
@@ -872,6 +871,7 @@ kernel void arrange_expert_routes(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     uint route_offset = thread_index == 0 ? 0 : scan[thread_index - 1];
+    uint sorted = route_offset;
     if (thread_index < params.experts) {
         atomic_store_explicit(counts + thread_index, route_offset, memory_order_relaxed);
     }
@@ -894,21 +894,46 @@ kernel void arrange_expert_routes(
     }
     threadgroup_barrier(mem_flags::mem_device);
     if (thread_index < params.experts) {
-        uint sorted = route_offset;
-        for (uint route = 0; route < route_count; ++route) {
-            uint row = route / params.routes;
-            uint slot = route % params.routes;
-            uint selected = indices[
-                params.indices_offset + ulong(row) * params.indices_row_stride +
-                ulong(slot) * params.indices_slot_stride];
-            if (selected == thread_index) {
-                sorted_routes[sorted++] = route;
-            }
-        }
         uint block = thread_index == 0 ? 0 : scan[thread_index - 1];
         for (uint start = 0; start < count; start += grouped_tile_rows) {
             blocks[block++] = uint3(
                 thread_index, route_offset + start, min(grouped_tile_rows, count - start));
+        }
+    }
+    if (params.routes <= staged_route_capacity) {
+        uint rows_per_stage = max(1u, staged_route_capacity / params.routes);
+        for (uint row_origin = 0; row_origin < params.rows; row_origin += rows_per_stage) {
+            uint row_count = min(rows_per_stage, params.rows - row_origin);
+            for (uint local_row = thread_index; local_row < row_count; local_row += thread_count) {
+                uint row = row_origin + local_row;
+                ulong index_base = params.indices_offset + ulong(row) * params.indices_row_stride;
+                uint stage_base = local_row * params.routes;
+                for (uint slot = 0; slot < params.routes; ++slot) {
+                    staged_routes[stage_base + slot] =
+                        indices[index_base + ulong(slot) * params.indices_slot_stride];
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (thread_index < params.experts) {
+                uint staged_count = row_count * params.routes;
+                uint route_origin = row_origin * params.routes;
+                for (uint staged = 0; staged < staged_count; ++staged) {
+                    if (staged_routes[staged] == thread_index) {
+                        sorted_routes[sorted++] = route_origin + staged;
+                    }
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    } else if (thread_index < params.experts) {
+        for (uint row = 0; row < params.rows; ++row) {
+            ulong index_base = params.indices_offset + ulong(row) * params.indices_row_stride;
+            uint route_base = row * params.routes;
+            for (uint slot = 0; slot < params.routes; ++slot) {
+                if (indices[index_base + ulong(slot) * params.indices_slot_stride] == thread_index) {
+                    sorted_routes[sorted++] = route_base + slot;
+                }
+            }
         }
     }
 }
