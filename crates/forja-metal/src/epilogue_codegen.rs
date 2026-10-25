@@ -231,7 +231,9 @@ fn generate_source_from_header(
             "\n",
             include_str!("gather_matmul.metal"),
             "\n",
-            include_str!("sdpa.metal"),
+            include_str!("steel_attention.metal"),
+            "\n",
+            include_str!("sdpa_kernels.metal"),
             "\n",
             include_str!("sdpa_vector.metal")
         )
