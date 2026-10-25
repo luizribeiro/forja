@@ -29,8 +29,8 @@ pub const VOCAB: u32 = 50_304;
 pub const HIDDEN: u32 = 2_048;
 /// Number of decoder layers.
 pub const LAYERS: usize = 16;
-/// Largest context accepted by this engine.
-pub const MAX_CONTEXT: u32 = 4_096;
+/// Largest context supported by the model architecture.
+pub const MAX_SUPPORTED_CONTEXT: u32 = 4_096;
 
 const HEADS: u32 = 16;
 const HEAD_DIM: u32 = 128;
@@ -59,7 +59,7 @@ fn serving_info() -> ServingInfo {
         page_tokens: 64,
         planes,
         active_lanes: 1,
-        max_context: MAX_CONTEXT,
+        max_context: MAX_SUPPORTED_CONTEXT,
         batch_shapes: Vec::new(),
     }
 }
@@ -361,13 +361,14 @@ struct OlmoeWeights {
     lm_head: Linear<bf16>,
 }
 
-/// OLMoE-1B-7B-0924 with a fixed 4096-token KV cache.
+/// OLMoE-1B-7B-0924 inference engine.
 pub struct Olmoe {
     weights: OlmoeWeights,
     variants: variants::Variants,
     kernels: GuestKernels,
     caches: CacheStorage,
     positions: Tensor<u32>,
+    max_context: u32,
     #[cfg(target_family = "wasm")]
     replay: bool,
     #[cfg(target_family = "wasm")]
@@ -382,7 +383,8 @@ impl Olmoe {
         pool: Option<PagedPool<'_>>,
         config: &EngineLoadConfig,
     ) -> Result<Self> {
-        let variants = variants::Variants::new(config)?;
+        let max_context = load_context(config)?;
+        let variants = variants::Variants::new(config, max_context)?;
         let weights = OlmoeWeights::load(weights, &Config)?;
         let caches = if let Some(pool) = pool {
             CacheStorage::Paged(
@@ -394,7 +396,7 @@ impl Olmoe {
         } else {
             CacheStorage::Contiguous(
                 (0..LAYERS)
-                    .map(|_| KvCache::new(HEADS, MAX_CONTEXT, HEAD_DIM, 0.0))
+                    .map(|_| KvCache::new(HEADS, max_context, HEAD_DIM, 0.0))
                     .collect::<Result<Vec<_>>>()?,
             )
         };
@@ -403,13 +405,14 @@ impl Olmoe {
             variants,
             kernels: GuestKernels::load()?,
             caches,
-            positions: Tensor::constant(&(0..MAX_CONTEXT).collect::<Vec<_>>(), &[MAX_CONTEXT])?,
+            positions: Tensor::constant(&(0..max_context).collect::<Vec<_>>(), &[max_context])?,
+            max_context,
             #[cfg(target_family = "wasm")]
             replay: config.replay,
             #[cfg(target_family = "wasm")]
-            decode: DecodeState::new(MAX_CONTEXT, VOCAB)?,
+            decode: DecodeState::new(max_context, VOCAB)?,
             #[cfg(target_family = "wasm")]
-            prefill: Some(ChunkedPrefill::new(MAX_CONTEXT, DEFAULT_PREFILL_CHUNK)?),
+            prefill: Some(ChunkedPrefill::new(max_context, DEFAULT_PREFILL_CHUNK)?),
         })
     }
 
@@ -528,7 +531,7 @@ impl Engine for Olmoe {
     fn describe() -> EngineInfo {
         EngineInfo {
             vocab: VOCAB,
-            max_context: MAX_CONTEXT,
+            max_context: MAX_SUPPORTED_CONTEXT,
             tap_layers: (1..=16).collect(),
             router_layers: (1..=16).collect(),
             serving: Some(serving_info()),
@@ -559,8 +562,8 @@ impl Engine for Olmoe {
         let end = input
             .start_pos
             .checked_add(sequence)
-            .filter(|&end| end <= MAX_CONTEXT)
-            .ok_or_else(|| forja_sdk::Error::loading("tokens exceed the 4096-token context"))?;
+            .filter(|&end| end <= self.max_context)
+            .ok_or_else(|| forja_sdk::Error::loading("tokens exceed the configured context"))?;
         #[cfg(target_family = "wasm")]
         if self.replay && sequence == 1 && !input.taps {
             let logits =
@@ -614,9 +617,9 @@ impl Engine for Olmoe {
                 let end = input
                     .start_pos
                     .checked_add(sequence)
-                    .filter(|&end| end <= MAX_CONTEXT)
+                    .filter(|&end| end <= self.max_context)
                     .ok_or_else(|| {
-                        forja_sdk::Error::loading("decode tokens exceed the 4096-token context")
+                        forja_sdk::Error::loading("decode tokens exceed the configured context")
                     })?;
                 if self.prefill_supports(input.start_pos, sequence) {
                     let logits = if self.replay {
@@ -642,10 +645,10 @@ impl Engine for Olmoe {
                     self.select_token(logits, end - 1)
                 }
             }
-            None if input.start_pos < MAX_CONTEXT && self.replay => {
+            None if input.start_pos < self.max_context && self.replay => {
                 self.decode_selected(None, input.start_pos, selection)
             }
-            None if input.start_pos < MAX_CONTEXT => {
+            None if input.start_pos < self.max_context => {
                 let token = self.decode.token()?;
                 let start = input.start_pos.into();
                 let end = (input.start_pos + 1).into();
@@ -658,7 +661,7 @@ impl Engine for Olmoe {
                 self.select_token(logits, input.start_pos)
             }
             None => Err(forja_sdk::Error::loading(
-                "decode position exceeds the 4096-token context",
+                "decode position exceeds the configured context",
             )),
         }
     }
@@ -750,7 +753,7 @@ impl Olmoe {
         start_pos: u32,
         selection: DecodeSelection,
     ) -> Result<forja_sdk::Graph<Tensor<f32>>> {
-        let position = forja_sdk::Param::new(0..=MAX_CONTEXT - 1)?;
+        let position = forja_sdk::Param::new(0..=self.max_context - 1)?;
         let start = position.at(start_pos);
         let end = (start.clone() + 1)?;
         let start_dim = start.clone().into();
@@ -808,6 +811,13 @@ impl Olmoe {
     }
 }
 
+fn load_context(config: &EngineLoadConfig) -> Result<u32> {
+    config
+        .max_context
+        .filter(|&context| context > 0 && context <= MAX_SUPPORTED_CONTEXT)
+        .ok_or_else(|| forja_sdk::Error::loading("profile max context is missing or unsupported"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -816,8 +826,18 @@ mod tests {
     fn describes_model_contract() {
         let info = Olmoe::describe();
         assert_eq!(info.vocab, VOCAB);
-        assert_eq!(info.max_context, MAX_CONTEXT);
+        assert_eq!(info.max_context, MAX_SUPPORTED_CONTEXT);
         assert_eq!(info.tap_layers, (1..=16).collect::<Vec<_>>());
         assert_eq!(info.router_layers, (1..=16).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn load_context_uses_the_profile_value() {
+        let config = EngineLoadConfig {
+            max_context: Some(2_048),
+            ..EngineLoadConfig::default()
+        };
+        assert_eq!(load_context(&config).unwrap(), 2_048);
+        assert!(load_context(&EngineLoadConfig::default()).is_err());
     }
 }

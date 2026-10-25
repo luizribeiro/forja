@@ -20,7 +20,7 @@ const BF16_SITES: &[&str] = &["dense.prefill.large-wide", "dense.prefill.other"]
 pub(crate) struct Variants(EngineSelections);
 
 impl Variants {
-    pub(crate) fn new(config: &EngineLoadConfig, dtype: DType) -> Result<Self> {
+    pub(crate) fn new(config: &EngineLoadConfig, dtype: DType, max_context: u32) -> Result<Self> {
         let sites = if dtype == DType::BF16 {
             [COMMON_SITES, BF16_SITES].concat()
         } else {
@@ -30,7 +30,7 @@ impl Variants {
             config,
             &[],
             &sites,
-            crate::MAX_CONTEXT,
+            max_context,
         )?))
     }
 

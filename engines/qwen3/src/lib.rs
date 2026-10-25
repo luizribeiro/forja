@@ -29,8 +29,8 @@ pub const VOCAB: u32 = 151_936;
 pub const HIDDEN: u32 = 1_024;
 /// Number of decoder layers.
 pub const LAYERS: usize = 28;
-/// Largest context accepted by this engine.
-pub const MAX_CONTEXT: u32 = 4_096;
+/// Largest context supported by the model architecture.
+pub const MAX_SUPPORTED_CONTEXT: u32 = 4_096;
 
 const QUERY_HEADS: u32 = 16;
 const KEY_VALUE_HEADS: u32 = 8;
@@ -56,7 +56,7 @@ fn serving_info() -> ServingInfo {
         page_tokens: 64,
         planes,
         active_lanes: 1,
-        max_context: MAX_CONTEXT,
+        max_context: MAX_SUPPORTED_CONTEXT,
         batch_shapes: Vec::new(),
     }
 }
@@ -450,13 +450,14 @@ impl<T: Activation> DecoderLayer<T> {
     }
 }
 
-/// Qwen3-0.6B with a fixed 4096-token KV cache.
+/// Qwen3-0.6B inference engine.
 pub struct Qwen3<T: Activation = f32> {
     weights: QwenWeights<T>,
     variants: variants::Variants,
     caches: CacheStorage<T>,
     kernels: GuestKernels,
     positions: Tensor<T>,
+    max_context: u32,
     #[cfg(target_family = "wasm")]
     replay: bool,
     #[cfg(target_family = "wasm")]
@@ -471,7 +472,8 @@ impl<T: Activation> Qwen3<T> {
         pool: Option<PagedPool<'_>>,
         config: &EngineLoadConfig,
     ) -> Result<Self> {
-        let variants = variants::Variants::new(config, T::KERNEL_DTYPE)?;
+        let max_context = load_context(config)?;
+        let variants = variants::Variants::new(config, T::KERNEL_DTYPE, max_context)?;
         let weights = QwenWeights::<_>::load(weights, &Config)?;
         let caches = if let Some(pool) = pool {
             CacheStorage::Paged(
@@ -483,24 +485,25 @@ impl<T: Activation> Qwen3<T> {
         } else {
             CacheStorage::Contiguous(
                 (0..LAYERS)
-                    .map(|_| KvCache::new(KEY_VALUE_HEADS, MAX_CONTEXT, HEAD_DIM, T::ZERO))
+                    .map(|_| KvCache::new(KEY_VALUE_HEADS, max_context, HEAD_DIM, T::ZERO))
                     .collect::<Result<Vec<_>>>()?,
             )
         };
         let kernels = GuestKernels::load::<T>()?;
-        let positions = activation_position_table::<T>()?;
+        let positions = activation_position_table::<T>(max_context)?;
         Ok(Self {
             weights,
             variants,
             caches,
             kernels,
             positions,
+            max_context,
             #[cfg(target_family = "wasm")]
             replay: config.replay,
             #[cfg(target_family = "wasm")]
-            decode: DecodeState::new(MAX_CONTEXT, VOCAB)?,
+            decode: DecodeState::new(max_context, VOCAB)?,
             #[cfg(target_family = "wasm")]
-            prefill: Some(ChunkedPrefill::new(MAX_CONTEXT, DEFAULT_PREFILL_CHUNK)?),
+            prefill: Some(ChunkedPrefill::new(max_context, DEFAULT_PREFILL_CHUNK)?),
         })
     }
 
@@ -565,7 +568,7 @@ impl Engine for ExportedQwen3 {
     fn describe() -> EngineInfo {
         EngineInfo {
             vocab: VOCAB,
-            max_context: MAX_CONTEXT,
+            max_context: MAX_SUPPORTED_CONTEXT,
             tap_layers: (1..=28).collect(),
             router_layers: Vec::new(),
             serving: Some(serving_info()),
@@ -596,8 +599,8 @@ impl Engine for ExportedQwen3 {
         let end_pos = input
             .start_pos
             .checked_add(sequence)
-            .filter(|&end| end <= MAX_CONTEXT)
-            .ok_or_else(|| forja_sdk::Error::loading("tokens exceed the 4096-token context"))?;
+            .filter(|&end| end <= self.max_context)
+            .ok_or_else(|| forja_sdk::Error::loading("tokens exceed the configured context"))?;
         #[cfg(target_family = "wasm")]
         if self.replay && sequence == 1 && !input.taps {
             let logits =
@@ -651,9 +654,9 @@ impl Engine for ExportedQwen3 {
                 let end = input
                     .start_pos
                     .checked_add(sequence)
-                    .filter(|&end| end <= MAX_CONTEXT)
+                    .filter(|&end| end <= self.max_context)
                     .ok_or_else(|| {
-                        forja_sdk::Error::loading("decode tokens exceed the 4096-token context")
+                        forja_sdk::Error::loading("decode tokens exceed the configured context")
                     })?;
                 if self.prefill_supports(input.start_pos, sequence) {
                     let logits = if self.replay {
@@ -679,10 +682,10 @@ impl Engine for ExportedQwen3 {
                     self.select_token(logits, end - 1)
                 }
             }
-            None if input.start_pos < MAX_CONTEXT && self.replay => {
+            None if input.start_pos < self.max_context && self.replay => {
                 self.decode_selected(None, input.start_pos, selection)
             }
-            None if input.start_pos < MAX_CONTEXT => {
+            None if input.start_pos < self.max_context => {
                 let token = self.decode.token()?;
                 let end = input.start_pos + 1;
                 let start_dim = input.start_pos.into();
@@ -696,7 +699,7 @@ impl Engine for ExportedQwen3 {
                 self.select_token(logits, input.start_pos)
             }
             None => Err(forja_sdk::Error::loading(
-                "decode position exceeds the 4096-token context",
+                "decode position exceeds the configured context",
             )),
         }
     }
@@ -913,7 +916,7 @@ impl<T: Activation> Qwen3<T> {
         start_pos: u32,
         selection: DecodeSelection,
     ) -> Result<forja_sdk::Graph<Tensor<f32>>> {
-        let position = forja_sdk::Param::new(0..=MAX_CONTEXT - 1)?;
+        let position = forja_sdk::Param::new(0..=self.max_context - 1)?;
         let start = position.at(start_pos);
         let end = (start.clone() + 1)?;
         let start_dim = start.clone().into();
@@ -976,13 +979,35 @@ impl<T: Activation> Qwen3<T> {
     }
 }
 
-fn activation_position_table<T: Activation>() -> Result<Tensor<T>> {
-    let values = (0..MAX_CONTEXT)
+fn activation_position_table<T: Activation>(max_context: u32) -> Result<Tensor<T>> {
+    let values = (0..max_context)
         .map(|position| {
             u16::try_from(position)
                 .map(T::from_position)
                 .map_err(|_| forja_sdk::Error::loading("position exceeds activation range"))
         })
         .collect::<Result<Vec<_>>>()?;
-    Tensor::constant(&values, &[MAX_CONTEXT])
+    Tensor::constant(&values, &[max_context])
+}
+
+fn load_context(config: &EngineLoadConfig) -> Result<u32> {
+    config
+        .max_context
+        .filter(|&context| context > 0 && context <= MAX_SUPPORTED_CONTEXT)
+        .ok_or_else(|| forja_sdk::Error::loading("profile max context is missing or unsupported"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn load_context_uses_the_profile_value() {
+        let config = EngineLoadConfig {
+            max_context: Some(2_048),
+            ..EngineLoadConfig::default()
+        };
+        assert_eq!(load_context(&config).unwrap(), 2_048);
+        assert!(load_context(&EngineLoadConfig::default()).is_err());
+    }
 }
