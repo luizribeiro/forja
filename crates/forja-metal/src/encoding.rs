@@ -11117,6 +11117,7 @@ mod tests {
             ("grouped_quantized_gemm_small_m", 8),
             ("grouped_quantized_gemm_32x32_2x2", 32),
             ("grouped_quantized_gemm_32x32_2x2_blocked", 32),
+            ("grouped_quantized_pair_32x32_2x2_blocked", 32),
         ] {
             let mut constants = constants.to_vec();
             constants.push((16, block_rows));

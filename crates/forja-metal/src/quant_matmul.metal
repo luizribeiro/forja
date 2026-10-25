@@ -1136,6 +1136,159 @@ grouped_quantized_gemm_kernel(grouped_quantized_gemm_small_m, 8, 1, 2, false)
 grouped_quantized_gemm_kernel(grouped_quantized_gemm_32x32_2x2, 32, 2, 2, false)
 grouped_quantized_gemm_kernel(grouped_quantized_gemm_32x32_2x2_blocked, 32, 2, 2, true)
 
+kernel void grouped_quantized_pair_32x32_2x2_blocked(
+    device const uchar *input [[buffer(0)]],
+    device const uchar *gate_packed [[buffer(1)]],
+    device const uchar *gate_scales [[buffer(2)]],
+    device const uchar *gate_biases [[buffer(3)]],
+    device const uchar *up_packed [[buffer(4)]],
+    device const uchar *up_scales [[buffer(5)]],
+    device const uchar *up_biases [[buffer(6)]],
+    device const uint *sorted_routes [[buffer(7)]],
+    device const uint3 *blocks [[buffer(8)]],
+    device uchar *output [[buffer(9)]],
+    constant GatherQuantMatmulParams &gate_params [[buffer(10)]],
+    constant GatherQuantMatmulParams &up_params [[buffer(11)]],
+    constant GatherQuantMatmulParams &params [[buffer(12)]],
+    FORJA_EPILOGUE_ARGUMENTS
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint3 threadgroup_size [[threads_per_threadgroup]],
+    ushort simdgroup [[simdgroup_index_in_threadgroup]],
+    ushort lane [[thread_index_in_simdgroup]],
+    uint3 tile [[threadgroup_position_in_grid]]) {
+    constexpr uint block_rows = 32;
+    constexpr uint block_columns = 32;
+    constexpr uint block_inner = 32;
+    constexpr uint tile_stride = 36;
+    threadgroup float input_tile[block_rows * tile_stride];
+    threadgroup float weight_tile[block_columns * tile_stride];
+    threadgroup uint route_rows[block_rows];
+    threadgroup uint route_slots[block_rows];
+    uint3 block = blocks[tile.y];
+    if (block.x == 0xffffffffu) {
+        return;
+    }
+    uint expert = block.x;
+    uint sorted_origin = block.y;
+    uint column_origin = tile.x * block_columns;
+    uint row_count = block.z;
+    uint thread_count = threadgroup_size.x * threadgroup_size.y * threadgroup_size.z;
+    BlockMMA<
+        float, block_rows, block_columns, block_inner, 2, 2,
+        tile_stride, tile_stride, true> gate_mma(simdgroup, lane);
+    BlockMMA<
+        float, block_rows, block_columns, block_inner, 2, 2,
+        tile_stride, tile_stride, true> up_mma(simdgroup, lane);
+    if (thread_index < block_rows) {
+        uint route = thread_index < row_count
+            ? sorted_routes[sorted_origin + thread_index]
+            : 0;
+        uint row = route / params.routes;
+        route_rows[thread_index] = row;
+        route_slots[thread_index] = route - row * params.routes;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint inner_origin = 0; inner_origin < params.inner; inner_origin += block_inner) {
+        if (input0_dtype == 0 &&
+            inner_origin + block_inner <= params.inner &&
+            params.input_offset % 4 == 0 && params.input_row_stride % 4 == 0 &&
+            params.input_inner_stride == 1) {
+            uint local_row = thread_index / 4;
+            uint local_inner = (thread_index % 4) * 8;
+            threadgroup float *destination = input_tile + local_row * tile_stride + local_inner;
+            if (local_row < row_count) {
+                device const float *source = reinterpret_cast<device const float *>(input) +
+                    params.input_offset + ulong(route_rows[local_row]) * params.input_row_stride +
+                    inner_origin + local_inner;
+                *reinterpret_cast<threadgroup float4 *>(destination) =
+                    *reinterpret_cast<device const float4 *>(source);
+                *reinterpret_cast<threadgroup float4 *>(destination + 4) =
+                    *reinterpret_cast<device const float4 *>(source + 4);
+            } else {
+                *reinterpret_cast<threadgroup float4 *>(destination) = 0.0f;
+                *reinterpret_cast<threadgroup float4 *>(destination + 4) = 0.0f;
+            }
+        } else {
+            for (uint linear = thread_index;
+                 linear < block_rows * block_inner;
+                 linear += thread_count) {
+                uint local_row = linear / block_inner;
+                uint local_inner = linear % block_inner;
+                uint inner = inner_origin + local_inner;
+                float value = 0.0f;
+                if (local_row < row_count && inner < params.inner) {
+                    value = load_float(
+                        input,
+                        params.input_offset + ulong(route_rows[local_row]) * params.input_row_stride +
+                            ulong(inner) * params.input_inner_stride,
+                        input0_dtype);
+                }
+                input_tile[local_row * tile_stride + local_inner] = value;
+            }
+        }
+        load_quantized_weight_tile<
+            float, block_inner, block_columns, tile_stride, true>(
+            gate_packed, gate_scales, gate_biases,
+            gate_params.packed_offset + ulong(expert) * gate_params.packed_expert_stride,
+            gate_params.scale_offset + ulong(expert) * gate_params.scale_expert_stride,
+            gate_params.bias_offset + ulong(expert) * gate_params.bias_expert_stride,
+            gate_params.packed_row_stride, gate_params.packed_word_stride,
+            gate_params.scale_row_stride, gate_params.scale_group_stride,
+            gate_params.bias_row_stride, gate_params.bias_group_stride,
+            inner_origin, column_origin, params.inner, params.columns,
+            weight_tile, thread_index, thread_count);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (gate_mma.simdgroup_row == 0 || row_count > block_rows / 2) {
+            gate_mma.multiply(input_tile, weight_tile);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        load_quantized_weight_tile<
+            float, block_inner, block_columns, tile_stride, true>(
+            up_packed, up_scales, up_biases,
+            up_params.packed_offset + ulong(expert) * up_params.packed_expert_stride,
+            up_params.scale_offset + ulong(expert) * up_params.scale_expert_stride,
+            up_params.bias_offset + ulong(expert) * up_params.bias_expert_stride,
+            up_params.packed_row_stride, up_params.packed_word_stride,
+            up_params.scale_row_stride, up_params.scale_group_stride,
+            up_params.bias_row_stride, up_params.bias_group_stride,
+            inner_origin, column_origin, params.inner, params.columns,
+            weight_tile, thread_index, thread_count);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (up_mma.simdgroup_row == 0 || row_count > block_rows / 2) {
+            up_mma.multiply(input_tile, weight_tile);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for (uint row_fragment = 0; row_fragment < 2; ++row_fragment) {
+        uint local_row = uint(gate_mma.simdgroup_row) * 8 + uint(gate_mma.fragment_row) +
+            row_fragment * 16;
+        if (local_row < row_count) {
+            uint output_row = route_rows[local_row];
+            uint output_slot = route_slots[local_row];
+            for (uint column_fragment = 0; column_fragment < 2; ++column_fragment) {
+                uint column = column_origin + uint(gate_mma.simdgroup_column) * 8 +
+                    uint(gate_mma.fragment_column) + column_fragment * 16;
+                uint fragment_index = row_fragment * 2 + column_fragment;
+                for (uint element = 0; element < 2; ++element) {
+                    if (column + element < params.columns) {
+                        float result = forja_epilogue(
+                            float(gate_mma.accumulators[fragment_index * 2 + element]),
+                            float(up_mma.accumulators[fragment_index * 2 + element]),
+                            output_row, output_slot, column + element,
+                            params.rows, params.routes, params.columns,
+                            FORJA_EPILOGUE_VALUES);
+                        ulong output_index = params.output_offset +
+                            ulong(output_row) * params.output_row_stride +
+                            ulong(output_slot) * params.output_slot_stride +
+                            ulong(column + element) * params.output_column_stride;
+                        store_float(output, output_index, output_dtype, result);
+                    }
+                }
+            }
+        }
+    }
+}
+
 kernel void gathered_pair_from_projections(
     device const float *gate [[buffer(0)]],
     device const float *up [[buffer(1)]],
