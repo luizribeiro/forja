@@ -945,7 +945,9 @@ kernel void arrange_expert_routes(
     }
 }
 
-template <uint block_rows, uint simdgroups_rows, uint simdgroups_columns>
+template <
+    uint block_rows, uint simdgroups_rows, uint simdgroups_columns,
+    bool skip_high_padding>
 void grouped_quantized_gemm_impl(
     device const uchar *input,
     device const uchar *packed,
@@ -1056,7 +1058,11 @@ void grouped_quantized_gemm_impl(
             inner_origin, column_origin, params.inner, params.columns,
             weight_tile, thread_index, thread_count);
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        mma.multiply(input_tile, weight_tile);
+        if constexpr (!skip_high_padding) {
+            mma.multiply(input_tile, weight_tile);
+        } else if (mma.simdgroup_row == 0 || row_count > block_rows / 2) {
+            mma.multiply(input_tile, weight_tile);
+        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     for (uint row_fragment = 0;
@@ -1096,7 +1102,8 @@ void grouped_quantized_gemm_impl(
     }
 }
 
-#define grouped_quantized_gemm_kernel(name, block_rows, simd_rows, simd_columns)   \
+#define grouped_quantized_gemm_kernel(                                             \
+    name, block_rows, simd_rows, simd_columns, skip_high_padding)                  \
 kernel void name(                                                                  \
     device const uchar *input [[buffer(0)]],                                        \
     device const uchar *packed [[buffer(1)]],                                       \
@@ -1117,15 +1124,17 @@ kernel void name(                                                               
     threadgroup float weight_tile[32 * tile_stride];                                \
     threadgroup uint route_rows[block_rows];                                        \
     threadgroup uint route_slots[block_rows];                                       \
-    grouped_quantized_gemm_impl<block_rows, simd_rows, simd_columns>(               \
+    grouped_quantized_gemm_impl<                                                    \
+        block_rows, simd_rows, simd_columns, skip_high_padding>(                    \
         input, packed, scales, biases, sorted_routes, blocks, output, params,       \
         FORJA_EPILOGUE_VALUES, thread_index, threadgroup_size, simdgroup, lane,     \
         tile, input_tile, weight_tile, route_rows, route_slots);                    \
 }
 
-grouped_quantized_gemm_kernel(grouped_quantized_gemm, 16, 1, 2)
-grouped_quantized_gemm_kernel(grouped_quantized_gemm_small_m, 8, 1, 2)
-grouped_quantized_gemm_kernel(grouped_quantized_gemm_32x32_2x2, 32, 2, 2)
+grouped_quantized_gemm_kernel(grouped_quantized_gemm, 16, 1, 2, false)
+grouped_quantized_gemm_kernel(grouped_quantized_gemm_small_m, 8, 1, 2, false)
+grouped_quantized_gemm_kernel(grouped_quantized_gemm_32x32_2x2, 32, 2, 2, false)
+grouped_quantized_gemm_kernel(grouped_quantized_gemm_32x32_2x2_blocked, 32, 2, 2, true)
 
 kernel void gathered_pair_from_projections(
     device const float *gate [[buffer(0)]],

@@ -192,6 +192,7 @@ fn metal_grouped_tile_heights_match_bits() {
             for name in [
                 "gather-quant-matmul.grouped",
                 "gather-quant-matmul.grouped-32x32-2x2",
+                "gather-quant-matmul.grouped-32x32-2x2-blocked",
             ] {
                 let output = metal
                     .alloc(DType::F32, &[case.rows, case.routes, case.columns])
@@ -211,6 +212,7 @@ fn metal_grouped_tile_heights_match_bits() {
                 outputs.push(metal.read(&output).unwrap());
             }
             assert_eq!(outputs[0], outputs[1]);
+            assert_eq!(outputs[0], outputs[2]);
         }
     }
 }
