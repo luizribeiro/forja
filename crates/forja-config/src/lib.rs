@@ -837,12 +837,13 @@ fixtures = "golden/qwen3-0.6b"
     }
 
     #[test]
-    fn committed_big_model_suite_only_reduces_repetitions() {
+    fn committed_big_model_suite_adds_long_contexts_and_reduces_repetitions() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../bench/suites/big-model.toml");
         let config: DevConfig = toml::from_str(&fs::read_to_string(path).unwrap()).unwrap();
         let expected = Bench {
             reps: nonzero(5),
             warmups: 1,
+            contexts: ContextList(vec![9, 512, 2_048, 4_000, 8_000, 16_000, 32_000]),
             ..Bench::default()
         };
         assert_eq!(config.bench, expected);

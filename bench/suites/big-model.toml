@@ -9,5 +9,8 @@ contexts = [
   512,
   2048,
   4000,
+  8000,
+  16000,
+  32000,
 ] # A context above the manifest's max_context is a load error, never clipped.
 selection = ["gpu-sequential", "gpu-pipelined"]
