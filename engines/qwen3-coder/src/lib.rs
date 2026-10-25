@@ -59,8 +59,8 @@ pub const VOCAB: u32 = 151_936;
 pub const HIDDEN: u32 = 2_048;
 /// Number of decoder layers in the full model.
 pub const LAYERS: usize = 48;
-/// Largest context accepted by this engine.
-pub const MAX_CONTEXT: u32 = 32_768;
+/// Largest context supported by the model architecture.
+pub const MAX_SUPPORTED_CONTEXT: u32 = 32_768;
 #[cfg(any(target_family = "wasm", test))]
 const PREFILL_CHUNK: u32 = 2_048;
 #[cfg(any(target_family = "wasm", test))]
@@ -98,7 +98,7 @@ fn serving_info() -> ServingInfo {
         page_tokens: 64,
         planes,
         active_lanes: ACTIVE_LANES,
-        max_context: MAX_CONTEXT,
+        max_context: MAX_SUPPORTED_CONTEXT,
         batch_shapes: [1, 2, 4, 8]
             .into_iter()
             .flat_map(|bucket| {
@@ -740,23 +740,23 @@ enum Cache {
 }
 
 impl Cache {
-    fn new(format: KvCacheFormat) -> Result<Self> {
+    fn new(format: KvCacheFormat, max_context: u32) -> Result<Self> {
         match format {
             KvCacheFormat::F16 => Ok(Self::F16(KvCache::new(
                 KEY_VALUE_HEADS,
-                MAX_CONTEXT,
+                max_context,
                 HEAD_DIM,
                 f16::ZERO,
             )?)),
             KvCacheFormat::Bf16 => Ok(Self::Bf16(KvCache::new(
                 KEY_VALUE_HEADS,
-                MAX_CONTEXT,
+                max_context,
                 HEAD_DIM,
                 bf16::ZERO,
             )?)),
             KvCacheFormat::F32 => Ok(Self::F32(KvCache::new(
                 KEY_VALUE_HEADS,
-                MAX_CONTEXT,
+                max_context,
                 HEAD_DIM,
                 0.0,
             )?)),
@@ -966,7 +966,7 @@ impl QwenWeights {
     }
 }
 
-/// Qwen3-Coder-30B-A3B-Instruct with a fixed 32768-token KV cache.
+/// Qwen3-Coder-30B-A3B-Instruct inference engine.
 pub struct Qwen3Coder {
     weights: QwenWeights,
     variants: variants::Variants,
@@ -976,6 +976,7 @@ pub struct Qwen3Coder {
     qk_norm_rope: Kernel,
     moe_epilogues: MoeEpilogues,
     activation_positions: Tensor<f32>,
+    max_context: u32,
     #[cfg(target_family = "wasm")]
     replay: bool,
     #[cfg(target_family = "wasm")]
@@ -1112,7 +1113,8 @@ impl Qwen3Coder {
         pool: Option<PagedPool<'_>>,
         config: &EngineLoadConfig,
     ) -> Result<Self> {
-        let variants = variants::Variants::new(config)?;
+        let max_context = load_context(config)?;
+        let variants = variants::Variants::new(config, max_context)?;
         let weights = QwenWeights::load(weights, layers)?;
         let caches = if let Some(pool) = pool {
             CacheStorage::Paged(
@@ -1124,13 +1126,13 @@ impl Qwen3Coder {
         } else {
             CacheStorage::Contiguous(
                 (0..layers)
-                    .map(|_| Cache::new(config.kv_cache))
+                    .map(|_| Cache::new(config.kv_cache, max_context))
                     .collect::<Result<Vec<_>>>()?,
             )
         };
         #[cfg(target_family = "wasm")]
         let decode = {
-            let mut decode = DecodeState::new(MAX_CONTEXT, VOCAB)?;
+            let mut decode = DecodeState::new(max_context, VOCAB)?;
             decode.select(forja_sdk::SamplingParams::default())?;
             decode
         };
@@ -1143,18 +1145,19 @@ impl Qwen3Coder {
             qk_norm_rope: qk_norm_rope_kernel(DType::F32, HEAD_DIM, RMS_EPSILON, ROPE_THETA)?,
             moe_epilogues: MoeEpilogues::load()?,
             activation_positions: Tensor::constant(
-                &(0..MAX_CONTEXT)
+                &(0..max_context)
                     .map(exact_position)
                     .collect::<Result<Vec<_>>>()?,
-                &[MAX_CONTEXT],
+                &[max_context],
             )?,
+            max_context,
             #[cfg(target_family = "wasm")]
             replay: config.replay,
             #[cfg(target_family = "wasm")]
             decode,
             #[cfg(target_family = "wasm")]
             prefill: Some(
-                ChunkedPrefill::new(MAX_CONTEXT, PREFILL_CHUNK)?
+                ChunkedPrefill::new(max_context, PREFILL_CHUNK)?
                     .with_tail_chunk(PREFILL_TAIL_CHUNK)?
                     .with_tail_capacity(PREFILL_TAIL_CAPACITY)?,
             ),
@@ -1374,7 +1377,7 @@ impl Engine for Qwen3Coder {
     fn describe() -> EngineInfo {
         EngineInfo {
             vocab: VOCAB,
-            max_context: MAX_CONTEXT,
+            max_context: MAX_SUPPORTED_CONTEXT,
             tap_layers: (1..=48).collect(),
             router_layers: (1..=48).collect(),
             serving: Some(serving_info()),
@@ -1423,8 +1426,8 @@ impl Engine for Qwen3Coder {
         let end = input
             .start_pos
             .checked_add(sequence)
-            .filter(|&end| end <= MAX_CONTEXT)
-            .ok_or_else(|| forja_sdk::Error::loading("tokens exceed the 32768-token context"))?;
+            .filter(|&end| end <= self.max_context)
+            .ok_or_else(|| forja_sdk::Error::loading("tokens exceed the configured context"))?;
         #[cfg(target_family = "wasm")]
         if self.replay && sequence == 1 && !input.taps {
             let logits = self.replay_decode(Some(&input.tokens), input.start_pos)?;
@@ -1477,9 +1480,9 @@ impl Engine for Qwen3Coder {
                 let end = input
                     .start_pos
                     .checked_add(sequence)
-                    .filter(|&end| end <= MAX_CONTEXT)
+                    .filter(|&end| end <= self.max_context)
                     .ok_or_else(|| {
-                        forja_sdk::Error::loading("decode tokens exceed the 32768-token context")
+                        forja_sdk::Error::loading("decode tokens exceed the configured context")
                     })?;
                 if self.prefill_supports(input.start_pos, sequence) {
                     let logits = if self.replay {
@@ -1505,10 +1508,10 @@ impl Engine for Qwen3Coder {
                     self.select_token(logits, end - 1)
                 }
             }
-            None if input.start_pos < MAX_CONTEXT && self.replay => {
+            None if input.start_pos < self.max_context && self.replay => {
                 self.decode_selected(None, input.start_pos)
             }
-            None if input.start_pos < MAX_CONTEXT => {
+            None if input.start_pos < self.max_context => {
                 let token = self.decode.token()?;
                 let start = input.start_pos.into();
                 let end = (input.start_pos + 1).into();
@@ -1521,14 +1524,14 @@ impl Engine for Qwen3Coder {
                 self.select_token(logits, input.start_pos)
             }
             None => Err(forja_sdk::Error::loading(
-                "decode position exceeds the 32768-token context",
+                "decode position exceeds the configured context",
             )),
         }
     }
 
     #[cfg(target_family = "wasm")]
     fn begin_decode(&mut self, input: forja_sdk::BeginDecodeInput) -> Result<Tensor<f32>> {
-        if input.start_pos >= MAX_CONTEXT {
+        if input.start_pos >= self.max_context {
             return Err(forja_sdk::Error::loading(
                 "constrained decode requires a position within context",
             ));
@@ -1889,7 +1892,7 @@ impl Qwen3Coder {
             if state.masked.is_none() {
                 let params = starts
                     .iter()
-                    .map(|_| Param::new(0..=MAX_CONTEXT - 1))
+                    .map(|_| Param::new(0..=self.max_context - 1))
                     .collect::<Result<Vec<_>>>()?;
                 let positions = params
                     .iter()
@@ -1945,7 +1948,7 @@ impl Qwen3Coder {
         let mut selection_positions = Vec::with_capacity(starts.len());
         for start in starts {
             let start = start.unwrap_or(0);
-            let param = Param::new(0..=MAX_CONTEXT - 1)?;
+            let param = Param::new(0..=self.max_context - 1)?;
             let position = Dim::from(param.at(start));
             lanes.push(Some(BatchLanePosition {
                 start: position.clone(),
@@ -2273,7 +2276,7 @@ impl Qwen3Coder {
     }
 
     fn capture_decode(&mut self, start_pos: u32) -> Result<forja_sdk::Graph<Tensor<f32>>> {
-        let position = forja_sdk::Param::new(0..=MAX_CONTEXT - 1)?;
+        let position = forja_sdk::Param::new(0..=self.max_context - 1)?;
         let start = position.at(start_pos);
         let end = (start.clone() + 1)?;
         let start_dim = start.clone().into();
@@ -2306,7 +2309,7 @@ impl Qwen3Coder {
         logits: &Tensor<f32>,
         start_pos: u32,
     ) -> Result<forja_sdk::Graph<Tensor<u32>>> {
-        let position = forja_sdk::Param::new(0..=MAX_CONTEXT - 1)?;
+        let position = forja_sdk::Param::new(0..=self.max_context - 1)?;
         let start = position.at(start_pos);
         let sampling = self.decode.sampling()?;
         let allow = self.decode.allow()?;
@@ -2353,6 +2356,13 @@ impl Qwen3Coder {
         );
         Ok(forja_sdk::DecodeOutput { logits, token })
     }
+}
+
+fn load_context(config: &EngineLoadConfig) -> Result<u32> {
+    config
+        .max_context
+        .filter(|&context| context > 0 && context <= MAX_SUPPORTED_CONTEXT)
+        .ok_or_else(|| forja_sdk::Error::loading("profile max context is missing or unsupported"))
 }
 
 #[cfg(test)]
@@ -2416,7 +2426,7 @@ mod tests {
     fn describes_model_contract() {
         let info = Qwen3Coder::describe();
         assert_eq!(info.vocab, VOCAB);
-        assert_eq!(info.max_context, MAX_CONTEXT);
+        assert_eq!(info.max_context, MAX_SUPPORTED_CONTEXT);
         assert_eq!(info.tap_layers, (1..=48).collect::<Vec<_>>());
         assert_eq!(info.router_layers, (1..=48).collect::<Vec<_>>());
         let serving = info.serving.unwrap();
@@ -2424,7 +2434,7 @@ mod tests {
         assert_eq!(serving.planes.len(), 96);
         assert_eq!(serving.planes[0].elements_per_token, 512);
         assert_eq!(serving.active_lanes, 8);
-        assert_eq!(serving.max_context, MAX_CONTEXT);
+        assert_eq!(serving.max_context, MAX_SUPPORTED_CONTEXT);
         assert_eq!(serving.batch_shapes.len(), 15);
         assert_eq!(
             serving
@@ -2452,6 +2462,16 @@ mod tests {
                 .collect::<Vec<_>>(),
             [16, 512, 2_048]
         );
+    }
+
+    #[test]
+    fn load_context_uses_the_profile_value() {
+        let config = EngineLoadConfig {
+            max_context: Some(32_768),
+            ..EngineLoadConfig::default()
+        };
+        assert_eq!(load_context(&config).unwrap(), 32_768);
+        assert!(load_context(&EngineLoadConfig::default()).is_err());
     }
 
     #[test]

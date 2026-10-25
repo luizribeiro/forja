@@ -45,13 +45,13 @@ const SITES: &[&str] = &[
 pub(crate) struct Variants(EngineSelections);
 
 impl Variants {
-    pub(crate) fn new(config: &EngineLoadConfig) -> Result<Self> {
+    pub(crate) fn new(config: &EngineLoadConfig, max_context: u32) -> Result<Self> {
         validate_batch_reductions(config)?;
         Ok(Self(EngineSelections::new(
             config,
             &[],
             SITES,
-            crate::MAX_CONTEXT,
+            max_context,
         )?))
     }
 
