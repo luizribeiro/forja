@@ -3637,10 +3637,19 @@ impl MetalBackend {
         }
         if let Some(kernel) = match selected_variant(dispatch) {
             Some(MetalVariant::PagedSdpaSteel) => Some(SdpaKernel::Steel),
-            Some(MetalVariant::PagedSdpaSteelHalf) => Some(SdpaKernel::SteelHalf),
+            Some(MetalVariant::PagedSdpaSteelHalf | MetalVariant::PagedSdpaSteelHalf32x16) => {
+                Some(SdpaKernel::SteelHalf)
+            }
             _ => None,
         } {
-            let (block_query, block_key) = steel_attention_tile(kernel, q[2])?;
+            let (block_query, block_key) = if matches!(
+                selected_variant(dispatch),
+                Some(MetalVariant::PagedSdpaSteelHalf32x16)
+            ) {
+                (32, 16)
+            } else {
+                steel_attention_tile(kernel, q[2])?
+            };
             if !steel_loader_offsets_fit(&query.layout, block_query)
                 || !steel_loader_offsets_fit(&key.layout, block_key)
                 || !steel_loader_offsets_fit(&value.layout, block_key)
@@ -8072,6 +8081,9 @@ fn paged_sdpa_kernel(dispatch: &Dispatch, width: u32) -> Result<&'static str, Ba
         (Some(MetalVariant::PagedSdpaSteel), 128) => Ok("paged_steel_attention_128"),
         (Some(MetalVariant::PagedSdpaSteelHalf), 64) => Ok("paged_steel_attention_half_64_64x32"),
         (Some(MetalVariant::PagedSdpaSteelHalf), 128) => Ok("paged_steel_attention_half_128_96x16"),
+        (Some(MetalVariant::PagedSdpaSteelHalf32x16), 128) => {
+            Ok("paged_steel_attention_half_128_32x16")
+        }
         (_, 64) => Ok("paged_sdpa_64"),
         (_, 128) => Ok("paged_sdpa_128"),
         _ => Err(BackendError::UnsupportedOperation),
@@ -8415,7 +8427,9 @@ pub(super) fn variant_supported(
             matches!(dispatch.op(), Op::PagedSdpa { .. })
         }
         MetalVariant::PagedSdpaSteel => paged_steel_sdpa_supported(dispatch)?,
-        MetalVariant::PagedSdpaSteelHalf => paged_half_steel_sdpa_supported(dispatch)?,
+        MetalVariant::PagedSdpaSteelHalf | MetalVariant::PagedSdpaSteelHalf32x16 => {
+            paged_half_steel_sdpa_supported(dispatch)?
+        }
         MetalVariant::TopKSingleK8 => dispatch_kernel(dispatch)? == "topk_single",
         MetalVariant::SamplePortable => dispatch_kernel(dispatch)? == "sample_rejection",
         MetalVariant::SampleParallel => dispatch_kernel(dispatch)? == "sample_parallel",
@@ -10720,6 +10734,7 @@ mod tests {
             ("paged-sdpa.decomposed", DType::F32, 7),
             ("paged-sdpa.steel", DType::F32, 7),
             ("paged-sdpa.steel-half", DType::F16, 7),
+            ("paged-sdpa.steel-half-32x16", DType::F16, 7),
         ] {
             let query = backend.alloc(DType::F32, &[16, query_length, 128]).unwrap();
             let key = backend.alloc(dtype, &[1, 64, 8, 128]).unwrap();

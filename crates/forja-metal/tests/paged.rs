@@ -832,37 +832,39 @@ fn check_paged_sdpa_real_shapes(dtype: DType, shapes: &[(u32, u32)], query_head_
             None,
         )
         .unwrap();
-        let variant = match (dtype, query_length) {
-            (_, 1) => "paged-sdpa.vector",
-            (DType::F32, _) => "paged-sdpa.steel",
-            _ => "paged-sdpa.steel-half",
+        let variants: &[&str] = match (dtype, query_length) {
+            (_, 1) => &["paged-sdpa.vector"],
+            (DType::F32, _) => &["paged-sdpa.steel"],
+            _ => &["paged-sdpa.steel-half", "paged-sdpa.steel-half-32x16"],
         };
-        let candidate = run_sdpa(
-            &metal,
-            dtype,
-            length,
-            query_length,
-            true,
-            false,
-            QUERY_HEADS,
-            KV_HEADS,
-            (0, 0),
-            &[],
-            Some(variant),
-            None,
-        )
-        .unwrap();
-        let row_elements = usize::try_from(query_length * WIDTH).unwrap();
-        let candidate_start = usize::try_from(query_head_range.start).unwrap() * row_elements;
-        let candidate_end = usize::try_from(query_head_range.end).unwrap() * row_elements;
-        let error = forja_testing::normwise_relative_error(
-            &reference,
-            &candidate[candidate_start..candidate_end],
-        );
-        assert!(
-            error <= forja_testing::dtype_tolerance(dtype).unwrap(),
-            "dtype={dtype:?} length={length} error={error}"
-        );
+        for &variant in variants {
+            let candidate = run_sdpa(
+                &metal,
+                dtype,
+                length,
+                query_length,
+                true,
+                false,
+                QUERY_HEADS,
+                KV_HEADS,
+                (0, 0),
+                &[],
+                Some(variant),
+                None,
+            )
+            .unwrap();
+            let row_elements = usize::try_from(query_length * WIDTH).unwrap();
+            let candidate_start = usize::try_from(query_head_range.start).unwrap() * row_elements;
+            let candidate_end = usize::try_from(query_head_range.end).unwrap() * row_elements;
+            let error = forja_testing::normwise_relative_error(
+                &reference,
+                &candidate[candidate_start..candidate_end],
+            );
+            assert!(
+                error <= forja_testing::dtype_tolerance(dtype).unwrap(),
+                "variant={variant} dtype={dtype:?} length={length} error={error}"
+            );
+        }
     }
 }
 
@@ -1294,26 +1296,54 @@ fn metal_paged_sdpa_matches_causal_prefill() {
             (hash ^ u64::from(bits)).wrapping_mul(0x0000_0100_0000_01b3)
         });
     assert_eq!(hash, 0x2e80_2477_d020_a26e);
+    let tiled = run_sdpa(
+        &metal,
+        DType::F16,
+        11,
+        11,
+        true,
+        true,
+        32,
+        4,
+        (0, 0),
+        &[],
+        Some("paged-sdpa.steel-half-32x16"),
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        candidate
+            .iter()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>(),
+        tiled
+            .iter()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
 fn metal_paged_steel_refuses_corrupt_entries() {
-    let error = run_sdpa(
-        &forja_metal::MetalBackend::new().unwrap(),
-        DType::F16,
-        129,
-        7,
-        true,
-        true,
-        16,
-        8,
-        (0, 0),
-        &[0],
-        Some("paged-sdpa.steel-half"),
-        None,
-    )
-    .unwrap_err();
-    assert!(matches!(error, BackendError::DeviceErrorFlag { .. }));
+    let metal = forja_metal::MetalBackend::new().unwrap();
+    for variant in ["paged-sdpa.steel-half", "paged-sdpa.steel-half-32x16"] {
+        let error = run_sdpa(
+            &metal,
+            DType::F16,
+            129,
+            7,
+            true,
+            true,
+            16,
+            8,
+            (0, 0),
+            &[0],
+            Some(variant),
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(error, BackendError::DeviceErrorFlag { .. }));
+    }
 }
 
 #[test]

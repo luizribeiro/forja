@@ -56,6 +56,7 @@ pub(crate) enum MetalVariant {
     PagedSdpaDecomposed,
     PagedSdpaSteel,
     PagedSdpaSteelHalf,
+    PagedSdpaSteelHalf32x16,
     TopKPortable,
     TopKSingleK8,
     TopKPartials,
@@ -635,6 +636,20 @@ const PAGED_SDPA_STEEL_HALF: &[Constraint] = &[
         allowed: REDUCED_DTYPES,
     },
 ];
+const PAGED_SDPA_STEEL_HALF_128: &[Constraint] = &[
+    PAGED_SDPA_STEEL[0],
+    value(PAGED_KEY_WIDTH, Relation::Equal(128)),
+    PAGED_SDPA_STEEL[2],
+    operation(OperationValue::PageTokens, Relation::MultipleOf(16)),
+    Constraint::DType {
+        tensor: KEY,
+        allowed: REDUCED_DTYPES,
+    },
+    Constraint::DType {
+        tensor: VALUE,
+        allowed: REDUCED_DTYPES,
+    },
+];
 
 macro_rules! variant {
     (@batch_invariant $batch_invariant:expr;
@@ -941,6 +956,15 @@ pub(crate) static REGISTRY: &[VariantDef<MetalVariant>] = &[
         &["reduced-precision paged-cache prefill."],
         &["f32 caches or single-token decode."],
         &["Converts paged MMA inputs to half and accumulates in f32."]
+    ),
+    batch_invariant_variant!(
+        "paged-sdpa.steel-half-32x16",
+        PagedSdpa,
+        PagedSdpaSteelHalf32x16,
+        PAGED_SDPA_STEEL_HALF_128,
+        &["reduced-precision paged-cache prefill with short query blocks."],
+        &["f32 caches, single-token decode, or longer query blocks."],
+        &["Uses 32x16 tiles with half MMA inputs and f32 accumulation."]
     ),
     batch_invariant_variant!(
         "sdpa.portable",
@@ -1651,6 +1675,7 @@ mod tests {
                 "paged-sdpa.decomposed",
                 "paged-sdpa.steel",
                 "paged-sdpa.steel-half",
+                "paged-sdpa.steel-half-32x16",
                 "sdpa.portable",
                 "sdpa.decomposed",
                 "sdpa.vector-single-pass",
@@ -2098,6 +2123,7 @@ mod tests {
         let decode = paged_sdpa_dispatch(DType::F16, 1, 128);
         let f32 = paged_sdpa_dispatch(DType::F32, 7, 128);
         assert!(resolve(&reduced, "paged-sdpa.steel-half", METAL4).is_ok());
+        assert!(resolve(&reduced, "paged-sdpa.steel-half-32x16", METAL4).is_ok());
         assert!(matches!(
             resolve(&decode, "paged-sdpa.steel-half", METAL4),
             Err(VariantError::Constraint { .. })
@@ -2107,6 +2133,11 @@ mod tests {
             Err(VariantError::Constraint { .. })
         ));
         assert!(resolve(&f32, "paged-sdpa.steel", METAL4).is_ok());
+        let width_64 = paged_sdpa_dispatch(DType::F16, 7, 64);
+        assert!(matches!(
+            resolve(&width_64, "paged-sdpa.steel-half-32x16", METAL4),
+            Err(VariantError::Constraint { .. })
+        ));
     }
 
     #[test]
@@ -2467,6 +2498,11 @@ mod tests {
                 "paged-sdpa.steel-half",
                 paged_sdpa_dispatch(DType::F16, 2, 128),
                 "paged_steel_attention_half_128_96x16",
+            ),
+            (
+                "paged-sdpa.steel-half-32x16",
+                paged_sdpa_dispatch(DType::F16, 2, 128),
+                "paged_steel_attention_half_128_32x16",
             ),
             (
                 "top-k.portable",
