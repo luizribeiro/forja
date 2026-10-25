@@ -8176,13 +8176,13 @@ fn steel_attention_tile(kernel: SdpaKernel, width: u32) -> Result<(u32, u32), Ba
 fn steel_attention_constants(
     dispatch: &Dispatch,
     kernel: SdpaKernel,
-) -> Result<[(u32, u32); 7], BackendError> {
+) -> Result<[(u32, u32); 6], BackendError> {
     let [query, key, value] = dispatch.inputs() else {
         return Err(BackendError::InvalidInput);
     };
-    let [_, query_length, width] = shape3(query.layout())?;
+    let [_, _, width] = shape3(query.layout())?;
     let [_, key_length, _] = shape3(key.layout())?;
-    let (block_query, block_key) = steel_attention_tile(kernel, width)?;
+    let (_, block_key) = steel_attention_tile(kernel, width)?;
     let Op::Sdpa { causal, .. } = dispatch.op() else {
         return Err(BackendError::InvalidInput);
     };
@@ -8191,7 +8191,6 @@ fn steel_attention_constants(
         (1, dtype_code(key.layout().dtype())),
         (2, dtype_code(dispatch.output().layout().dtype())),
         (3, dtype_code(value.layout().dtype())),
-        (210, u32::from(query_length % block_query == 0)),
         (211, u32::from(key_length % block_key == 0)),
         (212, u32::from(causal)),
     ])

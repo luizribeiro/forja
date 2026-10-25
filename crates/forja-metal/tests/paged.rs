@@ -1287,6 +1287,13 @@ fn metal_paged_sdpa_matches_causal_prefill() {
         forja_testing::normwise_relative_error(&reference, &candidate)
             <= forja_testing::F16_TOLERANCE
     );
+    let hash = candidate
+        .iter()
+        .map(|value| value.to_bits())
+        .fold(0xcbf2_9ce4_8422_2325_u64, |hash, bits| {
+            (hash ^ u64::from(bits)).wrapping_mul(0x0000_0100_0000_01b3)
+        });
+    assert_eq!(hash, 0x2e80_2477_d020_a26e);
 }
 
 #[test]
