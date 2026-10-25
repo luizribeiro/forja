@@ -215,3 +215,35 @@ kernel void gemv_transposed(
         }
     }
 }
+
+kernel void column_gemv(
+    device const uchar *a [[buffer(0)]],
+    device const uchar *b [[buffer(1)]],
+    device uchar *d [[buffer(2)]],
+    constant MatmulParams &params [[buffer(3)]],
+    FORJA_EPILOGUE_ARGUMENTS
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint3 threadgroup_size [[threads_per_threadgroup]],
+    uint3 tile [[threadgroup_position_in_grid]]) {
+    uint row = tile.y * threadgroup_size.x + thread_index;
+    if (row >= params.m) {
+        return;
+    }
+    ulong a_base = params.a_offset + ulong(tile.z) * params.batch_stride_a;
+    ulong b_base = params.b_offset + ulong(tile.z) * params.batch_stride_b;
+    ulong a_row_stride = params.a_column_major ? 1 : params.lda;
+    ulong a_column_stride = params.a_column_major ? params.lda : 1;
+    ulong b_row_stride = params.b_column_major ? 1 : params.ldb;
+    float sum = 0.0f;
+    for (uint inner = 0; inner < params.k; ++inner) {
+        sum += load_float(
+            a, a_base + ulong(row) * a_row_stride + ulong(inner) * a_column_stride,
+            input0_dtype) * load_float(
+                b, b_base + ulong(inner) * b_row_stride, input1_dtype);
+    }
+    float value = forja_epilogue(
+        sum, 0.0f, tile.z, row, 0, params.batch, params.m, 1,
+        FORJA_EPILOGUE_VALUES);
+    ulong d_base = params.d_offset + ulong(tile.z) * params.batch_stride_d;
+    store_float(d, d_base + ulong(row) * params.ldd, output_dtype, value);
+}

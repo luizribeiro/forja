@@ -5712,7 +5712,19 @@ impl MetalBackend {
         epilogue: Option<&PreparedEpilogue>,
     ) -> Result<MatmulLaunch, BackendError> {
         let (kernel, block_rows, block_columns, thread_count, constants) =
-            if shape.rows == 1 && selected != Some(MetalVariant::MatmulPortable) {
+            if selected == Some(MetalVariant::MatmulColumnGemv) {
+                (
+                    "column_gemv",
+                    256,
+                    1,
+                    256,
+                    vec![
+                        (0, dtype_code(shape.left_dtype)),
+                        (1, dtype_code(shape.right_dtype)),
+                        (2, dtype_code(shape.output_dtype)),
+                    ],
+                )
+            } else if shape.rows == 1 && selected != Some(MetalVariant::MatmulPortable) {
                 let transposed = match selected {
                     Some(MetalVariant::MatmulGemv) => false,
                     Some(MetalVariant::MatmulGemvTransposed) => true,
@@ -7718,6 +7730,7 @@ fn supported_dispatch(dispatch: &Dispatch) -> bool {
             Some(
                 MetalVariant::MatmulGemv
                     | MetalVariant::MatmulGemvTransposed
+                    | MetalVariant::MatmulColumnGemv
                     | MetalVariant::MatmulPortable
                     | MetalVariant::MatmulSteel64x64x16_2x2
                     | MetalVariant::MatmulSteel64x64x16_1x2
@@ -7968,6 +7981,7 @@ fn matmul_kernel(dispatch: &Dispatch) -> Result<&'static str, BackendError> {
         }
         Some(MetalVariant::MatmulGemv) => Ok("gemv"),
         Some(MetalVariant::MatmulGemvTransposed) => Ok("gemv_transposed"),
+        Some(MetalVariant::MatmulColumnGemv) => Ok("column_gemv"),
         Some(MetalVariant::MatmulSteel64x64x16_2x2) => Ok("steel_gemm_64_64_16_2_2"),
         Some(MetalVariant::MatmulSteel64x64x16_1x2) => Ok("steel_gemm_64_64_16_1_2"),
         Some(MetalVariant::MatmulSteel32x64x16_1x2) => Ok("steel_gemm_32_64_16_1_2"),
@@ -8313,6 +8327,7 @@ pub(super) fn variant_supported(
         MetalVariant::GatherQuantMatmulWeightedBroad => dispatch.primitive_inputs().len() == 6,
         MetalVariant::MatmulGemv => matmul_rows(dispatch)? == 1,
         MetalVariant::MatmulGemvTransposed => matmul_kernel(dispatch)? == "gemv_transposed",
+        MetalVariant::MatmulColumnGemv => matmul_kernel(dispatch)? == "column_gemv",
         MetalVariant::MatmulSteel64x64x16_2x2
         | MetalVariant::MatmulSteel64x64x16_1x2
         | MetalVariant::MatmulSteel64x32x32_2x2
@@ -8819,7 +8834,11 @@ fn dense_epilogue_requests(
     ];
     if matches!(
         selected_variant(dispatch),
-        Some(MetalVariant::MatmulGemv | MetalVariant::MatmulGemvTransposed)
+        Some(
+            MetalVariant::MatmulGemv
+                | MetalVariant::MatmulGemvTransposed
+                | MetalVariant::MatmulColumnGemv
+        )
     ) {
         return Ok(vec![EpiloguePipelineRequest {
             family: epilogue_codegen::FamilySourceTag::Dense,
@@ -11046,7 +11065,7 @@ mod tests {
         .unwrap();
         let mut requests = Vec::new();
         let dense_constants = vec![(0, 0), (1, 0), (2, 0)];
-        for implementation in ["gemv", "gemv_transposed"] {
+        for implementation in ["gemv", "gemv_transposed", "column_gemv"] {
             requests.push(EpiloguePipelineRequest {
                 family: epilogue_codegen::FamilySourceTag::Dense,
                 epilogue: Arc::clone(&epilogue),
@@ -11757,6 +11776,150 @@ mod tests {
             ("matmul.gemv-transposed", true, false),
         ] {
             assert_dense_epilogue(variant, transposed, broadcast, 1, 33, 17);
+        }
+        assert_dense_epilogue("matmul.column-gemv", false, false, 33, 7, 1);
+    }
+
+    #[test]
+    fn metal_column_gemv_matches_cpu_for_batches_and_odd_rows() {
+        fn run<B: Backend>(
+            backend: &B,
+            left_bytes: &[u8],
+            right_bytes: &[u8],
+            selection: Option<BackendDispatchData>,
+        ) -> Vec<u8> {
+            let left = backend.alloc(DType::F32, &[7, 33, 8]).unwrap();
+            let right = backend.alloc(DType::F32, &[7, 8, 1]).unwrap();
+            let output = backend.alloc(DType::F32, &[7, 33, 1]).unwrap();
+            backend.write(&left, left_bytes).unwrap();
+            backend.write(&right, right_bytes).unwrap();
+            let mut commands = CommandList::new();
+            commands
+                .dispatch(Op::Matmul, &[&left, &right], &output)
+                .unwrap();
+            if let Some(selection) = selection {
+                assert!(commands.set_last_backend_data(selection));
+            }
+            backend.submit(commands).unwrap().wait().unwrap();
+            backend.read(&output).unwrap()
+        }
+
+        let cpu = CpuBackend::new();
+        let metal = MetalBackend::new().unwrap();
+        let left_bytes = f32_pattern(7 * 33 * 8, 19);
+        let right_bytes = f32_pattern(7 * 8, 23);
+        let left = metal.alloc(DType::F32, &[7, 33, 8]).unwrap();
+        let right = metal.alloc(DType::F32, &[7, 8, 1]).unwrap();
+        let output = metal.alloc(DType::F32, &[7, 33, 1]).unwrap();
+        let variant = metal
+            .validate_variant_for_op(
+                Op::Matmul,
+                &[&left, &right],
+                &[&output],
+                "matmul.column-gemv",
+            )
+            .unwrap();
+        let expected = run(&cpu, &left_bytes, &right_bytes, None);
+        let actual = run(
+            &metal,
+            &left_bytes,
+            &right_bytes,
+            Some(BackendDispatchData::new(variant)),
+        );
+        assert_outputs_agree(DType::F32, &expected, &actual).unwrap();
+    }
+
+    #[test]
+    fn metal_column_gemv_covers_multiple_tiles_and_column_major_inputs() {
+        fn allocate<B: Backend>(backend: &B, spec: &TensorSpec, bytes: &[u8]) -> Tensor {
+            let mut tensor = backend
+                .alloc(spec.dtype(), spec.allocation_shape())
+                .unwrap();
+            backend.write(&tensor, bytes).unwrap();
+            for view in spec.views() {
+                tensor = backend.view(&tensor, view.clone()).unwrap();
+            }
+            tensor
+        }
+
+        fn run<B: Backend>(
+            backend: &B,
+            left_spec: &TensorSpec,
+            right_spec: &TensorSpec,
+            left_bytes: &[u8],
+            right_bytes: &[u8],
+            selection: Option<BackendDispatchData>,
+        ) -> Vec<u8> {
+            let left = allocate(backend, left_spec, left_bytes);
+            let right = allocate(backend, right_spec, right_bytes);
+            let output = backend
+                .alloc(DType::F32, &[left.layout().shape()[0], 1])
+                .unwrap();
+            let mut commands = CommandList::new();
+            commands
+                .dispatch(Op::Matmul, &[&left, &right], &output)
+                .unwrap();
+            if let Some(selection) = selection {
+                assert!(commands.set_last_backend_data(selection));
+            }
+            backend.submit(commands).unwrap().wait().unwrap();
+            backend.read(&output).unwrap()
+        }
+
+        let cpu = CpuBackend::new();
+        let metal = MetalBackend::new().unwrap();
+        for (left_spec, right_spec) in [
+            (
+                TensorSpec::contiguous(DType::F32, &[257, 8]),
+                TensorSpec::contiguous(DType::F32, &[8, 1]),
+            ),
+            (
+                TensorSpec::permuted(DType::F32, &[8, 257], &[1, 0]),
+                TensorSpec::contiguous(DType::F32, &[8, 1]),
+            ),
+            (
+                TensorSpec::contiguous(DType::F32, &[257, 8]),
+                TensorSpec::permuted(DType::F32, &[1, 8], &[1, 0]),
+            ),
+            (
+                TensorSpec::permuted(DType::F32, &[8, 513], &[1, 0]),
+                TensorSpec::permuted(DType::F32, &[1, 8], &[1, 0]),
+            ),
+        ] {
+            let left_elements = left_spec.allocation_shape().iter().product::<u32>();
+            let right_elements = right_spec.allocation_shape().iter().product::<u32>();
+            let left_bytes = f32_pattern(usize::try_from(left_elements).unwrap(), 29);
+            let right_bytes = f32_pattern(usize::try_from(right_elements).unwrap(), 31);
+            let left = allocate(&metal, &left_spec, &left_bytes);
+            let right = allocate(&metal, &right_spec, &right_bytes);
+            let output = metal
+                .alloc(DType::F32, &[left.layout().shape()[0], 1])
+                .unwrap();
+            let variant = metal
+                .validate_variant_for_op(
+                    Op::Matmul,
+                    &[&left, &right],
+                    &[&output],
+                    "matmul.column-gemv",
+                )
+                .unwrap();
+            let expected = run(
+                &cpu,
+                &left_spec,
+                &right_spec,
+                &left_bytes,
+                &right_bytes,
+                None,
+            );
+            let actual = run(
+                &metal,
+                &left_spec,
+                &right_spec,
+                &left_bytes,
+                &right_bytes,
+                Some(BackendDispatchData::new(variant)),
+            );
+            assert_outputs_agree(DType::F32, &expected, &actual).unwrap();
         }
     }
 

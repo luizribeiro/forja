@@ -17,6 +17,7 @@ pub(crate) enum MetalVariant {
     MatmulPortable,
     MatmulGemv,
     MatmulGemvTransposed,
+    MatmulColumnGemv,
     MatmulSteel64x64x16_2x2,
     MatmulSteel64x64x16_1x2,
     MatmulSteel64x32x32_2x2,
@@ -251,6 +252,7 @@ const KEY: TensorRef = TensorRef::input("key", 1);
 const VALUE: TensorRef = TensorRef::input("value", 2);
 
 const M: Dimension = dim("m", LEFT, Axis::FromEnd(2));
+const N: Dimension = dim("n", RIGHT, Axis::FromEnd(1));
 const QUANT_M: Dimension = dim("m", INPUT, Axis::Index(0));
 const INNER: Dimension = dim("inner", INPUT, Axis::Index(1));
 const EXPERTS: Dimension = dim("experts", PACKED, Axis::Index(0));
@@ -289,6 +291,7 @@ const fn operation(value: OperationValue, relation: Relation) -> Constraint {
 }
 
 const M_ONE: &[Constraint] = &[value(M, Relation::Equal(1))];
+const N_ONE: &[Constraint] = &[value(N, Relation::Equal(1))];
 const M_ONE_TRANSPOSED: &[Constraint] = &[
     value(M, Relation::Equal(1)),
     Constraint::Layout {
@@ -700,6 +703,15 @@ pub(crate) static REGISTRY: &[VariantDef<MetalVariant>] = &[
         &["m = 1 and the right matrix is column-major."],
         &["either matrix needs layout staging."],
         &["Reads the right operand in its transposed storage order."]
+    ),
+    batch_invariant_variant!(@class "matmul.column-gemv";
+        "matmul.column-gemv",
+        Matmul,
+        MatmulColumnGemv,
+        N_ONE,
+        &["one-column products with a short reduction axis."],
+        &["wide output matrices."],
+        &["Sums the reduction axis in fixed ascending order."]
     ),
     batch_invariant_variant!(
         "matmul.steel-64x64x16-2x2",
@@ -1611,6 +1623,7 @@ mod tests {
                 "matmul.portable",
                 "matmul.gemv",
                 "matmul.gemv-transposed",
+                "matmul.column-gemv",
                 "matmul.steel-64x64x16-2x2",
                 "matmul.steel-64x64x16-1x2",
                 "matmul.steel-64x32x32-2x2",
@@ -2252,6 +2265,11 @@ mod tests {
                 "matmul.gemv-transposed",
                 matmul_case(DType::F32, 1, 7, 33, true),
                 "gemv_transposed",
+            ),
+            (
+                "matmul.column-gemv",
+                matmul_case(DType::F32, 33, 7, 1, false),
+                "column_gemv",
             ),
             (
                 "matmul.steel-64x64x16-2x2",
