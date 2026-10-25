@@ -7560,6 +7560,7 @@ fn dispatch_profile(dispatch: &Dispatch, barrier: bool) -> Result<DispatchProfil
         gpu_end: Duration::ZERO,
         gap_before: Duration::ZERO,
         gpu_time: Duration::ZERO,
+        internal: Vec::new(),
     })
 }
 

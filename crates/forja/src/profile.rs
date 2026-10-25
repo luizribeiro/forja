@@ -407,6 +407,18 @@ fn report(
         .map(|(index, dispatch)| {
             let bytes = dispatch_bytes(dispatch)?;
             let rate = throughput(bytes, dispatch.gpu_time);
+            let internal = dispatch
+                .internal
+                .iter()
+                .map(|kernel| {
+                    serde_json::json!({
+                        "kernel": kernel.kernel,
+                        "start_seconds": kernel.gpu_start.as_secs_f64(),
+                        "end_seconds": kernel.gpu_end.as_secs_f64(),
+                        "gpu_time_seconds": kernel.gpu_time.as_secs_f64(),
+                    })
+                })
+                .collect::<Vec<_>>();
             Ok(serde_json::json!({
                 "index": index,
                 "op": op_name(dispatch.op),
@@ -420,6 +432,7 @@ fn report(
                 "gigabytes_per_second": rate,
                 "percent_of_peak": rate / peak * 100.0,
                 "barrier_before": dispatch.barrier,
+                "internal": internal,
             }))
         })
         .collect::<Result<Vec<_>, &'static str>>()?;
@@ -531,6 +544,7 @@ mod tests {
             gpu_end: Duration::from_micros(7),
             gap_before: Duration::from_micros(2),
             gpu_time: Duration::from_micros(7),
+            internal: Vec::new(),
         }
     }
 

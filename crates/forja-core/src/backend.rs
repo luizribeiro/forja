@@ -433,6 +433,21 @@ pub struct DispatchProfile {
     pub gap_before: Duration,
     /// Elapsed device time surrounding that operation.
     pub gpu_time: Duration,
+    /// Timed kernels encoded inside a composite backend operation.
+    pub internal: Vec<KernelProfile>,
+}
+
+/// Device timeline for one kernel inside a composite backend operation.
+#[derive(Clone, Debug, PartialEq)]
+pub struct KernelProfile {
+    /// Backend kernel name.
+    pub kernel: &'static str,
+    /// Device time from submission start to kernel start.
+    pub gpu_start: Duration,
+    /// Device time from submission start to kernel end.
+    pub gpu_end: Duration,
+    /// Elapsed device time surrounding the kernel.
+    pub gpu_time: Duration,
 }
 
 /// Host phases and device timings from one profiled submission.

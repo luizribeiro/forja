@@ -14,9 +14,9 @@ mod variant_proof;
 mod variants;
 
 pub use backend::{
-    AllocationRegistry, Backend, BackendError, DeviceInfo, DispatchProfile, MemoryUsage,
-    ProfileCount, ProfileTensor, ReadonlyImport, Submission, SubmissionProfile, ViewOp,
-    automatic_buffer_pool_capacity, automatic_live_bytes,
+    AllocationRegistry, Backend, BackendError, DeviceInfo, DispatchProfile, KernelProfile,
+    MemoryUsage, ProfileCount, ProfileTensor, ReadonlyImport, Submission, SubmissionProfile,
+    ViewOp, automatic_buffer_pool_capacity, automatic_live_bytes,
 };
 pub use forja_mmap::MappedRegion;
 pub use graph::{
