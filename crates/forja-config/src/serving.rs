@@ -93,6 +93,8 @@ pub struct Serving {
     /// Reuse matching prefixes retained by a paged KV cache.
     #[serde(rename = "prefix-reuse")]
     pub prefix_reuse: bool,
+    /// Maximum context allocated for the loaded model.
+    pub max_context: Choice<NonZeroU32>,
     /// Maximum simultaneously active sequences.
     pub max_active_sequences: Choice<NonZeroU32>,
     /// Maximum sequences in one batch.
@@ -115,6 +117,7 @@ impl Default for Serving {
     fn default() -> Self {
         Self {
             prefix_reuse: true,
+            max_context: Choice::Auto,
             max_active_sequences: Choice::Auto,
             max_batch_size: Choice::Auto,
             max_prefill_chunks: Choice::Auto,
@@ -490,6 +493,7 @@ max_output_tokens = 4096
         assert_eq!(config.metrics.path, "/metrics");
         assert_eq!(config.logging.format, LogFormat::Json);
         assert_eq!(config.serving.max_active_sequences, Choice::Auto);
+        assert_eq!(config.serving.max_context, Choice::Auto);
         assert_eq!(config.serving.page_pool_bytes, Choice::Auto);
     }
 

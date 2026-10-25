@@ -86,6 +86,7 @@ pub const HOST_LEAVES: &[(&str, ReloadClass)] = &[
     ("model.model", ReloadClass::Model),
     ("model.chat_format", ReloadClass::Model),
     ("serving.prefix-reuse", ReloadClass::Live),
+    ("serving.max_context", ReloadClass::Model),
     ("serving.max_active_sequences", ReloadClass::Live),
     ("serving.max_batch_size", ReloadClass::Live),
     ("serving.max_prefill_chunks", ReloadClass::Live),
@@ -149,8 +150,10 @@ pub fn host_reload_class(path: &str) -> Option<ReloadClass> {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+    use std::num::NonZeroU32;
 
     use super::*;
+    use crate::Choice;
 
     #[test]
     fn leaf_registry_is_unique_and_classifies_sensitive_boundaries() {
@@ -160,6 +163,10 @@ mod tests {
             .collect::<BTreeSet<_>>();
         assert_eq!(unique.len(), HOST_LEAVES.len());
         assert_eq!(host_reload_class("model.profile"), Some(ReloadClass::Model));
+        assert_eq!(
+            host_reload_class("serving.max_context"),
+            Some(ReloadClass::Model)
+        );
         assert_eq!(
             host_reload_class("serving.page_pool_bytes"),
             Some(ReloadClass::Restart)
@@ -177,10 +184,11 @@ mod tests {
         let mut candidate = previous.clone();
         candidate.server.queue_length = 7;
         candidate.model.engine = "next.wasm".into();
+        candidate.serving.max_context = Choice::Fixed(NonZeroU32::new(2_048).unwrap());
         candidate.metrics.path = "/new-metrics".to_owned();
         let diff = HostConfigDiff::between(&previous, &candidate).unwrap();
         assert_eq!(diff.live, ["server.queue_length"]);
-        assert_eq!(diff.model, ["model.engine"]);
+        assert_eq!(diff.model, ["model.engine", "serving.max_context"]);
         assert_eq!(diff.restart, ["metrics.path"]);
         assert!(!diff.is_empty());
     }
