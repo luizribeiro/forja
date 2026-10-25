@@ -229,8 +229,14 @@ async fn measure_profiled_phase(
 ) -> Result<Sample, Box<dyn Error>> {
     let result = match options.mode {
         ProfileMode::Prefill => {
+            prepare_profile_prefix(runner, tokens, options.prefix_context).await?;
             runner.set_profiling(true);
-            measure_prefill(runner, tokens).await
+            measure_prefill_from(
+                runner,
+                &tokens[options.prefix_context..],
+                options.prefix_context,
+            )
+            .await
         }
         ProfileMode::Decode => {
             let token = prepare_profile_context(runner, tokens, options.context, decode).await?;
@@ -250,7 +256,15 @@ async fn measure_profile_phase(
     decode: DecodeOptions,
 ) -> Result<Sample, Box<dyn Error>> {
     match options.mode {
-        ProfileMode::Prefill => measure_prefill(runner, tokens).await,
+        ProfileMode::Prefill => {
+            prepare_profile_prefix(runner, tokens, options.prefix_context).await?;
+            measure_prefill_from(
+                runner,
+                &tokens[options.prefix_context..],
+                options.prefix_context,
+            )
+            .await
+        }
         ProfileMode::Decode => {
             let token = prepare_profile_context(runner, tokens, options.context, decode).await?;
             measure_decode_step(runner, token, options.context, decode).await
@@ -1663,9 +1677,31 @@ async fn measure_prefill(
     runner: &mut EngineRunner<forja_metal::MetalBackend>,
     tokens: &[u32],
 ) -> Result<Sample, Box<dyn Error>> {
+    measure_prefill_from(runner, tokens, 0).await
+}
+
+#[cfg(target_os = "macos")]
+async fn prepare_profile_prefix(
+    runner: &mut EngineRunner<forja_metal::MetalBackend>,
+    tokens: &[u32],
+    prefix_context: usize,
+) -> Result<(), Box<dyn Error>> {
+    if prefix_context > 0 {
+        step(runner, tokens[..prefix_context].to_vec(), 0).await?;
+        runner.wait_for_queued_submissions().await?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+async fn measure_prefill_from(
+    runner: &mut EngineRunner<forja_metal::MetalBackend>,
+    tokens: &[u32],
+    start: usize,
+) -> Result<Sample, Box<dyn Error>> {
     let before = runner.metrics();
     let started = Instant::now();
-    step(runner, tokens.to_vec(), 0).await?;
+    step(runner, tokens.to_vec(), u32::try_from(start)?).await?;
     runner.wait_for_queued_submissions().await?;
     sample(before, runner.metrics(), started.elapsed())
 }

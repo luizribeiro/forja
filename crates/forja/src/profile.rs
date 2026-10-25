@@ -232,7 +232,7 @@ fn print_markdown(
     println!("- Device: {}", measurement.device);
     print_device_info(device);
     println!("- Mode: {}", mode_name(options.mode));
-    println!("- Tokens: {}", options.context);
+    print_profile_shape(options);
     println!("- Streaming read roofline: {peak:.1} GB/s");
     println!(
         "- Streaming copy traffic: {:.1} GB/s",
@@ -310,6 +310,17 @@ fn print_markdown(
         submission.gpu_time,
     );
     Ok(())
+}
+
+fn print_profile_shape(options: &Profile) {
+    println!("- Tokens: {}", options.context);
+    if options.prefix_context > 0 {
+        println!("- Cached prefix: {}", options.prefix_context);
+        println!(
+            "- Measured suffix: {}",
+            options.context - options.prefix_context
+        );
+    }
 }
 
 fn print_device_info(device: &DeviceInfo) {
@@ -455,6 +466,8 @@ fn report(
         },
         "mode": mode_name(options.mode),
         "tokens": options.context,
+        "cached_prefix_tokens": options.prefix_context,
+        "measured_tokens": options.context - options.prefix_context,
         "streaming_read_gigabytes_per_second": peak,
         "streaming_copy_gigabytes_per_second": device.streaming_copy_gigabytes_per_second,
         "unprofiled": {

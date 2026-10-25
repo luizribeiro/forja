@@ -166,6 +166,7 @@ pub(crate) struct Profile {
     pub(crate) engine: PathBuf,
     pub(crate) model_dir: PathBuf,
     pub(crate) context: usize,
+    pub(crate) prefix_context: usize,
     pub(crate) mode: ProfileMode,
     pub(crate) warmups: usize,
     pub(crate) sampling: BenchSampling,
@@ -188,6 +189,9 @@ struct ProfileArgs {
     /// Context length or prefill token count to profile.
     #[arg(long, value_parser = parse_profile_context)]
     context: u32,
+    /// Tokens to populate before measuring a suffix prefill.
+    #[arg(long, default_value_t = 0)]
+    prefix_context: u32,
     /// Inference phase to profile.
     #[arg(long, value_enum, default_value_t = ProfileMode::Decode)]
     mode: ProfileMode,
@@ -1272,10 +1276,21 @@ impl ProfileArgs {
             std::slice::from_ref(&engine),
         )
         .map_err(|error| Cli::command().error(clap::error::ErrorKind::ValueValidation, error))?;
+        if self.prefix_context > 0
+            && (self.mode != ProfileMode::Prefill || self.prefix_context >= self.context)
+        {
+            return Err(Cli::command().error(
+                clap::error::ErrorKind::ValueValidation,
+                "--prefix-context requires prefill mode and must be less than --context",
+            ));
+        }
         Ok(Profile {
             engine,
             model_dir,
             context: usize::try_from(self.context).map_err(|error| {
+                Cli::command().error(clap::error::ErrorKind::ValueValidation, error.to_string())
+            })?,
+            prefix_context: usize::try_from(self.prefix_context).map_err(|error| {
                 Cli::command().error(clap::error::ErrorKind::ValueValidation, error.to_string())
             })?,
             mode: self.mode,
@@ -1576,6 +1591,7 @@ mod tests {
         };
         assert_eq!(options.engine, PathBuf::from("/engine.wasm"));
         assert_eq!(options.context, 512);
+        assert_eq!(options.prefix_context, 0);
         assert_eq!(options.mode, ProfileMode::Decode);
         assert_eq!(options.warmups, 7);
         assert!(options.json);
@@ -1595,6 +1611,8 @@ mod tests {
                 "512",
                 "--mode",
                 "prefill",
+                "--prefix-context",
+                "256",
             ]
             .map(str::to_owned),
         )
@@ -1603,6 +1621,27 @@ mod tests {
             panic!("expected profile command");
         };
         assert_eq!(options.mode, ProfileMode::Prefill);
+        assert_eq!(options.prefix_context, 256);
+    }
+
+    #[test]
+    fn rejects_profile_prefix_outside_suffix_prefill() {
+        let error = parse(
+            [
+                "profile",
+                "--engine",
+                "/engine.wasm",
+                "--model",
+                "/model",
+                "--context",
+                "512",
+                "--prefix-context",
+                "512",
+            ]
+            .map(str::to_owned),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
     }
 
     #[test]
