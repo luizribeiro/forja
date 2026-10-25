@@ -5,11 +5,13 @@ mod variants;
 
 #[cfg(target_family = "wasm")]
 use forja_sdk::nn::blocks::{ChunkedPrefill, DecodeSelection, DecodeState, PrefillExecution};
+#[cfg(target_family = "wasm")]
+use forja_sdk::{BatchInput, BatchOutput, BatchSelectInput, Graph, Param};
 use forja_sdk::{
-    BatchInput, BatchOutput, BatchPhase, BatchSelectInput, BatchSelection, BatchShape, CachePlane,
-    DType, Dim, Engine, EngineInfo, EngineLoadConfig, KvCacheFormat, Load, PagedCache,
-    PagedCacheSet, PagedPool, Result, ServingInfo, StepInput, StepOutput, Tensor, VariantSelection,
-    Weights, bf16, export_engine, f16,
+    BatchPhase, BatchSelection, BatchShape, CachePlane, DType, Dim, Engine, EngineInfo,
+    EngineLoadConfig, KvCacheFormat, Load, PagedCache, PagedCacheSet, PagedPool, Result,
+    ServingInfo, StepInput, StepOutput, Tensor, VariantSelection, Weights, bf16, export_engine,
+    f16,
     kernel::{Epilogue, Kernel, TensorRef},
     nn::{
         RmsNorm, RmsNormConfig,
@@ -20,8 +22,6 @@ use forja_sdk::{
         moe_combine_with, moe_router_with,
     },
 };
-#[cfg(target_family = "wasm")]
-use forja_sdk::{Graph, Param};
 
 #[forja_sdk::kernel(map)]
 fn moe_gate_up(
@@ -61,9 +61,9 @@ pub const HIDDEN: u32 = 2_048;
 pub const LAYERS: usize = 48;
 /// Largest context accepted by this engine.
 pub const MAX_CONTEXT: u32 = 32_768;
-#[cfg(target_family = "wasm")]
+#[cfg(any(target_family = "wasm", test))]
 const PREFILL_CHUNK: u32 = 2_048;
-#[cfg(target_family = "wasm")]
+#[cfg(any(target_family = "wasm", test))]
 const PREFILL_TAIL_CHUNK: u32 = 16;
 #[cfg(target_family = "wasm")]
 const PREFILL_TAIL_CAPACITY: usize = 1;
@@ -1223,6 +1223,7 @@ impl Qwen3Coder {
             taps_enabled,
             attention_variant,
             None,
+            None,
         )
     }
 
@@ -1237,6 +1238,10 @@ impl Qwen3Coder {
         attention_variant: &VariantSelection,
         lane: u32,
     ) -> Result<SequenceOutput> {
+        let last = sequence
+            .checked_sub(1)
+            .ok_or_else(|| forja_sdk::Error::loading("tokens cannot be empty"))?
+            .into();
         self.forward_sequence_in(
             tokens,
             sequence,
@@ -1245,6 +1250,7 @@ impl Qwen3Coder {
             false,
             attention_variant,
             Some(lane),
+            Some(&last),
         )
     }
 
@@ -1258,6 +1264,7 @@ impl Qwen3Coder {
         taps_enabled: bool,
         attention_variant: &VariantSelection,
         paged_lane: Option<u32>,
+        lm_head_row: Option<&Dim>,
     ) -> Result<SequenceOutput> {
         let activation_positions = self.activation_positions.narrow(0, start, sequence)?;
         let mut hidden = self.weights.embed_tokens.forward(tokens)?;
@@ -1307,7 +1314,12 @@ impl Qwen3Coder {
         if taps.enabled() {
             taps.push(normalized.contiguous()?);
         }
-        let logits = self.weights.lm_head.forward(&self.variants, &normalized)?;
+        let logits = project_lm_head(
+            normalized,
+            lm_head_row,
+            |normalized, row| normalized.narrow(0, row, 1),
+            |normalized| self.weights.lm_head.forward(&self.variants, &normalized),
+        )?;
         Ok((logits, taps.finish(), routers))
     }
 
@@ -1331,9 +1343,29 @@ impl Qwen3Coder {
             selection.parameter,
             self.caches.is_paged(),
         )?;
-        let (logits, _, _) =
-            self.forward_sequence(tokens, sequence, start, end, false, &attention)?;
-        Self::last_logits(&logits, last)
+        let (logits, _, _) = self.forward_sequence_in(
+            tokens,
+            sequence,
+            start,
+            end,
+            false,
+            &attention,
+            None,
+            Some(last),
+        )?;
+        Self::last_logits(&logits, 0)
+    }
+}
+
+fn project_lm_head<T, U, R, E>(
+    normalized: T,
+    row: Option<&R>,
+    narrow: impl FnOnce(T, &R) -> std::result::Result<T, E>,
+    project: impl FnOnce(T) -> std::result::Result<U, E>,
+) -> std::result::Result<U, E> {
+    match row {
+        Some(row) => project(narrow(normalized, row)?),
+        None => project(normalized),
     }
 }
 
@@ -1592,7 +1624,7 @@ impl Engine for Qwen3Coder {
                     lane.slot,
                 )?
                 .0;
-            let logits = Self::last_logits(&logits, sequence - 1)?.reshape(&[1, VOCAB])?;
+            let logits = Self::last_logits(&logits, 0)?.reshape(&[1, VOCAB])?;
             let tokens = self.select_batch_rows(&logits, &input.lanes)?;
             return Ok(BatchOutput { logits, tokens });
         }
@@ -2326,6 +2358,59 @@ impl Qwen3Coder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn project_rows(rows: Vec<[f32; 3]>) -> Vec<[f32; 2]> {
+        rows.into_iter()
+            .map(|row| {
+                [
+                    row[0].mul_add(0.5, row[1].mul_add(-0.25, row[2] * 0.75)),
+                    row[0].mul_add(-0.5, row[1].mul_add(0.125, row[2] * 0.25)),
+                ]
+            })
+            .collect()
+    }
+
+    fn assert_last_row_projection(sequence: u32, last: u32) {
+        let normalized = (0..sequence)
+            .map(|row| {
+                let row = f32::from(u16::try_from(row).unwrap());
+                [row * 0.25 - 3.0, row * -0.5 + 1.0, row * 0.125]
+            })
+            .collect::<Vec<_>>();
+        let full = project_rows(normalized.clone());
+        let narrowed = project_lm_head(
+            normalized,
+            Some(&last),
+            |rows, &row| Ok::<_, ()>(vec![rows[usize::try_from(row).unwrap()]]),
+            |rows| Ok(project_rows(rows)),
+        )
+        .unwrap();
+        assert_eq!(narrowed, [full[usize::try_from(last).unwrap()]]);
+    }
+
+    #[test]
+    fn last_row_projection_matches_full_rows_at_prefill_boundaries() {
+        assert_last_row_projection(1, 0);
+        assert_last_row_projection(PREFILL_CHUNK, PREFILL_CHUNK - 1);
+        assert_last_row_projection(PREFILL_TAIL_CHUNK, 6);
+
+        let normalized = (0..PREFILL_TAIL_CHUNK)
+            .map(|row| {
+                let row = f32::from(u16::try_from(row).unwrap());
+                [row, row + 1.0, row + 2.0]
+            })
+            .collect::<Vec<_>>();
+        let tap = normalized.clone();
+        let full = project_lm_head(
+            normalized.clone(),
+            None::<&u32>,
+            |_, _| Err::<Vec<[f32; 3]>, ()>(()),
+            |rows| Ok(project_rows(rows)),
+        )
+        .unwrap();
+        assert_eq!(tap, normalized);
+        assert_eq!(full, project_rows(normalized));
+    }
 
     #[test]
     fn describes_model_contract() {
