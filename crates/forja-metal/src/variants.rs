@@ -31,6 +31,7 @@ pub(crate) enum MetalVariant {
     GatherQuantMatmulGroupedSmallM,
     GatherQuantMatmulGroupedPairSmallM,
     GatherQuantMatmulGrouped,
+    GatherQuantMatmulGrouped32x32,
     GatherQuantMatmulWeightedBroad,
     SdpaPortable,
     SdpaDecomposed,
@@ -836,6 +837,15 @@ pub(crate) static REGISTRY: &[VariantDef<MetalVariant>] = &[
         &["Sorts routes into bounded expert groups."]
     ),
     batch_invariant_variant!(
+        "gather-quant-matmul.grouped-32x32-2x2",
+        GatherQuantMatmul,
+        GatherQuantMatmulGrouped32x32,
+        GROUPED_MATMUL,
+        &["large routed batches that fill 32-row expert tiles."],
+        &["small or sparse routed batches."],
+        &["Uses a 32 by 32 tile across a 2 by 2 SIMD-group grid."]
+    ),
+    batch_invariant_variant!(
         "gather-quant-matmul.weighted-broad",
         GatherQuantMatmul,
         GatherQuantMatmulWeightedBroad,
@@ -1616,6 +1626,7 @@ mod tests {
                 "gather-quant-matmul.grouped-small-m",
                 "gather-quant-matmul.grouped-pair-small-m",
                 "gather-quant-matmul.grouped",
+                "gather-quant-matmul.grouped-32x32-2x2",
                 "gather-quant-matmul.weighted-broad",
                 "paged-sdpa.vector",
                 "paged-sdpa.vector-gqa-two-pass-32",
@@ -2316,6 +2327,11 @@ mod tests {
                 "gather-quant-matmul.grouped",
                 gathered_dispatch(64, 1, 256, 1),
                 "grouped_quantized_gemm",
+            ),
+            (
+                "gather-quant-matmul.grouped-32x32-2x2",
+                gathered_dispatch(64, 1, 256, 1),
+                "grouped_quantized_gemm_32x32_2x2",
             ),
             (
                 "gather-quant-matmul.weighted-broad",

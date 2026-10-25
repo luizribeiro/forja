@@ -389,6 +389,7 @@ fn grouped_gather_dispatch(dispatch: &Dispatch) -> bool {
         selected_variant(dispatch),
         Some(
             MetalVariant::GatherQuantMatmulGrouped
+                | MetalVariant::GatherQuantMatmulGrouped32x32
                 | MetalVariant::GatherQuantMatmulGroupedSmallM
                 | MetalVariant::GatherQuantMatmulGroupedPairSmallM
         )
@@ -396,6 +397,12 @@ fn grouped_gather_dispatch(dispatch: &Dispatch) -> bool {
 }
 
 fn grouped_block_rows(dispatch: &Dispatch) -> u32 {
+    if matches!(
+        selected_variant(dispatch),
+        Some(MetalVariant::GatherQuantMatmulGrouped32x32)
+    ) {
+        return 32;
+    }
     if matches!(
         selected_variant(dispatch),
         Some(
@@ -4876,10 +4883,10 @@ impl MetalBackend {
             .pipelines
             .lock()
             .map_err(|_| BackendError::ExecutionFailed)?;
-        let kernel = if block_rows == 8 {
-            "grouped_quantized_gemm_small_m"
-        } else {
-            "grouped_quantized_gemm"
+        let kernel = match block_rows {
+            8 => "grouped_quantized_gemm_small_m",
+            32 => "grouped_quantized_gemm_32x32_2x2",
+            _ => "grouped_quantized_gemm",
         };
         let pipeline = if let Some(epilogue) = epilogue {
             pipelines.lookup_epilogue(
@@ -4911,7 +4918,7 @@ impl MetalBackend {
                 depth: 1,
             },
             MTLSize {
-                width: 64,
+                width: if block_rows == 32 { 128 } else { 64 },
                 height: 1,
                 depth: 1,
             },
@@ -7726,6 +7733,7 @@ fn supported_dispatch(dispatch: &Dispatch) -> bool {
                     | MetalVariant::GatherQuantMatmulGroupedSmallM
                     | MetalVariant::GatherQuantMatmulGroupedPairSmallM
                     | MetalVariant::GatherQuantMatmulGrouped
+                    | MetalVariant::GatherQuantMatmulGrouped32x32
                     | MetalVariant::GatherQuantMatmulWeightedBroad
             )
         )
@@ -7904,18 +7912,17 @@ pub(super) fn dispatch_kernel(dispatch: &Dispatch) -> Result<&'static str, Backe
                     .ok_or(BackendError::InvalidInput)?;
                 weighted_gather_schedule(selected_variant(dispatch), *routes)?.implementation
             } else if dispatch.primitive_inputs().len() == 8 && grouped_gather_dispatch(dispatch) {
-                if grouped_block_rows(dispatch) == 8 {
-                    "gathered_pair_from_projections_small_m"
-                } else {
-                    "gathered_pair_from_projections"
+                match grouped_block_rows(dispatch) {
+                    8 => "gathered_pair_from_projections_small_m",
+                    _ => "gathered_pair_from_projections",
                 }
             } else if dispatch.primitive_inputs().len() == 8 {
                 "gather_quantized_pair"
             } else if grouped_gather_dispatch(dispatch) {
-                if grouped_block_rows(dispatch) == 8 {
-                    "grouped_quantized_gemm_small_m"
-                } else {
-                    "grouped_quantized_gemm"
+                match grouped_block_rows(dispatch) {
+                    8 => "grouped_quantized_gemm_small_m",
+                    32 => "grouped_quantized_gemm_32x32_2x2",
+                    _ => "grouped_quantized_gemm",
                 }
             } else {
                 "gather_quantized_gemv"
@@ -8319,6 +8326,7 @@ pub(super) fn variant_supported(
             quant_matmul_kernel(dispatch)?.starts_with("quantized_gemm_tiled_")
         }
         MetalVariant::GatherQuantMatmulGrouped
+        | MetalVariant::GatherQuantMatmulGrouped32x32
         | MetalVariant::GatherQuantMatmulGroupedSmallM
         | MetalVariant::GatherQuantMatmulGroupedPairSmallM => grouped_gather_dispatch(dispatch),
         MetalVariant::SdpaVectorSinglePass
@@ -8916,10 +8924,10 @@ fn gather_epilogue_requests(
         return Ok(vec![EpiloguePipelineRequest {
             family: epilogue_codegen::FamilySourceTag::GatherQuant,
             epilogue,
-            implementation: if block_rows == 8 {
-                "grouped_quantized_gemm_small_m"
-            } else {
-                "grouped_quantized_gemm"
+            implementation: match block_rows {
+                8 => "grouped_quantized_gemm_small_m",
+                32 => "grouped_quantized_gemm_32x32_2x2",
+                _ => "grouped_quantized_gemm",
             },
             constants,
         }]);
@@ -11009,6 +11017,7 @@ mod tests {
         for (implementation, block_rows) in [
             ("grouped_quantized_gemm", 16),
             ("grouped_quantized_gemm_small_m", 8),
+            ("grouped_quantized_gemm_32x32_2x2", 32),
         ] {
             let mut constants = constants.to_vec();
             constants.push((16, block_rows));

@@ -549,7 +549,7 @@ mod tests {
             .rfind("threadgroup_barrier(")
             .unwrap();
         let route = grouped[..grouped_call]
-            .rfind("uint route = sorted_routes[")
+            .rfind("uint output_row = route_rows[")
             .unwrap();
         let edge = grouped[..grouped_call]
             .rfind("if (column + element < params.columns)")

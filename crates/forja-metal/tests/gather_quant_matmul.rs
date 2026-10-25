@@ -161,6 +161,60 @@ fn metal_grouped_small_m_variants_match_cpu_at_edges() {
     }
 }
 
+#[test]
+fn metal_grouped_tile_heights_match_bits() {
+    let metal = MetalBackend::new().unwrap();
+    let mut values = DeterministicValues::new(0xbb67_ae85_84ca_a73b);
+    for (rows, routes) in [(33, 2), (64, 1)] {
+        let case = GroupedCase {
+            rows,
+            routes,
+            experts: 9,
+            inner: 128,
+            columns: 33,
+        };
+        for paired in [false, true] {
+            let specs = grouped_specs(case, paired);
+            let mut bytes = specs
+                .iter()
+                .map(|spec| generated_tensor_bytes(spec, &mut values).unwrap())
+                .collect::<Vec<_>>();
+            *bytes.last_mut().unwrap() = (0..rows * routes)
+                .flat_map(|_| 4_u32.to_le_bytes())
+                .collect();
+            let inputs = allocate_inputs(&metal, &specs, &bytes);
+            let op = Op::GatherQuantMatmul {
+                bits: 4,
+                group_size: 64,
+            };
+            let epilogue = paired.then(silu_mul_epilogue);
+            let mut outputs = Vec::new();
+            for name in [
+                "gather-quant-matmul.grouped",
+                "gather-quant-matmul.grouped-32x32-2x2",
+            ] {
+                let output = metal
+                    .alloc(DType::F32, &[case.rows, case.routes, case.columns])
+                    .unwrap();
+                let refs = tensor_refs(&inputs);
+                let variant = metal
+                    .validate_variant_for_op(op, &refs, &[&output], name)
+                    .unwrap();
+                submit_grouped(
+                    &metal,
+                    op,
+                    &inputs,
+                    &output,
+                    epilogue.as_ref(),
+                    Some(BackendDispatchData::new(variant)),
+                );
+                outputs.push(metal.read(&output).unwrap());
+            }
+            assert_eq!(outputs[0], outputs[1]);
+        }
+    }
+}
+
 fn assert_grouped_case(
     cpu: &CpuBackend,
     metal: &MetalBackend,
