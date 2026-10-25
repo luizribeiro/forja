@@ -6,6 +6,7 @@ use forja_host::{EngineLoadConfig, FixedVariantPick, VariantPickArm, VariantRule
 pub fn load_config(component: &Path) -> Result<EngineLoadConfig, Box<dyn Error>> {
     let profile = read_profile(&fs::read(component)?)?;
     Ok(EngineLoadConfig {
+        max_context: Some(profile.workload().max_context.get()),
         replay: true,
         paged_cache: profile.serving().is_some_and(|serving| serving.paged_cache),
         kv_cache: match profile.numerics().kv_cache {

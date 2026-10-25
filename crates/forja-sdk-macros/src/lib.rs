@@ -435,6 +435,7 @@ fn engine_load_config() -> proc_macro2::TokenStream {
     quote! {
         ::forja_sdk::EngineLoadConfig {
             num_hidden_layers: config.num_hidden_layers,
+            max_context: config.max_context,
             replay: config.replay,
             kv_cache: match config.kv_cache {
                 bindings::exports::l9o::gpu::engine::KvCacheFormat::Float16 => {

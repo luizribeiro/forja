@@ -621,6 +621,7 @@ fn native_load_config() -> Result<forja_sdk::EngineLoadConfig, Box<dyn Error>> {
     let config = common::load_config(test_guests::qwen3())?;
     Ok(forja_sdk::EngineLoadConfig {
         num_hidden_layers: None,
+        max_context: config.max_context,
         replay: config.replay,
         kv_cache: match config.kv_cache {
             forja_host::KvCacheFormat::F16 => forja_sdk::KvCacheFormat::F16,

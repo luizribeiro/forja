@@ -204,6 +204,8 @@ pub struct CachePlane {
 /// Effective engine-side selections supplied during load.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EngineLoadConfig {
+    /// Validated context length selected by the engine profile.
+    pub max_context: Option<u32>,
     /// Whether the guest captures and replays reusable graphs.
     pub replay: bool,
     /// Whether the host supplies paged cache storage to the guest.
@@ -221,6 +223,7 @@ pub struct EngineLoadConfig {
 impl Default for EngineLoadConfig {
     fn default() -> Self {
         Self {
+            max_context: None,
             replay: true,
             paged_cache: false,
             kv_cache: KvCacheFormat::F32,
@@ -1222,7 +1225,7 @@ where
             None => self.describe().await?,
         };
         let pool = if config.paged_cache {
-            match self.bind_page_pool(&info, config.kv_cache) {
+            match self.bind_page_pool(&info, config.max_context, config.kv_cache) {
                 Ok(pool) => pool,
                 Err(error) => return Ok(Err(error)),
             }
@@ -1246,6 +1249,7 @@ where
                         pool.map(Resource::new_borrow),
                         engine_bindings::exports::l9o::gpu::engine::LoadConfig {
                             num_hidden_layers,
+                            max_context: config.max_context,
                             replay: config.replay,
                             kv_cache: match config.kv_cache {
                                 KvCacheFormat::F16 => {
@@ -1305,6 +1309,7 @@ where
     fn bind_page_pool(
         &mut self,
         info: &EngineInfo,
+        max_context: Option<u32>,
         kv_cache: KvCacheFormat,
     ) -> Result<Option<u32>, compute::Error> {
         let Some(serving) = &info.serving else {
@@ -1312,9 +1317,12 @@ where
                 "paged cache requires an engine serving descriptor".to_owned(),
             ));
         };
+        let max_context = max_context.unwrap_or(serving.max_context);
         if serving.active_lanes == 0
             || serving.max_context == 0
             || serving.max_context > info.max_context
+            || max_context == 0
+            || max_context > serving.max_context
         {
             return Err(compute::Error::Layout(
                 "paged serving ceilings are invalid".to_owned(),
@@ -1358,7 +1366,7 @@ where
             .collect();
         let layout = PagedLayout::new(serving.page_tokens, planes)
             .map_err(|error| compute::Error::Layout(error.to_string()))?;
-        let pages_per_sequence = serving.max_context.div_ceil(serving.page_tokens);
+        let pages_per_sequence = max_context.div_ceil(serving.page_tokens);
         let declared_pages = paged_backing_pages(pages_per_sequence, serving.active_lanes)?;
         let byte_limit = self
             .store
@@ -1374,7 +1382,7 @@ where
         let entry = PagePoolEntry {
             pool,
             active_lanes: serving.active_lanes,
-            max_context: serving.max_context,
+            max_context,
             plane_count: u32::try_from(serving.planes.len())
                 .map_err(|_| compute::Error::Layout("paged plane count exceeds u32".to_owned()))?,
             slot_banks: None,
@@ -9271,9 +9279,19 @@ mod tests {
         .await?;
         let config = super::EngineLoadConfig {
             paged_cache: true,
+            max_context: Some(16),
             ..super::EngineLoadConfig::default()
         };
         runner.load_with_selections(None, &config).await??;
+        let pool = runner
+            .store
+            .data()
+            .table
+            .get(&Resource::<PagePoolEntry>::new_borrow(
+                runner.page_pool.unwrap(),
+            ))
+            .unwrap();
+        assert_eq!(pool.max_context, 16);
         runner.prepare_paged_lane(0, None, 8)?;
         runner.prepare_paged_lane(1, None, 8)?;
         let handle = runner

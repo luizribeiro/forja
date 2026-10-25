@@ -46,6 +46,7 @@ interface engine {
 
   record load-config {
     num-hidden-layers: option<u32>,
+    max-context: option<u32>,
     replay: bool,
     kv-cache: kv-cache-format,
     tunings: list<string>,

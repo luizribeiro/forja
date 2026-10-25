@@ -230,6 +230,7 @@ fn profile_load_config(
 ) -> Result<forja_host::EngineLoadConfig, String> {
     let selection = overrides.resolve(profile)?;
     Ok(forja_host::EngineLoadConfig {
+        max_context: Some(profile.workload().max_context.get()),
         replay: overrides.replay,
         paged_cache: profile.serving().is_some_and(|serving| serving.paged_cache),
         kv_cache: match profile.numerics().kv_cache {
@@ -581,6 +582,7 @@ mod tests {
     #[test]
     fn converts_profiles_to_deterministic_guest_load_config() {
         let config = profile_load_config(&profile(), &Engine::default()).unwrap();
+        assert_eq!(config.max_context, Some(4_096));
         assert!(config.paged_cache);
         assert_eq!(config.tunings.len(), 0);
         assert_eq!(

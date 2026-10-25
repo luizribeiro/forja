@@ -79,6 +79,8 @@ pub struct CachePlane {
 pub struct EngineLoadConfig {
     /// Number of leading decoder layers to load, or all layers when absent.
     pub num_hidden_layers: Option<u32>,
+    /// Validated context length selected by the engine profile.
+    pub max_context: Option<u32>,
     /// Whether to capture and replay reusable graphs.
     pub replay: bool,
     /// Key/value cache storage format selected by the profile.
@@ -95,6 +97,7 @@ impl Default for EngineLoadConfig {
     fn default() -> Self {
         Self {
             num_hidden_layers: None,
+            max_context: None,
             replay: true,
             kv_cache: KvCacheFormat::F32,
             tunings: Vec::new(),
