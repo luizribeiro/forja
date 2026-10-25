@@ -25,7 +25,7 @@ mod variants;
 #[cfg(target_os = "macos")]
 pub use bandwidth::MemoryBandwidth;
 #[cfg(target_os = "macos")]
-pub use encoding::MetalProgramHandle;
+pub use encoding::{MetalProgramHandle, ProfileTimestampGranularity};
 #[cfg(target_os = "macos")]
 pub use storage::{MetalBackend, MetalGraphReplay, ProgramCompileBudget};
 #[cfg(target_os = "macos")]

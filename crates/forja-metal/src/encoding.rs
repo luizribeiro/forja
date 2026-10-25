@@ -2174,6 +2174,15 @@ pub struct MetalSubmission {
     internal_profiles: Vec<InternalDispatchProfile>,
 }
 
+/// Timestamp granularity used for per-dispatch GPU profiling.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProfileTimestampGranularity {
+    /// Lower-overhead timestamps with implementation-defined placement.
+    Relaxed,
+    /// Timestamps placed precisely at dispatch boundaries.
+    Precise,
+}
+
 impl Submission for MetalSubmission {
     fn completion_serial(&self) -> Option<u64> {
         self.completion.event_value()
@@ -2281,14 +2290,32 @@ impl MetalBackend {
         &self,
         commands: CommandList,
     ) -> Result<MetalSubmission, BackendError> {
-        self.submit_commands_inner::<false>(commands, None, None)
+        self.submit_commands_inner::<false>(
+            commands,
+            None,
+            None,
+            ProfileTimestampGranularity::Precise,
+        )
     }
 
     pub(super) fn submit_commands_profiled(
         &self,
         commands: CommandList,
     ) -> Result<MetalSubmission, BackendError> {
-        self.submit_commands_inner::<true>(commands, None, None)
+        self.submit_profiled_with_granularity(commands, ProfileTimestampGranularity::Precise)
+    }
+
+    /// Submits commands with per-dispatch timestamps at the requested granularity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when validation, encoding, or submission fails.
+    pub fn submit_profiled_with_granularity(
+        &self,
+        commands: CommandList,
+        granularity: ProfileTimestampGranularity,
+    ) -> Result<MetalSubmission, BackendError> {
+        self.submit_commands_inner::<true>(commands, None, None, granularity)
     }
 
     pub(super) fn prepare_metal_graph(
@@ -2454,6 +2481,7 @@ impl MetalBackend {
                     barriers: &[false],
                 },
                 None,
+                ProfileTimestampGranularity::Precise,
                 &mut arguments,
                 None,
                 None,
@@ -2532,9 +2560,19 @@ impl MetalBackend {
             }
         }
         let submission = if profile {
-            self.submit_commands_inner::<true>(commands, Some(state), arena.as_ref())
+            self.submit_commands_inner::<true>(
+                commands,
+                Some(state),
+                arena.as_ref(),
+                ProfileTimestampGranularity::Precise,
+            )
         } else {
-            self.submit_commands_inner::<false>(commands, Some(state), arena.as_ref())
+            self.submit_commands_inner::<false>(
+                commands,
+                Some(state),
+                arena.as_ref(),
+                ProfileTimestampGranularity::Precise,
+            )
         };
         match submission {
             Ok(submission) => {
@@ -2558,6 +2596,7 @@ impl MetalBackend {
         commands: CommandList,
         graph: Option<&PreparedMetalGraph>,
         graph_arena: Option<&GraphArenaReservation>,
+        timestamp_granularity: ProfileTimestampGranularity,
     ) -> Result<MetalSubmission, BackendError> {
         #[cfg(test)]
         let submit_started = Instant::now();
@@ -2678,6 +2717,7 @@ impl MetalBackend {
                 barriers: &barriers,
             },
             PROFILE.then_some(&timestamps),
+            timestamp_granularity,
             &mut argument_writer,
             graph.and_then(|prepared| {
                 prepared
@@ -2764,6 +2804,7 @@ impl MetalBackend {
         table: &ProtocolObject<dyn MTL4ArgumentTable>,
         plan: &DispatchEncoding<'_>,
         timestamps: Option<&GpuTimestamps>,
+        timestamp_granularity: ProfileTimestampGranularity,
         arguments: &mut ArgumentWriter,
         prepared: Option<&[Option<StaticEncodingPlan>]>,
         graph_arena: Option<&BufferBinding>,
@@ -2786,12 +2827,17 @@ impl MetalBackend {
         let mut internal_profiles = Vec::new();
         for (index, (dispatch, &barrier)) in plan.dispatches.iter().zip(plan.barriers).enumerate() {
             if index > 0 {
-                write_dispatch_timestamp(&encoder, timestamps, 1 + index * 2);
+                write_dispatch_timestamp(
+                    &encoder,
+                    timestamps,
+                    timestamp_granularity,
+                    1 + index * 2,
+                );
             }
             if barrier {
                 encode_dispatch_barrier(&encoder);
             }
-            write_dispatch_timestamp(&encoder, timestamps, 2 + index * 2);
+            write_dispatch_timestamp(&encoder, timestamps, timestamp_granularity, 2 + index * 2);
             if timestamps.is_some() {
                 internal_profiles.extend(internal_dispatch_profiles(
                     dispatch,
@@ -2832,7 +2878,12 @@ impl MetalBackend {
             )?;
         }
         if !plan.dispatches.is_empty() {
-            write_dispatch_timestamp(&encoder, timestamps, 1 + plan.dispatches.len() * 2);
+            write_dispatch_timestamp(
+                &encoder,
+                timestamps,
+                timestamp_granularity,
+                1 + plan.dispatches.len() * 2,
+            );
         }
         encoder.endEncoding();
         let argument_usage = (arguments.offset > 0).then(|| ArgumentUsage {
@@ -8413,6 +8464,7 @@ fn encode_dispatch_barrier(encoder: &ProtocolObject<dyn objc2_metal::MTL4Compute
 fn write_dispatch_timestamp(
     encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
     timestamps: Option<&GpuTimestamps>,
+    granularity: ProfileTimestampGranularity,
     index: usize,
 ) {
     use objc2_metal::MTL4ComputeCommandEncoder;
@@ -8424,7 +8476,10 @@ fn write_dispatch_timestamp(
     // below `2 + 2 * dispatches`; the checked internal writer uses that value as its lower bound.
     unsafe {
         encoder.writeTimestampWithGranularity_intoHeap_atIndex(
-            MTL4TimestampGranularity::Precise,
+            match granularity {
+                ProfileTimestampGranularity::Relaxed => MTL4TimestampGranularity::Relaxed,
+                ProfileTimestampGranularity::Precise => MTL4TimestampGranularity::Precise,
+            },
             &timestamps.heap,
             index,
         );
@@ -8441,7 +8496,12 @@ fn write_internal_timestamp(
         if *next_timestamp >= timestamps.count {
             return Err(BackendError::ExecutionFailed);
         }
-        write_dispatch_timestamp(encoder, Some(timestamps), *next_timestamp);
+        write_dispatch_timestamp(
+            encoder,
+            Some(timestamps),
+            ProfileTimestampGranularity::Precise,
+            *next_timestamp,
+        );
         *next_timestamp = next_timestamp
             .checked_add(1)
             .ok_or(BackendError::ExecutionFailed)?;
@@ -10583,6 +10643,29 @@ mod tests {
             gpu_time <= wall_time,
             "GPU {gpu_time:?}, wall {wall_time:?}"
         );
+    }
+
+    #[test]
+    fn metal_profile_timestamp_granularity_preserves_submission_timing() {
+        let backend = MetalBackend::new().unwrap();
+        let input = backend.alloc(DType::F32, &[1]).unwrap();
+        let output = backend.alloc(DType::F32, &[1]).unwrap();
+        for granularity in [
+            ProfileTimestampGranularity::Relaxed,
+            ProfileTimestampGranularity::Precise,
+        ] {
+            let mut commands = CommandList::new();
+            commands.dispatch(Op::Copy, &[&input], &output).unwrap();
+            let submission = backend
+                .submit_profiled_with_granularity(commands, granularity)
+                .unwrap();
+            submission.wait().unwrap();
+            assert!(
+                submission
+                    .gpu_time()
+                    .is_some_and(|time| time > Duration::ZERO)
+            );
+        }
     }
 
     #[test]
