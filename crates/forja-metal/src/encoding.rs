@@ -1368,13 +1368,11 @@ struct MetalEncodingPlan {
     argument_offset: usize,
 }
 
-fn dedupe_plan_calls(plans: &mut [Option<StaticEncodingPlan>]) {
+fn dedupe_pipeline_calls(plans: &mut [Option<StaticEncodingPlan>]) {
     let mut pipeline = None::<Retained<ProtocolObject<dyn MTLComputePipelineState>>>;
-    let mut argument_table_set = false;
     for plan in plans {
         let Some(plan) = plan else {
             pipeline = None;
-            argument_table_set = false;
             continue;
         };
         plan.calls.retain(|call| match call {
@@ -1385,12 +1383,8 @@ fn dedupe_plan_calls(plans: &mut [Option<StaticEncodingPlan>]) {
                 pipeline = Some(next.clone());
                 !repeated
             }
-            PlanCall::ArgumentTable => {
-                let repeated = argument_table_set;
-                argument_table_set = true;
-                !repeated
-            }
-            PlanCall::Bind { .. }
+            PlanCall::ArgumentTable
+            | PlanCall::Bind { .. }
             | PlanCall::Dispatch { .. }
             | PlanCall::IndirectDispatch { .. }
             | PlanCall::Barrier
@@ -2497,7 +2491,7 @@ impl MetalBackend {
             }
             plans[index] = Some(StaticEncodingPlan { calls });
         }
-        dedupe_plan_calls(&mut plans);
+        dedupe_pipeline_calls(&mut plans);
         command_buffer.endCommandBuffer();
         let mut arena = vec![0_u8; arguments.offset];
         // SAFETY: The arena length is the initialized prefix of the live shared argument buffer.
@@ -9743,6 +9737,21 @@ mod tests {
     }
 
     #[test]
+    fn replay_plans_preserve_argument_table_activation() {
+        let plan = || StaticEncodingPlan {
+            calls: vec![PlanCall::ArgumentTable],
+        };
+        let mut plans = vec![Some(plan()), Some(plan())];
+
+        dedupe_pipeline_calls(&mut plans);
+
+        assert!(plans.iter().all(|plan| matches!(
+            plan.as_ref().map(|plan| plan.calls.as_slice()),
+            Some([PlanCall::ArgumentTable])
+        )));
+    }
+
+    #[test]
     fn program_cache_key_ignores_shapes_and_strides() {
         let backend = CpuBackend::new();
         let contiguous = identity_program(&backend, DType::F16, DType::F32, &[7, 33], false);
@@ -11225,7 +11234,7 @@ mod tests {
     }
 
     #[test]
-    fn static_plan_calls_are_deduplicated_within_dynamic_boundaries() {
+    fn static_plan_pipelines_are_deduplicated_within_dynamic_boundaries() {
         let backend = MetalBackend::new().unwrap();
         let static_input = backend.alloc(DType::F32, &[7]).unwrap();
         let static_output = backend.alloc(DType::F32, &[7]).unwrap();
@@ -11265,7 +11274,7 @@ mod tests {
                 .any(|call| matches!(call, PlanCall::ArgumentTable))
         };
         assert!(has_pipeline(0) && has_table(0));
-        assert!(!has_pipeline(1) && !has_table(1));
+        assert!(!has_pipeline(1) && has_table(1));
         assert!(plans[2].is_none());
         assert!(has_pipeline(3) && has_table(3));
     }
