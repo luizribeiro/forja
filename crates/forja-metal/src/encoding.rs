@@ -4794,12 +4794,12 @@ impl MetalBackend {
         );
         write_internal_timestamp(encoder, timestamps, internal_timestamp)?;
         encode_dispatch_barrier(encoder);
-        let arrange_pipeline = self
+        let plan_pipeline = self
             .pipelines
             .lock()
             .map_err(|_| BackendError::ExecutionFailed)?
-            .get("arrange_expert_routes", &[(16, block_rows)])?;
-        set_pipeline(encoder, &arrange_pipeline);
+            .get("plan_expert_routes", &[(16, block_rows)])?;
+        set_pipeline(encoder, &plan_pipeline);
         bindings.bind(table, 0, &indices.buffer);
         bindings.bind(table, 1, &sorted.buffer);
         bindings.bind(table, 2, &offsets.buffer);
@@ -4810,6 +4810,32 @@ impl MetalBackend {
             encoder,
             MTLSize {
                 width: 1,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: 256,
+                height: 1,
+                depth: 1,
+            },
+        );
+        encode_dispatch_barrier(encoder);
+        let arrange_pipeline = self
+            .pipelines
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?
+            .get("arrange_expert_routes", &[])?;
+        set_pipeline(encoder, &arrange_pipeline);
+        set_argument_table(encoder, table);
+        dispatch_threadgroups(
+            encoder,
+            MTLSize {
+                width: usize::try_from(
+                    offsets.layout.shape()[0]
+                        .checked_sub(1)
+                        .ok_or(BackendError::InvalidInput)?,
+                )
+                .map_err(|_| BackendError::InvalidInput)?,
                 height: 1,
                 depth: 1,
             },
@@ -9456,6 +9482,32 @@ mod tests {
             assert_eq!(&actual_routes[..expected_routes.len()], expected_routes);
             assert_eq!(actual_offsets, expected_offsets);
         }
+    }
+
+    #[test]
+    fn metal_parallel_expert_routes_cover_chunks_and_invalid_indices() {
+        let selected = vec![4; 1_025 * 3];
+        let (result, actual_routes, actual_offsets) = capture_expert_routes(1_025, 3, 7, &selected);
+        result.unwrap();
+        let (expected_routes, expected_offsets) = expected_expert_routes(&selected, 7);
+        assert_eq!(actual_routes, expected_routes);
+        assert_eq!(actual_offsets, expected_offsets);
+
+        let mut selected = (0..33 * 2).map(|route| route % 5).collect::<Vec<_>>();
+        selected[11] = 9;
+        let (result, actual_routes, actual_offsets) = capture_expert_routes(33, 2, 5, &selected);
+        assert!(matches!(
+            result,
+            Err(BackendError::DeviceErrorFlag {
+                flag: 1,
+                value: 9,
+                ..
+            })
+        ));
+        let (expected_routes, expected_offsets) = expected_expert_routes(&selected, 5);
+        assert_eq!(&actual_routes[..expected_routes.len()], expected_routes);
+        assert!(!actual_routes[..expected_routes.len()].contains(&11));
+        assert_eq!(actual_offsets, expected_offsets);
     }
 
     #[test]

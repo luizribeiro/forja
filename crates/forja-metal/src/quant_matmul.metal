@@ -845,7 +845,7 @@ kernel void count_expert_routes(
     }
 }
 
-kernel void arrange_expert_routes(
+kernel void plan_expert_routes(
     device const uint *indices [[buffer(0)]],
     device uint *sorted_routes [[buffer(1)]],
     device atomic_uint *counts [[buffer(2)]],
@@ -853,9 +853,7 @@ kernel void arrange_expert_routes(
     constant GatherQuantMatmulParams &params [[buffer(4)]],
     uint thread_index [[thread_position_in_threadgroup]],
     uint thread_count [[threads_per_threadgroup]]) {
-    constexpr uint staged_route_capacity = 2048;
     threadgroup uint scan[256];
-    threadgroup uint staged_routes[staged_route_capacity];
     uint count = thread_index < params.experts
         ? atomic_load_explicit(counts + thread_index, memory_order_relaxed)
         : 0;
@@ -871,7 +869,6 @@ kernel void arrange_expert_routes(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     uint route_offset = thread_index == 0 ? 0 : scan[thread_index - 1];
-    uint sorted = route_offset;
     if (thread_index < params.experts) {
         atomic_store_explicit(counts + thread_index, route_offset, memory_order_relaxed);
     }
@@ -900,41 +897,51 @@ kernel void arrange_expert_routes(
                 thread_index, route_offset + start, min(grouped_tile_rows, count - start));
         }
     }
-    if (params.routes <= staged_route_capacity) {
-        uint rows_per_stage = max(1u, staged_route_capacity / params.routes);
-        for (uint row_origin = 0; row_origin < params.rows; row_origin += rows_per_stage) {
-            uint row_count = min(rows_per_stage, params.rows - row_origin);
-            for (uint local_row = thread_index; local_row < row_count; local_row += thread_count) {
-                uint row = row_origin + local_row;
-                ulong index_base = params.indices_offset + ulong(row) * params.indices_row_stride;
-                uint stage_base = local_row * params.routes;
-                for (uint slot = 0; slot < params.routes; ++slot) {
-                    staged_routes[stage_base + slot] =
-                        indices[index_base + ulong(slot) * params.indices_slot_stride];
-                }
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (thread_index < params.experts) {
-                uint staged_count = row_count * params.routes;
-                uint route_origin = row_origin * params.routes;
-                for (uint staged = 0; staged < staged_count; ++staged) {
-                    if (staged_routes[staged] == thread_index) {
-                        sorted_routes[sorted++] = route_origin + staged;
-                    }
-                }
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-    } else if (thread_index < params.experts) {
-        for (uint row = 0; row < params.rows; ++row) {
+}
+
+kernel void arrange_expert_routes(
+    device const uint *indices [[buffer(0)]],
+    device uint *sorted_routes [[buffer(1)]],
+    device atomic_uint *counts [[buffer(2)]],
+    device uint3 *blocks [[buffer(3)]],
+    constant GatherQuantMatmulParams &params [[buffer(4)]],
+    uint thread_index [[thread_position_in_threadgroup]],
+    uint thread_count [[threads_per_threadgroup]],
+    uint expert [[threadgroup_position_in_grid]]) {
+    threadgroup uint scan[256];
+    uint sorted = atomic_load_explicit(counts + expert, memory_order_relaxed);
+    for (uint row_origin = 0; row_origin < params.rows; row_origin += thread_count) {
+        uint row = row_origin + thread_index;
+        uint matches = 0;
+        if (row < params.rows) {
             ulong index_base = params.indices_offset + ulong(row) * params.indices_row_stride;
-            uint route_base = row * params.routes;
             for (uint slot = 0; slot < params.routes; ++slot) {
-                if (indices[index_base + ulong(slot) * params.indices_slot_stride] == thread_index) {
-                    sorted_routes[sorted++] = route_base + slot;
+                matches += uint(indices[index_base + ulong(slot) * params.indices_slot_stride] == expert);
+            }
+        }
+        scan[thread_index] = matches;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint shift = 1; shift < 256; shift <<= 1) {
+            uint prefix = scan[thread_index];
+            if (thread_index >= shift) {
+                prefix += scan[thread_index - shift];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            scan[thread_index] = prefix;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (row < params.rows) {
+            uint destination = sorted + (thread_index == 0 ? 0 : scan[thread_index - 1]);
+            uint route = row * params.routes;
+            ulong index_base = params.indices_offset + ulong(row) * params.indices_row_stride;
+            for (uint slot = 0; slot < params.routes; ++slot) {
+                if (indices[index_base + ulong(slot) * params.indices_slot_stride] == expert) {
+                    sorted_routes[destination++] = route + slot;
                 }
             }
         }
+        sorted += scan[thread_count - 1];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 }
 
