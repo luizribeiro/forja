@@ -238,6 +238,9 @@ where
         prefill: &mut PendingPrefill,
         budget: u32,
     ) -> Result<bool, GenerationError> {
+        if self.scheduler.prefill_chunk_multiple.is_some() {
+            return self.advance_batch_prefill_piece(prefill, budget).await;
+        }
         let piece = self
             .scheduler
             .prompt_token_budget
@@ -272,6 +275,10 @@ where
             .unwrap_or(usize::MAX)
             .min(largest)
             .min(remaining.len());
+        #[cfg(test)]
+        if let Some(barrier) = &self.batch_test_barrier {
+            barrier.prompt_pieces.lock().unwrap().push(count);
+        }
         let shape = shapes
             .iter()
             .copied()

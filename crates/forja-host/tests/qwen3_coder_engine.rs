@@ -37,6 +37,38 @@ const SERVING_TOKENS: u32 = 128;
 #[tokio::test]
 #[ignore = "requires FORJA_MODELS and runs in the pre-push hook"]
 async fn metal_prompt_chunk_schedules_preserve_logits_and_tokens() -> Result<(), Box<dyn Error>> {
+    assert_chunk_schedules(0, 2752).await
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[ignore = "requires FORJA_MODELS and runs in the pre-push hook"]
+async fn metal_prompt_chunks_preserve_an_unaligned_cached_prefix() -> Result<(), Box<dyn Error>> {
+    assert_chunk_schedules(2047, 2055).await
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[ignore = "requires FORJA_MODELS and runs in the pre-push hook"]
+async fn metal_prompt_chunks_preserve_a_long_cached_prefix() -> Result<(), Box<dyn Error>> {
+    assert_chunk_schedules(24101, 2752).await
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[ignore = "requires FORJA_MODELS and runs in the pre-push hook"]
+async fn metal_prompt_chunks_preserve_odd_tails() -> Result<(), Box<dyn Error>> {
+    for tail in [1, 33, 511] {
+        assert_chunk_schedules(0, 2048 + tail).await?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+async fn assert_chunk_schedules(
+    prefix_tokens: u32,
+    prompt_tokens: u32,
+) -> Result<(), Box<dyn Error>> {
     let limits = Limits::new(
         64 * 1024 * 1024 * 1024,
         4,
@@ -51,14 +83,28 @@ async fn metal_prompt_chunk_schedules_preserve_logits_and_tokens() -> Result<(),
     runner
         .load_with_selections(Some(FULL_LAYERS), &load_config()?)
         .await??;
-    let tokens = (0..2_752)
+    let prefix = if prefix_tokens == 0 {
+        None
+    } else {
+        let tokens = (0..prefix_tokens)
+            .map(|position| 100 + position % 997)
+            .collect::<Vec<_>>();
+        chunked_prompt_outputs(&mut runner, &tokens, &[2048], None, 0).await?;
+        Some((
+            runner.paged_lane_prefix(0)?.ok_or("missing prefix")?,
+            prefix_tokens,
+        ))
+    };
+    let tokens = (0..prompt_tokens)
         .map(|position| 100 + position % 997)
         .collect::<Vec<_>>();
-    let small = chunked_prompt_outputs(&mut runner, &tokens, 512).await?;
-    let large = chunked_prompt_outputs(&mut runner, &tokens, 2_048).await?;
-    for (index, (small, large)) in small.iter().zip(&large).enumerate() {
-        assert!(small.0 == large.0, "logits differ at output {index}");
-        assert_eq!(small.1, large.1, "tokens differ at output {index}");
+    let reference = chunked_prompt_outputs(&mut runner, &tokens, &[512], prefix.clone(), 3).await?;
+    for schedule in [&[2048][..], &[512, 2048, 1024][..]] {
+        let candidate =
+            chunked_prompt_outputs(&mut runner, &tokens, schedule, prefix.clone(), 3).await?;
+        for (index, (reference, candidate)) in reference.iter().zip(&candidate).enumerate() {
+            assert!(reference == candidate, "output {index}: {schedule:?}");
+        }
     }
     Ok(())
 }
@@ -67,40 +113,53 @@ async fn metal_prompt_chunk_schedules_preserve_logits_and_tokens() -> Result<(),
 async fn chunked_prompt_outputs(
     runner: &mut EngineRunner<forja_metal::MetalBackend>,
     tokens: &[u32],
-    allowance: u32,
+    allowances: &[u32],
+    prefix: Option<(PagedPrefix, u32)>,
+    decode_tokens: u32,
 ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, Box<dyn Error>> {
+    let start = prefix.as_ref().map_or(0, |(_, tokens)| *tokens);
+    let reserved = u64::from(start) + u64::try_from(tokens.len())? + 4;
+    let prefix = prefix
+        .map(|(prefix, length)| prefix.fork_reserved(u64::from(length), reserved))
+        .transpose()?;
     runner.prepare_paged_lane(0, None, 0)?;
-    runner.prepare_paged_lane(0, None, u64::try_from(tokens.len())? + 4)?;
+    runner.prepare_paged_lane(0, prefix, reserved)?;
     let mut outputs = Vec::new();
     let mut next = None;
     let chunking = forja_host::PromptChunking::new(std::num::NonZeroU32::new(512).unwrap());
-    let mut position = 0;
-    for work in tokens.chunks(usize::try_from(allowance)?) {
-        for part in chunking.pieces(work) {
-            let output = runner
-                .batch_step(EngineBatch {
-                    shape: BatchShape {
-                        phase: BatchPhase::Prompt,
-                        bucket: 1,
-                        tokens: 512,
-                        selection: BatchSelection::Combined,
-                    },
-                    lanes: vec![Some(EngineBatchLane {
-                        slot: 0,
-                        tokens: Some(part.to_vec()),
-                        start_pos: position,
-                        sampling: SamplingParams::default(),
-                    })],
-                })
-                .await??;
-            let logits = runner.read(&output.logits).await?;
-            let selected = runner.read(&output.tokens).await?;
-            next = Some((logits, selected));
-            position += u32::try_from(part.len())?;
-        }
+    let mut consumed = 0;
+    let mut round = 0;
+    while consumed < tokens.len() {
+        let allowance = allowances[round % allowances.len()];
+        let count = usize::try_from(
+            chunking.merged_work(u32::try_from(tokens.len() - consumed)?, allowance),
+        )?;
+        assert!(count > 0);
+        let output = runner
+            .batch_step(EngineBatch {
+                shape: BatchShape {
+                    phase: BatchPhase::Prompt,
+                    bucket: 1,
+                    tokens: if allowance <= 512 { 512 } else { 2048 },
+                    selection: BatchSelection::Combined,
+                },
+                lanes: vec![Some(EngineBatchLane {
+                    slot: 0,
+                    tokens: Some(tokens[consumed..consumed + count].to_vec()),
+                    start_pos: start + u32::try_from(consumed)?,
+                    sampling: SamplingParams::default(),
+                })],
+            })
+            .await??;
+        next = Some((
+            runner.read(&output.logits).await?,
+            runner.read(&output.tokens).await?,
+        ));
+        consumed += count;
+        round += 1;
     }
     outputs.push(next.ok_or("empty prompt")?);
-    for offset in 0..3 {
+    for offset in 0..decode_tokens {
         let selected = batch_tokens(&outputs.last().ok_or("missing output")?.1)?[0];
         let output = runner
             .batch_step(EngineBatch {
@@ -113,7 +172,7 @@ async fn chunked_prompt_outputs(
                 lanes: vec![Some(EngineBatchLane {
                     slot: 0,
                     tokens: Some(vec![selected]),
-                    start_pos: u32::try_from(tokens.len())? + offset,
+                    start_pos: start + u32::try_from(tokens.len())? + offset,
                     sampling: SamplingParams::default(),
                 })],
             })

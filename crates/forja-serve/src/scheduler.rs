@@ -22,6 +22,7 @@ pub(crate) struct SchedulerPolicy {
     prompt_budget: u32,
     idle_prompt_budget: u32,
     prompt_chunking: forja_host::PromptChunking,
+    merge_prompt_chunks: bool,
     last_prompt: Option<RequestId>,
     active: usize,
 }
@@ -58,10 +59,22 @@ impl SchedulerPolicy {
             prompt_budget,
             idle_prompt_budget,
             prompt_chunking: forja_host::PromptChunking::new(piece),
+            merge_prompt_chunks: false,
             last_prompt: None,
             active: 0,
         })
     }
+    pub(crate) fn with_prompt_chunk_multiple(
+        mut self,
+        multiple: Option<std::num::NonZeroU32>,
+    ) -> Self {
+        if let Some(multiple) = multiple {
+            self.prompt_chunking = forja_host::PromptChunking::new(multiple);
+            self.merge_prompt_chunks = true;
+        }
+        self
+    }
+
     pub(crate) fn enqueue(&mut self, admission: Admission) {
         self.queue.push_back(Queued {
             admission,
@@ -161,7 +174,11 @@ impl SchedulerPolicy {
             let Some(tokens) = self.prompt.get(&id).copied() else {
                 continue;
             };
-            let spend = self.prompt_chunking.work(tokens, remaining);
+            let spend = if self.merge_prompt_chunks {
+                self.prompt_chunking.merged_work(tokens, remaining)
+            } else {
+                self.prompt_chunking.work(tokens, remaining)
+            };
             if spend == 0 {
                 break;
             }
@@ -260,5 +277,15 @@ mod tests {
         policy.retry_admission(first);
         policy.complete(RequestId(2));
         assert_eq!(policy.admit(|_| true), [RequestId(1)]);
+    }
+    #[test]
+    fn merges_declared_chunks_without_absorbing_the_tail() {
+        let mut policy = SchedulerPolicy::new(vec![1, 2], 2, 1, 512, 2048)
+            .unwrap()
+            .with_prompt_chunk_multiple(std::num::NonZeroU32::new(512));
+        policy.ready_prompt(RequestId(1), 2752);
+        assert_eq!(policy.prompt_batch(false), [(RequestId(1), 2048)]);
+        assert_eq!(policy.prompt_batch(true), [(RequestId(1), 512)]);
+        assert_eq!(policy.prompt_batch(false), [(RequestId(1), 192)]);
     }
 }

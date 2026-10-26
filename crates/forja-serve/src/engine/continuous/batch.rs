@@ -67,7 +67,7 @@ where
         receiver: &mut mpsc::Receiver<ServiceCommand>,
         pending: &mut VecDeque<RequestEnvelope>,
     ) {
-        let Ok(mut policy) = SchedulerPolicy::new(
+        let Ok(policy) = SchedulerPolicy::new(
             self.scheduler.decode_buckets.clone(),
             usize::try_from(self.scheduler.active_lanes).unwrap_or(usize::MAX),
             usize::try_from(self.scheduler.max_prefill_chunks).unwrap_or(usize::MAX),
@@ -76,6 +76,7 @@ where
         ) else {
             return;
         };
+        let mut policy = policy.with_prompt_chunk_multiple(self.scheduler.prefill_chunk_multiple);
         let mut active = Vec::new();
         let mut waiting = BTreeMap::new();
         let mut prefilling = BTreeMap::new();

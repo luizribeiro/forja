@@ -503,6 +503,7 @@ pub(crate) struct BatchTestBarrier {
     pause_prefill: AtomicBool,
     decoded_batches: AtomicU64,
     idle_rounds: AtomicU64,
+    prompt_pieces: StdMutex<Vec<usize>>,
     prompt_trace: StdMutex<Vec<(u32, bool, u64)>>,
     request_trace: StdMutex<Vec<(crate::scheduler::RequestId, bool, u64)>>,
     deferred_fallthroughs: AtomicU64,
@@ -535,6 +536,7 @@ impl BatchTestBarrier {
             pause_prefill: AtomicBool::new(false),
             decoded_batches: AtomicU64::new(0),
             idle_rounds: AtomicU64::new(0),
+            prompt_pieces: StdMutex::new(Vec::new()),
             prompt_trace: StdMutex::new(Vec::new()),
             request_trace: StdMutex::new(Vec::new()),
             deferred_fallthroughs: AtomicU64::new(0),
@@ -557,6 +559,10 @@ impl BatchTestBarrier {
 
     pub(crate) fn prompt_trace(&self) -> Vec<(u32, bool, u64)> {
         self.prompt_trace.lock().unwrap().clone()
+    }
+
+    pub(crate) fn prompt_pieces(&self) -> Vec<usize> {
+        self.prompt_pieces.lock().unwrap().clone()
     }
 
     pub(crate) fn request_trace(&self) -> Vec<(crate::scheduler::RequestId, bool, u64)> {
@@ -694,6 +700,7 @@ struct SchedulerConfig {
     profile_prompt_budget: u32,
     profile_prefill_chunk: u32,
     idle_prompt_token_budget: u32,
+    prefill_chunk_multiple: Option<std::num::NonZeroU32>,
     decode_buckets: Vec<u32>,
 }
 
@@ -712,6 +719,7 @@ impl SchedulerConfig {
                 profile_prompt_budget: profile_budget,
                 profile_prefill_chunk,
                 idle_prompt_token_budget: 1,
+                prefill_chunk_multiple: None,
                 decode_buckets: vec![1],
             });
         };
@@ -772,6 +780,10 @@ impl SchedulerConfig {
         )?)
         .unwrap_or(u32::MAX)
         .min(largest_prompt_chunk);
+        let prefill_chunk_multiple = serving.prefill_chunk_multiple.filter(|multiple| {
+            prompt_token_budget.is_multiple_of(multiple.get())
+                && idle_prompt_token_budget >= multiple.get()
+        });
         if !decode_buckets.is_empty() {
             crate::scheduler::SchedulerPolicy::new(
                 decode_buckets.clone(),
@@ -789,6 +801,7 @@ impl SchedulerConfig {
             profile_prompt_budget: profile_budget,
             profile_prefill_chunk,
             idle_prompt_token_budget,
+            prefill_chunk_multiple,
             decode_buckets,
         })
     }
@@ -2645,6 +2658,34 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("serving.max_active_sequences")
+        );
+    }
+
+    #[test]
+    fn operator_limits_can_disable_chunk_merging() {
+        let mut serving = serving_info();
+        serving.prefill_chunk_multiple = std::num::NonZeroU32::new(512);
+        let info = EngineInfo {
+            vocab: 1,
+            max_context: 4096,
+            tap_layers: vec![],
+            router_layers: vec![],
+            serving: Some(serving),
+        };
+        let mut config = HostConfig::default();
+        let resolved = SchedulerConfig::resolve(&info, &config, 512, 2048).unwrap();
+        assert_eq!(
+            resolved
+                .prefill_chunk_multiple
+                .map(std::num::NonZeroU32::get),
+            Some(512)
+        );
+        config.serving.prompt_token_budget = Choice::Fixed(std::num::NonZeroU64::new(128).unwrap());
+        assert!(
+            SchedulerConfig::resolve(&info, &config, 512, 2048)
+                .unwrap()
+                .prefill_chunk_multiple
+                .is_none()
         );
     }
 

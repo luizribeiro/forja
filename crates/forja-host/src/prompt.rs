@@ -25,9 +25,19 @@ impl PromptChunking {
         }
     }
 
-    /// Splits an aligned work allocation into stable execution pieces.
-    pub fn pieces(self, tokens: &[u32]) -> impl Iterator<Item = &[u32]> {
-        tokens.chunks(usize::try_from(self.piece.get()).unwrap_or(usize::MAX))
+    /// Merges full pieces without absorbing the final shorter tail.
+    #[must_use]
+    pub const fn merged_work(self, remaining: u32, allowance: u32) -> u32 {
+        let available = if remaining < allowance {
+            remaining
+        } else {
+            allowance
+        };
+        if remaining < self.piece.get() {
+            available
+        } else {
+            available / self.piece.get() * self.piece.get()
+        }
     }
 }
 
@@ -41,12 +51,14 @@ mod tests {
         assert_eq!(chunks.work(4097, 2047), 1536);
         assert_eq!(chunks.work(4097, 511), 0);
         assert_eq!(chunks.work(33, 511), 33);
-        assert_eq!(
-            chunks
-                .pieces(&vec![0; 2047])
-                .map(<[u32]>::len)
-                .collect::<Vec<_>>(),
-            [512, 512, 512, 511]
-        );
+    }
+    #[test]
+    fn merged_work_preserves_the_final_tail() {
+        let chunks = PromptChunking::new(NonZeroU32::new(512).unwrap());
+        assert_eq!(chunks.merged_work(2752, 2048), 2048);
+        assert_eq!(chunks.merged_work(704, 2048), 512);
+        assert_eq!(chunks.merged_work(192, 2048), 192);
+        assert_eq!(chunks.merged_work(2048, 1537), 1536);
+        assert_eq!(chunks.merged_work(512, 511), 0);
     }
 }

@@ -2954,6 +2954,7 @@ mod tests {
             assert!(round - released_round <= 1, "{requests:?} {trace:?}");
         }
         assert_eq!(trace[0], (4, false, 0));
+        assert_eq!(barrier.prompt_pieces()[0], 4);
         let mut work = std::collections::BTreeMap::new();
         for &(budget, decoding, batch) in &trace {
             if decoding {
