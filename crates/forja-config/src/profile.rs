@@ -490,6 +490,12 @@ fn validate(profile: &ProfileData) -> Result<(), String> {
     {
         return Err("serving.prompt-token-budget must not exceed max-context".to_owned());
     }
+    if profile
+        .serving
+        .is_some_and(|serving| serving.prompt_token_budget > profile.workload.prefill_chunk)
+    {
+        return Err("serving.prompt-token-budget must not exceed prefill-chunk".to_owned());
+    }
     validate_tunings(&profile.default_tunings)?;
     validate_variants(&profile.variants, profile.workload.max_context)?;
     require_count(

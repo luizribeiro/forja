@@ -230,6 +230,10 @@ fn rejects_invalid_workload_bounds_and_tuning_names() {
             .contains("must not exceed")
     );
     assert!(
+        error(&PROFILE.replace("prompt-token-budget = 512", "prompt-token-budget = 1024"))
+            .contains("must not exceed prefill-chunk")
+    );
+    assert!(
         error(&PROFILE.replace(
             "[\"residual-norm\", \"qk-norm-rope\"]",
             "[\"residual-norm\", \"residual-norm\"]"
