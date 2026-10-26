@@ -50,11 +50,11 @@ class OpenAIClient:
             connection.close()
         self.local.connection = None
 
-    def request(self, case: dict[str, object]) -> dict[str, object]:
+    def request(self, case: dict[str, object], on_first_token: Callable[[], None] | None = None) -> dict[str, object]:
         """Execute one concrete completion and retain only timings and counts."""
         body = request_body(case, self.model)
         route = "/v1/chat/completions" if case["route"] == "chat" else "/v1/completions"
-        return self._request(route, body, case.get("cancel_after_tokens", 0))
+        return self._request(route, body, case.get("cancel_after_tokens", 0), on_first_token)
 
     def chat(self, messages: list[dict[str, object]], output_tokens: int) -> dict[str, object]:
         """Execute one streaming greedy chat request with an explicit history."""
@@ -71,7 +71,8 @@ class OpenAIClient:
         return self._request("/v1/chat/completions", body, 0)
 
     def _request(
-        self, route: str, body: dict[str, object], cancel_after_tokens: int
+        self, route: str, body: dict[str, object], cancel_after_tokens: int,
+        on_first_token: Callable[[], None] | None = None,
     ) -> dict[str, object]:
         """Send one prepared OpenAI request and collect its timing sample."""
         started = time.perf_counter()
@@ -88,7 +89,7 @@ class OpenAIClient:
                 message = response.read(4096).decode(errors="replace")
                 return failed(started, f"HTTP {response.status}: {message}")
             if body.get("stream"):
-                return self.read_stream(response, cancel_after_tokens, started)
+                return self.read_stream(response, cancel_after_tokens, started, on_first_token)
             payload = json.loads(response.read())
             ended = time.perf_counter()
             usage = payload.get("usage", {})
@@ -113,6 +114,7 @@ class OpenAIClient:
         response: http.client.HTTPResponse,
         cancel_after_tokens: int,
         started: float,
+        on_first_token: Callable[[], None] | None = None,
     ) -> dict[str, object]:
         """Read SSE while measuring first-byte and inter-event latency."""
         arrivals = []
@@ -137,6 +139,8 @@ class OpenAIClient:
             if choices and has_content(choices[0]):
                 arrivals.append(time.perf_counter())
                 output.append(response_output(payload))
+                if len(arrivals) == 1 and on_first_token is not None:
+                    on_first_token()
                 if limit and len(arrivals) >= limit:
                     response.close()
                     self.local.connection = None
