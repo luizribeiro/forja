@@ -409,9 +409,14 @@
             pkgs.cargo-deny
             pkgs.git-absorb
             pkgs.uv
+            (pkgs.writeShellScriptBin "forja" ''
+              root="''${FORJA_ROOT:-$(git rev-parse --show-toplevel)}"
+              exec cargo run --release --quiet --manifest-path "$root/Cargo.toml" -p forja -- "$@"
+            '')
           ]
           ++ gitHooks.enabledPackages;
           shellHook = ''
+            export FORJA_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
             export FORJA_MODELS="''${FORJA_MODELS:-$HOME/.cache/forja/models}"
             ${gitHooks.shellHook}
           '';
