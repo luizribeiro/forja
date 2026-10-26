@@ -99,7 +99,7 @@ fn serving_info() -> ServingInfo {
         planes,
         active_lanes: ACTIVE_LANES,
         max_context: MAX_SUPPORTED_CONTEXT,
-        prefill_chunk_multiple: None,
+        prefill_chunk_multiple: std::num::NonZeroU32::new(512),
         batch_shapes: [1, 2, 4, 8]
             .into_iter()
             .flat_map(|bucket| {

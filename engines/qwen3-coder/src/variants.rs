@@ -1,7 +1,6 @@
 use forja_sdk::{
     EngineLoadConfig, EngineSelections, Param, Result, VariantSelection, target::metal::Variant,
 };
-use std::collections::BTreeMap;
 
 use crate::reduction_classes::serving_reduction_class;
 
@@ -47,6 +46,7 @@ pub(crate) struct Variants(EngineSelections);
 impl Variants {
     pub(crate) fn new(config: &EngineLoadConfig, max_context: u32) -> Result<Self> {
         validate_batch_reductions(config)?;
+        validate_prefill_reductions(config)?;
         Ok(Self(EngineSelections::new(
             config,
             &[],
@@ -114,11 +114,6 @@ impl Variants {
 }
 
 fn validate_batch_reductions(config: &EngineLoadConfig) -> Result<()> {
-    let picks = config
-        .fixed_variant_picks
-        .iter()
-        .map(|pick| (pick.site.as_str(), pick.name.as_str()))
-        .collect::<BTreeMap<_, _>>();
     for sites in [
         &[
             "quant.decode-q4",
@@ -145,20 +140,54 @@ fn validate_batch_reductions(config: &EngineLoadConfig) -> Result<()> {
             "moe.gate-up.batch-8",
         ],
     ] {
-        let mut class = None;
-        for site in sites {
-            let Some(name) = picks.get(site) else {
-                continue;
-            };
+        validate_reduction_classes(config, sites, "decode")?;
+    }
+    Ok(())
+}
+
+fn validate_prefill_reductions(config: &EngineLoadConfig) -> Result<()> {
+    for sites in [
+        &["quant.prefill-tiled"][..],
+        &["gather-quant-matmul.grouped"],
+        &["moe.gate-up.grouped"],
+        &["moe.combine-large"],
+        &["attention.prefill-small", "attention.prefill-large"],
+        &["paged-attention.prefill-large"],
+    ] {
+        validate_reduction_classes(config, sites, "prefill")?;
+    }
+    Ok(())
+}
+
+fn validate_reduction_classes(
+    config: &EngineLoadConfig,
+    sites: &[&str],
+    phase: &str,
+) -> Result<()> {
+    let mut class = None;
+    for &site in sites {
+        let names = config
+            .fixed_variant_picks
+            .iter()
+            .filter(|pick| pick.site == site)
+            .map(|pick| pick.name.as_str())
+            .chain(
+                config
+                    .variant_rule_picks
+                    .iter()
+                    .filter(|rule| rule.site == site)
+                    .flat_map(|rule| rule.arms.iter().map(|arm| arm.name.as_str())),
+            );
+        for name in names {
             let next = serving_reduction_class(name).ok_or_else(|| {
                 forja_sdk::Error::loading(format!(
                     "serving site {site:?} selected a non-invariant variant"
                 ))
             })?;
             if class.replace(next).is_some_and(|class| class != next) {
-                return Err(forja_sdk::Error::loading(
-                    "serving decode buckets require one reduction class",
-                ));
+                return Err(forja_sdk::Error::loading(format!(
+                    "serving {phase} chunks require one reduction class"
+                )));
             }
         }
     }
@@ -263,6 +292,21 @@ mod tests {
     }
 
     #[test]
+    fn prefill_accepts_unblocked_expert_reductions() {
+        let config = EngineLoadConfig {
+            fixed_variant_picks: ["gather-quant-matmul.grouped", "moe.gate-up.grouped"]
+                .into_iter()
+                .map(|site| forja_sdk::FixedVariantPick {
+                    site: site.into(),
+                    name: "gather-quant-matmul.grouped-32x32-2x2".into(),
+                })
+                .collect(),
+            ..EngineLoadConfig::default()
+        };
+        assert!(validate_prefill_reductions(&config).is_ok());
+    }
+
+    #[test]
     fn classifies_paged_attention_sites_at_boundaries() {
         assert_eq!(attention_phase(1, true), "decode");
         assert_eq!(attention_phase(2, true), "prefill-tiny");
@@ -271,5 +315,68 @@ mod tests {
         assert_eq!(attention_phase(511, true), "prefill-small");
         assert_eq!(attention_phase(512, true), "prefill-large");
         assert_eq!(attention_phase(33, false), "prefill-small");
+    }
+    #[test]
+    fn prefill_rules_require_one_known_reduction_class() {
+        use forja_sdk::{VariantPickArm, VariantRulePick};
+        for (small, large, shared, different) in [
+            (
+                None,
+                "paged-attention.prefill-large",
+                "paged-sdpa.steel-half-64x16",
+                "paged-sdpa.steel-half-32x16",
+            ),
+            (
+                Some("attention.prefill-small"),
+                "attention.prefill-large",
+                "sdpa.steel-half",
+                "sdpa.steel",
+            ),
+        ] {
+            let mut config = EngineLoadConfig {
+                variant_rule_picks: vec![VariantRulePick {
+                    site: large.into(),
+                    parameter: "position".into(),
+                    arms: [shared, shared]
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, name)| VariantPickArm {
+                            lo: u32::try_from(index).unwrap() * 2048,
+                            hi: u32::try_from(index).unwrap() * 2048 + 2047,
+                            name: name.into(),
+                        })
+                        .collect(),
+                }],
+                ..EngineLoadConfig::default()
+            };
+            if let Some(site) = small {
+                config
+                    .fixed_variant_picks
+                    .push(forja_sdk::FixedVariantPick {
+                        site: site.into(),
+                        name: different.into(),
+                    });
+                assert!(validate_prefill_reductions(&config).is_err());
+                config.fixed_variant_picks[0].name = shared.into();
+            }
+            assert!(validate_prefill_reductions(&config).is_ok());
+            config.variant_rule_picks[0].arms[1].name = different.into();
+            assert!(validate_prefill_reductions(&config).is_err());
+            config.variant_rule_picks[0].arms[1].name = "matmul.portable".into();
+            assert!(validate_prefill_reductions(&config).is_err());
+        }
+    }
+
+    #[test]
+    fn full_prefill_chunks_share_dispatch_sites() {
+        for rows in [512, 1024, 1536, 2048] {
+            for bits in [crate::Q4_BITS, crate::Q8_BITS] {
+                assert_eq!(quant_site(rows, bits), "quant.prefill-tiled");
+            }
+            assert_eq!(gathered_size(rows * crate::TOP_K), "grouped");
+            assert_eq!(attention_phase(rows, true), "prefill-large");
+            assert_eq!(attention_phase(rows, false), "prefill-large");
+            assert!(u64::from(rows) * u64::from(crate::HIDDEN) >= 1 << 20);
+        }
     }
 }
