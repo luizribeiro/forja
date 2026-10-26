@@ -20,6 +20,7 @@ pub(crate) struct SchedulerPolicy {
     active_limit: usize,
     prefill_limit: usize,
     prompt_budget: u32,
+    last_prompt: Option<RequestId>,
     active: usize,
 }
 impl SchedulerPolicy {
@@ -50,6 +51,7 @@ impl SchedulerPolicy {
             active_limit,
             prefill_limit,
             prompt_budget,
+            last_prompt: None,
             active: 0,
         })
     }
@@ -135,7 +137,11 @@ impl SchedulerPolicy {
 
     pub(crate) fn prompt_batch(&mut self) -> Vec<(RequestId, u32)> {
         let mut remaining = self.prompt_budget;
-        let ids = self.prompt.keys().copied().collect::<Vec<_>>();
+        let mut ids = self.prompt.keys().copied().collect::<Vec<_>>();
+        if let Some(last) = self.last_prompt {
+            let next = ids.partition_point(|&id| id <= last);
+            ids.rotate_left(next);
+        }
         let mut batch = Vec::new();
         for id in ids {
             if batch.len() == self.prefill_limit {
@@ -149,6 +155,7 @@ impl SchedulerPolicy {
                 break;
             }
             batch.push((id, spend));
+            self.last_prompt = Some(id);
             remaining -= spend;
             if spend == tokens {
                 self.prompt.remove(&id);
@@ -204,6 +211,19 @@ mod tests {
         policy.ready_prompt(RequestId(8), 1_000);
         assert_eq!(policy.prompt_batch(), [(RequestId(7), 2_000)]);
         assert_eq!(policy.decode_bucket([0, 2]), Some(4));
+    }
+
+    #[test]
+    fn rotates_prompt_work_so_a_short_arrival_can_start_decoding() {
+        let mut policy = SchedulerPolicy::new(vec![1, 2], 2, 2, 4).unwrap();
+        policy.ready_prompt(RequestId(1), 33);
+        assert_eq!(policy.prompt_batch(), [(RequestId(1), 4)]);
+        policy.ready_prompt(RequestId(2), 1);
+        assert_eq!(
+            policy.prompt_batch(),
+            [(RequestId(2), 1), (RequestId(1), 3)]
+        );
+        assert_eq!(policy.prompt_batch(), [(RequestId(1), 4)]);
     }
 
     #[test]
