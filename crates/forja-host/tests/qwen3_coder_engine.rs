@@ -36,6 +36,99 @@ const SERVING_TOKENS: u32 = 128;
 #[cfg(target_os = "macos")]
 #[tokio::test]
 #[ignore = "requires FORJA_MODELS and runs in the pre-push hook"]
+async fn metal_prompt_chunk_schedules_preserve_logits_and_tokens() -> Result<(), Box<dyn Error>> {
+    let limits = Limits::new(
+        64 * 1024 * 1024 * 1024,
+        4,
+        1_000_000_000,
+        20_000,
+        1024 * 1024 * 1024,
+    )
+    .with_command_limits(4_096, u64::MAX)
+    .with_guest_call_timeout(Duration::from_secs(300))
+    .with_gpu_limits(Duration::from_secs(60), Duration::from_secs(3_600));
+    let mut runner = runner_with_limits(test_guests::qwen3_coder(), limits).await?;
+    runner
+        .load_with_selections(Some(FULL_LAYERS), &load_config()?)
+        .await??;
+    let tokens = (0..2_752)
+        .map(|position| 100 + position % 997)
+        .collect::<Vec<_>>();
+    let small = chunked_prompt_outputs(&mut runner, &tokens, 512).await?;
+    let large = chunked_prompt_outputs(&mut runner, &tokens, 2_048).await?;
+    for (index, (small, large)) in small.iter().zip(&large).enumerate() {
+        assert!(small.0 == large.0, "logits differ at output {index}");
+        assert_eq!(small.1, large.1, "tokens differ at output {index}");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+async fn chunked_prompt_outputs(
+    runner: &mut EngineRunner<forja_metal::MetalBackend>,
+    tokens: &[u32],
+    allowance: u32,
+) -> Result<Vec<(Vec<u8>, Vec<u8>)>, Box<dyn Error>> {
+    runner.prepare_paged_lane(0, None, 0)?;
+    runner.prepare_paged_lane(0, None, u64::try_from(tokens.len())? + 4)?;
+    let mut outputs = Vec::new();
+    let mut next = None;
+    let chunking = forja_host::PromptChunking::new(std::num::NonZeroU32::new(512).unwrap());
+    let mut position = 0;
+    for work in tokens.chunks(usize::try_from(allowance)?) {
+        for part in chunking.pieces(work) {
+            let output = runner
+                .batch_step(EngineBatch {
+                    shape: BatchShape {
+                        phase: BatchPhase::Prompt,
+                        bucket: 1,
+                        tokens: 512,
+                        selection: BatchSelection::Combined,
+                    },
+                    lanes: vec![Some(EngineBatchLane {
+                        slot: 0,
+                        tokens: Some(part.to_vec()),
+                        start_pos: position,
+                        sampling: SamplingParams::default(),
+                    })],
+                })
+                .await??;
+            let logits = runner.read(&output.logits).await?;
+            let selected = runner.read(&output.tokens).await?;
+            next = Some((logits, selected));
+            position += u32::try_from(part.len())?;
+        }
+    }
+    outputs.push(next.ok_or("empty prompt")?);
+    for offset in 0..3 {
+        let selected = batch_tokens(&outputs.last().ok_or("missing output")?.1)?[0];
+        let output = runner
+            .batch_step(EngineBatch {
+                shape: BatchShape {
+                    phase: BatchPhase::Decode,
+                    bucket: 1,
+                    tokens: 1,
+                    selection: BatchSelection::Combined,
+                },
+                lanes: vec![Some(EngineBatchLane {
+                    slot: 0,
+                    tokens: Some(vec![selected]),
+                    start_pos: u32::try_from(tokens.len())? + offset,
+                    sampling: SamplingParams::default(),
+                })],
+            })
+            .await??;
+        outputs.push((
+            runner.read(&output.logits).await?,
+            runner.read(&output.tokens).await?,
+        ));
+    }
+    Ok(outputs)
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[ignore = "requires FORJA_MODELS and runs in the pre-push hook"]
 async fn metal_batch_tokens_match_single_lanes_exactly() -> Result<(), Box<dyn Error>> {
     let mut runner = runner(test_guests::qwen3_coder()).await?;
     let mut config = load_config()?;
@@ -944,10 +1037,18 @@ async fn decode_outputs(
 async fn runner(
     component: &std::path::Path,
 ) -> Result<EngineRunner<forja_metal::MetalBackend>, Box<dyn Error>> {
+    runner_with_limits(component, LIMITS).await
+}
+
+#[cfg(target_os = "macos")]
+async fn runner_with_limits(
+    component: &std::path::Path,
+    limits: Limits,
+) -> Result<EngineRunner<forja_metal::MetalBackend>, Box<dyn Error>> {
     Ok(EngineRunner::new(
         component,
         forja_metal::MetalBackend::new()?,
-        LIMITS,
+        limits,
         model_root()?.join("Qwen3-Coder-30B-A3B-Instruct-4bit/model.safetensors.index.json"),
     )
     .await?)

@@ -2,6 +2,9 @@
 
 #![allow(clippy::manual_async_fn)]
 
+mod prompt;
+pub use prompt::PromptChunking;
+
 #[cfg(test)]
 mod fuzz_tests;
 mod native;
