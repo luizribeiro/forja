@@ -345,3 +345,16 @@ def test_compare_reports_improvement_above_one_for_both_metric_directions() -> N
 
     assert reported["requests_per_second"] == 2.0
     assert reported["ttft_seconds.p50"] == 2.0
+
+
+def test_failed_warmup_refuses_a_serving_measurement() -> None:
+    class Client:
+        def request(self, _case):
+            return {"error": "quota refusal"}
+
+    try:
+        http_client.run_case(Client(), {"concurrency": 1}, 1, 5)
+    except RuntimeError as error:
+        assert "quota refusal" in str(error)
+    else:
+        raise AssertionError("failed warmup was discarded")

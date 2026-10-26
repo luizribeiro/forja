@@ -204,7 +204,10 @@ def run_case(
 
     for _ in range(warmups):
         with ThreadPoolExecutor(max_workers=case["concurrency"]) as executor:
-            list(executor.map(request, range(case["concurrency"])))
+            samples = list(executor.map(request, range(case["concurrency"])))
+        errors = [sample["error"] for sample in samples if sample["error"] is not None]
+        if errors:
+            raise RuntimeError(f"serving warmup failed: {errors}")
     if after_warmups is not None:
         after_warmups()
     count = repetitions * case["concurrency"]
