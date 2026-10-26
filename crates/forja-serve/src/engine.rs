@@ -2565,6 +2565,7 @@ mod tests {
             planes: Vec::new(),
             active_lanes: 8,
             max_context: 4_096,
+            prefill_chunk_multiple: None,
             batch_shapes: [1, 2, 4, 8]
                 .into_iter()
                 .map(|bucket| forja_host::BatchShape {

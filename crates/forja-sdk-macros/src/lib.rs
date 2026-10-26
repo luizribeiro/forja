@@ -358,6 +358,7 @@ fn serving_info() -> proc_macro2::TokenStream {
             }).collect(),
             active_lanes: serving.active_lanes,
             max_context: serving.max_context,
+            prefill_chunk_multiple: serving.prefill_chunk_multiple.map(::std::num::NonZeroU32::get),
             batch_shapes: serving.batch_shapes.into_iter().map(|shape| bindings::exports::l9o::gpu::engine::BatchShape {
                 phase: match shape.phase {
                     ::forja_sdk::BatchPhase::Prompt => bindings::exports::l9o::gpu::engine::BatchPhase::Prompt,

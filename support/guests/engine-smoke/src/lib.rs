@@ -38,6 +38,7 @@ impl Guest for Component {
                 }],
                 active_lanes: 2,
                 max_context: 32,
+                prefill_chunk_multiple: None,
                 batch_shapes: [1, 2]
                     .into_iter()
                     .flat_map(|bucket| {

@@ -156,6 +156,9 @@ pub struct ServingInfo {
     pub active_lanes: u32,
     /// Largest context accepted through paged serving.
     pub max_context: u32,
+    /// Full prompt chunks may merge at multiples of this size with identical bits.
+    /// A final shorter tail keeps its own boundary; `None` requires fixed pieces.
+    pub prefill_chunk_multiple: Option<std::num::NonZeroU32>,
     /// Exact graph shapes retained for serving.
     pub batch_shapes: Vec<BatchShape>,
 }
@@ -1140,6 +1143,12 @@ where
             .l9o_gpu_engine()
             .call_describe(&mut self.store)
             .await?;
+        let prefill_chunk_multiple = info
+            .serving
+            .as_ref()
+            .and_then(|serving| serving.prefill_chunk_multiple)
+            .map(std::num::NonZeroU32::try_from)
+            .transpose()?;
         let info = EngineInfo {
             vocab: info.vocab,
             max_context: info.max_context,
@@ -1158,6 +1167,7 @@ where
                     .collect(),
                 active_lanes: serving.active_lanes,
                 max_context: serving.max_context,
+                prefill_chunk_multiple,
                 batch_shapes: serving
                     .batch_shapes
                     .into_iter()
@@ -9149,6 +9159,7 @@ mod tests {
             planes: Vec::new(),
             active_lanes: 8,
             max_context: 32,
+            prefill_chunk_multiple: None,
             batch_shapes,
         };
         assert!(validate_batch_shapes(&serving(vec![shape])).is_ok());
@@ -9182,6 +9193,7 @@ mod tests {
             planes: Vec::new(),
             active_lanes: 2,
             max_context: 32,
+            prefill_chunk_multiple: None,
             batch_shapes: vec![shape],
         };
         let lane = |slot, start_pos| {
@@ -9255,6 +9267,7 @@ mod tests {
             planes: Vec::new(),
             active_lanes: 1,
             max_context: 32,
+            prefill_chunk_multiple: None,
             batch_shapes: vec![shape],
         };
         let input = |allow| EngineBatchSelect {

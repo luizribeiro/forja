@@ -38,6 +38,7 @@ impl Engine for ConstantEngine {
                     .into(),
                 active_lanes: 2,
                 max_context: 32,
+                prefill_chunk_multiple: std::num::NonZeroU32::new(2),
                 batch_shapes: vec![],
             }),
         }

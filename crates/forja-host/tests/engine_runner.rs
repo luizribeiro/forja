@@ -378,6 +378,10 @@ async fn run_engine(component: &Path, taps: bool, fixture: &str) -> wasmtime::Re
     assert_eq!(serving.planes[0].label, "cache");
     assert_eq!(serving.active_lanes, 2);
     assert_eq!(serving.max_context, 32);
+    assert_eq!(
+        serving.prefill_chunk_multiple,
+        taps.then(|| std::num::NonZeroU32::new(2).unwrap())
+    );
     runner.load().await??;
     let output = runner
         .step(EngineStep {

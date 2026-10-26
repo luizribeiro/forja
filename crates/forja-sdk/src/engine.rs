@@ -26,6 +26,9 @@ pub struct ServingInfo {
     pub active_lanes: u32,
     /// Largest context accepted through paged serving.
     pub max_context: u32,
+    /// Full prompt chunks may merge at multiples of this size with identical bits.
+    /// A final shorter tail keeps its own boundary; `None` requires fixed pieces.
+    pub prefill_chunk_multiple: Option<std::num::NonZeroU32>,
     /// Exact graph shapes retained for serving.
     pub batch_shapes: Vec<BatchShape>,
 }

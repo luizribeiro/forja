@@ -60,6 +60,7 @@ fn serving_info() -> ServingInfo {
         planes,
         active_lanes: 1,
         max_context: MAX_SUPPORTED_CONTEXT,
+        prefill_chunk_multiple: None,
         batch_shapes: Vec::new(),
     }
 }

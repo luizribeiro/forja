@@ -33,6 +33,7 @@ interface engine {
     planes: list<cache-plane>,
     active-lanes: u32,
     max-context: u32,
+    prefill-chunk-multiple: option<u32>,
     batch-shapes: list<batch-shape>,
   }
 
