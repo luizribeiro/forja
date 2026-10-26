@@ -1,5 +1,6 @@
 pub(crate) const SERVING_REDUCTION_CLASSES: &[(&str, &str)] = &[
     ("quant-matmul.gemv", "quant-matmul.row-gemv"),
+    ("quant-matmul.gemv-n2", "quant-matmul.row-gemv"),
     ("quant-matmul.row-gemv", "quant-matmul.row-gemv"),
     (
         "gather-quant-matmul.route-gemv",

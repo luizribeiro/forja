@@ -356,6 +356,46 @@ kernel void quantized_gemv(
     }
 }
 
+kernel void quantized_gemv_n2(
+    device const uchar *input [[buffer(0)]],
+    device const uchar *packed [[buffer(1)]],
+    device const uchar *scales [[buffer(2)]],
+    device const uchar *biases [[buffer(3)]],
+    device uchar *output [[buffer(4)]],
+    constant QuantMatmulParams &params [[buffer(5)]],
+    FORJA_EPILOGUE_ARGUMENTS
+    ushort simdgroup [[simdgroup_index_in_threadgroup]],
+    ushort lane [[thread_index_in_simdgroup]],
+    uint2 tile [[threadgroup_position_in_grid]]) {
+    uint first_column = tile.x * 4 + uint(simdgroup) * 2;
+    float sums[2] = {0.0f};
+    quantized_qmv_sums(
+        input, packed, scales, biases,
+        params.input_offset + ulong(tile.y) * params.input_row_stride,
+        params.packed_offset, params.scale_offset, params.bias_offset,
+        params.input_inner_stride, params.packed_row_stride,
+        params.packed_word_stride, params.scale_row_stride,
+        params.scale_group_stride, params.bias_row_stride,
+        params.bias_group_stride, params.inner, params.columns,
+        first_column, lane, quant_words_per_thread, sums);
+    if (lane == 0) {
+        for (uint item = 0; item < 2; ++item) {
+            uint column = first_column + item;
+            if (column < params.columns) {
+                float value = forja_epilogue(
+                    sums[item], 0.0f, 0u, tile.y, column,
+                    1u, params.rows, params.columns, FORJA_EPILOGUE_VALUES);
+                store_float(
+                    output,
+                    params.output_offset + ulong(tile.y) * params.output_row_stride +
+                        ulong(column) * params.output_column_stride,
+                    output_dtype,
+                    value);
+            }
+        }
+    }
+}
+
 kernel void quantized_gemv_q8_fast(
     device const uchar *input [[buffer(0)]],
     device const uchar *packed [[buffer(1)]],

@@ -39,6 +39,13 @@ fn pinned_decode_batch_variants_match_cpu_for_distinct_rows() {
     let reference = CpuBackend::new();
     let candidate = MetalBackend::new().unwrap();
     let mut values = DeterministicValues::new(0x510e_527f_ade6_82d1);
+    for (bits, name) in [
+        (4, "quant-matmul.gemv"),
+        (4, "quant-matmul.gemv-n2"),
+        (8, "quant-matmul.q8-fast-gemv"),
+    ] {
+        assert_pinned_decode_batch(&reference, &candidate, 1, bits, name, &mut values);
+    }
     for rows in [2, 4, 8] {
         assert_pinned_decode_batch(
             &reference,

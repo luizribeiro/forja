@@ -24,6 +24,7 @@ pub(crate) enum MetalVariant {
     MatmulSteel32x64x16_1x2,
     QuantMatmulPortable,
     QuantMatmulGemv,
+    QuantMatmulGemvN2,
     QuantMatmulQ8FastGemv,
     QuantMatmulSmallM,
     QuantMatmulTiled,
@@ -315,6 +316,10 @@ const STEEL: &[Constraint] = &[value(
     },
 )];
 const QUANT_GEMV: &[Constraint] = &[value(QUANT_M, Relation::Equal(1))];
+const QUANT_GEMV_N2: &[Constraint] = &[
+    QUANT_GEMV[0],
+    operation(OperationValue::Bits, Relation::Equal(4)),
+];
 const QUANT_ROW_GEMV: &[Constraint] = &[value(QUANT_M, Relation::Range { min: 2, max: 8 })];
 const Q8_FAST: &[Constraint] = &[
     value(QUANT_M, Relation::Range { min: 1, max: 8 }),
@@ -794,6 +799,15 @@ pub(crate) static REGISTRY: &[VariantDef<MetalVariant>] = &[
         &["single-row decode with general supported quantization."],
         &["large batches that can amortize tiled work."],
         &["General quantized matrix-vector multiplication."]
+    ),
+    batch_invariant_variant!(@class "quant-matmul.row-gemv";
+        "quant-matmul.gemv-n2",
+        QuantMatmul,
+        QuantMatmulGemvN2,
+        QUANT_GEMV_N2,
+        &["single-row q4 decode that benefits from more output parallelism."],
+        &["q8 weights or larger batches."],
+        &["Computes two output rows per SIMD group with the gemv reduction order."]
     ),
     batch_invariant_variant!(@class "quant-matmul.row-gemv";
         "quant-matmul.row-gemv",
@@ -1694,6 +1708,7 @@ mod tests {
                 "matmul.steel-32x64x16-1x2",
                 "quant-matmul.portable",
                 "quant-matmul.gemv",
+                "quant-matmul.gemv-n2",
                 "quant-matmul.row-gemv",
                 "quant-matmul.q8-fast-gemv",
                 "quant-matmul.small-m",
@@ -1825,9 +1840,18 @@ mod tests {
     }
 
     fn quant_dispatch(dtype: DType, rows: u32, inner: u32, strided: bool) -> Dispatch {
+        quant_dispatch_with_bits(dtype, rows, inner, strided, 8)
+    }
+
+    fn quant_dispatch_with_bits(
+        dtype: DType,
+        rows: u32,
+        inner: u32,
+        strided: bool,
+        bits: u8,
+    ) -> Dispatch {
         let backend = CpuBackend::new();
         let columns = 33;
-        let bits = 8;
         let group_size = 64;
         let input = if strided {
             let allocation = backend.alloc(dtype, &[rows, inner * 2]).unwrap();
@@ -2325,7 +2349,7 @@ mod tests {
     #[test]
     #[allow(clippy::too_many_lines)]
     fn every_variant_has_an_encoder_accepted_fixture() {
-        let fixtures = [
+        let fixtures = vec![
             (
                 "matmul.portable",
                 matmul_case(DType::F32, 1, 7, 33, true),
@@ -2375,6 +2399,11 @@ mod tests {
                 "quant-matmul.gemv",
                 quant_dispatch(DType::F32, 1, 64, false),
                 "quantized_gemv",
+            ),
+            (
+                "quant-matmul.gemv-n2",
+                quant_dispatch_with_bits(DType::F32, 1, 64, false, 4),
+                "quantized_gemv_n2",
             ),
             (
                 "quant-matmul.row-gemv",

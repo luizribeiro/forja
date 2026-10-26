@@ -4118,6 +4118,7 @@ impl MetalBackend {
         set_argument_table(encoder, table);
         let (column_tile, row_tile, threads) = match kernel {
             "quantized_gemv" => (if bits == 8 { 16 } else { 8 }, 1, 64),
+            "quantized_gemv_n2" => (4, 1, 64),
             "quantized_gemv_q8_fast" => (8, 1, 64),
             "quantized_gemm_tiled_f32"
             | "quantized_gemm_tiled_f16"
@@ -7937,6 +7938,7 @@ fn supported_dispatch(dispatch: &Dispatch) -> bool {
                     | MetalVariant::MatmulSteel32x64x16_1x2
                     | MetalVariant::QuantMatmulPortable
                     | MetalVariant::QuantMatmulGemv
+                    | MetalVariant::QuantMatmulGemvN2
                     | MetalVariant::QuantMatmulQ8FastGemv
                     | MetalVariant::QuantMatmulSmallM
                     | MetalVariant::QuantMatmulTiled
@@ -8169,6 +8171,7 @@ fn quant_matmul_kernel(dispatch: &Dispatch) -> Result<&'static str, BackendError
     };
     match selected_variant(dispatch) {
         Some(MetalVariant::QuantMatmulGemv) => Ok("quantized_gemv"),
+        Some(MetalVariant::QuantMatmulGemvN2) => Ok("quantized_gemv_n2"),
         Some(MetalVariant::QuantMatmulQ8FastGemv) => Ok("quantized_gemv_q8_fast"),
         Some(MetalVariant::QuantMatmulPortable | MetalVariant::QuantMatmulSmallM) => {
             Ok("quantized_gemm_small_m")
@@ -8573,7 +8576,9 @@ pub(super) fn variant_supported(
         | MetalVariant::MatmulSteel64x64x16_1x2
         | MetalVariant::MatmulSteel64x32x32_2x2
         | MetalVariant::MatmulSteel32x64x16_1x2 => matmul_rows(dispatch)? > 1,
-        MetalVariant::QuantMatmulGemv => (1..=8).contains(&rows()?),
+        MetalVariant::QuantMatmulGemv | MetalVariant::QuantMatmulGemvN2 => {
+            (1..=8).contains(&rows()?)
+        }
         MetalVariant::QuantMatmulQ8FastGemv => {
             quant_matmul_kernel(dispatch)? == "quantized_gemv_q8_fast"
         }
@@ -11347,6 +11352,7 @@ mod tests {
         let quant_constants = vec![(0, 0), (1, 1), (2, 0), (12, 8), (13, 64)];
         for implementation in [
             "quantized_gemv",
+            "quantized_gemv_n2",
             "quantized_gemv_q8_fast",
             "quantized_gemm_small_m",
             "quantized_gemm_tiled_f32",
@@ -12227,6 +12233,7 @@ mod tests {
             for bits in [4, 8] {
                 assert_quant_epilogue(&backend, "quant-matmul.gemv", dtype, bits, 1, 256, 33, true);
             }
+            assert_quant_epilogue(&backend, "quant-matmul.gemv-n2", dtype, 4, 1, 256, 33, true);
         }
         assert_quant_epilogue(
             &backend,
