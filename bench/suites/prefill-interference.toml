@@ -1,0 +1,25 @@
+[suite]
+schema_version = 1
+model = "mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit"
+revision = "6e302ea604ad9ab206367e2c501d1571023e7b6d"
+repetitions = 30
+warmups = 3
+connection_policy = "reuse"
+seed = 0
+
+[[case]]
+name = "long-prefill"
+route = "completions"
+prompt_tokens = [16384]
+output_tokens = 1
+concurrency = [1]
+sampling = "greedy"
+
+[[case]]
+name = "streaming-decode"
+route = "chat"
+prompt_tokens = [33]
+output_tokens = 128
+concurrency = [1, 4]
+sampling = "greedy"
+stream = true
