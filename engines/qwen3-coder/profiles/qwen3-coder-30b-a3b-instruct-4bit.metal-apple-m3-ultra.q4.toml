@@ -34,7 +34,7 @@ paged-cache = true
 
 [variants.fixed]
 "quant.decode-q4" = "quant-matmul.gemv-n2"
-"quant.decode-q8" = "quant-matmul.q8-fast-gemv"
+"quant.decode-q8" = "quant-matmul.q8-fast-gemv-n2"
 "quant.decode-b2-q4" = "quant-matmul.row-gemv"
 "quant.decode-b2-q8" = "quant-matmul.q8-fast-gemv"
 "quant.decode-b4-q4" = "quant-matmul.row-gemv"
