@@ -251,6 +251,10 @@ mod tests {
             serving_reduction_class("quant-matmul.gemv-n2"),
             serving_reduction_class("quant-matmul.row-gemv")
         );
+        assert_eq!(
+            serving_reduction_class("quant-matmul.q8-fast-gemv-n2"),
+            serving_reduction_class("quant-matmul.q8-fast-gemv")
+        );
         assert_ne!(
             serving_reduction_class("gather-quant-matmul.route-gemv"),
             serving_reduction_class("gather-quant-matmul.grouped-small-m")

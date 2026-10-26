@@ -8,6 +8,7 @@ pub(crate) const SERVING_REDUCTION_CLASSES: &[(&str, &str)] = &[
     ),
     ("quant-matmul.small-m", "quant-matmul.small-m"),
     ("quant-matmul.q8-fast-gemv", "quant-matmul.q8-fast-gemv"),
+    ("quant-matmul.q8-fast-gemv-n2", "quant-matmul.q8-fast-gemv"),
     (
         "gather-quant-matmul.grouped-small-m",
         "gather-quant-matmul.grouped-small-m",

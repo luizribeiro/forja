@@ -435,7 +435,7 @@ mod tests {
                 "if (column < params.columns)",
             ),
             (
-                "kernel void quantized_gemv_q8_fast(",
+                "void quantized_gemv_q8_fast_body(",
                 &["simd_sum("][..],
                 "if (column < params.columns)",
             ),
@@ -451,6 +451,13 @@ mod tests {
                 assert!(before.rfind(collective).unwrap() < before.rfind(edge).unwrap());
                 assert!(body[call..].find("store_float(").is_some());
             }
+        }
+        for (kernel, output_count) in [
+            ("kernel void quantized_gemv_q8_fast(", 4),
+            ("kernel void quantized_gemv_q8_fast_n2(", 2),
+        ] {
+            let body = function_definition(&source, kernel);
+            assert!(body.contains(&format!("quantized_gemv_q8_fast_body<{output_count}>(")));
         }
     }
 

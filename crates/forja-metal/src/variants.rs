@@ -26,6 +26,7 @@ pub(crate) enum MetalVariant {
     QuantMatmulGemv,
     QuantMatmulGemvN2,
     QuantMatmulQ8FastGemv,
+    QuantMatmulQ8FastGemvN2,
     QuantMatmulSmallM,
     QuantMatmulTiled,
     GatherQuantMatmulPortable,
@@ -321,8 +322,7 @@ const QUANT_GEMV_N2: &[Constraint] = &[
     operation(OperationValue::Bits, Relation::Equal(4)),
 ];
 const QUANT_ROW_GEMV: &[Constraint] = &[value(QUANT_M, Relation::Range { min: 2, max: 8 })];
-const Q8_FAST: &[Constraint] = &[
-    value(QUANT_M, Relation::Range { min: 1, max: 8 }),
+const Q8_FAST_SUFFIX: &[Constraint] = &[
     operation(OperationValue::Bits, Relation::Equal(8)),
     operation(OperationValue::GroupSize, Relation::MultipleOf(8)),
     value(INNER, Relation::MultipleOf(256)),
@@ -355,6 +355,17 @@ const Q8_FAST: &[Constraint] = &[
         alignment: 2,
     },
 ];
+const fn q8_fast_constraints(rows: Relation) -> [Constraint; Q8_FAST_SUFFIX.len() + 1] {
+    let mut constraints = [value(QUANT_M, rows); Q8_FAST_SUFFIX.len() + 1];
+    let mut index = 0;
+    while index < Q8_FAST_SUFFIX.len() {
+        constraints[index + 1] = Q8_FAST_SUFFIX[index];
+        index += 1;
+    }
+    constraints
+}
+const Q8_FAST: &[Constraint] = &q8_fast_constraints(Relation::Range { min: 1, max: 8 });
+const Q8_FAST_N2: &[Constraint] = &q8_fast_constraints(Relation::Equal(1));
 const SMALL_M: &[Constraint] = &[value(
     QUANT_M,
     Relation::Range {
@@ -826,6 +837,15 @@ pub(crate) static REGISTRY: &[VariantDef<MetalVariant>] = &[
         &["aligned contiguous q8 decode with wide inner dimensions."],
         &["strided tensors or q4 weights."],
         &["Uses vectorized q8 loads."]
+    ),
+    batch_invariant_variant!(@class "quant-matmul.q8-fast-gemv";
+        "quant-matmul.q8-fast-gemv-n2",
+        QuantMatmul,
+        QuantMatmulQ8FastGemvN2,
+        Q8_FAST_N2,
+        &["single-row aligned q8 decode that benefits from more output parallelism."],
+        &["strided tensors, q4 weights, or larger batches."],
+        &["Computes two output rows per SIMD group with the q8-fast reduction order."]
     ),
     batch_invariant_variant!(
         "quant-matmul.small-m",
@@ -1711,6 +1731,7 @@ mod tests {
                 "quant-matmul.gemv-n2",
                 "quant-matmul.row-gemv",
                 "quant-matmul.q8-fast-gemv",
+                "quant-matmul.q8-fast-gemv-n2",
                 "quant-matmul.small-m",
                 "quant-matmul.tiled",
                 "gather-quant-matmul.portable",
@@ -2414,6 +2435,11 @@ mod tests {
                 "quant-matmul.q8-fast-gemv",
                 quant_dispatch(DType::F16, 1, 256, false),
                 "quantized_gemv_q8_fast",
+            ),
+            (
+                "quant-matmul.q8-fast-gemv-n2",
+                quant_dispatch(DType::F16, 1, 256, false),
+                "quantized_gemv_q8_fast_n2",
             ),
             (
                 "quant-matmul.small-m",

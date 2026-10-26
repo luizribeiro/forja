@@ -396,19 +396,21 @@ kernel void quantized_gemv_n2(
     }
 }
 
-kernel void quantized_gemv_q8_fast(
-    device const uchar *input [[buffer(0)]],
-    device const uchar *packed [[buffer(1)]],
-    device const uchar *scales [[buffer(2)]],
-    device const uchar *biases [[buffer(3)]],
-    device uchar *output [[buffer(4)]],
-    constant QuantMatmulParams &params [[buffer(5)]],
-    FORJA_EPILOGUE_ARGUMENTS
-    ushort simdgroup [[simdgroup_index_in_threadgroup]],
-    ushort lane [[thread_index_in_simdgroup]],
-    uint2 tile [[threadgroup_position_in_grid]]) {
-    uint first_column = tile.x * 8 + uint(simdgroup) * 4;
-    float sums[4] = {0.0f};
+template <uint output_count>
+void quantized_gemv_q8_fast_body(
+    device const uchar *input,
+    device const uchar *packed,
+    device const uchar *scales,
+    device const uchar *biases,
+    device uchar *output,
+    constant QuantMatmulParams &params,
+    FORJA_EPILOGUE_PARAMETERS
+    ushort simdgroup,
+    ushort lane,
+    uint2 tile) {
+    uint first_column = tile.x * (output_count * 2) +
+        uint(simdgroup) * output_count;
+    float sums[output_count] = {0.0f};
     for (uint block = 0; block < params.inner; block += 256) {
         uint first_inner = block + uint(lane) * 8;
         float4 activations0 = load_float4_contiguous(
@@ -425,7 +427,7 @@ kernel void quantized_gemv_q8_fast(
             dot(activations1, float4(1.0f));
         uint group = first_inner / quant_group_size;
         uint first_word = first_inner / 4;
-        for (uint item = 0; item < 4; ++item) {
+        for (uint item = 0; item < output_count; ++item) {
             uint column = first_column + item;
             if (column < params.columns) {
                 ulong packed_index = params.packed_offset +
@@ -446,11 +448,11 @@ kernel void quantized_gemv_q8_fast(
             }
         }
     }
-    for (uint item = 0; item < 4; ++item) {
+    for (uint item = 0; item < output_count; ++item) {
         sums[item] = simd_sum(sums[item]);
     }
     if (lane == 0) {
-        for (uint item = 0; item < 4; ++item) {
+        for (uint item = 0; item < output_count; ++item) {
             uint column = first_column + item;
             if (column < params.columns) {
                 float value = forja_epilogue(
@@ -465,6 +467,38 @@ kernel void quantized_gemv_q8_fast(
             }
         }
     }
+}
+
+kernel void quantized_gemv_q8_fast(
+    device const uchar *input [[buffer(0)]],
+    device const uchar *packed [[buffer(1)]],
+    device const uchar *scales [[buffer(2)]],
+    device const uchar *biases [[buffer(3)]],
+    device uchar *output [[buffer(4)]],
+    constant QuantMatmulParams &params [[buffer(5)]],
+    FORJA_EPILOGUE_ARGUMENTS
+    ushort simdgroup [[simdgroup_index_in_threadgroup]],
+    ushort lane [[thread_index_in_simdgroup]],
+    uint2 tile [[threadgroup_position_in_grid]]) {
+    quantized_gemv_q8_fast_body<4>(
+        input, packed, scales, biases, output, params, FORJA_EPILOGUE_VALUES,
+        simdgroup, lane, tile);
+}
+
+kernel void quantized_gemv_q8_fast_n2(
+    device const uchar *input [[buffer(0)]],
+    device const uchar *packed [[buffer(1)]],
+    device const uchar *scales [[buffer(2)]],
+    device const uchar *biases [[buffer(3)]],
+    device uchar *output [[buffer(4)]],
+    constant QuantMatmulParams &params [[buffer(5)]],
+    FORJA_EPILOGUE_ARGUMENTS
+    ushort simdgroup [[simdgroup_index_in_threadgroup]],
+    ushort lane [[thread_index_in_simdgroup]],
+    uint2 tile [[threadgroup_position_in_grid]]) {
+    quantized_gemv_q8_fast_body<2>(
+        input, packed, scales, biases, output, params, FORJA_EPILOGUE_VALUES,
+        simdgroup, lane, tile);
 }
 
 struct GatherQuantMatmulParams {

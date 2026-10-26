@@ -43,6 +43,7 @@ fn pinned_decode_batch_variants_match_cpu_for_distinct_rows() {
         (4, "quant-matmul.gemv"),
         (4, "quant-matmul.gemv-n2"),
         (8, "quant-matmul.q8-fast-gemv"),
+        (8, "quant-matmul.q8-fast-gemv-n2"),
     ] {
         assert_pinned_decode_batch(&reference, &candidate, 1, bits, name, &mut values);
     }
