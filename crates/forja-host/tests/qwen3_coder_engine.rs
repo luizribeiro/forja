@@ -99,7 +99,7 @@ async fn assert_chunk_schedules(
         .map(|position| 100 + position % 997)
         .collect::<Vec<_>>();
     let reference = chunked_prompt_outputs(&mut runner, &tokens, &[512], prefix.clone(), 3).await?;
-    for schedule in [&[2048][..], &[512, 2048, 1024][..]] {
+    for schedule in [&[2048][..], &[64, 2048, 512][..]] {
         let candidate =
             chunked_prompt_outputs(&mut runner, &tokens, schedule, prefix.clone(), 3).await?;
         for (index, (reference, candidate)) in reference.iter().zip(&candidate).enumerate() {
@@ -126,7 +126,7 @@ async fn chunked_prompt_outputs(
     runner.prepare_paged_lane(0, prefix, reserved)?;
     let mut outputs = Vec::new();
     let mut next = None;
-    let chunking = forja_host::PromptChunking::new(std::num::NonZeroU32::new(512).unwrap());
+    let chunking = forja_host::PromptChunking::new(std::num::NonZeroU32::new(64).unwrap());
     let mut consumed = 0;
     let mut round = 0;
     while consumed < tokens.len() {

@@ -83,6 +83,7 @@ const Q4_BITS: u8 = 4;
 const Q8_BITS: u8 = 8;
 const QUANT_GROUP: u32 = 64;
 const ACTIVE_LANES: u32 = 8;
+const PREFILL_CHUNK_MULTIPLE: u32 = 64;
 
 fn serving_info() -> ServingInfo {
     let planes = (0..LAYERS)
@@ -99,7 +100,7 @@ fn serving_info() -> ServingInfo {
         planes,
         active_lanes: ACTIVE_LANES,
         max_context: MAX_SUPPORTED_CONTEXT,
-        prefill_chunk_multiple: std::num::NonZeroU32::new(512),
+        prefill_chunk_multiple: std::num::NonZeroU32::new(PREFILL_CHUNK_MULTIPLE),
         batch_shapes: [1, 2, 4, 8]
             .into_iter()
             .flat_map(|bucket| {

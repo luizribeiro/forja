@@ -61,7 +61,7 @@ paged-cache = true
 "top-k" = "top-k.single-k8"
 "sample" = "sample.parallel"
 "attention.prefill-small" = "sdpa.steel-half"
-"paged-attention.prefill-small" = "paged-sdpa.steel-half"
+"paged-attention.prefill-small" = "paged-sdpa.steel-half-64x16"
 "paged-attention.prefill-tiny" = "paged-sdpa.vector"
 
 [variants.rules."paged-attention.prefill-large"]

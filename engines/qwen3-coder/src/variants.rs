@@ -72,12 +72,7 @@ impl Variants {
     }
 
     pub(crate) fn combine(&self, sequence: u32) -> Result<Variant> {
-        let site = if u64::from(sequence) * u64::from(crate::HIDDEN) >= 1 << 20 {
-            "moe.combine-large"
-        } else {
-            "moe.combine-small"
-        };
-        self.0.at(site, 0)
+        self.0.at(combine_site(sequence), 0)
     }
 
     pub(crate) fn top_k(&self) -> Result<Variant> {
@@ -152,7 +147,10 @@ fn validate_prefill_reductions(config: &EngineLoadConfig) -> Result<()> {
         &["moe.gate-up.grouped"],
         &["moe.combine-large"],
         &["attention.prefill-small", "attention.prefill-large"],
-        &["paged-attention.prefill-large"],
+        &[
+            "paged-attention.prefill-small",
+            "paged-attention.prefill-large",
+        ],
     ] {
         validate_reduction_classes(config, sites, "prefill")?;
     }
@@ -192,6 +190,14 @@ fn validate_reduction_classes(
         }
     }
     Ok(())
+}
+
+fn combine_site(sequence: u32) -> &'static str {
+    if sequence >= crate::PREFILL_CHUNK_MULTIPLE {
+        "moe.combine-large"
+    } else {
+        "moe.combine-small"
+    }
 }
 
 fn gathered_site(operation: &str, routed_rows: u32) -> String {
@@ -321,19 +327,23 @@ mod tests {
         use forja_sdk::{VariantPickArm, VariantRulePick};
         for (small, large, shared, different) in [
             (
-                None,
+                "paged-attention.prefill-small",
                 "paged-attention.prefill-large",
                 "paged-sdpa.steel-half-64x16",
                 "paged-sdpa.steel-half-32x16",
             ),
             (
-                Some("attention.prefill-small"),
+                "attention.prefill-small",
                 "attention.prefill-large",
                 "sdpa.steel-half",
                 "sdpa.steel",
             ),
         ] {
             let mut config = EngineLoadConfig {
+                fixed_variant_picks: vec![forja_sdk::FixedVariantPick {
+                    site: small.into(),
+                    name: different.into(),
+                }],
                 variant_rule_picks: vec![VariantRulePick {
                     site: large.into(),
                     parameter: "position".into(),
@@ -349,16 +359,8 @@ mod tests {
                 }],
                 ..EngineLoadConfig::default()
             };
-            if let Some(site) = small {
-                config
-                    .fixed_variant_picks
-                    .push(forja_sdk::FixedVariantPick {
-                        site: site.into(),
-                        name: different.into(),
-                    });
-                assert!(validate_prefill_reductions(&config).is_err());
-                config.fixed_variant_picks[0].name = shared.into();
-            }
+            assert!(validate_prefill_reductions(&config).is_err());
+            config.fixed_variant_picks[0].name = shared.into();
             assert!(validate_prefill_reductions(&config).is_ok());
             config.variant_rule_picks[0].arms[1].name = different.into();
             assert!(validate_prefill_reductions(&config).is_err());
@@ -368,15 +370,21 @@ mod tests {
     }
 
     #[test]
-    fn full_prefill_chunks_share_dispatch_sites() {
-        for rows in [512, 1024, 1536, 2048] {
+    fn mergeable_prefill_chunks_use_validated_sites() {
+        for rows in [64, 128, 192, 256, 448, 512, 704, 1024, 1536, 2048] {
             for bits in [crate::Q4_BITS, crate::Q8_BITS] {
                 assert_eq!(quant_site(rows, bits), "quant.prefill-tiled");
             }
             assert_eq!(gathered_size(rows * crate::TOP_K), "grouped");
-            assert_eq!(attention_phase(rows, true), "prefill-large");
-            assert_eq!(attention_phase(rows, false), "prefill-large");
-            assert!(u64::from(rows) * u64::from(crate::HIDDEN) >= 1 << 20);
+            assert!(["prefill-small", "prefill-large"].contains(&attention_phase(rows, true)));
+            assert_eq!(combine_site(rows), "moe.combine-large");
         }
+    }
+    #[test]
+    fn combine_keeps_decode_buckets_outside_prefill_alignment() {
+        for rows in [1, 2, 4, 8, 63] {
+            assert_eq!(combine_site(rows), "moe.combine-small");
+        }
+        assert_eq!(combine_site(64), "moe.combine-large");
     }
 }
