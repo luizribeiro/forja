@@ -165,6 +165,10 @@ struct BlockMMA {
         }
     }
 
+    bool has_rows(uint row_count) thread {
+        return uint(simdgroup_row) * fragment_size < row_count;
+    }
+
     void multiply(
         threadgroup const T *a,
         threadgroup const T *b) thread {

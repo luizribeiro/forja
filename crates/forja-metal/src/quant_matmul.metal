@@ -1134,7 +1134,7 @@ void grouped_quantized_gemm_impl(
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if constexpr (!skip_high_padding) {
             mma.multiply(input_tile, weight_tile);
-        } else if (mma.simdgroup_row == 0 || row_count > block_rows / 2) {
+        } else if (mma.has_rows(row_count)) {
             mma.multiply(input_tile, weight_tile);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1312,7 +1312,7 @@ kernel void grouped_quantized_pair_32x32_2x2_blocked(
             inner_origin, column_origin, params.inner, params.columns,
             weight_tile, thread_index, thread_count);
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (gate_mma.simdgroup_row == 0 || row_count > block_rows / 2) {
+        if (gate_mma.has_rows(row_count)) {
             gate_mma.multiply(input_tile, weight_tile);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1328,7 +1328,7 @@ kernel void grouped_quantized_pair_32x32_2x2_blocked(
             inner_origin, column_origin, params.inner, params.columns,
             weight_tile, thread_index, thread_count);
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (up_mma.simdgroup_row == 0 || row_count > block_rows / 2) {
+        if (up_mma.has_rows(row_count)) {
             up_mma.multiply(input_tile, weight_tile);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);

@@ -165,7 +165,11 @@ fn metal_grouped_small_m_variants_match_cpu_at_edges() {
 fn metal_grouped_tile_heights_match_bits() {
     let metal = MetalBackend::new().unwrap();
     let mut values = DeterministicValues::new(0xbb67_ae85_84ca_a73b);
-    for (rows, routes) in [(33, 2), (64, 1)] {
+    for (rows, routes, expert_routes) in [(33, 2, 66), (64, 1, 64)]
+        .into_iter()
+        .chain((8..=17).map(|count| (64, 1, count)))
+        .chain((72..=81).map(|rows| (rows, 1, rows)))
+    {
         let case = GroupedCase {
             rows,
             routes,
@@ -180,7 +184,10 @@ fn metal_grouped_tile_heights_match_bits() {
                 .map(|spec| generated_tensor_bytes(spec, &mut values).unwrap())
                 .collect::<Vec<_>>();
             *bytes.last_mut().unwrap() = (0..rows * routes)
-                .flat_map(|_| 4_u32.to_le_bytes())
+                .flat_map(|route| {
+                    let expert = if route < expert_routes { 4_u32 } else { 5 };
+                    expert.to_le_bytes()
+                })
                 .collect();
             let inputs = allocate_inputs(&metal, &specs, &bytes);
             let op = Op::GatherQuantMatmul {
@@ -216,9 +223,15 @@ fn metal_grouped_tile_heights_match_bits() {
                 outputs.push(metal.read(&output).unwrap());
             }
             assert_eq!(outputs[0], outputs[1]);
-            assert_eq!(outputs[0], outputs[2]);
+            assert_eq!(
+                outputs[0], outputs[2],
+                "blocked: rows={rows}, routes={routes}, expert_routes={expert_routes}, paired={paired}"
+            );
             if paired {
-                assert_eq!(outputs[0], outputs[3]);
+                assert_eq!(
+                    outputs[0], outputs[3],
+                    "fused: rows={rows}, routes={routes}, expert_routes={expert_routes}"
+                );
             }
         }
     }
