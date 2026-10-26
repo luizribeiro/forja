@@ -1038,6 +1038,16 @@ paged_gqa_two_pass_tests!(
         4_001,
         "paged-sdpa.vector-gqa-two-pass-128"
     ),
+    (
+        metal_paged_gqa_512_split_matches_cpu_at_513,
+        513,
+        "paged-sdpa.vector-gqa-two-pass-512"
+    ),
+    (
+        metal_paged_gqa_1024_split_matches_cpu_at_4097,
+        4097,
+        "paged-sdpa.vector-gqa-two-pass-1024"
+    ),
 );
 
 fn for_each_paged_gqa_safety_heads(mut check: impl FnMut(u32, u32)) {
@@ -1081,6 +1091,8 @@ fn metal_paged_gqa_two_pass_keeps_barriers_uniform_across_rejected_pages() {
             (513, "paged-sdpa.vector-gqa-two-pass-32"),
             (2_048, "paged-sdpa.vector-gqa-two-pass"),
             (4_000, "paged-sdpa.vector-gqa-two-pass-128"),
+            (513, "paged-sdpa.vector-gqa-two-pass-512"),
+            (4_097, "paged-sdpa.vector-gqa-two-pass-1024"),
         ] {
             let pages = usize::try_from(length.div_ceil(64)).unwrap();
             let corrupt_pages = (1..pages).step_by(2).collect::<Vec<_>>();
@@ -1707,4 +1719,10 @@ fn metal_paged_decode_profile_separates_partial_and_reduce_passes() {
         .map(|p| p.gpu_time)
         .sum::<std::time::Duration>();
     assert!(accounted.abs_diff(dispatch.gpu_time) <= std::time::Duration::from_nanos(2));
+}
+
+#[test]
+fn metal_paged_gqa_wide_splits_match_cpu_at_long_context() {
+    check_paged_gqa_two_pass(64_001, "paged-sdpa.vector-gqa-two-pass-512", (32, 4));
+    check_paged_gqa_two_pass(128_001, "paged-sdpa.vector-gqa-two-pass-1024", (32, 4));
 }

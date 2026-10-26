@@ -8256,7 +8256,9 @@ fn paged_sdpa_kernel(dispatch: &Dispatch, width: u32) -> Result<&'static str, Ba
                 MetalVariant::PagedSdpaVectorGqaTwoPass32
                 | MetalVariant::PagedSdpaVectorGqaTwoPass64
                 | MetalVariant::PagedSdpaVectorGqaTwoPass128
-                | MetalVariant::PagedSdpaVectorGqaTwoPass256,
+                | MetalVariant::PagedSdpaVectorGqaTwoPass256
+                | MetalVariant::PagedSdpaVectorGqaTwoPass512
+                | MetalVariant::PagedSdpaVectorGqaTwoPass1024,
             ),
             128,
         ) => {
@@ -8295,6 +8297,8 @@ fn paged_gqa_blocks(variant: Option<MetalVariant>) -> Option<u32> {
         Some(MetalVariant::PagedSdpaVectorGqaTwoPass64) => Some(64),
         Some(MetalVariant::PagedSdpaVectorGqaTwoPass128) => Some(128),
         Some(MetalVariant::PagedSdpaVectorGqaTwoPass256) => Some(256),
+        Some(MetalVariant::PagedSdpaVectorGqaTwoPass512) => Some(512),
+        Some(MetalVariant::PagedSdpaVectorGqaTwoPass1024) => Some(1024),
         _ => None,
     }
 }
@@ -8637,7 +8641,9 @@ pub(super) fn variant_supported(
         MetalVariant::PagedSdpaVectorGqaTwoPass32
         | MetalVariant::PagedSdpaVectorGqaTwoPass64
         | MetalVariant::PagedSdpaVectorGqaTwoPass128
-        | MetalVariant::PagedSdpaVectorGqaTwoPass256 => {
+        | MetalVariant::PagedSdpaVectorGqaTwoPass256
+        | MetalVariant::PagedSdpaVectorGqaTwoPass512
+        | MetalVariant::PagedSdpaVectorGqaTwoPass1024 => {
             matches!(dispatch.op(), Op::PagedSdpa { .. })
         }
         MetalVariant::PagedSdpaSteel => paged_steel_sdpa_supported(dispatch)?,

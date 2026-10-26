@@ -57,6 +57,8 @@ pub(crate) enum MetalVariant {
     PagedSdpaVectorGqaTwoPass64,
     PagedSdpaVectorGqaTwoPass128,
     PagedSdpaVectorGqaTwoPass256,
+    PagedSdpaVectorGqaTwoPass512,
+    PagedSdpaVectorGqaTwoPass1024,
     PagedSdpaDecomposed,
     PagedSdpaSteel,
     PagedSdpaSteelHalf,
@@ -994,6 +996,24 @@ pub(crate) static REGISTRY: &[VariantDef<MetalVariant>] = &[
         &["Reuses each paged K/V load across grouped query heads with 256 reduction blocks."]
     ),
     batch_invariant_variant!(
+        "paged-sdpa.vector-gqa-two-pass-512",
+        PagedSdpa,
+        PagedSdpaVectorGqaTwoPass512,
+        PAGED_GQA_TWO_PASS,
+        &["long single-token paged decode with a supported query-to-K/V head ratio."],
+        &["unsupported grouped-query factors or shorter cache lengths."],
+        &["Reuses each paged K/V load across grouped query heads with 512 reduction blocks."]
+    ),
+    batch_invariant_variant!(
+        "paged-sdpa.vector-gqa-two-pass-1024",
+        PagedSdpa,
+        PagedSdpaVectorGqaTwoPass1024,
+        PAGED_GQA_TWO_PASS,
+        &["long single-token paged decode with a supported query-to-K/V head ratio."],
+        &["unsupported grouped-query factors or shorter cache lengths."],
+        &["Reuses each paged K/V load across grouped query heads with 1024 reduction blocks."]
+    ),
+    batch_invariant_variant!(
         "paged-sdpa.decomposed",
         PagedSdpa,
         PagedSdpaDecomposed,
@@ -1748,6 +1768,8 @@ mod tests {
                 "paged-sdpa.vector-gqa-two-pass",
                 "paged-sdpa.vector-gqa-two-pass-128",
                 "paged-sdpa.vector-gqa-two-pass-256",
+                "paged-sdpa.vector-gqa-two-pass-512",
+                "paged-sdpa.vector-gqa-two-pass-1024",
                 "paged-sdpa.decomposed",
                 "paged-sdpa.steel",
                 "paged-sdpa.steel-half",
@@ -2588,6 +2610,16 @@ mod tests {
             ),
             (
                 "paged-sdpa.vector-gqa-two-pass-256",
+                paged_sdpa_dispatch_with_heads(DType::F16, 8, 1, 128),
+                "paged_sdpa_2pass_1_gqa8_128",
+            ),
+            (
+                "paged-sdpa.vector-gqa-two-pass-512",
+                paged_sdpa_dispatch_with_heads(DType::F16, 8, 1, 128),
+                "paged_sdpa_2pass_1_gqa8_128",
+            ),
+            (
+                "paged-sdpa.vector-gqa-two-pass-1024",
                 paged_sdpa_dispatch_with_heads(DType::F16, 8, 1, 128),
                 "paged_sdpa_2pass_1_gqa8_128",
             ),
