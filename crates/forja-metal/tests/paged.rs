@@ -1671,3 +1671,40 @@ fn metal_paged_sdpa_microbenchmark() {
     }
     assert!(decode_regressions.is_empty(), "{decode_regressions:?}");
 }
+
+#[test]
+fn metal_paged_decode_profile_separates_partial_and_reduce_passes() {
+    let backend = forja_metal::MetalBackend::new().unwrap();
+    let (_, mut commands) = benchmark_commands(
+        &backend,
+        513,
+        1,
+        "sdpa.vector-two-pass-256",
+        "paged-sdpa.vector-gqa-two-pass-256",
+        false,
+        (32, 4),
+    );
+    let submission = backend
+        .submit_profiled_with_granularity(
+            commands(),
+            forja_metal::ProfileTimestampGranularity::Precise,
+        )
+        .unwrap();
+    submission.wait().unwrap();
+    let profile = submission.profile().unwrap();
+    let dispatch = &profile.per_dispatch[0];
+    assert_eq!(
+        dispatch
+            .internal
+            .iter()
+            .map(|p| p.kernel)
+            .collect::<Vec<_>>(),
+        ["paged_sdpa_2pass_1_gqa8_128", "paged_sdpa_2pass_2_128"]
+    );
+    let accounted = dispatch
+        .internal
+        .iter()
+        .map(|p| p.gpu_time)
+        .sum::<std::time::Duration>();
+    assert!(accounted.abs_diff(dispatch.gpu_time) <= std::time::Duration::from_nanos(2));
+}

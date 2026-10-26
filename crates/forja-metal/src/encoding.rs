@@ -3191,8 +3191,15 @@ impl MetalBackend {
                 self.encode_sdpa_dispatch(encoder, table, dispatch, bindings, arguments)?
             }
             Op::PagedSdpa { .. } => {
-                let (buffers, flag) =
-                    self.encode_paged_sdpa(encoder, table, dispatch, bindings, arguments)?;
+                let (buffers, flag) = self.encode_paged_sdpa(
+                    encoder,
+                    table,
+                    dispatch,
+                    bindings,
+                    arguments,
+                    timestamps,
+                    internal_timestamp,
+                )?;
                 error_flags.push(EncodedErrorFlag::new(flag, dispatch_index, "paged-sdpa"));
                 buffers
             }
@@ -3425,7 +3432,7 @@ impl MetalBackend {
         Ok(vec![ordinary_layout, params])
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
     fn encode_paged_sdpa(
         &self,
         encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
@@ -3433,6 +3440,8 @@ impl MetalBackend {
         dispatch: &Dispatch,
         bindings: &mut ArgumentBindings,
         arguments: &mut ArgumentWriter,
+        timestamps: Option<&GpuTimestamps>,
+        internal_timestamp: &mut usize,
     ) -> Result<(Vec<BufferBinding>, BufferBinding), BackendError> {
         let Op::PagedSdpa {
             scale,
@@ -3484,13 +3493,7 @@ impl MetalBackend {
             .shape()
             .try_into()
             .map_err(|_| BackendError::InvalidInput)?;
-        let gqa_blocks = match selected_variant(dispatch) {
-            Some(MetalVariant::PagedSdpaVectorGqaTwoPass32) => Some(32),
-            Some(MetalVariant::PagedSdpaVectorGqaTwoPass64) => Some(64),
-            Some(MetalVariant::PagedSdpaVectorGqaTwoPass128) => Some(128),
-            Some(MetalVariant::PagedSdpaVectorGqaTwoPass256) => Some(256),
-            _ => None,
-        };
+        let gqa_blocks = paged_gqa_blocks(selected_variant(dispatch));
         let mut params = Vec::with_capacity(128);
         params.extend_from_slice(&scale.to_ne_bytes());
         for value in [
@@ -3767,6 +3770,7 @@ impl MetalBackend {
                 },
             );
             encode_dispatch_barrier(encoder);
+            write_internal_timestamp(encoder, timestamps, internal_timestamp)?;
             let second = self
                 .pipelines
                 .lock()
@@ -8011,7 +8015,17 @@ fn dispatch_profile(dispatch: &Dispatch, barrier: bool) -> Result<DispatchProfil
     })
 }
 
-fn internal_dispatch_names(dispatch: &Dispatch) -> &'static [&'static str] {
+fn internal_dispatch_names(dispatch: &Dispatch) -> Vec<&'static str> {
+    if matches!(dispatch.op(), Op::PagedSdpa { .. })
+        && paged_gqa_blocks(selected_variant(dispatch)).is_some()
+        && let Ok(first) = dispatch_kernel(dispatch)
+    {
+        return vec![first, "paged_sdpa_2pass_2_128"];
+    }
+    internal_gather_dispatch_names(dispatch).to_vec()
+}
+
+fn internal_gather_dispatch_names(dispatch: &Dispatch) -> &'static [&'static str] {
     if !matches!(dispatch.op(), Op::GatherQuantMatmul { .. }) || !grouped_gather_dispatch(dispatch)
     {
         return &[];
@@ -8272,6 +8286,16 @@ fn paged_sdpa_kernel(dispatch: &Dispatch, width: u32) -> Result<&'static str, Ba
         (_, 64) => Ok("paged_sdpa_64"),
         (_, 128) => Ok("paged_sdpa_128"),
         _ => Err(BackendError::UnsupportedOperation),
+    }
+}
+
+fn paged_gqa_blocks(variant: Option<MetalVariant>) -> Option<u32> {
+    match variant {
+        Some(MetalVariant::PagedSdpaVectorGqaTwoPass32) => Some(32),
+        Some(MetalVariant::PagedSdpaVectorGqaTwoPass64) => Some(64),
+        Some(MetalVariant::PagedSdpaVectorGqaTwoPass128) => Some(128),
+        Some(MetalVariant::PagedSdpaVectorGqaTwoPass256) => Some(256),
+        _ => None,
     }
 }
 
