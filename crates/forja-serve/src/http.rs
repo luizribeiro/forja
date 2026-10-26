@@ -2766,6 +2766,7 @@ mod tests {
             info,
             max_context,
             16,
+            16,
             crate::PrefixIdentity::new(["engine", "profile", "weights", "tokenizer", "chat"])?,
         )?;
         if let Some(barrier) = barrier {

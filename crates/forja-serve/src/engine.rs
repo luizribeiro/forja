@@ -622,6 +622,8 @@ struct SchedulerConfig {
     max_prefill_chunks: u32,
     prompt_token_budget: u32,
     profile_prompt_budget: u32,
+    profile_prefill_chunk: u32,
+    idle_prompt_token_budget: u32,
     decode_buckets: Vec<u32>,
 }
 
@@ -630,6 +632,7 @@ impl SchedulerConfig {
         info: &EngineInfo,
         config: &HostConfig,
         profile_budget: u32,
+        profile_prefill_chunk: u32,
     ) -> Result<Self, GenerationError> {
         let Some(serving) = info.serving.as_ref() else {
             return Ok(Self {
@@ -637,12 +640,14 @@ impl SchedulerConfig {
                 max_prefill_chunks: 1,
                 prompt_token_budget: 1,
                 profile_prompt_budget: profile_budget,
+                profile_prefill_chunk,
+                idle_prompt_token_budget: 1,
                 decode_buckets: vec![1],
             });
         };
-        if profile_budget == 0 {
+        if profile_budget == 0 || profile_prefill_chunk == 0 {
             return Err(GenerationError::new(
-                "profile prompt budget must be positive",
+                "profile prompt limits must be positive",
             ));
         }
         let configured_active = resolve_u32_ceiling(
@@ -676,8 +681,27 @@ impl SchedulerConfig {
             .collect::<Vec<_>>();
         let (active_lanes, decode_buckets) =
             scheduler_decode_buckets(declared_buckets, configured_lanes);
-        let prompt_token_budget =
-            profile_budget.min(u32::try_from(configured_prompt).unwrap_or(u32::MAX));
+        let largest_prompt_chunk = serving
+            .batch_shapes
+            .iter()
+            .filter(|shape| {
+                shape.phase == BatchPhase::Prompt
+                    && shape.bucket == 1
+                    && shape.selection == BatchSelection::Combined
+            })
+            .map(|shape| shape.tokens)
+            .max()
+            .unwrap_or(profile_prefill_chunk);
+        let prompt_token_budget = profile_budget
+            .min(u32::try_from(configured_prompt).unwrap_or(u32::MAX))
+            .min(largest_prompt_chunk);
+        let idle_prompt_token_budget = u32::try_from(resolve_u64_ceiling(
+            config.serving.idle_prompt_token_budget,
+            u64::from(profile_prefill_chunk),
+            "serving.idle_prompt_token_budget",
+        )?)
+        .unwrap_or(u32::MAX)
+        .min(largest_prompt_chunk);
         if !decode_buckets.is_empty() {
             crate::scheduler::SchedulerPolicy::new(
                 decode_buckets.clone(),
@@ -692,6 +716,8 @@ impl SchedulerConfig {
             max_prefill_chunks,
             prompt_token_budget,
             profile_prompt_budget: profile_budget,
+            profile_prefill_chunk,
+            idle_prompt_token_budget,
             decode_buckets,
         })
     }
@@ -797,6 +823,7 @@ where
         info: EngineInfo,
         max_context: u32,
         profile_prompt_budget: u32,
+        profile_prefill_chunk: u32,
         prefix_identity: PrefixIdentity,
     ) -> Result<Self, GenerationError> {
         if tokenizer
@@ -822,7 +849,8 @@ where
                 PrefixIndex::new(limits).map_err(|error| GenerationError::new(error.to_string()))
             })
             .transpose()?;
-        let scheduler = SchedulerConfig::resolve(&info, &config, profile_prompt_budget)?;
+        let scheduler =
+            SchedulerConfig::resolve(&info, &config, profile_prompt_budget, profile_prefill_chunk)?;
         Ok(Self {
             model,
             runner,
@@ -871,8 +899,12 @@ where
         generation: u64,
         config: HostConfig,
     ) -> Result<(), GenerationError> {
-        let scheduler =
-            SchedulerConfig::resolve(&self.info, &config, self.scheduler.profile_prompt_budget)?;
+        let scheduler = SchedulerConfig::resolve(
+            &self.info,
+            &config,
+            self.scheduler.profile_prompt_budget,
+            self.scheduler.profile_prefill_chunk,
+        )?;
         if let (Some(serving), Some(index)) = (&self.info.serving, &mut self.prefix_index) {
             let limits = prefix_limits(serving, &config, self.max_context)?;
             index
@@ -2502,14 +2534,42 @@ mod tests {
         config.serving.max_batch_size = Choice::Fixed(std::num::NonZeroU32::new(2).unwrap());
         config.serving.max_prefill_chunks = Choice::Fixed(std::num::NonZeroU32::new(1).unwrap());
         config.serving.prompt_token_budget = Choice::Fixed(std::num::NonZeroU64::new(64).unwrap());
-        let resolved = SchedulerConfig::resolve(&info, &config, 128).unwrap();
+        config.serving.idle_prompt_token_budget =
+            Choice::Fixed(std::num::NonZeroU64::new(1024).unwrap());
+        let resolved = SchedulerConfig::resolve(&info, &config, 128, 2048).unwrap();
         assert_eq!(resolved.active_lanes, 2);
         assert_eq!(resolved.max_prefill_chunks, 1);
         assert_eq!(resolved.prompt_token_budget, 64);
+        assert_eq!(resolved.idle_prompt_token_budget, 1024);
+        let mut smaller = info.clone();
+        smaller
+            .serving
+            .as_mut()
+            .unwrap()
+            .batch_shapes
+            .push(forja_host::BatchShape {
+                phase: BatchPhase::Prompt,
+                bucket: 1,
+                tokens: 32,
+                selection: BatchSelection::Combined,
+            });
+        let capped = SchedulerConfig::resolve(&smaller, &config, 128, 2048).unwrap();
+        assert_eq!(
+            (capped.prompt_token_budget, capped.idle_prompt_token_budget),
+            (32, 32)
+        );
 
+        config.serving.idle_prompt_token_budget =
+            Choice::Fixed(std::num::NonZeroU64::new(2049).unwrap());
+        assert!(
+            SchedulerConfig::resolve(&info, &config, 128, 2048)
+                .unwrap_err()
+                .to_string()
+                .contains("serving.idle_prompt_token_budget")
+        );
         config.serving.max_active_sequences = Choice::Fixed(std::num::NonZeroU32::new(9).unwrap());
         assert!(
-            SchedulerConfig::resolve(&info, &config, 128)
+            SchedulerConfig::resolve(&info, &config, 128, 2048)
                 .unwrap_err()
                 .to_string()
                 .contains("serving.max_active_sequences")

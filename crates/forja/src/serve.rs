@@ -294,6 +294,7 @@ where
         profile
             .serving()
             .map_or(1, |serving| serving.prompt_token_budget.get()),
+        profile.workload().prefill_chunk.get(),
         identity,
     )
     .map_err(|error| error.to_string())?;
@@ -928,6 +929,7 @@ mod tests {
             profile
                 .serving()
                 .map_or(1, |serving| serving.prompt_token_budget.get()),
+            profile.workload().prefill_chunk.get(),
             identity,
         )?)
     }
@@ -1033,6 +1035,7 @@ mod tests {
             profile
                 .serving()
                 .map_or(1, |serving| serving.prompt_token_budget.get()),
+            profile.workload().prefill_chunk.get(),
             identity,
         )?)
     }

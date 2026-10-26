@@ -91,6 +91,7 @@ pub const HOST_LEAVES: &[(&str, ReloadClass)] = &[
     ("serving.max_batch_size", ReloadClass::Live),
     ("serving.max_prefill_chunks", ReloadClass::Live),
     ("serving.prompt_token_budget", ReloadClass::Live),
+    ("serving.idle_prompt_token_budget", ReloadClass::Live),
     ("serving.prefix_cache_entries", ReloadClass::Live),
     ("serving.prefix_cache_tokens", ReloadClass::Live),
     ("serving.prefix_cache_pages", ReloadClass::Live),

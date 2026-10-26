@@ -313,7 +313,7 @@ pub struct Workload {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 pub struct Serving {
-    /// Maximum prompt tokens scheduled in one iteration.
+    /// Prompt-token budget while any sequence is decoding.
     pub prompt_token_budget: NonZeroU32,
     /// Whether this profile selects host-owned paged cache storage.
     #[serde(skip_serializing_if = "std::ops::Not::not")]

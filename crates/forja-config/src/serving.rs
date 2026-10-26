@@ -101,8 +101,10 @@ pub struct Serving {
     pub max_batch_size: Choice<NonZeroU32>,
     /// Maximum prompt chunks admitted together.
     pub max_prefill_chunks: Choice<NonZeroU32>,
-    /// Maximum aggregate prompt tokens admitted together.
+    /// Aggregate prompt-token ceiling while any sequence decodes.
     pub prompt_token_budget: Choice<NonZeroU64>,
+    /// Aggregate prompt-token ceiling while no sequence decodes.
+    pub idle_prompt_token_budget: Choice<NonZeroU64>,
     /// Maximum reusable prefix records.
     pub prefix_cache_entries: Choice<NonZeroU32>,
     /// Maximum tokens retained by reusable prefixes.
@@ -122,6 +124,7 @@ impl Default for Serving {
             max_batch_size: Choice::Auto,
             max_prefill_chunks: Choice::Auto,
             prompt_token_budget: Choice::Auto,
+            idle_prompt_token_budget: Choice::Auto,
             prefix_cache_entries: Choice::Auto,
             prefix_cache_tokens: Choice::Auto,
             prefix_cache_pages: Choice::Auto,
