@@ -1,8 +1,8 @@
 # Qwen3
 
-Forja's dense Qwen3 engine currently targets Qwen3-0.6B on Metal for Apple M3 Ultra. Profiles are
-provided for f32 and bf16 activations and weights, with a 4096-token context and 512-token prefill
-chunks.
+Forja's dense Qwen3 engine currently targets Qwen3-0.6B on Metal for Apple M3 Ultra. The engine
+supports the model's native 40960-token maximum. The shipped f32 and bf16 profiles declare a
+4096-token context and use 512-token prefill chunks.
 
 ```console
 forja build qwen3-0.6b.metal-apple-m3-ultra.bf16

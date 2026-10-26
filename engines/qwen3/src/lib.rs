@@ -30,7 +30,7 @@ pub const HIDDEN: u32 = 1_024;
 /// Number of decoder layers.
 pub const LAYERS: usize = 28;
 /// Largest context supported by the model architecture.
-pub const MAX_SUPPORTED_CONTEXT: u32 = 4_096;
+pub const MAX_SUPPORTED_CONTEXT: u32 = 40_960;
 
 const QUERY_HEADS: u32 = 16;
 const KEY_VALUE_HEADS: u32 = 8;
