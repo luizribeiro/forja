@@ -238,6 +238,26 @@ where
         prefill: &mut PendingPrefill,
         budget: u32,
     ) -> Result<bool, GenerationError> {
+        let piece = self
+            .scheduler
+            .prompt_token_budget
+            .min(self.scheduler.idle_prompt_token_budget);
+        let mut remaining = budget;
+        while remaining > 0 {
+            let count = remaining.min(piece);
+            if self.advance_batch_prefill_piece(prefill, count).await? {
+                return Ok(true);
+            }
+            remaining -= count;
+        }
+        Ok(false)
+    }
+
+    async fn advance_batch_prefill_piece(
+        &mut self,
+        prefill: &mut PendingPrefill,
+        budget: u32,
+    ) -> Result<bool, GenerationError> {
         let remaining = prefill
             .request
             .tokens

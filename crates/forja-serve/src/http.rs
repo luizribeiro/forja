@@ -2724,6 +2724,18 @@ mod tests {
         (crate::ServingEngine<forja_cpu::CpuBackend>, TestWeights),
         Box<dyn Error + Send + Sync>,
     > {
+        continuous_engine_with_prompt_limits(barrier, max_context, 16, 16).await
+    }
+
+    async fn continuous_engine_with_prompt_limits(
+        barrier: Option<Arc<crate::engine::BatchTestBarrier>>,
+        max_context: u32,
+        budget: u32,
+        chunk: u32,
+    ) -> Result<
+        (crate::ServingEngine<forja_cpu::CpuBackend>, TestWeights),
+        Box<dyn Error + Send + Sync>,
+    > {
         let weights = test_weights()?;
         let mut runner = EngineRunner::new(
             test_guests::engine_smoke(),
@@ -2765,8 +2777,8 @@ mod tests {
             config,
             info,
             max_context,
-            16,
-            16,
+            budget,
+            chunk,
             crate::PrefixIdentity::new(["engine", "profile", "weights", "tokenizer", "chat"])?,
         )?;
         if let Some(barrier) = barrier {
@@ -2901,6 +2913,55 @@ mod tests {
         assert!(cancelled.await.unwrap().is_err());
         assert_serial(&survivor.await.unwrap().unwrap(), &expected);
         assert!(replacement.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn decode_joining_prefill_limits_work_between_tokens() {
+        let short_expected = serial_output("b", 7).await;
+        let long_prompt = "a".repeat(21);
+        let long_expected = serial_output(&long_prompt, 2).await;
+        let barrier = Arc::new(crate::engine::BatchTestBarrier::prefill_race());
+        let (engine, _weights) =
+            continuous_engine_with_prompt_limits(Some(Arc::clone(&barrier)), 32, 2, 4)
+                .await
+                .unwrap();
+        let actor = ServiceActor::spawn(engine, 16);
+        let long = actor
+            .complete_text(
+                text_request(&long_prompt, 2),
+                GenerationControl::new(Duration::from_secs(2)),
+            )
+            .unwrap();
+        barrier.reached().await;
+        let short = actor
+            .complete_text(
+                text_request("b", 7),
+                GenerationControl::new(Duration::from_secs(2)),
+            )
+            .unwrap();
+        let released_round = barrier.idle_rounds();
+        barrier.release();
+        assert_serial(&short.await.unwrap().unwrap(), &short_expected);
+        assert_serial(&long.await.unwrap().unwrap(), &long_expected);
+        let trace = barrier.prompt_trace();
+        let requests = barrier.request_trace();
+        let short_rounds = requests
+            .iter()
+            .filter(|&&(id, _, _)| id == crate::scheduler::RequestId(1))
+            .collect::<Vec<_>>();
+        assert_eq!(short_rounds.len(), 2);
+        for &&(_, _, round) in &short_rounds {
+            assert!(round - released_round <= 1, "{requests:?} {trace:?}");
+        }
+        assert_eq!(trace[0], (4, false, 0));
+        let mut work = std::collections::BTreeMap::new();
+        for &(budget, decoding, batch) in &trace {
+            if decoding {
+                *work.entry(batch).or_insert(0_u32) += budget;
+            }
+        }
+        assert!(!work.is_empty(), "{trace:?}");
+        assert!(work.values().all(|&tokens| tokens <= 2));
     }
 
     #[tokio::test]

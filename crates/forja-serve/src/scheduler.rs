@@ -20,6 +20,8 @@ pub(crate) struct SchedulerPolicy {
     active_limit: usize,
     prefill_limit: usize,
     prompt_budget: u32,
+    idle_prompt_budget: u32,
+    prompt_chunking: forja_host::PromptChunking,
     last_prompt: Option<RequestId>,
     active: usize,
 }
@@ -29,6 +31,7 @@ impl SchedulerPolicy {
         active_limit: usize,
         prefill_limit: usize,
         prompt_budget: u32,
+        idle_prompt_budget: u32,
     ) -> Result<Self, &'static str> {
         buckets.sort_unstable();
         buckets.dedup();
@@ -41,9 +44,11 @@ impl SchedulerPolicy {
         {
             return Err("decode buckets must span the active-lane ceiling");
         }
-        if prefill_limit == 0 || prompt_budget == 0 {
+        if prefill_limit == 0 || prompt_budget == 0 || idle_prompt_budget == 0 {
             return Err("prefill limits must be positive");
         }
+        let piece = std::num::NonZeroU32::new(prompt_budget.min(idle_prompt_budget))
+            .ok_or("prefill limits must be positive")?;
         Ok(Self {
             queue: VecDeque::new(),
             prompt: BTreeMap::new(),
@@ -51,6 +56,8 @@ impl SchedulerPolicy {
             active_limit,
             prefill_limit,
             prompt_budget,
+            idle_prompt_budget,
+            prompt_chunking: forja_host::PromptChunking::new(piece),
             last_prompt: None,
             active: 0,
         })
@@ -135,8 +142,12 @@ impl SchedulerPolicy {
         self.prompt.insert(id, tokens);
     }
 
-    pub(crate) fn prompt_batch(&mut self) -> Vec<(RequestId, u32)> {
-        let mut remaining = self.prompt_budget;
+    pub(crate) fn prompt_batch(&mut self, decoding: bool) -> Vec<(RequestId, u32)> {
+        let mut remaining = if decoding {
+            self.prompt_budget
+        } else {
+            self.idle_prompt_budget
+        };
         let mut ids = self.prompt.keys().copied().collect::<Vec<_>>();
         if let Some(last) = self.last_prompt {
             let next = ids.partition_point(|&id| id <= last);
@@ -150,7 +161,7 @@ impl SchedulerPolicy {
             let Some(tokens) = self.prompt.get(&id).copied() else {
                 continue;
             };
-            let spend = tokens.min(remaining);
+            let spend = self.prompt_chunking.work(tokens, remaining);
             if spend == 0 {
                 break;
             }
@@ -173,7 +184,7 @@ mod tests {
 
     #[test]
     fn admits_fifo_with_bounded_smaller_request_bypass() {
-        let mut policy = SchedulerPolicy::new(vec![1, 2, 4, 8], 8, 8, 2_048).unwrap();
+        let mut policy = SchedulerPolicy::new(vec![1, 2, 4, 8], 8, 8, 2_048, 2_048).unwrap();
         policy.enqueue(Admission {
             id: RequestId(1),
             reserved_tokens: 4_096,
@@ -206,29 +217,36 @@ mod tests {
 
     #[test]
     fn caps_prompt_work_and_selects_decode_buckets() {
-        let mut policy = SchedulerPolicy::new(vec![1, 2, 4, 8], 8, 1, 2_048).unwrap();
+        let mut policy = SchedulerPolicy::new(vec![1, 2, 4, 8], 8, 1, 2_048, 2_048).unwrap();
         policy.ready_prompt(RequestId(7), 2_000);
         policy.ready_prompt(RequestId(8), 1_000);
-        assert_eq!(policy.prompt_batch(), [(RequestId(7), 2_000)]);
+        assert_eq!(policy.prompt_batch(true), [(RequestId(7), 2_000)]);
         assert_eq!(policy.decode_bucket([0, 2]), Some(4));
     }
 
     #[test]
     fn rotates_prompt_work_so_a_short_arrival_can_start_decoding() {
-        let mut policy = SchedulerPolicy::new(vec![1, 2], 2, 2, 4).unwrap();
+        let mut policy = SchedulerPolicy::new(vec![1, 2], 2, 2, 4, 4).unwrap();
         policy.ready_prompt(RequestId(1), 33);
-        assert_eq!(policy.prompt_batch(), [(RequestId(1), 4)]);
+        assert_eq!(policy.prompt_batch(true), [(RequestId(1), 4)]);
         policy.ready_prompt(RequestId(2), 1);
-        assert_eq!(
-            policy.prompt_batch(),
-            [(RequestId(2), 1), (RequestId(1), 3)]
-        );
-        assert_eq!(policy.prompt_batch(), [(RequestId(1), 4)]);
+        assert_eq!(policy.prompt_batch(true), [(RequestId(2), 1)]);
+        assert_eq!(policy.prompt_batch(true), [(RequestId(1), 4)]);
+    }
+
+    #[test]
+    fn uses_full_prompt_chunks_only_while_no_sequence_decodes() {
+        assert!(SchedulerPolicy::new(vec![1], 1, 1, 1, 0).is_err());
+        let mut policy = SchedulerPolicy::new(vec![1, 2], 2, 2, 512, 2048).unwrap();
+        policy.ready_prompt(RequestId(1), 4097);
+        assert_eq!(policy.prompt_batch(false), [(RequestId(1), 2048)]);
+        assert_eq!(policy.prompt_batch(true), [(RequestId(1), 512)]);
+        assert_eq!(policy.prompt_batch(false), [(RequestId(1), 1537)]);
     }
 
     #[test]
     fn transient_admission_retry_keeps_the_request_at_the_head() {
-        let mut policy = SchedulerPolicy::new(vec![1, 2], 2, 2, 16).unwrap();
+        let mut policy = SchedulerPolicy::new(vec![1, 2], 2, 2, 16, 16).unwrap();
         let first = Admission {
             id: RequestId(1),
             reserved_tokens: 8,

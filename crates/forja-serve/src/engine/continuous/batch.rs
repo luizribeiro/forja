@@ -71,9 +71,8 @@ where
             self.scheduler.decode_buckets.clone(),
             usize::try_from(self.scheduler.active_lanes).unwrap_or(usize::MAX),
             usize::try_from(self.scheduler.max_prefill_chunks).unwrap_or(usize::MAX),
-            self.scheduler
-                .prompt_token_budget
-                .min(self.scheduler.idle_prompt_token_budget),
+            self.scheduler.prompt_token_budget,
+            self.scheduler.idle_prompt_token_budget,
         ) else {
             return;
         };
@@ -95,7 +94,10 @@ where
                     &mut next_id,
                 )
                 .await;
-                if active.iter().all(BatchLane::is_constrained) && !prefilling.is_empty() {
+                if !active.is_empty()
+                    && active.iter().all(BatchLane::is_constrained)
+                    && !prefilling.is_empty()
+                {
                     self.advance_prefills(&mut prefilling, &mut active, &mut current, &mut policy)
                         .await;
                 }
@@ -222,6 +224,12 @@ where
                     continue;
                 }
             };
+            #[cfg(test)]
+            if let Some(barrier) = &self.batch_test_barrier {
+                barrier
+                    .decoded_batches
+                    .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            }
             self.apply_batch_tokens(
                 batch.lanes,
                 batch.deferred_retirements,
@@ -817,6 +825,8 @@ where
             };
             match self.begin_batch_prefill(prepared, slot).await {
                 Ok(prefill) => {
+                    #[cfg(test)]
+                    self.trace_request(id, false);
                     policy.ready_prompt(id, prefill.remaining());
                     prefilling.insert(id, prefill);
                 }
@@ -846,7 +856,12 @@ where
         policy: &mut SchedulerPolicy,
     ) {
         let mut completed = Vec::new();
-        for (id, budget) in policy.prompt_batch() {
+        let decoding = !active.is_empty();
+        #[cfg(test)]
+        self.trace_prompt_round(decoding);
+        for (id, budget) in policy.prompt_batch(decoding) {
+            #[cfg(test)]
+            self.trace_prompt_work(budget, decoding);
             let Some(mut prefill) = prefilling.remove(&id) else {
                 continue;
             };
@@ -866,6 +881,10 @@ where
                     self.fail_batch_prefill(prefill, error);
                 }
             }
+        }
+        #[cfg(test)]
+        if let Some(barrier) = &self.batch_test_barrier {
+            barrier.pause_prefill_once().await;
         }
         let (submitted_slots, submission) = {
             let ordinary = active
@@ -911,7 +930,10 @@ where
                 return;
             }
         }
-        for (_, mut lane) in completed {
+        for (id, mut lane) in completed {
+            #[cfg(test)]
+            self.trace_request(id, true);
+            let _ = id;
             match lane
                 .accept(
                     lane.pending_token,

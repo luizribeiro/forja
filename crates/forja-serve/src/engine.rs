@@ -466,6 +466,27 @@ pub struct ServingEngine<B: Backend + Send + Sync + 'static> {
 }
 
 impl<B: Backend + Send + Sync + 'static> ServingEngine<B> {
+    #[cfg(test)]
+    fn trace_request(&self, id: crate::scheduler::RequestId, first_token: bool) {
+        if let Some(barrier) = &self.batch_test_barrier {
+            barrier.note_request(id, first_token);
+        }
+    }
+
+    #[cfg(test)]
+    fn trace_prompt_work(&self, budget: u32, decoding: bool) {
+        if let Some(barrier) = &self.batch_test_barrier {
+            barrier.note_prompt(budget, decoding);
+        }
+    }
+
+    #[cfg(test)]
+    fn trace_prompt_round(&self, decoding: bool) {
+        if !decoding && let Some(barrier) = &self.batch_test_barrier {
+            barrier.idle_rounds.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
     pub(crate) fn wait_for_quiescence(
         &self,
     ) -> impl Future<Output = Result<(), forja_core::BackendError>> + Send + 'static {
@@ -479,6 +500,11 @@ pub(crate) struct BatchTestBarrier {
     admission_overlapped: AtomicBool,
     retirement_drained: AtomicBool,
     prefill_overlap_width: AtomicU64,
+    pause_prefill: AtomicBool,
+    decoded_batches: AtomicU64,
+    idle_rounds: AtomicU64,
+    prompt_trace: StdMutex<Vec<(u32, bool, u64)>>,
+    request_trace: StdMutex<Vec<(crate::scheduler::RequestId, bool, u64)>>,
     deferred_fallthroughs: AtomicU64,
     reached: Notify,
     resume: Notify,
@@ -506,6 +532,11 @@ impl BatchTestBarrier {
             admission_overlapped: AtomicBool::new(false),
             retirement_drained: AtomicBool::new(false),
             prefill_overlap_width: AtomicU64::new(0),
+            pause_prefill: AtomicBool::new(false),
+            decoded_batches: AtomicU64::new(0),
+            idle_rounds: AtomicU64::new(0),
+            prompt_trace: StdMutex::new(Vec::new()),
+            request_trace: StdMutex::new(Vec::new()),
             deferred_fallthroughs: AtomicU64::new(0),
             reached: Notify::const_new(),
             resume: Notify::const_new(),
@@ -515,6 +546,45 @@ impl BatchTestBarrier {
             cancel_on_batch: StdMutex::new(None),
             refuse_release: AtomicBool::new(false),
             refuse_bind: AtomicBool::new(false),
+        }
+    }
+
+    pub(crate) fn prefill_race() -> Self {
+        let barrier = Self::new();
+        barrier.pause_prefill.store(true, Ordering::Release);
+        barrier
+    }
+
+    pub(crate) fn prompt_trace(&self) -> Vec<(u32, bool, u64)> {
+        self.prompt_trace.lock().unwrap().clone()
+    }
+
+    pub(crate) fn request_trace(&self) -> Vec<(crate::scheduler::RequestId, bool, u64)> {
+        self.request_trace.lock().unwrap().clone()
+    }
+
+    pub(crate) fn idle_rounds(&self) -> u64 {
+        self.idle_rounds.load(Ordering::Acquire)
+    }
+
+    fn note_request(&self, id: crate::scheduler::RequestId, first_token: bool) {
+        self.request_trace
+            .lock()
+            .unwrap()
+            .push((id, first_token, self.idle_rounds()));
+    }
+
+    fn note_prompt(&self, budget: u32, decoding: bool) {
+        self.prompt_trace.lock().unwrap().push((
+            budget,
+            decoding,
+            self.decoded_batches.load(Ordering::Acquire),
+        ));
+    }
+
+    async fn pause_prefill_once(&self) {
+        if self.pause_prefill.swap(false, Ordering::AcqRel) {
+            self.pause_once().await;
         }
     }
 
@@ -708,6 +778,7 @@ impl SchedulerConfig {
                 usize::try_from(active_lanes).unwrap_or(usize::MAX),
                 usize::try_from(max_prefill_chunks).unwrap_or(usize::MAX),
                 prompt_token_budget,
+                idle_prompt_token_budget,
             )
             .map_err(GenerationError::new)?;
         }
