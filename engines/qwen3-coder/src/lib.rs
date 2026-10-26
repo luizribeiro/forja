@@ -60,7 +60,7 @@ pub const HIDDEN: u32 = 2_048;
 /// Number of decoder layers in the full model.
 pub const LAYERS: usize = 48;
 /// Largest context supported by the model architecture.
-pub const MAX_SUPPORTED_CONTEXT: u32 = 32_768;
+pub const MAX_SUPPORTED_CONTEXT: u32 = 262_144;
 #[cfg(any(target_family = "wasm", test))]
 const PREFILL_CHUNK: u32 = 2_048;
 #[cfg(any(target_family = "wasm", test))]
