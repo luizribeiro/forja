@@ -1,0 +1,104 @@
+schema-version = 1
+family = "qwen3-coder"
+
+[model]
+id = "mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit"
+revision = "6e302ea604ad9ab206367e2c501d1571023e7b6d"
+weights-sha256 = "sha256:2f0797714404ba75a18599829d8ab96e316ef0088aa6f49e7cb7eb301043f5ec"
+chat-template-sha256 = "sha256:672e747c77e990320152343b0a4951222e40de5645297905d89afba05586d827"
+generation-config-sha256 = "sha256:c99723ab3ba28630d26ae23def77603b540a46924895af5cf234740d3b27b51d"
+
+[target]
+component = "wasm32-wasip2"
+backend = "metal"
+device-family = "apple-m3-ultra"
+
+[chat]
+tool-format = "qwen3-coder-xml"
+tool-format-options = {}
+
+[numerics]
+activations = "bf16"
+weights = "q4"
+kv-cache = "f16"
+
+[workload]
+kind = "causal-lm"
+batch = 1
+max-context = 131072
+prefill-chunk = 2048
+
+[serving]
+prompt-token-budget = 512
+paged-cache = true
+
+[variants.fixed]
+"quant.decode-q4" = "quant-matmul.gemv-n2"
+"quant.decode-q8" = "quant-matmul.q8-fast-gemv-n2"
+"quant.decode-b2-q4" = "quant-matmul.row-gemv"
+"quant.decode-b2-q8" = "quant-matmul.q8-fast-gemv"
+"quant.decode-b4-q4" = "quant-matmul.row-gemv"
+"quant.decode-b4-q8" = "quant-matmul.q8-fast-gemv"
+"quant.decode-b8-q4" = "quant-matmul.row-gemv"
+"quant.decode-b8-q8" = "quant-matmul.q8-fast-gemv"
+"quant.prefill-small" = "quant-matmul.small-m"
+"quant.prefill-tiled" = "quant-matmul.tiled"
+"gather-quant-matmul.small" = "gather-quant-matmul.route-gemv"
+"gather-quant-matmul.grouped-small-m" = "gather-quant-matmul.grouped-small-m"
+"gather-quant-matmul.grouped" = "gather-quant-matmul.grouped-32x32-2x2-blocked"
+"gather-quant-matmul.batch-2" = "gather-quant-matmul.route-gemv"
+"gather-quant-matmul.batch-4" = "gather-quant-matmul.route-gemv"
+"gather-quant-matmul.batch-8" = "gather-quant-matmul.route-gemv"
+"moe.gate-up.small" = "gather-quant-matmul.route-gemv"
+"moe.gate-up.grouped-small-m" = "gather-quant-matmul.grouped-pair-small-m"
+"moe.gate-up.grouped" = "gather-quant-matmul.grouped-pair-32x32-2x2-blocked"
+"moe.gate-up.batch-2" = "gather-quant-matmul.route-gemv"
+"moe.gate-up.batch-4" = "gather-quant-matmul.route-gemv"
+"moe.gate-up.batch-8" = "gather-quant-matmul.route-gemv"
+"moe.down-combine" = "gather-quant-matmul.route-gemv"
+"moe.combine-small" = "matmul.steel-64x32x32-2x2"
+"moe.combine-large" = "matmul.column-gemv"
+"top-k" = "top-k.single-k8"
+"sample" = "sample.parallel"
+"attention.prefill-small" = "sdpa.decomposed"
+"paged-attention.prefill-small" = "paged-sdpa.steel-half"
+"paged-attention.prefill-tiny" = "paged-sdpa.vector"
+
+[variants.rules."paged-attention.prefill-large"]
+parameter = "position"
+arms = [
+  { lo = 0, hi = 2047, name = "paged-sdpa.steel-half-32x16" },
+  { lo = 2048, hi = 131071, name = "paged-sdpa.steel-half-64x16" },
+]
+
+[variants.rules."attention.decode"]
+parameter = "position"
+arms = [
+  { lo = 0, hi = 510, name = "sdpa.decomposed" },
+  { lo = 511, hi = 1022, name = "sdpa.vector-gqa-two-pass-32" },
+  { lo = 1023, hi = 3071, name = "sdpa.vector-gqa-two-pass" },
+  { lo = 3072, hi = 8191, name = "sdpa.vector-gqa-two-pass-128" },
+  { lo = 8192, hi = 131071, name = "sdpa.vector-gqa-two-pass-256" },
+]
+
+[variants.rules."paged-attention.decode"]
+parameter = "position"
+arms = [
+  { lo = 0, hi = 510, name = "paged-sdpa.vector" },
+  { lo = 511, hi = 1022, name = "paged-sdpa.vector-gqa-two-pass-32" },
+  { lo = 1023, hi = 3071, name = "paged-sdpa.vector-gqa-two-pass" },
+  { lo = 3072, hi = 8191, name = "paged-sdpa.vector-gqa-two-pass-128" },
+  { lo = 8192, hi = 131071, name = "paged-sdpa.vector-gqa-two-pass-256" },
+]
+
+[variants.rules."attention.prefill-large"]
+parameter = "position"
+arms = [{ lo = 0, hi = 131071, name = "sdpa.steel-half" }]
+
+[quantization]
+scheme = "mlx-affine"
+default-bits = 4
+group-size = 64
+
+[quantization.overrides."model.layers.*.mlp.gate"]
+bits = 8

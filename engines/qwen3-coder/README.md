@@ -2,7 +2,8 @@
 
 Forja's Qwen3-Coder engine targets Qwen3-Coder-30B-A3B-Instruct with affine four-bit weights and
 q8 router gates on Metal for Apple M3 Ultra. The engine supports the model's native 262144-token
-maximum; both shipped profiles declare a 32768-token context. Prompts use 2048-token chunks with
+maximum. The standard and exact-cache profiles declare 32768 tokens; the long-context profile
+declares 131072. Prompts use 2048-token chunks with
 exact remainders capped at 16 tokens. The planner retains at most one full-chunk and one exact-tail
 graph.
 
@@ -17,6 +18,9 @@ otherwise use the default f16 profile for its lower memory use and better long-c
 forja build qwen3-coder-30b-a3b-instruct-4bit.metal-apple-m3-ultra.q4
 forja verify --engine qwen3-coder-30b-a3b-instruct-4bit.metal-apple-m3-ultra.q4
 forja bench --engine qwen3-coder-30b-a3b-instruct-4bit.metal-apple-m3-ultra.q4 --against
+
+forja build qwen3-coder-30b-a3b-instruct-4bit.metal-apple-m3-ultra.q4.long-context
+forja verify --engine qwen3-coder-30b-a3b-instruct-4bit.metal-apple-m3-ultra.q4.long-context
 
 forja build qwen3-coder-30b-a3b-instruct-4bit.metal-apple-m3-ultra.q4.kv-f32
 forja verify --engine qwen3-coder-30b-a3b-instruct-4bit.metal-apple-m3-ultra.q4.kv-f32
