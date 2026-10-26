@@ -530,7 +530,7 @@ DEFINE_PAGED_SDPA_PASS1_GQA(paged_sdpa_2pass_1_gqa1_128, 128, 1, 1, 1)
 DEFINE_PAGED_SDPA_PASS1_GQA(paged_sdpa_2pass_1_gqa1x8_128, 128, 1, 1, 8)
 DEFINE_PAGED_SDPA_PASS1_GQA(paged_sdpa_2pass_1_gqa2_128, 128, 2, 1, 1)
 DEFINE_PAGED_SDPA_PASS1_GQA(paged_sdpa_2pass_1_gqa2x8_128, 128, 2, 1, 8)
-DEFINE_PAGED_SDPA_PASS1_GQA(paged_sdpa_2pass_1_gqa8_128, 128, 8, 2, 1)
+DEFINE_PAGED_SDPA_PASS1_GQA(paged_sdpa_2pass_1_gqa8_128, 128, 8, 4, 1)
 
 template <uint D>
 void paged_sdpa_2pass_2_body(
