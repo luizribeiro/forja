@@ -18,6 +18,7 @@ pub(crate) const SERVING_REDUCTION_CLASSES: &[(&str, &str)] = &[
         "gather-quant-matmul.grouped-pair-small-m",
     ),
     ("quant-matmul.tiled", "quant-matmul.tiled"),
+    ("gather-quant-matmul.grouped", "gather-quant-matmul.grouped"),
     (
         "gather-quant-matmul.grouped-32x32-2x2",
         "gather-quant-matmul.grouped-32x32-2x2",
