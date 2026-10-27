@@ -13,7 +13,7 @@ mod weights;
 use std::time::{Duration, Instant};
 use std::{
     any::Any,
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     future::Future,
     path::{Path, PathBuf},
     pin::Pin,
@@ -3465,6 +3465,7 @@ fn record_graph_dispatch(
 pub struct CommandListEntry {
     commands: CommandList,
     recorded: Vec<RecordedDispatch>,
+    profile_scopes: BTreeMap<usize, Arc<forja_core::ProfileScope>>,
     access: SubmissionAccess,
     protected: HashSet<BufferId>,
     space: Option<ParamSpace>,
@@ -5357,6 +5358,7 @@ impl<B: Backend + 'static> Host<B> {
             .push(CommandListEntry {
                 commands: CommandList::new(),
                 recorded: Vec::new(),
+                profile_scopes: BTreeMap::new(),
                 access: SubmissionAccess::default(),
                 protected: HashSet::new(),
                 space: None,
@@ -5825,7 +5827,19 @@ impl<B: Backend + 'static> Host<B> {
         let built = entry
             .recorded
             .iter()
-            .try_for_each(|dispatch| record_graph_dispatch(&mut graph, dispatch));
+            .enumerate()
+            .try_for_each(|(index, dispatch)| {
+                record_graph_dispatch(&mut graph, dispatch)?;
+                if let Some(scope) = entry
+                    .profile_scopes
+                    .range(..=index)
+                    .next_back()
+                    .map(|(_, scope)| scope)
+                {
+                    graph.set_profile_scope(index, Arc::clone(scope))?;
+                }
+                Ok::<_, forja_core::GraphError>(())
+            });
         let validation_time = validation_started.elapsed();
         let graph = match built {
             Ok(()) => self.prepare_captured_graph(graph, &mut entry),
@@ -7652,6 +7666,27 @@ where
     fn new(&mut self) -> impl Future<Output = wasmtime::Result<Resource<CommandListEntry>>> + Send {
         let _timer = self.import_timer(ImportKind::CommandList);
         std::future::ready(Host::command_list(self).map_err(wasmtime::Error::msg))
+    }
+
+    fn set_profile_scope(
+        &mut self,
+        resource: Resource<CommandListEntry>,
+        site: String,
+        layer_type: String,
+        layer: Option<u32>,
+    ) -> impl Future<Output = wasmtime::Result<Result<(), compute::Error>>> + Send {
+        let result = (|| {
+            let scope = forja_core::ProfileScope::new(site, layer_type, layer)
+                .map_err(|error| compute::Error::Layout(error.to_string()))?;
+            let entry = self.table.get_mut(&resource).map_err(invalid_handle)?;
+            let scope = Arc::new(scope);
+            entry
+                .profile_scopes
+                .insert(entry.recorded.len(), Arc::clone(&scope));
+            entry.commands.set_profile_scope(Some(scope));
+            Ok(())
+        })();
+        std::future::ready(Ok(result))
     }
 
     fn output(
@@ -11250,6 +11285,60 @@ mod tests {
             .iter()
             .flat_map(|value| value.to_le_bytes())
             .collect()
+    }
+
+    #[tokio::test]
+    async fn captured_scopes_follow_symbolic_and_concrete_recording() {
+        let mut host = Host::new(CpuBackend::new(), GENEROUS);
+        let params = host
+            .params(vec![compute::ParamRange { lo: 0, hi: 7 }])
+            .unwrap();
+        let symbolic = bind_replay_space(&mut host, &params, &[7]);
+        let concrete = host.alloc(compute::Dtype::F32, &[7]).unwrap();
+        let commands = host.command_list().unwrap();
+        for (layer, input) in [(0, &symbolic), (1, &concrete)] {
+            compute::HostCommandList::set_profile_scope(
+                &mut host,
+                Resource::new_borrow(commands.rep()),
+                "block".into(),
+                "test".into(),
+                Some(layer),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let output = host.alloc(compute::Dtype::F32, &[7]).unwrap();
+            host.dispatch(
+                &commands,
+                compute::Op::Copy,
+                &[Resource::new_borrow(input.rep())],
+                &output,
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            host.table
+                .get(&commands)
+                .unwrap()
+                .commands
+                .dispatches()
+                .len(),
+            1
+        );
+        let graph = host.create_graph(commands).unwrap();
+        let graph = &host.table.get(&graph).unwrap().graph;
+        let replay = graph
+            .template()
+            .instantiate(&graph.values(vec![0]).unwrap())
+            .unwrap();
+        assert_eq!(
+            replay
+                .dispatches()
+                .iter()
+                .map(|dispatch| dispatch.profile_scope().unwrap().layer())
+                .collect::<Vec<_>>(),
+            vec![Some(0), Some(1)]
+        );
     }
 
     fn empty_graph<B>(host: &mut Host<B>) -> Resource<super::GraphEntry>

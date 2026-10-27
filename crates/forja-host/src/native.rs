@@ -189,6 +189,22 @@ pub struct NativeCommandList<B: Backend> {
 }
 
 impl<B: Backend> NativeCommandList<B> {
+    /// Sets engine-owned attribution for subsequent operations.
+    ///
+    /// # Errors
+    /// Returns an error for invalid diagnostic names.
+    pub fn set_profile_scope(
+        &mut self,
+        site: &str,
+        layer_type: &str,
+        layer: Option<u32>,
+    ) -> Result<(), BackendError> {
+        let scope = forja_core::ProfileScope::new(site.into(), layer_type.into(), layer)
+            .map_err(|_| BackendError::InvalidInput)?;
+        self.commands.set_profile_scope(Some(Arc::new(scope)));
+        Ok(())
+    }
+
     /// Validates and records one operation.
     ///
     /// # Errors
@@ -434,6 +450,28 @@ impl NativeCommandList<forja_metal::MetalBackend> {
 mod tests {
     use super::*;
     use forja_core::Slice;
+
+    #[test]
+    fn command_scope_is_validated_and_attached_to_operations() {
+        let host = NativeHost::new(forja_cpu::CpuBackend::new());
+        let input = host.alloc(DType::F32, &[7, 33]).unwrap();
+        let output = host.alloc(DType::F32, &[7, 33]).unwrap();
+        let mut commands = host.command_list();
+        commands
+            .set_profile_scope("layer/7", "sparse", Some(7))
+            .unwrap();
+        commands.dispatch(Op::Copy, &[&input], &output).unwrap();
+        let scope = commands
+            .commands
+            .last_dispatch()
+            .unwrap()
+            .profile_scope()
+            .unwrap();
+        assert_eq!(scope.site(), "layer/7");
+        assert_eq!(scope.layer_type(), "sparse");
+        assert_eq!(scope.layer(), Some(7));
+        assert!(commands.set_profile_scope("", "sparse", Some(7)).is_err());
+    }
 
     #[test]
     fn views_share_an_allocation_until_the_last_handle_drops() {

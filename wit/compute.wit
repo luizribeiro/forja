@@ -220,6 +220,7 @@ interface compute {
 
   resource command-list {
     constructor();
+    set-profile-scope: func(site: string, layer-type: string, layer: option<u32>) -> result<_, error>;
     output: func(value: borrow<tensor>) -> result<_, error>;
     dispatch: func(operation: op, ins: list<borrow<tensor>>, out: borrow<tensor>) -> result<_, error>;
     dispatch-many: func(operation: op, ins: list<borrow<tensor>>, outs: list<borrow<tensor>>) -> result<_, error>;

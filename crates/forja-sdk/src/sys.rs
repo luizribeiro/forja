@@ -179,6 +179,12 @@ pub(crate) trait Backend {
     ) -> Result<Self::Tensor>;
     fn read(tensor: &Self::Tensor) -> Result<Vec<u8>>;
     fn command_list() -> Result<Self::Commands>;
+    fn set_profile_scope(
+        commands: &mut Self::Commands,
+        site: &str,
+        layer_type: &str,
+        layer: Option<u32>,
+    ) -> Result<()>;
     fn graph_output(commands: &mut Self::Commands, tensor: &Self::Tensor) -> Result<()>;
     fn dispatch(
         commands: &mut Self::Commands,
@@ -362,6 +368,16 @@ pub(crate) mod guest {
 
         fn command_list() -> Result<Self::Commands> {
             Ok(compute::CommandList::new())
+        }
+        fn set_profile_scope(
+            commands: &mut Self::Commands,
+            site: &str,
+            layer_type: &str,
+            layer: Option<u32>,
+        ) -> Result<()> {
+            commands
+                .set_profile_scope(site, layer_type, layer)
+                .map_err(|error| guest_error(&error))
         }
 
         fn graph_output(commands: &mut Self::Commands, tensor: &Self::Tensor) -> Result<()> {
@@ -793,6 +809,14 @@ pub(crate) mod unavailable {
         fn command_list() -> Result<Self::Commands> {
             Err(error())
         }
+        fn set_profile_scope(
+            _commands: &mut Self::Commands,
+            _site: &str,
+            _layer_type: &str,
+            _layer: Option<u32>,
+        ) -> Result<()> {
+            Err(error())
+        }
 
         fn graph_output(_commands: &mut Self::Commands, _tensor: &Self::Tensor) -> Result<()> {
             Err(error())
@@ -1115,6 +1139,23 @@ pub(crate) mod native {
                 NativeDevice::Cpu => CPU_HOST.with(|host| Ok(Commands::Cpu(host.command_list()))),
                 #[cfg(all(feature = "native-metal", target_os = "macos"))]
                 NativeDevice::Metal => with_metal(|host| Ok(Commands::Metal(host.command_list()))),
+            }
+        }
+
+        fn set_profile_scope(
+            commands: &mut Self::Commands,
+            site: &str,
+            layer_type: &str,
+            layer: Option<u32>,
+        ) -> Result<()> {
+            match commands {
+                Commands::Cpu(commands) => commands
+                    .set_profile_scope(site, layer_type, layer)
+                    .map_err(error),
+                #[cfg(all(feature = "native-metal", target_os = "macos"))]
+                Commands::Metal(commands) => commands
+                    .set_profile_scope(site, layer_type, layer)
+                    .map_err(error),
             }
         }
 
@@ -1572,6 +1613,15 @@ pub(crate) fn read(tensor: &Handle) -> Result<Vec<u8>> {
 
 pub(crate) fn command_list() -> Result<Commands> {
     Active::command_list()
+}
+
+pub(crate) fn set_profile_scope(
+    commands: &mut Commands,
+    site: &str,
+    layer_type: &str,
+    layer: Option<u32>,
+) -> Result<()> {
+    Active::set_profile_scope(commands, site, layer_type, layer)
 }
 
 pub(crate) fn graph_output(commands: &mut Commands, tensor: &Handle) -> Result<()> {

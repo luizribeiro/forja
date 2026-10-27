@@ -503,6 +503,27 @@ pub(crate) fn record_import_variant(
     })
 }
 
+/// Sets engine-owned call-site and layer attribution for subsequent operations.
+///
+/// Attribution is retained by captured graphs and does not affect tensor execution.
+///
+/// # Errors
+/// Returns an error for invalid names or if command-list creation fails.
+pub fn profile_scope(site: &str, layer_type: &str, layer: Option<u32>) -> Result<()> {
+    CURRENT.with(|current| {
+        let mut current = current.borrow_mut();
+        if current.is_none() {
+            *current = Some(Recording::Lazy(sys::command_list()?));
+        }
+        match current.as_mut() {
+            Some(Recording::Lazy(commands) | Recording::Capture { commands, .. }) => {
+                sys::set_profile_scope(commands, site, layer_type, layer)
+            }
+            None => Err(crate::Error::new("current graph was not initialized")),
+        }
+    })
+}
+
 pub(crate) fn record_variant(
     operation: sys::Op,
     inputs: &[&sys::Handle],
