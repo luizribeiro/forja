@@ -1,0 +1,3907 @@
+{
+ "baseline": {
+  "build_environment": "profile-history-defaults (fixture)",
+  "catalog": {
+   "gather-quant-matmul.grouped-32x32-2x2-blocked": {
+    "source_hash": "7afe9324bc8e84c854135afb42b8b44571998ad9b1b41c617d45ae384e2c6a67"
+   },
+   "gather-quant-matmul.grouped-pair-small-m": {
+    "source_hash": "7afe9324bc8e84c854135afb42b8b44571998ad9b1b41c617d45ae384e2c6a67"
+   },
+   "gather-quant-matmul.grouped-small-m": {
+    "source_hash": "7afe9324bc8e84c854135afb42b8b44571998ad9b1b41c617d45ae384e2c6a67"
+   },
+   "gather-quant-matmul.route-gemv": {
+    "source_hash": "7afe9324bc8e84c854135afb42b8b44571998ad9b1b41c617d45ae384e2c6a67"
+   },
+   "matmul.column-gemv": {
+    "source_hash": "7afe9324bc8e84c854135afb42b8b44571998ad9b1b41c617d45ae384e2c6a67"
+   },
+   "matmul.steel-64x32x32-2x2": {
+    "source_hash": "7afe9324bc8e84c854135afb42b8b44571998ad9b1b41c617d45ae384e2c6a67"
+   },
+   "paged-sdpa.steel-half": {
+    "source_hash": "7afe9324bc8e84c854135afb42b8b44571998ad9b1b41c617d45ae384e2c6a67"
+   },
+   "paged-sdpa.steel-half-32x16": {
+    "source_hash": "7afe9324bc8e84c854135afb42b8b44571998ad9b1b41c617d45ae384e2c6a67"
+   },
+   "paged-sdpa.steel-half-64x16": {
+    "source_hash": "7afe9324bc8e84c854135afb42b8b44571998ad9b1b41c617d45ae384e2c6a67"
+   },
+   "paged-sdpa.vector": {
+    "source_hash": "7afe9324bc8e84c854135afb42b8b44571998ad9b1b41c617d45ae384e2c6a67"
+   },
+   "paged-sdpa.vector-gqa-two-pass": {
+    "source_hash": "7afe9324bc8e84c854135afb42b8b44571998ad9b1b41c617d45ae384e2c6a67"
+   },
+   "paged-sdpa.vector-gqa-two-pass-128": {
+    "source_hash": "7afe9324bc8e84c854135afb42b8b44571998ad9b1b41c617d45ae384e2c6a67"
+   },
+   "paged-sdpa.vector-gqa-two-pass-256": {
+    "source_hash": "7afe9324bc8e84c854135afb42b8b44571998ad9b1b41c617d45ae384e2c6a67"
+   },
+   "paged-sdpa.vector-gqa-two-pass-32": {
+    "source_hash": "7afe9324bc8e84c854135afb42b8b44571998ad9b1b41c617d45ae384e2c6a67"
+   },
+   "quant-matmul.gemv": {
+    "source_hash": "7afe9324bc8e84c854135afb42b8b44571998ad9b1b41c617d45ae384e2c6a67"
+   },
+   "quant-matmul.q8-fast-gemv": {
+    "source_hash": "7afe9324bc8e84c854135afb42b8b44571998ad9b1b41c617d45ae384e2c6a67"
+   },
+   "quant-matmul.row-gemv": {
+    "source_hash": "7afe9324bc8e84c854135afb42b8b44571998ad9b1b41c617d45ae384e2c6a67"
+   },
+   "quant-matmul.small-m": {
+    "source_hash": "7afe9324bc8e84c854135afb42b8b44571998ad9b1b41c617d45ae384e2c6a67"
+   },
+   "quant-matmul.tiled": {
+    "source_hash": "7afe9324bc8e84c854135afb42b8b44571998ad9b1b41c617d45ae384e2c6a67"
+   },
+   "sample.parallel": {
+    "source_hash": "7afe9324bc8e84c854135afb42b8b44571998ad9b1b41c617d45ae384e2c6a67"
+   },
+   "sdpa.decomposed": {
+    "source_hash": "7afe9324bc8e84c854135afb42b8b44571998ad9b1b41c617d45ae384e2c6a67"
+   },
+   "sdpa.steel-half": {
+    "source_hash": "7afe9324bc8e84c854135afb42b8b44571998ad9b1b41c617d45ae384e2c6a67"
+   },
+   "sdpa.vector-gqa-two-pass": {
+    "source_hash": "7afe9324bc8e84c854135afb42b8b44571998ad9b1b41c617d45ae384e2c6a67"
+   },
+   "sdpa.vector-gqa-two-pass-128": {
+    "source_hash": "7afe9324bc8e84c854135afb42b8b44571998ad9b1b41c617d45ae384e2c6a67"
+   },
+   "sdpa.vector-gqa-two-pass-256": {
+    "source_hash": "7afe9324bc8e84c854135afb42b8b44571998ad9b1b41c617d45ae384e2c6a67"
+   },
+   "sdpa.vector-gqa-two-pass-32": {
+    "source_hash": "7afe9324bc8e84c854135afb42b8b44571998ad9b1b41c617d45ae384e2c6a67"
+   },
+   "top-k.single-k8": {
+    "source_hash": "7afe9324bc8e84c854135afb42b8b44571998ad9b1b41c617d45ae384e2c6a67"
+   }
+  },
+  "commit": "e3c1313^",
+  "dirty": false,
+  "guest_source_hash": "b6ecf79bedf5c182e97fc870f87c9183b3df6be54350ce3b303fa9e26965c853",
+  "host_config": {
+   "replay": true
+  },
+  "host_environment": "profile-history-same-host (fixture)",
+  "host_hash": "8dddfdde8854cd2b01245b53f30a37641a850a72f2afaa3cf615cedb579f6533",
+  "kernel_source_hash": "7afe9324bc8e84c854135afb42b8b44571998ad9b1b41c617d45ae384e2c6a67",
+  "non_pick_profile": {
+   "chat": {
+    "tool-format": "qwen3-coder-xml",
+    "tool-format-options": {}
+   },
+   "family": "qwen3-coder",
+   "model": {
+    "chat-template-sha256": "sha256:672e747c77e990320152343b0a4951222e40de5645297905d89afba05586d827",
+    "generation-config-sha256": "sha256:c99723ab3ba28630d26ae23def77603b540a46924895af5cf234740d3b27b51d",
+    "id": "mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit",
+    "revision": "6e302ea604ad9ab206367e2c501d1571023e7b6d",
+    "weights-sha256": "sha256:2f0797714404ba75a18599829d8ab96e316ef0088aa6f49e7cb7eb301043f5ec"
+   },
+   "numerics": {
+    "activations": "bf16",
+    "kv-cache": "f16",
+    "weights": "q4"
+   },
+   "quantization": {
+    "default-bits": 4,
+    "group-size": 64,
+    "overrides": {
+     "model.layers.*.mlp.gate": {
+      "bits": 8
+     }
+    },
+    "scheme": "mlx-affine"
+   },
+   "schema-version": 1,
+   "serving": {
+    "paged-cache": true,
+    "prompt-token-budget": 512
+   },
+   "target": {
+    "backend": "metal",
+    "component": "wasm32-wasip2",
+    "device-family": "apple-m3-ultra"
+   },
+   "workload": {
+    "batch": 1,
+    "kind": "causal-lm",
+    "max-context": 32768,
+    "prefill-chunk": 2048
+   }
+  },
+  "profile_name": "qwen3-coder-30b-a3b-instruct-4bit.metal-apple-m3-ultra.q4",
+  "proof": {
+   "guest_source_hash": "b6ecf79bedf5c182e97fc870f87c9183b3df6be54350ce3b303fa9e26965c853",
+   "rows": {
+    "conversation": [
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "attention.prefill-large"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "attention.prefill-small"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "gather-quant-matmul.grouped"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "gather-quant-matmul.grouped-small-m"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "gather-quant-matmul.small"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "moe.combine-large"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "moe.combine-small"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "moe.down-combine"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "moe.gate-up.grouped"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "moe.gate-up.grouped-small-m"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "moe.gate-up.small"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "paged-attention.prefill-large"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "paged-attention.prefill-small"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "paged-attention.prefill-tiny"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "quant.prefill-small"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "quant.prefill-tiled"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "sample"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "top-k"
+     }
+    ],
+    "decode-16000": [
+     {
+      "ranges": {
+       "position": [
+        15999,
+        16127
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "paged-attention.decode"
+     },
+     {
+      "ranges": {
+       "position": [
+        15999,
+        16127
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "moe.down-combine"
+     },
+     {
+      "ranges": {
+       "position": [
+        15999,
+        16127
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "sample"
+     }
+    ],
+    "decode-32000": [
+     {
+      "ranges": {
+       "position": [
+        31999,
+        32127
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "paged-attention.decode"
+     },
+     {
+      "ranges": {
+       "position": [
+        31999,
+        32127
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "moe.down-combine"
+     },
+     {
+      "ranges": {
+       "position": [
+        31999,
+        32127
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "sample"
+     }
+    ],
+    "decode-4096": [
+     {
+      "ranges": {
+       "position": [
+        4095,
+        4223
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "paged-attention.decode"
+     },
+     {
+      "ranges": {
+       "position": [
+        4095,
+        4223
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "moe.down-combine"
+     },
+     {
+      "ranges": {
+       "position": [
+        4095,
+        4223
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "sample"
+     }
+    ],
+    "decode-512": [
+     {
+      "ranges": {
+       "position": [
+        511,
+        639
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "paged-attention.decode"
+     },
+     {
+      "ranges": {
+       "position": [
+        511,
+        639
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "moe.down-combine"
+     },
+     {
+      "ranges": {
+       "position": [
+        511,
+        639
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "sample"
+     }
+    ],
+    "decode-8000": [
+     {
+      "ranges": {
+       "position": [
+        7999,
+        8127
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "paged-attention.decode"
+     },
+     {
+      "ranges": {
+       "position": [
+        7999,
+        8127
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "moe.down-combine"
+     },
+     {
+      "ranges": {
+       "position": [
+        7999,
+        8127
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "sample"
+     }
+    ],
+    "prefill-16384": [
+     {
+      "ranges": {
+       "position": [
+        0,
+        16383
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "attention.prefill-large"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        16383
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "attention.prefill-small"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        16383
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "gather-quant-matmul.grouped"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        16383
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "gather-quant-matmul.grouped-small-m"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        16383
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "gather-quant-matmul.small"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        16383
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "moe.combine-large"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        16383
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "moe.combine-small"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        16383
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "moe.down-combine"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        16383
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "moe.gate-up.grouped"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        16383
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "moe.gate-up.grouped-small-m"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        16383
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "moe.gate-up.small"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        16383
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "paged-attention.prefill-large"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        16383
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "paged-attention.prefill-small"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        16383
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "paged-attention.prefill-tiny"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        16383
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "quant.prefill-small"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        16383
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "quant.prefill-tiled"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        16383
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "sample"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        16383
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "top-k"
+     }
+    ],
+    "prefill-2048": [
+     {
+      "ranges": {
+       "position": [
+        0,
+        2047
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "attention.prefill-large"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        2047
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "attention.prefill-small"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        2047
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "gather-quant-matmul.grouped"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        2047
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "gather-quant-matmul.grouped-small-m"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        2047
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "gather-quant-matmul.small"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        2047
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "moe.combine-large"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        2047
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "moe.combine-small"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        2047
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "moe.down-combine"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        2047
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "moe.gate-up.grouped"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        2047
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "moe.gate-up.grouped-small-m"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        2047
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "moe.gate-up.small"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        2047
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "paged-attention.prefill-large"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        2047
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "paged-attention.prefill-small"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        2047
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "paged-attention.prefill-tiny"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        2047
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "quant.prefill-small"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        2047
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "quant.prefill-tiled"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        2047
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "sample"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        2047
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "top-k"
+     }
+    ],
+    "prefill-512": [
+     {
+      "ranges": {
+       "position": [
+        0,
+        511
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "attention.prefill-large"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        511
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "attention.prefill-small"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        511
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "gather-quant-matmul.grouped"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        511
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "gather-quant-matmul.grouped-small-m"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        511
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "gather-quant-matmul.small"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        511
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "moe.combine-large"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        511
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "moe.combine-small"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        511
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "moe.down-combine"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        511
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "moe.gate-up.grouped"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        511
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "moe.gate-up.grouped-small-m"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        511
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "moe.gate-up.small"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        511
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "paged-attention.prefill-large"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        511
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "paged-attention.prefill-small"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        511
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "paged-attention.prefill-tiny"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        511
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "quant.prefill-small"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        511
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "quant.prefill-tiled"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        511
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "sample"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        511
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "top-k"
+     }
+    ],
+    "rss-32K": [
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "attention.prefill-large"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "attention.prefill-small"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "gather-quant-matmul.grouped"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "gather-quant-matmul.grouped-small-m"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "gather-quant-matmul.small"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "moe.combine-large"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "moe.combine-small"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "moe.down-combine"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "moe.gate-up.grouped"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "moe.gate-up.grouped-small-m"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "moe.gate-up.small"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "paged-attention.prefill-large"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "paged-attention.prefill-small"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "paged-attention.prefill-tiny"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "quant.prefill-small"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "quant.prefill-tiled"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "sample"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "top-k"
+     }
+    ],
+    "serving": [
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "attention.prefill-large"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "attention.prefill-small"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "gather-quant-matmul.grouped"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "gather-quant-matmul.grouped-small-m"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "gather-quant-matmul.small"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "moe.combine-large"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "moe.combine-small"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "moe.down-combine"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "moe.gate-up.grouped"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "moe.gate-up.grouped-small-m"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "moe.gate-up.small"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "paged-attention.prefill-large"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "paged-attention.prefill-small"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "paged-attention.prefill-tiny"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "quant.prefill-small"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "quant.prefill-tiled"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "sample"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "top-k"
+     }
+    ]
+   },
+   "sites": [
+    "attention.decode",
+    "attention.prefill-large",
+    "attention.prefill-small",
+    "gather-quant-matmul.batch-2",
+    "gather-quant-matmul.batch-4",
+    "gather-quant-matmul.batch-8",
+    "gather-quant-matmul.grouped",
+    "gather-quant-matmul.grouped-small-m",
+    "gather-quant-matmul.small",
+    "moe.combine-large",
+    "moe.combine-small",
+    "moe.down-combine",
+    "moe.gate-up.batch-2",
+    "moe.gate-up.batch-4",
+    "moe.gate-up.batch-8",
+    "moe.gate-up.grouped",
+    "moe.gate-up.grouped-small-m",
+    "moe.gate-up.small",
+    "paged-attention.decode",
+    "paged-attention.prefill-large",
+    "paged-attention.prefill-small",
+    "paged-attention.prefill-tiny",
+    "quant.decode-b2-q4",
+    "quant.decode-b2-q8",
+    "quant.decode-b4-q4",
+    "quant.decode-b4-q8",
+    "quant.decode-b8-q4",
+    "quant.decode-b8-q8",
+    "quant.decode-q4",
+    "quant.decode-q8",
+    "quant.prefill-small",
+    "quant.prefill-tiled",
+    "sample",
+    "top-k"
+   ]
+  },
+  "proof_hash": "0f54ed3e1c21bd80306160d2b7df83f04353aa2cef08bd521970189ca9aac0ac",
+  "toolchain_hash": "6abf13844638ddab6dfad7e174d31af7eb91d9ff4c978d13126d5732decc86dd",
+  "tunings": [],
+  "variants": {
+   "fixed": {
+    "attention.prefill-small": "sdpa.decomposed",
+    "gather-quant-matmul.batch-2": "gather-quant-matmul.route-gemv",
+    "gather-quant-matmul.batch-4": "gather-quant-matmul.route-gemv",
+    "gather-quant-matmul.batch-8": "gather-quant-matmul.route-gemv",
+    "gather-quant-matmul.grouped": "gather-quant-matmul.grouped-32x32-2x2-blocked",
+    "gather-quant-matmul.grouped-small-m": "gather-quant-matmul.grouped-small-m",
+    "gather-quant-matmul.small": "gather-quant-matmul.route-gemv",
+    "moe.combine-large": "matmul.column-gemv",
+    "moe.combine-small": "matmul.steel-64x32x32-2x2",
+    "moe.down-combine": "gather-quant-matmul.route-gemv",
+    "moe.gate-up.batch-2": "gather-quant-matmul.route-gemv",
+    "moe.gate-up.batch-4": "gather-quant-matmul.route-gemv",
+    "moe.gate-up.batch-8": "gather-quant-matmul.route-gemv",
+    "moe.gate-up.grouped": "gather-quant-matmul.grouped-32x32-2x2-blocked",
+    "moe.gate-up.grouped-small-m": "gather-quant-matmul.grouped-pair-small-m",
+    "moe.gate-up.small": "gather-quant-matmul.route-gemv",
+    "paged-attention.prefill-small": "paged-sdpa.steel-half",
+    "paged-attention.prefill-tiny": "paged-sdpa.vector",
+    "quant.decode-b2-q4": "quant-matmul.row-gemv",
+    "quant.decode-b2-q8": "quant-matmul.q8-fast-gemv",
+    "quant.decode-b4-q4": "quant-matmul.row-gemv",
+    "quant.decode-b4-q8": "quant-matmul.q8-fast-gemv",
+    "quant.decode-b8-q4": "quant-matmul.row-gemv",
+    "quant.decode-b8-q8": "quant-matmul.q8-fast-gemv",
+    "quant.decode-q4": "quant-matmul.gemv",
+    "quant.decode-q8": "quant-matmul.q8-fast-gemv",
+    "quant.prefill-small": "quant-matmul.small-m",
+    "quant.prefill-tiled": "quant-matmul.tiled",
+    "sample": "sample.parallel",
+    "top-k": "top-k.single-k8"
+   },
+   "rules": {
+    "attention.decode": {
+     "arms": [
+      {
+       "hi": 510,
+       "lo": 0,
+       "name": "sdpa.decomposed"
+      },
+      {
+       "hi": 1022,
+       "lo": 511,
+       "name": "sdpa.vector-gqa-two-pass-32"
+      },
+      {
+       "hi": 3071,
+       "lo": 1023,
+       "name": "sdpa.vector-gqa-two-pass"
+      },
+      {
+       "hi": 8191,
+       "lo": 3072,
+       "name": "sdpa.vector-gqa-two-pass-128"
+      },
+      {
+       "hi": 32767,
+       "lo": 8192,
+       "name": "sdpa.vector-gqa-two-pass-256"
+      }
+     ],
+     "parameter": "position"
+    },
+    "attention.prefill-large": {
+     "arms": [
+      {
+       "hi": 32767,
+       "lo": 0,
+       "name": "sdpa.steel-half"
+      }
+     ],
+     "parameter": "position"
+    },
+    "paged-attention.decode": {
+     "arms": [
+      {
+       "hi": 510,
+       "lo": 0,
+       "name": "paged-sdpa.vector"
+      },
+      {
+       "hi": 1022,
+       "lo": 511,
+       "name": "paged-sdpa.vector-gqa-two-pass-32"
+      },
+      {
+       "hi": 3071,
+       "lo": 1023,
+       "name": "paged-sdpa.vector-gqa-two-pass"
+      },
+      {
+       "hi": 8191,
+       "lo": 3072,
+       "name": "paged-sdpa.vector-gqa-two-pass-128"
+      },
+      {
+       "hi": 32767,
+       "lo": 8192,
+       "name": "paged-sdpa.vector-gqa-two-pass-256"
+      }
+     ],
+     "parameter": "position"
+    },
+    "paged-attention.prefill-large": {
+     "arms": [
+      {
+       "hi": 2047,
+       "lo": 0,
+       "name": "paged-sdpa.steel-half-32x16"
+      },
+      {
+       "hi": 32767,
+       "lo": 2048,
+       "name": "paged-sdpa.steel-half-64x16"
+      }
+     ],
+     "parameter": "position"
+    }
+   }
+  }
+ },
+ "candidate": {
+  "build_environment": "profile-history-defaults (fixture)",
+  "catalog": {
+   "gather-quant-matmul.grouped-32x32-2x2-blocked": {
+    "source_hash": "7afe9324bc8e84c854135afb42b8b44571998ad9b1b41c617d45ae384e2c6a67"
+   },
+   "gather-quant-matmul.grouped-pair-32x32-2x2-blocked": {
+    "source_hash": "7afe9324bc8e84c854135afb42b8b44571998ad9b1b41c617d45ae384e2c6a67"
+   },
+   "gather-quant-matmul.grouped-pair-small-m": {
+    "source_hash": "7afe9324bc8e84c854135afb42b8b44571998ad9b1b41c617d45ae384e2c6a67"
+   },
+   "gather-quant-matmul.grouped-small-m": {
+    "source_hash": "7afe9324bc8e84c854135afb42b8b44571998ad9b1b41c617d45ae384e2c6a67"
+   },
+   "gather-quant-matmul.route-gemv": {
+    "source_hash": "7afe9324bc8e84c854135afb42b8b44571998ad9b1b41c617d45ae384e2c6a67"
+   },
+   "matmul.column-gemv": {
+    "source_hash": "7afe9324bc8e84c854135afb42b8b44571998ad9b1b41c617d45ae384e2c6a67"
+   },
+   "matmul.steel-64x32x32-2x2": {
+    "source_hash": "7afe9324bc8e84c854135afb42b8b44571998ad9b1b41c617d45ae384e2c6a67"
+   },
+   "paged-sdpa.steel-half": {
+    "source_hash": "7afe9324bc8e84c854135afb42b8b44571998ad9b1b41c617d45ae384e2c6a67"
+   },
+   "paged-sdpa.steel-half-32x16": {
+    "source_hash": "7afe9324bc8e84c854135afb42b8b44571998ad9b1b41c617d45ae384e2c6a67"
+   },
+   "paged-sdpa.steel-half-64x16": {
+    "source_hash": "7afe9324bc8e84c854135afb42b8b44571998ad9b1b41c617d45ae384e2c6a67"
+   },
+   "paged-sdpa.vector": {
+    "source_hash": "7afe9324bc8e84c854135afb42b8b44571998ad9b1b41c617d45ae384e2c6a67"
+   },
+   "paged-sdpa.vector-gqa-two-pass": {
+    "source_hash": "7afe9324bc8e84c854135afb42b8b44571998ad9b1b41c617d45ae384e2c6a67"
+   },
+   "paged-sdpa.vector-gqa-two-pass-128": {
+    "source_hash": "7afe9324bc8e84c854135afb42b8b44571998ad9b1b41c617d45ae384e2c6a67"
+   },
+   "paged-sdpa.vector-gqa-two-pass-256": {
+    "source_hash": "7afe9324bc8e84c854135afb42b8b44571998ad9b1b41c617d45ae384e2c6a67"
+   },
+   "paged-sdpa.vector-gqa-two-pass-32": {
+    "source_hash": "7afe9324bc8e84c854135afb42b8b44571998ad9b1b41c617d45ae384e2c6a67"
+   },
+   "quant-matmul.gemv": {
+    "source_hash": "7afe9324bc8e84c854135afb42b8b44571998ad9b1b41c617d45ae384e2c6a67"
+   },
+   "quant-matmul.q8-fast-gemv": {
+    "source_hash": "7afe9324bc8e84c854135afb42b8b44571998ad9b1b41c617d45ae384e2c6a67"
+   },
+   "quant-matmul.row-gemv": {
+    "source_hash": "7afe9324bc8e84c854135afb42b8b44571998ad9b1b41c617d45ae384e2c6a67"
+   },
+   "quant-matmul.small-m": {
+    "source_hash": "7afe9324bc8e84c854135afb42b8b44571998ad9b1b41c617d45ae384e2c6a67"
+   },
+   "quant-matmul.tiled": {
+    "source_hash": "7afe9324bc8e84c854135afb42b8b44571998ad9b1b41c617d45ae384e2c6a67"
+   },
+   "sample.parallel": {
+    "source_hash": "7afe9324bc8e84c854135afb42b8b44571998ad9b1b41c617d45ae384e2c6a67"
+   },
+   "sdpa.decomposed": {
+    "source_hash": "7afe9324bc8e84c854135afb42b8b44571998ad9b1b41c617d45ae384e2c6a67"
+   },
+   "sdpa.steel-half": {
+    "source_hash": "7afe9324bc8e84c854135afb42b8b44571998ad9b1b41c617d45ae384e2c6a67"
+   },
+   "sdpa.vector-gqa-two-pass": {
+    "source_hash": "7afe9324bc8e84c854135afb42b8b44571998ad9b1b41c617d45ae384e2c6a67"
+   },
+   "sdpa.vector-gqa-two-pass-128": {
+    "source_hash": "7afe9324bc8e84c854135afb42b8b44571998ad9b1b41c617d45ae384e2c6a67"
+   },
+   "sdpa.vector-gqa-two-pass-256": {
+    "source_hash": "7afe9324bc8e84c854135afb42b8b44571998ad9b1b41c617d45ae384e2c6a67"
+   },
+   "sdpa.vector-gqa-two-pass-32": {
+    "source_hash": "7afe9324bc8e84c854135afb42b8b44571998ad9b1b41c617d45ae384e2c6a67"
+   },
+   "top-k.single-k8": {
+    "source_hash": "7afe9324bc8e84c854135afb42b8b44571998ad9b1b41c617d45ae384e2c6a67"
+   }
+  },
+  "commit": "e3c1313",
+  "dirty": false,
+  "guest_source_hash": "b6ecf79bedf5c182e97fc870f87c9183b3df6be54350ce3b303fa9e26965c853",
+  "host_config": {
+   "replay": true
+  },
+  "host_environment": "profile-history-same-host (fixture)",
+  "host_hash": "8dddfdde8854cd2b01245b53f30a37641a850a72f2afaa3cf615cedb579f6533",
+  "kernel_source_hash": "7afe9324bc8e84c854135afb42b8b44571998ad9b1b41c617d45ae384e2c6a67",
+  "non_pick_profile": {
+   "chat": {
+    "tool-format": "qwen3-coder-xml",
+    "tool-format-options": {}
+   },
+   "family": "qwen3-coder",
+   "model": {
+    "chat-template-sha256": "sha256:672e747c77e990320152343b0a4951222e40de5645297905d89afba05586d827",
+    "generation-config-sha256": "sha256:c99723ab3ba28630d26ae23def77603b540a46924895af5cf234740d3b27b51d",
+    "id": "mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit",
+    "revision": "6e302ea604ad9ab206367e2c501d1571023e7b6d",
+    "weights-sha256": "sha256:2f0797714404ba75a18599829d8ab96e316ef0088aa6f49e7cb7eb301043f5ec"
+   },
+   "numerics": {
+    "activations": "bf16",
+    "kv-cache": "f16",
+    "weights": "q4"
+   },
+   "quantization": {
+    "default-bits": 4,
+    "group-size": 64,
+    "overrides": {
+     "model.layers.*.mlp.gate": {
+      "bits": 8
+     }
+    },
+    "scheme": "mlx-affine"
+   },
+   "schema-version": 1,
+   "serving": {
+    "paged-cache": true,
+    "prompt-token-budget": 512
+   },
+   "target": {
+    "backend": "metal",
+    "component": "wasm32-wasip2",
+    "device-family": "apple-m3-ultra"
+   },
+   "workload": {
+    "batch": 1,
+    "kind": "causal-lm",
+    "max-context": 32768,
+    "prefill-chunk": 2048
+   }
+  },
+  "profile_name": "qwen3-coder-30b-a3b-instruct-4bit.metal-apple-m3-ultra.q4",
+  "proof": {
+   "guest_source_hash": "b6ecf79bedf5c182e97fc870f87c9183b3df6be54350ce3b303fa9e26965c853",
+   "rows": {
+    "conversation": [
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "attention.prefill-large"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "attention.prefill-small"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "gather-quant-matmul.grouped"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "gather-quant-matmul.grouped-small-m"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "gather-quant-matmul.small"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "moe.combine-large"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "moe.combine-small"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "moe.down-combine"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "moe.gate-up.grouped"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "moe.gate-up.grouped-small-m"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "moe.gate-up.small"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "paged-attention.prefill-large"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "paged-attention.prefill-small"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "paged-attention.prefill-tiny"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "quant.prefill-small"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "quant.prefill-tiled"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "sample"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "top-k"
+     }
+    ],
+    "decode-16000": [
+     {
+      "ranges": {
+       "position": [
+        15999,
+        16127
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "paged-attention.decode"
+     },
+     {
+      "ranges": {
+       "position": [
+        15999,
+        16127
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "moe.down-combine"
+     },
+     {
+      "ranges": {
+       "position": [
+        15999,
+        16127
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "sample"
+     }
+    ],
+    "decode-32000": [
+     {
+      "ranges": {
+       "position": [
+        31999,
+        32127
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "paged-attention.decode"
+     },
+     {
+      "ranges": {
+       "position": [
+        31999,
+        32127
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "moe.down-combine"
+     },
+     {
+      "ranges": {
+       "position": [
+        31999,
+        32127
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "sample"
+     }
+    ],
+    "decode-4096": [
+     {
+      "ranges": {
+       "position": [
+        4095,
+        4223
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "paged-attention.decode"
+     },
+     {
+      "ranges": {
+       "position": [
+        4095,
+        4223
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "moe.down-combine"
+     },
+     {
+      "ranges": {
+       "position": [
+        4095,
+        4223
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "sample"
+     }
+    ],
+    "decode-512": [
+     {
+      "ranges": {
+       "position": [
+        511,
+        639
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "paged-attention.decode"
+     },
+     {
+      "ranges": {
+       "position": [
+        511,
+        639
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "moe.down-combine"
+     },
+     {
+      "ranges": {
+       "position": [
+        511,
+        639
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "sample"
+     }
+    ],
+    "decode-8000": [
+     {
+      "ranges": {
+       "position": [
+        7999,
+        8127
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "paged-attention.decode"
+     },
+     {
+      "ranges": {
+       "position": [
+        7999,
+        8127
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "moe.down-combine"
+     },
+     {
+      "ranges": {
+       "position": [
+        7999,
+        8127
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "sample"
+     }
+    ],
+    "prefill-16384": [
+     {
+      "ranges": {
+       "position": [
+        0,
+        16383
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "attention.prefill-large"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        16383
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "attention.prefill-small"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        16383
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "gather-quant-matmul.grouped"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        16383
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "gather-quant-matmul.grouped-small-m"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        16383
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "gather-quant-matmul.small"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        16383
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "moe.combine-large"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        16383
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "moe.combine-small"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        16383
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "moe.down-combine"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        16383
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "moe.gate-up.grouped"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        16383
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "moe.gate-up.grouped-small-m"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        16383
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "moe.gate-up.small"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        16383
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "paged-attention.prefill-large"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        16383
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "paged-attention.prefill-small"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        16383
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "paged-attention.prefill-tiny"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        16383
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "quant.prefill-small"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        16383
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "quant.prefill-tiled"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        16383
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "sample"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        16383
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "top-k"
+     }
+    ],
+    "prefill-2048": [
+     {
+      "ranges": {
+       "position": [
+        0,
+        2047
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "attention.prefill-large"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        2047
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "attention.prefill-small"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        2047
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "gather-quant-matmul.grouped"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        2047
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "gather-quant-matmul.grouped-small-m"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        2047
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "gather-quant-matmul.small"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        2047
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "moe.combine-large"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        2047
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "moe.combine-small"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        2047
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "moe.down-combine"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        2047
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "moe.gate-up.grouped"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        2047
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "moe.gate-up.grouped-small-m"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        2047
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "moe.gate-up.small"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        2047
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "paged-attention.prefill-large"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        2047
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "paged-attention.prefill-small"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        2047
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "paged-attention.prefill-tiny"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        2047
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "quant.prefill-small"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        2047
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "quant.prefill-tiled"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        2047
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "sample"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        2047
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "top-k"
+     }
+    ],
+    "prefill-512": [
+     {
+      "ranges": {
+       "position": [
+        0,
+        511
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "attention.prefill-large"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        511
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "attention.prefill-small"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        511
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "gather-quant-matmul.grouped"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        511
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "gather-quant-matmul.grouped-small-m"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        511
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "gather-quant-matmul.small"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        511
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "moe.combine-large"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        511
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "moe.combine-small"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        511
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "moe.down-combine"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        511
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "moe.gate-up.grouped"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        511
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "moe.gate-up.grouped-small-m"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        511
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "moe.gate-up.small"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        511
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "paged-attention.prefill-large"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        511
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "paged-attention.prefill-small"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        511
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "paged-attention.prefill-tiny"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        511
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "quant.prefill-small"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        511
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "quant.prefill-tiled"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        511
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "sample"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        511
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "top-k"
+     }
+    ],
+    "rss-32K": [
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "attention.prefill-large"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "attention.prefill-small"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "gather-quant-matmul.grouped"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "gather-quant-matmul.grouped-small-m"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "gather-quant-matmul.small"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "moe.combine-large"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "moe.combine-small"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "moe.down-combine"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "moe.gate-up.grouped"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "moe.gate-up.grouped-small-m"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "moe.gate-up.small"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "paged-attention.prefill-large"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "paged-attention.prefill-small"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "paged-attention.prefill-tiny"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "quant.prefill-small"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "quant.prefill-tiled"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "sample"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "top-k"
+     }
+    ],
+    "serving": [
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "attention.prefill-large"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "attention.prefill-small"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "gather-quant-matmul.grouped"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "gather-quant-matmul.grouped-small-m"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "gather-quant-matmul.small"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "moe.combine-large"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "moe.combine-small"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "moe.down-combine"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "moe.gate-up.grouped"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "moe.gate-up.grouped-small-m"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "moe.gate-up.small"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "paged-attention.prefill-large"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "paged-attention.prefill-small"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "paged-attention.prefill-tiny"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "quant.prefill-small"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "quant.prefill-tiled"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "sample"
+     },
+     {
+      "ranges": {
+       "position": [
+        0,
+        32767
+       ],
+       "query": [
+        1,
+        2048
+       ]
+      },
+      "site": "top-k"
+     }
+    ]
+   },
+   "sites": [
+    "attention.decode",
+    "attention.prefill-large",
+    "attention.prefill-small",
+    "gather-quant-matmul.batch-2",
+    "gather-quant-matmul.batch-4",
+    "gather-quant-matmul.batch-8",
+    "gather-quant-matmul.grouped",
+    "gather-quant-matmul.grouped-small-m",
+    "gather-quant-matmul.small",
+    "moe.combine-large",
+    "moe.combine-small",
+    "moe.down-combine",
+    "moe.gate-up.batch-2",
+    "moe.gate-up.batch-4",
+    "moe.gate-up.batch-8",
+    "moe.gate-up.grouped",
+    "moe.gate-up.grouped-small-m",
+    "moe.gate-up.small",
+    "paged-attention.decode",
+    "paged-attention.prefill-large",
+    "paged-attention.prefill-small",
+    "paged-attention.prefill-tiny",
+    "quant.decode-b2-q4",
+    "quant.decode-b2-q8",
+    "quant.decode-b4-q4",
+    "quant.decode-b4-q8",
+    "quant.decode-b8-q4",
+    "quant.decode-b8-q8",
+    "quant.decode-q4",
+    "quant.decode-q8",
+    "quant.prefill-small",
+    "quant.prefill-tiled",
+    "sample",
+    "top-k"
+   ]
+  },
+  "proof_hash": "0f54ed3e1c21bd80306160d2b7df83f04353aa2cef08bd521970189ca9aac0ac",
+  "toolchain_hash": "6abf13844638ddab6dfad7e174d31af7eb91d9ff4c978d13126d5732decc86dd",
+  "tunings": [],
+  "variants": {
+   "fixed": {
+    "attention.prefill-small": "sdpa.decomposed",
+    "gather-quant-matmul.batch-2": "gather-quant-matmul.route-gemv",
+    "gather-quant-matmul.batch-4": "gather-quant-matmul.route-gemv",
+    "gather-quant-matmul.batch-8": "gather-quant-matmul.route-gemv",
+    "gather-quant-matmul.grouped": "gather-quant-matmul.grouped-32x32-2x2-blocked",
+    "gather-quant-matmul.grouped-small-m": "gather-quant-matmul.grouped-small-m",
+    "gather-quant-matmul.small": "gather-quant-matmul.route-gemv",
+    "moe.combine-large": "matmul.column-gemv",
+    "moe.combine-small": "matmul.steel-64x32x32-2x2",
+    "moe.down-combine": "gather-quant-matmul.route-gemv",
+    "moe.gate-up.batch-2": "gather-quant-matmul.route-gemv",
+    "moe.gate-up.batch-4": "gather-quant-matmul.route-gemv",
+    "moe.gate-up.batch-8": "gather-quant-matmul.route-gemv",
+    "moe.gate-up.grouped": "gather-quant-matmul.grouped-pair-32x32-2x2-blocked",
+    "moe.gate-up.grouped-small-m": "gather-quant-matmul.grouped-pair-small-m",
+    "moe.gate-up.small": "gather-quant-matmul.route-gemv",
+    "paged-attention.prefill-small": "paged-sdpa.steel-half",
+    "paged-attention.prefill-tiny": "paged-sdpa.vector",
+    "quant.decode-b2-q4": "quant-matmul.row-gemv",
+    "quant.decode-b2-q8": "quant-matmul.q8-fast-gemv",
+    "quant.decode-b4-q4": "quant-matmul.row-gemv",
+    "quant.decode-b4-q8": "quant-matmul.q8-fast-gemv",
+    "quant.decode-b8-q4": "quant-matmul.row-gemv",
+    "quant.decode-b8-q8": "quant-matmul.q8-fast-gemv",
+    "quant.decode-q4": "quant-matmul.gemv",
+    "quant.decode-q8": "quant-matmul.q8-fast-gemv",
+    "quant.prefill-small": "quant-matmul.small-m",
+    "quant.prefill-tiled": "quant-matmul.tiled",
+    "sample": "sample.parallel",
+    "top-k": "top-k.single-k8"
+   },
+   "rules": {
+    "attention.decode": {
+     "arms": [
+      {
+       "hi": 510,
+       "lo": 0,
+       "name": "sdpa.decomposed"
+      },
+      {
+       "hi": 1022,
+       "lo": 511,
+       "name": "sdpa.vector-gqa-two-pass-32"
+      },
+      {
+       "hi": 3071,
+       "lo": 1023,
+       "name": "sdpa.vector-gqa-two-pass"
+      },
+      {
+       "hi": 8191,
+       "lo": 3072,
+       "name": "sdpa.vector-gqa-two-pass-128"
+      },
+      {
+       "hi": 32767,
+       "lo": 8192,
+       "name": "sdpa.vector-gqa-two-pass-256"
+      }
+     ],
+     "parameter": "position"
+    },
+    "attention.prefill-large": {
+     "arms": [
+      {
+       "hi": 32767,
+       "lo": 0,
+       "name": "sdpa.steel-half"
+      }
+     ],
+     "parameter": "position"
+    },
+    "paged-attention.decode": {
+     "arms": [
+      {
+       "hi": 510,
+       "lo": 0,
+       "name": "paged-sdpa.vector"
+      },
+      {
+       "hi": 1022,
+       "lo": 511,
+       "name": "paged-sdpa.vector-gqa-two-pass-32"
+      },
+      {
+       "hi": 3071,
+       "lo": 1023,
+       "name": "paged-sdpa.vector-gqa-two-pass"
+      },
+      {
+       "hi": 8191,
+       "lo": 3072,
+       "name": "paged-sdpa.vector-gqa-two-pass-128"
+      },
+      {
+       "hi": 32767,
+       "lo": 8192,
+       "name": "paged-sdpa.vector-gqa-two-pass-256"
+      }
+     ],
+     "parameter": "position"
+    },
+    "paged-attention.prefill-large": {
+     "arms": [
+      {
+       "hi": 2047,
+       "lo": 0,
+       "name": "paged-sdpa.steel-half-32x16"
+      },
+      {
+       "hi": 32767,
+       "lo": 2048,
+       "name": "paged-sdpa.steel-half-64x16"
+      }
+     ],
+     "parameter": "position"
+    }
+   }
+  }
+ },
+ "profile_suffix": "",
+ "rows": [
+  {
+   "id": "decode-512",
+   "profile": "qwen3-coder-30b-a3b-instruct-4bit.metal-apple-m3-ultra.q4"
+  },
+  {
+   "id": "decode-4096",
+   "profile": "qwen3-coder-30b-a3b-instruct-4bit.metal-apple-m3-ultra.q4"
+  },
+  {
+   "id": "decode-8000",
+   "profile": "qwen3-coder-30b-a3b-instruct-4bit.metal-apple-m3-ultra.q4"
+  },
+  {
+   "id": "decode-16000",
+   "profile": "qwen3-coder-30b-a3b-instruct-4bit.metal-apple-m3-ultra.q4"
+  },
+  {
+   "id": "decode-32000",
+   "profile": "qwen3-coder-30b-a3b-instruct-4bit.metal-apple-m3-ultra.q4"
+  },
+  {
+   "id": "prefill-512",
+   "profile": "qwen3-coder-30b-a3b-instruct-4bit.metal-apple-m3-ultra.q4"
+  },
+  {
+   "id": "prefill-2048",
+   "profile": "qwen3-coder-30b-a3b-instruct-4bit.metal-apple-m3-ultra.q4"
+  },
+  {
+   "id": "prefill-16384",
+   "profile": "qwen3-coder-30b-a3b-instruct-4bit.metal-apple-m3-ultra.q4"
+  },
+  {
+   "id": "serving",
+   "profile": "qwen3-coder-30b-a3b-instruct-4bit.metal-apple-m3-ultra.q4"
+  },
+  {
+   "id": "conversation",
+   "profile": "qwen3-coder-30b-a3b-instruct-4bit.metal-apple-m3-ultra.q4"
+  },
+  {
+   "id": "rss-32K",
+   "profile": "qwen3-coder-30b-a3b-instruct-4bit.metal-apple-m3-ultra.q4"
+  }
+ ],
+ "source_commit": "e3c1313"
+}
