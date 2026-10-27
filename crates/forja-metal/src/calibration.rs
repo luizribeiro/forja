@@ -10,6 +10,8 @@ pub(crate) enum Probe {
     Mma(DType, Chains),
     NativeBf16(Chains),
     Threadgroup,
+    #[cfg(test)]
+    PagedContiguity,
 }
 
 #[derive(Clone, Copy)]
@@ -37,18 +39,22 @@ impl Probe {
             Self::Mma(_, _) => "calibration_mma_f32",
             Self::NativeBf16(_) => "calibration_mma_bf16_native",
             Self::Threadgroup => "calibration_threadgroup",
+            #[cfg(test)]
+            Self::PagedContiguity => "paged_contiguity_probe",
         }
     }
     const fn label(self) -> &'static str {
         match self {
             Self::NativeBf16(_) => "calibration_mma_bf16",
-            Self::Mma(_, _) | Self::Threadgroup => self.kernel(),
+            _ => self.kernel(),
         }
     }
     const fn independent_chains(self) -> u32 {
         match self {
             Self::Mma(_, chains) | Self::NativeBf16(chains) => chains.count(),
             Self::Threadgroup => 0,
+            #[cfg(test)]
+            Self::PagedContiguity => 0,
         }
     }
     pub(crate) const fn constants(self) -> [(u32, u32); 2] {
@@ -190,6 +196,8 @@ impl MetalBackend {
             Probe::NativeBf16(_) => Some(DType::BF16),
             Probe::Mma(dtype, _) => Some(dtype),
             Probe::Threadgroup => None,
+            #[cfg(test)]
+            Probe::PagedContiguity => None,
         };
         Ok(PreparedProbe {
             probe,
@@ -213,6 +221,10 @@ impl MetalBackend {
                 2 * 8 * 8 * 8,
             ],
             Probe::Threadgroup => [u64::from(THREADS), 16, 1],
+            #[cfg(test)]
+            Probe::PagedContiguity => {
+                return Err(BackendError::InvalidInput);
+            }
         }
         .into_iter()
         .chain([u64::from(GROUPS), u64::from(ITERATIONS)])
@@ -247,6 +259,10 @@ impl MetalBackend {
                 (initial + work * 0.1, initial + work * 4.0)
             }
             Probe::Threadgroup => (f64::from(ITERATIONS), f64::from(ITERATIONS) * 8.0),
+            #[cfg(test)]
+            Probe::PagedContiguity => {
+                return Err(BackendError::InvalidInput);
+            }
         };
         if values.as_chunks::<4>().0.iter().copied().any(|bytes| {
             let value = f64::from(f32::from_le_bytes(bytes));

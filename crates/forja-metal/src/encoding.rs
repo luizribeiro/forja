@@ -9980,6 +9980,55 @@ mod tests {
 
     use super::*;
 
+    fn assert_paged_integer_probe(
+        probe: crate::calibration::Probe,
+        cases: [[u32; 4]; 4],
+        expected: [[u32; 4]; 4],
+    ) {
+        let backend = MetalBackend::new().unwrap();
+        let input = backend.alloc(DType::U32, &[128]).unwrap();
+        let output = backend.alloc(DType::U32, &[128]).unwrap();
+        let mut bytes = vec![0; 128 * 4];
+        let encoded = cases
+            .into_iter()
+            .flatten()
+            .flat_map(u32::to_le_bytes)
+            .collect::<Vec<_>>();
+        bytes[..encoded.len()].copy_from_slice(&encoded);
+        backend.write(&input, &bytes).unwrap();
+        backend.write(&output, &vec![0; 128 * 4]).unwrap();
+        let mut commands = CommandList::new();
+        commands
+            .dispatch_many_with_backend_data(
+                Op::Copy,
+                &[&input],
+                &[&output],
+                BackendDispatchData::new(probe),
+            )
+            .unwrap();
+        backend.submit(commands).unwrap().wait().unwrap();
+        let expected = expected
+            .into_iter()
+            .flatten()
+            .flat_map(u32::to_le_bytes)
+            .collect::<Vec<_>>();
+        assert_eq!(&backend.read(&output).unwrap()[..expected.len()], expected);
+    }
+
+    #[test]
+    fn metal_paged_contiguity_does_not_wrap_physical_ids() {
+        assert_paged_integer_probe(
+            crate::calibration::Probe::PagedContiguity,
+            [
+                [u32::MAX - 2, 7, 4, 0],
+                [u32::MAX - 7, 7, u32::MAX, 0],
+                [5, 7, 12, 0],
+                [u32::MAX, 1, 0, 0],
+            ],
+            [[0; 4], [1, 0, 0, 0], [1, 0, 0, 0], [0; 4]],
+        );
+    }
+
     fn captured_u32s(buffer: &ProtocolObject<dyn MTLBuffer>, count: usize) -> Vec<u32> {
         // SAFETY: The retained shared-storage buffer contains at least `count` u32 values, and
         // the test reads it only after the submission has completed.

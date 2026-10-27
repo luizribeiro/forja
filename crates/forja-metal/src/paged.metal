@@ -16,6 +16,10 @@ inline bool paged_lane_active(device const uint *activity) {
     return paged_has_activity == 0 || activity[0] != 0;
 }
 
+inline bool paged_pages_are_consecutive(uint first, uint logical, uint physical) {
+    return ulong(physical) == ulong(first) + logical;
+}
+
 kernel void paged_copy(
     device uchar *ordinary [[buffer(0)]],
     device uchar *pool [[buffer(1)]],
@@ -115,10 +119,9 @@ kernel void paged_sdpa_validate(
     bool valid = logical_page < params.logical_pages;
     if (valid) {
         uint2 entry = table[logical_page];
-        uint expected = table[0].x + logical_page;
         valid = entry.x < params.physical_pages
             && generations[entry.x] == entry.y;
-        if (valid && entry.x != expected) {
+        if (valid && !paged_pages_are_consecutive(table[0].x, logical_page, entry.x)) {
             atomic_store_explicit(error_flag + 2, 0, memory_order_relaxed);
         }
     }
@@ -769,3 +772,12 @@ kernel void NAME(                                                            \
 
 DEFINE_PAGED_SDPA(paged_sdpa_64, 64)
 DEFINE_PAGED_SDPA(paged_sdpa_128, 128)
+
+kernel void paged_contiguity_probe(
+    device const uint4 *cases [[buffer(0)]], device uint4 *output [[buffer(1)]],
+    uint index [[thread_position_in_grid]]) {
+    if (index < 4) {
+        uint4 value = cases[index];
+        output[index] = uint4(uint(paged_pages_are_consecutive(value.x, value.y, value.z)), 0, 0, 0);
+    }
+}
