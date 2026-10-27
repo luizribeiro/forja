@@ -40,14 +40,20 @@ def measure(command: list[str]) -> dict:
     return record
 
 
-def metric(record: dict, pointer: str) -> float:
-    """Read a positive finite scalar using a JSON pointer."""
+def value_at(record: dict, pointer: str):
+    """Read one JSON pointer, including array indices and escaped field names."""
     if not pointer.startswith("/"):
         raise ValueError("metric must be a JSON pointer")
     value = record
     for part in pointer[1:].split("/"):
         key = part.replace("~1", "/").replace("~0", "~")
         value = value[int(key)] if isinstance(value, list) else value[key]
+    return value
+
+
+def metric(record: dict, pointer: str) -> float:
+    """Read a positive finite scalar using a JSON pointer."""
+    value = value_at(record, pointer)
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError("drift metric must be numeric")
     if not math.isfinite(value) or value <= 0:
