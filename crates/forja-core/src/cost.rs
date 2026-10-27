@@ -1,6 +1,8 @@
 //! Logical algorithm work; cache reuse and instruction throughput are measured separately.
 
 mod attention;
+#[cfg(test)]
+mod copies;
 mod routed;
 mod scalar;
 mod tiling;
