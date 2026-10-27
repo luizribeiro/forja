@@ -10535,9 +10535,6 @@ mod tests {
 
     #[test]
     fn row_layout_specializations_preserve_bits_and_bound_the_cache() {
-        let candidate = MetalBackend::new().unwrap();
-        let budget = crate::ProgramCompileBudget::new(2, Duration::from_hours(24)).unwrap();
-        let reference = MetalBackend::with_program_compile_budget(budget).unwrap();
         let program = Program {
             kind: ProgramKind::Row,
             insts: vec![
@@ -10549,6 +10546,36 @@ mod tests {
         }
         .validate()
         .unwrap();
+        assert_row_layout_bits(&program);
+    }
+
+    #[test]
+    fn row_layout_specializations_preserve_normalization_bits() {
+        let program = Program {
+            kind: ProgramKind::Row,
+            insts: vec![
+                Inst::Input(0),
+                Inst::Binary(BinOp::Mul, 0, 0),
+                Inst::Reduce(RedOp::Sum, 1),
+                Inst::Extent(0),
+                Inst::Cast(forja_core::program::ValueType::F32, 3),
+                Inst::Binary(BinOp::Div, 2, 4),
+                Inst::Const(1.0e-6),
+                Inst::Binary(BinOp::Add, 5, 6),
+                Inst::Unary(UnOp::Rsqrt, 7),
+                Inst::Binary(BinOp::Mul, 0, 8),
+            ],
+            outputs: vec![(0, 9)],
+        }
+        .validate()
+        .unwrap();
+        assert_row_layout_bits(&program);
+    }
+
+    fn assert_row_layout_bits(program: &ValidatedProgram) {
+        let candidate = MetalBackend::new().unwrap();
+        let budget = crate::ProgramCompileBudget::new(2, Duration::from_hours(24)).unwrap();
+        let reference = MetalBackend::with_program_compile_budget(budget).unwrap();
         let signature = KernelSignature::new(1, vec![DType::F32], vec![DType::F32], 0);
         let prepared = [&reference, &candidate]
             .map(|backend| prepare_program(backend, program.clone(), signature.clone()).unwrap());
