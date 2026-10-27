@@ -192,7 +192,7 @@ impl QuantLinear {
         let rows = input.shape().first().copied().ok_or_else(|| {
             forja_sdk::Error::loading("quantized linear input must have rank two")
         })?;
-        let selection = variants.quant(rows, self.bits)?;
+        let selection = variants.quant(rows, self.bits, self.packed.shape()[0])?;
         input.quant_matmul_with(
             &self.packed,
             &self.scales,

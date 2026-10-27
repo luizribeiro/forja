@@ -5,6 +5,7 @@ use forja_sdk::{
 use crate::reduction_classes::serving_reduction_class;
 
 const SITES: &[&str] = &[
+    "quant.vocab-decode",
     "quant.decode-q4",
     "quant.decode-q8",
     "quant.decode-b2-q4",
@@ -55,8 +56,8 @@ impl Variants {
         )?))
     }
 
-    pub(crate) fn quant(&self, rows: u32, bits: u8) -> Result<Variant> {
-        self.0.at(quant_site(rows, bits), 0)
+    pub(crate) fn quant(&self, rows: u32, bits: u8, columns: u32) -> Result<Variant> {
+        self.0.at(quant_call_site(rows, bits, columns), 0)
     }
 
     pub(crate) fn gather_matmul(&self, routed_rows: u32) -> Result<Variant> {
@@ -110,6 +111,7 @@ impl Variants {
 
 fn validate_batch_reductions(config: &EngineLoadConfig) -> Result<()> {
     for sites in [
+        &["quant.vocab-decode"][..],
         &[
             "quant.decode-q4",
             "quant.decode-b2-q4",
@@ -231,6 +233,14 @@ fn attention_phase(sequence: u32, paged: bool) -> &'static str {
     }
 }
 
+fn quant_call_site(rows: u32, bits: u8, columns: u32) -> &'static str {
+    if rows <= 8 && columns == crate::VOCAB {
+        "quant.vocab-decode"
+    } else {
+        quant_site(rows, bits)
+    }
+}
+
 fn quant_site(rows: u32, bits: u8) -> &'static str {
     match (rows, bits) {
         (1, crate::Q8_BITS) => "quant.decode-q8",
@@ -249,6 +259,24 @@ fn quant_site(rows: u32, bits: u8) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vocabulary_decode_keeps_one_pick_across_batch_buckets() {
+        for rows in [1, 2, 4, 7, 8] {
+            assert_eq!(
+                quant_call_site(rows, crate::Q4_BITS, crate::VOCAB),
+                "quant.vocab-decode"
+            );
+            assert_eq!(
+                quant_call_site(rows, crate::Q4_BITS, 5120),
+                quant_site(rows, crate::Q4_BITS)
+            );
+        }
+        assert_eq!(
+            quant_call_site(16, crate::Q4_BITS, crate::VOCAB),
+            "quant.prefill-tiled"
+        );
+    }
 
     #[test]
     fn classifies_quantized_dispatch_sites_at_boundaries() {
