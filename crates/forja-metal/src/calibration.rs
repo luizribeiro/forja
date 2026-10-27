@@ -1,5 +1,7 @@
 use crate::MetalBackend;
-use forja_core::{Backend, BackendDispatchData, BackendError, CommandList, DType, Op, Submission};
+use forja_core::{
+    Backend, BackendDispatchData, BackendError, CommandList, DType, Op, Submission, Tensor,
+};
 use objc2_metal::MTLComputePipelineState;
 use std::time::{Duration, Instant};
 
@@ -65,7 +67,7 @@ pub struct CalibrationSample {
     pub arithmetic: Option<DType>,
     /// Independent accumulator chains; zero for probes without MMA.
     pub independent_chains: u32,
-    /// Whether an observation selects a configuration rather than estimating its ceiling.
+    /// Whether this observation selected a configuration rather than estimating its ceiling.
     pub screening: bool,
     /// Work units executed in the timed command buffer.
     pub units: u64,
@@ -75,13 +77,20 @@ pub struct CalibrationSample {
     pub gpu: Duration,
 }
 
+#[derive(Clone, Copy)]
+struct PreparedProbe {
+    probe: Probe,
+    arithmetic: Option<DType>,
+    simdgroups: u32,
+}
+
 impl MetalBackend {
-    /// Measures register MMA and threadgroup reads.
+    /// Measures prepared MMA configurations and threadgroup reads.
     ///
-    /// Native BF16 MMA is probed; compiler refusal falls back to explicitly labelled f32 promotion.
+    /// BF16 compiler refusal falls back to explicitly labelled f32 promotion.
     ///
     /// # Errors
-    /// Returns an error for invalid sample counts or any allocation, execution or timing failure.
+    /// Returns an error for invalid counts or allocation, compilation, execution or timing failure.
     pub fn calibrate_compute(
         &self,
         warmups: u32,
@@ -94,31 +103,6 @@ impl MetalBackend {
             .calibration_lock
             .lock()
             .map_err(|_| BackendError::ExecutionFailed)?;
-        let native_source = format!(
-            "#define FORJA_CALIBRATION_NATIVE_BF16 1\n#include <metal_stdlib>\n#include <metal_simdgroup_matrix>\nusing namespace metal;\n{}",
-            include_str!("calibration.metal")
-        );
-        let mut pipelines = self
-            .pipelines
-            .lock()
-            .map_err(|_| BackendError::ExecutionFailed)?;
-        let native_bf16 = pipelines.try_calibration_shader(
-            &native_source,
-            Probe::NativeBf16(Chains::Four).kernel(),
-            &Probe::NativeBf16(Chains::Four).constants(),
-        )?;
-        let f32_probe = Probe::Mma(DType::F32, Chains::Four);
-        let simd_width = u32::try_from(
-            pipelines
-                .get(f32_probe.kernel(), &f32_probe.constants())?
-                .threadExecutionWidth(),
-        )
-        .map_err(|_| BackendError::InvalidInput)?;
-        let simdgroups = THREADS
-            .checked_div(simd_width)
-            .filter(|_| THREADS.is_multiple_of(simd_width))
-            .ok_or(BackendError::InvalidInput)?;
-        drop(pipelines);
         let input = self.alloc(DType::F32, &[GROUPS * THREADS])?;
         let output = self.alloc(DType::F32, &[GROUPS * THREADS])?;
         self.write(
@@ -134,58 +118,124 @@ impl MetalBackend {
             for probe in [
                 Probe::Mma(DType::F32, Chains::Four),
                 Probe::Mma(DType::F16, Chains::Four),
-                if native_bf16 {
-                    Probe::NativeBf16(Chains::Four)
-                } else {
-                    Probe::Mma(DType::BF16, Chains::Four)
-                },
+                Probe::Mma(DType::BF16, Chains::Four),
                 Probe::Threadgroup,
             ] {
-                let units = u64::from(GROUPS)
-                    * u64::from(ITERATIONS)
-                    * match probe {
-                        Probe::Mma(_, _) | Probe::NativeBf16(_) => {
-                            u64::from(simdgroups) * 4 * 2 * 8 * 8 * 8
-                        }
-                        Probe::Threadgroup => u64::from(THREADS) * 16,
-                    };
-                let mut measured =
-                    self.calibration_samples(probe.label(), units, warmups, repetitions, || {
-                        let mut commands = CommandList::new();
-                        commands
-                            .dispatch_many_with_backend_data(
-                                Op::Copy,
-                                &[&input],
-                                &[&output],
-                                BackendDispatchData::new(probe),
-                            )
-                            .map_err(|_| BackendError::InvalidInput)?;
-                        Ok(commands)
-                    })?;
-                for sample in &mut measured {
-                    sample.independent_chains = probe.independent_chains();
-                    sample.kernel = probe.kernel();
-                    sample.arithmetic = match probe {
-                        Probe::Mma(DType::BF16, _) => Some(DType::F32),
-                        Probe::NativeBf16(_) => Some(DType::BF16),
-                        Probe::Mma(dtype, _) => Some(dtype),
-                        Probe::Threadgroup => None,
-                    };
-                }
-                samples.extend(measured);
-                let values = self.read(&output)?;
-                if values.as_chunks::<4>().0.iter().copied().any(|bytes| {
-                    let value = f32::from_le_bytes(bytes);
-                    !value.is_finite() || value < 19.0
-                }) {
-                    return Err(BackendError::ExecutionFailed);
-                }
+                let prepared = self.prepare_calibration_probe(probe)?;
+                samples.extend(self.compute_probe_samples(
+                    prepared,
+                    [&input, &output],
+                    warmups,
+                    repetitions,
+                    false,
+                )?);
             }
             Ok(samples)
         })();
         self.release(&input)?;
         self.release(&output)?;
         result
+    }
+
+    fn prepare_calibration_probe(&self, probe: Probe) -> Result<PreparedProbe, BackendError> {
+        let mut pipelines = self
+            .pipelines
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?;
+        let probe = if let Probe::Mma(DType::BF16, chains) = probe {
+            let native = Probe::NativeBf16(chains);
+            let source = format!(
+                "#define FORJA_CALIBRATION_NATIVE_BF16 1\n#include <metal_stdlib>\n#include <metal_simdgroup_matrix>\nusing namespace metal;\n{}",
+                include_str!("calibration.metal")
+            );
+            if pipelines.try_calibration_shader(&source, native.kernel(), &native.constants())? {
+                native
+            } else {
+                probe
+            }
+        } else {
+            probe
+        };
+        let width = u32::try_from(
+            pipelines
+                .get(probe.kernel(), &probe.constants())?
+                .threadExecutionWidth(),
+        )
+        .map_err(|_| BackendError::InvalidInput)?;
+        let simdgroups = THREADS
+            .checked_div(width)
+            .filter(|_| THREADS.is_multiple_of(width))
+            .ok_or(BackendError::InvalidInput)?;
+        let arithmetic = match probe {
+            Probe::Mma(DType::BF16, _) => Some(DType::F32),
+            Probe::NativeBf16(_) => Some(DType::BF16),
+            Probe::Mma(dtype, _) => Some(dtype),
+            Probe::Threadgroup => None,
+        };
+        Ok(PreparedProbe {
+            probe,
+            arithmetic,
+            simdgroups,
+        })
+    }
+
+    fn compute_probe_samples(
+        &self,
+        prepared: PreparedProbe,
+        tensors: [&Tensor; 2],
+        warmups: u32,
+        repetitions: u32,
+        screening: bool,
+    ) -> Result<Vec<CalibrationSample>, BackendError> {
+        let units = match prepared.probe {
+            Probe::Mma(_, chains) | Probe::NativeBf16(chains) => [
+                u64::from(prepared.simdgroups),
+                u64::from(chains.count()),
+                2 * 8 * 8 * 8,
+            ],
+            Probe::Threadgroup => [u64::from(THREADS), 16, 1],
+        }
+        .into_iter()
+        .chain([u64::from(GROUPS), u64::from(ITERATIONS)])
+        .try_fold(1_u64, u64::checked_mul)
+        .ok_or(BackendError::InvalidInput)?;
+        let [input, output] = tensors;
+        let mut samples =
+            self.calibration_samples(prepared.probe.label(), units, warmups, repetitions, || {
+                let mut commands = CommandList::new();
+                commands
+                    .dispatch_many_with_backend_data(
+                        Op::Copy,
+                        &[input],
+                        &[output],
+                        BackendDispatchData::new(prepared.probe),
+                    )
+                    .map_err(|_| BackendError::InvalidInput)?;
+                Ok(commands)
+            })?;
+        for sample in &mut samples {
+            sample.kernel = prepared.probe.kernel();
+            sample.arithmetic = prepared.arithmetic;
+            sample.independent_chains = prepared.probe.independent_chains();
+            sample.screening = screening;
+        }
+        let values = self.read(output)?;
+        let (minimum, maximum) = match prepared.probe {
+            Probe::Mma(_, chains) | Probe::NativeBf16(chains) => {
+                let chains = f64::from(chains.count());
+                let initial = chains * (chains + 1.0);
+                let work = 2.0 * chains * 8.0 * f64::from(ITERATIONS) * 0.001 * 0.002;
+                (initial + work * 0.1, initial + work * 4.0)
+            }
+            Probe::Threadgroup => (f64::from(ITERATIONS), f64::from(ITERATIONS) * 8.0),
+        };
+        if values.as_chunks::<4>().0.iter().copied().any(|bytes| {
+            let value = f64::from(f32::from_le_bytes(bytes));
+            !value.is_finite() || value < minimum || value > maximum
+        }) {
+            return Err(BackendError::ExecutionFailed);
+        }
+        Ok(samples)
     }
 }
 
@@ -269,18 +319,11 @@ mod tests {
 
     #[test]
     fn native_bf16_identifier_selects_an_explicit_bfloat_mma_kernel() {
-        assert_eq!(
-            Probe::NativeBf16(Chains::Four).kernel(),
-            "calibration_mma_bf16_native"
-        );
-        assert_ne!(
-            Probe::NativeBf16(Chains::Four).kernel(),
-            Probe::Mma(DType::BF16, Chains::Four).kernel()
-        );
-        assert_eq!(
-            Probe::NativeBf16(Chains::Four).label(),
-            Probe::Mma(DType::BF16, Chains::Four).label()
-        );
+        let native = Probe::NativeBf16(Chains::Four);
+        let promoted = Probe::Mma(DType::BF16, Chains::Four);
+        assert_eq!(native.kernel(), "calibration_mma_bf16_native");
+        assert_ne!(native.kernel(), promoted.kernel());
+        assert_eq!(native.label(), promoted.label());
         assert!(
             include_str!("calibration.metal")
                 .contains("calibration_mma_kernel(calibration_mma_bf16_native, bfloat, bfloat)")
@@ -291,14 +334,33 @@ mod tests {
     fn metal_calibration_executes_observable_mma_and_threadgroup_work() {
         let backend = MetalBackend::new().unwrap();
         let samples = backend.calibrate_compute(0, 1).unwrap();
-        assert_eq!(samples.len(), 4);
-        assert_eq!(samples[0].arithmetic, Some(DType::F32));
-        assert_eq!(samples[1].arithmetic, Some(DType::F16));
+        assert_eq!(samples.iter().filter(|sample| sample.screening).count(), 0);
+        let measured = samples
+            .iter()
+            .filter(|sample| !sample.screening)
+            .collect::<Vec<_>>();
+        assert_eq!(measured.len(), 4);
+        assert_eq!(measured[0].arithmetic, Some(DType::F32));
+        assert_eq!(measured[1].arithmetic, Some(DType::F16));
         assert!(matches!(
-            samples[2].arithmetic,
+            measured[2].arithmetic,
             Some(DType::BF16 | DType::F32)
         ));
-        assert_eq!(samples[3].arithmetic, None);
+        assert_eq!(measured[2].name, "calibration_mma_bf16");
+        assert_eq!(
+            measured[2].kernel,
+            if measured[2].arithmetic == Some(DType::BF16) {
+                "calibration_mma_bf16_native"
+            } else {
+                "calibration_mma_bf16"
+            }
+        );
+        assert_eq!(measured[3].arithmetic, None);
+        assert!(
+            measured[..3]
+                .iter()
+                .all(|sample| [4, 8, 16].contains(&sample.independent_chains))
+        );
         assert!(samples.iter().all(|sample| sample.gpu > Duration::ZERO
             && sample.wall > Duration::ZERO
             && sample.units > 0));
