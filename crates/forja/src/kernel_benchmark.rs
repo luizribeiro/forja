@@ -11,7 +11,7 @@ pub(crate) struct Options {
     /// JSON operation, tensor shapes, data and optional permutations.
     #[arg(long)]
     pub(crate) shape: PathBuf,
-    /// Number of measured single-dispatch submissions.
+    /// Number of measured submissions.
     #[arg(long, default_value = "5")]
     pub(crate) reps: std::num::NonZeroU32,
     /// Independent operand sets, visited cyclically within each submission.
