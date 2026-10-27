@@ -67,7 +67,8 @@ pub(super) fn count(dispatch: &Dispatch, mut cost: KernelCost) -> Option<KernelC
         | Op::Matmul
         | Op::QuantMatmul { .. }
         | Op::Sdpa { .. }
-        | Op::PagedSdpa { .. } => return Some(cost),
+        | Op::PagedSdpa { .. }
+        | Op::PagedSdpaAppend { .. } => return Some(cost),
     };
     let experts = u64::from(inputs[1].layout().shape()[0]);
     let per_expert = per_expert_bytes(weights, experts)?;

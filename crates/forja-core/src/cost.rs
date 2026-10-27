@@ -83,7 +83,8 @@ impl KernelCost {
             | Op::GatherMatmul
             | Op::GatherQuantMatmul { .. }
             | Op::Sdpa { .. }
-            | Op::PagedSdpa { .. } => {}
+            | Op::PagedSdpa { .. }
+            | Op::PagedSdpaAppend { .. } => {}
         }
         scalar::count(
             dispatch,

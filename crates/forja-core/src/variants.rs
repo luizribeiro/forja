@@ -11,6 +11,8 @@ pub enum OperationKind {
     QuantMatmul,
     /// Routed affine-quantized matrix multiplication.
     GatherQuantMatmul,
+    /// Paged attention with an appended key/value row.
+    PagedSdpaAppend,
     /// Scaled dot-product attention.
     Sdpa,
     /// Scaled dot-product attention over authenticated page tables.
@@ -32,6 +34,7 @@ impl OperationKind {
             Op::QuantMatmul { .. } => Self::QuantMatmul,
             Op::GatherQuantMatmul { .. } => Self::GatherQuantMatmul,
             Op::Sdpa { .. } => Self::Sdpa,
+            Op::PagedSdpaAppend { .. } => Self::PagedSdpaAppend,
             Op::PagedSdpa { .. } => Self::PagedSdpa,
             Op::TopK { .. } => Self::TopK,
             Op::Sample { .. } => Self::Sample,
@@ -47,6 +50,7 @@ impl fmt::Display for OperationKind {
             Self::QuantMatmul => "quant-matmul",
             Self::GatherQuantMatmul => "gather-quant-matmul",
             Self::Sdpa => "sdpa",
+            Self::PagedSdpaAppend => "paged-sdpa-append",
             Self::PagedSdpa => "paged-sdpa",
             Self::TopK => "top-k",
             Self::Sample => "sample",
@@ -151,7 +155,9 @@ pub fn operation_value(op: Op, value: OperationValue) -> Option<u64> {
         ) => Some(u64::from(group_size)),
         (Op::TopK { k, .. }, OperationValue::TopK) => Some(u64::from(k)),
         (
-            Op::PagedCopy { page_tokens, .. } | Op::PagedSdpa { page_tokens, .. },
+            Op::PagedCopy { page_tokens, .. }
+            | Op::PagedSdpa { page_tokens, .. }
+            | Op::PagedSdpaAppend { page_tokens, .. },
             OperationValue::PageTokens,
         ) => Some(u64::from(page_tokens)),
         _ => None,

@@ -28,7 +28,8 @@ pub(super) fn count(dispatch: &Dispatch, mut cost: KernelCost) -> Option<KernelC
             key_length,
             ..
         } => (causal, q_start, key_length, true),
-        Op::Program(_)
+        Op::PagedSdpaAppend { .. }
+        | Op::Program(_)
         | Op::Copy
         | Op::PagedCopy { .. }
         | Op::RmsNorm { .. }

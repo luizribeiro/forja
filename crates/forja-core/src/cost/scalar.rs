@@ -91,7 +91,8 @@ pub(super) fn count(dispatch: &Dispatch, mut cost: KernelCost) -> Option<KernelC
         | Op::QuantMatmul { .. }
         | Op::GatherQuantMatmul { .. }
         | Op::Sdpa { .. }
-        | Op::PagedSdpa { .. } => cost.scalar_ops,
+        | Op::PagedSdpa { .. }
+        | Op::PagedSdpaAppend { .. } => cost.scalar_ops,
     };
     if let Some(epilogue) = dispatch.prepared_epilogue() {
         cost.scalar_ops = cost.scalar_ops.checked_add(program_ops(

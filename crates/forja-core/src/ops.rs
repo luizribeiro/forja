@@ -258,6 +258,17 @@ pub enum Op {
         /// The absolute position of the first query.
         q_start: u32,
     },
+    /// Appends one key/value row and attends through it using host-owned paged planes.
+    /// Outputs are attention, key pages, and value pages; inputs supply query, new K/V, table,
+    /// generations, and optional lane activity. Page planes remain inaccessible to guests.
+    PagedSdpaAppend {
+        /// Attention score multiplier.
+        scale: f32,
+        /// Position receiving the appended token.
+        q_start: u32,
+        /// Tokens stored in one page.
+        page_tokens: u32,
+    },
     /// Computes grouped-query attention directly over paged K/V planes.
     PagedSdpa {
         /// The score multiplier.
@@ -517,6 +528,22 @@ impl Dispatch {
         }
         Ok(rebound)
     }
+    /// Returns query, key pages, value pages, table, and generations for paged attention.
+    ///
+    /// Appended page planes are writable outputs; ordinary paged attention reads its inputs.
+    #[must_use]
+    pub fn paged_attention_inputs(&self) -> Option<[&Tensor; 5]> {
+        let [query, key, value, table, generations, ..] = self.inputs.as_slice() else {
+            return None;
+        };
+        let (key, value) = match self.op {
+            Op::PagedSdpa { .. } => (key, value),
+            Op::PagedSdpaAppend { .. } => (self.outputs.get(1)?, self.outputs.get(2)?),
+            _ => return None,
+        };
+        Some([query, key, value, table, generations])
+    }
+
     pub(crate) fn new(op: Op, inputs: &[&Tensor], output: &Tensor) -> Result<Self, OpError> {
         Self::new_many(op, inputs, &[output])
     }
@@ -530,6 +557,7 @@ impl Dispatch {
         check_common(inputs, outputs)?;
         let expected_outputs = match op {
             Op::TopK { .. } => 2,
+            Op::PagedSdpaAppend { .. } => 3,
             _ => 1,
         };
         if outputs.len() != expected_outputs {
@@ -604,6 +632,13 @@ impl Dispatch {
                 causal,
                 q_start,
             } => check_sdpa(inputs, output, scale, causal, q_start)?,
+            Op::PagedSdpaAppend {
+                scale,
+                q_start,
+                page_tokens,
+            } => {
+                check_paged_append(inputs, outputs, scale, q_start, page_tokens)?;
+            }
             Op::PagedSdpa {
                 scale,
                 causal,
@@ -2070,6 +2105,50 @@ fn check_sdpa(
     Ok(())
 }
 
+fn check_paged_append(
+    inputs: &[&Tensor],
+    outputs: &[&Tensor],
+    scale: f32,
+    q_start: u32,
+    page_tokens: u32,
+) -> Result<(), OpError> {
+    if !matches!(inputs.len(), 5 | 6) {
+        return Err(OpError::Arity {
+            expected: 5,
+            actual: inputs.len(),
+        });
+    }
+    let length = q_start
+        .checked_add(1)
+        .ok_or(OpError::InvalidKernelParameter)?;
+    let mut attention = vec![inputs[0], outputs[1], outputs[2], inputs[3], inputs[4]];
+    attention.extend(inputs.get(5).copied());
+    check_paged_sdpa(
+        &attention,
+        outputs[0],
+        scale,
+        true,
+        q_start,
+        length,
+        page_tokens,
+    )?;
+    if outputs[1].layout.shape()[3] != outputs[2].layout.shape()[3] {
+        return Err(OpError::InvalidKernelParameter);
+    }
+    if inputs[0].layout.shape()[1] != 1 {
+        return Err(shape_error(Operand::Input(0)));
+    }
+    for index in [1, 2] {
+        let pool = outputs[index].layout.shape();
+        if inputs[index].layout.dtype() != inputs[0].layout.dtype()
+            || inputs[index].layout.shape() != [1, pool[2], pool[3]]
+        {
+            return Err(shape_error(Operand::Input(index)));
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn check_paged_sdpa(
     inputs: &[&Tensor],
@@ -2423,6 +2502,30 @@ mod tests {
                 4,
             ),
             Ok(())
+        );
+    }
+
+    #[test]
+    fn paged_append_refuses_different_value_width() {
+        let query = tensor(1, DType::F32, &[2, 1, 4], &[4, 4, 1]);
+        let key = tensor(2, DType::F32, &[1, 1, 4], &[4, 4, 1]);
+        let value = tensor(3, DType::F32, &[1, 1, 2], &[2, 2, 1]);
+        let table = tensor(4, DType::U32, &[1, 2], &[2, 1]);
+        let generations = tensor(5, DType::U32, &[1], &[1]);
+        let output = tensor(6, DType::F32, &[2, 1, 2], &[2, 2, 1]);
+        let keys = tensor(7, DType::F16, &[1, 4, 1, 4], &[16, 4, 4, 1]);
+        let values = tensor(8, DType::F16, &[1, 4, 1, 2], &[8, 2, 2, 1]);
+        assert_eq!(
+            CommandList::new().dispatch_many(
+                Op::PagedSdpaAppend {
+                    scale: 1.0,
+                    q_start: 0,
+                    page_tokens: 4
+                },
+                &[&query, &key, &value, &table, &generations],
+                &[&output, &keys, &values],
+            ),
+            Err(OpError::InvalidKernelParameter)
         );
     }
 

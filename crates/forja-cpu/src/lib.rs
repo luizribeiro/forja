@@ -1422,6 +1422,7 @@ impl Backend for CpuBackend {
                 } => {
                     self.execute_sdpa(dispatch.inputs(), dispatch.output(), scale, causal, q_start)
                 }
+                Op::PagedSdpaAppend { .. } => Err(BackendError::UnsupportedOperation),
                 Op::PagedSdpa {
                     scale,
                     causal,

@@ -73,7 +73,8 @@ impl CostModel {
             | Op::QuantEmbed { .. }
             | Op::GatherMatmul
             | Op::Sdpa { .. }
-            | Op::PagedSdpa { .. } => return Some([cost.flops; 2]),
+            | Op::PagedSdpa { .. }
+            | Op::PagedSdpaAppend { .. } => return Some([cost.flops; 2]),
         };
         let factor = product(&[2, batch, round(columns, tn)?, round(inner, tk)?])?;
         Some([
@@ -94,6 +95,7 @@ fn attention_padded(tiles: &[(u32, [u32; 2])], dispatch: &Dispatch) -> Option<[u
         Op::Sdpa {
             causal, q_start, ..
         } => (causal, q_start, input[1].layout().shape()[1]),
+        Op::PagedSdpaAppend { q_start, .. } => (true, q_start, q_start.checked_add(1)?),
         Op::PagedSdpa {
             causal,
             q_start,

@@ -1244,7 +1244,7 @@ pub(crate) const fn portable_name(operation: OperationKind) -> Option<&'static s
         OperationKind::PagedSdpa => Some("paged-sdpa.vector"),
         OperationKind::TopK => Some("top-k.portable"),
         OperationKind::Sample => Some("sample.portable"),
-        OperationKind::Other => None,
+        OperationKind::PagedSdpaAppend | OperationKind::Other => None,
     }
 }
 
@@ -1257,7 +1257,7 @@ pub(crate) const fn portable_implementation(operation: OperationKind) -> Option<
         OperationKind::PagedSdpa => Some(MetalVariant::PagedSdpaVector),
         OperationKind::TopK => Some(MetalVariant::TopKPortable),
         OperationKind::Sample => Some(MetalVariant::SamplePortable),
-        OperationKind::Other => None,
+        OperationKind::PagedSdpaAppend | OperationKind::Other => None,
     }
 }
 

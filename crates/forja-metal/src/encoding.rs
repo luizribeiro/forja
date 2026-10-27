@@ -3208,6 +3208,7 @@ impl MetalBackend {
             return Ok(());
         }
         let buffers = match dispatch.op() {
+            Op::PagedSdpaAppend { .. } => return Err(BackendError::UnsupportedOperation),
             Op::RmsNorm { eps } => {
                 self.encode_rms_norm(encoder, table, dispatch, eps, bindings, arguments)?
             }
@@ -7563,6 +7564,7 @@ impl MetalBackend {
         arguments: &mut ArgumentSizer,
     ) -> Result<(), BackendError> {
         match dispatch.op() {
+            Op::PagedSdpaAppend { .. } => return Err(BackendError::UnsupportedOperation),
             Op::Program(_) => {
                 let program = dispatch.bound_program().ok_or(BackendError::InvalidInput)?;
                 for _ in program.inputs().iter().chain(program.outputs()) {
@@ -8150,6 +8152,7 @@ fn supported_dispatch(dispatch: &Dispatch) -> bool {
         return false;
     }
     match dispatch.op() {
+        Op::PagedSdpaAppend { .. } => false,
         Op::Program(_) => dispatch.bound_program().is_some(),
         Op::Copy
         | Op::PagedCopy { .. }
@@ -8312,6 +8315,7 @@ fn internal_dispatch_profiles(
 
 pub(super) fn dispatch_kernel(dispatch: &Dispatch) -> Result<&'static str, BackendError> {
     Ok(match dispatch.op() {
+        Op::PagedSdpaAppend { .. } => return Err(BackendError::UnsupportedOperation),
         Op::Program(_) => match dispatch
             .bound_program()
             .ok_or(BackendError::InvalidInput)?
