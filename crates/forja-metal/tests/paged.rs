@@ -553,7 +553,52 @@ fn run_sdpa<B: Backend + 'static>(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
+struct AppendOperand {
+    source: Tensor,
+    expected: Vec<u8>,
+    before: Vec<u8>,
+    written: std::ops::Range<usize>,
+}
+
+fn append_operand<B: Backend>(
+    backend: &B,
+    pool: &Tensor,
+    values: &[f32],
+    physical_token: u32,
+) -> Result<AppendOperand, BackendError> {
+    let shape = pool.layout().shape();
+    let elements = usize::try_from(shape[2] * shape[3]).unwrap();
+    let first = usize::try_from(physical_token).unwrap() * elements;
+    let source_values = &values[first..first + elements];
+    let storage = backend.alloc(DType::F32, &[1, shape[2], shape[3] * 2])?;
+    let backing = source_values
+        .iter()
+        .flat_map(|&value| [f32::NAN, value])
+        .collect::<Vec<_>>();
+    backend.write(&storage, &encode(&backing, DType::F32))?;
+    let source = backend.view(
+        &storage,
+        ViewOp::Slice(vec![
+            Slice::new(0, 1, 1).unwrap(),
+            Slice::new(0, shape[2], 1).unwrap(),
+            Slice::new(1, shape[3], 2).unwrap(),
+        ]),
+    )?;
+    let expected = encode(values, pool.layout().dtype());
+    let mut poisoned = values.to_vec();
+    poisoned[first..first + elements].fill(f32::NAN);
+    let before = encode(&poisoned, pool.layout().dtype());
+    backend.write(pool, &before)?;
+    let element_bytes = expected.len() / values.len();
+    Ok(AppendOperand {
+        source,
+        expected,
+        before,
+        written: first * element_bytes..(first + elements) * element_bytes,
+    })
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn run_sdpa_with_page_tokens<B: Backend + 'static>(
     backend: &B,
     dtype: DType,
@@ -622,35 +667,87 @@ fn run_sdpa_with_page_tokens<B: Backend + 'static>(
         }
     }
     backend.write(&query_storage, &encode(&query_storage_values, DType::F32))?;
-    backend.write(&key, &encode(&keys, dtype))?;
-    backend.write(&value, &encode(&values, dtype))?;
+    let append = if variant.is_some_and(|name| name.starts_with("paged-sdpa-append.")) {
+        let physical_token = entries[usize::try_from(q_start / page_tokens).unwrap()].0
+            * page_tokens
+            + q_start % page_tokens;
+        Some([
+            append_operand(backend, &key, &keys, physical_token)?,
+            append_operand(backend, &value, &values, physical_token)?,
+        ])
+    } else {
+        backend.write(&key, &encode(&keys, dtype))?;
+        backend.write(&value, &encode(&values, dtype))?;
+        None
+    };
     backend.write(&table, &table_bytes(&entries))?;
     backend.write(&generation_tensor, &generation_bytes(&generations))?;
     backend.write(&activity, &1_u32.to_ne_bytes())?;
     let mut commands = CommandList::new();
-    commands
-        .dispatch(
-            Op::PagedSdpa {
-                scale: 1.0 / (WIDTH as f32).sqrt(),
-                causal,
-                q_start,
-                key_length,
-                page_tokens,
-            },
-            &[&query, &key, &value, &table, &generation_tensor, &activity],
-            &output,
-        )
-        .map_err(|_| BackendError::InvalidInput)?;
-    if let Some(name) = variant {
-        let metal = (backend as &dyn Any)
-            .downcast_ref::<forja_metal::MetalBackend>()
-            .unwrap();
+    if let Some([new_key, new_value]) = &append {
+        commands
+            .dispatch_many(
+                Op::PagedSdpaAppend {
+                    scale: 1.0 / (WIDTH as f32).sqrt(),
+                    q_start,
+                    page_tokens,
+                },
+                &[
+                    &query,
+                    &new_key.source,
+                    &new_value.source,
+                    &table,
+                    &generation_tensor,
+                    &activity,
+                ],
+                &[&output, &key, &value],
+            )
+            .map_err(|_| BackendError::InvalidInput)?;
+    } else {
+        commands
+            .dispatch(
+                Op::PagedSdpa {
+                    scale: 1.0 / (WIDTH as f32).sqrt(),
+                    causal,
+                    q_start,
+                    key_length,
+                    page_tokens,
+                },
+                &[&query, &key, &value, &table, &generation_tensor, &activity],
+                &output,
+            )
+            .map_err(|_| BackendError::InvalidInput)?;
+    }
+    if let (Some(name), Some(metal)) = (
+        variant,
+        (backend as &dyn Any).downcast_ref::<forja_metal::MetalBackend>(),
+    ) {
         let selection = metal
             .validate_variant(commands.last_dispatch().unwrap(), name)
             .map_err(|_| BackendError::UnsupportedOperation)?;
         assert!(commands.set_last_backend_data(BackendDispatchData::new(selection)));
     }
-    finish_sdpa(backend, &output, backend.submit(commands)?, rejected_output)
+    let result = finish_sdpa(backend, &output, backend.submit(commands)?, rejected_output);
+    if let Some(operands) = append {
+        for (pool, operand) in [&key, &value].into_iter().zip(operands) {
+            let actual = backend.read(pool)?;
+            if result.is_ok() {
+                assert_eq!(actual, operand.expected);
+            } else if corrupt_pages.contains(&usize::try_from(q_start / page_tokens).unwrap()) {
+                assert_eq!(actual, operand.before);
+            } else {
+                assert_eq!(
+                    actual[..operand.written.start],
+                    operand.before[..operand.written.start]
+                );
+                assert_eq!(
+                    actual[operand.written.end..],
+                    operand.before[operand.written.end..]
+                );
+            }
+        }
+    }
+    result
 }
 
 fn assert_inactive_sdpa_zeroes_without_reading_pool(
@@ -956,6 +1053,44 @@ real_shape_tests!(
     (metal_paged_sdpa_matches_cpu_at_16384_bf16_heads_8_11, DType::BF16, 16_384, 2, 8..12),
     (metal_paged_sdpa_matches_cpu_at_16384_bf16_heads_12_15, DType::BF16, 16_384, 2, 12..16),
 );
+
+#[test]
+fn paged_append_cpu_matches_populated_attention() {
+    let cpu = forja_cpu::CpuBackend::new();
+    for dtype in [DType::F32, DType::F16, DType::BF16] {
+        let reference = run_sdpa(
+            &cpu,
+            dtype,
+            513,
+            1,
+            true,
+            false,
+            32,
+            4,
+            (0, 0),
+            &[],
+            None,
+            None,
+        )
+        .unwrap();
+        let actual = run_sdpa(
+            &cpu,
+            dtype,
+            513,
+            1,
+            true,
+            false,
+            32,
+            4,
+            (0, 0),
+            &[],
+            Some("paged-sdpa-append.vector-gqa-two-pass-32"),
+            None,
+        )
+        .unwrap();
+        forja_testing::assert_f32_values_agree(&reference, &actual).unwrap();
+    }
+}
 
 fn check_paged_gqa_two_pass(length: u32, variant: &str, heads: (u32, u32)) {
     let cpu = forja_cpu::CpuBackend::new();
