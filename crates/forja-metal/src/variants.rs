@@ -1893,6 +1893,60 @@ mod tests {
 
     use super::*;
 
+    fn assert_quant_tail_refusals(dispatch: &Dispatch, name: &str, multiples: (u64, u64)) {
+        let (bits, inner) = match dispatch.op() {
+            Op::QuantMatmul { bits, .. } => (bits, INNER),
+            Op::GatherQuantMatmul { bits, .. } => (bits, dim("inner", INPUT, Axis::FromEnd(1))),
+            _ => unreachable!(),
+        };
+        let definition = REGISTRY.iter().find(|entry| entry.name == name).unwrap();
+        let constraints = variant_constraints(definition, dispatch.primitive_inputs().len());
+        for required in [
+            value(inner, Relation::MultipleOf(multiples.0)),
+            operation(OperationValue::GroupSize, Relation::MultipleOf(multiples.1)),
+        ] {
+            assert!(
+                constraints.contains(&required),
+                "{name}: missing {required}"
+            );
+        }
+        assert!(resolve(dispatch, name, METAL4).is_ok());
+        let backend = CpuBackend::new();
+        for (inner, group, expected) in [
+            (784, 64, forja_core::QuantizedMatrixError::ColumnsNotGrouped),
+            (
+                768,
+                48,
+                forja_core::QuantizedMatrixError::UnsupportedGroupSize,
+            ),
+        ] {
+            let packed = backend
+                .alloc(DType::U32, &[33, inner * u32::from(bits) / 32])
+                .unwrap();
+            let parameters = backend.alloc(DType::F16, &[33, inner / group]).unwrap();
+            let result = forja_core::QuantizedMatrix::new(
+                33,
+                inner,
+                bits,
+                group,
+                packed.layout().clone(),
+                parameters.layout().clone(),
+                parameters.layout().clone(),
+            );
+            assert_eq!(
+                result.unwrap_err(),
+                expected,
+                "{name}: inner={inner}, group={group}"
+            );
+        }
+    }
+
+    #[test]
+    fn quantized_core_and_catalog_pin_tail_contracts() {
+        let dispatch = quant_dispatch(DType::F32, 1, 768, false);
+        assert_quant_tail_refusals(&dispatch, "quant-matmul.q8-fast-gemv", (256, 8));
+    }
+
     #[test]
     fn profiling_alternatives_pass_the_current_dispatch_contract() {
         let dispatch = matmul_dispatch(7);
