@@ -155,6 +155,7 @@ pub(crate) struct Bench {
 pub(crate) struct BenchMode {
     pub(crate) remeasure: bool,
     pub(crate) no_early_stop: bool,
+    pub(crate) raw_samples: bool,
 }
 
 #[derive(Debug, PartialEq)]
@@ -232,9 +233,8 @@ struct BenchArgs {
     /// Number of measured repetitions.
     #[arg(long, value_parser = parse_positive)]
     reps: Option<u32>,
-    /// Explicitly retain fixed repetitions without sequential stopping.
-    #[arg(long)]
-    no_early_stop: bool,
+    #[command(flatten)]
+    sampling_mode: SamplingModeArgs,
     /// Path for the JSON report.
     #[arg(long)]
     json: Option<PathBuf>,
@@ -254,6 +254,16 @@ struct BenchArgs {
     tuning: TuningBenchArgs,
     #[command(flatten)]
     record: RecordBenchArgs,
+}
+
+#[derive(Args)]
+struct SamplingModeArgs {
+    /// Explicitly retain fixed repetitions without sequential stopping.
+    #[arg(long)]
+    no_early_stop: bool,
+    /// Retain every rep with wall/GPU timing and measurement-window bounds.
+    #[arg(long)]
+    raw_samples: bool,
 }
 
 #[derive(Args)]
@@ -1109,7 +1119,8 @@ impl BenchArgs {
             accept_from: self.record.accept_from,
             mode: BenchMode {
                 remeasure: self.record.remeasure,
-                no_early_stop: self.no_early_stop,
+                no_early_stop: self.sampling_mode.no_early_stop,
+                raw_samples: self.sampling_mode.raw_samples,
             },
         })
     }

@@ -35,11 +35,12 @@ pub(crate) struct Summary {
     pub(crate) submissions: Stats,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, serde::Serialize)]
 struct Sample {
     wall_seconds: f64,
     gpu_seconds: f64,
     submissions: u32,
+    measurement_window: [f64; 2],
 }
 
 pub(crate) struct TokenProfile {
@@ -68,6 +69,7 @@ struct ProfileMeasurement {
 struct ContextMeasurement {
     context_start: usize,
     summary: Summary,
+    samples: Vec<Sample>,
 }
 
 #[derive(Clone)]
@@ -80,6 +82,7 @@ struct BatchDecodeMeasurement {
     summary: Summary,
     wall_itl: Stats,
     gpu_itl: Stats,
+    samples: Vec<Sample>,
 }
 
 const REPLAY_VALIDATION_ITERATIONS: u32 = 100_000;
@@ -129,6 +132,7 @@ struct BenchMeasurement {
     profiles: Vec<ProfileMeasurement>,
     output_digest: String,
     peak_footprint: u64,
+    raw_samples: serde_json::Value,
 }
 
 struct Acceptance {
@@ -1247,6 +1251,7 @@ async fn measure_points(
                     profiles,
                     output_digest,
                     peak_footprint,
+                    raw_samples,
                 } = bench_engine(options, point, component, host_argmax, overlap).await?;
                 if record_device.as_ref().is_some_and(|known| known != &device) {
                     return Err("benchmark engines opened different Metal devices".into());
@@ -1262,13 +1267,7 @@ async fn measure_points(
                         context.summary,
                     );
                 }
-                let profile_reports = profiles
-                    .iter()
-                    .map(profile_report)
-                    .collect::<Result<Vec<_>, _>>()?;
-                for report in &profile_reports {
-                    print_profile_report(&engine, selection, report);
-                }
+                let profile_reports = report_profiles(&profiles, &engine, selection)?;
                 let mut result = serde_json::json!({
                     "input": input,
                     "point": point.values,
@@ -1299,6 +1298,9 @@ async fn measure_points(
                         profile_reports.iter().map(profile_json).collect(),
                     );
                 }
+                if options.mode.raw_samples {
+                    attach_raw_samples(&mut result, raw_samples, &batches);
+                }
                 results.push(result);
             }
         }
@@ -1307,6 +1309,35 @@ async fn measure_points(
         results,
         record_device.ok_or("benchmark produced no results")?,
     ))
+}
+
+fn report_profiles(
+    profiles: &[ProfileMeasurement],
+    engine: &str,
+    selection: &str,
+) -> Result<Vec<ProfileReport>, Box<dyn Error>> {
+    let reports = profiles
+        .iter()
+        .map(profile_report)
+        .collect::<Result<Vec<_>, _>>()?;
+    for report in &reports {
+        print_profile_report(engine, selection, report);
+    }
+    Ok(reports)
+}
+
+fn attach_raw_samples(
+    result: &mut serde_json::Value,
+    raw: serde_json::Value,
+    batches: &[BatchDecodeMeasurement],
+) {
+    result["raw_samples"] = raw;
+    result["raw_samples"]["batch_decode"] = serde_json::json!(
+        batches
+            .iter()
+            .map(|batch| serde_json::json!({"bucket": batch.bucket, "samples": batch.samples}))
+            .collect::<Vec<_>>()
+    );
 }
 
 fn sampling_fallbacks_json(report: &ProfileReport) -> Option<serde_json::Value> {
@@ -1474,6 +1505,9 @@ async fn bench_engine(
     Ok(BenchMeasurement {
         pp: summarize(&pp, point.pp)?,
         tg: summarize(&tg, point.tg)?,
+        raw_samples: serde_json::json!({"clock": "unix-end-with-monotonic-duration",
+            "pp": pp, "tg": tg, "contexts": contexts.iter().map(|context|
+                serde_json::json!({"context_start": context.context_start, "samples": context.samples})).collect::<Vec<_>>()}),
         contexts,
         device,
         profiles,
@@ -1632,6 +1666,7 @@ async fn measure_record_batches(
             summary,
             wall_itl: stats(samples.iter().map(|sample| sample.wall_seconds / steps)),
             gpu_itl: stats(samples.iter().map(|sample| sample.gpu_seconds / steps)),
+            samples,
         });
     }
     Ok(measurements)
@@ -1860,6 +1895,7 @@ async fn measure_contexts(
         measurements.push(ContextMeasurement {
             context_start,
             summary: summarize(&samples, point.tg)?,
+            samples,
         });
     }
     Ok(measurements)
@@ -2185,6 +2221,7 @@ async fn measure_pipelined_profile_step(
         wall_seconds: sample.wall_seconds / 2.0,
         gpu_seconds: sample.gpu_seconds / 2.0,
         submissions: sample.submissions / 2,
+        ..sample
     })
 }
 
@@ -2335,7 +2372,11 @@ fn sample(
     if timed != submissions {
         return Err("a Metal submission did not report GPU time".into());
     }
+    let end = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs_f64();
     Ok(Sample {
+        measurement_window: [end - wall_time.as_secs_f64(), end],
         wall_seconds: wall_time.as_secs_f64(),
         gpu_seconds: after
             .gpu_time
@@ -2893,6 +2934,24 @@ mod tests {
         let accepted = accepted_profile(&source, &profile, &engine).unwrap();
         assert_eq!(accepted.default_tunings(), ["final-norm"]);
         assert_eq!(accepted.variants(), &expected.variants);
+    }
+
+    #[test]
+    fn raw_samples_retain_rep_counts_and_measurement_windows() {
+        let measured = Sample {
+            wall_seconds: 2.,
+            gpu_seconds: 1.,
+            submissions: 1,
+            measurement_window: [5., 7.],
+        };
+        let records = serde_json::to_value(vec![measured; 30]).unwrap();
+        assert_eq!(records.as_array().unwrap().len(), 30);
+        let window = &records[0]["measurement_window"];
+        assert_eq!(
+            window[1].as_f64().unwrap() - window[0].as_f64().unwrap(),
+            2.0
+        );
+        assert_eq!(records[0]["wall_seconds"], 2.0);
     }
 
     #[test]
