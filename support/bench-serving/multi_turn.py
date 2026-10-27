@@ -36,6 +36,7 @@ def arguments() -> argparse.Namespace:
     parser.add_argument("--resolved-config", type=Path)
     parser.add_argument("--artifact", action="append", default=[], type=serving_bench.artifact)
     parser.add_argument("--weights", action="append", default=[], type=Path)
+    serving_bench.measurement_options(parser)
     return parser.parse_args()
 
 
@@ -81,14 +82,19 @@ def turn_messages(repetition: str, turn: int, tool_tokens: int, assistant_tokens
     ]
 
 
-def run_conversation(client, suite, repetition):
+def run_conversation(client, suite, repetition, raw_samples=False):
     messages = [{"role": "system", "content": f"Deterministic benchmark {repetition}."}]
     samples = []
     prompts = []
     for turn, tool_tokens in enumerate(suite["tool_output_tokens"], 1):
         messages.extend(turn_messages(repetition, turn, tool_tokens, suite["scripted_assistant_tokens"]))
         prompts.append({"messages": [dict(message) for message in messages], "max_tokens": suite["output_tokens"]})
+        epoch = time.time()
         sample = client.chat(messages, suite["output_tokens"])
+        if raw_samples:
+            end = epoch + sample["e2e_seconds"]
+            sample["windows"] = {"ttft": [epoch, epoch + sample["ttft_seconds"]],
+                                 "decode": [end - sum(sample["itl_seconds"]), end]}
         if sample["error"] is not None:
             raise RuntimeError(f"turn {turn} failed: {sample['error']}")
         if not sample["itl_seconds"]:
@@ -126,6 +132,7 @@ def turn_reports(runs: list[list[dict[str, object]]], tool_tokens: list[int]) ->
                         "cached_tokens": sample["cached_tokens"],
                         "total_context_tokens": sample["total_context_tokens"],
                         "output_sha256": hashlib.sha256(sample["output"].encode()).hexdigest(),
+                        **({"windows": sample["windows"]} if "windows" in sample else {}),
                     }
                     for sample, rate in zip(samples, decode_rates)
                 ],
@@ -136,6 +143,7 @@ def turn_reports(runs: list[list[dict[str, object]]], tool_tokens: list[int]) ->
 
 def run(args: argparse.Namespace) -> dict[str, object]:
     suite, suite_hash = load_suite(args.suite)
+    suite = serving_bench.measurement_settings(args, suite)
     artifacts = dict(args.artifact)
     serving_bench.validate_identity(args, artifacts)
     command = shlex.split(args.server_command)
@@ -153,7 +161,8 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             label = f"sample-{repetition - suite['warmups']}" if measured else f"warmup-{repetition}"
             server.start()
             client.reset_connection()
-            samples, bodies = run_conversation(client, suite, label)
+            samples, bodies = run_conversation(client, suite, label,
+                **({"raw_samples": True} if getattr(args, "raw_samples", False) else {}))
             peak_rss = max(peak_rss, server.rss_bytes() or 0)
             if measured:
                 runs.append(samples)
@@ -169,6 +178,8 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         )
     return {
         "schema_version": 1,
+        "measurement_mode": {"sampling": "fixed", "reps": suite["repetitions"],
+                             "warmups": suite["warmups"], "unit": "whole-conversation"},
         "implementation": args.implementation,
         "model": {"id": suite["model"], "revision": suite["revision"]},
         "suite_sha256": suite_hash,

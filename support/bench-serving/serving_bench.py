@@ -31,7 +31,26 @@ def arguments() -> argparse.Namespace:
     parser.add_argument("--resolved-config", type=Path)
     parser.add_argument("--artifact", action="append", default=[], type=artifact)
     parser.add_argument("--weights", action="append", default=[], type=Path)
+    measurement_options(parser)
     return parser.parse_args()
+
+
+def measurement_options(parser):
+    """Expose fixed rep counts and raw windows to the interleaved gate driver."""
+    parser.add_argument("--reps", type=int)
+    parser.add_argument("--warmups", type=int)
+    parser.add_argument("--raw-samples", action="store_true")
+
+
+def measurement_settings(args, settings):
+    settings = dict(settings)
+    for flag, key, minimum in [("reps", "repetitions", 1), ("warmups", "warmups", 0)]:
+        value = getattr(args, flag, None)
+        if value is not None:
+            if value < minimum:
+                raise ValueError(f"invalid --{flag}")
+            settings[key] = value
+    return settings
 
 
 def artifact(value: str) -> tuple[str, Path]:
@@ -214,6 +233,7 @@ def exactness_report(results: list[dict[str, object]]) -> list[dict[str, object]
 def run(args: argparse.Namespace) -> dict[str, object]:
     """Run every expanded case and assemble one comparable record."""
     settings, cases, suite_hash = suite.load(args.suite)
+    settings = measurement_settings(args, settings)
     concrete = suite.expand(cases)
     artifacts = dict(args.artifact)
     validate_identity(args, artifacts)
@@ -250,6 +270,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                 settings["repetitions"],
                 restart,
                 begin_measurement,
+                **({"raw_samples": True} if getattr(args, "raw_samples", False) else {}),
             )
             result["server_metrics"] = metric_report(
                 metrics_before, scrape_metrics(args.metrics_url)
@@ -263,6 +284,8 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     prompt_hash = hashlib.sha256(json.dumps(prompts, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     return {
         "schema_version": 2,
+        "measurement_mode": {"sampling": "fixed", "reps": settings["repetitions"],
+                             "warmups": settings["warmups"], "unit": "whole-concurrent-case"},
         "implementation": args.implementation,
         "model": {"id": settings["model"], "revision": settings["revision"]},
         "suite_sha256": suite_hash,

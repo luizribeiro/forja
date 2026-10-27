@@ -45,7 +45,9 @@ def command_sampler(row: dict, directory: Path, guard: list[str], warmups: int,
         for pointer, expected in adapter.get("expected_provenance", {}).items():
             if value_at(record, pointer) != expected:
                 raise ValueError(f"measurement provenance mismatch: {pointer}")
-        if record.get("implementation") == "forja":
+        if "reps" in record.get("measurement_mode", {}) and record["measurement_mode"]["reps"] != reps:
+            raise ValueError("record repetition count differs from requested count")
+        if record.get("implementation") == "forja" and "inputs" in record and "config" in record:
             required = {"/provenance/binary_sha256", "/inputs/0/engine_sha256"}
             if not required <= adapter.get("expected_provenance", {}).keys():
                 raise ValueError("native adapter must pin binary and component hashes")
@@ -53,6 +55,12 @@ def command_sampler(row: dict, directory: Path, guard: list[str], warmups: int,
                 raise ValueError("native repetition count differs from requested count")
             if any(not result.get("output_digest") for result in record["results"]):
                 raise ValueError("native result has no output digest")
+        if any(result.get("errors") for result in record.get("results", [])):
+            raise ValueError("serving measurement contains errors")
+        if record.get("implementation") == "forja" and any(not result["exact"] for result in record.get("exactness", [])):
+            raise ValueError("serving exactness contract failed")
+        if record.get("prompt_cache_reused") is False:
+            raise ValueError("conversation cache path did not run")
         score = metric(record, adapter["metric"])
         if adapter.get("reciprocal", False):
             score = 1 / score

@@ -17,6 +17,7 @@ class Client:
             "cached_tokens": 0 if turn == 1 else (turn - 1) * 100,
             "output": "generated",
             "error": None,
+            "e2e_seconds": float(turn) + .02,
         }
 
 def test_committed_suite_is_a_twelve_turn_screen() -> None:
@@ -47,3 +48,12 @@ def test_conversation_grows_with_scripted_assistant_content() -> None:
     assert reports[1]["cache_phase"] == "cached"
     assert reports[1]["total_context_tokens"]["median"] == 204
     assert reports[0]["decode_tokens_per_second"]["median"] == 100.0
+
+
+def test_raw_turn_windows_keep_whole_sessions_as_independent_units():
+    suite = {"tool_output_tokens": [2], "max_context": 1000,
+             "output_tokens": 4, "scripted_assistant_tokens": 2}
+    samples, _ = multi_turn.run_conversation(Client(), suite, "sample-0", raw_samples=True)
+    report = multi_turn.turn_reports([samples], [2])[0]["samples"][0]
+    assert report["windows"]["ttft"][1] - report["windows"]["ttft"][0] == 1.
+    assert abs(report["windows"]["decode"][1] - report["windows"]["decode"][0] - .02) < 1e-6

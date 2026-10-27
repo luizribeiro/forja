@@ -77,6 +77,21 @@ def test_committed_suite_covers_serving_axes() -> None:
     assert any(case.get("cache_hit") for case in cases)
 
 
+def test_raw_case_windows_are_optional_and_keep_all_requests():
+    class Client:
+        def request(self, _case):
+            return http_client.sample(0, 1, 2, [1], 7, 2, 0, False, "synthetic")
+
+    classic = http_client.run_case(Client(), {"concurrency": 2}, 0, 2)
+    assert "raw_samples" not in classic
+    raw = http_client.run_case(Client(), {"concurrency": 2}, 0, 2, raw_samples=True)
+    assert len(raw["raw_samples"]["requests"]) == 4
+    assert raw["raw_samples"]["measurement_window"][1] > raw["raw_samples"]["measurement_window"][0]
+    settings = serving_bench.measurement_settings(argparse.Namespace(reps=30, warmups=3),
+                                                 {"repetitions": 5, "warmups": 1})
+    assert settings == {"repetitions": 30, "warmups": 3}
+
+
 def test_suite_rejects_unknown_case_keys() -> None:
     source = (Path(__file__).resolve().parents[2] / "bench/suites/serving.toml").read_text()
     with tempfile.TemporaryDirectory() as directory:

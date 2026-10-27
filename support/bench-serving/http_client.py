@@ -192,6 +192,7 @@ def run_case(
     repetitions: int,
     before_request: Callable[[], None] | None = None,
     after_warmups: Callable[[], None] | None = None,
+    raw_samples: bool = False,
 ) -> dict[str, object]:
     """Run one expanded case with its requested concurrency."""
     if before_request is not None and case["concurrency"] != 1:
@@ -211,13 +212,14 @@ def run_case(
     if after_warmups is not None:
         after_warmups()
     count = repetitions * case["concurrency"]
+    epoch = time.time()
     started = time.perf_counter()
     with ThreadPoolExecutor(max_workers=case["concurrency"]) as executor:
         samples = list(executor.map(request, range(count)))
     elapsed = time.perf_counter() - started
     good = [value for value in samples if value["error"] is None]
     itl = [value for item in good for value in item["itl_seconds"]]
-    return {
+    result = {
         "case": case,
         "requests": count,
         "requests_per_second": count / elapsed,
@@ -237,6 +239,10 @@ def run_case(
             }
         ),
     }
+    if raw_samples:
+        result["raw_samples"] = {"measurement_window": [epoch, epoch + elapsed],
+                                 "requests": samples}
+    return result
 
 
 def has_content(choice: dict[str, object]) -> bool:
