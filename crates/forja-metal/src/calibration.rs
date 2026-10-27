@@ -69,37 +69,30 @@ impl MetalBackend {
                 Probe::Mma(DType::BF16),
                 Probe::Threadgroup,
             ] {
-                for index in 0..warmups
-                    .checked_add(repetitions)
-                    .ok_or(BackendError::InvalidInput)?
-                {
-                    let mut commands = CommandList::new();
-                    commands
-                        .dispatch_many_with_backend_data(
-                            Op::Copy,
-                            &[&input],
-                            &[&output],
-                            BackendDispatchData::new(probe),
-                        )
-                        .map_err(|_| BackendError::InvalidInput)?;
-                    let started = Instant::now();
-                    let submission = self.submit(commands)?;
-                    submission.wait()?;
-                    let units = u64::from(GROUPS)
-                        * u64::from(ITERATIONS)
-                        * match probe {
-                            Probe::Mma(_) => 4 * 4 * 2 * 8 * 8 * 8,
-                            Probe::Threadgroup => u64::from(THREADS) * 16,
-                        };
-                    if index >= warmups {
-                        samples.push(CalibrationSample {
-                            name: probe.kernel(),
-                            units,
-                            wall: started.elapsed(),
-                            gpu: submission.gpu_time().ok_or(BackendError::ExecutionFailed)?,
-                        });
-                    }
-                }
+                let units = u64::from(GROUPS)
+                    * u64::from(ITERATIONS)
+                    * match probe {
+                        Probe::Mma(_) => 4 * 4 * 2 * 8 * 8 * 8,
+                        Probe::Threadgroup => u64::from(THREADS) * 16,
+                    };
+                samples.extend(self.calibration_samples(
+                    probe.kernel(),
+                    units,
+                    warmups,
+                    repetitions,
+                    || {
+                        let mut commands = CommandList::new();
+                        commands
+                            .dispatch_many_with_backend_data(
+                                Op::Copy,
+                                &[&input],
+                                &[&output],
+                                BackendDispatchData::new(probe),
+                            )
+                            .map_err(|_| BackendError::InvalidInput)?;
+                        Ok(commands)
+                    },
+                )?);
                 let values = self.read(&output)?;
                 if values.as_chunks::<4>().0.iter().copied().any(|bytes| {
                     let value = f32::from_le_bytes(bytes);
@@ -117,6 +110,76 @@ impl MetalBackend {
     }
 }
 
+impl MetalBackend {
+    pub(super) fn calibration_samples(
+        &self,
+        name: &'static str,
+        units: u64,
+        warmups: u32,
+        repetitions: u32,
+        mut commands: impl FnMut() -> Result<CommandList, BackendError>,
+    ) -> Result<Vec<CalibrationSample>, BackendError> {
+        if repetitions == 0 {
+            return Err(BackendError::InvalidInput);
+        }
+        let count = warmups
+            .checked_add(repetitions)
+            .ok_or(BackendError::InvalidInput)?;
+        let mut samples = Vec::new();
+        for index in 0..count {
+            let commands = commands()?;
+            let started = Instant::now();
+            let submission = self.submit(commands)?;
+            submission.wait()?;
+            let wall = started.elapsed();
+            let gpu = submission
+                .gpu_time()
+                .filter(|time| *time > Duration::ZERO)
+                .ok_or(BackendError::ExecutionFailed)?;
+            if index >= warmups {
+                samples.push(CalibrationSample {
+                    name,
+                    units,
+                    wall,
+                    gpu,
+                });
+            }
+        }
+        Ok(samples)
+    }
+
+    /// Measures the unprofiled floor of a dependent alternating copy chain.
+    ///
+    /// # Errors
+    /// Returns an error on invalid counts or allocation, execution, timing or release failure.
+    pub fn calibrate_dispatch(
+        &self,
+        warmups: u32,
+        repetitions: u32,
+    ) -> Result<Vec<CalibrationSample>, BackendError> {
+        let first = self.alloc(DType::F32, &[1])?;
+        let second = self.alloc(DType::F32, &[1])?;
+        let result =
+            self.calibration_samples("dependent_dispatch", 512, warmups, repetitions, || {
+                let mut commands = CommandList::new();
+                for index in 0..512 {
+                    let (input, output) = if index % 2 == 0 {
+                        (&first, &second)
+                    } else {
+                        (&second, &first)
+                    };
+                    commands
+                        .dispatch(Op::Copy, &[input], output)
+                        .map_err(|_| BackendError::InvalidInput)?;
+                }
+                Ok(commands)
+            });
+        self.release(&first)?;
+        self.release(&second)?;
+        result
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -130,5 +193,12 @@ mod tests {
             && sample.wall > Duration::ZERO
             && sample.units > 0));
         assert!(backend.calibrate_compute(0, 0).is_err());
+        let chain = backend.calibrate_dispatch(1, 2).unwrap();
+        assert_eq!(chain.len(), 2);
+        assert!(
+            chain
+                .iter()
+                .all(|sample| sample.units == 512 && sample.gpu > Duration::ZERO)
+        );
     }
 }

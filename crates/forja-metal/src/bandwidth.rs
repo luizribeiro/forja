@@ -1,17 +1,15 @@
-use std::time::Duration;
+use forja_core::{Backend, BackendError, CommandList, DType, Op};
 
-use forja_core::{Backend, BackendError, CommandList, DType, Op, Submission};
-
-use crate::MetalBackend;
+use crate::{CalibrationSample, MetalBackend};
 
 /// Caps the temporary device allocation while keeping the probe larger than cache.
 const STREAM_BYTES: u64 = 512 * 1024 * 1024;
 /// Splits the probe into enough rows to expose parallel streaming throughput.
 const ROWS: u32 = 256;
 /// Discards cold pipeline and allocation effects before measurement.
-const WARMUPS: usize = 3;
+const WARMUPS: u32 = 3;
 /// Bounds probe time while permitting a stable median.
-const SAMPLES: usize = 9;
+const SAMPLES: u32 = 9;
 
 /// Sustained device-memory rates from large streaming kernels.
 #[derive(Clone, Copy, Debug)]
@@ -44,60 +42,70 @@ impl MetalBackend {
 
     #[allow(clippy::cast_precision_loss)]
     fn measure_memory_bandwidth_uncached(&self) -> Result<MemoryBandwidth, BackendError> {
-        let elements = u32::try_from(STREAM_BYTES / DType::F32.byte_size())
+        let samples = self.calibrate_memory(WARMUPS, SAMPLES)?;
+        let median = |name| {
+            let mut times = samples
+                .iter()
+                .filter(|sample| sample.name == name)
+                .map(|sample| sample.gpu)
+                .collect::<Vec<_>>();
+            times.sort_unstable();
+            times[times.len() / 2].as_secs_f64()
+        };
+        Ok(MemoryBandwidth {
+            read_gigabytes_per_second: STREAM_BYTES as f64 / median("streaming_read") / 1e9,
+            copy_gigabytes_per_second: STREAM_BYTES as f64 * 2.0 / median("streaming_copy") / 1e9,
+        })
+    }
+
+    /// Records raw streaming read/copy timings for device calibration.
+    ///
+    /// # Errors
+    /// Returns an error on invalid counts or allocation, execution, timing or release failure.
+    pub fn calibrate_memory(
+        &self,
+        warmups: u32,
+        repetitions: u32,
+    ) -> Result<Vec<CalibrationSample>, BackendError> {
+        let columns = u32::try_from(STREAM_BYTES / 4 / u64::from(ROWS))
             .map_err(|_| BackendError::AllocationFailed)?;
-        let columns = elements
-            .checked_div(ROWS)
-            .ok_or(BackendError::AllocationFailed)?;
         let input = self.alloc(DType::F32, &[ROWS, columns])?;
         let copied = self.alloc(DType::F32, &[ROWS, columns])?;
         let reduced = self.alloc(DType::U32, &[ROWS])?;
-
         let result = (|| {
-            let read = measure(|| {
-                let mut commands = CommandList::new();
-                commands
-                    .dispatch(Op::Argmax { chunk_width: 2_048 }, &[&input], &reduced)
-                    .map_err(|_| BackendError::InvalidInput)?;
-                gpu_time(&self.submit(commands)?)
-            })?;
-            let copy = measure(|| {
-                let mut commands = CommandList::new();
-                commands
-                    .dispatch(Op::Copy, &[&input], &copied)
-                    .map_err(|_| BackendError::InvalidInput)?;
-                gpu_time(&self.submit(commands)?)
-            })?;
-            Ok(MemoryBandwidth {
-                read_gigabytes_per_second: STREAM_BYTES as f64 / read.as_secs_f64() / 1e9,
-                copy_gigabytes_per_second: STREAM_BYTES as f64 * 2.0 / copy.as_secs_f64() / 1e9,
-            })
+            let mut samples = self.calibration_samples(
+                "streaming_read",
+                STREAM_BYTES,
+                warmups,
+                repetitions,
+                || {
+                    let mut commands = CommandList::new();
+                    commands
+                        .dispatch(Op::Argmax { chunk_width: 2048 }, &[&input], &reduced)
+                        .map_err(|_| BackendError::InvalidInput)?;
+                    Ok(commands)
+                },
+            )?;
+            samples.extend(self.calibration_samples(
+                "streaming_copy",
+                STREAM_BYTES * 2,
+                warmups,
+                repetitions,
+                || {
+                    let mut commands = CommandList::new();
+                    commands
+                        .dispatch(Op::Copy, &[&input], &copied)
+                        .map_err(|_| BackendError::InvalidInput)?;
+                    Ok(commands)
+                },
+            )?);
+            Ok(samples)
         })();
-
         self.release(&input)?;
         self.release(&copied)?;
         self.release(&reduced)?;
         result
     }
-}
-
-fn gpu_time(submission: &impl Submission) -> Result<Duration, BackendError> {
-    submission.wait()?;
-    submission.gpu_time().ok_or(BackendError::ExecutionFailed)
-}
-
-fn measure(
-    mut sample: impl FnMut() -> Result<Duration, BackendError>,
-) -> Result<Duration, BackendError> {
-    for _ in 0..WARMUPS {
-        sample()?;
-    }
-    let mut timings = Vec::with_capacity(SAMPLES);
-    for _ in 0..SAMPLES {
-        timings.push(sample()?);
-    }
-    timings.sort_unstable();
-    Ok(timings[SAMPLES / 2])
 }
 
 #[cfg(test)]
@@ -107,6 +115,10 @@ mod tests {
     #[test]
     fn metal_streaming_probe_reports_rates() {
         let backend = super::MetalBackend::new().unwrap();
+        let samples = backend.calibrate_memory(0, 1).unwrap();
+        assert_eq!(samples.len(), 2);
+        assert_eq!(samples[0].units, super::STREAM_BYTES);
+        assert_eq!(samples[1].units, super::STREAM_BYTES * 2);
         let bandwidth = backend.measure_memory_bandwidth().unwrap();
         assert!((0.0..10_000.0).contains(&bandwidth.read_gigabytes_per_second));
         assert!((0.0..10_000.0).contains(&bandwidth.copy_gigabytes_per_second));
