@@ -48,6 +48,7 @@ def history_pair(commit, suffix=""):
         snapshots.append({**sources, "commit": revision, "dirty": False,
             "profile_name": profile_name, "non_pick_profile": profile,
             "build_environment": "profile-history-defaults (fixture)",
+            "host_environment": "profile-history-same-host (fixture)",
             "variants": variants, "tunings": [], "host_config": {"replay": True},
             "proof": proof, "proof_hash": digest(proof),
             "catalog": {name: {"source_hash": sources["kernel_source_hash"]} for name in names}})

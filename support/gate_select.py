@@ -8,7 +8,7 @@ import traceback
 from bench_cache import digest
 
 GLOBAL_KEYS = ("host_hash", "guest_source_hash", "toolchain_hash", "non_pick_profile",
-               "host_config", "tunings", "proof_hash", "build_environment")
+               "host_config", "tunings", "proof_hash", "build_environment", "host_environment")
 
 
 def pick(variants: dict, site: str, parameters: dict, value: int | None = None) -> str:

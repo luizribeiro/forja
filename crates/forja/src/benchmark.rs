@@ -2832,7 +2832,7 @@ fn stats_json(stats: Stats) -> serde_json::Value {
     })
 }
 
-fn command_output(program: &str, arguments: &[&str]) -> Result<String, Box<dyn Error>> {
+pub(crate) fn command_output(program: &str, arguments: &[&str]) -> Result<String, Box<dyn Error>> {
     let output = Command::new(program).args(arguments).output()?;
     if !output.status.success() {
         return Err(format!("{program} failed with {}", output.status).into());

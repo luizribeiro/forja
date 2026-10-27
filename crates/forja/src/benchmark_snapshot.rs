@@ -36,8 +36,12 @@ pub(crate) fn run(
         "profile_hash": profile.sha256()?, "profile_family": profile.family(),
         "non_pick_profile": non_pick_profile, "variants": selection.variants,
         "tunings": selection.tunings, "catalog": catalog,
+        "host_environment": {"hostname": crate::benchmark::command_output("hostname", &[])?,
+            "os": crate::benchmark::command_output("sw_vers", &["-productVersion"])?,
+            "device": catalog["device"]},
         "host_config": {"backend": config.backend, "limits": config.limits,
-                        "replay": config.engine.replay},
+                        "replay": config.engine.replay,
+                        "resolved_graph_replay": config.backend.metal.resolve().graph_replay},
     });
     fs::write(&options.json, serde_json::to_vec_pretty(&snapshot)?)?;
     Ok(())
