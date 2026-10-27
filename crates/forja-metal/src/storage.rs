@@ -759,7 +759,9 @@ impl MetalBackend {
             "\n",
             include_str!("sdpa_vector.metal"),
             "\n",
-            include_str!("paged.metal")
+            include_str!("paged.metal"),
+            "\n",
+            include_str!("calibration.metal")
         );
         let pipelines = PipelineCache::new(&device, source)?;
         let shared_event = device

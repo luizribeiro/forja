@@ -4,6 +4,8 @@
 #[cfg(target_os = "macos")]
 mod bandwidth;
 #[cfg(target_os = "macos")]
+mod calibration;
+#[cfg(target_os = "macos")]
 mod encoding;
 #[cfg(target_os = "macos")]
 mod epilogue_codegen;
@@ -24,6 +26,8 @@ mod variants;
 
 #[cfg(target_os = "macos")]
 pub use bandwidth::MemoryBandwidth;
+#[cfg(target_os = "macos")]
+pub use calibration::CalibrationSample;
 #[cfg(target_os = "macos")]
 pub use encoding::{MetalProgramHandle, ProfileTimestampGranularity};
 #[cfg(target_os = "macos")]

@@ -3221,6 +3221,37 @@ impl MetalBackend {
         };
         let input = self.encoder_tensor(input)?;
         let output = self.encoder_tensor(dispatch.output())?;
+        if let Some(probe) = dispatch.backend_data::<crate::calibration::Probe>() {
+            let pipeline = self
+                .pipelines
+                .lock()
+                .map_err(|_| BackendError::ExecutionFailed)?
+                .get(probe.kernel(), &[(220, crate::calibration::ITERATIONS)])?;
+            let layouts = vec![
+                Self::layout_buffer(&input.layout, arguments)?,
+                Self::layout_buffer(&output.layout, arguments)?,
+            ];
+            bindings.bind(table, 0, &input.buffer);
+            bindings.bind(table, 1, &output.buffer);
+            set_pipeline(encoder, &pipeline);
+            set_argument_table(encoder, table);
+            let count = usize::try_from(output.layout.element_count())
+                .map_err(|_| BackendError::InvalidInput)?;
+            dispatch_threadgroups(
+                encoder,
+                MTLSize {
+                    width: count / 128,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: 128,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            return Ok(layouts);
+        }
         self.encode_copy_tensors(encoder, table, &input, &output, bindings, arguments)
     }
 
