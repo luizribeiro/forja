@@ -81,13 +81,13 @@ arms = [
 [variants.rules."paged-attention.decode"]
 parameter = "position"
 arms = [
-  { lo = 0, hi = 510, name = "paged-sdpa.vector" },
-  { lo = 511, hi = 1022, name = "paged-sdpa.vector-gqa-two-pass-32" },
-  { lo = 1023, hi = 3071, name = "paged-sdpa.vector-gqa-two-pass" },
-  { lo = 3072, hi = 8191, name = "paged-sdpa.vector-gqa-two-pass-128" },
-  { lo = 8192, hi = 63998, name = "paged-sdpa.vector-gqa-two-pass-256" },
-  { lo = 63999, hi = 127998, name = "paged-sdpa.vector-gqa-two-pass-512" },
-  { lo = 127999, hi = 131071, name = "paged-sdpa.vector-gqa-two-pass-1024" },
+  { lo = 0, hi = 510, name = "paged-sdpa-append.vector-gqa-two-pass-32" },
+  { lo = 511, hi = 1022, name = "paged-sdpa-append.vector-gqa-two-pass-32" },
+  { lo = 1023, hi = 3071, name = "paged-sdpa-append.vector-gqa-two-pass-64" },
+  { lo = 3072, hi = 8191, name = "paged-sdpa-append.vector-gqa-two-pass-128" },
+  { lo = 8192, hi = 63998, name = "paged-sdpa-append.vector-gqa-two-pass-256" },
+  { lo = 63999, hi = 127998, name = "paged-sdpa-append.vector-gqa-two-pass-512" },
+  { lo = 127999, hi = 131071, name = "paged-sdpa-append.vector-gqa-two-pass-1024" },
 ]
 
 [variants.rules."attention.prefill-large"]

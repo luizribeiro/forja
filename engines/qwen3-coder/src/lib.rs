@@ -692,8 +692,19 @@ fn paged_cache_attention(
     end: &Dim,
     selection: &VariantSelection,
 ) -> Result<Tensor<f32>> {
-    cache.append(key, value, start)?;
-    cache.attention(query, ATTENTION_SCALE, start, end, selection.choice())
+    if query.shape()[0] == 1 {
+        cache.append_attention(
+            query,
+            [key, value],
+            ATTENTION_SCALE,
+            start,
+            end,
+            selection.choice(),
+        )
+    } else {
+        cache.append(key, value, start)?;
+        cache.attention(query, ATTENTION_SCALE, start, end, selection.choice())
+    }
 }
 
 enum CacheStorage {
