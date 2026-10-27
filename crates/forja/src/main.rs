@@ -5,8 +5,8 @@ mod benchmark;
 mod benchmark_record;
 mod benchmark_snapshot;
 mod benchmark_stats;
-#[cfg(test)]
-#[allow(dead_code)]
+mod calibration;
+#[cfg(any(target_os = "macos", test))]
 mod calibration_identity;
 mod config_show;
 mod engine;
@@ -75,6 +75,9 @@ fn run(command: args::Command) -> Result<(), Box<dyn Error>> {
         #[cfg(not(target_os = "macos"))]
         return Err("metal is available only on macOS".into());
     }
+    if let args::Command::Calibrate(options) = command {
+        return calibration::run(&options);
+    }
     if let args::Command::Config(options) = command {
         print!("{}", config_show::render(&options)?);
         return Ok(());
@@ -101,6 +104,7 @@ fn run(command: args::Command) -> Result<(), Box<dyn Error>> {
         args::Command::BenchKernel(options, config) => kernel_benchmark::run(&options, &config),
         args::Command::BenchSnapshot(options, config) => benchmark_snapshot::run(&options, &config),
         args::Command::Build(_) => unreachable!("build commands return before runtime"),
+        args::Command::Calibrate(_) => unreachable!("calibration returns before runtime"),
         args::Command::Catalog(_) => unreachable!("catalog commands return before runtime"),
         args::Command::Config(_) => unreachable!("configuration commands return before runtime"),
         args::Command::ConfigCheck | args::Command::ConfigSchema => {

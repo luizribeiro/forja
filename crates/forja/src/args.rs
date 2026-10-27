@@ -348,6 +348,7 @@ pub(crate) enum Command {
     BenchSnapshot(crate::benchmark_snapshot::Options, Box<DevConfig>),
     Build(Build),
     Catalog(Catalog),
+    Calibrate(crate::calibration::Options),
     Config(ConfigShow),
     ConfigCheck,
     ConfigSchema,
@@ -480,6 +481,8 @@ enum ParsedCommand {
     Build(BuildArgs),
     /// List selectable backend algorithms and their constraints.
     Catalog(CatalogArgs),
+    /// Measure or reuse device ceilings with raw timings and confidence intervals.
+    Calibrate(crate::calibration::Options),
     /// Inspect configuration.
     Config(ConfigArgs),
     /// Profile one inference phase.
@@ -499,6 +502,10 @@ pub(crate) fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Comma
     parse_with(arguments, dev_layers)
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "keep exhaustive command configuration dispatch together"
+)]
 fn parse_with(
     arguments: impl IntoIterator<Item = String>,
     base_layers: impl FnOnce(bool) -> Result<Vec<Layer>, ConfigError>,
@@ -560,6 +567,7 @@ fn parse_with(
     let layered = layer::<DevConfig>(layers).map_err(|error| config_error(&error))?;
     let limits = layered.config.limits.clone();
     Ok(match cli.command {
+        ParsedCommand::Calibrate(options) => Command::Calibrate(options),
         ParsedCommand::BenchKernel(options) => {
             Command::BenchKernel(options, Box::new(layered.config))
         }
@@ -937,6 +945,7 @@ impl ParsedCommand {
                 values.extend(graph_replay_sugar(options.graph_replay));
             }
             Self::Build(_)
+            | Self::Calibrate(_)
             | Self::Catalog(_)
             | Self::Config(_)
             | Self::Profile(_)
