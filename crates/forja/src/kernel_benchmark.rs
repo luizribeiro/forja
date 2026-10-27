@@ -14,6 +14,12 @@ pub(crate) struct Options {
     /// Number of measured single-dispatch submissions.
     #[arg(long, default_value = "5")]
     pub(crate) reps: std::num::NonZeroU32,
+    /// Independent operand sets, visited cyclically within each submission.
+    #[arg(long, default_value = "1")]
+    pub(crate) copies: std::num::NonZeroU32,
+    /// Dispatches per measured submission, amortizing command-buffer latency.
+    #[arg(long, default_value = "1")]
+    pub(crate) dispatches: std::num::NonZeroU32,
     /// Number of untimed submissions.
     #[arg(long, default_value_t = 1)]
     pub(crate) warmups: u32,
@@ -37,7 +43,7 @@ pub(crate) fn run(
 
 #[cfg(target_os = "macos")]
 fn run_metal(options: &Options, config: &forja_config::DevConfig) -> Result<(), Box<dyn Error>> {
-    use forja_core::{BackendDispatchData, CommandList, Submission};
+    use forja_core::Submission;
     let shape: Shape = serde_json::from_slice(&fs::read(&options.shape)?)?;
     let (backend, live_bytes) = crate::engine::metal_backend(
         config.backend.metal.resolve().graph_replay,
@@ -53,36 +59,24 @@ fn run_metal(options: &Options, config: &forja_config::DevConfig) -> Result<(), 
                 .checked_add(tensor.layout()?.1)
                 .ok_or_else(|| Box::<dyn Error>::from("allocation size overflow"))
         })?;
+    let bytes = bytes
+        .checked_mul(u64::from(options.copies.get()))
+        .ok_or("operand-set size overflow")?;
     if bytes > live_bytes {
         return Err("kernel diagnostic exceeds live-byte quota".into());
     }
-    let allocate = |specs: &[TensorShape]| {
-        specs
-            .iter()
-            .map(|spec| spec.allocate(&backend))
-            .collect::<Result<Vec<_>, _>>()
-    };
-    let inputs = allocate(&shape.inputs)?;
-    let outputs = allocate(&shape.outputs)?;
-    let inputs = inputs.iter().collect::<Vec<_>>();
-    let outputs = outputs.iter().collect::<Vec<_>>();
-    let variant =
-        backend.validate_variant_for_op(shape.operation, &inputs, &outputs, &options.variant)?;
+    let commands = diagnostic_commands(&backend, &shape, options)?;
+    let cost = commands
+        .last_dispatch()
+        .and_then(forja_core::KernelCost::of);
     let mut samples = Vec::new();
     let count = options
         .warmups
         .checked_add(options.reps.get())
         .ok_or("repetition count overflow")?;
     for index in 0..count {
-        let mut commands = CommandList::new();
-        commands.dispatch_many_with_backend_data(
-            shape.operation,
-            &inputs,
-            &outputs,
-            BackendDispatchData::new(variant),
-        )?;
         let started = Instant::now();
-        let submission = backend.submit(commands)?;
+        let submission = backend.submit(commands.clone())?;
         submission.wait()?;
         if index >= options.warmups {
             samples.push(serde_json::json!({"wall_seconds": started.elapsed().as_secs_f64(),
@@ -90,7 +84,8 @@ fn run_metal(options: &Options, config: &forja_config::DevConfig) -> Result<(), 
         }
     }
     let report = serde_json::json!({"kind": "kernel-diagnostic", "model_benchmark": false,
-        "variant": variant.name(), "shape": serde_json::from_slice::<serde_json::Value>(&fs::read(&options.shape)?)?,
+        "variant": options.variant, "copies": options.copies.get(), "resident_operand_bytes": bytes,
+        "dispatches_per_sample": options.dispatches.get(), "cost_per_dispatch": cost.map(forja_core::KernelCost::json), "shape": serde_json::from_slice::<serde_json::Value>(&fs::read(&options.shape)?)?,
         "warmups": options.warmups, "samples": samples, "provenance": {
             "commit": crate::provenance::commit(), "dirty": crate::provenance::dirty(),
             "binary_sha256": golden_fixtures::sha256_file(std::env::current_exe()?)?,
@@ -99,10 +94,49 @@ fn run_metal(options: &Options, config: &forja_config::DevConfig) -> Result<(), 
     fs::write(&options.json, serde_json::to_vec_pretty(&report)?)?;
     println!(
         "kernel diagnostic: {} ({} reps)",
-        variant.name(),
-        options.reps
+        options.variant, options.reps
     );
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn diagnostic_commands(
+    backend: &forja_metal::MetalBackend,
+    shape: &Shape,
+    options: &Options,
+) -> Result<forja_core::CommandList, Box<dyn Error>> {
+    use forja_core::{BackendDispatchData, CommandList};
+    let allocate = |specs: &[TensorShape]| {
+        specs
+            .iter()
+            .map(|spec| spec.allocate(backend))
+            .collect::<Result<Vec<_>, _>>()
+    };
+    if options.dispatches.get() < options.copies.get() {
+        return Err("dispatches must visit every operand set".into());
+    }
+    let operands = (0..options.copies.get())
+        .map(|_| Ok((allocate(&shape.inputs)?, allocate(&shape.outputs)?)))
+        .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+    let mut commands = CommandList::new();
+    for index in 0..options.dispatches.get() {
+        let (inputs, outputs) = &operands[usize::try_from(index % options.copies.get())?];
+        let inputs = inputs.iter().collect::<Vec<_>>();
+        let outputs = outputs.iter().collect::<Vec<_>>();
+        let variant = backend.validate_variant_for_op(
+            shape.operation,
+            &inputs,
+            &outputs,
+            &options.variant,
+        )?;
+        commands.dispatch_many_with_backend_data(
+            shape.operation,
+            &inputs,
+            &outputs,
+            BackendDispatchData::new(variant),
+        )?;
+    }
+    Ok(commands)
 }
 
 #[cfg(test)]
@@ -144,12 +178,14 @@ mod tests {
                 "outputs": [{"dtype":"f32","shape":[16,1,128]}]}),
             ),
         ] {
-            let options = Options {
+            let mut options = Options {
                 variant: variant.into(),
                 shape: root.join("shape.json"),
                 json: root.join("record.json"),
                 reps: std::num::NonZeroU32::new(1).unwrap(),
                 warmups: 0,
+                copies: std::num::NonZeroU32::new(3).unwrap(),
+                dispatches: std::num::NonZeroU32::new(7).unwrap(),
             };
             fs::write(&options.shape, serde_json::to_vec(&shape).unwrap()).unwrap();
             run(&options, &forja_config::DevConfig::default()).unwrap();
@@ -158,6 +194,10 @@ mod tests {
             assert_eq!(record["kind"], "kernel-diagnostic");
             assert_eq!(record["variant"], variant);
             assert_eq!(record["model_benchmark"], false);
+            assert_eq!(record["copies"], 3);
+            assert_eq!(record["dispatches_per_sample"], 7);
+            options.dispatches = std::num::NonZeroU32::new(2).unwrap();
+            assert!(run(&options, &forja_config::DevConfig::default()).is_err());
             assert_eq!(record["samples"].as_array().unwrap().len(), 1);
         }
         fs::remove_dir_all(root).unwrap();
