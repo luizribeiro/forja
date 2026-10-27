@@ -9,6 +9,29 @@ fn main() {
         track_git_path(&reference);
     }
     println!("cargo::rustc-env=FORJA_BUILD_REV={}", revision());
+    let mut environment = Vec::new();
+    for key in [
+        "PROFILE",
+        "OPT_LEVEL",
+        "DEBUG",
+        "HOST",
+        "TARGET",
+        "CARGO_ENCODED_RUSTFLAGS",
+        "SDKROOT",
+        "MACOSX_DEPLOYMENT_TARGET",
+    ] {
+        println!("cargo::rerun-if-env-changed={key}");
+        environment.push(format!("{key}={:?}", env::var(key).unwrap_or_default()));
+    }
+    let compiler = env::var_os("RUSTC")
+        .and_then(|rustc| Command::new(rustc).arg("-vV").output().ok())
+        .filter(|output| output.status.success())
+        .map_or_else(
+            || "unknown".to_owned(),
+            |output| String::from_utf8_lossy(&output.stdout).into_owned(),
+        );
+    environment.push(format!("compiler={compiler:?}"));
+    println!("cargo::rustc-env=FORJA_BUILD_ENV={}", environment.join(";"));
 }
 
 fn track_git_path(path: &str) {

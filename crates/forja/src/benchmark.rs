@@ -539,6 +539,7 @@ async fn run_metal(options: &Bench) -> Result<(), Box<dyn Error>> {
                 "commit": commit,
                 "dirty": crate::provenance::dirty(),
                 "binary_sha256": binary_sha256,
+                "build_environment": crate::provenance::BUILD_ENVIRONMENT,
                 "device": device,
                 "gpu_cores": gpu_cores,
                 "macos": os,
