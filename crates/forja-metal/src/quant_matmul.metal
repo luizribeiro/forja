@@ -102,7 +102,7 @@ float4 load_float4_contiguous(device const uchar *buffer, ulong index, uint dtyp
     return float4(*reinterpret_cast<device const bfloat4 *>(buffer + index * 2));
 }
 
-template <uint output_count, uint words_per_thread>
+template <uint output_count, uint words_per_thread, uint bits>
 void quantized_vector_sums(
     device const uchar *input,
     device const uchar *packed,
@@ -124,25 +124,19 @@ void quantized_vector_sums(
     uint first_column,
     ushort lane,
     thread float (&sums)[output_count]) {
-    uint values_per_word = 32 / quant_bits;
-    uint values_per_thread = values_per_word * words_per_thread;
-    device const uchar *weight_rows[output_count];
-    device const uchar *scale_rows[output_count];
-    device const uchar *bias_rows[output_count];
+    constexpr uint values_per_word = 32 / bits;
+    constexpr uint values_per_thread = values_per_word * words_per_thread;
+    if (first_column >= columns) return;
     uint scale_bytes = input1_dtype == 0 ? 4 : 2;
-    for (uint item = 0; item < output_count; ++item) {
-        uint column = first_column + item;
-        if (column < columns) {
-            weight_rows[item] = packed + (packed_base + ulong(column) * packed_row_stride) * 4;
-            scale_rows[item] = scales + (scale_base + ulong(column) * scale_row_stride) * scale_bytes;
-            bias_rows[item] = biases + (bias_base + ulong(column) * bias_row_stride) * scale_bytes;
-        }
-    }
+    device const uchar *weight_base = packed + (packed_base + ulong(first_column) * packed_row_stride) * 4;
+    device const uchar *scale_rows = scales + (scale_base + ulong(first_column) * scale_row_stride) * scale_bytes;
+    device const uchar *bias_rows = biases + (bias_base + ulong(first_column) * bias_row_stride) * scale_bytes;
     for (ulong block = 0; block < inner; block += values_per_thread * 32) {
         ulong first = block + uint(lane) * values_per_thread;
         if (first >= inner) continue;
-        float activations[32];
+        float activations[values_per_thread];
         float input_sum = 0.0f;
+        #pragma unroll
         for (uint element = 0; element < values_per_thread; element += 4) {
             ulong index = input_base + ulong(first + element) * input_stride;
             float4 values;
@@ -152,13 +146,14 @@ void quantized_vector_sums(
                 for (uint i = 0; i < 4; ++i) values[i] = load_float(input, index + ulong(i) * input_stride, input0_dtype);
             }
             input_sum += dot(values, float4(1.0f));
-            if (quant_bits == 4) values *= float4(1.0f, 1.0f/16.0f, 1.0f/256.0f, 1.0f/4096.0f);
+            if constexpr (bits == 4) values *= float4(1.0f, 1.0f/16.0f, 1.0f/256.0f, 1.0f/4096.0f);
             for (uint i = 0; i < 4; ++i) activations[element + i] = values[i];
         }
+        #pragma unroll
         for (uint item = 0; item < output_count; ++item) {
             if (first_column + item >= columns) continue;
             ulong index = ulong(first / values_per_word) * packed_word_stride;
-            device const uchar *row = weight_rows[item];
+            device const uchar *row = weight_base + ulong(item) * packed_row_stride * 4;
             uint4 words = uint4(0u);
             if (qmv_vector_contiguous != 0 || (packed_word_stride == 1 && ((packed_base + ulong(first_column + item) * packed_row_stride + index) % words_per_thread) == 0)) {
                 if constexpr (words_per_thread == 4) words = *reinterpret_cast<device const uint4 *>(row + index * 4);
@@ -167,8 +162,9 @@ void quantized_vector_sums(
                 for (uint i = 0; i < words_per_thread; ++i) words[i] = load_uint(row, index + ulong(i) * packed_word_stride);
             }
             float value = 0.0f;
+        #pragma unroll
             for (uint word = 0; word < words_per_thread; ++word) {
-                if (quant_bits == 4) {
+                if constexpr (bits == 4) {
                     ushort2 halves = as_type<ushort2>(words[word]);
                     for (uint part = 0; part < 2; ++part) {
                         uint i = word * 8 + part * 4;
@@ -181,8 +177,8 @@ void quantized_vector_sums(
                 }
             }
             ulong group = first / quant_group_size;
-            sums[item] += load_float(scale_rows[item], ulong(group) * scale_group_stride, input1_dtype) * value
-                + load_float(bias_rows[item], ulong(group) * bias_group_stride, input1_dtype) * input_sum;
+            sums[item] += load_float(scale_rows, ulong(item) * scale_row_stride + group * scale_group_stride, input1_dtype) * value
+                + load_float(bias_rows, ulong(item) * bias_row_stride + group * bias_group_stride, input1_dtype) * input_sum;
         }
     }
     for (uint item = 0; item < output_count; ++item) sums[item] = simd_sum(sums[item]);
@@ -212,17 +208,31 @@ void quantized_qmv_sums(
     uint words_per_thread,
     thread float (&sums)[output_count]) {
     if (qmv_vector_words == 4) {
-        quantized_vector_sums<output_count, 4>(
+        if (quant_bits == 4) {
+            quantized_vector_sums<output_count, 4, 4>(
         input, packed, scales, biases, input_base, packed_base, scale_base, bias_base,
         input_stride, packed_row_stride, packed_word_stride, scale_row_stride,
         scale_group_stride, bias_row_stride, bias_group_stride, inner, columns, first_column, lane, sums);
+        } else {
+            quantized_vector_sums<output_count, 4, 8>(
+        input, packed, scales, biases, input_base, packed_base, scale_base, bias_base,
+        input_stride, packed_row_stride, packed_word_stride, scale_row_stride,
+        scale_group_stride, bias_row_stride, bias_group_stride, inner, columns, first_column, lane, sums);
+        }
         return;
     }
     if (qmv_vector_words == 2) {
-        quantized_vector_sums<output_count, 2>(
+        if (quant_bits == 4) {
+            quantized_vector_sums<output_count, 2, 4>(
         input, packed, scales, biases, input_base, packed_base, scale_base, bias_base,
         input_stride, packed_row_stride, packed_word_stride, scale_row_stride,
         scale_group_stride, bias_row_stride, bias_group_stride, inner, columns, first_column, lane, sums);
+        } else {
+            quantized_vector_sums<output_count, 2, 8>(
+        input, packed, scales, biases, input_base, packed_base, scale_base, bias_base,
+        input_stride, packed_row_stride, packed_word_stride, scale_row_stride,
+        scale_group_stride, bias_row_stride, bias_group_stride, inner, columns, first_column, lane, sums);
+        }
         return;
     }
     uint values_per_word = 32 / quant_bits;

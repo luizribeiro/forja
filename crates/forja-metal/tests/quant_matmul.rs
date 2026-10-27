@@ -73,7 +73,7 @@ fn pinned_decode_batch_variants_match_cpu_for_distinct_rows() {
 fn vector_load_gemv_matches_cpu_and_keeps_batch_bits() {
     let reference = CpuBackend::new();
     let candidate = MetalBackend::new().unwrap();
-    for inner in [768, 2048, 4096] {
+    for inner in [64, 768, 2048, 4096] {
         for bits in [4, 8] {
             for name in ["quant-matmul.vector8", "quant-matmul.vector16"] {
                 let mut first = None;

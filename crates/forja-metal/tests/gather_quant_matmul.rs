@@ -180,7 +180,7 @@ fn vector_gather_raw_and_paired_match_cpu_at_decode_shapes() {
     let cpu = CpuBackend::new();
     let metal = MetalBackend::new().unwrap();
     let mut values = DeterministicValues::new(0x6a09_e667_f3bc_c909);
-    for inner in [768, 2048] {
+    for inner in [64, 768, 2048] {
         for rows in [1, 2, 4, 7, 8] {
             let case = GroupedCase {
                 rows,
@@ -217,7 +217,7 @@ fn vector_gather_weighted_matches_cpu() {
     )
     .unwrap();
     let mut values = DeterministicValues::new(0x6a09_e667_f3bc_c909);
-    for inner in [768, 2048] {
+    for inner in [64, 768, 2048] {
         for rows in [1, 7] {
             let case = GroupedCase {
                 rows,
