@@ -82,6 +82,23 @@ const PROBES: &[&str] = &[
     "dependent_dispatch",
 ];
 
+fn probe_mode(
+    name: &str,
+    arithmetic: Option<&str>,
+) -> Result<Option<&'static str>, Box<dyn Error>> {
+    match (name, arithmetic) {
+        ("calibration_mma_f32", Some("f32")) => Ok(Some("f32_native")),
+        ("calibration_mma_f16", Some("f16")) => Ok(Some("f16_native")),
+        ("calibration_mma_bf16", Some("bf16")) => Ok(Some("bf16_native")),
+        ("calibration_mma_bf16", Some("f32")) => Ok(Some("bf16_promoted_f32")),
+        (
+            "streaming_read" | "streaming_copy" | "calibration_threadgroup" | "dependent_dispatch",
+            None,
+        ) => Ok(None),
+        _ => Err("invalid calibration arithmetic mode".into()),
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn measure(options: &Options, identity: &Value) -> Result<Value, Box<dyn Error>> {
     let load_before = crate::machine_load::capture("BEFORE CALIBRATION")?;
@@ -109,18 +126,27 @@ fn measure(options: &Options, identity: &Value) -> Result<Value, Box<dyn Error>>
                 forja_core::DType::BF16 => "bf16",
                 _ => "f32",
             });
-        probes.insert(name.into(), json!({"arithmetic": arithmetic, "units_per_second": rates.median,
+        let mode = probe_mode(name, arithmetic)?;
+        probes.insert(name.into(), json!({"arithmetic": arithmetic, "arithmetic_mode": mode, "units_per_second": rates.median,
             "ci95": [rates.low, rates.high], "samples": selected.iter().map(|sample| sample_json(sample)).collect::<Vec<_>>()}));
     }
+    let arithmetic_probes = probes
+        .iter()
+        .filter_map(|(name, probe)| {
+            probe["arithmetic_mode"]
+                .as_str()
+                .map(|mode| (mode.to_owned(), json!(name)))
+        })
+        .collect::<serde_json::Map<_, _>>();
     Ok(
-        json!({"schema_version": 4, "kind": "device-calibration", "model_benchmark": false,
+        json!({"schema_version": 5, "kind": "device-calibration", "model_benchmark": false,
         "identity": identity, "warmups": options.warmups, "repetitions": options.reps,
         "timestamp_method": "unprofiled-command-buffer", "interval_method": "binomial-order-statistic-median",
         "bf16_arithmetic": if samples.iter().any(|sample| !sample.screening && sample.arithmetic == Some(forja_core::DType::BF16)) { "native-bf16" } else { "compiler refused native bf16 MMA; operands promoted to f32" },
         "threadgroup_method": "volatile float4 reads, 128 threads, one initialization barrier",
         "mma_method": "8x8x8 SIMD matrices; independent operands/accumulators, eight-way loop unroll; screen chain counts then confirm separately",
         "screening": samples.iter().filter(|sample| sample.screening).map(sample_json).collect::<Vec<_>>(),
-        "probes": probes, "provenance": {"commit": crate::provenance::commit(),
+        "arithmetic_probes": arithmetic_probes, "probes": probes, "provenance": {"commit": crate::provenance::commit(),
             "dirty": crate::provenance::dirty(), "build_environment": crate::provenance::BUILD_ENVIRONMENT,
             "binary_sha256": golden_fixtures::sha256_file(std::env::current_exe()?)?,
             "unix_seconds": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs(),
@@ -130,16 +156,37 @@ fn measure(options: &Options, identity: &Value) -> Result<Value, Box<dyn Error>>
 
 #[cfg(target_os = "macos")]
 fn sample_json(sample: &forja_metal::CalibrationSample) -> Value {
-    json!({"name": sample.name, "independent_chains": sample.independent_chains, "screening": sample.screening,
+    json!({"name": sample.name, "kernel": sample.kernel, "independent_chains": sample.independent_chains, "screening": sample.screening,
         "units": sample.units, "wall_seconds": sample.wall.as_secs_f64(), "gpu_seconds": sample.gpu.as_secs_f64()})
 }
 
 pub(crate) fn validate(record: &Value, identity: &Value) -> Result<(), Box<dyn Error>> {
-    if record["schema_version"] != 4 || record["identity"] != *identity {
+    if record["schema_version"] != 5 || record["identity"] != *identity {
         return Err("calibration identity or schema mismatch; recalibrate".into());
     }
     for &name in PROBES {
         let probe = &record["probes"][name];
+        let mode = probe_mode(name, probe["arithmetic"].as_str())?;
+        if probe["arithmetic_mode"] != json!(mode) {
+            return Err("calibration arithmetic mode mismatch".into());
+        }
+        if let Some(mode) = mode {
+            if record["arithmetic_probes"][mode] != name {
+                return Err("calibration arithmetic key mismatch".into());
+            }
+            let kernel = if mode == "bf16_native" {
+                "calibration_mma_bf16_native"
+            } else {
+                name
+            };
+            if probe["samples"]
+                .as_array()
+                .is_none_or(|samples| samples.iter().any(|sample| sample["kernel"] != kernel))
+            {
+                return Err("calibration arithmetic kernel mismatch".into());
+            }
+        }
+
         for value in [
             &probe["units_per_second"],
             &probe["ci95"][0],
@@ -200,6 +247,19 @@ fn validate_samples(probe: &Value, repetitions: u64) -> Result<(), Box<dyn Error
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn promoted_bf16_has_a_distinct_arithmetic_key() {
+        assert_eq!(
+            probe_mode("calibration_mma_bf16", Some("bf16")).unwrap(),
+            Some("bf16_native")
+        );
+        assert_eq!(
+            probe_mode("calibration_mma_bf16", Some("f32")).unwrap(),
+            Some("bf16_promoted_f32")
+        );
+        assert!(probe_mode("calibration_mma_f16", Some("f32")).is_err());
+    }
+
     #[test]
     fn warmups_are_bounded_and_allow_zero() {
         use clap::Parser;

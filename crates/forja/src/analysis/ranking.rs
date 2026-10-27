@@ -28,6 +28,7 @@ pub(super) fn aggregate(rows: &[Value], field: &str) -> Vec<Value> {
         let names = |key: &str| rows.iter().filter_map(|row| row[key].as_str()).collect::<BTreeSet<_>>();
         group["call_sites"] = json!(names("call_site"));
         group["bounds"] = json!(names("bound"));
+        group["arithmetic_modes"] = json!(names("arithmetic_mode"));
         let alternatives = first["alternatives"].as_array().into_iter().flatten().filter(|alternative| rows.iter().all(|row| row["alternatives"].as_array().is_some_and(|values| values.contains(alternative)))).collect::<Vec<_>>();
         group["alternatives"] = json!(alternatives);
         let raw = group["profiled_gpu_seconds"].as_f64().unwrap_or(1.0);
@@ -97,7 +98,7 @@ pub(crate) fn human(report: &Value) -> String {
     {
         let _ = writeln!(
             out,
-            "  {} | {} | {} | {:.1}% wall | recover {:.3}/{:.3} ms | BW {:.1}–{:.1}% | MMA {:.1}%",
+            "  {} | {} | {} | {:.1}% wall | recover {:.3}/{:.3} ms | BW {:.1}–{:.1}% | MMA {:.1}% {}",
             row["name"].as_str().unwrap_or("?"),
             row["variant"]
                 .as_str()
@@ -109,7 +110,8 @@ pub(crate) fn human(report: &Value) -> String {
             number(&row["recoverable_at_target_seconds"]) * 1000.0,
             number(&row["percent_of_streaming_read_ceiling_range"][0]),
             number(&row["percent_of_streaming_read_ceiling_range"][1]),
-            number(&row["percent_of_compute_ceiling"])
+            number(&row["percent_of_compute_ceiling"]),
+            row["arithmetic_modes"]
         );
         let _ = writeln!(out, "    screen: {}", row["alternatives"]);
     }

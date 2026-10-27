@@ -7,6 +7,11 @@ use serde_json::{Value, json};
 use std::error::Error;
 
 pub(super) fn ceilings(calibration: &Value, dtype: &str) -> Result<Ceilings, Box<dyn Error>> {
+    let mode = format!("{dtype}_native");
+    let compute_probe = calibration["arithmetic_probes"][&mode].as_str().ok_or_else(|| format!("no calibrated {mode} ceiling; promoted arithmetic cannot stand in for native arithmetic"))?;
+    if calibration["probes"][compute_probe]["arithmetic_mode"] != mode {
+        return Err("calibration arithmetic key disagrees with the executed probe".into());
+    }
     let rate = |name: &str| {
         positive(
             calibration["probes"][name]["units_per_second"]
@@ -17,7 +22,7 @@ pub(super) fn ceilings(calibration: &Value, dtype: &str) -> Result<Ceilings, Box
     Ceilings::new(
         rate("streaming_read")?,
         rate("streaming_copy")?,
-        rate(&format!("calibration_mma_{dtype}"))?,
+        rate(compute_probe)?,
         positive(1.0 / rate("dependent_dispatch")?)?,
     )
     .ok_or_else(|| "invalid calibrated ceilings".into())
@@ -95,7 +100,7 @@ impl Attribution {
         "layer_type": dispatch.scope.as_ref().map_or("unscoped", |scope| scope.layer_type.as_str()),
         "layer": dispatch.scope.as_ref().and_then(|scope| scope.layer), "op": dispatch.op, "kernel": kernel,
         "variant": dispatch.variant, "alternatives": dispatch.alternatives, "shape": dispatch.shape,
-        "compute_dtype": dispatch.compute_dtype, "cost": cost.json(), "physical_dispatches": count,
+        "compute_dtype": dispatch.compute_dtype, "arithmetic_mode": format!("{}_native", dispatch.compute_dtype), "cost": cost.json(), "physical_dispatches": count,
         "profiled_gpu_seconds": raw, "preceding_gap_seconds": gap, "attributed_gpu_seconds": current,
         "share_of_step_percent": current / wall * 100.0,
         "raw_gigabytes_per_second_range": [minimum_bytes / raw / 1e9, maximum_bytes / raw / 1e9],

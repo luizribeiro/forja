@@ -147,9 +147,12 @@ mod tests {
             ("calibration_mma_f32", 1000.0),
             ("dependent_dispatch", 100.0),
         ] {
-            probes[name] = json!({"units_per_second": rate});
+            probes[name] = json!({"units_per_second": rate, "ci95": [rate, rate], "arithmetic_mode": if name == "calibration_mma_f32" { Some("f32_native") } else { None }});
         }
-        (profile, json!({"probes": probes}))
+        (
+            profile,
+            json!({"probes": probes, "arithmetic_probes": {"f32_native": "calibration_mma_f32"}}),
+        )
     }
 
     #[test]
@@ -175,6 +178,23 @@ mod tests {
                 < f64::EPSILON
         );
         assert!(ranking::human(&report).contains("Unmeasured: block/layer-0/dispatch-0 / read-a"));
+    }
+
+    #[test]
+    fn native_bf16_never_uses_a_promoted_f32_probe() {
+        let (_, mut calibration) = fixture();
+        calibration["probes"]["calibration_mma_bf16"] = json!({"units_per_second": 2000.0, "ci95": [2000.0, 2000.0], "arithmetic_mode": "bf16_promoted_f32"});
+        calibration["arithmetic_probes"]["bf16_promoted_f32"] = json!("calibration_mma_bf16");
+        assert!(ceilings(&calibration, "bf16").is_err());
+        calibration["arithmetic_probes"]["bf16_native"] = json!("calibration_mma_bf16");
+        assert!(ceilings(&calibration, "bf16").is_err());
+        calibration["probes"]["calibration_mma_bf16"]["arithmetic_mode"] = json!("bf16_native");
+        assert!(
+            (ceilings(&calibration, "bf16").unwrap().compute_rate() - 2000.0).abs() < f64::EPSILON
+        );
+        assert!(
+            (ceilings(&calibration, "f32").unwrap().compute_rate() - 1000.0).abs() < f64::EPSILON
+        );
     }
 
     #[test]
