@@ -5,6 +5,8 @@ mod attention;
 mod copies;
 mod routed;
 pub use routed::quantized_route_index;
+#[cfg(test)]
+mod matrix_values;
 mod scalar;
 #[cfg(test)]
 mod scalar_values;
