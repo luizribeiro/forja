@@ -25,6 +25,8 @@ pub(crate) enum MetalVariant {
     QuantMatmulPortable,
     QuantMatmulGemv,
     QuantMatmulGemvN2,
+    QuantMatmulVector8,
+    QuantMatmulVector16,
     QuantMatmulQ8FastGemv,
     QuantMatmulQ8FastGemvN2,
     QuantMatmulSmallM,
@@ -329,6 +331,11 @@ const QUANT_GEMV: &[Constraint] = &[value(QUANT_M, Relation::Equal(1))];
 const QUANT_GEMV_N2: &[Constraint] = &[
     QUANT_GEMV[0],
     operation(OperationValue::Bits, Relation::Equal(4)),
+];
+const QUANT_VECTOR: &[Constraint] = &[
+    value(QUANT_M, Relation::Range { min: 1, max: 8 }),
+    value(INNER, Relation::MultipleOf(32)),
+    operation(OperationValue::GroupSize, Relation::MultipleOf(32)),
 ];
 const QUANT_ROW_GEMV: &[Constraint] = &[value(QUANT_M, Relation::Range { min: 2, max: 8 })];
 const Q8_FAST_SUFFIX: &[Constraint] = &[
@@ -850,6 +857,28 @@ pub(crate) static REGISTRY: &[VariantDef<MetalVariant>] = &[
         &["single-row q4 decode that benefits from more output parallelism."],
         &["q8 weights or larger batches."],
         &["Computes two output rows per SIMD group with the gemv reduction order."]
+    ),
+    batch_invariant_variant!(
+        "quant-matmul.vector8",
+        QuantMatmul,
+        QuantMatmulVector8,
+        QUANT_VECTOR,
+        &["contiguous decode weights with 8-byte packed loads."],
+        &["inner dimensions or quantization groups not divisible by 32."],
+        &[
+            "Uses a fixed lane partition for every batch row; strided views use guarded scalar loads."
+        ]
+    ),
+    batch_invariant_variant!(
+        "quant-matmul.vector16",
+        QuantMatmul,
+        QuantMatmulVector16,
+        QUANT_VECTOR,
+        &["contiguous decode weights with 16-byte packed loads."],
+        &["inner dimensions or quantization groups not divisible by 32."],
+        &[
+            "Uses a fixed lane partition for every batch row; strided views use guarded scalar loads."
+        ]
     ),
     batch_invariant_variant!(@class "quant-matmul.row-gemv";
         "quant-matmul.row-gemv",
@@ -1983,6 +2012,8 @@ mod tests {
                 "quant-matmul.portable",
                 "quant-matmul.gemv",
                 "quant-matmul.gemv-n2",
+                "quant-matmul.vector8",
+                "quant-matmul.vector16",
                 "quant-matmul.row-gemv",
                 "quant-matmul.q8-fast-gemv",
                 "quant-matmul.q8-fast-gemv-n2",
@@ -2445,6 +2476,20 @@ mod tests {
             error.to_string(),
             "metal matmul variant 'matmul.gemv': constraint 'm = 1' failed (m was 2)"
         );
+    }
+
+    #[test]
+    fn vector_gemv_refuses_prefill_rows() {
+        let decode = quant_dispatch(DType::F32, 8, 768, true);
+        let prefill = quant_dispatch(DType::F32, 9, 768, false);
+        for name in ["quant-matmul.vector8", "quant-matmul.vector16"] {
+            assert!(resolve(&decode, name, METAL4).is_ok());
+            assert_quant_tail_refusals(&decode, name, (32, 32));
+            assert!(matches!(
+                resolve(&prefill, name, METAL4),
+                Err(VariantError::Constraint { .. })
+            ));
+        }
     }
 
     #[test]

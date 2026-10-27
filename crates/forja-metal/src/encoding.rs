@@ -4328,9 +4328,9 @@ impl MetalBackend {
             (2, dtype_code(output.layout.dtype())),
             (12, u32::from(bits)),
             (13, group_size),
-            (222, 0),
-            (223, 2),
-            (224, 0),
+            (222, qmv_vector_config(dispatch)[0]),
+            (223, qmv_vector_config(dispatch)[1]),
+            (224, qmv_vector_config(dispatch)[2]),
             (15, quant_epilogue_specialization(columns, inner)),
         ];
         let mut pipelines = self
@@ -4363,7 +4363,15 @@ impl MetalBackend {
         set_argument_table(encoder, table);
         let (column_tile, row_tile, threads) = match kernel {
             "quantized_gemv" => (if bits == 8 { 16 } else { 8 }, 1, 64), // Vectors use n2.
-            "quantized_gemv_n2" | "quantized_gemv_q8_fast_n2" => (4, 1, 64),
+            "quantized_gemv_n2" => {
+                let groups = qmv_vector_config(dispatch)[1];
+                (
+                    groups * 2,
+                    1,
+                    usize::try_from(groups * 32).map_err(|_| BackendError::InvalidInput)?,
+                )
+            }
+            "quantized_gemv_q8_fast_n2" => (4, 1, 64),
             "quantized_gemv_q8_fast" => (8, 1, 64),
             "quantized_gemm_tiled_f32"
             | "quantized_gemm_tiled_f16"
@@ -8495,7 +8503,11 @@ fn quant_matmul_kernel(dispatch: &Dispatch) -> Result<&'static str, BackendError
     };
     match selected_variant(dispatch) {
         Some(MetalVariant::QuantMatmulGemv) => Ok("quantized_gemv"),
-        Some(MetalVariant::QuantMatmulGemvN2) => Ok("quantized_gemv_n2"),
+        Some(
+            MetalVariant::QuantMatmulGemvN2
+            | MetalVariant::QuantMatmulVector8
+            | MetalVariant::QuantMatmulVector16,
+        ) => Ok("quantized_gemv_n2"),
         Some(MetalVariant::QuantMatmulQ8FastGemv) => Ok("quantized_gemv_q8_fast"),
         Some(MetalVariant::QuantMatmulQ8FastGemvN2) => Ok("quantized_gemv_q8_fast_n2"),
         Some(MetalVariant::QuantMatmulPortable | MetalVariant::QuantMatmulSmallM) => {
@@ -8927,7 +8939,9 @@ pub(super) fn variant_supported(
         | MetalVariant::TopKPortable
         | MetalVariant::GatherQuantMatmulRouteGemv
         | MetalVariant::SdpaDecomposed
-        | MetalVariant::TopKPartials => true,
+        | MetalVariant::TopKPartials
+        | MetalVariant::QuantMatmulVector8
+        | MetalVariant::QuantMatmulVector16 => true,
         MetalVariant::GatherQuantMatmulWeightedBroad => dispatch.primitive_inputs().len() == 6,
         MetalVariant::MatmulGemv => matmul_rows(dispatch)? == 1,
         MetalVariant::MatmulGemvTransposed => matmul_kernel(dispatch)? == "gemv_transposed",
@@ -9375,6 +9389,23 @@ fn quantized_constants(
     ]
 }
 
+fn qmv_vector_config(dispatch: &Dispatch) -> [u32; 3] {
+    let words = match selected_variant(dispatch) {
+        Some(MetalVariant::QuantMatmulVector8) => 2,
+        Some(MetalVariant::QuantMatmulVector16) => 4,
+        _ => return [0, 2, 0],
+    };
+    let contiguous = dispatch.primitive_inputs().iter().all(|tensor| {
+        let layout = tensor.layout();
+        layout.is_contiguous()
+            && layout
+                .offset()
+                .checked_mul(layout.dtype().byte_size())
+                .is_some_and(|bytes| bytes.is_multiple_of(16))
+    });
+    [words, 4, u32::from(contiguous)]
+}
+
 fn quant_epilogue_specialization(columns: u32, inner: u32) -> u32 {
     u32::from(columns.is_multiple_of(8) && inner.is_multiple_of(512)) + 1
 }
@@ -9410,7 +9441,7 @@ fn epilogue_pipeline_requests(
                 scales,
                 dispatch.output(),
                 (bits, group_size),
-                [0, 2, 0],
+                qmv_vector_config(dispatch),
             );
             let implementation = quant_matmul_kernel(dispatch)?;
             if parameter_dependent {

@@ -45,7 +45,7 @@ fn pinned_decode_batch_variants_match_cpu_for_distinct_rows() {
         (8, "quant-matmul.q8-fast-gemv"),
         (8, "quant-matmul.q8-fast-gemv-n2"),
     ] {
-        assert_pinned_decode_batch(&reference, &candidate, 1, bits, name, &mut values);
+        assert_pinned_decode_batch(&reference, &candidate, 1, bits, name, 256, &mut values);
     }
     for rows in [2, 4, 8] {
         assert_pinned_decode_batch(
@@ -54,6 +54,7 @@ fn pinned_decode_batch_variants_match_cpu_for_distinct_rows() {
             rows,
             4,
             "quant-matmul.row-gemv",
+            256,
             &mut values,
         );
         assert_pinned_decode_batch(
@@ -62,8 +63,38 @@ fn pinned_decode_batch_variants_match_cpu_for_distinct_rows() {
             rows,
             8,
             "quant-matmul.q8-fast-gemv",
+            256,
             &mut values,
         );
+    }
+}
+
+#[test]
+fn vector_load_gemv_matches_cpu_and_keeps_batch_bits() {
+    let reference = CpuBackend::new();
+    let candidate = MetalBackend::new().unwrap();
+    for inner in [768, 2048, 4096] {
+        for bits in [4, 8] {
+            for name in ["quant-matmul.vector8", "quant-matmul.vector16"] {
+                let mut first = None;
+                for rows in [1, 2, 4, 7, 8] {
+                    let mut values = DeterministicValues::new(0x510e_527f_ade6_82d1);
+                    let actual = assert_pinned_decode_batch(
+                        &reference,
+                        &candidate,
+                        rows,
+                        bits,
+                        name,
+                        inner,
+                        &mut values,
+                    );
+                    if rows != 7 {
+                        let baseline = first.get_or_insert_with(|| actual[..33 * 4].to_vec());
+                        assert_eq!(&actual[..33 * 4], baseline);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -73,20 +104,33 @@ fn assert_pinned_decode_batch(
     rows: u32,
     bits: u8,
     name: &str,
+    inner: u32,
     values: &mut DeterministicValues,
-) {
-    let inner = 256;
+) -> Vec<u8> {
     let columns = 33;
     let group_size = 64;
     let activations = (0..rows * inner)
         .flat_map(|index| (f32::from(u16::try_from(index).unwrap()) / 257.0 - 4.0).to_le_bytes())
         .collect();
-    let specs = [
+    let mut specs = [
         TensorSpec::initialized(DType::F32, &[rows, inner], activations),
         TensorSpec::contiguous(DType::U32, &[columns, inner * u32::from(bits) / 32]),
         TensorSpec::contiguous(DType::F16, &[columns, inner / group_size]),
         TensorSpec::contiguous(DType::F16, &[columns, inner / group_size]),
     ];
+    if rows == 7 {
+        for spec in &mut specs {
+            let [height, width] = <[u32; 2]>::try_from(spec.allocation_shape()).unwrap();
+            *spec = TensorSpec::sliced(
+                spec.dtype(),
+                &[height, width * 2 + 1],
+                &[
+                    Slice::new(0, height, 1).unwrap(),
+                    Slice::new(1, width, 2).unwrap(),
+                ],
+            );
+        }
+    }
     let bytes = specs
         .iter()
         .map(|spec| generated_tensor_bytes(spec, values).unwrap())
@@ -108,12 +152,14 @@ fn assert_pinned_decode_batch(
         &candidate_output,
         Some(BackendDispatchData::new(variant)),
     );
+    let actual = candidate.read(&candidate_output).unwrap();
     assert_outputs_agree(
         DType::F32,
         &reference.read(&reference_output).unwrap(),
-        &candidate.read(&candidate_output).unwrap(),
+        &actual,
     )
     .unwrap();
+    actual
 }
 
 fn allocate_inputs<B: Backend>(
@@ -129,7 +175,9 @@ fn allocate_inputs<B: Backend>(
                 .alloc(spec.dtype(), spec.allocation_shape())
                 .unwrap();
             backend.write(&tensor, bytes).unwrap();
-            tensor
+            spec.views().iter().fold(tensor, |view, operation| {
+                backend.view(&view, operation.clone()).unwrap()
+            })
         })
         .collect()
 }
