@@ -1,6 +1,8 @@
 use std::{collections::BTreeMap, error::Error, fs, time::Duration};
 
 use forja_core::{Backend, DType, DeviceInfo, DispatchProfile, Op, ProfileTensor};
+
+mod record;
 use forja_host::EngineMemory;
 
 use crate::{
@@ -83,49 +85,11 @@ pub(crate) async fn run(options: &Profile) -> Result<(), Box<dyn Error>> {
 }
 
 fn dispatch_bytes(dispatch: &DispatchProfile) -> Result<u64, &'static str> {
-    if dispatch.op == Op::Embed {
-        let [embeddings, ids] = dispatch.inputs.as_slice() else {
-            return Err("embed profile has invalid inputs");
-        };
-        let width = embeddings
-            .shape
-            .last()
-            .copied()
-            .ok_or("embed profile has no width")?;
-        let rows = element_count(ids)?;
-        return rows
-            .checked_mul(u64::from(width))
-            .and_then(|count| count.checked_mul(embeddings.dtype.byte_size()))
-            .and_then(|bytes| bytes.checked_add(tensor_bytes(ids).ok()?))
-            .and_then(|bytes| {
-                dispatch.outputs.iter().try_fold(bytes, |sum, tensor| {
-                    sum.checked_add(tensor_bytes(tensor).ok()?)
-                })
-            })
-            .ok_or("dispatch byte count overflowed");
-    }
     dispatch
-        .inputs
-        .iter()
-        .chain(&dispatch.outputs)
-        .try_fold(0_u64, |sum, tensor| {
-            sum.checked_add(tensor_bytes(tensor)?)
-                .ok_or("dispatch byte count overflowed")
-        })
-}
-
-fn tensor_bytes(tensor: &ProfileTensor) -> Result<u64, &'static str> {
-    element_count(tensor)?
-        .checked_mul(tensor.dtype.byte_size())
-        .ok_or("tensor byte count overflowed")
-}
-
-fn element_count(tensor: &ProfileTensor) -> Result<u64, &'static str> {
-    tensor.shape.iter().try_fold(1_u64, |count, &extent| {
-        count
-            .checked_mul(u64::from(extent))
-            .ok_or("tensor element count overflowed")
-    })
+        .cost
+        .read_bytes
+        .checked_add(dispatch.cost.write_bytes)
+        .ok_or("dispatch byte count overflowed")
 }
 
 fn aggregate<'a>(
@@ -414,44 +378,19 @@ fn report(
         .as_ref()
         .ok_or("profiled step has no submission detail")?;
     let whole_run = whole_run_json(measurement)?;
-    let timeline = submission
-        .per_dispatch
-        .iter()
-        .enumerate()
-        .map(|(index, dispatch)| {
-            let bytes = dispatch_bytes(dispatch)?;
-            let rate = throughput(bytes, dispatch.gpu_time);
-            let internal = dispatch
-                .internal
-                .iter()
-                .map(|kernel| {
-                    serde_json::json!({
-                        "kernel": kernel.kernel,
-                        "start_seconds": kernel.gpu_start.as_secs_f64(),
-                        "end_seconds": kernel.gpu_end.as_secs_f64(),
-                        "gpu_time_seconds": kernel.gpu_time.as_secs_f64(),
-                    })
-                })
-                .collect::<Vec<_>>();
-            Ok(serde_json::json!({
-                "index": index,
-                "op": op_name(dispatch.op),
-                "kernel": dispatch.kernel,
-                "shape": shape(dispatch),
-                "start_seconds": dispatch.gpu_start.as_secs_f64(),
-                "end_seconds": dispatch.gpu_end.as_secs_f64(),
-                "gap_before_seconds": dispatch.gap_before.as_secs_f64(),
-                "gpu_time_seconds": dispatch.gpu_time.as_secs_f64(),
-                "bytes": bytes,
-                "gigabytes_per_second": rate,
-                "percent_of_peak": rate / peak * 100.0,
-                "barrier_before": dispatch.barrier,
-                "internal": internal,
-            }))
-        })
-        .collect::<Result<Vec<_>, &'static str>>()?;
+    let timeline = record::timeline(&submission.per_dispatch)?;
+    #[cfg(target_os = "macos")]
+    let identity = crate::calibration::identity()?;
+    #[cfg(not(target_os = "macos"))]
+    let identity = serde_json::Value::Null;
     Ok(serde_json::json!({
+        "schema_version": 2, "kind": "kernel-profile", "model_benchmark": false,
+        "device_identity": identity, "inputs": record::inputs(options)?,
+        "submissions": record::submissions(options.mode, &measurement.step.submissions)?,
+        "timestamp_method": "precise-per-dispatch",
         "provenance": {
+            "binary_sha256": golden_fixtures::sha256_file(std::env::current_exe()?)?,
+            "build_environment": crate::provenance::BUILD_ENVIRONMENT,
             "commit": crate::provenance::commit(),
             "dirty": crate::provenance::dirty(),
             "machine_load": {
@@ -556,6 +495,7 @@ mod tests {
             scope: None,
             op,
             kernel: "test",
+            compute_dtype: DType::F32,
             physical_dispatches: 1,
             variant: None,
             alternatives: Vec::new(),
@@ -573,32 +513,50 @@ mod tests {
     }
 
     #[test]
-    fn counts_logical_matmul_bytes() {
-        let profile = dispatch(
-            Op::Matmul,
-            vec![
-                tensor(DType::BF16, &[1, 1024]),
-                tensor(DType::BF16, &[1024, 3072]),
-            ],
-            vec![tensor(DType::BF16, &[1, 3072])],
+    fn timeline_retains_costs_and_engine_call_sites() {
+        let mut dispatch = dispatch(
+            Op::Copy,
+            vec![tensor(DType::F32, &[33])],
+            vec![tensor(DType::F32, &[33])],
         );
-        assert_eq!(
-            dispatch_bytes(&profile),
-            Ok((1024 + 1024 * 3072 + 3072) * 2)
+        dispatch.scope = Some(
+            forja_core::ProfileScope::new("decoder".into(), "sparse".into(), Some(7)).unwrap(),
         );
+        dispatch.cost = forja_core::KernelCost {
+            read_bytes: 132,
+            write_bytes: 132,
+            ..forja_core::KernelCost::default()
+        };
+        let timeline = record::timeline(&[dispatch.clone(), dispatch]).unwrap();
+        assert_eq!(timeline[0]["call_site"], "decoder/layer-7/dispatch-0");
+        assert_eq!(timeline[1]["call_site"], "decoder/layer-7/dispatch-1");
+        assert_eq!(timeline[0]["cost"]["read_bytes"], 132);
+        assert_eq!(timeline[0]["scope"]["layer_type"], "sparse");
+        assert_eq!(timeline[0]["physical_dispatches"], 1);
+        assert_eq!(timeline[0]["compute_dtype"], "f32");
     }
 
     #[test]
-    fn embedding_counts_selected_rows_not_the_table() {
-        let profile = dispatch(
-            Op::Embed,
-            vec![
-                tensor(DType::BF16, &[151_936, 1024]),
-                tensor(DType::U32, &[7]),
-            ],
-            vec![tensor(DType::BF16, &[7, 1024])],
+    fn records_every_submission_in_order() {
+        let dispatch = dispatch(
+            Op::Copy,
+            vec![tensor(DType::F32, &[7])],
+            vec![tensor(DType::F32, &[7])],
         );
-        assert_eq!(dispatch_bytes(&profile), Ok(7 * 1024 * 2 * 2 + 7 * 4));
+        let submission = forja_core::SubmissionProfile {
+            gpu_time: Duration::from_micros(10),
+            per_dispatch: vec![dispatch],
+            ..forja_core::SubmissionProfile::default()
+        };
+        let records =
+            record::submissions(ProfileMode::Prefill, &[submission.clone(), submission]).unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0]["index"], 0);
+        assert_eq!(records[1]["index"], 1);
+        assert_eq!(
+            records[1]["timeline"][0]["call_site"],
+            "unscoped/dispatch-0"
+        );
     }
 
     #[test]

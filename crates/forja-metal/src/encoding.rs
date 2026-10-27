@@ -8102,7 +8102,21 @@ fn dispatch_profile(
     let padded_flops = model
         .padded_flops(dispatch, cost)
         .ok_or(BackendError::InvalidInput)?;
+    let compute_dtype = if matches!(
+        selected_variant(dispatch),
+        Some(
+            MetalVariant::SdpaSteelHalf
+                | MetalVariant::PagedSdpaSteelHalf
+                | MetalVariant::PagedSdpaSteelHalf32x16
+                | MetalVariant::PagedSdpaSteelHalf64x16
+        )
+    ) {
+        DType::F16
+    } else {
+        DType::F32
+    };
     Ok(DispatchProfile {
+        compute_dtype,
         physical_dispatches,
         scope: dispatch.profile_scope().map(|scope| scope.as_ref().clone()),
         variant,
