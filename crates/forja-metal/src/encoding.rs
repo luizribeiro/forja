@@ -888,7 +888,19 @@ struct ProgramPipeline {
     compile_fallback: bool,
 }
 
+// Bound cache growth even when the compilation token bucket refills.
+const MAX_ROW_SPECIALIZATIONS: usize = 8;
+
+struct RowSpecialization {
+    layouts: Vec<Layout>,
+    resident: bool,
+    state: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+}
+
 pub(super) struct MetalProgram {
+    validated: ValidatedProgram,
+    signature: KernelSignature,
+    specializations: Mutex<Vec<RowSpecialization>>,
     rereading: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     resident: Option<LazyProgramPipeline>,
 }
@@ -896,8 +908,8 @@ pub(super) struct MetalProgram {
 // SAFETY: Compiled pipeline states are immutable, and Metal permits encoding them from multiple
 // host threads.
 unsafe impl Send for MetalProgram {}
-// SAFETY: Compiled pipeline states are immutable, and lazy initialization is synchronized by
-// `OnceLock`.
+// SAFETY: Compiled pipeline states are immutable; the mutexes and `OnceLock` synchronize
+// initialization and cache access.
 unsafe impl Sync for MetalProgram {}
 
 struct LazyProgramPipeline {
@@ -911,6 +923,92 @@ struct LazyProgramPipeline {
 pub struct MetalProgramHandle(pub(super) Arc<MetalProgram>);
 
 impl MetalProgram {
+    fn specialize(
+        &self,
+        backend: &MetalBackend,
+        dispatch: &Dispatch,
+        fallback: ProgramPipeline,
+    ) -> Result<ProgramPipeline, BackendError> {
+        if self.validated.program().kind != ProgramKind::Row || fallback.compile_fallback {
+            return Ok(fallback);
+        }
+        let bound = dispatch.bound_program().ok_or(BackendError::InvalidInput)?;
+        let layouts = bound
+            .inputs()
+            .iter()
+            .chain(bound.outputs())
+            .map(|tensor| tensor.layout().clone())
+            .collect::<Vec<_>>();
+        let mut cache = self
+            .specializations
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?;
+        if let Some(cached) = cache
+            .iter()
+            .find(|cached| cached.resident == fallback.resident && cached.layouts == layouts)
+        {
+            return Ok(ProgramPipeline {
+                state: cached.state.clone(),
+                ..fallback
+            });
+        }
+        if cache.len() >= MAX_ROW_SPECIALIZATIONS {
+            return Ok(fallback);
+        }
+        if !backend
+            .program_compile_tokens
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?
+            .consume(1)
+        {
+            return Ok(ProgramPipeline {
+                compile_fallback: true,
+                ..fallback
+            });
+        }
+        let key = ProgramPipelineKey::new(&self.validated, &self.signature, fallback.resident);
+        let source = map_codegen::generate(
+            &self.validated,
+            &self.signature,
+            fallback.resident,
+            &layouts,
+        );
+        let state = backend
+            .pipelines
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?
+            .compile_program_source(&key, &source)?;
+        let width = dispatch
+            .output()
+            .layout()
+            .shape()
+            .last()
+            .copied()
+            .ok_or(BackendError::InvalidInput)?;
+        let expected = program_row_dispatch_geometry(
+            &fallback.state,
+            dispatch.output().layout(),
+            width,
+            fallback.resident,
+        )?;
+        if !program_row_dispatch_geometry(
+            &state,
+            dispatch.output().layout(),
+            width,
+            fallback.resident,
+        )
+        .is_ok_and(|geometry| geometry == expected)
+        {
+            return Ok(fallback);
+        }
+        cache.push(RowSpecialization {
+            layouts,
+            resident: fallback.resident,
+            state: state.clone(),
+        });
+        Ok(ProgramPipeline { state, ..fallback })
+    }
+
     fn rereading(&self, compile_fallback: bool) -> ProgramPipeline {
         ProgramPipeline {
             state: self.rereading.clone(),
@@ -2329,6 +2427,9 @@ impl MetalBackend {
             }
         });
         let program = Arc::new(MetalProgram {
+            validated: program.clone(),
+            signature: signature.clone(),
+            specializations: Mutex::new(Vec::new()),
             rereading,
             resident,
         });
@@ -7372,6 +7473,7 @@ impl MetalBackend {
             .copied()
             .unwrap_or(1);
         let pipeline = handle.0.select(self, width)?;
+        let pipeline = handle.0.specialize(self, dispatch, pipeline)?;
         if pipeline.compile_fallback {
             *state.compile_fallbacks = state.compile_fallbacks.saturating_add(1);
         }
@@ -10429,6 +10531,66 @@ mod tests {
         assert_eq!(row_thread_count(512, 33).unwrap(), 64);
         assert_eq!(row_thread_count(512, 4_097).unwrap(), 256);
         assert_eq!(row_thread_count(768, 700).unwrap(), 704);
+    }
+
+    #[test]
+    fn row_layout_specializations_preserve_bits_and_bound_the_cache() {
+        let candidate = MetalBackend::new().unwrap();
+        let budget = crate::ProgramCompileBudget::new(2, Duration::from_hours(24)).unwrap();
+        let reference = MetalBackend::with_program_compile_budget(budget).unwrap();
+        let program = Program {
+            kind: ProgramKind::Row,
+            insts: vec![
+                Inst::Input(0),
+                Inst::Reduce(RedOp::Sum, 0),
+                Inst::Binary(BinOp::Add, 0, 1),
+            ],
+            outputs: vec![(0, 2)],
+        }
+        .validate()
+        .unwrap();
+        let signature = KernelSignature::new(1, vec![DType::F32], vec![DType::F32], 0);
+        let prepared = [&reference, &candidate]
+            .map(|backend| prepare_program(backend, program.clone(), signature.clone()).unwrap());
+        prepared[0]
+            .backend_handle::<MetalProgramHandle>()
+            .unwrap()
+            .0
+            .select(&reference, 1)
+            .unwrap();
+        for width in [1, 7, 33, 128, 256, 512, 1024, 2048, 4097, 7] {
+            let bytes = (0..=width * 2)
+                .flat_map(|index| {
+                    (f32::from(u16::try_from(index % 97).unwrap()) / 31.0 - 1.0).to_le_bytes()
+                })
+                .collect::<Vec<_>>();
+            let results = [&reference, &candidate]
+                .into_iter()
+                .zip(&prepared)
+                .map(|(backend, prepared)| {
+                    let storage = backend.alloc(DType::F32, &[width * 2 + 1]).unwrap();
+                    backend.write(&storage, &bytes).unwrap();
+                    let input = backend
+                        .view(
+                            &storage,
+                            ViewOp::Slice(vec![Slice::new(1, width, 2).unwrap()]),
+                        )
+                        .unwrap();
+                    let output = backend.alloc(DType::F32, &[width]).unwrap();
+                    let mut commands = CommandList::new();
+                    commands
+                        .dispatch_kernel(prepared, &[&input], &[&output])
+                        .unwrap();
+                    backend.submit(commands).unwrap().wait().unwrap();
+                    backend.read(&output).unwrap()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(results[0], results[1], "width={width}");
+        }
+        let handle = prepared[1].backend_handle::<MetalProgramHandle>().unwrap();
+        assert_eq!(handle.0.specializations.lock().unwrap().len(), 8);
+        let handle = prepared[0].backend_handle::<MetalProgramHandle>().unwrap();
+        assert!(handle.0.specializations.lock().unwrap().is_empty());
     }
 
     #[test]

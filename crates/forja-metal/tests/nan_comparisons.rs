@@ -5,7 +5,7 @@ use forja_core::{
     program::{BinOp, Inst, Program, ProgramKind, UnOp},
 };
 use forja_cpu::CpuBackend;
-use forja_metal::MetalBackend;
+use forja_metal::{MetalBackend, ProgramCompileBudget};
 use forja_testing::{TensorSpec, assert_program_backends_agree, program::ProgramCase};
 
 const COMPARISONS: [BinOp; 6] = [
@@ -34,7 +34,10 @@ fn rereading_row_nan_semantics_are_context_independent() {
 
 fn assert_nan_semantics(kind: ProgramKind, shape: &[u32]) {
     let cpu = CpuBackend::new();
-    let metal = MetalBackend::new().unwrap();
+    // Each numerical case can compile rereading, resident and layout-specialized forms.
+    let cases = COMPARISONS.len() * 3 + 2 * 3 + 1;
+    let budget = ProgramCompileBudget::new(cases * 3, std::time::Duration::from_hours(24)).unwrap();
+    let metal = MetalBackend::with_program_compile_budget(budget).unwrap();
     for op in COMPARISONS {
         for operands in [(0, 1), (1, 0), (0, 0)] {
             assert_case(&cpu, &metal, comparison_program(kind, op, operands), shape);
