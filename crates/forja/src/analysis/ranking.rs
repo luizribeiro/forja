@@ -22,23 +22,29 @@ pub(super) fn aggregate(rows: &[Value], field: &str) -> Vec<Value> {
         for &key in SUMS {
             group[key] = json!(rows.iter().filter_map(|row| row[key].as_f64()).sum::<f64>());
         }
-        for key in ["ceiling_seconds_range", "target_seconds_range", "recoverable_seconds_range"] {
+        for key in ["calibration_bound_seconds_envelope",
+            "ceiling_seconds_range", "target_seconds_range", "recoverable_seconds_range"] {
             group[key] = json!([0, 1].map(|index| rows.iter().filter_map(|row| row[key][index].as_f64()).sum::<f64>()));
         }
         let names = |key: &str| rows.iter().filter_map(|row| row[key].as_str()).collect::<BTreeSet<_>>();
+        group["below_calibrated_floor"] = json!(rows.iter().any(|row| row["below_calibrated_floor"].as_bool().unwrap_or(false)));
+        group["below_median_floor"] = json!(rows.iter().any(|row| row["below_median_floor"].as_bool().unwrap_or(false)));
+        group["over_100_percent"] = json!(rows.iter().any(|row| row["over_100_percent"].as_bool().unwrap_or(false)));
+        group["flagged_instances"] = json!(rows.iter().filter(|row| row["below_calibrated_floor"].as_bool().unwrap_or(false) || row["over_100_percent"].as_bool().unwrap_or(false) || row["below_median_floor"].as_bool().unwrap_or(false)).count());
         group["call_sites"] = json!(names("call_site"));
         group["bounds"] = json!(names("bound"));
         group["arithmetic_modes"] = json!(names("arithmetic_mode"));
         let alternatives = first["alternatives"].as_array().into_iter().flatten().filter(|alternative| rows.iter().all(|row| row["alternatives"].as_array().is_some_and(|values| values.contains(alternative)))).collect::<Vec<_>>();
         group["alternatives"] = json!(alternatives);
-        let raw = group["profiled_gpu_seconds"].as_f64().unwrap_or(1.0);
-        for key in ["percent_of_compute_ceiling", "percent_of_streaming_read_ceiling_range"] {
+        let raw = group["profiled_gpu_seconds"].as_f64().filter(|raw| *raw > 0.0).unwrap_or(1.0);
+        for key in ["percent_of_compute_ceiling", "percent_of_streaming_read_ceiling_range", "percent_of_streaming_copy_ceiling_range", "percent_of_memory_ceiling_range"] {
             if key.ends_with("range") {
-                group[key] = json!([0, 1].map(|index| rows.iter().map(|row| row[key][index].as_f64().unwrap_or(0.0) * row["profiled_gpu_seconds"].as_f64().unwrap_or(0.0)).sum::<f64>() / raw));
+                group[key] = json!([0, 1].map(|index| rows.iter().map(|row| row[key][index].as_f64().unwrap_or(0.0) * (row["profiled_gpu_seconds"].as_f64().unwrap_or(0.0) / raw)).sum::<f64>()));
             } else {
-                group[key] = json!(rows.iter().map(|row| row[key].as_f64().unwrap_or(0.0) * row["profiled_gpu_seconds"].as_f64().unwrap_or(0.0)).sum::<f64>() / raw);
+                group[key] = json!(rows.iter().map(|row| row[key].as_f64().unwrap_or(0.0) * (row["profiled_gpu_seconds"].as_f64().unwrap_or(0.0) / raw)).sum::<f64>());
             }
         }
+        group["over_100_percent"] = json!(group["over_100_percent"].as_bool().unwrap_or(false) || crate::analysis_diagnostics::over_100([group["share_of_step_percent"].as_f64().unwrap_or(0.0), group["percent_of_compute_ceiling"].as_f64().unwrap_or(0.0), group["percent_of_memory_ceiling_range"][1].as_f64().unwrap_or(0.0)]));
         group
     }).collect::<Vec<_>>();
     super::sort(&mut result);
@@ -63,12 +69,13 @@ pub(crate) fn human(report: &Value) -> String {
     );
     let _ = writeln!(
         out,
-        "Model bound {:.3}–{:.3} ms; GPU efficiency {:.1}–{:.1}%; dispatch floor {:.3} ms",
+        "Model bound {:.3}–{:.3} ms; GPU efficiency {:.1}–{:.1}%; dispatch floor {:.3} ms{}",
         number(&overall["lower_bound_seconds_range"][0]) * 1000.0,
         number(&overall["lower_bound_seconds_range"][1]) * 1000.0,
         number(&overall["gpu_efficiency_percent_range"][0]),
         number(&overall["gpu_efficiency_percent_range"][1]),
-        number(&overall["dispatch_count_floor_seconds"]) * 1000.0
+        number(&overall["dispatch_count_floor_seconds"]) * 1000.0,
+        crate::analysis_diagnostics::marker(overall)
     );
     for row in report["whole_model"]["by_layer_type"]
         .as_array()
@@ -77,12 +84,13 @@ pub(crate) fn human(report: &Value) -> String {
     {
         let _ = writeln!(
             out,
-            "  {}: bound {:.3}–{:.3} ms; GPU efficiency {:.1}–{:.1}%",
+            "  {}: bound {:.3}–{:.3} ms; GPU efficiency {:.1}–{:.1}%{}",
             row["layer_type"].as_str().unwrap_or("?"),
             number(&row["lower_bound_seconds_range"][0]) * 1000.0,
             number(&row["lower_bound_seconds_range"][1]) * 1000.0,
             number(&row["gpu_efficiency_percent_range"][0]),
-            number(&row["gpu_efficiency_percent_range"][1])
+            number(&row["gpu_efficiency_percent_range"][1]),
+            crate::analysis_diagnostics::marker(row)
         );
     }
     let _ = writeln!(
@@ -98,8 +106,9 @@ pub(crate) fn human(report: &Value) -> String {
     {
         let _ = writeln!(
             out,
-            "  {} | {} | {} | {:.1}% wall | recover {:.3}/{:.3} ms | BW {:.1}–{:.1}% | MMA {:.1}% {}",
+            "  {}{} | {} | {} | {:.1}% wall | recover {:.3}/{:.3} ms | BW {:.1}–{:.1}% | MMA {:.1}% {}",
             row["name"].as_str().unwrap_or("?"),
+            crate::analysis_diagnostics::marker(row),
             row["variant"]
                 .as_str()
                 .or_else(|| row["kernel"].as_str())
@@ -108,8 +117,8 @@ pub(crate) fn human(report: &Value) -> String {
             number(&row["share_of_step_percent"]),
             number(&row["recoverable_seconds"]) * 1000.0,
             number(&row["recoverable_at_target_seconds"]) * 1000.0,
-            number(&row["percent_of_streaming_read_ceiling_range"][0]),
-            number(&row["percent_of_streaming_read_ceiling_range"][1]),
+            number(&row["percent_of_memory_ceiling_range"][0]),
+            number(&row["percent_of_memory_ceiling_range"][1]),
             number(&row["percent_of_compute_ceiling"]),
             row["arithmetic_modes"]
         );
@@ -135,6 +144,33 @@ pub(crate) fn human(report: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn aggregate_markers_include_summed_shares_and_memory_percentages() {
+        let row = json!({"site_group":"a", "variant":"current", "kernel":"k", "profiled_gpu_seconds":1.0, "share_of_step_percent":70.0, "percent_of_streaming_read_ceiling_range":[50.0,50.0], "percent_of_streaming_copy_ceiling_range":[70.0,70.0], "percent_of_memory_ceiling_range":[70.0,70.0]});
+        let result = aggregate(&[row.clone(), row], "site_group");
+        assert_eq!(result[0]["share_of_step_percent"], 140.0);
+        assert_eq!(
+            result[0]["percent_of_memory_ceiling_range"],
+            json!([70.0, 70.0])
+        );
+        assert_eq!(result[0]["over_100_percent"], true);
+    }
+
+    #[test]
+    fn human_marks_resource_percentages_and_model_bound_excess() {
+        let report = json!({"mode":"decode", "tokens":1, "whole_model":{"overall":{"bound_exceeds_observed":true}, "by_layer_type":[{"layer_type":"test", "over_100_percent":true}]}, "ranked_call_sites":[{"name":"site", "over_100_percent":true}]});
+        let text = human(&report);
+        assert!(
+            text.lines().any(|line| line.starts_with("Model bound")
+                && line.contains("[! outside calibration CI]"))
+        );
+        assert!(
+            text.lines()
+                .any(|line| line.contains("test: bound") && line.contains("[! >100%]"))
+        );
+        assert!(text.contains("site [! >100%]"));
+    }
+
     #[test]
     fn candidates_must_satisfy_every_instance() {
         let rows = [
