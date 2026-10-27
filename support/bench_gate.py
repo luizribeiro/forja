@@ -9,7 +9,8 @@ import time
 from bench_cache import digest
 from gate_history import history
 from gate_records import command_sampler, save, session_key, verify_artifacts
-from gate_worker import close_workers, worker_pair
+from gate_worker import close_workers
+from gate_block_workers import block_workers
 from gate_runner import run_row
 from gate_select import select
 
@@ -65,7 +66,7 @@ def main():
                        "warmups_per_leg": warmups,
                        "warmups_per_launch": warmups if args.process_per_leg or args.no_early_stop else None,
                        "execution": "process-per-leg" if args.process_per_leg or args.no_early_stop
-                           else "resident-native-workers"},
+                           else "resident-block-workers"},
               "selection": selection, "rows": [], "started": time.time()}
     save(args.out / "plan.json", plan)
     save(args.out / "report.json", report)
@@ -101,8 +102,8 @@ def main():
             if active != group_key:
                 close_workers(workers)
                 workers = {}
-                workers, worker_info = worker_pair(row, group_directory, plan["guard"],
-                    1, warmups, enabled=not args.process_per_leg and not args.no_early_stop,
+                workers, worker_info = block_workers(row, group_directory, plan["guard"],
+                    warmups, group_seed, enabled=not args.process_per_leg and not args.no_early_stop,
                     timeout=args.worker_timeout)
                 if args.no_early_stop and not args.process_per_leg:
                     worker_info["reason"] = "fixed ABBA native repetition design"

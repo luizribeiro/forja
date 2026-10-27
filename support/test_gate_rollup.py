@@ -80,7 +80,7 @@ def test_main_checks_tree_artifacts_and_persists_verified_history(tmp_path, monk
     assert len(saved["log_scores"]) == 6 and saved["created_at"] > 0
 
 
-def test_native_groups_keep_one_process_per_side_across_nonadjacent_rows(tmp_path, monkeypatch):
+def test_native_groups_reuse_blocks_with_fresh_processes_and_random_startup(tmp_path, monkeypatch):
     script = tmp_path / "native"
     script.write_text(f"#!{sys.executable}\n" + '''import json,os,sys,time
 from pathlib import Path
@@ -113,8 +113,17 @@ for line in sys.stdin:
     report = json.loads((output / "report.json").read_text())
     assert report["decision"] == "no change"
     assert [row["id"] for row in report["rows"]] == ["first", "shared", "other"]
-    pids = [info["ready"]["pid"] for group in report["groups"] for info in group["workers"]["sides"].values()]
-    assert len(set(pids)) == 4
+    pids = [info["ready"]["pid"] for group in report["groups"]
+            for block in group["workers"]["blocks"] for info in block["sides"].values()]
+    assert len(set(pids)) == 24
+    for group in report["groups"]:
+        blocks = group["workers"]["blocks"]
+        assert len(blocks) == 6
+        for block in blocks:
+            assert list(block["sides"]) == list(block["startup_order"])
+            assert all(code == 0 for code in block["returncodes"].values())
+            assert block["wall_seconds"] > 0 and block["completed"] and block["legs_completed"] == 4
+        assert all(left["ended"] <= right["started"] for left, right in zip(blocks, blocks[1:]))
     assert report["mode"]["warmups_per_leg"] == 1 and report["mode"]["warmups_per_launch"] is None
     assert len(list(output.glob("group-*/*.command.json"))) == 48
     assert all(sample["reused_session"] for block in report["rows"][1]["runs"][0]["blocks"]

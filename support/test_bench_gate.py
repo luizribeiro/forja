@@ -66,12 +66,12 @@ path.write_text(json.dumps({"score":100,"other":200*math.exp(shift),"window":[no
 
 def test_failed_worker_request_keeps_its_command_and_error(tmp_path):
     class FailedWorker:
-        def sample(self, _output, log):
+        def sample(self, _side, _output, log, _phase, _block, _leg):
             log.write_text("worker failure")
             raise ValueError("lost response")
     adapter = {"command": ["/frozen/forja", "bench", "--reps", "{reps}", "--json", "{output}"]}
     row = {"id": "failed", "baseline": adapter, "candidate": adapter}
-    sampler = command_sampler(row, tmp_path, [], 1, True, workers={"A": FailedWorker()})
+    sampler = command_sampler(row, tmp_path, [], 1, True, workers=FailedWorker())
     with pytest.raises(ValueError, match="lost response"):
         sampler("A", 1, "primary", 0, 0)
     event = json.loads((tmp_path / "primary-00-0-A.command.json").read_text())

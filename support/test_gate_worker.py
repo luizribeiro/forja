@@ -75,6 +75,8 @@ def test_worker_pair_preserves_workload_and_explicit_cold_process_fallback(tmp_p
     assert "bench.warmups=3" in command and "--raw-samples" in command and "--worker" in command
     close_workers(workers)
     assert all(worker.closed for worker in workers.values())
+    with pytest.raises(ValueError, match="startup order"):
+        worker_pair(row, tmp_path, [], 1, 3, order="AA")
     for enabled, policy, reason in [(False, "fresh-request", "explicit"), (True, "cold-process", "cold")]:
         row["candidate"]["cache_state"] = policy
         workers, info = worker_pair(row, tmp_path, [], 1, 3, enabled=enabled)
@@ -82,3 +84,11 @@ def test_worker_pair_preserves_workload_and_explicit_cold_process_fallback(tmp_p
     row["candidate"]["cache_state"] = "unknown"
     with pytest.raises(ValueError, match="cache-state"):
         worker_pair(row, tmp_path, [], 1, 3)
+
+
+def test_block_workers_refuse_partial_block_entry_before_launch(tmp_path):
+    from gate_block_workers import BlockWorkers
+    workers = BlockWorkers({}, tmp_path, [], 1, 123, 2)
+    with pytest.raises(ValueError, match="incomplete"):
+        workers.sample("A", tmp_path / "output", tmp_path / "log", "primary", 0, 1)
+    assert not workers.info["blocks"]

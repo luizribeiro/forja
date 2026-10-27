@@ -20,7 +20,7 @@ rep's wall/GPU times and measurement window. Warmups are excluded from samples.
 
 | Control | Accelerated behavior | Explicit classic behavior |
 | --- | --- | --- |
-| Execution | Loaded native A/B workers for sequential samples | `--process-per-leg` |
+| Execution | Fresh native A/B pair retained for each block | `--process-per-leg` |
 | Sampling | Randomized sequential blocks, cap 30 reps/leg | `--no-early-stop --reps 30` |
 | Rows | Compare dependencies; drift-check unaffected rows | `--all-rows` |
 | Competitor | Reuse matching, fresh records with periodic probes | `--fresh-competitor` |
@@ -85,15 +85,20 @@ turns and a concurrent case's requests are observations of that session, not
 independent trials. Extend the session sequence while another row needs samples.
 Confirmation observations are fresh per row.
 
-Sequential native commands use one resident process per side and frozen workload.
-Both workers finish loading before the first leg. Rows with matching commands run
-together and share the workers; only one pair is retained at a time. Each leg runs
+Each sequential block starts a fresh process per side with its frozen workload.
+Startup order is randomized independently of ABBA/BAAB and recorded with its seed.
+Both workers finish loading before the first leg and stay loaded for all four
+legs. Process-level variability belongs inside the independent block. A fixed
+pair across blocks can confound process effects with build effects. Rows with
+matching commands share already-collected blocks; only one pair is retained. Each leg runs
 the declared warmups, drains GPU work and releases paged request lanes between
 measurement phases. Batch and single-request paths retain separate instances to
 preserve their original paged/graph state boundaries; each instance loads once.
 Positional inputs replay from zero; loaded weights and compiled kernels remain resident. Native records identify the worker PID, load count and
 cache policy; group records retain startup commands/times and complete worker logs.
 Per-leg command records distinguish request wall time from worker startup.
+Each block records total wall time including both starts and cleanup, and each
+worker records its PID and start/end timestamps.
 
 Use `--process-per-leg` for the launch-based path, older binaries without the worker
 protocol, or process-cold measurements. A native adapter may declare

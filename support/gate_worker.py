@@ -15,11 +15,11 @@ class Worker:
         self.buffer = b""
         self.sequence = 0
         self.ready = None
+        started = time.time()
         self.process = subprocess.Popen(command, cwd=cwd, stdin=subprocess.PIPE,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=0, start_new_session=True)
         self.selector = selectors.DefaultSelector()
         self.selector.register(self.process.stdout, selectors.EVENT_READ)
-        started = time.time()
         try:
             self.ready = self._response(b"FORJA_BENCH_READY ", startup_timeout)
             instances = self.ready.get("instance_loads", {})
@@ -101,13 +101,15 @@ def worker_command(command):
 
 
 def close_workers(workers):
-    for worker in workers.values():
-        worker.close()
+    if hasattr(workers, "close"):
+        workers.close()
+    else:
+        for worker in workers.values():
+            worker.close()
 
 
-def worker_pair(row, directory, guard, reps, warmups, enabled=True, timeout=3600):
+def worker_policy(row, enabled=True):
     """Only direct pinned native commands promise the fixed-workload protocol."""
-    from gate_records import measurement_command
     adapters = [row[side] for side in ["baseline", "candidate"]]
     policies = {adapter.get("cache_state", "fresh-request") for adapter in adapters}
     if not policies <= {"fresh-request", "cold-process"}:
@@ -117,19 +119,29 @@ def worker_pair(row, directory, guard, reps, warmups, enabled=True, timeout=3600
                      <= adapter.get("expected_provenance", {}).keys() for adapter in adapters)
     reason = ("explicit process-per-leg" if not enabled else "cold process required"
               if "cold-process" in policies else "adapter has no native worker protocol" if not native else None)
+    return reason
+
+
+def worker_pair(row, directory, guard, reps, warmups, enabled=True, timeout=3600, order="AB"):
+    from gate_records import measurement_command, save
+    reason = worker_policy(row, enabled)
     if reason:
         return {}, {"execution": "process-per-leg", "reason": reason}
+    if len(order) != 2 or set(order) != set("AB"):
+        raise ValueError("worker startup order must permute sides A and B")
     workers = {}
     try:
-        for side, adapter in zip("AB", adapters):
+        for side in order:
+            adapter = row["baseline" if side == "A" else "candidate"]
             command = measurement_command(adapter, directory / f"worker-{side}-unused.json",
                                           reps, warmups, True, guard)
             workers[side] = Worker(worker_command(command), adapter.get("cwd"),
                                    directory / f"worker-{side}.log", timeout=timeout)
+            save(directory / f"worker-{side}.start.json", workers[side].startup)
         if workers["A"].ready["pid"] == workers["B"].ready["pid"]:
             raise ValueError("baseline and candidate workers must be separate processes")
     except BaseException:
         close_workers(workers)
         raise
-    return workers, {"execution": "resident-worker", "cache_state": "fresh-request",
+    return workers, {"execution": "resident-worker", "cache_state": "fresh-request", "startup_order": order,
                      "sides": {side: worker.startup for side, worker in workers.items()}}

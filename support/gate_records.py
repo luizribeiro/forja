@@ -58,7 +58,7 @@ def command_sampler(row: dict, directory: Path, guard: list[str], warmups: int,
             print(f"START {row['id']} {stem}", flush=True)
             if workers:
                 try:
-                    event.update(workers[side].sample(output, log))
+                    event.update(workers.sample(side, output, log, phase_name, block, leg))
                 except Exception as error:
                     event.update(ended=time.time(), returncode=-1, execution="resident-worker",
                                  error={"type": type(error).__name__, "message": str(error)})
