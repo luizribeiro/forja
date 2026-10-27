@@ -224,7 +224,7 @@ struct ProfileArgs {
 
 #[derive(Args)]
 #[command(
-    long_about = "Benchmark engines with fixed repetitions (classic mode). Use --reps 30 --no-early-stop explicitly for classic sampling. Accelerated randomized gates use support/bench_gate.py; its --no-early-stop, --all-rows and --fresh-competitor flags restore full measurement. --accept-from adopts matching measurements; --accept --remeasure always measures again."
+    long_about = "Benchmark engines with fixed repetitions (classic mode). Use --reps 30 --no-early-stop explicitly for classic sampling. Accelerated randomized gates use resident A/B workers through support/bench_gate.py; --process-per-leg disables worker reuse, and --no-early-stop, --all-rows and --fresh-competitor restore full measurement. --worker exposes the fixed-workload sample protocol. --accept-from adopts matching measurements; --accept --remeasure always measures again."
 )]
 struct BenchArgs {
     /// WebAssembly engine component. Repeat to compare engines.

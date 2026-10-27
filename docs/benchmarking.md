@@ -16,10 +16,11 @@ The existing result payload, configuration hashes and rep counts are retained.
 `measurement_mode` adds provenance; `--raw-samples` optionally adds every measured
 rep's wall/GPU times and measurement window. Warmups are excluded from samples.
 
-`support/bench_gate.py` provides accelerated gates. Every control is independent:
+`support/bench_gate.py` provides accelerated gates. Each acceleration has an explicit fallback:
 
 | Control | Accelerated behavior | Explicit classic behavior |
 | --- | --- | --- |
+| Execution | Loaded native A/B workers for sequential samples | `--process-per-leg` |
 | Sampling | Randomized sequential blocks, cap 30 reps/leg | `--no-early-stop --reps 30` |
 | Rows | Compare dependencies; drift-check unaffected rows | `--all-rows` |
 | Competitor | Reuse matching, fresh records with periodic probes | `--fresh-competitor` |
@@ -27,7 +28,7 @@ rep's wall/GPU times and measurement window. Warmups are excluded from samples.
 
 ```console
 python3 support/bench_gate.py plan.json --out /path/evidence/accelerated
-python3 support/bench_gate.py plan.json --out /path/evidence/classic --no-early-stop --reps 30 --all-rows --fresh-competitor
+python3 support/bench_gate.py plan.json --out /path/evidence/classic --no-early-stop --reps 30 --all-rows --fresh-competitor --process-per-leg
 ```
 
 `--plan-only` writes the frozen plan, selection and modes without measuring.
@@ -74,8 +75,34 @@ PASS. A/A diagnostics explicitly label unavailable drift protection.
 Rows sharing identical frozen commands reuse whole sessions: a conversation's
 turns and a concurrent case's requests are observations of that session, not
 independent trials. Extend the session sequence while another row needs samples.
-Confirmation records are fresh per row. Generic command adapters currently launch
-per leg; loading, warmups and switching remain part of observed gate wall time.
+Confirmation observations are fresh per row.
+
+Sequential native commands use one resident process per side and frozen workload.
+Both workers finish loading before the first leg. Rows with matching commands run
+together and share the workers; only one pair is retained at a time. Each leg runs
+the declared warmups, drains GPU work and releases paged request lanes between
+measurement phases. Batch and single-request paths retain separate instances to
+preserve their original paged/graph state boundaries; each instance loads once.
+Positional inputs replay from zero; loaded weights and compiled kernels remain resident. Native records identify the worker PID, load count and
+cache policy; group records retain startup commands/times and complete worker logs.
+Per-leg command records distinguish request wall time from worker startup.
+
+Use `--process-per-leg` for the launch-based path, older binaries without the worker
+protocol, or process-cold measurements. A native adapter may declare
+`"cache_state":"cold-process"` to require this path for its whole group;
+`"fresh-request"` is the default. Unknown policies are errors. Fixed ABBA mode also
+uses the original per-leg native calls. Non-native command adapters retain their
+own process/session policy, recorded with the fallback reason.
+
+`forja bench --worker --raw-samples` serves newline-delimited JSON requests on
+stdin, each `{"id":1,"output":"/absolute/new-record.json"}`. IDs increase from one.
+The CLI freezes one engine, point, selection, repetition count and warmup policy;
+requests cannot change configuration. `FORJA_BENCH_READY` and `FORJA_BENCH_RESULT`
+prefix structured control lines on stdout; EOF closes the worker. The gate client
+checks PIDs and one load per isolated phase throughout. Worker startup permits the documented
+45-minute macOS launch queue; `--worker-timeout` bounds each sample response.
+Loading, warmups, resets, IPC and switching all remain part of observed gate wall
+time. Report startup and steady request times separately, plus amortized totals.
 
 ## Build and row selection
 
