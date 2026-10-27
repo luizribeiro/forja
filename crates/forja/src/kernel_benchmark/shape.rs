@@ -62,6 +62,8 @@ pub(super) struct TensorShape {
     #[serde(default)]
     u32_values: Option<Vec<u32>>,
     #[serde(default)]
+    seed: Option<u32>,
+    #[serde(default)]
     permutation: Option<Vec<u8>>,
 }
 
@@ -79,6 +81,9 @@ impl TensorShape {
                 .checked_mul(u64::from(dimension))
                 .ok_or("tensor size overflow")
         })?;
+        if self.seed.is_some() && self.u32_values.is_some() {
+            return Err("seed and explicit u32_values are mutually exclusive".into());
+        }
         if let Some(values) = &self.u32_values
             && (dtype != DType::U32 || u64::try_from(values.len())?.checked_mul(4) != Some(bytes))
         {
@@ -90,8 +95,14 @@ impl TensorShape {
     pub(super) fn allocate(&self, backend: &impl Backend) -> Result<Tensor, Box<dyn Error>> {
         let (dtype, bytes) = self.layout()?;
         let tensor = backend.alloc(dtype, &self.shape)?;
+        let byte_count = usize::try_from(bytes)?;
         let data = self.u32_values.as_ref().map_or_else(
-            || Ok(vec![0; usize::try_from(bytes)?]),
+            || {
+                Ok(self.seed.map_or_else(
+                    || vec![0; byte_count],
+                    |seed| seeded_bytes(dtype, byte_count, seed),
+                ))
+            },
             |values| Ok::<_, Box<dyn Error>>(values.iter().flat_map(|v| v.to_le_bytes()).collect()),
         )?;
         backend.write(&tensor, &data)?;
@@ -102,9 +113,42 @@ impl TensorShape {
     }
 }
 
+fn seeded_bytes(dtype: DType, bytes: usize, mut seed: u32) -> Vec<u8> {
+    let mut data = Vec::with_capacity(bytes);
+    while data.len() < bytes {
+        seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        let [lo, hi, _, _] = seed.to_le_bytes();
+        let low = u16::from_le_bytes([lo, hi]);
+        match dtype {
+            DType::U32 | DType::I32 => data.extend_from_slice(&seed.to_le_bytes()),
+            DType::F32 => data.extend_from_slice(
+                &(f32::from_bits(0x3f00_0000 | (seed & 0x007f_ffff)) - 0.75).to_le_bytes(),
+            ),
+            DType::F16 => data.extend_from_slice(&(0x3800_u16 | (low & 0x03ff)).to_le_bytes()),
+            DType::BF16 => data.extend_from_slice(&(0x3f00_u16 | (low & 0x007f)).to_le_bytes()),
+        }
+    }
+    data
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn seeded_operands_are_repeatable_and_nonzero() {
+        for dtype in [DType::F32, DType::F16, DType::BF16, DType::U32] {
+            let data = seeded_bytes(dtype, 132, 7);
+            assert_eq!(data.len(), 132);
+            assert_eq!(data, seeded_bytes(dtype, 132, 7));
+            assert_ne!(data, seeded_bytes(dtype, 132, 8));
+            assert!(data.iter().any(|&byte| byte != 0));
+        }
+        let spec: TensorShape =
+            serde_json::from_str(r#"{"dtype":"u32","shape":[1],"u32_values":[1],"seed":7}"#)
+                .unwrap();
+        assert!(spec.layout().is_err());
+    }
+
     #[test]
     fn shapes_refuse_overflow_and_mismatched_metadata() {
         let spec: TensorShape =
