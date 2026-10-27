@@ -1185,6 +1185,104 @@ paged_gqa_two_pass_tests!(
     ),
 );
 
+#[test]
+fn metal_paged_append_keeps_attention_bits_and_stored_planes() {
+    let metal = forja_metal::MetalBackend::new().unwrap();
+    for heads in [(16, 16), (16, 8), (32, 4)] {
+        for length in [1, 7, 33, 64, 65, 513] {
+            let expected = run_sdpa(
+                &metal,
+                DType::F16,
+                length,
+                1,
+                true,
+                false,
+                heads.0,
+                heads.1,
+                (0, 0),
+                &[],
+                Some("paged-sdpa.vector-gqa-two-pass-32"),
+                None,
+            )
+            .unwrap();
+            let actual = run_sdpa(
+                &metal,
+                DType::F16,
+                length,
+                1,
+                true,
+                false,
+                heads.0,
+                heads.1,
+                (0, 0),
+                &[],
+                Some("paged-sdpa-append.vector-gqa-two-pass-32"),
+                None,
+            )
+            .unwrap();
+            assert_eq!(encode(&expected, DType::F32), encode(&actual, DType::F32));
+        }
+    }
+}
+
+#[test]
+fn metal_paged_append_refuses_corrupt_destination_without_writing() {
+    let backend = forja_metal::MetalBackend::new().unwrap();
+    for_each_paged_gqa_safety_heads(|query_heads, kv_heads| {
+        for length in [64_u32, 65, 513] {
+            let corrupt = usize::try_from((length - 1) / 64).unwrap();
+            let error = run_sdpa(
+                &backend,
+                DType::F16,
+                length,
+                1,
+                true,
+                false,
+                query_heads,
+                kv_heads,
+                (0, 0),
+                &[corrupt],
+                Some("paged-sdpa-append.vector-gqa-two-pass-32"),
+                None,
+            )
+            .unwrap_err();
+            assert!(matches!(error, BackendError::DeviceErrorFlag { .. }));
+        }
+    });
+}
+
+#[test]
+fn metal_paged_append_keeps_barriers_uniform_across_rejected_pages() {
+    let backend = forja_metal::MetalBackend::new().unwrap();
+    for_each_paged_gqa_safety_heads(|query_heads, kv_heads| {
+        for length in [512_u32, 513] {
+            let corrupt = (1..usize::try_from(length.div_ceil(64)).unwrap())
+                .step_by(2)
+                .collect::<Vec<_>>();
+            for _ in 0..8 {
+                let mut output = Vec::new();
+                let error = run_sdpa(
+                    &backend,
+                    DType::F16,
+                    length,
+                    1,
+                    true,
+                    false,
+                    query_heads,
+                    kv_heads,
+                    (0, 0),
+                    &corrupt,
+                    Some("paged-sdpa-append.vector-gqa-two-pass-32"),
+                    Some(&mut output),
+                )
+                .unwrap_err();
+                assert!(matches!(error, BackendError::DeviceErrorFlag { .. }));
+                assert!(output.iter().all(|value| value.is_finite()));
+            }
+        }
+    });
+}
+
 fn for_each_paged_gqa_safety_heads(mut check: impl FnMut(u32, u32)) {
     for (query_heads, kv_heads) in [(32, 4), (16, 16), (16, 8)] {
         check(query_heads, kv_heads);

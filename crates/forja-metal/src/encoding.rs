@@ -3208,7 +3208,6 @@ impl MetalBackend {
             return Ok(());
         }
         let buffers = match dispatch.op() {
-            Op::PagedSdpaAppend { .. } => return Err(BackendError::UnsupportedOperation),
             Op::RmsNorm { eps } => {
                 self.encode_rms_norm(encoder, table, dispatch, eps, bindings, arguments)?
             }
@@ -3342,7 +3341,7 @@ impl MetalBackend {
             Op::Sdpa { .. } => {
                 self.encode_sdpa_dispatch(encoder, table, dispatch, bindings, arguments)?
             }
-            Op::PagedSdpa { .. } => {
+            Op::PagedSdpa { .. } | Op::PagedSdpaAppend { .. } => {
                 let (buffers, flag) = self.encode_paged_sdpa(
                     encoder,
                     table,
@@ -3629,7 +3628,7 @@ impl MetalBackend {
         timestamps: Option<&GpuTimestamps>,
         internal_timestamp: &mut usize,
     ) -> Result<(Vec<BufferBinding>, BufferBinding), BackendError> {
-        let (scale, causal, q_start, key_length, page_tokens, _append) = match dispatch.op() {
+        let (scale, causal, q_start, key_length, page_tokens, append) = match dispatch.op() {
             Op::PagedSdpa {
                 scale,
                 causal,
@@ -3651,6 +3650,14 @@ impl MetalBackend {
             ),
             _ => return Err(BackendError::InvalidInput),
         };
+        if append {
+            crate::variants::resolve(
+                dispatch,
+                "paged-sdpa-append.vector-gqa-two-pass-32",
+                &[forja_core::DeviceCapability::Metal4],
+            )
+            .map_err(|_| BackendError::UnsupportedOperation)?;
+        }
         let [
             query_tensor,
             key_tensor,
@@ -3692,6 +3699,9 @@ impl MetalBackend {
             .try_into()
             .map_err(|_| BackendError::InvalidInput)?;
         let gqa_blocks = paged_gqa_blocks(selected_variant(dispatch));
+        if append && selected_variant(dispatch) != Some(MetalVariant::PagedSdpaAppendGqa32) {
+            return Err(BackendError::UnsupportedOperation);
+        }
         let mut params = Vec::with_capacity(128);
         params.extend_from_slice(&scale.to_ne_bytes());
         for value in [
@@ -3746,6 +3756,7 @@ impl MetalBackend {
             (2, dtype_code(output.layout.dtype())),
             (3, dtype_code(value.layout.dtype())),
             (216, u32::from(has_activity)),
+            (218, u32::from(append)),
         ];
         let validation = self
             .pipelines
@@ -3952,6 +3963,22 @@ impl MetalBackend {
             bindings.bind(table, 8, &params);
             bindings.bind(table, 9, &error_flag);
             bindings.bind(table, 10, activity);
+            let append_layouts = if append {
+                let key = self.encoder_tensor(&dispatch.inputs()[1])?;
+                let value = self.encoder_tensor(&dispatch.inputs()[2])?;
+                let layouts = [
+                    Self::layout_buffer(&key.layout, arguments)?,
+                    Self::layout_buffer(&value.layout, arguments)?,
+                ];
+                bindings.bind(table, 11, &key.buffer);
+                bindings.bind(table, 12, &value.buffer);
+                bindings.bind(table, 13, &layouts[0]);
+                bindings.bind(table, 14, &layouts[1]);
+                Some(layouts)
+            } else {
+                None
+            };
+
             set_argument_table(encoder, table);
             dispatch_threadgroups(
                 encoder,
@@ -4001,6 +4028,7 @@ impl MetalBackend {
                 sums.buffer,
                 maxs.buffer,
             ];
+            temporaries.extend(append_layouts.into_iter().flatten());
             temporaries.extend(default_activity.clone());
             return Ok((temporaries, error_flag));
         }
@@ -7576,7 +7604,6 @@ impl MetalBackend {
         arguments: &mut ArgumentSizer,
     ) -> Result<(), BackendError> {
         match dispatch.op() {
-            Op::PagedSdpaAppend { .. } => return Err(BackendError::UnsupportedOperation),
             Op::Program(_) => {
                 let program = dispatch.bound_program().ok_or(BackendError::InvalidInput)?;
                 for _ in program.inputs().iter().chain(program.outputs()) {
@@ -7670,11 +7697,15 @@ impl MetalBackend {
                 Self::size_gather_quant_arguments(dispatch, arguments)?;
             }
             Op::Sdpa { .. } => self.size_sdpa_arguments(dispatch, arguments)?,
-            Op::PagedSdpa { .. } => {
+            Op::PagedSdpa { .. } | Op::PagedSdpaAppend { .. } => {
                 arguments.write(128)?;
                 arguments.write(4 * size_of::<u32>())?;
                 if dispatch.inputs().len() == 5 {
                     arguments.write(size_of::<u32>())?;
+                }
+                if matches!(dispatch.op(), Op::PagedSdpaAppend { .. }) {
+                    arguments.write(112)?;
+                    arguments.write(112)?;
                 }
                 if selected_variant(dispatch) == Some(MetalVariant::PagedSdpaDecomposed) {
                     for _ in 0..2 {
@@ -8164,7 +8195,6 @@ fn supported_dispatch(dispatch: &Dispatch) -> bool {
         return false;
     }
     match dispatch.op() {
-        Op::PagedSdpaAppend { .. } => false,
         Op::Program(_) => dispatch.bound_program().is_some(),
         Op::Copy
         | Op::PagedCopy { .. }
@@ -8180,6 +8210,7 @@ fn supported_dispatch(dispatch: &Dispatch) -> bool {
         | Op::GatherQuantMatmul { .. }
         | Op::Sdpa { .. }
         | Op::PagedSdpa { .. }
+        | Op::PagedSdpaAppend { .. }
         | Op::Sample { .. }
         | Op::SampleMasked { .. } => true,
     }
@@ -8248,8 +8279,10 @@ fn dispatch_profile(
 }
 
 fn internal_dispatch_names(dispatch: &Dispatch) -> Vec<&'static str> {
-    if matches!(dispatch.op(), Op::PagedSdpa { .. })
-        && paged_gqa_blocks(selected_variant(dispatch)).is_some()
+    if matches!(
+        dispatch.op(),
+        Op::PagedSdpa { .. } | Op::PagedSdpaAppend { .. }
+    ) && paged_gqa_blocks(selected_variant(dispatch)).is_some()
         && let Ok(first) = dispatch_kernel(dispatch)
     {
         return vec![first, "paged_sdpa_2pass_2_128"];
@@ -8327,7 +8360,6 @@ fn internal_dispatch_profiles(
 
 pub(super) fn dispatch_kernel(dispatch: &Dispatch) -> Result<&'static str, BackendError> {
     Ok(match dispatch.op() {
-        Op::PagedSdpaAppend { .. } => return Err(BackendError::UnsupportedOperation),
         Op::Program(_) => match dispatch
             .bound_program()
             .ok_or(BackendError::InvalidInput)?
@@ -8412,7 +8444,7 @@ pub(super) fn dispatch_kernel(dispatch: &Dispatch) -> Result<&'static str, Backe
             }
         }
         Op::Sdpa { .. } => sdpa_kernel(dispatch)?,
-        Op::PagedSdpa { .. } => {
+        Op::PagedSdpa { .. } | Op::PagedSdpaAppend { .. } => {
             let width = dispatch
                 .inputs()
                 .first()
@@ -8497,7 +8529,8 @@ fn paged_sdpa_kernel(dispatch: &Dispatch, width: u32) -> Result<&'static str, Ba
         (Some(MetalVariant::PagedSdpaDecomposed), 64 | 128) => Ok("sdpa_decomposed"),
         (
             Some(
-                MetalVariant::PagedSdpaVectorGqaTwoPass32
+                MetalVariant::PagedSdpaAppendGqa32
+                | MetalVariant::PagedSdpaVectorGqaTwoPass32
                 | MetalVariant::PagedSdpaVectorGqaTwoPass64
                 | MetalVariant::PagedSdpaVectorGqaTwoPass128
                 | MetalVariant::PagedSdpaVectorGqaTwoPass256
@@ -8539,7 +8572,9 @@ fn paged_sdpa_kernel(dispatch: &Dispatch, width: u32) -> Result<&'static str, Ba
 
 fn paged_gqa_blocks(variant: Option<MetalVariant>) -> Option<u32> {
     match variant {
-        Some(MetalVariant::PagedSdpaVectorGqaTwoPass32) => Some(32),
+        Some(MetalVariant::PagedSdpaAppendGqa32 | MetalVariant::PagedSdpaVectorGqaTwoPass32) => {
+            Some(32)
+        }
         Some(MetalVariant::PagedSdpaVectorGqaTwoPass64) => Some(64),
         Some(MetalVariant::PagedSdpaVectorGqaTwoPass128) => Some(128),
         Some(MetalVariant::PagedSdpaVectorGqaTwoPass256) => Some(256),
@@ -8578,7 +8613,8 @@ fn reusable_dispatch(dispatch: &Dispatch) -> bool {
         | Op::GatherQuantMatmul { .. }
         | Op::Sdpa { .. }
         | Op::PagedCopy { .. }
-        | Op::PagedSdpa { .. } => false,
+        | Op::PagedSdpa { .. }
+        | Op::PagedSdpaAppend { .. } => false,
         Op::Matmul => {
             dispatch
                 .primitive_inputs()
@@ -8897,6 +8933,7 @@ pub(super) fn variant_supported(
         | MetalVariant::PagedSdpaSteelHalf32x16
         | MetalVariant::PagedSdpaSteelHalf64x16 => paged_half_steel_sdpa_supported(dispatch)?,
         MetalVariant::TopKSingleK8 => dispatch_kernel(dispatch)? == "topk_single",
+        MetalVariant::PagedSdpaAppendGqa32 => matches!(dispatch.op(), Op::PagedSdpaAppend { .. }),
         MetalVariant::SamplePortable => dispatch_kernel(dispatch)? == "sample_rejection",
         MetalVariant::SampleParallel => dispatch_kernel(dispatch)? == "sample_parallel",
     })

@@ -53,6 +53,7 @@ pub(crate) enum MetalVariant {
     SdpaSteel,
     SdpaSteelHalf,
     PagedSdpaVector,
+    PagedSdpaAppendGqa32,
     PagedSdpaVectorGqaTwoPass32,
     PagedSdpaVectorGqaTwoPass64,
     PagedSdpaVectorGqaTwoPass128,
@@ -620,6 +621,27 @@ const PAGED_SDPA_DECOMPOSED: &[Constraint] = &[
     },
 ];
 const PAGED_GQA_RATIOS: &[u64] = &[1, 2, 8];
+const APPEND_KEY: TensorRef = TensorRef::output("key pages", 1);
+const APPEND_VALUE: TensorRef = TensorRef::output("value pages", 2);
+const PAGED_APPEND: &[Constraint] = &[
+    value(QUERY_LENGTH, Relation::Equal(1)),
+    value(
+        dim("key width", APPEND_KEY, Axis::Index(3)),
+        Relation::Equal(128),
+    ),
+    Constraint::DimensionsEqual {
+        left: dim("key width", APPEND_KEY, Axis::Index(3)),
+        right: dim("value width", APPEND_VALUE, Axis::Index(3)),
+    },
+    Constraint::Value {
+        value: ValueRef::Quotient {
+            name: "grouped-head SIMD count",
+            numerator: QUERY_HEADS,
+            denominator: dim("key/value heads", APPEND_KEY, Axis::Index(2)),
+        },
+        relation: Relation::OneOf(PAGED_GQA_RATIOS),
+    },
+];
 const PAGED_GQA_TWO_PASS: &[Constraint] = &[
     value(QUERY_LENGTH, Relation::Equal(1)),
     value(PAGED_KEY_WIDTH, Relation::Equal(128)),
@@ -961,6 +983,15 @@ pub(crate) static REGISTRY: &[VariantDef<MetalVariant>] = &[
         ]
     ),
     batch_invariant_variant!(
+        @class "paged-sdpa.vector-gqa-two-pass-32";
+        "paged-sdpa-append.vector-gqa-two-pass-32", PagedSdpaAppend,
+        PagedSdpaAppendGqa32, PAGED_APPEND,
+        &["single-token decode with authenticated key/value append."],
+        &["multi-token queries."],
+        &["Each dispatch handles one lane with fixed per-head reduction order.",
+          "The block owning the appended token writes its K/V before reading it."]
+    ),
+    batch_invariant_variant!(
         "paged-sdpa.vector-gqa-two-pass-32",
         PagedSdpa,
         PagedSdpaVectorGqaTwoPass32,
@@ -1244,7 +1275,8 @@ pub(crate) const fn portable_name(operation: OperationKind) -> Option<&'static s
         OperationKind::PagedSdpa => Some("paged-sdpa.vector"),
         OperationKind::TopK => Some("top-k.portable"),
         OperationKind::Sample => Some("sample.portable"),
-        OperationKind::PagedSdpaAppend | OperationKind::Other => None,
+        OperationKind::PagedSdpaAppend => Some("paged-sdpa-append.vector-gqa-two-pass-32"),
+        OperationKind::Other => None,
     }
 }
 
@@ -1257,7 +1289,8 @@ pub(crate) const fn portable_implementation(operation: OperationKind) -> Option<
         OperationKind::PagedSdpa => Some(MetalVariant::PagedSdpaVector),
         OperationKind::TopK => Some(MetalVariant::TopKPortable),
         OperationKind::Sample => Some(MetalVariant::SamplePortable),
-        OperationKind::PagedSdpaAppend | OperationKind::Other => None,
+        OperationKind::PagedSdpaAppend => Some(MetalVariant::PagedSdpaAppendGqa32),
+        OperationKind::Other => None,
     }
 }
 

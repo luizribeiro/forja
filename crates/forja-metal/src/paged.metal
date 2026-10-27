@@ -11,6 +11,7 @@ struct PagedCopyParams {
 };
 
 constant uint paged_has_activity [[function_constant(216)]];
+constant uint paged_appends [[function_constant(218)]];
 
 inline bool paged_lane_active(device const uint *activity) {
     return paged_has_activity == 0 || activity[0] != 0;
@@ -294,8 +295,8 @@ DEFINE_PAGED_STEEL_ATTENTION(paged_steel_attention_half_128_64x16, half, 64, 16,
 template <uint D, uint G, uint HPT, uint KVPTG>
 void paged_sdpa_2pass_1_gqa_body(
     device const uchar *query,
-    device const uchar *key,
-    device const uchar *value,
+    device uchar *key,
+    device uchar *value,
     device const uint2 *table,
     device const uint *generations,
     device uchar *partials,
@@ -304,6 +305,10 @@ void paged_sdpa_2pass_1_gqa_body(
     constant PagedSdpaParams &params,
     device atomic_uint *error_flag,
     device const uint *activity,
+    device const uchar *appended_key,
+    device const uchar *appended_value,
+    constant TensorLayout *appended_key_layout,
+    constant TensorLayout *appended_value_layout,
     uint3 position,
     uint simd_group,
     uint simd_lane,
@@ -332,6 +337,31 @@ void paged_sdpa_2pass_1_gqa_body(
     uint keys_per_chunk = paged_divide_up(keys_per_block, chunks_per_head);
     uint2 chunk_interval = paged_partition_interval(block_start, block_end, keys_per_chunk, chunk);
     uint chunk_start = chunk_interval.x, chunk_end = chunk_interval.y;
+
+    if (paged_appends != 0 && block_start <= params.query_start && params.query_start < block_end) {
+        if (simd_group == 0 && simd_lane == 0) {
+            auto page = authenticate_paged_page(params.query_start / params.page_tokens,
+                params.logical_pages, params.physical_pages, table, generations, error_flag);
+            first_page = page.physical;
+            valid = page.valid;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (valid != 0 && head_group == 0) {
+            ulong token = ulong(first_page) * params.page_tokens + params.query_start % params.page_tokens;
+            ulong key_base = (token * params.kv_heads + kv_head) * D;
+            ulong value_base = (token * params.kv_heads + kv_head) * params.value_width;
+            for (uint element = 0; element < elements_per_thread; ++element) {
+                uint column = simd_lane * elements_per_thread + element;
+                ulong k_index = appended_key_layout->offset + ulong(kv_head) * appended_key_layout->strides[1]
+                    + ulong(column) * appended_key_layout->strides[2];
+                ulong v_index = appended_value_layout->offset + ulong(kv_head) * appended_value_layout->strides[1]
+                    + ulong(column) * appended_value_layout->strides[2];
+                store_float(key, key_base + column, input1_dtype, load_float(appended_key, k_index, input0_dtype));
+                store_float(value, value_base + column, input2_dtype, load_float(appended_value, v_index, input0_dtype));
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+    }
 
     float q[HPT][elements_per_thread];
     float result[HPT][elements_per_thread];
@@ -506,8 +536,8 @@ void paged_sdpa_2pass_1_gqa_body(
 #define DEFINE_PAGED_SDPA_PASS1_GQA(NAME, D, G, HPT, KVPTG)                 \
 kernel void NAME(                                                            \
     device const uchar *query [[buffer(0)]],                                 \
-    device const uchar *key [[buffer(1)]],                                   \
-    device const uchar *value [[buffer(2)]],                                 \
+    device uchar *key [[buffer(1)]],                                   \
+    device uchar *value [[buffer(2)]],                                 \
     device const uint2 *table [[buffer(3)]],                                 \
     device const uint *generations [[buffer(4)]],                            \
     device uchar *partials [[buffer(5)]],                                    \
@@ -516,6 +546,10 @@ kernel void NAME(                                                            \
     constant PagedSdpaParams &params [[buffer(8)]],                          \
     device atomic_uint *error_flag [[buffer(9)]],                            \
     device const uint *activity [[buffer(10)]],                              \
+    device const uchar *appended_key [[buffer(11)]],                         \
+    device const uchar *appended_value [[buffer(12)]],                       \
+    constant TensorLayout &appended_key_layout [[buffer(13)]],              \
+    constant TensorLayout &appended_value_layout [[buffer(14)]],            \
     uint3 position [[threadgroup_position_in_grid]],                         \
     uint simd_group [[simdgroup_index_in_threadgroup]],                      \
     uint simd_lane [[thread_index_in_simdgroup]]) {                          \
@@ -528,7 +562,8 @@ kernel void NAME(                                                            \
     threadgroup uint valid;                                                  \
     paged_sdpa_2pass_1_gqa_body<D, G, HPT, KVPTG>(                          \
         query, key, value, table, generations, partials, sums, maxs, params, \
-        error_flag, activity, position, simd_group, simd_lane, partial_outputs,\
+        error_flag, activity, appended_key, appended_value, &appended_key_layout, \
+        &appended_value_layout, position, simd_group, simd_lane, partial_outputs,\
         partial_sums, partial_maxs, physical_pages, page_valid, first_page,  \
         valid);                                                              \
 }
