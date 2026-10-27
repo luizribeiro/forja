@@ -1,5 +1,7 @@
 //! Logical algorithm work; cache reuse and instruction throughput are measured separately.
 
+mod attention;
+
 use crate::{Dispatch, Op, Tensor, matmul_flops, quant_matmul_flops};
 
 /// Checked logical traffic and arithmetic for a validated operation.
@@ -51,7 +53,7 @@ impl KernelCost {
             }
             _ => {}
         }
-        Some(cost)
+        attention::count(dispatch, cost)
     }
 }
 
@@ -85,7 +87,7 @@ mod tests {
     use super::*;
     use crate::{BufferId, CommandList, DType, Layout};
 
-    fn tensor(id: u64, dtype: DType, shape: &[u32]) -> Tensor {
+    pub(super) fn tensor(id: u64, dtype: DType, shape: &[u32]) -> Tensor {
         let size = product(&shape.iter().copied().map(u64::from).collect::<Vec<_>>()).unwrap()
             * dtype.byte_size();
         Tensor::from_allocation(
