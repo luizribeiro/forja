@@ -98,3 +98,38 @@ class Worker:
 def worker_command(command):
     """Keep the frozen workload, including repetitions and warmups, at launch."""
     return [*command, "--worker", *([] if "--raw-samples" in command else ["--raw-samples"])]
+
+
+def close_workers(workers):
+    for worker in workers.values():
+        worker.close()
+
+
+def worker_pair(row, directory, guard, reps, warmups, enabled=True, timeout=3600):
+    """Only direct pinned native commands promise the fixed-workload protocol."""
+    from gate_records import measurement_command
+    adapters = [row[side] for side in ["baseline", "candidate"]]
+    policies = {adapter.get("cache_state", "fresh-request") for adapter in adapters}
+    if not policies <= {"fresh-request", "cold-process"}:
+        raise ValueError("unknown worker cache-state policy")
+    native = all(len(adapter["command"]) > 1 and adapter["command"][1] == "bench"
+                 and {"/provenance/binary_sha256", "/inputs/0/engine_sha256"}
+                     <= adapter.get("expected_provenance", {}).keys() for adapter in adapters)
+    reason = ("explicit process-per-leg" if not enabled else "cold process required"
+              if "cold-process" in policies else "adapter has no native worker protocol" if not native else None)
+    if reason:
+        return {}, {"execution": "process-per-leg", "reason": reason}
+    workers = {}
+    try:
+        for side, adapter in zip("AB", adapters):
+            command = measurement_command(adapter, directory / f"worker-{side}-unused.json",
+                                          reps, warmups, True, guard)
+            workers[side] = Worker(worker_command(command), adapter.get("cwd"),
+                                   directory / f"worker-{side}.log", timeout=timeout)
+        if workers["A"].ready["pid"] == workers["B"].ready["pid"]:
+            raise ValueError("baseline and candidate workers must be separate processes")
+    except BaseException:
+        close_workers(workers)
+        raise
+    return workers, {"execution": "resident-worker", "cache_state": "fresh-request",
+                     "sides": {side: worker.startup for side, worker in workers.items()}}

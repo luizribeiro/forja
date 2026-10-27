@@ -20,6 +20,14 @@ def verify_artifacts(artifacts: dict):
         if actual != expected:
             raise ValueError(f"frozen artifact mismatch: {name}")
 
+def measurement_command(adapter, output, reps, warmups, raw, guard):
+    substitutions = {"{output}": str(output), "{reps}": str(reps), "{warmups}": str(warmups)}
+    if "{output}" not in adapter["command"] or "{reps}" not in adapter["command"]:
+        raise ValueError("measurement command must declare {output} and {reps}")
+    return [*guard, *[substitutions.get(arg, arg).replace("{warmups}", str(warmups))
+                     for arg in adapter["command"] if raw or arg != "--raw-samples"]]
+
+
 def command_sampler(row: dict, directory: Path, guard: list[str], warmups: int,
                     sequential: bool, memo: dict | None = None):
     """Every original command, log and native record remains independently reviewable."""
@@ -28,12 +36,8 @@ def command_sampler(row: dict, directory: Path, guard: list[str], warmups: int,
         phase_name = phase if phase != "confirmation" else f"confirmation-{digest(row['id'])[:12]}"
         stem = f"{phase_name}-{block:02}-{leg}-{side}"
         output, log = directory / f"{stem}.json", directory / f"{stem}.log"
-        substitutions = {"{output}": str(output), "{reps}": str(reps), "{warmups}": str(warmups)}
         raw = sequential or phase == "drift"
-        command = [*guard, *[substitutions.get(arg, arg).replace("{warmups}", str(warmups)) for arg in adapter["command"]
-                             if raw or arg != "--raw-samples"]]
-        if "{output}" not in adapter["command"] or "{reps}" not in adapter["command"]:
-            raise ValueError("measurement command must declare {output} and {reps}")
+        command = measurement_command(adapter, output, reps, warmups, raw, guard)
         key = (phase_name, block, leg, side, reps)
         reused = memo is not None and key in memo
         if reused:
