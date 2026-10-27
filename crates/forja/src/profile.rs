@@ -555,6 +555,10 @@ mod tests {
         DispatchProfile {
             op,
             kernel: "test",
+            variant: None,
+            alternatives: Vec::new(),
+            cost: forja_core::KernelCost::default(),
+            padded_flops: [0; 2],
             inputs,
             outputs,
             barrier: true,

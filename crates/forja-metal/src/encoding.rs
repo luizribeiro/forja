@@ -2792,11 +2792,15 @@ impl MetalBackend {
             command_buffer.writeTimestampIntoHeap_atIndex(&timestamps.heap, 1);
         }
         command_buffer.endCommandBuffer();
-        let dispatch_profiles = dispatches
-            .iter()
-            .zip(&barriers)
-            .map(|(dispatch, &barrier)| dispatch_profile(dispatch, barrier))
-            .collect::<Result<Vec<_>, _>>()?;
+        let dispatch_profiles = if PROFILE {
+            dispatches
+                .iter()
+                .zip(&barriers)
+                .map(|(dispatch, &barrier)| dispatch_profile(dispatch, barrier))
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            Vec::new()
+        };
         let commit_started = PROFILE.then(Instant::now);
         let mut submission = self.commit(
             &command_buffer,
@@ -8032,7 +8036,16 @@ fn vectorized_argmax(input: &Layout, width: u32, chunk_width: u32) -> bool {
 }
 
 fn dispatch_profile(dispatch: &Dispatch, barrier: bool) -> Result<DispatchProfile, BackendError> {
+    let (variant, alternatives, model) = crate::variants::profile_selection(dispatch);
+    let cost = forja_core::KernelCost::of(dispatch).ok_or(BackendError::InvalidInput)?;
+    let padded_flops = model
+        .padded_flops(dispatch, cost)
+        .ok_or(BackendError::InvalidInput)?;
     Ok(DispatchProfile {
+        variant,
+        alternatives,
+        cost,
+        padded_flops,
         op: dispatch.op(),
         kernel: dispatch_kernel(dispatch)?,
         inputs: dispatch.inputs().iter().map(ProfileTensor::from).collect(),
@@ -11228,6 +11241,9 @@ mod tests {
         let output = backend.alloc(DType::F32, &[7, 33]).unwrap();
         let mut commands = CommandList::new();
         commands.dispatch(Op::Copy, &[&left], &output).unwrap();
+        let unprofiled = backend.submit(commands.clone()).unwrap();
+        unprofiled.wait().unwrap();
+        assert_eq!(unprofiled.dispatch_profiles.len(), 0);
         let submission = backend.submit_profiled(commands).unwrap();
         submission.wait().unwrap();
         let profile = submission.profile().unwrap();

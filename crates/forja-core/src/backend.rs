@@ -419,6 +419,14 @@ pub struct DispatchProfile {
     pub op: Op,
     /// Backend kernel or composite implementation selected for the operation.
     pub kernel: &'static str,
+    /// Selected catalog identity, when the operation has variants.
+    pub variant: Option<&'static str>,
+    /// Catalog alternatives validated against this dispatch and its reduction guarantee.
+    pub alternatives: Vec<&'static str>,
+    /// Logical operation cost, independent of tile padding.
+    pub cost: crate::KernelCost,
+    /// Lower and upper executed FLOPs after tile padding.
+    pub padded_flops: [u64; 2],
     /// Logical input metadata.
     pub inputs: Vec<ProfileTensor>,
     /// Logical output metadata.

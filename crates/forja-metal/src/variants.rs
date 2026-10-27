@@ -1742,6 +1742,42 @@ impl MetalVariant {
     }
 }
 
+pub(crate) fn profile_selection(
+    dispatch: &Dispatch,
+) -> (
+    Option<&'static str>,
+    Vec<&'static str>,
+    forja_core::CostModel,
+) {
+    let selected = dispatch
+        .backend_data::<ValidatedVariant>()
+        .copied()
+        .or_else(|| {
+            resolve(
+                dispatch,
+                portable_name(OperationKind::of(dispatch.op()))?,
+                METAL4,
+            )
+            .ok()
+        });
+    let Some(selected) = selected else {
+        return (None, Vec::new(), forja_core::CostModel::default());
+    };
+    let current = &REGISTRY[selected.index];
+    let alternatives = REGISTRY
+        .iter()
+        .filter(|variant| {
+            variant.name != current.name
+                && (!current.batch_invariant || variant.batch_invariant)
+                && (current.reduction_class.is_none()
+                    || variant.reduction_class == current.reduction_class)
+                && resolve(dispatch, variant.name, METAL4).is_ok()
+        })
+        .map(|variant| variant.name)
+        .collect();
+    (Some(current.name), alternatives, current.cost)
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
@@ -1753,6 +1789,21 @@ mod tests {
     use proptest::prelude::*;
 
     use super::*;
+
+    #[test]
+    fn profiling_alternatives_pass_the_current_dispatch_contract() {
+        let dispatch = matmul_dispatch(7);
+        let (selected, alternatives, model) = super::profile_selection(&dispatch);
+        assert_eq!(selected, Some("matmul.portable"));
+        assert_eq!(alternatives.len(), 0);
+        let cost = forja_core::KernelCost::of(&dispatch).unwrap();
+        assert!(model.padded_flops(&dispatch, cost).unwrap()[0] >= cost.flops);
+        let dispatch = quant_dispatch_with_bits(DType::F32, 1, 1024, false, 4);
+        let pick = super::resolve(&dispatch, "quant-matmul.gemv", super::METAL4).unwrap();
+        let dispatch = dispatch.with_backend_data(forja_core::BackendDispatchData::new(pick));
+        let (_, alternatives, _) = super::profile_selection(&dispatch);
+        assert!(alternatives.contains(&"quant-matmul.gemv-n2"));
+    }
 
     #[test]
     fn batch_invariant_variants_are_explicitly_audited() {
