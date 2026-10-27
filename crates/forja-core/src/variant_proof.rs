@@ -430,7 +430,9 @@ fn operation_expression(
 ) -> Result<Expression, ConstraintProofError> {
     let value = match (operation, value) {
         (
-            TemplateOp::PagedCopy { page_tokens, .. } | TemplateOp::PagedSdpa { page_tokens, .. },
+            TemplateOp::PagedCopy { page_tokens, .. }
+            | TemplateOp::PagedSdpa { page_tokens, .. }
+            | TemplateOp::PagedSdpaAppend { page_tokens, .. },
             OperationValue::PageTokens,
         ) => Some(u64::from(page_tokens)),
         (TemplateOp::Static(operation), value) => operation_value(operation, value),

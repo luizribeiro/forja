@@ -380,6 +380,15 @@ pub enum TemplateOp {
         /// Number of tokens in one page.
         page_tokens: u32,
     },
+    /// Paged append/attention with a parameterized destination token.
+    PagedSdpaAppend {
+        /// Attention score multiplier.
+        scale: f32,
+        /// Position receiving the appended token.
+        q_start: Affine,
+        /// Tokens stored in one page.
+        page_tokens: u32,
+    },
     /// Paged attention with parameterized query and key extents.
     PagedSdpa {
         /// The score multiplier.
@@ -425,9 +434,9 @@ impl TemplateOp {
     const fn parameter_mask(self) -> u16 {
         match self {
             Self::Static(_) => 0,
-            Self::Sdpa { q_start, .. } | Self::PagedCopy { start: q_start, .. } => {
-                q_start.parameter_mask()
-            }
+            Self::Sdpa { q_start, .. }
+            | Self::PagedCopy { start: q_start, .. }
+            | Self::PagedSdpaAppend { q_start, .. } => q_start.parameter_mask(),
             Self::PagedSdpa {
                 q_start,
                 key_length,
@@ -459,6 +468,16 @@ impl TemplateOp {
         Self::PagedCopy {
             direction,
             start,
+            page_tokens,
+        }
+    }
+
+    /// Creates paged append/attention with a possibly parameterized destination.
+    #[must_use]
+    pub const fn paged_sdpa_append(scale: f32, q_start: Affine, page_tokens: u32) -> Self {
+        Self::PagedSdpaAppend {
+            scale,
+            q_start,
             page_tokens,
         }
     }
@@ -543,6 +562,15 @@ impl TemplateOp {
                 start: start.evaluate(values)?,
                 page_tokens,
             }),
+            Self::PagedSdpaAppend {
+                scale,
+                q_start,
+                page_tokens,
+            } => Ok(Op::PagedSdpaAppend {
+                scale,
+                q_start: q_start.evaluate(values)?,
+                page_tokens,
+            }),
             Self::PagedSdpa {
                 scale,
                 causal,
@@ -590,7 +618,9 @@ impl TemplateOp {
     pub const fn is_parameter_dependent(self) -> bool {
         match self {
             Self::Static(_) => false,
-            Self::Sdpa { q_start, .. } => !q_start.is_constant(),
+            Self::Sdpa { q_start, .. } | Self::PagedSdpaAppend { q_start, .. } => {
+                !q_start.is_constant()
+            }
             Self::PagedCopy { start, .. } => !start.is_constant(),
             Self::PagedSdpa {
                 q_start,
@@ -617,6 +647,11 @@ impl From<Op> for TemplateOp {
                 start,
                 page_tokens,
             } => Self::paged_copy(direction, Affine::constant(start), page_tokens),
+            Op::PagedSdpaAppend {
+                scale,
+                q_start,
+                page_tokens,
+            } => Self::paged_sdpa_append(scale, q_start.into(), page_tokens),
             Op::PagedSdpa {
                 scale,
                 causal,
@@ -2296,6 +2331,34 @@ mod tests {
             .unwrap();
         TemplateTensor::symbolic(base.clone(), layout).unwrap()
     }
+    #[test]
+    fn instantiates_paged_append_positions_with_checked_arithmetic() {
+        let space = ParamSpace::new(std::iter::once(0..=u32::MAX).collect()).unwrap();
+        let op = TemplateOp::paged_sdpa_append(0.125, Affine::parameter(0, 1, 1), 16);
+        assert_eq!(
+            op.instantiate(&space.values(vec![7]).unwrap()),
+            Ok(Op::PagedSdpaAppend {
+                scale: 0.125,
+                q_start: 8,
+                page_tokens: 16,
+            })
+        );
+        assert_eq!(
+            op.instantiate(&space.values(vec![u32::MAX]).unwrap()),
+            Err(ParamError::ArithmeticOverflow)
+        );
+        assert!(op.is_parameter_dependent());
+        assert_eq!(op.parameter_mask(), 1);
+        assert!(
+            !TemplateOp::from(Op::PagedSdpaAppend {
+                scale: 0.125,
+                q_start: 0,
+                page_tokens: 16
+            })
+            .is_parameter_dependent()
+        );
+    }
+
     #[test]
     fn instantiates_affine_attention_positions_with_checked_arithmetic() {
         let space = ParamSpace::new(std::iter::once(0..=u32::MAX).collect()).unwrap();

@@ -1537,6 +1537,7 @@ const fn template_operation(operation: TemplateOp) -> OperationKind {
     match operation {
         TemplateOp::Static(operation) => OperationKind::of(operation),
         TemplateOp::Sdpa { .. } => OperationKind::Sdpa,
+        TemplateOp::PagedSdpaAppend { .. } => OperationKind::PagedSdpaAppend,
         TemplateOp::PagedSdpa { .. } => OperationKind::PagedSdpa,
         TemplateOp::Sample { .. } => OperationKind::Sample,
         TemplateOp::PagedCopy { .. } | TemplateOp::SampleMasked { .. } => OperationKind::Other,

@@ -6311,7 +6311,10 @@ impl<B: Backend + 'static> Host<B> {
             else {
                 return Err(guest_error(BackendError::InvalidInput));
             };
-            if template_operation_kind(*op) != forja_core::OperationKind::PagedSdpa {
+            if !matches!(
+                template_operation_kind(*op),
+                forja_core::OperationKind::PagedSdpa | forja_core::OperationKind::PagedSdpaAppend
+            ) {
                 return Err(guest_error(BackendError::InvalidInput));
             }
             self.metal_backend()?
@@ -8491,6 +8494,7 @@ fn template_operation_kind(operation: TemplateOp) -> forja_core::OperationKind {
     match operation {
         TemplateOp::Static(operation) => forja_core::OperationKind::of(operation),
         TemplateOp::Sdpa { .. } => forja_core::OperationKind::Sdpa,
+        TemplateOp::PagedSdpaAppend { .. } => forja_core::OperationKind::PagedSdpaAppend,
         TemplateOp::PagedSdpa { .. } => forja_core::OperationKind::PagedSdpa,
         TemplateOp::Sample { .. } => forja_core::OperationKind::Sample,
         TemplateOp::PagedCopy { .. } | TemplateOp::SampleMasked { .. } => {
