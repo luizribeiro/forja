@@ -50,7 +50,7 @@ pub(crate) fn run(options: &Options) -> Result<(), Box<dyn Error>> {
     if let Some(path) = &options.json {
         fs::write(path, serde_json::to_vec_pretty(&report)?)?;
     }
-    println!("{}", serde_json::to_string_pretty(&report)?);
+    print!("{}", crate::analysis_report::ranking::human(&report));
     Ok(())
 }
 

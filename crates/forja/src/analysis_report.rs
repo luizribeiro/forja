@@ -9,6 +9,8 @@ use std::error::Error;
 
 #[path = "analysis/model.rs"]
 mod model;
+#[path = "analysis/ranking.rs"]
+pub(super) mod ranking;
 
 pub(crate) fn report(
     profile: &Profile,
@@ -86,6 +88,7 @@ pub(crate) fn report(
             "Scalar/SFU and integer throughput are uncalibrated; MMA percentages use matrix-product FLOPs only.",
             "Alternatives preserve the selected reduction class and batch-invariance guarantee; screen before adoption."],
         "whole_model": model::summaries(profile, calibration, scale, target)?,
+        "by_kernel": ranking::aggregate(&kernels, "kernel"), "ranked_call_sites": ranking::aggregate(&dispatches, "site_group"),
         "dispatches": dispatches, "kernels": kernels }),
     )
 }
