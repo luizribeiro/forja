@@ -2,6 +2,7 @@
 //! Use this crate to describe validated tensor views and operation signatures.
 
 mod backend;
+mod cost;
 mod graph;
 mod layout;
 mod ops;
@@ -18,6 +19,7 @@ pub use backend::{
     MemoryUsage, ProfileCount, ProfileTensor, ReadonlyImport, Submission, SubmissionProfile,
     ViewOp, automatic_buffer_pool_capacity, automatic_live_bytes,
 };
+pub use cost::KernelCost;
 pub use forja_mmap::MappedRegion;
 pub use graph::{
     GraphError, GraphLimits, GraphMemoryPlan, GraphTemplate, PreparedGraph, TemplateOp,
