@@ -353,7 +353,10 @@ fn weighted_gather_schedule(
             threadgroup_width: 32,
         }),
         Some(
-            MetalVariant::GatherQuantMatmulPortable | MetalVariant::GatherQuantMatmulRouteGemv,
+            MetalVariant::GatherQuantMatmulPortable
+            | MetalVariant::GatherQuantMatmulRouteGemv
+            | MetalVariant::GatherQuantMatmulVector8
+            | MetalVariant::GatherQuantMatmulVector16,
         ) if routes <= 8 => Ok(WeightedGatherSchedule {
             implementation: "gather_quantized_weighted_sum",
             threadgroup_width: routes.checked_mul(32).ok_or(BackendError::InvalidInput)?,
@@ -4517,9 +4520,9 @@ impl MetalBackend {
             (2, dtype_code(output.layout.dtype())),
             (12, u32::from(bits)),
             (13, group_size),
-            (222, 0),
-            (223, 2),
-            (224, 0),
+            (222, qmv_vector_config(dispatch)[0]),
+            (223, qmv_vector_config(dispatch)[1]),
+            (224, qmv_vector_config(dispatch)[2]),
             (14, words_per_thread),
         ];
         let mut pipelines = self
@@ -4608,9 +4611,9 @@ impl MetalBackend {
             (2, dtype_code(output.layout.dtype())),
             (12, u32::from(bits)),
             (13, group_size),
-            (222, 0),
-            (223, 2),
-            (224, 0),
+            (222, qmv_vector_config(dispatch)[0]),
+            (223, qmv_vector_config(dispatch)[1]),
+            (224, qmv_vector_config(dispatch)[2]),
             (14, words_per_thread),
         ];
         let pipeline = self
@@ -4781,9 +4784,9 @@ impl MetalBackend {
             (2, dtype_code(output.layout.dtype())),
             (12, u32::from(bits)),
             (13, group_size),
-            (222, 0),
-            (223, 2),
-            (224, 0),
+            (222, qmv_vector_config(dispatch)[0]),
+            (223, qmv_vector_config(dispatch)[1]),
+            (224, qmv_vector_config(dispatch)[2]),
             (14, words_per_thread),
         ];
         let epilogue = dispatch
@@ -8223,6 +8226,10 @@ fn supported_dispatch(dispatch: &Dispatch) -> bool {
                     | MetalVariant::QuantMatmulTiled
                     | MetalVariant::GatherQuantMatmulPortable
                     | MetalVariant::GatherQuantMatmulRouteGemv
+                    | MetalVariant::GatherQuantMatmulVector8
+                    | MetalVariant::GatherQuantMatmulVector16
+                    | MetalVariant::QuantMatmulVector8
+                    | MetalVariant::QuantMatmulVector16
                     | MetalVariant::GatherQuantMatmulGroupedSmallM
                     | MetalVariant::GatherQuantMatmulGroupedPairSmallM
                     | MetalVariant::GatherQuantMatmulGrouped
@@ -8938,6 +8945,8 @@ pub(super) fn variant_supported(
         | MetalVariant::SdpaPortable
         | MetalVariant::TopKPortable
         | MetalVariant::GatherQuantMatmulRouteGemv
+        | MetalVariant::GatherQuantMatmulVector8
+        | MetalVariant::GatherQuantMatmulVector16
         | MetalVariant::SdpaDecomposed
         | MetalVariant::TopKPartials
         | MetalVariant::QuantMatmulVector8
@@ -9391,8 +9400,8 @@ fn quantized_constants(
 
 fn qmv_vector_config(dispatch: &Dispatch) -> [u32; 3] {
     let words = match selected_variant(dispatch) {
-        Some(MetalVariant::QuantMatmulVector8) => 2,
-        Some(MetalVariant::QuantMatmulVector16) => 4,
+        Some(MetalVariant::QuantMatmulVector8 | MetalVariant::GatherQuantMatmulVector8) => 2,
+        Some(MetalVariant::QuantMatmulVector16 | MetalVariant::GatherQuantMatmulVector16) => 4,
         _ => return [0, 2, 0],
     };
     let contiguous = dispatch.primitive_inputs().iter().all(|tensor| {
@@ -9403,7 +9412,12 @@ fn qmv_vector_config(dispatch: &Dispatch) -> [u32; 3] {
                 .checked_mul(layout.dtype().byte_size())
                 .is_some_and(|bytes| bytes.is_multiple_of(16))
     });
-    [words, 4, u32::from(contiguous)]
+    let groups = if matches!(dispatch.op(), Op::GatherQuantMatmul { .. }) {
+        2
+    } else {
+        4
+    };
+    [words, groups, u32::from(contiguous)]
 }
 
 fn quant_epilogue_specialization(columns: u32, inner: u32) -> u32 {
@@ -9557,6 +9571,18 @@ fn dense_epilogue_requests(
     }])
 }
 
+fn route_gemv_variant(dispatch: &Dispatch) -> bool {
+    matches!(
+        selected_variant(dispatch),
+        Some(
+            MetalVariant::GatherQuantMatmulPortable
+                | MetalVariant::GatherQuantMatmulRouteGemv
+                | MetalVariant::GatherQuantMatmulVector8
+                | MetalVariant::GatherQuantMatmulVector16
+        )
+    )
+}
+
 fn gather_epilogue_requests(
     dispatch: &Dispatch,
     epilogue: Arc<PreparedEpilogue>,
@@ -9572,7 +9598,7 @@ fn gather_epilogue_requests(
         scales,
         dispatch.output(),
         (bits, group_size),
-        [0, 2, 0],
+        qmv_vector_config(dispatch),
     );
     if inputs.len() == 6 {
         let inner = *input
@@ -9622,10 +9648,7 @@ fn gather_epilogue_requests(
             constants,
         }]);
     }
-    if !matches!(
-        selected_variant(dispatch),
-        Some(MetalVariant::GatherQuantMatmulPortable | MetalVariant::GatherQuantMatmulRouteGemv)
-    ) {
+    if !route_gemv_variant(dispatch) {
         return Err(BackendError::UnsupportedOperation);
     }
     if parameter_dependent {
@@ -9690,10 +9713,7 @@ fn paired_gather_epilogue_requests(
             constants: vec![(2, dtype_code(dispatch.output().layout().dtype()))],
         }]);
     }
-    if !matches!(
-        selected_variant(dispatch),
-        Some(MetalVariant::GatherQuantMatmulPortable | MetalVariant::GatherQuantMatmulRouteGemv)
-    ) {
+    if !route_gemv_variant(dispatch) {
         return Err(BackendError::UnsupportedOperation);
     }
     let specializations = if parameter_dependent {
@@ -12870,6 +12890,24 @@ mod tests {
             4097,
             true,
         );
+    }
+
+    #[test]
+    fn metal_vector_gemv_epilogues_cover_formats_and_dtypes() {
+        let backend = MetalBackend::new().unwrap();
+        for dtype in [DType::F32, DType::F16, DType::BF16] {
+            for bits in [4, 8] {
+                for variant in ["quant-matmul.vector8", "quant-matmul.vector16"] {
+                    assert_quant_epilogue(&backend, variant, dtype, bits, 7, 768, 33, true);
+                }
+                for variant in [
+                    "gather-quant-matmul.vector8",
+                    "gather-quant-matmul.vector16",
+                ] {
+                    assert_gather_quant_epilogue(&backend, variant, dtype, bits, [7, 3, 33], true);
+                }
+            }
+        }
     }
 
     #[test]

@@ -33,6 +33,8 @@ pub(crate) enum MetalVariant {
     QuantMatmulTiled,
     GatherQuantMatmulPortable,
     GatherQuantMatmulRouteGemv,
+    GatherQuantMatmulVector8,
+    GatherQuantMatmulVector16,
     GatherQuantMatmulGroupedSmallM,
     GatherQuantMatmulGroupedPairSmallM,
     GatherQuantMatmulGrouped,
@@ -491,6 +493,19 @@ const WEIGHTED_NARROW: &[Constraint] = &[
         right: WEIGHT_ROUTES,
     },
 ];
+const ROUTE_VECTOR: &[Constraint] = &[
+    value(
+        dim("inner", INPUT, Axis::FromEnd(1)),
+        Relation::MultipleOf(32),
+    ),
+    operation(OperationValue::GroupSize, Relation::MultipleOf(32)),
+];
+const WEIGHTED_VECTOR: &[Constraint] = &[
+    ROUTE_VECTOR[0],
+    ROUTE_VECTOR[1],
+    WEIGHTED_NARROW[0],
+    WEIGHTED_NARROW[1],
+];
 const WEIGHTED_SIGNATURE: &[Constraint] = &[Constraint::DimensionsEqual {
     left: MATMUL_ROUTES,
     right: WEIGHT_ROUTES,
@@ -942,6 +957,24 @@ pub(crate) static REGISTRY: &[VariantDef<MetalVariant>] = &[
         &["small routed batches or more than 256 experts."],
         &["enough routes to amortize grouping."],
         &["Executes each routed row directly."]
+    ),
+    batch_invariant_variant!(
+        "gather-quant-matmul.vector8",
+        GatherQuantMatmul,
+        GatherQuantMatmulVector8,
+        ROUTE_VECTOR,
+        &["routed decode with 8-byte packed loads."],
+        &["inner dimensions or quantization groups not divisible by 32."],
+        &["Each route keeps a fixed lane partition across batch buckets."]
+    ),
+    batch_invariant_variant!(
+        "gather-quant-matmul.vector16",
+        GatherQuantMatmul,
+        GatherQuantMatmulVector16,
+        ROUTE_VECTOR,
+        &["routed decode with 16-byte packed loads."],
+        &["inner dimensions or quantization groups not divisible by 32."],
+        &["Each route keeps a fixed lane partition across batch buckets."]
     ),
     batch_invariant_variant!(
         "gather-quant-matmul.grouped-small-m",
@@ -1429,6 +1462,9 @@ fn variant_constraints(
     input_count: usize,
 ) -> &'static [Constraint] {
     match (definition.implementation, input_count) {
+        (MetalVariant::GatherQuantMatmulVector8 | MetalVariant::GatherQuantMatmulVector16, 6) => {
+            WEIGHTED_VECTOR
+        }
         (MetalVariant::GatherQuantMatmulPortable | MetalVariant::GatherQuantMatmulRouteGemv, 6) => {
             WEIGHTED_NARROW
         }
@@ -2021,6 +2057,8 @@ mod tests {
                 "quant-matmul.tiled",
                 "gather-quant-matmul.portable",
                 "gather-quant-matmul.route-gemv",
+                "gather-quant-matmul.vector8",
+                "gather-quant-matmul.vector16",
                 "gather-quant-matmul.grouped-small-m",
                 "gather-quant-matmul.grouped-pair-small-m",
                 "gather-quant-matmul.grouped",
@@ -2490,6 +2528,8 @@ mod tests {
                 Err(VariantError::Constraint { .. })
             ));
         }
+        let gathered = gathered_dispatch(8, 8, 128, 1);
+        assert_quant_tail_refusals(&gathered, "gather-quant-matmul.vector8", (32, 32));
     }
 
     #[test]

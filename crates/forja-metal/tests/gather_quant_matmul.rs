@@ -156,8 +156,116 @@ fn metal_grouped_small_m_variants_match_cpu_at_edges() {
             columns: 1,
         },
     ] {
-        assert_grouped_case(&cpu, &metal, case, false, &mut values);
-        assert_grouped_case(&cpu, &metal, case, true, &mut values);
+        assert_grouped_case(
+            &cpu,
+            &metal,
+            case,
+            false,
+            &mut values,
+            "gather-quant-matmul.grouped-small-m",
+        );
+        assert_grouped_case(
+            &cpu,
+            &metal,
+            case,
+            true,
+            &mut values,
+            "gather-quant-matmul.grouped-pair-small-m",
+        );
+    }
+}
+
+#[test]
+fn vector_gather_raw_and_paired_match_cpu_at_decode_shapes() {
+    let cpu = CpuBackend::new();
+    let metal = MetalBackend::new().unwrap();
+    let mut values = DeterministicValues::new(0x6a09_e667_f3bc_c909);
+    for inner in [768, 2048] {
+        for rows in [1, 2, 4, 7, 8] {
+            let case = GroupedCase {
+                rows,
+                routes: 8,
+                experts: 9,
+                inner,
+                columns: 33,
+            };
+            for variant in [
+                "gather-quant-matmul.vector8",
+                "gather-quant-matmul.vector16",
+            ] {
+                for paired in [false, true] {
+                    assert_grouped_case(&cpu, &metal, case, paired, &mut values, variant);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn vector_gather_weighted_matches_cpu() {
+    let cpu = CpuBackend::new();
+    let metal = MetalBackend::new().unwrap();
+    let epilogue = prepare_epilogue(
+        Program {
+            kind: ProgramKind::Map,
+            insts: vec![Inst::Input(0)],
+            outputs: vec![(0, 0)],
+        }
+        .validate()
+        .unwrap(),
+        EpilogueSignature::new(1, 2, vec![], DType::F32),
+    )
+    .unwrap();
+    let mut values = DeterministicValues::new(0x6a09_e667_f3bc_c909);
+    for inner in [768, 2048] {
+        for rows in [1, 7] {
+            let case = GroupedCase {
+                rows,
+                routes: 8,
+                experts: 9,
+                inner,
+                columns: 33,
+            };
+            let mut specs = grouped_specs(case, false);
+            specs[0] = TensorSpec::contiguous(DType::F32, &[rows, 8, inner]);
+            specs.push(TensorSpec::contiguous(DType::F32, &[rows, 8]));
+            let bytes = specs
+                .iter()
+                .map(|spec| generated_tensor_bytes(spec, &mut values).unwrap())
+                .collect::<Vec<_>>();
+            let cpu_inputs = allocate_inputs(&cpu, &specs, &bytes);
+            let metal_inputs = allocate_inputs(&metal, &specs, &bytes);
+            let cpu_output = cpu.alloc(DType::F32, &[rows, 33]).unwrap();
+            let metal_output = metal.alloc(DType::F32, &[rows, 33]).unwrap();
+            let op = Op::GatherQuantMatmul {
+                bits: 4,
+                group_size: 64,
+            };
+            submit_grouped(&cpu, op, &cpu_inputs, &cpu_output, Some(&epilogue), None);
+            for name in [
+                "gather-quant-matmul.vector8",
+                "gather-quant-matmul.vector16",
+            ] {
+                let refs = tensor_refs(&metal_inputs);
+                let variant = metal
+                    .validate_variant_for_op(op, &refs, &[&metal_output], name)
+                    .unwrap();
+                submit_grouped(
+                    &metal,
+                    op,
+                    &metal_inputs,
+                    &metal_output,
+                    Some(&epilogue),
+                    Some(BackendDispatchData::new(variant)),
+                );
+                assert_outputs_agree(
+                    DType::F32,
+                    &cpu.read(&cpu_output).unwrap(),
+                    &metal.read(&metal_output).unwrap(),
+                )
+                .unwrap();
+            }
+        }
     }
 }
 
@@ -243,6 +351,7 @@ fn assert_grouped_case(
     case: GroupedCase,
     paired: bool,
     values: &mut DeterministicValues,
+    variant: &str,
 ) {
     let specs = grouped_specs(case, paired);
     let bytes = specs
@@ -262,16 +371,7 @@ fn assert_grouped_case(
     submit_grouped(cpu, op, &cpu_inputs, &cpu_output, epilogue.as_ref(), None);
     let inputs = tensor_refs(&metal_inputs);
     let variant = metal
-        .validate_variant_for_op(
-            op,
-            &inputs,
-            &[&metal_output],
-            if paired {
-                "gather-quant-matmul.grouped-pair-small-m"
-            } else {
-                "gather-quant-matmul.grouped-small-m"
-            },
-        )
+        .validate_variant_for_op(op, &inputs, &[&metal_output], variant)
         .unwrap();
     submit_grouped(
         metal,
