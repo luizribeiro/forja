@@ -27,6 +27,7 @@ pub(crate) fn report(
     let scale = positive(profile.unprofiled.gpu_time_seconds / profiled_gpu)?;
     let mut dispatches = Vec::new();
     let mut kernels = Vec::new();
+    let mut unmeasured = Vec::new();
     for submission in &profile.submissions {
         for dispatch in &submission.timeline {
             let ceiling = ceilings(calibration, &dispatch.compute_dtype)?;
@@ -53,16 +54,26 @@ pub(crate) fn report(
                 kernels.push(outer);
             } else {
                 for (index, kernel) in dispatch.internal.iter().enumerate() {
+                    let gap = if index == 0 {
+                        dispatch.gap_before_seconds
+                    } else {
+                        0.0
+                    };
+                    let Some(cost) = kernel.cost else {
+                        let attributed = positive((kernel.gpu_time_seconds + gap) * scale)?;
+                        unmeasured.push(json!({"submission": submission.index, "dispatch": dispatch.index, "phase": submission.phase,
+                            "call_site": dispatch.call_site, "kernel": kernel.kernel, "variant": dispatch.variant,
+                            "cost": null, "ranked": false, "reason": "unknown or non-integral internal cost",
+                            "profiled_gpu_seconds": kernel.gpu_time_seconds, "attributed_gpu_seconds": attributed,
+                            "share_of_step_percent": attributed / profile.unprofiled.wall_time_seconds * 100.0}));
+                        continue;
+                    };
                     let mut inner = attribution.row(
                         dispatch,
-                        kernel.cost,
+                        cost,
                         &kernel.kernel,
                         kernel.gpu_time_seconds,
-                        if index == 0 {
-                            dispatch.gap_before_seconds
-                        } else {
-                            0.0
-                        },
+                        gap,
                         1,
                     )?;
                     inner["submission"] = json!(submission.index);
@@ -89,7 +100,7 @@ pub(crate) fn report(
             "Alternatives preserve the selected reduction class and batch-invariance guarantee; screen before adoption."],
         "whole_model": model::summaries(profile, calibration, scale, target)?,
         "by_kernel": ranking::aggregate(&kernels, "kernel"), "ranked_call_sites": ranking::aggregate(&dispatches, "site_group"),
-        "dispatches": dispatches, "kernels": kernels }),
+        "unmeasured_kernels": unmeasured, "dispatches": dispatches, "kernels": kernels }),
     )
 }
 
@@ -139,6 +150,31 @@ mod tests {
             probes[name] = json!({"units_per_second": rate});
         }
         (profile, json!({"probes": probes}))
+    }
+
+    #[test]
+    fn unknown_subkernel_cost_is_listed_without_ranking_it_as_free() {
+        let (mut profile, calibration) = fixture();
+        profile.submissions[0].timeline[0].internal[0].cost = None;
+        profile.validate().unwrap();
+        let report = report(&profile, &calibration, 0.8).unwrap();
+        assert_eq!(report["unmeasured_kernels"].as_array().unwrap().len(), 1);
+        assert_eq!(report["unmeasured_kernels"][0]["kernel"], "read-a");
+        assert_eq!(report["unmeasured_kernels"][0]["ranked"], false);
+        assert_eq!(report["kernels"].as_array().unwrap().len(), 5);
+        let total = |key: &str| {
+            report[key]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|row| row["attributed_gpu_seconds"].as_f64().unwrap())
+                .sum::<f64>()
+        };
+        assert!(
+            (total("dispatches") - total("kernels") - total("unmeasured_kernels")).abs()
+                < f64::EPSILON
+        );
+        assert!(ranking::human(&report).contains("Unmeasured: block/layer-0/dispatch-0 / read-a"));
     }
 
     #[test]

@@ -454,8 +454,8 @@ pub struct DispatchProfile {
 /// Device timeline for one kernel inside a composite backend operation.
 #[derive(Clone, Debug, PartialEq)]
 pub struct KernelProfile {
-    /// Logical cost of this internal kernel, excluding its enclosing operation.
-    pub cost: crate::KernelCost,
+    /// Exact logical cost, or `None` when internal attribution cannot be established.
+    pub cost: Option<crate::KernelCost>,
     /// Backend kernel name.
     pub kernel: &'static str,
     /// Device time from submission start to kernel start.

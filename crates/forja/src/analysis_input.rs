@@ -23,12 +23,21 @@ pub(crate) struct Scope {
     pub(crate) layer: Option<u32>,
 }
 
+#[derive(Deserialize)]
+struct CostValue(#[serde(with = "Cost")] KernelCost);
+
+fn optional_cost<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<KernelCost>, D::Error> {
+    Ok(Option::<CostValue>::deserialize(deserializer)?.map(|value| value.0))
+}
+
 #[derive(Clone, Debug, Deserialize)]
 pub(crate) struct Interval {
     pub(crate) kernel: String,
     pub(crate) gpu_time_seconds: f64,
-    #[serde(with = "Cost")]
-    pub(crate) cost: KernelCost,
+    #[serde(deserialize_with = "optional_cost")]
+    pub(crate) cost: Option<KernelCost>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -130,7 +139,9 @@ impl Profile {
                 }
                 for kernel in &dispatch.internal {
                     positive(kernel.gpu_time_seconds)?;
-                    validate_cost(kernel.cost)?;
+                    if let Some(cost) = kernel.cost {
+                        validate_cost(cost)?;
+                    }
                 }
             }
         }

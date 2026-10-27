@@ -1831,7 +1831,7 @@ impl Completion {
                 Some((
                     metadata.dispatch,
                     KernelProfile {
-                        cost: metadata.cost,
+                        cost: Some(metadata.cost),
                         kernel: metadata.kernel,
                         gpu_start,
                         gpu_end,
@@ -2255,16 +2255,9 @@ impl Submission for MetalSubmission {
         {
             let outer = dispatches.get_mut(dispatch)?;
             let mut internal = internal;
-            if internal.cost.weight_bytes != 0 {
-                let projections = outer
-                    .cost
-                    .weight_bytes
-                    .checked_div(internal.cost.weight_bytes)?;
-                internal.cost.minimum_weight_bytes =
-                    outer.cost.minimum_weight_bytes.checked_div(projections)?;
-                internal.cost.maximum_weight_bytes =
-                    outer.cost.maximum_weight_bytes.checked_div(projections)?;
-            }
+            internal.cost = internal
+                .cost
+                .and_then(|cost| crate::cost_sharing::weights(outer.cost, cost));
             outer.internal.push(internal);
         }
         profile.per_dispatch = dispatches;
@@ -12635,9 +12628,9 @@ mod tests {
                 assert_eq!(internal.len(), 6);
                 assert_eq!(profile.per_dispatch[0].physical_dispatches, 6);
                 assert_eq!(internal[0].kernel, "count_expert_routes");
-                assert_eq!(internal[0].cost.flops, 0);
+                assert_eq!(internal[0].cost.unwrap().flops, 0);
                 assert_eq!(internal[1].kernel, "plan_expert_routes");
-                assert!(internal[3].cost.flops > 0);
+                assert!(internal[3].cost.unwrap().flops > 0);
                 assert_eq!(internal[5].kernel, "gathered_pair_from_projections");
                 assert!(
                     internal

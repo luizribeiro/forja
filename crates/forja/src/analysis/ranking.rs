@@ -113,6 +113,19 @@ pub(crate) fn human(report: &Value) -> String {
         );
         let _ = writeln!(out, "    screen: {}", row["alternatives"]);
     }
+    for row in report["unmeasured_kernels"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .take(10)
+    {
+        let _ = writeln!(
+            out,
+            "Unmeasured: {} / {} (cost unavailable; omitted from kernel ranking)",
+            row["call_site"].as_str().unwrap_or("?"),
+            row["kernel"].as_str().unwrap_or("?")
+        );
+    }
     out.push_str("\nFull JSON contains every dispatch, kernel, phase and layer type. Traffic is logical; expert reuse is a range. Scalar/SFU throughput is uncalibrated. Screen alternatives before adopting them.\n");
     out
 }

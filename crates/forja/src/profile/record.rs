@@ -24,7 +24,7 @@ pub(super) fn timeline(dispatches: &[DispatchProfile]) -> Result<Vec<Value>, &'s
             "barrier_before": dispatch.barrier, "bytes": bytes,
             "gigabytes_per_second": super::throughput(bytes, dispatch.gpu_time),
             "internal": dispatch.internal.iter().map(|kernel| json!({"kernel": kernel.kernel,
-                "cost": kernel.cost.json(), "start_seconds": kernel.gpu_start.as_secs_f64(),
+                "cost": kernel.cost.map(forja_core::KernelCost::json), "start_seconds": kernel.gpu_start.as_secs_f64(),
                 "end_seconds": kernel.gpu_end.as_secs_f64(), "gpu_time_seconds": kernel.gpu_time.as_secs_f64()})).collect::<Vec<_>>() }))
     }).collect()
 }

@@ -6,6 +6,8 @@ mod bandwidth;
 #[cfg(target_os = "macos")]
 mod calibration;
 #[cfg(target_os = "macos")]
+mod cost_sharing;
+#[cfg(target_os = "macos")]
 mod encoding;
 #[cfg(target_os = "macos")]
 mod epilogue_codegen;
