@@ -398,7 +398,7 @@ fn grouped_gather_dispatch(dispatch: &Dispatch) -> bool {
     )
 }
 
-fn grouped_block_rows(dispatch: &Dispatch) -> u32 {
+pub(crate) fn grouped_block_rows(dispatch: &Dispatch) -> u32 {
     if matches!(
         selected_variant(dispatch),
         Some(
@@ -5118,6 +5118,7 @@ impl MetalBackend {
                 depth: 1,
             },
         );
+        write_internal_timestamp(encoder, timestamps, internal_timestamp)?;
         encode_dispatch_barrier(encoder);
         let arrange_pipeline = self
             .pipelines
@@ -8154,6 +8155,7 @@ fn internal_gather_dispatch_names(dispatch: &Dispatch) -> &'static [&'static str
     if selected_variant(dispatch) == Some(MetalVariant::GatherQuantMatmulGroupedPair32x32Blocked) {
         return &[
             "count_expert_routes",
+            "plan_expert_routes",
             "arrange_expert_routes",
             "grouped_quantized_pair_32x32_2x2_blocked",
         ];
@@ -8161,6 +8163,7 @@ fn internal_gather_dispatch_names(dispatch: &Dispatch) -> &'static [&'static str
     match dispatch.primitive_inputs().len() {
         8 => &[
             "count_expert_routes",
+            "plan_expert_routes",
             "arrange_expert_routes",
             "grouped_quantized_gemm_gate",
             "grouped_quantized_gemm_up",
@@ -8169,6 +8172,7 @@ fn internal_gather_dispatch_names(dispatch: &Dispatch) -> &'static [&'static str
         6 => &[],
         _ => &[
             "count_expert_routes",
+            "plan_expert_routes",
             "arrange_expert_routes",
             "grouped_quantized_gemm",
         ],
@@ -12624,12 +12628,13 @@ mod tests {
             if variant == "gather-quant-matmul.grouped" {
                 let profile = submission.profile().unwrap();
                 let internal = &profile.per_dispatch[0].internal;
-                assert_eq!(internal.len(), 5);
+                assert_eq!(internal.len(), 6);
                 assert_eq!(profile.per_dispatch[0].physical_dispatches, 6);
                 assert_eq!(internal[0].kernel, "count_expert_routes");
                 assert_eq!(internal[0].cost.flops, 0);
-                assert!(internal[2].cost.flops > 0);
-                assert_eq!(internal[4].kernel, "gathered_pair_from_projections");
+                assert_eq!(internal[1].kernel, "plan_expert_routes");
+                assert!(internal[3].cost.flops > 0);
+                assert_eq!(internal[5].kernel, "gathered_pair_from_projections");
                 assert!(
                     internal
                         .iter()
@@ -12647,7 +12652,7 @@ mod tests {
                 let replay = backend.replay_graph(&graph, Vec::new(), true).unwrap();
                 replay.wait().unwrap();
                 let replay_profile = replay.profile().unwrap();
-                assert_eq!(replay_profile.per_dispatch[0].internal.len(), 5);
+                assert_eq!(replay_profile.per_dispatch[0].internal.len(), 6);
                 assert!(
                     replay_profile.per_dispatch[0]
                         .internal

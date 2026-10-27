@@ -42,17 +42,27 @@ pub(crate) fn internal(
     let index_bytes = routes.checked_mul(4)?;
     match kernel {
         "count_expert_routes" => Some(KernelCost {
-            read_bytes: index_bytes,
+            read_bytes: index_bytes.checked_mul(2)?,
             write_bytes: experts
                 .checked_add(1)?
                 .checked_mul(4)?
                 .checked_add(index_bytes)?,
             ..KernelCost::default()
         }),
+        "plan_expert_routes" => Some(KernelCost {
+            read_bytes: experts.checked_mul(4)?,
+            write_bytes: experts.checked_add(1)?.checked_mul(4)?.checked_add(
+                routes
+                    .div_ceil(u64::from(crate::encoding::grouped_block_rows(dispatch)))
+                    .checked_add(experts)?
+                    .checked_mul(12)?,
+            )?,
+            ..KernelCost::default()
+        }),
         "arrange_expert_routes" => Some(KernelCost {
             read_bytes: product(&[index_bytes, experts, 2])?
-                .checked_add(experts.checked_add(1)?.checked_mul(4)?)?,
-            write_bytes: index_bytes.checked_add(experts.checked_add(1)?.checked_mul(4)?)?,
+                .checked_add(experts.checked_mul(4)?)?,
+            write_bytes: index_bytes,
             scalar_ops: product(&[routes, experts, 2])?,
             ..KernelCost::default()
         }),
@@ -121,13 +131,19 @@ mod tests {
             internal(dispatch, "count_expert_routes", None)
                 .unwrap()
                 .read_bytes,
-            7 * 8 * 4
+            7 * 8 * 4 * 2
         );
         assert_eq!(
             internal(dispatch, "arrange_expert_routes", None)
                 .unwrap()
                 .read_bytes,
-            7 * 8 * 4 * 16 * 2 + 17 * 4
+            7 * 8 * 4 * 16 * 2 + 16 * 4
+        );
+        assert_eq!(
+            internal(dispatch, "plan_expert_routes", None)
+                .unwrap()
+                .write_bytes,
+            17 * 4 + (4 + 16) * 12
         );
     }
 }
