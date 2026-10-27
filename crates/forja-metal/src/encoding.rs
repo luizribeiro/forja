@@ -595,6 +595,7 @@ struct EncodedDispatches {
     arguments: Option<ArgumentUsage>,
     program_encoding: ProfileCount,
     program_compile_fallbacks: u64,
+    physical_counts: Vec<u64>,
     internal_profiles: Vec<InternalDispatchProfile>,
 }
 
@@ -665,6 +666,21 @@ enum PlanCall {
     },
     Barrier,
     InternalBoundary,
+}
+
+fn physical_dispatch_count(calls: &[PlanCall]) -> Result<u64, BackendError> {
+    u64::try_from(
+        calls
+            .iter()
+            .filter(|call| {
+                matches!(
+                    call,
+                    PlanCall::Dispatch { .. } | PlanCall::IndirectDispatch { .. }
+                )
+            })
+            .count(),
+    )
+    .map_err(|_| BackendError::InvalidInput)
 }
 
 struct PlanRecording {
@@ -2774,6 +2790,7 @@ impl MetalBackend {
         } else {
             Vec::new()
         };
+        let physical_counts = std::mem::take(&mut encoded.physical_counts);
         let resources =
             self.command_resources(&tensors, encoded, graph.map(|prepared| &prepared.buffers))?;
         objects.programs = prepared_programs;
@@ -2796,7 +2813,8 @@ impl MetalBackend {
             dispatches
                 .iter()
                 .zip(&barriers)
-                .map(|(dispatch, &barrier)| dispatch_profile(dispatch, barrier))
+                .zip(&physical_counts)
+                .map(|((dispatch, &barrier), &count)| dispatch_profile(dispatch, barrier, count))
                 .collect::<Result<Vec<_>, _>>()?
         } else {
             Vec::new()
@@ -2856,6 +2874,7 @@ impl MetalBackend {
             .and_then(|count| count.checked_add(2))
             .ok_or(BackendError::ExecutionFailed)?;
         let mut internal_profiles = Vec::new();
+        let mut physical_counts = Vec::new();
         for (index, (dispatch, &barrier)) in plan.dispatches.iter().zip(plan.barriers).enumerate() {
             if index > 0 {
                 write_dispatch_timestamp(
@@ -2890,8 +2909,17 @@ impl MetalBackend {
                     arguments,
                     graph_arena,
                 )?;
+                if timestamps.is_some() {
+                    physical_counts.push(physical_dispatch_count(&plan.calls)?);
+                }
                 continue;
             }
+            let recorder = timestamps.is_some().then(|| {
+                PlanRecorderScope::enter(
+                    arguments.raw.gpuAddress(),
+                    graph_arena.map(|arena| arena.raw.gpuAddress()),
+                )
+            });
             self.encode_dispatch(
                 &encoder,
                 table,
@@ -2907,6 +2935,9 @@ impl MetalBackend {
                 &mut program_encoding,
                 &mut program_compile_fallbacks,
             )?;
+            if let Some(recorder) = recorder {
+                physical_counts.push(physical_dispatch_count(&recorder.finish())?);
+            }
         }
         if !plan.dispatches.is_empty() {
             write_dispatch_timestamp(
@@ -2931,6 +2962,7 @@ impl MetalBackend {
             arguments: argument_usage,
             program_encoding,
             program_compile_fallbacks,
+            physical_counts,
             internal_profiles,
         })
     }
@@ -7754,6 +7786,7 @@ impl MetalBackend {
             arguments,
             program_encoding: _,
             program_compile_fallbacks: _,
+            physical_counts: _,
             internal_profiles: _,
         } = encoded;
         let mut indices = HashMap::<u64, usize>::new();
@@ -8035,13 +8068,18 @@ fn vectorized_argmax(input: &Layout, width: u32, chunk_width: u32) -> bool {
         && chunk_width.is_multiple_of(4)
 }
 
-fn dispatch_profile(dispatch: &Dispatch, barrier: bool) -> Result<DispatchProfile, BackendError> {
+fn dispatch_profile(
+    dispatch: &Dispatch,
+    barrier: bool,
+    physical_dispatches: u64,
+) -> Result<DispatchProfile, BackendError> {
     let (variant, alternatives, model) = crate::variants::profile_selection(dispatch);
     let cost = forja_core::KernelCost::of(dispatch).ok_or(BackendError::InvalidInput)?;
     let padded_flops = model
         .padded_flops(dispatch, cost)
         .ok_or(BackendError::InvalidInput)?;
     Ok(DispatchProfile {
+        physical_dispatches,
         scope: dispatch.profile_scope().map(|scope| scope.as_ref().clone()),
         variant,
         alternatives,
@@ -10853,6 +10891,7 @@ mod tests {
             arguments: None,
             program_encoding: ProfileCount::default(),
             program_compile_fallbacks: 0,
+            physical_counts: Vec::new(),
             internal_profiles: Vec::new(),
         };
         assert!(matches!(
@@ -10877,6 +10916,7 @@ mod tests {
             }),
             program_encoding: ProfileCount::default(),
             program_compile_fallbacks: 0,
+            physical_counts: Vec::new(),
             internal_profiles: Vec::new(),
         };
         assert!(matches!(
@@ -11253,6 +11293,7 @@ mod tests {
         let dispatch = &profile.per_dispatch[0];
         assert_eq!(dispatch.op, Op::Copy);
         assert_eq!(dispatch.kernel, "copy_contiguous");
+        assert_eq!(dispatch.physical_dispatches, 1);
         assert_eq!(dispatch.inputs[0].shape, [7, 33]);
         assert_eq!(dispatch.outputs[0].dtype, DType::F32);
         assert!(!dispatch.barrier);
@@ -12035,6 +12076,7 @@ mod tests {
                     }),
                     program_encoding: ProfileCount::default(),
                     program_compile_fallbacks: 0,
+                    physical_counts: Vec::new(),
                     internal_profiles: Vec::new(),
                 },
                 None,
@@ -12502,6 +12544,7 @@ mod tests {
                 let profile = submission.profile().unwrap();
                 let internal = &profile.per_dispatch[0].internal;
                 assert_eq!(internal.len(), 5);
+                assert_eq!(profile.per_dispatch[0].physical_dispatches, 6);
                 assert_eq!(internal[0].kernel, "count_expert_routes");
                 assert_eq!(internal[4].kernel, "gathered_pair_from_projections");
                 assert!(

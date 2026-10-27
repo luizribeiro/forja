@@ -425,6 +425,8 @@ pub struct DispatchProfile {
     pub variant: Option<&'static str>,
     /// Catalog alternatives validated against this dispatch and its reduction guarantee.
     pub alternatives: Vec<&'static str>,
+    /// Actual encoded GPU launches, including composite internals.
+    pub physical_dispatches: u64,
     /// Logical operation cost, independent of tile padding.
     pub cost: crate::KernelCost,
     /// Lower and upper executed FLOPs after tile padding.

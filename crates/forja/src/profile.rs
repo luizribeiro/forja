@@ -556,6 +556,7 @@ mod tests {
             scope: None,
             op,
             kernel: "test",
+            physical_dispatches: 1,
             variant: None,
             alternatives: Vec::new(),
             cost: forja_core::KernelCost::default(),
