@@ -6,6 +6,8 @@ mod copies;
 mod routed;
 pub use routed::quantized_route_index;
 mod scalar;
+#[cfg(test)]
+mod scalar_values;
 mod tiling;
 pub use tiling::CostModel;
 
