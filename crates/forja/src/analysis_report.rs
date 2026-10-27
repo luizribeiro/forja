@@ -7,6 +7,9 @@ use forja_core::KernelCost;
 use serde_json::{Value, json};
 use std::error::Error;
 
+#[path = "analysis/model.rs"]
+mod model;
+
 pub(crate) fn report(
     profile: &Profile,
     calibration: &Value,
@@ -82,6 +85,7 @@ pub(crate) fn report(
             "Traffic is logical, not a hardware DRAM counter; expert reuse is an interval unless proven by the command graph.",
             "Scalar/SFU and integer throughput are uncalibrated; MMA percentages use matrix-product FLOPs only.",
             "Alternatives preserve the selected reduction class and batch-invariance guarantee; screen before adoption."],
+        "whole_model": model::summaries(profile, calibration, scale, target)?,
         "dispatches": dispatches, "kernels": kernels }),
     )
 }
