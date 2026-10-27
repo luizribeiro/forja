@@ -3283,7 +3283,7 @@ impl MetalBackend {
                 .pipelines
                 .lock()
                 .map_err(|_| BackendError::ExecutionFailed)?
-                .get(probe.kernel(), &[(220, crate::calibration::ITERATIONS)])?;
+                .get(probe.kernel(), &probe.constants())?;
             let layouts = vec![
                 Self::layout_buffer(&input.layout, arguments)?,
                 Self::layout_buffer(&output.layout, arguments)?,
@@ -9509,6 +9509,7 @@ pub(super) struct PipelineCache {
     nan_preserving_library: Retained<ProtocolObject<dyn MTLLibrary>>,
     pipelines: HashMap<PipelineKey, Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
     unavailable_pipelines: HashSet<PipelineKey>,
+    calibration_native: HashSet<PipelineKey>,
     epilogue_libraries:
         HashMap<epilogue_codegen::SourceKey, Retained<ProtocolObject<dyn MTLLibrary>>>,
     epilogue_pipelines: HashMap<
@@ -9531,7 +9532,15 @@ impl PipelineCache {
         &mut self,
         source: &str,
         name: &str,
+        constants: &[(u32, u32)],
     ) -> Result<bool, BackendError> {
+        let key = PipelineKey {
+            name: name.to_owned(),
+            constants: constants.to_vec(),
+        };
+        if self.calibration_native.contains(&key) {
+            return Ok(true);
+        }
         let options = compile_options(MTLMathMode::Fast);
         let Ok(library) = self
             .device
@@ -9539,8 +9548,7 @@ impl PipelineCache {
         else {
             return Ok(false);
         };
-        let constants = vec![(220, crate::calibration::ITERATIONS)];
-        let values = function_constants(&constants)?;
+        let values = function_constants(constants)?;
         let Ok(function) =
             library.newFunctionWithName_constantValues_error(&NSString::from_str(name), &values)
         else {
@@ -9552,13 +9560,8 @@ impl PipelineCache {
         else {
             return Ok(false);
         };
-        self.pipelines.insert(
-            PipelineKey {
-                name: name.to_owned(),
-                constants,
-            },
-            pipeline,
-        );
+        self.calibration_native.insert(key.clone());
+        self.pipelines.insert(key, pipeline);
         Ok(true)
     }
 
@@ -9587,6 +9590,7 @@ impl PipelineCache {
             nan_preserving_library,
             pipelines: HashMap::new(),
             unavailable_pipelines: HashSet::new(),
+            calibration_native: HashSet::new(),
             epilogue_libraries: HashMap::new(),
             epilogue_pipelines: HashMap::new(),
             epilogue_counts: EpilogueCompileCounts::default(),
