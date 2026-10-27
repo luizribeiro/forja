@@ -4,6 +4,9 @@ Forja is a trusted Rust host for running LLM-written inference engines as WebAss
 
 This project is under construction.
 
+See [benchmarking](docs/benchmarking.md) for classic measurements, accelerated gates,
+competitor caching and kernel diagnostics.
+
 See [engine profiles](engines/) and [chat formats](chat-formats/) for supported models and serving
 formats.
 
