@@ -97,6 +97,7 @@ pub(crate) fn report(
             "Attribution scales precise intervals plus preceding gaps to unprofiled GPU time; per-kernel perturbation is unquantified.",
             "Traffic is logical, not a hardware DRAM counter; expert reuse is an interval unless proven by the command graph.",
             "Scalar/SFU and integer throughput are uncalibrated; MMA percentages use matrix-product FLOPs only.",
+            "Calibration bound envelopes combine per-probe CI endpoints, not a joint 95% interval; resource flags use raw GPU intervals.",
             "Alternatives preserve the selected reduction class and batch-invariance guarantee; screen before adoption."],
         "whole_model": model::summaries(profile, calibration, scale, target)?,
         "by_kernel": ranking::aggregate(&kernels, "kernel"), "ranked_call_sites": ranking::aggregate(&dispatches, "site_group"),
@@ -116,6 +117,29 @@ pub(super) fn sort(rows: &mut [Value]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn excess_within_calibration_uncertainty_is_visible_without_a_floor_violation() {
+        let (profile, mut calibration) = fixture();
+        calibration["probes"]["calibration_mma_f32"]["ci95"] = json!([800.0, 1200.0]);
+        let dispatch = &profile.submissions[0].timeline[1];
+        let cost = KernelCost {
+            flops: 4400,
+            ..KernelCost::default()
+        };
+        let row = Attribution {
+            scale: 10.0,
+            wall: 120.0,
+            target: 0.8,
+            ceilings: ceilings(&calibration, "f32").unwrap(),
+        }
+        .row(dispatch, cost, "test", 4.0, 0.0, 1)
+        .unwrap();
+        assert!((row["percent_of_compute_ceiling"].as_f64().unwrap() - 110.0).abs() < 1e-12);
+        assert_eq!(row["over_100_percent"], true);
+        assert_eq!(row["below_median_floor"], true);
+        assert_eq!(row["below_calibrated_floor"], false);
+    }
+
     fn fixture() -> (Profile, Value) {
         let cost = |read, flops| {
             KernelCost {

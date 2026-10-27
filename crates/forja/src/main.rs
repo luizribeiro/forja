@@ -1,6 +1,8 @@
 //! Command-line entry point for Forja engine tooling.
 
 mod analysis;
+#[path = "analysis/diagnostics.rs"]
+mod analysis_diagnostics;
 mod analysis_input;
 mod analysis_metrics;
 mod analysis_report;

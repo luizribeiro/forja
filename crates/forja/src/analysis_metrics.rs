@@ -1,7 +1,7 @@
 use crate::analysis_input::{Dispatch, positive};
 use forja_core::{
     KernelCost,
-    roofline::{self, Ceilings},
+    roofline::{self, Ceilings, Estimate},
 };
 use serde_json::{Value, json};
 use std::error::Error;
@@ -12,20 +12,41 @@ pub(super) fn ceilings(calibration: &Value, dtype: &str) -> Result<Ceilings, Box
     if calibration["probes"][compute_probe]["arithmetic_mode"] != mode {
         return Err("calibration arithmetic key disagrees with the executed probe".into());
     }
-    let rate = |name: &str| {
-        positive(
-            calibration["probes"][name]["units_per_second"]
-                .as_f64()
-                .ok_or("missing calibration ceiling")?,
+    let rate = |name: &str| -> Result<Estimate, Box<dyn Error>> {
+        let probe = &calibration["probes"][name];
+        let number = |value: &Value| value.as_f64().ok_or("missing calibration estimate");
+        Estimate::new(
+            number(&probe["units_per_second"])?,
+            [number(&probe["ci95"][0])?, number(&probe["ci95"][1])?],
         )
+        .ok_or_else(|| "invalid calibration confidence interval".into())
     };
-    Ceilings::new(
+    let dispatch = rate("dependent_dispatch")?;
+    let latency = Estimate::new(
+        1.0 / dispatch.median(),
+        [1.0 / dispatch.upper(), 1.0 / dispatch.lower()],
+    )
+    .ok_or("unrepresentable dispatch confidence interval")?;
+    Ok(Ceilings::with_intervals(
         rate("streaming_read")?,
         rate("streaming_copy")?,
         rate(compute_probe)?,
-        positive(1.0 / rate("dependent_dispatch")?)?,
+        latency,
+    ))
+}
+
+fn site_group(dispatch: &Dispatch) -> String {
+    dispatch.scope.as_ref().map_or_else(
+        || dispatch.call_site.clone(),
+        |scope| {
+            format!(
+                "{}/{}/{}",
+                scope.layer_type,
+                scope.site,
+                dispatch.call_site.rsplit('/').next().unwrap_or("dispatch")
+            )
+        },
     )
-    .ok_or_else(|| "invalid calibrated ceilings".into())
 }
 
 #[derive(Clone, Copy)]
@@ -72,6 +93,33 @@ impl Attribution {
         let upper = roofline::limits(high_cost, count, ceilings).ok_or("cost overflow")?;
         positive(limits.seconds())?;
         positive(upper.seconds())?;
+        let optimistic =
+            roofline::limits(cost, count, ceilings.optimistic()).ok_or("cost overflow")?;
+        let pessimistic =
+            roofline::limits(high_cost, count, ceilings.pessimistic()).ok_or("cost overflow")?;
+        #[allow(clippy::cast_precision_loss)]
+        let read_percent = [
+            roofline::traffic(cost, true)
+                .and_then(|bytes| bytes.checked_sub(cost.write_bytes))
+                .ok_or("cost overflow")? as f64
+                / raw
+                / ceilings.read_bandwidth()
+                * 100.0,
+            roofline::traffic(cost, false)
+                .and_then(|bytes| bytes.checked_sub(cost.write_bytes))
+                .ok_or("cost overflow")? as f64
+                / raw
+                / ceilings.read_bandwidth()
+                * 100.0,
+        ];
+        let copy_percent = [
+            minimum_bytes / raw / ceilings.copy_bandwidth() * 100.0,
+            maximum_bytes / raw / ceilings.copy_bandwidth() * 100.0,
+        ];
+        let memory_percent = [
+            read_percent[0].max(copy_percent[0]),
+            read_percent[1].max(copy_percent[1]),
+        ];
         let target_low = positive(
             limits
                 .target_seconds(target)
@@ -83,34 +131,35 @@ impl Attribution {
                 .ok_or("invalid utilization target")?,
         )?;
         let current = positive((raw + gap) * scale)?;
+        let share = current / wall * 100.0;
+        let compute_percent = compute / ceilings.compute_rate() * 100.0;
+        if memory_percent
+            .iter()
+            .chain([&share, &compute_percent])
+            .any(|value| !value.is_finite())
+        {
+            return Err("resource percentage overflow".into());
+        }
         let recoverable = |bound: f64| (current - bound).max(0.0);
-        let site_group = dispatch.scope.as_ref().map_or_else(
-            || dispatch.call_site.clone(),
-            |scope| {
-                format!(
-                    "{}/{}/{}",
-                    scope.layer_type,
-                    scope.site,
-                    dispatch.call_site.rsplit('/').next().unwrap_or("dispatch")
-                )
-            },
-        );
         Ok(
-            json!({"call_site": dispatch.call_site, "site_group": site_group,
+            json!({"call_site": dispatch.call_site, "site_group": site_group(dispatch),
         "layer_type": dispatch.scope.as_ref().map_or("unscoped", |scope| scope.layer_type.as_str()),
         "layer": dispatch.scope.as_ref().and_then(|scope| scope.layer), "op": dispatch.op, "kernel": kernel,
         "variant": dispatch.variant, "alternatives": dispatch.alternatives, "shape": dispatch.shape,
         "compute_dtype": dispatch.compute_dtype, "arithmetic_mode": format!("{}_native", dispatch.compute_dtype), "cost": cost.json(), "physical_dispatches": count,
         "profiled_gpu_seconds": raw, "preceding_gap_seconds": gap, "attributed_gpu_seconds": current,
-        "share_of_step_percent": current / wall * 100.0,
+        "share_of_step_percent": share,
         "raw_gigabytes_per_second_range": [minimum_bytes / raw / 1e9, maximum_bytes / raw / 1e9],
-        "percent_of_streaming_read_ceiling_range": [minimum_bytes / raw / ceilings.read_bandwidth() * 100.0, maximum_bytes / raw / ceilings.read_bandwidth() * 100.0],
-        "raw_teraflops_per_second": compute / 1e12, "percent_of_compute_ceiling": compute / ceilings.compute_rate() * 100.0,
+        "percent_of_streaming_read_ceiling_range": read_percent, "percent_of_streaming_copy_ceiling_range": copy_percent,
+        "percent_of_memory_ceiling_range": memory_percent, "resource_rate_time_basis": "raw-profiled-gpu-interval",
+        "raw_teraflops_per_second": compute / 1e12, "percent_of_compute_ceiling": compute_percent,
         "bound": limits.bound(), "bound_at_maximum_footprint": upper.bound(),
         "ceiling_seconds_range": [limits.seconds(), upper.seconds()], "target_seconds_range": [target_low, target_high],
         "recoverable_seconds": recoverable(limits.seconds()), "recoverable_seconds_range": [recoverable(upper.seconds()), recoverable(limits.seconds())],
         "recoverable_at_target_seconds": recoverable(target_low),
-        "below_calibrated_floor": raw < limits.seconds() }),
+        "calibration_bound_seconds_envelope": [optimistic.seconds(), pessimistic.seconds()],
+        "over_100_percent": crate::analysis_diagnostics::over_100([share, memory_percent[1], compute_percent]),
+        "below_median_floor": raw < limits.seconds(), "below_calibrated_floor": raw < optimistic.seconds() }),
         )
     }
 }
