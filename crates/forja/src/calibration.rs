@@ -93,7 +93,7 @@ fn measure(options: &Options, identity: &Value) -> Result<Value, Box<dyn Error>>
     for &name in PROBES {
         let selected = samples
             .iter()
-            .filter(|sample| sample.name == name)
+            .filter(|sample| sample.name == name && !sample.screening)
             .collect::<Vec<_>>();
         #[allow(clippy::cast_precision_loss)]
         let rates = crate::benchmark_stats::stats(
@@ -110,16 +110,16 @@ fn measure(options: &Options, identity: &Value) -> Result<Value, Box<dyn Error>>
                 _ => "f32",
             });
         probes.insert(name.into(), json!({"arithmetic": arithmetic, "units_per_second": rates.median,
-            "ci95": [rates.low, rates.high], "samples": selected.iter().map(|sample| json!({
-                "units": sample.units, "wall_seconds": sample.wall.as_secs_f64(), "gpu_seconds": sample.gpu.as_secs_f64()})).collect::<Vec<_>>()}));
+            "ci95": [rates.low, rates.high], "samples": selected.iter().map(|sample| sample_json(sample)).collect::<Vec<_>>()}));
     }
     Ok(
-        json!({"schema_version": 2, "kind": "device-calibration", "model_benchmark": false,
+        json!({"schema_version": 4, "kind": "device-calibration", "model_benchmark": false,
         "identity": identity, "warmups": options.warmups, "repetitions": options.reps,
         "timestamp_method": "unprofiled-command-buffer", "interval_method": "binomial-order-statistic-median",
-        "bf16_arithmetic": if samples.iter().any(|sample| sample.arithmetic == Some(forja_core::DType::BF16)) { "native-bf16" } else { "compiler refused native bf16 MMA; operands promoted to f32" },
+        "bf16_arithmetic": if samples.iter().any(|sample| !sample.screening && sample.arithmetic == Some(forja_core::DType::BF16)) { "native-bf16" } else { "compiler refused native bf16 MMA; operands promoted to f32" },
         "threadgroup_method": "volatile float4 reads, 128 threads, one initialization barrier",
-        "mma_method": "8x8x8 SIMD matrices; four independent accumulators per SIMD group",
+        "mma_method": "8x8x8 SIMD matrices; independent operands/accumulators, eight-way loop unroll; screen chain counts then confirm separately",
+        "screening": samples.iter().filter(|sample| sample.screening).map(sample_json).collect::<Vec<_>>(),
         "probes": probes, "provenance": {"commit": crate::provenance::commit(),
             "dirty": crate::provenance::dirty(), "build_environment": crate::provenance::BUILD_ENVIRONMENT,
             "binary_sha256": golden_fixtures::sha256_file(std::env::current_exe()?)?,
@@ -128,8 +128,14 @@ fn measure(options: &Options, identity: &Value) -> Result<Value, Box<dyn Error>>
     )
 }
 
+#[cfg(target_os = "macos")]
+fn sample_json(sample: &forja_metal::CalibrationSample) -> Value {
+    json!({"name": sample.name, "independent_chains": sample.independent_chains, "screening": sample.screening,
+        "units": sample.units, "wall_seconds": sample.wall.as_secs_f64(), "gpu_seconds": sample.gpu.as_secs_f64()})
+}
+
 pub(crate) fn validate(record: &Value, identity: &Value) -> Result<(), Box<dyn Error>> {
-    if record["schema_version"] != 2 || record["identity"] != *identity {
+    if record["schema_version"] != 4 || record["identity"] != *identity {
         return Err("calibration identity or schema mismatch; recalibrate".into());
     }
     for &name in PROBES {
