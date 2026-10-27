@@ -8,10 +8,7 @@ mod config_show;
 mod engine;
 mod generate;
 mod host_schema;
-#[cfg(test)]
-mod kernel_benchmark {
-    mod shape;
-}
+mod kernel_benchmark;
 mod logging;
 mod machine_load;
 mod profile;
@@ -97,6 +94,7 @@ fn run(command: args::Command) -> Result<(), Box<dyn Error>> {
         .build()?;
     match command {
         args::Command::Bench(options) => runtime.block_on(benchmark::run(&options)),
+        args::Command::BenchKernel(options, config) => kernel_benchmark::run(&options, &config),
         args::Command::Build(_) => unreachable!("build commands return before runtime"),
         args::Command::Catalog(_) => unreachable!("catalog commands return before runtime"),
         args::Command::Config(_) => unreachable!("configuration commands return before runtime"),

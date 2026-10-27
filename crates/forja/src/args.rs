@@ -294,6 +294,7 @@ enum AxisClass {
 #[derive(Debug, PartialEq)]
 pub(crate) enum Command {
     Bench(Bench),
+    BenchKernel(crate::kernel_benchmark::Options, Box<DevConfig>),
     Build(Build),
     Catalog(Catalog),
     Config(ConfigShow),
@@ -420,6 +421,8 @@ struct Cli {
 enum ParsedCommand {
     /// Benchmark one or more engines.
     Bench(BenchArgs),
+    /// Time a single catalog variant as a kernel diagnostic.
+    BenchKernel(crate::kernel_benchmark::Options),
     /// Build a reproducible profile-backed engine component.
     Build(BuildArgs),
     /// List selectable backend algorithms and their constraints.
@@ -504,6 +507,9 @@ fn parse_with(
     let layered = layer::<DevConfig>(layers).map_err(|error| config_error(&error))?;
     let limits = layered.config.limits.clone();
     Ok(match cli.command {
+        ParsedCommand::BenchKernel(options) => {
+            Command::BenchKernel(options, Box::new(layered.config))
+        }
         ParsedCommand::Bench(options) => Command::Bench(options.with_config(
             &layered,
             limits,
@@ -878,7 +884,8 @@ impl ParsedCommand {
             | Self::Catalog(_)
             | Self::Config(_)
             | Self::Profile(_)
-            | Self::Serve(_) => {}
+            | Self::Serve(_)
+            | Self::BenchKernel(_) => {}
         }
         values
             .into_iter()
