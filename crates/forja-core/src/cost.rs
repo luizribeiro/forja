@@ -2,6 +2,7 @@
 
 mod attention;
 mod routed;
+mod scalar;
 
 use crate::{Dispatch, Op, Tensor, matmul_flops, quant_matmul_flops};
 
@@ -61,7 +62,10 @@ impl KernelCost {
             }
             _ => {}
         }
-        routed::count(dispatch, attention::count(dispatch, cost)?)
+        scalar::count(
+            dispatch,
+            routed::count(dispatch, attention::count(dispatch, cost)?)?,
+        )
     }
 }
 
