@@ -122,6 +122,17 @@ mod tests {
                 "outputs": [{"dtype":"f32","shape":[1,33]}]}),
             ),
             (
+                "paged-sdpa-append.vector-gqa-two-pass-32",
+                serde_json::json!({
+                "operation": {"kind":"paged-sdpa-append","scale":0.1,"q_start":6,"page_tokens":32},
+                "inputs": [{"dtype":"f32","shape":[16,1,128]},
+                    {"dtype":"f32","shape":[1,8,128]}, {"dtype":"f32","shape":[1,8,128]},
+                    {"dtype":"u32","shape":[3,2],"u32_values":[2,1,0,1,1,1]},
+                    {"dtype":"u32","shape":[3],"u32_values":[1,1,1]}],
+                "outputs": [{"dtype":"f32","shape":[16,1,128]},
+                    {"dtype":"f16","shape":[3,32,8,128]}, {"dtype":"f16","shape":[3,32,8,128]}]}),
+            ),
+            (
                 "paged-sdpa.vector",
                 serde_json::json!({
                 "operation": {"kind":"paged-sdpa","scale":0.1,"causal":true,"q_start":6,

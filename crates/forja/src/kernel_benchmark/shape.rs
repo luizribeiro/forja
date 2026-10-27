@@ -28,6 +28,11 @@ enum Operation {
         causal: bool,
         q_start: u32,
     },
+    PagedSdpaAppend {
+        scale: f32,
+        q_start: u32,
+        page_tokens: u32,
+    },
     PagedSdpa {
         scale: f32,
         causal: bool,
