@@ -1,3 +1,5 @@
+#[cfg(target_os = "macos")]
+mod resident;
 use std::{
     collections::{BTreeMap, VecDeque},
     error::Error,
@@ -516,7 +518,13 @@ async fn run_metal(options: &Bench) -> Result<(), Box<dyn Error>> {
                 .collect::<Result<Vec<_>, _>>()
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let (results, device) = measure_points(options, &perf_keys, &perf_hashes).await?;
+    let (results, device) = measure_points(
+        options,
+        &perf_keys,
+        &perf_hashes,
+        &mut resident::Runners::new(false),
+    )
+    .await?;
     let load_after = machine_load::capture("AFTER BENCHMARK")?;
     check_strategy_outputs(&options.strategy_axes, &results)?;
     if options
@@ -1216,6 +1224,7 @@ async fn measure_points(
     options: &Bench,
     perf_keys: &[Vec<PerfKey>],
     perf_hashes: &[Vec<String>],
+    runners: &mut resident::Runners,
 ) -> Result<(Vec<serde_json::Value>, String), Box<dyn Error>> {
     let mut results = Vec::new();
     let mut record_device = None;
@@ -1229,7 +1238,7 @@ async fn measure_points(
             let batches = if batch_measurements_enabled(
                 options.rerun.as_ref().map(|record| record.schema_version),
             ) {
-                measure_record_batches(options, point, component).await?
+                measure_record_batches(options, point, component, runners).await?
             } else {
                 Vec::new()
             };
@@ -1253,7 +1262,7 @@ async fn measure_points(
                     output_digest,
                     peak_footprint,
                     raw_samples,
-                } = bench_engine(options, point, component, host_argmax, overlap).await?;
+                } = bench_engine(options, point, component, host_argmax, overlap, runners).await?;
                 if record_device.as_ref().is_some_and(|known| known != &device) {
                     return Err("benchmark engines opened different Metal devices".into());
                 }
@@ -1424,9 +1433,10 @@ async fn bench_engine(
     component: &Path,
     host_argmax: bool,
     overlap: bool,
+    runners: &mut resident::Runners,
 ) -> Result<BenchMeasurement, Box<dyn Error>> {
     let decode = decode_options(point, host_argmax, overlap);
-    let (mut runner, info, device) = load_benchmark_runner(options, point, component).await?;
+    let (mut runner, info, device) = runners.acquire(options, point, component).await?;
     let max_context = usize::try_from(info.max_context)?;
     let profile_context = *point
         .contexts
@@ -1499,10 +1509,15 @@ async fn bench_engine(
         decode.sampling,
     )
     .await?;
-    let contexts = after_runner_drop(runner, || {
-        measure_record_contexts(&tokens, point, options, component, decode, &tg)
-    })
-    .await?;
+    let contexts = if runners.retains() {
+        runners.release((runner, info, device.clone())).await?;
+        measure_record_contexts(&tokens, point, options, component, decode, &tg, runners).await?
+    } else {
+        after_runner_drop(runner, || {
+            measure_record_contexts(&tokens, point, options, component, decode, &tg, runners)
+        })
+        .await?
+    };
     Ok(BenchMeasurement {
         pp: summarize(&pp, point.pp)?,
         tg: summarize(&tg, point.tg)?,
@@ -1569,13 +1584,20 @@ fn batch_measurements_enabled(rerun_schema: Option<u32>) -> bool {
 }
 
 #[cfg(target_os = "macos")]
+#[allow(clippy::too_many_lines)]
 async fn measure_record_batches(
     options: &Bench,
     point: &BenchPoint,
     component: &Path,
+    runners: &mut resident::Runners,
 ) -> Result<Vec<BatchDecodeMeasurement>, Box<dyn Error>> {
-    let (mut runner, info, _) = load_benchmark_runner(options, point, component).await?;
+    let (mut runner, info, device) = runners
+        .acquire_phase(options, point, component, resident::Phase::Batch)
+        .await?;
     let Some(serving) = info.serving.as_ref() else {
+        runners
+            .release_phase(resident::Phase::Batch, (runner, info, device))
+            .await?;
         return Ok(Vec::new());
     };
     let buckets = [1_u32, 2, 4, 8]
@@ -1590,6 +1612,9 @@ async fn measure_record_batches(
         })
         .collect::<Vec<_>>();
     let Some(&largest) = buckets.last() else {
+        runners
+            .release_phase(resident::Phase::Batch, (runner, info, device))
+            .await?;
         return Ok(Vec::new());
     };
     let contexts = batch_contexts(usize::try_from(largest)?);
@@ -1670,6 +1695,9 @@ async fn measure_record_batches(
             samples,
         });
     }
+    runners
+        .release_phase(resident::Phase::Batch, (runner, info, device))
+        .await?;
     Ok(measurements)
 }
 
@@ -1852,10 +1880,11 @@ async fn measure_record_contexts(
     component: &Path,
     decode: DecodeOptions,
     primary: &[Sample],
+    runners: &mut resident::Runners,
 ) -> Result<Vec<ContextMeasurement>, Box<dyn Error>> {
     let rerun_schema = options.rerun.as_ref().map(|record| record.schema_version);
     if context_measurements_enabled(rerun_schema) {
-        measure_contexts(tokens, point, options, component, decode, primary).await
+        measure_contexts(tokens, point, options, component, decode, primary, runners).await
     } else {
         Ok(Vec::new())
     }
@@ -1869,6 +1898,7 @@ async fn measure_contexts(
     component: &Path,
     decode: DecodeOptions,
     primary: &[Sample],
+    runners: &mut resident::Runners,
 ) -> Result<Vec<ContextMeasurement>, Box<dyn Error>> {
     let primary_start = options.decode_prefill + 1;
     let mut measurements = Vec::with_capacity(point.contexts.len());
@@ -1877,8 +1907,8 @@ async fn measure_contexts(
         if context_start == primary_start {
             samples.extend_from_slice(primary);
         } else {
-            let (mut context_runner, _, _) =
-                load_benchmark_runner(options, point, component).await?;
+            let (mut context_runner, info, device) =
+                runners.acquire(options, point, component).await?;
             prepare_benchmark_runner(
                 &mut context_runner,
                 context_start
@@ -1892,6 +1922,7 @@ async fn measure_contexts(
             for _ in 0..options.reps {
                 samples.push(measure_decode(&mut context_runner, prompt, point.tg, decode).await?);
             }
+            runners.release((context_runner, info, device)).await?;
         }
         measurements.push(ContextMeasurement {
             context_start,
