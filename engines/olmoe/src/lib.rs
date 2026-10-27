@@ -456,6 +456,7 @@ impl Olmoe {
         attention_variant: &VariantSelection,
     ) -> Result<SequenceOutput> {
         let positions = self.positions.narrow(0, start, sequence)?;
+        forja_sdk::profile_scope("embedding", "global", None)?;
         let mut hidden = self.weights.model.embed_tokens.forward(tokens)?;
         let mut taps = Taps::new(taps_enabled, LAYERS);
         let mut routers = Vec::with_capacity(if taps_enabled { LAYERS } else { 0 });
@@ -465,6 +466,14 @@ impl Olmoe {
             attention: attention_variant,
         };
         for index in 0..LAYERS {
+            forja_sdk::profile_scope(
+                "decoder",
+                "sparse-decoder",
+                Some(
+                    u32::try_from(index)
+                        .map_err(|_| forja_sdk::Error::loading("layer index exceeds u32"))?,
+                ),
+            )?;
             let (next, router) = self.weights.model.layers[index].forward(
                 &hidden,
                 &positions,
@@ -481,6 +490,7 @@ impl Olmoe {
                 }
             }
         }
+        forja_sdk::profile_scope("output", "global", None)?;
         hidden = self.weights.model.norm.forward(&hidden)?;
         if taps.enabled() {
             taps.push(hidden.contiguous()?);

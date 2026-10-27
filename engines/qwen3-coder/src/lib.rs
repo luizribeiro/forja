@@ -1272,12 +1272,21 @@ impl Qwen3Coder {
         lm_head_row: Option<&Dim>,
     ) -> Result<SequenceOutput> {
         let activation_positions = self.activation_positions.narrow(0, start, sequence)?;
+        forja_sdk::profile_scope("embedding", "global", None)?;
         let mut hidden = self.weights.embed_tokens.forward(tokens)?;
         let layers = self.weights.layers.len();
         let mut normalized = self.weights.layers[0].input_layernorm.forward(&hidden)?;
         let mut taps = Taps::new(taps_enabled, layers);
         let mut routers = Vec::with_capacity(if taps_enabled { layers } else { 0 });
         for index in 0..layers {
+            forja_sdk::profile_scope(
+                "decoder",
+                "sparse-decoder",
+                Some(
+                    u32::try_from(index)
+                        .map_err(|_| forja_sdk::Error::loading("layer index exceeds u32"))?,
+                ),
+            )?;
             let following_norm = self
                 .weights
                 .layers
@@ -1319,6 +1328,7 @@ impl Qwen3Coder {
         if taps.enabled() {
             taps.push(normalized.contiguous()?);
         }
+        forja_sdk::profile_scope("output", "global", None)?;
         let logits = project_lm_head(
             normalized,
             lm_head_row,
@@ -2075,10 +2085,19 @@ impl Qwen3Coder {
         positions: &Tensor<f32>,
         lanes: &[Option<BatchLanePosition>],
     ) -> Result<Tensor<f32>> {
+        forja_sdk::profile_scope("embedding", "global", None)?;
         let mut hidden = self.weights.embed_tokens.forward(tokens)?;
         let layers = self.weights.layers.len();
         let mut normalized = self.weights.layers[0].input_layernorm.forward(&hidden)?;
         for index in 0..layers {
+            forja_sdk::profile_scope(
+                "decoder",
+                "sparse-decoder",
+                Some(
+                    u32::try_from(index)
+                        .map_err(|_| forja_sdk::Error::loading("layer index exceeds u32"))?,
+                ),
+            )?;
             let following_norm = self
                 .weights
                 .layers
@@ -2105,6 +2124,7 @@ impl Qwen3Coder {
             hidden = next;
             normalized = next_normalized;
         }
+        forja_sdk::profile_scope("output", "global", None)?;
         self.weights.lm_head.forward(&self.variants, &normalized)
     }
 

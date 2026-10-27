@@ -740,6 +740,7 @@ impl<T: Activation> Qwen3<T> {
         taps_enabled: bool,
     ) -> Result<(Tensor<T>, Vec<Tensor<f32>>)> {
         let positions = self.positions.narrow(0, start, sequence)?;
+        forja_sdk::profile_scope("embedding", "global", None)?;
         let mut hidden = self.weights.model.embed_tokens.forward(tokens)?;
         let mut normalized = rms_norm(
             &self.kernels.rms_norm,
@@ -748,6 +749,14 @@ impl<T: Activation> Qwen3<T> {
         )?;
         let mut taps = Taps::new(taps_enabled, LAYERS);
         for index in 0..LAYERS {
+            forja_sdk::profile_scope(
+                "decoder",
+                "dense-decoder",
+                Some(
+                    u32::try_from(index)
+                        .map_err(|_| forja_sdk::Error::loading("layer index exceeds u32"))?,
+                ),
+            )?;
             let layer = &self.weights.model.layers[index];
             let following_norm = self
                 .weights
@@ -780,6 +789,7 @@ impl<T: Activation> Qwen3<T> {
                 normalized = value;
             }
         }
+        forja_sdk::profile_scope("output", "global", None)?;
         hidden = rms_norm(
             &self.kernels.rms_norm,
             &hidden,
