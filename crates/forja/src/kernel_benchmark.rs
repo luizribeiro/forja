@@ -20,6 +20,9 @@ pub(crate) struct Options {
     /// Dispatches per measured submission, amortizing command-buffer latency.
     #[arg(long, default_value = "1")]
     pub(crate) dispatches: std::num::NonZeroU32,
+    /// Reuse the first output to serialize dispatches through write dependencies.
+    #[arg(long)]
+    pub(crate) serial: bool,
     /// Number of untimed submissions.
     #[arg(long, default_value_t = 1)]
     pub(crate) warmups: u32,
@@ -84,7 +87,7 @@ fn run_metal(options: &Options, config: &forja_config::DevConfig) -> Result<(), 
         }
     }
     let report = serde_json::json!({"kind": "kernel-diagnostic", "model_benchmark": false,
-        "variant": options.variant, "copies": options.copies.get(), "resident_operand_bytes": bytes,
+        "variant": options.variant, "serial": options.serial, "copies": options.copies.get(), "resident_operand_bytes": bytes,
         "dispatches_per_sample": options.dispatches.get(), "cost_per_dispatch": cost.map(forja_core::KernelCost::json), "shape": serde_json::from_slice::<serde_json::Value>(&fs::read(&options.shape)?)?,
         "warmups": options.warmups, "samples": samples, "provenance": {
             "commit": crate::provenance::commit(), "dirty": crate::provenance::dirty(),
@@ -123,7 +126,17 @@ fn diagnostic_commands(
     for index in 0..options.dispatches.get() {
         let (inputs, outputs) = &operands[usize::try_from(index % options.copies.get())?];
         let inputs = inputs.iter().collect::<Vec<_>>();
-        let outputs = outputs.iter().collect::<Vec<_>>();
+        let outputs = outputs
+            .iter()
+            .enumerate()
+            .map(|(index, output)| {
+                if options.serial && index == 0 {
+                    &operands[0].1[0]
+                } else {
+                    output
+                }
+            })
+            .collect::<Vec<_>>();
         let variant = backend.validate_variant_for_op(
             shape.operation,
             &inputs,
@@ -209,28 +222,41 @@ mod tests {
                 "outputs": [{"dtype":"f32","shape":[16,1,128]}]}),
             ),
         ] {
-            let mut options = Options {
-                variant: variant.into(),
-                shape: root.join("shape.json"),
-                json: root.join("record.json"),
-                reps: std::num::NonZeroU32::new(1).unwrap(),
-                warmups: 0,
-                copies: std::num::NonZeroU32::new(3).unwrap(),
-                dispatches: std::num::NonZeroU32::new(7).unwrap(),
-            };
-            fs::write(&options.shape, serde_json::to_vec(&shape).unwrap()).unwrap();
-            run(&options, &forja_config::DevConfig::default()).unwrap();
-            let record: serde_json::Value =
-                serde_json::from_slice(&fs::read(&options.json).unwrap()).unwrap();
-            assert_eq!(record["kind"], "kernel-diagnostic");
-            assert_eq!(record["variant"], variant);
-            assert_eq!(record["model_benchmark"], false);
-            assert_eq!(record["copies"], 3);
-            assert_eq!(record["dispatches_per_sample"], 7);
-            options.dispatches = std::num::NonZeroU32::new(2).unwrap();
-            assert!(run(&options, &forja_config::DevConfig::default()).is_err());
-            assert_eq!(record["samples"].as_array().unwrap().len(), 1);
+            assert_diagnostic_record(&root, variant, &shape);
         }
         fs::remove_dir_all(root).unwrap();
+    }
+    #[cfg(target_os = "macos")]
+    fn assert_diagnostic_record(root: &std::path::Path, variant: &str, shape: &serde_json::Value) {
+        let mut options = Options {
+            variant: variant.into(),
+            shape: root.join("shape.json"),
+            json: root.join("record.json"),
+            reps: std::num::NonZeroU32::new(1).unwrap(),
+            warmups: 0,
+            serial: true,
+            copies: std::num::NonZeroU32::new(3).unwrap(),
+            dispatches: std::num::NonZeroU32::new(7).unwrap(),
+        };
+        fs::write(&options.shape, serde_json::to_vec(shape).unwrap()).unwrap();
+        let backend = forja_metal::MetalBackend::new().unwrap();
+        let spec = serde_json::from_value(shape.clone()).unwrap();
+        let commands = diagnostic_commands(&backend, &spec, &options).unwrap();
+        assert_eq!(
+            forja_core::required_barriers(&commands),
+            [false, true, true, true, true, true, true]
+        );
+        run(&options, &forja_config::DevConfig::default()).unwrap();
+        let record: serde_json::Value =
+            serde_json::from_slice(&fs::read(&options.json).unwrap()).unwrap();
+        assert_eq!(record["kind"], "kernel-diagnostic");
+        assert_eq!(record["variant"], variant);
+        assert_eq!(record["model_benchmark"], false);
+        assert_eq!(record["serial"], true);
+        assert_eq!(record["copies"], 3);
+        assert_eq!(record["dispatches_per_sample"], 7);
+        options.dispatches = std::num::NonZeroU32::new(2).unwrap();
+        assert!(run(&options, &forja_config::DevConfig::default()).is_err());
+        assert_eq!(record["samples"].as_array().unwrap().len(), 1);
     }
 }
