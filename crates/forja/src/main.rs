@@ -5,6 +5,9 @@ mod benchmark;
 mod benchmark_record;
 mod benchmark_snapshot;
 mod benchmark_stats;
+#[cfg(test)]
+#[allow(dead_code)]
+mod calibration_identity;
 mod config_show;
 mod engine;
 mod generate;
