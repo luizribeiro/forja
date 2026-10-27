@@ -10,7 +10,7 @@ impl RouteFacts {
         let input = dispatch.primitive_inputs();
         let index = match dispatch.op() {
             Op::GatherMatmul => Some(2),
-            Op::GatherQuantMatmul { .. } => Some(if input.len() == 8 { 7 } else { 4 }),
+            Op::GatherQuantMatmul { .. } => forja_core::quantized_route_index(input.len()),
             _ => None,
         };
         if let Some(indices) = index.and_then(|index| input.get(index)) {

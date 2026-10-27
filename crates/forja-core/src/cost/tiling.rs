@@ -48,7 +48,7 @@ impl CostModel {
             ),
             Op::QuantMatmul { .. } => (round(rows, tm)?, round(rows, tm)?, 1),
             Op::GatherQuantMatmul { .. } => {
-                let index = if input.len() == 8 { 7 } else { 4 };
+                let index = super::quantized_route_index(input.len())?;
                 let routes = input[index].layout().element_count();
                 let experts = u64::from(input[1].layout().shape()[0]).min(routes);
                 let maximum_tiles = routes

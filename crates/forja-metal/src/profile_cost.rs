@@ -36,7 +36,7 @@ pub(crate) fn internal(
     if !matches!(dispatch.op(), Op::GatherQuantMatmul { .. }) {
         return Some(cost);
     }
-    let indices = &input[if input.len() == 8 { 7 } else { 4 }];
+    let indices = &input[forja_core::quantized_route_index(input.len())?];
     let routes = indices.layout().element_count();
     let experts = u64::from(input[1].layout().shape()[0]);
     let index_bytes = routes.checked_mul(4)?;

@@ -4,6 +4,7 @@ mod attention;
 #[cfg(test)]
 mod copies;
 mod routed;
+pub use routed::quantized_route_index;
 mod scalar;
 mod tiling;
 pub use tiling::CostModel;

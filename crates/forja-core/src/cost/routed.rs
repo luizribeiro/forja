@@ -1,6 +1,20 @@
 use super::{bytes, tensor_bytes};
 use crate::{Dispatch, KernelCost, Op, gather_matmul_flops, gather_quant_matmul_dispatch_flops};
 
+/// Returns the index operand slot for a validated routed quantized operation.
+#[must_use]
+pub const fn quantized_route_index(input_count: usize) -> Option<usize> {
+    match input_count {
+        5 | 6 => Some(4),
+        8 => Some(7),
+        _ => None,
+    }
+}
+
+fn per_expert_bytes(weights: u64, experts: u64) -> Option<u64> {
+    (weights.checked_rem(experts)? == 0).then_some(weights.checked_div(experts)?)
+}
+
 pub(super) fn count(dispatch: &Dispatch, mut cost: KernelCost) -> Option<KernelCost> {
     let inputs = dispatch.primitive_inputs();
     let (index, weights) = match dispatch.op() {
@@ -13,7 +27,7 @@ pub(super) fn count(dispatch: &Dispatch, mut cost: KernelCost) -> Option<KernelC
             (2, tensor_bytes(&inputs[1])?)
         }
         Op::GatherQuantMatmul { .. } => {
-            let index = if inputs.len() == 8 { 7 } else { 4 };
+            let index = quantized_route_index(inputs.len())?;
             cost.flops = gather_quant_matmul_dispatch_flops(
                 inputs[0].layout().shape(),
                 inputs[1].layout().shape(),
@@ -33,16 +47,18 @@ pub(super) fn count(dispatch: &Dispatch, mut cost: KernelCost) -> Option<KernelC
             return Some(cost);
         }
         Op::QuantEmbed { .. } => {
-            cost.weight_bytes = bytes(&inputs[..3])?
-                .checked_div(u64::from(inputs[0].layout().shape()[0]))?
-                .checked_mul(inputs[3].layout().element_count())?;
+            cost.weight_bytes = per_expert_bytes(
+                bytes(&inputs[..3])?,
+                u64::from(inputs[0].layout().shape()[0]),
+            )?
+            .checked_mul(inputs[3].layout().element_count())?;
             cost.read_bytes = cost.weight_bytes.checked_add(tensor_bytes(&inputs[3])?)?;
             return Some(cost);
         }
         _ => return Some(cost),
     };
     let experts = u64::from(inputs[1].layout().shape()[0]);
-    let per_expert = weights.checked_div(experts)?;
+    let per_expert = per_expert_bytes(weights, experts)?;
     let routes = inputs[index].layout().element_count();
     cost.weight_bytes = per_expert.checked_mul(routes)?;
     cost.read_bytes = cost
@@ -59,6 +75,16 @@ pub(super) fn count(dispatch: &Dispatch, mut cost: KernelCost) -> Option<KernelC
 mod tests {
     use super::*;
     use crate::{CommandList, DType, cost::tests::tensor};
+
+    #[test]
+    fn routed_index_slots_refuse_unknown_arities() {
+        assert_eq!(quantized_route_index(5), Some(4));
+        assert_eq!(quantized_route_index(6), Some(4));
+        assert_eq!(quantized_route_index(8), Some(7));
+        assert_eq!(quantized_route_index(7), None);
+        assert_eq!(per_expert_bytes(7, 2), None);
+        assert_eq!(per_expert_bytes(8, 0), None);
+    }
 
     #[test]
     fn routed_quantized_cost_counts_assignments_and_reuse_bounds() {
