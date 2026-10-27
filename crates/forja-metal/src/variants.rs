@@ -2689,8 +2689,13 @@ mod tests {
     #[test]
     fn weighted_gather_variants_partition_route_counts() {
         let weighted_broad = weighted_gather_dispatch(1, 9, 257);
-        let error = resolve(&weighted_broad, "gather-quant-matmul.route-gemv", METAL4).unwrap_err();
-        assert!(error.to_string().contains("routes is in 1..=8"));
+        for variant in [
+            "gather-quant-matmul.route-gemv",
+            "gather-quant-matmul.vector8",
+        ] {
+            let error = resolve(&weighted_broad, variant, METAL4).unwrap_err();
+            assert!(error.to_string().contains("routes is in 1..=8"));
+        }
         assert!(
             resolve(
                 &weighted_broad,
@@ -2761,6 +2766,16 @@ mod tests {
                 "quantized_gemv_n2",
             ),
             (
+                "quant-matmul.vector8",
+                quant_dispatch_with_bits(DType::F32, 1, 768, false, 4),
+                "quantized_gemv_n2",
+            ),
+            (
+                "quant-matmul.vector16",
+                quant_dispatch_with_bits(DType::F32, 1, 768, false, 4),
+                "quantized_gemv_n2",
+            ),
+            (
                 "quant-matmul.row-gemv",
                 quant_dispatch(DType::F32, 2, 64, false),
                 "quantized_gemv",
@@ -2793,6 +2808,11 @@ mod tests {
             (
                 "gather-quant-matmul.route-gemv",
                 gathered_dispatch(1, 1, 257, 1),
+                "gather_quantized_gemv",
+            ),
+            (
+                "gather-quant-matmul.vector8",
+                gathered_dispatch(1, 8, 128, 1),
                 "gather_quantized_gemv",
             ),
             (
@@ -2976,19 +2996,23 @@ mod tests {
         ];
         assert_eq!(fixtures.len(), REGISTRY.len());
         for (name, dispatch, kernel) in fixtures {
-            let definition = REGISTRY
-                .iter()
-                .find(|definition| definition.name == name)
-                .unwrap();
-            let validated = resolve(&dispatch, name, METAL4).unwrap();
-            let selected =
-                dispatch.with_backend_data(forja_core::BackendDispatchData::new(validated));
-            assert!(
-                crate::encoding::variant_supported(&selected, definition.implementation).unwrap(),
-                "{name}"
-            );
-            assert_eq!(crate::encoding::dispatch_kernel(&selected).unwrap(), kernel);
+            assert_variant_kernel(name, dispatch, kernel);
         }
+        for name in ["quant-matmul.vector8", "quant-matmul.vector16"] {
+            assert_variant_kernel(
+                name,
+                quant_dispatch(DType::F32, 1, 768, false),
+                "quantized_gemv_n2",
+            );
+        }
+    }
+
+    fn assert_variant_kernel(name: &str, dispatch: Dispatch, kernel: &str) {
+        let definition = REGISTRY.iter().find(|entry| entry.name == name).unwrap();
+        let validated = resolve(&dispatch, name, METAL4).unwrap();
+        let selected = dispatch.with_backend_data(forja_core::BackendDispatchData::new(validated));
+        assert!(crate::encoding::variant_supported(&selected, definition.implementation).unwrap());
+        assert_eq!(crate::encoding::dispatch_kernel(&selected).unwrap(), kernel);
     }
 
     #[test]
