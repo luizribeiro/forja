@@ -14,7 +14,7 @@ def run_row(row: dict, sample, seed: int, affected=True, no_early_stop=False,
         raise ValueError("fixed repetitions must be positive")
     question, x, y = row.get("question", "non-regression"), row.get("X", .02), row.get("Y", 0.)
     decide([], question, x, y)
-    rng = random.Random(seed)
+    phase_random = {}
     result = {"id": row["id"], "profile": row["profile"], "seed": seed,
               "mode": "fixed" if no_early_stop else "sequential",
               "method": "fixed-abba" if no_early_stop else METHOD,
@@ -27,6 +27,7 @@ def run_row(row: dict, sample, seed: int, affected=True, no_early_stop=False,
     expected_outputs = {}
 
     def block(phase, index):
+        rng = phase_random.setdefault(phase, random.Random(f"{seed}:{phase}"))
         order = "ABBA" if rng.getrandbits(1) else "BAAB"
         samples = [sample(side, 1, phase, index, leg) for leg, side in enumerate(order)]
         for item in samples:

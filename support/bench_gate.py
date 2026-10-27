@@ -1,4 +1,4 @@
-"""Run frozen gates with explicit classic controls and fail-closed verdicts."""
+"""Run frozen, serialized gates with explicit classic controls."""
 import argparse
 import json
 from pathlib import Path
@@ -69,15 +69,27 @@ def main():
     if dirty:
         raise ValueError("gate requires a clean source tree")
     verify_artifacts(plan["artifacts"])
+    groups = {}
+    report["groups"] = []
     try:
         for index, chosen in enumerate(selection["rows"]):
             row = history(plan["rows"][index])
             directory = args.out / f"row-{index:02}"
             directory.mkdir()
-            sampler = command_sampler(row, directory, plan["guard"], warmups, not args.no_early_stop)
+            group_key = digest([{key: row[side].get(key) for key in
+                ["command", "cwd", "expected_provenance"]} for side in ["baseline", "candidate"]])
+            if group_key not in groups:
+                group_directory = args.out / f"group-{len(groups):02}"
+                group_directory.mkdir()
+                groups[group_key] = (group_directory, {}, seed + len(groups))
+                report["groups"].append({"key": group_key, "directory": str(group_directory),
+                                         "seed": groups[group_key][2]})
+            group_directory, memo, group_seed = groups[group_key]
+            sampler = command_sampler(row, group_directory, plan["guard"], warmups,
+                                      not args.no_early_stop, memo)
             def progress(value, destination=directory):
                 save(destination / "progress.json", value)
-            result = run_row(row, sampler, seed + index,
+            result = run_row(row, sampler, group_seed,
                 affected=chosen["affected"] or "block_sd" not in row,
                 no_early_stop=args.no_early_stop, reps=args.reps, progress=progress)
             report["rows"].append(result)

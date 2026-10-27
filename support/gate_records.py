@@ -1,10 +1,11 @@
-"""Preserve frozen command records before interpreting measurements."""
+"""Frozen per-leg records shared only within one gate invocation."""
 import hashlib
 import json
 from pathlib import Path
 import subprocess
 import time
 import tomllib
+from bench_cache import digest
 from bench_cache_run import metric, value_at
 
 def save(path: Path, value):
@@ -20,27 +21,39 @@ def verify_artifacts(artifacts: dict):
             raise ValueError(f"frozen artifact mismatch: {name}")
 
 def command_sampler(row: dict, directory: Path, guard: list[str], warmups: int,
-                    sequential: bool):
+                    sequential: bool, memo: dict | None = None):
     """Every original command, log and native record remains independently reviewable."""
     def sample(side, reps, phase, block, leg):
         adapter = row["baseline" if side == "A" else "candidate"]
-        stem = f"{phase}-{block:02}-{leg}-{side}"
+        phase_name = phase if phase != "confirmation" else f"confirmation-{digest(row['id'])[:12]}"
+        stem = f"{phase_name}-{block:02}-{leg}-{side}"
         output, log = directory / f"{stem}.json", directory / f"{stem}.log"
-        if output.exists() or log.exists():
-            raise ValueError("refusing to repeat an existing measurement")
         substitutions = {"{output}": str(output), "{reps}": str(reps), "{warmups}": str(warmups)}
         raw = sequential or phase == "drift"
         command = [*guard, *[substitutions.get(arg, arg).replace("{warmups}", str(warmups)) for arg in adapter["command"]
                              if raw or arg != "--raw-samples"]]
         if "{output}" not in adapter["command"] or "{reps}" not in adapter["command"]:
             raise ValueError("measurement command must declare {output} and {reps}")
-        event = {"command": command, "cwd": adapter.get("cwd"), "started": time.time()}
-        print(f"START {row['id']} {stem}", flush=True)
-        with log.open("w") as stream:
-            result = subprocess.run(command, cwd=adapter.get("cwd"), stdout=stream, stderr=subprocess.STDOUT)
-        event.update(ended=time.time(), returncode=result.returncode)
-        save(directory / f"{stem}.command.json", event)
-        result.check_returncode()
+        key = (phase_name, block, leg, side, reps)
+        reused = memo is not None and key in memo
+        if reused:
+            event, expected_hash = memo[key]
+            if event["command"] != command or event["cwd"] != adapter.get("cwd"):
+                raise ValueError("shared session command differs")
+            if hashlib.sha256(output.read_bytes()).hexdigest() != expected_hash:
+                raise ValueError("shared session record changed")
+        else:
+            if output.exists() or log.exists():
+                raise ValueError("refusing to repeat an existing measurement")
+            event = {"command": command, "cwd": adapter.get("cwd"), "started": time.time()}
+            print(f"START {row['id']} {stem}", flush=True)
+            with log.open("w") as stream:
+                result = subprocess.run(command, cwd=adapter.get("cwd"), stdout=stream, stderr=subprocess.STDOUT)
+            event.update(ended=time.time(), returncode=result.returncode)
+            save(directory / f"{stem}.command.json", event)
+            result.check_returncode()
+            if memo is not None:
+                memo[key] = (event, hashlib.sha256(output.read_bytes()).hexdigest())
         record = json.loads(output.read_text())
         for pointer, expected in adapter.get("expected_provenance", {}).items():
             if value_at(record, pointer) != expected:
@@ -67,6 +80,7 @@ def command_sampler(row: dict, directory: Path, guard: list[str], warmups: int,
         window = value_at(record, adapter["window"]) if raw else [event["started"], event["ended"]]
         print(f"END {row['id']} {stem}", flush=True)
         return {"side": side, "start": window[0], "end": window[1], "score": score,
+                "reused_session": reused,
                 "output_digests": [result["output_digest"] for result in record.get("results", [])
                                    if result.get("output_digest")],
                 "record_file": str(output), "record_sha256": hashlib.sha256(output.read_bytes()).hexdigest()}
