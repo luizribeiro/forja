@@ -461,6 +461,15 @@ mod tests {
     }
 
     #[test]
+    fn adoption_retains_floating_point_measurement_values() {
+        let measured = serde_json::json!({"results": [{"gpu_seconds": 1.142_170_463_999_999_9,
+            "wall_seconds": 1.145_423_412_322_998}]});
+        let source = serde_json::to_vec(&measured).unwrap();
+        let adopted: serde_json::Value = serde_json::from_slice(&source).unwrap();
+        assert_eq!(serde_json::to_vec(&adopted).unwrap(), source);
+    }
+
+    #[test]
     fn adoption_requires_exact_binary_input_and_configuration_hashes() {
         let inputs: Vec<Input> = serde_json::from_value(serde_json::json!([{
             "engine_sha256": "component", "weights_sha256": "weights"

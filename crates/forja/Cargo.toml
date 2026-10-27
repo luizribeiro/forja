@@ -21,7 +21,7 @@ hyper.workspace = true
 hyper-util.workspace = true
 qwen3-coder-xml = { path = "../../chat-formats/qwen3-coder-xml" }
 serde.workspace = true
-serde_json.workspace = true
+serde_json = { workspace = true, features = ["float_roundtrip"] }
 sha2.workspace = true
 tokio.workspace = true
 tokenizers.workspace = true
