@@ -55,7 +55,19 @@ pub(super) fn count(dispatch: &Dispatch, mut cost: KernelCost) -> Option<KernelC
             cost.read_bytes = cost.weight_bytes.checked_add(tensor_bytes(&inputs[3])?)?;
             return Some(cost);
         }
-        _ => return Some(cost),
+        Op::Program(_)
+        | Op::Copy
+        | Op::PagedCopy { .. }
+        | Op::RmsNorm { .. }
+        | Op::Argmax { .. }
+        | Op::TopK { .. }
+        | Op::Sample { .. }
+        | Op::SampleMasked { .. }
+        | Op::Rope { .. }
+        | Op::Matmul
+        | Op::QuantMatmul { .. }
+        | Op::Sdpa { .. }
+        | Op::PagedSdpa { .. } => return Some(cost),
     };
     let experts = u64::from(inputs[1].layout().shape()[0]);
     let per_expert = per_expert_bytes(weights, experts)?;

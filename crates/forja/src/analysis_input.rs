@@ -139,7 +139,8 @@ impl Profile {
 }
 
 fn validate_cost(cost: KernelCost) -> Result<(), Box<dyn Error>> {
-    if cost.minimum_weight_bytes > cost.maximum_weight_bytes
+    if (cost.read_bytes == 0 && cost.write_bytes == 0 && cost.flops == 0 && cost.scalar_ops == 0)
+        || cost.minimum_weight_bytes > cost.maximum_weight_bytes
         || cost.maximum_weight_bytes > cost.weight_bytes
         || cost.read_bytes < cost.weight_bytes
         || cost.read_bytes.checked_add(cost.write_bytes).is_none()
@@ -155,7 +156,14 @@ mod tests {
     use super::*;
     #[test]
     fn costs_refuse_overflow_and_inconsistent_weight_reuse() {
-        assert!(validate_cost(KernelCost::default()).is_ok());
+        assert!(validate_cost(KernelCost::default()).is_err());
+        assert!(
+            validate_cost(KernelCost {
+                read_bytes: 1,
+                ..KernelCost::default()
+            })
+            .is_ok()
+        );
         assert!(
             validate_cost(KernelCost {
                 read_bytes: u64::MAX,

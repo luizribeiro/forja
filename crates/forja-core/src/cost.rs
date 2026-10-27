@@ -69,7 +69,21 @@ impl KernelCost {
                     quant_matmul_flops(inputs[0].layout().shape(), inputs[1].layout().shape())?;
                 cost.weight_bytes = bytes(&inputs[1..4])?;
             }
-            _ => {}
+            Op::Program(_)
+            | Op::Copy
+            | Op::PagedCopy { .. }
+            | Op::RmsNorm { .. }
+            | Op::Argmax { .. }
+            | Op::TopK { .. }
+            | Op::Sample { .. }
+            | Op::SampleMasked { .. }
+            | Op::Rope { .. }
+            | Op::Embed
+            | Op::QuantEmbed { .. }
+            | Op::GatherMatmul
+            | Op::GatherQuantMatmul { .. }
+            | Op::Sdpa { .. }
+            | Op::PagedSdpa { .. } => {}
         }
         scalar::count(
             dispatch,

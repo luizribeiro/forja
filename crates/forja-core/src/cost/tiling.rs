@@ -60,7 +60,20 @@ impl CostModel {
                     if input.len() == 8 { 2 } else { 1 },
                 )
             }
-            _ => return Some([cost.flops; 2]),
+            Op::Program(_)
+            | Op::Copy
+            | Op::PagedCopy { .. }
+            | Op::RmsNorm { .. }
+            | Op::Argmax { .. }
+            | Op::TopK { .. }
+            | Op::Sample { .. }
+            | Op::SampleMasked { .. }
+            | Op::Rope { .. }
+            | Op::Embed
+            | Op::QuantEmbed { .. }
+            | Op::GatherMatmul
+            | Op::Sdpa { .. }
+            | Op::PagedSdpa { .. } => return Some([cost.flops; 2]),
         };
         let factor = product(&[2, batch, round(columns, tn)?, round(inner, tk)?])?;
         Some([
@@ -87,7 +100,21 @@ fn attention_padded(tiles: &[(u32, [u32; 2])], dispatch: &Dispatch) -> Option<[u
             key_length,
             ..
         } => (causal, q_start, key_length),
-        _ => return None,
+        Op::Program(_)
+        | Op::Copy
+        | Op::PagedCopy { .. }
+        | Op::RmsNorm { .. }
+        | Op::Argmax { .. }
+        | Op::TopK { .. }
+        | Op::Sample { .. }
+        | Op::SampleMasked { .. }
+        | Op::Rope { .. }
+        | Op::Embed
+        | Op::QuantEmbed { .. }
+        | Op::Matmul
+        | Op::GatherMatmul
+        | Op::QuantMatmul { .. }
+        | Op::GatherQuantMatmul { .. } => return None,
     };
     let tile = tiles
         .iter()

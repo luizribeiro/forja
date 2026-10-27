@@ -28,7 +28,21 @@ pub(super) fn count(dispatch: &Dispatch, mut cost: KernelCost) -> Option<KernelC
             key_length,
             ..
         } => (causal, q_start, key_length, true),
-        _ => return Some(cost),
+        Op::Program(_)
+        | Op::Copy
+        | Op::PagedCopy { .. }
+        | Op::RmsNorm { .. }
+        | Op::Argmax { .. }
+        | Op::TopK { .. }
+        | Op::Sample { .. }
+        | Op::SampleMasked { .. }
+        | Op::Rope { .. }
+        | Op::Embed
+        | Op::QuantEmbed { .. }
+        | Op::Matmul
+        | Op::GatherMatmul
+        | Op::QuantMatmul { .. }
+        | Op::GatherQuantMatmul { .. } => return Some(cost),
     };
     let query = input[0].layout().shape();
     let keys = input[1].layout().shape();

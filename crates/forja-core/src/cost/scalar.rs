@@ -33,7 +33,12 @@ pub(super) fn program_ops(program: &Program, elements: u64, width: u64) -> Optio
                     elements
                 }
             }
-            _ => 0,
+            Inst::Input(_)
+            | Inst::Index(_)
+            | Inst::Const(_)
+            | Inst::Extent(_)
+            | Inst::Cast(_, _)
+            | Inst::Select(_, _, _) => 0,
         };
         operations = operations.checked_add(count)?;
         uniform.push(is_uniform);
@@ -77,7 +82,16 @@ pub(super) fn count(dispatch: &Dispatch, mut cost: KernelCost) -> Option<KernelC
         Op::Sample { .. } | Op::SampleMasked { .. } => {
             input[0].layout().element_count().checked_mul(4)?
         }
-        _ => cost.scalar_ops,
+        Op::Copy
+        | Op::PagedCopy { .. }
+        | Op::Embed
+        | Op::QuantEmbed { .. }
+        | Op::Matmul
+        | Op::GatherMatmul
+        | Op::QuantMatmul { .. }
+        | Op::GatherQuantMatmul { .. }
+        | Op::Sdpa { .. }
+        | Op::PagedSdpa { .. } => cost.scalar_ops,
     };
     if let Some(epilogue) = dispatch.prepared_epilogue() {
         cost.scalar_ops = cost.scalar_ops.checked_add(program_ops(
