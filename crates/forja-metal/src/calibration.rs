@@ -15,12 +15,16 @@ pub(crate) enum Probe {
 #[derive(Clone, Copy)]
 pub(crate) enum Chains {
     Four,
+    Eight,
+    Sixteen,
 }
 
 impl Chains {
     const fn count(self) -> u32 {
         match self {
             Self::Four => 4,
+            Self::Eight => 8,
+            Self::Sixteen => 16,
         }
     }
 }
@@ -85,9 +89,10 @@ struct PreparedProbe {
 }
 
 impl MetalBackend {
-    /// Measures prepared MMA configurations and threadgroup reads.
+    /// Screens independent MMA chains, then measures the selected configurations and TG reads.
     ///
-    /// BF16 compiler refusal falls back to explicitly labelled f32 promotion.
+    /// BF16 compiler refusal falls back to explicitly labelled f32 promotion. Screening
+    /// observations are retained separately from independent ceiling estimates.
     ///
     /// # Errors
     /// Returns an error for invalid counts or allocation, compilation, execution or timing failure.
@@ -115,21 +120,35 @@ impl MetalBackend {
         )?;
         let result = (|| {
             let mut samples = Vec::new();
-            for probe in [
-                Probe::Mma(DType::F32, Chains::Four),
-                Probe::Mma(DType::F16, Chains::Four),
-                Probe::Mma(DType::BF16, Chains::Four),
-                Probe::Threadgroup,
-            ] {
-                let prepared = self.prepare_calibration_probe(probe)?;
+            for dtype in [DType::F32, DType::F16, DType::BF16] {
+                let mut best: Option<(PreparedProbe, f64)> = None;
+                for chains in [Chains::Four, Chains::Eight, Chains::Sixteen] {
+                    let probe = self.prepare_calibration_probe(Probe::Mma(dtype, chains))?;
+                    let screen =
+                        self.compute_probe_samples(probe, [&input, &output], 1, 5, true)?;
+                    let score = median_rate(&screen)?;
+                    if best.is_none_or(|(_, previous)| score > previous) {
+                        best = Some((probe, score));
+                    }
+                    samples.extend(screen);
+                }
+                let (probe, _) = best.ok_or(BackendError::ExecutionFailed)?;
                 samples.extend(self.compute_probe_samples(
-                    prepared,
+                    probe,
                     [&input, &output],
                     warmups,
                     repetitions,
                     false,
                 )?);
             }
+            let probe = self.prepare_calibration_probe(Probe::Threadgroup)?;
+            samples.extend(self.compute_probe_samples(
+                probe,
+                [&input, &output],
+                warmups,
+                repetitions,
+                false,
+            )?);
             Ok(samples)
         })();
         self.release(&input)?;
@@ -239,6 +258,19 @@ impl MetalBackend {
     }
 }
 
+#[allow(clippy::cast_precision_loss)]
+fn median_rate(samples: &[CalibrationSample]) -> Result<f64, BackendError> {
+    let mut rates = samples
+        .iter()
+        .map(|sample| sample.units as f64 / sample.gpu.as_secs_f64())
+        .collect::<Vec<_>>();
+    rates.sort_by(f64::total_cmp);
+    rates
+        .get(rates.len() / 2)
+        .copied()
+        .ok_or(BackendError::ExecutionFailed)
+}
+
 impl MetalBackend {
     pub(super) fn calibration_samples(
         &self,
@@ -334,7 +366,7 @@ mod tests {
     fn metal_calibration_executes_observable_mma_and_threadgroup_work() {
         let backend = MetalBackend::new().unwrap();
         let samples = backend.calibrate_compute(0, 1).unwrap();
-        assert_eq!(samples.iter().filter(|sample| sample.screening).count(), 0);
+        assert_eq!(samples.iter().filter(|sample| sample.screening).count(), 45);
         let measured = samples
             .iter()
             .filter(|sample| !sample.screening)
