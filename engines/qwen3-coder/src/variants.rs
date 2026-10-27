@@ -6,6 +6,7 @@ use crate::reduction_classes::serving_reduction_class;
 
 const SITES: &[&str] = &[
     "quant.vocab-decode",
+    "quant.output-decode",
     "quant.decode-q4",
     "quant.decode-q8",
     "quant.decode-b2-q4",
@@ -112,6 +113,7 @@ impl Variants {
 fn validate_batch_reductions(config: &EngineLoadConfig) -> Result<()> {
     for sites in [
         &["quant.vocab-decode"][..],
+        &["quant.output-decode"],
         &[
             "quant.decode-q4",
             "quant.decode-b2-q4",
@@ -234,10 +236,10 @@ fn attention_phase(sequence: u32, paged: bool) -> &'static str {
 }
 
 fn quant_call_site(rows: u32, bits: u8, columns: u32) -> &'static str {
-    if rows <= 8 && columns == crate::VOCAB {
-        "quant.vocab-decode"
-    } else {
-        quant_site(rows, bits)
+    match (rows <= 8, columns) {
+        (true, crate::VOCAB) => "quant.vocab-decode",
+        (true, crate::HIDDEN) => "quant.output-decode",
+        _ => quant_site(rows, bits),
     }
 }
 
@@ -266,6 +268,10 @@ mod tests {
             assert_eq!(
                 quant_call_site(rows, crate::Q4_BITS, crate::VOCAB),
                 "quant.vocab-decode"
+            );
+            assert_eq!(
+                quant_call_site(rows, crate::Q4_BITS, crate::HIDDEN),
+                "quant.output-decode"
             );
             assert_eq!(
                 quant_call_site(rows, crate::Q4_BITS, 5120),
