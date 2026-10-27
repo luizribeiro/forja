@@ -3,6 +3,9 @@
 #[cfg(test)]
 #[allow(dead_code)]
 mod analysis_input;
+#[cfg(test)]
+#[allow(dead_code)]
+mod analysis_metrics;
 mod args;
 mod benchmark;
 mod benchmark_record;
