@@ -20,6 +20,29 @@ inline bool paged_pages_are_consecutive(uint first, uint logical, uint physical)
     return ulong(physical) == ulong(first) + logical;
 }
 
+struct AuthenticatedPagedPage {
+    uint physical;
+    uint valid;
+};
+
+AuthenticatedPagedPage authenticate_paged_page(
+    uint logical_page, uint logical_pages, uint physical_pages,
+    device const uint2 *table, device const uint *generations,
+    device atomic_uint *error_flag) {
+    bool valid = logical_page < logical_pages;
+    uint2 entry = uint2(0);
+    if (valid) {
+        entry = table[logical_page];
+        valid = entry.x < physical_pages;
+        if (valid) valid = generations[entry.x] == entry.y;
+    }
+    if (!valid) {
+        atomic_store_explicit(error_flag, 1, memory_order_relaxed);
+        atomic_fetch_min_explicit(error_flag + 1, logical_page, memory_order_relaxed);
+    }
+    return {valid ? entry.x : 0, uint(valid)};
+}
+
 kernel void paged_copy(
     device uchar *ordinary [[buffer(0)]],
     device uchar *pool [[buffer(1)]],
@@ -46,18 +69,10 @@ kernel void paged_copy(
     }
     if (thread_index == 0) {
         uint logical_page = logical_token / params.page_tokens;
-        valid = logical_page < params.logical_pages;
-        uint2 entry = uint2(0);
-        if (valid != 0) {
-            entry = table[logical_page];
-            valid = entry.x < params.physical_pages
-                && generations[entry.x] == entry.y;
-        }
-        physical_page = valid != 0 ? entry.x : 0;
-        if (valid == 0) {
-            atomic_store_explicit(error_flag, 1, memory_order_relaxed);
-            atomic_fetch_min_explicit(error_flag + 1, logical_page, memory_order_relaxed);
-        }
+        auto page = authenticate_paged_page(logical_page, params.logical_pages,
+            params.physical_pages, table, generations, error_flag);
+        valid = page.valid;
+        physical_page = page.physical;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (valid == 0 || element >= params.elements) {
@@ -116,18 +131,10 @@ kernel void paged_sdpa_validate(
     if (logical_page >= pages) {
         return;
     }
-    bool valid = logical_page < params.logical_pages;
-    if (valid) {
-        uint2 entry = table[logical_page];
-        valid = entry.x < params.physical_pages
-            && generations[entry.x] == entry.y;
-        if (valid && !paged_pages_are_consecutive(table[0].x, logical_page, entry.x)) {
-            atomic_store_explicit(error_flag + 2, 0, memory_order_relaxed);
-        }
-    }
-    if (!valid) {
-        atomic_store_explicit(error_flag, 1, memory_order_relaxed);
-        atomic_fetch_min_explicit(error_flag + 1, logical_page, memory_order_relaxed);
+    auto page = authenticate_paged_page(logical_page, params.logical_pages,
+        params.physical_pages, table, generations, error_flag);
+    if (page.valid != 0 && !paged_pages_are_consecutive(table[0].x, logical_page, page.physical)) {
+        atomic_store_explicit(error_flag + 2, 0, memory_order_relaxed);
     }
 }
 
@@ -336,14 +343,10 @@ void paged_sdpa_2pass_1_gqa_body(
     if (simd_group == 0 && simd_lane == 0) {
         valid = atomic_load_explicit(error_flag, memory_order_relaxed) == 0;
         if (valid != 0) {
-            uint2 entry = table[0];
-            valid = entry.x < params.physical_pages
-                && generations[entry.x] == entry.y;
-            first_page = valid != 0 ? entry.x : 0;
-            if (valid == 0) {
-                atomic_store_explicit(error_flag, 1, memory_order_relaxed);
-                atomic_fetch_min_explicit(error_flag + 1, 0, memory_order_relaxed);
-            }
+            auto page = authenticate_paged_page(0, params.logical_pages,
+                params.physical_pages, table, generations, error_flag);
+            valid = page.valid;
+            first_page = page.physical;
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -371,20 +374,10 @@ void paged_sdpa_2pass_1_gqa_body(
         if (simd_group == 0 && simd_lane == 0) {
             for (uint index = 0; index < batch_pages; ++index) {
                 uint logical_page = batch_start + index;
-                bool accepted = logical_page < params.logical_pages;
-                uint2 entry = uint2(0);
-                if (accepted) {
-                    entry = table[logical_page];
-                    accepted = entry.x < params.physical_pages
-                        && generations[entry.x] == entry.y;
-                }
-                page_valid[index] = accepted;
-                physical_pages[index] = accepted ? entry.x : 0;
-                if (!accepted) {
-                    atomic_store_explicit(error_flag, 1, memory_order_relaxed);
-                    atomic_fetch_min_explicit(
-                        error_flag + 1, logical_page, memory_order_relaxed);
-                }
+                auto page = authenticate_paged_page(logical_page, params.logical_pages,
+                    params.physical_pages, table, generations, error_flag);
+                page_valid[index] = page.valid;
+                physical_pages[index] = page.physical;
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
