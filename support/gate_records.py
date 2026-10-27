@@ -36,9 +36,15 @@ def session_key(row):
 def command_sampler(row: dict, directory: Path, guard: list[str], warmups: int,
                     sequential: bool, memo: dict | None = None, workers=None):
     """Every original command, log and native record remains independently reviewable."""
+    drift_seen = False
     def sample(side, reps, phase, block, leg):
+        nonlocal drift_seen
+        drift_seen = drift_seen or phase == "drift"
         adapter = row["baseline" if side == "A" else "candidate"]
-        phase_name = phase if phase != "confirmation" else f"confirmation-{digest(row['id'])[:12]}"
+        phase_name = phase
+        if phase == "confirmation" or (phase == "primary" and drift_seen):
+            label = "confirmation" if phase == "confirmation" else "promoted-primary"
+            phase_name = f"{label}-{digest(row['id'])[:12]}"
         stem = f"{phase_name}-{block:02}-{leg}-{side}"
         output, log = directory / f"{stem}.json", directory / f"{stem}.log"
         raw = sequential or phase == "drift"

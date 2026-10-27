@@ -77,3 +77,23 @@ def test_failed_worker_request_keeps_its_command_and_error(tmp_path):
     event = json.loads((tmp_path / "primary-00-0-A.command.json").read_text())
     assert event["execution"] == "resident-worker" and event["returncode"] == -1
     assert event["error"] == {"type": "ValueError", "message": "lost response"}
+
+
+def test_drift_promoted_rows_get_primary_measurements_after_their_screen(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    import time
+    def fake(command, **_):
+        now = time.time()
+        from pathlib import Path
+        Path(command[1]).write_text(json.dumps({"score": 100, "window": [now, now + .001]}))
+        return SimpleNamespace(returncode=0)
+    monkeypatch.setattr("gate_records.subprocess.run", fake)
+    adapter = {"command": ["fake", "{output}", "{reps}"], "metric": "/score", "window": "/window"}
+    row = {"id": "earlier", "baseline": adapter, "candidate": adapter}
+    memo = {}
+    earlier = command_sampler(row, tmp_path, [], 1, True, memo)("A", 1, "primary", 0, 0)
+    promoted = command_sampler({**row, "id": "promoted"}, tmp_path, [], 1, True, memo)
+    promoted("A", 1, "drift", 0, 0)
+    fresh = promoted("A", 1, "primary", 0, 0)
+    assert not fresh["reused_session"] and fresh["record_file"] != earlier["record_file"]
+    assert "promoted-primary" in fresh["record_file"]

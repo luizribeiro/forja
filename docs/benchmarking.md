@@ -141,7 +141,8 @@ Selection exceptions include their type, message and traceback in the report.
 Unaffected rows get five randomized blocks. Promote when their median log score
 falls below `-D`, with D derived from raw block noise, never marginal noise.
 Without comparable raw history, promote immediately: the first gate collects
-history across all rows. Promoted rows start fresh. Do not reuse screening samples
+history across all rows. Promoted rows get a fresh primary measurement namespace, including when other
+rows have already collected shared primary observations. Do not reuse screening samples
 for sequential decisions. `history.json` preserves dated block scores for future plans. History must have
 a pinned artifact hash, matching identity/method, at least six finite scores and
 nonzero SD. Stale/undated history (seven days by default) supplies no D; identity
