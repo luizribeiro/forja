@@ -10,7 +10,7 @@ from gate_select import GLOBAL_KEYS, select
 
 def snapshots():
     rows = [{"id": name, "profile": "profile"} for name in ["prefill", "decode-short", "decode-long"]]
-    proof = {"guest_source_hash": "guest", "rows": {
+    proof = {"guest_source_hash": "guest", "sites": ["prefill", "decode"], "rows": {
         "prefill": [{"site": "prefill", "ranges": {"query": [1, 2048]}}],
         "decode-short": [{"site": "decode", "ranges": {"position": [511, 638]} }],
         "decode-long": [{"site": "decode", "ranges": {"position": [63999, 64126]}}]}}

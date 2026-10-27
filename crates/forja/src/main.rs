@@ -3,6 +3,7 @@
 mod args;
 mod benchmark;
 mod benchmark_record;
+mod benchmark_snapshot;
 mod benchmark_stats;
 mod config_show;
 mod engine;
@@ -95,6 +96,7 @@ fn run(command: args::Command) -> Result<(), Box<dyn Error>> {
     match command {
         args::Command::Bench(options) => runtime.block_on(benchmark::run(&options)),
         args::Command::BenchKernel(options, config) => kernel_benchmark::run(&options, &config),
+        args::Command::BenchSnapshot(options, config) => benchmark_snapshot::run(&options, &config),
         args::Command::Build(_) => unreachable!("build commands return before runtime"),
         args::Command::Catalog(_) => unreachable!("catalog commands return before runtime"),
         args::Command::Config(_) => unreachable!("configuration commands return before runtime"),

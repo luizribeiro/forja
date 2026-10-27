@@ -321,6 +321,7 @@ enum AxisClass {
 pub(crate) enum Command {
     Bench(Bench),
     BenchKernel(crate::kernel_benchmark::Options, Box<DevConfig>),
+    BenchSnapshot(crate::benchmark_snapshot::Options, Box<DevConfig>),
     Build(Build),
     Catalog(Catalog),
     Config(ConfigShow),
@@ -449,6 +450,8 @@ enum ParsedCommand {
     Bench(BenchArgs),
     /// Time a single catalog variant as a kernel diagnostic.
     BenchKernel(crate::kernel_benchmark::Options),
+    /// Snapshot production-resolved picks and catalog properties for gate selection.
+    BenchSnapshot(crate::benchmark_snapshot::Options),
     /// Build a reproducible profile-backed engine component.
     Build(BuildArgs),
     /// List selectable backend algorithms and their constraints.
@@ -535,6 +538,9 @@ fn parse_with(
     Ok(match cli.command {
         ParsedCommand::BenchKernel(options) => {
             Command::BenchKernel(options, Box::new(layered.config))
+        }
+        ParsedCommand::BenchSnapshot(options) => {
+            Command::BenchSnapshot(options, Box::new(layered.config))
         }
         ParsedCommand::Bench(options) => Command::Bench(options.with_config(
             &layered,
@@ -911,7 +917,8 @@ impl ParsedCommand {
             | Self::Config(_)
             | Self::Profile(_)
             | Self::Serve(_)
-            | Self::BenchKernel(_) => {}
+            | Self::BenchKernel(_)
+            | Self::BenchSnapshot(_) => {}
         }
         values
             .into_iter()

@@ -8,7 +8,7 @@ import traceback
 from bench_cache import digest
 
 GLOBAL_KEYS = ("host_hash", "guest_source_hash", "toolchain_hash", "non_pick_profile",
-               "host_config", "tunings", "proof_hash")
+               "host_config", "tunings", "proof_hash", "build_environment")
 
 
 def pick(variants: dict, site: str, parameters: dict, value: int | None = None) -> str:
@@ -73,6 +73,8 @@ def select(rows: list[dict], baseline: dict, candidate: dict, all_rows=False) ->
                 fallback.append("guest proof does not match source")
             if digest(snapshot["proof"]) != snapshot["proof_hash"]:
                 fallback.append("guest proof fingerprint mismatch")
+            if set(snapshot["proof"]["sites"]) != set(snapshot["variants"]["fixed"]) | set(snapshot["variants"]["rules"]):
+                fallback.append("guest proof omits resolved sites")
         for key in GLOBAL_KEYS:
             if any(key not in snapshot or snapshot[key] is None or snapshot[key] == ""
                    for snapshot in [baseline, candidate]):
