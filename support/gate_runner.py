@@ -24,10 +24,17 @@ def run_row(row: dict, sample, seed: int, affected=True, no_early_stop=False,
               "drift_blocks": [], "runs": [], "confirmed_regression": False,
               "improvement_claim": False, "diagnostic": question == "equivalence",
               "drift_protection": "verified-history" if row.get("D") is not None else "unavailable"}
+    expected_outputs = {}
 
     def block(phase, index):
         order = "ABBA" if rng.getrandbits(1) else "BAAB"
         samples = [sample(side, 1, phase, index, leg) for leg, side in enumerate(order)]
+        for item in samples:
+            if item.get("output_digests"):
+                identity = "both" if row.get("require_equal_outputs") else item["side"]
+                expected = expected_outputs.setdefault(identity, item["output_digests"])
+                if item["output_digests"] != expected:
+                    raise ValueError("gate output digest equality contract failed")
         record = {"orientation": order, "samples": samples, "log_score": block_score(samples)}
         return record
 
