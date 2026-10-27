@@ -2,147 +2,132 @@
   "schema_version": 5,
   "implementation": "forja",
   "provenance": {
-    "commit": "3ab55d0c183017d7be9c7410b47613c7684e1b71",
+    "commit": "dee95c8e3290bb3ff156681c5d5a8fdf2f1f1188",
     "dirty": false,
-    "binary_sha256": "8edebd11824bdd8836bfc280251f65f3b16a593e147106cb949ae18ca14a4d6a",
+    "binary_sha256": "f2d13aab87c7221dfcfeedaa361f00f36d82557e3d3e4d5d5fc038561442d818",
     "device": "Apple M3 Ultra",
     "gpu_cores": 80,
     "macos": "27.0.1",
-    "date": "2026-10-24T14:34Z",
-    "duration_s": 548,
+    "date": "2026-10-27T02:05Z",
+    "duration_s": 543,
     "machine_load": {
       "before": {
         "load_average": [
-          2.94,
-          4.18,
-          3.85
+          2.23,
+          2.18,
+          2.02
         ],
         "gpu_device_percent": 0.0,
         "busiest_processes": [
           {
-            "pid": 662,
-            "cpu_percent": 43.5,
-            "command": "mds"
-          },
-          {
-            "pid": 56976,
-            "cpu_percent": 36.2,
+            "pid": 57021,
+            "cpu_percent": 17.1,
             "command": "ds4-server"
           },
           {
-            "pid": 794,
-            "cpu_percent": 24.2,
-            "command": "syspolicyd"
-          },
-          {
-            "pid": 949,
-            "cpu_percent": 18.7,
-            "command": "mds_stores"
-          },
-          {
-            "pid": 5274,
-            "cpu_percent": 5.3,
-            "command": "mdworker_shared"
-          },
-          {
-            "pid": 638,
-            "cpu_percent": 4.4,
-            "command": "fseventsd"
-          },
-          {
-            "pid": 5267,
-            "cpu_percent": 3.9,
-            "command": "mdworker_shared"
-          },
-          {
-            "pid": 5268,
-            "cpu_percent": 3.7,
-            "command": "mdworker_shared"
-          },
-          {
-            "pid": 5269,
-            "cpu_percent": 3.7,
-            "command": "mdworker_shared"
-          },
-          {
-            "pid": 5272,
-            "cpu_percent": 3.7,
-            "command": "mdworker_shared"
-          },
-          {
-            "pid": 5366,
-            "cpu_percent": 3.7,
-            "command": "mdworker_shared"
-          },
-          {
-            "pid": 5276,
-            "cpu_percent": 3.6,
-            "command": "mdworker_shared"
-          },
-          {
-            "pid": 5273,
-            "cpu_percent": 3.4,
-            "command": "mdworker_shared"
-          },
-          {
-            "pid": 5360,
-            "cpu_percent": 3.4,
-            "command": "mdworker_shared"
-          },
-          {
             "pid": 57122,
-            "cpu_percent": 3.4,
+            "cpu_percent": 4.4,
             "command": "python3.13"
           },
           {
-            "pid": 5194,
-            "cpu_percent": 3.3,
-            "command": "mdworker_shared"
+            "pid": 57166,
+            "cpu_percent": 4.4,
+            "command": "python3.13"
+          },
+          {
+            "pid": 3937,
+            "cpu_percent": 3.0,
+            "command": "claude"
+          },
+          {
+            "pid": 34523,
+            "cpu_percent": 2.5,
+            "command": "codex"
+          },
+          {
+            "pid": 50125,
+            "cpu_percent": 2.4,
+            "command": "claude"
+          },
+          {
+            "pid": 3636,
+            "cpu_percent": 2.3,
+            "command": "claude"
+          },
+          {
+            "pid": 1825,
+            "cpu_percent": 1.6,
+            "command": "firefox"
+          },
+          {
+            "pid": 89534,
+            "cpu_percent": 1.3,
+            "command": "claude"
+          },
+          {
+            "pid": 1997,
+            "cpu_percent": 1.2,
+            "command": "Steam Helper"
+          },
+          {
+            "pid": 3556,
+            "cpu_percent": 1.2,
+            "command": "claude"
           }
         ]
       },
       "after": {
         "load_average": [
-          1.02,
-          2.21,
-          3.09
+          2.34,
+          2.17,
+          2.01
         ],
-        "gpu_device_percent": 96.0,
+        "gpu_device_percent": 97.0,
         "busiest_processes": [
           {
             "pid": 56976,
-            "cpu_percent": 98.7,
+            "cpu_percent": 99.7,
             "command": "ds4-server"
           },
           {
-            "pid": 57122,
-            "cpu_percent": 3.6,
-            "command": "python3.13"
+            "pid": 662,
+            "cpu_percent": 50.5,
+            "command": "mds"
           },
           {
             "pid": 57166,
-            "cpu_percent": 3.6,
+            "cpu_percent": 4.4,
             "command": "python3.13"
           },
           {
-            "pid": 89534,
-            "cpu_percent": 2.0,
-            "command": "claude"
+            "pid": 57122,
+            "cpu_percent": 4.3,
+            "command": "python3.13"
           },
           {
-            "pid": 37781,
-            "cpu_percent": 1.2,
+            "pid": 869,
+            "cpu_percent": 1.9,
+            "command": "searchpartyd"
+          },
+          {
+            "pid": 34523,
+            "cpu_percent": 1.7,
             "command": "codex"
           },
           {
-            "pid": 674,
-            "cpu_percent": 1.1,
-            "command": "opendirectoryd"
+            "pid": 57021,
+            "cpu_percent": 1.4,
+            "command": "ds4-server"
           },
           {
             "pid": 1997,
-            "cpu_percent": 1.1,
+            "cpu_percent": 1.3,
             "command": "Steam Helper"
+          },
+          {
+            "pid": 674,
+            "cpu_percent": 1.0,
+            "command": "opendirectoryd"
           }
         ]
       }
@@ -150,7 +135,7 @@
   },
   "inputs": [
     {
-      "engine_sha256": "c25bd8b64a325f0df5792d18b063d1aff337eef34d5dbda900fea5a6e5773c31",
+      "engine_sha256": "d627e4e8572a879742031bd3387494041919d9afac19b80d43b1c924ac0d7b4c",
       "profile_name": "olmoe-1b-7b-0924.metal-apple-m3-ultra.bf16",
       "profile_family": "olmoe",
       "numerics": {
@@ -163,23 +148,23 @@
       "model_revision": "6d84c48581ece794365f2b8e9cfb043c68ade9c5"
     }
   ],
-  "config": "[backend]\nkind = \"metal\"\n\n[backend.metal]\ngraph_replay = \"tier2\"\npool_capacity = \"auto\"\n\n[bench]\nbreakdown = false\ncontexts = [9, 512, 2048]\ndecode_prefill = 8\npp = 512\nreps = 30\nselection = [\"gpu-sequential\", \"gpu-pipelined\"]\ntg = 128\nwarmups = 3\n\n[bench.sampling]\nseed = 0\ntemperature = 0.0\ntop_k = 0\ntop_p = 1.0\n\n[bench.vary]\n\n[engine]\nreplay = true\n\n[engine.tunings]\nadd = []\nbase = \"profile\"\nremove = []\n\n[engine.variant-picks]\n\n[engine.variant-rules]\n\n[limits]\ndispatches_per_list = 4096\ngpu_time_budget = \"3600000ms\"\nguest_call_timeout = \"300000ms\"\nguest_memory_bytes = 4294967296\ninstances = 10000\nlive_bytes = \"auto\"\nlive_graphs = 16\nlive_kernels = 64\nlive_tensor_handles = 20000\nread_bytes = 1073741824\nsubmission_timeout = \"60000ms\"\ntable_elements = 10000\ntensor_elements = 1000000000\ntensor_rank = 4\nwork_per_dispatch = \"unlimited\"\n\n[run]\nmax_tokens = 128\ntemperature = 0.0\ntop_k = 0\ntop_p = 1.0\n\n[verify]\nprompts = []\n",
+  "config": "[backend]\nkind = \"metal\"\n\n[backend.metal]\ngraph_replay = \"tier2\"\npool_capacity = \"auto\"\n\n[bench]\nbreakdown = false\ncontexts = [9, 512, 2048]\ndecode_prefill = 8\npp = 512\nreps = 30\nselection = [\"gpu-sequential\", \"gpu-pipelined\"]\ntg = 128\nwarmups = 3\n\n[bench.sampling]\nseed = 0\ntemperature = 0.0\ntop_k = 0\ntop_p = 1.0\n\n[bench.vary]\n\n[engine]\nreplay = true\n\n[engine.tunings]\nadd = []\nbase = \"profile\"\nremove = []\n\n[engine.variant-picks]\n\n[engine.variant-rules]\n\n[limits]\ndispatches_per_list = 4096\ngpu_time_budget = \"3600000ms\"\nguest_call_timeout = \"300000ms\"\nguest_memory_bytes = 4294967296\ninstances = 10000\nlive_bytes = 103079215104\nlive_graphs = 16\nlive_kernels = 64\nlive_tensor_handles = 20000\nread_bytes = 1073741824\nsubmission_timeout = \"60000ms\"\ntable_elements = 10000\ntensor_elements = 1000000000\ntensor_rank = 4\nwork_per_dispatch = \"unlimited\"\n\n[run]\nmax_tokens = 128\ntemperature = 0.0\ntop_k = 0\ntop_p = 1.0\n\n[verify]\nprompts = []\n",
   "origins": {
     "backend.kind": "default",
     "backend.metal.graph_replay": "auto",
     "backend.metal.pool_capacity": "default",
     "bench.breakdown": "default",
-    "bench.contexts": "--set #1",
-    "bench.decode_prefill": "default",
-    "bench.pp": "default",
-    "bench.reps": "default",
+    "bench.contexts": "--set #2",
+    "bench.decode_prefill": "config file",
+    "bench.pp": "config file",
+    "bench.reps": "config file",
     "bench.sampling.seed": "default",
     "bench.sampling.temperature": "default",
     "bench.sampling.top_k": "default",
     "bench.sampling.top_p": "default",
-    "bench.selection": "default",
-    "bench.tg": "default",
-    "bench.warmups": "default",
+    "bench.selection": "config file",
+    "bench.tg": "config file",
+    "bench.warmups": "config file",
     "engine.replay": "default",
     "engine.tunings.add": "default",
     "engine.tunings.base": "default",
@@ -189,7 +174,7 @@
     "limits.guest_call_timeout": "default",
     "limits.guest_memory_bytes": "default",
     "limits.instances": "default",
-    "limits.live_bytes": "default",
+    "limits.live_bytes": "--set #1",
     "limits.live_graphs": "default",
     "limits.live_kernels": "default",
     "limits.live_tensor_handles": "default",
@@ -206,49 +191,49 @@
     "verify.prompts": "default"
   },
   "auto_notes": [
-    "backend.metal.graph_replay: auto -> tier2 (Apple M3 Ultra/macOS 27.0.1 @3ab55d0c183017d7be9c7410b47613c7684e1b71)"
+    "backend.metal.graph_replay: auto -> tier2 (Apple M3 Ultra/macOS 27.0.1 @dee95c8e3290bb3ff156681c5d5a8fdf2f1f1188)"
   ],
-  "config_hash": "sha256:47ca1daf439a4e8e2d851f71cc2db68fb7d283fbf4d7cf7c6943db3ae5f6d8e5",
-  "perf_hash": "sha256:ccf5b0aac680fa21c9fafd0f2cd6ed1880100d2c66941f3b3feb05be506b9792",
+  "config_hash": "sha256:f05f78670bf35daf01e51e57520549f514e7979f6ba7d5e0ffa51769acf112dd",
+  "perf_hash": "sha256:362015184afa3bab5181ed259039c2df0d0367a08bb72c5134255b8881bb6244",
   "axes": {},
   "allow_diff": [],
   "results": [
     {
       "input": 0,
       "point": {},
-      "perf_hash": "sha256:6f18bbc4baf3c67dd7f4203f3e4b6f8efe7cfb1c8ff39058d7c4463e1180dc1f",
+      "perf_hash": "sha256:df245b9bc87d0a89f7bb33e3f240d65e0c396ec7e8bf6222baae32901953186b",
       "output_digest": "sha256:1bf38ff1897ecd7f923142eec9d87dfe94da16036abf70cbfa86c7d7ca560ed3",
-      "peak_physical_footprint_bytes": 31058438992,
+      "peak_physical_footprint_bytes": 31049821056,
       "selection": "gpu-sequential",
       "pp": {
         "tokens_per_second": {
           "wall": {
-            "median": 916.235738820817,
+            "median": 924.0225325433224,
             "ci95": [
-              907.114714908577,
-              920.4073815830692
+              919.0414798727572,
+              927.5083679868363
             ]
           },
           "gpu": {
-            "median": 919.6755758068512,
+            "median": 927.2860109163149,
             "ci95": [
-              910.9343040211321,
-              923.1982870344284
+              922.1569828176217,
+              931.8279308528203
             ]
           }
         },
         "wall_time_seconds": {
-          "median": 0.558810833,
+          "median": 0.554099042,
           "ci95": [
-            0.556275417,
-            0.564426959
+            0.552016583,
+            0.557102167
           ]
         },
         "gpu_time_seconds": {
-          "median": 0.5567198744999999,
+          "median": 0.5521490204999999,
           "ci95": [
-            0.55459375,
-            0.562060291
+            0.549457666,
+            0.55522
           ]
         },
         "submissions": {
@@ -262,32 +247,32 @@
       "tg": {
         "tokens_per_second": {
           "wall": {
-            "median": 84.89108895102345,
+            "median": 86.43998940507961,
             "ci95": [
-              84.10616826753122,
-              85.51861888520864
+              86.02295788092525,
+              86.7769768138528
             ]
           },
           "gpu": {
-            "median": 98.2409276436475,
+            "median": 98.49945578407346,
             "ci95": [
-              97.85018174115594,
-              98.50515889486628
+              97.95006934455508,
+              98.66993764293511
             ]
           }
         },
         "wall_time_seconds": {
-          "median": 1.507814937,
+          "median": 1.480796125,
           "ci95": [
-            1.4967500839999999,
-            1.5218859999999999
+            1.475045625,
+            1.487974875
           ]
         },
         "gpu_time_seconds": {
-          "median": 1.3029196005,
+          "median": 1.2994996225,
           "ci95": [
-            1.299424329,
-            1.308122251
+            1.297254291,
+            1.3067882530000001
           ]
         },
         "submissions": {
@@ -304,32 +289,32 @@
           "tg": {
             "tokens_per_second": {
               "wall": {
-                "median": 84.89108895102345,
+                "median": 86.43998940507961,
                 "ci95": [
-                  84.10616826753122,
-                  85.51861888520864
+                  86.02295788092525,
+                  86.7769768138528
                 ]
               },
               "gpu": {
-                "median": 98.2409276436475,
+                "median": 98.49945578407346,
                 "ci95": [
-                  97.85018174115594,
-                  98.50515889486628
+                  97.95006934455508,
+                  98.66993764293511
                 ]
               }
             },
             "wall_time_seconds": {
-              "median": 1.507814937,
+              "median": 1.480796125,
               "ci95": [
-                1.4967500839999999,
-                1.5218859999999999
+                1.475045625,
+                1.487974875
               ]
             },
             "gpu_time_seconds": {
-              "median": 1.3029196005,
+              "median": 1.2994996225,
               "ci95": [
-                1.299424329,
-                1.308122251
+                1.297254291,
+                1.3067882530000001
               ]
             },
             "submissions": {
@@ -346,32 +331,32 @@
           "tg": {
             "tokens_per_second": {
               "wall": {
-                "median": 84.46529459324722,
+                "median": 84.01149707452778,
                 "ci95": [
-                  83.7612395681879,
-                  84.63585394416339
+                  83.62886554830482,
+                  84.26520861522886
                 ]
               },
               "gpu": {
-                "median": 95.84582006562216,
+                "median": 95.73993777313146,
                 "ci95": [
-                  95.59782608780891,
-                  96.37384007674231
+                  95.51681315674853,
+                  96.1876285900845
                 ]
               }
             },
             "wall_time_seconds": {
-              "median": 1.515415375,
+              "median": 1.5236010835,
               "ci95": [
-                1.5123614170000002,
-                1.528153125
+                1.519013625,
+                1.530572
               ]
             },
             "gpu_time_seconds": {
-              "median": 1.335478166,
+              "median": 1.3369551450000001,
               "ci95": [
-                1.328161251,
-                1.338942581
+                1.330732464,
+                1.34007821
               ]
             },
             "submissions": {
@@ -388,32 +373,32 @@
           "tg": {
             "tokens_per_second": {
               "wall": {
-                "median": 79.7352756204588,
+                "median": 80.32985447346618,
                 "ci95": [
-                  78.83396354404776,
-                  80.2233049286197
+                  80.12068593945689,
+                  80.58863069134578
                 ]
               },
               "gpu": {
-                "median": 91.13651562226802,
+                "median": 91.21265541593533,
                 "ci95": [
-                  90.74822961760236,
-                  91.36264903545508
+                  90.92691497384045,
+                  91.48627593968901
                 ]
               }
             },
             "wall_time_seconds": {
-              "median": 1.6053130625,
+              "median": 1.59343,
               "ci95": [
-                1.5955463330000001,
-                1.623665667
+                1.588313375,
+                1.597589917
               ]
             },
             "gpu_time_seconds": {
-              "median": 1.4044864375000001,
+              "median": 1.4033140405000002,
               "ci95": [
-                1.401010165,
-                1.410495836
+                1.399116957,
+                1.407723995
               ]
             },
             "submissions": {
@@ -431,30 +416,30 @@
         {
           "parameters": 0,
           "nanoseconds": {
-            "median": 1.93334,
+            "median": 1.76292,
             "ci95": [
-              1.93167,
-              1.95167
+              1.72333,
+              1.765
             ]
           }
         },
         {
           "parameters": 4,
           "nanoseconds": {
-            "median": 17.13271,
+            "median": 16.995829999999998,
             "ci95": [
-              17.10959,
-              17.15583
+              16.73125,
+              17.20041
             ]
           }
         },
         {
           "parameters": 8,
           "nanoseconds": {
-            "median": 20.588335,
+            "median": 19.651039999999995,
             "ci95": [
-              20.32166,
-              22.13875
+              19.57958,
+              19.88333
             ]
           }
         }
@@ -466,39 +451,39 @@
     {
       "input": 0,
       "point": {},
-      "perf_hash": "sha256:6f18bbc4baf3c67dd7f4203f3e4b6f8efe7cfb1c8ff39058d7c4463e1180dc1f",
+      "perf_hash": "sha256:df245b9bc87d0a89f7bb33e3f240d65e0c396ec7e8bf6222baae32901953186b",
       "output_digest": "sha256:1bf38ff1897ecd7f923142eec9d87dfe94da16036abf70cbfa86c7d7ca560ed3",
-      "peak_physical_footprint_bytes": 32832252776,
+      "peak_physical_footprint_bytes": 32817851384,
       "selection": "gpu-pipelined",
       "pp": {
         "tokens_per_second": {
           "wall": {
-            "median": 916.8442006090172,
+            "median": 920.2847865543504,
             "ci95": [
-              913.4862099488373,
-              919.8513620089103
+              912.6389583275825,
+              922.1498543511133
             ]
           },
           "gpu": {
-            "median": 924.1067755860565,
+            "median": 925.6596617378452,
             "ci95": [
-              919.5935623479083,
-              925.5007321840552
+              919.066227420504,
+              929.9047937318604
             ]
           }
         },
         "wall_time_seconds": {
-          "median": 0.558437312,
+          "median": 0.556349521,
           "ci95": [
-            0.556611667,
-            0.560490125
+            0.555224292,
+            0.561010458
           ]
         },
         "gpu_time_seconds": {
-          "median": 0.5540485415,
+          "median": 0.55311925,
           "ci95": [
-            0.553214041,
-            0.556767708
+            0.550594,
+            0.557087166
           ]
         },
         "submissions": {
@@ -512,32 +497,32 @@
       "tg": {
         "tokens_per_second": {
           "wall": {
-            "median": 98.48547809158705,
+            "median": 98.32650013664838,
             "ci95": [
-              98.41429013935904,
-              98.5621919157154
+              98.13572784509275,
+              98.4648237782549
             ]
           },
           "gpu": {
-            "median": 99.13536182643469,
+            "median": 98.99065127310044,
             "ci95": [
-              99.06235185413925,
-              99.2056664292551
+              98.76602903881593,
+              99.09572894458603
             ]
           }
         },
         "wall_time_seconds": {
-          "median": 1.299684,
+          "median": 1.301785437,
           "ci95": [
-            1.2986724170000001,
-            1.3006241250000001
+            1.299956625,
+            1.304316
           ]
         },
         "gpu_time_seconds": {
-          "median": 1.2911638965,
+          "median": 1.2930515185,
           "ci95": [
-            1.29024888,
-            1.292115497
+            1.291680291,
+            1.295992167
           ]
         },
         "submissions": {
@@ -554,32 +539,32 @@
           "tg": {
             "tokens_per_second": {
               "wall": {
-                "median": 98.48547809158705,
+                "median": 98.32650013664838,
                 "ci95": [
-                  98.41429013935904,
-                  98.5621919157154
+                  98.13572784509275,
+                  98.4648237782549
                 ]
               },
               "gpu": {
-                "median": 99.13536182643469,
+                "median": 98.99065127310044,
                 "ci95": [
-                  99.06235185413925,
-                  99.2056664292551
+                  98.76602903881593,
+                  99.09572894458603
                 ]
               }
             },
             "wall_time_seconds": {
-              "median": 1.299684,
+              "median": 1.301785437,
               "ci95": [
-                1.2986724170000001,
-                1.3006241250000001
+                1.299956625,
+                1.304316
               ]
             },
             "gpu_time_seconds": {
-              "median": 1.2911638965,
+              "median": 1.2930515185,
               "ci95": [
-                1.29024888,
-                1.292115497
+                1.291680291,
+                1.295992167
               ]
             },
             "submissions": {
@@ -596,32 +581,32 @@
           "tg": {
             "tokens_per_second": {
               "wall": {
-                "median": 95.92425298170258,
+                "median": 95.72835331156233,
                 "ci95": [
-                  95.78934725172505,
-                  96.12422852580998
+                  95.54849454669097,
+                  95.87208865771399
                 ]
               },
               "gpu": {
-                "median": 96.64601801808124,
+                "median": 96.399189389627,
                 "ci95": [
-                  96.46208316100942,
-                  96.76166569262695
+                  96.23494896675693,
+                  96.55584778015255
                 ]
               }
             },
             "wall_time_seconds": {
-              "median": 1.334386375,
+              "median": 1.3371169164999999,
               "ci95": [
-                1.331610167,
-                1.3362655
+                1.33511225,
+                1.339633875
               ]
             },
             "gpu_time_seconds": {
-              "median": 1.324420896,
+              "median": 1.327811998,
               "ci95": [
-                1.322837914,
-                1.326946255
+                1.325657668,
+                1.33007812
               ]
             },
             "submissions": {
@@ -638,32 +623,32 @@
           "tg": {
             "tokens_per_second": {
               "wall": {
-                "median": 91.18443227825526,
+                "median": 91.44803001533049,
                 "ci95": [
-                  91.08550976222934,
-                  91.31669491025455
+                  91.33180323022792,
+                  91.55370572564716
                 ]
               },
               "gpu": {
-                "median": 91.74515417615322,
+                "median": 91.97568460343356,
                 "ci95": [
-                  91.64924972916931,
-                  91.88391661626451
+                  91.84235930622339,
+                  92.0854173684133
                 ]
               }
             },
             "wall_time_seconds": {
-              "median": 1.4037483955,
+              "median": 1.3997021040000002,
               "ci95": [
-                1.401715208,
-                1.405272917
+                1.3980865,
+                1.401483333
               ]
             },
             "gpu_time_seconds": {
-              "median": 1.3951690614999999,
+              "median": 1.3916721645,
               "ci95": [
-                1.39306208,
-                1.396629
+                1.39001379,
+                1.39369242
               ]
             },
             "submissions": {
@@ -681,30 +666,30 @@
         {
           "parameters": 0,
           "nanoseconds": {
-            "median": 1.93334,
+            "median": 1.76292,
             "ci95": [
-              1.93167,
-              1.95167
+              1.72333,
+              1.765
             ]
           }
         },
         {
           "parameters": 4,
           "nanoseconds": {
-            "median": 17.13271,
+            "median": 16.995829999999998,
             "ci95": [
-              17.10959,
-              17.15583
+              16.73125,
+              17.20041
             ]
           }
         },
         {
           "parameters": 8,
           "nanoseconds": {
-            "median": 20.588335,
+            "median": 19.651039999999995,
             "ci95": [
-              20.32166,
-              22.13875
+              19.57958,
+              19.88333
             ]
           }
         }
