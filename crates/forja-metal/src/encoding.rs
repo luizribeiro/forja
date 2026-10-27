@@ -3629,26 +3629,38 @@ impl MetalBackend {
         timestamps: Option<&GpuTimestamps>,
         internal_timestamp: &mut usize,
     ) -> Result<(Vec<BufferBinding>, BufferBinding), BackendError> {
-        let Op::PagedSdpa {
-            scale,
-            causal,
-            q_start,
-            key_length,
-            page_tokens,
-        } = dispatch.op()
-        else {
-            return Err(BackendError::InvalidInput);
+        let (scale, causal, q_start, key_length, page_tokens, _append) = match dispatch.op() {
+            Op::PagedSdpa {
+                scale,
+                causal,
+                q_start,
+                key_length,
+                page_tokens,
+            } => (scale, causal, q_start, key_length, page_tokens, false),
+            Op::PagedSdpaAppend {
+                scale,
+                q_start,
+                page_tokens,
+            } => (
+                scale,
+                true,
+                q_start,
+                q_start.checked_add(1).ok_or(BackendError::InvalidInput)?,
+                page_tokens,
+                true,
+            ),
+            _ => return Err(BackendError::InvalidInput),
         };
-        let (query_tensor, key_tensor, value_tensor, table_tensor, generation_tensor, activity) =
-            match dispatch.inputs() {
-                [query, key, value, table, generations] => {
-                    (query, key, value, table, generations, None)
-                }
-                [query, key, value, table, generations, activity] => {
-                    (query, key, value, table, generations, Some(activity))
-                }
-                _ => return Err(BackendError::InvalidInput),
-            };
+        let [
+            query_tensor,
+            key_tensor,
+            value_tensor,
+            table_tensor,
+            generation_tensor,
+        ] = dispatch
+            .paged_attention_inputs()
+            .ok_or(BackendError::InvalidInput)?;
+        let activity = dispatch.inputs().get(5);
         let query = self.encoder_tensor(query_tensor)?;
         let key = self.encoder_dense_tensor(key_tensor)?;
         let value = self.encoder_dense_tensor(value_tensor)?;
@@ -8494,7 +8506,9 @@ fn paged_sdpa_kernel(dispatch: &Dispatch, width: u32) -> Result<&'static str, Ba
             ),
             128,
         ) => {
-            let inputs = dispatch.inputs();
+            let inputs = dispatch
+                .paged_attention_inputs()
+                .ok_or(BackendError::InvalidInput)?;
             let query_heads = inputs
                 .first()
                 .and_then(|query| query.layout().shape().first())
