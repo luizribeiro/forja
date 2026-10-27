@@ -550,6 +550,7 @@ fn run_sdpa<B: Backend + 'static>(
         variant,
         rejected_output,
         64,
+        true,
     )
 }
 
@@ -613,6 +614,7 @@ fn run_sdpa_with_page_tokens<B: Backend + 'static>(
     variant: Option<&str>,
     rejected_output: Option<&mut Vec<f32>>,
     page_tokens: u32,
+    active: bool,
 ) -> Result<Vec<f32>, BackendError> {
     const WIDTH: u32 = 128;
 
@@ -682,7 +684,11 @@ fn run_sdpa_with_page_tokens<B: Backend + 'static>(
     };
     backend.write(&table, &table_bytes(&entries))?;
     backend.write(&generation_tensor, &generation_bytes(&generations))?;
-    backend.write(&activity, &1_u32.to_ne_bytes())?;
+    backend.write(&activity, &u32::from(active).to_ne_bytes())?;
+    backend.write(
+        &output_storage,
+        &encode(&vec![f32::NAN; query_values.len()], DType::F32),
+    )?;
     let mut commands = CommandList::new();
     if let Some([new_key, new_value]) = &append {
         commands
@@ -731,7 +737,9 @@ fn run_sdpa_with_page_tokens<B: Backend + 'static>(
     if let Some(operands) = append {
         for (pool, operand) in [&key, &value].into_iter().zip(operands) {
             let actual = backend.read(pool)?;
-            if result.is_ok() {
+            if !active {
+                assert_eq!(actual, operand.before);
+            } else if result.is_ok() {
                 assert_eq!(actual, operand.expected);
             } else if corrupt_pages.contains(&usize::try_from(q_start / page_tokens).unwrap()) {
                 assert_eq!(actual, operand.before);
@@ -1253,6 +1261,31 @@ fn metal_paged_append_keeps_attention_bits_and_stored_planes() {
 }
 
 #[test]
+fn metal_paged_append_gates_inactive_lanes_without_writing() {
+    let metal = forja_metal::MetalBackend::new().unwrap();
+    for_each_paged_gqa_safety_heads(|query_heads, kv_heads| {
+        let output = run_sdpa_with_page_tokens(
+            &metal,
+            DType::F16,
+            513,
+            1,
+            true,
+            false,
+            query_heads,
+            kv_heads,
+            (0, 0),
+            &[0, 8],
+            Some("paged-sdpa-append.vector-gqa-two-pass-32"),
+            None,
+            64,
+            false,
+        )
+        .unwrap();
+        assert!(output.iter().all(|&value| value == 0.0));
+    });
+}
+
+#[test]
 fn metal_paged_append_refuses_corrupt_destination_without_writing() {
     let backend = forja_metal::MetalBackend::new().unwrap();
     for_each_paged_gqa_safety_heads(|query_heads, kv_heads| {
@@ -1522,6 +1555,7 @@ fn metal_paged_steel_refuses_tiles_crossing_page_boundaries() {
             Some("paged-sdpa.steel-half"),
             None,
             page_tokens,
+            true,
         );
         assert_eq!(result.unwrap_err(), BackendError::UnsupportedOperation);
     }
