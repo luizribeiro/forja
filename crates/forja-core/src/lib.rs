@@ -11,6 +11,7 @@ mod paged_pool;
 mod profile_scope;
 pub mod program;
 mod quantized;
+pub mod roofline;
 mod symbolic;
 mod variant_proof;
 mod variants;
