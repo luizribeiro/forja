@@ -1,5 +1,8 @@
 //! Command-line entry point for Forja engine tooling.
 
+#[cfg(test)]
+#[allow(dead_code)]
+mod analysis_input;
 mod args;
 mod benchmark;
 mod benchmark_record;
