@@ -1,13 +1,8 @@
 //! Command-line entry point for Forja engine tooling.
 
-#[cfg(test)]
-#[allow(dead_code)]
+mod analysis;
 mod analysis_input;
-#[cfg(test)]
-#[allow(dead_code)]
 mod analysis_metrics;
-#[cfg(test)]
-#[allow(dead_code)]
 mod analysis_report;
 mod args;
 mod benchmark;
@@ -84,6 +79,9 @@ fn run(command: args::Command) -> Result<(), Box<dyn Error>> {
         #[cfg(not(target_os = "macos"))]
         return Err("metal is available only on macOS".into());
     }
+    if let args::Command::Analyze(options) = command {
+        return analysis::run(&options);
+    }
     if let args::Command::Calibrate(options) = command {
         return calibration::run(&options);
     }
@@ -113,6 +111,7 @@ fn run(command: args::Command) -> Result<(), Box<dyn Error>> {
         args::Command::BenchKernel(options, config) => kernel_benchmark::run(&options, &config),
         args::Command::BenchSnapshot(options, config) => benchmark_snapshot::run(&options, &config),
         args::Command::Build(_) => unreachable!("build commands return before runtime"),
+        args::Command::Analyze(_) => unreachable!("analysis returns before runtime"),
         args::Command::Calibrate(_) => unreachable!("calibration returns before runtime"),
         args::Command::Catalog(_) => unreachable!("catalog commands return before runtime"),
         args::Command::Config(_) => unreachable!("configuration commands return before runtime"),

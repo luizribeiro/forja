@@ -349,6 +349,7 @@ pub(crate) enum Command {
     Build(Build),
     Catalog(Catalog),
     Calibrate(crate::calibration::Options),
+    Analyze(crate::analysis::Options),
     Config(ConfigShow),
     ConfigCheck,
     ConfigSchema,
@@ -483,6 +484,8 @@ enum ParsedCommand {
     Catalog(CatalogArgs),
     /// Measure or reuse device ceilings with raw timings and confidence intervals.
     Calibrate(crate::calibration::Options),
+    /// Attribute a costed profile against measured device ceilings.
+    Analyze(crate::analysis::Options),
     /// Inspect configuration.
     Config(ConfigArgs),
     /// Profile one inference phase.
@@ -567,6 +570,7 @@ fn parse_with(
     let layered = layer::<DevConfig>(layers).map_err(|error| config_error(&error))?;
     let limits = layered.config.limits.clone();
     Ok(match cli.command {
+        ParsedCommand::Analyze(options) => Command::Analyze(options),
         ParsedCommand::Calibrate(options) => Command::Calibrate(options),
         ParsedCommand::BenchKernel(options) => {
             Command::BenchKernel(options, Box::new(layered.config))
@@ -946,6 +950,7 @@ impl ParsedCommand {
             }
             Self::Build(_)
             | Self::Calibrate(_)
+            | Self::Analyze(_)
             | Self::Catalog(_)
             | Self::Config(_)
             | Self::Profile(_)
