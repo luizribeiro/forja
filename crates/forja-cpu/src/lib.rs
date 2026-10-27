@@ -255,6 +255,52 @@ impl CpuBackend {
         }
     }
 
+    fn execute_paged_append(&self, dispatch: &forja_core::Dispatch) -> Result<(), BackendError> {
+        let Op::PagedSdpaAppend {
+            scale,
+            q_start,
+            page_tokens,
+        } = dispatch.op()
+        else {
+            return Err(BackendError::InvalidInput);
+        };
+        let inputs = dispatch.inputs();
+        for index in [1, 2] {
+            let pool = &dispatch.outputs()[index];
+            let shape = pool.layout().shape();
+            let width = shape[2]
+                .checked_mul(shape[3])
+                .ok_or(BackendError::InvalidInput)?;
+            let plane = self.view(pool, ViewOp::Reshape(vec![shape[0], shape[1], width]))?;
+            let copy_inputs = std::iter::once(&inputs[index])
+                .chain(&inputs[3..])
+                .cloned()
+                .collect::<Vec<_>>();
+            self.execute_paged_copy(
+                &copy_inputs,
+                &plane,
+                PagedCopyDirection::IntoPages,
+                q_start,
+                page_tokens,
+            )?;
+        }
+        let mut attention = dispatch
+            .paged_attention_inputs()
+            .ok_or(BackendError::InvalidInput)?
+            .map(Clone::clone)
+            .to_vec();
+        attention.extend(inputs.get(5).cloned());
+        self.execute_paged_sdpa(
+            &attention,
+            dispatch.output(),
+            scale,
+            true,
+            q_start,
+            q_start.checked_add(1).ok_or(BackendError::InvalidInput)?,
+            page_tokens,
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn execute_paged_sdpa(
         &self,
@@ -1422,7 +1468,7 @@ impl Backend for CpuBackend {
                 } => {
                     self.execute_sdpa(dispatch.inputs(), dispatch.output(), scale, causal, q_start)
                 }
-                Op::PagedSdpaAppend { .. } => Err(BackendError::UnsupportedOperation),
+                Op::PagedSdpaAppend { .. } => self.execute_paged_append(&dispatch),
                 Op::PagedSdpa {
                     scale,
                     causal,
@@ -1852,6 +1898,52 @@ mod tests {
             .map(|value| f16::from_f32(value).to_f32())
             .collect::<Vec<_>>();
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn paged_append_stores_both_planes_before_attention() {
+        let backend = CpuBackend::new();
+        let query = backend.alloc(DType::F32, &[16, 1, 128]).unwrap();
+        let key = backend.alloc(DType::F32, &[1, 8, 128]).unwrap();
+        let value = backend.alloc(DType::F32, &[1, 8, 128]).unwrap();
+        backend.write(&value, &f32_bytes(&[1.0; 8 * 128])).unwrap();
+        let table = backend.alloc(DType::U32, &[1, 2]).unwrap();
+        let generations = backend.alloc(DType::U32, &[1]).unwrap();
+        backend.write(&table, &u32_bytes(&[0, 1])).unwrap();
+        backend.write(&generations, &u32_bytes(&[1])).unwrap();
+        let key_pages = backend.alloc(DType::F16, &[1, 16, 8, 128]).unwrap();
+        let value_pages = backend.alloc(DType::F16, &[1, 16, 8, 128]).unwrap();
+        let output = backend.alloc(DType::F32, &[16, 1, 128]).unwrap();
+        let op = |q_start| Op::PagedSdpaAppend {
+            scale: 0.125,
+            q_start,
+            page_tokens: 16,
+        };
+        let inputs = [&query, &key, &value, &table, &generations];
+        let outputs = [&output, &key_pages, &value_pages];
+        let mut commands = CommandList::new();
+        commands.dispatch_many(op(0), &inputs, &outputs).unwrap();
+        backend.submit(commands).unwrap().wait().unwrap();
+        assert_eq!(backend.read(&output).unwrap(), f32_bytes(&[1.0; 16 * 128]));
+        let values = backend.read(&value_pages).unwrap();
+        assert_eq!(
+            values[..2048],
+            half::f16::from_f32(1.0)
+                .to_bits()
+                .to_le_bytes()
+                .repeat(1024)
+        );
+        assert!(values[2048..].iter().all(|&byte| byte == 0));
+        assert!(
+            CommandList::new()
+                .dispatch_many(op(u32::MAX), &inputs, &outputs)
+                .is_err()
+        );
+        assert!(
+            CommandList::new()
+                .dispatch_many(op(0), &inputs, &[&output, &key_pages, &key_pages])
+                .is_err()
+        );
     }
 
     #[test]
