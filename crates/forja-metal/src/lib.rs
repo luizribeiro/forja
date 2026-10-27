@@ -15,6 +15,8 @@ mod map_codegen;
 mod matmul;
 #[cfg(target_os = "macos")]
 mod memory;
+#[cfg(target_os = "macos")]
+mod profile_cost;
 #[cfg(all(test, target_os = "macos"))]
 #[path = "../tests/common/rounding_program.rs"]
 mod rounding_program;

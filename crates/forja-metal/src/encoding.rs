@@ -601,6 +601,7 @@ struct EncodedDispatches {
 
 #[derive(Clone)]
 struct InternalDispatchProfile {
+    cost: forja_core::KernelCost,
     dispatch: usize,
     kernel: &'static str,
     start: usize,
@@ -1830,6 +1831,7 @@ impl Completion {
                 Some((
                     metadata.dispatch,
                     KernelProfile {
+                        cost: metadata.cost,
                         kernel: metadata.kernel,
                         gpu_start,
                         gpu_end,
@@ -2893,7 +2895,7 @@ impl MetalBackend {
                     dispatch,
                     index,
                     internal_timestamp,
-                ));
+                )?);
             }
             if let Some(plan) = prepared
                 .and_then(|plans| plans.get(index))
@@ -8141,26 +8143,34 @@ fn internal_dispatch_profiles(
     dispatch: &Dispatch,
     dispatch_index: usize,
     first_internal: usize,
-) -> Vec<InternalDispatchProfile> {
+) -> Result<Vec<InternalDispatchProfile>, BackendError> {
     let names = internal_dispatch_names(dispatch);
     let outer_start = 2 + dispatch_index * 2;
     let outer_end = outer_start + 1;
     names
         .iter()
         .enumerate()
-        .map(|(index, &kernel)| InternalDispatchProfile {
-            dispatch: dispatch_index,
-            kernel,
-            start: if index == 0 {
-                outer_start
-            } else {
-                first_internal + index - 1
-            },
-            end: if index + 1 == names.len() {
-                outer_end
-            } else {
-                first_internal + index
-            },
+        .map(|(index, &kernel)| {
+            Ok(InternalDispatchProfile {
+                cost: crate::profile_cost::internal(
+                    dispatch,
+                    kernel,
+                    paged_gqa_blocks(selected_variant(dispatch)),
+                )
+                .ok_or(BackendError::InvalidInput)?,
+                dispatch: dispatch_index,
+                kernel,
+                start: if index == 0 {
+                    outer_start
+                } else {
+                    first_internal + index - 1
+                },
+                end: if index + 1 == names.len() {
+                    outer_end
+                } else {
+                    first_internal + index
+                },
+            })
         })
         .collect()
 }
@@ -12546,6 +12556,8 @@ mod tests {
                 assert_eq!(internal.len(), 5);
                 assert_eq!(profile.per_dispatch[0].physical_dispatches, 6);
                 assert_eq!(internal[0].kernel, "count_expert_routes");
+                assert_eq!(internal[0].cost.flops, 0);
+                assert!(internal[2].cost.flops > 0);
                 assert_eq!(internal[4].kernel, "gathered_pair_from_projections");
                 assert!(
                     internal
