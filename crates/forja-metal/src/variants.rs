@@ -1727,7 +1727,7 @@ impl MetalVariant {
         };
         let tile = match self {
             MatmulSteel64x64x16_2x2 | MatmulSteel64x64x16_1x2 => [64, 64, 16],
-            MatmulSteel64x32x32_2x2 => [64, 32, 32],
+            MetalVariant::MatmulPortable | MatmulSteel64x32x32_2x2 => [64, 32, 32],
             MatmulSteel32x64x16_1x2 => [32, 64, 16],
             GatherQuantMatmulGrouped => [16, 32, 32],
             MetalVariant::GatherQuantMatmulGroupedSmallM
@@ -1738,7 +1738,25 @@ impl MetalVariant {
             | GatherQuantMatmulGroupedPair32x32Blocked => [32, 32, 32],
             _ => [0; 3],
         };
-        forja_core::CostModel { tile }
+        let attention_tiles: &'static [(u32, [u32; 2])] = match self {
+            MetalVariant::SdpaSteel | MetalVariant::PagedSdpaSteel => {
+                &[(64, [32, 32]), (128, [32, 16])]
+            }
+            MetalVariant::SdpaSteelHalf | MetalVariant::PagedSdpaSteelHalf => {
+                &[(64, [64, 32]), (128, [96, 16])]
+            }
+            MetalVariant::PagedSdpaSteelHalf32x16 => &[(128, [32, 16])],
+            MetalVariant::PagedSdpaSteelHalf64x16 => &[(128, [64, 16])],
+            _ => &[],
+        };
+        forja_core::CostModel {
+            tile,
+            attention_tiles,
+            conditional_tiles: matches!(
+                self,
+                GatherQuantMatmulGrouped32x32Blocked | GatherQuantMatmulGroupedPair32x32Blocked
+            ),
+        }
     }
 }
 

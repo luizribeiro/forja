@@ -690,7 +690,11 @@ mod tests {
         name: "test.reference",
         operation: OperationKind::TopK,
         implementation: (),
-        cost: crate::CostModel { tile: [0; 3] },
+        cost: crate::CostModel {
+            tile: [0; 3],
+            conditional_tiles: false,
+            attention_tiles: &[],
+        },
         availability: &[DeviceCapability::Metal4],
         constraints: CONSTRAINTS,
         guarantees: Guarantee::Deterministic,
