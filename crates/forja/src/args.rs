@@ -151,8 +151,17 @@ pub(crate) struct Bench {
     pub(crate) mode: BenchMode,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum BenchExecution {
+    #[default]
+    ProcessPerLeg,
+    ResidentWorker,
+}
+
 #[derive(Debug, Default, PartialEq)]
 pub(crate) struct BenchMode {
+    pub(crate) execution: BenchExecution,
     pub(crate) remeasure: bool,
     pub(crate) no_early_stop: bool,
     pub(crate) raw_samples: bool,
@@ -258,6 +267,9 @@ struct BenchArgs {
 
 #[derive(Args)]
 struct SamplingModeArgs {
+    /// Serve fixed-workload sample requests on stdin while retaining loaded weights.
+    #[arg(long, requires = "raw_samples", conflicts_with_all = ["accept", "rerun", "against", "breakdown"])]
+    worker: bool,
     /// Explicitly retain fixed repetitions without sequential stopping.
     #[arg(long)]
     no_early_stop: bool,
@@ -1125,6 +1137,11 @@ impl BenchArgs {
             accept: self.record.accept,
             accept_from: self.record.accept_from,
             mode: BenchMode {
+                execution: if self.sampling_mode.worker {
+                    BenchExecution::ResidentWorker
+                } else {
+                    BenchExecution::ProcessPerLeg
+                },
                 remeasure: self.record.remeasure,
                 no_early_stop: self.sampling_mode.no_early_stop,
                 raw_samples: self.sampling_mode.raw_samples,

@@ -10,6 +10,7 @@ pub(crate) const SCHEMA_VERSION: u32 = 5;
 
 pub(crate) fn measurement_mode(options: &Bench) -> serde_json::Value {
     serde_json::json!({"sampling": "fixed", "early_stop": false,
+        "execution": options.mode.execution,
         "reps": options.reps, "explicit_no_early_stop": options.mode.no_early_stop,
         "acceptance": if options.mode.remeasure { "remeasured" } else { "measured" }})
 }

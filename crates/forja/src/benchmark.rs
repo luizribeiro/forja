@@ -165,7 +165,16 @@ pub(crate) async fn run(options: &Bench) -> Result<(), Box<dyn Error>> {
         return adopt_report(options, path);
     }
     #[cfg(target_os = "macos")]
-    return run_metal(options).await;
+    return if options.mode.execution == crate::args::BenchExecution::ResidentWorker {
+        resident::run(options).await
+    } else {
+        run_metal(
+            options,
+            &mut resident::Runners::new(false),
+            options.json.as_deref(),
+        )
+        .await
+    };
     #[cfg(not(target_os = "macos"))]
     Err("engine benchmarks require macOS and Metal".into())
 }
@@ -465,7 +474,11 @@ async fn measure_profile_phase(
 
 #[cfg(target_os = "macos")]
 #[allow(clippy::too_many_lines)]
-async fn run_metal(options: &Bench) -> Result<(), Box<dyn Error>> {
+async fn run_metal(
+    options: &Bench,
+    runners: &mut resident::Runners,
+    output: Option<&Path>,
+) -> Result<(), Box<dyn Error>> {
     let acceptance = prepare_acceptance(options)?;
     let started = Instant::now();
     let load_before = machine_load::capture("BEFORE BENCHMARK")?;
@@ -518,13 +531,7 @@ async fn run_metal(options: &Bench) -> Result<(), Box<dyn Error>> {
                 .collect::<Result<Vec<_>, _>>()
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let (results, device) = measure_points(
-        options,
-        &perf_keys,
-        &perf_hashes,
-        &mut resident::Runners::new(false),
-    )
-    .await?;
+    let (results, device) = measure_points(options, &perf_keys, &perf_hashes, runners).await?;
     let load_after = machine_load::capture("AFTER BENCHMARK")?;
     check_strategy_outputs(&options.strategy_axes, &results)?;
     if options
@@ -537,9 +544,9 @@ async fn run_metal(options: &Bench) -> Result<(), Box<dyn Error>> {
     if let Some(record) = &options.rerun {
         print_result_diff(record, &results)?;
     }
-    if options.json.is_some() || acceptance.is_some() {
+    if output.is_some() || acceptance.is_some() {
         let snapshot = benchmark_record::snapshot(options, &device, &os)?;
-        let report = serde_json::json!({
+        let mut report = serde_json::json!({
             "schema_version": benchmark_record::SCHEMA_VERSION,
             "implementation": "forja",
             "measurement_mode": benchmark_record::measurement_mode(options),
@@ -568,7 +575,12 @@ async fn run_metal(options: &Bench) -> Result<(), Box<dyn Error>> {
             "allow_diff": options.allow_diff.iter().map(KeyPath::as_str).collect::<Vec<_>>(),
             "results": results,
         });
-        if let Some(path) = &options.json {
+        if options.mode.execution == crate::args::BenchExecution::ResidentWorker {
+            report["worker"] = serde_json::json!({"pid": std::process::id(), "runner_loads": runners.loads,
+                "instance_loads": runners.instance_loads, "cache_state": "fresh-request; positional input replay starts at zero",
+                "warmups_per_leg": options.warmups});
+        }
+        if let Some(path) = output {
             if options.breakdown {
                 let breakdown_path = breakdown_record_path(path, &options.config.paths.scratch)?;
                 if let Some(parent) = breakdown_path.parent() {
