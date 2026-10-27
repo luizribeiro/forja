@@ -20,6 +20,8 @@ mod profile_cost;
 #[cfg(all(test, target_os = "macos"))]
 #[path = "../tests/common/rounding_program.rs"]
 mod rounding_program;
+#[cfg(target_os = "macos")]
+mod route_facts;
 mod scalar_codegen;
 #[cfg(target_os = "macos")]
 mod storage;

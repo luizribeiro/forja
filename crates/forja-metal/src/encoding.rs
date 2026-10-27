@@ -2253,7 +2253,19 @@ impl Submission for MetalSubmission {
             .completion
             .internal_dispatch_times(&self.internal_profiles)?
         {
-            dispatches.get_mut(dispatch)?.internal.push(internal);
+            let outer = dispatches.get_mut(dispatch)?;
+            let mut internal = internal;
+            if internal.cost.weight_bytes != 0 {
+                let projections = outer
+                    .cost
+                    .weight_bytes
+                    .checked_div(internal.cost.weight_bytes)?;
+                internal.cost.minimum_weight_bytes =
+                    outer.cost.minimum_weight_bytes.checked_div(projections)?;
+                internal.cost.maximum_weight_bytes =
+                    outer.cost.maximum_weight_bytes.checked_div(projections)?;
+            }
+            outer.internal.push(internal);
         }
         profile.per_dispatch = dispatches;
         Some(profile)
@@ -2812,11 +2824,18 @@ impl MetalBackend {
         }
         command_buffer.endCommandBuffer();
         let dispatch_profiles = if PROFILE {
+            let mut facts = crate::route_facts::RouteFacts::default();
             dispatches
                 .iter()
                 .zip(&barriers)
                 .zip(&physical_counts)
-                .map(|((dispatch, &barrier), &count)| dispatch_profile(dispatch, barrier, count))
+                .map(|((dispatch, &barrier), &count)| {
+                    let mut profile = dispatch_profile(dispatch, barrier, count)?;
+                    facts
+                        .refine(dispatch, &mut profile.cost)
+                        .ok_or(BackendError::InvalidInput)?;
+                    Ok(profile)
+                })
                 .collect::<Result<Vec<_>, _>>()?
         } else {
             Vec::new()
