@@ -415,6 +415,8 @@ impl From<&Tensor> for ProfileTensor {
 /// Device timeline attributed to one recorded dispatch.
 #[derive(Clone, Debug, PartialEq)]
 pub struct DispatchProfile {
+    /// Engine-owned call-site and architectural layer attribution.
+    pub scope: Option<crate::ProfileScope>,
     /// Operation recorded by the command list.
     pub op: Op,
     /// Backend kernel or composite implementation selected for the operation.

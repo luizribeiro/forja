@@ -8,6 +8,7 @@ mod layout;
 mod ops;
 mod paged;
 mod paged_pool;
+mod profile_scope;
 pub mod program;
 mod quantized;
 mod symbolic;
@@ -39,6 +40,7 @@ pub use paged_pool::{
     CowPageCopy, PagePool, PagePoolError, PagedMemoryUsage, PagedSequence, PagedSlot,
     PagedSlotBanks, SequenceCheckpoint, paged_slab_bytes,
 };
+pub use profile_scope::{ProfileScope, ProfileScopeError};
 pub use quantized::{QuantizedMatrix, QuantizedMatrixError, QuantizedMatrixPart};
 pub use symbolic::{
     Affine, ByteHull, MAX_PARAMS, ParamError, ParamSpace, ParamValues, SymbolicLayout,

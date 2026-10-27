@@ -553,6 +553,7 @@ mod tests {
         outputs: Vec<ProfileTensor>,
     ) -> DispatchProfile {
         DispatchProfile {
+            scope: None,
             op,
             kernel: "test",
             variant: None,

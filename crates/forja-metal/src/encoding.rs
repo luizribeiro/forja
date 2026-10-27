@@ -8042,6 +8042,7 @@ fn dispatch_profile(dispatch: &Dispatch, barrier: bool) -> Result<DispatchProfil
         .padded_flops(dispatch, cost)
         .ok_or(BackendError::InvalidInput)?;
     Ok(DispatchProfile {
+        scope: dispatch.profile_scope().map(|scope| scope.as_ref().clone()),
         variant,
         alternatives,
         cost,

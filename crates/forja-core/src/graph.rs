@@ -1,6 +1,6 @@
 use std::{
     any::Any,
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     error::Error,
     fmt,
     sync::Arc,
@@ -1032,6 +1032,7 @@ impl GraphMemoryPlan {
 /// A validated command sequence over one parameter space.
 #[derive(Clone, Debug)]
 pub struct GraphTemplate {
+    profile_scopes: BTreeMap<usize, Arc<crate::ProfileScope>>,
     space: ParamSpace,
     limits: GraphLimits,
     dispatches: Vec<TemplateDispatch>,
@@ -1114,10 +1115,27 @@ impl PreparedGraph {
 }
 
 impl GraphTemplate {
+    /// Attaches engine-owned attribution to an existing dispatch.
+    ///
+    /// # Errors
+    /// Returns an error if the dispatch index is outside this graph.
+    pub fn set_profile_scope(
+        &mut self,
+        index: usize,
+        scope: Arc<crate::ProfileScope>,
+    ) -> Result<(), GraphError> {
+        if index >= self.dispatches.len() {
+            return Err(GraphError::DispatchLimit);
+        }
+        self.profile_scopes.insert(index, scope);
+        Ok(())
+    }
+
     /// Creates an empty graph template governed by the supplied resource bounds.
     #[must_use]
     pub const fn new(space: ParamSpace, limits: GraphLimits) -> Self {
         Self {
+            profile_scopes: BTreeMap::new(),
             space,
             limits,
             dispatches: Vec::new(),
@@ -1201,6 +1219,7 @@ impl GraphTemplate {
         }
         let mut rebound = Self::new(self.space.clone(), self.limits);
         rebound.memory_arena = Some(arena.buffer());
+        rebound.profile_scopes.clone_from(&self.profile_scopes);
         for dispatch in &self.dispatches {
             let dispatch = dispatch.rebase(&plan.placements, arena.buffer())?;
             let (accesses, hull_accesses) = match &dispatch {
@@ -1514,7 +1533,7 @@ impl GraphTemplate {
             return Err(GraphError::ParameterSpaceMismatch);
         }
         let mut commands = CommandList::new();
-        for dispatch in &self.dispatches {
+        for (index, dispatch) in self.dispatches.iter().enumerate() {
             let concrete = match dispatch {
                 TemplateDispatch::Static(dispatch) => dispatch.as_ref().clone(),
                 TemplateDispatch::Dynamic {
@@ -1545,6 +1564,12 @@ impl GraphTemplate {
                         .with_backend_data(data)
                 }
             };
+            let concrete = self
+                .profile_scopes
+                .get(&index)
+                .map_or(concrete.clone(), |scope| {
+                    concrete.with_profile_scope(Arc::clone(scope))
+                });
             commands.push_and_reset_validation(concrete);
         }
         commands.set_precomputed_barriers(self.required_barriers.clone());
@@ -1881,6 +1906,30 @@ mod tests {
             * DType::F32.byte_size();
         let layout = Layout::contiguous(DType::F32, 0, shape.to_vec(), bytes).unwrap();
         Tensor::from_allocation(BufferId::new(1, buffer, bytes), layout, true).unwrap()
+    }
+
+    #[test]
+    fn engine_scope_survives_graph_instantiation() {
+        let scope = std::sync::Arc::new(
+            crate::ProfileScope::new("layer/7".into(), "sparse".into(), Some(7)).unwrap(),
+        );
+        let input = tensor(1, &[7, 33]);
+        let output = tensor(2, &[7, 33]);
+        let mut commands = CommandList::new();
+        commands.set_profile_scope(Some(scope.clone()));
+        commands.dispatch(Op::Copy, &[&input], &output).unwrap();
+        let space = ParamSpace::new(Vec::new()).unwrap();
+        let mut graph = GraphTemplate::new(space.clone(), GraphLimits::default());
+        graph
+            .dispatch(Op::Copy, &[&input.into()], &output.into())
+            .unwrap();
+        graph.set_profile_scope(0, scope.clone()).unwrap();
+        assert!(graph.set_profile_scope(1, scope.clone()).is_err());
+        let replay = graph
+            .instantiate(&space.values(Vec::new()).unwrap())
+            .unwrap();
+        assert_eq!(replay.dispatches()[0].profile_scope(), Some(&scope));
+        assert_eq!(commands.dispatches()[0].profile_scope(), Some(&scope));
     }
 
     #[test]

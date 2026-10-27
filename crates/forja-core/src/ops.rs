@@ -404,6 +404,7 @@ fn check_sampling_parameters(
 /// A dispatch whose signature and aliasing have been validated.
 #[derive(Clone)]
 pub struct Dispatch {
+    profile_scope: Option<Arc<crate::ProfileScope>>,
     op: Op,
     inputs: Vec<Tensor>,
     outputs: Vec<Tensor>,
@@ -441,6 +442,7 @@ impl fmt::Debug for Dispatch {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("Dispatch")
+            .field("profile_scope", &self.profile_scope)
             .field("op", &self.op)
             .field("inputs", &self.inputs)
             .field("outputs", &self.outputs)
@@ -464,6 +466,19 @@ struct EpilogueDispatch {
 }
 
 impl Dispatch {
+    /// Returns engine-owned diagnostic attribution, when supplied.
+    #[must_use]
+    pub fn profile_scope(&self) -> Option<&Arc<crate::ProfileScope>> {
+        self.profile_scope.as_ref()
+    }
+
+    /// Attaches already-validated diagnostic metadata without changing execution.
+    #[must_use]
+    pub fn with_profile_scope(mut self, scope: Arc<crate::ProfileScope>) -> Self {
+        self.profile_scope = Some(scope);
+        self
+    }
+
     pub(crate) fn rebase_tensors(
         &self,
         mut rebase: impl FnMut(&Tensor) -> Result<Tensor, LayoutError>,
@@ -496,6 +511,7 @@ impl Dispatch {
         } else {
             Self::new_many(self.op, &input_refs, &output_refs)?
         };
+        rebound.profile_scope.clone_from(&self.profile_scope);
         if let Some(data) = self.backend_data.clone() {
             rebound.set_backend_data(data);
         }
@@ -606,6 +622,7 @@ impl Dispatch {
             )?,
         }
         Ok(Self {
+            profile_scope: None,
             op,
             inputs: inputs.iter().map(|tensor| (*tensor).clone()).collect(),
             outputs: outputs.iter().map(|tensor| (*tensor).clone()).collect(),
@@ -676,6 +693,7 @@ impl Dispatch {
             .first()
             .ok_or(OpError::ProgramBinding(BindError::NoOutputs))?;
         Ok(Self {
+            profile_scope: None,
             op: Op::Program(program.validated().content_hash()),
             inputs: bound.inputs().to_vec(),
             outputs: bound.outputs().to_vec(),
@@ -768,6 +786,7 @@ impl Dispatch {
 /// An ordered list of validated backend work.
 #[derive(Clone, Debug, Default)]
 pub struct CommandList {
+    profile_scope: Option<Arc<crate::ProfileScope>>,
     dispatches: Vec<Dispatch>,
     validation: ValidationState,
     program_recording: Duration,
@@ -782,10 +801,16 @@ enum ValidationState {
 }
 
 impl CommandList {
+    /// Sets attribution inherited by subsequently recorded dispatches.
+    pub fn set_profile_scope(&mut self, scope: Option<Arc<crate::ProfileScope>>) {
+        self.profile_scope = scope;
+    }
+
     /// Creates an empty command list.
     #[must_use]
     pub const fn new() -> Self {
         Self {
+            profile_scope: None,
             dispatches: Vec::new(),
             validation: ValidationState::Fresh,
             program_recording: Duration::ZERO,
@@ -898,7 +923,10 @@ impl CommandList {
         Ok(())
     }
 
-    pub(crate) fn push_and_reset_validation(&mut self, dispatch: Dispatch) {
+    pub(crate) fn push_and_reset_validation(&mut self, mut dispatch: Dispatch) {
+        if dispatch.profile_scope.is_none() {
+            dispatch.profile_scope.clone_from(&self.profile_scope);
+        }
         self.validation = ValidationState::Fresh;
         self.dispatches.push(dispatch);
     }
