@@ -28,8 +28,13 @@ def measurement_command(adapter, output, reps, warmups, raw, guard):
                      for arg in adapter["command"] if raw or arg != "--raw-samples"]]
 
 
+def session_key(row):
+    return digest([{key: row[side].get(key) for key in
+        ["command", "cwd", "expected_provenance", "cache_state"]} for side in ["baseline", "candidate"]])
+
+
 def command_sampler(row: dict, directory: Path, guard: list[str], warmups: int,
-                    sequential: bool, memo: dict | None = None):
+                    sequential: bool, memo: dict | None = None, workers=None):
     """Every original command, log and native record remains independently reviewable."""
     def sample(side, reps, phase, block, leg):
         adapter = row["baseline" if side == "A" else "candidate"]
@@ -51,14 +56,29 @@ def command_sampler(row: dict, directory: Path, guard: list[str], warmups: int,
                 raise ValueError("refusing to repeat an existing measurement")
             event = {"command": command, "cwd": adapter.get("cwd"), "started": time.time()}
             print(f"START {row['id']} {stem}", flush=True)
-            with log.open("w") as stream:
-                result = subprocess.run(command, cwd=adapter.get("cwd"), stdout=stream, stderr=subprocess.STDOUT)
-            event.update(ended=time.time(), returncode=result.returncode)
+            if workers:
+                try:
+                    event.update(workers[side].sample(output, log))
+                except Exception as error:
+                    event.update(ended=time.time(), returncode=-1, execution="resident-worker",
+                                 error={"type": type(error).__name__, "message": str(error)})
+                    save(directory / f"{stem}.command.json", event)
+                    raise
+            else:
+                with log.open("w") as stream:
+                    result = subprocess.run(command, cwd=adapter.get("cwd"), stdout=stream, stderr=subprocess.STDOUT)
+                event.update(ended=time.time(), returncode=result.returncode, execution="process-per-leg")
             save(directory / f"{stem}.command.json", event)
-            result.check_returncode()
+            if event["returncode"] != 0:
+                raise subprocess.CalledProcessError(event["returncode"], command)
             if memo is not None:
                 memo[key] = (event, hashlib.sha256(output.read_bytes()).hexdigest())
         record = json.loads(output.read_text())
+        if workers and (record.get("worker", {}).get("pid") != event["worker_pid"]
+                        or record["worker"].get("runner_loads") != event["worker_result"]["runner_loads"]
+                        or record["worker"].get("instance_loads") != event["worker_result"].get("instance_loads")
+                        or record.get("measurement_mode", {}).get("execution") != "resident-worker"):
+            raise ValueError("native record does not match its resident worker")
         for pointer, expected in adapter.get("expected_provenance", {}).items():
             if value_at(record, pointer) != expected:
                 raise ValueError(f"measurement provenance mismatch: {pointer}")
@@ -84,7 +104,8 @@ def command_sampler(row: dict, directory: Path, guard: list[str], warmups: int,
         window = value_at(record, adapter["window"]) if raw else [event["started"], event["ended"]]
         print(f"END {row['id']} {stem}", flush=True)
         return {"side": side, "start": window[0], "end": window[1], "score": score,
-                "reused_session": reused,
+                "reused_session": reused, "execution": event.get("execution", "process-per-leg"),
+                "worker_pid": event.get("worker_pid"),
                 "output_digests": [result["output_digest"] for result in record.get("results", [])
                                    if result.get("output_digest")],
                 "record_file": str(output), "record_sha256": hashlib.sha256(output.read_bytes()).hexdigest()}

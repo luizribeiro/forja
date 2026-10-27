@@ -62,3 +62,18 @@ path.write_text(json.dumps({"score":100,"other":200*math.exp(shift),"window":[no
     assert all(s["reused_session"] for b in result["runs"][0]["blocks"][:6] for s in b["samples"])
     assert all(not s["reused_session"] for b in result["runs"][0]["blocks"][6:] for s in b["samples"])
     assert len(list(tmp_path.glob("*.command.json"))) == 64
+
+
+def test_failed_worker_request_keeps_its_command_and_error(tmp_path):
+    class FailedWorker:
+        def sample(self, _output, log):
+            log.write_text("worker failure")
+            raise ValueError("lost response")
+    adapter = {"command": ["/frozen/forja", "bench", "--reps", "{reps}", "--json", "{output}"]}
+    row = {"id": "failed", "baseline": adapter, "candidate": adapter}
+    sampler = command_sampler(row, tmp_path, [], 1, True, workers={"A": FailedWorker()})
+    with pytest.raises(ValueError, match="lost response"):
+        sampler("A", 1, "primary", 0, 0)
+    event = json.loads((tmp_path / "primary-00-0-A.command.json").read_text())
+    assert event["execution"] == "resident-worker" and event["returncode"] == -1
+    assert event["error"] == {"type": "ValueError", "message": "lost response"}

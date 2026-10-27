@@ -78,3 +78,44 @@ def test_main_checks_tree_artifacts_and_persists_verified_history(tmp_path, monk
     saved = json.loads((output / "row-00/history.json").read_text())
     assert saved["identity"] == "workload" and saved["method"] == METHOD
     assert len(saved["log_scores"]) == 6 and saved["created_at"] > 0
+
+
+def test_native_groups_keep_one_process_per_side_across_nonadjacent_rows(tmp_path, monkeypatch):
+    script = tmp_path / "native"
+    script.write_text(f"#!{sys.executable}\n" + '''import json,os,sys,time
+from pathlib import Path
+print('FORJA_BENCH_READY '+json.dumps({'protocol':1,'pid':os.getpid(),'runner_loads':1,'instance_loads':{'single':1}}),flush=True)
+for line in sys.stdin:
+ request=json.loads(line);now=time.time()
+ record={'implementation':'forja','provenance':{'binary_sha256':'host'},
+  'inputs':[{'engine_sha256':'guest'}],'config':'[bench]\\nreps=1',
+  'measurement_mode':{'execution':'resident-worker','reps':1},
+  'worker':{'pid':os.getpid(),'runner_loads':1,'instance_loads':{'single':1}},
+  'results':[{'output_digest':'exact','score':100,'window':[now,now+.000001]}]}
+ Path(request['output']).write_text(json.dumps(record))
+ print('FORJA_BENCH_RESULT '+json.dumps({'id':request['id'],'pid':os.getpid(),'runner_loads':1,'instance_loads':{'single':1}}),flush=True)
+''')
+    script.chmod(0o755)
+    adapter = {"command": [str(script), "bench", "--reps", "{reps}", "--json", "{output}"],
+        "metric": "/results/0/score", "window": "/results/0/window", "expected_provenance": {
+        "/provenance/binary_sha256": "host", "/inputs/0/engine_sha256": "guest"}}
+    other = {**adapter, "command": [*adapter["command"], "--set", "distinct-workload"]}
+    plan = {"artifacts": {str(script): hashlib.sha256(script.read_bytes()).hexdigest()}, "guard": [],
+        "rows": [{"id": name, "profile": "profile", "question": "equivalence",
+                  "baseline": value, "candidate": value}
+                 for name, value in [("first", adapter), ("other", other), ("shared", adapter)]]}
+    path = tmp_path / "plan.json"
+    path.write_text(json.dumps(plan))
+    monkeypatch.setattr(bench_gate.subprocess, "run", lambda args, **_: subprocess.CompletedProcess(args, 0, stdout=""))
+    output = tmp_path / "output"
+    monkeypatch.setattr(sys, "argv", ["gate", str(path), "--out", str(output)])
+    bench_gate.main()
+    report = json.loads((output / "report.json").read_text())
+    assert report["decision"] == "no change"
+    assert [row["id"] for row in report["rows"]] == ["first", "shared", "other"]
+    pids = [info["ready"]["pid"] for group in report["groups"] for info in group["workers"]["sides"].values()]
+    assert len(set(pids)) == 4
+    assert report["mode"]["warmups_per_leg"] == 1 and report["mode"]["warmups_per_launch"] is None
+    assert len(list(output.glob("group-*/*.command.json"))) == 48
+    assert all(sample["reused_session"] for block in report["rows"][1]["runs"][0]["blocks"]
+               for sample in block["samples"])
