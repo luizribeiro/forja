@@ -19,7 +19,7 @@ pub use backend::{
     MemoryUsage, ProfileCount, ProfileTensor, ReadonlyImport, Submission, SubmissionProfile,
     ViewOp, automatic_buffer_pool_capacity, automatic_live_bytes,
 };
-pub use cost::KernelCost;
+pub use cost::{CostModel, KernelCost};
 pub use forja_mmap::MappedRegion;
 pub use graph::{
     GraphError, GraphLimits, GraphMemoryPlan, GraphTemplate, PreparedGraph, TemplateOp,

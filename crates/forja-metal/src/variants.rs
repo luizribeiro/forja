@@ -688,6 +688,7 @@ macro_rules! variant {
             name: $name,
             operation: OperationKind::$operation,
             implementation: MetalVariant::$implementation,
+            cost: MetalVariant::$implementation.cost_model(),
             availability: METAL4,
             constraints: $constraints,
             guarantees: DETERMINISTIC,
@@ -1714,6 +1715,31 @@ pub(crate) fn markdown(device: &str) -> String {
 
 pub(crate) fn json(device: &str) -> String {
     render_catalog_json("metal", device, METAL4, REGISTRY)
+}
+
+impl MetalVariant {
+    pub(crate) const fn cost_model(self) -> forja_core::CostModel {
+        use MetalVariant::{
+            GatherQuantMatmulGrouped, GatherQuantMatmulGrouped32x32,
+            GatherQuantMatmulGrouped32x32Blocked, GatherQuantMatmulGroupedPair32x32Blocked,
+            MatmulSteel32x64x16_1x2, MatmulSteel64x32x32_2x2, MatmulSteel64x64x16_1x2,
+            MatmulSteel64x64x16_2x2, QuantMatmulTiled,
+        };
+        let tile = match self {
+            MatmulSteel64x64x16_2x2 | MatmulSteel64x64x16_1x2 => [64, 64, 16],
+            MatmulSteel64x32x32_2x2 => [64, 32, 32],
+            MatmulSteel32x64x16_1x2 => [32, 64, 16],
+            GatherQuantMatmulGrouped => [16, 32, 32],
+            MetalVariant::GatherQuantMatmulGroupedSmallM
+            | MetalVariant::GatherQuantMatmulGroupedPairSmallM => [8, 32, 32],
+            QuantMatmulTiled
+            | GatherQuantMatmulGrouped32x32
+            | GatherQuantMatmulGrouped32x32Blocked
+            | GatherQuantMatmulGroupedPair32x32Blocked => [32, 32, 32],
+            _ => [0; 3],
+        };
+        forja_core::CostModel { tile }
+    }
 }
 
 #[cfg(test)]

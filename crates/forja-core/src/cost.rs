@@ -3,6 +3,8 @@
 mod attention;
 mod routed;
 mod scalar;
+mod tiling;
+pub use tiling::CostModel;
 
 use crate::{Dispatch, Op, Tensor, matmul_flops, quant_matmul_flops};
 

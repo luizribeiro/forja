@@ -407,6 +407,8 @@ pub struct VariantDef<I> {
     pub name: &'static str,
     /// Portable operation computed by the algorithm.
     pub operation: OperationKind,
+    /// Algorithmic cost formula and tile geometry.
+    pub cost: crate::CostModel,
     /// Backend-private implementation tag.
     pub implementation: I,
     /// Capabilities required before the algorithm can be selected.
@@ -454,6 +456,7 @@ pub fn render_catalog_markdown<I>(
                 let _ = write!(output, "\n- {constraint}\n");
             }
         }
+        let _ = writeln!(output, "\n**Cost:** `{}`", variant.cost.json());
         append_markdown_sentences(&mut output, "Use when", variant.use_when);
         append_markdown_sentences(&mut output, "Avoid when", variant.avoid_when);
         append_markdown_sentences(&mut output, "Notes", variant.notes);
@@ -499,6 +502,7 @@ pub fn render_catalog_json<I>(
             serde_json::json!({
                 "name": variant.name,
                 "computes": variant.operation.to_string(),
+                "cost": variant.cost.json(),
                 "constraints": variant.constraints.iter().map(json_constraint).collect::<Vec<_>>(),
                 "use_when": variant.use_when,
                 "avoid_when": variant.avoid_when,
@@ -686,6 +690,7 @@ mod tests {
         name: "test.reference",
         operation: OperationKind::TopK,
         implementation: (),
+        cost: crate::CostModel { tile: [0; 3] },
         availability: &[DeviceCapability::Metal4],
         constraints: CONSTRAINTS,
         guarantees: Guarantee::Deterministic,
