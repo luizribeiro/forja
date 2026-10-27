@@ -153,7 +153,9 @@ pub(crate) async fn run(options: &Bench) -> Result<(), Box<dyn Error>> {
             &options.config.paths.scratch,
         )?;
     }
-    if let Some(path) = &options.accept_from {
+    if let Some(path) = &options.accept_from
+        && !options.mode.remeasure
+    {
         return adopt_report(options, path);
     }
     #[cfg(target_os = "macos")]
@@ -528,6 +530,7 @@ async fn run_metal(options: &Bench) -> Result<(), Box<dyn Error>> {
         let report = serde_json::json!({
             "schema_version": benchmark_record::SCHEMA_VERSION,
             "implementation": "forja",
+            "measurement_mode": benchmark_record::measurement_mode(options),
             "provenance": {
                 "commit": commit,
                 "dirty": crate::provenance::dirty(),

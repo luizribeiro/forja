@@ -31,6 +31,9 @@ def test_periodic_drift_then_invalidation(tmp_path):
     assert not report["competitor_cache"]["reused"]
     assert report["competitor_cache"]["drift"]["passed"] is False
     assert calls == ["full", "probe", "full"]
+    report = run(cache, full, probe, ["/score"], 10, .05, now=21, fresh=True)
+    assert not report["competitor_cache"]["reused"]
+    assert calls == ["full", "probe", "full", "full"]
 
 
 def test_probe_failure_is_not_silently_reused(tmp_path):

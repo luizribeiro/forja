@@ -56,13 +56,13 @@ def metric(record: dict, pointer: str) -> float:
 
 
 def run(cache: Cache, full, probe, metrics: list[str], interval: float,
-        tolerance: float, now: float | None = None) -> dict:
+        tolerance: float, now: float | None = None, fresh: bool = False) -> dict:
     """Probe periodically; mismatch or drift forces a fresh full measurement."""
     if (not metrics or not math.isfinite(interval) or interval <= 0
             or not math.isfinite(tolerance) or not 0 < tolerance < 1):
         raise ValueError("require metrics, positive drift interval and tolerance in (0,1)")
     now = time.time() if now is None else now
-    entry = cache.read(now)
+    entry = None if fresh else cache.read(now)
     if entry and now - entry["drift_checked_at"] >= interval:
         check = probe()
         ratios = {path: metric(check, path) / metric(entry["record"], path)
@@ -93,6 +93,8 @@ def main() -> None:
     parser.add_argument("--max-age", type=float, default=7 * 86400)
     parser.add_argument("--drift-interval", type=float, default=86400)
     parser.add_argument("--drift-tolerance", type=float, default=.05)
+    parser.add_argument("--fresh-competitor", action="store_true",
+                        help="classic mode: ignore cached measurements and measure again")
     args = parser.parse_args()
     request = json.loads(args.request.read_text())
     version = subprocess.run(request["version_command"], check=True, capture_output=True,
@@ -112,7 +114,8 @@ def main() -> None:
     cache = Cache(args.cache, identity, args.max_age)
     report = run(cache, lambda: measure(request["measure"]),
                  lambda: measure(request["drift"]), request["metrics"],
-                 args.drift_interval, args.drift_tolerance)
+                 args.drift_interval, args.drift_tolerance, fresh=args.fresh_competitor)
+    report["competitor_cache"]["mode"] = "fresh" if args.fresh_competitor else "cached-if-valid"
     args.json.parent.mkdir(parents=True, exist_ok=True)
     args.json.write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")
 

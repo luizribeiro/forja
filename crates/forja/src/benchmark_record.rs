@@ -8,6 +8,12 @@ use crate::args::{Bench, BenchPoint};
 
 pub(crate) const SCHEMA_VERSION: u32 = 5;
 
+pub(crate) fn measurement_mode(options: &Bench) -> serde_json::Value {
+    serde_json::json!({"sampling": "fixed", "early_stop": false,
+        "reps": options.reps, "explicit_no_early_stop": options.mode.no_early_stop,
+        "acceptance": if options.mode.remeasure { "remeasured" } else { "measured" }})
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub(crate) struct Input {
     pub(crate) engine_sha256: String,
@@ -358,6 +364,7 @@ mod tests {
             allow_diff: Vec::new(),
             accept: false,
             accept_from: None,
+            mode: crate::args::BenchMode::default(),
         }
     }
 
@@ -398,6 +405,25 @@ mod tests {
             comparison_hash(&perf_key(&point, &inputs[0], &profile()).unwrap()).unwrap(),
             "sha256:8ef1ab198a395a78e3e0c9609e09ac5c74b8a9d49508d7f1aee6ee94c6497d85"
         );
+    }
+
+    #[test]
+    fn classic_mode_retains_record_schema_configuration_and_repetition_counts() {
+        let mut options = options();
+        options.reps = 30;
+        options.config.bench.reps = std::num::NonZeroU32::new(30).unwrap();
+        let before = snapshot(&options, "device", "os").unwrap();
+        options.mode.no_early_stop = true;
+        let after = snapshot(&options, "device", "os").unwrap();
+        assert_eq!(before.config, after.config);
+        assert_eq!(
+            config_hash(&before, &[]).unwrap(),
+            config_hash(&after, &[]).unwrap()
+        );
+        assert_eq!(SCHEMA_VERSION, 5);
+        assert_eq!(measurement_mode(&options)["reps"], 30);
+        assert_eq!(measurement_mode(&options)["sampling"], "fixed");
+        assert!(!measurement_mode(&options)["early_stop"].as_bool().unwrap());
     }
 
     #[test]

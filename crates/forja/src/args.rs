@@ -148,6 +148,13 @@ pub(crate) struct Bench {
     pub(crate) allow_diff: Vec<KeyPath>,
     pub(crate) accept: bool,
     pub(crate) accept_from: Option<PathBuf>,
+    pub(crate) mode: BenchMode,
+}
+
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct BenchMode {
+    pub(crate) remeasure: bool,
+    pub(crate) no_early_stop: bool,
 }
 
 #[derive(Debug, PartialEq)]
@@ -206,6 +213,9 @@ struct ProfileArgs {
 }
 
 #[derive(Args)]
+#[command(
+    long_about = "Benchmark engines with fixed repetitions (classic mode). Use --reps 30 --no-early-stop explicitly for classic sampling. Accelerated randomized gates use support/bench_gate.py; its --no-early-stop, --all-rows and --fresh-competitor flags restore full measurement. --accept-from adopts matching measurements; --accept --remeasure always measures again."
+)]
 struct BenchArgs {
     /// WebAssembly engine component. Repeat to compare engines.
     #[arg(long = "engine", required = true)]
@@ -222,6 +232,9 @@ struct BenchArgs {
     /// Number of measured repetitions.
     #[arg(long, value_parser = parse_positive)]
     reps: Option<u32>,
+    /// Explicitly retain fixed repetitions without sequential stopping.
+    #[arg(long)]
+    no_early_stop: bool,
     /// Path for the JSON report.
     #[arg(long)]
     json: Option<PathBuf>,
@@ -260,6 +273,9 @@ struct RecordBenchArgs {
     /// Adopt a saved candidate report without running measurements.
     #[arg(long, requires = "accept", conflicts_with_all = ["rerun", "against", "allow_diff"])]
     accept_from: Option<PathBuf>,
+    /// Measure acceptance again, including when --accept-from supplies its configuration.
+    #[arg(long, requires = "accept")]
+    remeasure: bool,
 }
 
 #[derive(Args)]
@@ -1087,10 +1103,14 @@ impl BenchArgs {
             axes: config.bench.vary.clone(),
             strategy_axes,
             points,
-            rerun,
+            rerun: if self.record.remeasure { None } else { rerun },
             allow_diff: self.record.allow_diff,
             accept: self.record.accept,
             accept_from: self.record.accept_from,
+            mode: BenchMode {
+                remeasure: self.record.remeasure,
+                no_early_stop: self.no_early_stop,
+            },
         })
     }
 }
