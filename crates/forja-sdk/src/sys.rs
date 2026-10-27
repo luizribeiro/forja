@@ -1681,6 +1681,7 @@ pub(crate) fn paged_sdpa(
     slot: &guest::paged_storage::BatchSlot,
     lane: u32,
     query: &Handle,
+    appended: Option<[&Handle; 2]>,
     output: &Handle,
     key_plane: u32,
     value_plane: u32,
@@ -1690,31 +1691,31 @@ pub(crate) fn paged_sdpa(
     key_length: Affine,
     variant: &str,
 ) -> Result<()> {
-    guest::paged_storage::record_paged_sdpa(
-        commands,
-        slot,
-        lane,
-        query,
-        output,
-        &guest::paged_storage::SdpaCfg {
-            key_plane,
-            value_plane,
-            scale,
-            causal,
-            q_start: guest::compute::Affine {
-                param: q_start.param,
-                scale: q_start.scale,
-                offset: q_start.offset,
-            },
-            key_length: guest::compute::Affine {
-                param: key_length.param,
-                scale: key_length.scale,
-                offset: key_length.offset,
-            },
-            algorithm: variant.to_owned(),
+    let config = guest::paged_storage::SdpaCfg {
+        key_plane,
+        value_plane,
+        scale,
+        causal,
+        q_start: guest::compute::Affine {
+            param: q_start.param,
+            scale: q_start.scale,
+            offset: q_start.offset,
         },
-    )
-    .map_err(|error| Error::new(format!("{error:?}")))
+        key_length: guest::compute::Affine {
+            param: key_length.param,
+            scale: key_length.scale,
+            offset: key_length.offset,
+        },
+        algorithm: variant.to_owned(),
+    };
+    let result = if let Some([key, value]) = appended {
+        guest::paged_storage::record_paged_sdpa_append(
+            commands, slot, lane, query, key, value, output, &config,
+        )
+    } else {
+        guest::paged_storage::record_paged_sdpa(commands, slot, lane, query, output, &config)
+    };
+    result.map_err(|error| Error::new(format!("{error:?}")))
 }
 
 #[cfg(target_family = "wasm")]
