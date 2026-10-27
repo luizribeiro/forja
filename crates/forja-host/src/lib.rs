@@ -8340,6 +8340,28 @@ where
         )))
     }
 
+    fn record_paged_sdpa_append(
+        &mut self,
+        commands: Resource<CommandListEntry>,
+        slot: Resource<BatchSlotEntry>,
+        lane: u32,
+        query: Resource<TensorEntry>,
+        key: Resource<TensorEntry>,
+        value: Resource<TensorEntry>,
+        output: Resource<TensorEntry>,
+        config: paged_storage::SdpaCfg,
+    ) -> impl Future<Output = wasmtime::Result<Result<(), compute::Error>>> + Send {
+        std::future::ready(Ok(self.record_paged_attention(
+            &commands,
+            &slot,
+            lane,
+            &query,
+            &output,
+            &config,
+            Some([&key, &value]),
+        )))
+    }
+
     fn select_paged_sdpa_variant_rule(
         &mut self,
         commands: Resource<CommandListEntry>,
@@ -9673,7 +9695,19 @@ mod tests {
         Resource<BatchSlotEntry>,
         super::PagedPrefix,
     ) {
-        let pool = insert_test_pool(host, 2, 16);
+        bind_lanes_on_a_shared_prefix_with_width(host, lanes, 2)
+    }
+
+    fn bind_lanes_on_a_shared_prefix_with_width<B: Backend + Send + Sync + 'static>(
+        host: &mut Host<B>,
+        lanes: u32,
+        width: u64,
+    ) -> (
+        Resource<PagePoolEntry>,
+        Resource<BatchSlotEntry>,
+        super::PagedPrefix,
+    ) {
+        let pool = insert_test_pool_with_width(host, 2, 16, width);
         host.table.get_mut(&pool).unwrap().active_lanes = lanes;
         let slot = host.open_paged_slot(&pool, 2).unwrap();
         let mut prefix = host.table.get(&pool).unwrap().pool.reserve(8).unwrap();
@@ -9779,6 +9813,140 @@ mod tests {
             assert!(entry.access.reads.contains(buffer));
         }
         assert!(!entry.access.reads.contains(&buffers[0]));
+    }
+
+    async fn record_append_attention<B: Backend + Send + Sync + 'static>(
+        host: &mut Host<B>,
+        commands: &Resource<super::CommandListEntry>,
+        slot: &Resource<BatchSlotEntry>,
+        lane: u32,
+        rows: &[Resource<TensorEntry>; 4],
+        start: u32,
+    ) -> Result<(), compute::Error> {
+        <Host<B> as paged_storage::Host>::record_paged_sdpa_append(
+            host,
+            Resource::new_borrow(commands.rep()),
+            Resource::new_borrow(slot.rep()),
+            lane,
+            Resource::new_borrow(rows[0].rep()),
+            Resource::new_borrow(rows[1].rep()),
+            Resource::new_borrow(rows[2].rep()),
+            Resource::new_borrow(rows[3].rep()),
+            paged_storage::SdpaCfg {
+                key_plane: 0,
+                value_plane: 1,
+                scale: 1.0,
+                causal: true,
+                q_start: wit_affine(None, 0, start),
+                key_length: wit_affine(None, 0, start + 1),
+                algorithm: String::new(),
+            },
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn guest_append_attention_refuses_shared_prefix_and_protects_pools() {
+        let mut host = Host::new(CpuBackend::new(), GENEROUS);
+        let (_pool, slot, _prefix) = bind_lanes_on_a_shared_prefix(&mut host, 1);
+        let commands = host.command_list().unwrap();
+        let rows = append_attention_rows(&mut host, 2);
+        assert!(matches!(
+            record_append_attention(&mut host, &commands, &slot, 0, &rows, 0).await,
+            Err(compute::Error::Layout(_))
+        ));
+        record_append_attention(&mut host, &commands, &slot, 0, &rows, SHARED_PREFIX_TOKENS)
+            .await
+            .unwrap();
+        let entry = host.table.get(&commands).unwrap();
+        assert_eq!(entry.recorded.len(), 1);
+        for plane in &host.table.get(&slot).unwrap().planes {
+            let buffer = host
+                .entry(&Resource::new_borrow(*plane))
+                .unwrap()
+                .tensor
+                .buffer();
+            assert!(entry.protected.contains(&buffer));
+            assert!(entry.access.writes.contains(&buffer));
+            assert!(entry.access.reads.contains(&buffer));
+            assert!(
+                entry
+                    .retained
+                    .iter()
+                    .any(|retained| retained.tensor.buffer() == buffer)
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn metal_append_attention_preserves_every_neighbour_page() {
+        let mut host = Host::new(forja_metal::MetalBackend::new().unwrap(), GENEROUS);
+        let (_pool, slot, _prefix) = bind_lanes_on_a_shared_prefix_with_width(&mut host, 2, 128);
+        let (planes, neighbour, own) = {
+            let entry = host.table.get(&slot).unwrap();
+            let planes = entry
+                .planes
+                .iter()
+                .map(|plane| {
+                    host.entry(&Resource::new_borrow(*plane))
+                        .unwrap()
+                        .tensor
+                        .clone()
+                })
+                .collect::<Vec<_>>();
+            let neighbour = entry.binding.banks.slot(entry.active_bank, 1).unwrap();
+            let own = entry.binding.banks.slot(entry.active_bank, 0).unwrap();
+            (planes, neighbour, own)
+        };
+        for plane in &planes {
+            let elements = usize::try_from(
+                plane
+                    .layout()
+                    .shape()
+                    .iter()
+                    .map(|&size| u64::from(size))
+                    .product::<u64>(),
+            )
+            .unwrap();
+            host.backend
+                .write(plane, &f32_bytes(&vec![1.0; elements]))
+                .unwrap();
+        }
+        let before = planes
+            .iter()
+            .map(|plane| host.backend.read(plane).unwrap())
+            .collect::<Vec<_>>();
+        let commands = host.command_list().unwrap();
+        let rows = append_attention_rows(&mut host, 128);
+        assert!(matches!(
+            record_append_attention(&mut host, &commands, &slot, 0, &rows, 0).await,
+            Err(compute::Error::Layout(_))
+        ));
+        for (plane, bytes) in planes.iter().zip(&before) {
+            assert_eq!(host.backend.read(plane).unwrap(), *bytes);
+        }
+        record_append_attention(&mut host, &commands, &slot, 0, &rows, SHARED_PREFIX_TOKENS)
+            .await
+            .unwrap();
+        host.prepare_submit(commands).unwrap().run().await.unwrap();
+        for (index, (plane, before)) in planes.iter().zip(before).enumerate() {
+            let after = host.backend.read(plane).unwrap();
+            for logical in 0..2 {
+                let page = neighbour.table().resolve(logical).unwrap();
+                assert_eq!(
+                    shared_page_bytes(&after, plane.layout().shape(), page),
+                    shared_page_bytes(&before, plane.layout().shape(), page)
+                );
+            }
+            let page = own.table().resolve(1).unwrap();
+            let offset = (page as usize * 4 + 1) * 128 * size_of::<f32>();
+            assert_eq!(
+                after[offset..offset + 128 * size_of::<f32>()],
+                f32_bytes(&vec![[2.0, 3.0][index]; 128])
+            );
+        }
     }
 
     async fn record_into_pages<B: Backend + Send + Sync + 'static>(

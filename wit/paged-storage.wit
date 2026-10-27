@@ -68,4 +68,16 @@ interface paged-storage {
     parameter: u8,
     arms: list<variant-arm>,
   ) -> result<_, error>;
+
+  record-paged-sdpa-append: func(
+    cmds: borrow<command-list>,
+    slot: borrow<batch-slot>,
+    lane: u32,
+    query: borrow<tensor>,
+    key: borrow<tensor>,
+    value: borrow<tensor>,
+    output: borrow<tensor>,
+    config: sdpa-cfg,
+  ) -> result<_, error>;
+
 }
