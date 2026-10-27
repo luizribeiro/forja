@@ -5284,12 +5284,12 @@ impl<B: Backend + 'static> Host<B> {
         query: &Resource<TensorEntry>,
         output: &Resource<TensorEntry>,
         config: &paged_storage::SdpaCfg,
+        appended: Option<[&Resource<TensorEntry>; 2]>,
     ) -> Result<(), compute::Error> {
         let (key, table, generations, activity, usage) =
             self.paged_slot_entries(slot, lane, config.key_plane)?;
         let (value, _, _, _, _) = self.paged_slot_entries(slot, lane, config.value_plane)?;
-        let query = self.entry(query)?.clone();
-        let output = self.entry(output)?.clone();
+        let (query, output) = (self.entry(query)?.clone(), self.entry(output)?.clone());
         let [_query_heads, query_tokens, width]: [u32; 3] =
             query.tensor.layout().shape().try_into().map_err(|_| {
                 compute::Error::Layout("paged query must have rank three".to_owned())
@@ -5302,7 +5302,6 @@ impl<B: Backend + 'static> Host<B> {
             .checked_div(width)
             .filter(|&heads| heads != 0)
             .ok_or_else(|| compute::Error::Layout("paged plane width is invalid".to_owned()))?;
-        let plane_shape = [page_shape[0], page_shape[1], key_heads, width];
         let affine_q_start = core_affine(config.q_start);
         let affine_key_length = core_affine(config.key_length);
         if config.q_start.param != config.key_length.param
@@ -5313,44 +5312,77 @@ impl<B: Backend + 'static> Host<B> {
                 "paged attention positions do not match the bound sequence".to_owned(),
             ));
         }
+        if appended.is_some() && (query_tokens != 1 || !config.causal) {
+            return Err(compute::Error::Layout(
+                "paged append attention requires one causal query".to_owned(),
+            ));
+        }
         let page_tokens = page_shape[1];
-        let template = TemplateOp::paged_sdpa(
-            config.scale,
-            config.causal,
-            affine_q_start,
-            affine_key_length,
-            page_tokens,
-        );
-        let concrete = affine_q_start.is_constant().then_some(Op::PagedSdpa {
-            scale: config.scale,
-            causal: config.causal,
-            q_start: config.q_start.offset,
-            key_length: config.key_length.offset,
-            page_tokens,
-        });
         let protected = vec![
             key.tensor.buffer(),
             value.tensor.buffer(),
             table.tensor.buffer(),
             generations.tensor.buffer(),
         ];
-        let mut inputs = vec![
-            query,
-            self.reshape_paged_attention_plane(key, plane_shape)?,
-            self.reshape_paged_attention_plane(value, plane_shape)?,
-            table,
-            generations,
-        ];
+        let plane_shape = [page_shape[0], page_shape[1], key_heads, width];
+        let key = self.reshape_paged_attention_plane(key, plane_shape)?;
+        let value = self.reshape_paged_attention_plane(value, plane_shape)?;
+        let (operation, primary, outputs, bound) = if let Some([new_key, new_value]) = appended {
+            (
+                (
+                    TemplateOp::paged_sdpa_append(config.scale, affine_q_start, page_tokens),
+                    affine_q_start.is_constant().then_some(Op::PagedSdpaAppend {
+                        scale: config.scale,
+                        q_start: config.q_start.offset,
+                        page_tokens,
+                    }),
+                ),
+                [
+                    query,
+                    self.entry(new_key)?.clone(),
+                    self.entry(new_value)?.clone(),
+                ],
+                vec![output, key, value],
+                PagedBound::Write {
+                    start: affine_q_start,
+                    tokens: 1,
+                },
+            )
+        } else {
+            (
+                (
+                    TemplateOp::paged_sdpa(
+                        config.scale,
+                        config.causal,
+                        affine_q_start,
+                        affine_key_length,
+                        page_tokens,
+                    ),
+                    affine_q_start.is_constant().then_some(Op::PagedSdpa {
+                        scale: config.scale,
+                        causal: config.causal,
+                        q_start: config.q_start.offset,
+                        key_length: config.key_length.offset,
+                        page_tokens,
+                    }),
+                ),
+                [query, key, value],
+                vec![output],
+                PagedBound::KeyLength(affine_key_length),
+            )
+        };
+        let mut inputs = Vec::from(primary);
+        inputs.extend([table, generations]);
         inputs.extend(activity);
-        self.record_paged_dispatch(
+        self.record_paged_dispatch_many(
             commands,
-            (template, concrete),
+            operation,
             inputs,
-            output,
+            outputs,
             PagedDispatchContext {
                 protected,
                 usage,
-                bound: PagedBound::KeyLength(affine_key_length),
+                bound,
                 variant_name: (!config.algorithm.is_empty()).then_some(config.algorithm.as_str()),
             },
         )
@@ -8303,9 +8335,9 @@ where
         output: Resource<TensorEntry>,
         config: paged_storage::SdpaCfg,
     ) -> impl Future<Output = wasmtime::Result<Result<(), compute::Error>>> + Send {
-        std::future::ready(Ok(
-            self.record_paged_attention(&commands, &slot, lane, &query, &output, &config)
-        ))
+        std::future::ready(Ok(self.record_paged_attention(
+            &commands, &slot, lane, &query, &output, &config, None,
+        )))
     }
 
     fn select_paged_sdpa_variant_rule(
