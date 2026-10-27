@@ -54,6 +54,12 @@ pub(crate) enum MetalVariant {
     SdpaSteelHalf,
     PagedSdpaVector,
     PagedSdpaAppendGqa32,
+    PagedSdpaAppendGqa64,
+    PagedSdpaAppendGqa128,
+    PagedSdpaAppendGqa256,
+    PagedSdpaAppendGqa512,
+    PagedSdpaAppendGqa1024,
+
     PagedSdpaVectorGqaTwoPass32,
     PagedSdpaVectorGqaTwoPass64,
     PagedSdpaVectorGqaTwoPass128,
@@ -992,6 +998,51 @@ pub(crate) static REGISTRY: &[VariantDef<MetalVariant>] = &[
           "The block owning the appended token writes its K/V before reading it."]
     ),
     batch_invariant_variant!(
+        @class "paged-sdpa.vector-gqa-two-pass";
+        "paged-sdpa-append.vector-gqa-two-pass-64", PagedSdpaAppend,
+        PagedSdpaAppendGqa64, PAGED_APPEND,
+        &["single-token decode with authenticated key/value append."],
+        &["multi-token queries."],
+        &["Each dispatch handles one lane with fixed per-head reduction order.",
+          "The block owning the appended token writes its K/V before reading it."]
+    ),
+    batch_invariant_variant!(
+        @class "paged-sdpa.vector-gqa-two-pass-128";
+        "paged-sdpa-append.vector-gqa-two-pass-128", PagedSdpaAppend,
+        PagedSdpaAppendGqa128, PAGED_APPEND,
+        &["single-token decode with authenticated key/value append."],
+        &["multi-token queries."],
+        &["Each dispatch handles one lane with fixed per-head reduction order.",
+          "The block owning the appended token writes its K/V before reading it."]
+    ),
+    batch_invariant_variant!(
+        @class "paged-sdpa.vector-gqa-two-pass-256";
+        "paged-sdpa-append.vector-gqa-two-pass-256", PagedSdpaAppend,
+        PagedSdpaAppendGqa256, PAGED_APPEND,
+        &["single-token decode with authenticated key/value append."],
+        &["multi-token queries."],
+        &["Each dispatch handles one lane with fixed per-head reduction order.",
+          "The block owning the appended token writes its K/V before reading it."]
+    ),
+    batch_invariant_variant!(
+        @class "paged-sdpa.vector-gqa-two-pass-512";
+        "paged-sdpa-append.vector-gqa-two-pass-512", PagedSdpaAppend,
+        PagedSdpaAppendGqa512, PAGED_APPEND,
+        &["single-token decode with authenticated key/value append."],
+        &["multi-token queries."],
+        &["Each dispatch handles one lane with fixed per-head reduction order.",
+          "The block owning the appended token writes its K/V before reading it."]
+    ),
+    batch_invariant_variant!(
+        @class "paged-sdpa.vector-gqa-two-pass-1024";
+        "paged-sdpa-append.vector-gqa-two-pass-1024", PagedSdpaAppend,
+        PagedSdpaAppendGqa1024, PAGED_APPEND,
+        &["single-token decode with authenticated key/value append."],
+        &["multi-token queries."],
+        &["Each dispatch handles one lane with fixed per-head reduction order.",
+          "The block owning the appended token writes its K/V before reading it."]
+    ),
+    batch_invariant_variant!(
         "paged-sdpa.vector-gqa-two-pass-32",
         PagedSdpa,
         PagedSdpaVectorGqaTwoPass32,
@@ -1893,6 +1944,12 @@ mod tests {
                 "gather-quant-matmul.grouped-pair-32x32-2x2-blocked",
                 "gather-quant-matmul.weighted-broad",
                 "paged-sdpa.vector",
+                "paged-sdpa-append.vector-gqa-two-pass-32",
+                "paged-sdpa-append.vector-gqa-two-pass-64",
+                "paged-sdpa-append.vector-gqa-two-pass-128",
+                "paged-sdpa-append.vector-gqa-two-pass-256",
+                "paged-sdpa-append.vector-gqa-two-pass-512",
+                "paged-sdpa-append.vector-gqa-two-pass-1024",
                 "paged-sdpa.vector-gqa-two-pass-32",
                 "paged-sdpa.vector-gqa-two-pass",
                 "paged-sdpa.vector-gqa-two-pass-128",

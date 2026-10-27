@@ -3699,7 +3699,19 @@ impl MetalBackend {
             .try_into()
             .map_err(|_| BackendError::InvalidInput)?;
         let gqa_blocks = paged_gqa_blocks(selected_variant(dispatch));
-        if append && selected_variant(dispatch) != Some(MetalVariant::PagedSdpaAppendGqa32) {
+        if append
+            && !matches!(
+                selected_variant(dispatch),
+                Some(
+                    MetalVariant::PagedSdpaAppendGqa32
+                        | MetalVariant::PagedSdpaAppendGqa64
+                        | MetalVariant::PagedSdpaAppendGqa128
+                        | MetalVariant::PagedSdpaAppendGqa256
+                        | MetalVariant::PagedSdpaAppendGqa512
+                        | MetalVariant::PagedSdpaAppendGqa1024
+                )
+            )
+        {
             return Err(BackendError::UnsupportedOperation);
         }
         let mut params = Vec::with_capacity(128);
@@ -8530,6 +8542,11 @@ fn paged_sdpa_kernel(dispatch: &Dispatch, width: u32) -> Result<&'static str, Ba
         (
             Some(
                 MetalVariant::PagedSdpaAppendGqa32
+                | MetalVariant::PagedSdpaAppendGqa64
+                | MetalVariant::PagedSdpaAppendGqa128
+                | MetalVariant::PagedSdpaAppendGqa256
+                | MetalVariant::PagedSdpaAppendGqa512
+                | MetalVariant::PagedSdpaAppendGqa1024
                 | MetalVariant::PagedSdpaVectorGqaTwoPass32
                 | MetalVariant::PagedSdpaVectorGqaTwoPass64
                 | MetalVariant::PagedSdpaVectorGqaTwoPass128
@@ -8575,11 +8592,21 @@ fn paged_gqa_blocks(variant: Option<MetalVariant>) -> Option<u32> {
         Some(MetalVariant::PagedSdpaAppendGqa32 | MetalVariant::PagedSdpaVectorGqaTwoPass32) => {
             Some(32)
         }
-        Some(MetalVariant::PagedSdpaVectorGqaTwoPass64) => Some(64),
-        Some(MetalVariant::PagedSdpaVectorGqaTwoPass128) => Some(128),
-        Some(MetalVariant::PagedSdpaVectorGqaTwoPass256) => Some(256),
-        Some(MetalVariant::PagedSdpaVectorGqaTwoPass512) => Some(512),
-        Some(MetalVariant::PagedSdpaVectorGqaTwoPass1024) => Some(1024),
+        Some(MetalVariant::PagedSdpaAppendGqa64 | MetalVariant::PagedSdpaVectorGqaTwoPass64) => {
+            Some(64)
+        }
+        Some(MetalVariant::PagedSdpaAppendGqa128 | MetalVariant::PagedSdpaVectorGqaTwoPass128) => {
+            Some(128)
+        }
+        Some(MetalVariant::PagedSdpaAppendGqa256 | MetalVariant::PagedSdpaVectorGqaTwoPass256) => {
+            Some(256)
+        }
+        Some(MetalVariant::PagedSdpaAppendGqa512 | MetalVariant::PagedSdpaVectorGqaTwoPass512) => {
+            Some(512)
+        }
+        Some(
+            MetalVariant::PagedSdpaAppendGqa1024 | MetalVariant::PagedSdpaVectorGqaTwoPass1024,
+        ) => Some(1024),
         _ => None,
     }
 }
@@ -8933,7 +8960,14 @@ pub(super) fn variant_supported(
         | MetalVariant::PagedSdpaSteelHalf32x16
         | MetalVariant::PagedSdpaSteelHalf64x16 => paged_half_steel_sdpa_supported(dispatch)?,
         MetalVariant::TopKSingleK8 => dispatch_kernel(dispatch)? == "topk_single",
-        MetalVariant::PagedSdpaAppendGqa32 => matches!(dispatch.op(), Op::PagedSdpaAppend { .. }),
+        MetalVariant::PagedSdpaAppendGqa32
+        | MetalVariant::PagedSdpaAppendGqa64
+        | MetalVariant::PagedSdpaAppendGqa128
+        | MetalVariant::PagedSdpaAppendGqa256
+        | MetalVariant::PagedSdpaAppendGqa512
+        | MetalVariant::PagedSdpaAppendGqa1024 => {
+            matches!(dispatch.op(), Op::PagedSdpaAppend { .. })
+        }
         MetalVariant::SamplePortable => dispatch_kernel(dispatch)? == "sample_rejection",
         MetalVariant::SampleParallel => dispatch_kernel(dispatch)? == "sample_parallel",
     })

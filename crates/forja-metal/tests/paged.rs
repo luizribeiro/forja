@@ -1188,39 +1188,66 @@ paged_gqa_two_pass_tests!(
 #[test]
 fn metal_paged_append_keeps_attention_bits_and_stored_planes() {
     let metal = forja_metal::MetalBackend::new().unwrap();
-    for heads in [(16, 16), (16, 8), (32, 4)] {
-        for length in [1, 7, 33, 64, 65, 513] {
-            let expected = run_sdpa(
-                &metal,
-                DType::F16,
-                length,
-                1,
-                true,
-                false,
-                heads.0,
-                heads.1,
-                (0, 0),
-                &[],
-                Some("paged-sdpa.vector-gqa-two-pass-32"),
-                None,
-            )
-            .unwrap();
-            let actual = run_sdpa(
-                &metal,
-                DType::F16,
-                length,
-                1,
-                true,
-                false,
-                heads.0,
-                heads.1,
-                (0, 0),
-                &[],
-                Some("paged-sdpa-append.vector-gqa-two-pass-32"),
-                None,
-            )
-            .unwrap();
-            assert_eq!(encode(&expected, DType::F32), encode(&actual, DType::F32));
+    for (unfused, fused) in [
+        (
+            "paged-sdpa.vector-gqa-two-pass-32",
+            "paged-sdpa-append.vector-gqa-two-pass-32",
+        ),
+        (
+            "paged-sdpa.vector-gqa-two-pass",
+            "paged-sdpa-append.vector-gqa-two-pass-64",
+        ),
+        (
+            "paged-sdpa.vector-gqa-two-pass-128",
+            "paged-sdpa-append.vector-gqa-two-pass-128",
+        ),
+        (
+            "paged-sdpa.vector-gqa-two-pass-256",
+            "paged-sdpa-append.vector-gqa-two-pass-256",
+        ),
+        (
+            "paged-sdpa.vector-gqa-two-pass-512",
+            "paged-sdpa-append.vector-gqa-two-pass-512",
+        ),
+        (
+            "paged-sdpa.vector-gqa-two-pass-1024",
+            "paged-sdpa-append.vector-gqa-two-pass-1024",
+        ),
+    ] {
+        for heads in [(16, 16), (16, 8), (32, 4)] {
+            for length in [1, 7, 33, 64, 65, 513] {
+                let expected = run_sdpa(
+                    &metal,
+                    DType::F16,
+                    length,
+                    1,
+                    true,
+                    false,
+                    heads.0,
+                    heads.1,
+                    (0, 0),
+                    &[],
+                    Some(unfused),
+                    None,
+                )
+                .unwrap();
+                let actual = run_sdpa(
+                    &metal,
+                    DType::F16,
+                    length,
+                    1,
+                    true,
+                    false,
+                    heads.0,
+                    heads.1,
+                    (0, 0),
+                    &[],
+                    Some(fused),
+                    None,
+                )
+                .unwrap();
+                assert_eq!(encode(&expected, DType::F32), encode(&actual, DType::F32));
+            }
         }
     }
 }
