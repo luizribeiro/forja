@@ -118,6 +118,7 @@ fn diagnostic_commands(
     let operands = (0..options.copies.get())
         .map(|_| Ok((allocate(&shape.inputs)?, allocate(&shape.outputs)?)))
         .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+    let epilogue = shape.prepare_epilogue()?;
     let mut commands = CommandList::new();
     for index in 0..options.dispatches.get() {
         let (inputs, outputs) = &operands[usize::try_from(index % options.copies.get())?];
@@ -129,12 +130,19 @@ fn diagnostic_commands(
             &outputs,
             &options.variant,
         )?;
-        commands.dispatch_many_with_backend_data(
-            shape.operation,
-            &inputs,
-            &outputs,
-            BackendDispatchData::new(variant),
-        )?;
+        if let Some(epilogue) = &epilogue {
+            commands.dispatch_epilogue(shape.operation, &inputs, outputs[0], epilogue, &[])?;
+            if !commands.set_last_backend_data(BackendDispatchData::new(variant)) {
+                return Err("missing diagnostic dispatch".into());
+            }
+        } else {
+            commands.dispatch_many_with_backend_data(
+                shape.operation,
+                &inputs,
+                &outputs,
+                BackendDispatchData::new(variant),
+            )?;
+        }
     }
     Ok(commands)
 }
@@ -148,6 +156,29 @@ mod tests {
         let root = std::env::temp_dir().join(format!("forja-kernel-{}", std::process::id()));
         fs::create_dir_all(&root).unwrap();
         for (variant, shape) in [
+            (
+                "gather-quant-matmul.vector8",
+                serde_json::json!({
+                    "operation": {"kind":"gather-quant-matmul","bits":4,"group_size":64},
+                    "epilogue":"silu-mul",
+                    "inputs":[{"dtype":"f32","shape":[1,768]},
+                        {"dtype":"u32","shape":[2,33,96]}, {"dtype":"f16","shape":[2,33,12]}, {"dtype":"f16","shape":[2,33,12]},
+                        {"dtype":"u32","shape":[2,33,96]}, {"dtype":"f16","shape":[2,33,12]}, {"dtype":"f16","shape":[2,33,12]},
+                        {"dtype":"u32","shape":[1,2],"u32_values":[0,1]}],
+                    "outputs":[{"dtype":"f32","shape":[1,2,33]}]
+                }),
+            ),
+            (
+                "gather-quant-matmul.vector16",
+                serde_json::json!({
+                    "operation": {"kind":"gather-quant-matmul","bits":4,"group_size":64},
+                    "epilogue":"identity",
+                    "inputs":[{"dtype":"f32","shape":[1,2,768]},
+                        {"dtype":"u32","shape":[2,33,96]}, {"dtype":"f16","shape":[2,33,12]}, {"dtype":"f16","shape":[2,33,12]},
+                        {"dtype":"u32","shape":[1,2],"u32_values":[0,1]}, {"dtype":"f32","shape":[1,2]}],
+                    "outputs":[{"dtype":"f32","shape":[1,33]}]
+                }),
+            ),
             (
                 "matmul.gemv",
                 serde_json::json!({

@@ -9,6 +9,62 @@ pub(super) struct Shape {
     pub(super) operation: Op,
     pub(super) inputs: Vec<TensorShape>,
     pub(super) outputs: Vec<TensorShape>,
+    #[serde(default)]
+    pub(super) epilogue: Option<DiagnosticEpilogue>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(super) enum DiagnosticEpilogue {
+    Identity,
+    SiluMul,
+}
+
+impl Shape {
+    pub(super) fn prepare_epilogue(
+        &self,
+    ) -> Result<Option<std::sync::Arc<forja_core::program::PreparedEpilogue>>, Box<dyn Error>> {
+        use forja_core::program::{
+            BinOp, EpilogueSignature, Inst, Program, ProgramKind, UnOp, prepare_epilogue,
+        };
+        let Some(kind) = &self.epilogue else {
+            return Ok(None);
+        };
+        let output = self.outputs.first().ok_or("epilogue requires an output")?;
+        if self.outputs.len() != 1 {
+            return Err("epilogue requires one output".into());
+        }
+        let (accumulators, insts) = match kind {
+            DiagnosticEpilogue::Identity => (1, vec![Inst::Input(0)]),
+            DiagnosticEpilogue::SiluMul => (
+                2,
+                vec![
+                    Inst::Input(0),
+                    Inst::Input(1),
+                    Inst::Unary(UnOp::Neg, 0),
+                    Inst::Unary(UnOp::Exp, 2),
+                    Inst::Const(1.0),
+                    Inst::Binary(BinOp::Add, 4, 3),
+                    Inst::Binary(BinOp::Div, 0, 5),
+                    Inst::Binary(BinOp::Mul, 6, 1),
+                ],
+            ),
+        };
+        let last = u32::try_from(insts.len() - 1)?;
+        let program = Program {
+            kind: ProgramKind::Map,
+            insts,
+            outputs: vec![(0, last)],
+        }
+        .validate()?;
+        let signature = EpilogueSignature::new(
+            accumulators,
+            u8::try_from(output.shape.len())?,
+            vec![],
+            output.layout()?.0,
+        );
+        Ok(Some(prepare_epilogue(program, signature)?))
+    }
 }
 
 #[derive(Deserialize)]
