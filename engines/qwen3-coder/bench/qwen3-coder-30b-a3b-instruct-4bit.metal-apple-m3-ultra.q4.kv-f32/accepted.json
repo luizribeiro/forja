@@ -2,131 +2,131 @@
   "schema_version": 5,
   "implementation": "forja",
   "provenance": {
-    "commit": "3f284427d1c80f5951a04244691b33246ddd7e38",
+    "commit": "dee95c8e3290bb3ff156681c5d5a8fdf2f1f1188",
     "dirty": false,
-    "binary_sha256": "4ffb976e793c68e46a123991b8a73b160c72223e396a1dc293be5e4a83eebb9e",
+    "binary_sha256": "f2d13aab87c7221dfcfeedaa361f00f36d82557e3d3e4d5d5fc038561442d818",
     "device": "Apple M3 Ultra",
     "gpu_cores": 80,
     "macos": "27.0.1",
-    "date": "2026-10-26T07:52Z",
-    "duration_s": 2062,
+    "date": "2026-10-27T00:51Z",
+    "duration_s": 2060,
     "machine_load": {
       "before": {
         "load_average": [
-          1.49,
+          1.11,
           1.4,
-          1.59
+          1.64
         ],
         "gpu_device_percent": 0.0,
         "busiest_processes": [
           {
-            "pid": 949,
-            "cpu_percent": 15.5,
-            "command": "mds_stores"
+            "pid": 1,
+            "cpu_percent": 41.0,
+            "command": "launchd"
           },
           {
-            "pid": 662,
-            "cpu_percent": 10.7,
-            "command": "mds"
+            "pid": 43249,
+            "cpu_percent": 10.0,
+            "command": "claude"
           },
           {
-            "pid": 57021,
-            "cpu_percent": 5.1,
-            "command": "ds4-server"
+            "pid": 72316,
+            "cpu_percent": 6.9,
+            "command": "mdworker_shared"
+          },
+          {
+            "pid": 3636,
+            "cpu_percent": 6.8,
+            "command": "claude"
+          },
+          {
+            "pid": 72315,
+            "cpu_percent": 6.6,
+            "command": "mdworker_shared"
+          },
+          {
+            "pid": 72314,
+            "cpu_percent": 6.1,
+            "command": "mdworker_shared"
           },
           {
             "pid": 57122,
-            "cpu_percent": 4.6,
+            "cpu_percent": 4.8,
             "command": "python3.13"
           },
           {
             "pid": 57166,
-            "cpu_percent": 4.4,
+            "cpu_percent": 4.6,
             "command": "python3.13"
           },
           {
-            "pid": 73045,
-            "cpu_percent": 2.7,
-            "command": "mdworker_shared"
+            "pid": 72313,
+            "cpu_percent": 3.9,
+            "command": "bash"
           },
           {
-            "pid": 73048,
-            "cpu_percent": 2.4,
-            "command": "mdworker_shared"
+            "pid": 674,
+            "cpu_percent": 3.7,
+            "command": "opendirectoryd"
           },
           {
-            "pid": 794,
-            "cpu_percent": 2.3,
-            "command": "syspolicyd"
+            "pid": 34523,
+            "cpu_percent": 2.8,
+            "command": "codex"
           },
           {
-            "pid": 73039,
-            "cpu_percent": 1.9,
-            "command": "mdworker_shared"
+            "pid": 41938,
+            "cpu_percent": 1.8,
+            "command": "python3"
           },
           {
-            "pid": 73047,
-            "cpu_percent": 1.9,
-            "command": "mdworker_shared"
+            "pid": 50125,
+            "cpu_percent": 1.5,
+            "command": "claude"
           },
           {
-            "pid": 73046,
-            "cpu_percent": 1.7,
-            "command": "mdworker_shared"
+            "pid": 662,
+            "cpu_percent": 1.4,
+            "command": "mds"
           },
           {
-            "pid": 638,
-            "cpu_percent": 1.6,
-            "command": "fseventsd"
+            "pid": 699,
+            "cpu_percent": 1.4,
+            "command": "notifyd"
           },
           {
-            "pid": 73044,
-            "cpu_percent": 1.6,
-            "command": "mdworker_shared"
-          },
-          {
-            "pid": 73028,
-            "cpu_percent": 1.2,
-            "command": "mdworker_shared"
-          },
-          {
-            "pid": 672,
-            "cpu_percent": 1.0,
-            "command": "contextstored"
-          },
-          {
-            "pid": 1997,
-            "cpu_percent": 1.0,
-            "command": "Steam Helper"
+            "pid": 3937,
+            "cpu_percent": 1.1,
+            "command": "claude"
           }
         ]
       },
       "after": {
         "load_average": [
-          1.38,
-          1.45,
-          1.48
+          2.65,
+          2.07,
+          1.81
         ],
         "gpu_device_percent": 95.0,
         "busiest_processes": [
           {
             "pid": 56976,
-            "cpu_percent": 98.2,
+            "cpu_percent": 100.0,
             "command": "ds4-server"
           },
           {
-            "pid": 1,
-            "cpu_percent": 23.4,
-            "command": "launchd"
+            "pid": 57021,
+            "cpu_percent": 18.0,
+            "command": "ds4-server"
           },
           {
             "pid": 57122,
-            "cpu_percent": 4.0,
+            "cpu_percent": 3.6,
             "command": "python3.13"
           },
           {
             "pid": 57166,
-            "cpu_percent": 3.9,
+            "cpu_percent": 3.6,
             "command": "python3.13"
           }
         ]
@@ -135,7 +135,7 @@
   },
   "inputs": [
     {
-      "engine_sha256": "101a05227a232d6b9742139a256472713bd61df7aeb030b0078ae0af99d2755b",
+      "engine_sha256": "0854c7b34e7d47acd29b5752ca7b51959fac8e8f3426c9bb5e9aecb58bb0e701",
       "profile_name": "qwen3-coder-30b-a3b-instruct-4bit.metal-apple-m3-ultra.q4.kv-f32",
       "profile_family": "qwen3-coder",
       "numerics": {
@@ -143,12 +143,12 @@
         "weights": "q4",
         "kv-cache": "f32"
       },
-      "profile_hash": "sha256:79fcd6b86c153277538b24ad238c313584933bc4cca6faf594cfdf42fd565ac8",
+      "profile_hash": "sha256:3363d5f1ca89f1590c2378ae872b1adf1143221e0595e72c07ce691cf5ab8fe2",
       "weights_sha256": "sha256:2f0797714404ba75a18599829d8ab96e316ef0088aa6f49e7cb7eb301043f5ec",
       "model_revision": "6e302ea604ad9ab206367e2c501d1571023e7b6d"
     }
   ],
-  "config": "[backend]\nkind = \"metal\"\n\n[backend.metal]\ngraph_replay = \"tier2\"\npool_capacity = \"auto\"\n\n[bench]\nbreakdown = false\ncontexts = [9, 512, 2048, 4000]\ndecode_prefill = 8\npp = 512\nreps = 30\nselection = [\"gpu-sequential\", \"gpu-pipelined\"]\ntg = 128\nwarmups = 3\n\n[bench.sampling]\nseed = 0\ntemperature = 0.0\ntop_k = 0\ntop_p = 1.0\n\n[bench.vary]\n\n[engine]\nreplay = true\n\n[engine.tunings]\nadd = []\nbase = \"profile\"\nremove = []\n\n[engine.variant-picks]\n\n[engine.variant-rules]\n\n[limits]\ndispatches_per_list = 4096\ngpu_time_budget = \"3600000ms\"\nguest_call_timeout = \"300000ms\"\nguest_memory_bytes = 4294967296\ninstances = 10000\nlive_bytes = \"auto\"\nlive_graphs = 16\nlive_kernels = 64\nlive_tensor_handles = 20000\nread_bytes = 1073741824\nsubmission_timeout = \"60000ms\"\ntable_elements = 10000\ntensor_elements = 1000000000\ntensor_rank = 4\nwork_per_dispatch = \"unlimited\"\n\n[run]\nmax_tokens = 128\ntemperature = 0.0\ntop_k = 0\ntop_p = 1.0\n\n[verify]\nprompts = []\n",
+  "config": "[backend]\nkind = \"metal\"\n\n[backend.metal]\ngraph_replay = \"tier2\"\npool_capacity = \"auto\"\n\n[bench]\nbreakdown = false\ncontexts = [9, 512, 2048, 4000]\ndecode_prefill = 8\npp = 512\nreps = 30\nselection = [\"gpu-sequential\", \"gpu-pipelined\"]\ntg = 128\nwarmups = 3\n\n[bench.sampling]\nseed = 0\ntemperature = 0.0\ntop_k = 0\ntop_p = 1.0\n\n[bench.vary]\n\n[engine]\nreplay = true\n\n[engine.tunings]\nadd = []\nbase = \"profile\"\nremove = []\n\n[engine.variant-picks]\n\n[engine.variant-rules]\n\n[limits]\ndispatches_per_list = 4096\ngpu_time_budget = \"3600000ms\"\nguest_call_timeout = \"300000ms\"\nguest_memory_bytes = 4294967296\ninstances = 10000\nlive_bytes = 103079215104\nlive_graphs = 16\nlive_kernels = 64\nlive_tensor_handles = 20000\nread_bytes = 1073741824\nsubmission_timeout = \"60000ms\"\ntable_elements = 10000\ntensor_elements = 1000000000\ntensor_rank = 4\nwork_per_dispatch = \"unlimited\"\n\n[run]\nmax_tokens = 128\ntemperature = 0.0\ntop_k = 0\ntop_p = 1.0\n\n[verify]\nprompts = []\n",
   "origins": {
     "backend.kind": "default",
     "backend.metal.graph_replay": "auto",
@@ -174,7 +174,7 @@
     "limits.guest_call_timeout": "default",
     "limits.guest_memory_bytes": "default",
     "limits.instances": "default",
-    "limits.live_bytes": "default",
+    "limits.live_bytes": "--set #1",
     "limits.live_graphs": "default",
     "limits.live_kernels": "default",
     "limits.live_tensor_handles": "default",
@@ -191,49 +191,49 @@
     "verify.prompts": "default"
   },
   "auto_notes": [
-    "backend.metal.graph_replay: auto -> tier2 (Apple M3 Ultra/macOS 27.0.1 @3f284427d1c80f5951a04244691b33246ddd7e38)"
+    "backend.metal.graph_replay: auto -> tier2 (Apple M3 Ultra/macOS 27.0.1 @dee95c8e3290bb3ff156681c5d5a8fdf2f1f1188)"
   ],
-  "config_hash": "sha256:b1b11b915e07c6c7ad15e59c1018e6f6bc0c2187a1c08cc0fc7e473d04ab63e8",
-  "perf_hash": "sha256:7f3540184ed0482bb55c23d2fc0ae0817b456ac134ef52183e2f528ed1dee4f7",
+  "config_hash": "sha256:04bc0e141bc4dd5c0d1bfdcb32a4321bf58a03299f866e9e4739f1e3c3364a78",
+  "perf_hash": "sha256:1a81b6546d5cc06bf002d27a08cc9457f66069f404283928bcde0bb2ab413f24",
   "axes": {},
   "allow_diff": [],
   "results": [
     {
       "input": 0,
       "point": {},
-      "perf_hash": "sha256:599dad06dbb3a458e17d0ab27afc9f1c272b73db19f21045dd8c6daf3977a65d",
+      "perf_hash": "sha256:034e169df2e1ea400e9779057e0a6371f9a5585c3e73dbc1707e0644731cfbaa",
       "output_digest": "sha256:e2d9a485209b9196e82e4dc8ba6244cf006061b354fe966bf2b26dfbbca4a7bc",
-      "peak_physical_footprint_bytes": 36311662480,
+      "peak_physical_footprint_bytes": 35251175288,
       "selection": "gpu-sequential",
       "pp": {
         "tokens_per_second": {
           "wall": {
-            "median": 1399.9710189481716,
+            "median": 1399.617240917386,
             "ci95": [
-              1391.0373858277878,
-              1403.424454896442
+              1381.967460215775,
+              1406.909219061734
             ]
           },
           "gpu": {
-            "median": 1904.7149614428154,
+            "median": 1904.5556948103576,
             "ci95": [
-              1903.942331252736,
-              1905.2125782610722
+              1902.6310641436723,
+              1905.2846530623638
             ]
           }
         },
         "wall_time_seconds": {
-          "median": 0.36572193750000004,
+          "median": 0.365814396,
           "ci95": [
-            0.364821917,
-            0.368070625
+            0.363918292,
+            0.370486292
           ]
         },
         "gpu_time_seconds": {
-          "median": 0.26880662499999997,
+          "median": 0.268829104,
           "ci95": [
-            0.268736416,
-            0.268915708
+            0.26872625,
+            0.269101041
           ]
         },
         "submissions": {
@@ -247,32 +247,32 @@
       "tg": {
         "tokens_per_second": {
           "wall": {
-            "median": 86.61101823104495,
+            "median": 86.6190402796941,
             "ci95": [
-              85.49870447152908,
-              87.98782331013972
+              84.30605233894006,
+              87.4663459567315
             ]
           },
           "gpu": {
-            "median": 115.85975167235273,
+            "median": 115.32839664111931,
             "ci95": [
-              114.79557236311412,
-              116.53774990671471
+              113.74303539731159,
+              116.40354404885666
             ]
           }
         },
         "wall_time_seconds": {
-          "median": 1.4778740415,
+          "median": 1.4777415624999999,
           "ci95": [
-            1.45474675,
-            1.497098708
+            1.46342,
+            1.518277709
           ]
         },
         "gpu_time_seconds": {
-          "median": 1.104784102,
+          "median": 1.109874791,
           "ci95": [
-            1.098356542,
-            1.115025583
+            1.099622877,
+            1.125343627
           ]
         },
         "submissions": {
@@ -289,32 +289,32 @@
           "tg": {
             "tokens_per_second": {
               "wall": {
-                "median": 86.61101823104495,
+                "median": 86.6190402796941,
                 "ci95": [
-                  85.49870447152908,
-                  87.98782331013972
+                  84.30605233894006,
+                  87.4663459567315
                 ]
               },
               "gpu": {
-                "median": 115.85975167235273,
+                "median": 115.32839664111931,
                 "ci95": [
-                  114.79557236311412,
-                  116.53774990671471
+                  113.74303539731159,
+                  116.40354404885666
                 ]
               }
             },
             "wall_time_seconds": {
-              "median": 1.4778740415,
+              "median": 1.4777415624999999,
               "ci95": [
-                1.45474675,
-                1.497098708
+                1.46342,
+                1.518277709
               ]
             },
             "gpu_time_seconds": {
-              "median": 1.104784102,
+              "median": 1.109874791,
               "ci95": [
-                1.098356542,
-                1.115025583
+                1.099622877,
+                1.125343627
               ]
             },
             "submissions": {
@@ -331,32 +331,32 @@
           "tg": {
             "tokens_per_second": {
               "wall": {
-                "median": 78.60287726957152,
+                "median": 79.28628273607703,
                 "ci95": [
-                  78.28545876721921,
-                  80.45001096367093
+                  77.84322377893304,
+                  80.12827615537299
                 ]
               },
               "gpu": {
-                "median": 103.4202609147021,
+                "median": 103.64516553274032,
                 "ci95": [
-                  102.05452485915953,
-                  104.59681921301579
+                  102.33104263055914,
+                  104.7356365343495
                 ]
               }
             },
             "wall_time_seconds": {
-              "median": 1.6284391459999998,
+              "median": 1.614403021,
               "ci95": [
-                1.591050125,
-                1.6350418329999998
+                1.597438584,
+                1.644330666
               ]
             },
             "gpu_time_seconds": {
-              "median": 1.237668515,
+              "median": 1.234990603,
               "ci95": [
-                1.223746582,
-                1.254231502
+                1.22212462,
+                1.250842332
               ]
             },
             "submissions": {
@@ -373,32 +373,32 @@
           "tg": {
             "tokens_per_second": {
               "wall": {
-                "median": 63.72803790863669,
+                "median": 63.6478407703151,
                 "ci95": [
-                  63.444498496954225,
-                  64.52639965766164
+                  63.15474220376577,
+                  64.29943310439967
                 ]
               },
               "gpu": {
-                "median": 78.56363295478505,
+                "median": 78.27740249099534,
                 "ci95": [
-                  78.27272275670248,
-                  79.04986596594988
+                  77.46378906765165,
+                  79.10499911828826
                 ]
               }
             },
             "wall_time_seconds": {
-              "median": 2.0085376459999997,
+              "median": 2.0110661875,
               "ci95": [
-                1.9836842080000001,
-                2.017511416
+                1.990686291,
+                2.026767833
               ]
             },
             "gpu_time_seconds": {
-              "median": 1.6292534810000001,
+              "median": 1.6352263114999999,
               "ci95": [
-                1.619231082,
-                1.6353078760000002
+                1.61810254,
+                1.65238496
               ]
             },
             "submissions": {
@@ -415,32 +415,32 @@
           "tg": {
             "tokens_per_second": {
               "wall": {
-                "median": 51.25247312810541,
+                "median": 51.13933139472769,
                 "ci95": [
-                  51.00944401997458,
-                  51.3405670636065
+                  50.871651469174786,
+                  51.24454089403681
                 ]
               },
               "gpu": {
-                "median": 60.48264405513041,
+                "median": 60.64800461615471,
                 "ci95": [
-                  60.27550375019163,
-                  60.73131056629517
+                  60.44345905823721,
+                  60.830829021566544
                 ]
               }
             },
             "wall_time_seconds": {
-              "median": 2.497440562,
+              "median": 2.502966083,
               "ci95": [
-                2.493155166,
-                2.50933925
+                2.497827042,
+                2.516136125
               ]
             },
             "gpu_time_seconds": {
-              "median": 2.1163096045,
+              "median": 2.1105396045,
               "ci95": [
-                2.107644291,
-                2.123582418
+                2.104196212,
+                2.117681582
               ]
             },
             "submissions": {
@@ -461,38 +461,38 @@
           ],
           "capture": {
             "graphs": 2,
-            "wall_seconds": 0.024914791,
-            "validation_seconds": 0.012290458
+            "wall_seconds": 0.024180166,
+            "validation_seconds": 0.011011209
           },
           "aggregate": {
             "tokens_per_second": {
               "wall": {
-                "median": 74.20947326726198,
+                "median": 74.64835593137275,
                 "ci95": [
-                  73.64350852223795,
-                  75.08818463462816
+                  73.33899003457026,
+                  75.57636946877564
                 ]
               },
               "gpu": {
-                "median": 96.38620131986875,
+                "median": 96.23868762632657,
                 "ci95": [
-                  95.91318691239208,
-                  96.9482968083074
+                  95.66804694481887,
+                  97.1854593651631
                 ]
               }
             },
             "wall_time_seconds": {
-              "median": 1.724847542,
+              "median": 1.7147063120000001,
               "ci95": [
-                1.704662333,
-                1.738102958
+                1.693651083,
+                1.745319917
               ]
             },
             "gpu_time_seconds": {
-              "median": 1.3279909185,
+              "median": 1.330026956,
               "ci95": [
-                1.320291374,
-                1.334540162
+                1.317069455,
+                1.33795979
               ]
             },
             "submissions": {
@@ -509,17 +509,17 @@
               "context_start": 512,
               "itl_seconds": {
                 "wall": {
-                  "median": 0.013475371421875,
+                  "median": 0.013396143062500001,
                   "ci95": [
-                    0.0133176744765625,
-                    0.013578929359375
+                    0.0132316490859375,
+                    0.0136353118515625
                   ]
                 },
                 "gpu": {
-                  "median": 0.01037492905078125,
+                  "median": 0.01039083559375,
                   "ci95": [
-                    0.010314776359375,
-                    0.010426095015625
+                    0.0102896051171875,
+                    0.010452810859375
                   ]
                 }
               }
@@ -534,38 +534,38 @@
           ],
           "capture": {
             "graphs": 2,
-            "wall_seconds": 0.043951209,
-            "validation_seconds": 0.023035375
+            "wall_seconds": 0.041982666,
+            "validation_seconds": 0.020427249
           },
           "aggregate": {
             "tokens_per_second": {
               "wall": {
-                "median": 88.12729230791163,
+                "median": 88.29970403842097,
                 "ci95": [
-                  87.8909804041899,
-                  88.29088546336516
+                  88.05941933428325,
+                  88.40905616536789
                 ]
               },
               "gpu": {
-                "median": 106.99170418523161,
+                "median": 107.10692824553342,
                 "ci95": [
-                  106.81368756305355,
-                  107.18781556775912
+                  106.77706422971131,
+                  107.3432103997544
                 ]
               }
             },
             "wall_time_seconds": {
-              "median": 2.904888979,
+              "median": 2.899217229,
               "ci95": [
-                2.899506542,
-                2.912699333
+                2.895630958,
+                2.907127959
               ]
             },
             "gpu_time_seconds": {
-              "median": 2.392708895,
+              "median": 2.3901352045,
               "ci95": [
-                2.388331161,
-                2.3966965829999998
+                2.384873706,
+                2.397518623
               ]
             },
             "submissions": {
@@ -582,17 +582,17 @@
               "context_start": 512,
               "itl_seconds": {
                 "wall": {
-                  "median": 0.0226944451484375,
+                  "median": 0.0226501346015625,
                   "ci95": [
-                    0.022652394859375,
-                    0.0227554635390625
+                    0.022622116859375,
+                    0.0227119371796875
                   ]
                 },
                 "gpu": {
-                  "median": 0.0186930382421875,
+                  "median": 0.01867293128515625,
                   "ci95": [
-                    0.0186588371953125,
-                    0.018724192054687498
+                    0.018631825828125,
+                    0.0187306142421875
                   ]
                 }
               }
@@ -602,17 +602,17 @@
               "context_start": 2048,
               "itl_seconds": {
                 "wall": {
-                  "median": 0.0226944451484375,
+                  "median": 0.0226501346015625,
                   "ci95": [
-                    0.022652394859375,
-                    0.0227554635390625
+                    0.022622116859375,
+                    0.0227119371796875
                   ]
                 },
                 "gpu": {
-                  "median": 0.0186930382421875,
+                  "median": 0.01867293128515625,
                   "ci95": [
-                    0.0186588371953125,
-                    0.018724192054687498
+                    0.018631825828125,
+                    0.0187306142421875
                   ]
                 }
               }
@@ -629,38 +629,38 @@
           ],
           "capture": {
             "graphs": 2,
-            "wall_seconds": 0.074592874,
-            "validation_seconds": 0.045350583
+            "wall_seconds": 0.066880667,
+            "validation_seconds": 0.039066125
           },
           "aggregate": {
             "tokens_per_second": {
               "wall": {
-                "median": 114.83515162525765,
+                "median": 114.56222147723909,
                 "ci95": [
-                  114.65208379105341,
-                  115.09203935113715
+                  114.33171705569765,
+                  114.79483020325263
                 ]
               },
               "gpu": {
-                "median": 137.8772233842796,
+                "median": 138.00295490380947,
                 "ci95": [
-                  137.6681732389479,
-                  138.1521403959276
+                  137.65289494189963,
+                  138.11215473270954
                 ]
               }
             },
             "wall_time_seconds": {
-              "median": 4.458565396,
+              "median": 4.469187271,
               "ci95": [
-                4.4486135,
-                4.465684208
+                4.460131167,
+                4.478197417
               ]
             },
             "gpu_time_seconds": {
-              "median": 3.713449247,
+              "median": 3.7100654975,
               "ci95": [
-                3.706059121,
-                3.719087629
+                3.707132084,
+                3.719500416
               ]
             },
             "submissions": {
@@ -677,17 +677,17 @@
               "context_start": 512,
               "itl_seconds": {
                 "wall": {
-                  "median": 0.03483254215625,
+                  "median": 0.0349155255546875,
                   "ci95": [
-                    0.03475479296875,
-                    0.034888157875
+                    0.0348447747421875,
+                    0.0349859173203125
                   ]
                 },
                 "gpu": {
-                  "median": 0.0290113222421875,
+                  "median": 0.02898488669921875,
                   "ci95": [
-                    0.0289535868828125,
-                    0.0290553721015625
+                    0.02896196940625,
+                    0.029058597
                   ]
                 }
               }
@@ -697,17 +697,17 @@
               "context_start": 2048,
               "itl_seconds": {
                 "wall": {
-                  "median": 0.03483254215625,
+                  "median": 0.0349155255546875,
                   "ci95": [
-                    0.03475479296875,
-                    0.034888157875
+                    0.0348447747421875,
+                    0.0349859173203125
                   ]
                 },
                 "gpu": {
-                  "median": 0.0290113222421875,
+                  "median": 0.02898488669921875,
                   "ci95": [
-                    0.0289535868828125,
-                    0.0290553721015625
+                    0.02896196940625,
+                    0.029058597
                   ]
                 }
               }
@@ -717,17 +717,17 @@
               "context_start": 512,
               "itl_seconds": {
                 "wall": {
-                  "median": 0.03483254215625,
+                  "median": 0.0349155255546875,
                   "ci95": [
-                    0.03475479296875,
-                    0.034888157875
+                    0.0348447747421875,
+                    0.0349859173203125
                   ]
                 },
                 "gpu": {
-                  "median": 0.0290113222421875,
+                  "median": 0.02898488669921875,
                   "ci95": [
-                    0.0289535868828125,
-                    0.0290553721015625
+                    0.02896196940625,
+                    0.029058597
                   ]
                 }
               }
@@ -737,17 +737,17 @@
               "context_start": 2048,
               "itl_seconds": {
                 "wall": {
-                  "median": 0.03483254215625,
+                  "median": 0.0349155255546875,
                   "ci95": [
-                    0.03475479296875,
-                    0.034888157875
+                    0.0348447747421875,
+                    0.0349859173203125
                   ]
                 },
                 "gpu": {
-                  "median": 0.0290113222421875,
+                  "median": 0.02898488669921875,
                   "ci95": [
-                    0.0289535868828125,
-                    0.0290553721015625
+                    0.02896196940625,
+                    0.029058597
                   ]
                 }
               }
@@ -768,38 +768,38 @@
           ],
           "capture": {
             "graphs": 2,
-            "wall_seconds": 0.159218833,
-            "validation_seconds": 0.112198
+            "wall_seconds": 0.146880041,
+            "validation_seconds": 0.09796725
           },
           "aggregate": {
             "tokens_per_second": {
               "wall": {
-                "median": 134.43343170643698,
+                "median": 134.37331930733328,
                 "ci95": [
-                  134.2583590045903,
-                  134.5937064269675
+                  134.18510005802764,
+                  134.47255413541717
                 ]
               },
               "gpu": {
-                "median": 159.37929508164723,
+                "median": 159.4385014561458,
                 "ci95": [
-                  159.26785517605578,
-                  159.44988238432458
+                  159.35481537833329,
+                  159.52644226649102
                 ]
               }
             },
             "wall_time_seconds": {
-              "median": 7.617154,
+              "median": 7.6205604585,
               "ci95": [
-                7.6080823330000005,
-                7.627085625
+                7.614936792,
+                7.631249666
               ]
             },
             "gpu_time_seconds": {
-              "median": 6.4249248935,
+              "median": 6.4225390395,
               "ci95": [
-                6.422080623,
-                6.429420418
+                6.41899854,
+                6.425911872
               ]
             },
             "submissions": {
@@ -816,17 +816,17 @@
               "context_start": 512,
               "itl_seconds": {
                 "wall": {
-                  "median": 0.059509015625,
+                  "median": 0.05953562858203125,
                   "ci95": [
-                    0.059438143226562504,
-                    0.0595866064453125
+                    0.0594916936875,
+                    0.059619138015625
                   ]
                 },
                 "gpu": {
-                  "median": 0.05019472573046875,
+                  "median": 0.05017608624609375,
                   "ci95": [
-                    0.0501725048671875,
-                    0.050229847015625
+                    0.05014842609375,
+                    0.0502024365
                   ]
                 }
               }
@@ -836,17 +836,17 @@
               "context_start": 2048,
               "itl_seconds": {
                 "wall": {
-                  "median": 0.059509015625,
+                  "median": 0.05953562858203125,
                   "ci95": [
-                    0.059438143226562504,
-                    0.0595866064453125
+                    0.0594916936875,
+                    0.059619138015625
                   ]
                 },
                 "gpu": {
-                  "median": 0.05019472573046875,
+                  "median": 0.05017608624609375,
                   "ci95": [
-                    0.0501725048671875,
-                    0.050229847015625
+                    0.05014842609375,
+                    0.0502024365
                   ]
                 }
               }
@@ -856,17 +856,17 @@
               "context_start": 512,
               "itl_seconds": {
                 "wall": {
-                  "median": 0.059509015625,
+                  "median": 0.05953562858203125,
                   "ci95": [
-                    0.059438143226562504,
-                    0.0595866064453125
+                    0.0594916936875,
+                    0.059619138015625
                   ]
                 },
                 "gpu": {
-                  "median": 0.05019472573046875,
+                  "median": 0.05017608624609375,
                   "ci95": [
-                    0.0501725048671875,
-                    0.050229847015625
+                    0.05014842609375,
+                    0.0502024365
                   ]
                 }
               }
@@ -876,17 +876,17 @@
               "context_start": 2048,
               "itl_seconds": {
                 "wall": {
-                  "median": 0.059509015625,
+                  "median": 0.05953562858203125,
                   "ci95": [
-                    0.059438143226562504,
-                    0.0595866064453125
+                    0.0594916936875,
+                    0.059619138015625
                   ]
                 },
                 "gpu": {
-                  "median": 0.05019472573046875,
+                  "median": 0.05017608624609375,
                   "ci95": [
-                    0.0501725048671875,
-                    0.050229847015625
+                    0.05014842609375,
+                    0.0502024365
                   ]
                 }
               }
@@ -896,17 +896,17 @@
               "context_start": 512,
               "itl_seconds": {
                 "wall": {
-                  "median": 0.059509015625,
+                  "median": 0.05953562858203125,
                   "ci95": [
-                    0.059438143226562504,
-                    0.0595866064453125
+                    0.0594916936875,
+                    0.059619138015625
                   ]
                 },
                 "gpu": {
-                  "median": 0.05019472573046875,
+                  "median": 0.05017608624609375,
                   "ci95": [
-                    0.0501725048671875,
-                    0.050229847015625
+                    0.05014842609375,
+                    0.0502024365
                   ]
                 }
               }
@@ -916,17 +916,17 @@
               "context_start": 2048,
               "itl_seconds": {
                 "wall": {
-                  "median": 0.059509015625,
+                  "median": 0.05953562858203125,
                   "ci95": [
-                    0.059438143226562504,
-                    0.0595866064453125
+                    0.0594916936875,
+                    0.059619138015625
                   ]
                 },
                 "gpu": {
-                  "median": 0.05019472573046875,
+                  "median": 0.05017608624609375,
                   "ci95": [
-                    0.0501725048671875,
-                    0.050229847015625
+                    0.05014842609375,
+                    0.0502024365
                   ]
                 }
               }
@@ -936,17 +936,17 @@
               "context_start": 512,
               "itl_seconds": {
                 "wall": {
-                  "median": 0.059509015625,
+                  "median": 0.05953562858203125,
                   "ci95": [
-                    0.059438143226562504,
-                    0.0595866064453125
+                    0.0594916936875,
+                    0.059619138015625
                   ]
                 },
                 "gpu": {
-                  "median": 0.05019472573046875,
+                  "median": 0.05017608624609375,
                   "ci95": [
-                    0.0501725048671875,
-                    0.050229847015625
+                    0.05014842609375,
+                    0.0502024365
                   ]
                 }
               }
@@ -956,17 +956,17 @@
               "context_start": 2048,
               "itl_seconds": {
                 "wall": {
-                  "median": 0.059509015625,
+                  "median": 0.05953562858203125,
                   "ci95": [
-                    0.059438143226562504,
-                    0.0595866064453125
+                    0.0594916936875,
+                    0.059619138015625
                   ]
                 },
                 "gpu": {
-                  "median": 0.05019472573046875,
+                  "median": 0.05017608624609375,
                   "ci95": [
-                    0.0501725048671875,
-                    0.050229847015625
+                    0.05014842609375,
+                    0.0502024365
                   ]
                 }
               }
@@ -978,74 +978,74 @@
         {
           "parameters": 0,
           "nanoseconds": {
-            "median": 1.76333,
+            "median": 1.72333,
             "ci95": [
-              1.7625,
-              1.76416
+              1.72292,
+              1.72375
             ]
           }
         },
         {
           "parameters": 4,
           "nanoseconds": {
-            "median": 17.111874999999998,
+            "median": 17.38563,
             "ci95": [
-              17.05208,
-              17.31542
+              17.20083,
+              17.455
             ]
           }
         },
         {
           "parameters": 8,
           "nanoseconds": {
-            "median": 21.636045000000003,
+            "median": 20.038539999999998,
             "ci95": [
-              20.847499999999997,
-              21.72709
+              19.989589999999996,
+              20.087909999999997
             ]
           }
         }
       ],
       "sampling_fallbacks": [],
       "engine.tunings": [],
-      "engine.picks_hash": "sha256:6527881308fda86654db527a16f69b00a307f42b229c1a988183261b7c5d1224"
+      "engine.picks_hash": "sha256:dbddcbba6b24affa08619b1aed8d0738d3331b3f05c38454a7094f3b94ceba04"
     },
     {
       "input": 0,
       "point": {},
-      "perf_hash": "sha256:599dad06dbb3a458e17d0ab27afc9f1c272b73db19f21045dd8c6daf3977a65d",
+      "perf_hash": "sha256:034e169df2e1ea400e9779057e0a6371f9a5585c3e73dbc1707e0644731cfbaa",
       "output_digest": "sha256:e2d9a485209b9196e82e4dc8ba6244cf006061b354fe966bf2b26dfbbca4a7bc",
-      "peak_physical_footprint_bytes": 48477599352,
+      "peak_physical_footprint_bytes": 48473634352,
       "selection": "gpu-pipelined",
       "pp": {
         "tokens_per_second": {
           "wall": {
-            "median": 1348.4422524370118,
+            "median": 1317.5950111838592,
             "ci95": [
-              1304.7678902147095,
-              1401.7877585187866
+              1299.8200889058155,
+              1404.908516020626
             ]
           },
           "gpu": {
-            "median": 1903.3570788927445,
+            "median": 1901.7732419102538,
             "ci95": [
-              1884.309124224091,
-              1904.1839693423706
+              1885.1029182247362,
+              1902.640785886371
             ]
           }
         },
         "wall_time_seconds": {
-          "median": 0.379895771,
+          "median": 0.388604,
           "ci95": [
-            0.365247875,
-            0.392406959
+            0.364436541,
+            0.393900667
           ]
         },
         "gpu_time_seconds": {
-          "median": 0.26899839550000004,
+          "median": 0.26922243749999997,
           "ci95": [
-            0.268881583,
-            0.271717625
+            0.269099666,
+            0.271603208
           ]
         },
         "submissions": {
@@ -1059,32 +1059,32 @@
       "tg": {
         "tokens_per_second": {
           "wall": {
-            "median": 115.1126764345172,
+            "median": 115.90871038340518,
             "ci95": [
-              114.93886041483655,
-              115.28803401194435
+              115.79585947352112,
+              115.9551141630324
             ]
           },
           "gpu": {
-            "median": 116.40832165302817,
+            "median": 117.1152637153807,
             "ci95": [
-              116.27854140146795,
-              116.48277144779003
+              116.99678381691128,
+              117.23407732646353
             ]
           }
         },
         "wall_time_seconds": {
-          "median": 1.1119539999999999,
+          "median": 1.1043173545,
           "ci95": [
-            1.110262666,
-            1.113635541
+            1.103875417,
+            1.105393583
           ]
         },
         "gpu_time_seconds": {
-          "median": 1.0995777885,
+          "median": 1.0929403905,
           "ci95": [
-            1.098874953,
-            1.100805002
+            1.091832707,
+            1.094047168
           ]
         },
         "submissions": {
@@ -1101,32 +1101,32 @@
           "tg": {
             "tokens_per_second": {
               "wall": {
-                "median": 115.1126764345172,
+                "median": 115.90871038340518,
                 "ci95": [
-                  114.93886041483655,
-                  115.28803401194435
+                  115.79585947352112,
+                  115.9551141630324
                 ]
               },
               "gpu": {
-                "median": 116.40832165302817,
+                "median": 117.1152637153807,
                 "ci95": [
-                  116.27854140146795,
-                  116.48277144779003
+                  116.99678381691128,
+                  117.23407732646353
                 ]
               }
             },
             "wall_time_seconds": {
-              "median": 1.1119539999999999,
+              "median": 1.1043173545,
               "ci95": [
-                1.110262666,
-                1.113635541
+                1.103875417,
+                1.105393583
               ]
             },
             "gpu_time_seconds": {
-              "median": 1.0995777885,
+              "median": 1.0929403905,
               "ci95": [
-                1.098874953,
-                1.100805002
+                1.091832707,
+                1.094047168
               ]
             },
             "submissions": {
@@ -1143,32 +1143,32 @@
           "tg": {
             "tokens_per_second": {
               "wall": {
-                "median": 103.09933426321317,
+                "median": 104.24533583957755,
                 "ci95": [
-                  102.91683459364015,
-                  103.2742023252498
+                  104.09116220062032,
+                  104.53863389333016
                 ]
               },
               "gpu": {
-                "median": 103.98982237681702,
+                "median": 105.31773642470208,
                 "ci95": [
-                  103.76411787532129,
-                  104.24213235458224
+                  105.02781017846974,
+                  105.50954602522208
                 ]
               }
             },
             "wall_time_seconds": {
-              "median": 1.241521167,
+              "median": 1.2278733955,
               "ci95": [
-                1.239418917,
-                1.2437226670000001
+                1.224427709,
+                1.2296913329999999
               ]
             },
             "gpu_time_seconds": {
-              "median": 1.230889688,
+              "median": 1.21536985,
               "ci95": [
-                1.227910415,
-                1.233567081
+                1.213160371,
+                1.2187248290000001
               ]
             },
             "submissions": {
@@ -1185,32 +1185,32 @@
           "tg": {
             "tokens_per_second": {
               "wall": {
-                "median": 78.3455083880277,
+                "median": 78.78517060953413,
                 "ci95": [
-                  78.22081462562623,
-                  78.4119157275924
+                  78.71542371511424,
+                  78.87791643185106
                 ]
               },
               "gpu": {
-                "median": 78.7938295894355,
+                "median": 79.25804584902073,
                 "ci95": [
-                  78.70968798010027,
-                  78.92283680518376
+                  79.20576027851914,
+                  79.35045852157218
                 ]
               }
             },
             "wall_time_seconds": {
-              "median": 1.6337886875,
+              "median": 1.6246712295,
               "ci95": [
-                1.632404958,
-                1.636393083
+                1.622760917,
+                1.626110792
               ]
             },
             "gpu_time_seconds": {
-              "median": 1.6244927285000001,
+              "median": 1.6149779954999999,
               "ci95": [
-                1.621837293,
-                1.62622929
+                1.613097169,
+                1.61604408
               ]
             },
             "submissions": {
@@ -1227,32 +1227,32 @@
           "tg": {
             "tokens_per_second": {
               "wall": {
-                "median": 60.351394848197295,
+                "median": 60.425650330984894,
                 "ci95": [
-                  60.29633884045783,
-                  60.426640406255856
+                  60.3672960880872,
+                  60.52049517112643
                 ]
               },
               "gpu": {
-                "median": 60.657802027231185,
+                "median": 60.73155010525305,
                 "ci95": [
-                  60.56605606645518,
-                  60.74229692112696
+                  60.692624927953055,
+                  60.810004895276656
                 ]
               }
             },
             "wall_time_seconds": {
-              "median": 2.120912042,
+              "median": 2.1183057085000003,
               "ci95": [
-                2.118271,
-                2.122848625
+                2.114986,
+                2.120353375
               ]
             },
             "gpu_time_seconds": {
-              "median": 2.110198564,
+              "median": 2.1076359780000002,
               "ci95": [
-                2.107263085,
-                2.113394999
+                2.104916785,
+                2.108987709
               ]
             },
             "submissions": {
@@ -1273,38 +1273,38 @@
           ],
           "capture": {
             "graphs": 2,
-            "wall_seconds": 0.024914791,
-            "validation_seconds": 0.012290458
+            "wall_seconds": 0.024180166,
+            "validation_seconds": 0.011011209
           },
           "aggregate": {
             "tokens_per_second": {
               "wall": {
-                "median": 74.20947326726198,
+                "median": 74.64835593137275,
                 "ci95": [
-                  73.64350852223795,
-                  75.08818463462816
+                  73.33899003457026,
+                  75.57636946877564
                 ]
               },
               "gpu": {
-                "median": 96.38620131986875,
+                "median": 96.23868762632657,
                 "ci95": [
-                  95.91318691239208,
-                  96.9482968083074
+                  95.66804694481887,
+                  97.1854593651631
                 ]
               }
             },
             "wall_time_seconds": {
-              "median": 1.724847542,
+              "median": 1.7147063120000001,
               "ci95": [
-                1.704662333,
-                1.738102958
+                1.693651083,
+                1.745319917
               ]
             },
             "gpu_time_seconds": {
-              "median": 1.3279909185,
+              "median": 1.330026956,
               "ci95": [
-                1.320291374,
-                1.334540162
+                1.317069455,
+                1.33795979
               ]
             },
             "submissions": {
@@ -1321,17 +1321,17 @@
               "context_start": 512,
               "itl_seconds": {
                 "wall": {
-                  "median": 0.013475371421875,
+                  "median": 0.013396143062500001,
                   "ci95": [
-                    0.0133176744765625,
-                    0.013578929359375
+                    0.0132316490859375,
+                    0.0136353118515625
                   ]
                 },
                 "gpu": {
-                  "median": 0.01037492905078125,
+                  "median": 0.01039083559375,
                   "ci95": [
-                    0.010314776359375,
-                    0.010426095015625
+                    0.0102896051171875,
+                    0.010452810859375
                   ]
                 }
               }
@@ -1346,38 +1346,38 @@
           ],
           "capture": {
             "graphs": 2,
-            "wall_seconds": 0.043951209,
-            "validation_seconds": 0.023035375
+            "wall_seconds": 0.041982666,
+            "validation_seconds": 0.020427249
           },
           "aggregate": {
             "tokens_per_second": {
               "wall": {
-                "median": 88.12729230791163,
+                "median": 88.29970403842097,
                 "ci95": [
-                  87.8909804041899,
-                  88.29088546336516
+                  88.05941933428325,
+                  88.40905616536789
                 ]
               },
               "gpu": {
-                "median": 106.99170418523161,
+                "median": 107.10692824553342,
                 "ci95": [
-                  106.81368756305355,
-                  107.18781556775912
+                  106.77706422971131,
+                  107.3432103997544
                 ]
               }
             },
             "wall_time_seconds": {
-              "median": 2.904888979,
+              "median": 2.899217229,
               "ci95": [
-                2.899506542,
-                2.912699333
+                2.895630958,
+                2.907127959
               ]
             },
             "gpu_time_seconds": {
-              "median": 2.392708895,
+              "median": 2.3901352045,
               "ci95": [
-                2.388331161,
-                2.3966965829999998
+                2.384873706,
+                2.397518623
               ]
             },
             "submissions": {
@@ -1394,17 +1394,17 @@
               "context_start": 512,
               "itl_seconds": {
                 "wall": {
-                  "median": 0.0226944451484375,
+                  "median": 0.0226501346015625,
                   "ci95": [
-                    0.022652394859375,
-                    0.0227554635390625
+                    0.022622116859375,
+                    0.0227119371796875
                   ]
                 },
                 "gpu": {
-                  "median": 0.0186930382421875,
+                  "median": 0.01867293128515625,
                   "ci95": [
-                    0.0186588371953125,
-                    0.018724192054687498
+                    0.018631825828125,
+                    0.0187306142421875
                   ]
                 }
               }
@@ -1414,17 +1414,17 @@
               "context_start": 2048,
               "itl_seconds": {
                 "wall": {
-                  "median": 0.0226944451484375,
+                  "median": 0.0226501346015625,
                   "ci95": [
-                    0.022652394859375,
-                    0.0227554635390625
+                    0.022622116859375,
+                    0.0227119371796875
                   ]
                 },
                 "gpu": {
-                  "median": 0.0186930382421875,
+                  "median": 0.01867293128515625,
                   "ci95": [
-                    0.0186588371953125,
-                    0.018724192054687498
+                    0.018631825828125,
+                    0.0187306142421875
                   ]
                 }
               }
@@ -1441,38 +1441,38 @@
           ],
           "capture": {
             "graphs": 2,
-            "wall_seconds": 0.074592874,
-            "validation_seconds": 0.045350583
+            "wall_seconds": 0.066880667,
+            "validation_seconds": 0.039066125
           },
           "aggregate": {
             "tokens_per_second": {
               "wall": {
-                "median": 114.83515162525765,
+                "median": 114.56222147723909,
                 "ci95": [
-                  114.65208379105341,
-                  115.09203935113715
+                  114.33171705569765,
+                  114.79483020325263
                 ]
               },
               "gpu": {
-                "median": 137.8772233842796,
+                "median": 138.00295490380947,
                 "ci95": [
-                  137.6681732389479,
-                  138.1521403959276
+                  137.65289494189963,
+                  138.11215473270954
                 ]
               }
             },
             "wall_time_seconds": {
-              "median": 4.458565396,
+              "median": 4.469187271,
               "ci95": [
-                4.4486135,
-                4.465684208
+                4.460131167,
+                4.478197417
               ]
             },
             "gpu_time_seconds": {
-              "median": 3.713449247,
+              "median": 3.7100654975,
               "ci95": [
-                3.706059121,
-                3.719087629
+                3.707132084,
+                3.719500416
               ]
             },
             "submissions": {
@@ -1489,17 +1489,17 @@
               "context_start": 512,
               "itl_seconds": {
                 "wall": {
-                  "median": 0.03483254215625,
+                  "median": 0.0349155255546875,
                   "ci95": [
-                    0.03475479296875,
-                    0.034888157875
+                    0.0348447747421875,
+                    0.0349859173203125
                   ]
                 },
                 "gpu": {
-                  "median": 0.0290113222421875,
+                  "median": 0.02898488669921875,
                   "ci95": [
-                    0.0289535868828125,
-                    0.0290553721015625
+                    0.02896196940625,
+                    0.029058597
                   ]
                 }
               }
@@ -1509,17 +1509,17 @@
               "context_start": 2048,
               "itl_seconds": {
                 "wall": {
-                  "median": 0.03483254215625,
+                  "median": 0.0349155255546875,
                   "ci95": [
-                    0.03475479296875,
-                    0.034888157875
+                    0.0348447747421875,
+                    0.0349859173203125
                   ]
                 },
                 "gpu": {
-                  "median": 0.0290113222421875,
+                  "median": 0.02898488669921875,
                   "ci95": [
-                    0.0289535868828125,
-                    0.0290553721015625
+                    0.02896196940625,
+                    0.029058597
                   ]
                 }
               }
@@ -1529,17 +1529,17 @@
               "context_start": 512,
               "itl_seconds": {
                 "wall": {
-                  "median": 0.03483254215625,
+                  "median": 0.0349155255546875,
                   "ci95": [
-                    0.03475479296875,
-                    0.034888157875
+                    0.0348447747421875,
+                    0.0349859173203125
                   ]
                 },
                 "gpu": {
-                  "median": 0.0290113222421875,
+                  "median": 0.02898488669921875,
                   "ci95": [
-                    0.0289535868828125,
-                    0.0290553721015625
+                    0.02896196940625,
+                    0.029058597
                   ]
                 }
               }
@@ -1549,17 +1549,17 @@
               "context_start": 2048,
               "itl_seconds": {
                 "wall": {
-                  "median": 0.03483254215625,
+                  "median": 0.0349155255546875,
                   "ci95": [
-                    0.03475479296875,
-                    0.034888157875
+                    0.0348447747421875,
+                    0.0349859173203125
                   ]
                 },
                 "gpu": {
-                  "median": 0.0290113222421875,
+                  "median": 0.02898488669921875,
                   "ci95": [
-                    0.0289535868828125,
-                    0.0290553721015625
+                    0.02896196940625,
+                    0.029058597
                   ]
                 }
               }
@@ -1580,38 +1580,38 @@
           ],
           "capture": {
             "graphs": 2,
-            "wall_seconds": 0.159218833,
-            "validation_seconds": 0.112198
+            "wall_seconds": 0.146880041,
+            "validation_seconds": 0.09796725
           },
           "aggregate": {
             "tokens_per_second": {
               "wall": {
-                "median": 134.43343170643698,
+                "median": 134.37331930733328,
                 "ci95": [
-                  134.2583590045903,
-                  134.5937064269675
+                  134.18510005802764,
+                  134.47255413541717
                 ]
               },
               "gpu": {
-                "median": 159.37929508164723,
+                "median": 159.4385014561458,
                 "ci95": [
-                  159.26785517605578,
-                  159.44988238432458
+                  159.35481537833329,
+                  159.52644226649102
                 ]
               }
             },
             "wall_time_seconds": {
-              "median": 7.617154,
+              "median": 7.6205604585,
               "ci95": [
-                7.6080823330000005,
-                7.627085625
+                7.614936792,
+                7.631249666
               ]
             },
             "gpu_time_seconds": {
-              "median": 6.4249248935,
+              "median": 6.4225390395,
               "ci95": [
-                6.422080623,
-                6.429420418
+                6.41899854,
+                6.425911872
               ]
             },
             "submissions": {
@@ -1628,17 +1628,17 @@
               "context_start": 512,
               "itl_seconds": {
                 "wall": {
-                  "median": 0.059509015625,
+                  "median": 0.05953562858203125,
                   "ci95": [
-                    0.059438143226562504,
-                    0.0595866064453125
+                    0.0594916936875,
+                    0.059619138015625
                   ]
                 },
                 "gpu": {
-                  "median": 0.05019472573046875,
+                  "median": 0.05017608624609375,
                   "ci95": [
-                    0.0501725048671875,
-                    0.050229847015625
+                    0.05014842609375,
+                    0.0502024365
                   ]
                 }
               }
@@ -1648,17 +1648,17 @@
               "context_start": 2048,
               "itl_seconds": {
                 "wall": {
-                  "median": 0.059509015625,
+                  "median": 0.05953562858203125,
                   "ci95": [
-                    0.059438143226562504,
-                    0.0595866064453125
+                    0.0594916936875,
+                    0.059619138015625
                   ]
                 },
                 "gpu": {
-                  "median": 0.05019472573046875,
+                  "median": 0.05017608624609375,
                   "ci95": [
-                    0.0501725048671875,
-                    0.050229847015625
+                    0.05014842609375,
+                    0.0502024365
                   ]
                 }
               }
@@ -1668,17 +1668,17 @@
               "context_start": 512,
               "itl_seconds": {
                 "wall": {
-                  "median": 0.059509015625,
+                  "median": 0.05953562858203125,
                   "ci95": [
-                    0.059438143226562504,
-                    0.0595866064453125
+                    0.0594916936875,
+                    0.059619138015625
                   ]
                 },
                 "gpu": {
-                  "median": 0.05019472573046875,
+                  "median": 0.05017608624609375,
                   "ci95": [
-                    0.0501725048671875,
-                    0.050229847015625
+                    0.05014842609375,
+                    0.0502024365
                   ]
                 }
               }
@@ -1688,17 +1688,17 @@
               "context_start": 2048,
               "itl_seconds": {
                 "wall": {
-                  "median": 0.059509015625,
+                  "median": 0.05953562858203125,
                   "ci95": [
-                    0.059438143226562504,
-                    0.0595866064453125
+                    0.0594916936875,
+                    0.059619138015625
                   ]
                 },
                 "gpu": {
-                  "median": 0.05019472573046875,
+                  "median": 0.05017608624609375,
                   "ci95": [
-                    0.0501725048671875,
-                    0.050229847015625
+                    0.05014842609375,
+                    0.0502024365
                   ]
                 }
               }
@@ -1708,17 +1708,17 @@
               "context_start": 512,
               "itl_seconds": {
                 "wall": {
-                  "median": 0.059509015625,
+                  "median": 0.05953562858203125,
                   "ci95": [
-                    0.059438143226562504,
-                    0.0595866064453125
+                    0.0594916936875,
+                    0.059619138015625
                   ]
                 },
                 "gpu": {
-                  "median": 0.05019472573046875,
+                  "median": 0.05017608624609375,
                   "ci95": [
-                    0.0501725048671875,
-                    0.050229847015625
+                    0.05014842609375,
+                    0.0502024365
                   ]
                 }
               }
@@ -1728,17 +1728,17 @@
               "context_start": 2048,
               "itl_seconds": {
                 "wall": {
-                  "median": 0.059509015625,
+                  "median": 0.05953562858203125,
                   "ci95": [
-                    0.059438143226562504,
-                    0.0595866064453125
+                    0.0594916936875,
+                    0.059619138015625
                   ]
                 },
                 "gpu": {
-                  "median": 0.05019472573046875,
+                  "median": 0.05017608624609375,
                   "ci95": [
-                    0.0501725048671875,
-                    0.050229847015625
+                    0.05014842609375,
+                    0.0502024365
                   ]
                 }
               }
@@ -1748,17 +1748,17 @@
               "context_start": 512,
               "itl_seconds": {
                 "wall": {
-                  "median": 0.059509015625,
+                  "median": 0.05953562858203125,
                   "ci95": [
-                    0.059438143226562504,
-                    0.0595866064453125
+                    0.0594916936875,
+                    0.059619138015625
                   ]
                 },
                 "gpu": {
-                  "median": 0.05019472573046875,
+                  "median": 0.05017608624609375,
                   "ci95": [
-                    0.0501725048671875,
-                    0.050229847015625
+                    0.05014842609375,
+                    0.0502024365
                   ]
                 }
               }
@@ -1768,17 +1768,17 @@
               "context_start": 2048,
               "itl_seconds": {
                 "wall": {
-                  "median": 0.059509015625,
+                  "median": 0.05953562858203125,
                   "ci95": [
-                    0.059438143226562504,
-                    0.0595866064453125
+                    0.0594916936875,
+                    0.059619138015625
                   ]
                 },
                 "gpu": {
-                  "median": 0.05019472573046875,
+                  "median": 0.05017608624609375,
                   "ci95": [
-                    0.0501725048671875,
-                    0.050229847015625
+                    0.05014842609375,
+                    0.0502024365
                   ]
                 }
               }
@@ -1790,37 +1790,37 @@
         {
           "parameters": 0,
           "nanoseconds": {
-            "median": 1.76333,
+            "median": 1.72333,
             "ci95": [
-              1.7625,
-              1.76416
+              1.72292,
+              1.72375
             ]
           }
         },
         {
           "parameters": 4,
           "nanoseconds": {
-            "median": 17.111874999999998,
+            "median": 17.38563,
             "ci95": [
-              17.05208,
-              17.31542
+              17.20083,
+              17.455
             ]
           }
         },
         {
           "parameters": 8,
           "nanoseconds": {
-            "median": 21.636045000000003,
+            "median": 20.038539999999998,
             "ci95": [
-              20.847499999999997,
-              21.72709
+              19.989589999999996,
+              20.087909999999997
             ]
           }
         }
       ],
       "sampling_fallbacks": [],
       "engine.tunings": [],
-      "engine.picks_hash": "sha256:6527881308fda86654db527a16f69b00a307f42b229c1a988183261b7c5d1224"
+      "engine.picks_hash": "sha256:dbddcbba6b24affa08619b1aed8d0738d3331b3f05c38454a7094f3b94ceba04"
     }
   ]
 }
