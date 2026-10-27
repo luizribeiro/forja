@@ -113,6 +113,36 @@ pub(crate) fn config_hash(snapshot: &Snapshot, inputs: &[Input]) -> Result<Strin
     })
 }
 
+pub(crate) fn validate_adoption(
+    report: &serde_json::Value,
+    binary: &str,
+    inputs: &[Input],
+    config_hash: &str,
+    perf_hash: &str,
+) -> Result<(), String> {
+    for (pointer, expected) in [
+        ("/schema_version", serde_json::json!(SCHEMA_VERSION)),
+        ("/implementation", serde_json::json!("forja")),
+        ("/provenance/dirty", serde_json::json!(false)),
+        ("/provenance/binary_sha256", serde_json::json!(binary)),
+        (
+            "/provenance/commit",
+            serde_json::json!(crate::provenance::commit()),
+        ),
+        (
+            "/inputs",
+            serde_json::to_value(inputs).map_err(|error| error.to_string())?,
+        ),
+        ("/config_hash", serde_json::json!(config_hash)),
+        ("/perf_hash", serde_json::json!(perf_hash)),
+    ] {
+        if report.pointer(pointer) != Some(&expected) {
+            return Err(format!("--accept-from refuses mismatch at {pointer}"));
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn perf_key(
     point: &BenchPoint,
     input: &Input,
@@ -327,6 +357,7 @@ mod tests {
             rerun: None,
             allow_diff: Vec::new(),
             accept: false,
+            accept_from: None,
         }
     }
 
@@ -367,6 +398,39 @@ mod tests {
             comparison_hash(&perf_key(&point, &inputs[0], &profile()).unwrap()).unwrap(),
             "sha256:8ef1ab198a395a78e3e0c9609e09ac5c74b8a9d49508d7f1aee6ee94c6497d85"
         );
+    }
+
+    #[test]
+    fn adoption_requires_exact_binary_input_and_configuration_hashes() {
+        let inputs: Vec<Input> = serde_json::from_value(serde_json::json!([{
+            "engine_sha256": "component", "weights_sha256": "weights"
+        }]))
+        .unwrap();
+        let report = serde_json::json!({
+            "schema_version": SCHEMA_VERSION, "implementation": "forja",
+            "provenance": {"binary_sha256": "binary", "dirty": false,
+                           "commit": crate::provenance::commit()},
+            "inputs": inputs, "config_hash": "config", "perf_hash": "performance"
+        });
+        validate_adoption(&report, "binary", &inputs, "config", "performance").unwrap();
+        for pointer in [
+            "/schema_version",
+            "/provenance/binary_sha256",
+            "/provenance/commit",
+            "/provenance/dirty",
+            "/config_hash",
+            "/perf_hash",
+            "/inputs/0/engine_sha256",
+            "/inputs/0/weights_sha256",
+            "/inputs/0/profile_hash",
+        ] {
+            let mut changed = report.clone();
+            *changed.pointer_mut(pointer).unwrap() = serde_json::json!("mismatch");
+            assert!(
+                validate_adoption(&changed, "binary", &inputs, "config", "performance").is_err(),
+                "{pointer}"
+            );
+        }
     }
 
     #[test]

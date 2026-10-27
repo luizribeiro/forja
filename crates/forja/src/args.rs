@@ -147,6 +147,7 @@ pub(crate) struct Bench {
     pub(crate) rerun: Option<Recorded>,
     pub(crate) allow_diff: Vec<KeyPath>,
     pub(crate) accept: bool,
+    pub(crate) accept_from: Option<PathBuf>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -256,6 +257,9 @@ struct RecordBenchArgs {
     /// Accept a default baseline or one-value engine choice.
     #[arg(long, conflicts_with_all = ["rerun", "against"])]
     accept: bool,
+    /// Adopt a saved candidate report without running measurements.
+    #[arg(long, requires = "accept", conflicts_with_all = ["rerun", "against", "allow_diff"])]
+    accept_from: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -544,7 +548,12 @@ impl ParsedCommand {
         let Self::Bench(options) = self else {
             return Ok(None);
         };
-        if let Some(path) = &options.record.rerun {
+        if let Some(path) = options
+            .record
+            .rerun
+            .as_ref()
+            .or(options.record.accept_from.as_ref())
+        {
             return load_record(path).map(Some);
         }
         if !options.record.against {
@@ -1074,6 +1083,7 @@ impl BenchArgs {
             rerun,
             allow_diff: self.record.allow_diff,
             accept: self.record.accept,
+            accept_from: self.record.accept_from,
         })
     }
 }
@@ -2742,6 +2752,27 @@ fixtures = "/fixtures"
         assert_eq!(options.tg, 7);
         assert!(options.rerun.is_some());
         assert_eq!(options.allow_diff, [KeyPath::new("bench.reps")]);
+        let Command::Bench(adoption) = parse_with(
+            [
+                "bench".to_owned(),
+                "--engine".to_owned(),
+                "/engine.wasm".to_owned(),
+                "--model".to_owned(),
+                "/model".to_owned(),
+                "--accept".to_owned(),
+                "--accept-from".to_owned(),
+                path.display().to_string(),
+            ],
+            |isolated| {
+                assert!(isolated);
+                Ok(Vec::new())
+            },
+        )
+        .unwrap() else {
+            panic!("expected bench command")
+        };
+        assert_eq!(adoption.tg, 7);
+        assert_eq!(adoption.accept_from.as_ref(), Some(&path));
         fs::remove_dir_all(root).unwrap();
     }
 

@@ -153,6 +153,9 @@ pub(crate) async fn run(options: &Bench) -> Result<(), Box<dyn Error>> {
             &options.config.paths.scratch,
         )?;
     }
+    if let Some(path) = &options.accept_from {
+        return adopt_report(options, path);
+    }
     #[cfg(target_os = "macos")]
     return run_metal(options).await;
     #[cfg(not(target_os = "macos"))]
@@ -468,28 +471,7 @@ async fn run_metal(options: &Bench) -> Result<(), Box<dyn Error>> {
         .iter()
         .map(|component| crate::resolution::read_embedded_profile(component))
         .collect::<Result<Vec<_>, _>>()?;
-    let inputs = options
-        .engines
-        .iter()
-        .zip(&profiles)
-        .map(|(component, profile)| {
-            Ok(Input {
-                engine_sha256: sha256_file(component)?,
-                engine_variant: String::new(),
-                engine_build_profile: String::new(),
-                profile_name: component
-                    .file_stem()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .into_owned(),
-                profile_family: profile.family().to_owned(),
-                numerics: Some(*profile.numerics()),
-                profile_hash: Some(profile.sha256().map_err(std::io::Error::other)?),
-                weights_sha256: profile.model().weights_sha256.clone(),
-                model_revision: Some(profile.model().revision.clone()),
-            })
-        })
-        .collect::<Result<Vec<_>, std::io::Error>>()?;
+    let inputs = benchmark_inputs(options, &profiles)?;
     if let Some(record) = &options.rerun {
         validate_rerun_inputs(
             record,
@@ -584,6 +566,100 @@ async fn run_metal(options: &Bench) -> Result<(), Box<dyn Error>> {
         if let Some(acceptance) = acceptance {
             accept_report(options, &acceptance, &report)?;
         }
+    }
+    Ok(())
+}
+
+fn benchmark_inputs(
+    options: &Bench,
+    profiles: &[forja_config::Profile],
+) -> Result<Vec<Input>, std::io::Error> {
+    options
+        .engines
+        .iter()
+        .zip(profiles)
+        .map(|(component, profile)| {
+            Ok(Input {
+                engine_sha256: sha256_file(component)?,
+                engine_variant: String::new(),
+                engine_build_profile: String::new(),
+                profile_name: component
+                    .file_stem()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned(),
+                profile_family: profile.family().to_owned(),
+                numerics: Some(*profile.numerics()),
+                profile_hash: Some(profile.sha256().map_err(std::io::Error::other)?),
+                weights_sha256: profile.model().weights_sha256.clone(),
+                model_revision: Some(profile.model().revision.clone()),
+            })
+        })
+        .collect()
+}
+
+fn adopt_report(options: &Bench, path: &Path) -> Result<(), Box<dyn Error>> {
+    let acceptance = prepare_acceptance(options)?.ok_or("--accept-from requires --accept")?;
+    let bytes = fs::read(path)?;
+    let mut report: serde_json::Value = serde_json::from_slice(&bytes)?;
+    let record: Recorded = serde_json::from_value(report.clone())?;
+    let profiles = options
+        .engines
+        .iter()
+        .map(|component| crate::resolution::read_embedded_profile(component))
+        .collect::<Result<Vec<_>, _>>()?;
+    let inputs = benchmark_inputs(options, &profiles)?;
+    let device = report["provenance"]["device"]
+        .as_str()
+        .ok_or("record has no device")?;
+    let os = report["provenance"]["macos"]
+        .as_str()
+        .ok_or("record has no OS")?;
+    let snapshot = benchmark_record::snapshot(options, device, os)?;
+    let mut expected = Vec::new();
+    let mut hashes = Vec::new();
+    for point in &options.points {
+        let hash = benchmark_record::comparison_hash(&benchmark_record::perf_key(
+            point,
+            &inputs[0],
+            &profiles[0],
+        )?)?;
+        for selection in &point.selection {
+            expected.push((hash.clone(), serde_json::to_value(selection)?));
+        }
+        hashes.push(hash);
+    }
+    benchmark_record::validate_adoption(
+        &report,
+        &sha256_file(std::env::current_exe()?)?,
+        &inputs,
+        &benchmark_record::config_hash(&snapshot, &inputs)?,
+        &benchmark_record::combined_perf_hash(&hashes)?,
+    )?;
+    let keys = benchmark_record::recorded_perf_keys(&record)?;
+    for (result, key) in record.results.iter().zip(keys) {
+        let hash = benchmark_record::comparison_hash(&key)?;
+        let index = expected
+            .iter()
+            .position(|(expected_hash, selection)| {
+                expected_hash == &hash && selection == &result["selection"]
+            })
+            .ok_or("--accept-from has an unexpected or duplicate result")?;
+        if result["perf_hash"] != hash || result["output_digest"].as_str().is_none() {
+            return Err("--accept-from has an invalid result hash or output digest".into());
+        }
+        expected.remove(index);
+    }
+    if !expected.is_empty() || record.results.is_empty() {
+        return Err("--accept-from has incomplete result coverage".into());
+    }
+    report["adoption"] = serde_json::json!({
+        "source_record_sha256": format!("{:x}", <sha2::Sha256 as sha2::Digest>::digest(&bytes)),
+        "remeasured": false,
+    });
+    accept_report(options, &acceptance, &report)?;
+    if let Some(output) = &options.json {
+        write_json_atomic(output, &slim_record(&report))?;
     }
     Ok(())
 }
