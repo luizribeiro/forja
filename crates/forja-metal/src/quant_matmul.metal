@@ -7,6 +7,10 @@ constant uint gather_words_per_thread [[function_constant(14)]];
 constant uint quant_words_per_thread [[function_constant(15)]];
 constant uint grouped_tile_rows [[function_constant(16)]];
 
+constant uint qmv_vector_words [[function_constant(222)]];
+constant uint qmv_vector_groups [[function_constant(223)]];
+constant uint qmv_vector_contiguous [[function_constant(224)]];
+
 struct QuantEmbedParams {
     uint vocab;
     uint width;
@@ -303,7 +307,7 @@ kernel void quantized_gemv(
     ushort lane [[thread_index_in_simdgroup]],
     uint2 tile [[threadgroup_position_in_grid]]) {
     if (quant_bits == 8) {
-        uint first_column = tile.x * 16 + uint(simdgroup) * 8;
+        uint first_column = tile.x * (qmv_vector_groups * 8) + uint(simdgroup) * 8;
         float sums[8] = {0.0f};
         quantized_q8_sums(
             input, packed, scales, biases, params,
@@ -327,7 +331,7 @@ kernel void quantized_gemv(
         }
         return;
     }
-    uint first_column = tile.x * 8 + uint(simdgroup) * 4;
+    uint first_column = tile.x * (qmv_vector_groups * 4) + uint(simdgroup) * 4;
     float sums[4] = {0.0f};
     quantized_qmv_sums(
         input, packed, scales, biases,
@@ -367,7 +371,7 @@ kernel void quantized_gemv_n2(
     ushort simdgroup [[simdgroup_index_in_threadgroup]],
     ushort lane [[thread_index_in_simdgroup]],
     uint2 tile [[threadgroup_position_in_grid]]) {
-    uint first_column = tile.x * 4 + uint(simdgroup) * 2;
+    uint first_column = tile.x * (qmv_vector_groups * 2) + uint(simdgroup) * 2;
     float sums[2] = {0.0f};
     quantized_qmv_sums(
         input, packed, scales, biases,

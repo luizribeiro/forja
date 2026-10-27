@@ -4328,6 +4328,9 @@ impl MetalBackend {
             (2, dtype_code(output.layout.dtype())),
             (12, u32::from(bits)),
             (13, group_size),
+            (222, 0),
+            (223, 2),
+            (224, 0),
             (15, quant_epilogue_specialization(columns, inner)),
         ];
         let mut pipelines = self
@@ -4359,7 +4362,7 @@ impl MetalBackend {
         }
         set_argument_table(encoder, table);
         let (column_tile, row_tile, threads) = match kernel {
-            "quantized_gemv" => (if bits == 8 { 16 } else { 8 }, 1, 64),
+            "quantized_gemv" => (if bits == 8 { 16 } else { 8 }, 1, 64), // Vectors use n2.
             "quantized_gemv_n2" | "quantized_gemv_q8_fast_n2" => (4, 1, 64),
             "quantized_gemv_q8_fast" => (8, 1, 64),
             "quantized_gemm_tiled_f32"
@@ -4506,6 +4509,9 @@ impl MetalBackend {
             (2, dtype_code(output.layout.dtype())),
             (12, u32::from(bits)),
             (13, group_size),
+            (222, 0),
+            (223, 2),
+            (224, 0),
             (14, words_per_thread),
         ];
         let mut pipelines = self
@@ -4594,6 +4600,9 @@ impl MetalBackend {
             (2, dtype_code(output.layout.dtype())),
             (12, u32::from(bits)),
             (13, group_size),
+            (222, 0),
+            (223, 2),
+            (224, 0),
             (14, words_per_thread),
         ];
         let pipeline = self
@@ -4764,6 +4773,9 @@ impl MetalBackend {
             (2, dtype_code(output.layout.dtype())),
             (12, u32::from(bits)),
             (13, group_size),
+            (222, 0),
+            (223, 2),
+            (224, 0),
             (14, words_per_thread),
         ];
         let epilogue = dispatch
@@ -4970,6 +4982,9 @@ impl MetalBackend {
             (2, dtype_code(output.layout.dtype())),
             (12, u32::from(config.0)),
             (13, config.1),
+            (222, 0),
+            (223, 2),
+            (224, 0),
         ];
         let pipeline = self
             .pipelines
@@ -5318,6 +5333,9 @@ impl MetalBackend {
             (2, dtype_code(output.layout.dtype())),
             (12, u32::from(config.0)),
             (13, config.1),
+            (222, 0),
+            (223, 2),
+            (224, 0),
             (16, block_rows),
         ];
         let mut pipelines = self
@@ -6580,6 +6598,9 @@ impl MetalBackend {
                     (2, dtype_code(output.layout().dtype())),
                     (12, u32::from(bits)),
                     (13, group_size),
+                    (222, 0),
+                    (223, 2),
+                    (224, 0),
                 ],
             )?;
         set_pipeline(encoder, &pipeline);
@@ -9335,6 +9356,25 @@ fn dense_epilogue_specializations(config: GemmConfig) -> [[(u32, u32); 3]; 8] {
     values
 }
 
+fn quantized_constants(
+    input: &Tensor,
+    scales: &Tensor,
+    output: &Tensor,
+    config: (u8, u32),
+    geometry: [u32; 3],
+) -> Vec<(u32, u32)> {
+    vec![
+        (0, dtype_code(input.layout().dtype())),
+        (1, dtype_code(scales.layout().dtype())),
+        (2, dtype_code(output.layout().dtype())),
+        (12, u32::from(config.0)),
+        (13, config.1),
+        (222, geometry[0]),
+        (223, geometry[1]),
+        (224, geometry[2]),
+    ]
+}
+
 fn quant_epilogue_specialization(columns: u32, inner: u32) -> u32 {
     u32::from(columns.is_multiple_of(8) && inner.is_multiple_of(512)) + 1
 }
@@ -9365,13 +9405,13 @@ fn epilogue_pipeline_requests(
             let [input, _, scales, _] = dispatch.primitive_inputs() else {
                 return Err(BackendError::InvalidInput);
             };
-            let mut constants = vec![
-                (0, dtype_code(input.layout().dtype())),
-                (1, dtype_code(scales.layout().dtype())),
-                (2, dtype_code(dispatch.output().layout().dtype())),
-                (12, u32::from(bits)),
-                (13, group_size),
-            ];
+            let mut constants = quantized_constants(
+                input,
+                scales,
+                dispatch.output(),
+                (bits, group_size),
+                [0, 2, 0],
+            );
             let implementation = quant_matmul_kernel(dispatch)?;
             if parameter_dependent {
                 Ok([
@@ -9496,13 +9536,13 @@ fn gather_epilogue_requests(
     let inputs = dispatch.primitive_inputs();
     let input = inputs.first().ok_or(BackendError::InvalidInput)?;
     let scales = inputs.get(2).ok_or(BackendError::InvalidInput)?;
-    let mut constants = vec![
-        (0, dtype_code(input.layout().dtype())),
-        (1, dtype_code(scales.layout().dtype())),
-        (2, dtype_code(dispatch.output().layout().dtype())),
-        (12, u32::from(bits)),
-        (13, group_size),
-    ];
+    let mut constants = quantized_constants(
+        input,
+        scales,
+        dispatch.output(),
+        (bits, group_size),
+        [0, 2, 0],
+    );
     if inputs.len() == 6 {
         let inner = *input
             .layout()
@@ -11899,7 +11939,8 @@ mod tests {
                 });
             }
         }
-        let quant_constants = vec![(0, 0), (1, 1), (2, 0), (12, 8), (13, 64)];
+        let mut quant_constants = vec![(0, 0), (1, 1), (2, 0), (12, 8), (13, 64)];
+        quant_constants.extend([(222, 0), (223, 2), (224, 0)]);
         for implementation in [
             "quantized_gemv",
             "quantized_gemv_n2",
@@ -11924,7 +11965,8 @@ mod tests {
                 });
             }
         }
-        let gather_constants = vec![(0, 0), (1, 1), (2, 0), (12, 8), (13, 64)];
+        let mut gather_constants = vec![(0, 0), (1, 1), (2, 0), (12, 8), (13, 64)];
+        gather_constants.extend([(222, 0), (223, 2), (224, 0)]);
         for words in [
             gather_epilogue_specialization(7, 511),
             gather_epilogue_specialization(8, 512),
