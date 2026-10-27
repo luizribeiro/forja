@@ -1,5 +1,8 @@
 //! Logical roofline bounds using measured, device-independent resource ceilings.
 
+mod estimate;
+pub use estimate::Estimate;
+
 use crate::KernelCost;
 
 #[derive(Clone, Copy, Debug)]
@@ -9,6 +12,9 @@ pub struct Ceilings {
     copy_bytes_per_second: f64,
     flops_per_second: f64,
     dispatch_seconds: f64,
+    rates_low: [f64; 3],
+    rates_high: [f64; 3],
+    dispatch_interval: [f64; 2],
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -28,20 +34,55 @@ impl Ceilings {
         flops_per_second: f64,
         dispatch_seconds: f64,
     ) -> Option<Self> {
-        [
-            read_bytes_per_second,
-            copy_bytes_per_second,
-            flops_per_second,
-            dispatch_seconds,
-        ]
-        .iter()
-        .all(|value| value.is_finite() && *value > 0.0)
-        .then_some(Self {
-            read_bytes_per_second,
-            copy_bytes_per_second,
-            flops_per_second,
-            dispatch_seconds,
-        })
+        Some(Self::with_intervals(
+            Estimate::new(read_bytes_per_second, [read_bytes_per_second; 2])?,
+            Estimate::new(copy_bytes_per_second, [copy_bytes_per_second; 2])?,
+            Estimate::new(flops_per_second, [flops_per_second; 2])?,
+            Estimate::new(dispatch_seconds, [dispatch_seconds; 2])?,
+        ))
+    }
+
+    /// Retains measured confidence intervals for rates and dependent-dispatch latency.
+    #[must_use]
+    pub fn with_intervals(
+        read: Estimate,
+        copy: Estimate,
+        compute: Estimate,
+        dispatch: Estimate,
+    ) -> Self {
+        Self {
+            read_bytes_per_second: read.median(),
+            copy_bytes_per_second: copy.median(),
+            flops_per_second: compute.median(),
+            dispatch_seconds: dispatch.median(),
+            rates_low: [read.lower(), copy.lower(), compute.lower()],
+            rates_high: [read.upper(), copy.upper(), compute.upper()],
+            dispatch_interval: [dispatch.lower(), dispatch.upper()],
+        }
+    }
+
+    /// Uses the fastest ends of the measured rate and latency intervals.
+    #[must_use]
+    pub const fn optimistic(self) -> Self {
+        Self {
+            read_bytes_per_second: self.rates_high[0],
+            copy_bytes_per_second: self.rates_high[1],
+            flops_per_second: self.rates_high[2],
+            dispatch_seconds: self.dispatch_interval[0],
+            ..self
+        }
+    }
+
+    /// Uses the slowest ends of the measured rate and latency intervals.
+    #[must_use]
+    pub const fn pessimistic(self) -> Self {
+        Self {
+            read_bytes_per_second: self.rates_low[0],
+            copy_bytes_per_second: self.rates_low[1],
+            flops_per_second: self.rates_low[2],
+            dispatch_seconds: self.dispatch_interval[1],
+            ..self
+        }
     }
     /// Returns the streaming read ceiling in bytes per second.
     #[must_use]
@@ -136,6 +177,43 @@ mod tests {
     use super::*;
     fn ceilings() -> Ceilings {
         Ceilings::new(100.0, 200.0, 1000.0, 0.01).unwrap()
+    }
+
+    #[test]
+    fn calibration_intervals_bound_rates_and_invert_dispatch_latency() {
+        let measured = Ceilings::with_intervals(
+            Estimate::new(100.0, [80.0, 125.0]).unwrap(),
+            Estimate::new(200.0, [160.0, 250.0]).unwrap(),
+            Estimate::new(1000.0, [800.0, 1250.0]).unwrap(),
+            Estimate::new(0.01, [0.008, 0.0125]).unwrap(),
+        );
+        for cost in [
+            KernelCost {
+                read_bytes: 100,
+                ..KernelCost::default()
+            },
+            KernelCost {
+                flops: 1000,
+                ..KernelCost::default()
+            },
+        ] {
+            assert!(
+                (limits(cost, 1, measured.optimistic()).unwrap().seconds() - 0.8).abs()
+                    < f64::EPSILON
+            );
+            assert!(
+                (limits(cost, 1, measured.pessimistic()).unwrap().seconds() - 1.25).abs()
+                    < f64::EPSILON
+            );
+        }
+        assert!(
+            (limits(KernelCost::default(), 100, measured.optimistic())
+                .unwrap()
+                .seconds()
+                - 0.8)
+                .abs()
+                < f64::EPSILON
+        );
     }
 
     #[test]
