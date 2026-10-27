@@ -34,7 +34,6 @@ pub(crate) enum MetalVariant {
     GatherQuantMatmulPortable,
     GatherQuantMatmulRouteGemv,
     GatherQuantMatmulVector8,
-    GatherQuantMatmulVector16,
     GatherQuantMatmulGroupedSmallM,
     GatherQuantMatmulGroupedPairSmallM,
     GatherQuantMatmulGrouped,
@@ -968,15 +967,6 @@ pub(crate) static REGISTRY: &[VariantDef<MetalVariant>] = &[
         &["Each route keeps a fixed lane partition across batch buckets."]
     ),
     batch_invariant_variant!(
-        "gather-quant-matmul.vector16",
-        GatherQuantMatmul,
-        GatherQuantMatmulVector16,
-        ROUTE_VECTOR,
-        &["routed decode with 16-byte packed loads."],
-        &["inner dimensions or quantization groups not divisible by 32."],
-        &["Each route keeps a fixed lane partition across batch buckets."]
-    ),
-    batch_invariant_variant!(
         "gather-quant-matmul.grouped-small-m",
         GatherQuantMatmul,
         GatherQuantMatmulGroupedSmallM,
@@ -1462,9 +1452,7 @@ fn variant_constraints(
     input_count: usize,
 ) -> &'static [Constraint] {
     match (definition.implementation, input_count) {
-        (MetalVariant::GatherQuantMatmulVector8 | MetalVariant::GatherQuantMatmulVector16, 6) => {
-            WEIGHTED_VECTOR
-        }
+        (MetalVariant::GatherQuantMatmulVector8, 6) => WEIGHTED_VECTOR,
         (MetalVariant::GatherQuantMatmulPortable | MetalVariant::GatherQuantMatmulRouteGemv, 6) => {
             WEIGHTED_NARROW
         }
@@ -2058,7 +2046,6 @@ mod tests {
                 "gather-quant-matmul.portable",
                 "gather-quant-matmul.route-gemv",
                 "gather-quant-matmul.vector8",
-                "gather-quant-matmul.vector16",
                 "gather-quant-matmul.grouped-small-m",
                 "gather-quant-matmul.grouped-pair-small-m",
                 "gather-quant-matmul.grouped",

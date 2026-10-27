@@ -355,8 +355,7 @@ fn weighted_gather_schedule(
         Some(
             MetalVariant::GatherQuantMatmulPortable
             | MetalVariant::GatherQuantMatmulRouteGemv
-            | MetalVariant::GatherQuantMatmulVector8
-            | MetalVariant::GatherQuantMatmulVector16,
+            | MetalVariant::GatherQuantMatmulVector8,
         ) if routes <= 8 => Ok(WeightedGatherSchedule {
             implementation: "gather_quantized_weighted_sum",
             threadgroup_width: routes.checked_mul(32).ok_or(BackendError::InvalidInput)?,
@@ -8227,7 +8226,6 @@ fn supported_dispatch(dispatch: &Dispatch) -> bool {
                     | MetalVariant::GatherQuantMatmulPortable
                     | MetalVariant::GatherQuantMatmulRouteGemv
                     | MetalVariant::GatherQuantMatmulVector8
-                    | MetalVariant::GatherQuantMatmulVector16
                     | MetalVariant::QuantMatmulVector8
                     | MetalVariant::QuantMatmulVector16
                     | MetalVariant::GatherQuantMatmulGroupedSmallM
@@ -8946,7 +8944,6 @@ pub(super) fn variant_supported(
         | MetalVariant::TopKPortable
         | MetalVariant::GatherQuantMatmulRouteGemv
         | MetalVariant::GatherQuantMatmulVector8
-        | MetalVariant::GatherQuantMatmulVector16
         | MetalVariant::SdpaDecomposed
         | MetalVariant::TopKPartials
         | MetalVariant::QuantMatmulVector8
@@ -9401,7 +9398,7 @@ fn quantized_constants(
 fn qmv_vector_config(dispatch: &Dispatch) -> [u32; 3] {
     let words = match selected_variant(dispatch) {
         Some(MetalVariant::QuantMatmulVector8 | MetalVariant::GatherQuantMatmulVector8) => 2,
-        Some(MetalVariant::QuantMatmulVector16 | MetalVariant::GatherQuantMatmulVector16) => 4,
+        Some(MetalVariant::QuantMatmulVector16) => 4,
         _ => return [0, 2, 0],
     };
     let contiguous = dispatch.primitive_inputs().iter().all(|tensor| {
@@ -9578,7 +9575,6 @@ fn route_gemv_variant(dispatch: &Dispatch) -> bool {
             MetalVariant::GatherQuantMatmulPortable
                 | MetalVariant::GatherQuantMatmulRouteGemv
                 | MetalVariant::GatherQuantMatmulVector8
-                | MetalVariant::GatherQuantMatmulVector16
         )
     )
 }
@@ -12900,12 +12896,14 @@ mod tests {
                 for variant in ["quant-matmul.vector8", "quant-matmul.vector16"] {
                     assert_quant_epilogue(&backend, variant, dtype, bits, 7, 768, 33, true);
                 }
-                for variant in [
+                assert_gather_quant_epilogue(
+                    &backend,
                     "gather-quant-matmul.vector8",
-                    "gather-quant-matmul.vector16",
-                ] {
-                    assert_gather_quant_epilogue(&backend, variant, dtype, bits, [7, 3, 33], true);
-                }
+                    dtype,
+                    bits,
+                    [7, 3, 33],
+                    true,
+                );
             }
         }
     }

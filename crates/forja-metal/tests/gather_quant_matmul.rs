@@ -189,13 +189,9 @@ fn vector_gather_raw_and_paired_match_cpu_at_decode_shapes() {
                 inner,
                 columns: 33,
             };
-            for variant in [
-                "gather-quant-matmul.vector8",
-                "gather-quant-matmul.vector16",
-            ] {
-                for paired in [false, true] {
-                    assert_grouped_case(&cpu, &metal, case, paired, &mut values, variant);
-                }
+            let variant = "gather-quant-matmul.vector8";
+            for paired in [false, true] {
+                assert_grouped_case(&cpu, &metal, case, paired, &mut values, variant);
             }
         }
     }
@@ -242,29 +238,25 @@ fn vector_gather_weighted_matches_cpu() {
                 group_size: 64,
             };
             submit_grouped(&cpu, op, &cpu_inputs, &cpu_output, Some(&epilogue), None);
-            for name in [
-                "gather-quant-matmul.vector8",
-                "gather-quant-matmul.vector16",
-            ] {
-                let refs = tensor_refs(&metal_inputs);
-                let variant = metal
-                    .validate_variant_for_op(op, &refs, &[&metal_output], name)
-                    .unwrap();
-                submit_grouped(
-                    &metal,
-                    op,
-                    &metal_inputs,
-                    &metal_output,
-                    Some(&epilogue),
-                    Some(BackendDispatchData::new(variant)),
-                );
-                assert_outputs_agree(
-                    DType::F32,
-                    &cpu.read(&cpu_output).unwrap(),
-                    &metal.read(&metal_output).unwrap(),
-                )
+            let name = "gather-quant-matmul.vector8";
+            let refs = tensor_refs(&metal_inputs);
+            let variant = metal
+                .validate_variant_for_op(op, &refs, &[&metal_output], name)
                 .unwrap();
-            }
+            submit_grouped(
+                &metal,
+                op,
+                &metal_inputs,
+                &metal_output,
+                Some(&epilogue),
+                Some(BackendDispatchData::new(variant)),
+            );
+            assert_outputs_agree(
+                DType::F32,
+                &cpu.read(&cpu_output).unwrap(),
+                &metal.read(&metal_output).unwrap(),
+            )
+            .unwrap();
         }
     }
 }

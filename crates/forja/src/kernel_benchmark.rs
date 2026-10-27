@@ -182,7 +182,7 @@ mod tests {
                 }),
             ),
             (
-                "gather-quant-matmul.vector16",
+                "gather-quant-matmul.vector8",
                 serde_json::json!({
                     "operation": {"kind":"gather-quant-matmul","bits":4,"group_size":64},
                     "epilogue":"identity",
