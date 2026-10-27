@@ -31,7 +31,14 @@ pub(crate) fn identity() -> Result<Value, Box<dyn Error>> {
 }
 
 pub(crate) fn cache_key(identity: &Value) -> String {
-    format!("{:x}", Sha256::digest(identity.to_string().as_bytes()))
+    format!(
+        "{:x}",
+        Sha256::digest(
+            json!({"calibrator_schema": 2, "identity": identity})
+                .to_string()
+                .as_bytes()
+        )
+    )
 }
 
 #[cfg(test)]

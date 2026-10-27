@@ -101,15 +101,23 @@ fn measure(options: &Options, identity: &Value) -> Result<Value, Box<dyn Error>>
                 .iter()
                 .map(|sample| sample.units as f64 / sample.gpu.as_secs_f64()),
         );
-        probes.insert(name.into(), json!({"units_per_second": rates.median,
+        let arithmetic = selected
+            .first()
+            .and_then(|sample| sample.arithmetic)
+            .map(|dtype| match dtype {
+                forja_core::DType::F16 => "f16",
+                forja_core::DType::BF16 => "bf16",
+                _ => "f32",
+            });
+        probes.insert(name.into(), json!({"arithmetic": arithmetic, "units_per_second": rates.median,
             "ci95": [rates.low, rates.high], "samples": selected.iter().map(|sample| json!({
                 "units": sample.units, "wall_seconds": sample.wall.as_secs_f64(), "gpu_seconds": sample.gpu.as_secs_f64()})).collect::<Vec<_>>()}));
     }
     Ok(
-        json!({"schema_version": 1, "kind": "device-calibration", "model_benchmark": false,
+        json!({"schema_version": 2, "kind": "device-calibration", "model_benchmark": false,
         "identity": identity, "warmups": options.warmups, "repetitions": options.reps,
         "timestamp_method": "unprofiled-command-buffer", "interval_method": "binomial-order-statistic-median",
-        "bf16_arithmetic": "bf16 operands promoted to f32 MMA; no native bf16 ceiling claimed",
+        "bf16_arithmetic": if samples.iter().any(|sample| sample.arithmetic == Some(forja_core::DType::BF16)) { "native-bf16" } else { "compiler refused native bf16 MMA; operands promoted to f32" },
         "threadgroup_method": "volatile float4 reads, 128 threads, one initialization barrier",
         "mma_method": "8x8x8 SIMD matrices; four independent accumulators per SIMD group",
         "probes": probes, "provenance": {"commit": crate::provenance::commit(),
@@ -121,7 +129,7 @@ fn measure(options: &Options, identity: &Value) -> Result<Value, Box<dyn Error>>
 }
 
 pub(crate) fn validate(record: &Value, identity: &Value) -> Result<(), Box<dyn Error>> {
-    if record["schema_version"] != 1 || record["identity"] != *identity {
+    if record["schema_version"] != 2 || record["identity"] != *identity {
         return Err("calibration identity or schema mismatch; recalibrate".into());
     }
     for &name in PROBES {

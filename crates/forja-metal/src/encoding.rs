@@ -3297,12 +3297,15 @@ impl MetalBackend {
             dispatch_threadgroups(
                 encoder,
                 MTLSize {
-                    width: count / 128,
+                    width: count
+                        / usize::try_from(crate::calibration::THREADS)
+                            .map_err(|_| BackendError::InvalidInput)?,
                     height: 1,
                     depth: 1,
                 },
                 MTLSize {
-                    width: 128,
+                    width: usize::try_from(crate::calibration::THREADS)
+                        .map_err(|_| BackendError::InvalidInput)?,
                     height: 1,
                     depth: 1,
                 },
@@ -9506,6 +9509,41 @@ struct EpilogueCompileCounts {
 }
 
 impl PipelineCache {
+    pub(super) fn try_calibration_shader(
+        &mut self,
+        source: &str,
+        name: &str,
+    ) -> Result<bool, BackendError> {
+        let options = compile_options(MTLMathMode::Fast);
+        let Ok(library) = self
+            .device
+            .newLibraryWithSource_options_error(&NSString::from_str(source), Some(&options))
+        else {
+            return Ok(false);
+        };
+        let constants = vec![(220, crate::calibration::ITERATIONS)];
+        let values = function_constants(&constants)?;
+        let Ok(function) =
+            library.newFunctionWithName_constantValues_error(&NSString::from_str(name), &values)
+        else {
+            return Ok(false);
+        };
+        let Ok(pipeline) = self
+            .device
+            .newComputePipelineStateWithFunction_error(&function)
+        else {
+            return Ok(false);
+        };
+        self.pipelines.insert(
+            PipelineKey {
+                name: name.to_owned(),
+                constants,
+            },
+            pipeline,
+        );
+        Ok(true)
+    }
+
     #[cfg(test)]
     pub(super) fn set_threadgroup_memory_limit(&mut self, bytes: usize) {
         self.max_threadgroup_memory_length = bytes;

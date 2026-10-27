@@ -36,6 +36,9 @@ kernel void name(device const float *input [[buffer(0)]], device float *output [
 calibration_mma_kernel(calibration_mma_f32, float, float)
 calibration_mma_kernel(calibration_mma_f16, half, half)
 calibration_mma_kernel(calibration_mma_bf16, bfloat, float)
+#ifdef FORJA_CALIBRATION_NATIVE_BF16
+calibration_mma_kernel(calibration_mma_bf16_native, bfloat, bfloat)
+#endif
 
 kernel void calibration_threadgroup(device const float *input [[buffer(0)]],
                                    device float *output [[buffer(1)]],
