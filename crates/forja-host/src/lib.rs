@@ -5167,6 +5167,17 @@ impl<B: Backend + 'static> Host<B> {
         output: TensorEntry,
         context: PagedDispatchContext<'_>,
     ) -> Result<(), compute::Error> {
+        self.record_paged_dispatch_many(commands, operation, inputs, vec![output], context)
+    }
+
+    fn record_paged_dispatch_many(
+        &mut self,
+        commands: &Resource<CommandListEntry>,
+        operation: (TemplateOp, Option<Op>),
+        inputs: Vec<TensorEntry>,
+        outputs: Vec<TensorEntry>,
+        context: PagedDispatchContext<'_>,
+    ) -> Result<(), compute::Error> {
         let PagedDispatchContext {
             protected,
             usage,
@@ -5179,8 +5190,11 @@ impl<B: Backend + 'static> Host<B> {
         }
         let (template_op, concrete_op) = operation;
         let input_tensors = inputs.iter().map(|entry| &entry.tensor).collect::<Vec<_>>();
-        let output_tensors = [&output.tensor];
-        let dispatch_space = tensor_space(inputs.iter().chain([&output]))?;
+        let output_tensors = outputs
+            .iter()
+            .map(|entry| &entry.tensor)
+            .collect::<Vec<_>>();
+        let dispatch_space = tensor_space(inputs.iter().chain(&outputs))?;
         let entry = self.table.get(commands).map_err(invalid_handle)?;
         if entry.recorded.len() >= self.limits.dispatches_per_list {
             return Err(quota("command list dispatch count exceeds the guest limit"));
@@ -5193,7 +5207,10 @@ impl<B: Backend + 'static> Host<B> {
             .iter()
             .map(TensorEntry::template)
             .collect::<Result<Vec<_>, _>>()?;
-        let template_output = output.template()?;
+        let template_outputs = outputs
+            .iter()
+            .map(TensorEntry::template)
+            .collect::<Result<Vec<_>, _>>()?;
         #[cfg(target_os = "macos")]
         let variant = self.validate_paged_variant(
             &PagedVariantInputs {
@@ -5201,7 +5218,7 @@ impl<B: Backend + 'static> Host<B> {
                 inputs: &input_tensors,
                 outputs: &output_tensors,
                 template_inputs: &template_inputs,
-                template_output: &template_output,
+                template_outputs: &template_outputs,
                 space: dispatch_space.as_ref().or(entry.space.as_ref()),
                 is_static: concrete_op.is_some() && dispatch_space.is_none(),
             },
@@ -5218,7 +5235,7 @@ impl<B: Backend + 'static> Host<B> {
         {
             entry
                 .commands
-                .dispatch(operation, &input_tensors, &output.tensor)
+                .dispatch_many(operation, &input_tensors, &output_tensors)
                 .map_err(guest_error)?;
             let mut dispatch = entry
                 .commands
@@ -5240,21 +5257,21 @@ impl<B: Backend + 'static> Host<B> {
                 None => RecordedDispatch::Operation {
                     op: template_op,
                     inputs: template_inputs,
-                    outputs: vec![template_output],
+                    outputs: template_outputs,
                 },
                 Some(data) => RecordedDispatch::Variant {
                     op: template_op,
                     inputs: template_inputs,
-                    outputs: vec![template_output],
+                    outputs: template_outputs,
                     data,
                 },
             });
         }
         entry.space = entry.space.take().or(dispatch_space);
-        entry.access.record(&inputs, std::slice::from_ref(&output));
+        entry.access.record_paged(template_op, &inputs, &outputs);
         entry.protected.extend(protected);
         entry.retained.extend(inputs);
-        entry.retained.push(output);
+        entry.retained.extend(outputs);
         entry.note_paged(check)
     }
 
@@ -6265,7 +6282,7 @@ impl<B: Backend + 'static> Host<B> {
                     space,
                     request.operation.0,
                     &inputs,
-                    &[request.template_output],
+                    &request.template_outputs.iter().collect::<Vec<_>>(),
                     name,
                 )
                 .map_err(|error| variant_error(&error))?
@@ -6897,7 +6914,7 @@ struct PagedVariantInputs<'a> {
     inputs: &'a [&'a Tensor],
     outputs: &'a [&'a Tensor],
     template_inputs: &'a [TemplateTensor],
-    template_output: &'a TemplateTensor,
+    template_outputs: &'a [TemplateTensor],
     space: Option<&'a ParamSpace>,
     is_static: bool,
 }
@@ -6999,6 +7016,19 @@ struct SubmissionAccess {
 }
 
 impl SubmissionAccess {
+    fn record_paged(
+        &mut self,
+        operation: TemplateOp,
+        inputs: &[TensorEntry],
+        outputs: &[TensorEntry],
+    ) {
+        self.record(inputs, outputs);
+        if template_operation_kind(operation) == forja_core::OperationKind::PagedSdpaAppend {
+            self.reads
+                .extend(outputs.iter().skip(1).map(|entry| entry.tensor.buffer()));
+        }
+    }
+
     fn record(&mut self, inputs: &[TensorEntry], outputs: &[TensorEntry]) {
         self.reads
             .extend(inputs.iter().map(|entry| entry.tensor.buffer()));
@@ -9611,6 +9641,94 @@ mod tests {
                 .unwrap();
         }
         (pool, slot, retained)
+    }
+
+    fn append_attention_rows<B: Backend + Send + Sync + 'static>(
+        host: &mut Host<B>,
+        width: u32,
+    ) -> [Resource<TensorEntry>; 4] {
+        std::array::from_fn(|index| {
+            let row = host.alloc(compute::Dtype::F32, &[1, 1, width]).unwrap();
+            let value = [1.0, 2.0, 3.0, 0.0][index];
+            host.backend
+                .write(
+                    &host.entry(&row).unwrap().tensor,
+                    &f32_bytes(&vec![value; width as usize]),
+                )
+                .unwrap();
+            row
+        })
+    }
+
+    #[tokio::test]
+    async fn paged_append_records_and_retains_every_output() {
+        let mut host = Host::new(CpuBackend::new(), GENEROUS);
+        let (_pool, slot) = fresh_paged_lane(&mut host);
+        let commands = host.command_list().unwrap();
+        let rows = append_attention_rows(&mut host, 2);
+        let (key, table, generations, activity, usage) =
+            host.paged_slot_entries(&slot, 0, 0).unwrap();
+        let (value, _, _, _, _) = host.paged_slot_entries(&slot, 0, 1).unwrap();
+        let outputs = [host.entry(&rows[3]).unwrap().clone(), key, value].map(|mut entry| {
+            if entry.tensor.layout().shape().len() == 3 && entry.tensor.layout().shape()[1] == 4 {
+                let shape = entry.tensor.layout().shape();
+                let layout = entry
+                    .tensor
+                    .layout()
+                    .reshape(&[shape[0], shape[1], 1, 2])
+                    .unwrap();
+                entry.tensor = host.backend.tensor(entry.tensor.buffer(), layout).unwrap();
+            }
+            entry
+        });
+        let buffers = outputs.each_ref().map(|entry| entry.tensor.buffer());
+        let mut inputs = rows[..3]
+            .iter()
+            .map(|row| host.entry(row).unwrap().clone())
+            .collect::<Vec<_>>();
+        inputs.extend([table.clone(), generations.clone()]);
+        inputs.extend(activity);
+        let operation = Op::PagedSdpaAppend {
+            scale: 1.0,
+            q_start: 0,
+            page_tokens: 4,
+        };
+        host.record_paged_dispatch_many(
+            &commands,
+            (forja_core::TemplateOp::Static(operation), Some(operation)),
+            inputs,
+            Vec::from(outputs),
+            super::PagedDispatchContext {
+                protected: vec![
+                    buffers[1],
+                    buffers[2],
+                    table.tensor.buffer(),
+                    generations.tensor.buffer(),
+                ],
+                usage,
+                bound: super::PagedBound::Write {
+                    start: forja_core::Affine::constant(0),
+                    tokens: 1,
+                },
+                variant_name: None,
+            },
+        )
+        .unwrap();
+        let entry = host.table.get(&commands).unwrap();
+        for buffer in buffers {
+            assert!(entry.access.writes.contains(&buffer));
+            assert!(
+                entry
+                    .retained
+                    .iter()
+                    .any(|retained| retained.tensor.buffer() == buffer)
+            );
+        }
+        for buffer in &buffers[1..] {
+            assert!(entry.protected.contains(buffer));
+            assert!(entry.access.reads.contains(buffer));
+        }
+        assert!(!entry.access.reads.contains(&buffers[0]));
     }
 
     async fn record_into_pages<B: Backend + Send + Sync + 'static>(
