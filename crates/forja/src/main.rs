@@ -8,6 +8,10 @@ mod config_show;
 mod engine;
 mod generate;
 mod host_schema;
+#[cfg(test)]
+mod kernel_benchmark {
+    mod shape;
+}
 mod logging;
 mod machine_load;
 mod profile;
