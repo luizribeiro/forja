@@ -232,6 +232,47 @@ impl PagedCache<'_> {
         end: &Dim,
         selection: impl Into<crate::target::metal::VariantChoice<'a>>,
     ) -> Result<Tensor<T>> {
+        self.record_attention(query, None, scale, start, end, selection.into())
+    }
+
+    /// Appends one key/value row and attends through the opaque page capability.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for incompatible single-row shapes or refused host work.
+    pub fn append_attention<'a, T: Element>(
+        &self,
+        query: &Tensor<T>,
+        appended: [&Tensor<T>; 2],
+        scale: f32,
+        start: &Dim,
+        end: &Dim,
+        selection: impl Into<crate::target::metal::VariantChoice<'a>>,
+    ) -> Result<Tensor<T>> {
+        let [key, value] = appended;
+        if query.shape().len() != 3
+            || query.shape()[0] != 1
+            || key.shape().len() != 3
+            || key.shape()[0] != 1
+            || key.shape() != value.shape()
+            || key.shape()[2] != query.shape()[2]
+        {
+            return Err(Error::loading(
+                "paged append attention requires compatible single-row shapes",
+            ));
+        }
+        self.record_attention(query, Some(appended), scale, start, end, selection.into())
+    }
+
+    fn record_attention<T: Element>(
+        &self,
+        query: &Tensor<T>,
+        appended: Option<[&Tensor<T>; 2]>,
+        scale: f32,
+        start: &Dim,
+        end: &Dim,
+        selection: crate::target::metal::VariantChoice<'_>,
+    ) -> Result<Tensor<T>> {
         let [sequence, heads, width]: [u32; 3] = query
             .shape()
             .try_into()
@@ -247,14 +288,14 @@ impl PagedCache<'_> {
         let (start, end) = (crate::graph::affine(start)?, crate::graph::affine(end)?);
         #[cfg(target_family = "wasm")]
         crate::graph::record_import_variant(
-            selection.into(),
+            selection,
             |commands, name| {
                 crate::sys::paged_sdpa(
                     commands,
                     &self._set._slot,
                     self.lane,
                     query.handle(),
-                    None,
+                    appended.map(|rows| rows.map(Tensor::handle)),
                     paged_output.handle(),
                     self.key_plane,
                     self.value_plane,
@@ -271,7 +312,7 @@ impl PagedCache<'_> {
                     &self._set._slot,
                     self.lane,
                     query.handle(),
-                    None,
+                    appended.map(|rows| rows.map(Tensor::handle)),
                     paged_output.handle(),
                     self.key_plane,
                     self.value_plane,
@@ -285,7 +326,16 @@ impl PagedCache<'_> {
             },
         )?;
         #[cfg(not(target_family = "wasm"))]
-        let _ = (&query, &paged_output, scale, start, end, selection);
+        let _ = (
+            self,
+            &query,
+            appended,
+            &paged_output,
+            scale,
+            start,
+            end,
+            selection,
+        );
         output.reshape(&[sequence, hidden])
     }
 }
@@ -305,6 +355,35 @@ fn bind_replay_start_to_permuted_query<T: Element>(
 #[cfg(test)]
 mod tests {
     use super::PagedCacheSet;
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn append_attention_requires_compatible_single_rows() {
+        use crate::{Dim, Tensor};
+        let caches = PagedCacheSet { layers: 1 };
+        let cache = caches.layer(0).unwrap();
+        let query = Tensor::<f32>::zeros(&[1, 16, 128]).unwrap();
+        let key = Tensor::<f32>::zeros(&[1, 8, 128]).unwrap();
+        let variant =
+            crate::target::metal::Variant::new("paged-sdpa-append.vector-gqa-two-pass-32").unwrap();
+        let start = Dim::from(64_u32);
+        let end = Dim::from(65_u32);
+        assert_eq!(
+            cache
+                .append_attention(&query, [&key, &key], 0.125, &start, &end, &variant)
+                .unwrap()
+                .shape(),
+            &[1, 2048]
+        );
+        for shape in [&[7, 8, 128][..], &[1, 8, 64], &[1024]] {
+            let bad = Tensor::<f32>::zeros(shape).unwrap();
+            assert!(
+                cache
+                    .append_attention(&query, [&bad, &bad], 0.125, &start, &end, &variant)
+                    .is_err()
+            );
+        }
+    }
 
     #[test]
     fn assigns_one_key_value_pair_per_layer() {
