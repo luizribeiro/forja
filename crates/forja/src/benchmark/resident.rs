@@ -122,6 +122,11 @@ pub(super) async fn run(options: &Bench) -> Result<(), Box<dyn Error>> {
     let started = std::time::Instant::now();
     let mut runners = Runners::new(true);
     for phase in [Phase::Single, Phase::Batch] {
+        if phase == Phase::Batch
+            && options.mode.batch_measurements == crate::args::BatchMeasurements::Omit
+        {
+            continue;
+        }
         let loaded = runners
             .acquire_phase(options, &options.points[0], &options.engines[0], phase)
             .await?;

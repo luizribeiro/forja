@@ -10,7 +10,7 @@ pub(crate) const SCHEMA_VERSION: u32 = 5;
 
 pub(crate) fn measurement_mode(options: &Bench) -> serde_json::Value {
     serde_json::json!({"sampling": "fixed", "early_stop": false,
-        "execution": options.mode.execution,
+        "execution": options.mode.execution, "batch_measurements": options.mode.batch_measurements,
         "reps": options.reps, "explicit_no_early_stop": options.mode.no_early_stop,
         "acceptance": if options.mode.remeasure { "remeasured" } else { "measured" }})
 }
@@ -127,6 +127,17 @@ pub(crate) fn validate_adoption(
     config_hash: &str,
     perf_hash: &str,
 ) -> Result<(), String> {
+    if report
+        .pointer("/measurement_mode/batch_measurements")
+        .is_some_and(|value| value == "omit")
+        || report["results"].as_array().is_some_and(|results| {
+            results
+                .iter()
+                .any(|result| result.get("batch_measurements").is_some())
+        })
+    {
+        return Err("--accept-from refuses partial batch measurement coverage".to_owned());
+    }
     for (pointer, expected) in [
         ("/schema_version", serde_json::json!(SCHEMA_VERSION)),
         ("/implementation", serde_json::json!("forja")),
@@ -165,6 +176,22 @@ pub(crate) fn perf_key(
         "engine.picks_hash".to_owned(),
         serde_json::json!(hash(&selection.variants)?),
     );
+    Ok(key)
+}
+
+pub(crate) fn measurement_perf_key(
+    options: &Bench,
+    point: &BenchPoint,
+    input: &Input,
+    profile: &Profile,
+) -> Result<PerfKey, String> {
+    let mut key = perf_key(point, input, profile)?;
+    if options.mode.batch_measurements == crate::args::BatchMeasurements::Omit {
+        key.insert(
+            "bench.batch-measurements".to_owned(),
+            serde_json::json!("omit"),
+        );
+    }
     Ok(key)
 }
 
@@ -215,6 +242,12 @@ fn recorded_perf_key(
         .ok_or_else(|| "record result input is invalid".to_owned())?;
     let replay = config.backend.metal.resolve().graph_replay;
     let mut key = perf_key_from(&config, replay, input)?;
+    if let Some(coverage) = result.get("batch_measurements") {
+        if coverage != "omit" {
+            return Err("unknown batch measurement coverage".to_owned());
+        }
+        key.insert("bench.batch-measurements".to_owned(), coverage.clone());
+    }
     if record.schema_version >= 3 {
         for field in ["engine.tunings", "engine.picks_hash"] {
             let value = result[field].clone();
@@ -440,6 +473,16 @@ mod tests {
             "inputs": inputs, "config_hash": "config", "perf_hash": "performance"
         });
         validate_adoption(&report, "binary", &inputs, "config", "performance").unwrap();
+        let mut partial = report.clone();
+        partial["measurement_mode"] = serde_json::json!({"batch_measurements":"omit"});
+        assert!(
+            validate_adoption(&partial, "binary", &inputs, "config", "performance")
+                .unwrap_err()
+                .contains("partial")
+        );
+        partial["measurement_mode"] = serde_json::Value::Null;
+        partial["results"] = serde_json::json!([{"batch_measurements":"omit"}]);
+        assert!(validate_adoption(&partial, "binary", &inputs, "config", "performance").is_err());
         for pointer in [
             "/schema_version",
             "/provenance/binary_sha256",
@@ -482,7 +525,7 @@ mod tests {
 
     #[test]
     fn reconstructs_performance_keys_from_recorded_points() {
-        let options = options();
+        let mut options = options();
         let point = point(&options);
         let input = Input {
             engine_sha256: "engine".to_owned(),
@@ -496,7 +539,7 @@ mod tests {
             model_revision: None,
         };
         let expected = perf_key(&point, &input, &profile()).unwrap();
-        let record = Recorded {
+        let mut record = Recorded {
             schema_version: SCHEMA_VERSION,
             provenance: RecordedProvenance {
                 commit: "recorded".to_owned(),
@@ -511,7 +554,23 @@ mod tests {
                 "engine.picks_hash": expected["engine.picks_hash"],
             })],
         };
-        assert_eq!(recorded_perf_keys(&record).unwrap(), [expected]);
+        assert_eq!(
+            recorded_perf_keys(&record).unwrap().as_slice(),
+            std::slice::from_ref(&expected)
+        );
+        assert_eq!(
+            measurement_perf_key(&options, &point, &input, &profile()).unwrap(),
+            expected
+        );
+        options.mode.batch_measurements = crate::args::BatchMeasurements::Omit;
+        let partial = measurement_perf_key(&options, &point, &input, &profile()).unwrap();
+        assert_ne!(
+            comparison_hash(&partial).unwrap(),
+            comparison_hash(&expected).unwrap()
+        );
+        record.results[0]["batch_measurements"] = serde_json::json!("omit");
+        assert_eq!(recorded_perf_keys(&record).unwrap(), [partial]);
+        assert_eq!(measurement_mode(&options)["batch_measurements"], "omit");
     }
 
     #[test]

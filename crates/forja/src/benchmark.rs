@@ -516,7 +516,9 @@ async fn run_metal(
             inputs
                 .iter()
                 .zip(&profiles)
-                .map(|(input, profile)| benchmark_record::perf_key(point, input, profile))
+                .map(|(input, profile)| {
+                    benchmark_record::measurement_perf_key(options, point, input, profile)
+                })
                 .collect::<Result<Vec<_>, _>>()
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -647,7 +649,8 @@ fn adopt_report(options: &Bench, path: &Path) -> Result<(), Box<dyn Error>> {
     let mut expected = Vec::new();
     let mut hashes = Vec::new();
     for point in &options.points {
-        let hash = benchmark_record::comparison_hash(&benchmark_record::perf_key(
+        let hash = benchmark_record::comparison_hash(&benchmark_record::measurement_perf_key(
+            options,
             point,
             &inputs[0],
             &profiles[0],
@@ -693,6 +696,9 @@ fn adopt_report(options: &Bench, path: &Path) -> Result<(), Box<dyn Error>> {
 }
 
 fn prepare_acceptance(options: &Bench) -> Result<Option<Acceptance>, String> {
+    if options.accept && options.mode.batch_measurements == crate::args::BatchMeasurements::Omit {
+        return Err("--accept requires complete batch measurement coverage".to_owned());
+    }
     if !options.accept {
         return Ok(None);
     }
@@ -1247,9 +1253,11 @@ async fn measure_points(
     for (point_index, point) in options.points.iter().enumerate() {
         for (input, component) in options.engines.iter().enumerate() {
             let engine = component.display().to_string();
-            let batches = if batch_measurements_enabled(
-                options.rerun.as_ref().map(|record| record.schema_version),
-            ) {
+            let batches = if options.mode.batch_measurements
+                == crate::args::BatchMeasurements::Include
+                && batch_measurements_enabled(
+                    options.rerun.as_ref().map(|record| record.schema_version),
+                ) {
                 measure_record_batches(options, point, component, runners).await?
             } else {
                 Vec::new()
@@ -1315,6 +1323,9 @@ async fn measure_points(
                     "engine.tunings": perf_keys[point_index][input]["engine.tunings"],
                     "engine.picks_hash": perf_keys[point_index][input]["engine.picks_hash"],
                 });
+                if options.mode.batch_measurements == crate::args::BatchMeasurements::Omit {
+                    result["batch_measurements"] = serde_json::json!("omit");
+                }
                 if !profile_reports.is_empty() {
                     result["breakdown"] = serde_json::Value::Array(
                         profile_reports.iter().map(profile_json).collect(),

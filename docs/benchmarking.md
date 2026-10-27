@@ -36,6 +36,14 @@ Output directories must be new. A failed command stops execution. Fixed mode
 preserves the four ABBA legs and their original confidence intervals; it does not
 invent a pooled interval or a sequential PASS.
 
+Native commands include batch sizes declared by their benchmark suite even when a
+consumer reads only prefill/decode results. Use `--batch-measurements omit` explicitly
+when no selected row consumes those batch cases; `include` is the classic default.
+Omitted coverage appears in mode/result metadata and changes performance hashes.
+Such partial records cannot become accepted full-profile baselines. Use a complete
+record or `--accept --accept-from partial.json --remeasure` to measure full coverage.
+A resident worker with omitted batches retains only the single-request instance.
+
 ## Sequential decisions
 
 Each block randomly uses ABBA or BAAB, with the seed and actual orientation saved.

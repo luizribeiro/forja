@@ -159,8 +159,17 @@ pub(crate) enum BenchExecution {
     ResidentWorker,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, ValueEnum, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum BatchMeasurements {
+    #[default]
+    Include,
+    Omit,
+}
+
 #[derive(Debug, Default, PartialEq)]
 pub(crate) struct BenchMode {
+    pub(crate) batch_measurements: BatchMeasurements,
     pub(crate) execution: BenchExecution,
     pub(crate) remeasure: bool,
     pub(crate) no_early_stop: bool,
@@ -267,6 +276,9 @@ struct BenchArgs {
 
 #[derive(Args)]
 struct SamplingModeArgs {
+    /// Include all batch cases (classic), or omit them in explicitly partial records.
+    #[arg(long, value_enum, default_value_t = BatchMeasurements::Include)]
+    batch_measurements: BatchMeasurements,
     /// Serve fixed-workload sample requests on stdin while retaining loaded weights.
     #[arg(long, requires = "raw_samples", conflicts_with_all = ["accept", "rerun", "against", "breakdown"])]
     worker: bool,
@@ -1137,6 +1149,7 @@ impl BenchArgs {
             accept: self.record.accept,
             accept_from: self.record.accept_from,
             mode: BenchMode {
+                batch_measurements: self.sampling_mode.batch_measurements,
                 execution: if self.sampling_mode.worker {
                     BenchExecution::ResidentWorker
                 } else {
