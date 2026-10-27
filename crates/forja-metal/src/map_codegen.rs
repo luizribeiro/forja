@@ -1,7 +1,7 @@
 use std::fmt::{self, Write};
 
 use forja_core::{
-    DType,
+    DType, Layout,
     program::{Inst, KernelSignature, ProgramKind, RedOp, ValidatedProgram, ValueType},
 };
 
@@ -18,11 +18,12 @@ pub(super) fn generate(
     program: &ValidatedProgram,
     signature: &KernelSignature,
     resident: bool,
+    layouts: &[Layout],
 ) -> String {
     match program.program().kind {
         ProgramKind::Map => generate_map(program, signature),
-        ProgramKind::Row if resident => generate_resident_row(program, signature),
-        ProgramKind::Row => generate_row(program, signature),
+        ProgramKind::Row if resident => generate_resident_row(program, signature, layouts),
+        ProgramKind::Row => generate_row(program, signature, layouts),
     }
 }
 
@@ -31,7 +32,12 @@ fn generate_map(program: &ValidatedProgram, signature: &KernelSignature) -> Stri
     let rank = usize::from(signature.rank());
     let mut source = String::from(SHARED_HEADER);
     line(&mut source, format_args!("\nkernel void {KERNEL_NAME}("));
-    emit_operand_parameters(&mut source, inputs.len(), signature.output_dtypes().len());
+    emit_operand_parameters(
+        &mut source,
+        inputs.len(),
+        signature.output_dtypes().len(),
+        false,
+    );
     line(
         &mut source,
         format_args!("    uint3 position [[thread_position_in_grid]]) {{"),
@@ -68,8 +74,12 @@ fn generate_map(program: &ValidatedProgram, signature: &KernelSignature) -> Stri
     source
 }
 
-fn generate_row(program: &ValidatedProgram, signature: &KernelSignature) -> String {
-    let mut source = row_source(signature);
+fn generate_row(
+    program: &ValidatedProgram,
+    signature: &KernelSignature,
+    layouts: &[Layout],
+) -> String {
+    let mut source = row_source(signature, layouts);
     let rank = usize::from(signature.rank());
     let instructions = &program.program().insts;
     for (reduce_slot, (index, instruction)) in instructions
@@ -96,8 +106,12 @@ fn generate_row(program: &ValidatedProgram, signature: &KernelSignature) -> Stri
     source
 }
 
-fn generate_resident_row(program: &ValidatedProgram, signature: &KernelSignature) -> String {
-    let mut source = row_source(signature);
+fn generate_resident_row(
+    program: &ValidatedProgram,
+    signature: &KernelSignature,
+    layouts: &[Layout],
+) -> String {
+    let mut source = row_source(signature, layouts);
     let rank = usize::from(signature.rank());
     line(&mut source, format_args!("    bool active = lane < width;"));
     line(
@@ -143,7 +157,7 @@ fn generate_resident_row(program: &ValidatedProgram, signature: &KernelSignature
     source
 }
 
-fn row_source(signature: &KernelSignature) -> String {
+fn row_source(signature: &KernelSignature, layouts: &[Layout]) -> String {
     let rank = usize::from(signature.rank());
     let mut source = String::from(SHARED_HEADER);
     line(
@@ -154,6 +168,7 @@ fn row_source(signature: &KernelSignature) -> String {
         &mut source,
         signature.input_dtypes().len(),
         signature.output_dtypes().len(),
+        !layouts.is_empty(),
     );
     line(
         &mut source,
@@ -175,6 +190,34 @@ fn row_source(signature: &KernelSignature) -> String {
         &mut source,
         format_args!("    uint simd_group [[simdgroup_index_in_threadgroup]]) {{"),
     );
+    for ((name, slot), layout) in operands(
+        signature.input_dtypes().len(),
+        signature.output_dtypes().len(),
+    )
+    .zip(layouts)
+    {
+        let shape = layout
+            .shape()
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let strides = layout
+            .strides()
+            .iter()
+            .map(|value| format!("{value}ul"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        line(
+            &mut source,
+            format_args!(
+                "    constexpr TensorLayout {name}{slot}_layout = {{{}ul, {}, {{{shape}}}, {}, {{{strides}}}}};",
+                layout.offset(),
+                layout.shape().len(),
+                layout.element_count()
+            ),
+        );
+    }
     line(
         &mut source,
         format_args!("    threadgroup float partial[32];"),
@@ -215,7 +258,13 @@ fn emit_resident_reduce(source: &mut String, reduce_slot: usize, op: RedOp, oper
     line(source, format_args!("    }}"));
 }
 
-fn emit_operand_parameters(source: &mut String, input_count: usize, output_count: usize) {
+fn emit_operand_parameters(
+    source: &mut String,
+    input_count: usize,
+    output_count: usize,
+    specialized: bool,
+) {
+    let prefix = if specialized { "dynamic_" } else { "" };
     let operand_count = input_count + output_count;
     for slot in 0..input_count {
         line(
@@ -234,14 +283,18 @@ fn emit_operand_parameters(source: &mut String, input_count: usize, output_count
         let buffer = operand_count + slot;
         line(
             source,
-            format_args!("    constant TensorLayout &input{slot}_layout [[buffer({buffer})]],"),
+            format_args!(
+                "    constant TensorLayout &{prefix}input{slot}_layout [[buffer({buffer})]],"
+            ),
         );
     }
     for slot in 0..output_count {
         let buffer = operand_count + input_count + slot;
         line(
             source,
-            format_args!("    constant TensorLayout &output{slot}_layout [[buffer({buffer})]],"),
+            format_args!(
+                "    constant TensorLayout &{prefix}output{slot}_layout [[buffer({buffer})]],"
+            ),
         );
     }
 }
@@ -625,6 +678,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn row_source_embeds_validated_layouts() {
+        let program = Program {
+            kind: ProgramKind::Row,
+            insts: vec![Inst::Input(0), Inst::Reduce(RedOp::Sum, 0)],
+            outputs: vec![(0, 1)],
+        }
+        .validate()
+        .unwrap();
+        let signature = KernelSignature::new(1, vec![DType::F32], vec![DType::F32], 0);
+        let layouts = [
+            Layout::new(DType::F32, 1, vec![7], vec![2], 60).unwrap(),
+            Layout::contiguous(DType::F32, 0, vec![7], 28).unwrap(),
+        ];
+        for resident in [false, true] {
+            let source = generate(&program, &signature, resident, &layouts);
+            assert!(
+                source.contains("constexpr TensorLayout input0_layout = {1ul, 1, {7}, 7, {2ul}};")
+            );
+            assert!(source.contains("constant TensorLayout &dynamic_input0_layout"));
+        }
+    }
+
+    #[test]
     fn sigmoid_rounding_context_uses_the_shared_store() {
         let source = bound_source(
             &rounding_program::context_program(),
@@ -863,6 +939,6 @@ kernel void forja_row(
             outputs.to_vec(),
             0,
         );
-        generate(&program, &signature, resident)
+        generate(&program, &signature, resident, &[])
     }
 }

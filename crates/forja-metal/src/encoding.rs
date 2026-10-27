@@ -2311,7 +2311,7 @@ impl MetalBackend {
             .then_some(())
             .ok_or(BackendError::QuotaExceeded)?;
         let rereading_key = ProgramPipelineKey::new(program, signature, false);
-        let rereading_source = map_codegen::generate(program, signature, false);
+        let rereading_source = map_codegen::generate(program, signature, false, &[]);
         let rereading = self
             .pipelines
             .lock()
@@ -2322,7 +2322,7 @@ impl MetalBackend {
         let resident = (program.program().kind == ProgramKind::Row).then(|| {
             let key = ProgramPipelineKey::new(program, signature, true);
             LazyProgramPipeline {
-                source: map_codegen::generate(program, signature, true),
+                source: map_codegen::generate(program, signature, true, &[]),
                 key,
                 state: OnceLock::new(),
                 compilation: Mutex::new(()),
