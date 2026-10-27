@@ -12,6 +12,8 @@ pub(crate) enum Probe {
     Threadgroup,
     #[cfg(test)]
     PagedContiguity,
+    #[cfg(test)]
+    PagedPartition,
 }
 
 #[derive(Clone, Copy)]
@@ -41,6 +43,8 @@ impl Probe {
             Self::Threadgroup => "calibration_threadgroup",
             #[cfg(test)]
             Self::PagedContiguity => "paged_contiguity_probe",
+            #[cfg(test)]
+            Self::PagedPartition => "paged_partition_probe",
         }
     }
     const fn label(self) -> &'static str {
@@ -54,7 +58,7 @@ impl Probe {
             Self::Mma(_, chains) | Self::NativeBf16(chains) => chains.count(),
             Self::Threadgroup => 0,
             #[cfg(test)]
-            Self::PagedContiguity => 0,
+            Self::PagedContiguity | Self::PagedPartition => 0,
         }
     }
     pub(crate) const fn constants(self) -> [(u32, u32); 2] {
@@ -197,7 +201,7 @@ impl MetalBackend {
             Probe::Mma(dtype, _) => Some(dtype),
             Probe::Threadgroup => None,
             #[cfg(test)]
-            Probe::PagedContiguity => None,
+            Probe::PagedContiguity | Probe::PagedPartition => None,
         };
         Ok(PreparedProbe {
             probe,
@@ -222,7 +226,7 @@ impl MetalBackend {
             ],
             Probe::Threadgroup => [u64::from(THREADS), 16, 1],
             #[cfg(test)]
-            Probe::PagedContiguity => {
+            Probe::PagedContiguity | Probe::PagedPartition => {
                 return Err(BackendError::InvalidInput);
             }
         }
@@ -260,7 +264,7 @@ impl MetalBackend {
             }
             Probe::Threadgroup => (f64::from(ITERATIONS), f64::from(ITERATIONS) * 8.0),
             #[cfg(test)]
-            Probe::PagedContiguity => {
+            Probe::PagedContiguity | Probe::PagedPartition => {
                 return Err(BackendError::InvalidInput);
             }
         };

@@ -20,6 +20,16 @@ inline bool paged_pages_are_consecutive(uint first, uint logical, uint physical)
     return ulong(physical) == ulong(first) + logical;
 }
 
+inline uint paged_divide_up(uint value, uint divisor) {
+    return value == 0 ? 0 : (value - 1) / divisor + 1;
+}
+
+inline uint2 paged_partition_interval(uint start, uint limit, uint stride, uint part) {
+    if (start >= limit) return uint2(limit);
+    ulong first = min(ulong(limit), ulong(start) + ulong(part) * stride);
+    return uint2(uint(first), uint(min(ulong(limit), first + stride)));
+}
+
 struct AuthenticatedPagedPage {
     uint physical;
     uint valid;
@@ -127,7 +137,7 @@ kernel void paged_sdpa_validate(
     if (!paged_lane_active(activity)) {
         return;
     }
-    uint pages = (params.key_length + params.page_tokens - 1) / params.page_tokens;
+    uint pages = paged_divide_up(params.key_length, params.page_tokens);
     if (logical_page >= pages) {
         return;
     }
@@ -316,12 +326,12 @@ void paged_sdpa_2pass_1_gqa_body(
     uint block = position.z;
     uint chunk = head_group / head_groups;
     uint first_head = (head_group % head_groups) * HPT;
-    uint keys_per_block = (params.key_length + params.blocks - 1) / params.blocks;
-    uint block_start = block * keys_per_block;
-    uint block_end = min(params.key_length, block_start + keys_per_block);
-    uint keys_per_chunk = (keys_per_block + chunks_per_head - 1) / chunks_per_head;
-    uint chunk_start = block_start + chunk * keys_per_chunk;
-    uint chunk_end = min(block_end, chunk_start + keys_per_chunk);
+    uint keys_per_block = paged_divide_up(params.key_length, params.blocks);
+    uint2 block_interval = paged_partition_interval(0, params.key_length, keys_per_block, block);
+    uint block_start = block_interval.x, block_end = block_interval.y;
+    uint keys_per_chunk = paged_divide_up(keys_per_block, chunks_per_head);
+    uint2 chunk_interval = paged_partition_interval(block_start, block_end, keys_per_chunk, chunk);
+    uint chunk_start = chunk_interval.x, chunk_end = chunk_interval.y;
 
     float q[HPT][elements_per_thread];
     float result[HPT][elements_per_thread];
@@ -364,7 +374,7 @@ void paged_sdpa_2pass_1_gqa_body(
         return;
     }
     uint first_logical_page = block_start / params.page_tokens;
-    uint end_logical_page = (block_end + params.page_tokens - 1) / params.page_tokens;
+    uint end_logical_page = paged_divide_up(block_end, params.page_tokens);
     ulong key_row_stride = ulong(params.kv_heads) * D;
     ulong value_row_stride = ulong(params.kv_heads) * params.value_width;
     constexpr uint pages_per_batch = 4;
@@ -384,9 +394,10 @@ void paged_sdpa_2pass_1_gqa_body(
         for (uint index = 0; index < batch_pages; ++index) {
             if (page_valid[index] != 0) {
                 uint logical_page = batch_start + index;
-                uint page_start = logical_page * params.page_tokens;
+                uint2 page_interval = paged_partition_interval(0, params.key_length, params.page_tokens, logical_page);
+                uint page_start = page_interval.x;
                 uint key_start = max(chunk_start, page_start);
-                uint key_end = min(chunk_end, page_start + params.page_tokens);
+                uint key_end = min(chunk_end, page_interval.y);
                 if (params.causal != 0) {
                     key_end = min(key_end, params.query_start + 1);
                 }
@@ -669,7 +680,7 @@ void paged_sdpa_body(
         }
         return;
     }
-    uint pages = (params.key_length + params.page_tokens - 1) / params.page_tokens;
+    uint pages = paged_divide_up(params.key_length, params.page_tokens);
     for (uint logical_page = 0; logical_page < pages; ++logical_page) {
         uint page = first_page + logical_page;
         if (contiguous == 0) {
@@ -772,5 +783,15 @@ kernel void paged_contiguity_probe(
     if (index < 4) {
         uint4 value = cases[index];
         output[index] = uint4(uint(paged_pages_are_consecutive(value.x, value.y, value.z)), 0, 0, 0);
+    }
+}
+
+kernel void paged_partition_probe(
+    device const uint4 *cases [[buffer(0)]], device uint4 *output [[buffer(1)]],
+    uint index [[thread_position_in_grid]]) {
+    if (index < 4) {
+        uint4 value = cases[index];
+        uint2 interval = paged_partition_interval(value.x, value.y, value.z, value.w);
+        output[index] = uint4(interval, paged_divide_up(value.y, value.z), 0);
     }
 }

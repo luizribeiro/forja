@@ -10029,6 +10029,25 @@ mod tests {
         );
     }
 
+    #[test]
+    fn metal_paged_partition_bounds_do_not_wrap() {
+        assert_paged_integer_probe(
+            crate::calibration::Probe::PagedPartition,
+            [
+                [0, u32::MAX, 134_217_728, 31],
+                [u32::MAX - 7, u32::MAX, 4, 1],
+                [3, 33, 7, 7],
+                [0, 33, 7, 4],
+            ],
+            [
+                [4_160_749_568, u32::MAX, 32, 0],
+                [u32::MAX - 3, u32::MAX, 1_073_741_824, 0],
+                [33, 33, 5, 0],
+                [28, 33, 5, 0],
+            ],
+        );
+    }
+
     fn captured_u32s(buffer: &ProtocolObject<dyn MTLBuffer>, count: usize) -> Vec<u32> {
         // SAFETY: The retained shared-storage buffer contains at least `count` u32 values, and
         // the test reads it only after the submission has completed.
