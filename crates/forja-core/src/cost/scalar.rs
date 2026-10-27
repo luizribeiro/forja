@@ -47,7 +47,15 @@ pub(super) fn count(dispatch: &Dispatch, mut cost: KernelCost) -> Option<KernelC
     cost.scalar_ops = match dispatch.op() {
         Op::Program(_) => {
             let program = dispatch.bound_program()?.program().program();
-            let width = u64::from(*dispatch.output().layout().shape().last()?);
+            let width = u64::from(
+                dispatch
+                    .output()
+                    .layout()
+                    .shape()
+                    .last()
+                    .copied()
+                    .unwrap_or(1),
+            );
             program_ops(program, elements, width)?
         }
         Op::RmsNorm { .. } => elements.checked_mul(4)?.checked_add(
@@ -91,6 +99,33 @@ pub(super) fn count(dispatch: &Dispatch, mut cost: KernelCost) -> Option<KernelC
 mod tests {
     use super::*;
     use crate::program::{BinOp, RedOp, UnOp};
+
+    #[test]
+    fn scalar_map_counts_its_single_element() {
+        use crate::{
+            DType, Dispatch,
+            cost::tests::tensor,
+            program::{KernelSignature, prepared_for_test},
+        };
+        let program = Program {
+            kind: ProgramKind::Map,
+            insts: vec![Inst::Input(0), Inst::Unary(UnOp::Exp, 0)],
+            outputs: vec![(0, 1)],
+        }
+        .validate()
+        .unwrap();
+        let prepared = prepared_for_test(
+            program,
+            KernelSignature::new(0, vec![DType::F32], vec![DType::F32], 0),
+        )
+        .unwrap();
+        let input = tensor(1, DType::F32, &[]);
+        let output = tensor(2, DType::F32, &[]);
+        let dispatch = Dispatch::kernel(&prepared, &[&input], &[&output]).unwrap();
+        let cost = KernelCost::of(&dispatch).unwrap();
+        assert_eq!(cost.scalar_ops, 1);
+        assert_eq!((cost.read_bytes, cost.write_bytes), (4, 4));
+    }
 
     #[test]
     fn row_reductions_count_uniform_arithmetic_once_per_row() {
