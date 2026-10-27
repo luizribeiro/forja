@@ -1726,3 +1726,34 @@ fn metal_paged_gqa_wide_splits_match_cpu_at_long_context() {
     check_paged_gqa_two_pass(64_001, "paged-sdpa.vector-gqa-two-pass-512", (32, 4));
     check_paged_gqa_two_pass(128_001, "paged-sdpa.vector-gqa-two-pass-1024", (32, 4));
 }
+
+#[test]
+fn metal_paged_append_refuses_unsupported_width_without_writing() {
+    let backend = forja_metal::MetalBackend::new().unwrap();
+    let query = backend.alloc(DType::F32, &[1, 1, 64]).unwrap();
+    let source = backend.alloc(DType::F32, &[1, 1, 64]).unwrap();
+    let key = backend.alloc(DType::F16, &[1, 64, 1, 64]).unwrap();
+    let value = backend.alloc(DType::F16, &[1, 64, 1, 64]).unwrap();
+    let table = backend.alloc(DType::U32, &[1, 2]).unwrap();
+    let generations = backend.alloc(DType::U32, &[1]).unwrap();
+    let output = backend.alloc(DType::F32, &[1, 1, 64]).unwrap();
+    let before = backend.read(&key).unwrap();
+    let mut commands = CommandList::new();
+    commands
+        .dispatch_many(
+            Op::PagedSdpaAppend {
+                scale: 1.0,
+                q_start: 0,
+                page_tokens: 64,
+            },
+            &[&query, &source, &source, &table, &generations],
+            &[&output, &key, &value],
+        )
+        .unwrap();
+    assert!(matches!(
+        backend.submit(commands),
+        Err(BackendError::UnsupportedOperation)
+    ));
+    assert_eq!(backend.read(&key).unwrap(), before);
+    assert_eq!(backend.read(&value).unwrap(), before);
+}

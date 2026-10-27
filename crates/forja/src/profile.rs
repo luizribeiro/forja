@@ -125,7 +125,7 @@ fn op_name(operation: Op) -> &'static str {
         Op::QuantMatmul { .. } => "quant-matmul",
         Op::GatherQuantMatmul { .. } => "gather-quant-matmul",
         Op::Sdpa { .. } => "sdpa",
-        Op::PagedSdpaAppend { .. } => "other",
+        Op::PagedSdpaAppend { .. } => "paged-sdpa-append",
         Op::PagedSdpa { .. } => "paged-sdpa",
     }
 }
