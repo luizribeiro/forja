@@ -2374,6 +2374,31 @@ mod tests {
         commands.into_dispatches().remove(0)
     }
 
+    fn paged_append_dispatch() -> Dispatch {
+        let backend = CpuBackend::new();
+        let query = backend.alloc(DType::F32, &[8, 1, 128]).unwrap();
+        let key = backend.alloc(DType::F32, &[1, 1, 128]).unwrap();
+        let value = backend.alloc(DType::F32, &[1, 1, 128]).unwrap();
+        let table = backend.alloc(DType::U32, &[1, 2]).unwrap();
+        let generations = backend.alloc(DType::U32, &[1]).unwrap();
+        let output = backend.alloc(DType::F32, &[8, 1, 128]).unwrap();
+        let key_pool = backend.alloc(DType::F16, &[1, 64, 1, 128]).unwrap();
+        let value_pool = backend.alloc(DType::F16, &[1, 64, 1, 128]).unwrap();
+        let mut commands = CommandList::new();
+        commands
+            .dispatch_many(
+                Op::PagedSdpaAppend {
+                    scale: 0.1,
+                    q_start: 0,
+                    page_tokens: 64,
+                },
+                &[&query, &key, &value, &table, &generations],
+                &[&output, &key_pool, &value_pool],
+            )
+            .unwrap();
+        commands.into_dispatches().remove(0)
+    }
+
     fn paged_sdpa_dispatch(dtype: DType, query_length: u32, width: u32) -> Dispatch {
         paged_sdpa_dispatch_with_heads(dtype, 2, query_length, width)
     }
@@ -2919,6 +2944,36 @@ mod tests {
                 "sdpa.steel-half",
                 sdpa_dispatch_with_cache(DType::F32, DType::F16, 8, 64, 64, 128, 128),
                 "steel_attention_half_128_96x16",
+            ),
+            (
+                "paged-sdpa-append.vector-gqa-two-pass-32",
+                paged_append_dispatch(),
+                "paged_sdpa_2pass_1_gqa8_128",
+            ),
+            (
+                "paged-sdpa-append.vector-gqa-two-pass-64",
+                paged_append_dispatch(),
+                "paged_sdpa_2pass_1_gqa8_128",
+            ),
+            (
+                "paged-sdpa-append.vector-gqa-two-pass-128",
+                paged_append_dispatch(),
+                "paged_sdpa_2pass_1_gqa8_128",
+            ),
+            (
+                "paged-sdpa-append.vector-gqa-two-pass-256",
+                paged_append_dispatch(),
+                "paged_sdpa_2pass_1_gqa8_128",
+            ),
+            (
+                "paged-sdpa-append.vector-gqa-two-pass-512",
+                paged_append_dispatch(),
+                "paged_sdpa_2pass_1_gqa8_128",
+            ),
+            (
+                "paged-sdpa-append.vector-gqa-two-pass-1024",
+                paged_append_dispatch(),
+                "paged_sdpa_2pass_1_gqa8_128",
             ),
             (
                 "paged-sdpa.vector",
