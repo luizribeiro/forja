@@ -70,6 +70,12 @@ impl Runners {
         if self.retain { steps.min(2) } else { steps }
     }
 
+    // A worker measures phases serially; sharing keeps weights and graph arenas
+    // within one backend's residency budget for the entire block.
+    const fn storage_phase(&self, phase: Phase) -> Phase {
+        if self.retain { Phase::Single } else { phase }
+    }
+
     pub(super) async fn acquire(
         &mut self,
         options: &Bench,
@@ -87,6 +93,7 @@ impl Runners {
         component: &Path,
         phase: Phase,
     ) -> Result<Loaded, Box<dyn Error>> {
+        let phase = self.storage_phase(phase);
         if let Some(loaded) = self.loaded.remove(&phase) {
             return Ok(loaded);
         }
@@ -126,7 +133,11 @@ impl Runners {
                     .prepare_paged_lane(lane, None, 0)
                     .map_err(|error| format!("resident lane release failed: {error:?}"))?;
             }
-            if self.loaded.insert(phase, loaded).is_some() {
+            if self
+                .loaded
+                .insert(self.storage_phase(phase), loaded)
+                .is_some()
+            {
                 return Err("resident phase was returned twice".into());
             }
         }
@@ -210,6 +221,57 @@ pub(super) async fn run(options: &Bench) -> Result<(), Box<dyn Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires FORJA_MODELS and runs in the pre-push hook"]
+    fn metal_resident_phases_reuse_the_prefix_owner() -> Result<(), Box<dyn Error>> {
+        let models = std::env::var_os("FORJA_MODELS").ok_or("FORJA_MODELS is not set")?;
+        let component = test_guests::qwen3();
+        let crate::args::Command::Bench(options) = crate::args::parse([
+            "bench".to_owned(),
+            "--engine".to_owned(),
+            component.display().to_string(),
+            "--model".to_owned(),
+            Path::new(&models).join("Qwen3-0.6B").display().to_string(),
+        ])?
+        else {
+            return Err("expected benchmark options".into());
+        };
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()?
+            .block_on(async {
+                let mut runners = Runners::new(true);
+                let point = &options.points[0];
+                let (mut runner, info, device) =
+                    runners.acquire(&options, point, component).await?;
+                runner.prepare_paged_request(None, 16)?;
+                let request = forja_host::EngineDecode {
+                    tokens: Some(vec![1, 7, 33]),
+                    start_pos: 0,
+                    sampling: forja_host::SamplingParams::default(),
+                };
+                let output = runner.decode(request.clone()).await??;
+                let expected = runner.read(&output.logits).await?;
+                runner.wait_for_queued_submissions().await?;
+                let prefix = runner.paged_prefix()?.ok_or("missing prefix")?;
+                runners.release((runner, info, device)).await?;
+                for phase in [Phase::Batch, Phase::Single, Phase::Batch] {
+                    let (mut runner, info, device) = runners
+                        .acquire_phase(&options, point, component, phase)
+                        .await?;
+                    runner.prepare_paged_request(Some(prefix.fork_reserved(3, 16)?), 16)?;
+                    runner.prepare_paged_request(None, 0)?;
+                    runner.prepare_paged_request(None, 16)?;
+                    let output = runner.decode(request.clone()).await??;
+                    assert_eq!(runner.read(&output.logits).await?, expected);
+                    runners.release_phase(phase, (runner, info, device)).await?;
+                }
+                assert_eq!(runners.loads, 1);
+                assert_eq!(runners.instance_loads, [(Phase::Single, 1)].into());
+                Ok::<_, Box<dyn Error>>(())
+            })
+    }
 
     #[test]
     fn prefix_workers_refuse_profiling_before_loading_a_runner() {
