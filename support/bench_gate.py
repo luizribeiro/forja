@@ -59,6 +59,7 @@ def main():
     seed = args.seed if args.seed is not None else secrets.randbits(64)
     baseline = json.loads(Path(plan["baseline_snapshot"]).read_text()) if plan.get("baseline_snapshot") else {}
     candidate = json.loads(Path(plan["candidate_snapshot"]).read_text()) if plan.get("candidate_snapshot") else {}
+    input_plan_hash = digest(plan)
     selection = select(scoreboard_rows(plan), baseline, candidate, args.all_rows)
     plan = execution_plan(plan, selection, args.group, args.long_reason)
     chosen_by_id = {row["id"]: row for row in selection["rows"]}
@@ -68,7 +69,8 @@ def main():
     resident = not args.process_per_leg and not args.no_early_stop
     protocols = {row["id"]: measurement_protocol(row, resident, warmups) for row in plan["rows"]}
     legacy_priming = all(value["priming"] == "legacy" for value in protocols.values())
-    report = {"schema_version": 1, "plan_sha256": digest(plan), "seed": seed,
+    report = {"schema_version": 1, "plan_sha256": input_plan_hash,
+              "execution_plan_sha256": digest(plan), "seed": seed,
               "mode": {"sampling": "fixed" if args.no_early_stop else "sequential",
                        "row_selection": selection["mode"], "reps": args.reps,
                        "competitor": "fresh" if args.fresh_competitor else "cached-if-valid",

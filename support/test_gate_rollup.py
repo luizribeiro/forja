@@ -142,6 +142,9 @@ def test_regular_saved_plan_and_report_visibly_exclude_long_rows(tmp_path, monke
     report = json.loads((out / "report.json").read_text())
     assert [r["id"] for r in saved["rows"]] == ["short"]
     assert saved["skipped_rows"][0]["id"] == "long"
+    from bench_cache import digest
+    assert report["plan_sha256"] == digest(plan)
+    assert report["execution_plan_sha256"] == digest(saved)
     assert saved["gate_groups"] == report["gate_groups"]
     assert report["gate_group"] == "regular"
     assert report["gate_groups"][1]["status"] == "skipped-with-reason"
