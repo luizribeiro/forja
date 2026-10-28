@@ -14,6 +14,7 @@ from urllib.parse import urlsplit
 
 import http_client
 import provenance
+import priming
 import suite
 
 
@@ -40,6 +41,7 @@ def measurement_options(parser):
     parser.add_argument("--reps", type=int)
     parser.add_argument("--warmups", type=int)
     parser.add_argument("--raw-samples", action="store_true")
+    parser.add_argument("--priming", choices=("legacy", "bounded"), default="legacy")
 
 
 def measurement_settings(args, settings):
@@ -80,9 +82,11 @@ class Server:
         self.command = command
         self.url = url
         self.process: subprocess.Popen[bytes] | None = None
+        self.startup_seconds = 0.0
 
     def start(self) -> None:
         """Start the server and wait for its model endpoint."""
+        started = time.perf_counter()
         self.stop()
         self.process = subprocess.Popen(self.command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         deadline = time.monotonic() + 300
@@ -90,6 +94,7 @@ class Server:
             if self.process.poll() is not None:
                 raise RuntimeError(f"server exited with {self.process.returncode}")
             if ready(self.url):
+                self.startup_seconds += time.perf_counter() - started
                 return
             time.sleep(0.1)
         raise TimeoutError("server did not become ready within 300 seconds")
@@ -243,20 +248,35 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     started_at = datetime.now(timezone.utc).isoformat()
     started = time.perf_counter()
     results = []
+    bounded = getattr(args, "priming", "legacy") == "bounded"
+    primes = []
+    cold_startup = 0.0
+    timers = {"priming_seconds": 0.0, "prefix_preparation_seconds": 0.0, "measured_seconds": 0.0}
     try:
         for case in concrete:
-            if server.process is None and not case.get("cold"):
+            if (server.process is None and (bounded or not case.get("cold"))) or (bounded and case.get("cold")):
                 server.start()
                 client = http_client.OpenAIClient(args.url, settings["model"])
             assert client is not None
             if case.get("warm_prefix_tokens"):
-                client.request({**case, "prompt_tokens": 0, "output_tokens": 1})
+                preparation_started = time.perf_counter()
+                sample = client.request({**case, "prompt_tokens": 0, "output_tokens": 1})
+                if bounded and sample["error"] is not None:
+                    raise ValueError("warm-prefix preparation failed")
+                timers["prefix_preparation_seconds"] += time.perf_counter() - preparation_started
+            if bounded and settings["warmups"]:
+                prime = priming.case(client, case)
+                primes.append(prime)
+                timers["priming_seconds"] += prime.get("seconds", 0.0)
             before = server.rss_bytes()
             restart = None
             metrics_before = None
             if case.get("cold"):
                 def restart() -> None:
+                    nonlocal cold_startup
+                    previous = getattr(server, "startup_seconds", 0.0)
                     server.start()
+                    cold_startup += getattr(server, "startup_seconds", 0.0) - previous
                     client.reset_connection()
 
             def begin_measurement() -> None:
@@ -266,14 +286,18 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             result = http_client.run_case(
                 client,
                 case,
-                settings["warmups"],
+                0 if bounded else settings["warmups"],
                 settings["repetitions"],
                 restart,
                 begin_measurement,
                 **({"raw_samples": True} if getattr(args, "raw_samples", False) else {}),
             )
+            if bounded:
+                priming.validate_case(case, result)
+                timers["measured_seconds"] += result["measurement_seconds"]
+            # A cold restart replaces the counters; cross-process differences are invalid.
             result["server_metrics"] = metric_report(
-                metrics_before, scrape_metrics(args.metrics_url)
+                None if bounded and case.get("cold") else metrics_before, scrape_metrics(args.metrics_url)
             )
             rss = [value for value in [before, server.rss_bytes()] if value is not None]
             result["rss_bytes"] = max(rss) if rss else None
@@ -282,7 +306,16 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         server.stop()
     prompts = [http_client.request_body(case, settings["model"]) for case in concrete]
     prompt_hash = hashlib.sha256(json.dumps(prompts, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    if bounded:
+        timers["measured_window_seconds"] = timers["measured_seconds"]
+        timers["measured_seconds"] -= cold_startup
+        timers["server_startup_seconds"] = server.startup_seconds
+        timers["other_seconds"] = max(0.0, time.perf_counter() - started - sum(
+            value for key, value in timers.items() if key != "measured_window_seconds"))
     return {
+        **({"priming": {"protocol": "bounded-path-v1", "paths": primes},
+            "phase_timers": {**timers, "cold_startup_in_measured_window_seconds": cold_startup}}
+           if bounded else {}),
         "schema_version": 2,
         "measurement_mode": {"sampling": "fixed", "reps": settings["repetitions"],
                              "warmups": settings["warmups"], "unit": "whole-concurrent-case"},

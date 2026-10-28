@@ -321,6 +321,7 @@ def test_compare_refuses_every_workload_identity_mismatch() -> None:
         ("sampling_seed", 1),
         ("warmups", 4),
         ("connection_policy", "new"),
+        ("priming", {"protocol": "bounded-path-v1"}),
     ]:
         changed = {**record, field: value}
         try:

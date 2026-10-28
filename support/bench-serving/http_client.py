@@ -221,6 +221,7 @@ def run_case(
     itl = [value for item in good for value in item["itl_seconds"]]
     result = {
         "case": case,
+        "measurement_seconds": elapsed,
         "requests": count,
         "requests_per_second": count / elapsed,
         "ttft_seconds": stats([value["ttft_seconds"] for value in good]) if good else None,
@@ -229,6 +230,7 @@ def run_case(
         "prompt_tokens_per_second": sum(value["prompt_tokens"] for value in good) / elapsed,
         "output_tokens_per_second": sum(value["output_tokens"] for value in good) / elapsed,
         "cached_tokens": sum(value["cached_tokens"] for value in good),
+        "cache_hits": sum(value["cached_tokens"] > 0 for value in good),
         "errors": [value["error"] for value in samples if value["error"] is not None],
         "cancellations": sum(value["cancelled"] for value in samples),
         "output_sha256": sorted(
@@ -267,7 +269,7 @@ def response_output(payload: dict[str, object]) -> str:
 
 def sample(started, first, ended, itl, prompt_tokens, output_tokens, cached_tokens, cancelled, output):
     """Construct one bounded timing sample."""
-    return {"ttft_seconds": first - started, "itl_seconds": itl, "e2e_seconds": ended - started, "prompt_tokens": prompt_tokens, "output_tokens": output_tokens, "cached_tokens": cached_tokens, "cancelled": cancelled, "output": output, "error": None}
+    return {"request_window": [started, ended], "ttft_seconds": first - started, "itl_seconds": itl, "e2e_seconds": ended - started, "prompt_tokens": prompt_tokens, "output_tokens": output_tokens, "cached_tokens": cached_tokens, "cancelled": cancelled, "output": output, "error": None}
 
 
 def failed(started: float, error: str) -> dict[str, object]:

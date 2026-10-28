@@ -24,6 +24,7 @@ def comparable(left: dict[str, object], right: dict[str, object]) -> None:
         ("prompt/request hash", left.get("prompt_sha256"), right.get("prompt_sha256")),
         ("sampling seed", left.get("sampling_seed"), right.get("sampling_seed")),
         ("warmups", left.get("warmups"), right.get("warmups")),
+        ("priming protocol", left.get("priming", {}).get("protocol"), right.get("priming", {}).get("protocol")),
         ("connection policy", left.get("connection_policy"), right.get("connection_policy")),
     ]
     for name, old, new in checks:
