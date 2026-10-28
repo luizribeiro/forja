@@ -1595,20 +1595,12 @@ async fn bench_engine(
     }
     let profiles = benchmark_profiles(&mut runner, &tokens, point, options, decode).await?;
     let probe_started = Instant::now();
-    if runners.retains() {
-        runner.prepare_paged_request(None, 0)?;
-        prepare_benchmark_runner(
-            &mut runner,
-            tg_context_start
-                .checked_add(point.tg)
-                .ok_or("decode context length overflowed")?,
-        )?;
-    }
     let (output_digest, peak_footprint) = benchmark_output(
         &mut runner,
         &tokens[..options.decode_prefill],
         point.tg,
         decode.sampling,
+        runners,
     )
     .await?;
     runners
@@ -2085,8 +2077,27 @@ async fn benchmark_output(
     prompt: &[u32],
     steps: usize,
     sampling: SamplingParams,
+    runners: &resident::Runners,
 ) -> Result<(String, u64), Box<dyn Error>> {
-    let digest = probe_output(runner, prompt, steps, sampling).await?;
+    let digest = if runners.retains() {
+        let prefix = runners
+            .prefixes
+            .get(&(resident::Phase::Single, prompt.len()))
+            .ok_or("output prefix is unavailable")?;
+        prefix
+            .probe(
+                runner,
+                steps,
+                DecodeOptions {
+                    host_argmax: false,
+                    overlap: true,
+                    sampling,
+                },
+            )
+            .await?
+    } else {
+        probe_output(runner, prompt, steps, sampling).await?
+    };
     let peak = runner
         .memory_usage()
         .peak_physical_footprint

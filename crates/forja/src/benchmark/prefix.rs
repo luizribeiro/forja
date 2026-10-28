@@ -1,11 +1,12 @@
 use super::{
     DecodeOptions, EngineDecode, EngineRunner, Error, Instant, PagedPrefix, Sample,
-    measure_pipelined_tokens, prepare_decode, read_token, resident, timing,
+    measure_pipelined_tokens, read_token, resident, timing,
 };
 #[derive(Clone)]
 pub(super) struct Prepared {
     prefix: PagedPrefix,
     feedback: u32,
+    logits: std::sync::Arc<[u8]>,
     tokens: u32,
 }
 
@@ -21,14 +22,59 @@ impl Prepared {
         if !runner.prepare_paged_request(None, u64::from(tokens))? {
             return Err("prefix workers require authenticated paged storage".into());
         }
-        let feedback = prepare_decode(runner, prompt, options).await?;
+        let output = runner
+            .decode(EngineDecode {
+                tokens: Some(prompt.to_vec()),
+                start_pos: 0,
+                sampling: options.sampling,
+            })
+            .await?
+            .map_err(|error| format!("prefix preparation failed: {error:?}"))?;
+        let feedback = read_token(&runner.read(&output.token).await?)?;
+        let logits = runner.read(&output.logits).await?.into();
+        runner.wait_for_queued_submissions().await?;
         let prefix = runner.paged_prefix()?.ok_or("missing paged prefix")?;
         runner.prepare_paged_request(None, 0)?;
         Ok(Self {
             prefix,
             feedback,
+            logits,
             tokens,
         })
+    }
+
+    pub(super) async fn probe(
+        &self,
+        runner: &mut EngineRunner<forja_metal::MetalBackend>,
+        steps: usize,
+        options: DecodeOptions,
+    ) -> Result<String, Box<dyn Error>> {
+        if steps == 0 {
+            return Err("output probe must contain tokens".into());
+        }
+        let mut tokens = vec![self.feedback];
+        let logits = if steps == 1 {
+            self.logits.to_vec()
+        } else {
+            let mut output = self.seed(runner, steps, options).await?;
+            tokens.push(read_token(&runner.read(&output.token).await?)?);
+            for index in 2..steps {
+                output = runner
+                    .decode(EngineDecode {
+                        tokens: None,
+                        start_pos: self
+                            .tokens
+                            .checked_add(u32::try_from(index - 1)?)
+                            .ok_or("probe position overflow")?,
+                        sampling: options.sampling,
+                    })
+                    .await?
+                    .map_err(|error| format!("prefix probe failed: {error:?}"))?;
+                tokens.push(read_token(&runner.read(&output.token).await?)?);
+            }
+            runner.read(&output.logits).await?
+        };
+        Ok(super::benchmark_record::output_digest(&tokens, &logits))
     }
 
     async fn seed(
@@ -103,6 +149,7 @@ pub(super) async fn measure(
 
 #[cfg(test)]
 mod tests {
+    use super::super::prepare_decode;
     use super::*;
 
     #[test]
@@ -138,6 +185,7 @@ mod tests {
                     let cached = Prepared::new(&mut runner, &prompt, decode).await?;
                     let output = cached.seed(&mut runner, 8, decode).await?;
                     let actual = runner.read(&output.logits).await?;
+                    runner.prepare_paged_request(None, 0)?;
                     super::super::prepare_benchmark_runner(&mut runner, length + 9)?;
                     prepare_decode(&mut runner, &prompt, decode).await?;
                     let output = runner
@@ -151,6 +199,18 @@ mod tests {
                     assert_eq!(runner.read(&output.logits).await?, actual);
                     let output = cached.seed(&mut runner, 8, decode).await?;
                     assert_eq!(runner.read(&output.logits).await?, actual);
+                    for steps in [1, 4] {
+                        runner.prepare_paged_request(None, 0)?;
+                        super::super::prepare_benchmark_runner(&mut runner, length + 9)?;
+                        let expected = super::super::probe_output(
+                            &mut runner,
+                            &prompt,
+                            steps,
+                            decode.sampling,
+                        )
+                        .await?;
+                        assert_eq!(cached.probe(&mut runner, steps, decode).await?, expected);
+                    }
                 }
                 Ok::<_, Box<dyn Error>>(())
             })
