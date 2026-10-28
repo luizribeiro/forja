@@ -147,11 +147,34 @@ falls below `-D`, with D derived from raw block noise, never marginal noise.
 Without comparable raw history, promote immediately: the first gate collects
 history across all rows. Promoted rows get a fresh primary measurement namespace, including when other
 rows have already collected shared primary observations. Do not reuse screening samples
-for sequential decisions. `history.json` preserves dated block scores for future plans. History must have
-a pinned artifact hash, matching identity/method, at least six finite scores and
-nonzero SD. Stale/undated history (seven days by default) supplies no D; identity
-or hash mismatches are refused. This conservative collection run does not accept
-a candidate. A later independent run can use its verified noise history.
+for sequential decisions. `history.json` preserves dated block scores for future plans.
+Noise identity contains exactly `row`, `workload_sha256`, `harness_protocol`,
+`machine_identity`, `os_build` and the plan’s `guard` argv prefix. The workload hash binds model and token inputs,
+workload settings and metric/window selection. The versioned harness protocol also
+binds effective execution, priming and warmups. Changing a workload, protocol,
+machine, OS or resource wrapper invalidates reuse; changing host/engine code does not. Binary,
+component, profile, source and command-path hashes belong to measurement provenance,
+not noise identity. Frozen measurement artifacts still require exact hashes.
+
+History needs a pinned SHA256, matching identity/method, at least six finite block
+scores and nonzero SD. Stale/undated history (seven days by default) supplies no D;
+identity or hash mismatches are refused. Older build-bound histories additionally
+require `history.legacy_workload_sha256`: an audited hash of their original workload
+and tokens, compared with the current workload, plus the audited original `history.legacy_guard` argv. This explicit conversion preserves
+the pinned original file, timestamps and scores; never guess the missing hash from
+the new build or retag old measurements as new ones.
+
+`history.sd_factor` declares the allowed SD ratio (default 2, finite and greater
+than one). At the first sequential look, and after each later block, compare the
+observed block SD with stored SD in both directions. The five-block unaffected-row
+screen also checks it. A departure outside `[SD/factor, SD*factor]`, a fired drift
+screen, or baseline drift irreversibly forces full 30-block collection for that
+row, including any required confirmation. Reports and saved histories retain the
+reason, phase, block count, factor and observed/stored SD. A guarded PASS cannot
+be accepted or rescued later; an earlier FAIL remains evidence and still gets
+exactly one fresh confirmation. Missing noise history likewise collects all blocks
+before any positive decision, with no protected PASS. A later independent run can
+use the resulting verified workload noise.
 
 ## Separate long-context gate
 
