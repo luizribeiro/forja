@@ -13,7 +13,7 @@ from gate_worker import bind_measurement_protocol, close_workers, measurement_pr
 from gate_block_workers import block_workers
 from gate_runner import run_row
 from gate_select import select
-from gate_groups import execution_plan
+from gate_groups import execution_plan, scoreboard_rows
 
 def verdict(decisions: list[str]) -> str:
     """Diagnostics, partial measurements and failures cannot become a gating PASS."""
@@ -51,7 +51,7 @@ def main():
     parser.add_argument("--plan-only", action="store_true")
     args = parser.parse_args()
     plan = json.loads(args.plan.read_text())
-    if not plan.get("rows") or (not args.no_early_stop and args.reps != 30):
+    if not scoreboard_rows(plan) or (not args.no_early_stop and args.reps != 30):
         raise ValueError("require nonempty rows; sequential cap is 30 (--reps changes fixed mode)")
     if args.out.exists() and any(args.out.iterdir()):
         raise ValueError("output directory must be new or empty")
@@ -59,7 +59,7 @@ def main():
     seed = args.seed if args.seed is not None else secrets.randbits(64)
     baseline = json.loads(Path(plan["baseline_snapshot"]).read_text()) if plan.get("baseline_snapshot") else {}
     candidate = json.loads(Path(plan["candidate_snapshot"]).read_text()) if plan.get("candidate_snapshot") else {}
-    selection = select(plan["rows"], baseline, candidate, args.all_rows)
+    selection = select(scoreboard_rows(plan), baseline, candidate, args.all_rows)
     plan = execution_plan(plan, selection, args.group, args.long_reason)
     chosen_by_id = {row["id"]: row for row in selection["rows"]}
     warmups = args.warmups if args.warmups is not None else (3 if args.no_early_stop else 1)

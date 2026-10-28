@@ -31,18 +31,28 @@ def workload_context(row):
     return ceiling
 
 
+def scoreboard_rows(plan):
+    """Reopen saved plans without losing the separate, explicitly skipped group."""
+    rows = [{key: value for key, value in row.items() if key != "skip_reason"}
+            for row in [*plan.get("rows", []), *plan.get("skipped_rows", [])]]
+    if len({row["id"] for row in rows}) != len(rows):
+        raise ValueError("duplicate rows across active and skipped gate groups")
+    return rows
+
+
 def execution_plan(plan, selection, group="regular", long_reason=None):
     """Select exactly one gate group; preserve every excluded row and its reason."""
     if group not in {"regular", "long"} or long_reason is not None and (
             group != "long" or not long_reason.strip()):
         raise ValueError("long_reason requires a separate long gate and a nonempty reason")
+    all_rows = scoreboard_rows(plan)
     ceilings = {}
-    for row in plan["rows"]:
+    for row in all_rows:
         key = session_key(row)
         ceilings[key] = max(ceilings.get(key, 0), workload_context(row))
     rows = [{**row, "workload_max_context": ceilings[session_key(row)],
              "gate_group": "long" if ceilings[session_key(row)] >= LONG_CONTEXT else "regular"}
-            for row in plan["rows"]]
+            for row in all_rows]
     proven = {row["id"] for row in selection["rows"] if row.get("affected") and row.get("source_bound_affected")}
     summaries = []
     for name in ["regular", "long"]:

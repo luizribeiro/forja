@@ -12,7 +12,7 @@ def row(name, context, command=None):
 
 
 def selection(rows, proven=()):
-    return {"rows": [{**r, "affected": True, "source_bound_affected": r["id"] in proven} for r in rows]}
+    return {"mode": "fixture", "rows": [{**r, "affected": True, "source_bound_affected": r["id"] in proven} for r in rows]}
 
 
 @pytest.mark.parametrize("name,context", [
@@ -66,3 +66,14 @@ def test_missing_or_invalid_audited_ceiling_is_refused(ceiling):
     rows = [row("unknown", ceiling)]
     with pytest.raises(ValueError, match="workload_max_context"):
         execution_plan({"rows": rows}, selection(rows))
+
+
+def test_saved_regular_plan_can_reopen_as_a_separate_proven_long_plan():
+    rows = [row("short", 2048), row("long", 32768)]
+    regular = execution_plan({"rows": rows}, selection(rows))
+    again = execution_plan(regular, selection(rows))
+    assert again == regular
+    long = execution_plan(regular, selection(rows, ["long"]), "long")
+    assert [r["id"] for r in long["rows"]] == ["long"]
+    assert "skip_reason" not in long["rows"][0]
+    assert long["skipped_rows"][0]["id"] == "short"

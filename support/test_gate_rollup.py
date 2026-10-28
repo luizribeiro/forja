@@ -175,3 +175,21 @@ def test_explicit_periodic_long_plan_stays_separate(tmp_path, monkeypatch):
     assert [r["id"] for r in saved["rows"]] == ["long"]
     assert saved["gate_groups"][0]["status"] == "skipped-with-reason"
     assert saved["gate_groups"][1]["manual_or_periodic_reason"] == "periodic coverage"
+
+
+@pytest.mark.parametrize("has_short", [False, True])
+def test_reopened_plan_selects_dependencies_for_skipped_rows_too(tmp_path, monkeypatch, has_short):
+    from test_gate_groups import row, selection
+    from gate_groups import execution_plan
+    rows = ([row("short", 2048)] if has_short else []) + [row("long", 65536)]
+    saved = execution_plan({"rows": rows, "guard": [], "artifacts": {}}, selection(rows))
+    path = tmp_path / "regular.json"
+    path.write_text(json.dumps(saved))
+    def choose(all_rows, *_args):
+        assert {r["id"] for r in all_rows} == {r["id"] for r in rows}
+        return selection(all_rows, ["long"])
+    monkeypatch.setattr(bench_gate, "select", choose)
+    out = tmp_path / "long"
+    monkeypatch.setattr(sys, "argv", ["gate", str(path), "--out", str(out), "--group", "long", "--plan-only"])
+    bench_gate.main()
+    assert json.loads((out / "plan.json").read_text())["rows"][0]["id"] == "long"
