@@ -30,7 +30,7 @@ def measurement_command(adapter, output, reps, warmups, raw, guard):
 
 def session_key(row):
     return digest([{key: row[side].get(key) for key in
-        ["command", "cwd", "expected_provenance", "cache_state"]} for side in ["baseline", "candidate"]])
+        ["command", "cwd", "expected_provenance", "cache_state", "worker_protocol"]} for side in ["baseline", "candidate"]])
 
 
 def command_sampler(row: dict, directory: Path, guard: list[str], warmups: int,

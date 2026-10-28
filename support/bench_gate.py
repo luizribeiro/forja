@@ -9,7 +9,7 @@ import time
 from bench_cache import digest
 from gate_history import history
 from gate_records import command_sampler, save, session_key, verify_artifacts
-from gate_worker import close_workers
+from gate_worker import bind_measurement_protocol, close_workers, measurement_protocol
 from gate_block_workers import block_workers
 from gate_runner import run_row
 from gate_select import select
@@ -59,12 +59,16 @@ def main():
     warmups = args.warmups if args.warmups is not None else (3 if args.no_early_stop else 1)
     if warmups < 0 or args.reps <= 0 or args.worker_timeout <= 0:
         raise ValueError("invalid repetition/warmup counts")
+    resident = not args.process_per_leg and not args.no_early_stop
+    protocols = {row["id"]: measurement_protocol(row, resident, warmups) for row in plan["rows"]}
+    legacy_priming = all(value["priming"] == "legacy" for value in protocols.values())
     report = {"schema_version": 1, "plan_sha256": digest(plan), "seed": seed,
               "mode": {"sampling": "fixed" if args.no_early_stop else "sequential",
                        "row_selection": selection["mode"], "reps": args.reps,
                        "competitor": "fresh" if args.fresh_competitor else "cached-if-valid",
-                       "warmups_per_leg": warmups,
-                       "warmups_per_launch": warmups if args.process_per_leg or args.no_early_stop else None,
+                       "configured_priming_passes": warmups, "measurement_protocols": protocols,
+                       "warmups_per_leg": warmups if legacy_priming else None,
+                       "warmups_per_launch": warmups if legacy_priming and (args.process_per_leg or args.no_early_stop) else None,
                        "execution": "process-per-leg" if args.process_per_leg or args.no_early_stop
                            else "resident-block-workers"},
               "selection": selection, "rows": [], "started": time.time()}
@@ -88,7 +92,7 @@ def main():
     try:
         for index in indices:
             chosen = selection["rows"][index]
-            row = history(plan["rows"][index])
+            row = history(bind_measurement_protocol(plan["rows"][index], resident, warmups))
             directory = args.out / f"row-{index:02}"
             directory.mkdir()
             group_key = session_key(row)

@@ -9,7 +9,7 @@ import time
 
 
 class Worker:
-    def __init__(self, command, cwd, log: Path, timeout=3600, startup_timeout=2700):
+    def __init__(self, command, cwd, log: Path, timeout=3600, startup_timeout=2700, protocol=1):
         self.command, self.cwd, self.timeout = command, cwd, timeout
         self.log = log.open("wb")
         self.buffer = b""
@@ -23,7 +23,7 @@ class Worker:
         try:
             self.ready = self._response(b"FORJA_BENCH_READY ", startup_timeout)
             instances = self.ready.get("instance_loads", {})
-            if (self.ready.get("protocol") != 1 or not instances
+            if (self.ready.get("protocol") != protocol or not instances
                     or any(count != 1 for count in instances.values())
                     or self.ready.get("runner_loads") != sum(instances.values())):
                 raise ValueError("worker must load each isolated measurement instance exactly once")
@@ -62,7 +62,8 @@ class Worker:
         self.process.stdin.flush()
         with log.open("wb") as stream:
             result = self._response(b"FORJA_BENCH_RESULT ", self.timeout, stream)
-        if (result.get("id") != self.sequence or result.get("pid") != self.ready["pid"]
+        if (result.get("protocol", 1) != self.ready["protocol"]
+                or result.get("id") != self.sequence or result.get("pid") != self.ready["pid"]
                 or result.get("runner_loads") != self.ready["runner_loads"]
                 or result.get("instance_loads") != self.ready["instance_loads"]):
             raise ValueError("worker response identity or load count changed")
@@ -112,14 +113,46 @@ def worker_policy(row, enabled=True):
     """Only direct pinned native commands promise the fixed-workload protocol."""
     adapters = [row[side] for side in ["baseline", "candidate"]]
     policies = {adapter.get("cache_state", "fresh-request") for adapter in adapters}
-    if not policies <= {"fresh-request", "cold-process"}:
+    if not policies <= {"fresh-request", "cold-process", "prefix-fork-per-worker"}:
         raise ValueError("unknown worker cache-state policy")
+    protocols = {adapter.get("worker_protocol", 1) for adapter in adapters}
+    if len(protocols) != 1 or not protocols <= {1, 2}:
+        raise ValueError("worker protocols must match")
+    if (protocols == {2}) != (policies == {"prefix-fork-per-worker"}):
+        raise ValueError("worker protocol does not match cache-state policy")
     native = all(len(adapter["command"]) > 1 and adapter["command"][1] == "bench"
                  and {"/provenance/binary_sha256", "/inputs/0/engine_sha256"}
                      <= adapter.get("expected_provenance", {}).keys() for adapter in adapters)
     reason = ("explicit process-per-leg" if not enabled else "cold process required"
               if "cold-process" in policies else "adapter has no native worker protocol" if not native else None)
     return reason
+
+
+def measurement_protocol(row, enabled, warmups):
+    """Bind history to the effective execution and priming policy, including overrides."""
+    adapters = [row[side] for side in ["baseline", "candidate"]]
+    priming = {adapter["command"][adapter["command"].index("--priming") + 1]
+               if "--priming" in adapter["command"] else "legacy" for adapter in adapters}
+    if len(priming) != 1:
+        raise ValueError("priming protocols must match")
+    resident = worker_policy(row, enabled) is None
+    protocol = adapters[0].get("worker_protocol", 1) if resident else None
+    return {"execution": "resident-block-workers" if resident else "process-per-leg",
+            "worker_protocol": protocol, "configured_priming_passes": warmups,
+            "priming": "once-per-worker-shape; two decode steps" if protocol == 2 else priming.pop()}
+
+
+def bind_measurement_protocol(row, enabled, warmups):
+    """New protocols cannot borrow history from a different effective runtime mode."""
+    modern = any(adapter.get("worker_protocol") == 2 or "--priming" in adapter["command"]
+                 for adapter in [row["baseline"], row["candidate"]])
+    if not modern or not row.get("history_identity"):
+        return row
+    actual = measurement_protocol(row, enabled, warmups)
+    identity = row["history_identity"]
+    if row.get("history") and identity.get("measurement_protocol") != actual:
+        raise ValueError("history measurement protocol differs from runtime mode")
+    return {**row, "history_identity": {**identity, "measurement_protocol": actual}}
 
 
 def worker_pair(row, directory, guard, reps, warmups, enabled=True, timeout=3600, order="AB"):
@@ -136,12 +169,13 @@ def worker_pair(row, directory, guard, reps, warmups, enabled=True, timeout=3600
             command = measurement_command(adapter, directory / f"worker-{side}-unused.json",
                                           reps, warmups, True, guard)
             workers[side] = Worker(worker_command(command), adapter.get("cwd"),
-                                   directory / f"worker-{side}.log", timeout=timeout)
+                                   directory / f"worker-{side}.log", timeout=timeout,
+                                   protocol=adapter.get("worker_protocol", 1))
             save(directory / f"worker-{side}.start.json", workers[side].startup)
         if workers["A"].ready["pid"] == workers["B"].ready["pid"]:
             raise ValueError("baseline and candidate workers must be separate processes")
     except BaseException:
         close_workers(workers)
         raise
-    return workers, {"execution": "resident-worker", "cache_state": "fresh-request", "startup_order": order,
+    return workers, {"execution": "resident-worker", "cache_state": row["baseline"].get("cache_state", "fresh-request"), "startup_order": order,
                      "sides": {side: worker.startup for side, worker in workers.items()}}

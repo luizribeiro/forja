@@ -7,19 +7,19 @@ import pytest
 from gate_worker import Worker
 
 
-def fake_worker(tmp_path, behavior="normal"):
+def fake_worker(tmp_path, behavior="normal", protocol=1):
     script = tmp_path / f"worker-{behavior}.py"
     script.write_text('''import json,os,sys
 from pathlib import Path
 print('startup log', flush=True)
-print('FORJA_BENCH_READY '+json.dumps({'protocol':1,'pid':os.getpid(),'runner_loads':1,'instance_loads':{'single':1}}),flush=True)
+print('FORJA_BENCH_READY '+json.dumps({'protocol':PROTOCOL,'pid':os.getpid(),'runner_loads':1,'instance_loads':{'single':1}}),flush=True)
 for line in sys.stdin:
  request=json.loads(line)
  Path(request['output']).write_text(json.dumps({'pid':os.getpid(),'id':request['id']}))
  print('sample log',flush=True)
  print('FORJA_BENCH_RESULT '+json.dumps({'id':request['id'],'pid':os.getpid(),
-  'runner_loads':LOADS,'instance_loads':{'single':1}}),flush=True)
-'''.replace("LOADS", "2" if behavior == "reload" else "1"))
+  'protocol':PROTOCOL,'runner_loads':LOADS,'instance_loads':{'single':1}}),flush=True)
+'''.replace("LOADS", "2" if behavior == "reload" else "1").replace("PROTOCOL", str(protocol)))
     return [sys.executable, str(script)]
 
 
@@ -55,7 +55,7 @@ def test_worker_pair_preserves_workload_and_explicit_cold_process_fallback(tmp_p
     from gate_worker import worker_pair, close_workers
     class Fake:
         count = 0
-        def __init__(self, command, cwd, log, timeout):
+        def __init__(self, command, cwd, log, timeout, protocol=1):
             Fake.count += 1
             self.ready = {"pid": Fake.count}
             self.startup = {"command": command}
@@ -92,3 +92,27 @@ def test_block_workers_refuse_partial_block_entry_before_launch(tmp_path):
     with pytest.raises(ValueError, match="incomplete"):
         workers.sample("A", tmp_path / "output", tmp_path / "log", "primary", 0, 1)
     assert not workers.info["blocks"]
+
+
+def test_worker_protocol_identity_cannot_be_silently_reused(tmp_path):
+    from gate_records import session_key
+    from gate_worker import worker_policy
+    adapter = {"command": ["/forja", "bench"], "worker_protocol": 2,
+               "cache_state": "prefix-fork-per-worker"}
+    row = {"baseline": adapter, "candidate": dict(adapter)}
+    assert session_key(row) != session_key({"baseline": {}, "candidate": {}})
+    row["candidate"]["worker_protocol"] = 1
+    with pytest.raises(ValueError, match="protocols"):
+        worker_policy(row)
+    row["candidate"]["worker_protocol"] = 2
+    row["candidate"]["cache_state"] = "fresh-request"
+    with pytest.raises(ValueError, match="cache-state"):
+        worker_policy(row)
+    with pytest.raises(ValueError, match="load"):
+        Worker(fake_worker(tmp_path, protocol=2), None, tmp_path / "wrong.log", timeout=2)
+    worker = Worker(fake_worker(tmp_path, protocol=2), None, tmp_path / "right.log", timeout=2, protocol=2)
+    try:
+        event = worker.sample(tmp_path / "record2.json", tmp_path / "sample2.log")
+        assert event["worker_result"]["protocol"] == 2
+    finally:
+        worker.close()

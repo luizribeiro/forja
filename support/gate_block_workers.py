@@ -10,7 +10,8 @@ class BlockWorkers:
         self.row, self.directory, self.guard = row, directory, guard
         self.warmups, self.seed, self.timeout = warmups, seed, timeout
         self.active, self.key, self.next_leg = {}, None, 0
-        self.info = {"execution": "resident-block", "cache_state": "fresh-request", "blocks": []}
+        self.info = {"execution": "resident-block",
+                     "cache_state": row.get("baseline", {}).get("cache_state", "fresh-request"), "blocks": []}
 
     def persist(self):
         entry = self.info["blocks"][-1]
