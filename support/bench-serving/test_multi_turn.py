@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import multi_turn
+import pytest
 
 class Client:
     def __init__(self):
@@ -57,3 +58,73 @@ def test_raw_turn_windows_keep_whole_sessions_as_independent_units():
     report = multi_turn.turn_reports([samples], [2])[0]["samples"][0]
     assert report["windows"]["ttft"][1] - report["windows"]["ttft"][0] == 1.
     assert abs(report["windows"]["decode"][1] - report["windows"]["decode"][0] - .02) < 1e-6
+
+
+def test_bounded_primer_preserves_measured_conversation_and_validates_cache():
+    suite, _ = multi_turn.load_suite(Path(__file__).resolve().parents[2] / "bench/suites/multi-turn.toml")
+    original = {**suite, "tool_output_tokens": list(suite["tool_output_tokens"])}
+    prime = multi_turn.priming_suite(suite)
+    assert suite == original
+    assert prime["tool_output_tokens"] == [64, 64]
+    assert prime["output_tokens"] == 2
+    samples, _ = multi_turn.run_conversation(Client(), prime, "warmup-0")
+    multi_turn.validate_cache_path(samples)
+    samples[0]["cached_tokens"] = 16
+    with pytest.raises(ValueError, match="fresh"):
+        multi_turn.validate_cache_path(samples)
+    samples[0]["cached_tokens"] = 0
+    samples[1]["cached_tokens"] = 0
+    with pytest.raises(ValueError, match="cached-prefix"):
+        multi_turn.validate_cache_path(samples)
+
+
+def test_bounded_run_restarts_before_unchanged_measured_turns(monkeypatch, tmp_path):
+    import argparse
+
+    suite, _ = multi_turn.load_suite(Path(__file__).resolve().parents[2] / "bench/suites/multi-turn.toml")
+    suite = {**suite, "warmups": 3, "repetitions": 1}
+    starts, calls = [], []
+
+    class Server:
+        startup_seconds = 0.0
+
+        def __init__(self, *_args):
+            pass
+
+        def start(self):
+            starts.append(len(calls))
+
+        def stop(self):
+            pass
+
+        def rss_bytes(self):
+            return 0
+
+    class Transport(Client):
+        def __init__(self, *_args):
+            super().__init__()
+
+        def reset_connection(self):
+            self.histories = []
+
+    original_run = multi_turn.run_conversation
+
+    def conversation(client, active, label, **kwargs):
+        calls.append((active, label))
+        return original_run(client, active, label, **kwargs)
+
+    monkeypatch.setattr(multi_turn, "load_suite", lambda _path: (suite, "suite"))
+    monkeypatch.setattr(multi_turn, "run_conversation", conversation)
+    monkeypatch.setattr(multi_turn.serving_bench, "Server", Server)
+    monkeypatch.setattr(multi_turn.http_client, "OpenAIClient", Transport)
+    monkeypatch.setattr(multi_turn.serving_bench, "validate_identity", lambda *_args: None)
+    monkeypatch.setattr(multi_turn.provenance, "collect", lambda *_args: {})
+    args = argparse.Namespace(suite=tmp_path, artifact=[], server_command="server", url="http://local",
+                              priming="bounded", implementation="forja", repository=tmp_path,
+                              forja_repository=tmp_path, weights=[], resolved_config=None)
+    record = multi_turn.run(args)
+    assert starts == [0, 1]
+    assert calls[1] == (suite, "sample-0")
+    assert len(record["turns"]) == 12
+    assert record["prompt_cache_reused"]
+    assert record["priming"]["fresh_server_before_measurement"]

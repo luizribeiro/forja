@@ -141,6 +141,21 @@ def turn_reports(runs: list[list[dict[str, object]]], tool_tokens: list[int]) ->
     return reports
 
 
+def priming_suite(suite):
+    """Exercise streamed chat, tool history and a cache hit in two short turns."""
+    return {**suite, "tool_output_tokens": [64, 64],
+            "scripted_assistant_tokens": min(16, suite["scripted_assistant_tokens"]),
+            "output_tokens": 2}
+
+
+def validate_cache_path(samples):
+    """Each fresh conversation starts cold and then reuses its own prefix."""
+    if samples[0]["cached_tokens"] != 0:
+        raise ValueError("fresh conversation unexpectedly reused a cached prefix")
+    if any(sample["cached_tokens"] <= 0 for sample in samples[1:]):
+        raise ValueError("conversation cached-prefix path did not run")
+
+
 def run(args: argparse.Namespace) -> dict[str, object]:
     suite, suite_hash = load_suite(args.suite)
     suite = serving_bench.measurement_settings(args, suite)
@@ -154,15 +169,27 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     peak_rss = 0
     started_at = datetime.now(timezone.utc).isoformat()
     started = time.perf_counter()
+    bounded = getattr(args, "priming", "legacy") == "bounded"
+    warmups = min(1, suite["warmups"]) if bounded else suite["warmups"]
+    timers = {"priming_seconds": 0.0, "measured_seconds": 0.0}
+    primes = []
     try:
-        total = suite["warmups"] + suite["repetitions"]
+        total = warmups + suite["repetitions"]
         for repetition in range(total):
-            measured = repetition >= suite["warmups"]
-            label = f"sample-{repetition - suite['warmups']}" if measured else f"warmup-{repetition}"
+            measured = repetition >= warmups
+            label = f"sample-{repetition - warmups}" if measured else f"warmup-{repetition}"
             server.start()
             client.reset_connection()
-            samples, bodies = run_conversation(client, suite, label,
+            active_suite = priming_suite(suite) if bounded and not measured else suite
+            phase_started = time.perf_counter()
+            samples, bodies = run_conversation(client, active_suite, label,
                 **({"raw_samples": True} if getattr(args, "raw_samples", False) else {}))
+            if bounded:
+                timers["measured_seconds" if measured else "priming_seconds"] += time.perf_counter() - phase_started
+                validate_cache_path(samples)
+                if not measured:
+                    primes.append({"suite": active_suite, "cached_tokens": [sample["cached_tokens"] for sample in samples],
+                                   "streamed_tokens": [len(sample["itl_seconds"]) + 1 for sample in samples]})
             peak_rss = max(peak_rss, server.rss_bytes() or 0)
             if measured:
                 runs.append(samples)
@@ -170,6 +197,9 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     finally:
         server.stop()
     turns = turn_reports(runs, suite["tool_output_tokens"])
+    if bounded:
+        timers["server_startup_seconds"] = server.startup_seconds
+        timers["other_seconds"] = max(0.0, time.perf_counter() - started - sum(timers.values()))
     for turn in turns:
         total = turn["total_context_tokens"]
         print(
@@ -177,6 +207,8 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             f"median {total['median']:.0f}, max {total['ci95'][1]:.0f}"
         )
     return {
+        **({"priming": {"protocol": "bounded-conversation-v1", "paths": primes,
+                        "fresh_server_before_measurement": True}, "phase_timers": timers} if bounded else {}),
         "schema_version": 1,
         "measurement_mode": {"sampling": "fixed", "reps": suite["repetitions"],
                              "warmups": suite["warmups"], "unit": "whole-conversation"},
