@@ -40,6 +40,28 @@ def scoreboard_rows(plan):
     return rows
 
 
+def scope_competitor(plan, selected):
+    """An optional cache command cannot introduce a hidden long workload."""
+    skipped = plan.get("skipped_competitor") or {}
+    request = plan.get("competitor_request", skipped.get("request"))
+    if not request:
+        return plan
+    ceiling = plan.get("competitor_workload_max_context", skipped.get("workload_max_context"))
+    if type(ceiling) is not int or ceiling < 1:
+        raise ValueError("competitor request requires positive competitor_workload_max_context")
+    owner = "long" if ceiling >= LONG_CONTEXT else "regular"
+    cache = plan.get("competitor_cache", skipped.get("cache"))
+    result = {key: value for key, value in plan.items()
+              if key not in {"competitor_request", "competitor_cache", "skipped_competitor"}}
+    if owner in selected:
+        result.update(competitor_request=request, competitor_cache=cache)
+    else:
+        result["skipped_competitor"] = {"request": request, "cache": cache,
+            "workload_max_context": ceiling, "gate_group": owner,
+            "reason": "competitor workload belongs to a separate skipped gate group"}
+    return result
+
+
 def execution_plan(plan, selection, group="regular", long_reason=None):
     """Select exactly one gate group; preserve every excluded row and its reason."""
     if group not in {"regular", "long"} or long_reason is not None and (
@@ -70,5 +92,5 @@ def execution_plan(plan, selection, group="regular", long_reason=None):
     selected = {item["name"] for item in summaries if item["status"] == "selected"}
     skipped = [{**row, "skip_reason": next(item["reason"] for item in summaries
                  if item["name"] == row["gate_group"])} for row in rows if row["gate_group"] not in selected]
-    return {**plan, "rows": [row for row in rows if row["gate_group"] in selected],
-            "gate_group": group, "gate_groups": summaries, "skipped_rows": skipped}
+    return scope_competitor({**plan, "rows": [row for row in rows if row["gate_group"] in selected],
+            "gate_group": group, "gate_groups": summaries, "skipped_rows": skipped}, selected)

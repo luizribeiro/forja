@@ -77,3 +77,18 @@ def test_saved_regular_plan_can_reopen_as_a_separate_proven_long_plan():
     assert [r["id"] for r in long["rows"]] == ["long"]
     assert "skip_reason" not in long["rows"][0]
     assert long["skipped_rows"][0]["id"] == "short"
+
+
+def test_long_competitor_work_cannot_enter_regular_gate_through_cache_command():
+    rows = [row("short", 2048), row("long", 65536)]
+    plan = {"rows": rows, "competitor_request": "request.json", "competitor_cache": "cache",
+            "competitor_workload_max_context": 65536}
+    regular = execution_plan(plan, selection(rows))
+    assert "competitor_request" not in regular
+    assert regular["skipped_competitor"]["gate_group"] == "long"
+    assert regular["skipped_competitor"]["reason"]
+    long = execution_plan(regular, selection(rows, ["long"]), "long")
+    assert long["competitor_request"] == "request.json" and long["competitor_cache"] == "cache"
+    del plan["competitor_workload_max_context"]
+    with pytest.raises(ValueError, match="competitor_workload_max_context"):
+        execution_plan(plan, selection(rows))

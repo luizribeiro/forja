@@ -79,7 +79,8 @@ def main():
                        "warmups_per_launch": warmups if legacy_priming and (args.process_per_leg or args.no_early_stop) else None,
                        "execution": "process-per-leg" if args.process_per_leg or args.no_early_stop
                            else "resident-block-workers"},
-              "selection": selection, "gate_group": plan["gate_group"], "gate_groups": plan["gate_groups"],
+              "selection": selection, "skipped_competitor": plan.get("skipped_competitor"),
+              "gate_group": plan["gate_group"], "gate_groups": plan["gate_groups"],
               "skipped_rows": [{"id": row["id"], "gate_group": row["gate_group"],
                                 "reason": row["skip_reason"]} for row in plan["skipped_rows"]],
               "rows": [], "started": time.time()}

@@ -226,7 +226,10 @@ running. The short drift command must use the same path/workload at fewer reps.
 `--drift-tolerance` to 0.05. A failed/malformed probe stops; detected drift invalidates
 the cached measurement and triggers a full run. Reports retain original provenance,
 measurement age, cache key and probe records; they never relabel cached work fresh.
-A gate plan can supply `competitor_request` and `competitor_cache` paths.
+A gate plan can supply `competitor_request` and `competitor_cache` paths, with an
+audited `competitor_workload_max_context` for that whole request. A cache command
+belonging to the other gate group is retained as `skipped_competitor` with its
+reason; it cannot introduce long work into a regular run.
 
 ## Acceptance and kernel diagnostics
 
