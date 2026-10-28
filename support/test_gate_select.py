@@ -60,3 +60,15 @@ def test_internal_selection_errors_are_visible_and_still_gate_every_row(monkeypa
     assert all(row["affected"] for row in report["rows"])
     assert report["selection_errors"][0]["exception"] == "RuntimeError"
     assert "internal resolver failure" in report["selection_errors"][0]["traceback"]
+
+
+def test_source_bound_changes_are_distinct_from_unknown_or_explicit_selection():
+    rows, baseline, candidate = snapshots()
+    candidate["catalog"]["d"]["source_hash"] = "changed reachable kernel"
+    chosen = select(rows, baseline, candidate)["rows"]
+    assert [row["id"] for row in chosen if row["source_bound_affected"]] == [
+        "decode-short", "decode-long"]
+    candidate["host_hash"] = "unknown host dependency"
+    assert all(row["affected"] for row in select(rows, baseline, candidate)["rows"])
+    assert not any(row["source_bound_affected"] for row in select(rows, baseline, candidate)["rows"])
+    assert not any(row["source_bound_affected"] for row in select(rows, baseline, candidate, True)["rows"])

@@ -61,7 +61,7 @@ def select(rows: list[dict], baseline: dict, candidate: dict, all_rows=False) ->
     """Any unknown build dependency or incomplete proof selects every row."""
     if all_rows:
         return {"mode": "all-rows", "rows": [
-            {**row, "affected": True, "reasons": ["explicit all-rows"]} for row in rows],
+            {**row, "affected": True, "source_bound_affected": False, "reasons": ["explicit all-rows"]} for row in rows],
             "selection_errors": []}
     fallback = []
     errors = []
@@ -100,6 +100,7 @@ def select(rows: list[dict], baseline: dict, candidate: dict, all_rows=False) ->
     return {"mode": "all-rows" if all_rows else "dependency-selection",
             "selection_errors": errors,
             "rows": [{**row, "affected": bool(fallback or results[row["id"]]),
+                      "source_bound_affected": not fallback and bool(results[row["id"]]),
                       "reasons": sorted(set(fallback + results[row["id"]]))} for row in rows]}
 
 
