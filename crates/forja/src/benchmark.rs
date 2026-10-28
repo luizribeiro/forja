@@ -2127,6 +2127,16 @@ async fn measure_pipelined_decode(
                 .ok_or("submission count overflowed")?,
         )
         .await?;
+    measure_pipelined_tokens(runner, context_start, steps, sampling).await
+}
+
+#[cfg(target_os = "macos")]
+async fn measure_pipelined_tokens(
+    runner: &mut EngineRunner<forja_metal::MetalBackend>,
+    context_start: u32,
+    steps: usize,
+    sampling: SamplingParams,
+) -> Result<Sample, Box<dyn Error>> {
     let before = runner.metrics();
     let started = Instant::now();
     let mut position = context_start
