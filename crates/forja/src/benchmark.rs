@@ -584,7 +584,7 @@ async fn run_metal(
         if options.mode.execution == crate::args::BenchExecution::ResidentWorker {
             report["worker"] = serde_json::json!({"protocol":2,"prefix_entries":runners.prefixes.len(),"pid": std::process::id(), "runner_loads": runners.loads,
                 "instance_loads": runners.instance_loads, "cache_state": "prefix-fork-per-worker",
-                "warmups_per_leg": options.warmups, "phase_timers": runners.times.report(started.elapsed())?});
+                "configured_priming_passes": options.warmups, "priming_policy":"once-per-worker-shape; at most two decode steps", "phase_timers": runners.times.report(started.elapsed())?});
         }
         if let Some(path) = output {
             if options.breakdown {
@@ -1454,7 +1454,88 @@ where
 }
 
 #[cfg(target_os = "macos")]
-#[allow(clippy::too_many_lines)]
+async fn measure_record_prefill(
+    runner: &mut EngineRunner<forja_metal::MetalBackend>,
+    prompt: &[u32],
+    runners: &mut resident::Runners,
+    prime: bool,
+) -> Result<Sample, Box<dyn Error>> {
+    let started = Instant::now();
+    if runners.retains() {
+        runner.prepare_paged_request(None, 0)?;
+        prepare_benchmark_runner(runner, prompt.len())?;
+    }
+    let setup = started.elapsed();
+    let sample = measure_prefill(runner, prompt).await?;
+    if prime {
+        runners.times.add(timing::Stage::Prime, started.elapsed());
+    } else {
+        runners.times.add(timing::Stage::Setup, setup);
+        runners.times.add(
+            timing::Stage::Measured,
+            Duration::from_secs_f64(sample.wall_seconds),
+        );
+    }
+    Ok(sample)
+}
+
+#[cfg(target_os = "macos")]
+async fn prime_benchmark(
+    runner: &mut EngineRunner<forja_metal::MetalBackend>,
+    tokens: &[u32],
+    point: &BenchPoint,
+    options: &Bench,
+    decode: DecodeOptions,
+    runners: &mut resident::Runners,
+) -> Result<(), Box<dyn Error>> {
+    let pp_warmups = runners.warmup_count(resident::Prime::Prefill(point.pp), options.warmups);
+    let tg_warmups = runners.warmup_count(
+        resident::Prime::Decode(options.decode_prefill),
+        options.warmups,
+    );
+    for repetition in 0..pp_warmups.max(tg_warmups) {
+        if repetition < pp_warmups {
+            measure_record_prefill(runner, &tokens[..point.pp], runners, true).await?;
+        }
+        if repetition < tg_warmups {
+            measure_record_decode(
+                runner,
+                &tokens[..options.decode_prefill],
+                point.tg,
+                decode,
+                runners,
+                true,
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+async fn benchmark_profiles(
+    runner: &mut EngineRunner<forja_metal::MetalBackend>,
+    tokens: &[u32],
+    point: &BenchPoint,
+    options: &Bench,
+    decode: DecodeOptions,
+) -> Result<Vec<ProfileMeasurement>, Box<dyn Error>> {
+    if options.breakdown {
+        measure_profiles(
+            runner,
+            tokens,
+            options.reps,
+            options.warmups,
+            &point.contexts,
+            decode,
+        )
+        .await
+    } else {
+        Ok(Vec::new())
+    }
+}
+
+#[cfg(target_os = "macos")]
 async fn bench_engine(
     options: &Bench,
     point: &BenchPoint,
@@ -1474,11 +1555,11 @@ async fn bench_engine(
         .decode_prefill
         .checked_add(1)
         .ok_or("decode context length overflowed")?;
+    let decode_end = tg_context_start
+        .checked_add(point.tg)
+        .ok_or("decode context length overflowed")?;
     if point.pp > max_context
-        || tg_context_start
-            .checked_add(point.tg)
-            .ok_or("decode context length overflowed")?
-            > max_context
+        || decode_end > max_context
         || profile_context
             .checked_add(point.tg)
             .ok_or("decode context length overflowed")?
@@ -1495,30 +1576,11 @@ async fn bench_engine(
         point.pp.max(options.decode_prefill).max(profile_tokens),
         info.vocab,
     );
-    for _ in 0..options.warmups {
-        if runners.retains() {
-            runner.prepare_paged_request(None, 0)?;
-            prepare_benchmark_runner(&mut runner, point.pp)?;
-        }
-        measure_prefill(&mut runner, &tokens[..point.pp]).await?;
-        measure_record_decode(
-            &mut runner,
-            &tokens[..options.decode_prefill],
-            point.tg,
-            decode,
-            runners,
-            true,
-        )
-        .await?;
-    }
+    prime_benchmark(&mut runner, &tokens, point, options, decode, runners).await?;
     let mut pp = Vec::with_capacity(options.reps);
     let mut tg = Vec::with_capacity(options.reps);
     for _ in 0..options.reps {
-        if runners.retains() {
-            runner.prepare_paged_request(None, 0)?;
-            prepare_benchmark_runner(&mut runner, point.pp)?;
-        }
-        pp.push(measure_prefill(&mut runner, &tokens[..point.pp]).await?);
+        pp.push(measure_record_prefill(&mut runner, &tokens[..point.pp], runners, false).await?);
         tg.push(
             measure_record_decode(
                 &mut runner,
@@ -1531,19 +1593,7 @@ async fn bench_engine(
             .await?,
         );
     }
-    let profiles = if options.breakdown {
-        measure_profiles(
-            &mut runner,
-            &tokens,
-            options.reps,
-            options.warmups,
-            &point.contexts,
-            decode,
-        )
-        .await?
-    } else {
-        Vec::new()
-    };
+    let profiles = benchmark_profiles(&mut runner, &tokens, point, options, decode).await?;
     let probe_started = Instant::now();
     if runners.retains() {
         runner.prepare_paged_request(None, 0)?;
@@ -1709,19 +1759,35 @@ async fn measure_record_batches(
     for bucket in buckets {
         let capture_before = runner.metrics();
         let mut samples = Vec::with_capacity(options.reps);
-        for repetition in 0..options.warmups.saturating_add(options.reps) {
+        let warmups = runners.warmup_count(resident::Prime::Batch(bucket), options.warmups);
+        for repetition in 0..warmups.saturating_add(options.reps) {
+            let started = Instant::now();
+            let steps = if repetition < warmups {
+                runners.prime_steps(point.tg)
+            } else {
+                point.tg
+            };
             let sample = measure_batch_repetition(
                 &mut runner,
                 &prefixes,
                 &contexts,
                 &feedback,
                 bucket,
+                steps,
                 point.tg,
                 sampling_params(point),
             )
             .await?;
-            if repetition >= options.warmups {
+            if repetition >= warmups {
+                let measured = Duration::from_secs_f64(sample.wall_seconds);
+                runners.times.add(
+                    timing::Stage::Setup,
+                    started.elapsed().saturating_sub(measured),
+                );
+                runners.times.add(timing::Stage::Measured, measured);
                 samples.push(sample);
+            } else {
+                runners.times.add(timing::Stage::Prime, started.elapsed());
             }
         }
         let aggregate_tokens = usize::try_from(bucket)?
@@ -1809,12 +1875,13 @@ async fn measure_batch_repetition(
     feedback: &[u32],
     bucket: u32,
     steps: usize,
+    reserved_steps: usize,
     sampling: SamplingParams,
 ) -> Result<Sample, Box<dyn Error>> {
     let active = usize::try_from(bucket)?;
     for lane in 0..active {
         let reserved = u64::from(contexts[lane])
-            .checked_add(u64::try_from(steps)?)
+            .checked_add(u64::try_from(reserved_steps)?)
             .ok_or("batch benchmark reservation overflowed")?;
         let prefix_tokens = contexts[lane]
             .checked_sub(1)
@@ -1973,7 +2040,9 @@ async fn measure_contexts(
                 )?;
             }
             let prompt = &tokens[..context_start - 1];
-            for _ in 0..options.warmups {
+            let warmups =
+                runners.warmup_count(resident::Prime::Decode(context_start - 1), options.warmups);
+            for _ in 0..warmups {
                 measure_record_decode(&mut context_runner, prompt, point.tg, decode, runners, true)
                     .await?;
             }

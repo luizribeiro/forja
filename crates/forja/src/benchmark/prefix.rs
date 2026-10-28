@@ -82,6 +82,11 @@ pub(super) async fn measure(
     let started = Instant::now();
     prepared.seed(runner, steps, options).await?;
     let setup = started.elapsed();
+    let steps = if prime {
+        runners.prime_steps(steps)
+    } else {
+        steps
+    };
     let sample = measure_pipelined_tokens(runner, prepared.tokens, steps, options.sampling).await?;
     if prime {
         runners.times.add(timing::Stage::Prime, started.elapsed());

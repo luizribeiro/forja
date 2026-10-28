@@ -7,10 +7,18 @@ pub(super) enum Phase {
     Batch,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(super) enum Prime {
+    Prefill(usize),
+    Decode(usize),
+    Batch(u32),
+}
+
 type Loaded = (EngineRunner<forja_metal::MetalBackend>, EngineInfo, String);
 
 pub(super) struct Runners {
     retain: bool,
+    primed: std::collections::BTreeSet<Prime>,
     loaded: std::collections::BTreeMap<Phase, Loaded>,
     pub(super) instance_loads: std::collections::BTreeMap<Phase, u64>,
     pub(super) loads: u64,
@@ -22,6 +30,7 @@ impl Runners {
     pub(super) const fn new(retain: bool) -> Self {
         Self {
             retain,
+            primed: std::collections::BTreeSet::new(),
             loaded: std::collections::BTreeMap::new(),
             instance_loads: std::collections::BTreeMap::new(),
             loads: 0,
@@ -32,6 +41,17 @@ impl Runners {
 
     pub(super) const fn retains(&self) -> bool {
         self.retain
+    }
+
+    pub(super) fn warmup_count(&mut self, key: Prime, configured: usize) -> usize {
+        if !self.retain {
+            return configured;
+        }
+        usize::from(configured > 0 && self.primed.insert(key))
+    }
+
+    pub(super) fn prime_steps(&self, steps: usize) -> usize {
+        if self.retain { steps.min(2) } else { steps }
     }
 
     pub(super) async fn acquire(
@@ -166,6 +186,26 @@ pub(super) async fn run(options: &Bench) -> Result<(), Box<dyn Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn priming_is_bounded_per_shape_without_changing_classic_warmups() {
+        let mut retained = Runners::new(true);
+        assert_eq!(retained.warmup_count(Prime::Decode(33), 0), 0);
+        for key in [
+            Prime::Decode(33),
+            Prime::Decode(65),
+            Prime::Prefill(512),
+            Prime::Batch(4),
+        ] {
+            assert_eq!(retained.warmup_count(key, 3), 1);
+            assert_eq!(retained.warmup_count(key, 3), 0);
+        }
+        assert_eq!(retained.prime_steps(128), 2);
+        let mut classic = Runners::new(false);
+        assert_eq!(classic.warmup_count(Prime::Decode(33), 3), 3);
+        assert_eq!(classic.warmup_count(Prime::Decode(33), 3), 3);
+        assert_eq!(classic.prime_steps(128), 128);
+    }
 
     #[test]
     fn worker_protocol_refuses_replays_config_changes_and_existing_outputs() {
