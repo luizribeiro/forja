@@ -287,6 +287,45 @@ fn metal_grouped_tiles_match_cpu_for_quantized_formats() {
 }
 
 #[test]
+fn metal_grouped_quantized_rejects_partial_groups() {
+    let backend = MetalBackend::new().unwrap();
+    for inner in [97_u32, 100] {
+        for bits in [4_u8, 8] {
+            let input = backend.alloc(DType::F32, &[33, inner]).unwrap();
+            let packed = backend
+                .alloc(DType::U32, &[9, 33, inner.div_ceil(32 / u32::from(bits))])
+                .unwrap();
+            let scales = backend
+                .alloc(DType::F16, &[9, 33, inner.div_ceil(32)])
+                .unwrap();
+            let indices = backend.alloc(DType::U32, &[33, 2]).unwrap();
+            let output = backend.alloc(DType::F32, &[33, 2, 33]).unwrap();
+            let inputs = [&input, &packed, &scales, &scales, &indices];
+            let op = Op::GatherQuantMatmul {
+                bits,
+                group_size: 32,
+            };
+            assert!(matches!(
+                CommandList::new().dispatch(op, &inputs, &output),
+                Err(forja_core::OpError::Shape {
+                    operand: forja_core::Operand::Input(0)
+                })
+            ));
+            assert!(
+                backend
+                    .validate_variant_for_op(
+                        op,
+                        &inputs,
+                        &[&output],
+                        "gather-quant-matmul.grouped-32x32-2x2-blocked"
+                    )
+                    .is_err()
+            );
+        }
+    }
+}
+
+#[test]
 fn metal_grouped_tile_heights_match_bits() {
     let metal = MetalBackend::new().unwrap();
     let mut values = DeterministicValues::new(0xbb67_ae85_84ca_a73b);
