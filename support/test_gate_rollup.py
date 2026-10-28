@@ -38,7 +38,7 @@ def test_main_checks_tree_artifacts_and_persists_verified_history(tmp_path, monk
     artifact.write_text("frozen")
     history = tmp_path / "noise.json"
     history.write_text(json.dumps({"identity": identity(), "method": METHOD,
-        "created_at": time.time(), "log_scores": [-.003, .001, -.002, .002, .001, .003]}))
+        "created_at": time.time(), "log_scores": [-.001, .0004, -.0008, .0008, .0004, .0012]}))
     adapter = {"command": ["fake", "{output}", "{reps}"]}
     plan = {"artifacts": {str(artifact): hashlib.sha256(artifact.read_bytes()).hexdigest()},
             "guard": [], "rows": [{"id": "row", "profile": "profile", "workload_max_context": 1, "history_identity": identity(),
@@ -71,6 +71,14 @@ def test_main_checks_tree_artifacts_and_persists_verified_history(tmp_path, monk
         bench_gate.main()
     assert not calls
     artifact.write_text("frozen")
+    plan["guard"] = ["different-wrapper"]
+    path.write_text(json.dumps(plan))
+    monkeypatch.setattr(sys, "argv", ["gate", str(path), "--out", str(tmp_path / "guard-mismatch")])
+    with pytest.raises(ValueError, match="identity guard"):
+        bench_gate.main()
+    assert not calls
+    plan["guard"] = []
+    path.write_text(json.dumps(plan))
     output = tmp_path / "valid"
     monkeypatch.setattr(sys, "argv", ["gate", str(path), "--out", str(output)])
     bench_gate.main()

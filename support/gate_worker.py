@@ -157,9 +157,13 @@ def bind_measurement_protocol(row, enabled, warmups):
         return row
     actual = measurement_protocol(row, enabled, warmups)
     identity = row["history_identity"]
-    if row.get("history") and identity.get("measurement_protocol") != actual:
+    protocol = identity.get("harness_protocol")
+    expected = protocol.get("measurement_protocol") if protocol else identity.get("measurement_protocol")
+    if row.get("history") and expected != actual:
         raise ValueError("history measurement protocol differs from runtime mode")
-    return {**row, "history_identity": {**identity, "measurement_protocol": actual}}
+    updated = {**identity, "harness_protocol": {**protocol, "measurement_protocol": actual}} if protocol else {
+        **identity, "measurement_protocol": actual}
+    return {**row, "history_identity": updated}
 
 
 def worker_pair(row, directory, guard, reps, warmups, enabled=True, timeout=3600, order="AB"):

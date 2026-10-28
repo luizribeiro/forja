@@ -65,7 +65,7 @@ def test_drift_promotion_keeps_screen_separate_from_sequential_samples():
     result = run_row(row, sampler({"drift": .95}, []), 17, affected=False)
     assert len(result["drift_blocks"]) == 5
     assert result["promoted"]
-    assert len(result["runs"][0]["blocks"]) == 6
+    assert len(result["runs"][0]["blocks"]) == 30
     result = run_row(row, sampler({}, []), 17, affected=False)
     assert result["decision"] == "unchanged-drift-check"
     row["question"] = "equivalence"
@@ -84,9 +84,11 @@ def test_baseline_drift_uses_verified_noise_budget_instead_of_regression_toleran
         return run_row({"id": "row", "profile": "profile", "D": .003, "X": .02}, sample, 7)
 
     above = run(.01)
-    assert above["decision"] == "invalidated"
+    assert above["decision"] == "history-collected"
+    assert above["noise_guard"]["collection_fallbacks"][0]["reason"] == "baseline-drift"
+    assert above["runs"][0]["original_decision"]["decision"] == "invalidated"
     assert above["runs"][0]["pass_drift_budget"] == .003
-    assert len(above["runs"][0]["blocks"]) == 6
+    assert len(above["runs"][0]["blocks"]) == 30
     assert run(.002)["decision"] == "pass"
 
 
@@ -95,3 +97,12 @@ def test_no_verified_noise_history_cannot_claim_a_protected_gating_pass():
     assert result["decision"] == "history-collected"
     assert result["drift_protection"] == "unavailable"
     assert len(result["runs"][0]["blocks"]) == 30
+
+
+def test_fixed_mode_does_not_construct_noise_guard(monkeypatch):
+    import gate_runner
+    def forbidden(_row):
+        raise AssertionError("fixed mode must not construct a sequential noise guard")
+    monkeypatch.setattr(gate_runner, "NoiseGuard", forbidden)
+    assert run_row({"id": "row", "profile": "profile"}, sampler({}, []), 7,
+                   no_early_stop=True, affected=False)["decision"] == "fixed-complete"

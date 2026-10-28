@@ -50,6 +50,10 @@ def history(row: dict, now: float | None = None) -> dict:
     specification = row["history"]
     if not specification.get("sha256") or not row.get("history_identity"):
         raise ValueError("history requires a pinned SHA256 and identity")
+    factor = specification.get("sd_factor", 2.)
+    if not isinstance(factor, (int, float)) or not math.isfinite(factor) or factor <= 1:
+        raise ValueError("history SD factor must be finite and greater than one")
+    prepared["history_sd_factor"] = factor
     verify_artifacts({specification["path"]: specification["sha256"]})
     record = json.loads(Path(specification["path"]).read_text())
     expected = prepared["history_identity"]

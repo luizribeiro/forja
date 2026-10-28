@@ -108,6 +108,8 @@ def main():
         for index in indices:
             chosen = chosen_by_id[plan["rows"][index]["id"]]
             row = history(bind_measurement_protocol(plan["rows"][index], resident, warmups))
+            if row.get("history_identity") and row["history_identity"]["guard"] != plan["guard"]:
+                raise ValueError("noise identity guard differs from plan guard argv")
             directory = args.out / f"row-{index:02}"
             directory.mkdir()
             group_key = session_key(row)
@@ -139,7 +141,8 @@ def main():
             report["rows"].append(result)
             if result["runs"] and row.get("history_identity"):
                 save(directory / "history.json", {"identity": row["history_identity"],
-                    "created_at": time.time(), "method": result["method"], "log_scores": [
+                    "created_at": time.time(), "method": result["method"],
+                    "noise_guard": result.get("noise_guard"), "log_scores": [
                         block["log_score"] for block in result["runs"][0]["blocks"]]})
             save(args.out / "report.json", report)
         close_workers(workers)
