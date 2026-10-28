@@ -307,14 +307,15 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     prompts = [http_client.request_body(case, settings["model"]) for case in concrete]
     prompt_hash = hashlib.sha256(json.dumps(prompts, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     if bounded:
-        timers["measured_window_seconds"] = timers["measured_seconds"]
+        identity, timers["provenance_seconds"] = priming.timed_provenance(args, artifacts, command)
+        measured_window = timers["measured_seconds"]
         timers["measured_seconds"] -= cold_startup
         timers["server_startup_seconds"] = server.startup_seconds
-        timers["other_seconds"] = max(0.0, time.perf_counter() - started - sum(
-            value for key, value in timers.items() if key != "measured_window_seconds"))
+        timers = priming.phase_timers(started, timers, measured_seconds=measured_window,
+                                     cold_startup_seconds=cold_startup)
     return {
         **({"priming": {"protocol": "bounded-path-v1", "paths": primes},
-            "phase_timers": {**timers, "cold_startup_in_measured_window_seconds": cold_startup}}
+            "phase_timers": timers}
            if bounded else {}),
         "schema_version": 2,
         "measurement_mode": {"sampling": "fixed", "reps": settings["repetitions"],
@@ -328,7 +329,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         "warmups": settings["warmups"],
         "started_at": started_at,
         "duration_seconds": time.perf_counter() - started,
-        "provenance": provenance.collect(args.repository, args.forja_repository, artifacts, args.weights, args.resolved_config, command),
+        "provenance": identity if bounded else provenance.collect(args.repository, args.forja_repository, artifacts, args.weights, args.resolved_config, command),
         "results": results,
         "exactness": exactness_report(results),
     }

@@ -60,3 +60,27 @@ def test_cold_prime_requires_isolation_and_cancellation_is_required(monkeypatch)
     monkeypatch.setattr(priming.http_client, "run_case", run)
     with pytest.raises(ValueError, match="cancellation"):
         priming.case(None, measured)
+
+
+def test_phase_timers_keep_overlapping_windows_out_of_exclusive_sum(monkeypatch):
+    monkeypatch.setattr(priming.time, "perf_counter", lambda: 10.0)
+    phases = {"server_startup_seconds": 2., "priming_seconds": 1., "measured_seconds": 4.}
+    result = priming.phase_timers(0., phases, measured_seconds=6.)
+    assert result["total_seconds"] == 10.
+    assert result["other_seconds"] == 3.
+    assert result["overlapping_windows"]["measured_seconds"] == 6.
+    with pytest.raises(ValueError, match="overlap"):
+        priming.phase_timers(0., phases | {"measured_seconds": 8.})
+
+
+def test_provenance_hashing_is_included_in_phase_accounting(monkeypatch):
+    from types import SimpleNamespace
+    args = SimpleNamespace(repository=None, forja_repository=None, weights=[], resolved_config=None)
+    clock = iter([1., 3., 10.])
+    monkeypatch.setattr(priming.time, "perf_counter", lambda: next(clock))
+    monkeypatch.setattr(priming.provenance, "collect", lambda *_args: {"binary_sha256": "example"})
+    identity, elapsed = priming.timed_provenance(args, {}, [])
+    assert identity == {"binary_sha256": "example"}
+    result = priming.phase_timers(0., {"provenance_seconds": elapsed, "measured_seconds": 4.})
+    assert result["provenance_seconds"] == 2.
+    assert result["other_seconds"] == 4.

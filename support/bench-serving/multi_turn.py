@@ -13,6 +13,7 @@ from pathlib import Path
 
 import http_client
 import provenance
+import priming
 import serving_bench
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -198,8 +199,9 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         server.stop()
     turns = turn_reports(runs, suite["tool_output_tokens"])
     if bounded:
+        identity, timers["provenance_seconds"] = priming.timed_provenance(args, artifacts, command)
         timers["server_startup_seconds"] = server.startup_seconds
-        timers["other_seconds"] = max(0.0, time.perf_counter() - started - sum(timers.values()))
+        timers = priming.phase_timers(started, timers)
     for turn in turns:
         total = turn["total_context_tokens"]
         print(
@@ -225,7 +227,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             sample["cached_tokens"] > 0 for run in runs for sample in run[1:]
         ),
         "turns": turns,
-        "provenance": provenance.collect(args.repository, args.forja_repository, artifacts, args.weights, args.resolved_config, command),
+        "provenance": identity if bounded else provenance.collect(args.repository, args.forja_repository, artifacts, args.weights, args.resolved_config, command),
     }
 
 

@@ -1,5 +1,7 @@
 """Bounded requests exercise transport and cache paths before timed cases."""
 import http_client
+import provenance
+import time
 
 
 def overlap(samples):
@@ -45,3 +47,20 @@ def validate_case(case, result):
         raise ValueError("required warm-prefix path did not run")
     if case.get("cancel_after_tokens") and result["cancellations"] != result["requests"]:
         raise ValueError("required cancellation path did not run")
+
+
+def phase_timers(started, phases, **windows):
+    """Return exclusive phases and explicitly separate overlapping windows."""
+    total = time.perf_counter() - started
+    if any(value < 0 for value in phases.values()) or sum(phases.values()) > total + 1e-6:
+        raise ValueError("benchmark phase timers overlap")
+    return {**phases, "other_seconds": max(0.0, total - sum(phases.values())),
+            "total_seconds": total, "overlapping_windows": windows}
+
+
+def timed_provenance(args, artifacts, command):
+    """Include identity hashing in the per-leg runtime budget."""
+    started = time.perf_counter()
+    identity = provenance.collect(args.repository, args.forja_repository, artifacts,
+                                  args.weights, args.resolved_config, command)
+    return identity, time.perf_counter() - started
