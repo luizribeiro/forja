@@ -467,7 +467,7 @@ mod tests {
         for (kernel, end_marker, collective, edge) in [
             (
                 "kernel void quantized_gemm_small_m(",
-                "template <\n    typename T, uint block_inner",
+                "template <typename T, uint block_inner, uint block_columns, uint tile_stride>",
                 "simd_sum(",
                 "if (output_row < params.rows)",
             ),
@@ -569,7 +569,7 @@ mod tests {
         for (kernel, end_marker, collective, edge) in [
             (
                 "kernel void gather_quantized_pair(",
-                "template <\n    typename T, uint block_inner",
+                "template <uint BM, uint BK, uint THREADS>",
                 "threadgroup_barrier(",
                 "if (column < gate_params.columns)",
             ),

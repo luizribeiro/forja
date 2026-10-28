@@ -974,29 +974,6 @@ kernel void gather_quantized_pair(
     }
 }
 
-template <
-    typename T, uint block_inner, uint block_columns,
-    uint tile_stride, bool transpose>
-void load_quantized_weight_tile(
-    device const uchar *packed,
-    device const uchar *scales,
-    device const uchar *biases,
-    ulong packed_base,
-    ulong scale_base,
-    ulong bias_base,
-    ulong packed_row_stride,
-    ulong packed_word_stride,
-    ulong scale_row_stride,
-    ulong scale_group_stride,
-    ulong bias_row_stride,
-    ulong bias_group_stride,
-    uint inner_origin,
-    uint column_origin,
-    uint inner_extent,
-    uint column_extent,
-    threadgroup T *tile,
-    uint thread_index,
-    uint thread_count);
 
 kernel void count_expert_routes(
     device const uint *indices [[buffer(0)]],
@@ -1133,6 +1110,59 @@ kernel void arrange_expert_routes(
     }
 }
 
+template <uint BK, uint BN, uint THREADS>
+struct QuantizedWeightPrefetch {
+    static_assert(BN * BK % (4 * THREADS) == 0);
+    // Eight-bit weights have the fewest values per packed word, requiring the most slots.
+    static constant constexpr uint slots = BN * BK / ((32 / 8) * THREADS);
+    uint words[slots];
+    float scales[slots];
+    float biases[slots];
+
+    void load(device const uchar *packed, device const uchar *scale_buffer,
+        device const uchar *bias_buffer, constant GatherQuantMatmulParams &params,
+        uint expert, uint inner_origin, uint column_origin, uint thread_index) thread {
+        uint values_per_word = 32 / quant_bits;
+        uint words_per_column = BK / values_per_word;
+        uint slot = 0;
+        for (uint linear = thread_index; linear < BN * words_per_column; linear += THREADS, ++slot) {
+            uint column = column_origin + linear / words_per_column;
+            uint inner = inner_origin + (linear % words_per_column) * values_per_word;
+            uint word = 0;
+            float scale = 0.0f;
+            float bias = 0.0f;
+            if (inner < params.inner && column < params.columns) {
+                word = load_uint(packed, params.packed_offset + ulong(expert) * params.packed_expert_stride +
+                    ulong(column) * params.packed_row_stride + ulong(inner / values_per_word) * params.packed_word_stride);
+                uint group = inner / quant_group_size;
+                scale = load_float(scale_buffer, params.scale_offset + ulong(expert) * params.scale_expert_stride +
+                    ulong(column) * params.scale_row_stride + ulong(group) * params.scale_group_stride, input1_dtype);
+                bias = load_float(bias_buffer, params.bias_offset + ulong(expert) * params.bias_expert_stride +
+                    ulong(column) * params.bias_row_stride + ulong(group) * params.bias_group_stride, input1_dtype);
+            }
+            words[slot] = word;
+            scales[slot] = scale;
+            biases[slot] = bias;
+        }
+    }
+
+    template <uint S>
+    void store(threadgroup float *tile, uint inner_origin, uint inner_extent, uint thread_index) thread {
+        uint values_per_word = 32 / quant_bits;
+        uint words_per_column = BK / values_per_word;
+        uint mask = (1u << quant_bits) - 1u;
+        uint slot = 0;
+        for (uint linear = thread_index; linear < BN * words_per_column; linear += THREADS, ++slot) {
+            uint column = linear / words_per_column;
+            uint local_inner = (linear % words_per_column) * values_per_word;
+            for (uint e = 0; e < values_per_word; ++e) {
+                tile[column * S + local_inner + e] = inner_origin + local_inner + e < inner_extent
+                    ? scales[slot] * float((words[slot] >> (e * quant_bits)) & mask) + biases[slot] : 0.0f;
+            }
+        }
+    }
+};
+
 template <
     uint block_rows, uint simdgroups_rows, uint simdgroups_columns,
     bool skip_high_padding>
@@ -1180,6 +1210,8 @@ void grouped_quantized_gemm_impl(
         route_slots[thread_index] = route - row * params.routes;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
+    QuantizedWeightPrefetch<block_inner, block_columns, 32 * simdgroups_rows * simdgroups_columns> weights;
+    weights.load(packed, scales, biases, params, expert, 0, column_origin, thread_index);
     for (uint inner_origin = 0; inner_origin < params.inner; inner_origin += block_inner) {
         if (input0_dtype == 0 &&
             inner_origin + block_inner <= params.inner &&
@@ -1234,18 +1266,11 @@ void grouped_quantized_gemm_impl(
                 input_tile[local_row * tile_stride + local_inner] = value;
             }
         }
-        load_quantized_weight_tile<
-            float, block_inner, block_columns, tile_stride, true>(
-            packed, scales, biases,
-            params.packed_offset + ulong(expert) * params.packed_expert_stride,
-            params.scale_offset + ulong(expert) * params.scale_expert_stride,
-            params.bias_offset + ulong(expert) * params.bias_expert_stride,
-            params.packed_row_stride, params.packed_word_stride,
-            params.scale_row_stride, params.scale_group_stride,
-            params.bias_row_stride, params.bias_group_stride,
-            inner_origin, column_origin, params.inner, params.columns,
-            weight_tile, thread_index, thread_count);
+        weights.template store<tile_stride>(weight_tile, inner_origin, params.inner, thread_index);
         threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (inner_origin + block_inner < params.inner) {
+            weights.load(packed, scales, biases, params, expert, inner_origin + block_inner, column_origin, thread_index);
+        }
         if constexpr (!skip_high_padding) {
             mma.multiply(input_tile, weight_tile);
         } else if (mma.has_rows(row_count)) {
@@ -1376,6 +1401,9 @@ kernel void grouped_quantized_pair_32x32_2x2_blocked(
         route_slots[thread_index] = route - row * params.routes;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
+    QuantizedWeightPrefetch<block_inner, block_columns, 128> gate_weights, up_weights;
+    gate_weights.load(gate_packed, gate_scales, gate_biases, gate_params, expert, 0, column_origin, thread_index);
+    up_weights.load(up_packed, up_scales, up_biases, up_params, expert, 0, column_origin, thread_index);
     for (uint inner_origin = 0; inner_origin < params.inner; inner_origin += block_inner) {
         if (input0_dtype == 0 &&
             inner_origin + block_inner <= params.inner &&
@@ -1414,34 +1442,20 @@ kernel void grouped_quantized_pair_32x32_2x2_blocked(
                 input_tile[local_row * tile_stride + local_inner] = value;
             }
         }
-        load_quantized_weight_tile<
-            float, block_inner, block_columns, tile_stride, true>(
-            gate_packed, gate_scales, gate_biases,
-            gate_params.packed_offset + ulong(expert) * gate_params.packed_expert_stride,
-            gate_params.scale_offset + ulong(expert) * gate_params.scale_expert_stride,
-            gate_params.bias_offset + ulong(expert) * gate_params.bias_expert_stride,
-            gate_params.packed_row_stride, gate_params.packed_word_stride,
-            gate_params.scale_row_stride, gate_params.scale_group_stride,
-            gate_params.bias_row_stride, gate_params.bias_group_stride,
-            inner_origin, column_origin, params.inner, params.columns,
-            weight_tile, thread_index, thread_count);
+        gate_weights.template store<tile_stride>(weight_tile, inner_origin, params.inner, thread_index);
         threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (inner_origin + block_inner < params.inner) {
+            gate_weights.load(gate_packed, gate_scales, gate_biases, gate_params, expert, inner_origin + block_inner, column_origin, thread_index);
+        }
         if (gate_mma.has_rows(row_count)) {
             gate_mma.multiply(input_tile, weight_tile);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        load_quantized_weight_tile<
-            float, block_inner, block_columns, tile_stride, true>(
-            up_packed, up_scales, up_biases,
-            up_params.packed_offset + ulong(expert) * up_params.packed_expert_stride,
-            up_params.scale_offset + ulong(expert) * up_params.scale_expert_stride,
-            up_params.bias_offset + ulong(expert) * up_params.bias_expert_stride,
-            up_params.packed_row_stride, up_params.packed_word_stride,
-            up_params.scale_row_stride, up_params.scale_group_stride,
-            up_params.bias_row_stride, up_params.bias_group_stride,
-            inner_origin, column_origin, params.inner, params.columns,
-            weight_tile, thread_index, thread_count);
+        up_weights.template store<tile_stride>(weight_tile, inner_origin, params.inner, thread_index);
         threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (inner_origin + block_inner < params.inner) {
+            up_weights.load(up_packed, up_scales, up_biases, up_params, expert, inner_origin + block_inner, column_origin, thread_index);
+        }
         if (up_mma.has_rows(row_count)) {
             up_mma.multiply(input_tile, weight_tile);
         }
@@ -1593,72 +1607,6 @@ kernel void quantized_gemm_small_m(
                     ulong(column) * params.output_column_stride;
                 store_float(output, output_index, output_dtype, value);
             }
-        }
-    }
-}
-
-template <
-    typename T, uint block_inner, uint block_columns,
-    uint tile_stride, bool transpose>
-void load_quantized_weight_tile(
-    device const uchar *packed,
-    device const uchar *scales,
-    device const uchar *biases,
-    ulong packed_base,
-    ulong scale_base,
-    ulong bias_base,
-    ulong packed_row_stride,
-    ulong packed_word_stride,
-    ulong scale_row_stride,
-    ulong scale_group_stride,
-    ulong bias_row_stride,
-    ulong bias_group_stride,
-    uint inner_origin,
-    uint column_origin,
-    uint inner_extent,
-    uint column_extent,
-    threadgroup T *tile,
-    uint thread_index,
-    uint thread_count) {
-    uint values_per_word = 32 / quant_bits;
-    uint words_per_column = block_inner / values_per_word;
-    uint mask = (1u << quant_bits) - 1u;
-    for (uint linear = thread_index;
-         linear < block_columns * words_per_column;
-         linear += thread_count) {
-        uint local_column = linear / words_per_column;
-        uint local_word = linear % words_per_column;
-        uint column = column_origin + local_column;
-        uint inner = inner_origin + local_word * values_per_word;
-        uint word = 0;
-        float scale = 0.0f;
-        float bias = 0.0f;
-        if (inner < inner_extent && column < column_extent) {
-            word = load_uint(
-                packed,
-                packed_base + ulong(column) * packed_row_stride +
-                    ulong(inner / values_per_word) * packed_word_stride);
-            uint group = inner / quant_group_size;
-            scale = load_float(
-                scales,
-                scale_base + ulong(column) * scale_row_stride +
-                    ulong(group) * scale_group_stride,
-                input1_dtype);
-            bias = load_float(
-                biases,
-                bias_base + ulong(column) * bias_row_stride +
-                    ulong(group) * bias_group_stride,
-                input1_dtype);
-        }
-        for (uint element = 0; element < values_per_word; ++element) {
-            uint local_inner = local_word * values_per_word + element;
-            float value = inner + element < inner_extent
-                ? scale * float((word >> (element * quant_bits)) & mask) + bias
-                : 0.0f;
-            uint tile_index = transpose
-                ? local_column * tile_stride + local_inner
-                : local_inner * tile_stride + local_column;
-            tile[tile_index] = T(value);
         }
     }
 }

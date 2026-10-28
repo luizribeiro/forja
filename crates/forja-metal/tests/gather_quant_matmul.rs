@@ -163,6 +163,7 @@ fn metal_grouped_small_m_variants_match_cpu_at_edges() {
             false,
             &mut values,
             "gather-quant-matmul.grouped-small-m",
+            (4, 64),
         );
         assert_grouped_case(
             &cpu,
@@ -171,6 +172,7 @@ fn metal_grouped_small_m_variants_match_cpu_at_edges() {
             true,
             &mut values,
             "gather-quant-matmul.grouped-pair-small-m",
+            (4, 64),
         );
     }
 }
@@ -191,7 +193,7 @@ fn vector_gather_raw_and_paired_match_cpu_at_decode_shapes() {
             };
             let variant = "gather-quant-matmul.vector8";
             for paired in [false, true] {
-                assert_grouped_case(&cpu, &metal, case, paired, &mut values, variant);
+                assert_grouped_case(&cpu, &metal, case, paired, &mut values, variant, (4, 64));
             }
         }
     }
@@ -257,6 +259,29 @@ fn vector_gather_weighted_matches_cpu() {
                 &metal.read(&metal_output).unwrap(),
             )
             .unwrap();
+        }
+    }
+}
+
+#[test]
+fn metal_grouped_tiles_match_cpu_for_quantized_formats() {
+    let cpu = CpuBackend::new();
+    let metal = MetalBackend::new().unwrap();
+    let mut values = DeterministicValues::new(0x3c6e_f372_fe94_f82b);
+    for config in [(4, 32), (4, 128), (8, 32), (8, 64), (8, 128)] {
+        let case = GroupedCase {
+            rows: 33,
+            routes: 2,
+            experts: 9,
+            inner: 256,
+            columns: 33,
+        };
+        for (paired, variant) in [
+            (false, "gather-quant-matmul.grouped"),
+            (false, "gather-quant-matmul.grouped-32x32-2x2-blocked"),
+            (true, "gather-quant-matmul.grouped-pair-32x32-2x2-blocked"),
+        ] {
+            assert_grouped_case(&cpu, &metal, case, paired, &mut values, variant, config);
         }
     }
 }
@@ -344,8 +369,9 @@ fn assert_grouped_case(
     paired: bool,
     values: &mut DeterministicValues,
     variant: &str,
+    config: (u8, u32),
 ) {
-    let specs = grouped_specs(case, paired);
+    let specs = grouped_format_specs(case, paired, config);
     let bytes = specs
         .iter()
         .map(|spec| generated_tensor_bytes(spec, values).unwrap())
@@ -356,8 +382,8 @@ fn assert_grouped_case(
     let cpu_output = cpu.alloc(DType::F32, &shape).unwrap();
     let metal_output = metal.alloc(DType::F32, &shape).unwrap();
     let op = Op::GatherQuantMatmul {
-        bits: 4,
-        group_size: 64,
+        bits: config.0,
+        group_size: config.1,
     };
     let epilogue = paired.then(silu_mul_epilogue);
     submit_grouped(cpu, op, &cpu_inputs, &cpu_output, epilogue.as_ref(), None);
@@ -382,6 +408,11 @@ fn assert_grouped_case(
 }
 
 fn grouped_specs(case: GroupedCase, paired: bool) -> Vec<TensorSpec> {
+    grouped_format_specs(case, paired, (4, 64))
+}
+
+fn grouped_format_specs(case: GroupedCase, paired: bool, config: (u8, u32)) -> Vec<TensorSpec> {
+    let (bits, group_size) = config;
     let GroupedCase {
         rows,
         routes,
@@ -391,15 +422,21 @@ fn grouped_specs(case: GroupedCase, paired: bool) -> Vec<TensorSpec> {
     } = case;
     let mut specs = vec![
         TensorSpec::contiguous(DType::F32, &[rows, inner]),
-        TensorSpec::contiguous(DType::U32, &[experts, columns, inner / 8]),
-        TensorSpec::contiguous(DType::F16, &[experts, columns, inner / 64]),
-        TensorSpec::contiguous(DType::F16, &[experts, columns, inner / 64]),
+        TensorSpec::contiguous(
+            DType::U32,
+            &[experts, columns, inner * u32::from(bits) / 32],
+        ),
+        TensorSpec::contiguous(DType::F16, &[experts, columns, inner / group_size]),
+        TensorSpec::contiguous(DType::F16, &[experts, columns, inner / group_size]),
     ];
     if paired {
         specs.extend([
-            TensorSpec::contiguous(DType::U32, &[experts, columns, inner / 8]),
-            TensorSpec::contiguous(DType::F16, &[experts, columns, inner / 64]),
-            TensorSpec::contiguous(DType::F16, &[experts, columns, inner / 64]),
+            TensorSpec::contiguous(
+                DType::U32,
+                &[experts, columns, inner * u32::from(bits) / 32],
+            ),
+            TensorSpec::contiguous(DType::F16, &[experts, columns, inner / group_size]),
+            TensorSpec::contiguous(DType::F16, &[experts, columns, inner / group_size]),
         ]);
     }
     let total = rows * routes;
