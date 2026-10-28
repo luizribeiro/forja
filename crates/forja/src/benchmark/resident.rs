@@ -14,6 +14,7 @@ pub(super) struct Runners {
     loaded: std::collections::BTreeMap<Phase, Loaded>,
     pub(super) instance_loads: std::collections::BTreeMap<Phase, u64>,
     pub(super) loads: u64,
+    pub(super) times: super::timing::Timings,
 }
 
 impl Runners {
@@ -23,6 +24,7 @@ impl Runners {
             loaded: std::collections::BTreeMap::new(),
             instance_loads: std::collections::BTreeMap::new(),
             loads: 0,
+            times: super::timing::Timings::new(),
         }
     }
 
@@ -142,6 +144,7 @@ pub(super) async fn run(options: &Bench) -> Result<(), Box<dyn Error>> {
     for line in std::io::stdin().lock().lines() {
         let request = Request::parse(&line?, next)?;
         let started = std::time::Instant::now();
+        runners.times = super::timing::Timings::new();
         super::run_metal(options, &mut runners, Some(&request.output)).await?;
         println!(
             "FORJA_BENCH_RESULT {}",

@@ -1,5 +1,7 @@
 #[cfg(target_os = "macos")]
 mod resident;
+#[cfg(target_os = "macos")]
+mod timing;
 use std::{
     collections::{BTreeMap, VecDeque},
     error::Error,
@@ -580,7 +582,7 @@ async fn run_metal(
         if options.mode.execution == crate::args::BenchExecution::ResidentWorker {
             report["worker"] = serde_json::json!({"pid": std::process::id(), "runner_loads": runners.loads,
                 "instance_loads": runners.instance_loads, "cache_state": "fresh-request; positional input replay starts at zero",
-                "warmups_per_leg": options.warmups});
+                "warmups_per_leg": options.warmups, "phase_timers": runners.times.report(started.elapsed())?});
         }
         if let Some(path) = output {
             if options.breakdown {
@@ -1450,6 +1452,7 @@ where
 }
 
 #[cfg(target_os = "macos")]
+#[allow(clippy::too_many_lines)]
 async fn bench_engine(
     options: &Bench,
     point: &BenchPoint,
@@ -1525,6 +1528,7 @@ async fn bench_engine(
     } else {
         Vec::new()
     };
+    let probe_started = Instant::now();
     let (output_digest, peak_footprint) = benchmark_output(
         &mut runner,
         &tokens[..options.decode_prefill],
@@ -1532,6 +1536,9 @@ async fn bench_engine(
         decode.sampling,
     )
     .await?;
+    runners
+        .times
+        .add(timing::Stage::Probe, probe_started.elapsed());
     let contexts = if runners.retains() {
         runners.release((runner, info, device.clone())).await?;
         measure_record_contexts(&tokens, point, options, component, decode, &tg, runners).await?
