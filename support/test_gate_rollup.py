@@ -10,6 +10,7 @@ import pytest
 
 import bench_gate
 from gate_stats import METHOD
+from test_gate_history_loading import identity
 
 
 @pytest.mark.parametrize("decision,expected", [
@@ -36,11 +37,11 @@ def test_main_checks_tree_artifacts_and_persists_verified_history(tmp_path, monk
     artifact = tmp_path / "artifact"
     artifact.write_text("frozen")
     history = tmp_path / "noise.json"
-    history.write_text(json.dumps({"identity": "workload", "method": METHOD,
+    history.write_text(json.dumps({"identity": identity(), "method": METHOD,
         "created_at": time.time(), "log_scores": [-.003, .001, -.002, .002, .001, .003]}))
     adapter = {"command": ["fake", "{output}", "{reps}"]}
     plan = {"artifacts": {str(artifact): hashlib.sha256(artifact.read_bytes()).hexdigest()},
-            "guard": [], "rows": [{"id": "row", "profile": "profile", "workload_max_context": 1, "history_identity": "workload",
+            "guard": [], "rows": [{"id": "row", "profile": "profile", "workload_max_context": 1, "history_identity": identity(),
             "history": {"path": str(history), "sha256": hashlib.sha256(history.read_bytes()).hexdigest()},
             "baseline": adapter, "candidate": adapter}]}
     path = tmp_path / "plan.json"
@@ -76,7 +77,7 @@ def test_main_checks_tree_artifacts_and_persists_verified_history(tmp_path, monk
     report = json.loads((output / "report.json").read_text())
     assert report["decision"] == "pass" and report["gating_pass"]
     saved = json.loads((output / "row-00/history.json").read_text())
-    assert saved["identity"] == "workload" and saved["method"] == METHOD
+    assert saved["identity"] == identity() and saved["method"] == METHOD
     assert len(saved["log_scores"]) == 6 and saved["created_at"] > 0
 
 
