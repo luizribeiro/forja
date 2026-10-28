@@ -1,4 +1,6 @@
 #[cfg(target_os = "macos")]
+mod prefix;
+#[cfg(target_os = "macos")]
 mod resident;
 #[cfg(target_os = "macos")]
 mod timing;
@@ -580,8 +582,8 @@ async fn run_metal(
             "results": results,
         });
         if options.mode.execution == crate::args::BenchExecution::ResidentWorker {
-            report["worker"] = serde_json::json!({"pid": std::process::id(), "runner_loads": runners.loads,
-                "instance_loads": runners.instance_loads, "cache_state": "fresh-request; positional input replay starts at zero",
+            report["worker"] = serde_json::json!({"protocol":2,"prefix_entries":runners.prefixes.len(),"pid": std::process::id(), "runner_loads": runners.loads,
+                "instance_loads": runners.instance_loads, "cache_state": "prefix-fork-per-worker",
                 "warmups_per_leg": options.warmups, "phase_timers": runners.times.report(started.elapsed())?});
         }
         if let Some(path) = output {
@@ -1485,32 +1487,46 @@ async fn bench_engine(
         return Err("benchmark shape exceeds the engine context".into());
     }
     let reserved_tokens = benchmark_reservation(point, options, tg_context_start, profile_context)?;
-    prepare_benchmark_runner(&mut runner, reserved_tokens)?;
+    if !runners.retains() {
+        prepare_benchmark_runner(&mut runner, reserved_tokens)?;
+    }
     let profile_tokens = profile_context - 1;
     let tokens = synthetic_tokens(
         point.pp.max(options.decode_prefill).max(profile_tokens),
         info.vocab,
     );
     for _ in 0..options.warmups {
+        if runners.retains() {
+            runner.prepare_paged_request(None, 0)?;
+            prepare_benchmark_runner(&mut runner, point.pp)?;
+        }
         measure_prefill(&mut runner, &tokens[..point.pp]).await?;
-        measure_decode(
+        measure_record_decode(
             &mut runner,
             &tokens[..options.decode_prefill],
             point.tg,
             decode,
+            runners,
+            true,
         )
         .await?;
     }
     let mut pp = Vec::with_capacity(options.reps);
     let mut tg = Vec::with_capacity(options.reps);
     for _ in 0..options.reps {
+        if runners.retains() {
+            runner.prepare_paged_request(None, 0)?;
+            prepare_benchmark_runner(&mut runner, point.pp)?;
+        }
         pp.push(measure_prefill(&mut runner, &tokens[..point.pp]).await?);
         tg.push(
-            measure_decode(
+            measure_record_decode(
                 &mut runner,
                 &tokens[..options.decode_prefill],
                 point.tg,
                 decode,
+                runners,
+                false,
             )
             .await?,
         );
@@ -1529,6 +1545,15 @@ async fn bench_engine(
         Vec::new()
     };
     let probe_started = Instant::now();
+    if runners.retains() {
+        runner.prepare_paged_request(None, 0)?;
+        prepare_benchmark_runner(
+            &mut runner,
+            tg_context_start
+                .checked_add(point.tg)
+                .ok_or("decode context length overflowed")?,
+        )?;
+    }
     let (output_digest, peak_footprint) = benchmark_output(
         &mut runner,
         &tokens[..options.decode_prefill],
@@ -1939,18 +1964,31 @@ async fn measure_contexts(
         } else {
             let (mut context_runner, info, device) =
                 runners.acquire(options, point, component).await?;
-            prepare_benchmark_runner(
-                &mut context_runner,
-                context_start
-                    .checked_add(point.tg)
-                    .ok_or("decode context length overflowed")?,
-            )?;
+            if !runners.retains() {
+                prepare_benchmark_runner(
+                    &mut context_runner,
+                    context_start
+                        .checked_add(point.tg)
+                        .ok_or("decode context length overflowed")?,
+                )?;
+            }
             let prompt = &tokens[..context_start - 1];
             for _ in 0..options.warmups {
-                measure_decode(&mut context_runner, prompt, point.tg, decode).await?;
+                measure_record_decode(&mut context_runner, prompt, point.tg, decode, runners, true)
+                    .await?;
             }
             for _ in 0..options.reps {
-                samples.push(measure_decode(&mut context_runner, prompt, point.tg, decode).await?);
+                samples.push(
+                    measure_record_decode(
+                        &mut context_runner,
+                        prompt,
+                        point.tg,
+                        decode,
+                        runners,
+                        false,
+                    )
+                    .await?,
+                );
             }
             runners.release((context_runner, info, device)).await?;
         }
@@ -2109,6 +2147,22 @@ async fn measure_decode(
         runner.metrics(),
         started.ok_or("decode timing did not start")?.elapsed(),
     )
+}
+
+#[cfg(target_os = "macos")]
+async fn measure_record_decode(
+    runner: &mut EngineRunner<forja_metal::MetalBackend>,
+    prompt: &[u32],
+    steps: usize,
+    options: DecodeOptions,
+    runners: &mut resident::Runners,
+    prime: bool,
+) -> Result<Sample, Box<dyn Error>> {
+    if runners.retains() {
+        prefix::measure(runner, prompt, steps, options, runners, prime).await
+    } else {
+        measure_decode(runner, prompt, steps, options).await
+    }
 }
 
 #[cfg(target_os = "macos")]

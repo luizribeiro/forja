@@ -15,6 +15,7 @@ pub(super) struct Runners {
     pub(super) instance_loads: std::collections::BTreeMap<Phase, u64>,
     pub(super) loads: u64,
     pub(super) times: super::timing::Timings,
+    pub(super) prefixes: std::collections::BTreeMap<(Phase, usize), super::prefix::Prepared>,
 }
 
 impl Runners {
@@ -25,6 +26,7 @@ impl Runners {
             instance_loads: std::collections::BTreeMap::new(),
             loads: 0,
             times: super::timing::Timings::new(),
+            prefixes: std::collections::BTreeMap::new(),
         }
     }
 
@@ -121,6 +123,9 @@ pub(super) async fn run(options: &Bench) -> Result<(), Box<dyn Error>> {
     {
         return Err("resident workers require one frozen engine, point and selection".into());
     }
+    if options.points[0].selection != [forja_config::Selection::GpuPipelined] {
+        return Err("prefix workers require gpu-pipelined selection".into());
+    }
     let started = std::time::Instant::now();
     let mut runners = Runners::new(true);
     for phase in [Phase::Single, Phase::Batch] {
@@ -136,7 +141,7 @@ pub(super) async fn run(options: &Bench) -> Result<(), Box<dyn Error>> {
     }
     println!(
         "FORJA_BENCH_READY {}",
-        serde_json::json!({"protocol":1,"pid":std::process::id(),
+        serde_json::json!({"protocol":2,"pid":std::process::id(),
         "runner_loads":runners.loads,"instance_loads":runners.instance_loads,"startup_seconds":started.elapsed().as_secs_f64()})
     );
     std::io::stdout().flush()?;
@@ -148,7 +153,7 @@ pub(super) async fn run(options: &Bench) -> Result<(), Box<dyn Error>> {
         super::run_metal(options, &mut runners, Some(&request.output)).await?;
         println!(
             "FORJA_BENCH_RESULT {}",
-            serde_json::json!({"id":request.id,
+            serde_json::json!({"id":request.id,"protocol":2,"prefix_entries":runners.prefixes.len(),
             "pid":std::process::id(),"runner_loads":runners.loads,
             "instance_loads":runners.instance_loads,"wall_seconds":started.elapsed().as_secs_f64()})
         );

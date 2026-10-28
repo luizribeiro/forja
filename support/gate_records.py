@@ -81,10 +81,18 @@ def command_sampler(row: dict, directory: Path, guard: list[str], warmups: int,
                 memo[key] = (event, hashlib.sha256(output.read_bytes()).hexdigest())
         record = json.loads(output.read_text())
         if workers and (record.get("worker", {}).get("pid") != event["worker_pid"]
+                        or record["worker"].get("protocol", 1) != event["worker_result"].get("protocol", 1)
                         or record["worker"].get("runner_loads") != event["worker_result"]["runner_loads"]
                         or record["worker"].get("instance_loads") != event["worker_result"].get("instance_loads")
                         or record.get("measurement_mode", {}).get("execution") != "resident-worker"):
             raise ValueError("native record does not match its resident worker")
+        if workers and record["worker"].get("protocol") == 2:
+            count = record["worker"].get("prefix_entries")
+            if (not isinstance(count, int) or count <= 0
+                    or count != event["worker_result"].get("prefix_entries")
+                    or record["worker"].get("cache_state") != "prefix-fork-per-worker"
+                    or not record["worker"].get("phase_timers")):
+                raise ValueError("prefix worker cache/timing proof is missing")
         for pointer, expected in adapter.get("expected_provenance", {}).items():
             if value_at(record, pointer) != expected:
                 raise ValueError(f"measurement provenance mismatch: {pointer}")
