@@ -40,7 +40,7 @@ def test_main_checks_tree_artifacts_and_persists_verified_history(tmp_path, monk
         "created_at": time.time(), "log_scores": [-.003, .001, -.002, .002, .001, .003]}))
     adapter = {"command": ["fake", "{output}", "{reps}"]}
     plan = {"artifacts": {str(artifact): hashlib.sha256(artifact.read_bytes()).hexdigest()},
-            "guard": [], "rows": [{"id": "row", "profile": "profile", "history_identity": "workload",
+            "guard": [], "rows": [{"id": "row", "profile": "profile", "workload_max_context": 1, "history_identity": "workload",
             "history": {"path": str(history), "sha256": hashlib.sha256(history.read_bytes()).hexdigest()},
             "baseline": adapter, "candidate": adapter}]}
     path = tmp_path / "plan.json"
@@ -101,7 +101,7 @@ for line in sys.stdin:
         "/provenance/binary_sha256": "host", "/inputs/0/engine_sha256": "guest"}}
     other = {**adapter, "command": [*adapter["command"], "--set", "distinct-workload"]}
     plan = {"artifacts": {str(script): hashlib.sha256(script.read_bytes()).hexdigest()}, "guard": [],
-        "rows": [{"id": name, "profile": "profile", "question": "equivalence",
+        "rows": [{"id": name, "profile": "profile", "workload_max_context": 1, "question": "equivalence",
                   "baseline": value, "candidate": value}
                  for name, value in [("first", adapter), ("other", other), ("shared", adapter)]]}
     path = tmp_path / "plan.json"
@@ -128,3 +128,50 @@ for line in sys.stdin:
     assert len(list(output.glob("group-*/*.command.json"))) == 48
     assert all(sample["reused_session"] for block in report["rows"][1]["runs"][0]["blocks"]
                for sample in block["samples"])
+
+
+def test_regular_saved_plan_and_report_visibly_exclude_long_rows(tmp_path, monkeypatch):
+    from test_gate_groups import row
+    plan = {"guard": [], "artifacts": {}, "rows": [row("short", 2048), row("long", 65536)]}
+    path = tmp_path / "plan.json"
+    path.write_text(json.dumps(plan))
+    out = tmp_path / "regular"
+    monkeypatch.setattr(sys, "argv", ["gate", str(path), "--out", str(out), "--all-rows", "--plan-only"])
+    bench_gate.main()
+    saved = json.loads((out / "plan.json").read_text())
+    report = json.loads((out / "report.json").read_text())
+    assert [r["id"] for r in saved["rows"]] == ["short"]
+    assert saved["skipped_rows"][0]["id"] == "long"
+    assert saved["gate_groups"] == report["gate_groups"]
+    assert report["gate_group"] == "regular"
+    assert report["gate_groups"][1]["status"] == "skipped-with-reason"
+    assert report["skipped_rows"][0]["reason"]
+
+
+def test_unproven_long_gate_skips_without_starting_measurement(tmp_path, monkeypatch):
+    from test_gate_groups import row
+    path = tmp_path / "plan.json"
+    path.write_text(json.dumps({"rows": [row("long", 65536)], "guard": [], "artifacts": {}}))
+    out = tmp_path / "long"
+    monkeypatch.setattr(sys, "argv", ["gate", str(path), "--out", str(out), "--group", "long", "--all-rows"])
+    def unexpected(*args, **kwargs):
+        raise AssertionError("skipped long gate must not launch anything")
+    monkeypatch.setattr(bench_gate.subprocess, "run", unexpected)
+    bench_gate.main()
+    report = json.loads((out / "report.json").read_text())
+    assert report["decision"] == "skipped" and not report["gating_pass"]
+    assert report["gate_groups"][1]["status"] == "skipped-with-reason"
+
+
+def test_explicit_periodic_long_plan_stays_separate(tmp_path, monkeypatch):
+    from test_gate_groups import row
+    path = tmp_path / "plan.json"
+    path.write_text(json.dumps({"rows": [row("short", 2048), row("long", 131072)], "guard": [], "artifacts": {}}))
+    out = tmp_path / "long"
+    monkeypatch.setattr(sys, "argv", ["gate", str(path), "--out", str(out), "--group", "long",
+                                     "--long-reason", "periodic coverage", "--plan-only"])
+    bench_gate.main()
+    saved = json.loads((out / "plan.json").read_text())
+    assert [r["id"] for r in saved["rows"]] == ["long"]
+    assert saved["gate_groups"][0]["status"] == "skipped-with-reason"
+    assert saved["gate_groups"][1]["manual_or_periodic_reason"] == "periodic coverage"

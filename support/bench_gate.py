@@ -13,6 +13,7 @@ from gate_worker import bind_measurement_protocol, close_workers, measurement_pr
 from gate_block_workers import block_workers
 from gate_runner import run_row
 from gate_select import select
+from gate_groups import execution_plan
 
 def verdict(decisions: list[str]) -> str:
     """Diagnostics, partial measurements and failures cannot become a gating PASS."""
@@ -43,6 +44,9 @@ def main():
     parser.add_argument("--worker-timeout", type=float, default=3600,
                         help="Resident sample response deadline in seconds (startup allows 45 minutes)")
     parser.add_argument("--all-rows", action="store_true")
+    parser.add_argument("--group", choices=("regular", "long"), default="regular",
+                        help="Run one separate gate group; long never joins regular decisions")
+    parser.add_argument("--long-reason", help="Explicit manual or periodic long run without a source-bound affected row")
     parser.add_argument("--fresh-competitor", action="store_true")
     parser.add_argument("--plan-only", action="store_true")
     args = parser.parse_args()
@@ -56,6 +60,8 @@ def main():
     baseline = json.loads(Path(plan["baseline_snapshot"]).read_text()) if plan.get("baseline_snapshot") else {}
     candidate = json.loads(Path(plan["candidate_snapshot"]).read_text()) if plan.get("candidate_snapshot") else {}
     selection = select(plan["rows"], baseline, candidate, args.all_rows)
+    plan = execution_plan(plan, selection, args.group, args.long_reason)
+    chosen_by_id = {row["id"]: row for row in selection["rows"]}
     warmups = args.warmups if args.warmups is not None else (3 if args.no_early_stop else 1)
     if warmups < 0 or args.reps <= 0 or args.worker_timeout <= 0:
         raise ValueError("invalid repetition/warmup counts")
@@ -71,10 +77,16 @@ def main():
                        "warmups_per_launch": warmups if legacy_priming and (args.process_per_leg or args.no_early_stop) else None,
                        "execution": "process-per-leg" if args.process_per_leg or args.no_early_stop
                            else "resident-block-workers"},
-              "selection": selection, "rows": [], "started": time.time()}
+              "selection": selection, "gate_group": plan["gate_group"], "gate_groups": plan["gate_groups"],
+              "skipped_rows": [{"id": row["id"], "gate_group": row["gate_group"],
+                                "reason": row["skip_reason"]} for row in plan["skipped_rows"]],
+              "rows": [], "started": time.time()}
     save(args.out / "plan.json", plan)
     save(args.out / "report.json", report)
-    if args.plan_only:
+    if not plan["rows"]:
+        report.update(decision="skipped", gating_pass=False, ended=time.time())
+        save(args.out / "report.json", report)
+    if args.plan_only or not plan["rows"]:
         return
     repository = plan.get("repository", str(Path.cwd()))
     dirty = subprocess.run(["git", "-C", repository, "status", "--porcelain"],
@@ -91,7 +103,7 @@ def main():
     indices = sorted(range(len(plan["rows"])), key=lambda index: group_order[session_key(plan["rows"][index])])
     try:
         for index in indices:
-            chosen = selection["rows"][index]
+            chosen = chosen_by_id[plan["rows"][index]["id"]]
             row = history(bind_measurement_protocol(plan["rows"][index], resident, warmups))
             directory = args.out / f"row-{index:02}"
             directory.mkdir()
