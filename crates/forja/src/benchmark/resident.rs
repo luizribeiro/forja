@@ -151,8 +151,7 @@ impl Request {
     }
 }
 
-pub(super) async fn run(options: &Bench) -> Result<(), Box<dyn Error>> {
-    use std::io::{BufRead, Write};
+fn validate_options(options: &Bench) -> Result<(), Box<dyn Error>> {
     if options.engines.len() != 1
         || options.points.len() != 1
         || options.points[0].selection.len() != 1
@@ -162,6 +161,15 @@ pub(super) async fn run(options: &Bench) -> Result<(), Box<dyn Error>> {
     if options.points[0].selection != [forja_config::Selection::GpuPipelined] {
         return Err("prefix workers require gpu-pipelined selection".into());
     }
+    if options.breakdown {
+        return Err("prefix workers require unprofiled measurements".into());
+    }
+    Ok(())
+}
+
+pub(super) async fn run(options: &Bench) -> Result<(), Box<dyn Error>> {
+    use std::io::{BufRead, Write};
+    validate_options(options)?;
     let started = std::time::Instant::now();
     let mut runners = Runners::new(true);
     for phase in [Phase::Single, Phase::Batch] {
@@ -202,6 +210,25 @@ pub(super) async fn run(options: &Bench) -> Result<(), Box<dyn Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prefix_workers_refuse_profiling_before_loading_a_runner() {
+        let crate::args::Command::Bench(mut options) = crate::args::parse(
+            ["bench", "--engine", "/engine.wasm", "--model", "/model"].map(str::to_owned),
+        )
+        .unwrap() else {
+            panic!("expected benchmark options");
+        };
+        options.points[0].selection = vec![forja_config::Selection::GpuPipelined];
+        validate_options(&options).unwrap();
+        options.breakdown = true;
+        assert!(
+            validate_options(&options)
+                .unwrap_err()
+                .to_string()
+                .contains("unprofiled")
+        );
+    }
 
     #[test]
     fn priming_is_bounded_per_shape_without_changing_classic_warmups() {
