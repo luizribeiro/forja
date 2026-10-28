@@ -76,6 +76,7 @@ pub(super) async fn measure(
         let started = Instant::now();
         let prepared = Prepared::new(runner, prompt, options).await?;
         runners.times.add(timing::Stage::Prefix, started.elapsed());
+        runners.prefix_built()?;
         runners.prefixes.insert(key, prepared.clone());
         prepared
     };

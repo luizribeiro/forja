@@ -15,6 +15,7 @@ class Worker:
         self.buffer = b""
         self.sequence = 0
         self.ready = None
+        self.prefix_builds = None
         started = time.time()
         self.process = subprocess.Popen(command, cwd=cwd, stdin=subprocess.PIPE,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=0, start_new_session=True)
@@ -67,6 +68,12 @@ class Worker:
                 or result.get("runner_loads") != self.ready["runner_loads"]
                 or result.get("instance_loads") != self.ready["instance_loads"]):
             raise ValueError("worker response identity or load count changed")
+        if self.ready["protocol"] == 2:
+            count = result.get("prefix_builds")
+            if (not isinstance(count, int) or count <= 0
+                    or self.prefix_builds is not None and count != self.prefix_builds):
+                raise ValueError("worker rebuilt context prefixes within a block")
+            self.prefix_builds = count
         if not output.is_file():
             raise ValueError("worker completed without a native record")
         return {"started": started, "ended": time.time(), "returncode": 0,

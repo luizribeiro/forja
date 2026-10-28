@@ -582,7 +582,7 @@ async fn run_metal(
             "results": results,
         });
         if options.mode.execution == crate::args::BenchExecution::ResidentWorker {
-            report["worker"] = serde_json::json!({"protocol":2,"prefix_entries":runners.prefixes.len(),"pid": std::process::id(), "runner_loads": runners.loads,
+            report["worker"] = serde_json::json!({"protocol":2,"prefix_entries":runners.prefix_entries(),"prefix_builds":runners.prefix_builds,"pid": std::process::id(), "runner_loads": runners.loads,
                 "instance_loads": runners.instance_loads, "cache_state": "prefix-fork-per-worker",
                 "configured_priming_passes": options.warmups, "priming_policy":"once-per-worker-shape; at most two decode steps", "phase_timers": runners.times.report(started.elapsed())?});
         }
@@ -1730,6 +1730,10 @@ async fn measure_record_batches(
     let tokens = synthetic_tokens(token_count, info.vocab);
     let mut prefixes = Vec::with_capacity(BATCH_CONTEXTS.len());
     for (index, &context) in BATCH_CONTEXTS.iter().enumerate() {
+        if let Some(prefix) = runners.batch_prefixes.get(&index) {
+            prefixes.push(prefix.clone());
+            continue;
+        }
         let start = index
             .checked_mul(2_048)
             .ok_or("batch benchmark token offset overflowed")?;
@@ -1744,15 +1748,20 @@ async fn measure_record_batches(
         let reserved_tokens = u64::from(context)
             .checked_add(u64::try_from(point.tg)?)
             .ok_or("batch benchmark reservation overflowed")?;
-        prefixes.push(
-            prepare_batch_prefix(
-                &mut runner,
-                serving,
-                tokens[start..end].to_vec(),
-                reserved_tokens,
-            )
-            .await?,
-        );
+        let started = Instant::now();
+        let prefix = prepare_batch_prefix(
+            &mut runner,
+            serving,
+            tokens[start..end].to_vec(),
+            reserved_tokens,
+        )
+        .await?;
+        runners.times.add(timing::Stage::Prefix, started.elapsed());
+        runners.prefix_built()?;
+        if runners.retains() {
+            runners.batch_prefixes.insert(index, prefix.clone());
+        }
+        prefixes.push(prefix);
     }
     let feedback = synthetic_tokens(contexts.len(), info.vocab);
     let mut measurements = Vec::with_capacity(buckets.len());

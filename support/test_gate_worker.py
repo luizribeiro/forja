@@ -18,8 +18,8 @@ for line in sys.stdin:
  Path(request['output']).write_text(json.dumps({'pid':os.getpid(),'id':request['id']}))
  print('sample log',flush=True)
  print('FORJA_BENCH_RESULT '+json.dumps({'id':request['id'],'pid':os.getpid(),
-  'protocol':PROTOCOL,'runner_loads':LOADS,'instance_loads':{'single':1}}),flush=True)
-'''.replace("LOADS", "2" if behavior == "reload" else "1").replace("PROTOCOL", str(protocol)))
+  'protocol':PROTOCOL,'prefix_builds':PREFIX_BUILDS,'runner_loads':LOADS,'instance_loads':{'single':1}}),flush=True)
+'''.replace("LOADS", "2" if behavior == "reload" else "1").replace("PROTOCOL", str(protocol)).replace("PREFIX_BUILDS", "request[\"id\"]" if behavior == "rebuild" else "1"))
     return [sys.executable, str(script)]
 
 
@@ -114,5 +114,15 @@ def test_worker_protocol_identity_cannot_be_silently_reused(tmp_path):
     try:
         event = worker.sample(tmp_path / "record2.json", tmp_path / "sample2.log")
         assert event["worker_result"]["protocol"] == 2
+    finally:
+        worker.close()
+
+
+def test_prefix_repreparation_in_a_resident_block_fails_closed(tmp_path):
+    worker = Worker(fake_worker(tmp_path, "rebuild", protocol=2), None, tmp_path / "rebuild.log", timeout=2, protocol=2)
+    try:
+        worker.sample(tmp_path / "first.json", tmp_path / "first.log")
+        with pytest.raises(ValueError, match="rebuilt context"):
+            worker.sample(tmp_path / "second.json", tmp_path / "second.log")
     finally:
         worker.close()

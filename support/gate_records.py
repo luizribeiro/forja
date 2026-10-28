@@ -90,6 +90,8 @@ def command_sampler(row: dict, directory: Path, guard: list[str], warmups: int,
             count = record["worker"].get("prefix_entries")
             if (not isinstance(count, int) or count <= 0
                     or count != event["worker_result"].get("prefix_entries")
+                    or record["worker"].get("prefix_builds") != event["worker_result"].get("prefix_builds")
+                    or record["worker"].get("prefix_builds") != count
                     or record["worker"].get("cache_state") != "prefix-fork-per-worker"
                     or not record["worker"].get("phase_timers")):
                 raise ValueError("prefix worker cache/timing proof is missing")

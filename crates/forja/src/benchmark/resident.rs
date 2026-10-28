@@ -18,6 +18,8 @@ type Loaded = (EngineRunner<forja_metal::MetalBackend>, EngineInfo, String);
 
 pub(super) struct Runners {
     retain: bool,
+    pub(super) batch_prefixes: std::collections::BTreeMap<usize, super::PagedPrefix>,
+    pub(super) prefix_builds: u64,
     primed: std::collections::BTreeSet<Prime>,
     loaded: std::collections::BTreeMap<Phase, Loaded>,
     pub(super) instance_loads: std::collections::BTreeMap<Phase, u64>,
@@ -30,6 +32,8 @@ impl Runners {
     pub(super) const fn new(retain: bool) -> Self {
         Self {
             retain,
+            batch_prefixes: std::collections::BTreeMap::new(),
+            prefix_builds: 0,
             primed: std::collections::BTreeSet::new(),
             loaded: std::collections::BTreeMap::new(),
             instance_loads: std::collections::BTreeMap::new(),
@@ -41,6 +45,18 @@ impl Runners {
 
     pub(super) const fn retains(&self) -> bool {
         self.retain
+    }
+
+    pub(super) fn prefix_entries(&self) -> usize {
+        self.prefixes.len() + self.batch_prefixes.len()
+    }
+
+    pub(super) fn prefix_built(&mut self) -> Result<(), Box<dyn Error>> {
+        self.prefix_builds = self
+            .prefix_builds
+            .checked_add(1)
+            .ok_or("prefix build count overflow")?;
+        Ok(())
     }
 
     pub(super) fn warmup_count(&mut self, key: Prime, configured: usize) -> usize {
@@ -173,7 +189,7 @@ pub(super) async fn run(options: &Bench) -> Result<(), Box<dyn Error>> {
         super::run_metal(options, &mut runners, Some(&request.output)).await?;
         println!(
             "FORJA_BENCH_RESULT {}",
-            serde_json::json!({"id":request.id,"protocol":2,"prefix_entries":runners.prefixes.len(),
+            serde_json::json!({"id":request.id,"protocol":2,"prefix_entries":runners.prefix_entries(),"prefix_builds":runners.prefix_builds,
             "pid":std::process::id(),"runner_loads":runners.loads,
             "instance_loads":runners.instance_loads,"wall_seconds":started.elapsed().as_secs_f64()})
         );
