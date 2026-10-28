@@ -1110,6 +1110,58 @@ kernel void arrange_expert_routes(
     }
 }
 
+template <uint BM, uint BK, uint THREADS>
+struct GroupedInputLoader {
+    static_assert(BM * BK % THREADS == 0);
+    static constant constexpr uint count = BM * BK / THREADS;
+    float values[count];
+    ulong row_base;
+    bool valid_row;
+    uint local_inner;
+
+    void init(constant GatherQuantMatmulParams &params, threadgroup const uint *route_rows,
+              uint row_count, uint thread_index) thread {
+        uint linear = thread_index * count;
+        uint row = linear / BK;
+        local_inner = linear % BK;
+        valid_row = row < row_count;
+        row_base = valid_row ? params.input_offset + ulong(route_rows[row]) * params.input_row_stride : 0;
+    }
+
+    void load(device const uchar *input, constant GatherQuantMatmulParams &params,
+              uint inner_origin) thread {
+        if (input0_dtype == 0 && inner_origin + BK <= params.inner &&
+            params.input_offset % 4 == 0 && params.input_row_stride % 4 == 0 &&
+            params.input_inner_stride == 1) {
+            for (uint chunk = 0; chunk < count; chunk += 4) {
+                float4 value = 0.0f;
+                if (valid_row) {
+                    device const float *source = reinterpret_cast<device const float *>(input) +
+                        row_base + inner_origin + local_inner + chunk;
+                    value = *reinterpret_cast<device const float4 *>(source);
+                }
+                for (uint e = 0; e < 4; ++e) values[chunk + e] = value[e];
+            }
+        } else {
+            for (uint e = 0; e < count; ++e) {
+                uint inner = inner_origin + local_inner + e;
+                values[e] = valid_row && inner < params.inner
+                    ? load_float(input, row_base + ulong(inner) * params.input_inner_stride, input0_dtype) : 0.0f;
+            }
+        }
+    }
+
+    template <uint S>
+    void store(threadgroup float *tile, uint thread_index) thread {
+        uint linear = thread_index * count;
+        threadgroup float *destination = tile + (linear / BK) * S + linear % BK;
+        for (uint chunk = 0; chunk < count; chunk += 4) {
+            *reinterpret_cast<threadgroup float4 *>(destination + chunk) =
+                float4(values[chunk], values[chunk + 1], values[chunk + 2], values[chunk + 3]);
+        }
+    }
+};
+
 template <uint BK, uint BN, uint THREADS>
 struct QuantizedWeightPrefetch {
     static_assert(BN * BK % (4 * THREADS) == 0);
@@ -1119,9 +1171,10 @@ struct QuantizedWeightPrefetch {
     float scales[slots];
     float biases[slots];
 
-    void load(device const uchar *packed, device const uchar *scale_buffer,
-        device const uchar *bias_buffer, constant GatherQuantMatmulParams &params,
-        uint expert, uint inner_origin, uint column_origin, uint thread_index) thread {
+    void load(
+        device const uchar *packed, device const uchar *scale_buffer, device const uchar *bias_buffer,
+        constant GatherQuantMatmulParams &params, uint expert,
+        uint inner_origin, uint column_origin, uint thread_index) thread {
         uint values_per_word = 32 / quant_bits;
         uint words_per_column = BK / values_per_word;
         uint slot = 0;
@@ -1196,7 +1249,6 @@ void grouped_quantized_gemm_impl(
     uint sorted_origin = block.y;
     uint column_origin = tile.x * block_columns;
     uint row_count = block.z;
-    uint thread_count = threadgroup_size.x * threadgroup_size.y * threadgroup_size.z;
     BlockMMA<
         float, block_rows, block_columns, block_inner,
         simdgroups_rows, simdgroups_columns,
@@ -1212,60 +1264,11 @@ void grouped_quantized_gemm_impl(
     threadgroup_barrier(mem_flags::mem_threadgroup);
     QuantizedWeightPrefetch<block_inner, block_columns, 32 * simdgroups_rows * simdgroups_columns> weights;
     weights.load(packed, scales, biases, params, expert, 0, column_origin, thread_index);
+    GroupedInputLoader<block_rows, block_inner, 32 * simdgroups_rows * simdgroups_columns> activations;
+    activations.init(params, route_rows, row_count, thread_index);
     for (uint inner_origin = 0; inner_origin < params.inner; inner_origin += block_inner) {
-        if (input0_dtype == 0 &&
-            inner_origin + block_inner <= params.inner &&
-            params.input_offset % 4 == 0 && params.input_row_stride % 4 == 0 &&
-            params.input_inner_stride == 1) {
-            if constexpr (block_rows != 8) {
-                uint local_row = thread_index / 4;
-                uint local_inner = (thread_index % 4) * 8;
-                threadgroup float *destination =
-                    input_tile + local_row * tile_stride + local_inner;
-                if (local_row < row_count) {
-                    device const float *source = reinterpret_cast<device const float *>(input) +
-                        params.input_offset + ulong(route_rows[local_row]) * params.input_row_stride +
-                        inner_origin + local_inner;
-                    *reinterpret_cast<threadgroup float4 *>(destination) =
-                        *reinterpret_cast<device const float4 *>(source);
-                    *reinterpret_cast<threadgroup float4 *>(destination + 4) =
-                        *reinterpret_cast<device const float4 *>(source + 4);
-                } else {
-                    *reinterpret_cast<threadgroup float4 *>(destination) = 0.0f;
-                    *reinterpret_cast<threadgroup float4 *>(destination + 4) = 0.0f;
-                }
-            } else {
-                uint local_row = thread_index / 8;
-                uint local_inner = (thread_index % 8) * 4;
-                threadgroup float4 *destination = reinterpret_cast<threadgroup float4 *>(
-                    input_tile + local_row * tile_stride + local_inner);
-                if (local_row < row_count) {
-                    device const float *source = reinterpret_cast<device const float *>(input) +
-                        params.input_offset + ulong(route_rows[local_row]) * params.input_row_stride +
-                        inner_origin + local_inner;
-                    *destination = *reinterpret_cast<device const float4 *>(source);
-                } else {
-                    *destination = 0.0f;
-                }
-            }
-        } else {
-            for (uint linear = thread_index;
-                 linear < block_rows * block_inner;
-                 linear += thread_count) {
-                uint local_row = linear / block_inner;
-                uint local_inner = linear % block_inner;
-                uint inner = inner_origin + local_inner;
-                float value = 0.0f;
-                if (local_row < row_count && inner < params.inner) {
-                    value = load_float(
-                        input,
-                        params.input_offset + ulong(route_rows[local_row]) * params.input_row_stride +
-                            ulong(inner) * params.input_inner_stride,
-                        input0_dtype);
-                }
-                input_tile[local_row * tile_stride + local_inner] = value;
-            }
-        }
+        activations.load(input, params, inner_origin);
+        activations.template store<tile_stride>(input_tile, thread_index);
         weights.template store<tile_stride>(weight_tile, inner_origin, params.inner, thread_index);
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (inner_origin + block_inner < params.inner) {
@@ -1385,7 +1388,6 @@ kernel void grouped_quantized_pair_32x32_2x2_blocked(
     uint sorted_origin = block.y;
     uint column_origin = tile.x * block_columns;
     uint row_count = block.z;
-    uint thread_count = threadgroup_size.x * threadgroup_size.y * threadgroup_size.z;
     BlockMMA<
         float, block_rows, block_columns, block_inner, 2, 2,
         tile_stride, tile_stride, true> gate_mma(simdgroup, lane);
@@ -1404,44 +1406,11 @@ kernel void grouped_quantized_pair_32x32_2x2_blocked(
     QuantizedWeightPrefetch<block_inner, block_columns, 128> gate_weights, up_weights;
     gate_weights.load(gate_packed, gate_scales, gate_biases, gate_params, expert, 0, column_origin, thread_index);
     up_weights.load(up_packed, up_scales, up_biases, up_params, expert, 0, column_origin, thread_index);
+    GroupedInputLoader<block_rows, block_inner, 128> activations;
+    activations.init(params, route_rows, row_count, thread_index);
     for (uint inner_origin = 0; inner_origin < params.inner; inner_origin += block_inner) {
-        if (input0_dtype == 0 &&
-            inner_origin + block_inner <= params.inner &&
-            params.input_offset % 4 == 0 && params.input_row_stride % 4 == 0 &&
-            params.input_inner_stride == 1) {
-            uint local_row = thread_index / 4;
-            uint local_inner = (thread_index % 4) * 8;
-            threadgroup float *destination = input_tile + local_row * tile_stride + local_inner;
-            if (local_row < row_count) {
-                device const float *source = reinterpret_cast<device const float *>(input) +
-                    params.input_offset + ulong(route_rows[local_row]) * params.input_row_stride +
-                    inner_origin + local_inner;
-                *reinterpret_cast<threadgroup float4 *>(destination) =
-                    *reinterpret_cast<device const float4 *>(source);
-                *reinterpret_cast<threadgroup float4 *>(destination + 4) =
-                    *reinterpret_cast<device const float4 *>(source + 4);
-            } else {
-                *reinterpret_cast<threadgroup float4 *>(destination) = 0.0f;
-                *reinterpret_cast<threadgroup float4 *>(destination + 4) = 0.0f;
-            }
-        } else {
-            for (uint linear = thread_index;
-                 linear < block_rows * block_inner;
-                 linear += thread_count) {
-                uint local_row = linear / block_inner;
-                uint local_inner = linear % block_inner;
-                uint inner = inner_origin + local_inner;
-                float value = 0.0f;
-                if (local_row < row_count && inner < params.inner) {
-                    value = load_float(
-                        input,
-                        params.input_offset + ulong(route_rows[local_row]) * params.input_row_stride +
-                            ulong(inner) * params.input_inner_stride,
-                        input0_dtype);
-                }
-                input_tile[local_row * tile_stride + local_inner] = value;
-            }
-        }
+        activations.load(input, params, inner_origin);
+        activations.template store<tile_stride>(input_tile, thread_index);
         gate_weights.template store<tile_stride>(weight_tile, inner_origin, params.inner, thread_index);
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (inner_origin + block_inner < params.inner) {

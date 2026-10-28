@@ -548,27 +548,29 @@ fn grouped_1024_by_128_projection_matches_cpu() {
 }
 
 #[test]
-fn grouped_quantized_ops_match_cpu_for_strided_f32_inputs() {
+fn grouped_quantized_ops_match_cpu_for_strided_inputs() {
     let cpu = CpuBackend::new();
     let metal = MetalBackend::new().unwrap();
     let rows = 16;
     let inner = 64;
     let row_slice = Slice::new(0, rows, 1).unwrap();
-    let activations = [
-        TensorSpec::sliced_broadcast(
-            DType::F32,
-            &[rows, 4],
-            &[row_slice, Slice::new(0, 1, 1).unwrap()],
-            &[rows, inner],
-        ),
-        TensorSpec::sliced(
-            DType::F32,
-            &[rows, inner * 2],
-            &[row_slice, Slice::new(0, inner, 2).unwrap()],
-        ),
-    ];
-    for activation in activations {
-        assert_grouped_strided_case(&cpu, &metal, activation);
+    for dtype in [DType::F32, DType::F16, DType::BF16] {
+        let activations = [
+            TensorSpec::sliced_broadcast(
+                dtype,
+                &[rows, 4],
+                &[row_slice, Slice::new(0, 1, 1).unwrap()],
+                &[rows, inner],
+            ),
+            TensorSpec::sliced(
+                dtype,
+                &[rows, inner * 2],
+                &[row_slice, Slice::new(0, inner, 2).unwrap()],
+            ),
+        ];
+        for activation in activations {
+            assert_grouped_strided_case(&cpu, &metal, activation);
+        }
     }
 }
 
@@ -586,7 +588,7 @@ fn assert_grouped_strided_case(cpu: &CpuBackend, metal: &MetalBackend, activatio
     let scales = TensorSpec::contiguous(DType::F16, &[experts, columns, inner / 64]);
     let biases = TensorSpec::contiguous(DType::F16, &[experts, columns, inner / 64]);
     let indices = TensorSpec::initialized(DType::U32, &[rows, routes], selected);
-    let output = TensorSpec::contiguous(DType::F32, &[rows, routes, columns]);
+    let output = TensorSpec::contiguous(activation.dtype(), &[rows, routes, columns]);
     assert_backends_agree(
         cpu,
         metal,
