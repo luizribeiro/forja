@@ -92,9 +92,12 @@ legs. Process-level variability belongs inside the independent block. A fixed
 pair across blocks can confound process effects with build effects. Rows with
 matching commands share already-collected blocks; only one pair is retained. Each leg runs
 the declared warmups, drains GPU work and releases paged request lanes between
-measurement phases. Batch and single-request paths retain separate instances to
-preserve their original paged/graph state boundaries; each instance loads once.
-Positional inputs replay from zero; loaded weights and compiled kernels remain resident. Native records identify the worker PID, load count and
+measurement phases. Prefix workers share one model instance across serial single
+and batch phases. They prepare authenticated read-only prefixes once per worker
+and context, fork them per leg, and refuse prefix rebuilds within the block.
+Untimed decode priming is bounded to two steps per shape; prefill primes once at
+its declared shape. Full measured workloads stay unchanged. Classic process calls
+retain their original warmup policy. Loaded weights and compiled kernels remain resident. Native records identify the worker PID, load count and
 cache policy; group records retain startup commands/times and complete worker logs.
 Per-leg command records distinguish request wall time from worker startup.
 Each block records total wall time including both starts and cleanup, and each
@@ -112,7 +115,7 @@ stdin, each `{"id":1,"output":"/absolute/new-record.json"}`. IDs increase from o
 The CLI freezes one engine, point, selection, repetition count and warmup policy;
 requests cannot change configuration. `FORJA_BENCH_READY` and `FORJA_BENCH_RESULT`
 prefix structured control lines on stdout; EOF closes the worker. The gate client
-checks PIDs and one load per isolated phase throughout. Worker startup permits the documented
+checks PIDs, one model load and fixed prefix build counts throughout. Worker startup permits the documented
 45-minute macOS launch queue; `--worker-timeout` bounds each sample response.
 Loading, warmups, resets, IPC and switching all remain part of observed gate wall
 time. Report startup and steady request times separately, plus amortized totals.
@@ -135,8 +138,9 @@ maps each scoreboard row to `{"site":...,"ranges":{"position":[lo,hi],...}}`
 paths. Audit and test the proof against guest routing helpers. Inclusive ranges
 must cover every query/chunk boundary, generated position, graph and batch bucket;
 end-to-end rows include prefill/cache/decode consumers. Traces cannot prove absence.
-Missing proofs, unknown dependencies or host/ABI/build changes select every row.
-Selection exceptions include their type, message and traceback in the report.
+Missing proofs, unknown dependencies or host/ABI/build changes conservatively
+select regular rows. These fallbacks do not establish a source-bound affected long
+row. Selection exceptions include their type, message and traceback in the report.
 
 Unaffected rows get five randomized blocks. Promote when their median log score
 falls below `-D`, with D derived from raw block noise, never marginal noise.
@@ -149,11 +153,42 @@ nonzero SD. Stale/undated history (seven days by default) supplies no D; identit
 or hash mismatches are refused. This conservative collection run does not accept
 a candidate. A later independent run can use its verified noise history.
 
+## Separate long-context gate
+
+Every row declares a positive integer `workload_max_context`: an audited ceiling
+on the context actually prepared or consumed by its **whole command**, including
+priming, other metrics, suites and generated tokens. A configured cache capacity
+alone is not a prepared workload. Unknown ceilings are refused. Explicit native
+prefill/decode axes also raise the ceiling; rows sharing a command share its
+largest ceiling. A short metric collected alongside 64K decode therefore belongs
+to the long group too.
+
+A ceiling of 32,768 tokens or more routes the row to `long`, including 32K/64K/128K
+decode and 64K/128K prefill. Everything below it belongs to `regular`.
+The default invocation runs only `regular`. `--all-rows` applies within the
+requested group and never folds long work into a regular decision.
+
+```console
+python3 support/bench_gate.py plan.json --group regular --out /path/regular
+python3 support/bench_gate.py plan.json --group long --out /path/long
+python3 support/bench_gate.py plan.json --group long --long-reason "periodic coverage" --out /path/periodic-long
+```
+
+A validated source-bound dependency proof marking a long row affected makes the
+separate long group required (`required_by_proof`). Running `--group long` then
+selects that group. Unknown dependency fallbacks and explicit all-row selection
+cannot substitute for this proof. Otherwise a long run needs an explicit manual
+or periodic `--long-reason`. Regular and long decisions always remain separate.
+Saved plans and reports contain both `gate_groups`, each selected or
+`skipped-with-reason`, and retain every excluded row. Reopening a saved regular
+plan preserves the long group. A descriptive long screen must be labeled a
+screen; it supplies neither a gate decision nor reusable sequential history.
+
 ## Gate plan
 
 A plan contains `repository`, `guard` (an argv prefix), frozen `artifacts` mapping
 absolute paths to SHA-256, optional snapshot paths, and `rows`. Each row declares
-`id`, `profile`, `question`, `X`, `Y`, `alternative` and baseline/candidate adapters:
+`id`, `profile`, `workload_max_context`, `question`, `X`, `Y`, `alternative` and baseline/candidate adapters:
 
 ```json
 {
