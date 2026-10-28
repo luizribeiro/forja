@@ -172,34 +172,46 @@ struct BlockMMA {
     void multiply(
         threadgroup const T *a,
         threadgroup const T *b) thread {
+        #pragma clang loop unroll(full)
         for (int inner = 0; inner < block_inner; inner += fragment_size) {
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_matrix<mma_type, 8, 8> a_matrices[row_fragments];
             for (int row_fragment = 0; row_fragment < row_fragments; ++row_fragment) {
-                simdgroup_matrix<mma_type, 8, 8> a_matrix;
                 uint a_row = simdgroup_row * fragment_size + fragment_row +
                     row_fragment * fragment_size * simdgroups_rows;
                 for (int element = 0; element < 2; ++element) {
-                    a_matrix.thread_elements()[element] = mma_type(
+                    a_matrices[row_fragment].thread_elements()[element] = mma_type(
                         a[a_row * left_stride + inner + fragment_column + element]);
                 }
+            }
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_matrix<mma_type, 8, 8> b_matrices[column_fragments];
+            for (int column_fragment = 0; column_fragment < column_fragments; ++column_fragment) {
+                uint b_column = simdgroup_column * fragment_size + fragment_column +
+                    column_fragment * fragment_size * simdgroups_columns;
+                for (int element = 0; element < 2; ++element) {
+                    b_matrices[column_fragment].thread_elements()[element] = mma_type(
+                        right_transposed
+                            ? b[(b_column + element) * right_stride + inner + fragment_row]
+                            : b[(inner + fragment_row) * right_stride + b_column + element]);
+                }
+            }
+            simdgroup_barrier(mem_flags::mem_none);
+            for (int row_fragment = 0; row_fragment < row_fragments; ++row_fragment) {
                 for (int column_fragment = 0;
                      column_fragment < column_fragments;
                      ++column_fragment) {
-                    simdgroup_matrix<mma_type, 8, 8> b_matrix;
                     simdgroup_matrix<float, 8, 8> accumulator;
                     simdgroup_matrix<float, 8, 8> result;
-                    uint b_column = simdgroup_column * fragment_size + fragment_column +
-                        column_fragment * fragment_size * simdgroups_columns;
-                    int fragment_index = row_fragment * column_fragments + column_fragment;
+                    int column_index = row_fragment % 2
+                        ? column_fragments - 1 - column_fragment : column_fragment;
+                    int fragment_index = row_fragment * column_fragments + column_index;
                     for (int element = 0; element < 2; ++element) {
-                        b_matrix.thread_elements()[element] = mma_type(
-                            right_transposed
-                                ? b[(b_column + element) * right_stride + inner + fragment_row]
-                                : b[(inner + fragment_row) * right_stride + b_column + element]);
                         accumulator.thread_elements()[element] =
                             accumulators[fragment_index * 2 + element];
                     }
                     simdgroup_multiply_accumulate(
-                        result, a_matrix, b_matrix, accumulator);
+                        result, a_matrices[row_fragment], b_matrices[column_index], accumulator);
                     for (int element = 0; element < 2; ++element) {
                         accumulators[fragment_index * 2 + element] =
                             result.thread_elements()[element];

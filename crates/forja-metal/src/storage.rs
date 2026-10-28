@@ -34,6 +34,38 @@ use objc2_metal::{
     MTLResidencySetDescriptor, MTLResourceOptions, MTLSharedEvent, MTLSharedEventListener,
 };
 
+fn shader_source() -> &'static str {
+    concat!(
+        include_str!("elementwise.metal"),
+        "\n",
+        include_str!("kernels.metal"),
+        "\n",
+        include_str!("steel_gemm_loader.metal"),
+        "\n",
+        include_str!("steel_gemm_mma.metal"),
+        "\n",
+        include_str!("matmul.metal"),
+        "\n",
+        include_str!("quant_matmul.metal"),
+        "\n",
+        include_str!("gather_matmul.metal"),
+        "\n",
+        include_str!("steel_attention.metal"),
+        "\n",
+        include_str!("sdpa_kernels.metal"),
+        "\n",
+        include_str!("sdpa_vector.metal"),
+        "\n",
+        include_str!("paged.metal"),
+        "\n",
+        include_str!("calibration.metal")
+    )
+}
+
+#[cfg(test)]
+#[path = "../tests/block_mma.rs"]
+mod block_mma;
+
 pub(super) struct MetalBuffer {
     pub(super) raw: Retained<ProtocolObject<dyn MTLBuffer>>,
     pub(super) len: usize,
@@ -740,31 +772,7 @@ impl MetalBackend {
             .map_err(|_| BackendError::ExecutionFailed)?;
         residency.commit();
         queue.addResidencySet(&residency);
-        let source = concat!(
-            include_str!("elementwise.metal"),
-            "\n",
-            include_str!("kernels.metal"),
-            "\n",
-            include_str!("steel_gemm_loader.metal"),
-            "\n",
-            include_str!("steel_gemm_mma.metal"),
-            "\n",
-            include_str!("matmul.metal"),
-            "\n",
-            include_str!("quant_matmul.metal"),
-            "\n",
-            include_str!("gather_matmul.metal"),
-            "\n",
-            include_str!("steel_attention.metal"),
-            "\n",
-            include_str!("sdpa_kernels.metal"),
-            "\n",
-            include_str!("sdpa_vector.metal"),
-            "\n",
-            include_str!("paged.metal"),
-            "\n",
-            include_str!("calibration.metal")
-        );
+        let source = shader_source();
         let pipelines = PipelineCache::new(&device, source)?;
         let shared_event = device
             .newSharedEvent()
