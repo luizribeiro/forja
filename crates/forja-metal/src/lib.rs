@@ -12,6 +12,8 @@ mod encoding;
 #[cfg(target_os = "macos")]
 mod epilogue_codegen;
 #[cfg(target_os = "macos")]
+mod geometry;
+#[cfg(target_os = "macos")]
 mod map_codegen;
 #[cfg(target_os = "macos")]
 mod matmul;

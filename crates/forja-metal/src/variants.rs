@@ -1420,7 +1420,10 @@ pub(crate) static REGISTRY: &[VariantDef<MetalVariant>] = &[
         DeltaRule,
         &[value(
             dim("key width", QUERY, Axis::Index(1)),
-            Relation::Range { min: 1, max: 256 }
+            Relation::Range {
+                min: 1,
+                max: crate::geometry::DELTA_RULE_MAX_KEYS
+            }
         )],
         &["single-token recurrent updates with bounded key width."],
         &["multi-token chunk transforms or key widths above 256."],

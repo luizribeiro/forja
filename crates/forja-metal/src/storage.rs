@@ -34,7 +34,12 @@ use objc2_metal::{
     MTLResidencySetDescriptor, MTLResourceOptions, MTLSharedEvent, MTLSharedEventListener,
 };
 
-fn shader_source() -> &'static str {
+pub(super) fn shader_source() -> &'static str {
+    static SOURCE: OnceLock<String> = OnceLock::new();
+    SOURCE.get_or_init(|| format!("{}{}", crate::geometry::shader_defines(), shader_body()))
+}
+
+fn shader_body() -> &'static str {
     concat!(
         include_str!("elementwise.metal"),
         "\n",

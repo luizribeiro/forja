@@ -47,7 +47,7 @@ kernel void state_delta_rule(
     if (!authenticate_state(table,generations,params.access,error_flag)) { return; }
     uint q_head = head / (params.heads / params.q_heads);
     uint per_thread = (params.keys + 31) / 32;
-    float state[8];
+    float state[(FORJA_DELTA_RULE_MAX_KEYS + 31) / 32];
     float prediction = 0.0f;
     float d = load_float(decay,physical_index(layouts[3],head),program_input3_dtype);
     for (uint i=0; i<per_thread; ++i) {

@@ -1,3 +1,5 @@
+use forja_core::{StateOp, Tensor};
+
 use super::{
     ArgumentBindings, ArgumentWriter, BackendError, BufferBinding, Dispatch, MTL4ArgumentTable,
     MTLComputePipelineState, MTLSize, MetalBackend, Op, ProtocolObject, dispatch_threadgroups,
@@ -19,7 +21,7 @@ impl MetalBackend {
         };
         let input = dispatch.inputs();
         let ordinary = input.len() - 3;
-        let (kernel, geometry, groups) = state_geometry(dispatch)?;
+        let (kernel, geometry, groups) = state_geometry(operation, input, dispatch.outputs())?;
         let tensors = input
             .iter()
             .chain(dispatch.outputs())
@@ -78,20 +80,20 @@ impl MetalBackend {
     }
 }
 
-fn state_geometry(dispatch: &Dispatch) -> Result<(&'static str, [u32; 4], MTLSize), BackendError> {
-    let Op::State(operation) = dispatch.op() else {
-        return Err(BackendError::InvalidInput);
-    };
-    let input = dispatch.inputs();
+fn state_geometry(
+    operation: StateOp,
+    input: &[Tensor],
+    outputs: &[Tensor],
+) -> Result<(&'static str, [u32; 4], MTLSize), BackendError> {
     let mut groups = MTLSize {
         width: 1,
         height: 1,
         depth: 1,
     };
     match operation {
-        forja_core::StateOp::DeltaRule(_) => {
+        StateOp::DeltaRule(_) => {
             let s = input[5].layout().shape();
-            if s[1] > 256 {
+            if u64::from(s[1]) > crate::geometry::DELTA_RULE_MAX_KEYS {
                 return Err(BackendError::UnsupportedOperation);
             }
             groups.width =
@@ -103,10 +105,9 @@ fn state_geometry(dispatch: &Dispatch) -> Result<(&'static str, [u32; 4], MTLSiz
                 groups,
             ))
         }
-        forja_core::StateOp::CausalDepthwiseConv(_) => {
+        StateOp::CausalDepthwiseConv(_) => {
             let s = input[0].layout().shape();
-            let count = dispatch
-                .outputs()
+            let count = outputs
                 .iter()
                 .map(|t| t.layout().element_count())
                 .max()
