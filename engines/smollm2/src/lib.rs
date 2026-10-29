@@ -4,6 +4,8 @@
 
 mod optimized;
 pub mod reference;
+#[cfg(target_family = "wasm")]
+mod replay;
 pub mod variants;
 
 use forja_sdk::{
@@ -192,7 +194,11 @@ pub struct SmolLM2 {
 
 enum Execution {
     Reference(reference::Reference),
-    Optimized(optimized::Optimized),
+    Optimized {
+        engine: optimized::Optimized,
+        #[cfg(target_family = "wasm")]
+        replay: replay::Replay,
+    },
 }
 
 impl SmolLM2 {
@@ -227,9 +233,11 @@ impl SmolLM2 {
         }
         forja_sdk::EngineTunings::new(load, variants::TUNINGS)?;
         let path = if load.tunings.iter().any(|name| name == "optimized") {
-            Execution::Optimized(optimized::Optimized::load(
-                weights, config, context, load, pool,
-            )?)
+            Execution::Optimized {
+                engine: optimized::Optimized::load(weights, config, context, load, pool)?,
+                #[cfg(target_family = "wasm")]
+                replay: replay::Replay::new(load.replay)?,
+            }
         } else {
             if pool.is_some() {
                 return Err(forja_sdk::Error::loading(
@@ -295,18 +303,29 @@ impl forja_sdk::Engine for SmolLM2 {
             Execution::Reference(engine) => {
                 engine.forward(&input.tokens, input.start_pos, input.taps)
             }
-            Execution::Optimized(engine) => {
-                let sequence = input.tokens.shape()[0];
-                engine.forward(
-                    &input.tokens,
-                    sequence,
-                    &input.start_pos.into(),
-                    &(input.start_pos + sequence).into(),
-                    &(sequence - 1).into(),
-                    input.start_pos,
-                    None,
-                    input.taps,
-                )
+            Execution::Optimized {
+                engine,
+                #[cfg(target_family = "wasm")]
+                replay,
+            } => {
+                #[cfg(target_family = "wasm")]
+                {
+                    replay.step(engine, &input.tokens, input.start_pos, input.taps)
+                }
+                #[cfg(not(target_family = "wasm"))]
+                {
+                    let sequence = input.tokens.shape()[0];
+                    engine.forward(
+                        &input.tokens,
+                        sequence,
+                        &input.start_pos.into(),
+                        &forja_sdk::Dim::from(input.start_pos).checked_add(sequence)?,
+                        &(sequence - 1).into(),
+                        input.start_pos,
+                        None,
+                        input.taps,
+                    )
+                }
             }
         }
     }
@@ -334,7 +353,11 @@ impl forja_sdk::Engine for SmolLM2 {
                 taps: false,
             })?
             .logits;
-        let selected = logits.sample(&self.decode.sampling()?, slot)?;
+        let selected = logits.reshape(&[1, logits.shape()[0]])?.sample_with(
+            &self.decode.sampling()?,
+            slot,
+            &forja_sdk::target::metal::Variant::new("sample.parallel")?,
+        )?;
         let token = self.decode.store_selected(&selected, slot)?;
         Ok(forja_sdk::DecodeOutput { logits, token })
     }

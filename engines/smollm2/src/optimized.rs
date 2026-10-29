@@ -13,6 +13,8 @@ use forja_sdk::{
 pub(crate) struct Optimized {
     weights: ModelWeights,
     config: Config,
+    #[cfg(target_family = "wasm")]
+    pub(crate) context: u32,
     variants: crate::variants::Variants,
     caches: Caches,
     positions: Tensor<u32>,
@@ -51,6 +53,8 @@ impl Optimized {
         Ok(Self {
             weights: ModelWeights::load(weights, &config)?,
             config,
+            #[cfg(target_family = "wasm")]
+            context,
             fused: load.tunings.iter().any(|name| name == "fused-epilogues"),
             gate_up: gated_up_epilogue(1, 2, &[DType::F32], DType::F32)?,
             residual_norm: residual_norm_kernel(DType::F32, config.epsilon)?,

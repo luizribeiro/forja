@@ -972,6 +972,98 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    #[ignore = "requires FORJA_MODELS and runs in the pre-push hook"]
+    async fn metal_smollm2_replay_preserves_page_crossings() -> Result<(), Box<dyn Error>> {
+        use forja_host::{EngineRunner, EngineStep};
+        let root = PathBuf::from(env::var_os("FORJA_MODELS").ok_or("FORJA_MODELS is not set")?);
+        let component = test_guests::smollm2();
+        let weights = root.join("SmolLM2-135M-Instruct/model.safetensors");
+        let limits = crate::engine::limits(&forja_config::Limits::default())?;
+        let mut expected: Vec<Vec<f32>> = Vec::new();
+        for replay in [false, true] {
+            let mut runner = EngineRunner::new(
+                component,
+                forja_metal::MetalBackend::new()?,
+                limits,
+                &weights,
+            )
+            .await?;
+            let mut config = engine_load_config(component, &forja_config::Engine::default())?;
+            config.replay = replay;
+            runner.load_with_selections(None, &config).await??;
+            let mut actual = Vec::new();
+            for (tokens, start_pos) in [
+                (vec![7; 63], 0),
+                (vec![9], 63),
+                (vec![11], 64),
+                (vec![13], 65),
+            ] {
+                let output = runner
+                    .step(EngineStep {
+                        tokens,
+                        start_pos,
+                        taps: false,
+                    })
+                    .await??;
+                actual.push(decode_f32_le(&runner.read(&output.logits).await?)?);
+            }
+            if replay {
+                for (left, right) in expected.iter().zip(&actual) {
+                    assert!(normwise_relative_error(left, right)? <= 1.0e-5);
+                }
+            } else {
+                expected = actual;
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    #[ignore = "requires FORJA_MODELS and runs in the pre-push hook"]
+    async fn metal_smollm2_retained_decode_matches_golden_tokens() -> Result<(), Box<dyn Error>> {
+        use forja_host::{EngineDecode, EngineRunner, SamplingParams};
+        let root = PathBuf::from(env::var_os("FORJA_MODELS").ok_or("FORJA_MODELS is not set")?);
+        let fixtures = FixtureDirectory::open(root.join("golden/smollm2-135m-instruct"))?;
+        let fixture = fixtures
+            .prompt("short-english")
+            .ok_or("missing short fixture")?;
+        let prompt = fixture
+            .prompt_ids()
+            .iter()
+            .map(|&id| u32::try_from(id))
+            .collect::<Result<Vec<_>, _>>()?;
+        for component in [test_guests::smollm2_reference(), test_guests::smollm2()] {
+            let mut runner = EngineRunner::new(
+                component,
+                forja_metal::MetalBackend::new()?,
+                limits(&forja_config::Limits::default())?,
+                root.join("SmolLM2-135M-Instruct/model.safetensors"),
+            )
+            .await?;
+            let config = engine_load_config(component, &forja_config::Engine::default())?;
+            runner.load_with_selections(None, &config).await??;
+            for (step, &expected) in fixture.greedy_tokens().iter().enumerate() {
+                let output = runner
+                    .decode(EngineDecode {
+                        tokens: (step == 0).then(|| prompt.clone()),
+                        start_pos: if step == 0 {
+                            0
+                        } else {
+                            u32::try_from(prompt.len() + step - 1)?
+                        },
+                        sampling: SamplingParams::default(),
+                    })
+                    .await??;
+                let actual = crate::engine::read_token(&runner.read(&output.token).await?)?;
+                assert_eq!(i64::from(actual), expected);
+            }
+        }
+        Ok(())
+    }
+
     fn run_model_test(
         backend: BackendArg,
         precision: Precision,
