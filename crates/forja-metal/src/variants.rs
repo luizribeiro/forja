@@ -753,13 +753,19 @@ const PAGED_STEEL_256: &[Constraint] = &[
     PAGED_SDPA_STEEL[0],
     value(PAGED_KEY_WIDTH, Relation::Equal(256)),
     PAGED_SDPA_STEEL[2],
-    operation(OperationValue::PageTokens, Relation::MultipleOf(8)),
+    operation(
+        OperationValue::PageTokens,
+        Relation::MultipleOf(crate::geometry::STEEL_256_FLOAT[1] as u64),
+    ),
 ];
 const PAGED_STEEL_HALF_256: &[Constraint] = &[
     PAGED_STEEL_256[0],
     PAGED_STEEL_256[1],
     PAGED_STEEL_256[2],
-    operation(OperationValue::PageTokens, Relation::MultipleOf(16)),
+    operation(
+        OperationValue::PageTokens,
+        Relation::MultipleOf(crate::geometry::STEEL_256_HALF[1] as u64),
+    ),
     SDPA_STEEL_HALF[3],
     SDPA_STEEL_HALF[4],
 ];
@@ -2016,9 +2022,11 @@ impl MetalVariant {
             }
             MetalVariant::PagedSdpaSteelHalf32x16 => &[(128, [32, 16])],
             MetalVariant::PagedSdpaSteelHalf64x16 => &[(128, [64, 16])],
-            MetalVariant::SdpaSteel256 | MetalVariant::PagedSdpaSteel256 => &[(256, [16, 8])],
+            MetalVariant::SdpaSteel256 | MetalVariant::PagedSdpaSteel256 => {
+                &[(256, crate::geometry::STEEL_256_FLOAT)]
+            }
             MetalVariant::SdpaSteelHalf256 | MetalVariant::PagedSdpaSteelHalf256 => {
-                &[(256, [32, 16])]
+                &[(256, crate::geometry::STEEL_256_HALF)]
             }
             _ => &[],
         };

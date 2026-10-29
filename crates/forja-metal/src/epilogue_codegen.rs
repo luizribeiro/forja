@@ -217,7 +217,8 @@ fn generate_source_from_header(
     let helper = generate_helper(epilogue)?;
     let header = shared_header.replacen(IDENTITY_HELPER, &helper, 1);
     Ok(format!(
-        "{header}\n{}",
+        "{}{header}\n{}",
+        crate::geometry::shader_defines(),
         concat!(
             include_str!("kernels.metal"),
             "\n",
@@ -351,6 +352,12 @@ mod tests {
                 .any(|pair| { pair[0] == b'v' && pair[1].is_ascii_digit() })
         );
         assert!(source.contains("return v2;"));
+    }
+
+    #[test]
+    fn runtime_libraries_include_the_shared_shader_geometry() {
+        let source = generate_source(&bias_epilogue()).unwrap();
+        assert!(source.starts_with(&crate::geometry::shader_defines()));
     }
 
     #[test]

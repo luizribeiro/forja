@@ -8834,9 +8834,15 @@ fn steel_attention_kernel(kernel: SdpaKernel, width: u32) -> Result<&'static str
 
 fn steel_attention_tile(kernel: SdpaKernel, width: u32) -> Result<(u32, u32), BackendError> {
     match kernel {
-        SdpaKernel::Steel if width == 256 => Ok((16, 8)),
+        SdpaKernel::Steel if width == 256 => Ok((
+            crate::geometry::STEEL_256_FLOAT[0],
+            crate::geometry::STEEL_256_FLOAT[1],
+        )),
         SdpaKernel::Steel => Ok((32, if width == 64 { 32 } else { 16 })),
-        SdpaKernel::SteelHalf if width == 256 => Ok((32, 16)),
+        SdpaKernel::SteelHalf if width == 256 => Ok((
+            crate::geometry::STEEL_256_HALF[0],
+            crate::geometry::STEEL_256_HALF[1],
+        )),
         SdpaKernel::SteelHalf if width == 128 => Ok((96, 16)),
         SdpaKernel::SteelHalf => Ok((64, 32)),
         SdpaKernel::Vector | SdpaKernel::VectorGqa | SdpaKernel::Decomposed => {

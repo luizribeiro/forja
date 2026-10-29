@@ -107,5 +107,7 @@ DEFINE_STEEL_ATTENTION(steel_attention_half_64_64x32, half, 64, 32, 64, 8, 1)
 // 96 * (128 + 8) * 2 + (16 + 8) * 128 * 2 = 32,256 bytes, 512 below 32 KiB.
 DEFINE_STEEL_ATTENTION(steel_attention_half_128_96x16, half, 96, 16, 128, 12, 1)
 
-DEFINE_STEEL_ATTENTION(steel_attention_256, float, 16, 8, 256, 2, 1)
-DEFINE_STEEL_ATTENTION(steel_attention_half_256, half, 32, 16, 256, 4, 1)
+// 16 * (256 + 4) * 4 + (8 + 4) * 256 * 4 = 28,928 bytes, below 32 KiB.
+DEFINE_STEEL_ATTENTION(steel_attention_256, float, FORJA_STEEL_256_FLOAT_Q, FORJA_STEEL_256_FLOAT_K, 256, FORJA_STEEL_256_FLOAT_Q / 8, 1)
+// 32 * (256 + 8) * 2 + (16 + 8) * 256 * 2 = 29,184 bytes, below 32 KiB.
+DEFINE_STEEL_ATTENTION(steel_attention_half_256, half, FORJA_STEEL_256_HALF_Q, FORJA_STEEL_256_HALF_K, 256, FORJA_STEEL_256_HALF_Q / 8, 1)
