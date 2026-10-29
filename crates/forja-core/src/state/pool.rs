@@ -2,7 +2,7 @@ use std::{
     collections::VecDeque,
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
 
@@ -120,6 +120,7 @@ pub struct StateTransaction {
     input: u32,
     output: u32,
     submitted: Arc<AtomicU64>,
+    bound: Arc<AtomicBool>,
 }
 
 impl StateTransaction {
@@ -159,6 +160,7 @@ impl StateSequence {
             input,
             output,
             submitted: Arc::new(AtomicU64::new(0)),
+            bound: Arc::new(AtomicBool::new(false)),
         };
         self.latest_serial = serial;
         self.pending.push_back(transaction.clone());
@@ -296,7 +298,7 @@ impl StateSequence {
     /// Builds the slot-bound input/output allocation table for a live transaction.
     ///
     /// # Errors
-    /// Refuses capabilities from another sequence or already retired transactions.
+    /// Refuses foreign, retired or already bound transaction capabilities.
     pub fn bind(&self, transaction: &StateTransaction) -> Result<StateSlot, PagePoolError> {
         self.pending_index(transaction)?;
         let table = self.storage.table()?;
@@ -304,12 +306,17 @@ impl StateSequence {
             .iter()
             .map(|&index| table.entries()[index as usize])
             .collect();
-        Ok(StateSlot {
+        let slot = StateSlot {
             table: PageTable::new(entries, table.generations().to_vec())
                 .map_err(|_| PagePoolError::CorruptState)?,
             active: true,
             owner: Some(Arc::clone(&self.pool.completed)),
-        })
+        };
+        transaction
+            .bound
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| PagePoolError::InvalidCheckpoint)?;
+        Ok(slot)
     }
 }
 
@@ -388,6 +395,19 @@ mod tests {
         assert!(a.finish(&retry, true).is_err());
         assert!(a.bind(&retry).is_err());
     }
+    #[test]
+    fn transaction_clones_cannot_bind_a_second_recording() {
+        let layout = StateLayout::new(vec![StatePlane::new(DType::F32, vec![7]).unwrap()]).unwrap();
+        let pool = StatePool::new(layout, 1, 1024).unwrap();
+        let mut sequence = pool.reserve().unwrap();
+        let tx = sequence.begin(1).unwrap();
+        sequence.bind(&tx).unwrap();
+        assert!(matches!(
+            sequence.bind(&tx.clone()),
+            Err(PagePoolError::InvalidCheckpoint)
+        ));
+    }
+
     #[test]
     fn abandoning_restores_the_checkpoint_but_quarantines_uncertain_backing() {
         let layout = StateLayout::new(vec![StatePlane::new(DType::F32, vec![7]).unwrap()]).unwrap();
