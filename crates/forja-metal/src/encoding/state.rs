@@ -14,21 +14,19 @@ impl MetalBackend {
         bindings: &mut ArgumentBindings,
         arguments: &mut ArgumentWriter,
     ) -> Result<(Vec<BufferBinding>, BufferBinding), BackendError> {
-        let Op::State(operation @ forja_core::StateOp::DeltaRule(_)) = dispatch.op() else {
-            return Err(BackendError::UnsupportedOperation);
+        let Op::State(operation) = dispatch.op() else {
+            return Err(BackendError::InvalidInput);
         };
         let input = dispatch.inputs();
-        let state = input[5].layout().shape();
-        if state[1] > 256 {
-            return Err(BackendError::UnsupportedOperation);
-        }
+        let ordinary = input.len() - 3;
+        let (kernel, geometry, groups) = state_geometry(dispatch)?;
         let tensors = input
             .iter()
             .chain(dispatch.outputs())
             .map(|t| self.encoder_tensor(t))
             .collect::<Result<Vec<_>, _>>()?;
         let mut layout_bytes = Vec::new();
-        for tensor in tensors[..6].iter().chain(&tensors[9..]) {
+        for tensor in tensors[..ordinary].iter().chain(&tensors[input.len()..]) {
             layout_bytes.extend(encode_layout(&tensor.layout)?);
         }
         let layouts = arguments.write(&layout_bytes)?;
@@ -36,13 +34,10 @@ impl MetalBackend {
         let params: Vec<_> = [
             access.source(),
             access.destination(),
-            input[7].layout().shape()[0],
-            input[0].layout().shape()[0],
-            state[0],
-            state[1],
-            state[2],
+            input[input.len() - 2].layout().shape()[0],
         ]
         .into_iter()
+        .chain(geometry)
         .flat_map(u32::to_ne_bytes)
         .collect();
         let params = arguments.write(&params)?;
@@ -50,6 +45,7 @@ impl MetalBackend {
         let constants: Vec<_> = [0, 1, 3, 4, 5]
             .into_iter()
             .enumerate()
+            .take(ordinary)
             .map(|(i, slot)| (slot, dtype_code(input[i].layout().dtype())))
             .chain([(2, dtype_code(dispatch.output().layout().dtype()))])
             .collect();
@@ -57,7 +53,7 @@ impl MetalBackend {
             .pipelines
             .lock()
             .map_err(|_| BackendError::ExecutionFailed)?
-            .get("state_delta_rule", &constants)?;
+            .get(kernel, &constants)?;
         if pipeline.maxTotalThreadsPerThreadgroup() < 128 {
             return Err(BackendError::UnsupportedOperation);
         }
@@ -65,18 +61,13 @@ impl MetalBackend {
         for (index, tensor) in tensors.iter().enumerate() {
             bindings.bind(table, index, &tensor.buffer);
         }
-        bindings.bind(table, 11, &layouts);
-        bindings.bind(table, 12, &params);
-        bindings.bind(table, 13, &flag);
+        bindings.bind(table, tensors.len(), &layouts);
+        bindings.bind(table, tensors.len() + 1, &params);
+        bindings.bind(table, tensors.len() + 2, &flag);
         set_argument_table(encoder, table);
         dispatch_threadgroups(
             encoder,
-            MTLSize {
-                width: usize::try_from(state[2].div_ceil(4))
-                    .map_err(|_| BackendError::InvalidInput)?,
-                height: usize::try_from(state[0]).map_err(|_| BackendError::InvalidInput)?,
-                depth: 1,
-            },
+            groups,
             MTLSize {
                 width: 128,
                 height: 1,
@@ -84,5 +75,49 @@ impl MetalBackend {
             },
         );
         Ok((vec![layouts, params, flag.clone()], flag))
+    }
+}
+
+fn state_geometry(dispatch: &Dispatch) -> Result<(&'static str, [u32; 4], MTLSize), BackendError> {
+    let Op::State(operation) = dispatch.op() else {
+        return Err(BackendError::InvalidInput);
+    };
+    let input = dispatch.inputs();
+    let mut groups = MTLSize {
+        width: 1,
+        height: 1,
+        depth: 1,
+    };
+    match operation {
+        forja_core::StateOp::DeltaRule(_) => {
+            let s = input[5].layout().shape();
+            if s[1] > 256 {
+                return Err(BackendError::UnsupportedOperation);
+            }
+            groups.width =
+                usize::try_from(s[2].div_ceil(4)).map_err(|_| BackendError::InvalidInput)?;
+            groups.height = usize::try_from(s[0]).map_err(|_| BackendError::InvalidInput)?;
+            Ok((
+                "state_delta_rule",
+                [input[0].layout().shape()[0], s[0], s[1], s[2]],
+                groups,
+            ))
+        }
+        forja_core::StateOp::CausalDepthwiseConv(_) => {
+            let s = input[0].layout().shape();
+            let count = dispatch
+                .outputs()
+                .iter()
+                .map(|t| t.layout().element_count())
+                .max()
+                .ok_or(BackendError::InvalidInput)?;
+            groups.width =
+                usize::try_from(count.div_ceil(128)).map_err(|_| BackendError::InvalidInput)?;
+            Ok((
+                "state_causal_conv",
+                [s[0], s[1], input[1].layout().shape()[0], 0],
+                groups,
+            ))
+        }
     }
 }

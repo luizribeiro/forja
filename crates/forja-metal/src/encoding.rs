@@ -1,4 +1,6 @@
 mod state;
+#[cfg(test)]
+mod state_cache_tests;
 
 use std::{
     cell::{Cell, RefCell},
@@ -7662,7 +7664,7 @@ impl MetalBackend {
                 }
             }
             Op::State(_) => {
-                arguments.write(8 * 112)?;
+                arguments.write((dispatch.inputs().len() - 1) * 112)?;
                 arguments.write(7 * size_of::<u32>())?;
                 arguments.write(2 * size_of::<u32>())?;
             }
@@ -8254,9 +8256,9 @@ fn supported_dispatch(dispatch: &Dispatch) -> bool {
         return false;
     }
     match dispatch.op() {
-        Op::State(op) => matches!(op, forja_core::StateOp::DeltaRule(_)),
         Op::Program(_) => dispatch.bound_program().is_some(),
-        Op::Copy
+        Op::State(_)
+        | Op::Copy
         | Op::PagedCopy { .. }
         | Op::RmsNorm { .. }
         | Op::Argmax { .. }
@@ -8442,7 +8444,8 @@ pub(super) fn dispatch_kernel(dispatch: &Dispatch) -> Result<&'static str, Backe
                 "copy_strided"
             }
         }
-        Op::State(_) => "state_delta_rule",
+        Op::State(forja_core::StateOp::DeltaRule(_)) => "state_delta_rule",
+        Op::State(forja_core::StateOp::CausalDepthwiseConv(_)) => "state_causal_conv",
         Op::PagedCopy { .. } => "paged_copy",
         Op::RmsNorm { .. } => "rms_norm",
         Op::Argmax { chunk_width } => {
@@ -8694,7 +8697,8 @@ fn reusable_dispatch(dispatch: &Dispatch) -> bool {
         | Op::Sdpa { .. }
         | Op::PagedCopy { .. }
         | Op::PagedSdpa { .. }
-        | Op::PagedSdpaAppend { .. } => false,
+        | Op::PagedSdpaAppend { .. }
+        | Op::State(_) => false,
         Op::Matmul => {
             dispatch
                 .primitive_inputs()
@@ -10105,7 +10109,8 @@ fn function_constants(
 fn nan_preserving_kernel(name: &str) -> bool {
     matches!(
         name,
-        "state_delta_rule"
+        "state_causal_conv"
+            | "state_delta_rule"
             | "softmax_single"
             | "softmax_looped"
             | "argmax_partials"

@@ -1,7 +1,11 @@
-struct StateParams {
+struct StateAuth {
     uint source;
     uint destination;
     uint records;
+};
+
+struct StateParams {
+    StateAuth access;
     uint q_heads;
     uint heads;
     uint keys;
@@ -10,7 +14,7 @@ struct StateParams {
 
 bool authenticate_state(
     device const uint2 *table, device const uint *generations,
-    constant StateParams &params, device atomic_uint *error_flag) {
+    constant StateAuth &params, device atomic_uint *error_flag) {
     uint2 source = table[0];
     uint2 destination = table[1];
     bool valid = source.x == params.source && destination.x == params.destination
@@ -40,7 +44,7 @@ kernel void state_delta_rule(
         if (lane == 0) { store_float(output, physical_index(layouts[6],out_index),output_dtype,0.0f); }
         return;
     }
-    if (!authenticate_state(table,generations,params,error_flag)) { return; }
+    if (!authenticate_state(table,generations,params.access,error_flag)) { return; }
     uint q_head = head / (params.heads / params.q_heads);
     uint per_thread = (params.keys + 31) / 32;
     float state[8];
@@ -70,4 +74,53 @@ kernel void state_delta_rule(
     }
     result = simd_sum(result);
     if (lane == 0) { store_float(output,physical_index(layouts[6],out_index),output_dtype,result); }
+}
+
+struct ConvStateParams {
+    StateAuth access;
+    uint tokens;
+    uint channels;
+    uint taps;
+    uint reserved;
+};
+
+float causal_state_value(device const uchar *input, device const uchar *history,
+    constant TensorLayout *layouts, ulong row, uint channel, constant ConvStateParams &params) {
+    ulong history_rows = params.taps - 1;
+    if (row < history_rows) {
+        return load_float(history,physical_index(layouts[2],uint(row*params.channels+channel)),input0_dtype);
+    }
+    return load_float(input,physical_index(layouts[0],uint((row-history_rows)*params.channels+channel)),input0_dtype);
+}
+
+kernel void state_causal_conv(
+    device const uchar *input [[buffer(0)]], device const uchar *weight [[buffer(1)]],
+    device const uchar *history [[buffer(2)]], device const uint2 *table [[buffer(3)]],
+    device const uint *generations [[buffer(4)]], device const uint *activity [[buffer(5)]],
+    device uchar *output [[buffer(6)]], device uchar *next [[buffer(7)]],
+    constant TensorLayout *layouts [[buffer(8)]], constant ConvStateParams &params [[buffer(9)]],
+    device atomic_uint *error_flag [[buffer(10)]], uint index [[thread_position_in_grid]]) {
+    uint outputs = layouts[3].element_count;
+    uint states = layouts[4].element_count;
+    if (index >= max(outputs,states)) { return; }
+    if (activity[0] == 0) {
+        if (index < outputs) { store_float(output,physical_index(layouts[3],index),output_dtype,0.0f); }
+        return;
+    }
+    if (!authenticate_state(table,generations,params.access,error_flag)) { return; }
+    uint channel = index % params.channels;
+    if (index < outputs) {
+        ulong row = index / params.channels;
+        float sum = 0.0f;
+        for (uint tap=0;tap<params.taps;++tap) {
+            sum += causal_state_value(input,history,layouts,row+tap,channel,params)
+                * load_float(weight,physical_index(layouts[1],tap*params.channels+channel),input1_dtype);
+        }
+        store_float(output,physical_index(layouts[3],index),output_dtype,sum);
+    }
+    if (index < states) {
+        ulong row = ulong(params.tokens) + index / params.channels;
+        store_float(next,physical_index(layouts[4],index),input0_dtype,
+            causal_state_value(input,history,layouts,row,channel,params));
+    }
 }
