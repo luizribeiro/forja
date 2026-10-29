@@ -956,6 +956,22 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires FORJA_MODELS and runs in the pre-push hook"]
+    fn metal_smollm2_profiles_match_full_transformer_fixtures() -> Result<(), Box<dyn Error>> {
+        for component in [test_guests::smollm2_reference(), test_guests::smollm2()] {
+            let mut options = model_options(BackendArg::Metal, Precision::F32, Vec::new())?;
+            options.engine = component.to_owned();
+            options.model_dir.set_file_name("SmolLM2-135M-Instruct");
+            options.fixtures.set_file_name("smollm2-135m-instruct");
+            tokio::runtime::Builder::new_current_thread()
+                .build()?
+                .block_on(run_with_steps(&options, 32))?;
+        }
+        Ok(())
+    }
+
     fn run_model_test(
         backend: BackendArg,
         precision: Precision,

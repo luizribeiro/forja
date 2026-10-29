@@ -88,6 +88,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &bf16_target_dir,
         &out_dir,
     )?;
+    build_smollm2_profiles(&repository, &guest_target_dir, &out_dir)?;
     let release_dir = guest_target_dir.join("wasm32-wasip2/release");
     let olmoe = build_olmoe_profile(&olmoe_manifest, &guest_target_dir, &out_dir)?;
     let qwen3_coder =
@@ -309,4 +310,23 @@ fn required_var(name: &str) -> io::Result<std::ffi::OsString> {
 
 fn emit_guest_path(name: &str, path: &Path) {
     println!("cargo::rustc-env={name}={}", path.display());
+}
+
+fn build_smollm2_profiles(repository: &Path, target: &Path, out: &Path) -> io::Result<()> {
+    let engine = repository.join("engines/smollm2");
+    forja_build::build_component(&engine.join("Cargo.toml"), target, &[])?;
+    let component = target.join("wasm32-wasip2/release/smollm2.wasm");
+    for (suffix, variable) in [
+        ("reference", "SMOLLM2_REFERENCE_COMPONENT"),
+        ("f32", "SMOLLM2_COMPONENT"),
+    ] {
+        let profile = engine.join(format!(
+            "profiles/smollm2-135m-instruct.metal-apple-m3-ultra.{suffix}.toml"
+        ));
+        let output =
+            copy_profiled_component(&component, &profile, out, &format!("smollm2-{suffix}.wasm"))?;
+        emit_guest_path(variable, &output);
+    }
+    println!("cargo::rerun-if-changed={}", engine.display());
+    Ok(())
 }

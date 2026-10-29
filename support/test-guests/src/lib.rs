@@ -129,6 +129,18 @@ pub fn weights_smoke() -> &'static Path {
     Path::new(env!("WEIGHTS_SMOKE_COMPONENT"))
 }
 
+/// Returns the optimized `SmolLM2-135M-Instruct` component.
+#[must_use]
+pub fn smollm2() -> &'static Path {
+    Path::new(env!("SMOLLM2_COMPONENT"))
+}
+
+/// Returns the reference `SmolLM2-135M-Instruct` component.
+#[must_use]
+pub fn smollm2_reference() -> &'static Path {
+    Path::new(env!("SMOLLM2_REFERENCE_COMPONENT"))
+}
+
 #[cfg(test)]
 mod tests {
     use wasmtime::component::{Component, Linker, ResourceTable};
