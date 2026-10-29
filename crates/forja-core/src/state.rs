@@ -1,5 +1,7 @@
 //! Validated geometry for opaque per-sequence state.
 
+mod access;
+pub use access::StateAccess;
 mod pool;
 pub use pool::{StatePool, StateSequence, StateSlot, StateTransaction};
 

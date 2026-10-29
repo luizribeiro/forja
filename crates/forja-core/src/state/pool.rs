@@ -289,4 +289,33 @@ mod tests {
         assert!(a.finish(&retry, true).is_err());
         assert!(a.bind(&retry).is_err());
     }
+    #[test]
+    fn retiring_state_is_never_reallocated_before_its_reader_drains() {
+        let layout =
+            StateLayout::new(vec![StatePlane::new(DType::F32, vec![33]).unwrap()]).unwrap();
+        assert!(StatePool::new(layout.clone(), 1, 1).is_err());
+        let pool = StatePool::new(layout, 1, 4096).unwrap();
+        let mut sequence = pool.reserve().unwrap();
+        let transaction = sequence.begin(7).unwrap();
+        let slot = sequence.bind(&transaction).unwrap();
+        let access = crate::StateAccess::from_slot(&slot).unwrap();
+        assert_ne!(access.source(), access.destination());
+        assert!(crate::StateAccess::from_slot(&StateSlot::poisoned()).is_err());
+        drop(sequence);
+        assert!(pool.reserve().is_err());
+        pool.observe_completion(6).unwrap();
+        assert!(pool.reserve().is_err());
+        pool.observe_completion(7).unwrap();
+        let mut replacement = pool.reserve().unwrap();
+        let next = replacement.begin(8).unwrap();
+        let current = replacement.bind(&next).unwrap();
+        assert!(
+            PageTable::new(
+                slot.table.entries().to_vec(),
+                current.table.generations().to_vec()
+            )
+            .is_err()
+        );
+        assert!(replacement.bind(&transaction).is_err());
+    }
 }
