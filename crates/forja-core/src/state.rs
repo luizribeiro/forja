@@ -2,6 +2,8 @@
 
 mod access;
 pub use access::StateAccess;
+mod ops;
+pub use ops::StateOp;
 mod pool;
 pub use pool::{StatePool, StateSequence, StateSlot, StateTransaction};
 

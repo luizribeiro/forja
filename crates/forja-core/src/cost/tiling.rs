@@ -60,7 +60,8 @@ impl CostModel {
                     if input.len() == 8 { 2 } else { 1 },
                 )
             }
-            Op::Program(_)
+            Op::State(_)
+            | Op::Program(_)
             | Op::Copy
             | Op::PagedCopy { .. }
             | Op::RmsNorm { .. }
@@ -102,7 +103,8 @@ fn attention_padded(tiles: &[(u32, [u32; 2])], dispatch: &Dispatch) -> Option<[u
             key_length,
             ..
         } => (causal, q_start, key_length),
-        Op::Program(_)
+        Op::State(_)
+        | Op::Program(_)
         | Op::Copy
         | Op::PagedCopy { .. }
         | Op::RmsNorm { .. }

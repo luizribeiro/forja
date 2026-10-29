@@ -1411,6 +1411,7 @@ impl Backend for CpuBackend {
         let result = dispatches
             .into_iter()
             .try_for_each(|dispatch| match dispatch.op() {
+                Op::State(_) => Err(BackendError::UnsupportedOperation),
                 Op::Program(_) => dispatch
                     .bound_program()
                     .ok_or(BackendError::ExecutionFailed)

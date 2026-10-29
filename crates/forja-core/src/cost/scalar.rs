@@ -50,7 +50,7 @@ pub(super) fn count(dispatch: &Dispatch, mut cost: KernelCost) -> Option<KernelC
     let input = dispatch.primitive_inputs();
     let elements = dispatch.output().layout().element_count();
     cost.scalar_ops = match dispatch.op() {
-        Op::Program(_) => {
+        Op::State(_) | Op::Program(_) => {
             let program = dispatch.bound_program()?.program().program();
             let width = u64::from(
                 dispatch

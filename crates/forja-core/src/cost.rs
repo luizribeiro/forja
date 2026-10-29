@@ -4,6 +4,8 @@ mod attention;
 #[cfg(test)]
 mod copies;
 mod routed;
+#[cfg(test)]
+mod state_values;
 pub use routed::quantized_route_index;
 #[cfg(test)]
 mod matrix_values;
@@ -60,6 +62,7 @@ impl KernelCost {
         };
         let inputs = dispatch.primitive_inputs();
         match dispatch.op() {
+            Op::State(operation) => return operation.cost(inputs, cost),
             Op::Matmul => {
                 cost.flops = matmul_flops(inputs[0].layout().shape(), inputs[1].layout().shape())?;
                 cost.weight_bytes = tensor_bytes(&inputs[1])?;

@@ -55,7 +55,8 @@ pub(super) fn count(dispatch: &Dispatch, mut cost: KernelCost) -> Option<KernelC
             cost.read_bytes = cost.weight_bytes.checked_add(tensor_bytes(&inputs[3])?)?;
             return Some(cost);
         }
-        Op::Program(_)
+        Op::State(_)
+        | Op::Program(_)
         | Op::Copy
         | Op::PagedCopy { .. }
         | Op::RmsNorm { .. }

@@ -3297,6 +3297,7 @@ impl MetalBackend {
                 error_flags.push(EncodedErrorFlag::new(flag, dispatch_index, "quant-embed"));
                 buffers
             }
+            Op::State(_) => return Err(BackendError::UnsupportedOperation),
             Op::Copy => self.encode_copy(encoder, table, dispatch, bindings, arguments)?,
             Op::PagedCopy { .. } => {
                 let (buffers, flag) =
@@ -7653,6 +7654,7 @@ impl MetalBackend {
                     arguments.write(112)?;
                 }
             }
+            Op::State(_) => return Err(BackendError::UnsupportedOperation),
             Op::Copy => Self::size_copy_arguments(arguments)?,
             Op::PagedCopy { .. } => {
                 arguments.write(7 * size_of::<u32>())?;
@@ -8241,6 +8243,7 @@ fn supported_dispatch(dispatch: &Dispatch) -> bool {
         return false;
     }
     match dispatch.op() {
+        Op::State(_) => false,
         Op::Program(_) => dispatch.bound_program().is_some(),
         Op::Copy
         | Op::PagedCopy { .. }
@@ -8428,6 +8431,7 @@ pub(super) fn dispatch_kernel(dispatch: &Dispatch) -> Result<&'static str, Backe
                 "copy_strided"
             }
         }
+        Op::State(_) => "state-update",
         Op::PagedCopy { .. } => "paged_copy",
         Op::RmsNorm { .. } => "rms_norm",
         Op::Argmax { chunk_width } => {

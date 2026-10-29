@@ -146,6 +146,8 @@ impl Tensor {
 /// A trusted operation recorded in a command list.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Op {
+    /// Authenticated recurrent or convolution state update.
+    State(crate::StateOp),
     /// Executes a validated scalar program with this content identity.
     Program(ProgramHash),
     /// Copies and optionally casts one tensor.
@@ -556,7 +558,7 @@ impl Dispatch {
     ) -> Result<Self, OpError> {
         check_common(inputs, outputs)?;
         let expected_outputs = match op {
-            Op::TopK { .. } => 2,
+            Op::TopK { .. } | Op::State(_) => 2,
             Op::PagedSdpaAppend { .. } => 3,
             _ => 1,
         };
@@ -568,6 +570,7 @@ impl Dispatch {
         }
         let output = outputs[0];
         match op {
+            Op::State(operation) => operation.validate(inputs, outputs)?,
             Op::Program(_) => return Err(OpError::ProgramRequiresBinding),
             Op::Copy => check_copy(inputs, output)?,
             Op::PagedCopy {
