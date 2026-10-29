@@ -3959,8 +3959,12 @@ impl MetalBackend {
             }
         }
         if let Some(gqa_blocks) = gqa_blocks {
-            let (first_kernel, first_threads, kv_heads_per_group) =
-                paged_gqa_first_pass(q[0], k[2])?;
+            let (first_kernel, first_threads, head_groups) = if q[2] == 256 {
+                ("paged_sdpa_2pass_1_independent_256", 32, q[0])
+            } else {
+                let (kernel, threads, kv_per_group) = paged_gqa_first_pass(q[0], k[2])?;
+                (kernel, threads, k[2] / kv_per_group)
+            };
             let partials = self.scratch_tensor(query.layout.dtype(), &[q[0], gqa_blocks, v[3]])?;
             let sums = self.scratch_tensor(DType::F32, &[q[0], gqa_blocks])?;
             let maxs = self.scratch_tensor(DType::F32, &[q[0], gqa_blocks])?;
@@ -4008,13 +4012,15 @@ impl MetalBackend {
             dispatch_threadgroups(
                 encoder,
                 MTLSize {
-                    width: usize::try_from(k[2] / kv_heads_per_group)
-                        .map_err(|_| BackendError::InvalidInput)?,
+                    width: usize::try_from(head_groups).map_err(|_| BackendError::InvalidInput)?,
                     height: 1,
                     depth: usize::try_from(gqa_blocks).map_err(|_| BackendError::InvalidInput)?,
                 },
                 MTLSize {
-                    width: first_threads,
+                    width: required_thread_count(
+                        first.maxTotalThreadsPerThreadgroup(),
+                        first_threads,
+                    )?,
                     height: 1,
                     depth: 1,
                 },
@@ -4025,7 +4031,7 @@ impl MetalBackend {
                 .pipelines
                 .lock()
                 .map_err(|_| BackendError::ExecutionFailed)?
-                .get("paged_sdpa_2pass_2_128", &constants)?;
+                .get(paged_gqa_second_pass(q[2])?, &constants)?;
             set_pipeline(encoder, &second);
             for (index, tensor) in [&partials, &sums, &maxs, &output].into_iter().enumerate() {
                 bindings.bind(table, index, &tensor.buffer);
@@ -4041,7 +4047,11 @@ impl MetalBackend {
                     depth: 1,
                 },
                 MTLSize {
-                    width: second.maxTotalThreadsPerThreadgroup(),
+                    width: if q[2] == 256 {
+                        required_thread_count(second.maxTotalThreadsPerThreadgroup(), 1024)?
+                    } else {
+                        second.maxTotalThreadsPerThreadgroup()
+                    },
                     height: 1,
                     depth: 1,
                 },
@@ -8360,8 +8370,10 @@ fn internal_dispatch_names(dispatch: &Dispatch) -> Vec<&'static str> {
         Op::PagedSdpa { .. } | Op::PagedSdpaAppend { .. }
     ) && paged_gqa_blocks(selected_variant(dispatch)).is_some()
         && let Ok(first) = dispatch_kernel(dispatch)
+        && let Some(&width) = dispatch.output().layout().shape().last()
+        && let Ok(second) = paged_gqa_second_pass(width)
     {
-        return vec![first, "paged_sdpa_2pass_2_128"];
+        return vec![first, second];
     }
     internal_gather_dispatch_names(dispatch).to_vec()
 }
@@ -8641,6 +8653,7 @@ fn paged_sdpa_kernel(dispatch: &Dispatch, width: u32) -> Result<&'static str, Ba
                 .ok_or(BackendError::InvalidInput)?;
             paged_gqa_first_pass(query_heads, kv_heads).map(|(kernel, _, _)| kernel)
         }
+        (Some(MetalVariant::PagedSdpaWideTwoPass), 256) => Ok("paged_sdpa_2pass_1_independent_256"),
         (Some(MetalVariant::PagedSdpaSteel256), 256) => Ok("paged_steel_attention_256"),
         (Some(MetalVariant::PagedSdpaSteelHalf256), 256) => Ok("paged_steel_attention_half_256"),
         (Some(MetalVariant::PagedSdpaSteel), 64) => Ok("paged_steel_attention_64"),
@@ -8661,9 +8674,11 @@ fn paged_sdpa_kernel(dispatch: &Dispatch, width: u32) -> Result<&'static str, Ba
 
 fn paged_gqa_blocks(variant: Option<MetalVariant>) -> Option<u32> {
     match variant {
-        Some(MetalVariant::PagedSdpaAppendGqa32 | MetalVariant::PagedSdpaVectorGqaTwoPass32) => {
-            Some(32)
-        }
+        Some(
+            MetalVariant::PagedSdpaAppendGqa32
+            | MetalVariant::PagedSdpaVectorGqaTwoPass32
+            | MetalVariant::PagedSdpaWideTwoPass,
+        ) => Some(32),
         Some(MetalVariant::PagedSdpaAppendGqa64 | MetalVariant::PagedSdpaVectorGqaTwoPass64) => {
             Some(64)
         }
@@ -8680,6 +8695,14 @@ fn paged_gqa_blocks(variant: Option<MetalVariant>) -> Option<u32> {
             MetalVariant::PagedSdpaAppendGqa1024 | MetalVariant::PagedSdpaVectorGqaTwoPass1024,
         ) => Some(1024),
         _ => None,
+    }
+}
+
+fn paged_gqa_second_pass(width: u32) -> Result<&'static str, BackendError> {
+    match width {
+        128 => Ok("paged_sdpa_2pass_2_128"),
+        256 => Ok("paged_sdpa_2pass_2_256"),
+        _ => Err(BackendError::UnsupportedOperation),
     }
 }
 
@@ -8978,7 +9001,8 @@ pub(super) fn variant_supported(
             .ok_or(BackendError::InvalidInput)
     };
     Ok(match variant {
-        MetalVariant::DeltaRule
+        MetalVariant::PagedSdpaWideTwoPass
+        | MetalVariant::DeltaRule
         | MetalVariant::CausalDepthwiseConv
         | MetalVariant::MatmulPortable
         | MetalVariant::QuantMatmulPortable
@@ -9364,6 +9388,14 @@ fn map_dispatch_geometry(
             depth: 1,
         },
     ))
+}
+
+fn required_thread_count(available: usize, required: usize) -> Result<usize, BackendError> {
+    if available < required {
+        Err(BackendError::UnsupportedOperation)
+    } else {
+        Ok(required)
+    }
 }
 
 fn simd_thread_count(
@@ -9945,7 +9977,11 @@ impl PipelineCache {
             .device
             .newComputePipelineStateWithFunction_error(&function)
             .map_err(|_| BackendError::ExecutionFailed)?;
-        if (name.starts_with("steel_attention_") || name.starts_with("paged_steel_attention_"))
+        if (name.starts_with("steel_attention_")
+            || name.starts_with("paged_steel_attention_")
+            || ((name.starts_with("paged_sdpa_2pass_")
+                || name.starts_with("mlx_sdpa_vector_2pass_"))
+                && name.ends_with("_256")))
             && pipeline.staticThreadgroupMemoryLength() > self.max_threadgroup_memory_length
         {
             self.unavailable_pipelines.insert(key);
@@ -13788,6 +13824,17 @@ mod tests {
             output,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn wide_decode_refuses_incomplete_simd_reduction_groups() {
+        for required in [32, 1024] {
+            assert_eq!(required_thread_count(required, required), Ok(required));
+            assert_eq!(
+                required_thread_count(required - 1, required),
+                Err(BackendError::UnsupportedOperation)
+            );
+        }
     }
 
     struct SdpaOverride(Option<SdpaKernel>, Option<u32>);

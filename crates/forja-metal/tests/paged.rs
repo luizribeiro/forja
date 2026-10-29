@@ -2050,18 +2050,18 @@ fn metal_paged_append_refuses_unsupported_width_without_writing() {
     assert_eq!(backend.read(&value).unwrap(), before);
 }
 
-fn wide_prefill<B: Backend + 'static>(
+fn wide_attention<B: Backend + 'static>(
     backend: &B,
     dtype: DType,
-    queries: u32,
+    geometry: (u32, u32),
     variant: Option<&str>,
     page_tokens: u32,
 ) -> Result<Vec<f32>, BackendError> {
     run_sdpa_with_page_tokens::<_, 256>(
         backend,
         dtype,
-        33,
-        queries,
+        geometry.0,
+        geometry.1,
         true,
         false,
         24,
@@ -2085,14 +2085,54 @@ fn metal_paged_steel_256_matches_cpu_and_checks_page_divisibility() {
         (DType::BF16, "paged-sdpa.steel-half-256", 16),
     ] {
         for queries in [7, 33] {
-            let expected = wide_prefill(&cpu, dtype, queries, None, 64).unwrap();
-            let actual = wide_prefill(&metal, dtype, queries, Some(variant), 64).unwrap();
+            let expected = wide_attention(&cpu, dtype, (33, queries), None, 64).unwrap();
+            let actual = wide_attention(&metal, dtype, (33, queries), Some(variant), 64).unwrap();
             assert!(
                 forja_testing::normwise_relative_error(&expected, &actual)
                     <= forja_testing::dtype_tolerance(dtype).unwrap()
             );
         }
-        assert!(wide_prefill(&metal, dtype, 7, Some(variant), tile / 2).is_err());
-        assert!(wide_prefill(&metal, dtype, 1, Some(variant), 64).is_err());
+        assert!(wide_attention(&metal, dtype, (33, 7), Some(variant), tile / 2).is_err());
+        assert!(wide_attention(&metal, dtype, (33, 1), Some(variant), 64).is_err());
+    }
+}
+
+#[test]
+fn metal_paged_decode_256_matches_cpu_and_gates_poisoned_lanes() {
+    let cpu = forja_cpu::CpuBackend::new();
+    let metal = forja_metal::MetalBackend::new().unwrap();
+    let variant = "paged-sdpa.vector-256-two-pass";
+    for dtype in [DType::F32, DType::F16, DType::BF16] {
+        for length in [1, 7, 33, 4097] {
+            let expected = wide_attention(&cpu, dtype, (length, 1), None, 64).unwrap();
+            let actual = wide_attention(&metal, dtype, (length, 1), Some(variant), 64).unwrap();
+            assert!(
+                forja_testing::normwise_relative_error(&expected, &actual)
+                    <= forja_testing::dtype_tolerance(dtype).unwrap()
+            );
+        }
+        for active in [false, true] {
+            let result = run_sdpa_with_page_tokens::<_, 256>(
+                &metal,
+                dtype,
+                33,
+                1,
+                true,
+                false,
+                24,
+                4,
+                (0, 0),
+                &[0],
+                Some(variant),
+                None,
+                64,
+                active,
+            );
+            if active {
+                assert!(result.is_err());
+            } else {
+                assert!(result.unwrap().iter().all(|&x| x == 0.0));
+            }
+        }
     }
 }

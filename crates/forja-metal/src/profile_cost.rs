@@ -22,7 +22,7 @@ pub(crate) fn internal(
             width.checked_add(2)?,
             4,
         ])?;
-        if kernel == "paged_sdpa_2pass_2_128" {
+        if matches!(kernel, "paged_sdpa_2pass_2_128" | "paged_sdpa_2pass_2_256") {
             return Some(KernelCost {
                 read_bytes: partials,
                 write_bytes: cost.write_bytes,

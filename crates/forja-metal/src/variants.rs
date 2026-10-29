@@ -80,6 +80,7 @@ pub(crate) enum MetalVariant {
     PagedSdpaSteelHalf64x16,
     PagedSdpaSteel256,
     PagedSdpaSteelHalf256,
+    PagedSdpaWideTwoPass,
     TopKPortable,
     TopKSingleK8,
     TopKPartials,
@@ -760,6 +761,12 @@ const PAGED_STEEL_HALF_256: &[Constraint] = &[
     operation(OperationValue::PageTokens, Relation::MultipleOf(16)),
     SDPA_STEEL_HALF[3],
     SDPA_STEEL_HALF[4],
+];
+
+const PAGED_WIDE_TWO_PASS: &[Constraint] = &[
+    value(QUERY_LENGTH, Relation::Equal(1)),
+    value(PAGED_KEY_WIDTH, Relation::Equal(256)),
+    PAGED_GQA_TWO_PASS[2],
 ];
 
 macro_rules! variant {
@@ -1458,6 +1465,15 @@ pub(crate) static REGISTRY: &[VariantDef<MetalVariant>] = &[
         &["reduced-cache paged head-width-256 prefill."],
         &["f32 caches or pages not divisible by 16."],
         &["Authenticates 16-token key tiles and uses 32-query half MMA tiles."]
+    ),
+    batch_invariant_variant!(
+        "paged-sdpa.vector-256-two-pass",
+        PagedSdpa,
+        PagedSdpaWideTwoPass,
+        PAGED_WIDE_TWO_PASS,
+        &["head-width-256 decode at any integral grouped-query ratio."],
+        &["multi-token queries."],
+        &["One query head per threadgroup and 32 ordered reduction blocks."]
     ),
 ];
 
@@ -2196,6 +2212,7 @@ mod tests {
                 "sdpa.steel-half-256",
                 "paged-sdpa.steel-256",
                 "paged-sdpa.steel-half-256",
+                "paged-sdpa.vector-256-two-pass",
             ]
         );
     }
