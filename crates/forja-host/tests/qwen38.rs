@@ -222,6 +222,10 @@ fn eager_engine_feedback_matches_explicit_tokens() -> Result<(), Box<dyn Error>>
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
+#[path = "qwen38/metal.rs"]
+mod metal;
+
 #[test]
 fn invalid_spans_refuse_cleanly_and_execution_failure_requires_reload() -> Result<(), Box<dyn Error>>
 {
