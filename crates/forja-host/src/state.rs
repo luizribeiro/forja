@@ -1,9 +1,11 @@
 //! Opaque state storage charged to the runner's allocation budget.
 
+mod record;
+pub use record::StateRecording;
 #[cfg(test)]
 mod quota_tests;
 
-use crate::{Host, compute, guest_error, invalid_handle, quota};
+use crate::{Host, Limits, compute, guest_error, invalid_handle, quota};
 use forja_core::{Backend, Layout, PagePoolError, StateLayout, StatePool, StateSequence, Tensor};
 use std::sync::{
     Arc,
@@ -42,6 +44,7 @@ pub struct StateStorage<B: Backend> {
     planes: Vec<Tensor>,
     charge: StateCharge,
     limit: u64,
+    limits: Limits,
 }
 
 impl<B: Backend + 'static> Host<B> {
@@ -95,6 +98,7 @@ impl<B: Backend + 'static> Host<B> {
             planes: Vec::new(),
             charge,
             limit: self.limits.live_bytes,
+            limits: self.limits,
         };
         for plane in storage.pool.layout().planes() {
             let elements = u32::try_from(plane.elements())

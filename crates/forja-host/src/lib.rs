@@ -9,7 +9,7 @@ pub use prompt::PromptChunking;
 mod fuzz_tests;
 mod native;
 mod state;
-pub use state::StateStorage;
+pub use state::{StateRecording, StateStorage};
 mod weights;
 
 use std::time::{Duration, Instant};
