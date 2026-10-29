@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "model": {
+    "directory": "qwen38",
+    "file": "model.safetensors",
+    "sha256": "0408401d42e060d45356f745dc933ac045be0514d8fb0456142b6fb769d87f3b"
+  },
+  "libraries": {
+    "python": "3.12.12",
+    "safetensors": "0.8.0",
+    "torch": "2.8.0",
+    "transformers": "5.17.0"
+  },
+  "generation": {
+    "attention": "eager",
+    "device": "cpu",
+    "dtype": "float32",
+    "generated_tokens": 32,
+    "seed": 20250927,
+    "tokenization": "raw text, add_special_tokens=False"
+  },
+  "tensors": {},
+  "prompts": [
+    {
+      "name": "tiny",
+      "text": "fixed ids 1,7,32",
+      "file": "reference.safetensors",
+      "sha256": "ba1dfccc084427cb923071317e09c0531842b6103796cf9a538d824a0e6c25d7",
+      "prompt_tokens": 3
+    }
+  ]
+}

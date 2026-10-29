@@ -1,0 +1,14 @@
+{
+  "libraries": {
+    "python": "3.12.12",
+    "safetensors": "0.8.0",
+    "torch": "2.8.0",
+    "transformers": "5.17.0"
+  },
+  "source_sha256": "ae01454bf9d9756cd7fac32a6cfcc10ff1b1feecc3648a8570585f2d301afe2f",
+  "reference_source_sha256": "a2244d0c9d96c327d11e222dc047c8793971c5af9b88ffcaac315db615fb1b8d",
+  "weights_sha256": "0408401d42e060d45356f745dc933ac045be0514d8fb0456142b6fb769d87f3b",
+  "reference_sha256": "ba1dfccc084427cb923071317e09c0531842b6103796cf9a538d824a0e6c25d7",
+  "seed": 243,
+  "device": "cpu"
+}
