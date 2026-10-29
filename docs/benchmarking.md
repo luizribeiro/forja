@@ -1,24 +1,39 @@
-# Benchmarking
+# Benchmarking and optimization
 
-Run commands inside `nix develop`. Keep frozen binaries, components, configurations,
-model/token hashes, raw records and logs outside `target/`. Serialize GPU work.
-Correctness and serving exactness remain required independently of timing selection.
+Run commands inside `nix develop`. Preserve frozen binaries, components,
+configurations, model/token hashes, raw records and logs outside `target/`.
+Serialize GPU workloads. Correctness and serving exactness are required
+independently of which timing rows are selected.
 
-## Classic and accelerated modes
+## Choose a measurement mode
 
-Native `forja bench` uses fixed repetitions. The explicit classic spelling is:
+Use the **default fast gate** for a reviewed candidate against frozen baseline
+artifacts. It uses sequential stopping, automatic affected-row selection with
+five-block drift checks on unaffected rows, a matching competitor cache, and
+acceptance from the saved candidate record. Missing noise history collects all
+30 blocks and reports `history-collected`; the cap is inconclusive, never PASS.
+
+Use the **exhaustive fixed-repetition gate** for an audit, a fresh baseline, or a
+suspected dependency/cache issue. `--reps N --no-early-stop` fixes repetitions,
+`--all-rows` selects every row in the requested group, and `--fresh-competitor`
+remeasures the competitor. `forja bench --accept --remeasure` also remeasures
+instead of adopting a saved record. These controls are independent; use all of
+them for the complete exhaustive workflow. Long-context work remains separate.
+
+Native `forja bench` itself uses fixed repetitions; sequential decisions belong
+to `support/bench_gate.py`. Every native record includes `measurement_mode`;
+gate plans/reports preserve sampling, row-selection, process, cache and acceptance
+modes and explicit fallback reasons. Cached competitor records retain their age
+and original provenance. An adopted record retains `remeasured:false` and its
+adoption hash. Inspect these fields before comparing results.
 
 ```console
-forja bench --engine /path/engine.wasm --model /path/model --reps 30 --no-early-stop --json record.json
+forja bench --engine /path/engine.wasm --model /path/model --reps 30 --no-early-stop --raw-samples --json record.json
+python3 support/bench_gate.py plan.json --out /path/evidence/fast
+python3 support/bench_gate.py plan.json --out /path/evidence/exhaustive --reps 30 --no-early-stop --all-rows --fresh-competitor --process-per-leg
 ```
 
-The existing result payload, configuration hashes and rep counts are retained.
-`measurement_mode` adds provenance; `--raw-samples` optionally adds every measured
-rep's wall/GPU times and measurement window. Warmups are excluded from samples.
-
-`support/bench_gate.py` provides accelerated gates. Each acceleration has an explicit fallback:
-
-| Control | Accelerated behavior | Explicit classic behavior |
+| Control | Default fast gate | Exhaustive controls |
 | --- | --- | --- |
 | Execution | Fresh native A/B pair retained for each block | `--process-per-leg` |
 | Sampling | Randomized sequential blocks, cap 30 reps/leg | `--no-early-stop --reps 30` |
@@ -26,10 +41,6 @@ rep's wall/GPU times and measurement window. Warmups are excluded from samples.
 | Competitor | Reuse matching, fresh records with periodic probes | `--fresh-competitor` |
 | Acceptance | `--accept --accept-from candidate.json` | `--accept --remeasure` |
 
-```console
-python3 support/bench_gate.py plan.json --out /path/evidence/accelerated
-python3 support/bench_gate.py plan.json --out /path/evidence/classic --no-early-stop --reps 30 --all-rows --fresh-competitor --process-per-leg
-```
 
 `--plan-only` writes the frozen plan, selection and modes without measuring.
 Output directories must be new. A failed command stops execution. Fixed mode
@@ -38,7 +49,7 @@ invent a pooled interval or a sequential PASS.
 
 Native commands include batch sizes declared by their benchmark suite even when a
 consumer reads only prefill/decode results. Use `--batch-measurements omit` explicitly
-when no selected row consumes those batch cases; `include` is the classic default.
+when no selected row consumes those batch cases; `include` is the fixed-repetition default.
 Omitted coverage appears in mode/result metadata and changes performance hashes.
 Such partial records cannot become accepted full-profile baselines. Use a complete
 record or `--accept --accept-from partial.json --remeasure` to measure full coverage.
@@ -277,3 +288,81 @@ start at zero. Paged attention accepts explicit noncontiguous page tables and
 generation arrays. Core operation/catalog constraints and allocation quotas apply.
 Records say `kernel-diagnostic` and `model_benchmark:false`; use them for screens,
 never as model benchmarks or accepted model baselines.
+
+## Choose the next optimization
+
+Use `forja calibrate` once per device/OS identity. Its cache includes GPU family,
+core count, memory and OS build. `--force` refreshes it; `--json calibration.json`
+saves raw observations, median confidence intervals and build/load provenance.
+Streaming traffic, supported MMA arithmetic, threadgroup reads and dependent
+copies are microbenchmarks, not model benchmarks. MMA configurations are screened
+with independent accumulator counts, then confirmed with separate observations.
+BF16 compiler refusal is labelled as f32 promotion rather than native BF16.
+
+Record the actual engine component and full model with a costed profile:
+
+```console
+forja profile --engine /path/engine.wasm --model /path/model --mode prefill --context 16384 --json --set 'paths.scratch="/path/evidence/pp16k"'
+forja analyze --profile /path/evidence/pp16k/profile.json --calibration calibration.json --json analysis.json
+```
+
+Use `--mode decode --context 8192` for a decode step with populated KV. Prefill
+records retain every chunk, so an early chunk cannot stand in for the full run.
+Omit `--calibration` to reuse or create the matching device cache. Identity/schema
+mismatches are errors; profiles made by older binaries need recording again.
+
+Start with the ranked call sites, grouped across layers/chunks. The report names
+the selected variant, constraints-compatible alternatives, resource bound and
+recoverable GPU time at the ceiling and at `--target 0.8` (the default). JSON also
+contains individual dispatches, composite kernels, per-kernel totals, phase bounds
+and layer-type efficiency. A composite's internal kernels replace its outer time
+in kernel totals, so they are counted once. Candidate intersections satisfy every
+instance in a group. Copy a candidate and representative validated shape into
+`forja bench-kernel VARIANT --shape shape.json --json screen.json`; confirm any
+promising change with a full model `forja bench` record before adopting it.
+
+Interpret these as diagnostics. Precise timestamps perturb execution; the report
+shows that ratio and scales attribution to an unprofiled GPU control. Per-kernel
+perturbation remains unknown. Step shares use unprofiled wall time; host overhead
+is therefore visible as unassigned time. Traffic counts logical operands, not
+hardware DRAM transactions. Routed expert reuse produces a footprint interval;
+proven unique routes tighten it. Padding/tile FLOPs are separate from logical
+matrix FLOPs. Scalar/SFU/integer throughput has no calibrated ceiling.
+
+Decode's model bound streams touched matrix weights plus KV once. Prefill uses
+aggregate memory/compute rooflines. Both include the physical dispatch-count floor;
+per-dispatch bounds additionally constrain serial execution. These optimistic
+bounds omit scalar limitations and cache/occupancy effects. Efficiency above 100%
+or a dispatch below its floor signals a probe/model/timestamp mismatch to
+investigate, not negative recoverable time. Threadgroup bandwidth is recorded for
+kernel investigation but is not used as a logical global-memory ceiling.
+
+A `[! >100%]` marker identifies a displayed percentage above 100%.
+`[! outside calibration CI]` identifies an interval shorter than the optimistic
+calibrated bound. A median-only bound warning stays visible within the calibration
+interval. Model and layer-type flags use the GPU time displayed in their row;
+resource-rate flags use raw profiled GPU intervals. Group markers retain flagged
+individual intervals. Bound envelopes combine per-probe CI endpoints and do not
+form a joint 95% interval.
+
+Split routed projections each read their activation inputs. Sub-kernel traffic
+intentionally counts those reads per projection; model bounds use the enclosing
+logical cost. Shape-only minimum footprints assume distinct routes per row.
+Profiles prove that guarantee from top-k producers and weaken unproved bounds.
+
+## Reproduce the SmolLM2 records
+
+Download and build as in the [quickstart](../README.md), then run a complete suite:
+
+```sh
+forja -c bench/suites/default.toml --set 'bench.selection=["gpu-pipelined"]' bench --engine smollm2-135m-instruct.metal-apple-m3-ultra.f32 --raw-samples --json /absolute/path/forja.json
+uv run --locked --project support/bench-mlx support/bench-mlx/bench.py --model-dir "$FORJA_MODELS/SmolLM2-135M-Instruct" --suite bench/suites/default.toml --json /absolute/path/mlx.json
+python3 support/bench-mlx/compare.py /absolute/path/forja.json /absolute/path/mlx.json
+```
+
+Use the same suite and token generator, and compare the matching pipelined row.
+The MLX driver records effective settings and validates the loaded precision.
+SmolLM2's Forja profiles use f32-promoted weights, whereas this MLX baseline uses
+native bf16: label that precision difference instead of calling it a matched
+precision comparison. The [worked example](../engines/smollm2/README.md) links the
+actual records and explains each measured optimization.
