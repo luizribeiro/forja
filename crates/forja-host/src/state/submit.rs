@@ -8,13 +8,14 @@ pub struct StateSubmission<B: Backend> {
     recording: StateRecording<B>,
     submission: B::Submission,
     drained: bool,
+    queue_position: u64,
 }
 
 impl<B: Backend> StateRecording<B> {
     /// Queues all plane updates in version order, retaining their private backing.
     ///
     /// # Errors
-    /// Refuses incomplete updates, stale capabilities or nonmonotonic submission serials.
+    /// Refuses incomplete updates, stale capabilities or exhausted queue positions.
     /// A backend submission failure invalidates the storage until reload.
     pub fn submit(
         mut self,
@@ -30,18 +31,16 @@ impl<B: Backend> StateRecording<B> {
         }
         let storage = std::sync::Arc::clone(&self.storage);
         let mut last = storage
-            .last_submission
+            .queue_position
             .lock()
             .map_err(|_| invalid_handle("state submission order is poisoned"))?;
-        if self.serial() <= *last {
-            return Err(invalid_handle(
-                "state submission serial must increase across sequences",
-            ));
-        }
+        let queue_position = last
+            .checked_add(1)
+            .ok_or_else(|| invalid_handle("state queue timeline is exhausted"))?;
         sequence
-            .mark_submitted(&self.transaction)
+            .mark_submitted_at(&self.transaction, queue_position)
             .map_err(pool_error)?;
-        *last = self.serial();
+        *last = queue_position;
         let commands = std::mem::take(&mut self.commands);
         let submission = storage
             .backend
@@ -54,6 +53,7 @@ impl<B: Backend> StateRecording<B> {
             recording: self,
             submission,
             drained: false,
+            queue_position,
         })
     }
 }
@@ -107,7 +107,7 @@ impl<B: Backend> StateSubmission<B> {
             self.recording
                 .storage
                 .pool
-                .observe_completion(self.recording.serial())
+                .observe_completion(self.queue_position)
                 .map_err(|_| BackendError::ExecutionFailed)?;
             self.drained = true;
         }

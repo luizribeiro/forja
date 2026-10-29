@@ -1,5 +1,7 @@
 //! Opaque state storage charged to the runner's allocation budget.
 
+#[cfg(test)]
+mod multiple_sequences;
 mod record;
 pub use record::StateRecording;
 #[cfg(test)]
@@ -40,6 +42,7 @@ impl Drop for StateCharge {
 }
 
 /// Host-owned state backing; callers receive sequence capabilities, never plane tensors.
+/// Sequence serials are independent; physical retirement uses positions assigned while queueing.
 pub struct StateStorage<B: Backend> {
     backend: Arc<B>,
     pool: StatePool,
@@ -47,7 +50,7 @@ pub struct StateStorage<B: Backend> {
     charge: StateCharge,
     limit: u64,
     limits: Limits,
-    last_submission: Mutex<u64>,
+    queue_position: Mutex<u64>,
     poisoned: AtomicBool,
 }
 
@@ -103,7 +106,7 @@ impl<B: Backend + 'static> Host<B> {
             charge,
             limit: self.limits.live_bytes,
             limits: self.limits,
-            last_submission: Mutex::new(0),
+            queue_position: Mutex::new(0),
             poisoned: AtomicBool::new(false),
         };
         for plane in storage.pool.layout().planes() {
