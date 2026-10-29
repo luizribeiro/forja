@@ -44,7 +44,7 @@ pub use paged_pool::{
 };
 pub use profile_scope::{ProfileScope, ProfileScopeError};
 pub use quantized::{QuantizedMatrix, QuantizedMatrixError, QuantizedMatrixPart};
-pub use state::{StateLayout, StatePlane};
+pub use state::{StateLayout, StatePlane, StatePool, StateSequence, StateTransaction};
 pub use symbolic::{
     Affine, ByteHull, MAX_PARAMS, ParamError, ParamSpace, ParamValues, SymbolicLayout,
     SymbolicLayoutError,
