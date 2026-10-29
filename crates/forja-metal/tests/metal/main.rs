@@ -26,6 +26,8 @@ mod queue_ordering;
 mod rounding;
 #[path = "../row_programs.rs"]
 mod row_programs;
+#[path = "../state.rs"]
+mod state;
 #[path = "../top_k.rs"]
 mod top_k;
 #[path = "../variant_dispatch.rs"]

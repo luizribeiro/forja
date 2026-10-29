@@ -58,6 +58,8 @@ fn shader_source() -> &'static str {
         "\n",
         include_str!("paged.metal"),
         "\n",
+        include_str!("state.metal"),
+        "\n",
         include_str!("calibration.metal")
     )
 }

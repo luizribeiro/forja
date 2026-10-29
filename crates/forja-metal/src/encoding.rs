@@ -1,3 +1,5 @@
+mod state;
+
 use std::{
     cell::{Cell, RefCell},
     collections::{HashMap, HashSet},
@@ -3297,7 +3299,12 @@ impl MetalBackend {
                 error_flags.push(EncodedErrorFlag::new(flag, dispatch_index, "quant-embed"));
                 buffers
             }
-            Op::State(_) => return Err(BackendError::UnsupportedOperation),
+            Op::State(_) => {
+                let (buffers, flag) =
+                    self.encode_state(encoder, table, dispatch, bindings, arguments)?;
+                error_flags.push(EncodedErrorFlag::new(flag, dispatch_index, "state"));
+                buffers
+            }
             Op::Copy => self.encode_copy(encoder, table, dispatch, bindings, arguments)?,
             Op::PagedCopy { .. } => {
                 let (buffers, flag) =
@@ -7654,7 +7661,11 @@ impl MetalBackend {
                     arguments.write(112)?;
                 }
             }
-            Op::State(_) => return Err(BackendError::UnsupportedOperation),
+            Op::State(_) => {
+                arguments.write(8 * 112)?;
+                arguments.write(7 * size_of::<u32>())?;
+                arguments.write(2 * size_of::<u32>())?;
+            }
             Op::Copy => Self::size_copy_arguments(arguments)?,
             Op::PagedCopy { .. } => {
                 arguments.write(7 * size_of::<u32>())?;
@@ -8243,7 +8254,7 @@ fn supported_dispatch(dispatch: &Dispatch) -> bool {
         return false;
     }
     match dispatch.op() {
-        Op::State(_) => false,
+        Op::State(op) => matches!(op, forja_core::StateOp::DeltaRule(_)),
         Op::Program(_) => dispatch.bound_program().is_some(),
         Op::Copy
         | Op::PagedCopy { .. }
@@ -8431,7 +8442,7 @@ pub(super) fn dispatch_kernel(dispatch: &Dispatch) -> Result<&'static str, Backe
                 "copy_strided"
             }
         }
-        Op::State(_) => "state-update",
+        Op::State(_) => "state_delta_rule",
         Op::PagedCopy { .. } => "paged_copy",
         Op::RmsNorm { .. } => "rms_norm",
         Op::Argmax { chunk_width } => {
@@ -10094,7 +10105,8 @@ fn function_constants(
 fn nan_preserving_kernel(name: &str) -> bool {
     matches!(
         name,
-        "softmax_single"
+        "state_delta_rule"
+            | "softmax_single"
             | "softmax_looped"
             | "argmax_partials"
             | "topk_single"
