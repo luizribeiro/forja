@@ -3,6 +3,7 @@
 #![cfg_attr(not(target_family = "wasm"), forbid(unsafe_code))]
 
 pub mod reference;
+pub mod variants;
 
 use forja_sdk::{
     Load,

@@ -86,3 +86,38 @@ fn tiny_weights() -> Result<PathBuf, Box<dyn Error>> {
     fs::write(&path, bytes)?;
     Ok(path)
 }
+
+fn optimized_load() -> EngineLoadConfig {
+    EngineLoadConfig {
+        max_context: Some(64),
+        tunings: vec!["optimized".to_owned()],
+        fixed_variant_picks: [
+            ("dense.decode", "matmul.gemv-transposed"),
+            ("dense.prefill", "matmul.steel-32x64x16-1x2"),
+            ("attention.decode", "sdpa.decomposed"),
+            ("attention.prefill", "sdpa.decomposed"),
+        ]
+        .map(|(site, name)| forja_sdk::FixedVariantPick {
+            site: site.to_owned(),
+            name: name.to_owned(),
+        })
+        .to_vec(),
+        ..EngineLoadConfig::default()
+    }
+}
+
+#[test]
+fn optimized_registry_requires_complete_known_selections() {
+    use smollm2::variants::Variants;
+    let load = optimized_load();
+    let picks = Variants::new(&load, 64).unwrap();
+    assert_eq!(picks.linear(1).unwrap().name(), "matmul.gemv-transposed");
+    assert_eq!(picks.linear(7).unwrap().name(), "matmul.steel-32x64x16-1x2");
+    assert!(picks.attention(33, 0, None).is_ok());
+    let mut missing = load.clone();
+    missing.fixed_variant_picks.pop();
+    assert!(Variants::new(&missing, 64).is_err());
+    let mut unknown = load;
+    unknown.tunings.push("unknown".to_owned());
+    assert!(Variants::new(&unknown, 64).is_err());
+}
