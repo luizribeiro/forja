@@ -14,6 +14,8 @@ use crate::matmul::{MatrixLayout, classify};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum MetalVariant {
+    DeltaRule,
+    CausalDepthwiseConv,
     MatmulPortable,
     MatmulGemv,
     MatmulGemvTransposed,
@@ -1367,6 +1369,29 @@ pub(crate) static REGISTRY: &[VariantDef<MetalVariant>] = &[
         &["small vocabularies where fixed parallel setup dominates."],
         &["Uses chunk partials and exact parallel selection."]
     ),
+    batch_invariant_variant!(
+        "delta-rule.simd",
+        DeltaRule,
+        DeltaRule,
+        &[value(
+            dim("key width", QUERY, Axis::Index(1)),
+            Relation::Range { min: 1, max: 256 }
+        )],
+        &["single-token recurrent updates with bounded key width."],
+        &["multi-token chunk transforms or key widths above 256."],
+        &[
+            "Fixed SIMD reductions and f32 out-of-place state; authentication precedes all state access."
+        ]
+    ),
+    batch_invariant_variant!(
+        "causal-depthwise-conv.direct",
+        CausalDepthwiseConv,
+        CausalDepthwiseConv,
+        &[],
+        &["causal depthwise convolution with retained raw input history."],
+        &["convolution without state."],
+        &["Accumulates taps in ascending order and authenticates the private output version."]
+    ),
 ];
 
 pub(crate) const fn portable_name(operation: OperationKind) -> Option<&'static str> {
@@ -1379,6 +1404,8 @@ pub(crate) const fn portable_name(operation: OperationKind) -> Option<&'static s
         OperationKind::TopK => Some("top-k.portable"),
         OperationKind::Sample => Some("sample.portable"),
         OperationKind::PagedSdpaAppend => Some("paged-sdpa-append.vector-gqa-two-pass-32"),
+        OperationKind::DeltaRule => Some("delta-rule.simd"),
+        OperationKind::CausalDepthwiseConv => Some("causal-depthwise-conv.direct"),
         OperationKind::Other => None,
     }
 }
@@ -1393,6 +1420,8 @@ pub(crate) const fn portable_implementation(operation: OperationKind) -> Option<
         OperationKind::TopK => Some(MetalVariant::TopKPortable),
         OperationKind::Sample => Some(MetalVariant::SamplePortable),
         OperationKind::PagedSdpaAppend => Some(MetalVariant::PagedSdpaAppendGqa32),
+        OperationKind::DeltaRule => Some(MetalVariant::DeltaRule),
+        OperationKind::CausalDepthwiseConv => Some(MetalVariant::CausalDepthwiseConv),
         OperationKind::Other => None,
     }
 }
@@ -2090,8 +2119,65 @@ mod tests {
                 "top-k.partials",
                 "sample.portable",
                 "sample.parallel",
+                "delta-rule.simd",
+                "causal-depthwise-conv.direct",
             ]
         );
+    }
+
+    #[test]
+    fn recurrent_catalog_refuses_key_widths_beyond_its_register_capacity() {
+        use forja_core::{OperationKind, StateOp};
+        let cpu = CpuBackend::new();
+        let access = forja_testing::state_test_metadata().unwrap().0;
+        for keys in [1, 7, 33, 128, 256, 257] {
+            let shapes: &[&[u32]] = &[
+                &[1, keys],
+                &[1, keys],
+                &[3, 7],
+                &[3],
+                &[3],
+                &[3, keys, 7],
+                &[2, 2],
+                &[3],
+                &[1],
+            ];
+            let inputs = shapes
+                .iter()
+                .enumerate()
+                .map(|(i, s)| {
+                    cpu.alloc(if i < 6 { DType::F32 } else { DType::U32 }, s)
+                        .unwrap()
+                })
+                .collect::<Vec<_>>();
+            let y = cpu.alloc(DType::F32, &[3, 7]).unwrap();
+            let state = cpu.alloc(DType::F32, &[3, keys, 7]).unwrap();
+            let mut commands = CommandList::new();
+            commands
+                .dispatch_many(
+                    Op::State(StateOp::DeltaRule(access)),
+                    &inputs.iter().collect::<Vec<_>>(),
+                    &[&y, &state],
+                )
+                .unwrap();
+            let result = resolve(commands.last_dispatch().unwrap(), "delta-rule.simd", METAL4);
+            assert_eq!(result.is_ok(), keys <= 256);
+            assert!(
+                resolve(
+                    commands.last_dispatch().unwrap(),
+                    "causal-depthwise-conv.direct",
+                    METAL4
+                )
+                .is_err()
+            );
+        }
+        for kind in [OperationKind::DeltaRule, OperationKind::CausalDepthwiseConv] {
+            let name = portable_name(kind).unwrap();
+            let (_, definition) = definition(kind, name, METAL4).unwrap();
+            assert!(definition.batch_invariant);
+            assert_eq!(definition.reduction_class, Some(name));
+            assert_eq!(definition.cost.tile, [0; 3]);
+        }
     }
 
     #[test]

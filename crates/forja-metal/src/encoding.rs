@@ -8956,7 +8956,9 @@ pub(super) fn variant_supported(
             .ok_or(BackendError::InvalidInput)
     };
     Ok(match variant {
-        MetalVariant::MatmulPortable
+        MetalVariant::DeltaRule
+        | MetalVariant::CausalDepthwiseConv
+        | MetalVariant::MatmulPortable
         | MetalVariant::QuantMatmulPortable
         | MetalVariant::GatherQuantMatmulPortable
         | MetalVariant::SdpaPortable

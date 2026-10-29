@@ -5,6 +5,10 @@ use crate::{DType, Op};
 /// A portable operation family that may have backend algorithm variants.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum OperationKind {
+    /// Gated delta-rule recurrent update.
+    DeltaRule,
+    /// Causal depthwise convolution with retained history.
+    CausalDepthwiseConv,
     /// Dense matrix multiplication.
     Matmul,
     /// Affine-quantized matrix multiplication.
@@ -30,6 +34,8 @@ impl OperationKind {
     #[must_use]
     pub const fn of(op: Op) -> Self {
         match op {
+            Op::State(crate::StateOp::DeltaRule(_)) => Self::DeltaRule,
+            Op::State(crate::StateOp::CausalDepthwiseConv(_)) => Self::CausalDepthwiseConv,
             Op::Matmul => Self::Matmul,
             Op::QuantMatmul { .. } => Self::QuantMatmul,
             Op::GatherQuantMatmul { .. } => Self::GatherQuantMatmul,
@@ -46,6 +52,8 @@ impl OperationKind {
 impl fmt::Display for OperationKind {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
+            Self::DeltaRule => "delta-rule",
+            Self::CausalDepthwiseConv => "causal-depthwise-conv",
             Self::Matmul => "matmul",
             Self::QuantMatmul => "quant-matmul",
             Self::GatherQuantMatmul => "gather-quant-matmul",
