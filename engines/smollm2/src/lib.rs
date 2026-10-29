@@ -203,7 +203,16 @@ impl SmolLM2 {
     pub fn with_config(
         weights: &forja_sdk::Weights<'_>,
         load: &forja_sdk::EngineLoadConfig,
+        config: Config,
+    ) -> forja_sdk::Result<Self> {
+        Self::with_pool(weights, load, config, None)
+    }
+
+    fn with_pool(
+        weights: &forja_sdk::Weights<'_>,
+        load: &forja_sdk::EngineLoadConfig,
         mut config: Config,
+        pool: Option<forja_sdk::PagedPool<'_>>,
     ) -> forja_sdk::Result<Self> {
         config.validate()?;
         let context = load
@@ -218,8 +227,15 @@ impl SmolLM2 {
         }
         forja_sdk::EngineTunings::new(load, variants::TUNINGS)?;
         let path = if load.tunings.iter().any(|name| name == "optimized") {
-            Execution::Optimized(optimized::Optimized::load(weights, config, context, load)?)
+            Execution::Optimized(optimized::Optimized::load(
+                weights, config, context, load, pool,
+            )?)
         } else {
+            if pool.is_some() {
+                return Err(forja_sdk::Error::loading(
+                    "reference execution requires a contiguous cache",
+                ));
+            }
             Execution::Reference(reference::Reference::load(weights, config, context)?)
         };
         Ok(Self {
@@ -239,7 +255,22 @@ impl forja_sdk::Engine for SmolLM2 {
             max_context: 8_192,
             tap_layers: (1..=30).collect(),
             router_layers: Vec::new(),
-            serving: None,
+            serving: Some(forja_sdk::ServingInfo {
+                page_tokens: 64,
+                active_lanes: 1,
+                max_context: 8_192,
+                prefill_chunk_multiple: None,
+                batch_shapes: Vec::new(),
+                planes: (0..30)
+                    .flat_map(|layer| {
+                        ["key", "value"].map(move |kind| forja_sdk::CachePlane {
+                            elements_per_token: 192,
+                            alignment: 256,
+                            label: format!("layer-{layer}-{kind}"),
+                        })
+                    })
+                    .collect(),
+            }),
         }
     }
 
@@ -248,6 +279,14 @@ impl forja_sdk::Engine for SmolLM2 {
         config: forja_sdk::EngineLoadConfig,
     ) -> forja_sdk::Result<Self> {
         Self::with_config(weights, &config, Config::smollm2())
+    }
+
+    fn load_paged(
+        weights: &forja_sdk::Weights<'_>,
+        pool: Option<forja_sdk::PagedPool<'_>>,
+        config: forja_sdk::EngineLoadConfig,
+    ) -> forja_sdk::Result<Self> {
+        Self::with_pool(weights, &config, Config::smollm2(), pool)
     }
 
     fn step(&mut self, input: forja_sdk::StepInput) -> forja_sdk::Result<forja_sdk::StepOutput> {

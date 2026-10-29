@@ -44,6 +44,8 @@ impl Variants {
                 "dense.prefill",
                 "attention.decode",
                 "attention.prefill",
+                "paged-attention.decode",
+                "paged-attention.prefill",
             ],
             context,
         )?))
@@ -73,11 +75,13 @@ impl Variants {
         sequence: u32,
         start: u32,
         parameter: Option<&Param>,
+        paged: bool,
     ) -> Result<VariantSelection> {
-        let site = if sequence == 1 {
-            "attention.decode"
-        } else {
-            "attention.prefill"
+        let site = match (paged, sequence) {
+            (true, 1) => "paged-attention.decode",
+            (true, _) => "paged-attention.prefill",
+            (false, 1) => "attention.decode",
+            (false, _) => "attention.prefill",
         };
         parameter.map_or_else(
             || Ok(VariantSelection::Fixed(self.0.at(site, start)?)),

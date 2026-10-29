@@ -4,7 +4,8 @@
 
 use crate::{Config, ModelWeights};
 use forja_sdk::{
-    DType, Dim, EngineLoadConfig, Load, Param, Result, StepOutput, Tensor, Weights,
+    DType, Dim, EngineLoadConfig, Load, PagedCacheSet, PagedPool, Param, Result, StepOutput,
+    Tensor, Weights,
     kernel::{Epilogue, Kernel, TensorRef},
     nn::blocks::{KvCache, cached_attention_with, residual_norm, residual_norm_kernel},
 };
@@ -13,11 +14,16 @@ pub(crate) struct Optimized {
     weights: ModelWeights,
     config: Config,
     variants: crate::variants::Variants,
-    caches: Vec<KvCache<f32>>,
+    caches: Caches,
     positions: Tensor<u32>,
     fused: bool,
     gate_up: Epilogue,
     residual_norm: Kernel,
+}
+
+enum Caches {
+    Contiguous(Vec<KvCache<f32>>),
+    Paged(PagedCacheSet),
 }
 
 impl Optimized {
@@ -26,10 +32,22 @@ impl Optimized {
         config: Config,
         context: u32,
         load: &EngineLoadConfig,
+        pool: Option<PagedPool<'_>>,
     ) -> Result<Self> {
-        let caches = (0..config.layers)
-            .map(|_| KvCache::new(config.kv_heads, context, config.head_dim, 0.0))
-            .collect::<Result<_>>()?;
+        let caches = if let Some(pool) = pool {
+            Caches::Paged(
+                pool.cache_set(
+                    u32::try_from(config.layers)
+                        .map_err(|_| forja_sdk::Error::loading("layer count exceeds u32"))?,
+                )?,
+            )
+        } else {
+            Caches::Contiguous(
+                (0..config.layers)
+                    .map(|_| KvCache::new(config.kv_heads, context, config.head_dim, 0.0))
+                    .collect::<Result<_>>()?,
+            )
+        };
         Ok(Self {
             weights: ModelWeights::load(weights, &config)?,
             config,
@@ -73,7 +91,12 @@ impl Optimized {
         taps_enabled: bool,
     ) -> Result<StepOutput> {
         let c = self.config;
-        let pick = self.variants.attention(sequence, pick_start, parameter)?;
+        let pick = self.variants.attention(
+            sequence,
+            pick_start,
+            parameter,
+            matches!(self.caches, Caches::Paged(_)),
+        )?;
         let positions = self.positions.narrow(0, start, sequence)?;
         forja_sdk::profile_scope("embedding", "global", None)?;
         let mut hidden = self.weights.model.embed_tokens.forward(tokens)?;
@@ -106,16 +129,26 @@ impl Optimized {
             let value = self
                 .linear(&a.v_proj, &normalized)?
                 .reshape(&[sequence, c.kv_heads, c.head_dim])?;
-            let attended = cached_attention_with(
-                &query,
-                &key,
-                &value,
-                &mut self.caches[index],
-                c.attention_scale(),
-                start,
-                end,
-                pick.choice(),
-            )?;
+            let attended = match &mut self.caches {
+                Caches::Contiguous(caches) => cached_attention_with(
+                    &query,
+                    &key,
+                    &value,
+                    &mut caches[index],
+                    c.attention_scale(),
+                    start,
+                    end,
+                    pick.choice(),
+                )?,
+                Caches::Paged(caches) => {
+                    let cache = caches.layer(
+                        u32::try_from(index)
+                            .map_err(|_| forja_sdk::Error::loading("cache index exceeds u32"))?,
+                    )?;
+                    cache.append(&key, &value, start)?;
+                    cache.attention(&query, c.attention_scale(), start, end, pick.choice())?
+                }
+            };
             let update = self.linear(&a.o_proj, &attended)?;
             let (residual, mlp_input) =
                 self.add_norm(&hidden, &update, &layer.post_attention_layernorm)?;

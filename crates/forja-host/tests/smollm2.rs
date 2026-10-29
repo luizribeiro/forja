@@ -96,6 +96,8 @@ fn optimized_load() -> EngineLoadConfig {
             ("dense.prefill", "matmul.steel-32x64x16-1x2"),
             ("attention.decode", "sdpa.decomposed"),
             ("attention.prefill", "sdpa.decomposed"),
+            ("paged-attention.decode", "paged-sdpa.vector"),
+            ("paged-attention.prefill", "paged-sdpa.steel"),
         ]
         .map(|(site, name)| forja_sdk::FixedVariantPick {
             site: site.to_owned(),
@@ -113,7 +115,7 @@ fn optimized_registry_requires_complete_known_selections() {
     let picks = Variants::new(&load, 64).unwrap();
     assert_eq!(picks.linear(1).unwrap().name(), "matmul.gemv-transposed");
     assert_eq!(picks.linear(7).unwrap().name(), "matmul.steel-32x64x16-1x2");
-    assert!(picks.attention(33, 0, None).is_ok());
+    assert!(picks.attention(33, 0, None, false).is_ok());
     let mut missing = load.clone();
     missing.fixed_variant_picks.pop();
     assert!(Variants::new(&missing, 64).is_err());
@@ -166,4 +168,13 @@ fn metal_tiny_fused_epilogues_match_reference() -> Result<(), Box<dyn Error>> {
     let mut load = optimized_load();
     load.tunings.push("fused-epilogues".to_owned());
     compare_paths(&load)
+}
+
+#[test]
+fn serving_metadata_preserves_fixed_prompt_boundaries() {
+    let info = SmolLM2::describe().serving.unwrap();
+    assert_eq!(info.page_tokens, 64);
+    assert_eq!(info.planes.len(), 60);
+    assert_eq!(info.planes[0].elements_per_token, 192);
+    assert_eq!(info.prefill_chunk_multiple, None);
 }
