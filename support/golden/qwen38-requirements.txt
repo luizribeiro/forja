@@ -1,0 +1,5 @@
+# CPU reference environment; architecture code is local Transformers, without remote code.
+torch==2.8.0
+transformers==5.17.0
+safetensors==0.8.0
+tokenizers==0.23.3
