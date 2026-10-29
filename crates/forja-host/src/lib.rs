@@ -2908,6 +2908,27 @@ impl Grants {
 }
 
 impl Limits {
+    fn check_tensor_shape(&self, shape: &[u32]) -> Result<u64, compute::Error> {
+        if shape.len() > self.tensor_rank {
+            return Err(quota("tensor rank exceeds the guest limit"));
+        }
+        let elements = shape
+            .iter()
+            .try_fold(1_u64, |count, &extent| count.checked_mul(u64::from(extent)));
+        let Some(elements) = elements else {
+            return Err(quota("tensor element count exceeds the guest limit"));
+        };
+        if elements == 0 {
+            return Err(compute::Error::Layout(
+                "tensor must contain at least one element".to_owned(),
+            ));
+        }
+        if elements > self.tensor_elements {
+            return Err(quota("tensor element count exceeds the guest limit"));
+        }
+        Ok(elements)
+    }
+
     fn set_time_limits(
         &mut self,
         guest_call_timeout: Duration,
@@ -6188,24 +6209,7 @@ impl<B: Backend + 'static> Host<B> {
     }
 
     fn check_tensor_shape(&self, shape: &[u32]) -> Result<u64, compute::Error> {
-        if shape.len() > self.limits.tensor_rank {
-            return Err(quota("tensor rank exceeds the guest limit"));
-        }
-        let elements = shape
-            .iter()
-            .try_fold(1_u64, |count, &extent| count.checked_mul(u64::from(extent)));
-        let Some(elements) = elements else {
-            return Err(quota("tensor element count exceeds the guest limit"));
-        };
-        if elements == 0 {
-            return Err(compute::Error::Layout(
-                "tensor must contain at least one element".to_owned(),
-            ));
-        }
-        if elements > self.limits.tensor_elements {
-            return Err(quota("tensor element count exceeds the guest limit"));
-        }
-        Ok(elements)
+        self.limits.check_tensor_shape(shape)
     }
 
     fn check_handle_quota(&self) -> Result<(), compute::Error> {

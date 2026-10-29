@@ -68,17 +68,35 @@ impl<B: Backend + 'static> Host<B> {
         layout: StateLayout,
         sequences: u32,
     ) -> Result<Arc<StateStorage<B>>, compute::Error> {
+        StateStorage::create(
+            Arc::clone(&self.backend),
+            self.limits,
+            Arc::clone(&self.live_bytes),
+            layout,
+            sequences,
+        )
+    }
+}
+
+impl<B: Backend> StateStorage<B> {
+    pub(crate) fn create(
+        backend: Arc<B>,
+        limits: Limits,
+        live_bytes: Arc<AtomicU64>,
+        layout: StateLayout,
+        sequences: u32,
+    ) -> Result<Arc<Self>, compute::Error> {
         let records = sequences
             .checked_mul(3)
             .ok_or_else(|| quota("state record count overflow"))?;
-        if usize::try_from(records).map_or(true, |count| count > self.limits.table_elements) {
+        if usize::try_from(records).map_or(true, |count| count > limits.table_elements) {
             return Err(quota("state records exceed the table limit"));
         }
         for plane in layout.planes() {
-            self.check_tensor_shape(plane.shape())?;
+            limits.check_tensor_shape(plane.shape())?;
             let elements = u32::try_from(plane.elements())
                 .map_err(|_| quota("state plane exceeds the tensor limit"))?;
-            self.check_tensor_shape(&[records, elements])?;
+            limits.check_tensor_shape(&[records, elements])?;
         }
         let descriptor_bytes = u64::try_from(
             size_of::<forja_core::StatePlane>()
@@ -100,16 +118,15 @@ impl<B: Backend + 'static> Host<B> {
             .and_then(|n| n.checked_add(u64::from(sequences) * SEQUENCE_METADATA_RESERVE))
             .and_then(|n| n.checked_add(descriptor_bytes))
             .ok_or_else(|| quota("state byte count overflow"))?;
-        let charge =
-            StateCharge::reserve(Arc::clone(&self.live_bytes), self.limits.live_bytes, bytes)?;
+        let charge = StateCharge::reserve(live_bytes, limits.live_bytes, bytes)?;
         let pool = StatePool::new(layout, sequences, bytes).map_err(pool_error)?;
         let mut storage = StateStorage {
-            backend: Arc::clone(&self.backend),
+            backend,
             pool,
             planes: Vec::new(),
             charge,
-            limit: self.limits.live_bytes,
-            limits: self.limits,
+            limit: limits.live_bytes,
+            limits,
             queue_position: Mutex::new(0),
             poisoned: AtomicBool::new(false),
         };
