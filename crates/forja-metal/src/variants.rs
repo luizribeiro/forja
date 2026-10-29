@@ -57,6 +57,8 @@ pub(crate) enum MetalVariant {
     SdpaVectorGqaTwoPass256,
     SdpaSteel,
     SdpaSteelHalf,
+    SdpaSteel256,
+    SdpaSteelHalf256,
     PagedSdpaVector,
     PagedSdpaAppendGqa32,
     PagedSdpaAppendGqa64,
@@ -625,6 +627,18 @@ const SDPA_STEEL_HALF: &[Constraint] = &[
         tensor: VALUE,
         allowed: REDUCED_DTYPES,
     },
+];
+const SDPA_STEEL_256: &[Constraint] = &[
+    SDPA_STEEL[0],
+    value(KEY_WIDTH, Relation::Equal(256)),
+    SDPA_STEEL[2],
+];
+const SDPA_STEEL_HALF_256: &[Constraint] = &[
+    SDPA_STEEL_256[0],
+    SDPA_STEEL_256[1],
+    SDPA_STEEL_256[2],
+    SDPA_STEEL_HALF[3],
+    SDPA_STEEL_HALF[4],
 ];
 const TOP_K_SINGLE: &[Constraint] = &[
     operation(OperationValue::TopK, Relation::Equal(8)),
@@ -1392,6 +1406,24 @@ pub(crate) static REGISTRY: &[VariantDef<MetalVariant>] = &[
         &["convolution without state."],
         &["Accumulates taps in ascending order and authenticates the private output version."]
     ),
+    batch_invariant_variant!(
+        "sdpa.steel-256",
+        Sdpa,
+        SdpaSteel256,
+        SDPA_STEEL_256,
+        &["head-width-256 prefill with f32 MMA tiles."],
+        &["decode or insufficient threadgroup memory."],
+        &["Uses 16x8 tiles; pipeline creation checks threadgroup memory."]
+    ),
+    batch_invariant_variant!(
+        "sdpa.steel-half-256",
+        Sdpa,
+        SdpaSteelHalf256,
+        SDPA_STEEL_HALF_256,
+        &["head-width-256 reduced-cache prefill."],
+        &["f32 caches or decode."],
+        &["Uses 32x16 tiles with half operands and f32 accumulators."]
+    ),
 ];
 
 pub(crate) const fn portable_name(operation: OperationKind) -> Option<&'static str> {
@@ -1914,6 +1946,8 @@ impl MetalVariant {
             }
             MetalVariant::PagedSdpaSteelHalf32x16 => &[(128, [32, 16])],
             MetalVariant::PagedSdpaSteelHalf64x16 => &[(128, [64, 16])],
+            MetalVariant::SdpaSteel256 => &[(256, [16, 8])],
+            MetalVariant::SdpaSteelHalf256 => &[(256, [32, 16])],
             _ => &[],
         };
         forja_core::CostModel {
@@ -2121,6 +2155,8 @@ mod tests {
                 "sample.parallel",
                 "delta-rule.simd",
                 "causal-depthwise-conv.direct",
+                "sdpa.steel-256",
+                "sdpa.steel-half-256",
             ]
         );
     }
@@ -2646,6 +2682,28 @@ mod tests {
             Err(VariantError::Constraint { .. })
         ));
         assert!(resolve(&f32, "sdpa.steel", METAL4).is_ok());
+    }
+
+    #[test]
+    fn wide_steel_tiles_are_declared_and_refuse_wrong_width_or_dtype() {
+        for (name, dtype, tile) in [
+            ("sdpa.steel-256", DType::F32, [16, 8]),
+            ("sdpa.steel-half-256", DType::BF16, [32, 16]),
+        ] {
+            let dispatch = sdpa_dispatch(dtype, 6, 7, 33, 256, 256);
+            let pick = resolve(&dispatch, name, METAL4).unwrap();
+            assert_eq!(REGISTRY[pick.index].cost.attention_tiles, &[(256, tile)]);
+            assert!(resolve(&sdpa_dispatch(dtype, 6, 7, 33, 128, 128), name, METAL4).is_err());
+            assert!(resolve(&sdpa_dispatch(dtype, 6, 1, 33, 256, 256), name, METAL4).is_err());
+        }
+        assert!(
+            resolve(
+                &sdpa_dispatch(DType::F32, 6, 7, 33, 256, 256),
+                "sdpa.steel-half-256",
+                METAL4
+            )
+            .is_err()
+        );
     }
 
     #[test]

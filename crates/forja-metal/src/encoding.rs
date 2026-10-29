@@ -5441,6 +5441,9 @@ impl MetalBackend {
                 width,
                 [query.layout(), key.layout(), value.layout()],
             )?;
+            if width == 256 && kernel == SdpaKernel::Decomposed {
+                return Err(BackendError::UnsupportedOperation);
+            }
         }
         let (name, constants, fallback) = match kernel {
             kernel @ (SdpaKernel::Vector | SdpaKernel::VectorGqa) => {
@@ -5487,6 +5490,9 @@ impl MetalBackend {
             .get(name, &constants)
         {
             Ok(_) => Ok(kernel),
+            Err(BackendError::UnsupportedOperation) if width == 256 => {
+                Err(BackendError::UnsupportedOperation)
+            }
             Err(BackendError::UnsupportedOperation) => Ok(fallback),
             Err(error) => Err(error),
         }
@@ -8310,6 +8316,7 @@ fn dispatch_profile(
         selected_variant(dispatch),
         Some(
             MetalVariant::SdpaSteelHalf
+                | MetalVariant::SdpaSteelHalf256
                 | MetalVariant::PagedSdpaSteelHalf
                 | MetalVariant::PagedSdpaSteelHalf32x16
                 | MetalVariant::PagedSdpaSteelHalf64x16
@@ -8770,15 +8777,19 @@ fn steel_attention_kernel(kernel: SdpaKernel, width: u32) -> Result<&'static str
     match (kernel, width) {
         (SdpaKernel::Steel, 64) => Ok("steel_attention_64"),
         (SdpaKernel::Steel, 128) => Ok("steel_attention_128"),
+        (SdpaKernel::Steel, 256) => Ok("steel_attention_256"),
         (SdpaKernel::SteelHalf, 64) => Ok("steel_attention_half_64_64x32"),
         (SdpaKernel::SteelHalf, 128) => Ok("steel_attention_half_128_96x16"),
+        (SdpaKernel::SteelHalf, 256) => Ok("steel_attention_half_256"),
         _ => Err(BackendError::InvalidInput),
     }
 }
 
 fn steel_attention_tile(kernel: SdpaKernel, width: u32) -> Result<(u32, u32), BackendError> {
     match kernel {
+        SdpaKernel::Steel if width == 256 => Ok((16, 8)),
         SdpaKernel::Steel => Ok((32, if width == 64 { 32 } else { 16 })),
+        SdpaKernel::SteelHalf if width == 256 => Ok((32, 16)),
         SdpaKernel::SteelHalf if width == 128 => Ok((96, 16)),
         SdpaKernel::SteelHalf => Ok((64, 32)),
         SdpaKernel::Vector | SdpaKernel::VectorGqa | SdpaKernel::Decomposed => {
@@ -8860,8 +8871,10 @@ fn select_sdpa(dispatch: &Dispatch) -> Result<SdpaKernel, BackendError> {
             | MetalVariant::SdpaVectorGqaTwoPass128
             | MetalVariant::SdpaVectorGqaTwoPass256,
         ) => Ok(SdpaKernel::VectorGqa),
-        Some(MetalVariant::SdpaSteel) => Ok(SdpaKernel::Steel),
-        Some(MetalVariant::SdpaSteelHalf) => Ok(SdpaKernel::SteelHalf),
+        Some(MetalVariant::SdpaSteel | MetalVariant::SdpaSteel256) => Ok(SdpaKernel::Steel),
+        Some(MetalVariant::SdpaSteelHalf | MetalVariant::SdpaSteelHalf256) => {
+            Ok(SdpaKernel::SteelHalf)
+        }
         _ => Err(BackendError::InvalidInput),
     }
 }
@@ -8902,7 +8915,7 @@ fn steel_sdpa_supported(dispatch: &Dispatch) -> Result<bool, BackendError> {
     };
     let [_, query_length, width] = shape3(query.layout())?;
     let [_, _, value_width] = shape3(value.layout())?;
-    Ok(query_length > 1 && width == value_width && matches!(width, 64 | 128))
+    Ok(query_length > 1 && width == value_width && matches!(width, 64 | 128 | 256))
 }
 
 #[cfg(test)]
@@ -9004,8 +9017,10 @@ pub(super) fn variant_supported(
         | MetalVariant::SdpaVectorGqaTwoPass64
         | MetalVariant::SdpaVectorGqaTwoPass128
         | MetalVariant::SdpaVectorGqaTwoPass256 => vector_sdpa_supported(dispatch)?,
-        MetalVariant::SdpaSteel => steel_sdpa_supported(dispatch)?,
-        MetalVariant::SdpaSteelHalf => half_steel_sdpa_supported(dispatch)?,
+        MetalVariant::SdpaSteel | MetalVariant::SdpaSteel256 => steel_sdpa_supported(dispatch)?,
+        MetalVariant::SdpaSteelHalf | MetalVariant::SdpaSteelHalf256 => {
+            half_steel_sdpa_supported(dispatch)?
+        }
         MetalVariant::PagedSdpaVector | MetalVariant::PagedSdpaDecomposed => {
             matches!(dispatch.op(), Op::PagedSdpa { .. })
         }
@@ -14246,6 +14261,42 @@ mod tests {
             assert_mixed_sdpa(SdpaKernel::Vector, None, 1, 33, dtype);
             assert_mixed_sdpa(SdpaKernel::Vector, Some(64), 1, 1024, dtype);
         }
+    }
+
+    #[test]
+    fn metal_steel_256_matches_cpu_and_refuses_insufficient_threadgroup_memory() {
+        let backend = MetalBackend::new().unwrap();
+        for dtype in [DType::F16, DType::BF16] {
+            assert_half_steel_profile_case(&backend, dtype, 7, 33, 24, 4, 256);
+        }
+        {
+            let _override = SdpaOverride::set(SdpaKernel::Steel);
+            assert_backends_agree(
+                &CpuBackend::new(),
+                &backend,
+                Op::Sdpa {
+                    scale: 0.0625,
+                    causal: true,
+                    q_start: 26,
+                },
+                &[
+                    TensorSpec::contiguous(DType::F32, &[24, 7, 256]),
+                    TensorSpec::contiguous(DType::F32, &[4, 33, 256]),
+                    TensorSpec::contiguous(DType::F32, &[4, 33, 256]),
+                ],
+                &TensorSpec::contiguous(DType::F32, &[24, 7, 256]),
+            )
+            .unwrap();
+        }
+        backend.set_pipeline_threadgroup_memory_limit_for_test(28_000);
+        let mut pipelines = backend.pipelines.lock().unwrap();
+        assert!(matches!(
+            pipelines.get(
+                "steel_attention_256",
+                &[(0, 0), (1, 0), (2, 0), (3, 0), (211, 0), (212, 1), (217, 0)]
+            ),
+            Err(BackendError::UnsupportedOperation)
+        ));
     }
 
     #[test]
