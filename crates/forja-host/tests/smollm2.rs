@@ -160,3 +160,10 @@ fn compare_paths(load: &EngineLoadConfig) -> Result<(), Box<dyn Error>> {
     fs::remove_file(path)?;
     Ok(())
 }
+
+#[test]
+fn metal_tiny_fused_epilogues_match_reference() -> Result<(), Box<dyn Error>> {
+    let mut load = optimized_load();
+    load.tunings.push("fused-epilogues".to_owned());
+    compare_paths(&load)
+}

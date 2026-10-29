@@ -8,14 +8,24 @@ use forja_sdk::{
 };
 
 /// Registers the optimized implementation without a build feature.
-pub const TUNINGS: &[Tuning] = &[Tuning {
-    name: "optimized",
-    slot: "execution",
-    device_family: "apple-m3-ultra",
-    shape_class: "llama",
-    description: "Use engine-owned optimized execution",
-    rationale: "Keep the readable implementation available in the same component",
-}];
+pub const TUNINGS: &[Tuning] = &[
+    Tuning {
+        name: "optimized",
+        slot: "execution",
+        device_family: "apple-m3-ultra",
+        shape_class: "llama",
+        description: "Use engine-owned optimized execution",
+        rationale: "Keep the readable implementation available in the same component",
+    },
+    Tuning {
+        name: "fused-epilogues",
+        slot: "fusion",
+        device_family: "apple-m3-ultra",
+        shape_class: "llama",
+        description: "Fuse the gated up projection and residual normalization",
+        rationale: "Avoid intermediate activation writes and separate dispatches",
+    },
+];
 
 /// Validated profile choices for the optimized implementation.
 pub struct Variants(EngineSelections);

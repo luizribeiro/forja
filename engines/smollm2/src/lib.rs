@@ -8,7 +8,7 @@ pub mod variants;
 
 use forja_sdk::{
     Load,
-    nn::{Embedding, EmbeddingConfig, Linear, LinearConfig, RmsNorm, RmsNormConfig},
+    nn::{Embedding, EmbeddingConfig, RmsNorm, RmsNormConfig},
 };
 
 /// Dimensions shared by the reference and optimized implementations.
@@ -117,8 +117,8 @@ mod tests {
 }
 
 impl Config {
-    fn linear(input: u32, output: u32) -> LinearConfig {
-        LinearConfig::promoted_bf16(input, output)
+    fn linear(input: u32, output: u32) -> [u32; 2] {
+        [output, input]
     }
     fn norm(self) -> RmsNormConfig {
         RmsNormConfig::promoted_bf16(self.hidden, self.epsilon)
@@ -130,13 +130,13 @@ impl Config {
 #[allow(clippy::struct_field_names)]
 struct Attention {
     #[load(prefix, config = Config::linear(config.hidden, config.query_heads * config.head_dim))]
-    q_proj: Linear<f32>,
+    q_proj: Projection,
     #[load(prefix, config = Config::linear(config.hidden, config.kv_heads * config.head_dim))]
-    k_proj: Linear<f32>,
+    k_proj: Projection,
     #[load(prefix, config = Config::linear(config.hidden, config.kv_heads * config.head_dim))]
-    v_proj: Linear<f32>,
+    v_proj: Projection,
     #[load(prefix, config = Config::linear(config.query_heads * config.head_dim, config.hidden))]
-    o_proj: Linear<f32>,
+    o_proj: Projection,
 }
 
 #[derive(Load)]
@@ -144,11 +144,11 @@ struct Attention {
 #[allow(clippy::struct_field_names)]
 struct Mlp {
     #[load(prefix, config = Config::linear(config.hidden, config.intermediate))]
-    gate_proj: Linear<f32>,
+    gate_proj: Projection,
     #[load(prefix, config = Config::linear(config.hidden, config.intermediate))]
-    up_proj: Linear<f32>,
+    up_proj: Projection,
     #[load(prefix, config = Config::linear(config.intermediate, config.hidden))]
-    down_proj: Linear<f32>,
+    down_proj: Projection,
 }
 
 #[derive(Load)]
@@ -298,5 +298,29 @@ impl forja_sdk::Engine for SmolLM2 {
         let selected = logits.sample(&self.decode.sampling()?, slot)?;
         let token = self.decode.store_selected(&selected, slot)?;
         Ok(forja_sdk::DecodeOutput { logits, token })
+    }
+}
+
+struct Projection {
+    weight: forja_sdk::Tensor<f32>,
+}
+
+impl Load<[u32; 2]> for Projection {
+    fn load(weights: &forja_sdk::Weights<'_>, shape: &[u32; 2]) -> forja_sdk::Result<Self> {
+        Ok(Self {
+            weight: weights
+                .tensor::<forja_sdk::bf16>("weight", shape)?
+                .to_dtype()?,
+        })
+    }
+}
+
+impl Projection {
+    fn forward_with(
+        &self,
+        input: &forja_sdk::Tensor<f32>,
+        selection: &forja_sdk::target::metal::Variant,
+    ) -> forja_sdk::Result<forja_sdk::Tensor<f32>> {
+        input.matmul_with(&self.weight.t()?, selection)
     }
 }

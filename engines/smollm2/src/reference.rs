@@ -151,7 +151,7 @@ fn mlp(weights: &Mlp, hidden: &Tensor<f32>) -> Result<Tensor<f32>> {
     let up = linear(&weights.up_proj, hidden)?;
     linear(&weights.down_proj, &gate.silu_mul(&up)?)
 }
-fn linear(weights: &forja_sdk::nn::Linear<f32>, hidden: &Tensor<f32>) -> Result<Tensor<f32>> {
+fn linear(weights: &crate::Projection, hidden: &Tensor<f32>) -> Result<Tensor<f32>> {
     weights.forward_with(hidden, &Variant::new("matmul.portable")?)
 }
 pub(crate) fn input_length(shape: &[u32], start: u32, context: u32) -> Result<u32> {

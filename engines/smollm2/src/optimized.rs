@@ -4,11 +4,9 @@
 
 use crate::{Config, ModelWeights};
 use forja_sdk::{
-    Dim, EngineLoadConfig, Load, Param, Result, StepOutput, Tensor, Weights,
-    nn::{
-        Linear,
-        blocks::{KvCache, cached_attention_with},
-    },
+    DType, Dim, EngineLoadConfig, Load, Param, Result, StepOutput, Tensor, Weights,
+    kernel::{Epilogue, Kernel, TensorRef},
+    nn::blocks::{KvCache, cached_attention_with, residual_norm, residual_norm_kernel},
 };
 
 pub(crate) struct Optimized {
@@ -17,6 +15,9 @@ pub(crate) struct Optimized {
     variants: crate::variants::Variants,
     caches: Vec<KvCache<f32>>,
     positions: Tensor<u32>,
+    fused: bool,
+    gate_up: Epilogue,
+    residual_norm: Kernel,
 }
 
 impl Optimized {
@@ -32,21 +33,28 @@ impl Optimized {
         Ok(Self {
             weights: ModelWeights::load(weights, &config)?,
             config,
+            fused: load.tunings.iter().any(|name| name == "fused-epilogues"),
+            gate_up: gated_up_epilogue(1, 2, &[DType::F32], DType::F32)?,
+            residual_norm: residual_norm_kernel(DType::F32, config.epsilon)?,
             variants: crate::variants::Variants::new(load, context)?,
             caches,
             positions: Tensor::constant(&(0..context).collect::<Vec<_>>(), &[context])?,
         })
     }
 
-    fn linear(&self, projection: &Linear<f32>, hidden: &Tensor<f32>) -> Result<Tensor<f32>> {
+    fn linear(&self, projection: &crate::Projection, hidden: &Tensor<f32>) -> Result<Tensor<f32>> {
         projection.forward_with(hidden, &self.variants.linear(hidden.shape()[0])?)
     }
 
     fn add_norm(
+        &self,
         hidden: &Tensor<f32>,
         update: &Tensor<f32>,
         norm: &forja_sdk::nn::RmsNorm<f32>,
     ) -> Result<(Tensor<f32>, Tensor<f32>)> {
+        if self.fused {
+            return residual_norm(&self.residual_norm, hidden, update, norm.weight());
+        }
         let hidden = (hidden + update)?;
         let normalized = norm.forward(&hidden)?;
         Ok((hidden, normalized))
@@ -110,12 +118,21 @@ impl Optimized {
             )?;
             let update = self.linear(&a.o_proj, &attended)?;
             let (residual, mlp_input) =
-                Self::add_norm(&hidden, &update, &layer.post_attention_layernorm)?;
+                self.add_norm(&hidden, &update, &layer.post_attention_layernorm)?;
             let gate = self.linear(&layer.mlp.gate_proj, &mlp_input)?;
-            let up = self.linear(&layer.mlp.up_proj, &mlp_input)?;
-            let update = self.linear(&layer.mlp.down_proj, &gate.silu_mul(&up)?)?;
+            let activated = if self.fused {
+                mlp_input.matmul_epilogue_with(
+                    &layer.mlp.up_proj.weight.t()?,
+                    &self.gate_up,
+                    &[TensorRef::new(&gate)?],
+                    &self.variants.linear(sequence)?,
+                )?
+            } else {
+                gate.silu_mul(&self.linear(&layer.mlp.up_proj, &mlp_input)?)?
+            };
+            let update = self.linear(&layer.mlp.down_proj, &activated)?;
             if let Some(next) = self.weights.model.layers.get(index + 1) {
-                (hidden, normalized) = Self::add_norm(&residual, &update, &next.input_layernorm)?;
+                (hidden, normalized) = self.add_norm(&residual, &update, &next.input_layernorm)?;
             } else {
                 hidden = (&residual + &update)?;
             }
@@ -141,4 +158,9 @@ impl Optimized {
             router_logits: Vec::new(),
         })
     }
+}
+
+#[forja_sdk::kernel::kernel(map)]
+fn gated_up(up: forja_sdk::kernel::Elem, gate: forja_sdk::kernel::Elem) -> forja_sdk::kernel::Elem {
+    gate * gate.sigmoid() * up
 }
