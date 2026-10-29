@@ -39,7 +39,7 @@ impl CpuBackend {
             .collect::<Result<Vec<_>, _>>()?;
         let (output, state) = match operation {
             StateOp::DeltaRule(_) => delta_rule(&values, &inputs[5])?,
-            StateOp::CausalDepthwiseConv(_) => return Err(BackendError::UnsupportedOperation),
+            StateOp::CausalDepthwiseConv(_) => causal_conv(&values, &inputs[0])?,
         };
         self.write_output(&dispatch.outputs()[0], &output)?;
         self.write_output(&dispatch.outputs()[1], &state)
@@ -77,31 +77,44 @@ fn delta_rule(
     Ok((output, state))
 }
 
+fn causal_conv(values: &[Vec<f32>], input: &Tensor) -> Result<(Vec<f32>, Vec<f32>), BackendError> {
+    let rows = execution_usize(input.layout().shape()[0])?;
+    let channels = execution_usize(input.layout().shape()[1])?;
+    let taps = values[1].len() / channels;
+    let mut joined = values[2].clone();
+    joined.extend_from_slice(&values[0]);
+    let mut output = vec![0.0; values[0].len()];
+    for row in 0..rows {
+        for channel in 0..channels {
+            for tap in 0..taps {
+                output[row * channels + channel] +=
+                    joined[(row + tap) * channels + channel] * values[1][tap * channels + channel];
+            }
+        }
+    }
+    let history = joined[joined.len() - values[2].len()..].to_vec();
+    Ok((output, history))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use forja_core::{Backend, CommandList, DType, Op, Submission};
 
-    #[test]
-    fn delta_update_authenticates_before_reading_or_writing_state() {
-        let backend = CpuBackend::new();
+    fn state_inputs(
+        backend: &CpuBackend,
+        data: &[(&[u32], Vec<f32>)],
+    ) -> (forja_core::StateAccess, Vec<Tensor>) {
         let (access, specs) = forja_testing::state_test_metadata().unwrap();
         let mut inputs = Vec::new();
-        for (shape, values) in [
-            (&[1, 2][..], vec![1.0, 2.0]),
-            (&[1, 2], vec![0.5, 1.0]),
-            (&[1, 1], vec![3.0]),
-            (&[1], vec![0.5]),
-            (&[1], vec![0.25]),
-            (&[1, 2, 1], vec![2.0, 4.0]),
-        ] {
+        for (shape, values) in data {
             let tensor = backend.alloc(DType::F32, shape).unwrap();
             backend
                 .write(
                     &tensor,
                     &values
-                        .into_iter()
-                        .flat_map(f32::to_le_bytes)
+                        .iter()
+                        .flat_map(|value| value.to_le_bytes())
                         .collect::<Vec<_>>(),
                 )
                 .unwrap();
@@ -119,6 +132,23 @@ mod tests {
             backend.write(&tensor, &bytes).unwrap();
             inputs.push(tensor);
         }
+        (access, inputs)
+    }
+
+    #[test]
+    fn delta_update_authenticates_before_reading_or_writing_state() {
+        let backend = CpuBackend::new();
+        let (access, inputs) = state_inputs(
+            &backend,
+            &[
+                (&[1, 2], vec![1.0, 2.0]),
+                (&[1, 2], vec![0.5, 1.0]),
+                (&[1, 1], vec![3.0]),
+                (&[1], vec![0.5]),
+                (&[1], vec![0.25]),
+                (&[1, 2, 1], vec![2.0, 4.0]),
+            ],
+        );
         let y = backend.alloc(DType::F32, &[1, 1]).unwrap();
         let state = backend.alloc(DType::F32, &[1, 2, 1]).unwrap();
         let run = || {
@@ -145,5 +175,42 @@ mod tests {
         run().unwrap();
         assert_eq!(backend.read(&y).unwrap(), [0; 4]);
         assert_eq!(before, backend.read(&state).unwrap());
+    }
+    #[test]
+    fn causal_convolution_carries_raw_history_and_declares_its_cost() {
+        let backend = CpuBackend::new();
+        let (access, inputs) = state_inputs(
+            &backend,
+            &[
+                (&[2, 1], vec![3.0, 4.0]),
+                (&[3, 1], vec![0.25, 0.5, 1.0]),
+                (&[2, 1], vec![1.0, 2.0]),
+            ],
+        );
+        let y = backend.alloc(DType::F32, &[2, 1]).unwrap();
+        let state = backend.alloc(DType::F32, &[2, 1]).unwrap();
+        let op = Op::State(StateOp::CausalDepthwiseConv(access));
+        let refs = inputs.iter().collect::<Vec<_>>();
+        let mut commands = CommandList::new();
+        commands.dispatch_many(op, &refs, &[&y, &state]).unwrap();
+        let cost = forja_core::KernelCost::of(commands.last_dispatch().unwrap()).unwrap();
+        assert_eq!(
+            (cost.flops, cost.read_bytes, cost.write_bytes),
+            (12, 60, 16)
+        );
+        assert!(
+            CommandList::new()
+                .dispatch_many(op, &refs, &[&y, &inputs[2]])
+                .is_err()
+        );
+        backend.submit(commands).unwrap().wait().unwrap();
+        assert_eq!(
+            decode(&backend.read(&y).unwrap(), DType::F32).unwrap(),
+            vec![4.25, 6.0]
+        );
+        assert_eq!(
+            decode(&backend.read(&state).unwrap(), DType::F32).unwrap(),
+            vec![3.0, 4.0]
+        );
     }
 }
