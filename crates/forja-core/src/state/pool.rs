@@ -59,6 +59,7 @@ impl StatePool {
             latest_submission: 0,
             pending: VecDeque::new(),
             drain_until: 0,
+            quarantine_until: 0,
         })
     }
 
@@ -108,6 +109,7 @@ pub struct StateSequence {
     latest_submission: u64,
     pending: VecDeque<StateTransaction>,
     drain_until: u64,
+    quarantine_until: u64,
 }
 
 /// A capability for one out-of-place update, tied to its original sequence.
@@ -181,6 +183,9 @@ impl StateSequence {
         transaction: &StateTransaction,
         queue_serial: u64,
     ) -> Result<(), PagePoolError> {
+        if self.pool.completed.load(Ordering::Acquire) < self.quarantine_until {
+            return Err(PagePoolError::BankInFlight);
+        }
         let index = self.pending_index(transaction)?;
         if queue_serial <= self.latest_submission
             || transaction.submitted.load(Ordering::Acquire) != 0
@@ -195,6 +200,41 @@ impl StateSequence {
         self.storage.mark_submitted(queue_serial)?;
         self.latest_submission = queue_serial;
         transaction.submitted.store(queue_serial, Ordering::Release);
+        Ok(())
+    }
+
+    /// Cancels an unsubmitted reservation and every dependent reservation.
+    ///
+    /// # Errors
+    /// Refuses stale capabilities or cancellation after submission has been sealed.
+    pub fn cancel_unsubmitted(
+        &mut self,
+        transaction: &StateTransaction,
+    ) -> Result<(), PagePoolError> {
+        let index = self.pending_index(transaction)?;
+        if transaction.submitted.load(Ordering::Acquire) != 0 {
+            return Err(PagePoolError::BankInFlight);
+        }
+        self.pending.truncate(index);
+        Ok(())
+    }
+
+    /// Restores the committed journal without claiming uncertain GPU work has completed.
+    /// New logical reservations are allowed; execution and backing reuse remain quarantined.
+    ///
+    /// # Errors
+    /// Refuses foreign or already retired transaction capabilities.
+    pub fn abandon(&mut self, transaction: &StateTransaction) -> Result<(), PagePoolError> {
+        self.pending_index(transaction)?;
+        self.quarantine_until = self.quarantine_until.max(self.drain_until).max(
+            self.pending
+                .iter()
+                .map(|tx| tx.submitted.load(Ordering::Acquire))
+                .max()
+                .unwrap_or(0),
+        );
+        self.pending.clear();
+        self.drain_until = 0;
         Ok(())
     }
 
@@ -348,6 +388,50 @@ mod tests {
         assert!(a.finish(&retry, true).is_err());
         assert!(a.bind(&retry).is_err());
     }
+    #[test]
+    fn abandoning_restores_the_checkpoint_but_quarantines_uncertain_backing() {
+        let layout = StateLayout::new(vec![StatePlane::new(DType::F32, vec![7]).unwrap()]).unwrap();
+        let pool = StatePool::new(layout, 1, 1024).unwrap();
+        let mut sequence = pool.reserve().unwrap();
+        let first = sequence.begin(1).unwrap();
+        sequence.mark_submitted_at(&first, 11).unwrap();
+        pool.observe_completion(11).unwrap();
+        sequence.finish(&first, true).unwrap();
+        let second = sequence.begin(2).unwrap();
+        sequence.mark_submitted_at(&second, 12).unwrap();
+        sequence.abandon(&second).unwrap();
+        let retry = sequence.begin(3).unwrap();
+        assert_eq!(retry.input_version(), 1);
+        assert_eq!(
+            sequence.mark_submitted_at(&retry, 13),
+            Err(PagePoolError::BankInFlight)
+        );
+        drop(sequence);
+        assert!(pool.reserve().is_err());
+        pool.observe_completion(12).unwrap();
+        assert!(pool.reserve().is_ok());
+    }
+
+    #[test]
+    fn cancelling_an_unsubmitted_descendant_keeps_its_predecessor() {
+        let layout = StateLayout::new(vec![StatePlane::new(DType::F32, vec![7]).unwrap()]).unwrap();
+        let pool = StatePool::new(layout, 1, 1024).unwrap();
+        let mut sequence = pool.reserve().unwrap();
+        let first = sequence.begin(1).unwrap();
+        sequence.mark_submitted(&first).unwrap();
+        let second = sequence.begin(2).unwrap();
+        sequence.cancel_unsubmitted(&second).unwrap();
+        assert_eq!(
+            sequence.cancel_unsubmitted(&first),
+            Err(PagePoolError::BankInFlight)
+        );
+        let retry = sequence.begin(3).unwrap();
+        assert_eq!(retry.input_version(), 1);
+        sequence.cancel_unsubmitted(&retry).unwrap();
+        pool.observe_completion(1).unwrap();
+        sequence.finish(&first, true).unwrap();
+    }
+
     #[test]
     fn independent_sequence_serials_use_distinct_queue_positions() {
         let layout = StateLayout::new(vec![StatePlane::new(DType::F32, vec![7]).unwrap()]).unwrap();
