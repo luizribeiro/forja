@@ -606,7 +606,7 @@ pub(crate) mod guest {
         }
     }
 
-    fn wit_dtype(dtype: DType) -> compute::Dtype {
+    pub(crate) fn wit_dtype(dtype: DType) -> compute::Dtype {
         match dtype {
             DType::F32 => compute::Dtype::F32,
             DType::F16 => compute::Dtype::F16,
@@ -938,6 +938,8 @@ pub(crate) mod unavailable {
 
 #[cfg(feature = "native")]
 pub(crate) mod native {
+    mod state;
+    pub(crate) use state::State;
     use std::cell::Cell;
 
     use forja_core::{

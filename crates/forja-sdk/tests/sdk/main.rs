@@ -19,3 +19,6 @@ mod qwen_moe;
 #[cfg(feature = "native")]
 #[path = "../support/mod.rs"]
 mod support;
+
+#[path = "../state_native.rs"]
+mod state_native;

@@ -113,6 +113,7 @@ pub mod nn;
 mod paged;
 pub mod program;
 mod selections;
+pub mod state;
 mod sys;
 pub mod target;
 mod tensor;
