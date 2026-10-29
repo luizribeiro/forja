@@ -1,0 +1,25 @@
+[workspace]
+members = ["."]
+resolver = "3"
+
+[package]
+name = "smollm2"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+rust-version = "1.99.1"
+version = "0.0.0"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+forja-sdk = { path = "../../crates/forja-sdk", features = ["metal-variants"] }
+
+[lints.rust]
+missing_docs = "warn"
+
+[lints.clippy]
+pedantic = "warn"
+unwrap_used = "warn"
+expect_used = "warn"
