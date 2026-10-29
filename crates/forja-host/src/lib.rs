@@ -9,7 +9,7 @@ pub use prompt::PromptChunking;
 mod fuzz_tests;
 mod native;
 mod state;
-pub use state::{StateRecording, StateSequenceHandle, StateStorage, StateSubmission};
+pub use state::{StateCell, StateRecording, StateSequenceHandle, StateStorage, StateSubmission};
 mod weights;
 
 use std::time::{Duration, Instant};
@@ -53,6 +53,7 @@ const MAX_VARIANT_RULE_ARMS: usize = 64;
 /// Preserves one live-graph slot for an exact prompt tail.
 const MAX_RETAINED_BATCH_SHAPES: usize = 15;
 
+pub use native::NativeState;
 pub use native::{NativeCommandList, NativeEpilogue, NativeHost, NativeKernel, NativeTensor};
 pub use weights::{Safetensors, WeightError, WeightSource, WeightTensor};
 

@@ -1,9 +1,11 @@
 //! Opaque state storage charged to the runner's allocation budget.
 
+mod cell;
 #[cfg(test)]
 mod lifecycle_tests;
 #[cfg(test)]
 mod multiple_sequences;
+pub use cell::StateCell;
 mod record;
 pub use record::StateRecording;
 #[cfg(test)]

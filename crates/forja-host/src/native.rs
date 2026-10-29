@@ -1,3 +1,6 @@
+mod state;
+pub use state::NativeState;
+
 use std::{sync::Arc, time::Duration};
 
 use forja_core::{
@@ -12,6 +15,7 @@ use forja_core::{
 #[derive(Debug)]
 pub struct NativeHost<B: Backend> {
     backend: Arc<B>,
+    state_bytes: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl<B: Backend> NativeHost<B> {
@@ -20,6 +24,7 @@ impl<B: Backend> NativeHost<B> {
     pub fn new(backend: B) -> Self {
         Self {
             backend: Arc::new(backend),
+            state_bytes: Arc::default(),
         }
     }
 
