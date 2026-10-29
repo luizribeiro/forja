@@ -2,3 +2,6 @@
 #![forbid(unsafe_code)]
 mod config;
 pub use config::Config;
+
+/// Affine quantized projection storage.
+pub mod quant;

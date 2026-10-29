@@ -22,3 +22,6 @@ mod smollm2;
 mod tensor_smoke;
 #[path = "../toy_mlp.rs"]
 mod toy_mlp;
+
+#[path = "../qwen38.rs"]
+mod qwen38;
