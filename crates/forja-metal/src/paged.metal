@@ -292,6 +292,9 @@ DEFINE_PAGED_STEEL_ATTENTION(paged_steel_attention_half_128_96x16, half, 96, 16,
 DEFINE_PAGED_STEEL_ATTENTION(paged_steel_attention_half_128_32x16, half, 32, 16, 128)
 DEFINE_PAGED_STEEL_ATTENTION(paged_steel_attention_half_128_64x16, half, 64, 16, 128)
 
+DEFINE_PAGED_STEEL_ATTENTION(paged_steel_attention_256, float, 16, 8, 256)
+DEFINE_PAGED_STEEL_ATTENTION(paged_steel_attention_half_256, half, 32, 16, 256)
+
 template <uint D, uint G, uint HPT, uint KVPTG>
 void paged_sdpa_2pass_1_gqa_body(
     device const uchar *query,

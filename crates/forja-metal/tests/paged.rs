@@ -536,7 +536,7 @@ fn run_sdpa<B: Backend + 'static>(
     variant: Option<&str>,
     rejected_output: Option<&mut Vec<f32>>,
 ) -> Result<Vec<f32>, BackendError> {
-    run_sdpa_with_page_tokens(
+    run_sdpa_with_page_tokens::<_, 128>(
         backend,
         dtype,
         key_length,
@@ -600,7 +600,7 @@ fn append_operand<B: Backend>(
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-fn run_sdpa_with_page_tokens<B: Backend + 'static>(
+fn run_sdpa_with_page_tokens<B: Backend + 'static, const WIDTH: u32>(
     backend: &B,
     dtype: DType,
     key_length: u32,
@@ -616,8 +616,6 @@ fn run_sdpa_with_page_tokens<B: Backend + 'static>(
     page_tokens: u32,
     active: bool,
 ) -> Result<Vec<f32>, BackendError> {
-    const WIDTH: u32 = 128;
-
     let q_start = key_length
         .checked_sub(query_length)
         .ok_or(BackendError::InvalidInput)?;
@@ -1264,7 +1262,7 @@ fn metal_paged_append_keeps_attention_bits_and_stored_planes() {
 fn metal_paged_append_gates_inactive_lanes_without_writing() {
     let metal = forja_metal::MetalBackend::new().unwrap();
     for_each_paged_gqa_safety_heads(|query_heads, kv_heads| {
-        let output = run_sdpa_with_page_tokens(
+        let output = run_sdpa_with_page_tokens::<_, 128>(
             &metal,
             DType::F16,
             513,
@@ -1541,7 +1539,7 @@ fn metal_paged_sdpa_falls_back_after_a_consecutive_prefix() {
 fn metal_paged_steel_refuses_tiles_crossing_page_boundaries() {
     let metal = forja_metal::MetalBackend::new().unwrap();
     for page_tokens in [24, 40] {
-        let result = run_sdpa_with_page_tokens(
+        let result = run_sdpa_with_page_tokens::<_, 128>(
             &metal,
             DType::F16,
             page_tokens + 9,
@@ -2050,4 +2048,51 @@ fn metal_paged_append_refuses_unsupported_width_without_writing() {
     ));
     assert_eq!(backend.read(&key).unwrap(), before);
     assert_eq!(backend.read(&value).unwrap(), before);
+}
+
+fn wide_prefill<B: Backend + 'static>(
+    backend: &B,
+    dtype: DType,
+    queries: u32,
+    variant: Option<&str>,
+    page_tokens: u32,
+) -> Result<Vec<f32>, BackendError> {
+    run_sdpa_with_page_tokens::<_, 256>(
+        backend,
+        dtype,
+        33,
+        queries,
+        true,
+        false,
+        24,
+        4,
+        (0, 0),
+        &[],
+        variant,
+        None,
+        page_tokens,
+        true,
+    )
+}
+
+#[test]
+fn metal_paged_steel_256_matches_cpu_and_checks_page_divisibility() {
+    let cpu = forja_cpu::CpuBackend::new();
+    let metal = forja_metal::MetalBackend::new().unwrap();
+    for (dtype, variant, tile) in [
+        (DType::F32, "paged-sdpa.steel-256", 8),
+        (DType::F16, "paged-sdpa.steel-half-256", 16),
+        (DType::BF16, "paged-sdpa.steel-half-256", 16),
+    ] {
+        for queries in [7, 33] {
+            let expected = wide_prefill(&cpu, dtype, queries, None, 64).unwrap();
+            let actual = wide_prefill(&metal, dtype, queries, Some(variant), 64).unwrap();
+            assert!(
+                forja_testing::normwise_relative_error(&expected, &actual)
+                    <= forja_testing::dtype_tolerance(dtype).unwrap()
+            );
+        }
+        assert!(wide_prefill(&metal, dtype, 7, Some(variant), tile / 2).is_err());
+        assert!(wide_prefill(&metal, dtype, 1, Some(variant), 64).is_err());
+    }
 }

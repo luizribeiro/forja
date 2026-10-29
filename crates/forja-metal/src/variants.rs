@@ -78,6 +78,8 @@ pub(crate) enum MetalVariant {
     PagedSdpaSteelHalf,
     PagedSdpaSteelHalf32x16,
     PagedSdpaSteelHalf64x16,
+    PagedSdpaSteel256,
+    PagedSdpaSteelHalf256,
     TopKPortable,
     TopKSingleK8,
     TopKPartials,
@@ -743,6 +745,21 @@ const PAGED_SDPA_STEEL_HALF_128: &[Constraint] = &[
         tensor: VALUE,
         allowed: REDUCED_DTYPES,
     },
+];
+
+const PAGED_STEEL_256: &[Constraint] = &[
+    PAGED_SDPA_STEEL[0],
+    value(PAGED_KEY_WIDTH, Relation::Equal(256)),
+    PAGED_SDPA_STEEL[2],
+    operation(OperationValue::PageTokens, Relation::MultipleOf(8)),
+];
+const PAGED_STEEL_HALF_256: &[Constraint] = &[
+    PAGED_STEEL_256[0],
+    PAGED_STEEL_256[1],
+    PAGED_STEEL_256[2],
+    operation(OperationValue::PageTokens, Relation::MultipleOf(16)),
+    SDPA_STEEL_HALF[3],
+    SDPA_STEEL_HALF[4],
 ];
 
 macro_rules! variant {
@@ -1424,6 +1441,24 @@ pub(crate) static REGISTRY: &[VariantDef<MetalVariant>] = &[
         &["f32 caches or decode."],
         &["Uses 32x16 tiles with half operands and f32 accumulators."]
     ),
+    batch_invariant_variant!(
+        "paged-sdpa.steel-256",
+        PagedSdpa,
+        PagedSdpaSteel256,
+        PAGED_STEEL_256,
+        &["paged head-width-256 prefill."],
+        &["decode or pages not divisible by 8."],
+        &["Authenticates 8-token key tiles before forming addresses."]
+    ),
+    batch_invariant_variant!(
+        "paged-sdpa.steel-half-256",
+        PagedSdpa,
+        PagedSdpaSteelHalf256,
+        PAGED_STEEL_HALF_256,
+        &["reduced-cache paged head-width-256 prefill."],
+        &["f32 caches or pages not divisible by 16."],
+        &["Authenticates 16-token key tiles and uses 32-query half MMA tiles."]
+    ),
 ];
 
 pub(crate) const fn portable_name(operation: OperationKind) -> Option<&'static str> {
@@ -1946,8 +1981,10 @@ impl MetalVariant {
             }
             MetalVariant::PagedSdpaSteelHalf32x16 => &[(128, [32, 16])],
             MetalVariant::PagedSdpaSteelHalf64x16 => &[(128, [64, 16])],
-            MetalVariant::SdpaSteel256 => &[(256, [16, 8])],
-            MetalVariant::SdpaSteelHalf256 => &[(256, [32, 16])],
+            MetalVariant::SdpaSteel256 | MetalVariant::PagedSdpaSteel256 => &[(256, [16, 8])],
+            MetalVariant::SdpaSteelHalf256 | MetalVariant::PagedSdpaSteelHalf256 => {
+                &[(256, [32, 16])]
+            }
             _ => &[],
         };
         forja_core::CostModel {
@@ -2157,6 +2194,8 @@ mod tests {
                 "causal-depthwise-conv.direct",
                 "sdpa.steel-256",
                 "sdpa.steel-half-256",
+                "paged-sdpa.steel-256",
+                "paged-sdpa.steel-half-256",
             ]
         );
     }

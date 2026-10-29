@@ -3769,11 +3769,6 @@ impl MetalBackend {
             .as_ref()
             .map_or_else(|| default_activity.as_ref(), |tensor| Some(&tensor.buffer))
             .ok_or(BackendError::ExecutionFailed)?;
-        let kernel = match q[2] {
-            64 => "paged_sdpa_64",
-            128 => "paged_sdpa_128",
-            _ => return Err(BackendError::UnsupportedOperation),
-        };
         let constants = vec![
             (0, dtype_code(query.layout.dtype())),
             (1, dtype_code(key.layout.dtype())),
@@ -3889,11 +3884,14 @@ impl MetalBackend {
             return Ok((temporaries, error_flag));
         }
         if let Some(kernel) = match selected_variant(dispatch) {
-            Some(MetalVariant::PagedSdpaSteel) => Some(SdpaKernel::Steel),
+            Some(MetalVariant::PagedSdpaSteel | MetalVariant::PagedSdpaSteel256) => {
+                Some(SdpaKernel::Steel)
+            }
             Some(
                 MetalVariant::PagedSdpaSteelHalf
                 | MetalVariant::PagedSdpaSteelHalf32x16
-                | MetalVariant::PagedSdpaSteelHalf64x16,
+                | MetalVariant::PagedSdpaSteelHalf64x16
+                | MetalVariant::PagedSdpaSteelHalf256,
             ) => Some(SdpaKernel::SteelHalf),
             _ => None,
         } {
@@ -3952,6 +3950,9 @@ impl MetalBackend {
                     let mut temporaries = vec![params, error_flag.clone()];
                     temporaries.extend(default_activity.clone());
                     return Ok((temporaries, error_flag));
+                }
+                Err(BackendError::UnsupportedOperation) if q[2] == 256 => {
+                    return Err(BackendError::UnsupportedOperation);
                 }
                 Err(BackendError::UnsupportedOperation) => {}
                 Err(error) => return Err(error),
@@ -4056,6 +4057,11 @@ impl MetalBackend {
             temporaries.extend(default_activity.clone());
             return Ok((temporaries, error_flag));
         }
+        let kernel = match q[2] {
+            64 => "paged_sdpa_64",
+            128 => "paged_sdpa_128",
+            _ => return Err(BackendError::UnsupportedOperation),
+        };
         let pipeline = self
             .pipelines
             .lock()
@@ -8318,6 +8324,7 @@ fn dispatch_profile(
             MetalVariant::SdpaSteelHalf
                 | MetalVariant::SdpaSteelHalf256
                 | MetalVariant::PagedSdpaSteelHalf
+                | MetalVariant::PagedSdpaSteelHalf256
                 | MetalVariant::PagedSdpaSteelHalf32x16
                 | MetalVariant::PagedSdpaSteelHalf64x16
         )
@@ -8634,6 +8641,8 @@ fn paged_sdpa_kernel(dispatch: &Dispatch, width: u32) -> Result<&'static str, Ba
                 .ok_or(BackendError::InvalidInput)?;
             paged_gqa_first_pass(query_heads, kv_heads).map(|(kernel, _, _)| kernel)
         }
+        (Some(MetalVariant::PagedSdpaSteel256), 256) => Ok("paged_steel_attention_256"),
+        (Some(MetalVariant::PagedSdpaSteelHalf256), 256) => Ok("paged_steel_attention_half_256"),
         (Some(MetalVariant::PagedSdpaSteel), 64) => Ok("paged_steel_attention_64"),
         (Some(MetalVariant::PagedSdpaSteel), 128) => Ok("paged_steel_attention_128"),
         (Some(MetalVariant::PagedSdpaSteelHalf), 64) => Ok("paged_steel_attention_half_64_64x32"),
@@ -8942,7 +8951,7 @@ fn paged_steel_sdpa_supported(dispatch: &Dispatch) -> Result<bool, BackendError>
         .ok_or(BackendError::InvalidInput)?;
     Ok(query_length > 1
         && width == value_width
-        && matches!(width, 64 | 128)
+        && matches!(width, 64 | 128 | 256)
         && key.layout().shape().get(3) == Some(&width))
 }
 
@@ -9032,10 +9041,13 @@ pub(super) fn variant_supported(
         | MetalVariant::PagedSdpaVectorGqaTwoPass1024 => {
             matches!(dispatch.op(), Op::PagedSdpa { .. })
         }
-        MetalVariant::PagedSdpaSteel => paged_steel_sdpa_supported(dispatch)?,
+        MetalVariant::PagedSdpaSteel | MetalVariant::PagedSdpaSteel256 => {
+            paged_steel_sdpa_supported(dispatch)?
+        }
         MetalVariant::PagedSdpaSteelHalf
         | MetalVariant::PagedSdpaSteelHalf32x16
-        | MetalVariant::PagedSdpaSteelHalf64x16 => paged_half_steel_sdpa_supported(dispatch)?,
+        | MetalVariant::PagedSdpaSteelHalf64x16
+        | MetalVariant::PagedSdpaSteelHalf256 => paged_half_steel_sdpa_supported(dispatch)?,
         MetalVariant::TopKSingleK8 => dispatch_kernel(dispatch)? == "topk_single",
         MetalVariant::PagedSdpaAppendGqa32
         | MetalVariant::PagedSdpaAppendGqa64
