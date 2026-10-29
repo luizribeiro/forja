@@ -5627,18 +5627,22 @@ impl MetalBackend {
         dispatch_threadgroups(
             encoder,
             MTLSize {
-                width: usize::try_from(kv_heads).map_err(|_| BackendError::InvalidInput)?,
+                width: usize::try_from(if width == 256 { query_heads } else { kv_heads })
+                    .map_err(|_| BackendError::InvalidInput)?,
                 height: 1,
                 depth: usize::try_from(blocks).map_err(|_| BackendError::InvalidInput)?,
             },
             MTLSize {
-                width: usize::try_from(
-                    32_u32
-                        .checked_mul(heads_per_group)
-                        .and_then(|count| count.checked_mul(query_length))
-                        .ok_or(BackendError::InvalidInput)?,
-                )
-                .map_err(|_| BackendError::InvalidInput)?,
+                width: required_thread_count(
+                    first.maxTotalThreadsPerThreadgroup(),
+                    usize::try_from(
+                        32_u32
+                            .checked_mul(if width == 256 { 1 } else { heads_per_group })
+                            .and_then(|count| count.checked_mul(query_length))
+                            .ok_or(BackendError::InvalidInput)?,
+                    )
+                    .map_err(|_| BackendError::InvalidInput)?,
+                )?,
                 height: 1,
                 depth: 1,
             },
@@ -5676,7 +5680,11 @@ impl MetalBackend {
                 depth: 1,
             },
             MTLSize {
-                width: second.maxTotalThreadsPerThreadgroup(),
+                width: if width == 256 {
+                    required_thread_count(second.maxTotalThreadsPerThreadgroup(), 1024)?
+                } else {
+                    second.maxTotalThreadsPerThreadgroup()
+                },
                 height: 1,
                 depth: 1,
             },
@@ -8769,14 +8777,15 @@ fn vector_sdpa_supported(dispatch: &Dispatch) -> Result<bool, BackendError> {
 }
 
 fn vector_f32_supported(dispatch: &Dispatch) -> bool {
-    dispatch
-        .inputs()
-        .iter()
-        .chain(std::iter::once(dispatch.output()))
-        .all(|tensor| {
-            tensor.layout().dtype() == DType::F32
-                && tensor.layout().strides().last().copied() == Some(1)
-        })
+    dispatch.inputs()[0].layout().shape().last() != Some(&256)
+        && dispatch
+            .inputs()
+            .iter()
+            .chain(std::iter::once(dispatch.output()))
+            .all(|tensor| {
+                tensor.layout().dtype() == DType::F32
+                    && tensor.layout().strides().last().copied() == Some(1)
+            })
 }
 
 fn vector_kernel(prefix: &str, width: u32) -> Result<&'static str, BackendError> {
@@ -8785,12 +8794,15 @@ fn vector_kernel(prefix: &str, width: u32) -> Result<&'static str, BackendError>
         ("mlx_sdpa_vector", 128) => Ok("mlx_sdpa_vector_128"),
         ("mlx_sdpa_vector_2pass_1", 64) => Ok("mlx_sdpa_vector_2pass_1_64"),
         ("mlx_sdpa_vector_2pass_1", 128) => Ok("mlx_sdpa_vector_2pass_1_128"),
+        ("mlx_sdpa_vector_2pass_1", 256) => Ok("mlx_sdpa_vector_2pass_1_256"),
         ("mlx_sdpa_vector_2pass_1_gqa", 64) => Ok("mlx_sdpa_vector_2pass_1_gqa_64"),
         ("mlx_sdpa_vector_2pass_1_gqa", 128) => Ok("mlx_sdpa_vector_2pass_1_gqa_128"),
         ("mlx_sdpa_vector_2pass_2", 64) => Ok("mlx_sdpa_vector_2pass_2_64"),
         ("mlx_sdpa_vector_2pass_2", 128) => Ok("mlx_sdpa_vector_2pass_2_128"),
+        ("mlx_sdpa_vector_2pass_2", 256) => Ok("mlx_sdpa_vector_2pass_2_256"),
         ("mlx_sdpa_vector_2pass", 64) => Ok("mlx_sdpa_vector_2pass_64"),
         ("mlx_sdpa_vector_2pass", 128) => Ok("mlx_sdpa_vector_2pass_128"),
+        ("mlx_sdpa_vector_2pass", 256) => Ok("mlx_sdpa_vector_2pass_256"),
         ("mlx_sdpa_vector_2pass_gqa", 64) => Ok("mlx_sdpa_vector_2pass_gqa_64"),
         ("mlx_sdpa_vector_2pass_gqa", 128) => Ok("mlx_sdpa_vector_2pass_gqa_128"),
         ("mlx_sdpa_vector_f32", 64) => Ok("mlx_sdpa_vector_f32_64"),
@@ -8895,7 +8907,8 @@ fn select_sdpa(dispatch: &Dispatch) -> Result<SdpaKernel, BackendError> {
             | MetalVariant::SdpaVectorTwoPass128
             | MetalVariant::SdpaVectorTwoPass256
             | MetalVariant::SdpaVectorTwoPass512
-            | MetalVariant::SdpaVectorTwoPass1024,
+            | MetalVariant::SdpaVectorTwoPass1024
+            | MetalVariant::SdpaWideTwoPass,
         ) => Ok(SdpaKernel::Vector),
         Some(
             MetalVariant::SdpaVectorGqaTwoPass32
@@ -8935,7 +8948,7 @@ fn vector_two_pass_blocks(dispatch: &Dispatch) -> Option<u32> {
         MetalVariant::SdpaVectorTwoPass256 | MetalVariant::SdpaVectorGqaTwoPass256 => Some(256),
         MetalVariant::SdpaVectorTwoPass512 => Some(512),
         MetalVariant::SdpaVectorTwoPass1024 => Some(1024),
-        MetalVariant::SdpaVectorGqaTwoPass32 => Some(32),
+        MetalVariant::SdpaVectorGqaTwoPass32 | MetalVariant::SdpaWideTwoPass => Some(32),
         _ => None,
     }
 }
@@ -9001,6 +9014,10 @@ pub(super) fn variant_supported(
             .ok_or(BackendError::InvalidInput)
     };
     Ok(match variant {
+        MetalVariant::SdpaWideTwoPass => {
+            let [_, queries, width] = shape3(dispatch.inputs()[0].layout())?;
+            queries == 1 && width == 256
+        }
         MetalVariant::PagedSdpaWideTwoPass
         | MetalVariant::DeltaRule
         | MetalVariant::CausalDepthwiseConv
@@ -14319,6 +14336,33 @@ mod tests {
             assert_mixed_sdpa(SdpaKernel::Steel, None, 7, 33, dtype);
             assert_mixed_sdpa(SdpaKernel::Vector, None, 1, 33, dtype);
             assert_mixed_sdpa(SdpaKernel::Vector, Some(64), 1, 1024, dtype);
+        }
+    }
+
+    #[test]
+    fn metal_decode_256_matches_cpu_with_strided_caches() {
+        let backend = MetalBackend::new().unwrap();
+        let _override = SdpaOverride::vector_two_pass(32);
+        for dtype in [DType::F32, DType::F16, DType::BF16] {
+            for keys in [1, 7, 33, 4097] {
+                assert_backends_agree_at_tolerance(
+                    &CpuBackend::new(),
+                    &backend,
+                    Op::Sdpa {
+                        scale: 0.0625,
+                        causal: true,
+                        q_start: keys - 1,
+                    },
+                    &[
+                        TensorSpec::contiguous(DType::F32, &[24, 1, 256]),
+                        TensorSpec::permuted(dtype, &[keys, 4, 256], &[1, 0, 2]),
+                        TensorSpec::permuted(dtype, &[keys, 4, 256], &[1, 0, 2]),
+                    ],
+                    &TensorSpec::contiguous(DType::F32, &[24, 1, 256]),
+                    dtype,
+                )
+                .unwrap();
+            }
         }
     }
 

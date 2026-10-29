@@ -57,6 +57,7 @@ pub(crate) enum MetalVariant {
     SdpaVectorGqaTwoPass256,
     SdpaSteel,
     SdpaSteelHalf,
+    SdpaWideTwoPass,
     SdpaSteel256,
     SdpaSteelHalf256,
     PagedSdpaVector,
@@ -769,6 +770,12 @@ const PAGED_WIDE_TWO_PASS: &[Constraint] = &[
     PAGED_GQA_TWO_PASS[2],
 ];
 
+const SDPA_WIDE_TWO_PASS: &[Constraint] = &[
+    value(QUERY_LENGTH, Relation::Equal(1)),
+    SDPA_STEEL_256[1],
+    SDPA_STEEL_256[2],
+];
+
 macro_rules! variant {
     (@batch_invariant $batch_invariant:expr;
      $name:literal, $operation:ident, $implementation:ident, $constraints:expr,
@@ -1474,6 +1481,15 @@ pub(crate) static REGISTRY: &[VariantDef<MetalVariant>] = &[
         &["head-width-256 decode at any integral grouped-query ratio."],
         &["multi-token queries."],
         &["One query head per threadgroup and 32 ordered reduction blocks."]
+    ),
+    batch_invariant_variant!(
+        "sdpa.vector-256-two-pass",
+        Sdpa,
+        SdpaWideTwoPass,
+        SDPA_WIDE_TWO_PASS,
+        &["head-width-256 decode with one query head per threadgroup."],
+        &["multi-token queries."],
+        &["Uses 32 ordered reduction blocks independent of batch and grouped-query ratio."]
     ),
 ];
 
@@ -2213,6 +2229,7 @@ mod tests {
                 "paged-sdpa.steel-256",
                 "paged-sdpa.steel-half-256",
                 "paged-sdpa.vector-256-two-pass",
+                "sdpa.vector-256-two-pass",
             ]
         );
     }
@@ -2738,6 +2755,23 @@ mod tests {
             Err(VariantError::Constraint { .. })
         ));
         assert!(resolve(&f32, "sdpa.steel", METAL4).is_ok());
+    }
+
+    #[test]
+    fn wide_decode_catalog_declares_checked_logical_costs() {
+        let dispatch = sdpa_dispatch(DType::F32, 6, 1, 33, 256, 256);
+        let pick = resolve(&dispatch, "sdpa.vector-256-two-pass", METAL4).unwrap();
+        assert!(pick.is_batch_invariant());
+        let cost = forja_core::KernelCost::of(&dispatch).unwrap();
+        assert_eq!(cost.flops, 2 * 48 * 33 * 512);
+        assert!(
+            resolve(
+                &sdpa_dispatch(DType::F32, 6, 7, 33, 256, 256),
+                "sdpa.vector-256-two-pass",
+                METAL4
+            )
+            .is_err()
+        );
     }
 
     #[test]

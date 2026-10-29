@@ -106,7 +106,7 @@ kernel void NAME(                                                            \
 DEFINE_MLX_SDPA_VECTOR(mlx_sdpa_vector_64, 64)
 DEFINE_MLX_SDPA_VECTOR(mlx_sdpa_vector_128, 128)
 
-template <uint D>
+template <uint D, bool IndependentHeads>
 void mlx_sdpa_vector_2pass_1_body(
     device const uchar *query,
     device const uchar *key,
@@ -120,10 +120,10 @@ void mlx_sdpa_vector_2pass_1_body(
     uint simd_lane) {
     constexpr uint BD = 32;
     constexpr uint elements_per_thread = D / BD;
-    uint kv_head = position.x;
+    uint kv_head = IndependentHeads ? position.x / params.heads_per_group : position.x;
     uint block = position.z;
-    uint query_row = simd_group / params.heads_per_group;
-    uint group_head = simd_group % params.heads_per_group;
+    uint query_row = IndependentHeads ? 0 : simd_group / params.heads_per_group;
+    uint group_head = IndependentHeads ? position.x % params.heads_per_group : simd_group % params.heads_per_group;
     uint head = kv_head * params.heads_per_group + group_head;
     float q[elements_per_thread];
     float result[elements_per_thread];
@@ -177,7 +177,7 @@ void mlx_sdpa_vector_2pass_1_body(
     }
 }
 
-#define DEFINE_MLX_SDPA_VECTOR_PASS1(NAME, D)                               \
+#define DEFINE_MLX_SDPA_VECTOR_PASS1(NAME, D, INDEPENDENT)                               \
 kernel void NAME(                                                            \
     device const uchar *query [[buffer(0)]],                                 \
     device const uchar *key [[buffer(1)]],                                   \
@@ -189,12 +189,13 @@ kernel void NAME(                                                            \
     uint3 position [[threadgroup_position_in_grid]],                         \
     uint simd_group [[simdgroup_index_in_threadgroup]],                      \
     uint simd_lane [[thread_index_in_simdgroup]]) {                          \
-    mlx_sdpa_vector_2pass_1_body<D>(query, key, value, partials, sums, maxs, \
+    mlx_sdpa_vector_2pass_1_body<D, INDEPENDENT>(query, key, value, partials, sums, maxs, \
                                     params, position, simd_group, simd_lane); \
 }
 
-DEFINE_MLX_SDPA_VECTOR_PASS1(mlx_sdpa_vector_2pass_1_64, 64)
-DEFINE_MLX_SDPA_VECTOR_PASS1(mlx_sdpa_vector_2pass_1_128, 128)
+DEFINE_MLX_SDPA_VECTOR_PASS1(mlx_sdpa_vector_2pass_1_64, 64, false)
+DEFINE_MLX_SDPA_VECTOR_PASS1(mlx_sdpa_vector_2pass_1_128, 128, false)
+DEFINE_MLX_SDPA_VECTOR_PASS1(mlx_sdpa_vector_2pass_1_256, 256, true)
 
 template <uint D, uint G, uint HPT>
 void mlx_sdpa_vector_2pass_1_gqa_body(
@@ -424,6 +425,7 @@ kernel void NAME(                                                            \
 
 DEFINE_MLX_SDPA_VECTOR_PASS2(mlx_sdpa_vector_2pass_2_64, 64)
 DEFINE_MLX_SDPA_VECTOR_PASS2(mlx_sdpa_vector_2pass_2_128, 128)
+DEFINE_MLX_SDPA_VECTOR_PASS2(mlx_sdpa_vector_2pass_2_256, 256)
 
 template <uint D>
 void mlx_sdpa_vector_f32_body(
