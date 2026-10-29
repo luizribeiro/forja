@@ -1,0 +1,75 @@
+use crate::{Attention, Config, DeltaNet, FeedForward};
+use forja_sdk::{Error, Result, Tensor, Weights, bf16, target::metal::Variant};
+enum Mixer {
+    Recurrent(Box<DeltaNet>),
+    Attention(Box<Attention>),
+}
+/// A pre-normalized hybrid decoder layer with bf16 residual boundaries.
+pub struct DecoderLayer {
+    mixer: Mixer,
+    ffn: FeedForward,
+    input_norm: Tensor<bf16>,
+    post_norm: Tensor<bf16>,
+}
+impl DecoderLayer {
+    /// Loads the mixer selected by the model's fixed layer pattern.
+    ///
+    /// # Errors
+    /// Returns invalid indices, metadata or state/cache allocation errors.
+    pub fn load(weights: &Weights<'_>, config: Config, index: u32, context: u32) -> Result<Self> {
+        config.validate()?;
+        if index >= config.layers {
+            return Err(Error::loading("decoder layer index exceeds the model"));
+        }
+        let mixer = if config.full_attention(index) {
+            Mixer::Attention(Box::new(Attention::load(
+                &weights.scoped("self_attn"),
+                config,
+                context,
+            )?))
+        } else {
+            Mixer::Recurrent(Box::new(DeltaNet::load(
+                &weights.scoped("linear_attn"),
+                config,
+            )?))
+        };
+        Ok(Self {
+            mixer,
+            ffn: FeedForward::load(&weights.scoped("mlp"), config)?,
+            input_norm: weights.tensor("input_layernorm.weight", &[config.hidden])?,
+            post_norm: weights.tensor("post_attention_layernorm.weight", &[config.hidden])?,
+        })
+    }
+    /// Processes one token through the mixer and dense feed-forward residuals.
+    ///
+    /// # Errors
+    /// Refuses invalid input geometry, positions or failed tensor operations.
+    pub fn forward(
+        &mut self,
+        input: &Tensor<bf16>,
+        position: u32,
+        quant: Option<&Variant>,
+        attention: Option<&Variant>,
+    ) -> Result<Tensor<bf16>> {
+        let normalized = input.rms_norm(&self.input_norm, 1.0e-6)?;
+        let mixed = match &mut self.mixer {
+            Mixer::Recurrent(layer) => layer.deltanet_layer(&normalized, quant)?,
+            Mixer::Attention(layer) => {
+                layer.attention_layer(&normalized, position, quant, attention)?
+            }
+        };
+        let residual = (input + &mixed)?;
+        let normalized = residual.rms_norm(&self.post_norm, 1.0e-6)?;
+        &residual + &self.ffn.ffn(&normalized, quant)?
+    }
+    /// Clears recurrent carry before a new sequence. Attention writes replace its live prefix.
+    ///
+    /// # Errors
+    /// Returns private-state quota or allocation errors.
+    pub fn reset(&mut self) -> Result<()> {
+        if let Mixer::Recurrent(layer) = &mut self.mixer {
+            layer.reset()?;
+        }
+        Ok(())
+    }
+}

@@ -15,3 +15,6 @@ pub use attention::Attention;
 
 mod ffn;
 pub use ffn::FeedForward;
+
+mod layer;
+pub use layer::DecoderLayer;

@@ -131,3 +131,41 @@ fn feed_forward_preserves_the_bf16_silu_boundary() -> Result<(), Box<dyn Error>>
     std::fs::remove_file(path)?;
     Ok(())
 }
+
+#[test]
+fn decoder_residuals_match_independent_transformers_layers() -> Result<(), Box<dyn Error>> {
+    let weights = Weights::open(fixture("model.safetensors"))?;
+    let fixtures = golden_fixtures::FixtureDirectory::open(fixture(""))?;
+    let reference = fixtures.prompt("tiny").ok_or("missing tiny fixture")?;
+    for index in [0, 3] {
+        let input = reference
+            .hidden_state(index)
+            .ok_or("missing decoder input")?;
+        let input = Tensor::from_slice(input.values(), &[3, 64])?.to_dtype::<bf16>()?;
+        let expected = reference
+            .hidden_state(index + 1)
+            .ok_or("missing decoder output")?
+            .values();
+        let mut layer = qwen38::DecoderLayer::load(
+            &weights.scoped(format!("language_model.model.layers.{index}")),
+            qwen38::Config::tiny(),
+            u32::try_from(index)?,
+            64,
+        )?;
+        for row in 0..3 {
+            let mut output = layer.forward(&input.narrow(0, row, 1)?, row, None, None)?;
+            if index == 3 {
+                output = output.rms_norm(
+                    &weights.tensor("language_model.model.norm.weight", &[64])?,
+                    1.0e-6,
+                )?;
+            }
+            let start = usize::try_from(row)? * 64;
+            agree(
+                &expected[start..start + 64],
+                &output.to_dtype::<f32>()?.to_vec()?,
+            )?;
+        }
+    }
+    Ok(())
+}
