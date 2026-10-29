@@ -12,3 +12,6 @@ pub use deltanet::DeltaNet;
 
 mod attention;
 pub use attention::Attention;
+
+mod ffn;
+pub use ffn::FeedForward;

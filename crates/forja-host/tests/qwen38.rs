@@ -91,3 +91,43 @@ fn attention_block_matches_transformers_with_per_head_gates() -> Result<(), Box<
     }
     Ok(())
 }
+
+#[test]
+fn feed_forward_preserves_the_bf16_silu_boundary() -> Result<(), Box<dyn Error>> {
+    let mut source = weights::Weights::default();
+    for (name, input, output) in [
+        ("gate_proj", 64_u32, 128_u32),
+        ("up_proj", 64, 128),
+        ("down_proj", 128, 64),
+    ] {
+        let bytes = usize::try_from(input * output / 2)?;
+        let groups = usize::try_from(input * output / 64)?;
+        source.tensor(
+            &format!("{name}.weight"),
+            "U32",
+            &[output, input / 8],
+            &vec![0x11; bytes],
+        );
+        let scale = if input == 64 { 0.015_625 } else { 0.007_812_5 };
+        source.bf16(
+            &format!("{name}.scales"),
+            &[output, input / 64],
+            &vec![scale; groups],
+        );
+        source.bf16(
+            &format!("{name}.biases"),
+            &[output, input / 64],
+            &vec![0.0; groups],
+        );
+    }
+    let path = source.save("ffn")?;
+    let weights = Weights::open(&path)?;
+    let block = qwen38::FeedForward::load(&weights, qwen38::Config::tiny())?;
+    let input = Tensor::from_slice(&[bf16::from_f32(1.0); 64], &[1, 64])?;
+    assert_eq!(
+        block.ffn(&input, None)?.to_dtype::<f32>()?.to_vec()?,
+        [0.730_468_75; 64]
+    );
+    std::fs::remove_file(path)?;
+    Ok(())
+}
