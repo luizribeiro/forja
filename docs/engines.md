@@ -24,10 +24,11 @@ device choices; the host validates generic operations and memory capabilities.
    [`reference.rs`](../engines/smollm2/src/reference.rs): embedding, decoder layer,
    attention, MLP, RMS norm, output. Use a contiguous cache and fixed portable
    algorithms. Return last-token logits and the documented hidden-state taps.
-   Run `cargo nextest run --release -p forja-host --test host -E 'test(smollm2::metal_tiny)'`
+   Run `cargo nextest run --profile ci --release -p forja-host --test host -E 'test(smollm2::cpu_)'`
    for the random-weight cases in [`smollm2.rs`](../crates/forja-host/tests/smollm2.rs).
-   Expect chunked and whole
-   prompts to agree under the shared normwise f32 tolerance.
+   Expect reference and optimized logits and every layer tap to agree under the
+   shared normwise f32 tolerance, including cache continuations. This CPU check
+   needs no model download. Run Metal cases through nextest's serialized group.
 
 4. **Record independent goldens.** Run
    `uv run --locked --project support/golden support/golden/smollm2.py --model "$FORJA_MODELS/SmolLM2-135M-Instruct" --out "$FORJA_MODELS/golden/smollm2-135m-instruct"`.

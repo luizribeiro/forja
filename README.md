@@ -1,6 +1,6 @@
 # Forja
 
-**Fast, capability-safe LLM inference on Apple Silicon.**
+**Capability-safe LLM inference on Apple Silicon.**
 
 Forja is a Rust host that runs inference engines as WebAssembly components and
 executes their GPU work through Metal 4. Engines own their architectures and
@@ -22,7 +22,7 @@ tuning; small, import-free chat components own message formatting.
 | Qwen3-Coder-30B-A3B-Instruct | [MLX 4-bit](engines/qwen3-coder/) |
 
 Use macOS with Metal 4, Apple Silicon, Nix with flakes enabled, and a checkout of
-this repository. From its root, download the pinned Apache-2.0 model and build:
+this repository. These commands use the Apple M3 Ultra profile. From the root, download the pinned Apache-2.0 model and build:
 
 ```sh
 nix develop
