@@ -7,7 +7,7 @@ pub const MAX_PAGE_TOKENS: u32 = 4_096;
 /// Largest accepted plane count in one pool.
 pub const MAX_PAGED_PLANES: usize = 4_096;
 const MAX_LABEL_BYTES: usize = 64;
-const POISON_GENERATION: u32 = u32::MAX;
+pub(crate) const POISON_GENERATION: u32 = u32::MAX;
 
 /// One authenticated logical-to-physical page mapping.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

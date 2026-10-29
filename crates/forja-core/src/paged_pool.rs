@@ -1195,6 +1195,18 @@ fn preflight_pages(
     pages: u64,
     extra_bytes: u64,
 ) -> Result<(), PagePoolError> {
+    for &index in state
+        .free
+        .iter()
+        .rev()
+        .take(usize::try_from(pages).map_err(|_| PagePoolError::ArithmeticOverflow)?)
+    {
+        let page = state
+            .pages
+            .get(index as usize)
+            .ok_or(PagePoolError::CorruptState)?;
+        next_generation(page.generation)?;
+    }
     let free = u64::try_from(state.free.len()).map_err(|_| PagePoolError::ArithmeticOverflow)?;
     let missing = pages.saturating_sub(free);
     if missing > 0 && pool.inner.fixed_capacity {
@@ -1231,6 +1243,13 @@ fn grow_for(pool: &PagePool, state: &mut PoolState, pages: u64) -> Result<(), Pa
     Ok(())
 }
 
+fn next_generation(current: u32) -> Result<u32, PagePoolError> {
+    current
+        .checked_add(1)
+        .filter(|&next| next != crate::paged::POISON_GENERATION)
+        .ok_or(PagePoolError::ArithmeticOverflow)
+}
+
 fn allocate_pages(state: &mut PoolState, count: u64) -> Result<Vec<PageLease>, PagePoolError> {
     let mut pages =
         Vec::with_capacity(usize::try_from(count).map_err(|_| PagePoolError::ArithmeticOverflow)?);
@@ -1243,10 +1262,7 @@ fn allocate_pages(state: &mut PoolState, count: u64) -> Result<Vec<PageLease>, P
         if page.lifecycle != PageLifecycle::Free || page.references != 0 {
             return Err(PagePoolError::CorruptState);
         }
-        page.generation = page
-            .generation
-            .checked_add(1)
-            .ok_or(PagePoolError::ArithmeticOverflow)?;
+        page.generation = next_generation(page.generation)?;
         page.references = 1;
         page.lifecycle = PageLifecycle::Allocated;
         pages.push(PageLease {
@@ -1289,6 +1305,33 @@ mod tests {
             limit,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn poison_generation_is_never_allocated_and_exhaustion_is_atomic() {
+        let pool = pool(1024);
+        pool.lock().unwrap().pages[0].generation = u32::MAX - 2;
+        let last = pool.reserve(4).unwrap();
+        assert_eq!(
+            last.table().unwrap().entries()[0].generation(),
+            u32::MAX - 1
+        );
+        drop(last);
+        let before = pool.memory_usage().unwrap();
+        let free = pool.lock().unwrap().free.clone();
+        assert!(matches!(
+            pool.reserve(12),
+            Err(PagePoolError::ArithmeticOverflow)
+        ));
+        assert_eq!(pool.memory_usage().unwrap(), before);
+        assert_eq!(pool.lock().unwrap().free, free);
+        assert!(
+            PageTable::new(
+                PageTable::poisoned(1).entries().to_vec(),
+                vec![u32::MAX - 1]
+            )
+            .is_err()
+        );
     }
 
     #[test]
