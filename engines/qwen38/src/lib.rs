@@ -9,3 +9,6 @@ pub mod quant;
 mod deltanet;
 mod numerics;
 pub use deltanet::DeltaNet;
+
+mod attention;
+pub use attention::Attention;

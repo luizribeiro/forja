@@ -65,3 +65,29 @@ fn recurrent_block_matches_transformers_token_by_token() -> Result<(), Box<dyn E
     }
     Ok(())
 }
+
+#[test]
+fn attention_block_matches_transformers_with_per_head_gates() -> Result<(), Box<dyn Error>> {
+    let weights = Weights::open(fixture("model.safetensors"))?;
+    let reference = Weights::open(fixture("blocks.safetensors"))?;
+    let inputs = reference
+        .tensor::<f32>("block_input_3", &[3, 64])?
+        .to_dtype::<bf16>()?;
+    let outputs = reference
+        .tensor::<f32>("block_output_3", &[3, 64])?
+        .to_vec()?;
+    let mut block = qwen38::Attention::load(
+        &weights.scoped("language_model.model.layers.3.self_attn"),
+        qwen38::Config::tiny(),
+        64,
+    )?;
+    for row in 0..3 {
+        let actual = block
+            .attention_layer(&inputs.narrow(0, row, 1)?, row, None, None)?
+            .to_dtype::<f32>()?
+            .to_vec()?;
+        let start = usize::try_from(row)? * 64;
+        agree(&outputs[start..start + 64], &actual)?;
+    }
+    Ok(())
+}
