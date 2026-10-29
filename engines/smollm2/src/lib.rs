@@ -2,6 +2,7 @@
 
 #![cfg_attr(not(target_family = "wasm"), forbid(unsafe_code))]
 
+mod optimized;
 pub mod reference;
 pub mod variants;
 
@@ -191,6 +192,7 @@ pub struct SmolLM2 {
 
 enum Execution {
     Reference(reference::Reference),
+    Optimized(optimized::Optimized),
 }
 
 impl SmolLM2 {
@@ -214,8 +216,14 @@ impl SmolLM2 {
                 .filter(|&n| n > 0 && n <= config.layers)
                 .ok_or_else(|| forja_sdk::Error::loading("unsupported layer count"))?;
         }
+        forja_sdk::EngineTunings::new(load, variants::TUNINGS)?;
+        let path = if load.tunings.iter().any(|name| name == "optimized") {
+            Execution::Optimized(optimized::Optimized::load(weights, config, context, load)?)
+        } else {
+            Execution::Reference(reference::Reference::load(weights, config, context)?)
+        };
         Ok(Self {
-            path: Execution::Reference(reference::Reference::load(weights, config, context)?),
+            path,
             context,
             #[cfg(target_family = "wasm")]
             decode: forja_sdk::nn::blocks::DecodeState::new(context, config.vocab)?,
@@ -247,6 +255,19 @@ impl forja_sdk::Engine for SmolLM2 {
         match &mut self.path {
             Execution::Reference(engine) => {
                 engine.forward(&input.tokens, input.start_pos, input.taps)
+            }
+            Execution::Optimized(engine) => {
+                let sequence = input.tokens.shape()[0];
+                engine.forward(
+                    &input.tokens,
+                    sequence,
+                    &input.start_pos.into(),
+                    &(input.start_pos + sequence).into(),
+                    &(sequence - 1).into(),
+                    input.start_pos,
+                    None,
+                    input.taps,
+                )
             }
         }
     }

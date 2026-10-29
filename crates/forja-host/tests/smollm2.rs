@@ -121,3 +121,42 @@ fn optimized_registry_requires_complete_known_selections() {
     unknown.tunings.push("unknown".to_owned());
     assert!(Variants::new(&unknown, 64).is_err());
 }
+
+#[test]
+fn metal_tiny_optimized_matches_reference() -> Result<(), Box<dyn Error>> {
+    compare_paths(&optimized_load())
+}
+
+fn compare_paths(load: &EngineLoadConfig) -> Result<(), Box<dyn Error>> {
+    forja_sdk::set_native_device(forja_sdk::NativeDevice::Metal);
+    let path = tiny_weights()?;
+    let weights = Weights::open(&path)?;
+    let plain = EngineLoadConfig {
+        max_context: Some(64),
+        ..EngineLoadConfig::default()
+    };
+    for count in [1, 7, 33] {
+        let mut reference = SmolLM2::with_config(&weights, &plain, Config::tiny())?;
+        let mut optimized = SmolLM2::with_config(&weights, load, Config::tiny())?;
+        let tokens = (0..count).map(|index| index % 33).collect::<Vec<_>>();
+        let mut outputs = Vec::new();
+        for engine in [&mut reference, &mut optimized] {
+            outputs.push(engine.step(forja_sdk::StepInput {
+                tokens: Tensor::from_slice(&tokens, &[count])?,
+                start_pos: 0,
+                taps: true,
+            })?);
+        }
+        for (expected, actual) in std::iter::once((&outputs[0].logits, &outputs[1].logits))
+            .chain(outputs[0].taps.iter().zip(&outputs[1].taps))
+        {
+            forja_testing::assert_f32_values_agree(&expected.to_vec()?, &actual.to_vec()?)?;
+        }
+        forja_testing::assert_f32_values_agree(
+            &step(&mut reference, &[7], count)?,
+            &step(&mut optimized, &[7], count)?,
+        )?;
+    }
+    fs::remove_file(path)?;
+    Ok(())
+}
