@@ -4,12 +4,14 @@ mod record;
 pub use record::StateRecording;
 #[cfg(test)]
 mod quota_tests;
+mod submit;
+pub use submit::StateSubmission;
 
 use crate::{Host, Limits, compute, guest_error, invalid_handle, quota};
 use forja_core::{Backend, Layout, PagePoolError, StateLayout, StatePool, StateSequence, Tensor};
 use std::sync::{
-    Arc,
-    atomic::{AtomicU64, Ordering},
+    Arc, Mutex,
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
 const POOL_METADATA_RESERVE: u64 = 4096;
@@ -45,6 +47,8 @@ pub struct StateStorage<B: Backend> {
     charge: StateCharge,
     limit: u64,
     limits: Limits,
+    last_submission: Mutex<u64>,
+    poisoned: AtomicBool,
 }
 
 impl<B: Backend + 'static> Host<B> {
@@ -99,6 +103,8 @@ impl<B: Backend + 'static> Host<B> {
             charge,
             limit: self.limits.live_bytes,
             limits: self.limits,
+            last_submission: Mutex::new(0),
+            poisoned: AtomicBool::new(false),
         };
         for plane in storage.pool.layout().planes() {
             let elements = u32::try_from(plane.elements())
@@ -120,6 +126,7 @@ impl<B: Backend> StateStorage<B> {
     /// # Errors
     /// Returns quota or backend failure without exposing an incompletely initialized sequence.
     pub fn reserve(&self) -> Result<StateSequence, compute::Error> {
+        self.check_usable()?;
         let sequence = self.pool.reserve().map_err(pool_error)?;
         let table = sequence.allocation_table().map_err(pool_error)?;
         for (plane, descriptor) in self.pool.layout().planes().iter().enumerate() {
@@ -143,6 +150,16 @@ impl<B: Backend> StateStorage<B> {
             }
         }
         Ok(sequence)
+    }
+
+    fn check_usable(&self) -> Result<(), compute::Error> {
+        if self.poisoned.load(Ordering::Acquire) {
+            Err(invalid_handle(
+                "state storage requires reload after an uncertain submission",
+            ))
+        } else {
+            Ok(())
+        }
     }
 
     fn version_view(&self, plane: usize, record: u32) -> Result<Tensor, compute::Error> {

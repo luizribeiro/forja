@@ -8,13 +8,13 @@ use std::sync::Arc;
 
 /// A transaction recording that never exposes state backing as ordinary tensors.
 pub struct StateRecording<B: Backend> {
-    storage: Arc<StateStorage<B>>,
-    transaction: StateTransaction,
+    pub(super) storage: Arc<StateStorage<B>>,
+    pub(super) transaction: StateTransaction,
     access: StateAccess,
     metadata: Vec<Tensor>,
     _charge: StateCharge,
-    commands: CommandList,
-    updated: Vec<bool>,
+    pub(super) commands: CommandList,
+    pub(super) updated: Vec<bool>,
 }
 
 impl<B: Backend> StateStorage<B> {
@@ -27,6 +27,7 @@ impl<B: Backend> StateStorage<B> {
         sequence: &StateSequence,
         transaction: StateTransaction,
     ) -> Result<StateRecording<B>, compute::Error> {
+        self.check_usable()?;
         let records = self.planes[0].layout().shape()[0];
         let bytes = u64::from(records)
             .checked_mul(8)
