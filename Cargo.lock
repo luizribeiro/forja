@@ -878,6 +878,7 @@ dependencies = [
  "olmoe",
  "qwen3",
  "qwen3-coder",
+ "qwen38",
  "serde",
  "serde_json",
  "smollm2",
@@ -1861,6 +1862,13 @@ version = "0.0.0"
 dependencies = [
  "forja-chat-format",
  "serde_json",
+]
+
+[[package]]
+name = "qwen38"
+version = "0.0.0"
+dependencies = [
+ "forja-sdk",
 ]
 
 [[package]]

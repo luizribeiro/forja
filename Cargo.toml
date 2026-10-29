@@ -5,6 +5,7 @@ exclude = [
   "engines/olmoe",
   "engines/qwen3",
   "engines/qwen3-coder",
+  "engines/qwen38",
   "engines/smollm2",
 ]
 members = [
