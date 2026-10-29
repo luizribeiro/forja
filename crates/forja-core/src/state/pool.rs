@@ -2,7 +2,7 @@ use std::{
     collections::VecDeque,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicU64, Ordering},
     },
 };
 
@@ -56,6 +56,7 @@ impl StatePool {
             identity: Arc::new(()),
             committed: 0,
             latest_serial: 0,
+            latest_submission: 0,
             pending: VecDeque::new(),
             drain_until: 0,
         })
@@ -104,6 +105,7 @@ pub struct StateSequence {
     identity: Arc<()>,
     committed: u32,
     latest_serial: u64,
+    latest_submission: u64,
     pending: VecDeque<StateTransaction>,
     drain_until: u64,
 }
@@ -115,11 +117,11 @@ pub struct StateTransaction {
     serial: u64,
     input: u32,
     output: u32,
-    submitted: Arc<AtomicBool>,
+    submitted: Arc<AtomicU64>,
 }
 
 impl StateTransaction {
-    /// Submission serial whose completion governs publication and reuse.
+    /// Monotonic transaction serial within its owning sequence.
     #[must_use]
     pub const fn serial(&self) -> u64 {
         self.serial
@@ -154,30 +156,45 @@ impl StateSequence {
             serial,
             input,
             output,
-            submitted: Arc::new(AtomicBool::new(false)),
+            submitted: Arc::new(AtomicU64::new(0)),
         };
         self.latest_serial = serial;
         self.pending.push_back(transaction.clone());
         Ok(transaction)
     }
 
-    /// Seals a version before queue submission, preserving predecessor order.
+    /// Seals a version using its transaction serial as the queue position.
+    /// Use [`Self::mark_submitted_at`] when sequences have independent serials.
     ///
     /// # Errors
     /// Refuses stale, duplicate or out-of-order submissions without publishing state.
     pub fn mark_submitted(&mut self, transaction: &StateTransaction) -> Result<(), PagePoolError> {
+        self.mark_submitted_at(transaction, transaction.serial)
+    }
+
+    /// Seals an update at a host-assigned queue position, independent of sequence serials.
+    ///
+    /// # Errors
+    /// Refuses zero, stale, duplicate or out-of-order queue positions.
+    pub fn mark_submitted_at(
+        &mut self,
+        transaction: &StateTransaction,
+        queue_serial: u64,
+    ) -> Result<(), PagePoolError> {
         let index = self.pending_index(transaction)?;
-        if transaction.submitted.load(Ordering::Acquire)
+        if queue_serial <= self.latest_submission
+            || transaction.submitted.load(Ordering::Acquire) != 0
             || self
                 .pending
                 .iter()
                 .take(index)
-                .any(|tx| !tx.submitted.load(Ordering::Acquire))
+                .any(|tx| tx.submitted.load(Ordering::Acquire) == 0)
         {
             return Err(PagePoolError::InvalidCheckpoint);
         }
-        self.storage.mark_submitted(transaction.serial)?;
-        transaction.submitted.store(true, Ordering::Release);
+        self.storage.mark_submitted(queue_serial)?;
+        self.latest_submission = queue_serial;
+        transaction.submitted.store(queue_serial, Ordering::Release);
         Ok(())
     }
 
@@ -204,10 +221,10 @@ impl StateSequence {
             return Err(PagePoolError::InvalidCheckpoint);
         }
         let submitted = transaction.submitted.load(Ordering::Acquire);
-        if success && !submitted {
+        if success && submitted == 0 {
             return Err(PagePoolError::InvalidCheckpoint);
         }
-        if submitted && self.pool.completed.load(Ordering::Acquire) < transaction.serial {
+        if submitted != 0 && self.pool.completed.load(Ordering::Acquire) < submitted {
             return Err(PagePoolError::BankInFlight);
         }
         if success {
@@ -217,8 +234,9 @@ impl StateSequence {
             self.drain_until = self
                 .pending
                 .iter()
-                .filter(|tx| tx.submitted.load(Ordering::Acquire))
-                .fold(0, |serial, tx| serial.max(tx.serial));
+                .map(|tx| tx.submitted.load(Ordering::Acquire))
+                .max()
+                .unwrap_or(0);
             self.pending.clear();
         }
         Ok(())
@@ -330,6 +348,23 @@ mod tests {
         assert!(a.finish(&retry, true).is_err());
         assert!(a.bind(&retry).is_err());
     }
+    #[test]
+    fn independent_sequence_serials_use_distinct_queue_positions() {
+        let layout = StateLayout::new(vec![StatePlane::new(DType::F32, vec![7]).unwrap()]).unwrap();
+        let pool = StatePool::new(layout, 2, 1024).unwrap();
+        let mut a = pool.reserve().unwrap();
+        let mut b = pool.reserve().unwrap();
+        let first = a.begin(1).unwrap();
+        let second = b.begin(1).unwrap();
+        a.mark_submitted_at(&first, 11).unwrap();
+        b.mark_submitted_at(&second, 12).unwrap();
+        pool.observe_completion(11).unwrap();
+        a.finish(&first, true).unwrap();
+        assert_eq!(b.finish(&second, true), Err(PagePoolError::BankInFlight));
+        pool.observe_completion(12).unwrap();
+        b.finish(&second, true).unwrap();
+    }
+
     #[test]
     fn retiring_state_is_never_reallocated_before_its_reader_drains() {
         let layout =
