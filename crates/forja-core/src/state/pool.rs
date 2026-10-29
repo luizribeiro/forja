@@ -13,7 +13,7 @@ const VERSIONS: u64 = 3;
 /// Allocator for opaque sequence state, including two speculative descendants.
 #[derive(Clone)]
 pub struct StatePool {
-    layout: StateLayout,
+    layout: Arc<StateLayout>,
     pages: PagePool,
     completed: Arc<AtomicU64>,
 }
@@ -33,7 +33,7 @@ impl StatePool {
             .ok_or(PagePoolError::ArithmeticOverflow)?;
         let pages = PagePool::new_fixed(layout.storage_layout().clone(), records, byte_limit)?;
         Ok(Self {
-            layout,
+            layout: Arc::new(layout),
             pages,
             completed: Arc::new(AtomicU64::new(0)),
         })
@@ -41,7 +41,7 @@ impl StatePool {
 
     /// Validated geometry of the pool's private backing.
     #[must_use]
-    pub const fn layout(&self) -> &StateLayout {
+    pub fn layout(&self) -> &StateLayout {
         &self.layout
     }
 
@@ -226,6 +226,15 @@ impl StateSequence {
 }
 
 impl StateSequence {
+    /// Returns reserved version identities for trusted backend initialization.
+    ///
+    /// # Errors
+    /// Returns an error for stale or corrupted allocation metadata.
+    #[doc(hidden)]
+    pub fn allocation_table(&self) -> Result<PageTable, PagePoolError> {
+        self.storage.table()
+    }
+
     /// Builds the slot-bound input/output allocation table for a live transaction.
     ///
     /// # Errors

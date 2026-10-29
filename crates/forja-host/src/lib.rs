@@ -8,6 +8,8 @@ pub use prompt::PromptChunking;
 #[cfg(test)]
 mod fuzz_tests;
 mod native;
+mod state;
+pub use state::StateStorage;
 mod weights;
 
 use std::time::{Duration, Instant};
