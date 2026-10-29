@@ -18,3 +18,6 @@ pub use ffn::FeedForward;
 
 mod layer;
 pub use layer::DecoderLayer;
+
+mod model;
+pub use model::Model;
