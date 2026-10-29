@@ -1,5 +1,6 @@
 //! Text-only Qwen3.8 inference with affine four-bit weights.
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
+#![cfg_attr(not(target_family = "wasm"), forbid(unsafe_code))]
 mod config;
 pub use config::Config;
 
@@ -21,3 +22,10 @@ pub use layer::DecoderLayer;
 
 mod model;
 pub use model::Model;
+
+#[cfg_attr(
+    target_family = "wasm",
+    allow(unsafe_code, reason = "wit-bindgen generates the component ABI shim")
+)]
+mod engine;
+pub use engine::Qwen38;

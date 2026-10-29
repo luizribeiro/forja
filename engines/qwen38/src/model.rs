@@ -15,6 +15,7 @@ pub struct Model {
     layers: Vec<DecoderLayer>,
     quant: Option<Variant>,
     attention: Option<Variant>,
+    pub(crate) sample: Option<Variant>,
 }
 impl Model {
     /// Loads the text checkpoint and validates every tensor required by its declared layers.
@@ -84,6 +85,10 @@ impl Model {
             attention: picks
                 .as_ref()
                 .map(|picks| picks.at("attention", 0))
+                .transpose()?,
+            sample: picks
+                .as_ref()
+                .map(|picks| picks.at("sample", 0))
                 .transpose()?,
         })
     }

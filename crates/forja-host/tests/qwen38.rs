@@ -174,6 +174,55 @@ fn decoder_residuals_match_independent_transformers_layers() -> Result<(), Box<d
 mod verification;
 
 #[test]
+fn eager_engine_feedback_matches_explicit_tokens() -> Result<(), Box<dyn Error>> {
+    use forja_sdk::{DecodeInput, Engine, SamplingParams};
+    let weights = Weights::open(fixture("model.safetensors"))?;
+    let load = verification::tiny_load();
+    let mut retained = qwen38::Qwen38::with_config(&weights, &load, qwen38::Config::tiny())?;
+    let mut explicit = qwen38::Qwen38::with_config(&weights, &load, qwen38::Config::tiny())?;
+    let sampling = SamplingParams::default();
+    let input = || Tensor::from_slice(&[1, 7, 32], &[3]);
+    let first = retained.decode(DecodeInput {
+        tokens: Some(input()?),
+        start_pos: 0,
+        sampling,
+    })?;
+    let other = explicit.decode(DecodeInput {
+        tokens: Some(input()?),
+        start_pos: 0,
+        sampling,
+    })?;
+    assert_eq!(first.token.to_vec()?, other.token.to_vec()?);
+    let mut token = first.token.to_vec()?;
+    for position in 3..10 {
+        let actual = retained.decode(DecodeInput {
+            tokens: None,
+            start_pos: position,
+            sampling,
+        })?;
+        let expected = explicit.decode(DecodeInput {
+            tokens: Some(Tensor::from_slice(&token, &[1])?),
+            start_pos: position,
+            sampling,
+        })?;
+        token = actual.token.to_vec()?;
+        assert_eq!(token, expected.token.to_vec()?);
+        assert_eq!(actual.logits.to_vec()?, expected.logits.to_vec()?);
+    }
+    assert!(
+        retained
+            .decode(DecodeInput {
+                tokens: None,
+                start_pos: 0,
+                sampling
+            })
+            .is_err()
+    );
+    assert!(qwen38::Qwen38::describe().serving.is_none());
+    Ok(())
+}
+
+#[test]
 fn invalid_spans_refuse_cleanly_and_execution_failure_requires_reload() -> Result<(), Box<dyn Error>>
 {
     let weights = Weights::open(fixture("model.safetensors"))?;
