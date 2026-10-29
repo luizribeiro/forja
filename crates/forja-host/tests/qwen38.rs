@@ -25,3 +25,41 @@ fn affine_projection_validates_storage_and_matches_dequantized_rows() -> Result<
     std::fs::remove_file(path)?;
     Ok(())
 }
+
+fn fixture(name: &str) -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/qwen38")
+        .join(name)
+}
+fn agree(expected: &[f32], actual: &[f32]) -> Result<(), Box<dyn Error>> {
+    let error = golden_fixtures::normwise_relative_error(expected, actual)?;
+    assert!(error <= 1.0e-2, "relative error {error}");
+    Ok(())
+}
+#[test]
+fn recurrent_block_matches_transformers_token_by_token() -> Result<(), Box<dyn Error>> {
+    let weights = Weights::open(fixture("model.safetensors"))?;
+    let reference = Weights::open(fixture("blocks.safetensors"))?;
+    let inputs = reference
+        .tensor::<f32>("block_input_0", &[3, 64])?
+        .to_dtype::<bf16>()?;
+    let outputs = reference
+        .tensor::<f32>("block_output_0", &[3, 64])?
+        .to_vec()?;
+    let mut block = qwen38::DeltaNet::load(
+        &weights.scoped("language_model.model.layers.0.linear_attn"),
+        qwen38::Config::tiny(),
+    )?;
+    for _ in 0..2 {
+        for row in 0..3 {
+            let actual = block
+                .deltanet_layer(&inputs.narrow(0, row, 1)?, None)?
+                .to_dtype::<f32>()?
+                .to_vec()?;
+            let start = usize::try_from(row)? * 64;
+            agree(&outputs[start..start + 64], &actual)?;
+        }
+        block.reset()?;
+    }
+    Ok(())
+}
