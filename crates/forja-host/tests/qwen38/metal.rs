@@ -14,8 +14,8 @@ pub(super) fn tiny_load() -> forja_sdk::EngineLoadConfig {
     .to_vec();
     load
 }
-#[test]
-fn metal_tiny_model_matches_independent_transformers() -> Result<(), Box<dyn Error>> {
+#[tokio::test]
+async fn metal_tiny_model_matches_independent_transformers() -> Result<(), Box<dyn Error>> {
     forja_sdk::set_native_device(forja_sdk::NativeDevice::Metal);
     let weights = Weights::open(fixture("model.safetensors"))?;
     let fixtures = golden_fixtures::FixtureDirectory::open(fixture(""))?;
@@ -26,4 +26,5 @@ fn metal_tiny_model_matches_independent_transformers() -> Result<(), Box<dyn Err
         &mut model,
         fixtures.prompt("tiny").ok_or("missing fixture")?,
     )
+    .await
 }
