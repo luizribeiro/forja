@@ -1,0 +1,219 @@
+{
+  "schema_version": 1,
+  "implementation": "mlx_lm",
+  "model": "/Users/luiz/.cache/forja/models/SmolLM2-135M-Instruct",
+  "settings": {
+    "pp": 512,
+    "tg": 128,
+    "reps": 30,
+    "warmups": 3,
+    "decode_prefill": 8,
+    "contexts": [
+      9,
+      512,
+      2048,
+      4000
+    ],
+    "selection": [
+      "gpu-pipelined"
+    ],
+    "sampling": {
+      "temperature": 0.0,
+      "top_k": 0,
+      "top_p": 1.0,
+      "seed": 0
+    },
+    "breakdown": false,
+    "vary": {}
+  },
+  "tg_context_start": 9,
+  "results": [
+    {
+      "provenance": {
+        "git_commit": "d91117f64a93ce0b333875c30a3837edaaa80950",
+        "engine_component_sha256": null,
+        "device": "Apple M3 Ultra",
+        "os": "macOS 27.0.1",
+        "precision": "bf16",
+        "mlx": "0.32.2",
+        "mlx_lm": "0.31.3"
+      },
+      "prompt_processing": {
+        "tokens_per_second": {
+          "wall": {
+            "median": 25521.045111228275,
+            "p50": 25521.045111228275,
+            "p90": 25773.487773908684,
+            "p99": 26089.06029470432,
+            "ci95": [
+              25279.008420769394,
+              25644.93253884952
+            ]
+          },
+          "gpu": null
+        },
+        "wall_time_seconds": {
+          "median": 0.020061874529346824,
+          "p50": 0.020061874529346824,
+          "p90": 0.020552834030240774,
+          "p99": 0.020985124981962144,
+          "ci95": [
+            0.019964957959018648,
+            0.020253958995454013
+          ]
+        },
+        "gpu_time_seconds": null,
+        "submissions": null
+      },
+      "token_generation": {
+        "tokens_per_second": {
+          "wall": {
+            "median": 479.4725467840382,
+            "p50": 479.4725467840382,
+            "p90": 481.1839373474557,
+            "p99": 483.5895948550112,
+            "ci95": [
+              478.92914374748153,
+              480.5240720323568
+            ]
+          },
+          "gpu": null
+        },
+        "wall_time_seconds": {
+          "median": 0.2669600209919736,
+          "p50": 0.2669600209919736,
+          "p90": 0.26765320799313486,
+          "p99": 0.2681916250148788,
+          "ci95": [
+            0.26637583307456225,
+            0.26726291701197624
+          ]
+        },
+        "gpu_time_seconds": null,
+        "submissions": null
+      },
+      "context_token_generation": [
+        {
+          "context_start": 9,
+          "token_generation": {
+            "tokens_per_second": {
+              "wall": {
+                "median": 479.4725467840382,
+                "p50": 479.4725467840382,
+                "p90": 481.1839373474557,
+                "p99": 483.5895948550112,
+                "ci95": [
+                  478.92914374748153,
+                  480.5240720323568
+                ]
+              },
+              "gpu": null
+            },
+            "wall_time_seconds": {
+              "median": 0.2669600209919736,
+              "p50": 0.2669600209919736,
+              "p90": 0.26765320799313486,
+              "p99": 0.2681916250148788,
+              "ci95": [
+                0.26637583307456225,
+                0.26726291701197624
+              ]
+            },
+            "gpu_time_seconds": null,
+            "submissions": null
+          }
+        },
+        {
+          "context_start": 512,
+          "token_generation": {
+            "tokens_per_second": {
+              "wall": {
+                "median": 433.7984383689843,
+                "p50": 433.7984383689843,
+                "p90": 435.1517027577158,
+                "p99": 435.4786378506451,
+                "ci95": [
+                  433.56437535789433,
+                  434.5455201505891
+                ]
+              },
+              "gpu": null
+            },
+            "wall_time_seconds": {
+              "median": 0.2950679165078327,
+              "p50": 0.2950679165078327,
+              "p90": 0.29592779104132205,
+              "p99": 0.2960693329805508,
+              "ci95": [
+                0.29456062498502433,
+                0.29522720794193447
+              ]
+            },
+            "gpu_time_seconds": null,
+            "submissions": null
+          }
+        },
+        {
+          "context_start": 2048,
+          "token_generation": {
+            "tokens_per_second": {
+              "wall": {
+                "median": 394.3307832205457,
+                "p50": 394.3307832205457,
+                "p90": 395.65082804402107,
+                "p99": 395.9669638622215,
+                "ci95": [
+                  393.63565934097653,
+                  394.9579092871754
+                ]
+              },
+              "gpu": null
+            },
+            "wall_time_seconds": {
+              "median": 0.3246005830587819,
+              "p50": 0.3246005830587819,
+              "p90": 0.3258788329549134,
+              "p99": 0.3279209160245955,
+              "ci95": [
+                0.32408516702707857,
+                0.3251737919636071
+              ]
+            },
+            "gpu_time_seconds": null,
+            "submissions": null
+          }
+        },
+        {
+          "context_start": 4000,
+          "token_generation": {
+            "tokens_per_second": {
+              "wall": {
+                "median": 356.0354826797075,
+                "p50": 356.0354826797075,
+                "p90": 356.5342499990185,
+                "p99": 356.87873301585415,
+                "ci95": [
+                  355.3684530678257,
+                  356.22248311291474
+                ]
+              },
+              "gpu": null
+            },
+            "wall_time_seconds": {
+              "median": 0.35951472900342196,
+              "p50": 0.35951472900342196,
+              "p90": 0.3610637920210138,
+              "p99": 0.36270854203030467,
+              "ci95": [
+                0.3593260000925511,
+                0.3601895410101861
+              ]
+            },
+            "gpu_time_seconds": null,
+            "submissions": null
+          }
+        }
+      ]
+    }
+  ]
+}
