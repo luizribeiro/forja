@@ -14347,24 +14347,31 @@ mod tests {
         let backend = MetalBackend::new().unwrap();
         let _override = SdpaOverride::vector_two_pass(32);
         for dtype in [DType::F32, DType::F16, DType::BF16] {
-            for keys in [1, 7, 33, 4097] {
-                assert_backends_agree_at_tolerance(
-                    &CpuBackend::new(),
-                    &backend,
-                    Op::Sdpa {
-                        scale: 0.0625,
-                        causal: true,
-                        q_start: keys - 1,
-                    },
-                    &[
-                        TensorSpec::contiguous(DType::F32, &[24, 1, 256]),
-                        TensorSpec::permuted(dtype, &[keys, 4, 256], &[1, 0, 2]),
-                        TensorSpec::permuted(dtype, &[keys, 4, 256], &[1, 0, 2]),
-                    ],
-                    &TensorSpec::contiguous(DType::F32, &[24, 1, 256]),
-                    dtype,
-                )
-                .unwrap();
+            let query_dtypes: &[DType] = if dtype == DType::F32 {
+                &[DType::F32]
+            } else {
+                &[DType::F32, dtype]
+            };
+            for &query_dtype in query_dtypes {
+                for keys in [1, 7, 33, 4097] {
+                    assert_backends_agree_at_tolerance(
+                        &CpuBackend::new(),
+                        &backend,
+                        Op::Sdpa {
+                            scale: 0.0625,
+                            causal: true,
+                            q_start: keys - 1,
+                        },
+                        &[
+                            TensorSpec::contiguous(query_dtype, &[24, 1, 256]),
+                            TensorSpec::permuted(dtype, &[keys, 4, 256], &[1, 0, 2]),
+                            TensorSpec::permuted(dtype, &[keys, 4, 256], &[1, 0, 2]),
+                        ],
+                        &TensorSpec::contiguous(query_dtype, &[24, 1, 256]),
+                        dtype,
+                    )
+                    .unwrap();
+                }
             }
         }
     }

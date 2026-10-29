@@ -536,7 +536,7 @@ fn run_sdpa<B: Backend + 'static>(
     variant: Option<&str>,
     rejected_output: Option<&mut Vec<f32>>,
 ) -> Result<Vec<f32>, BackendError> {
-    run_sdpa_with_page_tokens::<_, 128>(
+    run_sdpa_with_page_tokens::<_, 128, false>(
         backend,
         dtype,
         key_length,
@@ -600,7 +600,7 @@ fn append_operand<B: Backend>(
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-fn run_sdpa_with_page_tokens<B: Backend + 'static, const WIDTH: u32>(
+fn run_sdpa_with_page_tokens<B: Backend + 'static, const WIDTH: u32, const REDUCED_QUERY: bool>(
     backend: &B,
     dtype: DType,
     key_length: u32,
@@ -647,7 +647,8 @@ fn run_sdpa_with_page_tokens<B: Backend + 'static, const WIDTH: u32>(
         }
     }
     let query_values = seeded_query_values(query_heads, query_length, WIDTH, query_head_offset);
-    let query_storage = backend.alloc(DType::F32, &[query_length, query_heads, WIDTH])?;
+    let query_dtype = if REDUCED_QUERY { dtype } else { DType::F32 };
+    let query_storage = backend.alloc(query_dtype, &[query_length, query_heads, WIDTH])?;
     let query = backend.view(&query_storage, ViewOp::Permute(vec![1, 0, 2]))?;
     let key = backend.alloc(dtype, &[physical_pages, page_tokens, kv_heads, WIDTH])?;
     let value = backend.alloc(dtype, &[physical_pages, page_tokens, kv_heads, WIDTH])?;
@@ -666,7 +667,7 @@ fn run_sdpa_with_page_tokens<B: Backend + 'static, const WIDTH: u32>(
             }
         }
     }
-    backend.write(&query_storage, &encode(&query_storage_values, DType::F32))?;
+    backend.write(&query_storage, &encode(&query_storage_values, query_dtype))?;
     let append = if variant.is_some_and(|name| name.starts_with("paged-sdpa-append.")) {
         let physical_token = entries[usize::try_from(q_start / page_tokens).unwrap()].0
             * page_tokens
@@ -1262,7 +1263,7 @@ fn metal_paged_append_keeps_attention_bits_and_stored_planes() {
 fn metal_paged_append_gates_inactive_lanes_without_writing() {
     let metal = forja_metal::MetalBackend::new().unwrap();
     for_each_paged_gqa_safety_heads(|query_heads, kv_heads| {
-        let output = run_sdpa_with_page_tokens::<_, 128>(
+        let output = run_sdpa_with_page_tokens::<_, 128, false>(
             &metal,
             DType::F16,
             513,
@@ -1539,7 +1540,7 @@ fn metal_paged_sdpa_falls_back_after_a_consecutive_prefix() {
 fn metal_paged_steel_refuses_tiles_crossing_page_boundaries() {
     let metal = forja_metal::MetalBackend::new().unwrap();
     for page_tokens in [24, 40] {
-        let result = run_sdpa_with_page_tokens::<_, 128>(
+        let result = run_sdpa_with_page_tokens::<_, 128, false>(
             &metal,
             DType::F16,
             page_tokens + 9,
@@ -2050,14 +2051,14 @@ fn metal_paged_append_refuses_unsupported_width_without_writing() {
     assert_eq!(backend.read(&value).unwrap(), before);
 }
 
-fn wide_attention<B: Backend + 'static>(
+fn wide_attention<B: Backend + 'static, const REDUCED_QUERY: bool>(
     backend: &B,
     dtype: DType,
     geometry: (u32, u32),
     variant: Option<&str>,
     page_tokens: u32,
 ) -> Result<Vec<f32>, BackendError> {
-    run_sdpa_with_page_tokens::<_, 256>(
+    run_sdpa_with_page_tokens::<_, 256, REDUCED_QUERY>(
         backend,
         dtype,
         geometry.0,
@@ -2085,15 +2086,20 @@ fn metal_paged_steel_256_matches_cpu_and_checks_page_divisibility() {
         (DType::BF16, "paged-sdpa.steel-half-256", 16),
     ] {
         for queries in [7, 33] {
-            let expected = wide_attention(&cpu, dtype, (33, queries), None, 64).unwrap();
-            let actual = wide_attention(&metal, dtype, (33, queries), Some(variant), 64).unwrap();
+            let expected =
+                wide_attention::<_, false>(&cpu, dtype, (33, queries), None, 64).unwrap();
+            let actual =
+                wide_attention::<_, false>(&metal, dtype, (33, queries), Some(variant), 64)
+                    .unwrap();
             assert!(
                 forja_testing::normwise_relative_error(&expected, &actual)
                     <= forja_testing::dtype_tolerance(dtype).unwrap()
             );
         }
-        assert!(wide_attention(&metal, dtype, (33, 7), Some(variant), tile / 2).is_err());
-        assert!(wide_attention(&metal, dtype, (33, 1), Some(variant), 64).is_err());
+        assert!(
+            wide_attention::<_, false>(&metal, dtype, (33, 7), Some(variant), tile / 2).is_err()
+        );
+        assert!(wide_attention::<_, false>(&metal, dtype, (33, 1), Some(variant), 64).is_err());
     }
 }
 
@@ -2104,15 +2110,16 @@ fn metal_paged_decode_256_matches_cpu_and_gates_poisoned_lanes() {
     let variant = "paged-sdpa.vector-256-two-pass";
     for dtype in [DType::F32, DType::F16, DType::BF16] {
         for length in [1, 7, 33, 4097] {
-            let expected = wide_attention(&cpu, dtype, (length, 1), None, 64).unwrap();
-            let actual = wide_attention(&metal, dtype, (length, 1), Some(variant), 64).unwrap();
+            let expected = wide_attention::<_, false>(&cpu, dtype, (length, 1), None, 64).unwrap();
+            let actual =
+                wide_attention::<_, false>(&metal, dtype, (length, 1), Some(variant), 64).unwrap();
             assert!(
                 forja_testing::normwise_relative_error(&expected, &actual)
                     <= forja_testing::dtype_tolerance(dtype).unwrap()
             );
         }
         for active in [false, true] {
-            let result = run_sdpa_with_page_tokens::<_, 256>(
+            let result = run_sdpa_with_page_tokens::<_, 256, false>(
                 &metal,
                 dtype,
                 33,
@@ -2133,6 +2140,27 @@ fn metal_paged_decode_256_matches_cpu_and_gates_poisoned_lanes() {
             } else {
                 assert!(result.unwrap().iter().all(|&x| x == 0.0));
             }
+        }
+    }
+}
+
+#[test]
+fn metal_wide_attention_matches_cpu_with_reduced_queries() {
+    let cpu = forja_cpu::CpuBackend::new();
+    let metal = forja_metal::MetalBackend::new().unwrap();
+    for dtype in [DType::F16, DType::BF16] {
+        for (variant, queries) in [
+            ("paged-sdpa.vector-256-two-pass", 1),
+            ("paged-sdpa.steel-256", 7),
+            ("paged-sdpa.steel-half-256", 7),
+        ] {
+            let expected = wide_attention::<_, true>(&cpu, dtype, (33, queries), None, 64).unwrap();
+            let actual =
+                wide_attention::<_, true>(&metal, dtype, (33, queries), Some(variant), 64).unwrap();
+            assert!(
+                forja_testing::normwise_relative_error(&expected, &actual)
+                    <= forja_testing::dtype_tolerance(dtype).unwrap()
+            );
         }
     }
 }
