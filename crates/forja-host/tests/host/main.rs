@@ -16,6 +16,8 @@ mod qwen3_coder_engine;
 mod qwen_engine;
 #[path = "../qwen_weights.rs"]
 mod qwen_weights;
+#[path = "../smollm2.rs"]
+mod smollm2;
 #[path = "../tensor_smoke.rs"]
 mod tensor_smoke;
 #[path = "../toy_mlp.rs"]

@@ -154,7 +154,7 @@ fn mlp(weights: &Mlp, hidden: &Tensor<f32>) -> Result<Tensor<f32>> {
 fn linear(weights: &forja_sdk::nn::Linear<f32>, hidden: &Tensor<f32>) -> Result<Tensor<f32>> {
     weights.forward_with(hidden, &Variant::new("matmul.portable")?)
 }
-fn input_length(shape: &[u32], start: u32, context: u32) -> Result<u32> {
+pub(crate) fn input_length(shape: &[u32], start: u32, context: u32) -> Result<u32> {
     match shape {
         [n] if *n > 0 && start.checked_add(*n).is_some_and(|end| end <= context) => Ok(*n),
         _ => Err(forja_sdk::Error::loading("invalid token shape or context")),

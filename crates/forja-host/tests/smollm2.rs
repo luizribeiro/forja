@@ -1,0 +1,88 @@
+//! Random-weight Llama exercises the same projection and cache geometry as the full model.
+
+use forja_sdk::{Engine, EngineLoadConfig, Tensor, Weights};
+use forja_testing::DeterministicValues;
+use smollm2::{Config, SmolLM2};
+use std::{error::Error, fs, path::PathBuf};
+
+#[test]
+fn metal_tiny_reference_accepts_chunked_prompts() -> Result<(), Box<dyn Error>> {
+    forja_sdk::set_native_device(forja_sdk::NativeDevice::Metal);
+    let path = tiny_weights()?;
+    let weights = Weights::open(&path)?;
+    let load = EngineLoadConfig {
+        max_context: Some(64),
+        ..EngineLoadConfig::default()
+    };
+    let mut whole = SmolLM2::with_config(&weights, &load, Config::tiny())?;
+    let expected = step(&mut whole, &[1, 7, 32], 0)?;
+    let mut chunks = SmolLM2::with_config(&weights, &load, Config::tiny())?;
+    step(&mut chunks, &[1], 0)?;
+    let actual = step(&mut chunks, &[7, 32], 1)?;
+    forja_testing::assert_f32_values_agree(&expected, &actual)?;
+    assert!(step(&mut chunks, &[1], 64).is_err());
+    assert!(step(&mut chunks, &[], 0).is_err());
+    fs::remove_file(path)?;
+    Ok(())
+}
+
+fn step(engine: &mut SmolLM2, tokens: &[u32], start_pos: u32) -> Result<Vec<f32>, Box<dyn Error>> {
+    let count = u32::try_from(tokens.len())?;
+    Ok(engine
+        .step(forja_sdk::StepInput {
+            tokens: Tensor::from_slice(tokens, &[count])?,
+            start_pos,
+            taps: false,
+        })?
+        .logits
+        .to_vec()?)
+}
+
+fn tiny_weights() -> Result<PathBuf, Box<dyn Error>> {
+    let mut random = DeterministicValues::new(0x243f_6a88_85a3_08d3);
+    let mut header = serde_json::Map::new();
+    let mut data = Vec::new();
+    let mut tensor = |name: String, shape: &[u32], norm: bool| {
+        let start = data.len();
+        for _ in 0..shape.iter().product::<u32>() {
+            let value = random
+                .next_f32()
+                .mul_add(0.05, if norm { 1.0 } else { 0.0 });
+            let bf16 = forja_sdk::bf16::from_f32(value);
+            data.extend(bf16.to_bits().to_le_bytes());
+        }
+        header.insert(
+            name,
+            serde_json::json!({"dtype":"BF16", "shape":shape,
+            "data_offsets":[start,data.len()]}),
+        );
+    };
+    tensor("model.embed_tokens.weight".to_owned(), &[33, 24], false);
+    tensor("model.norm.weight".to_owned(), &[24], true);
+    for layer in 0..2 {
+        for name in ["input_layernorm", "post_attention_layernorm"] {
+            tensor(format!("model.layers.{layer}.{name}.weight"), &[24], true);
+        }
+        for (name, shape) in [
+            ("self_attn.q_proj", [24, 24]),
+            ("self_attn.k_proj", [8, 24]),
+            ("self_attn.v_proj", [8, 24]),
+            ("self_attn.o_proj", [24, 24]),
+            ("mlp.gate_proj", [40, 24]),
+            ("mlp.up_proj", [40, 24]),
+            ("mlp.down_proj", [24, 40]),
+        ] {
+            tensor(format!("model.layers.{layer}.{name}.weight"), &shape, false);
+        }
+    }
+    let mut header = serde_json::to_vec(&header)?;
+    while !header.len().is_multiple_of(8) {
+        header.push(b' ');
+    }
+    let mut bytes = u64::try_from(header.len())?.to_le_bytes().to_vec();
+    bytes.extend(header);
+    bytes.extend(data);
+    let path = std::env::temp_dir().join(format!("forja-smollm2-{}", std::process::id()));
+    fs::write(&path, bytes)?;
+    Ok(path)
+}

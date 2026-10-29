@@ -1,6 +1,6 @@
 //! Configuration for the `SmolLM2` Llama engine.
 
-#![forbid(unsafe_code)]
+#![cfg_attr(not(target_family = "wasm"), forbid(unsafe_code))]
 
 pub mod reference;
 
@@ -178,4 +178,103 @@ struct Model {
 struct ModelWeights {
     #[load(prefix)]
     model: Model,
+}
+
+/// `SmolLM2` with a profile-selected execution path.
+pub struct SmolLM2 {
+    path: Execution,
+    context: u32,
+    #[cfg(target_family = "wasm")]
+    decode: forja_sdk::nn::blocks::DecodeState,
+}
+
+enum Execution {
+    Reference(reference::Reference),
+}
+
+impl SmolLM2 {
+    /// Loads a real or tiny architecture from the same named bf16 tensors.
+    ///
+    /// # Errors
+    /// Returns an error for invalid load settings, weights, or allocations.
+    pub fn with_config(
+        weights: &forja_sdk::Weights<'_>,
+        load: &forja_sdk::EngineLoadConfig,
+        mut config: Config,
+    ) -> forja_sdk::Result<Self> {
+        config.validate()?;
+        let context = load
+            .max_context
+            .filter(|&n| n > 0 && n <= config.context)
+            .ok_or_else(|| forja_sdk::Error::loading("unsupported profile context"))?;
+        if let Some(layers) = load.num_hidden_layers {
+            config.layers = usize::try_from(layers)
+                .ok()
+                .filter(|&n| n > 0 && n <= config.layers)
+                .ok_or_else(|| forja_sdk::Error::loading("unsupported layer count"))?;
+        }
+        Ok(Self {
+            path: Execution::Reference(reference::Reference::load(weights, config, context)?),
+            context,
+            #[cfg(target_family = "wasm")]
+            decode: forja_sdk::nn::blocks::DecodeState::new(context, config.vocab)?,
+        })
+    }
+}
+
+#[forja_sdk::export_engine]
+impl forja_sdk::Engine for SmolLM2 {
+    fn describe() -> forja_sdk::EngineInfo {
+        forja_sdk::EngineInfo {
+            vocab: 49_152,
+            max_context: 8_192,
+            tap_layers: (1..=30).collect(),
+            router_layers: Vec::new(),
+            serving: None,
+        }
+    }
+
+    fn load(
+        weights: &forja_sdk::Weights<'_>,
+        config: forja_sdk::EngineLoadConfig,
+    ) -> forja_sdk::Result<Self> {
+        Self::with_config(weights, &config, Config::smollm2())
+    }
+
+    fn step(&mut self, input: forja_sdk::StepInput) -> forja_sdk::Result<forja_sdk::StepOutput> {
+        reference::input_length(input.tokens.shape(), input.start_pos, self.context)?;
+        match &mut self.path {
+            Execution::Reference(engine) => {
+                engine.forward(&input.tokens, input.start_pos, input.taps)
+            }
+        }
+    }
+
+    #[cfg(target_family = "wasm")]
+    fn decode(
+        &mut self,
+        input: forja_sdk::DecodeInput,
+    ) -> forja_sdk::Result<forja_sdk::DecodeOutput> {
+        self.decode.select(input.sampling)?;
+        let tokens = match input.tokens {
+            Some(tokens) => tokens,
+            None => self.decode.token()?,
+        };
+        let sequence = reference::input_length(tokens.shape(), input.start_pos, self.context)?;
+        let slot = input
+            .start_pos
+            .checked_add(sequence)
+            .and_then(|end| end.checked_sub(1))
+            .ok_or_else(|| forja_sdk::Error::loading("decode position overflow"))?;
+        let logits = self
+            .step(forja_sdk::StepInput {
+                tokens,
+                start_pos: input.start_pos,
+                taps: false,
+            })?
+            .logits;
+        let selected = logits.sample(&self.decode.sampling()?, slot)?;
+        let token = self.decode.store_selected(&selected, slot)?;
+        Ok(forja_sdk::DecodeOutput { logits, token })
+    }
 }

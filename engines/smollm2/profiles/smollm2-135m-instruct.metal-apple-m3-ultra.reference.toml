@@ -1,0 +1,22 @@
+schema-version = 1
+family = "smollm2"
+
+[model]
+id = "HuggingFaceTB/SmolLM2-135M-Instruct"
+revision = "12fd25f77366fa6b3b4b768ec3050bf629380bac"
+weights-sha256 = "sha256:5af571cbf074e6d21a03528d2330792e532ca608f24ac70a143f6b369968ab8c"
+
+[target]
+component = "wasm32-wasip2"
+backend = "metal"
+device-family = "apple-m3-ultra"
+
+[numerics]
+activations = "f32"
+weights = "f32"
+
+[workload]
+kind = "causal-lm"
+batch = 1
+max-context = 8192
+prefill-chunk = 512
