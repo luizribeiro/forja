@@ -33,3 +33,6 @@ prompt-token-budget = 512
 "attention.prefill" = "sdpa.steel"
 "paged-attention.decode" = "paged-sdpa.vector"
 "paged-attention.prefill" = "paged-sdpa.steel"
+
+[chat]
+component = "smollm2-chat"

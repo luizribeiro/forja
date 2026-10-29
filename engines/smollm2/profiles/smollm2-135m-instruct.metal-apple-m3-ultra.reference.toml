@@ -20,3 +20,6 @@ kind = "causal-lm"
 batch = 1
 max-context = 8192
 prefill-chunk = 512
+
+[chat]
+component = "smollm2-chat"

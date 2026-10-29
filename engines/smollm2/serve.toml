@@ -1,0 +1,4 @@
+[model]
+engine = "target/engines/smollm2-135m-instruct.metal-apple-m3-ultra.f32.wasm"
+profile = "engines/smollm2/profiles/smollm2-135m-instruct.metal-apple-m3-ultra.f32.toml"
+chat_format = "target/engines/smollm2-135m-instruct.metal-apple-m3-ultra.f32.chat-format.wasm"
