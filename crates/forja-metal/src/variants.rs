@@ -2965,10 +2965,51 @@ mod tests {
         );
     }
 
+    fn state_dispatch(delta: bool) -> Dispatch {
+        let cpu = CpuBackend::new();
+        let (access, _) = forja_testing::state_test_metadata().unwrap();
+        let shapes: &[&[u32]] = if delta {
+            &[&[1, 7], &[1, 7], &[3, 7], &[3], &[3], &[3, 7, 7]]
+        } else {
+            &[&[1, 7], &[4, 7], &[3, 7]]
+        };
+        let mut inputs = shapes
+            .iter()
+            .map(|shape| cpu.alloc(DType::F32, shape).unwrap())
+            .collect::<Vec<_>>();
+        for shape in [&[2, 2][..], &[3], &[1]] {
+            inputs.push(cpu.alloc(DType::U32, shape).unwrap());
+        }
+        let output = cpu
+            .alloc(DType::F32, if delta { &[3, 7] } else { &[1, 7] })
+            .unwrap();
+        let next = cpu.alloc(DType::F32, shapes[shapes.len() - 1]).unwrap();
+        let op = if delta {
+            forja_core::StateOp::DeltaRule(access)
+        } else {
+            forja_core::StateOp::CausalDepthwiseConv(access)
+        };
+        let mut commands = CommandList::new();
+        commands
+            .dispatch_many(
+                Op::State(op),
+                &inputs.iter().collect::<Vec<_>>(),
+                &[&output, &next],
+            )
+            .unwrap();
+        commands.into_dispatches().remove(0)
+    }
+
     #[test]
     #[allow(clippy::too_many_lines)]
     fn every_variant_has_an_encoder_accepted_fixture() {
         let fixtures = vec![
+            ("delta-rule.simd", state_dispatch(true), "state_delta_rule"),
+            (
+                "causal-depthwise-conv.direct",
+                state_dispatch(false),
+                "state_causal_conv",
+            ),
             (
                 "matmul.portable",
                 matmul_case(DType::F32, 1, 7, 33, true),
