@@ -28,6 +28,8 @@ mod rounding;
 mod row_programs;
 #[path = "../state.rs"]
 mod state;
+#[path = "../state_auth.rs"]
+mod state_auth;
 #[path = "../top_k.rs"]
 mod top_k;
 #[path = "../variant_dispatch.rs"]
