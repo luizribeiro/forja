@@ -1042,6 +1042,46 @@ fn decode(bytes: &[u8], dtype: DType) -> Result<Vec<f32>, AgreementError> {
         .collect()
 }
 
+/// Builds valid private-version identities and their table/generation/activity test tensors.
+///
+/// # Errors
+/// Returns an error if the small metadata allocator cannot be constructed.
+pub fn state_test_metadata() -> Result<(forja_core::StateAccess, [TensorSpec; 3]), AgreementError> {
+    use forja_core::{StateAccess, StateLayout, StatePlane, StatePool};
+    let layout = StateLayout::new(vec![StatePlane::new(DType::F32, vec![1])?])?;
+    let pool = StatePool::new(layout, 1, 128).map_err(|_| BackendError::InvalidInput)?;
+    let mut sequence = pool.reserve().map_err(|_| BackendError::InvalidInput)?;
+    let tx = sequence.begin(1).map_err(|_| BackendError::InvalidInput)?;
+    let slot = sequence.bind(&tx).map_err(|_| BackendError::InvalidInput)?;
+    let access = StateAccess::from_slot(&slot).map_err(|_| BackendError::InvalidInput)?;
+    let table = slot.table();
+    Ok((
+        access,
+        [
+            TensorSpec::initialized(
+                DType::U32,
+                &[2, 2],
+                table
+                    .entries()
+                    .iter()
+                    .flat_map(|entry| [entry.page(), entry.generation()])
+                    .flat_map(u32::to_le_bytes)
+                    .collect(),
+            ),
+            TensorSpec::initialized(
+                DType::U32,
+                &[3],
+                table
+                    .generations()
+                    .iter()
+                    .flat_map(|word| word.to_le_bytes())
+                    .collect(),
+            ),
+            TensorSpec::initialized(DType::U32, &[1], 1_u32.to_le_bytes().to_vec()),
+        ],
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

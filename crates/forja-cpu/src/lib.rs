@@ -2,6 +2,7 @@
 
 pub mod interpreter;
 pub mod paged;
+mod state;
 
 use std::{ops::Range, sync::Mutex, time::Duration};
 
@@ -1411,7 +1412,7 @@ impl Backend for CpuBackend {
         let result = dispatches
             .into_iter()
             .try_for_each(|dispatch| match dispatch.op() {
-                Op::State(_) => Err(BackendError::UnsupportedOperation),
+                Op::State(operation) => self.execute_state(&dispatch, operation),
                 Op::Program(_) => dispatch
                     .bound_program()
                     .ok_or(BackendError::ExecutionFailed)
