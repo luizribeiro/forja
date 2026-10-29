@@ -1,47 +1,48 @@
 # Forja
 
-Forja is a trusted Rust host for running LLM-written inference engines as WebAssembly components while executing their GPU work through Metal 4 with capability-controlled memory access.
+**Fast, capability-safe LLM inference on Apple Silicon.**
 
-This project is under construction.
+Forja is a Rust host that runs inference engines as WebAssembly components and
+executes their GPU work through Metal 4. Engines own their architectures and
+tuning; small, import-free chat components own message formatting.
 
-See [benchmarking](docs/benchmarking.md) for classic measurements, accelerated gates,
-competitor caching and kernel diagnostics.
+- **Safety by construction.** A restricted kernel language and validated buffer
+  capabilities bound GPU memory access. Guests never submit Metal source.
+- **Measured speed.** [`forja bench` records](engines/smollm2/bench/) preserve model,
+  component, configuration and machine provenance; the [worked example](engines/smollm2/README.md)
+  includes measured optimization gains and an `mlx_lm` comparison.
+- **Engine-owned tuning.** Profiles select kernels, fusion and replay without
+  model or chip switches in the host.
 
-See [engine profiles](engines/) and [chat formats](chat-formats/) for supported models and serving
-formats.
+| Supported model | Profiles and usage |
+| --- | --- |
+| SmolLM2-135M-Instruct | [Reference and optimized f32](engines/smollm2/) |
+| Qwen3-0.6B | [f32 and bf16](engines/qwen3/) |
+| OLMoE-1B-7B-0924 | [bf16](engines/olmoe/) |
+| Qwen3-Coder-30B-A3B-Instruct | [MLX 4-bit](engines/qwen3-coder/) |
 
-`forja serve` provides no authentication. By default it reuses exact token prefixes from earlier
-requests on engines with a paged KV cache; `cached_tokens` and response timing therefore reveal
-cache membership. The cache keeps a bounded LRU index of many prefixes, so any recently served
-prompt can be probed. Contiguous KV caches remain supported but do not reuse prefixes.
-Multi-tenant deployments behind one server should set `serving.prefix-reuse = false` unless their
-trusted upstream provides the required isolation.
+Use macOS with Metal 4, Apple Silicon, Nix with flakes enabled, and a checkout of
+this repository. From its root, download the pinned Apache-2.0 model and build:
 
-Weight grants are capabilities for operator-owned model files. Granted files must not be modified
-or truncated while a guest or tensor can still reference them. Breaking that contract can change
-inference inputs or terminate the host with a bus error.
-
-Measure Metal submission latency with:
-
-```console
-nix develop -c cargo run -p forja-metal --release --example submission_latency
+```sh
+nix develop
+python3 engines/smollm2/download.py && forja build smollm2-135m-instruct.metal-apple-m3-ultra.f32
+forja run --engine smollm2-135m-instruct.metal-apple-m3-ultra.f32 --prompt 'The capital of France is' --max-tokens 16
+forja --isolated -c engines/smollm2/serve.toml --set "model.model=\"$FORJA_MODELS/SmolLM2-135M-Instruct\"" serve
 ```
 
-Generate the Qwen3 transformer golden fixtures once after downloading the model:
+Keep the server running and use a second terminal:
 
-```console
-nix develop -c sh -c 'uv run --project support/golden support/golden/generate.py --model "$FORJA_MODELS/Qwen3-0.6B" --out "$FORJA_MODELS/golden/qwen3-0.6b"'
+```sh
+curl -sS http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/json' -d '{"model":"HuggingFaceTB/SmolLM2-135M-Instruct","messages":[{"role":"user","content":"What is gravity?"}],"max_tokens":32,"temperature":0}'
 ```
 
-Run the pp512/tg128 Forja and MLX-LM engine baselines and print their median wall throughput with 95% confidence intervals:
+Read [serving and configuration](docs/serving.md),
+[adding and optimizing engines](docs/engines.md), [benchmarking](docs/benchmarking.md),
+and [architecture and safety](docs/architecture.md). Serving configuration includes
+the prefix-cache isolation and stable-weight-file contracts.
 
-```console
-nix develop -c sh -c 'cargo run --release -p forja -- bench --engine "$FORJA_ENGINE" --model "$FORJA_MODELS/Qwen3-0.6B" --json /tmp/forja-bench.json && uv run --locked --project support/bench-mlx support/bench-mlx/bench.py --model-dir "$FORJA_MODELS/Qwen3-0.6B" --json /tmp/mlx-bench.json && python3 support/bench-mlx/compare.py /tmp/forja-bench.json /tmp/mlx-bench.json'
-```
-
-Set `FORJA_ENGINE` to the Qwen WebAssembly component to measure. To compare replay behavior,
-pass the default and `no-replay` components with two `--engine` flags.
-
-Use `-c bench/suites/default.toml` for release-comparable measurements. For large models,
-`-c bench/suites/big-model.toml` adds decode probes through 32,000 tokens and uses fewer
-repetitions for faster optimization-loop measurements.
+Forja is under active development. Supported models have profiles, golden-fixture
+verification and recorded benchmarks; context and precision limits are documented
+with each engine. Licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE).
+Model weights retain their upstream licenses.
