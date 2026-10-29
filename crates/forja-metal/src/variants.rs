@@ -3004,6 +3004,36 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     fn every_variant_has_an_encoder_accepted_fixture() {
         let fixtures = vec![
+            (
+                "sdpa.steel-256",
+                sdpa_dispatch(DType::F32, 6, 7, 33, 256, 256),
+                "steel_attention_256",
+            ),
+            (
+                "sdpa.steel-half-256",
+                sdpa_dispatch(DType::BF16, 6, 7, 33, 256, 256),
+                "steel_attention_half_256",
+            ),
+            (
+                "paged-sdpa.steel-256",
+                paged_sdpa_dispatch(DType::F32, 7, 256),
+                "paged_steel_attention_256",
+            ),
+            (
+                "paged-sdpa.steel-half-256",
+                paged_sdpa_dispatch(DType::BF16, 7, 256),
+                "paged_steel_attention_half_256",
+            ),
+            (
+                "paged-sdpa.vector-256-two-pass",
+                paged_sdpa_dispatch_with_heads(DType::F32, 6, 1, 256),
+                "paged_sdpa_2pass_1_independent_256",
+            ),
+            (
+                "sdpa.vector-256-two-pass",
+                sdpa_dispatch(DType::F32, 6, 1, 33, 256, 256),
+                "mlx_sdpa_vector_2pass_256",
+            ),
             ("delta-rule.simd", state_dispatch(true), "state_delta_rule"),
             (
                 "causal-depthwise-conv.direct",
