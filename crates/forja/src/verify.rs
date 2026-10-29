@@ -975,7 +975,8 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[tokio::test]
     #[ignore = "requires FORJA_MODELS and runs in the pre-push hook"]
-    async fn metal_smollm2_replay_preserves_page_crossings() -> Result<(), Box<dyn Error>> {
+    async fn metal_smollm2_replay_preserves_chunk_tails_and_page_crossings()
+    -> Result<(), Box<dyn Error>> {
         use forja_host::{EngineRunner, EngineStep};
         let root = PathBuf::from(env::var_os("FORJA_MODELS").ok_or("FORJA_MODELS is not set")?);
         let component = test_guests::smollm2();
@@ -995,10 +996,11 @@ mod tests {
             runner.load_with_selections(None, &config).await??;
             let mut actual = Vec::new();
             for (tokens, start_pos) in [
-                (vec![7; 63], 0),
-                (vec![9], 63),
-                (vec![11], 64),
-                (vec![13], 65),
+                (vec![7; 1025], 0),
+                (vec![9], 1025),
+                (vec![11], 1026),
+                (vec![13; 33], 1027),
+                (vec![17; 33], 1060),
             ] {
                 let output = runner
                     .step(EngineStep {

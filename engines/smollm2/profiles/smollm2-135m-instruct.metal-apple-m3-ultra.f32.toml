@@ -1,6 +1,6 @@
 schema-version = 1
 family = "smollm2"
-default-tunings = ["optimized", "fused-epilogues"]
+default-tunings = ["optimized", "fused-epilogues", "chunked-prefill"]
 
 [model]
 id = "HuggingFaceTB/SmolLM2-135M-Instruct"

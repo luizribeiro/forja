@@ -25,6 +25,14 @@ pub const TUNINGS: &[Tuning] = &[
         description: "Fuse the gated up projection and residual normalization",
         rationale: "Avoid intermediate activation writes and separate dispatches",
     },
+    Tuning {
+        name: "chunked-prefill",
+        slot: "prefill",
+        device_family: "apple-m3-ultra",
+        shape_class: "llama",
+        description: "Bound prompt graphs to 512 tokens and exact tails",
+        rationale: "Reuse full-chunk captures while bounding live activation storage",
+    },
 ];
 
 /// Validated profile choices for the optimized implementation.

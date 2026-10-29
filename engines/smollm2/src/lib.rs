@@ -195,7 +195,7 @@ pub struct SmolLM2 {
 enum Execution {
     Reference(reference::Reference),
     Optimized {
-        engine: optimized::Optimized,
+        engine: Box<optimized::Optimized>,
         #[cfg(target_family = "wasm")]
         replay: replay::Replay,
     },
@@ -234,9 +234,15 @@ impl SmolLM2 {
         forja_sdk::EngineTunings::new(load, variants::TUNINGS)?;
         let path = if load.tunings.iter().any(|name| name == "optimized") {
             Execution::Optimized {
-                engine: optimized::Optimized::load(weights, config, context, load, pool)?,
+                engine: Box::new(optimized::Optimized::load(
+                    weights, config, context, load, pool,
+                )?),
                 #[cfg(target_family = "wasm")]
-                replay: replay::Replay::new(load.replay)?,
+                replay: replay::Replay::new(
+                    context,
+                    load.replay,
+                    load.tunings.iter().any(|name| name == "chunked-prefill"),
+                )?,
             }
         } else {
             if pool.is_some() {
