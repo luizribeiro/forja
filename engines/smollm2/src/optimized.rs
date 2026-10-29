@@ -6,9 +6,11 @@ use crate::{Config, ModelWeights};
 use forja_sdk::{
     DType, Dim, EngineLoadConfig, Load, PagedCacheSet, PagedPool, Param, Result, StepOutput,
     Tensor, Weights,
-    kernel::{Epilogue, Kernel, TensorRef},
-    nn::blocks::{KvCache, cached_attention_with, residual_norm, residual_norm_kernel},
+    kernel::{Epilogue, Kernel},
+    nn::blocks::{KvCache, residual_norm, residual_norm_kernel},
 };
+#[cfg(target_family = "wasm")]
+use forja_sdk::{kernel::TensorRef, nn::blocks::cached_attention_with};
 
 pub(crate) struct Optimized {
     weights: ModelWeights,
@@ -50,8 +52,13 @@ impl Optimized {
                     .collect::<Result<_>>()?,
             )
         };
+        #[cfg(not(target_family = "wasm"))]
+        let weights = ModelWeights::load(weights, &config)?.for_cpu(config.cpu);
         Ok(Self {
+            #[cfg(target_family = "wasm")]
             weights: ModelWeights::load(weights, &config)?,
+            #[cfg(not(target_family = "wasm"))]
+            weights,
             config,
             #[cfg(target_family = "wasm")]
             context,
@@ -82,7 +89,11 @@ impl Optimized {
         Ok((hidden, normalized))
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "native test fallbacks retain the execution order"
+    )]
     pub(crate) fn forward(
         &mut self,
         tokens: &Tensor<u32>,
@@ -134,16 +145,31 @@ impl Optimized {
                 .linear(&a.v_proj, &normalized)?
                 .reshape(&[sequence, c.kv_heads, c.head_dim])?;
             let attended = match &mut self.caches {
-                Caches::Contiguous(caches) => cached_attention_with(
-                    &query,
-                    &key,
-                    &value,
-                    &mut caches[index],
-                    c.attention_scale(),
-                    start,
-                    end,
-                    pick.choice(),
-                )?,
+                Caches::Contiguous(caches) => {
+                    #[cfg(not(target_family = "wasm"))]
+                    {
+                        crate::native_attention(
+                            [&query, &key, &value],
+                            &mut caches[index],
+                            [start, end],
+                            c,
+                            &pick,
+                        )?
+                    }
+                    #[cfg(target_family = "wasm")]
+                    {
+                        cached_attention_with(
+                            &query,
+                            &key,
+                            &value,
+                            &mut caches[index],
+                            c.attention_scale(),
+                            start,
+                            end,
+                            pick.choice(),
+                        )?
+                    }
+                }
                 Caches::Paged(caches) => {
                     let cache = caches.layer(
                         u32::try_from(index)
@@ -158,12 +184,25 @@ impl Optimized {
                 self.add_norm(&hidden, &update, &layer.post_attention_layernorm)?;
             let gate = self.linear(&layer.mlp.gate_proj, &mlp_input)?;
             let activated = if self.fused {
-                mlp_input.matmul_epilogue_with(
-                    &layer.mlp.up_proj.weight.t()?,
-                    &self.gate_up,
-                    &[TensorRef::new(&gate)?],
-                    &self.variants.linear(sequence)?,
-                )?
+                #[cfg(not(target_family = "wasm"))]
+                {
+                    crate::native_gate_up(
+                        &mlp_input,
+                        &layer.mlp.up_proj,
+                        &gate,
+                        &self.gate_up,
+                        &self.variants.linear(sequence)?,
+                    )?
+                }
+                #[cfg(target_family = "wasm")]
+                {
+                    mlp_input.matmul_epilogue_with(
+                        &layer.mlp.up_proj.weight.t()?,
+                        &self.gate_up,
+                        &[TensorRef::new(&gate)?],
+                        &self.variants.linear(sequence)?,
+                    )?
+                }
             } else {
                 gate.silu_mul(&self.linear(&layer.mlp.up_proj, &mlp_input)?)?
             };
@@ -182,6 +221,16 @@ impl Optimized {
         if taps_enabled {
             taps.push(hidden.contiguous()?);
         }
+        #[cfg(not(target_family = "wasm"))]
+        let logits = crate::native_project(
+            &self.weights.model.embed_tokens,
+            &hidden.narrow(0, last, 1)?,
+            c.cpu,
+            &self.variants.linear(1)?,
+        )?
+        .reshape(&[c.vocab])?
+        .contiguous()?;
+        #[cfg(target_family = "wasm")]
         let logits = self
             .weights
             .model

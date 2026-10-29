@@ -130,7 +130,15 @@ fn metal_tiny_optimized_matches_reference() -> Result<(), Box<dyn Error>> {
 }
 
 fn compare_paths(load: &EngineLoadConfig) -> Result<(), Box<dyn Error>> {
-    forja_sdk::set_native_device(forja_sdk::NativeDevice::Metal);
+    compare_paths_on(load, Config::tiny(), forja_sdk::NativeDevice::Metal)
+}
+
+fn compare_paths_on(
+    load: &EngineLoadConfig,
+    config: Config,
+    device: forja_sdk::NativeDevice,
+) -> Result<(), Box<dyn Error>> {
+    forja_sdk::set_native_device(device);
     let path = tiny_weights()?;
     let weights = Weights::open(&path)?;
     let plain = EngineLoadConfig {
@@ -138,8 +146,8 @@ fn compare_paths(load: &EngineLoadConfig) -> Result<(), Box<dyn Error>> {
         ..EngineLoadConfig::default()
     };
     for count in [1, 7, 33] {
-        let mut reference = SmolLM2::with_config(&weights, &plain, Config::tiny())?;
-        let mut optimized = SmolLM2::with_config(&weights, load, Config::tiny())?;
+        let mut reference = SmolLM2::with_config(&weights, &plain, config)?;
+        let mut optimized = SmolLM2::with_config(&weights, load, config)?;
         let tokens = (0..count).map(|index| index % 33).collect::<Vec<_>>();
         let mut outputs = Vec::new();
         for engine in [&mut reference, &mut optimized] {
@@ -149,6 +157,8 @@ fn compare_paths(load: &EngineLoadConfig) -> Result<(), Box<dyn Error>> {
                 taps: true,
             })?);
         }
+        assert_eq!(outputs[0].taps.len(), 2);
+        assert_eq!(outputs[1].taps.len(), 2);
         for (expected, actual) in std::iter::once((&outputs[0].logits, &outputs[1].logits))
             .chain(outputs[0].taps.iter().zip(&outputs[1].taps))
         {
@@ -177,4 +187,12 @@ fn serving_metadata_preserves_fixed_prompt_boundaries() {
     assert_eq!(info.planes.len(), 60);
     assert_eq!(info.planes[0].elements_per_token, 192);
     assert_eq!(info.prefill_chunk_multiple, None);
+}
+
+#[test]
+fn cpu_tiny_paths_match_with_and_without_fusion() -> Result<(), Box<dyn Error>> {
+    let mut load = optimized_load();
+    compare_paths_on(&load, Config::tiny_cpu(), forja_sdk::NativeDevice::Cpu)?;
+    load.tunings.push("fused-epilogues".to_owned());
+    compare_paths_on(&load, Config::tiny_cpu(), forja_sdk::NativeDevice::Cpu)
 }

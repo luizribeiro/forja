@@ -26,6 +26,8 @@ pub struct Config {
     context: u32,
     epsilon: f32,
     theta: f32,
+    #[cfg(not(target_family = "wasm"))]
+    cpu: bool,
 }
 
 impl Config {
@@ -43,6 +45,8 @@ impl Config {
             context: 8_192,
             epsilon: 1.0e-5,
             theta: 100_000.0,
+            #[cfg(not(target_family = "wasm"))]
+            cpu: false,
         }
     }
 
@@ -60,6 +64,18 @@ impl Config {
             context: 64,
             epsilon: 1.0e-5,
             theta: 100_000.0,
+            #[cfg(not(target_family = "wasm"))]
+            cpu: false,
+        }
+    }
+
+    /// Tiny architecture using the native CPU test backend's basic operators.
+    #[cfg(not(target_family = "wasm"))]
+    #[must_use]
+    pub const fn tiny_cpu() -> Self {
+        Self {
+            cpu: true,
+            ..Self::tiny()
         }
     }
 
@@ -370,12 +386,36 @@ impl forja_sdk::Engine for SmolLM2 {
 }
 
 struct Projection {
+    #[cfg(not(target_family = "wasm"))]
+    cpu: bool,
     weight: forja_sdk::Tensor<f32>,
+}
+
+#[cfg(not(target_family = "wasm"))]
+impl ModelWeights {
+    fn for_cpu(mut self, cpu: bool) -> Self {
+        for layer in &mut self.model.layers {
+            for projection in [
+                &mut layer.self_attn.q_proj,
+                &mut layer.self_attn.k_proj,
+                &mut layer.self_attn.v_proj,
+                &mut layer.self_attn.o_proj,
+                &mut layer.mlp.gate_proj,
+                &mut layer.mlp.up_proj,
+                &mut layer.mlp.down_proj,
+            ] {
+                projection.cpu = cpu;
+            }
+        }
+        self
+    }
 }
 
 impl Load<[u32; 2]> for Projection {
     fn load(weights: &forja_sdk::Weights<'_>, shape: &[u32; 2]) -> forja_sdk::Result<Self> {
         Ok(Self {
+            #[cfg(not(target_family = "wasm"))]
+            cpu: false,
             weight: weights
                 .tensor::<forja_sdk::bf16>("weight", shape)?
                 .to_dtype()?,
@@ -389,6 +429,73 @@ impl Projection {
         input: &forja_sdk::Tensor<f32>,
         selection: &forja_sdk::target::metal::Variant,
     ) -> forja_sdk::Result<forja_sdk::Tensor<f32>> {
+        #[cfg(not(target_family = "wasm"))]
+        if self.cpu {
+            return input.matmul(&self.weight.t()?);
+        }
         input.matmul_with(&self.weight.t()?, selection)
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn native_project(
+    table: &Embedding<f32>,
+    input: &forja_sdk::Tensor<f32>,
+    cpu: bool,
+    pick: &forja_sdk::target::metal::Variant,
+) -> forja_sdk::Result<forja_sdk::Tensor<f32>> {
+    if cpu {
+        table.project(input)
+    } else {
+        table.project_with(input, pick)
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn native_attention(
+    [query, key, value]: [&forja_sdk::Tensor<f32>; 3],
+    cache: &mut forja_sdk::nn::blocks::KvCache<f32>,
+    [start, end]: [&forja_sdk::Dim; 2],
+    config: Config,
+    pick: &forja_sdk::VariantSelection,
+) -> forja_sdk::Result<forja_sdk::Tensor<f32>> {
+    if config.cpu {
+        forja_sdk::nn::blocks::cached_attention(
+            query,
+            key,
+            value,
+            cache,
+            config.attention_scale(),
+            start,
+            end,
+        )
+    } else {
+        forja_sdk::nn::blocks::cached_attention_with(
+            query,
+            key,
+            value,
+            cache,
+            config.attention_scale(),
+            start,
+            end,
+            pick.choice(),
+        )
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn native_gate_up(
+    input: &forja_sdk::Tensor<f32>,
+    up: &Projection,
+    gate: &forja_sdk::Tensor<f32>,
+    epilogue: &forja_sdk::kernel::Epilogue,
+    pick: &forja_sdk::target::metal::Variant,
+) -> forja_sdk::Result<forja_sdk::Tensor<f32>> {
+    let weight = up.weight.t()?;
+    let extra = [forja_sdk::kernel::TensorRef::new(gate)?];
+    if up.cpu {
+        input.matmul_epilogue(&weight, epilogue, &extra)
+    } else {
+        input.matmul_epilogue_with(&weight, epilogue, &extra, pick)
     }
 }

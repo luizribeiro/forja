@@ -2,12 +2,11 @@
 //! and a vocabulary projection tied to the embedding table.
 #![forbid(unsafe_code)]
 use crate::{Attention, Config, DecoderLayer, Mlp, ModelWeights};
+#[cfg(target_family = "wasm")]
+use forja_sdk::nn::blocks::cached_attention_with;
 use forja_sdk::{
     Dim, Result, StepOutput, Tensor,
-    nn::{
-        Embedding, RmsNorm,
-        blocks::{KvCache, cached_attention_with},
-    },
+    nn::{Embedding, RmsNorm, blocks::KvCache},
     target::metal::Variant,
 };
 /// Unfused Llama with a contiguous KV cache.
@@ -28,8 +27,14 @@ impl Reference {
         if context == 0 || context > config.context {
             return Err(forja_sdk::Error::loading("unsupported context"));
         }
+        #[cfg(not(target_family = "wasm"))]
+        let weights =
+            <ModelWeights as forja_sdk::Load<Config>>::load(weights, &config)?.for_cpu(config.cpu);
         Ok(Self {
+            #[cfg(target_family = "wasm")]
             weights: <ModelWeights as forja_sdk::Load<Config>>::load(weights, &config)?,
+            #[cfg(not(target_family = "wasm"))]
+            weights,
             config,
             context,
             caches: (0..config.layers)
@@ -71,6 +76,16 @@ impl Reference {
             taps.push(hidden.contiguous()?);
         }
         let last = hidden.narrow(0, sequence - 1, 1)?;
+        #[cfg(not(target_family = "wasm"))]
+        let logits = crate::native_project(
+            &weights.model.embed_tokens,
+            &last,
+            config.cpu,
+            &Variant::new("matmul.portable")?,
+        )?
+        .reshape(&[config.vocab])?
+        .contiguous()?;
+        #[cfg(target_family = "wasm")]
         let logits = weights
             .model
             .embed_tokens
@@ -134,6 +149,15 @@ fn attention(
             .ok_or_else(|| forja_sdk::Error::loading("attention position overflow"))?,
     );
     let start = Dim::from(start);
+    #[cfg(not(target_family = "wasm"))]
+    let attended = crate::native_attention(
+        [&query, &key, &value],
+        cache,
+        [&start, &end],
+        config,
+        &forja_sdk::VariantSelection::Fixed(Variant::new("sdpa.decomposed")?),
+    )?;
+    #[cfg(target_family = "wasm")]
     let attended = cached_attention_with(
         &query,
         &key,
