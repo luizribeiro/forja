@@ -1,6 +1,5 @@
 //! Reusable transformer blocks.
 
-#[cfg(target_family = "wasm")]
 use crate::SamplingParams;
 use crate::{
     DType, Dim, Element, Error, FloatElement, Graph, Param, Result, Slice, Tensor,
@@ -952,7 +951,6 @@ pub struct KvCache<T: Element> {
 }
 
 /// Captured decode path selected for a request.
-#[cfg(target_family = "wasm")]
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub enum DecodeSelection {
     /// Return logits without selecting a token.
@@ -964,7 +962,6 @@ pub enum DecodeSelection {
 }
 
 /// Shared token buffers, sampling state, and captured decode graphs.
-#[cfg(target_family = "wasm")]
 pub struct DecodeState {
     token: Tensor<u32>,
     output_tokens: Tensor<u32>,
@@ -976,7 +973,6 @@ pub struct DecodeState {
     next_pos: u32,
 }
 
-#[cfg(target_family = "wasm")]
 impl DecodeState {
     /// Allocates decode state for a fixed context capacity.
     ///
@@ -1011,8 +1007,16 @@ impl DecodeState {
                 params.temperature.to_bits(),
                 params.top_k,
                 params.top_p.to_bits(),
-                params.seed as u32,
-                (params.seed >> 32) as u32,
+                u32::from_le_bytes(
+                    params.seed.to_le_bytes()[..4]
+                        .try_into()
+                        .map_err(|_| Error::new("invalid seed word"))?,
+                ),
+                u32::from_le_bytes(
+                    params.seed.to_le_bytes()[4..]
+                        .try_into()
+                        .map_err(|_| Error::new("invalid seed word"))?,
+                ),
             ];
             self.sampling.write(&words)?;
             self.sampling_params = Some(params);
@@ -1034,16 +1038,25 @@ impl DecodeState {
     }
 
     /// Returns an alias of the current token buffer.
+    ///
+    /// # Errors
+    /// Returns an error when the host refuses the tensor view.
     pub fn token(&self) -> Result<Tensor<u32>> {
         self.token.alias()
     }
 
     /// Returns an alias of the generated-token buffer.
+    ///
+    /// # Errors
+    /// Returns an error when the host refuses the tensor view.
     pub fn output_tokens(&self) -> Result<Tensor<u32>> {
         self.output_tokens.alias()
     }
 
     /// Returns an alias of the packed sampling parameters.
+    ///
+    /// # Errors
+    /// Returns an error when the host refuses the tensor view.
     pub fn sampling(&self) -> Result<Tensor<u32>> {
         self.sampling.alias()
     }
@@ -1127,6 +1140,9 @@ impl DecodeState {
     }
 
     /// Returns the selected token stored at `slot`.
+    ///
+    /// # Errors
+    /// Returns an error when the host refuses the tensor view.
     pub fn selected(&self, slot: impl Into<Dim>) -> Result<Tensor<u32>> {
         self.output_tokens.narrow(0, slot, 1)
     }
