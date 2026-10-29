@@ -2164,3 +2164,37 @@ fn metal_wide_attention_matches_cpu_with_reduced_queries() {
         }
     }
 }
+
+#[test]
+fn metal_wide_steel_page_divisibility_covers_near_multiples() {
+    let cpu = forja_cpu::CpuBackend::new();
+    let metal = forja_metal::MetalBackend::new().unwrap();
+    for page_tokens in [24, 40] {
+        let expected =
+            wide_attention::<_, false>(&cpu, DType::F32, (33, 7), None, page_tokens).unwrap();
+        let actual = wide_attention::<_, false>(
+            &metal,
+            DType::F32,
+            (33, 7),
+            Some("paged-sdpa.steel-256"),
+            page_tokens,
+        )
+        .unwrap();
+        assert!(
+            forja_testing::normwise_relative_error(&expected, &actual)
+                <= forja_testing::dtype_tolerance(DType::F32).unwrap()
+        );
+        for dtype in [DType::F16, DType::BF16] {
+            assert!(
+                wide_attention::<_, false>(
+                    &metal,
+                    dtype,
+                    (33, 7),
+                    Some("paged-sdpa.steel-half-256"),
+                    page_tokens
+                )
+                .is_err()
+            );
+        }
+    }
+}
