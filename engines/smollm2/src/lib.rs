@@ -2,6 +2,13 @@
 
 #![forbid(unsafe_code)]
 
+pub mod reference;
+
+use forja_sdk::{
+    Load,
+    nn::{Embedding, EmbeddingConfig, Linear, LinearConfig, RmsNorm, RmsNormConfig},
+};
+
 /// Dimensions shared by the reference and optimized implementations.
 #[derive(Clone, Copy, Debug)]
 pub struct Config {
@@ -105,4 +112,70 @@ mod tests {
         invalid.kv_heads = 0;
         assert!(invalid.validate().is_err());
     }
+}
+
+impl Config {
+    fn linear(input: u32, output: u32) -> LinearConfig {
+        LinearConfig::promoted_bf16(input, output)
+    }
+    fn norm(self) -> RmsNormConfig {
+        RmsNormConfig::promoted_bf16(self.hidden, self.epsilon)
+    }
+}
+
+#[derive(Load)]
+#[load(config = Config)]
+#[allow(clippy::struct_field_names)]
+struct Attention {
+    #[load(prefix, config = Config::linear(config.hidden, config.query_heads * config.head_dim))]
+    q_proj: Linear<f32>,
+    #[load(prefix, config = Config::linear(config.hidden, config.kv_heads * config.head_dim))]
+    k_proj: Linear<f32>,
+    #[load(prefix, config = Config::linear(config.hidden, config.kv_heads * config.head_dim))]
+    v_proj: Linear<f32>,
+    #[load(prefix, config = Config::linear(config.query_heads * config.head_dim, config.hidden))]
+    o_proj: Linear<f32>,
+}
+
+#[derive(Load)]
+#[load(config = Config)]
+#[allow(clippy::struct_field_names)]
+struct Mlp {
+    #[load(prefix, config = Config::linear(config.hidden, config.intermediate))]
+    gate_proj: Linear<f32>,
+    #[load(prefix, config = Config::linear(config.hidden, config.intermediate))]
+    up_proj: Linear<f32>,
+    #[load(prefix, config = Config::linear(config.intermediate, config.hidden))]
+    down_proj: Linear<f32>,
+}
+
+#[derive(Load)]
+#[load(config = Config)]
+struct DecoderLayer {
+    #[load(prefix, config = config.norm())]
+    input_layernorm: RmsNorm<f32>,
+    #[load(prefix)]
+    self_attn: Attention,
+    #[load(prefix, config = config.norm())]
+    post_attention_layernorm: RmsNorm<f32>,
+    #[load(prefix)]
+    mlp: Mlp,
+}
+
+#[derive(Load)]
+#[load(config = Config)]
+struct Model {
+    #[load(prefix, config = EmbeddingConfig::promoted_bf16(config.vocab, config.hidden))]
+    embed_tokens: Embedding<f32>,
+    #[load(prefix, count = config.layers)]
+    layers: Vec<DecoderLayer>,
+    #[load(prefix, config = config.norm())]
+    norm: RmsNorm<f32>,
+}
+
+#[derive(Load)]
+#[load(config = Config)]
+struct ModelWeights {
+    #[load(prefix)]
+    model: Model,
 }
