@@ -48,11 +48,19 @@ fn metal_block_mma_preserves_dense_bits() {
     for transposed in [false, true] {
         let kernel = include_str!("fixtures/block_mma_dense.metal")
             .replace("TEST_TRANSPOSED", if transposed { "true" } else { "false" });
-        let run = |source: &str| dense_result(&format!("{}\n{kernel}", source.replace(entry, "")));
-        let expected = run(&reference);
-        let actual = run(production);
-        assert_eq!(actual, expected, "right_transposed={transposed}");
-        results.push(actual);
+        let run = |source: &str, prefetch: bool| {
+            let kernel = kernel.replace("TEST_PREFETCH", if prefetch { "true" } else { "false" });
+            dense_result(&format!("{}\n{kernel}", source.replace(entry, "")))
+        };
+        let expected = run(&reference, false);
+        for prefetch in [false, true] {
+            let actual = run(production, prefetch);
+            assert_eq!(
+                actual, expected,
+                "right_transposed={transposed}, prefetch={prefetch}"
+            );
+        }
+        results.push(expected);
     }
     assert_eq!(results[0], results[1]);
 }

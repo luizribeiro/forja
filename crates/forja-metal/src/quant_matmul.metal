@@ -1275,9 +1275,9 @@ void grouped_quantized_gemm_impl(
             weights.load(packed, scales, biases, params, expert, inner_origin + block_inner, column_origin, thread_index);
         }
         if constexpr (!skip_high_padding) {
-            mma.multiply(input_tile, weight_tile);
+            mma.template multiply<block_rows == 32 && simdgroups_rows == 2 && simdgroups_columns == 2>(input_tile, weight_tile);
         } else if (mma.has_rows(row_count)) {
-            mma.multiply(input_tile, weight_tile);
+            mma.template multiply<block_rows == 32 && simdgroups_rows == 2 && simdgroups_columns == 2>(input_tile, weight_tile);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
@@ -1417,7 +1417,7 @@ kernel void grouped_quantized_pair_32x32_2x2_blocked(
             gate_weights.load(gate_packed, gate_scales, gate_biases, gate_params, expert, inner_origin + block_inner, column_origin, thread_index);
         }
         if (gate_mma.has_rows(row_count)) {
-            gate_mma.multiply(input_tile, weight_tile);
+            gate_mma.template multiply<true>(input_tile, weight_tile);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         up_weights.template store<tile_stride>(weight_tile, inner_origin, params.inner, thread_index);
@@ -1426,7 +1426,7 @@ kernel void grouped_quantized_pair_32x32_2x2_blocked(
             up_weights.load(up_packed, up_scales, up_biases, up_params, expert, inner_origin + block_inner, column_origin, thread_index);
         }
         if (up_mma.has_rows(row_count)) {
-            up_mma.multiply(input_tile, weight_tile);
+            up_mma.template multiply<true>(input_tile, weight_tile);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
@@ -1722,7 +1722,7 @@ void quantized_gemm_tiled_impl(
             packed, scales, biases, params,
             inner_origin, column_origin, weight_tile, thread_index, thread_count);
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        mma.multiply(input_tile, weight_tile);
+        mma.template multiply<true>(input_tile, weight_tile);
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     for (int row_fragment = 0; row_fragment < mma.row_fragments; ++row_fragment) {

@@ -23,7 +23,7 @@ kernel void steel_gemm_64_32_32_2_2(
                 load_float(b, ulong(origin + k) * params.ldb + n, input1_dtype);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        mma.multiply(left, right);
+        mma.template multiply<TEST_PREFETCH>(left, right);
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     mma.store(output, 0, params.ldd, 0, 0, params.m, params.n, output_dtype);
