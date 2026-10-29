@@ -2,7 +2,7 @@ use std::{
     collections::VecDeque,
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
 
@@ -115,6 +115,7 @@ pub struct StateTransaction {
     serial: u64,
     input: u32,
     output: u32,
+    submitted: Arc<AtomicBool>,
 }
 
 impl StateTransaction {
@@ -132,7 +133,7 @@ impl StateTransaction {
 }
 
 impl StateSequence {
-    /// Starts an update from the newest submitted predecessor.
+    /// Reserves an update from the newest declared predecessor.
     ///
     /// # Errors
     /// Refuses unordered serials, a third descendant, or reuse before failure drain.
@@ -148,16 +149,46 @@ impl StateSequence {
         let output = (0..3)
             .find(|&version| version != self.committed && version != input)
             .ok_or(PagePoolError::BankInFlight)?;
-        self.storage.mark_submitted(serial)?;
         let transaction = StateTransaction {
             identity: Arc::clone(&self.identity),
             serial,
             input,
             output,
+            submitted: Arc::new(AtomicBool::new(false)),
         };
         self.latest_serial = serial;
         self.pending.push_back(transaction.clone());
         Ok(transaction)
+    }
+
+    /// Seals a version before queue submission, preserving predecessor order.
+    ///
+    /// # Errors
+    /// Refuses stale, duplicate or out-of-order submissions without publishing state.
+    pub fn mark_submitted(&mut self, transaction: &StateTransaction) -> Result<(), PagePoolError> {
+        let index = self.pending_index(transaction)?;
+        if transaction.submitted.load(Ordering::Acquire)
+            || self
+                .pending
+                .iter()
+                .take(index)
+                .any(|tx| !tx.submitted.load(Ordering::Acquire))
+        {
+            return Err(PagePoolError::InvalidCheckpoint);
+        }
+        self.storage.mark_submitted(transaction.serial)?;
+        transaction.submitted.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    fn pending_index(&self, transaction: &StateTransaction) -> Result<usize, PagePoolError> {
+        if !Arc::ptr_eq(&self.identity, &transaction.identity) {
+            return Err(PagePoolError::InvalidCheckpoint);
+        }
+        self.pending
+            .iter()
+            .position(|tx| tx.serial == transaction.serial)
+            .ok_or(PagePoolError::InvalidCheckpoint)
     }
 
     /// Publishes successful work or taints its speculative descendants after failure.
@@ -169,22 +200,25 @@ impl StateSequence {
         transaction: &StateTransaction,
         success: bool,
     ) -> Result<(), PagePoolError> {
-        if !Arc::ptr_eq(&self.identity, &transaction.identity)
-            || self
-                .pending
-                .front()
-                .is_none_or(|tx| tx.serial != transaction.serial)
-        {
+        if self.pending_index(transaction)? != 0 {
             return Err(PagePoolError::InvalidCheckpoint);
         }
-        if self.pool.completed.load(Ordering::Acquire) < transaction.serial {
+        let submitted = transaction.submitted.load(Ordering::Acquire);
+        if success && !submitted {
+            return Err(PagePoolError::InvalidCheckpoint);
+        }
+        if submitted && self.pool.completed.load(Ordering::Acquire) < transaction.serial {
             return Err(PagePoolError::BankInFlight);
         }
         if success {
             self.committed = transaction.output;
             self.pending.pop_front();
         } else {
-            self.drain_until = self.latest_serial;
+            self.drain_until = self
+                .pending
+                .iter()
+                .filter(|tx| tx.submitted.load(Ordering::Acquire))
+                .fold(0, |serial, tx| serial.max(tx.serial));
             self.pending.clear();
         }
         Ok(())
@@ -197,14 +231,7 @@ impl StateSequence {
     /// # Errors
     /// Refuses capabilities from another sequence or already retired transactions.
     pub fn bind(&self, transaction: &StateTransaction) -> Result<StateSlot, PagePoolError> {
-        if !Arc::ptr_eq(&self.identity, &transaction.identity)
-            || !self
-                .pending
-                .iter()
-                .any(|tx| tx.serial == transaction.serial)
-        {
-            return Err(PagePoolError::InvalidCheckpoint);
-        }
+        self.pending_index(transaction)?;
         let table = self.storage.table()?;
         let entries = [transaction.input, transaction.output]
             .iter()
@@ -266,6 +293,10 @@ mod tests {
         let first = a.begin(1).unwrap();
         assert!(b.finish(&first, true).is_err());
         let second = a.begin(2).unwrap();
+        assert!(a.mark_submitted(&second).is_err());
+        a.mark_submitted(&first).unwrap();
+        assert!(a.mark_submitted(&first).is_err());
+        a.mark_submitted(&second).unwrap();
         assert!(a.begin(3).is_err());
         assert!(a.finish(&first, true).is_err());
         pool.observe_completion(1).unwrap();
@@ -284,6 +315,7 @@ mod tests {
         let other = StatePool::new(pool.layout().clone(), 1, 1024).unwrap();
         assert!(other.validate_slot(&slot).is_err());
         pool.validate_slot(&StateSlot::poisoned()).unwrap();
+        a.mark_submitted(&retry).unwrap();
         pool.observe_completion(3).unwrap();
         a.finish(&retry, true).unwrap();
         assert!(a.finish(&retry, true).is_err());
@@ -297,6 +329,7 @@ mod tests {
         let pool = StatePool::new(layout, 1, 4096).unwrap();
         let mut sequence = pool.reserve().unwrap();
         let transaction = sequence.begin(7).unwrap();
+        sequence.mark_submitted(&transaction).unwrap();
         let slot = sequence.bind(&transaction).unwrap();
         let access = crate::StateAccess::from_slot(&slot).unwrap();
         assert_ne!(access.source(), access.destination());
@@ -317,5 +350,19 @@ mod tests {
             .is_err()
         );
         assert!(replacement.bind(&transaction).is_err());
+    }
+    #[test]
+    fn an_unsubmitted_cancellation_needs_no_synthetic_gpu_completion() {
+        let layout = StateLayout::new(vec![StatePlane::new(DType::F32, vec![7]).unwrap()]).unwrap();
+        let pool = StatePool::new(layout, 1, 1024).unwrap();
+        let mut sequence = pool.reserve().unwrap();
+        let tx = sequence.begin(10).unwrap();
+        assert!(sequence.finish(&tx, true).is_err());
+        sequence.finish(&tx, false).unwrap();
+        assert!(sequence.mark_submitted(&tx).is_err());
+        let next = sequence.begin(11).unwrap();
+        sequence.finish(&next, false).unwrap();
+        drop(sequence);
+        assert!(pool.reserve().is_ok());
     }
 }
