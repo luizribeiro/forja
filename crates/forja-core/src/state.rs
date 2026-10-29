@@ -1,7 +1,7 @@
 //! Validated geometry for opaque per-sequence state.
 
 mod pool;
-pub use pool::{StatePool, StateSequence, StateTransaction};
+pub use pool::{StatePool, StateSequence, StateSlot, StateTransaction};
 
 use crate::{BackendError, DType, MAX_RANK, PagedLayout, PagedPlane};
 

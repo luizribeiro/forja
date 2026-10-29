@@ -6,7 +6,7 @@ use std::{
     },
 };
 
-use crate::{PagePool, PagePoolError, PagedMemoryUsage, PagedSequence, StateLayout};
+use crate::{PagePool, PagePoolError, PageTable, PagedMemoryUsage, PagedSequence, StateLayout};
 
 const VERSIONS: u64 = 3;
 
@@ -69,6 +69,23 @@ impl StatePool {
         self.pages.observe_completion(serial)?;
         self.completed.fetch_max(serial, Ordering::AcqRel);
         Ok(())
+    }
+
+    /// Checks that a lane capability belongs to this pool before recording work.
+    ///
+    /// # Errors
+    /// Returns a foreign-resource refusal without touching any backing memory.
+    pub fn validate_slot(&self, slot: &StateSlot) -> Result<(), PagePoolError> {
+        if !slot.active
+            || slot
+                .owner
+                .as_ref()
+                .is_some_and(|owner| Arc::ptr_eq(owner, &self.completed))
+        {
+            Ok(())
+        } else {
+            Err(PagePoolError::ForeignResource)
+        }
     }
 
     /// Bytes charged for physical records and hidden tables, including retired records.
@@ -174,6 +191,66 @@ impl StateSequence {
     }
 }
 
+impl StateSequence {
+    /// Builds the slot-bound input/output allocation table for a live transaction.
+    ///
+    /// # Errors
+    /// Refuses capabilities from another sequence or already retired transactions.
+    pub fn bind(&self, transaction: &StateTransaction) -> Result<StateSlot, PagePoolError> {
+        if !Arc::ptr_eq(&self.identity, &transaction.identity)
+            || !self
+                .pending
+                .iter()
+                .any(|tx| tx.serial == transaction.serial)
+        {
+            return Err(PagePoolError::InvalidCheckpoint);
+        }
+        let table = self.storage.table()?;
+        let entries = [transaction.input, transaction.output]
+            .iter()
+            .map(|&index| table.entries()[index as usize])
+            .collect();
+        Ok(StateSlot {
+            table: PageTable::new(entries, table.generations().to_vec())
+                .map_err(|_| PagePoolError::CorruptState)?,
+            active: true,
+            owner: Some(Arc::clone(&self.pool.completed)),
+        })
+    }
+}
+
+/// Host-only immutable lane binding; allocation IDs never become guest tensors.
+#[derive(Clone, Debug)]
+pub struct StateSlot {
+    table: PageTable,
+    active: bool,
+    owner: Option<Arc<AtomicU64>>,
+}
+
+impl StateSlot {
+    /// A padding lane with impossible generations and no authorized state access.
+    #[must_use]
+    pub fn poisoned() -> Self {
+        Self {
+            table: PageTable::poisoned(2),
+            active: false,
+            owner: None,
+        }
+    }
+
+    /// Generation-authenticated input/output mappings for trusted backend upload.
+    #[must_use]
+    pub const fn table(&self) -> &PageTable {
+        &self.table
+    }
+
+    /// Whether the slot may read or update state.
+    #[must_use]
+    pub const fn is_active(&self) -> bool {
+        self.active
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -197,9 +274,19 @@ mod tests {
         assert!(a.begin(3).is_err());
         pool.observe_completion(2).unwrap();
         let retry = a.begin(3).unwrap();
-        assert_ne!(retry.input, retry.output);
+        let slot = a.bind(&retry).unwrap();
+        pool.validate_slot(&slot).unwrap();
+        assert_ne!(
+            slot.table.resolve(0).unwrap(),
+            slot.table.resolve(1).unwrap()
+        );
+        assert!(b.bind(&retry).is_err());
+        let other = StatePool::new(pool.layout().clone(), 1, 1024).unwrap();
+        assert!(other.validate_slot(&slot).is_err());
+        pool.validate_slot(&StateSlot::poisoned()).unwrap();
         pool.observe_completion(3).unwrap();
         a.finish(&retry, true).unwrap();
         assert!(a.finish(&retry, true).is_err());
+        assert!(a.bind(&retry).is_err());
     }
 }
