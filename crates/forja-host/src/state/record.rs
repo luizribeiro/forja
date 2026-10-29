@@ -205,4 +205,59 @@ mod tests {
             charge
         );
     }
+
+    fn failed_predecessor_taints_queued_descendant<B: Backend + 'static>(backend: B) {
+        let host = Host::new(backend, Limits::new(65536, 8, 4096, 128, 4096));
+        let layout =
+            StateLayout::new(vec![StatePlane::new(DType::F32, vec![1, 1]).unwrap()]).unwrap();
+        let storage = host.create_state_storage(layout, 1).unwrap();
+        let mut sequence = storage.reserve().unwrap();
+        let x = host.backend.alloc(DType::F32, &[1, 1]).unwrap();
+        let weights = host.backend.alloc(DType::F32, &[2, 1]).unwrap();
+        let y = host.backend.alloc(DType::F32, &[1, 1]).unwrap();
+        let later_y = host.backend.alloc(DType::F32, &[1, 1]).unwrap();
+        host.backend.write(&x, &2_f32.to_le_bytes()).unwrap();
+        host.backend
+            .write(
+                &weights,
+                &[1_f32.to_le_bytes(), 1_f32.to_le_bytes()].concat(),
+            )
+            .unwrap();
+        host.backend.write(&y, &9_f32.to_le_bytes()).unwrap();
+        let first = sequence.begin(1).unwrap();
+        let mut bad = storage.record(&sequence, first).unwrap();
+        bad.causal_convolution(0, &x, &weights, &y).unwrap();
+        host.backend.write(&bad.metadata[1], &[0; 12]).unwrap();
+        let first = bad.submit(&mut sequence).unwrap();
+        let second = sequence.begin(2).unwrap();
+        let mut descendant = storage.record(&sequence, second).unwrap();
+        descendant
+            .causal_convolution(0, &x, &weights, &later_y)
+            .unwrap();
+        let second = descendant.submit(&mut sequence).unwrap();
+        assert!(first.finish(&mut sequence).is_err());
+        assert!(sequence.begin(3).is_err());
+        assert!(second.finish(&mut sequence).is_err());
+        assert_eq!(host.backend.read(&y).unwrap(), 9_f32.to_le_bytes());
+        let retry = sequence.begin(3).unwrap();
+        let mut retry = storage.record(&sequence, retry).unwrap();
+        retry.causal_convolution(0, &x, &weights, &y).unwrap();
+        retry
+            .submit(&mut sequence)
+            .unwrap()
+            .finish(&mut sequence)
+            .unwrap();
+        assert_eq!(host.backend.read(&y).unwrap(), 2_f32.to_le_bytes());
+    }
+
+    #[test]
+    fn failed_state_submission_restores_checkpoint_after_descendant_drain() {
+        failed_predecessor_taints_queued_descendant(forja_cpu::CpuBackend::new());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_failed_state_submission_restores_checkpoint_after_descendant_drain() {
+        failed_predecessor_taints_queued_descendant(forja_metal::MetalBackend::new().unwrap());
+    }
 }

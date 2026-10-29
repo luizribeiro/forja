@@ -2950,7 +2950,10 @@ impl MetalBackend {
                     || vec![residency.clone()],
                     |graph| vec![residency.clone(), graph.residency.clone()],
                 ),
-                order_on_queue: graph.is_some(),
+                order_on_queue: graph.is_some()
+                    || dispatches
+                        .iter()
+                        .any(|dispatch| matches!(dispatch.op(), Op::State(_))),
             },
             timestamps,
             &mut objects,
