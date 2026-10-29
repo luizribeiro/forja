@@ -12,6 +12,7 @@ mod profile_scope;
 pub mod program;
 mod quantized;
 pub mod roofline;
+mod state;
 mod symbolic;
 mod variant_proof;
 mod variants;
@@ -43,6 +44,7 @@ pub use paged_pool::{
 };
 pub use profile_scope::{ProfileScope, ProfileScopeError};
 pub use quantized::{QuantizedMatrix, QuantizedMatrixError, QuantizedMatrixPart};
+pub use state::{StateLayout, StatePlane};
 pub use symbolic::{
     Affine, ByteHull, MAX_PARAMS, ParamError, ParamSpace, ParamValues, SymbolicLayout,
     SymbolicLayoutError,
