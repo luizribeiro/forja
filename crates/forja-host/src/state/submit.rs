@@ -1,13 +1,15 @@
 use super::{StateRecording, pool_error};
 use crate::{compute, guest_error, invalid_handle};
-use forja_core::{Backend, BackendError, StateSequence, Submission};
+use forja_core::{Backend, BackendError, Submission};
 use std::sync::atomic::Ordering;
 
-/// Retains private state and authentication storage until submitted work drains.
+/// Retains sequence ownership and reconciles a transaction even when dropped early.
+#[must_use = "Finishing publishes state; dropping cancels after one wait."]
 pub struct StateSubmission<B: Backend> {
     recording: StateRecording<B>,
     submission: B::Submission,
-    drained: bool,
+    completion: Option<Result<(), BackendError>>,
+    reconciled: bool,
     queue_position: u64,
 }
 
@@ -17,13 +19,8 @@ impl<B: Backend> StateRecording<B> {
     /// # Errors
     /// Refuses incomplete updates, stale capabilities or exhausted queue positions.
     /// A backend submission failure invalidates the storage until reload.
-    pub fn submit(
-        mut self,
-        sequence: &mut StateSequence,
-    ) -> Result<StateSubmission<B>, compute::Error> {
+    pub fn submit(mut self) -> Result<StateSubmission<B>, compute::Error> {
         self.storage.check_usable()?;
-        let slot = sequence.bind(&self.transaction).map_err(pool_error)?;
-        self.storage.pool.validate_slot(&slot).map_err(pool_error)?;
         if self.updated.iter().any(|&updated| !updated) {
             return Err(invalid_handle(
                 "every state plane must be updated before submission",
@@ -37,7 +34,8 @@ impl<B: Backend> StateRecording<B> {
         let queue_position = last
             .checked_add(1)
             .ok_or_else(|| invalid_handle("state queue timeline is exhausted"))?;
-        sequence
+        self.sequence
+            .lock()
             .mark_submitted_at(&self.transaction, queue_position)
             .map_err(pool_error)?;
         *last = queue_position;
@@ -49,10 +47,12 @@ impl<B: Backend> StateRecording<B> {
                 storage.poisoned.store(true, Ordering::Release);
             })
             .map_err(guest_error)?;
+        self.handed_off = true;
         Ok(StateSubmission {
             recording: self,
             submission,
-            drained: false,
+            completion: None,
+            reconciled: false,
             queue_position,
         })
     }
@@ -62,54 +62,58 @@ impl<B: Backend> StateSubmission<B> {
     /// Drains execution and publishes every plane together on success.
     ///
     /// # Errors
-    /// Returns execution failure without publishing; descendants remain tainted until drain.
-    pub fn finish(self, sequence: &mut StateSequence) -> Result<(), compute::Error> {
-        self.complete(sequence, true)
+    /// Returns a reconciliation or execution failure without publishing failed work.
+    pub fn finish(mut self) -> Result<(), compute::Error> {
+        self.complete(true)
     }
 
-    /// Drains execution and restores the retained predecessor without publication.
+    /// Waits once and restores the retained checkpoint without publication.
     ///
     /// # Errors
-    /// Returns an execution or transaction-order error after draining the command.
-    pub fn cancel(self, sequence: &mut StateSequence) -> Result<(), compute::Error> {
-        self.complete(sequence, false)
+    /// Returns a reconciliation or execution failure after restoring the logical checkpoint.
+    pub fn cancel(mut self) -> Result<(), compute::Error> {
+        self.complete(false)
     }
 
-    fn complete(
-        mut self,
-        sequence: &mut StateSequence,
-        publish: bool,
-    ) -> Result<(), compute::Error> {
-        let result = self.drain();
-        if matches!(result, Err(BackendError::Timeout)) {
-            result.map_err(guest_error)?;
-        } else {
-            let publication = sequence
-                .finish(&self.recording.transaction, publish && result.is_ok())
-                .map_err(pool_error);
-            result.map_err(guest_error)?;
-            publication?;
+    fn complete(&mut self, publish: bool) -> Result<(), compute::Error> {
+        let execution = self.drain();
+        self.reconciled = true;
+        let mut sequence = self.recording.sequence.lock();
+        if matches!(execution, Err(BackendError::Timeout)) {
+            sequence
+                .abandon(&self.recording.transaction)
+                .map_err(pool_error)?;
+        } else if let Err(error) =
+            sequence.finish(&self.recording.transaction, publish && execution.is_ok())
+        {
+            sequence
+                .abandon(&self.recording.transaction)
+                .map_err(pool_error)?;
+            return Err(pool_error(error));
         }
-        Ok(())
+        execution.map_err(guest_error)
     }
 
     fn drain(&mut self) -> Result<(), BackendError> {
-        if self.drained {
-            return Ok(());
+        if let Some(result) = self.completion {
+            return result;
         }
         let result = self.submission.wait();
+        self.completion = Some(result);
         if matches!(result, Err(BackendError::Timeout)) {
             self.recording
                 .storage
                 .poisoned
                 .store(true, Ordering::Release);
-        } else {
-            self.recording
-                .storage
-                .pool
-                .observe_completion(self.queue_position)
-                .map_err(|_| BackendError::ExecutionFailed)?;
-            self.drained = true;
+        } else if self
+            .recording
+            .storage
+            .pool
+            .observe_completion(self.queue_position)
+            .is_err()
+        {
+            self.completion = Some(Err(BackendError::ExecutionFailed));
+            return Err(BackendError::ExecutionFailed);
         }
         result
     }
@@ -117,7 +121,9 @@ impl<B: Backend> StateSubmission<B> {
 
 impl<B: Backend> Drop for StateSubmission<B> {
     fn drop(&mut self) {
-        let _ = self.drain();
+        if !self.reconciled {
+            let _ = self.complete(false);
+        }
     }
 }
 
@@ -138,7 +144,7 @@ mod tests {
         ])
         .unwrap();
         let storage = host.create_state_storage(layout, 1).unwrap();
-        let mut sequence = storage.reserve().unwrap();
+        let sequence = storage.reserve().unwrap();
         let tensor = |shape: &[u32], values: &[f32]| {
             let t = host.backend.alloc(DType::F32, shape).unwrap();
             host.backend
@@ -160,12 +166,13 @@ mod tests {
         let y = tensor(&[1, 1], &[0.]);
         let conv_y = tensor(&[1, 1], &[0.]);
         for (serial, expected) in [(1, 1_f32), (2, 1.5), (3, 1.5)] {
-            let tx = sequence.begin(serial).unwrap();
+            let tx = sequence.begin(serial * 2 - 1).unwrap();
             let mut incomplete = storage.record(&sequence, tx.clone()).unwrap();
             incomplete
                 .delta_rule(0, [&q, &q, &v, &decay, &beta], &y)
                 .unwrap();
-            assert!(incomplete.submit(&mut sequence).is_err());
+            assert!(incomplete.submit().is_err());
+            let tx = sequence.begin(serial * 2).unwrap();
             let mut recording = storage.record(&sequence, tx).unwrap();
             recording
                 .delta_rule(0, [&q, &q, &v, &decay, &beta], &y)
@@ -173,11 +180,11 @@ mod tests {
             recording
                 .causal_convolution(1, &v, &weights, &conv_y)
                 .unwrap();
-            let submission = recording.submit(&mut sequence).unwrap();
+            let submission = recording.submit().unwrap();
             if serial == 2 {
-                submission.cancel(&mut sequence).unwrap();
+                submission.cancel().unwrap();
             } else {
-                submission.finish(&mut sequence).unwrap();
+                submission.finish().unwrap();
             }
             assert_eq!(host.backend.read(&y).unwrap(), expected.to_le_bytes());
             let expected_conv = if serial == 1 { 2_f32 } else { 4_f32 };

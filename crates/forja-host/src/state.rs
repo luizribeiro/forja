@@ -1,16 +1,20 @@
 //! Opaque state storage charged to the runner's allocation budget.
 
 #[cfg(test)]
+mod lifecycle_tests;
+#[cfg(test)]
 mod multiple_sequences;
 mod record;
 pub use record::StateRecording;
 #[cfg(test)]
 mod quota_tests;
+mod sequence;
+pub use sequence::StateSequenceHandle;
 mod submit;
 pub use submit::StateSubmission;
 
 use crate::{Host, Limits, compute, guest_error, invalid_handle, quota};
-use forja_core::{Backend, Layout, PagePoolError, StateLayout, StatePool, StateSequence, Tensor};
+use forja_core::{Backend, Layout, PagePoolError, StateLayout, StatePool, Tensor};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, AtomicU64, Ordering},
@@ -128,7 +132,7 @@ impl<B: Backend> StateStorage<B> {
     ///
     /// # Errors
     /// Returns quota or backend failure without exposing an incompletely initialized sequence.
-    pub fn reserve(&self) -> Result<StateSequence, compute::Error> {
+    pub fn reserve(self: &Arc<Self>) -> Result<StateSequenceHandle<B>, compute::Error> {
         self.check_usable()?;
         let sequence = self.pool.reserve().map_err(pool_error)?;
         let table = sequence.allocation_table().map_err(pool_error)?;
@@ -152,7 +156,7 @@ impl<B: Backend> StateStorage<B> {
                     .map_err(guest_error)?;
             }
         }
-        Ok(sequence)
+        Ok(StateSequenceHandle::new(Arc::clone(self), sequence))
     }
 
     fn check_usable(&self) -> Result<(), compute::Error> {
@@ -239,7 +243,7 @@ mod tests {
         assert!(host.create_state_storage(layout, 2).is_err());
         assert_eq!(host.live_bytes.load(Ordering::Acquire), charged);
         let sequence = storage.reserve().unwrap();
-        let table = sequence.allocation_table().unwrap();
+        let table = sequence.lock().allocation_table().unwrap();
         for entry in table.entries() {
             host.backend
                 .write(&storage.version_view(0, entry.page()).unwrap(), &[0x3f; 28])
@@ -247,7 +251,7 @@ mod tests {
         }
         drop(sequence);
         let replacement = storage.reserve().unwrap();
-        for entry in replacement.allocation_table().unwrap().entries() {
+        for entry in replacement.lock().allocation_table().unwrap().entries() {
             assert_eq!(
                 host.backend
                     .read(&storage.version_view(0, entry.page()).unwrap())

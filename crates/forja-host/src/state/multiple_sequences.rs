@@ -5,8 +5,8 @@ fn independent_serials<B: Backend + 'static>(backend: B) {
     let host = Host::new(backend, Limits::new(65536, 8, 4096, 128, 4096));
     let layout = StateLayout::new(vec![StatePlane::new(DType::F32, vec![1, 1]).unwrap()]).unwrap();
     let storage = host.create_state_storage(layout, 2).unwrap();
-    let mut a = storage.reserve().unwrap();
-    let mut b = storage.reserve().unwrap();
+    let a = storage.reserve().unwrap();
+    let b = storage.reserve().unwrap();
     let x = host.backend.alloc(DType::F32, &[1, 1]).unwrap();
     let weights = host.backend.alloc(DType::F32, &[2, 1]).unwrap();
     let y_a = host.backend.alloc(DType::F32, &[1, 1]).unwrap();
@@ -24,10 +24,10 @@ fn independent_serials<B: Backend + 'static>(backend: B) {
     let mut second = storage.record(&b, second).unwrap();
     first.causal_convolution(0, &x, &weights, &y_a).unwrap();
     second.causal_convolution(0, &x, &weights, &y_b).unwrap();
-    let first = first.submit(&mut a).unwrap();
-    let second = second.submit(&mut b).unwrap();
-    second.finish(&mut b).unwrap();
-    first.finish(&mut a).unwrap();
+    let first = first.submit().unwrap();
+    let second = second.submit().unwrap();
+    second.finish().unwrap();
+    first.finish().unwrap();
     assert_eq!(host.backend.read(&y_a).unwrap(), 2_f32.to_le_bytes());
     assert_eq!(host.backend.read(&y_b).unwrap(), 2_f32.to_le_bytes());
     assert_eq!(a.begin(2).unwrap().input_version(), 1);

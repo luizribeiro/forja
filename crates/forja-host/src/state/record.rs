@@ -1,8 +1,7 @@
-use super::{StateCharge, StateStorage, pool_error};
+use super::{StateCharge, StateSequenceHandle, StateStorage, pool_error};
 use crate::{compute, guest_error, invalid_handle, quota};
 use forja_core::{
-    Backend, CommandList, DType, KernelCost, Op, StateAccess, StateOp, StateSequence,
-    StateTransaction, Tensor,
+    Backend, CommandList, DType, KernelCost, Op, StateAccess, StateOp, StateTransaction, Tensor,
 };
 use std::sync::Arc;
 
@@ -10,6 +9,8 @@ use std::sync::Arc;
 pub struct StateRecording<B: Backend> {
     pub(super) storage: Arc<StateStorage<B>>,
     pub(super) transaction: StateTransaction,
+    pub(super) sequence: StateSequenceHandle<B>,
+    pub(super) handed_off: bool,
     access: StateAccess,
     metadata: Vec<Tensor>,
     _charge: StateCharge,
@@ -24,10 +25,13 @@ impl<B: Backend> StateStorage<B> {
     /// Refuses foreign capabilities, quota exhaustion or backend allocation failure.
     pub fn record(
         self: &Arc<Self>,
-        sequence: &StateSequence,
+        sequence: &StateSequenceHandle<B>,
         transaction: StateTransaction,
     ) -> Result<StateRecording<B>, compute::Error> {
         self.check_usable()?;
+        if !Arc::ptr_eq(self, &sequence.storage) {
+            return Err(invalid_handle("state sequence belongs to another storage"));
+        }
         let records = self.planes[0].layout().shape()[0];
         let bytes = u64::from(records)
             .checked_mul(8)
@@ -35,12 +39,14 @@ impl<B: Backend> StateStorage<B> {
             .and_then(|n| n.checked_add(u64::try_from(self.planes.len()).ok()?.checked_mul(2048)?))
             .ok_or_else(|| quota("state recording size overflow"))?;
         let charge = StateCharge::reserve(Arc::clone(&self.charge.live), self.limit, bytes)?;
-        let slot = sequence.bind(&transaction).map_err(pool_error)?;
+        let slot = sequence.lock().bind(&transaction).map_err(pool_error)?;
         self.pool.validate_slot(&slot).map_err(pool_error)?;
         let access = StateAccess::from_slot(&slot).map_err(pool_error)?;
         let mut recording = StateRecording {
             storage: Arc::clone(self),
             transaction,
+            sequence: sequence.clone(),
+            handed_off: false,
             access,
             metadata: Vec::new(),
             _charge: charge,
@@ -164,6 +170,17 @@ impl<B: Backend> StateRecording<B> {
 
 impl<B: Backend> Drop for StateRecording<B> {
     fn drop(&mut self) {
+        if !self.handed_off {
+            let mut sequence = self.sequence.lock();
+            if sequence.cancel_unsubmitted(&self.transaction).is_err()
+                && self
+                    .storage
+                    .poisoned
+                    .load(std::sync::atomic::Ordering::Acquire)
+            {
+                let _ = sequence.abandon(&self.transaction);
+            }
+        }
         for tensor in &self.metadata {
             let _ = self.storage.backend.release(tensor);
         }
@@ -186,7 +203,7 @@ mod tests {
             StateLayout::new(vec![StatePlane::new(DType::F32, vec![3, 7]).unwrap()]).unwrap();
         let storage = host.create_state_storage(layout.clone(), 1).unwrap();
         let foreign = host.create_state_storage(layout, 1).unwrap();
-        let mut sequence = storage.reserve().unwrap();
+        let sequence = storage.reserve().unwrap();
         let tx = sequence.begin(1).unwrap();
         assert!(foreign.record(&sequence, tx.clone()).is_err());
         let charge = host.live_bytes.load(std::sync::atomic::Ordering::Acquire);
@@ -211,7 +228,7 @@ mod tests {
         let layout =
             StateLayout::new(vec![StatePlane::new(DType::F32, vec![1, 1]).unwrap()]).unwrap();
         let storage = host.create_state_storage(layout, 1).unwrap();
-        let mut sequence = storage.reserve().unwrap();
+        let sequence = storage.reserve().unwrap();
         let x = host.backend.alloc(DType::F32, &[1, 1]).unwrap();
         let weights = host.backend.alloc(DType::F32, &[2, 1]).unwrap();
         let y = host.backend.alloc(DType::F32, &[1, 1]).unwrap();
@@ -228,25 +245,21 @@ mod tests {
         let mut bad = storage.record(&sequence, first).unwrap();
         bad.causal_convolution(0, &x, &weights, &y).unwrap();
         host.backend.write(&bad.metadata[1], &[0; 12]).unwrap();
-        let first = bad.submit(&mut sequence).unwrap();
+        let first = bad.submit().unwrap();
         let second = sequence.begin(2).unwrap();
         let mut descendant = storage.record(&sequence, second).unwrap();
         descendant
             .causal_convolution(0, &x, &weights, &later_y)
             .unwrap();
-        let second = descendant.submit(&mut sequence).unwrap();
-        assert!(first.finish(&mut sequence).is_err());
+        let second = descendant.submit().unwrap();
+        assert!(first.finish().is_err());
         assert!(sequence.begin(3).is_err());
-        assert!(second.finish(&mut sequence).is_err());
+        assert!(second.finish().is_err());
         assert_eq!(host.backend.read(&y).unwrap(), 9_f32.to_le_bytes());
         let retry = sequence.begin(3).unwrap();
         let mut retry = storage.record(&sequence, retry).unwrap();
         retry.causal_convolution(0, &x, &weights, &y).unwrap();
-        retry
-            .submit(&mut sequence)
-            .unwrap()
-            .finish(&mut sequence)
-            .unwrap();
+        retry.submit().unwrap().finish().unwrap();
         assert_eq!(host.backend.read(&y).unwrap(), 2_f32.to_le_bytes());
     }
 
