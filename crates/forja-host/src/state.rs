@@ -16,6 +16,7 @@ pub use cell::StateCell;
 mod record;
 pub use record::StateRecording;
 mod journal;
+mod outcome;
 #[cfg(test)]
 mod quota_tests;
 pub use journal::LanePosition;

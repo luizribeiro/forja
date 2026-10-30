@@ -33,6 +33,7 @@ pub struct StateRecording<B: Backend> {
     pub(super) sequence: StateSequenceHandle<B>,
     pub(super) handed_off: bool,
     pub(super) access: StateAccess,
+    pub(super) predecessor: Option<Arc<super::outcome::StateOutcome>>,
     pub(super) scratch: Vec<super::block::StateScratch<B>>,
     pub(super) metadata: Arc<StateMetadata<B>>,
     pub(super) commands: CommandList,
@@ -75,7 +76,13 @@ impl<B: Backend> StateStorage<B> {
             self.limit.min(limits.live_bytes),
             bytes,
         )?;
-        let slot = sequence.lock().bind(&transaction).map_err(pool_error)?;
+        let (slot, predecessor) = {
+            let sequence = sequence.lock();
+            (
+                sequence.bind(&transaction).map_err(pool_error)?,
+                sequence.dependency(&transaction).map_err(pool_error)?,
+            )
+        };
         self.pool.validate_slot(&slot).map_err(pool_error)?;
         let access = StateAccess::from_slot(&slot).map_err(pool_error)?;
         let table = slot
@@ -95,6 +102,7 @@ impl<B: Backend> StateStorage<B> {
             sequence: sequence.clone(),
             handed_off: false,
             access,
+            predecessor,
             scratch: Vec::new(),
             metadata: Arc::new(metadata),
             commands: CommandList::new(),

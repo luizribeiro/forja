@@ -64,6 +64,7 @@ impl<B: Backend> StateBatch<B> {
             .queue_position
             .lock()
             .map_err(|_| invalid_handle("state queue is poisoned"))?;
+        storage.check_usable()?;
         let position = queue
             .checked_add(1)
             .ok_or_else(|| invalid_handle("state queue timeline exhausted"))?;

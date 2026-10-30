@@ -2,7 +2,7 @@ use super::*;
 use crate::{Host, LanePosition, Limits};
 use forja_core::{DType, StateLayout, StatePlane};
 
-fn queued_cancellation<B: Backend + 'static>(backend: B) {
+fn queued_cancellation<B: Backend + Send + Sync + 'static>(backend: B) {
     let host = Host::new(backend, Limits::new(131_072, 8, 4096, 128, 4096));
     let storage = host
         .create_state_storage(
@@ -71,9 +71,25 @@ fn queued_cancellation<B: Backend + 'static>(backend: B) {
     }
     batch(6, 2).submit_and_finish().unwrap();
     let first = batch(7, 3).submit().unwrap();
-    let second = batch(8, 4).submit().unwrap();
-    first.finish().unwrap();
-    second.finish().unwrap();
+    let second = batch(8, 4);
+    std::thread::scope(|scope| {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = scope.spawn(move || {
+            sender
+                .send(second.submit().and_then(StateBatchSubmission::finish))
+                .unwrap();
+        });
+        assert!(matches!(
+            receiver.recv_timeout(std::time::Duration::from_millis(100)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        first.finish().unwrap();
+        receiver
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
+        worker.join().unwrap();
+    });
     for lane in &lanes {
         assert_eq!(lane.position(), position(4));
     }

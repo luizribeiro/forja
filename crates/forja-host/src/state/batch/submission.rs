@@ -1,6 +1,6 @@
 use super::StateBatch;
 use crate::compute;
-use forja_core::{Backend, Submission};
+use forja_core::{Backend, BackendError, Submission};
 
 /// Completion owner for every lane in a queued protected-state batch.
 #[must_use = "Finish publishes the batch; dropping cancels it after drain."]
@@ -30,9 +30,23 @@ impl<B: Backend> StateBatchSubmission<B> {
 
     fn complete(&mut self, publish: bool) -> Result<(), compute::Error> {
         self.reconciled = true;
-        let execution = self
+        let mut execution = self
             .submission
             .wait_timeout(self.batch.recordings[0].limits.submission_timeout);
+        if execution != Err(BackendError::Timeout) {
+            for recording in &self.batch.recordings {
+                if let Some(predecessor) = &recording.predecessor {
+                    match predecessor.wait(recording.limits.submission_timeout) {
+                        Ok(true) => (),
+                        Ok(false) => execution = Err(BackendError::ExecutionFailed),
+                        Err(error) => {
+                            execution = Err(error);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
         self.batch.reconcile(self.position, execution, publish)
     }
 }

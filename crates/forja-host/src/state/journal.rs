@@ -1,4 +1,6 @@
+use super::outcome::StateOutcome;
 use forja_core::{PagePoolError, StateCheckpoint, StateSequence, StateTransaction};
+use std::sync::Arc;
 use std::{
     collections::VecDeque,
     ops::{Deref, DerefMut},
@@ -19,7 +21,14 @@ pub struct LanePosition {
     pub reserved_tokens: u64,
 }
 
-type Pending = (u64, LanePosition, StateCheckpoint, LanePosition);
+struct Pending {
+    serial: u64,
+    position: LanePosition,
+    predecessor: StateCheckpoint,
+    input: LanePosition,
+    outcome: Arc<StateOutcome>,
+    dependency: Option<Arc<StateOutcome>>,
+}
 
 pub(super) struct StateJournal {
     sequence: StateSequence,
@@ -55,7 +64,10 @@ impl StateJournal {
         serial: u64,
         position: Option<LanePosition>,
     ) -> Result<StateTransaction, PagePoolError> {
-        let input = self.pending.back().map_or(self.position, |entry| entry.1);
+        let input = self
+            .pending
+            .back()
+            .map_or(self.position, |entry| entry.position);
         let position = position.unwrap_or(input);
         if position.tokens > position.reserved_tokens {
             return Err(PagePoolError::InvalidCheckpoint);
@@ -68,8 +80,15 @@ impl StateJournal {
                 return Err(error);
             }
         };
-        self.pending
-            .push_back((serial, position, checkpoint, input));
+        let dependency = self.pending.back().map(|entry| Arc::clone(&entry.outcome));
+        self.pending.push_back(Pending {
+            serial,
+            position,
+            predecessor: checkpoint,
+            input,
+            outcome: Arc::default(),
+            dependency,
+        });
         self.retained = None;
         Ok(transaction)
     }
@@ -81,16 +100,20 @@ impl StateJournal {
         let index = self
             .pending
             .iter()
-            .position(|entry| entry.0 == transaction.serial())
+            .position(|entry| entry.serial == transaction.serial())
             .ok_or(PagePoolError::InvalidCheckpoint)?;
         self.sequence.cancel_unsubmitted(transaction)?;
-        self.pending.truncate(index);
+        for entry in self.pending.drain(index..) {
+            entry.outcome.finish(false);
+        }
         Ok(())
     }
 
     pub(super) fn abandon(&mut self, transaction: &StateTransaction) -> Result<(), PagePoolError> {
         self.sequence.abandon(transaction)?;
-        self.pending.clear();
+        for entry in self.pending.drain(..) {
+            entry.outcome.finish(false);
+        }
         Ok(())
     }
 
@@ -99,19 +122,33 @@ impl StateJournal {
         transaction: &StateTransaction,
         success: bool,
     ) -> Result<(), PagePoolError> {
-        if self.pending.front().map(|entry| entry.0) != Some(transaction.serial()) {
+        if self.pending.front().map(|entry| entry.serial) != Some(transaction.serial()) {
             return Err(PagePoolError::InvalidCheckpoint);
         }
         self.sequence.finish(transaction, success)?;
         if success {
-            if let Some((_, position, predecessor, input)) = self.pending.pop_front() {
-                self.position = position;
-                self.retained = Some((predecessor, input));
+            if let Some(entry) = self.pending.pop_front() {
+                self.position = entry.position;
+                self.retained = Some((entry.predecessor, entry.input));
+                entry.outcome.finish(true);
             }
         } else {
-            self.pending.clear();
+            for entry in self.pending.drain(..) {
+                entry.outcome.finish(false);
+            }
         }
         Ok(())
+    }
+
+    pub(super) fn dependency(
+        &self,
+        transaction: &StateTransaction,
+    ) -> Result<Option<Arc<StateOutcome>>, PagePoolError> {
+        self.pending
+            .iter()
+            .find(|entry| entry.serial == transaction.serial())
+            .map(|entry| entry.dependency.clone())
+            .ok_or(PagePoolError::InvalidCheckpoint)
     }
 
     pub(super) fn rewind(&mut self, tokens: u64) -> Result<(), PagePoolError> {
