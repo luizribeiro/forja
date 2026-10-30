@@ -14,17 +14,6 @@ pub(super) struct StageTest {
     pub(super) panel: Option<u32>,
 }
 
-const SCALAR_STAGES: [&str; 4] = [
-    "state_block_gram",
-    "state_block_solve",
-    "state_block_carry",
-    "state_block_output",
-];
-
-fn panel_width(panel: Option<u32>) -> u32 {
-    panel.unwrap_or(32)
-}
-
 impl MetalBackend {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn encode_delta_block(
@@ -45,7 +34,7 @@ impl MetalBackend {
         }
         let scratch = DeltaBlockScratch::new(query[0], state[0], state[1], state[2])
             .map_err(|_| BackendError::InvalidInput)?;
-        let panel: Option<u32> = None;
+        let panel = super::super::delta_block_mma_panel(dispatch);
         #[cfg(test)]
         let test = dispatch.backend_data::<StageTest>();
         #[cfg(test)]
@@ -78,7 +67,7 @@ impl MetalBackend {
         ]
         .into_iter()
         .chain(scratch.offsets())
-        .chain([panel_width(panel)])
+        .chain([panel.unwrap_or(32)])
         .flat_map(u32::to_ne_bytes)
         .collect();
         let params = arguments.write(&params)?;
@@ -98,7 +87,10 @@ impl MetalBackend {
         bindings.bind(table, tensors.len() + 1, &params);
         bindings.bind(table, tensors.len() + 2, &flag);
         set_argument_table(encoder, table);
-        for (stage, name) in SCALAR_STAGES.into_iter().enumerate() {
+        for (stage, name) in super::super::delta_block_kernels(dispatch)
+            .into_iter()
+            .enumerate()
+        {
             #[cfg(test)]
             let name = if let Some(test) = test {
                 if stage != test.stage {

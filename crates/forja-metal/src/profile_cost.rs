@@ -12,6 +12,10 @@ pub(crate) fn internal(
     blocks: Option<u32>,
 ) -> Option<KernelCost> {
     if let Some(stages) = KernelCost::delta_block_stages(dispatch) {
+        let kernel = kernel
+            .strip_suffix("_mma")
+            .or_else(|| kernel.strip_suffix("_panel"))
+            .unwrap_or(kernel);
         let index = [
             "state_block_gram",
             "state_block_solve",

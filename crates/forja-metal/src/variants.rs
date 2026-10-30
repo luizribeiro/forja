@@ -16,6 +16,8 @@ use crate::matmul::{MatrixLayout, classify};
 pub(crate) enum MetalVariant {
     DeltaRule,
     DeltaBlockWy64,
+    DeltaBlockWy64Mma16,
+    DeltaBlockWy64Mma32,
     CausalDepthwiseConv,
     MatmulPortable,
     MatmulGemv,
@@ -826,6 +828,14 @@ macro_rules! batch_invariant_variant {
     };
 }
 
+const DELTA_BLOCK_KEYS: &[Constraint] = &[value(
+    dim("key width", QUERY, Axis::Index(2)),
+    Relation::Range {
+        min: 1,
+        max: crate::geometry::DELTA_RULE_MAX_KEYS,
+    },
+)];
+
 pub(crate) static REGISTRY: &[VariantDef<MetalVariant>] = &[
     batch_invariant_variant!(
         "matmul.portable",
@@ -1442,16 +1452,24 @@ pub(crate) static REGISTRY: &[VariantDef<MetalVariant>] = &[
         "delta-rule-block.wy64-fixed",
         DeltaRuleBlock,
         DeltaBlockWy64,
-        &[value(
-            dim("key width", QUERY, Axis::Index(2)),
-            Relation::Range {
-                min: 1,
-                max: crate::geometry::DELTA_RULE_MAX_KEYS
-            }
-        )],
+        DELTA_BLOCK_KEYS,
         &["canonical 64-token block transforms with serial state carry."],
         &["key widths above 256 or a different numerical block identity."],
         &["Fixed-tree f32 Gram, solve, carry and output stages; masked partial blocks."]
+    ),
+    batch_invariant_variant!(@class "delta-rule-block.wy64-mma";
+        "delta-rule-block.wy64-mma-v16", DeltaRuleBlock, DeltaBlockWy64Mma16,
+        DELTA_BLOCK_KEYS,
+        &["f32 block transforms with 16-column persistent carry panels."],
+        &["small transforms dominated by dispatch setup."],
+        &["Ordered 8x8 f32 MMA fragments, fixed-tree solves and causal diagonal output masks."]
+    ),
+    batch_invariant_variant!(@class "delta-rule-block.wy64-mma";
+        "delta-rule-block.wy64-mma-v32", DeltaRuleBlock, DeltaBlockWy64Mma32,
+        DELTA_BLOCK_KEYS,
+        &["f32 block transforms with 32-column persistent carry panels."],
+        &["register pressure that favors a narrower carry panel."],
+        &["Ordered 8x8 f32 MMA fragments; shares arithmetic with the 16-column carry panel."]
     ),
     batch_invariant_variant!(
         "causal-depthwise-conv.direct",
@@ -2009,6 +2027,14 @@ pub(crate) fn json(device: &str) -> String {
 }
 
 impl MetalVariant {
+    pub(crate) const fn delta_block_panel(self) -> Option<u32> {
+        match self {
+            Self::DeltaBlockWy64Mma16 => Some(16),
+            Self::DeltaBlockWy64Mma32 => Some(32),
+            _ => None,
+        }
+    }
+
     pub(crate) const fn cost_model(self) -> forja_core::CostModel {
         use MetalVariant::{
             GatherQuantMatmulGrouped, GatherQuantMatmulGrouped32x32,
@@ -2251,6 +2277,8 @@ mod tests {
                 "sample.parallel",
                 "delta-rule.simd",
                 "delta-rule-block.wy64-fixed",
+                "delta-rule-block.wy64-mma-v16",
+                "delta-rule-block.wy64-mma-v32",
                 "causal-depthwise-conv.direct",
                 "sdpa.steel-256",
                 "sdpa.steel-half-256",
@@ -3057,6 +3085,16 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     fn every_variant_has_an_encoder_accepted_fixture() {
         let fixtures = vec![
+            (
+                "delta-rule-block.wy64-mma-v16",
+                state_dispatch(forja_core::StateOp::DeltaRuleBlock),
+                "state_delta_rule_block",
+            ),
+            (
+                "delta-rule-block.wy64-mma-v32",
+                state_dispatch(forja_core::StateOp::DeltaRuleBlock),
+                "state_delta_rule_block",
+            ),
             (
                 "delta-rule-block.wy64-fixed",
                 state_dispatch(forja_core::StateOp::DeltaRuleBlock),

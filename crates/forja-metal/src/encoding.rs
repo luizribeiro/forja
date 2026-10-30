@@ -8418,12 +8418,7 @@ fn internal_dispatch_names(dispatch: &Dispatch) -> Vec<&'static str> {
         dispatch.op(),
         Op::State(forja_core::StateOp::DeltaRuleBlock(_))
     ) {
-        return vec![
-            "state_block_gram",
-            "state_block_solve",
-            "state_block_carry",
-            "state_block_output",
-        ];
+        return delta_block_kernels(dispatch).to_vec();
     }
     if matches!(
         dispatch.op(),
@@ -8436,6 +8431,28 @@ fn internal_dispatch_names(dispatch: &Dispatch) -> Vec<&'static str> {
         return vec![first, second];
     }
     internal_gather_dispatch_names(dispatch).to_vec()
+}
+
+fn delta_block_mma_panel(dispatch: &Dispatch) -> Option<u32> {
+    selected_variant(dispatch).and_then(MetalVariant::delta_block_panel)
+}
+
+fn delta_block_kernels(dispatch: &Dispatch) -> [&'static str; 4] {
+    if delta_block_mma_panel(dispatch).is_some() {
+        [
+            "state_block_gram_mma",
+            "state_block_solve_panel",
+            "state_block_carry_mma",
+            "state_block_output_mma",
+        ]
+    } else {
+        [
+            "state_block_gram",
+            "state_block_solve",
+            "state_block_carry",
+            "state_block_output",
+        ]
+    }
 }
 
 fn internal_gather_dispatch_names(dispatch: &Dispatch) -> &'static [&'static str] {
@@ -9080,6 +9097,8 @@ pub(super) fn variant_supported(
         MetalVariant::PagedSdpaWideTwoPass
         | MetalVariant::DeltaRule
         | MetalVariant::DeltaBlockWy64
+        | MetalVariant::DeltaBlockWy64Mma16
+        | MetalVariant::DeltaBlockWy64Mma32
         | MetalVariant::CausalDepthwiseConv
         | MetalVariant::MatmulPortable
         | MetalVariant::QuantMatmulPortable
@@ -10054,7 +10073,8 @@ impl PipelineCache {
             .device
             .newComputePipelineStateWithFunction_error(&function)
             .map_err(|_| BackendError::ExecutionFailed)?;
-        if (name.starts_with("steel_attention_")
+        if (name.starts_with("state_block_")
+            || name.starts_with("steel_attention_")
             || name.starts_with("paged_steel_attention_")
             || ((name.starts_with("paged_sdpa_2pass_")
                 || name.starts_with("mlx_sdpa_vector_2pass_"))
