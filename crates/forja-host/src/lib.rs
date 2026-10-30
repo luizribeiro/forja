@@ -1488,6 +1488,14 @@ where
                     self.rollback_paged_append(checkpoint)?;
                     return Err(error);
                 }
+                if let Err(error) = self
+                    .store
+                    .data_mut()
+                    .prepare_paged_single_metadata(pool, start, tokens)
+                {
+                    self.rollback_paged_append(checkpoint)?;
+                    return Err(error);
+                }
                 Ok(checkpoint)
             }
             None => Ok(None),
@@ -3992,7 +4000,8 @@ impl<B: Backend + 'static> Host<B> {
         start: u32,
         tokens: u32,
     ) -> Result<(Option<SequenceCheckpoint>, Option<SubmitRequest<B>>), compute::Error> {
-        self.begin_paged_update(pool, start, tokens, None)
+        self.activate_default_paged_lane(pool)?;
+        self.begin_paged_lane_update(pool, 0, start, tokens, None)
     }
 
     fn begin_paged_update(
@@ -4002,8 +4011,34 @@ impl<B: Backend + 'static> Host<B> {
         tokens: u32,
         action: Option<StateAction>,
     ) -> Result<(Option<SequenceCheckpoint>, Option<SubmitRequest<B>>), compute::Error> {
-        self.activate_default_paged_lane(pool_rep)?;
+        if let Some(slot) = self.paged_state_slot(pool_rep)? {
+            self.select_paged_batch_bank(slot)?;
+        } else {
+            self.activate_default_paged_lane(pool_rep)?;
+        }
         self.begin_paged_lane_update(pool_rep, 0, start, tokens, action)
+    }
+
+    fn paged_state_slot(&self, pool: u32) -> Result<Option<u32>, compute::Error> {
+        let slot = self
+            .table
+            .get(&Resource::<PagePoolEntry>::new_borrow(pool))
+            .map_err(invalid_handle)?
+            .slot;
+        Ok(slot.filter(|slot| self.state_slots.contains_key(slot)))
+    }
+
+    fn prepare_paged_single_metadata(
+        &mut self,
+        pool: u32,
+        start: u32,
+        tokens: u32,
+    ) -> Result<(), compute::Error> {
+        if let Some(slot) = self.paged_state_slot(pool)? {
+            self.write_paged_lane_metadata(pool, &[Some((start, tokens))])?;
+            self.advance_paged_batch_bank(slot)?;
+        }
+        Ok(())
     }
 
     fn activate_default_paged_lane(&self, pool_rep: u32) -> Result<(), compute::Error> {
@@ -11801,17 +11836,50 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(!runner.supports_prefix_reuse());
-        let output = runner
-            .step(EngineStep {
-                phase: BatchPhase::Prompt,
-                tokens: vec![1],
-                start_pos: 0,
-                taps: false,
-            })
-            .await
-            .unwrap()
-            .unwrap();
-        assert!((first_f32(&runner.read(&output.logits).await.unwrap()) - 1.0).abs() < 1.0e-5);
+        runner.prepare_paged_lane(1, None, 8).unwrap();
+        let pool = runner.page_pool.unwrap();
+        let slot_id = runner.paged_batch_slot(pool).unwrap();
+        let peer = runner.store.data().paged_lane_prefix(pool, 1).unwrap();
+        let binding = Arc::clone(
+            &runner
+                .store
+                .data()
+                .table
+                .get(&Resource::<BatchSlotEntry>::new_borrow(slot_id))
+                .unwrap()
+                .binding,
+        );
+        for bank in 0..2 {
+            binding.activity[bank][1].store(true, Ordering::Release);
+        }
+        for position in 0..3 {
+            let output = runner
+                .step(EngineStep {
+                    phase: if position == 0 {
+                        BatchPhase::Prompt
+                    } else {
+                        BatchPhase::Decode
+                    },
+                    tokens: vec![1],
+                    start_pos: position,
+                    taps: false,
+                })
+                .await
+                .unwrap()
+                .unwrap();
+            assert!((first_f32(&runner.read(&output.logits).await.unwrap()) - 1.0).abs() < 1.0e-5);
+            let host = runner.store.data();
+            let slot = host
+                .table
+                .get(&Resource::<BatchSlotEntry>::new_borrow(slot_id))
+                .unwrap();
+            assert_eq!(slot.active_bank, usize::try_from(position % 2).unwrap());
+            assert!(binding.activity[slot.active_bank][0].load(Ordering::Acquire));
+            assert!(!binding.activity[slot.active_bank][1].load(Ordering::Acquire));
+            let current = host.paged_lane_prefix(pool, 1).unwrap();
+            assert!(Arc::ptr_eq(&peer.sequence, &current.sequence));
+            assert_eq!(current.sequence.lock().unwrap().logical_len(), 0);
+        }
         fs::remove_file(weights).unwrap();
     }
 
