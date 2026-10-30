@@ -5,6 +5,27 @@ use forja_core::{
 };
 use std::sync::Arc;
 
+pub(super) struct StateMetadata<B: Backend> {
+    backend: Arc<B>,
+    tensors: Vec<Tensor>,
+    charge: Arc<StateCharge>,
+}
+
+impl<B: Backend> std::ops::Deref for StateMetadata<B> {
+    type Target = [Tensor];
+    fn deref(&self) -> &Self::Target {
+        &self.tensors
+    }
+}
+
+impl<B: Backend> Drop for StateMetadata<B> {
+    fn drop(&mut self) {
+        for tensor in &self.tensors {
+            let _ = self.backend.release(tensor);
+        }
+    }
+}
+
 /// A transaction recording that never exposes state backing as ordinary tensors.
 pub struct StateRecording<B: Backend> {
     pub(super) storage: Arc<StateStorage<B>>,
@@ -13,8 +34,7 @@ pub struct StateRecording<B: Backend> {
     pub(super) handed_off: bool,
     pub(super) access: StateAccess,
     pub(super) scratch: Vec<super::block::StateScratch<B>>,
-    metadata: Vec<Tensor>,
-    charge: Arc<StateCharge>,
+    pub(super) metadata: Arc<StateMetadata<B>>,
     pub(super) commands: CommandList,
     pub(super) updated: Vec<bool>,
     pub(super) limits: Limits,
@@ -58,6 +78,17 @@ impl<B: Backend> StateStorage<B> {
         let slot = sequence.lock().bind(&transaction).map_err(pool_error)?;
         self.pool.validate_slot(&slot).map_err(pool_error)?;
         let access = StateAccess::from_slot(&slot).map_err(pool_error)?;
+        let table = slot
+            .table()
+            .entries()
+            .iter()
+            .flat_map(|entry| [entry.page(), entry.generation()])
+            .collect::<Vec<_>>();
+        let metadata = StateMetadata {
+            backend: Arc::clone(&self.backend),
+            tensors: Vec::new(),
+            charge: Arc::new(charge),
+        };
         let mut recording = StateRecording {
             storage: Arc::clone(self),
             transaction,
@@ -65,18 +96,11 @@ impl<B: Backend> StateStorage<B> {
             handed_off: false,
             access,
             scratch: Vec::new(),
-            metadata: Vec::new(),
-            charge: Arc::new(charge),
+            metadata: Arc::new(metadata),
             commands: CommandList::new(),
             updated: vec![false; self.planes.len()],
             limits,
         };
-        let table = slot
-            .table()
-            .entries()
-            .iter()
-            .flat_map(|entry| [entry.page(), entry.generation()])
-            .collect::<Vec<_>>();
         for (shape, values) in [
             (vec![2, 2], table),
             (vec![records], slot.table().generations().to_vec()),
@@ -86,7 +110,10 @@ impl<B: Backend> StateStorage<B> {
                 .backend
                 .alloc(DType::U32, &shape)
                 .map_err(guest_error)?;
-            recording.metadata.push(tensor.clone());
+            Arc::get_mut(&mut recording.metadata)
+                .ok_or_else(|| invalid_handle("state metadata was shared before construction"))?
+                .tensors
+                .push(tensor.clone());
             let bytes = values
                 .iter()
                 .flat_map(|v| v.to_le_bytes())
@@ -101,7 +128,7 @@ impl<B: Backend> StateRecording<B> {
     pub(super) fn retained_resources(&self) -> Vec<forja_core::CompletionResource> {
         let mut owners = vec![
             forja_core::CompletionResource::new(Arc::clone(&self.storage.charge)),
-            forja_core::CompletionResource::new(Arc::clone(&self.charge)),
+            forja_core::CompletionResource::new(Arc::clone(&self.metadata.charge)),
         ];
         owners.extend(
             self.scratch
@@ -177,7 +204,7 @@ impl<B: Backend> StateRecording<B> {
             .version_view(plane, self.access.destination())?;
         let mut operands = inputs.to_vec();
         operands.push(&previous);
-        operands.extend(&self.metadata);
+        operands.extend(self.metadata.iter());
         let outputs = [output, &next]
             .into_iter()
             .chain(scratch)
@@ -235,9 +262,6 @@ impl<B: Backend> Drop for StateRecording<B> {
                 let _ = sequence.abandon(&self.transaction);
             }
         }
-        for tensor in &self.metadata {
-            let _ = self.storage.backend.release(tensor);
-        }
     }
 }
 
@@ -275,6 +299,41 @@ mod tests {
             host.live_bytes.load(std::sync::atomic::Ordering::Acquire),
             charge
         );
+    }
+
+    #[test]
+    fn captured_metadata_retains_its_charge_without_pinning_a_sequence() {
+        let host = Host::new(
+            forja_cpu::CpuBackend::new(),
+            Limits::new(65536, 8, 4096, 128, 4096),
+        );
+        let storage = host
+            .create_state_storage(
+                StateLayout::new(vec![StatePlane::new(DType::F32, vec![7, 33]).unwrap()]).unwrap(),
+                1,
+            )
+            .unwrap();
+        let before = host.live_bytes.load(std::sync::atomic::Ordering::Acquire);
+        let sequence = storage.reserve().unwrap();
+        let recording = storage
+            .record(&sequence, sequence.begin(1).unwrap())
+            .unwrap();
+        let metadata = Arc::clone(&recording.metadata);
+        let retained = host.live_bytes.load(std::sync::atomic::Ordering::Acquire);
+        assert!(retained > before);
+        drop(recording);
+        drop(sequence);
+        let replacement = storage.reserve().unwrap();
+        assert_eq!(
+            host.live_bytes.load(std::sync::atomic::Ordering::Acquire),
+            retained
+        );
+        drop(metadata);
+        assert_eq!(
+            host.live_bytes.load(std::sync::atomic::Ordering::Acquire),
+            before
+        );
+        drop(replacement);
     }
 
     fn failed_predecessor_taints_queued_descendant<B: Backend + 'static>(backend: B) {
