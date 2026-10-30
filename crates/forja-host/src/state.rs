@@ -1,7 +1,7 @@
 //! Opaque state storage charged to the runner's allocation budget.
 
 mod batch;
-pub use batch::StateBatch;
+pub use batch::{StateBatch, StateBatchSubmission};
 mod block;
 mod capture;
 mod cell;

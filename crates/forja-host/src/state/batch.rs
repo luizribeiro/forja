@@ -1,6 +1,11 @@
+mod submission;
+pub use submission::StateBatchSubmission;
+#[cfg(test)]
+mod queue_tests;
+
 use super::{StateRecording, pool_error};
 use crate::{compute, guest_error, invalid_handle};
-use forja_core::{Backend, BackendError, CommandList, Submission};
+use forja_core::{Backend, BackendError, CommandList};
 use std::sync::{Arc, atomic::Ordering};
 
 /// Plane-complete updates for distinct lanes sharing one protected state pool.
@@ -36,7 +41,15 @@ impl<B: Backend> StateBatch<B> {
     ///
     /// # Errors
     /// Returns admission, authentication or execution failure without partial publication.
-    pub fn submit_and_finish(mut self) -> Result<(), compute::Error> {
+    pub fn submit_and_finish(self) -> Result<(), compute::Error> {
+        self.submit()?.finish()
+    }
+
+    /// Queues every lane as one submission while retaining all version owners.
+    ///
+    /// # Errors
+    /// Returns admission or submission failure; uncertain execution requires reload.
+    pub fn submit(mut self) -> Result<StateBatchSubmission<B>, compute::Error> {
         let storage = Arc::clone(&self.recordings[0].storage);
         storage.check_usable()?;
         let mut commands = CommandList::new();
@@ -79,7 +92,21 @@ impl<B: Backend> StateBatch<B> {
             .inspect_err(|_| storage.poisoned.store(true, Ordering::Release))
             .map_err(guest_error)?;
         drop(queue);
-        let execution = submission.wait_timeout(self.recordings[0].limits.submission_timeout);
+        Ok(StateBatchSubmission {
+            batch: self,
+            submission,
+            position,
+            reconciled: false,
+        })
+    }
+
+    fn reconcile(
+        &mut self,
+        position: u64,
+        execution: Result<(), BackendError>,
+        publish: bool,
+    ) -> Result<(), compute::Error> {
+        let storage = Arc::clone(&self.recordings[0].storage);
         if execution == Err(BackendError::Timeout) {
             storage.poisoned.store(true, Ordering::Release);
             for recording in &self.recordings {
@@ -100,7 +127,7 @@ impl<B: Backend> StateBatch<B> {
             .iter()
             .zip(&self.recordings)
             .try_for_each(|(lane, recording)| {
-                lane.validate_finish(&recording.transaction, execution.is_ok())
+                lane.validate_finish(&recording.transaction, publish && execution.is_ok())
             });
         if let Err(error) = validation {
             for (lane, recording) in lanes.iter_mut().zip(&self.recordings) {
@@ -109,7 +136,7 @@ impl<B: Backend> StateBatch<B> {
             return Err(pool_error(error));
         }
         for (lane, recording) in lanes.iter_mut().zip(&self.recordings) {
-            lane.finish(&recording.transaction, execution.is_ok())
+            lane.finish(&recording.transaction, publish && execution.is_ok())
                 .map_err(pool_error)?;
         }
         execution.map_err(guest_error)
