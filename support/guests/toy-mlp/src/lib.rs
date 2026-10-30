@@ -58,6 +58,7 @@ pub struct ToyEngine {
 impl Engine for ToyEngine {
     fn describe() -> EngineInfo {
         EngineInfo {
+            prompt_block_tokens: None,
             vocab: VOCAB,
             max_context: MAX_CONTEXT,
             tap_layers: vec![0, 1],

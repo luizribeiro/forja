@@ -541,6 +541,7 @@ impl Olmoe {
 impl Engine for Olmoe {
     fn describe() -> EngineInfo {
         EngineInfo {
+            prompt_block_tokens: None,
             vocab: VOCAB,
             max_context: MAX_SUPPORTED_CONTEXT,
             tap_layers: (1..=16).collect(),

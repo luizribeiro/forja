@@ -38,6 +38,7 @@ interface engine {
   }
 
   record engine-info {
+    prompt-block-tokens: option<u32>,
     vocab: u32,
     max-context: u32,
     tap-layers: list<u32>,

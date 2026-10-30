@@ -281,6 +281,7 @@ impl SmolLM2 {
 impl forja_sdk::Engine for SmolLM2 {
     fn describe() -> forja_sdk::EngineInfo {
         forja_sdk::EngineInfo {
+            prompt_block_tokens: None,
             vocab: 49_152,
             max_context: 8_192,
             tap_layers: (1..=30).collect(),

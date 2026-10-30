@@ -23,6 +23,7 @@ struct ConstantEngine {
 impl Engine for ConstantEngine {
     fn describe() -> EngineInfo {
         EngineInfo {
+            prompt_block_tokens: None,
             vocab: 4,
             max_context: MAX_CONTEXT,
             tap_layers: vec![0],

@@ -22,6 +22,7 @@ struct PrefillReplayEngine {
 impl Engine for PrefillReplayEngine {
     fn describe() -> EngineInfo {
         EngineInfo {
+            prompt_block_tokens: None,
             vocab: VOCAB,
             max_context: MAX_CONTEXT,
             tap_layers: vec![0],

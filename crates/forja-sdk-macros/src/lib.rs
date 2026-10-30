@@ -158,6 +158,7 @@ fn engine_guest_impl() -> proc_macro2::TokenStream {
             fn describe() -> WitEngineInfo {
                 let info = <ExportedEngine as ::forja_sdk::Engine>::describe();
                 WitEngineInfo {
+                    prompt_block_tokens: info.prompt_block_tokens.map(std::num::NonZeroU32::get),
                     vocab: info.vocab,
                     max_context: info.max_context,
                     tap_layers: info.tap_layers,

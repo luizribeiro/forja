@@ -46,6 +46,7 @@
 //! impl Engine for Llama {
 //!     fn describe() -> EngineInfo {
 //!         EngineInfo {
+//! prompt_block_tokens: None,
 //!             vocab: VOCAB,
 //!             max_context: 4096,
 //!             tap_layers: vec![],

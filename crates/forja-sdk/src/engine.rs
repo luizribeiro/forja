@@ -3,6 +3,8 @@ use crate::{PagedSlot, Result, Tensor, Weights};
 /// Static metadata declared by an inference engine.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EngineInfo {
+    /// Atomic numerical prompt block; only the true prompt tail may be shorter.
+    pub prompt_block_tokens: Option<std::num::NonZeroU32>,
     /// Number of logits produced for the last input position.
     pub vocab: u32,
     /// Largest supported context length.

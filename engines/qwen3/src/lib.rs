@@ -568,6 +568,7 @@ impl Engine for ExportedQwen3 {
     /// Tap `i` is decoder layer `i`; tap 28 includes the final model norm.
     fn describe() -> EngineInfo {
         EngineInfo {
+            prompt_block_tokens: None,
             vocab: VOCAB,
             max_context: MAX_SUPPORTED_CONTEXT,
             tap_layers: (1..=28).collect(),

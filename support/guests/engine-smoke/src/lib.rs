@@ -25,6 +25,7 @@ struct Component;
 impl Guest for Component {
     fn describe() -> EngineInfo {
         EngineInfo {
+            prompt_block_tokens: None,
             vocab: 4,
             max_context: 33,
             tap_layers: vec![0],

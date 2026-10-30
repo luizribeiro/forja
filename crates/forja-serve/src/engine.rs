@@ -704,6 +704,50 @@ struct SchedulerConfig {
     decode_buckets: Vec<u32>,
 }
 
+fn validate_prompt_block(
+    info: &EngineInfo,
+    config: &HostConfig,
+    profile_budget: u32,
+    profile_chunk: u32,
+) -> Result<(), GenerationError> {
+    if info.prompt_block_tokens.is_none() {
+        return Ok(());
+    }
+    let prompt = resolve_u64_ceiling(
+        config.serving.prompt_token_budget,
+        u64::from(profile_budget),
+        "serving.prompt_token_budget",
+    )?;
+    let idle = resolve_u64_ceiling(
+        config.serving.idle_prompt_token_budget,
+        u64::from(profile_chunk),
+        "serving.idle_prompt_token_budget",
+    )?;
+    validate_resolved_prompt_block(info, prompt, idle, profile_chunk, info.prompt_block_tokens)
+}
+
+fn validate_resolved_prompt_block(
+    info: &EngineInfo,
+    prompt: u64,
+    idle: u64,
+    chunk: u32,
+    multiple: Option<std::num::NonZeroU32>,
+) -> Result<(), GenerationError> {
+    let Some(block) = info.prompt_block_tokens.map(std::num::NonZeroU32::get) else {
+        return Ok(());
+    };
+    if prompt < u64::from(block)
+        || idle < u64::from(block)
+        || !chunk.is_multiple_of(block)
+        || multiple.is_none_or(|multiple| !multiple.get().is_multiple_of(block))
+    {
+        return Err(GenerationError::new(
+            "prompt budgets must admit the engine's atomic numerical block",
+        ));
+    }
+    Ok(())
+}
+
 impl SchedulerConfig {
     fn resolve(
         info: &EngineInfo,
@@ -711,15 +755,19 @@ impl SchedulerConfig {
         profile_budget: u32,
         profile_prefill_chunk: u32,
     ) -> Result<Self, GenerationError> {
+        validate_prompt_block(info, config, profile_budget, profile_prefill_chunk)?;
         let Some(serving) = info.serving.as_ref() else {
+            let atomic = info
+                .prompt_block_tokens
+                .map_or(1, std::num::NonZeroU32::get);
             return Ok(Self {
                 active_lanes: 1,
                 max_prefill_chunks: 1,
-                prompt_token_budget: 1,
+                prompt_token_budget: atomic,
                 profile_prompt_budget: profile_budget,
                 profile_prefill_chunk,
-                idle_prompt_token_budget: 1,
-                prefill_chunk_multiple: None,
+                idle_prompt_token_budget: atomic,
+                prefill_chunk_multiple: info.prompt_block_tokens,
                 decode_buckets: vec![1],
             });
         };
@@ -759,17 +807,7 @@ impl SchedulerConfig {
             .collect::<Vec<_>>();
         let (active_lanes, decode_buckets) =
             scheduler_decode_buckets(declared_buckets, configured_lanes);
-        let largest_prompt_chunk = serving
-            .batch_shapes
-            .iter()
-            .filter(|shape| {
-                shape.phase == BatchPhase::Prompt
-                    && shape.bucket == 1
-                    && shape.selection == BatchSelection::Combined
-            })
-            .map(|shape| shape.tokens)
-            .max()
-            .unwrap_or(profile_prefill_chunk);
+        let largest_prompt_chunk = largest_prompt_chunk(serving, profile_prefill_chunk);
         let prompt_token_budget = profile_budget
             .min(u32::try_from(configured_prompt).unwrap_or(u32::MAX))
             .min(largest_prompt_chunk);
@@ -780,10 +818,20 @@ impl SchedulerConfig {
         )?)
         .unwrap_or(u32::MAX)
         .min(largest_prompt_chunk);
-        let prefill_chunk_multiple = serving.prefill_chunk_multiple.filter(|multiple| {
-            prompt_token_budget.is_multiple_of(multiple.get())
-                && idle_prompt_token_budget >= multiple.get()
-        });
+        let prefill_chunk_multiple = serving
+            .prefill_chunk_multiple
+            .or(info.prompt_block_tokens)
+            .filter(|multiple| {
+                prompt_token_budget.is_multiple_of(multiple.get())
+                    && idle_prompt_token_budget >= multiple.get()
+            });
+        validate_resolved_prompt_block(
+            info,
+            u64::from(prompt_token_budget),
+            u64::from(idle_prompt_token_budget),
+            profile_prefill_chunk,
+            prefill_chunk_multiple,
+        )?;
         if !decode_buckets.is_empty() {
             crate::scheduler::SchedulerPolicy::new(
                 decode_buckets.clone(),
@@ -805,6 +853,20 @@ impl SchedulerConfig {
             decode_buckets,
         })
     }
+}
+
+fn largest_prompt_chunk(serving: &forja_host::ServingInfo, fallback: u32) -> u32 {
+    serving
+        .batch_shapes
+        .iter()
+        .filter(|shape| {
+            shape.phase == BatchPhase::Prompt
+                && shape.bucket == 1
+                && shape.selection == BatchSelection::Combined
+        })
+        .map(|shape| shape.tokens)
+        .max()
+        .unwrap_or(fallback)
 }
 
 fn resolve_u32_ceiling(
@@ -2610,6 +2672,7 @@ mod tests {
     #[test]
     fn explicit_scheduler_limits_must_lower_engine_limits() {
         let info = EngineInfo {
+            prompt_block_tokens: None,
             vocab: 1,
             max_context: 4_096,
             tap_layers: Vec::new(),
@@ -2664,10 +2727,76 @@ mod tests {
     }
 
     #[test]
+    fn atomic_prompt_blocks_refuse_lower_budgets_without_paged_serving() {
+        let info = EngineInfo {
+            prompt_block_tokens: std::num::NonZeroU32::new(64),
+            vocab: 1,
+            max_context: 4096,
+            tap_layers: Vec::new(),
+            router_layers: Vec::new(),
+            serving: None,
+        };
+        let mut config = HostConfig::default();
+        let resolved = SchedulerConfig::resolve(&info, &config, 64, 64).unwrap();
+        assert_eq!(resolved.prompt_token_budget, 64);
+        assert_eq!(resolved.prefill_chunk_multiple, info.prompt_block_tokens);
+        config.serving.prompt_token_budget = Choice::Fixed(std::num::NonZeroU64::new(32).unwrap());
+        assert!(SchedulerConfig::resolve(&info, &config, 64, 64).is_err());
+        config.serving.prompt_token_budget = Choice::Auto;
+        config.serving.idle_prompt_token_budget =
+            Choice::Fixed(std::num::NonZeroU64::new(32).unwrap());
+        assert!(SchedulerConfig::resolve(&info, &config, 64, 64).is_err());
+        config.serving.idle_prompt_token_budget = Choice::Auto;
+        assert!(SchedulerConfig::resolve(&info, &config, 32, 64).is_err());
+        assert!(SchedulerConfig::resolve(&info, &config, 64, 33).is_err());
+    }
+
+    #[test]
+    fn atomic_prompt_blocks_validate_final_serving_geometry() {
+        let mut info = EngineInfo {
+            prompt_block_tokens: std::num::NonZeroU32::new(64),
+            vocab: 1,
+            max_context: 4096,
+            tap_layers: vec![],
+            router_layers: vec![],
+            serving: Some(serving_info()),
+        };
+        let config = HostConfig::default();
+        for (tokens, multiple, valid) in [
+            (32, 64, false),
+            (64, 32, false),
+            (128, 96, false),
+            (64, 64, true),
+            (128, 128, true),
+        ] {
+            let serving = info.serving.as_mut().unwrap();
+            serving.prefill_chunk_multiple = std::num::NonZeroU32::new(multiple);
+            serving
+                .batch_shapes
+                .retain(|shape| shape.phase != BatchPhase::Prompt);
+            serving.batch_shapes.push(forja_host::BatchShape {
+                phase: BatchPhase::Prompt,
+                bucket: 1,
+                tokens,
+                selection: BatchSelection::Combined,
+            });
+            assert_eq!(
+                SchedulerConfig::resolve(&info, &config, 128, 128).is_ok(),
+                valid,
+                "tokens={tokens}, multiple={multiple}"
+            );
+        }
+        info.serving.as_mut().unwrap().prefill_chunk_multiple = None;
+        let resolved = SchedulerConfig::resolve(&info, &config, 128, 128).unwrap();
+        assert_eq!(resolved.prefill_chunk_multiple, info.prompt_block_tokens);
+    }
+
+    #[test]
     fn operator_limits_can_disable_chunk_merging() {
         let mut serving = serving_info();
         serving.prefill_chunk_multiple = std::num::NonZeroU32::new(512);
         let info = EngineInfo {
+            prompt_block_tokens: None,
             vocab: 1,
             max_context: 4096,
             tap_layers: vec![],

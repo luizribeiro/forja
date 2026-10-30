@@ -139,6 +139,8 @@ pub fn is_paged_bank_in_flight(error: &compute::Error) -> bool {
 /// Static metadata declared by an engine component.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EngineInfo {
+    /// Atomic numerical prompt block; only the true prompt tail may be shorter.
+    pub prompt_block_tokens: Option<std::num::NonZeroU32>,
     /// Logit vector length.
     pub vocab: u32,
     /// Largest accepted token position.
@@ -1168,7 +1170,15 @@ where
             .and_then(|serving| serving.prefill_chunk_multiple)
             .map(std::num::NonZeroU32::try_from)
             .transpose()?;
+        let prompt_block_tokens = info
+            .prompt_block_tokens
+            .map(std::num::NonZeroU32::try_from)
+            .transpose()?;
+        if prompt_block_tokens.is_some_and(|block| block.get() > info.max_context) {
+            wasmtime::bail!("engine prompt block exceeds its context");
+        }
         let info = EngineInfo {
+            prompt_block_tokens,
             vocab: info.vocab,
             max_context: info.max_context,
             tap_layers: info.tap_layers,
