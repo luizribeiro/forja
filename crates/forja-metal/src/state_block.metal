@@ -43,6 +43,43 @@ float delta_block_tree(device const uchar *left, device const uchar *right,
     return lanes[0];
 }
 
+void delta_block_gram_terms(device float *scratch, device const uchar *log_decay,
+    device const uchar *beta, constant TensorLayout *layouts,
+    constant DeltaBlockParams &params, uint block, uint head, uint row, uint column,
+    float query_dot, float key_dot) {
+    uint rows = delta_block_rows(params,block);
+    uint base = delta_block_base(params,block,head);
+    uint lower = base + params.offsets[0] + row * FORJA_DELTA_BLOCK_TOKENS + column;
+    uint query_gram = base + params.offsets[1] + row * FORJA_DELTA_BLOCK_TOKENS + column;
+    if (row >= rows || column > row) {
+        scratch[lower] = 0.0f;
+        scratch[query_gram] = 0.0f;
+        return;
+    }
+    uint absolute_row = block * FORJA_DELTA_BLOCK_TOKENS + row;
+    float interval = 0.0f;
+    for (uint at = row; at > column; --at) {
+        uint decay_index = (block * FORJA_DELTA_BLOCK_TOKENS + at) * params.heads + head;
+        interval += load_float(log_decay,physical_index(layouts[3],decay_index),program_input3_dtype);
+    }
+    float factor = f32_exp_rounded(interval);
+    if (row == column) { scratch[lower] = 1.0f; }
+    else {
+        float coefficient = load_float(beta,physical_index(layouts[4],absolute_row*params.heads+head),program_input4_dtype);
+        scratch[lower] = coefficient * key_dot * factor;
+    }
+    scratch[query_gram] = query_dot * factor;
+    if (row == rows-1) { scratch[base+params.offsets[3]+column] = factor; }
+    if (column == 0) {
+        float prefix = 0.0f;
+        for (uint at=0; at<=row; ++at) {
+            uint decay_index = (block*FORJA_DELTA_BLOCK_TOKENS+at)*params.heads+head;
+            prefix += load_float(log_decay,physical_index(layouts[3],decay_index),program_input3_dtype);
+        }
+        scratch[base+params.offsets[2]+row] = f32_exp_rounded(prefix);
+    }
+}
+
 kernel void state_block_gram(
     device const uchar *query [[buffer(0)]], device const uchar *key [[buffer(1)]],
     device const uchar *value [[buffer(2)]], device const uchar *log_decay [[buffer(3)]],
@@ -61,40 +98,20 @@ kernel void state_block_gram(
     uint block = (index / matrix) % params.blocks;
     uint row = (index / FORJA_DELTA_BLOCK_TOKENS) % FORJA_DELTA_BLOCK_TOKENS;
     uint column = index % FORJA_DELTA_BLOCK_TOKENS;
-    uint rows = delta_block_rows(params,block);
-    uint base = delta_block_base(params,block,head);
-    uint lower = base + params.offsets[0] + row * FORJA_DELTA_BLOCK_TOKENS + column;
-    uint query_gram = base + params.offsets[1] + row * FORJA_DELTA_BLOCK_TOKENS + column;
-    scratch[lower] = 0.0f;
-    scratch[query_gram] = 0.0f;
-    if (row >= rows || column > row) { return; }
-    uint query_head = head / (params.heads / params.query_heads);
-    uint absolute_row = block * FORJA_DELTA_BLOCK_TOKENS + row;
-    uint absolute_column = block * FORJA_DELTA_BLOCK_TOKENS + column;
-    float interval = 0.0f;
-    for (uint at = row; at > column; --at) {
-        uint decay_index = (block * FORJA_DELTA_BLOCK_TOKENS + at) * params.heads + head;
-        interval += load_float(log_decay,physical_index(layouts[3],decay_index),program_input3_dtype);
-    }
-    float factor = f32_exp_rounded(interval);
-    if (row == column) { scratch[lower] = 1.0f; }
-    else {
-        float dot = delta_block_tree(key,key,layouts,1,1,absolute_row,absolute_column,
+    float query_dot = 0.0f;
+    float key_dot = 0.0f;
+    if (row < delta_block_rows(params,block) && column <= row) {
+        uint query_head = head / (params.heads / params.query_heads);
+        uint absolute_row = block*FORJA_DELTA_BLOCK_TOKENS+row;
+        uint absolute_column = block*FORJA_DELTA_BLOCK_TOKENS+column;
+        query_dot = delta_block_tree(query,key,layouts,0,1,absolute_row,absolute_column,
             query_head,query_head,params);
-        float coefficient = load_float(beta,physical_index(layouts[4],absolute_row*params.heads+head),program_input4_dtype);
-        scratch[lower] = coefficient * dot * factor;
-    }
-    scratch[query_gram] = delta_block_tree(query,key,layouts,0,1,absolute_row,absolute_column,
-        query_head,query_head,params) * factor;
-    if (row == rows-1) { scratch[base+params.offsets[3]+column] = factor; }
-    if (column == 0) {
-        float prefix = 0.0f;
-        for (uint at=0; at<=row; ++at) {
-            uint decay_index = (block*FORJA_DELTA_BLOCK_TOKENS+at)*params.heads+head;
-            prefix += load_float(log_decay,physical_index(layouts[3],decay_index),program_input3_dtype);
+        if (row != column) {
+            key_dot = delta_block_tree(key,key,layouts,1,1,absolute_row,absolute_column,
+                query_head,query_head,params);
         }
-        scratch[base+params.offsets[2]+row] = f32_exp_rounded(prefix);
     }
+    delta_block_gram_terms(scratch,log_decay,beta,layouts,params,block,head,row,column,query_dot,key_dot);
 }
 
 float delta_block_solve_tree(device const float *scratch, uint base, uint lower_offset,
