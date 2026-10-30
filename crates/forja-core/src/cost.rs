@@ -51,6 +51,33 @@ pub struct KernelCost {
 }
 
 impl KernelCost {
+    /// Adds independent stage work, preserving every traffic subset and refusing overflow.
+    #[must_use]
+    pub fn checked_add(self, rhs: Self) -> Option<Self> {
+        Some(Self {
+            read_bytes: self.read_bytes.checked_add(rhs.read_bytes)?,
+            write_bytes: self.write_bytes.checked_add(rhs.write_bytes)?,
+            flops: self.flops.checked_add(rhs.flops)?,
+            scalar_ops: self.scalar_ops.checked_add(rhs.scalar_ops)?,
+            sfu_ops: self.sfu_ops.checked_add(rhs.sfu_ops)?,
+            state_read_bytes: self.state_read_bytes.checked_add(rhs.state_read_bytes)?,
+            state_write_bytes: self.state_write_bytes.checked_add(rhs.state_write_bytes)?,
+            scratch_read_bytes: self
+                .scratch_read_bytes
+                .checked_add(rhs.scratch_read_bytes)?,
+            scratch_write_bytes: self
+                .scratch_write_bytes
+                .checked_add(rhs.scratch_write_bytes)?,
+            weight_bytes: self.weight_bytes.checked_add(rhs.weight_bytes)?,
+            minimum_weight_bytes: self
+                .minimum_weight_bytes
+                .checked_add(rhs.minimum_weight_bytes)?,
+            maximum_weight_bytes: self
+                .maximum_weight_bytes
+                .checked_add(rhs.maximum_weight_bytes)?,
+            kv_bytes: self.kv_bytes.checked_add(rhs.kv_bytes)?,
+        })
+    }
     /// Work of the four authenticated delta-block GPU stages, excluding the composite duplicate.
     #[must_use]
     pub fn delta_block_stages(dispatch: &Dispatch) -> Option<[Self; 4]> {
@@ -153,6 +180,50 @@ mod tests {
             true,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn composite_work_preserves_subsets_and_refuses_overflow() {
+        let cost = KernelCost {
+            read_bytes: u64::MAX,
+            scratch_read_bytes: 64,
+            state_read_bytes: 32,
+            write_bytes: 96,
+            scratch_write_bytes: 64,
+            state_write_bytes: 32,
+            flops: 128,
+            scalar_ops: 7,
+            sfu_ops: 3,
+            weight_bytes: 48,
+            minimum_weight_bytes: 16,
+            maximum_weight_bytes: 48,
+            kv_bytes: 8,
+        };
+        assert_eq!(cost.checked_add(KernelCost::default()), Some(cost));
+        assert!(
+            cost.checked_add(KernelCost {
+                read_bytes: 1,
+                ..KernelCost::default()
+            })
+            .is_none()
+        );
+        let sum = KernelCost {
+            read_bytes: 96,
+            ..cost
+        }
+        .checked_add(KernelCost {
+            read_bytes: 96,
+            ..cost
+        })
+        .unwrap();
+        assert_eq!(sum.scratch_read_bytes, 128);
+        assert_eq!(sum.state_read_bytes, 64);
+        assert_eq!(sum.sfu_ops, 6);
+        assert_eq!(sum.flops, 256);
+        assert_eq!(sum.weight_bytes, 96);
+        assert_eq!(sum.minimum_weight_bytes, 32);
+        assert_eq!(sum.maximum_weight_bytes, 96);
+        assert_eq!(sum.kv_bytes, 16);
     }
 
     #[test]

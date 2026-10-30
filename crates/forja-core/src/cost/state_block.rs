@@ -155,19 +155,9 @@ fn publish_cost(
 }
 
 pub(crate) fn composite(stages: &[KernelCost; 4]) -> Option<KernelCost> {
-    let sum = |field: fn(&KernelCost) -> u64| add(&stages.map(|stage| field(&stage)));
-    Some(KernelCost {
-        read_bytes: sum(|stage| stage.read_bytes)?,
-        write_bytes: sum(|stage| stage.write_bytes)?,
-        flops: sum(|stage| stage.flops)?,
-        scalar_ops: sum(|stage| stage.scalar_ops)?,
-        sfu_ops: sum(|stage| stage.sfu_ops)?,
-        state_read_bytes: sum(|stage| stage.state_read_bytes)?,
-        state_write_bytes: sum(|stage| stage.state_write_bytes)?,
-        scratch_read_bytes: sum(|stage| stage.scratch_read_bytes)?,
-        scratch_write_bytes: sum(|stage| stage.scratch_write_bytes)?,
-        ..KernelCost::default()
-    })
+    stages
+        .iter()
+        .try_fold(KernelCost::default(), |sum, stage| sum.checked_add(*stage))
 }
 
 pub(super) fn dispatch_stages(dispatch: &Dispatch) -> Option<[KernelCost; 4]> {
