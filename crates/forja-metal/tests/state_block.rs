@@ -169,6 +169,16 @@ fn metal_delta_block_preserves_a_long_canonical_scan() {
 
 #[test]
 fn metal_delta_block_profile_accounts_for_four_stages_once() {
+    for variant in [
+        None,
+        Some("delta-rule-block.wy64-mma-v16"),
+        Some("delta-rule-block.wy64-mma-v32"),
+    ] {
+        assert_block_profile(variant);
+    }
+}
+
+fn assert_block_profile(variant: Option<&str>) {
     use forja_core::{Backend, CommandList, KernelCost, Submission};
     use forja_testing::{DeterministicValues, generated_tensor_bytes};
     let backend = forja_metal::MetalBackend::new().unwrap();
@@ -214,28 +224,38 @@ fn metal_delta_block_profile_accounts_for_four_stages_once() {
         )
         .unwrap();
     let expected = KernelCost::of(commands.last_dispatch().unwrap()).unwrap();
+    if let Some(name) = variant {
+        let pick = backend
+            .validate_variant(commands.last_dispatch().unwrap(), name)
+            .unwrap();
+        assert!(commands.set_last_backend_data(forja_core::BackendDispatchData::new(pick)));
+    }
     let submission = backend.submit_profiled(commands).unwrap();
     submission.wait().unwrap();
     let profile = submission.profile().unwrap();
     let dispatch = &profile.per_dispatch[0];
     assert_eq!(dispatch.physical_dispatches, 4);
     assert_eq!(dispatch.internal.len(), 4);
-    assert_eq!(
-        dispatch
-            .internal
-            .iter()
-            .map(|stage| stage.cost.unwrap().read_bytes)
-            .sum::<u64>(),
-        expected.read_bytes
-    );
-    assert_eq!(
-        dispatch
-            .internal
-            .iter()
-            .map(|stage| stage.cost.unwrap().write_bytes)
-            .sum::<u64>(),
-        expected.write_bytes
-    );
+    let sum = dispatch
+        .internal
+        .iter()
+        .try_fold(KernelCost::default(), |sum, stage| {
+            sum.checked_add(stage.cost.unwrap())
+        })
+        .unwrap();
+    assert_eq!(sum, dispatch.cost);
+    assert_eq!(sum.flops, expected.flops);
+    assert_eq!(sum.state_read_bytes, 3 * 7 * 33 * 4);
+    assert_eq!(sum.state_write_bytes, sum.state_read_bytes);
+    if variant.is_some() {
+        assert_eq!(
+            dispatch.internal[1].cost.unwrap().scratch_read_bytes,
+            4096 * 4 * 3 * 2 + 21 * 7 * 4
+        );
+        assert_ne!(sum.read_bytes, expected.read_bytes);
+    } else {
+        assert_eq!(sum, expected);
+    }
     let duration = dispatch
         .internal
         .iter()

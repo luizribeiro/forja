@@ -1,4 +1,5 @@
 use forja_core::{Dispatch, KernelCost, Op};
+pub(crate) mod state_block;
 
 fn product(values: &[u64]) -> Option<u64> {
     values
@@ -11,20 +12,11 @@ pub(crate) fn internal(
     kernel: &str,
     blocks: Option<u32>,
 ) -> Option<KernelCost> {
-    if let Some(stages) = KernelCost::delta_block_stages(dispatch) {
-        let kernel = kernel
-            .strip_suffix("_mma")
-            .or_else(|| kernel.strip_suffix("_panel"))
-            .unwrap_or(kernel);
-        let index = [
-            "state_block_gram",
-            "state_block_solve",
-            "state_block_carry",
-            "state_block_output",
-        ]
-        .iter()
-        .position(|name| *name == kernel)?;
-        return Some(stages[index]);
+    if matches!(
+        dispatch.op(),
+        Op::State(forja_core::StateOp::DeltaRuleBlock(_))
+    ) {
+        return block_internal(dispatch, kernel);
     }
     let mut cost = KernelCost::of(dispatch)?;
     let input = dispatch.primitive_inputs();
@@ -109,6 +101,25 @@ pub(crate) fn internal(
         }
         _ => Some(cost),
     }
+}
+
+fn block_internal(dispatch: &Dispatch, kernel: &str) -> Option<KernelCost> {
+    let stages = crate::encoding::delta_block_mma_panel(dispatch)
+        .and_then(|panel| state_block::stages(dispatch, panel))
+        .or_else(|| KernelCost::delta_block_stages(dispatch))?;
+    let kernel = kernel
+        .strip_suffix("_mma")
+        .or_else(|| kernel.strip_suffix("_panel"))
+        .unwrap_or(kernel);
+    let index = [
+        "state_block_gram",
+        "state_block_solve",
+        "state_block_carry",
+        "state_block_output",
+    ]
+    .iter()
+    .position(|name| *name == kernel)?;
+    Some(stages[index])
 }
 
 #[cfg(test)]

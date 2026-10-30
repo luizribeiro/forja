@@ -8373,7 +8373,9 @@ fn dispatch_profile(
     physical_dispatches: u64,
 ) -> Result<DispatchProfile, BackendError> {
     let (variant, alternatives, model) = crate::variants::profile_selection(dispatch);
-    let cost = forja_core::KernelCost::of(dispatch).ok_or(BackendError::InvalidInput)?;
+    let cost = crate::profile_cost::state_block::composite(dispatch)
+        .or_else(|| forja_core::KernelCost::of(dispatch))
+        .ok_or(BackendError::InvalidInput)?;
     let padded_flops = model
         .padded_flops(dispatch, cost)
         .ok_or(BackendError::InvalidInput)?;
@@ -8433,7 +8435,7 @@ fn internal_dispatch_names(dispatch: &Dispatch) -> Vec<&'static str> {
     internal_gather_dispatch_names(dispatch).to_vec()
 }
 
-fn delta_block_mma_panel(dispatch: &Dispatch) -> Option<u32> {
+pub(crate) fn delta_block_mma_panel(dispatch: &Dispatch) -> Option<u32> {
     selected_variant(dispatch).and_then(MetalVariant::delta_block_panel)
 }
 
