@@ -1,5 +1,5 @@
 use super::{outcome::StateOutcome, paired::PagedInput};
-use forja_core::{PagePoolError, StateCheckpoint, StateSequence, StateTransaction};
+use forja_core::{PagePoolError, StateSequence, StateTransaction};
 use std::sync::Arc;
 use std::{
     collections::VecDeque,
@@ -25,8 +25,7 @@ struct Pending {
     paged: Option<PagedInput>,
     serial: u64,
     position: LanePosition,
-    predecessor: StateCheckpoint,
-    input: LanePosition,
+    predecessor: super::StateLaneCheckpoint,
     outcome: Arc<StateOutcome>,
     dependency: Option<Arc<StateOutcome>>,
 }
@@ -38,7 +37,7 @@ pub(super) struct StateJournal {
     feedback: Option<super::feedback::LaneFeedback>,
     pub(super) position: LanePosition,
     pending: VecDeque<Pending>,
-    retained: Option<(StateCheckpoint, LanePosition)>,
+    retained: Option<super::StateLaneCheckpoint>,
 }
 
 impl Deref for StateJournal {
@@ -94,12 +93,13 @@ impl StateJournal {
         if position.tokens > position.reserved_tokens {
             return Err(PagePoolError::InvalidCheckpoint);
         }
-        let checkpoint = self.sequence.checkpoint_latest()?;
-        let (mut retained, position_before) = self
-            .retained
-            .take()
-            .map_or((None, None), |(checkpoint, position)| {
-                (Some(checkpoint), Some(position))
+        let checkpoint = self.checkpoint_latest()?;
+        let (mut retained, boundary_before) =
+            self.retained.take().map_or((None, None), |checkpoint| {
+                (
+                    Some(checkpoint.version),
+                    Some((checkpoint.position, checkpoint.feedback)),
+                )
             });
         let transaction = match self
             .sequence
@@ -107,10 +107,20 @@ impl StateJournal {
         {
             Ok(transaction) => transaction,
             Err(error) => {
-                self.retained = retained.zip(position_before);
+                self.retained =
+                    retained
+                        .zip(boundary_before)
+                        .map(
+                            |(version, (position, feedback))| super::StateLaneCheckpoint {
+                                version,
+                                position,
+                                feedback,
+                            },
+                        );
                 return Err(error);
             }
         };
+        drop(boundary_before);
         let dependency = self.pending.back().map(|entry| Arc::clone(&entry.outcome));
         self.retained_paged = None;
         self.pending.push_back(Pending {
@@ -118,7 +128,6 @@ impl StateJournal {
             serial,
             position,
             predecessor: checkpoint,
-            input,
             outcome: Arc::default(),
             dependency,
         });
@@ -161,7 +170,7 @@ impl StateJournal {
         if success {
             if let Some(entry) = self.pending.pop_front() {
                 self.position = entry.position;
-                self.retained = Some((entry.predecessor, entry.input));
+                self.retained = Some(entry.predecessor);
                 self.retained_paged = entry.paged;
                 entry.outcome.finish(true);
             }
@@ -181,7 +190,7 @@ impl StateJournal {
             .iter_mut()
             .find(|entry| entry.serial == serial)
             .ok_or(PagePoolError::InvalidCheckpoint)?;
-        if entry.paged.is_some() || entry.input.tokens != paged.tokens() {
+        if entry.paged.is_some() || entry.predecessor.position.tokens != paged.tokens() {
             return Err(PagePoolError::InvalidCheckpoint);
         }
         entry.paged = Some(paged);
@@ -274,16 +283,19 @@ impl StateJournal {
     }
 
     pub(super) fn rewind(&mut self, tokens: u64) -> Result<(), PagePoolError> {
-        let (checkpoint, position) = self
+        let checkpoint = self
             .retained
             .as_ref()
-            .filter(|(_, position)| position.tokens == tokens)
+            .filter(|checkpoint| checkpoint.position.tokens == tokens)
             .ok_or(PagePoolError::InvalidCheckpoint)?;
-        self.sequence.rewind(checkpoint)?;
+        self.sequence.rewind(&checkpoint.version)?;
         if let Some(paged) = self.retained_paged.take() {
             paged.restore()?;
         }
-        self.position = *position;
+        if let (Some(feedback), Some(boundary)) = (&self.feedback, &checkpoint.feedback) {
+            feedback.restore(boundary)?;
+        }
+        self.position = checkpoint.position;
         self.retained = None;
         Ok(())
     }
@@ -316,7 +328,7 @@ mod tests {
         pool.observe_completion(1).unwrap();
         journal.finish(&first, true).unwrap();
         assert!(journal.begin(3, Some(position(3))).is_err());
-        assert_eq!(journal.retained.as_ref().unwrap().1.tokens, 0);
+        assert_eq!(journal.retained.as_ref().unwrap().position.tokens, 0);
         drop(caller);
         let third = journal.begin(3, Some(position(3))).unwrap();
         journal.mark_submitted(&third).unwrap();
@@ -384,5 +396,67 @@ mod tests {
         let retry = journal.begin(5, Some(position(66))).unwrap();
         journal.cancel_unsubmitted(&retry).unwrap();
         assert_eq!(journal.position, position(64));
+    }
+    #[test]
+    fn retained_predecessor_restores_its_exact_feedback_association() {
+        use crate::{Host, Limits, state::feedback::FeedbackBinding};
+        let host = Host::new(
+            forja_cpu::CpuBackend::new(),
+            Limits::new(65536, 8, 4096, 128, 4096),
+        );
+        let binding = FeedbackBinding::new(&host, 1).unwrap();
+        let pool = StatePool::new(
+            StateLayout::new(vec![StatePlane::new(DType::F32, vec![7, 33]).unwrap()]).unwrap(),
+            1,
+            65536,
+        )
+        .unwrap();
+        let mut journal = StateJournal::new(pool.reserve().unwrap());
+        journal.attach_feedback(binding.clone()).unwrap();
+        for tokens in 1..=2 {
+            let transaction = journal
+                .begin(
+                    tokens,
+                    Some(crate::LanePosition {
+                        tokens,
+                        sampler: tokens - 1,
+                        reserved_tokens: 7,
+                        ..crate::LanePosition::default()
+                    }),
+                )
+                .unwrap();
+            journal.mark_submitted(&transaction).unwrap();
+            pool.observe_completion(tokens).unwrap();
+            journal.finish(&transaction, true).unwrap();
+        }
+        let predecessor = journal
+            .retained
+            .as_ref()
+            .unwrap()
+            .feedback
+            .as_ref()
+            .unwrap()
+            .checkpoint
+            .clone();
+        let scalar = predecessor.scalar().index();
+        let mut map = binding.versions.lock().unwrap();
+        let selected = map.claim_scratch(1).unwrap();
+        map.publish_selection(&predecessor, 1, &selected).unwrap();
+        assert!(map.claim_scratch(1).is_err());
+        drop(map);
+        journal.rewind(1).unwrap();
+        assert_eq!(journal.position.tokens, 1);
+        assert_eq!(journal.position.sampler, 0);
+        assert_eq!(
+            journal
+                .checkpoint_latest()
+                .unwrap()
+                .feedback
+                .unwrap()
+                .checkpoint
+                .scalar()
+                .index(),
+            scalar
+        );
     }
 }
