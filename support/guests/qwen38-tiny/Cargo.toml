@@ -1,0 +1,15 @@
+[package]
+name = "qwen38-tiny"
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+forja-sdk.workspace = true
+qwen38 = { path = "../../../engines/qwen38", default-features = false }
+
+[lints]
+workspace = true

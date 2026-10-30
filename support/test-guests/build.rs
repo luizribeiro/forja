@@ -36,12 +36,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "custom-chat-format-smoke",
             "--exclude",
             "continuous-chat-format-smoke",
+            "--exclude",
+            "qwen38-tiny",
         ],
     )?;
     forja_build::build_component(
         &guest_manifest,
         &guest_target_dir,
         &["-p", "metal-variant-smoke"],
+    )?;
+    let tiny_target = main_target_dir.join("qwen38-tiny-build");
+    forja_build::build_component(
+        &repository.join("support/guests/qwen38-tiny/Cargo.toml"),
+        &tiny_target,
+        &[],
     )?;
     let chat_format_manifest = repository.join("support/guests/chat-format-smoke/Cargo.toml");
     forja_build::build_core_module(&chat_format_manifest, &pure_guest_target_dir, &[])?;
@@ -106,6 +114,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     emit_guest_path(
         "ENGINE_SMOKE_COMPONENT",
         &release_dir.join("engine_smoke.wasm"),
+    );
+    emit_guest_path(
+        "QWEN38_TINY_COMPONENT",
+        &tiny_target.join("wasm32-wasip2/release/qwen38_tiny.wasm"),
     );
     emit_guest_path(
         "ENGINE_SDK_SMOKE_COMPONENT",

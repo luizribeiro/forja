@@ -1,7 +1,7 @@
 use crate::{Config, Model};
 use forja_sdk::{
     DecodeInput, DecodeOutput, Engine, EngineInfo, EngineLoadConfig, Error, Result, StepInput,
-    StepOutput, Weights, export_engine, nn::blocks::DecodeState,
+    StepOutput, Weights, nn::blocks::DecodeState,
 };
 /// Single-lane text engine with eager feedback and no prefix or graph reuse.
 pub struct Qwen38 {
@@ -30,7 +30,7 @@ impl Qwen38 {
         })
     }
 }
-#[export_engine]
+#[cfg_attr(feature = "component", forja_sdk::export_engine)]
 impl Engine for Qwen38 {
     fn describe() -> EngineInfo {
         let c = Config::model();

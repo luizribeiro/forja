@@ -418,3 +418,6 @@ fn private_serving_planes_cover_each_recurrent_layer() {
         .is_err()
     );
 }
+
+#[path = "qwen38/component.rs"]
+mod component;

@@ -305,6 +305,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "qwen38"
+version = "0.0.0"
+dependencies = [
+ "forja-sdk",
+]
+
+[[package]]
+name = "qwen38-tiny"
+version = "0.0.0"
+dependencies = [
+ "forja-sdk",
+ "qwen38",
+]
+
+[[package]]
 name = "rmsnorm-smoke"
 version = "0.0.0"
 dependencies = [

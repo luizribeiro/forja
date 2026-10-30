@@ -141,6 +141,12 @@ pub fn smollm2_reference() -> &'static Path {
     Path::new(env!("SMOLLM2_REFERENCE_COMPONENT"))
 }
 
+/// Returns the small hybrid engine component used with independent random weights.
+#[must_use]
+pub fn qwen38_tiny() -> &'static Path {
+    Path::new(env!("QWEN38_TINY_COMPONENT"))
+}
+
 /// Returns the eager text-only Qwen3.8 engine component.
 #[must_use]
 pub fn qwen38() -> &'static Path {

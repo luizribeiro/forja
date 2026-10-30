@@ -8,6 +8,7 @@ members = [
   "hello",
   "metal-variant-smoke",
   "program-smoke",
+  "qwen38-tiny",
   "prefill-replay-smoke",
   "rmsnorm-smoke",
   "sdk-smoke",

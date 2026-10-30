@@ -13,8 +13,13 @@ version = "0.0.0"
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[features]
+default = ["component", "metal-variants"]
+component = []
+metal-variants = ["forja-sdk/metal-variants"]
+
 [dependencies]
-forja-sdk = { path = "../../crates/forja-sdk", features = ["metal-variants"] }
+forja-sdk = { path = "../../crates/forja-sdk" }
 
 [lints.rust]
 missing_docs = "warn"
