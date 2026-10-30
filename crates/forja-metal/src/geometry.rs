@@ -1,6 +1,7 @@
 //! Geometry shared by host validation and the Metal source prefix.
 
 pub(crate) const DELTA_RULE_MAX_KEYS: u64 = 256;
+pub(crate) const DELTA_BLOCK_TOKENS: usize = forja_core::DeltaBlockScratch::TOKENS;
 pub(crate) const STEEL_256_FLOAT: [u32; 2] = [16, 8];
 pub(crate) const STEEL_256_HALF: [u32; 2] = [32, 16];
 
@@ -8,10 +9,12 @@ pub(crate) fn shader_defines() -> String {
     format!(
         concat!(
             "#define FORJA_DELTA_RULE_MAX_KEYS {}\n",
+            "#define FORJA_DELTA_BLOCK_TOKENS {}\n",
             "#define FORJA_STEEL_256_FLOAT_Q {}\n#define FORJA_STEEL_256_FLOAT_K {}\n",
             "#define FORJA_STEEL_256_HALF_Q {}\n#define FORJA_STEEL_256_HALF_K {}\n",
         ),
         DELTA_RULE_MAX_KEYS,
+        DELTA_BLOCK_TOKENS,
         STEEL_256_FLOAT[0],
         STEEL_256_FLOAT[1],
         STEEL_256_HALF[0],

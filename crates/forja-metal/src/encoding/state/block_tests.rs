@@ -172,3 +172,8 @@ fn block_stage_harness_refuses_keys_above_the_backend_limit() {
         Err(BackendError::UnsupportedOperation)
     );
 }
+
+#[test]
+fn scalar_gram_matches_cpu_stage_oracle() {
+    check(0, "state_block_gram", None, 128).unwrap();
+}

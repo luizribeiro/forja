@@ -65,6 +65,8 @@ fn shader_body() -> &'static str {
         "\n",
         include_str!("state.metal"),
         "\n",
+        include_str!("state_block.metal"),
+        "\n",
         include_str!("calibration.metal")
     )
 }
