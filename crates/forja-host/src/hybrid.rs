@@ -34,6 +34,7 @@ pub(crate) struct StateUse {
     pub(crate) bank: usize,
     pub(crate) lane: usize,
     pub(crate) active: bool,
+    pub(crate) tokens: u64,
 }
 
 impl<B: Backend + 'static> Host<B> {
@@ -71,20 +72,20 @@ impl<B: Backend + 'static> Host<B> {
         if algorithm.len() > crate::MAX_VARIANT_NAME_BYTES {
             return Err(invalid_handle("state algorithm name exceeds its limit"));
         }
+        let tokens = match operation {
+            paged_storage::StateOperation::DeltaRule => 1,
+            _ => inputs
+                .first()
+                .and_then(|entry| entry.tensor.layout().shape().first())
+                .copied()
+                .map_or(0, u64::from),
+        };
         if active {
             let window = slot_entry
                 .binding
                 .banks
                 .append_window(bank, lane)
                 .map_err(invalid_handle)?;
-            let tokens = match operation {
-                paged_storage::StateOperation::DeltaRule => 1,
-                _ => inputs
-                    .first()
-                    .and_then(|entry| entry.tensor.layout().shape().first())
-                    .copied()
-                    .map_or(0, u64::from),
-            };
             if tokens == 0 || window.end.checked_sub(window.start) != Some(tokens) {
                 return Err(invalid_handle(
                     "state update differs from its admitted token span",
@@ -143,6 +144,7 @@ impl<B: Backend + 'static> Host<B> {
             bank,
             lane,
             active,
+            tokens,
         };
         if !entry.state_uses.contains(&usage) {
             entry.state_uses.push(usage);
@@ -397,6 +399,183 @@ impl<B: Backend + 'static> Host<B> {
                 .commands(usage.bank, usage.lane, usage.active)?
                 .release_graph_scratch();
             captured.capture.release_graph_scratch();
+        }
+        Ok(())
+    }
+}
+
+struct BoundState {
+    retained: Vec<crate::TensorEntry>,
+    bindings: forja_core::ReplayBindings,
+    usages: Vec<StateUse>,
+    banks: Vec<(std::sync::Arc<crate::PagedBinding>, usize)>,
+}
+
+impl<B: Backend + 'static> Host<B> {
+    pub(crate) fn prepare_state_replay_with_flight(
+        &mut self,
+        resource: &Resource<crate::GraphEntry>,
+        values: Vec<u32>,
+        flight: crate::ReplayFlight,
+    ) -> Result<crate::SubmitRequest<B>, compute::Error> {
+        let entry = self.table.get(resource).map_err(invalid_handle)?;
+        if entry.captured_state.is_empty() {
+            return self.prepare_replay_with_flight(resource, values, flight);
+        }
+        let mut retained = entry.retained.clone();
+        let (graph, access, captures, mut paged, mut checks) = (
+            std::sync::Arc::clone(&entry.graph),
+            entry.access.clone(),
+            entry.captured_state.clone(),
+            entry.paged.clone(),
+            entry.paged_bounds.clone(),
+        );
+        let checked = graph
+            .values(values.clone())
+            .map_err(|error| crate::graph_error(&error))?;
+        let bound = self.bind_graph_state(&captures)?;
+        retained.extend(bound.retained);
+        for usage in paged
+            .iter_mut()
+            .chain(checks.iter_mut().map(|check| &mut check.usage))
+        {
+            if let Some((_, bank)) = bound
+                .banks
+                .iter()
+                .find(|(binding, _)| std::sync::Arc::ptr_eq(binding, &usage.binding))
+            {
+                usage.bank = *bank;
+            }
+        }
+        crate::PagedCheck::validate_all(&checks, Some(&checked))?;
+        let (batch, mut owners) = self.prepare_state_work(&bound.usages)?;
+        owners.extend(
+            captures
+                .iter()
+                .flat_map(|captured| captured.capture.retained_resources()),
+        );
+        let mut request = self.submission_request(
+            crate::SubmissionWork::Replay {
+                graph,
+                values,
+                bindings: bound.bindings,
+            },
+            access,
+            retained,
+            paged,
+            Some(flight),
+        );
+        request.state_batch = batch;
+        request.state_owners = owners;
+        request.captured_state = captures
+            .into_iter()
+            .map(|captured| captured.capture)
+            .collect();
+        Ok(request)
+    }
+
+    fn bind_graph_state(
+        &mut self,
+        captures: &[CapturedState],
+    ) -> Result<BoundState, compute::Error> {
+        let mut bound = BoundState {
+            retained: Vec::new(),
+            bindings: forja_core::ReplayBindings::default(),
+            usages: Vec::new(),
+            banks: Vec::new(),
+        };
+        let mut slots = std::collections::HashSet::new();
+        for captured in captures {
+            let original = captured.usage;
+            let slot = self
+                .table
+                .get(&Resource::<crate::BatchSlotEntry>::new_borrow(
+                    original.slot,
+                ))
+                .map_err(invalid_handle)?;
+            let bank = slot.active_bank;
+            if slots.insert(original.slot) {
+                if captures.iter().any(|capture| {
+                    capture.usage.slot == original.slot && capture.usage.bank != original.bank
+                }) || slot.binding.activity[bank]
+                    .iter()
+                    .enumerate()
+                    .any(|(lane, active)| {
+                        active.load(std::sync::atomic::Ordering::Acquire)
+                            && !captures.iter().any(|capture| {
+                                capture.usage.slot == original.slot && capture.usage.lane == lane
+                            })
+                    })
+                {
+                    return Err(invalid_handle(
+                        "graph lanes or captured banks differ from the submission",
+                    ));
+                }
+                bound
+                    .banks
+                    .push((std::sync::Arc::clone(&slot.binding), bank));
+                self.bind_slot_bank_buffers(
+                    original.slot,
+                    original.bank,
+                    bank,
+                    &mut bound.bindings,
+                    &mut bound.retained,
+                )?;
+            }
+            let active = slot.binding.activity[bank][original.lane]
+                .load(std::sync::atomic::Ordering::Acquire);
+            if active {
+                let window = slot
+                    .binding
+                    .banks
+                    .append_window(bank, original.lane)
+                    .map_err(invalid_handle)?;
+                if window.end.checked_sub(window.start) != Some(original.tokens) {
+                    return Err(invalid_handle(
+                        "captured state token extent differs from the append",
+                    ));
+                }
+            }
+            let state = self
+                .state_slots
+                .get_mut(&original.slot)
+                .ok_or_else(|| invalid_handle("state slot is missing"))?;
+            let bindings = captured
+                .capture
+                .bind(state.commands(bank, original.lane, active)?)?;
+            bound.bindings.extend(bindings).map_err(invalid_handle)?;
+            bound.usages.push(StateUse {
+                bank,
+                active,
+                ..original
+            });
+        }
+        Ok(bound)
+    }
+
+    fn bind_slot_bank_buffers(
+        &self,
+        slot: u32,
+        original: usize,
+        bank: usize,
+        bindings: &mut forja_core::ReplayBindings,
+        retained: &mut Vec<crate::TensorEntry>,
+    ) -> Result<(), compute::Error> {
+        let slot = self
+            .table
+            .get(&Resource::<crate::BatchSlotEntry>::new_borrow(slot))
+            .map_err(invalid_handle)?;
+        for (old, new) in slot.tables[original]
+            .iter()
+            .chain(&slot.metadata[original])
+            .zip(slot.tables[bank].iter().chain(&slot.metadata[bank]))
+        {
+            let old = self.entry(&Resource::new_borrow(*old))?.tensor.buffer();
+            let new = self.entry(&Resource::new_borrow(*new))?.clone();
+            bindings
+                .buffer(old, new.tensor.buffer())
+                .map_err(invalid_handle)?;
+            retained.push(new);
         }
         Ok(())
     }

@@ -6251,6 +6251,7 @@ impl<B: Backend + 'static> Host<B> {
     ) -> SubmitRequest<B> {
         SubmitRequest {
             backend: Arc::clone(&self.backend),
+            captured_state: Vec::new(),
             state_batch: None,
             state_owners: Vec::new(),
             work,
@@ -6309,6 +6310,7 @@ impl<B: Backend + 'static> Host<B> {
             SubmissionWork::Replay {
                 graph: Arc::clone(&entry.graph),
                 values,
+                bindings: forja_core::ReplayBindings::default(),
             },
             entry.access.clone(),
             Vec::new(),
@@ -7053,6 +7055,7 @@ struct ReadRequest<B: Backend> {
 struct SubmitRequest<B: Backend> {
     backend: Arc<B>,
     work: SubmissionWork,
+    captured_state: Vec<StateCapture>,
     state_batch: Option<StateBatch<B>>,
     state_owners: Vec<forja_core::CompletionResource>,
     access: SubmissionAccess,
@@ -7076,6 +7079,7 @@ enum SubmissionWork {
     Replay {
         graph: Arc<PreparedGraph>,
         values: Vec<u32>,
+        bindings: forja_core::ReplayBindings,
     },
 }
 
@@ -7705,6 +7709,7 @@ where
             let Self {
                 backend,
                 work,
+                captured_state: _captured_state,
                 state_batch,
                 state_owners,
                 access,
@@ -7816,20 +7821,22 @@ fn submit_work<B: Backend>(
             backend.submit_profiled_retained(commands, owners)
         }
         SubmissionWork::Commands(commands) => backend.submit_retained(commands, owners),
-        SubmissionWork::Replay { graph, values } if owners.is_empty() => {
+        SubmissionWork::Replay {
+            graph,
+            values,
+            bindings,
+        } if owners.is_empty() && bindings.is_empty() => {
             if profiled {
                 backend.replay_profiled(&graph, values)
             } else {
                 backend.replay(&graph, values)
             }
         }
-        SubmissionWork::Replay { graph, values } => backend.replay_bound_retained(
-            &graph,
+        SubmissionWork::Replay {
+            graph,
             values,
-            &forja_core::ReplayBindings::default(),
-            owners,
-            profiled,
-        ),
+            bindings,
+        } => backend.replay_bound_retained(&graph, values, &bindings, owners, profiled),
     }
 }
 
@@ -8700,7 +8707,7 @@ where
         let request = accessor.with(|mut access| {
             access
                 .get()
-                .prepare_replay_with_flight(&resource, values, flight)
+                .prepare_state_replay_with_flight(&resource, values, flight)
         });
         let request = match request {
             Ok(value) => value,

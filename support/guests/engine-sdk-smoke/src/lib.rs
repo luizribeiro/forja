@@ -81,7 +81,17 @@ impl Engine for ConstantEngine {
         config: EngineLoadConfig,
     ) -> Result<Self> {
         let mut engine = Self::load(weights, config)?;
-        engine.paged = pool.map(|pool| pool.cache_set(1)).transpose()?;
+        engine.paged = pool
+            .map(|pool| {
+                pool.cache_set_with_state(
+                    1,
+                    &[forja_sdk::PagedStateDescriptor {
+                        dtype: forja_sdk::DType::F32,
+                        shape: vec![1, 64],
+                    }],
+                )
+            })
+            .transpose()?;
         Ok(engine)
     }
 
@@ -148,8 +158,16 @@ impl ConstantEngine {
                 .as_ref()
                 .ok_or_else(|| forja_sdk::Error::loading("paged smoke cache is missing"))?
                 .layer(0)?;
+            let history = self
+                .paged
+                .as_ref()
+                .ok_or_else(|| forja_sdk::Error::loading("state cache is missing"))?
+                .state_at(0, 0)?;
+            let weights = Tensor::from_slice(&[1.0; 128], &[2, 64])?;
             let variant = Variant::new("paged-sdpa.vector")?;
             self.paged_graph = Some(capture(&[&parameter], || {
+                let _history =
+                    history.causal_convolution(&self.paged_value.reshape(&[1, 64])?, &weights)?;
                 cache.append(&self.paged_key, &self.paged_value, &start)?;
                 cache
                     .attention(&self.paged_query, 1.0, &start, &end, &variant)?
